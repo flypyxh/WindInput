@@ -170,6 +170,7 @@ impl Coordinator {
             Some(ModeKind::TempPinyin) => Some(&state.temp_pinyin_buffer),
             Some(ModeKind::TempEnglish) => Some(&state.temp_english_buffer),
             Some(ModeKind::Mix(_)) => Some(&state.mix_buffer),
+            Some(ModeKind::RareChar) => Some(&state.special_buffer),
             _ => None,
         }
     }
@@ -187,7 +188,7 @@ impl Coordinator {
         let rw = state.rewind.take();
         let origin = rw.as_ref().map(|r| r.origin).unwrap_or_default();
         let snapshot = rw.map(|r| r.snapshot).unwrap_or_default();
-        // 退出当前夺取式模式：URL / z-fallback 的临拼、临英、mix。
+        // 退出当前夺取式模式：URL / z-fallback 的临拼、临英、mix、生僻字。
         // ⚠️ 必须与 `active_hijack_buffer` 枚举的模式**一一对应**：那边认得、这边漏了，
         // 就会走 `reset_exclusive_modes` 兜底——状态清得掉，但各模式自己的收尾
         // （committed_segs、cursor、mix 的透镜态）不会跑，回退后留下半清理的残局。
@@ -198,6 +199,7 @@ impl Coordinator {
             Some(ModeKind::TempPinyin) => self.exit_temp_pinyin(state),
             Some(ModeKind::TempEnglish) => self.exit_temp_english(state),
             Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
+            Some(ModeKind::RareChar) => self.exit_special_mode(state),
             _ => self.reset_exclusive_modes(state),
         }
         // 回放目标由**来源**决定，不是恒定的 `input_buffer`（见 `RewindOrigin`）。

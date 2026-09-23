@@ -376,12 +376,38 @@ impl Coordinator {
     /// 退出特殊模式并清空相关状态（码表缓存保留供复用）。
     pub(crate) fn exit_special_mode(&self, state: &mut State) {
         state.active = None;
+        // 夺取回退登记随模式一起作废（防御性）：z 夺取进生僻字后，登记若留着，下次进生僻字
+        // 打到与残余码相同的缓冲再退格，会被误判成「退回夺取边界」而跳回 `z`。端到端没能
+        // 构造出这条路径（空格 / Esc / 首键进入各有别处先清掉），但这里清掉不依赖那些巧合。
+        // `rewind_hijack` 是先 `take` 再调本函数，不受影响。
+        state.rewind = None;
         state.overlay_spec = None;
         state.special_buffer.clear();
         state.special_cursor = 0;
         state.special_prefix.clear();
         state.candidates.clear();
         state.preedit.clear();
+    }
+
+    /// [`Self::update_special_candidates`] 请求的全码自动上屏：命令候选走命令路径，
+    /// 普通候选记统计、退出模式后上屏。字母键臂与 z 夺取进生僻字（`try_z_fallback`）共用。
+    pub(crate) fn special_auto_commit(&self, state: &mut State, cand: Candidate) -> KeyAction {
+        // $CC 命令候选自动命中：与手动选中同路（退出模式 + 异步执行动作）。
+        let code = state.special_buffer.clone();
+        if let Some(act) =
+            self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_special_mode(st))
+        {
+            return act;
+        }
+        self.record_commit(
+            &cand.text,
+            state.special_buffer.len() as u32,
+            -1,
+            wind_store::stats::CommitSource::SpecialMode,
+        );
+        self.exit_special_mode(state);
+        self.notify_ui_hide();
+        Self::commit_action(cand.text, true)
     }
 
     /// 按当前编码缓冲刷新特殊模式候选（经其引用方案的引擎查询，复用方案 CodeTableSpec 全码策略）。
@@ -683,22 +709,7 @@ impl Coordinator {
                 preedit_cursor::BufEdit::new(&mut state.special_buffer, &mut state.special_cursor)
                     .insert(ch);
                 if let Some(cand) = self.update_special_candidates(state) {
-                    // $CC 命令候选自动命中：与手动选中同路（退出模式 + 异步执行动作）。
-                    let code = state.special_buffer.clone();
-                    if let Some(act) = self.overlay_commit_command(state, &cand, &code, |s, st| {
-                        s.exit_special_mode(st)
-                    }) {
-                        return act;
-                    }
-                    self.record_commit(
-                        &cand.text,
-                        state.special_buffer.len() as u32,
-                        -1,
-                        wind_store::stats::CommitSource::SpecialMode,
-                    );
-                    self.exit_special_mode(state);
-                    self.notify_ui_hide();
-                    return Self::commit_action(cand.text, true);
+                    return self.special_auto_commit(state, cand);
                 }
                 let display = state.preedit.clone();
                 let caret_pos = self.overlay_caret(state);

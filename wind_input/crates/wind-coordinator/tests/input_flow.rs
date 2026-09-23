@@ -799,6 +799,87 @@ fn test_z_key_action_enters_special() {
     );
 }
 
+/// `z_key_action = "rare_char"`：z 进生僻字模式（用当前方案的编码，只出生僻字）（GH#146）。
+///
+/// ★ 必须装上 `zz*` 系统短语再测：headless 的 store 为 `None`、短语层恒空，不装的话 z 是
+/// 死码、首键直接进模式——而真机出厂有几十条 `zz*`，首键 z **恒让位**，进模式只能靠
+/// `try_z_fallback` 破前缀夺取。夺取回路曾不接生僻字，于是设置页选了这一项也永远进不去。
+///
+/// 三段：首键让位 → 第二键破前缀夺取 → 候选只留生僻字（普通五笔 `gg` 首选是「五」）。
+#[test]
+fn test_z_key_action_enters_rare_char() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "rare_char".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.debug_install_phrases(zz_system_phrases());
+
+    press_vk(&coord, 0x5A, false); // z
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "前提：有 `zz*` 短语时 z 是活码前缀，首键应让位"
+    );
+    let a = press_letter(&coord, 'g');
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("rare_char"),
+        "`zg` 破前缀后应被夺取进生僻字模式"
+    );
+    assert_eq!(
+        action_text(&a).unwrap_or_default(),
+        "zg",
+        "组合区保留引导键 z"
+    );
+
+    press_letter(&coord, 'g');
+    let texts = coord.debug_page_texts();
+    assert!(!texts.is_empty(), "生僻字模式下 `gg` 应有候选（如「玨」）");
+    assert!(
+        !texts.iter().any(|t| t == "五"),
+        "生僻字模式不该出常用字「五」，实际: {:?}",
+        texts
+    );
+}
+
+/// z 夺取进生僻字后，退格退到夺取边界即撤销夺取、回到正常码流 `z`（与临拼等同一套回退）。
+#[test]
+fn test_z_key_action_rare_char_backspace_rewinds() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "rare_char".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.debug_install_phrases(zz_system_phrases());
+
+    press_vk(&coord, 0x5A, false); // z（让位）
+    press_letter(&coord, 'g'); // 夺取
+    assert_eq!(coord.debug_active_mode(), Some("rare_char"));
+    let a = coord.handle_key_event(&key_event(0x08, EVENT_KEY_DOWN)); // Backspace
+    assert_eq!(coord.debug_active_mode(), None, "退格应撤销夺取");
+    assert_eq!(
+        action_text(&a).unwrap_or_default(),
+        "z",
+        "回退目标是夺取前的正常码流"
+    );
+}
+
+/// 真机出厂 `system.phrases.toml` 的 `zz*` 标点短语的最小替身（见上方两条测试）。
+fn zz_system_phrases() -> Vec<wind_phrase::PhraseSeed> {
+    let seed = |code: &str, text: &str| wind_phrase::PhraseSeed {
+        code: code.into(),
+        text: text.into(),
+        weight: 0,
+        position: 0,
+        is_system: true,
+        category: String::new(),
+    };
+    vec![seed("zzbd", "、"), seed("zzsz", "…")]
+}
+
 /// `z_key_action` 指向不存在的目标：**不得吞键**，z 落普通输入作正常码。
 ///
 /// 吞键的后果是把 z 这个编码键废掉，且用户从现象上完全看不出原因——配错一个 id
