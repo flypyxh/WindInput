@@ -49,10 +49,13 @@ fn engine(tag: &str, count: u8, max: u8) -> PinyinEngine {
     PinyinEngine::new(cfg, dict(tag))
 }
 
+/// (名次, 文本)
+type Ranked = Vec<(u8, String)>;
+
 /// (候选里的整句按名次, 池子里的整句按名次)
-fn sentences(e: &PinyinEngine, input: &str) -> (Vec<(u8, String)>, Vec<(u8, String)>) {
+fn sentences(e: &PinyinEngine, input: &str) -> (Ranked, Ranked) {
     let r = e.convert(input, 100).expect("convert");
-    let mut shown: Vec<(u8, String)> = r
+    let mut shown: Ranked = r
         .candidates
         .iter()
         .filter(|c| c.sentence_rank > 0)
