@@ -1136,6 +1136,21 @@ pub struct PinyinGlobalConfig {
     /// 上限 8（引擎 `SENTENCE_COUNT_LIMIT`）。
     #[serde(default = "default_sentence_count")]
     pub sentence_max_count: u8,
+    /// 整句切换键：在整句池（`sentence_max_count` 条）里滚动显示窗口。**空串 = 关闭（出厂）**。
+    ///
+    /// 键名取值同 `keys.session_actions` 那张表（`wind_keys::keymap::session_key_name_to_vk`：
+    /// 会话功能键 `tab` 等 + 符号键 `backtick` 等，可带 `shift+`）。不认识的键名**告警后按
+    /// 关闭处理**，不静默。
+    ///
+    /// ★ **键即开关**，与 `input.english_case_cycle_key` 同形：不再另设 `enabled` bool，否则
+    /// 就是两道闸串联——用户把键配好却没反应，两处显示都正常。
+    ///
+    /// ⚠️ **只在「整句池 ≥ 2 条」时夺取**，其余时候这个键保持它原本的语义。Tab 出厂是
+    /// 翻页键、也是配对跳出键与加词界面的切来源键，所以不能无条件抢；出厂 `sentence_max_count
+    /// = 1` 时池子恒空，即使配了键也不会吃。撞车时启动体检告警，见
+    /// `Coordinator::warn_sentence_cycle_conflict`。
+    #[serde(default)]
+    pub sentence_cycle_key: String,
     /// 拼音分隔策略（"auto" 等）。原 input.pinyin_separator 收拢至此。
     #[serde(default = "default_pinyin_separator")]
     pub separator: String,
@@ -1375,6 +1390,7 @@ impl Default for PinyinGlobalConfig {
             sentence_uses_user_words: false,
             sentence_count: default_sentence_count(),
             sentence_max_count: default_sentence_count(),
+            sentence_cycle_key: String::new(),
             english_merge: PinyinEnglishMerge::default(),
             separator: default_pinyin_separator(),
             fuzzy: PinyinFuzzy::default(),

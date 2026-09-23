@@ -1057,6 +1057,13 @@ impl MessageHandler for Coordinator {
             return act;
         }
 
+        // ── 整句切换（`schema.pinyin.sentence_cycle_key`）──
+        // 同上一段的层级与理由。守卫（配了键 / 普通拼音输入 / 整句池 ≥ 2 条）都在函数内部，
+        // 任一不成立即返回 None —— Tab 出厂是翻页键，池子不足两条时必须原样落回翻页。
+        if let Some(act) = self.try_sentence_cycle_key(data) {
+            return act;
+        }
+
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // **无条件**写入（含 false）：只在为真时置位会把上一次按键的来源留给这一次，
         // 表现为「先按一下小键盘、再按主键盘同一个键也出半角」。见 `State::numpad_origin`。

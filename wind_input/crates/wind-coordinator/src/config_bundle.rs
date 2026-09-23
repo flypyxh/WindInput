@@ -82,6 +82,9 @@ pub(crate) struct ConfigBundle {
     /// 英文大小写档位循环的触发键 VK（预解析自 `input.english_case_cycle_key`）。
     /// `None` = 功能关闭——**键即开关**，此外没有第二个闸门。
     pub(crate) english_case_cycle_vk: Option<u32>,
+    /// 整句切换键（预解析自 `schema.pinyin.sentence_cycle_key`）。`None` = 功能关闭 ——
+    /// **键即开关**，同 `english_case_cycle_vk`。带 `shift` 位：`shift+tab` 与 `tab` 是两个键。
+    pub(crate) sentence_cycle_key: Option<keymap::SessionKey>,
     /// 输入右符号本身是否跳出（`jump_out_keys` 含 `right_symbol`）。对称配对不受此项影响。
     pub(crate) jump_out_on_right_symbol: bool,
     /// 「英半列有自定义标点映射」的源字符集合（预解析自 `punct.custom_mappings`，空=英文模式
@@ -429,6 +432,22 @@ impl ConfigBundle {
                 config.input.english_case_cycle_key
             );
         }
+        // 整句切换键：与会话动作同一张键名表（`session_key_name_to_vk`），组合期间 C++ 本就
+        // 把这些键转发过来。写了值却解析不出来 ⇒ 用户以为开了、实际是关的，必须告警。
+        let sentence_cycle_raw = config.schema.pinyin.sentence_cycle_key.trim();
+        let sentence_cycle_key = if sentence_cycle_raw.is_empty() {
+            None
+        } else {
+            let parsed = keymap::session_key_name_to_vk(sentence_cycle_raw);
+            if parsed.is_none() {
+                warn!(
+                    "schema.pinyin.sentence_cycle_key = {:?} 不是可识别的键名，整句切换按关闭处理；\
+                     可用值同 keys.session_actions 的键名（如 tab / backtick，可带 shift+）",
+                    config.schema.pinyin.sentence_cycle_key
+                );
+            }
+            parsed
+        };
         let jump_out_on_right_symbol =
             parse_jump_out_on_right_symbol(&config.input.auto_pair.jump_out_keys);
         // 英文模式下需要 DLL 吃下转发的标点键 = 「全局配了英半列自定义」∪「英文智能符号参与集」
@@ -506,6 +525,7 @@ impl ConfigBundle {
             en_pairs,
             jump_out_keys,
             english_case_cycle_vk,
+            sentence_cycle_key,
             jump_out_on_right_symbol,
             custom_en_punct_chars,
             cn_passthrough_punct_chars,

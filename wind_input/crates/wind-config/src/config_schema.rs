@@ -287,6 +287,8 @@ static REGISTRY: &[ConfigField] = &[
     // 整句 N-best：露几条 / 算几条（切换键的池子）。出厂 1/1 = 单条整句。
     f("schema.pinyin.sentence_count", Int),
     f("schema.pinyin.sentence_max_count", Int),
+    // 整句切换键：键即开关，空串 = 关闭（出厂）。只在整句池 ≥ 2 条时夺取。
+    f("schema.pinyin.sentence_cycle_key", Str),
     f("schema.pinyin.separator", Str),
     // 单字输入（拼音侧）。与码表那份是两件独立的事、不共享取值——两种引擎对「只出单字」
     // 的诉求本就不同（码表是定长盲打，拼音只是不出词）。拼音**没有**方案级覆盖。

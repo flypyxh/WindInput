@@ -4905,9 +4905,23 @@ impl EngineManager {
                 // 那一侧的拼音候选也来自同一个 `PinyinEngine`，没有单独关掉的理由。
                 sentence_uses_user_words: pg.sentence_uses_user_words,
                 // 整句 N-best（露几条 / 算几条）。规整（夹界、算的不少于露的）在引擎侧
-                // `Config::sentence_counts` 里做，这里原样透传。
-                sentence_count: pg.sentence_count,
-                sentence_max_count: pg.sentence_max_count,
+                // `Config::sentence_counts` 里做，这里只做一件事：**混输的拼音子引擎钉成 1/1**。
+                //
+                // N-best 是拼音方案的验证工具，协调器会在 count>1 时把整句块摆到候选最前
+                // （`place_sentence_block`）。混输下那等于让拼音整句越过码表精确候选 ——
+                // 打五笔的人一旦开了这项，满屏首位全是拼音组句。混输的拼音本就在降档层里
+                // 竞争（见 `MixedEngine` 的分档加权），整句块不该有跳档的特权。
+                // 判据与上面 `enable_partial_final` 同为「是不是混输辅助」。
+                sentence_count: if mix_secondary.is_some() {
+                    1
+                } else {
+                    pg.sentence_count
+                },
+                sentence_max_count: if mix_secondary.is_some() {
+                    1
+                } else {
+                    pg.sentence_max_count
+                },
                 // ⚠️ 补全这两项**不按 `mix_pinyin` 分流**，与上面三项刻意不同：它们约束的是
                 // 「引擎敢预测多少你没打的音节」，这个偏好与「当前是不是混输」无关，是用户
                 // 对候选面的统一取舍。分流会让同一个设置在两种方案下表现不一致。

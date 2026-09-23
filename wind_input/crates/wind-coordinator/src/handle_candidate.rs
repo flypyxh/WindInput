@@ -259,6 +259,101 @@ pub(crate) fn place_english_after_common_exact(candidates: &mut Vec<Candidate>, 
     *candidates = rest;
 }
 
+/// 整句 N-best 块：`show > 1` 时把 `sentence_rank > 0` 的候选**按名次连续摆到最前**。
+///
+/// ## 为什么要强制摆位
+///
+/// 整句本身**没有**锚定（`freq_rerank` 已刻意移除，见那里「整句不再锚定」一段）——它靠
+/// weight 挣位置，词频也能把它挤下去。单条时这是对的；但 N-best 的用途是**并排比较**
+/// 几种整句解读（验证用户词进整句、调权重），备选若被普通候选隔开、散在各处，就失去了
+/// 比较的意义。所以只在 `show > 1`（用户显式开了多条）时整块前置；出厂 `show == 1` 直接
+/// 返回，排序仍是「整句靠 weight 挣位置」那一套，逐位不变。
+///
+/// ## 只搬整句那几条
+///
+/// 其余候选按原序收进 `rest`，**不改变任何两条非整句候选的相对次序**（与英文后置同一
+/// 手法）。2b 混合整句 / 2c 残码整句的 `sentence_rank` 为 0，不在块内。
+///
+/// 位置钉在词频重排与英文定位**之后**、shadow **之前**：前两者都会重新排序，放它们前面
+/// 就被搅散；shadow 是用户显式的置顶/删除，保留最终话语权。
+///
+/// ## 块里至少两条才摆
+///
+/// 只有一条带名次的整句时（这次解码没出备选、或混输——引擎把混输的拼音子引擎钉成 1/1）
+/// 直接返回：那不是「块」，是普通的单条整句，该按单条的规矩靠 weight 挣位置。
+/// 少了这道，用户全局开了 `sentence_count = 3` 再切到五笔混输，名次 1 的拼音整句就会
+/// 被拉到码表精确候选前面 —— 判据放在这里而不只靠引擎侧那一处，是因为「块」这个语义
+/// 本身就要求 ≥2，不依赖上游恰好没产出。
+pub(crate) fn place_sentence_block(candidates: &mut Vec<Candidate>, show: usize) {
+    if show <= 1 || candidates.iter().filter(|c| c.sentence_rank > 0).count() < 2 {
+        return;
+    }
+    let (mut block, rest): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(candidates)
+        .into_iter()
+        .partition(|c| c.sentence_rank > 0);
+    block.sort_by_key(|c| c.sentence_rank);
+    block.extend(rest);
+    *candidates = block;
+}
+
+/// 整句切换键：把显示窗口在整句池里**向后滚一格并回卷**，换掉候选里露出的整句。
+///
+/// 返回换完之后窗口第一条所在的下标（供调用方把高亮落上去）；池子不足两条、或候选里
+/// 根本没有露出的整句时返回 `None` —— 调用方据此**不吃键**，让这个键回到它原本的语义
+/// （Tab 出厂是翻页键）。
+///
+/// ## 窗口怎么滚
+///
+/// 池 `K` 条、候选里露 `m` 条（`m` = 当前带名次的候选数，≤ `sentence_count`）。窗口起点
+/// `w` 每按一次 +1、对 `K` 取模，露出的是 `pool[(w+i) % K]`（`i` ∈ `0..m`）。露 1 算 5 时
+/// 就是「同一个位置轮流换五种解读」，露 3 算 5 就是「三条一组地往后看」，两种用法同一条规则。
+///
+/// 换进来的整句按窗口内位置重新编名次（1..=m）——`place_sentence_block` 按名次排，名次
+/// 跟着窗口走，块内顺序才与用户看到的滚动方向一致。
+///
+/// ## 同文去重
+///
+/// 池里名次 > `sentence_count` 的整句从没和候选列表合并过（引擎侧「露不出来的只进池子」），
+/// 它的文本可能恰好等于列表里某条普通候选（`你好` 既是整句又是词）。换进来之后把那条
+/// 普通候选删掉，免得一屏出现两条同字——两条同字选哪条都一样，留着只是占位。
+pub(crate) fn cycle_sentence_window(
+    candidates: &mut Vec<Candidate>,
+    pool: &[Candidate],
+    window: &mut usize,
+) -> Option<usize> {
+    let k = pool.len();
+    if k < 2 {
+        return None;
+    }
+    let mut slots: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.sentence_rank > 0)
+        .map(|(i, _)| i)
+        .collect();
+    if slots.is_empty() {
+        return None;
+    }
+    slots.sort_by_key(|&i| candidates[i].sentence_rank);
+    slots.truncate(k);
+    *window = (*window + 1) % k;
+    for (i, &slot) in slots.iter().enumerate() {
+        let mut incoming = pool[(*window + i) % k].clone();
+        incoming.sentence_rank = (i + 1) as u8;
+        candidates[slot] = incoming;
+    }
+    // 同文去重：只删「不在窗口里」的那条。先记下窗口里的文本，再按下标过滤。
+    let window_texts: Vec<String> = slots.iter().map(|&i| candidates[i].text.clone()).collect();
+    let mut idx = 0usize;
+    candidates.retain(|c| {
+        let keep = slots.contains(&idx) || !window_texts.contains(&c.text);
+        idx += 1;
+        keep
+    });
+    // 去重可能删掉了窗口之前的条目，窗口首条的下标要重新找。
+    candidates.iter().position(|c| c.sentence_rank == 1)
+}
+
 /// 满码空码清空的**最终复核**：候选列表里是否存在「拦得住清空」的候选。
 ///
 /// 清空要穿过三道门，缺一不可：
@@ -1074,6 +1169,8 @@ impl Coordinator {
         // 候选调整（shadow）的归一编码。双拼下 = 全拼码（`hc`→`hao`），使双拼与全拼共享
         // 同一条规则；全拼/码表/混输恒空串 = 落回击键，行为不变。见 `State::shadow_code`。
         state.shadow_code = result.shadow_code.clone();
+        // 整句 N-best 池子（出厂恒空），供整句切换键滚动窗口。见 `State::sentence_pool`。
+        state.sentence_pool = result.sentence_pool.clone();
         let engine_count = result.candidates.len();
         // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
         let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
@@ -1369,6 +1466,12 @@ impl Coordinator {
         // （真机现象：打 `hen` 英文第一、打 `shi` 英文不在第一，差别只是用户对哪个音节
         // 选得多）。放在 shadow 之前——shadow 是用户显式置顶，保留最终话语权。
         place_english_after_common_exact(&mut candidates, &state.input_buffer);
+        // 整句 N-best 块（仅 `sentence_count > 1`）：放在上面两道重排之后、shadow 之前，
+        // 理由见 `place_sentence_block`。
+        place_sentence_block(
+            &mut candidates,
+            usize::from(self.rt().config.schema.pinyin.sentence_count),
+        );
         // Shadow 的取码口与写端 `candidate_op_scope` 同源（见 `shadow_code_of`）——双拼下
         // 是归一后的全拼码，其余恒为击键。⚠️ 与上一行的词频记账**刻意不同域**：那条链有
         // 自己的 `freq_code`（码表按输入码、拼音按候选码），两者别互相照抄。
@@ -1985,6 +2088,8 @@ impl Coordinator {
         state.preedit_abbrev_body.clear();
         state.preedit_codetable_body.clear();
         state.shadow_code.clear();
+        state.sentence_pool.clear();
+        state.sentence_window = 0;
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
@@ -6407,5 +6512,165 @@ mod english_placement_tests {
         let before = texts(&v2).iter().map(|s| s.to_string()).collect::<Vec<_>>();
         place_english_after_common_exact(&mut v2, "");
         assert_eq!(texts(&v2), before, "空输入时早退，不得改动列表");
+    }
+}
+
+#[cfg(test)]
+mod sentence_block_tests {
+    //! 整句 N-best 块的摆位：`sentence_count > 1` 时按名次连续摆到最前，其余不动。
+    use super::*;
+
+    fn c(text: &str, rank: u8) -> Candidate {
+        Candidate {
+            text: text.into(),
+            sentence_rank: rank,
+            is_sentence: rank > 0,
+            ..Default::default()
+        }
+    }
+
+    fn texts(v: &[Candidate]) -> Vec<&str> {
+        v.iter().map(|x| x.text.as_str()).collect()
+    }
+
+    /// 词频重排把整句块打散之后，摆位把它们按名次收拢到最前。
+    #[test]
+    fn scattered_sentences_are_gathered_to_the_front_in_rank_order() {
+        let mut v = vec![
+            c("有", 0),
+            c("有概论吗", 2),
+            c("游", 0),
+            c("有该论吗", 1),
+            c("又", 0),
+            c("有盖伦吗", 3),
+        ];
+        place_sentence_block(&mut v, 3);
+        assert_eq!(
+            texts(&v),
+            vec!["有该论吗", "有概论吗", "有盖伦吗", "有", "游", "又"]
+        );
+    }
+
+    /// 非整句候选的**相对次序**必须原样保留 —— 摆位只搬整句那几条。
+    #[test]
+    fn non_sentence_order_is_untouched() {
+        let mut v = vec![c("乙", 0), c("整2", 2), c("甲", 0), c("整1", 1), c("丙", 0)];
+        place_sentence_block(&mut v, 2);
+        assert_eq!(&texts(&v)[2..], &["乙", "甲", "丙"]);
+    }
+
+    /// 出厂 `show == 1`：什么都不动。整句靠 weight 挣位置那一套逐位不变。
+    #[test]
+    fn show_one_is_a_no_op() {
+        let mut v = vec![c("有", 0), c("有该论吗", 1), c("有概论吗", 2)];
+        let before: Vec<String> = texts(&v).iter().map(|s| s.to_string()).collect();
+        place_sentence_block(&mut v, 1);
+        assert_eq!(texts(&v), before);
+    }
+
+    /// 块里只有一条带名次的整句 ⇒ 不摆。
+    ///
+    /// 这是混输的保护：引擎把混输的拼音子引擎钉成 1/1，只会产出名次 1 那一条；
+    /// 用户全局开了 `sentence_count = 3` 再切到五笔混输，没有这道就会把拼音整句拉到
+    /// 码表精确候选前面。
+    #[test]
+    fn a_single_ranked_sentence_is_not_a_block() {
+        let mut v = vec![c("工作", 0), c("啊啊我", 1)];
+        place_sentence_block(&mut v, 3);
+        assert_eq!(texts(&v), vec!["工作", "啊啊我"], "单条不该越过码表候选");
+    }
+}
+
+#[cfg(test)]
+mod sentence_cycle_tests {
+    //! 整句切换键的窗口滚动：`pool[(w+i) % K]`，到头回卷，名次跟着窗口重编。
+    use super::*;
+
+    fn c(text: &str, rank: u8) -> Candidate {
+        Candidate {
+            text: text.into(),
+            sentence_rank: rank,
+            is_sentence: rank > 0,
+            ..Default::default()
+        }
+    }
+
+    fn pool(texts: &[&str]) -> Vec<Candidate> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| c(t, (i + 1) as u8))
+            .collect()
+    }
+
+    fn texts(v: &[Candidate]) -> Vec<&str> {
+        v.iter().map(|x| x.text.as_str()).collect()
+    }
+
+    /// 露 1 算 3：同一个位置轮流换三种解读，第三次回卷到最优解。
+    #[test]
+    fn single_slot_rotates_through_pool_and_wraps() {
+        let p = pool(&["甲句", "乙句", "丙句"]);
+        let mut v = vec![c("甲句", 1), c("词", 0)];
+        let mut w = 0;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let first = cycle_sentence_window(&mut v, &p, &mut w).expect("池子 ≥2 应当切换");
+            seen.push(v[first].text.clone());
+        }
+        assert_eq!(seen, vec!["乙句", "丙句", "甲句"], "滚到头回卷");
+        assert_eq!(texts(&v), vec!["甲句", "词"], "普通候选不动");
+    }
+
+    /// 露 2 算 3：两条一组往后看，名次按窗口内位置重编（块内顺序与滚动方向一致）。
+    #[test]
+    fn multi_slot_window_slides_and_ranks_follow_window() {
+        let p = pool(&["甲句", "乙句", "丙句"]);
+        let mut v = vec![c("甲句", 1), c("乙句", 2), c("词", 0)];
+        let mut w = 0;
+        cycle_sentence_window(&mut v, &p, &mut w).unwrap();
+        assert_eq!(texts(&v), vec!["乙句", "丙句", "词"]);
+        assert_eq!(
+            v.iter().map(|x| x.sentence_rank).collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        cycle_sentence_window(&mut v, &p, &mut w).unwrap();
+        assert_eq!(texts(&v), vec!["丙句", "甲句", "词"], "窗口回卷");
+    }
+
+    /// 池子不足两条 ⇒ 不切换（返回 None），调用方据此不吃键，Tab 落回翻页。
+    #[test]
+    fn pool_below_two_does_not_cycle() {
+        let mut v = vec![c("甲句", 1), c("词", 0)];
+        let mut w = 0;
+        assert_eq!(
+            cycle_sentence_window(&mut v, &pool(&["甲句"]), &mut w),
+            None
+        );
+        assert_eq!(cycle_sentence_window(&mut v, &[], &mut w), None);
+        assert_eq!(w, 0, "没切换就不该动窗口");
+    }
+
+    /// 候选里没有露出的整句（比如 shadow 把它删了）⇒ 不切换。
+    #[test]
+    fn no_visible_sentence_does_not_cycle() {
+        let mut v = vec![c("词", 0)];
+        let mut w = 0;
+        assert_eq!(
+            cycle_sentence_window(&mut v, &pool(&["甲句", "乙句"]), &mut w),
+            None
+        );
+    }
+
+    /// 换进来的整句恰好与某条普通候选同文 ⇒ 删掉那条普通候选，一屏不出两条同字。
+    #[test]
+    fn incoming_sentence_replaces_same_text_normal_candidate() {
+        let p = pool(&["甲句", "你好"]);
+        let mut v = vec![c("甲句", 1), c("你好", 0), c("词", 0)];
+        let mut w = 0;
+        let first = cycle_sentence_window(&mut v, &p, &mut w).unwrap();
+        assert_eq!(texts(&v), vec!["你好", "词"]);
+        assert_eq!(first, 0);
+        assert_eq!(v[0].sentence_rank, 1, "留下的是窗口里那条");
     }
 }

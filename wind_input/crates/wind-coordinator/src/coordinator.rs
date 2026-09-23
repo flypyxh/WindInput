@@ -592,6 +592,15 @@ pub(crate) struct State {
     /// ——规则写得进去、读不出来，界面毫无异常。守门测试见 `handle_candidate.rs` 的
     /// `every_shadow_read_goes_through_normalized_code`。
     pub(crate) shadow_code: String,
+    /// 整句 N-best 的池子（本次转换的全部整句，按名次、已去重），供整句切换键滚动窗口。
+    ///
+    /// 来自 `ConvertResult::sentence_pool`，**只在 `schema.pinyin.sentence_max_count > 1` 时
+    /// 非空**。每次 `update_candidates` 清空重填：池子只对「当前这串输入」有效，输入一变
+    /// 旧池子里的整句就不再是这串键的解读了。
+    pub(crate) sentence_pool: Vec<Candidate>,
+    /// 整句切换键把显示窗口在池子里滚到了第几条（0 = 原始名次，即解码最优解打头）。
+    /// 与 `sentence_pool` 同生命周期，随它一起清零。
+    pub(crate) sentence_window: usize,
     /// 出简让全用：本次输入过程中**各级简码位的首选**，下标 0/1/2 = 码长 1/2/3。
     /// 值为 `(该级的码, 首选文本)`——记的是用户**实际看到的**那一条（已过 `apply_filter` /
     /// `apply_freq_rerank` / `apply_shadow`），故天然含调频与候选调整的效果。
@@ -2436,6 +2445,8 @@ impl Coordinator {
                 preedit_abbrev_body: String::new(),
                 preedit_codetable_body: String::new(),
                 shadow_code: String::new(),
+                sentence_pool: Vec::new(),
+                sentence_window: 0,
                 shortcode_tops: [const { None }; 3],
                 candidates: Vec::new(),
                 selected_index: 0,
@@ -2661,6 +2672,7 @@ impl Coordinator {
         coordinator.warn_code_char_conflicts();
         // 档位循环触发键的撞车体检（只告警）。出厂不配 ⇒ 默认直接返回。
         coordinator.warn_english_case_cycle_conflict();
+        coordinator.warn_sentence_cycle_conflict();
         coordinator
     }
 
@@ -7600,6 +7612,84 @@ impl Coordinator {
         );
     }
 
+    /// 整句切换键（`schema.pinyin.sentence_cycle_key`）：在整句池里滚动显示窗口。
+    ///
+    /// 与英文大小写档位循环同处「候选显示期间生效的快捷键」这一层、同为**临时夺取**：
+    /// 守卫任一不成立即返回 `None`，按键原样落回它本来的语义（Tab 出厂是翻页键）。
+    ///
+    /// 守卫：配了键 / 按的就是那个键（含 Shift 位）/ 普通拼音输入态（无 overlay 模式）/
+    /// 有输入 / **整句池 ≥ 2 条**。最后一条是关键：出厂 `sentence_max_count = 1` 时池子恒空，
+    /// 即使用户配了键也不会吃；开了 N-best 但这串输入只解出一种整句时也不吃。
+    ///
+    /// 切换**不重新转换**：池子是这串输入的完整解码结果，换窗口只是换显示。下一次按键
+    /// 触发 `update_candidates` 时池子与窗口一并重置（见 `State::sentence_pool`）。
+    pub(crate) fn try_sentence_cycle_key(&self, data: &KeyEventData) -> Option<KeyAction> {
+        if data.event_type != EVENT_KEY_DOWN {
+            return None;
+        }
+        // 带 Ctrl/Alt/Cmd 的组合归宿主快捷键，不是本功能。
+        if data.modifiers & MOD_SHORTCUT != 0 {
+            return None;
+        }
+        let key = self.rt().sentence_cycle_key?;
+        if data.key_code != key.vk || (data.modifiers & MOD_SHIFT != 0) != key.shift {
+            return None;
+        }
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state: &mut State = &mut guard;
+        if state.active.is_some() || state.input_buffer.is_empty() || state.sentence_pool.len() < 2
+        {
+            return None;
+        }
+        let first = crate::handle_candidate::cycle_sentence_window(
+            &mut state.candidates,
+            &state.sentence_pool,
+            &mut state.sentence_window,
+        )?;
+        // 高亮落到窗口首条上：空格上屏的就是用户刚切到的那种解读。
+        // 直接写页码而**不经 `turn_page`**：那个会置 `paged`（「这批候选被翻过页」），
+        // 而切换整句不是翻页，`-` 键的翻页身份不该因此改变。
+        let per_page = self.per_page(state.active);
+        state.current_page = first / per_page;
+        state.selected_index = first % per_page;
+        self.clear_hover();
+        self.notify_ui_update(state);
+        // `Consumed` = 吞键、组合区不变：用户打的那串码原样留着，只换了候选内容。
+        Some(KeyAction::Consumed)
+    }
+
+    /// 启动体检：整句切换键被别的功能占着 → 告警（文案同 `warn_english_case_cycle_conflict`
+    /// 的形制：逐类点名占用方，并给出化解办法）。
+    ///
+    /// 这不是配置冲突（各自都合法），而是**运行期的优先级夺取**：整句池 ≥ 2 条时那些绑定
+    /// 按不出来。不告警的话用户只会看到「Tab 翻页有时好用有时不好用」，无从知道是谁夺走的。
+    pub(crate) fn warn_sentence_cycle_conflict(&self) {
+        let rt = self.rt();
+        let Some(key) = rt.sentence_cycle_key else {
+            return;
+        };
+        let vk = key.vk;
+        let mut owners: Vec<&str> = Vec::new();
+        if rt.session_keys.classify(vk, key.shift, true).is_some()
+            || rt.schema_session_vks.contains(&vk)
+        {
+            owners.push("会话动作 / 翻页（keys.session_actions / keys.page_keys）");
+        }
+        if rt.jump_out_keys.contains(&vk) {
+            owners.push("配对跳出键（input.auto_pair.jump_out_keys）");
+        }
+        if owners.is_empty() {
+            return;
+        }
+        warn!(
+            "整句切换键（schema.pinyin.sentence_cycle_key = {:?}）同时配作 {}；\
+             打拼音且整句算出 ≥2 条时本键归整句切换，那些功能在此期间按不出来。\
+             要保留它们：把 sentence_cycle_key 换成别的键或留空；要保留整句切换：把那些功能改绑到别的键",
+            rt.config.schema.pinyin.sentence_cycle_key,
+            owners.join(" / ")
+        );
+    }
+
     fn handle_capslock_hook_press(&self) {
         // 合成一个 keyup 事件：CapsLock 在键盘路径上本来就只有 keyup 到得了服务端
         // （见 `handle_session_action_key_up`），保持同形以免两条路径的守卫产生差异。
@@ -8355,6 +8445,9 @@ impl Coordinator {
 /// - `is_synthesized` —— 引擎新拼出来的，还是词库本就有这个词条（同文合并会给后者
 ///   补上整句身份，见该字段文档）；
 /// - `is_sentence_demoted` —— 是否已让位于精确整词（还在列表里，只是不占首位）。
+///
+/// 另带 N-best 名次 `sentence_rank`：**只在 ≥ 2 时**写成 `整句#2(…)`。最优解（名次 1）与
+/// 出厂单条整句不标号，出厂下的标记因此与 N-best 之前一字不差。
 fn sentence_debug_tag(c: &Candidate) -> Option<String> {
     if !c.is_sentence {
         return None;
@@ -8365,7 +8458,12 @@ fn sentence_debug_tag(c: &Candidate) -> Option<String> {
     } else {
         ""
     };
-    Some(format!("整句({kind}{demoted})"))
+    let rank = if c.sentence_rank >= 2 {
+        format!("#{}", c.sentence_rank)
+    } else {
+        String::new()
+    };
+    Some(format!("整句{rank}({kind}{demoted})"))
 }
 
 #[cfg(test)]
@@ -8422,6 +8520,20 @@ mod sentence_debug_tag_tests {
             Some("整句(合成·已降位)"),
             "降位是排序决策、不清 is_sentence，调试时必须看得见"
         );
+    }
+
+    #[test]
+    fn nbest_rank_shows_only_for_alternatives() {
+        let tag = |rank: u8| {
+            sentence_debug_tag(&cand(|c| {
+                c.is_sentence = true;
+                c.is_synthesized = true;
+                c.sentence_rank = rank;
+            }))
+        };
+        // 名次 1 = 最优解，与出厂单条整句同一标记。
+        assert_eq!(tag(1).as_deref(), Some("整句(合成)"));
+        assert_eq!(tag(3).as_deref(), Some("整句#3(合成)"));
     }
 }
 
