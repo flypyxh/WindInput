@@ -12,6 +12,10 @@ pub type Rgba = [u8; 4];
 /// 解析 #RRGGBB 或 #RRGGBBAA。
 pub fn parse_hex(s: &str) -> Option<Rgba> {
     let s = s.trim().trim_start_matches('#');
+    // 先挡非 ASCII：下面按字节切片，多字节字符会让切点落在字中间而 panic。
+    if !s.is_ascii() {
+        return None;
+    }
     let h = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
     match s.len() {
         6 => Some([h(0)?, h(2)?, h(4)?, 255]),
@@ -127,6 +131,10 @@ mod tests {
         assert_eq!(parse_hex("#FF8040"), Some([255, 128, 64, 255]));
         assert_eq!(parse_hex("#00000080"), Some([0, 0, 0, 128]));
         assert_eq!(parse_hex("nope"), None);
+        // 非 ASCII：6 字节的「红红」长度凑得上 6 位分支，按字节切片会切在字中间而 panic。
+        // 用户手改 config.toml 就能喂进来（角标色、语言栏主字色都走这里）。
+        assert_eq!(parse_hex("红红"), None);
+        assert_eq!(parse_hex("#红红ab"), None);
     }
 
     #[test]
