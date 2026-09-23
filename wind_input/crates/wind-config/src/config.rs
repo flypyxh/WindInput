@@ -1124,6 +1124,18 @@ pub struct PinyinGlobalConfig {
     /// 有可乘之机）。
     #[serde(default)]
     pub sentence_uses_user_words: bool,
+    /// 整句 N-best：候选列表里**露**几条整句。出厂 1 = 单条整句（改动前的行为）。
+    ///
+    /// 起因是可验证性：整句只出一条、赢者通吃，用户词（`sentence_uses_user_words`）赢了
+    /// 才看得见、输了什么线索都没有。>1 时整句块连续摆在候选最前。
+    ///
+    /// ⚠️ 默认值与 `wind_engine::pinyin::Config::default()` 那份**必须同值**。
+    #[serde(default = "default_sentence_count")]
+    pub sentence_count: u8,
+    /// 整句 N-best：解码时**算**几条（切换键的池子）。不足 `sentence_count` 时按后者抬，
+    /// 上限 8（引擎 `SENTENCE_COUNT_LIMIT`）。
+    #[serde(default = "default_sentence_count")]
+    pub sentence_max_count: u8,
     /// 拼音分隔策略（"auto" 等）。原 input.pinyin_separator 收拢至此。
     #[serde(default = "default_pinyin_separator")]
     pub separator: String,
@@ -1361,6 +1373,8 @@ impl Default for PinyinGlobalConfig {
             use_smart_compose: true,
             // 出厂关，理由见字段文档的三条结构事实。与引擎侧 `pinyin::Config::default()` 同值。
             sentence_uses_user_words: false,
+            sentence_count: default_sentence_count(),
+            sentence_max_count: default_sentence_count(),
             english_merge: PinyinEnglishMerge::default(),
             separator: default_pinyin_separator(),
             fuzzy: PinyinFuzzy::default(),
@@ -6550,6 +6564,12 @@ impl Default for SystemConfig {
 }
 
 // ───────────────────────── 共享 default 助手 ─────────────────────────
+
+/// 整句 N-best 两个数量的出厂值：1 = 单条整句（N-best 之前的行为）。
+/// ⚠️ 与引擎 `pinyin::Config::default()` 同值。
+fn default_sentence_count() -> u8 {
+    1
+}
 
 fn default_true() -> bool {
     true

@@ -314,8 +314,9 @@ pub struct Candidate {
     ///
     /// **为什么不直接清 `is_sentence`**：该标记的语义是「引擎对整串输入的最优解读」，
     /// 是**来源**属性；降级是**排序**决策。两者混在一个布尔里，日后任何新增的
-    /// `is_sentence` 消费方都会连带继承排序语义。目前 `is_sentence` 的唯一生产消费点是
-    /// `freq_rerank` 的顶部锚定，正是本字段要豁免的那一条。
+    /// `is_sentence` 消费方都会连带继承排序语义。（`freq_rerank` 曾对 `is_sentence` 做顶部
+    /// 锚定、本字段当时是要豁免那一条；**锚定已被移除**，见 `freq_rerank.rs` 里「整句不再
+    /// 锚定」一段 —— 现在整句靠 weight 挣位置，本字段仍由 step 6.5/6.5b 用来记录「已让位」。）
     ///
     /// **为什么不复用 `is_exact_code`**：拼音引擎按约定全体不置位该字段
     /// （见其文档「拼音引擎不置位」一条），混输下码表精确档恒先于拼音依赖这个约定；
@@ -324,6 +325,18 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_sentence_demoted: bool,
+    /// 整句 N-best 里的名次：`0` = 不是 N-best 整句；`1` = 最优解；`2..` = 备选。
+    ///
+    /// 只在 `schema.pinyin.sentence_count > 1` 时有消费者：协调器据此把整句块连续摆到
+    /// 候选最前（见 `handle_candidate.rs::place_sentence_block`）。出厂 `count = 1` 时
+    /// 最优解照样标 1，但没有任何代码读它 —— 排序仍是「整句靠 weight 挣位置」那一套。
+    ///
+    /// **不复用 `is_sentence`**：那个布尔说的是「这是一种整句解读」，同文合并时也会被
+    /// 补标到词典词条上；名次是 N-best 这一次解码的排位，两者正交。
+    ///
+    /// 引擎/协调器内部用，不推送 UI。
+    #[serde(skip)]
+    pub sentence_rank: u8,
     /// 该整句是引擎**新合成**的解读，词库里没有以它为整体的词条。
     ///
     /// ## 为什么不能用 [[is_sentence]] 代替
@@ -528,6 +541,7 @@ impl Default for Candidate {
             is_exact_code: false,
             is_sentence: false,
             is_sentence_demoted: false,
+            sentence_rank: 0,
             is_synthesized: false,
             is_split_composed: false,
             is_draft: false,

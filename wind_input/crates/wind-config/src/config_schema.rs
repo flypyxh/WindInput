@@ -284,6 +284,9 @@ static REGISTRY: &[ConfigField] = &[
     // 用户词进整句词图（S2）。**出厂 false**，且只接已晋升的用户词（不接临时词/草稿层）。
     // 整句没有 N-best ⇒ 赢者通吃，故它是一个真正会改变所有老用户整句结果的开关。
     f("schema.pinyin.sentence_uses_user_words", Bool),
+    // 整句 N-best：露几条 / 算几条（切换键的池子）。出厂 1/1 = 单条整句。
+    f("schema.pinyin.sentence_count", Int),
+    f("schema.pinyin.sentence_max_count", Int),
     f("schema.pinyin.separator", Str),
     // 单字输入（拼音侧）。与码表那份是两件独立的事、不共享取值——两种引擎对「只出单字」
     // 的诉求本就不同（码表是定长盲打，拼音只是不出词）。拼音**没有**方案级覆盖。

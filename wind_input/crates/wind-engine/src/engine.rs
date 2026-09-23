@@ -109,6 +109,14 @@ pub struct ConvertResult {
     ///
     /// 码表 / 混输 / 英文引擎恒为空串：它们的击键即码位，本就没有第二个域。
     pub shadow_code: String,
+    /// 整句 N-best 的**池子**：按名次排好、已按文本去重的全部整句（名次 1..=K）。
+    ///
+    /// 候选列表里只露前 `sentence_count` 条；池子多出来的那几条供协调器的切换键滚动窗口，
+    /// 切换时不必重新解码。**只在 `sentence_max_count > 1` 时非空**——出厂 1 时它恒空，
+    /// 协调器据此判定「没有可切换的整句」、切换键不吃键。
+    ///
+    /// 码表 / 混输 / 英文引擎恒为空：N-best 目前只接在拼音 step 2 主整句上。
+    pub sentence_pool: Vec<Candidate>,
 }
 
 /// [`ConvertOptions::admit`] 的候选准入判据。

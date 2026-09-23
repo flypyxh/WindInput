@@ -773,6 +773,19 @@ pub struct Config {
     /// ⚠️ **只接 `USER_WORDS`（已晋升），不接临时词，更不接草稿层**。S5 滑窗会造出大量
     /// 杂词，它的「用过即转正」才是质量闸；杂词若直接进整句词图，污染的是所有人的整句。
     pub sentence_uses_user_words: bool,
+    /// 整句 N-best：候选列表里**露**几条整句（step 2 主整句）。出厂 1 = 现在的行为。
+    ///
+    /// 起因是可验证性：整句只出一条、赢者通吃，用户词（S2）赢了才看得见、输了什么线索都
+    /// 没有。调到 >1 后次优整句也进候选，协调器把整句块连续摆到最前（`sentence_rank`）。
+    ///
+    /// ⚠️ 只作用于 step 2 主整句。2b 混合整句 / 2c 残码整句仍各出一条：它们是特殊形态的
+    /// 补充解读（2c 连消费长度都与主整句不同层），多解意义不大、叠在一起反而难辨认。
+    pub sentence_count: u8,
+    /// 整句 N-best：解码时**算**几条（切换键的池子）。`>= sentence_count`，不足时按后者抬。
+    ///
+    /// 算得多、露得少：候选列表里露 `sentence_count` 条，切换键在这 `sentence_max_count`
+    /// 条里滚动窗口，切换时不必重新解码。
+    pub sentence_max_count: u8,
     /// **双拼方案下**是否额外把击键串当全拼解释一遍（`nihao` → 「你好」）。
     ///
     /// 服务「多人共用一台机器」：主力用户打双拼，偶尔来的人只会全拼。产出的候选整体沉在
@@ -852,7 +865,28 @@ impl Default for Config {
             // 默认关：理由见字段文档的三条结构事实（赢者通吃 / 影响全体老用户 / 标定只做了截断）。
             // ⚠️ 与 `wind_config::PinyinGlobalConfig` 那份默认值**保持同值**，同 completion 两项。
             sentence_uses_user_words: false,
+            // 出厂 1/1 = 现在的行为（单条整句），K-best 在 K=1 时与单路径 DP 逐位相同。
+            // ⚠️ 与 `wind_config::PinyinGlobalConfig` 那两项**保持同值**。
+            sentence_count: 1,
+            sentence_max_count: 1,
         }
+    }
+}
+
+/// 整句 N-best 两个数量的上限。
+///
+/// 解码代价随 K 线性增长（`dp[i]` 每个位置 top-K），而候选窗一页通常 5~9 条，
+/// 整句块再大就把普通候选挤出首页了。8 是「一页装得下、再多也看不过来」的界。
+pub const SENTENCE_COUNT_LIMIT: u8 = 8;
+
+impl Config {
+    /// 规整后的 (露几条, 算几条)：两者都夹在 `1..=SENTENCE_COUNT_LIMIT`，且算的不少于露的。
+    ///
+    /// 放在这里而不是配置加载处：引擎也可能被直接构造（测试、REPL），规整只写一处。
+    pub fn sentence_counts(&self) -> (usize, usize) {
+        let show = self.sentence_count.clamp(1, SENTENCE_COUNT_LIMIT) as usize;
+        let pool = (self.sentence_max_count.clamp(1, SENTENCE_COUNT_LIMIT) as usize).max(show);
+        (show, pool)
     }
 }
 
@@ -2566,6 +2600,8 @@ impl Engine for PinyinEngine {
         // 与词典整词同文而被合并的那一支不记入——它本身就是精确整词，不存在「让位」问题。
         // 供 step 6.5 的降级判定使用（须等 step 6 并入用户/临时层后才能定夺）。
         let mut synthesized_sentence: Option<String> = None;
+        // 整句 N-best 的池子，随结果带给协调器（见 `ConvertResult::sentence_pool`）。
+        let mut sentence_pool: Vec<Candidate> = Vec::new();
 
         // 整串是否已被完整音节覆盖。**两条简拼路径共用**：step 2b 的混合整句与 step 5b/6.2
         // 的混合简拼都只在「输入里有成不了音节的字母」时才该启动，纯全拼一律不碰。
@@ -2634,52 +2670,89 @@ impl Engine for PinyinEngine {
                     });
                 }
             }
-            let result = self.viterbi.decode(&lattice, input_len);
-            // 仅接受有限概率的完整路径：解码失败时 log_prob 为 NEG_INFINITY，
-            // 不能把这种空/错误路径强插到首选位置。
-            if !result.words.is_empty() && result.log_prob.is_finite() {
+            // 整句 N-best（见 `Config::sentence_counts`）。出厂 (1, 1) 时 `decode_nbest`
+            // 走的就是原来的单路径 `decode`，下面的循环只转一圈、只进 `rank == 1` 分支，
+            // 与改动前逐位相同。
+            let (show_n, pool_k) = self.config.sentence_counts();
+            let mut seen: Vec<String> = Vec::new();
+            for result in self.viterbi.decode_nbest(&lattice, input_len, pool_k) {
+                // 仅接受有限概率的完整路径：解码失败时 log_prob 为 NEG_INFINITY，
+                // 不能把这种空/错误路径强插到首选位置。
+                if result.words.is_empty() || !result.log_prob.is_finite() {
+                    continue;
+                }
                 let sentence: String = result.words.join("");
-                if !sentence.is_empty() {
-                    // 整句优先：给予高权重置顶（log_prob 为负，原 .max(1) 会被截断淘汰）。
-                    // clamp + saturating_add 防止超长低频句的 log_prob 溢出 i32 导致沉底/panic。
-                    let weight = sentence_weight(result.log_prob, result.words.len());
+                // 不同切分可能拼出同一串字（`decode_nbest` 不去重），按文本去重后才计名次。
+                if sentence.is_empty() || seen.contains(&sentence) {
+                    continue;
+                }
+                seen.push(sentence.clone());
+                let rank = seen.len() as u8;
+                // 整句优先：给予高权重置顶（log_prob 为负，原 .max(1) 会被截断淘汰）。
+                // clamp + saturating_add 防止超长低频句的 log_prob 溢出 i32 导致沉底/panic。
+                let weight = sentence_weight(result.log_prob, result.words.len());
+                // 整句的边界 = 解码器**实际选中**的那条路径（多路径下同一串输入可有多种切法，
+                // 只有解码器知道走的是哪条）。回退到 maximum_match 仅用于解码器给不出边界的
+                // 极端情形（超 64 字节）。
+                let boundary = if result.boundary != 0 {
+                    result.boundary
+                } else {
+                    syllables_boundary_mask(&syllables, completed.len())
+                };
+                let merged =
                     if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
                         // 整句与已有候选（如精确匹配 你好）同文：提升其权重置顶，
                         // 同时抹去 is_partial（step1 标了 true，但整句是完整解读并非子短语），
                         // 否则残码场景下 is_partial=true 会在排序时被 is_partial=false 的前缀补全
                         // （如「你好吗」）压下去——后者经 trailing_partial 优化也是 false。
-                        existing.weight = existing.weight.max(weight);
-                        existing.is_partial = false;
-                        // 同文合并后它就是整句解本身，须继承整句身份，
-                        // 否则 freq_rerank 会把它当普通候选而让别的整句锚定到它之上。
-                        existing.is_sentence = true;
+                        //
+                        // ⚠️ 备选（rank ≥ 2）只在「露得出来」时才合并：露不出来的只进池子，
+                        // 不该去改一条普通候选的权重与身份。
+                        if rank == 1 || rank as usize <= show_n {
+                            existing.weight = existing.weight.max(weight);
+                            existing.is_partial = false;
+                            // 同文合并后它就是整句解本身，须继承整句身份，
+                            // 否则 freq_rerank 会把它当普通候选而让别的整句锚定到它之上。
+                            existing.is_sentence = true;
+                            existing.sentence_rank = rank;
+                        }
+                        true
                     } else {
-                        synthesized_sentence = Some(sentence.clone());
-                        candidates.insert(
-                            0,
-                            Candidate {
-                                text: sentence,
-                                // 码为完成音节前缀（不含残码），使 consumed_length=completed_len，
-                                // 整句上屏后残码留缓冲续输（你好m → 选你好留 m）。
-                                code: completed.to_string(),
-                                weight,
-                                natural_order: 0,
-                                source: CandidateSource::Pinyin,
-                                is_sentence: true,
-                                // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
-                                is_synthesized: true,
-                                // 整句的边界 = 解码器**实际选中**的那条路径（多路径下同一串
-                                // 输入可有多种切法，只有解码器知道走的是哪条）。回退到
-                                // maximum_match 仅用于解码器给不出边界的极端情形（超 64 字节）。
-                                boundary: if result.boundary != 0 {
-                                    result.boundary
-                                } else {
-                                    syllables_boundary_mask(&syllables, completed.len())
-                                },
-                                ..Default::default()
-                            },
-                        );
-                    }
+                        false
+                    };
+                let fresh = Candidate {
+                    text: sentence.clone(),
+                    // 码为完成音节前缀（不含残码），使 consumed_length=completed_len，
+                    // 整句上屏后残码留缓冲续输（你好m → 选你好留 m）。
+                    code: completed.to_string(),
+                    weight,
+                    natural_order: 0,
+                    source: CandidateSource::Pinyin,
+                    is_sentence: true,
+                    // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
+                    is_synthesized: !merged,
+                    boundary,
+                    sentence_rank: rank,
+                    ..Default::default()
+                };
+                if pool_k > 1 {
+                    sentence_pool.push(fresh.clone());
+                }
+                if merged {
+                    continue;
+                }
+                if rank == 1 {
+                    synthesized_sentence = Some(sentence);
+                    candidates.insert(0, fresh);
+                } else if rank as usize <= show_n {
+                    // 备选紧跟在已插入的整句之后。位置在这里只是初值 —— 引擎随后按层级/
+                    // 权重重排、协调器再按消费长度重排，真正把整句块连续摆到最前的是
+                    // 协调器的 `place_sentence_block`（仅 `sentence_count > 1` 时生效）。
+                    let at = candidates
+                        .iter()
+                        .position(|c| c.sentence_rank == 0)
+                        .unwrap_or(candidates.len());
+                    candidates.insert(at, fresh);
                 }
             }
         }
@@ -4132,6 +4205,7 @@ impl Engine for PinyinEngine {
             // 拼音无「全码/空码补全」概念（`single_code_*` 是码表专属）。
             completion_hints: Vec::new(),
             shadow_code,
+            sentence_pool,
         })
     }
 

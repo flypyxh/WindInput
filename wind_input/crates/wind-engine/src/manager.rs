@@ -4880,6 +4880,10 @@ impl EngineManager {
                 // 用户词进整句词图（S2）。全局项，混输的拼音子引擎同样适用：
                 // 那一侧的拼音候选也来自同一个 `PinyinEngine`，没有单独关掉的理由。
                 sentence_uses_user_words: pg.sentence_uses_user_words,
+                // 整句 N-best（露几条 / 算几条）。规整（夹界、算的不少于露的）在引擎侧
+                // `Config::sentence_counts` 里做，这里原样透传。
+                sentence_count: pg.sentence_count,
+                sentence_max_count: pg.sentence_max_count,
                 // ⚠️ 补全这两项**不按 `mix_pinyin` 分流**，与上面三项刻意不同：它们约束的是
                 // 「引擎敢预测多少你没打的音节」，这个偏好与「当前是不是混输」无关，是用户
                 // 对候选面的统一取舍。分流会让同一个设置在两种方案下表现不一致。
