@@ -1620,23 +1620,34 @@ pub trait WebDataRpc: WebDataHost {
         let r = wind_transfer::scheme::delete_package(id, &user, &system, &keep)?;
         // 级联清词库数据:仅清数据域=方案自身的(拼音族数据在共享 pinyin 域,
         // data_schema_id≠自身时跳过;文件已删读不到类型时回落自身,清空域无害)。
-        if let Some(store) = self.user_store() {
-            for sid in &r.schema_ids {
-                if self.engine_mgr().data_schema_id(sid) == *sid {
-                    store.clear_user_words(sid)?;
-                    store.clear_temp_words(sid)?;
-                    // 草稿层同属该方案的数据域：方案都删了，它记下的猜测就是垃圾。
-                    // 漏掉这一条不会立刻出错（草稿带 TTL，启动清理终会收走），
-                    // 但在那之前它们仍会被召回并跃迁——往一个已不存在的方案的临时词库里写。
-                    store.clear_drafts(sid)?;
-                    store.clear_freq(sid)?;
-                    store.clear_shadow(sid)?;
+        //
+        // 清库出错**不得跳过下方收尾**:文件此时已删,forget / 吃键集重建不跑的话,运行时
+        // 状态要到重启才与磁盘一致。故先记下错误,收尾做完再返回。
+        let cleared: anyhow::Result<()> = (|| {
+            if let Some(store) = self.user_store() {
+                for sid in &r.schema_ids {
+                    if self.engine_mgr().data_schema_id(sid) == *sid {
+                        store.clear_user_words(sid)?;
+                        store.clear_temp_words(sid)?;
+                        // 草稿层同属该方案的数据域：方案都删了，它记下的猜测就是垃圾。
+                        // 漏掉这一条不会立刻出错（草稿带 TTL，启动清理终会收走），
+                        // 但在那之前它们仍会被召回并跃迁——往一个已不存在的方案的临时词库里写。
+                        store.clear_drafts(sid)?;
+                        store.clear_freq(sid)?;
+                        store.clear_shadow(sid)?;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
         for sid in &r.schema_ids {
             self.engine_mgr().forget_deleted_schema(sid);
         }
+        // 被删方案的自定义标点 / 码元首码 / `[key_actions]` 引导键仍在吃键集里（GH#144 同根）：
+        // 不重建的话，英文态下 DLL 会继续吃它配过英半列的键、再原样吐回 ASCII（非 TSF 宿主上
+        // 即「吃了再吐」），直到重启。
+        self.refresh_schema_derived_config();
+        cleared?;
         Ok(json!({
             "ok": true,
             "deleted": r.deleted,
@@ -1713,6 +1724,12 @@ pub trait WebDataRpc: WebDataHost {
         for id in &r.schema_ids {
             self.engine_mgr().invalidate_schema(id);
         }
+        // 吃键集随之重建（GH#144 同根）：进了 `available` 的方案稍后会经 config.setItems 自愈，
+        // 但 overlay 方案（快符等）不进 `available`，它的自定义标点 / 符号码元 / 引导键会一直
+        // 被透传，直到重启。
+        if !r.schema_ids.is_empty() {
+            self.refresh_schema_derived_config();
+        }
         Ok(json!({
             "imported": r.imported,
             "conflicts": r.conflicts,
@@ -1752,6 +1769,9 @@ pub trait WebDataRpc: WebDataHost {
         // 覆盖已加载方案时失效缓存（新方案为安全 no-op），与 path 版同处置。
         for id in &r.schema_ids {
             self.engine_mgr().invalidate_schema(id);
+        }
+        if !r.schema_ids.is_empty() {
+            self.refresh_schema_derived_config(); // 同 path 版（GH#144 同根）
         }
         Ok(json!({
             "imported": r.imported,
@@ -1945,8 +1965,17 @@ pub trait WebDataRpc: WebDataHost {
             self.restore_missing_system_phrases("备份还原");
             self.rebuild_phrases();
         }
-        if touched_config {
-            self.reload_user_config();
+        // 方案文件 / 方案 override 变了：吃键集的跨方案并集随之过期（GH#144 同根）。只看这两个
+        // 前缀——`r.schemas_touched` 收的是词库 / 词频 / shadow 等**数据域**，不进并集。
+        // `reload_user_config` 成功时自带同一套重建与推送，故二者择一；它返回 `true` 表示
+        // **加载失败**（只报错、bundle 未重建），那时方案这一侧仍要单独补一次。
+        let touched_schemas = r
+            .restored
+            .iter()
+            .any(|p| p.starts_with("schemas/") || p.starts_with("schema_overrides/"));
+        let reload_failed = touched_config && self.reload_user_config();
+        if touched_schemas && (!touched_config || reload_failed) {
+            self.refresh_schema_derived_config();
         }
         if touched_charsets {
             self.reload_charsets();
@@ -9253,4 +9282,68 @@ fn dict_yaml_name(path: &std::path::Path) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod schema_key_gate_wiring_tests {
+    //! 改动方案文件 / 方案 override 的每个 RPC 落盘后都必须重建吃键集（GH#144 及同根）。
+    //!
+    //! 吃键集（DLL 据以决定哪些标点键交给 core）只在 `ConfigBundle` 构建时算一次，其中的
+    //! 跨方案并集读的正是方案文件与 override。这几个 RPC 都不经 `config.setItems`，漏接
+    //! `refresh_schema_derived_config` 的表现是「改了要重启才生效」，零日志。
+    //!
+    //! 为什么是**源码守卫**而不是端到端：导入 / 删除 / 还原写的是真实用户目录
+    //! （`Config::user_config_dir()`，由安装器的 datadir.conf 决定，测试进程改不了），跑起来
+    //! 会改开发机上正在用的配置——本文件的 scheme / theme 契约测试同样只测到「包不存在即报错」
+    //! 为止。重建本身的正确性由 wind-coordinator 的 `schema_punct_custom_mixed.rs` 端到端覆盖
+    //! （saveConfig / invalidate 两条路），这里只钉「每个入口都接上了」。
+
+    /// 取 `fn <name>(` 起到其首个 4 格缩进的闭合 `}` 为止的函数体（trait 默认方法都在 4 格
+    /// 缩进上闭合），不会越界带上下一个函数的文档注释。只扫文件中**第一个** `#[cfg(test)]`
+    /// 之前的部分——被守护的函数若挪到那之后，这里会报「找不到」而不是假绿。
+    fn fn_body(name: &str) -> &'static str {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let head = format!("fn {name}(");
+        let start = prod.find(&head).unwrap_or_else(|| {
+            panic!("找不到 {head}——改名了，或挪到了第一个 #[cfg(test)] 之后？同步更新本守卫")
+        });
+        let rest = &prod[start + head.len()..];
+        let end = rest
+            .find("\n    }\n")
+            .unwrap_or_else(|| panic!("{head} 找不到函数体的闭合行"));
+        &rest[..end]
+    }
+
+    #[test]
+    fn schema_mutating_rpcs_refresh_key_gate() {
+        for name in [
+            "web_schema_save_config",
+            "web_schema_reset_config",
+            "web_schema_delete",
+            "web_scheme_import_package",
+            "web_scheme_import_text",
+            "web_backup_restore",
+        ] {
+            assert!(
+                fn_body(name).contains("refresh_schema_derived_config()"),
+                "{name} 改了方案文件 / override，却没重建吃键集（GH#144 同根）"
+            );
+        }
+    }
+
+    /// CLI `schema set/reset` 写完 override 后调的 `schema.invalidate` 在分派表里就地实现。
+    #[test]
+    fn schema_invalidate_arm_refreshes_key_gate() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = prod
+            .find("\"schema.invalidate\" =>")
+            .expect("分派表里找不到 schema.invalidate");
+        let arm_len = prod[start..]
+            .find("\n            }")
+            .expect("schema.invalidate 臂不再是块形式？同步更新本守卫");
+        let arm = &prod[start..start + arm_len];
+        assert!(arm.contains("refresh_schema_derived_config()"));
+    }
 }
