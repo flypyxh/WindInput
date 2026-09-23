@@ -244,3 +244,109 @@ fn temp_word_in_abbrev_sentence_on_real_dict() {
         }
     }
 }
+
+/// 开销：用户词节点的**模糊分支**（`add_store_nodes` → `add_store_fuzzy_nodes`）。
+///
+/// 每个跨度 × 至多 4 条所打码切分 × 至多 64 个变体码（按码归并后）各一次 store 点查，
+/// 11 组模糊全开时是 S2 里最贵的一段。5000 条用户词模拟用久了的词库；4 / 6 / 8 音节
+/// 各一条，三种配置在同一进程里**交替**跑 3 轮，免得热身 / 频率漂移偏向某一态。
+///
+/// 模糊分支本身的增量要拿「去掉该分支」的构建另跑一遍对照（同一二进制里没有开关）。
+#[test]
+#[ignore = "依赖 build_dev/data，且是计时用例（请用 --release）"]
+fn fuzzy_store_node_cost_on_real_dict() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：找不到 build_dev/data");
+        return;
+    };
+    let db = std::env::temp_dir().join("wind_s2_fz_cost.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(wind_store::Store::open(&db).unwrap());
+
+    // 5000 条随机多音节词（2~4 音节），音节池偏向探针串里出现的音节，让点查真有命中。
+    const POOL: &[&str] = &[
+        "cai", "jiu", "duo", "lian", "wo", "ni", "jin", "tian", "ba", "shi", "zhi", "chi", "fan",
+        "xiang", "he", "yi", "qi", "hao", "de", "le", "zai", "you", "ren", "min", "zhong", "guo",
+        "sheng", "huo", "neng", "li", "lan", "nan", "fang", "hua", "ran", "can", "zan", "san",
+        "ying", "xin", "qing", "jian", "yuan", "wang", "chuan",
+    ];
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut rows = Vec::with_capacity(5000);
+    while rows.len() < 5000 {
+        let n = 2 + (next() % 3) as usize;
+        let mut code = String::new();
+        let mut boundary = 0u64;
+        let mut text = String::new();
+        for _ in 0..n {
+            boundary |= 1 << code.len();
+            code.push_str(POOL[(next() % POOL.len() as u64) as usize]);
+            text.push(char::from_u32(0x4E00 + (next() % 20000) as u32).unwrap());
+        }
+        rows.push(wind_store::wdict::WordIo {
+            code,
+            text,
+            weight: 1200,
+            count: 0,
+            boundary: Some(boundary),
+        });
+    }
+    store.import_user_words("pinyin", &rows).unwrap();
+    println!("用户词: {}", store.count_user_words("pinyin").unwrap());
+
+    let base = Config::load(Some(&dir)).unwrap_or_default();
+    let mk = |fz: bool, s2: bool| {
+        let mut c = base.clone();
+        let f = &mut c.schema.pinyin.fuzzy;
+        f.enabled = fz;
+        f.zh_z = fz;
+        f.ch_c = fz;
+        f.sh_s = fz;
+        f.n_l = fz;
+        f.f_h = fz;
+        f.r_l = fz;
+        f.an_ang = fz;
+        f.en_eng = fz;
+        f.in_ing = fz;
+        f.ian_iang = fz;
+        f.uan_uang = fz;
+        c.schema.pinyin.sentence_uses_user_words = s2;
+        EngineManager::with_store(&c, Some(&dir), Some(store.clone()))
+    };
+    let configs = [
+        ("模糊全开+S2", mk(true, true)),
+        ("模糊全开,S2关", mk(true, false)),
+        ("模糊关+S2", mk(false, true)),
+    ];
+    let probes = [
+        ("4音节", "chaijiuduolian"),
+        ("6音节", "wochaijiuduolianba"),
+        ("8音节", "nijintianchaijiuduolianba"),
+        ("8音节b", "woxiangheniyiqichifan"),
+    ];
+    const N: u32 = 30;
+    for (_, m) in &configs {
+        for (_, p) in probes {
+            let _ = m.convert(p, 100); // 热身
+        }
+    }
+    for round in 1..=3 {
+        println!("\n—— 第 {round} 轮（每格 {N} 次均值）");
+        for (label, p) in probes {
+            let mut row = format!("{label:<6} {p:<26}");
+            for (name, m) in &configs {
+                let t = std::time::Instant::now();
+                for _ in 0..N {
+                    let _ = m.convert(p, 100);
+                }
+                row += &format!(" | {name} {:>8.2?}", t.elapsed() / N);
+            }
+            println!("{row}");
+        }
+    }
+}

@@ -5,6 +5,7 @@
 
 use crate::pinyin::dag::{MaskCheck, SegGraph};
 use crate::pinyin::fuzzy::{FuzzyConfig, FuzzyMatcher};
+use std::collections::{BTreeMap, HashMap};
 use wind_dict::cached::CachedDict;
 use wind_dict::manager::DictManager;
 
@@ -165,6 +166,18 @@ const ABBREV_NODE_LIMIT: usize = 8;
 /// 同一个 code 下的用户词通常只有一两条（用户不会给同一串拼音造十个词），8 是宽松上界；
 /// 它同时是成本闸门：整句建图要遍历全部 (p, q) 跨度，每个跨度一次 redb 点查。
 const USER_NODE_LIMIT: usize = 8;
+
+/// 用户词模糊入图时，从一个起点出发、**同一音节数**上最多保留几条在途的
+/// （所打码切分 × 逐音节变体）组合（[`LatticeBuilder::add_store_fuzzy_nodes`]）。
+///
+/// 超出时按改动处数升序保留，截掉的只是模糊处数多的组合（及其后继——后继的处数只增不减）。
+/// 每条组合在它到达的终点上各是一次候选点查（按变体码归并后），故这也是成本闸门。
+///
+/// 取 256 = 旧口径「一条切分 [`super::fuzzy::MAX_FUZZY_COMBOS`](64) × 4 条切分」：
+/// 不再按切分截断之后，多切分的串（`fanganfangan…` 同音节数下有 8 条切分）要的是
+/// 「每条切分都至少保住少处模糊的那些组合」，按处数排序的同层预算正好表达这一点；
+/// 量级与旧上界持平，性能见 `pinyin_sentence_user_words_probe::fuzzy_store_node_cost_on_real_dict`。
+const USER_FUZZY_LAYER_BUDGET: usize = 256;
 
 /// 用户词入图时的**对数域加成**（[`LatticeBuilder::add_store_nodes`]）。
 ///
@@ -638,17 +651,37 @@ impl LatticeBuilder {
     ///
     /// 中间不做分布重映射：默认档位本就落在合理位置（造词晋升 800 压过 94.7% 的系统词）。
     ///
+    /// ## 模糊音（`fuzzy_config` 开了任一组时）
+    ///
+    /// 记录存的是**规范码** + 规范码坐标下的边界，按所打码点查，翘舌打法 `chaijiu` 永远撞不上
+    /// `caijiu`。每个起点另走 [`Self::add_store_fuzzy_nodes`]，打分与 [`Self::build`] 里的
+    /// 系统词模糊节点同口径（每改动一处扣 [`FUZZY_SYLLABLE_LOG_PENALTY`]），再叠用户词的截顶
+    /// 与加成。模糊全关时一次额外查询都没有。
+    ///
     /// ⚠️ 本方法由 `Config::sentence_uses_user_words` 把关，**出厂关闭**；开关的三条理由
     /// 见该字段文档（赢者通吃 / 影响全体老用户 / 标定只做了截断）。
+    ///
+    /// `require_reachable` 与同一张图的 [`Self::build`] 传同值：不可达起点上的节点 Viterbi
+    /// 永远走不到（`build` 在那里一个节点都没建，本方法的节点又只沿图边延伸），跳过它们
+    /// 不改变解码结果，只省点查。
+    #[allow(clippy::too_many_arguments)]
     pub fn add_store_nodes(
         &self,
         input: &str,
         graph: &SegGraph,
         store: &DictManager,
+        fuzzy_config: Option<&FuzzyConfig>,
+        require_reachable: bool,
         nodes: &mut [Vec<LatticeNode>],
     ) {
+        let fuzzy = fuzzy_config.filter(|f| f.any_enabled());
+        // 各音节边的变体表：同一条边会被许多起点、许多前缀组合反复展开，算一次即可。
+        let mut edge_variants: HashMap<(usize, usize), Vec<(String, usize)>> = HashMap::new();
         let input_len = input.len();
         for p in 0..input_len.min(graph.len()) {
+            if require_reachable && !graph.is_reachable(p) {
+                continue;
+            }
             for q in graph.ends_within(p, self.max_word_len) {
                 if q > input_len || q >= nodes.len() {
                     continue;
@@ -674,13 +707,16 @@ impl LatticeBuilder {
                     let log_prob = score_node(&cand.text, code, weight)
                         - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64
                         + USER_NODE_BONUS;
-                    // 约束 3：同词同起点取更优的那个分，而不是先到先得。
+                    // 约束 3：同词同起点取更优的那个分，而不是先到先得。赢了连切分一起换：
+                    // 被替换的切分同样是图上的合法路径，新切分与本条用户记录逐音节对应。
                     if let Some(existing) = nodes[q]
                         .iter_mut()
                         .find(|n| n.word == cand.text && n.start == p)
                     {
                         if log_prob > existing.log_prob {
                             existing.log_prob = log_prob;
+                            existing.syllables = slice_syllables(code, &offsets);
+                            existing.syl_mask = offsets_mask(&offsets);
                         }
                         continue;
                     }
@@ -693,6 +729,170 @@ impl LatticeBuilder {
                         log_prob,
                     });
                 }
+            }
+            if let Some(fuzzy) = fuzzy {
+                self.add_store_fuzzy_nodes(
+                    p,
+                    input,
+                    graph,
+                    store,
+                    fuzzy,
+                    &mut edge_variants,
+                    nodes,
+                );
+            }
+        }
+    }
+
+    /// [`Self::add_store_nodes`] 的模糊分支：从起点 `p` 出发的全部用户词模糊节点。
+    ///
+    /// ## 边界为什么要逐音节对
+    ///
+    /// 变体码与所打码**不同域**（`chai` 4 字节 vs `cai` 3 字节），记录的 `boundary` 不能直接套
+    /// `graph.mask_path`。做法：沿图的音节边从 `p` 逐层延伸，每走一条边就地展开该音节的变体
+    /// （[`FuzzyMatcher::fuzzy_variants_scored`]，与系统词、step 6 同一份判据），组合携带
+    /// （变体码、**变体码自己的**音节边界、所打码切分、改动处数）。命中记录的 `boundary` 必须
+    /// **恰好等于**变体边界——于是记录的每个音节都一一对应到所打码的一个音节上。节点的
+    /// `syllables` / `syl_mask` 用那条**所打码**切分，与精确节点同域（下游逐步上屏 / consumed
+    /// 都按所打码走）。
+    ///
+    /// **不先枚举路径再展开**：那样要给路径条数设上限，而截断是按图的遍历顺序截的、没有语义，
+    /// 记录唯一对得上的那条切分可能正好被截掉（`fanganfangan…` 同音节数下 8 条切分）。
+    /// 逐层延伸时各切分共享前缀，截断只发生在同层组合超出 [`USER_FUZZY_LAYER_BUDGET`] 时，
+    /// 且按改动处数截——少处模糊的组合在任何切分上都先保住。
+    ///
+    /// 比 [`Self::build`] 的系统词模糊节点**更严**：那边无边界校验、切分取 `any_path` 一条猜的；
+    /// 这边沿用精确分支的约束 2（整句节点要真值切分，`boundary == 0` 天然对不上任何变体边界）。
+    ///
+    /// ## 打分
+    ///
+    /// 与 [`Self::build`] 的系统词模糊节点同口径：`score_node(变体码)` − 每处改动
+    /// [`FUZZY_SYLLABLE_LOG_PENALTY`] − 歧义罚，再叠 [`USER_NODE_WEIGHT_CAP`] / [`USER_NODE_BONUS`]。
+    /// 同词同起点仍取较大者（约束 3）。精确优先由罚分保证：同权重时模糊那条恒多扣
+    /// ln2 × 改动处数，压不过所打码的精确命中；同一个词两份记录（精确码、规范码各一）时
+    /// 取较大者只改分数、不改出哪个词——节点上不带来源标记，没有 step 6 那种「存储码被
+    /// 改写」的问题。
+    ///
+    /// ## 成本
+    ///
+    /// 变体码按（终点, 码）归并（`xi|an` 与 `xian` 都能展开出 `xiang`），每个只点查 store 一次；
+    /// 上界 = 层数(≤ `max_word_len`) × [`USER_FUZZY_LAYER_BUDGET`]，扣掉全原音节的组合。
+    #[allow(clippy::too_many_arguments)]
+    fn add_store_fuzzy_nodes(
+        &self,
+        p: usize,
+        input: &str,
+        graph: &SegGraph,
+        store: &DictManager,
+        fuzzy: &FuzzyConfig,
+        edge_variants: &mut HashMap<(usize, usize), Vec<(String, usize)>>,
+        nodes: &mut [Vec<LatticeNode>],
+    ) {
+        /// 在途组合：(当前位置, 变体码, 变体边界, 所打码切分（相对 p 的起点偏移）, 改动处数)
+        type Combo = (usize, String, u64, Vec<usize>, usize);
+        /// 到达某终点的一种形态：(变体边界, 所打码切分, 改动处数)
+        type Shape = (u64, Vec<usize>, usize);
+        let end_limit = input.len().min(nodes.len().saturating_sub(1));
+        // (终点, 变体码) → 形态。BTreeMap：点查与建节点的顺序确定，节点次序不随哈希漂移。
+        let mut spans: BTreeMap<(usize, String), Vec<Shape>> = BTreeMap::new();
+        let mut layer: Vec<Combo> = vec![(p, String::new(), 0, Vec::new(), 0)];
+        for _ in 0..self.max_word_len {
+            let mut next: Vec<Combo> = Vec::new();
+            for (pos, variant, mask, offsets, edits) in &layer {
+                let bit = if variant.len() < 64 {
+                    1u64 << variant.len()
+                } else {
+                    0
+                };
+                let mut offs = offsets.clone();
+                offs.push(pos - p);
+                for &e in graph.edges_from(*pos) {
+                    if e > end_limit {
+                        continue;
+                    }
+                    let opts = edge_variants.entry((*pos, e)).or_insert_with(|| {
+                        let syl = &input[*pos..e];
+                        // 首项恒为原音节（0 处改动），同 `expand_syllables`。
+                        let mut v = vec![(syl.to_string(), 0)];
+                        v.extend(FuzzyMatcher::fuzzy_variants_scored(syl, fuzzy));
+                        v
+                    });
+                    for (opt, opt_edits) in opts.iter() {
+                        next.push((
+                            e,
+                            format!("{variant}{opt}"),
+                            mask | bit,
+                            offs.clone(),
+                            edits + opt_edits,
+                        ));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            if next.len() > USER_FUZZY_LAYER_BUDGET {
+                // 稳定排序后截断：结果确定，但**不是**「每层全局改动最少」的精确保证——
+                // 同改动数内部按遍历生成顺序截（先到的边、先到的变体先留），且只在本层比较：
+                // 被截掉的父组合，其后代可能比下一层留下的组合改动更少。实际会触发：11 组全开、
+                // 6 音节 4 条切分时，≤2 处改动的组合约 292 条，会在同改动数内部被截。
+                next.sort_by_key(|c| c.4);
+                next.truncate(USER_FUZZY_LAYER_BUDGET);
+            }
+            for (q, variant, mask, offsets, edits) in &next {
+                // 全原音节组合 = 所打码本身，已由精确分支处理（且带真值边界校验）。
+                if *edits > 0 {
+                    spans.entry((*q, variant.clone())).or_default().push((
+                        *mask,
+                        offsets.clone(),
+                        *edits,
+                    ));
+                }
+            }
+            layer = next;
+        }
+
+        for ((q, variant), shapes) in &spans {
+            let q = *q;
+            let code = &input[p..q];
+            for cand in store.search(variant, USER_NODE_LIMIT) {
+                if !is_sentence_store_word(&cand) {
+                    continue;
+                }
+                // 边界逐音节对上的那条切分；多条都对上时取改动最少的。
+                let Some((_, offsets, edits)) = shapes
+                    .iter()
+                    .filter(|(mask, _, _)| *mask == cand.boundary)
+                    .min_by_key(|(_, _, edits)| *edits)
+                else {
+                    continue;
+                };
+                let weight = cand.weight.min(USER_NODE_WEIGHT_CAP);
+                let log_prob = score_node(&cand.text, variant, weight)
+                    - FUZZY_SYLLABLE_LOG_PENALTY * *edits as f64
+                    - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, offsets) as f64
+                    + USER_NODE_BONUS;
+                // 约束 3。赢了连切分一起换：被替换的切分同样是图上的合法路径，
+                // 新切分与本条用户记录逐音节对应。
+                if let Some(existing) = nodes[q]
+                    .iter_mut()
+                    .find(|n| n.word == cand.text && n.start == p)
+                {
+                    if log_prob > existing.log_prob {
+                        existing.log_prob = log_prob;
+                        existing.syllables = slice_syllables(code, offsets);
+                        existing.syl_mask = offsets_mask(offsets);
+                    }
+                    continue;
+                }
+                nodes[q].push(LatticeNode {
+                    start: p,
+                    end: q,
+                    word: cand.text,
+                    syllables: slice_syllables(code, offsets),
+                    syl_mask: offsets_mask(offsets),
+                    log_prob,
+                });
             }
         }
     }

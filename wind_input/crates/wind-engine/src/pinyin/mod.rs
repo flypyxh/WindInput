@@ -1208,17 +1208,25 @@ impl PinyinEngine {
     /// 开关与 `store_layers` 的判定收在这里，调用点只写一行 —— 三处各写一遍 `if` 的话，
     /// 新增通路时漏掉判定就是「开关对那条路不生效」，而那种错在测试里长得和「功能没接」
     /// 一模一样。
+    /// `require_reachable` 传与同一张图的 `build` 相同的值。
     fn maybe_add_store_nodes(
         &self,
         input: &str,
         graph: &SegGraph,
+        require_reachable: bool,
         nodes: &mut [Vec<lattice::LatticeNode>],
     ) {
         if self.config.sentence_uses_user_words
             && let Some(store_dm) = &self.store_layers
         {
-            self.lattice_builder
-                .add_store_nodes(input, graph, store_dm, nodes);
+            self.lattice_builder.add_store_nodes(
+                input,
+                graph,
+                store_dm,
+                Some(&self.fuzzy_config),
+                require_reachable,
+                nodes,
+            );
         }
     }
 
@@ -2736,7 +2744,7 @@ impl Engine for PinyinEngine {
                 Some(&self.fuzzy_config),
                 true,
             );
-            self.maybe_add_store_nodes(completed, &seg_graph, &mut lattice_nodes);
+            self.maybe_add_store_nodes(completed, &seg_graph, true, &mut lattice_nodes);
             let input_len = completed.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
             for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
@@ -2913,7 +2921,7 @@ impl Engine for PinyinEngine {
             // S2：残码整句同样认用户词 —— 前半句用自造词、末尾还没打完，是最常见的形态
             // （`yougailunm` = 有 + 盖伦 + 残码 m）。残码那一段由上面的 partial_final
             // 节点负责，两者在同一张图上各管各的跨度。
-            self.maybe_add_store_nodes(query, &seg_graph, &mut lattice_nodes);
+            self.maybe_add_store_nodes(query, &seg_graph, true, &mut lattice_nodes);
             let full_len = query.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); full_len + 1];
             for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
@@ -3012,7 +3020,7 @@ impl Engine for PinyinEngine {
             self.lattice_builder
                 .add_abbrev_nodes(abbr_query, dict, &mut lattice_nodes);
             // S2：混合整句里**全拼那几段**也认用户词（`bzdgailun` 的 `gailun` 段）……
-            self.maybe_add_store_nodes(abbr_query, &graph, &mut lattice_nodes);
+            self.maybe_add_store_nodes(abbr_query, &graph, false, &mut lattice_nodes);
             // ……**声母段**另查用户层的简拼索引：上面那条按全拼码点查，在 `bcx` 这种声母串上
             // 必然落空，用户造的「拜城县」于是永远进不了 `bcxrmzf` 的整句。
             if self.config.sentence_uses_user_words
@@ -5051,6 +5059,231 @@ mod tests {
         assert!(!c.is_fuzzy);
         assert_eq!(c.code, "caijiuduolian");
         assert_eq!(c.meta.learn_code, None, "精确命中的码即规范码，不另带");
+    }
+
+    // ── 整句建图 S2 的用户词节点同样走模糊（`lattice::add_store_nodes`）。
+    //
+    // 记录存的是规范码 + 规范码坐标下的边界；整句按所打码的跨度点查，翘舌打法
+    // `chaijiu` 撞不上 `caijiu` ⇒ 整句里永远认不出自造的「菜就」，只能靠 step 6 的
+    // 子短语候选一段段选。系统词节点在 `build` 里早就做了模糊，用户词节点是缺的那一半。
+
+    /// [`engine_with_user_words_fuzzy`] + 打开 `sentence_uses_user_words`（`on`）。
+    fn sentence_engine_with_user_words_fuzzy(
+        tag: &str,
+        words: &[(&str, &str, u64)],
+        fz: FuzzyConfig,
+        on: bool,
+    ) -> PinyinEngine {
+        let mut eng = engine_with_user_words_fuzzy(tag, words, fz);
+        eng.config.sentence_uses_user_words = on;
+        eng
+    }
+
+    fn sentence_of(eng: &PinyinEngine, input: &str) -> Option<Candidate> {
+        eng.convert(input, 50)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|c| c.is_sentence)
+    }
+
+    /// 「菜就」caijiu（cai|jiu → 位 0/3）、「多练」duolian（duo|lian → 位 0/3）。
+    const CAIJIU_DUOLIAN: &[(&str, &str, u64)] =
+        &[("caijiu", "菜就", 0b1001), ("duolian", "多练", 0b1001)];
+
+    /// 主诉求：c=ch 下翘舌打法，整句由两个用户词拼出，且节点落在**所打码**域
+    /// （整句的码与消费长度都是用户敲的那串，分步上屏按它走）。
+    #[test]
+    fn fuzzy_sentence_joins_user_words_under_retroflex_typing() {
+        let eng = sentence_engine_with_user_words_fuzzy("fz_s2_join", CAIJIU_DUOLIAN, ch_c(), true);
+        let s = sentence_of(&eng, "chaijiuduolian").expect("应产出整句");
+        assert_eq!(s.text, "菜就多练");
+        assert_eq!(s.code, "chaijiuduolian", "整句码留用户敲的那份");
+        assert_eq!(s.consumed_length, "chaijiuduolian".len());
+        // 精确打法照旧（对照）。
+        let s = sentence_of(&eng, "caijiuduolian").expect("精确打法应产出整句");
+        assert_eq!(s.text, "菜就多练");
+    }
+
+    /// 记录边界必须**逐音节**对上变体码的切分：`ca|ijiu` 这种边界的记录不进图，
+    /// `boundary == 0` 的也不进（同精确路径的约束 2）。
+    #[test]
+    fn fuzzy_sentence_rejects_user_word_with_mismatched_boundary() {
+        for (tag, boundary) in [("fz_s2_badmask", 0b101u64), ("fz_s2_nomask", 0)] {
+            let eng = sentence_engine_with_user_words_fuzzy(
+                tag,
+                &[("caijiu", "菜就", boundary), ("duolian", "多练", 0b1001)],
+                ch_c(),
+                true,
+            );
+            let s = sentence_of(&eng, "chaijiuduolian");
+            assert!(
+                s.as_ref().is_none_or(|c| !c.text.contains("菜就")),
+                "边界 {boundary:#b} 对不上变体码切分，不得进整句，实际: {:?}",
+                s.map(|c| c.text)
+            );
+        }
+    }
+
+    /// 名次为 `rank` 的整句（N-best 下 1 = 最优解）。
+    fn sentence_ranked(eng: &PinyinEngine, input: &str, rank: u8) -> Option<String> {
+        eng.convert(input, 50)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|c| c.is_sentence && c.sentence_rank == rank)
+            .map(|c| c.text)
+    }
+
+    /// 精确优先：同一跨度上所打码精确命中「柴旧」、模糊命中「菜就」，同权重时整句取精确那条。
+    ///
+    /// 开 N-best（露 2）看第二名：「菜就多练」必须**在图里**且输掉，才证明是罚分压住了它，
+    /// 而不是模糊分支根本没把它放进来。
+    #[test]
+    fn fuzzy_sentence_prefers_exact_user_word() {
+        let mut eng = sentence_engine_with_user_words_fuzzy(
+            "fz_s2_exact",
+            &[
+                ("caijiu", "菜就", 0b1001),
+                ("chaijiu", "柴旧", 0b10001),
+                ("duolian", "多练", 0b1001),
+            ],
+            ch_c(),
+            true,
+        );
+        eng.config.sentence_count = 2;
+        eng.config.sentence_max_count = 2;
+        assert_eq!(
+            sentence_ranked(&eng, "chaijiuduolian", 1).as_deref(),
+            Some("柴旧多练"),
+            "精确命中不得被模糊那条压过"
+        );
+        assert_eq!(
+            sentence_ranked(&eng, "chaijiuduolian", 2).as_deref(),
+            Some("菜就多练"),
+            "模糊那条应在图里、排第二"
+        );
+    }
+
+    /// 记录边界对应的**不是**最短 / 最先遍历到的那条切分，模糊打法仍能进整句。
+    ///
+    /// f=h 下打 `hanganhanganhangan`：每 6 字母一段有 `han|gan`、`hang|an` 两种切法，三段共
+    /// 8 条 6 音节切分。记录「方案方案方案」的边界是 `fang|an` ×3——按图边升序遍历它是**最后**
+    /// 一条；先枚举路径再按条数截断（旧实现取前 4 条）会恰好把它截掉。
+    #[test]
+    fn fuzzy_sentence_matches_record_on_non_first_segmentation() {
+        let mut code = String::new();
+        let mut boundary = 0u64;
+        for syl in ["fang", "an", "fang", "an", "fang", "an"] {
+            boundary |= 1 << code.len();
+            code.push_str(syl);
+        }
+        let eng = sentence_engine_with_user_words_fuzzy(
+            "fz_s2_multipath",
+            &[(&code, "方案方案方案", boundary), ("ba", "吧", 0b1)],
+            FuzzyConfig {
+                f_h: true,
+                ..Default::default()
+            },
+            true,
+        );
+        let s = sentence_of(&eng, "hanganhanganhanganba").expect("应产出整句");
+        assert_eq!(s.text, "方案方案方案吧");
+        // 整句边界落在所打码域、且是记录对应的那条切分：hang|an|hang|an|hang|an|ba
+        let mut want = 0u64;
+        let mut pos = 0;
+        for syl in ["hang", "an", "hang", "an", "hang", "an", "ba"] {
+            want |= 1 << pos;
+            pos += syl.len();
+        }
+        assert_eq!(s.boundary, want);
+    }
+
+    /// 模糊用户节点赢下同词同跨度的**系统词模糊节点**时，切分一起换成用户记录对应的那条。
+    ///
+    /// 系统词「西昂」码 `xiang`，ian=iang 下 `xian` 的系统模糊节点切分取 `any_path`（最少音节）
+    /// = `xian` 一个音节——两个字配一个音节。用户记录「西昂」边界 `xi|ang`，对应所打码
+    /// `xi|an`；它带用户加成赢下该节点后，整句边界应是 `xi|an|duo|lian`。
+    #[test]
+    fn fuzzy_user_node_win_replaces_segmentation() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("xiang".to_string(), "西昂".to_string(), 500, 0);
+        let store = tmp_store("fz_s2_replace");
+        for (code, text, boundary) in [("xiang", "西昂", 0b101u64), ("duolian", "多练", 0b1001)]
+        {
+            store
+                .add_user_word("pinyin", code, text, 500, boundary)
+                .unwrap();
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        let eng = PinyinEngine::new(
+            Config {
+                sentence_uses_user_words: true,
+                ..Default::default()
+            },
+            CachedDict::Memory(raw),
+        )
+        // ian=iang 让系统词在 `xian` 单音节上模糊命中「西昂」；an=ang 让用户记录经 `xi|an` 对上。
+        .with_fuzzy(FuzzyConfig {
+            an_ang: true,
+            ian_iang: true,
+            ..Default::default()
+        })
+        .with_store_layers(Arc::new(dm));
+        let s = sentence_of(&eng, "xianduolian").expect("应产出整句");
+        assert_eq!(s.text, "西昂多练");
+        // xi|an|duo|lian → 位 0/2/4/7；系统节点那条 xian|duo|lian 是位 0/4/7。
+        assert_eq!(s.boundary, 0b1001_0101, "应换成用户记录对应的切分");
+    }
+
+    /// 精确分支同理：用户**精确**记录赢下同词同跨度的系统词节点时，切分换成用户记录那条。
+    ///
+    /// 系统词「西安」码 `xian` 无边界（`boundary == 0` 降级放行），`build` 取 `any_path`
+    /// （最少音节）= `xian` 一个音节；用户记录「西安」边界 `xi|an`，带用户加成赢下该节点后，
+    /// 整句边界应是 `xi|an|duo|lian`。
+    #[test]
+    fn exact_user_node_win_replaces_segmentation() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("xian".to_string(), "西安".to_string(), 500, 0);
+        let store = tmp_store("s2_exact_replace");
+        for (code, text, boundary) in [("xian", "西安", 0b101u64), ("duolian", "多练", 0b1001)]
+        {
+            store
+                .add_user_word("pinyin", code, text, 500, boundary)
+                .unwrap();
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        let eng = PinyinEngine::new(
+            Config {
+                sentence_uses_user_words: true,
+                ..Default::default()
+            },
+            CachedDict::Memory(raw),
+        )
+        .with_store_layers(Arc::new(dm));
+        let s = sentence_of(&eng, "xianduolian").expect("应产出整句");
+        assert_eq!(s.text, "西安多练");
+        // xi|an|duo|lian → 位 0/2/4/7；系统节点那条 xian|duo|lian 是位 0/4/7。
+        assert_eq!(s.boundary, 0b1001_0101, "应换成用户记录对应的切分");
+    }
+
+    /// 关模糊音 / 关 `sentence_uses_user_words`：整句都不认翘舌打法下的「菜就」。
+    #[test]
+    fn fuzzy_sentence_user_word_needs_both_switches() {
+        for (tag, fz, on) in [
+            ("fz_s2_fzoff", FuzzyConfig::default(), true),
+            ("fz_s2_s2off", ch_c(), false),
+        ] {
+            let eng = sentence_engine_with_user_words_fuzzy(tag, CAIJIU_DUOLIAN, fz, on);
+            let s = sentence_of(&eng, "chaijiuduolian");
+            assert!(
+                s.as_ref().is_none_or(|c| !c.text.contains("菜就")),
+                "[{tag}] 整句不应出现「菜就」，实际: {:?}",
+                s.map(|c| c.text)
+            );
+        }
     }
 
     /// 构造「带 qing 同音字洪泛的系统词典 + 用户长词」的引擎（复用于长词上浮系列测试）。

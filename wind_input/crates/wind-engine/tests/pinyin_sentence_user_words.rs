@@ -266,3 +266,74 @@ fn extreme_weight_is_capped() {
         "截断值本身与超大值应给出同样的结果"
     );
 }
+
+// ── 模糊音：用户词节点同样按模糊打法入图（`add_store_nodes` 的模糊分支）。
+//
+// 记录存规范码 + 规范码坐标的边界，整句按所打码点查 ⇒ 模糊打法下自造词进不了整句。
+// 系统词节点在 `build` 里早有模糊，用户词节点是缺的那一半。
+
+/// [`engine`] + 模糊音 n=l。
+fn engine_n_l(tag: &str, s: Arc<Store>, on: bool, fuzzy: bool) -> PinyinEngine {
+    engine(tag, s, on).with_fuzzy(wind_engine::pinyin::fuzzy::FuzzyConfig {
+        n_l: fuzzy,
+        ..Default::default()
+    })
+}
+
+/// 主诉求：n=l 下 `gainun`（`nun` 是模糊拼写层的边）整句认出 `gailun` 的「盖伦」。
+#[test]
+fn fuzzy_typing_joins_user_word_into_sentence() {
+    let s = store("fz_join");
+    s.add_user_word("pinyin", "gailun", "盖伦", 1200, 0b1001)
+        .unwrap();
+    assert_eq!(
+        sentence(&engine_n_l("fz_join_on", s, true, true), "yougainunma").as_deref(),
+        Some("有盖伦吗"),
+        "模糊打法下整句应认得用户词"
+    );
+}
+
+/// 关模糊音 / 关开关：模糊打法的整句都不出「盖伦」。
+#[test]
+fn fuzzy_user_word_sentence_needs_both_switches() {
+    for (tag, on, fuzzy) in [("fz_off", true, false), ("fz_s2off", false, true)] {
+        let s = store(tag);
+        s.add_user_word("pinyin", "gailun", "盖伦", 1200, 0b1001)
+            .unwrap();
+        let got = sentence(&engine_n_l(tag, s, on, fuzzy), "yougainunma");
+        assert!(
+            !got.as_deref().unwrap_or("").contains("盖伦"),
+            "[{tag}] 不该出「盖伦」，实际: {got:?}"
+        );
+    }
+}
+
+/// 边界对不上变体码切分（ga|ilun）、或无边界的记录，模糊分支同样拒收。
+#[test]
+fn fuzzy_branch_rejects_mismatched_boundary() {
+    for (tag, boundary) in [("fz_bad", 0b101u64), ("fz_none", 0)] {
+        let s = store(tag);
+        s.add_user_word("pinyin", "gailun", "盖伦", 1200, boundary)
+            .unwrap();
+        let got = sentence(&engine_n_l(tag, s, true, true), "yougainunma");
+        assert!(
+            !got.as_deref().unwrap_or("").contains("盖伦"),
+            "[{tag}] 边界 {boundary:#b} 不得进图，实际: {got:?}"
+        );
+    }
+}
+
+/// 开模糊但打的是精确码：与关模糊时整句逐位相同（模糊分支只多出同词的更低分节点）。
+#[test]
+fn fuzzy_on_exact_typing_unchanged() {
+    let s = store("fz_exact");
+    s.add_user_word("pinyin", "gailun", "盖伦", 1200, 0b1001)
+        .unwrap();
+    for input in ["yougailunma", "yougoulunma"] {
+        assert_eq!(
+            sentence(&engine_n_l("fz_exact_on", s.clone(), true, true), input),
+            sentence(&engine_n_l("fz_exact_off", s.clone(), true, false), input),
+            "{input}"
+        );
+    }
+}

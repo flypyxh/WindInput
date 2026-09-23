@@ -32,13 +32,25 @@ fn data_dir() -> Option<PathBuf> {
 
 /// 用户词表为 `words`、模糊音开 c=ch（`fuzzy = false` 则全关）的引擎。
 fn manager(dir: &Path, tag: &str, words: &[(&str, &str)], fuzzy: bool) -> EngineManager {
+    let words: Vec<(&str, &str, u64)> = words.iter().map(|&(c, t)| (c, t, 0)).collect();
+    manager_s2(dir, tag, &words, fuzzy, false)
+}
+
+/// 同 [`manager`]，但用户词带边界，且 `s2` 控制 `sentence_uses_user_words`（整句认用户词）。
+fn manager_s2(
+    dir: &Path,
+    tag: &str,
+    words: &[(&str, &str, u64)],
+    fuzzy: bool,
+    s2: bool,
+) -> EngineManager {
     let root = std::env::temp_dir().join(format!("wind_pinyin_fuzzy_user_{tag}"));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let store = Arc::new(Store::open(root.join("user_data.db")).expect("打开 store"));
-    for (code, text) in words {
+    for (code, text, boundary) in words {
         store
-            .add_user_word("pinyin", code, text, 1200, 0)
+            .add_user_word("pinyin", code, text, 1200, *boundary)
             .expect("写入用户词");
     }
     let mut cfg = Config::default();
@@ -46,6 +58,7 @@ fn manager(dir: &Path, tag: &str, words: &[(&str, &str)], fuzzy: bool) -> Engine
     cfg.schema.active = "pinyin".to_string();
     cfg.schema.pinyin.fuzzy.enabled = fuzzy;
     cfg.schema.pinyin.fuzzy.ch_c = fuzzy;
+    cfg.schema.pinyin.sentence_uses_user_words = s2;
     EngineManager::with_store_override(
         &cfg,
         Some(dir),
@@ -101,4 +114,67 @@ fn fuzzy_off_keeps_user_word_exact_only() {
     let mgr = manager(&dir, "off", &[("caijiuduolian", WORD)], false);
     assert_eq!(rank(&mgr, "chaijiuduolian", WORD), None);
     assert_eq!(rank(&mgr, "caijiuduolian", WORD), Some(0));
+}
+
+/// 整句那一条（`is_sentence`）的文本。
+fn sentence(mgr: &EngineManager, input: &str) -> Option<String> {
+    mgr.convert_with("pinyin", input, 50)
+        .candidates
+        .into_iter()
+        .find(|c| c.is_sentence)
+        .map(|c| c.text)
+}
+
+/// 整句（`sentence_uses_user_words` 开）：翘舌打法下用户词「菜就多练」作为**整句中的一段**
+/// 出现（`wo` + `chaijiuduolian`）。step 6 只给得出整词候选，整句这一条靠
+/// `lattice::add_store_nodes` 的模糊分支——记录存的是规范码 `caijiuduolian`。
+///
+/// ⚠️ 单拿两字词「菜就」测不出来：真实词库下 `caijiu` 精确打法的整句也是「才就」——
+/// 才 / 就 都在虚词表里，各拿 +2.0 优待并豁免每词罚，合计压过 w=1200 + 加成的用户词。
+/// 那是 S2 标定的事，与模糊无关（精确打法同样输），这里不拿它当判据。
+#[test]
+fn fuzzy_typing_puts_user_word_into_sentence() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：build_dev 拼音词库不存在");
+        return;
+    };
+    // cai|jiu|duo|lian → 位 0/3/6/9
+    let words = [("caijiuduolian", "菜就多练", 0b10_0100_1001u64)];
+    let cases = [
+        // (tag, 模糊, S2, 输入, 期望整句含「菜就多练」)
+        ("s2_on", true, true, "wochaijiuduolian", true),
+        ("s2_on_exact", true, true, "wocaijiuduolian", true),
+        ("s2_off", true, false, "wochaijiuduolian", false),
+        ("fz_off", false, true, "wochaijiuduolian", false),
+        ("fz_off_exact", false, true, "wocaijiuduolian", true),
+    ];
+    for (tag, fz, s2, input, want) in cases {
+        let got = sentence(&manager_s2(&dir, tag, &words, fz, s2), input);
+        println!("[{tag}] {input} → {got:?}");
+        assert_eq!(
+            got.as_deref().unwrap_or("").contains("菜就多练"),
+            want,
+            "[{tag}] {input} 整句: {got:?}"
+        );
+    }
+}
+
+/// 边界对不上变体码切分的记录，模糊分支不收（同精确分支的约束 2）。
+#[test]
+fn fuzzy_sentence_rejects_record_with_wrong_boundary() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：build_dev 拼音词库不存在");
+        return;
+    };
+    for (tag, boundary) in [("bad_mask", 0b10_0100_0101u64), ("no_mask", 0)] {
+        let words = [("caijiuduolian", "菜就多练", boundary)];
+        let got = sentence(
+            &manager_s2(&dir, tag, &words, true, true),
+            "wochaijiuduolian",
+        );
+        assert!(
+            !got.as_deref().unwrap_or("").contains("菜就多练"),
+            "[{tag}] 边界 {boundary:#b} 不得进整句: {got:?}"
+        );
+    }
 }
