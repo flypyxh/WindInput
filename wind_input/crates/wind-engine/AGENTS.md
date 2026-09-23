@@ -46,6 +46,11 @@
   `Candidate::sentence_rank`（0 = 非 N-best 整句）；池子在 `ConvertResult::sentence_pool`，**只在 K>1
   时非空**——协调器靠「池子 ≥ 2 条」判断切换键该不该吃。部分可达路径 `log_prob = NEG_INFINITY`
   的旧语义必须保留（曾改成 `dp[end]`，部分解就抢了首选）。混输辅助引擎在 manager 里钉成 1/1。
+- **评测看界面序，不看引擎序**：`convert` 的顺序不是用户看到的顺序——协调器以
+  `wind_candidate::candidate_display_order`（消费长度为首键）整体重排。只吃掉前缀的部分候选在引擎序里
+  能压住整串匹配、界面上恰好相反（`baichx` 下「拜城县」引擎序第 72、界面第 1）。`tests/pinyin_eval.rs`
+  出两张表：引擎序（历史基线，limit 10）与界面序（limit 300 → 同一比较器 → 同文去重，与协调器实测
+  逐条对拍一致）。E 类（短简拼 `zhge`/`zhy`/`baichx`）只有界面序有意义。
 - **整句候选与词库同量纲**：拼音侧 `SENTENCE_WEIGHT_BASE`(3e7) **已退役**（`docs/design/sentence-weight-same-axis.md`，四步全部实施），现为 `sentence_weight()` = `exp(log_prob/n + ln DICT_TOTAL)`，即各词频次的几何平均。整句要降位走 `is_sentence_demoted`（step 6.5「整句让位于精确整词」，把整句压到 `用户词weight - 1`——这是「用户把词加进词库、配再高权重也换不回首选」的修复点）。3e7 只在**码表侧**还活着，且那边的值是 1e6（`codetable/sentence.rs`）。
 - **懒加载 + single-flight 构建锁**：`ensure_loaded` 抢方案专属 build_lock 后复查，避免后台预热与首次切换重复熔大词库；不同方案可并行构建。引擎缓存仅在 `invalidate_schema`/`reload_from_config` 清除（无 LRU 驱逐，与 Go 版不同）。
 - **`convert` 永不 panic**：引擎错误降级为 `ConvertResult::default()`（空候选），勿在热路径用会 panic 的 `unwrap`。锁中毒统一 `unwrap_or_else(|e| e.into_inner())`。

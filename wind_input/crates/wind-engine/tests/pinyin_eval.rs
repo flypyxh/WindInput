@@ -41,6 +41,23 @@
 //! | **C** 多音节含缩合音 | `mm != true_syls` 且 `mm.len() >= 2` | 词跨多个 mm 音节，但内部某处边界与真值不符（西安交通大学：真值 6 音节 vs mm 5 音节） |
 //!
 //! B / C 判据互斥且穷尽（在 `mm != true_syls` 前提下按 `mm.len()` 二分），**不存在重叠**。
+//!
+//! D / E 两类不是从词库记录分类而来，是用 A 池的常用词**构造**的击键串：D = 简拼词 + 全拼词
+//! 的长串（`bzd`+`haobuhao`），E = 单个词的短简拼形态（`zhge` / `zhy` / `baichx`），见各自的
+//! 构造函数。
+//!
+//! ## 两套位次：引擎序与界面序
+//!
+//! **引擎序**（主表）= `convert` 直接给出的顺序，limit 取 [`TOP_N`]。它**不是**用户看到的顺序：
+//! 协调器还要以 `wind_candidate::candidate_display_order` 整体重排（消费长度为首键）。只吃掉
+//! 前缀的部分候选在引擎序里可以压住整串匹配，界面上恰好相反——`baichx` 下「拜城县」引擎序
+//! 第 72、界面第 1；混合整句改层级那轮，D 类引擎序 top-1 掉了 0.7 个点，界面上一条没变。
+//!
+//! **界面序**（第二张表）= 以协调器的 limit（[`UI_LIMIT`]）取候选 → 同一个
+//! `candidate_display_order` 排序 → 按文本去重（保留第一条）。协调器此后还有英文定位、
+//! 整句块等后处理，但对纯拼音出厂配置不改变顺序：与协调器实测（`Coordinator` +
+//! `debug_all_candidate_texts`）对拍过 E 类 5063 条、D 类 1000 条，首选与期望词位次**逐条一致**
+//! （2026-09-23）。**判断一个排序改动对用户的影响，看界面序。**
 //! 选 `mm.len()` 而非「是否含零声母字」作判据的理由：前者直接刻画**缺陷的结构形态**
 //! ——「占据单音节边」才是「短词被误提升」的机制本身；后者只是该形态的常见成因。
 
@@ -126,6 +143,7 @@ enum Class {
     B,
     C,
     D,
+    E,
 }
 
 impl Class {
@@ -135,6 +153,7 @@ impl Class {
             Class::B => "B_contracted_short",
             Class::C => "C_multi_syllable_contracted",
             Class::D => "D_mixed_abbrev_sentence",
+            Class::E => "E_short_abbrev",
         }
     }
 
@@ -144,6 +163,7 @@ impl Class {
             Class::B => "B 缩合音短词 (塌缩进单音节边)",
             Class::C => "C 多音节含缩合音 (跨多音节但边界不符)",
             Class::D => "D 简拼+全拼混合整句 (bzd+haobuhao)",
+            Class::E => "E 短简拼 (zhge / zhy / baichx)",
         }
     }
 
@@ -155,6 +175,7 @@ impl Class {
     fn col4_meaning(self) -> &'static str {
         match self {
             Class::D => "首词命中",
+            Class::E => "无（击键不是音节）",
             _ => "切分正确",
         }
     }
@@ -173,6 +194,8 @@ struct Sample {
     /// 用于 `partial_ok`：整句没出来时，至少要能确认「首选给对了 W1」——那是当前
     /// 分步上屏的行为，改动后不应下降。
     parts: Vec<String>,
+    /// E 类的击键形态（`R` / `L` / `F`，见 [`build_short_abbrev_samples`]）。其余类为空。
+    form: &'static str,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -313,6 +336,7 @@ fn classify(
         unigram: 0,
         class,
         parts: Vec::new(),
+        form: "",
     })
 }
 
@@ -413,8 +437,90 @@ fn build_mixed_samples(
             unigram: a.unigram.min(b.unigram),
             class: Class::D,
             parts: vec![a.text.clone(), b.text.clone()],
+            form: "",
         });
     }
+    out
+}
+
+/// E 类样本：常用词的**短简拼**击键，期望 = 该词本身。
+///
+/// 用户反馈 `zhge`→这个、`zhy`→这样、`baichx`→拜城县打不出首选，而 A~D 类都覆盖不到：
+/// A/B/C 是全拼，D 是「简拼词 + 全拼词」的长串，那里通常没有能吃满整串的简拼词与整句
+/// 竞争 —— 混合整句曾因层级错位以「之后个」压过「这个」，D 类一条都没反映出来。
+///
+/// 每个 2~3 音节常用词生成三种形态（声母取法：zh/ch/sh 保留两个字母，与用户实际打法一致）：
+/// - `R` 全声母：这样 → `zhy`、中国人 → `zhgr`；
+/// - `L` 声母 + 末音节全拼：这个 → `zhge`；
+/// - `F` 首音节全拼 + 其余声母：拜城县 → `baichx`。
+///
+/// 入池条件：
+/// - 击键串 ≥ 4 字节。更短的串不触发混合整句（`MIN_MIXED_SENTENCE_LEN`），且大多是
+///   纯声母二字简拼，歧义本就由词频裁决，不是本类要看的。
+/// - **整串不能被完整切成音节序列**（同 D 类的理由：否则走的是全拼路径）。
+/// - 同一击键串只留**词频最高**的那个词当期望：`zhge` 下「这个」与「整个」都合法，
+///   用户打它时最可能要的是更常用的那个，否则指标会被同键歧义灌满噪声。
+fn build_short_abbrev_samples(
+    pool: &[Sample],
+    trie: &SyllableTrie,
+    reject: &mut HashMap<&'static str, usize>,
+) -> Vec<Sample> {
+    // 与 D 类同一口径：只用常用词（词频前 1/3，须 `unigram > 0`）。
+    let mut common: Vec<&Sample> = pool.iter().filter(|s| s.unigram > 0).collect();
+    common.sort_by(|a, b| b.unigram.cmp(&a.unigram).then_with(|| a.text.cmp(&b.text)));
+    common.truncate((common.len() / 3).max(1));
+
+    let initial = |syl: &str| -> String {
+        if ["zh", "ch", "sh"].iter().any(|p| syl.starts_with(p)) {
+            syl[..2].to_string()
+        } else {
+            syl[..1].to_string()
+        }
+    };
+    // 击键串 → 样本；同键留词频高者（`common` 已按词频降序，先到者即最高）。
+    let mut by_input: HashMap<String, Sample> = HashMap::new();
+    for w in common
+        .iter()
+        .filter(|s| (2..=3).contains(&s.true_syls.len()))
+    {
+        let syls = &w.true_syls;
+        let n = syls.len();
+        let forms: [(&'static str, String); 3] = [
+            ("R", syls.iter().map(|s| initial(s)).collect()),
+            (
+                "L",
+                syls[..n - 1].iter().map(|s| initial(s)).collect::<String>() + &syls[n - 1],
+            ),
+            (
+                "F",
+                syls[0].clone() + &syls[1..].iter().map(|s| initial(s)).collect::<String>(),
+            ),
+        ];
+        for (form, stroke) in forms {
+            if stroke.len() < 4 {
+                *reject.entry("E_stroke_too_short").or_default() += 1;
+                continue;
+            }
+            if Dag::build(&stroke, trie).maximum_match().concat() == stroke {
+                *reject.entry("E_stroke_is_full_pinyin").or_default() += 1;
+                continue;
+            }
+            by_input.entry(stroke.clone()).or_insert_with(|| Sample {
+                text: w.text.clone(),
+                input: stroke,
+                true_syls: syls.clone(),
+                mm: Vec::new(),
+                weight: w.weight,
+                unigram: w.unigram,
+                class: Class::E,
+                parts: Vec::new(),
+                form,
+            });
+        }
+    }
+    let mut out: Vec<Sample> = by_input.into_values().collect();
+    // HashMap 迭代序不定：先定序，抽样才可复现。
+    out.sort_by(|a, b| a.input.cmp(&b.input));
     out
 }
 
@@ -452,6 +558,7 @@ fn stratified_sample(mut pool: Vec<Sample>, n: usize, seed: u64) -> Vec<Sample> 
                 unigram: chunk[i].unigram,
                 class: chunk[i].class,
                 parts: chunk[i].parts.clone(),
+                form: chunk[i].form,
             });
         }
     }
@@ -464,6 +571,21 @@ fn stratified_sample(mut pool: Vec<Sample>, n: usize, seed: u64) -> Vec<Sample> 
 
 const TOP_N: usize = 10;
 
+/// 界面序那一路的取数上限：协调器给引擎传的就是它（见 `truncate_with_abbrev_quota` 的文档）。
+/// 引擎先排序后截断，上限不同则活过截断的候选不同，故必须与协调器同值，不能沿用 [`TOP_N`]。
+const UI_LIMIT: usize = 300;
+
+/// 界面序候选：与协调器同一个比较器排序、按文本去重（保留排序后的第一条，同协调器）。
+///
+/// 为什么可以不跑协调器：见模块文档「两套位次」一节（对拍逐条一致）。
+fn ui_candidates(mgr: &EngineManager, input: &str) -> Vec<wind_candidate::Candidate> {
+    let mut c = mgr.convert_with("pinyin", input, UI_LIMIT).candidates;
+    c.sort_by(|a, b| wind_candidate::candidate_display_order(a, b, false, false, input));
+    let mut seen = std::collections::HashSet::new();
+    c.retain(|x| seen.insert(x.text.clone()));
+    c
+}
+
 struct Miss {
     input: String,
     expect: String,
@@ -472,6 +594,8 @@ struct Miss {
     unigram: u64,
     true_syls: String,
     mm: String,
+    /// E 类的击键形态（R/L/F），其余类为空。
+    form: &'static str,
 }
 
 #[derive(Default)]
@@ -505,6 +629,14 @@ struct Score {
     ///
     /// 缺了这个区分，光看 `partial_ok` 会把后者误读成前者。
     partial_recall: usize,
+    /// 界面序（见模块文档「两套位次」）的 top-1 / top-5 / MRR 累加。
+    ui_top1: usize,
+    ui_top5: usize,
+    ui_mrr_sum: f64,
+    /// 界面序未进首选的样本（`got_top1` 为界面首选）。
+    ui_misses: Vec<Miss>,
+    /// **仅 E 类**：按击键形态（R/L/F）分列的 (样本数, 界面序首选命中)。
+    forms: std::collections::BTreeMap<&'static str, (usize, usize)>,
     misses: Vec<Miss>,
     /// 切分不正确的样本明细（含失败**原因分类**，见 `SegMiss::reason`）
     seg_misses: Vec<SegMiss>,
@@ -649,12 +781,21 @@ fn pinyin_eval_report() {
     };
     *class_totals.entry(Class::D.key()).or_default() += d_pool.len();
     pools.insert(Class::D.key(), d_pool);
+    let e_pool = {
+        let a_pool = pools
+            .get(Class::A.key())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        build_short_abbrev_samples(a_pool, &trie, &mut reject)
+    };
+    *class_totals.entry(Class::E.key()).or_default() += e_pool.len();
+    pools.insert(Class::E.key(), e_pool);
 
     let gen_ms = t_gen.elapsed().as_millis();
 
     println!("\n=== 评测集生成 ({} ms) ===", gen_ms);
     println!("词库原始条目: {}", raw.len());
-    for c in [Class::A, Class::B, Class::C, Class::D] {
+    for c in [Class::A, Class::B, Class::C, Class::D, Class::E] {
         println!(
             "  {:<44} 总体 {:>7}",
             c.label(),
@@ -667,7 +808,7 @@ fn pinyin_eval_report() {
 
     // ---- 2. 抽样
     let mut samples: Vec<(Class, Vec<Sample>)> = Vec::new();
-    for c in [Class::A, Class::B, Class::C, Class::D] {
+    for c in [Class::A, Class::B, Class::C, Class::D, Class::E] {
         let pool = pools.remove(c.key()).unwrap_or_default();
         samples.push((c, stratified_sample(pool, n_per_class, seed)));
     }
@@ -687,6 +828,34 @@ fn pinyin_eval_report() {
             sc.total += 1;
             let cands = mgr.convert_with("pinyin", &s.input, TOP_N).candidates;
             let rank = cands.iter().position(|c| c.text == s.text);
+            let ui = ui_candidates(&mgr, &s.input);
+            let ui_rank = ui.iter().position(|c| c.text == s.text);
+            if let Some(r) = ui_rank {
+                if r == 0 {
+                    sc.ui_top1 += 1;
+                }
+                if r < 5 {
+                    sc.ui_top5 += 1;
+                }
+                sc.ui_mrr_sum += 1.0 / (r as f64 + 1.0);
+            }
+            if s.class == Class::E {
+                let f = sc.forms.entry(s.form).or_default();
+                f.0 += 1;
+                f.1 += usize::from(ui_rank == Some(0));
+            }
+            if ui_rank != Some(0) {
+                sc.ui_misses.push(Miss {
+                    input: s.input.clone(),
+                    expect: s.text.clone(),
+                    rank: ui_rank,
+                    got_top1: ui.first().map(|c| c.text.clone()).unwrap_or_default(),
+                    unigram: s.unigram,
+                    true_syls: s.true_syls.join("|"),
+                    mm: s.mm.join("|"),
+                    form: s.form,
+                });
+            }
             let tm = true_mask(&s.true_syls);
             // D 类：击键串与真值音节不同域（`bzd` 不是音节），切分判据无从成立。
             // 第四列改度量「首选至少给对了 W1」——当前分步上屏的实际行为。
@@ -704,7 +873,9 @@ fn pinyin_eval_report() {
                     sc.partial_recall += 1;
                 }
             }
+            // E 类击键不是音节（`zhge` 的 `zh` 是声母），切分判据无从成立，不计。
             match cands.first() {
+                _ if s.class == Class::E => {}
                 Some(top) if top.code == s.input && top.boundary != 0 && top.boundary == tm => {
                     sc.seg_ok += 1;
                 }
@@ -765,6 +936,7 @@ fn pinyin_eval_report() {
                     unigram: s.unigram,
                     true_syls: s.true_syls.join("|"),
                     mm: s.mm.join("|"),
+                    form: s.form,
                 });
             }
         }
@@ -805,6 +977,11 @@ fn pinyin_eval_report() {
         Class::D.key(),
         Class::D.col4_meaning()
     );
+    println!(
+        "  {} 的第四列恒为 0：{}。它的指标看下面的界面序表。",
+        Class::E.key(),
+        Class::E.col4_meaning()
+    );
     println!("  D 类 top-1 度量「智能组句」：简拼段目前不进 lattice/Viterbi，基线预期接近 0。");
     if let Some((_, sc, _)) = scores.iter().find(|(c, _, _)| *c == Class::D) {
         println!(
@@ -814,6 +991,41 @@ fn pinyin_eval_report() {
             Score::rate(sc.partial_recall, sc.total) * 100.0
         );
     }
+
+    println!(
+        "\n=== 界面序（convert 取 {} 条 → candidate_display_order → 同文去重；判断对用户的影响看这张）===",
+        UI_LIMIT
+    );
+    println!(
+        "{:<46} {:>6} {:>9} {:>9} {:>9}",
+        "类别", "样本", "top-1", "top-5", "MRR"
+    );
+    for (c, sc, _) in &scores {
+        println!(
+            "{:<46} {:>6} {:>8.2}% {:>8.2}% {:>9.4}",
+            c.label(),
+            sc.total,
+            Score::rate(sc.ui_top1, sc.total) * 100.0,
+            Score::rate(sc.ui_top5, sc.total) * 100.0,
+            if sc.total == 0 {
+                0.0
+            } else {
+                sc.ui_mrr_sum / sc.total as f64
+            },
+        );
+    }
+    if let Some((_, sc, _)) = scores.iter().find(|(c, _, _)| *c == Class::E) {
+        let forms: Vec<String> = sc
+            .forms
+            .iter()
+            .map(|(f, (n, hit))| format!("{f} {:.2}% (n={n})", Score::rate(*hit, *n) * 100.0))
+            .collect();
+        println!(
+            "  E 类按形态（R 全声母 zhy / L 声母+末音节 zhge / F 首音节+声母 baichx）: {}",
+            forms.join("，")
+        );
+    }
+
     println!("\n评测总耗时: {} ms（含引擎初始化 {} ms）", run_ms, load_ms);
 
     // 切分不正确的明细：按原因分桶。`wrong_split` 才是「多路径选错了切分」，
@@ -915,6 +1127,26 @@ fn pinyin_eval_report() {
         }
     }
 
+    for (c, sc, _) in &scores {
+        if *c != Class::E {
+            continue;
+        }
+        println!("\n--- {} 界面序非首选明细（前 {}）---", c.label(), dump);
+        for m in sc.ui_misses.iter().take(dump) {
+            println!(
+                "  {:<14} [{}] 期望 {:<8} 界面位次 {:<5} 界面首选 {:<10} uni={}",
+                m.input,
+                m.form,
+                m.expect,
+                m.rank
+                    .map(|r| (r + 1).to_string())
+                    .unwrap_or_else(|| "miss".into()),
+                m.got_top1,
+                m.unigram
+            );
+        }
+    }
+
     // ---- 5. 机器可读输出
     let mut j = String::new();
     j.push_str("{\n");
@@ -948,6 +1180,52 @@ fn pinyin_eval_report() {
             sc.top5,
             ms
         );
+        let _ = writeln!(
+            j,
+            "      \"ui_top1\": {:.6}, \"ui_top5\": {:.6}, \"ui_mrr\": {:.6}, \"ui_top1_hits\": {},",
+            Score::rate(sc.ui_top1, sc.total),
+            Score::rate(sc.ui_top5, sc.total),
+            if sc.total == 0 {
+                0.0
+            } else {
+                sc.ui_mrr_sum / sc.total as f64
+            },
+            sc.ui_top1
+        );
+        if *c == Class::E {
+            let forms: Vec<String> = sc
+                .forms
+                .iter()
+                .map(|(f, (n, hit))| {
+                    format!(
+                        "\"{f}\": {{ \"n\": {n}, \"ui_top1\": {:.6} }}",
+                        Score::rate(*hit, *n)
+                    )
+                })
+                .collect();
+            let _ = writeln!(j, "      \"forms\": {{ {} }},", forms.join(", "));
+        }
+        j.push_str("      \"ui_misses\": [\n");
+        for (k, m) in sc.ui_misses.iter().take(dump).enumerate() {
+            let _ = writeln!(
+                j,
+                "        {{ \"input\": \"{}\", \"expect\": \"{}\", \"rank\": {}, \"top1\": \"{}\", \"unigram\": {}, \"form\": \"{}\" }}{}",
+                json_escape(&m.input),
+                json_escape(&m.expect),
+                m.rank
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "null".into()),
+                json_escape(&m.got_top1),
+                m.unigram,
+                m.form,
+                if k + 1 == sc.ui_misses.len().min(dump) {
+                    ""
+                } else {
+                    ","
+                }
+            );
+        }
+        j.push_str("      ],\n");
         // D 类专有：首词命中率（seg_ok 对它恒为 0，不可用于对账）
         if *c == Class::D {
             let _ = writeln!(
@@ -1076,4 +1354,45 @@ fn pinyin_eval_class_census() {
     let mut rj: Vec<_> = reject.iter().collect();
     rj.sort();
     println!("\n丢弃: {:?}", rj);
+}
+
+/// E 类的形态生成与同键去重（纯逻辑，不需要词库，常规 `cargo test` 就跑）。
+#[test]
+fn short_abbrev_forms_and_dedup() {
+    let sample = |text: &str, syls: &[&str], unigram: u64| Sample {
+        text: text.into(),
+        input: syls.concat(),
+        true_syls: syls.iter().map(|s| s.to_string()).collect(),
+        mm: Vec::new(),
+        weight: unigram,
+        unigram,
+        class: Class::A,
+        parts: Vec::new(),
+        form: "",
+    };
+    // 常用词取词频前 1/3：3 个目标词 + 6 个低频填充，目标词恰好全进。
+    let mut pool = vec![
+        sample("这个", &["zhe", "ge"], 900),
+        sample("整个", &["zheng", "ge"], 800),
+        sample("拜城县", &["bai", "cheng", "xian"], 700),
+    ];
+    for i in 0..6 {
+        pool.push(sample(&format!("填{i}"), &["a", "a"], 1));
+    }
+    let trie = SyllableTrie::new();
+    let mut reject = HashMap::new();
+    let got: HashMap<String, (String, &'static str)> =
+        build_short_abbrev_samples(&pool, &trie, &mut reject)
+            .into_iter()
+            .map(|s| (s.input, (s.text, s.form)))
+            .collect();
+
+    // zh/ch/sh 保留两个字母；三种形态各就各位。
+    assert_eq!(got.get("baichx"), Some(&("拜城县".into(), "F")));
+    assert_eq!(got.get("bchxian"), Some(&("拜城县".into(), "L")));
+    assert_eq!(got.get("bchx"), Some(&("拜城县".into(), "R")));
+    // `zhge` 同时是「这个」与「整个」的 L 形态：留词频高的「这个」。
+    assert_eq!(got.get("zhge"), Some(&("这个".into(), "L")));
+    // 不足 4 字节（`zhg`）不入池。
+    assert!(!got.contains_key("zhg"), "{got:?}");
 }
