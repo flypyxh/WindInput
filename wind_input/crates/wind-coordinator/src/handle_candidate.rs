@@ -3179,18 +3179,10 @@ impl Coordinator {
         // ⇒ 走到这条路的临英上屏（鼠标点选、移动端候选栏）永远不补空格，哪怕用户把
         // `input.temp_english.commit_space` 打开了。2026-09-14 审查发现，已改。
         //
-        // ⚠️ **全角态下本路径补的是半角空格**，与键盘出口不一致：键盘经
-        // `commit_temp_english_text` 会按 `state.full_width` 转全角（U+3000），而这条
-        // overlay 路径整条都不接 `to_full_width` —— 正文本身也一样（既有缺口，非本次引入）。
-        // 本次往这条路上新加了一个空格字符，等于把那个差异扩大了一格，记在此处。
-        //
-        // ⚠️ **覆盖边界**：临英经本函数的两条入口（`select_candidate_at` 的 overlay 分支
-        // → 鼠标点选、`candidate_pull` → 移动端候选栏）**没有端到端测试**。它们的上屏不经
-        // KeyAction 返回值，而是 `push_server.push_commit_to_active` 投递；`PushServer` 没有
-        // 公开的客户端注册接口（注册在 pipe 监听里），集成测试无从观测那条通道。
-        // 现由键盘路径的 `temp_english_select_appends_space` 间接保障 —— 两条路自本次起
-        // **共用同一个判据**（就是下面这个表达式）。若日后有人把这两条路的判据拆开写，
-        // 这层间接保障立刻失效，届时必须补真测试。
+        // 临英的鼠标点选 / 移动端候选栏（`select_candidate_at`）已改走键盘同一出口
+        // `commit_temp_english_selected`，不再经本函数（此前走这里时拿主路的 `input_buffer`
+        // 判原码，临英下恒空 ⇒ 原文与变形永不补空格，全角态也不转）。`_in` 仍保留：
+        // 别的通用上屏点若在临英语境下调到这里，读的必须是临英那一份开关。
         english_text_counts_as_input(source, text, input) && self.english_space_enabled_in(state)
     }
 
@@ -4433,8 +4425,8 @@ impl Coordinator {
         let _ = self.mouse_select_action(page_local);
     }
 
-    /// [`Self::mouse_select`] 的实现，返回主输入路实际推送的 KeyAction 供测试断言
-    /// （overlay / `$CC` 命令 / 越界等不经 push 的路径返回 None）。
+    /// [`Self::mouse_select`] 的实现，返回主输入路（及临英）实际推送的 KeyAction 供测试断言
+    /// （其余 overlay / `$CC` 命令 / 越界返回 None）。
     ///
     /// 页内下标 → 绝对下标的换算在此，**页范围校验也在此**：桌面候选窗只画当前页，
     /// 点到页外即为坐标算错，必须拒绝。移动端不是这样（见 [`Self::select_candidate_at`]）。
@@ -4459,7 +4451,7 @@ impl Coordinator {
     /// 分页仍然保留、也仍然有意义：它决定空格上屏的目标与数字键的语义。这里只是把
     /// 「选哪一个」从视图坐标里解放出来。
     ///
-    /// @return 主输入路实际产生的 KeyAction（overlay / `$CC` 命令 / 越界返回 None）
+    /// @return 主输入路与临英实际产生的 KeyAction（其余 overlay / `$CC` 命令 / 越界返回 None）
     pub(crate) fn select_candidate_at(&self, idx: usize) -> Option<KeyAction> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // 联想候选就住在 `candidates` 里，故本函数**原样适用**——鼠标点选联想词与点选
@@ -4564,6 +4556,25 @@ impl Coordinator {
             self.complete_to_group_code(&mut state, &code);
             return None;
         }
+        // 临英：与键盘选词（空格 / 数字键 / 次三选键）走**同一个出口**
+        // `commit_temp_english_selected` —— 补空格按 `input.temp_english.commit_space`、全角态
+        // 补全角空格、记临英词频、退出模式都在那里。此前落到下方通用分支：`commit_candidate`
+        // 拿主路的 `input_buffer`（临英下恒空）判原码，永不补空格；也不记词频、全角态不转。
+        // 返回值照主路一样带出来，`debug_mouse_select` 由此可观测。
+        if state.active == Some(ModeKind::TempEnglish) {
+            let chinese_mode = state.chinese_mode;
+            let act = self.commit_temp_english_selected(&mut state, idx);
+            drop(state);
+            match &act {
+                // 空文本上屏：只需让宿主结束 composition（同 $CC 命令分支）。
+                KeyAction::ClearComposition => {
+                    self.push_server
+                        .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
+                }
+                _ => self.push_no_key_ctx_action(&act, chinese_mode),
+            }
+            return Some(act);
+        }
         let text = state.candidates[idx].text.clone();
         let s2t_override = state.candidates[idx].s2t_override.clone();
         let source = state.candidates[idx].source;
@@ -4592,7 +4603,7 @@ impl Coordinator {
         None
     }
 
-    /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回主输入路实际推送的 KeyAction
+    /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回主输入路（及临英）实际推送的 KeyAction
     /// （`UpdateComposition` = 分步提交，组合区留活；`InsertText` = 整串上屏）。
     pub fn debug_mouse_select(&self, page_local: usize) -> Option<KeyAction> {
         self.mouse_select_action(page_local)

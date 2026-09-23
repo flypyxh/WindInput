@@ -1164,10 +1164,8 @@ impl Coordinator {
     /// 与 `schema.english.commit_space` 已于 2026-09-14 拆开），**按出口给**而非在这里统一判：
     /// 选词类出口补，回车与标点顶屏不补（前者是终结性动作，后者补了会得到 `hello ,`）。
     ///
-    /// ⚠️ 经本函数的选词出口只有**空格 / 数字键 / 次三选键**三个。**鼠标点选不走这里**
-    /// —— overlay 模式下它走 `select_candidate_at` 的 overlay 分支（见该函数文档：
-    /// 「overlay…不经 `commit_selected`…仍走原『整串提交 + 彻底复位』路径」），
-    /// 补空格由那条路上的 `english_appends_space` 判。
+    /// 经本函数的选词出口：**空格 / 数字键 / 次三选键 / 鼠标点选 / 移动端候选栏**
+    /// （后两者经 `select_candidate_at` 的临英分支 → `commit_temp_english_selected`）。
     pub(crate) fn commit_temp_english_text(
         &self,
         state: &mut State,
@@ -1209,11 +1207,8 @@ impl Coordinator {
     /// 此前它们各自 `candidates[gi].text.clone()` 后直接上屏文本，**候选身份在出口处就丢了**
     /// ——这才是临英一直没有词频的根因，不是漏调了哪一行。
     ///
-    /// ⚠️ **鼠标点选不在其内**（原文曾写「五个选词出口……鼠标点选……一律走这里」，不实）：
-    /// overlay 模式下鼠标走 `select_candidate_at` 的 overlay 分支，整串提交后彻底复位，
-    /// **不经本函数** —— 于是它既不补空格（已于 2026-09-14 修，见 `english_appends_space`），
-    /// 也**不记词频**（`record_temp_english_selection` 同样被跳过）。后者仍未修，
-    /// 是与本条同根的既有缺口。
+    /// 鼠标点选与移动端候选栏同样经这里（`select_candidate_at` 的临英分支），补空格、全角、
+    /// 词频三件事与键盘出口逐字节一致。
     pub(crate) fn commit_temp_english_selected(&self, state: &mut State, gi: usize) -> KeyAction {
         if let Some(act) = self.temp_english_try_command(state, gi) {
             return act;

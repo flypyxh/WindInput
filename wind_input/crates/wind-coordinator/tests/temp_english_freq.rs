@@ -497,3 +497,106 @@ fn temp_english_enter_never_appends_space() {
     let text = commit_text(&coord.handle_key_event(&key(VK_RETURN, 0)));
     assert_eq!(text, "Hel", "回车上屏原文，且不补空格");
 }
+
+// ── 鼠标点选（`select_candidate_at` 的临英分支）────────────────────────────────
+//
+// 此前临英的鼠标点选落在通用 overlay 分支：`commit_candidate` 拿主路 `input_buffer`（临英下
+// 恒空）判原码 ⇒ 永不补空格；也不记词频、全角态不转。现改走键盘同一出口，下面三条逐项钉住。
+// `debug_mouse_select` 取页内下标：0 = 原文，1 = 词库首条（本文件的配置关了变形）。
+
+/// 鼠标点选词库候选上屏补空格，与数字键同口径。
+#[test]
+fn temp_english_mouse_select_appends_space() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = temp_english_config(false, "position");
+    cfg.input.temp_english.commit_space = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    enter_temp_english(&coord, "hel");
+    let picked = dict_texts(&coord).first().cloned().expect("应有词库候选");
+    let act = coord
+        .debug_mouse_select(1)
+        .expect("临英鼠标点选应带回上屏动作");
+    assert_eq!(
+        commit_text(&act),
+        format!("{picked} "),
+        "鼠标点选也应补一个空格"
+    );
+    assert_eq!(coord.debug_active_mode(), None, "上屏后退出临英");
+
+    // 原文候选（无 source）同样补——那正是旧路径判不中的一类。
+    enter_temp_english(&coord, "qzxv");
+    let act = coord
+        .debug_mouse_select(0)
+        .expect("临英鼠标点选应带回上屏动作");
+    assert_eq!(commit_text(&act), "Qzxv ", "点原文也应补一个空格");
+}
+
+/// 反向对照：开关关闭时鼠标点选不补。
+#[test]
+fn temp_english_mouse_select_no_space_when_disabled() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = temp_english_config(false, "position");
+    cfg.input.temp_english.commit_space = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    enter_temp_english(&coord, "hel");
+    let picked = dict_texts(&coord).first().cloned().expect("应有词库候选");
+    let act = coord
+        .debug_mouse_select(1)
+        .expect("临英鼠标点选应带回上屏动作");
+    assert_eq!(commit_text(&act), picked, "开关关闭时不得补空格");
+}
+
+/// 鼠标点选同样记临英词频（落 `english` 桶），与数字键同口径。
+#[test]
+fn temp_english_mouse_select_records_freq() {
+    if !has_english_schema() {
+        return;
+    }
+    let store = store_at("mouse_select");
+    let coord = Coordinator::new_headless_with_store(
+        temp_english_config(true, "position"),
+        Some(&data_dir()),
+        store.clone(),
+    );
+
+    enter_temp_english(&coord, "hel");
+    let picked = dict_texts(&coord).first().cloned().expect("应有词库候选");
+    coord
+        .debug_mouse_select(1)
+        .expect("临英鼠标点选应带回上屏动作");
+    assert!(
+        store
+            .get_freq("english", &picked.to_lowercase(), &picked)
+            .unwrap()
+            .is_some(),
+        "鼠标点选「{picked}」后应在 english 桶留下词频记录"
+    );
+}
+
+/// 全角态下鼠标点选：正文转全角、补的是全角空格（U+3000），与键盘出口一致。
+#[test]
+fn temp_english_mouse_select_full_width() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = temp_english_config(false, "position");
+    cfg.input.temp_english.commit_space = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_menu_command("toggle_width");
+
+    enter_temp_english(&coord, "qzxv");
+    let act = coord
+        .debug_mouse_select(0)
+        .expect("临英鼠标点选应带回上屏动作");
+    assert_eq!(
+        commit_text(&act),
+        "Ｑｚｘｖ\u{3000}",
+        "全角态应上屏全角正文 + 全角空格"
+    );
+}
