@@ -374,6 +374,9 @@ pub trait WebDataRpc: WebDataHost {
             "schema.invalidate" => {
                 let id = str_param(params, "id")?;
                 self.engine_mgr().invalidate_schema(id);
+                // CLI 直接写 override 后走这里，与 saveConfig 同形（GH#144）：吃键集等跨方案
+                // 派生集合不重建，方案自定义标点 / 引导键要等重启才生效。
+                self.refresh_schema_derived_config();
                 Ok(json!({ "ok": true }))
             }
             // 全量强制重建词库缓存（CLI `schema rebuild`）：失效全部引擎后删缓存产物。
@@ -1522,12 +1525,16 @@ pub trait WebDataRpc: WebDataHost {
             t.insert("dictionaries".to_string(), d.clone());
         }
         self.engine_mgr().write_schema_override(id, &ov)?;
+        // 吃键集等跨方案派生集合只在 ConfigBundle 构建时算；方案 override 不在 config.toml
+        // 里，不在此重建就要等重启 / 下次改全局设置才生效（GH#144）。
+        self.refresh_schema_derived_config();
         Ok(json!({ "ok": true }))
     }
 
     fn web_schema_reset_config(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
         self.engine_mgr().delete_schema_override(id)?;
+        self.refresh_schema_derived_config(); // 同 saveConfig（GH#144）
         Ok(json!({ "ok": true }))
     }
 

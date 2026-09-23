@@ -265,6 +265,30 @@ impl Coordinator {
         }
     }
 
+    /// 方案 override（`schema.saveConfig` / `schema.resetConfig`）落盘后，重建 `ConfigBundle`
+    /// 里的**跨方案派生集合**并下发 DLL（GH#144）。
+    ///
+    /// `SchemaKeyUnion`（方案自定义标点覆盖的键、英半列、方案 `[key_actions]` /
+    /// `[session_actions]` 的键……）只在 bundle 构建时算一次，而方案 override 不在
+    /// `config.toml` 里——设置页只改方案设置时不调 `config.setItems`，`reload_user_config`
+    /// 与 `refresh_config_in_memory` 都不会发生。不重建的表现：出字侧（`effective_punct`
+    /// 每键现查 `behavior_for`）是对的，可 `cn_passthrough_punct_chars` 仍含方案刚配的键
+    /// （`/` `@` `-` 这类中文标点表没映射的），DLL 在 `OnTestKeyDown` 就放行给宿主，
+    /// 方案表那一格静默失效，直到重启或随便改一项全局设置。
+    ///
+    /// 推送集合与 `reload_user_config` 里配置派生的那几条逐条对应；热键表经 activation
+    /// 定向推给活跃客户端（理由见那边 ★★ 注释：广播会污染 hostRenderAvail 位）。
+    pub(crate) fn refresh_schema_derived_config(&self) {
+        self.refresh_config_in_memory(|_| {});
+        self.push_custom_en_punct_config(0);
+        self.push_cn_passthrough_punct_config(0);
+        self.push_en_passthrough_punct_config(0);
+        let active_token = self.push_server.active_token();
+        if active_token != 0 {
+            self.push_activation_status(active_token);
+        }
+    }
+
     /// 下发**英文标点态**那份透传集合（[`Self::push_cn_passthrough_punct_config`] 的姊妹）。
     ///
     /// 两份都要推：标点态是运行时状态，DLL 按当下态二选一。只推中文那份的话，用户把标点

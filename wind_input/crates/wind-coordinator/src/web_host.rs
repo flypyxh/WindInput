@@ -39,6 +39,9 @@ pub trait WebDataHost {
     fn auto_comment_sources(&self) -> Vec<crate::coordinator::AutoCommentSource>;
     fn sync_chaizi_assets(&self);
     fn reload_user_config(&self) -> bool;
+    /// 方案 override 落盘后重建跨方案派生集合并下发 DLL（吃键集等），见
+    /// `Coordinator::refresh_schema_derived_config`。
+    fn refresh_schema_derived_config(&self);
     fn push_theme(&self, name: &str, is_dark: bool);
     fn theme_search_dirs(&self) -> Vec<std::path::PathBuf>;
     fn list_themes_full(&self) -> Vec<(String, String, bool)>;
@@ -247,6 +250,9 @@ impl WebDataHost for Coordinator {
     }
     fn reload_user_config(&self) -> bool {
         Coordinator::reload_user_config(self)
+    }
+    fn refresh_schema_derived_config(&self) {
+        Coordinator::refresh_schema_derived_config(self);
     }
     fn push_theme(&self, name: &str, is_dark: bool) {
         Coordinator::push_theme(self, name, is_dark);
