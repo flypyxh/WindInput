@@ -181,6 +181,11 @@ fn store_node_lookup_cost_on_real_dict() {
 ///
 /// 打印关 / 开两态的前 15 个候选（带整句名次），外加「拜城县」「拜城县人民政府」的位次。
 /// 开启态同时开 N-best（露 3 算 5），看它输了的话输给了谁。
+///
+/// ⚠️ 这里是**引擎层**顺序，不是界面顺序：协调器 `candidate_display_order` 还要按消费长度
+/// 优先整体重排一遍（`cmp_by_consumed`）。只吃掉前缀的部分候选（`baichx` 下的「白」
+/// consumed=3）在引擎层可以排在整串简拼词前面，界面上则相反——实测「拜城县」引擎层第 72、
+/// 界面第 1。量界面位次要走 `Coordinator` + `debug_all_candidate_texts`。
 #[test]
 #[ignore = "依赖 build_dev/data"]
 fn temp_word_in_abbrev_sentence_on_real_dict() {
