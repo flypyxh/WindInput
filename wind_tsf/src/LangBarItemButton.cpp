@@ -2,11 +2,10 @@
 #include "TextService.h"
 #include "IPCClient.h"
 #include "Globals.h"
+#include "LoadingIcon.h"
 #include <olectl.h>  // For CONNECT_E_* constants
-#include <dwrite.h>
 #include <shellscalingapi.h>  // GetDpiForMonitor / MDT_EFFECTIVE_DPI（符号动态取，不静态链接 shcore）
 
-#pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "advapi32.lib")
 
 // Detect if the system taskbar uses dark mode by reading the registry.
@@ -25,88 +24,6 @@ static bool IsSystemDarkMode()
         &size);
     return value == 0;
 }
-
-// DirectWrite factory (lazy-initialized, per-process lifetime)
-static IDWriteFactory* g_pDWriteFactory = nullptr;
-
-static bool EnsureDWriteFactory()
-{
-    if (!g_pDWriteFactory)
-    {
-        if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-            __uuidof(IDWriteFactory),
-            reinterpret_cast<IUnknown**>(&g_pDWriteFactory))))
-            return false;
-    }
-    return true;
-}
-
-// Minimal IDWriteTextRenderer that delegates DrawGlyphRun to IDWriteBitmapRenderTarget.
-// Matches the Go-side rendering path for consistent text quality.
-class IconTextRenderer : public IDWriteTextRenderer
-{
-public:
-    IconTextRenderer(IDWriteBitmapRenderTarget* pTarget, IDWriteRenderingParams* pParams, COLORREF color)
-        : _refCount(1), _pTarget(pTarget), _pParams(pParams), _color(color) {}
-
-    // IUnknown
-    STDMETHOD(QueryInterface)(REFIID riid, void** ppv) override
-    {
-        if (IsEqualIID(riid, IID_IUnknown) ||
-            IsEqualIID(riid, __uuidof(IDWriteTextRenderer)) ||
-            IsEqualIID(riid, __uuidof(IDWritePixelSnapping)))
-        {
-            *ppv = this;
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    STDMETHOD_(ULONG, AddRef)() override { return InterlockedIncrement(&_refCount); }
-    STDMETHOD_(ULONG, Release)() override
-    {
-        ULONG c = InterlockedDecrement(&_refCount);
-        if (c == 0) delete this;
-        return c;
-    }
-
-    // IDWritePixelSnapping
-    STDMETHOD(IsPixelSnappingDisabled)(void*, BOOL* isDisabled) override
-    {
-        *isDisabled = FALSE;  // Pixel snapping enabled for sharp small text
-        return S_OK;
-    }
-    STDMETHOD(GetCurrentTransform)(void*, DWRITE_MATRIX* transform) override
-    {
-        *transform = { 1.0f, 0, 0, 1.0f, 0, 0 };  // Identity
-        return S_OK;
-    }
-    STDMETHOD(GetPixelsPerDip)(void*, FLOAT* pixelsPerDip) override
-    {
-        *pixelsPerDip = 1.0f;
-        return S_OK;
-    }
-
-    // IDWriteTextRenderer
-    STDMETHOD(DrawGlyphRun)(void*, FLOAT baselineOriginX, FLOAT baselineOriginY,
-        DWRITE_MEASURING_MODE measuringMode, const DWRITE_GLYPH_RUN* glyphRun,
-        const DWRITE_GLYPH_RUN_DESCRIPTION*, IUnknown*) override
-    {
-        RECT blackBoxRect;
-        return _pTarget->DrawGlyphRun(baselineOriginX, baselineOriginY,
-            measuringMode, glyphRun, _pParams, _color, &blackBoxRect);
-    }
-    STDMETHOD(DrawUnderline)(void*, FLOAT, FLOAT, const DWRITE_UNDERLINE*, IUnknown*) override { return S_OK; }
-    STDMETHOD(DrawStrikethrough)(void*, FLOAT, FLOAT, const DWRITE_STRIKETHROUGH*, IUnknown*) override { return S_OK; }
-    STDMETHOD(DrawInlineObject)(void*, FLOAT, FLOAT, IDWriteInlineObject*, BOOL, BOOL, IUnknown*) override { return S_OK; }
-
-private:
-    LONG _refCount;
-    IDWriteBitmapRenderTarget* _pTarget;
-    IDWriteRenderingParams* _pParams;
-    COLORREF _color;
-};
 
 // GUID_LBI_INPUTMODE - 用于在 Windows 10/11 输入指示器显示模式图标
 // {2C77A81E-41CC-4178-A3A7-5F8A987568E1}
@@ -143,6 +60,7 @@ CLangBarItemButton::CLangBarItemButton(CTextService* pTextService)
     , _bKeyboardDisabled(FALSE)
     , _bDarkMode(IsSystemDarkMode() ? TRUE : FALSE)
     , _hMsgWnd(NULL)
+    , _bIconLoading(TRUE)
 {
     // Default input type label
     wcscpy_s(_inputTypeLabel, L"中");
@@ -249,6 +167,14 @@ STDAPI CLangBarItemButton::GetTooltipString(BSTR* pbstrToolTip)
     // 「输入法被系统禁用」这些成因——而图标只能表达「不可用」，说清是哪一种正是 tooltip
     // 的职责。那些成因服务端全都有（见 Rust 侧 InputBlock），留在这边只会让同一件事有
     // 两个负责者、各说各话。
+    //
+    // 例外是图标正显示加载中（SHM 取不到）时：服务端推来的旧文案描述的是某个模式，
+    // 与一个「…」图标对不上，这时只说正在加载。
+    if (_bIconLoading)
+    {
+        *pbstrToolTip = SysAllocString(L"清风输入法：正在加载…");
+        return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
+    }
     if (_pTextService != nullptr)
     {
         const std::wstring text = _pTextService->GetLangBarTooltip();
@@ -570,20 +496,13 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
 
     const int iconSize = _LangBarIconSizePx();
 
-    HDC hdcScreen = GetDC(NULL);
-    if (hdcScreen == NULL)
-    {
-        WIND_LOG_ERROR(L"GetIcon: GetDC failed\n");
-        return E_FAIL;
-    }
-
     // ── 优先取服务端预渲染的图标 ──
     //
     // 无条件优先取服务端预渲染图标。
     //
     // 这里曾有一道 localOnlyState 旁路：密码框 / 无可编辑上下文 / 键盘禁用三档改走本地
     // 绘制，理由是「服务端无从得知」。判定收归服务端之后该前提不再成立——那三档现在由
-    // 服务端渲进 SHM（含变淡），本地绘制只剩「服务没起来」这一个用途。
+    // 服务端渲进 SHM（含变淡），本地只剩「服务没起来」时的加载中图标。
     // 留着旁路的代价是同一件事有两个渲染实现，迟早各说各话。
     {
         std::vector<BYTE> shmPixels;
@@ -594,7 +513,7 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
             HICON hIcon = _CreateIconFromBgra(shmPixels.data(), shmSize);
             if (hIcon != NULL)
             {
-                ReleaseDC(NULL, hdcScreen);
+                _bIconLoading = FALSE;
                 // seq 是判断「这一帧是不是最新版」的唯一可靠依据：与服务端
                 // 「语言栏图标已发布 seq=N」直接对号。此前只能按两侧时间戳去凑，
                 // 而毫秒级的陈旧读恰恰是时间戳最凑不准的场合（见 ReadVariant 注释）。
@@ -607,255 +526,37 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
         }
     }
 
-    // ── 本地绘制 ──
-    // 服务未启动、SHM 尚未发布、或上面那几种本地态时走这里。
+    // ── 加载中 ──
+    // 服务未启动、SHM 尚未发布、或读取失败时走这里。
     // 这条路径**不可删除**：DLL 加载在每一个宿主进程里，而服务的可用性无法保证。
-
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
-    if (hdcMem == NULL)
+    //
+    // 这里**刻意不再画模式主字**。主字颜色由主题 / 用户配置决定，只有服务端知道；
+    // 本地按黑白画出来的「中/英」与服务端那份时而不同，用户看到的就是颜色时有时无，
+    // 且无从分辨「服务没就绪」与「正常状态」。画一个与任何主字都不像的「…」即可区分。
+    // 键盘禁用的变淡也不适用：那是服务端才判得出的状态，由服务端渲进 SHM。
+    //
+    // 兼容旧版服务（不发布图标 SHM 的 v0.117 以前）时同样显示加载中，不回退主字：
+    // 协议里没有能区分「旧服务」与「新服务尚未发布」的判据（PROTOCOL_VERSION 自
+    // v1.1 起未变、握手不带服务版本；两者在 DLL 看来都只是 OpenFileMappingW 失败），
+    // 而 DLL 与服务同一安装包发布，新 DLL + 旧服务只会出现在异常的半升级状态里。
+    // 为这种状态保留一整套 DirectWrite 主字绘制，代价是继续背着上面那个颜色问题。
+    const std::vector<uint8_t> loadingPixels =
+        loading_icon::RenderBgra(iconSize, _bDarkMode != FALSE);
+    HICON hIcon = _CreateIconFromBgra(loadingPixels.data(), iconSize);
+    if (hIcon == NULL)
     {
-        ReleaseDC(NULL, hdcScreen);
-        WIND_LOG_ERROR(L"GetIcon: CreateCompatibleDC failed\n");
+        WIND_LOG_ERROR(L"GetIcon: create loading icon failed\n");
         return E_FAIL;
     }
-
-    // Create 32-bit DIB section for better compatibility with Windows 10/11
-    BITMAPINFO bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = iconSize;
-    bmi.bmiHeader.biHeight = -iconSize;  // Top-down DIB
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* pBits = nullptr;
-    HBITMAP hBitmap = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (hBitmap == NULL || pBits == nullptr)
+    if (!_bIconLoading)
     {
-        DeleteDC(hdcMem);
-        ReleaseDC(NULL, hdcScreen);
-        WIND_LOG_ERROR(L"GetIcon: CreateDIBSection failed\n");
-        return E_FAIL;
+        // 只在进入加载中的那一下记一条：GetIcon 由系统按需回调，每次都记会刷屏。
+        WIND_LOG_INFO_FMT(L"GetIcon: icon SHM unavailable, showing loading icon size=%d\n",
+                          iconSize);
     }
-    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
-
-    // Fill with opaque black (BGRA = 0,0,0,255) so GDI can properly anti-alias
-    // against a solid background. Alpha will be replaced later from text luminance.
-    {
-        BYTE* initPixels = (BYTE*)pBits;
-        for (int i = 0; i < iconSize * iconSize; i++)
-        {
-            initPixels[i * 4 + 0] = 0;    // B
-            initPixels[i * 4 + 1] = 0;    // G
-            initPixels[i * 4 + 2] = 0;    // R
-            initPixels[i * 4 + 3] = 255;  // A = opaque
-        }
-    }
-
-    // Display text is determined by Go service via _inputTypeLabel
-    // (e.g., "中", "英", "A", "拼", "五", "双")
-    //
-    // 打不出中文的两种场景统一显「英」：密码框（键已被 IsPasswordSuppressActive 全放行）
-    // 与焦点不在可编辑控件里（键透传给宿主）。二者成因不同，但从用户视角是同一个问题的
-    // 同一个答案——「我现在敲键盘会出什么」——那就该是同一个图标；具体差异交给 tooltip。
-    //
-    // 曾用「变淡」表示无可编辑上下文，实测被否：变淡的语义是「输入法本身不可用」，
-    // 强度和出现频率都不匹配「焦点不在文本框上」这种日常状态（点按钮/列表/桌面都会进），
-    // 结果是图标频繁变灰、用户无从理解。变淡现在只留给线程级 KEYBOARD_DISABLED。
-    //
-    // ⚠ **只改这一处呈现**：_inputTypeLabel 与 _bChineseMode 的持久值一概不动。
-    // 真正的英文闸在别处（C++ 的吃键放行 + core 的 password_suppress 透传），把状态
-    // 烧进标签本身，会让「图标变英、中文照样输入」的老毛病换个地方复发。
-    // 本地绘制只在服务不可用时发生，此时没有任何「不可输入」信息可用，照常画方案标签。
-    const wchar_t* text = _inputTypeLabel;
-
-    // Draw white text on black using DirectWrite GDI-interop path
-    // (IDWriteBitmapRenderTarget + IDWriteTextRenderer — same as Go-side candidate window)
-    bool textRendered = false;
-    float fontSizeDIP = (float)(iconSize - 2);
-
-    if (EnsureDWriteFactory())
-    {
-        IDWriteGdiInterop* pGdiInterop = nullptr;
-        HRESULT hr = g_pDWriteFactory->GetGdiInterop(&pGdiInterop);
-        if (SUCCEEDED(hr))
-        {
-            IDWriteBitmapRenderTarget* pBitmapTarget = nullptr;
-            hr = pGdiInterop->CreateBitmapRenderTarget(NULL, iconSize, iconSize, &pBitmapTarget);
-            if (SUCCEEDED(hr))
-            {
-                // 1 DIP = 1 pixel (bitmap is already DPI-scaled)
-                pBitmapTarget->SetPixelsPerDip(1.0f);
-
-                // Fill bitmap target with black background
-                HDC hdcBitmap = pBitmapTarget->GetMemoryDC();
-                RECT rcFill = { 0, 0, iconSize, iconSize };
-                FillRect(hdcBitmap, &rcFill, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
-                // Grayscale rendering params: disable ClearType to avoid subpixel
-                // color artifacts in luminance-to-alpha conversion for icon rendering
-                IDWriteRenderingParams* pRenderParams = nullptr;
-                {
-                    IDWriteRenderingParams* pDefault = nullptr;
-                    g_pDWriteFactory->CreateRenderingParams(&pDefault);
-                    if (pDefault)
-                    {
-                        g_pDWriteFactory->CreateCustomRenderingParams(
-                            pDefault->GetGamma(),
-                            pDefault->GetEnhancedContrast(),
-                            0.0f,  // clearTypeLevel = 0: force grayscale AA
-                            pDefault->GetPixelGeometry(),
-                            DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-                            &pRenderParams
-                        );
-                        pDefault->Release();
-                    }
-                }
-
-                // Create text format and layout
-                IDWriteTextFormat* pTextFormat = nullptr;
-                hr = g_pDWriteFactory->CreateTextFormat(
-                    L"Microsoft YaHei UI",
-                    nullptr,
-                    DWRITE_FONT_WEIGHT_LIGHT,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    fontSizeDIP,
-                    L"zh-cn",
-                    &pTextFormat
-                );
-
-                if (SUCCEEDED(hr))
-                {
-                    pTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    pTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-                    IDWriteTextLayout* pLayout = nullptr;
-                    hr = g_pDWriteFactory->CreateTextLayout(
-                        text, (UINT32)wcslen(text), pTextFormat,
-                        (float)iconSize, (float)iconSize, &pLayout);
-
-                    if (SUCCEEDED(hr))
-                    {
-                        // Render via IconTextRenderer → BitmapRenderTarget::DrawGlyphRun
-                        IconTextRenderer* pRenderer = new IconTextRenderer(
-                            pBitmapTarget, pRenderParams, RGB(255, 255, 255));
-                        pLayout->Draw(nullptr, pRenderer, 0, 0);
-                        pRenderer->Release();
-
-                        // Copy rendered text from bitmap target to our DIB section
-                        BitBlt(hdcMem, 0, 0, iconSize, iconSize, hdcBitmap, 0, 0, SRCCOPY);
-                        textRendered = true;
-
-                        pLayout->Release();
-                    }
-                    pTextFormat->Release();
-                }
-                if (pRenderParams) pRenderParams->Release();
-                pBitmapTarget->Release();
-            }
-            pGdiInterop->Release();
-        }
-    }
-
-    // GDI fallback if DirectWrite unavailable
-    if (!textRendered)
-    {
-        SetBkMode(hdcMem, TRANSPARENT);
-        SetTextColor(hdcMem, RGB(255, 255, 255));
-        int fontSize = iconSize - 2;
-        HFONT hFont = CreateFontW(
-            -fontSize, 0, 0, 0, FW_MEDIUM,
-            FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE,
-            L"Microsoft YaHei"
-        );
-        if (hFont == NULL)
-            hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
-        HFONT hOldFont = (HFONT)SelectObject(hdcMem, hFont);
-        RECT rc = { 0, 0, iconSize, iconSize };
-        DrawTextW(hdcMem, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(hdcMem, hOldFont);
-        if (hFont != GetStockObject(DEFAULT_GUI_FONT))
-            DeleteObject(hFont);
-    }
-
-    // Convert white-on-black text to alpha mask for theme-aware rendering.
-    // Text luminance becomes alpha; RGB is set based on system theme:
-    //   Light mode: RGB(0,0,0)       → black text on light taskbar
-    //   Dark mode:  RGB(255,255,255) → white text on dark taskbar
-    // TF_LBI_STYLE_TEXTCOLORICON should handle this automatically, but some
-    // Windows versions don't reliably recolor, so we detect the theme ourselves.
-    BYTE fgColor = _bDarkMode ? 255 : 0;
-    BYTE* pixels = (BYTE*)pBits;
-    for (int i = 0; i < iconSize * iconSize; i++)
-    {
-        BYTE b = pixels[i * 4 + 0];
-        BYTE g = pixels[i * 4 + 1];
-        BYTE r = pixels[i * 4 + 2];
-        // max(r, g, b) as alpha - preserves anti-aliased edge transitions
-        BYTE alpha = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        // When keyboard is disabled, reduce alpha to 35% for dimmed appearance
-        // ⚠ 变淡**只给线程级 KEYBOARD_DISABLED**：它表示「输入法整个被禁用」，罕见且严重。
-        // 不要把「焦点不在可编辑控件里」并进来——那是日常状态（点按钮/列表/桌面都会进），
-        // 曾试过并入，实测图标频繁变灰、用户无从理解，已改为与密码框一样显「英」。
-        if (_bKeyboardDisabled)
-            alpha = (BYTE)(alpha * 90 / 255);
-        pixels[i * 4 + 0] = fgColor; // B
-        pixels[i * 4 + 1] = fgColor; // G
-        pixels[i * 4 + 2] = fgColor; // R
-        pixels[i * 4 + 3] = alpha;   // A = text coverage
-    }
-
-    // Create monochrome mask bitmap (all zeros for 32-bit alpha icon)
-    BITMAPINFO bmiMask = { 0 };
-    bmiMask.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmiMask.bmiHeader.biWidth = iconSize;
-    bmiMask.bmiHeader.biHeight = iconSize;  // Bottom-up for mask (positive height)
-    bmiMask.bmiHeader.biPlanes = 1;
-    bmiMask.bmiHeader.biBitCount = 1;
-    bmiMask.bmiHeader.biCompression = BI_RGB;
-
-    void* pMaskBits = nullptr;
-    HBITMAP hMaskBitmap = CreateDIBSection(hdcMem, &bmiMask, DIB_RGB_COLORS, &pMaskBits, NULL, 0);
-    if (hMaskBitmap == NULL || pMaskBits == nullptr)
-    {
-        SelectObject(hdcMem, hOldBitmap);
-        DeleteObject(hBitmap);
-        DeleteDC(hdcMem);
-        ReleaseDC(NULL, hdcScreen);
-        WIND_LOG_ERROR(L"GetIcon: CreateDIBSection for mask failed\n");
-        return E_FAIL;
-    }
-
-    // Fill mask with zeros (alpha channel handles transparency for 32-bit icons)
-    int maskRowBytes = ((iconSize + 31) / 32) * 4;
-    memset(pMaskBits, 0, maskRowBytes * iconSize);
-
-    SelectObject(hdcMem, hOldBitmap);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
-
-    // Create icon
-    ICONINFO iconInfo = { 0 };
-    iconInfo.fIcon = TRUE;
-    iconInfo.hbmMask = hMaskBitmap;
-    iconInfo.hbmColor = hBitmap;
-
-    *phIcon = CreateIconIndirect(&iconInfo);
-
-    DeleteObject(hBitmap);
-    DeleteObject(hMaskBitmap);
-
-    WIND_LOG_DEBUG_FMT(L"GetIcon: size=%d, text=%ls, icon=%p\n",
-              iconSize, text, *phIcon);
-
-    return (*phIcon != nullptr) ? S_OK : E_FAIL;
+    _bIconLoading = TRUE;
+    *phIcon = hIcon;
+    return S_OK;
 }
 
 STDAPI CLangBarItemButton::GetText(BSTR* pbstrText)

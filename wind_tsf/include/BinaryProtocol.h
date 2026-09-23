@@ -606,7 +606,7 @@ constexpr uint32_t ICON_SHM_MAGIC   = 0x4F434957; // 'WICO' (bytes W,I,C,O)
 // 128 KiB）不占版本号——外面没有任何一代在跑，留着历史编号只会让人误以为有兼容包袱。
 // 首个发布版本即 1；发布之后再改布局才 bump。
 // 与 Rust 侧 wind-ipc/protocol.rs 的同名常量必须逐字一致；版本不匹配时本端直接判失败
-// 退回本地绘制（图标还在、只是没角标），而不是硬读出一张错位的花屏。
+// 显示「加载中」图标，而不是硬读出一张错位的花屏。
 constexpr uint32_t ICON_SHM_VERSION = 1;
 constexpr uint32_t ICON_SHM_SIZE    = 128 * 1024;
 

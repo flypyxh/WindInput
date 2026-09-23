@@ -11,7 +11,7 @@
 // 改版本号时这里编译失败，强制回去同步那个名字。
 //
 // 漏改的后果无声——Rust 侧的 icon_shm_name 会自动带上新版本，本端还在开旧名字，
-// OpenFileMappingW 恒失败，图标退回本地绘制照常显示、只是永远不跟随标点变化。
+// OpenFileMappingW 恒失败，图标永远停在「加载中」。
 static_assert(ICON_SHM_VERSION == 1,
               "改了 ICON_SHM_VERSION 必须同步 Globals.h 里 WIND_ICON_SHM_NAME 的 _v1");
 
@@ -99,14 +99,14 @@ bool CIconShmReader::ReadVariant(int desiredSizePx, bool darkTheme,
     const uint8_t wantTheme = darkTheme ? ICON_THEME_DARK : ICON_THEME_LIGHT;
 
     // 重试 3 次：撞上并发发布的概率本就极低（发布是用户操作级频率，拷贝是微秒级），
-    // 连撞三次基本只能是 SHM 内容异常，此时退回本地绘制比继续转圈更合适。
+    // 连撞三次基本只能是 SHM 内容异常，此时退回加载中图标比继续转圈更合适。
     for (int attempt = 0; attempt < 3; ++attempt)
     {
         const uint32_t seq1 = ReadU32(base, 8);
         if (seq1 == 0)
         {
             // SHM 已建但服务还没发布过内容。若照读会得到一张全透明的空图标，
-            // 那比退回本地绘制糟得多——用户会看到图标"消失"。
+            // 那比退回加载中图标糟得多——用户会看到图标"消失"。
             return false;
         }
 

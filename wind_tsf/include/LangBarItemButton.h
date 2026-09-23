@@ -185,6 +185,9 @@ private:
     BOOL _bToolbarVisible;     // Toolbar visibility
     BOOL _bKeyboardDisabled;   // Keyboard disabled by system (线程级 compartment)
     BOOL _bDarkMode;           // System dark mode state (cached, updated on status change)
+    // 最近一次 GetIcon 给的是加载中图标（SHM 不可用）。初值 TRUE：首个 GetIcon 之前
+    // 没有任何服务端图标可言。tooltip 据此与图标保持一致。
+    BOOL _bIconLoading;
 
     // 模式主字。中文态取方案的 icon_label（"中"/"拼"/"五"/"双"），非中文态取
     // [ui.labels]（默认 "英"/"A"，用户可配，最多 2 个字符）。
@@ -195,7 +198,7 @@ private:
     // 取 8 与 STATUS_UPDATE_DATA::iconLabel 对齐，两个缓冲同进同出。
     wchar_t _inputTypeLabel[8];
 
-    // 服务端预渲染图标的读端。取不到时 GetIcon 退回本地 DirectWrite 绘制，
+    // 服务端预渲染图标的读端。取不到时 GetIcon 显示加载中图标（LoadingIcon.h），
     // 故本对象不可用**不是**错误状态（服务未启动时就是这样）。
     CIconShmReader _iconShm;
 
