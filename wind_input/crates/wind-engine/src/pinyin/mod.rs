@@ -2934,6 +2934,17 @@ impl Engine for PinyinEngine {
                 .add_abbrev_nodes(abbr_query, dict, &mut lattice_nodes);
             // S2：混合整句里**全拼那几段**也认用户词（`bzdgailun` 的 `gailun` 段）……
             self.maybe_add_store_nodes(abbr_query, &graph, &mut lattice_nodes);
+            // ……**声母段**另查用户层的简拼索引：上面那条按全拼码点查，在 `bcx` 这种声母串上
+            // 必然落空，用户造的「拜城县」于是永远进不了 `bcxrmzf` 的整句。
+            if self.config.sentence_uses_user_words
+                && let Some(store_dm) = &self.store_layers
+            {
+                self.lattice_builder.add_store_abbrev_nodes(
+                    abbr_query,
+                    store_dm,
+                    &mut lattice_nodes,
+                );
+            }
 
             let input_len = abbr_query.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
@@ -2978,17 +2989,6 @@ impl Engine for PinyinEngine {
                             natural_order: 0,
                             source: CandidateSource::Pinyin,
                             is_sentence: true,
-            // ……**声母段**另查用户层的简拼索引：上面那条按全拼码点查，在 `bcx` 这种声母串上
-            // 必然落空，用户造的「拜城县」于是永远进不了 `bcxrmzf` 的整句。
-            if self.config.sentence_uses_user_words
-                && let Some(store_dm) = &self.store_layers
-            {
-                self.lattice_builder.add_store_abbrev_nodes(
-                    abbr_query,
-                    store_dm,
-                    &mut lattice_nodes,
-                );
-            }
                             // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
                             is_synthesized: true,
                             // 解码器实际走的那条路径。简拼段每字母一位，故回填出的
