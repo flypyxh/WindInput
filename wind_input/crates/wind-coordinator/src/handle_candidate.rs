@@ -4442,6 +4442,23 @@ impl Coordinator {
         self.select_candidate_at(idx)
     }
 
+    /// `$CC` 命令候选的执行输入（无 `group_code` 时）：**当前模式自己的编码缓冲**。
+    ///
+    /// 必须与各模式键盘出口传给 [`Self::overlay_commit_command`] 的 `code` 同源——临英
+    /// `temp_english_buffer`、临拼 `temp_pinyin_buffer`、快捷输入 `mix_buffer`、快符 / 生僻字
+    /// `special_buffer`、辅助码取来源缓冲。此前鼠标路一律取主路 `input_buffer`，在 overlay
+    /// 下恒为空串：同一条命令候选，键盘选与鼠标点拿到的输入不同。
+    pub(crate) fn command_input_code<'a>(&self, state: &'a State) -> &'a str {
+        match state.active {
+            Some(ModeKind::TempEnglish) => &state.temp_english_buffer,
+            Some(ModeKind::TempPinyin) => &state.temp_pinyin_buffer,
+            Some(ModeKind::Mix(_)) => &state.mix_buffer,
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => &state.special_buffer,
+            Some(ModeKind::AuxCode) => self.aux_code_source_buffer(state),
+            _ => &state.input_buffer,
+        }
+    }
+
     /// **按绝对下标选词**：`mouse_select` 与移动端滚动候选栏的共同内核。
     ///
     /// 移动端的候选栏是一条可滚动的长列表，没有"页"这个视觉概念，用户想点第几个就点第几个。
@@ -4502,7 +4519,7 @@ impl Coordinator {
             // 命令 nav 携完整码 group_code 作执行输入；精确码命令用当前缓冲。
             let gc = state.candidates[idx].group_code.clone();
             let input = if gc.is_empty() {
-                state.input_buffer.clone()
+                self.command_input_code(&state).to_string()
             } else {
                 gc
             };
@@ -4515,10 +4532,15 @@ impl Coordinator {
             //      `ClearComposition` 清掉，而鼠标点击不在按键应答里，没有那个出口。
             // `spawn_command_action` 的文档早写明「不做任何状态重置，调用方须先退出」，
             // 这条鼠标通路是唯一漏做的。
-            self.reset_pinyin_composition(&mut state);
-            state.active = None;
+            //
+            // 复位走 `cancel_session`（按 `active` 分派各模式的退出函数，含 `notify_ui_hide`）：
+            // overlay 下键盘选命令候选走的是各自的 `exit_*`（`overlay_commit_command` 的退出
+            // 闭包），这里若只清拼音组合态，各模式后来新加的「退出必须清」字段都会从鼠标
+            // 这条路漏掉。主输入路那一臂即 `reset_pinyin_composition`，与改动前等价。
+            // 返回值（`ClearComposition`）丢弃：鼠标点击没有按键应答可承载它，下方手工推
+            // `encode_clear_composition` 就是它的等价物。
+            let _ = self.cancel_session(&mut state);
             drop(state);
-            self.notify_ui_hide();
             // 补上键盘路径由 KeyAction 承担的那一半：让宿主结束 composition。
             self.push_server
                 .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
@@ -6683,5 +6705,128 @@ mod sentence_cycle_tests {
         assert_eq!(texts(&v), vec!["你好", "词"]);
         assert_eq!(first, 0);
         assert_eq!(v[0].sentence_rank, 1, "留下的是窗口里那条");
+    }
+}
+
+#[cfg(test)]
+mod mouse_command_overlay_tests {
+    //! 鼠标点 `$CC` 命令候选（`select_candidate_at` 的命令分支）在 overlay 模式下必须与
+    //! 键盘选同一候选对齐：命令输入取**该模式自己的编码缓冲**、退出走该模式的退出函数。
+    //! 此前命令输入一律取主路 `input_buffer`（overlay 下恒空），复位只清拼音组合态。
+    use super::*;
+    use std::sync::Arc;
+    use wind_config::config::Config;
+
+    fn coord() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
+
+    /// 一条命令候选（无 `group_code` ⇒ 执行输入取当前编码缓冲）。headless 下 `self_weak`
+    /// 未装配，`spawn_command` 只告警跳过，不会真去执行。
+    fn command() -> Candidate {
+        Candidate {
+            text: "cmd".into(),
+            is_command: true,
+            phrase_template: "$CC(noop)".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 命令输入按模式取缓冲，与各模式键盘出口传给 `overlay_commit_command` 的 `code` 一致。
+    #[test]
+    fn command_input_follows_active_mode_buffer() {
+        let c = coord();
+        let mut st = c.state.lock().unwrap();
+        st.input_buffer = "main".into();
+        st.temp_english_buffer = "te".into();
+        st.temp_pinyin_buffer = "tp".into();
+        st.mix_buffer = "mx".into();
+        st.special_buffer = "sp".into();
+        let cases = [
+            (None, "main"),
+            (Some(ModeKind::TempEnglish), "te"),
+            (Some(ModeKind::TempPinyin), "tp"),
+            (Some(ModeKind::Mix(0)), "mx"),
+            (Some(ModeKind::Special(0)), "sp"),
+            (Some(ModeKind::RareChar), "sp"),
+        ];
+        for (mode, want) in cases {
+            st.active = mode;
+            assert_eq!(c.command_input_code(&st), want, "{mode:?}");
+        }
+        // 辅助码按**来源**取：主输入路来的取 `input_buffer`，临拼来的取 `temp_pinyin_buffer`。
+        st.active = Some(ModeKind::AuxCode);
+        for (origin, want) in [(None, "main"), (Some(ModeKind::TempPinyin), "tp")] {
+            st.aux_code = Some(aux_overlay(origin));
+            assert_eq!(c.command_input_code(&st), want, "AuxCode origin={origin:?}");
+        }
+    }
+
+    fn aux_overlay(origin: Option<ModeKind>) -> crate::handle_aux_code::AuxCodeOverlay {
+        crate::handle_aux_code::AuxCodeOverlay {
+            session: wind_aux_code::AuxCodeSession::new(Vec::new()),
+            preedit_base: String::new(),
+            preedit_prefix: String::new(),
+            filter_options: Default::default(),
+            origin,
+        }
+    }
+
+    /// 辅助码（从临拼进来）里鼠标点命令候选：overlay 与来源临拼的缓冲一并清掉。
+    /// 旧写法只清拼音组合态 + `active = None`，`aux_code` 与 `temp_pinyin_buffer` 都残留。
+    #[test]
+    fn aux_code_command_click_exits_cleanly() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::AuxCode);
+            st.aux_code = Some(aux_overlay(Some(ModeKind::TempPinyin)));
+            st.temp_pinyin_buffer = "li".into();
+            st.candidates = vec![command()];
+        }
+        let _ = c.select_candidate_at(0);
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.aux_code.is_none(), "辅助码 overlay 不得残留");
+        assert!(st.temp_pinyin_buffer.is_empty(), "来源临拼的缓冲不得残留");
+    }
+
+    /// 临英里鼠标点命令候选：退出走 `exit_temp_english`，缓冲 / 前缀不残留。
+    #[test]
+    fn temp_english_command_click_exits_cleanly() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::TempEnglish);
+            st.temp_english_buffer = "Hel".into();
+            st.temp_english_cursor = 3;
+            st.temp_english_prefix = "`".into();
+            st.candidates = vec![command()];
+        }
+        assert!(c.select_candidate_at(0).is_none(), "命令分支不带回上屏动作");
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.temp_english_buffer.is_empty(), "临英缓冲不得残留");
+        assert!(st.temp_english_prefix.is_empty(), "临英前缀不得残留");
+        assert_eq!(st.temp_english_cursor, 0);
+        assert!(st.candidates.is_empty());
+    }
+
+    /// 快捷输入里鼠标点命令候选：`exit_mix_mode` 清掉前缀与已转换段。
+    #[test]
+    fn mix_command_click_exits_cleanly() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::Mix(0));
+            st.mix_buffer = "ab".into();
+            st.mix_prefix = ";".into();
+            st.candidates = vec![command()];
+        }
+        let _ = c.select_candidate_at(0);
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.mix_buffer.is_empty());
+        assert!(st.mix_prefix.is_empty(), "快捷输入前缀不得残留");
     }
 }
