@@ -912,6 +912,13 @@ impl View {
         (self.mw, self.mh)
     }
 
+    /// 排布后的绝对矩形（layout 后有效）。仅供测试断言「某节点实际占多宽」——
+    /// `measured_size` 是撑开前的量，被 `fill_cross` 拉宽的部分看不到。
+    #[cfg(test)]
+    pub(crate) fn laid_rect(&self) -> Rect {
+        self.rect
+    }
+
     /// 旋转 90° 绘制子树（方向由 [`Self::rot`] 定）。
     ///
     /// 三步：**把屏幕上那块底子逆向旋转搬进临时缓冲 → 子树照常画进去 → 正向旋转搬回**。
@@ -1022,20 +1029,6 @@ impl View {
         if let Some(g) = &self.bg_gradient {
             paint_bg_gradient(buf, buf_w, buf_h, r, self.corner_radius, g);
         }
-        if let Some((bc, bw)) = self.border {
-            fill_ring(
-                buf,
-                buf_w,
-                buf_h,
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                bc,
-                self.corner_radius,
-                bw,
-            );
-        }
         // 背景填充图（叠在底色上，裁到圆角内）。
         if let Some(img) = &self.bg_image {
             paint_bg_image(buf, buf_w, buf_h, r, self.corner_radius, img);
@@ -1065,6 +1058,22 @@ impl View {
         // z<0 覆盖图（在内容下方）。
         for layer in self.layers.iter().filter(|l| l.z < 0) {
             paint_layer(buf, buf_w, buf_h, r, layer);
+        }
+        // 边框压在背景图与 z<0 层**之上**（与主题编辑器预览同序）。放在背景图之前的话，
+        // 带背景图的主题（窗口整体铺一张图）边框被图盖掉，预览里有、实机没有（t206）。
+        if let Some((bc, bw)) = self.border {
+            fill_ring(
+                buf,
+                buf_w,
+                buf_h,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                bc,
+                self.corner_radius,
+                bw,
+            );
         }
         // 文本
         if let Some(t) = &self.text {
@@ -3083,5 +3092,58 @@ mod layout_tests {
         root.collect_hits(&mut out);
         let tags: Vec<i32> = out.iter().map(|(t, _)| *t).collect();
         assert_eq!(tags, vec![0, 1, 2]); // 先序遍历；root 默认 tag=-1 不收集
+    }
+}
+
+/// 绘制层序：边框必须压在背景图之上（t206）。
+///
+/// 不 gate 平台：只用定宽定高与纯色位图，不碰文本测量。
+#[cfg(test)]
+mod paint_order_tests {
+    use super::*;
+    use crate::text::dwrite::TextRenderer;
+    use base64::Engine as _;
+
+    fn solid_png_uri(rgba: [u8; 4]) -> String {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba(rgba));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("PNG 编码");
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        )
+    }
+
+    /// 窗口整体铺一张不透明背景图、再配一圈边框：边框处必须是边框色。
+    /// 背景图先于边框画的话这里是图的绿色——预览里有边框、实机被图盖掉。
+    #[test]
+    fn border_is_painted_over_bg_image() {
+        let tr = TextRenderer::new("test", 20.0).unwrap();
+        let mut v = View::container(Layout::Row)
+            .fixed_w(20.0)
+            .fixed_h(20.0)
+            .border([255, 0, 0, 255], 3.0)
+            .bg_image(ViewImage {
+                path: solid_png_uri([0, 255, 0, 255]),
+                mode: String::new(),
+                slice: [0.0; 4],
+                slice_repeat: [false; 2],
+                opacity: 1.0,
+                tint: None,
+            });
+        v.layout(0.0, 0.0, &tr);
+        let (w, h) = (20usize, 20usize);
+        let mut buf = vec![0u8; w * h * 4];
+        v.paint(&mut buf, w as u32, h as u32, &tr);
+
+        // BGRA；取左缘中点（边框环内）与正中（只有图）。
+        let at = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            [buf[i + 2], buf[i + 1], buf[i]]
+        };
+        assert_eq!(at(1, 10), [255, 0, 0], "边框被背景图盖住了");
+        assert_eq!(at(10, 10), [0, 255, 0], "背景图本身没画出来");
     }
 }

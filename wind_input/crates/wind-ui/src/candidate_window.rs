@@ -2583,8 +2583,12 @@ impl CandidateWindow {
             // 右对齐区（mode_label / 并入的翻页栏）：band 跨轴撑满窗口内容宽 + spacer 吸收中间空白，
             // 才能把右侧内容顶到栏行末尾。二者任一存在即启用（排布：[编码] spacer [mode_label] [翻页栏]）。
             let need_right_align = !self.mode_label.is_empty() || pager_will_inline;
+            // 编码栏恒撑满窗口内容宽（与主题编辑器预览 `stretch: true` 一致）。曾经只在
+            // 清风设计主题 / 右对齐区存在时才撑满，第三方主题的编码栏就只有编码那么宽，
+            // 配了背景色后后半截露出窗口底（窗口透明时就是透明的一段）。
+            band = band.fill_cross();
             if need_right_align {
-                band = band.fill_cross().child(View::spacer());
+                band = band.child(View::spacer());
             }
             // 模式标记：右对齐到栏行末尾（在翻页栏之左）；字号取主题 mode_label 配置。
             if !self.mode_label.is_empty() {
@@ -2605,13 +2609,10 @@ impl CandidateWindow {
                 band = band.child(chip);
             }
             // 翻页栏并入（pager_will_inline）：在末尾装配段追加到此 band 末尾（spacer 右侧）。
-            // 清风设计主题（定义 separator 色）：预编辑行全宽 + 底部极淡分隔线（与候选区分）；
-            // 普通/第三方主题（无 separator）保持原行为（内容宽、无分隔线），尽量减少影响。
+            // 清风设计主题（定义 separator 色）：编码栏底部加一条极淡分隔线（与候选区分）；
+            // 普通/第三方主题（无 separator）不加。
             let sep_col = t.color("separator", [0, 0, 0, 0]);
             let preedit_designed = sep_col[3] > 0;
-            if preedit_designed && !need_right_align {
-                band = band.fill_cross();
-            }
             preedit_band = Some(band);
             if preedit_designed {
                 preedit_sep = Some(
@@ -4834,6 +4835,32 @@ mod pager_inline_tests {
         let items: Vec<CandidateItem> = ["一", "二", "三"].iter().map(|t| cand(t)).collect();
         w.update(preedit, preedit.len(), label, items, 0, -1, 1, 3);
         w
+    }
+
+    /// 独立编码栏必须撑满窗口内容宽，与主题编辑器预览一致。
+    ///
+    /// 只有编码那么宽时，配了背景色的编码栏后半截露出窗口底（窗口透明就是透明的一段）。
+    /// 取无徽标、无并入翻页栏的那档——那两者在时 band 本来就撑满，测不到这条。
+    /// 默认主题没配 `separator`，即「第三方主题」那条路径。
+    #[test]
+    fn own_preedit_bar_spans_window_content_width() {
+        let w = bar_win("", false, "a");
+        let root = laid(&w, false);
+        let band = &root.children[0];
+        assert!(
+            band.text.is_none() && !band.children.is_empty(),
+            "前置：首个子节点应为编码栏"
+        );
+        let content_w = root.measured_size().0 - root.padding.l - root.padding.r;
+        let band_w = band.laid_rect().w;
+        assert!(
+            band.children[0].measured_size().0 < content_w,
+            "前置：编码本身须比窗口内容窄，否则恒真"
+        );
+        assert_eq!(
+            band_w, content_w,
+            "编码栏只有 {band_w} 宽，窗口内容宽 {content_w}"
+        );
     }
 
     /// ★ F-17：**独立**编码栏那条落点同样要为并入的翻页栏留出宽度。
