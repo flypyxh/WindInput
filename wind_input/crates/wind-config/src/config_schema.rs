@@ -644,6 +644,11 @@ static REGISTRY: &[ConfigField] = &[
     // 角标规则表（顺序即优先级）。条目内的字段（state / corner / color_light …）
     // 是 StructList 条目的属性，不在本注册表单独登记，同 schema.mix_modes。
     f("ui.langbar.badges", StructList),
+    // 主字色：Str，"" = 跟随主题（R3 空串哨兵）。色值合法性由协调器解析时判定并回落。
+    f("ui.langbar.text_color_cn_light", Str),
+    f("ui.langbar.text_color_cn_dark", Str),
+    f("ui.langbar.text_color_en_light", Str),
+    f("ui.langbar.text_color_en_dark", Str),
     // -- ui.labels（非中文态的图标主字；中文态在方案文件的 [schema] icon_label）--
     // 类型是 Str 而非 Enum：值域是"任意 ≤2 字符"，不是一组枚举值。上限由
     // `wind_config::schema::icon_label_trunc` 在读取侧统一截断，不在这里表达——

@@ -333,6 +333,10 @@ pub struct IconSpec {
     /// 放进 spec 而非单独传参，是为了让发布器的"状态未变则跳过"判据自动把它算进去：
     /// 相位一变就是新内容，该重发；相位不变就该跳过。
     pub frame: u32,
+    /// 主字显示的是否为英文态标签（非中文态 / 不可输入态 / CapsLock 都算）。
+    ///
+    /// 只用来挑主字色（见 [`TextColors`]），不影响字形——字形由 `label` 决定。
+    pub english: bool,
 }
 
 impl Default for IconSpec {
@@ -343,6 +347,50 @@ impl Default for IconSpec {
             full_width: false,
             dimmed: false,
             frame: 0,
+            english: false,
+        }
+    }
+}
+
+/// 主字色，按「中/英 × 任务栏浅/深」四格，每格 RGBA（非预乘）。
+///
+/// 这里拿的是**合并后的最终值**（用户 > 主题 > 内置，合并在协调器一处做完），
+/// 渲染器不再回落。默认 = 改动前写死的颜色：浅色任务栏黑、深色任务栏白。
+///
+/// alpha 只作用于主字字形（字形覆盖度 × alpha）；`auto` 角标与演示跑马灯只取 RGB，
+/// 它们的不透明度各有自己的来源（`badge_alpha` / 条目色值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextColors {
+    pub cn_light: [u8; 4],
+    pub cn_dark: [u8; 4],
+    pub en_light: [u8; 4],
+    pub en_dark: [u8; 4],
+}
+
+impl TextColors {
+    /// 内置浅色任务栏主字色（黑）。
+    pub const BUILTIN_LIGHT: [u8; 4] = [0, 0, 0, 255];
+    /// 内置深色任务栏主字色（白）。
+    pub const BUILTIN_DARK: [u8; 4] = [255, 255, 255, 255];
+
+    /// 按（是否英文态，任务栏是否深色）取一格。
+    pub fn pick(&self, english: bool, dark_theme: bool) -> [u8; 4] {
+        match (english, dark_theme) {
+            (false, false) => self.cn_light,
+            (false, true) => self.cn_dark,
+            (true, false) => self.en_light,
+            (true, true) => self.en_dark,
+        }
+    }
+}
+
+impl Default for TextColors {
+    fn default() -> Self {
+        Self {
+            cn_light: Self::BUILTIN_LIGHT,
+            cn_dark: Self::BUILTIN_DARK,
+            en_light: Self::BUILTIN_LIGHT,
+            en_dark: Self::BUILTIN_DARK,
         }
     }
 }
@@ -580,6 +628,8 @@ pub struct IconRenderer {
     /// 开启后需要有人按帧推进 [`IconSpec::frame`] 并重新发布，否则画面是静止的——
     /// 渲染端只负责按相位画，不负责驱动时间。
     pub demo_animation: bool,
+    /// 主字色（最终值），见 [`TextColors`]。
+    pub text_colors: TextColors,
 }
 
 impl IconRenderer {
@@ -721,6 +771,7 @@ impl IconRenderer {
             badge_alpha: Self::DEFAULT_BADGE_ALPHA,
             badge_scale: 1.0,
             demo_animation: false,
+            text_colors: TextColors::default(),
         })
     }
 
@@ -765,8 +816,11 @@ impl IconRenderer {
     pub fn render(&self, size_px: u16, dark_theme: bool, spec: &IconSpec) -> Vec<u8> {
         let n = size_px as usize;
         let s = size_px as f32;
-        let fg: u8 = if dark_theme { 255 } else { 0 };
-        let fg3 = [fg, fg, fg];
+        // 主字色按（中/英，任务栏明暗）取；输出是 BGR 顺序，这里从 RGBA 换过去。
+        // fg3 同时是 `auto` 角标与演示跑马灯的颜色（与主字同色）。
+        let [fr, fg, fb, fa] = self.text_colors.pick(spec.english, dark_theme);
+        let fg3 = [fb, fg, fr];
+        let text_alpha = fa as f32 / 255.0;
 
         let glyph = self.render_glyph_mask(size_px, spec);
         // 总开关关掉时 active_layers 直接返回空表，于是「关掉」在像素上必然与
@@ -817,7 +871,7 @@ impl IconRenderer {
             // 写成循环而不是把每层权重展开成一条乘法链：层数现在由规则表决定，
             // 展开式每加一层就要给之前每一项补一个 `(1 - a)` 因子，漏一个不报错，
             // 只让某一层的颜色偏一点——16px 上根本看不出来。
-            let g_a = glyph.get(i) * (1.0 - clear.get(i));
+            let g_a = glyph.get(i) * (1.0 - clear.get(i)) * text_alpha;
             let mut a = g_a;
             let mut col = [
                 fg3[0] as f32 * g_a,
@@ -1229,6 +1283,7 @@ impl LangBarIconPublisher {
         badge_scale: Option<f32>,
         badge_alpha: Option<f32>,
         rules: Option<Vec<BadgeRule>>,
+        text_colors: Option<TextColors>,
     ) -> bool {
         let r = &mut self.renderer;
         let mut changed = false;
@@ -1249,6 +1304,10 @@ impl LangBarIconPublisher {
         if let Some(v) = rules {
             set(r.rules != v);
             r.rules = v;
+        }
+        if let Some(v) = text_colors {
+            set(r.text_colors != v);
+            r.text_colors = v;
         }
 
         if changed {
@@ -2533,6 +2592,111 @@ mod tests {
             "wrote {} （上排浅底、下排深底，左→右为一圈的 8 帧）",
             p.display()
         );
+    }
+
+    /// 取整张图 alpha 最大的那个像素的 BGR（非预乘，即该处的实际颜色）。
+    fn densest_bgr(buf: &[u8]) -> [u8; 3] {
+        let px = buf.chunks_exact(4).max_by_key(|p| p[3]).expect("空图");
+        assert!(px[3] > 0, "整张图没有任何墨迹");
+        [px[0], px[1], px[2]]
+    }
+
+    /// 只画演示跑马灯的渲染器：跑马灯与主字同色、且不依赖文本后端，
+    /// 故能在 Linux（文本后端是 mock、画不出主字）上验证主字色的取用。
+    fn marquee_only(colors: TextColors) -> IconRenderer {
+        let mut r = IconRenderer::new(BadgeStyle::None).expect("renderer");
+        r.demo_animation = true;
+        r.text_colors = colors;
+        r
+    }
+
+    fn lang_spec(english: bool) -> IconSpec {
+        IconSpec {
+            english,
+            ..IconSpec::default()
+        }
+    }
+
+    /// 默认主字色 = 改动前写死的值：浅色任务栏黑、深色任务栏白，中英一致。
+    #[test]
+    fn default_text_colors_match_legacy_black_white() {
+        let r = marquee_only(TextColors::default());
+        for english in [false, true] {
+            let light = r.render(32, false, &lang_spec(english));
+            let dark = r.render(32, true, &lang_spec(english));
+            assert_eq!(densest_bgr(&light), [0, 0, 0], "english={english} 浅色");
+            assert_eq!(
+                densest_bgr(&dark),
+                [255, 255, 255],
+                "english={english} 深色"
+            );
+        }
+    }
+
+    /// 中英配了不同色，english 标识必须真的选到不同的色（且按明暗各取各的格子）。
+    #[test]
+    fn english_flag_selects_its_own_text_color() {
+        let colors = TextColors {
+            cn_light: [0xFF, 0x00, 0x00, 0xFF],
+            cn_dark: [0x00, 0xFF, 0x00, 0xFF],
+            en_light: [0x00, 0x00, 0xFF, 0xFF],
+            en_dark: [0xFF, 0xFF, 0x00, 0xFF],
+        };
+        let r = marquee_only(colors);
+        // 输出是 BGR：RGBA 红 → [0, 0, 255]。
+        assert_eq!(
+            densest_bgr(&r.render(32, false, &lang_spec(false))),
+            [0, 0, 255]
+        );
+        assert_eq!(
+            densest_bgr(&r.render(32, true, &lang_spec(false))),
+            [0, 255, 0]
+        );
+        assert_eq!(
+            densest_bgr(&r.render(32, false, &lang_spec(true))),
+            [255, 0, 0]
+        );
+        assert_eq!(
+            densest_bgr(&r.render(32, true, &lang_spec(true))),
+            [0, 255, 255]
+        );
+    }
+
+    /// `auto` 角标与主字同色：换了主字色，auto 角标跟着换。
+    #[test]
+    fn auto_badge_follows_text_color() {
+        let mut r = with_rule(BadgeRule {
+            state: BadgeState::PunctCn,
+            corner: Corner::BottomRight,
+            color_light: BadgeColor::AUTO,
+            color_dark: BadgeColor::AUTO,
+            scale: 1.0,
+        });
+        r.badge_alpha = 1.0;
+        r.text_colors.cn_light = [0x12, 0x34, 0x56, 0xFF];
+        let buf = r.render(32, false, &spec(PunctBadge::Chinese));
+        assert_eq!(densest_bgr(&buf), [0x56, 0x34, 0x12]);
+    }
+
+    /// 真机字形：中英分色后主字像素颜色不同；默认下明暗两档是 0 / 255。
+    /// 只在 Windows 上跑：其它平台文本后端是 mock，画不出主字。
+    #[cfg(windows)]
+    #[test]
+    fn glyph_uses_text_colors() {
+        let mut r = IconRenderer::new(BadgeStyle::None).expect("renderer");
+        assert_eq!(
+            densest_bgr(&r.render(32, false, &lang_spec(false))),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            densest_bgr(&r.render(32, true, &lang_spec(false))),
+            [255, 255, 255]
+        );
+        r.text_colors.en_light = [0xFF, 0x00, 0x00, 0xFF];
+        let cn = r.render(32, false, &lang_spec(false));
+        let en = r.render(32, false, &lang_spec(true));
+        assert_eq!(densest_bgr(&cn), [0, 0, 0]);
+        assert_eq!(densest_bgr(&en), [0, 0, 255]);
     }
 
     /// 尺寸档标记开启时，各档左上角画的点数不同——这是真机验证"系统用了哪档"的依据。

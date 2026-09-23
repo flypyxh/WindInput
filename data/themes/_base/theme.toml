@@ -60,6 +60,13 @@ toolbar_settings_bg = { light = "${surface}", dark = "${border}" }
 toolbar_settings_icon = { light = "${text_dim}", dark = "#9B8CCE" }
 toolbar_settings_hole = { light = "${surface}", dark = "${border}" }
 
+# 任务栏语言栏图标主字色：cn = 中文态标签，en = 英文态标签（含不可输入态、CapsLock）。
+# 注意 light/dark 指**任务栏**明暗（浅色任务栏配深字、深色任务栏配浅字），与候选窗明暗无关。
+# 用 ${…} 引用别的 token 时按同一档取值：light 档取被引 token 的 light 值、dark 档取 dark 值
+# （引用不跟随候选窗当前明暗）。用户可在 [ui.langbar] text_color_* 覆盖。
+langbar_text_cn = { light = "#000000", dark = "#FFFFFF" }
+langbar_text_en = { light = "#000000", dark = "#FFFFFF" }
+
 [window]
 padding = [6, 8]
 radius = 8

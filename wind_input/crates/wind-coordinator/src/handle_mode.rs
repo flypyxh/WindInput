@@ -1143,6 +1143,10 @@ impl Coordinator {
             .theme_index_labels
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = theme.views.index_labels.clone();
+        // 语言栏主字色的主题那一份。push_theme 是换主题 / 切明暗 / 重载的共同出口，
+        // 接在这里三条路都覆盖到；内部无变化不重发。
+        #[cfg(all(feature = "desktop-ui", windows))]
+        self.set_langbar_theme_text(theme.langbar_text);
         let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(theme)));
     }
 

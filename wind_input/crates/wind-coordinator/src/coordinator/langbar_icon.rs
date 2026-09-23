@@ -16,6 +16,70 @@ static ICON_PUBLISHER: std::sync::OnceLock<
     std::sync::Mutex<Option<wind_ui::langbar_icon::LangBarIconPublisher>>,
 > = std::sync::OnceLock::new();
 
+/// 主字色的两份来源：（用户配置解析结果，主题 token）。合并见 [`effective_text_colors`]。
+///
+/// 独立于发布器存放而不是等发布器建好再记：`push_theme` 在构造期就会调，那时发布器尚未
+/// 创建；若为了记主题色去建发布器并发布，会先发一张没套用户配置的图（开机图标闪一下）。
+/// 两份各由自己的入口写（`apply_langbar_config` / `push_theme`），任一变化都按合并结果重发。
+#[cfg(all(feature = "desktop-ui", windows))]
+static LANGBAR_TEXT_SOURCES: std::sync::Mutex<(
+    wind_theme::LangbarTextColors,
+    wind_theme::LangbarTextColors,
+)> = std::sync::Mutex::new((NO_TEXT_COLORS, NO_TEXT_COLORS));
+
+#[cfg(all(feature = "desktop-ui", windows))]
+const NO_TEXT_COLORS: wind_theme::LangbarTextColors = wind_theme::LangbarTextColors {
+    cn_light: None,
+    cn_dark: None,
+    en_light: None,
+    en_dark: None,
+};
+
+/// 主字色单点合并：**用户非空 > 主题 Some > 内置黑白**，四格各自独立回落。
+///
+/// 渲染器只拿这里的结果、自己不再回落——合并若散到两处，「用户清空某一格后该回落到哪」
+/// 就会各说各话。
+#[cfg(all(feature = "desktop-ui", any(windows, test)))]
+pub(crate) fn effective_text_colors(
+    user: &wind_theme::LangbarTextColors,
+    theme: &wind_theme::LangbarTextColors,
+) -> wind_ui::langbar_icon::TextColors {
+    use wind_ui::langbar_icon::TextColors;
+    let pick =
+        |u: Option<[u8; 4]>, t: Option<[u8; 4]>, builtin: [u8; 4]| u.or(t).unwrap_or(builtin);
+    TextColors {
+        cn_light: pick(user.cn_light, theme.cn_light, TextColors::BUILTIN_LIGHT),
+        cn_dark: pick(user.cn_dark, theme.cn_dark, TextColors::BUILTIN_DARK),
+        en_light: pick(user.en_light, theme.en_light, TextColors::BUILTIN_LIGHT),
+        en_dark: pick(user.en_dark, theme.en_dark, TextColors::BUILTIN_DARK),
+    }
+}
+
+/// 解析 `[ui.langbar] text_color_*`：`""` = 跟随主题（None）；非法色值记警告并**只让这一格**
+/// 回落跟随主题——改错一个色值若连带另外三格一起打回默认，用户对不上因果。
+#[cfg(all(feature = "desktop-ui", any(windows, test)))]
+pub(crate) fn parse_user_text_colors(
+    cfg: &wind_config::LangBarConfig,
+) -> wind_theme::LangbarTextColors {
+    let parse = |raw: &str, item: &str| -> Option<[u8; 4]> {
+        let t = raw.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let c = wind_theme::palette::parse_hex(t);
+        if c.is_none() {
+            tracing::warn!(value = raw, item, "语言栏主字色无法解析，按跟随主题处理");
+        }
+        c
+    };
+    wind_theme::LangbarTextColors {
+        cn_light: parse(&cfg.text_color_cn_light, "text_color_cn_light"),
+        cn_dark: parse(&cfg.text_color_cn_dark, "text_color_cn_dark"),
+        en_light: parse(&cfg.text_color_en_light, "text_color_en_light"),
+        en_dark: parse(&cfg.text_color_en_dark, "text_color_en_dark"),
+    }
+}
+
 /// 演示动画的代际。开/关各 +1，驱动线程每帧核对自己那一代是否仍是当前值，不是就退出。
 ///
 /// 用代际而不是 `JoinHandle` + 停止标志：菜单可以被连点，两次开启之间那个线程还没退出，
@@ -229,6 +293,15 @@ impl Coordinator {
             })
             .collect();
 
+        // 主字色：记下用户这一份，与主题那份合并。先取完来源锁再取发布器锁，不嵌套。
+        let text_colors = {
+            let mut src = LANGBAR_TEXT_SOURCES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            src.0 = parse_user_text_colors(&cfg);
+            effective_text_colors(&src.0, &src.1)
+        };
+
         let changed = {
             let Ok(mut guard) = Self::icon_publisher().lock() else {
                 return;
@@ -241,7 +314,40 @@ impl Coordinator {
                 Some(cfg.badge_scale),
                 Some(cfg.badge_alpha),
                 Some(rules),
+                Some(text_colors),
             )
+        };
+        // 锁已释放——发布内部还要取同一把锁。
+        if changed {
+            self.publish_langbar_icon_now();
+        }
+    }
+
+    /// 主题换了（切主题 / 切明暗 / 重载）：记下主题给的主字色，有变化就重渲重发。
+    ///
+    /// 发布器尚未创建（构造期的首次 `push_theme`）时只记不发——首发由
+    /// [`Self::publish_initial_langbar_icon`] 负责，它经 `apply_langbar_config` 会把这份
+    /// 主题色一并合进去。
+    #[cfg(all(feature = "desktop-ui", windows))]
+    pub(crate) fn set_langbar_theme_text(&self, theme: wind_theme::LangbarTextColors) {
+        let text_colors = {
+            let mut src = LANGBAR_TEXT_SOURCES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            src.1 = theme;
+            effective_text_colors(&src.0, &src.1)
+        };
+        let Some(cell) = ICON_PUBLISHER.get() else {
+            return;
+        };
+        let changed = {
+            let Ok(mut guard) = cell.lock() else {
+                return;
+            };
+            let Some(p) = guard.as_mut() else {
+                return;
+            };
+            p.apply_appearance(None, None, None, None, Some(text_colors))
         };
         // 锁已释放——发布内部还要取同一把锁。
         if changed {
@@ -394,6 +500,9 @@ impl Coordinator {
             // （切中英/切标点）也会走到这里，若在此归零，跑马灯每被状态变化打断一次就
             // 跳回起点。相位归发布器所有、只由动画定时器推进，是这两件事互不干扰的前提。
             frame: p.demo_frame(),
+            // 主字显示英文态标签（非有效中文态 / 不可输入态，CapsLock 已并进
+            // effective_chinese）时取英文那两格主字色。
+            english: !effective_chinese || block.shows_english(),
         };
 
         match p.publish(&spec) {
@@ -509,5 +618,66 @@ mod default_parity_tests {
             BadgeStyle::None,
             "角标总开关默认必须是关"
         );
+    }
+}
+
+#[cfg(all(test, feature = "desktop-ui"))]
+mod text_color_tests {
+    use super::{effective_text_colors, parse_user_text_colors};
+    use wind_theme::LangbarTextColors;
+    use wind_ui::langbar_icon::TextColors;
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+    /// 三档优先级：用户 > 主题 > 内置，且每格独立回落。
+    #[test]
+    fn user_over_theme_over_builtin_per_cell() {
+        let user = LangbarTextColors {
+            cn_light: Some(RED),
+            ..Default::default()
+        };
+        let theme = LangbarTextColors {
+            cn_light: Some(GREEN),
+            en_dark: Some(GREEN),
+            ..Default::default()
+        };
+        let got = effective_text_colors(&user, &theme);
+        assert_eq!(got.cn_light, RED, "用户非空压过主题");
+        assert_eq!(got.en_dark, GREEN, "用户空则取主题");
+        assert_eq!(got.cn_dark, TextColors::BUILTIN_DARK, "都没给回落内置白");
+        assert_eq!(got.en_light, TextColors::BUILTIN_LIGHT, "都没给回落内置黑");
+    }
+
+    /// 全空 = 改动前的写死黑白。
+    #[test]
+    fn nothing_configured_is_legacy_black_white() {
+        let none = LangbarTextColors::default();
+        assert_eq!(effective_text_colors(&none, &none), TextColors::default());
+    }
+
+    /// 用户色：空串跟随主题；合法值（含 8 位带 alpha）照用；非法值只让那一格回落主题。
+    #[test]
+    fn user_colors_parse_and_invalid_falls_back_to_theme() {
+        let cfg = wind_config::LangBarConfig {
+            text_color_cn_light: "#FF0000".into(),
+            text_color_cn_dark: "not-a-color".into(),
+            text_color_en_light: " #00FF0080 ".into(),
+            text_color_en_dark: String::new(),
+            ..Default::default()
+        };
+        let user = parse_user_text_colors(&cfg);
+        assert_eq!(user.cn_light, Some(RED));
+        assert_eq!(user.cn_dark, None, "非法色值按跟随主题");
+        assert_eq!(user.en_light, Some([0, 255, 0, 0x80]));
+        assert_eq!(user.en_dark, None);
+
+        let theme = LangbarTextColors {
+            cn_dark: Some(GREEN),
+            ..Default::default()
+        };
+        let got = effective_text_colors(&user, &theme);
+        assert_eq!(got.cn_dark, GREEN, "非法那一格回落到主题值");
+        assert_eq!(got.cn_light, RED, "其余格不受牵连");
     }
 }

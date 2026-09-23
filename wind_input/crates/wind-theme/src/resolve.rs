@@ -61,6 +61,33 @@ pub struct Resolved {
     /// 资产搜索目录（self + base 链）：用于视图节点里**字面** image ref（如 _base 的 chevron.svg，
     /// 不在 resources 注册表）解析为绝对路径——派生主题继承 base 的图标需到 base 目录查找。
     pub asset_dirs: Vec<std::path::PathBuf>,
+    /// 任务栏语言栏图标主字色（token `langbar_text_cn` / `langbar_text_en`）。
+    pub langbar_text: LangbarTextColors,
+}
+
+/// 任务栏语言栏图标主字色，四格独立。
+///
+/// ⚠ 这里的 light/dark 指**任务栏**明暗（服务端每档都渲染两套图标、DLL 按任务栏明暗挑），
+/// 与候选窗主题的 `is_dark` 无关——所以 `resolve()` 对 colors 另按 false/true 各解析一次，
+/// 不跟随本次求值的 `is_dark`。`None` = 主题没给，由消费端回落内置黑/白。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LangbarTextColors {
+    pub cn_light: Option<Rgba>,
+    pub cn_dark: Option<Rgba>,
+    pub en_light: Option<Rgba>,
+    pub en_dark: Option<Rgba>,
+}
+
+/// 按任务栏浅/深两档各解析一次 colors，取 `langbar_text_cn` / `langbar_text_en`。
+fn resolve_langbar_text(colors: Option<&toml::Value>) -> LangbarTextColors {
+    let light = resolve_palette(colors, false);
+    let dark = resolve_palette(colors, true);
+    LangbarTextColors {
+        cn_light: light.get("langbar_text_cn").copied(),
+        cn_dark: dark.get("langbar_text_cn").copied(),
+        en_light: light.get("langbar_text_en").copied(),
+        en_dark: dark.get("langbar_text_en").copied(),
+    }
 }
 
 /// 颜色 token 求值（与 Go resolveColorToken 对齐）：
@@ -337,6 +364,7 @@ pub fn resolve(theme: &Theme, is_dark: bool, asset_dirs: &[std::path::PathBuf]) 
         behavior,
         resources,
         asset_dirs: asset_dirs.to_vec(),
+        langbar_text: resolve_langbar_text(theme.colors.as_ref()),
     }
 }
 
@@ -567,6 +595,55 @@ mod tests {
 
     fn load_jidian(is_dark: bool) -> Resolved {
         load_resolved_dirs(&[testdata_dir(), data_dir()], "jidian-classic", is_dark).unwrap()
+    }
+
+    fn typed(text: &str) -> Theme {
+        let value: toml::Value = toml::from_str(text).unwrap();
+        crate::normalize::normalize_theme(value).try_into().unwrap()
+    }
+
+    /// 语言栏主字色的 light/dark 是任务栏明暗：候选窗无论按浅色还是深色求值，四格都齐。
+    #[test]
+    fn langbar_text_resolves_both_taskbar_tones() {
+        let expect = LangbarTextColors {
+            cn_light: Some([0, 0, 0, 255]),
+            cn_dark: Some([255, 255, 255, 255]),
+            en_light: Some([0, 0, 0, 255]),
+            en_dark: Some([255, 255, 255, 255]),
+        };
+        assert_eq!(load("default", false).langbar_text, expect);
+        assert_eq!(load("default", true).langbar_text, expect);
+    }
+
+    /// 子主题覆盖 `_base` 的 token，未覆盖的那个仍继承 `_base`；引用链可用。
+    #[test]
+    fn langbar_text_theme_overrides_base() {
+        let root = std::env::temp_dir().join(format!("wt-langbar-{}", std::process::id()));
+        let dir = root.join("lbtest");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("theme.toml"),
+            "base = \"_base\"\n[colors]\nmy_red = \"#FF0000\"\n\
+             langbar_text_cn = { light = \"${my_red}\", dark = \"#00FF0080\" }\n",
+        )
+        .unwrap();
+        let r = load_resolved_dirs(&[root.clone(), data_dir()], "lbtest", false).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(r.langbar_text.cn_light, Some([255, 0, 0, 255]));
+        assert_eq!(r.langbar_text.cn_dark, Some([0, 255, 0, 0x80]));
+        assert_eq!(r.langbar_text.en_light, Some([0, 0, 0, 255]));
+        assert_eq!(r.langbar_text.en_dark, Some([255, 255, 255, 255]));
+    }
+
+    /// 主题（含 base 链）都没写 token 时四格为 None，交给消费端回落内置色。
+    #[test]
+    fn langbar_text_absent_is_none() {
+        let r = resolve(
+            &typed("[colors]\ntext = \"#123456\"\n"),
+            false,
+            &[data_dir()],
+        );
+        assert_eq!(r.langbar_text, LangbarTextColors::default());
     }
 
     /// footer_bar 的禁用态 patch 要一路活到 RvNode —— 翻页箭头灰显色的唯一来源。

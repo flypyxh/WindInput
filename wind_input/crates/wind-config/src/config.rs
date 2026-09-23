@@ -5346,6 +5346,23 @@ pub struct LangBarConfig {
     /// 角标规则表，顺序即优先级（见本结构体的文档）。
     #[serde(default = "default_langbar_badges")]
     pub badges: Vec<LangBarBadge>,
+    /// 中文态主字在浅色任务栏上的颜色：`#RRGGBB` / `#RRGGBBAA`，`""`（默认）= 跟随主题
+    /// （主题 token `langbar_text_cn`，主题也没给则内置黑）。
+    ///
+    /// 优先级「用户非空 > 主题 > 内置」，四格各自独立回落；合并在协调器的
+    /// `effective_text_colors` 一处完成。非法色值记警告并只让**这一格**回落主题。
+    /// `en` = 英文态标签（含不可输入态、CapsLock）。light/dark 指任务栏明暗。
+    #[serde(default)]
+    pub text_color_cn_light: String,
+    /// 中文态主字在深色任务栏上的颜色，语义同 [`Self::text_color_cn_light`]（内置白）。
+    #[serde(default)]
+    pub text_color_cn_dark: String,
+    /// 英文态主字在浅色任务栏上的颜色，语义同 [`Self::text_color_cn_light`]。
+    #[serde(default)]
+    pub text_color_en_light: String,
+    /// 英文态主字在深色任务栏上的颜色，语义同 [`Self::text_color_cn_light`]（内置白）。
+    #[serde(default)]
+    pub text_color_en_dark: String,
 }
 
 /// 一条角标规则（`[[ui.langbar.badges]]`）：某状态成立时，在某角落用某色画一个角标。
@@ -5443,6 +5460,10 @@ impl Default for LangBarConfig {
             badge_scale: 1.0,
             badge_alpha: default_langbar_badge_alpha(),
             badges: default_langbar_badges(),
+            text_color_cn_light: String::new(),
+            text_color_cn_dark: String::new(),
+            text_color_en_light: String::new(),
+            text_color_en_dark: String::new(),
         }
     }
 }
