@@ -624,7 +624,9 @@ fn mixed_sentence_combines_abbrev_and_full_pinyin() {
             .collect::<Vec<_>>()
     );
     assert!(top.is_sentence, "须标整句身份");
-    assert!(!top.is_abbrev, "整句不是简拼候选，标了会沉进简拼层");
+    // 与整串简拼词同层按权重竞争（`pinyin_mixed_sentence_layer.rs`）。它仍是首选：
+    // 前缀回退的「不知道」带 `is_partial`，同层内排在完整匹配之后。
+    assert!(top.is_abbrev, "②b 整句在简拼层");
     assert_eq!(top.consumed_length, 5, "整句消费全部击键");
 }
 

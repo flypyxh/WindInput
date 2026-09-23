@@ -324,9 +324,10 @@ fn mixed_sentence_with_separator_is_known_unreachable() {
     };
     let mgr = quanpin(&dir, "mixed_sentence");
 
-    assert_eq!(
-        texts(&mgr, "nihm").first().map(String::as_str),
-        Some("你后面"),
+    // 断言「在列表里」而非「是首选」：②b 整句在简拼层，引擎层会排在只吃 `ni` 的部分
+    // 单字之后；界面上协调器以消费长度为首键，它仍是首选。本用例钉的是可达性。
+    assert!(
+        texts(&mgr, "nihm").contains(&"你后面".to_string()),
         "基线：不加分隔符时混合整句可达"
     );
     assert!(
