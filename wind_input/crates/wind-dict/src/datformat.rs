@@ -302,7 +302,8 @@ fn find_base(codes: &[i32], base: &mut Vec<i32>, check: &mut Vec<i32>, free: &mu
 
 // ======================= 写入 =======================
 
-/// 空槽标记。真实文本长度受 `DatEntryRow` 的 `u16` 字段约束（≤ 65535），撞不上。
+/// 空槽标记（放在长度位）。真实长度撞不上它：长度为 `u32::MAX` 的串塞不进 `buf`——
+/// 池偏移本身就是 `u32`，写到那一步文件偏移早已溢出。
 const POOL_EMPTY: u32 = u32::MAX;
 /// 初始槽数，必须是 2 的幂（`slot_of` 用 `& mask` 取模）。
 const POOL_INITIAL_SLOTS: usize = 1024;
@@ -325,7 +326,13 @@ fn pool_hash(bytes: &[u8]) -> u64 {
     }
     // 长度混进去：否则 "ab\0" 与 "ab" 在补零后同哈希（相等性仍由 slot_of 逐字节判，
     // 这里只是少一次探测冲突）。
-    (h.rotate_left(5) ^ bytes.len() as u64).wrapping_mul(SEED)
+    let h = (h.rotate_left(5) ^ bytes.len() as u64).wrapping_mul(SEED);
+    // ★ 终混：把高位转到低位。乘法积的低 k 位只取决于两个乘数的低 k 位，而 `slot_of` 取
+    // 槽用的恰恰是低位（`h & mask`）——不转的话，短中文串的落点几乎只由头两个字节决定。
+    // 拿拼音词库全部 64 万个唯一文本模拟，最终 2^21 槽：不转时平均探测 7.4 次、最坏 300+，
+    // 只落在 28.5 万个不同的槽；转过之后平均 1.2、最坏十几，与理想哈希持平。
+    // rustc-hash 2.x 在 `finish` 里补的也是这一下（同样是 26）。
+    h.rotate_left(26)
 }
 
 /// 字符串池（去重）。
@@ -2173,10 +2180,36 @@ mod tests {
         let _ = std::fs::remove_file(&wdat_path);
     }
 
-    /// 简拼 AbbrevSection 往返：简拼查得到、按权重排序，且**不污染全拼**精确/前缀查询。
+    /// `pool_hash` 的**低位**必须分布开——开放寻址取槽用的是 `h & mask`。
     ///
-    /// ⚠️ **条目内容已随 v5 从「词」改为「全拼码」**（二级索引指向主键）。取出的
-    /// `DictEntry::text` 现在装的是码，调用方拿它去主表装配候选。
+    /// 去重测试守不住这条：哈希再烂，判等也是逐字节的，结果永远对，只是线性探测退化成
+    /// 长链扫描、构建变慢。这里直接数「不同的落点」：两字中文串（与真实词库同形）在
+    /// 2^17 槽上应接近随机分布；低位只由头两字节决定时，落点数会塌到零头。
+    #[test]
+    fn pool_hash_spreads_low_bits_for_short_cjk_strings() {
+        let mask = (1usize << 17) - 1;
+        let mut homes = std::collections::HashSet::new();
+        let mut n = 0usize;
+        // 常用汉字区里取 256×256 个两字组合，头一个字只有 256 种——正是会把坏哈希
+        // 打回原形的那种输入。
+        for a in 0x4E00u32..0x4F00 {
+            for b in 0x5000u32..0x5100 {
+                let s: String = [char::from_u32(a).unwrap(), char::from_u32(b).unwrap()]
+                    .iter()
+                    .collect();
+                homes.insert((pool_hash(s.as_bytes()) as usize) & mask);
+                n += 1;
+            }
+        }
+        // 65536 个键扔进 131072 个槽，理想随机约落 51.6k 个不同槽（1-e^-0.5 的期望）。
+        // 下限取 45k 留足余量；去掉终混的 `rotate_left` 时实测只落 128 个槽。
+        assert!(
+            homes.len() > 45_000,
+            "{n} 个两字串只落在 {} 个不同的槽——低位没混开，线性探测会退化成长链",
+            homes.len()
+        );
+    }
+
     /// 字符串池必须**真的**去重：同一文本无论来自哪个 code、哪个段，都返回同一个偏移，
     /// 且 `buf` 里只存一份。
     ///
@@ -2227,6 +2260,10 @@ mod tests {
         assert_eq!(pool.buf.len(), expect, "buf 应恰好装下每个唯一文本一份");
     }
 
+    /// 简拼 AbbrevSection 往返：简拼查得到、按权重排序，且**不污染全拼**精确/前缀查询。
+    ///
+    /// ⚠️ **条目内容已随 v5 从「词」改为「全拼码」**（二级索引指向主键）。取出的
+    /// `DictEntry::text` 现在装的是码，调用方拿它去主表装配候选。
     #[test]
     fn abbrev_section_roundtrip() {
         let p = std::env::temp_dir().join("wdat_abbrev_test.wdat");

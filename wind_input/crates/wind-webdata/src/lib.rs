@@ -1377,8 +1377,10 @@ pub trait WebDataRpc: WebDataHost {
             // 由此可见的两件**设计使然、不是缺陷**的事：
             // - 全拼与双拼显示**同一个数**：拼音族共享同一份用户词/临时词（`data_schema_id`
             //   把 `engine.type == "pinyin"` 的方案统一折叠到 "pinyin"）。
-            // - 混输方案显示 **0**：混输本身不存用户词，词按来源落在它的目标方案里
-            //   （主码表方案 / "pinyin"，见 `write_data_schema_id`）。这里报 0 是如实反映。
+            // - 混输方案通常显示 **0**：混输本身不存用户词，引擎写端按来源落到它的目标方案里
+            //   （主码表方案 / "pinyin"，见 `write_data_schema_id`）。但 `data_schema_id` 对混输
+            //   返回它自己的 id，所以若真有入口直接以混输方案调 `dict.add`，词会落进混输自己
+            //   的桶，这里也会如实报出——与 `dict.listPaged` 同源，口径不会分叉。
             let data_schema = self.engine_mgr().data_schema_id(id);
             let user_words = store.count_user_words(&data_schema).unwrap_or(0);
             let temp_words = store.count_temp_words(&data_schema).unwrap_or(0);
@@ -7885,6 +7887,18 @@ short_code_yield_level = 2
             .unwrap();
         }
 
+        // 临时词没有设置页写入口，由引擎写端落库——那里走 `write_data_schema_id`，拼音族
+        // 已经折叠成 "pinyin"，所以这里直接写折叠后的桶。条数与用户词**刻意错开**
+        // （拼音族 2 条、码表 3 条），免得 tempWords 的断言碰巧与 userWords 同值而放过串线。
+        for (code, text) in [("haoya", "好呀"), ("nihao", "你好")] {
+            store.learn_temp_word("pinyin", code, text, 500, 0).unwrap();
+        }
+        for (code, text) in [("cccc", "又"), ("dddd", "大"), ("eeee", "月")] {
+            store
+                .learn_temp_word("wubi_like", code, text, 500, 0)
+                .unwrap();
+        }
+
         let stats = c.web_data_rpc("dict.stats", &json!({})).unwrap();
         let rows = stats.as_array().expect("stats 是数组");
         let row_of = |id: &str| -> Value {
@@ -7893,6 +7907,24 @@ short_code_yield_level = 2
                 .cloned()
                 .unwrap_or(Value::Null)
         };
+
+        // tempWords：只把 `count_temp_words(&data_schema)` 退回 `count_temp_words(id)` 时，
+        // 只有这三条会红——userWords 与 shadowRules 的断言对它全绿。
+        assert_eq!(
+            row_of("pinyin_simp")["tempWords"],
+            2,
+            "全拼须报出拼音桶里的临时词"
+        );
+        assert_eq!(
+            row_of("double_pinyin")["tempWords"],
+            2,
+            "双拼与全拼共享临时词，须报同一个数"
+        );
+        assert_eq!(
+            row_of("wubi_like")["tempWords"],
+            3,
+            "码表方案报自己桶里的临时词"
+        );
 
         // 正向：拼音族两行报同一个数。
         assert_eq!(
