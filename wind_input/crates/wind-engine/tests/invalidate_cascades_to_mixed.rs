@@ -29,12 +29,20 @@ fn data_dir() -> PathBuf {
 }
 
 fn fixtures_present(dir: &std::path::Path) -> bool {
+    // 英文词库目录也要在：缺了它 english 建不起来，下面「前提：混输借了共享英文引擎」
+    // 会红，而不是按文件头说的静默跳过。
     dir.join("schemas/english.schema.toml").exists()
+        && dir.join("schemas/english").is_dir()
         && dir.join(format!("schemas/{MIXED}.schema.toml")).exists()
 }
 
 /// 每个用例一个独立的 override 目录——写 override 是这些用例的动作本身，共用会串台。
+/// 目录名带进程号：并发会话同时跑同一个用例时会互相 `remove_dir_all`。
 fn manager(tag: &str) -> Option<(EngineManager, PathBuf)> {
+    manager_with(tag, true)
+}
+
+fn manager_with(tag: &str, enable_english: bool) -> Option<(EngineManager, PathBuf)> {
     let dir = data_dir();
     if !fixtures_present(&dir) {
         eprintln!("跳过：缺少英文方案或混输方案");
@@ -43,8 +51,8 @@ fn manager(tag: &str) -> Option<(EngineManager, PathBuf)> {
     let mut cfg = Config::default();
     cfg.schema.available = vec![MIXED.into(), "english".into()];
     cfg.schema.active = MIXED.into();
-    cfg.schema.mix.enable_english = true;
-    let ov = std::env::temp_dir().join(format!("wind_inv_cascade_{tag}"));
+    cfg.schema.mix.enable_english = enable_english;
+    let ov = std::env::temp_dir().join(format!("wind_inv_cascade_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ov);
     std::fs::create_dir_all(&ov).ok()?;
     let mgr = EngineManager::with_store_override(&cfg, Some(&dir), None, Some(ov.clone()));
@@ -122,5 +130,31 @@ fn invalidating_an_unrelated_schema_leaves_the_mixed_schema_alone() {
     assert!(
         mgr.is_loaded(MIXED),
         "无关方案的失效不该波及混输——扇出的判据是成员关系，不是「是个混输就失效」"
+    );
+}
+
+/// ★ `enable_english` **关着**时改英文方案的配置，混输不许被牵连。
+///
+/// `loaded_mixed_dependents` 对 english 一律返回全部混输（它原是给「转发」设计的）。扇出拿它
+/// 做摘除时若不看开关，开关关着——混输手里根本没有英文子引擎——也会每保存一次英文 override
+/// 就把所有混输白白重建一遍（秒级）。上面那条锐利性对照用的是无关方案 id，守不住 english 这支。
+///
+/// 反向验证（变异）：删掉 `invalidate_schema` 里的 `english_unused_by_mixed` 判断，本用例红。
+#[test]
+fn invalidating_english_leaves_mixed_alone_when_english_merge_is_off() {
+    let Some((mgr, _ov)) = manager_with("english_off", false) else {
+        return;
+    };
+    assert!(mgr.ensure_schema(MIXED), "前提：混输方案应能加载");
+    assert!(
+        !mgr.is_loaded("english"),
+        "前提：开关关着时混输不该去建英文引擎"
+    );
+
+    write_override(&mgr, "english");
+
+    assert!(
+        mgr.is_loaded(MIXED),
+        "混输没借英文子引擎，改英文配置不该让它重建"
     );
 }

@@ -43,7 +43,9 @@ fn a_malformed_english_schema_typed_as_mixed_must_not_deadlock() {
         return;
     }
 
-    let ov = std::env::temp_dir().join("wind_en_self_borrow_ov");
+    // 目录名带进程号：并发会话同时跑本用例会互相删目录，english.toml 被删掉后 english 按
+    // 普通方案加载，用例恒绿却什么也没测到。
+    let ov = std::env::temp_dir().join(format!("wind_en_self_borrow_ov_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ov);
     std::fs::create_dir_all(&ov).unwrap();
     // 先把畸形 override 落盘，再建 manager——让它从一开始就读到 type = "mixed"。

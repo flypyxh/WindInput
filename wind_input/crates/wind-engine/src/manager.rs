@@ -2748,8 +2748,17 @@ impl EngineManager {
             //
             // 对「mixed 里根本没建 english 子引擎」（`enable_english` 关着）的情形，这一趟
             // 失效是多余的 —— 但多余只是一次重建，而漏掉是功能不生效，两者不对等。
+            //
+            // 依赖方**先取后失效**：`invalidate_schema(schema_id)` 自带扇出，会顺手把混输从
+            // `engines` 摘掉，之后再问 `loaded_mixed_dependents` 恒为空——这段循环就成了死代码，
+            // 日志不打、混输自己按 id 缓存的那几项也不再清。先取出来，完整失效照旧走一遍。
+            let dependents: Vec<String> = self
+                .loaded_mixed_dependents(schema_id)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
             self.invalidate_schema(schema_id);
-            for (mixed_id, _) in self.loaded_mixed_dependents(schema_id) {
+            for mixed_id in dependents {
                 info!("启用词库 {}：失效混输方案 {} 待重建", dict_id, mixed_id);
                 self.invalidate_schema(&mixed_id);
             }
@@ -2888,11 +2897,26 @@ impl EngineManager {
         //
         // 取 id 时就把 `Arc` 丢掉（`map(|(id, _)| id)`）：留在 `Vec` 里会把旧引擎的释放
         // 推迟到本函数返回，而这里正是要让它尽早落地。
-        let dependents: Vec<String> = self
-            .loaded_mixed_dependents(schema_id)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        //
+        // english 那一支额外看 `enable_english`：`loaded_mixed_dependents` 对 english **一律**
+        // 返回全部混输（它原是给「转发 set_dict_enabled」设计的，转发不到只是空操作），拿来做
+        // 摘除就过宽了——开关关着时混输手里根本没有英文子引擎，每次保存英文方案 override
+        // 都会白白重建所有混输（秒级）。`mix` 只在 `reload_from_config` 里与 `engines.clear()`
+        // 一起更新，所以这里读到的值就是在世混输构建时用的那个。
+        let english_unused_by_mixed = schema_id == ENGLISH_SCHEMA
+            && !self
+                .mix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .enable_english;
+        let dependents: Vec<String> = if english_unused_by_mixed {
+            Vec::new()
+        } else {
+            self.loaded_mixed_dependents(schema_id)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
         for mixed_id in dependents {
             debug!("失效 {schema_id}：连带失效混输方案 {mixed_id}（它捧着旧的成员子引擎）");
             self.engines
