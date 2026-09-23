@@ -218,36 +218,65 @@ impl RvViews {
     /// 消费方只在**换主题时**走一遍（`CandidateWindow::set_theme`），不在渲染热路径：
     /// 每个字族一次 `FindFamilyName` 是按 COM 调用计费的，逐帧逐节点查等于按帧计费。
     pub fn declared_font_families(&self) -> Vec<(String, String)> {
-        let mut nodes: Vec<(&str, &RvNode)> = vec![
-            ("views.window", &self.window),
-            ("views.preedit_bar", &self.preedit_bar),
-            ("views.candidate_list", &self.candidate_list),
-            ("views.item", &self.item),
-            ("views.index", &self.index),
-            ("views.text", &self.text),
-            ("views.comment", &self.comment),
-            ("views.accent_bar", &self.accent_bar),
-            ("views.footer_bar", &self.footer_bar),
-            ("views.mode_label", &self.mode_label),
-        ];
-        // 可选节点：主题没写就没有对应的键，列出来只会让 warn 指向一个不存在的路径。
-        for (path, opt) in [
-            ("views.status", &self.status),
-            ("views.tooltip", &self.tooltip),
-            ("views.toast", &self.toast),
-            ("views.menu.root", &self.menu_root),
-            ("views.menu.item", &self.menu_item),
-            ("views.menu.separator", &self.menu_separator),
-        ] {
-            if let Some(n) = opt {
-                nodes.push((path, n));
-            }
-        }
+        // 借 [`Self::font_nodes_mut`] 的节点表（只读场景克隆一份）：节点表只写一处，
+        // 「告警查的节点」与「用户字体清掉的节点」才不会各自漂移。只在换主题 / 换字体时走，
+        // 不在渲染热路径。
+        let mut copy = self.clone();
         let mut out = Vec::new();
-        for (path, n) in nodes {
+        for (path, n) in copy.font_nodes_mut() {
             collect_font_families(path, n, &mut out);
         }
         out
+    }
+
+    /// 清掉全部节点（含状态 patch）上的主题字族声明，让它们回落渲染器的全局字族。
+    ///
+    /// 用于「外观覆盖主题」：用户配了非空 `ui.font.family` 时，主题节点字族一律让位
+    /// （优先级见 wind-ui `CandidateWindow::refresh_effective_theme`）。
+    pub fn clear_font_families(&mut self) {
+        for (_, n) in self.font_nodes_mut() {
+            clear_node_font_family(n);
+        }
+    }
+
+    /// 可能声明 `font_family` 的全部节点（可选节点未写则不列）。
+    fn font_nodes_mut(&mut self) -> Vec<(&'static str, &mut RvNode)> {
+        let mut nodes: Vec<(&'static str, &mut RvNode)> = vec![
+            ("views.window", &mut self.window),
+            ("views.preedit_bar", &mut self.preedit_bar),
+            ("views.candidate_list", &mut self.candidate_list),
+            ("views.item", &mut self.item),
+            ("views.index", &mut self.index),
+            ("views.text", &mut self.text),
+            ("views.comment", &mut self.comment),
+            ("views.accent_bar", &mut self.accent_bar),
+            ("views.footer_bar", &mut self.footer_bar),
+            ("views.mode_label", &mut self.mode_label),
+        ];
+        // 可选节点：主题没写就没有对应的键，列出来只会让 warn 指向一个不存在的路径。
+        for (path, opt) in [
+            ("views.status", &mut self.status),
+            ("views.tooltip", &mut self.tooltip),
+            ("views.toast", &mut self.toast),
+            ("views.menu.root", &mut self.menu_root),
+            ("views.menu.item", &mut self.menu_item),
+            ("views.menu.separator", &mut self.menu_separator),
+        ] {
+            if let Some(n) = opt.as_mut() {
+                nodes.push((path, n));
+            }
+        }
+        nodes
+    }
+}
+
+fn clear_node_font_family(n: &mut RvNode) {
+    n.font_family = None;
+    for sub in [&mut n.selected, &mut n.hover, &mut n.disabled]
+        .into_iter()
+        .flatten()
+    {
+        clear_node_font_family(sub);
     }
 }
 
@@ -312,6 +341,23 @@ mod font_family_tests {
                 ("views.menu.item".to_string(), "Segoe UI".to_string()),
             ],
             "顺序按节点表 + 状态 patch 紧跟其基态；空白与 None 不该出现"
+        );
+    }
+
+    #[test]
+    fn clear_font_families_strips_every_declared_node_and_state() {
+        let mut v = RvViews {
+            text: node(Some("思源宋体")),
+            footer_bar: node(Some("Consolas")),
+            ..Default::default()
+        };
+        v.item.selected = Some(Box::new(node(Some("Consolas Bold"))));
+        v.menu_item = Some(node(Some("Segoe UI")));
+        assert!(!v.declared_font_families().is_empty());
+        v.clear_font_families();
+        assert!(
+            v.declared_font_families().is_empty(),
+            "清完仍有声明：节点表与告警表不同源"
         );
     }
 

@@ -151,6 +151,11 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未随任何版本发布到用户手里（接进设置页的改动与本次迁移在同一个未发布版本内），
     // 且新旧默认值都是 "candidate"，能读到它的只有开发期配置。
     &["schema", "codetable", "frequency", "english_code_scope"],
+    // 并入 `ui.candidate.font_size`（0 = 跟随主题）。它仍被值迁移读取，按下方 ★ 判据
+    // 本不该进来——能进来是因为 [`Config::prune_user_config`] 在清本清单**之前**先把
+    // [`Config::migrate_font_size_follow_theme_value`] 的结果落盘，清的时候它已对生效值
+    // 毫无影响。新增同类条目须照此先落盘迁移。
+    &["ui", "candidate", "font_size_follow_theme"],
     // ⛔ `ui.candidate.comment_max_chars`（已拆成 `_vertical` / `_horizontal`）**刻意不登记**。
     //
     // 本清单的不变量是上一段那句「删掉不改变任何生效值」，而该键**仍在被读取**——
@@ -5629,12 +5634,14 @@ pub struct UiCandidateConfig {
     pub preedit_display: String,
     #[serde(default)]
     pub hide_window: bool,
-    /// 候选文本字号（默认 18；0 亦表示跟随主题 behavior.font_size）。
+    /// 候选文本字号：0（默认）= 跟随主题 `behavior.font_size`，>0 = 用户指定。
+    ///
+    /// 0 可以当「跟随」哨兵，是因为 0 号字本身不是合法取值（R3「外观覆盖主题」）。
+    /// 旧的 `font_size_follow_theme` 开关已并入本键，迁移见
+    /// [`Config::migrate_font_size_follow_theme_value`]。
+    /// serde 缺省（0.0）与 [`Default`] 一致，缺键即跟随主题。
     #[serde(default)]
     pub font_size: f32,
-    /// 字号跟随主题（默认开）：true 时忽略 font_size，用主题 behavior.font_size。
-    #[serde(default)]
-    pub font_size_follow_theme: bool,
     /// 翻页栏显示覆盖："" 跟随主题 / "hide" / "auto"(>1页) / "always"。
     ///
     /// **可按排布分档**（见 [`ByLayout`]）：`"hide"` 横竖共用，`"h:hide v:always"` 分设。
@@ -5904,8 +5911,7 @@ impl Default for UiCandidateConfig {
             layout: "horizontal".to_string(),
             preedit_display: default_preedit_display(),
             hide_window: false,
-            font_size: 18.0,
-            font_size_follow_theme: true,
+            font_size: 0.0,
             pager_bar_display: ByLayout::default(),
             page_number_display: ByLayout::default(),
             max_chars: 16,
@@ -7402,6 +7408,53 @@ impl Config {
     fn migrate_user_layer_value(layer: &mut toml::Value) {
         Self::migrate_show_code_hint_value(layer);
         Self::migrate_comment_max_chars_value(layer);
+        Self::migrate_font_size_follow_theme_value(layer);
+    }
+
+    /// 旧版 `ui.candidate.font_size_follow_theme` 的出厂值，也是缺该键时的生效值。
+    const LEGACY_FONT_SIZE_FOLLOW_DEFAULT: bool = true;
+    /// 旧版 `ui.candidate.font_size` 的出厂值。旧版写回会剪掉「等于出厂值」的键，
+    /// 所以「关了跟随、字号保持 18」的用户文件里只剩 `follow = false`，字号要按它补回。
+    const LEGACY_FONT_SIZE_DEFAULT: f64 = 18.0;
+
+    /// 存量迁移（**层内**、须在反序列化前跑）：`ui.candidate.font_size_follow_theme`（bool）
+    /// + `font_size` 两处表达 → 只剩 `font_size`（0 = 跟随主题，>0 = 用户指定）。
+    ///
+    /// 按**这一层**写了什么判（判据同 [`Self::migrate_user_layer_value`] 的文档）：
+    /// - 写了 `follow = true`                → `font_size = 0`（旧语义下本层的字号被忽略）；
+    /// - 写了 `follow = false`               → 保留本层 `font_size`；本层没写则补旧出厂值 18
+    ///   （见 [`Self::LEGACY_FONT_SIZE_DEFAULT`] 的理由）；
+    /// - 没写 `follow`、但写了 `font_size`   → 旧默认即跟随，那个字号从未生效 ⇒ `font_size = 0`；
+    /// - 两者都没写                          → 不动（新出厂值 0 本就是跟随）。
+    ///
+    /// 迁移后旧键从本层移除。用户文件里的旧键另由 [`Config::prune_user_config`] 先迁移
+    /// **落盘**、再按 [`RETIRED_KEYS`] 清除——只清不迁会把 `follow = false` 用户的字号丢掉。
+    ///
+    /// 已知近似：「没写 follow 就按旧默认 true」没去看下层（L2.5 定制层）是否写过 false。
+    /// 定制层关跟随、用户层只改字号这一组合下，迁移会把用户字号归 0。
+    fn migrate_font_size_follow_theme_value(layer: &mut toml::Value) {
+        let Some(cand) = layer
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("candidate"))
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return;
+        };
+        let follow = match cand.remove("font_size_follow_theme") {
+            Some(v) => v.as_bool().unwrap_or(Self::LEGACY_FONT_SIZE_FOLLOW_DEFAULT),
+            None if cand.contains_key("font_size") => Self::LEGACY_FONT_SIZE_FOLLOW_DEFAULT,
+            None => return,
+        };
+        let size = if follow {
+            toml::Value::Float(0.0)
+        } else {
+            match cand.get("font_size") {
+                Some(v) => v.clone(),
+                None => toml::Value::Float(Self::LEGACY_FONT_SIZE_DEFAULT),
+            }
+        };
+        info!("Migrated ui.candidate.font_size_follow_theme={follow} → font_size={size}");
+        cand.insert("font_size".to_string(), size);
     }
 
     /// 存量迁移（**须在反序列化前**跑，字段已改名）：`schema.pinyin.show_code_hint`(bool)
@@ -7583,9 +7636,14 @@ impl Config {
             },
         };
 
+        // 仍有值迁移读取的退役键，先把迁移结果落盘再清（见 RETIRED_KEYS 里该条的说明）。
+        // 迁移会把旧键从 root 里摘掉，故需单独计数，否则 removed==0 时不写盘、迁移白做。
+        let before = root.clone();
+        Self::migrate_font_size_follow_theme_value(&mut root);
+        let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
         // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
-        let mut removed = prune_retired(&mut root);
+        let mut removed = migrated + prune_retired(&mut root);
         // 冗余键需要出厂默认做逐键比对，取不到时跳过（安全降级为「不清理」的旧行为）。
         if let Some(preset) = Self::preset_for_pruning() {
             removed += prune_redundant(&mut root, &preset);
@@ -8597,6 +8655,10 @@ impl Config {
         if !root.is_table() {
             root = toml::Value::Table(Default::default());
         }
+        // 旧字号开关若还在文件里（`prune_user_config` 没跑过），必须在写新值**之前**迁掉：
+        // 否则写入 `font_size = 0`（等于出厂值 ⇒ 被剪掉）后，残留的 `follow = false` 会在
+        // 下次 load 被迁成 18，用户刚选的「跟随主题」被打回。
+        Self::migrate_font_size_follow_theme_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -10486,8 +10548,7 @@ active = "x"
     #[test]
     fn test_candidate_tuning_defaults_and_methods() {
         let c = Config::default().ui.candidate;
-        assert_eq!(c.font_size, 18.0, "字号默认 18");
-        assert!(c.font_size_follow_theme, "默认跟随主题");
+        assert_eq!(c.font_size, 0.0, "字号默认 0 = 跟随主题");
         assert_eq!(c.max_chars, 16, "默认最大 16 字");
         assert!(c.index_labels.is_empty() && !c.flip_when_above);
         // 未配置 → 全部让位（主题/默认数字由协调器裁决）
@@ -11303,6 +11364,67 @@ scripts = { latin = 42 }
     /// 这条测试就是补上那个缺口：按真实链路走一遍「用户层 ⊕ L1 默认」，断言最终
     /// 反序列化出来的值。关过编码提示的用户升级后提示自己回来，属于本仓反复出现的那类
     /// 「配了没反应 / 自己变回来」的静默失效。
+    /// 旧字号开关迁移：跑真实链路（用户层迁移 → ⊕ L1 默认 → 反序列化），返回生效字号。
+    fn font_size_after_migration(user_toml: &str) -> (f32, toml::Value) {
+        let mut user: toml::Value = toml::from_str(user_toml).unwrap();
+        Config::migrate_user_layer_value(&mut user);
+        let mut merged = toml::Value::try_from(Config::default()).unwrap();
+        merge_value(&mut merged, user.clone());
+        let cfg: Config = merged.try_into().expect("反序列化");
+        (cfg.ui.candidate.font_size, user)
+    }
+
+    #[test]
+    fn migrate_font_size_follow_true_means_follow_theme() {
+        let (fs, user) = font_size_after_migration(
+            "[ui.candidate]\nfont_size = 22\nfont_size_follow_theme = true\n",
+        );
+        assert_eq!(
+            fs, 0.0,
+            "follow=true 时旧字号从未生效，迁移为 0（跟随主题）"
+        );
+        assert!(
+            get_nested(&user, &["ui", "candidate", "font_size_follow_theme"]).is_none(),
+            "旧键须从本层移除"
+        );
+    }
+
+    /// 旧出厂默认即 follow=true：缺该键时写着的字号同样从未生效。
+    #[test]
+    fn migrate_font_size_missing_follow_means_follow_theme() {
+        let (fs, _) = font_size_after_migration("[ui.candidate]\nfont_size = 22\n");
+        assert_eq!(fs, 0.0);
+    }
+
+    #[test]
+    fn migrate_font_size_follow_false_keeps_user_size() {
+        let (fs, _) = font_size_after_migration(
+            "[ui.candidate]\nfont_size = 22\nfont_size_follow_theme = false\n",
+        );
+        assert_eq!(fs, 22.0);
+    }
+
+    /// ★ 旧版写回会剪掉等于出厂值的键：「关跟随、字号保持 18」的文件里只剩 follow=false。
+    /// 不补 18 的话会落到新出厂值 0，用户被悄悄切回跟随主题。
+    #[test]
+    fn migrate_font_size_follow_false_without_size_restores_legacy_default() {
+        let (fs, _) = font_size_after_migration("[ui.candidate]\nfont_size_follow_theme = false\n");
+        assert_eq!(fs, 18.0);
+    }
+
+    #[test]
+    fn migrate_font_size_untouched_layer_follows_theme_by_default() {
+        let (fs, user) = font_size_after_migration("[ui.candidate]\nmax_chars = 9\n");
+        assert_eq!(fs, 0.0);
+        assert!(get_nested(&user, &["ui", "candidate", "font_size"]).is_none());
+    }
+
+    #[test]
+    fn serde_default_of_font_size_matches_default_impl() {
+        let c: UiCandidateConfig = toml::from_str("").unwrap();
+        assert_eq!(c.font_size, UiCandidateConfig::default().font_size);
+    }
+
     #[test]
     fn migrate_show_code_hint_works_through_the_real_layering() {
         for (old, want) in [(false, "off"), (true, "codetable")] {

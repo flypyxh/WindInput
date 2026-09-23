@@ -41,6 +41,40 @@ fn resolve_font_family(family: &str) -> &str {
     if f.is_empty() { DEFAULT_FONT_FAMILY } else { f }
 }
 
+/// 外观字体覆盖主题节点字族（R3「外观覆盖主题」）：用户 `ui.font.family` 非空时，主题
+/// **全部**节点（含状态 patch）的 `font_family` 一律让位——清空后叶子回落渲染器的全局
+/// 字族，即用户字体本身。空 = 不动，主题节点字族照常生效（与改动前一致）。
+///
+/// 完整优先级（候选文字节点）：方案级 `[candidate] font_family` > 用户 `ui.font.family`
+/// > 主题节点 `font_family` > 内置默认 [`DEFAULT_FONT_FAMILY`]；其余节点没有方案级那一档。
+///
+/// `ui.font.fallback` / `ui.font.scripts` **不必**按同一规则处理，主题节点字族本就压不住它们：
+/// - scripts：`create_layout` 里按脚本切段的指派在叶子字族**之后**设置，恒胜过节点字族；
+/// - fallback：默认链另挂了一条不按 base family 筛选的兜底映射（`ensure_fallback` 第 3 段），
+///   base 是主题字族时照样按用户的链接续缺字；CoreText 的 cascade list 是字体级属性，同理。
+///
+/// 所以只有「主字族」这一格会被主题压住，要改的也只有这一格。
+fn apply_user_font(views: &mut wind_theme::RvViews, user_family: &str) {
+    if !user_family.trim().is_empty() {
+        views.clear_font_families();
+    }
+}
+
+/// 方案级 `[candidate] font_family`（空 = 不覆盖）只作用于候选文字节点，理由见
+/// [`CandidateWindow::text_family_override`]。须在 [`apply_user_font`] 之后叠。
+fn apply_scheme_text_font(views: &mut wind_theme::RvViews, scheme_family: &str) {
+    let f = scheme_family.trim();
+    if !f.is_empty() {
+        views.text.font_family = Some(f.to_string());
+    }
+}
+
+/// 生效候选基准字号（逻辑像素）：用户值 > 0 取用户值，否则主题 `behavior.font_size`
+/// （`ui.candidate.font_size` 的 0 = 跟随主题）。
+fn effective_base_font_size(user: f32, theme: i32) -> f32 {
+    if user > 0.0 { user } else { theme as f32 }
+}
+
 /// 把 `[ui.font]` 的三个键折成渲染层的 [`FontPlan`]。
 ///
 /// 纯函数：它承载了本功能全部的「配置怎么变成方案」的判定（链首归一、未知类名处置），
@@ -291,15 +325,26 @@ pub struct CandidateWindow {
     mouse: Rc<RefCell<CandidateMouse>>,
     /// 悬停编码反查气泡
     tooltip: Option<crate::tooltip::Tooltip>,
-    /// 已解析主题（RVNode 树 + palette）；默认兜底（空 palette + 渲染器内置色）
+    /// **生效**主题：[`Self::theme_source`] 叠上外观覆盖（字体 / 字号）之后的那份。
+    /// 渲染与测量一律只读它，由 [`Self::refresh_effective_theme`] 单点产出。
     theme: wind_theme::Resolved,
+    /// 协调器下发的原始主题（未叠外观覆盖）。只供 [`Self::refresh_effective_theme`] 读。
+    theme_source: wind_theme::Resolved,
+    /// 用户外观字体（`ui.font.family`，已 trim）；空 = 跟随主题节点字族。
+    user_font_family: String,
+    /// 生效的候选基准字号（逻辑像素）：用户 `ui.candidate.font_size` > 0 时取它，否则主题
+    /// `behavior.font_size`。由 [`Self::refresh_effective_theme`] 算出，渲染只读它。
+    base_font_logical: f32,
+    /// 上次做过存在性检查的生效主题字族，未变就不再问（每个字族一次 COM 调用）。
+    checked_theme_families: Vec<(String, String)>,
     /// DPI 缩放（主题几何为逻辑像素，渲染时乘此）
     scale: f32,
     /// 竖排布局（候选纵向堆叠）；默认横排。来自 ui.candidate.layout。
     vertical: bool,
     /// 候选**文字节点**的字族覆盖（方案级 `[candidate] font_family`）；空 = 不覆盖。
     ///
-    /// 优先级：方案 > 主题节点 `views.text.font_family` > 全局 `ui.font`。
+    /// 优先级：方案 > 用户 `ui.font.family`（非空）> 主题节点 `views.text.font_family` >
+    /// 内置默认（见 [`apply_user_font`]）。
     /// ⚠️ 只作用于候选文字：序号/编码栏/注释/翻页栏是拉丁与数字，跟着换蒙文字体反而更差；
     /// 要按脚本换字体用全局 `ui.font.scripts`（按字符分，比按节点分更贴合真实问题）。
     text_family_override: String,
@@ -406,6 +451,13 @@ impl CandidateWindow {
             mouse,
             tooltip: crate::tooltip::Tooltip::new(tooltip_events).ok(),
             theme: wind_theme::Resolved::default(),
+            theme_source: wind_theme::Resolved::default(),
+            user_font_family: String::new(),
+            base_font_logical: effective_base_font_size(
+                0.0,
+                wind_theme::Resolved::default().behavior.font_size,
+            ),
+            checked_theme_families: Vec::new(),
             scale: CandidateWindowConfig::get_dpi_scale(),
             vertical: false,
             rotated: false,
@@ -443,13 +495,14 @@ impl CandidateWindow {
         let want = family.trim().to_string();
         if want != self.text_family_override {
             tracing::info!(
-                "候选文字字族：「{}」→「{}」（方案级 [candidate] font_family；空 = 回落主题节点或 ui.font.family）",
+                "候选文字字族：「{}」→「{}」（方案级 [candidate] font_family；空 = 回落 ui.font.family 或主题节点）",
                 self.text_family_override,
                 want
             );
             self.warn_if_family_missing(&want, "方案级 [candidate] font_family");
         }
         self.text_family_override = want;
+        self.refresh_effective_theme();
     }
 
     /// 设置候选布局方向。三位的语义见 [`Self::rotated`] / [`Self::upright`] 与
@@ -482,6 +535,7 @@ impl CandidateWindow {
     /// 设置候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
     pub fn set_font_size_override(&mut self, font_size: f32) {
         self.font_size_override = font_size.max(0.0);
+        self.refresh_effective_theme();
     }
 
     /// 设置候选窗尺寸下限（抗抖动）。来自 ui.candidate.min_window_width_horizontal /
@@ -759,6 +813,8 @@ impl CandidateWindow {
         let resolved = resolve_font_family(family);
         self.warn_if_family_missing(resolved, "ui.font.family");
         self.text_renderer.set_font_family(resolved);
+        self.user_font_family = family.trim().to_string();
+        self.refresh_effective_theme();
     }
 
     /// 设置候选字体的回退链与按脚本的字体指派（来自 `ui.font.fallback` / `ui.font.scripts`）。
@@ -998,11 +1054,32 @@ impl CandidateWindow {
 
     /// 应用主题（协调器下发）。同步更新悬停 tooltip 配色。
     pub fn set_theme(&mut self, theme: wind_theme::Resolved) {
+        self.theme_source = theme;
+        self.refresh_effective_theme();
         if let Some(tip) = self.tooltip.as_mut() {
-            tip.set_theme(&theme);
+            tip.set_theme(&self.theme);
         }
-        self.warn_missing_theme_families(&theme);
-        self.theme = theme;
+    }
+
+    /// 由原始主题 + 外观覆盖算出生效主题（[`Self::theme`]）与生效字号——**唯一**的合并点。
+    ///
+    /// 在四个低频入口（换主题 / 用户字体 / 方案级字体 / 用户字号）调用，不在渲染热路径。
+    /// 渲染与测量（`build_tree` 里的 `measure_style` 与各叶子）都只读结果，
+    /// 两条路径因此天然同源，不在节点构建处散写「用户有值就用用户的」。
+    fn refresh_effective_theme(&mut self) {
+        let mut t = self.theme_source.clone();
+        apply_user_font(&mut t.views, &self.user_font_family);
+        // 存在性告警按**生效**字族查：被用户字体覆盖掉的主题字族不会被用到，报它缺字体
+        // 只会误导。方案级覆盖在查完之后才叠上——它有自己的告警（来源名不同）。
+        let declared = t.views.declared_font_families();
+        if declared != self.checked_theme_families {
+            self.warn_missing_theme_families(&declared);
+            self.checked_theme_families = declared;
+        }
+        apply_scheme_text_font(&mut t.views, &self.text_family_override);
+        self.base_font_logical =
+            effective_base_font_size(self.font_size_override, t.behavior.font_size);
+        self.theme = t;
     }
 
     /// 主题各节点声明的字族逐个查一次存在性，缺的记 warn。见 [`Self::warn_if_family_missing`]。
@@ -1016,11 +1093,11 @@ impl CandidateWindow {
     ///
     /// **按字族去重**：一份主题里十来个节点常配同一个名字，缺失时刷十条一模一样的 warn
     /// 只会把日志淹掉。留第一个声明它的节点路径，用户照着去主题文件里搜那个名字就够了。
-    fn warn_missing_theme_families(&self, theme: &wind_theme::Resolved) {
+    fn warn_missing_theme_families(&self, declared: &[(String, String)]) {
         let mut seen = std::collections::HashSet::new();
-        for (path, family) in theme.views.declared_font_families() {
+        for (path, family) in declared {
             if seen.insert(family.clone()) {
-                self.warn_if_family_missing(&family, &format!("主题节点 {path}.font_family"));
+                self.warn_if_family_missing(family, &format!("主题节点 {path}.font_family"));
             }
         }
     }
@@ -1112,7 +1189,7 @@ impl CandidateWindow {
         if (new_scale - self.scale).abs() > 0.01 {
             self.scale = new_scale;
             self.text_renderer
-                .set_base_size((self.theme.behavior.font_size as f32) * new_scale);
+                .set_base_size(self.base_font_logical * new_scale);
         }
 
         // ── 渲染计时（定位长按翻页卡顿耗时段）──
@@ -1290,7 +1367,7 @@ impl CandidateWindow {
         if (new_scale - self.scale).abs() > 0.01 {
             self.scale = new_scale;
             self.text_renderer
-                .set_base_size((self.theme.behavior.font_size as f32) * new_scale);
+                .set_base_size(self.base_font_logical * new_scale);
         }
 
         let mut root = self.build_tree(false);
@@ -1468,7 +1545,7 @@ impl CandidateWindow {
         if (new_scale - self.scale).abs() > 0.01 {
             self.scale = new_scale;
             self.text_renderer
-                .set_base_size((self.theme.behavior.font_size as f32) * new_scale);
+                .set_base_size(self.base_font_logical * new_scale);
         }
 
         let mut root = self.build_tree(false);
@@ -2177,17 +2254,14 @@ impl CandidateWindow {
         use wind_theme::schema::Dim;
         let t = &self.theme;
         let v = &t.views;
-        // 候选文字的字族：**方案级覆盖优先于主题节点**，空 = 不覆盖。
+        // 候选文字的字族：优先级（方案 > 用户 > 主题 > 默认）已在
+        // `refresh_effective_theme` 折进生效主题，这里只取结果。
         //
-        // ★ 只算一次、四个消费点（两处测量 + 候选叶子 + 占位行叶子）共用同一个值。
+        // ★ 只取一次、四个消费点（两处测量 + 候选叶子 + 占位行叶子）共用同一个值。
         // 各自去取的话必然漂移，而漂移的两种表现都不报错：测量与渲染不同源 ⇒ 预算按一种
         // 字体算、排版按另一种走，窗口右侧留白或右缘溢出；占位行漏掉 ⇒ 它与真实行行高不等
         // （本文件下方 `padded_rows_equal_real_rows_in_height` 已为同一件事钉过一次）。
-        let text_family: Option<String> = if self.text_family_override.trim().is_empty() {
-            v.text.font_family.clone()
-        } else {
-            Some(self.text_family_override.clone())
-        };
+        let text_family: Option<String> = v.text.font_family.clone();
         // above=true（窗口被上翻到光标上方）时，据两个正交开关派生上方专属行为：
         //   flip_cands = 反转候选项排列顺序（ui.candidate.flip_when_above，仅竖排有意义）
         //   swap_bands = 交换编码区↔候选区上下位置（ui.candidate.swap_preedit_when_above，编码沉底贴光标）
@@ -2209,14 +2283,10 @@ impl CandidateWindow {
             && !self.preedit_embedded
             && self.pager_visible();
         let s = self.scale;
-        // 字号：base = 用户覆盖(ui.candidate.font_size>0) 否则主题 behavior.font_size（默认 18）× DPI；
+        // 字号：base = 生效基准字号（用户 ui.candidate.font_size>0 否则主题 behavior.font_size，
+        // 合并见 `refresh_effective_theme`）× DPI；
         // 序号/注释/预编辑按各节点 font_size（相对主字号的有符号逻辑偏移）调整。
-        let base_logical = if self.font_size_override > 0.0 {
-            self.font_size_override
-        } else {
-            t.behavior.font_size as f32
-        };
-        let base_fs = base_logical * s;
+        let base_fs = self.base_font_logical * s;
         let node_fs = |n: &RvNode| (base_fs + n.font_size * s).max(6.0 * s);
         let index_fs = node_fs(&v.index);
         let text_fs = node_fs(&v.text);
@@ -6037,5 +6107,176 @@ mod theme_font_check_tests {
         let before = w.text_renderer.asked_families().len();
         w.set_theme(wind_theme::Resolved::default());
         assert_eq!(w.text_renderer.asked_families().len(), before);
+    }
+}
+
+/// 外观覆盖主题（R3）：候选窗字体 / 字号的生效优先级。
+///
+/// 断言落在 `build_tree` 产出的叶子上——渲染与测量（`measure_style`）读的是同一份生效主题，
+/// 叶子字族/字号就是两条路径共同的输入。mock 后端测量不看字族，故字族只做结构断言，
+/// 字号额外做一条测量断言。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod font_precedence_tests {
+    use super::*;
+    use wind_theme::RvNode;
+
+    fn node(family: &str) -> RvNode {
+        RvNode {
+            font_family: Some(family.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 主题给候选窗全部相关节点都配了字族（编码栏、序号、文字、注释、翻页栏、模式徽标）。
+    fn themed() -> wind_theme::Resolved {
+        let mut t = wind_theme::Resolved::default();
+        t.views.text = node("主题宋体");
+        t.views.index = node("主题楷体");
+        t.views.comment = node("主题楷体");
+        t.views.preedit_bar = node("主题黑体");
+        t.views.footer_bar = node("主题黑体");
+        t.views.mode_label = node("主题黑体");
+        t
+    }
+
+    fn win(theme: wind_theme::Resolved) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_theme(theme);
+        w
+    }
+
+    fn fill(w: &mut CandidateWindow) {
+        let items = ["候选", "词"]
+            .iter()
+            .map(|t| CandidateItem {
+                text: t.to_string(),
+                code: String::new(),
+                label: String::new(),
+                tooltip: String::new(),
+                comment: "注".to_string(),
+                no_index: false,
+            })
+            .collect();
+        w.update("abc", 3, "中", items, 0, -1, 1, 2);
+    }
+
+    /// 整棵树所有叶子声明的字族（去重），以及候选文字叶子的字族。
+    fn families(w: &mut CandidateWindow) -> (Vec<String>, Option<String>) {
+        fill(w);
+        let root = w.build_tree(false);
+        fn walk(v: &View, all: &mut Vec<String>, text: &mut Option<String>) {
+            if let Some(f) = &v.font_family
+                && !all.contains(f)
+            {
+                all.push(f.clone());
+            }
+            if v.text.as_deref() == Some("候选") {
+                *text = v.font_family.clone();
+            }
+            for c in &v.children {
+                walk(c, all, text);
+            }
+        }
+        let (mut all, mut text) = (Vec::new(), None);
+        walk(&root, &mut all, &mut text);
+        (all, text)
+    }
+
+    #[test]
+    fn default_tier_no_family_anywhere() {
+        let mut w = win(wind_theme::Resolved::default());
+        let (all, text) = families(&mut w);
+        assert!(
+            all.is_empty(),
+            "无主题/用户/方案字族时叶子应全部走内置默认：{all:?}"
+        );
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn theme_tier_applies_when_user_family_empty() {
+        let mut w = win(themed());
+        w.set_font_family("");
+        let (all, text) = families(&mut w);
+        assert_eq!(text.as_deref(), Some("主题宋体"));
+        assert!(
+            all.contains(&"主题黑体".to_string()),
+            "非文字节点仍跟主题：{all:?}"
+        );
+    }
+
+    /// ★ 用户字体非空：全部节点（不只候选文字）的主题字族都让位，叶子回落全局字族（=用户字体）。
+    #[test]
+    fn user_tier_beats_theme_on_every_node() {
+        let mut w = win(themed());
+        w.set_font_family("用户字体");
+        let (all, text) = families(&mut w);
+        assert_eq!(text, None, "候选文字应回落全局字族（用户字体）");
+        assert!(all.is_empty(), "仍有节点带着主题字族：{all:?}");
+    }
+
+    /// 顺序无关：先设用户字体、后换主题，结果相同（启动时两条命令的到达序不承重）。
+    #[test]
+    fn user_tier_survives_a_later_theme_switch() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.set_font_family("用户字体");
+        w.set_theme(themed());
+        let (all, _) = families(&mut w);
+        assert!(all.is_empty(), "{all:?}");
+    }
+
+    #[test]
+    fn scheme_tier_beats_user_on_text_only() {
+        let mut w = win(themed());
+        w.set_font_family("用户字体");
+        w.set_text_family_override("方案字体");
+        let (all, text) = families(&mut w);
+        assert_eq!(text.as_deref(), Some("方案字体"));
+        assert_eq!(all, vec!["方案字体".to_string()], "方案级只作用于候选文字");
+    }
+
+    #[test]
+    fn clearing_user_family_falls_back_to_theme() {
+        let mut w = win(themed());
+        w.set_font_family("用户字体");
+        w.set_font_family("  ");
+        let (_, text) = families(&mut w);
+        assert_eq!(text.as_deref(), Some("主题宋体"));
+    }
+
+    /// 被用户字体盖掉的主题字族不该被问存在性（否则对用不到的字体报缺失）。
+    #[test]
+    fn overridden_theme_families_are_not_checked() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.set_font_family("用户字体");
+        let before = w.text_renderer.asked_families().len();
+        w.set_theme(themed());
+        assert_eq!(&w.text_renderer.asked_families()[before..], [] as [&str; 0]);
+    }
+
+    /// 字号：用户值 > 0 胜过主题，0 跟随主题；测量与叶子同源（窗口宽度随之变）。
+    #[test]
+    fn font_size_user_beats_theme_and_zero_follows() {
+        let mut t = wind_theme::Resolved::default();
+        t.behavior.font_size = 18;
+        let mut w = win(t);
+        fill(&mut w);
+        let width = |w: &CandidateWindow| {
+            let mut root = w.build_tree(false);
+            root.layout(0.0, 0.0, &w.text_renderer);
+            root.measured_size().0
+        };
+        let theme_w = width(&w);
+        assert_eq!(w.base_font_logical, 18.0);
+        w.set_font_size_override(30.0);
+        assert_eq!(w.base_font_logical, 30.0);
+        let user_w = width(&w);
+        assert!(user_w > theme_w, "用户字号没作用到测量上");
+        w.set_font_size_override(0.0);
+        assert_eq!(w.base_font_logical, 18.0, "0 = 跟随主题");
     }
 }

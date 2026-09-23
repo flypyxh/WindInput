@@ -204,6 +204,8 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // 候选字号/字体先于主题下发（理由见 `send_candidate_font`）。
+        coordinator.send_candidate_font(&coordinator.rt().config);
         coordinator.push_theme(&name, coordinator.resolve_theme_dark());
         // 下发候选布局方向（ui.candidate.layout）。
         let orientation =
@@ -218,11 +220,8 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetPreeditEmbedded(embedded));
-        // 候选字号覆盖 + 悬停提示延迟初值
+        // 悬停提示延迟等初值（候选字号/字体已在 push_theme 之前下发）
         let rt0 = coordinator.rt();
-        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFontSize(
-            rt0.config.ui.candidate.font_size,
-        ));
         let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFlipWhenAbove(
             rt0.config.ui.candidate.flip_when_above,
         ));
@@ -253,7 +252,7 @@ impl Coordinator {
         coordinator.sync_comment_dicts();
         // emoji 扩展表首次加载（`[input.emoji]`，出厂 enabled=false ⇒ 不打开任何文件）。
         coordinator.sync_emoji_dict();
-        // 统一应用外观项（幂等）：补齐上面手动块未含的候选字体族 / 翻页栏 / 页码 / 字号跟随主题，
+        // 统一应用外观项（幂等）：补齐上面手动块未含的翻页栏 / 页码等外观项，
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
         coordinator

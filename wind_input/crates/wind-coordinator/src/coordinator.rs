@@ -4451,6 +4451,29 @@ impl Coordinator {
     /// 按当前配置（bundle）重新下发外观相关 UI 指令并同步运行时态。
     /// 热重载用：候选排列方向 / 编码显示方式 / 候选窗显隐 改动即时生效（无需重启）。
     /// 与命令栏 ime.toggle 共写同一组运行时 Mutex；以 config 为准重置（config 为持久化真相源）。
+    /// 下发候选字号与字体（`ui.candidate.font_size` / `ui.font.*`）。原样下发用户值：
+    /// 与主题的合并（0 / 空 = 跟随主题）只在渲染端 `CandidateWindow::refresh_effective_theme`
+    /// 一处完成，这里不做判断。
+    ///
+    /// 启动时须排在首次 `push_theme` **之前**（见 construct.rs）：用户字体先到，主题到达时
+    /// 被它覆盖掉的主题字族就不会被当作「将要使用」去查存在性、误报缺字体。
+    pub(crate) fn send_candidate_font(&self, config: &wind_config::Config) {
+        let _ = self.ui_tx.send(UiCommand::SetCandidateFontSize(
+            config.ui.candidate.font_size,
+        ));
+        // 候选字体（ui.font.family / fallback / scripts；family 空=跟随主题节点字族/内置默认）。
+        let font = &config.ui.font;
+        let _ = self.ui_tx.send(UiCommand::SetCandidateFont {
+            family: font.family.clone(),
+            fallback: font.fallback.clone(),
+            scripts: font
+                .scripts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        });
+    }
+
     pub(crate) fn apply_ui_config(&self) {
         let bundle = self.rt();
         let cand = &bundle.config.ui.candidate;
@@ -4489,24 +4512,7 @@ impl Coordinator {
             self.clear_hover();
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
-        // 候选字号覆盖（ui.candidate.font_size，0=跟随主题）；font_size_follow_theme=true 时强制跟随。
-        let font_size = if cand.font_size_follow_theme {
-            0.0
-        } else {
-            cand.font_size
-        };
-        let _ = self.ui_tx.send(UiCommand::SetCandidateFontSize(font_size));
-        // 候选字体（ui.font.family / fallback / scripts；family 空=渲染端内置默认）。
-        let font = &bundle.config.ui.font;
-        let _ = self.ui_tx.send(UiCommand::SetCandidateFont {
-            family: font.family.clone(),
-            fallback: font.fallback.clone(),
-            scripts: font
-                .scripts
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        });
+        self.send_candidate_font(&bundle.config);
         // 翻页栏 / 页码显示覆盖（ui.candidate.pager_bar_display / page_number_display）
         let (pager_h, pager_v) = cand.pager_bar_display.both_str();
         let _ = self.ui_tx.send(UiCommand::SetPagerDisplay {

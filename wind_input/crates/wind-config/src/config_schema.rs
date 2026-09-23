@@ -560,7 +560,6 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.fast_typing_window_ms", Int),
     f("ui.candidate.fast_first_show_fallback_ms", Int),
     f("ui.candidate.font_size", Float),
-    f("ui.candidate.font_size_follow_theme", Bool),
     // 这两项可按候选窗排布分档（`"h:hide v:always"`），故是 LayoutEnum 而非 Enum——
     // 值域不变，只是每一档各过一遍。
     f(

@@ -1161,8 +1161,9 @@ fast_typing_window_ms = 100
 # 必须远小于 wait 档的 150ms——Word 这类宿主不发 OnLayoutChange 且组合坐标要 60~190ms 才到，
 # 连打时组合只活 27~57ms，上屏即作废 timer，150ms 兜底永远不会到期（fast 就退化成 wait）。
 fast_first_show_fallback_ms = 25
-font_size = 18
-font_size_follow_theme = true
+# 候选字号：0 = 跟随主题的 behavior.font_size；>0 = 自定字号（覆盖主题）。
+# 旧版的 font_size_follow_theme 开关已并入本项，升级时自动迁移。
+font_size = 0
 per_page = 7
 per_page_extended = 0
 max_chars = 16

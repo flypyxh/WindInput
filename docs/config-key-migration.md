@@ -100,6 +100,7 @@
 | 旧 | 现行 |
 |---|---|
 | `ui.candidate.*`（12） | 不变 |
+| `ui.candidate.font_size_follow_theme` | 并入 `ui.candidate.font_size`（0.123 起，0 = 跟随主题；值迁移见 `Config::migrate_font_size_follow_theme_value`，旧键登记 `RETIRED_KEYS`） |
 | `ui.font.*`（3） | 不变 |
 | `ui.theme.{name,style}` | 不变 |
 | `ui.mode_indicator.style` | 不变 |
