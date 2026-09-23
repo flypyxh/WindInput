@@ -273,6 +273,32 @@ fn truncate_with_abbrev_quota(cands: &mut Vec<Candidate>, max_candidates: usize)
 /// 这正是 step 6.5 的模糊降级拆不掉的根因。
 const FUZZY_WEIGHT_SCALE: f64 = 0.5;
 
+/// 用户/临时层的**简拼**命中遇到同文已有候选时：合并进去，而不是整条丢弃。
+///
+/// 整串简拼（step 6.1）与前缀回退（`recall_abbrev_prefix` ③④）共用。规则照搬全拼
+/// step 6 的同文合并（那边有完整论证），只取与简拼相关的两条：
+/// - `weight` 取 **max**，且只在已有候选**本身在简拼层**（`is_abbrev`）时才动——
+///   跨层的同文（例如残码整句）描述的是另一种解释，用户权重不该借合并越层；
+/// - 来源标记按命中的实际归属置位，存储码随之带走（右键删除按标记选表、按码拼 key）。
+///
+/// 旧行为是 `continue`：系统库已有的词（真实词库「拜城县」w=1），用户学过（w=800）后
+/// 在 `bcx` 下仍排第 46 位，与没学过一模一样，右键删除也找不到它的记录。
+fn merge_store_abbrev_hit(existing: &mut Candidate, hit: &Candidate, weight: i32) {
+    if existing.is_abbrev {
+        existing.weight = existing.weight.max(weight);
+    }
+    if hit.meta.is_temp_dict {
+        existing.meta.is_temp_dict = true;
+    } else {
+        existing.meta.is_user_dict = true;
+    }
+    existing.meta.store_code = hit
+        .meta
+        .store_code
+        .clone()
+        .or_else(|| Some(hit.code.as_str().into()));
+}
+
 /// 对模糊命中施加权重折扣：`weight × 0.5^fuzzy_edits`，见 [`FUZZY_WEIGHT_SCALE`]。
 ///
 /// `fuzzy_edits` 是**模糊改动处数**而非音节数：一个音节可以声母、韵母同时模糊
@@ -1364,16 +1390,25 @@ impl PinyinEngine {
                 let Some(edits) = [plain_edits, mixed_edits].into_iter().flatten().min() else {
                     continue;
                 };
-                {
-                    push(
-                        cands,
-                        store_base,
-                        c.text,
-                        c.code,
-                        fuzzy_penalized(c.weight, edits),
-                        c.boundary,
-                        edits > 0,
-                    );
+                let w = fuzzy_penalized(c.weight, edits);
+                // 同文已在（本切点或更早切点的系统词）：合并，不丢弃（见 merge_store_abbrev_hit）。
+                if let Some(existing) = cands.iter_mut().find(|x| x.text == c.text) {
+                    merge_store_abbrev_hit(existing, &c, w);
+                    continue;
+                }
+                let before = cands.len();
+                push(
+                    cands,
+                    store_base,
+                    c.text.clone(),
+                    c.code.clone(),
+                    w,
+                    c.boundary,
+                    edits > 0,
+                );
+                // `push` 新建的候选不带来源：补上，与 step 6.1 新增的用户词同样可删、可辨。
+                if let Some(pushed) = cands.get_mut(before) {
+                    pushed.meta = c.meta;
                 }
             }
         }
@@ -3595,7 +3630,7 @@ impl Engine for PinyinEngine {
                     stroke_is_plain_abbrev,
                     &mixed_pats,
                 ) {
-                    if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
+                    if c.text.is_empty() {
                         continue;
                     }
                     // 比对基准是原始击键（见 `abbr_query`）：双拼下 query 已是转换结果，
@@ -3629,6 +3664,13 @@ impl Engine for PinyinEngine {
                     let Some(edits) = [plain_edits, mixed_edits].into_iter().flatten().min() else {
                         continue;
                     };
+                    // 同文已在（系统简拼候选）：合并，不丢弃。判据要先过——没过判据的命中
+                    // 不是这串击键的解释，不该给同文候选提权。
+                    if let Some(existing) = candidates.iter_mut().find(|x| x.text == c.text) {
+                        let w = fuzzy_penalized(c.weight, edits);
+                        merge_store_abbrev_hit(existing, &c, w);
+                        continue;
+                    }
                     c.source = CandidateSource::Pinyin;
                     // **保留全拼码**（连同同域的 boundary），不覆盖成简拼串。
                     //

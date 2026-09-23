@@ -169,3 +169,77 @@ fn prefix_fallback_gives_store_layer_its_own_quota() {
         "短串下用户词本就该在: {short:?}"
     );
 }
+
+/// 同文合并：系统库**已有**的词（真实词库里「拜城县」w=1），用户学过之后简拼下也要认
+/// 用户的权重，并带上来源标记。
+///
+/// 旧行为：简拼的用户层召回（整串 step 6.1 与前缀回退 ③④）遇到同文系统候选就
+/// `continue`，用户那条的权重与标记整条丢掉 —— 学过的「拜城县」在 `bcx` 下仍是第 46 位
+/// （真实词库），与没学过一模一样。全拼那条（step 6）早就改成了「同文合并、weight 取
+/// max」（`自激` 那一轮），简拼这两处漏了。
+fn cand<'a>(
+    r: &'a [wind_candidate::Candidate],
+    text: &str,
+) -> Option<(usize, &'a wind_candidate::Candidate)> {
+    r.iter().enumerate().find(|(_, c)| c.text == text)
+}
+
+#[test]
+fn learned_word_already_in_system_dict_is_lifted_in_plain_abbrev() {
+    let s = store("merge_plain");
+    s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b100001001)
+        .unwrap();
+    let e = engine_with_store("merge_plain", BCX_ENTRIES.len(), s);
+    let r = e.convert("bcx", 300).unwrap().candidates;
+    let (i, c) = cand(&r, "拜城县").expect("应召回");
+    assert_eq!(
+        i,
+        0,
+        "w=800 高于键下所有系统词（最高 517），应排首位: {:?}",
+        texts(&e, "bcx", 5)
+    );
+    assert!(
+        c.meta.is_temp_dict,
+        "合并后要带临时词标记（右键删除按它选表）"
+    );
+}
+
+#[test]
+fn learned_word_already_in_system_dict_is_lifted_in_mixed_abbrev() {
+    let s = store("merge_mixed");
+    s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b100001001)
+        .unwrap();
+    let e = engine_with_store("merge_mixed", BCX_ENTRIES.len(), s);
+    let r = e.convert("baicx", 300).unwrap().candidates;
+    let (_, c) = cand(&r, "拜城县").expect("应召回");
+    assert_eq!(c.weight, 800, "混合简拼下同样取用户权重");
+    assert!(c.meta.is_temp_dict);
+}
+
+/// 前缀回退（`bcxrmzf` 的分段候选）同理：用户那条要么合并进同文系统候选，要么自己
+/// 新增时也带上标记。
+#[test]
+fn learned_word_already_in_system_dict_is_lifted_in_prefix_fallback() {
+    let s = store("merge_fallback");
+    s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b100001001)
+        .unwrap();
+    let e = engine_with_store("merge_fallback", BCX_ENTRIES.len(), s);
+    let r = e.convert("bcxrmzf", 300).unwrap().candidates;
+    let (_, c) = cand(&r, "拜城县").expect("应召回");
+    assert_eq!(c.weight, 800);
+    assert!(c.meta.is_temp_dict);
+}
+
+/// 合并只**提权不降权**（同 step 6）：用户权重低于系统时保留系统值。
+#[test]
+fn merge_never_lowers_system_weight() {
+    let s = store("merge_lower");
+    // 「不出现」系统 w=517，用户库里给它 10。
+    s.add_user_word("pinyin", "buchuxian", "不出现", 10, 0b100101)
+        .unwrap();
+    let e = engine_with_store("merge_lower", BCX_ENTRIES.len(), s);
+    let r = e.convert("bcx", 300).unwrap().candidates;
+    let (i, c) = cand(&r, "不出现").expect("应召回");
+    assert_eq!((i, c.weight), (0, 517));
+    assert!(c.meta.is_user_dict);
+}
