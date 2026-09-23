@@ -135,6 +135,58 @@ fn space_select_appends_space_when_capitalized() {
     assert_eq!(text, format!("{top} "), "首字母大写选首选后应补一个空格");
 }
 
+/// 选中**大小写变形**候选上屏，同样要补空格（GH#152）。
+///
+/// 变形（`case_variants`，英文方案出厂关）与原文同属 `english_head_candidates` 构造的头部
+/// 候选，`source` 为 `None`；判据第二分支只认「与原码逐字节相等」，于是原文补、变形不补。
+/// 用词库里没有的串，头部三条的位次就是确定的：`[原文, 首字母大写, 全大写]`。
+#[test]
+fn case_variant_select_appends_space() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = english_config(true);
+    cfg.schema.english.case_variants = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    type_word(&coord, "qzxv");
+    let page = coord.debug_page_texts();
+    assert_eq!(
+        page.get(..3),
+        Some(&["qzxv".to_string(), "Qzxv".to_string(), "QZXV".to_string()][..]),
+        "前提：头部应为原文 + 两条变形，实际 {page:?}"
+    );
+
+    let text = commit_text(&coord.handle_key_event(&key_event(VK_2, EVENT_KEY_DOWN)));
+    assert_eq!(text, "Qzxv ", "选首字母大写变形后应补一个空格");
+
+    type_word(&coord, "qzxv");
+    let text = commit_text(&coord.handle_key_event(&key_event(VK_3, EVENT_KEY_DOWN)));
+    assert_eq!(text, "QZXV ", "选全大写变形后应补一个空格");
+}
+
+/// CapsLock 全大写档下选首选（原文头部候选被整列套形成全大写）同样补空格。
+///
+/// 档位投影作用于**含头部候选**的整列：原文 `qzxv` 显示为 `QZXV`、`source` 仍为 `None`，
+/// 走的是与变形候选同一条判据。钉住它，免得有人以为档位候选恒是词库来源。
+#[test]
+fn capslock_upper_tier_select_appends_space() {
+    if !has_english_schema() {
+        return;
+    }
+    let mut cfg = english_config(true);
+    cfg.input.english_case_cycle_key = "capslock".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    type_word(&coord, "qzxv");
+    assert!(coord.debug_cycle_english_case(), "前提：应切到全大写档");
+    let top = coord.debug_page_texts().first().cloned().expect("应有候选");
+    assert_eq!(top, "QZXV", "前提：全大写档首选应是套形后的原文");
+
+    let text = commit_text(&coord.handle_key_event(&key_event(VK_SPACE, EVENT_KEY_DOWN)));
+    assert_eq!(text, "QZXV ", "全大写档选首选后应补一个空格");
+}
+
 /// 反向对照：开关关闭时**不得**补空格。
 ///
 /// 没有这一条，「恒补空格」的实现也能让上面那条通过——本项的缺陷史正是「判据看着对、

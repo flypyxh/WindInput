@@ -3037,10 +3037,24 @@ impl Coordinator {
     ///
     /// 两侧用同一个 `cased_or_buffer` 取原码，故 `==` 逐字节相等，判据继续严格表达
     /// 「上屏的就是所打原码」。⚠️ **不要改成 `eq_ignore_ascii_case`**：那是逆命题谬误
-    /// ——「大小写无关相等」只说明候选是输入串的**某个**大小写变体，而变体不止原码一个，
-    /// 会连 `case_variants` 的变形候选（`hel`→`HEL`）、CapsLock 档位候选、以及缩写类短语
-    /// （打 `usa` 选中 `USA`，`source == Phrase`）一并补上空格 —— 最后一条正好违反上面
-    /// 第一条理由里写的「短语等其它来源不该补空格」。
+    /// ——「大小写无关相等」只说明候选是输入串的**某个**大小写变体，会连缩写类短语
+    /// （打 `usa` 选中 `USA`，`source == Phrase`）一并补上空格 —— 正好违反上面第一条理由
+    /// 里写的「短语等其它来源不该补空格」。
+    ///
+    /// # 第三个判据：头部候选里的大小写变形（GH#152）
+    ///
+    /// `case_variants` 的变形（`hel` → `Hel` / `HEL`）与原文同属头部候选、同样没有
+    /// `source`，是「所打原码换一种大小写」—— 用户拍板：选它上屏也补空格。判据取
+    /// **`source == None` 且文本 ∈ `key_convert::en_case_variants(input)`**，两半缺一不可：
+    /// - 只看文本就退回上面那个 `eq_ignore_ascii_case` 的坑（`USA` 恰好也是 `usa` 的全大写形）；
+    /// - 用 `en_case_variants` 而不是「大小写无关相等」，是因为变形只有这三种形态、且与
+    ///   头部候选的构造**同一个函数**，判据与产出同源。
+    ///
+    /// CapsLock 档位（`apply_english_case`）整列套形、**含头部候选**：原文 `hel` 在全大写档
+    /// 显示为 `HEL`、`source` 仍为 `None`，同样经这一条补空格 —— 与同档位的词库候选
+    /// （`source == English`，第一分支）一致。
+    ///
+    /// 判据本体在 [`english_text_counts_as_input`]（纯函数，便于单测钉住短语反例）。
     ///
     /// ⚠️ 非英文**语境**不会误中：`english_space_enabled_in` 要么要求 `active_is_english()`
     /// （英文方案），要么要求 `state.active == TempEnglish`（临英 overlay），中文语境下两条
@@ -3072,8 +3086,7 @@ impl Coordinator {
         // 现由键盘路径的 `temp_english_select_appends_space` 间接保障 —— 两条路自本次起
         // **共用同一个判据**（就是下面这个表达式）。若日后有人把这两条路的判据拆开写，
         // 这层间接保障立刻失效，届时必须补真测试。
-        (source == CandidateSource::English || (!input.is_empty() && text == input))
-            && self.english_space_enabled_in(state)
+        english_text_counts_as_input(source, text, input) && self.english_space_enabled_in(state)
     }
 
     /// 词频记账用的码——**码表与拼音/英文口径不同**，这是两类方案的语义差异。
@@ -4536,6 +4549,59 @@ impl Coordinator {
             chinese_mode,
             has_new_composition: false,
         }
+    }
+}
+
+/// [`Coordinator::english_appends_space`] 的「这条候选算不算英文内容」一半（不含开关）。
+///
+/// 三个判据的理由见该方法文档：英文词库来源 / 与所打原码逐字节相等 / 无来源的头部候选
+/// 且文本是所打原码的某种大小写形态（GH#152）。
+pub(crate) fn english_text_counts_as_input(
+    source: CandidateSource,
+    text: &str,
+    input: &str,
+) -> bool {
+    if source == CandidateSource::English {
+        return true;
+    }
+    if input.is_empty() {
+        return false;
+    }
+    text == input
+        || (source == CandidateSource::None
+            && crate::key_convert::en_case_variants(input)
+                .iter()
+                .any(|v| v == text))
+}
+
+#[cfg(test)]
+mod english_text_counts_as_input_tests {
+    use super::english_text_counts_as_input;
+    use wind_candidate::CandidateSource as S;
+
+    /// 头部候选的大小写变形算原码（GH#152）。
+    #[test]
+    fn head_case_variants_count() {
+        assert!(english_text_counts_as_input(S::None, "hel", "hel"));
+        assert!(english_text_counts_as_input(S::None, "Hel", "hel"));
+        assert!(english_text_counts_as_input(S::None, "HEL", "hel"));
+        assert!(english_text_counts_as_input(S::None, "hel", "Hel"));
+    }
+
+    /// ★ 反例：缩写类短语（打 `usa` 选 `USA`）文本恰好是全大写形，但来源是短语，不算。
+    /// 没有这条，把判据简化成「只看文本」也不会有任何测试变红。
+    #[test]
+    fn phrase_with_case_variant_text_does_not_count() {
+        assert!(!english_text_counts_as_input(S::Phrase, "USA", "usa"));
+        assert!(!english_text_counts_as_input(S::Assoc, "Hel", "hel"));
+    }
+
+    /// 非大小写形态（混合大小写、别的词）不算；空输入一律不算。
+    #[test]
+    fn other_forms_do_not_count() {
+        assert!(!english_text_counts_as_input(S::None, "hEl", "hel"));
+        assert!(!english_text_counts_as_input(S::None, "help", "hel"));
+        assert!(!english_text_counts_as_input(S::None, "", ""));
     }
 }
 
