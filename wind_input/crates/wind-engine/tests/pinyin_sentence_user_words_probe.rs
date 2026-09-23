@@ -176,3 +176,66 @@ fn store_node_lookup_cost_on_real_dict() {
         );
     }
 }
+
+/// 用户反馈现场（`bcxrmzf` 丢前缀「拜城县」）：临时词 + 纯简拼长串，真实词库下的位次。
+///
+/// 打印关 / 开两态的前 15 个候选（带整句名次），外加「拜城县」「拜城县人民政府」的位次。
+/// 开启态同时开 N-best（露 3 算 5），看它输了的话输给了谁。
+#[test]
+#[ignore = "依赖 build_dev/data"]
+fn temp_word_in_abbrev_sentence_on_real_dict() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：找不到 build_dev/data");
+        return;
+    };
+    let base = Config::load(Some(&dir)).unwrap_or_default();
+    let mut cfg_off = base.clone();
+    cfg_off.schema.pinyin.sentence_uses_user_words = false;
+    let mut cfg_on = base;
+    cfg_on.schema.pinyin.sentence_uses_user_words = true;
+    cfg_on.schema.pinyin.sentence_count = 3;
+    cfg_on.schema.pinyin.sentence_max_count = 5;
+
+    for (label, cfg, learn) in [
+        ("关（无临时词）", &cfg_off, false),
+        ("关（有临时词）", &cfg_off, true),
+        ("开（有临时词，露3算5）", &cfg_on, true),
+    ] {
+        let db = std::env::temp_dir().join(format!("wind_bcx_probe_{}.redb", learn as u8));
+        let _ = std::fs::remove_file(&db);
+        let store = Arc::new(wind_store::Store::open(&db).unwrap());
+        if learn {
+            // 出厂自动学词权重 800（coordinator `LEARN_ADD_WEIGHT`），bai|cheng|xian → 0/3/8
+            store
+                .learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b100001001)
+                .unwrap();
+        }
+        let mgr = EngineManager::with_store(cfg, Some(&dir), Some(store));
+        for input in ["bcxrmzf", "bcx", "baichx"] {
+            let t = std::time::Instant::now();
+            let cands = mgr.convert(input, 300).candidates;
+            let cost = t.elapsed();
+            let pos = |s: &str| {
+                cands
+                    .iter()
+                    .position(|c| c.text == s)
+                    .map_or("无".to_string(), |i| format!("第{}位", i + 1))
+            };
+            println!(
+                "\n[{label}] {input}  ({cost:.2?})  拜城县: {}  拜城县人民政府: {}",
+                pos("拜城县"),
+                pos("拜城县人民政府")
+            );
+            for (i, c) in cands.iter().take(15).enumerate() {
+                let tag = if c.is_sentence {
+                    format!("整句#{}", c.sentence_rank)
+                } else if c.meta.is_temp_dict {
+                    "临时词".into()
+                } else {
+                    String::new()
+                };
+                println!("  {:>2}. {} {tag}", i + 1, c.text);
+            }
+        }
+    }
+}
