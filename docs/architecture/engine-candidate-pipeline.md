@@ -250,9 +250,30 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 >   加成的由来：出厂加词 `ADD_WORD_WEIGHT=1200` 翻不过同码的中频词（实测「概论」1217，
 >   差 17 分），用户按设计流程走完整句仍然不认。**不抬 `ADD_WORD_WEIGHT`**——那会动候选层
 >   的标定，而候选层本来就是对的。
-> - ⚠️ **整句没有 N-best**（`ViterbiResult` 只有一条 `words`）⇒ 用户词进图是赢者通吃，
->   赢了整句就变、输了什么都看不见。这是它出厂必须关的根本原因。
+> - ⚠️ 出厂只出**一条**整句 ⇒ 用户词进图是赢者通吃，赢了整句就变、输了什么都看不见。
+>   这是它出厂必须关的根本原因。要看它输给了谁，调大 `sentence_count` / `sentence_max_count`
+>   （下文「整句 N-best」），再在候选调试信息里看来源标记（最优解 `整句(合成)`，备选 `整句#2(合成)`…）。
 > - 关闭态零回归已证：`pinyin_eval` 四类 × 四项指标与改动前**逐位相同**。
+
+> **整句 N-best（2026-09-23）**。`Viterbi::decode_nbest` 让每个 `dp[i]` 保留 top-K 前驱（`prev_idx`
+> 回溯），**K=1 与原解码逐位相同**；有 grammar 走 `decode_beam` 时仍只返回 1 条。只接②主通路，
+> ②b 混合简拼 / ②c 残码各仍一条。
+>
+> - `sentence_count`（露几条）/ `sentence_max_count`（算几条）经 `Config::sentence_counts` 夹到
+>   `1..=8`、且算的不少于露的。结果按**文本去重**后编名次 `Candidate::sentence_rank`（1 = 最优，
+>   0 = 不是 N-best 整句）；名次 1 走原插入逻辑，2..=露 的与同文普通候选合并。
+> - K>1 时全部结果进 `ConvertResult::sentence_pool`（K=1 恒空）——协调器以「池 ≥ 2 条」作为
+>   切换键是否夺键的唯一判据。
+> - 部分可达路径的 `log_prob = NEG_INFINITY` 是压制部分解的机制，K-best 必须原样保留
+>   （首版取 `dp[end]`，「不知道哈」这类部分解就抢了首选；`partial_reach_paths_report_neg_infinity` 钉住）。
+> - **协调器排布**：露 >1 时 `place_sentence_block` 把 rank>0 的条目按名次强制移到最前（块内按
+>   名次，块整体置顶——`freq_rerank` 已不锚定整句，不强制就会被挤散）；露 1 时不动，零回归。
+> - **切换键** `sentence_cycle_key`（键即开关，出厂空）：`cycle_sentence_window` 把窗口在池中后移
+>   一格并回卷，换入条目按窗口内位置重编名次、删掉同文普通候选，高亮落在名次 1 上。不重新转换；
+>   `update_candidates` 每次清空池子与窗口。守卫不成立一律原样放行（Tab 出厂在高亮组里）。
+> - 混输的拼音辅助引擎在 manager 里钉成 1/1：整句块置顶会越过码表精确候选。
+> - 调试信息的来源标记对备选带名次（`sentence_debug_tag`：`整句#2(合成)`，名次 1 不标号），
+>   用来看用户词进图后到底输给了哪条。
 
 节点打分（lattice.rs `score_node()`）：以 `ln(weight / DICT_TOTAL)` 为基础（`weight` 即词条自身的
 词典权重，`w ≤ 0` 走 `0.5/T` 兜底，对齐 librime 的 `DBL_EPSILON` 思路），叠加单字实词惩罚(-3.0)/虚词加成(+2.0)/
@@ -975,7 +996,9 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | `schema.mix.show_source_hint` | false | 拼音候选「拼」标记 |
 | `schema.codetable.*`（auto_commit_at_full / auto_commit_min_len / clear_on_empty_max / top_code_commit / show_code_hint / single_code_input / single_code_complete 等） | 见 config.toml | 可被 `schema_overrides/{id}.toml [codetable]` 按方案覆盖 |
 | `schema.pinyin.use_smart_compose` | — | Viterbi 整句开关 |
-| `schema.pinyin.sentence_uses_user_words` | **false** | 已晋升的用户词进整句词图（S2）。只接 `USER_WORDS`，不接临时词/草稿层。出厂关的理由是结构性的：整句无 N-best ⇒ 赢者通吃 |
+| `schema.pinyin.sentence_uses_user_words` | **false** | 已晋升的用户词进整句词图（S2）。只接 `USER_WORDS`，不接临时词/草稿层。出厂关的理由是结构性的：出厂只出一条整句 ⇒ 赢者通吃 |
+| `schema.pinyin.sentence_count` / `sentence_max_count` | 1 / 1 | 整句 N-best：露几条 / 算几条（上限 8，算的不少于露的）。露 >1 时协调器把整句块强制摆到最前（`place_sentence_block`）；混输辅助引擎钉成 1/1 |
+| `schema.pinyin.sentence_cycle_key` | ""（关） | 整句切换键，**键即开关**。只在整句池 ≥ 2 条时夺取，窗口在池中滚动一格并回卷；其余时候按键照旧（Tab 出厂是高亮/翻页键）。撞车启动告警 |
 | `schema.pinyin.fuzzy.*` | — | 模糊音 11 对开关 |
 | `schema.pinyin.frequency.*`（half_life / base_scale / recency_peak） | — | 拼音词频衰减参数 |
 | `schema.pinyin.auto_learn.*` | — | 自动造词 |

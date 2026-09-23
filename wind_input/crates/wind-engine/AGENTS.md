@@ -35,7 +35,15 @@
   全拼降级支路刻意不接。**只收已晋升的用户词**（临时词与草稿层不收——滑窗草稿会造大量杂词），
   **`boundary == 0` 不进图**（与 `build` 的降级放行相反：整句节点必须有真值切分），
   **同词同起点取 `log_prob` 较大者**（GH#93 要的是「我调过的权重整句也得认」）。
-  ⚠️ 整句**没有 N-best**，用户词进图是赢者通吃 —— 这是它出厂必须关的根本原因。
+  出厂关的原因：用户词进图会换掉唯一那条整句。现在有 N-best 可以看见它输给了谁（见下条），
+  但出厂仍是露 1 算 1，所以默认仍是赢者通吃。
+- **整句 N-best**（2026-09-23）：`Viterbi::decode_nbest` 在 `dp[i]` 上保留 top-K（带 `prev_idx`），
+  **K=1 与原解码逐位相同**；有 grammar（`decode_beam`）时只返回 1 条。`schema.pinyin.sentence_count`
+  （露几条）/ `sentence_max_count`（算几条，= 切换键的池子）由 `Config::sentence_counts` 夹到
+  `1..=SENTENCE_COUNT_LIMIT(8)` 且池不小于露。只接②主通路，②b / ②c 仍各一条。按文本去重后计名次，
+  `Candidate::sentence_rank`（0 = 非 N-best 整句）；池子在 `ConvertResult::sentence_pool`，**只在 K>1
+  时非空**——协调器靠「池子 ≥ 2 条」判断切换键该不该吃。部分可达路径 `log_prob = NEG_INFINITY`
+  的旧语义必须保留（曾改成 `dp[end]`，部分解就抢了首选）。混输辅助引擎在 manager 里钉成 1/1。
 - **整句候选与词库同量纲**：拼音侧 `SENTENCE_WEIGHT_BASE`(3e7) **已退役**（`docs/design/sentence-weight-same-axis.md`，四步全部实施），现为 `sentence_weight()` = `exp(log_prob/n + ln DICT_TOTAL)`，即各词频次的几何平均。整句要降位走 `is_sentence_demoted`（step 6.5「整句让位于精确整词」，把整句压到 `用户词weight - 1`——这是「用户把词加进词库、配再高权重也换不回首选」的修复点）。3e7 只在**码表侧**还活着，且那边的值是 1e6（`codetable/sentence.rs`）。
 - **懒加载 + single-flight 构建锁**：`ensure_loaded` 抢方案专属 build_lock 后复查，避免后台预热与首次切换重复熔大词库；不同方案可并行构建。引擎缓存仅在 `invalidate_schema`/`reload_from_config` 清除（无 LRU 驱逐，与 Go 版不同）。
 - **`convert` 永不 panic**：引擎错误降级为 `ConvertResult::default()`（空候选），勿在热路径用会 panic 的 `unwrap`。锁中毒统一 `unwrap_or_else(|e| e.into_inner())`。
