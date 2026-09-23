@@ -202,8 +202,13 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 - 分隔符 `'`：硬边界。`segment_with_separators()` 按 `'` 分段各段独立切分；
   `map_consumed_over_separators()` 把 consumed_length 补偿回原始输入空间（mod.rs:325-343）。
 - 模糊音（fuzzy.rs）：`FuzzyConfig` 11 个开关（zh_z/ch_c/sh_s/n_l/f_h/r_l + an_ang/en_eng/in_ing/
-  ian_iang/uan_uang），`lookup_with_fuzzy()`（mod.rs:221）对各音节变体做笛卡尔积扩展查询
-  （组合数 > 64 跳过），命中标 `is_fuzzy`。
+  ian_iang/uan_uang），`lookup_with_fuzzy()` 对各音节变体做笛卡尔积扩展查询
+  （`expand_syllables` 组合数上限 64：超预算时逐级降低「可同时模糊的音节数」，不是整体跳过），
+  命中标 `is_fuzzy`。变体生成收口在 `fuzzy_codes()`，系统词库与
+  用户/临时造词层（`search_store_fuzzy()`，⑥ 与全拼降级支路 ④）共用——造词写库用的是
+  规范码（`learn_code`），不在 store 侧展开的话模糊打法永远打不出自己学过的词（t215）。
+  ⚠️ 用户词**尚未**做模糊的路径：前缀补全（与系统词一致）、整句建图 S2（`add_store_nodes`，
+  记录边界与所打码不同域，要另做边界映射）、6.2 简拼前缀回退。
 
 ### 4.2 候选生成各步（`convert()`，`pinyin/mod.rs`）
 
@@ -222,7 +227,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 | — | **用户词入词图（S2）**：②/②b/②c 三条建图通路在 `build` 之后各追加一次 `add_store_nodes`，由 `schema.pinyin.sentence_uses_user_words` 把关（**出厂 false**）。全拼降级支路刻意不接 | 见下方说明 |
 | ⑤ 简拼 | `AbbrevMatcher` 判定（每字母为音节首字母且非完整音节序列）→ `search_abbrev(query, ABBREV_INDEX_LIMIT)` | natural_order=999999 沉底 |
 | ⑤b 混合简拼 | `mixed_abbrev::mixed_patterns` 枚举「声母段 + 音节段」的解释（`nhao` = n\|hao、`zhge` = zh\|ge），投影成声母键点查同一张 `AbbrevSection`，再逐段校验 | `is_abbrev` |
-| ⑥ 用户/临时造词层 | store_layers 整串精确 + 子码 + 前缀，按 text 与系统词典去重 | — |
+| ⑥ 用户/临时造词层 | store_layers 整串精确 + 子码 + 前缀，整串与子码另查模糊变体码（同 ①③，前缀不做），按 text 与系统词典去重（精确先到先占位） | — |
 | **6.2 简拼前缀回退** | 整串无产出时按切点从长到短重查（`recall_abbrev_prefix`）：每切点 `MAX_FALLBACK_PER_CUT`(6) 条、只取前 `MAX_FALLBACK_CUTS`(2) 个有产出的切点。**系统层与 store 层各记各的配额基准**。这是**唯一**能产出「只消费前 N 码」简拼候选的路径 | `is_abbrev` + `is_partial` + 自带 `consumed_length` |
 
 > **两条简拼路径共用一个取码窗口** [`ABBREV_INDEX_LIMIT`](../../wind_input/crates/wind-engine/src/pinyin/mod.rs)(64)。

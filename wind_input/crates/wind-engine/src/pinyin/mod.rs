@@ -1645,6 +1645,24 @@ impl PinyinEngine {
                     false,
                 );
             }
+            // 模糊音同 ①（t215）：用户词记录的是规范码，模糊打法只能靠变体码撞上。
+            // 放在精确那路之后，同文时 `push` 的去重让精确那条占位。
+            for c in
+                self.search_store_fuzzy(store_dm, &completed, syllables, MAX_FULL_PINYIN_RECALL)
+            {
+                let n = completed.len();
+                push(
+                    cands,
+                    c.text,
+                    completed.clone(),
+                    c.weight,
+                    c.natural_order,
+                    c.boundary,
+                    false,
+                    n,
+                    true,
+                );
+            }
             for c in store_dm.search_prefix(stroke, MAX_FULL_PINYIN_RECALL) {
                 // ★ 音节边界对齐必须**在本支路自己判一次**：`recall_full_pinyin` 被刻意放在
                 // step 6.3 那道 retain **之后**（6.3 的尺子 `syllable_cap` 由双拼域音节数算出，
@@ -2013,55 +2031,81 @@ impl PinyinEngine {
         // 模糊变体命中一律 boundary=0（不设防）：词典给的是**变体码**（如 zhongguo）的切分，
         // 而候选对外的 code 是用户实际输入的原码（zongguo）——两者不同域，位偏移对不上，
         // 直接采信会错位误杀。模糊音本就是放宽匹配，不校验边界是合理的。
-        if syllables.len() <= 1 {
-            // 单音节：对该音节（无切分时退化为整码）生成变体逐个查询。
-            let syllable: &str = if syllables.len() == 1 {
-                &syllables[0]
-            } else {
-                code
-            };
-            for (variant, edits) in
-                fuzzy::FuzzyMatcher::fuzzy_variants_scored(syllable, &self.fuzzy_config)
-            {
-                // 走 `search_with_boundary` 而非 `search`：变体码与它自己的边界同域，
-                // 那份真值正是造词要的（候选对外仍报 boundary=0，见下）。
-                for h in self.dict.search_with_boundary(&variant) {
-                    if seen.insert(h.text.clone()) {
-                        results.push(LookupHit {
-                            text: h.text,
-                            // 单音节也可能声母、韵母同时模糊（`sen`→`sheng` 计 2 处），
-                            // 故按变体自带的改动处数罚，不再恒当 1 处。
-                            weight: fuzzy_penalized(h.weight, edits),
-                            order: h.order,
-                            is_fuzzy: true,
-                            boundary: 0,
-                            dict: Some((variant.clone(), h.boundary)),
-                        });
-                    }
-                }
-            }
-        } else {
-            // 多音节：笛卡尔积展开各音节变体，拼成完整 altCode 查询。
-            for (alt_code, fuzzy_count) in self.expand_code(syllables) {
-                if alt_code == code {
-                    continue;
-                }
-                for h in self.dict.search_with_boundary(&alt_code) {
-                    if seen.insert(h.text.clone()) {
-                        results.push(LookupHit {
-                            text: h.text,
-                            weight: fuzzy_penalized(h.weight, fuzzy_count),
-                            order: h.order,
-                            is_fuzzy: true,
-                            boundary: 0,
-                            dict: Some((alt_code.clone(), h.boundary)),
-                        });
-                    }
+        for (variant, edits) in self.fuzzy_codes(code, syllables) {
+            // 走 `search_with_boundary` 而非 `search`：变体码与它自己的边界同域，
+            // 那份真值正是造词要的（候选对外仍报 boundary=0，见上）。
+            for h in self.dict.search_with_boundary(&variant) {
+                if seen.insert(h.text.clone()) {
+                    results.push(LookupHit {
+                        text: h.text,
+                        // 按变体自带的改动处数罚：单音节也可能声母、韵母同时模糊
+                        // （`sen`→`sheng` 计 2 处），多音节按各音节处数累加。
+                        weight: fuzzy_penalized(h.weight, edits),
+                        order: h.order,
+                        is_fuzzy: true,
+                        boundary: 0,
+                        dict: Some((variant.clone(), h.boundary)),
+                    });
                 }
             }
         }
 
         results
+    }
+
+    /// `code`（音节切分为 `syllables`）的全部模糊变体码及各自的改动处数，**不含** `code` 本身。
+    ///
+    /// 系统词库（[`Self::lookup_with_fuzzy`]）与用户/临时造词层（[`Self::search_store_fuzzy`]）
+    /// 共用这一份判据 —— 两处各展开一遍的话，迟早一边多认一种变体、一边少认。
+    /// 模糊音全关时返回空（单音节 `fuzzy_variants_scored` 为空；多音节只剩原码、被过滤）。
+    fn fuzzy_codes(&self, code: &str, syllables: &[String]) -> Vec<(String, usize)> {
+        if syllables.len() <= 1 {
+            // 单音节：对该音节（无切分时退化为整码）生成变体。
+            let syllable: &str = syllables.first().map_or(code, String::as_str);
+            fuzzy::FuzzyMatcher::fuzzy_variants_scored(syllable, &self.fuzzy_config)
+        } else {
+            // 多音节：笛卡尔积展开各音节变体（组合数上限见 `expand_syllables`）。
+            self.expand_code(syllables)
+                .into_iter()
+                .filter(|(alt, _)| alt != code)
+                .collect()
+        }
+    }
+
+    /// 用户/临时造词层的模糊音召回：拿 `code` 的模糊变体码逐个查 store（t215）。
+    ///
+    /// 造词写库用的是**规范读音码**（`learn_code`），故用户按模糊打法敲出来的串在 store 里
+    /// 永远查不到原码 —— 必须像系统词库那样对输入展开变体去撞。模糊音全关时不查任何东西。
+    ///
+    /// 返回的候选已按系统词模糊命中的口径改写（同 [`LookupHit::dict`] 的理由）：
+    /// - `code` 换成用户敲的 `code`（`consumed_length` / 分步上屏 / 词频记账绑在它上面），
+    ///   `boundary` 置 0（记录的边界在变体码域，与原码位偏移对不上）；
+    /// - 记录自身的码与边界放进 `meta.store_code`（右键删除按它拼 key）与
+    ///   `meta.learn_code`（造词写库，写回规范码而不是模糊原码）；
+    /// - `weight` 按改动处数打 [`fuzzy_penalized`] 折扣并标 `is_fuzzy`。
+    fn search_store_fuzzy(
+        &self,
+        store_dm: &DictManager,
+        code: &str,
+        syllables: &[String],
+        limit: usize,
+    ) -> Vec<Candidate> {
+        if !self.fuzzy_config.any_enabled() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (variant, edits) in self.fuzzy_codes(code, syllables) {
+            for mut c in store_dm.search(&variant, limit) {
+                c.meta.store_code = Some(c.code.as_str().into());
+                c.meta.learn_code = Some((std::mem::take(&mut c.code), c.boundary));
+                c.code = code.to_string();
+                c.boundary = 0;
+                c.weight = fuzzy_penalized(c.weight, edits);
+                c.is_fuzzy = true;
+                out.push(c);
+            }
+        }
+        out
     }
 
     /// 对多音节做模糊变体笛卡尔积展开（对齐 Go `FuzzyConfig.ExpandCode`）。
@@ -3377,6 +3421,31 @@ impl Engine for PinyinEngine {
                 }
             }
             store_cands.extend(store_dm.search_prefix(query, limit));
+            // 模糊音（t215）：整串与各前缀子码的变体码，变体生成与系统词 `lookup_with_fuzzy`
+            // 同源（`fuzzy_codes`）；前缀补全那路系统词也不做模糊，这里同样不做。
+            // 排在全部精确结果**之后**：下面按 text 合并、先到者占位，同文时须以精确那条为准。
+            // 整串只在无残码时展开：有残码时（`chaijiuduolianm`）精确那路也只查 `query`、
+            // 查不到 `completed` 这一段 —— 与系统词 step 1 查 `completed` 不同，是既有口径，
+            // 两路要改须一起改。
+            // 关模糊音时整段跳过（`search_store_fuzzy` 本也立即返回，但前缀循环的 join 白分配）。
+            let fuzzy_on = self.fuzzy_config.any_enabled();
+            if fuzzy_on && completed == query {
+                store_cands.extend(self.search_store_fuzzy(store_dm, query, &syllables, limit));
+            }
+            if fuzzy_on && syllables.len() >= 2 {
+                for end in 1..syllables.len().min(6) {
+                    let code: String = syllables[..end].join("");
+                    if code == query {
+                        continue;
+                    }
+                    store_cands.extend(self.search_store_fuzzy(
+                        store_dm,
+                        &code,
+                        &syllables[..end],
+                        limit,
+                    ));
+                }
+            }
 
             // 用户长词上浮的**封顶基准**：提升后的补全不得越过「本次输入的最佳完整解」——
             // 码 == completed 的顶层候选（精确整词 / Viterbi 整句，均在此前步骤产出）。取其最大
@@ -3451,6 +3520,13 @@ impl Engine for PinyinEngine {
                         let w = existing.weight.max(c.weight);
                         existing.weight = promotion_cap.map_or(w, |cap| w.min(cap));
                     }
+                    // 同一层先已并入过同文记录（精确那批排在模糊之前）：模糊那条不得再改写
+                    // 存储码，否则右键删除删到的是规范码那条，用户指向的精确记录原样留着。
+                    let same_layer_seen = if c.meta.is_temp_dict {
+                        existing.meta.is_temp_dict
+                    } else {
+                        existing.meta.is_user_dict
+                    };
                     // 标记按来源分流：`c` 来自 StoreTempLayer 就是临时词，不能盖成用户词。
                     // 两层都有同文记录时两个标记都置，删除侧据此把两张表都删掉。
                     if c.meta.is_temp_dict {
@@ -3460,7 +3536,14 @@ impl Engine for PinyinEngine {
                     }
                     // 存储码随标记一起带走（`code` 字段仍归已有候选）。两层码不同的极端情形
                     // 下这里只留得住后来那个，删除侧因此仍把 `code` 作为兜底一并尝试。
-                    existing.meta.store_code = Some(c.code.as_str().into());
+                    // 模糊命中的 `c.code` 已换成用户敲的码，记录码在它自己的 `store_code` 里。
+                    if !(c.is_fuzzy && same_layer_seen) {
+                        existing.meta.store_code = c
+                            .meta
+                            .store_code
+                            .clone()
+                            .or_else(|| Some(c.code.as_str().into()));
+                    }
                     continue;
                 }
                 c.source = CandidateSource::Pinyin;
@@ -4758,6 +4841,174 @@ mod tests {
             "nihao".len(),
             "应只消费前缀 nihao"
         );
+    }
+
+    // ── 模糊音召回用户/临时词（t215 / A2-44）。
+    //
+    // 用户词落库的是**规范读音码**（模糊命中造词走 `learn_code`，见 `pinyin_learn_code`），
+    // 而 step 6 此前只拿用户实际敲的码去查 store —— 系统词库那条路有 `lookup_with_fuzzy`
+    // 展开，用户词这条路没有，于是开了 c=ch 后 `chaijiuduolian` 打不出自己加的
+    // 「菜就多练 / caijiuduolian」，多打几遍（学进去的仍是 `caijiuduolian`）也没用。
+
+    /// 挂上只含给定用户词的 store 层，模糊音按 `fz` 配置。系统词典为空，
+    /// 故候选只可能来自用户层。
+    fn engine_with_user_words_fuzzy(
+        tag: &str,
+        words: &[(&str, &str, u64)],
+        fz: FuzzyConfig,
+    ) -> PinyinEngine {
+        let store = tmp_store(tag);
+        for (code, text, boundary) in words {
+            store
+                .add_user_word("pinyin", code, text, 500, *boundary)
+                .unwrap();
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+        empty_engine()
+            .with_fuzzy(fz)
+            .with_store_layers(Arc::new(dm))
+    }
+
+    fn ch_c() -> FuzzyConfig {
+        FuzzyConfig {
+            ch_c: true,
+            ..Default::default()
+        }
+    }
+
+    /// 主诉求：c=ch 开启时，翘舌打法召回平舌码的用户词。
+    ///
+    /// 候选对外的 `code` 留用户敲的那份（`consumed_length` 与分步上屏依赖它，同系统词模糊
+    /// 命中），规范码经 `store_code`（右键删除按它拼 key）与 `learn_code`（造词写库）带出。
+    #[test]
+    fn fuzzy_input_recalls_user_word_stored_under_canonical_code() {
+        let eng = engine_with_user_words_fuzzy(
+            "fz_user_full",
+            &[("caijiuduolian", "菜就多练", 0)],
+            ch_c(),
+        );
+        let r = eng.convert("chaijiuduolian", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "菜就多练")
+            .unwrap_or_else(|| {
+                panic!(
+                    "c=ch 下 chaijiuduolian 应召回用户词「菜就多练」，实际: {:?}",
+                    r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+                )
+            });
+        assert!(c.meta.is_user_dict, "来源应标用户词");
+        assert!(c.is_fuzzy, "应标模糊命中（据此施加权重折扣）");
+        assert!(c.weight < 500, "模糊命中须打折扣，实际 weight={}", c.weight);
+        assert_eq!(c.code, "chaijiuduolian", "候选码留用户敲的那份");
+        assert_eq!(c.consumed_length, "chaijiuduolian".len(), "应消费整串");
+        assert_eq!(
+            c.meta.store_code.as_deref(),
+            Some("caijiuduolian"),
+            "删除要按记录自身的码拼 key"
+        );
+        assert_eq!(
+            c.meta.learn_code.as_ref().map(|(code, _)| code.as_str()),
+            Some("caijiuduolian"),
+            "造词写库须用规范码，不得写入翘舌原码"
+        );
+    }
+
+    /// 手动分隔符、单音节、双音节、仅部分音节模糊，都应召回。
+    #[test]
+    fn fuzzy_user_word_recall_covers_separator_and_short_words() {
+        let eng = engine_with_user_words_fuzzy(
+            "fz_user_shapes",
+            &[
+                ("caijiuduolian", "菜就多练", 0),
+                ("caidan", "菜单", 0),
+                ("cai", "蔡", 0),
+                ("cuchuan", "粗喘", 0),
+            ],
+            ch_c(),
+        );
+        for (input, want) in [
+            ("chai'jiu'duo'lian", "菜就多练"),
+            ("chaidan", "菜单"),
+            ("chai", "蔡"),
+            // 反向 + 仅部分音节模糊：c→ch 在首音节、ch 原样在次音节。
+            ("chuchuan", "粗喘"),
+            // 反向：平舌打法召回翘舌码。
+            ("cucuan", "粗喘"),
+        ] {
+            let r = eng.convert(input, 20).unwrap();
+            assert!(
+                r.candidates.iter().any(|c| c.text == want),
+                "{input} 应召回用户词「{want}」，实际: {:?}",
+                r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 前缀子短语同样走模糊：`chaijiuduolian` 里的 `chaijiu` 召回用户词「菜就」，
+    /// 且只消费 `chaijiu`（分步上屏，剩余拼音续转）。
+    #[test]
+    fn fuzzy_user_word_recalled_as_subphrase() {
+        let eng = engine_with_user_words_fuzzy("fz_user_sub", &[("caijiu", "菜就", 0)], ch_c());
+        let r = eng.convert("chaijiuduolian", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "菜就")
+            .expect("前缀子短语应模糊召回用户词「菜就」");
+        assert!(c.is_fuzzy);
+        assert_eq!(c.consumed_length, "chaijiu".len(), "应只消费 chaijiu");
+    }
+
+    /// 同文时精确命中优先：用户词里同时有精确码与模糊码的同一个词，候选须按精确那条算
+    /// （不打折、不标模糊）。
+    #[test]
+    fn exact_user_word_wins_over_fuzzy_duplicate() {
+        let eng = engine_with_user_words_fuzzy(
+            "fz_user_dup",
+            &[("chaidan", "菜单", 0), ("caidan", "菜单", 0)],
+            ch_c(),
+        );
+        let r = eng.convert("chaidan", 20).unwrap();
+        let c = r.candidates.iter().find(|c| c.text == "菜单").unwrap();
+        assert!(!c.is_fuzzy, "精确命中在先，不得被模糊那条盖掉");
+        assert_eq!(c.weight, 500);
+        // 存储码也须指向精确那条：否则右键删除删掉的是 `caidan`，`chaidan` 原样重现。
+        assert!(
+            c.meta.store_code.as_deref().is_none_or(|s| s == "chaidan"),
+            "存储码不得被模糊那条改写成规范码，实际: {:?}",
+            c.meta.store_code
+        );
+    }
+
+    /// 关模糊音时行为不变：翘舌打法召不回平舌码的用户词，平舌打法照旧命中。
+    #[test]
+    fn fuzzy_off_user_word_recall_unchanged() {
+        let eng = engine_with_user_words_fuzzy(
+            "fz_user_off",
+            &[("caijiuduolian", "菜就多练", 0), ("caijiu", "菜就", 0)],
+            FuzzyConfig::default(),
+        );
+        let r = eng.convert("chaijiuduolian", 20).unwrap();
+        assert!(
+            r.candidates.is_empty(),
+            "模糊音关闭时不应有任何召回，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let r = eng.convert("caijiuduolian", 20).unwrap();
+        let c = r.candidates.iter().find(|c| c.text == "菜就多练").unwrap();
+        assert!(!c.is_fuzzy);
+        assert_eq!(c.code, "caijiuduolian");
+        assert_eq!(c.meta.learn_code, None, "精确命中的码即规范码，不另带");
     }
 
     /// 构造「带 qing 同音字洪泛的系统词典 + 用户长词」的引擎（复用于长词上浮系列测试）。

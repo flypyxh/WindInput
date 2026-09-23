@@ -190,3 +190,61 @@ fn type_and_find(coord: &Coordinator, input: &str, want: &str) -> bool {
     coord.handle_key_event_policed(&key(0x1B));
     found
 }
+
+/// 论坛 t215 / A2-44 的原始路径：开 c=ch，**用翘舌打法**分步组出「菜就多练」，
+/// 下次仍用翘舌打法得能直接打出来。
+///
+/// 造词写库用的是规范码 `caijiuduolian`（上面两条守的就是这个），而此前 step 6
+/// 只拿用户敲的 `chaijiuduolian` 去查 store —— 于是用户原话里「多打几遍加入词库，
+/// 还是不能通过翘舌打出」：学进去的词只有平舌打法认。
+#[test]
+fn word_learned_by_fuzzy_typing_is_retypeable_by_fuzzy_typing() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.ch_c = true;
+    let db = std::env::temp_dir().join("wind_learn_code_fuzzy_retype.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord =
+        Coordinator::new_headless_with_store(c.clone(), Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    // 前提：未造词时翘舌打法出不来这个词，否则下面测的是系统词库。
+    assert!(
+        !type_and_find(&coord, "chaijiuduolian", "菜就多练"),
+        "前提：未造词时 chaijiuduolian 不得出「菜就多练」"
+    );
+
+    for ch in "chaijiuduolian".chars() {
+        coord.handle_key_event_policed(&key((ch.to_ascii_uppercase() as u32) & 0xFF));
+    }
+    assert!(pick(&coord, "菜").is_none(), "选「菜」应留在组合区分步");
+    assert!(pick(&coord, "就").is_none(), "选「就」应留在组合区分步");
+    assert!(pick(&coord, "多").is_none(), "选「多」应留在组合区分步");
+    assert_eq!(
+        pick(&coord, "练").as_deref(),
+        Some("菜就多练"),
+        "选完应整体上屏"
+    );
+
+    let learned: Vec<String> = store
+        .search_temp_words_prefix("pinyin", "", 200)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.text == "菜就多练")
+        .map(|r| r.code)
+        .collect();
+    assert_eq!(learned, ["caijiuduolian"], "造词码须为规范码");
+
+    assert!(
+        type_and_find(&coord, "chaijiuduolian", "菜就多练"),
+        "翘舌打法须能打出按规范码学进去的词"
+    );
+    assert!(
+        type_and_find(&coord, "caijiuduolian", "菜就多练"),
+        "平舌打法照旧"
+    );
+}
