@@ -757,21 +757,25 @@ pub struct Config {
     pub completion_min_syllables: u32,
     /// 词组补全的音节数约束：候选最多比输入多几个音节。
     pub completion_max_extra_syllables: u32,
-    /// 是否让**已晋升的用户词**参与整句解码（S2）。
+    /// 是否让**用户上屏过的词**（用户词 + 临时词）参与整句解码（S2）。
     ///
     /// 关闭（出厂）时整句词图只从系统词库建，用户自造词永远不会成为整句的一段：
     /// 「盖伦」单独打得出、「有盖伦吗」却被打散（t134），手动调过权重的词在整句里
     /// 同样不认（GH#93）——那不是联想弱也不是词频没学到，是它**根本没参与整句分词**。
     ///
     /// ★ **出厂 false 是硬约束**，理由不是「怕有 bug」而是三条结构事实：
-    /// - 整句**没有 N-best**（`ViterbiResult` 只有一条 `words`）⇒ 用户词进图是**赢者通吃**，
-    ///   赢了整句就变、输了什么都看不见，没有第二候选兜底；
+    /// - 出厂只出**一条**整句（`sentence_count = 1`）⇒ 用户词进图是**赢者通吃**，
+    ///   赢了整句就变、输了什么都看不见。调大 N-best 才看得到它输给了谁；
     /// - 它会改变**所有**老用户的整句结果，包括从未造过词的人（wdict 导入词也进图）；
     /// - 用户词的 weight 轴与词频轴同源但语义不同（前者是「我要这个词」，后者是频次），
     ///   标定只做了上限截断（见 [`USER_NODE_WEIGHT_CAP`]），没有做分布对齐。
     ///
-    /// ⚠️ **只接 `USER_WORDS`（已晋升），不接临时词，更不接草稿层**。S5 滑窗会造出大量
-    /// 杂词，它的「用过即转正」才是质量闸；杂词若直接进整句词图，污染的是所有人的整句。
+    /// ⚠️ **接用户词与临时词，不接草稿层**。S5 滑窗会造出大量杂词，它的「用过即转正」
+    /// （草稿 → 临时）才是质量闸；杂词若直接进整句词图，污染的是所有人的整句。临时词曾经
+    /// 也被挡，结果系统库没有的词（「拜城县」）手打一次后整句仍不认，要用够晋升次数才行。
+    ///
+    /// 全拼段点查全拼码（`lattice::add_store_nodes`），简拼整句（②b）的声母段另查用户层的
+    /// 简拼索引（`lattice::add_store_abbrev_nodes`）。
     pub sentence_uses_user_words: bool,
     /// 整句 N-best：候选列表里**露**几条整句（step 2 主整句）。出厂 1 = 现在的行为。
     ///
@@ -2928,10 +2932,7 @@ impl Engine for PinyinEngine {
             );
             self.lattice_builder
                 .add_abbrev_nodes(abbr_query, dict, &mut lattice_nodes);
-            // S2：混合整句里**全拼那几段**也认用户词（`bzdgailun` 的 `gailun` 段）。
-            // ⚠️ 简拼段上取不到 —— 那里 `&input[p..q]` 是声母串，而用户词的 code 是全拼，
-            // 点查必然落空。这是有意的：简拼段的用户词召回归 step 5b/6.2，
-            // 那两条走的是声母投影键，与本方法不同域。
+            // S2：混合整句里**全拼那几段**也认用户词（`bzdgailun` 的 `gailun` 段）……
             self.maybe_add_store_nodes(abbr_query, &graph, &mut lattice_nodes);
 
             let input_len = abbr_query.len();
@@ -2977,6 +2978,17 @@ impl Engine for PinyinEngine {
                             natural_order: 0,
                             source: CandidateSource::Pinyin,
                             is_sentence: true,
+            // ……**声母段**另查用户层的简拼索引：上面那条按全拼码点查，在 `bcx` 这种声母串上
+            // 必然落空，用户造的「拜城县」于是永远进不了 `bcxrmzf` 的整句。
+            if self.config.sentence_uses_user_words
+                && let Some(store_dm) = &self.store_layers
+            {
+                self.lattice_builder.add_store_abbrev_nodes(
+                    abbr_query,
+                    store_dm,
+                    &mut lattice_nodes,
+                );
+            }
                             // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
                             is_synthesized: true,
                             // 解码器实际走的那条路径。简拼段每字母一位，故回填出的

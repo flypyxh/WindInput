@@ -1,11 +1,11 @@
-//! S2：已晋升的用户词参与整句解码。
+//! S2：用户上屏过的词（用户词 + 临时词）参与整句解码。
 //!
 //! 整句词图此前只从系统词库建（`lattice.rs::build` 只吃一个 `CachedDict`），用户词挂在
 //! `PinyinEngine::store_layers` 上、两者从不相交 ⇒ 自造词**根本没参与整句分词**：
 //! 「盖伦」单独打得出、「有盖伦吗」被打散（t134）；手动调过权重的词在整句里也不认（GH#93）。
 //!
-//! ⚠️ **整句没有 N-best**（`ViterbiResult` 只有一条 `words`）：用户词进图是赢者通吃，
-//! 赢了整句就变、输了什么都看不见。故本文件的断言都落在「整句那一条」上，
+//! ⚠️ 出厂只出**一条**整句：用户词进图是赢者通吃，赢了整句就变、输了什么都看不见。
+//! 故本文件的断言都落在「整句那一条」上，
 //! 而不是「候选列表里有没有」—— 后者早就有了（step 6 的 store 层召回），不是本项要修的。
 //!
 //! 自带 wdat 夹具 + 真 redb store，不依赖 `build_dev/data`。
@@ -175,17 +175,19 @@ fn partial_final_sentence_also_uses_user_words() {
     );
 }
 
-/// 硬约束：**临时词不进图**。滑窗草稿会造大量杂词，「用过即转正」才是质量闸。
+/// **临时词也进图**：它是用户上屏过的词，「用过即转正」这道闸在草稿 → 临时那一跳。
+///
+/// 曾经钉的是反方向（临时词不进图），结果系统库没有的词手打一次后整句仍不认——
+/// 「拜城县」要用够晋升次数才进得了 `bcxrmzf` 的整句。见 `pinyin_sentence_user_words_abbrev.rs`。
+/// 权重取出厂自动学词值 800（coordinator `LEARN_ADD_WEIGHT`），比手动加词的 1200 更低，
+/// 同样要赢过「概论」1217。
 #[test]
-fn temp_words_never_enter_the_lattice() {
+fn temp_words_enter_the_lattice() {
     let s = store("temp");
-    s.learn_temp_word("pinyin", "gailun", "盖伦", 1200, 0b1001)
+    s.learn_temp_word("pinyin", "gailun", "盖伦", 800, 0b1001)
         .unwrap();
     let got = sentence(&engine("temp_on", s, true), "yougailunma");
-    assert!(
-        !got.as_deref().unwrap_or("").contains("盖伦"),
-        "临时词不得进整句词图，实际: {got:?}"
-    );
+    assert_eq!(got.as_deref(), Some("有盖伦吗"));
 }
 
 /// 硬约束：**无 boundary 的用户词不进图**（隐性造词 / 手输码）。

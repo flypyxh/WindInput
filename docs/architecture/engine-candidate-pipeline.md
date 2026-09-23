@@ -240,8 +240,12 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 > 上，两者从不相交 ⇒ 自造词**根本没参与整句分词**（t134「盖伦单独能出、有盖伦吗就打散」、
 > GH#93「整句无法记忆手动调整过的词」）。
 >
-> - **只收已晋升的用户词**（`is_user_dict && !is_temp_dict`）。临时词与草稿层不收——滑窗
->   草稿会造大量杂词，「用过即转正」才是它的质量闸。
+> - **收用户词与临时词，不收草稿层**（`lattice::is_sentence_store_word`）。滑窗草稿会造
+>   大量杂词，「用过即转正」（草稿 → 临时）才是它的质量闸。临时词曾被一并挡掉：系统库
+>   没有的「拜城县」手打一次只进临时库，`bcxrmzf` 的整句要等它用够晋升次数才认。
+> - **简拼段另查用户层简拼索引**（`add_store_abbrev_nodes`，只在 ②b）：全拼点查在 `bcx`
+>   这种声母串上必然落空。打分同系统简拼节点（`ABBREV_NODE_PENALTY × 字母数`）加用户词
+>   截顶与加成；索引「无边界组」带回的 `boundary == 0` 词在切分校验处被拒。
 > - **`boundary == 0` 不进图**，与 `build` 对系统词的降级放行**相反**：整句每个节点都要求
 >   真值切分，无边界的手输码词进去等于让 Viterbi 按猜的切分组句。
 > - **同词同起点取 `log_prob` 较大者**（不是「已存在就跳过」）——GH#93 要的正是
@@ -996,7 +1000,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | `schema.mix.show_source_hint` | false | 拼音候选「拼」标记 |
 | `schema.codetable.*`（auto_commit_at_full / auto_commit_min_len / clear_on_empty_max / top_code_commit / show_code_hint / single_code_input / single_code_complete 等） | 见 config.toml | 可被 `schema_overrides/{id}.toml [codetable]` 按方案覆盖 |
 | `schema.pinyin.use_smart_compose` | — | Viterbi 整句开关 |
-| `schema.pinyin.sentence_uses_user_words` | **false** | 已晋升的用户词进整句词图（S2）。只接 `USER_WORDS`，不接临时词/草稿层。出厂关的理由是结构性的：出厂只出一条整句 ⇒ 赢者通吃 |
+| `schema.pinyin.sentence_uses_user_words` | **false** | 用户词与临时词进整句词图（S2，简拼段也认），不接草稿层。出厂关的理由是结构性的：出厂只出一条整句 ⇒ 赢者通吃 |
 | `schema.pinyin.sentence_count` / `sentence_max_count` | 1 / 1 | 整句 N-best：露几条 / 算几条（上限 8，算的不少于露的）。露 >1 时协调器把整句块强制摆到最前（`place_sentence_block`）；混输辅助引擎钉成 1/1 |
 | `schema.pinyin.sentence_cycle_key` | ""（关） | 整句切换键，**键即开关**。只在整句池 ≥ 2 条时夺取，窗口在池中滚动一格并回卷；其余时候按键照旧（Tab 出厂是高亮/翻页键）。撞车启动告警 |
 | `schema.pinyin.fuzzy.*` | — | 模糊音 11 对开关 |

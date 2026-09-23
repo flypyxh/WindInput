@@ -208,6 +208,13 @@ pub(crate) const USER_NODE_BONUS: f64 = 2.0;
 /// 不会跨到对数正值那一段去碾压一切。
 const USER_NODE_WEIGHT_CAP: i32 = 1_000_000;
 
+/// 用户层里**哪些词进整句词图**：用户词与临时词（都是用户上屏过的），不收草稿。
+///
+/// 草稿在拼音侧目前根本不挂层（只码表造词挂），`is_draft` 这一条是防将来挂上时静默漏进来。
+fn is_sentence_store_word(c: &wind_candidate::Candidate) -> bool {
+    (c.meta.is_user_dict || c.meta.is_temp_dict) && !c.is_draft
+}
+
 /// 简拼跨度的最大字母数（= 最大音节数）。与 `AbbrevMatcher::find_candidates` 的上限一致。
 const MAX_ABBREV_SPAN: usize = 6;
 
@@ -605,9 +612,12 @@ impl LatticeBuilder {
     ///
     /// ## 三条约束（都不是「防御性编程」，各有具体代价）
     ///
-    /// 1. **只收已晋升的用户词**（`meta.is_user_dict && !meta.is_temp_dict`）。临时词与
-    ///    草稿层不收 —— 滑窗草稿会造出大量杂词，它的「用过即转正」才是质量闸；杂词直接
-    ///    进整句词图，污染的是所有人的整句。
+    /// 1. **只收用户上屏过的词**（用户词 + 临时词，见 [`is_sentence_store_word`]）。草稿层
+    ///    不收 —— 滑窗草稿会造出大量杂词，它的「用过即转正」（草稿 → 临时）才是质量闸；
+    ///    杂词直接进整句词图，污染的是所有人的整句。
+    ///    ⚠️ 临时词**曾经**也被挡（误把质量闸放在了临时 → 用户那一跳）：系统库没有的词
+    ///    （「拜城县」）手打一次只会进临时库，要再用够 `promote_count` 次才晋升，而在那之前
+    ///    整句永远不认它——用户看到的就是「刚打过的词，连着打就没了」。
     /// 2. **`boundary == 0` 不进图**（与 [`Self::add_abbrev_nodes`] 同、与 [`Self::build`]
     ///    的降级放行**相反**）。整句的每个节点都要求真值切分：手输码用户词没有可信边界，
     ///    放进去等于让 Viterbi 按猜出来的切分组句。代价是隐性造词（无边界）不参与整句，
@@ -645,8 +655,8 @@ impl LatticeBuilder {
                 }
                 let code = &input[p..q];
                 for cand in store.search(code, USER_NODE_LIMIT) {
-                    // 约束 1：只认已晋升的用户词。
-                    if !cand.meta.is_user_dict || cand.meta.is_temp_dict {
+                    // 约束 1：只认用户上屏过的词。
+                    if !is_sentence_store_word(&cand) {
                         continue;
                     }
                     // 约束 2：必须有真值切分，且该切分是本跨度上的一条合法路径。
@@ -680,6 +690,91 @@ impl LatticeBuilder {
                         word: cand.text,
                         syllables: slice_syllables(code, &offsets),
                         syl_mask: offsets_mask(&offsets),
+                        log_prob,
+                    });
+                }
+            }
+        }
+    }
+
+    /// 在简拼整句（step ②b）的词图上**追加用户词的简拼节点**：[`Self::add_abbrev_nodes`]
+    /// 的用户层版本。
+    ///
+    /// [`Self::add_store_nodes`] 按 `&input[p..q]` 点查全拼码，在简拼段上（`bcx` 是声母串）
+    /// 必然落空；系统词在这里走的是 wdat 的简拼索引，用户层一直缺这一半 ⇒ 打 `bcxrmzf`
+    /// 时用户造的「拜城县」进不了整句，哪怕已经晋升。
+    ///
+    /// 约束与两个兄弟方法对齐：
+    /// - 词源同 [`Self::add_store_nodes`] 约束 1（[`is_sentence_store_word`]）；
+    /// - **音节数 = 简拼字母数**，且**逐段首字母 = 对应字母**：层接口的 `search_abbrev`
+    ///   明说返回的是超集，判据必须由调用方做。超集的实际来源是 store 索引的「无边界组」
+    ///   （`boundary == 0` 的词按码首字母挂着，查 `bcx` 会连 `b` 组一并带回），它们在
+    ///   `syllables_from_boundary` 这一步就被拒——与 [`Self::add_store_nodes`] 约束 2 同理；
+    /// - 打分 = 简拼节点的罚分（`ABBREV_NODE_PENALTY × 字母数`）+ 用户词的截顶与加成，
+    ///   与同位置的系统简拼节点公平竞争；
+    /// - 同词同起点取 `log_prob` 较大者（同 [`Self::add_store_nodes`] 约束 3）。
+    ///
+    /// zh/ch/sh 按一个字母计（`z`），与 `add_abbrev_nodes` 相同——整句简拼域目前就是
+    /// 「一个音节 = 一个字母」。
+    pub fn add_store_abbrev_nodes(
+        &self,
+        input: &str,
+        store: &DictManager,
+        nodes: &mut [Vec<LatticeNode>],
+    ) {
+        let input_len = input.len();
+        let bytes = input.as_bytes();
+        for p in 0..input_len {
+            if !bytes[p].is_ascii_lowercase() {
+                continue;
+            }
+            for span in 2..=MAX_ABBREV_SPAN {
+                let q = p + span;
+                if q > input_len || q >= nodes.len() {
+                    break;
+                }
+                if !bytes[p..q].iter().all(|b| b.is_ascii_lowercase()) {
+                    break;
+                }
+                let stroke = &input[p..q];
+                for cand in store.search_abbrev(stroke, USER_NODE_LIMIT) {
+                    if !is_sentence_store_word(&cand) {
+                        continue;
+                    }
+                    let Some(syls) = crate::pinyin::mixed_abbrev::syllables_from_boundary(
+                        &cand.code,
+                        cand.boundary,
+                    ) else {
+                        continue;
+                    };
+                    if syls.len() != span
+                        || !syls
+                            .iter()
+                            .zip(stroke.bytes())
+                            .all(|(syl, b)| syl.as_bytes().first() == Some(&b))
+                    {
+                        continue;
+                    }
+                    let weight = cand.weight.min(USER_NODE_WEIGHT_CAP);
+                    let log_prob = score_node(&cand.text, &cand.code, weight)
+                        - ABBREV_NODE_PENALTY * span as f64
+                        + USER_NODE_BONUS;
+                    if let Some(existing) = nodes[q]
+                        .iter_mut()
+                        .find(|n| n.word == cand.text && n.start == p)
+                    {
+                        if log_prob > existing.log_prob {
+                            existing.log_prob = log_prob;
+                        }
+                        continue;
+                    }
+                    nodes[q].push(LatticeNode {
+                        start: p,
+                        end: q,
+                        word: cand.text,
+                        // 击键空间：每个字母一个音节位（同 add_abbrev_nodes）
+                        syllables: stroke.chars().map(|c| c.to_string()).collect(),
+                        syl_mask: (0..span).fold(0u64, |m, i| m | (1u64 << i)),
                         log_prob,
                     });
                 }

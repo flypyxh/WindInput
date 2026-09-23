@@ -30,9 +30,11 @@
 - **拼音 vs 码表的根本差异**：拼音走连续解码（DAG 分词 + Viterbi 打分 + 层级排序，节点分取自词条自身的词典权重），码表只做 `DictManager` 精确 + 前缀查表无评分。匹配层级的**唯一真相**是 `wind_candidate::cmp_match_layers`（`is_abbrev`/`is_prefix`/`is_partial`），引擎层、协调器 `candidate_display_order`、`freq_rerank` 三处统一调用它，勿再各写一份。
 - **「层级」与「来源」必须分开**：层级键是布尔的，等价于「惩罚 = ∞」，只该用于结构性的匹配质量差异。召回**来源**（模糊音 `is_fuzzy`、用户词 `meta.is_user_dict`）一律走 weight 上的惩罚/加成，不得塞进 `cmp_match_layers`。`is_fuzzy` 曾是其首要键，真实词库下把模糊候选整体压到 200 名开外（`si` 下「是」第 231 位，而生产候选上限 50~300），模糊音在拼音/混输/临拼三条路径上全部等价于未实现；现改为 `FUZZY_WEIGHT_SCALE` 折扣。同理 `is_prefix` 被静态短语、`is_fuzzy` 被用户词简拼借作「沉底」标记都已拆出独立字段（`is_promoted_completion` / `is_abbrev`）——**要沉底就加自己的字段，别借现成的布尔**。
 - **整句词图的来源有两个，不是一个**（S2，2026-09-23）：系统词库走 `self.dict`（`CachedDict`），
-  已晋升的用户词走 `store_layers` + `lattice::add_store_nodes`，由 `schema.pinyin.sentence_uses_user_words`
+  用户上屏过的词（用户词 + 临时词）走 `store_layers` + `lattice::add_store_nodes`（全拼段）/
+  `add_store_abbrev_nodes`（②b 的简拼段，查用户层简拼索引），由 `schema.pinyin.sentence_uses_user_words`
   把关（**出厂 false**）。三条建图通路（②主 / ②b 混合 / ②c 残码）各在 `build` 之后追加一次，
-  全拼降级支路刻意不接。**只收已晋升的用户词**（临时词与草稿层不收——滑窗草稿会造大量杂词），
+  全拼降级支路刻意不接。**收用户词与临时词、不收草稿层**（滑窗草稿会造大量杂词；临时词曾被一并挡掉，
+  系统库没有的「拜城县」手打过后 `bcxrmzf` 整句仍不认），
   **`boundary == 0` 不进图**（与 `build` 的降级放行相反：整句节点必须有真值切分），
   **同词同起点取 `log_prob` 较大者**（GH#93 要的是「我调过的权重整句也得认」）。
   出厂关的原因：用户词进图会换掉唯一那条整句。现在有 N-best 可以看见它输给了谁（见下条），
