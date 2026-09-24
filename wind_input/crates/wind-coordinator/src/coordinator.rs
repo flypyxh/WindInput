@@ -6417,6 +6417,7 @@ impl Coordinator {
             UiEvent::SoftKeyboardFunctionKey(name) => self.ui_softkeyboard_fn_key(&name),
             UiEvent::StatusTipMoved { x, y } => self.save_status_tip_pos(x, y),
             UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),
+            UiEvent::CandidateDoubleClick => self.on_candidate_double_click(),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
             UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
             UiEvent::RequestInputDiagMenu { x, y } => self.show_input_diag_menu(x, y),

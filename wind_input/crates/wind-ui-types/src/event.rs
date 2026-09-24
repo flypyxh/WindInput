@@ -79,6 +79,9 @@ pub enum UiEvent {
     /// 候选窗被拖动到新位置（内容左上屏幕坐标）。协调器仅在 fixed 模式下持久化；
     /// follow_caret 模式的拖动是"本次组合内临时挪开"，不落盘。
     CandidateWindowMoved { x: i32, y: i32 },
+    /// 候选窗**空白处**（编码栏 / 内边距）被双击。协调器按 `ui.candidate.double_click_screenshot`
+    /// 决定是否截图——UI 侧读不到配置，只报事实。候选项与翻页键不产生本事件（按下即动作）。
+    CandidateDoubleClick,
     /// 右键状态提示气泡请求弹出菜单（屏幕坐标）
     RequestStatusMenu { x: i32, y: i32 },
     /// 右键悬停提示（编码反查气泡）请求弹出菜单（屏幕坐标）

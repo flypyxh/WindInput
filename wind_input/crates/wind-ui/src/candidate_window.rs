@@ -427,6 +427,7 @@ impl CandidateWindow {
             drag_origin: (0, 0),
             drag_pin: None,
             margin: (0, 0, 0, 0),
+            double_click: crate::double_click::DoubleClick::new(),
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -3663,6 +3664,8 @@ pub struct CandidateMouse {
     /// 窗口左上 + (left, top) = **内容**左上，即落盘用的坐标系；四个分量一起用于
     /// 按内容矩形做拖动钳制。
     margin: (i32, i32, i32, i32),
+    /// 空白处双击判定（截图用，见 `UiEvent::CandidateDoubleClick`）。
+    double_click: crate::double_click::DoubleClick,
 }
 
 impl CandidateMouse {
@@ -3776,12 +3779,15 @@ impl WindowMouse for CandidateMouse {
                 let i = self.hit(x, y);
                 match i {
                     TAG_PAGE_PREV => {
+                        self.double_click.reset();
                         let _ = self.events.send(UiEvent::Page(-1));
                     }
                     TAG_PAGE_NEXT => {
+                        self.double_click.reset();
                         let _ = self.events.send(UiEvent::Page(1));
                     }
                     i if i >= 0 => {
+                        self.double_click.reset();
                         let _ = self.events.send(UiEvent::CandidateSelect(i as usize));
                     }
                     _ => {
@@ -3806,6 +3812,21 @@ impl WindowMouse for CandidateMouse {
                     self.dragging = false;
                     unsafe {
                         let _ = ReleaseCapture();
+                    }
+                    // 双击判定：只收「按下到松开窗口没挪」的空白处单击——拖过一下的不算，
+                    // 否则拖完紧跟一次点击也会截图。候选项 / 翻页键按下即动作，不经这里。
+                    let (interval, slop) = crate::double_click::system_thresholds();
+                    if self.window_origin() == Some(self.drag_origin) {
+                        let mut p = POINT::default();
+                        unsafe {
+                            let _ = GetCursorPos(&mut p);
+                        }
+                        let now = Instant::now();
+                        if self.double_click.on_click(now, p.x, p.y, interval, slop) {
+                            let _ = self.events.send(UiEvent::CandidateDoubleClick);
+                        }
+                    } else {
+                        self.double_click.reset();
                     }
                     // 以真实窗口位置落定，避免累积误差
                     if let Some(pos) = self.window_origin() {

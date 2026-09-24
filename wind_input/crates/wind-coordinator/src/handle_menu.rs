@@ -141,6 +141,15 @@ impl Drop for ProbeGate {
 }
 
 impl Coordinator {
+    /// 候选窗空白处被双击（`UiEvent::CandidateDoubleClick`）：开关打开时截候选窗到剪贴板。
+    ///
+    /// 与右键菜单「截图到剪贴板」走同一条 UI 命令，Toast 与失败文案也就同一套。
+    pub(crate) fn on_candidate_double_click(&self) {
+        if self.rt().config.ui.candidate.double_click_screenshot {
+            let _ = self.ui_tx.send(UiCommand::ScreenshotCandidateToClipboard);
+        }
+    }
+
     /// 菜单项激活：UI 已自管导航/子菜单，这里仅按动作派发。
     pub(crate) fn menu_action(&self, kind: MenuKind) {
         let (page_local, text) = {
@@ -3438,5 +3447,40 @@ impl Coordinator {
         let _ = self
             .ui_tx
             .send(UiCommand::ShowCandidateMenu { items, anchor });
+    }
+}
+
+#[cfg(test)]
+mod candidate_double_click_tests {
+    //! 双击候选窗截图（`ui.candidate.double_click_screenshot`，论坛 t109）。
+    //!
+    //! 走 `inject_ui_event` 而不直调处理函数：UI 事件分发那一臂漏接同样是「双击没反应」，
+    //! 直调测不到。
+
+    use crate::coordinator::Coordinator;
+    use wind_config::Config;
+    use wind_ui_types::{UiCommand, UiEvent};
+
+    fn screenshot_sent(on: bool) -> bool {
+        let mut cfg = Config::default();
+        cfg.ui.candidate.double_click_screenshot = on;
+        let (c, rx) = Coordinator::new_headless_with_ui(cfg, None);
+        while rx.try_recv().is_ok() {}
+        c.inject_ui_event(UiEvent::CandidateDoubleClick);
+        rx.try_iter()
+            .any(|cmd| matches!(cmd, UiCommand::ScreenshotCandidateToClipboard))
+    }
+
+    #[test]
+    fn double_click_copies_candidate_screenshot_when_enabled() {
+        assert!(
+            screenshot_sent(true),
+            "开关打开时双击应请求候选窗截图到剪贴板"
+        );
+    }
+
+    #[test]
+    fn double_click_is_ignored_when_disabled() {
+        assert!(!screenshot_sent(false), "出厂关闭时双击不应截图");
     }
 }

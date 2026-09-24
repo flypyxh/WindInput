@@ -5807,6 +5807,12 @@ pub struct UiCandidateConfig {
     /// 横排下翻页栏本就落在行尾，此项无影响；蒙文旋转态维持底部独立行（并入会让箭头跟着转 90°）。
     #[serde(default)]
     pub pager_in_preedit: bool,
+    /// 双击候选窗空白处（编码栏 / 内边距）把候选窗当前画面截图复制到剪贴板（默认关，论坛 t109）。
+    ///
+    /// 只认**空白处**：候选项在按下那一刻就选词上屏、候选窗随之消失，双击落不到第二下；
+    /// 翻页键同理会换页。空白处单击本来只起拖动，双击不会误伤选词。
+    #[serde(default)]
+    pub double_click_screenshot: bool,
     /// 候选窗定位方式："follow_caret"（默认，跟随光标）/ "fixed"（固定屏幕坐标）。
     /// fixed 下窗口不再随光标移动，也不再上翻（flip/swap_when_above 随之失去意义）。
     #[serde(default = "default_candidate_position_mode")]
@@ -5934,6 +5940,7 @@ impl Default for UiCandidateConfig {
             flip_when_above: false,
             swap_preedit_when_above: false,
             pager_in_preedit: false,
+            double_click_screenshot: false,
             position_mode: default_candidate_position_mode(),
             custom_x: 0,
             custom_y: 0,
@@ -12174,6 +12181,14 @@ smart_method = "delete_replace"
     fn top_commit_mode_absent_defaults_direct_commit() {
         let cfg: InputConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.top_commit_mode, TopCommitMode::DirectCommit);
+    }
+
+    /// 双击候选窗截图：出厂关，空表反序列化与 Default 一致。
+    #[test]
+    fn candidate_double_click_screenshot_defaults_off() {
+        let c: UiCandidateConfig = toml::from_str("").unwrap();
+        assert!(!c.double_click_screenshot);
+        assert!(!UiCandidateConfig::default().double_click_screenshot);
     }
 
     /// 工具栏自动隐藏：默认关、超时 5 秒；空表反序列化与 Default 一致。

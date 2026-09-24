@@ -586,6 +586,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.flip_when_above", Bool),
     f("ui.candidate.swap_preedit_when_above", Bool),
     f("ui.candidate.pager_in_preedit", Bool),
+    f("ui.candidate.double_click_screenshot", Bool),
     f(
         "ui.candidate.position_mode",
         Enum(&["follow_caret", "fixed"]),
