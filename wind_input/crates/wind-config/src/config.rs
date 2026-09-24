@@ -4061,6 +4061,9 @@ pub struct TempEnglishConfig {
     /// ⚠️ **行为变更**（此前两者共用 `schema.english.commit_space`）：升级前开着英文方案
     /// 那个开关的用户，临英会从「补」变成「不补」，需要另外打开本项。出厂两者皆关，
     /// 故只影响主动开启过的用户。
+    ///
+    /// ★ 也作用于**快捷输入里的英文**（A2-3b）：英文词库候选与所打原文上屏补空格，
+    /// 中文候选与计算结果不补。判据见 `Coordinator::mix_candidate_is_english`。
     #[serde(default)]
     pub commit_space: bool,
     /// 临英下的词组分词输入（论坛 t42）：用 `'` 切开各段，每段只打前缀。**默认关**。

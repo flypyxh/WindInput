@@ -464,8 +464,8 @@ code 是 query 前缀 → 只消费前缀长度，剩余拼音继续转换；否
   「按段找词组」。出厂词组大量 `weight = 0`，这个次序在实际候选窗里说了算。
 - **排序 `weight 降序 → 跨度升序 → 文本序`**：主键必须是 weight（本文档 §跨组件硬约定：
   协调器会按 weight 统一重排，引擎内不改 weight 的排序会被冲掉）。跨度是次级键。
-- **三个作用域，两份开关**：`schema.english.phrase_seg`（英文方案 + 快捷输入英文）与
-  `input.temp_english.phrase_seg`（临英）。引擎侧不分作用域（三者共用同一实例），
+- **三个作用域，两份开关**：`schema.english.phrase_seg`（英文方案）与
+  `input.temp_english.phrase_seg`（临英 + 快捷输入英文，快捷输入里的英文一律跟临英那份开关）。引擎侧不分作用域（三者共用同一实例），
   只收一个「有没有任何一个开着」；闸门在协调器——`'` 进不了缓冲，`convert` 的
   `input.contains(sep)` 就早退。
 - 快捷输入侧另有 `MixLens::Phrase` 透镜：接受集 = 小写字母 + 分词符、**只查 english 成员**、

@@ -408,15 +408,76 @@ impl Coordinator {
             return None;
         }
         drop(rt);
-        // ⚠️ 走 `mix_members_resolved` 而不是自己再解析一遍占位符：`update_mix_candidates`
-        // 的成员循环用的就是它，两处必须是同一份口径。自己写一份的话，`$primary_pinyin`
-        // 这类占位符的解析规则哪天改了只会改到其中一处，而症状是「本实例明明有英文成员，
-        // 分词符却不生效」——静默且难查。
-        let has_english = self
-            .mix_members_resolved(idx)
+        self.mix_has_english(idx)
+            .then_some(wind_engine::english_phrase::PHRASE_SEPARATOR)
+    }
+
+    /// 本 mix 实例是否含英文成员。
+    ///
+    /// ⚠️ 走 `mix_members_resolved` 而不是自己再解析一遍占位符：`update_mix_candidates`
+    /// 的成员循环用的就是它，两处必须是同一份口径。自己写一份的话，`$primary_pinyin`
+    /// 这类占位符的解析规则哪天改了只会改到其中一处，而症状是「本实例明明有英文成员，
+    /// 分词符却不生效」——静默且难查。
+    fn mix_has_english(&self, idx: u8) -> bool {
+        self.mix_members_resolved(idx)
             .iter()
-            .any(|m| m == "english");
-        has_english.then_some(wind_engine::english_phrase::PHRASE_SEPARATOR)
+            .any(|m| m == "english")
+    }
+
+    /// 快捷输入里的英文上屏对齐临英（A2-3b）：这条候选「算不算英文」。
+    ///
+    /// 算英文的才按 `input.temp_english.commit_space` 补空格、全角态转全角——快捷输入里的
+    /// 英文**一律读临英那份开关**（用户 2026-09-24 拍板，不另立第三份），因为两者是同一种
+    /// 场景：中文里插一个英文词。
+    ///
+    /// 判据三条缺一不可（前两条即 [`Self::mix_raw_counts_as_english`]，与原文出口共用）：
+    /// - 本实例含英文成员——没有英文成员的自定义融合模式（如拼音+五笔）与临英毫无关系；
+    /// - 非数字透镜——计算/日期/金额的结果（`12` → `12`）文本恰好等于所打原码，照
+    ///   `english_text_counts_as_input` 的第二判据会被误认成「原文」；
+    /// - [`english_text_counts_as_input`](crate::handle_candidate::english_text_counts_as_input)
+    ///   ——与英文方案/临英同一个纯函数：英文词库来源，或所打原文（含 Free 透镜的原文候选）
+    ///   及其大小写变形。中文候选文本永远不等于字母缓冲，天然落空。
+    ///
+    /// ⚠️ **不要**图省事把 Mix 并进 `in_english_input_context`：那是「整个语境在打英文」，
+    /// 并进去会让 mix 的**中文**候选也补空格，还会连带打开 CapsLock 档位循环。
+    fn mix_candidate_is_english(&self, state: &State, cand: &Candidate) -> bool {
+        self.mix_raw_counts_as_english(state)
+            && crate::handle_candidate::english_text_counts_as_input(
+                cand.source,
+                &cand.text,
+                &state.mix_buffer,
+            )
+    }
+
+    /// 快捷输入的**缓冲原文**上屏（空格兜底 / 回车 / 切中英文）是否按英文对待（A2-3b）：
+    /// 本实例含英文成员且不在数字透镜。
+    ///
+    /// 数字透镜必须排除：`;1+` 这类算式原文与英文毫无关系，且那几条出口各有自己的全半角
+    /// 口径（小键盘恒半角 `numpad_raw_output` 等），在这里转全角会绕过它们——曾出现全角态
+    /// 下 `;1+` 空格得 `1+`、回车得 `１＋` 的分叉。三条出口共用本判据，不许各写一份。
+    pub(crate) fn mix_raw_counts_as_english(&self, state: &State) -> bool {
+        self.mix_lens(state) != MixLens::Numeric && self.mix_has_english(state.mix_id)
+    }
+
+    /// 快捷输入英文上屏后要补的空格（按 `input.temp_english.commit_space`）；不补时为空串。
+    /// 全角态补全角空格，与临英 `commit_temp_english_text` 同口径。
+    fn mix_english_space(&self, state: &State) -> &'static str {
+        if !self.rt().config.input.temp_english.commit_space {
+            ""
+        } else if state.full_width {
+            "\u{3000}"
+        } else {
+            " "
+        }
+    }
+
+    /// 全角态下把快捷输入的英文上屏文本转全角（对齐临英）；半角态原样返回。
+    pub(crate) fn mix_english_width(state: &State, text: &str) -> String {
+        if state.full_width {
+            wind_transform::fullwidth::to_full_width(text)
+        } else {
+            text.to_string()
+        }
     }
 
     /// 本 mix 实例的自由输入设置（实例缺失时按 `Off`——没有实例就没有自由输入可言）。
@@ -1869,7 +1930,15 @@ impl Coordinator {
                 text: display,
             }
         } else {
-            let out = format!("{}{}", state.committed_text, cand.text);
+            // 英文候选对齐临英（A2-3b）：全角态转全角、按临英开关补空格。判据须在
+            // `exit_mix_mode` 清缓冲之前取。
+            let english = self.mix_candidate_is_english(state, &cand);
+            let cand_text = if english {
+                Self::mix_english_width(state, &cand.text)
+            } else {
+                cand.text.clone()
+            };
+            let out = format!("{}{}", state.committed_text, cand_text);
             let code_len = if numeric {
                 0
             } else {
@@ -1920,6 +1989,13 @@ impl Coordinator {
                 Some(t) => format!("{}{}", self.maybe_convert(state, &state.committed_text), t),
                 None => self.maybe_convert(state, &out),
             };
+            // 补空格排在记账与简繁转换之后：带空格的文本进统计表就是一条对不上的脏键。
+            // 分步确认那一支（上方）不补——组合区还留着，那不是一次上屏。
+            let out = if english {
+                out + self.mix_english_space(state)
+            } else {
+                out
+            };
             self.exit_mix_mode(state);
             self.notify_ui_hide();
             Self::commit_action(out, true)
@@ -1952,8 +2028,9 @@ impl Coordinator {
         let lens = self.mix_lens(state);
         if lens == MixLens::Free {
             // 自由输入：缓冲不是任何成员的合法编码，查谁都只会得到噪声。唯一候选＝所打原文，
-            // 保证「打什么上屏什么」。**不做全角转换**——与 mix 既有上屏路径保持一致
-            // （临英会转，两者是否对齐是独立待定项，不在本次改动范围内）。
+            // 保证「打什么上屏什么」。候选文本保持半角原样；全角转换与补空格在上屏出口
+            // `mix_select_at` 做（含英文成员的实例对齐临英，A2-3b 定案），这里不转——
+            // 否则候选窗里显示的就是全角串、且与出口处的判据（文本 == 缓冲）对不上。
             //
             // 刻意**不走 `finalize_candidates`**：那是词库候选里 `$AA`/`$CC` 特殊语法的展开点，
             // 而自由输入的文本是用户逐键打进来的字面内容——打了 `$AA` 就该出 `$AA`。
@@ -2420,6 +2497,13 @@ impl Coordinator {
                         state,
                         &format!("{}{}", state.committed_text, state.mix_buffer),
                     );
+                    // 含英文成员的实例对齐临英空格兜底（A2-3b）：全角态转全角、按临英开关
+                    // 补空格。数字透镜（算式无结果）不算英文，原样上屏。
+                    let out = if self.mix_raw_counts_as_english(state) {
+                        Self::mix_english_width(state, &out) + self.mix_english_space(state)
+                    } else {
+                        out
+                    };
                     commit_text(self, state, out)
                 } else {
                     let (start, _) = self.page_range(state);
@@ -2466,6 +2550,13 @@ impl Coordinator {
                     state,
                     &format!("{}{}{}", guide, state.committed_text, state.mix_buffer),
                 );
+                // 含英文成员的实例对齐临英回车（A2-3b）：全角态转全角；回车是终结性动作，
+                // 不补空格。数字透镜除外，判据与空格兜底共用 `mix_raw_counts_as_english`。
+                let out = if self.mix_raw_counts_as_english(state) {
+                    Self::mix_english_width(state, &out)
+                } else {
+                    out
+                };
                 commit_text(self, state, out)
             }
             _ => {
@@ -2685,14 +2776,20 @@ impl Coordinator {
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
-                        match &state.candidates[idx].s2t_override {
+                        // 英文候选对齐临英顶屏（A2-3b）：全角态转全角，但**不补空格**
+                        // （补了会得到 `hello ,`，同临英 ⑥ 与主输入路 `commit_highlight_then_char`）。
+                        let cand = &state.candidates[idx];
+                        let text = if self.mix_candidate_is_english(state, cand) {
+                            Self::mix_english_width(state, &cand.text)
+                        } else {
+                            cand.text.clone()
+                        };
+                        match &cand.s2t_override {
                             Some(t) => {
                                 format!("{}{}", self.maybe_convert(state, &state.committed_text), t)
                             }
-                            None => self.maybe_convert(
-                                state,
-                                &format!("{}{}", state.committed_text, state.candidates[idx].text),
-                            ),
+                            None => self
+                                .maybe_convert(state, &format!("{}{}", state.committed_text, text)),
                         }
                     } else {
                         self.maybe_convert(state, &state.committed_text.clone())

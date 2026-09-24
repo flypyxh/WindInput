@@ -8048,7 +8048,16 @@ impl Coordinator {
                         let code = format!("{}{}", guide, buf);
                         self.record_commit(&code, code.len() as u32, -1, CommitSource::ModeSwitch);
                         let raw = format!("{}{}{}", guide, state.committed_text, buf);
-                        self.maybe_convert(state, &raw)
+                        let out = self.maybe_convert(state, &raw);
+                        // 快捷输入含英文成员时对齐临英（A2-3b）：全角态转全角，与 mix 回车
+                        // 同一判据（`mix_raw_counts_as_english`，数字透镜除外）。
+                        if matches!(state.active, Some(ModeKind::Mix(_)))
+                            && self.mix_raw_counts_as_english(state)
+                        {
+                            Self::mix_english_width(state, &out)
+                        } else {
+                            out
+                        }
                     } else if !prefix.is_empty() && !self.enter_clears_composition() {
                         // 只按了模式进入符（缓冲空）：原样上屏该前缀符号本身，与回车空缓冲上屏一致
                         // （enter_behavior=clear 时回车也不上屏，故一并放弃）。
