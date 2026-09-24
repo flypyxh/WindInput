@@ -823,6 +823,140 @@ pub fn schema_override_of(key: &str) -> Option<&'static SchemaOverride> {
     })
 }
 
+/// 这份方案（**合并后**：方案文件 ⊕ override 层）覆盖了哪些全局配置键。
+///
+/// 回答全局设置页「已被 N 个方案覆盖」的反查（R8.6）。键名与 [`SCHEMA_OVERRIDES`] 的登记
+/// 一一对应（前缀型登记展开成直接子键），每个键至多出现一次。
+///
+/// 判据逐字段与各 `resolved()` 的折叠条件一致：`Option` 取 `is_some()`、`LayoutIntent`
+/// 取非 `Follow`、码元字符集取非空串——「写了但等于全局值」也算覆盖，因为此后改全局对
+/// 它已无影响，这正是用户要被提示的事。
+///
+/// ⚠️ 与 [`SCHEMA_OVERRIDES`] 一样没有编译期约束：新增方案级字段时两处都要加一行。
+/// 护栏是 `overridden_keys_covers_every_schema_override_entry`（登记了而这里漏了会红）。
+///
+/// `[punct] mode` 不在内：它没有对应的全局键（见 [`SCHEMA_OVERRIDES`] 的「不在表里」一节）。
+pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static str> {
+    let ct = &schema.engine.codetable;
+    let freq = ct.frequency.clone().unwrap_or_default();
+    let em = ct.english_merge.clone().unwrap_or_default();
+    let aux = &schema.engine.aux_code;
+    let punct_table = schema.punct.custom_mappings.is_some();
+    let cand = &schema.candidate;
+    let checks = [
+        // ── [engine.codetable] ⇄ schema.codetable.* ──
+        (
+            "schema.codetable.top_code_commit",
+            ct.top_code_commit.is_some(),
+        ),
+        (
+            "schema.codetable.clear_on_empty_max",
+            ct.clear_on_empty_max.is_some(),
+        ),
+        (
+            "schema.codetable.auto_commit_at_full",
+            ct.auto_commit_at_full.is_some(),
+        ),
+        (
+            "schema.codetable.auto_commit_min_len",
+            ct.auto_commit_min_len.is_some(),
+        ),
+        ("schema.codetable.punct_commit", ct.punct_commit.is_some()),
+        (
+            "schema.codetable.show_code_hint",
+            ct.show_code_hint.is_some(),
+        ),
+        (
+            "schema.codetable.single_code_input",
+            ct.single_code_input.is_some(),
+        ),
+        (
+            "schema.codetable.single_code_complete",
+            ct.single_code_complete.is_some(),
+        ),
+        (
+            "schema.codetable.short_code_yield_level",
+            ct.short_code_yield_level.is_some(),
+        ),
+        ("schema.codetable.single_char", ct.single_char.is_some()),
+        ("schema.codetable.z_key_repeat", ct.z_key_repeat.is_some()),
+        ("schema.codetable.z_key_action", ct.z_key_action.is_some()),
+        // 码元字符集用空串表达「未设置」（见 `CodetableGlobal::resolved`）。
+        ("schema.codetable.input_chars", !ct.input_chars.is_empty()),
+        (
+            "schema.codetable.leading_chars",
+            !ct.leading_chars.is_empty(),
+        ),
+        // ── [engine.codetable.frequency] ──
+        ("schema.codetable.frequency.enabled", freq.enabled.is_some()),
+        (
+            "schema.codetable.frequency.strategy",
+            freq.strategy.is_some(),
+        ),
+        (
+            "schema.codetable.frequency.promote_prefix",
+            freq.promote_prefix.is_some(),
+        ),
+        (
+            "schema.codetable.frequency.half_life",
+            freq.half_life.is_some(),
+        ),
+        (
+            "schema.codetable.frequency.protect_top_n",
+            freq.protect_top_n.is_some(),
+        ),
+        (
+            "schema.codetable.frequency.protect_top_n_len1",
+            freq.protect_top_n_len1.is_some(),
+        ),
+        (
+            "schema.codetable.frequency.protect_top_n_len2",
+            freq.protect_top_n_len2.is_some(),
+        ),
+        (
+            "schema.codetable.frequency.protect_top_n_len3",
+            freq.protect_top_n_len3.is_some(),
+        ),
+        // ── [engine.codetable.english_merge] ──
+        ("schema.codetable.english_merge.enable", em.enable.is_some()),
+        (
+            "schema.codetable.english_merge.min_length",
+            em.min_length.is_some(),
+        ),
+        (
+            "schema.codetable.english_merge.block_commit",
+            em.block_commit.is_some(),
+        ),
+        // ── [engine.aux_code] ⇄ schema.pinyin.aux_code.* ──
+        ("schema.pinyin.aux_code.enabled", aux.enabled.is_some()),
+        (
+            "schema.pinyin.aux_code.max_phrase_len",
+            aux.max_phrase_len.is_some(),
+        ),
+        // ── [punct]：整表替换连总开关一起换掉，两条登记由同一个字段判定 ──
+        ("input.punct.custom_mappings", punct_table),
+        ("input.punct.custom_enabled", punct_table),
+        // ── [candidate] ──
+        (
+            "ui.candidate.layout",
+            cand.layout != crate::config::LayoutIntent::Follow,
+        ),
+        (
+            "ui.candidate.comment_template_vertical",
+            cand.comment_template_vertical.is_some(),
+        ),
+        (
+            "ui.candidate.comment_template_horizontal",
+            cand.comment_template_horizontal.is_some(),
+        ),
+    ];
+    checks
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(k, _)| k)
+        .collect()
+}
+
 /// 把命令行/词条来源的原始字符串按注册表类型解析为 TOML 值（CLI `config set` 与
 /// cmdbar `config.set` 共用；解析不校验枚举成员与范围，交给 [`validate`]）。
 ///
@@ -1752,5 +1886,144 @@ mod layout_enum_tests {
     fn is_not_a_whole_value_leaf() {
         // 设置端写它时发的是一个标量（标签式），不该落进写盘闸的「整体一份」那一类。
         assert!(!field(KEY).unwrap().ty.is_whole_value_leaf());
+    }
+}
+
+#[cfg(test)]
+mod overridden_keys_tests {
+    use super::*;
+
+    fn schema_of(body: &str) -> crate::schema::Schema {
+        let src = format!("[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n{body}");
+        toml::from_str(&src).unwrap_or_else(|e| panic!("最小方案解析失败：{e}\n{src}"))
+    }
+
+    #[test]
+    fn overridden_keys_lists_codetable_option_fields_once() {
+        let s = schema_of(
+            "[engine.codetable]\ntop_code_commit = true\n[candidate]\nlayout = \"vertical\"\n",
+        );
+        let keys = schema_overridden_keys(&s);
+        assert!(
+            keys.contains(&"schema.codetable.top_code_commit"),
+            "{keys:?}"
+        );
+        assert!(keys.contains(&"ui.candidate.layout"), "{keys:?}");
+        assert_eq!(
+            keys.iter()
+                .filter(|k| **k == "schema.codetable.top_code_commit")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn overridden_keys_ignores_follow_and_none() {
+        // 显式写 follow、写空的码元字符集、只写引擎固定参数：都不算覆盖全局。
+        let s = schema_of(
+            "[engine.codetable]\nmax_code_length = 4\ninput_chars = \"\"\n[candidate]\nlayout = \"follow\"\n[punct]\nmode = \"chinese\"\n",
+        );
+        assert!(
+            schema_overridden_keys(&s).is_empty(),
+            "{:?}",
+            schema_overridden_keys(&s)
+        );
+    }
+
+    /// 前缀型登记在方案文件里的落点段。与 `SchemaOverride::section` 刻意不共用：那是给用户看
+    /// 的提示文案（写作 `[codetable]`），这里要的是能被 serde 读进 `Schema` 的真实路径。
+    fn schema_section_of_prefix(prefix: &str) -> &'static str {
+        match prefix {
+            "schema.codetable." => "engine.codetable",
+            "schema.codetable.frequency." => "engine.codetable.frequency",
+            "schema.codetable.english_merge." => "engine.codetable.english_merge",
+            other => panic!(
+                "新增了前缀登记 {other}：在此补它在方案文件里的段，并让 schema_overridden_keys 认它"
+            ),
+        }
+    }
+
+    /// 精确登记项的最小方案片段——只设这一项。
+    fn minimal_setting_of_exact(key: &str) -> &'static str {
+        match key {
+            "schema.pinyin.aux_code.enabled" => "[engine.aux_code]\nenabled = true\n",
+            "schema.pinyin.aux_code.max_phrase_len" => "[engine.aux_code]\nmax_phrase_len = 3\n",
+            // 方案级没有 `custom_enabled`（见 `PunctSpec::custom_mappings` 的 ⛔）：声明了自己的
+            // 表就整表替换、连全局开关一起换掉。于是两条登记由同一个字段判定，这是登记语义
+            // 本身（见 SCHEMA_OVERRIDES 那条 note），不是豁免。
+            "input.punct.custom_mappings" | "input.punct.custom_enabled" => {
+                "[punct.custom_mappings]\n\",\" = [\"，\", \"，\", \"，\", \",\"]\n"
+            }
+            "ui.candidate.layout" => "[candidate]\nlayout = \"vertical\"\n",
+            "ui.candidate.comment_template_vertical" => {
+                "[candidate]\ncomment_template_vertical = \"x\"\n"
+            }
+            "ui.candidate.comment_template_horizontal" => {
+                "[candidate]\ncomment_template_horizontal = \"x\"\n"
+            }
+            other => panic!(
+                "新增了登记项 {other}：在此补一份只设该项的最小方案片段，并让 schema_overridden_keys 认它"
+            ),
+        }
+    }
+
+    fn sample_value(key: &str) -> String {
+        match field(key)
+            .unwrap_or_else(|| panic!("{key} 未在注册表登记"))
+            .ty
+        {
+            FieldType::Bool => "true".into(),
+            FieldType::Int => "1".into(),
+            FieldType::Float => "1.5".into(),
+            FieldType::Str => "\"x\"".into(),
+            FieldType::Enum(vs) => format!("{:?}", vs[0]),
+            other => panic!("{key} 的类型 {other:?} 在方案级没有标量形态，测试需要单独处理"),
+        }
+    }
+
+    /// 每个被 SCHEMA_OVERRIDES 登记为「可被方案覆盖」的键，都必须能被本函数识别，
+    /// 否则全局页的「已被 N 个方案覆盖」会对它恒显示 0（R8.6），这是护栏。
+    ///
+    /// 前缀型登记按注册表展开成它管辖的**全部直接子键**（与 `schema_override_of` 同一判据），
+    /// 每个键各造一份只设该键的方案。展开取自注册表而不是 `CodeTableSpec` 字段：全局页的行
+    /// 是按注册表画的，注册表里多出一个方案读不进去的键，这里就该红。
+    ///
+    /// 豁免：无。每条登记都能由方案侧某个 Option / 非 Follow / 非空字段判定。
+    #[test]
+    fn overridden_keys_covers_every_schema_override_entry() {
+        let mut checked = 0;
+        for o in SCHEMA_OVERRIDES {
+            let cases: Vec<(&str, String)> = if o.key.ends_with('.') {
+                let section = schema_section_of_prefix(o.key);
+                let keys: Vec<&str> = registry()
+                    .iter()
+                    .map(|f| f.key)
+                    .filter(|k| schema_override_of(k).is_some_and(|hit| hit.key == o.key))
+                    .collect();
+                assert!(
+                    !keys.is_empty(),
+                    "前缀登记 {} 在注册表里一个子键都没有",
+                    o.key
+                );
+                keys.into_iter()
+                    .map(|k| {
+                        let leaf = &k[o.key.len()..];
+                        (k, format!("[{section}]\n{leaf} = {}\n", sample_value(k)))
+                    })
+                    .collect()
+            } else {
+                vec![(o.key, minimal_setting_of_exact(o.key).to_string())]
+            };
+            for (key, body) in cases {
+                let got = schema_overridden_keys(&schema_of(&body));
+                assert!(
+                    got.contains(&key),
+                    "只设了 {key} 的方案没被识别为覆盖它（片段：{body:?}，结果：{got:?}）"
+                );
+                checked += 1;
+            }
+        }
+        // 防「循环体一次没进」的空过：登记表 + 前缀展开至少有这么多键。
+        assert!(checked >= 30, "只验了 {checked} 个键，展开逻辑可能坏了");
     }
 }

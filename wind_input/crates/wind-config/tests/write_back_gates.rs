@@ -106,9 +106,11 @@ const CONFIG_LOAD_SITES: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/wind-webdata/src/lib.rs",
-        2,
+        3,
         "config_patch_diff 已闸（mark_degraded_seeds）；keys_overview 只显示不写盘，\
-         且降级时不列出不可信的那一层（见 keys_overview 的文档）",
+         且降级时不列出不可信的那一层（见 keys_overview 的文档）；followed_behavior 只读，\
+         出的是「跟随全局」的显示值且已登记 READONLY_SIDECAR_FIELDS、不随 saveConfig 写回\
+         （段降级时给的是出厂值，与运行时按出厂值跑一致）",
     ),
 ];
 

@@ -5755,6 +5755,100 @@ fn test_web_theme_resolved_falls_back_to_default_theme() {
     assert!(v["fontSize"].as_i64().unwrap() > 0, "{v}");
 }
 
+/// 造一个只含若干最小码表方案的临时数据目录：`(id, 方案文件里追加的段)`。
+///
+/// 覆盖反查要测「方案文件与 override 层写同一个键」，而测试不能往真实 `build_dev/data`
+/// 的方案文件里写字，故自带方案文件；引擎只需一张一行的小码表能建起来即可。
+fn override_summary_data_dir(tag: &str, schemas: &[(&str, &str)]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wind_ovsum_data_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let sd = dir.join("schemas");
+    for (id, extra) in schemas {
+        std::fs::create_dir_all(sd.join(id)).unwrap();
+        std::fs::write(
+            sd.join(format!("{id}.schema.toml")),
+            format!(
+                "[schema]\nid = \"{id}\"\nname = \"{id}\"\n\
+                 [engine]\ntype = \"codetable\"\n\
+                 [[dictionaries]]\nid = \"main\"\npath = \"{id}/{id}.dict.yaml\"\ndefault = true\n\
+                 {extra}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sd.join(format!("{id}/{id}.dict.yaml")),
+            format!("---\nname: {id}\nversion: \"1\"\n...\n阿\ta\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// `schema.overrideSummary`：方案文件与 override 层写同一个键只算一次覆盖；数组按方案列表
+/// 顺序；没启用的方案不计。顺带验 `getConfig.followedBehavior` 的形状。
+#[test]
+fn test_web_override_summary_counts_each_schema_once() {
+    let data = override_summary_data_dir(
+        "once",
+        &[
+            // 方案文件自带 top_code_commit，override 层再写一次（值不同也仍是同一次覆盖）。
+            (
+                "ovs_a",
+                "[engine.codetable]\ntop_code_commit = true\n[candidate]\nlayout = \"vertical\"\n",
+            ),
+            ("ovs_b", ""),
+            // 装了但没启用：它的覆盖不该出现在反查里。
+            ("ovs_c", "[engine.codetable]\ntop_code_commit = true\n"),
+        ],
+    );
+    let ov = std::env::temp_dir().join("wind_ovsum_ov_once");
+    let _ = std::fs::remove_dir_all(&ov);
+    std::fs::create_dir_all(&ov).unwrap();
+    for id in ["ovs_a", "ovs_b"] {
+        let v = if id == "ovs_a" { "false" } else { "true" };
+        std::fs::write(
+            ov.join(format!("{id}.toml")),
+            format!("[engine.codetable]\ntop_code_commit = {v}\n"),
+        )
+        .unwrap();
+    }
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["ovs_a".into(), "ovs_b".into()];
+    cfg.schema.active = "ovs_a".into();
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data), Some(ov.clone()));
+
+    let sum = coord
+        .web_data_rpc("schema.overrideSummary", &serde_json::json!({}))
+        .unwrap();
+    assert_eq!(
+        sum["schema.codetable.top_code_commit"],
+        serde_json::json!(["ovs_a", "ovs_b"]),
+        "{sum}"
+    );
+    assert_eq!(
+        sum["ui.candidate.layout"],
+        serde_json::json!(["ovs_a"]),
+        "{sum}"
+    );
+    // 谁都没写的键不出现（不是空数组）。
+    assert!(sum.get("schema.codetable.punct_commit").is_none(), "{sum}");
+
+    let got = coord
+        .web_data_rpc("schema.getConfig", &serde_json::json!({ "id": "ovs_a" }))
+        .unwrap();
+    let fb = &got["followedBehavior"];
+    assert!(
+        ["horizontal", "vertical"].contains(&fb["layout"].as_str().unwrap_or("")),
+        "{fb}"
+    );
+    assert!(fb["fontFamily"].is_string(), "{fb}");
+    assert!(fb["auxEnabled"].is_boolean(), "{fb}");
+    assert!(fb["auxMaxPhraseLen"].is_u64(), "{fb}");
+
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
 #[test]
 fn test_stats_recorded_through_deferred_policed() {
     // 回归：生产链路是 bridge → DeferredHandler → Coordinator，bridge 调 handle_key_event_policed。
