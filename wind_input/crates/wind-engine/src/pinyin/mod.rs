@@ -289,9 +289,11 @@ const FUZZY_WEIGHT_SCALE: f64 = 0.5;
 /// 一半、要删第二次（审查查出，同款写法也在 step 6）。
 ///
 /// ⚠️ **刻意不清 `is_synthesized`**（已有候选是 ②b 整句时它为真）：看似「用户层有了就不算
-/// 新合成」，但这条整句的 `code` 是击键串，协调器 6b 按 `code` 点查临时词必然落空，它推进
-/// 晋升计数靠的正是 `is_synthesized` 触发的 `learn_phrase_on_commit`（按全拼码写、已存在即
-/// count++）。清掉它，这个词就永远攒不到晋升次数。
+/// 新合成」，但它决定上屏后走不走 `learn_phrase_on_commit`——那一路按造词码（规范码 +
+/// 规范边界）写、已存在即 count++。协调器 6b 现按 `store_code` 点查也能命中这条记录，
+/// 但对「刚由造词写过的码」刻意跳过（防同一次上屏 +2），两路只走一路。保留标记，计数与
+/// 边界补写就始终由造词那一路负责；清掉则改由 6b 计数、边界退回它的推算口径——
+/// 行为可以接受，但没有理由在这里悄悄换路。
 fn merge_store_abbrev_hit(existing: &mut Candidate, hit: &Candidate, weight: i32) {
     if existing.is_abbrev {
         existing.weight = existing.weight.max(weight);

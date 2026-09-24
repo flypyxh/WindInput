@@ -3242,15 +3242,48 @@ impl Coordinator {
             // 不跳就是同一次上屏 count +2（见 `learn_phrase_on_commit` 的返回值说明）。
             // **刚跃迁的草稿同样要跳过**：跃迁已把 count 记成 1，6b 再点查命中一次
             // 就是同一次上屏 count +2 —— 与上面那条 `learned_code` 是同一个坑。
+            //
+            // **点查用记录码**：模糊召回的候选 `code` 是所打码（`chaijiuduolian`），记录在
+            // 规范码（`caijiuduolian`，即 `meta.store_code`）下，只拿 `code` 点查永远落空 ⇒
+            // 模糊打法选多少次都不涨计数、永远晋升不了。故依次试 `store_code`、`code`，取
+            // 第一个查得到的（同 `delete_candidate` 的试码法）——对只试 `code` 的旧写法是严格
+            // 超集：双层同文时 `store_code` 可能指向用户层的码，那时退回 `code` 仍能命中。
+            //
+            // 边界跟着码走：码是 `code` 时用候选边界；是记录码时只能用同码的 `learn_code`
+            // 边界（模糊命中的 `learn_code` 正是（记录码, 记录边界）），否则给 0。候选边界在
+            // 所打码坐标下，补进规范码记录（旧边界为 0 时 `learn_temp_word` 会补写）就是错的。
+            //
+            // 「刚造词」守卫比的也必须是**命中的那个码**：造词写的是规范码，与这里命中的
+            // 记录码相同；拿所打码比会漏判，同一次上屏计数 +2。
             if !cand.is_phrase
                 && !promoted_draft
-                && learned_code.as_deref() != Some(code.as_str())
                 && let Some(store) = &self.store
             {
                 let active = self.engine_mgr.active_schema_id();
-                if let Some(schema) = self.engine_mgr.write_data_schema_id(&active, cand.source)
-                    && let Ok(Some(_)) = store.get_temp_word(&schema, &code, &cand.text)
+                let hit = self
+                    .engine_mgr
+                    .write_data_schema_id(&active, cand.source)
+                    .and_then(|schema| {
+                        [cand.meta.store_code.as_deref(), Some(code.as_str())]
+                            .into_iter()
+                            .flatten()
+                            .find(|c| {
+                                matches!(store.get_temp_word(&schema, c, &cand.text), Ok(Some(_)))
+                            })
+                            .map(|c| (schema, c.to_string()))
+                    });
+                if let Some((schema, temp_code)) = hit
+                    && learned_code.as_deref() != Some(temp_code.as_str())
                 {
+                    let temp_boundary = if temp_code == code {
+                        cand.boundary
+                    } else {
+                        cand.meta
+                            .learn_code
+                            .as_ref()
+                            .filter(|(c, _)| *c == temp_code)
+                            .map_or(0, |(_, b)| *b)
+                    };
                     let promote_count = if self.engine_mgr.is_pinyin() {
                         self.engine_mgr.auto_learn_settings().promote_count
                     } else {
@@ -3260,18 +3293,18 @@ impl Coordinator {
                             .promote_count
                     };
                     // 选中已存在的临时词：learn_temp_word 内部沿用旧 boundary，仅当旧值为 0
-                    // （v1 遗留/无信息）时用候选自带的边界补上。
+                    // （v1 遗留/无信息）时用上面算出的边界补上。
                     if let Ok(count) = store.learn_temp_word(
                         &schema,
-                        &code,
+                        &temp_code,
                         &cand.text,
                         LEARN_ADD_WEIGHT,
-                        cand.boundary,
+                        temp_boundary,
                     ) {
                         self.maybe_promote_temp(
                             store,
                             &schema,
-                            &code,
+                            &temp_code,
                             &cand.text,
                             count,
                             promote_count,
@@ -4467,14 +4500,14 @@ impl Coordinator {
         let code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
         let chinese_mode = state.chinese_mode;
         let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source, &code);
-        // 鼠标提交后彻底复位各输入模式，避免遗留状态
-        state.active = None;
-        state.temp_pinyin_buffer.clear();
-        state.temp_pinyin_prefix.clear();
-        state.temp_english_buffer.clear();
+        // 鼠标提交后彻底复位：走 `cancel_session`（按 `active` 分派各模式的 `exit_*`，
+        // 含 `notify_ui_hide`），与命令候选分支同一个退出点。此前这里手工只清 `active` 与
+        // 临拼 / 临英几个字段，生僻字的 `special_buffer` 与夺取回退登记 `rewind`、快捷输入的
+        // `mix_buffer` 都留着——各模式以后新增的「退出必清」字段也会从这里漏掉。
+        // 返回值（`ClearComposition`）丢弃：上屏文本下面经 push 投递。
+        let _ = self.cancel_session(&mut state);
         drop(state);
 
-        self.notify_ui_hide();
         // 同 push_commit_text：push 路不经按键收口，换行改写在此接一次（A3-3）。
         let out_nl = self.convert_commit_newline(out.clone());
         let encoded =
@@ -6633,6 +6666,59 @@ mod mouse_command_overlay_tests {
             filter_options: Default::default(),
             origin,
         }
+    }
+
+    /// 生僻字（经 z 夺取进来）里鼠标点**普通候选**：回退登记与编码缓冲不得残留。
+    /// 通用 overlay 分支曾只清 `active` 与临拼 / 临英字段，`rewind` 留着 ⇒ 下次缓冲
+    /// 恰等于残余码时退格会被误判成「退回夺取边界」。
+    #[test]
+    fn rare_char_plain_click_exits_cleanly() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::RareChar);
+            st.special_buffer = "gg".into();
+            st.special_prefix = "z".into();
+            st.rewind = Some(crate::pipeline::Rewind {
+                snapshot: "z".into(),
+                host_text: "g".into(),
+                origin: crate::pipeline::RewindOrigin::Normal,
+            });
+            st.candidates = vec![Candidate {
+                text: "玨".into(),
+                ..Default::default()
+            }];
+        }
+        let _ = c.select_candidate_at(0);
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.rewind.is_none(), "夺取回退登记不得残留");
+        assert!(st.special_buffer.is_empty(), "生僻字编码缓冲不得残留");
+        assert!(st.special_prefix.is_empty());
+        assert!(st.overlay_spec.is_none(), "overlay 段快照随模式丢弃");
+    }
+
+    /// 快捷输入里鼠标点普通候选：`mix_buffer` / 前缀不得残留。
+    #[test]
+    fn mix_plain_click_exits_cleanly() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::Mix(0));
+            st.mix_buffer = "ab".into();
+            st.mix_prefix = ";".into();
+            st.committed_text = "前".into();
+            st.candidates = vec![Candidate {
+                text: "阿".into(),
+                ..Default::default()
+            }];
+        }
+        let _ = c.select_candidate_at(0);
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.mix_buffer.is_empty(), "快捷输入缓冲不得残留");
+        assert!(st.mix_prefix.is_empty());
+        assert!(st.committed_text.is_empty(), "文本透镜的已转换前缀不得残留");
     }
 
     /// 辅助码（从临拼进来）里鼠标点命令候选：overlay 与来源临拼的缓冲一并清掉。

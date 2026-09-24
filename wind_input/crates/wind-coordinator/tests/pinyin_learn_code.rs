@@ -335,3 +335,83 @@ fn s2_fuzzy_sentence_commit_learns_canonical_code() {
         "造词码须为规范码"
     );
 }
+
+/// 模糊打法选中**临时词**，也要推进它的晋升计数（6b）。
+///
+/// 模糊召回的候选 `code` 是所打码（`chaijiuduolian`），记录码在 `meta.store_code`
+/// （`caijiuduolian`）。6b 曾拿 `code` 去点查临时库 ⇒ 永远查不到 ⇒ 选多少次都不涨，
+/// 模糊打法下这个词永远晋升不了。
+#[test]
+fn fuzzy_pick_of_temp_word_advances_its_count() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.ch_c = true;
+    let db = std::env::temp_dir().join("wind_learn_code_fuzzy_temp_count.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    const WORD: &str = "菜就多练";
+    // cai|jiu|duo|lian → 位 0/3/6/9
+    let n = store
+        .learn_temp_word("pinyin", "caijiuduolian", WORD, 500, 0b10_0100_1001)
+        .unwrap();
+    assert_eq!(n, 1, "前提：临时词初始计数 1");
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    assert_eq!(
+        type_and_pick(&coord, "chaijiuduolian", WORD).as_deref(),
+        Some(WORD),
+        "前提：翘舌打法能召回并选中临时词「{WORD}」"
+    );
+    assert_eq!(
+        store
+            .get_temp_word("pinyin", "caijiuduolian", WORD)
+            .unwrap(),
+        Some(2),
+        "模糊打法选中临时词，计数应推进到 2"
+    );
+    assert_eq!(
+        temp_records(&store, WORD),
+        [("caijiuduolian".to_string(), 0b10_0100_1001u64)],
+        "不得在所打码下另写一条记录"
+    );
+}
+
+/// 模糊整句**重复上屏**：每次只计一次。
+///
+/// 第二次上屏时整句候选同文并入了临时词「才就多练 / caijiuduolian」：造词路径按规范码
+/// `+1`，6b 若再按记录码点查命中又 `+1`。「刚造词就跳过」的守卫比的必须是 6b **命中的码**
+/// （规范码），拿所打码比会漏判 —— 计数变 3。
+#[test]
+fn fuzzy_sentence_repeat_commit_counts_once() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.ch_c = true;
+    let db = std::env::temp_dir().join("wind_learn_code_fuzzy_sentence_twice.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    const SENT: &str = "才就多练";
+    for round in 1..=2u32 {
+        assert_eq!(
+            type_and_pick(&coord, "chaijiuduolian", SENT).as_deref(),
+            Some(SENT),
+            "前提：第 {round} 次整句上屏"
+        );
+        assert_eq!(
+            store
+                .get_temp_word("pinyin", "caijiuduolian", SENT)
+                .unwrap(),
+            Some(round),
+            "第 {round} 次上屏后计数应为 {round}"
+        );
+    }
+}
