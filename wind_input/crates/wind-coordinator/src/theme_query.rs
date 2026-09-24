@@ -217,9 +217,11 @@ mod follow_values_tests {
 
     #[test]
     fn pager_display_maps_theme_behavior() {
-        let mut r = Resolved::default();
-        r.behavior = ResolvedBehavior {
-            hide_pager: true,
+        let mut r = Resolved {
+            behavior: ResolvedBehavior {
+                hide_pager: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(follow_values_of("default", &r).pager_bar_display, "hide");
