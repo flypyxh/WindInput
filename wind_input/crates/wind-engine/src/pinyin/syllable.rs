@@ -192,6 +192,36 @@ impl SyllableTrie {
     }
 }
 
+/// 拼音词条码 `code` 能否切回**合法全拼音节序列**——临时词自动晋升进用户库前的校验
+/// （协调层 `maybe_promote_temp`）。
+///
+/// 旧版 ②b 混合整句按击键混合码造词（`bzdnihao`、边界按击键逐字母记），这类记录打不出来，
+/// 晋升进用户库就成了永久坏码。判据：
+/// - 有边界：按**记录自己的**边界切（[`super::mixed_abbrev::syllables_from_boundary`]，与简拼、
+///   混合判据同一个切法），每段都须是标准音节（[`SyllableTrie::is_syllable`]，不含模糊拼写层）；
+/// - 边界为 0（无信息：手输码、v1 遗留、拼接超 64 字节或任一段缺边界时造词置 0）或码长超 64
+///   （边界表达不下）：退而问「整码能否被标准音节表切满」（[`super::dag::Dag::build_strict`]）。
+///   合法全拼的无边界记录照常通过，`bzdnihao` 这类从 `b` 起就切不动的照样被拒。
+///
+/// 含分隔符 `'`、大写字母或非 ASCII 的码一律按「非全拼」处理（不做规范化）：造词写入的码
+/// 恒为小写全拼，出现这些字符说明来源本就不是规范码。
+///
+/// ⚠️ 标准音节表缺少词库里少数真实音节（`dia` 嗲、`nia`、`pia`、`yai`、`lvan` 等），含这些
+/// 音节的词不会自动晋升；补表另立项（它同时影响这些音节能否被全拼打出来）。
+pub fn is_full_pinyin_code(code: &str, boundary: u64) -> bool {
+    static TRIE: std::sync::LazyLock<SyllableTrie> = std::sync::LazyLock::new(SyllableTrie::new);
+    if code.is_empty() || !code.is_ascii() {
+        return false;
+    }
+    if boundary == 0 || code.len() > 64 {
+        return super::dag::Dag::build_strict(code, &TRIE)
+            .unmatched_tail()
+            .is_empty();
+    }
+    super::mixed_abbrev::syllables_from_boundary(code, boundary)
+        .is_some_and(|syls| syls.iter().all(|s| TRIE.is_syllable(s)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +301,26 @@ mod tests {
             vec!["ti".to_string()],
             "strict 版须与未注册模糊层时完全一致"
         );
+    }
+
+    /// 晋升校验：合法全拼（有 / 无边界）通过；击键混合码、边界切错的、非 ASCII 的拒。
+    #[test]
+    fn full_pinyin_code_check() {
+        // bu|zhi|dao|ni|hao → 位 0/2/5/8/10
+        assert!(is_full_pinyin_code("buzhidaonihao", 0b101_0010_0101));
+        assert!(
+            is_full_pinyin_code("buzhidaonihao", 0),
+            "无边界时整码切得满即通过"
+        );
+        // 旧 ②b 的击键混合码：b|z|d|ni|hao（逐字母边界）与无边界两种形态都拒。
+        assert!(!is_full_pinyin_code("bzdnihao", 0b10_1111));
+        assert!(!is_full_pinyin_code("bzdnihao", 0));
+        // 边界切错（bu|zh|idao…）：码本身合法，但记录自己的切分不是音节序列。
+        assert!(!is_full_pinyin_code(
+            "buzhidaonihao",
+            0b101_0010_0101 | 0b1000
+        ));
+        assert!(!is_full_pinyin_code("", 0));
+        assert!(!is_full_pinyin_code("不知道", 0));
     }
 }

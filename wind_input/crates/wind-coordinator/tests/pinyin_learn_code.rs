@@ -578,3 +578,55 @@ fn user_abbrev_node_sentence_commit_learns_full_pinyin() {
         "造词码须为完整全拼 + 规范边界"
     );
 }
+
+/// 自动晋升校验（`maybe_promote_temp`）端到端：临时层预置 `count = promote_count − 1` 的记录，
+/// 打 `bzdnihao` 选整句「不知道你好」一次，把计数推到阈值。
+///
+/// - 旧版 ②b 写下的击键混合码 `bzdnihao`（边界按击键逐字母：b|z|d|ni|hao）经 6b 推进到阈值，
+///   **不晋升**，留在临时层；
+/// - 对照：规范码 `buzhidaonihao` 同样条件下（经造词推进到阈值）正常晋升。
+#[test]
+fn legacy_mixed_code_is_not_auto_promoted() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    const SENT: &str = "不知道你好";
+    const PROMOTE: usize = 3;
+    for (tag, code, boundary, want_promoted) in [
+        ("legacy", "bzdnihao", 0b10_1111u64, false),
+        ("canon", "buzhidaonihao", 0b101_0010_0101, true),
+    ] {
+        let mut c = cfg();
+        c.schema.pinyin.fuzzy.enabled = false;
+        c.schema.pinyin.auto_learn.promote_count = PROMOTE;
+        let db = std::env::temp_dir().join(format!("wind_learn_code_promo_{tag}.redb"));
+        let _ = std::fs::remove_file(&db);
+        let store = Arc::new(Store::open(&db).unwrap());
+        for _ in 0..PROMOTE - 1 {
+            store
+                .learn_temp_word("pinyin", code, SENT, 800, boundary)
+                .unwrap();
+        }
+        let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+        coord.prewarm_indexes();
+        assert_eq!(
+            type_and_pick(&coord, "bzdnihao", SENT).as_deref(),
+            Some(SENT),
+            "[{tag}] 前提：选中上屏"
+        );
+        let promoted = store
+            .get_user_words("pinyin", code)
+            .unwrap()
+            .iter()
+            .any(|r| r.text == SENT);
+        assert_eq!(promoted, want_promoted, "[{tag}] {code} 是否晋升");
+        if !want_promoted {
+            assert_eq!(
+                store.get_temp_word("pinyin", code, SENT).unwrap(),
+                Some(PROMOTE as u32),
+                "[{tag}] 前提：计数确实推到了阈值（否则没晋升不说明校验生效）"
+            );
+        }
+    }
+}

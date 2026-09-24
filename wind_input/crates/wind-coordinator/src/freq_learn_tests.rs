@@ -823,3 +823,75 @@ fn unknown_block_name_does_not_disable_the_rest() {
     c.record_selection("weixiao", "😀", CandidateSource::None);
     assert!(store.get_freq("pinyin", "weixiao", "😀").unwrap().is_none());
 }
+
+// ── 临时词自动晋升校验（`maybe_promote_temp`）。
+//
+// 旧版 ②b 混合整句按击键混合码造词（`bzdnihao`，边界按击键逐字母记）。这类记录打不出来，
+// 晋升进用户库就是永久坏码。拼音族数据域（`pinyin`）晋升前校验码能否切回合法全拼音节；
+// 码表方案的码不是拼音，不校验。
+
+fn promo_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
+    let path = std::env::temp_dir().join(format!("wind_promo_check_{tag}.redb"));
+    let _ = std::fs::remove_file(&path);
+    let store = Arc::new(Store::open(&path).unwrap());
+    let c = Coordinator::new_headless_with_store(Config::default(), None, Arc::clone(&store));
+    (c, store)
+}
+
+/// 预置一条临时词，并按「计数已到阈值」调一次晋升判定；返回用户库里是否有了它。
+fn promote_once(tag: &str, schema: &str, code: &str, text: &str, boundary: u64) -> bool {
+    let (c, store) = promo_coord(tag);
+    store
+        .learn_temp_word(schema, code, text, 800, boundary)
+        .unwrap();
+    c.maybe_promote_temp(&store, schema, code, text, 3, 3);
+    store
+        .get_user_words(schema, code)
+        .unwrap()
+        .iter()
+        .any(|r| r.text == text)
+}
+
+#[test]
+fn legacy_mixed_code_temp_word_is_not_promoted() {
+    // b|z|d|ni|hao 逐字母边界（旧 ②b 写的形态）与无边界两种都不晋升。
+    assert!(!promote_once(
+        "legacy_b",
+        "pinyin",
+        "bzdnihao",
+        "不知道你好",
+        0b10_1111
+    ));
+    assert!(!promote_once(
+        "legacy_0",
+        "pinyin",
+        "bzdnihao",
+        "不知道你好",
+        0
+    ));
+}
+
+#[test]
+fn canonical_pinyin_temp_word_is_promoted() {
+    // bu|zhi|dao|ni|hao → 位 0/2/5/8/10；无边界的合法全拼同样晋升（不误伤）。
+    assert!(promote_once(
+        "canon_b",
+        "pinyin",
+        "buzhidaonihao",
+        "不知道你好",
+        0b101_0010_0101
+    ));
+    assert!(promote_once(
+        "canon_0",
+        "pinyin",
+        "buzhidaonihao",
+        "不知道你好",
+        0
+    ));
+}
+
+#[test]
+fn codetable_temp_word_is_promoted_without_pinyin_check() {
+    // 码表码不是拼音，切不出音节也照常晋升。
+    assert!(promote_once("codetable", "wubi86", "abcd", "测试", 0));
+}

@@ -630,6 +630,17 @@ impl Coordinator {
     }
 
     /// 临时词晋升判定：promote_count>0 且累积 count 达阈 → 移入用户词库。0=禁用（对齐 Go 语义）。
+    ///
+    /// **拼音族数据域**（`schema` 是存储归属 id：纯拼音 / 双拼 / 混输的拼音侧都折叠成
+    /// `PINYIN_DATA_SCHEMA`，见 `EngineManager::write_data_schema_id`）晋升前校验：码须能按
+    /// **记录自己的**边界切回合法全拼音节（`is_full_pinyin_code`，边界为 0 时退而问整码能否
+    /// 被音节表切满）。切不回的不晋升，记录留在临时层自然淘汰。
+    ///
+    /// 要挡的是旧版 ②b 混合整句按击键混合码造的词（`bzdnihao → 不知道你好`）：它打不出来，
+    /// 选中时经 6b 推进计数，一旦晋升就成了用户库里的永久坏码。码表方案的码不是拼音，不校验。
+    ///
+    /// 只管**自动**晋升；设置页的手动晋升（`temp.promote` / `temp.promoteAll`）是用户主动操作，
+    /// 不经此处。
     pub(crate) fn maybe_promote_temp(
         &self,
         store: &wind_store::Store,
@@ -642,8 +653,20 @@ impl Coordinator {
         if promote_count == 0 || (count as usize) < promote_count {
             return;
         }
+        if schema == wind_engine::manager::PINYIN_DATA_SCHEMA {
+            let boundary = store
+                .get_temp_words(schema, code)
+                .ok()
+                .and_then(|recs| recs.into_iter().find(|r| r.text == text))
+                .map_or(0, |r| r.boundary);
+            if !wind_engine::pinyin::syllable::is_full_pinyin_code(code, boundary) {
+                // 日志规范：不带词文本；码是拼音串，debug 级可带。
+                debug!("temp word not promoted: code {code} is not full pinyin");
+                return;
+            }
+        }
         match store.promote_temp_word(schema, code, text) {
-            Ok(true) => debug!("temp word promoted: {} -> {}", code, text),
+            Ok(true) => debug!("temp word promoted: code={}", code),
             Ok(false) => {}
             Err(e) => warn!("promote_temp_word failed: {}", e),
         }
