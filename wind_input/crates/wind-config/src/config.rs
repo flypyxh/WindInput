@@ -1707,7 +1707,7 @@ impl BoundAction {
 /// - `"page_prev"` / `"page_next"`：上一页 / 下一页
 /// - `"highlight_up"` / `"highlight_down"`：高亮上移 / 下移
 /// - `"cancel"`（别名 `"clear"`）：放弃当前输入，等同 Esc
-/// - `"select_candidate:N"`：选中当前页第 N 个候选（N 从 1 起，`2` 即次选键）
+/// - `"select_candidate:N"`：选中当前页第 N 个候选（N 从 1 起、至多 10，`2` 即次选键）
 /// - `"select_char:N"`：以词定字，取当前高亮候选词的第 N 个字（N 从 1 起）
 /// - `"aux_code"` / `"aux_code:page_next"`：进辅助码筛选（后者与下翻页共键）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1730,7 +1730,7 @@ pub enum SessionAction {
     /// `"clear"` 因此收作**别名**而非第二个动词：用户按「清空」的心智去写照样能用，
     /// 但内核只有一种行为，不会出现「两个名字行为微妙不同」这种最难查的配置陷阱。
     Cancel,
-    /// 选中当前页第 N 个候选（**N 从 1 起**，1 = 首选）。收编自 `keys.select_key_groups`。
+    /// 选中当前页第 N 个候选（**N 从 1 起，至多 10**，1 = 首选）。收编自 `keys.select_key_groups`。
     ///
     /// 载荷用「第几个」而非内部的 0-based 偏移：配置是给人读的，`select_candidate:2`
     /// 一眼就是「次选键」。转换成偏移在消费点做一次即可。
@@ -1816,11 +1816,13 @@ impl SessionAction {
     /// （见 [`Self::parse_checked`]）。
     pub fn parse(s: &str) -> Self {
         let t = s.trim().to_lowercase();
-        // 带载荷的两个动词。序号从 1 起且限个位数——页内候选与词长都远不到两位数，
-        // 放宽只会让 `select_candidate:99` 这种一定不生效的配置被静默收下。
+        // 带载荷的两个动词。序号从 1 起——`select_candidate` 上限随每页候选数上限（10，
+        // 数字键 0 选第 10 个，见 coordinator 的 `handle_number_key_select`）到 10；
+        // `select_char` 仍限个位数，词长远不到两位数，放宽只会让
+        // `select_char:99` 这种一定不生效的配置被静默收下。
         if let Some(n) = t.strip_prefix("select_candidate:") {
             return match n.trim().parse::<u8>() {
-                Ok(n @ 1..=9) => Self::SelectCandidate(n),
+                Ok(n @ 1..=10) => Self::SelectCandidate(n),
                 _ => Self::None,
             };
         }
@@ -9167,6 +9169,7 @@ mod tests {
     fn select_ordinals_are_range_checked() {
         for bad in [
             "select_candidate:0",
+            "select_candidate:11",
             "select_candidate:99",
             "select_candidate:x",
             "select_candidate:",
@@ -9186,9 +9189,15 @@ mod tests {
             SessionAction::parse("select_candidate:2"),
             SessionAction::SelectCandidate(2)
         );
+        assert_eq!(
+            SessionAction::parse("select_candidate:10"),
+            SessionAction::SelectCandidate(10),
+            "候选窗最多开到 10 个，第 10 个候选键要选得进"
+        );
         // Display 与 parse 互为逆运算——写回读不回来是「配置丢了」那类问题的根源。
         for a in [
             SessionAction::SelectCandidate(3),
+            SessionAction::SelectCandidate(10),
             SessionAction::SelectChar(1),
         ] {
             assert_eq!(SessionAction::parse(&a.to_string()), a);
