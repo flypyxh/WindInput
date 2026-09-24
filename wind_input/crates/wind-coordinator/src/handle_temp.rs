@@ -958,6 +958,46 @@ impl Coordinator {
                     let (start, _) = self.page_range(state);
                     let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
+                    // 标点键：高亮候选整体上屏时，标点**跟着一起上屏**（按中英标点配置转换）。
+                    // 此前这里只上屏候选，标点字符没有任何出口 ⇒ `nihao,` 只得「你好」。
+                    // 对齐快捷输入 ⑥、临英与主输入路 `commit_highlight_then_char`。
+                    //
+                    // 只接「整体上屏」这一形：组 / 命令候选各有自己的语义，仍按原样走
+                    // `commit_temp_pinyin_selected`。
+                    //
+                    // ⚠️ **分步候选高亮时标点仍被吞**（只确认该段、留在临拼、标点不输出），这是
+                    // 刻意保留的现状而非遗漏：剩余拼音还没转换，此刻输出标点只有两种形态——
+                    // ① 标点插在已转换段与剩余码之间（「你，hao」），词被从中间切开；② 照主输入路
+                    // `commit_highlight_then_char` / 快捷输入 ⑥ 那样丢掉剩余码再上屏，用户打的码
+                    // 静默消失。两者都比「少一个标点」更糟，改哪种须先定产品语义，故暂不动。
+                    // （高亮只有用户手动移到分步候选上才会停在这里，首选恒是整句。）
+                    let total = state.temp_pinyin_buffer.len();
+                    let partial = cand.consumed_length > 0
+                        && cand.consumed_length < total
+                        && state
+                            .temp_pinyin_buffer
+                            .is_char_boundary(cand.consumed_length);
+                    if !cand.is_group
+                        && !cand.is_command
+                        && !partial
+                        && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+                    {
+                        let punct = self.convert_punct_char(state, ch);
+                        let act =
+                            self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32);
+                        return match act {
+                            KeyAction::InsertText { text, .. } => {
+                                self.record_commit(
+                                    &punct,
+                                    0,
+                                    -1,
+                                    wind_store::stats::CommitSource::Punctuation,
+                                );
+                                Self::commit_action(format!("{text}{punct}"), true)
+                            }
+                            other => other,
+                        };
+                    }
                     self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
                 } else {
                     self.exit_temp_pinyin(state);
