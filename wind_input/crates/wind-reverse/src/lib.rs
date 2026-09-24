@@ -1095,7 +1095,13 @@ impl ReverseLookup {
                     // 有音节可依：筛出去调后相等的首个读音；一个都不匹配时**不回退**到首音——
                     // 不匹配意味着这个字的读音表里根本没有词条标注的那个音（词库或读音表有一方
                     // 过时），此时首音同样没有依据，给出它只会掩盖数据问题。
-                    Some(w) => readings.iter().find(|r| strip_tone(r) == w),
+                    //
+                    // 例外是**简拼音节**（`sa'h` 造出的「撒哈」，词条码为 `sa`+`h`）：简拼段是读音
+                    // 的前缀，仍是词条给的依据，故精确不中时取首个以它开头的读音（t200）。
+                    Some(w) => readings
+                        .iter()
+                        .find(|r| strip_tone(r) == w)
+                        .or_else(|| readings.iter().find(|r| strip_tone(r).starts_with(&w))),
                     None => readings.first(),
                 }
             })
@@ -1423,6 +1429,22 @@ mod tests {
             "",
             "读音表里没有该音节时不得拿首音充数"
         );
+    }
+
+    /// ★ 简拼音节（t200「撒哈」只注出 `sā`）：以简拼造的词/整句，词条码里该字的音节只有
+    /// 声母（`sa` + `h`），精确匹配必落空、那个字被整段吞掉。简拼段是读音的**前缀**，
+    /// 仍是词条给的依据 —— 精确不中时退而取首个以它开头的读音。
+    #[test]
+    fn abbreviated_syllable_matches_by_prefix() {
+        let mut rl = ReverseLookup::default();
+        rl.set_pinyin(vec![
+            ('撒', vec!["sā", "sǎ"]),
+            ('哈', vec!["hā", "hǎ", "hà"]),
+        ]);
+        assert_eq!(rl.toned_pinyin_of("撒哈", Some(&["sa", "h"]), " "), "sā hā");
+        // 前缀仍按音节筛：「行」读音里只有 h 开头的 háng 能配上 `h`。
+        let rl = heteronym_rl();
+        assert_eq!(rl.toned_pinyin_of("行", Some(&["h"]), " "), "háng");
     }
 
     /// 无读音的字跳过（不产出空段/孤立分隔符）；整词皆无返回空串。
