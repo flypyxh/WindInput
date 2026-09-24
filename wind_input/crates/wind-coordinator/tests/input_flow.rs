@@ -5760,7 +5760,7 @@ fn test_web_theme_resolved_falls_back_to_default_theme() {
 /// 覆盖反查要测「方案文件与 override 层写同一个键」，而测试不能往真实 `build_dev/data`
 /// 的方案文件里写字，故自带方案文件；引擎只需一张一行的小码表能建起来即可。
 fn override_summary_data_dir(tag: &str, schemas: &[(&str, &str)]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("wind_ovsum_data_{tag}"));
+    let dir = std::env::temp_dir().join(format!("wind_ovsum_data_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let sd = dir.join("schemas");
     for (id, extra) in schemas {
@@ -5801,7 +5801,7 @@ fn test_web_override_summary_counts_each_schema_once() {
             ("ovs_c", "[engine.codetable]\ntop_code_commit = true\n"),
         ],
     );
-    let ov = std::env::temp_dir().join("wind_ovsum_ov_once");
+    let ov = std::env::temp_dir().join(format!("wind_ovsum_ov_once_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ov);
     std::fs::create_dir_all(&ov).unwrap();
     for id in ["ovs_a", "ovs_b"] {
