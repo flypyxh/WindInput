@@ -1667,6 +1667,15 @@ pub struct Coordinator {
     /// （见 `handle_caret_probe` 里那段「已否定」清单）。本条不问坐标之间的几何关系，
     /// 只问「这一帧和宿主自己声明的重排前坐标是不是同一个值」。
     pub(crate) last_pre_reflow_probe: Mutex<(i32, i32, bool)>,
+    /// 本轮 `PRE_REFLOW` 帧携带的组合起点 (x, y, seen)，**只供兜底首显定位**（A2-42）。
+    ///
+    /// 首显等不到权威坐标时（记事本常见：OnLayoutChange 25ms 内不来），兜底只能用缓存——
+    /// 而缓存 caret 已被这一帧刷成**首字母之后**的位置，组合起点却要等随后的矩形帧才锁。
+    /// 于是首显画在 caret、第 2 个字母 reshow 时改取组合起点，当着用户的面左跳一格。
+    /// 组合起点是按键前的插入点，宿主重排不挪它，比同一帧的 caret 更接近最终锚点。
+    /// ⚠ 只作显示位置，**不锁进 `composition_start`**：锁错了本组合内救不回来，
+    /// 而只显示的话，后续权威帧与它不符时照常 reshow 纠正。组合结束 / 换 docMgr 时清。
+    pub(crate) pre_reflow_comp_start: Mutex<(i32, i32, bool)>,
     /// 本组合内**组合矩形**首帧给出的锚点 (x, y, locked)——同一行里它就是最终答案。
     ///
     /// ★★ 存的是**值**而不是一个 bool，因为矩形这条路必须保持「**每帧如实**」的语义。
@@ -2579,6 +2588,7 @@ impl Coordinator {
             composition_start: Mutex::new((0, 0, false)),
             locked_rect_anchor: Mutex::new((0, 0, false)),
             last_pre_reflow_probe: Mutex::new((0, 0, false)),
+            pre_reflow_comp_start: Mutex::new((0, 0, false)),
             last_reported_comp_start: Mutex::new((0, 0, false)),
             last_authoritative_caret: Mutex::new((0, 0, false)),
             last_key_at: Mutex::new(None),
@@ -6205,10 +6215,22 @@ impl Coordinator {
         // 把候选窗从首显处挪到组合起点——而上一行 `settle` 刚判定这 13px 不值得校正。排在
         // `cs.2` 后面等于让组合起点从侧面绕过 settle，悬停一次就补上那 13px。
         // 真正该动候选窗的两种情形（首显、坐标校正）都不满足 `hold_anchor`，照常走下面两条。
+        // 本轮首次下发、组合起点还没锁：pre_reflow 帧报过组合起点就先用它（见字段注释，A2-42）。
+        let pre_cs = *self
+            .pre_reflow_comp_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (cx, cy, ch, anchor_source) = if hold_anchor {
             (anchor.0, anchor.1, state.caret_height, "shown_anchor")
         } else if in_app && cs.2 {
             (cs.0, cs.1, state.caret_height, "composition_start")
+        } else if in_app && !shown && pre_cs.2 {
+            (
+                pre_cs.0,
+                pre_cs.1,
+                state.caret_height,
+                "pre_reflow_comp_start",
+            )
         } else {
             (state.caret_x, state.caret_y, state.caret_height, "caret")
         };
@@ -12816,6 +12838,71 @@ mod caret_compat_tests {
         assert!(
             !*c.pending_first_show.lock().unwrap(),
             "对照组：普通 probe 满足判据 1 时应当提前首显（否则本测试证明不了差别来自 source）"
+        );
+    }
+
+    /// ★★ A2-42（t210）：兜底首显要画在 pre_reflow 帧报的**组合起点**，不能画在它的 caret。
+    ///
+    /// 2026-09-24 靶机记事本实录（fast 档，probe 可信，OnLayoutChange 在 25ms 内没来）：
+    ///   09.464  probe(pre_reflow) caret=1151 compStart=1139   ← 首字母已落进编辑区
+    ///   09.485  兜底到期 → 首显 anchor=caret pos=1151          ← 组合起点此时还没锁
+    ///   09.521  caret_update 带组合矩形 (1139..1151) → 起点锁 1139，settle 吸收（不 reshow）
+    ///   09.569  第 2 个字母 caret 右移 8px → reshow → anchor=composition_start pos=1139 ← 跳 12px
+    /// 有矩形时 settle 不回灌 `shown_anchor`（矩形是真值），所以错的是首显那一刻的位置本身。
+    /// pre_reflow 的 compStart 是按键前的插入点，重排不挪它；缓存里那份 caret 已经在它右边一格。
+    #[test]
+    fn fallback_first_show_uses_the_pre_reflow_composition_start() {
+        let run = |cs_in_probe: (i32, i32)| {
+            let c = fast_coord(true);
+            {
+                let mut st = c.state.lock().unwrap();
+                st.caret_x = 1139;
+                st.caret_y = 881;
+                st.caret_height = 31;
+            }
+            drive_first_frame(&c);
+            assert!(
+                *c.pending_first_show.lock().unwrap(),
+                "probe 可信的宿主首帧应等坐标，本用例测的是兜底那条路"
+            );
+            let mut pre = probe_at(1151, 881, 31);
+            pre.composition_start_x = cs_in_probe.0;
+            pre.composition_start_y = cs_in_probe.1;
+            pre.source = wind_ipc::protocol::caret_source::PRE_REFLOW;
+            c.handle_caret_probe(&pre);
+            let token = *c.pending_first_show_token.lock().unwrap();
+            c.fire_pending_first_show(token);
+            let shown = *c.shown_anchor.lock().unwrap();
+            // 随后两帧权威坐标：先是带矩形的那帧（被 settle 吸收），再是第 2 个字母
+            let mut a = probe_at(1151, 881, 31);
+            a.composition_start_x = 1139;
+            a.composition_rect = Some((1139, 850, 1151, 881));
+            c.handle_caret_update(&a);
+            let mut b = probe_at(1159, 881, 31);
+            b.composition_start_x = 1139;
+            b.composition_rect = Some((1139, 850, 1159, 881));
+            c.handle_caret_update(&b);
+            (shown, *c.shown_anchor.lock().unwrap())
+        };
+
+        let (first, after_second_key) = run((1139, 881));
+        assert_eq!(
+            (first.0, first.1),
+            (1139, 881),
+            "兜底首显应取 pre_reflow 帧的组合起点，而不是已右移一格的 caret"
+        );
+        assert_eq!(
+            (after_second_key.0, after_second_key.1),
+            (1139, 881),
+            "第 2 个字母之后候选窗不得再挪（A2-42 的症状）"
+        );
+
+        // 对照组：pre_reflow 帧不带组合起点时维持原行为（用缓存 caret），证明差别来自 compStart
+        let (first, _) = run((0, 0));
+        assert_eq!(
+            (first.0, first.1),
+            (1151, 881),
+            "对照组：没有组合起点可用时兜底照旧用缓存 caret"
         );
     }
 

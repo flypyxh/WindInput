@@ -2235,6 +2235,10 @@ impl MessageHandler for Coordinator {
             .last_pre_reflow_probe
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+        *self
+            .pre_reflow_comp_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
         // ⚠ `shown_anchor` 在这里**刻意不清**：它答的是「候选窗此刻画在屏幕的哪里」，而焦点
         // 切换并不会把候选窗从屏幕上抹掉——它还在旧位置画着。清掉反而让下面 reshow 的判据
         // 失去基准（那个判据正是靠它发现「候选窗落在旧 docMgr 上」的）。锚点只在候选窗真正
@@ -3550,11 +3554,26 @@ impl MessageHandler for Coordinator {
                 .last_pre_reflow_probe
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = (data.x, data.y, true);
+            // 组合起点只在本帧被收入时记（退化帧 / probe 不可信的宿主不给它当兜底位置），
+            // 500px 同源校验与 handle_caret_update 锁组合起点那处一致。
+            let (csx, csy) = (data.composition_start_x, data.composition_start_y);
+            if absorbed
+                && (csx != 0 || csy != 0)
+                && (i64::from(csx) - i64::from(data.x)).abs() < 500
+                && (i64::from(csy) - i64::from(data.y)).abs() < 500
+            {
+                *self
+                    .pre_reflow_comp_start
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = (csx, csy, true);
+            }
             debug!(
-                "caret_probe(pre_reflow) → 刷新缓存 + 记为本轮重排前基准: ({},{}) h={} {}",
+                "caret_probe(pre_reflow) → 刷新缓存 + 记为本轮重排前基准: ({},{}) h={} compStart=({},{}) {}",
                 data.x,
                 data.y,
                 data.height,
+                data.composition_start_x,
+                data.composition_start_y,
                 if absorbed {
                     "已收入"
                 } else {

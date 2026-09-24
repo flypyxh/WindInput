@@ -63,6 +63,10 @@ impl Coordinator {
             .last_pre_reflow_probe
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+        *self
+            .pre_reflow_comp_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
         // 候选窗显示锚点同理：它描述的是「这一轮候选窗画在哪」，组合一结束就失效。
         // 不清会让下一轮的非坐标重绘复用上一轮的位置。
         *self.shown_anchor.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
