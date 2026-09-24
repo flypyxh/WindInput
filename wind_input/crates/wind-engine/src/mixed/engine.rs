@@ -17,6 +17,10 @@ use wind_candidate::{Candidate, CandidateSource};
 /// （生产 `max_candidates=300` ⇒ 60 席）。见 [`MixedEngine::truncate_with_pinyin_quota`]。
 const PINYIN_QUOTA_DIVISOR: usize = 5;
 
+/// [`MixedEngine::pinyin_claims_overflow`] 取拼音候选的上限：与协调器给引擎的上限同值，
+/// 保证简拼层的 ②b 混合整句活过引擎截断（见该函数内注释）。
+const PINYIN_CLAIM_PROBE_LIMIT: usize = 300;
+
 /// 判定[截断优先级档](MixedEngine::truncation_tier)所需的两个判据串。
 ///
 /// 两者都随调用路径变化，故不能从候选自身推出，必须由调用方按语境传入：
@@ -301,13 +305,25 @@ impl MixedEngine {
         let Some(sec) = &self.secondary else {
             return false;
         };
-        let Ok(r) = sec.convert(input, 1) else {
+        // 上限不能取 1：②b 混合整句带 `is_abbrev`（与整串简拼词同层按权重竞争），引擎序里
+        // 排在只吃首音节的部分候选之后，limit 1 会在截断时把它丢掉。取协调器同值，保证它
+        // 活过截断；上限只影响截断，不影响引擎算多少。
+        let Ok(r) = sec.convert(input, PINYIN_CLAIM_PROBE_LIMIT) else {
             return false;
         };
         let input_len = input.chars().count();
-        r.candidates
-            .first()
-            .is_some_and(|c| c.consumed_length == 0 || c.consumed_length >= input_len)
+        let consumes_all = |c: &Candidate| c.consumed_length == 0 || c.consumed_length >= input_len;
+        // 首选吃满整串，**或**有整句吃满整串。后一条只对 ②b 混合整句起作用：非简拼层的整句
+        // 本就排在部分候选之前，首选那条已覆盖它们；②b 整句自 `3934d5cc` 起在简拼层，
+        // `wobzd` 的首选成了只吃 `wo` 的「我」，不补这一条就让码表认领了整串
+        // （`tests/mixed_overflow_abbrev_sentence.rs`）。
+        //
+        // ⚠️ 不放宽成「任一候选吃满整串」：整串简拼词（`yijga` 读成 yi+j+g+a 也许恰有一个）
+        // 此前从不参与认领，放宽会把本该让给码表的串也判给拼音。
+        r.candidates.first().is_some_and(consumes_all)
+            || r.candidates
+                .iter()
+                .any(|c| c.is_sentence && consumes_all(c))
     }
 
     /// 英文是否**主张**这个超码长串：英文词库里有**精确整串**词条（`github` 是完整英文词）。
