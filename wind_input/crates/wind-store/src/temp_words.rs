@@ -71,6 +71,7 @@ impl Store {
                 )?;
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(new_count)
         })
     }
@@ -116,6 +117,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(result)
         })
     }
@@ -275,6 +277,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(deleted)
         })
     }
@@ -361,6 +364,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(rows.len())
         })
     }
@@ -392,6 +396,7 @@ impl Store {
             }
             abbrev_index::clear_schema(&mut txn.open_table(TEMP_ABBREV)?, schema)?;
             txn.commit()?;
+            self.bump_words_gen();
             Ok(n)
         })
     }
@@ -414,6 +419,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(())
         })
     }
@@ -487,6 +493,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(promoted)
         })
     }

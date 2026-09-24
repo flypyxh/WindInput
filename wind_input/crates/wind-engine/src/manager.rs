@@ -478,6 +478,9 @@ pub struct EngineManager {
     /// [编码] 段按词查实际码。懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
     /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
     reverse_index: Mutex<HashMap<String, Arc<ReverseIndex>>>,
+    /// 词语联想的用户词 / 临时词文本索引（store 按码排，按文本前缀查要另建）。
+    /// 见 [`crate::user_assoc`]；只留当前联想方案一份。
+    user_assoc: crate::user_assoc::SharedSlot,
     /// 码表**单字全码**表缓存:方案 id → (汉字 → 全码)。供造词按 `[[encoder.rules]]` 组装
     /// 词组编码(见 `encode_word`)。与 `reverse_index` 分开是刻意的——那份按「码长升序」排,
     /// 服务悬停 `[编码]` 的打法列表展示;这份要的是「按权重挑全码」,两种排序需求互斥。
@@ -752,6 +755,7 @@ impl EngineManager {
             primary_codetable: Mutex::new(primary_codetable),
             primary_pinyin: Mutex::new(config.schema.primary_pinyin.clone()),
             reverse_index: Mutex::new(HashMap::new()),
+            user_assoc: Default::default(),
             single_char_codes: Mutex::new(None),
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
@@ -1206,12 +1210,23 @@ impl EngineManager {
         }
     }
 
-    /// **词语联想**取数：`schema_id` 词库里以 `prefix` 开头、且严格更长的词，
-    /// 按词库权重降序取前 `limit` 条。返回 (整词, 权重)。
+    /// **词语联想**取数：以 `prefix` 开头、且严格更长的词，按下述分档合并后取前 `limit` 条。
+    /// 返回 (整词, 该词在自己那一层里的权重)，**顺序即最终顺序**（跨层权重量纲不同，
+    /// 调用方不得再按权重重排）。
     ///
-    /// 复用悬停 [编码] 段那份反查索引（词 → 编码，按词字节序排），前缀扫描是二分 + 顺序走。
-    /// 索引本身懒构建、最多缓存两份——首次联想会触发一次全量构建（十万词级约几十毫秒），
-    /// 之后常驻。
+    /// # 三层怎么合并（论坛 t185）
+    ///
+    /// 1. **用户词**（store 用户词库）——用户自己造 / 导入 / 晋升的词，是「我的词汇」，
+    ///    排最前。层内按用户词权重降序。
+    /// 2. **系统词**（`schema_id` 词库的反查索引）——层内按词库权重降序。
+    /// 3. **临时词**（自动造词 / 自学习尚未晋升的）——**补位**，排在系统词之后：
+    ///    它们未经确认、码表自动造词会产出噪声，放前面会把系统词挤掉；但系统词不够填满
+    ///    时（「荷载」这类专业词的延长）正好补上。
+    ///
+    /// 同文本先到先得（用户词里有的系统词不再重复）。
+    ///
+    /// 用户词 / 临时词按 `data_schema_id(schema_id)` 归属取（拼音系方案共享 `"pinyin"`）。
+    /// 两份索引都**不在按键线程上构建**：没就绪就这一层这次不出。
     pub fn assoc_prefix_words(
         &self,
         schema_id: &str,
@@ -1221,15 +1236,48 @@ impl EngineManager {
         if schema_id.is_empty() || prefix.is_empty() || limit == 0 {
             return Vec::new();
         }
+        let user_idx = self.store.as_ref().and_then(|store| {
+            crate::user_assoc::get_or_refresh(
+                &self.user_assoc,
+                store,
+                &self.data_schema_id(schema_id),
+            )
+        });
+        let mut out: Vec<(String, i32)> = Vec::with_capacity(limit);
+        let mut push = |t: &str, w: i32| {
+            if out.len() < limit && !out.iter().any(|(o, _)| o == t) {
+                out.push((t.to_string(), w));
+            }
+        };
+        if let Some(u) = &user_idx {
+            for (t, w) in u.user_with_prefix(prefix, limit) {
+                push(t, w);
+            }
+        }
         // 索引没就绪就这次不联想（**不阻塞按键线程**）。联想是锦上添花，且
         // `maybe_enter_assoc` 在无候选时直接返回、不改任何状态，降级完全无副作用。
-        let Some(idx) = self.reverse_index_if_ready(schema_id) else {
-            return Vec::new();
-        };
-        idx.texts_with_prefix(prefix, limit)
-            .into_iter()
-            .map(|(t, w)| (t.to_string(), w))
-            .collect()
+        if let Some(idx) = self.reverse_index_if_ready(schema_id) {
+            for (t, w) in idx.texts_with_prefix(prefix, limit) {
+                push(t, w);
+            }
+        }
+        if let Some(u) = &user_idx {
+            for (t, w) in u.temp_with_prefix(prefix, limit) {
+                push(t, w);
+            }
+        }
+        out
+    }
+
+    /// 阻塞地建好词语联想的用户词文本索引（预热线程 / 测试用，**不可进按键链路**）。
+    /// 无 store 或已是最新时返回 false。
+    pub fn prewarm_user_assoc(&self, schema_id: &str) -> bool {
+        match &self.store {
+            Some(store) if !schema_id.is_empty() => {
+                crate::user_assoc::prewarm(&self.user_assoc, store, &self.data_schema_id(schema_id))
+            }
+            _ => false,
+        }
     }
 
     /// 已建好的反查索引；**没有就返回 `None`，绝不现建**。

@@ -128,6 +128,15 @@ pub struct Store {
     /// 累计丢弃页缓存的次数。供测试断言与诊断——「缓存到底有没有被回收」在外部
     /// 不可观测（RSS 不降，见 `tests/redb_cache_high_water.rs`），只能由内部报数。
     drops: std::sync::atomic::AtomicU64,
+    /// 用户词 / 临时词两表的**写代次**：凡写这两张表的函数在进 `with_db` 前 +1，
+    /// `resume`（备份还原换了整个文件）也 +1。只增不减、进程内有效。
+    ///
+    /// 供按文本前缀取用户词的内存索引（词语联想，见 `wind-engine` 的 `UserAssocIndex`）
+    /// 判「缓存是否过期」——store 的键是 `schema\0code\0text`，没有按文本的次序，
+    /// 每次联想都扫全表在按键路径上付不起（用户词库可达十九万条）。
+    ///
+    /// 宁多勿少：多 +1 只是多一次后台重建，漏 +1 则联想里永远缺那个词。
+    words_gen: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -153,6 +162,7 @@ impl Store {
             cache_bytes,
             touched: std::sync::atomic::AtomicBool::new(false),
             drops: std::sync::atomic::AtomicU64::new(0),
+            words_gen: std::sync::atomic::AtomicU64::new(0),
         };
         store.run_migrations()?;
         store.backfill_abbrev_indexes();
@@ -232,6 +242,16 @@ impl Store {
             Some(db) => f(db),
             None => anyhow::bail!("store is paused"),
         }
+    }
+
+    /// 用户词 / 临时词两表的写代次，见字段 `words_gen`。
+    pub fn words_generation(&self) -> u64 {
+        self.words_gen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_words_gen(&self) {
+        self.words_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// 读取存储版本（无 version 键视为 0=全新库）。
@@ -327,6 +347,7 @@ impl Store {
             let db = open_db(&self.path, self.cache_bytes)?;
             Self::init_tables(&db)?;
             *guard = Some(db);
+            self.bump_words_gen();
             info!("Store resumed: {}", self.path.display());
         }
         Ok(())

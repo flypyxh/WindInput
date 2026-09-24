@@ -4285,6 +4285,15 @@ impl Coordinator {
                 debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
             }
         }
+        // 词语联想的用户词 / 临时词文本索引（t185）：联想开着才建——它要扫整张用户词表，
+        // 关着联想的用户不该付这笔。没预热也不致命：首次联想会起后台重建，那一次只出系统词。
+        if self.assoc_config().kind != wind_assoc::AssocKind::Off {
+            let sid = self.engine_mgr.assoc_word_schema();
+            let t0 = std::time::Instant::now();
+            if self.engine_mgr.prewarm_user_assoc(&sid) {
+                debug!("预热联想用户词索引 {} 用时 {:?}", sid, t0.elapsed());
+            }
+        }
         // 自动造词开着才预热单字全码表：它是另一次全量扫描（同量级），关着的用户
         // 不该为一个用不到的功能付出启动时间与内存。开着而不预热则第一次上屏必卡，
         // 因为造词跑在上屏线程上。
@@ -5034,8 +5043,8 @@ impl Coordinator {
                     .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
                     .unwrap_or_else(|| (CandidateSource::default(), state.input_buffer.clone()));
                 let out = self.commit_candidate(state, &text, None, source, &code);
-                self.notify_ui_hide();
-                return Self::commit_action(out, true);
+                // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
+                return self.auto_commit_then_assoc(state, out, &text);
             }
             // 含副作用命令自动命中：与空格选中命令同路（清组合 + 异步执行）。
             InputOutcome::AutoCommand(cand) => {

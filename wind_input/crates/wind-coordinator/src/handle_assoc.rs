@@ -267,10 +267,12 @@ impl AssocProvider for PrefixWords<'_> {
         if limit == 0 || self.schema.is_empty() {
             return Vec::new();
         }
-        self.mgr
-            .assoc_prefix_words(&self.schema, ctx.text, limit)
+        let words = self.mgr.assoc_prefix_words(&self.schema, ctx.text, limit);
+        let n = words.len() as i64;
+        words
             .into_iter()
-            .map(|(word, weight)| {
+            .enumerate()
+            .map(|(i, (word, _weight))| {
                 // 上文必是它的前缀（`assoc_prefix_words` 的后置条件），故 strip 恒成功；
                 // 兜底成整词只是不让一个不该发生的情况变成 panic。
                 let commit = word.strip_prefix(ctx.text).unwrap_or(&word).to_string();
@@ -278,7 +280,10 @@ impl AssocProvider for PrefixWords<'_> {
                     text: word,
                     commit: Some(commit),
                     source: AssocSource::Prefix,
-                    score: weight as i64,
+                    // ★ 按**名次**给分，不按权重：取数口已把用户词 / 系统词 / 临时词三层
+                    // 分档排好（见 `assoc_prefix_words`），三层权重量纲不同，按权重重排
+                    // 会把分档打乱。
+                    score: n - i as i64,
                 }
             })
             .collect()
@@ -713,6 +718,39 @@ impl Coordinator {
     pub(crate) fn assoc_backspace(&self, state: &mut State) -> KeyAction {
         let cancels_only = self.rt().config.input.association.backspace_cancels_only;
         self.assoc_dismiss_with(state, cancels_only)
+    }
+
+    /// **引擎替用户做主上屏**（满码唯一自动上屏 `InputOutcome::AutoCommit`）的出口：
+    /// 上屏 `out`，并接上与 `commit_selected` 整串分支**同一段**联想接线（论坛 t185）。
+    ///
+    /// 此前两个 `AutoCommit` 消费点只 `commit_action` 了事——开着自动上屏的五笔用户，
+    /// 单字全码几乎都唯一，于是「打完一个字给以它开头的词」整个失效且完全静默。
+    ///
+    /// `assoc_ctx` 取**简体域**的上屏文本（未经简繁转换、未补空格），理由同
+    /// `commit_selected`：词库前缀检索在简体域。
+    ///
+    /// 调用前 `commit_candidate` 已清空缓冲与候选。门槛再验一遍「主输入态、无已转换段、
+    /// 缓冲空」——联想态的互斥不变式要的正是这个形状，任何一条不满足就只上屏不联想。
+    ///
+    /// ⚠️ **顶码上屏不走这里**：顶码之后余码留在缓冲里继续组码，那一刻不是「上屏完毕」，
+    /// 与联想态「缓冲为空」的前提互斥。
+    pub(crate) fn auto_commit_then_assoc(
+        &self,
+        state: &mut State,
+        out: String,
+        assoc_ctx: &str,
+    ) -> KeyAction {
+        if state.active.is_none()
+            && state.committed_text.is_empty()
+            && state.input_buffer.is_empty()
+            && self.maybe_enter_assoc(state, assoc_ctx)
+        {
+            self.notify_ui_update(state);
+            // 与 `commit_selected` 同：上屏后重开占位组合，联想态才收得到后续按键。
+            return self.commit_then_new_composition(out, ASSOC_COMPOSITION.to_string());
+        }
+        self.notify_ui_hide();
+        Self::commit_action(out, true)
     }
 
     /// 上屏一条**联想候选**之后，还要不要再联想一轮。

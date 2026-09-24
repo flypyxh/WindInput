@@ -279,6 +279,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(promoted)
         })
     }

@@ -1748,8 +1748,8 @@ impl MessageHandler for Coordinator {
                                 (CandidateSource::default(), state.input_buffer.clone())
                             });
                         let out = self.commit_candidate(&mut state, &text, None, source, &code);
-                        self.notify_ui_hide();
-                        return Self::commit_action(out, true);
+                        // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
+                        return self.auto_commit_then_assoc(&mut state, out, &text);
                     }
                     // 含副作用命令自动命中：与空格选中命令同路（清组合 + 异步执行）。
                     InputOutcome::AutoCommand(cand) => {

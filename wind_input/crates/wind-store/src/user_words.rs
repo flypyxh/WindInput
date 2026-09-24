@@ -306,6 +306,7 @@ impl Store {
                 t.insert(key.as_str(), enc_val_ordered(w, c, ca, b, order).as_slice())?;
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(())
         })
     }
@@ -464,6 +465,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(())
         })
     }
@@ -498,6 +500,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(updated)
         })
     }
@@ -546,6 +549,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(())
         })
     }
@@ -577,6 +581,7 @@ impl Store {
             }
             abbrev_index::clear_schema(&mut txn.open_table(USER_ABBREV)?, schema)?;
             txn.commit()?;
+            self.bump_words_gen();
             Ok(n)
         })
     }
@@ -657,6 +662,7 @@ impl Store {
                 }
             }
             txn.commit()?;
+            self.bump_words_gen();
             Ok(c)
         })
     }
