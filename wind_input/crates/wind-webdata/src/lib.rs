@@ -592,6 +592,7 @@ pub trait WebDataRpc: WebDataHost {
 
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
+            "theme.resolved" => Ok(serde_json::to_value(self.theme_follow_values())?),
             "theme.preview" => self.web_theme_preview(params),
             "theme.getText" => self.web_theme_get_text(params),
             "theme.delete" => self.web_theme_delete(params),

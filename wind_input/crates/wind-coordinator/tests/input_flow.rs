@@ -5721,6 +5721,41 @@ fn test_web_theme_preview_real() {
 }
 
 #[test]
+fn test_web_theme_resolved_real() {
+    if !has_schemas() {
+        eprintln!("skip: no build_dev/data");
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let v = coord
+        .web_data_rpc("theme.resolved", &serde_json::json!({}))
+        .unwrap();
+    assert!(v["fontSize"].as_i64().unwrap() > 0, "{v}");
+    assert!(
+        ["hide", "always", "auto"].contains(&v["pagerBarDisplay"].as_str().unwrap()),
+        "{v}"
+    );
+    assert_eq!(v["langbarText"].as_array().unwrap().len(), 4, "{v}");
+}
+
+#[test]
+fn test_web_theme_resolved_falls_back_to_default_theme() {
+    if !has_schemas() {
+        eprintln!("skip: no build_dev/data");
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.ui.theme.name = "不存在的主题".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let v = coord
+        .web_data_rpc("theme.resolved", &serde_json::json!({}))
+        .unwrap();
+    // FALLBACK_THEME（wind-coordinator/src/handle_mode.rs）取值 "default"。
+    assert_eq!(v["themeId"].as_str().unwrap(), "default", "{v}");
+    assert!(v["fontSize"].as_i64().unwrap() > 0, "{v}");
+}
+
+#[test]
 fn test_stats_recorded_through_deferred_policed() {
     // 回归：生产链路是 bridge → DeferredHandler → Coordinator，bridge 调 handle_key_event_policed。
     // 若 DeferredHandler 不转发 policed，则 Coordinator 的统计埋点被跳过、上屏计数恒为 0。
