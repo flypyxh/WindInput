@@ -4069,6 +4069,9 @@ pub struct TempEnglishConfig {
     /// 语义、分词符、跳词规则完全一致——临英只是「临时状态」，核心功能与英文方案统一，
     /// 但进入时机不同、需求可能相反（长时打英文 vs 中文里插一个英文词），故开关独立。
     ///
+    /// ★ 也作用于**快捷输入里的英文成员**（A2-3b）：同属「中文里插一个英文词」，
+    /// 读这一份而不是 [`EnglishGlobal::phrase_seg`]，见 `Coordinator::mix_phrase_separator`。
+    ///
     /// ⚠️ 开启后 `'` 在临英下不再作二三候选键（`select_key_offset` 那条判定够不着它）。
     /// 与英文方案侧同一个取舍，理由见那边。
     #[serde(default)]

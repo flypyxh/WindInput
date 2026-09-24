@@ -385,10 +385,10 @@ impl Coordinator {
 
     /// 本 mix 实例是否把 `'` 用作英文词组分词符（t42）。
     ///
-    /// 跟随 `schema.english.phrase_seg`——快捷输入的英文成员**就是**英文方案的那个引擎
-    /// （`build_engine("english")`），两者用同一份词库、同一套分词规则，再立一个开关只会
-    /// 变成「在这里开了、在那里没开」的两处真相。临英则不同：它有自己独立的那份
-    /// （`input.temp_english.phrase_seg`），理由见该字段。
+    /// 跟随**临英那份** `input.temp_english.phrase_seg`（A2-3b，用户 2026-09-24 拍板：
+    /// 快捷输入里的英文一律读临英的开关，不另立第三份）。快捷输入与临英是同一种场景——
+    /// 「中文里插一个英文词」，取舍与临英一致；英文方案那份（`schema.english.phrase_seg`）
+    /// 管的是「长时打英文」，与这里无关。引擎实例仍是共用的那一个，按作用域把关在这里。
     ///
     /// 还要求本实例**确实含英文成员**：没有英文成员时 `'` 没有任何东西可查，夺走它
     /// 只是白白让第三候选键失效。
@@ -404,7 +404,7 @@ impl Coordinator {
     /// 两处若各写一份判据，表现就是「打得进去、选不出来」，且不报任何错。
     pub(crate) fn mix_phrase_separator(&self, idx: u8) -> Option<char> {
         let rt = self.rt();
-        if !rt.config.schema.english.phrase_seg {
+        if !rt.config.input.temp_english.phrase_seg {
             return None;
         }
         drop(rt);

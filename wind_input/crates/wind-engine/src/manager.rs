@@ -2056,8 +2056,8 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        // 词组分词（t42）：快捷输入英文跟随 `schema.english.phrase_seg`（它的英文成员就是
-        // 英文方案那个引擎），临英那份是独立开关，故两者相或。引擎只需知道「要不要具备
+        // 词组分词（t42）：英文方案读 `schema.english.phrase_seg`，临英与快捷输入英文共读
+        // `input.temp_english.phrase_seg`（A2-3b），两份开关相或。引擎只需知道「要不要具备
         // 这个能力」——按作用域把关是协调器的事，见 `build_engine` 的参数说明。
         let phrase_seg_anywhere = self
             .english

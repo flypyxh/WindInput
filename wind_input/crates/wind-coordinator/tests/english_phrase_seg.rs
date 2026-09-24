@@ -353,12 +353,16 @@ fn temp_english_scope_has_its_own_switch() {
 
 // ───────────────────── 快捷输入（mix） ─────────────────────
 
+/// 快捷输入里的英文读**临英那份**开关（`input.temp_english.phrase_seg`，A2-3b）。
+///
+/// 英文方案那份刻意置反：两份取值相同时，读错了开关也照样全绿。
 fn quick_config(phrase_seg: bool) -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into(), "english".into()];
     cfg.schema.active = "wubi86".into();
     cfg.input.default.chinese_mode = true;
-    cfg.schema.english.phrase_seg = phrase_seg;
+    cfg.input.temp_english.phrase_seg = phrase_seg;
+    cfg.schema.english.phrase_seg = !phrase_seg;
     cfg
 }
 
@@ -375,7 +379,7 @@ fn quick_page(s: &str, tag: &str, phrase_seg: bool) -> Vec<String> {
     c.debug_page_texts()
 }
 
-/// 快捷输入的英文成员同样支持分词（跟随 `schema.english.phrase_seg`）。
+/// 快捷输入的英文成员同样支持分词（跟随 `input.temp_english.phrase_seg`）。
 #[test]
 fn quick_input_english_matches_phrases() {
     if !has_english_schema() {
@@ -388,6 +392,39 @@ fn quick_input_english_matches_phrases() {
             .any(|t| t.starts_with("iPhone") && t.contains("Pro")),
         "快捷输入里 `ip'pro` 应命中 iPhone … Pro，实际: {p:?}"
     );
+}
+
+/// ★ 反向对照（A2-3b）：英文方案那份开着、临英那份关着时，快捷输入**不分词**。
+///
+/// 取 `free_input = off`：出厂 `auto` 下 `'` 不分词时会作字面输入进缓冲（Free 透镜），
+/// 看不出它是不是还是选词键。关掉自由输入后，`'` 要么被分词符臂收走、要么是第三候选键，
+/// 二者泾渭分明。
+#[test]
+fn quick_input_ignores_english_schema_switch() {
+    if !has_english_schema() {
+        eprintln!("跳过：缺少英文方案或词库");
+        return;
+    }
+    let mut cfg = quick_config(false); // 临英关、英文方案开
+    cfg.schema.mix_modes[0].free_input = FreeInputMode::Off;
+    let c = coord_with(cfg, "q_scope");
+    c.handle_key_event(&key(VK_SEMICOLON));
+    for ch in "ip".chars() {
+        c.handle_key_event(&key((ch.to_ascii_uppercase() as u32) & 0xFF));
+    }
+    let before = c.debug_page_texts();
+    assert!(
+        before.len() >= 3,
+        "前提：`;ip` 应有 3 条以上候选，实际: {before:?}"
+    );
+    let third = before[2].clone();
+    match c.handle_key_event(&key(VK_QUOTE)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(
+            text, third,
+            "临英那份关着时 `'` 必须仍是第三候选键，哪怕 schema.english.phrase_seg 开着"
+        ),
+        other => panic!("`'` 应作三选键上屏，实际: {other:?}"),
+    }
 }
 
 /// ★★ 分词符不得把透镜推进 Free —— 否则词组打得进去却选不出来。
