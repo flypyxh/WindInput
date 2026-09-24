@@ -4660,6 +4660,59 @@ impl EngineManager {
         toml::from_str(&content).ok()
     }
 
+    /// 混输引用图（primary / secondary 两条边）上从 `start` 出发可达的第一个环，
+    /// 返回环路径（首尾同名，如 `["a", "b", "a"]`）；无环返回 `None`。
+    ///
+    /// `edges(id)` 给出 `id` 引用的子方案；非混输 / 读不到的方案给空。自引用、间接环、
+    /// 以及「`start` 本身不在环上、但它引用的方案成环」都算——后者照样会让递归构建无底。
+    fn find_mixed_cycle(start: &str, edges: &dyn Fn(&str) -> Vec<String>) -> Option<Vec<String>> {
+        fn dfs(
+            id: &str,
+            edges: &dyn Fn(&str) -> Vec<String>,
+            path: &mut Vec<String>,
+            done: &mut std::collections::HashSet<String>,
+        ) -> Option<Vec<String>> {
+            if let Some(pos) = path.iter().position(|p| p == id) {
+                let mut cycle = path[pos..].to_vec();
+                cycle.push(id.to_string());
+                return Some(cycle);
+            }
+            if done.contains(id) {
+                return None;
+            }
+            path.push(id.to_string());
+            for child in edges(id) {
+                if let Some(c) = dfs(&child, edges, path, done) {
+                    return Some(c);
+                }
+            }
+            path.pop();
+            done.insert(id.to_string());
+            None
+        }
+        dfs(
+            start,
+            edges,
+            &mut Vec::new(),
+            &mut std::collections::HashSet::new(),
+        )
+    }
+
+    /// 读方案（含 override）得到它在混输引用图上的出边；供 [`Self::find_mixed_cycle`] 用。
+    fn mixed_edges_of(id: &str, data_dir: &Path, override_dir: Option<&Path>) -> Vec<String> {
+        match Self::read_schema(id, Some(data_dir), override_dir) {
+            Some(s) if s.engine.engine_type.eq_ignore_ascii_case("mixed") => {
+                let m = &s.engine.mixed;
+                [&m.primary_schema, &m.secondary_schema]
+                    .into_iter()
+                    .filter(|x| !x.is_empty())
+                    .cloned()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 为指定 schema 构建引擎
     ///
     /// `mixed_role`：见 [`MixedRole`]。`None` = 独立方案（非混输成员），走各引擎默认。
@@ -4694,6 +4747,21 @@ impl EngineManager {
             if m.primary_schema.is_empty() {
                 warn!("mixed schema {} 缺少 primary_schema", schema_id);
                 return None;
+            }
+            // 引用成环（自引用 / 互指 / 更长的环）时下面的递归构建无底，Rust 栈溢出直接
+            // abort 整个进程。畸形 override 就能造出来（`merge_toml` 无字段白名单）。只在顶层
+            // （`mixed_role == None`）查一次：它覆盖整张可达子图，子层再查是重复读盘。
+            if mixed_role.is_none() {
+                let edges = |id: &str| Self::mixed_edges_of(id, data_dir, override_dir);
+                if let Some(cycle) = Self::find_mixed_cycle(schema_id, &edges) {
+                    warn!(
+                        "混输方案 {} 的 primary_schema/secondary_schema 引用成环：{}，\
+                         该方案不可用。请检查方案文件或 schema_overrides 里的 [engine.mixed]。",
+                        schema_id,
+                        cycle.join(" → ")
+                    );
+                    return None;
+                }
             }
             let primary = Self::build_engine(
                 &m.primary_schema,
@@ -6078,6 +6146,39 @@ impl EngineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 混输引用环的路径要能直接贴进日志：自引用、互指、下游成环、菱形（非环）四种形状。
+    #[test]
+    fn find_mixed_cycle_reports_path() {
+        let graph = |pairs: &'static [(&'static str, &'static [&'static str])]| {
+            move |id: &str| -> Vec<String> {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == id)
+                    .map(|(_, v)| v.iter().map(|s| s.to_string()).collect())
+                    .unwrap_or_default()
+            }
+        };
+        let g = graph(&[("a", &["a"])]);
+        assert_eq!(
+            EngineManager::find_mixed_cycle("a", &g).unwrap(),
+            ["a", "a"]
+        );
+        let g = graph(&[("a", &["b", "py"]), ("b", &["a"])]);
+        assert_eq!(
+            EngineManager::find_mixed_cycle("a", &g).unwrap(),
+            ["a", "b", "a"]
+        );
+        // a 本身不在环上，但它引用的 b↔c 成环：递归照样无底，必须报。
+        let g = graph(&[("a", &["b"]), ("b", &["c"]), ("c", &["b"])]);
+        assert_eq!(
+            EngineManager::find_mixed_cycle("a", &g).unwrap(),
+            ["b", "c", "b"]
+        );
+        // 菱形共享子方案（primary 与 secondary 都落到 d）不是环。
+        let g = graph(&[("a", &["b", "c"]), ("b", &["d"]), ("c", &["d"])]);
+        assert_eq!(EngineManager::find_mixed_cycle("a", &g), None);
+    }
 
     /// 反查索引落在**方案自己的目录**下，且与主词库放得多深无关。
     ///
