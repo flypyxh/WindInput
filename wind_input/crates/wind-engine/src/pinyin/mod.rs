@@ -3033,6 +3033,9 @@ impl Engine for PinyinEngine {
                 );
             }
 
+            // zh/ch/sh 被拆成两个声母的读法扣分（`zhge` ≠ 之后 + 个）。放在全部节点
+            // （含用户层）进图之后，理由见 `RETROFLEX_SPLIT_PENALTY`。
+            lattice::penalize_retroflex_splits(abbr_query, &mut lattice_nodes);
             let input_len = abbr_query.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
             for (end_pos, at_end) in lattice_nodes.iter().enumerate() {

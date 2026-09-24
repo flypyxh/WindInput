@@ -155,6 +155,27 @@ pub(crate) const FUZZY_SYLLABLE_LOG_PENALTY: f64 = std::f64::consts::LN_2;
 /// **本值由 `pinyin_eval` 的 D 类对账定出，改动前必须重跑**（见 `pinyin-mixed-abbrev.md` §4.8）。
 pub(crate) const ABBREV_NODE_PENALTY: f64 = 1.2;
 
+/// 混合整句里把 `zh` / `ch` / `sh` **拆成两个声母**（z|h）时，每处拆分的扣分（对数域）。
+///
+/// 用户打 `zh` 绝大多数时候要的是翘舌声母（`zhge` = 这个），而简拼节点按「一个字母一个
+/// 声母」读，会把它读成 z|h：「之后」(zhi|hou) 的简拼恰好是 `zh`，于是 `zhge` 组出
+/// 「之后个」、`shzhe` 组出「生活这」、`zhrgan` 组出「之后如果按钮」。拆开读并非不合法
+/// （「最后」的简拼就是 `zh`），故是**罚**不是禁。
+///
+/// 取值由 `pinyin_eval` 界面序扫出（2026-09-24，seed 20260721；A/B/C 不受影响，只有 ②b 用）：
+///
+/// | 惩罚 | E 短简拼 top-1 | 其中 R 全声母 | D 混合长串 top-1 |
+/// |---|---|---|---|
+/// | 0 | 64.40% | 27.27% | 12.20% |
+/// | 2 | 68.20% | 52.27% | 12.20% |
+/// | 4 | 70.60% | 70.45% | 12.10% |
+/// | **8** | **74.40%** | **90.91%** | **12.00%** |
+/// | 50（≈禁止） | 75.50% | 90.91% | 11.40% |
+///
+/// 8 处：E 类新增 100 条、丢 0 条；D 类丢的 2 条正是用户真把 s|h、z|h 当两个声母打的
+/// （「可视化」`ksh`、「相互帮助」`xhbz` + 「黑武士」）。再往上 E 只多 11 条、D 却丢 8 条。
+pub(crate) const RETROFLEX_SPLIT_PENALTY: f64 = 8.0;
+
 /// 单个简拼跨度最多取几个词进图。
 ///
 /// 简拼召回面宽（`bzd` 真实词库下 12 个词），全塞进去会让节点数与 Viterbi 的边数一起膨胀，
@@ -392,6 +413,39 @@ pub struct LatticeNode {
     /// 故必须逐节点记录：Viterbi 选中哪条节点，整句的真实边界就是哪条。
     pub syl_mask: u64,
     pub log_prob: f64,
+}
+
+/// 词图里把 `zh` / `ch` / `sh` **拆成两个声母**（z|h）的次数：某个 `h` 紧跟在 z/c/s 之后、
+/// 且这个 `h` 是一个新音节的起点。
+///
+/// 两种形态用同一条判据覆盖：
+/// - 节点内部：简拼节点「之后」(`zh` = z|h) —— `syl_mask` 在 `h` 那一位置位；
+/// - 跨节点：节点从 `h` 起、前一字节是 z/c/s —— 音节不可能以 z/c/s 结尾，前一段必是以该
+///   字母作声母的简拼段，于是同样是拆开的。
+fn retroflex_splits(input: &[u8], node: &LatticeNode) -> usize {
+    let is_zcs = |b: u8| matches!(b, b'z' | b'c' | b's');
+    let starts_syllable = |i: usize| (node.syl_mask >> (i - node.start)) & 1 == 1;
+    (node.start..node.end)
+        .filter(|&i| input[i] == b'h' && i > 0 && is_zcs(input[i - 1]) && starts_syllable(i))
+        .count()
+}
+
+/// 对把 zh/ch/sh 拆成两个声母的节点扣分：每处 [`RETROFLEX_SPLIT_PENALTY`]（判据见
+/// [`retroflex_splits`]）。
+///
+/// 须在**所有节点都进图之后**调用（系统简拼节点、用户层节点都会拆），且只用于混合整句
+/// （②b）：纯全拼词图里音节不会以 z/c/s 结尾，`h` 前面不可能是拆开的声母，调用是空操作。
+pub fn penalize_retroflex_splits(input: &str, nodes: &mut [Vec<LatticeNode>]) {
+    let penalty = RETROFLEX_SPLIT_PENALTY;
+    let bytes = input.as_bytes();
+    for at_end in nodes.iter_mut() {
+        for node in at_end.iter_mut() {
+            let n = retroflex_splits(bytes, node);
+            if n > 0 {
+                node.log_prob -= penalty * n as f64;
+            }
+        }
+    }
 }
 
 /// 格子构建器
