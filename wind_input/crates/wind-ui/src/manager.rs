@@ -928,13 +928,17 @@ impl UiManager {
                             t.set_corner(work_right, work_bottom);
                         }
                     }
-                    UiCommand::SetToolbarAutoHide { enabled, delay_ms } => {
+                    UiCommand::SetToolbarAutoHide {
+                        enabled,
+                        delay_ms,
+                        hover_reveal,
+                    } => {
                         debug!(
-                            "UI: SetToolbarAutoHide enabled={} delay={}ms",
-                            enabled, delay_ms
+                            "UI: SetToolbarAutoHide enabled={} delay={}ms hover_reveal={}",
+                            enabled, delay_ms, hover_reveal
                         );
                         if let Some(t) = &mut toolbar {
-                            t.set_auto_hide(enabled, delay_ms);
+                            t.set_auto_hide(enabled, delay_ms, hover_reveal);
                         }
                     }
                     UiCommand::SetToolbarVertical(v) => {

@@ -3,6 +3,11 @@
 //! 生命周期：显示（on_shown 重置计时）→ 超时 → 1 秒线性淡出 → 隐藏。
 //! 光标在工具栏内或拖动中顺延计时；淡出中光标移入取消淡出恢复不透明。
 //! 未启用/无活动计时时 `is_active()` 为 false，调用方走快速路径（不取时间）。
+//!
+//! **悬停唤回（假隐藏，论坛 t167）**：开启后淡出完毕不真隐藏，而是以 [`GHOST_ALPHA`]
+//! 留在原位——几乎看不见，但仍可被鼠标命中；光标移到那里即恢复不透明，移开后按原逻辑
+//! 满 delay 再淡出。真隐藏（全屏 / 英文态 / 失焦经 `HideToolbar`）照旧走 `on_hidden`，
+//! 与假隐藏无关。
 
 use std::time::{Duration, Instant};
 
@@ -16,6 +21,12 @@ const FADE_DURATION: Duration = Duration::from_millis(1000);
 /// 分辨力之下，再高只是白费唤醒。
 const FADE_FRAME: Duration = Duration::from_millis(16);
 
+/// 假隐藏时的整窗常数 alpha。
+///
+/// 不能取 0：Layered Window 的命中测试按合成后的 alpha 判透明，0 就等于真隐藏——鼠标
+/// 穿透过去，悬停唤回无从谈起。取 1（≈0.4% 不透明度）肉眼不可见，又保留命中区域。
+pub const GHOST_ALPHA: u8 = 1;
+
 /// tick 推进后调用方需执行的动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoHideAction {
@@ -27,6 +38,8 @@ pub enum AutoHideAction {
     Restore,
     /// 淡出完成：隐藏窗口。
     Hide,
+    /// 淡出完成（悬停唤回开启）：以 [`GHOST_ALPHA`] 留在原位，等光标移入。
+    Ghost,
 }
 
 pub struct AutoHide {
@@ -43,6 +56,10 @@ pub struct AutoHide {
     /// 事件驱动后 tick 只在唤醒时发生，最后一次顺延可能远早于真正的离开时刻，隐藏会
     /// 相应提前。显式记住这一沿，才能让隐藏时刻与轮询年代一致。
     was_engaged: bool,
+    /// 悬停唤回开关（`ui.toolbar.auto_hide_hover_reveal`）。
+    hover_reveal: bool,
+    /// 处于假隐藏（已淡出到 [`GHOST_ALPHA`]，等光标移入）。
+    ghosted: bool,
 }
 
 impl AutoHide {
@@ -53,7 +70,20 @@ impl AutoHide {
             deadline: None,
             fade_start: None,
             was_engaged: false,
+            hover_reveal: false,
+            ghosted: false,
         }
+    }
+
+    /// 配置悬停唤回。返回 true = 关掉时正处于假隐藏，调用方需恢复不透明并重新计时
+    /// （此后到期走真隐藏）。
+    pub fn configure_hover_reveal(&mut self, on: bool) -> bool {
+        self.hover_reveal = on;
+        if !on && self.ghosted {
+            self.ghosted = false;
+            return true;
+        }
+        false
     }
 
     /// 配置变更（SetToolbarAutoHide）。返回 true = 淡出被中断，调用方需恢复不透明。
@@ -62,11 +92,12 @@ impl AutoHide {
         self.enabled = enabled;
         self.delay = Duration::from_millis(delay_ms.max(1000));
         if !enabled {
-            let was_fading = self.fade_start.is_some();
+            let was_dimmed = self.fade_start.is_some() || self.ghosted;
             self.deadline = None;
             self.fade_start = None;
             self.was_engaged = false;
-            return was_fading;
+            self.ghosted = false;
+            return was_dimmed;
         }
         false
     }
@@ -76,6 +107,7 @@ impl AutoHide {
         if self.enabled {
             self.deadline = Some(now + self.delay);
             self.fade_start = None;
+            self.ghosted = false;
         }
     }
 
@@ -84,6 +116,7 @@ impl AutoHide {
         self.deadline = None;
         self.fade_start = None;
         self.was_engaged = false;
+        self.ghosted = false;
     }
 
     /// 下一次需要 `tick_at` 的时刻；`None` = 无需为本状态机安排唤醒。
@@ -93,7 +126,10 @@ impl AutoHide {
     /// 要么返回 `None`。
     ///
     /// 光标占用工具栏期间照常返回到期时刻（而非 `None`）：到点醒来发现仍被占用就再顺延
-    /// 一轮，每 delay 一次的唤醒可忽略。反过来若在此返回 `None`、只等 `WM_MOUSELEAVE`
+    /// 一轮，每 delay 一次的唤醒可忽略。
+    ///
+    /// 假隐藏期间返回 `None`：唤回它的是光标移入时的 `WM_MOUSEMOVE`，那条消息本身就会
+    /// 唤醒消息循环，没有东西等着到期。反过来若在此返回 `None`、只等 `WM_MOUSELEAVE`
     /// 来唤醒，工具栏就把「自动隐藏还能不能发生」全押在那条消息必达上——窗口在光标停留
     /// 期间被隐藏或重建都会让它不再到来，代价是自动隐藏永久失效。
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
@@ -105,7 +141,7 @@ impl AutoHide {
 
     /// 是否有活动计时/淡出。false 时调用方跳过 tick 推进（不取 Instant::now()）。
     pub fn is_active(&self) -> bool {
-        self.deadline.is_some() || self.fade_start.is_some()
+        self.deadline.is_some() || self.fade_start.is_some() || self.ghosted
     }
 
     /// 推进状态机。cursor_inside=光标在工具栏窗口内；dragging=拖动中。
@@ -118,6 +154,16 @@ impl AutoHide {
         // 否则占用分支自己的 return 会把它吃掉。
         let just_left = self.was_engaged && !engaged;
         self.was_engaged = engaged;
+        if self.ghosted {
+            // 假隐藏：只等光标移入。移入即恢复并从此刻重新计时（移开的那一沿由上面的
+            // `was_engaged` 照常处理，与正常显示时同一套）。
+            if engaged {
+                self.ghosted = false;
+                self.deadline = Some(now + self.delay);
+                return AutoHideAction::Restore;
+            }
+            return AutoHideAction::None;
+        }
         if engaged {
             // 悬停/拖动：顺延计时；淡出中则取消恢复。
             self.deadline = Some(now + self.delay);
@@ -137,6 +183,10 @@ impl AutoHide {
             if elapsed >= FADE_DURATION {
                 self.deadline = None;
                 self.fade_start = None;
+                if self.hover_reveal {
+                    self.ghosted = true;
+                    return AutoHideAction::Ghost;
+                }
                 return AutoHideAction::Hide;
             }
             let t = elapsed.as_secs_f32() / FADE_DURATION.as_secs_f32();
@@ -363,6 +413,113 @@ mod tests {
             ah.tick_at(t0 + Duration::from_millis(500), false, false),
             AutoHideAction::None
         );
+    }
+
+    /// 启用「悬停唤回」（假隐藏）并显示于 t0。
+    fn armed_ghost() -> (AutoHide, Instant) {
+        let mut ah = AutoHide::new();
+        ah.configure_hover_reveal(true);
+        ah.configure(true, 5000);
+        let t0 = Instant::now();
+        ah.on_shown(t0);
+        (ah, t0)
+    }
+
+    /// 假隐藏：淡出完毕不真隐藏，而是留一层几乎透明、仍可命中的窗口。
+    #[test]
+    fn hover_reveal_ghosts_instead_of_hiding() {
+        let (mut ah, t0) = armed_ghost();
+        assert_eq!(
+            ah.tick_at(t0 + 5 * SEC, false, false),
+            AutoHideAction::Fade(255)
+        );
+        assert_eq!(
+            ah.tick_at(t0 + 6 * SEC, false, false),
+            AutoHideAction::Ghost,
+            "淡出完毕应转入假隐藏，而不是 Hide"
+        );
+        // 假隐藏期间保持活动（光标移入要能被 tick 看见），但不要求定时唤醒：
+        // 唤醒它的是 WM_MOUSEMOVE 本身。
+        assert!(ah.is_active());
+        assert_eq!(ah.next_deadline(t0 + 6 * SEC), None);
+        // 光标没来：一直停在假隐藏，不重复提交。
+        assert_eq!(
+            ah.tick_at(t0 + 60 * SEC, false, false),
+            AutoHideAction::None
+        );
+    }
+
+    /// 光标移到原位 → 立即恢复不透明；移开后按原逻辑满 delay 再淡出。
+    #[test]
+    fn hovering_the_ghost_reveals_then_hides_again_after_leaving() {
+        let (mut ah, t0) = armed_ghost();
+        ah.tick_at(t0 + 5 * SEC, false, false);
+        assert_eq!(
+            ah.tick_at(t0 + 6 * SEC, false, false),
+            AutoHideAction::Ghost
+        );
+        assert_eq!(
+            ah.tick_at(t0 + 20 * SEC, true, false),
+            AutoHideAction::Restore,
+            "悬停在假隐藏的工具栏上应恢复显示"
+        );
+        assert_eq!(ah.tick_at(t0 + 30 * SEC, true, false), AutoHideAction::None);
+        // t0+31s 移开 → t0+36s 才开始淡出。
+        assert_eq!(
+            ah.tick_at(t0 + 31 * SEC, false, false),
+            AutoHideAction::None
+        );
+        assert_eq!(
+            ah.tick_at(t0 + 35 * SEC, false, false),
+            AutoHideAction::None
+        );
+        assert_eq!(
+            ah.tick_at(t0 + 36 * SEC, false, false),
+            AutoHideAction::Fade(255)
+        );
+        assert_eq!(
+            ah.tick_at(t0 + 37 * SEC, false, false),
+            AutoHideAction::Ghost
+        );
+    }
+
+    /// 状态刷新（切中英等，经 render → on_shown）把假隐藏的工具栏正常亮出来。
+    #[test]
+    fn shown_clears_ghost() {
+        let (mut ah, t0) = armed_ghost();
+        ah.tick_at(t0 + 5 * SEC, false, false);
+        ah.tick_at(t0 + 6 * SEC, false, false);
+        ah.on_shown(t0 + 10 * SEC);
+        assert_eq!(ah.next_deadline(t0 + 10 * SEC), Some(t0 + 15 * SEC));
+        assert_eq!(
+            ah.tick_at(t0 + 14 * SEC, false, false),
+            AutoHideAction::None
+        );
+    }
+
+    /// 真隐藏（全屏 / 英文态 / 失焦经 HideToolbar）清掉假隐藏，不再响应悬停。
+    #[test]
+    fn hidden_clears_ghost() {
+        let (mut ah, t0) = armed_ghost();
+        ah.tick_at(t0 + 5 * SEC, false, false);
+        ah.tick_at(t0 + 6 * SEC, false, false);
+        ah.on_hidden();
+        assert!(!ah.is_active());
+        assert_eq!(ah.tick_at(t0 + 7 * SEC, true, false), AutoHideAction::None);
+    }
+
+    /// 假隐藏中关掉自动隐藏 → 要求恢复不透明（否则工具栏停在几乎透明的样子）。
+    #[test]
+    fn disabling_while_ghosted_requests_restore() {
+        let (mut ah, t0) = armed_ghost();
+        ah.tick_at(t0 + 5 * SEC, false, false);
+        ah.tick_at(t0 + 6 * SEC, false, false);
+        assert!(ah.configure(false, 5000));
+        // 只关「悬停唤回」同理：此后该走真隐藏，假隐藏的窗口先亮回来重新计时。
+        let (mut ah, t0) = armed_ghost();
+        ah.tick_at(t0 + 5 * SEC, false, false);
+        ah.tick_at(t0 + 6 * SEC, false, false);
+        assert!(ah.configure_hover_reveal(false));
     }
 
     #[test]

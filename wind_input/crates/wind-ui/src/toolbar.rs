@@ -295,8 +295,10 @@ impl Toolbar {
 
     /// 配置自动隐藏（启动/配置重载时经 SetToolbarAutoHide 下发）。
     /// 淡出中关闭开关 → 恢复不透明；开启且当前可见 → 立即起表。
-    pub fn set_auto_hide(&mut self, enabled: bool, delay_ms: u64) {
-        if self.auto_hide.configure(enabled, delay_ms)
+    pub fn set_auto_hide(&mut self, enabled: bool, delay_ms: u64, hover_reveal: bool) {
+        // 先配悬停唤回：关掉它时若正处于假隐藏，要先亮回来（下面 enabled 分支会重新计时）。
+        let unghosted = self.auto_hide.configure_hover_reveal(hover_reveal);
+        if (self.auto_hide.configure(enabled, delay_ms) || unghosted)
             && let Err(e) = self.window.update_with_alpha(255)
         {
             tracing::warn!("Toolbar restore alpha: {}", e);
@@ -859,6 +861,13 @@ impl Toolbar {
                     }
                 }
                 AutoHideAction::Hide => self.hide(),
+                // 假隐藏：窗口留在原位、`visible` 仍为 true（tick 与鼠标处理照常），只把整窗
+                // alpha 压到几乎不可见。光标移入时由上面的 Restore 分支亮回来。
+                AutoHideAction::Ghost => {
+                    if let Err(e) = self.window.update_with_alpha(crate::auto_hide::GHOST_ALPHA) {
+                        tracing::warn!("Toolbar ghost: {}", e);
+                    }
+                }
             }
         }
     }

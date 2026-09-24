@@ -103,9 +103,14 @@ pub enum UiCommand {
     /// 把工具栏落到指定显示器工作区的右下角——焦点切到一块从未拖过工具栏的屏时下发。
     /// 传边界而非坐标：右下角要减工具栏自身尺寸，那只有 UI 侧知道。
     SetToolbarCorner { work_right: i32, work_bottom: i32 },
-    /// 工具栏自动隐藏配置（开关 + 超时毫秒）。来自 ui.toolbar.auto_hide / auto_hide_delay，
-    /// 协调器 apply_ui_config（启动 + 配置重载）下发。
-    SetToolbarAutoHide { enabled: bool, delay_ms: u64 },
+    /// 工具栏自动隐藏配置（开关 + 超时毫秒 + 悬停唤回）。来自 ui.toolbar.auto_hide /
+    /// auto_hide_delay / auto_hide_hover_reveal，协调器 apply_ui_config（启动 + 配置重载）下发。
+    /// `hover_reveal` = 淡出后不真隐藏、留一层几乎透明的可命中窗口，光标移到原位即重新显示。
+    SetToolbarAutoHide {
+        enabled: bool,
+        delay_ms: u64,
+        hover_reveal: bool,
+    },
     /// 工具栏纵向排列（true=竖条）。来自 ui.toolbar.vertical，
     /// 协调器 apply_ui_config（启动 + 配置重载）下发。
     SetToolbarVertical(bool),

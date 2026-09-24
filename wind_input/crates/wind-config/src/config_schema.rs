@@ -629,8 +629,10 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.toolbar.visible", Bool),
     f("ui.toolbar.hide_in_fullscreen", Bool),
     f("ui.toolbar.fullscreen_watch", Bool),
+    f("ui.toolbar.hide_in_english", Bool),
     f("ui.toolbar.auto_hide", Bool),
     f("ui.toolbar.auto_hide_delay", Int),
+    f("ui.toolbar.auto_hide_hover_reveal", Bool),
     f("ui.toolbar.vertical", Bool),
     // items 的**顺序即渲染顺序**（不同于 ui.status.items 的顺序无语义）。StrList 不带值域
     // 校验，非法项由协调器的 `parse_toolbar_items` 跳过并告警——那里同时要处理顺序，

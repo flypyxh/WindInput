@@ -2224,10 +2224,9 @@ impl Coordinator {
     /// 唯一的生产调用点在 `cfg(windows)` 的复查线程里，故非 Windows 下它只有测试在用。
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn toolbar_wants_display(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .toolbar_conjunction()
+        let hide_in_english = self.rt().config.ui.toolbar.hide_in_english;
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        toolbar_gate_open(s.toolbar_conjunction(), hide_in_english, s.chinese_mode)
     }
 
     /// 推送当前状态到常驻工具栏（中英/方案/标点/全半角）
@@ -2248,6 +2247,7 @@ impl Coordinator {
                 .fullscreen_cached
                 .load(std::sync::atomic::Ordering::Relaxed))
             || self.ui_suppressed_by_host().is_some();
+        let hide_in_english = self.rt().config.ui.toolbar.hide_in_english;
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // 四项合取：本输入法在服务某宿主（ime_active）、焦点在可编辑控件里
         // （has_edit_context）、用户开着工具栏（toolbar_visible）、且未处于全屏。
@@ -2260,17 +2260,22 @@ impl Coordinator {
         // 挂着的线程要等 `PARK_FALLBACK` 兜底才醒 —— 用户退出全屏后十来秒工具栏才回来。
         // 「隐藏 ⇒ 闸随后会关」这个想当然，正是 `watch_gate_stays_open_while_hidden_by_fullscreen`
         // 那条测试钉着要否掉的。
-        let gate_open = s.toolbar_conjunction();
+        //
+        // 「英文状态隐藏」（`hide_in_english`）并进**闸**而不是与全屏否决并列：英文态下工具栏
+        // 横竖不显示，前台全不全屏无人关心，复查线程不该为它醒着；切回中文时本函数会被
+        // 重新调用，闸随之打开、照常叫醒复查线程。
+        let gate_open = toolbar_gate_open(s.toolbar_conjunction(), hide_in_english, s.chinese_mode);
         if !gate_open || hide_fullscreen {
             // 记录是哪一项否决了显示：UI 层日志只看得到「HideToolbar」，判不出成因，
             // 而四条路径的排查方向完全不同（激活态乱序 / 焦点离开输入框 / 用户关了开关 /
             // 全屏探测）。
             tracing::debug!(
-                "notify_toolbar: 隐藏 ime_active={} has_edit_ctx={} toolbar_visible={} fullscreen={}",
+                "notify_toolbar: 隐藏 ime_active={} has_edit_ctx={} toolbar_visible={} fullscreen={} english={}",
                 s.ime_active,
                 s.has_edit_context,
                 s.toolbar_visible,
-                hide_fullscreen
+                hide_fullscreen,
+                hide_in_english && !s.chinese_mode
             );
             drop(s);
             // 闸开着却走到隐藏分支 = 「三项合取成立，只是被全屏否决了」，正是复查线程最该
@@ -2593,6 +2598,16 @@ fn screenshots_dir() -> Option<String> {
 /// 哨兵值与合法值域重叠是根因；这里在落盘侧下移 1px 避开：视觉不可察觉，语义无歧义。
 fn avoid_unset_sentinel(x: i32, y: i32) -> (i32, i32) {
     if (x, y) == (0, 0) { (0, 1) } else { (x, y) }
+}
+
+/// 工具栏的**闸**：三项合取（见 [`State::toolbar_conjunction`]）再减去「英文状态隐藏」。
+///
+/// 抽成自由函数是为了让 `notify_toolbar` 与全屏复查线程的开销闸
+/// （`toolbar_wants_display`）共用同一判据——两处一旦分叉，复查线程就会在工具栏根本
+/// 不显示时白跑，或者在该显示时睡着。
+fn toolbar_gate_open(conjunction: bool, hide_in_english: bool, chinese_mode: bool) -> bool {
+    let english_veto = hide_in_english && !chinese_mode;
+    conjunction && !english_veto
 }
 
 #[cfg(test)]
@@ -3482,5 +3497,78 @@ mod candidate_double_click_tests {
     #[test]
     fn double_click_is_ignored_when_disabled() {
         assert!(!screenshot_sent(false), "出厂关闭时双击不应截图");
+    }
+}
+
+#[cfg(test)]
+mod english_veto_tests {
+    //! 「英文状态隐藏工具栏」（`ui.toolbar.hide_in_english`，论坛 t167）。
+
+    use crate::coordinator::Coordinator;
+    use wind_config::Config;
+    use wind_ui_types::UiCommand;
+
+    fn coord(
+        hide_in_english: bool,
+        chinese: bool,
+    ) -> (
+        std::sync::Arc<Coordinator>,
+        std::sync::mpsc::Receiver<UiCommand>,
+    ) {
+        let mut cfg = Config::default();
+        cfg.ui.toolbar.hide_in_english = hide_in_english;
+        let (c, rx) = Coordinator::new_headless_with_ui(cfg, None);
+        {
+            let mut s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.ime_active = true;
+            s.has_edit_context = true;
+            s.toolbar_visible = true;
+            s.chinese_mode = chinese;
+        }
+        c.reset_toolbar_push_dedup();
+        (c, rx)
+    }
+
+    fn last_toolbar(rx: &std::sync::mpsc::Receiver<UiCommand>) -> Option<bool> {
+        let mut last = None;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                UiCommand::UpdateToolbar(_) => last = Some(true),
+                UiCommand::HideToolbar => last = Some(false),
+                _ => {}
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn english_mode_hides_toolbar_when_enabled() {
+        let (c, rx) = coord(true, false);
+        c.notify_toolbar();
+        assert_eq!(last_toolbar(&rx), Some(false), "英文态应隐藏工具栏");
+        assert!(
+            !c.toolbar_wants_display(),
+            "英文态下全屏复查闸应关：工具栏不显示，前台全不全屏无人关心"
+        );
+    }
+
+    #[test]
+    fn switching_back_to_chinese_shows_toolbar_again() {
+        let (c, rx) = coord(true, false);
+        c.notify_toolbar();
+        c.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chinese_mode = true;
+        c.notify_toolbar();
+        assert_eq!(last_toolbar(&rx), Some(true), "切回中文应恢复工具栏");
+        assert!(c.toolbar_wants_display());
+    }
+
+    #[test]
+    fn english_mode_keeps_toolbar_when_disabled() {
+        let (c, rx) = coord(false, false);
+        c.notify_toolbar();
+        assert_eq!(last_toolbar(&rx), Some(true), "出厂关闭：英文态照常显示");
     }
 }

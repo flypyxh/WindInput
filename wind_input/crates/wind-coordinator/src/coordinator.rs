@@ -4567,6 +4567,7 @@ impl Coordinator {
         let _ = self.ui_tx.send(UiCommand::SetToolbarAutoHide {
             enabled: tb.auto_hide,
             delay_ms: u64::from(tb.auto_hide_delay.max(1)) * 1000,
+            hover_reveal: tb.auto_hide_hover_reveal,
         });
         let _ = self.ui_tx.send(UiCommand::SetToolbarVertical(tb.vertical));
         // 工具栏格的显隐与顺序（ui.toolbar.items）。解析（含非法项告警、留空回落全集）

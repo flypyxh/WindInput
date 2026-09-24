@@ -5152,12 +5152,26 @@ pub struct ToolbarConfig {
     /// 调整，写两处迟早只改一处。
     #[serde(default = "default_true")]
     pub fullscreen_watch: bool,
+    /// 英文状态下隐藏工具栏（默认关，论坛 t167）。
+    ///
+    /// 「英文状态」= 中英模式处于英文（`chinese_mode == false`），与全屏否决同档：只否决显示，
+    /// 切回中文时照常出现。临时英文 / 大写锁定仍属中文态，不在此列。
+    #[serde(default)]
+    pub hide_in_english: bool,
     /// 自动隐藏：显示后超时无交互则淡出（默认关）。
     #[serde(default)]
     pub auto_hide: bool,
     /// 自动隐藏超时（秒，默认 5；下限 1 由协调器钳制）。
     #[serde(default = "default_toolbar_auto_hide_delay")]
     pub auto_hide_delay: u32,
+    /// 自动隐藏改为「假隐藏」（默认 true，论坛 t167）：淡出后窗口仍留在原位（几乎透明、
+    /// 可被鼠标命中），光标移到那里即重新显示，移开后按 `auto_hide_delay` 再淡出。
+    /// 关掉则淡出后真隐藏，只有状态变化（切中英等）才重新出现。仅在 `auto_hide` 下有意义。
+    ///
+    /// 代价：假隐藏期间那一小块屏幕的点击落在工具栏上，而不是下面的应用——但光标得先
+    /// 移过去，工具栏会先亮出来，不会「点到看不见的东西」。
+    #[serde(default = "default_true")]
+    pub auto_hide_hover_reveal: bool,
     /// 纵向排列（默认 false=横条）。纵向是横向的转置：条宽取主题 `[toolbar] height`，
     /// 每格高取 `button_width`，故同一套主题几何在两个朝向下都成立、无需另配。
     /// 属用户偏好而非视觉设计，所以落在此处而非主题。
@@ -5329,8 +5343,10 @@ impl Default for ToolbarConfig {
             visible: true,
             hide_in_fullscreen: true,
             fullscreen_watch: true,
+            hide_in_english: false,
             auto_hide: false,
             auto_hide_delay: 5,
+            auto_hide_hover_reveal: true,
             vertical: false,
             items: default_toolbar_items(),
             buttons: Vec::new(),
@@ -12255,6 +12271,17 @@ smart_method = "delete_replace"
         let d = ToolbarConfig::default();
         assert!(!d.auto_hide);
         assert_eq!(d.auto_hide_delay, 5);
+    }
+
+    /// 「英文状态隐藏工具栏」出厂关、「悬停唤回」出厂开；空表反序列化与 Default 一致。
+    #[test]
+    fn toolbar_english_and_hover_reveal_defaults() {
+        let tb: ToolbarConfig = toml::from_str("").unwrap();
+        assert!(!tb.hide_in_english);
+        assert!(tb.auto_hide_hover_reveal);
+        let d = ToolbarConfig::default();
+        assert!(!d.hide_in_english);
+        assert!(d.auto_hide_hover_reveal);
     }
 
     /// `rare_char` 必须解析成生僻字模式，且**未知动词仍回落 None**。
