@@ -1153,7 +1153,8 @@ pub struct PinyinGlobalConfig {
     /// 就是两道闸串联——用户把键配好却没反应，两处显示都正常。
     ///
     /// ⚠️ **只在「整句池 ≥ 2 条」时夺取**，其余时候这个键保持它原本的语义。Tab 出厂是
-    /// 翻页键、也是配对跳出键与加词界面的切来源键，所以不能无条件抢；出厂 `sentence_max_count
+    /// 高亮下移键、也是配对跳出键与加词界面的切来源键，所以不能无条件抢；它若是当前方案的
+    /// 音节分隔符或被方案 `[key_actions]` 绑定，则一律让位（不夺取）；出厂 `sentence_max_count
     /// = 1` 时池子恒空，即使配了键也不会吃。撞车时启动体检告警，见
     /// `Coordinator::warn_sentence_cycle_conflict`。
     #[serde(default)]

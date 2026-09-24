@@ -15,6 +15,8 @@ use wind_ipc::protocol::EVENT_KEY_DOWN;
 use wind_store::Store;
 
 const VK_TAB: u32 = 0x09;
+const VK_DOWN: u32 = 0x28;
+const VK_BACKTICK: u32 = 0xC0;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -44,7 +46,11 @@ fn coord(count: u8, max: u8, cycle_key: &str, tag: &str) -> Arc<Coordinator> {
     cfg.schema.pinyin.sentence_count = count;
     cfg.schema.pinyin.sentence_max_count = max;
     cfg.schema.pinyin.sentence_cycle_key = cycle_key.into();
-    let path = std::env::temp_dir().join(format!("wind_sentence_cycle_{tag}.redb"));
+    // 文件名带进程号：并发会话同时跑本文件时不互相覆盖（审查查出）。
+    let path = std::env::temp_dir().join(format!(
+        "wind_sentence_cycle_{tag}_{}.redb",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
     Coordinator::new_headless_with_store(
         cfg,
@@ -91,6 +97,9 @@ fn single_slot_cycles_and_wraps() {
     let c = coord(1, 3, "tab", "single");
     type_pinyin(&c, "yougailunma");
     let first = c.debug_page_texts()[0].clone();
+    // 先把高亮挪开：切换前高亮本就在 0 的话，「高亮落在换进来的那条上」这条断言看不出任何事。
+    c.handle_key_event(&key(VK_DOWN));
+    assert_eq!(c.debug_page_info().1, 1, "前提：方向键把高亮移到了第 2 条");
     c.handle_key_event(&key(VK_TAB));
     let second = c.debug_page_texts()[0].clone();
     assert_ne!(
@@ -122,8 +131,7 @@ fn block_of_three_is_on_top_and_rotates() {
         "最前 3 位应是整句块（四字）: {:?}",
         c.debug_page_texts()
     );
-    let mut uniq = top.clone();
-    uniq.dedup();
+    let uniq: std::collections::HashSet<&String> = top.iter().collect();
     assert_eq!(uniq.len(), 3, "整句块三条互不相同: {top:?}");
     c.handle_key_event(&key(VK_TAB));
     let after: Vec<String> = c.debug_page_texts()[..3].to_vec();
@@ -142,4 +150,23 @@ fn empty_key_means_off_even_with_nbest() {
     let before = c.debug_page_texts();
     c.handle_key_event(&key(VK_TAB));
     assert_eq!(c.debug_page_texts(), before, "没配键不得换候选");
+}
+
+/// 切换键若恰是当前方案的**音节分隔符**，一律让位（审查查出）。
+///
+/// 全拼出厂 `separator = "auto"`：`'` 被选词键占着时反引号就是分隔符。用户把切换键选成反引号、
+/// 开了 N-best，打到 2 个音节以上（池子才非空）分隔符就按不进去了。
+#[test]
+fn separator_key_is_never_taken() {
+    if !has_pinyin() {
+        eprintln!("跳过：缺少 build_dev/data");
+        return;
+    }
+    let c = coord(1, 3, "backtick", "separator");
+    type_pinyin(&c, "yougailunma");
+    let act = c.handle_key_event(&key(VK_BACKTICK));
+    assert!(
+        !matches!(act, wind_bridge::handler::KeyAction::Consumed),
+        "反引号是分隔符，不得被整句切换吃掉，实际 {act:?}"
+    );
 }

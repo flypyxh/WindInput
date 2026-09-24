@@ -1059,7 +1059,7 @@ impl MessageHandler for Coordinator {
 
         // ── 整句切换（`schema.pinyin.sentence_cycle_key`）──
         // 同上一段的层级与理由。守卫（配了键 / 普通拼音输入 / 整句池 ≥ 2 条）都在函数内部，
-        // 任一不成立即返回 None —— Tab 出厂是翻页键，池子不足两条时必须原样落回翻页。
+        // 任一不成立即返回 None —— Tab 出厂是高亮下移键，池子不足两条时必须原样落回。
         if let Some(act) = self.try_sentence_cycle_key(data) {
             return act;
         }

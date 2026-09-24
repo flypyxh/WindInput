@@ -601,6 +601,9 @@ pub(crate) struct State {
     /// 整句切换键把显示窗口在池子里滚到了第几条（0 = 原始名次，即解码最优解打头）。
     /// 与 `sentence_pool` 同生命周期，随它一起清零。
     pub(crate) sentence_window: usize,
+    /// 窗口为 0 时的候选列表快照，第一次切换时拍下；每次切换从它重建（见
+    /// `cycle_sentence_window`）。与 `sentence_pool` 同生命周期。
+    pub(crate) sentence_base: Vec<Candidate>,
     /// 出简让全用：本次输入过程中**各级简码位的首选**，下标 0/1/2 = 码长 1/2/3。
     /// 值为 `(该级的码, 首选文本)`——记的是用户**实际看到的**那一条（已过 `apply_filter` /
     /// `apply_freq_rerank` / `apply_shadow`），故天然含调频与候选调整的效果。
@@ -2447,6 +2450,7 @@ impl Coordinator {
                 shadow_code: String::new(),
                 sentence_pool: Vec::new(),
                 sentence_window: 0,
+                sentence_base: Vec::new(),
                 shortcode_tops: [const { None }; 3],
                 candidates: Vec::new(),
                 selected_index: 0,
@@ -7621,10 +7625,14 @@ impl Coordinator {
     /// 整句切换键（`schema.pinyin.sentence_cycle_key`）：在整句池里滚动显示窗口。
     ///
     /// 与英文大小写档位循环同处「候选显示期间生效的快捷键」这一层、同为**临时夺取**：
-    /// 守卫任一不成立即返回 `None`，按键原样落回它本来的语义（Tab 出厂是翻页键）。
+    /// 守卫任一不成立即返回 `None`，按键原样落回它本来的语义（Tab 出厂是高亮下移键）。
     ///
-    /// 守卫：配了键 / 按的就是那个键（含 Shift 位）/ 普通拼音输入态（无 overlay 模式）/
-    /// 有输入 / **整句池 ≥ 2 条**。最后一条是关键：出厂 `sentence_max_count = 1` 时池子恒空，
+    /// 守卫：配了键 / 按的就是那个键（含 Shift 位）/ **不是本方案的手动分隔符、也没被本方案
+    /// `[key_actions]` 绑定** / 普通拼音输入态（无 overlay 模式）/ 有输入 / **整句池 ≥ 2 条**。
+    ///
+    /// 分隔符与方案绑定那条是审查查出的：全拼出厂 `separator = "auto"`，`'` 被选词键占着时
+    /// 反引号就是音节分隔符；用户在设置页把切换键选成反引号，打到 2 个音节以上（池子才非空）
+    /// 分隔符就永远按不进去。这两者在「打拼音中途」有自己的语义，一律让位。最后一条是关键：出厂 `sentence_max_count = 1` 时池子恒空，
     /// 即使用户配了键也不会吃；开了 N-best 但这串输入只解出一种整句时也不吃。
     ///
     /// 切换**不重新转换**：池子是这串输入的完整解码结果，换窗口只是换显示。下一次按键
@@ -7641,6 +7649,14 @@ impl Coordinator {
         if data.key_code != key.vk || (data.modifiers & MOD_SHIFT != 0) != key.shift {
             return None;
         }
+        if !key.shift
+            && (self.manual_separator_key(key.vk)
+                || self
+                    .bound_action_in_schema(key.vk, &self.engine_mgr.active_schema_id())
+                    .is_some())
+        {
+            return None;
+        }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state: &mut State = &mut guard;
         if state.active.is_some() || state.input_buffer.is_empty() || state.sentence_pool.len() < 2
@@ -7649,6 +7665,7 @@ impl Coordinator {
         }
         let first = crate::handle_candidate::cycle_sentence_window(
             &mut state.candidates,
+            &mut state.sentence_base,
             &state.sentence_pool,
             &mut state.sentence_window,
         )?;
@@ -7659,9 +7676,18 @@ impl Coordinator {
         state.current_page = first / per_page;
         state.selected_index = first % per_page;
         self.clear_hover();
+        // 高亮换了 ⇒ 组合区按高亮候选重算（双拼下简拼 / 整句的切法不同，审查查出漏了这步）。
+        // 回传写法同方向键移动高亮（`handle_nav_key`）：只有形态真变了、且编码显示在宿主里时
+        // 才回传组合串，否则吞键即可。
+        let before = state.preedit.clone();
+        self.sync_preedit_to_highlight(state);
+        let composed = (state.preedit != before && self.preedit_in_app_effective()).then(|| {
+            let text = state.preedit.clone();
+            let caret_pos = text.chars().count() as u32;
+            KeyAction::UpdateComposition { text, caret_pos }
+        });
         self.notify_ui_update(state);
-        // `Consumed` = 吞键、组合区不变：用户打的那串码原样留着，只换了候选内容。
-        Some(KeyAction::Consumed)
+        Some(composed.unwrap_or(KeyAction::Consumed))
     }
 
     /// 启动体检：整句切换键被别的功能占着 → 告警（文案同 `warn_english_case_cycle_conflict`
@@ -7675,14 +7701,41 @@ impl Coordinator {
             return;
         };
         let vk = key.vk;
+        // 键配好了、池子却恒空 ⇒ 用户以为开了、实际永远不生效。「键即开关」的初衷就是不要
+        // 第二道闸，而算几条整句事实上成了第二道——至少把它说出来（审查查出）。
+        let p = &rt.config.schema.pinyin;
+        if p.sentence_count.max(p.sentence_max_count) < 2 {
+            warn!(
+                "整句切换键（schema.pinyin.sentence_cycle_key = {:?}）已配置，但 sentence_count 与 \
+                 sentence_max_count 都小于 2，整句池恒空、切换键永远不会生效；要用它请把备选条数调到 ≥2",
+                p.sentence_cycle_key
+            );
+        }
         let mut owners: Vec<&str> = Vec::new();
         if rt.session_keys.classify(vk, key.shift, true).is_some()
-            || rt.schema_session_vks.contains(&vk)
+            || (!key.shift && rt.schema_session_vks.contains(&vk))
         {
-            owners.push("会话动作 / 翻页（keys.session_actions / keys.page_keys）");
+            owners.push(
+                "会话动作 / 高亮 / 翻页（keys.session_actions / highlight_keys / page_keys）",
+            );
         }
-        if rt.jump_out_keys.contains(&vk) {
+        if !key.shift && rt.jump_out_keys.contains(&vk) {
             owners.push("配对跳出键（input.auto_pair.jump_out_keys）");
+        }
+        if !key.shift && rt.english_case_cycle_vk == Some(vk) {
+            owners.push("英文大小写档位循环（input.english_case_cycle_key，它先处理、会先截走）");
+        }
+        // 下两类在夺键时会**让位**（本键不生效），而不是被夺——同样要说出来，否则用户只看到
+        // 「配了切换键没反应」。
+        if !key.shift && self.manual_separator_key(vk) {
+            owners.push("当前方案的音节分隔符（schema.pinyin.separator，本键此时让位给分隔符）");
+        }
+        if !key.shift
+            && self
+                .bound_action_in_schema(vk, &self.engine_mgr.active_schema_id())
+                .is_some()
+        {
+            owners.push("当前方案的 [key_actions] 绑定（本键此时让位给方案绑定）");
         }
         if owners.is_empty() {
             return;

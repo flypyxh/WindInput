@@ -152,6 +152,12 @@ pub(crate) fn place_english_after_common_exact(candidates: &mut Vec<Candidate>, 
 /// 位置钉在词频重排与英文定位**之后**、shadow **之前**：前两者都会重新排序，放它们前面
 /// 就被搅散；shadow 是用户显式的置顶/删除，保留最终话语权。
 ///
+/// ## 已降位的整句不进块
+///
+/// `is_sentence_demoted` = 引擎已让它让位于精确整词（step 6.5：用户把词加进词库、配了高权重，
+/// 首选该换成那个词）。把它拉回块首等于在 N-best 配置下撤销那条修复（审查查出），故块只收
+/// 未降位的；降位的留在原处。
+///
 /// ## 块里至少两条才摆
 ///
 /// 只有一条带名次的整句时（这次解码没出备选、或混输——引擎把混输的拼音子引擎钉成 1/1）
@@ -160,12 +166,13 @@ pub(crate) fn place_english_after_common_exact(candidates: &mut Vec<Candidate>, 
 /// 被拉到码表精确候选前面 —— 判据放在这里而不只靠引擎侧那一处，是因为「块」这个语义
 /// 本身就要求 ≥2，不依赖上游恰好没产出。
 pub(crate) fn place_sentence_block(candidates: &mut Vec<Candidate>, show: usize) {
-    if show <= 1 || candidates.iter().filter(|c| c.sentence_rank > 0).count() < 2 {
+    let in_block = |c: &Candidate| c.sentence_rank > 0 && !c.is_sentence_demoted;
+    if show <= 1 || candidates.iter().filter(|c| in_block(c)).count() < 2 {
         return;
     }
     let (mut block, rest): (Vec<Candidate>, Vec<Candidate>) = std::mem::take(candidates)
         .into_iter()
-        .partition(|c| c.sentence_rank > 0);
+        .partition(|c| in_block(c));
     block.sort_by_key(|c| c.sentence_rank);
     block.extend(rest);
     *candidates = block;
@@ -175,7 +182,7 @@ pub(crate) fn place_sentence_block(candidates: &mut Vec<Candidate>, show: usize)
 ///
 /// 返回换完之后窗口第一条所在的下标（供调用方把高亮落上去）；池子不足两条、或候选里
 /// 根本没有露出的整句时返回 `None` —— 调用方据此**不吃键**，让这个键回到它原本的语义
-/// （Tab 出厂是翻页键）。
+/// （Tab 出厂是高亮下移键）。
 ///
 /// ## 窗口怎么滚
 ///
@@ -193,6 +200,7 @@ pub(crate) fn place_sentence_block(candidates: &mut Vec<Candidate>, show: usize)
 /// 普通候选删掉，免得一屏出现两条同字——两条同字选哪条都一样，留着只是占位。
 pub(crate) fn cycle_sentence_window(
     candidates: &mut Vec<Candidate>,
+    base: &mut Vec<Candidate>,
     pool: &[Candidate],
     window: &mut usize,
 ) -> Option<usize> {
@@ -200,7 +208,11 @@ pub(crate) fn cycle_sentence_window(
     if k < 2 {
         return None;
     }
-    let mut slots: Vec<usize> = candidates
+    // 基底 = 窗口为 0 时的列表，**第一次切换时拍下**（此时后处理——繁体变体展开等——都已
+    // 做完）。每次切换都从基底重建，而不是在当前列表上累积改：累积改的话同文去重删掉的普通
+    // 候选再也回不来，转满一圈也回不到原列表（审查查出）。池子一重填基底就作废（调用方清空）。
+    let src: &[Candidate] = if base.is_empty() { candidates } else { base };
+    let mut slots: Vec<usize> = src
         .iter()
         .enumerate()
         .filter(|(_, c)| c.sentence_rank > 0)
@@ -209,22 +221,29 @@ pub(crate) fn cycle_sentence_window(
     if slots.is_empty() {
         return None;
     }
-    slots.sort_by_key(|&i| candidates[i].sentence_rank);
+    if base.is_empty() {
+        *base = candidates.clone();
+    }
+    slots.sort_by_key(|&i| base[i].sentence_rank);
     slots.truncate(k);
     *window = (*window + 1) % k;
-    for (i, &slot) in slots.iter().enumerate() {
-        let mut incoming = pool[(*window + i) % k].clone();
-        incoming.sentence_rank = (i + 1) as u8;
-        candidates[slot] = incoming;
+    let mut v = base.clone();
+    if *window != 0 {
+        for (i, &slot) in slots.iter().enumerate() {
+            let mut incoming = pool[(*window + i) % k].clone();
+            incoming.sentence_rank = (i + 1) as u8;
+            v[slot] = incoming;
+        }
+        // 同文去重：只删「不在窗口里」的那条。先记下窗口里的文本，再按下标过滤。
+        let window_texts: Vec<String> = slots.iter().map(|&i| v[i].text.clone()).collect();
+        let mut idx = 0usize;
+        v.retain(|c| {
+            let keep = slots.contains(&idx) || !window_texts.contains(&c.text);
+            idx += 1;
+            keep
+        });
     }
-    // 同文去重：只删「不在窗口里」的那条。先记下窗口里的文本，再按下标过滤。
-    let window_texts: Vec<String> = slots.iter().map(|&i| candidates[i].text.clone()).collect();
-    let mut idx = 0usize;
-    candidates.retain(|c| {
-        let keep = slots.contains(&idx) || !window_texts.contains(&c.text);
-        idx += 1;
-        keep
-    });
+    *candidates = v;
     // 去重可能删掉了窗口之前的条目，窗口首条的下标要重新找。
     candidates.iter().position(|c| c.sentence_rank == 1)
 }
@@ -1023,6 +1042,10 @@ impl Coordinator {
         } else {
             None
         };
+        // 混输分段上屏的剩余编码走**独立的拼音方案引擎**（不是混输辅助），拿到的是用户配的
+        // N-best 条数——混输下整句块置顶、切换键夺键都不该出现（引擎侧只把混输辅助钉成 1/1，
+        // 管不到这条路），故在这里一并关掉（审查查出）。
+        let via_mixed_pinyin = pinyin_schema.is_some();
         let result = match pinyin_schema {
             Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
                 self.engine_mgr
@@ -1045,7 +1068,17 @@ impl Coordinator {
         // 同一条规则；全拼/码表/混输恒空串 = 落回击键，行为不变。见 `State::shadow_code`。
         state.shadow_code = result.shadow_code.clone();
         // 整句 N-best 池子（出厂恒空），供整句切换键滚动窗口。见 `State::sentence_pool`。
-        state.sentence_pool = result.sentence_pool.clone();
+        //
+        // 池子一重填，窗口与基底一并作废：本函数也被翻页扩容（`expand_candidates`）调用，列表
+        // 按引擎原序重建、首位回到最优解；窗口序号不清零就与列表错位，下一次切换会跳一格
+        // （审查查出）。代价是扩容会丢掉用户切到的位置——扩容本就少见，一致性优先。
+        state.sentence_pool = if via_mixed_pinyin {
+            Vec::new()
+        } else {
+            result.sentence_pool.clone()
+        };
+        state.sentence_window = 0;
+        state.sentence_base.clear();
         let engine_count = result.candidates.len();
         // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
         let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
@@ -1345,7 +1378,11 @@ impl Coordinator {
         // 理由见 `place_sentence_block`。
         place_sentence_block(
             &mut candidates,
-            usize::from(self.rt().config.schema.pinyin.sentence_count),
+            if via_mixed_pinyin {
+                1
+            } else {
+                usize::from(self.rt().config.schema.pinyin.sentence_count)
+            },
         );
         // Shadow 的取码口与写端 `candidate_op_scope` 同源（见 `shadow_code_of`）——双拼下
         // 是归一后的全拼码，其余恒为击键。⚠️ 与上一行的词频记账**刻意不同域**：那条链有
@@ -1357,6 +1394,17 @@ impl Coordinator {
         // 之后（那是 `apply_freq_rerank` 强加的次序，见下），若不额外让路就会反过来覆盖
         // 用户的调整。`user_pinned` 就是那条让路判据，取值只此一处。
         let mut user_pinned = self.apply_shadow(&mut candidates, &shadow_code);
+        // 整句池走**同一条过滤链**（同补全池的理由）：它直接拷自引擎结果，不过滤的话切换键能
+        // 把用户隐藏掉的整句、被检索范围滤掉的生僻字整句换回来（审查查出）。shadow 的置顶会
+        // 挪动次序，过完按名次排回——池子的顺序就是名次。
+        if !state.sentence_pool.is_empty() {
+            let mut pool = std::mem::take(&mut state.sentence_pool);
+            self.apply_filter(state, &mut pool);
+            self.apply_single_char(state, &mut pool);
+            self.apply_shadow(&mut pool, &shadow_code);
+            pool.sort_by_key(|c| c.sentence_rank);
+            state.sentence_pool = pool;
+        }
         // ── 空码补全收口 ──────────────────────────────────────────────────────
         // 精确匹配模式下「一条候选都没有」时补一条兜底。判据必须落在**最终列表**上：码表引擎
         // 与短语层各自只看得见自己那一半，谁先跑谁就会拿子集的空当成全局的空——引擎抢先补一条，
@@ -1965,6 +2013,7 @@ impl Coordinator {
         state.shadow_code.clear();
         state.sentence_pool.clear();
         state.sentence_window = 0;
+        state.sentence_base.clear();
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
@@ -6570,9 +6619,11 @@ mod sentence_cycle_tests {
         let p = pool(&["甲句", "乙句", "丙句"]);
         let mut v = vec![c("甲句", 1), c("词", 0)];
         let mut w = 0;
+        let mut base = Vec::new();
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let first = cycle_sentence_window(&mut v, &p, &mut w).expect("池子 ≥2 应当切换");
+            let first =
+                cycle_sentence_window(&mut v, &mut base, &p, &mut w).expect("池子 ≥2 应当切换");
             seen.push(v[first].text.clone());
         }
         assert_eq!(seen, vec!["乙句", "丙句", "甲句"], "滚到头回卷");
@@ -6585,13 +6636,14 @@ mod sentence_cycle_tests {
         let p = pool(&["甲句", "乙句", "丙句"]);
         let mut v = vec![c("甲句", 1), c("乙句", 2), c("词", 0)];
         let mut w = 0;
-        cycle_sentence_window(&mut v, &p, &mut w).unwrap();
+        let mut base = Vec::new();
+        cycle_sentence_window(&mut v, &mut base, &p, &mut w).unwrap();
         assert_eq!(texts(&v), vec!["乙句", "丙句", "词"]);
         assert_eq!(
             v.iter().map(|x| x.sentence_rank).collect::<Vec<_>>(),
             vec![1, 2, 0]
         );
-        cycle_sentence_window(&mut v, &p, &mut w).unwrap();
+        cycle_sentence_window(&mut v, &mut base, &p, &mut w).unwrap();
         assert_eq!(texts(&v), vec!["丙句", "甲句", "词"], "窗口回卷");
     }
 
@@ -6600,11 +6652,12 @@ mod sentence_cycle_tests {
     fn pool_below_two_does_not_cycle() {
         let mut v = vec![c("甲句", 1), c("词", 0)];
         let mut w = 0;
+        let mut base = Vec::new();
         assert_eq!(
-            cycle_sentence_window(&mut v, &pool(&["甲句"]), &mut w),
+            cycle_sentence_window(&mut v, &mut base, &pool(&["甲句"]), &mut w),
             None
         );
-        assert_eq!(cycle_sentence_window(&mut v, &[], &mut w), None);
+        assert_eq!(cycle_sentence_window(&mut v, &mut base, &[], &mut w), None);
         assert_eq!(w, 0, "没切换就不该动窗口");
     }
 
@@ -6613,8 +6666,9 @@ mod sentence_cycle_tests {
     fn no_visible_sentence_does_not_cycle() {
         let mut v = vec![c("词", 0)];
         let mut w = 0;
+        let mut base = Vec::new();
         assert_eq!(
-            cycle_sentence_window(&mut v, &pool(&["甲句", "乙句"]), &mut w),
+            cycle_sentence_window(&mut v, &mut base, &pool(&["甲句", "乙句"]), &mut w),
             None
         );
     }
@@ -6625,10 +6679,27 @@ mod sentence_cycle_tests {
         let p = pool(&["甲句", "你好"]);
         let mut v = vec![c("甲句", 1), c("你好", 0), c("词", 0)];
         let mut w = 0;
-        let first = cycle_sentence_window(&mut v, &p, &mut w).unwrap();
+        let mut base = Vec::new();
+        let first = cycle_sentence_window(&mut v, &mut base, &p, &mut w).unwrap();
         assert_eq!(texts(&v), vec!["你好", "词"]);
         assert_eq!(first, 0);
         assert_eq!(v[0].sentence_rank, 1, "留下的是窗口里那条");
+    }
+
+    /// 转满一圈回到原列表：同文去重删掉的普通候选要回来（审查查出：曾在当前列表上累积改，
+    /// 删掉的就再也回不来）。
+    #[test]
+    fn full_round_restores_the_original_list() {
+        let p = pool(&["甲句", "你好"]);
+        let orig = vec![c("甲句", 1), c("你好", 0), c("词", 0)];
+        let mut v = orig.clone();
+        let mut w = 0;
+        let mut base = Vec::new();
+        cycle_sentence_window(&mut v, &mut base, &p, &mut w).unwrap();
+        assert_eq!(texts(&v), vec!["你好", "词"]);
+        cycle_sentence_window(&mut v, &mut base, &p, &mut w).unwrap();
+        assert_eq!(texts(&v), texts(&orig), "转满一圈应回到原列表");
+        assert_eq!(w, 0);
     }
 }
 
