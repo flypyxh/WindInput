@@ -4382,8 +4382,8 @@ impl Coordinator {
         let _ = self.mouse_select_action(page_local);
     }
 
-    /// [`Self::mouse_select`] 的实现，返回主输入路（及临英）实际推送的 KeyAction 供测试断言
-    /// （其余 overlay / `$CC` 命令 / 越界返回 None）。
+    /// [`Self::mouse_select`] 的实现，返回实际推送的 KeyAction 供测试断言
+    /// （`$CC` 命令 / 组折叠 / 越界返回 None）。
     ///
     /// 页内下标 → 绝对下标的换算在此，**页范围校验也在此**：桌面候选窗只画当前页，
     /// 点到页外即为坐标算错，必须拒绝。移动端不是这样（见 [`Self::select_candidate_at`]）。
@@ -4425,7 +4425,7 @@ impl Coordinator {
     /// 分页仍然保留、也仍然有意义：它决定空格上屏的目标与数字键的语义。这里只是把
     /// 「选哪一个」从视图坐标里解放出来。
     ///
-    /// @return 主输入路与临英实际产生的 KeyAction（其余 overlay / `$CC` 命令 / 越界返回 None）
+    /// @return 实际产生的 KeyAction（主输入路与各 overlay 均带出；仅 `$CC` 命令、组折叠、越界返回 None）
     pub(crate) fn select_candidate_at(&self, idx: usize) -> Option<KeyAction> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // 联想候选就住在 `candidates` 里，故本函数**原样适用**——鼠标点选联想词与点选
@@ -4529,20 +4529,34 @@ impl Coordinator {
             return Some(act);
         }
         // ── 以下为 overlay 模式（active != None）路径 ──
-        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
-        if state.candidates[idx].is_group {
-            let code = state.candidates[idx].group_code.clone();
-            self.complete_to_group_code(&mut state, &code);
-            return None;
-        }
-        // 临英：与键盘选词（空格 / 数字键 / 次三选键）走**同一个出口**
-        // `commit_temp_english_selected` —— 补空格按 `input.temp_english.commit_space`、全角态
-        // 补全角空格、记临英词频、退出模式都在那里。此前落到下方通用分支：`commit_candidate`
-        // 拿主路的 `input_buffer`（临英下恒空）判原码，永不补空格；也不记词频、全角态不转。
-        // 返回值照主路一样带出来，`debug_mouse_select` 由此可观测。
-        if state.active == Some(ModeKind::TempEnglish) {
+        // 有候选的 overlay 模式：与键盘选词（空格 / 数字键 / 次三选键）走**同一个出口**，
+        // 与 `select_page_candidate` 的派发逐臂对应（只是这里按绝对下标）：
+        // - 临英 `commit_temp_english_selected`：补空格、全角空格、临英词频；
+        // - 临拼 `commit_temp_pinyin_selected`：**分步转换**（部分匹配并入已转换前缀、留在
+        //   模式内），造词；
+        // - 快捷输入 `mix_select_at`：重复上屏候选不记选词、按透镜分步 / 上屏、6b 与造词；
+        // - 快符 / 生僻字 `commit_special_candidate`：该方案的词频与全码策略。
+        // 此前它们落到下方通用分支：`commit_candidate` 拿主路 `input_buffer`（overlay 下恒空）
+        // 判原码、整串上屏再清空 —— 临拼 / 快捷输入的分步转换被整串丢掉，repeat 候选被当成
+        // 有编码的候选记了选词，临英不补空格。返回值照主路一样带出来（分步时是
+        // `UpdateComposition`，组合区留活），`debug_mouse_select` 由此可观测。
+        let page_local_pos = page_local as i32;
+        let routed = match state.active {
+            Some(ModeKind::TempEnglish) => Some(self.commit_temp_english_selected(&mut state, idx)),
+            Some(ModeKind::TempPinyin) => {
+                let cand = state.candidates[idx].clone();
+                Some(self.commit_temp_pinyin_selected(&mut state, &cand, page_local_pos))
+            }
+            Some(ModeKind::Mix(_)) => Some(self.mix_select_at(&mut state, idx, page_local_pos)),
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+                Some(self.commit_special_candidate(&mut state, idx))
+            }
+            // 网址 / 邮箱 / Unicode：键盘侧不按序号选词（数字是合法字符），鼠标点选仍走
+            // 下方通用分支「整串上屏 + 退出」。
+            _ => None,
+        };
+        if let Some(act) = routed {
             let chinese_mode = state.chinese_mode;
-            let act = self.commit_temp_english_selected(&mut state, idx);
             drop(state);
             match &act {
                 // 空文本上屏：只需让宿主结束 composition（同 $CC 命令分支）。
@@ -4553,6 +4567,16 @@ impl Coordinator {
                 _ => self.push_no_key_ctx_action(&act, chinese_mode),
             }
             return Some(act);
+        }
+        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
+        //
+        // ⚠️ 必须排在上面的模式派发**之后**：`complete_to_group_code` 写的是主路
+        // `input_buffer`、查的是主方案；临拼 / 快捷输入 / 快符的组候选要由各自出口处理
+        // （写本模式缓冲、查本模式方案），先走这里就会串台——主缓冲被写成组码、模式缓冲不动。
+        if state.candidates[idx].is_group {
+            let code = state.candidates[idx].group_code.clone();
+            self.complete_to_group_code(&mut state, &code);
+            return None;
         }
         let text = state.candidates[idx].text.clone();
         let s2t_override = state.candidates[idx].s2t_override.clone();
@@ -4579,10 +4603,13 @@ impl Coordinator {
             "mouse_select: overlay 整串提交 '{}' (page_local={})",
             out, page_local
         );
-        None
+        // 同样带出上屏动作：桌面 `mouse_select` 丢弃返回值只靠上面的 push；移动端
+        // （`candidate_pull`）headless 下 push 无消费端，返回 None 会被当成 passthrough，
+        // 模式退了、文字却没上屏。
+        Some(Self::commit_action(out, chinese_mode))
     }
 
-    /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回主输入路（及临英）实际推送的 KeyAction
+    /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回实际推送的 KeyAction
     /// （`UpdateComposition` = 分步提交，组合区留活；`InsertText` = 整串上屏）。
     pub fn debug_mouse_select(&self, page_local: usize) -> Option<KeyAction> {
         self.mouse_select_action(page_local)
@@ -6767,9 +6794,9 @@ mod mouse_command_overlay_tests {
         }
     }
 
-    /// 生僻字（经 z 夺取进来）里鼠标点**普通候选**：回退登记与编码缓冲不得残留。
-    /// 通用 overlay 分支曾只清 `active` 与临拼 / 临英字段，`rewind` 留着 ⇒ 下次缓冲
-    /// 恰等于残余码时退格会被误判成「退回夺取边界」。
+    /// 生僻字（经 z 夺取进来）里鼠标点**普通候选**：走键盘同一出口
+    /// `commit_special_candidate`，整串上屏并带回动作；回退登记与编码缓冲不得残留
+    /// （`rewind` 留着 ⇒ 下次缓冲恰等于残余码时退格会被误判成「退回夺取边界」）。
     #[test]
     fn rare_char_plain_click_exits_cleanly() {
         let c = coord();
@@ -6788,7 +6815,10 @@ mod mouse_command_overlay_tests {
                 ..Default::default()
             }];
         }
-        let _ = c.select_candidate_at(0);
+        match c.select_candidate_at(0) {
+            Some(KeyAction::InsertText { text, .. }) => assert_eq!(text, "玨"),
+            other => panic!("生僻字点选应带回上屏动作（专用出口），实际: {other:?}"),
+        }
         let st = c.state.lock().unwrap();
         assert_eq!(st.active, None);
         assert!(st.rewind.is_none(), "夺取回退登记不得残留");
@@ -6797,7 +6827,8 @@ mod mouse_command_overlay_tests {
         assert!(st.overlay_spec.is_none(), "overlay 段快照随模式丢弃");
     }
 
-    /// 快捷输入里鼠标点普通候选：`mix_buffer` / 前缀不得残留。
+    /// 快捷输入里鼠标点普通候选（整串消费）：走 `mix_select_at` 上屏，`mix_buffer` /
+    /// 前缀 / 已转换前缀不得残留。
     #[test]
     fn mix_plain_click_exits_cleanly() {
         let c = coord();
@@ -6818,6 +6849,55 @@ mod mouse_command_overlay_tests {
         assert!(st.mix_buffer.is_empty(), "快捷输入缓冲不得残留");
         assert!(st.mix_prefix.is_empty());
         assert!(st.committed_text.is_empty(), "文本透镜的已转换前缀不得残留");
+    }
+
+    /// 临拼里鼠标点**组折叠候选**：由临拼自己的出口展开（补全写进 `temp_pinyin_buffer`），
+    /// 不得先落到通用的 `complete_to_group_code`——那会把组码写进主路 `input_buffer`、
+    /// 查主方案，模式缓冲不动，下一键就串台。
+    #[test]
+    fn temp_pinyin_group_click_expands_in_mode() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::TempPinyin);
+            st.temp_pinyin_buffer = "z".into();
+            st.temp_pinyin_cursor = 1;
+            st.candidates = vec![Candidate {
+                text: "组".into(),
+                is_group: true,
+                group_code: "zzbd".into(),
+                ..Default::default()
+            }];
+        }
+        let _ = c.select_candidate_at(0);
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, Some(ModeKind::TempPinyin), "展开组不退出模式");
+        assert_eq!(st.temp_pinyin_buffer, "zzbd", "组码应写进临拼缓冲");
+        assert!(st.input_buffer.is_empty(), "主路缓冲不得被写入组码");
+    }
+
+    /// Unicode 模式（键盘侧不按序号选词）里鼠标点候选：仍走通用分支「整串上屏 + 退出」，
+    /// 并带回上屏动作——移动端 headless 下 push 无消费端，返回 None 会被当成 passthrough。
+    #[test]
+    fn unicode_plain_click_commits_and_exits() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::Unicode);
+            st.unicode_buffer = "u+4e2d".into();
+            st.unicode_cursor = st.unicode_buffer.len();
+            st.candidates = vec![Candidate {
+                text: "中".into(),
+                ..Default::default()
+            }];
+        }
+        match c.select_candidate_at(0) {
+            Some(KeyAction::InsertText { text, .. }) => assert_eq!(text, "中"),
+            other => panic!("通用分支应带回上屏动作，实际: {other:?}"),
+        }
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.unicode_buffer.is_empty(), "Unicode 缓冲不得残留");
     }
 
     /// 辅助码（从临拼进来）里鼠标点命令候选：overlay 与来源临拼的缓冲一并清掉。

@@ -1722,6 +1722,79 @@ fn mouse_select_two_step_segmentation() {
     assert_eq!(coord.debug_candidate_count(), 0, "两步点选完组合区应清空");
 }
 
+/// 临时拼音里鼠标点子短语：与数字键同为**分步转换**（组合区留活剩余拼音），再点剩余
+/// 那段才整体上屏。
+///
+/// 曾走 overlay 通用分支 `commit_candidate`：整串上屏所点的那个字、剩余拼音直接丢弃。
+#[test]
+fn mouse_select_temp_pinyin_is_stepwise() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // ` 进临拼
+    press_str(&coord, "nihao");
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("temp_pinyin"),
+        "前提：在临拼"
+    );
+    let texts = coord.debug_page_texts();
+    let p_ni = texts
+        .iter()
+        .position(|t| t == "你")
+        .unwrap_or_else(|| panic!("候选应含子短语「你」，实际: {texts:?}"));
+    let step = coord.debug_mouse_select(p_ni).expect("临拼点选应带回动作");
+    assert!(
+        matches!(step, KeyAction::UpdateComposition { .. }),
+        "点子短语应分步（组合区留活），实际: {step:?}"
+    );
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("temp_pinyin"),
+        "分步后仍在临拼"
+    );
+    let texts2 = coord.debug_page_texts();
+    let p_hao = texts2
+        .iter()
+        .position(|t| t == "好")
+        .unwrap_or_else(|| panic!("剩余 hao 的候选应含「好」，实际: {texts2:?}"));
+    match coord.debug_mouse_select(p_hao) {
+        Some(KeyAction::InsertText { text, .. }) => {
+            assert_eq!(text, "你好", "两步点选应整体上屏，不得丢已转换的「你」")
+        }
+        other => panic!("点「好」应上屏，实际: {other:?}"),
+    }
+    assert_eq!(coord.debug_active_mode(), None, "上屏后退出临拼");
+}
+
+/// 快捷输入（拼音成员）里鼠标点子短语：同样分步，不整串上屏丢码。
+#[test]
+fn mouse_select_mix_is_stepwise() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "mix:quick_mix".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0x5A, false); // z 进快捷输入（headless 无 zz* 短语，首键即进）
+    press_str(&coord, "nihao");
+    assert_eq!(coord.debug_active_mode(), Some("mix"), "前提：在快捷输入");
+    let texts = coord.debug_page_texts();
+    let p_ni = texts
+        .iter()
+        .position(|t| t == "你")
+        .unwrap_or_else(|| panic!("候选应含子短语「你」，实际: {texts:?}"));
+    let step = coord
+        .debug_mouse_select(p_ni)
+        .expect("快捷输入点选应带回动作");
+    assert!(
+        matches!(step, KeyAction::UpdateComposition { .. }),
+        "点子短语应分步（组合区留活），实际: {step:?}"
+    );
+    assert_eq!(coord.debug_active_mode(), Some("mix"), "分步后仍在快捷输入");
+}
+
 #[test]
 fn test_schema_switch_via_menu() {
     if !has_schemas() {

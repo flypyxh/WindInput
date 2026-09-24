@@ -1784,6 +1784,16 @@ impl Coordinator {
         if gi >= end {
             return KeyAction::Consumed;
         }
+        self.mix_select_at(state, gi, page_offset as i32)
+    }
+
+    /// 按**绝对下标**选中 mix 候选（[`Self::mix_select`] 的内核）。`pos` 只进统计
+    /// （候选首选率，与数字键的页内序号同一量纲）。鼠标点选 / 移动端候选栏经
+    /// `select_candidate_at` 直接调它——移动端不翻页，下标可以越过当前页。
+    ///
+    /// 前置条件：调用方保证 `gi < state.candidates.len()`（两个调用方都已校验）。
+    pub(crate) fn mix_select_at(&self, state: &mut State, gi: usize, pos: i32) -> KeyAction {
+        debug_assert!(gi < state.candidates.len(), "mix_select_at 越界: {gi}");
         // 重复上屏候选：与空格臂同一条路径（不记选词、不造词）。必须在取 `cand` 之后、
         // 一切记账之前 —— 往下任何一步都会把它当成一条有编码的正常候选。
         if state.mix_repeat {
@@ -1834,7 +1844,7 @@ impl Coordinator {
             self.record_commit(
                 &cand.text,
                 code.len() as u32,
-                page_offset as i32,
+                pos,
                 wind_store::stats::CommitSource::Mix,
             );
             state.committed_segs.push(CommittedSeg {
@@ -1900,7 +1910,7 @@ impl Coordinator {
             self.record_commit(
                 &cand.text,
                 code_len,
-                page_offset as i32,
+                pos,
                 wind_store::stats::CommitSource::Mix,
             );
             // 变体候选末段用覆盖文本；普通候选整体转换（保留 STPhrases 跨段词级消歧）。

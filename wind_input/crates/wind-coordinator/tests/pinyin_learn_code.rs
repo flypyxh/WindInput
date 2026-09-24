@@ -415,3 +415,49 @@ fn fuzzy_sentence_repeat_commit_counts_once() {
         );
     }
 }
+
+/// S2（整句组词使用用户词）：**单个用户词**组成的整句上屏，不得往临时层再复制一份，
+/// 候选页也不得出现同文重复——精确与模糊（c=ch）两种打法都一样。
+///
+/// 设计约定：用户词进整句只影响排序，不产生新词；多词整句（「有盖伦吗」）才照常作为新词
+/// 学进临时层。这条钉的是前者，免得以后改造词路径时把已在用户库的词又学一遍。
+#[test]
+fn s2_single_user_word_sentence_does_not_duplicate() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.ch_c = true;
+    c.schema.pinyin.sentence_uses_user_words = true;
+    let db = std::env::temp_dir().join("wind_learn_code_s2_no_dup.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    const WORD: &str = "菜就多练";
+    store
+        .add_user_word("pinyin", "caijiuduolian", WORD, 1200, 0b10_0100_1001)
+        .unwrap();
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    for input in ["caijiuduolian", "chaijiuduolian", "chaijiuduolian"] {
+        for ch in input.chars() {
+            coord.handle_key_event_policed(&key((ch.to_ascii_uppercase() as u32) & 0xFF));
+        }
+        let page = coord.debug_page_texts();
+        assert_eq!(
+            page.iter().filter(|t| *t == WORD).count(),
+            1,
+            "[{input}] 候选页里「{WORD}」应恰好一条，实际: {page:?}"
+        );
+        assert_eq!(
+            pick(&coord, WORD).as_deref(),
+            Some(WORD),
+            "[{input}] 前提：选中上屏"
+        );
+        assert!(
+            temp_records(&store, WORD).is_empty(),
+            "[{input}] 已在用户库的词不得再写进临时层"
+        );
+    }
+}

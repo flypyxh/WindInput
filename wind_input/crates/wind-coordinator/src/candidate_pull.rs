@@ -86,12 +86,12 @@ impl Coordinator {
     /// 宿主拿到 ops 就执行，不需要 push 通道。此前移动端点选候选靠合成数字键走按键路，
     /// 正是因为桌面的鼠标点选把上屏结果发进 push 管道，而 headless 那头没有消费端。
     ///
-    /// 越界、`$CC` 命令候选、overlay 模式（临拼/快捷输入等）这些**不经主输入路**的
-    /// 情形返回 `passthrough`（`consumed=false`、无 ops）——它们的副作用已在内部完成
-    /// （命令已异步执行、overlay 已整串提交并复位），宿主不该再补一次上屏。
+    /// 主输入路与**所有 overlay 模式**（临英 / 临拼 / 快捷输入 / 快符 / 生僻字走各自的键盘
+    /// 选词出口；网址 / 邮箱 / Unicode 整串上屏）都返回编辑指令，宿主**须**按指令执行
+    /// （分步时是改组合区，整串时是上屏）；内部那次 push 在 headless 下没有消费端，不会重复。
     ///
-    /// **临英例外**：它与主输入路一样走键盘选词出口（`commit_temp_english_selected`），
-    /// 返回编辑指令，宿主**须**按指令上屏；内部那次 push 在 headless 下没有消费端，不会重复。
+    /// 只有越界、`$CC` 命令候选（已异步执行）、组折叠候选（已就地展开）返回 `passthrough`
+    /// （`consumed=false`、无 ops）。
     pub fn select_candidate(&self, index: usize) -> KeyOutcome {
         match self.select_candidate_at(index) {
             Some(action) => edit_ops::to_outcome(action),
