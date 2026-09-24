@@ -50,7 +50,8 @@ fn assert_new_form(text: &str, which: &str) {
 
 #[test]
 fn badge_color_migration_lands_on_disk_via_prune_and_set_user_value() {
-    let tmp = std::env::temp_dir().join("wind_badge_migration_e2e");
+    // 带进程 id：并发会话共享 TMPDIR，固定目录名会互相 remove_dir_all。
+    let tmp = std::env::temp_dir().join(format!("wind_badge_migration_e2e_{}", std::process::id()));
     let root = tmp.join("install");
     let user = tmp.join("UserData");
     let conf = tmp.join("datadir.conf");
@@ -87,6 +88,14 @@ fn badge_color_migration_lands_on_disk_via_prune_and_set_user_value() {
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(text.contains("wubi98"), "本次修改要落盘\n{text}");
     assert_new_form(&text, "set_user_value");
+
+    // ── 三、set_user_value 直接写入旧写法：新传入的值也必须迁移后落盘（旧写法只读不写）──
+    write_at(&user, "config.toml", "");
+    let old: toml::Value =
+        toml::from_str::<toml::Value>(OLD_BADGES).unwrap()["ui"]["langbar"]["badges"].clone();
+    Config::set_user_value(&["ui", "langbar", "badges"], old).unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_new_form(&text, "set_user_value（新传入值）");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

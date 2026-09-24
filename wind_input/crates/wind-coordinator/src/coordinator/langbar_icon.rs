@@ -86,8 +86,9 @@ pub(crate) fn parse_user_text_colors(
 /// - `alpha` 原样透传：`None` = 跟随全局 `badge_alpha`，`Some(1.0)` 会切挖空档。
 ///
 /// 定制层里没迁移的旧写法**只读不写**地兼容：`auto` 同 `""`；`#RRGGBBAA` 的末两位是
-/// 这一条自己的不透明度，优先于 `alpha`（旧写法里它就是那一条的全部意图）。判 8 位只能看
-/// **原字符串的长度**：`parse_hex` 会把 6 位补成 `a = 255`，把「没写」与「写了 FF」抹平。
+/// 这一条自己的不透明度，只在 `alpha` 为 `None` 时采用——与迁移「本层已写 `alpha_x` 则不覆盖」
+/// 同一取舍：显式的新键优先。这一支只在未迁移的数据上走到。判 8 位只能看**原字符串的长度**：
+/// `parse_hex` 会把 6 位补成 `a = 255`，把「没写」与「写了 FF」抹平。
 ///
 /// 解析失败只让色相回落「与主字同色」并记警告，`alpha` 照旧生效——改错一个色值若连带
 /// 不透明度一起打回，用户对不上因果。
@@ -101,11 +102,8 @@ pub(crate) fn badge_color_of(color: &str, alpha: Option<f32>) -> wind_ui::langba
     match wind_theme::palette::parse_hex(t) {
         Some([r, g, b, a]) => BadgeColor {
             rgb: Some([b, g, r]),
-            alpha: if t.trim_start_matches('#').len() == 8 {
-                Some(a as f32 / 255.0)
-            } else {
-                alpha
-            },
+            alpha: alpha
+                .or_else(|| (t.trim_start_matches('#').len() == 8).then_some(a as f32 / 255.0)),
         },
         None => {
             tracing::warn!(value = color, "语言栏角标配色无法解析，按与主字同色处理");
@@ -724,14 +722,19 @@ mod badge_color_tests {
         );
     }
 
-    /// 定制层里没迁移的旧写法仍能读：`auto` 与 8 位色值（后者自带 alpha 优先）。
+    /// 定制层里没迁移的旧写法仍能读：`auto` 与 8 位色值（显式 alpha 键优先）。
     #[test]
     fn badge_color_of_reads_legacy_forms() {
         assert_eq!(badge_color_of("auto", None), BadgeColor::AUTO);
         assert_eq!(badge_color_of(" AUTO ", Some(0.3)).alpha, Some(0.3));
-        let c = badge_color_of("#112233FF", Some(0.5));
+        let c = badge_color_of("#112233FF", None);
         assert_eq!(c.rgb, Some([0x33, 0x22, 0x11]));
-        assert_eq!(c.alpha, Some(1.0), "8 位自带的不透明度优先于 alpha 键");
+        assert_eq!(c.alpha, Some(1.0), "未写 alpha 键时用 8 位自带的不透明度");
+        assert_eq!(
+            badge_color_of("#112233FF", Some(0.5)).alpha,
+            Some(0.5),
+            "显式 alpha 键优先，与迁移的取舍一致"
+        );
     }
 
     #[test]

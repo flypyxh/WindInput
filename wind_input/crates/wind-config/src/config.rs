@@ -8832,8 +8832,6 @@ impl Config {
         // 否则写入 `font_size = 0`（等于出厂值 ⇒ 被剪掉）后，残留的 `follow = false` 会在
         // 下次 load 被迁成 18，用户刚选的「跟随主题」被打回。
         Self::migrate_font_size_follow_theme_value(&mut root);
-        // 角标旧色值同理：整表写回前迁掉，否则旧写法会被原样固化在用户层。
-        Self::migrate_langbar_badge_colors_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -8850,6 +8848,9 @@ impl Config {
                 set_nested(t, path, value);
             }
         }
+        // 角标旧色值：放在 set_nested **之后**，盘上已有的与本次新传入的一并迁掉
+        // （旧写法只读不写）；放在之前则新值里的 `auto` / 8 位色值会原样落盘。
+        Self::migrate_langbar_badge_colors_value(&mut root);
 
         let out = toml::to_string_pretty(&root)?;
         let tmp = file.with_extension("toml.tmp");
