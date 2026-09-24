@@ -1049,6 +1049,12 @@ impl MessageHandler for Coordinator {
             return act;
         }
 
+        // ── 上屏注释 / 拼音（`input.alt_commit`：Alt+数字 / Alt+空格）──
+        // 与上一段同层、同理由：候选热键，须先于下方 Ctrl/Alt 组合的兜底清组合分支。
+        if let Some(act) = self.try_alt_commit(data, numpad_origin) {
+            return act;
+        }
+
         // ── 英文候选大小写档位循环（`input.english_case_cycle_key`）──
         // 与上一段同处「候选窗显示期间生效的快捷键」这一层，理由也相同：五个模式一次接通。
         // 守卫（配了键 / 按的就是那个键 / 英文语境 / 有候选）都在函数内部，任一不成立即返回

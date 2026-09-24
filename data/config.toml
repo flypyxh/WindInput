@@ -579,6 +579,15 @@ commit_newline = "keep"
 #   ⚠️ 被夺取的键在英文输入期间用不出原本的语义(capslock 的大写锁定、tab 的辅助码/配对跳出/
 #      会话动作)，其余时候一律照旧。撞车时启动会告警。
 english_case_cycle_key = ""
+# alt_commit：上屏注释 / 拼音——组合中按 Alt+数字 N 上屏第 N 个候选的拼音或注释，而不是候选字；
+#   Alt+空格 取高亮那条（出厂即首选）。off(出厂) | pinyin | pinyin_plain | comment
+#   pinyin        带调拼音，音节间空格（nǐ hǎo）
+#   pinyin_plain  不带调（ni hao）
+#   comment       候选右侧注释段的原文（按当前注释模板渲染，不截断）
+#   键不可改。只在「中文 + 有候选」时生效，其余时候 Alt+数字（程序菜单加速键）、
+#   Alt+空格（窗口系统菜单）照常归程序。keys.key_actions 里已绑的 Alt 组合优先，本项让位。
+#   候选没有可上屏的内容时什么都不上屏、组合保留（不回落成候选字）。
+alt_commit = "off"
 # 空码（打了码但一个候选都没有，多半是打错了）时，终结键怎么处置这串废码。
 #   enter_behavior           回车          commit | clear
 #   space_on_empty_behavior  空格          commit | clear

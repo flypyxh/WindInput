@@ -4367,6 +4367,83 @@ impl Coordinator {
         Some(KeyAction::Consumed)
     }
 
+    /// 上屏注释 / 拼音（`input.alt_commit`，t138）：Alt+数字 N 上屏当前页第 N 个候选的
+    /// 拼音或注释，Alt+空格 取高亮那条（与空格同一目标，出厂即首选）。
+    ///
+    /// 守卫（任一不成立返回 `None`，按键落回原有语义）：功能开着 / 修饰位**恰为** Alt /
+    /// 不是小键盘改写来的 / 该 Alt 组合没被用户在 `keys.key_actions` 里绑走 / 中文态 + 有候选 +
+    /// 不在快捷加词里。
+    ///
+    /// 结局：
+    /// - 有文本 ⇒ 已确认前缀（拼音分步上屏那段）＋注释一并上屏，整段会话结束（同 Esc 的退出
+    ///   路径）。未被该候选消费的余码随之丢弃——要整句的拼音就选整句候选。**不记词频**：上屏的
+    ///   不是这个词。
+    /// - 没有可上屏的（注释模板为空、查不到读音…）或序号越界 ⇒ 吞键、会话原样保留。
+    ///   **不回落成候选字**：用户按的是「要注释」，给他候选字等于替他做了另一件事。
+    ///
+    /// `numpad_origin`：小键盘 Alt+数字是 Windows 的 Alt 码输入，`numpad_behavior =
+    /// follow_main` 会把它改写成主键盘码，必须在这里排除。
+    pub(crate) fn try_alt_commit(
+        &self,
+        data: &KeyEventData,
+        numpad_origin: bool,
+    ) -> Option<KeyAction> {
+        use wind_config::config::AltCommit;
+        use wind_ipc::protocol::MOD_ALT;
+        if numpad_origin || data.modifiers & wind_config::hotkey::MOD_GENERIC_MASK != MOD_ALT {
+            return None;
+        }
+        let kind = AltCommit::from_config(&self.rt().config.input.alt_commit);
+        if kind == AltCommit::Off {
+            return None;
+        }
+        let page_local = match data.key_code {
+            keymap::VK_SPACE => None,
+            0x30 => Some(9),
+            k @ 0x31..=0x39 => Some((k - 0x31) as usize),
+            _ => return None,
+        };
+        // 用户绑定让位。编译期已不给撞键的组合登记，这里是分派期的同一判据：
+        // 用户的动作在上游 `match_key_down` 段已分派；它因自身守卫没接（返回 None）时，
+        // 也不该被本功能顺手接走。
+        let hash = (MOD_ALT << 16) | data.key_code;
+        if self
+            .rt()
+            .compiled_hotkeys
+            .match_key_down(hash)
+            .is_some_and(|a| !a.is_empty())
+        {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.chinese_mode || state.candidates.is_empty() || state.add_word_active {
+            return None;
+        }
+        let idx = match page_local {
+            None => self
+                .highlighted_global_index(&state)
+                .min(state.candidates.len() - 1),
+            Some(n) => {
+                let (start, end) = self.page_range(&state);
+                if start + n >= end {
+                    return Some(KeyAction::Consumed);
+                }
+                start + n
+            }
+        };
+        let cand = state.candidates[idx].clone();
+        let text = self.alt_commit_text(&state, &cand, kind);
+        if text.is_empty() {
+            debug!("alt_commit: 候选 #{idx} 没有可上屏的内容（{kind:?}），吞键");
+            return Some(KeyAction::Consumed);
+        }
+        let prefix = self.take_committed(&mut state);
+        let mut out = self.maybe_convert(&state, &prefix);
+        out.push_str(&text);
+        let _ = self.cancel_session(&mut state);
+        Some(Self::commit_action(out, true))
+    }
+
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。
     ///
     /// 主输入路（`active == None`）复用键盘选词的 [`Self::commit_selected`]，其返回的 KeyAction

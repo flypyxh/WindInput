@@ -154,6 +154,9 @@ const PUNCT_EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear", "clear_no
 /// 运行时却认它——或者反过来。
 pub(crate) const CODE_HINT_SOURCE_VALUES: &[&str] = &["off", "codetable", "shuangpin", "auto"];
 
+/// `input.alt_commit` 的值域。⚠️ 与 [`wind_config::config::AltCommit::from_config`] 逐项对齐。
+pub(crate) const ALT_COMMIT_VALUES: &[&str] = &["off", "pinyin", "pinyin_plain", "comment"];
+
 const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step", "position"];
 
 /// 前缀补全参与词频位置提升的范围（按语义单元数判定）。
@@ -369,6 +372,7 @@ static REGISTRY: &[ConfigField] = &[
     // 不在本注册表（那是另一份文件的 schema）。
     f("input.commit_newline", Enum(NEWLINE_STYLE_VALUES)),
     f("input.english_case_cycle_key", Str),
+    f("input.alt_commit", Enum(ALT_COMMIT_VALUES)),
     // 检索范围放宽（智能档增强，见 docs/design/smart-filter-scope-relax.md）
     f("input.scope_relax.page_end_key", Bool),
     f("input.scope_relax.prefix", Str),

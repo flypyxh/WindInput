@@ -5990,20 +5990,8 @@ impl Coordinator {
         //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):**无视开关强制显示**
         //    (对齐 Go AddCodeHintsForced)——这些模式本身就是"用拼音反查码表编码",必须出码。
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
-        let force_hint = matches!(
-            state.active,
-            Some(ModeKind::TempPinyin) | Some(ModeKind::Mix(_))
-        );
-        // overlay 反查模式强制放行反查：这些模式本身就是「用拼音反查码表编码」，出不了码
-        // 就失去了意义（对齐 Go AddCodeHintsForced）。
-        // ★ 并集而非替换，见 `CodeHintSource::forcing_reverse` —— 改写成恒 CodeTable 会把
-        // 「只要双拼码」的用户在快捷输入里想看的那一列一并关掉。
-        let configured = self.engine_mgr.code_hint_source();
-        let hint_source = if force_hint {
-            configured.forcing_reverse()
-        } else {
-            configured
-        };
+        let force_hint = Self::forces_code_hint(state);
+        let hint_source = self.comment_hint_source(state);
         let tip_opts = wind_reverse::TooltipOptions {
             code: tip_cfg.code_enabled,
             pinyin: tip_cfg.pinyin_enabled,

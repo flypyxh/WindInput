@@ -173,6 +173,7 @@ const VK_LCONTROL: u32 = 0xA2;
 const VK_RCONTROL: u32 = 0xA3;
 const VK_CAPITAL: u32 = 0x14;
 const VK_TAB: u32 = 0x09;
+const VK_SPACE: u32 = 0x20;
 const VK_PRIOR: u32 = 0x21;
 const VK_NEXT: u32 = 0x22;
 const VK_OEM_1: u32 = 0xBA; // ;
@@ -586,6 +587,34 @@ impl Compiler {
         for tmpl in [&h.pin_candidate, &h.delete_candidate] {
             for entry in compile_number_hotkey(tmpl) {
                 result.key_down.push(entry);
+            }
+        }
+
+        // ── KeyDown：上屏注释 / 拼音（`input.alt_commit`，SESSION policy）──
+        //
+        // Alt+0..9 与 Alt+Space，只带 SESSION 位——与置顶/删除同一档：TSF 只在「中文 + 有会话」
+        // 时吃（`OnTestKeyDown` / `OnKeyDown` 两道闸门都按这个位判），候选可见期间才被
+        // `_RegisterCandidateHotkeys` 抢占成系统热键，其余时候 Alt+数字（宿主菜单加速键）、
+        // Alt+空格（窗口系统菜单）原样归宿主。action 为空＝仅转发，语义在协调器
+        // `try_alt_commit` 分派。
+        //
+        // ★ 必须排在 key_actions 与数字模板**之后**，且撞键就**不登记**：用户在 key_actions
+        // 里绑过的 Alt 组合让位给用户。只靠 `.find()` 先到先得不够——TSF 那侧的白名单是按
+        // 策略位分桶的集合，同一个 hash 同时进 SESSION 桶会改变用户绑定的吃键条件。
+        if crate::config::AltCommit::from_config(&self.config.input.alt_commit)
+            != crate::config::AltCommit::Off
+        {
+            for vk in std::iter::once(VK_SPACE).chain(0x30..=0x39) {
+                let raw = key_hash(MOD_ALT, vk);
+                if result.key_down.iter().any(|e| e.match_hash == raw) {
+                    debug!("input.alt_commit: Alt+0x{vk:02X} 已被其它绑定占用，让位");
+                    continue;
+                }
+                result.key_down.push(HotkeyEntry {
+                    tsf_hash: raw | HOTKEY_POLICY_SESSION,
+                    match_hash: raw,
+                    action: String::new(),
+                });
             }
         }
 
@@ -1908,5 +1937,91 @@ mod tests {
             e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
             "进 overlay 只在中文输入中途有意义"
         );
+    }
+
+    // ── 上屏注释 / 拼音（`input.alt_commit`，C2-6 / t138）──
+
+    fn alt_entries(compiled: &CompiledHotkeys) -> Vec<&HotkeyEntry> {
+        compiled
+            .key_down
+            .iter()
+            .filter(|e| (e.match_hash >> 16) == MOD_ALT)
+            .collect()
+    }
+
+    /// 出厂关：一个 Alt 组合都不进表——Alt+数字 / Alt+空格 原样归宿主（菜单加速键、系统菜单）。
+    #[test]
+    fn alt_commit_off_registers_nothing() {
+        let compiled = Compiler::new(Config::default()).compile();
+        assert!(
+            alt_entries(&compiled).is_empty(),
+            "出厂 alt_commit=off，不该登记任何 Alt 组合"
+        );
+    }
+
+    /// 开启后 Alt+0..9 与 Alt+Space 共 11 个键进 key_down，**只带 SESSION 位**：
+    /// 无会话 / 英文模式一律放行（TSF 两道闸门与 `should_handle_key` 都按这个位判），
+    /// 候选可见期间才由 `_RegisterCandidateHotkeys` 抢占。action 为空＝仅转发，
+    /// 语义在协调器的 `try_alt_commit` 里分派。
+    #[test]
+    fn alt_commit_on_registers_eleven_session_keys() {
+        let mut cfg = Config::default();
+        cfg.input.alt_commit = "pinyin".into();
+        let compiled = Compiler::new(cfg).compile();
+        let alts = alt_entries(&compiled);
+        let mut vks: Vec<u32> = alts.iter().map(|e| e.match_hash & 0xFFFF).collect();
+        vks.sort();
+        let mut want: Vec<u32> = (0x30..=0x39).collect();
+        want.insert(0, VK_SPACE);
+        assert_eq!(vks, want);
+        for e in alts {
+            assert_eq!(
+                e.tsf_hash & 0xF000_0000,
+                HOTKEY_POLICY_SESSION,
+                "只该带 SESSION 位（不能 GLOBAL/CHINESE_ONLY/FORWARD_ONLY）: 0x{:08X}",
+                e.tsf_hash
+            );
+            assert!(e.action.is_empty(), "仅转发登记，action 必须为空");
+            assert_eq!(
+                KeyDownPolicy::from_tsf_hash(e.tsf_hash),
+                KeyDownPolicy::Session
+            );
+        }
+    }
+
+    /// 用户在 `keys.key_actions` 里已绑的 Alt 组合**让位**：本功能不登记那个键，
+    /// 表里只剩用户那条（`.find()` 先到先得的同时，推给 TSF 的策略位也只有一份）。
+    #[test]
+    fn alt_commit_yields_to_user_combo_binding() {
+        let mut cfg = Config::default();
+        cfg.input.alt_commit = "comment".into();
+        cfg.keys
+            .key_actions
+            .insert("alt+3".into(), "toggle_punct".into());
+        let compiled = Compiler::new(cfg).compile();
+        let raw = key_hash(MOD_ALT, 0x33);
+        let hits: Vec<&HotkeyEntry> = compiled
+            .key_down
+            .iter()
+            .filter(|e| e.match_hash == raw)
+            .collect();
+        assert_eq!(hits.len(), 1, "Alt+3 只该有用户那一条");
+        assert_eq!(hits[0].action, "toggle_punct");
+        assert_eq!(alt_entries(&compiled).len(), 11, "其余 10 个照常登记");
+    }
+
+    /// 候选热键槽位（TSF `kHotkeyIdCandidateMax` = 32）装得下「出厂置顶 + 删除 + 本功能」。
+    /// 超出的那些 `_RegisterCandidateHotkeys` 静默 break，退回 OnTestKeyDown 退路。
+    #[test]
+    fn session_hotkeys_fit_candidate_slots_with_alt_commit() {
+        let mut cfg = Config::default();
+        cfg.input.alt_commit = "pinyin".into();
+        let compiled = Compiler::new(cfg).compile();
+        let n = compiled
+            .key_down
+            .iter()
+            .filter(|e| e.tsf_hash & HOTKEY_POLICY_SESSION != 0)
+            .count();
+        assert!(n <= 32, "SESSION 热键 {n} 个，超过 TSF 候选槽位 32");
     }
 }

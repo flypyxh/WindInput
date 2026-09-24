@@ -353,6 +353,23 @@ fn pinyin_text(
     lookup(&c.text, Some(&syls))
 }
 
+/// 去掉拼音声调符号（`nǐ hǎo` → `ni hao`）。`ü` 保留——它是字母不是声调。
+fn strip_tones(s: &str) -> String {
+    s.chars()
+        .map(|ch| match ch {
+            'ā' | 'á' | 'ǎ' | 'à' => 'a',
+            'ē' | 'é' | 'ě' | 'è' => 'e',
+            'ī' | 'í' | 'ǐ' | 'ì' => 'i',
+            'ō' | 'ó' | 'ǒ' | 'ò' => 'o',
+            'ū' | 'ú' | 'ǔ' | 'ù' => 'u',
+            'ǖ' | 'ǘ' | 'ǚ' | 'ǜ' => 'ü',
+            'ń' | 'ň' | 'ǹ' => 'n',
+            'ḿ' => 'm',
+            other => other,
+        })
+        .collect()
+}
+
 /// 「模式 → 注释模板覆盖」映射。**唯一一处**把这层对应关系写死的地方——新增模式只加一行。
 ///
 /// 返回 `None` = 该模式没有覆盖，跟随全局；`Some(s)` = 用 `s`（`s` 可能是空串，
@@ -477,6 +494,81 @@ impl crate::coordinator::Coordinator {
             schema_template_of(behavior, vertical),
             cfg.ui.candidate.comment_template(vertical),
         )
+    }
+
+    /// overlay 反查模式（临时拼音 / 快捷输入）：无视 `code_hint_source` 强制出码。
+    pub(crate) fn forces_code_hint(state: &State) -> bool {
+        matches!(
+            state.active,
+            Some(ModeKind::TempPinyin) | Some(ModeKind::Mix(_))
+        )
+    }
+
+    /// 注释段求值用的编码来源档。候选窗渲染与「上屏注释」（`input.alt_commit`）共用，
+    /// 两处各算一份的话，同一条候选显示的注释与上屏的注释会不一样。
+    ///
+    /// overlay 反查模式强制放行反查：这些模式本身就是「用拼音反查码表编码」，出不了码
+    /// 就失去了意义（对齐 Go AddCodeHintsForced）。
+    /// ★ 并集而非替换，见 `CodeHintSource::forcing_reverse` —— 改写成恒 CodeTable 会把
+    /// 「只要双拼码」的用户在快捷输入里想看的那一列一并关掉。
+    pub(crate) fn comment_hint_source(&self, state: &State) -> CodeHintSource {
+        let configured = self.engine_mgr.code_hint_source();
+        if Self::forces_code_hint(state) {
+            configured.forcing_reverse()
+        } else {
+            configured
+        }
+    }
+
+    /// 「上屏注释 / 拼音」（`input.alt_commit`，t138）要上屏的文本；空串＝这条候选没有可上屏的。
+    ///
+    /// - `Pinyin` / `PinyinPlain`：与注释变量 `${pinyin}` 同一算法（[`pinyin_text`]），后者再去调。
+    /// - `Comment`：当前生效的注释模板（与候选窗同一裁决：模式级 → 方案级 → 全局，排布方向
+    ///   同 `notify_ui_update`）渲染出的原文，**不做显示截断**——截断是候选窗的空间预算，
+    ///   上屏半截注释没有意义。
+    ///
+    /// ⚠️ 调用方持 state 锁；本函数自取一次 `self.reverse` 读锁（同 `notify_ui_update`）。
+    pub(crate) fn alt_commit_text(
+        &self,
+        state: &State,
+        c: &Candidate,
+        kind: wind_config::config::AltCommit,
+    ) -> String {
+        use wind_config::config::AltCommit;
+        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+        let toned = || {
+            pinyin_text(
+                c,
+                |t| self.engine_mgr.word_pinyin_syllables(t),
+                |t, syls| reverse.toned_pinyin_of(t, syls, SYLLABLE_SEP),
+            )
+        };
+        match kind {
+            AltCommit::Off => String::new(),
+            AltCommit::Pinyin => toned(),
+            AltCommit::PinyinPlain => strip_tones(&toned()),
+            AltCommit::Comment => {
+                let rt = self.rt();
+                let behavior = self.engine_mgr.active_behavior();
+                let vertical = self.desired_orientation(state).vertical;
+                let tpl = self.comment_template_for(&rt.config, state, &behavior, vertical);
+                let fallback = self
+                    .effective_data_schema(state)
+                    .unwrap_or_else(|| self.engine_mgr.active_schema_id());
+                let is_mix = matches!(state.active, Some(ModeKind::Mix(_)));
+                let dict_schema = self.comment_dict_scope(state, c, is_mix, &fallback);
+                render(tpl, 0, |name, arg| {
+                    self.eval_var(
+                        name,
+                        arg,
+                        c,
+                        &reverse,
+                        self.comment_hint_source(state),
+                        &dict_schema,
+                    )
+                })
+            }
+        }
     }
 
     /// 渲染该候选的注释段。`vertical` 决定用哪份模板。

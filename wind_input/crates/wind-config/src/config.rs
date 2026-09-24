@@ -1040,6 +1040,37 @@ impl Default for EnglishFrequency {
 /// ★ 改名顺带消解了一处长期的同名冲突：`schema.codetable.show_code_hint` 管的是**码表
 /// 引擎**给前缀候选标剩余编码（敲 `si` 时给 `sikao` 标 `kao`），与本键毫无关系却一直同名。
 /// `docs/design/candidate-comment-layering.md` 把这对同名键记为待办已久。
+/// `input.alt_commit` 的值域：Alt+数字 / Alt+空格 上屏候选的**什么**。
+///
+/// 一个键兼作开关与内容选择（而不是 bool + 内容两键）：关着时内容无意义，两键组合里有一半
+/// 格子是死的；设置页也只需一个下拉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AltCommit {
+    /// 关（出厂）：Alt 组合一个都不登记，原样归宿主。
+    #[default]
+    Off,
+    /// 带调拼音，音节以空格分隔（`nǐ hǎo`）。与注释变量 `${pinyin}` 同一算法。
+    Pinyin,
+    /// 不带调拼音（`ni hao`；ü 保留为 `ü`）。
+    PinyinPlain,
+    /// 候选注释段的渲染结果（当前生效的注释模板，不做显示截断）。
+    Comment,
+}
+
+impl AltCommit {
+    /// 认不出的值按 `Off` 处理——这是一个会抢宿主快捷键的功能，写错不该让它意外开启。
+    ///
+    /// ⚠️ match 臂必须与 `config_schema::ALT_COMMIT_VALUES` 逐项对齐。
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pinyin" => Self::Pinyin,
+            "pinyin_plain" => Self::PinyinPlain,
+            "comment" => Self::Comment,
+            _ => Self::Off,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodeHintSource {
     /// 两种编码都不显示（旧 `show_code_hint = false`）。
@@ -3500,6 +3531,16 @@ pub struct InputConfig {
     /// `Coordinator::warn_english_case_cycle_conflict`。
     #[serde(default)]
     pub english_case_cycle_key: String,
+    /// 上屏注释 / 拼音（t138）：组合中按 **Alt+数字 N** 上屏第 N 个候选的拼音或注释
+    /// 而非候选字本身，**Alt+空格** 取高亮那条（出厂即首选）。键**不可配**，本项同时是开关与
+    /// 内容选择：`off`（出厂）/ `pinyin`（带调）/ `pinyin_plain`（不带调）/ `comment`（候选
+    /// 右侧的注释段原文，不截断）。解析见 [`AltCommit`]。
+    ///
+    /// 冲突处置（排查清单见 `docs/design/alt-commit.md`）：只在「中文 + 有候选」时吃键，
+    /// 其余时候 Alt+数字 / Alt+空格 原样归宿主；`keys.key_actions` 里用户已绑的 Alt 组合
+    /// 一律让位（编译期不登记、分派期不认领）。
+    #[serde(default = "default_alt_commit")]
+    pub alt_commit: String,
     /// 检索范围放宽（智能档增强）。
     #[serde(default)]
     pub scope_relax: ScopeRelaxConfig,
@@ -3674,6 +3715,7 @@ impl Default for InputConfig {
             rare_phrase: default_rare_phrase(),
             commit_newline: default_commit_newline(),
             english_case_cycle_key: String::new(),
+            alt_commit: default_alt_commit(),
             scope_relax: ScopeRelaxConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
@@ -6628,6 +6670,10 @@ fn default_sentence_count() -> u8 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_alt_commit() -> String {
+    "off".to_string()
 }
 
 fn default_numpad_behavior() -> String {
