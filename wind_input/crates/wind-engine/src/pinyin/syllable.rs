@@ -1,4 +1,4 @@
-//! 音节 Trie（~400 个合法拼音音节）
+//! 音节 Trie（414 个合法拼音音节）
 //!
 //! 与 Go 版本 `wind_input/internal/engine/pinyin/syllable_trie.go` 对齐。
 //! 使用 HashMap Trie 实现高效音节边界检测。
@@ -93,7 +93,7 @@ impl SyllableTrie {
     }
 }
 
-/// 标准普通话音节全集（约 410 个，封闭集）。
+/// 标准普通话音节全集（414 个，封闭集）。
 /// 供 SyllableTrie 构建，以及造词时遍历查词典反推单字读音（generate::CharPinyinIndex）。
 pub const STANDARD_SYLLABLES: &[&str] = &[
     "a", "ai", "an", "ang", "ao", "ba", "bai", "ban", "bang", "bao", "bei", "ben", "beng", "bi",
@@ -131,6 +131,25 @@ pub const STANDARD_SYLLABLES: &[&str] = &[
     // 与 Go syllable_trie.go / shuangpin.validPinyinSyllables 对齐补全的稀有音节
     // （双拼转换真值依赖：紫光 ik→shei、ziguang 等；以及 kei/tei/zhei/nun/rua/yo）。
     "kei", "tei", "zhei", "shei", "nun", "rua", "yo",
+    // 词库（rime cn_dicts）里真实出现、且《现代汉语词典》/《通用规范汉字表》收录的稀有音节：
+    // 嗲 dia、塞 sei（口语音 sēi）、𤭢 cei。缺了它们，切分器把 `dia` 错切成 `di|a`；
+    // `sei`/`cei` 切不动 ⇒ 这些字打不出，含它们的临时词过不了晋升校验。
+    // `sei`/`cei` 前面不可能有以 s/c 收尾的音节，`dia` 的新切法只与 `di|a…` 竞争；补表前后
+    // 对拍词库里全部 13552 条含 `dia` 的词，全拼界面首选一条未变。
+    // 已知代价（接受）：双拼里解码到这三个音节的两键组合（小鹤 `dx`/`sw`/`cw`、搜狗 `dw`/
+    // `sz`/`cz` 等）以前解不出音节、落到简拼（东西/所谓/成为…），现在首选是嗲/塞/𤭢。
+    // 这是方案定义本身（小鹤 dx 就是 dia），与 kei/nun/zhei 等既有稀有音节的行为一致。
+    //
+    // 刻意**不收**（词库 41448 / 8105 里有、但不是普通话规范音节）：
+    // - `yai`(崖)：台湾国语读音，普通话读 yá；`lvan`(娈孪挛)：普通话读 luán，lüan 不是
+    //   普通话音节，且补了会破坏 `spelling.rs` 的 ü 归一化穷尽性前提；
+    // - `nia`(娘)、`pia`(啪)、`fong`(甮)、`wong`(𥥈)、`fiao`(覅)：方言 / 象声，《现汉》不作
+    //   普通话音节（fiao 仅标〈方〉）；
+    // - `eh`(诶)：rime 对 ê 的转写，不是《汉语拼音方案》拼式；
+    // - `biang`(𰻝)：不在《通用规范汉字表》。
+    // 另有实测代价：补 `eh`/`wong`/`fong`/`pia` 后，`eh`→「恶化」、`wong`→「我能够」这类
+    // 简拼 / 残码打法整屏只剩一个生僻字。
+    "dia", "sei", "cei",
 ];
 
 impl SyllableTrie {
@@ -206,8 +225,8 @@ impl SyllableTrie {
 /// 含分隔符 `'`、大写字母或非 ASCII 的码一律按「非全拼」处理（不做规范化）：造词写入的码
 /// 恒为小写全拼，出现这些字符说明来源本就不是规范码。
 ///
-/// ⚠️ 标准音节表缺少词库里少数真实音节（`dia` 嗲、`nia`、`pia`、`yai`、`lvan` 等），含这些
-/// 音节的词不会自动晋升；补表另立项（它同时影响这些音节能否被全拼打出来）。
+/// 判据就是 [`STANDARD_SYLLABLES`]：词库里的非规范读音（`yai`/`lvan`/`nia`/`pia`/`eh` 等，
+/// 取舍见该表尾注）不在表内，含它们的词不会自动晋升——与它们本就打不出来一致。
 pub fn is_full_pinyin_code(code: &str, boundary: u64) -> bool {
     static TRIE: std::sync::LazyLock<SyllableTrie> = std::sync::LazyLock::new(SyllableTrie::new);
     if code.is_empty() || !code.is_ascii() {
@@ -322,5 +341,34 @@ mod tests {
         ));
         assert!(!is_full_pinyin_code("", 0));
         assert!(!is_full_pinyin_code("不知道", 0));
+    }
+
+    /// 词库里真实出现、《现代汉语词典》/《通用规范汉字表》收录的稀有音节：
+    /// 嗲 dia、塞 sei（口语音 sēi）、𤭢 cei。缺了它们全拼打不出、含它们的临时词也晋升不了。
+    #[test]
+    fn rare_standard_syllables_are_recognized() {
+        let trie = SyllableTrie::new();
+        for syl in ["dia", "sei", "cei"] {
+            assert!(trie.is_syllable(syl), "{syl} 应是标准音节");
+        }
+        // dia|sheng|dia|qi → 位 0/3/8/11
+        assert!(is_full_pinyin_code("diashengdiaqi", 0b1001_0000_1001));
+        // 边界为 0 时补表前也能按 di|a 切通，这条只防回归
+        assert!(is_full_pinyin_code("diashengdiaqi", 0));
+        assert!(is_full_pinyin_code("dia", 0b1));
+        assert!(is_full_pinyin_code("sei", 0b1));
+        assert!(is_full_pinyin_code("cei", 0));
+    }
+
+    /// 刻意**不**收的读音（取舍理由见 [`STANDARD_SYLLABLES`] 尾部注释）：
+    /// 台湾国语 / 方言音 / 非《汉语拼音方案》拼式。锁住决定，免得被按「词库里有」顺手补进来。
+    #[test]
+    fn nonstandard_readings_stay_out_of_table() {
+        let trie = SyllableTrie::new();
+        for syl in [
+            "yai", "lvan", "nia", "pia", "fong", "eh", "wong", "fiao", "biang",
+        ] {
+            assert!(!trie.is_syllable(syl), "{syl} 不应进标准音节表");
+        }
     }
 }

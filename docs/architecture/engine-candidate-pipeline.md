@@ -192,8 +192,14 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 
 ### 4.1 音节切分
 
-- `SyllableTrie`（syllable.rs）：~417 个标准音节的字节级 Trie，`match_at()` 返回某位置全部可能音节。
-  开了模糊音时还带**第二层**「模糊拼写」（`fuzzy::fuzzy_spellings`，全 11 组共 59 条）：
+- `SyllableTrie`（syllable.rs）：414 个标准音节（`STANDARD_SYLLABLES`）的字节级 Trie，`match_at()` 返回某位置全部可能音节。
+  表内含词库里真实出现的稀有规范音节 `dia`(嗲) / `sei`(塞) / `cei`(𤭢)；词库 41448 里的非普通话读音
+  `yai` / `lvan` / `nia` / `pia` / `eh` / `wong` / `fong` / `fiao` / `biang` **刻意不收**（取舍与实测代价见该表尾注）。
+  音节表只进引擎运行期结构（切分、模糊拼写、双拼反查、造词读音索引），**不进任何落盘缓存**
+  （wdat 的边界取自词库源的空格），改表无需动缓存指纹。补表的代价：双拼里解码到这三个音节的
+  两键组合（小鹤 `dx`/`sw`/`cw` 等）首选从简拼词变成嗲/塞/𤭢；已学的含 dia 用户词边界可能仍按
+  `di|a` 记，仍能命中。
+  开了模糊音时还带**第二层**「模糊拼写」（`fuzzy::fuzzy_spellings`，全 11 组共 59 条；补 `cei` 后 `sei` 转正、新增 `chei`）：
   `tin`/`zuang`/`fui` 这类本身不成音节的错音串在此成为一条可切的边——模糊变体是在切分
   **之后**才逐音节展开的，切不出来就等于整条模糊链路没执行。该层**只影响 `match_at`**，
   `is_syllable`/`is_prefix` 与 `Dag::build_strict` 保持严格（真值判据、造词边界推导用）。

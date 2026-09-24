@@ -1,4 +1,4 @@
-//! 双拼方案覆盖率：**每个内置方案能否打出全部 410 个标准音节**。
+//! 双拼方案覆盖率：**每个内置方案能否打出全部 414 个标准音节**。
 //!
 //! 现有双拼测试（`shuangpin.rs` 34 条）是逐例断言——小鹤 9 条、手道 7 条，
 //! 自然码/搜狗/紫光/微软各 1 条，**abc 一条没有**。逐例测试只能覆盖写测试的人想到的
@@ -7,7 +7,7 @@
 //!
 //! 本文件换一种覆盖方式：**反向枚举**。把全部键对（a-z 及符号键的两两组合）过一遍
 //! `convert`，得到该方案实际能产出的音节集合，再与 `STANDARD_SYLLABLES` 对账。
-//! 一次断言覆盖「目录里的全部方案 × 410 音节」，新增方案自动纳入（方案清单扫目录得来）。
+//! 一次断言覆盖「目录里的全部方案 × 414 音节」，新增方案自动纳入（方案清单扫目录得来）。
 //!
 //! ⚠️ 覆盖率只回答「打不打得出」，不回答「**官方**击键打不打得出」。方案之间零声母
 //! 规则不同（O 引导 vs 首字母引导），抄串了照样全绿 —— 那一层由本文件末尾的
@@ -98,6 +98,17 @@ fn reachable(conv: &ShuangpinConverter) -> HashMap<String, String> {
 /// 是高频音节 —— 这是双拼编码本身的容量限制，不是数据缺失，各家商业方案同样如此。
 const KNOWN_UNREACHABLE: &[&str] = &["lo"];
 
+/// 只在个别方案里打不出的音节（`(方案 id, 音节)`），性质同上：一键双韵母、转换只取第一个合法者。
+///
+/// `shoudao` 的 `dia`：`k` 键配 `["en", "ia"]`，`d`+`k` 的两个解 `den`(扽) / `dia`(嗲) 都是
+/// 合法音节，`den` 在前。`dia` 是后补进标准音节表的（此前任何方案都打不出它），故这不是退化；
+/// 调换韵母顺序只会换成 `den` 打不出。其余方案 `dia` 均可达。
+const KNOWN_UNREACHABLE_IN_LAYOUT: &[(&str, &str)] = &[("shoudao", "dia")];
+
+fn allowed_in(id: &str) -> impl Fn(&str) -> bool + '_ {
+    move |s| KNOWN_UNREACHABLE.contains(&s) || KNOWN_UNREACHABLE_IN_LAYOUT.contains(&(id, s))
+}
+
 /// **门禁**：每个内置方案都必须能打出全部标准音节（白名单除外）。
 ///
 /// 这条断言是本文件存在的理由。它替代不了逐例测试的精确性，但覆盖的是逐例测试
@@ -108,15 +119,15 @@ const KNOWN_UNREACHABLE: &[&str] = &["lo"];
 /// 两处都是「结构就位、数据没填满」，加载测试、逐例测试、真机常用字全都碰不到。
 #[test]
 fn every_layout_covers_all_standard_syllables() {
-    let allow: HashSet<&str> = KNOWN_UNREACHABLE.iter().copied().collect();
     let mut failures = Vec::new();
 
     for id in layouts() {
         let got = reachable(&load(&id));
+        let allowed = allowed_in(&id);
         let mut missing: Vec<&str> = STANDARD_SYLLABLES
             .iter()
             .copied()
-            .filter(|s| !got.contains_key(*s) && !allow.contains(s))
+            .filter(|s| !got.contains_key(*s) && !allowed(s))
             .collect();
         missing.sort_unstable();
         if !missing.is_empty() {
@@ -135,12 +146,26 @@ fn every_layout_covers_all_standard_syllables() {
 /// 缺了这条自检，白名单会随着方案数据修好而悄悄变成一张废纸，还继续豁免着别的东西。
 #[test]
 fn whitelist_entries_are_still_actually_unreachable() {
-    for id in layouts() {
+    let ids = layouts();
+    for (layout, s) in KNOWN_UNREACHABLE_IN_LAYOUT {
+        assert!(
+            ids.iter().any(|id| id == layout),
+            "KNOWN_UNREACHABLE_IN_LAYOUT 的 ({layout}, {s}) 指向不存在的方案"
+        );
+    }
+    for id in ids {
         let got = reachable(&load(&id));
         for s in KNOWN_UNREACHABLE {
             assert!(
                 !got.contains_key(*s),
                 "{id} 现在打得出「{s}」了（击键 {:?}）—— 请把它从 KNOWN_UNREACHABLE 移除",
+                got.get(*s)
+            );
+        }
+        for (_, s) in KNOWN_UNREACHABLE_IN_LAYOUT.iter().filter(|(l, _)| *l == id) {
+            assert!(
+                !got.contains_key(*s),
+                "{id} 现在打得出「{s}」了（击键 {:?}）—— 请把它从 KNOWN_UNREACHABLE_IN_LAYOUT 移除",
                 got.get(*s)
             );
         }
