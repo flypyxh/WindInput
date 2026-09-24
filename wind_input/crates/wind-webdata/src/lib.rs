@@ -2523,12 +2523,36 @@ pub trait WebDataRpc: WebDataHost {
                 }
             }
         }
+        // 最近使用（t63「筛出长期没再输入的」）：词频表里的 last_used 与加入时间取大者。
+        // 只取词频那份不行——从没被选中过的临时词（count==1 那批，正是要清理的主力）
+        // 在词频表里根本没有记录，会全部并列成「从未使用」而丢掉新旧之分。
+        let keys: Vec<(String, String, String)> = all
+            .iter()
+            .map(|w| (schema.to_string(), w.code.clone(), w.text.clone()))
+            .collect();
+        let freq = store.get_freq_batch(&keys)?;
+        let mut all: Vec<(_, i64)> = all
+            .into_iter()
+            .zip(freq)
+            .map(|(w, f)| {
+                let used = f.map_or(0, |f| f.last_used).max(w.created_at);
+                (w, used)
+            })
+            .collect();
+        // 筛选在切片前做：`maxCount` 次数上限、`usedBefore` 最近使用早于该时刻（unix 秒）。
+        let max_count = params.get("maxCount").and_then(|v| v.as_u64());
+        let used_before = params.get("usedBefore").and_then(|v| v.as_i64());
+        all.retain(|(w, used)| {
+            max_count.is_none_or(|n| u64::from(w.count) <= n)
+                && used_before.is_none_or(|t| *used < t)
+        });
         let total = all.len();
-        if let Some((by, desc)) = parse_sort(params, &["code", "text", "count"]) {
-            all.sort_by(|a, b| {
+        if let Some((by, desc)) = parse_sort(params, &["code", "text", "count", "lastUsed"]) {
+            all.sort_by(|(a, au), (b, bu)| {
                 let ord = match by {
                     "count" => a.count.cmp(&b.count),
                     "text" => a.text.cmp(&b.text),
+                    "lastUsed" => au.cmp(bu),
                     _ => a.code.cmp(&b.code),
                 };
                 if desc { ord.reverse() } else { ord }
@@ -2538,9 +2562,9 @@ pub trait WebDataRpc: WebDataHost {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|r| {
+            .map(|(r, used)| {
                 let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
-                json!({ "code": code, "text": ui_text(&r.text), "count": r.count })
+                json!({ "code": code, "text": ui_text(&r.text), "count": r.count, "lastUsed": used })
             })
             .collect();
         Ok(json!({ "items": items, "total": total }))
@@ -4891,6 +4915,86 @@ outside: rare
         }));
         // `women` 那条 boundary 传的是 0（无切分信息），故显示码不插空格。
         assert_eq!(codes(&desc), vec!["women".to_string()], "全局倒序的头一条");
+    }
+
+    /// 临时词筛选（t63）：按次数上限 / 最近使用截止时刻过滤，按最近使用排序；
+    /// 过滤在切片前做，`total` 是过滤后的全集大小（设置端据此翻页、按筛选结果批量删）。
+    #[test]
+    fn temp_list_paged_filters_by_count_and_last_used() {
+        let c = coord("temp_filter");
+        let store = c.user_store().expect("有 store");
+        store
+            .learn_temp_word("pinyin", "haoya", "好呀", 500, 0)
+            .unwrap();
+        store
+            .learn_temp_word("pinyin", "nihao", "你好", 500, 0)
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .learn_temp_word("pinyin", "women", "我们", 500, 0)
+                .unwrap();
+        }
+        let call = |params: Value| c.web_data_rpc("temp.listPaged", &params).unwrap();
+        let texts = |v: &Value| -> Vec<String> {
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|it| it["text"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+
+        // ① 次数上限：count ≤ 1 的只有两条（「我们」学了三次）。
+        let low = call(json!({ "schemaId": "pinyin", "maxCount": 1, "offset": 0, "limit": 1 }));
+        assert_eq!(low["total"], json!(2), "total 须是过滤后的全集而非全表");
+        assert_eq!(texts(&low).len(), 1, "过滤后照样切片");
+
+        // ② 每条都带 lastUsed（无词频记录时回落到加入时间，恒 > 0）。
+        let all = call(json!({ "schemaId": "pinyin", "offset": 0, "limit": 100 }));
+        for it in all["items"].as_array().unwrap() {
+            assert!(
+                it["lastUsed"].as_i64().unwrap_or(0) > 0,
+                "缺 lastUsed：{it}"
+            );
+        }
+
+        // ③ 最近使用截止：截止在未来 ⇒ 全中；截止在很久以前 ⇒ 一条不中。
+        let now = chrono::Utc::now().timestamp();
+        let future = call(
+            json!({ "schemaId": "pinyin", "usedBefore": now + 3600, "offset": 0, "limit": 100 }),
+        );
+        assert_eq!(future["total"], json!(3));
+        let past = call(
+            json!({ "schemaId": "pinyin", "usedBefore": now - 86400, "offset": 0, "limit": 100 }),
+        );
+        assert_eq!(past["total"], json!(0));
+
+        // ④ 词频记录里的最近使用优先于加入时间：选过一次的那条 lastUsed 取词频那份。
+        store.record_freq("pinyin", "nihao", "你好").unwrap();
+        let v = call(json!({ "schemaId": "pinyin", "offset": 0, "limit": 100,
+            "sortBy": "lastUsed", "sortOrder": "desc" }));
+        assert_eq!(texts(&v).len(), 3);
+        let last = |t: &str| {
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|it| it["text"] == json!(t))
+                .unwrap()["lastUsed"]
+                .as_i64()
+                .unwrap()
+        };
+        assert!(
+            last("你好") >= last("好呀"),
+            "词频的最近使用不应早于加入时间"
+        );
+
+        // ⑤ 两个过滤条件取交集。
+        let both = call(
+            json!({ "schemaId": "pinyin", "maxCount": 1, "usedBefore": now - 86400,
+            "offset": 0, "limit": 100 }),
+        );
+        assert_eq!(both["total"], json!(0));
     }
 
     /// 影子规则分页：切片 + total，以及**按显示文本搜索/排序**。
