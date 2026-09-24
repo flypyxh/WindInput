@@ -4892,6 +4892,8 @@ impl EngineManager {
                 in_ing: pg.fuzzy.enabled && pg.fuzzy.in_ing,
                 ian_iang: pg.fuzzy.enabled && pg.fuzzy.ian_iang,
                 uan_uang: pg.fuzzy.enabled && pg.fuzzy.uan_uang,
+                un_ong: pg.fuzzy.enabled && pg.fuzzy.un_ong,
+                eng_ong: pg.fuzzy.enabled && pg.fuzzy.eng_ong,
             };
             let pcfg = PinyinConfig {
                 use_smart_compose: pg.use_smart_compose,

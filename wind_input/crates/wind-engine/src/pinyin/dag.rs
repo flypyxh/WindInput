@@ -574,6 +574,8 @@ mod tests {
             in_ing: true,
             ian_iang: true,
             uan_uang: true,
+            un_ong: true,
+            eng_ong: true,
         }));
 
         for input in [
@@ -585,6 +587,14 @@ mod tests {
             "jisuanji",
             "shengchan",
             "guanli",
+            // eng_ong 的零声母端 `eng`→`ong`：`ong` 若成了可切的边，`xi|ong` 就是一种
+            // 新切分（jiong/qiong 同形）。
+            "xiongdi",
+            "jiongpo",
+            "qiongren",
+            // un_ong：`jun`/`qun`/`xun` 的对端 `jong`/`qong`/`xong` 不是音节。
+            "junren",
+            "xunzhao",
         ] {
             let fuzzy = Dag::build(input, &trie);
             let strict = Dag::build_strict(input, &trie);

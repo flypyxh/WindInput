@@ -23,6 +23,10 @@ pub struct FuzzyConfig {
     pub in_ing: bool,
     pub ian_iang: bool,
     pub uan_uang: bool,
+    /// `un ↔ ong`（`dun`↔`dong`、`yun`↔`yong`）。
+    pub un_ong: bool,
+    /// `eng ↔ ong`（`deng`↔`dong`、`zheng`↔`zhong`）。
+    pub eng_ong: bool,
 }
 
 impl FuzzyConfig {
@@ -42,6 +46,8 @@ impl FuzzyConfig {
             || self.in_ing
             || self.ian_iang
             || self.uan_uang
+            || self.un_ong
+            || self.eng_ong
     }
 }
 
@@ -311,6 +317,22 @@ const FINAL_GROUPS: &[FuzzyGroup] = &[
         b: "uang",
         flag: |c| c.uan_uang,
     },
+    // `ong` 同属下面两组（与声母 `l` 同属 n↔l、r↔l 同形），两组都开时有两个对端。
+    // **不传递**：[`part_options`] 只取与原韵母直接成对的对端，`dun` 不会经 `ong` 走到
+    // `deng`。**按拼写字面配对**：`jun`/`qun`/`xun` 的韵母按字面切成 `un`，对端 `jong` 等非音节由
+    // `VALID_SYLLABLES` 过滤，不映射到 `jiong` 系（iong 韵）；`yun↔yong` 能配上只是 `y` 按声母
+    // 切后字面恰好对上——从发音看它与 jun↔jiong 同类，这个不对称是刻意接受的（与手机输入法
+    // 「un=ong」的字面语义一致）。反向注册的 `jong`/`qong`/`xong` 拼写因此落到军/群/寻。
+    FuzzyGroup {
+        a: "un",
+        b: "ong",
+        flag: |c| c.un_ong,
+    },
+    FuzzyGroup {
+        a: "eng",
+        b: "ong",
+        flag: |c| c.eng_ong,
+    },
 ];
 
 /// 声母表，**按长度降序**（`zh`/`ch`/`sh` 必须先于 `z`/`c`/`s`，否则 `sheng` 会被切成
@@ -402,10 +424,12 @@ fn combo_count(per_syllable: &[Vec<(String, usize)>], limit: usize) -> usize {
 /// 惩罚、排序）沿用既有链路 —— 切出 `tin` 后 [`FuzzyMatcher::fuzzy_variants_scored`]
 /// 因 `check_valid` 为假而宽松放行，照常产出 `ting` 并计 1 处改动，下游无需任何改动。
 ///
-/// ## 两个刻意的边界
+/// ## 三个刻意的边界
 ///
 /// - **只收非法拼写**：产物本身已是合法音节的（`jin`→`jing`、`si`→`shi`）不注册，
 ///   它们本来就切得出来，重复注册只会让 `is_end` 多一份无谓开销。
+/// - **不收零声母拼写**（`eng`→`ong`）：以元音开头的边能接在任何音节后面，会改动
+///   合法输入的切分（`xiongdi` 多出 `xi|ong|di`）。
 /// - **只进切分层，不进 `is_syllable`/`is_prefix`**：后两者是**真值判据**，被双拼真值
 ///   校验（[`shuangpin`](super::shuangpin)）、造词边界推导（[`generate`](super::generate)）
 ///   等复用，让 `tin` 变成「合法音节」会污染它们。
@@ -425,6 +449,12 @@ pub fn fuzzy_spellings(config: &FuzzyConfig) -> Vec<String> {
             for (j, fin) in finals.iter().enumerate() {
                 if i == 0 && j == 0 {
                     continue; // 音节自身
+                }
+                // 零声母的非法拼写不注册：它以元音开头，能接在任何以辅音收尾的前一音节
+                // 后面，`eng`→`ong` 会在 `xi|ong`、`ji|ong` 处凭空多出切分（而没有人用
+                // `ong` 去打「鞥」）。今天只有这一条落在这里。
+                if init.is_empty() {
+                    continue;
                 }
                 let variant = format!("{init}{fin}");
                 if !VALID_SYLLABLES.contains(variant.as_str()) {
@@ -598,7 +628,9 @@ mod tests {
     fn any_enabled_reflects_each_group() {
         assert!(!FuzzyConfig::default().any_enabled(), "默认全关");
         assert!(cfg(|c| c.zh_z = true).any_enabled());
-        assert!(cfg(|c| c.uan_uang = true).any_enabled(), "末位组也须被算上");
+        assert!(cfg(|c| c.uan_uang = true).any_enabled());
+        assert!(cfg(|c| c.un_ong = true).any_enabled());
+        assert!(cfg(|c| c.eng_ong = true).any_enabled(), "末位组也须被算上");
     }
 
     // ------------------------------------------------------------ retroflex_relaxed
@@ -984,6 +1016,166 @@ mod tests {
             out,
             vec![(String::new(), 0)],
             "空音节列表只产出空串，交调用方跳过"
+        );
+    }
+
+    // ------------------------------------------------------------ un_ong / eng_ong
+
+    /// 断言 `from` 在 `c` 下的变体**恰好**是 `expect`（顺序无关）。
+    fn assert_variants(from: &str, c: &FuzzyConfig, expect: &[&str]) {
+        let mut got = FuzzyMatcher::fuzzy_variants(from, c);
+        got.sort();
+        let mut want: Vec<String> = expect.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want, "{from} 的变体");
+    }
+
+    /// `un ↔ ong`：声母后接 un 的音节，凡 ong 那端合法的双向互通。
+    #[test]
+    fn un_ong_pairs_legal_syllables_both_ways() {
+        let c = cfg(|c| c.un_ong = true);
+        for (un, ong) in [
+            ("dun", "dong"),
+            ("tun", "tong"),
+            ("lun", "long"),
+            ("zun", "zong"),
+            ("cun", "cong"),
+            ("sun", "song"),
+            ("zhun", "zhong"),
+            ("chun", "chong"),
+            ("shun", "shong"),
+            ("run", "rong"),
+            ("gun", "gong"),
+            ("kun", "kong"),
+            ("hun", "hong"),
+            ("yun", "yong"),
+        ] {
+            if !VALID_SYLLABLES.contains(ong) {
+                // shong 不是音节：shun 这一对只能被过滤（下一条测试钉住）。
+                continue;
+            }
+            assert_variants(un, &c, &[ong]);
+            assert_variants(ong, &c, &[un]);
+        }
+        // 关着时一条都不出。
+        assert!(FuzzyMatcher::fuzzy_variants("dun", &FuzzyConfig::default()).is_empty());
+    }
+
+    /// `jun`/`qun`/`xun` 的韵母切出来是 `un`（`split_initial_final` 按字面切，不还原 ü），
+    /// 对端 `jong`/`qong`/`xong` 不是音节，须被过滤。**不**映射到 `jiong`/`qiong`/`xiong`
+    /// —— 那是 iong 韵，不属于本组。`shun`→`shong` 同理。
+    #[test]
+    fn un_ong_filters_illegal_counterparts() {
+        let c = cfg(|c| c.un_ong = true);
+        for s in ["jun", "qun", "xun", "shun"] {
+            assert_variants(s, &c, &[]);
+        }
+        // iong 韵不受本组影响（反向也不会产出 jun）。
+        assert_variants("jiong", &c, &[]);
+        assert_variants("xiong", &c, &[]);
+    }
+
+    /// `eng ↔ ong`：只保留两端都合法的；`feng`/`meng`/`peng`/`beng`/`weng` 的对端
+    /// `fong`/`mong`/`pong`/`bong`/`wong` 不是音节，须被过滤。
+    #[test]
+    fn eng_ong_pairs_only_legal_syllables() {
+        let c = cfg(|c| c.eng_ong = true);
+        for (eng, ong) in [
+            ("deng", "dong"),
+            ("teng", "tong"),
+            ("neng", "nong"),
+            ("leng", "long"),
+            ("geng", "gong"),
+            ("keng", "kong"),
+            ("heng", "hong"),
+            ("zeng", "zong"),
+            ("ceng", "cong"),
+            ("seng", "song"),
+            ("zheng", "zhong"),
+            ("cheng", "chong"),
+            ("reng", "rong"),
+        ] {
+            assert_variants(eng, &c, &[ong]);
+            assert_variants(ong, &c, &[eng]);
+        }
+        for s in ["feng", "meng", "peng", "beng", "weng", "sheng", "eng"] {
+            assert_variants(s, &c, &[]);
+        }
+        // yong 的对端 yeng 同样不是音节。
+        assert_variants("yong", &c, &[]);
+    }
+
+    /// `ong` 同属两组（与声母 `l` 同属 n↔l、r↔l 同形）：两组都开时两个对端都出。
+    /// 但**不传递**：只取与原韵母直接成对的对端 —— `dun` 不经 `ong` 走到 `deng`，
+    /// `den` 也不经 `eng` 走到 `dong`。
+    #[test]
+    fn ong_groups_expand_direct_pairs_only() {
+        let all = cfg(|c| {
+            c.en_eng = true;
+            c.un_ong = true;
+            c.eng_ong = true;
+        });
+        assert_variants("dong", &all, &["dun", "deng"]);
+        assert_variants("deng", &all, &["den", "dong"]);
+        assert_variants("dun", &all, &["dong"]);
+        assert_variants("den", &all, &["deng"]);
+
+        // 与声母组交叉：zhong 在 zh_z + un_ong + eng_ong 下 2×3 的笛卡尔积全合法。
+        let c = cfg(|c| {
+            c.zh_z = true;
+            c.un_ong = true;
+            c.eng_ong = true;
+        });
+        let out = FuzzyMatcher::fuzzy_variants_scored("zhong", &c);
+        for (v, k) in [
+            ("zong", 1),
+            ("zhun", 1),
+            ("zheng", 1),
+            ("zun", 2),
+            ("zeng", 2),
+        ] {
+            assert_eq!(
+                out.iter().find(|(s, _)| s == v).map(|(_, n)| *n),
+                Some(k),
+                "zhong→{v} 须计 {k} 处，实际: {out:?}"
+            );
+        }
+        assert_eq!(out.len(), 5, "实际: {out:?}");
+    }
+
+    /// 多音节展开：`dunxi` 在 un_ong 下出 `dongxi`（东西），且守住组合预算。
+    #[test]
+    fn un_ong_expands_within_multi_syllable_code() {
+        let c = cfg(|c| {
+            c.un_ong = true;
+            c.eng_ong = true;
+            c.en_eng = true;
+        });
+        let out = FuzzyMatcher::expand_syllables(&syls(&["dun", "xi"]), &c);
+        assert_eq!(fuzzy_count_of(&out, "dongxi"), Some(1), "实际: {out:?}");
+        // ong 有两个对端 ⇒ 每个 zhong 3 个选项，4 个即 81 > 64，须降级而非放弃。
+        let out = FuzzyMatcher::expand_syllables(&syls(&["zhong"; 4]), &c);
+        assert!(out.len() <= MAX_FUZZY_COMBOS, "{}", out.len());
+        assert_eq!(out[0].0, "zhongzhongzhongzhong");
+        assert!(out.iter().any(|(_, k)| *k == 1));
+    }
+
+    /// 切分层：打的那端不成音节时照样注册（与 `tin`→`ting` 同一机制），
+    /// 但**零声母**的 `ong`（来自 `eng`→`ong`）不注册 —— 它会在 `xi|ong`、`ji|ong`
+    /// 处凭空造出新切分，而没有人会用 `ong` 去打「鞥」。
+    #[test]
+    fn fuzzy_spellings_for_ong_groups() {
+        let un = fuzzy_spellings(&cfg(|c| c.un_ong = true));
+        for s in ["jong", "qong", "xong", "shong"] {
+            assert!(un.contains(&s.to_string()), "{s} 须注册，实际: {un:?}");
+        }
+        let eng = fuzzy_spellings(&cfg(|c| c.eng_ong = true));
+        for s in ["fong", "mong", "pong", "bong", "wong", "yeng"] {
+            assert!(eng.contains(&s.to_string()), "{s} 须注册，实际: {eng:?}");
+        }
+        assert!(
+            !eng.contains(&"ong".to_string()),
+            "零声母 ong 不得注册，实际: {eng:?}"
         );
     }
 }

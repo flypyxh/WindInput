@@ -312,6 +312,9 @@ en_eng = false
 in_ing = false
 ian_iang = false
 uan_uang = false
+# 韵母组（un/eng 与 ong）
+un_ong = false
+eng_ong = false
 
 # 拼音调频（衰减参数；三个数值 0 = 用词频 store 的内置默认）。
 [schema.pinyin.frequency]

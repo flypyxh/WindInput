@@ -312,6 +312,8 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.fuzzy.in_ing", Bool),
     f("schema.pinyin.fuzzy.ian_iang", Bool),
     f("schema.pinyin.fuzzy.uan_uang", Bool),
+    f("schema.pinyin.fuzzy.un_ong", Bool),
+    f("schema.pinyin.fuzzy.eng_ong", Bool),
     f("schema.pinyin.frequency.enabled", Bool),
     f("schema.pinyin.frequency.half_life", Float),
     f("schema.pinyin.frequency.base_scale", Float),

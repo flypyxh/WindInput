@@ -2701,6 +2701,10 @@ pub struct PinyinFuzzy {
     pub ian_iang: bool,
     #[serde(default)]
     pub uan_uang: bool,
+    #[serde(default)]
+    pub un_ong: bool,
+    #[serde(default)]
+    pub eng_ong: bool,
 }
 
 /// 快捷输入的**全局**行为配置。
@@ -11774,6 +11778,12 @@ scripts = { latin = 42 }
         assert_eq!(c.schema.pinyin.separator, "auto");
         assert!(!c.schema.pinyin.fuzzy.enabled);
         assert!(!c.schema.pinyin.fuzzy.zh_z);
+        assert!(!c.schema.pinyin.fuzzy.un_ong, "un_ong 出厂关");
+        assert!(!c.schema.pinyin.fuzzy.eng_ong, "eng_ong 出厂关");
+        // 单写一项只开那一项，另一项保持出厂关。
+        let c = merged_with("[schema.pinyin.fuzzy]\nun_ong = true\n");
+        assert!(c.schema.pinyin.fuzzy.un_ong);
+        assert!(!c.schema.pinyin.fuzzy.eng_ong);
     }
 
     /// `auto_learn.max_word_length` 的默认值必须**两条路一致**：代码默认

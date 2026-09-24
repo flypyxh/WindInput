@@ -315,6 +315,8 @@ fn fuzzy_store_node_cost_on_real_dict() {
         f.in_ing = fz;
         f.ian_iang = fz;
         f.uan_uang = fz;
+        f.un_ong = fz;
+        f.eng_ong = fz;
         c.schema.pinyin.sentence_uses_user_words = s2;
         EngineManager::with_store(&c, Some(&dir), Some(store.clone()))
     };
