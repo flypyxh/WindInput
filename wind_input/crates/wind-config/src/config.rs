@@ -6103,6 +6103,15 @@ pub struct UiFontConfig {
     /// ⛔ 同样不得加 `skip_serializing_if`，理由见 [`Self::fallback`]。
     #[serde(default)]
     pub scripts: BTreeMap<String, Vec<String>>,
+    /// 候选字体的**字重**（100–950，OpenType 口径；0 = 不指定，按常规 / 跟随主题）。
+    ///
+    /// 字重是独立维度而不是写进 `family`：DirectWrite 的 family 名不含字重（「思源宋体」
+    /// 下有七个字重的 face），GDI 时代的「思源宋体 SemiBold」这类名字查不到（看板 A2-1）。
+    /// 存量配置里那种旧名由渲染端解析兼容，名字里的字重在本键为 0 时生效。
+    /// 主题节点显式写的 `font_weight`（如选中加粗）仍胜过本键。
+    /// ⛔ 不得加 `skip_serializing_if`，理由见 [`Self::fallback`]。
+    #[serde(default)]
+    pub weight: i32,
 }
 
 /// 主题配置（[ui.theme]）

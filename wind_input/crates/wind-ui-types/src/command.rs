@@ -156,6 +156,8 @@ pub enum UiCommand {
         fallback: Vec<String>,
         /// `ui.font.scripts`：脚本类名 → 该类的字体链。
         scripts: Vec<(String, Vec<String>)>,
+        /// `ui.font.weight`，0 = 不指定（旧 GDI 字体名里带的字重 / 常规）。
+        weight: i32,
     },
     /// 候选**文字节点**的字族覆盖（方案级 `[candidate] font_family`）；空 = 不覆盖。
     ///

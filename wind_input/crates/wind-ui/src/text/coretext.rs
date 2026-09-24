@@ -135,7 +135,7 @@ impl TextRenderer {
     /// # ⚠️ 此前这里恒返回 `None`
     ///
     /// 理由写的是「先一律不知道，宁可少一条提示也不误报」，而调用方
-    /// （`CandidateWindow::warn_if_family_missing`）的判据是 `== Some(false)`
+    /// （`CandidateWindow::resolve_and_report`）按 `Some(false)` 才判缺失
     /// ⇒ **整条字体缺失告警在 macOS 上空转**：`ui.font.family` / 方案级 `[candidate]
     /// font_family` / 主题节点写错字族名，画面静默回落、日志一个字都没有，而 macOS 上
     /// 写错的概率比 Windows 还高（主题多半是在 Windows 上做的，字体名照抄过来就不存在）。
@@ -154,6 +154,16 @@ impl TextRenderer {
                 .any(|n| n.to_string().eq_ignore_ascii_case(name)),
         )
     }
+
+    /// 按 face 全名找 family：CoreText 侧未实现。旧 GDI face name 是 Windows 设置页的产物，
+    /// macOS 上只靠 `font_resolve` 的剥字重后缀那一步兜底。
+    pub fn find_face(&self, _name: &str) -> Option<(String, i32)> {
+        None
+    }
+
+    /// 全局默认字重（`ui.font.weight`）：**本后端尚未实现**——与节点字重一样被
+    /// [`Self::font_styled`] 忽略（平台限制，见看板 A2-1）。保留接口是为了两平台配置通路一致。
+    pub fn set_default_weight(&mut self, _weight: i32) {}
 
     /// 加载拆字字根字体（TTF）作级联回退；失败返回 Err（不影响普通文本渲染）。
     /// `_family` 为 DWrite 家族名（Windows 侧用），CoreText 直接从字体文件字节建描述符，故忽略。

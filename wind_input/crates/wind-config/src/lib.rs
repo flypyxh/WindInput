@@ -11,6 +11,7 @@ pub mod code_charset;
 pub mod config;
 pub mod config_schema;
 pub mod dir_var;
+pub mod font_name;
 pub mod hotkey;
 pub mod patch;
 pub mod runtime_state;

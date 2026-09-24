@@ -212,7 +212,7 @@ impl RvViews {
     /// 字族名写错在渲染层**没有任何信号**：DirectWrite 的 `SetFontFamilyName` 对不存在的
     /// 家族返回成功、静默回落默认字体，画面上只表现为「字体不对、字看着小了一圈」。
     /// `ui.font.family` 与方案级 `[candidate] font_family` 都已在设置那一刻查一次存在性并
-    /// 记 warn（wind-ui `CandidateWindow::warn_if_family_missing`），主题节点这条一直漏着
+    /// 记 warn（wind-ui `CandidateWindow::resolve_and_report`），主题节点这条一直漏着
     /// ——而主题恰恰最容易写错：作者自己机器上装着那款字体，换台机器就静默回落。
     ///
     /// 消费方只在**换主题时**走一遍（`CandidateWindow::set_theme`），不在渲染热路径：
@@ -236,6 +236,17 @@ impl RvViews {
     pub fn clear_font_families(&mut self) {
         for (_, n) in self.font_nodes_mut() {
             clear_node_font_family(n);
+        }
+    }
+
+    /// 把全部节点（含状态 patch）声明的字族逐个交给 `resolve` 换成渲染端认得的名字。
+    ///
+    /// `resolve` 返回 `(family, 字重)`，字重 `0` = 名字里没带字重。存量主题里的旧 GDI face
+    /// name（「思源宋体 SemiBold」）靠它拆成 family「思源宋体」+ 600（看板 A2-1）：
+    /// 节点**自己没写** `font_weight`（0 = 继承）时才采用名字里的字重，写了的以节点为准。
+    pub fn resolve_font_families(&mut self, mut resolve: impl FnMut(&str) -> (String, i32)) {
+        for (_, n) in self.font_nodes_mut() {
+            resolve_node_font_family(n, &mut resolve);
         }
     }
 
@@ -267,6 +278,27 @@ impl RvViews {
             }
         }
         nodes
+    }
+}
+
+fn resolve_node_font_family(n: &mut RvNode, resolve: &mut dyn FnMut(&str) -> (String, i32)) {
+    if let Some(f) = n
+        .font_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        let (family, weight) = resolve(f);
+        if weight > 0 && n.font_weight == 0 {
+            n.font_weight = weight;
+        }
+        n.font_family = Some(family);
+    }
+    for sub in [&mut n.selected, &mut n.hover, &mut n.disabled]
+        .into_iter()
+        .flatten()
+    {
+        resolve_node_font_family(sub, resolve);
     }
 }
 
@@ -359,6 +391,28 @@ mod font_family_tests {
             v.declared_font_families().is_empty(),
             "清完仍有声明：节点表与告警表不同源"
         );
+    }
+
+    /// 旧 GDI face name 拆出的字重只在节点自己没写字重时采用；状态 patch 同样过一遍。
+    #[test]
+    fn resolve_font_families_rewrites_names_and_fills_only_unset_weights() {
+        let mut v = RvViews {
+            text: node(Some("思源宋体 SemiBold")),
+            ..Default::default()
+        };
+        let mut sel = node(Some("思源宋体 SemiBold"));
+        sel.font_weight = 800;
+        v.item.selected = Some(Box::new(sel));
+        v.resolve_font_families(|f| match f {
+            "思源宋体 SemiBold" => ("思源宋体".to_string(), 600),
+            other => (other.to_string(), 0),
+        });
+        assert_eq!(v.text.font_family.as_deref(), Some("思源宋体"));
+        assert_eq!(v.text.font_weight, 600);
+        let sel = v.item.selected.as_ref().unwrap();
+        assert_eq!(sel.font_family.as_deref(), Some("思源宋体"));
+        assert_eq!(sel.font_weight, 800, "节点显式写的字重不被名字里的字重覆盖");
+        assert_eq!(v.comment.font_family, None, "没声明的节点不凭空长出字族");
     }
 
     /// 没配过字体的主题一条都不该报——否则每次换主题都白查一轮 COM。

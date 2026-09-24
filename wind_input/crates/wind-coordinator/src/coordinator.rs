@@ -4485,6 +4485,7 @@ impl Coordinator {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            weight: font.weight,
         });
     }
 

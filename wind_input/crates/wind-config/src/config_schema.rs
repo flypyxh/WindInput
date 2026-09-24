@@ -601,6 +601,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.font.path", Str),
     f("ui.font.render_mode", Enum(&["directwrite", "gdi"])),
     f("ui.font.fallback", StrList),
+    f("ui.font.weight", Int),
     // 脚本类名 → 该类的字体链。登记为 Map（叶子、不下钻）：`latin`/`cjk` 这些是**数据**
     // 不是配置项，下钻会把 `ui.font.scripts.latin` 当成注册表键去比对。同 `keys.key_actions`。
     f("ui.font.scripts", Map(FONT_SCRIPT_KEYS)),

@@ -1285,6 +1285,8 @@ fallback = []
 # 按脚本单独指派字体：键取 latin/greek/cyrillic/cjk/emoji/digits/punct，值是该类自己的字体链。
 # Windows 上 emoji 类未指派时默认用 Segoe UI Emoji；写 emoji = [] 可取消这条默认指派
 scripts = {}
+# 字重：0=不指定（常规/跟随主题）| 100 极细 … 400 常规 · 500 中等 · 600 半粗 · 700 粗 … 900 黑
+weight = 0
 
 [ui.theme]
 name = "default"

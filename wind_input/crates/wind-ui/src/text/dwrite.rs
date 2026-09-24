@@ -190,6 +190,52 @@ mod imp {
         height: u32,
     }
 
+    /// 读一个 `IDWriteLocalizedStrings` 的全部 `(locale, 名字)`。
+    fn localized(strings: &IDWriteLocalizedStrings) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        unsafe {
+            for i in 0..strings.GetCount() {
+                let loc = strings.GetLocaleNameLength(i).ok().and_then(|len| {
+                    let mut buf = vec![0u16; len as usize + 1];
+                    strings
+                        .GetLocaleName(i, &mut buf)
+                        .ok()
+                        .map(|_| String::from_utf16_lossy(&buf[..len as usize]))
+                });
+                let name = strings.GetStringLength(i).ok().and_then(|len| {
+                    let mut buf = vec![0u16; len as usize + 1];
+                    strings
+                        .GetString(i, &mut buf)
+                        .ok()
+                        .map(|_| String::from_utf16_lossy(&buf[..len as usize]))
+                });
+                if let (Some(l), Some(n)) = (loc, name) {
+                    out.push((l, n));
+                }
+            }
+        }
+        out
+    }
+
+    /// 读字体的某项信息串（全名 / GDI family 名等），没有就是空表。
+    fn informational(
+        font: &IDWriteFont,
+        id: DWRITE_INFORMATIONAL_STRING_ID,
+    ) -> Vec<(String, String)> {
+        unsafe {
+            let mut strings: Option<IDWriteLocalizedStrings> = None;
+            let mut exists = BOOL(0);
+            if font
+                .GetInformationalStrings(id, &mut strings, &mut exists)
+                .is_err()
+                || !exists.as_bool()
+            {
+                return Vec::new();
+            }
+            strings.map(|s| localized(&s)).unwrap_or_default()
+        }
+    }
+
     /// 文本渲染器
     pub struct TextRenderer {
         /// 字体族（宽字符，含结尾 0）
@@ -230,6 +276,9 @@ mod imp {
         /// 行距用。键 = (字号取整, 字重, base family)；与 `measure_cache` 同步清空
         /// （回退链换了度量口径就变）。
         line_heights: RefCell<HashMap<LineProbeKey, (f32, f32)>>,
+        /// 全局默认字重（`ui.font.weight`，或旧 GDI 字体名里带的字重）；0 = 常规 400。
+        /// 承载在 TextFormat 上，叶子字重（主题节点 `font_weight`）非 0 时在 layout 层覆盖它。
+        default_weight: i32,
     }
 
     /// [`TextRenderer::line_heights`] 的键：(字号取整, 字重, base family)。
@@ -273,6 +322,7 @@ mod imp {
                     plan: FontPlan::default(),
                     fallback: RefCell::new(None),
                     fallback_failed: std::cell::Cell::new(false),
+                    default_weight: 0,
                 })
             }
         }
@@ -474,6 +524,97 @@ mod imp {
             }
         }
 
+        /// 按字体 **face** 的名字（GDI family 名 / 全名）在系统字体集里找，返回它所属的
+        /// DirectWrite family 名（本地化名，zh-cn 优先）与该 face 的字重。
+        ///
+        /// 给存量配置里的旧 GDI face name 兜底（看板 A2-1）：「思源宋体 SemiBold」这类
+        /// 剥字重词就能解析的走不到这里（见 `font_resolve::resolve_font_name` 的顺序），
+        /// 这里接的是字重词表之外的写法、以及 family 名与 GDI 名根本不同的字体。
+        ///
+        /// 比对的是字体**自报**的名字，不用 `IDWriteGdiInterop::CreateFontFromLOGFONT`：
+        /// 后者对查不到的名字做 GDI 模糊匹配、返回「最近似」的字体，正是要避免的静默纠错；
+        /// 且 `LOGFONTW.lfFaceName` 只有 31 个字符，长名字会被截断。
+        ///
+        /// ⚠️ 全量遍历系统字体集（几千个 face），只在名字**已确认**不是 family 名时才调，
+        /// 且调用方按名字缓存结果——不在渲染热路径。
+        pub fn find_face(&self, name: &str) -> Option<(String, i32)> {
+            use wind_config::font_name::{font_name_eq, pick_localized_name};
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            unsafe {
+                let mut collection: Option<IDWriteFontCollection> = None;
+                self.factory
+                    .GetSystemFontCollection(&mut collection, false)
+                    .ok()?;
+                let collection = collection?;
+                // (family 名, 字重, 是否斜体)。同一个 GDI 名常对应一组 face（常规/粗/斜），
+                // 取非斜体里最接近常规的那个——用户选的是「这个字体」而不是它的粗体变体。
+                let mut best: Option<(String, i32, bool)> = None;
+                for fi in 0..collection.GetFontFamilyCount() {
+                    let Ok(family) = collection.GetFontFamily(fi) else {
+                        continue;
+                    };
+                    let family_name = || {
+                        family
+                            .GetFamilyNames()
+                            .ok()
+                            .and_then(|n| pick_localized_name(&localized(&n)))
+                    };
+                    for i in 0..family.GetFontCount() {
+                        let Ok(font) = family.GetFont(i) else {
+                            continue;
+                        };
+                        if font.GetSimulations() != DWRITE_FONT_SIMULATIONS_NONE {
+                            continue; // 模拟粗/斜是算出来的，不是一个真实 face
+                        }
+                        let weight = font.GetWeight().0;
+                        let full = informational(&font, DWRITE_INFORMATIONAL_STRING_FULL_NAME);
+                        if full.iter().any(|(_, n)| font_name_eq(n, name)) {
+                            // 全名唯一指向一个 face，直接用。
+                            return family_name().map(|f| (f, weight));
+                        }
+                        let gdi =
+                            informational(&font, DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES);
+                        if gdi.iter().any(|(_, n)| font_name_eq(n, name)) {
+                            let italic = font.GetStyle() != DWRITE_FONT_STYLE_NORMAL;
+                            let better = best.as_ref().is_none_or(|(_, w, it)| {
+                                (italic, (weight - 400).abs()) < (*it, (*w - 400).abs())
+                            });
+                            if better && let Some(f) = family_name() {
+                                best = Some((f, weight, italic));
+                            }
+                        }
+                    }
+                }
+                best.map(|(f, w, _)| (f, w))
+            }
+        }
+
+        /// 设全局默认字重（`ui.font.weight` 或旧字体名里带的字重；0 = 常规）。
+        ///
+        /// 三处缓存都要清：TextFormat 按字号缓存、字重就烧在它里面；测量与行高缓存的键里
+        /// 字重 0 表示「继承默认」，默认一换这些条目记的就是旧字重的宽高。
+        pub fn set_default_weight(&mut self, weight: i32) {
+            if self.default_weight == weight {
+                return;
+            }
+            self.default_weight = weight;
+            self.formats.borrow_mut().clear();
+            self.measure_cache.borrow_mut().clear();
+            self.line_heights.borrow_mut().clear();
+        }
+
+        /// TextFormat 实际承载的字重。
+        fn format_weight(&self) -> i32 {
+            if self.default_weight > 0 {
+                self.default_weight
+            } else {
+                400
+            }
+        }
+
         /// 取（或构建）本方案的自定义字体回退对象。方案不需要回退时返回 `None`——
         /// 不设自定义回退 = 走系统默认回退 = 与升级前逐位等价，故这条路径零回归。
         ///
@@ -621,7 +762,7 @@ mod imp {
                     .CreateTextFormat(
                         PCWSTR(self.family.as_ptr()),
                         None,
-                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_WEIGHT(self.format_weight()),
                         DWRITE_FONT_STYLE_NORMAL,
                         DWRITE_FONT_STRETCH_NORMAL,
                         key as f32,
@@ -675,7 +816,9 @@ mod imp {
                     startPosition: 0,
                     length: probe.len() as u32,
                 };
-                if weight > 0 && weight != 400 {
+                // 与 TextFormat 自带的默认字重比，而不是与 400 比：全局设了 600 时，
+                // 节点显式写的 400 也得真的落下去。
+                if weight > 0 && weight != self.format_weight() {
                     let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT(weight), full);
                 }
                 if let Some(fam) = family {
@@ -758,7 +901,9 @@ mod imp {
                     startPosition: 0,
                     length: wide.len() as u32,
                 };
-                if weight > 0 && weight != 400 {
+                // 与 TextFormat 自带的默认字重比，而不是与 400 比：全局设了 600 时，
+                // 节点显式写的 400 也得真的落下去。
+                if weight > 0 && weight != self.format_weight() {
                     let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT(weight), full);
                 }
                 // 叶子级字族优先，其次方案默认链的链首；都没有就沿用 TextFormat 的全局字族。
@@ -1380,6 +1525,13 @@ mod imp {
         plan: FontPlan,
         /// 被问过存在性的字族名，按提问顺序。见 [`Self::asked_families`]。
         asked_families: std::cell::RefCell<Vec<String>>,
+        /// 测试注入的「系统字体集」：`Some` 时 [`Self::family_exists`] 按它作答，
+        /// 让字体名解析的接线能在 Linux 上测到。见 [`Self::set_mock_families`]。
+        mock_families: Option<Vec<String>>,
+        /// 最近一次 [`Self::set_font_family`] 设进来的字族（接线测试读回）。
+        family: String,
+        /// 最近一次 [`Self::set_default_weight`] 设进来的字重（接线测试读回）。
+        default_weight: i32,
     }
 
     impl TextRenderer {
@@ -1388,7 +1540,34 @@ mod imp {
                 font_size,
                 plan: FontPlan::default(),
                 asked_families: std::cell::RefCell::new(Vec::new()),
+                mock_families: None,
+                family: String::new(),
+                default_weight: 0,
             })
+        }
+
+        /// 测试用：声明 mock 的「系统字体集」。之后 `family_exists` 按它回答 `Some(..)`。
+        pub fn set_mock_families(&mut self, families: &[&str]) {
+            self.mock_families = Some(families.iter().map(|s| s.to_string()).collect());
+        }
+
+        /// 最近一次设进来的全局字族。
+        pub fn font_family(&self) -> &str {
+            &self.family
+        }
+
+        /// 最近一次设进来的全局默认字重。
+        pub fn default_weight(&self) -> i32 {
+            self.default_weight
+        }
+
+        pub fn set_default_weight(&mut self, weight: i32) {
+            self.default_weight = weight;
+        }
+
+        /// mock：没有 face 表可查。
+        pub fn find_face(&self, _name: &str) -> Option<(String, i32)> {
+            None
         }
 
         pub fn base_size(&self) -> f32 {
@@ -1399,7 +1578,9 @@ mod imp {
             self.font_size = size;
         }
 
-        pub fn set_font_family(&mut self, _font_family: &str) {}
+        pub fn set_font_family(&mut self, font_family: &str) {
+            self.family = font_family.to_string();
+        }
 
         /// mock：等宽近似不看字体，只存下来供 `font_plan()` 读回（接线类测试要断言它）。
         pub fn set_font_plan(&mut self, plan: FontPlan) {
@@ -1417,7 +1598,10 @@ mod imp {
         /// 空转了很久没被发现（那边同样恒返回 `None`）。见 [`Self::asked_families`]。
         pub fn family_exists(&self, family: &str) -> Option<bool> {
             self.asked_families.borrow_mut().push(family.to_string());
-            None
+            self.mock_families.as_ref().map(|fs| {
+                fs.iter()
+                    .any(|f| wind_config::font_name::font_name_eq(f, family))
+            })
         }
 
         /// 至今被问过存在性的字族名，按提问顺序。仅 mock 后端有，供接线测试断言

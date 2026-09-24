@@ -372,9 +372,11 @@ impl Forwarder {
                 family,
                 fallback,
                 scripts,
+                weight,
             } => {
                 self.win.set_font_family(&family);
                 self.win.set_font_plan(&family, &fallback, &scripts);
+                self.win.set_font_weight(weight);
             }
             UiCommand::SetCandidateMinSize {
                 width_horizontal,

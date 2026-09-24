@@ -1014,12 +1014,16 @@ impl UiManager {
                         family,
                         fallback,
                         scripts,
+                        weight,
                     } => {
                         // 两步顺序承重：`set_font_family` 换的是 TextFormat 的全局字族，
                         // `set_font_plan` 换的是链与指派，后者的链首必须是前者刚设进去的
                         // 那个字族（空字族回落内置默认的判定在 `resolve_family` 一处）。
                         candidate_window.set_font_family(&family);
                         candidate_window.set_font_plan(&family, &fallback, &scripts);
+                        // 字重排在 `set_font_family` 之后：后者会按新字族名重算「名字里带的
+                        // 字重」，本键非 0 时要压过它。
+                        candidate_window.set_font_weight(weight);
                     }
                     UiCommand::SetCandidateMinSize {
                         width_horizontal,

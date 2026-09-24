@@ -8,6 +8,9 @@ pub mod dwrite;
 // 它的区间表与继承规则要能在 CI 的 Linux test job 上跑到——同 `pua_runs` 的先例。
 pub mod script;
 
+// 配置字体名 → 渲染端 family 的判定顺序（纯逻辑，平台能力以闭包注入），同上理由。
+pub mod font_resolve;
+
 // macOS：CoreText 真字形后端，提供与 dwrite 同契约的 TextRenderer（dwrite.rs 在
 // target_os="macos" 下 re-export 它），让候选窗在 mac 上渲染真实汉字（非 mock 桩）。
 #[cfg(target_os = "macos")]

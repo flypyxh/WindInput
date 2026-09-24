@@ -19,6 +19,7 @@ use crate::sys::{
     WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
 use crate::text::dwrite::{TextRenderer, TextStyle};
+use crate::text::font_resolve::{FontNameSource, ResolvedFont, resolve_font_name};
 use crate::text::script::{FontPlan, ScriptClass};
 use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
 use wind_theme::DEFAULT_ACCENT_BAR_HEIGHT_RATIO;
@@ -332,6 +333,15 @@ pub struct CandidateWindow {
     theme_source: wind_theme::Resolved,
     /// 用户外观字体（`ui.font.family`，已 trim）；空 = 跟随主题节点字族。
     user_font_family: String,
+    /// 用户全局字重（`ui.font.weight`）；0 = 不指定（取 [`Self::family_weight`]，再无则常规）。
+    user_font_weight: i32,
+    /// `ui.font.family` 是旧 GDI face name（「思源宋体 SemiBold」）时从名字里解析出的字重；
+    /// 0 = 名字里没带。见 [`Self::apply_default_weight`]。
+    family_weight: i32,
+    /// 字体名解析缓存（配置名 → 渲染端 family + 字重）。解析可能要全量扫系统字体集，
+    /// 而主题刷新会把同一批名字反复过一遍。每次 `set_font_family`（即配置重载）清空，
+    /// 让新装的字体在下次保存设置后就能被认出来。
+    font_names: RefCell<std::collections::HashMap<String, ResolvedFont>>,
     /// 生效的候选基准字号（逻辑像素）：用户 `ui.candidate.font_size` > 0 时取它，否则主题
     /// `behavior.font_size`。由 [`Self::refresh_effective_theme`] 算出，渲染只读它。
     base_font_logical: f32,
@@ -454,6 +464,9 @@ impl CandidateWindow {
             theme: wind_theme::Resolved::default(),
             theme_source: wind_theme::Resolved::default(),
             user_font_family: String::new(),
+            user_font_weight: 0,
+            family_weight: 0,
+            font_names: RefCell::new(std::collections::HashMap::new()),
             base_font_logical: effective_base_font_size(
                 0.0,
                 wind_theme::Resolved::default().behavior.font_size,
@@ -500,7 +513,7 @@ impl CandidateWindow {
                 self.text_family_override,
                 want
             );
-            self.warn_if_family_missing(&want, "方案级 [candidate] font_family");
+            self.resolve_and_report(&want, "方案级 [candidate] font_family");
         }
         self.text_family_override = want;
         self.refresh_effective_theme();
@@ -786,36 +799,93 @@ impl CandidateWindow {
         out
     }
 
-    /// 配置里写的字族名系统里没有时记一条 warn。
+    /// 把配置里的字体名解析成渲染端认得的 family（+ 名字里带的字重），按名字缓存。
     ///
-    /// # ★ 判据是 `Some(false)`，不是 `!= Some(true)`
+    /// **所有**字体名入口（`ui.font.family` / `fallback` / `scripts`、方案级
+    /// `[candidate] font_family`、主题节点 `font_family`）都走这一个函数，判定顺序见
+    /// [`resolve_font_name`]：原串是 family 就原样用；否则剥掉结尾字重词、再否则按 face 全名
+    /// 查——存量配置里的旧 GDI face name（「思源宋体 SemiBold」）靠这两步自愈（看板 A2-1）。
+    fn resolve_font(&self, name: &str) -> ResolvedFont {
+        let name = name.trim();
+        if let Some(r) = self.font_names.borrow().get(name) {
+            return r.clone();
+        }
+        let r = resolve_font_name(
+            name,
+            |n| self.text_renderer.family_exists(n),
+            |n| self.text_renderer.find_face(n),
+        );
+        self.font_names
+            .borrow_mut()
+            .insert(name.to_string(), r.clone());
+        r
+    }
+
+    /// [`Self::resolve_font`] + 按结果记日志。空名字返回 `None`。
     ///
-    /// [`TextRenderer::family_exists`] 三态：`None` 表示**查不了**（mock 后端、CoreText、
-    /// 或拿不到系统字体集）。把 `None` 也当成缺失会让非 Windows 平台每次设字体都刷一条
-    /// 假 warn——「查不到」与「确实没有」是两件事，只有后者才是用户要看的那条。
+    /// # ★ 缺失的判据是「解析后仍 `Missing`」，不是 `family_exists != Some(true)`
     ///
-    /// `source` 写配置键的**全名**：用户看到 warn 后要能直接去改那一项，
-    /// 而三个来源（全局主字体 / 回退链 / 方案级）改的是三个不同的地方。
-    fn warn_if_family_missing(&self, family: &str, source: &str) {
+    /// `Unknown` 表示**查不了**（mock 后端、或拿不到系统字体集）。把它也当成缺失会让
+    /// 非 Windows 平台每次设字体都刷一条假 warn——「查不到」与「确实没有」是两件事。
+    ///
+    /// `source` 写配置键的**全名**：用户看到日志后要能直接去改那一项，
+    /// 而几个来源（全局主字体 / 回退链 / 方案级 / 主题节点）改的是不同的地方。
+    fn resolve_and_report(&self, family: &str, source: &str) -> Option<ResolvedFont> {
         let name = family.trim();
         if name.is_empty() {
-            return;
+            return None;
         }
-        if self.text_renderer.family_exists(name) == Some(false) {
-            tracing::warn!(
+        let r = self.resolve_font(name);
+        match r.source {
+            FontNameSource::Missing => tracing::warn!(
                 "{source} 指定的字体「{name}」不在系统字体集里，已被静默回落到默认字体——\
-                 请确认填的是字体的**家族名**（如 Mongolian Baiti），DirectWrite 不认字体全名与文件名"
-            );
+                 请确认填的是字体的**家族名**（如 Mongolian Baiti），DirectWrite 不认文件名"
+            ),
+            FontNameSource::WeightSuffix | FontNameSource::FaceName => tracing::info!(
+                "{source} 的字体名「{name}」是旧式（GDI）字体名，已按家族「{}」+ 字重 {} 解析——\
+                 在设置页重新选一次字体与字重即可换成新写法",
+                r.family,
+                r.weight
+            ),
+            FontNameSource::Exact | FontNameSource::Unknown => {}
         }
+        Some(r)
     }
 
     /// 设置候选字体族（来自 ui.font.family；空=默认 [`DEFAULT_FONT_FAMILY`]）。
     pub fn set_font_family(&mut self, family: &str) {
-        let resolved = resolve_font_family(family);
-        self.warn_if_family_missing(resolved, "ui.font.family");
-        self.text_renderer.set_font_family(resolved);
+        // 配置重载的入口：清掉解析缓存，新装 / 卸掉的字体在这之后才会被重新判定。
+        self.font_names.borrow_mut().clear();
+        let name = resolve_font_family(family);
+        let r = self
+            .resolve_and_report(name, "ui.font.family")
+            .unwrap_or_else(|| ResolvedFont {
+                family: name.to_string(),
+                weight: 0,
+                source: FontNameSource::Unknown,
+            });
+        self.text_renderer.set_font_family(&r.family);
+        self.family_weight = r.weight;
+        self.apply_default_weight();
         self.user_font_family = family.trim().to_string();
         self.refresh_effective_theme();
+    }
+
+    /// 设置全局字重（来自 `ui.font.weight`；0 = 不指定）。
+    pub fn set_font_weight(&mut self, weight: i32) {
+        self.user_font_weight = weight.max(0);
+        self.apply_default_weight();
+    }
+
+    /// 渲染器默认字重：用户 `ui.font.weight` > 旧字体名里带的字重 > 常规。
+    /// 主题节点显式的 `font_weight`（含「选中加粗」）在 layout 层仍胜过它。
+    fn apply_default_weight(&mut self) {
+        let w = if self.user_font_weight > 0 {
+            self.user_font_weight
+        } else {
+            self.family_weight
+        };
+        self.text_renderer.set_default_weight(w);
     }
 
     /// 设置候选字体的回退链与按脚本的字体指派（来自 `ui.font.fallback` / `ui.font.scripts`）。
@@ -831,15 +901,31 @@ impl CandidateWindow {
         fallback: &[String],
         scripts: &[(String, Vec<String>)],
     ) {
-        for f in fallback {
-            self.warn_if_family_missing(f, "ui.font.fallback");
-        }
-        for (key, chain) in scripts {
-            for f in chain {
-                self.warn_if_family_missing(f, &format!("ui.font.scripts.{key}"));
-            }
-        }
-        let plan = build_font_plan(family, fallback, scripts);
+        // 链里每一项都换成解析后的 family：链首必须与 `set_font_family` 设进 TextFormat 的
+        // 那个名字逐字相同（`AddMapping` 靠 baseFamilyName 认段），故链首也走同一个解析。
+        // 回退链与脚本指派表达不了字重，名字里带的字重在这里丢弃（日志里已说明是旧名）。
+        let family = self.resolve_font(resolve_font_family(family)).family;
+        let fallback: Vec<String> = fallback
+            .iter()
+            .map(|f| {
+                self.resolve_and_report(f, "ui.font.fallback")
+                    .map_or_else(|| f.clone(), |r| r.family)
+            })
+            .collect();
+        let scripts: Vec<(String, Vec<String>)> = scripts
+            .iter()
+            .map(|(key, chain)| {
+                let chain = chain
+                    .iter()
+                    .map(|f| {
+                        self.resolve_and_report(f, &format!("ui.font.scripts.{key}"))
+                            .map_or_else(|| f.clone(), |r| r.family)
+                    })
+                    .collect();
+                (key.clone(), chain)
+            })
+            .collect();
+        let plan = build_font_plan(&family, &fallback, &scripts);
         // 出厂注入的 emoji 指派（见 `build_font_plan`）不在用户的 `scripts` 里，上面的循环
         // 查不到它；精简过的 Windows 镜像缺 Segoe UI Emoji 时，用户得知道是哪一项在回落。
         if !scripts
@@ -847,7 +933,7 @@ impl CandidateWindow {
             .any(|(k, _)| ScriptClass::from_key(k) == Some(ScriptClass::Emoji))
             && plan.chain_for(Some(ScriptClass::Emoji)) == [DEFAULT_EMOJI_FAMILY]
         {
-            self.warn_if_family_missing(DEFAULT_EMOJI_FAMILY, "ui.font.scripts.emoji（出厂默认）");
+            self.resolve_and_report(DEFAULT_EMOJI_FAMILY, "ui.font.scripts.emoji（出厂默认）");
         }
         self.text_renderer.set_font_plan(plan);
     }
@@ -1078,6 +1164,12 @@ impl CandidateWindow {
             self.checked_theme_families = declared;
         }
         apply_scheme_text_font(&mut t.views, &self.text_family_override);
+        // 主题节点与方案级字族换成渲染端认得的名字（旧 GDI face name → family + 字重）。
+        // 缓存已由上面的告警检查填好，这里不会再问一遍字体集。
+        t.views.resolve_font_families(|f| {
+            let r = self.resolve_font(f);
+            (r.family, r.weight)
+        });
         self.base_font_logical =
             effective_base_font_size(self.font_size_override, t.behavior.font_size);
         // 渲染器的基准字号也要跟上：没显式带字号的节点回落到它（`View` 取 `tr.base_size()`），
@@ -1087,7 +1179,7 @@ impl CandidateWindow {
         self.theme = t;
     }
 
-    /// 主题各节点声明的字族逐个查一次存在性，缺的记 warn。见 [`Self::warn_if_family_missing`]。
+    /// 主题各节点声明的字族逐个查一次存在性，缺的记 warn。见 [`Self::resolve_and_report`]。
     ///
     /// 全局 `ui.font.family` 与方案级 `[candidate] font_family` 早有这道查，主题节点一直漏着
     /// ——而主题是最容易写错的那处：作者自己机器上装着那款字体，换台机器就静默回落，
@@ -1102,7 +1194,7 @@ impl CandidateWindow {
         let mut seen = std::collections::HashSet::new();
         for (path, family) in declared {
             if seen.insert(family.clone()) {
-                self.warn_if_family_missing(family, &format!("主题节点 {path}.font_family"));
+                self.resolve_and_report(family, &format!("主题节点 {path}.font_family"));
             }
         }
     }
@@ -6132,6 +6224,78 @@ mod theme_font_check_tests {
         let before = w.text_renderer.asked_families().len();
         w.set_theme(wind_theme::Resolved::default());
         assert_eq!(w.text_renderer.asked_families().len(), before);
+    }
+}
+
+/// 字体名解析的接线（看板 A2-1）：旧 GDI face name 在**每个**字体入口都换成 family + 字重。
+///
+/// 只在 mock 后端下编译，理由同上：它靠 `set_mock_families` 注入「系统字体集」。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod font_name_resolve_tests {
+    use super::*;
+
+    fn win() -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.text_renderer.set_mock_families(&[
+            "思源宋体",
+            "霞鹜文楷",
+            "Consolas",
+            DEFAULT_FONT_FAMILY,
+        ]);
+        w
+    }
+
+    #[test]
+    fn legacy_global_family_becomes_family_plus_default_weight() {
+        let mut w = win();
+        w.set_font_family("思源宋体 SemiBold");
+        assert_eq!(w.text_renderer.font_family(), "思源宋体");
+        assert_eq!(w.text_renderer.default_weight(), 600);
+        // 回退链的链首必须与 TextFormat 的字族逐字相同，否则 AddMapping 认不出段。
+        w.set_font_plan("思源宋体 SemiBold", &["霞鹜文楷 Medium".to_string()], &[]);
+        assert_eq!(
+            w.text_renderer.font_plan().chain_for(None),
+            ["思源宋体".to_string(), "霞鹜文楷".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_weight_beats_the_weight_in_the_name() {
+        let mut w = win();
+        w.set_font_family("思源宋体 SemiBold");
+        w.set_font_weight(300);
+        assert_eq!(w.text_renderer.default_weight(), 300);
+        w.set_font_weight(0);
+        assert_eq!(
+            w.text_renderer.default_weight(),
+            600,
+            "0 = 回到名字里的字重"
+        );
+        w.set_font_family("思源宋体");
+        assert_eq!(w.text_renderer.default_weight(), 0, "新写法不带字重");
+    }
+
+    #[test]
+    fn a_correct_family_name_is_passed_through_untouched() {
+        let mut w = win();
+        w.set_font_family("Consolas");
+        assert_eq!(w.text_renderer.font_family(), "Consolas");
+        assert_eq!(w.text_renderer.default_weight(), 0);
+    }
+
+    #[test]
+    fn theme_and_scheme_families_go_through_the_same_resolution() {
+        let mut w = win();
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.comment.font_family = Some("霞鹜文楷 Medium".to_string());
+        w.set_theme(theme);
+        w.set_text_family_override("思源宋体 SemiBold");
+        let v = &w.theme.views;
+        assert_eq!(v.comment.font_family.as_deref(), Some("霞鹜文楷"));
+        assert_eq!(v.comment.font_weight, 500);
+        assert_eq!(v.text.font_family.as_deref(), Some("思源宋体"));
+        assert_eq!(v.text.font_weight, 600);
     }
 }
 
