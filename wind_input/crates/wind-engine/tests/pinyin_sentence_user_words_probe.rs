@@ -319,6 +319,7 @@ fn fuzzy_store_node_cost_on_real_dict() {
         EngineManager::with_store(&c, Some(&dir), Some(store.clone()))
     };
     let configs = [
+        ("出厂", mk(false, false)),
         ("模糊全开+S2", mk(true, true)),
         ("模糊全开,S2关", mk(true, false)),
         ("模糊关+S2", mk(false, true)),

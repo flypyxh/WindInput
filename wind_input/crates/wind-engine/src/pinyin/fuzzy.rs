@@ -504,6 +504,22 @@ impl FuzzyMatcher {
     /// 逐个累加，即概率域按改动处数**累乘 0.5**。我们此前两处惩罚（词图 −0.5、候选层
     /// ×0.01）都是**一次性固定值**，`beijinsi`（2 处模糊）与 `si`（1 处）同等对待。
     pub fn expand_syllables(syllables: &[String], config: &FuzzyConfig) -> Vec<(String, usize)> {
+        Self::expand_syllables_masked(syllables, config)
+            .into_iter()
+            .map(|(code, edits, _)| (code, edits))
+            .collect()
+    }
+
+    /// [`Self::expand_syllables`] 外加每个变体码**自己的音节边界**（各音节起始字节位，
+    /// 与词典 / store 的 `boundary` 同域）。展开与降级逻辑是同一份，只多记一个位掩码。
+    ///
+    /// 变体音节与原音节码长可以不同（`zong`→`zhong`），变体码的边界没法从原码切分推出。
+    /// 用途：整句词图的系统词模糊节点要带规范码 + 规范边界（`LatticeNode::canon`），
+    /// 词条自己没边界时就用这份。起始位 ≥ 64 的音节不记位。
+    pub fn expand_syllables_masked(
+        syllables: &[String],
+        config: &FuzzyConfig,
+    ) -> Vec<(String, usize, u64)> {
         let per_syllable: Vec<Vec<(String, usize)>> = syllables
             .iter()
             .map(|s| {
@@ -520,22 +536,35 @@ impl FuzzyMatcher {
             limit -= 1;
         }
 
-        // 元素为 (码, 累计改动处数, 已模糊的音节数)——后者仅用于按 `limit` 剪枝。
-        let mut codes: Vec<(String, usize, usize)> = vec![(String::new(), 0, 0)];
+        // 元素为 (码, 累计改动处数, 已模糊的音节数, 边界位掩码)——第三项仅用于按 `limit` 剪枝。
+        let mut codes: Vec<(String, usize, usize, u64)> = vec![(String::new(), 0, 0, 0)];
         for opts in &per_syllable {
-            let mut next: Vec<(String, usize, usize)> = Vec::with_capacity(codes.len());
-            for (prefix, edits, fuzzy_syls) in &codes {
+            let mut next: Vec<(String, usize, usize, u64)> = Vec::with_capacity(codes.len());
+            for (prefix, edits, fuzzy_syls, mask) in &codes {
+                let start_bit = if prefix.len() < 64 {
+                    1u64 << prefix.len()
+                } else {
+                    0
+                };
                 for (i, (opt, opt_edits)) in opts.iter().enumerate() {
                     let fuzzy_syls = fuzzy_syls + usize::from(i > 0);
                     if fuzzy_syls > limit {
                         continue;
                     }
-                    next.push((format!("{prefix}{opt}"), edits + opt_edits, fuzzy_syls));
+                    next.push((
+                        format!("{prefix}{opt}"),
+                        edits + opt_edits,
+                        fuzzy_syls,
+                        mask | start_bit,
+                    ));
                 }
             }
             codes = next;
         }
-        codes.into_iter().map(|(c, edits, _)| (c, edits)).collect()
+        codes
+            .into_iter()
+            .map(|(c, edits, _, mask)| (c, edits, mask))
+            .collect()
     }
 
     /// 检查两个拼音是否模糊等价
@@ -678,6 +707,19 @@ mod tests {
     /// 测试辅助：查某个变体码对应的模糊音节数。
     fn fuzzy_count_of(out: &[(String, usize)], code: &str) -> Option<usize> {
         out.iter().find(|(c, _)| c == code).map(|(_, k)| *k)
+    }
+
+    /// 带边界的展开：变体码的边界按**变体音节**的长度记（`zong|guo` → `zhong|guo` 是 {0,5}
+    /// 而非 {0,4}），且与不带边界的版本逐项同码同处数。
+    #[test]
+    fn expand_syllables_masked_tracks_variant_boundaries() {
+        let c = cfg(|c| c.zh_z = true);
+        let input = syls(&["zong", "guo"]);
+        let masked = FuzzyMatcher::expand_syllables_masked(&input, &c);
+        assert!(masked.contains(&("zongguo".to_string(), 0, 0b10001)));
+        assert!(masked.contains(&("zhongguo".to_string(), 1, 0b100001)));
+        let plain: Vec<(String, usize)> = masked.into_iter().map(|(s, k, _)| (s, k)).collect();
+        assert_eq!(plain, FuzzyMatcher::expand_syllables(&input, &c));
     }
 
     /// 全原音节组合恒排第一、且模糊音节数为 0（调用方据 `variant == code` 跳过精确命中，

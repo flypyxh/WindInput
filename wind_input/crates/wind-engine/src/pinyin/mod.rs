@@ -1790,6 +1790,7 @@ impl PinyinEngine {
                         word: node.word.clone(),
                         syl_mask: node.syl_mask,
                         log_prob: node.log_prob,
+                        canon: node.canon.clone(),
                     });
                 }
             }
@@ -1835,6 +1836,11 @@ impl PinyinEngine {
                     is_partial: completed.len() < stroke.len(),
                     boundary: result.boundary,
                     consumed_length: completed.len(),
+                    // 模糊整句的造词码（规范码），全精确时为 None。见 `ViterbiResult::learn_code`。
+                    meta: wind_candidate::CandidateMeta {
+                        learn_code: result.learn_code(&completed),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 });
             }
@@ -2758,6 +2764,7 @@ impl Engine for PinyinEngine {
                         word: node.word.clone(),
                         syl_mask: node.syl_mask,
                         log_prob: node.log_prob,
+                        canon: node.canon.clone(),
                     });
                 }
             }
@@ -2824,6 +2831,11 @@ impl Engine for PinyinEngine {
                     is_synthesized: !merged,
                     boundary,
                     sentence_rank: rank,
+                    // 模糊整句的造词码（规范码），全精确时为 None。见 `ViterbiResult::learn_code`。
+                    meta: wind_candidate::CandidateMeta {
+                        learn_code: result.learn_code(completed),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 if pool_k > 1 {
@@ -2899,7 +2911,9 @@ impl Engine for PinyinEngine {
         //     压根不出现，于是候选集与放开门槛前逐条一致，连截断边界都不动。
         //
         //     `completed_syls >= 2` 仍走原来的立即插入，行为逐字不变。
-        let mut short_sentence_pending: Option<(String, i32, u64)> = None;
+        // (整句文本, 权重, 所打码边界, 造词码)
+        type PendingSentence = (String, i32, u64, Option<(String, u64)>);
+        let mut short_sentence_pending: Option<PendingSentence> = None;
         if self.config.use_smart_compose
             && allow_partial_final
             // 原为 `syllables.len() >= 2`（至少两个完整音节才谈得上组句）。放开到 1 是为了
@@ -2935,6 +2949,7 @@ impl Engine for PinyinEngine {
                         word: node.word.clone(),
                         syl_mask: node.syl_mask,
                         log_prob: node.log_prob,
+                        canon: node.canon.clone(),
                     });
                 }
             }
@@ -2946,7 +2961,8 @@ impl Engine for PinyinEngine {
                     // 此处 `completed_syls`（step 4 才定义）尚不可见，用同源的 `syllables`
                     if syllables.len() as u32 <= SENTENCE_KEEP_MAX_COMPLETED_SYLS {
                         // 短上下文档：留到 6.5b 之后按 SENTENCE_KEEP_RATIO 定夺（见上方说明）
-                        short_sentence_pending = Some((sentence, weight, result.boundary));
+                        short_sentence_pending =
+                            Some((sentence, weight, result.boundary, result.learn_code(query)));
                     } else if let Some(existing) =
                         candidates.iter_mut().find(|c| c.text == sentence)
                     {
@@ -2970,6 +2986,10 @@ impl Engine for PinyinEngine {
                                 // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
                                 is_synthesized: true,
                                 boundary: result.boundary,
+                                meta: wind_candidate::CandidateMeta {
+                                    learn_code: result.learn_code(query),
+                                    ..Default::default()
+                                },
                                 ..Default::default()
                             },
                         );
@@ -3049,6 +3069,7 @@ impl Engine for PinyinEngine {
                         word: node.word.clone(),
                         syl_mask: node.syl_mask,
                         log_prob: node.log_prob,
+                        canon: node.canon.clone(),
                     });
                 }
             }
@@ -3097,6 +3118,11 @@ impl Engine for PinyinEngine {
                             // 长串混合整句（pinyin_eval D 类）1000 条逐条零差异。
                             // 见 `tests/pinyin_mixed_sentence_layer.rs`。
                             is_abbrev: true,
+                            // 简拼节点不带规范码（击键即码），只有全拼段的模糊节点会让它非 None。
+                            meta: wind_candidate::CandidateMeta {
+                                learn_code: result.learn_code(abbr_query),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                     );
@@ -4020,7 +4046,7 @@ impl Engine for PinyinEngine {
         // ★ 放在 6.5b **之后**是有意的：本档整句不参与那轮让位。6.5b 的语义是「整句丢掉了
         // 残码、该让位给用完残码的补全」，而本档整句消费了整串，压根不是它要治的对象；
         // 若放在之前，它会被无条件降到 `补全max - 1`，正是「在吗」被压到 818 的原因。
-        if let Some((text, weight, boundary)) = short_sentence_pending {
+        if let Some((text, weight, boundary, learn_code)) = short_sentence_pending {
             // 补全侧没有「恰好用完残码」的答案（None）时无从比较，放行 —— 与本文件
             // 「无信息一律放行」一致，且那种情况下整句本就是唯一的整串解释。
             // 补全侧没有「恰好用完残码」的答案（None）⇒ 词库在这个码上一无所有，放行。
@@ -4052,6 +4078,10 @@ impl Engine for PinyinEngine {
                             // 新建整句 = 引擎合成的解读，词库无此词条（同文合并那三处刻意不设）。
                             is_synthesized: true,
                             boundary,
+                            meta: wind_candidate::CandidateMeta {
+                                learn_code,
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                     );
@@ -5249,6 +5279,46 @@ mod tests {
         assert_eq!(s.text, "西昂多练");
         // xi|an|duo|lian → 位 0/2/4/7；系统节点那条 xian|duo|lian 是位 0/4/7。
         assert_eq!(s.boundary, 0b1001_0101, "应换成用户记录对应的切分");
+        // 规范码随胜者一起换：用户记录 xi|ang，而非系统节点按变体推出的 xiang 单音节。
+        assert_eq!(
+            s.meta.learn_code,
+            Some(code_and_mask(&["xi", "ang", "duo", "lian"]))
+        );
+    }
+
+    /// 用户**精确**记录赢下同词的系统**模糊**节点时，规范码清回 `None`（所打码即规范码）。
+    ///
+    /// 系统词「西昂」码 `xiang`，ian=iang 下以 `xian` 模糊命中（带规范码 `xiang`）；用户
+    /// 记录「西昂」就登记在所打码 `xian`（xi|an）上、带加成赢下该节点。整句全是精确节点，
+    /// 造词码应为 `None`——若还挂着系统节点的 `xiang`，学进去的是 `xiangduolian`。
+    #[test]
+    fn exact_user_node_win_clears_canon() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("xiang".to_string(), "西昂".to_string(), 500, 0);
+        let store = tmp_store("s2_exact_clears_canon");
+        for (code, text, boundary) in [("xian", "西昂", 0b101u64), ("duolian", "多练", 0b1001)]
+        {
+            store
+                .add_user_word("pinyin", code, text, 500, boundary)
+                .unwrap();
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        let eng = PinyinEngine::new(
+            Config {
+                sentence_uses_user_words: true,
+                ..Default::default()
+            },
+            CachedDict::Memory(raw),
+        )
+        .with_fuzzy(FuzzyConfig {
+            ian_iang: true,
+            ..Default::default()
+        })
+        .with_store_layers(Arc::new(dm));
+        let s = sentence_of(&eng, "xianduolian").expect("应产出整句");
+        assert_eq!(s.text, "西昂多练");
+        assert_eq!(s.meta.learn_code, None);
     }
 
     /// 精确分支同理：用户**精确**记录赢下同词同跨度的系统词节点时，切分换成用户记录那条。
@@ -5281,6 +5351,62 @@ mod tests {
         assert_eq!(s.text, "西安多练");
         // xi|an|duo|lian → 位 0/2/4/7；系统节点那条 xian|duo|lian 是位 0/4/7。
         assert_eq!(s.boundary, 0b1001_0101, "应换成用户记录对应的切分");
+    }
+
+    // ── 模糊整句的**造词码**（`Candidate::meta.learn_code`）。
+    //
+    // 整句候选的 `code` 是所打码（`consumed_length` / 分步上屏绑在它上面），单段整句上屏时
+    // 协调层 `learn_phrase_on_commit` 优先取 `learn_code`、缺省才用 `code`。模糊整句若不带
+    // 规范码，学进去的就是 `chaijiuduolian` 这种非规范码，下次同样打法零罚精确命中它。
+
+    /// 由音节序列算 (码, 边界)。
+    fn code_and_mask(syls: &[&str]) -> (String, u64) {
+        let mut code = String::new();
+        let mut mask = 0u64;
+        for s in syls {
+            mask |= 1 << code.len();
+            code.push_str(s);
+        }
+        (code, mask)
+    }
+
+    /// S2 用户词模糊节点 + 精确节点混排：造词码 = 各节点规范码拼接，边界换到规范码坐标。
+    #[test]
+    fn fuzzy_sentence_learn_code_is_canonical() {
+        let eng =
+            sentence_engine_with_user_words_fuzzy("fz_s2_learn", CAIJIU_DUOLIAN, ch_c(), true);
+        let s = sentence_of(&eng, "chaijiuduolian").expect("应产出整句");
+        assert_eq!(s.text, "菜就多练");
+        assert_eq!(s.code, "chaijiuduolian", "候选码仍是所打码");
+        assert_eq!(
+            s.meta.learn_code,
+            Some(code_and_mask(&["cai", "jiu", "duo", "lian"])),
+            "造词码须为规范码（菜就走模糊、多练走精确）"
+        );
+        // 全精确：不带造词码（与候选码相同），行为逐位不变。
+        let s = sentence_of(&eng, "caijiuduolian").expect("精确打法应产出整句");
+        assert_eq!(s.meta.learn_code, None);
+    }
+
+    /// 系统词模糊节点（`build` 的模糊分支）同样带规范码；词条无边界时按变体音节推。
+    #[test]
+    fn system_fuzzy_sentence_learn_code_is_canonical() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("zhongguo".to_string(), "中国".to_string(), 5000, 0);
+        raw.merge_single("renmin".to_string(), "人民".to_string(), 5000, 0);
+        let eng =
+            PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(FuzzyConfig {
+                zh_z: true,
+                ..Default::default()
+            });
+        let s = sentence_of(&eng, "zongguorenmin").expect("应产出整句");
+        assert_eq!(s.text, "中国人民");
+        assert_eq!(
+            s.meta.learn_code,
+            Some(code_and_mask(&["zhong", "guo", "ren", "min"]))
+        );
+        let s = sentence_of(&eng, "zhongguorenmin").expect("精确打法应产出整句");
+        assert_eq!(s.meta.learn_code, None, "全精确不带造词码");
     }
 
     /// 关模糊音 / 关 `sentence_uses_user_words`：整句都不认翘舌打法下的「菜就」。
@@ -5787,6 +5913,33 @@ mod tests {
 
     fn texts(r: &ConvertResult) -> Vec<&str> {
         r.candidates.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// 全拼降级支路的整句同样带造词码：双拼方案下按全拼 + z=zh 打 `zongguorenmin`，
+    /// 整句「中国人民」的 `code` 是击键串，`learn_code` 是规范码 zhong|guo|ren|min。
+    #[test]
+    fn full_pinyin_fallback_fuzzy_sentence_learn_code() {
+        let eng = sp_fp_engine(
+            "fuzzy_learn",
+            &[("中国", "zhong guo", 5000), ("人民", "ren min", 5000)],
+            true,
+        )
+        .with_fuzzy(FuzzyConfig {
+            zh_z: true,
+            ..Default::default()
+        });
+        let r = eng.convert("zongguorenmin", 50).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.is_sentence && c.is_fullpinyin_fallback)
+            .unwrap_or_else(|| panic!("应出降级支路整句，实际候选: {:?}", texts(&r)));
+        assert_eq!(c.text, "中国人民");
+        assert_eq!(c.code, "zongguorenmin");
+        assert_eq!(
+            c.meta.learn_code,
+            Some(code_and_mask(&["zhong", "guo", "ren", "min"]))
+        );
     }
 
     /// ★★ 核心用例，同时**锁住支路的位置**。

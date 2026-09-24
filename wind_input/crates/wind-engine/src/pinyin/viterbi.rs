@@ -28,6 +28,59 @@ pub struct ViterbiResult {
     ///
     /// 0 = 无可用信息（解码失败 / 输入超 64 字节，超出 bitmask 表达范围）。
     pub boundary: u64,
+    /// 路径上**至少一个节点带规范码**（`WordNode::canon`）时，按路径顺序列出各节点；
+    /// 全部精确命中时为 `None`，不做任何分配。供 [`Self::learn_code`] 拼造词码。
+    pub pieces: Option<Vec<SentencePiece>>,
+}
+
+/// 整句路径上的一个节点，供拼造词码（见 [`ViterbiResult::learn_code`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentencePiece {
+    /// 所打码上的字节跨度
+    pub start: usize,
+    pub end: usize,
+    /// 节点在所打码坐标下的音节边界（相对 `start`）
+    pub syl_mask: u64,
+    /// 同 `WordNode::canon`
+    pub canon: Option<(String, u64)>,
+}
+
+impl ViterbiResult {
+    /// 整句的**造词码**：各节点规范码按路径顺序拼接，边界按累积的规范码长度平移后合并。
+    /// 精确节点取所打码 `input[start..end]` 那一段与它自己的 `syl_mask`。
+    ///
+    /// 全精确（`pieces == None`）返回 `None`：造词码与整句候选的 `code` / `boundary` 相同，
+    /// 语义同 `Candidate::meta.learn_code` 的 `None`。拼出的码超 64 字节、或任一段边界缺失时，
+    /// 边界整体置 0（与协调层 `learn_phrase_on_commit` 拼多段时的口径一致：半截边界比没有更糟）。
+    ///
+    /// `input` 必须是建图所用的那串（step 2 的 `completed`、2b 的整串、2c 含残码的整串）。
+    pub fn learn_code(&self, input: &str) -> Option<(String, u64)> {
+        let pieces = self.pieces.as_ref()?;
+        // 传错串（如 2c 该传含残码的整串却传了 `completed`）时，下面的 `input.get(..)?` 会
+        // 静默返回 None、整句不带造词码——在测试里就让它响。
+        debug_assert!(
+            pieces.last().is_none_or(|p| p.end <= input.len()),
+            "learn_code 的 input（{} 字节）短于路径终点 {:?}",
+            input.len(),
+            pieces.last().map(|p| p.end)
+        );
+        let mut code = String::new();
+        let mut boundary = 0u64;
+        let mut boundary_ok = true;
+        for piece in pieces {
+            let (c, b) = match &piece.canon {
+                Some((c, b)) => (c.as_str(), *b),
+                None => (input.get(piece.start..piece.end)?, piece.syl_mask),
+            };
+            if b == 0 || code.len() + c.len() > 64 {
+                boundary_ok = false;
+            } else {
+                boundary |= b << code.len();
+            }
+            code.push_str(c);
+        }
+        Some((code, if boundary_ok { boundary } else { 0 }))
+    }
 }
 
 /// 词节点（用于构建 lattice）
@@ -39,6 +92,8 @@ pub struct WordNode {
     /// 本节点所采用切分的音节起始位 bitmask，相对 `start`（见 `LatticeNode::syl_mask`）
     pub syl_mask: u64,
     pub log_prob: f64,
+    /// 造词用规范码，见 `LatticeNode::canon`。`None` = 所打码那段本身。
+    pub canon: Option<(String, u64)>,
 }
 
 /// 单状态 DP 的状态（**无 grammar 时**用）。
@@ -59,6 +114,8 @@ struct DpEntry {
     prev_idx: usize,
     word: String,
     syl_mask: u64,
+    /// 见 `WordNode::canon`（精确节点为 `None`，克隆不分配）。
+    canon: Option<(String, u64)>,
 }
 
 /// 往**降序**的 top-K 列表里插入一条，超出 `k` 的丢弃。
@@ -96,6 +153,8 @@ struct BeamEntry {
     prev_word: String,
     word: String,
     syl_mask: u64,
+    /// 见 `WordNode::canon`（精确节点为 `None`，克隆不分配）。
+    canon: Option<(String, u64)>,
 }
 
 /// 每个位置最多保留几条线。对齐 librime `BeamSearch::kMaxLineCandidates`
@@ -205,6 +264,7 @@ impl ViterbiDecoder {
             slot.prev_word.clear();
             slot.prev_word.push_str(prev_word);
             slot.syl_mask = node.syl_mask;
+            slot.canon.clone_from(&node.canon);
         } else {
             // 已满且不严格优于最差的一条：直接丢弃，不付 clone 的代价。
             if states.len() >= BEAM_WIDTH
@@ -220,6 +280,7 @@ impl ViterbiDecoder {
                 prev_word: prev_word.to_string(),
                 word: node.word.clone(),
                 syl_mask: node.syl_mask,
+                canon: node.canon.clone(),
             });
         }
         states.sort_by(|a, b| {
@@ -251,6 +312,7 @@ impl ViterbiDecoder {
                 words: Vec::new(),
                 log_prob: 0.0,
                 boundary: 0,
+                pieces: None,
             };
         }
 
@@ -373,6 +435,7 @@ impl ViterbiDecoder {
                 words: Vec::new(),
                 log_prob: f64::NEG_INFINITY,
                 boundary: 0,
+                pieces: None,
             })
     }
 
@@ -395,6 +458,7 @@ impl ViterbiDecoder {
             prev_idx: 0,
             word: String::new(),
             syl_mask: 0,
+            canon: None,
         });
 
         // nodes[end_pos] = 所有在字节位置 end_pos 结束的词（与 LatticeBuilder::build 的
@@ -419,6 +483,7 @@ impl ViterbiDecoder {
                         prev_idx: idx,
                         word: node.word.clone(),
                         syl_mask: node.syl_mask,
+                        canon: node.canon.clone(),
                     };
                     push_topk(&mut dp[end_pos], entry, k);
                 }
@@ -451,6 +516,7 @@ impl ViterbiDecoder {
                 // 回溯第 rank 条：沿 (prev_pos, prev_idx) 往回走。
                 let mut words = Vec::new();
                 let mut boundary = 0u64;
+                let mut has_canon = false;
                 let (mut pos, mut idx) = (end, rank);
                 while pos > 0 {
                     let entry = &dp[pos][idx];
@@ -461,9 +527,30 @@ impl ViterbiDecoder {
                     if expressible {
                         boundary |= entry.syl_mask << entry.prev_pos;
                     }
+                    has_canon |= entry.canon.is_some();
                     (pos, idx) = (entry.prev_pos, entry.prev_idx);
                 }
                 words.reverse();
+                // 只有路径上真有模糊节点才再走一遍收集片段：全精确时零分配。
+                let pieces = has_canon.then(|| {
+                    let mut out = Vec::with_capacity(words.len());
+                    let (mut pos, mut idx) = (end, rank);
+                    while pos > 0 {
+                        let entry = &dp[pos][idx];
+                        if entry.word.is_empty() {
+                            break;
+                        }
+                        out.push(SentencePiece {
+                            start: entry.prev_pos,
+                            end: pos,
+                            syl_mask: entry.syl_mask,
+                            canon: entry.canon.clone(),
+                        });
+                        (pos, idx) = (entry.prev_pos, entry.prev_idx);
+                    }
+                    out.reverse();
+                    out
+                });
                 ViterbiResult {
                     words,
                     log_prob: if full_reach {
@@ -472,6 +559,7 @@ impl ViterbiDecoder {
                         f64::NEG_INFINITY
                     },
                     boundary: if expressible { boundary } else { 0 },
+                    pieces,
                 }
             })
             .collect()
@@ -495,6 +583,7 @@ impl ViterbiDecoder {
             prev_word: String::new(),
             word: String::new(),
             syl_mask: 0,
+            canon: None,
         });
 
         // 前向 DP
@@ -562,6 +651,9 @@ impl ViterbiDecoder {
         let mut boundary = 0u64;
         let expressible = input_len <= 64;
         let mut cursor: Option<&BeamEntry> = dp[pos].first();
+        // beam 本就只回溯一条，片段随路收集（语法模型出厂关闭，这里不追零分配）；
+        // 全精确时丢弃，结果与 DP 一侧同形。
+        let mut pieces = Vec::new();
         while pos > 0 {
             let Some(entry) = cursor else {
                 break;
@@ -573,6 +665,12 @@ impl ViterbiDecoder {
             if expressible {
                 boundary |= entry.syl_mask << entry.prev_pos;
             }
+            pieces.push(SentencePiece {
+                start: entry.prev_pos,
+                end: pos,
+                syl_mask: entry.syl_mask,
+                canon: entry.canon.clone(),
+            });
             let prev_pos = entry.prev_pos;
             let prev_word = entry.prev_word.as_str();
             // 前驱必然还在（见前向 DP 处关于「定稿」的论证）；找不到只可能是
@@ -582,11 +680,14 @@ impl ViterbiDecoder {
         }
 
         words.reverse();
+        pieces.reverse();
+        let pieces = pieces.iter().any(|p| p.canon.is_some()).then_some(pieces);
 
         ViterbiResult {
             words,
             log_prob: final_log_prob,
             boundary: if expressible { boundary } else { 0 },
+            pieces,
         }
     }
 }
@@ -609,6 +710,7 @@ mod tests {
             word: "你好".to_string(),
             syl_mask: 0b101, // ni|hao
             log_prob: 10.0,
+            canon: None,
         });
         let decoder = ViterbiDecoder::new();
         let result = decoder.decode(&nodes, input_len);
@@ -627,6 +729,7 @@ mod tests {
             word: "你".to_string(),
             syl_mask: 0b1,
             log_prob: 3.0,
+            canon: None,
         });
         nodes[5].push(WordNode {
             start: 2,
@@ -634,6 +737,7 @@ mod tests {
             word: "好".to_string(),
             syl_mask: 0b1,
             log_prob: 3.0,
+            canon: None,
         });
         (nodes, input_len)
     }
@@ -656,6 +760,7 @@ mod tests {
             word: word.to_string(),
             syl_mask: 0b1,
             log_prob,
+            canon: None,
         }
     }
 
@@ -890,5 +995,41 @@ mod tests {
             ("你".to_string(), "好".to_string(), true),
             "上文是前一个词，且落在整句末尾"
         );
+    }
+
+    /// 规范码随路径透传：每条解拼的是**自己那条路径**上的节点，DP（含 K-best）与 beam 同形；
+    /// 全精确的解 `pieces` 为 `None`、`learn_code` 为 `None`。
+    ///
+    /// 输入 `zongguo`（z=zh 打法）：路径甲 = 「中」(zong→zhong, 模糊) + 「国」(guo, 精确)，
+    /// 路径乙 = 「宗国」整段精确。
+    #[test]
+    fn canon_pieces_follow_each_path() {
+        let input = "zongguo";
+        let input_len = input.len();
+        let mut nodes: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
+        let mut zhong = node(0, 4, "中", 3.0);
+        zhong.canon = Some(("zhong".to_string(), 0b1));
+        nodes[4].push(zhong);
+        nodes[7].push(node(4, 7, "国", 3.0));
+        let mut whole = node(0, 7, "宗国", 5.0);
+        whole.syl_mask = 0b10001;
+        nodes[7].push(whole);
+
+        let r = ViterbiDecoder::decode_dp_nbest(&nodes, input_len, 2);
+        assert_eq!(r[0].words, ["中", "国"]);
+        // zhong|guo → 位 0/5（规范码坐标），而整句 boundary 仍是所打码坐标 0/4。
+        assert_eq!(r[0].boundary, 0b10001);
+        assert_eq!(
+            r[0].learn_code(input),
+            Some(("zhongguo".to_string(), 0b100001))
+        );
+        assert_eq!(r[1].words, ["宗国"]);
+        assert_eq!(r[1].pieces, None, "全精确的解不收集片段");
+        assert_eq!(r[1].learn_code(input), None);
+
+        let beam = ViterbiDecoder::with_grammar(Arc::new(crate::pinyin::grammar::NullGrammar))
+            .decode(&nodes, input_len);
+        assert_eq!(beam.words, r[0].words);
+        assert_eq!(beam.pieces, r[0].pieces, "beam 与 DP 收集的片段一致");
     }
 }

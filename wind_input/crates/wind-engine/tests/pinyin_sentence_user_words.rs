@@ -337,3 +337,207 @@ fn fuzzy_on_exact_typing_unchanged() {
         );
     }
 }
+
+/// 模糊整句的**造词码**：整句 `code` 留所打码，`meta.learn_code` 是各节点规范码的拼接。
+///
+/// - 有「盖伦」用户词：S2 的用户词模糊节点，规范码 = 记录自身的码与边界；
+/// - 无用户词：系统词模糊节点「概论」（wdat 带真值边界 gai|lun），规范码取词条自带边界。
+///
+/// 两种情况整句都是 you|gai|lun|ma（位 0/3/6/9），「有」「吗」是精确节点、取所打码那段。
+#[test]
+fn fuzzy_sentence_carries_canonical_learn_code() {
+    let full = |e: &PinyinEngine| {
+        e.convert("yougainunma", 100)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|c| c.is_sentence)
+            .expect("应产出整句")
+    };
+    let want = Some(("yougailunma".to_string(), 0b10_0100_1001u64));
+
+    let s = store("fz_learn_user");
+    s.add_user_word("pinyin", "gailun", "盖伦", 1200, 0b1001)
+        .unwrap();
+    let c = full(&engine_n_l("fz_learn_user", s, true, true));
+    assert_eq!(c.text, "有盖伦吗");
+    assert_eq!(c.code, "yougainunma", "候选码仍是所打码");
+    assert_eq!(c.meta.learn_code, want);
+
+    let c = full(&engine_n_l(
+        "fz_learn_sys",
+        store("fz_learn_sys"),
+        true,
+        true,
+    ));
+    assert!(
+        c.text.contains("概论"),
+        "前提：无用户词时整句走系统词「概论」，实际 {}",
+        c.text
+    );
+    assert_eq!(c.meta.learn_code, want);
+
+    // 精确打法：造词码为 None（即候选码本身）。
+    let c = full_exact(&engine_n_l(
+        "fz_learn_exact",
+        store("fz_learn_exact"),
+        true,
+        true,
+    ));
+    assert_eq!(c.meta.learn_code, None);
+}
+
+fn full_exact(e: &PinyinEngine) -> wind_candidate::Candidate {
+    e.convert("yougailunma", 100)
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|c| c.is_sentence)
+        .expect("应产出整句")
+}
+
+/// 系统词模糊节点的规范边界**优先用词条自带的真值**，而不是按变体切分推。
+///
+/// `xian` 在词图上取最少音节的 `any_path` = 一个音节，ian=iang 展开出变体 `xiang`（推得的
+/// 边界只有位 0）；词条「西昂」登记的真值却是 xi|ang（位 0/2）。造词码的边界要跟词条走，
+/// 否则学进去的「西昂多练」少一个音节，简拼索引算出的声母串是 `xdl` 而不是 `xadl`。
+#[test]
+fn system_fuzzy_node_canon_prefers_entry_boundary() {
+    let dir = std::env::temp_dir().join("wind_s2_canon_entry_boundary");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wdat = dir.join("t.wdat");
+    let mut w = WdatWriter::new();
+    w.add_with_boundary("duolian".into(), vec![("多练".into(), 5000, 0, 0b1001)]);
+    w.add_with_boundary("xiang".into(), vec![("西昂".into(), 5000, 0, 0b101)]);
+    w.write(&wdat).unwrap();
+    let dict = CachedDict::load_at(&dir.join("t.dict.yaml"), &wdat).expect("加载 wdat 夹具");
+    let eng = PinyinEngine::new(PyConfig::default(), dict).with_fuzzy(
+        wind_engine::pinyin::fuzzy::FuzzyConfig {
+            ian_iang: true,
+            ..Default::default()
+        },
+    );
+    let c = eng
+        .convert("xianduolian", 100)
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|c| c.is_sentence)
+        .expect("应产出整句");
+    assert_eq!(c.text, "西昂多练");
+    // xi|ang|duo|lian → 位 0/2/5/8
+    assert_eq!(
+        c.meta.learn_code,
+        Some(("xiangduolian".to_string(), 0b1_0010_0101))
+    );
+}
+
+/// 残码整句（step 2c）同样带造词码：模糊节点取规范码，**残码位保持所打的那几个字母**
+/// （`LatticeNode::canon` 对残码节点恒 `None`——它补出的字读什么是预测，不是用户打出的码）。
+#[test]
+fn partial_final_fuzzy_sentence_learn_code() {
+    let s = store("fz_learn_partial");
+    s.add_user_word("pinyin", "gailun", "盖伦", 1200, 0b1001)
+        .unwrap();
+    let c = engine_n_l("fz_learn_partial", s, true, true)
+        .convert("yougainunm", 100)
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|c| c.is_sentence && c.code == "yougainunm")
+        .expect("应产出残码整句");
+    assert!(c.text.starts_with("有盖伦"), "实际 {}", c.text);
+    // you|gai|lun|m → 位 0/3/6/9
+    assert_eq!(
+        c.meta.learn_code,
+        Some(("yougailunm".to_string(), 0b10_0100_1001u64))
+    );
+}
+
+/// 词条：(码, [(词, 权重)], 边界)。
+type Entry<'a> = (&'a str, &'a [(&'a str, i32)], u64);
+
+/// 只含给定词条与简拼索引（声母串, 全拼码）的 wdat 系统词库。
+fn wdat_dict(tag: &str, entries: &[Entry], abbrevs: &[(&str, &str)]) -> CachedDict {
+    let dir = std::env::temp_dir().join(format!("wind_s2_learn_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wdat = dir.join("t.wdat");
+    let mut w = WdatWriter::new();
+    for (code, words, boundary) in entries {
+        w.add_with_boundary(
+            (*code).into(),
+            words
+                .iter()
+                .enumerate()
+                .map(|(i, (t, wt))| ((*t).into(), *wt, i as u32, *boundary))
+                .collect(),
+        );
+    }
+    for (abbrev, code) in abbrevs {
+        w.add_abbrev((*abbrev).into(), vec![((*code).into(), 1000)]);
+    }
+    w.write(&wdat).unwrap();
+    CachedDict::load_at(&dir.join("t.dict.yaml"), &wdat).expect("加载 wdat 夹具")
+}
+
+fn n_l() -> wind_engine::pinyin::fuzzy::FuzzyConfig {
+    wind_engine::pinyin::fuzzy::FuzzyConfig {
+        n_l: true,
+        ..Default::default()
+    }
+}
+
+/// 转换 `input`，取码为 `code` 的整句候选。
+fn sentence_with_code(e: &PinyinEngine, input: &str, code: &str) -> wind_candidate::Candidate {
+    e.convert(input, 100)
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|c| c.is_sentence && c.code == code)
+        .unwrap_or_else(|| panic!("{input} 应产出码为 {code} 的整句"))
+}
+
+/// step 2c 的**延迟定夺**档（1 个完整音节 + 残码，`short_sentence_pending`）同样带造词码。
+///
+/// `nunm`：`nun` 经 n=l 模糊命中「论」（规范码 lun），残码 `m` 补成「吗」。残码位保留所打字母。
+#[test]
+fn deferred_partial_sentence_learn_code() {
+    let dict = wdat_dict(
+        "deferred",
+        &[
+            ("lun", &[("论", 60_000)], 0b1),
+            ("ma", &[("吗", 300_000)], 0b1),
+        ],
+        &[],
+    );
+    let e = PinyinEngine::new(PyConfig::default(), dict).with_fuzzy(n_l());
+    let c = sentence_with_code(&e, "nunm", "nunm");
+    assert_eq!(c.text, "论吗");
+    // lun|m → 位 0/3
+    assert_eq!(c.meta.learn_code, Some(("lunm".to_string(), 0b1001)));
+}
+
+/// step 2b 混合整句：全拼段的模糊节点取规范码，**简拼段保留击键字母**（简拼节点 canon 为 None）。
+#[test]
+fn mixed_abbrev_sentence_learn_code() {
+    let dict = wdat_dict(
+        "mixed",
+        &[
+            // bu|zhi|dao → 位 0/2/5
+            ("buzhidao", &[("不知道", 500_000)], 0b100101),
+            // gai|lun → 位 0/3
+            ("gailun", &[("概论", 50_000)], 0b1001),
+        ],
+        &[("bzd", "buzhidao")],
+    );
+    let e = PinyinEngine::new(PyConfig::default(), dict).with_fuzzy(n_l());
+    let c = sentence_with_code(&e, "bzdgainun", "bzdgainun");
+    assert_eq!(c.text, "不知道概论");
+    // b|z|d|gai|lun → 位 0/1/2/3/6
+    assert_eq!(
+        c.meta.learn_code,
+        Some(("bzdgailun".to_string(), 0b100_1111))
+    );
+}

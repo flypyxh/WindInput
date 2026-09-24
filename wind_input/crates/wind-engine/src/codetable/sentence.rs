@@ -604,6 +604,7 @@ impl CodeSentenceDecoder {
                         // 它随 Viterbi 回溯累加成整句的切分 mask，供 preedit 显示。
                         syl_mask: 1,
                         log_prob,
+                        canon: None,
                     });
                 }
             }

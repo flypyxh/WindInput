@@ -262,10 +262,20 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 >   `USER_FUZZY_LAYER_BUDGET`(256)，超出时按改动处数截。打分与 `build` 的系统词模糊节点同口径
 >   （每处改动 −ln2）再叠用户词截顶与加成。系统词节点本就做模糊，故不存在「用户模糊词无对手」
 >   的偏置。模糊全关时零额外查询；与 `build` 同值传 `require_reachable`，不可达起点不查。
-> - ⚠️ **模糊整句上屏会按所打码造词**：整句候选的 `code` 是所打码、不带 `learn_code`，单段整句
->   经 `learn_phrase_on_commit` 落库的就是 `chaijiuduolian` 这样的非规范码。系统词模糊整句
->   本就同病（`build` 的模糊节点早已存在），修法要让词图节点携带规范码与规范边界、三条整句
->   通路拼出整句的 `learn_code`，尚未做。
+> - **模糊整句的造词码**（`LatticeNode::canon` → `WordNode::canon` → `ViterbiResult::learn_code`）。
+>   整句候选的 `code` 必须是所打码（`consumed_length` / 分步上屏绑在它上面），而单段整句上屏时
+>   `learn_phrase_on_commit` 优先取 `meta.learn_code`。故词图节点带 `canon`：模糊命中 = (命中的
+>   词条码, 该码自身坐标下的边界)——系统词模糊节点边界优先取词条真值、缺失时按变体音节推
+>   （`expand_syllables_masked`），用户词模糊节点取记录自身的码与边界；精确 / 简拼 / 残码节点
+>   为 `None`（取所打码那段与 `syl_mask`，零分配）。同词同起点替换时 `canon` 随胜者换。
+>   Viterbi（K-best 与 beam）回溯时仅在路径上有模糊节点时收集片段，整句通路（step 2 / 2b / 2c /
+>   双拼全拼降级，含 N-best 池）按片段拼 `learn_code`；全精确时为 `None`，行为逐位不变。
+>   此前不带它时，`chaijiuduolian` 的整句按所打码落库，下次同样打法零罚精确命中这条非规范记录。
+>   残码位刻意不填：补出的那个字读什么是预测，造词码保留用户打出的字母（与改前一致）。
+>   ⚠️ 2b / 2c 改前就会把**简拼字母 / 残码字母**写进造词码（`bzdgailun`、`lunm` 这类记录
+>   几乎打不出来，只在临时层堆积），本次只把其中的模糊段换成规范码，简拼 / 残码段照旧。
+>   简拼节点其实持有完整规范码（用户简拼节点的 `cand.code` / `boundary`、系统简拼节点回查出
+>   的全码），填进 `canon` 就能让 2b 学到完整全拼——那会改变既有行为，留作后续。
 > - **同词同起点取 `log_prob` 较大者**（不是「已存在就跳过」）——GH#93 要的正是
 >   「我调过的权重整句也得认」。
 > - 标定两头都管：下有 `USER_NODE_BONUS`(+2.0 对数域)、上有 `USER_NODE_WEIGHT_CAP`(1e6)。

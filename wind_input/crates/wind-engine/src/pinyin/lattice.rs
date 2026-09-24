@@ -413,6 +413,15 @@ pub struct LatticeNode {
     /// 故必须逐节点记录：Viterbi 选中哪条节点，整句的真实边界就是哪条。
     pub syl_mask: u64,
     pub log_prob: f64,
+    /// **造词用的规范码**：模糊命中时 = (命中的词条码, 该码自身坐标下的音节边界)；
+    /// 精确命中与简拼 / 残码节点为 `None`（规范码即所打码 `input[start..end]` 那一段，
+    /// 边界即 `syl_mask`，不必另存、零分配）。
+    ///
+    /// 只服务一件事：整句候选的 `Candidate::meta.learn_code`。整句的 `code` 必须是所打码
+    /// （`consumed_length` / 分步上屏绑在它上面），而单段整句上屏造词时要写的是用户下次真能
+    /// 打出来的规范码——`chaijiuduolian` 的整句若按所打码落库，下次同样打法零罚精确命中这条
+    /// 非规范记录。Viterbi 回溯把它透传出来（`ViterbiResult::learn_code`）。
+    pub canon: Option<(String, u64)>,
 }
 
 /// 词图里把 `zh` / `ch` / `sh` **拆成两个声母**（z|h）的次数：某个 `h` 紧跟在 z/c/s 之后、
@@ -546,6 +555,7 @@ impl LatticeBuilder {
                         syllables: slice_syllables(code, &offsets),
                         syl_mask: offsets_mask(&offsets),
                         log_prob,
+                        canon: None,
                     });
                 }
 
@@ -568,29 +578,39 @@ impl LatticeBuilder {
                         continue;
                     };
                     let syls = slice_syllables(code, &offsets);
-                    for (variant, fuzzy_edits) in FuzzyMatcher::expand_syllables(&syls, fuzzy) {
+                    for (variant, fuzzy_edits, variant_mask) in
+                        FuzzyMatcher::expand_syllables_masked(&syls, fuzzy)
+                    {
                         // 全原音节组合 == 原码，属精确命中，已由上面的 search_with_boundary
                         // 循环加入（且带真值边界校验），不可在此重复添加为模糊节点。
                         if variant == code {
                             continue;
                         }
-                        for (text, weight, _order) in &dict.search(&variant) {
+                        for hit in dict.search_with_boundary(&variant) {
                             // 去重
-                            if nodes[q].iter().any(|n| n.word == *text && n.start == p) {
+                            if nodes[q].iter().any(|n| n.word == hit.text && n.start == p) {
                                 continue;
                             }
                             // 模糊命中同样按图上那条标注路径计歧义罚：惩罚是**切分**的
                             // 属性（该路径是否踩在歧义接缝上），与词条来源无关。
-                            let log_prob = score_node(text, &variant, *weight)
+                            let log_prob = score_node(&hit.text, &variant, hit.weight)
                                 - FUZZY_SYLLABLE_LOG_PENALTY * fuzzy_edits as f64
                                 - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
+                            // 规范边界优先用词条自带的真值（与变体码同域）；缺失时按变体
+                            // 音节长度推——变体就是按这条切分逐音节展开出来的。
+                            let canon_mask = if hit.boundary != 0 {
+                                hit.boundary
+                            } else {
+                                variant_mask
+                            };
                             nodes[q].push(LatticeNode {
                                 start: p,
                                 end: q,
-                                word: text.clone(),
+                                word: hit.text,
                                 syllables: slice_syllables(code, &offsets),
                                 syl_mask: offsets_mask(&offsets),
                                 log_prob,
+                                canon: Some((variant.clone(), canon_mask)),
                             });
                         }
                     }
@@ -662,6 +682,7 @@ impl LatticeBuilder {
                             syllables: stroke.chars().map(|c| c.to_string()).collect(),
                             syl_mask: (0..span).fold(0u64, |m, i| m | (1u64 << i)),
                             log_prob,
+                            canon: None,
                         });
                     }
                 }
@@ -771,6 +792,7 @@ impl LatticeBuilder {
                             existing.log_prob = log_prob;
                             existing.syllables = slice_syllables(code, &offsets);
                             existing.syl_mask = offsets_mask(&offsets);
+                            existing.canon = None;
                         }
                         continue;
                     }
@@ -781,6 +803,7 @@ impl LatticeBuilder {
                         syllables: slice_syllables(code, &offsets),
                         syl_mask: offsets_mask(&offsets),
                         log_prob,
+                        canon: None,
                     });
                 }
             }
@@ -936,6 +959,7 @@ impl LatticeBuilder {
                         existing.log_prob = log_prob;
                         existing.syllables = slice_syllables(code, offsets);
                         existing.syl_mask = offsets_mask(offsets);
+                        existing.canon = Some((variant.clone(), cand.boundary));
                     }
                     continue;
                 }
@@ -946,6 +970,8 @@ impl LatticeBuilder {
                     syllables: slice_syllables(code, offsets),
                     syl_mask: offsets_mask(offsets),
                     log_prob,
+                    // 记录自己的码与边界：边界已逐音节验过等于变体边界。
+                    canon: Some((variant.clone(), cand.boundary)),
                 });
             }
         }
@@ -1030,6 +1056,7 @@ impl LatticeBuilder {
                         syllables: stroke.chars().map(|c| c.to_string()).collect(),
                         syl_mask: (0..span).fold(0u64, |m, i| m | (1u64 << i)),
                         log_prob,
+                        canon: None,
                     });
                 }
             }
@@ -1111,6 +1138,8 @@ impl LatticeBuilder {
                 syllables: vec![partial.to_string()],
                 syl_mask: 1,
                 log_prob,
+                // 残码位不填：见 `LatticeNode::canon`，残码整句的造词口径不在本字段范围。
+                canon: None,
             });
         }
     }

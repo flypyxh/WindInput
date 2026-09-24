@@ -248,3 +248,90 @@ fn word_learned_by_fuzzy_typing_is_retypeable_by_fuzzy_typing() {
         "平舌打法照旧"
     );
 }
+
+/// 敲入 `input` 后直接选中整句 `want`（不分步），返回上屏文本。
+fn type_and_pick(coord: &Coordinator, input: &str, want: &str) -> Option<String> {
+    for ch in input.chars() {
+        coord.handle_key_event_policed(&key((ch.to_ascii_uppercase() as u32) & 0xFF));
+    }
+    pick(coord, want)
+}
+
+/// 临时库里文本为 `text` 的全部记录 (码, 边界)。
+fn temp_records(store: &Store, text: &str) -> Vec<(String, u64)> {
+    store
+        .search_temp_words_prefix("pinyin", "", 500)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.text == text)
+        .map(|r| (r.code, r.boundary))
+        .collect()
+}
+
+/// 模糊**整句**一次上屏（单段整句造词）：写库码须为规范码，不是所打码。
+///
+/// 整句候选的 `code` 是所打码 `chaijiuduolian`；此前不带 `learn_code`，
+/// `learn_phrase_on_commit` 便把它原样写进临时库 —— 下次同样打法**零罚精确命中**这条
+/// 非规范记录，平舌打法反而打不出。改后写的是 `caijiuduolian`，翘舌打法只能经模糊召回它。
+///
+/// 这条走的是**系统词**模糊节点（`build` 的模糊分支），与 S2 开关无关。
+#[test]
+fn fuzzy_sentence_commit_learns_canonical_code() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.ch_c = true;
+    let db = std::env::temp_dir().join("wind_learn_code_fuzzy_sentence.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    const SENT: &str = "才就多练";
+    assert_eq!(
+        type_and_pick(&coord, "chaijiuduolian", SENT).as_deref(),
+        Some(SENT),
+        "前提：翘舌打法的整句是「{SENT}」且一次上屏"
+    );
+    // cai|jiu|duo|lian → 位 0/3/6/9
+    assert_eq!(
+        temp_records(&store, SENT),
+        [("caijiuduolian".to_string(), 0b10_0100_1001u64)],
+        "造词码须为规范码，且边界在规范码坐标下"
+    );
+}
+
+/// 同上，经 S2 的用户词模糊节点组出的整句：`wo` + 用户词「菜就多练」（规范码 caijiuduolian）。
+#[test]
+fn s2_fuzzy_sentence_commit_learns_canonical_code() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.ch_c = true;
+    c.schema.pinyin.sentence_uses_user_words = true;
+    let db = std::env::temp_dir().join("wind_learn_code_s2_fuzzy_sentence.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    store
+        .add_user_word("pinyin", "caijiuduolian", "菜就多练", 1200, 0b10_0100_1001)
+        .unwrap();
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    const SENT: &str = "我菜就多练";
+    assert_eq!(
+        type_and_pick(&coord, "wochaijiuduolian", SENT).as_deref(),
+        Some(SENT),
+        "前提：整句是「{SENT}」且一次上屏"
+    );
+    // wo|cai|jiu|duo|lian → 位 0/2/5/8/11
+    assert_eq!(
+        temp_records(&store, SENT),
+        [("wocaijiuduolian".to_string(), 0b1001_0010_0101u64)],
+        "造词码须为规范码"
+    );
+}
