@@ -788,27 +788,83 @@ remote_rename_aside() {
 foreach(\$n in @($arr)){ \$p=Join-Path \$d \$n; if(Test-Path \$p){ Rename-Item \$p (\$n+'.old_'+(Get-Random)) -Force } }" >/dev/null 2>&1 || true
 }
 
-# 启动远端主进程（避免等 TSF 被动加载）。
+# 部署期闸门：HKLM\Software\WindInput[Dev] 的 InstallerRunning="1" 时，宿主里的 TSF DLL
+# 连不上管道也不自行拉起服务（wind_tsf/src/IPCClient.cpp 的 _StartService → _InstallerGuardBlocks）。
+#
+# ★ 为什么必须有：dev.sh 此前从不写它（dev.ps1 早有 Set-InstallerRunning，又一处两侧漂移）。
+#   taskkill 之后、改名让路之前的那一两秒里，靶机上任一宿主敲键/切焦点，DLL 就按**原路径**
+#   CreateProcess 起了**旧 exe**；随后改名让路把这个正在跑的旧 exe 改成 .old_*，scp 写上新 exe，
+#   脚本末尾的计划任务启动被单例挡掉 —— 而旧的存活检查按映像名 tasklist，照样报「存活」。
+#   2026-09-24 实测：服务日志 23:15:44 起的是 build 14:39Z，新 exe mtime 23:15:47。
+#
+# ⚠️ 键按变体分：DLL 读的是 "Software\\" WIND_APP_NAME（dev 为 WindInputDev，见
+#   wind_tsf/include/Globals.h），写错变体就是一道不生效的闸门。
+# ⚠️ 开启时顺手删掉 InstallerRunningOwner：若残留一个已死安装器的 owner，DLL 走身份校验
+#   判「主人已死 → 遗物」而放行，闸门静默失效。无 owner 时走 10 分钟年龄兜底 —— 脚本中途
+#   被打断没来得及清，最多挡 10 分钟，不会永久卡死。
+# ⚠️ 结尾的 exit 0 不能省：值不存在时 Remove-ItemProperty 虽被 -EA 静默，powershell 仍以
+#   「最后一条命令失败」退出码 1 收场，于是写成功了也报失败（实跑踩到）。
+# ⚠️ 键写入需要管理员 SSH 会话（同步 TSF 系统副本本来就需要）；失败只告警不中断，
+#   靠 remote_start_main 的「新版本存活」校验兜底。
+remote_deploy_guard() {
+    local profile="$1" on="$2" app="WindInput"
+    [ "$profile" = dev ] && app="WindInputDev"
+    local k="HKLM:\\Software\\$app"
+    if [ "$on" = on ]; then
+        remote_ps "\$ErrorActionPreference='Stop'; if(-not (Test-Path '$k')){ New-Item -Path '$k' -Force | Out-Null }; \
+Set-ItemProperty -Path '$k' -Name InstallerRunning -Value '1' -Type String -Force; \
+Remove-ItemProperty -Path '$k' -Name InstallerRunningOwner -EA SilentlyContinue; exit 0" >/dev/null 2>&1 \
+            && gray "  部署闸门开启：$k InstallerRunning=1（推送期间 TSF DLL 不自动拉起服务）" \
+            || warn "  部署闸门开启失败（$k）；推送期间宿主可能拉起旧 exe，靠最后的版本校验兜底"
+    else
+        remote_ps "\$ErrorActionPreference='Stop'; if(Test-Path '$k'){ Set-ItemProperty -Path '$k' -Name InstallerRunning -Value '0' -Type String -Force }" >/dev/null 2>&1 \
+            || warn "  部署闸门清除失败（$k InstallerRunning 仍为 1，10 分钟后 DLL 按陈旧标记放行）"
+    fi
+}
+
+# 启动远端主进程，并校验跑起来的**确实是刚推上去的那份 exe**。
 # 注意：经 SSH 直接 Start-Process 的子进程会随 SSH 断开被 Job Object 连带杀掉
 # （症状：部署后看不到进程）。改用计划任务(schtasks)在用户交互会话拉起，脱离 SSH 生命周期。
+#
+# ★ 判据是「运行中进程映像文件的 MD5 == 本地产物 MD5」，不是「有个叫 wind_input*.exe 的进程」：
+#   后者在推送途中被拉起的旧进程（映像已被改名成 .old_*）面前恒真，见 remote_deploy_guard。
+#   不一致就把该变体进程全停掉再起，最多 3 轮，仍不一致返回 1。
 remote_start_main() {
     local profile="$1" sfx=""; [ "$profile" = dev ] && sfx="_dev"
-    local exe="$REMOTE_DIR/wind_input${sfx}.exe"
-    say "启动远端主进程 wind_input${sfx}.exe (计划任务,脱离 SSH 会话)..."
-    # 用 ScheduledTasks cmdlet 在用户交互会话(session 1)拉起：进程脱离 SSH 的
-    # Job Object，SSH 断开后仍存活；路径作普通字符串传入，无 cmd 引号困扰。
-    remote_ps "\$ErrorActionPreference='SilentlyContinue'; \
+    local name="wind_input${sfx}" exe="$REMOTE_DIR/wind_input${sfx}.exe"
+    local local_exe; local_exe="$(out_for "$profile")/$name.exe"
+    local want; want="$(md5sum "$local_exe" 2>/dev/null | awk '{print toupper($1)}')"
+    local build; build="$(strings -n 8 "$local_exe" 2>/dev/null | grep -oE '\(build [^ )]+' | head -1 | cut -c8-)"
+    [ -n "$want" ] || { err "本地无 $local_exe，无法校验远端版本"; return 1; }
+    local try out
+    for try in 1 2 3; do
+        say "启动远端主进程 $name.exe (计划任务,脱离 SSH 会话；第 $try 轮)..."
+        remote_ps "\$ErrorActionPreference='SilentlyContinue'; \
 \$exe='$exe'.Replace('/','\\'); \$wd='$REMOTE_DIR'.Replace('/','\\'); \
 \$a=New-ScheduledTaskAction -Execute \$exe -WorkingDirectory \$wd; \
 Register-ScheduledTask -TaskName 'WindInputDeployBoot' -Action \$a -Force | Out-Null; \
 Start-ScheduledTask -TaskName 'WindInputDeployBoot'; Start-Sleep -Seconds 2; \
 Unregister-ScheduledTask -TaskName 'WindInputDeployBoot' -Confirm:\$false" >/dev/null 2>&1 || true
-    sleep 2
-    if ssh "$WIND_REMOTE" "tasklist /FI \"IMAGENAME eq wind_input${sfx}.exe\" /NH" 2>/dev/null | grep -qi "wind_input${sfx}.exe"; then
-        say "主进程已启动并存活。"
-    else
-        warn "未检测到主进程存活（可能被单例/任务策略挡住）；可在 Windows 手动启动，或开始输入由 TSF 拉起。"
-    fi
+        sleep 2
+        # 每行: pid|映像MD5|映像路径。映像已被改名让路的旧进程，Path 指向 .old_*，MD5 对不上。
+        out="$(remote_ps "Get-Process -Name '$name' -EA SilentlyContinue | ForEach-Object { \
+\$h=''; try { \$h=(Get-FileHash -Algorithm MD5 -LiteralPath \$_.Path -EA Stop).Hash } catch {}; \
+'{0}|{1}|{2}' -f \$_.Id, \$h, \$_.Path }" 2>/dev/null | tr -d '\r')"
+        if printf '%s\n' "$out" | grep -q "^[0-9]*|$want|"; then
+            say "新版本主进程已启动并存活（映像 MD5 = 本地产物 ${want:0:8}…，build ${build:-?}）。"
+            return 0
+        fi
+        if [ -n "$out" ]; then
+            warn "  运行中的 $name 不是刚推上去的版本（占着单例，新进程起不来）:"
+            printf '%s\n' "$out" | sed 's/^/    /'
+        else
+            warn "  未检测到 $name 进程。"
+        fi
+        ssh "$WIND_REMOTE" "taskkill /F /IM $name.exe" >/dev/null 2>&1 || true
+        sleep 1
+    done
+    err "3 轮后远端运行的仍不是本地产物（期望 MD5 $want，build ${build:-?}）—— 部署未生效，别按新版本测。"
+    return 1
 }
 
 # TSF DLL 的**系统副本**同步：<System32|SysWOW64>\IME\<App>\。
@@ -865,6 +921,15 @@ do_push_full() {
     resolve_remote_dir "$profile" || return 1
     local outdir; outdir="$(out_for "$profile")"
     [ -d "$outdir" ] || { err "无 $outdir；请先 '$([ "$profile" = dev ] && echo d1 || echo 1)' 全构建。"; return 1; }
+    remote_deploy_guard "$profile" on
+    _push_full_body "$profile" "$outdir"
+    local rc=$?
+    remote_deploy_guard "$profile" off
+    return $rc
+}
+
+_push_full_body() {
+    local profile="$1" outdir="$2"
     say "\n停止远端进程（$profile）..."
     remote_taskkill "$profile"
     ssh "$WIND_REMOTE" "if not exist \"${REMOTE_DIR//\//\\}\" mkdir \"${REMOTE_DIR//\//\\}\"" >/dev/null 2>&1 || true
@@ -875,7 +940,7 @@ do_push_full() {
     if scp -r "$outdir"/* "$WIND_REMOTE:$REMOTE_DIR/"; then
         # ★ 与 do_push_module 同理：不同步系统副本，新 TSF DLL 不会被任何宿主加载。
         remote_sync_tsf_system_copy "$profile" || return 1
-        remote_start_main "$profile"
+        remote_start_main "$profile" || return 1
         remote_cleanup_old
         say "已全量部署并启动（$profile）。"
     else
@@ -911,6 +976,16 @@ do_push_module() {
     for f in "${files[@]}"; do
         [ -f "$outdir/$f" ] || { err "本地无 $outdir/$f（先构建对应模块）"; return 1; }
     done
+    remote_deploy_guard "$profile" on
+    _push_module_body "$profile" "$mod" "$outdir" "${files[@]}"
+    local rc=$?
+    remote_deploy_guard "$profile" off
+    return $rc
+}
+
+_push_module_body() {
+    local profile="$1" mod="$2" outdir="$3"; shift 3
+    local files=("$@") f
     say "\n停止远端进程（$profile/$mod）..."
     remote_taskkill "$profile" "$mod"
     say "改名让路 + 推送..."
@@ -932,9 +1007,11 @@ do_push_module() {
             tsf) remote_sync_tsf_system_copy "$profile" || return 1 ;;
         esac
         # 推了核心/TSF 则重启主进程让其立即生效
-        case "$mod" in core|tsf) remote_start_main "$profile" ;; esac
+        case "$mod" in core|tsf) remote_start_main "$profile" || return 1 ;; esac
         remote_cleanup_old
         say "模块部署完成（$profile/$mod）。"
+    else
+        return 1
     fi
 }
 
