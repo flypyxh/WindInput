@@ -1134,6 +1134,19 @@ impl ReverseLookup {
             .join(sep)
     }
 
+    /// 词的**整词反查编码串**（逐字编码以 `sep` 连接，无拆字数据的字跳过）。全空返回空串。
+    ///
+    /// 与 [`Self::radicals_of`] 对称、同源不同列：那边取字根（「这个词长什么样」），这里
+    /// 取拆字库里记录的编码（「这个词逐字怎么打」）。与 [`Self::chaizi_code_of`] 的关系
+    /// 也对应 `radicals_of` 与 [`Self::chaizi_code_of`] 里 `chaizi`/单字取码的关系：
+    /// 那个仅单字候选可用，这个不限字数。
+    pub fn codes_of(&self, text: &str, sep: &str) -> String {
+        text.chars()
+            .filter_map(|c| self.chaizi.code(c))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
     /// 生成词的拼音编码（空格分隔、去声调小写；ü→v）。无读音的字跳过。
     /// 用于设置页 dict.genPinyin / 拼音方案加词自动出码。
     pub fn gen_pinyin(&self, text: &str) -> String {
@@ -2226,6 +2239,17 @@ mod tests {
         assert_eq!(rl.radicals_of("好人", " "), "女子 人");
         assert_eq!(rl.radicals_of("好X", " "), "女子", "无字根的字跳过");
         assert_eq!(rl.radicals_of("XY", " "), "");
+    }
+
+    /// 整词编码串：与 `radicals_of` 对称，逐字取拆字库里记录的编码而非字根，
+    /// 无编码的字同样跳过。
+    #[test]
+    fn codes_of_joins_per_char() {
+        let rl = sample_rl();
+        assert_eq!(rl.codes_of("好", " "), "vbg");
+        assert_eq!(rl.codes_of("好人", " "), "vbg w");
+        assert_eq!(rl.codes_of("好X", " "), "vbg", "无编码的字跳过");
+        assert_eq!(rl.codes_of("XY", " "), "");
     }
 
     #[test]

@@ -696,6 +696,7 @@ impl crate::coordinator::Coordinator {
             "chaizi_code" if single => reverse.chaizi_code_of(text),
             "chaizi_code" => String::new(),
             "chaizi_all" => reverse.radicals_of(text, arg.unwrap_or(" ")),
+            "chaizi_code_all" => reverse.codes_of(text, arg.unwrap_or(" ")),
             // `shuangpin` —— 这段文本的双拼编码。
             //
             // 与注释段同义但取音节的路子不同：那边有候选身份，直接用词条真值
@@ -743,6 +744,8 @@ impl crate::coordinator::Coordinator {
     ///   拼在一起即悬停提示拆字段的同款信息（`亻尔 [wq]`），但格式由模板决定而非写死。
     /// - `chaizi_all[:分隔符]` —— 不限字数的逐字字根，默认空格连接；带参数可改，
     ///   如 `${chaizi_all:／}` → `亻尔／女子`。长度自负（配 `comment_max_chars` 或只用于竖排）。
+    /// - `chaizi_code_all[:分隔符]` —— 与 `chaizi_all` 对称，取的是逐字**编码**而非字根，
+    ///   不限字数、默认空格连接、参数改分隔符规则相同（t207）。无编码的字同样跳过。
     /// - `dict` —— 用户挂载的注释词库（`[[ui.comment_dicts]]`）里该词的注释。键是**词**，
     ///   一份「英汉释义」「emoji 名称」可跨全部方案复用；候选 `code` 作可选消歧。
     ///
@@ -868,6 +871,7 @@ impl crate::coordinator::Coordinator {
             "chaizi_code" if single => reverse.chaizi_code_of(&c.text),
             "chaizi_code" => String::new(),
             "chaizi_all" => reverse.radicals_of(&c.text, arg.unwrap_or(" ")),
+            "chaizi_code_all" => reverse.codes_of(&c.text, arg.unwrap_or(" ")),
             // 用户挂载的注释词库（`[[ui.comment_dicts]]`）。键是**词**，故一份库可跨方案复用；
             // 候选自身的 `code` 作可选消歧（注释库声明了 code 列时才生效，跨方案对不上则
             // 回落该词首条，见 `ReverseLookup::comment_of`）。
@@ -1684,6 +1688,34 @@ mod eval_var_tests {
             co.eval_text_var("code_hint", None, "你好", &rev),
             None,
             "code_hint 依赖候选身份，裸文本入口不该有"
+        );
+    }
+
+    /// ★ `chaizi_code_all`（t207）—— 与 `chaizi_all` 对称，逐字反查编码，不限字数。
+    ///
+    /// 两处 match（候选注释 `eval_var` / 裸文本 `eval_text_var`）都要认得这个名字，
+    /// 且都不受 `single`（仅单字）门控——这正是它与 `chaizi_code` 的分工差异。
+    /// 测试环境的 `ReverseLookup::default()` 没有拆字数据，产出恒为空串，这里只钉
+    /// 「已知变量名、且不受单字门控」，实际取值由 wind-reverse::codes_of 的单测钉住。
+    #[test]
+    fn chaizi_code_all_is_known_and_not_single_gated() {
+        let co = coord("shuangpin");
+        let rev = wind_reverse::ReverseLookup::default();
+        // 候选注释入口：多字候选也应给出「已知变量」（空串而非 None）。
+        let word = Candidate {
+            text: "你好".into(),
+            ..nihao()
+        };
+        assert_eq!(
+            eval(&co, "chaizi_code_all", &word, CodeHintSource::Auto).as_deref(),
+            Some(""),
+            "无拆字数据时应为空串（已知变量），而非 None（未知变量名）"
+        );
+        // 裸文本入口（dict.rev）同一词汇表。
+        assert!(
+            co.eval_text_var("chaizi_code_all", None, "你好", &rev)
+                .is_some(),
+            "chaizi_code_all 在 dict.rev 入口也应是已知变量名"
         );
     }
 
