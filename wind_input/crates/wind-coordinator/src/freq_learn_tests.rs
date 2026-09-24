@@ -895,3 +895,52 @@ fn codetable_temp_word_is_promoted_without_pinyin_check() {
     // 码表码不是拼音，切不出音节也照常晋升。
     assert!(promote_once("codetable", "wubi86", "abcd", "测试", 0));
 }
+
+// ── overlay（临拼 / 快捷输入）造词的各段同源守卫（`learn_phrase_on_commit_in`）。
+//
+// 集成测试走不到这道守卫：快捷输入末段归英文 / 码表成员时，成员类型闸门先挡下了。
+// 这里直接构造分段，owner 取拼音型方案，只变末段来源。
+
+/// 构造两段 `committed_segs`（首段拼音 `nihao`、末段 `shijie` 来源由参数给），按 overlay
+/// 拼音方案造词，返回拼音桶里是否写进了「你好世界」。
+fn overlay_learn_two_segs(tag: &str, tail_source: CandidateSource) -> bool {
+    let (c, store) = pinyin_coord(&format!("{tag}_{}", std::process::id()));
+    {
+        let mut st = c.state.lock().unwrap();
+        st.committed_segs.clear();
+        for (code, text, source, boundary) in [
+            ("nihao", "你好", CandidateSource::Pinyin, 0b101u64),
+            ("shijie", "世界", tail_source, 0b1001),
+        ] {
+            st.committed_segs.push(CommittedSeg {
+                raw_code: code.into(),
+                code: code.into(),
+                text: text.into(),
+                source,
+                boundary,
+                learn: None,
+            });
+        }
+    }
+    {
+        let st = c.state.lock().unwrap();
+        c.learn_phrase_on_commit_in(&st, false, Some("py_solo"));
+    }
+    store
+        .get_temp_word("pinyin", "nihaoshijie", "你好世界")
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn overlay_mixed_source_segments_are_not_learned() {
+    // 正向对照：两段同源（拼音）照常造词——否则下面的「没学」不说明守卫生效。
+    assert!(
+        overlay_learn_two_segs("ovl_same_src", CandidateSource::Pinyin),
+        "前提：overlay 拼音方案下同源两段应造词"
+    );
+    assert!(
+        !overlay_learn_two_segs("ovl_mixed_src", CandidateSource::English),
+        "overlay 各段来源不同（拼音 + 英文）不得造词"
+    );
+}

@@ -547,7 +547,11 @@ impl Coordinator {
             });
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             // 单段整句同样要造词（临拼模式下整句一次上屏亦只 push 一段）。
-            self.learn_phrase_on_commit(state, cand.is_synthesized);
+            // 闸门与归属按**临拼目标方案**（主方案可能是五笔，见 `learn_phrase_on_commit_in`）；
+            // 取不到目标方案就不造词——传 `None` 会退回活跃方案语义，那正是本修复要去掉的。
+            if let Some(owner) = temp_pinyin_owner.as_deref() {
+                self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
+            }
             // 变体候选末段用覆盖文本；普通候选整体转换（保留 STPhrases 跨段词级消歧）。
             let out = match &cand.s2t_override {
                 Some(t) => format!("{}{}", self.maybe_convert(state, &state.committed_text), t),

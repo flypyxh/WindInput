@@ -478,10 +478,35 @@ impl Coordinator {
     ///
     /// 多段时两者 key 不同（造词写整串 `nihaoshijie`，6b 查末段 `shijie`），都该执行，
     /// 故返回的是 code 而非 bool：调用方比对 code 是否相同，只在相同时跳过。
+    ///
+    /// 主输入路专用（闸门与归属按活跃方案）；overlay 走 [`Self::learn_phrase_on_commit_in`]。
     pub(crate) fn learn_phrase_on_commit(
         &self,
         state: &State,
         single_is_synthesized: bool,
+    ) -> Option<String> {
+        self.learn_phrase_on_commit_in(state, single_is_synthesized, None)
+    }
+
+    /// [`Self::learn_phrase_on_commit`] 的内核。`overlay` = overlay 模式下**产出这些段的方案**
+    /// （临拼：`temp_pinyin_schema`；快捷输入：本次候选的成员方案 `mix_candidate_owner`）。
+    ///
+    /// # 为什么 overlay 不能按活跃方案判
+    ///
+    /// 临拼 / 快捷输入产出的是拼音词，与主方案是什么无关。按活跃方案判，主方案是纯码表
+    /// （五笔）时 `is_codetable()` 恒真 ⇒ 两条 overlay 分步组词**永远不造词**；归属也会
+    /// 落到活跃方案的桶。故 `Some(schema)` 时闸门与归属一律按该方案：
+    ///
+    /// - 只接拼音型（折叠到 `"pinyin"`）与混输型（按段来源分流，同主路混输那支）方案，
+    ///   码表 / 英文成员产出的段不走本路（码表另有 `auto_phrase`，英文无造词语义）；
+    /// - **各段来源必须一致**：快捷输入可以先分步选拼音「你好」、再选英文 `hel`，拼成的
+    ///   `nihaohel → 你好hel` 谁也打不出来。只看末段候选的成员不够——末段是拼音、前段是
+    ///   码表（混输超码长回捞）同样是混源。
+    pub(crate) fn learn_phrase_on_commit_in(
+        &self,
+        state: &State,
+        single_is_synthesized: bool,
+        overlay: Option<&str>,
     ) -> Option<String> {
         // 单段仅当它是整句解时放行；其余仍要求 ≥2 段。
         if state.committed_segs.len() < 2
@@ -495,8 +520,19 @@ impl Coordinator {
         // 混输**不**在此排除：其拼音子引擎的分步转换会正常产生 committed_segs，那是合法的
         // 拼音造词路径（学成拼音码的词）。混输的**单字序列**另由 auto_phrase 缓冲学成码表词，
         // 两者是不同维度、可并存。
-        if self.engine_mgr.is_codetable() {
-            return None;
+        //
+        // overlay 按它自己的方案判（见本函数文档），不问活跃方案。
+        match overlay {
+            None if self.engine_mgr.is_codetable() => return None,
+            Some(o)
+                if !matches!(
+                    self.engine_mgr.schema_engine_type(o).as_deref(),
+                    Some("pinyin" | "mixed")
+                ) =>
+            {
+                return None;
+            }
+            _ => {}
         }
         // 闸门统一读 `[schema.pinyin.auto_learn]`：**走到这里的产出恒是拼音词**
         // （纯码表已在上方 `is_codetable()` 处返回），故闸门、字数上下限、晋升阈值都归拼音。
@@ -578,12 +614,16 @@ impl Coordinator {
             return None;
         };
         let active = self.engine_mgr.active_schema_id();
-        // 归属方案：非混输维持折叠自身/拼音（不看段来源，现行为）；
+        // 段的产出方案：overlay 用它自己的（临拼目标 / 快捷输入成员），主路用活跃方案。
+        let owner = overlay.unwrap_or(&active);
+        // 归属方案：非混输维持折叠自身/拼音（主路不看段来源，现行为）；
         // 混输仅当全段同源时用该源归属 id（混源/无法归因跳过，混合码写给谁都无意义）。
+        // overlay 的拼音方案同样要求全段同源（快捷输入可跨成员分步，见本函数文档）。
         // 注：混源判定使用截后 segs，截掉的段不参与归属判断。
-        let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
-            let first = segs[0].source; // 上面的 is_empty 守卫已保证非空
-            if segs.iter().any(|seg| seg.source != first) {
+        let first = segs[0].source; // 上面的 is_empty 守卫已保证非空
+        let mixed_source = segs.iter().any(|seg| seg.source != first);
+        let schema = if self.engine_mgr.schema_engine_type(owner).as_deref() == Some("mixed") {
+            if mixed_source {
                 return None; // 混源：跳过自动造词
             }
             // 全段码表：混输超码长回捞的前缀候选现在带 `consumed_length`（见 `mixed/engine.rs`
@@ -593,9 +633,12 @@ impl Coordinator {
             if first == CandidateSource::CodeTable {
                 return None;
             }
-            self.engine_mgr.write_data_schema_id(&active, first)? // None = 无法归因来源
+            self.engine_mgr.write_data_schema_id(owner, first)? // None = 无法归因来源
         } else {
-            self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
+            if overlay.is_some() && mixed_source {
+                return None; // overlay 混源（拼音段 + 英文 / 码表段）：跳过自动造词
+            }
+            self.engine_mgr.data_schema_id(owner) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         };
         // 查重用户词库：同「码+词」已在用户层则不再写临时层（对齐码表侧 `flush_auto_phrase`
         // 的查重②）。已经是用户词的，再进临时层既无晋升意义、又让候选面多一条同文项。

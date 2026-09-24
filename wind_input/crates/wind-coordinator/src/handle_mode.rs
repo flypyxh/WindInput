@@ -1970,7 +1970,11 @@ impl Coordinator {
                         learn: cand.meta.learn_code.clone(),
                     });
                     // 单段整句同样要造词（混输下拼音子引擎的整句一次上屏亦只 push 一段）。
-                    self.learn_phrase_on_commit(state, cand.is_synthesized);
+                    // 闸门与归属按**本候选的成员方案**，不按活跃方案（见
+                    // `learn_phrase_on_commit_in`）；归不到成员（内置来源等）就不造词。
+                    if let Some(owner) = mix_member_owner.as_deref() {
+                        self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
+                    }
                 }
             } else {
                 // 数字透镜（计算/日期/金额）无编码可记词频，但同样是一次上屏：
