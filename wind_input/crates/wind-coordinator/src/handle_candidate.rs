@@ -3,8 +3,8 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
 use crate::coordinator::{
-    CommittedSeg, Coordinator, DEFERRED_COMPOSITION_FALLBACK_MS, InputOutcome, LEARN_ADD_WEIGHT,
-    State, now_unix_secs, punct_char,
+    CommittedSeg, Coordinator, DEFERRED_COMPOSITION_FALLBACK_MS, InputOutcome, State,
+    now_unix_secs, punct_char,
 };
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
@@ -3295,83 +3295,14 @@ impl Coordinator {
             let promoted_draft =
                 cand.is_draft && self.promote_draft_on_commit(&code, &cand.text, cand.boundary);
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
-            // 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。
             // is_group/is_command 已在 commit_selected 入口提前返回；is_phrase 由本条件显式过滤
             //（短语无临时词晋升语义），此处均为普通候选。
             //
-            // **刚由造词写入的那条要跳过**：单段整句时造词的 key 与这里的点查完全相同，
-            // 不跳就是同一次上屏 count +2（见 `learn_phrase_on_commit` 的返回值说明）。
-            // **刚跃迁的草稿同样要跳过**：跃迁已把 count 记成 1，6b 再点查命中一次
-            // 就是同一次上屏 count +2 —— 与上面那条 `learned_code` 是同一个坑。
-            //
-            // **点查用记录码**：模糊召回的候选 `code` 是所打码（`chaijiuduolian`），记录在
-            // 规范码（`caijiuduolian`，即 `meta.store_code`）下，只拿 `code` 点查永远落空 ⇒
-            // 模糊打法选多少次都不涨计数、永远晋升不了。故依次试 `store_code`、`code`，取
-            // 第一个查得到的（同 `delete_candidate` 的试码法）——对只试 `code` 的旧写法是严格
-            // 超集：双层同文时 `store_code` 可能指向用户层的码，那时退回 `code` 仍能命中。
-            //
-            // 边界跟着码走：码是 `code` 时用候选边界；是记录码时只能用同码的 `learn_code`
-            // 边界（模糊命中的 `learn_code` 正是（记录码, 记录边界）），否则给 0。候选边界在
-            // 所打码坐标下，补进规范码记录（旧边界为 0 时 `learn_temp_word` 会补写）就是错的。
-            //
-            // 「刚造词」守卫比的也必须是**命中的那个码**：造词写的是规范码，与这里命中的
-            // 记录码相同；拿所打码比会漏判，同一次上屏计数 +2。
-            if !cand.is_phrase
-                && !promoted_draft
-                && let Some(store) = &self.store
-            {
+            // **刚跃迁的草稿要跳过**：跃迁已把 count 记成 1，6b 再点查命中一次就是同一次上屏
+            // count +2 —— 与 `learned_code` 是同一个坑（后者在共用函数里判）。
+            if !cand.is_phrase && !promoted_draft {
                 let active = self.engine_mgr.active_schema_id();
-                let hit = self
-                    .engine_mgr
-                    .write_data_schema_id(&active, cand.source)
-                    .and_then(|schema| {
-                        [cand.meta.store_code.as_deref(), Some(code.as_str())]
-                            .into_iter()
-                            .flatten()
-                            .find(|c| {
-                                matches!(store.get_temp_word(&schema, c, &cand.text), Ok(Some(_)))
-                            })
-                            .map(|c| (schema, c.to_string()))
-                    });
-                if let Some((schema, temp_code)) = hit
-                    && learned_code.as_deref() != Some(temp_code.as_str())
-                {
-                    let temp_boundary = if temp_code == code {
-                        cand.boundary
-                    } else {
-                        cand.meta
-                            .learn_code
-                            .as_ref()
-                            .filter(|(c, _)| *c == temp_code)
-                            .map_or(0, |(_, b)| *b)
-                    };
-                    let promote_count = if self.engine_mgr.is_pinyin() {
-                        self.engine_mgr.auto_learn_settings().promote_count
-                    } else {
-                        self.engine_mgr
-                            .codetable_settings()
-                            .auto_phrase
-                            .promote_count
-                    };
-                    // 选中已存在的临时词：learn_temp_word 内部沿用旧 boundary，仅当旧值为 0
-                    // （v1 遗留/无信息）时用上面算出的边界补上。
-                    if let Ok(count) = store.learn_temp_word(
-                        &schema,
-                        &temp_code,
-                        &cand.text,
-                        LEARN_ADD_WEIGHT,
-                        temp_boundary,
-                    ) {
-                        self.maybe_promote_temp(
-                            store,
-                            &schema,
-                            &temp_code,
-                            &cand.text,
-                            count,
-                            promote_count,
-                        );
-                    }
-                }
+                self.bump_selected_temp_word(&active, cand, &code, learned_code.as_deref());
             }
             // 变体候选（用户明选「齣」类 1对多变体）：末段用覆盖文本、前缀单独转换。
             // 普通候选保持**整体**转换——STPhrases 词级最长匹配可跨 committed/候选边界

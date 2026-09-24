@@ -944,3 +944,72 @@ fn overlay_mixed_source_segments_are_not_learned() {
         "overlay 各段来源不同（拼音 + 英文）不得造词"
     );
 }
+
+// ── 6b 晋升阈值按落桶选（`bump_selected_temp_word`）。
+//
+// 混输 owner（mx_test）选中拼音侧临时词：落 `pinyin` 桶，阈值须取拼音那份；码表侧临时词
+// 落主码表方案桶，阈值取码表那份。两份阈值刻意取不同值，读错一侧即红。
+
+const BUMP_PY_PROMOTE: usize = 2;
+const BUMP_CT_PROMOTE: usize = 5;
+
+/// 混输方案（mx_test）的无头 Coordinator，拼音 / 码表晋升阈值分别为 2 / 5。
+fn mixed_bump_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
+    let tag = format!("{tag}_{}", std::process::id());
+    // 借 `mixed_coord` 落好方案文件，再按本组所需配置另起一个。
+    drop(mixed_coord(&tag));
+    let base_dir = std::env::temp_dir().join(format!("wind_coord_p2d_{tag}"));
+    let mut cfg = Config::default();
+    cfg.schema.active = "mx_test".into();
+    cfg.schema.available = vec!["mx_test".into(), "ct_test".into(), "py_test".into()];
+    cfg.schema.pinyin.auto_learn.promote_count = BUMP_PY_PROMOTE;
+    cfg.schema.codetable.auto_phrase.promote_count = BUMP_CT_PROMOTE;
+    let db_path = std::env::temp_dir().join(format!("wind_coord_bump_{tag}.redb"));
+    let _ = std::fs::remove_file(&db_path);
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    let c = Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+    (c, store)
+}
+
+/// 预置 1 次临时词，经 6b 选中一次（计数到 2），返回是否晋升进用户库。
+fn bump_once(tag: &str, bucket: &str, source: CandidateSource, code: &str, boundary: u64) -> bool {
+    let (c, store) = mixed_bump_coord(tag);
+    store
+        .learn_temp_word(bucket, code, "你好", 800, boundary)
+        .unwrap();
+    let cand = wind_candidate::Candidate {
+        text: "你好".into(),
+        code: code.into(),
+        source,
+        boundary,
+        ..Default::default()
+    };
+    c.bump_selected_temp_word("mx_test", &cand, code, None);
+    let promoted = store
+        .get_user_words(bucket, code)
+        .unwrap()
+        .iter()
+        .any(|r| r.text == "你好");
+    if !promoted {
+        assert_eq!(
+            store.get_temp_word(bucket, code, "你好").unwrap(),
+            Some(2),
+            "前提（{tag}）：6b 应把计数推到 2（否则没晋升不说明阈值取对）"
+        );
+    }
+    promoted
+}
+
+#[test]
+fn bump_threshold_follows_landing_bucket() {
+    // 拼音侧：落 pinyin 桶，阈值 2 ⇒ 第 2 次晋升。按 owner 类型选会取码表的 5，不晋升。
+    assert!(
+        bump_once("bump_py", "pinyin", CandidateSource::Pinyin, "nihao", 0b101),
+        "混输 owner 下拼音桶临时词应按拼音阈值晋升"
+    );
+    // 码表侧：落主码表方案桶，阈值 5 ⇒ 第 2 次不晋升（反向对照，防「一律取拼音阈值」）。
+    assert!(
+        !bump_once("bump_ct", "ct_test", CandidateSource::CodeTable, "wqvb", 0),
+        "混输 owner 下码表桶临时词应按码表阈值，2 次不晋升"
+    );
+}

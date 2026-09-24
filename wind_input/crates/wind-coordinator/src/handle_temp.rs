@@ -539,7 +539,7 @@ impl Coordinator {
         } else {
             state.committed_segs.push(CommittedSeg {
                 raw_code,
-                code,
+                code: code.clone(),
                 text: cand.text.clone(),
                 source: cand.source,
                 boundary: cand.boundary,
@@ -550,7 +550,12 @@ impl Coordinator {
             // 闸门与归属按**临拼目标方案**（主方案可能是五笔，见 `learn_phrase_on_commit_in`）；
             // 取不到目标方案就不造词——传 `None` 会退回活跃方案语义，那正是本修复要去掉的。
             if let Some(owner) = temp_pinyin_owner.as_deref() {
-                self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
+                let learned_code =
+                    self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
+                // 6b：选中已有临时词推进晋升计数，与主路同一函数；归属同上取临拼目标方案。
+                if !cand.is_phrase {
+                    self.bump_selected_temp_word(owner, cand, &code, learned_code.as_deref());
+                }
             }
             // 变体候选末段用覆盖文本；普通候选整体转换（保留 STPhrases 跨段词级消歧）。
             let out = match &cand.s2t_override {

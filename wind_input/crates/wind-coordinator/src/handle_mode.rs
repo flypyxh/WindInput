@@ -1973,7 +1973,18 @@ impl Coordinator {
                     // 闸门与归属按**本候选的成员方案**，不按活跃方案（见
                     // `learn_phrase_on_commit_in`）；归不到成员（内置来源等）就不造词。
                     if let Some(owner) = mix_member_owner.as_deref() {
-                        self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
+                        let learned_code =
+                            self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
+                        // 6b：选中已有临时词推进晋升计数，与主路同一函数；归属同上取成员方案。
+                        // 点查码与主路同取 `cand_code`（上面分段存的是整个缓冲）。
+                        if !cand.is_phrase {
+                            self.bump_selected_temp_word(
+                                owner,
+                                &cand,
+                                &Self::cand_code(&state.mix_buffer, &cand),
+                                learned_code.as_deref(),
+                            );
+                        }
                     }
                 }
             } else {

@@ -672,6 +672,95 @@ impl Coordinator {
         }
     }
 
+    /// 6b：选中**已有临时词**时累加计数、推进晋升（对齐 Go LearnWord-on-commit）。
+    ///
+    /// 主输入路 `commit_selected`、临拼整体上屏、快捷输入 `mix_select_at` 共用——原先只有
+    /// 主路有这一步，overlay 里选多少次临时词都不涨计数、永远晋升不了。
+    ///
+    /// - `owner`：产出该候选的方案。主路传活跃方案；overlay 传它实际用的方案（临拼目标方案 /
+    ///   快捷输入成员方案，与 `learn_phrase_on_commit_in` 同源）。按活跃方案取会在五笔主方案下
+    ///   去查 `wubi86` 桶，拼音临时词一条都点不中。
+    /// - `code`：候选码（`cand_code`）；`learned_code`：本次上屏造词写入的码（见下）。
+    ///
+    /// 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。
+    ///
+    /// **刚由造词写入的那条要跳过**：单段整句时造词的 key 与这里的点查完全相同，
+    /// 不跳就是同一次上屏 count +2（见 `learn_phrase_on_commit` 的返回值说明）。
+    ///
+    /// **点查用记录码**：模糊召回的候选 `code` 是所打码（`chaijiuduolian`），记录在
+    /// 规范码（`caijiuduolian`，即 `meta.store_code`）下，只拿 `code` 点查永远落空 ⇒
+    /// 模糊打法选多少次都不涨计数、永远晋升不了。故依次试 `store_code`、`code`，取
+    /// 第一个查得到的（同 `delete_candidate` 的试码法）——对只试 `code` 的旧写法是严格
+    /// 超集：双层同文时 `store_code` 可能指向用户层的码，那时退回 `code` 仍能命中。
+    ///
+    /// 边界跟着码走：码是 `code` 时用候选边界；是记录码时只能用同码的 `learn_code`
+    /// 边界（模糊命中的 `learn_code` 正是（记录码, 记录边界）），否则给 0。候选边界在
+    /// 所打码坐标下，补进规范码记录（旧边界为 0 时 `learn_temp_word` 会补写）就是错的。
+    ///
+    /// 「刚造词」守卫比的也必须是**命中的那个码**：造词写的是规范码，与这里命中的
+    /// 记录码相同；拿所打码比会漏判，同一次上屏计数 +2。
+    ///
+    /// 晋升阈值按**落桶**选：拼音数据域（`PINYIN_DATA_SCHEMA`）读 `[schema.pinyin.auto_learn]`，
+    /// 否则读码表 `auto_phrase`（活跃方案那份；overlay 的码表成员与活跃方案不同时是已知近似，
+    /// 出厂成员里没有码表）。不能按 `owner` 的引擎类型选：混输 owner 选中拼音侧临时词时
+    /// owner 不是拼音型，却落在拼音桶——那会拿码表的阈值去晋升拼音词，与同一桶里造词路径
+    /// （`learn_phrase_on_commit_in` 恒读拼音阈值）两套口径。
+    pub(crate) fn bump_selected_temp_word(
+        &self,
+        owner: &str,
+        cand: &wind_candidate::Candidate,
+        code: &str,
+        learned_code: Option<&str>,
+    ) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let hit = self
+            .engine_mgr
+            .write_data_schema_id(owner, cand.source)
+            .and_then(|schema| {
+                [cand.meta.store_code.as_deref(), Some(code)]
+                    .into_iter()
+                    .flatten()
+                    .find(|c| matches!(store.get_temp_word(&schema, c, &cand.text), Ok(Some(_))))
+                    .map(|c| (schema, c.to_string()))
+            });
+        let Some((schema, temp_code)) = hit else {
+            return;
+        };
+        if learned_code == Some(temp_code.as_str()) {
+            return;
+        }
+        let temp_boundary = if temp_code == code {
+            cand.boundary
+        } else {
+            cand.meta
+                .learn_code
+                .as_ref()
+                .filter(|(c, _)| *c == temp_code)
+                .map_or(0, |(_, b)| *b)
+        };
+        let promote_count = if schema == wind_engine::manager::PINYIN_DATA_SCHEMA {
+            self.engine_mgr.auto_learn_settings().promote_count
+        } else {
+            self.engine_mgr
+                .codetable_settings()
+                .auto_phrase
+                .promote_count
+        };
+        // 选中已存在的临时词：learn_temp_word 内部沿用旧 boundary，仅当旧值为 0
+        // （v1 遗留/无信息）时用上面算出的边界补上。
+        if let Ok(count) = store.learn_temp_word(
+            &schema,
+            &temp_code,
+            &cand.text,
+            LEARN_ADD_WEIGHT,
+            temp_boundary,
+        ) {
+            self.maybe_promote_temp(store, &schema, &temp_code, &cand.text, count, promote_count);
+        }
+    }
+
     /// 临时词晋升判定：promote_count>0 且累积 count 达阈 → 移入用户词库。0=禁用（对齐 Go 语义）。
     ///
     /// **拼音族数据域**（`schema` 是存储归属 id：纯拼音 / 双拼 / 混输的拼音侧都折叠成
