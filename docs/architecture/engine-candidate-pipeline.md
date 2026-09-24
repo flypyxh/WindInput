@@ -221,7 +221,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 |---|---|---|
 | ① 精确查找 | `lookup_with_fuzzy(completed)`——以**完成音节前缀**（去尾部残码）为查询码与存储 code | — |
 | ② Viterbi 整句 | `use_smart_compose` 且 ≥2 音节：LatticeBuilder 建词图（`max_word_len=10`，模糊变体 -0.5 惩罚）→ ViterbiDecoder DP 最优路径；权重 = `sentence_weight()` = `exp(log_prob/n + ln DICT_TOTAL)`，即各词频次的**几何平均**，与词库同量纲。⚠️ `SENTENCE_WEIGHT_BASE(3e7)` **在拼音侧已退役**（见 `docs/design/sentence-weight-same-axis.md`，3e7 只在码表侧还活着且值为 1e6）。**只在 `completed`（去尾部残码）上建图** | `is_sentence`，insert(0) |
-| ②b 混合整句 | 简拼段与全拼段同图解码（`bzdhaobuhao`→不知道好不好）；在**整串**上建图 + `add_abbrev_nodes`。**与整串简拼词同层按权重竞争**：曾不标 `is_abbrev` 而落在全拼层，`zhge` 组出的「之后个」(w=3263) 因此整层压过「这个」(w=555006) 。**zh/ch/sh 拆成两个声母**（z\|h，如「之后」的简拼 `zh`）的读法每处扣 `RETROFLEX_SPLIT_PENALTY`(8.0)：`shzhe` 不再组出「生活这」；是罚不是禁（`zhhai`→最后还照出）。评测 E 类界面序 64.40% → 74.40% | `is_sentence` + `is_abbrev` |
+| ②b 混合整句 | 简拼段与全拼段同图解码（`bzdhaobuhao`→不知道好不好）；在**整串**上建图 + `add_abbrev_nodes`。**与整串简拼词同层按权重竞争**：曾不标 `is_abbrev` 而落在全拼层，`zhge` 组出的「之后个」(w=3263) 因此整层压过「这个」(w=555006) 。**zh/ch/sh 拆成两个声母**（z\|h，如「之后」的简拼 `zh`）的读法每处扣 `RETROFLEX_SPLIT_PENALTY`(8.0)：`shzhe` 不再组出「生活这」；是罚不是禁（`zhhai`→最后还照出）。评测 E 类界面序 64.40% → 74.40%。**简拼段抢走前一全拼音节韵尾**（`ningbr` 读成 ni + n\|g + b\|r →「你能够比如」）同样扣 `CODA_STEAL_PENALTY`(8.0)，E 类再 → 76.20% | `is_sentence` + `is_abbrev` |
 | ②c **残码整句** | 尾部残码作为**待定音节**入图（`add_partial_final_nodes`），Viterbi 选最优单字：`buzhidaok`→「不知道**看**」。在**含残码的整串**上重建图——step ② 的 `nodes` 只到 `completed.len()+1`，残码末端没有槽位。对齐 librime `enable_completion` / fcitx5 不完整拼音。门槛：≥2 完整音节、非双拼、非分隔符、**非混输**（`enable_partial_final`） | `is_sentence` + `is_sentence_unanchored` |
 | ③ DAG 子短语 | 前 6 音节的各前缀子段查词（分段上屏候选） | `is_partial` |
 | ④ 前缀补全 | `search_prefix(query, 30)` | `is_prefix` |

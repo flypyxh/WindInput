@@ -5,6 +5,7 @@
 
 use crate::pinyin::dag::{MaskCheck, SegGraph};
 use crate::pinyin::fuzzy::{FuzzyConfig, FuzzyMatcher};
+use crate::pinyin::syllable::SyllableTrie;
 use std::collections::{BTreeMap, HashMap};
 use wind_dict::cached::CachedDict;
 use wind_dict::manager::DictManager;
@@ -175,6 +176,28 @@ pub(crate) const ABBREV_NODE_PENALTY: f64 = 1.2;
 /// 8 处：E 类新增 100 条、丢 0 条；D 类丢的 2 条正是用户真把 s|h、z|h 当两个声母打的
 /// （「可视化」`ksh`、「相互帮助」`xhbz` + 「黑武士」）。再往上 E 只多 11 条、D 却丢 8 条。
 pub(crate) const RETROFLEX_SPLIT_PENALTY: f64 = 8.0;
+
+/// 混合整句里简拼段**抢走前一全拼音节的韵尾**时的扣分（对数域）。
+///
+/// 用户打 `ningbr`（宁波人）时 `ning` 是一个完整音节，而简拼节点可以从它中间的 `n` 起头，把
+/// 串读成 ni + n|g + b|r，组出「你能够比如」；同类还有 `zhentp` →「这钕铁硼」、`banld` →
+/// 「把年龄段」。用户把一个音节打全了，就几乎不会是要把它的韵尾拆给下一个词当声母。
+/// 判据见 [`steals_coda`]；与 [`RETROFLEX_SPLIT_PENALTY`] 同理，是罚不是禁。
+///
+/// 取值由 `pinyin_eval` 界面序扫出（2026-09-24，seed 20260721，已含翘舌拆分惩罚）：
+///
+/// | 惩罚 | E 短简拼 top-1 | 其中 F 首音节+声母 | D 混合长串 top-1 |
+/// |---|---|---|---|
+/// | 0 | 74.40% | 72.24% | 12.00% |
+/// | 2 | 75.20% | 73.43% | 12.00% |
+/// | 4 | 75.70% | 74.41% | 12.00% |
+/// | **8** | **76.20%** | **75.20%** | **12.00%** |
+/// | 16 / 50 | 76.20% | 75.20% | 12.00% |
+///
+/// 8 处 E 类新增 18、丢 0，此后不再变化；A~D 全程逐位不变。E 类剩余的 F 形态失败以同音 /
+/// 同简拼竞争为主（就你能 / 就你那），另有零声母音节的切分歧义（`xianzw` → 西安作为），
+/// 那是全拼音节图本身的问题，不归本项管。
+pub(crate) const CODA_STEAL_PENALTY: f64 = 8.0;
 
 /// 单个简拼跨度最多取几个词进图。
 ///
@@ -437,6 +460,45 @@ fn retroflex_splits(input: &[u8], node: &LatticeNode) -> usize {
     (node.start..node.end)
         .filter(|&i| input[i] == b'h' && i > 0 && is_zcs(input[i - 1]) && starts_syllable(i))
         .count()
+}
+
+/// 节点是否**抢了前一音节的韵尾**：节点的第一段是单字母声母（起点 `p`），而 `p` 前面有一个
+/// 音节把 `input[p]` 吸收进去后仍是合法音节（`ningbr` 读成 ni + n|g|… 时，`nin` / `ning`
+/// 都是音节）。
+///
+/// 只看「`p` 前面**存在**这样一个音节」，不看 Viterbi 实际选的前驱是谁——节点打分时还不知道
+/// 前驱。于是前驱若是个恰好以同一字母收尾的简拼段，也会被一并扣分；评测里 D 类（简拼词 +
+/// 全拼词长串）一条未变，说明这种误伤在实际输入里罕见。
+fn steals_coda(input: &str, trie: &SyllableTrie, node: &LatticeNode) -> bool {
+    let p = node.start;
+    if p == 0 || node.end <= p {
+        return false;
+    }
+    // 第一段长度：syl_mask 里 bit0 之后的下一个置位，或到节点末尾。
+    let seg_len = (1..node.end - p)
+        .find(|&i| (node.syl_mask >> i) & 1 == 1)
+        .unwrap_or(node.end - p);
+    if seg_len != 1 {
+        return false;
+    }
+    (p.saturating_sub(6)..p).any(|q| {
+        input.is_char_boundary(q)
+            && trie.is_syllable(&input[q..p])
+            && trie.is_syllable(&input[q..=p])
+    })
+}
+
+/// 对抢了前一音节韵尾的节点扣 [`CODA_STEAL_PENALTY`]（判据见 [`steals_coda`]）。
+///
+/// 与 [`penalize_retroflex_splits`] 同处调用：②b 全部节点进图之后。
+pub fn penalize_coda_steals(input: &str, trie: &SyllableTrie, nodes: &mut [Vec<LatticeNode>]) {
+    for at_end in nodes.iter_mut() {
+        for node in at_end.iter_mut() {
+            if steals_coda(input, trie, node) {
+                node.log_prob -= CODA_STEAL_PENALTY;
+            }
+        }
+    }
 }
 
 /// 对把 zh/ch/sh 拆成两个声母的节点扣分：每处 [`RETROFLEX_SPLIT_PENALTY`]（判据见
