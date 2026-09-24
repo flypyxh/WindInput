@@ -1047,6 +1047,8 @@ delete_candidate = "ctrl+shift+number"
 pin_candidate = "ctrl+number"
 toggle_toolbar = 'ctrl+shift+\'
 open_settings = "ctrl+shift+]"
+# 打开词库管理页的开关键。"none" = 不绑；填一个组合键即可用，如 "ctrl+shift+d"。
+open_dictionary = "none"
 add_word = "ctrl+equal"
 open_add_word_dialog = "ctrl+shift+equal"
 toggle_s2t = "ctrl+shift+j"
@@ -1060,9 +1062,9 @@ take_screenshot = "ctrl+shift+f11"
 #   清空即禁用。给某个**面**配直通车（softkeyboard:<面id>）仍写 key_actions。
 softkeyboard = "ctrl+shift+k"
 # 改用系统级 RegisterHotKey 抢占的**动作名**列表（不是键串）：列进来的动作会绕开宿主
-# 自身的同名快捷键。仅支持无需按键上下文的 8 个动作：
+# 自身的同名快捷键。仅支持无需按键上下文的 9 个动作：
 #   switch_engine / toggle_full_width / toggle_punct / toggle_toolbar /
-#   open_settings / take_screenshot / toggle_s2t / toggle_t2s
+#   open_settings / open_dictionary / take_screenshot / toggle_s2t / toggle_t2s
 # 写入其它名字只会进 warn 日志并被忽略。activate_ime 不在此列（走系统
 # DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。空 = 全部走普通键盘钩子。
 global_hotkeys = []

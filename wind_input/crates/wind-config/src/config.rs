@@ -1551,6 +1551,7 @@ impl BoundAction {
         "toggle_t2s",
         "toggle_toolbar",
         "open_settings",
+        "open_dictionary",
         "take_screenshot",
     ];
 
@@ -1628,6 +1629,9 @@ impl BoundAction {
             // ⚠️ 载荷是 `String`，**编译期穷举不了**，新增的 A 类动词会静默落进 `false`
             // 那一档。守门交给测试 `chinese_only_covers_every_dispatch_action`：它遍历
             // `DISPATCH_ACTIONS` 比对一张预期表，新增动词时那条会红，逼人当场表态。
+            //
+            // `open_dictionary`（词库管理）落 `false`：与 `open_settings` 同档——打开的是
+            // 一个独立窗口，跟当前是不是中文输入态无关，英文态下也该按得动。
             Self::Action(a) => matches!(a.as_str(), "toggle_punct" | "toggle_s2t" | "toggle_t2s"),
         }
     }
@@ -4571,6 +4575,11 @@ pub struct KeysConfig {
     pub toggle_toolbar: String,
     #[serde(default = "default_open_settings")]
     pub open_settings: String,
+    /// 打开词库管理页快捷键。**出厂不绑**——与 `toggle_t2s` 同理：这是个小众直达入口，
+    /// 常规路径（菜单「词库管理…」/设置页内导航）已经够用，任何默认组合都在抢用户键位。
+    /// 落点见 `Coordinator::open_dictionary`：直接跳设置端 `dict` 页并带上当前方案 id。
+    #[serde(default = "default_open_dictionary")]
+    pub open_dictionary: String,
     #[serde(default = "default_add_word")]
     pub add_word: String,
     #[serde(default = "default_open_add_word_dialog")]
@@ -4906,6 +4915,7 @@ impl Default for KeysConfig {
             toggle_punct: default_toggle_punct(),
             toggle_toolbar: default_toggle_toolbar(),
             open_settings: default_open_settings(),
+            open_dictionary: default_open_dictionary(),
             add_word: default_add_word(),
             open_add_word_dialog: default_open_add_word_dialog(),
             toggle_s2t: default_toggle_s2t(),
@@ -6499,6 +6509,7 @@ mod bound_action_chinese_only_tests {
             ("toggle_full_width", false),
             ("toggle_toolbar", false),
             ("open_settings", false),
+            ("open_dictionary", false),
             ("take_screenshot", false),
             // 只在中文态有意义。
             ("toggle_punct", true),
@@ -6719,6 +6730,13 @@ fn default_toggle_toolbar() -> String {
 
 fn default_open_settings() -> String {
     "ctrl+shift+]".to_string()
+}
+
+/// 出厂不绑——写 `"none"` 而不是空串，理由同 `default_toggle_t2s`：设置页的 hotkey
+/// 控件在禁用态恒写 `"none"`，出厂值若是空串，用户什么都没动打开一次设置页就会被判
+/// 「有未保存的更改」。
+fn default_open_dictionary() -> String {
+    "none".to_string()
 }
 
 fn default_smart_symbol_timeout_ms() -> i32 {

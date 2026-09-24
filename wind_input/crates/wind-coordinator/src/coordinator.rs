@@ -7338,6 +7338,10 @@ impl Coordinator {
                 self.open_settings(None);
                 true
             }
+            "open_dictionary" => {
+                self.open_dictionary();
+                true
+            }
             "take_screenshot" => {
                 self.trigger_screenshot();
                 true
@@ -7371,12 +7375,13 @@ impl Coordinator {
     fn build_global_hotkey_entries(&self) -> Vec<GlobalHotkeyEntry> {
         let rt = self.rt();
         let k = &rt.config.keys;
-        let supported: [(&str, &str); 8] = [
+        let supported: [(&str, &str); 9] = [
             ("switch_engine", k.switch_engine.as_str()),
             ("toggle_full_width", k.toggle_full_width.as_str()),
             ("toggle_punct", k.toggle_punct.as_str()),
             ("toggle_toolbar", k.toggle_toolbar.as_str()),
             ("open_settings", k.open_settings.as_str()),
+            ("open_dictionary", k.open_dictionary.as_str()),
             ("take_screenshot", k.take_screenshot.as_str()),
             ("toggle_s2t", k.toggle_s2t.as_str()),
             ("toggle_t2s", k.toggle_t2s.as_str()),

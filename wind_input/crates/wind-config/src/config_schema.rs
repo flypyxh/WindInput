@@ -518,6 +518,7 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.toggle_punct", Str),
     f("keys.toggle_toolbar", Str),
     f("keys.open_settings", Str),
+    f("keys.open_dictionary", Str),
     f("keys.add_word", Str),
     f("keys.open_add_word_dialog", Str),
     f("keys.toggle_s2t", Str),
