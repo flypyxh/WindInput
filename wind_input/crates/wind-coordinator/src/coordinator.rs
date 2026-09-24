@@ -1869,6 +1869,9 @@ pub struct Coordinator {
     pub(crate) stat_collector: Option<StatCollector>,
     /// 本次按键是否已被具体上屏路径记录统计（AtomicBool，避免与 state 锁冲突致死锁）。
     pub(crate) stat_recorded: std::sync::atomic::AtomicBool,
+    /// 统计事件捕获（仅测试）：`None` = 不捕获（生产恒 `None`，零增长）；
+    /// `debug_capture_stat_events` 置 `Some` 后，每次 `record_commit*` 追加 (来源, 文本)。
+    pub(crate) debug_stat_events: Mutex<Option<Vec<(CommitSource, String)>>>,
     /// 全屏状态缓存：由 notify_toolbar_async 在后台线程异步刷新，notify_toolbar 直接读取，
     /// 消除 bridge handler 线程上的 SHQueryUserNotificationState 阻塞。
     ///
@@ -2635,6 +2638,7 @@ impl Coordinator {
             candidate_font_sent: Mutex::new(String::new()),
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
+            debug_stat_events: Mutex::new(None),
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
             fullscreen_probing: std::sync::atomic::AtomicBool::new(false),
             #[cfg(windows)]
@@ -8147,6 +8151,14 @@ impl Coordinator {
     ) {
         if text.is_empty() {
             return;
+        }
+        if let Some(log) = self
+            .debug_stat_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            log.push((source, text.to_string()));
         }
         let collector = match self.stat_collector.as_ref() {
             Some(c) => c,

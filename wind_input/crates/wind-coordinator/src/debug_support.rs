@@ -174,6 +174,25 @@ impl Coordinator {
         self.record_input_stats(action);
     }
 
+    /// 开始捕获统计事件（清空已捕获的；仅测试）。之后每次上屏记账（`record_commit*`，
+    /// 空文本除外）追加一条 (来源, 文本)，与统计开关、有无采集器无关。
+    pub fn debug_capture_stat_events(&self) {
+        *self
+            .debug_stat_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+
+    /// 取走已捕获的统计事件（未开始捕获时为空；仅测试）。
+    pub fn debug_take_stat_events(&self) -> Vec<(wind_store::stats::CommitSource, String)> {
+        self.debug_stat_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
     /// 本次按键是否已被具体上屏路径记账(仅测试)。
     pub fn debug_stat_recorded(&self) -> bool {
         self.stat_recorded

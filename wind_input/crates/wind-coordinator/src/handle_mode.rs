@@ -2840,13 +2840,33 @@ impl Coordinator {
                     }
                     // 高亮是变体候选时末段用覆盖文本；否则整体转换（保留跨段词级消歧）。
                     let head = if has_head {
+                        let (start, _) = self.page_range(state);
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
+                        // 顶屏也是一次选中：记词频（含上屏历史）与输入统计，与 `mix_select_at`
+                        // 整体上屏那支同口径（归属按成员方案、带 emoji 守卫）；对照临英 ⑥ 与
+                        // 主输入路 `commit_highlight_then_char`。必须在 `exit_mix_mode` 清缓冲前。
+                        // 重复上屏候选已由 `has_head` 排除；数字透镜无编码可记，只记历史。
+                        let cand = state.candidates[idx].clone();
+                        let code_len = if self.mix_lens(state).commits_whole() {
+                            self.push_commit_history(&cand.text);
+                            0
+                        } else {
+                            let owner = self.mix_candidate_owner(state, &cand);
+                            let freq_code = self.freq_code(&state.mix_buffer, &cand);
+                            self.record_selection_cand_in(owner.as_deref(), &freq_code, &cand);
+                            Self::cand_code(&state.mix_buffer, &cand).len() as u32
+                        };
+                        self.record_commit(
+                            &cand.text,
+                            code_len,
+                            idx.saturating_sub(start) as i32,
+                            wind_store::stats::CommitSource::Mix,
+                        );
                         // 英文候选对齐临英顶屏（A2-3b）：全角态转全角，但**不补空格**
                         // （补了会得到 `hello ,`，同临英 ⑥ 与主输入路 `commit_highlight_then_char`）。
-                        let cand = &state.candidates[idx];
-                        let text = if self.mix_candidate_is_english(state, cand) {
+                        let text = if self.mix_candidate_is_english(state, &cand) {
                             Self::mix_english_width(state, &cand.text)
                         } else {
                             cand.text.clone()
@@ -2862,6 +2882,10 @@ impl Coordinator {
                         self.maybe_convert(state, &state.committed_text.clone())
                     };
                     let punct = self.convert_punct_char(state, ch);
+                    // 标点恒在此按 `Punctuation` 单独记（同临英 ⑥）。有高亮候选时上方已记候选段、
+                    // 顶层兜底随之跳过，不记就漏；无候选时（只剩已转换前缀 / 空缓冲）也显式记——
+                    // 前缀在分步选中时已记过，交给兜底会把「前缀+标点」整串再按「候选」记一遍。
+                    self.record_commit(&punct, 0, -1, wind_store::stats::CommitSource::Punctuation);
                     self.exit_mix_mode(state);
                     self.notify_ui_hide();
                     Self::commit_action(format!("{}{}", head, punct), true)
