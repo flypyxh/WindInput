@@ -62,12 +62,13 @@ pub(crate) use wind_candidate::candidate_display_order;
 /// ## 判据：插在「开头那段连续的常用精确解」之后
 ///
 /// `source_tier <= 1` 即「码表精确 / 精确码短语 / 拼音精确档」——`is_pinyin_exact_tier`
-/// 要求消费整串、非前缀/子短语/简拼/模糊、且 `is_common`。三个真实场景：
+/// 要求消费整串、非前缀/子短语/简拼/模糊、且 `is_common`。另加一类：吃满整串、全为常用字的
+/// ②b **混合简拼整句**（带 `is_abbrev`，故不在拼音精确档；理由见函数内注释）。三个真实场景：
 ///
 /// | 输入 | 中文侧 | 结果 |
 /// |---|---|---|
 /// | `hen` | 很/恨/狠/痕 都是常用精确解 | 很 恨 狠 痕 **hen** 佷 𬣳… |
-/// | `hello` | 只有「和理论哦」（Viterbi 整句，消费整串） | 和理论哦 **hello** 和 喝… |
+/// | `hello` | 只有「和理论哦」（②b 混合整句，消费整串） | 和理论哦 **hello** 和 喝…（`hello` 恰为英文词时整句让位，见下） |
 /// | `github` | 无中文候选 | **GitHub** |
 ///
 /// 于是「中文侧解得好就让位、解不出就上前」是自动的，不需要权重阈值——而阈值在这里根本
@@ -112,11 +113,22 @@ pub(crate) fn place_english_after_common_exact(candidates: &mut Vec<Candidate>, 
         let lower = input.to_lowercase();
         english.iter().any(|c| c.code == lower)
     };
+    // ②b **混合简拼整句**自 `3934d5cc` 起带 `is_abbrev`（与整串简拼词同层按权重竞争），
+    // `is_pinyin_exact_tier` 因此不再认它、`source_tier` 落到 4。但在**这里**它的身份没变：
+    // 仍是吃满整串、全为常用字的一种完整解读，此前一直算在开头那段里——不补这一条，
+    // `hell` 的英文前缀补全 `hello` 就会插到「哈额乐乐」前面（审查查出）。混输的跨来源
+    // 档位刻意不跟着改：那里它就该在拼音非精确档，两件事只在本函数里分开。
+    let leads_as_exact = |c: &Candidate| {
+        wind_candidate::source_tier(c, input) <= 1
+            || (c.is_sentence
+                && c.is_abbrev
+                && c.source == CandidateSource::Pinyin
+                && c.is_common
+                && wind_candidate::effective_consumed(c, input.len()) >= input.len())
+    };
     let pos = rest
         .iter()
-        .take_while(|c| {
-            wind_candidate::source_tier(c, input) <= 1 && !(english_exact && c.is_synthesized)
-        })
+        .take_while(|c| leads_as_exact(c) && !(english_exact && c.is_synthesized))
         .count();
     rest.splice(pos..pos, english);
     *candidates = rest;
@@ -6307,7 +6319,11 @@ mod english_placement_tests {
     #[test]
     fn english_second_when_chinese_side_is_thin() {
         let mut v = vec![
-            zh("和理论哦", "hello", true, 5),
+            Candidate {
+                is_sentence: true,
+                is_abbrev: true,
+                ..zh("和理论哦", "hello", true, 5)
+            },
             zh("和", "he", true, 2),
             zh("喝", "he", true, 2),
             en("hello", "hello"),
@@ -6361,6 +6377,18 @@ mod english_placement_tests {
         }
     }
 
+    /// ②b **混合简拼整句**：合成整句 + `is_abbrev`（`3934d5cc` 起与整串简拼词同层）。
+    ///
+    /// `hello` 的「和理论哦」、`hell` 的「哈额乐乐」都是这一种（he + l|l + o）。夹具曾不带
+    /// `is_abbrev`，于是 `source_tier` 算出档 1；真实流水线里它在档 4——审查查出夹具与现实
+    /// 脱节，真实行为已经变了而用例照绿。
+    fn mixed_sentence(text: &str, code: &str, consumed: usize) -> Candidate {
+        Candidate {
+            is_abbrev: true,
+            ..synth(text, code, consumed)
+        }
+    }
+
     /// ★ 整串是英文词时，引擎拼凑出来的整句让位给英文。
     ///
     /// 真机现场：开简拼后打 `hello` 出「和理论哦」、`book` 出「波哦看」、`work` 出
@@ -6368,7 +6396,7 @@ mod english_placement_tests {
     #[test]
     fn synthesized_sentence_yields_to_an_exact_english_word() {
         let mut v = vec![
-            synth("和理论哦", "hello", 5),
+            mixed_sentence("和理论哦", "hello", 5),
             zh("和", "he", true, 2),
             zh("喝", "he", true, 2),
             en("hello", "hello"),
@@ -6415,7 +6443,7 @@ mod english_placement_tests {
     #[test]
     fn synthesized_sentence_keeps_its_place_when_english_is_only_a_prefix_hit() {
         let mut v = vec![
-            synth("哈额乐乐", "hell", 4),
+            mixed_sentence("哈额乐乐", "hell", 4),
             // 英文候选的 code 比输入长 ⇒ 前缀命中，不是整串精确。
             en("hello", "hello"),
         ];

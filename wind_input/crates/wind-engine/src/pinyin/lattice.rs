@@ -485,6 +485,18 @@ fn steals_coda(input: &str, trie: &SyllableTrie, node: &LatticeNode) -> bool {
     if p == 0 || node.end <= p {
         return false;
     }
+    // a/e/o 起头时要分清两种节点：
+    // - **全拼节点**的零声母音节（「阿姨」a|yi）：不是抢韵尾，`ji` + 阿姨 不该因 `jia` 是音节
+    //   而被罚（审查查出）；
+    // - **简拼节点**的元音声母（e = er / en…、o = ou…）：照样是抢，`yuedzh` 读成 yu + 耳朵(e|d)
+    //   组出「与耳朵之后」、`naoxh` 读成 na + 偶像(o|x) 组出「那偶像化」。一律豁免 a/e/o 时
+    //   评测 E 类正好丢这两条。
+    // 简拼节点的特征是每段都是单个字母（`add_abbrev_nodes` / `add_store_abbrev_nodes` 按击键
+    // 逐字母填 `syllables`），且至少两段。
+    let is_abbrev_node = node.syllables.len() >= 2 && node.syllables.iter().all(|s| s.len() == 1);
+    if matches!(input.as_bytes()[p], b'a' | b'e' | b'o') && !is_abbrev_node {
+        return false;
+    }
     // 第一段长度：syl_mask 里 bit0 之后的下一个置位，或到节点末尾。
     let seg_len = (1..node.end - p)
         .find(|&i| (node.syl_mask >> i) & 1 == 1)
@@ -1259,4 +1271,59 @@ fn slice_syllables(code: &str, offsets: &[usize]) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod coda_steal_tests {
+    //! [`steals_coda`] 的三种形态：只有**简拼段**抢前一音节的韵尾才算，全拼零声母节点不算。
+
+    use super::*;
+
+    fn node(start: usize, syllables: &[&str]) -> LatticeNode {
+        let mut mask = 0u64;
+        let mut off = 0;
+        for s in syllables {
+            mask |= 1 << off;
+            off += s.len();
+        }
+        LatticeNode {
+            start,
+            end: start + off,
+            word: String::new(),
+            syllables: syllables.iter().map(|s| s.to_string()).collect(),
+            syl_mask: mask,
+            log_prob: 0.0,
+            canon: None,
+        }
+    }
+
+    #[test]
+    fn consonant_abbrev_segment_steals() {
+        // `ningbr` 读成 ni + n|g：`nin` 是音节。
+        assert!(steals_coda(
+            "ningbr",
+            &SyllableTrie::new(),
+            &node(2, &["n", "g"])
+        ));
+    }
+
+    #[test]
+    fn vowel_abbrev_segment_steals() {
+        // `yuedzh` 读成 yu + 耳朵(e|d)：`yue` 是音节。
+        assert!(steals_coda(
+            "yuedzh",
+            &SyllableTrie::new(),
+            &node(2, &["e", "d"])
+        ));
+    }
+
+    #[test]
+    fn full_pinyin_zero_initial_node_does_not_steal() {
+        // `ji` + 阿姨(a|yi)：`jia` 虽是音节，但「阿」是零声母全拼音节，不是简拼声母。
+        assert!(!steals_coda(
+            "jiayi",
+            &SyllableTrie::new(),
+            &node(2, &["a", "yi"])
+        ));
+    }
 }

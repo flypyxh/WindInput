@@ -515,6 +515,8 @@ impl MixedEngine {
     /// 拼音块的最尾。于是码表候选一多（本 doc 上面记的「52 个 2 码前缀条目数 > 300、最多
     /// `kh` 663 条」），拼音子引擎那边刚由 `truncate_with_abbrev_quota` 救回来的简拼候选，
     /// 到这里会被**再截一次**。彻底的修法是让本函数的 extra 选取也给 `is_abbrev` 留一席。
+    /// 自 `3934d5cc` 起 ②b **混合整句**也带 `is_abbrev`（与整串简拼词同层按权重竞争），同样
+    /// 落在这个缺口里——只在开了 `enable_pinyin_abbrev`（出厂关）且码表候选超上限时可见。
     ///
     /// ⚠️ 补进来的拼音候选**追加在尾部、不保证有序**——这依赖协调器
     /// `candidate_display_order` 会**无条件重排全部候选**（见 candidate-sorting-rules.md §6）。
