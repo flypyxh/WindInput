@@ -2245,6 +2245,58 @@ impl Coordinator {
                 //   不再出现。改前 `shadow.rs` 的 `position.min(len)` 会把它 clamp 到段末尾、
                 //   强行留一个位置——而用户把一条候选「往后移到第 80」本就是要压下去，
                 //   在只有 50 个位置的成员段里让它消失才是这个意图的正解。
+                //
+                // ── 英文成员的头部候选（原文 + 大小写变形），对齐临英（A2-3b）──
+                //
+                // 读**临英那两份**开关（`input.temp_english.raw_candidate` / `case_variants`）：
+                // 快捷输入里的英文与临英同属「中文里插一个英文词」，用户拍板不另立第三份。
+                // 生成、`InDict` 判据、分词降级都走 `english_candidates` 那组共用函数，与临英
+                // 同进同退（见 `update_temp_english_candidates`）。
+                //
+                // 落点是**英文段段首**，不是全表首：成员顺序即候选优先级，排在前面的成员照旧
+                // 在前。插在重排与候选调整**之后**——「首条是所打原文」的承诺不能被词频冲掉
+                // （同临英只对词库段重排）。插在截配额**之前**——头部候选占本成员的名额，
+                // 否则英文段会从 50 条长到 53 条，挤占靠后成员（见上方配额说明）。
+                //
+                // `InDict` 的判据用本段的 `member_cands`（已过 shadow）：用户隐藏的词不该再让
+                // 原文冒出来。词组透镜下 `Always` 降级成 `InDict`——与临英同一条理由
+                // （`ip'pro` 这串是查询语法不是内容）；词组透镜 ⇔ 分词开关开着且缓冲含分词符，
+                // 与临英的 `phrase_active` 是同一个判据。
+                //
+                // ⚠️ 词组透镜下**一律不产变形**，比临英（变形跟着原文走）更严：分词关着时
+                // `;don't` 落 Free 透镜、唯一候选是原文；开着时它落词组透镜、原文因 `InDict`
+                // 命中而保留，若再跟出 `Don't` / `DON'T`，同一串输入就会因为开关而变样——
+                // `phrase_seg_does_not_break_apostrophe_free_input` 钉的正是「开关两档逐条一致」。
+                //
+                // mix 文本缓冲恒小写，故变形只有首字母大写 / 全大写两条；大小写跟随输入与
+                // CapsLock 档位循环不在此接（要改 `MixLens` 的透镜判据，另议）。
+                if member == "english" {
+                    let te = &self.rt().config.input.temp_english;
+                    let raw_mode = crate::english_candidates::raw_mode_under_phrase_seg(
+                        te.raw_candidate,
+                        phrase_only,
+                    );
+                    let want_variants = te.case_variants && !phrase_only;
+                    let want_raw = crate::english_candidates::wants_raw_candidate(
+                        raw_mode,
+                        &state.mix_buffer,
+                        &member_cands,
+                    );
+                    let mut heads = crate::english_candidates::english_head_candidates(
+                        &state.mix_buffer,
+                        want_raw,
+                        want_variants,
+                    );
+                    if !heads.is_empty() {
+                        // 精确去重（不是小写去重）：头部的 `Vim` 吃掉词库里的 `Vim`，但 `hello`
+                        // 不该把词库里的 `Hello` 一起抹掉。与 `InDict` 判据同按字面，同进同退。
+                        let texts: std::collections::HashSet<&str> =
+                            heads.iter().map(|c| c.text.as_str()).collect();
+                        member_cands.retain(|c| !texts.contains(c.text.as_str()));
+                        heads.append(&mut member_cands);
+                        member_cands = heads;
+                    }
+                }
                 member_cands.truncate(MIX_MEMBER_QUOTA);
                 for c in member_cands {
                     if seen.insert(c.text.clone()) {

@@ -4031,6 +4031,9 @@ pub struct TempEnglishConfig {
     /// ⚠️ `show_candidates = false` 时词库**根本不被查询**，`InDict` 的判据无从回答，
     /// 届时按 [`RawCandidateMode::Always`] 处理（见 `update_temp_english_candidates`）
     /// ——否则这个组合下临英一条候选都不产。
+    ///
+    /// ★ 本项与 [`Self::case_variants`] 也作用于**快捷输入里的英文成员**（A2-3b）：头部候选
+    /// 落在英文段段首（成员顺序即优先级，不抢全表首位），且占该成员的候选配额。
     #[serde(default, deserialize_with = "de_raw_candidate")]
     pub raw_candidate: RawCandidateMode,
     /// 生成大小写变形候选（全小写 / 首字母大写 / 全大写）。
