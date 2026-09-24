@@ -7529,7 +7529,7 @@ impl Config {
     ///
     /// 逐条、逐侧（light/dark）处理 `color_x`：
     /// - `auto`（不分大小写）→ `""`（与主字同色）；
-    /// - `#RRGGBBAA`         → `#RRGGBB` + `alpha_x = AA/255`（`FF` 即 1.0，仍是挖空档）；
+    /// - `#RRGGBBAA`（`#` 可省）→ `#RRGGBB` + `alpha_x = AA/255`（`FF` 即 1.0，仍是挖空档）；
     /// - 其余（6 位、空串、非法值）不动——非法值留给渲染侧记警告，迁移不替用户猜。
     ///
     /// 本层已显式写了 `alpha_x` 时不覆盖（新键是用户后来写的，比旧色值末两位更可信）。
@@ -7551,12 +7551,12 @@ impl Config {
                     continue;
                 };
                 let t = raw.trim();
+                // `#` 可省：渲染侧 `parse_hex` 两种写法都认，手写配置里也都见过；
+                // 只认带 `#` 的话，`2288E080` 就漏迁，落进新语义后被当非法色值。
+                let hex = t.strip_prefix('#').unwrap_or(t);
                 let (color, alpha) = if t.eq_ignore_ascii_case("auto") {
                     (String::new(), None)
-                } else if let Some(hex) = t
-                    .strip_prefix('#')
-                    .filter(|h| h.len() == 8 && h.bytes().all(|c| c.is_ascii_hexdigit()))
-                {
+                } else if hex.len() == 8 && hex.bytes().all(|c| c.is_ascii_hexdigit()) {
                     let aa = u8::from_str_radix(&hex[6..], 16).expect("已校验为十六进制");
                     (format!("#{}", &hex[..6]), Some(f64::from(aa) / 255.0))
                 } else {
@@ -11638,6 +11638,19 @@ scripts = { latin = 42 }
         );
         assert_eq!(b[0].color_light, "#2288E0");
         assert_eq!(b[0].color_dark, "#2288E0");
+        assert!((b[0].alpha_light.unwrap() - 128.0 / 255.0).abs() < 1e-3);
+        assert_eq!(b[0].alpha_dark, Some(1.0));
+    }
+
+    /// 旧写法 8 位色值的 `#` 可省（渲染侧 `parse_hex` 两种都认）：不带 `#` 的同样拆，
+    /// 输出统一带 `#`。
+    #[test]
+    fn migrate_badge_rgba8_without_hash_prefix_also_splits() {
+        let b = badges_after_migration(
+            "[[ui.langbar.badges]]\nstate = \"punct_cn\"\ncolor_light = \"2288E080\"\ncolor_dark = \"2288e0ff\"\n",
+        );
+        assert_eq!(b[0].color_light, "#2288E0");
+        assert_eq!(b[0].color_dark, "#2288e0");
         assert!((b[0].alpha_light.unwrap() - 128.0 / 255.0).abs() < 1e-3);
         assert_eq!(b[0].alpha_dark, Some(1.0));
     }
