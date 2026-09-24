@@ -1208,14 +1208,20 @@ function Stop-WindService ([string]$suffix) {
 # (NSIS 安装器走的就是这条路), 但本脚本此前从不写它 —— 读端在本仓、写端在安装器仓,
 # 没有任何编译期约束能发现这条部署路径漏接。
 #
-# 注: 该键 release/dev 共用一个路径 (DLL 读的是同一个), 故两变体部署不可并行。
-function Set-InstallerRunning ([bool]$on) {
-    $key = "HKLM:\Software\WindInput"
+# 注: 键按变体分开 —— DLL 读的是 WIND_APP_REGKEY = Software\<WIND_APP_NAME>
+# (wind_tsf\include\Globals.h), dev 变体即 Software\WindInputDev。此前这里写死
+# Software\WindInput, 部署 dev 时闸门写错了键、dev DLL 照样抢跑拉起旧 exe
+# (2026-09-24 靶机实锤, dev.sh 侧同症见 remote_deploy_guard)。
+function Set-InstallerRunning ([bool]$on, [string]$profile = "release") {
+    $app = if ($profile -eq "dev") { "WindInputDev" } else { "WindInput" }
+    $key = "HKLM:\Software\$app"
     try {
         if ($on) {
             if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
             Set-ItemProperty -Path $key -Name "InstallerRunning" -Value "1" -Type String -Force -ErrorAction Stop
-            Gray "  - InstallerRunning=1 (部署期禁止 TSF DLL 拉起服务)"
+            # 残留的已死安装器 owner 会让 DLL 判闸门为遗留物而放行, 开闸时一并清掉。
+            Remove-ItemProperty -Path $key -Name "InstallerRunningOwner" -ErrorAction SilentlyContinue
+            Gray "  - $app InstallerRunning=1 (部署期禁止 TSF DLL 拉起服务)"
         }
         elseif (Test-Path $key) {
             Set-ItemProperty -Path $key -Name "InstallerRunning" -Value "0" -Type String -Force -ErrorAction Stop
@@ -1278,7 +1284,7 @@ function Deploy-Full ([string]$profile = "release") {
     }
     Say "`n========== 系统安装 ($profile) → $targetDir =========="
     # 闸门必须在停服务【之前】拉起 —— 服务一死, 宿主里的 DLL 立刻就有拉起它的动机。
-    Set-InstallerRunning $true
+    Set-InstallerRunning $true $profile
     try {
         Say "[1/7] 停止旧进程..."; Stop-WindService $suffix
         Say "[2/7] 反注册旧 TSF COM..."; Unregister-Tsf $targetDir $suffix
@@ -1312,7 +1318,7 @@ function Deploy-Full ([string]$profile = "release") {
     finally {
         # 任何出口 (含中途 return $false 与异常) 都必须清零, 否则闸门永久留在 1,
         # DLL 从此再不肯拉起服务 —— 那会是个比本竞态更难查的故障。
-        Set-InstallerRunning $false
+        Set-InstallerRunning $false $profile
     }
 }
 
@@ -1352,7 +1358,7 @@ function Deploy-Module ([string]$profile, [string]$mod) {
     Say "`n========== 系统安装模块 ($profile/$mod) → $targetDir =========="
     # 模块部署不动 data\, 但 core/tsf 会杀服务或换 DLL —— 同样给了 DLL 抢跑的机会,
     # 拉起的是新旧混搭的一代 (如新 DLL 配旧 exe), 故一并上闸门。
-    if ($touchesService) { Set-InstallerRunning $true }
+    if ($touchesService) { Set-InstallerRunning $true $profile }
     try {
         if ($touchesService) { Say "[1/4] 停止旧进程..."; Stop-WindService $suffix }
         else                 { Say "[1/4] (跳过停服务: $mod 不参与输入法运行时)" }
@@ -1378,7 +1384,7 @@ function Deploy-Module ([string]$profile, [string]$mod) {
         return $true
     }
     finally {
-        if ($touchesService) { Set-InstallerRunning $false }
+        if ($touchesService) { Set-InstallerRunning $false $profile }
     }
 }
 
