@@ -283,20 +283,39 @@ const FUZZY_WEIGHT_SCALE: f64 = 0.5;
 ///
 /// 旧行为是 `continue`：系统库已有的词（真实词库「拜城县」w=1），用户学过（w=800）后
 /// 在 `bcx` 下仍排第 46 位，与没学过一模一样，右键删除也找不到它的记录。
+///
+/// ⚠️ 两个来源标记**分别**并入：`hit` 来自 `CompositeDict::merge_search`，同一个词同时在用户层
+/// 与临时层时两条已合成一条、两个标记都为真。写成 if/else 只会置上一个，右键删除便只删掉
+/// 一半、要删第二次（审查查出，同款写法也在 step 6）。
+///
+/// ⚠️ **刻意不清 `is_synthesized`**（已有候选是 ②b 整句时它为真）：看似「用户层有了就不算
+/// 新合成」，但这条整句的 `code` 是击键串，协调器 6b 按 `code` 点查临时词必然落空，它推进
+/// 晋升计数靠的正是 `is_synthesized` 触发的 `learn_phrase_on_commit`（按全拼码写、已存在即
+/// count++）。清掉它，这个词就永远攒不到晋升次数。
 fn merge_store_abbrev_hit(existing: &mut Candidate, hit: &Candidate, weight: i32) {
     if existing.is_abbrev {
         existing.weight = existing.weight.max(weight);
     }
-    if hit.meta.is_temp_dict {
-        existing.meta.is_temp_dict = true;
-    } else {
-        existing.meta.is_user_dict = true;
-    }
+    merge_store_origin(existing, hit);
     existing.meta.store_code = hit
         .meta
         .store_code
         .clone()
         .or_else(|| Some(hit.code.as_str().into()));
+    existing.absorb_codes_from(hit);
+}
+
+/// 把 store 层命中 `hit` 的来源标记并入 `existing`：临时层 → `is_temp_dict`，用户层 →
+/// `is_user_dict`，两层都有（`merge_search` 已把同文两条合成一条）→ 两个都置。
+///
+/// 两个标记都没有的命中按用户层算，与此前 if/else 的兜底一致。
+fn merge_store_origin(existing: &mut Candidate, hit: &Candidate) {
+    if hit.meta.is_temp_dict {
+        existing.meta.is_temp_dict = true;
+    }
+    if hit.meta.is_user_dict || !hit.meta.is_temp_dict {
+        existing.meta.is_user_dict = true;
+    }
 }
 
 /// 对模糊命中施加权重折扣：`weight × 0.5^fuzzy_edits`，见 [`FUZZY_WEIGHT_SCALE`]。
@@ -799,6 +818,8 @@ pub struct Config {
     /// ⚠️ **接用户词与临时词，不接草稿层**。S5 滑窗会造出大量杂词，它的「用过即转正」
     /// （草稿 → 临时）才是质量闸；杂词若直接进整句词图，污染的是所有人的整句。临时词曾经
     /// 也被挡，结果系统库没有的词（「拜城县」）手打一次后整句仍不认，要用够晋升次数才行。
+    /// ⚠️ 临时层也收自动造词直接写入的**分步上屏拼接**与**选中的合成整句**（不经草稿），
+    /// 分错段的一次上屏会以整节点进图自我强化，见 `lattice::add_store_nodes` 约束 1。
     ///
     /// 全拼段点查全拼码（`lattice::add_store_nodes`），简拼整句（②b）的声母段另查用户层的
     /// 简拼索引（`lattice::add_store_abbrev_nodes`）。
@@ -3615,11 +3636,7 @@ impl Engine for PinyinEngine {
                     };
                     // 标记按来源分流：`c` 来自 StoreTempLayer 就是临时词，不能盖成用户词。
                     // 两层都有同文记录时两个标记都置，删除侧据此把两张表都删掉。
-                    if c.meta.is_temp_dict {
-                        existing.meta.is_temp_dict = true;
-                    } else {
-                        existing.meta.is_user_dict = true;
-                    }
+                    merge_store_origin(existing, &c);
                     // 存储码随标记一起带走（`code` 字段仍归已有候选）。两层码不同的极端情形
                     // 下这里只留得住后来那个，删除侧因此仍把 `code` 作为兜底一并尝试。
                     // 模糊命中的 `c.code` 已换成用户敲的码，记录码在它自己的 `store_code` 里。

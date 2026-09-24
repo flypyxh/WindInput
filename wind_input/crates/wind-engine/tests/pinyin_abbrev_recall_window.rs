@@ -53,13 +53,17 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
 
 /// 系统词库：`bcx` 键下 `count` 条词 + 一条无关的 `nihao`（让全拼路径有东西可出）。
 fn sys_dict(tag: &str, count: usize) -> CachedDict {
+    sys_dict_with(tag, &BCX_ENTRIES[..count.min(BCX_ENTRIES.len())])
+}
+
+/// 同 [`sys_dict`]，但 `bcx` 键下放的是指定的那几条。
+fn sys_dict_with(tag: &str, picked: &[(&str, &str, i32, u64)]) -> CachedDict {
     let dir = tmp_dir(tag);
     let wdat = dir.join("t.wdat");
     let mut w = WdatWriter::new();
     w.add_with_boundary("nihao".into(), vec![("你好".into(), 5328, 0, 0b101)]);
     w.add_abbrev("nh".into(), vec![("nihao".into(), 5328)]);
 
-    let picked = &BCX_ENTRIES[..count.min(BCX_ENTRIES.len())];
     for (code, text, weight, boundary) in picked {
         w.add_with_boundary(
             (*code).into(),
@@ -89,13 +93,17 @@ fn engine(tag: &str, count: usize) -> PinyinEngine {
 }
 
 fn engine_with_store(tag: &str, count: usize, s: Arc<Store>) -> PinyinEngine {
+    engine_with_store_dict(sys_dict(tag, count), s)
+}
+
+fn engine_with_store_dict(dict: CachedDict, s: Arc<Store>) -> PinyinEngine {
     let dm = wind_dict::manager::DictManager::new();
     dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
         s.clone(),
         "pinyin",
     )));
     dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(s, "pinyin")));
-    PinyinEngine::new(PyConfig::default(), sys_dict(tag, count)).with_store_layers(Arc::new(dm))
+    PinyinEngine::new(PyConfig::default(), dict).with_store_layers(Arc::new(dm))
 }
 
 fn texts(e: &PinyinEngine, input: &str, max: usize) -> Vec<String> {
@@ -216,18 +224,46 @@ fn learned_word_already_in_system_dict_is_lifted_in_mixed_abbrev() {
     assert!(c.meta.is_temp_dict);
 }
 
-/// 前缀回退（`bcxrmzf` 的分段候选）同理：用户那条要么合并进同文系统候选，要么自己
-/// 新增时也带上标记。
+/// 前缀回退（`bcxrmzf` 的分段候选）同理。系统层只放两条，让「拜城县」先由系统层 ① 推进
+/// 切点 `bcx` 的配额，用户层 ③④ 再命中它时**走的是合并分支**。
+///
+/// ⚠️ 不能沿用 12 条的 `BCX_ENTRIES`：「拜城县」w=1 排第 12，进不了 ① 的 6 席配额
+/// （`MAX_FALLBACK_PER_CUT`），③④ 找不到同文、走的是新推入分支——那样测的是「新推入补
+/// 来源标记」，合并分支从未被执行（审查查出）。
 #[test]
 fn learned_word_already_in_system_dict_is_lifted_in_prefix_fallback() {
     let s = store("merge_fallback");
     s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b100001001)
         .unwrap();
-    let e = engine_with_store("merge_fallback", BCX_ENTRIES.len(), s);
+    let picked = [BCX_ENTRIES[0], BCX_ENTRIES[11]];
+    assert_eq!(picked[1].1, "拜城县", "夹具前提");
+    let e = engine_with_store_dict(sys_dict_with("merge_fallback", &picked), s);
     let r = e.convert("bcxrmzf", 300).unwrap().candidates;
     let (_, c) = cand(&r, "拜城县").expect("应召回");
-    assert_eq!(c.weight, 800);
+    assert!(c.is_partial, "前提：这是前缀回退的分段候选");
+    assert_eq!(c.weight, 800, "合并后取用户权重");
     assert!(c.meta.is_temp_dict);
+}
+
+/// 同一个词同时在用户层与临时层：合并后两个来源标记**都**要在，右键删除才会两张表都删。
+///
+/// `merge_search` 已把两层同文合成一条、两个标记都为真；合并函数曾写成 if/else、只置一个。
+#[test]
+fn merge_keeps_both_store_origins() {
+    let s = store("merge_both");
+    s.add_user_word("pinyin", "baichengxian", "拜城县", 1200, 0b100001001)
+        .unwrap();
+    s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b100001001)
+        .unwrap();
+    let e = engine_with_store("merge_both", BCX_ENTRIES.len(), s);
+    let r = e.convert("bcx", 300).unwrap().candidates;
+    let (_, c) = cand(&r, "拜城县").expect("应召回");
+    assert!(
+        c.meta.is_user_dict && c.meta.is_temp_dict,
+        "两层来源都要保留: user={} temp={}",
+        c.meta.is_user_dict,
+        c.meta.is_temp_dict
+    );
 }
 
 /// 合并只**提权不降权**（同 step 6）：用户权重低于系统时保留系统值。

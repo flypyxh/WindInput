@@ -138,6 +138,18 @@ impl DictLayer for StoreUserLayer {
             .collect();
         sort_trunc(cands, limit)
     }
+
+    fn search_abbrev_exact(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        let recs = self
+            .store
+            .search_user_words_by_abbrev_exact(&self.schema_id, abbrev, limit)
+            .unwrap_or_default();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, false, false))
+            .collect();
+        sort_trunc(cands, limit)
+    }
 }
 
 /// 临时学习词层（redb 后端，可变）。
@@ -198,6 +210,18 @@ impl DictLayer for StoreTempLayer {
         let recs = self
             .store
             .search_temp_words_by_abbrev(&self.schema_id, abbrev, limit)
+            .unwrap_or_default();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, true, false))
+            .collect();
+        sort_trunc(cands, limit)
+    }
+
+    fn search_abbrev_exact(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        let recs = self
+            .store
+            .search_temp_words_by_abbrev_exact(&self.schema_id, abbrev, limit)
             .unwrap_or_default();
         let cands = recs
             .into_iter()

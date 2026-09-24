@@ -211,6 +211,17 @@ const ABBREV_NODE_LIMIT: usize = 8;
 /// 它同时是成本闸门：整句建图要遍历全部 (p, q) 跨度，每个跨度一次 redb 点查。
 const USER_NODE_LIMIT: usize = 8;
 
+/// 用户层简拼节点每个跨度**取数**的上限（过判据、按权重取前 [`USER_NODE_LIMIT`] 之前）。
+///
+/// 取数用 `search_abbrev_exact`（只查本组，无边界词不在其中）。存储层按索引键字典序数够
+/// 上限就返回，**不按权重**——所以上限太小会在判据前切掉高权重词（曾是 8：同组 10 个词时
+/// 「拜城县」就被切掉），太大又让按键路径随用户库规模线性变慢。实测（每个被查的两/三字母组
+/// 塞 2000 个用户词、`bcxrmzf` 一次转换，关 → 开）：不设上限 +60~90ms，64 +1.7ms，32 +1.1ms。
+///
+/// ⚠️ 已知限制：同一声母串的用户词超过本值时，超出部分按码的字典序被截，与权重无关。
+/// 要彻底解决需在索引里按权重排序，本项不做。值与引擎侧 `ABBREV_INDEX_LIMIT` 同为 64。
+const USER_ABBREV_SCAN_LIMIT: usize = 64;
+
 /// 用户词模糊入图时，从一个起点出发、**同一音节数**上最多保留几条在途的
 /// （所打码切分 × 逐音节变体）组合（[`LatticeBuilder::add_store_fuzzy_nodes`]）。
 ///
@@ -768,6 +779,9 @@ impl LatticeBuilder {
     ///    ⚠️ 临时词**曾经**也被挡（误把质量闸放在了临时 → 用户那一跳）：系统库没有的词
     ///    （「拜城县」）手打一次只会进临时库，要再用够 `promote_count` 次才晋升，而在那之前
     ///    整句永远不认它——用户看到的就是「刚打过的词，连着打就没了」。
+    ///    ⚠️ 临时层并不只有草稿跃迁来的词：自动造词（`learn_phrase_on_commit`）会把**分步上屏
+    ///    的拼接**与**选中的合成整句**直接写进临时层，不经草稿。分错段的一次上屏因此也会以
+    ///    整节点进图、带着 [`USER_NODE_BONUS`] 自我强化——这是开关出厂关的理由之一。
     /// 2. **`boundary == 0` 不进图**（与 [`Self::add_abbrev_nodes`] 同、与 [`Self::build`]
     ///    的降级放行**相反**）。整句的每个节点都要求真值切分：手输码用户词没有可信边界，
     ///    放进去等于让 Viterbi 按猜出来的切分组句。代价是隐性造词（无边界）不参与整句，
@@ -1048,10 +1062,12 @@ impl LatticeBuilder {
     ///
     /// 约束与两个兄弟方法对齐：
     /// - 词源同 [`Self::add_store_nodes`] 约束 1（[`is_sentence_store_word`]）；
-    /// - **音节数 = 简拼字母数**，且**逐段首字母 = 对应字母**：层接口的 `search_abbrev`
-    ///   明说返回的是超集，判据必须由调用方做。超集的实际来源是 store 索引的「无边界组」
-    ///   （`boundary == 0` 的词按码首字母挂着，查 `bcx` 会连 `b` 组一并带回），它们在
-    ///   `syllables_from_boundary` 这一步就被拒——与 [`Self::add_store_nodes`] 约束 2 同理；
+    /// - **音节数 = 简拼字母数**，且**逐段首字母 = 对应字母**：层接口明说返回超集，判据由
+    ///   调用方做；`boundary == 0` 的词在 `syllables_from_boundary` 这一步被拒——与
+    ///   [`Self::add_store_nodes`] 约束 2 同理；
+    /// - 取数用 `search_abbrev_exact`（只查本组，上限 [`USER_ABBREV_SCAN_LIMIT`]），**过完判据
+    ///   再按权重取前 [`USER_NODE_LIMIT`]**。曾用带上限的 `search_abbrev`：存储层按索引键字典序数够就返回、
+    ///   且连带扫无边界组，手动加过几个同首字母的词就把名额占满，「拜城县」进不了图；
     /// - 打分 = 简拼节点的罚分（`ABBREV_NODE_PENALTY × 字母数`）+ 用户词的截顶与加成，
     ///   与同位置的系统简拼节点公平竞争；
     /// - 同词同起点取 `log_prob` 较大者（同 [`Self::add_store_nodes`] 约束 3）。
@@ -1079,24 +1095,29 @@ impl LatticeBuilder {
                     break;
                 }
                 let stroke = &input[p..q];
-                for cand in store.search_abbrev(stroke, USER_NODE_LIMIT) {
-                    if !is_sentence_store_word(&cand) {
-                        continue;
-                    }
-                    let Some(syls) = crate::pinyin::mixed_abbrev::syllables_from_boundary(
-                        &cand.code,
-                        cand.boundary,
-                    ) else {
-                        continue;
-                    };
-                    if syls.len() != span
-                        || !syls
-                            .iter()
-                            .zip(stroke.bytes())
-                            .all(|(syl, b)| syl.as_bytes().first() == Some(&b))
-                    {
-                        continue;
-                    }
+                // 先过判据、再按权重取前 N：截断若在判据之前做（带上限查询），名额会被必然
+                // 拒收的无边界词占满、或按索引键字典序切掉高权重词（见 `search_abbrev_exact`）。
+                let mut hits: Vec<_> = store
+                    .search_abbrev_exact(stroke, USER_ABBREV_SCAN_LIMIT)
+                    .into_iter()
+                    .filter(|cand| {
+                        is_sentence_store_word(cand)
+                            && crate::pinyin::mixed_abbrev::syllables_from_boundary(
+                                &cand.code,
+                                cand.boundary,
+                            )
+                            .is_some_and(|syls| {
+                                syls.len() == span
+                                    && syls
+                                        .iter()
+                                        .zip(stroke.bytes())
+                                        .all(|(syl, b)| syl.as_bytes().first() == Some(&b))
+                            })
+                    })
+                    .collect();
+                hits.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
+                hits.truncate(USER_NODE_LIMIT);
+                for cand in hits {
                     let weight = cand.weight.min(USER_NODE_WEIGHT_CAP);
                     let log_prob = score_node(&cand.text, &cand.code, weight)
                         - ABBREV_NODE_PENALTY * span as f64

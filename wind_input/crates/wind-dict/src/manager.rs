@@ -53,6 +53,11 @@ impl DictManager {
         self.composite.search_abbrev(abbrev, limit)
     }
 
+    /// 见 [`crate::layer::DictLayer::search_abbrev_exact`]。
+    pub fn search_abbrev_exact(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        self.composite.search_abbrev_exact(abbrev, limit)
+    }
+
     /// 是否存在**严格长于** `prefix` 的编码（跨层，见 `DictLayer::has_longer_code`）。
     pub fn has_longer_code(&self, prefix: &str) -> bool {
         self.composite.has_longer_code(prefix)

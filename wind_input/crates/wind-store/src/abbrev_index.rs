@@ -190,12 +190,18 @@ pub(crate) fn search(
     schema: &str,
     abbrev: &str,
     limit: usize,
+    with_no_boundary: bool,
 ) -> anyhow::Result<Vec<UserWordRecord>> {
     let txn = db.begin_read()?;
     let idx = txn.open_table(idx_table)?;
     let main = txn.open_table(main_table)?;
     let mut out = Vec::new();
-    for g in scan_groups(abbrev) {
+    let groups = if with_no_boundary {
+        scan_groups(abbrev)
+    } else {
+        vec![abbrev.to_string()]
+    };
+    for g in groups {
         let prefix = format!("{schema}\u{0}{g}\u{0}");
         for item in idx.range(prefix.as_str()..)? {
             let (k, _) = item?;
@@ -272,7 +278,7 @@ impl crate::Store {
         abbrev: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<UserWordRecord>> {
-        self.with_db(|db| search(db, USER_ABBREV, USER_WORDS, schema, abbrev, limit))
+        self.with_db(|db| search(db, USER_ABBREV, USER_WORDS, schema, abbrev, limit, true))
     }
 
     /// 按声母串检索**临时词**。见 [`search`]。
@@ -282,7 +288,35 @@ impl crate::Store {
         abbrev: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<UserWordRecord>> {
-        self.with_db(|db| search(db, TEMP_ABBREV, TEMP_WORDS, schema, abbrev, limit))
+        self.with_db(|db| search(db, TEMP_ABBREV, TEMP_WORDS, schema, abbrev, limit, true))
+    }
+
+    /// 用户词里声母串**恰为** `abbrev` 的词条：只扫本组、不扫无边界组。`limit = 0` 不设上限。
+    ///
+    /// 给整句词图的用户层简拼节点用（`wind_engine::pinyin::lattice::add_store_abbrev_nodes`）。
+    /// [`Self::search_user_words_by_abbrev`] 不适合那里：它连带扫无边界组（`boundary == 0`），
+    /// 而词图节点要求真值切分、这组必然全被拒收——手动加过几个同首字母的词就能把名额占满，
+    /// 真正命中的词反被挤出去。
+    ///
+    /// ⚠️ `limit` 按**索引键字典序**截断、不看权重（两个接口都一样）。调用方要按权重取，
+    /// 就给足余量、过完判据再排。
+    pub fn search_user_words_by_abbrev_exact(
+        &self,
+        schema: &str,
+        abbrev: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<UserWordRecord>> {
+        self.with_db(|db| search(db, USER_ABBREV, USER_WORDS, schema, abbrev, limit, false))
+    }
+
+    /// 临时词版的 [`Self::search_user_words_by_abbrev_exact`]。
+    pub fn search_temp_words_by_abbrev_exact(
+        &self,
+        schema: &str,
+        abbrev: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<UserWordRecord>> {
+        self.with_db(|db| search(db, TEMP_ABBREV, TEMP_WORDS, schema, abbrev, limit, false))
     }
 
     /// 两张索引表的条目总数（O(1)）。为 0 而主表非空即说明索引待重建。

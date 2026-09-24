@@ -22,6 +22,8 @@ enum Query {
     Prefix,
     /// 声母串（简拼召回）
     Abbrev,
+    /// 声母串恰为本组、不含无边界词（整句词图用，见 `DictLayer::search_abbrev_exact`）
+    AbbrevExact,
 }
 
 impl CompositeDict {
@@ -85,6 +87,11 @@ impl CompositeDict {
         self.merge_search(abbrev, limit, Query::Abbrev)
     }
 
+    /// 见 [`crate::layer::DictLayer::search_abbrev_exact`]。
+    pub fn search_abbrev_exact(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        self.merge_search(abbrev, limit, Query::AbbrevExact)
+    }
+
     /// 是否存在**严格长于** `prefix` 的编码：任一**启用**层命中即 true，命中即短路。
     ///
     /// 刻意不经 `merge_search`——那条路会按 text 去重并「同 text 取最短码」
@@ -138,6 +145,7 @@ impl CompositeDict {
                 Query::Exact => layer.search(query, limit),
                 Query::Prefix => layer.search_prefix(query, limit),
                 Query::Abbrev => layer.search_abbrev(query, limit),
+                Query::AbbrevExact => layer.search_abbrev_exact(query, limit),
             };
             // 层级基序档位：写入候选的 base_order 字段（独立排序层级，不折进 natural_order）。
             let layer_base_order = layer.base_order();

@@ -1122,7 +1122,8 @@ pub struct PinyinGlobalConfig {
     /// —— wdict 导入词也进图）；用户词 weight 的标定只做了上限截断、没做分布对齐。
     ///
     /// ⚠️ 接用户词与临时词，**不接草稿层**——滑窗草稿会造大量杂词，「用过即转正」
-    /// （草稿 → 临时）才是它的质量闸。全拼段见 `pinyin/lattice.rs::add_store_nodes`，
+    /// （草稿 → 临时）是它的质量闸；但临时层也收自动造词直接写入的分步拼接与合成整句，
+    /// 分错段的上屏同样会进图（见 `add_store_nodes` 约束 1）。全拼段见 `pinyin/lattice.rs::add_store_nodes`，
     /// 简拼段见 `add_store_abbrev_nodes`。
     ///
     /// ⚠️ 默认值与 `wind_engine::pinyin::Config::default()` 那份**必须同值**

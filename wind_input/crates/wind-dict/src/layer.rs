@@ -58,6 +58,15 @@ pub trait DictLayer: Send + Sync {
         Vec::new()
     }
 
+    /// 声母串**恰为** `abbrev` 的词条：不含无边界词（`boundary == 0`）。`limit = 0` 不设上限。
+    ///
+    /// 与 [`Self::search_abbrev`] 的区别只在取数范围：那边为简拼召回服务，要连无边界词一起
+    /// 交给引擎现切；这边给整句词图用，节点要求真值切分，无边界词必被拒收，不该占名额。
+    /// 默认返回空，理由同 [`Self::search_abbrev`]。
+    fn search_abbrev_exact(&self, _abbrev: &str, _limit: usize) -> Vec<Candidate> {
+        Vec::new()
+    }
+
     /// 该层是否存在**严格长于** `prefix` 的编码——「更长后继」存在性判据，供上屏安全阀
     /// （自动上屏 / 满码清空 / 顶码）使用：还能接着打就别急着替用户上屏。
     ///

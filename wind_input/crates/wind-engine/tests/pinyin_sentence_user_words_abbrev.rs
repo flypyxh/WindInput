@@ -101,11 +101,12 @@ fn promoted_word_joins_abbrev_sentence() {
     assert_eq!(on.as_deref(), Some("拜城县人民政府"));
 }
 
-/// 简拼索引交回的是**超集**：`boundary == 0` 的词（手输码、旧版扁平导入）算不出声母串，
-/// 按码首字母挂在「无边界组」里，查 `bcx` 时整组一并带回。它们不能进图——整句节点要求
+/// `boundary == 0` 的词（手输码、旧版扁平导入）算不出声母串，不能进简拼整句——整句节点要求
 /// 真值切分（同 `add_store_nodes` 约束 2）。
 ///
-/// ⚠️ 本条先验证过可观测性：去掉 `add_store_abbrev_nodes` 里的切分校验，它会红。
+/// 两道闸：取数用 `search_abbrev_exact`，存储层就不交回无边界组；`syllables_from_boundary`
+/// 的切分校验是第二道。曾经只有后一道（旧查询连无边界组一起交回），那时变异验证过去掉它即红；
+/// 现在单去任一道都不会红，两道同时去掉才红。
 #[test]
 fn abbrev_store_node_rejects_words_without_boundary() {
     let s = store("nobound");
@@ -117,4 +118,39 @@ fn abbrev_store_node_rejects_words_without_boundary() {
         Some("不出现人民政府"),
         "无边界的词不该进简拼整句"
     );
+}
+
+/// 审查查出：用户层简拼查询曾带上限 8，而存储层**按索引键字典序**数够 8 条就返回、且会一并
+/// 扫「无边界组」（`boundary == 0` 的词按码首字母挂着）——截断发生在权重排序与判据之前。
+///
+/// 场景一：用户手动加过 ≥8 个 b 开头的词（手输码 boundary=0，必然被判据拒收），它们把名额
+/// 占满，临时词「拜城县」进不了图。
+#[test]
+fn no_boundary_words_do_not_crowd_out_the_abbrev_hit() {
+    let s = store("crowd_nobound");
+    for i in 0..10 {
+        s.add_user_word("pinyin", &format!("ba{i}"), &format!("手{i}"), 1200, 0)
+            .unwrap();
+    }
+    s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, BCX_BOUNDARY)
+        .unwrap();
+    let on = sentence(&engine("crowd_nobound_on", s, true), "bcxrmzf");
+    assert_eq!(on.as_deref(), Some("拜城县人民政府"));
+}
+
+/// 场景二：同一声母组词多，目标词的码按字典序靠后（`bachaxi` < `baichengxian`），
+/// 按键序截 8 条就把权重最高的它截掉了。应按权重取。
+#[test]
+fn abbrev_hits_are_ranked_by_weight_not_key_order() {
+    let s = store("crowd_group");
+    // ba|cha|xi → 位 0/2/5：投影同为 `bcx`，码的字典序排在 `baichengxian` 之前。
+    for i in 0..10 {
+        s.add_user_word("pinyin", "bachaxi", &format!("巴{i}"), 10, 0b100101)
+            .unwrap();
+    }
+    // 与竞争词**同在用户层**：各层分别截断后才合并，放在临时层它自己那层没有对手。
+    s.add_user_word("pinyin", "baichengxian", "拜城县", 1200, BCX_BOUNDARY)
+        .unwrap();
+    let on = sentence(&engine("crowd_group_on", s, true), "bcxrmzf");
+    assert_eq!(on.as_deref(), Some("拜城县人民政府"));
 }
