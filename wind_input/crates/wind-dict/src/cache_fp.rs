@@ -127,6 +127,17 @@ fn fingerprint(sources: &[&Path], tag: &str) -> Option<String> {
     Some(format!("{:016x}", h.finish()))
 }
 
+/// 供 [`crate::build_guard`] 用的构建输入键：与 `.fp` 同一套指纹。源读不出时返回固定的
+/// `unreadable`——这种情况下指纹本就无法判定，按「同一份输入」计数即可。
+pub fn build_key(sources: &[&Path], tag: &str) -> String {
+    fingerprint(sources, tag).unwrap_or_else(|| "unreadable".to_string())
+}
+
+/// 二级缓存（如 `.wridx`）的构建输入键，语义同 [`build_key`]。
+pub fn derived_build_key(source_digests: &[String], tag: &str) -> String {
+    derived_fingerprint(source_digests, tag)
+}
+
 /// 缓存是否可复用：缓存文件存在 且 指纹 sidecar 与当前源内容+tag 一致。
 /// `tag` 见 [`fingerprint`]，必须与写入时一致。
 pub fn cache_is_fresh(cache: &Path, sources: &[&Path], tag: &str) -> bool {

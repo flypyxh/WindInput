@@ -612,7 +612,7 @@ fn purge_cache_files(dir: &Path, removed: &mut usize, failed: &mut usize) {
         let is_cache = p
             .extension()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb" | "wridx"));
+            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb" | "wridx" | "building"));
         if !is_cache {
             continue;
         }
@@ -1583,10 +1583,27 @@ impl EngineManager {
             }
         }
 
-        // ② 重建。
+        // ② 重建。峰值远高于成品（251 万词的方案估 400~500 MB），登记尝试以便连续死在
+        //    这里时下次跳过（见 build_guard）。无缓存路径时无处记录，照旧直接建。
+        let attempt = match (cache.as_deref(), digests.as_deref()) {
+            (Some(c), Some(dg)) => match wind_dict::build_guard::begin(
+                c,
+                &wind_dict::cache_fp::derived_build_key(dg, wind_dict::cache_fp::REVERSE_INDEX_TAG),
+            ) {
+                wind_dict::build_guard::Gate::Proceed(a) => Some(a),
+                wind_dict::build_guard::Gate::Skip { reason } => {
+                    error!("方案 {schema_id} 的反查索引本次不可用：{reason}");
+                    return ReverseIndex::default();
+                }
+            },
+            _ => None,
+        };
         let t0 = std::time::Instant::now();
         let image = wind_dict::cached::serialize_reverse_index_from(&dicts);
         let built = t0.elapsed();
+        if let Some(a) = attempt {
+            a.finish();
+        }
 
         // ③ 落盘后**从盘上重新打开**——这一步才真正把索引字节移出进程私有内存。
         //    任一环失败都只是退回「常驻内存」这个旧行为，不影响正确性。
@@ -5723,6 +5740,18 @@ impl EngineManager {
             return Some(CachedDict::Mmap(reader));
         }
 
+        // 构建期峰值远高于成品，理由与退避语义同 load_rime_pinyin_dict 里那段。
+        let attempt = match wind_dict::build_guard::begin(
+            combined,
+            &wind_dict::cache_fp::build_key(&paths, COMBINED_CACHE_TAG),
+        ) {
+            wind_dict::build_guard::Gate::Proceed(a) => a,
+            wind_dict::build_guard::Gate::Skip { reason } => {
+                error!("合并词库本次不可用：{reason}");
+                return None;
+            }
+        };
+
         // 按 code 聚合所有源词库条目（前面的库优先级更高，先加入；同 text 取更高权重）
         let mut agg: HashMap<String, Vec<(String, i32)>> = HashMap::new();
         let mut total = 0usize;
@@ -5759,6 +5788,7 @@ impl EngineManager {
             }
         }
         if total == 0 {
+            attempt.finish();
             return None;
         }
 
@@ -5767,7 +5797,9 @@ impl EngineManager {
             entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             writer.add(code, entries);
         }
-        match writer.write(combined) {
+        let written = writer.write(combined);
+        attempt.finish();
+        match written {
             Ok(_) => {
                 // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
                 wind_dict::cache_fp::write_cache_fp(combined, &paths, COMBINED_CACHE_TAG);
@@ -5981,6 +6013,19 @@ impl EngineManager {
             Self::remove_stale_cache(&merged_wdat);
         }
 
+        // 下面这段是构建峰值所在（65 万条实测 ~420 MB），内存不足时分配失败直接 abort、
+        // 不可捕获（见 build_guard）。登记一次尝试：若连续死在这里，下次启动跳过而非再死。
+        let attempt = match wind_dict::build_guard::begin(
+            &merged_wdat,
+            &wind_dict::cache_fp::build_key(&src_refs, MERGED_CACHE_TAG),
+        ) {
+            wind_dict::build_guard::Gate::Proceed(a) => a,
+            wind_dict::build_guard::Gate::Skip { reason } => {
+                error!("拼音词库 {} 本次不可用：{reason}", dict_path.display());
+                return None;
+            }
+        };
+
         // 并行解析每个源正文（纯 CPU 多线程），直接产出 (code,text,weight)：不再为每个子表
         // 生成中间 .wdat，也绕过 CodetableDict 的 BTreeMap 构建与逐 code 排序（merged 稍后会
         // 统一按权重重排）。WdatWriter 的 add 系列不合并同 code 的多次调用（内部直接 push），
@@ -6025,6 +6070,7 @@ impl EngineManager {
         }
 
         if total_entries == 0 {
+            attempt.finish();
             warn!("No entries loaded from pinyin dictionary");
             return None;
         }
@@ -6070,6 +6116,7 @@ impl EngineManager {
         // 一步结束时就还给分配器了，而回退重写只需要已经构建好的字节。从前是拿 writer 在
         // 循环里重试，等于把那 130 MB 一直押到最后一个目标写完。
         let blob = writer.build();
+        attempt.finish();
         for target in [&merged_wdat, &temp_fallback] {
             let is_fallback = target.as_path() == temp_fallback.as_path();
             if let Err(e) = blob.emit(target) {
@@ -8260,6 +8307,41 @@ input_chars = \"a-z;\"
         let _ = std::fs::remove_dir_all(&ov_dir);
     }
 
+    /// A1-7：merged 缓存的构建若连续死在中途（内存不足 abort，不可捕获），下次启动必须
+    /// 跳过这次必败的构建而不是再死一次；源文件一变就恢复尝试。
+    #[test]
+    fn merged_pinyin_build_skipped_after_repeated_deaths() {
+        let dir = std::env::temp_dir().join(format!("wind_eng_a17-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dict = dir.join("py.dict.yaml");
+        std::fs::write(&dict, "---\nname: py\n...\n你好\tni hao\t100\n").unwrap();
+        let merged = cache_path(&dict, "merged.wdat");
+        let key = wind_dict::cache_fp::build_key(&[dict.as_path()], MERGED_CACHE_TAG);
+
+        // 模拟前 MAX_ATTEMPTS 次启动都死在构建里：登记了尝试、却没走到 finish。
+        for _ in 0..wind_dict::build_guard::MAX_ATTEMPTS {
+            match wind_dict::build_guard::begin(&merged, &key) {
+                wind_dict::build_guard::Gate::Proceed(a) => drop(a),
+                wind_dict::build_guard::Gate::Skip { .. } => panic!("尚未到退避阈值"),
+            }
+        }
+        assert!(
+            EngineManager::load_rime_pinyin_dict(&dict).is_none(),
+            "同一输入已连续死在构建中，本次应降级而不是再建"
+        );
+        assert!(!merged.exists(), "跳过时不应产出缓存");
+
+        // 源变了 → 重新尝试并成功，且成功后不再留记录。
+        std::fs::write(&dict, "---\nname: py\n...\n你好\tni hao\t200\n").unwrap();
+        assert!(EngineManager::load_rime_pinyin_dict(&dict).is_some());
+        let mut marker = merged.clone().into_os_string();
+        marker.push(".building");
+        assert!(!std::path::Path::new(&marker).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn purge_cache_files_only_removes_cache_extensions() {
         let dir = std::env::temp_dir().join(format!("wind_eng_purge-{}", std::process::id()));
@@ -8270,13 +8352,15 @@ input_chars = \"a-z;\"
         std::fs::write(sub.join("main.combined.wdat"), b"x").unwrap();
         std::fs::write(sub.join("main.wdat.fp"), b"x").unwrap();
         std::fs::write(dir.join("unigram.wdb"), b"x").unwrap();
+        // 构建死亡记录（应删：「重建缓存」即手动重试，见 build_guard）
+        std::fs::write(sub.join("main.wdat.building"), b"x").unwrap();
         // 非缓存文件（应留）
         std::fs::write(dir.join("note.txt"), b"x").unwrap();
         std::fs::write(sub.join("raw.dict.yaml"), b"x").unwrap();
 
         let (mut removed, mut failed) = (0usize, 0usize);
         purge_cache_files(&dir, &mut removed, &mut failed);
-        assert_eq!((removed, failed), (4, 0));
+        assert_eq!((removed, failed), (5, 0));
         assert!(dir.join("note.txt").exists());
         assert!(sub.join("raw.dict.yaml").exists());
         assert!(!sub.join("main.wdat").exists());
