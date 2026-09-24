@@ -934,9 +934,9 @@ impl LatticeBuilder {
     /// 与 [`Self::build`] 的系统词模糊节点同口径：`score_node(变体码)` − 每处改动
     /// [`FUZZY_SYLLABLE_LOG_PENALTY`] − 歧义罚，再叠 [`USER_NODE_WEIGHT_CAP`] / [`USER_NODE_BONUS`]。
     /// 同词同起点仍取较大者（约束 3）。精确优先由罚分保证：同权重时模糊那条恒多扣
-    /// ln2 × 改动处数，压不过所打码的精确命中；同一个词两份记录（精确码、规范码各一）时
-    /// 取较大者只改分数、不改出哪个词——节点上不带来源标记，没有 step 6 那种「存储码被
-    /// 改写」的问题。
+    /// ln2 × 改动处数，压不过所打码的精确命中。同一个词两份记录（精确码、规范码各一）时
+    /// 出哪个词不变，但**分高者决定整句按哪个码造词**：替换时 `canon` / 切分随胜者一起换
+    /// （精确胜者清成 `None`、模糊胜者写记录自己的码与边界），整句的 `learn_code` 由此拼出。
     ///
     /// ## 成本
     ///
@@ -1082,7 +1082,8 @@ impl LatticeBuilder {
     ///   且连带扫无边界组，手动加过几个同首字母的词就把名额占满，「拜城县」进不了图；
     /// - 打分 = 简拼节点的罚分（`ABBREV_NODE_PENALTY × 字母数`）+ 用户词的截顶与加成，
     ///   与同位置的系统简拼节点公平竞争；
-    /// - 同词同起点取 `log_prob` 较大者（同 [`Self::add_store_nodes`] 约束 3）。
+    /// - 同词同起点取 `log_prob` 较大者，切分与 `canon` 随胜者换（同 [`Self::add_store_nodes`]
+    ///   约束 3）。
     ///
     /// zh/ch/sh 按一个字母计（`z`），与 `add_abbrev_nodes` 相同——整句简拼域目前就是
     /// 「一个音节 = 一个字母」。
@@ -1134,12 +1135,21 @@ impl LatticeBuilder {
                     let log_prob = score_node(&cand.text, &cand.code, weight)
                         - ABBREV_NODE_PENALTY * span as f64
                         + USER_NODE_BONUS;
+                    // 同词同起点取较大者，赢了切分与 `canon` 随胜者一起换（同两个兄弟方法）。
+                    //
+                    // 不会破坏既有节点的上屏 / consumed：节点的起止字节不变，而 consumed 与上屏
+                    // 由起止决定。换进来的是该简拼词自己的逐字母切分（击键域，每字母一位）——
+                    // 被替换的若是全拼节点，其切分未必与之同形（`any_path` 取最少音节时，两字的
+                    // 「西昂」可以配单音节 `xian`），但整句回填的边界本就该跟胜出的那条解释走。
                     if let Some(existing) = nodes[q]
                         .iter_mut()
                         .find(|n| n.word == cand.text && n.start == p)
                     {
                         if log_prob > existing.log_prob {
                             existing.log_prob = log_prob;
+                            existing.syllables = stroke.chars().map(|c| c.to_string()).collect();
+                            existing.syl_mask = (0..span).fold(0u64, |m, i| m | (1u64 << i));
+                            existing.canon = None;
                         }
                         continue;
                     }

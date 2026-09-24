@@ -294,17 +294,46 @@ const FUZZY_WEIGHT_SCALE: f64 = 0.5;
 /// 但对「刚由造词写过的码」刻意跳过（防同一次上屏 +2），两路只走一路。保留标记，计数与
 /// 边界补写就始终由造词那一路负责；清掉则改由 6b 计数、边界退回它的推算口径——
 /// 行为可以接受，但没有理由在这里悄悄换路。
-fn merge_store_abbrev_hit(existing: &mut Candidate, hit: &Candidate, weight: i32) {
+///
+/// `hit_is_fuzzy`：本条是否经模糊变体键命中（处数 > 0），决定它能否改写存储码，见
+/// [`merge_store_origin_and_code`]。
+fn merge_store_abbrev_hit(
+    existing: &mut Candidate,
+    hit: &Candidate,
+    weight: i32,
+    hit_is_fuzzy: bool,
+) {
     if existing.is_abbrev {
         existing.weight = existing.weight.max(weight);
     }
-    merge_store_origin(existing, hit);
-    existing.meta.store_code = hit
-        .meta
-        .store_code
-        .clone()
-        .or_else(|| Some(hit.code.as_str().into()));
+    merge_store_origin_and_code(existing, hit, hit_is_fuzzy);
     existing.absorb_codes_from(hit);
+}
+
+/// store 层命中 `hit` 并入同文已有候选时：来源标记并入（[`merge_store_origin`]），存储码
+/// 随之带走——除非 **`hit` 是模糊命中、且同一层先已并入过同文记录**。
+///
+/// 同层同文可以有两条记录（遗留的非规范码 + 规范码，或所打码精确那条 + 变体键捞回的那条）。
+/// 精确那批先到；模糊那条后到时再改写存储码，右键删除删掉的就是它，用户指向的精确记录原样
+/// 留着。全拼 step 6 与简拼合并（[`merge_store_abbrev_hit`]）共用这一份判据。
+///
+/// 存储码取 `hit.meta.store_code`，缺省用 `hit.code`：模糊命中的 `code` 已换成用户敲的码，
+/// 记录码在它自己的 `store_code` 里（`search_store_fuzzy`）。两层码不同的极端情形下这里只
+/// 留得住后来那个，删除侧因此仍把 `code` 作为兜底一并尝试。
+fn merge_store_origin_and_code(existing: &mut Candidate, hit: &Candidate, hit_is_fuzzy: bool) {
+    let same_layer_seen = if hit.meta.is_temp_dict {
+        existing.meta.is_temp_dict
+    } else {
+        existing.meta.is_user_dict
+    };
+    merge_store_origin(existing, hit);
+    if !(hit_is_fuzzy && same_layer_seen) {
+        existing.meta.store_code = hit
+            .meta
+            .store_code
+            .clone()
+            .or_else(|| Some(hit.code.as_str().into()));
+    }
 }
 
 /// 把 store 层命中 `hit` 的来源标记并入 `existing`：临时层 → `is_temp_dict`，用户层 →
@@ -1424,7 +1453,7 @@ impl PinyinEngine {
                 let w = fuzzy_penalized(c.weight, edits);
                 // 同文已在（本切点或更早切点的系统词）：合并，不丢弃（见 merge_store_abbrev_hit）。
                 if let Some(existing) = cands.iter_mut().find(|x| x.text == c.text) {
-                    merge_store_abbrev_hit(existing, &c, w);
+                    merge_store_abbrev_hit(existing, &c, w, edits > 0);
                     continue;
                 }
                 let before = cands.len();
@@ -1577,6 +1606,10 @@ impl PinyinEngine {
         // 判据落在 consumed 上，两件事各归各位。
         //
         // `consumed_length == 0` 表示引擎未标注（全仓约定＝消费整串），不得替换。
+        //
+        // `meta` 原样带进候选：系统词模糊命中的造词码（`learn_code` = 词典码 + 边界，同主路径
+        // step 1/3），store 层命中的来源标记 / 存储码 / 造词码（同 step 6）。此前这里一律
+        // `Default`，分步组词按模糊原码造词、用户词右键删不掉。
         let push = |cands: &mut Vec<Candidate>,
                     text: String,
                     code: String,
@@ -1585,7 +1618,8 @@ impl PinyinEngine {
                     boundary: u64,
                     is_prefix: bool,
                     consumed: usize,
-                    is_fuzzy: bool| {
+                    is_fuzzy: bool,
+                    meta: wind_candidate::CandidateMeta| {
             if text.is_empty() {
                 return;
             }
@@ -1606,12 +1640,17 @@ impl PinyinEngine {
                 is_partial: !is_prefix && consumed < stroke.len(),
                 boundary,
                 consumed_length: consumed,
+                meta,
                 ..Default::default()
             };
             if let Some(existing) = cands.iter_mut().find(|c| c.text == cand.text) {
                 if existing.consumed_length != 0 && existing.consumed_length < cand.consumed_length
                 {
                     *existing = cand;
+                } else if cand.meta.is_user_dict || cand.meta.is_temp_dict {
+                    // 后到的 store 命中整条让位，但来源标记与存储码并入先占位的那条
+                    // （同主路径 step 6）：系统词先占位时，右键删除才找得到用户记录。
+                    merge_store_origin_and_code(existing, &cand, cand.is_fuzzy);
                 }
                 return;
             }
@@ -1629,14 +1668,17 @@ impl PinyinEngine {
         // 于是同一个人同一套模糊音设置在两条流下表现不一致，这本身就是缺陷。
         // 惩罚由 `lookup_with_fuzzy` 内部的 `fuzzy_penalized`（0.5^音节数）施加，与主路径同源。
         let completed: String = syllables.concat();
-        // ⚠️ 本支路（双拼下的全拼降级）**刻意不带 `learn_code`**：它的候选 `code` 是击键前缀，
-        // 而双拼击键与全拼码本就不同域，造词侧另有一套（分段态由主路径产生）。带出来只会让
-        // 两套域在同一个字段里混着。
+        // 模糊命中带 `learn_code`（词典码 + 边界），同主路径 step 1：本支路的候选码是击键，
+        // 而击键在这里就是全拼（同一个域），分步组词时造词侧拼的正是这份规范码。
         for h in self.lookup_with_fuzzy(&completed, syllables) {
             let c = completed.clone();
             let n = c.len();
+            let meta = wind_candidate::CandidateMeta {
+                learn_code: h.dict,
+                ..Default::default()
+            };
             push(
-                cands, h.text, c, h.weight, h.order, h.boundary, false, n, h.is_fuzzy,
+                cands, h.text, c, h.weight, h.order, h.boundary, false, n, h.is_fuzzy, meta,
             );
         }
 
@@ -1653,8 +1695,12 @@ impl PinyinEngine {
                 {
                     let c = code.clone();
                     let n = c.len();
+                    let meta = wind_candidate::CandidateMeta {
+                        learn_code: h.dict,
+                        ..Default::default()
+                    };
                     push(
-                        cands, h.text, c, h.weight, h.order, h.boundary, false, n, h.is_fuzzy,
+                        cands, h.text, c, h.weight, h.order, h.boundary, false, n, h.is_fuzzy, meta,
                     );
                 }
             }
@@ -1692,6 +1738,7 @@ impl PinyinEngine {
                 true,
                 stroke.len(),
                 false,
+                Default::default(),
             );
         }
 
@@ -1709,6 +1756,7 @@ impl PinyinEngine {
                     false,
                     n,
                     false,
+                    c.meta,
                 );
             }
             // 模糊音同 ①（t215）：用户词记录的是规范码，模糊打法只能靠变体码撞上。
@@ -1727,6 +1775,7 @@ impl PinyinEngine {
                     false,
                     n,
                     true,
+                    c.meta,
                 );
             }
             for c in store_dm.search_prefix(stroke, MAX_FULL_PINYIN_RECALL) {
@@ -1767,6 +1816,7 @@ impl PinyinEngine {
                     true,
                     stroke.len(),
                     false,
+                    c.meta,
                 );
             }
         }
@@ -1781,8 +1831,6 @@ impl PinyinEngine {
         //    切分图走 `from_dag`（多路径）而非 `from_syllables`：全拼的切分是**猜的**，词图该
         //    看到全部切法——这正是它与双拼主路径 `fixed_segmentation` 的分野，也是当初判定
         //    「不能跑两遍 convert」的根由。
-        //
-        //    模糊音传 `None`：与本支路其余部分一致，降级通道不做二次放大。
         //
         //    **S2 的用户词节点同样不接**，判据与上面拒绝 2c 残码补全的是同一条：本支路是
         //    「双拼用户偶尔打一次全拼」的降级通道，产出恒沉在双拼候选之后，而用户词进图会
@@ -3629,26 +3677,10 @@ impl Engine for PinyinEngine {
                         let w = existing.weight.max(c.weight);
                         existing.weight = promotion_cap.map_or(w, |cap| w.min(cap));
                     }
-                    // 同一层先已并入过同文记录（精确那批排在模糊之前）：模糊那条不得再改写
-                    // 存储码，否则右键删除删到的是规范码那条，用户指向的精确记录原样留着。
-                    let same_layer_seen = if c.meta.is_temp_dict {
-                        existing.meta.is_temp_dict
-                    } else {
-                        existing.meta.is_user_dict
-                    };
                     // 标记按来源分流：`c` 来自 StoreTempLayer 就是临时词，不能盖成用户词。
-                    // 两层都有同文记录时两个标记都置，删除侧据此把两张表都删掉。
-                    merge_store_origin(existing, &c);
-                    // 存储码随标记一起带走（`code` 字段仍归已有候选）。两层码不同的极端情形
-                    // 下这里只留得住后来那个，删除侧因此仍把 `code` 作为兜底一并尝试。
-                    // 模糊命中的 `c.code` 已换成用户敲的码，记录码在它自己的 `store_code` 里。
-                    if !(c.is_fuzzy && same_layer_seen) {
-                        existing.meta.store_code = c
-                            .meta
-                            .store_code
-                            .clone()
-                            .or_else(|| Some(c.code.as_str().into()));
-                    }
+                    // 两层都有同文记录时两个标记都置，删除侧据此把两张表都删掉。存储码随标记
+                    // 一起带走（`code` 字段仍归已有候选），同层已并入过时模糊那条不改写。
+                    merge_store_origin_and_code(existing, &c, c.is_fuzzy);
                     continue;
                 }
                 c.source = CandidateSource::Pinyin;
@@ -3738,7 +3770,7 @@ impl Engine for PinyinEngine {
                     // 不是这串击键的解释，不该给同文候选提权。
                     if let Some(existing) = candidates.iter_mut().find(|x| x.text == c.text) {
                         let w = fuzzy_penalized(c.weight, edits);
-                        merge_store_abbrev_hit(existing, &c, w);
+                        merge_store_abbrev_hit(existing, &c, w, edits > 0);
                         continue;
                     }
                     c.source = CandidateSource::Pinyin;
@@ -5106,6 +5138,55 @@ mod tests {
         );
     }
 
+    /// 简拼合并同 step 6 的守卫：同层同文两条记录（所打码精确那条 + 模糊键那条），模糊那条
+    /// 后到时不得改写存储码——否则右键删除删掉的是它，用户指向的精确记录原样留着。
+    ///
+    /// n=l 下打 `lh`：`lihao` 的简拼键就是 `lh`（0 处改动），`nihao` 经变体键 `nh` 捞回（1 处）。
+    #[test]
+    fn abbrev_fuzzy_duplicate_does_not_steal_store_code() {
+        let eng = engine_with_user_words_fuzzy(
+            "fz_abbrev_dup",
+            &[("lihao", "你好", 0b101), ("nihao", "你好", 0b101)],
+            FuzzyConfig {
+                n_l: true,
+                ..Default::default()
+            },
+        );
+        let r = eng.convert("lh", 20).unwrap();
+        let c = r.candidates.iter().find(|c| c.text == "你好").unwrap();
+        assert_eq!(
+            c.meta.store_code.as_deref().unwrap_or(&c.code),
+            "lihao",
+            "存储码须指向精确那条记录"
+        );
+    }
+
+    /// 同上，走简拼**前缀回退**（`recall_abbrev_prefix`）：`lhx` 整串无产出，退到切点 `lh`，
+    /// 尾部 `x` 留作残码。两条同文记录在那里合并，模糊那条同样不得改写存储码。
+    #[test]
+    fn abbrev_prefix_fallback_fuzzy_duplicate_does_not_steal_store_code() {
+        let eng = engine_with_user_words_fuzzy(
+            "fz_abbrev_prefix_dup",
+            &[("lihao", "你好", 0b101), ("nihao", "你好", 0b101)],
+            FuzzyConfig {
+                n_l: true,
+                ..Default::default()
+            },
+        );
+        let r = eng.convert("lhx", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "你好")
+            .unwrap_or_else(|| panic!("前缀回退应出「你好」，实际: {:?}", texts(&r)));
+        assert_eq!(c.consumed_length, 2, "前提：走的是前缀回退（只消费 lh）");
+        assert_eq!(
+            c.meta.store_code.as_deref().unwrap_or(&c.code),
+            "lihao",
+            "存储码须指向精确那条记录"
+        );
+    }
+
     /// 关模糊音时行为不变：翘舌打法召不回平舌码的用户词，平舌打法照旧命中。
     #[test]
     fn fuzzy_off_user_word_recall_unchanged() {
@@ -5935,6 +6016,108 @@ mod tests {
 
     fn texts(r: &ConvertResult) -> Vec<&str> {
         r.candidates.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// `add_store_abbrev_nodes` 赢下同词同跨度的既有节点时，切分与 `canon` 随胜者换
+    /// （与 `add_store_nodes` 的两个分支一致），不只换分数。
+    ///
+    /// 直接在词图上验：预置一个同词、低分、带规范码与别种切分的节点，调用后应整体换成
+    /// 用户简拼节点的击键域切分、`canon == None`。
+    #[test]
+    fn store_abbrev_node_win_replaces_segmentation_and_canon() {
+        let store = tmp_store("abbrev_node_replace");
+        // bai|cheng|xian → 位 0/3/8
+        store
+            .add_user_word("pinyin", "baichengxian", "拜城县", 800, 0b1_0000_1001)
+            .unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        let mut nodes: Vec<Vec<lattice::LatticeNode>> = vec![Vec::new(); 4];
+        nodes[3].push(lattice::LatticeNode {
+            start: 0,
+            end: 3,
+            word: "拜城县".to_string(),
+            syllables: vec!["bcx".to_string()],
+            syl_mask: 0b1,
+            log_prob: -1000.0,
+            canon: Some(("baichengxian".to_string(), 0b1_0000_1001)),
+        });
+        LatticeBuilder::new().add_store_abbrev_nodes("bcx", &dm, &mut nodes);
+        assert_eq!(nodes[3].len(), 1, "同词同起点不新增");
+        let n = &nodes[3][0];
+        assert!(n.log_prob > -1000.0, "分数应换成用户节点的");
+        assert_eq!(n.syllables, ["b", "c", "x"]);
+        assert_eq!(n.syl_mask, 0b111);
+        assert_eq!(n.canon, None);
+    }
+
+    /// 全拼降级支路的**单词**候选同样带造词码与来源（与主路径 step 1/3/6 同口径）：
+    /// 系统词模糊命中带词典码，用户词模糊命中带记录码、来源标记与存储码。
+    ///
+    /// 此前本支路经 `push` 重建候选时 meta 整个丢掉：分步选「中国」再选别的词，造出来的
+    /// 是 `zongguo…` 这种模糊原码（f8707f74 在主路径修过的那一类），用户词还删不掉。
+    #[test]
+    fn full_pinyin_fallback_fuzzy_words_carry_learn_code() {
+        let store = tmp_store("sp_fp_fuzzy_words");
+        store
+            .add_user_word("pinyin", "caijiu", "菜就", 500, 0b1001)
+            .unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        let eng = sp_fp_engine("fuzzy_words", &[("中国", "zhong guo", 5000)], true)
+            .with_fuzzy(FuzzyConfig {
+                zh_z: true,
+                ch_c: true,
+                ..Default::default()
+            })
+            .with_store_layers(Arc::new(dm));
+
+        let r = eng.convert("zongguo", 50).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "中国" && c.is_fullpinyin_fallback)
+            .unwrap_or_else(|| panic!("应出降级支路的「中国」，实际: {:?}", texts(&r)));
+        assert!(c.is_fuzzy);
+        assert_eq!(c.code, "zongguo", "候选码仍是击键");
+        assert_eq!(
+            c.meta.learn_code.as_ref().map(|(code, _)| code.as_str()),
+            Some("zhongguo"),
+            "系统词模糊命中须带词典码"
+        );
+
+        let r = eng.convert("chaijiu", 50).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "菜就" && c.is_fullpinyin_fallback)
+            .unwrap_or_else(|| panic!("应出降级支路的「菜就」，实际: {:?}", texts(&r)));
+        assert_eq!(c.meta.learn_code, Some(("caijiu".to_string(), 0b1001)));
+        assert!(c.meta.is_user_dict, "来源标记不得丢");
+        assert_eq!(c.meta.store_code.as_deref(), Some("caijiu"), "删除按记录码");
+    }
+
+    /// 降级支路同文去重时，后到的 store 命中虽然整条让位，**来源标记与存储码要并入**
+    /// 先占位的那条（同主路径 step 6）：系统词「菜就」先在 ① 占位、用户也收录了它，
+    /// 否则右键删除找不到用户那条记录。
+    #[test]
+    fn full_pinyin_fallback_merges_store_origin_into_same_text() {
+        let store = tmp_store("sp_fp_merge_origin");
+        store
+            .add_user_word("pinyin", "caijiu", "菜就", 500, 0b1001)
+            .unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        let eng = sp_fp_engine("merge_origin", &[("菜就", "cai jiu", 5000)], true)
+            .with_store_layers(Arc::new(dm));
+        let r = eng.convert("caijiu", 50).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "菜就" && c.is_fullpinyin_fallback)
+            .unwrap_or_else(|| panic!("应出降级支路的「菜就」，实际: {:?}", texts(&r)));
+        assert!(c.meta.is_user_dict, "用户词的来源须并入");
+        assert_eq!(c.meta.store_code.as_deref(), Some("caijiu"));
     }
 
     /// 全拼降级支路的整句同样带造词码：双拼方案下按全拼 + z=zh 打 `zongguorenmin`，
