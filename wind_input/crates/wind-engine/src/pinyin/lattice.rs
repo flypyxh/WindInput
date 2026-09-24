@@ -447,9 +447,12 @@ pub struct LatticeNode {
     /// 故必须逐节点记录：Viterbi 选中哪条节点，整句的真实边界就是哪条。
     pub syl_mask: u64,
     pub log_prob: f64,
-    /// **造词用的规范码**：模糊命中时 = (命中的词条码, 该码自身坐标下的音节边界)；
-    /// 精确命中与简拼 / 残码节点为 `None`（规范码即所打码 `input[start..end]` 那一段，
-    /// 边界即 `syl_mask`，不必另存、零分配）。
+    /// **造词用的规范码**：(词条码, 该码自身坐标下的音节边界)，所打码不是规范码时才填：
+    /// - 模糊命中：命中的词条码；
+    /// - 简拼节点（系统 / 用户）：回查出的完整全拼与它的真值边界——击键字母 `bzd` 不是
+    ///   能再打出来的码；
+    /// - 精确命中为 `None`（规范码即所打码 `input[start..end]` 那一段，边界即 `syl_mask`，
+    ///   零分配）；残码节点也为 `None`（补出的字读什么是预测，造词码保留所打字母）。
     ///
     /// 只服务一件事：整句候选的 `Candidate::meta.learn_code`。整句的 `code` 必须是所打码
     /// （`consumed_length` / 分步上屏绑在它上面），而单段整句上屏造词时要写的是用户下次真能
@@ -750,8 +753,16 @@ impl LatticeBuilder {
                     for hit in dict.search_with_boundary(&abbr_code) {
                         // **音节数必须等于简拼字母数**（同 mod.rs step5 的过滤）：扁平码有损，
                         // `xa` 指向的 `xian` 回查主表会把 1 音节的「先」一并捞出来。
-                        // boundary==0 无从校验，直接跳过——混合整句的每个节点都要求真值切分。
-                        if hit.boundary.count_ones() as usize != span {
+                        // 切分走与用户侧（`add_store_abbrev_nodes`）同一个函数：boundary==0 与
+                        // bit0 未置位的畸形边界切不出来，直接跳过——混合整句的每个节点都要求真值
+                        // 切分。（越出码长的高位被该函数忽略、不计音节，与 `count_ones` 不同。）
+                        if crate::pinyin::mixed_abbrev::syllables_from_boundary(
+                            &abbr_code,
+                            hit.boundary,
+                        )
+                        .map(|s| s.len())
+                            != Some(span)
+                        {
                             continue;
                         }
                         if nodes[q].iter().any(|n| n.word == hit.text && n.start == p) {
@@ -767,7 +778,10 @@ impl LatticeBuilder {
                             syllables: stroke.chars().map(|c| c.to_string()).collect(),
                             syl_mask: (0..span).fold(0u64, |m, i| m | (1u64 << i)),
                             log_prob,
-                            canon: None,
+                            // 回查出的词条码与它的真值边界：整句造词写完整全拼，而不是击键
+                            // 字母。见 `LatticeNode::canon`。边界必非 0——上面已经过
+                            // `syllables_from_boundary` 校验且音节数 = 字母数（≥ 2）。
+                            canon: Some((abbr_code.clone(), hit.boundary)),
                         });
                     }
                 }
@@ -1149,7 +1163,7 @@ impl LatticeBuilder {
                             existing.log_prob = log_prob;
                             existing.syllables = stroke.chars().map(|c| c.to_string()).collect();
                             existing.syl_mask = (0..span).fold(0u64, |m, i| m | (1u64 << i));
-                            existing.canon = None;
+                            existing.canon = Some((cand.code.clone(), cand.boundary));
                         }
                         continue;
                     }
@@ -1161,7 +1175,8 @@ impl LatticeBuilder {
                         syllables: stroke.chars().map(|c| c.to_string()).collect(),
                         syl_mask: (0..span).fold(0u64, |m, i| m | (1u64 << i)),
                         log_prob,
-                        canon: None,
+                        // 记录自己的码与边界（`syllables_from_boundary` 已保证边界非 0）。
+                        canon: Some((cand.code.clone(), cand.boundary)),
                     });
                 }
             }

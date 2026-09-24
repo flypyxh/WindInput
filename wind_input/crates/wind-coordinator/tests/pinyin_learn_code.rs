@@ -461,3 +461,120 @@ fn s2_single_user_word_sentence_does_not_duplicate() {
         );
     }
 }
+
+/// ②b 混合整句一次上屏：造词码是**完整全拼 + 规范边界**，不是「简拼字母 + 全拼」的击键
+/// 混合码（`bzdnihao` 这种码几乎打不出来，只会在临时层堆积）。简拼段的节点带回查出的
+/// 词条码（`LatticeNode::canon`）；出厂配置（模糊关）即生效。
+///
+/// 落库后两种打法都够得着：全拼码点查命中，简拼索引按规范边界建出 `bzdnh`。
+#[test]
+fn mixed_abbrev_sentence_commit_learns_full_pinyin() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.enabled = false;
+    let db = std::env::temp_dir().join("wind_learn_code_mixed_abbrev.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    const SENT: &str = "不知道你好";
+    assert_eq!(
+        type_and_pick(&coord, "bzdnihao", SENT).as_deref(),
+        Some(SENT),
+        "前提：混合整句是「{SENT}」且一次上屏"
+    );
+    // bu|zhi|dao|ni|hao → 位 0/2/5/8/10
+    assert_eq!(
+        temp_records(&store, SENT),
+        [("buzhidaonihao".to_string(), 0b101_0010_0101u64)],
+        "造词码须为完整全拼 + 规范边界"
+    );
+    let by_abbrev: Vec<String> = store
+        .search_temp_words_by_abbrev("pinyin", "bzdnh", 0)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+    assert!(
+        by_abbrev.iter().any(|t| t == SENT),
+        "简拼索引须按规范边界召回，实际: {by_abbrev:?}"
+    );
+}
+
+/// ②b 混合整句与用户库里的同文词合并后上屏：造词码是完整全拼，`learn_phrase_on_commit`
+/// 按（码, 词）查到用户库已有这条，**不再写临时层**。
+///
+/// 此前造词码是击键混合码 `bzdnihao`，查重按它查不到用户库那条 `buzhidaonihao`，于是每上屏
+/// 一次就在临时层多一条打不出来的 `bzdnihao → 不知道你好`（实测，简拼节点 canon 置 None 即复现；
+/// 同 `s2_single_user_word_sentence_does_not_duplicate` 的约定）。
+#[test]
+fn mixed_abbrev_sentence_does_not_duplicate_user_word() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.enabled = false;
+    let db = std::env::temp_dir().join("wind_learn_code_mixed_abbrev_dup.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    const SENT: &str = "不知道你好";
+    store
+        .add_user_word("pinyin", "buzhidaonihao", SENT, 1200, 0b101_0010_0101)
+        .unwrap();
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    assert_eq!(
+        type_and_pick(&coord, "bzdnihao", SENT).as_deref(),
+        Some(SENT),
+        "前提：选中上屏"
+    );
+    assert!(
+        temp_records(&store, SENT).is_empty(),
+        "已在用户库的词不得再写进临时层，实际: {:?}",
+        temp_records(&store, SENT)
+    );
+}
+
+/// ②b 里的**用户简拼节点**（S2 开，临时层「拜城县」）：`bcxrmzf` 选整句「拜城县人民政府」上屏，
+/// 造词码是完整全拼——拜城县段取临时记录自己的规范码，人民政府段取系统词条码。
+#[test]
+fn user_abbrev_node_sentence_commit_learns_full_pinyin() {
+    if !has_dict() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let mut c = cfg();
+    c.schema.pinyin.fuzzy.enabled = false;
+    c.schema.pinyin.sentence_uses_user_words = true;
+    let db = std::env::temp_dir().join("wind_learn_code_user_abbrev_node.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    // bai|cheng|xian → 位 0/3/8
+    store
+        .learn_temp_word("pinyin", "baichengxian", "拜城县", 800, 0b1_0000_1001)
+        .unwrap();
+    let coord = Coordinator::new_headless_with_store(c, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    const SENT: &str = "拜城县人民政府";
+    assert_eq!(
+        type_and_pick(&coord, "bcxrmzf", SENT).as_deref(),
+        Some(SENT),
+        "前提：整句是「{SENT}」且一次上屏"
+    );
+    // bai|cheng|xian|ren|min|zheng|fu → 位 0/3/8/12/15/18/23
+    let want: u64 = [0, 3, 8, 12, 15, 18, 23]
+        .iter()
+        .fold(0, |m, b| m | (1u64 << b));
+    assert_eq!(
+        temp_records(&store, SENT),
+        [("baichengxianrenminzhengfu".to_string(), want)],
+        "造词码须为完整全拼 + 规范边界"
+    );
+}

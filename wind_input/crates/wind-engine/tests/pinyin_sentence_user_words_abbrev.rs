@@ -154,3 +154,55 @@ fn abbrev_hits_are_ranked_by_weight_not_key_order() {
     let on = sentence(&engine("crowd_group_on", s, true), "bcxrmzf");
     assert_eq!(on.as_deref(), Some("拜城县人民政府"));
 }
+
+/// 由音节序列算 (码, 边界)。
+fn code_and_mask(syls: &[&str]) -> (String, u64) {
+    let mut code = String::new();
+    let mut mask = 0u64;
+    for s in syls {
+        mask |= 1 << code.len();
+        code.push_str(s);
+    }
+    (code, mask)
+}
+
+fn sentence_learn_code(e: &PinyinEngine, input: &str) -> (String, Option<(String, u64)>) {
+    let c = e
+        .convert(input, 100)
+        .unwrap()
+        .candidates
+        .into_iter()
+        .find(|c| c.is_sentence)
+        .expect("应产出整句");
+    (c.text, c.meta.learn_code)
+}
+
+/// 简拼整句（②b）的造词码是**完整全拼**：简拼节点带回查出的规范码与规范边界（`canon`），
+/// 不再把击键字母 `bcx` / `rmzf` 写进造词码——那种码几乎打不出来，只会在临时层堆积。
+///
+/// 系统简拼节点（「不出现」「人民政府」）与用户简拼节点（「拜城县」）两种都验。
+#[test]
+fn abbrev_sentence_learn_code_is_full_pinyin() {
+    let (text, learn) =
+        sentence_learn_code(&engine("learn_sys", store("learn_sys"), false), "bcxrmzf");
+    assert_eq!(text, "不出现人民政府");
+    assert_eq!(
+        learn,
+        Some(code_and_mask(&[
+            "bu", "chu", "xian", "ren", "min", "zheng", "fu"
+        ]))
+    );
+
+    let s = store("learn_user");
+    s.learn_temp_word("pinyin", "baichengxian", "拜城县", 800, BCX_BOUNDARY)
+        .unwrap();
+    let (text, learn) = sentence_learn_code(&engine("learn_user", s, true), "bcxrmzf");
+    assert_eq!(text, "拜城县人民政府");
+    assert_eq!(
+        learn,
+        Some(code_and_mask(&[
+            "bai", "cheng", "xian", "ren", "min", "zheng", "fu"
+        ])),
+        "用户简拼节点取记录自己的规范码"
+    );
+}

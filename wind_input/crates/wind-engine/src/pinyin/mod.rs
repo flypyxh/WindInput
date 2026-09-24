@@ -6022,7 +6022,7 @@ mod tests {
     /// （与 `add_store_nodes` 的两个分支一致），不只换分数。
     ///
     /// 直接在词图上验：预置一个同词、低分、带规范码与别种切分的节点，调用后应整体换成
-    /// 用户简拼节点的击键域切分、`canon == None`。
+    /// 用户简拼节点的击键域切分与它自己的规范码。
     #[test]
     fn store_abbrev_node_win_replaces_segmentation_and_canon() {
         let store = tmp_store("abbrev_node_replace");
@@ -6040,7 +6040,8 @@ mod tests {
             syllables: vec!["bcx".to_string()],
             syl_mask: 0b1,
             log_prob: -1000.0,
-            canon: Some(("baichengxian".to_string(), 0b1_0000_1001)),
+            // 预置一个不同的规范码，换没换一眼可辨。
+            canon: Some(("stale".to_string(), 0b1)),
         });
         LatticeBuilder::new().add_store_abbrev_nodes("bcx", &dm, &mut nodes);
         assert_eq!(nodes[3].len(), 1, "同词同起点不新增");
@@ -6048,7 +6049,11 @@ mod tests {
         assert!(n.log_prob > -1000.0, "分数应换成用户节点的");
         assert_eq!(n.syllables, ["b", "c", "x"]);
         assert_eq!(n.syl_mask, 0b111);
-        assert_eq!(n.canon, None);
+        assert_eq!(
+            n.canon,
+            Some(("baichengxian".to_string(), 0b1_0000_1001)),
+            "canon 换成用户简拼节点自己的规范码"
+        );
     }
 
     /// 全拼降级支路的**单词**候选同样带造词码与来源（与主路径 step 1/3/6 同口径）：

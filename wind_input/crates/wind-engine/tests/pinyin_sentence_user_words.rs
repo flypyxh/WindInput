@@ -519,7 +519,8 @@ fn deferred_partial_sentence_learn_code() {
     assert_eq!(c.meta.learn_code, Some(("lunm".to_string(), 0b1001)));
 }
 
-/// step 2b 混合整句：全拼段的模糊节点取规范码，**简拼段保留击键字母**（简拼节点 canon 为 None）。
+/// step 2b 混合整句：全拼段的模糊节点取规范码，**简拼段取回查出的完整全拼**（简拼节点的
+/// `canon` = 词条码 + 规范边界），整句造词码是完整全拼。
 #[test]
 fn mixed_abbrev_sentence_learn_code() {
     let dict = wdat_dict(
@@ -535,9 +536,33 @@ fn mixed_abbrev_sentence_learn_code() {
     let e = PinyinEngine::new(PyConfig::default(), dict).with_fuzzy(n_l());
     let c = sentence_with_code(&e, "bzdgainun", "bzdgainun");
     assert_eq!(c.text, "不知道概论");
-    // b|z|d|gai|lun → 位 0/1/2/3/6
+    // bu|zhi|dao|gai|lun → 位 0/2/5/8/11
     assert_eq!(
         c.meta.learn_code,
-        Some(("bzdgailun".to_string(), 0b100_1111))
+        Some(("buzhidaogailun".to_string(), 0b1001_0010_0101))
     );
+}
+
+/// 出厂配置（模糊关）下混合整句同样带完整全拼造词码：只要有简拼段就带，此前为 None
+/// （造词退回整句 `code` = 击键串 `bzdgailun`）。
+#[test]
+fn mixed_abbrev_sentence_learn_code_without_fuzzy() {
+    let dict = wdat_dict(
+        "mixed_nofz",
+        &[
+            ("buzhidao", &[("不知道", 500_000)], 0b100101),
+            ("gailun", &[("概论", 50_000)], 0b1001),
+        ],
+        &[("bzd", "buzhidao")],
+    );
+    let e = PinyinEngine::new(PyConfig::default(), dict);
+    let c = sentence_with_code(&e, "bzdgailun", "bzdgailun");
+    assert_eq!(c.text, "不知道概论");
+    assert_eq!(
+        c.meta.learn_code,
+        Some(("buzhidaogailun".to_string(), 0b1001_0010_0101))
+    );
+    // 精确全拼整句（无简拼段）：仍为 None。
+    let c = sentence_with_code(&e, "buzhidaogailun", "buzhidaogailun");
+    assert_eq!(c.meta.learn_code, None);
 }

@@ -329,6 +329,9 @@ fn fuzzy_store_node_cost_on_real_dict() {
         ("6音节", "wochaijiuduolianba"),
         ("8音节", "nijintianchaijiuduolianba"),
         ("8音节b", "woxiangheniyiqichifan"),
+        // ②b 混合整句（简拼段 + 全拼段）
+        ("混合2b", "bzdhaobuhao"),
+        ("混合2b长", "wojintianbzdchishenme"),
     ];
     const N: u32 = 30;
     for (_, m) in &configs {
