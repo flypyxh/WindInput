@@ -5413,7 +5413,7 @@ pub struct LangBarConfig {
     /// 角标全局大小倍率（1.0 = 基准尺寸）。单条可用 `badges[].scale` 再乘一次。
     #[serde(default = "default_one")]
     pub badge_scale: f32,
-    /// 角标不透明度的**全局默认**（0~1）。单条可用色值末两位（`#RRGGBBAA`）覆盖。
+    /// 角标不透明度的**全局默认**（0~1）。单条可用 `badges[].alpha_light` / `alpha_dark` 覆盖。
     ///
     /// 它同时是档位开关：`= 1.0` 走「实心 + 挖空」（标记周围切掉一圈主字），
     /// `< 1.0` 走「半透明 + 保留主字」（笔画从标记里透出来）。两者是互斥的分离手段，
@@ -5467,27 +5467,33 @@ pub struct LangBarBadge {
     /// `top_left` / `top_right` / `bottom_right` / `bottom_left`。未知回落 `bottom_right`。
     #[serde(default = "default_langbar_corner")]
     pub corner: String,
-    /// 浅色任务栏上的颜色：`#RRGGBB`、`#RRGGBBAA`，或 `auto`（与主字同色）。
-    ///
-    /// **末两位 `AA` 是这一条自己的不透明度**（网页那套写法），不写就用全局
-    /// `badge_alpha`。于是「全局 + 条目覆盖」不必再开一个字段：色值本身就区分得开
-    /// 「没说」（6 位）与「这条自己说了算」（8 位）。
-    ///
-    /// ⚠ `AA` 填 `FF` 不是「最不透明」那么简单——它会把这一条切到**挖空档**
-    /// （角标实心 + 周围切掉一圈主字），与半遮是两种不同的画法，见
-    /// `wind_ui::langbar_icon::IconRenderer::badge_alpha`。
+    /// 浅色任务栏上的颜色：`#RRGGBB`，或 `""`（与主字同色）。不透明度见 [`Self::alpha_light`]。
     ///
     /// 亮暗分两个字段而不是一个：渲染本来就按「尺寸档 × 明暗两档」出全部变体，
     /// 按主题取色是白拿的；而同一个色在浅色与深色任务栏上的可辨度可以差很远。
     /// 出厂三条都写成亮暗同色——那三色本就是按「深浅两种任务栏上都立得住」挑的。
     ///
-    /// 解析失败回落 `auto` 并记警告，只回落**这一项**：改错一个色值若连带把位置、
+    /// 解析失败回落「与主字同色」并记警告，只回落**这一项**：改错一个色值若连带把位置、
     /// 大小一起打回默认，用户根本对不上因果。
-    #[serde(default = "default_langbar_color_auto")]
+    ///
+    /// 旧写法 `auto` / `#RRGGBBAA`（末两位是本条不透明度）由
+    /// `Config::migrate_langbar_badge_colors_value` 迁为 `""` / `#RRGGBB` + `alpha_light`；
+    /// 定制层里没迁移的旧写法渲染侧仍能读，但只读不写。
+    #[serde(default = "default_langbar_color_follow")]
     pub color_light: String,
     /// 深色任务栏上的颜色，语义同 [`Self::color_light`]。
-    #[serde(default = "default_langbar_color_auto")]
+    #[serde(default = "default_langbar_color_follow")]
     pub color_dark: String,
+    /// 本条在浅色任务栏上自己的不透明度（0~1）。`None` = 跟随全局 `badge_alpha`。
+    ///
+    /// ⚠ 填 `1.0` 不是「最不透明」那么简单——它会把这一条切到**挖空档**
+    /// （角标实心 + 周围切掉一圈主字），与半遮是两种不同的画法，见
+    /// `wind_ui::langbar_icon::IconRenderer::badge_alpha`（语义同旧 8 位写法的 `FF`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_light: Option<f32>,
+    /// 本条在深色任务栏上自己的不透明度，语义同 [`Self::alpha_light`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha_dark: Option<f32>,
     /// 本条相对全局倍率的**额外**倍率（1.0 = 与其他角标同大）。
     ///
     /// 两级而不是一级：全局那一级答「角标整体要多大」，这一级答「这一条要不要比别人
@@ -5510,8 +5516,9 @@ fn default_langbar_badge_alpha() -> f32 {
 fn default_langbar_corner() -> String {
     "bottom_right".to_string()
 }
-fn default_langbar_color_auto() -> String {
-    "auto".to_string()
+/// 角标色值缺省 = 与主字同色。
+fn default_langbar_color_follow() -> String {
+    String::new()
 }
 
 /// 出厂规则表：中文标点右下蓝、英文标点右下橙、全角右上玫红，亮暗同色、大小相同。
@@ -5525,6 +5532,8 @@ fn default_langbar_badges() -> Vec<LangBarBadge> {
         corner: corner.to_string(),
         color_light: color.to_string(),
         color_dark: color.to_string(),
+        alpha_light: None,
+        alpha_dark: None,
         scale,
     };
     vec![
@@ -7513,6 +7522,57 @@ impl Config {
         Self::migrate_show_code_hint_value(layer);
         Self::migrate_comment_max_chars_value(layer);
         Self::migrate_font_size_follow_theme_value(layer);
+        Self::migrate_langbar_badge_colors_value(layer);
+    }
+
+    /// 存量迁移（**层内**）：`[[ui.langbar.badges]]` 的色值哨兵拆成「色值 + 不透明度」两键。
+    ///
+    /// 逐条、逐侧（light/dark）处理 `color_x`：
+    /// - `auto`（不分大小写）→ `""`（与主字同色）；
+    /// - `#RRGGBBAA`         → `#RRGGBB` + `alpha_x = AA/255`（`FF` 即 1.0，仍是挖空档）；
+    /// - 其余（6 位、空串、非法值）不动——非法值留给渲染侧记警告，迁移不替用户猜。
+    ///
+    /// 本层已显式写了 `alpha_x` 时不覆盖（新键是用户后来写的，比旧色值末两位更可信）。
+    /// 幂等：迁移后的形态再跑一遍不会命中任何分支。
+    fn migrate_langbar_badge_colors_value(layer: &mut toml::Value) {
+        let Some(badges) = layer
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("langbar"))
+            .and_then(|l| l.get_mut("badges"))
+            .and_then(toml::Value::as_array_mut)
+        else {
+            return;
+        };
+        for badge in badges.iter_mut().filter_map(toml::Value::as_table_mut) {
+            for (color_key, alpha_key) in
+                [("color_light", "alpha_light"), ("color_dark", "alpha_dark")]
+            {
+                let Some(raw) = badge.get(color_key).and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let t = raw.trim();
+                let (color, alpha) = if t.eq_ignore_ascii_case("auto") {
+                    (String::new(), None)
+                } else if let Some(hex) = t
+                    .strip_prefix('#')
+                    .filter(|h| h.len() == 8 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+                {
+                    let aa = u8::from_str_radix(&hex[6..], 16).expect("已校验为十六进制");
+                    (format!("#{}", &hex[..6]), Some(f64::from(aa) / 255.0))
+                } else {
+                    continue;
+                };
+                info!(
+                    "Migrated ui.langbar.badges.{color_key}={raw} → {color:?}, {alpha_key}={alpha:?}"
+                );
+                badge.insert(color_key.to_string(), toml::Value::String(color));
+                if let Some(a) = alpha
+                    && !badge.contains_key(alpha_key)
+                {
+                    badge.insert(alpha_key.to_string(), toml::Value::Float(a));
+                }
+            }
+        }
     }
 
     /// 旧版 `ui.candidate.font_size_follow_theme` 的出厂值，也是缺该键时的生效值。
@@ -7752,6 +7812,7 @@ impl Config {
         // 迁移会把旧键从 root 里摘掉，故需单独计数，否则 removed==0 时不写盘、迁移白做。
         let before = root.clone();
         Self::migrate_font_size_follow_theme_value(&mut root);
+        Self::migrate_langbar_badge_colors_value(&mut root);
         let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
         // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
@@ -8771,6 +8832,8 @@ impl Config {
         // 否则写入 `font_size = 0`（等于出厂值 ⇒ 被剪掉）后，残留的 `follow = false` 会在
         // 下次 load 被迁成 18，用户刚选的「跟随主题」被打回。
         Self::migrate_font_size_follow_theme_value(&mut root);
+        // 角标旧色值同理：整表写回前迁掉，否则旧写法会被原样固化在用户层。
+        Self::migrate_langbar_badge_colors_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -11536,6 +11599,66 @@ scripts = { latin = 42 }
         let (fs, user) = font_size_after_migration("[ui.candidate]\nmax_chars = 9\n");
         assert_eq!(fs, 0.0);
         assert!(get_nested(&user, &["ui", "candidate", "font_size"]).is_none());
+    }
+
+    fn badges_after_migration(user_toml: &str) -> Vec<LangBarBadge> {
+        let mut user: toml::Value = toml::from_str(user_toml).unwrap();
+        Config::migrate_user_layer_value(&mut user);
+        let mut merged = toml::Value::try_from(Config::default()).unwrap();
+        merge_value(&mut merged, user);
+        let cfg: Config = merged.try_into().expect("反序列化");
+        cfg.ui.langbar.badges
+    }
+
+    #[test]
+    fn migrate_badge_auto_becomes_empty() {
+        let b = badges_after_migration(
+            "[[ui.langbar.badges]]\nstate = \"punct_cn\"\ncolor_light = \"auto\"\ncolor_dark = \"auto\"\n",
+        );
+        assert_eq!(b[0].color_light, "");
+        assert_eq!(b[0].color_dark, "");
+        assert_eq!(b[0].alpha_light, None);
+    }
+
+    #[test]
+    fn migrate_badge_rgb6_keeps_color_and_follows_global_alpha() {
+        let b = badges_after_migration(
+            "[[ui.langbar.badges]]\nstate = \"punct_cn\"\ncolor_light = \"#2288E0\"\ncolor_dark = \"#2288E0\"\n",
+        );
+        assert_eq!(b[0].color_light, "#2288E0");
+        assert_eq!(b[0].alpha_light, None);
+    }
+
+    /// 浅、深两侧 8 位色值的 alpha 不同，迁移后各自保留。
+    #[test]
+    fn migrate_badge_rgba8_splits_alpha_per_side() {
+        let b = badges_after_migration(
+            "[[ui.langbar.badges]]\nstate = \"punct_cn\"\ncolor_light = \"#2288E080\"\ncolor_dark = \"#2288E0FF\"\n",
+        );
+        assert_eq!(b[0].color_light, "#2288E0");
+        assert_eq!(b[0].color_dark, "#2288E0");
+        assert!((b[0].alpha_light.unwrap() - 128.0 / 255.0).abs() < 1e-3);
+        assert_eq!(b[0].alpha_dark, Some(1.0));
+    }
+
+    /// 缺色值键时 serde 默认即「与主字同色」—— 旧版缺键的生效值是 `auto`，新版是 `""`，
+    /// 两者同义，故缺键不需要迁移。
+    #[test]
+    fn migrate_badge_missing_color_defaults_to_follow() {
+        let b = badges_after_migration("[[ui.langbar.badges]]\nstate = \"punct_cn\"\n");
+        assert_eq!(
+            (b[0].color_light.as_str(), b[0].color_dark.as_str()),
+            ("", "")
+        );
+        assert_eq!((b[0].alpha_light, b[0].alpha_dark), (None, None));
+    }
+
+    #[test]
+    fn factory_badges_have_no_auto_and_no_alpha() {
+        for b in Config::default().ui.langbar.badges {
+            assert!(b.color_light != "auto" && b.color_dark != "auto");
+            assert_eq!((b.alpha_light, b.alpha_dark), (None, None));
+        }
     }
 
     #[test]
