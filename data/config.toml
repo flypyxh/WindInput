@@ -1335,9 +1335,9 @@ hide_in_english = false
 # 自动隐藏：显示后 auto_hide_delay 秒无交互则 1 秒淡出（悬停/拖动顺延；默认关）
 auto_hide = false
 auto_hide_delay = 5
-# 自动隐藏为「假隐藏」：淡出后仍留在原位（几乎透明），鼠标移到那里即重新显示，移开后再淡出。
+# 自动隐藏的附加选项「假隐藏」（默认关）：开启后淡出后仍留在原位（几乎透明），鼠标移到那里即重新显示，移开后再淡出。
 # 关掉则淡出后真隐藏，只在切换中英等状态变化时重新出现。仅在 auto_hide = true 时有意义。
-auto_hide_hover_reveal = true
+auto_hide_hover_reveal = false
 # 纵向排列：竖着摆放工具栏（默认横条）。几何仍取主题 [toolbar]，条宽=height、每格高=button_width。
 vertical = false
 # 显示哪些格、按什么顺序（数组顺序即从左到右 / 从上到下的顺序）；留空 = 全部显示。
