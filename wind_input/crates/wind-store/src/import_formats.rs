@@ -159,8 +159,11 @@ pub fn parse_words_rime(text: &str, policy: CodePolicy) -> Result<(Vec<WordIo>, 
                 .map(str::trim)
                 .unwrap_or("")
         };
-        let word = get("text");
-        let code_raw = get("code");
+        let (mut word, mut code_raw) = (get("text"), get("code"));
+        // 命令栏语法条目列序写反时逐行对调（t172），与码表加载 `parse_rime_line` 同判据。
+        if crate::wdict::is_cmdbar_text(code_raw) && !crate::wdict::is_cmdbar_text(word) {
+            std::mem::swap(&mut word, &mut code_raw);
+        }
         if word.is_empty() || code_raw.is_empty() {
             skipped += 1;
             continue;
@@ -226,8 +229,11 @@ pub fn parse_words_tsv(text: &str, policy: CodePolicy) -> Result<(Vec<WordIo>, u
             skipped += 1;
             continue;
         }
-        let code_raw = fields[0].trim();
-        let word = fields[1].trim();
+        let (mut code_raw, mut word) = (fields[0].trim(), fields[1].trim());
+        // 同 Rime 路径：命令栏语法条目写在编码位时对调（t172）。
+        if crate::wdict::is_cmdbar_text(code_raw) && !crate::wdict::is_cmdbar_text(word) {
+            std::mem::swap(&mut word, &mut code_raw);
+        }
         if code_raw.is_empty() || word.is_empty() || !is_valid_code(code_raw) {
             skipped += 1;
             continue;
@@ -347,6 +353,22 @@ mod tests {
         let (rows, _) = parse_words_tsv(tsv, CodePolicy::PINYIN).unwrap();
         assert_eq!(rows[0].text, "甲\n乙", "TSV 路径须反转义 \\n");
         assert_eq!(rows[1].text, "C:\\Users");
+    }
+
+    /// 命令栏语法条目列序写反时逐行纠正（t172）：`$SS(...)` 不可能是编码。
+    /// 两条导入路径都得认，否则同一行在「加载」与「导入」下结局不同。
+    #[test]
+    fn import_swaps_cmdbar_entry_written_in_wrong_column() {
+        let ss = r#"$SS("括号", "【】", "（）")"#;
+        let rime = format!("---\nname: t\n...\n甲\tjy\nuu\t{ss}\n");
+        let (rows, skipped) = parse_words_rime(&rime, CodePolicy::CODETABLE).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!((rows[1].code.as_str(), rows[1].text.as_str()), ("uu", ss));
+
+        let tsv = format!("jy\t甲\n{ss}\tuu\n");
+        let (rows, skipped) = parse_words_tsv(&tsv, CodePolicy::CODETABLE).unwrap();
+        assert_eq!(skipped, 0, "列序写反的 $SS 行不该被当非法行丢掉");
+        assert_eq!((rows[1].code.as_str(), rows[1].text.as_str()), ("uu", ss));
     }
 
     /// 反转义必须发生在 trim **之后**：转义序列在 trim 阶段是可见字符，剥不掉；

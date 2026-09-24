@@ -109,7 +109,10 @@ pub fn unescape_text_field(s: &str) -> String {
 /// 判据须在**存储形态与文件形态上给出同一答案**，否则两侧分流不一致，往返即损坏。
 /// 这里成立：两种形态的差别只有换行/制表与 `\n`/`\t` 的互换，而 `is_cmdbar_grammar`
 /// 看的是顶层 `$CC` 一类 marker 与顶层未转义 `{`，二者都不受影响。
-fn is_cmdbar_text(s: &str) -> bool {
+///
+/// 另作词库列序纠错的判据（t172）：命中者绝不可能是编码（码的字符集里没有 `$` / `{`），
+/// 落在 code 列只说明那一行的列序写反了。
+pub fn is_cmdbar_text(s: &str) -> bool {
     wind_cmdbar::is_cmdbar_grammar(s)
 }
 

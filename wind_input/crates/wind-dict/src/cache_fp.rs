@@ -37,7 +37,9 @@ fn fp_sidecar(cache: &Path) -> PathBuf {
 ///   （`$CC(..., open("D:\\notes"))` 不再被本层与 cmdbar lexer 各吃一个反斜杠）
 /// - 5 = 行尾空白只参与判定、不参与取值：text 列原样保留尾随空白，code/weight 各自
 ///   `trim_end`（CodeFirst 布局下末列 text 的尾随空格不再被剥——蒙古文以空格作词间分隔）
-const PARSE_SEMANTICS_VERSION: u32 = 5;
+/// - 6 = 命令栏语法条目（`$CC(`/`$SS(` 等）落在 code 列时逐行对调列序（t172：照文档
+///   「编码在前」手写进文本在前的词库，整条 `$SS` 被当成编码、永远打不出来）
+const PARSE_SEMANTICS_VERSION: u32 = 6;
 
 /// 流式读取时的喂料缓冲区大小：足够大以摊薄 syscall 次数，又不至于把峰值分配
 /// 重新做回「文件大小」量级——这正是 [`fingerprint`] 从 `std::fs::read` 整读
