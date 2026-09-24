@@ -763,6 +763,8 @@ impl Coordinator {
 
     pub(crate) fn exit_mix_mode(&self, state: &mut State) {
         state.active = None;
+        // 夺取回退登记随模式一起作废，理由同 `exit_special_mode`。
+        state.rewind = None;
         state.mix_buffer.clear();
         state.mix_cursor = 0;
         state.mix_repeat = false;
@@ -3052,5 +3054,35 @@ mod comment_dict_scope_tests {
             c.comment_dict_scope(&state, &cand(CandidateSource::Phrase), true, "wubi86"),
             "wubi86"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_clears_rewind_tests {
+    use crate::coordinator::{Coordinator, State};
+    use wind_config::Config;
+
+    /// 四个可被 z 夺取的模式，退出时都要作废夺取回退登记（与 `exit_special_mode` 一致）。
+    /// 留着 ⇒ 下次进同一模式、缓冲恰等于旧残余码时退格会被误判成「退回夺取边界」。
+    #[test]
+    fn every_z_hijack_target_exit_clears_rewind() {
+        let c = Coordinator::new_headless(Config::default(), None);
+        type Exit = fn(&Coordinator, &mut State);
+        let exits: [(&str, Exit); 4] = [
+            ("temp_pinyin", |c, s| c.exit_temp_pinyin(s)),
+            ("temp_english", |c, s| c.exit_temp_english(s)),
+            ("mix", |c, s| c.exit_mix_mode(s)),
+            ("special", |c, s| c.exit_special_mode(s)),
+        ];
+        let mut st = c.state.lock().unwrap();
+        for (name, exit) in exits {
+            st.rewind = Some(crate::pipeline::Rewind {
+                snapshot: "z".into(),
+                host_text: "l".into(),
+                origin: crate::pipeline::RewindOrigin::Normal,
+            });
+            exit(&c, &mut st);
+            assert!(st.rewind.is_none(), "{name} 退出后夺取回退登记不得残留");
+        }
     }
 }

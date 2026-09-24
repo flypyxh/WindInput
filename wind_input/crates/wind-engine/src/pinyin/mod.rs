@@ -3192,7 +3192,9 @@ impl Engine for PinyinEngine {
                             // 长串混合整句（pinyin_eval D 类）1000 条逐条零差异。
                             // 见 `tests/pinyin_mixed_sentence_layer.rs`。
                             is_abbrev: true,
-                            // 简拼节点不带规范码（击键即码），只有全拼段的模糊节点会让它非 None。
+                            // 简拼节点带完整规范码（回查词条的全拼 + 规范边界），故混合简拼整句的
+                            // 造词码是完整全拼（`bzdgailun` → `buzhidaogailun`）；全拼段的模糊节点
+                            // 同样贡献词典码。全部节点都是精确全拼时为 None。
                             meta: wind_candidate::CandidateMeta {
                                 learn_code: result.learn_code(abbr_query),
                                 ..Default::default()

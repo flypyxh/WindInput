@@ -70,7 +70,9 @@ pub struct CandidateMeta {
     pub store_code: Option<std::sync::Arc<str>>,
     /// **造词用的规范词条编码**与它自己的音节边界；`None` = 与候选 `code`/`boundary` 相同。
     ///
-    /// 只有模糊音命中会让两者分家：用户敲 `senri`、词典里的词是 `shengri`。候选对外的
+    /// 让两者分家的来源有三处：模糊音命中（用户敲 `senri`、词典里的词是 `shengri`）；简拼节点
+    /// （简拼 / 混合简拼整句，击键 `bzdgailun`、造词码是完整全拼 `buzhidaogailun`）；双拼的
+    /// 全拼降级支路（该支路里的模糊命中与整句同样带词典码）。以模糊音为例，候选对外的
     /// `code` 必须留**用户那份** —— `consumed_length` 的判据是 `query.starts_with(&c.code)`，
     /// 换成词典码会落到「消费整串」分支、分步上屏当场失效；preedit 跟随与词频记账同理绑在
     /// 它上面。而造词要的恰恰是**词典那份**：写进词库的码得是用户下次真能打出来的。

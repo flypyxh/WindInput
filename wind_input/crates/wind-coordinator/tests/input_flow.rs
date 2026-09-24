@@ -10833,3 +10833,98 @@ fn unicode_digits_are_code_not_selection() {
         other => panic!("数字键不该触发选词，实际: {:?}", other),
     }
 }
+
+/// z 夺取进 `target`（`temp_pinyin` / `mix:quick_mix`）后打成 `lalal`，选一个双字词（吃掉
+/// `lala`）分步上屏，返回协调器与所选的词。此时缓冲只剩 `l`，恰等于夺取边界
+/// （`Rewind::host_text` = 残余码 `l`），而组合区是「词 + l」。
+fn z_hijack_stepwise_to_boundary(
+    target: &str,
+    mode: &str,
+    by_mouse: bool,
+) -> (std::sync::Arc<Coordinator>, String) {
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.schema.codetable.z_key_action = target.into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.debug_install_phrases(zz_system_phrases());
+    press_vk(&coord, 0x5A, false); // z（`zz*` 活码让位）
+    press_letter(&coord, 'l'); // `zl` 破前缀 → 夺取，残余码 `l`
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some(mode),
+        "前提：z 夺取应已生效"
+    );
+    press_str(&coord, "alal");
+    let texts = coord.debug_page_texts();
+    let (p, word) = texts
+        .iter()
+        .position(|t| t.chars().count() == 2)
+        .map(|p| (p, texts[p].clone()))
+        .unwrap_or_else(|| panic!("lalal 的候选里应有双字词，实际: {texts:?}"));
+    let step = if by_mouse {
+        coord.debug_mouse_select(p).expect("点选应带回动作")
+    } else {
+        coord.handle_key_event(&key_event(0x31 + p as u32, EVENT_KEY_DOWN))
+    };
+    let disp = action_text(&step).unwrap_or_default();
+    assert!(
+        matches!(step, KeyAction::UpdateComposition { .. }) && disp.ends_with(&format!("{word}l")),
+        "前提：选双字词应分步上屏、组合区为「{word}」+ 剩余码 l，实际: {step:?}"
+    );
+    (coord, word)
+}
+
+/// 分步上屏后缓冲恰等于夺取边界时按退格，**不得**触发夺取回退：已转换前缀还在组合区，
+/// 回退会把它连同本模式一起清掉（`exit_*` 清 `committed_text`），用户选好的字凭空消失、
+/// 组合区跳回 `z`。应走本模式自己的退格——段回退优先，把词退回成码并回缓冲前部。
+fn assert_backspace_pops_segment(coord: &Coordinator, word: &str, mode: &str) {
+    let a = coord.handle_key_event(&key_event(0x08, EVENT_KEY_DOWN));
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some(mode),
+        "已有分步上屏的「{word}」时退格不得撤销夺取，实际动作: {a:?}"
+    );
+    let text = action_text(&a).unwrap_or_default().replace('\'', "");
+    assert!(
+        text.ends_with("lalal"),
+        "退格应段回退：「{word}」的码并回缓冲、组合区回到 lalal，实际: {a:?}"
+    );
+}
+
+#[test]
+fn z_hijack_temp_pinyin_stepwise_backspace_keeps_committed_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let (coord, word) = z_hijack_stepwise_to_boundary("temp_pinyin", "temp_pinyin", false);
+    assert_backspace_pops_segment(&coord, &word, "temp_pinyin");
+}
+
+#[test]
+fn z_hijack_mix_stepwise_backspace_keeps_committed_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let (coord, word) = z_hijack_stepwise_to_boundary("mix:quick_mix", "mix", false);
+    assert_backspace_pops_segment(&coord, &word, "mix");
+}
+
+/// 鼠标点选的分步上屏走 `select_candidate_at`，与数字键不是同一入口，单独锁。
+#[test]
+fn z_hijack_temp_pinyin_mouse_stepwise_backspace_keeps_committed_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let (coord, word) = z_hijack_stepwise_to_boundary("temp_pinyin", "temp_pinyin", true);
+    assert_backspace_pops_segment(&coord, &word, "temp_pinyin");
+}
+
+/// 同上，快捷输入的鼠标分步（`mix_select_at`）。
+#[test]
+fn z_hijack_mix_mouse_stepwise_backspace_keeps_committed_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let (coord, word) = z_hijack_stepwise_to_boundary("mix:quick_mix", "mix", true);
+    assert_backspace_pops_segment(&coord, &word, "mix");
+}

@@ -311,6 +311,8 @@ impl Coordinator {
     /// 退出临时拼音模式并清空相关状态（含逐步转换的已转换前缀）
     pub(crate) fn exit_temp_pinyin(&self, state: &mut State) {
         state.active = None;
+        // 夺取回退登记随模式一起作废，理由同 `exit_special_mode`。
+        state.rewind = None;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_cursor = 0;
         state.temp_pinyin_schema.clear();
@@ -969,6 +971,8 @@ impl Coordinator {
 
     pub(crate) fn exit_temp_english(&self, state: &mut State) {
         state.active = None;
+        // 夺取回退登记随模式一起作废，理由同 `exit_special_mode`。
+        state.rewind = None;
         state.temp_english_buffer.clear();
         state.temp_english_cursor = 0;
         state.temp_english_prefix.clear();

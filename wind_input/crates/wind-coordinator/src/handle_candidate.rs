@@ -4452,9 +4452,10 @@ impl Coordinator {
     /// `commit_candidate`（无条件清空缓冲），故点选分段候选会丢弃剩余编码、丢失已确认前缀段，
     /// 并把词频错记到整串码上。
     ///
-    /// overlay 模式（临拼/特殊/临英/混输，`active != None`）在键盘侧由各自的专用处理器接管、
-    /// 不经 `commit_selected`（见 coordinator 内 `state.active` 的单点分派），故仍走原
-    /// 「整串提交 + 彻底复位」路径，不向其引入未定义的分段语义。
+    /// overlay 模式（`active != None`）不经 `commit_selected`，而是走**各模式自己的键盘出口**
+    /// （临英 / 临拼 / 快捷输入 / 快符与生僻字，派发见 [`Self::select_candidate_at`]），临拼与
+    /// 快捷输入的分步转换由此与数字键一致。只有网址 / 邮箱 / Unicode（键盘侧不按序号选词）
+    /// 仍走「整串提交 + 彻底复位」。
     pub(crate) fn mouse_select(&self, page_local: usize) {
         let _ = self.mouse_select_action(page_local);
     }
@@ -4538,11 +4539,13 @@ impl Coordinator {
         // `CMD_COMMIT_TEXT`，宿主侧仍是「组合区活跃时提交」。走本分支则先 ClearComposition
         // 再裸插入，换行等语义随之改变（原委见 [`Self::commit_command`]）。
         // overlay 路径不在此列：它有各自的退出闭包，仍按 `overlay_commit_command` 语义异步执行。
+        // 求值输入与下方命令执行输入同源（`command_input_code`）：辅助码从临拼来时取的是
+        // 临拼缓冲，取主路 `input_buffer`（此时恒空）会把依赖 `code` 的纯文本命令误判成动作。
         let cmd_commits_text = main_path
             && self.command_commits_text(&state.candidates[idx], {
                 let gc = &state.candidates[idx].group_code;
                 if gc.is_empty() {
-                    &state.input_buffer
+                    self.command_input_code(&state)
                 } else {
                     gc
                 }
@@ -6869,6 +6872,36 @@ mod mouse_command_overlay_tests {
             filter_options: Default::default(),
             origin,
         }
+    }
+
+    /// 辅助码（从临拼进来）里鼠标点**纯文本命令**：「是否纯文本」的求值输入必须与命令
+    /// 执行输入同源（`command_input_code` = 来源临拼缓冲）。曾取主路 `input_buffer`（此时恒空），
+    /// `type(code)` 求值成空串 ⇒ 判成「非纯文本」落进 `$CC` 分支，经 `cancel_session` 退出后
+    /// 返回 None；而键盘选同一候选走 `aux_code_committed` → 临拼出口，带回 `ClearComposition`。
+    #[test]
+    fn aux_code_from_temp_pinyin_text_command_uses_mode_buffer() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = Some(ModeKind::AuxCode);
+            st.aux_code = Some(aux_overlay(Some(ModeKind::TempPinyin)));
+            st.temp_pinyin_buffer = "tp".into();
+            st.temp_pinyin_cursor = 2;
+            st.candidates = vec![Candidate {
+                text: "标签".into(),
+                is_command: true,
+                phrase_template: r#"$CC("标签", type(code))"#.into(),
+                ..Default::default()
+            }];
+        }
+        match c.select_candidate_at(0) {
+            Some(KeyAction::ClearComposition) => {}
+            other => panic!("应与键盘同走来源临拼的命令出口，实际: {other:?}"),
+        }
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.active, None);
+        assert!(st.aux_code.is_none());
+        assert!(st.temp_pinyin_buffer.is_empty());
     }
 
     /// 生僻字（经 z 夺取进来）里鼠标点**普通候选**：走键盘同一出口

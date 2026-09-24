@@ -175,10 +175,17 @@ impl Coordinator {
         }
     }
 
-    /// 是否可回退：已登记 + 当前模式 buffer 已退回到夺取边界（== 登记时的 host_text）。
+    /// 是否可回退：已登记 + 当前模式 buffer 已退回到夺取边界（== 登记时的 host_text）
+    /// + 没有分步上屏留下的已转换前缀。
+    ///
+    /// ★ `committed_text` 非空时缓冲等于边界只是巧合：临拼 / 快捷输入打 `lalal` 选「拉拉」
+    /// 分步上屏后缓冲剩 `l`，恰等于残余码，此刻回退会经 `exit_*` 把「拉拉」一并清掉、组合区
+    /// 跳回 `z`。判据收在这里而不是「分步上屏时清 `rewind`」：分步出口有键盘 / 次选键 keyup /
+    /// 鼠标 / 辅助码转交多条，这里是唯一的汇合点；且段全部退回后（`committed_text` 又空、
+    /// 缓冲回到边界）那一帧正是夺取边界本身，回退仍应可用，清掉登记就回不去了。
     pub(crate) fn can_rewind(&self, state: &State) -> bool {
         match (&state.rewind, self.active_hijack_buffer(state)) {
-            (Some(rw), Some(buf)) => buf == rw.host_text,
+            (Some(rw), Some(buf)) => buf == rw.host_text && state.committed_text.is_empty(),
             _ => false,
         }
     }
