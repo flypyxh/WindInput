@@ -1079,6 +1079,10 @@ impl CandidateWindow {
         apply_scheme_text_font(&mut t.views, &self.text_family_override);
         self.base_font_logical =
             effective_base_font_size(self.font_size_override, t.behavior.font_size);
+        // 渲染器的基准字号也要跟上：没显式带字号的节点回落到它（`View` 取 `tr.base_size()`），
+        // 只在换 DPI 时更新的话，改字号/换主题后这些节点会停在旧值直到下次换显示器。
+        self.text_renderer
+            .set_base_size(self.base_font_logical * self.scale);
         self.theme = t;
     }
 
@@ -6278,5 +6282,20 @@ mod font_precedence_tests {
         assert!(user_w > theme_w, "用户字号没作用到测量上");
         w.set_font_size_override(0.0);
         assert_eq!(w.base_font_logical, 18.0, "0 = 跟随主题");
+    }
+
+    /// 渲染器基准字号随生效字号走，不只在换 DPI 时更新。
+    #[test]
+    fn renderer_base_size_follows_effective_font_size() {
+        let mut t = wind_theme::Resolved::default();
+        t.behavior.font_size = 18;
+        let mut w = win(t);
+        w.set_font_size_override(30.0);
+        assert_eq!(w.text_renderer.base_size(), 30.0, "改字号后基准字号没跟上");
+        let mut t2 = wind_theme::Resolved::default();
+        t2.behavior.font_size = 22;
+        w.set_font_size_override(0.0);
+        w.set_theme(t2);
+        assert_eq!(w.text_renderer.base_size(), 22.0, "换主题后基准字号没跟上");
     }
 }

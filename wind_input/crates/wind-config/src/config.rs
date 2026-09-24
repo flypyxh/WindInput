@@ -7432,6 +7432,9 @@ impl Config {
     ///
     /// 已知近似：「没写 follow 就按旧默认 true」没去看下层（L2.5 定制层）是否写过 false。
     /// 定制层关跟随、用户层只改字号这一组合下，迁移会把用户字号归 0。
+    /// 反方向同理：定制层写了 `font_size = 20`、用户层只剩 `follow = false` 时，本层补的是
+    /// 旧出厂 18 而非定制层的 20。两者都只出现在「定制版 + 用户改过跟随」的组合里，且
+    /// 结果只是字号回到某个出厂值，不值得为此让层内迁移去读别的层。
     fn migrate_font_size_follow_theme_value(layer: &mut toml::Value) {
         let Some(cand) = layer
             .get_mut("ui")
@@ -7570,7 +7573,12 @@ impl Config {
         }
         if let Some(custom_dir) = Self::custom_data_dir() {
             let custom_config = custom_dir.join("config.toml");
-            if let Some(v) = Self::read_toml_value(&custom_config) {
+            if let Some(mut v) = Self::read_toml_value(&custom_config) {
+                // 与 `load()` 的 L2.5 同一道迁移：否则定制层里旧格式的键（如只写了
+                // `font_size = 22`，旧语义下被 follow_theme 压住、`load()` 迁成 0）在这份
+                // 出厂基线里仍是 22，剪枝会把用户显式设的 22 当成「等于默认」删掉，
+                // 违反「清理前后 load 结果逐键相同」。
+                Self::migrate_user_layer_value(&mut v);
                 merge_value(&mut merged, v);
             }
         }

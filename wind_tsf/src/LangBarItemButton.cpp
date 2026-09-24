@@ -61,6 +61,7 @@ CLangBarItemButton::CLangBarItemButton(CTextService* pTextService)
     , _bDarkMode(IsSystemDarkMode() ? TRUE : FALSE)
     , _hMsgWnd(NULL)
     , _bIconLoading(TRUE)
+    , _bLoggedLoading(FALSE)
 {
     // Default input type label
     wcscpy_s(_inputTypeLabel, L"中");
@@ -548,9 +549,12 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
         WIND_LOG_ERROR(L"GetIcon: create loading icon failed\n");
         return E_FAIL;
     }
-    if (!_bIconLoading)
+    if (!_bIconLoading || !_bLoggedLoading)
     {
         // 只在进入加载中的那一下记一条：GetIcon 由系统按需回调，每次都记会刷屏。
+        // _bLoggedLoading 兜住「服务从头到尾没起来」：那时 _bIconLoading 初值即 TRUE，
+        // 永远不经过 FALSE→TRUE，却正是最需要这条日志的现场。
+        _bLoggedLoading = TRUE;
         WIND_LOG_INFO_FMT(L"GetIcon: icon SHM unavailable, showing loading icon size=%d\n",
                           iconSize);
     }
@@ -821,9 +825,15 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
         CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (pThis != nullptr && pThis->_pLangBarItemSink != nullptr)
         {
-            // 只报 TF_LBI_ICON。别顺手带上 TEXT/TOOLTIP：那两项没变，一起报只会让系统
-            // 多查几次，而本命令的调用频率可以很高（演示动画每帧一次）。
-            pThis->_pLangBarItemSink->OnUpdate(TF_LBI_ICON);
+            // 平时只报 TF_LBI_ICON：TEXT/TOOLTIP 没变，一起报只会让系统多查几次，而本命令
+            // 的调用频率可以很高（演示动画每帧一次）。
+            // 例外：还在「加载中」时 tooltip 是「正在加载…」，服务首次发布图标正是走这里，
+            // 只报 ICON 的话图标已恢复、悬停却一直停在「正在加载…」。GetIcon 会在这次
+            // 回调里把 _bIconLoading 清掉，故这一带只发生一次。
+            DWORD flags = TF_LBI_ICON;
+            if (pThis->_bIconLoading)
+                flags |= TF_LBI_TOOLTIP;
+            pThis->_pLangBarItemSink->OnUpdate(flags);
         }
         return 0;
     }

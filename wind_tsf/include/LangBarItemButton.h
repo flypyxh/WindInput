@@ -188,6 +188,8 @@ private:
     // 最近一次 GetIcon 给的是加载中图标（SHM 不可用）。初值 TRUE：首个 GetIcon 之前
     // 没有任何服务端图标可言。tooltip 据此与图标保持一致。
     BOOL _bIconLoading;
+    // 「进入加载中」那条日志是否记过；见 GetIcon。
+    BOOL _bLoggedLoading;
 
     // 模式主字。中文态取方案的 icon_label（"中"/"拼"/"五"/"双"），非中文态取
     // [ui.labels]（默认 "英"/"A"，用户可配，最多 2 个字符）。
