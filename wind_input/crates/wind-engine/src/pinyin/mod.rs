@@ -4291,16 +4291,51 @@ impl Engine for PinyinEngine {
         // 保底配额现已有**一档**：`truncate_with_abbrev_quota`，判据是 `is_abbrev`。
         // 但下沉 P0 要的是按**消费长度**分档（参考混输 `PINYIN_QUOTA_DIVISOR`），那件仍未做
         // —— 单档只护住了简拼这一类，消费长度短的候选仍会被长候选整批挤出截断窗口。
-        candidates.sort_by(|a, b| {
+        //
+        // 零权重读音让位的重排（截断之后）用的也是它，两处必须同一个比较器。
+        let engine_order = |a: &Candidate, b: &Candidate| {
             wind_candidate::cmp_match_layers(a, b)
                 .then(b.weight.cmp(&a.weight))
                 .then(a.natural_order.cmp(&b.natural_order))
-        });
+        };
+        candidates.sort_by(engine_order);
         if abbrev_quota {
             truncate_with_abbrev_quota(&mut candidates, max_candidates);
         } else {
             // 调用方声明了不重排（见 `ConvertOptions::no_abbrev_quota`）：补位在那边是净损失。
             candidates.truncate(max_candidates);
+        }
+
+        // 零权重读音让位：精确单字的**这个读音**词库权重为 0（𤭢 cei、塞 sei、嫩 nun、这 zhei）
+        // ⇒ 并入简拼层按 weight 竞争（`Candidate::is_zero_weight_reading`）。双拼两键 `cw`
+        // 首选回到简拼词「成为」，𤭢 仍在候选里；嗲(dia=182) 这类有权重的读音不动。
+        //
+        // 判据只认**词库原值**：模糊命中（权重是折扣后的、读音也不是这个）、整句、补全、
+        // 子短语、全拼降级支路一律不算；用户词 / 临时词里有这个字 = 用户用过这个读音，不让位。
+        // 用户选过的字由 `freq_rerank::rerank_pinyin_positional` 摘掉标记。
+        //
+        // ⚠️ **必须在截断之后置位、再稳定重排**：标记把字沉到简拼层末尾，截断前置位的话
+        // `truncate_with_abbrev_quota` 腾位时从尾部先挤掉的就是它们（小鹤 `jx` 的夾/挟/袷整条
+        // 消失，8 个布局两键共 584 个输入掉字），而词频重排在截断之后、救不回来。
+        // 截断按改动前的次序做 ⇒ 活过截断的集合与改前逐条一致，变的只有次序。
+        // 位置也须在下方 preedit 读 `candidates.first()` 之前。
+        let mut any_zero_weight = false;
+        for c in candidates.iter_mut() {
+            c.is_zero_weight_reading = c.weight == 0
+                && c.code == completed
+                && c.text.chars().count() == 1
+                && !c.is_abbrev
+                && !c.is_prefix
+                && !c.is_partial
+                && !c.is_sentence
+                && !c.is_fuzzy
+                && !c.is_fullpinyin_fallback
+                && !c.meta.is_user_dict
+                && !c.meta.is_temp_dict;
+            any_zero_weight |= c.is_zero_weight_reading;
+        }
+        if any_zero_weight {
+            candidates.sort_by(engine_order);
         }
 
         let (mut preedit_display, completed_syllables, partial_syllable) =

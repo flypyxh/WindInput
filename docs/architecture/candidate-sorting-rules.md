@@ -289,6 +289,10 @@
                              （实测红 10 条，含两条真回归）。根因是架构差异——librime 的
                              `Translation` 惰性流式从不全局截断，我们是一次性产生 N 条 + 截断。
 ① cmp_match_layers        is_abbrev 升 → **eff_prefix** 升 → is_partial 升
+                          （简拼层 = `is_abbrev || is_zero_weight_reading`：零权重读音的精确单字
+                            并入简拼层按 weight 让位，小鹤 `cw` 首选「成为」而非 𤭢。简拼层在
+                            前缀、子短语层之下，故它同时沉到这两层之后，不只是「与简拼词同层」；
+                            见 engine-candidate-pipeline.md §4.1）
                           （`eff_prefix = is_prefix && !is_promoted_completion`，与引擎、
                             `freq_rerank` 共用同一个函数，三处不得各写一份）
                           ⚠️ 曾在协调器另写过一份「同构但忽略 `is_promoted_completion`」的副本，

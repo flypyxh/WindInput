@@ -326,6 +326,17 @@ pub fn rerank_pinyin_positional(
     promote_prefix: PromotePrefix,
     input_len: usize,
 ) {
+    // 零权重读音让位（`Candidate::is_zero_weight_reading`）对**用户选过的字**不再成立：
+    // 有了词频就是用户用过这个读音，退回精确层，再按位置提升与同层竞争。
+    //
+    // 不靠位置提升把它从简拼层里捞回来：它在简拼层的**末尾**（小鹤 `cw` 下 𤭢 在第 140 位），
+    // 减半模型要选 8 次才到顶，而用户第一次就是翻十几页找到它的。
+    for c in candidates.iter_mut() {
+        if c.is_zero_weight_reading && promotion_power(c, recs, now, profile, promote_prefix) > 0.0
+        {
+            c.is_zero_weight_reading = false;
+        }
+    }
     rerank_positional(
         candidates,
         recs,
@@ -581,6 +592,36 @@ mod tests {
             "整句只是退居第二，不得被赶出列表"
         );
         assert_eq!(cands[2].text, "拟");
+    }
+
+    /// 零权重读音让位对**有词频记录**的字失效：摘掉标记、退回精确层，排到简拼词之前。
+    /// 无记录的对照字保留标记、留在简拼层。
+    #[test]
+    fn freq_record_clears_zero_weight_reading() {
+        let zero = |text: &str| {
+            let mut c = pin(text, 0);
+            c.is_zero_weight_reading = true;
+            c
+        };
+        let abbrev = {
+            let mut c = pin("成为", 50000);
+            c.is_abbrev = true;
+            c
+        };
+        let mut cands = vec![abbrev, zero("𤭢"), zero("嫩")];
+        let r = recs(&[("𤭢", 1, NOW)]);
+        rerank_pinyin_positional(
+            &mut cands,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+            0,
+        );
+        assert_eq!(cands[0].text, "𤭢", "选过的字应退回精确层、排到简拼词之前");
+        assert!(!cands[0].is_zero_weight_reading);
+        assert_eq!(cands[1].text, "成为");
+        assert!(cands[2].is_zero_weight_reading, "无词频记录的字仍应让位");
     }
 
     /// ★ **模糊同码候选**能靠词频反超整句 —— 这是移除整句锚定唯一实际改变的场景。

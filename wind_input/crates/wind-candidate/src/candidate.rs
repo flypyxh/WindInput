@@ -263,6 +263,19 @@ pub struct Candidate {
     /// 引擎内部用于排序，不推送 UI。
     #[serde(skip)]
     pub is_fullpinyin_fallback: bool,
+    /// 是否为**零权重读音**的精确单字：该字的这个读音在词库里权重为 0（几乎没人这么读，
+    /// 如 𤭢 cei、塞 sei、嫩 nun、这 zhei）。拼音引擎在截断**之后**置位，
+    /// [`cmp_match_layers`] 把它并入**简拼层**，于是双拼两键 `cw` 首选是简拼词「成为」
+    /// 而不是 𤭢，但 𤭢 仍在候选里；有权重的读音（嗲 dia=182）不置位、照旧首选。
+    ///
+    /// ⚠️ 简拼层排在前缀补全层、子短语层**之下**，所以它不只是「与简拼词同层」——同消费长度
+    /// 下它也沉到全部前缀补全与子短语之后，在简拼层内按 weight（=0）再排到简拼词之后。
+    ///
+    /// 用户词 / 临时词里有的字不置位（用户用过这个读音）。有词频记录的字由
+    /// `freq_rerank::rerank_pinyin_positional` 摘掉标记、退回精确层；**关闭调频或记录衰减
+    /// 殆尽后，标记会重新生效**（它每次转换都由引擎重算，不落盘）。引擎内部用于排序，不推送 UI。
+    #[serde(skip)]
+    pub is_zero_weight_reading: bool,
     /// 是否为前缀补全候选（候选编码比输入更长，如输入 si 补全出「思考」(sikao)）。
     /// 排序时前缀补全整体降到精确匹配（code==输入）之后，使等长精确候选优先
     /// （如输入 si 时单字「四」优先于补全词「思考」），对齐 Go 的 Exact>>Partial 层级。
@@ -538,6 +551,7 @@ impl Default for Candidate {
             is_fuzzy: false,
             is_abbrev: false,
             is_fullpinyin_fallback: false,
+            is_zero_weight_reading: false,
             is_prefix: false,
             is_partial: false,
             is_exact_code: false,
@@ -707,9 +721,12 @@ pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     // limit 恒为 300 ⇒ 被 `truncate` 丢弃。给它补上上浮判据也无用：`is_promoted_completion`
     // 在这一行根本不被看，位次只从 603 挪到 595，出不了沉底组。
     let fp_demoted = |c: &Candidate| c.is_fullpinyin_fallback && (eff_prefix(c) || c.is_partial);
+    // 简拼层：零权重读音的精确单字并入此层按 weight 竞争（见 [[Candidate::is_zero_weight_reading]]；
+    // 简拼层在前缀、子短语层之下，故它比「与简拼词同层」更沉）。
+    let abbrev_layer = |c: &Candidate| c.is_abbrev || c.is_zero_weight_reading;
     fp_demoted(a)
         .cmp(&fp_demoted(b))
-        .then(a.is_abbrev.cmp(&b.is_abbrev))
+        .then(abbrev_layer(a).cmp(&abbrev_layer(b)))
         .then(eff_prefix(a).cmp(&eff_prefix(b)))
         .then(a.is_partial.cmp(&b.is_partial))
 }
@@ -1410,5 +1427,21 @@ mod match_layer_tests {
             Ordering::Greater,
             "简拼是首要键，即便其结构更优也须沉在前缀补全之后"
         );
+    }
+
+    /// 零权重读音的精确单字并入简拼层：与简拼词同层（由权重决出），整体沉在精确之后。
+    #[test]
+    fn zero_weight_reading_joins_abbrev_layer() {
+        let exact = Candidate::default();
+        let zero_weight = Candidate {
+            is_zero_weight_reading: true,
+            ..Default::default()
+        };
+        let abbrev = Candidate {
+            is_abbrev: true,
+            ..Default::default()
+        };
+        assert_eq!(cmp_match_layers(&zero_weight, &abbrev), Ordering::Equal);
+        assert_eq!(cmp_match_layers(&exact, &zero_weight), Ordering::Less);
     }
 }
