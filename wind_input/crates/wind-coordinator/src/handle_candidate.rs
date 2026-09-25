@@ -18,6 +18,12 @@ use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
 use wind_ui_types::CandidateOp;
 
+/// 英文词频召回（[`Coordinator::english_freq_recall`]）每次最多补进几个词。
+///
+/// 召回的词从池尾起步、按 `base_pos / 2^有效次数` 前移；按有效次数取前 16 个（已验证是
+/// 词库词的）已经覆盖「能进前几页」的全部候选者，再多的只是在池尾附近换位置。
+const ENGLISH_RECALL_MAX: usize = 16;
+
 /// 候选词条操作（置顶 / 前移 / 后移 / 删除 / 恢复默认）的作用域快照。
 /// 由 [`Coordinator::candidate_op_scope`] 解析，菜单构建、写端、macOS 禁用位三处共用。
 pub(crate) struct CandidateOpScope {
@@ -854,6 +860,131 @@ impl Coordinator {
         }
     }
 
+    /// 英文词频**召回**（A2-39③）：词频表里以 `code` 开头、有记录、仍是词库词、却不在
+    /// `pool` 里的英文词，造成候选返回，由调用方并进池子后再跑 [`Self::apply_freq_rerank_in`]。
+    ///
+    /// # 为什么需要
+    ///
+    /// 词频重排只作用于**已取回**的候选，而英文单字母前缀下引擎只取 300 条（`t` 前缀有上万
+    /// 个词）。原序排在 300 名开外的词——`t` 下的 `translation`——用多少次都排不上来：
+    /// 取数上限先于词频生效。拼音「长词召回」是同一类问题。
+    ///
+    /// # 口径
+    ///
+    /// - **只在调频开着时做**（`freq_settings_for(owner).enabled`），关着时一次查询都不发、
+    ///   池子逐字不变。
+    /// - **只对英文引擎**（归属方案的引擎类型是 `English`）：英文方案本身、临英、快捷输入
+    ///   的英文成员三处调用点共用本函数，其余方案直接返回空。
+    /// - **只在 `code_scope = candidate`（出厂）下做**：那时记账码是词本身的词库码，
+    ///   「码以当前输入开头」正是「这个词是当前前缀的补全」，词频表按码排序，一次**前缀
+    ///   区间扫描**（`for_each_freq`，redb range，不扫全表）就取齐。`input` 口径下各前缀
+    ///   码位独立，别的前缀上学到的本就不该作用于这里，而本码位的记录都是从这个码位的
+    ///   列表里选出来的——它们当时就在池里。
+    /// - **只收仍是词库词的记录**：逐条按记录码向引擎精确查一次、文本须一致。词频是排序
+    ///   维度，不是词条来源；导入残留、词库已停用的词不该借词频表复活。
+    /// - 召回的词放在**池尾**（`natural_order` 接在池内最大值之后）：它的原序本就在取数
+    ///   上限之外，池尾是它原序位次的下界。位置提升按 `base_pos / 2^有效次数` 前移——
+    ///   `t` 下池子 300 条，用 5 次到第 9 位左右，与池内词同一把尺。
+    ///
+    /// # 规模
+    ///
+    /// 扫描量 = 该前缀下有记录的英文词数（用户实际用过的词，通常几个到几十个），不是词库
+    /// 规模。按衰减后的有效次数从高到低逐条验证，攒够 [`ENGLISH_RECALL_MAX`] 个词库词即停——
+    /// 次数更少的词即便召回，也只能从池尾前移一两次，进不了前几页。
+    pub(crate) fn english_freq_recall(
+        &self,
+        schema_override: Option<&str>,
+        pool: &[Candidate],
+        code: &str,
+    ) -> Vec<Candidate> {
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        if code.is_empty() {
+            return Vec::new();
+        }
+        let owner = schema_override
+            .map(str::to_string)
+            .unwrap_or_else(|| self.engine_mgr.active_schema_id());
+        if self.engine_mgr.loaded_engine_type(&owner) != Some(wind_engine::EngineType::English) {
+            return Vec::new();
+        }
+        let settings = self.engine_mgr.freq_settings_for(&owner);
+        if !settings.enabled || settings.english_code_by_input {
+            return Vec::new();
+        }
+        let data_schema = self.engine_mgr.data_schema_id(&owner);
+        // 有效次数与重排同一套算法：`count × 半衰期衰减`，不足
+        // `MIN_PROMOTION_POWER` 的记录在重排里提升强度为 0——召回回来也只会钉在池尾，
+        // 不如不召。`MIN_PROMOTION_POWER` 与 `decay_factor` 都取自重排本身，不另立口径。
+        let now = now_unix_secs();
+        let profile = self.engine_mgr.freq_profile_for(&owner);
+        let mut rows: Vec<(String, String, f64)> = Vec::new();
+        let scanned = store.for_each_freq(&data_schema, code, &mut |rc, text, rec| {
+            let eff = rec.count as f64 * profile.decay_factor(&rec, now);
+            if eff >= wind_engine::freq_rerank::MIN_PROMOTION_POWER
+                && !settings.excluded_from_freq(text)
+            {
+                rows.push((rc.to_string(), text.to_string(), eff));
+            }
+            true
+        });
+        if let Err(e) = scanned {
+            warn!("english freq recall scan failed: {}", e);
+            return Vec::new();
+        }
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let in_pool: std::collections::HashSet<&str> =
+            pool.iter().map(|c| c.text.as_str()).collect();
+        rows.retain(|(_, text, _)| !in_pool.contains(text.as_str()));
+        rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let mut next_order = pool
+            .iter()
+            .map(|c| c.natural_order)
+            .max()
+            .map_or(0, |m| m + 1);
+        let mut out: Vec<Candidate> = Vec::new();
+        // ★ **先验证、后截断**：按有效次数从高到低逐条验证，攒够 `ENGLISH_RECALL_MAX` 个
+        // 词库词才停。反过来（先截前 N 条再验证）的话，同前缀下一批非词库残留或导入的
+        // 旧记录会占满名额，把用户最近真在用的词挤出去。验证次数的上界是本前缀下的
+        // 记录数（用户实际用过的词），不是词库规模。
+        for (rc, text, _) in rows {
+            if out.len() >= ENGLISH_RECALL_MAX {
+                break;
+            }
+            // 同一个词可能在词频表里挂在两个码下（`translation` / `t9n` 两个词库条目），
+            // 只召回一次。
+            if out.iter().any(|c| c.text == text) {
+                continue;
+            }
+            let Some(mut c) = self
+                .engine_mgr
+                .convert_with(
+                    &owner,
+                    &rc,
+                    crate::english_candidates::ENGLISH_EXACT_LOOKUP_LIMIT,
+                )
+                .candidates
+                .into_iter()
+                .find(|c| c.source == CandidateSource::English && c.code == rc && c.text == text)
+            else {
+                continue;
+            };
+            // 引擎按记录码查，标的是「对记录码精确」；对当前输入它是前缀补全（同
+            // `CodeTableEngine::convert` 的 `is_exact_code = code == input`）。
+            c.is_exact_code = c.code == code;
+            c.natural_order = next_order;
+            next_order += 1;
+            out.push(c);
+        }
+        if !out.is_empty() {
+            debug!(recalled = out.len(), "英文词频召回");
+        }
+        out
+    }
+
     /// 短语候选的**稳定 id**（`Candidate::id`）：`phrase:{code}:{原始记录文本}`，对齐 Go
     /// `dict.phraseCandID`。供 shadow 规则跨日精准匹配——短语的显示文本可能是模板求值结果
     /// （`date` 的 `$Y-$MM-$DD` → `2026-07-29`），以文本为键的规则次日必失配。
@@ -1348,6 +1479,14 @@ impl Coordinator {
         // 候选层级排序：合并引擎候选 + 短语后按统一层级重排（见 `candidate_display_order`）。
         // base_sort=natural 时忽略权重，对齐引擎 by_natural（否则合并短语后重排会与引擎发散）。
         let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
+        // 英文方案：把用过、但原序在取数上限之外的词补进来（A2-39③；非英文方案与调频关时
+        // 空操作）。★ 放在**排序 / 去重 / 过滤之前**，让召回的词与引擎候选走同一条加工链：
+        // 检索范围过滤（`apply_filter`）与单字过滤（`apply_single_char`）滤掉的东西，召回
+        // 不能在它们之后再塞回来（开了单字模式却冒出整词）。排序按显示序：召回词的权重不高于
+        // 池尾（池子本就是引擎按同一口径取的前 N），`natural_order` 又接在池内最大值之后，
+        // 故它们落在池尾——正是重排要的 base_pos。
+        let recalled = self.english_freq_recall(None, &candidates, &state.input_buffer);
+        candidates.extend(recalled);
         // ⚠️ 常用字判定必须**先于排序**：混输的拼音精确档拿 `is_common` 作提档准入条件
         // （见 `mark_common` 与 `wind_candidate::is_pinyin_exact_tier`）。过滤仍在下面按模式进行。
         self.mark_common(&mut candidates);

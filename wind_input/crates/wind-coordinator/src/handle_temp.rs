@@ -1131,6 +1131,10 @@ impl Coordinator {
             // ★ 码取**小写化缓冲**：临英缓冲带大写（Shift+H 进入即 `H`），而英文方案下
             // `input_buffer` 恒为全小写。不归一的话两个入口各存一份键，「临英里学到的、
             // 切到英文方案不生效」，而这种失效是完全静默的。
+            //
+            // 重排前先把「用过、但原序在取数上限之外」的词补进池尾（A2-39③，调频关时空操作）。
+            let recalled = self.english_freq_recall(Some(ENGLISH_SCHEMA), &dict_part, &code);
+            dict_part.extend(recalled);
             self.apply_freq_rerank_in(Some(ENGLISH_SCHEMA), &mut dict_part, &code);
             self.apply_shadow_in(Some(ENGLISH_SCHEMA), &mut dict_part, &code);
             // ★ 大小写投影排在重排与置顶**之后**：那两者都以候选 `text` 为键，先改写文本

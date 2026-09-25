@@ -13,7 +13,7 @@
 //! 配置取出厂（`Config::load` = 代码默认 + `build_dev/data/config.toml` + 用户层；用例覆盖
 //! `schema.available/active` 与调频开关，用户层若另改了临英/英文段会混进来，读数前先看一眼）。
 //!
-//! 2026-09-25 实测结论（数据见报告）：
+//! 2026-09-25 修前实测结论：
 //! - 出厂调频关：不记、不排，位次恒不变——出厂值问题；
 //! - 调频开、打全再上屏（空格 / 选小写）：一条都不记。打全 `translation` 时词库那条被头部
 //!   原文 / 大小写变形吞掉，头部候选不是 `English` 来源，`record_temp_english_selection` 跳过；
@@ -21,10 +21,16 @@
 //!   `tran` 41→4；但 `t` 下它**根本不在取回的 300 条里**，重排只作用于已取回的候选，
 //!   用多少次都上不来——取数上限先于词频重排，是代码问题。
 //!
+//! 修后（②头部候选按对应词库词记、③调频开时从词频表召回池外的词，正式断言见
+//! `temp_english_hotword_recall.rs`）：调频开时三种打法一致——`t` 下 选 1/3/5 次后
+//! 下标 152/39/11（第 22/6/2 页），`tr`/`tra` 6、`tran` 4；调频关逐字不变。
+//! `observe_recall_other_entries_and_cost` 另量英文方案 / 快捷输入的位次与召回的每键耗时。
+//!
 //! ⚠️ 依赖 `build_dev/data` 真实词库；缺失时跳过。
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
@@ -225,4 +231,104 @@ fn observe_translation_rank_under_t() {
             observe(freq, via);
         }
     }
+}
+
+/// 召回在英文方案 / 快捷输入上的位次，以及 `t` 这一键的耗时（召回开 vs 调频关）。
+///
+/// 词频表直接种 5 次 `(translation, translation)` 与 20 个别的 `t` 开头词频行（模拟一个用过
+/// 不少 t 词的用户：召回要逐条扫描 + 验证），`t` 各打 200 次取均值。
+#[test]
+#[ignore = "A2-39 观测，手动跑：--ignored --nocapture"]
+fn observe_recall_other_entries_and_cost() {
+    if !has_english_schema() {
+        eprintln!("跳过：缺少英文方案或词库");
+        return;
+    }
+    let db = std::env::temp_dir().join(format!("wind_a2_39_cost_{}.redb", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    for _ in 0..5 {
+        store.record_freq("english", WORD, WORD).unwrap();
+    }
+    // 20 个 t 开头、原序多在池外的词（取自出厂 en.dict.yaml）。
+    for w in [
+        "tackling",
+        "taxation",
+        "technicians",
+        "temperatures",
+        "tentative",
+        "territorial",
+        "textbook",
+        "theology",
+        "thinking",
+        "threatening",
+        "throwing",
+        "timeshares",
+        "tolerated",
+        "townhouse",
+        "tradesman",
+        "tranquil",
+        "transferred",
+        "transition",
+        "transmit",
+        "teaspoon",
+    ] {
+        store.record_freq("english", w, w).unwrap();
+    }
+    let build = |freq: bool, active: &str| {
+        let mut cfg = Config::load(Some(&data_dir())).unwrap_or_default();
+        cfg.schema.available = vec!["wubi86".into(), "english".into()];
+        cfg.schema.active = active.into();
+        cfg.input.default.chinese_mode = true;
+        cfg.schema.english.frequency.enabled = freq;
+        Coordinator::new_headless_with_store(cfg, Some(&data_dir()), Arc::clone(&store))
+    };
+    // 英文方案：主输入路直接打 `t`。
+    for freq in [false, true] {
+        let coord = build(freq, "english");
+        coord.handle_key_event(&key(b'T' as u32, 0));
+        let all = coord.debug_all_candidate_texts();
+        let r = all.iter().position(|t| t.eq_ignore_ascii_case(WORD));
+        eprintln!(
+            "A2-39 英文方案 调频={} | `t`: {}",
+            if freq { "开" } else { "关" },
+            fmt_rank((r, all.len(), coord.debug_page_texts().len().max(1)))
+        );
+    }
+    // 快捷输入：`;t`。
+    for freq in [false, true] {
+        let coord = build(freq, "wubi86");
+        coord.handle_key_event(&key(0xBA, 0));
+        coord.handle_key_event(&key(b'T' as u32, 0));
+        let all = coord.debug_all_candidate_texts();
+        let r = all.iter().position(|t| t.eq_ignore_ascii_case(WORD));
+        let first_en = all.iter().position(|t| t.is_ascii());
+        eprintln!(
+            "A2-39 快捷输入 调频={} | `;t`: {}（英文段首下标 {first_en:?}）",
+            if freq { "开" } else { "关" },
+            fmt_rank((r, all.len(), coord.debug_page_texts().len().max(1)))
+        );
+    }
+    // 耗时：临英 Shift+T 一键（含进模式与候选构建），200 次均值。
+    for freq in [false, true] {
+        let coord = build(freq, "wubi86");
+        enter(&coord, "t");
+        coord.handle_key_event(&key(VK_ESCAPE, 0));
+        let n = 200;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            enter(&coord, "t");
+            coord.handle_key_event(&key(VK_ESCAPE, 0));
+        }
+        eprintln!(
+            "A2-39 耗时 调频={} | 临英 `t`（含 Esc）每次 {:.1} µs",
+            if freq {
+                "开（召回 21 行）"
+            } else {
+                "关"
+            },
+            t0.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+    }
+    let _ = std::fs::remove_file(&db);
 }

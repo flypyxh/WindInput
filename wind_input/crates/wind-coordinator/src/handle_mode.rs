@@ -2280,6 +2280,14 @@ impl Coordinator {
                 };
                 let mut member_cands = result.candidates;
                 let mix_member_owner = Some(member.clone());
+                // 英文成员：重排前补进用过、但原序在取数窗口之外的词（A2-39③；非英文成员
+                // 与调频关时空操作）。
+                let recalled = self.english_freq_recall(
+                    mix_member_owner.as_deref(),
+                    &member_cands,
+                    &state.mix_buffer,
+                );
+                member_cands.extend(recalled);
                 self.apply_freq_rerank_in(
                     mix_member_owner.as_deref(),
                     &mut member_cands,

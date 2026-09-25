@@ -228,7 +228,7 @@ fn completion_distance_discount(eff: f64, extra: u8) -> f64 {
 ///
 /// 这相当于把旧模型的「阈值褪色」以更合理的形式带回：作用在**归一化的有效次数**上，
 /// 而不是在权重分上（后者的阈值随词库分布漂移，正是被推翻的那套）。
-const MIN_PROMOTION_POWER: f64 = 0.5;
+pub const MIN_PROMOTION_POWER: f64 = 0.5;
 
 /// 候选的**有效提升强度**：`count` 经半衰期衰减，**保留小数**。
 ///
