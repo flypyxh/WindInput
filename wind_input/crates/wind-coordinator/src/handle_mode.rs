@@ -136,6 +136,16 @@ impl MixLens {
             MixLens::Phrase => true,
         }
     }
+
+    /// 候选有没有**可记的编码**（记词频 / 选词历史的判据）。与 [`Self::commits_whole`]
+    /// 是两个问题：词组透镜整体上屏，但它的候选是英文词库词、有码可记（同临英）；
+    /// 数字透镜的计算结果与自由输入的原文没有。穷尽 `match` 的理由同上。
+    pub(crate) fn has_code(self) -> bool {
+        match self {
+            MixLens::Text | MixLens::Phrase => true,
+            MixLens::Numeric | MixLens::Free => false,
+        }
+    }
 }
 
 impl Coordinator {
@@ -1914,10 +1924,13 @@ impl Coordinator {
         }
         // 整体上屏 vs 分步确认的**真正判据**——数字透镜的计算结果与自由输入的原文都没有
         // 可分段消费的编码，只有文本透镜（拼音/英文/码表）才做前缀分步确认。
-        let numeric = self.mix_lens(state).commits_whole();
+        let lens = self.mix_lens(state);
+        let whole = lens.commits_whole();
+        // 记词频的判据另取：词组透镜整体上屏但有码可记（见 `MixLens::has_code`）。
+        let recordable = lens.has_code();
         let total = state.mix_buffer.len();
         let consumed = cand.consumed_length;
-        let partial = !numeric
+        let partial = !whole
             && consumed > 0
             && consumed < total
             && state.mix_buffer.is_char_boundary(consumed);
@@ -1970,12 +1983,12 @@ impl Coordinator {
             let out = format!("{}{}", state.committed_text, cand_text);
             // 候选码（全拼语义）：码长统计、造词分段与 6b 点查共用。
             let cand_code = Self::cand_code(&state.mix_buffer, &cand);
-            let code_len = if numeric {
-                0
-            } else {
+            let code_len = if recordable {
                 cand_code.len() as u32
+            } else {
+                0
             };
-            if !numeric {
+            if recordable {
                 // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
                 // 归属同上，与读端同源（见 `mix_candidate_owner`）。
                 // 同上走 `_cand_in`，带 emoji 守卫。
@@ -2029,7 +2042,7 @@ impl Coordinator {
                     }
                 }
             } else {
-                // 数字透镜（计算/日期/金额）无编码可记词频，但同样是一次上屏：
+                // 数字透镜（计算/日期/金额）与自由输入原文无编码可记词频，但同样是一次上屏：
                 // 单独记历史，使「算完再按 ; 空格」能重复刚上屏的结果。
                 self.push_commit_history(&cand.text);
             }
@@ -2906,7 +2919,7 @@ impl Coordinator {
                         // 主输入路 `commit_highlight_then_char`。必须在 `exit_mix_mode` 清缓冲前。
                         // 重复上屏候选已由 `has_head` 排除；数字透镜无编码可记，只记历史。
                         let cand = state.candidates[idx].clone();
-                        let code_len = if self.mix_lens(state).commits_whole() {
+                        let code_len = if !self.mix_lens(state).has_code() {
                             self.push_commit_history(&cand.text);
                             0
                         } else {
