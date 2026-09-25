@@ -2602,16 +2602,24 @@ impl Coordinator {
                 }
                 // 空格：选当前高亮候选（文本透镜逐步转换）
                 if state.candidates.is_empty() {
-                    // 上屏剩余原码：committed 段已在各次选词记过，此处只记 mix_buffer 避免重复。
+                    // 空码空格：按 space_on_empty_behavior，与主路同一判据——"clear" 连已选段
+                    // 一起丢；否则上屏「引导字母 + 已选段 + 剩余原码」。字母引导键
+                    // （z_key_action = "mix:<id>"）归还同回车，见 `guide_to_return`。
+                    if self.rt().config.input.space_on_empty_behavior == "clear" {
+                        return commit_text(self, state, String::new());
+                    }
+                    let guide = Self::guide_to_return(&state.mix_prefix, &state.committed_text);
+                    // committed 段已在各次选词记过，此处只记本次实际上屏的原码避免重复。
+                    let raw = format!("{}{}", guide, state.mix_buffer);
                     self.record_commit(
-                        &state.mix_buffer,
-                        state.mix_buffer.len() as u32,
+                        &raw,
+                        raw.len() as u32,
                         -1,
                         wind_store::stats::CommitSource::Mix,
                     );
                     let out = self.maybe_convert(
                         state,
-                        &format!("{}{}", state.committed_text, state.mix_buffer),
+                        &format!("{}{}{}", guide, state.committed_text, state.mix_buffer),
                     );
                     // 含英文成员的实例对齐临英空格兜底（A2-3b）：全角态转全角、按临英开关
                     // 补空格。数字透镜（算式无结果）不算英文，原样上屏。

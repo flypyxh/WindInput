@@ -741,9 +741,38 @@ impl Coordinator {
                     let cand = state.candidates[idx].clone();
                     self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
                 } else {
+                    // 无候选（空码空格）：按 space_on_empty_behavior，与主路同一判据——
+                    // "clear" 连已选段一起丢；否则上屏「引导字母 + 已选段 + 剩余原码」，
+                    // 引导字母归还同回车（见 `guide_to_return`），快捷输入同一臂同口径。
+                    if self.rt().config.input.space_on_empty_behavior == "clear" {
+                        self.exit_temp_pinyin(state);
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
+                    let guide =
+                        Self::guide_to_return(&state.temp_pinyin_prefix, &state.committed_text);
+                    // committed 段已在各次选词记过，此处只记本次实际上屏的原码避免重复。
+                    let raw = format!("{}{}", guide, state.temp_pinyin_buffer);
+                    self.record_commit(
+                        &raw,
+                        raw.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::TempPinyin,
+                    );
+                    let out = self.maybe_convert(
+                        state,
+                        &format!(
+                            "{}{}{}",
+                            guide, state.committed_text, state.temp_pinyin_buffer
+                        ),
+                    );
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
-                    KeyAction::ClearComposition
+                    if out.is_empty() {
+                        KeyAction::ClearComposition
+                    } else {
+                        Self::commit_action(out, true)
+                    }
                 }
             }
             keymap::VK_RETURN => {
