@@ -560,6 +560,9 @@ impl Coordinator {
                 &cand.text,
                 cand.source,
             );
+        } else {
+            // 上屏历史是 `record_selection_in` 的一部分，跳过词频时须单独补上。
+            self.push_commit_history(&cand.text);
         }
         self.record_commit(
             &cand.text,
