@@ -641,6 +641,12 @@ numpad_half_width = false
 #   pre_confirm         = 留在 TSF 组合态聚合，延到最终 CommitText 才真提交；diff 式宿主
 #                          （终端 / Chromium）不双写，但部分宿主会给整段画下划线。
 top_commit_mode = "direct_commit"
+# 顶屏类上屏（标点顶屏 / 非码元字符与小键盘顶屏 / 进模式顶屏 / 次三选键越界的
+# commit_and_input）是否也造词并推进临时词晋升计数（内部项，设置页不暴露）。顶屏即「选高亮
+# 那条」，与按空格选中同口径，故默认开；关掉时各路（含临时拼音）一律不造词、不推晋升计数。
+# 高亮是分步候选（只消费前缀）时顶屏只推晋升计数、不造词。词频与上屏历史不受本项影响。
+# 例外：临时拼音里按非标点键被吞掉时选中高亮候选，那是选词不是顶屏，恒造词、不读本项。
+top_commit_learn = true
 
 # 检索范围放宽（filter_mode = "smart" 时的增强，见 docs/design/smart-filter-scope-relax.md）
 #

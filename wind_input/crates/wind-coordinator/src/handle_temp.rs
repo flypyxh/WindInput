@@ -469,6 +469,18 @@ impl Coordinator {
         cand: &Candidate,
         candidate_pos: i32,
     ) -> KeyAction {
+        self.commit_temp_pinyin_selected_learn(state, cand, candidate_pos, true)
+    }
+
+    /// [`Self::commit_temp_pinyin_selected`] 的本体。`learn` = 整体上屏时是否造词并推 6b：
+    /// 选词出口恒 `true`；顶屏类出口（标点顶屏）传 [`Self::top_commit_learns`]。
+    pub(crate) fn commit_temp_pinyin_selected_learn(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        candidate_pos: i32,
+        learn: bool,
+    ) -> KeyAction {
         // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（二级选择，不上屏组名）。
         if cand.is_group {
             state.temp_pinyin_buffer = cand.group_code.clone();
@@ -549,7 +561,7 @@ impl Coordinator {
             // 单段整句同样要造词（临拼模式下整句一次上屏亦只 push 一段）。
             // 闸门与归属按**临拼目标方案**（主方案可能是五笔，见 `learn_phrase_on_commit_in`）；
             // 取不到目标方案就不造词——传 `None` 会退回活跃方案语义，那正是本修复要去掉的。
-            if let Some(owner) = temp_pinyin_owner.as_deref() {
+            if learn && let Some(owner) = temp_pinyin_owner.as_deref() {
                 let learned_code =
                     self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
                 // 6b：选中已有临时词推进晋升计数，与主路同一函数；归属同上取临拼目标方案。
@@ -877,6 +889,10 @@ impl Coordinator {
                         (idx - self.page_range(state).0) as i32,
                         wind_store::stats::CommitSource::TempPinyin,
                     );
+                    // 造词 / 6b：归属取临拼目标方案，取不到不学（同 `commit_temp_pinyin_selected`）。
+                    if let Some(owner) = temp_pinyin_owner.as_deref() {
+                        self.learn_on_top_commit(state, &cand, &code, Some(owner));
+                    }
                     state.committed_text.push_str(&cand.text);
                 }
                 let head = self.maybe_convert(state, &state.committed_text.clone());
@@ -1012,8 +1028,13 @@ impl Coordinator {
                         && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
                     {
                         let punct = self.convert_punct_char(state, ch);
-                        let act =
-                            self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32);
+                        // 顶屏类出口：造词 / 6b 跟随 `input.top_commit_learn`。
+                        let act = self.commit_temp_pinyin_selected_learn(
+                            state,
+                            &cand,
+                            (idx - start) as i32,
+                            self.top_commit_learns(),
+                        );
                         return match act {
                             KeyAction::InsertText { text, .. } => {
                                 self.record_commit(
@@ -1027,6 +1048,9 @@ impl Coordinator {
                             other => other,
                         };
                     }
+                    // 兜底：非标点键（吞键）/ 组 / 命令 / 分步候选。**恒造词**，不读
+                    // `input.top_commit_learn`——这里不是「顶掉高亮再接着输出一个字符」，
+                    // 那个键被吞掉了，语义就是选中高亮候选，与空格选词同一口径。
                     self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
                 } else {
                     self.exit_temp_pinyin(state);

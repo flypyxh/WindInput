@@ -2936,6 +2936,11 @@ impl Coordinator {
                                 }
                                 None => self.push_commit_history(&cand.text),
                             }
+                            // 造词 / 6b：归属按成员方案（同 `mix_select_at`），归不到成员不学。
+                            if let Some(owner) = self.mix_candidate_owner(state, &cand) {
+                                let buf = state.mix_buffer.clone();
+                                self.learn_on_top_commit(state, &cand, &buf, Some(&owner));
+                            }
                             Self::cand_code(&state.mix_buffer, &cand).len() as u32
                         };
                         self.record_commit(

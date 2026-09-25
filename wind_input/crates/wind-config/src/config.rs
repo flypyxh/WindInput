@@ -3682,6 +3682,16 @@ pub struct InputConfig {
     /// 顶码上屏策略（内部/实验，默认 direct_commit 真提交时序，躲开 diff 合并与整段下划线）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub top_commit_mode: TopCommitMode,
+    /// 顶屏类上屏（标点顶屏 / 非码元字符与小键盘顶屏 / 进模式顶屏）是否也**造词并推进
+    /// 临时词晋升计数**（6b），口径与各路选词出口一致（内部配置，不进设置页）。
+    ///
+    /// 默认开：顶屏就是「选高亮那条」，与按空格选中是同一次选择。关掉时各路（含临拼）一律
+    /// 不造词、不推 6b——词频与上屏历史不受本项影响。次三选键越界的 `commit_and_input`
+    /// 也算顶屏；高亮是分步候选时只推 6b 不造词。
+    ///
+    /// 例外：临拼兜底臂（非标点键被吞、选中高亮候选）是选词不是顶屏，恒造词、不读本项。
+    #[serde(default = "default_true")]
+    pub top_commit_learn: bool,
     /// 联想（上屏后按上文推荐下一个词/标点）。默认关。
     #[serde(default)]
     pub association: AssociationConfig,
@@ -3749,6 +3759,7 @@ impl Default for InputConfig {
             cmdbar: CmdbarConfig::default(),
             phrase: PhraseConfig::default(),
             top_commit_mode: TopCommitMode::default(),
+            top_commit_learn: true,
             association: AssociationConfig::default(),
             caret: CaretPlacementConfig::default(),
         }

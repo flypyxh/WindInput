@@ -496,6 +496,8 @@ static REGISTRY: &[ConfigField] = &[
         "input.top_commit_mode",
         Enum(&["pre_confirm", "direct_commit"]),
     ),
+    // 顶屏类上屏是否造词 + 推 6b（内部配置）
+    f("input.top_commit_learn", Bool),
     // 联想。kind 兼任开关与类型（"off" 即关）。本段是**桌面基线**，移动端的差异走
     // [mobile.association]——值域里不留平台哨兵。
     f("input.association.kind", Enum(&["off", "word", "smart"])),

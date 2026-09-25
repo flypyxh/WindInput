@@ -5424,6 +5424,12 @@ impl Coordinator {
         ch: char,
         has_comp: bool,
     ) -> KeyAction {
+        // 顶屏的高亮候选造词 / 推 6b（见 `learn_on_top_commit`），须在 `take_committed` 清段前。
+        // 联想态不顶屏，判据同下方（收在 `highlight_for_top_commit`）。
+        if let Some((_, cand)) = self.highlight_for_top_commit(state) {
+            let buf = state.input_buffer.clone();
+            self.learn_on_top_commit(state, &cand, &buf, None);
+        }
         let committed = self.take_committed(state);
         let mut out = self.maybe_convert(state, &committed);
         // ★ 联想态**不顶屏**。

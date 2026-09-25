@@ -3360,6 +3360,19 @@ impl Coordinator {
         cand: &Candidate,
         candidate_pos: i32,
     ) -> KeyAction {
+        self.commit_selected_learn(state, cand, candidate_pos, true)
+    }
+
+    /// [`Self::commit_selected`] 的本体。`learn` = 整体上屏时是否造词、草稿转正并推 6b：
+    /// 选词出口恒 `true`；顶屏类出口（次三选键越界 `commit_and_input`）传
+    /// [`Self::top_commit_learns`]。
+    pub(crate) fn commit_selected_learn(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        candidate_pos: i32,
+        learn: bool,
+    ) -> KeyAction {
         // 前缀导航候选：补全输入到该组完整码并重查展开（二级选择，不上屏组名）。
         if cand.is_group {
             let code = cand.group_code.clone();
@@ -3441,7 +3454,7 @@ impl Coordinator {
                 state.committed_text,
                 cand.commit_override.as_deref().unwrap_or(&cand.text)
             );
-            let learned_code = if !from_assoc {
+            let learned_code = if learn && !from_assoc {
                 // 自动造词：多段组成的词，或一次选中的整句解（后者只有一段，
                 // 靠 `is_sentence` 放行——见 `learn_phrase_on_commit` 的「为什么单段整句要单独放行」）。
                 self.learn_phrase_on_commit(state, cand.is_synthesized)
@@ -3453,15 +3466,16 @@ impl Coordinator {
             // 草稿只有被用过才留得下来，没被用过的到期自动丢弃——这是滑窗模型敢产出
             // 大量杂词的前提：过滤在使用端，不在产生端。
             // 见 `docs/design/auto-phrase-draft-layer.md` §6。
-            let promoted_draft =
-                cand.is_draft && self.promote_draft_on_commit(&code, &cand.text, cand.boundary);
+            let promoted_draft = learn
+                && cand.is_draft
+                && self.promote_draft_on_commit(&code, &cand.text, cand.boundary);
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
             // is_group/is_command 已在 commit_selected 入口提前返回；is_phrase 由本条件显式过滤
             //（短语无临时词晋升语义），此处均为普通候选。
             //
             // **刚跃迁的草稿要跳过**：跃迁已把 count 记成 1，6b 再点查命中一次就是同一次上屏
             // count +2 —— 与 `learned_code` 是同一个坑（后者在共用函数里判）。
-            if !cand.is_phrase && !promoted_draft {
+            if learn && !cand.is_phrase && !promoted_draft {
                 let active = self.engine_mgr.active_schema_id();
                 self.bump_selected_temp_word(&active, cand, &code, learned_code.as_deref());
             }
@@ -3627,7 +3641,13 @@ impl Coordinator {
                 // 触发键字符按标点流水线转换（在提交前取，chinese_punct 等状态不受提交影响）。
                 let piece = self.convert_punct(state, key_char, prev_char);
                 let cand = state.candidates[hi].clone();
-                let act = self.commit_selected(state, &cand, state.selected_index as i32);
+                // 顶屏类出口：造词 / 6b 跟随 `input.top_commit_learn`。
+                let act = self.commit_selected_learn(
+                    state,
+                    &cand,
+                    state.selected_index as i32,
+                    self.top_commit_learns(),
+                );
                 Self::append_to_insert_text(act, &piece)
             }
             // "ignore" 及未知值：吞键无效（保留组合，不上屏）
@@ -3988,16 +4008,19 @@ impl Coordinator {
     /// 不必显式 `exit_assoc`：联想候选就住在 `state.candidates` 里，进模式各 `enter_*` 都会
     /// 清空候选，联想随之隐式退出（见 `handle_assoc` 模块文档）。
     pub(crate) fn take_committed_with_highlight(&self, state: &mut State) -> Option<String> {
+        // 顶屏的高亮候选并进已转换段后造词 / 推 6b（见 `learn_on_top_commit`）。须在
+        // `take_committed` 清段之前；主输入路归属活跃方案。
+        let highlight = self.highlight_for_top_commit(state);
+        if let Some((_, cand)) = &highlight {
+            let buf = state.input_buffer.clone();
+            self.learn_on_top_commit(state, cand, &buf, None);
+        }
         let prefix = self.take_committed(state);
         let mut out = self.maybe_convert(state, &prefix);
-        if state.candidates.is_empty() || state.assoc_active() {
+        let Some((idx, cand)) = highlight else {
             return (!out.is_empty()).then_some(out);
-        }
+        };
         let (start, _) = self.page_range(state);
-        let idx = self
-            .highlighted_global_index(state)
-            .min(state.candidates.len() - 1);
-        let cand = state.candidates[idx].clone();
         // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
         let freq_code = self.freq_code(&state.input_buffer, &cand);
         self.record_selection_cand(&freq_code, &cand);
@@ -4012,6 +4035,90 @@ impl Coordinator {
         );
         out.push_str(&self.cand_convert_text(state, &cand));
         Some(out)
+    }
+
+    /// 顶屏类出口（标点顶屏 / 非码元字符与小键盘顶屏 / 进模式顶屏 / 次三选键越界
+    /// `commit_and_input`）是否造词并推 6b。读内部配置 `input.top_commit_learn`（默认开）。
+    pub(crate) fn top_commit_learns(&self) -> bool {
+        self.rt().config.input.top_commit_learn
+    }
+
+    /// 顶屏时被顶的高亮候选：`(全局下标, 候选)`。无候选或联想态（联想没有码，不顶屏）时
+    /// `None`。主输入路各顶屏出口共用，判据只写这一处。
+    pub(crate) fn highlight_for_top_commit(&self, state: &State) -> Option<(usize, Candidate)> {
+        if state.candidates.is_empty() || state.assoc_active() {
+            return None;
+        }
+        let idx = self
+            .highlighted_global_index(state)
+            .min(state.candidates.len() - 1);
+        Some((idx, state.candidates[idx].clone()))
+    }
+
+    /// 顶屏类出口的造词与 6b：顶屏即「选高亮那条」，与各路选词出口的整体上屏同口径——
+    /// 把被顶的候选并进已转换段（码取 `cand_code`，回退码是整个 `buf`），再走
+    /// `learn_phrase_on_commit_in` 与 `bump_selected_temp_word`。
+    ///
+    /// `overlay` 同 `learn_phrase_on_commit_in`：`None` = 主输入路（活跃方案），临拼传目标
+    /// 方案、快捷输入传候选的成员方案（归不到成员时调用方不调）。
+    ///
+    /// ⚠️ 须在调用方 `take_committed` / 退出模式**之前**调用：那两步会清空已转换段。
+    /// 联想 / 组 / 命令 / emoji 候选没有对应编码，不参与（同各路选词出口的守卫）。
+    ///
+    /// 高亮是**分步候选**（只消费缓冲前缀）时不造词、只推 6b：顶屏只上屏这一段，剩余码
+    /// 被丢弃，拼出的词不是用户打全的那串（同临拼标点臂对分步候选的排除）。
+    pub(crate) fn learn_on_top_commit(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        buf: &str,
+        overlay: Option<&str>,
+    ) {
+        if !self.top_commit_learns()
+            || cand.source == CandidateSource::Assoc
+            || cand.is_group
+            || cand.is_command
+            || cand.is_emoji_suggestion
+        {
+            return;
+        }
+        let code = Self::cand_code(buf, cand);
+        let consumed = cand.consumed_length;
+        let partial = consumed > 0 && consumed < buf.len() && buf.is_char_boundary(consumed);
+        let learned_code = if partial {
+            None
+        } else {
+            state.committed_segs.push(CommittedSeg {
+                raw_code: buf.to_string(),
+                code: code.clone(),
+                text: cand.text.clone(),
+                source: cand.source,
+                boundary: cand.boundary,
+                learn: cand.meta.learn_code.clone(),
+            });
+            self.learn_phrase_on_commit_in(state, cand.is_synthesized, overlay)
+        };
+        // 草稿候选（主输入路才有）：同 `commit_selected`，用过即转正；刚转正的跳过 6b，
+        // 否则同一次上屏计数 +2。
+        let promoted_draft = overlay.is_none()
+            && cand.is_draft
+            && self.promote_draft_on_commit(&code, &cand.text, cand.boundary);
+        if !cand.is_phrase && !promoted_draft {
+            let owner = overlay
+                .map(str::to_string)
+                .unwrap_or_else(|| self.engine_mgr.active_schema_id());
+            self.bump_selected_temp_word(&owner, cand, &code, learned_code.as_deref());
+        }
+    }
+
+    /// 主输入路顶屏（标点顶屏的两条出口共用）：取高亮候选走 [`Self::learn_on_top_commit`]，
+    /// 归属活跃方案。无候选 / 联想态（不顶屏）时什么也不做。
+    pub(crate) fn learn_on_main_punct_top_commit(&self, state: &mut State) {
+        let Some((_, cand)) = self.highlight_for_top_commit(state) else {
+            return;
+        };
+        let buf = state.input_buffer.clone();
+        self.learn_on_top_commit(state, &cand, &buf, None);
     }
 
     /// 「顶屏文本 + 进模式新组合」收尾（进特殊模式 / 临时拼音 / mix 融合共用）：与顶码

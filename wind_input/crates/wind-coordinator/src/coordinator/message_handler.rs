@@ -1952,6 +1952,7 @@ impl MessageHandler for Coordinator {
                             // 「丢废码但出标点」与「照常上屏」。
                             let discard_empty_code =
                                 self.punct_empty_code_policy(&state) == PunctEmptyCodePolicy::Clear;
+                            self.learn_on_main_punct_top_commit(&mut state);
                             let committed = self.take_committed(&mut state);
                             let mut commit_text = if discard_empty_code {
                                 String::new()
@@ -2020,6 +2021,7 @@ impl MessageHandler for Coordinator {
                     // 走不到这里——那一态必须早于标点流水线返回，见该处注释。
                     let discard_empty_code =
                         self.punct_empty_code_policy(&state) == PunctEmptyCodePolicy::Clear;
+                    self.learn_on_main_punct_top_commit(&mut state);
                     let committed = self.take_committed(&mut state);
                     let mut out = if discard_empty_code {
                         String::new()
