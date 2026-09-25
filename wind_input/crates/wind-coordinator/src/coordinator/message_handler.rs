@@ -1459,7 +1459,10 @@ impl MessageHandler for Coordinator {
                         -1,
                         CommitSource::RawInput,
                     );
-                    let mut text = self.maybe_convert(&state, &format!("{}{}", prefix, raw_code));
+                    let raw_text = format!("{}{}", prefix, raw_code);
+                    let mut text = self.maybe_convert(&state, &raw_text);
+                    // 原码类上屏也进上屏历史（转换前形态、不含下面补的空格，同回车）。
+                    self.push_commit_history(&raw_text);
                     // 英文补空格（`schema.english.commit_space`）：本分支上屏的是**输入缓冲
                     // 原码**（词库里没有的自造词），无候选可依，故用方案口径
                     // `english_space_enabled_in`（语境口径）而非候选口径。与选中候选补空格一致——两者都是
@@ -1530,7 +1533,11 @@ impl MessageHandler for Coordinator {
                     // ⚠️ 本块与上方 VK_SPACE 空码分支逐行同形，唯一差别是**不补英文空格**
                     // （`schema.english.commit_space`）：回车是终结性动作，多伴随换行/提交
                     // 意图，与空格「接着打下一个词」的语义相反。这是刻意的不对称，不是漏接。
-                    let text = self.maybe_convert(&state, &format!("{}{}", prefix, raw_code));
+                    let raw_text = format!("{}{}", prefix, raw_code);
+                    let text = self.maybe_convert(&state, &raw_text);
+                    // 原码类上屏也进上屏历史（`;` 重复上屏取得到）。记**转换前形态**（与选词
+                    // 出口一致）：重复上屏时会再过一次简繁转换。原码不是词库词，不记词频。
+                    self.push_commit_history(&raw_text);
                     state.input_buffer.clear();
                     state.input_buffer_cased.clear();
                     state.candidates.clear();
@@ -1976,10 +1983,13 @@ impl MessageHandler for Coordinator {
                                 commit_text.push_str(&self.cand_convert_text(&state, &cand));
                             } else if !state.input_buffer.is_empty() && !discard_empty_code {
                                 // 无候选顶屏的是原码 → 同回车，用用户所打的大小写形态。
-                                commit_text.push_str(preedit_cursor::cased_or_buffer(
+                                let raw = preedit_cursor::cased_or_buffer(
                                     &state.input_buffer,
                                     &state.input_buffer_cased,
-                                ));
+                                );
+                                // 原码类上屏进上屏历史（转换前形态、不含标点，同回车）。
+                                self.push_commit_history(&format!("{committed}{raw}"));
+                                commit_text.push_str(raw);
                             }
                             state.input_buffer.clear();
                             state.candidates.clear();
@@ -2071,10 +2081,13 @@ impl MessageHandler for Coordinator {
                         out.push_str(&self.cand_convert_text(&state, &cand));
                     } else if !state.input_buffer.is_empty() && !discard_empty_code {
                         // 无候选顶屏的是原码 → 同回车，用用户所打的大小写形态。
-                        out.push_str(preedit_cursor::cased_or_buffer(
+                        let raw = preedit_cursor::cased_or_buffer(
                             &state.input_buffer,
                             &state.input_buffer_cased,
-                        ));
+                        );
+                        // 原码类上屏进上屏历史（转换前形态、不含标点，同回车）。
+                        self.push_commit_history(&format!("{committed}{raw}"));
+                        out.push_str(raw);
                     }
                     let had_input = !state.input_buffer.is_empty()
                         || !state.candidates.is_empty()

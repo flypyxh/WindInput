@@ -2630,10 +2630,10 @@ impl Coordinator {
                         -1,
                         wind_store::stats::CommitSource::Mix,
                     );
-                    let out = self.maybe_convert(
-                        state,
-                        &format!("{}{}{}", guide, state.committed_text, state.mix_buffer),
-                    );
+                    let raw_text = format!("{}{}{}", guide, state.committed_text, state.mix_buffer);
+                    // 原码类上屏也进上屏历史（转换前形态、不含补的空格，同回车）；原码不记词频。
+                    self.push_commit_history(&raw_text);
+                    let out = self.maybe_convert(state, &raw_text);
                     // 含英文成员的实例对齐临英空格兜底（A2-3b）：全角态转全角、按临英开关
                     // 补空格。数字透镜（算式无结果）不算英文，原样上屏。
                     let out = if self.mix_raw_counts_as_english(state) {
@@ -2683,10 +2683,11 @@ impl Coordinator {
                     -1,
                     wind_store::stats::CommitSource::Mix,
                 );
-                let out = self.maybe_convert(
-                    state,
-                    &format!("{}{}{}", guide, state.committed_text, state.mix_buffer),
-                );
+                let raw_text = format!("{}{}{}", guide, state.committed_text, state.mix_buffer);
+                // 原码类上屏也进上屏历史（`;` 重复上屏取得到）。记**转换前形态**（与选词出口
+                // 一致）：重复上屏时会再过一次简繁转换。原码不记词频。
+                self.push_commit_history(&raw_text);
+                let out = self.maybe_convert(state, &raw_text);
                 // 含英文成员的实例对齐临英回车（A2-3b）：全角态转全角；回车是终结性动作，
                 // 不补空格。数字透镜除外，判据与空格兜底共用 `mix_raw_counts_as_english`。
                 let out = if self.mix_raw_counts_as_english(state) {

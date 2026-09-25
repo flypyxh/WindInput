@@ -771,13 +771,13 @@ impl Coordinator {
                         -1,
                         wind_store::stats::CommitSource::TempPinyin,
                     );
-                    let out = self.maybe_convert(
-                        state,
-                        &format!(
-                            "{}{}{}",
-                            guide, state.committed_text, state.temp_pinyin_buffer
-                        ),
+                    let raw_text = format!(
+                        "{}{}{}",
+                        guide, state.committed_text, state.temp_pinyin_buffer
                     );
+                    let out = self.maybe_convert(state, &raw_text);
+                    // 原码类上屏也进上屏历史（转换前形态，同回车）；原码不记词频。
+                    self.push_commit_history(&raw_text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     if out.is_empty() {
@@ -831,13 +831,14 @@ impl Coordinator {
                     -1,
                     wind_store::stats::CommitSource::TempPinyin,
                 );
-                let out = self.maybe_convert(
-                    state,
-                    &format!(
-                        "{}{}{}",
-                        guide, state.committed_text, state.temp_pinyin_buffer
-                    ),
+                let raw_text = format!(
+                    "{}{}{}",
+                    guide, state.committed_text, state.temp_pinyin_buffer
                 );
+                let out = self.maybe_convert(state, &raw_text);
+                // 原码类上屏也进上屏历史（`;` 重复上屏取得到）。记**转换前形态**（与选词出口
+                // 一致）：重复上屏时会再过一次简繁转换。原码不记词频。
+                self.push_commit_history(&raw_text);
                 self.exit_temp_pinyin(state);
                 self.notify_ui_hide();
                 if out.is_empty() {
@@ -1508,6 +1509,8 @@ impl Coordinator {
                     // 无候选（`show_candidates` 关闭 / 原文与变形都不产 / `in_dict` 未命中且词库无命中）：上屏缓冲原文。这正是英文方案
                     // 「空格上屏原码」的对应出口，故同样补空格。
                     let text = state.temp_english_buffer.clone();
+                    // 原码类上屏也进上屏历史（转换前形态、不含补的空格，同回车）。
+                    self.push_commit_history(&text);
                     let sp = self.english_space_enabled_in(state);
                     commit_text(self, state, text, sp)
                 }
@@ -1542,7 +1545,11 @@ impl Coordinator {
                 let text = if state.temp_english_buffer.is_empty() {
                     state.temp_english_prefix.clone()
                 } else {
-                    state.temp_english_buffer.clone()
+                    // 原码类上屏也进上屏历史，记**转换前形态**（半角，与临英选词出口一致；
+                    // 全角由上屏时再转）。空缓冲上屏的是触发键字符，不记。
+                    let raw = state.temp_english_buffer.clone();
+                    self.push_commit_history(&raw);
+                    raw
                 };
                 commit_text(self, state, text, false)
             }
@@ -1673,6 +1680,8 @@ impl Coordinator {
                         self.record_temp_english_selection(state, &cand);
                         cand.text
                     } else {
+                        // 无候选顶掉原文：原码类上屏也进上屏历史（转换前形态、不含标点）。
+                        self.push_commit_history(&state.temp_english_buffer);
                         state.temp_english_buffer.clone()
                     };
                     let base = if state.full_width {
