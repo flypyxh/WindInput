@@ -1968,10 +1968,12 @@ impl Coordinator {
                 cand.text.clone()
             };
             let out = format!("{}{}", state.committed_text, cand_text);
+            // 候选码（全拼语义）：码长统计、造词分段与 6b 点查共用。
+            let cand_code = Self::cand_code(&state.mix_buffer, &cand);
             let code_len = if numeric {
                 0
             } else {
-                Self::cand_code(&state.mix_buffer, &cand).len() as u32
+                cand_code.len() as u32
             };
             if !numeric {
                 // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
@@ -2000,7 +2002,9 @@ impl Coordinator {
                     state.committed_segs.push(CommittedSeg {
                         // 消费整串：回退码即整个缓冲
                         raw_code: state.mix_buffer.clone(),
-                        code,
+                        // 造词码取候选码（全拼语义），与主路 / 临拼整体上屏同口径；
+                        // 取整个缓冲会把 `h`（或双拼击键 `hc`）写进词库。
+                        code: cand_code.clone(),
                         text: cand.text.clone(),
                         source: cand.source,
                         boundary: cand.boundary,
@@ -2013,12 +2017,12 @@ impl Coordinator {
                         let learned_code =
                             self.learn_phrase_on_commit_in(state, cand.is_synthesized, Some(owner));
                         // 6b：选中已有临时词推进晋升计数，与主路同一函数；归属同上取成员方案。
-                        // 点查码与主路同取 `cand_code`（上面分段存的是整个缓冲）。
+                        // 点查码与主路同取 `cand_code`（与上面分段的造词码同一份）。
                         if !cand.is_phrase {
                             self.bump_selected_temp_word(
                                 owner,
                                 &cand,
-                                &Self::cand_code(&state.mix_buffer, &cand),
+                                &cand_code,
                                 learned_code.as_deref(),
                             );
                         }
