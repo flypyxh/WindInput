@@ -273,6 +273,76 @@ pub(crate) fn dedup_by_text(cands: &mut Vec<Candidate>) {
     cands.retain(|c| seen.insert(c.text.clone()));
 }
 
+/// 「按一个完整词库码精确查词」的取数上限——头部候选找对应词库词（A2-39②）与英文词频
+/// 召回验证（A2-39③）共用。
+///
+/// 同码的词库条目只是同一个词的几种大小写写法（`us` / `US`），而引擎把精确码命中排在
+/// 前缀补全之前，8 条绰绰有余。⚠️ 它只管**返回**几条：码表引擎内部查词库时按
+/// `max(limit, 50)` 取数再截断（`CodeTableEngine::convert`），调小它省不了查询本身。
+pub(crate) const ENGLISH_EXACT_LOOKUP_LIMIT: usize = 8;
+
+impl crate::coordinator::Coordinator {
+    /// 头部候选（所打原文 / 大小写变形）对应的**英文词库词**——记词频用（A2-39②）。
+    ///
+    /// 打全 `translation` 时，词库里的 `translation` 被头部候选按字面去重吃掉，用户上屏的
+    /// 是头部那条（原文 `Translation` 或变形 `translation`）。头部候选没有词库来源，写端
+    /// 若只认来源，这次上屏就一条都不记——而「打全再上屏」恰是最常见的用法。
+    ///
+    /// 按英文词库的键规则找回它：码 = 小写化的缓冲（词库 code 列恒小写），在**精确码**命中里
+    /// 先找字面相同的，再找仅大小写不同的（打 `usa` 上屏，记到词库的 `USA`）。找到就返回
+    /// 那条词库候选，但 `text` 换成**实际上屏的头部文本**、词库原文留在 `case_source`——与
+    /// 大小写投影同一个表示法：`freq_text()` 是词频键，`text` 仍是用户看见的形态。
+    /// 快捷输入与英文方案经 `record_selection_cand_in` 记账，那里历史取 `text`；临英的
+    /// 上屏历史不经本函数，由 `record_temp_english_selection` 直接记实际上屏文本。
+    ///
+    /// 找不到（纯原文，不是词库词）返回 `None`，调用方照旧不记词频：词频是**已有候选的排序
+    /// 维度**，不是词条来源——记下来就是读端永远查不中的孤儿键
+    /// （`temp_english_literal_text_is_not_recorded` 钉着）。想让自造词参与排序，该走加词。
+    ///
+    /// `cand` 不是头部候选（有来源 / 有码 / 短语 / emoji，或文本不是缓冲的大小写形态）、
+    /// 或 `engine_schema` 的调频关着时直接 `None`，不查词库。
+    pub(crate) fn english_head_dict_word(
+        &self,
+        engine_schema: &str,
+        buf: &str,
+        cand: &Candidate,
+    ) -> Option<Candidate> {
+        let head_text = cand.freq_text();
+        let is_head = cand.source == CandidateSource::None
+            && cand.code.is_empty()
+            && !cand.is_phrase
+            && !cand.is_command
+            && !cand.is_emoji_suggestion
+            && !buf.is_empty()
+            && head_text.eq_ignore_ascii_case(buf);
+        if !is_head {
+            return None;
+        }
+        // 调频关着就不查：结果只用来记词频，而写端本来也会因开关关着而不写。先判开关，
+        // 关着时连这次查询与它的副作用（临英的上屏历史）都不发生，行为与改前逐字相同。
+        if !self.engine_mgr.freq_settings_for(engine_schema).enabled {
+            return None;
+        }
+        let code = buf.to_lowercase();
+        let hits: Vec<Candidate> = self
+            .engine_mgr
+            .convert_with(engine_schema, &code, ENGLISH_EXACT_LOOKUP_LIMIT)
+            .candidates
+            .into_iter()
+            .filter(|c| c.source == CandidateSource::English && c.code == code)
+            .collect();
+        let mut word = hits
+            .iter()
+            .find(|c| c.text == head_text)
+            .or_else(|| hits.iter().find(|c| c.text.eq_ignore_ascii_case(head_text)))?
+            .clone();
+        if word.text != cand.text {
+            word.case_source = Some(std::mem::replace(&mut word.text, cand.text.clone()));
+        }
+        Some(word)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn dict_cand(text: &str) -> Candidate {

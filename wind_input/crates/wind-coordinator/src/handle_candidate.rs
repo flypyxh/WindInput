@@ -459,7 +459,21 @@ impl Coordinator {
     /// 正是「消费点接在走不到的调用点上」那种静默失效。
     /// `every_record_selection_call_goes_through_freq_code` 同时扫描两个名字，记账码的
     /// 口径约束对本函数同样成立。
+    ///
+    /// ★ 英文方案的**头部候选**（原文 / 大小写变形）按它对应的词库词记（A2-39②，与临英、
+    /// 快捷输入同一个 `english_head_dict_word`）：大写打 `Translation` 上屏，记到词库的
+    /// `translation`，而不是 `(translation, Translation)` 这条读端永远查不中的键。落在这个
+    /// 薄包装里而非各出口，是因为主输入路的选词 / 顶屏出口全都经过这里（见上）。
+    /// 调用方传进来的 `code` 对无来源的头部候选就是小写输入缓冲（`freq_code` 的兜底分支）。
+    /// 找不到对应词库词时照旧按原样记（保持改前行为）。
     pub(crate) fn record_selection_cand(&self, code: &str, cand: &Candidate) {
+        if self.engine_mgr.active_is_english() {
+            let active = self.engine_mgr.active_schema_id();
+            if let Some(word) = self.english_head_dict_word(&active, code, cand) {
+                let freq_code = self.freq_code(code, &word);
+                return self.record_selection_cand_in(None, &freq_code, &word);
+            }
+        }
         self.record_selection_cand_in(None, code, cand)
     }
 

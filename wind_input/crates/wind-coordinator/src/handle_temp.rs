@@ -1282,19 +1282,42 @@ impl Coordinator {
     /// ★ 取码前**先小写化缓冲**：`freq_code` 在 `code_scope = "input"` 下拿的就是这个串，
     /// 而英文方案那侧 `input_buffer` 恒为全小写。不归一 ⇒ `Hel` 与 `hel` 是两个键，两个入口
     /// 永远学不到一块去。
+    ///
+    /// ★ **头部候选按它对应的词库词记**（A2-39②）：打全 `translation` 再上屏，上屏的是头部
+    /// 那条（词库那条已被它按字面去重吃掉），不找回词库词的话这个最常见的打法一条都不记。
+    /// 纯原文（不是词库词）仍不记，理由见 `english_head_dict_word`。
+    ///
+    /// ★ **上屏历史与词频分开、无条件记实际上屏文本**（同快捷输入的口径）：历史是「`;`
+    /// 重复上屏」的数据源，要的是用户看见的形态——打 `Translation` 上屏，调回来也得是
+    /// `Translation`，不能是词频键用的词库原文 `translation`。历史不看调频开关、不看有没有
+    /// 词库来源：纯原文上屏同样是一次上屏。
     fn record_temp_english_selection(&self, state: &State, cand: &Candidate) {
-        if cand.source != CandidateSource::English {
+        let head_word;
+        let freq_cand = if cand.source == CandidateSource::English {
+            Some(cand)
+        } else {
+            // 查词库用临英当下的词库方案；候选显示关着（`None`）时临英本就不查词库，
+            // 这里也不为记一次词频去加载它。
+            head_word = self.overlay_engine_schema(state).and_then(|dict_schema| {
+                self.english_head_dict_word(&dict_schema, &state.temp_english_buffer, cand)
+            });
+            head_word.as_ref()
+        };
+        let Some(freq_cand) = freq_cand else {
+            self.push_commit_history(&cand.text);
             return;
-        }
+        };
         let code = state.temp_english_buffer.to_lowercase();
-        // ★ `freq_text()` 而非 `text`：候选可能已被大小写投影改写过，而读端
+        // ★ 词频记 `freq_text()` 而非 `text`：候选可能已被大小写投影改写过，而读端
         // `apply_freq_rerank_in` 排在投影之前、看到的是词库原文。存投影后的形态 ⇒
         // 写 `Hill`、读 `hill`，两端永不相交，英文词频整体静默失效。
-        self.record_selection_in(
+        // 历史记实际上屏的 `cand.text`（本函数会先记历史、再看开关，关着也记）。
+        self.record_selection_cased_in(
             Some(ENGLISH_SCHEMA),
-            &self.freq_code(&code, cand),
-            cand.freq_text(),
-            cand.source,
+            &self.freq_code(&code, freq_cand),
+            freq_cand.freq_text(),
+            &cand.text,
+            freq_cand.source,
         );
     }
 

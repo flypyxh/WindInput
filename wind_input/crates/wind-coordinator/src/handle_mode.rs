@@ -263,6 +263,35 @@ impl Coordinator {
             .find(|m| self.engine_mgr.loaded_engine_type(m) == Some(want))
     }
 
+    /// 快捷输入上屏时**按哪条候选记词频**（A2-39②）：`None` = 只记上屏历史、不记词频。
+    ///
+    /// 英文成员的头部候选（原文 / 大小写变形）没有来源，按来源反查不到成员方案 ⇒ 归属曾落回
+    /// **主方案**（码表调频开着时写出 `("wubi86", "translation", "translation")` 这种五笔读端
+    /// 永远用不上的行），而英文桶一条不记。改为按临英同一口径找回它对应的英文词库词
+    /// （`english_head_dict_word`），找得到就按那个词记进英文成员桶——与从列表里选中该词
+    /// 逐字节同一行；找不到（纯原文）或英文调频关着时就不记词频（上屏历史照记，与改前
+    /// 同一条）。
+    ///
+    /// 其余候选原样返回，行为不变。
+    pub(crate) fn mix_freq_candidate<'a>(
+        &self,
+        state: &State,
+        cand: &'a Candidate,
+    ) -> Option<std::borrow::Cow<'a, Candidate>> {
+        use wind_candidate::CandidateSource;
+        if cand.source != CandidateSource::None || !self.mix_candidate_is_english(state, cand) {
+            return Some(std::borrow::Cow::Borrowed(cand));
+        }
+        let english_member = self
+            .mix_members_resolved(state.mix_id)
+            .into_iter()
+            .find(|m| {
+                self.engine_mgr.loaded_engine_type(m) == Some(wind_engine::EngineType::English)
+            })?;
+        self.english_head_dict_word(&english_member, &state.mix_buffer, cand)
+            .map(std::borrow::Cow::Owned)
+    }
+
     /// 单条候选查注释**库**时的白名单作用域（`[[ui.comment_dicts]].schemas`）。
     ///
     /// 非 mix 时恒是 `fallback`（调用方按 `effective_data_schema` 解析一次的那份）。
@@ -1948,9 +1977,17 @@ impl Coordinator {
                 // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
                 // 归属同上，与读端同源（见 `mix_candidate_owner`）。
                 // 同上走 `_cand_in`，带 emoji 守卫。
-                let freq_code = self.freq_code(&state.mix_buffer, &cand);
+                // 英文头部候选按它对应的词库词记（A2-39②，见 `mix_freq_candidate`）；
+                // 下面造词 / 临时词晋升仍按候选本身的归属，不受这一换的影响。
+                match self.mix_freq_candidate(state, &cand) {
+                    Some(freq_cand) => {
+                        let freq_code = self.freq_code(&state.mix_buffer, &freq_cand);
+                        let owner = self.mix_candidate_owner(state, &freq_cand);
+                        self.record_selection_cand_in(owner.as_deref(), &freq_code, &freq_cand);
+                    }
+                    None => self.push_commit_history(&cand.text),
+                }
                 let mix_member_owner = self.mix_candidate_owner(state, &cand);
-                self.record_selection_cand_in(mix_member_owner.as_deref(), &freq_code, &cand);
                 // ⚠️ emoji 候选**不进分段、不参与造词**：它是按候选文本查表追加上去的，
                 // 与 `mix_buffer` 没有编码对应关系（`code` 恒空、`consumed_length` 恒 0）。
                 // 放进 `committed_segs` 会让 `learn_phrase_on_commit` 把它当成一段正常文本
@@ -2853,9 +2890,19 @@ impl Coordinator {
                             self.push_commit_history(&cand.text);
                             0
                         } else {
-                            let owner = self.mix_candidate_owner(state, &cand);
-                            let freq_code = self.freq_code(&state.mix_buffer, &cand);
-                            self.record_selection_cand_in(owner.as_deref(), &freq_code, &cand);
+                            // 英文头部候选按对应词库词记（A2-39②），同 `mix_select_at`。
+                            match self.mix_freq_candidate(state, &cand) {
+                                Some(freq_cand) => {
+                                    let owner = self.mix_candidate_owner(state, &freq_cand);
+                                    let freq_code = self.freq_code(&state.mix_buffer, &freq_cand);
+                                    self.record_selection_cand_in(
+                                        owner.as_deref(),
+                                        &freq_code,
+                                        &freq_cand,
+                                    );
+                                }
+                                None => self.push_commit_history(&cand.text),
+                            }
                             Self::cand_code(&state.mix_buffer, &cand).len() as u32
                         };
                         self.record_commit(
