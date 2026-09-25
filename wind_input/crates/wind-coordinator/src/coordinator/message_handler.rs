@@ -1874,7 +1874,11 @@ impl MessageHandler for Coordinator {
                         !state.input_buffer.is_empty() || !state.committed_text.is_empty();
                     if has_input {
                         let punct_commit = match self.engine_mgr.current_engine_type() {
-                            Some(wind_engine::EngineType::Pinyin) => true,
+                            // 英文方案恒允许：`punct_commit` 是码表「标点顶字」的方案属性，
+                            // 英文词后接标点是最基本的用法，不该被码表的出厂 false 吞掉。
+                            Some(
+                                wind_engine::EngineType::Pinyin | wind_engine::EngineType::English,
+                            ) => true,
                             // 码表/混输：读有效码表配置（全局 schema.codetable + 方案 override）。
                             _ => self.engine_mgr.codetable_settings().punct_commit,
                         };
