@@ -139,7 +139,7 @@ impl Coordinator {
     /// 初版设计想在无效时摆一条「码点无效」的提示候选，免得候选窗空着像卡死。但候选窗里
     /// 的东西是**能被空格上屏的**——用户打错一位再按空格，屏幕上就会出现「码点无效」四个
     /// 字。空列表 + 模式徽标已经足够表达「这串不是有效码点」，且与网址模式（恒无候选）
-    /// 的观感一致。无效时按空格上屏的是缓冲原文（见 [`Self::handle_unicode_key`]）。
+    /// 的观感一致。无效时按空格上屏的是缓冲原文（见 [`Self::commit_unicode`]）。
     pub(crate) fn update_unicode_candidates(&self, state: &mut State) {
         state.candidates.clear();
         self.reset_candidate_view(state);
@@ -156,6 +156,31 @@ impl Coordinator {
             comment,
             ..Default::default()
         });
+    }
+
+    /// Unicode 模式上屏（空格 / 回车 / 鼠标点选共用的出口）。
+    ///
+    /// 有候选（码点有效）→ 上屏那个字符；无候选 → 上屏缓冲原文。后者与网址模式同口径
+    /// 「打什么上屏什么」：`u+zzz` 这种打错的串，把原文还给用户比吞掉它好——用户至少能
+    /// 看见自己打了什么，改一位重来即可。
+    pub(crate) fn commit_unicode(&self, state: &mut State) -> KeyAction {
+        let text = state
+            .candidates
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_else(|| state.unicode_buffer.clone());
+        // 统计来源用 `RawInput`（原始编码上屏）而**不新增枚举值**：`CommitSource`
+        // 带显式判别值且 `COUNT` 是 `by_source` 数组的长度，加一项会动到已落盘的
+        // 统计结构。语义上也站得住——码点是用户以原始形式直接指定的，不是从词库
+        // 选出来的候选。
+        self.record_commit(&text, 0, -1, wind_store::stats::CommitSource::RawInput);
+        self.exit_unicode_mode(state);
+        self.notify_ui_hide();
+        if text.is_empty() {
+            KeyAction::ClearComposition
+        } else {
+            Self::commit_action(text, true)
+        }
     }
 
     /// Unicode 模式按键处理：可见 ASCII 累积；空格/回车上屏；退格删空退出；Esc 放弃。
@@ -217,29 +242,7 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
-            keymap::VK_SPACE | keymap::VK_RETURN => {
-                // 有候选（码点有效）→ 上屏那个字符；无候选 → 上屏缓冲原文。
-                //
-                // 后者与网址模式同口径「打什么上屏什么」：`u+zzz` 这种打错的串，把原文还
-                // 给用户比吞掉它好——用户至少能看见自己打了什么，改一位重来即可。
-                let text = state
-                    .candidates
-                    .first()
-                    .map(|c| c.text.clone())
-                    .unwrap_or_else(|| state.unicode_buffer.clone());
-                // 统计来源用 `RawInput`（原始编码上屏）而**不新增枚举值**：`CommitSource`
-                // 带显式判别值且 `COUNT` 是 `by_source` 数组的长度，加一项会动到已落盘的
-                // 统计结构。语义上也站得住——码点是用户以原始形式直接指定的，不是从词库
-                // 选出来的候选。
-                self.record_commit(&text, 0, -1, wind_store::stats::CommitSource::RawInput);
-                self.exit_unicode_mode(state);
-                self.notify_ui_hide();
-                if text.is_empty() {
-                    KeyAction::ClearComposition
-                } else {
-                    Self::commit_action(text, true)
-                }
-            }
+            keymap::VK_SPACE | keymap::VK_RETURN => self.commit_unicode(state),
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 // 小键盘（direct 语义）回退 `numpad_char`：十六进制含 0-9，与主键盘同待遇。

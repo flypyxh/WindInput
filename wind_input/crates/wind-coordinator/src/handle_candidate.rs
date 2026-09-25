@@ -4708,77 +4708,61 @@ impl Coordinator {
         //   模式内），造词；
         // - 快捷输入 `mix_select_at`：重复上屏候选不记选词、按透镜分步 / 上屏、6b 与造词；
         // - 快符 / 生僻字 `commit_special_candidate`：该方案的词频与全码策略。
-        // 此前它们落到下方通用分支：`commit_candidate` 拿主路 `input_buffer`（overlay 下恒空）
+        // 此前它们落到一条通用分支（现已删除）：`commit_candidate` 拿主路 `input_buffer`（overlay 下恒空）
         // 判原码、整串上屏再清空 —— 临拼 / 快捷输入的分步转换被整串丢掉，repeat 候选被当成
         // 有编码的候选记了选词，临英不补空格。返回值照主路一样带出来（分步时是
         // `UpdateComposition`，组合区留活），`debug_mouse_select` 由此可观测。
+        //
+        // 派发写成**穷尽** `match`、不留通用兜底：那条通用分支对任何 overlay 都是错的出口
+        // （网址 / 邮箱 / Unicode 最后落在那里时还写出空码孤儿词频）。新增模式时编译器会
+        // 逼着在这里选出口，而不是静默落进兜底。
         let page_local_pos = page_local as i32;
-        let routed = match state.active {
-            Some(ModeKind::TempEnglish) => Some(self.commit_temp_english_selected(&mut state, idx)),
+        let act = match state.active {
+            Some(ModeKind::TempEnglish) => self.commit_temp_english_selected(&mut state, idx),
             Some(ModeKind::TempPinyin) => {
                 let cand = state.candidates[idx].clone();
-                Some(self.commit_temp_pinyin_selected(&mut state, &cand, page_local_pos))
+                self.commit_temp_pinyin_selected(&mut state, &cand, page_local_pos)
             }
-            Some(ModeKind::Mix(_)) => Some(self.mix_select_at(&mut state, idx, page_local_pos)),
+            Some(ModeKind::Mix(_)) => self.mix_select_at(&mut state, idx, page_local_pos),
             Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
-                Some(self.commit_special_candidate(&mut state, idx))
+                self.commit_special_candidate(&mut state, idx)
             }
-            // 网址 / 邮箱 / Unicode：键盘侧不按序号选词（数字是合法字符），鼠标点选仍走
-            // 下方通用分支「整串上屏 + 退出」。
-            _ => None,
-        };
-        if let Some(act) = routed {
-            let chinese_mode = state.chinese_mode;
-            drop(state);
-            match &act {
-                // 空文本上屏：只需让宿主结束 composition（同 $CC 命令分支）。
-                KeyAction::ClearComposition => {
-                    self.push_server
-                        .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
+            // 网址 / 邮箱：键盘侧不按序号选词（数字是合法字符），但鼠标点选须与空格走同一个
+            // 出口（记统计、学后缀 / 网址历史）。出口按高亮取候选，故先把高亮移到被点的那条
+            // （移动端不翻页、`idx` 可越出当页，页码一并换算）。
+            Some(ModeKind::Url) | Some(ModeKind::Email) => {
+                let pp = self.per_page(state.active).max(1);
+                state.current_page = idx / pp;
+                state.selected_index = idx % pp;
+                if state.active == Some(ModeKind::Url) {
+                    self.commit_url(&mut state, true)
+                } else {
+                    self.commit_email(&mut state, true)
                 }
-                _ => self.push_no_key_ctx_action(&act, chinese_mode),
             }
-            return Some(act);
-        }
-        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
-        //
-        // ⚠️ 必须排在上面的模式派发**之后**：`complete_to_group_code` 写的是主路
-        // `input_buffer`、查的是主方案；临拼 / 快捷输入 / 快符的组候选要由各自出口处理
-        // （写本模式缓冲、查本模式方案），先走这里就会串台——主缓冲被写成组码、模式缓冲不动。
-        if state.candidates[idx].is_group {
-            let code = state.candidates[idx].group_code.clone();
-            self.complete_to_group_code(&mut state, &code);
-            return None;
-        }
-        let text = state.candidates[idx].text.clone();
-        let s2t_override = state.candidates[idx].s2t_override.clone();
-        let source = state.candidates[idx].source;
-        // 记账码按来源分流（见 `freq_code`）：码表用输入码，拼音/英文用候选存储码。
-        let code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
+            // Unicode 恒至多一条候选，出口取首条即被点的那条。
+            Some(ModeKind::Unicode) => self.commit_unicode(&mut state),
+            // 主输入路（含辅助码）已在上方 `main_path` 分支返回，到不了这里。保守兜底：
+            // 什么都不做（不上屏、不改状态），调试构建下直接暴露。
+            None | Some(ModeKind::AuxCode) => {
+                debug_assert!(
+                    false,
+                    "select_candidate_at: 主输入路应已在 main_path 分支返回"
+                );
+                return None;
+            }
+        };
         let chinese_mode = state.chinese_mode;
-        let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source, &code);
-        // 鼠标提交后彻底复位：走 `cancel_session`（按 `active` 分派各模式的 `exit_*`，
-        // 含 `notify_ui_hide`），与命令候选分支同一个退出点。此前这里手工只清 `active` 与
-        // 临拼 / 临英几个字段，生僻字的 `special_buffer` 与夺取回退登记 `rewind`、快捷输入的
-        // `mix_buffer` 都留着——各模式以后新增的「退出必清」字段也会从这里漏掉。
-        // 返回值（`ClearComposition`）丢弃：上屏文本下面经 push 投递。
-        let _ = self.cancel_session(&mut state);
         drop(state);
-
-        // 同 push_commit_text：push 路不经按键收口，换行改写在此接一次（A3-3）。
-        let out_nl = self.convert_commit_newline(out.clone());
-        let encoded =
-            wind_ipc::codec::encode_commit_text(&out_nl, None, false, chinese_mode, false);
-        // 仅推给活动客户端，避免广播导致多个 TSF 端重复上屏
-        self.push_server.push_commit_to_active(&encoded);
-        debug!(
-            "mouse_select: overlay 整串提交 '{}' (page_local={})",
-            out, page_local
-        );
-        // 同样带出上屏动作：桌面 `mouse_select` 丢弃返回值只靠上面的 push；移动端
-        // （`candidate_pull`）headless 下 push 无消费端，返回 None 会被当成 passthrough，
-        // 模式退了、文字却没上屏。
-        Some(Self::commit_action(out, chinese_mode))
+        match &act {
+            // 空文本上屏：只需让宿主结束 composition（同 $CC 命令分支）。
+            KeyAction::ClearComposition => {
+                self.push_server
+                    .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
+            }
+            _ => self.push_no_key_ctx_action(&act, chinese_mode),
+        }
+        Some(act)
     }
 
     /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回实际推送的 KeyAction
