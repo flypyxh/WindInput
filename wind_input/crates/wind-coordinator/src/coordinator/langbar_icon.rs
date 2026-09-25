@@ -80,6 +80,38 @@ pub(crate) fn parse_user_text_colors(
     }
 }
 
+/// 一条角标规则某一侧（light/dark）的配置 → 渲染侧的着色。
+///
+/// - `""`（含解析失败）= 与主字同色；`#RRGGBB` = 指定色相（RGB → BGR）；
+/// - `alpha` 原样透传：`None` = 跟随全局 `badge_alpha`，`Some(1.0)` 会切挖空档。
+///
+/// 定制层里没迁移的旧写法**只读不写**地兼容：`auto` 同 `""`；`#RRGGBBAA` 的末两位是
+/// 这一条自己的不透明度，只在 `alpha` 为 `None` 时采用——与迁移「本层已写 `alpha_x` 则不覆盖」
+/// 同一取舍：显式的新键优先。这一支只在未迁移的数据上走到。判 8 位只能看**原字符串的长度**：
+/// `parse_hex` 会把 6 位补成 `a = 255`，把「没写」与「写了 FF」抹平。
+///
+/// 解析失败只让色相回落「与主字同色」并记警告，`alpha` 照旧生效——改错一个色值若连带
+/// 不透明度一起打回，用户对不上因果。
+#[cfg(all(feature = "desktop-ui", any(windows, test)))]
+pub(crate) fn badge_color_of(color: &str, alpha: Option<f32>) -> wind_ui::langbar_icon::BadgeColor {
+    use wind_ui::langbar_icon::BadgeColor;
+    let t = color.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+        return BadgeColor { rgb: None, alpha };
+    }
+    match wind_theme::palette::parse_hex(t) {
+        Some([r, g, b, a]) => BadgeColor {
+            rgb: Some([b, g, r]),
+            alpha: alpha
+                .or_else(|| (t.trim_start_matches('#').len() == 8).then_some(a as f32 / 255.0)),
+        },
+        None => {
+            tracing::warn!(value = color, "语言栏角标配色无法解析，按与主字同色处理");
+            BadgeColor { rgb: None, alpha }
+        }
+    }
+}
+
 /// 演示动画的代际。开/关各 +1，驱动线程每帧核对自己那一代是否仍是当前值，不是就退出。
 ///
 /// 用代际而不是 `JoinHandle` + 停止标志：菜单可以被连点，两次开启之间那个线程还没退出，
@@ -234,41 +266,15 @@ impl Coordinator {
     ///
     /// 单项解析失败只记警告并降级，**不整段回落**：改错一个色值若连带把位置、大小
     /// 一起打回默认，用户根本对不上因果。降级的粒度按字段有没有合理默认值来定——
-    /// 颜色退到 `auto`、位置退到右下角，而**状态没有默认值**，不认识就丢掉整条规则。
+    /// 颜色退到与主字同色、位置退到右下角，而**状态没有默认值**，不认识就丢掉整条规则。
     ///
-    /// 色值里的不透明度（`#RRGGBBAA` 末两位）在这里与全局 `badge_alpha` 合流：
-    /// 配置侧只表达「这一条说了没有」，合并发生在渲染侧的 `active_layers`。
+    /// 每条的不透明度（`alpha_light/dark`）在这里只是透传：配置侧只表达「这一条说了没有」，
+    /// 与全局 `badge_alpha` 的合流发生在渲染侧的 `active_layers`。
     #[cfg(all(feature = "desktop-ui", windows))]
     pub(crate) fn apply_langbar_config(&self) {
-        use wind_ui::langbar_icon::{BadgeColor, BadgeRule, BadgeState, BadgeStyle, Corner};
+        use wind_ui::langbar_icon::{BadgeRule, BadgeState, BadgeStyle, Corner};
 
         let cfg = { self.rt().config.ui.langbar.clone() };
-
-        // 色值 → 渲染侧的着色。`auto`（含解析失败）= 与主字同色 + 全局不透明度。
-        //
-        // ⚠ 「有没有指定不透明度」只能看**原字符串的长度**：`parse_hex` 会把 6 位补成
-        // `alpha = 255`，那一步就把「没写」和「写了 FF」抹平了，而这两者含义完全不同
-        // ——后者会把这一条切到挖空档（角标实心 + 周围切掉一圈主字）。
-        let parse_color = |raw: &str, what: &str| -> BadgeColor {
-            let t = raw.trim();
-            if t.eq_ignore_ascii_case("auto") {
-                return BadgeColor::AUTO;
-            }
-            match wind_theme::palette::parse_hex(t) {
-                Some([r, g, b, a]) => BadgeColor {
-                    rgb: Some([b, g, r]),
-                    alpha: (t.trim_start_matches('#').len() == 8).then_some(a as f32 / 255.0),
-                },
-                None => {
-                    tracing::warn!(
-                        value = raw,
-                        item = what,
-                        "语言栏角标配色无法解析，按 auto（与主字同色）处理"
-                    );
-                    BadgeColor::AUTO
-                }
-            }
-        };
 
         // 关掉的规则整条不进渲染器：那边只需回答"画哪些"，不必再处理"配了但不画"。
         let rules: Vec<BadgeRule> = cfg
@@ -286,8 +292,8 @@ impl Coordinator {
                 Some(BadgeRule {
                     state,
                     corner: Corner::from_id(&b.corner),
-                    color_light: parse_color(&b.color_light, "color_light"),
-                    color_dark: parse_color(&b.color_dark, "color_dark"),
+                    color_light: badge_color_of(&b.color_light, b.alpha_light),
+                    color_dark: badge_color_of(&b.color_dark, b.alpha_dark),
                     scale: b.scale,
                 })
             })
@@ -679,5 +685,66 @@ mod text_color_tests {
         let got = effective_text_colors(&user, &theme);
         assert_eq!(got.cn_dark, GREEN, "非法那一格回落到主题值");
         assert_eq!(got.cn_light, RED, "其余格不受牵连");
+    }
+}
+
+#[cfg(all(test, feature = "desktop-ui"))]
+mod badge_color_tests {
+    use super::badge_color_of;
+    use wind_ui::langbar_icon::BadgeColor;
+
+    #[test]
+    fn badge_color_of_empty_is_auto() {
+        assert_eq!(badge_color_of("", None), BadgeColor::AUTO);
+    }
+
+    #[test]
+    fn badge_color_of_rgb6_carries_alpha_param() {
+        let c = badge_color_of("#112233", Some(0.5));
+        assert_eq!(c.rgb, Some([0x33, 0x22, 0x11]), "RGB → BGR");
+        assert_eq!(c.alpha, Some(0.5));
+        assert_eq!(
+            badge_color_of("#112233", None).alpha,
+            None,
+            "未设置 = 跟随全局"
+        );
+    }
+
+    #[test]
+    fn badge_color_of_empty_keeps_alpha_param() {
+        assert_eq!(
+            badge_color_of("", Some(1.0)),
+            BadgeColor {
+                rgb: None,
+                alpha: Some(1.0)
+            },
+            "与主字同色也能单独设不透明度（含切挖空档）"
+        );
+    }
+
+    /// 定制层里没迁移的旧写法仍能读：`auto` 与 8 位色值（显式 alpha 键优先）。
+    #[test]
+    fn badge_color_of_reads_legacy_forms() {
+        assert_eq!(badge_color_of("auto", None), BadgeColor::AUTO);
+        assert_eq!(badge_color_of(" AUTO ", Some(0.3)).alpha, Some(0.3));
+        let c = badge_color_of("#112233FF", None);
+        assert_eq!(c.rgb, Some([0x33, 0x22, 0x11]));
+        assert_eq!(c.alpha, Some(1.0), "未写 alpha 键时用 8 位自带的不透明度");
+        assert_eq!(
+            badge_color_of("#112233FF", Some(0.5)).alpha,
+            Some(0.5),
+            "显式 alpha 键优先，与迁移的取舍一致"
+        );
+    }
+
+    #[test]
+    fn badge_color_of_invalid_falls_back_to_follow() {
+        assert_eq!(
+            badge_color_of("not-a-color", Some(0.5)),
+            BadgeColor {
+                rgb: None,
+                alpha: Some(0.5)
+            }
+        );
     }
 }

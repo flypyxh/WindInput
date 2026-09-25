@@ -51,6 +51,9 @@ pub trait WebDataHost {
     /// 窄面签名不携带宿主内部类型与锁形态。
     fn current_theme_is_dark(&self) -> bool;
 
+    /// 主题对外观可覆盖键给出的值（设置端「跟随主题（值）」），见 `theme_query.rs`。
+    fn theme_follow_values(&self) -> Option<crate::theme_query::ThemeFollowValues>;
+
     /// 加词界面的默认上下文（目标方案 + 最近上屏文本），见
     /// [`crate::handle_addword::AddWordContext`]。
     ///
@@ -274,6 +277,9 @@ impl WebDataHost for Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .resolve_dark()
+    }
+    fn theme_follow_values(&self) -> Option<crate::theme_query::ThemeFollowValues> {
+        Coordinator::theme_follow_values(self)
     }
     fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow> {
         Coordinator::quick_format_rows(self)

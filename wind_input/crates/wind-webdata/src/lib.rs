@@ -366,6 +366,8 @@ pub trait WebDataRpc: WebDataHost {
             }
             // ── 方案配置编辑（三层合并：默认 ← 方案文件 ← override 层）──
             "schema.getConfig" => self.web_schema_get_config(params),
+            // 全局页「已被 N 个方案覆盖」的反查：全局键 → 覆盖它的方案 id 列表（R8.6）。
+            "schema.overrideSummary" => self.web_schema_override_summary(),
             "schema.saveConfig" => self.web_schema_save_config(params),
             "schema.resetConfig" => self.web_schema_reset_config(params),
             "schema.setDictEnabled" => self.web_schema_set_dict_enabled(params),
@@ -592,6 +594,7 @@ pub trait WebDataRpc: WebDataHost {
 
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
+            "theme.resolved" => Ok(serde_json::to_value(self.theme_follow_values())?),
             "theme.preview" => self.web_theme_preview(params),
             "theme.getText" => self.web_theme_get_text(params),
             "theme.delete" => self.web_theme_delete(params),
@@ -1495,11 +1498,46 @@ pub trait WebDataRpc: WebDataHost {
                     obj.insert("keysOverview".to_string(), Value::Array(overview));
                     // 全局层不可信时的说明（见 [`keys_overview`]）。恒在，无降级时为 `null`。
                     obj.insert("keysOverviewDegraded".to_string(), overview_degraded);
+                    // 方案对话框「跟随全局（值）」要显示的值（R8.2）：方案没覆盖时实际按什么跑。
+                    // 不让设置页自己从全局配置里拼：字体那一档要回落到主题，而主题解析只在内核。
+                    obj.insert("followedBehavior".to_string(), self.followed_behavior());
                 }
                 Ok(v)
             }
             None => Ok(json!({})),
         }
+    }
+
+    /// `schema.overrideSummary`：`{ "<全局键>": ["<方案 id>", ...] }`。
+    ///
+    /// 只数 `available_schemas()`（用户启用、且未被定制版 hide 的方案）——没启用的方案
+    /// 覆盖了什么，用户在全局页上不需要被提醒。按方案**合并后**的配置判（方案文件 ⊕
+    /// override 层）：两层写同一个键是同一次覆盖，一个方案对一个键至多计一次；
+    /// 数组顺序即方案列表顺序。
+    fn web_schema_override_summary(&self) -> anyhow::Result<Value> {
+        let mgr = self.engine_mgr();
+        let mut out = serde_json::Map::new();
+        for id in mgr.available_schemas() {
+            let Some(s) = mgr.schema_merged(&id) else {
+                continue;
+            };
+            for key in wind_config::config_schema::schema_overridden_keys(&s) {
+                if let Value::Array(ids) = out.entry(key).or_insert_with(|| json!([])) {
+                    ids.push(json!(id));
+                }
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    /// `getConfig.followedBehavior` 的组装：读盘上的全局配置（与 [`keys_overview`] 同一取法）
+    /// + 当前主题的字体。
+    fn followed_behavior(&self) -> Value {
+        // 读不到全局配置时按出厂值给：这里只是「跟随时显示什么」的提示值，不参与写盘。
+        let cfg = wind_config::Config::load(wind_config::Config::data_dir().as_deref())
+            .unwrap_or_default();
+        let theme_font = self.theme_follow_values().and_then(|t| t.font_family);
+        followed_behavior_of(&cfg, theme_font)
     }
 
     fn web_schema_save_config(&self, params: &Value) -> anyhow::Result<Value> {
@@ -4129,7 +4167,30 @@ pub const READONLY_SIDECAR_FIELDS: &[&str] = &[
     // 漏登记的话它会随 saveConfig 落进 override，从此方案文件里带着一段**某次启动的**
     // 降级快照，谁也不读、也没人会想到去删。
     "keysOverviewDegraded",
+    // 「跟随全局」时的实际值（布局/字体/辅助码）。不剥的话一整份全局快照会落进 override，
+    // 方案从此把这几项钉死在打开设置页那一刻——正是上面说的冻结。
+    "followedBehavior",
 ];
+
+/// [`WebDataRpc::followed_behavior`] 的纯函数内核：配置与主题字体由调用方给定。
+///
+/// - `layout`：与运行时同一裁决（`Orientation::from_layout_str`），只出 `horizontal`/`vertical`；
+/// - `fontFamily`：全局 `ui.font.family`，空（= 跟随主题）则取主题字体，再空为 `""`；
+/// - `auxEnabled` / `auxMaxPhraseLen`：全局 `schema.pinyin.aux_code`。
+fn followed_behavior_of(cfg: &wind_config::Config, theme_font: Option<String>) -> Value {
+    let font = if cfg.ui.font.family.is_empty() {
+        theme_font.unwrap_or_default()
+    } else {
+        cfg.ui.font.family.clone()
+    };
+    let aux = &cfg.schema.pinyin.aux_code;
+    json!({
+        "layout": wind_config::Orientation::from_layout_str(&cfg.ui.candidate.layout).layout_str(),
+        "fontFamily": font,
+        "auxEnabled": aux.enabled,
+        "auxMaxPhraseLen": aux.max_phrase_len,
+    })
+}
 
 /// 按键总览：这个方案下每个绑过的键**当前**干什么、来自哪一层。
 ///
@@ -9449,5 +9510,56 @@ mod schema_key_gate_wiring_tests {
             .expect("schema.invalidate 臂不再是块形式？同步更新本守卫");
         let arm = &prod[start..start + arm_len];
         assert!(arm.contains("refresh_schema_derived_config()"));
+    }
+}
+
+#[cfg(test)]
+mod followed_behavior_tests {
+    use super::*;
+
+    #[test]
+    fn followed_behavior_reads_global_values() {
+        let mut cfg = wind_config::Config::default();
+        cfg.ui.candidate.layout = "vertical".into();
+        cfg.ui.font.family = "霞鹜文楷".into();
+        cfg.schema.pinyin.aux_code.enabled = true;
+        cfg.schema.pinyin.aux_code.max_phrase_len = 3;
+        let v = followed_behavior_of(&cfg, Some("主题字体".into()));
+        assert_eq!(
+            v,
+            json!({
+                "layout": "vertical",
+                "fontFamily": "霞鹜文楷",
+                "auxEnabled": true,
+                "auxMaxPhraseLen": 3,
+            })
+        );
+    }
+
+    /// 全局字体空 = 跟随主题 ⇒ 给主题的字体；主题也没给 ⇒ 空串（不是「默认」之类的占位词）。
+    #[test]
+    fn followed_behavior_font_falls_back_to_theme_then_empty() {
+        let mut cfg = wind_config::Config::default();
+        cfg.ui.font.family = String::new();
+        let v = followed_behavior_of(&cfg, Some("主题字体".into()));
+        assert_eq!(v["fontFamily"], "主题字体");
+        let v = followed_behavior_of(&cfg, None);
+        assert_eq!(v["fontFamily"], "");
+    }
+
+    /// 全局 layout 只认横竖两档：空串/未知值按运行时同一裁决落到横排。
+    #[test]
+    fn followed_behavior_layout_is_horizontal_or_vertical() {
+        let mut cfg = wind_config::Config::default();
+        cfg.ui.candidate.layout = String::new();
+        assert_eq!(followed_behavior_of(&cfg, None)["layout"], "horizontal");
+    }
+
+    #[test]
+    fn followed_behavior_is_a_readonly_sidecar() {
+        assert!(
+            READONLY_SIDECAR_FIELDS.contains(&"followedBehavior"),
+            "旁路字段漏登记：{READONLY_SIDECAR_FIELDS:?}"
+        );
     }
 }

@@ -1177,7 +1177,7 @@ impl Coordinator {
     /// 当作不存在，直接按 [`FALLBACK_THEME`] 加载。只在列表侧滤的话，存量用户
     /// `ui.theme.name` 里指着的那个主题照常生效——「设置页里找不到它，界面上却就是它」。
     /// 替换同样**不写盘**（沿用本函数既有语义），用户卸掉定制包即恢复原样。
-    fn load_theme_with_fallback<T>(
+    pub(crate) fn load_theme_with_fallback<T>(
         mut load: impl FnMut(&str) -> anyhow::Result<T>,
         name: &str,
     ) -> Option<(String, T)> {

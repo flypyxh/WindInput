@@ -129,6 +129,65 @@ impl Coordinator {
     }
 }
 
+/// 主题对「外观可覆盖键」给出的值——设置端「跟随主题（值）」的数据源（R8.1）。
+///
+/// 只抽几个字段就把 `Resolved` 丢掉：它约 13 KB，按值传递在 debug 构建下曾把栈撑爆
+/// （见 [`Coordinator::set_theme_style_name`] 上的说明），而 RPC 的 ctrl 线程没有
+/// 另设栈大小。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeFollowValues {
+    pub theme_id: String,
+    pub font_size: i32,
+    pub font_family: Option<String>,
+    pub font_weight: i32,
+    pub pager_bar_display: &'static str,
+    pub page_number_display: &'static str,
+    pub langbar_text: [Option<String>; 4],
+}
+
+/// 与 `wind_ui::candidate_window::pager_visible` 的「跟随主题」分支同一裁决。
+fn follow_values_of(theme_id: &str, r: &wind_theme::resolve::Resolved) -> ThemeFollowValues {
+    let b = &r.behavior;
+    let hex = |c: Option<Rgba>| c.map(|[r, g, b, _]| format!("#{r:02X}{g:02X}{b:02X}"));
+    let lt = &r.langbar_text;
+    ThemeFollowValues {
+        theme_id: theme_id.to_string(),
+        font_size: b.font_size,
+        font_family: r.views.text.font_family.clone(),
+        font_weight: r.views.text.font_weight,
+        pager_bar_display: if b.hide_pager {
+            "hide"
+        } else if b.always_show_pager {
+            "always"
+        } else {
+            "auto"
+        },
+        page_number_display: if b.show_page_number { "show" } else { "hide" },
+        langbar_text: [
+            hex(lt.cn_light),
+            hex(lt.cn_dark),
+            hex(lt.en_light),
+            hex(lt.en_dark),
+        ],
+    }
+}
+
+impl Coordinator {
+    /// 当前生效主题的跟随值。与桌面推送链同一裁决：先过定制版 hide，再回落
+    /// `FALLBACK_THEME`（`load_theme_with_fallback`）；两级都失败返回 None。
+    pub fn theme_follow_values(&self) -> Option<ThemeFollowValues> {
+        let dirs = self.theme_search_dirs();
+        let name = <Self as crate::web_host::WebDataHost>::current_theme_name(self);
+        let is_dark = <Self as crate::web_host::WebDataHost>::current_theme_is_dark(self);
+        let (id, resolved) = Self::load_theme_with_fallback(
+            |n| wind_theme::load_resolved_dirs(&dirs, n, is_dark).map(Box::new),
+            &name,
+        )?;
+        Some(follow_values_of(&id, &resolved))
+    }
+}
+
 /// `[R, G, B, A]` → `0xAARRGGBB`。
 ///
 /// 用 ARGB 而不是原样透出 `[u8; 4]`：Android 的 `Color` 与 iOS 的 `UIColor(rgb:)`
@@ -148,5 +207,52 @@ mod tests {
         assert_eq!(rgba_to_argb([0xFF, 0x00, 0x00, 0xFF]), 0xFFFF_0000);
         // 半透明纯蓝：A=80 → 0x800000FF
         assert_eq!(rgba_to_argb([0x00, 0x00, 0xFF, 0x80]), 0x8000_00FF);
+    }
+}
+
+#[cfg(test)]
+mod follow_values_tests {
+    use super::*;
+    use wind_theme::resolve::{Resolved, ResolvedBehavior};
+
+    #[test]
+    fn pager_display_maps_theme_behavior() {
+        let mut r = Resolved {
+            behavior: ResolvedBehavior {
+                hide_pager: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(follow_values_of("default", &r).pager_bar_display, "hide");
+        r.behavior = ResolvedBehavior {
+            always_show_pager: true,
+            ..Default::default()
+        };
+        assert_eq!(follow_values_of("default", &r).pager_bar_display, "always");
+        r.behavior = ResolvedBehavior::default();
+        assert_eq!(follow_values_of("default", &r).pager_bar_display, "auto");
+    }
+
+    #[test]
+    fn page_number_and_font_fields_copied() {
+        let mut r = Resolved::default();
+        r.behavior.show_page_number = false;
+        r.behavior.font_size = 20;
+        r.views.text.font_weight = 500;
+        let v = follow_values_of("x", &r);
+        assert_eq!(v.page_number_display, "hide");
+        assert_eq!(v.font_size, 20);
+        assert_eq!(v.font_weight, 500);
+        assert_eq!(v.font_family, None);
+    }
+
+    #[test]
+    fn langbar_text_formats_rgb_hex_and_keeps_none() {
+        let mut r = Resolved::default();
+        r.langbar_text.cn_light = Some([0x11, 0x22, 0x33, 0xFF]);
+        let v = follow_values_of("x", &r);
+        assert_eq!(v.langbar_text[0].as_deref(), Some("#112233"));
+        assert_eq!(v.langbar_text[1], None);
     }
 }
