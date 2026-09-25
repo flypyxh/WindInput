@@ -603,3 +603,102 @@ fn recall_ranks_by_decayed_count() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ───────────────────────── 英文方案：非词库原文不记词频 ─────────────────────────
+
+/// 英文方案（调频开）下打一个词库里没有的串，高亮第 `pick` 条上屏；返回上屏文本。
+fn english_schema_commit(coord: &Coordinator, word: &str, pick: usize) -> String {
+    for c in word.chars() {
+        coord.handle_key_event(&key((c.to_ascii_uppercase() as u32) & 0xFF, 0));
+    }
+    let act = if pick == 0 {
+        coord.handle_key_event(&key(VK_SPACE, 0))
+    } else {
+        coord.handle_key_event(&key(0x31 + pick as u32, 0))
+    };
+    commit_text(&act)
+}
+
+fn english_rows(store: &Store) -> Vec<String> {
+    let mut rows = Vec::new();
+    store
+        .for_each_freq("english", "", &mut |code, text, rec| {
+            rows.push(format!("({code}, {text}, {})", rec.count));
+            true
+        })
+        .unwrap();
+    rows
+}
+
+fn english_schema_config() -> Config {
+    let mut cfg = config(true);
+    cfg.schema.active = "english".into();
+    cfg
+}
+
+/// 英文方案下空格上屏**非词库原文**（`wxyzq`，头部原文候选、找不到对应词库词）：
+/// **不记词频**（读端永远查不中的孤儿键，与临英 / 快捷输入同口径），但输入统计与上屏历史
+/// 照记——`;` 进快捷输入，重复上屏候选就是它。
+#[test]
+fn english_schema_literal_raw_commit_records_no_freq() {
+    if !has_english_schema() {
+        return;
+    }
+    let (store, path) = fresh_store("schema_literal");
+    let coord = Coordinator::new_headless_with_store(
+        english_schema_config(),
+        Some(&data_dir()),
+        store.clone(),
+    );
+    coord.debug_capture_stat_events();
+    let text = english_schema_commit(&coord, "wxyzq", 0);
+    assert_eq!(text.trim_end(), "wxyzq", "前提：空格上屏的是原文");
+    assert_eq!(
+        english_rows(&store),
+        Vec::<String>::new(),
+        "非词库原文不得记词频"
+    );
+    assert!(
+        coord
+            .debug_take_stat_events()
+            .iter()
+            .any(|(_, t)| t == "wxyzq"),
+        "输入统计照记"
+    );
+    // 上屏历史：`;` 进快捷输入，空缓冲的重复上屏候选就是它。
+    coord.handle_key_event(&key(VK_SEMICOLON, 0));
+    assert_eq!(
+        coord.debug_page_texts(),
+        vec!["wxyzq".to_string()],
+        "上屏历史照记：`;` 应调出 wxyzq"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 对照：**用户词库里的词**（`wxyzqab`，英文来源）照常记词频——它是词库候选，不是头部原文。
+/// 同时覆盖用户词被头部原文按字面吃掉的情形（打全 `wxyzqab` 空格上屏原文）：能找到对应的
+/// 用户词，按它记。
+#[test]
+fn english_schema_user_word_still_records_freq() {
+    if !has_english_schema() {
+        return;
+    }
+    let (store, path) = fresh_store("schema_userword");
+    store
+        .add_user_word("english", "wxyzqab", "wxyzqab", 0, 0)
+        .unwrap();
+    let coord = Coordinator::new_headless_with_store(
+        english_schema_config(),
+        Some(&data_dir()),
+        store.clone(),
+    );
+    // 打 `wxyzq` 选第 2 条（首条是原文 `wxyzq`，其后是用户词 `wxyzqab`）。
+    let text = english_schema_commit(&coord, "wxyzq", 1);
+    assert_eq!(text.trim_end(), "wxyzqab", "前提：第 2 条是用户词");
+    assert_eq!(english_count(&store, "wxyzqab", "wxyzqab"), 1);
+    // 打全再空格上屏头部原文：按对应的用户词记。
+    let text = english_schema_commit(&coord, "wxyzqab", 0);
+    assert_eq!(text.trim_end(), "wxyzqab");
+    assert_eq!(english_count(&store, "wxyzqab", "wxyzqab"), 2);
+    let _ = std::fs::remove_file(&path);
+}

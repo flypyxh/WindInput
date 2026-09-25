@@ -471,14 +471,22 @@ impl Coordinator {
     /// `translation`，而不是 `(translation, Translation)` 这条读端永远查不中的键。落在这个
     /// 薄包装里而非各出口，是因为主输入路的选词 / 顶屏出口全都经过这里（见上）。
     /// 调用方传进来的 `code` 对无来源的头部候选就是小写输入缓冲（`freq_code` 的兜底分支）。
-    /// 找不到对应词库词时照旧按原样记（保持改前行为）。
+    ///
+    /// ★ 找不到对应词库词的头部候选（纯原文，如 `wxyzq`）**不记词频、只记上屏历史**——与
+    /// 临英 / 快捷输入同一口径（理由见 `english_head_dict_word`：`(wxyzq, wxyzq)` 是读端永远
+    /// 查不中的孤儿键）。输入统计由各出口自己的 `record_commit` 记，不经本函数，照旧。
+    /// 调频关时同样只记历史——那时改前也只记了历史（写端被开关挡下）。
     pub(crate) fn record_selection_cand(&self, code: &str, cand: &Candidate) {
-        if self.engine_mgr.active_is_english() {
+        if self.engine_mgr.active_is_english()
+            && crate::english_candidates::is_english_head_candidate(cand, code)
+        {
             let active = self.engine_mgr.active_schema_id();
             if let Some(word) = self.english_head_dict_word(&active, code, cand) {
                 let freq_code = self.freq_code(code, &word);
                 return self.record_selection_cand_in(None, &freq_code, &word);
             }
+            self.push_commit_history(&cand.text);
+            return;
         }
         self.record_selection_cand_in(None, code, cand)
     }

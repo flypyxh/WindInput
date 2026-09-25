@@ -273,6 +273,22 @@ pub(crate) fn dedup_by_text(cands: &mut Vec<Candidate>) {
     cands.retain(|c| seen.insert(c.text.clone()));
 }
 
+/// 这条候选是不是**英文头部候选**（所打原文 / 它的大小写变形）：无来源、无码、非短语 /
+/// 命令 / emoji，且文本是缓冲 `buf` 的某种大小写形态。
+///
+/// 头部候选由 [`english_head_candidates`] 生成，候选身上没有「我是头部」的标记，只能按
+/// 这组特征认；[`crate::coordinator::Coordinator::english_head_dict_word`] 与英文方案主路的
+/// 记账分流（`record_selection_cand`）共用本判据，两处必须同一口径。
+pub(crate) fn is_english_head_candidate(cand: &Candidate, buf: &str) -> bool {
+    cand.source == CandidateSource::None
+        && cand.code.is_empty()
+        && !cand.is_phrase
+        && !cand.is_command
+        && !cand.is_emoji_suggestion
+        && !buf.is_empty()
+        && cand.freq_text().eq_ignore_ascii_case(buf)
+}
+
 /// 「按一个完整词库码精确查词」的取数上限——头部候选找对应词库词（A2-39②）与英文词频
 /// 召回验证（A2-39③）共用。
 ///
@@ -307,17 +323,10 @@ impl crate::coordinator::Coordinator {
         buf: &str,
         cand: &Candidate,
     ) -> Option<Candidate> {
-        let head_text = cand.freq_text();
-        let is_head = cand.source == CandidateSource::None
-            && cand.code.is_empty()
-            && !cand.is_phrase
-            && !cand.is_command
-            && !cand.is_emoji_suggestion
-            && !buf.is_empty()
-            && head_text.eq_ignore_ascii_case(buf);
-        if !is_head {
+        if !is_english_head_candidate(cand, buf) {
             return None;
         }
+        let head_text = cand.freq_text();
         // 调频关着就不查：结果只用来记词频，而写端本来也会因开关关着而不写。先判开关，
         // 关着时连这次查询与它的副作用（临英的上屏历史）都不发生，行为与改前逐字相同。
         if !self.engine_mgr.freq_settings_for(engine_schema).enabled {
