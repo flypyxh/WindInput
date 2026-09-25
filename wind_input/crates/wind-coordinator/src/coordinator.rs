@@ -8010,11 +8010,19 @@ impl Coordinator {
             let text = if state.active == Some(ModeKind::TempEnglish)
                 && !state.temp_english_buffer.is_empty()
             {
-                if state.full_width {
+                let text = if state.full_width {
                     to_full_width(&state.temp_english_buffer)
                 } else {
                     state.temp_english_buffer.clone()
-                }
+                };
+                // 与临拼 / mix / 主路的残留同口径：本次上屏按模式切换来源记统计。
+                self.record_commit(
+                    &text,
+                    state.temp_english_buffer.len() as u32,
+                    -1,
+                    CommitSource::ModeSwitch,
+                );
+                text
             } else if let Some((buf, prefix)) = match state.active {
                 Some(ModeKind::TempPinyin) => Some((
                     state.temp_pinyin_buffer.clone(),
