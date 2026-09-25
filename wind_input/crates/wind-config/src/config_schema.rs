@@ -737,7 +737,7 @@ pub struct SchemaOverride {
 ///
 /// # ⚠️ 没有编译期约束，加方案级字段时必须回来加一行
 ///
-/// 「方案的 `[codetable].top_code_commit` 覆盖全局的 `schema.codetable.top_code_commit`」
+/// 「方案的 `[engine.codetable].top_code_commit` 覆盖全局的 `schema.codetable.top_code_commit`」
 /// 这层对应关系只存在于 `resolved()` 的函数体里，类型系统看不见。新增方案级字段而漏了
 /// 这张表，后果是设置页那一行**不再提示可被覆盖**——没有任何测试会红。
 /// 各方案级段的权威定义：[`crate::schema::SchemaBehavior`]（punct/candidate/phrases）、
@@ -751,7 +751,7 @@ pub struct SchemaOverride {
 pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
     SchemaOverride {
         key: "schema.codetable.",
-        section: "[codetable]",
+        section: "[engine.codetable]",
         note: "码表方案可逐项覆盖这里的设置；方案没写的项仍然用这里的值。",
     },
     // 调频子段单独登记：段前缀不递归（见 `SchemaOverride::key`）。
@@ -760,23 +760,23 @@ pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
     // 去方案里写一段不会被读的配置。
     SchemaOverride {
         key: "schema.codetable.frequency.",
-        section: "[codetable.frequency]",
+        section: "[engine.codetable.frequency]",
         note: "码表方案可逐项覆盖这里的调频设置；方案没写的项仍然用这里的值。",
     },
     // 同上：段前缀不递归，英文候选子段要自己登记一条。
     SchemaOverride {
         key: "schema.codetable.english_merge.",
-        section: "[codetable.english_merge]",
+        section: "[engine.codetable.english_merge]",
         note: "码表方案可逐项覆盖这里的英文候选设置；方案没写的项仍然用这里的值。",
     },
     SchemaOverride {
         key: "schema.pinyin.aux_code.enabled",
-        section: "[aux_code]",
+        section: "[engine.aux_code]",
         note: "方案可覆盖这一项；方案没写则用这里的值。",
     },
     SchemaOverride {
         key: "schema.pinyin.aux_code.max_phrase_len",
-        section: "[aux_code]",
+        section: "[engine.aux_code]",
         note: "方案可覆盖这一项；方案没写则用这里的值。",
     },
     SchemaOverride {
@@ -1739,6 +1739,36 @@ mod tests {
         assert!(schema_override_of("input.punct.smart_list").is_none());
     }
 
+    /// 登记的段名必须是方案文件里真实存在的段——它原样进设置页提示，用户照着写。
+    ///
+    /// 现场：`[codetable]` / `[aux_code]` 挂了很久，而这两段实际在 `[engine.*]` 下、也没有
+    /// serde 别名；照提示写进方案文件的配置会被静默忽略（`Schema` 不拒未知字段）。
+    #[test]
+    fn schema_override_sections_exist_in_schema() {
+        // 可选子段默认是 None、序列化时不出现，先填上才能在树里找到它们。
+        let mut schema = crate::schema::Schema::default();
+        schema.engine.codetable.frequency = Some(Default::default());
+        schema.engine.codetable.english_merge = Some(Default::default());
+        let tree = toml::Value::try_from(schema).expect("序列化 Schema");
+        for o in SCHEMA_OVERRIDES {
+            let path = o
+                .section
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("{} 的段名 {:?} 不是 [a.b] 形式", o.key, o.section));
+            let mut node = &tree;
+            for seg in path.split('.') {
+                node = node.get(seg).unwrap_or_else(|| {
+                    panic!(
+                        "{} 登记的段 {} 在 Schema 里不存在（断在 {seg}）",
+                        o.key, o.section
+                    )
+                });
+            }
+            assert!(node.is_table(), "{} 登记的段 {} 不是表", o.key, o.section);
+        }
+    }
+
     /// 段前缀**不递归**：子段要么自己登记，要么不该被标记。
     ///
     /// 现场：第一版用递归前缀，`schema.codetable.auto_phrase.*` 六个键被一并标成
@@ -1747,10 +1777,10 @@ mod tests {
     /// 写了没反应还以为是自己写错了。
     #[test]
     fn section_prefix_does_not_leak_into_subsections() {
-        // 登记了的子段：命中，且命中的是**子段那一条**（提示文案要说 [codetable.frequency]）。
+        // 登记了的子段：命中，且命中的是**子段那一条**（提示文案要说 [engine.codetable.frequency]）。
         let hit = schema_override_of("schema.codetable.frequency.half_life")
             .expect("frequency 子段已单独登记，应命中");
-        assert_eq!(hit.section, "[codetable.frequency]");
+        assert_eq!(hit.section, "[engine.codetable.frequency]");
         // 没登记的子段：绝不能因为父段登记了就跟着被标。
         for k in [
             "schema.codetable.auto_phrase.enabled",
@@ -1931,7 +1961,7 @@ mod overridden_keys_tests {
     }
 
     /// 前缀型登记在方案文件里的落点段。与 `SchemaOverride::section` 刻意不共用：那是给用户看
-    /// 的提示文案（写作 `[codetable]`），这里要的是能被 serde 读进 `Schema` 的真实路径。
+    /// 的提示文案（带方括号，如 `[engine.codetable]`），这里要的是点分路径。
     fn schema_section_of_prefix(prefix: &str) -> &'static str {
         match prefix {
             "schema.codetable." => "engine.codetable",

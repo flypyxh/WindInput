@@ -391,7 +391,7 @@ pub struct EngineManager {
     data_dir: Option<std::path::PathBuf>,
     /// redb 持久化存储（用户词/临时词层；None=无持久化，如纯测试/REPL）
     store: Option<Arc<wind_store::Store>>,
-    /// 全局码表配置（公共基线；方案经 schema_overrides 的 [codetable] 段逐字段覆盖）。
+    /// 全局码表配置（公共基线；方案经 schema_overrides 的 [engine.codetable] 段逐字段覆盖）。
     /// Mutex 以支持热重载（变更后清空引擎缓存按新策略重建）。
     codetable: Mutex<wind_config::CodetableGlobal>,
     /// 全局混输配置（融合策略；全局唯一，无方案级 override）。Mutex 以支持热重载。
