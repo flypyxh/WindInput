@@ -3520,6 +3520,7 @@ pub struct InputConfig {
     pub commit_newline: String,
     /// 英文输入态（英文方案 / 临时英文）下，**临时夺取哪个键**来切换候选的大小写档位：
     /// 默认 → 全大写 → 全小写 → 默认，一次组合结束即复位。空串 = 关闭（出厂）。
+    /// 快捷输入里有英文段时同样生效，档位只套英文段（中文候选与计算结果不动）。
     ///
     /// 值域见 `Coordinator::parse_case_cycle_key`：`capslock` / `tab` / `enter` / `space` /
     /// `escape`。不认识的键名**告警后按关闭处理**，不静默。
@@ -4063,6 +4064,10 @@ pub struct TempEnglishConfig {
     /// 仍重新裁定的行为（用户 2026-09-09 拍板）。两者的区别不在观感而在规则：
     /// 旧实现是**整串套形**（不管词库原文长什么样），本项是**逐位投影且单向**
     /// （只覆盖用户按了 Shift 的那几位，词库自带的大写一律保留）。
+    ///
+    /// ★ 也作用于**快捷输入里的英文**：Shift+字母让缓冲带上大写（落自由输入透镜）时，
+    /// 纯字母缓冲在所打原文之后追加英文段，其词库候选按本项投影（见
+    /// `Coordinator::mix_free_english_segment`）。
     #[serde(default = "default_true")]
     pub case_follow_input: bool,
     /// 临英选词上屏后自动补一个空格。

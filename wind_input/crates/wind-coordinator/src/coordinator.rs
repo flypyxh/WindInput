@@ -7592,12 +7592,18 @@ impl Coordinator {
         // 未配置触发键就没有这条路：`?` 在此只作「无配置即返回 None」的守卫，值本身不用。
         self.rt().english_case_cycle_vk?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.candidates.is_empty() || !self.in_english_input_context(&state) {
+        // 快捷输入单列一问（`mix_highlight_is_english`），**不**并进 `in_english_input_context`：
+        // 那是「整个语境在打英文」，mix 的中文候选不该跟着补空格（见 `mix_candidate_is_english`）。
+        if state.candidates.is_empty()
+            || !(self.in_english_input_context(&state) || self.mix_highlight_is_english(&state))
+        {
             return None;
         }
         state.english_case_variant = state.english_case_variant.next();
         if state.active == Some(ModeKind::TempEnglish) {
             self.update_temp_english_candidates(&mut state);
+        } else if matches!(state.active, Some(ModeKind::Mix(_))) {
+            self.update_mix_candidates(&mut state);
         } else {
             // 英文引擎恒 `should_commit = false`（见 `EnglishEngine::convert`），故这里
             // 不会有自动上屏意向要处置；返回值刻意丢弃。
@@ -7666,7 +7672,7 @@ impl Coordinator {
             return;
         }
         warn!(
-            "英文大小写档位循环占用的键（input.english_case_cycle_key = {:?}）同时配作 {}；             英文方案 / 临时英文**输入期间**本键归档位循环，那些功能在此期间按不出来。             要保留它们：把 english_case_cycle_key 换成别的键或留空；要保留档位循环：把那些功能改绑到别的键",
+            "英文大小写档位循环占用的键（input.english_case_cycle_key = {:?}）同时配作 {}；             英文方案 / 临时英文输入期间、以及快捷输入**高亮英文候选**时，本键归档位循环，那些功能在此期间按不出来。             要保留它们：把 english_case_cycle_key 换成别的键或留空；要保留档位循环：把那些功能改绑到别的键",
             rt.config.input.english_case_cycle_key,
             owners.join(" / ")
         );

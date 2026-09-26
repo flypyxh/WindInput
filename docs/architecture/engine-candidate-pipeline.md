@@ -471,6 +471,13 @@ code 是 query 前缀 → 只消费前缀长度，剩余拼音继续转换；否
 - 快捷输入侧另有 `MixLens::Phrase` 透镜：接受集 = 小写字母 + 分词符、**只查 english 成员**、
   选词键同 Text。不能并进 `Text`（那会让 `don't` 被喂给拼音成员并打散），也不能落进
   `Free`（那里一个选词键都没有）。
+- 快捷输入里带大写的**纯字母**缓冲（Shift+字母）仍落 `Free` 透镜，但在所打原文之后**追加英文段**
+  （`mix_free_english_segment`，仅 `free_input = auto` 且含英文成员）：变形 + 词库候选，词库候选按
+  `input.temp_english.case_follow_input` 跟随输入大小写，`english_case_cycle_key` 档位循环只套英文段。
+  透镜判据不动——大写并进 `Text` 会让拼音 / 码表成员拿到非编码串，并牵动 A2-23 / t157 的 Free 语义。
+- 头部候选（原文 / 大小写变形）与**英文词库**候选字面相同时，由词库那条占据头部那一格（保留来源 /
+  编码 / 释义），不再另出一条无来源的原文（`english_candidates::merge_head_with_dict`，英文方案 /
+  临英 / 快捷输入三路共用）；同名的短语、命令照旧被头部吃掉。
 
 ### 6.1 英文候选混入非混输方案（`schema.codetable.english_merge` / `schema.pinyin.english_merge`）
 

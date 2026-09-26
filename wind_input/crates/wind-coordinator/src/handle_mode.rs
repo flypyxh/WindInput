@@ -669,6 +669,8 @@ impl Coordinator {
         state.active = Some(ModeKind::Mix(idx));
         state.mix_id = idx;
         state.mix_buffer.clear();
+        // 大小写档位属于这一次组合：从别的模式（临英 / 英文方案）带进来的档位不得串进来。
+        state.english_case_variant = crate::english_candidates::CaseVariant::default();
         state.mix_cursor = 0;
         // 透镜不再有状态位：由 `mix_lens(state)` 按缓冲实时推导（清空缓冲即回到基线）。
         // 显示态前缀（进入键符号，如 ";"；经 z_key_action 进入时为 "z"）：只显示不消费，
@@ -881,7 +883,38 @@ impl Coordinator {
         state.committed_segs.clear();
         state.candidates.clear();
         state.preedit.clear();
+        // 大小写档位属于**这一次**组合（同临英 `exit_temp_english`）。
+        state.english_case_variant = crate::english_candidates::CaseVariant::default();
         // 布局无需在此恢复：active 已清空，下一次 notify_ui_update 会自动算回全局基线。
+    }
+
+    /// 快捷输入此刻的**高亮候选**是不是英文候选（英文成员 / Free 英文段 / 词组透镜）——
+    /// 大小写档位循环（`input.english_case_cycle_key`）在快捷输入里的夺取判据，对齐临英。
+    ///
+    /// 只看高亮：档位键可能配成 Space / Enter / Esc / Tab，高亮是中文候选时它们必须保持原功能
+    /// （空格仍选词）。Free 透镜里非纯字母的字面输入（`;12.5GB`、`;C++`）不是英文词，不夺取
+    /// ——判据与 Free 英文段的生成条件共用 [`Self::mix_free_is_english_word`]。
+    pub(crate) fn mix_highlight_is_english(&self, state: &State) -> bool {
+        if !matches!(state.active, Some(ModeKind::Mix(_))) || state.mix_repeat {
+            return false;
+        }
+        if self.mix_lens(state) == MixLens::Free && !self.mix_free_is_english_word(state) {
+            return false;
+        }
+        let Some(cand) = state.candidates.get(self.highlighted_global_index(state)) else {
+            return false;
+        };
+        self.mix_candidate_is_english(state, cand)
+    }
+
+    /// Free 透镜下这串缓冲是不是「英文词」：`free_input = auto`、含英文成员、纯 ASCII 字母
+    /// （只因含大写才越界）。Free 英文段的生成（`mix_free_english_segment`）、按英文记词频、
+    /// 档位键夺取三处共用，判据只此一份。
+    pub(crate) fn mix_free_is_english_word(&self, state: &State) -> bool {
+        self.mix_free_input(state.mix_id) == FreeInputMode::Auto
+            && !state.mix_buffer.is_empty()
+            && state.mix_buffer.chars().all(|c| c.is_ascii_alphabetic())
+            && self.mix_has_english(state.mix_id)
     }
 
     /// 候选的**出口文本**（显示与上屏同源）：1对多变体候选（`s2t_override`）直接用覆盖
@@ -2049,6 +2082,18 @@ impl Coordinator {
                         }
                     }
                 }
+            } else if lens == MixLens::Free && english && self.mix_free_is_english_word(state) {
+                // Free 透镜里的英文段（见 `mix_free_english_segment`）：词库词按词库原文记词频、
+                // 头部候选找回对应词库词记（同临英）；都不是词库词时只记历史。不分段、不造词。
+                match self.mix_freq_candidate(state, &cand) {
+                    Some(freq_cand) => {
+                        let code = state.mix_buffer.to_lowercase();
+                        let freq_code = self.freq_code(&code, &freq_cand);
+                        let owner = self.mix_candidate_owner(state, &freq_cand);
+                        self.record_selection_cand_in(owner.as_deref(), &freq_code, &freq_cand);
+                    }
+                    None => self.push_commit_history(&cand.text),
+                }
             } else {
                 // 数字透镜（计算/日期/金额）与自由输入原文无编码可记词频，但同样是一次上屏：
                 // 单独记历史，使「算完再按 ; 空格」能重复刚上屏的结果。
@@ -2111,10 +2156,14 @@ impl Coordinator {
             //
             // 刻意**不走 `finalize_candidates`**：那是词库候选里 `$AA`/`$CC` 特殊语法的展开点，
             // 而自由输入的文本是用户逐键打进来的字面内容——打了 `$AA` 就该出 `$AA`。
-            state.candidates = vec![Candidate {
-                text: state.mix_buffer.clone(),
-                ..Default::default()
-            }];
+            let raw = state.mix_buffer.clone();
+            state.candidates = match self.mix_free_english_segment(state, &raw) {
+                Some(seg) => seg,
+                None => vec![Candidate {
+                    text: raw,
+                    ..Default::default()
+                }],
+            };
             return;
         }
         let numeric = lens == MixLens::Numeric;
@@ -2353,8 +2402,10 @@ impl Coordinator {
                 // 命中而保留，若再跟出 `Don't` / `DON'T`，同一串输入就会因为开关而变样——
                 // `phrase_seg_does_not_break_apostrophe_free_input` 钉的正是「开关两档逐条一致」。
                 //
-                // mix 文本缓冲恒小写，故变形只有首字母大写 / 全大写两条；大小写跟随输入与
-                // CapsLock 档位循环不在此接（要改 `MixLens` 的透镜判据，另议）。
+                // mix 文本缓冲恒小写，故变形只有首字母大写 / 全大写两条，大小写跟随输入在
+                // 这里无事可做；带大写的缓冲落 Free 透镜，那里的英文段按临英开关投影（见
+                // `mix_free_english_segment`）。大小写档位（`english_case_cycle_key`）在下面
+                // 并入头部之后只套本段，夺取判据见 `mix_highlight_is_english`。
                 if member == "english" {
                     let te = &self.rt().config.input.temp_english;
                     let raw_mode = crate::english_candidates::raw_mode_under_phrase_seg(
@@ -2378,6 +2429,16 @@ impl Coordinator {
                         heads,
                         std::mem::take(&mut member_cands),
                     );
+                    // 大小写档位（`english_case_cycle_key`）只套英文段，同临英作用于整段（含头部）。
+                    if state.english_case_variant != crate::english_candidates::CaseVariant::Default
+                        && crate::english_candidates::apply_english_case(
+                            &mut member_cands,
+                            &state.mix_buffer,
+                            state.english_case_variant,
+                        )
+                    {
+                        crate::english_candidates::dedup_by_text(&mut member_cands);
+                    }
                 }
                 member_cands.truncate(MIX_MEMBER_QUOTA);
                 for c in member_cands {
@@ -2415,6 +2476,77 @@ impl Coordinator {
         self.apply_emoji_suggestions(&mut state.candidates);
         // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
         self.expand_s2t_variants(state);
+    }
+
+    /// Free 透镜下的**英文段**：缓冲是纯 ASCII 字母（Free 只因含大写才越界）、本实例含英文
+    /// 成员且 `free_input = auto` 时，按临英口径给出「原文 + 大小写变形 + 词库候选」；
+    /// 否则 `None`（调用方照旧只给原文）。
+    ///
+    /// # 为什么落在 Free 里而不是改透镜判据
+    ///
+    /// Shift+字母让缓冲带上大写，按 [`MixLens::accepts`] 越界进 Free——英文成员根本没被问到，
+    /// 临英那套「词库候选跟随输入大小写」（`input.temp_english.case_follow_input`，快捷输入
+    /// 英文一律读临英开关）就无从生效。把大写并进 Text 的接受集会让拼音 / 码表成员拿到大写
+    /// 串（它们不是编码），还得给数字键、选词键重新定义语义，牵动 A2-23 / t157 那组 Free
+    /// 判据。这里只在 Free 的候选上**追加**英文段：透镜分类、字面输入、无选词键的语义全都
+    /// 不动；原文仍钉首位（打什么上屏什么），高亮移动 + 空格即可选词库词。
+    ///
+    /// `Always` 实例是专做字面输入的，不追加。含数字 / 符号的缓冲（`GetTestData()`、
+    /// `12.5GB`）不是英文词，也不追加。
+    ///
+    /// 词库段的加工次序同临英（`update_temp_english_candidates`）：取数 → 召回 → 词频重排 →
+    /// 候选调整 → 大小写投影，头部最后并入（与词库同名的头部格由词库词占据）。
+    fn mix_free_english_segment(&self, state: &State, raw: &str) -> Option<Vec<Candidate>> {
+        const EN: &str = "english";
+        if !self.mix_free_is_english_word(state) {
+            return None;
+        }
+        let te = self.rt().config.input.temp_english.clone();
+        let mut dict: Vec<Candidate> = Vec::new();
+        let mut cased = false;
+        if te.show_candidates && self.engine_mgr.ensure_schema(EN) {
+            let code = raw.to_lowercase();
+            let limit =
+                Self::initial_candidate_limit_of(self.engine_mgr.loaded_engine_type(EN), &code)
+                    .min(MIX_MEMBER_FETCH_CAP);
+            let mut seen = std::collections::HashSet::new();
+            dict = self
+                .engine_mgr
+                .convert_with(EN, &code, limit)
+                .candidates
+                .into_iter()
+                .filter(|c| seen.insert(c.text.clone()))
+                .collect();
+            // 归属取英文**成员方案**，与写端 `mix_candidate_owner` 落同一个桶（同文本透镜成员段）。
+            let mix_member_owner = Some(EN.to_string());
+            let recalled = self.english_freq_recall(mix_member_owner.as_deref(), &dict, &code);
+            dict.extend(recalled);
+            self.apply_freq_rerank_in(mix_member_owner.as_deref(), &mut dict, &code);
+            self.apply_shadow_in(mix_member_owner.as_deref(), &mut dict, &code);
+            if te.case_follow_input {
+                cased = crate::english_candidates::apply_english_case(
+                    &mut dict,
+                    raw,
+                    crate::english_candidates::CaseVariant::Default,
+                );
+            }
+        }
+        // 原文恒在（Free 的「打什么上屏什么」）；变形读临英开关。
+        let head = crate::english_candidates::english_head_candidates(raw, true, te.case_variants);
+        let mut seg = crate::english_candidates::merge_head_with_dict(head, dict);
+        // 大小写档位作用于整段（含头部），同临英。
+        if state.english_case_variant != crate::english_candidates::CaseVariant::Default {
+            cased |= crate::english_candidates::apply_english_case(
+                &mut seg,
+                raw,
+                state.english_case_variant,
+            );
+        }
+        if cased {
+            crate::english_candidates::dedup_by_text(&mut seg);
+        }
+        seg.truncate(MIX_MEMBER_QUOTA);
+        Some(seg)
     }
 
     /// 空缓冲时注入「重复上屏」候选（成员 `quick_input.repeat`）：把上次上屏的内容
