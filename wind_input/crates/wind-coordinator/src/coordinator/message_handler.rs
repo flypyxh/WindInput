@@ -2005,6 +2005,14 @@ impl MessageHandler for Coordinator {
                                 );
                                 // 原码类上屏进上屏历史（转换前形态、不含标点，同回车）。
                                 self.push_commit_history(&format!("{committed}{raw}"));
+                                // 输入统计同回车上屏原码：只记本次上屏的原码（已转换前缀选词时已记过），
+                                // 标点在下面另记一笔。此前只记了标点，原码在统计里消失。
+                                self.record_commit(
+                                    raw,
+                                    raw.len() as u32,
+                                    -1,
+                                    CommitSource::RawInput,
+                                );
                                 commit_text.push_str(raw);
                             }
                             state.input_buffer.clear();
@@ -2103,6 +2111,9 @@ impl MessageHandler for Coordinator {
                         );
                         // 原码类上屏进上屏历史（转换前形态、不含标点，同回车）。
                         self.push_commit_history(&format!("{committed}{raw}"));
+                        // 输入统计同回车上屏原码：只记本次上屏的原码（已转换前缀选词时已记过），
+                        // 标点在下面另记一笔。此前只记了标点，原码在统计里消失。
+                        self.record_commit(raw, raw.len() as u32, -1, CommitSource::RawInput);
                         out.push_str(raw);
                     }
                     // 联想态计入「有输入」：宿主里挂着占位组合，这个标点须由服务端出、
