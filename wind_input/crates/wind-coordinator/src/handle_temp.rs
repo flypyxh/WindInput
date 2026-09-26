@@ -1004,19 +1004,16 @@ impl Coordinator {
                     let (start, _) = self.page_range(state);
                     let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    // 标点键：高亮候选整体上屏时，标点**跟着一起上屏**（按中英标点配置转换）。
+                    // 标点键：顶屏高亮候选，标点**跟着一起上屏**（按中英标点配置转换）。
                     // 此前这里只上屏候选，标点字符没有任何出口 ⇒ `nihao,` 只得「你好」。
                     // 对齐快捷输入 ⑥、临英与主输入路 `commit_highlight_then_char`。
                     //
-                    // 只接「整体上屏」这一形：组 / 命令候选各有自己的语义，仍按原样走
+                    // 只接「文本候选」：组 / 命令候选各有自己的语义，仍按原样走
                     // `commit_temp_pinyin_selected`。
                     //
-                    // ⚠️ **分步候选高亮时标点仍被吞**（只确认该段、留在临拼、标点不输出），这是
-                    // 刻意保留的现状而非遗漏：剩余拼音还没转换，此刻输出标点只有两种形态——
-                    // ① 标点插在已转换段与剩余码之间（「你，hao」），词被从中间切开；② 照主输入路
-                    // `commit_highlight_then_char` / 快捷输入 ⑥ 那样丢掉剩余码再上屏，用户打的码
-                    // 静默消失。两者都比「少一个标点」更糟，改哪种须先定产品语义，故暂不动。
-                    // （高亮只有用户手动移到分步候选上才会停在这里，首选恒是整句。）
+                    // 高亮停在**分步候选**时同主路拼音：顶屏「已选段 + 该候选」+ 标点，剩余码
+                    // 丢弃并退出（主路标点臂顶屏后清缓冲；造词只推 6b，见 `learn_on_top_commit`）。
+                    // 此前这一形被排除在外，走 `commit_temp_pinyin_selected` 只确认那一段——标点被吞。
                     let total = state.temp_pinyin_buffer.len();
                     let partial = cand.consumed_length > 0
                         && cand.consumed_length < total
@@ -1025,10 +1022,23 @@ impl Coordinator {
                             .is_char_boundary(cand.consumed_length);
                     if !cand.is_group
                         && !cand.is_command
-                        && !partial
                         && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
                     {
                         let punct = self.convert_punct_char(state, ch);
+                        if partial {
+                            let out = self.temp_pinyin_partial_top_commit(
+                                state,
+                                &cand,
+                                (idx - start) as i32,
+                            );
+                            self.record_commit(
+                                &punct,
+                                0,
+                                -1,
+                                wind_store::stats::CommitSource::Punctuation,
+                            );
+                            return Self::commit_action(format!("{out}{punct}"), true);
+                        }
                         // 顶屏类出口：造词 / 6b 跟随 `input.top_commit_learn`。
                         let act = self.commit_temp_pinyin_selected_learn(
                             state,
@@ -1095,6 +1105,45 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// 临拼高亮停在分步候选时的顶屏（标点臂用）：上屏「已选段 + 该候选」，**丢弃剩余码**
+    /// 并退出临拼——与主路拼音标点顶屏同口径（那里顶屏后清缓冲）。返回要上屏的文本
+    /// （不含标点）。
+    ///
+    /// 记账同 `commit_temp_pinyin_selected`：词频归临拼目标方案、输入统计按临拼来源记一段。
+    /// 造词 / 6b 走 `learn_on_top_commit`：分步候选不造词、只推 6b（同 091b8f0f）。
+    fn temp_pinyin_partial_top_commit(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        candidate_pos: i32,
+    ) -> String {
+        let owner = self.overlay_engine_schema(state);
+        let code = Self::cand_code(&state.temp_pinyin_buffer, cand);
+        self.record_selection_cand_in(
+            owner.as_deref(),
+            &self.freq_code(&state.temp_pinyin_buffer, cand),
+            cand,
+        );
+        self.record_commit(
+            &cand.text,
+            code.len() as u32,
+            candidate_pos,
+            wind_store::stats::CommitSource::TempPinyin,
+        );
+        if let Some(owner) = owner.as_deref() {
+            let buf = state.temp_pinyin_buffer.clone();
+            self.learn_on_top_commit(state, cand, &buf, Some(owner));
+        }
+        // 变体候选末段用覆盖文本；普通候选整体转换（同 `commit_temp_pinyin_selected`）。
+        let out = match &cand.s2t_override {
+            Some(t) => format!("{}{}", self.maybe_convert(state, &state.committed_text), t),
+            None => self.maybe_convert(state, &format!("{}{}", state.committed_text, cand.text)),
+        };
+        self.exit_temp_pinyin(state);
+        self.notify_ui_hide();
+        out
     }
 
     /// 临拼无候选时按标点：与主路空码标点同一套语义（`input.punct_on_empty_behavior`，
