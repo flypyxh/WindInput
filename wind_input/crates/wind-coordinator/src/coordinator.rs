@@ -5424,6 +5424,9 @@ impl Coordinator {
         ch: char,
         has_comp: bool,
     ) -> KeyAction {
+        // 联想态：整个收掉（候选 + 编码栏标识 + 自动隐藏计时），不顶屏，只出该字符。
+        // `has_comp` 由调用方按「候选非空」算过，联想态下为真，下面照常收窗。
+        self.exit_assoc(state, crate::handle_assoc::AssocExit::TopCommitKey);
         // 顶屏的高亮候选造词 / 推 6b（见 `learn_on_top_commit`），须在 `take_committed` 清段前。
         // 联想态不顶屏，判据同下方（收在 `highlight_for_top_commit`）。
         if let Some((_, cand)) = self.highlight_for_top_commit(state) {

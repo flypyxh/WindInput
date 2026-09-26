@@ -45,6 +45,16 @@ impl Coordinator {
         s.candidates.iter().map(|c| c.text.clone()).collect()
     }
 
+    /// 当前 `state.preedit`（测试/诊断用）。联想态在非嵌入模式下往这里写「联想输入」
+    /// 标识，退出联想必须连它一起清掉——集成测试够不着 `state`，只能经这里断言。
+    pub fn debug_preedit(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .preedit
+            .clone()
+    }
+
     /// 推给 TSF 的 key_up 热键白名单（测试/诊断用）。
     ///
     /// 这正是 `push_activation_status` 发出去的那份，不是另算一遍——修饰键类绑定

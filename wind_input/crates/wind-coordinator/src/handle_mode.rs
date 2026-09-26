@@ -735,10 +735,17 @@ impl Coordinator {
             // 软键盘不是模式，没有「顶字进入」的区别——但既然本函数的语义是「先把已转换
             // 前缀和高亮候选上屏」，这里也要顶，否则开面板会把用户正在打的编码丢掉。
             BoundAction::SoftKeyboard(page) => {
+                let was_assoc = state.assoc_active();
                 let committed = self.take_committed_with_highlight(state);
                 let act = self.toggle_softkeyboard(page.as_deref());
                 Some(match committed {
                     Some(text) => self.commit_then_new_composition(text, String::new()),
+                    // 联想态：候选窗要自己收，宿主里的占位组合也要收——空文本上屏结束组合
+                    // （同 `softkeyboard_hotkey` 的「空文本也要走 InsertText」）。
+                    None if was_assoc => {
+                        self.notify_ui_hide();
+                        Self::commit_action(String::new(), state.chinese_mode)
+                    }
                     None => act,
                 })
             }

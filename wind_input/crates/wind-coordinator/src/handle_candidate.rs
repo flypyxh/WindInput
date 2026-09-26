@@ -4005,9 +4005,10 @@ impl Coordinator {
     /// 打了码、还没选词，按这个键意味着『就选高亮那条吧』」。联想态**没有码**——高亮那条是
     /// 输入法猜的，不是用户在选，此刻按引导键的意图就是进模式。
     ///
-    /// 不必显式 `exit_assoc`：联想候选就住在 `state.candidates` 里，进模式各 `enter_*` 都会
-    /// 清空候选，联想随之隐式退出（见 `handle_assoc` 模块文档）。
+    /// 联想态在这里**显式**收掉（`exit_assoc`）：进模式的各 `enter_*` 虽会清候选，但开软键盘
+    /// 这类不是模式的动作不清，联想候选就会挂着；清候选也清不掉编码栏标识与自动隐藏计时。
     pub(crate) fn take_committed_with_highlight(&self, state: &mut State) -> Option<String> {
+        self.exit_assoc(state, crate::handle_assoc::AssocExit::TopCommitKey);
         // 顶屏的高亮候选并进已转换段后造词 / 推 6b（见 `learn_on_top_commit`）。须在
         // `take_committed` 清段之前；主输入路归属活跃方案。
         let highlight = self.highlight_for_top_commit(state);

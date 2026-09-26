@@ -91,6 +91,9 @@ pub(crate) enum AssocExit {
     ModeActivate,
     /// 自动隐藏计时到期（`hide_after_ms`）。
     Timeout,
+    /// 顶屏类按键（标点 / 小键盘 / 非码元字符 / 进模式、开软键盘的引导键）。联想态不顶屏，
+    /// 只收掉联想再出该键——与空格选联想、Esc 取消后的状态一致（候选、标识、计时一并清）。
+    TopCommitKey,
 }
 
 /// 联想窗自动隐藏的单槽定时器。

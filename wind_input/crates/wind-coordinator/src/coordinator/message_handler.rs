@@ -713,7 +713,7 @@ impl MessageHandler for Coordinator {
         // ①再也看不到透传。
         //
         // ⚠️ 但**别把它当成一条有守门测试的不变式**：两者今天是互斥的（孤儿标记只由
-        // `fire_assoc_hide` 置位，而它置位前刚 `exit_assoc` 过 ⇒ 那一刻联想已不活跃；
+        // `fire_assoc_hide` 与联想态右括号跳出置位，两处置位前都刚 `exit_assoc` 过 ⇒ 那一刻联想已不活跃；
         // 再次进入联想必经上屏，上屏动作本身就是 `Fate::Absorbs`，会先把标记清掉），
         // 所以「两个都成立」的那一帧构造不出来，对调这两行测试也不会红。
         // 顺序按上面的理由定死，是为了万一将来有第三条路径把标记置在联想活跃期间。
@@ -1844,6 +1844,18 @@ impl MessageHandler for Coordinator {
                     }
                 }
                 if let Some(ch) = punct_char(data.key_code, shift) {
+                    // 联想态：先把联想**整个**收掉，再按空闲态出标点（联想不顶屏）。
+                    //
+                    // ★ 必须早于下面的智能符号：`hold_composition` 的 press1 在「无输入」时
+                    // 短路返回 `HoldComposition`，联想态恰是「缓冲空 + 候选非空」——收口若
+                    // 放在后面的清候选处，这条路根本走不到，联想候选留在 `candidates` 里，
+                    // 此后的光标上报被当成组合期间的上报锁住组合起点（现象：候选窗位置
+                    // 不再跟随光标）。普通出口虽清了候选，也漏清编码栏标识与自动隐藏计时。
+                    let was_assoc =
+                        self.exit_assoc(&mut state, crate::handle_assoc::AssocExit::TopCommitKey);
+                    if was_assoc {
+                        self.notify_ui_hide();
+                    }
                     // 快照 held_text：非参与集合的标点会在 try_smart_symbol_replace 中解除武装
                     // 并清空 held_text，须在此前保存，以便下方普通标点流程将旧符号纳入 CommitText。
                     // 加超时防护：若 arm.at 已超出 timeout，说明 C++ timer 已自然触发提交，
@@ -2093,7 +2105,10 @@ impl MessageHandler for Coordinator {
                         self.push_commit_history(&format!("{committed}{raw}"));
                         out.push_str(raw);
                     }
-                    let had_input = !state.input_buffer.is_empty()
+                    // 联想态计入「有输入」：宿主里挂着占位组合，这个标点须由服务端出、
+                    // 不能落下面 CapsLock 的透传（透传不碰组合，占位组合会悬着）。
+                    let had_input = was_assoc
+                        || !state.input_buffer.is_empty()
                         || !state.candidates.is_empty()
                         || !committed.is_empty();
                     state.input_buffer.clear();
@@ -2145,6 +2160,16 @@ impl MessageHandler for Coordinator {
                             // 同 handle_punct：多字符右段配不上单个标点按键，只能 Tab/Enter 跳出。
                             if tr.peek().is_some_and(|e| e.right_is_char(pch)) {
                                 tr.pop();
+                                // 联想态：宿主里还挂着占位组合，而 `MoveCursorRight` 不碰组合。
+                                // 跳出语义保留（不改成再上屏一个右括号——那是「））」），占位组合
+                                // 按超时孤儿那套两路收口（见 `fire_assoc_hide`）：主动 push 结束
+                                // 组合；push 没落地时，下一次透传键由 `adopt_orphaned_placeholder`
+                                // 收掉——跳出合成的那个 VK_RIGHT 若被宿主会话转发回来，正是那一键。
+                                if was_assoc {
+                                    self.assoc_placeholder_orphaned
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    self.push_end_composition();
+                                }
                                 return KeyAction::MoveCursorRight { count: 1 };
                             }
                             tr.clear();
