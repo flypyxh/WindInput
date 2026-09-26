@@ -2,7 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, State, numpad_char, punct_char};
+use crate::coordinator::{Coordinator, PunctEmptyCodePolicy, State, numpad_char, punct_char};
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
 use tracing::debug;
@@ -399,6 +399,8 @@ impl Coordinator {
         {
             return act;
         }
+        // 自动上屏也是一次选中：记账同选词出口（`record_special_selection`）。
+        self.record_special_selection(state, &cand);
         self.record_commit(
             &cand.text,
             state.special_buffer.len() as u32,
@@ -520,6 +522,33 @@ impl Coordinator {
         None
     }
 
+    /// 特殊模式各上屏出口（选词 / 标点顶屏 / 全码自动上屏）共用的记账：词频 + 上屏历史。
+    /// 输入统计（`record_commit`）由各出口自己记（码长、位次口径各不同）。
+    ///
+    /// 词频记账**归属特殊方案自身**（与主方案同层级，只是用特殊按键进入）。
+    /// 记账码用输入码：特殊方案是码表语义，`a`/`ab`/`abc` 是三个独立码位，
+    /// 与 `freq_code` 对 CodeTable 来源的口径一致。
+    ///
+    /// 生僻字模式不记词频（用户拍板）：模式是一次性的逃生口，用完不留痕，正常输入的
+    /// 候选顺序纹丝不动。⚠️ `record_commit`（统计）与上屏历史不在此列，它们是另外
+    /// 两条通路——一并跳过会让「重复上屏」取不到刚打出来的那个生僻字。
+    ///
+    /// 抽出来是因为三个出口此前只有选词这一处记了：标点顶屏与自动上屏只记统计，
+    /// 顶屏 / 自动上屏出去的字既不调频、`;` 也重复不出来。
+    fn record_special_selection(&self, state: &State, cand: &Candidate) {
+        if !matches!(state.active, Some(ModeKind::RareChar)) {
+            self.record_selection_in(
+                self.effective_data_schema(state).as_deref(),
+                &state.special_buffer,
+                &cand.text,
+                cand.source,
+            );
+        } else {
+            // 上屏历史是 `record_selection_in` 的一部分，跳过词频时须单独补上。
+            self.push_commit_history(&cand.text);
+        }
+    }
+
     /// 特殊模式选中某候选（全局下标 `gi`）：`$AA`/`$SS` 组折叠候选 → 补全编码到完整码重查展开（二级选择）；
     /// `$CC` 命令候选 → 执行动作（退出后异步跑，触发键码不上屏）；否则文本上屏。
     /// 统一空格 / 数字键 / 二三候选键的选中入口，保证组/命令候选选中行为一致。
@@ -544,26 +573,7 @@ impl Coordinator {
         {
             return act;
         }
-        // 词频记账**归属特殊方案自身**（与主方案同层级，只是用特殊按键进入）。
-        // 记账码用输入码：特殊方案是码表语义，`a`/`ab`/`abc` 是三个独立码位，
-        // 与 `freq_code` 对 CodeTable 来源的口径一致。
-        //
-        // 此前这里只有 record_commit（统计），完全不记词频——特殊模式的候选顺序
-        // 因此永远是词库原序，用户选过多少次都不会往前走。
-        // 生僻字模式不记词频（用户拍板）：模式是一次性的逃生口，用完不留痕，正常输入的
-        // 候选顺序纹丝不动。⚠️ `record_commit`（统计）与上屏历史不在此列，它们是另外
-        // 两条通路——一并跳过会让「重复上屏」取不到刚打出来的那个生僻字。
-        if !matches!(state.active, Some(ModeKind::RareChar)) {
-            self.record_selection_in(
-                self.effective_data_schema(state).as_deref(),
-                &code,
-                &cand.text,
-                cand.source,
-            );
-        } else {
-            // 上屏历史是 `record_selection_in` 的一部分，跳过词频时须单独补上。
-            self.push_commit_history(&cand.text);
-        }
+        self.record_special_selection(state, &cand);
         self.record_commit(
             &cand.text,
             state.special_buffer.len() as u32,
@@ -754,16 +764,50 @@ impl Coordinator {
                     {
                         return self.commit_special_candidate(state, idx);
                     }
-                    let committed = hi
-                        .map(|idx| state.candidates[idx].text.clone())
-                        .unwrap_or_default();
+                    let committed = match hi {
+                        Some(idx) => {
+                            // 顶屏也是一次选中：记账同选词出口（`record_special_selection`）。
+                            let cand = state.candidates[idx].clone();
+                            self.record_special_selection(state, &cand);
+                            self.record_commit(
+                                &cand.text,
+                                state.special_buffer.len() as u32,
+                                -1,
+                                wind_store::stats::CommitSource::SpecialMode,
+                            );
+                            cand.text
+                        }
+                        // 无候选：与主路空码标点同一判据（`punct_on_empty_behavior`）。字母引导符
+                        // 算码，理由同临拼（见 `temp_pinyin_punct_without_candidate`）。
+                        // 小键盘（direct）维持既有口径（同主路 `commit_highlight_then_char`）。
+                        None if punct_char(data.key_code, shift).is_none() => String::new(),
+                        None => {
+                            let guide = Self::guide_to_return(&state.special_prefix, "");
+                            let raw = format!("{guide}{}", state.special_buffer);
+                            match self.punct_empty_code_policy_for(state, &raw) {
+                                PunctEmptyCodePolicy::ClearNoInput => {
+                                    self.exit_special_mode(state);
+                                    self.notify_ui_hide();
+                                    return KeyAction::ClearComposition;
+                                }
+                                PunctEmptyCodePolicy::Clear => String::new(),
+                                PunctEmptyCodePolicy::Commit => {
+                                    if !raw.is_empty() {
+                                        self.record_commit(
+                                            &raw,
+                                            raw.len() as u32,
+                                            -1,
+                                            wind_store::stats::CommitSource::SpecialMode,
+                                        );
+                                        // 原码类上屏进上屏历史（不含标点，同主路）；原码不记词频。
+                                        self.push_commit_history(&raw);
+                                    }
+                                    raw
+                                }
+                            }
+                        }
+                    };
                     let punct = self.convert_punct_char(state, ch);
-                    self.record_commit(
-                        &committed,
-                        state.special_buffer.len() as u32,
-                        -1,
-                        wind_store::stats::CommitSource::SpecialMode,
-                    );
                     self.record_commit(&punct, 0, -1, wind_store::stats::CommitSource::Punctuation);
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
