@@ -314,10 +314,15 @@ fn temp_english_space_raw_commit_enters_history() {
     commit_then_repeat(&coord, VK_SPACE, "Helo");
 }
 
+/// 临英无候选按标点对齐英文方案主路、读 `punct_on_empty_behavior`（出厂 `clear` 丢原文），
+/// 故显式取 `commit` 档——同上方主路那两条。
 #[test]
 fn temp_english_punct_raw_commit_enters_history() {
     skip_without_data!();
-    let coord = open_with("wubi86", no_temp_english_candidates);
+    let coord = open_with("wubi86", |c| {
+        no_temp_english_candidates(c);
+        c.input.punct_on_empty_behavior = "commit".into();
+    });
     temp_english_helo(&coord);
     assert_no_candidates(&coord);
     match coord.handle_key_event(&key(VK_COMMA, 0)) {

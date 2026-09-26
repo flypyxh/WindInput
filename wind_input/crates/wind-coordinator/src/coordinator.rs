@@ -2746,8 +2746,18 @@ impl Coordinator {
     /// `CommitAndHoldComposition`），第三态加进来时，bool 判据的漏接会静默落进 else 分支，
     /// 而 `match` 的漏接是编译错误。参见 [`Self::enter_clears_composition`] 的同款教训。
     pub(crate) fn punct_empty_code_policy(&self, state: &State) -> PunctEmptyCodePolicy {
+        self.punct_empty_code_policy_for(state, &state.input_buffer)
+    }
+
+    /// 同 [`Self::punct_empty_code_policy`]，但「编码」取调用方给的缓冲——独占模式
+    /// （临拼 / 快捷输入 / 临英）的码不在 `input_buffer` 里。判据与值域只此一份。
+    pub(crate) fn punct_empty_code_policy_for(
+        &self,
+        state: &State,
+        buffer: &str,
+    ) -> PunctEmptyCodePolicy {
         // 有候选 / 没编码 ⇒ 不是空码，本开关不管。
-        if !state.candidates.is_empty() || state.input_buffer.is_empty() {
+        if !state.candidates.is_empty() || buffer.is_empty() {
             return PunctEmptyCodePolicy::Commit;
         }
         match self.rt().config.input.punct_on_empty_behavior.as_str() {

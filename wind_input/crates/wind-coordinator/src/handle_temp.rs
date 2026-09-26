@@ -4,8 +4,8 @@
 //! 触发键判定、进入/退出、候选刷新、按键处理、选词上屏。
 
 use crate::coordinator::{
-    CommittedSeg, Coordinator, ENGINE_MAX_CANDIDATES, State, TEMP_PINYIN_MAX_CANDIDATES,
-    numpad_char, punct_char,
+    CommittedSeg, Coordinator, ENGINE_MAX_CANDIDATES, PunctEmptyCodePolicy, State,
+    TEMP_PINYIN_MAX_CANDIDATES, numpad_char, punct_char,
 };
 use crate::key_convert::printable_char;
 use crate::pipeline::{ModeKind, Rewind, RewindOrigin};
@@ -1053,6 +1053,41 @@ impl Coordinator {
                     // `input.top_commit_learn`——这里不是「顶掉高亮再接着输出一个字符」，
                     // 那个键被吞掉了，语义就是选中高亮候选，与空格选词同一口径。
                     self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
+                } else if data.modifiers & MOD_SHIFT == 0
+                    && self.select_key_offset(data.key_code).is_some()
+                {
+                    // 二三候选键越界（一条候选都没有）：同主路 `handle_overflow_select_key` 的
+                    // 无候选分支，按 `keys.overflow.select_key` 处置——`ignore`（出厂）吞键、
+                    // 组合留着继续打；`commit` 丢码退出；`commit_and_input` 丢码并出该键字符。
+                    // 此前一律退出清空，已选段与剩余码无声丢掉。
+                    let key_char = punct_char(data.key_code, false);
+                    match self.rt().config.keys.overflow.select_key.as_str() {
+                        "commit" => {
+                            self.exit_temp_pinyin(state);
+                            self.notify_ui_hide();
+                            KeyAction::ClearComposition
+                        }
+                        "commit_and_input" => {
+                            let piece = key_char
+                                .map(|c| self.convert_punct(state, c, data.prev_char))
+                                .unwrap_or_default();
+                            self.exit_temp_pinyin(state);
+                            self.notify_ui_hide();
+                            if !piece.is_empty() {
+                                self.record_commit(
+                                    &piece,
+                                    0,
+                                    -1,
+                                    wind_store::stats::CommitSource::Punctuation,
+                                );
+                            }
+                            Self::commit_action(piece, true)
+                        }
+                        _ => KeyAction::Consumed,
+                    }
+                } else if let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+                {
+                    self.temp_pinyin_punct_without_candidate(state, ch)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -1060,6 +1095,51 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// 临拼无候选时按标点：与主路空码标点同一套语义（`input.punct_on_empty_behavior`，
+    /// 判据 `punct_empty_code_policy_for`）。`commit` 上屏「引导字母 + 已选段 + 剩余原码」
+    /// 再接标点（原码记统计与上屏历史，同空格 / 回车臂）；`clear` 全丢只出标点；
+    /// `clear_no_input` 连标点也不出。无论哪档都退出临拼。
+    ///
+    /// 此前这里一律 `ClearComposition`：已选段、剩余码、标点三样全丢。
+    fn temp_pinyin_punct_without_candidate(&self, state: &mut State, ch: char) -> KeyAction {
+        // 字母引导符（z 进模式）算码：它是用户真实打出的击键，与 `guide_to_return` 同一判据。
+        // 不算的话，z 进模式后空缓冲按标点会被判「非空码」照上屏 z，clear 档丢不掉它。
+        let guide = Self::guide_to_return(&state.temp_pinyin_prefix, &state.committed_text);
+        let code = format!("{guide}{}", state.temp_pinyin_buffer);
+        let head = match self.punct_empty_code_policy_for(state, &code) {
+            PunctEmptyCodePolicy::ClearNoInput => {
+                self.exit_temp_pinyin(state);
+                self.notify_ui_hide();
+                return KeyAction::ClearComposition;
+            }
+            PunctEmptyCodePolicy::Clear => String::new(),
+            PunctEmptyCodePolicy::Commit => {
+                // committed 段已在各次选词记过，此处只记本次实际上屏的原码避免重复。
+                let raw = format!("{}{}", guide, state.temp_pinyin_buffer);
+                let raw_text = format!(
+                    "{}{}{}",
+                    guide, state.committed_text, state.temp_pinyin_buffer
+                );
+                if !raw.is_empty() {
+                    self.record_commit(
+                        &raw,
+                        raw.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::TempPinyin,
+                    );
+                    // 原码类上屏进上屏历史（转换前形态、不含标点，同主路）；原码不记词频。
+                    self.push_commit_history(&raw_text);
+                }
+                self.maybe_convert(state, &raw_text)
+            }
+        };
+        let punct = self.convert_punct_char(state, ch);
+        self.record_commit(&punct, 0, -1, wind_store::stats::CommitSource::Punctuation);
+        self.exit_temp_pinyin(state);
+        self.notify_ui_hide();
+        Self::commit_action(format!("{head}{punct}"), true)
     }
 
     /// 退出临时英文模式并清空状态
@@ -1680,9 +1760,20 @@ impl Coordinator {
                         self.record_temp_english_selection(state, &cand);
                         cand.text
                     } else {
-                        // 无候选顶掉原文：原码类上屏也进上屏历史（转换前形态、不含标点）。
-                        self.push_commit_history(&state.temp_english_buffer);
-                        state.temp_english_buffer.clone()
+                        // 无候选：与英文方案主路空码标点同一判据（`punct_on_empty_behavior`）。
+                        match self.punct_empty_code_policy_for(state, &state.temp_english_buffer) {
+                            PunctEmptyCodePolicy::ClearNoInput => {
+                                self.exit_temp_english(state);
+                                self.notify_ui_hide();
+                                return KeyAction::ClearComposition;
+                            }
+                            PunctEmptyCodePolicy::Clear => String::new(),
+                            PunctEmptyCodePolicy::Commit => {
+                                // 顶掉原文：原码类上屏也进上屏历史（转换前形态、不含标点）。
+                                self.push_commit_history(&state.temp_english_buffer);
+                                state.temp_english_buffer.clone()
+                            }
+                        }
                     };
                     let base = if state.full_width {
                         to_full_width(&base)
@@ -1690,7 +1781,14 @@ impl Coordinator {
                         base
                     };
                     let punct = self.convert_punct_char(state, ch);
-                    self.record_commit(&base, 0, -1, wind_store::stats::CommitSource::TempEnglish);
+                    if !base.is_empty() {
+                        self.record_commit(
+                            &base,
+                            0,
+                            -1,
+                            wind_store::stats::CommitSource::TempEnglish,
+                        );
+                    }
                     self.record_commit(&punct, 0, -1, wind_store::stats::CommitSource::Punctuation);
                     self.exit_temp_english(state);
                     self.notify_ui_hide();

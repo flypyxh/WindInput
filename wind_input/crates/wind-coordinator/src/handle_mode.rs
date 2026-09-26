@@ -4,7 +4,8 @@
 //! 简繁、方案切换、主题切换、mix 融合模式、引擎方案叠加。
 
 use crate::coordinator::{
-    CommittedSeg, Coordinator, SchemaToggleOrigin, State, SwitchCommit, ToggleLanding,
+    CommittedSeg, Coordinator, PunctEmptyCodePolicy, SchemaToggleOrigin, State, SwitchCommit,
+    ToggleLanding,
 };
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
@@ -2900,6 +2901,7 @@ impl Coordinator {
                 // 小键盘键（direct 语义）回退 numpad_char 复用此路——仅**文本透镜**会走到这里，
                 // 数字透镜的小键盘早在 ① mix_numeric_input_char 作表达式字符入缓冲。
                 // follow_main 时键已在入口归一化为主键盘键。
+                let punct_key = punct_char(data.key_code, shift).is_some();
                 if let Some(ch) =
                     punct_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
                 {
@@ -2971,7 +2973,48 @@ impl Coordinator {
                             None => self
                                 .maybe_convert(state, &format!("{}{}", state.committed_text, text)),
                         }
+                    } else if punct_key {
+                        // 无高亮候选按标点：与主路空码标点同一判据（`punct_on_empty_behavior`）。
+                        // `commit` 上屏「引导字母 + 已选段 + 剩余原码」（同空格 / 回车臂）；`clear`
+                        // 连已选段一起丢、只出标点；`clear_no_input` 连标点也不出。此前这里只
+                        // 上屏已选段，剩余原码与字母引导符静默丢掉，且不读该开关。
+                        // 字母引导符（z 进模式）算码，理由同临拼
+                        // （见 `temp_pinyin_punct_without_candidate`）。
+                        let guide = Self::guide_to_return(&state.mix_prefix, &state.committed_text);
+                        let code = format!("{guide}{}", state.mix_buffer);
+                        match self.punct_empty_code_policy_for(state, &code) {
+                            PunctEmptyCodePolicy::ClearNoInput => {
+                                return commit_text(self, state, String::new());
+                            }
+                            PunctEmptyCodePolicy::Clear => String::new(),
+                            PunctEmptyCodePolicy::Commit => {
+                                // committed 段已在各次选词记过，此处只记本次实际上屏的原码。
+                                let raw = format!("{}{}", guide, state.mix_buffer);
+                                let raw_text = format!(
+                                    "{}{}{}",
+                                    guide, state.committed_text, state.mix_buffer
+                                );
+                                if !raw.is_empty() {
+                                    self.record_commit(
+                                        &raw,
+                                        raw.len() as u32,
+                                        -1,
+                                        wind_store::stats::CommitSource::Mix,
+                                    );
+                                    // 原码类上屏进上屏历史（转换前形态、不含标点）；不记词频。
+                                    self.push_commit_history(&raw_text);
+                                }
+                                let out = self.maybe_convert(state, &raw_text);
+                                // 含英文成员的实例对齐临英（A2-3b）：全角态转全角；顶屏不补空格。
+                                if !raw.is_empty() && self.mix_raw_counts_as_english(state) {
+                                    Self::mix_english_width(state, &out)
+                                } else {
+                                    out
+                                }
+                            }
+                        }
                     } else {
+                        // 小键盘（direct）无高亮候选：维持既有口径（同主路 `commit_highlight_then_char`）。
                         self.maybe_convert(state, &state.committed_text.clone())
                     };
                     let punct = self.convert_punct_char(state, ch);
