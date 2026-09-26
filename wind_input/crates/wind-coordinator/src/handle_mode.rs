@@ -2367,20 +2367,17 @@ impl Coordinator {
                         &state.mix_buffer,
                         &member_cands,
                     );
-                    let mut heads = crate::english_candidates::english_head_candidates(
+                    let heads = crate::english_candidates::english_head_candidates(
                         &state.mix_buffer,
                         want_raw,
                         want_variants,
                     );
-                    if !heads.is_empty() {
-                        // 精确去重（不是小写去重）：头部的 `Vim` 吃掉词库里的 `Vim`，但 `hello`
-                        // 不该把词库里的 `Hello` 一起抹掉。与 `InDict` 判据同按字面，同进同退。
-                        let texts: std::collections::HashSet<&str> =
-                            heads.iter().map(|c| c.text.as_str()).collect();
-                        member_cands.retain(|c| !texts.contains(c.text.as_str()));
-                        heads.append(&mut member_cands);
-                        member_cands = heads;
-                    }
+                    // 与词库同名的头部格由词库词占据（保留来源 / 编码 / 释义），其余同名项被
+                    // 头部吃掉；与 `InDict` 判据同按字面，同进同退（见 `merge_head_with_dict`）。
+                    member_cands = crate::english_candidates::merge_head_with_dict(
+                        heads,
+                        std::mem::take(&mut member_cands),
+                    );
                 }
                 member_cands.truncate(MIX_MEMBER_QUOTA);
                 for c in member_cands {

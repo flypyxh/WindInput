@@ -37,8 +37,8 @@ use wind_config::config::RawCandidateMode;
 ///
 /// 判据用字面相等（`==`），**不是** `eq_ignore_ascii_case`、**也不是** `is_exact_code`，
 /// 理由见 [`RawCandidateMode`] 的类型文档（`he'll` 的 code 同为 `hell`；`usa` 的字面不在
-/// 词库里）。口径与紧邻调用点的**精确去重**一致，两处必须同进同退：去重按字面吃掉词库
-/// 同名候选，判据也按字面认定「同名候选存在」。
+/// 词库里）。口径与紧邻调用点的 [`merge_head_with_dict`] 一致，两处必须同进同退：那里按字面
+/// 让词库同名词占据头部格，判据也按字面认定「同名候选存在」。
 ///
 /// ★ **必须先按 `source` 收到英文词库来源上**，只比 `text` 会被短语误判。主输入路传进来的
 /// 是**整张候选表**，走到这里时短语/命令/组候选已经并进去了（`finalize_candidates` 还把
@@ -142,6 +142,45 @@ pub(crate) fn english_head_candidates(
             });
         }
     }
+    out
+}
+
+/// 头部候选并入词库段（英文方案主路 / 临英 / 快捷输入英文成员三路共用）：返回
+/// `头部段 ++ 剩余词库段`。
+///
+/// 头部某条与**英文词库**候选字面相同时，由那条词库候选**占据头部那一格**（保留来源 /
+/// 编码 / 释义等属性），不再另出一条无来源的头部候选。位置语义不变：头部仍钉在词库段
+/// 之前、不受调频（词库段的重排早已算完，这里只是把同名那条挪到头部那一格）。
+///
+/// 此前是精确去重：词库同名词被头部**吃掉**，那一格只剩一条无来源、无码、无释义的原文。
+///
+/// 只认 `source == English`：短语 / 命令等同名项不是「这个词」本身（命令的文本是显示标签，
+/// 顶到头部会把「上屏原文」变成「执行动作」），照旧被头部吃掉——与 [`wants_raw_candidate`]
+/// 的 `InDict` 判据同一口径（只认英文词库来源、按字面）。
+///
+/// 记账不受影响：占位后它就是一条普通词库候选，按词库来源记词频；没被占位的头部候选
+/// 仍经 `english_head_dict_word` 找回词库词记账（dc03ba4c）。
+pub(crate) fn merge_head_with_dict(
+    head: Vec<Candidate>,
+    mut dict: Vec<Candidate>,
+) -> Vec<Candidate> {
+    if head.is_empty() {
+        return dict;
+    }
+    let mut out = Vec::with_capacity(head.len() + dict.len());
+    for h in head {
+        match dict
+            .iter()
+            .position(|c| c.source == CandidateSource::English && c.text == h.text)
+        {
+            Some(i) => out.push(dict.remove(i)),
+            None => out.push(h),
+        }
+    }
+    // 精确去重（不是小写去重）：`hello` 不该把词库里的 `Hello` 一起抹掉。
+    let texts: std::collections::HashSet<String> = out.iter().map(|c| c.text.clone()).collect();
+    dict.retain(|c| !texts.contains(&c.text));
+    out.append(&mut dict);
     out
 }
 
@@ -579,6 +618,35 @@ mod tests {
             .collect();
         dedup_by_text(&mut v);
         assert_eq!(texts(&v), vec!["Hi", "hi", "HI"]);
+    }
+
+    /// 头部格由同名**英文词库**候选占据；同名短语不算（照旧被头部吃掉），其余词库段保序。
+    #[test]
+    fn merge_head_keeps_dict_word_in_head_slot() {
+        let mut word = dict_cand("hello");
+        word.code = "hello".into();
+        word.comment = "释义".into();
+        let head = english_head_candidates("hello", true, true);
+        let dict = vec![
+            dict_cand("help"),
+            phrase_cand("HELLO"),
+            word,
+            dict_cand("Hello"),
+        ];
+        let merged = merge_head_with_dict(head, dict);
+        assert_eq!(texts(&merged), vec!["hello", "Hello", "HELLO", "help"]);
+        assert_eq!(
+            merged[0].source,
+            CandidateSource::English,
+            "原文那一格是词库词"
+        );
+        assert_eq!(merged[0].comment, "释义", "词库词的属性保留");
+        assert_eq!(merged[1].source, CandidateSource::English, "变形格同理");
+        assert_eq!(
+            merged[2].source,
+            CandidateSource::None,
+            "同名短语不占格：头部变形照旧，短语被吃掉"
+        );
     }
 
     /// 无字母的输入三形态相同，变形为空——只剩原文。

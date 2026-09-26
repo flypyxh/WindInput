@@ -537,9 +537,10 @@ impl Coordinator {
     /// 顶屏 / 自动上屏出去的字既不调频、`;` 也重复不出来。
     fn record_special_selection(&self, state: &State, cand: &Candidate) {
         if !matches!(state.active, Some(ModeKind::RareChar)) {
+            let code = state.special_buffer.clone();
             self.record_selection_in(
                 self.effective_data_schema(state).as_deref(),
-                &state.special_buffer,
+                &code,
                 &cand.text,
                 cand.source,
             );

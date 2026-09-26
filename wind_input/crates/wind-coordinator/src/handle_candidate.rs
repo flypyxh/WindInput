@@ -1684,14 +1684,12 @@ impl Coordinator {
             let head =
                 crate::english_candidates::english_head_candidates(raw, want_raw, want_variants);
             if !head.is_empty() {
-                // 精确去重：词库里字面相同的那条被头部候选吃掉（同临英）。**不是**小写去重
-                // ——`hello` 不该把词库里的 `Hello` 一起抹掉。
-                let heads: std::collections::HashSet<&str> =
-                    head.iter().map(|c| c.text.as_str()).collect();
-                candidates.retain(|c| !heads.contains(c.text.as_str()));
-                let mut merged = head;
-                merged.append(&mut candidates);
-                candidates = merged;
+                // 与词库同名的头部格由词库词占据（保留来源 / 编码 / 释义），其余同名项被头部
+                // 吃掉（同临英 / 快捷输入，见 `merge_head_with_dict`）。
+                candidates = crate::english_candidates::merge_head_with_dict(
+                    head,
+                    std::mem::take(&mut candidates),
+                );
             }
             // 档位（CapsLock 循环）作用于整列，含头部候选——用户按出「全大写」时列表里
             // 不该还留着小写的变形候选。档位非默认时投影不再参与（用户已显式指定形态）。
@@ -3688,7 +3686,7 @@ impl Coordinator {
         if cand.actions.is_empty() {
             let ch = runes[char_index].to_string();
             match Self::select_char_freq_code(&cand, runes.len(), char_index) {
-                Some(code) => self.record_selection(&code, &ch, cand.source),
+                Some(freq_code) => self.record_selection(&freq_code, &ch, cand.source),
                 None => self.push_commit_history(&ch),
             }
         }

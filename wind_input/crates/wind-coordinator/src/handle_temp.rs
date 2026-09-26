@@ -1353,33 +1353,29 @@ impl Coordinator {
         // 变形跟着原文走（同主输入路）。临英出厂 `case_variants = true`，不管的话
         // `ip'pro` 会先出 `Ip'pro` / `ip'pro` / `IP'PRO` 三条才轮到词组。
         let want_variants = want_variants && (!phrase_active || want_raw);
-        let mut cands =
+        let head =
             crate::english_candidates::english_head_candidates(&buf, want_raw, want_variants);
-        if !cands.is_empty() {
-            let heads: std::collections::HashSet<&str> =
-                cands.iter().map(|c| c.text.as_str()).collect();
-            dict_part.retain(|c| !heads.contains(c.text.as_str()));
-        }
-        // 头部占 `0..h`，词库段整体后移 h 位。对每条加同一个偏移不动相对序。
+        // 与词库同名的头部格由词库词占据（保留来源 / 编码 / 释义），见 `merge_head_with_dict`。
+        // 头部占 `0..h`（含被词库同名词占据的那几格，它们的号改写成头部位次），其余词库段
+        // 整体后移 h 位；对每条加同一个偏移不动相对序。
         //
-        // ⚠️ 号**可能有空洞**，与拆分前并非逐值相同：那时被头部文本吃掉的那条词库候选在入列
-        // 阶段就被挡下、不占号，现在它要到上面 `retain` 才被移除、号已经发出去了。
-        // `natural_order` 只作为 `better()` / `by_natural()` 的**相对**比较键，且本路径在此
-        // 之后不再排序（`finalize_candidates` 不排），故无可观察差异——但别据此在别处依赖
-        // 它的**绝对值**。
+        // ⚠️ 词库段的号**可能有空洞**：占到头部格的词库候选原有的号空出来了。`natural_order`
+        // 只作为 `better()` / `by_natural()` 的**相对**比较键，且本路径在此之后不再排序
+        // （`finalize_candidates` 不排），故无可观察差异——但别据此在别处依赖它的**绝对值**。
         //
-        // ⚠️ 同源的另一处顺序变化：`apply_shadow_in` 现在看到的表里**还留着**那条将被头部
-        // 吃掉的候选（它用的是绝对下标 `position.min(len)`），于是「把某词置顶到第 2 位」
-        // 在原文命中时会落到第 1 位。这是**向主输入路对齐**（那边一直是 shadow 在前、
-        // 去重在后），不是缺陷；记在这里是因为「置顶位置差一位」这种现象不写下来会查很久。
-        let head_len = cands.len() as i32;
+        // ⚠️ `apply_shadow_in` 看到的表里**还留着**之后会移到头部格的那条同名候选（它用的是
+        // 绝对下标 `position.min(len)`），于是「把某词置顶到第 2 位」在原文命中时会落到第 1 位。
+        // 这是**向主输入路对齐**（那边同样是 shadow 在前、并头部在后），不是缺陷；记在这里是
+        // 因为「置顶位置差一位」这种现象不写下来会查很久。
+        let head_len = head.len();
+        let mut cands = crate::english_candidates::merge_head_with_dict(head, dict_part);
         for (i, c) in cands.iter_mut().enumerate() {
-            c.natural_order = i as i32;
+            if i < head_len {
+                c.natural_order = i as i32;
+            } else {
+                c.natural_order += head_len as i32;
+            }
         }
-        for c in dict_part.iter_mut() {
-            c.natural_order += head_len;
-        }
-        cands.append(&mut dict_part);
         // 档位（CapsLock 循环）作用于**整列**，含头部候选：用户按出「全大写」时，列表里
         // 不该还留着小写的变形候选。档位非默认时不再跑投影——用户已显式指定形态。
         if state.english_case_variant != crate::english_candidates::CaseVariant::Default {
