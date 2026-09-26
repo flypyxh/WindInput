@@ -3681,12 +3681,16 @@ impl Coordinator {
         if char_index >= runes.len() {
             return None;
         }
-        // 词频学习：以词定字应记实际选的「单字」（非整词），否则造词策略会误判为多字词；
-        // 仅普通候选（无副作用命令 Action）才学（对齐 Go len(cand.Actions)==0）。
+        // 词频学习：以词定字记实际选的「单字」（非整词），且按**这个字自己的编码**记——
+        // 拿整词码记单字（`nihao` + 「好」）是读端永远查不中的孤儿行。取不到可靠编码时
+        // 只记上屏历史（见 `select_char_freq_code`）。仅普通候选（无副作用命令 Action）
+        // 才学（对齐 Go len(cand.Actions)==0）。
         if cand.actions.is_empty() {
-            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let freq_code = self.freq_code(&state.input_buffer, &cand);
-            self.record_selection(&freq_code, &runes[char_index].to_string(), cand.source);
+            let ch = runes[char_index].to_string();
+            match Self::select_char_freq_code(&cand, runes.len(), char_index) {
+                Some(code) => self.record_selection(&code, &ch, cand.source),
+                None => self.push_commit_history(&ch),
+            }
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
         let combined = format!("{}{}", state.committed_text, runes[char_index]);
@@ -3695,6 +3699,31 @@ impl Coordinator {
         self.reset_pinyin_composition(state);
         self.notify_ui_hide();
         Some(Self::commit_action(out, chinese))
+    }
+
+    /// 以词定字选出的第 `char_index` 个字（词共 `char_count` 字）**自己的**词频记账码；
+    /// `None` = 拿不到可靠编码，只记历史不记词频。
+    ///
+    /// - **拼音**：候选码是整词全拼，按词典真值音节边界（`boundary`）切开，音节数与字数
+    ///   相等时取对应位置的音节——正是用户单打这个字时的码（`hao` + 「好」），读端查得中。
+    ///   无边界（旧数据 / 造词）或音节数对不上（儿化等）⇒ `None`，不猜切分。
+    /// - **码表**：词频按输入码位记（码位独立）。这个字在用户打的码位下不是候选，按整词码
+    ///   记是孤儿行；换成它自己的全码也不可靠——单字多半用简码打，全码那一行同样读不到。
+    ///   ⇒ `None`。
+    /// - 英文 / 短语 / 无来源：单字没有独立码位 ⇒ `None`。
+    pub(crate) fn select_char_freq_code(
+        cand: &Candidate,
+        char_count: usize,
+        char_index: usize,
+    ) -> Option<String> {
+        if cand.source != CandidateSource::Pinyin || cand.code.is_empty() {
+            return None;
+        }
+        let syllables =
+            wind_engine::pinyin::mixed_abbrev::syllables_from_boundary(&cand.code, cand.boundary)?;
+        (syllables.len() == char_count)
+            .then(|| syllables.get(char_index).map(|s| s.to_string()))
+            .flatten()
     }
 
     /// 以词定字的完整流程，含 overflow 策略（对齐 Go handleSelectCharWithOverflow）。
@@ -7250,5 +7279,61 @@ mod mouse_command_overlay_tests {
         assert_eq!(st.active, None);
         assert!(st.mix_buffer.is_empty());
         assert!(st.mix_prefix.is_empty(), "快捷输入前缀不得残留");
+    }
+}
+
+#[cfg(test)]
+mod select_char_freq_code_tests {
+    use super::*;
+
+    fn py(code: &str, boundary: u64) -> Candidate {
+        Candidate {
+            text: "你好".into(),
+            code: code.into(),
+            boundary,
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        }
+    }
+
+    /// ni|hao：bit0 + bit2。
+    const NI_HAO: u64 = 0b101;
+
+    #[test]
+    fn picks_syllable_by_boundary() {
+        let c = py("nihao", NI_HAO);
+        assert_eq!(
+            Coordinator::select_char_freq_code(&c, 2, 0).as_deref(),
+            Some("ni")
+        );
+        assert_eq!(
+            Coordinator::select_char_freq_code(&c, 2, 1).as_deref(),
+            Some("hao")
+        );
+    }
+
+    /// 音节数与字数对不上（儿化等）/ 没有边界 / 非拼音来源：拿不到可靠编码，不记词频。
+    #[test]
+    fn unreliable_code_yields_none() {
+        let c = py("nihao", NI_HAO);
+        assert_eq!(
+            Coordinator::select_char_freq_code(&c, 3, 1),
+            None,
+            "音节数 ≠ 字数"
+        );
+        assert_eq!(
+            Coordinator::select_char_freq_code(&py("nihao", 0), 2, 1),
+            None,
+            "无边界不猜切分"
+        );
+        let ct = Candidate {
+            source: CandidateSource::CodeTable,
+            ..py("wqvb", 0b1)
+        };
+        assert_eq!(
+            Coordinator::select_char_freq_code(&ct, 2, 1),
+            None,
+            "码表不记"
+        );
     }
 }
