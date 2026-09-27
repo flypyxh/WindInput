@@ -822,21 +822,42 @@ Remove-ItemProperty -Path '$k' -Name InstallerRunningOwner -EA SilentlyContinue;
     fi
 }
 
+# 开闸 + 装 trap：推送途中 Ctrl+C / kill / 断线也要关闸，否则 InstallerRunning=1 残留，
+# 靶机上 DLL 最多 10 分钟不自行拉起服务（表现为「部署完却打不出字」）。
+# 做法同 rbuild_trap_on：信号里先收尾，再恢复原 trap 并把同一信号重发给自己，
+# 这样退出状态仍是「被信号中断」。正常结束由 deploy_guard_close 关闸并恢复原 trap。
+deploy_guard_open() {
+    local profile="$1" sig
+    DEPLOY_GUARD_SAVED_TRAPS="$(trap -p INT TERM HUP)"
+    remote_deploy_guard "$profile" on
+    for sig in INT TERM HUP; do
+        # shellcheck disable=SC2064  # profile 与 sig 要在装 trap 时展开
+        trap "remote_deploy_guard '$profile' off; trap - INT TERM HUP; eval \"\$DEPLOY_GUARD_SAVED_TRAPS\"; kill -$sig \$\$" "$sig"
+    done
+}
+deploy_guard_close() {
+    remote_deploy_guard "$1" off
+    trap - INT TERM HUP
+    eval "$DEPLOY_GUARD_SAVED_TRAPS"
+}
+
 # 启动远端主进程，并校验跑起来的**确实是刚推上去的那份 exe**。
 # 注意：经 SSH 直接 Start-Process 的子进程会随 SSH 断开被 Job Object 连带杀掉
 # （症状：部署后看不到进程）。改用计划任务(schtasks)在用户交互会话拉起，脱离 SSH 生命周期。
 #
-# ★ 判据是「运行中进程映像文件的 MD5 == 本地产物 MD5」，不是「有个叫 wind_input*.exe 的进程」：
-#   后者在推送途中被拉起的旧进程（映像已被改名成 .old_*）面前恒真，见 remote_deploy_guard。
+# ★ 判据是「运行中进程映像 = 安装目录里那份 exe」（MD5 相同且映像路径不是 .old_*），
+#   不是「有个叫 wind_input*.exe 的进程」：后者在推送途中被拉起的旧进程（映像已被改名成
+#   .old_*）面前恒真，见 remote_deploy_guard。
+#   期望值取**远端**安装目录里的 exe，不取本地产物：只推 tsf（pm1/pdm1）时远端 exe 本就
+#   不是本地这份，拿本地比会把好好的进程当旧版本杀掉；全量/core 推送后远端那份即新文件。
 #   不一致就把该变体进程全停掉再起，最多 3 轮，仍不一致返回 1。
+#   映像路径读不到（权限不足时 Path 为 null）的进程无从比对，单独报出、不当版本不符去杀。
 remote_start_main() {
     local profile="$1" sfx=""; [ "$profile" = dev ] && sfx="_dev"
     local name="wind_input${sfx}" exe="$REMOTE_DIR/wind_input${sfx}.exe"
-    local local_exe; local_exe="$(out_for "$profile")/$name.exe"
-    local want; want="$(md5sum "$local_exe" 2>/dev/null | awk '{print toupper($1)}')"
-    local build; build="$(strings -n 8 "$local_exe" 2>/dev/null | grep -oE '\(build [^ )]+' | head -1 | cut -c8-)"
-    [ -n "$want" ] || { err "本地无 $local_exe，无法校验远端版本"; return 1; }
-    local try out
+    local want; want="$(remote_ps "(Get-FileHash -Algorithm MD5 -LiteralPath '$exe' -EA Stop).Hash" 2>/dev/null | tr -d '\r' | tail -1)"
+    [[ "$want" =~ ^[0-9A-F]{32}$ ]] || { err "读不到远端 $exe 的 MD5，无法校验运行中的版本"; return 1; }
+    local try out known
     for try in 1 2 3; do
         say "启动远端主进程 $name.exe (计划任务,脱离 SSH 会话；第 $try 轮)..."
         remote_ps "\$ErrorActionPreference='SilentlyContinue'; \
@@ -850,9 +871,15 @@ Unregister-ScheduledTask -TaskName 'WindInputDeployBoot' -Confirm:\$false" >/dev
         out="$(remote_ps "Get-Process -Name '$name' -EA SilentlyContinue | ForEach-Object { \
 \$h=''; try { \$h=(Get-FileHash -Algorithm MD5 -LiteralPath \$_.Path -EA Stop).Hash } catch {}; \
 '{0}|{1}|{2}' -f \$_.Id, \$h, \$_.Path }" 2>/dev/null | tr -d '\r')"
-        if printf '%s\n' "$out" | grep -q "^[0-9]*|$want|"; then
-            say "新版本主进程已启动并存活（映像 MD5 = 本地产物 ${want:0:8}…，build ${build:-?}）。"
+        if printf '%s\n' "$out" | grep -v '\.old_' | grep -q "^[0-9]*|$want|."; then
+            say "新版本主进程已启动并存活（映像 = 安装目录 exe，MD5 ${want:0:8}…）。"
             return 0
+        fi
+        known="$(printf '%s\n' "$out" | grep -v '^[0-9]*||$' | grep -v '^$')"
+        if [ -n "$out" ] && [ -z "$known" ]; then
+            err "  无法读取 $name 的映像路径（Path 为空，多半是 SSH 会话权限不足），无从判断是否新版本:"
+            printf '%s\n' "$out" | sed 's/^/    /'
+            return 1
         fi
         if [ -n "$out" ]; then
             warn "  运行中的 $name 不是刚推上去的版本（占着单例，新进程起不来）:"
@@ -863,7 +890,7 @@ Unregister-ScheduledTask -TaskName 'WindInputDeployBoot' -Confirm:\$false" >/dev
         ssh "$WIND_REMOTE" "taskkill /F /IM $name.exe" >/dev/null 2>&1 || true
         sleep 1
     done
-    err "3 轮后远端运行的仍不是本地产物（期望 MD5 $want，build ${build:-?}）—— 部署未生效，别按新版本测。"
+    err "3 轮后远端运行的仍不是安装目录里那份 exe（期望 MD5 $want）—— 部署未生效，别按新版本测。"
     return 1
 }
 
@@ -921,10 +948,10 @@ do_push_full() {
     resolve_remote_dir "$profile" || return 1
     local outdir; outdir="$(out_for "$profile")"
     [ -d "$outdir" ] || { err "无 $outdir；请先 '$([ "$profile" = dev ] && echo d1 || echo 1)' 全构建。"; return 1; }
-    remote_deploy_guard "$profile" on
+    deploy_guard_open "$profile"
     _push_full_body "$profile" "$outdir"
     local rc=$?
-    remote_deploy_guard "$profile" off
+    deploy_guard_close "$profile"
     return $rc
 }
 
@@ -976,10 +1003,10 @@ do_push_module() {
     for f in "${files[@]}"; do
         [ -f "$outdir/$f" ] || { err "本地无 $outdir/$f（先构建对应模块）"; return 1; }
     done
-    remote_deploy_guard "$profile" on
+    deploy_guard_open "$profile"
     _push_module_body "$profile" "$mod" "$outdir" "${files[@]}"
     local rc=$?
-    remote_deploy_guard "$profile" off
+    deploy_guard_close "$profile"
     return $rc
 }
 
