@@ -5,7 +5,7 @@
 //! measure/arrange 算出尺寸与每候选的绝对矩形（供鼠标命中），再 paint 到 BGRA 缓冲区。
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
@@ -326,6 +326,9 @@ pub struct CandidateWindow {
     mouse: Rc<RefCell<CandidateMouse>>,
     /// 悬停编码反查气泡
     tooltip: Option<crate::tooltip::Tooltip>,
+    /// 气泡此刻跟着哪个候选（页内下标；-1 = 无），与 [`CandidateMouse`] 共享，悬停宽限据此
+    /// 判「移开的正是气泡所属的候选」。本地显示与宿主渲染两路都在这里记。
+    tip_for: Rc<Cell<i32>>,
     /// 「屏幕点处最上层是不是这个窗口」，默认 [`crate::window::window_at`]；测试换桩。
     window_at: fn(HWND, i32, i32) -> bool,
     /// **生效**主题：[`Self::theme_source`] 叠上外观覆盖（字体 / 字号）之后的那份。
@@ -424,6 +427,7 @@ impl CandidateWindow {
         let text_renderer = TextRenderer::new(DEFAULT_FONT_FAMILY, config.font_size)?;
         let tooltip_events = events.clone();
         let self_events = events.clone();
+        let tip_for = Rc::new(Cell::new(-1));
         let mouse = Rc::new(RefCell::new(CandidateMouse {
             hit_rects: Vec::new(),
             events,
@@ -442,6 +446,8 @@ impl CandidateWindow {
             double_click: crate::double_click::DoubleClick::new(),
             tip_hold: TipHold::Off,
             tip_released: false,
+            tip_for: tip_for.clone(),
+            deferred: None,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -464,6 +470,7 @@ impl CandidateWindow {
             text_renderer,
             hit_rects: Vec::new(),
             mouse,
+            tip_for,
             tooltip: crate::tooltip::Tooltip::new(tooltip_events).ok(),
             window_at: crate::window::window_at,
             theme: wind_theme::Resolved::default(),
@@ -1884,6 +1891,13 @@ impl CandidateWindow {
                 Some((code, r)) => {
                     // 旋转态一并走「侧边」：它的候选项是又高又窄的一列，
                     // 按横排的「上方/下方」放会离得很远。
+                    self.tip_for.set(hover);
+                    tip.set_anchor((
+                        wx + r.x as i32,
+                        wy + r.y as i32,
+                        wx + (r.x + r.w) as i32,
+                        wy + (r.y + r.h) as i32,
+                    ));
                     if self.vertical || self.rotated {
                         // 竖排：以悬停候选项自身宽度为锚点（hit rect 已含阴影偏移，wx+r.x 即屏幕坐标）。
                         // tooltip 显示在候选项右侧，空间不足时改左侧，不遮挡下方候选。
@@ -1905,7 +1919,10 @@ impl CandidateWindow {
                         );
                     }
                 }
-                None => tip.hide(),
+                None => {
+                    self.tip_for.set(-1);
+                    tip.hide();
+                }
             }
         }
     }
@@ -1936,6 +1953,7 @@ impl CandidateWindow {
             None
         };
 
+        self.tip_for.set(if info.is_some() { hover } else { -1 });
         let tip = self.tooltip.as_mut()?;
         match info {
             Some((code, r)) => {
@@ -3726,8 +3744,10 @@ impl CandidateWindow {
             // 注意 hide_local_window_only()（host-render 分流）刻意不走这里，落位状态须保留。
             m.reset_drag();
         }
+        // 候选窗收起：气泡失去依附对象，光标停在它上面也得收（Esc / 上屏 / 失焦 ...）。
+        self.tip_for.set(-1);
         if let Some(t) = self.tooltip.as_mut() {
-            t.hide();
+            t.hide_force();
         }
     }
 
@@ -3737,17 +3757,24 @@ impl CandidateWindow {
     #[cfg(windows)]
     pub fn hide_local_window_only(&mut self) {
         self.window.hide();
+        // 宿主接管绘制：本地气泡无条件收（光标在上面也一样），宽限只按候选悬停走。
         if let Some(t) = self.tooltip.as_mut() {
-            t.hide();
+            t.hide_force();
         }
     }
 
     /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件），并推进候选右键对气泡的
     /// 压制（见 [`TipHold`]）。
     pub fn tick(&mut self) {
+        let now = Instant::now();
+        // 悬停宽限：光标已进入气泡就撤掉待发的悬停变化，到期未进则照发（见 [`hover_move`]）。
+        if self.mouse.borrow().deferred.is_some() {
+            let on_tip = self.tooltip.as_ref().is_some_and(|t| t.cursor_on_tip_now());
+            self.mouse.borrow_mut().resolve_deferred(now, on_tip);
+        }
         let (hold, released) = {
             let mut m = self.mouse.borrow_mut();
-            m.flush(Instant::now(), self.hover);
+            m.flush(now, self.hover);
             (m.tip_hold.active(), std::mem::take(&mut m.tip_released))
         };
         // 右键那一刻已显示的气泡就在这里收掉：消息泵刚派发完 WM_RBUTTONDOWN，本轮即生效，
@@ -3775,7 +3802,10 @@ impl CandidateWindow {
             TipHold::AwaitMenu { until } => Some(until),
             _ => None,
         };
-        [m.engage_deadline(), hold].into_iter().flatten().min()
+        [m.engage_deadline(), hold, m.deferred]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -3847,6 +3877,58 @@ pub struct CandidateMouse {
     /// 压制刚解除且 UI 画着的悬停正是光标下的目标：待 [`CandidateWindow::tick`] 取走并
     /// 本地补显示气泡。
     tip_released: bool,
+    /// 气泡此刻跟着哪个候选（与 [`CandidateWindow`] 共享，见其同名字段）。
+    tip_for: Rc<Cell<i32>>,
+    /// 悬停宽限：待发的悬停变化（`pending_raw`）到期时刻，见 [`hover_move`]。
+    deferred: Option<Instant>,
+}
+
+/// 光标离开气泡所属候选、去往「无」（空隙 / 内边距 / 翻页器）的宽限：与气泡那侧的
+/// [`crate::tooltip::LEAVE_GRACE_MS`] 同值——从候选行穿过空隙进入气泡要这么久。
+const TIP_GRACE: Duration = Duration::from_millis(crate::tooltip::LEAVE_GRACE_MS as u64);
+
+/// 气泡显示中、光标移到**另一个**候选的切换延迟。气泡在旁侧时，从候选 A 斜着去 A 的气泡
+/// 会擦过相邻行 B；立刻切到 B，A 的气泡就被换掉、永远够不着。150ms 够手速正常地穿过一行
+/// （三四十像素），而在候选间正常移动时高亮只慢这么一点，不显得迟钝。比宽限短：去往另一个
+/// 候选多半是真想看它。
+const TIP_SWITCH: Duration = Duration::from_millis(150);
+
+/// 悬停从 `last` 变到 `raw` 时是即时发出还是延后（设计 §7.6 C）。只有 `last` 的气泡正显示
+/// （`tip_for == last`）时才延后：去往「无」按 [`TIP_GRACE`]，去往另一个候选按 [`TIP_SWITCH`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoverMove {
+    Now,
+    Defer(Duration),
+}
+
+fn hover_move(last: i32, raw: i32, tip_for: i32) -> HoverMove {
+    let tip_up = (0..TAG_PAGE_PREV).contains(&last) && tip_for == last;
+    if !tip_up {
+        HoverMove::Now
+    } else if (0..TAG_PAGE_PREV).contains(&raw) {
+        HoverMove::Defer(TIP_SWITCH)
+    } else {
+        HoverMove::Defer(TIP_GRACE)
+    }
+}
+
+/// 待发的悬停变化此刻该怎么办：光标进了气泡 → 撤掉（悬停留在原候选，气泡自己的离开跟踪
+/// 接手）；到期 → 发出；否则再等。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deferred {
+    Wait,
+    Cancel,
+    Fire,
+}
+
+fn resolve_deferred(now: Instant, until: Instant, on_tip: bool) -> Deferred {
+    if on_tip {
+        Deferred::Cancel
+    } else if now >= until {
+        Deferred::Fire
+    } else {
+        Deferred::Wait
+    }
 }
 
 /// 「等菜单」阶段的兜底超时（取值理由见 `popup_menu::MENU_REPLY_TIMEOUT`）：超时按「菜单已
@@ -3952,9 +4034,28 @@ impl CandidateMouse {
         }
     }
 
+    /// 推进悬停宽限（见 [`resolve_deferred`]）。`on_tip` = 光标此刻在气泡上。
+    fn resolve_deferred(&mut self, now: Instant, on_tip: bool) {
+        let Some(until) = self.deferred else {
+            return;
+        };
+        match resolve_deferred(now, until, on_tip) {
+            Deferred::Wait => {}
+            Deferred::Cancel => self.deferred = None,
+            Deferred::Fire => {
+                self.deferred = None;
+                if self.pending_raw != self.last_hover {
+                    self.last_hover = self.pending_raw;
+                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
+                }
+            }
+        }
+    }
+
     /// 候选窗上右键（候选菜单 / 空白处主菜单）：进入压制「等菜单」阶段，并把激活闸门打回
     /// 未激活，见 [`TipHold`]。
     fn hold_tooltip(&mut self, now: Instant) {
+        self.deferred = None;
         self.tip_hold = TipHold::AwaitMenu {
             until: now + HOLD_MENU_TIMEOUT,
         };
@@ -3989,6 +4090,7 @@ impl CandidateMouse {
     /// - [`CandidateWindow::hide`]：清掉闸门与残留悬停，使下一轮从未激活态起步。它顺带采的
     ///   那次基线到下次显示时多半已经过时（用户在这期间移动了鼠标），**不能当作基线的来源**。
     fn reset_hover(&mut self) {
+        self.deferred = None;
         self.last_hover = -1;
         self.engaged = false;
         self.engage_at = None;
@@ -4177,10 +4279,24 @@ impl WindowMouse for CandidateMouse {
                     .tip_hold
                     .advance(Instant::now(), crate::popup_menu::menu_visible());
                 if self.engaged {
-                    // 已激活：即时高亮/显示 tooltip，无逐项延迟
-                    if raw != self.last_hover {
-                        self.last_hover = raw;
-                        let _ = self.events.send(UiEvent::Hover(raw));
+                    // 已激活：即时高亮/显示 tooltip，无逐项延迟——除非正移开气泡所属的
+                    // 候选（悬停宽限，见 `hover_move`）。
+                    if raw == self.last_hover {
+                        // 回到原候选：待发的变化作废。
+                        self.deferred = None;
+                    } else {
+                        match hover_move(self.last_hover, raw, self.tip_for.get()) {
+                            HoverMove::Now => {
+                                self.deferred = None;
+                                self.last_hover = raw;
+                                let _ = self.events.send(UiEvent::Hover(raw));
+                            }
+                            HoverMove::Defer(d) => {
+                                // 取较早者：宽限里又移到另一个候选时按切换延迟收紧，不顺延。
+                                let at = Instant::now() + d;
+                                self.deferred = Some(self.deferred.map_or(at, |u| u.min(at)));
+                            }
+                        }
                     }
                 } else if self.engage_at.is_none() && !self.tip_hold.blocks_gate() {
                     // 首次真实移动：启动窗口级激活闸门（仅一次，~60ms）。
@@ -6792,6 +6908,8 @@ mod tip_hold_tests {
             double_click: crate::double_click::DoubleClick::new(),
             tip_hold: TipHold::Off,
             tip_released: false,
+            tip_for: Rc::new(Cell::new(-1)),
+            deferred: None,
         };
         (m, rx)
     }
@@ -7098,5 +7216,172 @@ mod tip_hold_tests {
         w.window_at = |_, _, _| false;
         w.menu_outside_press(25, 5, true);
         assert_eq!(menu_requests(&rx), 0);
+    }
+
+    // ---- 悬停宽限与强制隐藏（设计 §7.6 C）----
+
+    #[test]
+    fn hover_move_table() {
+        use HoverMove::*;
+        // 气泡跟着候选 0：去往「无」宽限，去往候选 1 切换延迟。
+        assert_eq!(hover_move(0, -1, 0), Defer(TIP_GRACE));
+        assert_eq!(
+            hover_move(0, TAG_PAGE_PREV, 0),
+            Defer(TIP_GRACE),
+            "翻页器按「无」"
+        );
+        assert_eq!(hover_move(0, 1, 0), Defer(TIP_SWITCH));
+        // 气泡不跟着移开的那个候选（没显示 / 跟着别的）：即时。
+        assert_eq!(hover_move(0, -1, -1), Now);
+        assert_eq!(hover_move(0, 1, 1), Now);
+        assert_eq!(hover_move(-1, 0, -1), Now);
+        assert_eq!(
+            hover_move(TAG_PAGE_PREV, 0, TAG_PAGE_PREV),
+            Now,
+            "翻页器没有气泡"
+        );
+        assert!(TIP_SWITCH < TIP_GRACE);
+    }
+
+    #[test]
+    fn resolve_deferred_table() {
+        let t0 = Instant::now();
+        let until = t0 + TIP_GRACE;
+        assert_eq!(resolve_deferred(t0, until, false), Deferred::Wait);
+        assert_eq!(resolve_deferred(until, until, false), Deferred::Fire);
+        assert_eq!(
+            resolve_deferred(t0, until, true),
+            Deferred::Cancel,
+            "进了气泡就撤"
+        );
+        assert_eq!(resolve_deferred(until, until, true), Deferred::Cancel);
+    }
+
+    /// 已激活、悬停在候选 0 上且气泡跟着它。
+    fn engaged_on_0() -> (CandidateMouse, Receiver<UiEvent>) {
+        let (mut m, rx) = mouse(0);
+        m.engaged = true;
+        m.last_hover = 0;
+        m.tip_for.set(0);
+        (m, rx)
+    }
+
+    /// 候选 → 空隙 → 气泡：穿过空隙时不发 `Hover(-1)`；进了气泡则整个撤掉，悬停留在 0。
+    #[test]
+    fn gap_on_the_way_to_tip_keeps_hover() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        assert!(hovers(&rx).is_empty(), "空隙里不得立刻清悬停");
+        assert!(m.deferred.is_some());
+        m.resolve_deferred(later(), true);
+        assert!(hovers(&rx).is_empty(), "进了气泡：撤掉");
+        assert!(m.deferred.is_none());
+        assert_eq!(m.last_hover, 0);
+    }
+
+    /// 宽限到期仍不在气泡上（也没回来）：照发。
+    #[test]
+    fn gap_fires_after_grace() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        m.resolve_deferred(Instant::now(), false);
+        assert!(hovers(&rx).is_empty(), "未到期不发");
+        m.resolve_deferred(later(), false);
+        assert_eq!(hovers(&rx), vec![-1]);
+        assert_eq!(m.last_hover, -1);
+    }
+
+    /// 宽限期内回到原候选：待发作废，到期也不发。
+    #[test]
+    fn return_to_same_candidate_cancels() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        real_move(&mut m, 5);
+        assert!(m.deferred.is_none());
+        m.resolve_deferred(later(), false);
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 擦过相邻候选：不立刻切换，切换延迟到期才发；期间进了气泡则不切。
+    #[test]
+    fn crossing_neighbour_defers_switch() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 25);
+        assert!(hovers(&rx).is_empty(), "擦过候选 1 不立刻切");
+        let until = m.deferred.expect("延后");
+        assert!(until <= Instant::now() + TIP_SWITCH);
+        m.resolve_deferred(until, false);
+        assert_eq!(hovers(&rx), vec![1]);
+        // 进了气泡的那种。
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 25);
+        m.resolve_deferred(later(), true);
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 先进空隙（宽限）、再到另一个候选：按较早的切换延迟收紧，不顺延。
+    #[test]
+    fn switch_after_gap_tightens_deadline() {
+        let (mut m, _rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        let grace = m.deferred.unwrap();
+        real_move(&mut m, 25);
+        assert!(m.deferred.unwrap() < grace);
+    }
+
+    /// 气泡没跟着移开的候选：悬停照旧即时。
+    #[test]
+    fn no_tip_no_grace() {
+        let (mut m, rx) = engaged_on_0();
+        m.tip_for.set(-1);
+        real_move(&mut m, 15);
+        assert_eq!(hovers(&rx), vec![-1]);
+        assert!(m.deferred.is_none());
+    }
+
+    /// 窗口层：tick 在光标进了气泡时撤掉待发；到期时间进入 next_deadline。
+    #[test]
+    fn window_tick_cancels_when_cursor_on_tip() {
+        let (mut w, rx) = window();
+        assert_eq!(w.tip_for.get(), 0, "显示气泡即记下它跟着谁");
+        {
+            let mut m = w.mouse.borrow_mut();
+            m.engaged = true;
+            m.last_hover = 0;
+            real_move(&mut m, 15);
+        }
+        let _ = hovers(&rx);
+        let until = w.mouse.borrow().deferred.expect("延后");
+        assert_eq!(w.next_deadline(), Some(until));
+        w.tooltip_mut().unwrap().stub_on_tip(true);
+        w.tick();
+        assert!(w.mouse.borrow().deferred.is_none());
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// Esc / 上屏 / 失焦（候选窗收起）：光标就停在气泡上、跟踪挂着，气泡也得收；待发的
+    /// 悬停与「气泡跟着谁」一并清掉。
+    #[test]
+    fn candidate_hide_force_hides_tip_under_cursor() {
+        let (mut w, _rx) = window();
+        {
+            let t = w.tooltip_mut().unwrap();
+            t.stub_on_tip(true);
+            t.simulate_move();
+        }
+        w.mouse.borrow_mut().deferred = Some(later());
+        w.hide();
+        assert!(!tip_shown(&w), "候选窗收起，气泡不得残留");
+        assert_eq!(w.tip_for.get(), -1);
+        assert!(w.mouse.borrow().deferred.is_none());
+    }
+
+    /// 悬停变成「无」（协调器重绘）：`tip_for` 随之清掉，不再对后续移动延后。
+    #[test]
+    fn tip_for_clears_when_tip_goes_away() {
+        let (mut w, _rx) = window();
+        w.hover = -1;
+        w.update_tooltip(0, 0);
+        assert_eq!(w.tip_for.get(), -1);
     }
 }

@@ -31,6 +31,12 @@
 //! 都没在气泡上移动就离开，那条移动永远不来，故另起复查定时器（[`RECHECK_MS`]），且跟踪没
 //! 挂着时 [`Tooltip::hide`] 改问真实光标，不按 `mouse_over` 推迟。
 //!
+//! # 悬停宽限与强制隐藏（设计 §7.6 C）
+//!
+//! 真实离开气泡不当场藏，开 [`LEAVE_GRACE_MS`] 宽限：光标穿过空隙回到所属候选行时，悬停值
+//! 没变、协调器不重绘，当场藏了气泡就不回来。候选窗收起走 [`Tooltip::hide_force`]，光标停在
+//! 气泡上也照收。
+//!
 //! 「关掉的正是气泡的菜单」看 `suppress_hide`。它由协调器的 `SetTooltipMenuOpen` 维护，
 //! 但协调器有几条收菜单的路（打字、失焦、切走输入法、组合被终止）走的是 `HideMenu` /
 //! `HideCandidates`，不一定补发 `SetTooltipMenuOpen(false)`。故 UI 循环在这两条命令真把一个
@@ -120,9 +126,14 @@ enum MenuEvent {
         on_tip: bool,
         spurious: u8,
     },
-    /// 伪离开后的复查定时器到期（见 [`RECHECK_MS`]）。`suppress` 同 `Leave`：光标没动就
-    /// 右键气泡时，菜单请求已发出、抑制已开，复查不该再来定去留。
-    Recheck { suppress: bool, on_tip: bool },
+    /// 复查定时器到期：伪离开后的复查（[`RECHECK_MS`]），或真实离开后的宽限
+    /// （[`LEAVE_GRACE_MS`]）。`suppress` 同 `Leave`：光标没动就右键气泡时，菜单请求已发出、
+    /// 抑制已开，复查不该再来定去留。`on_anchor` = 光标在气泡所属的候选行上。
+    Recheck {
+        suppress: bool,
+        on_tip: bool,
+        on_anchor: bool,
+    },
 }
 
 /// 气泡对 [`MenuEvent`] 的反应。
@@ -141,7 +152,18 @@ enum MenuStep {
     AwaitMove,
     /// 复查时光标仍在气泡上：补挂离开跟踪（不清伪离开计数）。
     Retrack,
+    /// 真实离开：先不隐藏，开宽限期（[`LEAVE_GRACE_MS`]），到期再定。
+    Grace,
+    /// 宽限到期时光标回到了气泡所属的候选行：气泡留下，不挂跟踪——此后去留跟着候选悬停走。
+    Idle,
 }
+
+/// 真实离开气泡后的宽限期（毫秒）。从气泡移回它所属的候选行要穿过两者之间的空隙
+/// （阴影扩边、内边距）；一离开就藏，光标回到候选行时悬停值没变、协调器不重绘，气泡就再也
+/// 不回来，看上去是「移回去气泡没了」。280ms 覆盖正常手速穿过十几到几十像素的空隙，又短到
+/// 移到别处时气泡的逗留不显得拖沓（常见 hover-intent 取 200–300ms）。与候选窗那侧的
+/// `candidate_window::TIP_GRACE` 同值，两侧对称。
+pub(crate) const LEAVE_GRACE_MS: u32 = 280;
 
 /// 连续伪离开的上限：到达后按真实离开处理。每条伪离开之后复查补挂一次跟踪，若系统始终
 /// 认定光标不在气泡上，就会「补挂 → 伪离开 → 补挂」无限循环；宁可把气泡藏掉。
@@ -151,7 +173,6 @@ const MAX_SPURIOUS_LEAVES: u8 = 3;
 /// 移动；那次移动由系统在下一次取输入时合成，通常在一帧（~16ms）内就被处理掉，80ms 足以
 /// 让它落定，又短到人察觉不出「移开后气泡慢半拍才消失」。复查兜的是光标一次都没在气泡上
 /// 移动就离开的情形——那时气泡收不到 `WM_MOUSEMOVE`，没有别的消息会来重挂跟踪。
-#[cfg_attr(not(windows), allow(dead_code))] // 仅 Windows 的 SetTimer 用到
 const RECHECK_MS: u32 = 80;
 
 /// 复查定时器的 id（`SetTimer` 按窗口区分，气泡窗口只有这一个定时器）。
@@ -184,10 +205,16 @@ fn menu_step(event: MenuEvent) -> MenuStep {
             spurious,
             ..
         } if spurious < MAX_SPURIOUS_LEAVES => MenuStep::AwaitMove,
-        MenuEvent::Leave { .. } => MenuStep::Hide,
+        // 伪离开到上限：系统始终不认光标在气泡上，宽限只会再绕一圈，直接隐藏。
+        MenuEvent::Leave { on_tip: true, .. } => MenuStep::Hide,
+        // 真实离开：宽限，给「穿过空隙回到候选行 / 回到气泡」留时间。
+        MenuEvent::Leave { .. } => MenuStep::Grace,
         MenuEvent::Recheck { suppress: true, .. } => MenuStep::Ignore,
         MenuEvent::Recheck { on_tip: true, .. } => MenuStep::Retrack,
-        MenuEvent::Recheck { on_tip: false, .. } => MenuStep::Hide,
+        MenuEvent::Recheck {
+            on_anchor: true, ..
+        } => MenuStep::Idle,
+        MenuEvent::Recheck { .. } => MenuStep::Hide,
     }
 }
 
@@ -215,8 +242,11 @@ struct TooltipMouse {
     /// 连续伪离开次数（见 [`MAX_SPURIOUS_LEAVES`]），真实 `WM_MOUSEMOVE` / 菜单关闭留下 /
     /// 隐藏时清零。
     spurious: u8,
-    /// 复查定时器是否在走（见 [`RECHECK_MS`]）。
+    /// 复查定时器是否在走（见 [`RECHECK_MS`] / [`LEAVE_GRACE_MS`]）。
     recheck_pending: bool,
+    /// 气泡所属候选行的屏幕矩形 `(left, top, right, bottom)`，宽限到期时判「光标回到了
+    /// 候选行」用。由候选窗在显示气泡时给出。
+    anchor: Option<(i32, i32, i32, i32)>,
 }
 
 impl TooltipMouse {
@@ -268,13 +298,26 @@ impl TooltipMouse {
         self.arm_leave();
     }
 
-    /// 启动伪离开后的复查定时器（见 [`RECHECK_MS`]）。
-    fn start_recheck(&mut self) {
+    /// 光标此刻是否在气泡所属的候选行上。
+    fn cursor_on_anchor(&self) -> bool {
+        let Some((l, t, r, b)) = self.anchor else {
+            return false;
+        };
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return false;
+        }
+        p.x >= l && p.x < r && p.y >= t && p.y < b
+    }
+
+    /// 启动复查定时器（`ms` 后到期，见 [`RECHECK_MS`] / [`LEAVE_GRACE_MS`]）。
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn start_recheck(&mut self, ms: u32) {
         self.recheck_pending = true;
         #[cfg(windows)]
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::SetTimer;
-            SetTimer(self.hwnd, RECHECK_TIMER, RECHECK_MS, None);
+            SetTimer(self.hwnd, RECHECK_TIMER, ms, None);
         }
     }
 
@@ -364,7 +407,12 @@ impl WindowMouse for TooltipMouse {
                     MenuStep::AwaitMove => {
                         self.spurious += 1;
                         self.mouse_over.set(true);
-                        self.start_recheck();
+                        self.start_recheck(RECHECK_MS);
+                    }
+                    MenuStep::Grace => {
+                        self.spurious = 0;
+                        self.mouse_over.set(false);
+                        self.start_recheck(LEAVE_GRACE_MS);
                     }
                     // 鼠标离开时直接隐藏（对齐 Go TooltipWindow WM_MOUSELEAVE 行为）。
                     MenuStep::Hide => self.hide_now(),
@@ -380,6 +428,7 @@ impl WindowMouse for TooltipMouse {
                 let event = MenuEvent::Recheck {
                     suppress: self.suppress_hide.get(),
                     on_tip: self.cursor_on_tip(),
+                    on_anchor: self.cursor_on_anchor(),
                 };
                 let step = menu_step(event);
                 tracing::info!(
@@ -389,6 +438,10 @@ impl WindowMouse for TooltipMouse {
                 match step {
                     MenuStep::Retrack => self.retrack(),
                     MenuStep::Hide => self.hide_now(),
+                    MenuStep::Idle => {
+                        self.mouse_over.set(false);
+                        self.spurious = 0;
+                    }
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -470,6 +523,7 @@ impl Tooltip {
             window_at: crate::window::window_at,
             spurious: 0,
             recheck_pending: false,
+            anchor: None,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -691,10 +745,49 @@ impl Tooltip {
         }
     }
 
+    /// 无条件隐藏：候选窗收起（组合结束、Esc、上屏、失焦、切走输入法、宿主渲染分流）后
+    /// 气泡失去依附对象，光标停在它上面也得收。[`Self::hide`] 的推迟是给「悬停变了」这类
+    /// 隐藏用的，这里连同跟踪、复查 / 宽限定时器一并归位。
+    pub fn hide_force(&mut self) {
+        self.mouse.borrow_mut().settle_hidden();
+        if self.visible.get() {
+            self.window.hide();
+            self.visible.set(false);
+        }
+    }
+
+    /// 气泡所属候选行的屏幕矩形 `(left, top, right, bottom)`（宽限到期判「回到了候选行」）。
+    pub fn set_anchor(&mut self, rect: (i32, i32, i32, i32)) {
+        self.mouse.borrow_mut().anchor = Some(rect);
+    }
+
+    /// 光标此刻是否在气泡上（窗口可见时才可能为真）。候选窗的悬停宽限据此判「已进入气泡」。
+    pub fn cursor_on_tip_now(&self) -> bool {
+        self.visible.get() && self.cursor_on_tip()
+    }
+
     /// 本地窗口是否处于显示态（测试用；Windows 上问系统见 [`Self::is_visible`]）。
     #[cfg(test)]
     pub(crate) fn shown(&self) -> bool {
         self.visible.get()
+    }
+
+    /// 测试用：光标「在不在气泡上」的桩。
+    #[cfg(test)]
+    pub(crate) fn stub_on_tip(&self, on_tip: bool) {
+        self.mouse.borrow_mut().window_at = if on_tip {
+            |_, _, _| true
+        } else {
+            |_, _, _| false
+        };
+    }
+
+    /// 测试用：模拟光标在气泡上移动（挂上离开跟踪、`mouse_over` 置位）。
+    #[cfg(test)]
+    pub(crate) fn simulate_move(&self) {
+        self.mouse
+            .borrow_mut()
+            .on_message(HWND::default(), WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
     }
 
     /// 是否处于「菜单打开中」的隐藏抑制（测试用）。
@@ -765,7 +858,9 @@ impl Tooltip {
             m.cancel_recheck();
             return;
         }
-        let on_tip = self.cursor_on_tip();
+        // 已被收起（候选窗先收、菜单后收）的气泡不可能在光标下；桩测试里 window_at 不看
+        // 可见性，这里显式挡住。
+        let on_tip = self.visible.get() && self.cursor_on_tip();
         match menu_step(MenuEvent::Closed { on_tip }) {
             MenuStep::Keep => self.mouse.borrow_mut().rearm(),
             _ => {
@@ -1130,7 +1225,7 @@ mod tests {
         assert_eq!(menu_step(leave(true, true, 0)), Ignore);
         assert_eq!(menu_step(leave(true, false, 0)), Ignore);
         assert_eq!(menu_step(leave(false, true, 0)), AwaitMove);
-        assert_eq!(menu_step(leave(false, false, 0)), Hide);
+        assert_eq!(menu_step(leave(false, false, 0)), Grace, "真实离开先宽限");
         // 伪离开连续到上限：按真实离开处理，免得「补挂 → 伪离开」无限循环。
         assert_eq!(
             menu_step(leave(false, true, MAX_SPURIOUS_LEAVES - 1)),
@@ -1138,12 +1233,19 @@ mod tests {
         );
         assert_eq!(menu_step(leave(false, true, MAX_SPURIOUS_LEAVES)), Hide);
         // 复查定时器到期：光标仍在气泡上就补挂跟踪，否则隐藏。
-        let recheck = |suppress, on_tip| Recheck { suppress, on_tip };
-        assert_eq!(menu_step(recheck(false, true)), Retrack);
-        assert_eq!(menu_step(recheck(false, false)), Hide);
+        let recheck = |suppress, on_tip, on_anchor| Recheck {
+            suppress,
+            on_tip,
+            on_anchor,
+        };
+        assert_eq!(menu_step(recheck(false, true, false)), Retrack);
+        assert_eq!(menu_step(recheck(false, true, true)), Retrack);
+        assert_eq!(menu_step(recheck(false, false, false)), Hide);
+        // 宽限到期时光标回到了气泡所属的候选行：留下。
+        assert_eq!(menu_step(recheck(false, false, true)), Idle);
         // 抑制中（光标没动就右键了气泡，菜单请求已发出）：复查不定去留。
-        assert_eq!(menu_step(recheck(true, true)), Ignore);
-        assert_eq!(menu_step(recheck(true, false)), Ignore);
+        assert_eq!(menu_step(recheck(true, true, false)), Ignore);
+        assert_eq!(menu_step(recheck(true, false, false)), Ignore);
     }
 
     fn tooltip_with_rx(on_tip: bool) -> (Tooltip, std::sync::mpsc::Receiver<UiEvent>) {
@@ -1233,6 +1335,7 @@ mod tests {
     #[test]
     fn dismissed_menu_clears_suppress_and_right_click_still_works() {
         let (mut t, rx) = tooltip_with_rx(true);
+        t.visible.set(true);
         crate::popup_menu::set_menu_visible(false);
         own_right_down(&t);
         t.set_menu_open(true);
@@ -1295,14 +1398,18 @@ mod tests {
         assert!(t.mouse.borrow().tracking);
     }
 
-    /// 真离开（光标已不在气泡上）：隐藏，且 `visible` 同步为 false——此后 `hide()` 按「已隐藏」
-    /// 幂等跳过，再显示时照常置回 true。
+    /// 真离开（光标已不在气泡上）：先宽限、不当场藏；到期光标既不在气泡也不在候选行上则
+    /// 隐藏，且 `visible` 同步为 false——此后 `hide()` 按「已隐藏」幂等跳过，再显示时照常
+    /// 置回 true。
     #[test]
     fn real_leave_hides_and_syncs_visible() {
         let (mut t, _rx) = tooltip_with_rx(false);
         t.visible.set(true);
         t.mouse_over.set(true);
         mouse_leave(&t);
+        assert!(t.shown(), "宽限期内不藏");
+        assert!(t.mouse.borrow().recheck_pending, "离开即开宽限");
+        recheck_fires(&t);
         assert!(!t.shown(), "离开隐藏须同步 visible");
         assert!(!t.mouse_over.get());
         t.hide();
@@ -1526,6 +1633,65 @@ mod tests {
         assert!(t.shown());
         assert!(t.mouse_over.get());
         assert!(t.mouse.borrow().tracking);
+    }
+
+    /// 从气泡移回它所属的候选行（穿过空隙）：宽限到期时光标在候选行上 → 气泡留下，不挂
+    /// 跟踪（此后去留跟着候选悬停走）。mock 光标恒在 (0,0)。
+    #[test]
+    fn grace_expiry_on_anchor_keeps_tip() {
+        let (mut t, _rx) = tooltip_with_rx(false);
+        t.visible.set(true);
+        t.set_anchor((-5, -5, 5, 5));
+        t.mouse_over.set(true);
+        mouse_leave(&t);
+        recheck_fires(&t);
+        assert!(t.shown(), "回到候选行：气泡留下");
+        let m = t.mouse.borrow();
+        assert!(!t.mouse_over.get() && !m.tracking && !m.recheck_pending);
+    }
+
+    /// 宽限期内候选侧决定换走（悬停变了 → `hide()`）：当场隐藏并撤掉宽限。
+    #[test]
+    fn hide_during_grace_hides_now() {
+        let (mut t, _rx) = tooltip_with_rx(false);
+        t.visible.set(true);
+        t.mouse_over.set(true);
+        mouse_leave(&t);
+        t.hide();
+        assert!(!t.shown());
+        assert!(!t.mouse.borrow().recheck_pending);
+    }
+
+    /// 强制隐藏：光标就在气泡上、跟踪挂着也收；跟踪 / 复查 / 计数一并归位。对照 `hide()`
+    /// 在同样条件下推迟。
+    #[test]
+    fn hide_force_ignores_cursor_on_tip() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.simulate_move();
+        t.hide();
+        assert!(t.shown(), "对照：悬停类隐藏推迟");
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        assert!(t.mouse.borrow().recheck_pending);
+        t.hide_force();
+        assert!(!t.shown());
+        let m = t.mouse.borrow();
+        assert!(!t.mouse_over.get() && !m.tracking && !m.recheck_pending && m.spurious == 0);
+    }
+
+    /// 候选窗先收（强制隐藏）、菜单后收（`HideCandidates` 的顺序）：已收起的气泡不再被
+    /// 「光标在气泡上 → 留下」重挂跟踪。
+    #[test]
+    fn menu_close_after_force_hide_does_not_rearm() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.hide_force();
+        t.on_menu_dismissed();
+        assert!(!t.shown());
+        assert!(!t.mouse_over.get() && !t.mouse.borrow().tracking);
     }
 
     /// 同一次关闭收到第二条 `SetTooltipMenuOpen(false)`：幂等，不再重挂跟踪。
