@@ -6109,9 +6109,10 @@ impl Coordinator {
         // 注释查的是 B 桶」这类只在多成员配置下才现形的错配。
         let mix_comment_scope = matches!(state.active, Some(ModeKind::Mix(_)));
         // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
-        // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_in），
+        // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_display），
         // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
         // 临时拼音/快捷输入反查模式）标题带来源方案名：[编码(五笔)]。
+        // 含用户层：自己造的词也显示编码（text-code-lookup.md）。
         let code_schema = tip_cfg
             .code_enabled
             .then(|| self.engine_mgr.code_source_schema())
@@ -6150,11 +6151,11 @@ impl Coordinator {
                 // 回答的是「这个候选怎么打出来」，用户实际敲的就是内部文本那个码；改成查繁化
                 // 文本只会让它查不到而整段消失，是拿一个**已经正确**的段去换取形式上的一致。
                 // 想再动它之前，先拿出一个真实的错例（2026-09-08 复核，没有找到）。
-                // `word_codes_in` 返回 None＝**反查索引尚未就绪**（区别于「查不到」的
+                // `word_codes_display` 返回 None＝**系统层反查索引尚未就绪**（区别于「查不到」的
                 // Some("")）。此时本段不显示，并已在循环外触发后台构建，建好后自动补上。
                 let word_code = code_schema
                     .as_deref()
-                    .and_then(|sid| self.engine_mgr.word_codes_in(sid, &c.text))
+                    .and_then(|sid| self.engine_mgr.word_codes_display(sid, &c.text))
                     .filter(|s| !s.is_empty());
                 let mut tooltip = reverse.tooltip_for(
                     &disp,

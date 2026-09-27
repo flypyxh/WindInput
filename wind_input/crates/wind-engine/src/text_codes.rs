@@ -10,6 +10,57 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// 「按词查编码」的一次快照：系统层（反查索引）+ 用户层。某层 `None` = 这一层还没就绪，
+/// **不是**「查不到」（沿用 `EngineManager::word_codes_in` 的三态约定）。
+#[derive(Default, Clone)]
+pub struct TextCodeView {
+    pub(crate) system: Option<Arc<wind_dict::cached::ReverseIndex>>,
+    pub(crate) user: Option<Arc<UserTextIndex>>,
+}
+
+impl TextCodeView {
+    pub fn system_ready(&self) -> bool {
+        self.system.is_some()
+    }
+
+    /// 至少有一层可查。
+    pub fn has_any(&self) -> bool {
+        self.system.is_some() || self.user.is_some()
+    }
+
+    /// 按「系统层 → 用户层」依次把该词的码交给 `pred`，任一返回 true 即停并返回 true。零分配。
+    pub fn any_code(&self, text: &str, pred: &mut dyn FnMut(&str) -> bool) -> bool {
+        if let Some(sys) = &self.system
+            && let Some(list) = sys.codes_of(text)
+            && list.iter().any(&mut *pred)
+        {
+            return true;
+        }
+        self.user
+            .as_ref()
+            .is_some_and(|u| u.codes_of(text).any(&mut *pred))
+    }
+
+    /// 该词全部编码：系统层在前、用户层补不重复者，整体按码长稳定排序（与反查索引「码长升序」同口径）。
+    pub fn codes_of(&self, text: &str) -> Vec<&str> {
+        let mut v: Vec<&str> = self
+            .system
+            .as_ref()
+            .and_then(|s| s.codes_of(text))
+            .map(|l| l.iter().collect())
+            .unwrap_or_default();
+        if let Some(u) = &self.user {
+            for c in u.codes_of(text) {
+                if !v.contains(&c) {
+                    v.push(c);
+                }
+            }
+        }
+        v.sort_by_key(|c| c.len());
+        v
+    }
+}
+
 /// 同时保留的方案份数上限。在用的方案通常是：主码表、联想方案、辅助码引用的方案，
 /// 取 4 留一格余量；超出时淘汰最久未用且不在重建中的那份。
 const MAX_SLOTS: usize = 4;
@@ -104,17 +155,13 @@ impl UserTextIndex {
         codes.into_iter().flat_map(|s| s.split('\t'))
     }
 
-    // Task 3 会用它判过期；本任务只在测试里调，非测试构建下暂时是死代码。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 供 `get_or_refresh` / `prewarm` 判过期。
     fn is_stale(&self, store: &wind_store::Store) -> bool {
         self.generation != store.words_generation_of(&self.data_schema)
     }
 }
 
-// 下面这一片（槽位、单飞重建）是 Task 3 接入 `EngineManager` 才会被生产代码调用；
-// 本任务只在测试里练，非测试构建下暂时是死代码。
 #[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct Slot {
     index: Option<Arc<UserTextIndex>>,
     building: bool,
@@ -122,18 +169,15 @@ struct Slot {
 }
 
 #[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct UserTextSlots {
     map: HashMap<String, Slot>,
     tick: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type SharedSlots = Arc<Mutex<UserTextSlots>>;
 
 impl UserTextSlots {
     /// 为 `key` 腾位：新方案进来且已满时，淘汰最久未用、且不在重建中的一份。
-    #[cfg_attr(not(test), allow(dead_code))]
     fn make_room_for(&mut self, key: &str) {
         if self.map.contains_key(key) || self.map.len() < MAX_SLOTS {
             return;
@@ -149,7 +193,6 @@ impl UserTextSlots {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn touch(&mut self, key: &str) -> &mut Slot {
         self.make_room_for(key);
         self.tick += 1;
@@ -161,7 +204,6 @@ impl UserTextSlots {
 }
 
 /// 取可用索引（可能略旧）；缺失或过期时起一次后台重建（已有在建则不重复起）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn get_or_refresh(
     slots: &SharedSlots,
     store: &Arc<wind_store::Store>,
@@ -199,7 +241,6 @@ pub(crate) fn get_or_refresh(
     current
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct BuildingGuard(SharedSlots, String);
 
 impl Drop for BuildingGuard {
@@ -217,7 +258,6 @@ impl Drop for BuildingGuard {
 }
 
 /// 阻塞地建好并放进槽（预热 / 测试用）。已是最新则不重建，返回是否真的建了。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn prewarm(slots: &SharedSlots, store: &wind_store::Store, data_schema: &str) -> bool {
     {
         let mut g = slots.lock().unwrap_or_else(|e| e.into_inner());

@@ -481,11 +481,14 @@ pub struct EngineManager {
     primary_pinyin: Mutex<String>,
     /// 码表反查索引缓存:方案 id → (汉字/词 → 全部编码,码长升序)。供拼音编码提示与悬停
     /// [编码] 段按词查实际码。懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
-    /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
+    /// 内存护栏:每份索引可达数万词条,只缓存「本次请求方 + 主码表 + 在用集合」几份
+    /// (见 `reverse_index_for` / `reverse_index_pins`)。
     reverse_index: Mutex<HashMap<String, Arc<ReverseIndex>>>,
     /// 词语联想的用户词 / 临时词文本索引（store 按码排，按文本前缀查要另建）。
     /// 见 [`crate::user_assoc`]；只留当前联想方案一份。
     user_assoc: crate::user_assoc::SharedSlot,
+    /// 按词查编码的用户层，按方案分槽。见 [`crate::text_codes`]。
+    user_text: crate::text_codes::SharedSlots,
     /// 码表**单字全码**表缓存:方案 id → (汉字 → 全码)。供造词按 `[[encoder.rules]]` 组装
     /// 词组编码(见 `encode_word`)。与 `reverse_index` 分开是刻意的——那份按「码长升序」排,
     /// 服务悬停 `[编码]` 的打法列表展示;这份要的是「按权重挑全码」,两种排序需求互斥。
@@ -761,6 +764,7 @@ impl EngineManager {
             primary_pinyin: Mutex::new(config.schema.primary_pinyin.clone()),
             reverse_index: Mutex::new(HashMap::new()),
             user_assoc: Default::default(),
+            user_text: Default::default(),
             single_char_codes: Mutex::new(None),
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
@@ -1082,10 +1086,14 @@ impl EngineManager {
         if primary.is_empty() {
             return Some(String::new()); // 没有主码表＝确定没有编码可显示，不是「没就绪」
         }
+        let v = self.text_codes(&primary);
+        if !v.system_ready() {
+            return None;
+        }
         Some(
-            self.reverse_index_if_ready(&primary)?
-                .codes_of(text)
-                .and_then(|codes| codes.last().map(str::to_string))
+            v.codes_of(text)
+                .last()
+                .map(|s| s.to_string())
                 .unwrap_or_default(),
         )
     }
@@ -1172,6 +1180,49 @@ impl EngineManager {
                 .map(|codes| codes.join("/"))
                 .unwrap_or_default(),
         )
+    }
+
+    /// 「按词查编码」统一入口：系统层 + 用户层的一次快照，**不阻塞**。
+    ///
+    /// 用户层过期或缺失时，本次照用旧的（或没有），另起后台重建；系统层没就绪就是 `None`，
+    /// 由调用方决定要不要派后台构建（打字链路用 `Coordinator::spawn_index_warm`）。
+    /// 设计见 `docs/design/text-code-lookup.md`。
+    pub fn text_codes(&self, schema_id: &str) -> crate::text_codes::TextCodeView {
+        if schema_id.is_empty() {
+            return Default::default();
+        }
+        let system = self.reverse_index_if_ready(schema_id);
+        let user = self.store.as_ref().and_then(|s| {
+            crate::text_codes::get_or_refresh(&self.user_text, s, &self.data_schema_id(schema_id))
+        });
+        crate::text_codes::TextCodeView { system, user }
+    }
+
+    /// 阻塞地把两层都建好（预热线程 / 测试用，**不可进按键链路**）。返回是否真的建了东西。
+    pub fn prewarm_text_codes(&self, schema_id: &str) -> bool {
+        if schema_id.is_empty() {
+            return false;
+        }
+        let built_sys = self.prewarm_reverse_index(schema_id);
+        let built_user = self.store.as_ref().is_some_and(|s| {
+            crate::text_codes::prewarm(&self.user_text, s, &self.data_schema_id(schema_id))
+        });
+        built_sys || built_user
+    }
+
+    /// 展示用的「这个词怎么打」：系统层 + 用户层，`/` 连接、码长升序。
+    ///
+    /// 三态同 [`Self::word_codes_in`]：`None` = 系统层还没就绪。与它的区别只在**含用户层**——
+    /// 加词去重要的是「系统词库里有没有」，那条口径刻意不变，仍用 `word_codes_in`。
+    pub fn word_codes_display(&self, schema_id: &str, text: &str) -> Option<String> {
+        if schema_id.is_empty() {
+            return Some(String::new());
+        }
+        let v = self.text_codes(schema_id);
+        if !v.system_ready() {
+            return None;
+        }
+        Some(v.codes_of(text).join("/"))
     }
 
     /// 同 [`Self::word_codes_in`]，但**索引没建好就地建**（可能阻塞秒级）。
@@ -1425,8 +1476,9 @@ impl EngineManager {
 
     /// 取 `schema_id` 的反查索引,缺则全量构建并缓存（**会阻塞秒级**）。
     ///
-    /// 内存护栏:最多保留两份——本次请求方 + 全局主码表(悬停查活跃码表、拼音提示查主码表,
-    /// 两者常为同一方案;方案切换的残留索引随下次构建清退)。
+    /// 内存护栏:只保留「本次请求方 + 主码表 + 在用集合」（见 [`Self::reverse_index_pins`]）——
+    /// 原先只留请求方与主码表两份，联想方案、辅助码引用的方案会与它们互相顶掉、反复秒级重建；
+    /// 方案切换的残留索引随下次构建清退。
     ///
     /// ⚠️ **只该在两种场合调用**：后台预热线程，或用户主动发起、本就预期要等的操作
     /// （如加词去重校验——那里返回空表会导致**重复加词**，是正确性问题，不能降级）。
@@ -1456,10 +1508,16 @@ impl EngineManager {
             return Some(m);
         }
         let m = Arc::new(self.build_reverse_index_for(schema_id)?);
+        let pins = self.reverse_index_pins();
         let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
         guard.insert(schema_id.to_string(), m.clone());
-        guard.retain(|k, _| k == schema_id || k == &primary);
+        guard.retain(|k, _| reverse_index_keeps(k, schema_id, &primary, &pins));
         Some(m)
+    }
+
+    /// 反查索引「在用集合」里除主码表外的方案。Task 6 会追加辅助码引用的方案。
+    fn reverse_index_pins(&self) -> Vec<String> {
+        vec![self.assoc_word_schema()]
     }
 
     /// 后台预热反查索引：把「首次使用时才建」提前到预热线程。
@@ -1636,7 +1694,7 @@ impl EngineManager {
     ///
     /// # 为什么要落盘成 `.wridx`
     ///
-    /// 索引在大词库上是**长尾灾难**：feihuzj2 方案 251 万词 → 95.4 MB 常驻，且最多缓存两份。
+    /// 索引在大词库上是**长尾灾难**：feihuzj2 方案 251 万词 → 95.4 MB 常驻，且同时缓存多份。
     /// 落盘后由 [`ReverseIndex::open`] 决定常驻还是 mmap（阈值
     /// [`REVERSE_INDEX_RESIDENT_MAX`]），大索引的字节因此完全不进程私有内存。
     ///
@@ -6380,9 +6438,34 @@ impl EngineManager {
     }
 }
 
+/// 反查索引的保留判据：本次请求的、主码表、以及当前在用集合里的（联想方案、辅助码引用的方案）。
+///
+/// 原先只留「本次 + 主码表」两份：辅助码引用五笔、联想用拼音时，三者会互相顶掉、反复秒级重建。
+fn reverse_index_keeps(k: &str, requested: &str, primary: &str, pins: &[String]) -> bool {
+    k == requested || k == primary || pins.iter().any(|p| p == k)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_index_keeps_pinned_schemas() {
+        let pins = vec!["pinyin".to_string(), "wbx".to_string()];
+        assert!(
+            reverse_index_keeps("wbx", "stroke", "wubi86", &pins),
+            "在用集合里的不淘汰"
+        );
+        assert!(
+            reverse_index_keeps("wubi86", "stroke", "wubi86", &pins),
+            "主码表不淘汰"
+        );
+        assert!(
+            reverse_index_keeps("stroke", "stroke", "wubi86", &pins),
+            "本次请求的不淘汰"
+        );
+        assert!(!reverse_index_keeps("old", "stroke", "wubi86", &pins));
+    }
 
     /// 混输引用环的路径要能直接贴进日志：自引用、互指、下游成环、菱形（非环）四种形状。
     #[test]

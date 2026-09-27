@@ -676,10 +676,10 @@ impl crate::coordinator::Coordinator {
                 // 空串的理由同上面的 `code_rev`。
                 let codes = self
                     .engine_mgr
-                    .word_codes_in(&sid, text)
+                    .word_codes_display(&sid, text)
                     .unwrap_or_default();
                 match arg {
-                    // `word_codes_in` 固定用 `/` 连接，换分隔符只能在这里替。
+                    // `word_codes_display` 固定用 `/` 连接，换分隔符只能在这里替。
                     Some(sep) if !codes.is_empty() => codes.replace('/', sep),
                     _ => codes,
                 }
@@ -833,7 +833,7 @@ impl crate::coordinator::Coordinator {
                     let sid = self.engine_mgr.code_source_schema();
                     let codes = self
                         .engine_mgr
-                        .word_codes_in(&sid, &c.text)
+                        .word_codes_display(&sid, &c.text)
                         .unwrap_or_default();
                     match arg {
                         Some(sep) if !codes.is_empty() => codes.replace('/', sep),

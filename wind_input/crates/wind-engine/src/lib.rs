@@ -24,3 +24,4 @@ pub use engine::{
 pub use english::EnglishEngine;
 pub use manager::{EngineManager, FreqSettings, FreqStrategy, SchemaDictFile};
 pub use pinyin::PinyinEngine;
+pub use text_codes::TextCodeView;
