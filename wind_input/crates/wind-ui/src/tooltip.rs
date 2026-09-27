@@ -23,6 +23,12 @@
 //! - 气泡自己的 `WM_RBUTTONDOWN` 在**任何**菜单打开期间一律不理，只认轮询那一路，免得
 //!   同一次右键请求两遍菜单；工具栏 / 状态菜单开着时右键气泡也就只关菜单。
 //!
+//! 重挂离开跟踪会招来一条**伪** `WM_MOUSELEAVE`：菜单持有捕获期间，系统记的「鼠标所在窗口」
+//! 是菜单；`ReleaseCapture` 后还没处理过一次鼠标移动时就 `TrackMouseEvent`，系统认定光标
+//! 不在气泡上，当场投递离开——而此刻抑制刚解除，照旧处理就会把刚决定留下的气泡藏掉（靶机
+//! 实测：左键点气泡关菜单、菜单开着时右键气泡另一处，气泡都随之消失）。故「离开」也问真实
+//! 光标：光标仍在气泡上就不是离开，只清掉跟踪，等下一次真实 `WM_MOUSEMOVE` 再挂。
+//!
 //! 「关掉的正是气泡的菜单」看 `suppress_hide`。它由协调器的 `SetTooltipMenuOpen` 维护，
 //! 但协调器有几条收菜单的路（打字、失焦、切走输入法、组合被终止）走的是 `HideMenu` /
 //! `HideCandidates`，不一定补发 `SetTooltipMenuOpen(false)`。故 UI 循环在这两条命令真把一个
@@ -105,6 +111,8 @@ enum MenuEvent {
     },
     /// 菜单已关闭（协调器 `SetTooltipMenuOpen(false)`，或 UI 循环收掉了可见菜单）。
     Closed { on_tip: bool },
+    /// 气泡收到 `WM_MOUSELEAVE`。`suppress` = 菜单打开中的隐藏抑制。
+    Leave { suppress: bool, on_tip: bool },
 }
 
 /// 气泡对 [`MenuEvent`] 的反应。
@@ -118,6 +126,9 @@ enum MenuStep {
     Keep,
     /// 隐藏气泡。
     Hide,
+    /// 伪离开：留下气泡，只清掉离开跟踪，等下一次真实 `WM_MOUSEMOVE` 再挂。不能当场重挂——
+    /// 系统此刻仍认定光标不在气泡上，重挂只会再收一条伪离开。
+    AwaitMove,
 }
 
 /// 判据表（设计 §7.6 B）。
@@ -139,14 +150,17 @@ fn menu_step(event: MenuEvent) -> MenuStep {
         MenuEvent::OutsidePress { .. } => MenuStep::Ignore,
         MenuEvent::Closed { on_tip: true } => MenuStep::Keep,
         MenuEvent::Closed { on_tip: false } => MenuStep::Hide,
+        // 菜单开着时的离开是移向菜单，不隐藏（气泡去留等 Closed 再定）。
+        MenuEvent::Leave { suppress: true, .. } => MenuStep::Ignore,
+        // 光标仍在气泡上：伪离开，见模块文档。
+        MenuEvent::Leave { on_tip: true, .. } => MenuStep::AwaitMove,
+        MenuEvent::Leave { .. } => MenuStep::Hide,
     }
 }
 
 /// 鼠标跟踪器：检测鼠标是否悬停在 tooltip 上（WM_MOUSELEAVE 触发时直接隐藏窗口）；
 /// 右键弹出菜单（按段 / 按行复制、上屏，复制全部，截图此窗口）。
 struct TooltipMouse {
-    /// 仅 Windows 读取（TrackMouseEvent / ShowWindow）；其它平台无 Win32 消息泵。
-    #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: HWND,
     mouse_over: Rc<Cell<bool>>,
     tracking: bool,
@@ -160,9 +174,23 @@ struct TooltipMouse {
     /// 期间自己的右键不理：菜单轮询合成的那次先发出请求、菜单还没出现，同一次右键的真实
     /// 消息随后才到，不挡就请求两遍、菜单重弹。超过 `MENU_REPLY_TIMEOUT` 视为请求已丢。
     requested_at: Cell<Option<std::time::Instant>>,
+    /// 窗口是否显示中（与 `Tooltip` 共享）：离开隐藏在这里执行，得同步它，否则
+    /// `Tooltip::hide` 的幂等判断会以为窗口还开着。
+    visible: Rc<Cell<bool>>,
+    /// 「屏幕点处最上层是不是这个窗口」，默认 [`crate::window::window_at`]；测试换桩。
+    window_at: fn(HWND, i32, i32) -> bool,
 }
 
 impl TooltipMouse {
+    /// 光标此刻是否在气泡上（问系统，不看 `mouse_over`）。
+    fn cursor_on_tip(&self) -> bool {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return false;
+        }
+        (self.window_at)(self.hwnd, p.x, p.y)
+    }
+
     /// 是否有菜单请求在途（发出后协调器尚未回应，且未超时）。
     fn request_in_flight(&self, now: std::time::Instant) -> bool {
         self.requested_at
@@ -231,16 +259,25 @@ impl WindowMouse for TooltipMouse {
                 None
             }
             WM_MOUSELEAVE => {
-                self.mouse_over.set(false);
+                // 跟踪随这条消息失效；下一次 WM_MOUSEMOVE 重挂。
                 self.tracking = false;
-                // 鼠标离开时直接隐藏（对齐 Go TooltipWindow WM_MOUSELEAVE 行为）；
-                // 菜单打开期间抑制——鼠标离开是移向菜单窗口，不是真正离开。
-                if !self.suppress_hide.get() {
-                    #[cfg(windows)]
-                    unsafe {
-                        use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                let event = MenuEvent::Leave {
+                    suppress: self.suppress_hide.get(),
+                    on_tip: self.cursor_on_tip(),
+                };
+                match menu_step(event) {
+                    MenuStep::AwaitMove => self.mouse_over.set(true),
+                    MenuStep::Hide => {
+                        // 鼠标离开时直接隐藏（对齐 Go TooltipWindow WM_MOUSELEAVE 行为）。
+                        self.mouse_over.set(false);
+                        self.visible.set(false);
+                        #[cfg(windows)]
+                        unsafe {
+                            use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+                            let _ = ShowWindow(self.hwnd, SW_HIDE);
+                        }
                     }
+                    _ => self.mouse_over.set(false),
                 }
                 None
             }
@@ -275,7 +312,8 @@ pub struct Tooltip {
     window: LayeredWindow,
     renderer: TextRenderer,
     scale: f32,
-    visible: bool,
+    /// 窗口是否显示中（与 `TooltipMouse` 共享：离开隐藏在那边执行）。
+    visible: Rc<Cell<bool>>,
     bg: [u8; 4],
     fg: [u8; 4],
     /// 主题位图背景 + z 层（jidian tooltip 吃九宫格 panel + 角标水印）。
@@ -296,8 +334,6 @@ pub struct Tooltip {
     hits: Rc<RefCell<HitState>>,
     /// 鼠标处理器本体：菜单关闭时要重挂它的离开跟踪、菜单外右键要借它请求菜单。
     mouse: Rc<RefCell<TooltipMouse>>,
-    /// 「屏幕点处最上层是不是这个窗口」，默认 [`crate::window::window_at`]；测试换桩。
-    window_at: fn(HWND, i32, i32) -> bool,
 }
 
 impl Tooltip {
@@ -308,6 +344,7 @@ impl Tooltip {
         let mouse_over = Rc::new(Cell::new(false));
         let suppress_hide = Rc::new(Cell::new(false));
         let hits = Rc::new(RefCell::new(HitState::default()));
+        let visible = Rc::new(Cell::new(false));
         // 注册鼠标跟踪：鼠标进入 tooltip 时保持可见；WM_MOUSELEAVE 触发时自动隐藏；右键弹出菜单。
         let mouse = Rc::new(RefCell::new(TooltipMouse {
             hwnd: window.hwnd(),
@@ -317,13 +354,15 @@ impl Tooltip {
             suppress_hide: suppress_hide.clone(),
             hits: hits.clone(),
             requested_at: Cell::new(None),
+            visible: visible.clone(),
+            window_at: crate::window::window_at,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
             window,
             renderer,
             scale,
-            visible: false,
+            visible,
             bg: BG,
             fg: FG,
             bg_image: None,
@@ -336,7 +375,6 @@ impl Tooltip {
             suppress_hide,
             hits,
             mouse,
-            window_at: crate::window::window_at,
         })
     }
 
@@ -491,7 +529,7 @@ impl Tooltip {
         // 内容盒按工作区钳位（下方优先，不足上翻到候选行上方）；窗口原点 = 内容锚点 − 左/上 margin。
         let (px, py) = clamp_to_work_area(x, anchor_top, anchor_bottom, cw, ch);
         self.window.show(px - ml as i32, py - mt as i32);
-        self.visible = true;
+        self.visible.set(true);
     }
 
     /// 竖排模式：在候选窗右侧显示提示，右侧空间不足时改显示在左侧。
@@ -516,7 +554,7 @@ impl Tooltip {
         let (cw, ch, ml, mt, ..) = self.render_to_window(&text);
         let (px, py) = clamp_beside(win_left, win_right, row_top, row_bottom, cw, ch);
         self.window.show(px - ml as i32, py - mt as i32);
-        self.visible = true;
+        self.visible.set(true);
     }
 
     pub fn hide(&mut self) {
@@ -524,16 +562,16 @@ impl Tooltip {
             // 鼠标正悬停在 tooltip 上，不立即隐藏；WM_MOUSELEAVE 触发后 TooltipMouse 会自动隐藏窗口。
             return;
         }
-        if self.visible {
+        if self.visible.get() {
             self.window.hide();
-            self.visible = false;
+            self.visible.set(false);
         }
     }
 
     /// 本地窗口是否处于显示态（测试用；Windows 上问系统见 [`Self::is_visible`]）。
     #[cfg(test)]
     pub(crate) fn shown(&self) -> bool {
-        self.visible
+        self.visible.get()
     }
 
     /// 是否处于「菜单打开中」的隐藏抑制（测试用）。
@@ -578,7 +616,14 @@ impl Tooltip {
     ///
     /// 「在不在气泡上」问真实光标而不看 `mouse_over`：菜单开着期间气泡收不到鼠标消息，
     /// 那个值停在鼠标移向菜单时的 false，用它判会把「点回气泡关菜单」误当成离开。
+    ///
+    /// 关闭是幂等的：抑制已解除时直接返回。协调器对同一次关闭可能下发不止一条
+    /// `SetTooltipMenuOpen(false)`（`MenuClose` 与收菜单的其它路各发一条），每条都重挂一次离开
+    /// 跟踪毫无意义；别人的菜单（工具栏 / 状态）关闭时也不该来动气泡。
     pub fn set_menu_open(&mut self, open: bool) {
+        if !open && !self.suppress_hide.get() {
+            return;
+        }
         self.suppress_hide.set(open);
         if open {
             // 协调器已回应这次请求（菜单随后就到）。
@@ -616,7 +661,7 @@ impl Tooltip {
         let step = menu_step(MenuEvent::OutsidePress {
             right,
             own_menu: self.suppress_hide.get(),
-            on_tip: (self.window_at)(self.window.hwnd(), x, y),
+            on_tip: (self.mouse.borrow().window_at)(self.window.hwnd(), x, y),
         });
         if step != MenuStep::RequestMenu {
             return false;
@@ -629,11 +674,7 @@ impl Tooltip {
 
     /// 光标此刻是否在气泡上。
     fn cursor_on_tip(&self) -> bool {
-        let mut p = POINT::default();
-        if unsafe { GetCursorPos(&mut p) }.is_err() {
-            return false;
-        }
-        (self.window_at)(self.window.hwnd(), p.x, p.y)
+        self.mouse.borrow().cursor_on_tip()
     }
 
     /// 窗口左上角屏幕坐标（分层窗口无非客户区，客户区原点即窗口原点）。
@@ -945,12 +986,18 @@ mod tests {
         // 菜单关闭：光标在气泡上就留下，否则隐藏。
         assert_eq!(menu_step(Closed { on_tip: true }), Keep);
         assert_eq!(menu_step(Closed { on_tip: false }), Hide);
+        // 离开：菜单开着时不理；光标仍在气泡上是伪离开；否则隐藏。
+        let leave = |suppress, on_tip| Leave { suppress, on_tip };
+        assert_eq!(menu_step(leave(true, true)), Ignore);
+        assert_eq!(menu_step(leave(true, false)), Ignore);
+        assert_eq!(menu_step(leave(false, true)), AwaitMove);
+        assert_eq!(menu_step(leave(false, false)), Hide);
     }
 
     fn tooltip_with_rx(on_tip: bool) -> (Tooltip, std::sync::mpsc::Receiver<UiEvent>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut t = Tooltip::new(tx).expect("mock 气泡");
-        t.window_at = if on_tip {
+        let t = Tooltip::new(tx).expect("mock 气泡");
+        t.mouse.borrow_mut().window_at = if on_tip {
             |_, _, _| true
         } else {
             |_, _, _| false
@@ -1052,23 +1099,92 @@ mod tests {
     #[test]
     fn menu_closed_off_tip_hides_even_with_stale_mouse_over() {
         let (mut t, _rx) = tooltip_with_rx(false);
-        t.visible = true;
+        t.visible.set(true);
         t.set_menu_open(true);
         t.mouse_over.set(true);
         t.set_menu_open(false);
         assert!(!t.suppress_hide.get());
         assert!(!t.mouse_over.get());
-        assert!(!t.visible);
+        assert!(!t.shown());
     }
 
     /// 菜单关闭时光标在气泡上：留下。
     #[test]
     fn menu_closed_on_tip_keeps_it() {
         let (mut t, _rx) = tooltip_with_rx(true);
-        t.visible = true;
+        t.visible.set(true);
         t.set_menu_open(true);
         t.set_menu_open(false);
-        assert!(t.visible && t.mouse_over.get());
+        assert!(t.shown() && t.mouse_over.get());
+    }
+
+    fn mouse_leave(t: &Tooltip) {
+        t.mouse
+            .borrow_mut()
+            .on_message(HWND::default(), WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+    }
+
+    /// 菜单关闭、留下气泡并重挂跟踪后，系统当场投来的离开是伪的（光标仍在气泡上）：气泡
+    /// 留下，跟踪清掉等下一次移动重挂。靶机实测左键点气泡关菜单时正是这条把气泡藏掉。
+    #[test]
+    fn spurious_leave_after_menu_close_keeps_tip() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        assert!(t.shown(), "伪离开不隐藏");
+        assert!(t.mouse_over.get(), "光标仍在气泡上");
+        assert!(!t.mouse.borrow().tracking, "跟踪失效，等下一次移动重挂");
+        // 下一次真实移动重挂跟踪。
+        t.mouse
+            .borrow_mut()
+            .on_message(HWND::default(), WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
+        assert!(t.mouse.borrow().tracking);
+    }
+
+    /// 真离开（光标已不在气泡上）：隐藏，且 `visible` 同步为 false——此后 `hide()` 按「已隐藏」
+    /// 幂等跳过，再显示时照常置回 true。
+    #[test]
+    fn real_leave_hides_and_syncs_visible() {
+        let (mut t, _rx) = tooltip_with_rx(false);
+        t.visible.set(true);
+        t.mouse_over.set(true);
+        mouse_leave(&t);
+        assert!(!t.shown(), "离开隐藏须同步 visible");
+        assert!(!t.mouse_over.get());
+        t.hide();
+        assert!(!t.shown());
+        t.show(&doc(), 0, 10, 10, 20);
+        assert!(t.shown());
+    }
+
+    /// 菜单开着时的离开（移向菜单）：不隐藏，光标在不在气泡上都一样。
+    #[test]
+    fn leave_while_menu_open_is_ignored() {
+        for on_tip in [false, true] {
+            let (mut t, _rx) = tooltip_with_rx(on_tip);
+            t.visible.set(true);
+            t.set_menu_open(true);
+            mouse_leave(&t);
+            assert!(t.shown());
+            assert!(!t.mouse_over.get());
+        }
+    }
+
+    /// 同一次关闭收到第二条 `SetTooltipMenuOpen(false)`：幂等，不再重挂跟踪。
+    #[test]
+    fn repeated_menu_close_does_not_rearm() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        assert!(t.mouse.borrow().tracking);
+        // 伪离开清掉跟踪；随后到达的重复关闭不得再挂（再挂只会再招一条伪离开）。
+        mouse_leave(&t);
+        t.set_menu_open(false);
+        assert!(!t.mouse.borrow().tracking, "重复关闭不重挂");
+        assert!(t.shown());
     }
 
     #[test]

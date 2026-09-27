@@ -340,6 +340,16 @@ pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在�
 
 - 「光标在不在气泡上」一律问系统（`WindowFromPoint` 是否为气泡窗口），不看 `mouse_over`；
   保留时重挂 `TrackMouseEvent`，之后移出气泡照常隐藏。
+- 伪 `WM_MOUSELEAVE`：菜单持有捕获期间，系统记的「鼠标所在窗口」是菜单；`ReleaseCapture` 后
+  还没处理过一次鼠标移动就重挂 `TrackMouseEvent`，系统认定光标不在气泡上，当场投递一条离开
+  （靶机日志：`WindowFromPoint` 仍是气泡、按键仍按着，离开照到）。此刻抑制刚解除，照旧处理
+  就会把刚决定留下的气泡藏掉——左键点气泡、菜单开着时右键气泡另一处，气泡都随之消失。故离开
+  也进判据表：抑制中不理；光标仍在气泡上是伪离开，不隐藏、只清跟踪，等下一次真实
+  `WM_MOUSEMOVE` 再挂（当场重挂只会再招一条）；否则隐藏。离开隐藏同步气泡的显示态，
+  `Tooltip::hide` 的幂等判断不被蒙蔽。
+- `SetTooltipMenuOpen(false)` 幂等：抑制已解除时直接返回。同一次关闭协调器可能发不止一条
+  （`MenuClose` 与收菜单的其它路各一条），多余的那条不再重挂跟踪；工具栏 / 状态菜单关闭时也
+  不来动气泡。
 - 菜单外右键：菜单轮询记下这次按下（坐标 + 是否逻辑右键，按 `SM_SWAPBUTTON` 换算），UI 循环
   紧跟菜单 `tick` 转给候选窗：落在气泡上且关掉的正是气泡的菜单 → 气泡按新位置发
   `RequestTooltipMenu`；落在候选窗上 → 合成一次候选窗右键。「关掉的正是气泡的菜单」看气泡的
