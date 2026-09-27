@@ -25,8 +25,7 @@ final class TooltipPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
-        level = .popUpMenu
-        isFloatingPanel = true
+        level = .popUpMenu // 勿再设 isFloatingPanel：会把 level 冲回 3（见 CandidatePanel.init）
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         hidesOnDeactivate = false
         ignoresMouseEvents = true   // 点击穿透, 不干扰候选框

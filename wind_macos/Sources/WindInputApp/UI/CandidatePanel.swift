@@ -258,8 +258,11 @@ final class CandidatePanel: NSPanel {
         self.isOpaque = false
         self.backgroundColor = .clear
         self.hasShadow = true
+        // ⚠️ 不要再设 `isFloatingPanel = true`：它的 setter 会把 level 改回 floating(3)，
+        // 写在这行后面等于把 `.popUpMenu` 冲掉。3 只压得住普通窗口（layer 0），压不住
+        // Spotlight / 「应用程序」列表搜索（layer 23）、Alfred 这类高层宿主，候选窗画了却
+        // 被整个盖住（A2-53 / GH#158，26.5.1 实测）。Tooltip / StatusBubble / Toast 同理。
         self.level = .popUpMenu
-        self.isFloatingPanel = true
         self.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         self.hidesOnDeactivate = false
         self.becomesKeyOnlyIfNeeded = true

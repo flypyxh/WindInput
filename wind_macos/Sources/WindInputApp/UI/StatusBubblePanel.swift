@@ -79,8 +79,7 @@ final class StatusBubblePanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
-        level = .popUpMenu
-        isFloatingPanel = true
+        level = .popUpMenu // 勿再设 isFloatingPanel：会把 level 冲回 3（见 CandidatePanel.init）
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         hidesOnDeactivate = false
         // 曾是 ignoresMouseEvents=true (点击穿透)。改为接收鼠标事件才能拖动 —— 与 Windows
