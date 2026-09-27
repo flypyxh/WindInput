@@ -4846,8 +4846,8 @@ impl EngineManager {
         if first {
             warn!(
                 "方案 {schema_id} 的 {} 不是受支持的键，已忽略——词库不带字体。\
-                 要让私用区（PUA）文字用方案自带的字体文件渲染，写在 [engine.chaizi] 的 \
-                 font_path / font_family；字体已装进系统时也可用 [candidate] font_family",
+                 方案的候选文字字体请在设置「方案管理 → 方案设置」里指定（落盘为 \
+                 [candidate] font_family，引用已安装的字体）",
                 items.join("、")
             );
         }
@@ -6437,8 +6437,10 @@ impl EngineManager {
 /// `[[dictionaries]]` 条目里写了 `font_path` / `font_family` 的，逐项返回描述。
 ///
 /// 这两个键**从来不是** `DictSpec` 的字段，serde 按未知键静默丢弃——可它们长得太像
-/// 真的了：`[engine.chaizi]` 同名同义，于是方案作者照猫画虎写进词库段，字体一路不生效、
-/// 日志一个字都没有（Toli 蒙古文方案就是这样交付的）。收进 `degraded_items` 走现成的
+/// 真的了：`[engine.chaizi]` 下有同名键（那是拆字字根字体，另一回事），方案作者便把
+/// 方案字体照这个样子写进词库段，字体一路不生效、日志一个字都没有（Toli 蒙古文方案就是
+/// 这样交付的）。方案字体的正路是 `[candidate] font_family`（设置页「方案设置」的候选字体）。
+/// 收进 `degraded_items` 走现成的
 /// toast 通路，而不是给 `DictSpec` 加两个没人读的字段。
 fn misplaced_dict_font_keys(schema: &toml::Value) -> Vec<String> {
     let Some(dicts) = schema.get("dictionaries").and_then(|d| d.as_array()) else {
@@ -6452,7 +6454,7 @@ fn misplaced_dict_font_keys(schema: &toml::Value) -> Vec<String> {
             ["font_path", "font_family"]
                 .into_iter()
                 .filter(|k| d.contains_key(*k))
-                .map(move |k| format!("[[dictionaries]] {id}.{k}（应写在 [engine.chaizi]）"))
+                .map(move |k| format!("[[dictionaries]] {id}.{k}（请改用方案设置里的候选字体）"))
         })
         .collect()
 }
@@ -7771,8 +7773,8 @@ mod tests {
         assert_eq!(
             schema.degraded_items,
             vec![
-                "[[dictionaries]] toli_main.font_path（应写在 [engine.chaizi]）".to_string(),
-                "[[dictionaries]] toli_main.font_family（应写在 [engine.chaizi]）".to_string(),
+                "[[dictionaries]] toli_main.font_path（请改用方案设置里的候选字体）".to_string(),
+                "[[dictionaries]] toli_main.font_family（请改用方案设置里的候选字体）".to_string(),
             ]
         );
 
