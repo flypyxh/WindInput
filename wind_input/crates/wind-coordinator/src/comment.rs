@@ -8,6 +8,7 @@
 //! | `${name:arg}` | 带参数的变量（如 `${chaizi_all:／}` 指定逐字分隔符） |
 //! | `${a\|b\|c}` | 取**首个非空**的变量 |
 //! | `{ … }` | 可选段：段内变量**全为空**则整段（含字面文本）消失；可嵌套，段内字面 `{` 必须配对 |
+//! | `$[颜色]{ … }` | 内联色：只管上色，**不是**可选段（内部变量照常计入外层的「有值」判定，全空时自己也不消失）；颜色写法与回落见 `docs/design/text-span-colors.md` §4 |
 //!
 //! ⚠️ 可选段按层数配对（2026-09 起，为悬停提示合并段的 `{${chaizi}{ [${chaizi_code}]}\t}`）。
 //! 此前段内第一个 `}` 即结束，段里落单的字面 `{`（如 `{(${a}{)}`）原样输出；现在它会去配
@@ -75,6 +76,9 @@ use crate::pipeline::ModeKind;
 use wind_candidate::{Candidate, CandidateSource};
 use wind_config::config::{CodeHintSource, CommentTemplateOverride};
 use wind_config::{Config, OverlaySpec};
+use wind_ui_types::{InlineColor, SpanStyle, StyledText};
+
+use std::sync::{Arc, LazyLock};
 
 /// 一次变量引用：名字 + 可选参数（`${chaizi_all:／}` 的 `／`）。
 ///
@@ -112,6 +116,10 @@ enum Node {
     /// `{ … }`：段内变量全空则整段消失。可嵌套：`{${a}{ [${b}]}\t}` 里内段只管 `b`，
     /// 外段在 `a`、`b` 任一非空时保留（悬停提示「拆字 / 拼音」合并段就靠这个表达）。
     Group(Vec<Node>),
+    /// `$[颜色]{ … }`：只管上色。内部变量照常计入外层的「有值」判定；全空时它自己**不**消失
+    /// ——要「空则消失」就再套一层可选段。这样给任意一段花括号配平的片段包上 `$[…]{}`，
+    /// 文字输出逐字节不变（设计 text-span-colors.md §4.3）。
+    Color(InlineColor, Vec<Node>),
 }
 
 /// 解析模板。**不会失败**——未闭合的 `${` / `{` 一律退化为字面文本。
@@ -125,6 +133,22 @@ fn parse(tpl: &str) -> Vec<Node> {
     let mut text = String::new();
     let mut i = 0usize;
     while i < b.len() {
+        // `$[颜色]{…}`：语法不成立即 `$` 按字面输出、从 `[` 继续扫描（§4.4）。
+        if b[i] == b'$'
+            && i + 1 < b.len()
+            && b[i + 1] == b'['
+            && let Some((spec_end, body_end)) = color_bounds(b, i + 2)
+        {
+            if !text.is_empty() {
+                nodes.push(Node::Text(std::mem::take(&mut text)));
+            }
+            nodes.push(Node::Color(
+                InlineColor::parse(&tpl[i + 2..spec_end]),
+                parse(&tpl[spec_end + 2..body_end]),
+            ));
+            i = body_end + 1;
+            continue;
+        }
         // `${a|b}` —— 先于裸 `{` 判定，否则变量的 `{` 会被当成段起点。
         if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
             if let Some(end) = find_byte(b, i + 2, b'}') {
@@ -176,6 +200,25 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
+/// `SPEC` 的长度上限（字节）。超过即不算内联色语法——防止一个落单的 `$[` 把后面整段模板
+/// 都吞成颜色说明。
+const COLOR_SPEC_MAX: usize = 64;
+
+/// `$[` 之后（`from` 指向 `SPEC` 首字节）：语法成立时返回 `(']' 的位置, BODY 结束 '}' 的位置)`。
+///
+/// 成立只看两条（§4.4）：`SPEC` 里不含 `{` `}` 换行且不超过 64 字节；`]` 紧跟 `{` 且 `BODY`
+/// 按层数配对闭合。`SPEC` 写的是什么不影响成立——颜色非法照样是内联色，只是按正文色显示。
+fn color_bounds(b: &[u8], from: usize) -> Option<(usize, usize)> {
+    let limit = (from + COLOR_SPEC_MAX + 1).min(b.len());
+    let close = (from..limit).find(|&j| matches!(b[j], b']' | b'{' | b'}' | b'\n'))?;
+    if b[close] != b']' || close + 1 >= b.len() || b[close + 1] != b'{' {
+        return None;
+    }
+    // BODY 与可选段同一套配对规则：`SPEC` 里不许出现花括号，故 `$[…]{…}` 贡献的花括号天然配平。
+    let end = find_group_end(b, close + 2)?;
+    Some((close, end))
+}
+
 fn find_byte(b: &[u8], from: usize, target: u8) -> Option<usize> {
     (from..b.len()).find(|&i| b[i] == target)
 }
@@ -204,20 +247,85 @@ fn find_group_end(b: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// 渲染结果：文本 + 「本段里出现过非空变量吗」。
+/// 结构角色（§3.2）：模板字面文字在正文里是 `literal`，在段名里是 `title`。常驻一份，
+/// 免得每段字面文字都分配一个 `Arc<str>`。
+static ROLE_LITERAL: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("literal"));
+static ROLE_TITLE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("title"));
+
+/// 变量名 → 角色名：只有一张别名表（`code` → `code_rev`、`code_all` → `code_rev_all`，
+/// 见 `Coordinator::eval_var` 的兼容别名说明）。主题只需认规范名。
+pub(crate) fn role_of(name: &str) -> &str {
+    match name {
+        "code" => "code_rev",
+        "code_all" => "code_rev_all",
+        other => other,
+    }
+}
+
+/// 片段构建器：输出缓冲 + 颜色栈 + 「是否在段名里」。
+///
+/// `Color` 节点**在当前构建器里原地渲染**（进入时压栈、退出时弹栈），不另开子构建器：
+/// 「空变量吞掉紧邻的一个空白」看的永远是同一个输出缓冲的末尾，跨颜色边界照吞。若 `Color`
+/// 也开子构建器，`${pinyin} $[accent]{${chaizi}}` 里 `${chaizi}` 为空时它看到的是空的子缓冲，
+/// 吞不到外面那个空格（§8.1）。只有 `Group` 用子构建器——它要先渲染再决定整段要不要。
+struct Builder {
+    out: StyledText,
+    colors: Vec<InlineColor>,
+    in_title: bool,
+}
+
+impl Builder {
+    fn new(in_title: bool) -> Self {
+        Self {
+            out: StyledText::new(),
+            colors: Vec::new(),
+            in_title,
+        }
+    }
+
+    /// 同颜色栈、同段名语境的空子构建器（`Group` 用）。
+    fn child(&self) -> Self {
+        Self {
+            out: StyledText::new(),
+            colors: self.colors.clone(),
+            in_title: self.in_title,
+        }
+    }
+
+    fn push(&mut self, s: &str, role: Option<Arc<str>>) {
+        let style = SpanStyle {
+            role,
+            in_title: self.in_title,
+            color: self.colors.last().cloned(),
+        };
+        self.out.push(s, &style);
+    }
+
+    fn push_literal(&mut self, s: &str) {
+        let role = if self.in_title {
+            &*ROLE_TITLE
+        } else {
+            &*ROLE_LITERAL
+        };
+        self.push(s, Some(role.clone()));
+    }
+
+    /// 吞掉末尾一个空格或制表符。
+    fn pop_whitespace(&mut self) {
+        self.out.pop_if(|c| c == ' ' || c == '\t');
+    }
+}
+
+/// 渲染节点序列到构建器，返回「本段里出现过非空（且计数的）变量吗」。
 ///
 /// 后者是可选段与顶层的存废依据，**必须与文本分开返回**：一个段可能渲染出非空文本
 /// （字面装饰字符）却一个变量都没填上，那正是要整段丢弃的情形（`(拼: )`）。
-struct Rendered {
-    text: String,
-    any_var_filled: bool,
-}
-
-/// 渲染节点序列。`eval` 按变量名求值：`None` = **未知变量名**，`Some("")` = 已知但为空。
+///
+/// `eval` 按变量名求值：`None` = **未知变量名**，`Some("")` = 已知但为空。
 ///
 /// 两者刻意区分：未知变量名原样输出 `${name}` 并**计作已填充**，于是拼错的变量名一定会
 /// 显示在候选栏里让用户看见。若把未知当空处理，用户得到的是「配了没反应」——本仓记忆里
-/// 反复出现的那类静默失效。
+/// 反复出现的那类静默失效。回显不带角色：它是错误提示，用正文色，不借任何角色的色。
 ///
 /// `counts(name)` 决定「这个变量填上了」算不算数：悬停提示的逐字段里 `${char}` 恒非空，
 /// 若计入，查不到读音的字会留下孤零零的 `好：`。注释段传恒真。
@@ -225,85 +333,85 @@ fn render_nodes(
     nodes: &[Node],
     eval: &impl Fn(&str, Option<&str>) -> Option<String>,
     counts: &impl Fn(&str) -> bool,
-) -> Rendered {
-    let mut out = String::new();
+    b: &mut Builder,
+) -> bool {
     let mut any = false;
     for node in nodes {
         match node {
-            Node::Text(t) => out.push_str(t),
+            Node::Text(t) => b.push_literal(t),
             Node::Var(refs) => {
                 // 未知名恒排在「首个非空」判定之外单独处理：它不是值，是错误提示。
-                let mut value: Option<(String, bool)> = None;
+                // 角色 = **实际取到值的那个变量**（`${code_hint|code_rev}` 取到反查码时是 code_rev）。
+                let mut value: Option<(String, bool, Option<&str>)> = None;
                 for r in refs {
                     match eval(&r.name, r.arg.as_deref()) {
                         None => {
-                            value = Some((format!("${{{}}}", r.name), true));
+                            value = Some((format!("${{{}}}", r.name), true, None));
                             break;
                         }
                         Some(v) if !v.is_empty() => {
-                            value = Some((v, counts(&r.name)));
+                            value = Some((v, counts(&r.name), Some(role_of(&r.name))));
                             break;
                         }
                         Some(_) => {} // 已知但空 → 试下一个回退
                     }
                 }
                 match value {
-                    Some((v, counted)) => {
-                        out.push_str(&v);
+                    Some((v, counted, role)) => {
+                        b.push(&v, role.map(Arc::from));
                         any |= counted;
                     }
                     // 空变量吞掉紧邻的一个空白：`(拼: ${pinyin} ${chaizi})` 在拆字为空时
                     // 不留下 `)` 前那个多余空格。只吞一个——吞到底会把用户有意排的版式抹平。
-                    None => {
-                        if out.ends_with(' ') || out.ends_with('\t') {
-                            out.pop();
-                        }
-                    }
+                    None => b.pop_whitespace(),
                 }
             }
             Node::Group(inner) => {
-                let r = render_nodes(inner, eval, counts);
-                if r.any_var_filled {
-                    out.push_str(&r.text);
+                let mut child = b.child();
+                if render_nodes(inner, eval, counts, &mut child) {
+                    b.out.append(&child.out);
                     any = true;
-                } else if out.ends_with(' ') || out.ends_with('\t') {
+                } else {
                     // 整段消失时同样吞掉紧邻空白（`${code}{ (${pinyin})}` → `wq`，非 `wq `）。
-                    out.pop();
+                    b.pop_whitespace();
                 }
+            }
+            Node::Color(color, inner) => {
+                b.colors.push(color.clone());
+                any |= render_nodes(inner, eval, counts, b);
+                b.colors.pop();
             }
         }
     }
-    Rendered {
-        text: out,
-        any_var_filled: any,
-    }
+    any
 }
 
-/// 渲染模板。**纯函数**。
+/// 渲染模板为带分段样式的文字。**纯函数**。
 ///
-/// 整个模板按一个隐式可选段处理：所有变量都为空 ⇒ 返回空串。否则返回渲染结果（已 trim
+/// 整个模板按一个隐式可选段处理：所有变量都为空 ⇒ 返回空。否则返回渲染结果（已 trim
 /// 首尾空白——模板里为分隔而写的空格，在相邻内容缺席时不该留在两端）。
 ///
-/// `max_chars` = 0 表示不限；超出则截断并加 `…`。
+/// `max_chars` = 0 表示不限；超出则按字符截断并加 `…`（`…` 继承被截处前一个字的样式）。
+pub(crate) fn render_styled(
+    tpl: &str,
+    max_chars: usize,
+    eval: impl Fn(&str, Option<&str>) -> Option<String>,
+) -> StyledText {
+    let mut b = Builder::new(false);
+    if !render_nodes(&parse(tpl), &eval, &|_| true, &mut b) {
+        return StyledText::new();
+    }
+    b.out.trim().truncate_chars(max_chars, "…")
+}
+
+/// [`render_styled`] 的纯文本形态：要上屏的文字（`alt_commit_text` 上屏注释、`reverse_render`
+/// 的 cmdbar `dict.rev`），`$[…]{}` 只留 `BODY` 的文字（§4.6）。
 pub(crate) fn render(
     tpl: &str,
     max_chars: usize,
     eval: impl Fn(&str, Option<&str>) -> Option<String>,
 ) -> String {
-    let r = render_nodes(&parse(tpl), &eval, &|_| true);
-    if !r.any_var_filled {
-        return String::new();
-    }
-    let s = r.text.trim();
-    if max_chars == 0 {
-        return s.to_string();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
-        return s.to_string();
-    }
-    let head: String = chars[..max_chars].iter().collect();
-    format!("{head}…")
+    render_styled(tpl, max_chars, eval).into_string()
 }
 
 /// 预解析的模板：配置快照里存一份，候选循环里只渲染不解析。
@@ -323,23 +431,38 @@ impl Template {
     /// 与注释段的 [`render`] 不同，这里**既不 trim、也不做「全空则整体消失」**，都留给调用方：
     /// 悬停提示的原始行是复制 / 上屏的取值来源，完整原文开头的缩进、`\t` 必须原样保留；
     /// 段内容全空要消失，而段名的字面文字（`编码`）不能消失。
+    #[cfg(test)]
     pub(crate) fn render(
         &self,
         eval: &impl Fn(&str, Option<&str>) -> Option<String>,
         counts: &impl Fn(&str) -> bool,
     ) -> (String, bool) {
-        let r = render_nodes(&self.0, eval, counts);
-        (r.text, r.any_var_filled)
+        let (t, filled) = self.render_styled(eval, counts, false);
+        (t.into_string(), filled)
+    }
+
+    /// 同 [`Self::render`]，产出带分段样式的文字。`in_title` = 这是段名模板：字面文字的角色
+    /// 是 `title` 而非 `literal`，变量片段带 `in_title`（角色未配色时回落 `title`，§3.2）。
+    pub(crate) fn render_styled(
+        &self,
+        eval: &impl Fn(&str, Option<&str>) -> Option<String>,
+        counts: &impl Fn(&str) -> bool,
+        in_title: bool,
+    ) -> (StyledText, bool) {
+        let mut b = Builder::new(in_title);
+        let filled = render_nodes(&self.0, eval, counts, &mut b);
+        (b.out, filled)
     }
 
     /// 模板的**字面文字**里是否含字符 `c`（不看变量值）。悬停提示据此认出「分列行」：
     /// 模板自己写了 `\t` 的段才是有意分列，变量值里带进来的 `\t` 只是内容。
     pub(crate) fn has_literal(&self, c: char) -> bool {
         fn walk(nodes: &[Node], c: char) -> bool {
+            // ⚠️ 必须下钻 `Color`：漏了的话 `$[x]{…\t…}` 不被认为是分列段 → 被折行。
             nodes.iter().any(|n| match n {
                 Node::Text(t) => t.contains(c),
                 Node::Var(_) => false,
-                Node::Group(inner) => walk(inner, c),
+                Node::Group(inner) | Node::Color(_, inner) => walk(inner, c),
             })
         }
         walk(&self.0, c)
@@ -349,10 +472,12 @@ impl Template {
     /// 代价高的数据（调试上下文、反查索引），没引用就不算。
     pub(crate) fn references(&self, name: &str) -> bool {
         fn walk(nodes: &[Node], name: &str) -> bool {
+            // ⚠️ 必须下钻 `Color`：漏了的话 `$[x]{${debug}}` 不被认为引用了 debug →
+            // 调试上下文不准备 → 段静默为空。
             nodes.iter().any(|n| match n {
                 Node::Text(_) => false,
                 Node::Var(refs) => refs.iter().any(|r| r.name == name),
-                Node::Group(inner) => walk(inner, name),
+                Node::Group(inner) | Node::Color(_, inner) => walk(inner, name),
             })
         }
         walk(&self.0, name)
@@ -686,8 +811,8 @@ impl crate::coordinator::Coordinator {
         reverse: &wind_reverse::ReverseLookup,
         hint_source: CodeHintSource,
         dict_schema: &str,
-    ) -> String {
-        render(tpl, max_chars, |name, arg| {
+    ) -> StyledText {
+        render_styled(tpl, max_chars, |name, arg| {
             self.eval_var(name, arg, c, reverse, hint_source, dict_schema)
         })
     }
@@ -1922,7 +2047,6 @@ mod legacy_parity {
         "a}b{c",
         "${ a } ${a:} ${a:x:y}",
         "中文标签：${a}，${b}。",
-        "$[accent]{${a}}",
         "$[x]{",
         "",
     ];
@@ -2009,5 +2133,269 @@ mod legacy_parity {
                 }
             }
         }
+    }
+}
+
+/// 内联色 `$[…]{}` 与片段角色（设计 text-span-colors.md §3.2、§4、§8.1）。
+#[cfg(test)]
+mod styled_tests {
+    use super::*;
+    use wind_theme::{Atom, ColorRef};
+
+    fn ev<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str, Option<&str>) -> Option<String> + 'a {
+        move |n, _| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// `(文字, 角色, 颜色名)` 逐段列出；颜色名取常态亮侧原子的名字 / `#` / `!`（非法）。
+    fn spans(t: &StyledText) -> Vec<(String, Option<String>, Option<String>)> {
+        t.spans()
+            .iter()
+            .map(|s| {
+                let color = s.color.as_ref().map(|c| match &c.normal.light {
+                    Atom::Name(n) => n.to_string(),
+                    Atom::Rgba(_) => "#".to_string(),
+                    Atom::Invalid => "!".to_string(),
+                });
+                (
+                    t.as_str()[s.start as usize..s.end as usize].to_string(),
+                    s.role.as_deref().map(str::to_string),
+                    color,
+                )
+            })
+            .collect()
+    }
+
+    fn sp(
+        text: &str,
+        role: Option<&str>,
+        color: Option<&str>,
+    ) -> (String, Option<String>, Option<String>) {
+        (text.into(), role.map(Into::into), color.map(Into::into))
+    }
+
+    /// 去掉模板里全部 `$[…]{` 与对应的 `}`（仅供「纯加法」断言，用例里的 BODY 不含别的 `}`
+    /// 以外的结构时足够）：按解析树重建文字，不靠字符串替换。
+    fn strip_colors(tpl: &str) -> String {
+        fn walk(nodes: &[Node], out: &mut String) {
+            for n in nodes {
+                match n {
+                    Node::Text(t) => out.push_str(t),
+                    Node::Var(refs) => {
+                        out.push_str("${");
+                        let names: Vec<String> = refs
+                            .iter()
+                            .map(|r| match &r.arg {
+                                Some(a) => format!("{}:{a}", r.name),
+                                None => r.name.clone(),
+                            })
+                            .collect();
+                        out.push_str(&names.join("|"));
+                        out.push('}');
+                    }
+                    Node::Group(inner) => {
+                        out.push('{');
+                        walk(inner, out);
+                        out.push('}');
+                    }
+                    Node::Color(_, inner) => walk(inner, out),
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(&parse(tpl), &mut out);
+        out
+    }
+
+    /// 「加颜色」是纯加法：包上 `$[…]{}` 前后，文字输出逐字节相同（§4.3）。
+    #[test]
+    fn wrapping_in_color_is_purely_additive() {
+        let cases = [
+            "$[accent]{${a}}",
+            "(${a} $[accent]{${b}})",
+            "{$[accent]{(${a})}}",
+            "$[accent]{{(${a})}}",
+            "${a}$[#C00000/#FF8080]{(${b})}",
+            "$[text_dim,selected=on_accent]{${a}}：$[warning]{${b}}",
+            "${a}{ $[success]{[${b}]}}",
+            "$[x]{$[y]{${a}} ${b}}",
+            "$[红]{${a}}",
+        ];
+        let fixtures: [&[(&str, &str)]; 4] = [
+            &[("a", "nǐ"), ("b", "亻尔")],
+            &[("a", "nǐ"), ("b", "")],
+            &[("a", ""), ("b", "亻尔")],
+            &[("a", ""), ("b", "")],
+        ];
+        for tpl in cases {
+            let plain = strip_colors(tpl);
+            assert!(!plain.contains("$["), "{tpl}: 剥色后仍有 $[");
+            for fx in fixtures {
+                assert_eq!(
+                    render(tpl, 0, ev(fx)),
+                    render(&plain, 0, ev(fx)),
+                    "{tpl} vs {plain}，取值 {fx:?}"
+                );
+                let t = Template::parse(tpl).render(&ev(fx), &|_| true);
+                let p = Template::parse(&plain).render(&ev(fx), &|_| true);
+                assert_eq!(t, p, "Template {tpl} vs {plain}，取值 {fx:?}");
+            }
+        }
+    }
+
+    /// 内联色只管上色、不是可选段：内部变量全空时它自己不消失（`()` 留着）。
+    #[test]
+    fn color_is_not_an_optional_group() {
+        let t = render("${b}$[accent]{(${a})}", 0, ev(&[("a", ""), ("b", "x")]));
+        assert_eq!(t, "x()");
+        // 要「空则消失」就套一层可选段，两种写法等价。
+        for tpl in ["${b}{$[accent]{(${a})}}", "${b}$[accent]{{(${a})}}"] {
+            assert_eq!(render(tpl, 0, ev(&[("a", ""), ("b", "x")])), "x", "{tpl}");
+        }
+    }
+
+    /// 内部变量计入外层「有值」判定：外层可选段因颜色段里的变量而保留。
+    #[test]
+    fn color_body_vars_count_for_enclosing_group() {
+        let t = render("{[$[accent]{${a}}]}", 0, ev(&[("a", "x")]));
+        assert_eq!(t, "[x]");
+    }
+
+    /// 空变量吞空白跨颜色边界照吞：`${chaizi}` 为空时 `)` 前不留空格；
+    /// 同一模板经 `Template::render_styled`（不 trim）渲染，行尾也不多空格。
+    #[test]
+    fn whitespace_swallow_crosses_color_boundary() {
+        let fx = [("pinyin", "nǐ"), ("chaizi", "")];
+        assert_eq!(
+            render("(${pinyin} $[accent]{${chaizi}})", 0, ev(&fx)),
+            "(nǐ)"
+        );
+        let (t, _) = Template::parse("${pinyin} $[accent]{${chaizi}}").render_styled(
+            &ev(&fx),
+            &|_| true,
+            false,
+        );
+        assert_eq!(t.as_str(), "nǐ");
+        assert_eq!(spans(&t), vec![sp("nǐ", Some("pinyin"), None)]);
+    }
+
+    /// 角色：变量值 = 归一后的变量名（别名、回退链取到的那个）；字面 = literal；
+    /// 未知变量回显无角色（不建区间）。
+    #[test]
+    fn roles_follow_the_variable_that_produced_the_text() {
+        let fx = [("code_hint", ""), ("code", "wq"), ("pinyin", "nǐ")];
+        let t = render_styled("${code_hint|code}(${pinyin}) ${pinyn}", 0, ev(&fx));
+        assert_eq!(t.as_str(), "wq(nǐ) ${pinyn}");
+        assert_eq!(
+            spans(&t),
+            vec![
+                sp("wq", Some("code_rev"), None),
+                sp("(", Some("literal"), None),
+                sp("nǐ", Some("pinyin"), None),
+                sp(") ", Some("literal"), None),
+            ]
+        );
+        assert_eq!(role_of("code_all"), "code_rev_all");
+    }
+
+    /// 颜色栈：内联色标在其内的全部片段上（嵌套取内层），字面文字也带色。
+    #[test]
+    fn inline_color_marks_everything_inside() {
+        let t = render_styled(
+            "$[accent]{(${a}$[#F80]{${b}})}",
+            0,
+            ev(&[("a", "x"), ("b", "y")]),
+        );
+        assert_eq!(t.as_str(), "(xy)");
+        assert_eq!(
+            spans(&t),
+            vec![
+                sp("(", Some("literal"), Some("accent")),
+                sp("x", Some("a"), Some("accent")),
+                sp("y", Some("b"), Some("#")),
+                sp(")", Some("literal"), Some("accent")),
+            ]
+        );
+    }
+
+    /// 语法成立与否只看结构，不看颜色写得对不对（§4.4）。
+    #[test]
+    fn syntax_validity_is_structural() {
+        let fx = [("a", "x")];
+        // 颜色非法：语法成立，只显示 BODY。
+        for tpl in ["$[红]{${a}}", "$[]{${a}}", "$[#GG]{${a}}"] {
+            let t = render_styled(tpl, 0, ev(&fx));
+            assert_eq!(t.as_str(), "x", "{tpl}");
+            let c = t.spans()[0].color.as_ref().expect("仍是内联色");
+            assert_eq!(
+                c.normal,
+                ColorRef {
+                    light: Atom::Invalid,
+                    dark: Atom::Invalid
+                }
+            );
+        }
+        // 结构不成立：`$` 按字面、从 `[` 继续扫描——与引入内联色之前的引擎逐字节相同。
+        let long = format!("$[{}]{{${{a}}}}", "a".repeat(65));
+        for tpl in [
+            "$[accent${a}",
+            "$[accent]${a}",
+            "$[acc\nent]{${a}}",
+            "$[a{b]{${a}}",
+            "$[a]{${a}",
+            long.as_str(),
+        ] {
+            let got = render(tpl, 0, ev(&fx));
+            assert!(got.starts_with("$["), "{tpl:?} 不成立，应留字面：{got}");
+            assert_eq!(got, super::legacy_ref::render(tpl, 0, ev(&fx)), "{tpl:?}");
+        }
+        let ok64 = format!("$[{}]{{${{a}}}}", "a".repeat(64));
+        assert_eq!(render(&ok64, 0, ev(&fx)), "x", "恰 64 字节成立");
+    }
+
+    /// 截断标记 `…` 继承被截处前一个字的样式。
+    #[test]
+    fn truncation_mark_inherits_style() {
+        let t = render_styled("$[accent]{${a}}", 2, ev(&[("a", "abcd")]));
+        assert_eq!(t.as_str(), "ab…");
+        assert_eq!(spans(&t), vec![sp("ab…", Some("a"), Some("accent"))]);
+    }
+
+    /// 段名模板：字面文字角色 title、变量片段 in_title。
+    #[test]
+    fn title_context_marks_literals_and_vars() {
+        let (t, _) = Template::parse("编码{(${code_source})}").render_styled(
+            &ev(&[("code_source", "五笔")]),
+            &|_| true,
+            true,
+        );
+        assert_eq!(t.as_str(), "编码(五笔)");
+        assert_eq!(
+            spans(&t),
+            vec![
+                sp("编码(", Some("title"), None),
+                sp("五笔", Some("code_source"), None),
+                sp(")", Some("title"), None),
+            ]
+        );
+        assert!(t.spans().iter().all(|s| s.in_title));
+    }
+
+    /// 两个 walker 必须下钻 Color 节点（§8.1 ⚠️）。
+    #[test]
+    fn walkers_descend_into_color() {
+        let t = Template::parse("$[x]{${debug}}");
+        assert!(
+            t.references("debug"),
+            "漏下钻 ⇒ 调试上下文不准备、段静默为空"
+        );
+        let t = Template::parse("$[x]{a\tb}");
+        assert!(t.has_literal('\t'), "漏下钻 ⇒ 分列段被折行");
     }
 }

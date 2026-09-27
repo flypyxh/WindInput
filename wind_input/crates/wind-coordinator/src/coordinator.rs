@@ -6288,7 +6288,7 @@ impl Coordinator {
                         self.resolve_index_label(cand_cfg, i)
                     },
                     tooltip,
-                    comment: comment.into(),
+                    comment,
                     no_index: hide_index,
                 }
             })
@@ -9414,6 +9414,79 @@ mod mode_comment_e2e_tests {
             Some("临英码".to_string()),
             "临英期间必须改用模式级模板——只测 template_for 抓不到消费端没接线"
         );
+    }
+
+    /// `TEXT_ROLES` 契约清单（设计 text-span-colors.md §3.1）里每个变量名都能被某个求值入口
+    /// 求出值（空串也算）：候选上下文（`eval_var`）、气泡附加（`cand_eval`）、逐字上下文。
+    ///
+    /// 判据落在「写进模板不会原样回显 `${…}`」上——那正是求值入口不认这个名字时的表现。
+    /// 走真实的 `notify_ui_update`，气泡附加那几个变量只在它的闭包里，单测够不着。
+    #[test]
+    fn every_text_role_is_evaluable_somewhere() {
+        const PER_CHAR: &[&str] = &["char", "readings", "unicode"];
+        let vars: Vec<&str> = wind_ui_types::TEXT_ROLES
+            .iter()
+            .copied()
+            .filter(|r| !matches!(*r, "title" | "literal"))
+            .collect();
+        let whole: String = vars
+            .iter()
+            .filter(|v| !PER_CHAR.contains(v))
+            .map(|v| format!("${{{v}}}"))
+            .collect();
+        let per_char: String = PER_CHAR.iter().map(|v| format!("${{{v}}}")).collect();
+        // 注释段只有候选上下文（`eval_var`）；气泡的整段求值再加上气泡附加变量。
+        const BUBBLE_ONLY: &[&str] = &[
+            "word_code",
+            "code_source",
+            "debug",
+            "full_text",
+            "unicode_all",
+        ];
+        let cand_ctx: String = vars
+            .iter()
+            .filter(|v| !PER_CHAR.contains(v) && !BUBBLE_ONLY.contains(v))
+            .map(|v| format!("${{{v}}}"))
+            .collect();
+        let tooltip_of = |comment_tpl: &str, whole_tpl: &str| {
+            let mut cfg = Config::default();
+            cfg.ui.candidate.comment_template_vertical = format!("${{code_hint}}{comment_tpl}");
+            cfg.ui.candidate.comment_template_horizontal = format!("${{code_hint}}{comment_tpl}");
+            let sec = |each: &str, template: &str| wind_config::config::TooltipSection {
+                enabled: true,
+                label: "段".into(),
+                template: template.into(),
+                each: each.into(),
+                promote: String::new(),
+                inline: false,
+            };
+            cfg.ui.tooltip.sections =
+                vec![sec("", &format!("整{whole_tpl}")), sec("char", &per_char)];
+            let (c, rx) = coord_with_ui(cfg);
+            emit(&c, None);
+            let mut got = None;
+            while let Ok(cmd) = rx.try_recv() {
+                if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                    got = candidates
+                        .first()
+                        .map(|c| (c.comment.as_str().to_string(), c.tooltip.to_plain_text()));
+                }
+            }
+            got.expect("应下发候选")
+        };
+        let (comment, tooltip) = tooltip_of(&cand_ctx, &whole);
+        assert!(
+            !comment.contains("${"),
+            "注释里有求值入口不认的变量：{comment}"
+        );
+        assert!(
+            !tooltip.contains("${"),
+            "气泡里有求值入口不认的变量：{tooltip}"
+        );
+        // 防空转：逐字段的 `${unicode}` 恒有值，气泡一定在；拼错的名字一定会回显。
+        assert!(tooltip.contains("U+6D4B"), "气泡应含逐字段：{tooltip}");
+        let (comment, tooltip) = tooltip_of("${no_such_var}", "${no_such_var}");
+        assert!(comment.contains("${no_such_var}") && tooltip.contains("${no_such_var}"));
     }
 
     /// ★ 空串 = 本模式不显示注释（与「跟随全局」是两回事），且这条语义要一路走到 UI。
