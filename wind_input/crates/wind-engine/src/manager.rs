@@ -521,6 +521,18 @@ pub struct EngineManager {
     /// 不该和引擎构建互相阻塞，两者的等待方也不同（前者是后台线程，后者是切换方案的用户）。
     /// 兼作「是否正在建」的判据（`try_lock` 失败即在建），供打字线路决定要不要再 spawn。
     index_build_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 反查索引被 build_guard 跳过（同一份输入已连续死在构建中）的方案。
+    ///
+    /// 跳过时不写 `reverse_index` 缓存（空表会被当真结果用），于是「没就绪」一直成立；
+    /// 若不另记一笔，协调器每次重绘都会判「该预热」→ 起线程 → 再次 Skip → 通知重绘，
+    /// 无限循环（且每轮重读方案、打 error! 日志）。记在这里后预热/判在建直接短路。
+    ///
+    /// 与 `reverse_index` 同生命周期：凡清空那张表的地方（启用词库变更、方案失效、
+    /// 配置重载、「重建词库缓存」经 invalidate_schema）一并清空，即给一次重试机会。
+    reverse_index_skipped: Mutex<std::collections::HashSet<String>>,
+    /// 测试钩子：[`Self::build_reverse_index_for`] 被调用的次数（证明短路生效）。
+    #[cfg(test)]
+    reverse_index_build_calls: std::sync::atomic::AtomicUsize,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -767,6 +779,9 @@ impl EngineManager {
             shuangpin_reverse_cache: Mutex::new((String::new(), None)),
             build_locks: Mutex::new(HashMap::new()),
             index_build_locks: Mutex::new(HashMap::new()),
+            reverse_index_skipped: Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            reverse_index_build_calls: std::sync::atomic::AtomicUsize::new(0),
         };
         // 仅同步构建活跃方案；其余方案由 Coordinator 启动后台预热（prewarm_schema）提前构建，
         // 避免首次切换时同步重熔大词库卡顿。单飞构建锁保证预热与切换不重复构建。
@@ -1160,8 +1175,8 @@ impl EngineManager {
     /// 展示类调用方（悬停 [编码] 段、候选注释）`unwrap_or_default()` 即可 —— 这一次
     /// 不显示编码，下一次索引好了自然就有了。
     ///
-    /// **本方法绝不阻塞**。需要「等到就绪为止」的调用方用
-    /// [`Self::word_codes_in_blocking`]，并且必须清楚自己会等上秒级。
+    /// **本方法绝不阻塞**。索引没就绪时调用方应后台预热（协调器的
+    /// `ensure_reverse_index_async`）并本次放弃，而不是就地等。
     pub fn word_codes_in(&self, schema_id: &str, text: &str) -> Option<String> {
         if schema_id.is_empty() {
             return Some(String::new()); // 没指定方案＝确定无从查起，不是「没就绪」
@@ -1172,29 +1187,6 @@ impl EngineManager {
                 .map(|codes| codes.join("/"))
                 .unwrap_or_default(),
         )
-    }
-
-    /// 同 [`Self::word_codes_in`]，但**索引没建好就地建**（可能阻塞秒级）。
-    ///
-    /// 只给「宁可等、也不能拿到错误答案」的调用方用——目前只有加词去重。
-    /// ⚠️ **绝不可用在按键处理链路上**：TSF→服务是同步 IPC，那一等就是整机卡顿。
-    ///
-    /// 索引本次建不出来（build_guard 退避）时返回 `Err(可读原因)`——**不能**当作查无此词，
-    /// 那等于去重失效；调用方应中止加词并把原因告诉用户。
-    pub fn word_codes_in_blocking(&self, schema_id: &str, text: &str) -> Result<String, String> {
-        if schema_id.is_empty() {
-            return Ok(String::new());
-        }
-        let idx = self.reverse_index_for(schema_id).ok_or_else(|| {
-            format!(
-                "方案 {schema_id} 的反查索引此前多次构建失败（常见原因是内存不足），\
-                 暂时无法校验重复，已取消本次加词。释放内存后可在设置里重建词库缓存再试。"
-            )
-        })?;
-        Ok(idx
-            .codes_of(text)
-            .map(|codes| codes.join("/"))
-            .unwrap_or_default())
     }
 
     /// **词语联想的词源方案**：从哪本词库里捞「以上文为前缀的更长的词」。
@@ -1455,7 +1447,17 @@ impl EngineManager {
         if let Some(m) = self.reverse_index_if_ready(schema_id) {
             return Some(m);
         }
-        let m = Arc::new(self.build_reverse_index_for(schema_id)?);
+        if self.reverse_index_skipped(schema_id) {
+            return None;
+        }
+        let Some(idx) = self.build_reverse_index_for(schema_id) else {
+            self.reverse_index_skipped
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(schema_id.to_string());
+            return None;
+        };
+        let m = Arc::new(idx);
         let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
         guard.insert(schema_id.to_string(), m.clone());
         guard.retain(|k, _| k == schema_id || k == &primary);
@@ -1468,15 +1470,27 @@ impl EngineManager {
     /// 恰好落在打字的同步链路上。预热线程本就在启动后 1.5 秒跑，把这件事挪进去，
     /// 绝大多数用户就再也碰不到它。
     ///
-    /// 幂等；返回是否真的执行了构建（供调用方计时/记日志）。
+    /// 幂等；返回是否真的得到了索引（供调用方计时/记日志、决定要不要通知重绘）。
+    /// 被 build_guard 跳过时返回 `false`，此后直到缓存失效都不再尝试
+    /// （见 `reverse_index_skipped`）。
     ///
     /// 单飞在 [`Self::reverse_index_for`] 里（`index_build_locks`）。
     pub fn prewarm_reverse_index(&self, schema_id: &str) -> bool {
-        if schema_id.is_empty() || self.reverse_index_if_ready(schema_id).is_some() {
+        if schema_id.is_empty()
+            || self.reverse_index_if_ready(schema_id).is_some()
+            || self.reverse_index_skipped(schema_id)
+        {
             return false;
         }
-        let _ = self.reverse_index_for(schema_id);
-        true
+        self.reverse_index_for(schema_id).is_some()
+    }
+
+    /// 该方案的反查索引本次进程是否已被 build_guard 放弃（直到缓存失效前不再尝试）。
+    pub fn reverse_index_skipped(&self, schema_id: &str) -> bool {
+        self.reverse_index_skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(schema_id)
     }
 
     /// 该方案的反查索引是否**正在后台构建**。
@@ -1714,6 +1728,9 @@ impl EngineManager {
     /// 返回 `None` 仅当构建被 build_guard 跳过（同一份输入已连续死在构建中）：
     /// 这**不是**「查无此词」，调用方不得把它当空表缓存或使用。
     fn build_reverse_index_for(&self, schema_id: &str) -> Option<ReverseIndex> {
+        #[cfg(test)]
+        self.reverse_index_build_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(data_dir) = self.data_dir.as_deref() else {
             return Some(ReverseIndex::default());
         };
@@ -2990,6 +3007,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.reverse_index_skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
         *self
             .single_char_codes
@@ -3151,6 +3172,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.reverse_index_skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
         *self
             .single_char_codes
@@ -3255,6 +3280,10 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner()) = primary;
         // 主码表可能变更:失效反查索引,下次按新主码表重建。
         self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.reverse_index_skipped
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -8495,6 +8524,89 @@ input_chars = \"a-z;\"
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// 反查索引被 build_guard 跳过后，本进程不得再反复尝试：否则协调器「预热 → Skip →
+    /// 通知重绘 → 再预热」无限循环。缓存失效（如重建词库缓存）后才给一次重试机会。
+    #[test]
+    fn reverse_index_skip_is_remembered_until_invalidated() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let base = std::env::temp_dir().join(format!("wind_eng_riskip-{}", std::process::id()));
+        let schemas = base.join("schemas");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(schemas.join("riskip")).unwrap();
+        let sid = format!("riskip_{}", std::process::id());
+        std::fs::write(
+            schemas.join(format!("{sid}.schema.toml")),
+            format!(
+                "[schema]\nid = \"{sid}\"\n[engine]\ntype = \"codetable\"\n\
+                 [[dictionaries]]\nid = \"d\"\npath = \"riskip/d.dict.yaml\"\n\
+                 type = \"rime_codetable\"\ndefault = true\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("riskip/d.dict.yaml"),
+            "---\nname: d\n...\n工\ta\t100\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.available = vec![sid.clone()];
+        cfg.schema.active = sid.clone();
+        let mgr = EngineManager::new(&cfg, Some(&base));
+
+        let Some(cache) = EngineManager::reverse_index_cache_path(&sid) else {
+            eprintln!("!!! 无缓存根，build_guard 不参与，本测试没有真正运行");
+            return;
+        };
+        let schema = EngineManager::read_schema(&sid, Some(&base), mgr.override_dir.as_deref())
+            .expect("方案可读");
+        let dicts = EngineManager::load_dicts_individually(&schema, &schemas);
+        let dg = EngineManager::reverse_index_source_digests(&dicts).expect("词库有源文件");
+        let key =
+            wind_dict::cache_fp::derived_build_key(&dg, wind_dict::cache_fp::REVERSE_INDEX_TAG);
+        let mut marker = cache.clone().into_os_string();
+        marker.push(".building");
+        let marker = std::path::PathBuf::from(marker);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        struct Cleanup(Vec<std::path::PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = std::fs::remove_dir_all(p);
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let _cleanup = Cleanup(vec![base.clone(), cache.parent().unwrap().to_path_buf()]);
+        // 已连续死满 MAX_ATTEMPTS 次、且无活着的持有者。
+        std::fs::write(
+            &marker,
+            format!("{key}\n{}\n", wind_dict::build_guard::MAX_ATTEMPTS),
+        )
+        .unwrap();
+
+        assert!(!mgr.prewarm_reverse_index(&sid), "被跳过时不得报「建成」");
+        assert!(mgr.reverse_index_skipped(&sid));
+        let calls = mgr.reverse_index_build_calls.load(Relaxed);
+        assert_eq!(calls, 1);
+        assert!(!mgr.prewarm_reverse_index(&sid));
+        assert_eq!(
+            mgr.reverse_index_build_calls.load(Relaxed),
+            calls,
+            "已记下跳过，第二次预热不得再走构建（再读方案、再过 build_guard）"
+        );
+
+        // 失效后重试：清掉死亡记录再重建即成功。
+        let _ = std::fs::remove_file(&marker);
+        mgr.invalidate_schema(&sid);
+        assert!(!mgr.reverse_index_skipped(&sid));
+        assert!(mgr.prewarm_reverse_index(&sid), "失效后应重试并建成");
+        assert_eq!(
+            mgr.word_codes_in(&sid, "工").as_deref(),
+            Some("a"),
+            "重试建成的是真索引"
+        );
     }
 
     /// A1-7：merged 缓存的构建若连续死在中途（内存不足 abort，不可捕获），下次启动必须

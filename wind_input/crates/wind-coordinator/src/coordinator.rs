@@ -4342,7 +4342,11 @@ impl Coordinator {
         let index_ready = self.engine_mgr.reverse_index_if_ready(schema_id).is_some();
         let single_char_ready =
             !with_single_char || self.engine_mgr.single_char_codes_ready(schema_id);
+        // 已被 build_guard 放弃的方案不再起线程：构建线程结束时会通知重绘，重绘又回到这里，
+        // 不挡住就是「每次重绘起一个线程」的无限循环。造词缺了反查索引也做不了查重，
+        // 故单字全码表一并不建。
         if (index_ready && single_char_ready)
+            || self.engine_mgr.reverse_index_skipped(schema_id)
             || self.engine_mgr.is_building_reverse_index(schema_id)
         {
             return;
