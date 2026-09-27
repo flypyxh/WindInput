@@ -32,12 +32,15 @@ const THEMES: &[&str] = &[
     "msime",
 ];
 
-/// 四种排布：`(名字, vertical, rotated, upright)`。合法组合只有这四个（见 `set_orientation`）。
-const LAYOUTS: &[(&str, bool, bool, bool)] = &[
-    ("横排", false, false, false),
-    ("竖排", true, false, false),
-    ("旋转", false, true, false),
-    ("直立", false, true, true),
+/// 排布：`(名字, vertical, rotated, upright, 内联编码)`。前三位的合法组合只有四个（见
+/// `set_orientation`）；内联编码另走 `preedit_view` 的 build 回调，直立态下它也逐格扶正。
+const LAYOUTS: &[(&str, bool, bool, bool, bool)] = &[
+    ("横排", false, false, false, false),
+    ("竖排", true, false, false, false),
+    ("旋转", false, true, false, false),
+    ("直立", false, true, true, false),
+    ("横排·内联编码", false, false, false, true),
+    ("直立·内联编码", false, true, true, true),
 ];
 
 fn themes_dir() -> PathBuf {
@@ -95,12 +98,13 @@ fn render_theme(name: &str, dark: bool) -> String {
     let theme = wind_theme::load_resolved(&themes_dir(), name, dark)
         .unwrap_or_else(|e| panic!("加载出厂主题 {name}（dark={dark}）失败：{e}"));
     let mut out = String::new();
-    for &(label, vertical, rotated, upright) in LAYOUTS {
+    for &(label, vertical, rotated, upright, embedded) in LAYOUTS {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
         w.scale = 1.0;
         w.set_theme(theme.clone());
         w.set_orientation(vertical, rotated, upright);
+        w.set_preedit_embedded(embedded);
         // 选中 0、悬停 1：一帧里三态俱全。模式徽标给一个，直立态下它也逐格扶正。
         w.update("nihao", 3, "拼", candidates(), 0, 1, 1, 2);
         let mut root = w.build_tree(false);
