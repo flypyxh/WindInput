@@ -1502,6 +1502,15 @@ pub trait WebDataRpc: WebDataHost {
                     // 方案对话框「跟随全局（值）」要显示的值（R8.2）：方案没覆盖时实际按什么跑。
                     // 不让设置页自己从全局配置里拼：字体那一档要回落到主题，而主题解析只在内核。
                     obj.insert("followedBehavior".to_string(), self.followed_behavior());
+                    // 方案文件**自己**声明的辅助码来源（不含 override 层）。设置页据此区分
+                    // 「跟随方案」与「用户选的」：`engine.aux_code.files` 是合并值，两种来源
+                    // 给出的都是一个数组，答不了「这是谁写的」。
+                    let base_files = self
+                        .engine_mgr()
+                        .schema_base(id)
+                        .map(|s| s.engine.aux_code.files)
+                        .unwrap_or_default();
+                    obj.insert("auxCodeBaseFiles".to_string(), json!(base_files));
                 }
                 Ok(v)
             }
@@ -4200,6 +4209,9 @@ pub const READONLY_SIDECAR_FIELDS: &[&str] = &[
     // 「跟随全局」时的实际值（布局/字体/辅助码）。不剥的话一整份全局快照会落进 override，
     // 方案从此把这几项钉死在打开设置页那一刻——正是上面说的冻结。
     "followedBehavior",
+    // 方案文件自己的辅助码来源（设置页判「跟随方案」用）。不剥的话一份基线快照会落进
+    // override，从此方案作者改了推荐码表也透不过来。
+    "auxCodeBaseFiles",
 ];
 
 /// [`WebDataRpc::followed_behavior`] 的纯函数内核：配置与主题字体由调用方给定。
@@ -7805,6 +7817,58 @@ moved = [{ id = 'date.lunar', position = 0 }]
         assert_eq!(e.name, "往返", "override 未提及的字段仍来自方案文件");
 
         let _ = std::fs::remove_file(&store_path);
+    }
+
+    /// 设置页区分「跟随方案」与「用户选的来源」要看方案文件自己的 files——合并值答不了。
+    #[test]
+    fn get_config_exposes_aux_code_base_files_and_strips_it_on_save() {
+        let dir =
+            std::env::temp_dir().join(format!("wind_webdata_aux_base_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(
+            schemas.join("zz_py.schema.toml"),
+            "[schema]\nid = \"zz_py\"\nname = \"拼\"\n[engine]\ntype = \"pinyin\"\n\
+             [engine.aux_code]\nfiles = [\"aux_code/stroke.txt\"]\n",
+        )
+        .unwrap();
+        let ov = dir.join("overrides");
+        std::fs::create_dir_all(&ov).unwrap();
+        std::fs::write(
+            ov.join("zz_py.toml"),
+            "[engine.aux_code]\nfiles = [\"schema:wubi86\"]\n",
+        )
+        .unwrap();
+        let store = std::sync::Arc::new(wind_store::Store::open(&dir.join("s.redb")).unwrap());
+        let c = Coordinator::new_headless_with_store_override(
+            wind_config::Config::default(),
+            Some(&dir),
+            store,
+            Some(ov.clone()),
+        );
+        let v = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_py" }))
+            .unwrap();
+        assert_eq!(
+            v["auxCodeBaseFiles"],
+            json!(["aux_code/stroke.txt"]),
+            "方案文件自己的 files"
+        );
+        assert_eq!(
+            v["engine"]["aux_code"]["files"],
+            json!(["schema:wubi86"]),
+            "合并值是 override 的"
+        );
+        // 原样回传不能把旁路字段写进 override。
+        c.web_data_rpc("schema.saveConfig", &json!({ "id": "zz_py", "cfg": v }))
+            .unwrap();
+        let saved = std::fs::read_to_string(ov.join("zz_py.toml")).unwrap();
+        assert!(
+            !saved.contains("auxCodeBaseFiles"),
+            "旁路字段必须剥掉：{saved}"
+        );
+        assert!(saved.contains("schema:wubi86"), "用户的选择保留：{saved}");
     }
 
     /// 三态控件的读侧契约：`getConfig` 必须让设置页分得清「作者写的」与「用户改的」。
