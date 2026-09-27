@@ -47,7 +47,7 @@
 ```toml
 [ui.tooltip]
 delay     = 200     # 不变
-max_chars = 200     # 新增：单行显示上限（字符数，超出加 …），0 = 不限。仅影响显示，不影响复制/上屏
+max_chars = 200     # 新增：单行显示上限（按字素簇计，超出加 …），0 = 不限。仅影响显示，不影响复制/上屏
 wrap_width = 40     # 新增：折行宽度（显示列，全角计 2），0 = 不折行
 
 [[ui.tooltip.sections]]
@@ -170,6 +170,11 @@ template = "${char}：{${chaizi}{ [${chaizi_code}]}\t}${readings}"
   门控；码表方案下恒空（候选的码就是用户自己打的）。
 - `${word_code}`（气泡）：**任何候选**在编码来源方案里怎么打，码表方案下取自身全部编码，
   不受注释门控。
+
+★ **逐字段里的 `${code_rev_all}` 与候选级口径不同**：逐字求值走按裸文本求值的路径
+（`eval_text_var`，cmdbar `dict.rev` 同一条），取的是 `code_source_schema`（与 `${word_code}`
+同一个方案），且**不受** `code_hint_source` 门控。候选级的 `${code_rev_all}` 仍受门控、只对拼音
+来源候选有值。文档站配方「逐字看编码」依赖的正是前者。
 
 `${code}` 已是 `${code_rev}` 的永久兼容别名（见 `comment.rs` `eval_var` 文档），不能挪作他用，
 故新名叫 `word_code`。求值直接搬现行代码：`engine_mgr.code_source_schema()` 取方案、
@@ -361,8 +366,8 @@ P1 实施时参照实现**保留**在 `wind-coordinator/src/tooltip.rs` 的测�
 |---|---|---|
 | P1 | 段配置 + 迁移；`TooltipDoc`；段渲染接入注释模板引擎（含 `each`）；`word_code`/`code_source`/`char`/`readings`/`unicode*`/`debug` 变量；删 `merge_chaizi_pinyin` 与 `TooltipOptions` | §8.2 对拍全绿；REGISTRY/L2 守门绿 |
 | P2 | `${full_text}`、`max_chars`、`wrap_width`；原始行/显示行分离；非 CJK 候选出气泡 | 截断候选出现完整原文段；复制取到未截断原文 |
-| P3 | 右键命中（自绘 + 宿主渲染）、菜单、复制/上屏段与行、上屏前一致性校验 | 协调器侧菜单构建与取值单测；靶机人工验（判据随 P3 给出） |
-| P4 | wind-setting 段列表编辑器（启停、排序、段名/模板/each 编辑、按预设添加：编码 / 拼音 / 拆字 / 拆字+拼音 / 完整原文 / Unicode / 注释库 / 调试）；文档站 `customize/candidate-tooltip` 与 guides/config | 设置仓五道闸门绿；新 label 过拼音检索表 |
+| P3 | 右键命中（自绘气泡；宿主渲染见 §7.5，本轮未做）、菜单、复制/上屏段与行、上屏前一致性校验 | 协调器侧菜单构建与取值单测；靶机人工验（判据随 P3 给出） |
+| P4 | wind-setting 段列表编辑器（启停、排序、段名/模板/each 编辑、按预设添加：编码 / 拼音 / 拆字 / 拆字+拼音 / 完整原文 / Unicode / 注释库 / 调试）；文档站 `settings/appearance/candidate-tooltip` 与 guides/config | 设置仓五道闸门绿；新 label 过拼音检索表 |
 
 ## 11 已确认（2026-09-27）
 
