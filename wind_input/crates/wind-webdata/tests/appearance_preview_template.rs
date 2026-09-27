@@ -147,7 +147,17 @@ fn preview_template_contract() {
         json!([{"start": 0, "end": 6, "rgba": [66, 133, 244, 255]}])
     );
 
-    // ④ 未知 scene 报错。
+    // ④ 色块：与内联色同一求法——候选窗取同名色，气泡先查 tooltip_<名>；没请求就是空表。
+    let r =
+        call(json!({"template": "", "scene": "comment", "swatches": ["error", "accent"]})).unwrap();
+    assert_eq!(r["swatches"]["error"], json!([217, 48, 37, 255]));
+    assert_eq!(r["swatches"]["accent"], json!([66, 133, 244, 255]));
+    let r = call(json!({"template": "", "scene": "content", "swatches": ["error"]})).unwrap();
+    assert_eq!(r["swatches"]["error"], json!([242, 139, 130, 255]));
+    let r = call(json!({"template": "x", "scene": "comment"})).unwrap();
+    assert_eq!(r["swatches"], json!({}));
+
+    // ⑤ 未知 scene 报错。
     assert!(call(json!({"template": "x", "scene": "nope"})).is_err());
 
     let _ = std::fs::remove_dir_all(&tmp);

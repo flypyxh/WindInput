@@ -4050,12 +4050,15 @@ pub trait WebDataRpc: WebDataHost {
 
     /// `appearance.previewTemplate`：模板在当前主题下的渲染效果（设置页输入框下方的预览行）。
     ///
-    /// 入参 `{ template, scene: "comment" | "label" | "content", each? }`。回包：
+    /// 入参 `{ template, scene: "comment" | "label" | "content", each?, swatches?: [名字] }`。回包：
     /// ```text
     /// { text, fg, bg, runs: [{start, end, rgba}],
     ///   selected: { fg, bg, runs } | null,      // 仅 comment：高亮候选里的样子
-    ///   problems: [{start, end, message}] }
+    ///   problems: [{start, end, message}],
+    ///   swatches: { 名字: rgba } }              // 入参 swatches 里每个名字写成 `$[名字]` 的实际颜色
     /// ```
+    /// `swatches` 给设置页「插入颜色」的色块着色：求法与模板里的内联色完全相同（气泡场景先查
+    /// `tooltip_<名>`），色块因此就是插进去以后的样子。
     /// ⚠️ 两类区间坐标系不同：`runs` 是**输出偏移**（`text` 里的 UTF-8 字节区间，给预览上色）；
     /// `problems` 是**模板偏移**（入参 `template` 里的 UTF-8 字节区间，给输入框标位置）。设置端
     /// 的输入框显示转义后的模板（`\t` 以两个字符显示），要把 `problems` 换算到显示文本上再标。
@@ -4187,6 +4190,28 @@ pub trait WebDataRpc: WebDataHost {
         }
         problems.sort_by_key(|p| p["start"].as_u64());
 
+        let swatches: serde_json::Map<String, Value> = params
+            .get("swatches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|name| {
+                let c = wind_theme::InlineColor::parse(name);
+                let rgba = wind_theme::span_color(
+                    &theme,
+                    node,
+                    is_tooltip,
+                    TextState::Normal,
+                    fallback,
+                    None,
+                    false,
+                    Some(&c),
+                );
+                (name.to_string(), json!(rgba))
+            })
+            .collect();
+
         Ok(json!({
             "text": sample.text.as_str(),
             "fg": fg,
@@ -4194,6 +4219,7 @@ pub trait WebDataRpc: WebDataHost {
             "runs": runs,
             "selected": selected,
             "problems": problems,
+            "swatches": swatches,
         }))
     }
 
