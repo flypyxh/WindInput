@@ -7,7 +7,7 @@
 //! | `${name}` | 变量替换 |
 //! | `${name:arg}` | 带参数的变量（如 `${chaizi_all:／}` 指定逐字分隔符） |
 //! | `${a\|b\|c}` | 取**首个非空**的变量 |
-//! | `{ … }` | 可选段：段内变量**全为空**则整段（含字面文本）消失 |
+//! | `{ … }` | 可选段：段内变量**全为空**则整段（含字面文本）消失；可嵌套 |
 //!
 //! 另有两条隐含规则：
 //! - **空变量吞掉紧邻的一个空白**：`{(拼: ${pinyin} ${chaizi})}` 在拆字为空时得
@@ -105,7 +105,8 @@ enum Node {
     Text(String),
     /// `${a|b}`：按序取首个非空变量。
     Var(Vec<VarRef>),
-    /// `{ … }`：段内变量全空则整段消失。不嵌套（段内的 `{` 按字面处理）。
+    /// `{ … }`：段内变量全空则整段消失。可嵌套：`{${a}{ [${b}]}\t}` 里内段只管 `b`，
+    /// 外段在 `a`、`b` 任一非空时保留（悬停提示「拆字 / 拼音」合并段就靠这个表达）。
     Group(Vec<Node>),
 }
 
@@ -143,7 +144,7 @@ fn parse(tpl: &str) -> Vec<Node> {
                 if !text.is_empty() {
                     nodes.push(Node::Text(std::mem::take(&mut text)));
                 }
-                // 段不嵌套：内部再出现的 `{` 由递归解析按字面文本处理（它找不到配对的 `}`）。
+                // 内段由递归解析处理：`find_group_end` 已按层数配对，切出来的段内文本是平衡的。
                 nodes.push(Node::Group(parse(&tpl[i + 1..end])));
                 i = end + 1;
                 continue;
@@ -175,17 +176,24 @@ fn find_byte(b: &[u8], from: usize, target: u8) -> Option<usize> {
     (from..b.len()).find(|&i| b[i] == target)
 }
 
-/// 找可选段的结束 `}`，**跳过内部的 `${…}`**。未闭合返回 `None`。
+/// 找可选段的结束 `}`，**跳过内部的 `${…}`**、按层数配对内段。未闭合返回 `None`。
+///
+/// 曾经不配对（段内第一个 `}` 即结束），于是 `{${a}{ [${b}]}\t}` 会被切成段 `${a}{ [${b}]`
+/// 加字面 `\t}`——内段吞掉了外段的右括号。悬停提示合并段的模板要嵌套才表达得出来。
 fn find_group_end(b: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
+    let mut depth = 0usize;
     while i < b.len() {
         if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
             // 变量未闭合 ⇒ 段也无从闭合（`?` 即 return None）。
             i = find_byte(b, i + 2, b'}')? + 1;
             continue;
         }
-        if b[i] == b'}' {
-            return Some(i);
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return Some(i),
+            b'}' => depth -= 1,
+            _ => {}
         }
         i += 1;
     }
@@ -206,7 +214,14 @@ struct Rendered {
 /// 两者刻意区分：未知变量名原样输出 `${name}` 并**计作已填充**，于是拼错的变量名一定会
 /// 显示在候选栏里让用户看见。若把未知当空处理，用户得到的是「配了没反应」——本仓记忆里
 /// 反复出现的那类静默失效。
-fn render_nodes(nodes: &[Node], eval: &impl Fn(&str, Option<&str>) -> Option<String>) -> Rendered {
+///
+/// `counts(name)` 决定「这个变量填上了」算不算数：悬停提示的逐字段里 `${char}` 恒非空，
+/// 若计入，查不到读音的字会留下孤零零的 `好：`。注释段传恒真。
+fn render_nodes(
+    nodes: &[Node],
+    eval: &impl Fn(&str, Option<&str>) -> Option<String>,
+    counts: &impl Fn(&str) -> bool,
+) -> Rendered {
     let mut out = String::new();
     let mut any = false;
     for node in nodes {
@@ -214,24 +229,24 @@ fn render_nodes(nodes: &[Node], eval: &impl Fn(&str, Option<&str>) -> Option<Str
             Node::Text(t) => out.push_str(t),
             Node::Var(refs) => {
                 // 未知名恒排在「首个非空」判定之外单独处理：它不是值，是错误提示。
-                let mut value: Option<String> = None;
+                let mut value: Option<(String, bool)> = None;
                 for r in refs {
                     match eval(&r.name, r.arg.as_deref()) {
                         None => {
-                            value = Some(format!("${{{}}}", r.name));
+                            value = Some((format!("${{{}}}", r.name), true));
                             break;
                         }
                         Some(v) if !v.is_empty() => {
-                            value = Some(v);
+                            value = Some((v, counts(&r.name)));
                             break;
                         }
                         Some(_) => {} // 已知但空 → 试下一个回退
                     }
                 }
                 match value {
-                    Some(v) => {
+                    Some((v, counted)) => {
                         out.push_str(&v);
-                        any = true;
+                        any |= counted;
                     }
                     // 空变量吞掉紧邻的一个空白：`(拼: ${pinyin} ${chaizi})` 在拆字为空时
                     // 不留下 `)` 前那个多余空格。只吞一个——吞到底会把用户有意排的版式抹平。
@@ -243,7 +258,7 @@ fn render_nodes(nodes: &[Node], eval: &impl Fn(&str, Option<&str>) -> Option<Str
                 }
             }
             Node::Group(inner) => {
-                let r = render_nodes(inner, eval);
+                let r = render_nodes(inner, eval, counts);
                 if r.any_var_filled {
                     out.push_str(&r.text);
                     any = true;
@@ -271,7 +286,7 @@ pub(crate) fn render(
     max_chars: usize,
     eval: impl Fn(&str, Option<&str>) -> Option<String>,
 ) -> String {
-    let r = render_nodes(&parse(tpl), &eval);
+    let r = render_nodes(&parse(tpl), &eval, &|_| true);
     if !r.any_var_filled {
         return String::new();
     }
@@ -285,6 +300,43 @@ pub(crate) fn render(
     }
     let head: String = chars[..max_chars].iter().collect();
     format!("{head}…")
+}
+
+/// 预解析的模板：配置快照里存一份，候选循环里只渲染不解析。
+///
+/// 注释段至今仍是每次 [`render`] 现解析（模板串从三层覆盖里现取，没有一个稳定的快照落点）；
+/// 悬停提示的段列表是全局一份、随 `ConfigBundle` 重建，故在那里解析一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Template(Vec<Node>);
+
+impl Template {
+    pub(crate) fn parse(tpl: &str) -> Self {
+        Self(parse(tpl))
+    }
+
+    /// 渲染为 `(已 trim 的文本, 是否有计数变量非空)`。不做「全空则整体消失」——那是调用方
+    /// 的决定：段内容要消失，段名的字面文字（`编码`）不能消失。
+    pub(crate) fn render(
+        &self,
+        eval: &impl Fn(&str, Option<&str>) -> Option<String>,
+        counts: &impl Fn(&str) -> bool,
+    ) -> (String, bool) {
+        let r = render_nodes(&self.0, eval, counts);
+        (r.text.trim().to_string(), r.any_var_filled)
+    }
+
+    /// 模板里是否引用了变量 `name`（含回退链、可选段内）。供调用方决定要不要预先准备
+    /// 代价高的数据（调试上下文、反查索引），没引用就不算。
+    pub(crate) fn references(&self, name: &str) -> bool {
+        fn walk(nodes: &[Node], name: &str) -> bool {
+            nodes.iter().any(|n| match n {
+                Node::Text(_) => false,
+                Node::Var(refs) => refs.iter().any(|r| r.name == name),
+                Node::Group(inner) => walk(inner, name),
+            })
+        }
+        walk(&self.0, name)
+    }
 }
 
 /// 音节间分隔符。**注音用空格**（rime 注音惯例 `nǐ hǎo`）而非隔音符 `'`：
@@ -462,6 +514,31 @@ pub(crate) fn resolve_template<'a>(
     global: &'a str,
 ) -> &'a str {
     mode.or(schema).unwrap_or(global)
+}
+
+/// 裸文本变量里**只依赖反查表**的那一部分（`char` 与 `chaizi*` 一族）。
+///
+/// 从 [`Coordinator::eval_text_var`] 拆出来，是为了让悬停提示逐字段的对拍测试不构造协调器
+/// 也能走到**生产同一份**求值代码：拆字列正是旧 `merge_chaizi_pinyin` 行序的判据，
+/// 若测试里另写一份，对拍证明的就只是两份手写实现彼此一致。
+pub(crate) fn reverse_text_var(
+    name: &str,
+    arg: Option<&str>,
+    text: &str,
+    reverse: &wind_reverse::ReverseLookup,
+) -> Option<String> {
+    // 判据是 `chars().count()` 而非 `len()`：扩展区汉字走代理对，按字节数会被当成词组。
+    let single = text.chars().count() == 1;
+    Some(match name {
+        "char" => text.to_string(),
+        "chaizi" if single => reverse.radicals_of(text, ""),
+        "chaizi" => String::new(),
+        "chaizi_code" if single => reverse.chaizi_code_of(text),
+        "chaizi_code" => String::new(),
+        "chaizi_all" => reverse.radicals_of(text, arg.unwrap_or(" ")),
+        "chaizi_code_all" => reverse.codes_of(text, arg.unwrap_or(" ")),
+        _ => return None,
+    })
 }
 
 impl crate::coordinator::Coordinator {
@@ -642,17 +719,14 @@ impl crate::coordinator::Coordinator {
     ///   文本不是用户打出来的，反查正是这里的全部目的。
     /// - `shuangpin` —— 同义，但音节来路不同：那边有候选身份可用词条真值 `code`+`boundary`，
     ///   这边是裸文本，只能按词推断读音再编码。
-    fn eval_text_var(
+    pub(crate) fn eval_text_var(
         &self,
         name: &str,
         arg: Option<&str>,
         text: &str,
         reverse: &wind_reverse::ReverseLookup,
     ) -> Option<String> {
-        // 判据是 `chars().count()` 而非 `len()`：扩展区汉字走代理对，按字节数会被当成词组。
-        let single = text.chars().count() == 1;
         Some(match name {
-            "char" => text.to_string(),
             // 索引未就绪给空串（而不是 `None`）：`None` 在渲染层专表**未知变量名**，
             // 会原样输出 `${code_rev}` 让用户看见拼写错误。空串则不计入
             // `reverse_render` 的 found 判据，整条反查候选这一次照旧不出现 —— 想要的
@@ -695,12 +769,6 @@ impl crate::coordinator::Coordinator {
                     reverse.toned_pinyin_of(text, Some(&syls), SYLLABLE_SEP)
                 }
             }
-            "chaizi" if single => reverse.radicals_of(text, ""),
-            "chaizi" => String::new(),
-            "chaizi_code" if single => reverse.chaizi_code_of(text),
-            "chaizi_code" => String::new(),
-            "chaizi_all" => reverse.radicals_of(text, arg.unwrap_or(" ")),
-            "chaizi_code_all" => reverse.codes_of(text, arg.unwrap_or(" ")),
             // `shuangpin` —— 这段文本的双拼编码。
             //
             // 与注释段同义但取音节的路子不同：那边有候选身份，直接用词条真值
@@ -718,7 +786,7 @@ impl crate::coordinator::Coordinator {
             // 比给整条求值链加一个参数划算；且它没有候选身份，也就没有临英那种
             // 「数据归 english 桶」的语境可言。
             "dict" => reverse.comment_of(text, None, &self.engine_mgr.active_schema_id()),
-            _ => return None,
+            _ => return reverse_text_var(name, arg, text, reverse),
         })
     }
 
@@ -781,7 +849,7 @@ impl crate::coordinator::Coordinator {
         }
     }
 
-    fn eval_var(
+    pub(crate) fn eval_var(
         &self,
         name: &str,
         arg: Option<&str>,
@@ -1265,6 +1333,30 @@ mod tests {
             "段内变量的右花括号不是段结束"
         );
         assert_eq!(render("{[${a}]}", 0, ev(&[("a", "")])), "");
+    }
+
+    /// ★ 可选段可嵌套：内段只管自己的变量，外段在内外任一变量非空时保留。
+    /// 悬停提示「拆字 / 拼音」合并段的模板 `{${chaizi}{ [${chaizi_code}]}\t}` 就是这个形态；
+    /// 不配对的话内段会吞掉外段的右括号，`\t}` 沦为字面文本。
+    #[test]
+    fn groups_nest() {
+        const T: &str = "{${a}{ [${b}]}|}${c}";
+        let r = |a, b, c| render(T, 0, ev(&[("a", a), ("b", b), ("c", c)]));
+        assert_eq!(r("A", "B", "C"), "A [B]|C");
+        assert_eq!(r("A", "", "C"), "A|C", "内段消失不牵连外段");
+        assert_eq!(r("", "", "C"), "C", "内外全空整段消失");
+        assert_eq!(r("", "B", "C"), "[B]|C", "内段有值即撑住外段");
+        // 未闭合的内段：外段配不上对，退化为字面文本，后面的段照常解析。
+        assert_eq!(render("{x{${a}}", 0, ev(&[("a", "A")])), "{xA");
+    }
+
+    /// 计数谓词：不计数的变量照常输出，但撑不起整个模板或可选段。
+    #[test]
+    fn uncounted_var_renders_but_does_not_fill() {
+        let e = ev(&[("char", "好"), ("r", "")]);
+        let t = Template::parse("${char}：${r}");
+        assert_eq!(t.render(&e, &|n| n != "char"), ("好：".to_string(), false));
+        assert_eq!(t.render(&e, &|_| true), ("好：".to_string(), true));
     }
 
     // ---------------- 变量参数 `${name:arg}` ----------------

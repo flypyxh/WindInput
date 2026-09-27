@@ -6099,7 +6099,7 @@ impl Coordinator {
         // 悬停提示/候选微调配置（热重载快照）
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
-        let tip_cfg = &rt.config.ui.tooltip;
+        let tip = &rt.tooltip;
         // 命令直通车候选前缀标注（features.cmdbar.candidate_prefix）：仅命令候选(is_command)显示。
         let cmd_prefix = rt.config.input.cmdbar.candidate_prefix.as_str();
         // 检索范围放宽（自动补充）候选的前缀标注，见 docs/design/smart-filter-scope-relax.md
@@ -6112,15 +6112,9 @@ impl Coordinator {
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
         let force_hint = Self::forces_code_hint(state);
         let hint_source = self.comment_hint_source(state);
-        let tip_opts = wind_reverse::TooltipOptions {
-            code: tip_cfg.code_enabled,
-            pinyin: tip_cfg.pinyin_enabled,
-            heteronyms: tip_cfg.pinyin_heteronyms,
-            max_readings: tip_cfg.pinyin_max_readings,
-            chaizi: tip_cfg.chaizi_enabled,
-        };
-        // 调试提示上下文：仅开启调试段时解析一次（mixed 归属 / 方案 id），循环内按候选来源选用。
-        let dbg_ctx = if tip_cfg.debug_enabled {
+        // 调试提示上下文：仅有段引用 `${debug}` 时解析一次（mixed 归属 / 方案 id），
+        // 循环内按候选来源选用。
+        let dbg_ctx = if tip.references("debug") {
             // 归属与读写两端同源（`effective_data_schema`）：特殊模式下若这里仍按 active 解析，
             // 调试段显示的计数与排序实际用的不是同一个 key——排查时会被它带偏，
             // 而这正是最难察觉的一种不一致。
@@ -6159,12 +6153,12 @@ impl Coordinator {
         // 「哪个候选算哪个成员」的判据就是第二个真相源，漂移后的表现是「词频记进 A 桶、
         // 注释查的是 B 桶」这类只在多成员配置下才现形的错配。
         let mix_comment_scope = matches!(state.active, Some(ModeKind::Mix(_)));
-        // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
-        // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_in），
-        // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
-        // 临时拼音/快捷输入反查模式）标题带来源方案名：[编码(五笔)]。
-        let code_schema = tip_cfg
-            .code_enabled
+        // `${word_code}` / `${code_source}` 的来源方案（循环外解析一次，没有段引用就不碰）：
+        // 码表方案=自身全部编码（码长升序 a/ab/abc）、混输=其主码表成员、拼音=全局主码表。
+        // 编码按词查方案词库反查索引（word_codes_in），不按取码规则生成。候选并非用该编码方案
+        // 直接输入时（来源方案≠活跃方案，或处于临时拼音/快捷输入反查模式）`${code_source}`
+        // 才有值，出厂段名据此显示为 [编码(五笔)]。
+        let code_schema = (tip.references("word_code") || tip.references("code_source"))
             .then(|| self.engine_mgr.code_source_schema())
             .filter(|s| !s.is_empty());
         // 反查索引没就绪就**在后台建**，本次先不显示编码段（绝不在此等）。
@@ -6192,11 +6186,12 @@ impl Coordinator {
                 // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
                 // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
                 let disp = cand_cfg.truncate_display(&full);
-                // 反查提示按截断后文本生成：超长候选（如长短语）逐字反查会撑爆气泡且显示不全，
-                // 只提示实际显示出的字（… 为非 CJK，tooltip_for 自动滤除，不影响反查内容）。
-                // [编码] 段按候选**完整原文**查词库（截断/繁化文本词库里没有；查不到=None 不显示）。
+                // 悬停提示按段列表渲染（见 `crate::tooltip`）。逐字段遍历**截断后**的显示文本：
+                // 超长候选（如长短语）逐字展开会撑爆气泡，只提示实际显示出的字（… 非汉字，
+                // 逐字段自动跳过）。`${word_code}` 则按候选**完整原文**查词库（截断/繁化文本
+                // 词库里没有；查不到=空，段随之消失）。
                 //
-                // ⚠️ 曾改成按显示文本（`full`）查，动机是「气泡三段应同属一个域」——已回退。
+                // ⚠️ 曾改成按显示文本（`full`）查编码，动机是「气泡三段应同属一个域」——已回退。
                 // 拼音段/拆字段吃显示文本是**它们**的事（拆字库覆盖繁体字，查得到），而编码段
                 // 回答的是「这个候选怎么打出来」，用户实际敲的就是内部文本那个码；改成查繁化
                 // 文本只会让它查不到而整段消失，是拿一个**已经正确**的段去换取形式上的一致。
@@ -6206,18 +6201,40 @@ impl Coordinator {
                 let word_code = code_schema
                     .as_deref()
                     .and_then(|sid| self.engine_mgr.word_codes_in(sid, &c.text))
-                    .filter(|s| !s.is_empty());
-                let mut tooltip = reverse.tooltip_for(
-                    &disp,
-                    &tip_opts,
-                    word_code.as_deref(),
-                    code_source_name.as_deref(),
-                );
-                // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
-                // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
-                // `ui.tooltip.*` 三段（编码/拼音/拆字），塞了会与之重复。
+                    .unwrap_or_default();
                 let dict_schema =
                     self.comment_dict_scope(state, c, mix_comment_scope, &comment_dict_schema);
+                // 调试正文要点查 redb 词频，按需算且一个候选只算一次。
+                let debug_body = std::cell::OnceCell::new();
+                let cand_eval = |name: &str, arg: Option<&str>| -> Option<String> {
+                    Some(match name {
+                        "word_code" => word_code.clone(),
+                        "code_source" => code_source_name.clone().unwrap_or_default(),
+                        "debug" => dbg_ctx
+                            .as_ref()
+                            .map(|ctx| {
+                                debug_body
+                                    .get_or_init(|| {
+                                        self.debug_tooltip_body(c, &state.input_buffer, ctx)
+                                    })
+                                    .clone()
+                            })
+                            .unwrap_or_default(),
+                        _ => {
+                            return crate::tooltip::candidate_var(name, arg, &disp).or_else(|| {
+                                self.eval_var(name, arg, c, &reverse, hint_source, &dict_schema)
+                            });
+                        }
+                    })
+                };
+                let char_eval = |ch: char, name: &str, arg: Option<&str>| {
+                    crate::tooltip::char_var(name, arg, ch, &reverse)
+                        .or_else(|| self.eval_text_var(name, arg, &ch.to_string(), &reverse))
+                };
+                let tooltip = tip.render(&disp, &cand_eval, &char_eval).to_plain_text();
+                // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
+                // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
+                // `ui.tooltip.sections`，塞了会与之重复。
                 let comment = self.comment_for(
                     c,
                     comment_tpl,
@@ -6226,15 +6243,6 @@ impl Coordinator {
                     hint_source,
                     &dict_schema,
                 );
-                // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
-                // （tooltip 各 provider 全关即真正为空，不显示气泡）。
-                if let Some(ctx) = &dbg_ctx {
-                    let dbg = self.debug_tooltip_section(c, &state.input_buffer, ctx);
-                    if !tooltip.is_empty() {
-                        tooltip.push('\n');
-                    }
-                    tooltip.push_str(&dbg);
-                }
                 CandidateItem {
                     // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
                     // 检索范围放宽补进来的候选同理加标注（`input.scope_relax.prefix`），让用户
@@ -8633,14 +8641,9 @@ impl Coordinator {
             .unwrap_or(0)
     }
 
-    /// 候选调试信息段：`[调试]` 独占一行 + 来源行 + 合并的（编码/权重/序/词频/标记）行。
-    /// 保持约 3 行；来源区分系统/用户短语、用户/临时词库、码表(方案)、拼音、英文。
-    fn debug_tooltip_section(
-        &self,
-        c: &Candidate,
-        input_code: &str,
-        ctx: &DebugSchemaCtx,
-    ) -> String {
+    /// 候选调试信息（悬停提示 `${debug}` 的值）：来源行 + 合并的（编码/权重/序/词频/标记）行。
+    /// 来源区分系统/用户短语、用户/临时词库、码表(方案)、拼音、英文。`[调试]` 标题归段名。
+    fn debug_tooltip_body(&self, c: &Candidate, input_code: &str, ctx: &DebugSchemaCtx) -> String {
         let source = self.debug_source_label(c, ctx);
         let count = self.debug_freq_count(c, input_code, ctx);
         let mut parts: Vec<String> = Vec::new();
@@ -8659,7 +8662,7 @@ impl Coordinator {
         if c.has_shadow {
             parts.push("✎已调整".to_string());
         }
-        format!("[调试]\n来源: {source}\n{}", parts.join(" · "))
+        format!("来源: {source}\n{}", parts.join(" · "))
     }
 }
 

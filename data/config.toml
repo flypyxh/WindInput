@@ -1341,15 +1341,71 @@ custom_y = 0
 # s2t 段管两个转换方向：简入繁出开着显「繁」，繁入简出开着显「繁→简」，都关则不显示。
 items = ["schema", "punct", "full_width", "s2t", "caps"]
 
-# 悬停提示：原 ui.tooltip.{code,pinyin,chaizi,debug}.* 子表已拍平为平铺字段
+# 悬停提示（鼠标停在候选上弹出的气泡）
 [ui.tooltip]
-delay = 200
-code_enabled = true
-pinyin_enabled = true
-pinyin_heteronyms = true
-pinyin_max_readings = 0
-chaizi_enabled = false
-debug_enabled = false
+delay = 200   # 悬停多久后显示（毫秒）
+
+# 气泡由下面这些段自上而下组成，数组顺序即显示顺序。每段：
+# enabled   段开关（默认 true）。关着的段保留在这里，想看时改成 true 即可。
+# label     段名，显示为 [段名] 独占一行；留空则无标题行。段名本身也是模板，
+#           如 "编码{(${code_source})}"：拼音方案下反查五笔时显示「编码(五笔)」，直接打五笔时显示「编码」。
+# template  段内容，语法与变量同候选注释模板（${变量}、${a|b} 取首个非空、{…} 可选段）。
+#           结果按换行拆行、空行丢弃；整段为空则不显示。
+# each      求值粒度：""（默认）整个候选求值一次；"han" 对候选里每个汉字各求值一次、每字一行；
+#           "char" 对每个非空白字符各求值一次。逐字时 ${char} 是当前字，它不算「这行有内容」——
+#           一行里除 ${char} 外全空（如某字查不到读音）则整行不显示。
+# promote   仅逐字段：填一个变量名，该变量非空的行排在前面（各组内保持原文顺序）。
+# inline    内容恰为一行时写成「段名: 内容」，不单独占一行标题。
+# 气泡专属变量：${word_code} 该词在编码来源方案里的全部编码（a/ab/abc）；${code_source} 编码来源
+# 方案名（直接用该方案输入时为空）；${readings} / ${readings:N} 当前字的全部读音 / 前 N 个；
+# ${unicode} 当前字码位；${unicode_all} / ${unicode_all:分隔符} 逐字码位；${debug} 调试信息。
+# 注释模板的变量（${pinyin}、${chaizi}、${chaizi_code}、${dict}……）同样可用。
+[[ui.tooltip.sections]]
+enabled = true
+label = "编码{(${code_source})}"
+template = "${word_code}"
+each = ""
+promote = ""
+inline = false
+
+[[ui.tooltip.sections]]
+enabled = true
+label = "拼音"
+template = "${char}：${readings}"
+each = "han"
+promote = ""
+inline = false
+
+[[ui.tooltip.sections]]
+enabled = false
+label = "拆字"
+template = "${char}：${chaizi}{ [${chaizi_code}]}"
+each = "han"
+promote = ""
+inline = false
+
+[[ui.tooltip.sections]]
+enabled = false
+label = "Unicode"
+template = "${char}：${unicode}"
+each = "char"
+promote = ""
+inline = false
+
+[[ui.tooltip.sections]]
+enabled = false
+label = "调试"
+template = "${debug}"
+each = ""
+promote = ""
+inline = false
+
+# 拆字与拼音想合成一段（旧版「拆字 / 拼音」的样子）时，把「拼音」「拆字」两段换成这一段：
+# [[ui.tooltip.sections]]
+# label = "拆字 / 拼音"
+# each = "han"
+# promote = "chaizi"
+# template = "${char}：{${chaizi}{ [${chaizi_code}]}\t}${readings}"
 
 [ui.toolbar]
 visible = true
