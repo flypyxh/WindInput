@@ -142,11 +142,20 @@ pub struct Store {
     /// count +1，若也算结构变化，开着联想时几乎每次上屏都会触发一次后台全表重建。
     ///
     /// 宁多勿少：多 +1 只是多一次后台重建，漏 +1 则联想里永远缺那个词。
+    ///
+    /// 按方案的见 `words_gen_by_schema`。
     words_gen: std::sync::atomic::AtomicU64,
     /// **临时词** count 变化的代次（commit 后 +1）。临时词的 count 决定联想分档（门槛 2）
     /// 与档内排序，但它随选词频繁变化，消费方应节流地跟（见 `UserAssocIndex`）。
     /// 用户词的 count 不影响联想，不计入。
     words_count_gen: std::sync::atomic::AtomicU64,
+    /// **按方案**的结构代次：`bump_words_gen(schema)` 同时推进全局 `words_gen` 与这里该方案的计数。
+    ///
+    /// 全局代次对「引用另一个方案」的索引太粗：在拼音里打字自动造词，会让五笔的用户词索引
+    /// （辅助码引用五笔时要用）也判过期、后台重扫。见 `docs/design/text-code-lookup.md` §3.2。
+    words_gen_by_schema: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// 不分方案的写入（`resume` 换了整个文件）推进的纪元；`words_generation_of` 把它并进返回值。
+    words_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -174,6 +183,8 @@ impl Store {
             drops: std::sync::atomic::AtomicU64::new(0),
             words_gen: std::sync::atomic::AtomicU64::new(0),
             words_count_gen: std::sync::atomic::AtomicU64::new(0),
+            words_gen_by_schema: Default::default(),
+            words_epoch: std::sync::atomic::AtomicU64::new(0),
         };
         store.run_migrations()?;
         store.backfill_abbrev_indexes();
@@ -261,8 +272,35 @@ impl Store {
         self.words_gen.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn bump_words_gen(&self) {
+    /// 某方案的结构代次：`(全体纪元, 该方案计数)`，任一分量变化即说明该方案的用户词 / 临时词变了。
+    pub fn words_generation_of(&self, schema: &str) -> (u64, u64) {
+        let epoch = self.words_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let n = self
+            .words_gen_by_schema
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema)
+            .copied()
+            .unwrap_or(0);
+        (epoch, n)
+    }
+
+    pub(crate) fn bump_words_gen(&self, schema: &str) {
         self.words_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *self
+            .words_gen_by_schema
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(schema.to_string())
+            .or_default() += 1;
+    }
+
+    /// 不分方案的结构变化（整库还原）：全局与纪元一起推进。
+    pub(crate) fn bump_words_epoch(&self) {
+        self.words_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.words_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
@@ -370,7 +408,7 @@ impl Store {
             let db = open_db(&self.path, self.cache_bytes)?;
             Self::init_tables(&db)?;
             *guard = Some(db);
-            self.bump_words_gen();
+            self.bump_words_epoch();
             info!("Store resumed: {}", self.path.display());
         }
         Ok(())

@@ -306,7 +306,7 @@ impl Store {
                 t.insert(key.as_str(), enc_val_ordered(w, c, ca, b, order).as_slice())?;
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(())
         })
     }
@@ -465,7 +465,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(())
         })
     }
@@ -500,7 +500,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(updated)
         })
     }
@@ -554,7 +554,7 @@ impl Store {
             // 只有新造词、权重变化才动联想索引；纯 count +1（绝大多数选词）不算——用户词在
             // 联想里按权重排，count 不参与。
             if structural {
-                self.bump_words_gen();
+                self.bump_words_gen(schema);
             }
             Ok(())
         })
@@ -587,7 +587,7 @@ impl Store {
             }
             abbrev_index::clear_schema(&mut txn.open_table(USER_ABBREV)?, schema)?;
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(n)
         })
     }
@@ -668,7 +668,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(c)
         })
     }

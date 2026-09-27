@@ -75,7 +75,7 @@ impl Store {
             txn.commit()?;
             // 新词是结构变化；已有词只是 count +1（边界补齐不进联想索引）。
             if is_new {
-                self.bump_words_gen();
+                self.bump_words_gen(schema);
             } else {
                 self.bump_words_count_gen();
             }
@@ -286,7 +286,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(deleted)
         })
     }
@@ -373,7 +373,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(rows.len())
         })
     }
@@ -405,7 +405,7 @@ impl Store {
             }
             abbrev_index::clear_schema(&mut txn.open_table(TEMP_ABBREV)?, schema)?;
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(n)
         })
     }
@@ -428,7 +428,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(())
         })
     }
@@ -502,7 +502,7 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            self.bump_words_gen(schema);
             Ok(promoted)
         })
     }
