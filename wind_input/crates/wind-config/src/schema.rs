@@ -286,6 +286,10 @@ impl ChaiziSpec {
     }
 }
 
+/// `[engine.aux_code].files` 里「引用一个码表方案」的条目前缀：`"schema:wubi86"`。
+/// 其余条目是码表文件路径（相对 schemas 目录）。见 `docs/design/aux-code-schema-source.md` §3。
+pub const AUX_SCHEMA_SOURCE_PREFIX: &str = "schema:";
+
 /// 辅助码方案段（`[engine.aux_code]`）：**方案作者的码表基线 + 行为 tri-state 覆盖**。
 ///
 /// 与 [`CodeTableSpec`] 同构（见 schema-config-layering.md §4）：
@@ -298,8 +302,12 @@ impl ChaiziSpec {
 /// 只是「这个方案该用哪张表」，不代表用户要用它。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuxCodeSpec {
-    /// 辅助码文件列表（`字=码` 文本，每行一条），相对 schemas 目录。
-    /// 多份按**顺序** merge 成一张表（先出现 = 高优，见 wind-aux-code 的 merge 语义）。
+    /// 辅助码来源列表，**顺序即优先级**（先出现 = 高优）。两种条目：
+    /// - `"aux_code/flypy_full.txt"`：码表文件（`字=码` 文本），相对 schemas 目录；
+    /// - `"schema:wubi86"`：引用一个码表方案，取它的系统词库 + 用户词库里的编码
+    ///   （见 [`AUX_SCHEMA_SOURCE_PREFIX`]）。只能引用 `codetable` 方案、不能引用自己。
+    ///
+    /// override 层写这个键即**整组替换**方案文件的基线（`merge_toml` 对数组整体替换）。
     #[serde(default)]
     pub files: Vec<String>,
     /// 本方案是否启用辅助码。`None` = 回落全局 `[schema.pinyin.aux_code].enabled`。

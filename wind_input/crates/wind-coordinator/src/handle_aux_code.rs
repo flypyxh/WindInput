@@ -167,7 +167,15 @@ impl Coordinator {
             self.warn_aux_code_key_taken(key_code);
             return None;
         }
-        let paths = settings.files;
+        // 第一期协调器接入前的过渡：只取文件来源，行为与改动前一致（Task 6 换成完整实现）。
+        let paths: Vec<std::path::PathBuf> = settings
+            .sources
+            .iter()
+            .filter_map(|s| match s {
+                wind_engine::AuxSource::File(p) => Some(p.clone()),
+                wind_engine::AuxSource::Schema(_) => None,
+            })
+            .collect();
         if paths.is_empty() || state.candidates.is_empty() {
             return None;
         }

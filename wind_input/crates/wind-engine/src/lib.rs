@@ -22,6 +22,8 @@ pub use engine::{
     AdmitFn, BoundaryResolution, ConvertOptions, ConvertResult, Engine, EngineType, ExtendedEngine,
 };
 pub use english::EnglishEngine;
-pub use manager::{EngineManager, FreqSettings, FreqStrategy, SchemaDictFile};
+pub use manager::{
+    AuxCodeSettings, AuxSource, EngineManager, FreqSettings, FreqStrategy, SchemaDictFile,
+};
 pub use pinyin::PinyinEngine;
 pub use text_codes::TextCodeView;

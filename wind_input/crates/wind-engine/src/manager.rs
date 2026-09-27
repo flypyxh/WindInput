@@ -297,6 +297,15 @@ pub struct OverlayEntry {
     pub spec: wind_config::OverlaySpec,
 }
 
+/// 一条已解析的辅助码来源，见 `[engine.aux_code].files`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuxSource {
+    /// 码表文件的绝对路径。
+    File(std::path::PathBuf),
+    /// 被引用的码表方案 id（已验证存在、是 codetable、不是自己）。
+    Schema(String),
+}
+
 /// 活跃方案的辅助码生效设置（全局基线折叠方案覆盖后的结果）。
 ///
 /// 由 [`EngineManager::aux_code_settings`] 一次读出，供协调器的进入门卫与筛选选项共用
@@ -307,8 +316,18 @@ pub struct AuxCodeSettings {
     pub enabled: bool,
     /// 词组长度上限（0 = 不限）。
     pub max_phrase_len: usize,
-    /// 已解析的码表文件绝对路径。**`enabled == false` 时恒空**（关闭即不解析）。
-    pub files: Vec<std::path::PathBuf>,
+    /// 已解析的来源，顺序即优先级。**`enabled == false` 时恒空**（关闭即不解析）。
+    pub sources: Vec<AuxSource>,
+}
+
+impl AuxCodeSettings {
+    /// 其中被引用的方案 id。
+    pub fn schema_sources(&self) -> impl Iterator<Item = &str> {
+        self.sources.iter().filter_map(|s| match s {
+            AuxSource::Schema(id) => Some(id.as_str()),
+            AuxSource::File(_) => None,
+        })
+    }
 }
 
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
@@ -1515,9 +1534,15 @@ impl EngineManager {
         Some(m)
     }
 
-    /// 反查索引「在用集合」里除主码表外的方案。Task 6 会追加辅助码引用的方案。
+    /// 反查索引「在用集合」里除主码表外的方案：联想词方案 + 辅助码引用的方案。
     fn reverse_index_pins(&self) -> Vec<String> {
-        vec![self.assoc_word_schema()]
+        let mut v = vec![self.assoc_word_schema()];
+        v.extend(
+            self.aux_code_settings()
+                .schema_sources()
+                .map(str::to_string),
+        );
+        v
     }
 
     /// 后台预热反查索引：把「首次使用时才建」提前到预热线程。
@@ -4257,21 +4282,35 @@ impl EngineManager {
             .map(|s| s.engine.aux_code);
         let resolved = global.resolved(spec.as_ref());
         // 关闭时不解析路径：省掉 N 次目录探测，也避免为一个用不上的功能刷 warn。
-        let files = if resolved.enabled {
+        let sources = if resolved.enabled {
             spec.map(|c| {
                 c.files
                     .iter()
-                    .filter_map(|rel| {
+                    .filter_map(|entry| {
+                        if let Some(id) =
+                            entry.strip_prefix(wind_config::schema::AUX_SCHEMA_SOURCE_PREFIX)
+                        {
+                            let id = id.trim();
+                            if id.is_empty() || id == schema_id {
+                                tracing::warn!("辅助码来源无效（空或引用自己）: {entry}");
+                                return None;
+                            }
+                            if self.schema_engine_type(id).as_deref() != Some("codetable") {
+                                tracing::warn!("辅助码来源方案不存在或不是码表方案: {id}");
+                                return None;
+                            }
+                            return Some(AuxSource::Schema(id.to_string()));
+                        }
                         let p = wind_config::Config::resolve_schema_resource(
                             self.data_dir.as_deref(),
-                            rel,
+                            entry,
                         );
                         if p.is_none() {
                             tracing::warn!(
-                                "辅助码文件不存在（用户/系统 schemas 目录均未找到）: {rel}"
+                                "辅助码文件不存在（用户/系统 schemas 目录均未找到）: {entry}"
                             );
                         }
-                        p
+                        p.map(AuxSource::File)
                     })
                     .collect()
             })
@@ -4282,7 +4321,7 @@ impl EngineManager {
         AuxCodeSettings {
             enabled: resolved.enabled,
             max_phrase_len: resolved.max_phrase_len,
-            files,
+            sources,
         }
     }
 
