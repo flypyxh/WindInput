@@ -79,14 +79,14 @@ impl FreqProfile {
 }
 
 /// value: count u32 + last_used i64 = 12 字节
-fn enc_freq(count: u32, last_used: i64) -> [u8; 12] {
+pub(crate) fn enc_freq(count: u32, last_used: i64) -> [u8; 12] {
     let mut b = [0u8; 12];
     b[0..4].copy_from_slice(&count.to_le_bytes());
     b[4..12].copy_from_slice(&last_used.to_le_bytes());
     b
 }
 
-fn dec_freq(b: &[u8]) -> Option<FreqRecord> {
+pub(crate) fn dec_freq(b: &[u8]) -> Option<FreqRecord> {
     if b.len() < 12 {
         return None;
     }

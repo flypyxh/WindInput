@@ -45,6 +45,14 @@ impl Coordinator {
         s.candidates.iter().map(|c| c.text.clone()).collect()
     }
 
+    /// 按上文 `text` 算出的联想候选文本（不进联想态、不改状态；评测 / 诊断用）。
+    pub fn debug_assoc_suggest(&self, text: &str) -> Vec<String> {
+        self.assoc_hits(&self.assoc_config(), text)
+            .into_iter()
+            .map(|h| h.text)
+            .collect()
+    }
+
     /// 当前 `state.preedit`（测试/诊断用）。联想态在非嵌入模式下往这里写「联想输入」
     /// 标识，退出联想必须连它一起清掉——集成测试够不着 `state`，只能经这里断言。
     pub fn debug_preedit(&self) -> String {

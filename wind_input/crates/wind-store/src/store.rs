@@ -74,6 +74,9 @@ pub(crate) const TEMP_ABBREV: TableDefinition<&str, &[u8]> = TableDefinition::ne
 /// 新表无需迁移：`init_tables` 在写事务里 `open_table` 即创建。
 pub(crate) const DRAFT_WORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("draft_words");
 /// 用户词频：key = "{schema}\0{code}\0{text}"，value = {count,last_used}（见 frequency.md）
+/// 联想历史：key = "{schema}\0{上文}\0{选中的整词}"，value 同 [`FREQ`]（count + last_used）。
+/// 用户在某上文后选了哪条联想，见 [`crate::assoc_history`]。
+pub(crate) const ASSOC_HIST: TableDefinition<&str, &[u8]> = TableDefinition::new("assoc_history");
 pub(crate) const FREQ: TableDefinition<&str, &[u8]> = TableDefinition::new("freq");
 /// Shadow 规则：key = "{schema}\0{code}"
 pub(crate) const SHADOW: TableDefinition<&str, &[u8]> = TableDefinition::new("shadow");
@@ -213,6 +216,7 @@ impl Store {
             w.open_table(USER_ABBREV)?;
             w.open_table(TEMP_WORDS)?;
             w.open_table(TEMP_ABBREV)?;
+            w.open_table(ASSOC_HIST)?;
             w.open_table(DRAFT_WORDS)?;
             w.open_table(FREQ)?;
             w.open_table(SHADOW)?;
@@ -521,13 +525,13 @@ impl Store {
         &self.path
     }
 
-    /// 枚举四张按 schema 前缀编码的表（user/temp/freq/shadow）里出现过的全部 schema id。
+    /// 枚举按 schema 前缀编码的表（user/temp/freq/shadow/assoc_history）里出现过的全部 schema id。
     /// 备份用：确保有数据但未在当前配置启用的方案也被覆盖。
     pub fn list_data_schemas(&self) -> anyhow::Result<Vec<String>> {
         let mut set = std::collections::BTreeSet::new();
         self.with_db(|db| {
             let txn = db.begin_read()?;
-            for table in [USER_WORDS, TEMP_WORDS, FREQ, SHADOW] {
+            for table in [USER_WORDS, TEMP_WORDS, FREQ, SHADOW, ASSOC_HIST] {
                 let t = txn.open_table(table)?;
                 for item in t.range::<&str>(..)? {
                     let (k, _) = item?;

@@ -140,6 +140,18 @@ pub fn create_backup(
             "freq",
             meta.clone(),
         )?;
+        // 联想历史（t185 方案 B）归「freq」段（见 `section_of`）：同是「用出来的」使用数据，
+        // 设置端的备份段落不必多一项。
+        let assoc = store.export_assoc_history_jsonl(sc)?;
+        if !assoc.is_empty() {
+            add(
+                &mut w,
+                format!("userdata/assoc_history/{sc}.jsonl"),
+                assoc.as_bytes(),
+                "assoc_history",
+                meta.clone(),
+            )?;
+        }
         let shadow = store.export_shadow_jsonl(sc)?;
         add(
             &mut w,
@@ -275,6 +287,7 @@ fn section_of(ty: &str) -> &str {
         "theme_file" => "themes",
         "stats_meta" => "stats",
         "compat" => "config",
+        "assoc_history" => "freq",
         other => other,
     }
 }
@@ -390,6 +403,14 @@ pub fn restore_backup(
                     store.clear_freq(schema)?;
                 }
                 store.import_freq_jsonl(schema, &text())?;
+                schemas_touched.insert(schema.to_string());
+                restored.push(e.path.clone());
+            }
+            "assoc_history" if !schema.is_empty() => {
+                if replace && cleared.insert(format!("assoc_history:{schema}")) {
+                    store.clear_assoc_history(schema)?;
+                }
+                store.import_assoc_history_jsonl(schema, &text())?;
                 schemas_touched.insert(schema.to_string());
                 restored.push(e.path.clone());
             }
@@ -980,6 +1001,53 @@ mod tests {
         .unwrap();
         assert!(r2.conflicts.is_empty());
         assert_eq!(std::fs::read(&cfg2).unwrap(), b"[ui]\n");
+    }
+
+    /// 联想历史（t185 方案 B）随「freq」段备份 / 还原：选了 `freq` 段就带上它。
+    #[test]
+    fn assoc_history_roundtrips_under_freq_section() {
+        let t = tempfile::tempdir().unwrap();
+        let s = seed_store(t.path());
+        s.record_assoc_pick("wb", "荷", "荷枪实弹").unwrap();
+        s.record_assoc_pick("wb", "荷", "荷枪实弹").unwrap();
+        let out = t.path().join("b.zip");
+        let src = BackupSources {
+            user_config_file: None,
+            compat_file: None,
+            user_schemas_dir: None,
+            user_schema_overrides_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        let opts = BackupOptions {
+            include_stats: false,
+            include_state: false,
+        };
+        create_backup(&s, &src, &out, "1.0.0", "windows", "t", &opts).unwrap();
+
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
+        s2.record_assoc_pick("wb", "荷", "荷花").unwrap(); // 本地旧记录
+        let targets = RestoreTargets {
+            user_config_file: None,
+            compat_file: None,
+            user_schemas_dir: None,
+            user_schema_overrides_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        let sections = vec!["freq".to_string()];
+        restore_backup(
+            &out,
+            &s2,
+            &targets,
+            crate::merge::Strategy::Replace,
+            Some(&sections),
+        )
+        .unwrap();
+        let got = s2.assoc_history("wb", "荷", 0).unwrap();
+        assert_eq!(got.len(), 1, "Replace 清掉本地旧记录：{got:?}");
+        assert_eq!((got[0].0.as_str(), got[0].1.count), ("荷枪实弹", 2));
     }
 
     #[test]

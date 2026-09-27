@@ -313,3 +313,63 @@ fn temp_noise_does_not_displace_system_words() {
         "个人档按 count 降序，实得 {got:?}"
     );
 }
+
+/// 在联想态里选中 `word`（按它在当前页的位置按数字键），返回上屏文本。
+fn pick_assoc(c: &Coordinator, word: &str) -> String {
+    let idx = c
+        .debug_page_texts()
+        .iter()
+        .position(|t| t == word)
+        .unwrap_or_else(|| panic!("前提：联想当前页有「{word}」：{:?}", c.debug_page_texts()));
+    let act = press(c, 0x31 + idx as u32);
+    committed(&act).unwrap_or_default().to_string()
+}
+
+/// ★ 方案 B（History）：在「荷」之后选过两次「荷枪实弹」，第三次上屏「荷」后它排第一，且不重复出现。
+#[test]
+fn assoc_history_promotes_picked_word() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, _) = coord("h_pick", "word", false, |_| {});
+    let base = assoc_after_he(&c);
+    let base_pos = base.iter().position(|t| t == "荷枪实弹");
+    assert!(
+        base_pos.is_some_and(|p| p > 0),
+        "前提：系统序里它不在首位 {base:?}"
+    );
+    assert_eq!(pick_assoc(&c, "荷枪实弹"), "枪实弹", "只补剩余部分");
+    assoc_after_he(&c);
+    pick_assoc(&c, "荷枪实弹");
+    let got = assoc_after_he(&c);
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some("荷枪实弹"),
+        "实得 {got:?}"
+    );
+    assert_eq!(
+        got.iter().filter(|t| *t == "荷枪实弹").count(),
+        1,
+        "去重：{got:?}"
+    );
+}
+
+/// History 只记在**它的上文**下：「荷」之后选的，不影响别的上文。
+#[test]
+fn assoc_history_is_keyed_by_context() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, store) = coord("h_ctx", "word", false, |_| {});
+    assoc_after_he(&c);
+    pick_assoc(&c, "荷枪实弹");
+    let rows = store.assoc_history("wubi86", "荷", 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "荷枪实弹");
+    assert!(
+        store
+            .assoc_history("wubi86", "荷枪", 10)
+            .unwrap()
+            .is_empty()
+    );
+}

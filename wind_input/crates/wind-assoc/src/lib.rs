@@ -163,7 +163,9 @@ impl AssocKind {
     pub fn allows(self, src: AssocSource) -> bool {
         match self {
             AssocKind::Off => false,
-            AssocKind::Word => src == AssocSource::Prefix,
+            // History 今天只记前缀延伸类的选择（整词以上文开头），与词语联想「只出上文的
+            // 延长」同形 ⇒ 词语联想档也放行它。
+            AssocKind::Word => matches!(src, AssocSource::Prefix | AssocSource::History),
             AssocKind::Smart => true,
         }
     }

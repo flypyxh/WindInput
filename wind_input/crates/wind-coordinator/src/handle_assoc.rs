@@ -293,7 +293,73 @@ impl AssocProvider for PrefixWords<'_> {
     }
 }
 
+/// 联想历史的取数源：用户**在这个上文之后**从联想里选过的词（论坛 t185 方案 B）。
+///
+/// 读 store 的 `assoc_history` 表（一次范围扫描）；写在 [`Coordinator::record_assoc_pick`]。
+/// 分值 = 选中次数的衰减分（与 FREQ 同一套 `pinyin_score`），源内按它降序。
+struct HistoryWords<'a> {
+    store: &'a wind_store::Store,
+    schema: String,
+    profile: wind_store::freq::FreqProfile,
+}
+
+impl AssocProvider for HistoryWords<'_> {
+    fn suggest(&self, ctx: &AssocContext<'_>, limit: usize) -> Vec<AssocHit> {
+        if limit == 0 || self.schema.is_empty() {
+            return Vec::new();
+        }
+        let rows = match self.store.assoc_history(&self.schema, ctx.text, limit) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("读联想历史失败（本次不出历史）: {e}");
+                return Vec::new();
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        rows.into_iter()
+            // 只收「上文的严格延长」：今天写入端只记前缀延伸类的选择（见 `record_assoc_pick`），
+            // 这里再守一道，免得导入的脏数据把「上屏补剩余部分」算错。
+            .filter_map(|(word, rec)| {
+                let rest = word
+                    .strip_prefix(ctx.text)
+                    .filter(|r| !r.is_empty())?
+                    .to_string();
+                Some(AssocHit {
+                    score: (self.profile.pinyin_score(&rec, now) * 1000.0) as i64,
+                    text: word,
+                    commit: Some(rest),
+                    source: AssocSource::History,
+                })
+            })
+            .collect()
+    }
+}
+
 impl Coordinator {
+    /// 词语联想的数据归属 id（store 键里的 schema）：联想词源方案折叠后的数据域。
+    fn assoc_data_schema(&self) -> String {
+        self.engine_mgr
+            .data_schema_id(&self.engine_mgr.assoc_word_schema())
+    }
+
+    /// 选中联想候选后记一笔联想历史（方案 B 的写入端）。
+    ///
+    /// 只记**前缀延伸**类的选择（有 `commit_override`：显示整词、上屏补剩余）——上文就是
+    /// 整词去掉补出的那截。标点联想等没有「上文 → 词」的前缀关系，不记。
+    pub(crate) fn record_assoc_pick(&self, cand: &Candidate) {
+        let (Some(store), Some(rest)) = (&self.store, cand.commit_override.as_deref()) else {
+            return;
+        };
+        let Some(context) = cand.text.strip_suffix(rest).filter(|c| !c.is_empty()) else {
+            return;
+        };
+        if let Err(e) = store.record_assoc_pick(&self.assoc_data_schema(), context, &cand.text) {
+            tracing::debug!("记联想历史失败: {e}");
+        }
+    }
+
     /// 退出联想态。已不在联想态时是空操作（返回 false）。
     ///
     /// 调用点遍布各条按键分派臂，故**必须幂等且极廉价**——绝大多数按键并不在联想态下发生。
@@ -318,17 +384,10 @@ impl Coordinator {
         AssocConfig::from_config(&rt.config.input.association, mobile)
     }
 
-    /// 按刚上屏的文本生成联想候选并进入联想态。返回是否真的进入了。
-    ///
-    /// # 调用契约
-    ///
-    /// 调用前编码缓冲与常规候选**必须已清空**（互斥不变式，见
-    /// [`State::debug_assert_assoc_invariant`]）。上屏路径上这件事由
-    /// `reset_pinyin_composition` 完成，故本函数只该在它之后调用。
-    pub(crate) fn maybe_enter_assoc(&self, state: &mut State, text: &str) -> bool {
-        let cfg = self.assoc_config();
+    /// 按上文算联想候选（不改状态）。`maybe_enter_assoc` 与评测 / 诊断共用这一份。
+    pub(crate) fn assoc_hits(&self, cfg: &AssocConfig, text: &str) -> Vec<AssocHit> {
         if cfg.kind == AssocKind::Off {
-            return false;
+            return Vec::new();
         }
         let ctx = AssocContext {
             text,
@@ -344,16 +403,36 @@ impl Coordinator {
             // 恰恰常是混输。解析规则见 `assoc_word_schema`。
             schema: self.engine_mgr.assoc_word_schema(),
         };
-        // ⚠️ 四个源里目前接了两个。History（个人搭配，需新建 redb 表）与 Bigram
-        // （词→后继表，需离线蒸馏）尚无 provider ⇒ `associate` 对它们 `continue`，
+        // ⚠️ 四个源里目前接了三个（History 见 `HistoryWords`，2026-09 接入）。Bigram
+        // （词→后继表，需离线蒸馏）尚无 provider ⇒ `associate` 对它 `continue`，
         // 配额顺延。这是有意的分期，不是漏接。
         //
         // 档位过滤在 `AssocConfig::source_enabled` 里，**不在这里**：这里一律登记全部
         // 已实现的源，由 kind 决定谁能出场。两处都做过滤会让「词语联想为什么没标点」
         // 这类问题有两个答案。
-        let providers: &[(AssocSource, &dyn AssocProvider)] =
-            &[(AssocSource::Prefix, &prefix), (AssocSource::Punct, &punct)];
-        let hits = wind_assoc::associate(&ctx, &cfg, providers);
+        let history = self.store.as_deref().map(|store| HistoryWords {
+            store,
+            schema: self.assoc_data_schema(),
+            profile: self.engine_mgr.pinyin_freq_profile(),
+        });
+        let mut providers: Vec<(AssocSource, &dyn AssocProvider)> =
+            vec![(AssocSource::Prefix, &prefix), (AssocSource::Punct, &punct)];
+        if let Some(h) = &history {
+            providers.push((AssocSource::History, h));
+        }
+        wind_assoc::associate(&ctx, cfg, &providers)
+    }
+
+    /// 按刚上屏的文本生成联想候选并进入联想态。返回是否真的进入了。
+    ///
+    /// # 调用契约
+    ///
+    /// 调用前编码缓冲与常规候选**必须已清空**（互斥不变式，见
+    /// [`State::debug_assert_assoc_invariant`]）。上屏路径上这件事由
+    /// `reset_pinyin_composition` 完成，故本函数只该在它之后调用。
+    pub(crate) fn maybe_enter_assoc(&self, state: &mut State, text: &str) -> bool {
+        let cfg = self.assoc_config();
+        let hits = self.assoc_hits(&cfg, text);
         if hits.is_empty() {
             return false;
         }

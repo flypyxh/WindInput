@@ -133,6 +133,35 @@ bridge 回 `StatusUpdate`，而 C++ 的 StatusUpdate 分支**明确不结束组�
 **本次照用旧索引**、后台单飞重建，按键线程上零扫描。代价是刚写入的词要到重建完成后的
 下一次上屏才进联想。联想开着才在启动预热里建它。
 
+### 3.1.2 联想历史（History 来源）与实测
+
+**History**（优先级 0，排在 Prefix 前）：store 表 `assoc_history`，键
+`schema\0上文\0整词`，值同 FREQ（count + last_used）。写入端在 `commit_selected` 的
+`from_assoc` 分支调 `record_assoc_pick`：只记前缀延伸类的选择（候选带
+`commit_override`，上文 = 整词去掉补出的那截），标点联想不记。读端 `HistoryWords` 按
+`schema\0上文\0` 做一次范围扫描，分值 = `pinyin_score(count, last_used) × 1000`，
+源内按它降序；与 Prefix 按文本去重、先到先得（同一个词出现在 History 里，Prefix 那条
+就不再出）。词语联想档（`AssocKind::Word`）放行 History：它只出上文的延长，与 Prefix 同形。
+归属 id = `data_schema_id(assoc_word_schema())`。不进用户词文本索引，不 bump 写代次。
+随「清空词频」、删方案级联清除；备份里作 `assoc_history` 条目，归「freq」段。
+
+**离线评测**（`tests/assoc_eval.rs::assoc_rank_eval`，ignored；语料 = 文档站 content，
+wubi86 最大匹配切词，上文 = 词首字，前半训练后半测量 4000 条，max_count = 9）：
+
+| 配置 | top1 | top3 | MRR |
+|---|---|---|---|
+| 基线（静态序） | 28.65% | 50.00% | 0.4313 |
+| A（FREQ 档内重排） | 60.33% | 81.17% | 0.7191 |
+| A+B（+ 联想历史，假设训练期都经联想上屏，偏乐观） | 61.08% | 83.05% | 0.7318 |
+
+A 的提升里含「训练 / 测量同一批文档、用词高度重复」的成分，看 delta 不看绝对值；B 在
+A 之上增益小，是因为这个口径下「首字 → 词」与 FREQ 高度同源——B 的价值在 FREQ 给不了的
+场景（同一个词在不同上文下的偏好、正常打字没打过而只在联想里选过的词）。
+
+**按键路径耗时**（`assoc_key_path_latency_heavy_user`，release，19 万条用户词 + 10 万条
+词频 + 2 万条联想历史，上文取 1000 个常用首字）：纯联想取数 P50 0.111 ms / P99 0.244 ms；
+「空格上屏 + 进联想」整键 P50 0.128 ms / P99 0.232 ms。
+
 上文取的是 `out`（转换后的文本）而非 `final_simplified`：用户屏幕上真正出现的是
 简繁转换、英文补空格之后的形态，联想该看的是**那个**。拿转换前的形态去联想，
 繁体用户会在「你好」后面收到按简体规则算出来的推荐。

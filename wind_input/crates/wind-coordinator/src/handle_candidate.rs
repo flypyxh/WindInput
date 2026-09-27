@@ -3512,6 +3512,10 @@ impl Coordinator {
             //      拿它去查一条也查不到。（标点联想两种都行，但没理由分叉。）
             //   ② **完整词**——选中联想「中国」时 `out` 只是补出去的「国」，而屏幕上
             //      是「中国」。拿「国」当上文，续联想会从错误的前缀接下去。
+            // 联想历史（方案 B）：选的是联想候选就记「上文 → 整词」。
+            if from_assoc {
+                self.record_assoc_pick(cand);
+            }
             let assoc_ctx = if from_assoc {
                 cand.text.clone()
             } else {

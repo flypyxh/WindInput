@@ -1672,6 +1672,7 @@ pub trait WebDataRpc: WebDataHost {
                         // 但在那之前它们仍会被召回并跃迁——往一个已不存在的方案的临时词库里写。
                         store.clear_drafts(sid)?;
                         store.clear_freq(sid)?;
+                        store.clear_assoc_history(sid)?;
                         store.clear_shadow(sid)?;
                     }
                 }
@@ -2238,6 +2239,8 @@ pub trait WebDataRpc: WebDataHost {
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        // 联想历史（t185）同是「用出来的」使用数据，随「清空词频」一并清。
+        store.clear_assoc_history(&schema)?;
         Ok(json!(store.clear_freq(&schema)?))
     }
 
