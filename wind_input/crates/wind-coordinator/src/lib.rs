@@ -7,6 +7,8 @@ pub mod candidate_pull;
 #[cfg(test)]
 pub(crate) mod charset_test_support;
 pub(crate) mod comment;
+/// 设置页预览行的模板样例求值（`comment` 本身不对外，只开放这一块）。
+pub use comment::preview as template_preview;
 pub(crate) mod config_bundle;
 pub(crate) mod construct;
 pub mod coordinator;

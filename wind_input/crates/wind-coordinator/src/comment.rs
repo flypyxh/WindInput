@@ -2043,6 +2043,9 @@ mod eval_var_tests {
     }
 }
 
+/// 设置页预览行的模板样例求值与诊断（设计 text-span-colors.md §11）。
+pub mod preview;
+
 // 改动前的模板引擎逐字副本，只作对拍参照（见文件头）。
 #[cfg(test)]
 #[path = "comment_legacy_ref.rs"]
