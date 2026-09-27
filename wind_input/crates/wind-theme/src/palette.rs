@@ -9,9 +9,22 @@ use toml::Value;
 /// 颜色 [R, G, B, A]，与 UI 缓冲约定一致。
 pub type Rgba = [u8; 4];
 
-/// 解析 #RRGGBB 或 #RRGGBBAA。
+/// 解析 `#RRGGBB` / `#RRGGBBAA`（`#` 可省），以及 `#RGB`（`#` 必带，扩写为 `#RRGGBB`）。
+///
+/// 3 位简写必须带 `#`：本函数的调用方不止主题，还有语言栏配置（`[ui.langbar]` 各色，用户手填）
+/// 与模板内联色（`$[…]{}`，名字与色值共用一个位置）。3 位也可裸写的话，`bad`、`fed`、`ace`
+/// 这类英文单词会被当成颜色。6 / 8 位的裸写保持原样——那是既有行为，手写配置里见过。
 pub fn parse_hex(s: &str) -> Option<Rgba> {
-    let s = s.trim().trim_start_matches('#');
+    let s = s.trim();
+    if let Some(d) = s.strip_prefix('#')
+        && d.len() == 3
+        && d.is_ascii()
+    {
+        // 单个十六进制位 v 扩写为 vv，即 v × 17。
+        let n = |i: usize| u8::from_str_radix(&d[i..=i], 16).ok().map(|v| v * 17);
+        return Some([n(0)?, n(1)?, n(2)?, 255]);
+    }
+    let s = s.trim_start_matches('#');
     // 先挡非 ASCII：下面按字节切片，多字节字符会让切点落在字中间而 panic。
     if !s.is_ascii() {
         return None;
@@ -135,6 +148,25 @@ mod tests {
         // 用户手改 config.toml 就能喂进来（角标色、语言栏主字色都走这里）。
         assert_eq!(parse_hex("红红"), None);
         assert_eq!(parse_hex("#红红ab"), None);
+    }
+
+    #[test]
+    fn short_hex_expands_each_digit() {
+        assert_eq!(parse_hex("#F80"), Some([0xFF, 0x88, 0x00, 255]));
+        assert_eq!(parse_hex(" #abc "), Some([0xAA, 0xBB, 0xCC, 255]));
+        assert_eq!(parse_hex("#GG0"), None);
+        // 「红」恰是 3 字节：不先挡非 ASCII 的话，按字节切片会切在字中间而 panic。
+        assert_eq!(parse_hex("#红"), None);
+    }
+
+    /// 3 位不带 `#` 一律不认：语言栏配置与内联色里，`bad` / `fed` / `ace` 是词不是颜色。
+    #[test]
+    fn short_hex_requires_hash() {
+        for word in ["bad", "fed", "ace", "F80", "##F80"] {
+            assert_eq!(parse_hex(word), None, "{word} 不该被当成颜色");
+        }
+        // 6 / 8 位的裸写是既有行为，保持。
+        assert_eq!(parse_hex("FF8040"), Some([255, 128, 64, 255]));
     }
 
     #[test]
