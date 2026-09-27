@@ -123,6 +123,10 @@ pub struct RvNode {
     pub shadow_spread_offset_x: Option<Dim>,
     pub shadow_spread_offset_y: Option<Dim>,
     pub shadow_color: Option<Rgba>,
+    /// 文字角色色（分段着色，`[comment.roles]` / `[tooltip.roles]`）：角色名 → 已解析颜色。
+    /// 空 = 没配，片段一律按正文色。只有 `comment`（含状态 patch）与 `tooltip` 消费，
+    /// 求色见 [`crate::span::span_color`]。
+    pub roles: std::collections::HashMap<String, Rgba>,
     /// 状态 patch（递归）。仅合并色/图/边框/字体/层，不合并几何（state_geometry unsupported）。
     pub selected: Option<Box<RvNode>>,
     pub hover: Option<Box<RvNode>>,
