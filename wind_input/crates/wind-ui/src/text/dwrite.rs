@@ -1621,6 +1621,10 @@ mod imp {
         ///
         /// 表里查不到的 effect（理论上不会出现：effect 只有 `draw_runs` 设；真出现了多半是
         /// 运行时把 effect 包了一层、指针变了）按基色、在第一遍画，宁可颜色不对也不丢字。
+        ///
+        /// ⚠️ 第一遍是按**首个 alpha 组**混合的：基色的 alpha 与首组不同时（例如基色半透明、
+        /// 区间全覆盖且首组不透明），兜底画出的字用的是首组的 alpha，而不是基色自己的。
+        /// 这只影响「反查失败」这个本不该发生的兜底，不为它多画一遍。
         fn pick(&self, effect: Option<&windows::core::IUnknown>) -> Option<u32> {
             if let Some(e) = effect {
                 let p = e.as_raw() as usize;

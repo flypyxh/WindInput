@@ -19,6 +19,7 @@
 
 use super::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 use wind_ui_types::{SpanStyle, StyledText, TooltipDoc, TooltipLine, TooltipSection};
 
 /// 出厂主题目录下的主题（含两个抽象 base：它们同样可加载，且是其余主题的公共祖先）。
@@ -167,7 +168,7 @@ fn render_theme(name: &str, dark: bool) -> String {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut tip = crate::tooltip::Tooltip::new(tx).unwrap();
     tip.set_theme(&theme);
-    let (buf, w, h, log) = tip.golden_frame(&tooltip_doc());
+    let (buf, w, h, log) = tip.golden_frame(&Arc::new(tooltip_doc()));
     out.push_str(&format!(
         "== 气泡 ==\n-- 绘制 {w}x{h} 像素摘要 {:016x}\n",
         fnv1a(&buf)

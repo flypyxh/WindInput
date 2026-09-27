@@ -37,9 +37,17 @@ impl Atom {
     /// `ATOM := '#' HEX{3|6|8} | NAME`，`NAME = [a-z0-9_]+`。其余一律 [`Atom::Invalid`]。
     fn parse(s: &str) -> Self {
         let s = s.trim();
-        if s.starts_with('#') {
-            // parse_hex 对 6/8 位不要求 `#`，但这里已确认带了；`##…` 之类由它判非法。
-            return parse_hex(s).map_or(Atom::Invalid, Atom::Rgba);
+        if let Some(hex) = s.strip_prefix('#') {
+            // 恰好一个 `#`、其后全是十六进制位，才交给 parse_hex 换算。不能直接喂它：它会先
+            // 削掉**全部**前导 `#`（`##C00000` 照认），且按 `from_str_radix` 逐两位解析，
+            // 那个函数认前导 `+`（`#+F+F+F` 照认）——内联色要的是写法严格。
+            let strict =
+                matches!(hex.len(), 3 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+            return if strict {
+                parse_hex(s).map_or(Atom::Invalid, Atom::Rgba)
+            } else {
+                Atom::Invalid
+            };
         }
         let is_name = !s.is_empty()
             && s.bytes()
@@ -122,8 +130,11 @@ pub fn body_color(node: &RvNode, state: TextState, fallback: Rgba) -> Rgba {
 ///
 /// 气泡里的名字先查 `tooltip_<名>`、查不到再查同名：为白底调的亮档色放进深色气泡会看不清
 /// （§5.4）。`transparent` 占着宽度却看不见，只会是误用，按查不到处理（§4.5）。
+///
+/// 解析出来 alpha 为 0 的一律按查不到处理（字面 `#RRGGBB00`、alpha 为 0 的 token 同理）：
+/// 文字占着宽度却看不见，只会是误用，与 `transparent` 同一口径（§4.5）。
 fn resolve_ref(theme: &Resolved, is_tooltip: bool, r: &ColorRef) -> Option<Rgba> {
-    match if theme.is_dark { &r.dark } else { &r.light } {
+    let c = match if theme.is_dark { &r.dark } else { &r.light } {
         Atom::Rgba(c) => Some(*c),
         Atom::Invalid => None,
         Atom::Name(n) if &**n == "transparent" => None,
@@ -132,7 +143,8 @@ fn resolve_ref(theme: &Resolved, is_tooltip: bool, r: &ColorRef) -> Option<Rgba>
             .flatten()
             .or_else(|| theme.palette.get(&**n))
             .copied(),
-    }
+    };
+    c.filter(|c| c[3] != 0)
 }
 
 /// 一个片段该用的颜色（§6.2）。
@@ -261,6 +273,14 @@ mod tests {
         }
         // 裸 6 位不带 # 是名字（查不到即回落），不是颜色。
         assert_eq!(InlineColor::parse("ff0000").normal, both(name("ff0000")));
+        // 写法严格：多个 `#`、`from_str_radix` 认的前导 `+`、夹空格都不是颜色。
+        for spec in ["##C00000", "#+F+F+F", "#+FF0000", "# FF0000", "#FF 000"] {
+            assert_eq!(
+                InlineColor::parse(spec).normal,
+                both(Atom::Invalid),
+                "{spec:?}"
+            );
+        }
     }
 
     // ---------------- 求色 ----------------
@@ -654,6 +674,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 全透明色（字面 `#RRGGBB00`、alpha 为 0 的 token、`transparent`）一律按正文色。
+    #[test]
+    fn fully_transparent_colors_fall_back_to_body() {
+        let mut t = theme(false);
+        t.palette.insert("clear".to_string(), [9, 9, 9, 0]);
+        t.palette.insert("tooltip_ghost".to_string(), [9, 9, 9, 0]);
+        let n = node();
+        for spec in ["#FF000000", "clear", "transparent", "#FF000000/#00FF0000"] {
+            assert_eq!(
+                sc(&t, &n, false, Normal, None, false, Some(spec)),
+                BODY,
+                "{spec}"
+            );
+        }
+        assert_eq!(sc(&t, &n, true, Normal, None, false, Some("ghost")), BODY);
+        // 半透明不受影响。
+        assert_eq!(
+            sc(&t, &n, false, Normal, None, false, Some("#FF000080")),
+            [255, 0, 0, 0x80]
+        );
     }
 
     /// 节点自带正文色时，兜底不参与。

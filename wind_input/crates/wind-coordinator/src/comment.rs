@@ -253,6 +253,24 @@ fn find_group_end(b: &[u8], from: usize) -> Option<usize> {
 const ROLE_LITERAL: &str = "literal";
 const ROLE_TITLE: &str = "title";
 
+/// 求值入口认得、却不在契约清单 `TEXT_ROLES` 里的变量：它的文字不产角色，主题给它配的色
+/// 静默不生效。每个名字只记一次 warn——这条分支只有清单外的名字走得到，热路径没有额外开销。
+/// 源码扫描测试 `every_evaluable_variable_is_a_listed_role` 在编译期守同一件事，这里是运行期兜底。
+fn warn_unlisted_role(name: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen
+        .get_or_insert_with(Default::default)
+        .insert(name.to_string())
+    {
+        tracing::warn!(
+            variable = name,
+            "模板变量不在 TEXT_ROLES 契约清单里：它的文字不带角色，主题的角色色对它不生效"
+        );
+    }
+}
+
 /// 变量名 → 角色名：只有一张别名表（`code` → `code_rev`、`code_all` → `code_rev_all`，
 /// 见 `Coordinator::eval_var` 的兼容别名说明）。主题只需认规范名。
 pub(crate) fn role_of(name: &str) -> &str {
@@ -351,6 +369,9 @@ fn render_nodes(
                             break;
                         }
                         Some(v) if !v.is_empty() => {
+                            if r.role.is_none() {
+                                warn_unlisted_role(&r.name);
+                            }
                             value = Some((v, counts(&r.name), r.role));
                             break;
                         }
@@ -2400,6 +2421,38 @@ mod styled_tests {
         assert!(t.spans().iter().all(|s| s.in_title));
     }
 
+    /// 可选段在内联色里（`$[x]{{…}}`）：段内片段照样带外层的内联色——`Group` 的子构建器
+    /// 必须继承颜色栈，否则套一层可选段颜色就丢了。
+    #[test]
+    fn group_inside_color_keeps_the_color() {
+        let t = render_styled("$[accent]{{(${code_rev})}}", 0, ev(&[("code_rev", "wq")]));
+        assert_eq!(t.as_str(), "(wq)");
+        assert_eq!(
+            spans(&t),
+            vec![
+                sp("(", Some("literal"), Some("accent")),
+                sp("wq", Some("code_rev"), Some("accent")),
+                sp(")", Some("literal"), Some("accent")),
+            ]
+        );
+    }
+
+    /// 可选段 → 内联色 → 可选段 的嵌套：最内层取最近的内联色，段外的字面不带色。
+    #[test]
+    fn nested_group_color_group() {
+        let t = render_styled("[{<$[warning]{{${pinyin}}!}>}]", 0, ev(&[("pinyin", "nǐ")]));
+        assert_eq!(t.as_str(), "[<nǐ!>]");
+        assert_eq!(
+            spans(&t),
+            vec![
+                sp("[<", Some("literal"), None),
+                sp("nǐ", Some("pinyin"), Some("warning")),
+                sp("!", Some("literal"), Some("warning")),
+                sp(">]", Some("literal"), None),
+            ]
+        );
+    }
+
     /// 两个 walker 必须下钻 Color 节点（§8.1 ⚠️）。
     #[test]
     fn walkers_descend_into_color() {
@@ -2410,5 +2463,133 @@ mod styled_tests {
         );
         let t = Template::parse("$[x]{a\tb}");
         assert!(t.has_literal('\t'), "漏下钻 ⇒ 分列段被折行");
+    }
+}
+
+/// `TEXT_ROLES` 契约清单 ⊇ 全部求值入口认得的变量名（设计 text-span-colors.md §3.1）。
+///
+/// 反方向的守卫：`Span::role` 取自清单，清单外的变量不产角色、主题给它配的色静默不生效。
+/// 求值入口是若干 `match` / 闭包，没有可枚举的集合，故直接扫源码——抽出各入口函数体里的
+/// `"名字" =>` / `"名字" |` / `"名字" if` 分支，经别名表归一后逐个核对。新增变量忘了进清单，
+/// 这里就红。
+#[cfg(test)]
+mod role_contract_tests {
+    use super::role_of;
+
+    /// 从 `from` 起第一个 `{` 开始、按花括号配对截出函数 / 闭包体（跳过字符串字面量）。
+    fn body_after<'a>(src: &'a str, anchor: &str) -> &'a str {
+        let at = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("源码里找不到 {anchor:?}——入口改名了？同步改这条测试"));
+        let b = src.as_bytes();
+        let open = at + src[at..].find('{').expect("入口后应有函数体");
+        let (mut depth, mut i, mut in_str) = (0usize, open, false);
+        while i < b.len() {
+            match (in_str, b[i]) {
+                (true, b'\\') => i += 1,
+                (true, b'"') => in_str = false,
+                (false, b'"') => in_str = true,
+                (false, b'{') => depth += 1,
+                (false, b'}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{anchor:?} 的函数体没闭合");
+    }
+
+    /// 抽出 `"名字"` 后紧跟 `=>`、`|`、`if` 的变量名（match 分支的形态）。
+    fn arm_names(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(q) = rest.find('"') {
+            let after = &rest[q + 1..];
+            let Some(end) = after.find('"') else { break };
+            let name = &after[..end];
+            let tail = after[end + 1..].trim_start();
+            let is_arm = tail.starts_with("=>")
+                || (tail.starts_with('|') && !tail.starts_with("||"))
+                || tail.starts_with("if ");
+            if is_arm
+                && !name.is_empty()
+                && name.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+            {
+                out.push(name.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+        out
+    }
+
+    fn entry_names(extra: Option<(&str, &str)>) -> Vec<String> {
+        let comment = include_str!("comment.rs");
+        let tooltip = include_str!("tooltip.rs");
+        let coordinator = include_str!("coordinator.rs");
+        let mut bodies = vec![
+            body_after(comment, "pub(crate) fn eval_var("),
+            body_after(comment, "pub(crate) fn eval_text_var("),
+            body_after(comment, "pub(crate) fn reverse_text_var("),
+            body_after(comment, "pub(crate) fn role_of("),
+            body_after(tooltip, "pub(crate) fn char_var("),
+            body_after(tooltip, "let cand_eval = |name: &str, arg: Option<&str>|"),
+            body_after(
+                coordinator,
+                "let cand_eval = |name: &str, arg: Option<&str>|",
+            ),
+        ];
+        if let Some((src, anchor)) = extra {
+            bodies.push(body_after(src, anchor));
+        }
+        bodies.into_iter().flat_map(arm_names).collect()
+    }
+
+    fn unlisted(names: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = names
+            .iter()
+            .map(|n| role_of(n).to_string())
+            .filter(|r| !wind_ui_types::TEXT_ROLES.contains(&r.as_str()))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn every_evaluable_variable_is_a_listed_role() {
+        let names = entry_names(None);
+        // 防空转：几个确定存在的变量必须被扫到。
+        for must in [
+            "code_hint",
+            "readings",
+            "word_code",
+            "full_text",
+            "char",
+            "code",
+        ] {
+            assert!(
+                names.iter().any(|n| n == must),
+                "扫描漏了 {must}：{names:?}"
+            );
+        }
+        assert_eq!(
+            unlisted(&names),
+            Vec::<String>::new(),
+            "这些变量能求值却不在 TEXT_ROLES 里——主题给它们配的角色色会静默不生效"
+        );
+    }
+
+    /// 扫描确实抓得住：往一个 match 里塞个清单外的名字就报出来。
+    #[test]
+    fn scan_catches_an_unlisted_arm() {
+        const FAKE: &str = r#"fn fake(name: &str) -> Option<String> {
+            Some(match name { "pinyin" => x(), "no_such_role" if y => z(), _ => return None })
+        }"#;
+        let names = entry_names(Some((FAKE, "fn fake(")));
+        assert_eq!(unlisted(&names), vec!["no_such_role".to_string()]);
     }
 }

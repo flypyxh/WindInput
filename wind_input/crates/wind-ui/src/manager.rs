@@ -1506,7 +1506,7 @@ mod hide_popup_menu_tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx.clone()).unwrap();
         let t = w.tooltip_mut().expect("mock 气泡");
-        t.show(&doc(), 0, 0, 0, 10);
+        t.show(&std::sync::Arc::new(doc()), 0, 0, 0, 10);
         t.set_menu_open(true);
         let m = crate::popup_menu::PopupMenu::new(tx).expect("mock 菜单");
         (w, Some(m))

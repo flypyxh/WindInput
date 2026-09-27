@@ -241,7 +241,7 @@ impl Forwarder {
                     candidates
                         .get(hover as usize)
                         .map(|c| c.tooltip.clone())
-                        .filter(|d| !d.to_plain_text().is_empty())
+                        .filter(|d| !d.sections.is_empty())
                 } else {
                     None
                 };
@@ -1311,14 +1311,22 @@ mod tests {
         use wind_ui_types::{SpanStyle, StyledText, TooltipDoc, TooltipLine, TooltipSection};
         let cap = Arc::new(Mutex::new(Vec::new()));
         let (mut f, _ev) = mk(cap.clone(), "_t_runs");
-        let theme = |dark| {
+        // `error` 在气泡里先查 `tooltip_error`（§6.2 作用域查找），两档各给一个值。
+        let theme = |dark: bool| {
+            let mut palette = std::collections::HashMap::new();
+            palette.insert("error".to_string(), [1, 1, 1, 255]);
+            palette.insert(
+                "tooltip_error".to_string(),
+                if dark { [3, 3, 3, 255] } else { [2, 2, 2, 255] },
+            );
             Box::new(wind_theme::Resolved {
                 is_dark: dark,
+                palette,
                 ..Default::default()
             })
         };
         f.handle(UiCommand::SetTheme(theme(false)));
-        // 「你：nǐ」里 `nǐ` 带亮 / 暗两色的内联色。
+        // 「你：nǐ !」里 `nǐ` 带亮 / 暗两色的字面内联色，`!` 带名字写的内联色 `error`。
         let mut text = StyledText::from("你：");
         text.push(
             "nǐ",
@@ -1326,6 +1334,14 @@ mod tests {
                 color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(
                     "#C00000/#FF8080",
                 ))),
+                ..Default::default()
+            },
+        );
+        text.push(" ", &SpanStyle::default());
+        text.push(
+            "!",
+            &SpanStyle {
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse("error"))),
                 ..Default::default()
             },
         );
@@ -1378,11 +1394,15 @@ mod tests {
                 .collect()
         };
         // 「你：」是 2 个 UTF-16 码元，`nǐ` 从 2 起、长 2。
-        assert_eq!(last_runs(&cap), vec![(2, 2, [0xC0, 0, 0, 255])]);
+        assert_eq!(
+            last_runs(&cap),
+            vec![(2, 2, [0xC0, 0, 0, 255]), (5, 1, [2, 2, 2, 255])],
+            "名字写的颜色在气泡里取 tooltip_error 而不是 error"
+        );
         f.handle(UiCommand::SetTheme(theme(true)));
         assert_eq!(
             last_runs(&cap),
-            vec![(2, 2, [0xFF, 0x80, 0x80, 255])],
+            vec![(2, 2, [0xFF, 0x80, 0x80, 255]), (5, 1, [3, 3, 3, 255])],
             "换明暗重推的气泡必须按新主题现算颜色"
         );
     }

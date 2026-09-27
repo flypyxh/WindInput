@@ -44,6 +44,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use crate::manager::UiEvent;
@@ -60,7 +61,8 @@ use wind_ui_types::{TooltipDoc, TooltipHit};
 /// 当前显示内容的命中信息（`Tooltip` 写、`TooltipMouse` 读）。
 #[derive(Default)]
 struct HitState {
-    doc: TooltipDoc,
+    /// 与协调器下发的 `CandidateItem::tooltip` 共享同一份，不深拷贝。
+    doc: Arc<TooltipDoc>,
     /// 气泡属于当前页第几个候选（页内下标）。
     candidate: i32,
     /// 文本块在窗口客户区里的矩形（最近一次渲染）。
@@ -669,7 +671,10 @@ impl Tooltip {
 
     /// 渲染 golden 用：按显示路径画一帧，返回 `(缓冲, 宽, 高, 绘制调用记录)`。
     #[cfg(all(test, not(windows), not(target_os = "macos")))]
-    pub(crate) fn golden_frame(&mut self, doc: &TooltipDoc) -> (Vec<u8>, u32, u32, Vec<String>) {
+    pub(crate) fn golden_frame(
+        &mut self,
+        doc: &Arc<TooltipDoc>,
+    ) -> (Vec<u8>, u32, u32, Vec<String>) {
         let text = self.set_doc(doc, 0);
         let _ = self.renderer.take_draw_log();
         let (buf, w, h, ..) = self.render_to_bgra(&text);
@@ -695,7 +700,7 @@ impl Tooltip {
     /// `candidate` 是气泡所属候选的页内下标，右键时随菜单请求带回协调器。
     pub fn show(
         &mut self,
-        doc: &TooltipDoc,
+        doc: &Arc<TooltipDoc>,
         candidate: i32,
         x: i32,
         anchor_top: i32,
@@ -720,7 +725,7 @@ impl Tooltip {
     #[allow(clippy::too_many_arguments)]
     pub fn show_beside(
         &mut self,
-        doc: &TooltipDoc,
+        doc: &Arc<TooltipDoc>,
         candidate: i32,
         win_left: i32,
         win_right: i32,
@@ -814,7 +819,7 @@ impl Tooltip {
     ///
     /// 颜色在这里按**当前**主题现求：片段带的是角色 / 颜色引用，换主题、切明暗后重画即取到
     /// 新颜色。正文色兜底与 [`Self::set_theme`] 同源（palette `tooltip_text` → 节点文字色）。
-    fn set_doc(&mut self, doc: &TooltipDoc, candidate: i32) -> String {
+    fn set_doc(&mut self, doc: &Arc<TooltipDoc>, candidate: i32) -> String {
         // 伪离开后等复查期间换了内容（光标移到别的候选，协调器重绘直接 show 新气泡，不经
         // `hide`）：光标已不在气泡上，复查到期会把新气泡当「离开」藏掉——就此归位。光标
         // 仍在气泡上、只是内容原地刷新的，复查照旧。
@@ -837,7 +842,7 @@ impl Tooltip {
             None => Vec::new(),
         };
         let mut h = self.hits.borrow_mut();
-        h.doc = doc.clone();
+        h.doc = Arc::clone(doc);
         h.candidate = candidate;
         h.text_box = None;
         styled.into_string()
@@ -950,7 +955,7 @@ impl Tooltip {
     #[cfg(windows)]
     pub fn render_frame(
         &mut self,
-        doc: &TooltipDoc,
+        doc: &Arc<TooltipDoc>,
         candidate: i32,
         x: i32,
         anchor_top: i32,
@@ -971,7 +976,7 @@ impl Tooltip {
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame_beside(
         &mut self,
-        doc: &TooltipDoc,
+        doc: &Arc<TooltipDoc>,
         candidate: i32,
         win_left: i32,
         win_right: i32,
@@ -1193,7 +1198,7 @@ mod tests {
     #[test]
     fn hit_maps_client_point_to_section_and_raw_line() {
         let mut t = tooltip();
-        let text = t.set_doc(&doc(), 3);
+        let text = t.set_doc(&Arc::new(doc()), 3);
         let _ = t.render_to_bgra(&text);
         let h = t.hits.borrow();
         let b = h.text_box.expect("渲染后应记下文本块");
@@ -1443,7 +1448,7 @@ mod tests {
         assert!(!t.mouse_over.get());
         t.hide();
         assert!(!t.shown());
-        t.show(&doc(), 0, 10, 10, 20);
+        t.show(&Arc::new(doc()), 0, 10, 10, 20);
         assert!(t.shown());
     }
 
@@ -1586,7 +1591,7 @@ mod tests {
         t.set_menu_open(false);
         mouse_leave(&t);
         set_on_tip(&t, false);
-        t.show(&doc(), 1, 10, 10, 20);
+        t.show(&Arc::new(doc()), 1, 10, 10, 20);
         recheck_fires(&t);
         assert!(t.shown(), "新气泡不得被旧复查藏掉");
     }
@@ -1599,7 +1604,7 @@ mod tests {
         t.set_menu_open(true);
         t.set_menu_open(false);
         mouse_leave(&t);
-        t.show(&doc(), 0, 10, 10, 20);
+        t.show(&Arc::new(doc()), 0, 10, 10, 20);
         assert!(t.mouse.borrow().recheck_pending);
     }
 
@@ -1769,7 +1774,7 @@ mod tests {
                 lines: vec![TooltipLine { text, raw: 0 }],
             }],
         };
-        let (_, _, _, log) = t.golden_frame(&doc);
+        let (_, _, _, log) = t.golden_frame(&Arc::new(doc));
         assert_eq!(log.len(), 1);
         assert!(
             log[0].starts_with("draw_runs ")
