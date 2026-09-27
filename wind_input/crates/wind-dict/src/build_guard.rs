@@ -143,8 +143,11 @@ struct Marker {
 
 /// 读标记。不存在或内容残缺都当作没有记录。
 fn read_marker(marker: &Path) -> Option<Marker> {
-    let text = std::fs::read_to_string(marker).ok()?;
-    let mut lines = text.lines();
+    let raw = std::fs::read_to_string(marker).ok()?;
+    // 标记是本进程自己写的，但缓存目录可能被用户拷来拷去；孤立 \r 会让整份成一行、
+    // 计数读不出 ⇒ 当作无标记放行，退避失效。
+    let normalized = wind_utils::text::normalize_input(&raw);
+    let mut lines = normalized.lines();
     let key = lines.next()?.to_string();
     let count = lines.next()?.trim().parse().ok()?;
     let holder = lines.next().and_then(|l| {
