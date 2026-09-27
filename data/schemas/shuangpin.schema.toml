@@ -25,6 +25,8 @@ layout = "xiaohe"
 #     enabled = true
 # 行为字段（enabled / max_phrase_len）在此留空 = 回落全局，见 schema-config-layering.md §4。
 [engine.aux_code]
+# files 也可写 "schema:<码表方案 id>"，取该方案系统词库 + 用户词库里的编码，如
+# files = ["schema:wubi86"]。
 files = ["aux_code/flypy_full.txt"]
 
 # 反引号进辅助码（组码中有效；空缓冲时落普通标点）。覆盖全局 backtick = "temp_pinyin"

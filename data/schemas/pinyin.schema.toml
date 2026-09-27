@@ -19,6 +19,8 @@ scheme = "full"
 # ⚠️ 本段只声明「全拼推荐哪张辅助码表」，**不代表功能开启**。
 # 总开关是 config.toml 的 [schema.pinyin.aux_code].enabled（出厂 false）。
 [engine.aux_code]
+# files 也可写 "schema:<码表方案 id>"，取该方案系统词库 + 用户词库里的编码，如
+# files = ["schema:wubi86"]。
 files = ["aux_code/stroke.txt"]
 
 # ★ 全拼出厂**不设**辅助码触发键，且这不是「暂时没配」——是键位预算不够。

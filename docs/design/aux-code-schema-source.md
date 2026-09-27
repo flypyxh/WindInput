@@ -1,6 +1,6 @@
 # 辅助码来源：方案引用 + 码表文件并存
 
-状态：设计（2026-09-27 第三版），待确认。
+状态：第一期已实施（分支 feat/aux-code-source，见 §8 分期表提交号）。
 依赖：`docs/design/text-code-lookup.md`（按词查编码统一入口）。
 前置：`docs/design/aux-code-settings-ui.md`（P1 / P3 已实施，本文取代其 P2 的「码表选择」一条）。
 后续：直接辅助码另立设计，本文只为它备好数据层（见附录 A）。
@@ -151,13 +151,13 @@ R8.1 勾选行：
 
 ## 8. 分期
 
-| 期 | 内容 | 仓 |
-|---|---|---|
-| 0 | 前置：「按词查编码」统一入口第一期（`text-code-lookup.md`） | 主仓 |
-| 1 | `AuxCodeLookup` 接口与来源拼接；`schema:` 条目解析；方案来源接统一入口；后台预热与缓存键（修 saveConfig 不失效）；`schema.auxCodeSources` | 主仓 |
-| 2 | 笔画码表方案、全拼默认改引用、NOTICE | 主仓（工具 + 数据） |
-| 3 | 「辅助码来源」勾选行、mock、渲染与写回测试 | wind-setting |
-| 4 | 文档：`[engine.aux_code].files` 的 `schema:` 写法；「用五笔 / 笔画方案作拼音辅助码」 | 文档站 |
+| 期 | 内容 | 仓 | 提交（分支 feat/aux-code-source） |
+|---|---|---|---|
+| 0 | 前置：「按词查编码」统一入口第一期（`text-code-lookup.md`） | 主仓 | `8b99d7a7`、`d5fa0499`、`d000b8e6` |
+| 1 | `AuxCodeLookup` 接口与来源拼接；`schema:` 条目解析；方案来源接统一入口；后台预热与缓存键（修 saveConfig 不失效）；`schema.auxCodeSources` | 主仓 | `9ab878f4`、`31cd04c8`、`09e1459d`、`51595c94` |
+| 2 | 笔画码表方案、全拼默认改引用、NOTICE | 主仓（工具 + 数据） | - |
+| 3 | 「辅助码来源」勾选行、mock、渲染与写回测试 | wind-setting | - |
+| 4 | 文档：`[engine.aux_code].files` 的 `schema:` 写法；「用五笔 / 笔画方案作拼音辅助码」 | 文档站 | - |
 
 触发键与分隔符冲突警示（原 P2 第 6 条）不在本文范围。
 
