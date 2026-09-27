@@ -10,7 +10,10 @@ pub struct CandidateItem {
     /// 序号标签（如 "1" / "a"）；空则按位置自动用数字编号
     pub label: String,
     /// 悬停提示（结构化，段 → 显示行）。空文档 = 不显示气泡。
-    pub tooltip: TooltipDoc,
+    ///
+    /// 共享持有：协调器的右键菜单缓存与下发给 UI 的这份是同一个文档，UI 悬停时再取也不深拷贝
+    /// ——每次按键满页候选各一份，带样式的文字深拷贝一遍在 §13.3 的预算里显得出来。
+    pub tooltip: std::sync::Arc<TooltipDoc>,
     /// 候选注释（编码后缀/短语提示等），非空时在候选词右侧以注释样式内联显示；空则不显示。
     /// 模板渲染出的注释带分段样式（角色 / 内联色）；其余来源 `String::into()` 即无样式。
     pub comment: StyledText,
@@ -101,7 +104,7 @@ impl TooltipDoc {
     /// （设计 text-span-colors.md §3.2）：主题给段名配色时，括号跟段名同色。
     fn plain_lines(&self) -> Vec<(StyledText, TooltipHit)> {
         let deco = SpanStyle {
-            role: Some(std::sync::Arc::from("title")),
+            role: Some("title"),
             in_title: true,
             color: None,
         };
@@ -244,7 +247,7 @@ mod tests {
         t.push(
             "你",
             &SpanStyle {
-                role: Some("char".into()),
+                role: Some("char"),
                 ..Default::default()
             },
         );
@@ -271,7 +274,7 @@ mod tests {
         let roles: Vec<(u32, u32, Option<&str>)> = s
             .spans()
             .iter()
-            .map(|sp| (sp.start, sp.end, sp.role.as_deref()))
+            .map(|sp| (sp.start, sp.end, sp.role))
             .collect();
         // "[编码]\nvbg\nU: x"：[ 在 0..1，] 在 7..8，": " 在 14..16。
         assert_eq!(

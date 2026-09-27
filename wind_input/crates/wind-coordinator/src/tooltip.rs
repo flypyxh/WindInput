@@ -71,7 +71,8 @@ pub(crate) struct CompiledTooltip {
 /// 一个候选的气泡：给 UI 的显示结构 + 协调器自留的原始行。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenderedTooltip {
-    pub(crate) doc: TooltipDoc,
+    /// 与下发给 UI 的 `CandidateItem::tooltip` 共享同一份。
+    pub(crate) doc: std::sync::Arc<TooltipDoc>,
     /// `raw[段][原始行]`，与 `doc.sections` 一一对应；`TooltipLine::raw` 是第二维下标。
     pub(crate) raw: Vec<Vec<String>>,
     /// 每段是否逐字段（`each = han | char`），与 `doc.sections` 一一对应。右键菜单只对
@@ -233,7 +234,7 @@ impl CompiledTooltip {
             // 原始行是复制 / 上屏的取值来源，必须保真：不 trim、保留段内空行（多段落原文），
             // 只去掉首尾的空白行；全是空白即空段。样式跟着行走：原始行存纯文本（复制 / 上屏），
             // 同形的带样式行供显示。
-            let mut styled: Vec<StyledText> = rows.iter().flat_map(split_lines).collect();
+            let mut styled: Vec<StyledText> = rows.into_iter().flat_map(split_lines).collect();
             while styled.last().is_some_and(|l| l.as_str().trim().is_empty()) {
                 styled.pop();
             }
@@ -258,7 +259,7 @@ impl CompiledTooltip {
                 0
             };
             let lines = styled
-                .iter()
+                .into_iter()
                 .enumerate()
                 .flat_map(|(i, l)| {
                     let idx = u16::try_from(i).unwrap_or(u16::MAX);
@@ -267,11 +268,13 @@ impl CompiledTooltip {
                         .map(move |text| TooltipLine { text, raw: idx })
                 })
                 .collect();
-            out.doc.sections.push(TooltipSection {
-                title: (!title.is_empty()).then_some(title),
-                inline,
-                lines,
-            });
+            std::sync::Arc::make_mut(&mut out.doc)
+                .sections
+                .push(TooltipSection {
+                    title: (!title.is_empty()).then_some(title),
+                    inline,
+                    lines,
+                });
             out.raw.push(raw);
             out.per_char.push(sec.each != Each::Whole);
         }
@@ -287,7 +290,7 @@ impl CompiledTooltip {
     /// - `first_offset`：第一条显示行已被占掉的宽度（inline 段的 `标题: `）。
     fn display_lines(
         &self,
-        raw: &StyledText,
+        raw: StyledText,
         columns: bool,
         first_offset: usize,
     ) -> Vec<StyledText> {
@@ -296,7 +299,7 @@ impl CompiledTooltip {
         // 会命中第 2 行。只改显示行；原始行（复制 / 上屏的取值）保留原字符。
         let normalized = normalize_breaks(raw);
         let mut out = Vec::new();
-        for (i, part) in split_lines(&normalized).into_iter().enumerate() {
+        for (i, part) in split_lines(normalized).into_iter().enumerate() {
             let line = match part.as_str().grapheme_indices(true).nth(self.max_chars) {
                 Some((cut, _)) if self.max_chars > 0 => {
                     part.cut_with_mark(cut, TRUNCATION_MARK.encode_utf8(&mut [0; 4]))
@@ -306,15 +309,19 @@ impl CompiledTooltip {
             if self.wrap_width == 0 || (columns && line.as_str().contains('\t')) {
                 out.push(line);
             } else {
-                out.extend(
-                    wrap(
-                        line.as_str(),
-                        self.wrap_width,
-                        if i == 0 { first_offset } else { 0 },
-                    )
-                    .into_iter()
-                    .map(|(s, e)| line.slice(s, e)),
+                let ranges = wrap(
+                    line.as_str(),
+                    self.wrap_width,
+                    if i == 0 { first_offset } else { 0 },
                 );
+                // 常见情形一行放得下：原样搬走，不切片、不分配。
+                if let [(0, e)] = ranges.as_slice()
+                    && *e == line.len()
+                {
+                    out.push(line);
+                } else {
+                    out.extend(ranges.into_iter().map(|(s, e)| line.slice(s, e)));
+                }
             }
         }
         out.retain(|l| !l.as_str().trim().is_empty());
@@ -322,8 +329,11 @@ impl CompiledTooltip {
     }
 }
 
-/// 按 `\n` 切成多行（带样式），同 `str::split('\n')`。
-fn split_lines(t: &StyledText) -> Vec<StyledText> {
+/// 按 `\n` 切成多行（带样式），同 `str::split('\n')`。没有换行时原样返回、不分配。
+fn split_lines(t: StyledText) -> Vec<StyledText> {
+    if !t.as_str().contains('\n') {
+        return vec![t];
+    }
     let s = t.as_str();
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -336,10 +346,10 @@ fn split_lines(t: &StyledText) -> Vec<StyledText> {
 }
 
 /// 断行符归一为 `\n`：`\r\n` 本就是一个字素簇，逐簇映射，样式跟着该簇走。
-fn normalize_breaks(t: &StyledText) -> StyledText {
+fn normalize_breaks(t: StyledText) -> StyledText {
     let is_break = |c: char| matches!(c, '\r' | '\u{85}' | '\u{2028}' | '\u{2029}');
     if !t.as_str().contains(is_break) {
-        return t.clone();
+        return t;
     }
     let mut out = StyledText::new();
     for (i, g) in t.as_str().grapheme_indices(true) {
@@ -1385,12 +1395,7 @@ mod tests {
     fn roles(t: &StyledText) -> Vec<(&str, Option<&str>)> {
         t.spans()
             .iter()
-            .map(|s| {
-                (
-                    &t.as_str()[s.start as usize..s.end as usize],
-                    s.role.as_deref(),
-                )
-            })
+            .map(|s| (&t.as_str()[s.start as usize..s.end as usize], s.role))
             .collect()
     }
 

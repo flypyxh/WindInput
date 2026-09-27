@@ -32,9 +32,9 @@ pub(crate) fn color_runs(
                 is_tooltip,
                 state,
                 body_fallback,
-                s.role.as_deref(),
+                s.role,
                 s.in_title,
-                s.color.as_ref(),
+                s.color.as_deref(),
             );
             (rgba != body).then_some(ColorRun {
                 start: s.start,
@@ -57,22 +57,24 @@ mod tests {
         t.push(
             "kao",
             &SpanStyle {
-                role: Some("code_hint".into()),
+                role: Some("code_hint"),
                 ..Default::default()
             },
         );
         t.push(
             "(",
             &SpanStyle {
-                role: Some("literal".into()),
+                role: Some("literal"),
                 ..Default::default()
             },
         );
         t.push(
             "x",
             &SpanStyle {
-                role: Some("pinyin".into()),
-                color: Some(wind_theme::InlineColor::parse("#FF0000")),
+                role: Some("pinyin"),
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(
+                    "#FF0000",
+                ))),
                 ..Default::default()
             },
         );
@@ -108,7 +110,7 @@ mod tests {
         t.push(
             "kao",
             &SpanStyle {
-                role: Some("code_hint".into()),
+                role: Some("code_hint"),
                 ..Default::default()
             },
         );

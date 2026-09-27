@@ -7166,7 +7166,7 @@ mod tip_hold_tests {
             text: t.into(),
             code: String::new(),
             label: String::new(),
-            tooltip: doc(),
+            tooltip: std::sync::Arc::new(doc()),
             comment: Default::default(),
             no_index: false,
         };
@@ -7500,15 +7500,15 @@ mod comment_color_tests {
         t.push(
             "wq",
             &SpanStyle {
-                role: Some("code_rev".into()),
-                color: Some(wind_theme::InlineColor::parse(spec)),
+                role: Some("code_rev"),
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(spec))),
                 ..Default::default()
             },
         );
         t.push(
             "(nǐ)",
             &SpanStyle {
-                role: Some("literal".into()),
+                role: Some("literal"),
                 ..Default::default()
             },
         );

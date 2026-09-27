@@ -58,18 +58,18 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// 一段带角色的文字（协调器模板引擎产出的片段形态）。
-fn piece(out: &mut StyledText, text: &str, role: &str, in_title: bool) {
+fn piece(out: &mut StyledText, text: &str, role: &'static str, in_title: bool) {
     out.push(
         text,
         &SpanStyle {
-            role: Some(role.into()),
+            role: Some(role),
             in_title,
             color: None,
         },
     );
 }
 
-fn role_text(text: &str, role: &str) -> StyledText {
+fn role_text(text: &str, role: &'static str) -> StyledText {
     let mut t = StyledText::new();
     piece(&mut t, text, role, false);
     t
@@ -84,7 +84,7 @@ fn candidates() -> Vec<CandidateItem> {
         text: text.to_string(),
         code: String::new(),
         label: String::new(),
-        tooltip: TooltipDoc::default(),
+        tooltip: Default::default(),
         comment,
         no_index: false,
     };

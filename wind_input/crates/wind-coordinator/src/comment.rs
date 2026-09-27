@@ -78,7 +78,7 @@ use wind_config::config::{CodeHintSource, CommentTemplateOverride};
 use wind_config::{Config, OverlaySpec};
 use wind_ui_types::{InlineColor, SpanStyle, StyledText};
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 /// 一次变量引用：名字 + 可选参数（`${chaizi_all:／}` 的 `／`）。
 ///
@@ -88,20 +88,22 @@ use std::sync::{Arc, LazyLock};
 struct VarRef {
     name: String,
     arg: Option<String>,
+    /// 这个变量取到值时片段带的角色：别名归一后、契约清单里的常驻名（清单外为 `None`）。
+    /// 解析时算一次——渲染在每次按键的候选循环里，逐次查表会吃掉 §13.3 的性能预算。
+    role: Option<&'static str>,
 }
 
 impl VarRef {
     /// 解析 `name` 或 `name:arg`。只切**第一个**冒号——分隔符本身可以含冒号。
     fn parse(s: &str) -> Self {
-        match s.split_once(':') {
-            Some((n, a)) => Self {
-                name: n.trim().to_string(),
-                arg: Some(a.to_string()),
-            },
-            None => Self {
-                name: s.trim().to_string(),
-                arg: None,
-            },
+        let (name, arg) = match s.split_once(':') {
+            Some((n, a)) => (n.trim(), Some(a.to_string())),
+            None => (s.trim(), None),
+        };
+        Self {
+            name: name.to_string(),
+            arg,
+            role: wind_ui_types::static_role(role_of(name)),
         }
     }
 }
@@ -119,7 +121,7 @@ enum Node {
     /// `$[颜色]{ … }`：只管上色。内部变量照常计入外层的「有值」判定；全空时它自己**不**消失
     /// ——要「空则消失」就再套一层可选段。这样给任意一段花括号配平的片段包上 `$[…]{}`，
     /// 文字输出逐字节不变（设计 text-span-colors.md §4.3）。
-    Color(InlineColor, Vec<Node>),
+    Color(Arc<InlineColor>, Vec<Node>),
 }
 
 /// 解析模板。**不会失败**——未闭合的 `${` / `{` 一律退化为字面文本。
@@ -143,7 +145,7 @@ fn parse(tpl: &str) -> Vec<Node> {
                 nodes.push(Node::Text(std::mem::take(&mut text)));
             }
             nodes.push(Node::Color(
-                InlineColor::parse(&tpl[i + 2..spec_end]),
+                Arc::new(InlineColor::parse(&tpl[i + 2..spec_end])),
                 parse(&tpl[spec_end + 2..body_end]),
             ));
             i = body_end + 1;
@@ -247,10 +249,9 @@ fn find_group_end(b: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// 结构角色（§3.2）：模板字面文字在正文里是 `literal`，在段名里是 `title`。常驻一份，
-/// 免得每段字面文字都分配一个 `Arc<str>`。
-static ROLE_LITERAL: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("literal"));
-static ROLE_TITLE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("title"));
+/// 结构角色（§3.2）：模板字面文字在正文里是 `literal`，在段名里是 `title`。
+const ROLE_LITERAL: &str = "literal";
+const ROLE_TITLE: &str = "title";
 
 /// 变量名 → 角色名：只有一张别名表（`code` → `code_rev`、`code_all` → `code_rev_all`，
 /// 见 `Coordinator::eval_var` 的兼容别名说明）。主题只需认规范名。
@@ -270,7 +271,7 @@ pub(crate) fn role_of(name: &str) -> &str {
 /// 吞不到外面那个空格（§8.1）。只有 `Group` 用子构建器——它要先渲染再决定整段要不要。
 struct Builder {
     out: StyledText,
-    colors: Vec<InlineColor>,
+    colors: Vec<Arc<InlineColor>>,
     in_title: bool,
 }
 
@@ -292,7 +293,7 @@ impl Builder {
         }
     }
 
-    fn push(&mut self, s: &str, role: Option<Arc<str>>) {
+    fn push(&mut self, s: &str, role: Option<&'static str>) {
         let style = SpanStyle {
             role,
             in_title: self.in_title,
@@ -303,11 +304,11 @@ impl Builder {
 
     fn push_literal(&mut self, s: &str) {
         let role = if self.in_title {
-            &*ROLE_TITLE
+            ROLE_TITLE
         } else {
-            &*ROLE_LITERAL
+            ROLE_LITERAL
         };
-        self.push(s, Some(role.clone()));
+        self.push(s, Some(role));
     }
 
     /// 吞掉末尾一个空格或制表符。
@@ -342,7 +343,7 @@ fn render_nodes(
             Node::Var(refs) => {
                 // 未知名恒排在「首个非空」判定之外单独处理：它不是值，是错误提示。
                 // 角色 = **实际取到值的那个变量**（`${code_hint|code_rev}` 取到反查码时是 code_rev）。
-                let mut value: Option<(String, bool, Option<&str>)> = None;
+                let mut value: Option<(String, bool, Option<&'static str>)> = None;
                 for r in refs {
                     match eval(&r.name, r.arg.as_deref()) {
                         None => {
@@ -350,7 +351,7 @@ fn render_nodes(
                             break;
                         }
                         Some(v) if !v.is_empty() => {
-                            value = Some((v, counts(&r.name), Some(role_of(&r.name))));
+                            value = Some((v, counts(&r.name), r.role));
                             break;
                         }
                         Some(_) => {} // 已知但空 → 试下一个回退
@@ -358,7 +359,8 @@ fn render_nodes(
                 }
                 match value {
                     Some((v, counted, role)) => {
-                        b.push(&v, role.map(Arc::from));
+                        // 角色取契约清单里的常驻名（清单外的名字不产角色，见 `Span::role`）。
+                        b.push(&v, role);
                         any |= counted;
                     }
                     // 空变量吞掉紧邻的一个空白：`(拼: ${pinyin} ${chaizi})` 在拆字为空时
@@ -397,11 +399,7 @@ pub(crate) fn render_styled(
     max_chars: usize,
     eval: impl Fn(&str, Option<&str>) -> Option<String>,
 ) -> StyledText {
-    let mut b = Builder::new(false);
-    if !render_nodes(&parse(tpl), &eval, &|_| true, &mut b) {
-        return StyledText::new();
-    }
-    b.out.trim().truncate_chars(max_chars, "…")
+    Template::parse(tpl).render_whole(max_chars, &eval)
 }
 
 /// [`render_styled`] 的纯文本形态：要上屏的文字（`alt_commit_text` 上屏注释、`reverse_render`
@@ -439,6 +437,20 @@ impl Template {
     ) -> (String, bool) {
         let (t, filled) = self.render_styled(eval, counts, false);
         (t.into_string(), filled)
+    }
+
+    /// 按注释段口径渲染（见 [`render_styled`]）：整个模板是一个隐式可选段、trim、按字截断。
+    /// 预解析的模板在候选循环外解析一次、循环里只渲染。
+    pub(crate) fn render_whole(
+        &self,
+        max_chars: usize,
+        eval: &impl Fn(&str, Option<&str>) -> Option<String>,
+    ) -> StyledText {
+        let mut b = Builder::new(false);
+        if !render_nodes(&self.0, eval, &|_| true, &mut b) {
+            return StyledText::new();
+        }
+        b.out.into_trimmed().into_truncated(max_chars, "…")
     }
 
     /// 同 [`Self::render`]，产出带分段样式的文字。`in_title` = 这是段名模板：字面文字的角色
@@ -806,13 +818,13 @@ impl crate::coordinator::Coordinator {
     pub(crate) fn comment_for(
         &self,
         c: &Candidate,
-        tpl: &str,
+        tpl: &Template,
         max_chars: usize,
         reverse: &wind_reverse::ReverseLookup,
         hint_source: CodeHintSource,
         dict_schema: &str,
     ) -> StyledText {
-        render_styled(tpl, max_chars, |name, arg| {
+        tpl.render_whole(max_chars, &|name, arg| {
             self.eval_var(name, arg, c, reverse, hint_source, dict_schema)
         })
     }
@@ -2165,7 +2177,7 @@ mod styled_tests {
                 });
                 (
                     t.as_str()[s.start as usize..s.end as usize].to_string(),
-                    s.role.as_deref().map(str::to_string),
+                    s.role.map(str::to_string),
                     color,
                 )
             })
@@ -2317,8 +2329,9 @@ mod styled_tests {
             spans(&t),
             vec![
                 sp("(", Some("literal"), Some("accent")),
-                sp("x", Some("a"), Some("accent")),
-                sp("y", Some("b"), Some("#")),
+                // `a` / `b` 不在契约清单里：没有角色，但仍带内联色。
+                sp("x", None, Some("accent")),
+                sp("y", None, Some("#")),
                 sp(")", Some("literal"), Some("accent")),
             ]
         );
@@ -2364,7 +2377,7 @@ mod styled_tests {
     fn truncation_mark_inherits_style() {
         let t = render_styled("$[accent]{${a}}", 2, ev(&[("a", "abcd")]));
         assert_eq!(t.as_str(), "ab…");
-        assert_eq!(spans(&t), vec![sp("ab…", Some("a"), Some("accent"))]);
+        assert_eq!(spans(&t), vec![sp("ab…", None, Some("accent"))]);
     }
 
     /// 段名模板：字面文字角色 title、变量片段 in_title。

@@ -2754,6 +2754,7 @@ dependencies = [
 name = "wind-ui-types"
 version = "0.1.0"
 dependencies = [
+ "smallvec",
  "wind-bridge",
  "wind-theme",
 ]

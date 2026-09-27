@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 pub use wind_theme::InlineColor;
 
 /// 对外契约清单：模板里能产出的**全部角色名**（变量名 + 结构角色）。
@@ -40,25 +42,35 @@ pub const TEXT_ROLES: &[&str] = &[
     "literal",
 ];
 
+/// 清单里的同名常驻字符串（`Span::role` 用）；清单外为 `None`。
+pub fn static_role(name: &str) -> Option<&'static str> {
+    TEXT_ROLES.iter().copied().find(|r| *r == name)
+}
+
 /// 带样式文字里的一段：`[start, end)` 字节区间（落在字符边界上）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
     /// 角色 = 归一后的变量名，或结构角色 `title` / `literal`；`None` = 无角色（未知变量回显）。
-    pub role: Option<Arc<str>>,
+    ///
+    /// 取自 [`TEXT_ROLES`] 的常驻字符串（[`static_role`]）：每个变量值都要带角色，候选循环里
+    /// 逐片段分配或引用计数会在满页 × 每次按键的频率上显出来（设计 §13.3 的 < 5% 预算）。
+    /// 清单外的名字没有角色、按正文色——主题本就无从给一个没公开的名字配色；新增模板变量时
+    /// 连同清单一起加。
+    pub role: Option<&'static str>,
     /// 在段名（气泡 label）里产出的片段：角色未配色时回落 `title` 角色，而非正文色。
     pub in_title: bool,
-    /// 内联色（`$[…]{}`）。有值即优先于角色。
-    pub color: Option<InlineColor>,
+    /// 内联色（`$[…]{}`）。有值即优先于角色。共享持有：一个 `$[…]{}` 里的全部片段指向同一份。
+    pub color: Option<Arc<InlineColor>>,
 }
 
 impl Span {
     fn same_style(
         &self,
-        role: &Option<Arc<str>>,
+        role: &Option<&'static str>,
         in_title: bool,
-        color: &Option<InlineColor>,
+        color: &Option<Arc<InlineColor>>,
     ) -> bool {
         self.role == *role && self.in_title == in_title && self.color == *color
     }
@@ -67,9 +79,9 @@ impl Span {
 /// 一段文字的样式（[`StyledText::push`] 的参数、[`StyledText::style_at`] 的结果）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SpanStyle {
-    pub role: Option<Arc<str>>,
+    pub role: Option<&'static str>,
     pub in_title: bool,
-    pub color: Option<InlineColor>,
+    pub color: Option<Arc<InlineColor>>,
 }
 
 impl SpanStyle {
@@ -90,14 +102,17 @@ impl SpanStyle {
 pub struct StyledText {
     text: String,
     /// 按 `start` 升序、互不重叠、非空。未被覆盖的文字 = 节点正文色。
-    spans: Vec<Span>,
+    ///
+    /// 内联存放前 3 段：出厂模板下一段注释 / 一条气泡行只有一两个片段，免得每条文字一次堆分配、
+    /// 气泡文档整份克隆（下发 UI 一份、右键菜单留一份）时再一次（§13.3 的 < 5% 预算，实测）。
+    spans: SmallVec<[Span; 3]>,
 }
 
 impl From<String> for StyledText {
     fn from(text: String) -> Self {
         Self {
             text,
-            spans: Vec::new(),
+            spans: SmallVec::new(),
         }
     }
 }
@@ -129,6 +144,10 @@ impl StyledText {
         &self.spans
     }
 
+    fn spans_mut(&mut self) -> &mut SmallVec<[Span; 3]> {
+        &mut self.spans
+    }
+
     pub fn into_string(self) -> String {
         self.text
     }
@@ -144,17 +163,18 @@ impl StyledText {
         if style.is_plain() {
             return;
         }
-        if let Some(last) = self.spans.last_mut()
+        let spans = self.spans_mut();
+        if let Some(last) = spans.last_mut()
             && last.end == start
             && last.same_style(&style.role, style.in_title, &style.color)
         {
             last.end = end;
             return;
         }
-        self.spans.push(Span {
+        spans.push(Span {
             start,
             end,
-            role: style.role.clone(),
+            role: style.role,
             in_title: style.in_title,
             color: style.color.clone(),
         });
@@ -163,7 +183,7 @@ impl StyledText {
     /// 追加另一段带样式文字（区间按偏移并入）。
     pub fn append(&mut self, other: &StyledText) {
         let mut at = 0usize;
-        for sp in &other.spans {
+        for sp in other.spans() {
             let (s, e) = (sp.start as usize, sp.end as usize);
             if at < s {
                 self.push(&other.text[at..s], &SpanStyle::default());
@@ -171,7 +191,7 @@ impl StyledText {
             self.push(
                 &other.text[s..e],
                 &SpanStyle {
-                    role: sp.role.clone(),
+                    role: sp.role,
                     in_title: sp.in_title,
                     color: sp.color.clone(),
                 },
@@ -194,12 +214,12 @@ impl StyledText {
         }
         self.text.pop();
         let end = self.text.len() as u32;
-        if let Some(last) = self.spans.last_mut()
-            && last.end > end
-        {
+        if self.spans().last().is_some_and(|l| l.end > end) {
+            let spans = self.spans_mut();
+            let last = spans.last_mut().expect("刚判过非空");
             last.end = end;
             if last.start >= last.end {
-                self.spans.pop();
+                spans.pop();
             }
         }
         true
@@ -208,31 +228,32 @@ impl StyledText {
     /// 取 `[start, end)` 字节区间（须在字符边界上），区间裁剪并平移。
     pub fn slice(&self, start: usize, end: usize) -> StyledText {
         let (s, e) = (start as u32, end as u32);
+        let spans: SmallVec<[Span; 3]> = self
+            .spans()
+            .iter()
+            .filter_map(|sp| {
+                let (a, b) = (sp.start.max(s), sp.end.min(e));
+                (a < b).then(|| Span {
+                    start: a - s,
+                    end: b - s,
+                    ..sp.clone()
+                })
+            })
+            .collect();
         StyledText {
             text: self.text[start..end].to_string(),
-            spans: self
-                .spans
-                .iter()
-                .filter_map(|sp| {
-                    let (a, b) = (sp.start.max(s), sp.end.min(e));
-                    (a < b).then(|| Span {
-                        start: a - s,
-                        end: b - s,
-                        ..sp.clone()
-                    })
-                })
-                .collect(),
+            spans,
         }
     }
 
     /// 字节位置 `at` 处那个字的样式（不在任何区间内 = 默认样式）。
     pub fn style_at(&self, at: usize) -> SpanStyle {
         let at = at as u32;
-        self.spans
+        self.spans()
             .iter()
             .find(|sp| sp.start <= at && at < sp.end)
             .map(|sp| SpanStyle {
-                role: sp.role.clone(),
+                role: sp.role,
                 in_title: sp.in_title,
                 color: sp.color.clone(),
             })
@@ -241,22 +262,35 @@ impl StyledText {
 
     /// 去掉首尾空白（Unicode 空白，同 `str::trim`）。
     pub fn trim(&self) -> StyledText {
+        self.clone().into_trimmed()
+    }
+
+    /// 同 [`Self::trim`]，就地处理：两端本就没有空白时原样返回、不分配（模板渲染的热路径）。
+    pub fn into_trimmed(self) -> StyledText {
         let t = self.text.trim_start();
         let start = self.text.len() - t.len();
         let end = start + t.trim_end().len();
+        if start == 0 && end == self.text.len() {
+            return self;
+        }
         self.slice(start, end)
     }
 
     /// 按字符数截断：超过 `max_chars` 个字就只留前 `max_chars` 个，再接 `mark`。`mark` 继承被截处
     /// 前一个字的样式——它不承载信息，不单设角色。`max_chars == 0` 表示不限。
     pub fn truncate_chars(&self, max_chars: usize, mark: &str) -> StyledText {
+        self.clone().into_truncated(max_chars, mark)
+    }
+
+    /// 同 [`Self::truncate_chars`]，没超出时原样返回、不分配。
+    pub fn into_truncated(self, max_chars: usize, mark: &str) -> StyledText {
         if max_chars == 0 {
-            return self.clone();
+            return self;
         }
-        let Some((cut, _)) = self.text.char_indices().nth(max_chars) else {
-            return self.clone();
-        };
-        self.cut_with_mark(cut, mark)
+        match self.text.char_indices().nth(max_chars) {
+            Some((cut, _)) => self.cut_with_mark(cut, mark),
+            None => self,
+        }
     }
 
     /// 截在字节位置 `cut`（字符边界），接上继承前一个字样式的 `mark`。
@@ -288,18 +322,15 @@ impl StyledText {
 mod tests {
     use super::*;
 
-    fn role(r: &str) -> SpanStyle {
+    fn role(r: &'static str) -> SpanStyle {
         SpanStyle {
-            role: Some(Arc::from(r)),
+            role: Some(r),
             ..Default::default()
         }
     }
 
     fn ranges(t: &StyledText) -> Vec<(u32, u32, Option<&str>)> {
-        t.spans()
-            .iter()
-            .map(|s| (s.start, s.end, s.role.as_deref()))
-            .collect()
+        t.spans().iter().map(|s| (s.start, s.end, s.role)).collect()
     }
 
     #[test]

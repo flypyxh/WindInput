@@ -136,7 +136,7 @@ pub struct Forwarder {
     /// ★ 存结构化的 `TooltipDoc` 而不是算好颜色的结果：换主题 / 换明暗时 `handle` 用它重推
     /// 当前帧（`affects_appearance` 分支），每次推送都按**当前**主题现算分段颜色——存颜色的话，
     /// 重推出去的气泡仍是旧主题的颜色。
-    last_tip: Option<TooltipDoc>,
+    last_tip: Option<Arc<TooltipDoc>>,
     /// 当前主题（`SetTheme` 留一份），推气泡时现算分段颜色用。
     theme: Option<Box<wind_theme::Resolved>>,
 }
@@ -648,7 +648,7 @@ impl Forwarder {
     ///
     /// 内容更新（`UpdateCandidates`）与纯外观变更（换主题/字号…）共用此路径——后者若不
     /// 走这里重推一帧，显示中的候选窗就会停在旧样子。
-    fn push_current_frame(&mut self, tip: Option<TooltipDoc>) {
+    fn push_current_frame(&mut self, tip: Option<Arc<TooltipDoc>>) {
         match self.win.render_frame() {
             Some(f) => {
                 let (sx, sy, w, h, scale, soft, absolute) = (
@@ -1323,18 +1323,20 @@ mod tests {
         text.push(
             "nǐ",
             &SpanStyle {
-                color: Some(wind_theme::InlineColor::parse("#C00000/#FF8080")),
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(
+                    "#C00000/#FF8080",
+                ))),
                 ..Default::default()
             },
         );
         let mut cand = item("你");
-        cand.tooltip = TooltipDoc {
+        cand.tooltip = Arc::new(TooltipDoc {
             sections: vec![TooltipSection {
                 title: None,
                 inline: false,
                 lines: vec![TooltipLine { text, raw: 0 }],
             }],
-        };
+        });
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
             preedit_caret: 1,

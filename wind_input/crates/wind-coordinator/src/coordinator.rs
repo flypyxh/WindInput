@@ -6147,8 +6147,13 @@ impl Coordinator {
         // 这是「旋转态的 vertical 恒为 false ⇒ 所有按方向分叉的配置走横排支」这条总规则的
         // 一个实例，不是遗漏；要给旋转态单独的模板，用方案级 `[candidate]` 那两个键。
         let comment_vertical = self.desired_orientation(state).vertical;
-        let comment_tpl =
-            self.comment_template_for(&rt.config, state, &schema_behavior, comment_vertical);
+        // 解析一次、循环里逐候选只渲染（模板串对整页相同）。
+        let comment_tpl = crate::comment::Template::parse(self.comment_template_for(
+            &rt.config,
+            state,
+            &schema_behavior,
+            comment_vertical,
+        ));
         // 注释段长度预算横竖各一份：横排全部候选共享一行宽度，竖排每行独占。
         let comment_max = cand_cfg.comment_max_chars(comment_vertical);
         // 注释**库**的 `schemas` 白名单作用域：与词频/短语同源取 `effective_data_schema`
@@ -6264,7 +6269,7 @@ impl Coordinator {
                 // `ui.tooltip.sections`，塞了会与之重复。
                 let comment = self.comment_for(
                     c,
-                    comment_tpl,
+                    &comment_tpl,
                     comment_max,
                     &reverse,
                     hint_source,
