@@ -1,0 +1,10 @@
+# 测试主题：派生主题只改一个角色、撤销一个角色（`""` = 未设置），其余继承。
+base = "span-roles"
+
+[meta]
+name = "分段着色测试·派生"
+version = "1.0"
+
+[comment.roles]
+pinyin = "#00AA00"
+literal = ""

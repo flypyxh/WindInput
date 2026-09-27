@@ -244,6 +244,7 @@ fn resolve_view_node(
     if let Some(img) = &n.next_image {
         out.next_image = Some(to_rv_image(img, palette, is_dark));
     }
+    out.roles = resolve_roles(&n.roles, palette, is_dark);
     if let Some(sh) = &n.shadow {
         out.shadow_offset_x = sh.offset_x;
         out.shadow_offset_y = sh.offset_y;
@@ -256,8 +257,29 @@ fn resolve_view_node(
     out
 }
 
+/// 角色色表求值：`""`（未设置）与未解析的 token 不入表（后者沿用 `resolve_color` 的 warn）；
+/// `transparent` 与 alpha 为 0 的颜色拒收并 warn——文字占着宽度却看不见，只会是误用，与内联色
+/// 同一口径（§4.5、§5.1）。
+fn resolve_roles(
+    roles: &HashMap<String, Ld>,
+    palette: &HashMap<String, Rgba>,
+    is_dark: bool,
+) -> HashMap<String, Rgba> {
+    roles
+        .iter()
+        .filter_map(|(role, ld)| {
+            let c = resolve_color(Some(ld), palette, is_dark)?;
+            if c[3] == 0 {
+                tracing::warn!("主题角色色 {role} 是全透明色，按未设置处理");
+                return None;
+            }
+            Some((role.clone(), c))
+        })
+        .collect()
+}
+
 /// 状态 patch ViewNode → 递归 RVNode（与 Go resolveState 对齐）。
-/// nil-gating：仅当显式给了 bg/图/渐变/层/text/border 色/border 宽/字重，或有 palette 默认色，
+/// nil-gating：仅当显式给了 bg/图/渐变/层/text/border 色/border 宽/字重/角色色，或有 palette 默认色，
 /// 才算「有覆盖」返回 Some；**不看几何**（状态改几何会致候选框跳动，state_geometry unsupported）。
 fn resolve_state(
     node: Option<&ViewNode>,
@@ -282,6 +304,8 @@ fn resolve_state(
             || rc(&n.border.color).is_some()
             || n.border.width.is_some()
             || n.font_weight.is_some()
+            // 只写了 `[comment.selected.roles]` 的 patch 也算「有覆盖」，否则被整体丢弃。
+            || !resolve_roles(&n.roles, palette, is_dark).is_empty()
         {
             has = true;
         }
@@ -1140,5 +1164,108 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
             resolve_state(Some(&color_patch), &palette, false, None, None).is_some(),
             "改色 patch 应保留"
         );
+    }
+
+    // ───────────────────── 文字角色色（分段着色 §5）─────────────────────
+
+    fn roles_theme(name: &str, dark: bool) -> Resolved {
+        crate::load_resolved_dirs(&[testdata_dir(), data_dir_for_roles()], name, dark)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    fn data_dir_for_roles() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes")
+    }
+
+    fn hex(s: &str) -> Rgba {
+        parse_hex(s).unwrap()
+    }
+
+    #[test]
+    fn comment_roles_resolve_tokens_and_light_dark() {
+        let l = roles_theme("span-roles", false);
+        let d = roles_theme("span-roles", true);
+        assert_eq!(l.views.comment.roles["code_rev"], hex("#C00000"));
+        assert_eq!(d.views.comment.roles["code_rev"], hex("#FF8080"));
+        assert_eq!(l.views.comment.roles["literal"], hex("#B0B0B0"));
+        assert_eq!(d.views.comment.roles["literal"], hex("#606060"));
+        assert_eq!(l.views.comment.roles["pinyin"], hex("#008000"));
+        let tip = l.views.tooltip.as_ref().unwrap();
+        assert_eq!(tip.roles["title"], l.palette["accent"]);
+        assert_eq!(tip.roles["readings"], hex("#9AD0FF"));
+    }
+
+    /// transparent 与 alpha 为 0 的角色色拒收（按未设置）。
+    #[test]
+    fn transparent_roles_are_rejected() {
+        let t = roles_theme("span-roles", false);
+        assert!(!t.views.comment.roles.contains_key("chaizi"));
+        assert!(!t.views.comment.roles.contains_key("dict"));
+    }
+
+    /// 状态 patch：选中态有正文色 + 单列角色；悬停态**只**写了 roles 也不能被丢。
+    #[test]
+    fn state_roles_survive_nil_gating() {
+        let t = roles_theme("span-roles", false);
+        let sel = t.views.comment.selected.as_ref().expect("selected");
+        assert_eq!(sel.text_color, Some(hex("#FFFFFF")));
+        assert_eq!(sel.roles["code_rev"], hex("#FFE08A"));
+        let hov = t
+            .views
+            .comment
+            .hover
+            .as_ref()
+            .expect("只写 roles 的 hover patch 不能被丢");
+        assert_eq!(hov.roles["pinyin"], hex("#0000FF"));
+        assert_eq!(hov.text_color, None);
+    }
+
+    /// 派生主题逐键深合并：改一个、`""` 撤销一个、其余继承。
+    #[test]
+    fn derived_theme_merges_roles_per_key() {
+        let t = roles_theme("span-roles-child", false);
+        let r = &t.views.comment.roles;
+        assert_eq!(r["pinyin"], hex("#00AA00"));
+        assert!(!r.contains_key("literal"), "`\"\"` 撤销 base 的角色");
+        assert_eq!(r["code_rev"], hex("#C00000"), "未提及的角色继承 base");
+        assert_eq!(
+            t.views.comment.selected.as_ref().unwrap().roles["code_rev"],
+            hex("#FFE08A")
+        );
+    }
+
+    /// 出厂主题一律不配 roles（零变化的前提）；角色色表对其余节点也是空的。
+    #[test]
+    fn factory_themes_have_no_roles() {
+        for name in [
+            "_base",
+            "_qingfeng",
+            "default",
+            "amber",
+            "jade",
+            "violet",
+            "msime",
+        ] {
+            for dark in [false, true] {
+                let t = roles_theme(name, dark);
+                let v = &t.views;
+                assert!(v.comment.roles.is_empty(), "{name}");
+                assert!(
+                    v.comment
+                        .selected
+                        .as_ref()
+                        .is_none_or(|n| n.roles.is_empty()),
+                    "{name}"
+                );
+                assert!(
+                    v.comment.hover.as_ref().is_none_or(|n| n.roles.is_empty()),
+                    "{name}"
+                );
+                assert!(
+                    v.tooltip.as_ref().is_none_or(|n| n.roles.is_empty()),
+                    "{name}"
+                );
+            }
+        }
     }
 }

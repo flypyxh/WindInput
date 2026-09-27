@@ -1783,4 +1783,60 @@ mod tests {
             log[0]
         );
     }
+
+    /// 非出厂测试主题的气泡角色色：段名装饰与字面走 title、段名里的变量回落 title、readings 自有色。
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn theme_roles_color_the_tooltip() {
+        use wind_ui_types::{SpanStyle, StyledText};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let theme = wind_theme::load_resolved_dirs(
+            &[
+                root.join("../wind-theme/testdata/themes"),
+                root.join("../../../data/themes"),
+            ],
+            "span-roles",
+            false,
+        )
+        .unwrap();
+        let mut t = tooltip();
+        t.set_theme(&theme);
+        let title_role = |s: &str, role| {
+            let mut x = StyledText::new();
+            x.push(
+                s,
+                &SpanStyle {
+                    role: Some(role),
+                    in_title: true,
+                    ..Default::default()
+                },
+            );
+            x
+        };
+        let mut title = title_role("编码(", "title");
+        title.append(&title_role("五笔", "code_source"));
+        let mut line = StyledText::new();
+        line.push(
+            "hǎo",
+            &SpanStyle {
+                role: Some("readings"),
+                ..Default::default()
+            },
+        );
+        let doc = TooltipDoc {
+            sections: vec![TooltipSection {
+                title: Some(title),
+                inline: false,
+                lines: vec![TooltipLine { text: line, raw: 0 }],
+            }],
+        };
+        let (_, _, _, log) = t.golden_frame(&Arc::new(doc));
+        let accent = theme.palette["accent"];
+        // "[编码(五笔)]\nhǎo"：`[编码(` 与 `五笔`（回落 title）同为 accent，`]` 也是；readings 自有色。
+        let want = format!(
+            "runs=[ColorRun {{ start: 0, end: 8, rgba: {accent:?} }}, ColorRun {{ start: 8, end: 14, rgba: {accent:?} }}, \
+             ColorRun {{ start: 14, end: 15, rgba: {accent:?} }}, ColorRun {{ start: 16, end: 20, rgba: [154, 208, 255, 255] }}]"
+        );
+        assert!(log[0].contains(&want), "{}\n期望含 {want}", log[0]);
+    }
 }

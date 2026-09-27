@@ -310,6 +310,12 @@ pub struct ViewNode {
     pub col_gap: Option<Dim>,
     pub title_gap: Option<Dim>,
 
+    /// 文字角色色（分段着色，设计 text-span-colors.md §5）：角色名 → 颜色，值的写法同 `color`。
+    /// `""` = 未设置（派生主题借此撤销 base 配的某个角色）。只有 `comment`（含 `selected` /
+    /// `hover`）与 `tooltip` 消费；角色名不校验——更新版本的主题在旧引擎上应静默忽略。
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, Ld>,
+
     // 状态态 patch（递归）。
     pub selected: Option<Box<ViewNode>>,
     pub hover: Option<Box<ViewNode>>,

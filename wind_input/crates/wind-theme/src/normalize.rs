@@ -570,4 +570,16 @@ mod tests {
         assert!(sel.color.is_some());
         assert!(item.hover.as_ref().unwrap().background.color.is_some());
     }
+
+    /// 扁平写法 `[comment.selected.roles]` 落到 `views.comment.selected.roles`（§5.2：normalize 不用改，
+    /// `roles` 是普通子表、状态已递归——这条钉住它）。
+    #[test]
+    fn flat_state_roles_land_under_the_state() {
+        let t = load(
+            "[comment.roles]\npinyin = \"#008000\"\n[comment.selected.roles]\ncode_rev = \"${accent}\"\n",
+        );
+        let c = &t.views.unwrap().comment;
+        assert!(c.roles.contains_key("pinyin"));
+        assert!(c.selected.as_ref().unwrap().roles.contains_key("code_rev"));
+    }
 }
