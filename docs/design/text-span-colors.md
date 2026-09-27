@@ -1,6 +1,6 @@
 # 渲染文字的分段着色：主题角色色 + 模板内联颜色
 
-> 2026-09-27 设计；§16 各项均已于同日确认，无待确认项。
+> 2026-09-27 设计；§16 各项均已于同日确认，无待确认项。同日按设计审查意见修订（I1～I9 与 16 条次要项）。
 > 前身：`candidate-comment-layering.md`（注释模板语法）、`candidate-tooltip-sections.md`
 > （气泡段列表与 `TooltipDoc`；其 §9「段标题的独立样式……属主题能力扩展，另立」的**颜色**部分
 > 由本设计承接，加粗仍不做）。
@@ -30,7 +30,7 @@
 | DirectWrite 测量缓存键 = 文本 + 字号 + 字重 + 字族（`measure_key`）；**layout 不缓存**，measure 未命中与每次 draw 各建一个 | `dwrite.rs` `measure` / `draw` | 颜色只进 draw，不进 measure，缓存天然不被污染（§7.2） |
 | `DrawGlyphRun` 的 drawing effect 参数（`_effect`）至今未用；颜色经 `clientDrawingContext` 整段透传 | `dwrite.rs` `GlyphRenderer` | 按区间上色走 `SetDrawingEffect` + 读 effect（§7.2） |
 | 文字 alpha 不交给 DirectWrite，而是 draw 第 3 步按**整段一个** `fa` 后混 | `dwrite.rs` `draw` 步骤 3 | 片段颜色 alpha 不同时要分组多遍（§7.2） |
-| CoreText 按属性串排版，`make_line` 已给全区间设 `kCTForegroundColorAttributeName` | `coretext.rs` | 改成按区间设即可，alpha 由 CG 原生处理 |
+| CoreText 按属性串排版，`make_line` 已给全区间设 `kCTForegroundColorAttributeName` | `coretext.rs` | 按区间改属性会切分 CTRun，**不能假定度量不变**；首选「整形一次、按 run 子区间换填充色」（§7.3） |
 | 状态 patch 只对 `item`/`text`/`index`/`comment`/`footer_bar.disabled`/菜单项求值；**`tooltip` 没有状态 patch** | `resolve.rs` `resolve_views` | 角色表：注释节点有常态/选中/悬停三份，气泡只有常态（§5.3） |
 | `resolve_state` 的 nil 门控只看色/图/边框/字重，状态 patch 只写了别的字段时整体为 `None` | `resolve.rs` `resolve_state` | 只写 `[comment.selected.roles]` 的 patch 会被丢掉，门控要加一条（§5.2） |
 | 注释的选中/悬停正文色只看 `comment.selected/hover`，**不继承 `item.selected` 的色** | `candidate_window.rs` `eff_text` | 规则 3 的「该状态正文色」= `eff_text(&v.comment, …)`（§6.3） |
@@ -40,6 +40,9 @@
 | `CandidateItem` 经进程内 mpsc（`UiCommand`）交 UI，不过 IPC；TSF UIElement 与 Android 拉取面都不带注释 | `coordinator.rs`、`handle_uielement.rs`、`candidate_pull.rs` | IPC / bridge 不涉及（§8.4） |
 | **`parse_hex` 只认 6/8 位**，而文档站 themes.mdx 与主题编辑器（`lib/color.ts`）都声称/支持 `#RGB` | `palette.rs` | 现存不一致：编辑器预览出色、引擎回落。本设计顺手补 3 位（§5.5） |
 | 出厂配置、测试、文档站、设置端**无一处**出现 `$[` | grep 全仓 | 新语法与老模板冲突概率极低（§13.1） |
+| 软键盘「激活键文字」按 `softkb_active_text` → `accent_text` → … 取色 | `soft_keyboard.rs` `set_theme`（约 489 行） | `_base` 一旦有 `accent_text = ${accent}`，`_base`/`msime` 的激活键会变成强调色字压强调色底；P2 顺手把这一级改为 `on_accent`（§15） |
+| `wind-ui/src/text/mock.rs` 不在模块树里（`text/mod.rs` 未声明），是死文件 | `text/mod.rs` | Linux mock 以 `dwrite.rs` 里的 `imp` 为准（§7.4） |
+| `parse_hex` 也用于语言栏配置（`[ui.langbar] text_color_*` 等），且对 `#` 可有可无 | `palette.rs`、wind-config | 补 3 位时必须要求带 `#`（§5.5） |
 
 ## 2 目标
 
@@ -53,7 +56,7 @@
 
 ### 非目标
 
-- 候选正文 `text` 不纳入（§8.6）。
+- 候选正文 `text` 不纳入（§8.5）。
 - 不做字重、字号、下划线等**非颜色**的分段样式——它们会改度量，破坏「颜色不影响布局」这条地基。
 - 不做用户级（`config.toml`）角色色覆盖（§9）。
 - 编码栏、状态提示、Toast、菜单不纳入：它们没有模板，没有分段的来源。
@@ -63,10 +66,11 @@
 ### 3.1 数据结构（wind-ui-types）
 
 ```rust
-/// 带分段样式的文字。纯文本照旧是 `text`，样式是挂在旁边的区间表。
+/// 带分段样式的文字：纯文本 + 挂在旁边的区间表。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct StyledText {
-    pub text: String,
+    /// 私有：只经构建器写入，保证区间与文字同步（见下）。对外 `as_str()`。
+    text: String,
     /// 按 `start` 升序、互不重叠；区间以字节计、落在字符边界上。空 = 整段节点正文色。
     /// 未被任何区间覆盖的文字 = 节点正文色。
     spans: Vec<Span>,
@@ -76,48 +80,61 @@ pub struct StyledText {
 pub struct Span {
     pub start: u32,
     pub end: u32,
-    pub role: Role,
+    /// 角色 = **归一后的变量名**（`code_rev`、`pinyin` …），或结构角色 `title` / `literal`；
+    /// `None` = 无角色（未知变量名的回显）。
+    pub role: Option<Arc<str>>,
     /// 在段名（气泡 label）里产出的片段：角色未配色时回落 `title` 角色，而非正文色（§3.2）。
     pub in_title: bool,
     /// 内联色（`$[…]{}`）。有值即优先于角色（§6.2）。
     pub color: Option<InlineColor>,
 }
 
-/// `TEXT_ROLES` 的下标；`Role::NONE` = 无角色。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Role(u16);
-
-pub const TEXT_ROLES: &[&str] = &[
-    "title", "literal", "char",
-    "code_hint", "code_rev", "code_rev_all", "shuangpin", "pinyin",
-    "chaizi", "chaizi_code", "chaizi_all", "chaizi_code_all", "dict", "emoji",
-    "word_code", "code_source", "full_text", "readings", "unicode", "unicode_all", "debug",
-];
+impl StyledText {
+    pub fn as_str(&self) -> &str;
+    pub fn is_empty(&self) -> bool;
+    pub fn spans(&self) -> &[Span];
+}
+impl From<String> for StyledText { /* 无区间 */ }
 ```
 
 - **为什么是「纯文本 + 区间表」而不是 `Vec<(String, Style)>`**：下游绝大多数代码只关心文字
-  （测量、截断判定、复制、上屏、指纹、右键菜单标签），它们继续读 `text`，一行不改；只有画字的那一处
+  （测量、截断判定、复制、上屏、指纹、右键菜单标签），它们读 `as_str()` 即可；只有画字的那一处
   读区间。两种表示信息等价，但前者让「颜色只进 draw」在类型上就成立。
-- **为什么捆成一个类型而不是 `CandidateItem` 上并列一个 `comment_spans`**：并列字段迟早出现
-  「文字改了、区间没跟着改」——截断、trim、吞空白都在改文字。捆在一起、构造时校验（升序、不重叠、
-  在界内、在字符边界），不变量只守一处。
+- **为什么捆成一个类型、且 `text` 私有**：并列字段或公开 `text` 都会出现「文字改了、区间没跟着改」
+  ——截断、trim、吞空白都在改文字。文字只能经构建器（§8.1）写入，构造时校验（升序、不重叠、在界内、
+  在字符边界），不变量只守一处。
 - `InlineColor` / `ColorRef` 的定义在 wind-theme（§4.2），它依赖调色板的解析；wind-ui-types 已依赖 wind-theme。
-- `TEXT_ROLES` 放 wind-ui-types：协调器（产出方）、wind-ui（消费方）、文档站与主题编辑器（契约）
-  都认这一张表。协调器加一条测试：`eval_var` / `eval_text_var` / `char_var` 认识的每个变量名，
-  归一后都在表里——新增变量忘了登记角色就红。
+
+**角色名的来源与别名**：角色直接存归一后的变量名，不另编号。归一只靠一张别名表
+（`code` → `code_rev`、`code_all` → `code_rev_all`），放在 `comment.rs` 模板引擎里，产出片段时查一次。
+变量名本身散在几个求值入口里（见下），编号表做不到与它们同源，存名字则天然同源。
+
+`TEXT_ROLES`（wind-ui-types 的 `pub const`）只作**对外契约清单**：文档站角色表、主题编辑器严格模式照它
+列出与校验；引擎本身不查它。守它的测试是「清单里每个变量名都能被某个求值入口求出值（`Some`，空串也算）」，
+入口逐一列明：
+
+| 入口 | 位置 | 覆盖的变量 |
+|---|---|---|
+| 候选上下文 | `Coordinator::eval_var`（`comment.rs`） | `code_hint`、`emoji`、`code_rev(_all)`、`shuangpin`、`pinyin`、`chaizi*`、`dict` |
+| 气泡候选上下文附加 | `coordinator.rs` 气泡组装处的 `cand_eval`；`CompiledTooltip::render` 内层的 `cand_eval` | `word_code`、`code_source`、`debug`；`full_text`、`unicode_all` |
+| 逐字上下文 | `tooltip::char_var`；`Coordinator::eval_text_var` | `readings`、`unicode`；`char` 及与候选上下文同名的变量 |
+
+结构角色 `title`、`literal` 不是变量，测试单列排除；别名表的每个键也必须能求值（今天
+`legacy_names_are_aliases` 已守）。反方向（「每个能求值的变量都在清单里」）写不出来——入口是
+`match` 分支，没有可枚举的集合——故不测，靠新增变量时对照本表更新清单与文档。
 
 ### 3.2 角色从哪来（协调器产出规则）
 
 | 文字来源 | 角色 | 说明 |
 |---|---|---|
-| `${name}` 的值 | `name`（别名归一） | `${code}` → `code_rev`，`${code_all}` → `code_rev_all`；主题只需认规范名 |
+| `${name}` 的值 | `name`（经别名表归一） | `${code}` → `code_rev`，`${code_all}` → `code_rev_all`；主题只需认规范名 |
 | `${a\|b\|c}` 的值 | **实际取到值的那个变量** | `${code_hint\|code_rev}` 取到反查码时是 `code_rev` |
 | `${name:arg}` 的值 | `name` | 参数不影响角色 |
 | 模板字面文字（正文） | `literal` | `(拼: `、`：`、`\t`、` [`、`]` |
 | 模板字面文字（段名里） | `title` | |
 | 气泡段名的装饰 `[` `]` 与 inline 段的 `: ` | `title` | 由 `TooltipDoc` 拼出，不是模板字面 |
 | 段名里的变量值（`编码{(${code_source})}` 的 `五笔`） | `code_source`，`in_title = true` | 主题没配 `code_source` 时回落 `title` 色，整个段名同色 |
-| 未知变量名的原样回显 `${pinyn}` | `Role::NONE` | 它是错误提示，用正文色，不借任何角色的色 |
+| 未知变量名的原样回显 `${pinyn}` | 无（`None`） | 它是错误提示，用正文色，不借任何角色的色；在段名里也不回落 `title` |
 | 截断标记 `…`（`comment_max_chars` / 气泡 `max_chars`） | 与被截处前一个字同样式 | 不单设角色：它不承载信息 |
 | 非模板来源的注释（快捷加词预览行的提示等） | 无片段 | 整段正文色 |
 
@@ -140,7 +157,8 @@ COLOR := ATOM ( '/' ATOM )?                  单值 = 亮暗共用；a/b = 亮/�
 ATOM  := '#' HEX{3|6|8} | NAME               NAME = [a-z0-9_]+，调色板 token 名
 ```
 
-- `SPEC` 内各记号两侧空白忽略；`SPEC` 不得含 `]` `{` `}` 换行，长度 ≤ 64 字节。
+- 上面的文法只决定**颜色是否合法**（§4.5），不决定语法是否成立（§4.4）。
+- `SPEC` 内各记号两侧空白忽略。
 - `BODY` 是普通模板（变量、可选段、嵌套的 `$[…]{}` 都可以写），按层数配对到对应的 `}`。
 - 例：`$[accent]{${code_rev}}`、`$[#C00000/#FF8080]{(${pinyin})}`、
   `$[text_dim,selected=on_accent]{${chaizi}}`、`{ $[success]{[${dict}]}}`。
@@ -175,12 +193,19 @@ impl InlineColor { pub fn parse(spec: &str) -> Self }           // 不失败，�
   要「空则消失」就套一层可选段：`{$[accent]{(${pinyin})}}` 或 `$[accent]{{(${pinyin})}}`，两种等价；
 - 「空变量吞掉紧邻的一个空白」照旧按**输出文字**判断，跨不跨颜色边界都一样吞。
 
-这样定义是为了让「加颜色」对已有模板是**纯加法**：给任意一段包上 `$[…]{}`，文字输出逐字节不变。
+这样定义是为了让「加颜色」对已有模板是**纯加法**：给任意一段**花括号配平**的片段包上 `$[…]{}`，
+文字输出逐字节不变（包住半个 `{…}` 会改变配对，那不是加颜色而是改结构）。
 
 ### 4.4 何时仍是字面文字
 
-只有「`$[` + 合法字符的 `SPEC` + `]` + 紧跟 `{` + 能配对闭合的 `BODY`」才构成语法；任一处不满足，
-`$` 按字面输出、从 `[` 继续扫描。与现有 `${` 未闭合即退化为字面的宽容取向一致。
+语法是否成立只看两条：
+
+1. `$[` 之后到第一个 `]` 之间的 `SPEC` 不含 `{` `}` 换行（遇到它们即不成立），长度 ≤ 64 字节；
+2. `]` 紧跟 `{`，且 `BODY` 能按层数配对闭合。
+
+任一条不满足，`$` 按字面输出、从 `[` 继续扫描，与现有 `${` 未闭合即退化为字面的宽容取向一致。
+`SPEC` 里写的是什么**不影响**语法是否成立：`$[红]{x}`、`$[]{x}`、`$[#GG]{x}` 都是语法成立、颜色非法，
+按 §4.5 处理（显示 `x`、正文色、预览提示）。这样用户写错颜色时不会突然看到一串字面 `$[…]`。
 
 ### 4.5 非法或查不到的颜色
 
@@ -194,7 +219,7 @@ impl InlineColor { pub fn parse(spec: &str) -> Self }           // 不失败，�
 
 模板引擎另有两个出口，产物是**要上屏的文字**而非显示：`alt_commit_text`（上屏注释）与
 `reverse_render`（cmdbar `dict.rev`）。它们继续调 `render()` 得 `String`，`$[…]{}` 只留 `BODY` 的文字。
-复制 / 上屏 / 「复制全部」同理，一律取 `StyledText::text` 或气泡的原始行（本来就是纯文本）。
+复制 / 上屏 / 「复制全部」同理，一律取 `StyledText::as_str()` 或气泡的原始行（本来就是纯文本）。
 
 ## 5 主题：角色表
 
@@ -219,8 +244,9 @@ title    = "${accent}"
 readings = "#9AD0FF"
 ```
 
-- 值的形态与节点 `color` 完全相同：`${token}` / `#hex` / `{ light, dark }`；`""` = 未设置（跟随正文色），
-  派生主题借此撤销 base 配的某个角色。
+- 值的形态与节点 `color` 相同：`${token}` / `#hex` / `{ light, dark }`；`""` = 未设置（跟随正文色），
+  派生主题借此撤销 base 配的某个角色。唯一例外：`transparent` 在角色表里按未设置处理并 warn，
+  与内联色口径一致（§4.5）——文字占着宽度却看不见，只会是误用。
 - 只有 `comment`（含 `selected` / `hover`）与 `tooltip` 消费；写在其它节点下的 `roles` 被忽略。
 - 引擎**不校验**角色名：更新版本的主题（用到了新变量的角色）在旧引擎上应静默忽略而非报错。
   拼写检查交给主题编辑器的严格模式（§10）。
@@ -233,7 +259,7 @@ readings = "#9AD0FF"
 | `normalize.rs` | **不用改**：`roles` 是普通子表，`normalize_node` 不认识的键原样保留，`selected`/`hover` 已递归；加一条测试钉住扁平写法 `[comment.selected.roles]` 落到 `views.comment.selected.roles` |
 | `theme.rs` `merge` | **不用改**：表对表逐键深合并，派生主题可只改一个角色；`{light,dark}` 对标量按既有「整体重置」语义 |
 | `rvnode.rs` `RvNode` | `pub roles: HashMap<String, Rgba>`（已解析；空 = 未配） |
-| `resolve.rs` `resolve_view_node` | 逐项 `resolve_color`，`None`（空串、未解析的 token）不入表——未解析 token 沿用现有 warn |
+| `resolve.rs` `resolve_view_node` | 逐项 `resolve_color`，`None`（空串、未解析的 token）与 `transparent` 不入表——未解析 token 沿用现有 warn |
 | `resolve.rs` `resolve_state` | nil 门控加 `|| !resolved_roles.is_empty()`；否则只写了 `[comment.selected.roles]` 的 patch 被整体丢弃 |
 
 气泡节点 `rv.tooltip` 与注释节点走同一个 `resolve_view_node`，无需分别处理。
@@ -267,31 +293,65 @@ readings = "#9AD0FF"
 
 #### 新增：候选窗用（为 `bg` 调）
 
-| 名字 | 用途 | 亮 | 暗 | 对比度：亮/白底 · 亮/选中底 `#E6F0FF` · 暗/`#2D2D2D` · 暗/选中底 `#3D4A5C` |
+`_base` 底色：亮/白底 `#FFFFFF`、亮/选中底 `#E6F0FF`、暗/`#2D2D2D`、暗/选中底 `#3D4A5C`。
+`_qingfeng` 系（`default`、`amber`、`jade`、`violet`）底色：亮/白底 `#FFFFFF`、亮/选中底 `accent_soft`
+叠白底 ≈ `#EBF2FE`、暗/`#121826`、暗/选中底 ≈ `#192B4C`。
+
+| 名字 | 用途 | 亮 | 暗 | `_base` 对比度（亮白 · 亮选中 · 暗底 · 暗选中） | `_qingfeng` 对比度（同序） |
+|---|---|---|---|---|---|
+| `accent_text` | 可读的强调**文字**色 | `${accent}` | `${accent}` | 3.56 · 3.10 · 3.86 · 2.53 | 用其自有值 `#2563eb`/`#60a5fa`：5.17 · 4.59 · 6.97 · 5.54 |
+| `success` | 成功 / 肯定 | `#1E8E3E` | `#81C995` | 4.21 · 3.66 · 7.03 · 4.60 | 4.21 · 3.74 · 9.05 · 7.19 |
+| `warning` | 提醒 | `#B06000` | `#FDD663` | 4.65 · 4.04 · 9.82 · 6.42 | 4.65 · 4.13 · 12.64 · 10.04 |
+| `error` | 错误 / 否定 | `#D93025` | `#F28B82` | 4.77 · 4.15 · 5.77 · 3.77 | 4.77 · 4.24 · 7.42 · 5.89 |
+| `info` | 说明 / 补充 | `#1A73E8` | `#8AB4F8` | 4.51 · 3.92 · 6.53 · 4.27 | 4.51 · 4.00 · 8.41 · 6.68 |
+
+#### 气泡用：契约里每个名字都有 `tooltip_<名>`（为深色气泡底调，§6.2 作用域查找）
+
+**契约名在气泡里都有可读担保**：上两张表里的每个名字 `x`，`_base` 都定义了 `tooltip_x`，内联色在气泡里
+写 `x` 取到的是 `tooltip_x`。气泡在语境上没有意义的名字（`on_accent`、`selection_text`）等于
+`tooltip_text`，保证写了也可读。
+
+| 名字 | 亮 | 暗 | 对比度：`_base` 亮档气泡 `#3C3C3C` · 暗档 `#1E1E1E` · `_qingfeng` 亮档 `#2A2F3E` · 暗档 `#12151F` | 状态 |
 |---|---|---|---|---|
-| `accent_text` | 可读的强调**文字**色 | `${accent}` | `${accent}` | 3.56 · 3.10 · 3.86 · 2.53 |
-| `success` | 成功 / 肯定 | `#1E8E3E` | `#81C995` | 4.21 · 3.66 · 7.03 · 4.60 |
-| `warning` | 提醒 | `#B06000` | `#FDD663` | 4.65 · 4.04 · 9.82 · 6.42 |
-| `error` | 错误 / 否定 | `#D93025` | `#F28B82` | 4.77 · 4.15 · 5.77 · 3.77 |
-| `info` | 说明 / 补充 | `#1A73E8` | `#8AB4F8` | 4.51 · 3.92 · 6.53 · 4.27 |
+| `tooltip_text` | `#FFFFFF` | `${text}` | 11.03 · 12.63 · 13.34 · 16.43（暗档按各自 `text`：`_base` `#E0E0E0`、`_qingfeng` `#F2F3F7`） | 已有 |
+| `tooltip_text_dim` | `#BDBDBD` | `#BDBDBD` | 5.87 · 8.87 · 7.10 · 9.70 | 新增 |
+| `tooltip_text_hint` | `#A0A0A0` | `#A0A0A0` | 4.22 · 6.38 · 5.10 · 6.97 | 新增 |
+| `tooltip_accent` | `#8AB4F8` | `#8AB4F8` | 5.23 · 7.91 · 6.33 · 8.64 | 新增；`_qingfeng` 系各自覆盖，见下 |
+| `tooltip_accent_text` | `${tooltip_accent}` | 同左 | 同 `tooltip_accent` | 新增 |
+| `tooltip_on_accent` | `${tooltip_text}` | 同左 | 同 `tooltip_text` | 新增 |
+| `tooltip_selection_text` | `${tooltip_text}` | 同左 | 同 `tooltip_text` | 新增 |
+| `tooltip_success` | `#81C995` | `#81C995` | 5.63 · 8.51 · 6.81 · 9.30 | 新增 |
+| `tooltip_warning` | `#FDD663` | `#FDD663` | 7.87 · 11.89 · 9.51 · 12.99 | 新增 |
+| `tooltip_error` | `#F28B82` | `#F28B82` | 4.62 · 6.98 · 5.58 · 7.63 | 新增 |
+| `tooltip_info` | `#8AB4F8` | `#8AB4F8` | 5.23 · 7.91 · 6.33 · 8.64 | 新增 |
 
-#### 新增：气泡用（为深色气泡底调，§6.2 作用域查找）
+`tooltip_text_dim` / `tooltip_text_hint` 为什么要补：直接用候选窗的值，`text_hint` 暗档 `#808080` 在
+`_base` 亮档气泡上只有 2.79，`text_dim` 亮档 `#646464` 压在深色气泡上更低。补的两色保持「主文字 > 次要 >
+提示」的明度阶梯（`#FFFFFF` > `#BDBDBD` > `#A0A0A0`），最低一档仍 ≥ 4.22。
 
-| 名字 | 亮 | 暗 | 对比度：`_base` 亮档气泡 `#3C3C3C` · 暗档 `#1E1E1E` · `_qingfeng` 亮档 `#2A2F3E` · 暗档 `#12151F` |
-|---|---|---|---|
-| `tooltip_accent_text` | `#8AB4F8` | `#8AB4F8` | 5.23 · 7.91 · 6.33 · 8.64 |
-| `tooltip_success` | `#81C995` | `#81C995` | 5.63 · 8.51 · 6.81 · 9.30 |
-| `tooltip_warning` | `#FDD663` | `#FDD663` | 7.87 · 11.89 · 9.51 · 12.99 |
-| `tooltip_error` | `#F28B82` | `#F28B82` | 4.62 · 6.98 · 5.58 · 7.63 |
-| `tooltip_info` | `#8AB4F8` | `#8AB4F8` | 5.23 · 7.91 · 6.33 · 8.64 |
+**`tooltip_accent` 要随主题换色**：`_base` 给的 `#8AB4F8` 是蓝。`_qingfeng` 系的强调色各不相同，故
+`_qingfeng` 与其派生主题各自覆盖 `tooltip_accent` 为本主题 `accent_text` 的**暗档值**（为深底调过）：
+
+| 主题 | `tooltip_accent` | 对比度（`_qingfeng` 亮档气泡 · 暗档） |
+|---|---|---|
+| `_qingfeng`（蓝，`default` 继承） | `#60a5fa` | 5.25 · 7.17 |
+| `amber`（橙） | `#fbbf24` | 7.99 · 10.91 |
+| `jade`（绿） | `#34d399` | 6.94 · 9.48 |
+| `violet`（紫） | `#a78bfa` | 4.90 · 6.69 |
+
+不能写成 `${accent_text}`：它的亮档是为白底调的深色，在亮档（深色）气泡里会看不清，而调色板引用没法
+「取另一档的值」。于是「清风·XX 只覆盖 primary / accent_text / accent_soft 三色即整体换色」这条约定
+（`_qingfeng/theme.toml` 文件头）变成四色，文件头注释同步改。`msime` 继承 `_base`、主色是微软蓝，
+`_base` 的蓝色 `tooltip_accent` 与之协调，不覆盖。第三方主题改了 `primary` 而没覆盖 `tooltip_accent` 时，
+气泡里的强调色仍是蓝——可读但不同色相；主题编辑器在「改了 primary、未改 tooltip_accent」时给提示（§10）。
 
 （对比度按 WCAG 相对亮度公式计算；气泡底色带 alpha（`F0`/`F5`），按不透明近似。）
 
 **取值依据**：
 
-- **对比度**：候选窗四色在所属明暗档的窗口底色上 ≥ 4.2，在选中底色上 ≥ 3.66。
+- **对比度**：候选窗四色在所属明暗档的窗口底色上 ≥ 4.2，在选中底色上 ≥ 3.66（`_qingfeng` 系 ≥ 3.74）。
   作为参照，出厂注释色 `text_hint` 亮档在白底只有 2.96——新色都比现有注释更易读，不会出现
-  「标了色反而看不清」。气泡五色在四种出厂气泡底上 ≥ 4.62。
+  「标了色反而看不清」。气泡各色在四种出厂气泡底上 ≥ 4.22。
 - **与现有色板协调**：`_base` 的品牌蓝 `#4285F4` 是 Google 蓝，四个语义色取同一套 Google 配色的
   深浅配对——亮档取深阶（`#1E8E3E` 绿、`#D93025` 红、`#1A73E8` 蓝，`warning` 取深橙 `#B06000`：
   黄色系在白底上够不到 4.5），暗档取浅阶（`#81C995` / `#FDD663` / `#F28B82` / `#8AB4F8`）。
@@ -305,17 +365,27 @@ readings = "#9AD0FF"
 
 **气泡为什么要单独一组、以及查找规则**：为白底调的亮档色放进深色气泡，`#D93025` 对比度从白底的 4.77
 掉到 2.31，`#1E8E3E` 从 4.21 掉到 2.62。故内联色在**气泡里**按名字 `x` 求色时先查 `tooltip_x`，查不到
-再查 `x`（2026-09-27 确认，§6.2）。这条规则同样让气泡里的 `$[text]{…}` 取到 `tooltip_text`——
-在气泡里「正文色」本就该是气泡文字色，与直觉一致。
+再查 `x`（2026-09-27 确认，§6.2）。于是气泡里的 `$[text]{…}` 取到 `tooltip_text`——在气泡里「正文色」
+本就该是气泡文字色，与直觉一致。
 
-新增 token 不被任何出厂节点引用，外观零变化；`Resolved.palette` 多出十项，Android 拉取调色板
-（`theme_palette`）会多拿到这些键，无害。
+新增 token 不被任何出厂节点引用，外观零变化——**唯一例外是软键盘**：它的激活键文字按
+`softkb_active_text` → `accent_text` → … 取色（`soft_keyboard.rs`），`_base` 有了 `accent_text` 后
+`_base` / `msime` 的激活键会变成强调色字压强调色底。P2 把这一级改为 `on_accent`（§15）；`_qingfeng` 系
+今天就已是 `accent_text` 字压 `accent` 底，改后变为白字，属顺带修正，靶机核对一眼。`Resolved.palette`
+多出十几项，Android 拉取调色板（`theme_palette`）会多拿到这些键，无害。
 
 ### 5.5 `#RGB`
 
 `parse_hex` 补 3 位（`#F80` → `#FF8800`）。这同时修掉 §1.1 那条现存不一致：文档站与编辑器都说
-支持 `#RGB`，引擎却回落。作用面是所有主题颜色字面值；此前写了 3 位色的主题在引擎里是「没配」，
-修后开始生效——这是文档承诺的行为，不算回归，发版说明写一句。
+支持 `#RGB`，引擎却回落。
+
+- **3 位形式必须带 `#`**：`parse_hex` 今天对 `#` 可有可无（6/8 位裸写也认）。3 位若也可裸写，`bad`、
+  `fed`、`ace` 这类英文单词会被当成颜色——而 `parse_hex` 的调用方不止主题，还有语言栏配置
+  （`[ui.langbar] text_color_*` 等用户手填的字符串）与本设计的内联色名字。6/8 位的裸写保持现状。
+- 作用面：所有主题颜色字面值、语言栏颜色配置、内联色。此前写了 3 位色的主题在引擎里是「没配」，
+  修后开始生效——这是文档承诺的行为，不算回归，发版说明写一句。
+- 主题编辑器 `lib/color.ts` 还接受 `rgb()` / `rgba()`，引擎不认（整个都不认，不止 3 位）；编辑器严格模式
+  对此给提示（§10），不在引擎侧扩。
 
 ## 6 求色（UI 侧）
 
@@ -327,7 +397,25 @@ readings = "#9AD0FF"
    下的颜色——内联亮暗对 `#C00000/#FF8080` 的取值时机就是**每次画**，不需要协调器重算候选；
 3. 协调器不持有 `Resolved`（它只在切主题时加载一次推给 UI），在候选循环里查主题是新耦合。
 
-求色函数放 wind-ui（新模块，如 `span_color.rs`），候选窗、气泡、macOS 气泡下发三处共用。
+**求色函数是 wind-theme 里的纯函数**（如 `wind_theme::span_color`），不依赖 wind-ui-types 的 `Span`：
+
+```rust
+pub fn span_color(
+    theme: &Resolved,
+    node: &RvNode,          // views.comment 或 views.tooltip
+    is_tooltip: bool,       // 决定内联色名字的 tooltip_ 作用域查找
+    state: TextState,       // Normal | Selected | Hover
+    body_fallback: Rgba,    // 节点未配正文色时的渲染层兜底（候选窗今天是 [150,150,150,255]）
+    role: Option<&str>,
+    in_title: bool,
+    inline: Option<&InlineColor>,
+) -> Rgba
+```
+
+四处共用：wind-ui 的候选窗与自绘气泡、`manager_macos.rs`（算 macOS 气泡的 runs）、wind-webdata
+（设置页预览，§11）。放 wind-theme 而不是 wind-ui 的理由是第四个调用方：wind-webdata 不该为求个颜色
+依赖整套 UI crate；且它只依赖 `Resolved` / `RvNode` / `InlineColor` 三个 wind-theme 自己的类型，
+可在 Linux 上直接单测全部分支。候选窗现有的 `eff_text` 闭包随之改调这里的正文色计算，保证两处同一口径。
 
 ### 6.2 顺序
 
@@ -346,7 +434,7 @@ if let Some(ic) = s.color:                      // ① 内联色优先
 if st ≠ 常态 && n.<st>.roles[s.role] 有值  → return 它         // ② 状态态单列的角色色
 if state_changed_body                      → return body      // 规则 3
 if n.roles[s.role] 有值                     → return 它         // ③ 常态角色色
-if s.in_title && n.roles["title"] 有值      → return 它         // ④ 段名里的变量回落 title
+if s.in_title && s.role 非 None && n.roles["title"] 有值 → return 它   // ④ 段名里的变量回落 title（未知变量回显除外）
 return body                                                   // ⑤ 正文色
 ```
 
@@ -408,19 +496,26 @@ pub struct View {
 记录的插入符问题是同一个问题，同一个答案：整串一次整形，颜色只作用于绘制。
 
 直立态（`upright_text`）本就把注释逐格切成多个叶子（这个拆分今天就存在，与着色无关）：
-每格取落在它字节范围内的区间、平移到格内偏移。
+每格取落在它字节范围内的区间、平移到格内偏移。为此 `upright_text` 的 leaf 回调要扩参，把**该格在整串里的
+字节偏移**传出来（今天只传格文本与 caret），回调据此切区间；不切格时偏移为 0、区间原样。
 
 ### 7.2 DirectWrite
 
 - `TextRenderer` 新增 `draw_runs(buf, …, text, ts, base_color, runs)`；`runs` 为空直接调现有 `draw`
   ——出厂路径一个字节都不变。
-- 建 layout 后对每个区间 `SetDrawingEffect(effect, range)`（区间换算成 UTF-16 码元，同 `pua_runs` 口径）；
-  effect 是一个只装 RGBA 的轻量 COM 对象（`#[implement]`）。`DrawGlyphRun` 读 `_effect`：有则用它的色，
-  无则用 `clientDrawingContext` 里的基色。彩色 emoji 的前景哨兵层同样取这个色。
+- 建 layout 后对每个区间 `SetDrawingEffect(effect, range)`（区间换算成 UTF-16 码元，同 `pua_runs` 口径）。
+  `DrawGlyphRun` 读 `_effect`：有则用它对应的色，无则用 `clientDrawingContext` 里的基色。彩色 emoji 的
+  前景哨兵层同样取这个色。
+  - 实现提示：**不必自定义 COM 接口**。每次 draw 为每种颜色建一个最简的 `IUnknown` 对象，连同颜色放进
+    一张表（经 `clientDrawingContext` 传给回调）；`DrawGlyphRun` 拿到的 `_effect` 按**指针身份**
+    （`as_raw()`）在表里反查颜色即可。对象只活到本次 draw 结束。
 - **alpha 分组**：draw 第 3 步把文字 alpha `fa` 在回写时**统一**混入，而「哪个像素属于哪个片段」
-  在那一步已经不可知。故按 alpha 把区间分组，每组一遍「拷底 → Draw（只画本组，其余 glyph run 在
-  `DrawGlyphRun` 里跳过）→ 按本组 `fa` 回写」。不透明色（绝大多数）与基色同组，常见情形仍是一遍；
-  多一个 alpha 多一遍，每遍只扫包围盒。后一遍拷底时前一遍的字已在缓冲里，合成顺序正确。
+  在那一步已经不可知。故按 alpha 把区间分组，每组一遍 Draw（只画本组，其余 glyph run 在
+  `DrawGlyphRun` 里跳过）。不透明色（绝大多数）与基色同组，常见情形仍是一遍。
+  - ⚠️ 多遍时**不能**每遍都「拷底 → 回写预乘值」：第 3 步回写的是按窗口 alpha **预乘**后的值，下一遍
+    第 1 步又把它当直通值拷进 DIB，半透明底（窗口 alpha < 255，如 `_base` 气泡 `F0`）上的字会被二次预乘、
+    发暗。做法：包围盒内先把底拷进一块**直通值草稿区**，各遍都在草稿区上「画 → 按本组 `fa` 混合」累积，
+    最后统一按窗口 alpha 预乘、回写缓冲**一次**。单遍时与现行逻辑逐字节等价。
 - **缓存不受污染**：
   - `measure_cache` 键是 `measure_key(text, size, weight, family)`，measure 路径根本拿不到区间；
   - layout 不缓存：measure 未命中与每次 draw 都新建（`create_layout`），effect 只设在 draw 那个一次性
@@ -433,13 +528,26 @@ pub struct View {
 
 ### 7.3 CoreText
 
-`make_line` 由「全区间一个 `kCTForegroundColorAttributeName`」改为「先设基色、再按区间逐个覆盖」
-（`CFRange` 以 UTF-16 计）。CG 原生按区间处理 alpha，无需分组。`measure` 构造的 line 不带颜色，不受影响。
+「颜色不影响度量」在 CoreText 上**不能假定成立**：属性不同的区间会被切成不同的 CTRun，跨边界的字距
+与连字可能因此变化——带色 line 的宽度可能不等于 `measure` 用的无色 line。
+
+- **首选**：整形只做一次。整串设 `kCTForegroundColorFromContextAttributeName = true`（字色取上下文填充色），
+  line 与 `measure` 用的完全同构；绘制时遍历 `CTLineGetGlyphRuns`，对每个 CTRun 用
+  `CTRunGetStringIndices` 把颜色区间换算成**字形子区间**，逐段 `CGContextSetFillColor` + `CTRunDraw(run,
+  ctx, subrange)`。字形位置来自同一次整形，度量一致由构造保证。CG 原生处理 alpha，无需分组。
+- **备选**：按区间设 `kCTForegroundColorAttributeName`（`CFRange` 以 UTF-16 计）。实现最短，但风险即上所述，
+  只在首选方案遇到阻碍（例如彩色 emoji 在 `FromContext` 下取色异常）时采用，且必须过 P1 的宽度用例。
+- P1 加 macOS 用例：同一文本，带色 line 与无色 line 的 typographic width 相等（含跨颜色边界的连字 / 字距
+  样例，如 `fi`、`AV` 恰好落在边界上）。只能在 macOS CI 上跑。
 
 ### 7.4 mock（Linux，`dwrite.rs` 的 `imp`）
 
-`draw_runs` 同 `draw` 为空操作。布局测试照常跑；「出厂零变化」的结构断言（叶子 `color_runs` 为空）
-在 Linux 上即可验证。
+Linux mock 以 `dwrite.rs` 里的 `imp` 为准；`wind-ui/src/text/mock.rs` 不在模块树里（`text/mod.rs`
+未声明），是死文件，不要在那里改（可顺手删除）。
+
+- `draw_runs` 同 `draw` 不出像素。
+- **新增绘制调用记录**：`imp::TextRenderer` 记下每次绘制调用 `(text, x, y, ts, color, 是否走 runs 及 runs)`，
+  供 §13.2 的 golden 对拍。记录只在测试构建开启，不影响生产路径（生产的 Linux 构建本就没有真实渲染）。
 
 ### 7.5 宿主渲染
 
@@ -457,8 +565,14 @@ pub struct View {
 - Swift `decodeTooltipPayload`：沿用 `fontPath` 那条「`off < buf.count` 才读」的先例容忍缺省。
   旧 `.app` + 新服务：多出的尾段被忽略，退化为单色；新 `.app` + 旧服务：没有尾段，同样单色。
 - `TooltipPanel.show` 在 `.foregroundColor: fg` 之后逐区间 `addAttribute(.foregroundColor, …)`。
-- `manager_macos.rs` 需要在 `SetTheme` 时留一份气泡节点的角色表与调色板（现在只留 `tooltip_bg/fg`
-  两个 hex），供每帧算 `runs`。
+- `rgba: u32` 的字节序：按小端 u32 写出，字节依次为 **R、G、B、A**（即 `R | G<<8 | B<<16 | A<<24`）；
+  Swift 侧按 **sRGB** 建色：`NSColor(srgbRed: r/255, green: g/255, blue: b/255, alpha: a/255)`，
+  与 Rust 侧 CoreText 渲染候选窗所用的色彩空间一致，同一颜色在候选窗与气泡里看起来相同。
+- `manager_macos.rs` 需要在 `SetTheme` 时留一份当前 `Resolved`（现在只留 `tooltip_bg/fg` 两个 hex），
+  供算 `runs`。
+- **`Forwarder.last_tip` 改存结构化的 `TooltipDoc`**（现在是 `Option<String>`），每次 push 时按当前主题
+  **现算** runs。原因：换主题 / 换明暗时 `handle` 会用 `last_tip` 重推当前帧（`affects_appearance` 分支），
+  若存的是算好颜色的结果，重推出去的气泡仍是旧主题的颜色。
 
 ## 8 链路：从模板到像素
 
@@ -466,8 +580,15 @@ pub struct View {
 
 - `Node` 新增 `Color(InlineColor, Vec<Node>)`；`parse` 在 `$` 分支里先判 `${`、再判 `$[`（§4.4）；
   `find_group_end` 不用改——`SPEC` 里不许出现花括号，`$[…]{…}` 贡献的花括号天然配平。
-- `render_nodes` 的输出从 `String` 改为一个片段构建器：`push(&str, Role, in_title, color)` 合并相邻同样式；
+- `render_nodes` 的输出从 `String` 改为一个片段构建器：`push(&str, role, in_title)` 合并相邻同样式；
   `pop_whitespace()` 取代现在的 `out.pop()`（吞空白时同步收缩末尾区间、删掉变空的区间）。
+- **`Color` 节点在当前构建器里原地渲染**：进入时把颜色压入构建器的颜色栈，渲染子节点，退出时弹出；
+  `push` 用栈顶颜色标记片段。它**不另开子构建器**，子节点的 `any_var_filled` 直接累加到父层。
+  只有 `Group` 用子构建器（它要先渲染再决定整段要不要），保留时把子构建器的文字与区间按偏移并回父层。
+  这样「空变量吞掉紧邻的一个空白」看的永远是**同一个**输出缓冲的末尾，跨颜色边界照吞——若 `Color` 也开
+  子构建器，`${pinyin} $[accent]{${chaizi}}` 里 `${chaizi}` 为空时，它看到的是空的子缓冲，吞不到外面那个空格。
+  用例：`(${pinyin} $[accent]{${chaizi}})` 在拆字为空时得 `(nǐ)`；同一模板经气泡的 `Template::render`
+  （不 trim）渲染，行尾也不能多出空格。
 - `render()`（纯文本，供 §4.6 两个出口）保留签名，内部取构建器的 `text`；新增 `render_styled()` 给
   `comment_for` 用。`trim()` 与 `comment_max_chars` 截断改在构建器上做：截断按 `char` 计（现口径不变），
   `…` 继承被截处前一个字的样式。
@@ -499,8 +620,15 @@ pub struct TooltipLine    { pub text: StyledText, pub raw: u16 }
 - `plain_lines()` 改为产出带样式的行（`[`、`]`、`: ` 以 `title` 角色拼进去），`to_plain_text()` 与新增的
   `to_styled()`（整块文字 + 区间，给自绘气泡与 macOS 下发）都从它取——画出来的行、命中换算的行、
   下发的行仍是同一份排列。
-- `hit_at_line`、行等高命中、`doc_fingerprint` 比对：不受影响。指纹会把片段算进去，UI 与协调器对同一份
-  文档算出同一个值，比对语义不变。
+- `hit_at_line`、行等高命中：不受影响。
+- **指纹拆成两个**：
+  - `fingerprint()`（右键菜单核对用，`doc_fingerprint`）只 hash **文字与 `raw` 下标**（段名文字、inline、
+    每行文字与 `raw`），不含片段；
+  - 需要「内容含颜色都相同」判断的地方（如是否要重画）直接比 `TooltipDoc` 的 `PartialEq`，不另设指纹。
+
+  理由：右键核对要防的是「段下标错位、取到别的段」，那只与文字结构有关。若颜色也进指纹，只改了颜色的
+  刷新（用户在设置页改了模板里的 `$[…]`、或片段因角色归一变化）会让菜单弹出前后指纹不等，菜单退化成
+  只剩「截图此窗口」，而此时取值其实完全正确。
 - 右键菜单标签（`handle_tooltip.rs` `section_label`）、复制 / 上屏段与行、「复制全部」（`raw_plain_text`）
   全部取纯文本。
 
@@ -508,12 +636,14 @@ pub struct TooltipLine    { pub text: StyledText, pub raw: u16 }
 
 | 类型 | 改动 |
 |---|---|
-| `CandidateItem.comment` | `String` → `StyledText`（`From<String>` 给无样式来源用；`is_empty()` / `as_str()` 供现有调用点） |
+| `CandidateItem.comment` | `String` → `StyledText`（`From<String>` 给无样式来源用；现有调用点改读 `as_str()` / `is_empty()`） |
 | `TooltipSection.title` | `Option<String>` → `Option<StyledText>` |
 | `TooltipLine.text` | `String` → `StyledText` |
-| `View` | 加 `color_runs` |
+| `View` | 加 `color_runs`；`upright_text` 的 leaf 回调加格的字节偏移 |
 | `TextRenderer`（三后端） | 加 `draw_runs` |
 | `wind-ipc` `encode_tooltip_show` | 加尾段 `runs`（Swift 解码同步） |
+| `manager_macos.rs` `Forwarder.last_tip` | `Option<String>` → `Option<TooltipDoc>` |
+| `TooltipDoc::fingerprint` | 只 hash 文字与 `raw`（§8.2） |
 
 ### 8.4 IPC / bridge
 
@@ -544,19 +674,19 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 
 ## 10 主题编辑器（WindInputThemeEditor）同步点
 
-编辑器对外的契约在面板文案里，以下几处要与引擎同步：
+编辑器对外的契约在面板文案里，以下几处要与引擎同步（路径相对编辑器仓根）：
 
 | 文件 | 改动 |
 |---|---|
-| `lib/theme3/types.ts` `ViewNodeV3` | 加 `roles?: Record<string, Color>` |
-| `lib/theme3/toml.ts` | `NODE_KNOWN` 加 `roles`；读写 `[comment.roles]`、`[comment.selected.roles]`、`[comment.hover.roles]`、`[tooltip.roles]` |
-| `lib/theme3/strict.ts` | `roles` 的键**不是**开放命名空间：按公开角色表（从 `TEXT_ROLES` 抄一份，附来源注释）报未知角色，抓 `pinyn` 这类错字 |
-| `lib/theme3/resolve.ts` + `engineParity.test.ts` | 求值角色表（含状态），与引擎对拍 |
-| `lib/theme3/tokenMeta.ts` | 新 token 中文名：`accent_text` 强调文字、`success` 成功、`warning` 提醒、`error` 错误、`info` 说明、`tooltip_*` 同名加「（提示框）」；`TOKEN_GROUPS` 新增「文字标注色」组 |
-| `lib/theme3/presets/baseChain.ts` | `_base` 改动后跑 `pnpm bake:theme` 重新烘焙（勿手改） |
-| `lib/color.ts` | 已支持 `#RGB`，无需改；§5.5 修的是引擎一侧 |
-| `components/form/ViewsEditorV3.vue` | 注释、提示框节点加「文字角色色」面板：常态 / 选中 / 悬停三栏（提示框只有常态）；文案写明回落规则 §6.3 |
-| `lib/preview/candidateBox.ts`、`otherWindows.ts` | 预览样例带片段（如注释 `kao` 标 `code_hint`、气泡段名标 `title`），按 §6.2 求色，否则配了角色在预览里看不出来 |
+| `src/lib/theme3/types.ts` `ViewNodeV3` | 加 `roles?: Record<string, Color>` |
+| `src/lib/theme3/toml.ts` | `NODE_KNOWN` 加 `roles`；读写 `[comment.roles]`、`[comment.selected.roles]`、`[comment.hover.roles]`、`[tooltip.roles]` |
+| `src/lib/theme3/strict.ts` | `roles` 的键**不是**开放命名空间：按公开角色表（从 `TEXT_ROLES` 抄一份，附来源注释）报未知角色，抓 `pinyn` 这类错字；角色值写 `transparent` 报提示；任何颜色值写成 `rgb()` / `rgba()` 报提示（编辑器 `src/lib/color.ts` 认、引擎不认，导出后在引擎里等于没配） |
+| `src/lib/theme3/resolve.ts` + `engineParity.test.ts` | 求值角色表（含状态），与引擎对拍 |
+| `src/lib/theme3/tokenMeta.ts` | 新 token 中文名：`accent_text` 强调文字、`success` 成功、`warning` 提醒、`error` 错误、`info` 说明、`tooltip_*` 同名加「（提示框）」；`TOKEN_GROUPS` 新增「文字标注色」「提示框标注色」两组 |
+| `src/lib/theme3/presets/baseChain.ts` | `_base` / `_qingfeng` 改动后跑 `pnpm bake:theme` 重新烘焙（勿手改） |
+| `src/lib/color.ts` | 已支持 `#RGB`，无需改；§5.5 修的是引擎一侧 |
+| `src/components/form/ViewsEditorV3.vue` | 注释、提示框节点加「文字角色色」面板：常态 / 选中 / 悬停三栏（提示框只有常态）；文案写明回落规则 §6.3；配色页在「改了 `primary`、未改 `tooltip_accent`」时提示（§5.4） |
+| `src/lib/preview/candidateBox.ts`、`src/lib/preview/otherWindows.ts` | 预览样例带片段（如注释 `kao` 标 `code_hint`、气泡段名标 `title`），按 §6.2 求色，否则配了角色在预览里看不出来 |
 
 ## 11 设置端（wind-setting）
 
@@ -564,12 +694,23 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 `field_dialogs.rs` `build_comment_dialog`）与提示内容对话框的段表单（`dialogs/tooltip_sections_dialog.rs`）。
 
 - **预览行**（两处都加）：模板输入框下方一行，显示当前主题下的渲染效果（常态；注释另显一行选中态）。
-  - 值来自 core 新 RPC（如 `appearance.previewTemplate`）：入参模板 + 场景（注释 / 段名 / 段内容 + `each`），
-    core 用固定样例（`你好`，候选专属变量给样例值）求值，返回 `{ text, runs: [{start, end, rgba}], problems:
-    [{start, end, message}] }`，颜色已按当前主题与明暗解析。设置端不依赖 wind-theme，求色必须在 core。
-  - 渲染用 windui 的 `RichText`（`src/ui/rich.rs`，支持逐 span 固定色），底色取主题窗口底色 / 气泡底色。
+  - 值来自 core 新 RPC（如 `appearance.previewTemplate`），**由 wind-webdata 分发**：`WebDataHost`
+    （`wind-coordinator/src/web_host.rs`）加一个「模板样例求值」入口，协调器实现它（它够得着变量求值）；
+    主题按 `current_theme_name()` / `current_theme_is_dark()` 经 `wind_theme::load_resolved_dirs`
+    （目录取 `theme_search_dirs()`）现取，颜色用 §6.1 的 `wind_theme::span_color` 求。设置端不依赖 wind-theme，
+    求色必须在 core。
+  - 入参：模板 + 场景（注释 / 段名 / 段内容 + `each`）。core 用固定样例（`你好`，候选专属变量给样例值）求值。
+  - 回包：`{ text, runs: [{start, end, rgba}], problems: [{start, end, message}], bg }`。两类区间的坐标系
+    不同，协议里写明：
+    - `runs` 是**输出偏移**（`text` 里的字节区间，给预览上色）；
+    - `problems` 是**模板偏移**（入参模板里的字节区间，给输入框标位置）。设置端的输入框显示的是**转义后**的
+      模板（`\t`、`\n` 以两个字符显示，见 `tooltip_sections_dialog.rs` 的 `escape_template`），故设置端要把
+      `problems` 的区间经同一张转义映射换算到显示文本上再标注。
+  - 渲染用 windui 的 `RichText`（`src/ui/rich.rs`，支持逐 span 固定色），底色取回包的 `bg`（主题窗口底色 /
+    气泡底色）。
   - `problems` 覆盖：颜色非法、名字当前主题查不到、未知 `key=`、未知变量名（后者今天只在候选栏里能看到）。
-  - 新 RPC 在 `wind-rpc` 的 dispatch / security 白名单登记，mock 回包补一条。
+  - **新设置端配旧 core**：方法不存在即回错误，设置端静默隐藏预览行（不弹错、不占位），其余编辑功能照常。
+  - 设置端 mock 回包补一条（`src/rpc.rs` 的 mock 表）。
 - **调色板点选插入**：输入框旁「插入颜色」按钮，弹出标准色色块（§5.4，按当前主题着色、带中文名）
   + 「自定义 #…」。有选区（windui core `selection_of`）则包住选区成 `$[名]{选区}`，无选区插入 `$[名]{}`
   并把光标放进花括号。
@@ -597,16 +738,21 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 
 | 期 | 对拍 |
 |---|---|
-| P1 | Windows 目标（wine / CI）：① 同一文本，`runs` 为空 vs 全部 run 取基色 → 缓冲逐字节相同；② 多色 run vs 单色 → 「被改动像素」掩码逐像素相同（颜色不影响字形位置）；③ `measure` 结果与缓存条目数不受 `draw_runs` 调用影响 |
-| P2 | 旧 `render()` 作为测试内参照实现保留：出厂模板 + 现有全部注释用例，`render_styled().text` 与参照逐字节相同；气泡 2⁵ 开关组合对拍（`tooltip.rs` 现有）改用 `doc.to_plain_text()` 断言，照旧全绿；每个 `$[…]{}` 用例同时断言「去掉 `$[…]{` `}` 后的模板输出相同文字」（§4.3 纯加法） |
-| P3 | 全部出厂主题（`_base`、`_qingfeng`、`default`、`amber`、`jade`、`violet`、`msime`）× 亮暗：`RvViews` 各节点 `roles` 为空；§5.4 契约名全部可解析；出厂主题 × 出厂模板 × 选中/悬停/常态构建候选窗 View 树：所有叶子 `color_runs` 为空（Linux 可跑，§6.4 的结构保证） |
+| P1（前置） | **先录 golden，再改渲染层**：在**改动前的提交**上给 mock `imp` 加绘制调用记录（§7.4，这一步本身不改任何行为），录出「出厂主题 × 出厂模板 × 常态/选中/悬停 × 横排/竖排/直立」的 View 树 Debug dump + 绘制调用日志，入库作参照。参照必须来自改动前——事后用新代码录的 golden 只能证明「和自己一样」 |
+| P1 | Windows 目标：**第一步先验证 wine 的 DirectWrite 会不会把 drawing effect 传进 `DrawGlyphRun`**（写个最小用例看 `_effect` 是否非空）；传不进就改由 Windows CI 或编译机跑，不要让下面几条在 wine 上「空转全绿」。① 非空断言：绘制后被改动的像素数 > 0（否则后两条可能在什么都没画时平凡成立）；② 多个 effect 全取基色 vs 无 effect → 缓冲逐字节相同；③ 色相断言：两色文本（如红 `ab` + 蓝 `cd`），在各 run 字形的 x 区间内，被改动像素按色相统计以该 run 的颜色为主；④ 半透明底 + 两种 alpha 的多遍绘制，与逐 run 单独绘制再合成的结果一致（守 §7.2 的二次预乘）；⑤ `measure` 结果与缓存条目数不受 `draw_runs` 影响。macOS CI：带色 line 与无色 line 的 typographic width 相等（§7.3）；golden 对拍（Linux）逐字节相同 |
+| P2 | golden 对拍仍逐字节相同（P2 起协调器产出片段，出厂下必须全部解析到正文色而被丢弃，§6.4）。旧 `render()` 作为测试内参照实现保留：出厂模板 + 现有全部注释用例，`render_styled().text` 与参照逐字节相同；气泡 2⁵ 开关组合对拍（`tooltip.rs` 现有）改用 `doc.to_plain_text()` 断言，照旧全绿；每个 `$[…]{}` 用例同时断言「去掉 `$[…]{` `}` 后的模板输出相同文字」（§4.3 纯加法） |
+| P3 | 复用 P1 前置的 golden：出厂主题 × 出厂模板 × 三态 × 三种排布，View 树 dump 与绘制调用日志与改动前**逐字节相同**（含「没有任何调用走 runs」）。另：全部出厂主题（`_base`、`_qingfeng`、`default`、`amber`、`jade`、`violet`、`msime`）× 亮暗，`RvViews` 各节点 `roles` 为空、§5.4 契约名（含全部 `tooltip_*`）可解析 |
 
 ### 13.3 性能
 
-- 协调器：每次按键为整页（≤10）候选各渲染一次注释、一份气泡。片段只是每段几个区间，无样式时
-  `Vec::new()` 不分配；模板解析多一个 `$[` 分支。验收：满页 `notify_ui_update` 耗时增幅 < 5%
-  （出厂配置，≥3 次取中位）。
-- UI：出厂路径早返回，零新增开销；有颜色时每叶子一次 `SetDrawingEffect` × 区间数，alpha 不同才多遍。
+- 协调器：每次按键为整页（≤10）候选各渲染一次注释、一份气泡。**出厂配置下也会产出片段**——协调器不知道
+  主题配没配角色，每个变量值、每段字面文字都照样带角色区间（出厂注释一条通常 1 个区间，气泡每行 2～4 个），
+  外加角色名的 `Arc<str>` 克隆与构建器的合并判断。模板解析多一个 `$[` 分支。
+- UI：出厂下每个片段仍要走一次 §6.2 求色（查角色表、比正文色）才能判定「等于正文色、丢弃」；丢弃之后
+  绘制走旧路径，**绘制**零新增开销，但**求色**不是零。有颜色时每叶子一次 `SetDrawingEffect` × 区间数，
+  alpha 不同才多遍。
+- 以上开销量级都很小，但不作「零开销」的论断，以实测为准。验收：出厂配置下满页 `notify_ui_update`
+  耗时增幅 < 5%、候选窗一次 `render_frame` 耗时增幅 < 5%（各 ≥3 次取中位）。
 
 ### 13.4 前向 / 后向
 
@@ -628,10 +774,10 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 
 | 期 | 内容 | 验收 |
 |---|---|---|
-| P1 | View `color_runs`（含直立态按格切分）；DirectWrite `draw_runs`（drawing effect + alpha 分组）；CoreText 按区间属性；mock；`parse_hex` 补 `#RGB`；`encode_tooltip_show` 尾段 + Swift 解码与 `TooltipPanel` 着色 | §13.2 P1 三条；Swift 解码新旧两形单测 |
-| P2 | `StyledText` / `Span` / `Role` / `TEXT_ROLES`；`InlineColor` 解析；模板引擎 `Color` 节点与构建器；注释与气泡全链路带片段（截断、折行、段名、`plain_lines`）；UI 求色（§6.2，含内联色的状态回落与气泡 `tooltip_` 作用域查找）；标准色 10 个新 token 入 `_base`（§5.4，内联写名字才有东西可查） | §13.2 P2；`TEXT_ROLES` 覆盖测试；walker 下钻用例；性能 < 5%；求色用例：规则 3 按值判（选中态正文色写成与常态同值 ⇒ 不回落；亮暗两档各判）、气泡里 `$[error]` 取 `tooltip_error`、`$[text]` 取 `tooltip_text`、主题未定义 `tooltip_x` 时回落 `x`；`_base` 全部契约名在亮暗两档都能解析（覆盖测试，契约表即断言表） |
-| P3 | 主题 `roles`（schema / resolve / 状态门控）与角色色求值；出厂零变化对拍；主题编辑器同步（§10） | §13.2 P3；编辑器 `engineParity` 绿、`pnpm bake:theme` 后 `check:base` 绿；靶机人工验判据随 P3 给出 |
-| P4 | 设置端预览 RPC、预览行、插入颜色（§11）；文档站（§12） | 设置仓五道闸门绿；新 label 过拼音检索表 |
+| P1 | **前置：在改动前的提交上给 mock 加绘制调用记录并录 golden**（§13.2）；再做 View `color_runs`（含直立态按格切分、`upright_text` 回调扩参）；DirectWrite `draw_runs`（先验 wine 能否传 effect；drawing effect 按指针反查 + alpha 分组 + 直通值草稿区）；CoreText（`FromContext` + 按 CTRun 子区间 `CTRunDraw`）；`parse_hex` 补 `#RGB`（必须带 `#`）；`encode_tooltip_show` 尾段 + Swift 解码与 `TooltipPanel` 着色 | §13.2 P1 各条；Swift 解码新旧两形单测 |
+| P2 | `StyledText` / `Span` / 别名表 / `TEXT_ROLES` 契约清单；macOS `Forwarder.last_tip` 改存 `TooltipDoc`、推送时现算 runs（§7.6）；`InlineColor` 解析；模板引擎 `Color` 节点与构建器；注释与气泡全链路带片段（截断、折行、段名、`plain_lines`）；UI 求色（§6.2，含内联色的状态回落与气泡 `tooltip_` 作用域查找）；标准色新 token 入 `_base`、`tooltip_accent` 入 `_qingfeng` 系四个主题（§5.4，内联写名字才有东西可查）；`wind_theme::span_color` 纯函数；软键盘激活键文字的第二级取色 `accent_text` → `on_accent`（`soft_keyboard.rs`，§5.4）；`TooltipDoc::fingerprint` 只 hash 文字与 `raw` | §13.2 P2；`TEXT_ROLES` 清单可求值测试（§3.1）；walker 下钻用例；吞空白跨颜色边界用例（§8.1）；只改颜色时菜单指纹不变的用例；`span_color` 全分支单测（Linux）；性能 < 5%（§13.3）；求色用例：规则 3 按值判（选中态正文色写成与常态同值 ⇒ 不回落；亮暗两档各判）、气泡里 `$[error]` 取 `tooltip_error`、`$[text]` 取 `tooltip_text`、主题未定义 `tooltip_x` 时回落 `x`；`_base` 全部契约名及其 `tooltip_*` 在亮暗两档都能解析（覆盖测试，契约表即断言表）；软键盘在 `_base` / `msime` / `default` 下激活键文字色的断言 |
+| P3 | 主题 `roles`（schema / resolve / 状态门控，`transparent` 拒收）与角色色求值；出厂零变化对拍；主题编辑器同步（§10） | §13.2 P3；编辑器 `engineParity` 绿、`pnpm bake:theme` 后 `check:base` 绿；靶机人工验判据随 P3 给出 |
+| P4 | wind-webdata 预览 RPC 与 `WebDataHost` 入口；设置端预览行、插入颜色、旧 core 静默降级（§11）；文档站（§12） | 设置仓五道闸门绿；新 label 过拼音检索表；`problems` 区间经转义映射标注正确的用例（含 `\t`） |
 
 P1～P3 与设置仓 P4 同版发布（同 `candidate-tooltip-sections.md` 的做法），P1 不单独出包：
 单有渲染能力、没有产出片段的来源，用户看不到任何东西。
@@ -652,6 +798,9 @@ P1～P3 与设置仓 P4 同版发布（同 `candidate-tooltip-sections.md` 的�
    不按主题写没写来判；亮暗两档各自比较（§6.3、§6.2 伪代码）。
 6. **标准色契约新增清单**：`accent_text`（提升到 `_base`）、`success`、`warning`、`error`、`info`，
    每个都配气泡色 `tooltip_*`；不加 `link`。默认值与取值依据见 §5.4。
+7. **契约里的每个名字在气泡里都有 `tooltip_<名>`**（由设计审查引出，按第 4 条的原则延伸）：补
+   `tooltip_text_dim`、`tooltip_text_hint`、`tooltip_accent`（`_qingfeng` 系各自覆盖为本主题色），
+   `tooltip_on_accent`、`tooltip_selection_text` 等于 `tooltip_text`；契约名在气泡里都有可读担保（§5.4）。
 
 ## 17 待确认
 
