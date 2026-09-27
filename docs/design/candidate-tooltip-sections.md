@@ -1,0 +1,314 @@
+# 候选悬停提示的分段自定义
+
+> 2026-09-27 设计，§11 三项已于同日确认。
+> 前身：`candidate-comment-layering.md`（注释模板的语法与变量体系，本设计直接复用）。
+
+## 1 问题
+
+悬停提示（候选气泡）至今只有开关，没有自定义手段：
+
+| 键 | 作用 |
+|---|---|
+| `ui.tooltip.code_enabled` | `[编码]` 段 |
+| `ui.tooltip.pinyin_enabled` / `pinyin_heteronyms` / `pinyin_max_readings` | `[拼音]` 段及其读音数 |
+| `ui.tooltip.chaizi_enabled` | `[拆字]` 段 |
+| `ui.tooltip.debug_enabled` | `[调试]` 段 |
+
+段的内容、顺序、标题、格式全部写死在 `ReverseLookup::tooltip_for`（wind-reverse）与
+`Coordinator::debug_tooltip_section`（wind-coordinator）里。由此有四条实际缺口：
+
+1. **二合一是固化策略**。拆字与拼音同开时，`merge_chaizi_pinyin` 按段名把两段合成
+   `[拆字 / 拼音]`（`\t` 分列）。想分开、想换列序、想去掉拆字编码，都无从表达。
+2. **气泡看不到被截断的原文**。候选按 `ui.candidate.max_chars`（出厂 16）截断加 `…`，而
+   气泡也按**截断后**文本生成——长短语在两处都看不全。
+3. **只有 CJK 候选有气泡**。`tooltip_for` 先滤掉 `< U+3400` 的字符，滤空就整体返回空串：
+   英文、符号、emoji 候选即使有编码、有注释库释义，也没有气泡。
+4. **想加一种内容就得改代码**。Unicode 码位、注释库释义这类需求，注释段早已能用变量
+   表达（`${dict}` 等），气泡却只能等新开关。
+
+右键菜单同样是整块处理：只有「复制内容」（整段文本）和「截图此窗口」，不能针对某一段操作。
+
+## 2 目标
+
+- 气泡由**有序段列表**构成，每段 = 段名 + 段内容，都可配。
+- 段内容用注释模板的**同一套语法和变量**，不另起一套。
+- 新增能力：完整原文、Unicode 码位、逐字模式；拼音+拆字合并改由模板表达。
+- 右键识别点中的段/行，可**复制或上屏该段**（或该行）。
+- 出厂外观零回归，唯一例外是非 CJK 候选开始有气泡（§8.3）。
+
+### 非目标
+
+- 不做模式级 / 方案级分层，只有全局一份（§9）。
+- 不做「悬停时才计算」的惰性求值（§9）。
+- macOS 原生气泡的右键（§7.5）。
+
+## 3 配置模型
+
+```toml
+[ui.tooltip]
+delay     = 200     # 不变
+max_chars = 200     # 新增：单行显示上限（字符数，超出加 …），0 = 不限。仅影响显示，不影响复制/上屏
+wrap_width = 40     # 新增：折行宽度（显示列，全角计 2），0 = 不折行
+
+[[ui.tooltip.sections]]
+label    = "完整原文"
+template = "${full_text}"            # 仅候选被截断时有值，平时整段不出现
+
+[[ui.tooltip.sections]]
+label    = "编码{(${code_source})}"
+template = "${word_code}"
+
+[[ui.tooltip.sections]]
+label    = "拼音"
+each     = "han"
+template = "${char}：${readings}"
+
+[[ui.tooltip.sections]]
+enabled  = false
+label    = "拆字"
+each     = "han"
+template = "${char}：${chaizi}{ [${chaizi_code}]}"
+
+[[ui.tooltip.sections]]
+enabled  = false
+label    = "Unicode"
+each     = "char"
+template = "${char}：${unicode}"
+
+[[ui.tooltip.sections]]
+enabled  = false
+label    = "调试"
+template = "${debug}"
+```
+
+### 3.1 段字段
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | 段开关。保留「内置段关着」这种状态，设置页可一键开，不必删了再加 |
+| `label` | 模板 | `""` | 段名。**本身也是模板**：`编码{(${code_source})}` 在非直接输入时得 `编码(五笔)`，否则 `编码`。空 = 无标题行 |
+| `template` | 模板 | 必填 | 段内容 |
+| `each` | 枚举 | `""` | `""` 整个候选求值一次；`han` 对显示文本中每个 ≥U+3400 的字求值一次（现行口径）；`char` 对每个非空白字符求值一次 |
+| `promote` | 变量名 | `""` | 仅逐字段：按「该变量是否非空」把行**稳定**分成两组，非空组在前。见 §3.3 |
+| `inline` | bool | `false` | 仅当内容恰为一行时生效：渲染成 `标签: 内容` 而非标题独占一行（如 `Unicode: U+597D`） |
+
+段内容求值结果按 `\n` 拆成行（多行变量如 `${debug}` 天然成立）；逐字模式下每字一行，
+**空行丢弃**；所有行都为空的段整段不显示（与注释模板「全空即消失」同一规则）。
+
+★ **`${char}` 不计入「有值」判定**。它在逐字模式下恒非空，若计入，`${char}：${readings}` 对查不到
+读音的字会留下孤零零的 `好：`，而现行实现是整行跳过。规则：一行里除 `${char}` 外的变量全空，
+该行按空行丢弃。
+
+### 3.2 为什么是「段列表」而不是「一整个模板」
+
+气泡与注释段的差别在于它是**分段、多行**的，右键也要按段操作（§7）。段是一等结构，
+UI 才有东西可命中；一整个模板字符串里用 `\n` 分段，结构就只存在于用户脑子里。
+
+### 3.3 为什么 `each` 是必需的，而不是再加几个「逐字」变量
+
+注释模板对一个候选求值一次、产出一行。拼音段、拆字段却是**逐字一行**。若用
+`${pinyin_lines}`、`${chaizi_lines}` 这类变量各自产出多行，合并两列就又得在代码里按字
+对齐——正是现在 `merge_chaizi_pinyin` 在做的事。有了 `each`，合并只是一行模板：
+
+```toml
+label    = "拆字 / 拼音"
+each     = "han"
+promote  = "chaizi"
+template = "${char}：{${chaizi}{ [${chaizi_code}]}\t}${readings}"
+```
+
+拆字那部分包在可选段里：无拆字的字整段消失，得 `好：hǎo`；无读音时末尾 `\t` 被空变量吞掉，
+得 `好：女子 [vbg]`——两种退化都与现行输出一致（注释模板的「空变量吞掉紧邻前一个空白」规则）。
+
+**行序必须与现行一致**（2026-09-27 确认）：`merge_chaizi_pinyin` 先按原文顺序出有拆字的字，
+**有拼音无拆字的字补在末尾**（「你好」若「你」无拆字，得先「好」后「你」）。逐字求值天然是原文
+顺序，故加 `promote = "chaizi"`：有拆字的行稳定前置，其余行保持原文相对顺序跟在后面，与旧输出
+逐行相同。`promote` 是通用字段（按任一变量分组），不为拆字特设。
+
+`merge_chaizi_pinyin` 与 `TooltipOptions` 随之删除。
+
+### 3.4 落点与登记（config-design-rules）
+
+- R2：与方案无关的外观偏好 → config.toml 全局。
+- REGISTRY：`ui.tooltip.sections` 登记为 `StructList`（整体不透明叶子，同 `ui.comment_dicts`、
+  `ui.toolbar.buttons`）；`max_chars`、`wrap_width` 为 `Int`。
+- L1 / L2 同源：`Config::default()` 的段列表与 `data/config.toml` 写出的一致，默认值守门测试三层。
+- 旧键 `code_enabled`、`pinyin_enabled`、`pinyin_heteronyms`、`pinyin_max_readings`、
+  `chaizi_enabled`、`debug_enabled` 退役：Value 层迁移（§8.1）+ `RETIRED_KEYS`。
+
+## 4 变量
+
+### 4.1 求值上下文
+
+`each = ""` 时，上下文是**候选**，与注释模板一致，现有全部变量可用（`code_hint`、`code_rev`、
+`shuangpin`、`pinyin`、`chaizi*`、`dict`、`emoji`……）。
+
+`each = "han" | "char"` 时，上下文是**单个字**，走 `comment.rs` 里已有的「按裸文本求值」
+那条路径（cmdbar `dict.rev` 在用）。候选级变量（如 `${code_hint}`）在逐字段里仍可引用，
+取的是候选的值——允许但通常没有意义，不报错。
+
+### 4.2 新增变量
+
+| 变量 | 上下文 | 值 |
+|---|---|---|
+| `${word_code}` | 候选 | 编码来源方案里该词的**全部**编码，码长升序 `/` 连接（`a/ab/abc`）。即现行 `[编码]` 段的内容，取值逻辑不变（§4.3） |
+| `${code_source}` | 候选 | 编码来源方案名；候选就是用该方案直接输入时为空 |
+| `${full_text}` | 候选 | 完整原文。**仅当候选显示被截断时有值**，否则为空 ⇒ 整段自动消失，无需条件语法 |
+| `${char}` | 逐字 | 当前字 |
+| `${readings[:N]}` | 逐字 | 该字全部读音，`/` 连接；`N` 限前 N 个。取代 `pinyin_heteronyms`（=`:1`）与 `pinyin_max_readings`（=`:N`） |
+| `${unicode}` | 逐字 | `U+597D`（非 BMP 照写五/六位，如 `U+2A6D6`） |
+| `${unicode_all[:分隔符]}` | 候选 | 逐字码位，默认空格连接 |
+| `${debug}` | 候选 | 现行调试段的正文（不含 `[调试]` 标题，标题交给 `label`） |
+
+后续可加（本轮不做）：`${block}`（所属 Unicode 区块，如「扩展B」，需一张区块表）。
+
+### 4.3 `${word_code}` 为什么不复用 `${code_rev_all}`
+
+两者问的不是一个问题：
+
+- `${code_rev_all}`（注释段）：**拼音来源候选**在主码表里怎么打，受 `code_hint_source`
+  门控；码表方案下恒空（候选的码就是用户自己打的）。
+- `${word_code}`（气泡）：**任何候选**在编码来源方案里怎么打，码表方案下取自身全部编码，
+  不受注释门控。
+
+`${code}` 已是 `${code_rev}` 的永久兼容别名（见 `comment.rs` `eval_var` 文档），不能挪作他用，
+故新名叫 `word_code`。求值直接搬现行代码：`engine_mgr.code_source_schema()` 取方案、
+`word_codes_in` 按候选**完整原文**查（不按显示文本，理由见 `coordinator.rs` 那段 2026-09-08
+复核注释）、索引未就绪返回空并后台构建。
+
+## 5 长度保护与折行
+
+- **显示与取值分离**：段内容先求出**原始行**（raw lines），再经「单行截断（`max_chars`）→
+  折行（`wrap_width`）」得到**显示行**。复制 / 上屏一律取原始行——截断和折行只是给人看的。
+- **折行在协调器里做**（已确认）：按显示宽度硬插 `\n`，渲染层、宿主渲染、macOS 三端都不用
+  改就一致。View 引擎不支持文本折行（`comment.rs` 已记），这是最小改动。
+  - 宽度按显示列计，全角/CJK 计 2，其余计 1；含 `\t` 的行（分列行）不折。
+- **逐字段的规模**天然受控：它只遍历**显示文本**（截断后，≤ `ui.candidate.max_chars` 字）。
+  完整原文只进 `${full_text}`，不会让逐字段展开成几十行。
+- **气泡的触发条件改为「有任一非空段」**，不再要求含 CJK 字（缺口 3）。
+
+## 6 数据结构
+
+气泡从字符串升级为结构体，段结构一路保留到 UI，右键才有东西可命中：
+
+```rust
+// wind-ui-types
+pub struct TooltipDoc {
+    pub sections: Vec<TooltipSection>,
+}
+pub struct TooltipSection {
+    pub title: Option<String>, // 已求值的段名；inline 段在渲染时拼成 `标签: 内容`
+    pub inline: bool,
+    pub lines: Vec<TooltipLine>,
+}
+pub struct TooltipLine {
+    pub text: String, // 显示行（已截断/折行）
+    pub raw: u16,     // 所属原始行下标（折行产生的多条显示行指向同一原始行）
+}
+```
+
+- `CandidateItem.tooltip: String` → `TooltipDoc`。`tooltip_text()`（「复制全部」）与 macOS
+  下发改为调用 `TooltipDoc::to_plain_text()`，输出与现行格式相同。
+- **原始行不下发 UI**：协调器保留本页每个候选的原始段内容（`Vec<Vec<String>>`，按页缓存，
+  换页/重算时覆盖）。UI 只需回报命中位置，取值在协调器侧完成——值可能很长（完整原文），
+  没必要每次按键都复制一份给 UI。
+- 模板在配置加载时解析一次、随配置快照缓存，不在候选循环里解析。
+
+## 7 右键：识别与动作
+
+### 7.1 命中
+
+气泡由「标题行 + 内容行」逐行排布。UI 在渲染时记下每条显示行的纵向区间，
+`WM_RBUTTONDOWN` 时用客户区 y 坐标换算出 `(section, line)`：
+
+```rust
+UiEvent::RequestTooltipMenu { x, y, hit: Option<TooltipHit> }
+pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在标题行 raw_line = None
+```
+
+点在内边距或段间空白 ⇒ `hit = None`，菜单退化为现行两项。
+
+### 7.2 菜单
+
+| 条件 | 菜单项 |
+|---|---|
+| 命中某段 | 复制「段名」 · 上屏「段名」 |
+| 命中逐字段的某一行 | 另加：复制此行 · 上屏此行 |
+| 恒有 | 复制全部 · 截图此窗口（现行两项） |
+
+段名为空时用序号兜底（「第 2 段」）。菜单项文字过长时截断段名。
+
+### 7.3 取值
+
+- **复制 / 上屏某段**：该段原始行以 `\n` 连接，**不含段名**。例：`[编码(五笔)]` 段复制得 `vbg`；
+  完整原文段复制得**未截断、未折行**的原文。
+- **此行**：取该原始行。逐字段的行形如 `好：hǎo/hào`，原样取——想只要读音的用户可以把模板
+  改成只输出读音。
+
+### 7.4 上屏语义
+
+- 上屏走「直接上屏文本」那条路：清空当前组合、提交该文本、退出候选。
+- **不计词频、不触发造词/联想**：用户选的是提示里的一段信息，不是这个候选。
+- 执行前校验悬停目标仍是弹菜单时那个候选（按页缓存里的候选文本比对）；不一致则放弃并
+  提示，避免菜单打开期间候选刷新导致上屏错位。
+
+### 7.5 平台覆盖
+
+- Windows 自绘气泡：本设计完整覆盖。
+- 宿主渲染（TSF 带窗口）：气泡帧由 UI 进程渲染后写入共享内存，行区间同样可得；需确认该
+  窗口的右键是否已转发到 `RequestTooltipMenu`，未转发则本轮保持现状并记入待办。
+- macOS：原生 .app 自绘气泡，只下发纯文本；右键不在本轮范围。
+
+## 8 迁移与零回归
+
+### 8.1 旧键 → 段列表（Value 层，反序列化之前）
+
+| 旧配置 | 生成的段 |
+|---|---|
+| `code_enabled` | 编码段 `enabled` |
+| `pinyin_enabled` + `pinyin_heteronyms` / `pinyin_max_readings` | 拼音段；`${readings}` / `${readings:1}` / `${readings:N}` |
+| `chaizi_enabled = true` 且拼音开 | 拼音段、拆字段替换为**一个**「拆字 / 拼音」合并段（§3.3 那一行模板，含 `promote`），外观与行序均与现状一致 |
+| `chaizi_enabled = true` 且拼音关 | 拆字段 `enabled = true` |
+| `debug_enabled` | 调试段 `enabled` |
+
+以出厂段列表为底（因而老用户也得到新增的「完整原文」段、关着的「Unicode」段），再按上表改写。
+用户已写 `sections` 时以 `sections` 为准，旧键只清不迁。
+
+### 8.2 对拍
+
+现行 `tooltip_for` + `debug_tooltip_section` 在删除前先作为测试内的**参照实现**保留，
+对一组夹具逐字节比对「旧开关组合 → 迁移出的段列表 → 新渲染」与旧输出，覆盖：多音字、
+扩展区字、拆字库未收录的字、无编码、跨方案带来源名、调试段、全部 2⁵ 种开关组合。
+对拍通过后删参照实现。
+
+### 8.3 唯一的刻意差异
+
+合并段行序**不变**（§3.3 `promote`），对拍按旧顺序逐字节断言。
+
+**非 CJK 候选开始有气泡**（缺口 3 的修复）。例：码表里的符号候选若在词库里有编码，
+   会出现 `[编码]` 段。若要严格零回归，可给编码段默认加 `each` 之外的门控，但那等于把
+   缺口 3 留着。
+
+## 9 不做的，以及理由
+
+- **模式级 / 方案级分层**：注释段分层的理由是横竖排可用宽度差一个数量级、不同方案要不同
+  编码提示；气泡不受排布影响，编码段已按上下文自适应（`${code_source}`）。先只做全局，
+  出现真实需求再按 `candidate-comment-layering.md` 的三态模型加层。
+- **惰性求值**：现在每次按键为整页候选算好气泡。新增变量不改变量级（完整原文只在截断时
+  有值，≤ 200 字 × 一页）。改成悬停时再算要动 UI↔协调器协议，与本需求正交，另立。
+- **段标题的独立样式**（加粗、另一颜色）：结构化之后才成为可能，属主题能力扩展，另立。
+
+## 10 分期
+
+| 期 | 内容 | 验收 |
+|---|---|---|
+| P1 | 段配置 + 迁移；`TooltipDoc`；段渲染接入注释模板引擎（含 `each`）；`word_code`/`code_source`/`char`/`readings`/`unicode*`/`debug` 变量；删 `merge_chaizi_pinyin` 与 `TooltipOptions` | §8.2 对拍全绿；REGISTRY/L2 守门绿 |
+| P2 | `${full_text}`、`max_chars`、`wrap_width`；原始行/显示行分离；非 CJK 候选出气泡 | 截断候选出现完整原文段；复制取到未截断原文 |
+| P3 | 右键命中（自绘 + 宿主渲染）、菜单、复制/上屏段与行、上屏前一致性校验 | 协调器侧菜单构建与取值单测；靶机人工验（判据随 P3 给出） |
+| P4 | wind-setting 段列表编辑器（启停、排序、段名/模板/each 编辑、按预设添加：编码 / 拼音 / 拆字 / 拆字+拼音 / 完整原文 / Unicode / 注释库 / 调试）；文档站 `customize/candidate-tooltip` 与 guides/config | 设置仓五道闸门绿；新 label 过拼音检索表 |
+
+## 11 已确认（2026-09-27）
+
+1. 合并段行序不能改 → 加 `promote`（§3.3），迁移与对拍按旧顺序。
+2. 出厂新增「完整原文」段（开，置首：只在截断时出现，出现时正是用户最想看的）与「Unicode」段（关）。
+3. 上屏不按段限制，所有段都可复制、上屏。
