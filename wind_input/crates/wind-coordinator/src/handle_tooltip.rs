@@ -4,15 +4,30 @@
 //! 候选页组装时把本页每个候选的 [`RenderedTooltip`] 连同候选文本缓存进
 //! `Coordinator::tooltip_page`。UI 右键时只回报「哪个候选、点中哪段哪行」，取值在这边做。
 //!
-//! 菜单打开期间候选页可能被刷新（光标上报、异步反查索引建好……），故弹菜单时把目标候选的
-//! 文本记进 `tooltip_menu_target`，执行动作前与当下缓存比对：不一致就放弃，不拿别的候选的
-//! 气泡去上屏。设计见 `docs/design/candidate-tooltip-sections.md` §7。
+//! # 两道一致性闸门
+//!
+//! 同一个候选的气泡可能在任何时刻被重算（光标上报触发重组装、反查索引后台建好后前面多出
+//! 一个 `[编码]` 段……）。段下标一错位，「上屏此行」就会取到别的段的内容。故：
+//!
+//! 1. **弹菜单时**核对 UI 所画与缓存一致：`RequestTooltipMenu` 带上 UI 所画 `TooltipDoc` 的
+//!    指纹，与缓存条目的指纹不等就不给任何取值类菜单项（只剩「截图此窗口」）。命中是按 UI
+//!    所见换算的，缓存换了结构，那个 `(段, 行)` 在缓存里指的就不是用户点的那一行。
+//!    「复制全部」此时也不给：协调器手里只有缓存那一份，复制它等于复制一份用户没看见的内容。
+//! 2. **执行动作时**一律从弹菜单那一刻的**整份快照**（`TooltipMenuTarget::entry`）取值，
+//!    菜单标签与取值因此恒来自同一个结构。复制到此为止——候选变了照样复制快照里的内容。
+//!    上屏还要再核对会话与当前候选：候选原文已变或会话已结束就放弃（上屏要落在用户右键时
+//!    的那个组合语境里）。
+//!
+//! 放弃时发 Toast「候选已变化，未执行」，并记 warn（不含候选原文）。
+//! 设计见 `docs/design/candidate-tooltip-sections.md` §7。
 
 use crate::coordinator::Coordinator;
 use crate::tooltip::RenderedTooltip;
 use tracing::{debug, warn};
 use wind_bridge::handler::KeyAction;
-use wind_ui_types::{MenuAnchor, MenuCmd, MenuItemSpec, MenuKind, TooltipHit, UiCommand};
+use wind_ui_types::{
+    MenuAnchor, MenuCmd, MenuItemSpec, MenuKind, ToastKind, ToastPosition, TooltipHit, UiCommand,
+};
 
 /// 本页一个候选的气泡缓存。
 #[derive(Debug, Clone)]
@@ -22,15 +37,18 @@ pub(crate) struct TooltipPageEntry {
     pub(crate) rendered: RenderedTooltip,
 }
 
-/// 右键菜单弹出时的目标快照。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 右键菜单弹出时的目标快照（仅在 UI 所画与缓存一致时才有）。
+#[derive(Debug, Clone)]
 pub(crate) struct TooltipMenuTarget {
     /// 页内下标。
     pub(crate) candidate: usize,
-    /// 弹菜单那一刻该候选的原文。
-    pub(crate) text: String,
+    /// 弹菜单那一刻的整份缓存条目：菜单标签由它生成，取值也只从它取。
+    pub(crate) entry: TooltipPageEntry,
     pub(crate) hit: Option<TooltipHit>,
 }
+
+/// 放弃执行时的 Toast 文案（候选已变、会话已结束、没有可信快照）。
+const ABANDONED_TOAST: &str = "候选已变化，未执行";
 
 /// 菜单项里段名的长度上限（字符数），超出截断加 `…`。菜单是一列窄条，段名是用户写的模板
 /// 求值结果，可能很长（`编码{(${code_source})}` 求出长方案名）。
@@ -51,9 +69,11 @@ fn section_label(title: Option<&str>, section: usize) -> String {
 /// 按命中位置构建菜单（设计 §7.2）：
 /// - 命中某段 ⇒ 复制「段名」· 上屏「段名」；
 /// - 命中逐字段的某一行 ⇒ 另加 复制此行 · 上屏此行；
-/// - 恒有 ⇒ 复制全部 · 截图此窗口。
+/// - 有可信快照 ⇒ 复制全部；
+/// - 恒有 ⇒ 截图此窗口。
 ///
-/// `entry` 缺失（缓存里没有这个候选）或命中越界时退化为只有恒有的两项。
+/// `entry` 为 `None` 表示没有可信快照（缓存里没有这个候选，或与 UI 所画不一致），此时
+/// 只剩「截图此窗口」；命中越界时退化为「复制全部 · 截图此窗口」。
 pub(crate) fn tooltip_menu_items(
     entry: Option<&TooltipPageEntry>,
     hit: Option<TooltipHit>,
@@ -97,7 +117,9 @@ pub(crate) fn tooltip_menu_items(
             items.push(M::separator());
         }
     }
-    items.push(M::leaf("复制全部", cmd(MenuCmd::TooltipCopy), true, false));
+    if entry.is_some() {
+        items.push(M::leaf("复制全部", cmd(MenuCmd::TooltipCopy), true, false));
+    }
     items.push(M::leaf(
         "截图此窗口",
         cmd(MenuCmd::TooltipScreenshot),
@@ -130,7 +152,7 @@ fn tooltip_value(
 }
 
 impl Coordinator {
-    /// 右键悬停提示：记下目标、弹出菜单。
+    /// 右键悬停提示：核对 UI 所画与缓存一致、记下快照、弹出菜单。
     ///
     /// **先**发 SetTooltipMenuOpen(true) 抑制 tooltip 的 WM_MOUSELEAVE 自动隐藏——
     /// 右键弹出菜单后鼠标会移到菜单窗口上，若不抑制 tooltip 会当场消失，菜单就指向一个
@@ -141,21 +163,28 @@ impl Coordinator {
         y: i32,
         candidate: i32,
         hit: Option<TooltipHit>,
+        doc_fingerprint: u64,
     ) {
         let _ = self.ui_tx.send(UiCommand::SetTooltipMenuOpen(true));
-        let items = {
+        let target = {
             let page = self.tooltip_page.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = usize::try_from(candidate).ok().and_then(|i| page.get(i));
-            *self
-                .tooltip_menu_target
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = entry.map(|e| TooltipMenuTarget {
-                candidate: candidate as usize,
-                text: e.text.clone(),
+            let idx = usize::try_from(candidate).ok();
+            let entry = idx.and_then(|i| page.get(i));
+            let consistent = entry.filter(|e| e.rendered.doc.fingerprint() == doc_fingerprint);
+            if entry.is_some() && consistent.is_none() {
+                debug!("悬停提示菜单：候选 #{candidate} 的气泡与 UI 所画不一致，只给截图");
+            }
+            consistent.zip(idx).map(|(e, i)| TooltipMenuTarget {
+                candidate: i,
+                entry: e.clone(),
                 hit,
-            });
-            tooltip_menu_items(entry, hit)
+            })
         };
+        let items = tooltip_menu_items(target.as_ref().map(|t| &t.entry), hit);
+        *self
+            .tooltip_menu_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = target;
         self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
@@ -163,15 +192,27 @@ impl Coordinator {
         });
     }
 
-    /// 执行悬停提示菜单的复制 / 上屏类命令。
+    /// 执行悬停提示菜单的复制 / 上屏类命令。放弃时 Toast 告知。
     pub(crate) fn tooltip_menu_action(&self, cmd: MenuCmd) {
-        let Some(value) = self.tooltip_menu_value(cmd) else {
+        let target = self
+            .tooltip_menu_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(target) = target else {
+            warn!("悬停提示菜单：没有可信的气泡快照，放弃 {cmd:?}");
+            self.tooltip_abandoned();
+            return;
+        };
+        let Some(value) = tooltip_value(&target.entry, target.hit, cmd) else {
+            debug!("悬停提示菜单：{cmd:?} 与命中位置 {:?} 对不上", target.hit);
             return;
         };
         match cmd {
             MenuCmd::TooltipCommitSection | MenuCmd::TooltipCommitLine => {
-                if let Some(act) = self.tooltip_commit_action(&value) {
-                    self.push_no_key_ctx_action(&act, true);
+                match self.tooltip_commit_action(&target, &value) {
+                    Some(act) => self.push_no_key_ctx_action(&act, true),
+                    None => self.tooltip_abandoned(),
                 }
             }
             _ => {
@@ -180,36 +221,38 @@ impl Coordinator {
         }
     }
 
-    /// 取菜单命令对应的原文；目标候选已变（或已不在本页）时放弃并记日志。
-    fn tooltip_menu_value(&self, cmd: MenuCmd) -> Option<String> {
-        let target = self
-            .tooltip_menu_target
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()?;
-        let page = self.tooltip_page.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = page.get(target.candidate).filter(|e| e.text == target.text) else {
-            // 不打候选原文：info 以上不记用户输入（见 AGENTS.md 日志规范）。
-            warn!(
-                "悬停提示菜单：候选 #{} 已在菜单打开期间变化，放弃 {cmd:?}",
-                target.candidate
-            );
-            return None;
-        };
-        let v = tooltip_value(entry, target.hit, cmd);
-        if v.is_none() {
-            debug!("悬停提示菜单：{cmd:?} 与命中位置 {:?} 对不上", target.hit);
-        }
-        v
+    fn tooltip_abandoned(&self) {
+        self.show_toast(ABANDONED_TOAST, ToastPosition::BottomRight, ToastKind::Info);
     }
 
     /// 上屏悬停提示里的一段文本：走「上屏任意文本并结束会话」同一出口，不记词频、
-    /// 不进联想（上屏的不是这个候选）。没有进行中的候选会话（菜单打开期间已上屏 / 取消）
-    /// 时放弃——那时组合已经没了，宿主里的光标位置不再是用户右键时的那个语境。
-    pub(crate) fn tooltip_commit_action(&self, text: &str) -> Option<KeyAction> {
+    /// 不进联想（上屏的不是这个候选）。
+    ///
+    /// 放弃（返回 `None`）的两种情形：会话已结束（菜单打开期间已上屏 / 取消——组合没了，
+    /// 宿主里的光标已不在用户右键时的语境）；目标候选原文已变（上屏会落在另一个候选的
+    /// 组合上）。
+    pub(crate) fn tooltip_commit_action(
+        &self,
+        target: &TooltipMenuTarget,
+        text: &str,
+    ) -> Option<KeyAction> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
             warn!("悬停提示菜单：候选会话已结束，放弃上屏");
+            return None;
+        }
+        let same = self
+            .tooltip_page
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(target.candidate)
+            .is_some_and(|e| e.text == target.entry.text);
+        if !same {
+            // 不打候选原文：info 以上不记用户输入（见 AGENTS.md 日志规范）。
+            warn!(
+                "悬停提示菜单：候选 #{} 已在菜单打开期间变化，放弃上屏",
+                target.candidate
+            );
             return None;
         }
         Some(self.commit_text_ending_session(&mut state, text))
@@ -273,8 +316,8 @@ mod tests {
         assert_eq!(labels(&tooltip_menu_items(Some(&e), None)), all, "内边距");
         assert_eq!(
             labels(&tooltip_menu_items(None, hit(0, None))),
-            all,
-            "缓存缺失"
+            ["截图此窗口"],
+            "没有可信快照（缓存缺失 / 与 UI 所画不一致）：不给任何取值项"
         );
         assert_eq!(
             labels(&tooltip_menu_items(Some(&e), hit(1, Some(1)))),
@@ -436,12 +479,183 @@ mod tests {
         }
     }
 
-    /// 上屏走「结束会话」出口：整段上屏、会话结束、不记词频。
+    /// 弹菜单（与 UI 一致的指纹）并取出菜单项标签。
+    fn open_menu(
+        c: &Coordinator,
+        rx: &Receiver<UiCommand>,
+        fp: u64,
+        h: Option<TooltipHit>,
+    ) -> Vec<String> {
+        let _ = drain(rx);
+        c.show_tooltip_menu(0, 0, 0, h, fp);
+        drain(rx)
+            .into_iter()
+            .find_map(|cmd| match cmd {
+                UiCommand::ShowCandidateMenu { items, .. } => {
+                    Some(items.into_iter().map(|i| i.label).collect())
+                }
+                _ => None,
+            })
+            .expect("应弹出菜单")
+    }
+
+    fn fp0(c: &Coordinator) -> u64 {
+        c.tooltip_page.lock().unwrap()[0].rendered.doc.fingerprint()
+    }
+
+    /// 把第 0 个候选的气泡换成「前面多一个 [编码] 段」的结构，候选原文不变——审查探针的
+    /// 现场：反查索引后台建好，同一个候选的气泡被重算。
+    fn prepend_code_section(c: &Coordinator) {
+        let mut page = c.tooltip_page.lock().unwrap();
+        let r = &mut page[0].rendered;
+        r.doc.sections.insert(
+            0,
+            wind_ui_types::TooltipSection {
+                title: Some("编码".into()),
+                inline: false,
+                lines: vec![TooltipLine {
+                    text: "wqvb".into(),
+                    raw: 0,
+                }],
+            },
+        );
+        r.raw.insert(0, vec!["wqvb".into()]);
+        r.per_char.insert(0, false);
+    }
+
+    fn copied(rx: &Receiver<UiCommand>) -> Vec<String> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                UiCommand::CopyTooltipText(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn toasts(rx: &Receiver<UiCommand>) -> Vec<String> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                UiCommand::ShowToast { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 审查探针，闸门一：UI 画的是旧结构、缓存已换成新结构（前面插了一段）⇒ 指纹不等，
+    /// 只给截图，不给任何取值项；此时硬点取值命令也只会放弃并 Toast。
     #[test]
-    fn commit_ends_session_without_learning() {
-        let Some((c, _rx, _u)) = typed("commit") else {
+    fn menu_degrades_when_ui_and_cache_disagree() {
+        let Some((c, rx, _u)) = typed("fp") else {
             return;
         };
+        let ui_fp = fp0(&c);
+        let ui_line = c.tooltip_page.lock().unwrap()[0]
+            .rendered
+            .raw
+            .last()
+            .cloned();
+        prepend_code_section(&c);
+        let items = open_menu(&c, &rx, ui_fp, hit(0, Some(0)));
+        assert_eq!(items, ["截图此窗口"]);
+        c.tooltip_menu_action(MenuCmd::TooltipCopyLine);
+        assert_eq!(toasts(&rx), [ABANDONED_TOAST]);
+        // 指纹一致时恢复完整菜单（对照：闸门不是一刀切）。
+        let items = open_menu(&c, &rx, fp0(&c), hit(0, Some(0)));
+        assert!(
+            items.contains(&"复制全部".to_string()),
+            "{items:?} / UI 行 {ui_line:?}"
+        );
+    }
+
+    /// 审查探针，闸门二：弹菜单时一致，菜单开着期间同一候选的结构变了 ⇒ 取值仍来自快照，
+    /// 「上屏此行」上屏的是用户点的那一行，而不是新结构同位置的 `wqvb`。
+    #[test]
+    fn action_takes_value_from_snapshot_not_from_refreshed_cache() {
+        let Some((c, rx, _u)) = typed("snap") else {
+            return;
+        };
+        let (sec, line, want) = {
+            let page = c.tooltip_page.lock().unwrap();
+            let r = &page[0].rendered;
+            let s = r
+                .per_char
+                .iter()
+                .position(|&p| p)
+                .expect("出厂有逐字的拼音段");
+            (s as u16, 0u16, r.raw[s][0].clone())
+        };
+        let cap = c.push_server.attach_capture_client(7);
+        let _ = open_menu(&c, &rx, fp0(&c), hit(sec, Some(line)));
+        prepend_code_section(&c);
+        c.tooltip_menu_action(MenuCmd::TooltipCommitLine);
+        let pushed: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert_eq!(
+            pushed.last(),
+            Some(&wind_ipc::codec::encode_commit_text(
+                &want, None, false, true, false
+            )),
+            "应上屏快照里的「{want}」"
+        );
+    }
+
+    /// 候选已变：复制照常（取快照），上屏放弃并 Toast。
+    #[test]
+    fn changed_candidate_still_copies_but_refuses_commit() {
+        let Some((c, rx, _u)) = typed("stale") else {
+            return;
+        };
+        let want = c.tooltip_page.lock().unwrap()[0].rendered.raw_plain_text();
+        let _ = open_menu(&c, &rx, fp0(&c), hit(0, None));
+        // 菜单开着时候选刷新（Esc 后重打 shi）：第 0 个候选不再是「你好」。
+        c.handle_key_event(&key(wind_keys::keymap::VK_ESCAPE));
+        for ch in "SHI".chars() {
+            c.handle_key_event(&key(ch as u32));
+        }
+        assert_ne!(c.tooltip_page.lock().unwrap()[0].text, "你好");
+        let _ = drain(&rx);
+        c.tooltip_menu_action(MenuCmd::TooltipCopy);
+        assert_eq!(copied(&rx), [want]);
+        let cap = c.push_server.attach_capture_client(9);
+        c.tooltip_menu_action(MenuCmd::TooltipCommitSection);
+        assert_eq!(cap.try_iter().count(), 0, "候选已变不得上屏");
+        assert_eq!(toasts(&rx), [ABANDONED_TOAST]);
+    }
+
+    /// 完整链路：菜单动作 → `commit_text_ending_session` → `push_no_key_ctx_action` → push。
+    /// 含换行的原文经与候选上屏同一道换行改写；会话结束、不进联想、不记词频、不喂造词。
+    #[test]
+    fn commit_goes_through_the_push_exit() {
+        let Some((c, rx, _u)) = typed("push") else {
+            return;
+        };
+        // 完整原文段（含换行）：真实的多行完整原文要长短语词条，这里直接放进缓存。
+        let full = "第一行\n第二行";
+        {
+            let mut page = c.tooltip_page.lock().unwrap();
+            let r = &mut page[0].rendered;
+            r.doc.sections.insert(
+                0,
+                wind_ui_types::TooltipSection {
+                    title: Some("完整原文".into()),
+                    inline: false,
+                    lines: vec![
+                        TooltipLine {
+                            text: "第一行".into(),
+                            raw: 0,
+                        },
+                        TooltipLine {
+                            text: "第二行".into(),
+                            raw: 1,
+                        },
+                    ],
+                },
+            );
+            r.raw
+                .insert(0, full.split('\n').map(str::to_string).collect());
+            r.per_char.insert(0, false);
+        }
         let store = c.store.clone().expect("指定了用户目录应开 store");
         let freq = || {
             store
@@ -450,41 +664,37 @@ mod tests {
                 .flatten()
                 .map(|r| r.count)
         };
-        let before = freq();
-        let act = c.tooltip_commit_action("nǐ hǎo");
-        match act {
-            Some(KeyAction::InsertText { ref text, .. }) => assert_eq!(text, "nǐ hǎo"),
-            other => panic!("应整段上屏，实际 {other:?}"),
-        }
-        assert_eq!(c.debug_candidate_count(), 0, "上屏后会话应结束");
-        assert_eq!(freq(), before, "上屏的不是候选，不该记词频");
-        assert!(c.tooltip_commit_action("x").is_none(), "会话已结束时放弃");
-    }
+        let freq_before = freq();
+        let writes_before = c
+            .auto_phrase_writes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let history_before = c.recent_commits.lock().unwrap().clone();
+        let cap = c.push_server.attach_capture_client(3);
 
-    /// 菜单打开期间候选变了：取值放弃；没变：照常取到原文。
-    #[test]
-    fn stale_target_is_abandoned() {
-        let Some((c, rx, _u)) = typed("stale") else {
-            return;
-        };
-        c.show_tooltip_menu(0, 0, 0, hit(0, Some(0)));
-        let items: Vec<String> = drain(&rx)
-            .into_iter()
-            .find_map(|cmd| match cmd {
-                UiCommand::ShowCandidateMenu { items, .. } => {
-                    Some(items.into_iter().map(|i| i.label).collect())
-                }
-                _ => None,
-            })
-            .expect("应弹出菜单");
-        assert!(items.contains(&"复制全部".to_string()));
-        assert!(c.tooltip_menu_value(MenuCmd::TooltipCopy).is_some());
-        // 菜单开着时候选刷新（Esc 后重打 shi）：第 0 个候选不再是「你好」。
-        c.handle_key_event(&key(wind_keys::keymap::VK_ESCAPE));
-        for ch in "SHI".chars() {
-            c.handle_key_event(&key(ch as u32));
-        }
-        assert_ne!(c.tooltip_page.lock().unwrap()[0].text, "你好");
-        assert!(c.tooltip_menu_value(MenuCmd::TooltipCopy).is_none());
+        let _ = open_menu(&c, &rx, fp0(&c), hit(0, None));
+        c.tooltip_menu_action(MenuCmd::TooltipCommitSection);
+
+        let expected = c.convert_commit_newline(full.to_string());
+        let pushed: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert_eq!(
+            pushed.last(),
+            Some(&wind_ipc::codec::encode_commit_text(
+                &expected, None, false, true, false
+            )),
+            "换行改写与候选上屏同一道（push_no_key_ctx_action）"
+        );
+        assert_eq!(c.debug_candidate_count(), 0, "会话结束，也没进联想");
+        assert_eq!(freq(), freq_before, "上屏的不是候选，不记词频");
+        assert_eq!(
+            c.auto_phrase_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            writes_before,
+            "不喂自动造词"
+        );
+        assert_eq!(*c.recent_commits.lock().unwrap(), history_before);
+        // 会话结束后再上屏：放弃并 Toast。
+        let _ = drain(&rx);
+        c.tooltip_menu_action(MenuCmd::TooltipCommitSection);
+        assert_eq!(toasts(&rx), [ABANDONED_TOAST]);
     }
 }

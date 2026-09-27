@@ -6561,7 +6561,8 @@ impl Coordinator {
                 y,
                 candidate,
                 hit,
-            } => self.show_tooltip_menu(x, y, candidate, hit),
+                doc_fingerprint,
+            } => self.show_tooltip_menu(x, y, candidate, hit, doc_fingerprint),
             UiEvent::RequestInputDiagMenu { x, y } => self.show_input_diag_menu(x, y),
             UiEvent::SystemThemeChanged => self.on_system_theme_changed(),
             UiEvent::CandidateFlipped(v) => self

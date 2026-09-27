@@ -279,18 +279,32 @@ impl CompiledTooltip {
     ///   从中间折开会把第二列甩到下一行行首。变量值带进来的 `\t` 只是内容，照常折。
     /// - `first_offset`：第一条显示行已被占掉的宽度（inline 段的 `标题: `）。
     fn display_lines(&self, raw: &str, columns: bool, first_offset: usize) -> Vec<String> {
-        let line = if self.max_chars > 0 && raw.graphemes(true).count() > self.max_chars {
-            let head: String = raw.graphemes(true).take(self.max_chars).collect();
-            format!("{head}{TRUNCATION_MARK}")
-        } else {
-            raw.to_string()
-        };
-        let lines = if self.wrap_width == 0 || (columns && line.contains('\t')) {
-            vec![line]
-        } else {
-            wrap(&line, self.wrap_width, first_offset)
-        };
-        lines.into_iter().filter(|l| !l.trim().is_empty()).collect()
+        // DirectWrite 除 `\n` 外还在 `\r`、U+0085、U+2028、U+2029 处断行。不先归一，这些字符
+        // 会在渲染时多折出行来，而行数是命中换算的前提（每行等高、按 `\n` 计行）——点第 3 行
+        // 会命中第 2 行。只改显示行；原始行（复制 / 上屏的取值）保留原字符。
+        let normalized = raw
+            .replace("\r\n", "\n")
+            .replace(['\r', '\u{85}', '\u{2028}', '\u{2029}'], "\n");
+        let mut out = Vec::new();
+        for (i, part) in normalized.split('\n').enumerate() {
+            let line = if self.max_chars > 0 && part.graphemes(true).count() > self.max_chars {
+                let head: String = part.graphemes(true).take(self.max_chars).collect();
+                format!("{head}{TRUNCATION_MARK}")
+            } else {
+                part.to_string()
+            };
+            if self.wrap_width == 0 || (columns && line.contains('\t')) {
+                out.push(line);
+            } else {
+                out.extend(wrap(
+                    &line,
+                    self.wrap_width,
+                    if i == 0 { first_offset } else { 0 },
+                ));
+            }
+        }
+        out.retain(|l| !l.trim().is_empty());
+        out
     }
 }
 
@@ -1216,6 +1230,21 @@ mod tests {
         let r = render_limited(&t, &truncated("a…", "ab\ncd"));
         assert!(!r.doc.sections[0].inline, "两条原始行就不 inline");
         assert_eq!(r.doc.to_plain_text(), "[码]\nab\ncd");
+    }
+
+    /// DirectWrite 认作断行的 `\r`、U+0085、U+2028、U+2029 在显示行里归一成换行（否则渲染
+    /// 多出的行会让命中换算错位）；原始行保留原字符。
+    #[test]
+    fn exotic_line_breaks_are_normalized_for_display_only() {
+        let t = limited(0, 0, &[section("", "", "${full_text}")]);
+        let full = "a\rb\u{85}c\u{2028}d\u{2029}e\r\nf";
+        let r = render_limited(&t, &truncated("a…", full));
+        assert_eq!(
+            texts(&r, 0),
+            [("a", 0), ("b", 0), ("c", 0), ("d", 0), ("e", 0), ("f", 1)]
+        );
+        assert_eq!(r.raw[0], ["a\rb\u{85}c\u{2028}d\u{2029}e\r", "f"]);
+        assert_eq!(r.raw[0].join("\n"), full);
     }
 
     /// 截断标记与候选窗同源：拿 `truncate_display` 的真实产物喂进来，逐字段不为 … 出行。

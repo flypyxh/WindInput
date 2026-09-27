@@ -230,7 +230,7 @@ pub struct TooltipLine {
 气泡由「标题行 + 内容行」逐行排布。`WM_RBUTTONDOWN` 时用客户区坐标换算出 `(section, line)`：
 
 ```rust
-UiEvent::RequestTooltipMenu { x, y, candidate: i32, hit: Option<TooltipHit> }
+UiEvent::RequestTooltipMenu { x, y, candidate: i32, hit: Option<TooltipHit>, doc_fingerprint: u64 }
 pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在标题行 raw_line = None
 ```
 
@@ -242,6 +242,12 @@ pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在�
   未必还指着那个候选，故由显示气泡的 UI 一方带上。
 - 点在内边距（文本块外） ⇒ `hit = None`，菜单只有「复制全部 · 截图此窗口」。段与段之间
   没有空白行，不存在「段间空白」。
+- **`doc_fingerprint`**：UI 所画 `TooltipDoc` 的指纹。同一候选的气泡可能在菜单弹出前被重算
+  （反查索引后台建好，前面多出 `[编码]` 段），命中是按 UI 所见换算的，段下标会错位。协调器
+  与缓存条目指纹比对，不等则菜单只剩「截图此窗口」——「复制全部」也不给，因为协调器手里
+  只有缓存那一份，复制它等于复制用户没看见的内容。
+- 显示行生成时把 `\r`、U+0085、U+2028、U+2029 归一成换行（DirectWrite 在这些字符处也断行，
+  不归一则渲染行数与按 `\n` 计的行数不符，命中错位）；原始行保留原字符。
 
 ### 7.2 菜单
 
@@ -268,8 +274,9 @@ pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在�
   已确认前缀连同该文本一并上屏、结束会话（清组合、退候选），经 push 管道投递。
 - **不计词频、不触发造词/联想**：用户选的是提示里的一段信息，不是这个候选。该出口不写
   词频；自动造词的投喂挂在按键出口，push 投递不经过它。
-- 执行前校验悬停目标仍是弹菜单时那个候选（按页缓存里的候选文本比对）；不一致则放弃并
-  记日志（warn，不含候选原文）。候选会话已结束（菜单打开期间已上屏 / 取消）时上屏也放弃。
+- 弹菜单时把整份缓存条目存成快照（`TooltipMenuTarget::entry`），菜单标签与取值都来自它。
+  复制只看快照，候选变了照样复制；上屏还要核对：会话已结束，或页缓存里该位置的候选原文
+  已变，就放弃。放弃时 Toast「候选已变化，未执行」并记 warn（不含候选原文）。
 
 ### 7.5 平台覆盖
 

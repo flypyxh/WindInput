@@ -22,13 +22,13 @@ pub struct CandidateItem {
 /// [`Self::to_plain_text`] 画出整块文本，右键时用 [`Self::hit_at_line`] 把点中的那一行
 /// 换算回 `(段, 原始行)`。只下发**显示行**；原始行（复制 / 上屏的取值）留在协调器。
 /// 设计见 `docs/design/candidate-tooltip-sections.md` §6、§7。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct TooltipDoc {
     pub sections: Vec<TooltipSection>,
 }
 
 /// 气泡的一段。只有非空段才会进 [`TooltipDoc`]。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TooltipSection {
     /// 已求值的段名；`None` = 无标题行。
     pub title: Option<String>,
@@ -42,7 +42,7 @@ pub struct TooltipSection {
 }
 
 /// 气泡的一条显示行。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TooltipLine {
     pub text: String,
     /// 所属原始行在本段中的下标。现在一条原始行恰对应一条显示行；将来单行截断 / 折行
@@ -61,6 +61,18 @@ pub struct TooltipHit {
 impl TooltipDoc {
     pub fn is_empty(&self) -> bool {
         self.sections.is_empty()
+    }
+
+    /// 内容指纹。右键时 UI 带上它，协调器据此核对「UI 画的」与「缓存里的」是不是同一份：
+    /// 同一个候选的气泡可能在菜单弹出前刷新过（如反查索引后台建好，前面多出一段），
+    /// 段下标一错位，「上屏此行」就会取到别的段。
+    ///
+    /// `DefaultHasher::new()` 的键是固定的，同一进程内结果稳定——UI 与协调器同进程，够用。
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
     }
 
     /// 纯文本的逐行形态，每行带上它命中的位置。[`Self::to_plain_text`] 与
@@ -170,5 +182,16 @@ mod tests {
         );
         assert_eq!(doc.hit_at_line(6), None);
         assert_eq!(doc.to_plain_text().lines().count(), 6);
+    }
+
+    #[test]
+    fn fingerprint_tracks_content() {
+        let a = TooltipDoc {
+            sections: vec![sec(Some("拼音"), false, &["你：nǐ"])],
+        };
+        let mut b = a.clone();
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        b.sections.insert(0, sec(Some("编码"), false, &["wqvb"]));
+        assert_ne!(a.fingerprint(), b.fingerprint(), "前面插入一段即不同");
     }
 }

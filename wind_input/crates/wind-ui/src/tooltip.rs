@@ -155,6 +155,7 @@ impl WindowMouse for TooltipMouse {
                     y: sy,
                     candidate: hits.candidate,
                     hit,
+                    doc_fingerprint: hits.doc.fingerprint(),
                 });
                 None
             }
@@ -667,21 +668,43 @@ mod tests {
         Tooltip::new(tx).expect("创建气泡窗口（非 Windows 下是内存桩）")
     }
 
-    /// ★ 外观零回归：气泡画的仍是一个叶节点、同一串文本。同一份内容以 `TooltipDoc` 下发与
-    /// 以旧的纯文本下发，渲染出的尺寸与像素逐字节相同。
+    /// ★ 外观零回归的约束在「画的是同一串文本」：渲染路径没改（仍是 `render_to_bgra(&str)`
+    /// 画一个叶节点），故只要 `TooltipDoc` 扁平化出的文本与旧版逐字节相同，像素就相同。
+    /// 像素本身不在这里比——同一串文本自己比自己证明不了任何事。
     #[test]
-    fn doc_renders_exactly_like_the_legacy_string() {
+    fn doc_flattens_to_the_legacy_string() {
         let legacy = "[完整原文]\n一二三四五\n六七\n[拼音]\n你：nǐ\n好：hǎo/hào";
         assert_eq!(doc().to_plain_text(), legacy);
-        let mut a = tooltip();
-        let mut b = tooltip();
-        let text = a.set_doc(&doc(), 0);
-        let from_doc = a.render_to_bgra(&text);
-        let from_str = b.render_to_bgra(legacy);
-        assert_eq!(from_doc, from_str);
+    }
+
+    /// 命中换算「按行数均分」的前提：多行文本的高度 = 行数 × 单行高度，含 CJK 与 emoji 行
+    /// （渲染器行距钉成 UNIFORM，回退字体再高也不撑高行框）。只有真 DirectWrite 能验证；
+    /// mock 后端的高度本就是按行数算的。
+    #[cfg(windows)]
+    #[test]
+    fn multiline_height_is_lines_times_line_height() {
+        let r = TextRenderer::new("Microsoft YaHei UI", FONT_PX).expect("DirectWrite");
+        let one = r.measure_text("A").height;
+        for text in [
+            "A\n你好\n😀",
+            "😀\nA",
+            "你\n好\n吗\n👨\u{200D}👩\u{200D}👧",
+            "[拼音]\n你：nǐ\n好：hǎo/hào",
+        ] {
+            let n = text.split('\n').count() as f32;
+            let h = r.measure_text(text).height;
+            assert!(
+                (h - one * n).abs() < 0.5,
+                "{text:?}: 高 {h}，应为 {n} × {one}"
+            );
+        }
     }
 
     /// 命中换算：标题行 / 内容行 / 折行后的第二条显示行 / 内边距。
+    ///
+    /// 在非 Windows（mock 渲染器）下只验证换算的算术：矩形、按行均分、行号到 `(段, 原始行)`
+    /// 的映射。「每行真的等高」由上面的 `multiline_height_is_lines_times_line_height` 在
+    /// Windows 上兜底。
     #[test]
     fn hit_maps_client_point_to_section_and_raw_line() {
         let mut t = tooltip();
