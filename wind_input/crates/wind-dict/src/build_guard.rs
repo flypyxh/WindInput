@@ -17,11 +17,20 @@
 //! - 标记的持有者**仍然活着** → 那是别的进程/线程正在建，不是死亡，**不计数**、照常放行
 //!   （各自构建，最后写入者生效）。只有持有者已死，它那次登记才算一次失败。
 //!   持有者身份 = pid + 进程启动时间（防 pid 复用）；判活失败时保守当作活着——
-//!   宁可少退避一次，也不能把并发的在建构建误判成死亡而让词库不可用；
+//!   宁可少退避一次，也不能把并发的在建构建误判成死亡而让词库不可用。
+//!   启动时间取不到的平台（Linux / Windows / macOS 以外）写 `pid 0`，读端见 0 一律当活着；
+//!   只有旧格式（无持有者行）才当已死；
 //! - 输入键不同（源文件变了）→ 计数归零，重新尝试；
 //! - 手动删掉标记文件 → 重新尝试。
 //!
 //! 允许一次重试，是因为内存不足常是瞬时的（当时开着别的大程序）。
+//!
+//! # 已知的偏保守取舍
+//!
+//! - 标记只有一个持有者行：活着的持有者被后来者覆盖后，若前者随后死在构建里，这次死亡
+//!   不会被记上（少记一次）。代价只是多重试一次，换来的是不必维护持有者列表。
+//! - Linux 判活看 `/proc/<pid>/stat`：已退出但尚未被父进程回收的**僵尸进程**仍在那里、
+//!   启动时间也对得上，会被当成活着，直到被回收。同样只会少记一次死亡。
 
 use std::path::{Path, PathBuf};
 
@@ -42,16 +51,20 @@ struct Holder {
 }
 
 impl Holder {
-    fn current() -> Option<Holder> {
+    /// 取不到启动时间时记 `start = 0`（＝判不了），读端据此当活着。
+    fn current() -> Holder {
         let pid = std::process::id();
-        Some(Holder {
+        Holder {
             pid,
-            start: process_start_time(pid)?,
-        })
+            start: process_start_time(pid).unwrap_or(0),
+        }
     }
 
     /// 持有者是否仍在运行。**判不了就当活着**（见模块文档）。
     fn is_alive(self) -> bool {
+        if self.start == 0 {
+            return true;
+        }
         match process_start_time(self.pid) {
             Some(start) => start == self.start,
             None => !process_definitely_gone(self.pid),
@@ -99,7 +112,27 @@ fn process_start_time(pid: u32) -> Option<u64> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: 缓冲区即 info 本身，长度如实传入；只读查询。
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }
@@ -128,13 +161,20 @@ fn process_definitely_gone(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+fn process_definitely_gone(pid: u32) -> bool {
+    // SAFETY: 信号 0 只做存在性检查，不投递任何信号。
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn process_definitely_gone(_pid: u32) -> bool {
     false
 }
 
 /// 盘上的标记。`count` 是已登记的尝试次数（**含**持有者自己那次）；
-/// `holder` 缺失（旧格式或取不到身份）当作已死。
+/// `holder` 缺失（旧格式）当作已死；持有者 `start == 0` 表示写端判不了，当作活着。
 struct Marker {
     key: String,
     count: u32,
@@ -243,9 +283,8 @@ pub fn begin(cache: &Path, key: &str) -> Gate {
     if let Some(dir) = marker.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let holder = Holder::current()
-        .map(|h| format!("{} {}\n", h.pid, h.start))
-        .unwrap_or_default();
+    let h = Holder::current();
+    let holder = format!("{} {}\n", h.pid, h.start);
     if let Err(e) = std::fs::write(&marker, format!("{key}\n{}\n{holder}", prev + 1)) {
         tracing::warn!(
             "无法写入构建标记 {}: {e}。若本次构建因内存不足崩溃，下次启动无法识别、会再次重试。",
@@ -396,9 +435,23 @@ mod tests {
         assert!(matches!(begin(&cache, "k1"), Gate::Skip { .. }));
     }
 
+    /// 写端判不了启动时间（未知平台）时记 `pid 0`：读端须当作活着、不计数，
+    /// 否则这些平台上并发的在建构建会被当成死亡（审查 H1 复现）。
+    #[test]
+    fn holder_with_unknown_start_counts_as_alive() {
+        let (_d, cache) = cache_in("unknown_start");
+        std::fs::write(
+            marker_path(&cache),
+            format!("k1\n{MAX_ATTEMPTS}\n{} 0\n", dead_pid()),
+        )
+        .unwrap();
+        proceed(begin(&cache, "k1")).finish();
+    }
+
     #[test]
     fn current_process_is_alive_and_dead_child_is_not() {
-        let me = Holder::current().expect("本平台应能取到自身身份");
+        let me = Holder::current();
+        assert_ne!(me.start, 0, "Linux / Windows / macOS 应能取到自身启动时间");
         assert!(me.is_alive());
         assert!(
             !Holder {
