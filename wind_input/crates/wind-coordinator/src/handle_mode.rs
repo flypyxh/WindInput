@@ -1850,6 +1850,7 @@ impl Coordinator {
         // 注释库**刻意不在此同步**：挂载集合与方案无关（`schemas` 白名单已下移到
         // `comment_of` 的查询期求值），切方案不改变该挂载什么。见 `sync_comment_dicts`。
         self.invalidate_aux_code_table(); // 辅助码表各方案不同，切方案必须重挂（见函数注释）
+        self.warm_aux_code_sources(); // 新方案的辅助码来源方案后台预热（门卫要求索引已就绪）
         // ── 归位到「能用新方案打字」的状态：无条件，不受任何配置门控 ──────────────
         //
         // 切方案的语义前提就是「我要用这个方案打字」，而英文半角与 CapsLock 开启这两种

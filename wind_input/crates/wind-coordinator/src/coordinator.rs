@@ -4066,6 +4066,9 @@ impl Coordinator {
                     // 表现：用户在设置页打开自动造词后，最先打的那几个词被静默吞掉，
                     // 大词库上（真机 253 万条实测秒级构建）能吞掉一整句。
                     //
+                    // 辅助码引用的方案来源也在 `prewarm_indexes` 里（在用集合只随 `schema` 段与
+                    // `input.temp_pinyin` 变，二者都会标脏，故不必在非脏分支另补）。
+                    //
                     // ⚠️ 必须后台：`prewarm_indexes` 阻塞秒级，而本函数是设置页 RPC 调过来的。
                     // 与启动线程、测试、移动端 prepare() 共用同一个 `prewarm_indexes`。
                     if let Some(weak) = self.self_weak.get().cloned() {
@@ -4301,6 +4304,15 @@ impl Coordinator {
                 debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
             }
         }
+        // 辅助码引用的码表方案（`schema:<id>`，含临拼目标方案引用的）：进入辅助码的门卫
+        // 要求其反查索引已就绪、按键线程绝不现建——不预热的话每次启动后第一次按辅助码键
+        // 都静默不进。辅助码关着时集合为空，不白建。
+        for id in self.engine_mgr.aux_code_schemas_in_use() {
+            let t0 = std::time::Instant::now();
+            if self.engine_mgr.prewarm_reverse_index(&id) {
+                debug!("预热辅助码来源反查索引 {} 用时 {:?}", id, t0.elapsed());
+            }
+        }
         // 词语联想的用户词 / 临时词文本索引（t185）：联想开着才建——它要扫整张用户词表，
         // 关着联想的用户不该付这笔。没预热也不致命：首次联想会起后台重建，那一次只出系统词。
         if self.assoc_config().kind != wind_assoc::AssocKind::Off {
@@ -4321,6 +4333,20 @@ impl Coordinator {
                     debug!("预热单字全码表 {} 用时 {:?}", sid, t0.elapsed());
                 }
             }
+        }
+    }
+
+    /// 后台预热辅助码在用的方案来源（见 [`EngineManager::aux_code_schemas_in_use`]）。
+    ///
+    /// 切方案、保存 / 重置方案设置（`refresh_schema_derived_config`）之后调：这些操作会换掉
+    /// 「在用」集合或让反查索引失效，不补一次预热，下一次按辅助码键就会因索引未就绪而静默
+    /// 不进。全局配置重载走 `reload_user_config` 里那次 [`Self::prewarm_indexes`]，已含本集合。
+    /// 只派活不等（`spawn_index_warm` 自带去重与延迟提示），可在 RPC / 切方案路径上调。
+    ///
+    /// [`EngineManager::aux_code_schemas_in_use`]: wind_engine::EngineManager::aux_code_schemas_in_use
+    pub(crate) fn warm_aux_code_sources(&self) {
+        for id in self.engine_mgr.aux_code_schemas_in_use() {
+            self.spawn_index_warm(&id, false);
         }
     }
 

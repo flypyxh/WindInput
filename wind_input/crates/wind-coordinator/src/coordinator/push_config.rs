@@ -280,6 +280,9 @@ impl Coordinator {
     /// 定向推给活跃客户端（理由见那边 ★★ 注释：广播会污染 hostRenderAvail 位）。
     pub(crate) fn refresh_schema_derived_config(&self) {
         self.refresh_config_in_memory(|_| {});
+        // 方案设置可能改了 `[engine.aux_code].files`（换了引用的码表方案），新来源的反查索引
+        // 要提前在后台建好，否则下一次按辅助码键静默不进。
+        self.warm_aux_code_sources();
         self.push_custom_en_punct_config(0);
         self.push_cn_passthrough_punct_config(0);
         self.push_en_passthrough_punct_config(0);

@@ -253,7 +253,18 @@ impl Coordinator {
         state.candidates = match rt {
             Some(rt) => {
                 let lookup = rt.lookup(&self.engine_mgr);
-                overlay.session.apply(&lookup, &overlay.filter_options)
+                let unready = lookup.unready_schemas();
+                if unready.is_empty() {
+                    overlay.session.apply(&lookup, &overlay.filter_options)
+                } else {
+                    // 会话中途方案来源的反查索引被清掉：只剩用户层可比会把候选滤到几乎全空。
+                    // 本次原样放行、派后台重建（建好后下一个码即恢复筛选），与进入门卫同策略。
+                    for id in unready {
+                        self.spawn_index_warm(id, false);
+                    }
+                    debug!("aux_code: 方案来源索引会话中失效，本次不筛选");
+                    overlay.session.restore_original()
+                }
             }
             None => overlay.session.restore_original(),
         };
@@ -1885,11 +1896,32 @@ mod tests {
         format!("zz_ax_{tag}_{}", std::process::id())
     }
 
+    /// 用例结束（含 panic）时清掉夹具目录与码表方案在共享缓存根下的产物（`<cache>/<id>/`）。
+    /// id 带进程号，不清的话每跑一次就在真实缓存目录里多留一个 `zz_ax_*`，无上限增长。
+    struct Cleanup {
+        id: String,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(cache) = Config::cache_dir() {
+                let _ = std::fs::remove_dir_all(cache.join(&self.id));
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// pinyin 方案的 `files` 由调用方给（TOML 数组字面量），并带上 `wbx_id` 方案与 `flypy_test.txt`。
-    fn data_dir_with_files(tag: &str, files: &str, wbx_id: &str) -> std::path::PathBuf {
+    /// 返回的 [`Cleanup`] 要一直持有到用例结束。
+    fn data_dir_with_files(tag: &str, files: &str, wbx_id: &str) -> (std::path::PathBuf, Cleanup) {
         let dir =
             std::env::temp_dir().join(format!("wind_aux_code_src_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let guard = Cleanup {
+            id: wbx_id.to_string(),
+            dir: dir.clone(),
+        };
         let schemas = dir.join("schemas");
         std::fs::create_dir_all(schemas.join("aux_code")).unwrap();
         std::fs::write(
@@ -1908,7 +1940,7 @@ mod tests {
         .unwrap();
         std::fs::write(schemas.join("aux_code/other.txt"), "李=qq\n樱=qq\n河=qq\n").unwrap();
         write_wbx(&schemas, wbx_id);
-        dir
+        (dir, guard)
     }
 
     fn seed<'a>(
@@ -1934,7 +1966,7 @@ mod tests {
     fn schema_source_filters_by_codetable_codes() {
         let id = wbx_id("schema");
         let files = format!(r#"["schema:{id}", "aux_code/flypy_test.txt"]"#);
-        let dir = data_dir_with_files("schema", &files, &id);
+        let (dir, _g) = data_dir_with_files("schema", &files, &id);
         let c = coord_with_data("schema_src", dir);
         c.engine_mgr.prewarm_text_codes(&id);
         let mut st = seed(&c, &["工", "攻", "公", "河"]);
@@ -1951,7 +1983,7 @@ mod tests {
     fn schema_source_includes_user_words() {
         let id = wbx_id("user");
         let files = format!(r#"["schema:{id}"]"#);
-        let dir = data_dir_with_files("user", &files, &id);
+        let (dir, _g) = data_dir_with_files("user", &files, &id);
         let c = coord_with_data("schema_user", dir);
         c.store
             .as_ref()
@@ -1960,7 +1992,7 @@ mod tests {
             .unwrap();
         c.engine_mgr.prewarm_text_codes(&id);
         let mut st = seed(&c, &["工", "嗨"]);
-        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
         let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('Z'), 0));
         assert_eq!(kept(&st), vec!["嗨"]);
     }
@@ -1970,19 +2002,22 @@ mod tests {
     fn schema_source_not_ready_does_not_enter() {
         let id = wbx_id("cold");
         let files = format!(r#"["schema:{id}"]"#);
-        let dir = data_dir_with_files("cold", &files, &id);
+        let (dir, _g) = data_dir_with_files("cold", &files, &id);
         let c = coord_with_data("schema_cold", dir);
         let mut st = seed(&c, &["工", "攻"]);
         assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_none());
         assert_eq!(st.active, None);
         assert_eq!(kept(&st), vec!["工", "攻"], "候选原封不动");
+        drop(st);
+        // 门卫派出的后台构建建好后，下一次按键即可进入；等它落盘完，Cleanup 才清得干净。
+        wait_index_ready(&c, &id);
     }
 
     /// ★ 改了来源（override 层换 files）不切方案也要生效——此前缓存只在切方案时清。
     #[test]
     fn source_change_takes_effect_without_schema_switch() {
         let id = wbx_id("ovr");
-        let dir = data_dir_with_files("ovr", r#"["aux_code/flypy_test.txt"]"#, &id);
+        let (dir, _g) = data_dir_with_files("ovr", r#"["aux_code/flypy_test.txt"]"#, &id);
         let ov = dir.join("overrides");
         std::fs::create_dir_all(&ov).unwrap();
         let path =
@@ -1994,7 +2029,7 @@ mod tests {
         let c =
             Coordinator::new_headless_with_store_override(cfg, Some(&dir), store, Some(ov.clone()));
         let mut st = seed(&c, &["李", "樱", "河"]);
-        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
         let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('M'), 0));
         assert_eq!(kept(&st), vec!["李", "樱"]);
         let _ = c.handle_aux_code_key(&mut st, &key(keymap::VK_ESCAPE, 0));
@@ -2003,8 +2038,88 @@ mod tests {
             "[engine.aux_code]\nfiles = [\"aux_code/other.txt\"]\n",
         )
         .unwrap();
-        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
         let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('Q'), 0));
         assert_eq!(kept(&st), vec!["李", "樱", "河"], "新来源 other.txt 生效");
+    }
+
+    /// 轮询到该方案的反查索引建好（上限 5 秒）。
+    fn wait_index_ready(c: &Coordinator, id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while c.engine_mgr.reverse_index_if_ready(id).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "反查索引 5 秒内没有建好"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// ★ 会话中途方案来源的反查索引被清掉（改方案设置 / 词库启用集变更都会整表清）：
+    /// 本次原样放行、后台重建，而不是只拿用户层去比、把候选滤到几乎全空。
+    #[test]
+    fn schema_layer_lost_mid_session_passes_through_and_rebuilds() {
+        let id = wbx_id("lost");
+        let files = format!(r#"["schema:{id}"]"#);
+        let (dir, _g) = data_dir_with_files("lost", &files, &id);
+        let c = coord_with_data("schema_lost", dir);
+        c.engine_mgr.prewarm_text_codes(&id);
+        let mut st = seed(&c, &["工", "攻", "公", "河"]);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('A'), 0));
+        assert_eq!(kept(&st), vec!["工", "攻"]);
+        c.engine_mgr.invalidate_schema(&id);
+        assert!(c.engine_mgr.reverse_index_if_ready(&id).is_none());
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('T'), 0));
+        assert_eq!(
+            kept(&st),
+            vec!["工", "攻", "公", "河"],
+            "系统层没了：原样放行，不拿用户层单独筛"
+        );
+        drop(st);
+        // 派出的后台重建真的把索引建回来了（也保证 Cleanup 之后不再有线程往缓存目录写）。
+        wait_index_ready(&c, &id);
+    }
+
+    /// ★ 启动预热覆盖辅助码引用的方案：否则每次启动后第一次按辅助码键都静默不进。
+    #[test]
+    fn prewarm_indexes_covers_aux_schema_sources() {
+        let id = wbx_id("warm");
+        let files = format!(r#"["schema:{id}"]"#);
+        let (dir, _g) = data_dir_with_files("warm", &files, &id);
+        let c = coord_with_data("schema_warm", dir);
+        assert!(c.engine_mgr.reverse_index_if_ready(&id).is_none());
+        c.prewarm_indexes();
+        assert!(c.engine_mgr.reverse_index_if_ready(&id).is_some());
+        let mut st = seed(&c, &["工", "攻"]);
+        assert!(
+            c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some(),
+            "预热后第一次按键即可进入"
+        );
+    }
+
+    /// 相邻的文件来源合成一层（wind-aux-code 的「多表坍缩成单表」），只有方案来源各占一层；
+    /// 被方案来源隔开的文件段各自合并，清单顺序即优先级不变。
+    #[test]
+    fn adjacent_file_sources_collapse_into_one_layer() {
+        let id = wbx_id("merge");
+        let files = format!(
+            r#"["aux_code/flypy_test.txt", "aux_code/other.txt", "schema:{id}", "aux_code/other.txt"]"#
+        );
+        let (dir, _g) = data_dir_with_files("merge", &files, &id);
+        let c = coord_with_data("schema_merge", dir);
+        let settings = c.engine_mgr.aux_code_settings();
+        assert_eq!(settings.sources.len(), 4);
+        let rt = c.ensure_aux_code_runtime(&settings.sources);
+        assert_eq!(rt.layer_count(), 3, "文件段 + 方案 + 文件段");
+        c.engine_mgr.prewarm_text_codes(&id);
+        let mut st = seed(&c, &["李", "樱", "河", "工"]);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('Q'), 0));
+        assert_eq!(
+            kept(&st),
+            vec!["李", "樱", "河"],
+            "合并层里低优表的码同样生效"
+        );
     }
 }

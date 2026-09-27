@@ -1,8 +1,10 @@
 //! 辅助码的运行时来源：`[engine.aux_code].files` 按序解析出的各层，查询时顺序拼接。
 //!
-//! 不预先合并成一张表：方案来源的码来自「系统词库 + 用户词库」，用户层会随造词后台重建，
-//! 只能在每次筛选时取当下的视图（`EngineManager::text_codes`）。文件来源仍是进来时读一次的
-//! 静态表。设计见 `docs/design/aux-code-schema-source.md` §4、§5。
+//! 方案来源不能预先合并成一张表：它的码来自「系统词库 + 用户词库」，用户层会随造词后台
+//! 重建，只能在每次筛选时取当下的视图（`EngineManager::text_codes`）。文件来源仍是进来时读
+//! 一次的静态表，且**相邻的文件来源照 wind-aux-code 的规矩 `merge` 坍缩成一张**——只有方案
+//! 来源各占一层，层数 = 方案来源数 + 被它们隔开的文件段数。设计见
+//! `docs/design/aux-code-schema-source.md` §4、§5。
 
 use wind_aux_code::{AuxCodeLookup, AuxCodeTable};
 use wind_engine::{AuxSource, EngineManager, TextCodeView};
@@ -22,31 +24,50 @@ enum Layer {
 
 impl AuxCodeRuntime {
     /// 文件来源同步读（码表小，与改动前同一时机）；方案来源只记 id，数据在查询时取。
+    ///
+    /// 相邻的文件来源 `merge` 成一张表（`load_merged`：先出现 = 高优、跨表同码去重），
+    /// 被方案来源隔开的各段分别合并——保持「清单顺序即优先级」不变。
     pub(crate) fn build(sources: &[AuxSource], engine: &EngineManager) -> Self {
         let mut name = String::new();
-        let layers = sources
-            .iter()
-            .map(|s| match s {
-                AuxSource::File(p) => {
-                    let t = wind_aux_code::load_from_file(p);
-                    if name.is_empty() {
-                        name = t.name.clone();
-                    }
-                    Layer::Table(t)
+        let mut layers = Vec::new();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        // 把攒着的一段相邻文件来源合成一层。名字取首个非空，与 `merge` 的取名规则同序。
+        let flush =
+            |files: &mut Vec<std::path::PathBuf>, layers: &mut Vec<Layer>, name: &mut String| {
+                if files.is_empty() {
+                    return;
                 }
+                let t = wind_aux_code::load_merged(files);
+                files.clear();
+                if name.is_empty() {
+                    *name = t.name.clone();
+                }
+                layers.push(Layer::Table(t));
+            };
+        for s in sources {
+            match s {
+                AuxSource::File(p) => files.push(p.clone()),
                 AuxSource::Schema(id) => {
+                    flush(&mut files, &mut layers, &mut name);
                     if name.is_empty() {
                         name = engine.schema_name(id);
                     }
-                    Layer::Schema(id.clone())
+                    layers.push(Layer::Schema(id.clone()));
                 }
-            })
-            .collect();
+            }
+        }
+        flush(&mut files, &mut layers, &mut name);
         Self {
             key: sources.to_vec(),
             name,
             layers,
         }
+    }
+
+    /// 层数（文件段合并后）。
+    #[cfg(test)]
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
     }
 
     pub(crate) fn matches(&self, sources: &[AuxSource]) -> bool {
@@ -72,7 +93,7 @@ impl AuxCodeRuntime {
                 .iter()
                 .map(|l| match l {
                     Layer::Table(t) => Now::Table(t),
-                    Layer::Schema(id) => Now::View(engine.text_codes(id)),
+                    Layer::Schema(id) => Now::View(id, engine.text_codes(id)),
                 })
                 .collect(),
         }
@@ -85,7 +106,24 @@ pub(crate) struct AuxLookupNow<'a> {
 
 enum Now<'a> {
     Table(&'a AuxCodeTable),
-    View(TextCodeView),
+    View(&'a str, TextCodeView),
+}
+
+impl AuxLookupNow<'_> {
+    /// 系统层（反查索引）没就绪的方案来源。
+    ///
+    /// 进入时门卫已要求它们就绪，但会话中途索引可能被清掉（改了方案设置、词库启用集变了、
+    /// 主码表重载都会整表清空反查索引）。这时只剩用户层的码可比，几乎所有候选都会被滤掉
+    /// ——调用方据此把本次当「未就绪」处理：原样放行 + 后台重建。
+    pub(crate) fn unready_schemas(&self) -> Vec<&str> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Now::View(id, v) if !v.system_ready() => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl AuxCodeLookup for AuxLookupNow<'_> {
@@ -94,14 +132,14 @@ impl AuxCodeLookup for AuxLookupNow<'_> {
         let text: &str = ch.encode_utf8(&mut buf);
         self.layers.iter().any(|l| match l {
             Now::Table(t) => t.any_code(ch, pred),
-            Now::View(v) => v.any_code(text, pred),
+            Now::View(_, v) => v.any_code(text, pred),
         })
     }
 
     fn is_empty(&self) -> bool {
         self.layers.iter().all(|l| match l {
             Now::Table(t) => AuxCodeLookup::is_empty(*t),
-            Now::View(v) => !v.has_any(),
+            Now::View(_, v) => !v.has_any(),
         })
     }
 }
