@@ -484,7 +484,6 @@ impl MacPanel {
             NSBackingStoreType::Buffered,
             false,
         );
-        panel.setFloatingPanel(true);
         panel.setHidesOnDeactivate(false);
         panel.setOpaque(false);
         panel.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -496,8 +495,10 @@ impl MacPanel {
                 | NSWindowCollectionBehavior::FullScreenAuxiliary
                 | NSWindowCollectionBehavior::Stationary,
         );
-        // 浮在普通窗口之上。对位 Windows 侧的 HWND_TOPMOST。
-        panel.setLevel(FLOATING_WINDOW_LEVEL);
+        // 浮在普通窗口与 Spotlight 这类高层宿主之上。对位 Windows 侧的 HWND_TOPMOST。
+        // 不设 `setFloatingPanel(true)`：它只做一件事——把 level 改成浮动层(3)，写在本行
+        // 之后就会把它冲掉（.app 侧四个面板正是栽在这个顺序上，A2-53）。
+        panel.setLevel(POP_UP_MENU_WINDOW_LEVEL);
 
         let view = PanelView::new(mtm, rect, scale);
         panel.setContentView(Some(&view));
@@ -662,9 +663,12 @@ impl MacPanel {
     }
 }
 
-/// `NSFloatingWindowLevel`。AppKit 的窗口层级是 `CGWindowLevelForKey` 的映射值，
-/// 浮动层恒为 3（`kCGFloatingWindowLevelKey`）。
-const FLOATING_WINDOW_LEVEL: isize = 3;
+/// `NSPopUpMenuWindowLevel`。AppKit 的窗口层级是 `CGWindowLevelForKey` 的映射值，
+/// 弹出菜单层恒为 101（`kCGPopUpMenuWindowLevelKey`），与 .app 侧候选窗等面板同层。
+///
+/// 不用浮动层(3)：它只压得住普通窗口(0)，Spotlight 与「应用程序」列表搜索的窗口在 23，
+/// 软键盘在那里被整个盖住（A2-53 跟进，macOS 26.5.1 实测）。
+const POP_UP_MENU_WINDOW_LEVEL: isize = 101;
 
 /// 物理 Shift 是否按住、大写锁定是否开着。
 ///
