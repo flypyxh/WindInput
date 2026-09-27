@@ -453,6 +453,16 @@ fn last_ascii_break(cur: &[(usize, &str, usize)]) -> Option<usize> {
     None
 }
 
+/// [`char_var`] 认得的变量名（与 match 分支一一对应，见 comment.rs 的 `EVAL_VAR_NAMES` 一节）。
+pub(crate) const CHAR_VAR_NAMES: &[&str] = &["readings", "unicode"];
+
+/// 气泡整段求值（`TooltipSections::render` 里的 `cand_eval`）自己认得的变量名。
+pub(crate) const TOOLTIP_CAND_VAR_NAMES: &[&str] = &["full_text", "unicode_all"];
+
+/// 协调器给气泡的候选级求值（coordinator.rs 候选循环里的 `cand_eval`）自己认得的变量名，
+/// 其余回落 `eval_var`。
+pub(crate) const TOOLTIP_COORD_VAR_NAMES: &[&str] = &["word_code", "code_source", "debug"];
+
 /// 逐字上下文里气泡专属的变量。`None` = 不是这里的变量（交给下一层）。
 ///
 /// - `readings[:N]` —— 该字全部读音（最常用在前）以 `/` 连接，`N` 限前 N 个。取代旧

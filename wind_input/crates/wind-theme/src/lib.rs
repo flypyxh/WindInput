@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/pkg/theme/` 对齐（schema v3）；存储格式为 TOML（扁平人写形态，
 //! 经 `normalize` 归一化为内存形态，见 `normalize.rs`）。
 
+pub mod fallback;
 pub mod normalize;
 pub mod palette;
 pub mod resolve;

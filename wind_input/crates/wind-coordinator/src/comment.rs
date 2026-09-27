@@ -130,59 +130,74 @@ enum Node {
 /// 语法写错时让他看到自己打的原文（`${pinyn}` 原样出现），比弹一个错误对话框或者静默
 /// 变空更容易自己改对。
 fn parse(tpl: &str) -> Vec<Node> {
+    let pairs = Pairs::new(tpl.as_bytes());
+    parse_range(tpl, &pairs, 0, tpl.len(), 0)
+}
+
+/// 解析 `tpl[start..end]`（下标一律是整个模板里的绝对位置，配对表按整串算一次）。
+/// `depth` = 外面已套了几层 `{…}` / `$[…]{…}`，到 [`MAX_DEPTH`] 后花括号按字面处理。
+fn parse_range(tpl: &str, pairs: &Pairs, start: usize, end: usize, depth: usize) -> Vec<Node> {
     let b = tpl.as_bytes();
+    let nest = depth < MAX_DEPTH;
     let mut nodes = Vec::new();
     let mut text = String::new();
-    let mut i = 0usize;
-    while i < b.len() {
+    let mut i = start;
+    while i < end {
         // `$[颜色]{…}`：语法不成立即 `$` 按字面输出、从 `[` 继续扫描（§4.4）。
-        if b[i] == b'$'
-            && i + 1 < b.len()
+        if nest
+            && b[i] == b'$'
+            && i + 1 < end
             && b[i + 1] == b'['
-            && let Some((spec_end, body_end)) = color_bounds(b, i + 2)
+            && let Some((spec_end, body_end)) = color_bounds(b, pairs, i + 2, end)
         {
             if !text.is_empty() {
                 nodes.push(Node::Text(std::mem::take(&mut text)));
             }
             nodes.push(Node::Color(
                 Arc::new(InlineColor::parse(&tpl[i + 2..spec_end])),
-                parse(&tpl[spec_end + 2..body_end]),
+                parse_range(tpl, pairs, spec_end + 2, body_end, depth + 1),
             ));
             i = body_end + 1;
             continue;
         }
         // `${a|b}` —— 先于裸 `{` 判定，否则变量的 `{` 会被当成段起点。
-        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
-            if let Some(end) = find_byte(b, i + 2, b'}') {
+        if b[i] == b'$' && i + 1 < end && b[i + 1] == b'{' {
+            if let Some(close) = pairs.var_end(i + 2, end) {
                 if !text.is_empty() {
                     nodes.push(Node::Text(std::mem::take(&mut text)));
                 }
                 nodes.push(Node::Var(
-                    tpl[i + 2..end]
+                    tpl[i + 2..close]
                         .split('|')
                         .map(VarRef::parse)
                         .filter(|v| !v.name.is_empty())
                         .collect(),
                 ));
-                i = end + 1;
+                i = close + 1;
                 continue;
             }
             // 未闭合 → 后面全是字面文本。
-        } else if b[i] == b'{' {
-            // 段内容的扫描必须跳过 `${…}`，否则变量的 `}` 会被误当作段结束。
-            if let Some(end) = find_group_end(b, i + 1) {
-                if !text.is_empty() {
-                    nodes.push(Node::Text(std::mem::take(&mut text)));
-                }
-                // 内段由递归解析处理：`find_group_end` 已按层数配对，切出来的段内文本是平衡的。
-                nodes.push(Node::Group(parse(&tpl[i + 1..end])));
-                i = end + 1;
-                continue;
+        } else if nest
+            && b[i] == b'{'
+            && let Some(close) = pairs.group_end(i, end)
+        {
+            if !text.is_empty() {
+                nodes.push(Node::Text(std::mem::take(&mut text)));
             }
+            // 段内由递归解析处理：配对表已按层数配好，段内文本是平衡的。
+            nodes.push(Node::Group(parse_range(
+                tpl,
+                pairs,
+                i + 1,
+                close,
+                depth + 1,
+            )));
+            i = close + 1;
+            continue;
         }
         // 按字符推进，保证切片落在 UTF-8 边界上（模板含中文标签文字）。
         let ch_len = utf8_len(b[i]);
-        text.push_str(&tpl[i..(i + ch_len).min(tpl.len())]);
+        text.push_str(&tpl[i..(i + ch_len).min(end)]);
         i += ch_len;
     }
     if !text.is_empty() {
@@ -206,47 +221,92 @@ fn utf8_len(first: u8) -> usize {
 /// 都吞成颜色说明。
 const COLOR_SPEC_MAX: usize = 64;
 
+/// 可选段 / 内联色的嵌套上限。更深的 `{` 与 `$[…]{` 按字面文字处理。
+///
+/// 解析与渲染都按层递归，层数不设限的话，一个几千层的模板（手滑粘贴、或故意构造）存进
+/// 配置就能在候选渲染时把服务的栈打穿、进程直接 abort。32 远超任何真实用途：出厂最深的
+/// 是悬停提示合并段的 3 层，手写模板很难超过 5 层；而 32 层 × 每层几百字节的栈帧离线程栈
+/// 上限还有两个数量级。超限不报错、按字面显示，与本解析器「写错就原样给人看」的取向一致。
+pub(crate) const MAX_DEPTH: usize = 32;
+
+/// 整个模板的花括号配对表，**一次线性扫描**算好。
+///
+/// 此前 `find_group_end` 每遇到一个 `{` 就往后重扫到配对处，`${` 找 `}` 也是逐次往后找：
+/// 一串未闭合的 `{`（20 万个）就是平方级，实测 37 秒——同样是存进配置就卡死候选渲染的形状。
+///
+/// 配对规则与旧的逐次扫描逐字相同（测试 `pairs_match_rescan_reference` 按随机模板对拍）：
+/// `${` 跳到其后第一个 `}`（变量未闭合 ⇒ 其后再无 `}`，一切段都闭合不了）；其余 `{` `}` 按层
+/// 配对。从任一段首重扫与从头扫一遍切出的记号相同——段首本就是整串扫描里的记号边界。
+struct Pairs {
+    /// `next_close[i]` = `i` 起（含）第一个 `}` 的位置；没有为 `usize::MAX`。
+    next_close: Vec<usize>,
+    /// `group_close[i]`（`b[i] == '{'` 且不是 `${` 的 `{`）= 配对的 `}`；没有为 `usize::MAX`。
+    group_close: Vec<usize>,
+}
+
+impl Pairs {
+    fn new(b: &[u8]) -> Self {
+        let n = b.len();
+        let mut next_close = vec![usize::MAX; n + 1];
+        for i in (0..n).rev() {
+            next_close[i] = if b[i] == b'}' { i } else { next_close[i + 1] };
+        }
+        let mut group_close = vec![usize::MAX; n];
+        let mut stack = Vec::new();
+        let mut i = 0;
+        while i < n {
+            if b[i] == b'$' && i + 1 < n && b[i + 1] == b'{' {
+                match next_close[i + 2] {
+                    usize::MAX => break,
+                    c => {
+                        i = c + 1;
+                        continue;
+                    }
+                }
+            }
+            match b[i] {
+                b'{' => stack.push(i),
+                b'}' => {
+                    if let Some(open) = stack.pop() {
+                        group_close[open] = i;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Self {
+            next_close,
+            group_close,
+        }
+    }
+
+    /// `${` 之后（`from` 指向名字首字节）的收尾 `}`，须在 `end` 之前。
+    fn var_end(&self, from: usize, end: usize) -> Option<usize> {
+        let c = *self.next_close.get(from)?;
+        (c < end).then_some(c)
+    }
+
+    /// `open` 处的 `{` 的配对 `}`，须在 `end` 之前。
+    fn group_end(&self, open: usize, end: usize) -> Option<usize> {
+        let c = *self.group_close.get(open)?;
+        (c < end).then_some(c)
+    }
+}
+
 /// `$[` 之后（`from` 指向 `SPEC` 首字节）：语法成立时返回 `(']' 的位置, BODY 结束 '}' 的位置)`。
 ///
 /// 成立只看两条（§4.4）：`SPEC` 里不含 `{` `}` 换行且不超过 64 字节；`]` 紧跟 `{` 且 `BODY`
 /// 按层数配对闭合。`SPEC` 写的是什么不影响成立——颜色非法照样是内联色，只是按正文色显示。
-fn color_bounds(b: &[u8], from: usize) -> Option<(usize, usize)> {
-    let limit = (from + COLOR_SPEC_MAX + 1).min(b.len());
+fn color_bounds(b: &[u8], pairs: &Pairs, from: usize, end: usize) -> Option<(usize, usize)> {
+    let limit = (from + COLOR_SPEC_MAX + 1).min(end);
     let close = (from..limit).find(|&j| matches!(b[j], b']' | b'{' | b'}' | b'\n'))?;
-    if b[close] != b']' || close + 1 >= b.len() || b[close + 1] != b'{' {
+    if b[close] != b']' || close + 1 >= end || b[close + 1] != b'{' {
         return None;
     }
     // BODY 与可选段同一套配对规则：`SPEC` 里不许出现花括号，故 `$[…]{…}` 贡献的花括号天然配平。
-    let end = find_group_end(b, close + 2)?;
-    Some((close, end))
-}
-
-fn find_byte(b: &[u8], from: usize, target: u8) -> Option<usize> {
-    (from..b.len()).find(|&i| b[i] == target)
-}
-
-/// 找可选段的结束 `}`，**跳过内部的 `${…}`**、按层数配对内段。未闭合返回 `None`。
-///
-/// 曾经不配对（段内第一个 `}` 即结束），于是 `{${a}{ [${b}]}\t}` 会被切成段 `${a}{ [${b}]`
-/// 加字面 `\t}`——内段吞掉了外段的右括号。悬停提示合并段的模板要嵌套才表达得出来。
-fn find_group_end(b: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    let mut depth = 0usize;
-    while i < b.len() {
-        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
-            // 变量未闭合 ⇒ 段也无从闭合（`?` 即 return None）。
-            i = find_byte(b, i + 2, b'}')? + 1;
-            continue;
-        }
-        match b[i] {
-            b'{' => depth += 1,
-            b'}' if depth == 0 => return Some(i),
-            b'}' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    let body_end = pairs.group_end(close + 1, end)?;
+    Some((close, body_end))
 }
 
 /// 结构角色（§3.2）：模板字面文字在正文里是 `literal`，在段名里是 `title`。
@@ -693,6 +753,49 @@ pub(crate) fn resolve_template<'a>(
 ) -> &'a str {
     mode.or(schema).unwrap_or(global)
 }
+
+// ── 各求值入口认得的变量名 ──────────────────────────────────────────────────────
+//
+// 与各入口的 match 分支一一对应，测试 `entry_name_tables_match_their_bodies` 扫源码逐表核对
+// （多一个、少一个都红）。设置页模板预览按场景取它们的并集判「此处可不可用」，与真实渲染的
+// 求值链同一口径——另写一份清单的话，候选栏里原样回显的 `${word_code}` 在预览里会照常出值。
+
+/// [`Coordinator::eval_var`]（注释段；气泡整段 / 段名 / 逐字段的最后一层回落）。
+pub(crate) const EVAL_VAR_NAMES: &[&str] = &[
+    "code_hint",
+    "emoji",
+    "code_rev",
+    "code",
+    "code_rev_all",
+    "code_all",
+    "shuangpin",
+    "pinyin",
+    "chaizi",
+    "chaizi_code",
+    "chaizi_all",
+    "chaizi_code_all",
+    "dict",
+];
+
+/// [`Coordinator::eval_text_var`] 自己的分支（其余交给 [`reverse_text_var`]）。
+pub(crate) const EVAL_TEXT_VAR_NAMES: &[&str] = &[
+    "code_rev",
+    "code",
+    "code_rev_all",
+    "code_all",
+    "pinyin",
+    "shuangpin",
+    "dict",
+];
+
+/// [`reverse_text_var`]。
+pub(crate) const REVERSE_TEXT_VAR_NAMES: &[&str] = &[
+    "char",
+    "chaizi",
+    "chaizi_code",
+    "chaizi_all",
+    "chaizi_code_all",
+];
 
 /// 裸文本变量里**只依赖反查表**的那一部分（`char` 与 `chaizi*` 一族）。
 ///
@@ -2469,6 +2572,114 @@ mod styled_tests {
     }
 }
 
+/// 入参防护：嵌套上限与线性配对（`MAX_DEPTH` / `Pairs`）。
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    /// 旧的逐次重扫实现，留作对拍基准（配对规则必须逐字相同）。
+    fn rescan_group_end(b: &[u8], from: usize) -> Option<usize> {
+        let mut i = from;
+        let mut depth = 0usize;
+        while i < b.len() {
+            if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+                i = (i + 2..b.len()).find(|&j| b[j] == b'}')? + 1;
+                continue;
+            }
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' if depth == 0 => return Some(i),
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// 配对表与旧的逐次重扫在随机模板上逐位置一致（凡旧解析会去找配对的 `{`）。
+    #[test]
+    fn pairs_match_rescan_reference() {
+        let alphabet = b"${}[]a";
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let b: Vec<u8> = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            let pairs = Pairs::new(&b);
+            // 只比「解析器会问到的」`{`：扫到它时它是记号边界（不在某个 `${…}` 里）。
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
+                    match (i + 2..b.len()).find(|&j| b[j] == b'}') {
+                        Some(c) => {
+                            i = c + 1;
+                            continue;
+                        }
+                        None => {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                if b[i] == b'{' {
+                    assert_eq!(
+                        pairs.group_end(i, b.len()),
+                        rescan_group_end(&b, i + 1),
+                        "{:?} @ {i}",
+                        String::from_utf8_lossy(&b)
+                    );
+                }
+                i += 1;
+            }
+        }
+    }
+
+    fn eval(name: &str, _: Option<&str>) -> Option<String> {
+        (name == "a").then(|| "A".to_string())
+    }
+
+    /// 深度 5000 的嵌套不打穿栈：超过上限的层按字面文字输出，上限以内照常求值。
+    #[test]
+    fn deep_nesting_is_bounded() {
+        let n = 5000;
+        for (open, close) in [("{", "}"), ("$[accent]{", "}")] {
+            let tpl = format!("{}${{a}}{}", open.repeat(n), close.repeat(n));
+            let out = render(&tpl, 0, eval);
+            assert!(out.contains('A'), "变量照常求值");
+            // 上限以内的层被解析吃掉，超出的层原样留在输出里。
+            let literal_opens = out.matches('{').count();
+            assert_eq!(literal_opens, n - MAX_DEPTH, "{open}");
+        }
+    }
+
+    /// 20 万个未闭合的 `{`（以及 `${`）在毫秒级完成：配对是一次线性扫描。
+    #[test]
+    fn unclosed_braces_are_linear() {
+        for tpl in [
+            "{".repeat(200_000),
+            "${".repeat(100_000),
+            "{${a}".repeat(40_000),
+        ] {
+            let t = std::time::Instant::now();
+            let _ = Template::parse(&tpl);
+            // 平方级实测 37 秒；线性扫描在调试构建下也远低于这个宽松上限。
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "{:?}",
+                t.elapsed()
+            );
+        }
+    }
+}
+
 /// `TEXT_ROLES` 契约清单 ⊇ 全部求值入口认得的变量名（设计 text-span-colors.md §3.1）。
 ///
 /// 反方向的守卫：`Span::role` 取自清单，清单外的变量不产角色、主题给它配的色静默不生效。
@@ -2560,6 +2771,50 @@ mod role_contract_tests {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// 各入口旁的变量名常量表与入口的 match 分支逐一相符（设置页预览按它们判场景可用性）。
+    #[test]
+    fn entry_name_tables_match_their_bodies() {
+        let comment = include_str!("comment.rs");
+        let tooltip = include_str!("tooltip.rs");
+        let coordinator = include_str!("coordinator.rs");
+        let cases: [(&str, &str, &[&str]); 6] = [
+            (comment, "pub(crate) fn eval_var(", super::EVAL_VAR_NAMES),
+            (
+                comment,
+                "pub(crate) fn eval_text_var(",
+                super::EVAL_TEXT_VAR_NAMES,
+            ),
+            (
+                comment,
+                "pub(crate) fn reverse_text_var(",
+                super::REVERSE_TEXT_VAR_NAMES,
+            ),
+            (
+                tooltip,
+                "pub(crate) fn char_var(",
+                crate::tooltip::CHAR_VAR_NAMES,
+            ),
+            (
+                tooltip,
+                "let cand_eval = |name: &str, arg: Option<&str>|",
+                crate::tooltip::TOOLTIP_CAND_VAR_NAMES,
+            ),
+            (
+                coordinator,
+                "let cand_eval = |name: &str, arg: Option<&str>|",
+                crate::tooltip::TOOLTIP_COORD_VAR_NAMES,
+            ),
+        ];
+        for (src, anchor, table) in cases {
+            let mut got = arm_names(body_after(src, anchor));
+            got.sort();
+            got.dedup();
+            let mut want: Vec<String> = table.iter().map(|s| s.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{anchor} 的分支与常量表对不上");
+        }
     }
 
     #[test]

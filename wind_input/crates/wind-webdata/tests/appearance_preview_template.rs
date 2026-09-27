@@ -27,6 +27,7 @@ error = "#D93025"
 tooltip_error = "#F28B82"
 tooltip_bg = "#3C3C3CF0"
 tooltip_text = "#FFFFFF"
+ghost = "#FF000000"
 
 [comment]
 color = "${text_hint}"
@@ -157,7 +158,46 @@ fn preview_template_contract() {
     let r = call(json!({"template": "x", "scene": "comment"})).unwrap();
     assert_eq!(r["swatches"], json!({}));
 
-    // ⑤ 未知 scene 报错。
+    // ⑤ 入参上限：模板 4KB、色块 32 个，超了直接报错（不去求值）。
+    let big = "a".repeat(wind_webdata::PREVIEW_TEMPLATE_MAX + 1);
+    assert!(call(json!({"template": big, "scene": "comment"})).is_err());
+    let ok = "a".repeat(wind_webdata::PREVIEW_TEMPLATE_MAX);
+    assert!(call(json!({"template": ok, "scene": "comment"})).is_ok());
+    let many: Vec<String> = (0..=wind_webdata::PREVIEW_SWATCHES_MAX)
+        .map(|i| format!("c{i}"))
+        .collect();
+    assert!(call(json!({"template": "", "scene": "comment", "swatches": many})).is_err());
+
+    // ⑥ 与引擎口径对齐的诊断：气泡里的 selected=、主题里全透明的名字、SPEC 里被忽略的片段、
+    //    场景外的变量。
+    let msgs = |r: &Value| -> Vec<String> {
+        r["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["message"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let r = call(json!({"template": "$[error,selected=nope]{x}", "scene": "content"})).unwrap();
+    assert_eq!(
+        msgs(&r),
+        vec!["「selected=」在气泡里不生效，已忽略"],
+        "气泡不去查 nope"
+    );
+    let r = call(json!({"template": "$[ghost]{x}", "scene": "comment"})).unwrap();
+    assert!(msgs(&r)[0].contains("全透明"), "{:?}", msgs(&r));
+    let r = call(json!({"template": "$[accent,selected]{x} $[accent,]{y}", "scene": "comment"}))
+        .unwrap();
+    let m = msgs(&r);
+    assert!(
+        m.iter().any(|m| m.contains("=颜色")) && m.iter().any(|m| m.contains("逗号")),
+        "{m:?}"
+    );
+    let r = call(json!({"template": "${word_code}", "scene": "comment"})).unwrap();
+    assert_eq!(r["text"], "${word_code}", "注释里没有气泡变量，原样回显");
+    assert!(msgs(&r)[0].starts_with("此处不可用"));
+
+    // ⑦ 未知 scene 报错。
     assert!(call(json!({"template": "x", "scene": "nope"})).is_err());
 
     let _ = std::fs::remove_dir_all(&tmp);

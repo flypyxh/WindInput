@@ -4065,8 +4065,28 @@ pub trait WebDataRpc: WebDataHost {
     /// 颜色一律 `[R, G, B, A]`。等于正文色的区间不下发（与渲染层同一口径）。
     fn web_appearance_preview_template(&self, params: &Value) -> anyhow::Result<Value> {
         use wind_coordinator::template_preview::TemplateScene;
+        use wind_theme::fallback;
         use wind_theme::{Atom, Rgba, TextState};
         let template = str_param(params, "template")?;
+        // 入参上限：设置页的模板输入框是单行，真实模板几十字节；上限只为挡住异常入参
+        // （引擎本身已有嵌套上限与线性配对，这里再省掉无意义的大块求值）。
+        anyhow::ensure!(
+            template.len() <= PREVIEW_TEMPLATE_MAX,
+            "模板过长（{} 字节，上限 {PREVIEW_TEMPLATE_MAX}）",
+            template.len()
+        );
+        let swatch_names: Vec<&str> = params
+            .get("swatches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        anyhow::ensure!(
+            swatch_names.len() <= PREVIEW_SWATCHES_MAX,
+            "swatches 过多（{} 个，上限 {PREVIEW_SWATCHES_MAX}）",
+            swatch_names.len()
+        );
         let scene = match str_param(params, "scene")? {
             "comment" => TemplateScene::Comment,
             "label" => TemplateScene::TooltipLabel,
@@ -4081,23 +4101,25 @@ pub trait WebDataRpc: WebDataHost {
         };
         let is_tooltip = scene != TemplateScene::Comment;
         let sample = self.template_sample(template, &scene);
-        // 主题现取：与候选窗同一条搜索链、同一个当前主题与明暗。取不到（主题文件坏了）时
-        // 退化为不着色的纯文本预览，不让整个对话框报错。
-        let theme = wind_theme::load_resolved_dirs(
+        // 主题现取：与候选窗同一条搜索链、同一个当前主题与明暗。每次预览都从磁盘解析一次
+        // （设计 §11 已知局限：低频的设置页操作，不值得为它挂一份缓存）。取不到（主题文件坏了）
+        // 时退化为兜底色的预览，并给一条总的提示——不逐个把颜色名误报成「当前主题没有」。
+        let loaded = wind_theme::load_resolved_dirs(
             &self.theme_search_dirs(),
             &self.current_theme_name(),
             self.current_theme_is_dark(),
-        )
-        .unwrap_or_default();
+        );
+        let theme_ok = loaded.is_ok();
+        let theme = loaded.unwrap_or_default();
         let default_node = wind_theme::RvNode::default();
+        // 兜底色与渲染层（wind-ui 候选窗 / 气泡）取同一组常量。
         let (node, fallback): (&wind_theme::RvNode, Rgba) = if is_tooltip {
             (
                 theme.views.tooltip.as_ref().unwrap_or(&default_node),
-                theme.color("tooltip_text", [255, 255, 255, 255]),
+                theme.color("tooltip_text", fallback::TOOLTIP_TEXT),
             )
         } else {
-            // 兜底同候选窗注释（candidate_window.rs COMMENT_FALLBACK）。
-            (&theme.views.comment, [150, 150, 150, 255])
+            (&theme.views.comment, fallback::COMMENT_TEXT)
         };
         let runs_of = |state: TextState| -> (Value, Rgba) {
             let body = wind_theme::body_color(node, state, fallback);
@@ -4123,14 +4145,11 @@ pub trait WebDataRpc: WebDataHost {
         };
         let (runs, fg) = runs_of(TextState::Normal);
         let bg = if is_tooltip {
+            // 同 wind-ui 气泡：调色板兜底，节点底色覆盖。
             node.bg_color
-                .unwrap_or(theme.color("tooltip_bg", [60, 60, 60, 240]))
+                .unwrap_or(theme.color("tooltip_bg", fallback::TOOLTIP_BG))
         } else {
-            theme
-                .views
-                .window
-                .bg_color
-                .unwrap_or(theme.color("bg", [255, 255, 255, 255]))
+            theme.views.window.bg_color.unwrap_or(fallback::WINDOW_BG)
         };
         let selected = (!is_tooltip).then(|| {
             let (runs, fg) = runs_of(TextState::Selected);
@@ -4140,19 +4159,41 @@ pub trait WebDataRpc: WebDataHost {
                 .selected
                 .as_ref()
                 .and_then(|n| n.bg_color)
-                .unwrap_or(theme.color("selection", [230, 240, 255, 255]));
+                .unwrap_or(fallback::SELECTED_BG);
             json!({"fg": fg, "bg": bg, "runs": runs})
         });
 
-        // 问题：未知变量（主题无关）+ 内联色（写法 / 当前主题查不查得到 / 全透明 / 未知 key）。
+        // 问题：变量（主题无关，含场景外变量）+ 内联色（写法 / 当前主题查不查得到 / 全透明 /
+        // 被忽略的 SPEC 片段）。
         let mut problems: Vec<Value> = sample
             .problems
             .iter()
             .map(|p| json!({"start": p.start, "end": p.end, "message": p.message}))
             .collect();
+        if !theme_ok && !sample.colors.is_empty() {
+            problems.push(json!({
+                "start": 0, "end": 0,
+                "message": "当前主题加载失败，预览按兜底色显示，颜色名无法核对",
+            }));
+        }
+        // 名字在当前场景下查到的颜色：气泡先查 `tooltip_<名>`（与 span_color 同一顺序）。
+        let lookup = |n: &str| -> Option<Rgba> {
+            is_tooltip
+                .then(|| theme.palette.get(&format!("tooltip_{n}")))
+                .flatten()
+                .or_else(|| theme.palette.get(n))
+                .copied()
+        };
+        let transparent = "全透明的颜色看不见，按正文色显示".to_string();
         for c in &sample.colors {
             let mut msgs: Vec<String> = Vec::new();
-            let refs = std::iter::once(&c.color.normal).chain(c.color.selected.as_ref());
+            let mut refs = vec![&c.color.normal];
+            match &c.color.selected {
+                // `selected=` 只在候选注释里有意义：气泡没有选中态，引擎忽略它，不必查名字。
+                Some(_) if is_tooltip => msgs.push("「selected=」在气泡里不生效，已忽略".into()),
+                Some(sel) => refs.push(sel),
+                None => {}
+            }
             for r in refs {
                 for atom in [&r.light, &r.dark] {
                     let m = match atom {
@@ -4160,19 +4201,18 @@ pub trait WebDataRpc: WebDataHost {
                             "颜色写法不对：写 #RGB / #RRGGBB / #RRGGBBAA 或调色板颜色名"
                                 .to_string(),
                         ),
-                        Atom::Rgba(rgba) if rgba[3] == 0 => {
-                            Some("全透明的颜色看不见，按正文色显示".to_string())
-                        }
-                        Atom::Name(n) if &**n == "transparent" => {
-                            Some("全透明的颜色看不见，按正文色显示".to_string())
-                        }
-                        Atom::Name(n) => {
-                            let found = (is_tooltip
-                                && theme.palette.contains_key(&format!("tooltip_{n}")))
-                                || theme.palette.contains_key(&**n);
-                            (!found).then(|| format!("当前主题没有颜色「{n}」，按正文色显示"))
-                        }
+                        Atom::Rgba(rgba) if rgba[3] == 0 => Some(transparent.clone()),
                         Atom::Rgba(_) => None,
+                        Atom::Name(n) if &**n == "transparent" => Some(transparent.clone()),
+                        // 主题没加载成功：上面已给总提示，不逐个误报。
+                        Atom::Name(_) if !theme_ok => None,
+                        Atom::Name(n) => match lookup(n) {
+                            None => Some(format!("当前主题没有颜色「{n}」，按正文色显示")),
+                            Some(rgba) if rgba[3] == 0 => {
+                                Some(format!("「{n}」在当前主题里是全透明，按正文色显示"))
+                            }
+                            Some(_) => None,
+                        },
                     };
                     if let Some(m) = m
                         && !msgs.contains(&m)
@@ -4181,21 +4221,15 @@ pub trait WebDataRpc: WebDataHost {
                     }
                 }
             }
-            for k in &c.unknown_keys {
-                msgs.push(format!("不认识的「{k}」，已忽略（目前只支持 selected=）"));
-            }
+            msgs.extend(c.notes.iter().cloned());
             for m in msgs {
                 problems.push(json!({"start": c.start, "end": c.end, "message": m}));
             }
         }
         problems.sort_by_key(|p| p["start"].as_u64());
 
-        let swatches: serde_json::Map<String, Value> = params
-            .get("swatches")
-            .and_then(Value::as_array)
+        let swatches: serde_json::Map<String, Value> = swatch_names
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
             .map(|name| {
                 let c = wind_theme::InlineColor::parse(name);
                 let rgba = wind_theme::span_color(
@@ -4318,6 +4352,11 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
 }
 
 /// 稀疏 diff：返回 `cfg` 相对 `base` 的变化项（仅含改动的叶子/键）；无变化返回 None。
+/// `appearance.previewTemplate` 的模板长度上限（字节）。设置页输入框是单行，真实模板几十字节。
+pub const PREVIEW_TEMPLATE_MAX: usize = 4096;
+/// `appearance.previewTemplate` 一次最多求几个色块（设置页用 8 个）。
+pub const PREVIEW_SWATCHES_MAX: usize = 32;
+
 /// 对象逐键递归；数组/标量按整体比较（不同则取 cfg）。用于 schema override 最小化。
 /// `getConfig` 附带的只读旁路字段——回传 `saveConfig` 时必须剥掉。
 ///

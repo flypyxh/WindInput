@@ -746,7 +746,7 @@ mod tests {
         }
     }
 
-    const COMMENT_FALLBACK: Rgba = [150, 150, 150, 255];
+    const COMMENT_FALLBACK: Rgba = crate::fallback::COMMENT_TEXT;
     const PROBE_ROLES: &[Option<&str>] = &[
         Some("code_rev"),
         Some("pinyin"),
@@ -757,6 +757,21 @@ mod tests {
         Some("code_source"),
         Some("readings"),
         None,
+    ];
+
+    /// 内联色探针：名字（气泡里先查 `tooltip_<名>`）、亮暗对、测试主题自己的 token、
+    /// `selected=` 变体、没写 `=` 的 selected（忽略）、查不到 / transparent / alpha 0（回落正文色）。
+    const PROBE_INLINE: &[&str] = &[
+        "error",
+        "accent_text",
+        "text_dim",
+        "#C00000/#80FF80",
+        "code_color",
+        "text_dim,selected=error",
+        "accent,selected",
+        "nope",
+        "transparent",
+        "#12345600",
     ];
 
     fn span_roles_expected() -> String {
@@ -805,15 +820,56 @@ mod tests {
                     ));
                 }
             }
+            // 内联色：注释三态（role 取 pinyin——它有常态 / 悬停角色色，验证内联色压过角色色）
+            // 与气泡常态（名字的 tooltip_ 作用域）。
+            let mut inline = Vec::new();
+            for spec in PROBE_INLINE {
+                let ic = InlineColor::parse(spec);
+                for (st_name, st) in [
+                    ("normal", TextState::Normal),
+                    ("selected", TextState::Selected),
+                    ("hover", TextState::Hover),
+                ] {
+                    let col = span_color(
+                        &t,
+                        c,
+                        false,
+                        st,
+                        COMMENT_FALLBACK,
+                        Some("pinyin"),
+                        false,
+                        Some(&ic),
+                    );
+                    inline.push(format!(
+                        "{{\"node\": \"comment\", \"state\": \"{st_name}\", \"spec\": \"{spec}\", \"color\": {}}}",
+                        hex8(col)
+                    ));
+                }
+                let col = span_color(
+                    &t,
+                    &tip,
+                    true,
+                    TextState::Normal,
+                    tip_fb,
+                    Some("readings"),
+                    false,
+                    Some(&ic),
+                );
+                inline.push(format!(
+                    "{{\"node\": \"tooltip\", \"state\": \"normal\", \"spec\": \"{spec}\", \"color\": {}}}",
+                    hex8(col)
+                ));
+            }
             modes.push(format!(
-                "  \"{mode}\": {{\n    \"comment\": {{\"text\": {}, \"roles\": {}, \"selected\": {}, \"hover\": {}}},\n    \"tooltip\": {{\"text\": {}, \"roles\": {}}},\n    \"span\": [\n      {}\n    ]\n  }}",
+                "  \"{mode}\": {{\n    \"comment\": {{\"text\": {}, \"roles\": {}, \"selected\": {}, \"hover\": {}}},\n    \"tooltip\": {{\"text\": {}, \"roles\": {}}},\n    \"span\": [\n      {}\n    ],\n    \"inline\": [\n      {}\n    ]\n  }}",
                 c.text_color.map_or("null".into(), hex8),
                 roles_json(&c.roles),
                 state_json(c.selected.as_deref()),
                 state_json(c.hover.as_deref()),
                 hex8(tip_fb),
                 roles_json(&tip.roles),
-                spans.join(",\n      ")
+                spans.join(",\n      "),
+                inline.join(",\n      ")
             ));
         }
         format!("{{\n{}\n}}\n", modes.join(",\n"))

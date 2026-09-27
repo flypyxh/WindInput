@@ -77,7 +77,7 @@ fn effective_base_font_size(user: f32, theme: i32) -> f32 {
 }
 
 /// 注释节点没配文字色时的渲染层兜底（分段着色求色的 `body_fallback` 与之同源）。
-const COMMENT_FALLBACK: [u8; 4] = [150, 150, 150, 255];
+const COMMENT_FALLBACK: [u8; 4] = wind_theme::fallback::COMMENT_TEXT;
 
 /// 候选的文字状态：选中优先于悬停（与 `eff_text` / `wind_theme::span_color` 同一口径）。
 fn text_state(sel: bool, hov: bool) -> wind_theme::TextState {
@@ -2766,7 +2766,7 @@ impl CandidateWindow {
             .max(min_text_w);
 
         let mut root = View::container(Layout::Column)
-            .bg(col(v.window.bg_color, [255, 255, 255, 255]))
+            .bg(col(v.window.bg_color, wind_theme::fallback::WINDOW_BG))
             .border(
                 col(v.window.border_color, [200, 200, 200, 200]),
                 dim(v.window.border_width, 1.0).max(1.0),
@@ -2890,8 +2890,8 @@ impl CandidateWindow {
 
         // 候选项颜色（基态）。状态色（选中/悬停）逐项经 eff_text 计算。
         let text_color = col(v.text.text_color, [30, 30, 30, 255]);
-        let sel_bg = patch_bg(&v.item.selected, [230, 240, 255, 255]);
-        let hover_bg = patch_bg(&v.item.hover, [238, 242, 247, 255]);
+        let sel_bg = patch_bg(&v.item.selected, wind_theme::fallback::SELECTED_BG);
+        let hover_bg = patch_bg(&v.item.hover, wind_theme::fallback::HOVER_BG);
         let index_color = col(v.index.text_color, [66, 133, 244, 255]);
         let comment_color = col(v.comment.text_color, COMMENT_FALLBACK);
         let comment_fs = node_fs(&v.comment);

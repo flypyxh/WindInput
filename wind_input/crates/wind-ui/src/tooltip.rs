@@ -472,8 +472,8 @@ impl WindowMouse for TooltipMouse {
 }
 
 const FONT_PX: f32 = 13.0;
-const BG: [u8; 4] = [60, 60, 64, 240]; // 深灰底（RGBA）
-const FG: [u8; 4] = [240, 240, 245, 255];
+const BG: [u8; 4] = wind_theme::fallback::TOOLTIP_BG; // 深灰底（RGBA）
+const FG: [u8; 4] = wind_theme::fallback::TOOLTIP_TEXT;
 
 /// 提示气泡窗口
 pub struct Tooltip {

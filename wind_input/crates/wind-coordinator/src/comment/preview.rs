@@ -12,7 +12,7 @@
 //! 颜色（按当前主题求色、颜色名在当前主题里查不查得到）由 wind-webdata 做——它能加载主题，
 //! 这里只交出每个内联色的写法与位置。
 
-use super::{Template, VarRef, color_bounds, find_byte, find_group_end, role_of, utf8_len};
+use super::{MAX_DEPTH, Pairs, Template, VarRef, color_bounds, role_of, utf8_len};
 use std::sync::Arc;
 use wind_theme::InlineColor;
 use wind_ui_types::StyledText;
@@ -45,8 +45,9 @@ pub struct ColorSpec {
     pub start: usize,
     pub end: usize,
     pub color: Arc<InlineColor>,
-    /// `SPEC` 里认不出的 `key=value` 的 key（前向兼容：引擎忽略它们，预览提示）。
-    pub unknown_keys: Vec<String>,
+    /// `SPEC` 里被引擎**忽略**的部分（与主题无关）：认不出的 `key=`、没写 `=` 的 `selected`、
+    /// 多余的逗号。引擎的处理见 `InlineColor::parse`，这里只把它们说出来。
+    pub notes: Vec<String>,
 }
 
 /// 样例求值结果。
@@ -58,6 +59,74 @@ pub struct TemplateSample {
     pub problems: Vec<TemplateProblem>,
     /// 全部内联色的写法与位置，颜色相关的诊断由调用方按主题做。
     pub colors: Vec<ColorSpec>,
+}
+
+/// 求值层级：决定哪些变量有值（与真实渲染的求值链一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    /// 注释段：只有 `eval_var`。
+    Comment,
+    /// 气泡段名、整段内容：再加候选级的 `cand_eval` 两层。
+    Whole,
+    /// 气泡逐字段：再加逐字的 `char_var` / `eval_text_var` / `reverse_text_var`。
+    PerChar,
+}
+
+impl Layer {
+    fn of(scene: &TemplateScene) -> Self {
+        match scene {
+            TemplateScene::Comment => Self::Comment,
+            TemplateScene::TooltipLabel => Self::Whole,
+            TemplateScene::TooltipContent { each } => match each.trim() {
+                "han" | "char" => Self::PerChar,
+                _ => Self::Whole,
+            },
+        }
+    }
+
+    /// 这一层的真实求值链认不认得 `name`。表取自各入口旁的常量（测试逐表对过 match 分支）。
+    fn has(self, name: &str) -> bool {
+        use super::{EVAL_TEXT_VAR_NAMES, EVAL_VAR_NAMES, REVERSE_TEXT_VAR_NAMES};
+        use crate::tooltip::{CHAR_VAR_NAMES, TOOLTIP_CAND_VAR_NAMES, TOOLTIP_COORD_VAR_NAMES};
+        let any = |tables: &[&[&str]]| tables.iter().any(|t| t.contains(&name));
+        any(&[EVAL_VAR_NAMES])
+            || (self != Self::Comment && any(&[TOOLTIP_CAND_VAR_NAMES, TOOLTIP_COORD_VAR_NAMES]))
+            || (self == Self::PerChar
+                && any(&[CHAR_VAR_NAMES, EVAL_TEXT_VAR_NAMES, REVERSE_TEXT_VAR_NAMES]))
+    }
+
+    /// 「此处不可用」的说明。
+    fn unavailable_hint(self) -> &'static str {
+        match self {
+            Self::Comment => "候选注释里没有这个变量，会原样显示",
+            Self::Whole => "整段求值时没有这个变量（逐字段才有），会原样显示",
+            Self::PerChar => "这里没有这个变量，会原样显示",
+        }
+    }
+}
+
+/// `SPEC` 里被引擎忽略的部分，逐条说明（与 `InlineColor::parse` 的处理一一对应）。
+fn spec_notes(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .skip(1)
+        .filter_map(|item| {
+            let t = item.trim();
+            if t.is_empty() {
+                return Some("多余的逗号，已忽略".to_string());
+            }
+            let key = t.split_once('=').map(|(k, _)| k.trim());
+            match key {
+                Some("selected") => None,
+                None if t == "selected" => {
+                    Some("「selected」后面要写「=颜色」，已忽略".to_string())
+                }
+                _ => Some(format!(
+                    "不认识的「{}」，已忽略（目前只支持 selected=）",
+                    key.unwrap_or(t)
+                )),
+            }
+        })
+        .collect()
 }
 
 /// 求值入口认得的变量：契约清单里的变量 + 兼容别名。
@@ -117,62 +186,61 @@ fn sample_value(name: &str, arg: Option<&str>, ch: Option<char>) -> Option<Strin
     })
 }
 
-/// 扫出模板里的变量引用与内联色（位置按入参模板计）。结构判定与模板引擎的 `parse` 同一套
-/// 规则、同一组私有函数（`color_bounds` / `find_group_end` …），不另写一份配对逻辑。
+/// 扫出模板里的变量引用与内联色（位置按入参模板计）。结构判定与模板引擎的 `parse_range`
+/// 同一套规则、同一张配对表与同一个嵌套上限，不另写一份配对逻辑。
 fn scan(
     tpl: &str,
-    base: usize,
+    pairs: &Pairs,
+    (start, end): (usize, usize),
+    depth: usize,
     vars: &mut Vec<(usize, usize, Vec<String>)>,
     colors: &mut Vec<ColorSpec>,
 ) {
     let b = tpl.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] == b'$'
-            && i + 1 < b.len()
+    let nest = depth < MAX_DEPTH;
+    let mut i = start;
+    while i < end {
+        if nest
+            && b[i] == b'$'
+            && i + 1 < end
             && b[i + 1] == b'['
-            && let Some((spec_end, body_end)) = color_bounds(b, i + 2)
+            && let Some((spec_end, body_end)) = color_bounds(b, pairs, i + 2, end)
         {
             let spec = &tpl[i + 2..spec_end];
-            let unknown_keys = spec
-                .split(',')
-                .skip(1)
-                .filter_map(|item| {
-                    let key = item.split_once('=').map_or(item, |(k, _)| k).trim();
-                    (key != "selected").then(|| key.to_string())
-                })
-                .collect();
             colors.push(ColorSpec {
-                start: base + i + 2,
-                end: base + spec_end,
+                start: i + 2,
+                end: spec_end,
                 color: Arc::new(InlineColor::parse(spec)),
-                unknown_keys,
+                notes: spec_notes(spec),
             });
             scan(
-                &tpl[spec_end + 2..body_end],
-                base + spec_end + 2,
+                tpl,
+                pairs,
+                (spec_end + 2, body_end),
+                depth + 1,
                 vars,
                 colors,
             );
             i = body_end + 1;
             continue;
         }
-        if b[i] == b'$' && i + 1 < b.len() && b[i + 1] == b'{' {
-            if let Some(end) = find_byte(b, i + 2, b'}') {
-                let names = tpl[i + 2..end]
+        if b[i] == b'$' && i + 1 < end && b[i + 1] == b'{' {
+            if let Some(close) = pairs.var_end(i + 2, end) {
+                let names = tpl[i + 2..close]
                     .split('|')
                     .map(|s| VarRef::parse(s).name)
                     .filter(|n| !n.is_empty())
                     .collect();
-                vars.push((base + i, base + end + 1, names));
-                i = end + 1;
+                vars.push((i, close + 1, names));
+                i = close + 1;
                 continue;
             }
-        } else if b[i] == b'{'
-            && let Some(end) = find_group_end(b, i + 1)
+        } else if nest
+            && b[i] == b'{'
+            && let Some(close) = pairs.group_end(i, end)
         {
-            scan(&tpl[i + 1..end], base + i + 1, vars, colors);
-            i = end + 1;
+            scan(tpl, pairs, (i + 1, close), depth + 1, vars, colors);
+            i = close + 1;
             continue;
         }
         i += utf8_len(b[i]);
@@ -182,7 +250,16 @@ fn scan(
 /// 按场景用样例求值并诊断。
 pub fn sample(template: &str, scene: &TemplateScene) -> TemplateSample {
     let t = Template::parse(template);
-    let whole = |name: &str, arg: Option<&str>| sample_value(name, arg, None);
+    let layer = Layer::of(scene);
+    // 场景外的变量与真实渲染一样返回 `None`（原样回显），不给样例值。
+    let value = move |name: &str, arg: Option<&str>, ch: Option<char>| {
+        if layer.has(name) {
+            sample_value(name, arg, ch)
+        } else {
+            None
+        }
+    };
+    let whole = |name: &str, arg: Option<&str>| value(name, arg, None);
     let text = match scene {
         TemplateScene::Comment => t.render_whole(0, &whole),
         TemplateScene::TooltipLabel => t.render_styled(&whole, &|_| true, true).0.trim(),
@@ -199,7 +276,7 @@ pub fn sample(template: &str, scene: &TemplateScene) -> TemplateSample {
                         }
                     })
                     .filter_map(|c| {
-                        let eval = |name: &str, arg: Option<&str>| sample_value(name, arg, Some(c));
+                        let eval = |name: &str, arg: Option<&str>| value(name, arg, Some(c));
                         let (row, filled) = t.render_styled(&eval, &|n| n != "char", false);
                         filled.then_some(row)
                     })
@@ -213,18 +290,40 @@ pub fn sample(template: &str, scene: &TemplateScene) -> TemplateSample {
         },
     };
     let (mut vars, mut colors) = (Vec::new(), Vec::new());
-    scan(template, 0, &mut vars, &mut colors);
-    let problems = vars
-        .into_iter()
-        .filter_map(|(start, end, names)| {
-            let unknown: Vec<String> = names.into_iter().filter(|n| !is_known(n)).collect();
-            (!unknown.is_empty()).then(|| TemplateProblem {
+    let pairs = Pairs::new(template.as_bytes());
+    scan(
+        template,
+        &pairs,
+        (0, template.len()),
+        0,
+        &mut vars,
+        &mut colors,
+    );
+    let mut problems = Vec::new();
+    for (start, end, names) in vars {
+        let (unknown, elsewhere): (Vec<String>, Vec<String>) = names
+            .into_iter()
+            .filter(|n| !layer.has(n))
+            .partition(|n| !is_known(n));
+        if !unknown.is_empty() {
+            problems.push(TemplateProblem {
                 start,
                 end,
                 message: format!("未知变量：{}", unknown.join("、")),
-            })
-        })
-        .collect();
+            });
+        }
+        if !elsewhere.is_empty() {
+            problems.push(TemplateProblem {
+                start,
+                end,
+                message: format!(
+                    "此处不可用：{}（{}）",
+                    elsewhere.join("、"),
+                    layer.unavailable_hint()
+                ),
+            });
+        }
+    }
     TemplateSample {
         text,
         problems,
@@ -311,18 +410,21 @@ mod tests {
 
     /// 内联色的位置（SPEC 区间，含嵌套在可选段 / 内联色里的）与未知 key。
     #[test]
-    fn color_specs_with_positions_and_unknown_keys() {
+    fn color_specs_with_positions_and_notes() {
         let tpl = "{a $[accent,hover=x]{b $[#GG]{c}}}";
         let s = sample(tpl, &TemplateScene::Comment);
         let got: Vec<(&str, Vec<String>)> = s
             .colors
             .iter()
-            .map(|c| (&tpl[c.start..c.end], c.unknown_keys.clone()))
+            .map(|c| (&tpl[c.start..c.end], c.notes.clone()))
             .collect();
         assert_eq!(
             got,
             vec![
-                ("accent,hover=x", vec!["hover".to_string()]),
+                (
+                    "accent,hover=x",
+                    vec!["不认识的「hover」，已忽略（目前只支持 selected=）".to_string()]
+                ),
                 ("#GG", vec![])
             ]
         );
@@ -332,6 +434,70 @@ mod tests {
                 .colors
                 .is_empty()
         );
+    }
+
+    /// ★ 变量按场景放行，与真实求值链一致：注释里没有气泡的候选级变量，整段里没有逐字变量。
+    /// 场景外的变量原样回显（真实候选栏 / 气泡里就是这样），并报「此处不可用」。
+    #[test]
+    fn variables_are_scoped_by_scene() {
+        let whole = TemplateScene::TooltipContent { each: "".into() };
+        let han = TemplateScene::TooltipContent { each: "han".into() };
+        let unavailable = |tpl: &str, scene: &TemplateScene| {
+            sample(tpl, scene)
+                .problems
+                .iter()
+                .any(|p| p.message.starts_with("此处不可用"))
+        };
+        // 注释：气泡候选级变量不可用，原样回显。
+        let s = sample("${word_code}", &TemplateScene::Comment);
+        assert_eq!(s.text.as_str(), "${word_code}");
+        assert!(unavailable("${word_code}", &TemplateScene::Comment));
+        for v in [
+            "${full_text}",
+            "${debug}",
+            "${readings}",
+            "${char}",
+            "${unicode}",
+        ] {
+            assert!(unavailable(v, &TemplateScene::Comment), "{v}");
+        }
+        // 段名 / 整段：候选级变量可用，逐字变量不可用。
+        assert_eq!(
+            sample("${word_code}", &TemplateScene::TooltipLabel)
+                .text
+                .as_str(),
+            "wqvb"
+        );
+        assert!(!unavailable("${code_source}${unicode_all}", &whole));
+        assert!(unavailable("${char}", &whole));
+        assert!(unavailable("${readings}", &TemplateScene::TooltipLabel));
+        // 逐字：全部可用。
+        assert!(!unavailable(
+            "${char}${readings}${unicode}${word_code}${code_hint}",
+            &han
+        ));
+        // 注释里 eval_var 的变量照常可用。
+        assert!(!unavailable(
+            "${code_hint}${emoji}${dict}${code}",
+            &TemplateScene::Comment
+        ));
+        // 未知变量仍按「未知」报，不混进「不可用」。
+        let s = sample("${pinyn}", &TemplateScene::Comment);
+        assert!(s.problems[0].message.starts_with("未知变量"));
+        assert_eq!(s.problems.len(), 1);
+    }
+
+    /// 引擎忽略的 SPEC 片段逐条说明：没写 `=` 的 selected、多余逗号、未知 key。
+    #[test]
+    fn spec_notes_follow_engine_parse() {
+        assert_eq!(
+            spec_notes("accent,selected"),
+            vec!["「selected」后面要写「=颜色」，已忽略"]
+        );
+        assert_eq!(spec_notes("accent,"), vec!["多余的逗号，已忽略"]);
+        assert!(spec_notes("accent, selected = on_accent").is_empty());
+        // 与引擎一致：没写 `=` 的 selected 不产生选中态颜色。
+        assert!(InlineColor::parse("accent,selected").selected.is_none());
     }
 
     /// 样例表覆盖契约里的全部变量（否则预览会把合法变量报成未知）。
