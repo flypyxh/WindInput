@@ -1098,10 +1098,13 @@ impl ReverseLookup {
                     //
                     // 例外是**简拼音节**（`sa'h` 造出的「撒哈」，词条码为 `sa`+`h`）：简拼段是读音
                     // 的前缀，仍是词条给的依据，故精确不中时取首个以它开头的读音（t200）。
-                    Some(w) => readings
-                        .iter()
-                        .find(|r| strip_tone(r) == w)
-                        .or_else(|| readings.iter().find(|r| strip_tone(r).starts_with(&w))),
+                    // 只认**纯声母**段：带元音的是完整音节（`an`），前缀回退会把它错配成 `áng`。
+                    Some(w) => readings.iter().find(|r| strip_tone(r) == w).or_else(|| {
+                        let initial_only = !w.contains(['a', 'e', 'i', 'o', 'u', 'v']);
+                        initial_only
+                            .then(|| readings.iter().find(|r| strip_tone(r).starts_with(&w)))
+                            .flatten()
+                    }),
                     None => readings.first(),
                 }
             })
@@ -1310,6 +1313,10 @@ impl ReverseLookup {
 }
 
 /// 去声调：带调号韵母 → 基本字母（ü→v，符合拼音输入习惯）。
+///
+/// 与 `wind-coordinator` 的 `comment::strip_tones` 平行但口径不同：这里产出与输入码
+/// 比对的键（`ü`→`v`、小写、不处理 `ń`/`ḿ`），那边产出给人看的注释（`ü` 保留、
+/// `ń`/`ḿ` 去调）。改其一时核对另一处是否也该改。
 fn strip_tone(py: &str) -> String {
     py.chars()
         .map(|c| match c {
@@ -1458,6 +1465,14 @@ mod tests {
         // 前缀仍按音节筛：「行」读音里只有 h 开头的 háng 能配上 `h`。
         let rl = heteronym_rl();
         assert_eq!(rl.toned_pinyin_of("行", Some(&["h"]), " "), "háng");
+    }
+
+    /// 反例：完整音节不走前缀回退——`an` 不得配上 `áng`。
+    #[test]
+    fn full_syllable_does_not_match_by_prefix() {
+        let mut rl = ReverseLookup::default();
+        rl.set_pinyin(vec![('昂', vec!["áng"])]);
+        assert_eq!(rl.toned_pinyin_of("昂", Some(&["an"]), " "), "");
     }
 
     /// 无读音的字跳过（不产出空段/孤立分隔符）；整词皆无返回空串。
