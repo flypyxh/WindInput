@@ -27,6 +27,22 @@ pub fn take_system_color_changed() -> bool {
     SYSTEM_COLOR_CHANGED.swap(false, Ordering::Relaxed)
 }
 
+/// 屏幕点 `(x, y)` 处最上层的窗口是不是 `hwnd`。
+///
+/// 用 `WindowFromPoint` 而非比窗口矩形：它与鼠标消息同一套命中（隐藏窗口不算、分层窗口
+/// 全透明的阴影扩边穿透），被 `ShowWindow(SW_HIDE)` 直接藏掉的窗口也不会误判成「还在上面」。
+/// 调用方以函数指针持有它，测试换成桩（非 Windows 恒 false，走不到命中分支）。
+#[cfg(windows)]
+pub(crate) fn window_at(hwnd: HWND, x: i32, y: i32) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+    unsafe { WindowFromPoint(POINT { x, y }) == hwnd }
+}
+#[cfg(not(windows))]
+pub(crate) fn window_at(_hwnd: HWND, _x: i32, _y: i32) -> bool {
+    false
+}
+
 /// `LayeredWindow::show_z` 的 z 序意图。
 ///
 /// 存在的理由：`show()` 历来无条件把窗口插进**置顶组**，这对候选窗/工具栏是对的

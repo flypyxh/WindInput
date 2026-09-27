@@ -306,7 +306,7 @@ impl UiManager {
             }
 
             // 推进鼠标悬停防抖（稳定后才发出 Hover）
-            candidate_window.tick(popup_menu.as_ref().is_some_and(|m| m.is_visible()));
+            candidate_window.tick();
             // 推进工具栏悬停高亮（按光标位置本地重绘）
             if let Some(t) = &mut toolbar {
                 t.tick();
@@ -314,12 +314,12 @@ impl UiManager {
             // 推进菜单（脏重绘 / 关闭）
             if let Some(m) = &mut popup_menu {
                 m.tick();
-                // 关掉菜单的那次菜单外按下转给气泡：菜单开着时气泡收不到鼠标消息，在它上面
-                // 再右键只有这里看得见（见 `Tooltip::on_menu_outside_press`）。必须紧跟 tick：
+                // 关掉菜单的那次菜单外按下转给候选窗 / 气泡：菜单开着时它们收不到鼠标消息，在
+                // 上面再右键只有这里看得见（见 `CandidateWindow::menu_outside_press`）。必须紧跟 tick：
                 // 协调器回应 MenuClose 的 SetTooltipMenuOpen(false) 此时还没轮到本线程处理，
                 // 气泡的「菜单打开中」标志仍在，据此认出关掉的是它的菜单。
                 if let Some(p) = m.take_outside_press() {
-                    candidate_window.tooltip_menu_outside_press(p.x, p.y, p.right);
+                    candidate_window.menu_outside_press(p.x, p.y, p.right);
                 }
             }
             // 推进软键盘（点击派发 / 长按重复 / 悬停重绘）
@@ -484,9 +484,7 @@ impl UiManager {
                             hr.hide_kind(HOST_WINDOW_TOOLTIP);
                         }
                         candidate_window.hide();
-                        if let Some(m) = &mut popup_menu {
-                            m.hide();
-                        }
+                        hide_popup_menu(&mut popup_menu, &mut candidate_window);
                     }
                     UiCommand::ShowCandidateMenu { items, anchor } => {
                         debug!(
@@ -506,9 +504,7 @@ impl UiManager {
                         }
                     }
                     UiCommand::HideMenu => {
-                        if let Some(m) = &mut popup_menu {
-                            m.hide();
-                        }
+                        hide_popup_menu(&mut popup_menu, &mut candidate_window);
                     }
                     UiCommand::CopyToClipboard(text) => {
                         crate::popup_menu::set_clipboard_text(&text);
@@ -1223,6 +1219,22 @@ impl UiManager {
 impl Drop for UiManager {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(UiCommand::Shutdown);
+    }
+}
+
+/// 协调器命令收菜单（`HideMenu` / `HideCandidates`）。真收掉了一个**可见**菜单时告诉气泡：
+/// 协调器有几条收菜单的路不补发 `SetTooltipMenuOpen(false)`，气泡的抑制标志要在这里收口
+/// （见 `Tooltip::on_menu_dismissed`）。菜单已由自己 tick 收起（点了菜单项）时不算——那条路
+/// 协调器会在派发完菜单命令后才解除，「截图此窗口」靠的就是这个先后。
+fn hide_popup_menu(
+    popup_menu: &mut Option<crate::popup_menu::PopupMenu>,
+    candidate_window: &mut crate::candidate_window::CandidateWindow,
+) {
+    if let Some(m) = popup_menu
+        && m.is_visible()
+    {
+        m.hide();
+        candidate_window.tooltip_menu_dismissed();
     }
 }
 

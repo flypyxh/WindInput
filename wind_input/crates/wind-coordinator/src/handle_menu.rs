@@ -1672,8 +1672,13 @@ impl Coordinator {
             | keymap::VK_ESCAPE => {
                 let _ = self.ui_tx.send(UiCommand::MenuKey(key_code));
             }
-            // 其它键：关闭菜单并吞掉
-            _ => self.menu_close(),
+            // 其它键：关闭菜单并吞掉。一并解除气泡 / 状态气泡的隐藏抑制——只收菜单会让它
+            // 残留（气泡从此移出不隐藏、右键被当成「菜单开着」）；这里没有菜单命令要派发，
+            // 不受 clear_tooltip_menu_flag 的截图时序约束。
+            _ => {
+                self.menu_close();
+                self.clear_tooltip_menu_flag();
+            }
         }
         true
     }
@@ -3576,5 +3581,30 @@ mod english_veto_tests {
         let (c, rx) = coord(false, false);
         c.notify_toolbar();
         assert_eq!(last_toolbar(&rx), Some(true), "出厂关闭：英文态照常显示");
+    }
+}
+
+#[cfg(test)]
+mod menu_close_tests {
+    use super::*;
+    use wind_config::Config;
+    use wind_ui_types::UiCommand;
+
+    /// 菜单开着时打字：菜单被收掉的同时要解除气泡的隐藏抑制。只发 `HideMenu` 的话气泡的
+    /// `suppress_hide` 残留为 true，从此移出不隐藏、右键被当成「菜单开着」。
+    #[test]
+    fn typing_closes_menu_and_releases_tooltip_suppress() {
+        let (c, rx) = Coordinator::new_headless_with_ui(Config::default(), None);
+        c.mark_menu_open(0, String::new());
+        while rx.try_recv().is_ok() {}
+        assert!(c.forward_menu_key(0x41), "菜单开着时其它键被吞");
+        let cmds: Vec<UiCommand> = rx.try_iter().collect();
+        assert!(cmds.iter().any(|m| matches!(m, UiCommand::HideMenu)));
+        assert!(
+            cmds.iter()
+                .any(|m| matches!(m, UiCommand::SetTooltipMenuOpen(false))),
+            "须一并解除气泡抑制：{cmds:?}"
+        );
+        assert!(!c.is_menu_open());
     }
 }

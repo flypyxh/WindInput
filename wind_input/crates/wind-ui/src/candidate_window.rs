@@ -326,6 +326,8 @@ pub struct CandidateWindow {
     mouse: Rc<RefCell<CandidateMouse>>,
     /// 悬停编码反查气泡
     tooltip: Option<crate::tooltip::Tooltip>,
+    /// 「屏幕点处最上层是不是这个窗口」，默认 [`crate::window::window_at`]；测试换桩。
+    window_at: fn(HWND, i32, i32) -> bool,
     /// **生效**主题：[`Self::theme_source`] 叠上外观覆盖（字体 / 字号）之后的那份。
     /// 渲染与测量一律只读它，由 [`Self::refresh_effective_theme`] 单点产出。
     theme: wind_theme::Resolved,
@@ -438,9 +440,8 @@ impl CandidateWindow {
             drag_pin: None,
             margin: (0, 0, 0, 0),
             double_click: crate::double_click::DoubleClick::new(),
-            tip_hold: false,
+            tip_hold: TipHold::Off,
             tip_released: false,
-            menu_open: false,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -464,6 +465,7 @@ impl CandidateWindow {
             hit_rects: Vec::new(),
             mouse,
             tooltip: crate::tooltip::Tooltip::new(tooltip_events).ok(),
+            window_at: crate::window::window_at,
             theme: wind_theme::Resolved::default(),
             theme_source: wind_theme::Resolved::default(),
             user_font_family: String::new(),
@@ -1145,10 +1147,31 @@ impl CandidateWindow {
         }
     }
 
-    /// 菜单外按下转给悬停 tooltip（见其 `on_menu_outside_press` 说明）。
-    pub fn tooltip_menu_outside_press(&mut self, x: i32, y: i32, right: bool) {
+    /// 关掉菜单的那次菜单外按下（菜单轮询所见，见 `popup_menu::OutsidePress`）。
+    ///
+    /// 菜单开着时同线程的候选窗、气泡都收不到鼠标消息，这次按下只有轮询看得见。右键落在
+    /// 气泡上交给气泡（重开气泡菜单，见其 `on_menu_outside_press`）；落在候选窗上则合成一次
+    /// 候选窗右键——「关旧开新」，与在没有菜单时右键同一效果。左键只关菜单。
+    pub fn menu_outside_press(&mut self, x: i32, y: i32, right: bool) {
+        if let Some(t) = self.tooltip.as_mut()
+            && t.on_menu_outside_press(x, y, right)
+        {
+            return;
+        }
+        if !right || !self.visible || !(self.window_at)(self.window.hwnd(), x, y) {
+            return;
+        }
+        let origin = self.mouse.borrow().window_origin();
+        let (ox, oy) = origin.unwrap_or((0, 0));
+        self.mouse
+            .borrow_mut()
+            .right_click((x - ox) as f32, (y - oy) as f32, (x, y));
+    }
+
+    /// UI 循环收掉了一个可见菜单（协调器 `HideMenu` / `HideCandidates`），转给气泡。
+    pub fn tooltip_menu_dismissed(&mut self) {
         if let Some(t) = self.tooltip.as_mut() {
-            t.on_menu_outside_press(x, y, right);
+            t.on_menu_dismissed();
         }
     }
 
@@ -1821,7 +1844,7 @@ impl CandidateWindow {
 
     /// 气泡该跟哪个悬停目标：候选右键压制期间一律「无」（高亮照旧，只是不弹气泡）。
     fn tooltip_hover(&self) -> i32 {
-        if self.mouse.borrow().tip_hold {
+        if self.mouse.borrow().tip_hold.active() {
             -1
         } else {
             self.hover
@@ -3713,21 +3736,20 @@ impl CandidateWindow {
         }
     }
 
-    /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件），并执行候选右键对气泡的
-    /// 压制（见 [`CandidateMouse::hold_tooltip`]）。`menu_open` = 弹出菜单此刻是否可见。
-    pub fn tick(&mut self, menu_open: bool) {
+    /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件），并推进候选右键对气泡的
+    /// 压制（见 [`TipHold`]）。
+    pub fn tick(&mut self) {
         let (hold, released) = {
             let mut m = self.mouse.borrow_mut();
-            m.menu_open = menu_open;
-            m.flush();
-            (m.tip_hold, std::mem::take(&mut m.tip_released))
+            m.flush(Instant::now(), self.hover);
+            (m.tip_hold.active(), std::mem::take(&mut m.tip_released))
         };
         // 右键那一刻已显示的气泡就在这里收掉：消息泵刚派发完 WM_RBUTTONDOWN，本轮即生效，
         // 赶在菜单弹出之前。hide 幂等，压制期间每轮调用也只是一次判断。
         if hold && let Some(t) = self.tooltip.as_mut() {
             t.hide();
         }
-        // 压制解除时悬停目标没变 → 协调器不会重绘（悬停值没变），气泡得在这里自己补显示。
+        // 压制解除时 UI 画着的悬停就是光标下的目标 → 协调器不会重绘，气泡得在这里自己补显示。
         if released && self.visible {
             let origin = self.mouse.borrow().window_origin();
             if let Some((wx, wy)) = origin {
@@ -3736,13 +3758,18 @@ impl CandidateWindow {
         }
     }
 
-    /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无待到期的悬停闸门。
+    /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无待到期者。
     ///
-    /// 消息循环据此安排唤醒。唯一的到期源是悬停激活闸门（`engage_at`）：它在用户首次真实
-    /// 移动鼠标到候选窗上时武装，到期后悬停才开始响应。激活之后悬停走 `on_message` 即时
-    /// 发出，不再需要唤醒。
+    /// 消息循环据此安排唤醒。两个到期源：悬停激活闸门（`engage_at`，用户首次真实移动鼠标到
+    /// 候选窗上时武装，到期后悬停才开始响应；激活之后悬停走 `on_message` 即时发出，不再需要
+    /// 唤醒），以及右键压制「等菜单」阶段的兜底超时（见 [`TipHold::AwaitMenu`]）。
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.mouse.borrow().engage_deadline()
+        let m = self.mouse.borrow();
+        let hold = match m.tip_hold {
+            TipHold::AwaitMenu { until } => Some(until),
+            _ => None,
+        };
+        [m.engage_deadline(), hold].into_iter().flatten().min()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -3809,12 +3836,64 @@ pub struct CandidateMouse {
     margin: (i32, i32, i32, i32),
     /// 空白处双击判定（截图用，见 `UiEvent::CandidateDoubleClick`）。
     double_click: crate::double_click::DoubleClick,
-    /// 候选窗上右键后压住悬停气泡，直到菜单关闭后重新走完一次激活延迟，见 [`Self::hold_tooltip`]。
-    tip_hold: bool,
-    /// 压制刚解除且悬停目标没变：待 [`CandidateWindow::tick`] 取走并补显示气泡。
+    /// 候选窗右键对悬停气泡的压制阶段，见 [`TipHold`]。
+    tip_hold: TipHold,
+    /// 压制刚解除且 UI 画着的悬停正是光标下的目标：待 [`CandidateWindow::tick`] 取走并
+    /// 本地补显示气泡。
     tip_released: bool,
-    /// 弹出菜单此刻是否可见（UI 循环每轮经 [`CandidateWindow::tick`] 同步）。
-    menu_open: bool,
+}
+
+/// 「等菜单」阶段的兜底超时。右键到菜单可见要走一个 UI → 协调器 → UI 的来回，正常是毫秒
+/// 级；协调器处理鼠标事件的线程可能短暂卡在状态锁上（重载配置、建反查索引），1.5 秒足够
+/// 宽。再久多半是请求被丢了（候选已清空时协调器不弹菜单），这时不该让气泡一直压着——
+/// 超时按「菜单已关闭」处理。万一菜单来得比这还晚，出现时照样进 [`TipHold::InMenu`]。
+const HOLD_MENU_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// 候选窗右键对悬停气泡的压制（设计 §7.6 A）。
+///
+/// 不压的话气泡会盖在菜单上：① 右键时气泡已显示，它不会自己消失；② 右键时激活延迟还没
+/// 到期，到期后照发 `Hover`，气泡在菜单弹出**之后**冒出来、叠在菜单上面（z 序后来者居上）。
+///
+/// 做成阶段而不是一个布尔：右键到菜单可见之间，「菜单开着」还是 false，只靠它挡闸门的话，
+/// 这段来回里鼠标动 1px 就会重新武装闸门，到期时菜单已弹出，气泡照样叠上去；
+/// `ui.tooltip.delay=0` 时气泡甚至抢在菜单之前出来。
+///
+/// 只压气泡、不清悬停：悬停高亮还指着右键的那个候选，是「菜单作用于谁」的唯一提示。
+/// 清了（发 `Hover(-1)`）高亮会跳回键盘选中项，看上去像是菜单对着别的候选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TipHold {
+    /// 不压。
+    Off,
+    /// 已右键、菜单还没出现。闸门既不武装也不到期。`until` 为兜底超时时刻。
+    AwaitMenu { until: Instant },
+    /// 菜单开着。闸门既不武装也不到期。
+    InMenu,
+    /// 菜单已关：等一次真实移动武装闸门、再走完一次延迟才解除。
+    AwaitMove,
+}
+
+impl TipHold {
+    /// 按「菜单此刻是否可见」与时间推进阶段。
+    fn advance(self, now: Instant, menu_visible: bool) -> Self {
+        match self {
+            TipHold::Off => TipHold::Off,
+            TipHold::AwaitMenu { .. } if menu_visible => TipHold::InMenu,
+            TipHold::AwaitMenu { until } if now >= until => TipHold::AwaitMove,
+            TipHold::InMenu if !menu_visible => TipHold::AwaitMove,
+            // 迟到的菜单（超时之后才出现）同样要压住。
+            TipHold::AwaitMove if menu_visible => TipHold::InMenu,
+            other => other,
+        }
+    }
+
+    /// 本阶段是否挡住激活闸门（不武装、不到期）。
+    fn blocks_gate(self) -> bool {
+        matches!(self, TipHold::AwaitMenu { .. } | TipHold::InMenu)
+    }
+
+    fn active(self) -> bool {
+        self != TipHold::Off
+    }
 }
 
 impl CandidateMouse {
@@ -3829,42 +3908,73 @@ impl CandidateMouse {
         self.engage_at
     }
 
-    /// 悬停激活闸门到期时由 UI 循环调用：激活并补发当前悬停。
-    fn flush(&mut self) {
+    /// UI 循环每轮调用：推进右键压制阶段；悬停激活闸门到期则激活并补发当前悬停。
+    ///
+    /// `drawn_hover` 是 UI 此刻画着的悬停（`CandidateWindow::hover`，协调器最近一次下发的值）。
+    /// 解除压制时拿它而不是 `last_hover` 比：压制期间候选若重绘过（协调器重置悬停），
+    /// `last_hover` 还是旧值，与光标下的目标相等就不发 `Hover`，而 UI 画的已经是 -1，
+    /// 气泡便再也不回来。
+    fn flush(&mut self, now: Instant, drawn_hover: i32) {
+        self.tip_hold = self
+            .tip_hold
+            .advance(now, crate::popup_menu::menu_visible());
+        if self.tip_hold.blocks_gate() {
+            // 进入「等菜单 / 菜单中」前武装的闸门一律作废（迟到的菜单从 AwaitMove 进来时
+            // 闸门可能已在走）。
+            self.engage_at = None;
+            return;
+        }
         if self.engaged {
             return; // 已激活：悬停在 on_message 内即时发出
         }
         if let Some(at) = self.engage_at
-            && Instant::now() >= at
+            && now >= at
         {
             self.engaged = true;
             self.engage_at = None;
-            let changed = self.pending_raw != self.last_hover;
-            if changed {
+            if self.tip_hold == TipHold::AwaitMove {
+                self.tip_hold = TipHold::Off;
+                self.last_hover = self.pending_raw;
+                if self.pending_raw == drawn_hover {
+                    // UI 画着的就是它：协调器不会重绘，由窗口本地补显示气泡。
+                    self.tip_released = true;
+                } else {
+                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
+                }
+            } else if self.pending_raw != self.last_hover {
                 self.last_hover = self.pending_raw;
                 let _ = self.events.send(UiEvent::Hover(self.pending_raw));
-            }
-            if std::mem::take(&mut self.tip_hold) {
-                // 目标变了，协调器会重绘、气泡随之出现；没变就得本地补一次。
-                self.tip_released = !changed;
             }
         }
     }
 
-    /// 候选窗上右键（候选菜单 / 空白处主菜单）：压住悬停气泡，并把激活闸门打回未激活。
-    ///
-    /// 不压的话气泡会盖在菜单上：① 右键时气泡已显示，它不会自己消失；② 右键时激活延迟还没
-    /// 到期，到期后照发 `Hover`，气泡在菜单弹出**之后**冒出来、叠在菜单上面（z 序后来者居上）。
-    /// 打回闸门同时管住菜单关闭之后——鼠标要重新移动、再走一次延迟气泡才回来，
-    /// 不会菜单一关就立刻冒出来。
-    ///
-    /// 只压气泡、不清悬停：悬停高亮还指着右键的那个候选，是「菜单作用于谁」的唯一提示。
-    /// 清了（发 `Hover(-1)`）高亮会跳回键盘选中项，看上去像是菜单对着别的候选。
-    fn hold_tooltip(&mut self) {
-        self.tip_hold = true;
+    /// 候选窗上右键（候选菜单 / 空白处主菜单）：进入压制「等菜单」阶段，并把激活闸门打回
+    /// 未激活，见 [`TipHold`]。
+    fn hold_tooltip(&mut self, now: Instant) {
+        self.tip_hold = TipHold::AwaitMenu {
+            until: now + HOLD_MENU_TIMEOUT,
+        };
         self.tip_released = false;
         self.engaged = false;
         self.engage_at = None;
+    }
+
+    /// 候选窗右键：客户区 `(x, y)` 定命中，屏幕 `screen` 定菜单位置。命中候选 → 词条菜单，
+    /// 空白处 → 功能主菜单（光标处向下弹）。`WM_RBUTTONDOWN` 与菜单外右键合成共用。
+    fn right_click(&mut self, x: f32, y: f32, (sx, sy): (i32, i32)) {
+        let i = self.hit(x, y);
+        self.hold_tooltip(Instant::now());
+        if i >= 0 {
+            let _ = self.events.send(UiEvent::RequestCandidateMenu {
+                page_local: i as usize,
+                x: sx,
+                y: sy,
+            });
+        } else {
+            let _ = self
+                .events
+                .send(UiEvent::RequestMainMenu(MenuAnchor::at_point(sx, sy)));
+        }
     }
 
     /// 重置悬停状态：清空闸门与去重值，并**以当前物理光标位重建基线**。
@@ -3879,7 +3989,7 @@ impl CandidateMouse {
         self.engaged = false;
         self.engage_at = None;
         self.pending_raw = -1;
-        self.tip_hold = false;
+        self.tip_hold = TipHold::Off;
         self.tip_released = false;
         let (sx, sy) = unsafe {
             let mut p = POINT::default();
@@ -4057,43 +4167,39 @@ impl WindowMouse for CandidateMouse {
                 let (x, y) = mouse_pos(lparam);
                 let raw = self.hit(x, y);
                 self.pending_raw = raw;
+                // 先按此刻的菜单可见性推进压制阶段：菜单在上一次 tick 之后才收起时，关后的
+                // 第一次移动就该能武装闸门，不必再等一轮。
+                self.tip_hold = self
+                    .tip_hold
+                    .advance(Instant::now(), crate::popup_menu::menu_visible());
                 if self.engaged {
                     // 已激活：即时高亮/显示 tooltip，无逐项延迟
                     if raw != self.last_hover {
                         self.last_hover = raw;
                         let _ = self.events.send(UiEvent::Hover(raw));
                     }
-                } else if self.engage_at.is_none() && !(self.tip_hold && self.menu_open) {
+                } else if self.engage_at.is_none() && !self.tip_hold.blocks_gate() {
                     // 首次真实移动：启动窗口级激活闸门（仅一次，~60ms）。
-                    // 右键压制期间菜单还开着就不武装：菜单开着时气泡一律不弹。
+                    // 右键压制「等菜单 / 菜单中」不武装，见 TipHold。
                     self.engage_at =
                         Some(Instant::now() + Duration::from_millis(self.engage_delay_ms));
                 }
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
+                // 菜单开着时这次右键由菜单轮询那一路合成（`CandidateWindow::menu_outside_press`），
+                // 两路都认会请求两遍菜单。
+                if crate::popup_menu::menu_visible() {
+                    return Some(LRESULT(0));
+                }
                 let (x, y) = mouse_pos(lparam);
-                let i = self.hit(x, y);
-                self.hold_tooltip();
                 // 用屏幕光标坐标定位菜单
-                let (sx, sy) = unsafe {
+                let screen = unsafe {
                     let mut p = POINT::default();
                     let _ = GetCursorPos(&mut p);
                     (p.x, p.y)
                 };
-                if i >= 0 {
-                    // 命中候选 → 词条菜单
-                    let _ = self.events.send(UiEvent::RequestCandidateMenu {
-                        page_local: i as usize,
-                        x: sx,
-                        y: sy,
-                    });
-                } else {
-                    // 空白处 → 功能主菜单（光标处向下弹）
-                    let _ = self
-                        .events
-                        .send(UiEvent::RequestMainMenu(MenuAnchor::at_point(sx, sy)));
-                }
+                self.right_click(x, y, screen);
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
@@ -6642,13 +6748,18 @@ mod font_precedence_tests {
 /// 候选右键对悬停气泡的压制（设计 `candidate-tooltip-sections.md` §7.6 规则 A）。
 ///
 /// 非 Windows 下 `GetCursorPos` 是 mock（恒 (0,0)），物理移动门控靠每次移动前把
-/// `last_cursor` 拨开来模拟「鼠标真动了」；激活延迟设 0，`flush` 一调即到期。
+/// `last_cursor` 拨开来模拟「鼠标真动了」。时间一律显式传入 `flush`，不依赖真实流逝；
+/// 「菜单是否可见」是线程局部，测试线程各自一份。
 #[cfg(test)]
 mod tip_hold_tests {
     use super::*;
+    use crate::popup_menu::set_menu_visible;
     use std::sync::mpsc::{Receiver, channel};
 
-    fn mouse() -> (CandidateMouse, Receiver<UiEvent>) {
+    const DELAY: u64 = 60;
+
+    fn mouse(delay_ms: u64) -> (CandidateMouse, Receiver<UiEvent>) {
+        set_menu_visible(false);
         let (tx, rx) = channel();
         let r = |x| Rect {
             x,
@@ -6664,7 +6775,7 @@ mod tip_hold_tests {
             engaged: false,
             engage_at: None,
             pending_raw: -1,
-            engage_delay_ms: 0,
+            engage_delay_ms: delay_ms,
             hwnd: HWND::default(),
             dragging: false,
             drag_anchor: (0, 0),
@@ -6672,9 +6783,8 @@ mod tip_hold_tests {
             drag_pin: None,
             margin: (0, 0, 0, 0),
             double_click: crate::double_click::DoubleClick::new(),
-            tip_hold: false,
+            tip_hold: TipHold::Off,
             tip_released: false,
-            menu_open: false,
         };
         (m, rx)
     }
@@ -6692,6 +6802,11 @@ mod tip_hold_tests {
         m.on_message(HWND::default(), WM_RBUTTONDOWN, WPARAM(0), lp(x, 5));
     }
 
+    /// 远在任何延迟之后（但早于「等菜单」的兜底超时）。
+    fn later() -> Instant {
+        Instant::now() + Duration::from_millis(1000)
+    }
+
     fn hovers(rx: &Receiver<UiEvent>) -> Vec<i32> {
         rx.try_iter()
             .filter_map(|e| match e {
@@ -6701,76 +6816,265 @@ mod tip_hold_tests {
             .collect()
     }
 
+    fn menu_requests(rx: &Receiver<UiEvent>) -> usize {
+        rx.try_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    UiEvent::RequestCandidateMenu { .. } | UiEvent::RequestMainMenu(_)
+                )
+            })
+            .count()
+    }
+
+    /// 已激活、悬停在候选 0 上（UI 画着的悬停也是 0）。
+    fn engaged_on_first(delay_ms: u64) -> (CandidateMouse, Receiver<UiEvent>) {
+        let (mut m, rx) = mouse(delay_ms);
+        real_move(&mut m, 5);
+        m.flush(later(), -1);
+        assert_eq!(hovers(&rx), vec![0]);
+        (m, rx)
+    }
+
     /// 右键时激活延迟还没到期：到期后不能再发 Hover——那正是「气泡在菜单弹出后冒出来、
     /// 叠在菜单上」的来路。
     #[test]
     fn right_click_cancels_pending_engage() {
-        let (mut m, rx) = mouse();
+        let (mut m, rx) = mouse(DELAY);
         real_move(&mut m, 5);
         assert!(m.engage_at.is_some(), "首次真实移动武装闸门");
         right_click(&mut m, 5);
-        m.flush();
-        assert!(m.tip_hold);
+        m.flush(later(), -1);
+        assert!(m.tip_hold.active());
         assert!(m.engage_at.is_none());
         assert!(hovers(&rx).is_empty(), "闸门已撤，不应再发悬停");
     }
 
-    /// 已激活时右键：闸门打回未激活，气泡压住；菜单开着期间移动不武装闸门。
-    #[test]
-    fn menu_open_blocks_rearming() {
-        let (mut m, rx) = mouse();
-        real_move(&mut m, 5);
-        m.flush();
-        assert_eq!(hovers(&rx), vec![0]);
+    /// 审查探针（H1）：右键 → 菜单可见之前鼠标动了 → 菜单可见 → 到期。整段都不得发 Hover。
+    /// 右键到菜单可见之间「菜单开着」还是 false，只靠它挡闸门时这里会漏。
+    fn probe_right_move_menu_flush(delay_ms: u64) {
+        let (mut m, rx) = engaged_on_first(delay_ms);
         right_click(&mut m, 5);
-        assert!(m.tip_hold && !m.engaged);
-        m.menu_open = true;
         real_move(&mut m, 25);
-        m.flush();
-        assert!(m.engage_at.is_none(), "菜单开着时不武装");
-        assert!(hovers(&rx).is_empty());
-        assert!(m.tip_hold);
+        m.flush(later(), 0);
+        assert!(hovers(&rx).is_empty(), "等菜单阶段不得发悬停");
+        set_menu_visible(true);
+        m.flush(later(), 0);
+        real_move(&mut m, 6);
+        m.flush(later(), 0);
+        assert_eq!(m.tip_hold, TipHold::InMenu);
+        assert!(m.engage_at.is_none(), "菜单中不武装");
+        assert!(hovers(&rx).is_empty(), "菜单中不得发悬停");
     }
 
-    /// 菜单关闭后要重新移动、再走一次延迟才解除压制；目标没变时由窗口本地补显示。
+    #[test]
+    fn move_before_menu_shows_does_not_rearm() {
+        probe_right_move_menu_flush(DELAY);
+    }
+
+    /// `ui.tooltip.delay=0`：闸门一武装就到期，没有「等菜单」阶段时气泡会抢在菜单之前出来。
+    #[test]
+    fn move_before_menu_shows_does_not_rearm_with_zero_delay() {
+        probe_right_move_menu_flush(0);
+    }
+
+    /// 菜单关闭后要重新移动、再走一次延迟才解除；UI 画着的悬停就是光标下的目标时由窗口
+    /// 本地补显示（不发 Hover，协调器不会因同值重绘）。
     #[test]
     fn release_after_fresh_engage_same_target() {
-        let (mut m, rx) = mouse();
-        real_move(&mut m, 5);
-        m.flush();
-        let _ = hovers(&rx);
+        let (mut m, rx) = engaged_on_first(DELAY);
         right_click(&mut m, 5);
-        m.menu_open = false;
-        m.flush();
-        assert!(m.tip_hold, "菜单一关、鼠标没动：仍压着");
+        set_menu_visible(true);
+        m.flush(Instant::now(), 0);
+        set_menu_visible(false);
+        m.flush(later(), 0);
+        assert_eq!(m.tip_hold, TipHold::AwaitMove, "菜单一关、鼠标没动：仍压着");
         real_move(&mut m, 6);
-        m.flush();
-        assert!(!m.tip_hold);
-        assert!(m.tip_released, "目标没变，协调器不会重绘，须本地补显示");
+        let armed = m.engage_at.expect("真实移动武装闸门");
+        m.flush(armed - Duration::from_millis(1), 0);
+        assert!(m.tip_hold.active(), "延迟没走完不解除");
+        m.flush(armed, 0);
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(m.tip_released, "UI 画着的就是它，须本地补显示");
         assert!(hovers(&rx).is_empty());
     }
 
-    /// 解除时目标变了：发 Hover，由协调器重绘带出气泡，不需本地补显示。
+    /// 解除时目标变了：发 Hover，由协调器重绘带出气泡。
     #[test]
     fn release_after_fresh_engage_new_target() {
-        let (mut m, rx) = mouse();
-        real_move(&mut m, 5);
-        m.flush();
-        let _ = hovers(&rx);
+        let (mut m, rx) = engaged_on_first(DELAY);
         right_click(&mut m, 5);
+        m.flush(later(), 0);
         real_move(&mut m, 25);
-        m.flush();
-        assert!(!m.tip_hold);
+        // 没有菜单出现：等兜底超时后才算关闭。
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, 0);
+        real_move(&mut m, 26);
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 3, 0);
+        assert_eq!(m.tip_hold, TipHold::Off);
         assert!(!m.tip_released);
         assert_eq!(hovers(&rx), vec![1]);
+    }
+
+    /// M1：压制期间候选重绘过、协调器把悬停清成 -1（UI 画的是 -1），而 `last_hover` 还是 0。
+    /// 解除时回到同一候选，必须发 Hover(0)——按 `last_hover` 判会以为「没变」，气泡不再回来。
+    #[test]
+    fn release_after_repaint_resends_hover() {
+        let (mut m, rx) = engaged_on_first(DELAY);
+        right_click(&mut m, 5);
+        set_menu_visible(true);
+        m.flush(Instant::now(), 0);
+        set_menu_visible(false);
+        real_move(&mut m, 6);
+        m.flush(later(), -1);
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(!m.tip_released);
+        assert_eq!(hovers(&rx), vec![0]);
+    }
+
+    /// 兜底超时：请求被丢、菜单始终没出现，压制不能永久持续。
+    #[test]
+    fn await_menu_times_out_to_await_move() {
+        let (mut m, _rx) = mouse(DELAY);
+        right_click(&mut m, 5);
+        let TipHold::AwaitMenu { until } = m.tip_hold else {
+            panic!("右键后应在等菜单：{:?}", m.tip_hold);
+        };
+        m.flush(until - Duration::from_millis(1), -1);
+        assert!(m.tip_hold.blocks_gate());
+        m.flush(until, -1);
+        assert_eq!(m.tip_hold, TipHold::AwaitMove);
+    }
+
+    /// 迟到的菜单（超时之后才出现）照样压住，已武装的闸门作废。
+    #[test]
+    fn late_menu_reenters_in_menu() {
+        let (mut m, rx) = mouse(DELAY);
+        right_click(&mut m, 5);
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, -1);
+        real_move(&mut m, 6);
+        assert!(m.engage_at.is_some());
+        set_menu_visible(true);
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 3, -1);
+        assert_eq!(m.tip_hold, TipHold::InMenu);
+        assert!(m.engage_at.is_none());
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 菜单开着时候选窗自己收到的右键不理：这次按下由菜单轮询合成，两路都认会请求两遍。
+    #[test]
+    fn own_right_click_ignored_while_menu_visible() {
+        let (mut m, rx) = mouse(DELAY);
+        set_menu_visible(true);
+        right_click(&mut m, 5);
+        assert_eq!(menu_requests(&rx), 0);
+        assert!(!m.tip_hold.active());
     }
 
     /// 组合结束 / 窗口重新出现：压制随悬停状态一并清掉，不带进下一轮。
     #[test]
     fn reset_hover_clears_hold() {
-        let (mut m, _rx) = mouse();
+        let (mut m, _rx) = mouse(DELAY);
         right_click(&mut m, 5);
         m.reset_hover();
-        assert!(!m.tip_hold && !m.tip_released);
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(!m.tip_released);
+    }
+
+    // ---- 窗口层：气泡真的被收起 / 补回（M2），菜单外右键合成（L1） ----
+
+    fn doc() -> wind_ui_types::TooltipDoc {
+        wind_ui_types::TooltipDoc {
+            sections: vec![wind_ui_types::TooltipSection {
+                title: None,
+                inline: false,
+                lines: vec![wind_ui_types::TooltipLine {
+                    text: "nǐ".into(),
+                    raw: 0,
+                }],
+            }],
+        }
+    }
+
+    /// 候选窗（mock）：两个带气泡的候选，UI 悬停在候选 0 上，气泡已显示。
+    fn window() -> (CandidateWindow, Receiver<UiEvent>) {
+        set_menu_visible(false);
+        let (tx, rx) = channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        let item = |t: &str| CandidateItem {
+            text: t.into(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: doc(),
+            comment: String::new(),
+            no_index: false,
+        };
+        w.candidates = vec![item("你"), item("拟")];
+        let r = |x| Rect {
+            x,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        w.hit_rects = vec![(0, r(0.0)), (1, r(20.0))];
+        w.mouse.borrow_mut().hit_rects = w.hit_rects.clone();
+        w.hover = 0;
+        w.visible = true;
+        w.update_tooltip(0, 0);
+        assert!(tip_shown(&w), "前提：气泡已显示");
+        (w, rx)
+    }
+
+    fn tip_shown(w: &CandidateWindow) -> bool {
+        w.tooltip.as_ref().is_some_and(|t| t.shown())
+    }
+
+    /// 右键当轮 tick 就收起已显示的气泡；压制期间重绘不再弹出；解除后补回。
+    #[test]
+    fn hold_hides_tip_and_repaint_keeps_it_hidden() {
+        let (mut w, _rx) = window();
+        w.mouse.borrow_mut().right_click(5.0, 5.0, (5, 5));
+        w.tick();
+        assert!(!tip_shown(&w), "右键后气泡须收起");
+        w.update_tooltip(0, 0);
+        assert!(!tip_shown(&w), "压制期间重绘不得弹出气泡");
+        // 菜单出现又关闭，随后重新移动、走完延迟。
+        set_menu_visible(true);
+        w.tick();
+        set_menu_visible(false);
+        w.tick();
+        {
+            let mut m = w.mouse.borrow_mut();
+            m.engage_delay_ms = 0;
+            real_move(&mut m, 6);
+        }
+        w.tick();
+        assert!(tip_shown(&w), "解除后同一候选的气泡须补回");
+    }
+
+    /// L1：菜单开着时在候选窗上右键（候选窗收不到，由菜单轮询转来）→ 关旧开新。
+    #[test]
+    fn outside_right_press_on_candidate_window_reopens_menu() {
+        let (mut w, rx) = window();
+        w.window_at = |_, _, _| true;
+        w.menu_outside_press(25, 5, true);
+        let evs: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, UiEvent::RequestCandidateMenu { page_local: 1, .. })),
+            "命中候选 1 应请求其词条菜单：{evs:?}"
+        );
+        assert!(w.mouse.borrow().tip_hold.active(), "合成右键同样压住气泡");
+        // 左键：只关菜单。
+        w.menu_outside_press(25, 5, false);
+        assert_eq!(menu_requests(&rx), 0);
+    }
+
+    /// 右键落在候选窗外（且不在气泡上）：不合成。
+    #[test]
+    fn outside_right_press_elsewhere_is_ignored() {
+        let (mut w, rx) = window();
+        w.window_at = |_, _, _| false;
+        w.menu_outside_press(25, 5, true);
+        assert_eq!(menu_requests(&rx), 0);
     }
 }

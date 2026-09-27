@@ -187,6 +187,23 @@ pub struct OutsidePress {
     pub right: bool,
 }
 
+thread_local! {
+    /// 弹出菜单此刻是否可见（UI 线程内共享）。
+    static MENU_VISIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 弹出菜单此刻是否可见。候选窗 / 气泡在 wnd_proc 里就要问（菜单开着时它们的右键由菜单
+/// 轮询那一路接管），故做成线程局部而非由 UI 循环每轮传值：传值要到下一轮 tick 才更新，
+/// 菜单关掉后紧跟着的那条鼠标消息会读到过时的「开着」。菜单与这些窗口同在 UI 线程。
+pub(crate) fn menu_visible() -> bool {
+    MENU_VISIBLE.with(|v| v.get())
+}
+
+/// 写 [`menu_visible`]。仅 `PopupMenu::show` / `hide` 与测试调用。
+pub(crate) fn set_menu_visible(visible: bool) {
+    MENU_VISIBLE.with(|v| v.set(visible));
+}
+
 /// 菜单交互状态（与 wnd_proc 共享）。只做结构变更，dirty 触发 PopupMenu 协调重绘。
 struct MenuState {
     /// 打开的层级链（last = 最深/当前活动层）
@@ -623,6 +640,7 @@ impl PopupMenu {
         }
         self.reconcile();
         self.visible = true;
+        set_menu_visible(true);
         unsafe {
             // 捕获前先把光标掰正：SetCapture 期间系统不再发 WM_SETCURSOR，光标会
             // 冻结在捕获瞬间的形状，下方 wnd_proc 的 WM_SETCURSOR 分支收不到消息。
@@ -1043,6 +1061,7 @@ impl PopupMenu {
                 }
             }
             self.visible = false;
+            set_menu_visible(false);
             // 全部窗口已 SW_HIDE，基线随之作废——否则下次弹出时内容碰巧相同的层
             // 会被判为「无变化」而跳过 show，结果是根本不出现。
             self.invalidate_rendered();

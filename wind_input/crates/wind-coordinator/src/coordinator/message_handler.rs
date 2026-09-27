@@ -2526,6 +2526,10 @@ impl MessageHandler for Coordinator {
         self.notify_toolbar_async(); // 防抖，异步避免阻塞 bridge 线程
         if clears_input {
             self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
+            // 只收菜单、不解除气泡 / 状态气泡的隐藏抑制会让它残留（气泡从此移出不隐藏、右键被当成
+            // 「菜单开着」）。这里之后没有菜单命令要派发，不受 clear_tooltip_menu_flag 的截图时序
+            // 约束，可以立即解除。UI 侧另有兜底（Tooltip::on_menu_dismissed），两处幂等叠加。
+            self.clear_tooltip_menu_flag();
             self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
             self.terminate_auto_phrase("focus_lost"); // 换窗口 = 一段输入结束
         }
@@ -2683,6 +2687,8 @@ impl MessageHandler for Coordinator {
         }
         self.notify_toolbar_async(); // 非激活态 → notify_toolbar 内部下发 HideToolbar（异步）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
+        // 同 handle_focus_lost：只收菜单不解除抑制会残留；此后无菜单命令派发，可立即解除。
+        self.clear_tooltip_menu_flag();
         self.hide_tip(); // 切走本输入法隐藏状态提示
         self.terminate_auto_phrase("ime_deactivated"); // 切走输入法 = 一段输入结束
     }
@@ -2857,6 +2863,8 @@ impl MessageHandler for Coordinator {
         drop(state);
         self.clear_pair_tracker(); // 组合意外终止：配对上下文失效，清栈防跳出键误判
         self.notify_ui_hide();
+        // 同 handle_focus_lost：只收菜单不解除抑制会残留；此后无菜单命令派发，可立即解除。
+        self.clear_tooltip_menu_flag();
     }
 
     fn handle_caret_update(&self, data: &CaretData) {
