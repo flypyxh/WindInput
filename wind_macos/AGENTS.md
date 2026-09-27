@@ -340,7 +340,7 @@ SHM / socket / config 全部变体隔离（漏一处即冲突，如曾漏 SHM �
 | `Sources/WindInputApp/UI/CandidatePanel.swift` | 候选框 NSPanel（borderless 浮窗）+ 自绘 bitmap + 鼠标命中/悬停; 空白处右键经 UnifiedMenuBuilder 弹统一菜单; 空白处左键**拖动**整窗，松手回报 `pos.candidate`（见「浮窗拖动与位置固定」）|
 | `Sources/WindInputApp/UI/UnifiedMenuBuilder.swift` | 把服务下发的统一菜单树（MenuItemData）构建为原生 NSMenu; 三处共用。两种派发：`.inProcess`（普通 NSMenu，builder 作 target 回调）与 `.imkCommand`（系统输入菜单，target=nil + selector，IMK 经 doCommandBySelector 路由）; 菜单 id 统一经 NSMenuItem.tag 回传 |
 | `Sources/WindInputApp/UI/ModeStatusController.swift` | 菜单栏模式指示器（NSStatusItem）: 收 CmdModeStatus 显示中英/全半角/标点/方案; 下拉菜单（NSMenuDelegate 动态填充）复用统一菜单树，点击回发 CmdMenuAction，服务未就绪时回退只读状态 |
-| `Sources/WindInputApp/UI/TooltipPanel.swift` | 候选悬停 tooltip NSPanel。配色与拆字字根字体路径随 `CmdTooltipShow` 下发（服务侧 `manager_macos.rs` 从主题求值成 `#RRGGBBAA`）; 空串则用内置深色默认 |
+| `Sources/WindInputApp/UI/TooltipPanel.swift` | 候选悬停 tooltip NSPanel。配色与拆字字根字体路径随 `CmdTooltipShow` 下发（服务侧 `manager_macos.rs` 从主题求值成 `#RRGGBBAA`）; 空串则用内置深色默认。分段颜色走同一帧的 `runs` 尾段（UTF-16 区间 + 已解析的 RGBA，缺省即单色，新旧两端互容） |
 | `Sources/WindInputApp/UI/StatusBubblePanel.swift` | 锚 caret 的模式状态气泡（收 CmdStatusShow）; 可拖动，松手回报 `pos.status_tip`，并应答服务端的 `pos.status_tip.query` |
 | `Sources/WindInputApp/UI/PanelGeometry.swift` | 把 `WireGeometry` 的纯几何接到真实 NSScreen（只决定「哪块屏」这一件事，其余在 kit 里可测）|
 | `Sources/WindInputApp/UI/ToastPanel.swift` | 屏幕级 Toast 通知 NSPanel（词库就绪/错误等）: 收 CmdToastShow（标题+正文+bg/fg/accent+position+时长）渲染暗色圆角卡片 + 左侧 accent 条，按 durationMs 自动隐藏（0=5000，<0 常驻）; 点击穿透 |
