@@ -15,6 +15,7 @@ use std::ffi::c_void;
 use core_foundation::array::CFArray;
 use core_foundation::attributed_string::CFMutableAttributedString;
 use core_foundation::base::{CFRange, TCFType};
+use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
 
@@ -27,9 +28,19 @@ use core_text::font::CTFont;
 use core_text::font_collection;
 use core_text::font_descriptor::{CTFontDescriptor, kCTFontCascadeListAttribute};
 use core_text::line::CTLine;
-use core_text::string_attributes::{kCTFontAttributeName, kCTForegroundColorAttributeName};
+use core_text::run::CTRunRef;
+use core_text::string_attributes::{
+    kCTFontAttributeName, kCTForegroundColorAttributeName,
+    kCTForegroundColorFromContextAttributeName,
+};
+use foreign_types::ForeignType;
 
-use super::dwrite::{TextMetrics, TextStyle};
+use super::dwrite::{ColorRun, TextMetrics, TextStyle, utf16_runs};
+
+// core-text 没有包 `CTRunDraw`（按字形子区间画一个 run）；框架本身已由 core-text 链接。
+unsafe extern "C" {
+    fn CTRunDraw(run: CTRunRef, context: *mut core_graphics::sys::CGContext, range: CFRange);
+}
 use super::script::FontPlan;
 
 /// 主字体载入失败时的系统回退字体族。
@@ -366,6 +377,95 @@ impl TextRenderer {
         Ok(())
     }
 
+    /// 分段着色绘制。镜像 dwrite 的 `TextRenderer::draw_runs`：`runs` 为空（或全被判为非法
+    /// 区间）时就是 [`Self::draw`]。
+    ///
+    /// # 为什么不按区间设 `kCTForegroundColorAttributeName`
+    ///
+    /// 属性不同的区间会被 CoreText 切成不同的 CTRun，跨边界的字距与连字可能因此变化——带色
+    /// line 的宽度就不再等于 [`Self::measure`] 量出的宽度，布局与绘制对不上。
+    ///
+    /// 做法是**整形只做一次**：整串设 `kCTForegroundColorFromContextAttributeName`（字色取
+    /// 上下文填充色），这个 line 除此之外与测量用的完全同构；绘制时逐个 CTRun，用
+    /// `string_indices` 把颜色区间换算成字形子区间，逐段换填充色再 `CTRunDraw`。字形位置
+    /// 来自同一次整形，度量一致由构造保证。CoreGraphics 原生处理填充色的 alpha，无需像
+    /// DirectWrite 那样按 alpha 分组。
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_runs(
+        &self,
+        buf: &mut [u8],
+        buf_width: u32,
+        buf_height: u32,
+        x: f32,
+        y: f32,
+        text: &str,
+        ts: &TextStyle,
+        color: [u8; 4],
+        runs: &[ColorRun],
+    ) -> Result<(), String> {
+        let spans = utf16_runs(text, runs);
+        if spans.is_empty() {
+            return self.draw(buf, buf_width, buf_height, x, y, text, ts, color);
+        }
+        if buf_width == 0 || buf_height == 0 || ts.size <= 0.0 {
+            return Ok(());
+        }
+        let w = buf_width as usize;
+        let h = buf_height as usize;
+        if buf.len() < w * h * 4 {
+            return Err("buffer too small".into());
+        }
+        let font = self.font_styled(ts.size, ts.weight, ts.family);
+        let line = make_context_colored_line(text, &font);
+        // 某个 UTF-16 下标的颜色：区间重叠时后者覆盖前者，与 DirectWrite 侧
+        // 「后设的 SetDrawingEffect 覆盖先设的」一致。
+        let color_at = |i: isize| -> [u8; 4] {
+            spans
+                .iter()
+                .rev()
+                .find(|(s, l, _)| i >= *s as isize && i < (*s + *l) as isize)
+                .map_or(color, |r| r.2)
+        };
+        let ascent = font.ascent();
+        let space = CGColorSpace::create_device_rgb();
+        let bitmap_info = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
+        {
+            let ctx = CGContext::create_bitmap_context(
+                Some(buf.as_mut_ptr() as *mut c_void),
+                w,
+                h,
+                8,
+                w * 4,
+                &space,
+                bitmap_info,
+            );
+            // 定位与 `draw` 同一口径；各 run 的字形位置相对于这个行原点。
+            ctx.set_text_position(x as f64, (h as f32 - (y + ascent as f32)) as f64);
+            for run in line.glyph_runs().iter() {
+                let idx = run.string_indices();
+                let mut g = 0usize;
+                while g < idx.len() {
+                    let c = color_at(idx[g]);
+                    let mut e = g + 1;
+                    while e < idx.len() && color_at(idx[e]) == c {
+                        e += 1;
+                    }
+                    ctx.set_fill_color(&cg_rgba(c));
+                    unsafe {
+                        CTRunDraw(
+                            run.as_concrete_TypeRef(),
+                            ctx.as_ptr(),
+                            CFRange::init(g as isize, (e - g) as isize),
+                        );
+                    }
+                    g = e;
+                }
+            }
+            ctx.flush();
+        }
+        Ok(())
+    }
+
     /// 测量文本尺寸（用基准字号）。
     pub fn measure_text(&self, text: &str) -> TextMetrics {
         self.measure_text_sized(text, self.font_size)
@@ -496,6 +596,35 @@ fn make_line(text: &str, font: &CTFont, color: Option<&CGColor>) -> CTLine {
     CTLine::new_with_attributed_string(attr.as_concrete_TypeRef())
 }
 
+/// `[R, G, B, A]` → CGColor（设备 RGB，与 `draw` 同一色彩空间）。
+fn cg_rgba(c: [u8; 4]) -> CGColor {
+    CGColor::rgb(
+        c[0] as f64 / 255.0,
+        c[1] as f64 / 255.0,
+        c[2] as f64 / 255.0,
+        c[3] as f64 / 255.0,
+    )
+}
+
+/// 字色取上下文填充色的单行 CTLine（[`TextRenderer::draw_runs`] 用）。
+///
+/// 除 `kCTForegroundColorFromContextAttributeName` 外与 `make_line(text, font, None)`
+/// （测量用）同构，且该属性整串统一，不切分 CTRun。
+fn make_context_colored_line(text: &str, font: &CTFont) -> CTLine {
+    let mut attr = CFMutableAttributedString::new();
+    attr.replace_str(&CFString::new(text), CFRange::init(0, 0));
+    let range = CFRange::init(0, attr.char_len());
+    unsafe {
+        attr.set_attribute(range, kCTFontAttributeName, font);
+        attr.set_attribute(
+            range,
+            kCTForegroundColorFromContextAttributeName,
+            &CFBoolean::true_value(),
+        );
+    }
+    CTLine::new_with_attributed_string(attr.as_concrete_TypeRef())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +683,81 @@ mod tests {
             r.family_exists(&FALLBACK_FAMILY.to_lowercase()),
             Some(true),
             "大小写不敏感，同 DirectWrite 的 FindFamilyName"
+        );
+    }
+
+    /// 分段着色用的 line 与测量用的 line 宽度相等——含连字 / 字距恰好落在颜色边界上的样例
+    /// （`fi` 在 `of|fice` 的 `f|i` 之间、`AV` 在 `A|V` 之间）。
+    ///
+    /// 这是「颜色不影响度量」在 CoreText 上的证据：若改成按区间设前景色属性，CTRun 会在
+    /// 颜色边界被切开，连字与字距就可能丢失，宽度随之漂移。
+    #[test]
+    fn colored_line_width_equals_measured_width() {
+        let r = TextRenderer::new("Helvetica", 16.0).unwrap();
+        for text in ["office", "AVATAR", "fi AV 你好", "WAVE fifty"] {
+            let font = r.font_for(16.0);
+            let plain = make_line(text, &font, None).get_typographic_bounds().width;
+            let colored = make_context_colored_line(text, &font)
+                .get_typographic_bounds()
+                .width;
+            assert_eq!(plain, colored, "{text:?}：带色 line 宽度与测量 line 不同");
+            assert_eq!(
+                r.measure(text, &TextStyle::new(16.0)).width,
+                colored as f32,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// 真按区间上了色：红 `ab` + 蓝 `cd`，各自 x 区间内改动像素以本段色为主；并且非空。
+    #[test]
+    fn draw_runs_colors_each_range() {
+        let r = TextRenderer::new("Helvetica", 32.0).unwrap();
+        let (w, h) = (200u32, 60u32);
+        let bg = [255u8, 255, 255, 255].repeat((w * h) as usize);
+        let mut buf = bg.clone();
+        let ts = TextStyle::new(32.0);
+        let x0 = 4.0;
+        let split = x0 + r.measure("ab", &ts).width;
+        let runs = [
+            ColorRun {
+                start: 0,
+                end: 2,
+                rgba: [220, 0, 0, 255],
+            },
+            ColorRun {
+                start: 2,
+                end: 4,
+                rgba: [0, 0, 220, 255],
+            },
+        ];
+        r.draw_runs(&mut buf, w, h, x0, 4.0, "abcd", &ts, [0, 0, 0, 255], &runs)
+            .unwrap();
+        let (mut left, mut right) = ((0, 0), (0, 0));
+        for i in 0..(w * h) as usize {
+            if buf[i * 4..i * 4 + 4] == bg[i * 4..i * 4 + 4] {
+                continue;
+            }
+            // BGRA 内存序：[0]=B、[2]=R。
+            let (b, red) = (buf[i * 4] as i32, buf[i * 4 + 2] as i32);
+            let side = if ((i as u32 % w) as f32) < split {
+                &mut left
+            } else {
+                &mut right
+            };
+            if red > b + 30 {
+                side.0 += 1;
+            } else if b > red + 30 {
+                side.1 += 1;
+            }
+        }
+        assert!(
+            left.0 > 20 && left.0 > left.1 * 4,
+            "左半应以红为主：{left:?}"
+        );
+        assert!(
+            right.1 > 20 && right.1 > right.0 * 4,
+            "右半应以蓝为主：{right:?}"
         );
     }
 }
