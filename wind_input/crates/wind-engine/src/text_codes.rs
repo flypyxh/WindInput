@@ -59,6 +59,29 @@ impl TextCodeView {
         v.sort_by_key(|c| c.len());
         v
     }
+
+    /// 编码提示用的「全码」：全部码里的最大码长；该长度上**系统层优先**（取其中最后一个，
+    /// 与改用户层之前 `ReverseIndex::codes_of(..).last()` 同口径），系统层在该长度没有码
+    /// 才取用户层的。
+    ///
+    /// 不能直接取 [`Self::codes_of`] 的最后一个：同长时用户码排在系统码后面，用户给「工」
+    /// 加个同长的 `gggg`，提示就从词库里的 `aaaa` 变成了它。
+    pub(crate) fn hint_code<'a>(&'a self, text: &str) -> Option<&'a str> {
+        let sys: Vec<&'a str> = self
+            .system
+            .as_ref()
+            .and_then(|s| s.codes_of(text))
+            .map(|l| l.iter().collect())
+            .unwrap_or_default();
+        let user: Vec<&'a str> = self
+            .user
+            .as_ref()
+            .map(|u| u.codes_of(text).collect())
+            .unwrap_or_default();
+        let max = sys.iter().chain(&user).map(|c| c.len()).max()?;
+        let at_max = |v: Vec<&'a str>| v.into_iter().rev().find(|c| c.len() == max);
+        at_max(sys).or_else(|| at_max(user))
+    }
 }
 
 /// 同时保留的方案份数上限。在用的方案通常是：主码表、联想方案、辅助码引用的方案，
@@ -178,6 +201,9 @@ pub(crate) type SharedSlots = Arc<Mutex<UserTextSlots>>;
 
 impl UserTextSlots {
     /// 为 `key` 腾位：新方案进来且已满时，淘汰最久未用、且不在重建中的一份。
+    ///
+    /// 所有槽都在重建时不淘汰，新方案照样进来，份数会暂时超过 [`MAX_SLOTS`]——在建的槽
+    /// 被删掉的话它的重建线程白跑、单飞标记也跟着丢；多出的那份等下次有空闲槽时再被淘汰。
     fn make_room_for(&mut self, key: &str) {
         if self.map.contains_key(key) || self.map.len() < MAX_SLOTS {
             return;
@@ -357,6 +383,73 @@ mod tests {
         let slots = SharedSlots::default();
         // 冷启动：本次拿不到（后台去建），调用方按「这一层没就绪」处理。
         assert!(get_or_refresh(&slots, &s, "wb").is_none());
+    }
+
+    /// 轮询到「该槽有索引且不在重建中」为止（上限 5 秒），返回那份索引。
+    fn wait_built(slots: &SharedSlots, key: &str) -> Arc<UserTextIndex> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let g = slots.lock().unwrap();
+                if let Some(s) = g.map.get(key)
+                    && !s.building
+                    && let Some(i) = &s.index
+                {
+                    return i.clone();
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台重建 5 秒内没有完成"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn building(slots: &SharedSlots, key: &str) -> bool {
+        slots
+            .lock()
+            .unwrap()
+            .map
+            .get(key)
+            .is_some_and(|s| s.building)
+    }
+
+    /// ★ 后台重建的结果会被**下一次调用**看到：冷启动那次返回 None 并起重建，建好后
+    /// `get_or_refresh` 拿到新表、单飞标记已复位且不再起重建；之后本方案写入 → 本次照返回
+    /// 旧表 + 后台重建 → 下一次拿到新内容。
+    #[test]
+    fn background_rebuild_is_seen_by_next_call() {
+        let s = tmp_store("bg");
+        s.add_user_word("wb", "zzzz", "嗨", 0, 0).unwrap();
+        let slots = SharedSlots::default();
+        assert!(
+            get_or_refresh(&slots, &s, "wb").is_none(),
+            "冷启动本次拿不到"
+        );
+        let built = wait_built(&slots, "wb");
+        assert_eq!(built.codes_of("嗨").collect::<Vec<_>>(), vec!["zzzz"]);
+        let got = get_or_refresh(&slots, &s, "wb").expect("建好后下一次调用拿得到");
+        assert!(Arc::ptr_eq(&got, &built));
+        assert!(!building(&slots, "wb"), "已是最新，不再起重建");
+
+        s.add_user_word("wb", "aaaa", "嗨", 0, 0).unwrap();
+        let stale = get_or_refresh(&slots, &s, "wb").expect("过期时照返回旧表");
+        assert_eq!(
+            stale.codes_of("嗨").collect::<Vec<_>>(),
+            vec!["zzzz"],
+            "本次是旧内容"
+        );
+        // `building` 在 get_or_refresh 返回前已于锁内置位，故这里等到的必是新表。
+        let fresh = wait_built(&slots, "wb");
+        assert!(!Arc::ptr_eq(&fresh, &stale));
+        assert_eq!(
+            fresh.codes_of("嗨").collect::<Vec<_>>(),
+            vec!["aaaa", "zzzz"]
+        );
+        let again = get_or_refresh(&slots, &s, "wb").unwrap();
+        assert!(Arc::ptr_eq(&again, &fresh), "下一次调用拿到新表");
+        assert!(!building(&slots, "wb"));
     }
 
     #[test]

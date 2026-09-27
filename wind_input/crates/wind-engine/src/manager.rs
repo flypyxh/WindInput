@@ -551,6 +551,8 @@ pub struct EngineManager {
     /// 不该和引擎构建互相阻塞，两者的等待方也不同（前者是后台线程，后者是切换方案的用户）。
     /// 兼作「是否正在建」的判据（`try_lock` 失败即在建），供打字线路决定要不要再 spawn。
     index_build_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 已告警过的无效辅助码来源条目（`方案\0条目`），见 [`Self::first_aux_source_warn`]。
+    aux_source_warned: Mutex<std::collections::HashSet<String>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -798,6 +800,7 @@ impl EngineManager {
             shuangpin_reverse_cache: Mutex::new((String::new(), None)),
             build_locks: Mutex::new(HashMap::new()),
             index_build_locks: Mutex::new(HashMap::new()),
+            aux_source_warned: Mutex::default(),
         };
         // 仅同步构建活跃方案；其余方案由 Coordinator 启动后台预热（prewarm_schema）提前构建，
         // 避免首次切换时同步重熔大词库卡顿。单飞构建锁保证预热与切换不重复构建。
@@ -1104,6 +1107,7 @@ impl EngineManager {
     /// (后者生成码常与码表实际码不一致,导致全被拒)。
     /// **返回 `None` 表示反查索引尚未就绪**，不是「查不到」——见 [`Self::word_codes_in`]
     /// 的三态说明。展示类调用方 `unwrap_or_default()` 即可。
+    /// 含用户层：同长时系统码优先，用户码只在词库没有该长度的码时才出（见 `TextCodeView::hint_code`）。
     pub fn codetable_reverse_hint(&self, text: &str) -> Option<String> {
         let primary = self
             .primary_codetable
@@ -1117,12 +1121,7 @@ impl EngineManager {
         if !v.system_ready() {
             return None;
         }
-        Some(
-            v.codes_of(text)
-                .last()
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
-        )
+        Some(v.hint_code(text).map(str::to_string).unwrap_or_default())
     }
 
     /// 用**主拼音方案**为词推断带空格的音节码（`行长` → `hang zhang`），供候选注释的注音
@@ -1542,14 +1541,48 @@ impl EngineManager {
         Some(m)
     }
 
-    /// 反查索引「在用集合」里除主码表外的方案：联想词方案 + 辅助码引用的方案。
+    /// 辅助码**当下可能用到**的方案来源（`schema:<id>`），去重、保序：活跃方案的
+    /// `[engine.aux_code]` ∪ 临拼目标方案的（五笔下从临拼进辅助码时，码表配在拼音方案里）。
+    /// 辅助码关闭时对应方案的来源恒空（见 [`Self::aux_code_settings_of`]）。
+    ///
+    /// 供反查索引的内存护栏钉住它们、以及启动 / 切方案 / 改配置后的后台预热——两处用同一份
+    /// 集合，否则「预热了却被护栏顶掉」或「钉住了却没人预热」。
+    ///
+    /// 临拼目标**不走** [`Self::temp_pinyin_target`]：那个函数会 `ensure_loaded` 目标方案
+    /// （可能是秒级的拼音库加载），而本函数在切方案 / 保存设置的路径上也会被调。这里只要
+    /// 目标方案的 id 去读它的方案文件，不需要它的引擎。
+    pub fn aux_code_schemas_in_use(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push_from = |schema_id: &str| {
+            for id in self.aux_code_settings_of(schema_id).schema_sources() {
+                if !out.iter().any(|s| s == id) {
+                    out.push(id.to_string());
+                }
+            }
+        };
+        push_from(&self.active_schema_id());
+        let enabled = self
+            .temp_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enabled;
+        let primary = self
+            .primary_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(target) =
+            Self::resolve_temp_pinyin_target(enabled, self.current_engine_type(), &primary)
+        {
+            push_from(&target);
+        }
+        out
+    }
+
+    /// 反查索引「在用集合」里除主码表外的方案：联想词方案 + 辅助码在用的方案来源。
     fn reverse_index_pins(&self) -> Vec<String> {
         let mut v = vec![self.assoc_word_schema()];
-        v.extend(
-            self.aux_code_settings()
-                .schema_sources()
-                .map(str::to_string),
-        );
+        v.extend(self.aux_code_schemas_in_use());
         v
     }
 
@@ -4300,11 +4333,15 @@ impl EngineManager {
                         {
                             let id = id.trim();
                             if id.is_empty() || id == schema_id {
-                                tracing::warn!("辅助码来源无效（空或引用自己）: {entry}");
+                                if self.first_aux_source_warn(schema_id, entry) {
+                                    tracing::warn!("辅助码来源无效（空或引用自己）: {entry}");
+                                }
                                 return None;
                             }
                             if self.schema_engine_type(id).as_deref() != Some("codetable") {
-                                tracing::warn!("辅助码来源方案不存在或不是码表方案: {id}");
+                                if self.first_aux_source_warn(schema_id, entry) {
+                                    tracing::warn!("辅助码来源方案不存在或不是码表方案: {id}");
+                                }
                                 return None;
                             }
                             return Some(AuxSource::Schema(id.to_string()));
@@ -4313,7 +4350,7 @@ impl EngineManager {
                             self.data_dir.as_deref(),
                             entry,
                         );
-                        if p.is_none() {
+                        if p.is_none() && self.first_aux_source_warn(schema_id, entry) {
                             tracing::warn!(
                                 "辅助码文件不存在（用户/系统 schemas 目录均未找到）: {entry}"
                             );
@@ -4331,6 +4368,17 @@ impl EngineManager {
             max_phrase_len: resolved.max_phrase_len,
             sources,
         }
+    }
+
+    /// 「辅助码来源条目无效」这条告警是否**头一次**报（按 方案 + 条目 记）。
+    ///
+    /// 不节流的话每按一次辅助码键、每建一次反查索引（护栏要算在用集合）都打一条，
+    /// 而这是一次性的配置错误，报一次足够定位。改了配置后条目文本变了，自然会再报。
+    fn first_aux_source_warn(&self, schema_id: &str, entry: &str) -> bool {
+        self.aux_source_warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(format!("{schema_id}\0{entry}"))
     }
 
     /// 设置页「辅助码来源」的可选项：码表方案（排除 `exclude`，即请求方自己）+ 码表文件。
@@ -7258,6 +7306,16 @@ mod tests {
             FreqStrategy::Step,
             "未知策略应回退 step"
         );
+    }
+
+    /// 无效辅助码来源的告警按「方案 + 条目」只报一次；换个条目 / 换个方案照报。
+    #[test]
+    fn aux_source_warn_is_once_per_schema_and_entry() {
+        let mgr = EngineManager::new(&Config::default(), None);
+        assert!(mgr.first_aux_source_warn("pinyin", "schema:nope"));
+        assert!(!mgr.first_aux_source_warn("pinyin", "schema:nope"));
+        assert!(mgr.first_aux_source_warn("pinyin", "schema:other"));
+        assert!(mgr.first_aux_source_warn("shuangpin", "schema:nope"));
     }
 
     /// 临时拼音目标方案取自 schema.primary_pinyin（空=全拼）。
