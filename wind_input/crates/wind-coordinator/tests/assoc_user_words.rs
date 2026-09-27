@@ -422,6 +422,34 @@ fn assoc_history_drops_deleted_words() {
     );
 }
 
+/// ★ History 先过滤存在性再截名额：一批已删掉（词库里没有）的高分历史词不得挤掉
+/// 排在它们后面的有效历史。旧实现先按 limit 截断再过滤，名额被死词永久占住。
+#[test]
+fn assoc_history_deleted_words_do_not_hold_slots() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, _) = coord("h_slots", "word", false, |s| {
+        for i in 0..20 {
+            for _ in 0..3 {
+                s.record_assoc_pick("wubi86", "荷", &format!("荷已删{i:02}"))
+                    .unwrap();
+            }
+        }
+        s.record_assoc_pick("wubi86", "荷", "荷枪实弹").unwrap();
+    });
+    let got = assoc_after_he(&c);
+    assert!(
+        !got.iter().any(|t| t.starts_with("荷已删")),
+        "词库里没有的历史词不该出现：{got:?}"
+    );
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some("荷枪实弹"),
+        "有效历史应经 History 前置，实得 {got:?}"
+    );
+}
+
 /// ★ 拼音方案：FREQ 的键是候选码（无分隔的全拼，如 `zhongguowenhua`），联想查 FREQ 用的
 /// 反查索引码与之同形 ⇒ 正常打字选过的词在联想里上浮。
 #[test]

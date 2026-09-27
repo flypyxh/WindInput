@@ -314,7 +314,9 @@ impl AssocProvider for HistoryWords<'_> {
         if limit == 0 || self.schema.is_empty() {
             return Vec::new();
         }
-        let rows = match self.store.assoc_history(&self.schema, ctx.text, limit) {
+        // 取该上文下的**全部**行（limit=0），过滤后再截名额：先截后滤会让已删的高分词
+        // 永久占住名额、挤掉排在后面的有效历史。store 本就整段扫描再排序，全取不多花 IO。
+        let rows = match self.store.assoc_history(&self.schema, ctx.text, 0) {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("读联想历史失败（本次不出历史）: {e}");
@@ -325,10 +327,11 @@ impl AssocProvider for HistoryWords<'_> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         rows.into_iter()
-            // 只收「上文的严格延长」：今天写入端只记前缀延伸类的选择（见 `record_assoc_pick`），
-            // 这里再守一道，免得导入的脏数据把「上屏补剩余部分」算错。
+            // 存在性：历史表不随删词级联清理，删掉的词在这里丢掉（见类型文档）。
             .filter(|(word, _)| self.mgr.assoc_word_known(&self.word_schema, word))
             .filter_map(|(word, rec)| {
+                // 只收「上文的严格延长」：今天写入端只记前缀延伸类的选择（见
+                // `record_assoc_pick`），这里再守一道，免得导入的脏数据把「上屏补剩余部分」算错。
                 let rest = word
                     .strip_prefix(ctx.text)
                     .filter(|r| !r.is_empty())?
@@ -340,6 +343,7 @@ impl AssocProvider for HistoryWords<'_> {
                     source: AssocSource::History,
                 })
             })
+            .take(limit)
             .collect()
     }
 }
