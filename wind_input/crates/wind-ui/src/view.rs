@@ -1428,36 +1428,64 @@ fn paint_placed_bg_image(
         let Some(fill) = cache.fill(&img.path, spec, lw as u32, lh as u32, tint) else {
             return;
         };
-        let Some(img_path) = round_rect_path(lx, ly, lw, lh, 0.0) else {
-            return;
-        };
-        let Some(mut clip) = Mask::new(buf_w, buf_h) else {
-            return;
-        };
-        clip.fill_path(&node_path, FillRule::Winding, true, Transform::identity());
-        let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
-            return;
-        };
-        let shader = Pattern::new(
-            fill.as_ref(),
-            SpreadMode::Pad,
-            FilterQuality::Nearest,
-            img.opacity.clamp(0.0, 1.0),
-            Transform::from_translate(lx, ly),
-        );
-        let paint = Paint {
-            shader,
-            anti_alias: true,
-            ..Default::default()
-        };
-        pm.fill_path(
-            &img_path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            Some(&clip),
+        draw_clipped(
+            buf,
+            buf_w,
+            buf_h,
+            fill,
+            (lx, ly, lw, lh),
+            img.opacity,
+            Some(&node_path),
         );
     });
+}
+
+/// 把已按目标尺寸备好的填充位图贴到 `(x, y, w, h)`，只留 `clip` 路径内的部分（None=不裁）。
+/// 定位背景图（裁到节点圆角盒）与覆盖图（裁到节点矩形）共用。
+fn draw_clipped(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    fill: &tiny_skia::Pixmap,
+    (x, y, w, h): (f32, f32, f32, f32),
+    opacity: f32,
+    clip: Option<&tiny_skia::Path>,
+) {
+    let Some(img_path) = round_rect_path(x, y, w, h, 0.0) else {
+        return;
+    };
+    let mask = match clip {
+        Some(clip) => {
+            let Some(mut mask) = Mask::new(buf_w, buf_h) else {
+                return;
+            };
+            mask.fill_path(clip, FillRule::Winding, true, Transform::identity());
+            Some(mask)
+        }
+        None => None,
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    let shader = Pattern::new(
+        fill.as_ref(),
+        SpreadMode::Pad,
+        FilterQuality::Nearest,
+        opacity.clamp(0.0, 1.0),
+        Transform::from_translate(x, y),
+    );
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+    pm.fill_path(
+        &img_path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        mask.as_ref(),
+    );
 }
 
 /// `ViewImage` → 填充规格。
@@ -1478,8 +1506,11 @@ fn fill_spec_of(img: &ViewImage) -> crate::image_cache::FillSpec {
     }
 }
 
-/// 绘制 z 层覆盖图：按 place 定位（见 [`ImagePlace::rect`]）置于 host 内，stretch 到目标尺寸 + opacity。
+/// 绘制 z 层覆盖图：按 place 定位（见 [`ImagePlace::rect`]）置于 host 内，stretch 到目标尺寸 + opacity；
+/// 超出 host 矩形（不带圆角）的部分裁掉，内容上下两层同一口径——对齐编辑器预览 `paintLayers`。
 fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewLayer) {
+    let (x, y, rw, rh) = snap_to_pixels(host.x, host.y, host.w, host.h);
+    let (rw, rh) = (rw.max(1.0), rh.max(1.0));
     IMAGE_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         let Some((lx, ly, lw, lh)) = layer.place.rect(host, || cache.src_size(&layer.path)) else {
@@ -1494,30 +1525,24 @@ fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewL
         ) else {
             return;
         };
-        let Some(path) = round_rect_path(lx, ly, lw, lh, 0.0) else {
+        // 整块落在 host 内就不必建蒙版（逐帧每层一张整缓冲大小的蒙版不便宜）。
+        let inside = lx >= x && ly >= y && lx + lw <= x + rw && ly + lh <= y + rh;
+        let host_path = if inside {
+            None
+        } else {
+            round_rect_path(x, y, rw, rh, 0.0)
+        };
+        if !inside && host_path.is_none() {
             return;
-        };
-        let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
-            return;
-        };
-        let shader = Pattern::new(
-            fill.as_ref(),
-            SpreadMode::Pad,
-            FilterQuality::Nearest,
-            layer.opacity.clamp(0.0, 1.0),
-            Transform::from_translate(lx, ly),
-        );
-        let paint = Paint {
-            shader,
-            anti_alias: true,
-            ..Default::default()
-        };
-        pm.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
+        }
+        draw_clipped(
+            buf,
+            buf_w,
+            buf_h,
+            fill,
+            (lx, ly, lw, lh),
+            layer.opacity,
+            host_path.as_ref(),
         );
     });
 }
@@ -3447,6 +3472,74 @@ mod bg_place_tests {
         assert_eq!(rgb(&buf, 60, 32, 8), [255, 0, 0], "盒内那半没画");
         assert_eq!(alpha(&buf, 60, 42, 8), 0, "节点右缘外被涂");
         assert_eq!(alpha(&buf, 60, 39, 0), 0, "圆角外被涂");
+    }
+
+    fn layer(path: String, z: i32, place: ImagePlace) -> ViewLayer {
+        ViewLayer {
+            path,
+            z,
+            place,
+            opacity: 1.0,
+        }
+    }
+
+    /// 覆盖图超出节点的部分裁掉，裁到节点**矩形**（不带圆角）——对齐编辑器预览
+    /// `paintLayers` 的 `ctx.rect` 硬裁；内容上下两层同一口径。
+    #[test]
+    fn layer_overflow_is_clipped_to_node_rect() {
+        for z in [-1, 1] {
+            // 节点 40×40（圆角 12）放在 60×40 缓冲里；图 16×16 贴右上角再向右挪 6px，一半出界。
+            let p = ImagePlace {
+                off_x: 6.0,
+                ..place("top-right")
+            };
+            let buf = paint(
+                View::container(Layout::Row).radius(12.0).layers(vec![layer(
+                    png_uri(RED, 16, 16),
+                    z,
+                    p,
+                )]),
+                40.0,
+                40.0,
+                60,
+                40,
+            );
+            assert_eq!(rgb(&buf, 60, 32, 8), [255, 0, 0], "z={z}：盒内那半没画");
+            assert_eq!(alpha(&buf, 60, 40, 8), 0, "z={z}：节点右缘外被涂");
+            assert_eq!(alpha(&buf, 60, 45, 8), 0, "z={z}：节点右缘外被涂");
+            assert_eq!(
+                rgb(&buf, 60, 39, 0),
+                [255, 0, 0],
+                "z={z}：覆盖图只裁矩形，圆角处照画（编辑器口径）"
+            );
+        }
+    }
+
+    /// 完全落在节点内的覆盖图不受裁剪影响：同一位置、节点大小不同，画出来逐像素一致。
+    #[test]
+    fn layer_inside_node_is_not_trimmed() {
+        let p = ImagePlace {
+            off_x: 5.0,
+            off_y: 5.0,
+            ..place("top-left")
+        };
+        let at = |n: f32| {
+            paint(
+                View::container(Layout::Row).layers(vec![layer(two_tone_uri(), 1, p.clone())]),
+                n,
+                n,
+                60,
+                60,
+            )
+        };
+        let small = at(13.0);
+        assert_eq!(rgb(&small, 60, 5, 5), [255, 0, 0]);
+        assert_eq!(
+            rgb(&small, 60, 12, 8),
+            [0, 0, 255],
+            "贴着节点边的那列被裁了"
+        );
+        assert!(small == at(60.0), "节点内的覆盖图被裁剪改了像素");
     }
 
     /// 不配定位 = 铺满节点。对拍：铺满结果与「左上锚点、尺寸恰为节点」的定位结果逐像素一致，
