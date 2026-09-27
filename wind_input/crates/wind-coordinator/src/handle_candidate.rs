@@ -3733,13 +3733,16 @@ impl Coordinator {
         if hi >= state.candidates.len() {
             return None;
         }
+        // 逆切分次选只显示后段（「② 困难」）：以词定字按**所见**取字，被隐藏的前段视同已定、
+        // 照样上屏 ⇒ 按 1 得「很困」而不是「很」。前段为空 = 普通候选，按整串取字。
+        let (split_front, shown) = self.split_front_and_shown(state, &state.candidates[hi]);
         let cand = state.candidates[hi].clone();
         // 未展开的组候选（cand.text 是组名如「标点符号」）不可作字源 → 吞键，让用户先展开
         // （与 commit_selected 的组候选二级选择一致）。
         if cand.is_group {
             return Some(KeyAction::Consumed);
         }
-        let runes: Vec<char> = cand.text.chars().collect();
+        let runes: Vec<char> = shown.chars().collect();
         // 候选词长度不足 → None，由调用方按 overflow 处理
         if char_index >= runes.len() {
             return None;
@@ -3756,7 +3759,10 @@ impl Coordinator {
             }
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
-        let combined = format!("{}{}", state.committed_text, runes[char_index]);
+        let combined = format!(
+            "{}{}{}",
+            state.committed_text, split_front, runes[char_index]
+        );
         let out = self.maybe_convert(state, &combined);
         let chinese = state.chinese_mode;
         self.reset_pinyin_composition(state);

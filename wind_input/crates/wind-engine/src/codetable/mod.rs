@@ -5,5 +5,5 @@
 pub mod engine;
 pub mod sentence;
 
-pub use engine::{BaseSort, CodeTableEngine, CommitOptions, SplitTrigger};
+pub use engine::{BaseSort, CodeTableEngine, CommitOptions, SplitAltDisplay, SplitTrigger};
 pub use sentence::{CodeSentenceDecoder, SentenceResult, ShortCodeIndex};

@@ -393,6 +393,11 @@ pub struct CodeTableSpec {
     /// 切分候选沉底且不参与自动上屏）。非法值回退 `"empty"` 并告警。
     #[serde(default)]
     pub split_trigger: String,
+    /// 逆切分**次选**的显示形态：`""`/`"back"`（默认，次选只显示后段——「① 很可能 ② 困难」，
+    /// 选 ② 上屏「很困难」）/ `"full"`（次选也显示整串「② 很困难」）。只影响显示，
+    /// 上屏恒为整串。非法值回退 `"back"` 并告警。需求来源：论坛 t11 / t231。
+    #[serde(default)]
+    pub split_alt_display: String,
 
     // ── 方案内联行为覆盖（None=回落全局 schema.codetable；Some=覆盖）──
     /// 顶码上屏（超满码长取前 N 码首选上屏）。

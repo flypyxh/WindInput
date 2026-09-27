@@ -69,7 +69,7 @@ impl Coordinator {
         } else {
             state.candidates[offset..end]
                 .iter()
-                .map(|c| c.text.clone())
+                .map(|c| self.cand_display_text(&state, c))
                 .collect()
         };
         CandidateWindow {

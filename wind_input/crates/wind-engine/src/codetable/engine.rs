@@ -71,6 +71,10 @@ const SPLIT_BACK_LIMIT: usize = 8;
 /// 这个旋钮在文档里被定位成「给方案作者实测用的」，更容易被填大。
 const SPLIT_FRONT_LIMIT: usize = 8;
 
+/// 逆切分每段向词典取数的**池子**大小：候选调整（删除 / 置顶）在这个池子上做完再截到
+/// 前段 / 后段各自的条数，见 [`CodeTableEngine::split_segment`]。
+const SPLIT_SEGMENT_POOL: usize = 16;
+
 /// 逆切分的**前段码长**：恒 2，即一个**二简**。
 ///
 /// # 为什么是常量而不是「码长的一半」
@@ -131,6 +135,41 @@ impl SplitTrigger {
     }
 }
 
+/// 逆切分**次选**的显示形态（`[engine.codetable].split_alt_display`）。
+///
+/// 需求方（论坛 t11 / t231）对组合候选的理解是「组合态」：首选是**组合区**（前段 + 后段首选），
+/// 次选是**等待组合**的后段重码——前段已经认定、不再参与选择，就像已经上屏了一样。
+/// 于是 `hfkn` 应显示「① 很可能 ② 困难」，选 ② 上屏「很困难」。
+///
+/// 只动**显示**、不动上屏：候选的 `text` 恒为完整组合（词频、候选调整、上屏都按它走），
+/// 后段文本放进 `Candidate::display_text`，由协调器在显示出口取用。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SplitAltDisplay {
+    /// 次选只显示后段（默认，需求方的形态）。
+    #[default]
+    Back,
+    /// 次选也显示完整组合（「显示什么就上屏什么」，0.122 的形态）。
+    Full,
+}
+
+impl SplitAltDisplay {
+    /// 解析配置字符串：`""`/`"back"` → Back，`"full"` → Full；其余回退 Back 并告警
+    /// （同 [`SplitTrigger::parse`]）。
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("full") {
+            Self::Full
+        } else {
+            if !s.is_empty() && !s.eq_ignore_ascii_case("back") {
+                tracing::warn!(
+                    value = %s,
+                    "[engine.codetable].split_alt_display 取值无法识别，已回退 \"back\"；合法值仅 \"back\" / \"full\""
+                );
+            }
+            Self::Back
+        }
+    }
+}
+
 /// 码表上屏策略配置（schema 的 [engine.codetable] 相关开关）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CommitOptions {
@@ -168,6 +207,8 @@ pub struct CommitOptions {
     pub split_front_candidates: usize,
     /// 逆切分的触发档。见 [`SplitTrigger`]。
     pub split_trigger: SplitTrigger,
+    /// 逆切分次选的显示形态。见 [`SplitAltDisplay`]。
+    pub split_alt_display: SplitAltDisplay,
 }
 
 /// 码表引擎
@@ -195,6 +236,14 @@ pub struct CodeTableEngine {
     /// 它内部两张表都是 `OnceLock` 懒构建的全表扫描——关闭的方案连这个结构都不建；
     /// 开启的方案由 [`Self::prewarm_sentence`] 在后台线程提前填好，不占按键线程。
     sentence: Option<super::sentence::CodeSentenceDecoder>,
+    /// 逆切分段候选要吃的**候选调整**（shadow）：`(store, 数据归属方案 id)`。
+    ///
+    /// 候选调整平时在协调器那层应用（`apply_shadow_in`），而逆切分的两段是本引擎**自己**
+    /// 查的——协调器只看得见拼好的整串，用户在 `n` 上删掉的「内容」照样被拼进 `kpn`
+    /// → 「恐怕内容」（论坛 t231）。故段候选在这里按 `(方案, 段码)` 补吃一次。
+    ///
+    /// `None`（无 store 的测试 / CLI）⇒ 段候选不做调整，退回纯词库序。
+    segment_shadow: Option<(Arc<wind_store::Store>, String)>,
 }
 
 impl CodeTableEngine {
@@ -241,7 +290,15 @@ impl CodeTableEngine {
             // 构建方用 `with_own_extra_dicts` 按方案填。既有调用点（含测试）无需改动：
             // 空集只会让热插拔退化成「失效重建」，不会给出错误答案。
             own_extra_dicts: std::collections::HashSet::new(),
+            segment_shadow: None,
         }
+    }
+
+    /// 注入逆切分段候选的候选调整来源。`schema` 须是**数据归属** id（码表即方案自身 id，
+    /// 与协调器 `apply_shadow_in` 取 `data_schema_id` 同口径）。
+    pub fn with_segment_shadow(mut self, store: Arc<wind_store::Store>, schema: &str) -> Self {
+        self.segment_shadow = Some((store, schema.to_string()));
+        self
     }
 
     /// 注入码元字符集。缺省即内置默认 `a-z`。
@@ -370,14 +427,20 @@ impl CodeTableEngine {
     ///      需求方补充的「**且无后续编码**」恰好补上那个缺口：没有更长后继时用户已经打不
     ///      下去了，这串确实就是到此为止 ⇒ `sma` 无后继时切成 `sm`(什么) + `a`(啊)。
     /// 3. **`split_trigger` 定的空度**（[`SplitTrigger::allows`]）；
-    /// 4. **两段都查得到字词** —— 切一半没有意义；而查到的若只是符号（二简位没字可编时
-    ///    被编进去的 `→`/emoji/标点），那一段视同空码，见 [`wind_candidate::is_word_like`]。
+    /// 4. **两段都有编码** —— 切一半没有意义。字、词、符号一视同仁（段码上编的是符号也切），
+    ///    被用户在候选调整里删光的段视同空码，见 [`Self::split_segment`]。
     ///
     /// # 排序
     ///
-    /// `weight` 取两段的**较小值**：组合的可信度不高于最弱的那一段。前段恒取首选时
-    /// （默认）这等价于「按后段权重序」，与构造序一致；`natural_order` 填构造序作为
-    /// 同权重时的末级键，`base_sort = natural` 的方案也因此拿到同一个序。
+    /// `weight` 取两段的**较小值**：组合的可信度不高于最弱的那一段。随后再沿构造序压成
+    /// **单调不增**（后一条不高于前一条），`natural_order` 填构造序作同权重时的末级键——
+    /// 协调器按 `candidate_display_order` 重排（权重先于出现序）后仍得到构造序。
+    ///
+    /// ⚠️ 单调化不是修饰，构造序承载着两件协调器看不见的事：
+    /// - **段内的候选调整**：`split_segment` 按置顶改了段内次序，而段权重还是词库原值。
+    ///   不压的话，用户在 `kn` 上置顶的「难」到协调器又被按权重排回第二（审查实测）；
+    /// - **同前段相邻**：前段多取（`split_front_candidates` > 1）时，按原始权重会把不同
+    ///   前段的行交错，而次选只显示后段——「② 很能 ③ 难」读起来是「很难」，上屏却是「很可难」。
     ///
     /// # 返回
     ///
@@ -413,31 +476,36 @@ impl CodeTableEngine {
         // 不会被换掉。此前这里的注释把那条写成了对两种查询都成立，是错的。）
         //
         // 本函数只读段候选的 `text` 与 `weight`，不读 `code`。
-        // ⚠️ 两段都要滤掉**非字词**候选（符号/表情/标点/西文）：二简位没字可编时被编进去的
-        // 符号若照拼，产物是「字 + →」这种读不通的东西。滤空即视同该段空码 ⇒ 整体不产出
-        // ⇒ `is_empty` 保持真 ⇒ 满码空码清空按方案原本的设定走（正是需求方要的处理方案）。
-        let words_only = |v: Vec<Candidate>| -> Vec<Candidate> {
-            v.into_iter()
-                .filter(|c| wind_candidate::is_word_like(&c.text))
-                .collect()
-        };
-        let front = words_only(self.dm.search(
+        let front = self.split_segment(
             &front_code,
             self.opts.split_front_candidates.clamp(1, SPLIT_FRONT_LIMIT),
-        ));
+        );
         if front.is_empty() {
             return none;
         }
-        let back = words_only(self.dm.search(&back_code, SPLIT_BACK_LIMIT));
+        let back = self.split_segment(&back_code, SPLIT_BACK_LIMIT);
         if back.is_empty() {
             return none;
         }
 
         let mut out = Vec::with_capacity(front.len() * back.len());
-        for f in &front {
+        let alt_back_only = self.opts.split_alt_display == SplitAltDisplay::Back;
+        for (fi, f) in front.iter().enumerate() {
             for b in &back {
                 out.push(Candidate {
                     text: format!("{}{}", f.text, b.text),
+                    // 次选只显示后段（[`SplitAltDisplay::Back`]）：前段取的是**段首选**的那一行，
+                    // 前段就是「已认定」的，只剩后段待选。前段非首选的行（`split_front_candidates`
+                    // > 1 才有）照样显示整串，否则两行显示同一个后段、分不出前段差在哪。
+                    //
+                    // 后段首选那一条也填：「谁是首选」要到协调器排完序才知道（词频重排、候选调整
+                    // 都可能把次选顶上来），首条组合显示整串由协调器的显示出口判定
+                    // （`cand_display_text`）。
+                    display_text: if alt_back_only && fi == 0 {
+                        b.text.clone()
+                    } else {
+                        String::new()
+                    },
                     // 整串：`decide_auto_commit` 的判据是「恰一个 `code == input` 的候选」，
                     // 后段唯一时它恰好成立 ⇒ 原帖「前后都唯一即自动上屏」零额外判据地实现。
                     code: input.to_string(),
@@ -472,8 +540,50 @@ impl CodeTableEngine {
                 });
             }
         }
+        for i in 1..out.len() {
+            out[i].weight = out[i].weight.min(out[i - 1].weight);
+        }
         let split = format!("{front_code}{SPLIT_SEPARATOR}{back_code}");
         (out, split)
+    }
+
+    /// 逆切分一段的候选：精确查词典 → 吃候选调整 → 剔除特殊语法 → 截到 `limit` 条。
+    ///
+    /// # 为什么先多取再截
+    ///
+    /// 候选调整要在**截断之前**做：前段默认只取 1 条，若先截再删，用户删掉的恰是段首选时
+    /// 前段就空了、整个组合消失，而不是像正常输入那样由次选补位；置顶同理——被置顶的候选
+    /// 不在截断后的那 1 条里就无从上位。取数池 [`SPLIT_SEGMENT_POOL`] 与协调器按段码看到的
+    /// 列表同量级，置顶位次超出池子的（极少见）不生效。
+    ///
+    /// # 符号照样参与（论坛 t11，需求方 2026-09-20 两次澄清）
+    ///
+    /// 「有实际编码就切，不论字、词、符」：`xkok` → `xk`(行) + `ok`(👌)。0.122 曾把「只查到
+    /// 符号的段」当空码，是误读了需求方 09-19 那条（那条说的是二简位**没有编码**时按空码
+    /// 处理，符号不算空码）。
+    ///
+    /// 唯独剔除**特殊语法**值（`$CC(..)` 命令 / `$SS` 组 / `{date}` 之类求值模板）：它们要到
+    /// 协调器的 `finalize_candidates` 才展开，拼进组合就是把源码当文本上屏。判据与那里的
+    /// 快路径同一个（含 `$` 或 `{`），代价是字面就是 `$`、`{` 的符号条目也不参与切分。
+    fn split_segment(&self, code: &str, limit: usize) -> Vec<Candidate> {
+        let mut v = self.dm.search(code, SPLIT_SEGMENT_POOL);
+        if let Some((store, schema)) = &self.segment_shadow
+            && let Ok(Some(rec)) = store.get_shadow_rules(schema, code)
+        {
+            let pinned: Vec<wind_candidate::ShadowPinRule> = rec
+                .pinned
+                .iter()
+                .map(|p| wind_candidate::ShadowPinRule {
+                    word: p.word.clone(),
+                    cand_id: p.cand_id.clone(),
+                    position: p.position,
+                })
+                .collect();
+            wind_candidate::apply_shadow(&mut v, &rec.deleted, &pinned);
+        }
+        v.retain(|c| !c.text.contains('$') && !c.text.contains('{'));
+        v.truncate(limit);
+        v
     }
 
     /// 整句解的**切分分段**（诊断/探针用）。`None` = 未开启整句或解不出。
@@ -1634,9 +1744,12 @@ mod tests {
         ("aaaa", "工", 100),
         // 一简：三码切分（2+1）的后段落点。
         ("a", "啊", 950),
-        // ★ 二简位被**符号**占着（论坛 t11 第 2 条：「无字词可编也编成了符号」）。
-        // 它查得到、但不是字词 ⇒ 该段须视同空码。
+        // ★ 二简位被**符号**占着（论坛 t11：「无字词可编也编成了符号」）。
+        // 有编码就切，符号照样参与（需求方 2026-09-20 澄清）。
         ("qw", "→", 700),
+        // 二简位是**特殊语法**值：要到协调器才展开，拼进组合就是源码上屏 ⇒ 须剔除。
+        ("zx", "$CC(ime.x)", 700),
+        ("zy", "{date}", 700),
     ];
 
     /// 让 `hfkn` **有前缀候选却仍无精确解** —— 构造 `no_exact` 档场景的唯一条目。
@@ -1781,12 +1894,22 @@ mod tests {
         );
     }
 
-    /// ★ 段候选只是**符号**时视同该段空码（论坛 t11 补充第 2 条）。
-    ///
-    /// 二简位没字可编时被编进去的 `→`/emoji/标点若照拼，产物是「字 + →」这种读不通的东西。
-    /// 滤空 ⇒ 整体不产出 ⇒ `is_empty` 保持真 ⇒ 满码空码清空按方案原设定走。
+    /// ★ 段候选是**符号**也照样切（论坛 t11，需求方 2026-09-20：「有实际编码就切，不论字、
+    /// 词、符」）。0.122 曾把符号段视同空码，是误读了 09-19 那条。
     #[test]
-    fn split_treats_symbol_only_segment_as_empty() {
+    fn split_symbol_segment_participates() {
+        let e = split_engine(&[], split_opts());
+        // `qw` 只有符号「→」：有编码就切（论坛 t11，`xkok` → 行👌 同形）。
+        let r = e.convert("qwkn", 50).unwrap();
+        assert_eq!(texts(&r), vec!["→能", "→难"]);
+        let r = e.convert("hfqw", 50).unwrap();
+        assert_eq!(texts(&r), vec!["很可→"], "后段是符号同样切");
+    }
+
+    /// 特殊语法值（`$CC` 命令 / `{..}` 模板）不参与：它们要到协调器才展开，拼进组合就是
+    /// 源码上屏。剔光的段视同空码 ⇒ 满码空码清空照常生效。
+    #[test]
+    fn split_skips_special_syntax_segment() {
         let e = split_engine(
             &[],
             CommitOptions {
@@ -1794,22 +1917,128 @@ mod tests {
                 ..split_opts()
             },
         );
-        // `qw` 只有符号「→」，`kn` 有字 ⇒ 前段被滤空 ⇒ 不产出。
-        let r = e.convert("qwkn", 50).unwrap();
-        assert!(
-            r.candidates.is_empty(),
-            "符号段须视同空码，实际: {:?}",
-            texts(&r)
-        );
-        assert!(
-            r.is_empty && r.should_clear,
-            "视同空码 ⇒ 满码空码清空照常生效（这正是需求方要的处理方案）"
-        );
+        for input in ["zxkn", "zykn", "hfzx"] {
+            let r = e.convert(input, 50).unwrap();
+            assert!(r.candidates.is_empty(), "{input}：实际 {:?}", texts(&r));
+            assert!(
+                r.is_empty && r.should_clear,
+                "{input}：视同空码 ⇒ 满码空码清空"
+            );
+        }
+    }
 
-        // ★ 反向对照：换成有字的前段，同一后段就切得出来 —— 证明挡住它的是「符号」
-        // 这个判据本身，不是那两段码碰巧查不到。
-        let ok = e.convert("hfkn", 50).unwrap();
-        assert!(ok.candidates.iter().any(|c| c.is_split_composed));
+    /// 次选显示形态（论坛 t231）：默认 `Back` —— 同前段的每一行都带后段文本作显示，
+    /// 首条整串显示由协调器的显示出口判定（`cand_display_text`）；`Full` 一条都不填。
+    #[test]
+    fn split_alt_display_back_fills_back_text() {
+        let e = split_engine(&[], split_opts());
+        let r = e.convert("hfkn", 50).unwrap();
+        let disp: Vec<&str> = r
+            .candidates
+            .iter()
+            .map(|c| c.display_text.as_str())
+            .collect();
+        assert_eq!(disp, vec!["能", "难"]);
+        assert_eq!(texts(&r), vec!["很可能", "很可难"], "上屏文本不变");
+
+        let full = split_engine(
+            &[],
+            CommitOptions {
+                split_alt_display: SplitAltDisplay::Full,
+                ..split_opts()
+            },
+        );
+        let r = full.convert("hfkn", 50).unwrap();
+        assert!(r.candidates.iter().all(|c| c.display_text.is_empty()));
+    }
+
+    /// 前段多取时，前段**非首选**的行照样整串显示——否则两行显示同一个后段、分不出差别。
+    #[test]
+    fn split_alt_display_only_for_front_top() {
+        let e = split_engine(
+            &[("hf", "很", 800)],
+            CommitOptions {
+                split_front_candidates: 2,
+                ..split_opts()
+            },
+        );
+        let r = e.convert("hfkn", 50).unwrap();
+        let rows: Vec<(&str, &str)> = r
+            .candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c.display_text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("很可能", "能"),
+                ("很可难", "难"),
+                ("很能", ""),
+                ("很难", "")
+            ]
+        );
+        // 权重沿构造序单调不增：协调器按权重重排后同前段仍相邻（原始权重下
+        // 「很能」800 会插到「很可难」500 前面，次选显示「难」就被读成「很难」）。
+        let w: Vec<i32> = r.candidates.iter().map(|c| c.weight).collect();
+        assert!(w.windows(2).all(|p| p[0] >= p[1]), "权重须单调不增：{w:?}");
+    }
+
+    #[test]
+    fn split_alt_display_parse() {
+        assert_eq!(SplitAltDisplay::parse(""), SplitAltDisplay::Back);
+        assert_eq!(SplitAltDisplay::parse("back"), SplitAltDisplay::Back);
+        assert_eq!(SplitAltDisplay::parse("FULL"), SplitAltDisplay::Full);
+        assert_eq!(SplitAltDisplay::parse("bogus"), SplitAltDisplay::Back);
+    }
+
+    fn split_store(tag: &str) -> Arc<wind_store::Store> {
+        let root = std::env::temp_dir().join(format!("wind_split_shadow_{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Arc::new(wind_store::Store::open(root.join("user_data.db")).unwrap())
+    }
+
+    /// 论坛 t231：候选调整里删掉的词不得被拼进组合（`n` 删「内容」后 `kpn` 出了「恐怕内容」）。
+    #[test]
+    fn split_segment_respects_shadow_delete() {
+        let store = split_store("del");
+        store.delete_shadow("xh", "kn", "能").unwrap();
+        let e = split_engine(&[], split_opts()).with_segment_shadow(store.clone(), "xh");
+        assert_eq!(texts(&e.convert("hfkn", 50).unwrap()), vec!["很可难"]);
+
+        // 删掉的恰是**前段首选**：由前段次选补位，而不是整个组合消失（先多取再截的理由）。
+        store.delete_shadow("xh", "hf", "很可").unwrap();
+        let e = split_engine(&[("hf", "很", 800)], split_opts())
+            .with_segment_shadow(store.clone(), "xh");
+        assert_eq!(texts(&e.convert("hfkn", 50).unwrap()), vec!["很难"]);
+
+        // ★ 反向对照：别的方案的规则不串味 —— 证明生效的是按 (方案, 段码) 取的那条规则。
+        let other = split_engine(&[], split_opts()).with_segment_shadow(store, "other");
+        assert_eq!(
+            texts(&other.convert("hfkn", 50).unwrap()),
+            vec!["很可能", "很可难"]
+        );
+    }
+
+    /// 段首选跟着候选调整的置顶走：用户在 `kn` 上把「难」置顶，组合首选随之变成「很可难」。
+    #[test]
+    fn split_segment_respects_shadow_pin() {
+        let store = split_store("pin");
+        store.pin_shadow("xh", "kn", "难", None, 0).unwrap();
+        let e = split_engine(&[], split_opts()).with_segment_shadow(store, "xh");
+        assert_eq!(
+            texts(&e.convert("hfkn", 50).unwrap()),
+            vec!["很可难", "很可能"]
+        );
+    }
+
+    /// 某段被用户删光 ⇒ 视同空码，整体不产出。
+    #[test]
+    fn split_segment_deleted_empty_means_no_split() {
+        let store = split_store("empty");
+        store.delete_shadow("xh", "xt", "学").unwrap();
+        let e = split_engine(&[], split_opts()).with_segment_shadow(store, "xh");
+        assert!(e.convert("xtkn", 50).unwrap().candidates.is_empty());
     }
 
     /// 两段缺一不产：切一半的结果只会让用户以为词库缺条目。

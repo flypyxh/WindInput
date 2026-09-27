@@ -527,6 +527,17 @@ pub struct Candidate {
     #[serde(skip)]
     pub case_source: Option<String>,
     pub id: String,
+    /// 候选窗里**显示**的文本；空串 = 显示 `text`（绝大多数候选）。上屏、词频、候选调整
+    /// 一律仍按 `text`，本字段只换显示。
+    ///
+    /// 目前唯一的生产方是码表逆切分的「次选只显示后段」（`SplitAltDisplay::Back`，论坛
+    /// t231）：`hfkn` 的 ② 显示「困难」、上屏「很困难」。首条组合显示整串，由协调器的
+    /// 显示出口 `cand_display_text` 按列表位置判定。
+    ///
+    /// ⚠️ 与 `commit_override` 方向相反、别互相顶替：那个是「显示 `text`、上屏另一串」。
+    ///
+    /// 引擎内部用，不推送 UI（UI 收到的是显示出口算好的文本）。
+    #[serde(skip)]
     pub display_text: String,
     pub actions: Vec<Action>,
 }

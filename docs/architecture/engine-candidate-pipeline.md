@@ -159,7 +159,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 | `single_code_input` | 精确模式：禁前缀匹配 |
 | `single_code_complete` | 精确模式下的空码补全 |
 | `show_code_hint` | 前缀候选标注剩余编码 |
-| `split_input` / `split_front_candidates` / `split_trigger` | **逆切分**：**恰好**满码长且空码时，把码切成前后两段（各 `max_code_length/2`）各查一次词典，拼成组合候选（`hfkn` → `hf`(很可) + `kn`(能) → 「很可能」）。候选 `code` 为整串 ⇒ 后段唯一时被既有 `decide_auto_commit` 认作「恰一个精确匹配」而自动上屏，后段重码时出候选窗；`handle_top_code` 走 `convert(prefix,1)` ⇒ 继续打字母顶的就是切分首选。**方案级引擎固定参数，出厂关**。见 [codetable-split-input.md](../design/codetable-split-input.md) |
+| `split_input` / `split_front_candidates` / `split_trigger` / `split_alt_display` | **逆切分**：满码长（或无后继的未满码）且空码时，切出一个二简作前段、余下归后段，各查一次词典（段候选吃候选调整），拼成组合候选（`hfkn` → `hf`(很可) + `kn`(能) → 「很可能」）。候选 `code` 为整串 ⇒ 后段唯一时被既有 `decide_auto_commit` 认作「恰一个精确匹配」而自动上屏，后段重码时出候选窗；`handle_top_code` 走 `convert(prefix,1)` ⇒ 继续打字母顶的就是切分首选。**方案级引擎固定参数，出厂关**。见 [codetable-split-input.md](../design/codetable-split-input.md) |
 
 配置来源：全局 `schema.codetable.*` + 方案 `[engine.codetable]` 行为字段逐字段折叠（`Some` 覆盖 /
 `None` 回落全局）。行为与引擎固定参数**同段同结构**收在 `CodeTableSpec`（`wind-config/src/schema.rs`）：

@@ -933,6 +933,52 @@ impl Coordinator {
         }
     }
 
+    /// 候选的**显示文本**：逆切分次选（带 `display_text`）只显示后段，其余同
+    /// [`Self::cand_convert_text`]。**只给显示出口用**（候选窗 / 宿主候选列表 / 移动端拉取）——
+    /// 上屏一律走 `cand_convert_text`，显示与上屏在这里分叉是刻意的（`hfkn` ② 显示「困难」、
+    /// 上屏「很困难」）。
+    ///
+    /// **首条组合显示整串**在这里判，而不是在装配时清字段：写 `state.candidates` 的路径不止
+    /// 主路一条（快捷输入、特殊模式、辅助码重筛），数据侧收口必漏一处，漏了就是首条也只显示
+    /// 后段、前段从候选窗里整个消失。`c` 须借自 `state.candidates`（按地址认首条）。
+    ///
+    /// 简繁：先转**整串**再取尾部——OpenCC 按词转换带上下文，后段单独转与整串转可能不同，
+    /// 显示就会与上屏对不上。转换改变了字数（罕见）时退回后段单独转。
+    pub(crate) fn cand_display_text(&self, state: &State, c: &Candidate) -> String {
+        let full = self.cand_convert_text(state, c);
+        if c.display_text.is_empty() || Self::is_first_split(state, c) {
+            return full;
+        }
+        let tail = c.display_text.chars().count();
+        let len = full.chars().count();
+        if len == c.text.chars().count() && tail <= len {
+            full.chars().skip(len - tail).collect()
+        } else {
+            self.maybe_convert(state, &c.display_text)
+        }
+    }
+
+    /// 逆切分次选的 `(被隐藏的前段, 所见的后段)`；不是只显示后段的候选 ⇒ `("", text)`。
+    /// 内部文本域（未做简繁），供以词定字按所见取字。`c` 须借自 `state.candidates`。
+    pub(crate) fn split_front_and_shown(&self, state: &State, c: &Candidate) -> (String, String) {
+        if !c.display_text.is_empty()
+            && !Self::is_first_split(state, c)
+            && let Some(front) = c.text.strip_suffix(c.display_text.as_str())
+        {
+            return (front.to_string(), c.display_text.clone());
+        }
+        (String::new(), c.text.clone())
+    }
+
+    /// `c` 是不是列表里**第一条**逆切分组合候选（组合区：显示整串）。
+    fn is_first_split(state: &State, c: &Candidate) -> bool {
+        state
+            .candidates
+            .iter()
+            .find(|x| x.is_split_composed)
+            .is_some_and(|x| std::ptr::eq(x, c))
+    }
+
     /// **上屏与显示的唯一文本变换出口**：按当前开着的方向做简繁转换，都没开（或数据
     /// 缺失）则原样返回。
     ///

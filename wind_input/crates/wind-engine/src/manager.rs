@@ -5307,6 +5307,9 @@ impl EngineManager {
                 split_trigger: crate::codetable::SplitTrigger::parse(
                     &schema.engine.codetable.split_trigger,
                 ),
+                split_alt_display: crate::codetable::SplitAltDisplay::parse(
+                    &schema.engine.codetable.split_alt_display,
+                ),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -5369,10 +5372,19 @@ impl EngineManager {
                     charset.leading_chars().into_iter().collect::<String>()
                 );
             }
+            let mut engine = CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
+                .with_charset(charset)
+                .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema));
+            // 逆切分的两段由引擎自己查，协调器的候选调整够不着，须另行注入（论坛 t231）。
+            // 归属 id 取方案自身：码表的 `data_schema_id` 就是自身 id（只有拼音族折叠），
+            // 混输下逆切分恒关、注入了也不会被读。
+            if commit_opts.split_input
+                && let Some(store) = &store
+            {
+                engine = engine.with_segment_shadow(store.clone(), schema_id);
+            }
             Some(Box::new(Self::attach_sentence_freq(
-                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
-                    .with_charset(charset)
-                    .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema)),
+                engine,
                 commit_opts.sentence_input,
                 &schemas,
             )))

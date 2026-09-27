@@ -6137,7 +6137,7 @@ impl Coordinator {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let full = self.cand_convert_text(state, c);
+                let full = self.cand_display_text(state, c);
                 // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
                 // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
                 let disp = cand_cfg.truncate_display(&full);
