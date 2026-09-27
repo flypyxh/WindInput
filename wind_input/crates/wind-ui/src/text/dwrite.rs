@@ -1706,6 +1706,12 @@ mod imp {
         family: String,
         /// 最近一次 [`Self::set_default_weight`] 设进来的字重（接线测试读回）。
         default_weight: i32,
+        /// 绘制调用记录（每次 draw 一行），供渲染 golden 对拍。见 [`Self::take_draw_log`]。
+        ///
+        /// mock 不出像素，「画了什么、画在哪、用什么色」就只剩这份记录能对拍；只在测试构建
+        /// 存在，生产路径（Linux 本就没有真实渲染）不付任何代价。
+        #[cfg(test)]
+        draw_log: std::cell::RefCell<Vec<String>>,
     }
 
     impl TextRenderer {
@@ -1717,7 +1723,15 @@ mod imp {
                 mock_families: None,
                 family: String::new(),
                 default_weight: 0,
+                #[cfg(test)]
+                draw_log: std::cell::RefCell::new(Vec::new()),
             })
+        }
+
+        /// 取走至今的绘制调用记录（取后清空）。
+        #[cfg(test)]
+        pub fn take_draw_log(&self) -> Vec<String> {
+            std::mem::take(&mut *self.draw_log.borrow_mut())
         }
 
         /// 测试用：声明 mock 的「系统字体集」。之后 `family_exists` 按它回答 `Some(..)`。
@@ -1813,45 +1827,70 @@ mod imp {
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text(
             &self,
-            _buf: &mut [u8],
-            _buf_width: u32,
-            _buf_height: u32,
-            _x: f32,
-            _y: f32,
-            _text: &str,
-            _color: [u8; 4],
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            color: [u8; 4],
         ) -> Result<(), String> {
-            Ok(())
+            self.draw_text_sized(
+                buf,
+                buf_width,
+                buf_height,
+                x,
+                y,
+                text,
+                self.font_size,
+                color,
+            )
         }
 
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text_sized(
             &self,
-            _buf: &mut [u8],
-            _buf_width: u32,
-            _buf_height: u32,
-            _x: f32,
-            _y: f32,
-            _text: &str,
-            _size: f32,
-            _color: [u8; 4],
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            size: f32,
+            color: [u8; 4],
         ) -> Result<(), String> {
-            Ok(())
+            self.draw(
+                buf,
+                buf_width,
+                buf_height,
+                x,
+                y,
+                text,
+                &TextStyle::new(size),
+                color,
+            )
         }
 
-        /// mock：绘制空操作（样式忽略）。
+        /// mock：不出像素（样式忽略）；测试构建下记一行绘制调用。
         #[allow(clippy::too_many_arguments)]
+        #[cfg_attr(not(test), allow(unused_variables))]
         pub fn draw(
             &self,
             _buf: &mut [u8],
             _buf_width: u32,
             _buf_height: u32,
-            _x: f32,
-            _y: f32,
-            _text: &str,
-            _ts: &TextStyle,
-            _color: [u8; 4],
+            x: f32,
+            y: f32,
+            text: &str,
+            ts: &TextStyle,
+            color: [u8; 4],
         ) -> Result<(), String> {
+            #[cfg(test)]
+            self.draw_log.borrow_mut().push(format!(
+                "draw text={text:?} at=({x:?},{y:?}) size={:?} weight={} family={:?} \
+                 color={color:?}",
+                ts.size, ts.weight, ts.family,
+            ));
             Ok(())
         }
     }

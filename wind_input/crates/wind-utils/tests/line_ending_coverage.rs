@@ -106,6 +106,12 @@ const ALLOWED: &[(&str, &str)] = &[
          读文件那条是 read_toml，同 config.rs 的理由。\
          （2026-09-17 审查曾把它列为待修，是判错了，核对代码后移到这里。）",
     ),
+    (
+        "crates/wind-ui/src/candidate_window/render_golden.rs",
+        "整个文件是测试模块（#[cfg(test)] 挂在父模块的 mod 声明上，守卫的 strip_tests 看不到）。\
+         .lines() 只用来在 golden 对不上时定位首个不同行、写进失败信息；判等比的是整串，\
+         检入的 golden 由本仓自己生成，不是用户文件。",
+    ),
     // ---- 另案：修法与其余几处不同 ----
     (
         "crates/wind-dict/src/codetable.rs",

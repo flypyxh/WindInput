@@ -662,6 +662,15 @@ impl Tooltip {
         (buf, w, h, cw, ch, ml, mt, mr, mb, has_shadow)
     }
 
+    /// 渲染 golden 用：按显示路径画一帧，返回 `(缓冲, 宽, 高, 绘制调用记录)`。
+    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    pub(crate) fn golden_frame(&mut self, doc: &TooltipDoc) -> (Vec<u8>, u32, u32, Vec<String>) {
+        let text = self.set_doc(doc, 0);
+        let _ = self.renderer.take_draw_log();
+        let (buf, w, h, ..) = self.render_to_bgra(&text);
+        (buf, w, h, self.renderer.take_draw_log())
+    }
+
     /// 渲染文本到窗口缓冲，返回内容尺寸和阴影 margin。
     /// 返回 `(cw, ch, ml, mt, mr, mb)`；失败返回 None（text 为空时调用方已拦截）。
     fn render_to_window(&mut self, text: &str) -> (u32, u32, u32, u32, u32, u32) {

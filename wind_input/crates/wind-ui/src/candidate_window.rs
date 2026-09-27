@@ -7385,3 +7385,7 @@ mod tip_hold_tests {
         assert_eq!(w.tip_for.get(), -1);
     }
 }
+
+// 渲染 golden 对拍（Linux mock 后端才有绘制调用记录）。见模块文档。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod render_golden;

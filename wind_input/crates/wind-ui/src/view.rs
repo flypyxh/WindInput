@@ -269,7 +269,7 @@ pub struct ViewGradient {
 }
 
 /// 四边内/外边距
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Edges {
     pub l: f32,
     pub t: f32,
@@ -303,14 +303,14 @@ impl Edges {
 }
 
 /// 主轴方向
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     Row,
     Column,
 }
 
 /// 对齐方式（交叉轴 / 文本水平）
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Align {
     Start,
     Center,
@@ -945,6 +945,71 @@ impl View {
     /// 测得尺寸（measure 后有效）
     pub fn measured_size(&self) -> (f32, f32) {
         (self.mw, self.mh)
+    }
+
+    /// 整棵树逐节点的文本转储（每节点一行，按深度缩进），供渲染 golden 对拍。
+    ///
+    /// 每行只列**与默认值不同**的字段（布局结果 `m`/`rect` 恒列）。手写而不 `#[derive(Debug)]`：
+    /// 派生输出会随新增字段整体变形，而 golden 要守的恰恰是「加了新能力、出厂路径的树逐字节
+    /// 不变」——新字段取默认值时不出现，出厂路径的转储就与加字段前相同。
+    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    pub(crate) fn debug_dump(&self) -> String {
+        let mut out = String::new();
+        self.dump_into(&mut out, 0, &View::default());
+        out
+    }
+
+    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    fn dump_into(&self, out: &mut String, depth: usize, d: &View) {
+        let mut line = format!("{:indent$}{:?}", "", self.layout, indent = depth * 2);
+        let mut field = |name: &str, v: String, dv: String| {
+            if v != dv {
+                line.push_str(&format!(" {name}={v}"));
+            }
+        };
+        macro_rules! f {
+            ($name:literal, $($field:tt)+) => {
+                field($name, format!("{:?}", self.$($field)+), format!("{:?}", d.$($field)+))
+            };
+        }
+        f!("margin", margin);
+        f!("padding", padding);
+        f!("gap", gap);
+        f!("cross", cross_align);
+        f!("main", main_align);
+        f!("fixed_w", fixed_w);
+        f!("fixed_h", fixed_h);
+        f!("min_w", min_w);
+        f!("min_h", min_h);
+        f!("bg", bg);
+        f!("radius", corner_radius);
+        f!("border", border);
+        f!("text", text);
+        f!("color", text_color);
+        f!("size", font_size);
+        f!("weight", font_weight);
+        f!("family", font_family);
+        f!("align", text_align);
+        f!("caret", caret_at);
+        f!("caret_w", caret_w);
+        f!("bar", left_bar);
+        f!("circle", circle_bg);
+        f!("image", bg_image);
+        f!("gradient", bg_gradient);
+        f!("layers", layers);
+        f!("grow", grow);
+        f!("fill", fill_cross);
+        f!("clip", clip);
+        f!("tag", tag);
+        f!("rot", rot);
+        line.push_str(&format!(
+            " m=({:?},{:?}) rect={:?}\n",
+            self.mw, self.mh, self.rect
+        ));
+        out.push_str(&line);
+        for c in &self.children {
+            c.dump_into(out, depth + 1, d);
+        }
     }
 
     /// 排布后的绝对矩形（layout 后有效）。仅供测试断言「某节点实际占多宽」——

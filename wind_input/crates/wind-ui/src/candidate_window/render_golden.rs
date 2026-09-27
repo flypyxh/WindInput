@@ -1,0 +1,201 @@
+//! 渲染 golden 对拍：出厂主题 × 出厂注释 / 气泡样例 × 常态 / 选中 / 悬停 × 四种排布。
+//!
+//! # 守的是什么
+//!
+//! 分段着色（`docs/design/text-span-colors.md` §13.2）要求「出厂外观逐字节不变」。
+//! 这件事单靠「新代码的某条断言」证明不了——新代码录的参照只能证明「和自己一样」。
+//! 所以参照必须在**动渲染层之前**录下、入库，之后每一步改动都拿它对拍。
+//!
+//! 每个用例录三样东西，Linux mock 后端下全部确定：
+//! - **View 树转储**（[`View::debug_dump`]）：布局、颜色、字号、字重、裁剪、旋转逐字段；
+//! - **绘制调用日志**：mock `TextRenderer` 记下的每一次文字绘制（文本、坐标、样式、颜色）；
+//! - **像素摘要**：mock 不出字形，但背景 / 边框 / 圆角 / 阴影是 tiny-skia 真光栅化，
+//!   对整块缓冲取 FNV-1a 摘要（不用 `DefaultHasher`：它的算法不作承诺，换工具链会假红）。
+//!
+//! # 更新参照
+//!
+//! 只在**有意**改变出厂外观时才重录：`WIND_UI_BLESS_GOLDEN=1 cargo test -p wind-ui --lib
+//! render_golden`，然后在提交里说明为什么变。改渲染层时 golden 红了，默认是回归。
+
+use super::*;
+use std::path::PathBuf;
+use wind_ui_types::{TooltipDoc, TooltipLine, TooltipSection};
+
+/// 出厂主题目录下的主题（含两个抽象 base：它们同样可加载，且是其余主题的公共祖先）。
+const THEMES: &[&str] = &[
+    "_base",
+    "_qingfeng",
+    "default",
+    "amber",
+    "jade",
+    "violet",
+    "msime",
+];
+
+/// 四种排布：`(名字, vertical, rotated, upright)`。合法组合只有这四个（见 `set_orientation`）。
+const LAYOUTS: &[(&str, bool, bool, bool)] = &[
+    ("横排", false, false, false),
+    ("竖排", true, false, false),
+    ("旋转", false, true, false),
+    ("直立", false, true, true),
+];
+
+fn themes_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes")
+}
+
+fn golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/render_golden")
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// 出厂注释模板 `${code_hint|code_rev|shuangpin}` 渲染出的样子：短编码、空注释、多字词编码。
+fn candidates() -> Vec<CandidateItem> {
+    let c = |text: &str, comment: &str| CandidateItem {
+        text: text.to_string(),
+        code: String::new(),
+        label: String::new(),
+        tooltip: TooltipDoc::default(),
+        comment: comment.to_string(),
+        no_index: false,
+    };
+    // 下标 0 选中、1 悬停、2/3 常态（一条无注释、一条有）。
+    vec![c("好", "vb"), c("号", "kg"), c("浩", ""), c("你好", "wqvb")]
+}
+
+/// 出厂气泡段（完整原文关、编码、拼音逐字）渲染出的样子。
+fn tooltip_doc() -> TooltipDoc {
+    let line = |t: &str, raw| TooltipLine {
+        text: t.to_string(),
+        raw,
+    };
+    TooltipDoc {
+        sections: vec![
+            TooltipSection {
+                title: Some("编码(五笔)".into()),
+                inline: false,
+                lines: vec![line("wqvb", 0)],
+            },
+            TooltipSection {
+                title: Some("拼音".into()),
+                inline: false,
+                lines: vec![line("你：nǐ", 0), line("好：hǎo/hào", 1)],
+            },
+        ],
+    }
+}
+
+/// 一个主题（亮或暗）的全部用例，拼成一份文本。
+fn render_theme(name: &str, dark: bool) -> String {
+    let theme = wind_theme::load_resolved(&themes_dir(), name, dark)
+        .unwrap_or_else(|e| panic!("加载出厂主题 {name}（dark={dark}）失败：{e}"));
+    let mut out = String::new();
+    for &(label, vertical, rotated, upright) in LAYOUTS {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_theme(theme.clone());
+        w.set_orientation(vertical, rotated, upright);
+        // 选中 0、悬停 1：一帧里三态俱全。模式徽标给一个，直立态下它也逐格扶正。
+        w.update("nihao", 3, "拼", candidates(), 0, 1, 1, 2);
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        let (mw, mh) = root.measured_size();
+        let (bw, bh) = (mw.ceil().max(1.0) as u32, mh.ceil().max(1.0) as u32);
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        let _ = w.text_renderer.take_draw_log();
+        root.paint(&mut buf, bw, bh, &w.text_renderer);
+        out.push_str(&format!("== 候选窗 {label} ==\n"));
+        out.push_str(&root.debug_dump());
+        out.push_str(&format!(
+            "-- 绘制 {bw}x{bh} 像素摘要 {:016x}\n",
+            fnv1a(&buf)
+        ));
+        for l in w.text_renderer.take_draw_log() {
+            out.push_str(&l);
+            out.push('\n');
+        }
+    }
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut tip = crate::tooltip::Tooltip::new(tx).unwrap();
+    tip.set_theme(&theme);
+    let (buf, w, h, log) = tip.golden_frame(&tooltip_doc());
+    out.push_str(&format!(
+        "== 气泡 ==\n-- 绘制 {w}x{h} 像素摘要 {:016x}\n",
+        fnv1a(&buf)
+    ));
+    for l in log {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    // 主题资源的绝对路径随检出位置变，换成占位符。
+    let dir = themes_dir().to_string_lossy().into_owned();
+    out.replace(&dir, "<themes>")
+}
+
+#[test]
+fn factory_render_matches_golden() {
+    let bless = std::env::var_os("WIND_UI_BLESS_GOLDEN").is_some();
+    let dir = golden_dir();
+    let mut failed = Vec::new();
+    for &name in THEMES {
+        for dark in [false, true] {
+            let got = render_theme(name, dark);
+            let file = dir.join(format!(
+                "{name}-{}.txt",
+                if dark { "dark" } else { "light" }
+            ));
+            if bless {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&file, &got).unwrap();
+                continue;
+            }
+            let want = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("读 golden {} 失败：{e}", file.display()));
+            if got != want {
+                // 首个不同行，省得在上千行里肉眼找。
+                let line = got
+                    .lines()
+                    .zip(want.lines())
+                    .position(|(a, b)| a != b)
+                    .map_or(got.lines().count().min(want.lines().count()), |i| i);
+                failed.push(format!(
+                    "{}：第 {} 行起不同\n  实得 {:?}\n  参照 {:?}",
+                    file.display(),
+                    line + 1,
+                    got.lines().nth(line),
+                    want.lines().nth(line),
+                ));
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "出厂渲染与 golden 不一致（有意改外观才用 WIND_UI_BLESS_GOLDEN=1 重录）：\n{}",
+        failed.join("\n")
+    );
+}
+
+/// 守 golden 本身不是空转：候选文字、注释、气泡文字都必须出现在绘制日志里，
+/// 且注释确实有非空的那几条——否则上面的对拍测的是一个什么都没画的世界。
+#[test]
+fn golden_covers_comments_and_tooltip() {
+    let got = render_theme("default", false);
+    for needle in [
+        "text=\"好\"",
+        "text=\"vb\"",
+        "text=\"kg\"",
+        "text=\"wqvb\"",
+        "text=\"[编码(五笔)]\\nwqvb\\n[拼音]\\n你：nǐ\\n好：hǎo/hào\"",
+    ] {
+        assert!(got.contains(needle), "golden 里找不到 {needle}");
+    }
+    // 直立态注释逐格切：`wqvb` 在直立段里是四个单字母叶子。
+    let upright = got.split("== 候选窗 直立 ==").nth(1).unwrap();
+    assert!(upright.contains("text=\"w\""), "直立态注释应逐格切开");
+}
