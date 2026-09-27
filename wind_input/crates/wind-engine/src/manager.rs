@@ -4802,7 +4802,8 @@ impl EngineManager {
         // 下面的段级降级。清空→反序列化→取走，把这些回落也收进 `degraded_items`，
         // 否则用户的处境仍是「我写的这项没反应，也没人告诉我」。
         wind_config::tolerant_de::clear_fallbacks();
-        match base.clone().try_into::<Schema>() {
+        let misplaced = misplaced_dict_font_keys(&base);
+        let mut schema = match base.clone().try_into::<Schema>() {
             Ok(mut s) => {
                 let fallbacks = wind_config::tolerant_de::take_fallbacks();
                 if !fallbacks.is_empty() {
@@ -4825,6 +4826,30 @@ impl EngineManager {
             // 默认值，方案的其余部分照常工作，降级清单挂在 `Schema::degraded_items`
             // 上交给协调器 toast。
             Err(root_err) => Self::salvage_schema(schema_id, base, &root_err),
+        }?;
+        if !misplaced.is_empty() {
+            Self::warn_misplaced_dict_font_once(schema_id, &misplaced);
+            schema.degraded_items.extend(misplaced);
+        }
+        Some(schema)
+    }
+
+    /// `[[dictionaries]]` 下写了字体键时告警一次（`read_schema` 一次启动会被调用多次）。
+    fn warn_misplaced_dict_font_once(schema_id: &str, items: &[String]) {
+        static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let first = WARNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(schema_id.to_string());
+        if first {
+            warn!(
+                "方案 {schema_id} 的 {} 不是受支持的键，已忽略——词库不带字体。\
+                 要让私用区（PUA）文字用方案自带的字体文件渲染，写在 [engine.chaizi] 的 \
+                 font_path / font_family；字体已装进系统时也可用 [candidate] font_family",
+                items.join("、")
+            );
         }
     }
 
@@ -6409,6 +6434,29 @@ impl EngineManager {
     }
 }
 
+/// `[[dictionaries]]` 条目里写了 `font_path` / `font_family` 的，逐项返回描述。
+///
+/// 这两个键**从来不是** `DictSpec` 的字段，serde 按未知键静默丢弃——可它们长得太像
+/// 真的了：`[engine.chaizi]` 同名同义，于是方案作者照猫画虎写进词库段，字体一路不生效、
+/// 日志一个字都没有（Toli 蒙古文方案就是这样交付的）。收进 `degraded_items` 走现成的
+/// toast 通路，而不是给 `DictSpec` 加两个没人读的字段。
+fn misplaced_dict_font_keys(schema: &toml::Value) -> Vec<String> {
+    let Some(dicts) = schema.get("dictionaries").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    dicts
+        .iter()
+        .filter_map(|d| d.as_table())
+        .flat_map(|d| {
+            let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            ["font_path", "font_family"]
+                .into_iter()
+                .filter(|k| d.contains_key(*k))
+                .map(move |k| format!("[[dictionaries]] {id}.{k}（应写在 [engine.chaizi]）"))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7697,6 +7745,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// `[[dictionaries]]` 下的 `font_path` / `font_family` 不是受支持的键。以前被静默丢弃，
+    /// 方案作者只看得到「字体没生效」；现在要进 `degraded_items`（toast 的数据源），
+    /// 并且方案其余部分照常读出。
+    #[test]
+    fn font_keys_under_dictionaries_are_reported_not_silently_dropped() {
+        let base_dir =
+            std::env::temp_dir().join(format!("wind_eng_dict_font_data_{}", std::process::id()));
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(
+            schemas.join("toli.schema.toml"),
+            "[schema]\nid = \"toli\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"toli_main\"\npath = \"toli/toli.dict.yaml\"\n\
+             font_path = \"toli/Menk.ttf\"\nfont_family = \"Menk\"\n",
+        )
+        .unwrap();
+
+        let schema = EngineManager::read_schema("toli", Some(&base_dir), None)
+            .expect("多写两个键不许让方案读不出来");
+        assert_eq!(schema.dictionaries.len(), 1);
+        assert_eq!(
+            schema.degraded_items,
+            vec![
+                "[[dictionaries]] toli_main.font_path（应写在 [engine.chaizi]）".to_string(),
+                "[[dictionaries]] toli_main.font_family（应写在 [engine.chaizi]）".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 写在正确位置（`[engine.chaizi]`）的字体不许被误报。
+    #[test]
+    fn font_keys_in_engine_chaizi_are_not_reported() {
+        let v: toml::Value = toml::from_str(
+            "[engine.chaizi]\nfont_path = \"a.ttf\"\nfont_family = \"A\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"a.dict.yaml\"\n",
+        )
+        .unwrap();
+        assert!(misplaced_dict_font_keys(&v).is_empty());
     }
 
     /// 用户 override 里写了值域外的值，**不许**让整个方案读不出来。

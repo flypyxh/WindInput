@@ -1964,6 +1964,53 @@ pub(crate) struct ChaiziAssets {
     pub(crate) font: Option<(String, String)>,
 }
 
+/// 字根字体从 `sent` 变到 `want` 时要下发的 `(路径, 家族名)`；不用发时 `None`。
+///
+/// 变为「没有」时下发**空路径**＝撤掉，而不是什么都不发：渲染端的私用区字体位只有一个，
+/// 且压过方案级 `[candidate] font_family`。以前只停发不撤，五笔（黑体字根）切到蒙古文
+/// 方案后，蒙文的私用区码位仍被切到字根字体，画成字根或空白。
+fn chaizi_font_to_send(
+    sent: &Option<(String, String)>,
+    want: &Option<(String, String)>,
+) -> Option<(String, String)> {
+    if sent == want {
+        return None;
+    }
+    Some(want.clone().unwrap_or_default())
+}
+
+#[cfg(test)]
+mod chaizi_font_to_send_tests {
+    use super::chaizi_font_to_send;
+
+    fn font(p: &str) -> Option<(String, String)> {
+        Some((p.to_string(), "F".to_string()))
+    }
+
+    #[test]
+    fn switching_to_a_schema_without_chaizi_font_clears_it() {
+        assert_eq!(
+            chaizi_font_to_send(&font("wubi86/HeiTiZiGen.ttf"), &None),
+            Some((String::new(), String::new()))
+        );
+    }
+
+    #[test]
+    fn a_new_font_is_sent() {
+        assert_eq!(chaizi_font_to_send(&None, &font("a.ttf")), font("a.ttf"));
+        assert_eq!(
+            chaizi_font_to_send(&font("a.ttf"), &font("b.ttf")),
+            font("b.ttf")
+        );
+    }
+
+    #[test]
+    fn unchanged_sends_nothing() {
+        assert_eq!(chaizi_font_to_send(&None, &None), None);
+        assert_eq!(chaizi_font_to_send(&font("a.ttf"), &font("a.ttf")), None);
+    }
+}
+
 /// 一次候选刷新后的输入结局（码表全码/空码策略，仅正向输入字母时消费）。
 pub(crate) enum InputOutcome {
     /// 正常更新候选，继续组合。
@@ -3675,21 +3722,21 @@ impl Coordinator {
                 .reload_chaizi(new_db.as_deref());
             assets.db = new_db;
         }
-        if new_font != assets.font {
-            // 变为 None 时仅不再重发（字体集无撤销接口；旧字体仅影响 PUA 段渲染，无害）。
-            if let Some((path, family)) = &new_font {
+        if let Some((path, family)) = chaizi_font_to_send(&assets.font, &new_font) {
+            if path.is_empty() {
+                info!("撤下字根字体（当前方案无可用的 [engine.chaizi] 字体）");
+            } else {
                 // 打成 info 而不是 debug：「字根字体到底下发过没有」是这条链路上唯一能把
                 // 「没解析到」「解析到但渲染端加载失败」「一切正常」三态分开的观测点，
                 // 而渲染端的失败告警在另一个日志域里（wind-ui）。缺了这一行，日志上
                 // 「没有任何字根字体相关记录」既可能是没配、也可能是没走到这里。
                 info!("下发字根字体: {path}（家族名 {family}）");
-                let _ = self.ui_tx.send(UiCommand::SetTooltipChaiziFont {
-                    path: path.clone(),
-                    family: family.clone(),
-                });
             }
-            assets.font = new_font;
+            let _ = self
+                .ui_tx
+                .send(UiCommand::SetTooltipChaiziFont { path, family });
         }
+        assets.font = new_font;
     }
 
     /// 同步注释词库（`[[ui.comment_dicts]]`）到反查表：解析路径列表，与上次生效的比对，

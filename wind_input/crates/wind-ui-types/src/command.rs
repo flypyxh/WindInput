@@ -207,6 +207,10 @@ pub enum UiCommand {
     /// 同样横竖各一份，理由见上。
     SetPageNumberDisplay { h: String, v: String },
     /// 拆字字根字体（PUA 字根字符渲染）：TTF 文件路径 + DWrite 家族名（取自方案 [engine.chaizi]）。
+    ///
+    /// `path` 为空 = **撤掉**字根字体。渲染端的私用区字体位只有一个，且优先于方案级
+    /// `[candidate] font_family`：切到不带字根字体的方案时不撤，上一个方案的字根字体就会
+    /// 接管新方案的全部私用区文字（五笔 → Toli 蒙古文：蒙文被画成字根或空白）。
     SetTooltipChaiziFont { path: String, family: String },
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）。
     ShowCandidateMenu {

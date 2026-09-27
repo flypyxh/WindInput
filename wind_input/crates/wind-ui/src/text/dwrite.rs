@@ -364,7 +364,7 @@ mod imp {
                 let fallback = |what: &str| {
                     tracing::warn!(
                         "词库字体的家族名「{declared}」在该字体文件里不存在，且{what}，\
-                         字体将不生效——请把方案 [[dictionaries]] 的 font_family 改成字体自报的家族名"
+                         字体将不生效——请把方案 [engine.chaizi] 的 font_family 改成字体自报的家族名"
                     );
                     declared.to_string()
                 };
@@ -384,13 +384,25 @@ mod imp {
                 let real = String::from_utf16_lossy(&buf[..len as usize]);
                 tracing::warn!(
                     "词库字体的家族名「{declared}」在该字体文件里不存在，已改用它自报的「{real}」——\
-                     请把方案 [[dictionaries]] 的 font_family 改成后者"
+                     请把方案 [engine.chaizi] 的 font_family 改成后者"
                 );
                 real
             }
         }
 
+        /// `path` 为空 = 撤掉字根字体：私用区段不再被切到任何自定义字体集。
+        ///
+        /// ★ 先撤旧的再加载新的：加载失败时的结局必须是「没有字根字体」，而不是「沿用上一个
+        /// 方案的」——协调器已把新路径记为已下发、不会重发，旧字体会一直接管新方案的私用区。
+        /// 字根字体决定 PUA 字符的字形来源 → 测量宽度随之变，缓存一并清掉（不清的话切换拆字
+        /// 方案后字根仍按旧字体的宽度布局，表现为字根格错位/重叠）。
         pub fn set_chaizi_font(&mut self, path: &str, family: &str) -> Result<(), String> {
+            self.chaizi = None;
+            self.measure_cache.borrow_mut().clear();
+            self.line_heights.borrow_mut().clear();
+            if path.is_empty() {
+                return Ok(());
+            }
             unsafe {
                 let f3: IDWriteFactory3 = self
                     .factory
@@ -425,10 +437,6 @@ mod imp {
                     .chain(std::iter::once(0))
                     .collect();
                 self.chaizi = Some(ChaiziFont { collection, family });
-                // 字根字体改变了 PUA 字符的字形来源 → 其测量宽度随之改变。不清缓存的话，
-                // 切换拆字方案后字根仍按旧字体的宽度布局（表现为字根格错位/重叠）。
-                self.measure_cache.borrow_mut().clear();
-                self.line_heights.borrow_mut().clear();
                 Ok(())
             }
         }
@@ -436,6 +444,12 @@ mod imp {
         /// 基准字号（View 叶子未显式指定字号时回退）。
         pub fn base_size(&self) -> f32 {
             self.font_size
+        }
+
+        /// 仅测试可见：当前是否挂着字根字体。
+        #[cfg(test)]
+        pub fn has_chaizi_font(&self) -> bool {
+            self.chaizi.is_some()
         }
 
         /// 仅测试可见：当前测量缓存条目数。
@@ -1846,6 +1860,43 @@ mod imp {
 // 换行语义：关自动换行、留硬换行。两条缺一不可——只验前者会让多行候选静默退化成单行，
 // 只验后者则放任溢出继续。需要真实 DirectWrite，gate 到 Windows。
 #[cfg(all(test, windows))]
+mod chaizi_font_clear_tests {
+    use super::TextRenderer;
+
+    const FONT: &str = r"C:\Windows\Fonts\consola.ttf";
+
+    fn tr() -> TextRenderer {
+        TextRenderer::new("Microsoft YaHei UI", 16.0).expect("建 TextRenderer")
+    }
+
+    /// 空路径 = 撤掉。撤不掉的话，五笔的黑体字根会接管蒙古文方案的全部私用区文字。
+    #[test]
+    fn empty_path_clears_the_chaizi_font() {
+        if !std::path::Path::new(FONT).exists() {
+            return; // 精简版 Windows 可能没有这个文件；缺文件不该判失败
+        }
+        let mut r = tr();
+        r.set_chaizi_font(FONT, "").expect("加载系统字体");
+        assert!(r.has_chaizi_font());
+        r.set_chaizi_font("", "").expect("空路径不是错误");
+        assert!(!r.has_chaizi_font());
+        assert_eq!(r.measure_cache_len(), 0);
+    }
+
+    /// 新字体加载失败时不许沿用旧的：协调器不会重发，旧字体会一直留在新方案上。
+    #[test]
+    fn a_failed_load_does_not_keep_the_previous_font() {
+        if !std::path::Path::new(FONT).exists() {
+            return;
+        }
+        let mut r = tr();
+        r.set_chaizi_font(FONT, "").expect("加载系统字体");
+        assert!(r.set_chaizi_font(r"C:\不存在\no.ttf", "").is_err());
+        assert!(!r.has_chaizi_font());
+    }
+}
+
+#[cfg(all(test, windows))]
 mod wrapping_tests {
     use super::{TextRenderer, TextStyle};
 
@@ -2603,7 +2654,7 @@ mod tests {
     }
 }
 
-/// 词库级字体（`[[dictionaries]]` 的 `font_path` / `font_family`）的家族名探针。
+/// 方案自带字体（`[engine.chaizi]` 的 `font_path` / `font_family`）的家族名探针。
 ///
 /// # 为什么需要它
 ///
