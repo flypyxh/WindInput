@@ -72,8 +72,8 @@ pub struct StyledText {
     /// 私有：只经构建器写入，保证区间与文字同步（见下）。对外 `as_str()`。
     text: String,
     /// 按 `start` 升序、互不重叠；区间以字节计、落在字符边界上。空 = 整段节点正文色。
-    /// 未被任何区间覆盖的文字 = 节点正文色。
-    spans: Vec<Span>,
+    /// 未被任何区间覆盖的文字 = 节点正文色。内联存放前 3 段（`SmallVec<[Span; 3]>`，§13.3）。
+    spans: SmallVec<[Span; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,12 +81,13 @@ pub struct Span {
     pub start: u32,
     pub end: u32,
     /// 角色 = **归一后的变量名**（`code_rev`、`pinyin` …），或结构角色 `title` / `literal`；
-    /// `None` = 无角色（未知变量名的回显）。
-    pub role: Option<Arc<str>>,
+    /// `None` = 无角色（未知变量名的回显，以及不在 `TEXT_ROLES` 里的变量）。
+    /// 取自 `TEXT_ROLES` 的常驻字符串，模板解析时就算好（§13.3：逐片段分配 / 引用计数吃掉性能预算）。
+    pub role: Option<&'static str>,
     /// 在段名（气泡 label）里产出的片段：角色未配色时回落 `title` 角色，而非正文色（§3.2）。
     pub in_title: bool,
-    /// 内联色（`$[…]{}`）。有值即优先于角色（§6.2）。
-    pub color: Option<InlineColor>,
+    /// 内联色（`$[…]{}`）。有值即优先于角色（§6.2）。同一个 `$[…]{}` 内的片段共享一份。
+    pub color: Option<Arc<InlineColor>>,
 }
 
 impl StyledText {
@@ -105,12 +106,19 @@ impl From<String> for StyledText { /* 无区间 */ }
   在字符边界），不变量只守一处。
 - `InlineColor` / `ColorRef` 的定义在 wind-theme（§4.2），它依赖调色板的解析；wind-ui-types 已依赖 wind-theme。
 
-**角色名的来源与别名**：角色直接存归一后的变量名，不另编号。归一只靠一张别名表
-（`code` → `code_rev`、`code_all` → `code_rev_all`），放在 `comment.rs` 模板引擎里，产出片段时查一次。
-变量名本身散在几个求值入口里（见下），编号表做不到与它们同源，存名字则天然同源。
+**角色名的来源与别名**：角色存归一后的变量名，不另编号。归一只靠一张别名表
+（`code` → `code_rev`、`code_all` → `code_rev_all`），放在 `comment.rs` 模板引擎里，模板解析时查一次。
 
-`TEXT_ROLES`（wind-ui-types 的 `pub const`）只作**对外契约清单**：文档站角色表、主题编辑器严格模式照它
-列出与校验；引擎本身不查它。守它的测试是「清单里每个变量名都能被某个求值入口求出值（`Some`，空串也算）」，
+`TEXT_ROLES`（wind-ui-types 的 `pub const`）是**对外契约清单**：文档站角色表、主题编辑器严格模式照它
+列出与校验。**引擎也查它**（2026-09-27 P2 为性能预算改定，§13.3）：片段的角色取自这张表里的常驻字符串，
+**清单外的变量不产角色**——主题给它配的色不生效，模板引擎对每个这样的名字 warn 一次。所以新增模板变量
+必须同时进清单。两个方向都有测试守：
+
+- 清单 ⊆ 求值入口：清单里每个变量名都能被某个求值入口求出值（`Some`，空串也算），走真实
+  `notify_ui_update`，写进模板不得回显 `${…}`；
+- 求值入口 ⊆ 清单：扫下表各入口的源码，抽出 `match` 里 `"名字" =>` / `"名字" |` / `"名字" if` 的分支，
+  经别名表归一后必须都在清单里（`every_evaluable_variable_is_a_listed_role`）。
+
 入口逐一列明：
 
 | 入口 | 位置 | 覆盖的变量 |
@@ -120,8 +128,7 @@ impl From<String> for StyledText { /* 无区间 */ }
 | 逐字上下文 | `tooltip::char_var`；`Coordinator::eval_text_var` | `readings`、`unicode`；`char` 及与候选上下文同名的变量 |
 
 结构角色 `title`、`literal` 不是变量，测试单列排除；别名表的每个键也必须能求值（今天
-`legacy_names_are_aliases` 已守）。反方向（「每个能求值的变量都在清单里」）写不出来——入口是
-`match` 分支，没有可枚举的集合——故不测，靠新增变量时对照本表更新清单与文档。
+`legacy_names_are_aliases` 已守）。新增求值入口时把它加进源码扫描测试的入口表。
 
 ### 3.2 角色从哪来（协调器产出规则）
 
@@ -134,7 +141,7 @@ impl From<String> for StyledText { /* 无区间 */ }
 | 模板字面文字（段名里） | `title` | |
 | 气泡段名的装饰 `[` `]` 与 inline 段的 `: ` | `title` | 由 `TooltipDoc` 拼出，不是模板字面 |
 | 段名里的变量值（`编码{(${code_source})}` 的 `五笔`） | `code_source`，`in_title = true` | 主题没配 `code_source` 时回落 `title` 色，整个段名同色 |
-| 未知变量名的原样回显 `${pinyn}` | 无（`None`） | 它是错误提示，用正文色，不借任何角色的色；在段名里也不回落 `title` |
+| 未知变量名的原样回显 `${pinyn}` | 无（`None`） | 它是错误提示，用正文色，不借任何角色的色；在段名里也不回落 `title`。写在 `$[…]{}` 里时回显照样带该内联色（内联色标在其内的全部片段上） |
 | 截断标记 `…`（`comment_max_chars` / 气泡 `max_chars`） | 与被截处前一个字同样式 | 不单设角色：它不承载信息 |
 | 非模板来源的注释（快捷加词预览行的提示等） | 无片段 | 整段正文色 |
 
@@ -781,9 +788,9 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
   气泡 `title` / `code_source` / `char` / `literal` / `readings`），golden 文件一字未改、仍逐字节相同，
   且日志里没有 `draw_runs`；把「丢弃等于正文色的区间」变异掉后 golden 变红。
 - 实现与本文的偏差（均为实现细节，契约不变）：
-  - `Span::role` 是 `Option<&'static str>`（取自 `TEXT_ROLES`），不是 `Option<Arc<str>>`；于是 §3.1
-    「引擎本身不查 `TEXT_ROLES`」不再成立——**清单外的变量名不产角色**、按正文色。新增模板变量必须
-    同时进清单，否则主题给它配的色不生效（可求值测试只守「清单 ⊆ 求值入口」，反方向仍靠人）。
+  - `Span::role` 是 `Option<&'static str>`（取自 `TEXT_ROLES`），不是 `Option<Arc<str>>`；**清单外的
+    变量名不产角色**、按正文色。§3.1 正文已按此改写；审查后补了两道守卫：运行期 warn-once、源码扫描测试
+    （求值入口 ⊆ 清单）。
   - `Span::color` 是 `Option<Arc<InlineColor>>`；`CandidateItem::tooltip` 是 `Arc<TooltipDoc>`（§13.3）。
   - `InlineColor` / `span_color` / `body_color` 放在 wind-theme 新模块 `span.rs`，不在 `palette.rs`。
   - `RvNode::roles` 字段与 `span_color` 的角色分支在 P2 就位并有全分支单测；主题 `[*.roles]` 的
