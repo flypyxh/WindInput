@@ -157,7 +157,7 @@ fn pua_runs(wide: &[u16]) -> Vec<(usize, usize)> {
 }
 
 #[cfg(windows)]
-pub use imp::TextRenderer;
+pub use imp::{GlyphRunFont, TextRenderer};
 
 /// Windows 实现（DirectWrite）。非 Windows 平台见文件末尾的 mock。
 #[cfg(windows)]
@@ -590,6 +590,27 @@ mod imp {
                 }
                 best.map(|(f, w, _)| (f, w))
             }
+        }
+
+        /// 按与 [`Self::draw`] 相同的 layout 排一遍 `text`，报出每段字形**实际**用到的字体。
+        ///
+        /// 诊断用（`examples/font_weight_probe.rs`）：「字重设了没效果」到底是配置没传到、
+        /// 还是字体本身没有那个字重、或被系统回退换成了别的字体，只有渲染端自己的说法算数。
+        pub fn probe_glyph_runs(
+            &self,
+            text: &str,
+            ts: &TextStyle,
+        ) -> Result<Vec<GlyphRunFont>, String> {
+            let layout = self.create_layout(text, ts, f32::MAX, f32::MAX)?;
+            let rec = RunRecorder::default();
+            let runs = rec.runs.clone();
+            let renderer: IDWriteTextRenderer = rec.into();
+            unsafe {
+                layout
+                    .Draw(None, &renderer, 0.0, 0.0)
+                    .map_err(|e| format!("TextLayout::Draw: {e}"))?;
+            }
+            Ok(runs.take())
         }
 
         /// 设全局默认字重（`ui.font.weight` 或旧字体名里带的字重；0 = 常规）。
@@ -1448,6 +1469,144 @@ mod imp {
             Ok(())
         }
     }
+    /// 一段字形实际用到的字体（[`TextRenderer::probe_glyph_runs`] 的结果）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GlyphRunFont {
+        /// 这段的字形数。
+        pub glyphs: u32,
+        /// face 所属 family 名（本地化名，zh-cn 优先）。
+        pub family: String,
+        /// face 名（Regular / Bold / SemiBold …，英文名优先）。
+        pub face: String,
+        /// face 自报的字重（不含模拟）。
+        pub weight: i32,
+        /// DirectWrite 是否在该 face 上做了粗体模拟。
+        pub bold_sim: bool,
+        /// 是否做了斜体模拟。
+        pub oblique_sim: bool,
+    }
+
+    /// 只记录不绘制的字形渲染器：把每个 glyph run 的 font face 记下来。
+    #[implement(IDWriteTextRenderer)]
+    #[derive(Default)]
+    struct RunRecorder {
+        runs: std::rc::Rc<RefCell<Vec<GlyphRunFont>>>,
+    }
+
+    #[allow(non_snake_case)]
+    impl IDWritePixelSnapping_Impl for RunRecorder_Impl {
+        fn IsPixelSnappingDisabled(&self, _ctx: *const c_void) -> windows::core::Result<BOOL> {
+            Ok(FALSE)
+        }
+
+        fn GetCurrentTransform(
+            &self,
+            _ctx: *const c_void,
+            transform: *mut DWRITE_MATRIX,
+        ) -> windows::core::Result<()> {
+            unsafe {
+                if !transform.is_null() {
+                    *transform = DWRITE_MATRIX {
+                        m11: 1.0,
+                        m22: 1.0,
+                        ..Default::default()
+                    };
+                }
+            }
+            Ok(())
+        }
+
+        fn GetPixelsPerDip(&self, _ctx: *const c_void) -> windows::core::Result<f32> {
+            Ok(1.0)
+        }
+    }
+
+    #[allow(non_snake_case)]
+    impl IDWriteTextRenderer_Impl for RunRecorder_Impl {
+        fn DrawGlyphRun(
+            &self,
+            _ctx: *const c_void,
+            _x: f32,
+            _y: f32,
+            _mode: DWRITE_MEASURING_MODE,
+            glyph_run: *const DWRITE_GLYPH_RUN,
+            _desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+            _effect: Option<&windows::core::IUnknown>,
+        ) -> windows::core::Result<()> {
+            use wind_config::font_name::pick_localized_name;
+            let Some(run) = (unsafe { glyph_run.as_ref() }) else {
+                return Ok(());
+            };
+            let Some(face) = run.fontFace.as_ref() else {
+                return Ok(());
+            };
+            let sims = unsafe { face.GetSimulations() };
+            let face3: IDWriteFontFace3 = face.cast()?;
+            let (family, face_name, weight) = unsafe {
+                let family = face3
+                    .GetFamilyNames()
+                    .ok()
+                    .and_then(|n| pick_localized_name(&localized(&n)))
+                    .unwrap_or_default();
+                let names = face3
+                    .GetFaceNames()
+                    .map(|n| localized(&n))
+                    .unwrap_or_default();
+                let face_name = names
+                    .iter()
+                    .find(|(l, _)| l.eq_ignore_ascii_case("en-us"))
+                    .or(names.first())
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
+                (family, face_name, face3.GetWeight().0)
+            };
+            self.runs.borrow_mut().push(GlyphRunFont {
+                glyphs: run.glyphCount,
+                family,
+                face: face_name,
+                weight,
+                bold_sim: (sims.0 & DWRITE_FONT_SIMULATIONS_BOLD.0) != 0,
+                oblique_sim: (sims.0 & DWRITE_FONT_SIMULATIONS_OBLIQUE.0) != 0,
+            });
+            Ok(())
+        }
+
+        fn DrawUnderline(
+            &self,
+            _ctx: *const c_void,
+            _x: f32,
+            _y: f32,
+            _underline: *const DWRITE_UNDERLINE,
+            _effect: Option<&windows::core::IUnknown>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn DrawStrikethrough(
+            &self,
+            _ctx: *const c_void,
+            _x: f32,
+            _y: f32,
+            _strikethrough: *const DWRITE_STRIKETHROUGH,
+            _effect: Option<&windows::core::IUnknown>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn DrawInlineObject(
+            &self,
+            _ctx: *const c_void,
+            _x: f32,
+            _y: f32,
+            _obj: Option<&IDWriteInlineObject>,
+            _sideways: BOOL,
+            _rtl: BOOL,
+            _effect: Option<&windows::core::IUnknown>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
     /// [`TextRenderer::resolve_family_in`] 的两条语义。用 Windows 自带字体建集，
     /// 不依赖任何外部资源，故是常规用例而非 `#[ignore]` 探针。
     ///
