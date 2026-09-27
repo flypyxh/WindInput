@@ -37,17 +37,24 @@
 ## 3. 结构
 
 ```
-EngineManager::text_codes(schema_id) -> TextCodeView      // 不阻塞，可能缺层
+EngineManager::text_codes(schema_id) -> TextCodeView                 // 不阻塞，可能缺层
+EngineManager::prewarm_text_codes(schema_id) -> bool                 // 阻塞把两层都建好，预热线程/测试用
+EngineManager::word_codes_display(schema_id, text) -> Option<String> // 展示用：系统+用户，`/` 连接、码长升序
 TextCodeView {
     system: Option<Arc<ReverseIndex>>,     // None = 尚未就绪
     user:   Option<Arc<UserTextIndex>>,    // None = 尚未就绪 / 无 store
 }
 impl TextCodeView {
-    fn codes_of(&self, text: &str, layers: Layers) -> Codes;       // 各层按序拼接、去重
-    fn with_prefix(&self, prefix: &str, layers: Layers, limit) -> …; // 第二期，供联想
+    fn system_ready(&self) -> bool;
+    fn has_any(&self) -> bool;                                       // 至少一层可查
+    fn any_code(&self, text: &str, pred: &mut dyn FnMut(&str) -> bool) -> bool; // 系统→用户依次问 pred，零分配
+    fn codes_of(&self, text: &str) -> Vec<&str>;                     // 系统层在前、用户层补不重复者，码长升序
+    fn with_prefix(&self, prefix: &str, limit) -> …;                 // 第二期，供联想；层选择随之落地
 }
-Layers = SYSTEM | USER | TEMP 的位组合
 ```
+
+第一期没有 `Layers` 参数——`codes_of` / `any_code` 固定拼「系统 + 用户」两层，调用方选不了。
+「各使用方自己选层」（见 §2）与临时层，等第二期词语联想迁移时随 `with_prefix` 一起加（见 §5）。
 
 ### 3.1 系统层：沿用反查索引，不新建数据结构
 
@@ -73,8 +80,11 @@ Layers = SYSTEM | USER | TEMP 的位组合
 2. **收全部编码**：今天同一文本只留排序键最大的那条码。按词查编码要该词的全部编码。
    表项改为「文本 → 码列表」，联想取首码即可，行为不变。
 3. **按方案分槽**：今天只有一个槽，放当前联想方案。辅助码引用的方案（如五笔）与联想方案
-   （拼音）同时在用，共用一个槽会互相顶掉。改为按 `data_schema_id` 分槽，淘汰规则与 §3.1
-   的在用集合一致。
+   （拼音）同时在用，共用一个槽会互相顶掉。改为按 `data_schema_id` 分槽，**槽位数按容量上限
+   淘汰**（`MAX_SLOTS = 4`，满了淘汰最久未用且不在重建中的一份），不像 §3.1 的反查索引那样按
+   「在用集合」淘汰——在用集合要读方案文件才算得出，而槽位插入发生在查询路径上，算不起。
+   容量上限同样覆盖主码表 / 联想 / 辅助码三个在用方案，代价是同时在用超过 4 个方案时会有
+   一份反复重建。
 
 **写代次按方案计**：`Store::words_generation` 是全局的——在拼音里打字自动造词，会让五笔的用户层
 也判过期、后台重扫。给 store 加 `words_generation_of(schema)`：`bump_words_gen` 的调用点
@@ -86,7 +96,8 @@ Layers = SYSTEM | USER | TEMP 的位组合
 **只在用到时检查**：查询时发现过期，本次照用旧的，起后台重建。不监听写入——没人查的方案一次都不扫。
 刚写入的词晚一次查询生效。
 
-临时词：`UserTextIndex` 内分用户、临时两张表（今天就是这样），由 `Layers` 决定取哪张。
+临时词：第一期不收——`UserTextIndex` 只有用户词一张表，没有临时表，也没有 `Layers` 参数可选。
+第一期两个使用方（辅助码、编码显示）都只要系统 + 用户；临时层随第二期词语联想迁移再加（见 §5）。
 
 ### 3.3 就绪语义
 
@@ -117,9 +128,12 @@ Layers = SYSTEM | USER | TEMP 的位组合
 
 | 期 | 内容 | 提交（分支 feat/aux-code-source） |
 |---|---|---|
-| 1 | `TextCodeView` 入口；`UserTextIndex`（收单字、收全部编码、按方案分槽）；store 分方案写代次；反查索引保留策略改为在用集合；接入辅助码与编码显示 | `8b99d7a7`、`d5fa0499`、`d000b8e6` |
+| 1 | `TextCodeView` 入口；`UserTextIndex`（收单字、收全部编码、按方案分槽）；store 分方案写代次；反查索引保留策略改为在用集合；接入辅助码与编码显示 | `8b99d7a7`、`d5fa0499`、`d000b8e6`（辅助码接入本入口另计入 `09e1459d`，见下） |
 | 2 | 词语联想迁到本入口，删掉 `user_assoc` 自带的索引（A/B 对拍） | - |
 | 3 | 码表造词的单字全码纳入用户层（先出全码判据的论证） | - |
+
+辅助码那侧的接入（`AuxCodeLookup` 改拿 `TextCodeView`）提交号算在
+`docs/design/aux-code-schema-source.md` 第 1 期里，即 `09e1459d`（见该文档 §8 分期表）。
 
 ## 7. 验收
 
