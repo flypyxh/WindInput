@@ -1515,13 +1515,14 @@ impl Coordinator {
                 };
                 Some((e.name, short))
             }
-            // 辅助码：显示码表名（如「笔画」）；表未加载或未命名 → 无指示（沿用主路径）。
+            // 辅助码：显示首个来源的名（码表名如「笔画」或方案名）；未建或未命名 → 无指示（沿用主路径）。
             ModeKind::AuxCode => {
-                let table = self
-                    .aux_code_table
+                let rt = self
+                    .aux_code_runtime
                     .read()
-                    .unwrap_or_else(|e| e.into_inner());
-                let name = table.as_ref()?.name.clone();
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()?;
+                let name = rt.name().to_string();
                 if name.is_empty() {
                     None
                 } else {

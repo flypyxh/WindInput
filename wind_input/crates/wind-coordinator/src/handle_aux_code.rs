@@ -26,6 +26,7 @@
 
 use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
+use std::sync::Arc;
 use tracing::{debug, info};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
@@ -80,21 +81,33 @@ enum AuxKeyRole {
 /// [`wind_aux_code::AuxCodeSession`]；显示态（组合区 preedit/光标）与筛选会话打包在
 /// [`AuxCodeOverlay`]，经 `State.aux_code` 整体持有、整体销毁。
 impl Coordinator {
-    /// 首次辅助码输入时懒加载辅助码表：`load_merged` 合并所有已解析路径
-    /// （先出现 = 高优），已加载过则 no-op。空表语义由 wind-aux-code 内部处理（passthrough）。
-    pub(crate) fn ensure_aux_code_table(&self, paths: &[std::path::PathBuf]) {
-        let mut table = self
-            .aux_code_table
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if table.is_none() {
-            let merged = wind_aux_code::load_merged(paths);
-            let n = merged.char_count();
-            *table = Some(merged);
-            if n > 0 {
-                info!("Loaded aux-code table ({} chars)", n);
-            }
+    /// 取辅助码运行时来源：缓存的来源清单与本次一致就复用，否则重建。
+    ///
+    /// ★ 按来源清单判断而不是只靠「切方案清空」：在设置页改了来源（写 override）不会切方案，
+    /// 旧做法会一直用旧表直到下次切方案。
+    pub(crate) fn ensure_aux_code_runtime(
+        &self,
+        sources: &[wind_engine::AuxSource],
+    ) -> Arc<crate::aux_code_source::AuxCodeRuntime> {
+        if let Some(rt) = self
+            .aux_code_runtime
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|rt| rt.matches(sources))
+        {
+            return rt.clone();
         }
+        let rt = Arc::new(crate::aux_code_source::AuxCodeRuntime::build(
+            sources,
+            &self.engine_mgr,
+        ));
+        info!("Loaded aux-code sources ({} layers)", sources.len());
+        *self
+            .aux_code_runtime
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(rt.clone());
+        rt
     }
 
     /// 「辅助码触发键被音节分隔符占用」的诊断告警，**每方案一次**（复位点见
@@ -119,6 +132,7 @@ impl Coordinator {
     /// - 功能未启用（`[schema.pinyin.aux_code].enabled` 折叠方案覆盖后为 false，**出厂即此**）
     /// - 触发键已被拼音音节分隔符占用（见 [`Self::warn_aux_code_key_taken`]）
     /// - 方案未配 `[engine.aux_code].files` 或码表文件全部缺失
+    /// - 引用的码表方案（`schema:<id>`）反查索引未就绪（派后台构建，建好后再按即可）
     /// - 当前无候选（没有可筛的东西；空缓冲下触发键落普通标点流程）
     pub(crate) fn enter_aux_code(&self, state: &mut State, key_code: u32) -> Option<KeyAction> {
         // ★★ 只能从**主输入路**进入：本模式筛的是主路候选，而各 overlay 模式有自己的
@@ -167,19 +181,24 @@ impl Coordinator {
             self.warn_aux_code_key_taken(key_code);
             return None;
         }
-        // 第一期协调器接入前的过渡：只取文件来源，行为与改动前一致（Task 6 换成完整实现）。
-        let paths: Vec<std::path::PathBuf> = settings
-            .sources
-            .iter()
-            .filter_map(|s| match s {
-                wind_engine::AuxSource::File(p) => Some(p.clone()),
-                wind_engine::AuxSource::Schema(_) => None,
-            })
-            .collect();
-        if paths.is_empty() || state.candidates.is_empty() {
+        if settings.sources.is_empty() || state.candidates.is_empty() {
             return None;
         }
-        self.ensure_aux_code_table(&paths);
+        let rt = self.ensure_aux_code_runtime(&settings.sources);
+        // 方案来源的系统层（反查索引）未就绪：不进入、不吞键，派后台构建（建好有提示与重渲染）。
+        // 按键线程绝不现建——那是秒级操作，而 TSF→服务是同步 IPC。
+        let pending: Vec<String> = rt
+            .schema_ids()
+            .filter(|id| self.engine_mgr.reverse_index_if_ready(id).is_none())
+            .map(str::to_string)
+            .collect();
+        if !pending.is_empty() {
+            for id in &pending {
+                self.spawn_index_warm(id, false);
+            }
+            debug!("aux_code: 方案来源索引未就绪，本次不进入");
+            return None;
+        }
         // 三件套整体建立：筛选会话（快照原始候选，后续筛选都从它重筛）+ 显示基线
         // （进入前的拼音显示，退出还原）+ 显示前缀（基线 + 分隔符，进入拼一次）。
         // 此后三者同生共死，退出/上屏/复位一律整体销毁，见 `AuxCodeOverlay`。
@@ -224,14 +243,18 @@ impl Coordinator {
         // 契约，否则筛选后高亮会停在原地、可能指向已沉底的被滤候选）。
         // 先 reset（取 `&mut state`）再取 overlay 借用：`is_none` 守卫已保证非 None。
         self.reset_candidate_view(state);
-        let overlay = state.aux_code.as_mut().expect("辅助码模式必持 overlay");
-        let table = self
-            .aux_code_table
+        let rt = self
+            .aux_code_runtime
             .read()
-            .unwrap_or_else(|e| e.into_inner());
-        // 空表 = 未加载（防御语义：不过滤，还原快照，见 wind-aux-code）。
-        state.candidates = match table.as_ref() {
-            Some(t) => overlay.session.apply(t, &overlay.filter_options),
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let overlay = state.aux_code.as_mut().expect("辅助码模式必持 overlay");
+        // 未建 = 防御语义：不过滤，还原快照（见 wind-aux-code）。
+        state.candidates = match rt {
+            Some(rt) => {
+                let lookup = rt.lookup(&self.engine_mgr);
+                overlay.session.apply(&lookup, &overlay.filter_options)
+            }
             None => overlay.session.restore_original(),
         };
         // 组合区 = 显示前缀（进入时拼好：基线 + 4 空格）+ 辅助码缓冲。
@@ -1829,5 +1852,159 @@ mod tests {
             SessionAction::None
         );
         assert_eq!(SessionAction::parse_checked("aux_code:page_prev"), None);
+    }
+
+    /// 自造码表方案（工=a/aaaa、攻=atyy、公=wcu），供 `schema:<id>` 引用。
+    ///
+    /// ★ id 由调用方给且每条用例不同（含进程号）：反查索引的磁盘缓存按方案 id 落在进程外的
+    /// 共享目录，并行用例若共用一个 id 会互相覆盖。
+    fn write_wbx(schemas: &std::path::Path, id: &str) {
+        std::fs::create_dir_all(schemas.join(id)).unwrap();
+        std::fs::write(
+            schemas.join(format!("{id}.schema.toml")),
+            format!(
+                "[schema]\nid = \"{id}\"\nname = \"测五\"\n[engine]\ntype = \"codetable\"\n\
+                 [engine.codetable]\nmax_code_length = 4\n\
+                 [[dictionaries]]\nid = \"{id}_main\"\npath = \"{id}/{id}.dict.yaml\"\n\
+                 type = \"rime_codetable\"\ndefault = true\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join(format!("{id}/{id}.dict.yaml")),
+            format!(
+                "---\nname: {id}\nversion: \"1\"\ncolumns:\n  - code\n  - text\n  - weight\n...\n\
+                 a\t工\t100\naaaa\t工\t90\natyy\t攻\t80\nwcu\t公\t80\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// 本进程内唯一的码表方案 id（见 [`write_wbx`]）。
+    fn wbx_id(tag: &str) -> String {
+        format!("zz_ax_{tag}_{}", std::process::id())
+    }
+
+    /// pinyin 方案的 `files` 由调用方给（TOML 数组字面量），并带上 `wbx_id` 方案与 `flypy_test.txt`。
+    fn data_dir_with_files(tag: &str, files: &str, wbx_id: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wind_aux_code_src_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(schemas.join("aux_code")).unwrap();
+        std::fs::write(
+            schemas.join("pinyin.schema.toml"),
+            format!(
+                "[schema]\nid = \"pinyin\"\nname = \"pinyin\"\n[engine]\ntype = \"pinyin\"\n\
+                 [engine.aux_code]\nfiles = {files}\nenabled = true\n\
+                 [key_actions]\nbacktick = \"aux_code\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("aux_code/flypy_test.txt"),
+            "李=mz\n樱=my\n河=sk\n",
+        )
+        .unwrap();
+        std::fs::write(schemas.join("aux_code/other.txt"), "李=qq\n樱=qq\n河=qq\n").unwrap();
+        write_wbx(&schemas, wbx_id);
+        dir
+    }
+
+    fn seed<'a>(
+        c: &'a Arc<Coordinator>,
+        texts: &[&str],
+    ) -> std::sync::MutexGuard<'a, crate::coordinator::State> {
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        st.input_buffer = "gong".to_string();
+        st.candidates = texts.iter().map(|t| cand(t)).collect();
+        st.selected_index = 0;
+        st.current_page = 0;
+        st.preedit = "gong".to_string();
+        st
+    }
+
+    fn kept(st: &crate::coordinator::State) -> Vec<String> {
+        st.candidates.iter().map(|c| c.text.clone()).collect()
+    }
+
+    /// `schema:<id>`：用码表方案的编码筛拼音候选；与文件来源混列时两边的码都生效。
+    #[test]
+    fn schema_source_filters_by_codetable_codes() {
+        let id = wbx_id("schema");
+        let files = format!(r#"["schema:{id}", "aux_code/flypy_test.txt"]"#);
+        let dir = data_dir_with_files("schema", &files, &id);
+        let c = coord_with_data("schema_src", dir);
+        c.engine_mgr.prewarm_text_codes(&id);
+        let mut st = seed(&c, &["工", "攻", "公", "河"]);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('A'), 0));
+        assert_eq!(kept(&st), vec!["工", "攻"], "方案来源：a 命中工/攻");
+        let _ = c.handle_aux_code_key(&mut st, &key(keymap::VK_BACK, 0));
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('S'), 0));
+        assert_eq!(kept(&st), vec!["河"], "文件来源的码同样生效");
+    }
+
+    /// 被引用方案里用户自己加的编码也能筛到（系统 + 用户词库是一个整体）。
+    #[test]
+    fn schema_source_includes_user_words() {
+        let id = wbx_id("user");
+        let files = format!(r#"["schema:{id}"]"#);
+        let dir = data_dir_with_files("user", &files, &id);
+        let c = coord_with_data("schema_user", dir);
+        c.store
+            .as_ref()
+            .unwrap()
+            .add_user_word(&id, "zzzz", "嗨", 0, 0)
+            .unwrap();
+        c.engine_mgr.prewarm_text_codes(&id);
+        let mut st = seed(&c, &["工", "嗨"]);
+        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('Z'), 0));
+        assert_eq!(kept(&st), vec!["嗨"]);
+    }
+
+    /// ★ 系统层没就绪：不进入、不吞键——按键线程绝不现建反查索引。
+    #[test]
+    fn schema_source_not_ready_does_not_enter() {
+        let id = wbx_id("cold");
+        let files = format!(r#"["schema:{id}"]"#);
+        let dir = data_dir_with_files("cold", &files, &id);
+        let c = coord_with_data("schema_cold", dir);
+        let mut st = seed(&c, &["工", "攻"]);
+        assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_none());
+        assert_eq!(st.active, None);
+        assert_eq!(kept(&st), vec!["工", "攻"], "候选原封不动");
+    }
+
+    /// ★ 改了来源（override 层换 files）不切方案也要生效——此前缓存只在切方案时清。
+    #[test]
+    fn source_change_takes_effect_without_schema_switch() {
+        let id = wbx_id("ovr");
+        let dir = data_dir_with_files("ovr", r#"["aux_code/flypy_test.txt"]"#, &id);
+        let ov = dir.join("overrides");
+        std::fs::create_dir_all(&ov).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("wind_aux_code_ovr_{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+        let mut cfg = Config::default();
+        cfg.schema.active = "pinyin".to_string();
+        let c =
+            Coordinator::new_headless_with_store_override(cfg, Some(&dir), store, Some(ov.clone()));
+        let mut st = seed(&c, &["李", "樱", "河"]);
+        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('M'), 0));
+        assert_eq!(kept(&st), vec!["李", "樱"]);
+        let _ = c.handle_aux_code_key(&mut st, &key(keymap::VK_ESCAPE, 0));
+        std::fs::write(
+            ov.join("pinyin.toml"),
+            "[engine.aux_code]\nfiles = [\"aux_code/other.txt\"]\n",
+        )
+        .unwrap();
+        let _ = c.enter_aux_code(&mut st, keymap::VK_BACKTICK);
+        let _ = c.handle_aux_code_key(&mut st, &key(vk_letter('Q'), 0));
+        assert_eq!(kept(&st), vec!["李", "樱", "河"], "新来源 other.txt 生效");
     }
 }

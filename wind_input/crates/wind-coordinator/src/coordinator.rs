@@ -1343,9 +1343,10 @@ pub struct Coordinator {
     /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段随主码表方案
     /// 热重载（见 `sync_chaizi_assets`），拼音段启动加载后不变。
     pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
-    /// 辅助码表（懒加载，首次辅助码输入时经 `ensure_aux_code_table` 读取并 merge；路径由
-    /// 调用方经覆盖解析函数定位，本处不做 `data_dir.join`）。`None` = 尚未加载。
-    pub(crate) aux_code_table: std::sync::RwLock<Option<wind_aux_code::AuxCodeTable>>,
+    /// 辅助码运行时来源（进入辅助码时按 `[engine.aux_code].files` 建，来源清单即缓存键）。
+    /// `None` = 尚未建 / 已失效。见 [`crate::aux_code_source`]。
+    pub(crate) aux_code_runtime:
+        std::sync::RwLock<Option<Arc<crate::aux_code_source::AuxCodeRuntime>>>,
     /// emoji 扩展表（`[input.emoji]`，mmap 只读）。`None` = 功能关闭 / 数据缺失 / 建缓存失败。
     ///
     /// ★ 功能关闭时恒为 `None` 且**数据文件根本不打开**——未启用的用户为本功能付出的
@@ -2545,7 +2546,7 @@ impl Coordinator {
             // 只看 `state_dir()` 挡不住测试夹具——那是进程外的全局路径，夹具同样取得到。
             state_writer: state_writer::StateWriter::new(persists_state, Config::state_dir()),
             reverse: std::sync::RwLock::new(reverse),
-            aux_code_table: std::sync::RwLock::new(None),
+            aux_code_runtime: std::sync::RwLock::new(None),
             // 空初值 + 下面 new() 里的 sync_emoji_dict 首次加载：与注释库/拆字字体同一套
             // 「声明式变更」写法，启动与后续 reload 走**同一条**代码路径。
             emoji_dict: std::sync::RwLock::new(None),
@@ -3928,15 +3929,16 @@ impl Coordinator {
         r
     }
 
-    /// 辅助码表缓存失效：方案切换后置 `None`，下次进入辅助码时按新方案的
-    /// `[engine.aux_code]` 重新懒加载（`ensure_aux_code_table` 只在 `None` 时加载）。
+    /// 辅助码来源缓存失效：方案切换后置 `None`，下次进入辅助码时按新方案的
+    /// `[engine.aux_code]` 重建（`ensure_aux_code_runtime` 另按来源清单比对，来源没变也会
+    /// 因这里置空而重读文件表——切方案时顺带刷新磁盘上改过的码表）。
     ///
     /// 缓存是**全局共享一份**、不区分方案，而各方案码表不同（拼音用笔画表、双拼用
     /// 小鹤全码表）——切方案不清缓存会让双拼仍在用拼音那份表。与 `sync_chaizi_assets`
     /// / `sync_comment_dicts` 同源：方案附属资源随活跃方案切换重挂载。
     pub(crate) fn invalidate_aux_code_table(&self) {
         *self
-            .aux_code_table
+            .aux_code_runtime
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
         // 键位环境随方案而变（全拼反引号是分隔符、双拼是自由键），故告警配额一并重置。
@@ -4335,7 +4337,7 @@ impl Coordinator {
         self.spawn_index_warm(schema_id, true);
     }
 
-    fn spawn_index_warm(&self, schema_id: &str, with_single_char: bool) {
+    pub(crate) fn spawn_index_warm(&self, schema_id: &str, with_single_char: bool) {
         if schema_id.is_empty() {
             return;
         }
