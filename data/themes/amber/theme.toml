@@ -1,5 +1,5 @@
 # 清风·橙：暖金橙色调（对齐 Claude Design 橙色）。
-# 覆盖 primary/accent_text/accent_soft + accent_menu（菜单高亮 700 阶橙，配白字对比足），其余继承 _qingfeng。
+# 覆盖 primary/accent_text/accent_soft + accent_menu + tooltip_accent（菜单高亮 700 阶橙，配白字对比足），其余继承 _qingfeng。
 base = "_qingfeng"
 
 [meta]
@@ -13,3 +13,4 @@ primary = "#f59e0b"
 accent_text = { light = "#d97706", dark = "#fbbf24" }
 accent_soft = { light = "#f59e0b1A", dark = "#f59e0b2E" }
 accent_menu = { light = "#B45309", dark = "#fbbf24" }
+tooltip_accent = { light = "#fbbf24", dark = "#fbbf24" }

@@ -1,5 +1,5 @@
 # 清风·紫：薰衣草紫色调（对齐 Claude Design 紫色）。
-# 覆盖 primary/accent_text/accent_soft + accent_menu（菜单高亮 700 阶紫），其余继承 _qingfeng。
+# 覆盖 primary/accent_text/accent_soft + accent_menu + tooltip_accent（菜单高亮 700 阶紫），其余继承 _qingfeng。
 base = "_qingfeng"
 
 [meta]
@@ -13,3 +13,4 @@ primary = "#8b5cf6"
 accent_text = { light = "#7c3aed", dark = "#a78bfa" }
 accent_soft = { light = "#8b5cf61A", dark = "#8b5cf62E" }
 accent_menu = { light = "#6D28D9", dark = "#a78bfa" }
+tooltip_accent = { light = "#a78bfa", dark = "#a78bfa" }

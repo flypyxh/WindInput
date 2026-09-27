@@ -540,6 +540,122 @@ mod tests {
         );
     }
 
+    // ---------------- 标准色契约（§5.4）----------------
+
+    fn factory(name: &str, dark: bool) -> Resolved {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes");
+        crate::load_resolved(&dir, name, dark).unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    const FACTORY: &[&str] = &[
+        "_base",
+        "_qingfeng",
+        "default",
+        "amber",
+        "jade",
+        "violet",
+        "msime",
+    ];
+
+    /// 契约表：名字 → `_base` 的（亮, 暗）值。表即断言。
+    const CONTRACT: &[(&str, &str, &str)] = &[
+        ("success", "#1E8E3E", "#81C995"),
+        ("warning", "#B06000", "#FDD663"),
+        ("error", "#D93025", "#F28B82"),
+        ("info", "#1A73E8", "#8AB4F8"),
+        ("tooltip_text_dim", "#BDBDBD", "#BDBDBD"),
+        ("tooltip_text_hint", "#A0A0A0", "#A0A0A0"),
+        ("tooltip_accent", "#8AB4F8", "#8AB4F8"),
+        ("tooltip_accent_text", "#8AB4F8", "#8AB4F8"),
+        ("tooltip_success", "#81C995", "#81C995"),
+        ("tooltip_warning", "#FDD663", "#FDD663"),
+        ("tooltip_error", "#F28B82", "#F28B82"),
+        ("tooltip_info", "#8AB4F8", "#8AB4F8"),
+    ];
+
+    /// 候选窗用的契约名（已有 + 新增）；每个在气泡里都有 `tooltip_<名>`。
+    const NAMES: &[&str] = &[
+        "text",
+        "text_dim",
+        "text_hint",
+        "accent",
+        "on_accent",
+        "selection_text",
+        "accent_text",
+        "success",
+        "warning",
+        "error",
+        "info",
+    ];
+
+    /// 全部出厂主题 × 亮暗：契约名与其 `tooltip_*` 都能解析。
+    #[test]
+    fn every_factory_theme_resolves_the_contract() {
+        for name in FACTORY {
+            for dark in [false, true] {
+                let t = factory(name, dark);
+                for n in NAMES {
+                    assert!(t.palette.contains_key(*n), "{name} dark={dark}: 缺 {n}");
+                    let tip = format!("tooltip_{n}");
+                    assert!(t.palette.contains_key(&tip), "{name} dark={dark}: 缺 {tip}");
+                }
+                // 出厂节点不配角色：零变化的前提之一。
+                assert!(t.views.comment.roles.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn base_contract_values() {
+        for dark in [false, true] {
+            let t = factory("_base", dark);
+            for (n, l, d) in CONTRACT {
+                let want = parse_hex(if dark { d } else { l }).unwrap();
+                assert_eq!(t.palette[*n], want, "_base dark={dark}: {n}");
+            }
+            assert_eq!(t.palette["accent_text"], t.palette["accent"]);
+            assert_eq!(t.palette["tooltip_on_accent"], t.palette["tooltip_text"]);
+            assert_eq!(
+                t.palette["tooltip_selection_text"],
+                t.palette["tooltip_text"]
+            );
+        }
+    }
+
+    /// 清风系各自覆盖 tooltip_accent（本主题 accent_text 的暗档值）；msime 沿用 _base 的蓝。
+    #[test]
+    fn tooltip_accent_follows_each_theme() {
+        for (name, want) in [
+            ("_qingfeng", "#60a5fa"),
+            ("default", "#60a5fa"),
+            ("amber", "#fbbf24"),
+            ("jade", "#34d399"),
+            ("violet", "#a78bfa"),
+            ("msime", "#8AB4F8"),
+        ] {
+            for dark in [false, true] {
+                let t = factory(name, dark);
+                assert_eq!(
+                    t.palette["tooltip_accent"],
+                    parse_hex(want).unwrap(),
+                    "{name}"
+                );
+                assert_eq!(
+                    t.palette["tooltip_accent_text"],
+                    parse_hex(want).unwrap(),
+                    "{name}"
+                );
+            }
+            if name != "msime" {
+                assert_eq!(
+                    factory(name, true).palette["accent_text"],
+                    parse_hex(want).unwrap(),
+                    "{name}: tooltip_accent 应等于 accent_text 暗档"
+                );
+            }
+        }
+    }
+
     /// 节点自带正文色时，兜底不参与。
     #[test]
     fn node_text_color_overrides_fallback() {

@@ -2,7 +2,9 @@
 # 继承 _base（沿用其资产链：footer chevron / 全部兜底语义色），在其上叠加「清风」设计体系：
 #   现代蓝(#3b82f6) + 半透明 accent 选中态 + 12px 圆角窗 + 柔和投影 + 预编辑底部分隔线 +
 #   淡色纯数字序号 + 半透明工具栏激活态 + 暗色深蓝灰面板 + 默认不显页码。
-# 「清风·XX」主题继承本主题，仅覆盖 primary / accent_text / accent_soft 三色即整体换色。
+# 「清风·XX」主题继承本主题，覆盖 primary / accent_text / accent_soft / accent_menu /
+# tooltip_accent 即整体换色（tooltip_accent 取本主题 accent_text 的暗档值——气泡底两档都是
+# 深色，不能写成 ${accent_text}：它的亮档是为白底调的深色）。
 #
 # 设计意图：所有「清风」品牌外观集中在此层，_base 保持中性黑白以最小化对第三方主题的影响。
 base = "_base"
@@ -52,6 +54,7 @@ menu_separator = { light = "#EBEDF2", dark = "${border}" }
 
 tooltip_bg = { light = "#2A2F3EF5", dark = "#12151FF5" }
 tooltip_text = { light = "#FFFFFF", dark = "${text}" }
+tooltip_accent = { light = "#60a5fa", dark = "#60a5fa" }
 status_bg = { light = "#2A2F3EF0", dark = "#12151FF0" }
 status_text = { light = "#FFFFFF", dark = "${text}" }
 status_border = "${accent}"

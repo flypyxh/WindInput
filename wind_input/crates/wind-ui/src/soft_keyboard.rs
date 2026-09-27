@@ -163,6 +163,56 @@ impl Default for Colors {
     }
 }
 
+impl Colors {
+    /// 从主题取色（见 [`SoftKeyboard::set_theme`] 的文档）。抽成纯函数是为了让取色链能被测到：
+    /// `SoftKeyboard` 要真窗口才能构造。
+    fn from_theme(theme: &wind_theme::Resolved) -> Self {
+        let d = Colors::default();
+        // 专用覆盖 → 键盘域语义色 → 候选窗同类色 → 硬编码兜底。
+        let pick =
+            |own: &str, kbd: &str, fallback: [u8; 4]| theme.color(own, theme.color(kbd, fallback));
+        Colors {
+            panel: pick(
+                "softkb_bg",
+                "keyboard_bg",
+                theme.color("candidate_bg", d.panel),
+            ),
+            keycap: pick("softkb_key_bg", "key_bg", d.keycap),
+            keycap_fn: pick("softkb_fnkey_bg", "key_special_bg", d.keycap_fn),
+            keycap_dead: pick("softkb_dead_bg", "surface", d.keycap_dead),
+            line: pick("softkb_border", "border", d.line),
+            ink: pick(
+                "softkb_text",
+                "key_text",
+                theme.color("candidate_text", d.ink),
+            ),
+            hint: pick("softkb_hint", "key_hint", d.hint),
+            accent: pick(
+                "softkb_active_bg",
+                "accent",
+                theme.color("candidate_selected_bg", d.accent),
+            ),
+            accent_soft: pick(
+                "softkb_hover_bg",
+                "key_pressed_bg",
+                theme.color("accent_soft", d.accent_soft),
+            ),
+            // 激活键是「强调色底上的字」：第二级取 on_accent，不取 accent_text。
+            // accent_text 是「在普通底上可读的强调色文字」，拿来压强调色底就是同色字压同色底——
+            // _base 提供了 accent_text（= accent，分段着色的标准色契约）之后，_base / msime 的
+            // 激活键字会整个消失在底色里；清风系此前就是 accent_text 字压 accent 底。
+            on_accent: pick(
+                "softkb_active_text",
+                "on_accent",
+                theme.color("candidate_selected_text", d.on_accent),
+            ),
+            grip: pick("softkb_grip", "toolbar_grip", d.grip),
+            hover: pick("softkb_hover_soft", "toolbar_hover", d.hover),
+            fn_ink: pick("softkb_fnkey_text", "text_dim", d.fn_ink),
+        }
+    }
+}
+
 /// 鼠标交互状态。与窗口共享（`register_mouse` 要 `Rc<RefCell<dyn WindowMouse>>`）。
 #[derive(Default)]
 struct SoftMouse {
@@ -456,45 +506,7 @@ impl SoftKeyboard {
     ///
     /// `softkb_*` 仍留在链首，给「只想单独调桌面软键盘」的人一个口子。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
-        let d = Colors::default();
-        // 专用覆盖 → 键盘域语义色 → 候选窗同类色 → 硬编码兜底。
-        let pick =
-            |own: &str, kbd: &str, fallback: [u8; 4]| theme.color(own, theme.color(kbd, fallback));
-        self.colors = Colors {
-            panel: pick(
-                "softkb_bg",
-                "keyboard_bg",
-                theme.color("candidate_bg", d.panel),
-            ),
-            keycap: pick("softkb_key_bg", "key_bg", d.keycap),
-            keycap_fn: pick("softkb_fnkey_bg", "key_special_bg", d.keycap_fn),
-            keycap_dead: pick("softkb_dead_bg", "surface", d.keycap_dead),
-            line: pick("softkb_border", "border", d.line),
-            ink: pick(
-                "softkb_text",
-                "key_text",
-                theme.color("candidate_text", d.ink),
-            ),
-            hint: pick("softkb_hint", "key_hint", d.hint),
-            accent: pick(
-                "softkb_active_bg",
-                "accent",
-                theme.color("candidate_selected_bg", d.accent),
-            ),
-            accent_soft: pick(
-                "softkb_hover_bg",
-                "key_pressed_bg",
-                theme.color("accent_soft", d.accent_soft),
-            ),
-            on_accent: pick(
-                "softkb_active_text",
-                "accent_text",
-                theme.color("candidate_selected_text", d.on_accent),
-            ),
-            grip: pick("softkb_grip", "toolbar_grip", d.grip),
-            hover: pick("softkb_hover_soft", "toolbar_hover", d.hover),
-            fn_ink: pick("softkb_fnkey_text", "text_dim", d.fn_ink),
-        };
+        self.colors = Colors::from_theme(theme);
         if self.visible {
             self.render();
         }
@@ -2665,5 +2677,30 @@ mod tests {
         assert_eq!(scroll_to_show(&[50.0, 50.0], 0.0, 1, 0.0, view), 0.0);
         // 空表不 panic
         assert_eq!(scroll_to_show(&[], 0.0, 3, 0.0, view), 0.0);
+    }
+}
+
+// 激活键文字色：强调色底上的字取 on_accent（分段着色给 _base 加了 accent_text 之后，
+// 旧的第二级 accent_text 会让 _base / msime 的激活键同色字压同色底）。
+#[cfg(test)]
+mod active_key_color_tests {
+    use super::Colors;
+
+    fn theme(name: &str) -> wind_theme::Resolved {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes");
+        wind_theme::load_resolved(&dir, name, false).unwrap()
+    }
+
+    #[test]
+    fn active_key_text_is_on_accent_not_accent() {
+        for name in ["_base", "msime", "default"] {
+            let t = theme(name);
+            let c = Colors::from_theme(&t);
+            assert_eq!(
+                c.on_accent, t.palette["on_accent"],
+                "{name}：激活键文字应取 on_accent"
+            );
+            assert_ne!(c.on_accent, c.accent, "{name}：激活键字色不能与底色相同");
+        }
     }
 }
