@@ -318,15 +318,31 @@ impl Template {
         Self(parse(tpl))
     }
 
-    /// 渲染为 `(已 trim 的文本, 是否有计数变量非空)`。不做「全空则整体消失」——那是调用方
-    /// 的决定：段内容要消失，段名的字面文字（`编码`）不能消失。
+    /// 渲染为 `(文本, 是否有计数变量非空)`。
+    ///
+    /// 与注释段的 [`render`] 不同，这里**既不 trim、也不做「全空则整体消失」**，都留给调用方：
+    /// 悬停提示的原始行是复制 / 上屏的取值来源，完整原文开头的缩进、`\t` 必须原样保留；
+    /// 段内容全空要消失，而段名的字面文字（`编码`）不能消失。
     pub(crate) fn render(
         &self,
         eval: &impl Fn(&str, Option<&str>) -> Option<String>,
         counts: &impl Fn(&str) -> bool,
     ) -> (String, bool) {
         let r = render_nodes(&self.0, eval, counts);
-        (r.text.trim().to_string(), r.any_var_filled)
+        (r.text, r.any_var_filled)
+    }
+
+    /// 模板的**字面文字**里是否含字符 `c`（不看变量值）。悬停提示据此认出「分列行」：
+    /// 模板自己写了 `\t` 的段才是有意分列，变量值里带进来的 `\t` 只是内容。
+    pub(crate) fn has_literal(&self, c: char) -> bool {
+        fn walk(nodes: &[Node], c: char) -> bool {
+            nodes.iter().any(|n| match n {
+                Node::Text(t) => t.contains(c),
+                Node::Var(_) => false,
+                Node::Group(inner) => walk(inner, c),
+            })
+        }
+        walk(&self.0, c)
     }
 
     /// 模板里是否引用了变量 `name`（含回退链、可选段内）。供调用方决定要不要预先准备
@@ -1361,6 +1377,14 @@ mod tests {
         let t = Template::parse("${char}：${r}");
         assert_eq!(t.render(&e, &|n| n != "char"), ("好：".to_string(), false));
         assert_eq!(t.render(&e, &|_| true), ("好：".to_string(), true));
+        // 不 trim：首尾空白是内容（悬停提示的原始行要逐字节还原）。
+        let lead = Template::parse("\t${char} ");
+        assert_eq!(lead.render(&e, &|_| true).0, "\t好 ");
+        assert!(lead.has_literal('\t'));
+        assert!(
+            !Template::parse("${char}").has_literal('\t'),
+            "变量值不算字面"
+        );
     }
 
     // ---------------- 变量参数 `${name:arg}` ----------------

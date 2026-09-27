@@ -32,7 +32,10 @@ pub struct TooltipDoc {
 pub struct TooltipSection {
     /// 已求值的段名；`None` = 无标题行。
     pub title: Option<String>,
-    /// 内容恰为一行时渲染成 `标题: 内容`，而非标题独占一行。
+    /// 渲染成 `标题: 第一条显示行`（其余显示行照常另起），而非标题独占一行。
+    ///
+    /// 由协调器按**原始内容恰为一行**判定后置位：一条长内容折成多条显示行仍算一行，
+    /// 故这里不再看 `lines.len()`。
     pub inline: bool,
     /// 非空。
     pub lines: Vec<TooltipLine>,
@@ -53,14 +56,17 @@ impl TooltipDoc {
     }
 
     /// 纯文本形态：段间换行；有标题的段写成 `[标题]` 独占一行再逐行列内容，
-    /// `inline` 且恰一行时写成 `标题: 内容`；无标题的段只列内容。
+    /// `inline` 段写成 `标题: 第一行`、其余行照列；无标题的段只列内容。
     ///
     /// 这是气泡、「复制全部」与 macOS 下发共用的格式，与段列表引入前的输出逐字节相同。
     pub fn to_plain_text(&self) -> String {
         let mut out: Vec<String> = Vec::new();
         for sec in &self.sections {
             match (&sec.title, sec.lines.as_slice()) {
-                (Some(t), [only]) if sec.inline => out.push(format!("{t}: {}", only.text)),
+                (Some(t), [first, rest @ ..]) if sec.inline => {
+                    out.push(format!("{t}: {}", first.text));
+                    out.extend(rest.iter().map(|l| l.text.clone()));
+                }
                 (title, lines) => {
                     if let Some(t) = title {
                         out.push(format!("[{t}]"));
@@ -98,14 +104,15 @@ mod tests {
             sections: vec![
                 sec(Some("编码"), false, &["vbg"]),
                 sec(Some("Unicode"), true, &["U+597D"]),
-                sec(Some("拼音"), true, &["好：hǎo", "人：rén"]),
+                sec(Some("拼音"), false, &["好：hǎo", "人：rén"]),
+                sec(Some("原文"), true, &["折成", "两行"]),
                 sec(None, false, &["无标题"]),
             ],
         };
         assert_eq!(
             doc.to_plain_text(),
-            "[编码]\nvbg\nUnicode: U+597D\n[拼音]\n好：hǎo\n人：rén\n无标题",
-            "inline 只在恰一行时生效；多行照常标题独占一行"
+            "[编码]\nvbg\nUnicode: U+597D\n[拼音]\n好：hǎo\n人：rén\n原文: 折成\n两行\n无标题",
+            "inline 段标题接第一条显示行，其余显示行照常另起"
         );
         assert_eq!(TooltipDoc::default().to_plain_text(), "");
     }

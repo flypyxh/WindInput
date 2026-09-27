@@ -31,6 +31,7 @@ wind-softkeyboard = { path = "../wind-softkeyboard" }
 wind-reverse = { path = "../wind-reverse" }
 wind-aux-code = { path = "../wind-aux-code" }
 wind-punct = { path = "../wind-punct" }
+unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = "0.4"

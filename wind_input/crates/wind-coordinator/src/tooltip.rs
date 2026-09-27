@@ -26,11 +26,11 @@
 
 use crate::comment::Template;
 use tracing::warn;
-use wind_config::config::{TooltipConfig, TooltipSection as SectionConfig, is_wide_char};
+use unicode_segmentation::UnicodeSegmentation;
+use wind_config::config::{
+    TRUNCATION_MARK, TooltipConfig, TooltipSection as SectionConfig, is_wide_char,
+};
 use wind_ui_types::{TooltipDoc, TooltipLine, TooltipSection};
-
-/// 候选显示截断追加的标记，与 `CandidateConfig::truncate_display` 同一个字符。
-const TRUNC_MARK: char = '…';
 
 /// 逐字段遍历的「汉字」口径：≥ U+3400（扩展 A 起）。与段列表引入前的气泡一致。
 fn is_han(c: char) -> bool {
@@ -54,6 +54,8 @@ struct CompiledSection {
     each: Each,
     promote: Option<String>,
     inline: bool,
+    /// 模板**字面**写了 `\t`：这段是分列行（「拆字 / 拼音」合并段），含 `\t` 的行不折。
+    columns: bool,
 }
 
 /// 预解析的段列表（只含启用的段）+ 显示行的长度保护。
@@ -97,6 +99,7 @@ impl CompiledTooltip {
                     .filter(|p| !p.is_empty())
                     .map(str::to_string),
                 inline: s.inline,
+                columns: Template::parse(&s.template).has_literal('\t'),
             })
             .collect();
         Self {
@@ -133,7 +136,7 @@ impl CompiledTooltip {
     ) -> RenderedTooltip {
         let truncated = disp != full;
         let shown = if truncated {
-            disp.strip_suffix(TRUNC_MARK).unwrap_or(disp)
+            disp.strip_suffix(TRUNCATION_MARK).unwrap_or(disp)
         } else {
             disp
         };
@@ -191,30 +194,41 @@ impl CompiledTooltip {
                     rows.into_iter().map(|(_, text)| text).collect()
                 }
             };
-            let raw: Vec<String> = rows
+            // 原始行是复制 / 上屏的取值来源，必须保真：不 trim、保留段内空行（多段落原文），
+            // 只去掉首尾的空白行；全是空白即空段。
+            let mut raw: Vec<String> = rows
                 .iter()
                 .flat_map(|r| r.split('\n'))
-                .filter(|l| !l.trim().is_empty())
                 .map(str::to_string)
                 .collect();
+            while raw.last().is_some_and(|l| l.trim().is_empty()) {
+                raw.pop();
+            }
+            let head = raw.iter().take_while(|l| l.trim().is_empty()).count();
+            raw.drain(..head);
             if raw.is_empty() {
                 continue;
             }
+            // 段名的字面文字不随变量全空而消失：`编码{(${code_source})}` 直接输入时就是 `编码`。
+            let (title, _) = sec.label.render(&cand_eval, &|_| true);
+            let title = title.trim().to_string();
+            // inline 按**原始行数**判：一条长原文折成多条显示行仍是「一行内容」，照样写成
+            // `标题: 内容`；此时 `标题: ` 占掉第一条显示行的宽度。
+            let inline = sec.inline && raw.len() == 1 && !title.is_empty();
+            let prefix = if inline { str_width(&title) + 2 } else { 0 };
             let lines = raw
                 .iter()
                 .enumerate()
                 .flat_map(|(i, l)| {
                     let idx = u16::try_from(i).unwrap_or(u16::MAX);
-                    self.display_lines(l)
+                    self.display_lines(l, sec.columns, if i == 0 { prefix } else { 0 })
                         .into_iter()
                         .map(move |text| TooltipLine { text, raw: idx })
                 })
                 .collect();
-            // 段名的字面文字不随变量全空而消失：`编码{(${code_source})}` 直接输入时就是 `编码`。
-            let (title, _) = sec.label.render(&cand_eval, &|_| true);
             out.doc.sections.push(TooltipSection {
                 title: (!title.is_empty()).then_some(title),
-                inline: sec.inline,
+                inline,
                 lines,
             });
             out.raw.push(raw);
@@ -222,36 +236,111 @@ impl CompiledTooltip {
         out
     }
 
-    /// 原始行 → 显示行：先按 `max_chars` 截断（超出加 `…`），再按 `wrap_width` 硬折。
+    /// 原始行 → 显示行：先按 `max_chars` 截断（超出加 `…`），再按 `wrap_width` 折行，
+    /// 丢掉全是空白的显示行。都按**字素簇**计，不会把 emoji 序列、组合字符从中间切开。
     ///
-    /// 含 `\t` 的行不折：那是分列行（「拆字 / 拼音」合并段），渲染端按 `\t` 列对齐，
-    /// 从中间折开会把第二列甩到下一行行首，对不齐反而更难读。
-    fn display_lines(&self, raw: &str) -> Vec<String> {
-        let line = if self.max_chars > 0 && raw.chars().count() > self.max_chars {
-            let head: String = raw.chars().take(self.max_chars).collect();
-            format!("{head}{TRUNC_MARK}")
+    /// - `columns`：分列段（模板字面写了 `\t`）里含 `\t` 的行不折——渲染端按 `\t` 列对齐，
+    ///   从中间折开会把第二列甩到下一行行首。变量值带进来的 `\t` 只是内容，照常折。
+    /// - `first_offset`：第一条显示行已被占掉的宽度（inline 段的 `标题: `）。
+    fn display_lines(&self, raw: &str, columns: bool, first_offset: usize) -> Vec<String> {
+        let line = if self.max_chars > 0 && raw.graphemes(true).count() > self.max_chars {
+            let head: String = raw.graphemes(true).take(self.max_chars).collect();
+            format!("{head}{TRUNCATION_MARK}")
         } else {
             raw.to_string()
         };
-        if self.wrap_width == 0 || line.contains('\t') {
-            return vec![line];
-        }
-        let mut out = Vec::new();
-        let mut cur = String::new();
-        let mut w = 0usize;
-        for c in line.chars() {
-            let cw = if is_wide_char(c) { 2 } else { 1 };
-            // 当前行非空才折：宽度不足一个全角字（wrap_width = 1）时，那个字独占一行而不是死循环。
-            if w + cw > self.wrap_width && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                w = 0;
-            }
-            cur.push(c);
-            w += cw;
-        }
-        out.push(cur);
-        out
+        let lines = if self.wrap_width == 0 || (columns && line.contains('\t')) {
+            vec![line]
+        } else {
+            wrap(&line, self.wrap_width, first_offset)
+        };
+        lines.into_iter().filter(|l| !l.trim().is_empty()).collect()
     }
+}
+
+/// 字素簇的显示宽度：CJK / 全角记 2（口径同 `is_wide_char`），emoji 也记 2——含 ZWJ 或
+/// 变体选择符 U+FE0F 的序列、以及补充平面的 emoji 区。其余记 1。
+///
+/// 与 `is_wide_char` 刻意不同：那条口径给图标主字用，把 emoji 记 1 是为了 C++ 侧缓冲容量
+/// （见其文档）；气泡是在量一行摆不摆得下，emoji 在屏上就是两列宽。
+fn grapheme_width(g: &str) -> usize {
+    let first = g.chars().next().unwrap_or(' ');
+    let emoji = matches!(first as u32, 0x1F000..=0x1FAFF)
+        || g.contains('\u{200D}')
+        || g.contains('\u{FE0F}');
+    if is_wide_char(first) || emoji { 2 } else { 1 }
+}
+
+fn str_width(s: &str) -> usize {
+    s.graphemes(true).map(grapheme_width).sum()
+}
+
+/// 连续 ASCII 片段里的断点字符：断在它**之后**（`a/ab/` | `abc`）。
+fn is_break_char(g: &str) -> bool {
+    matches!(g, " " | "/" | "·")
+}
+
+/// 按显示宽度折行。溢出发生在一段连续 ASCII（编码列表 `a/ab/abc`、英文单词）中间时，
+/// 优先退回到这段里最后一个空格、`/`、`·` 之后断开，把被切的 token 整个带到下一行；
+/// 这段里没有断点（或溢出点不在 ASCII 里，如汉字）才硬折。
+///
+/// 当前行为空时不折：宽度不足一个全角字（`width = 1`）时，那个字独占一行而不是死循环。
+fn wrap(line: &str, width: usize, first_offset: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur: Vec<(&str, usize)> = Vec::new();
+    let mut w = 0usize;
+    for g in line.graphemes(true) {
+        // 折出来的续行不以空白开头：那串空白就是断点（第一行的缩进是内容，照留）。
+        if cur.is_empty() && !out.is_empty() && g.trim().is_empty() {
+            continue;
+        }
+        let gw = grapheme_width(g);
+        let limit = if out.is_empty() {
+            width.saturating_sub(first_offset).max(1)
+        } else {
+            width
+        };
+        if w + gw > limit && !cur.is_empty() {
+            let token_char = g.is_ascii() && !g.trim().is_empty() && !is_break_char(g);
+            let carry = if token_char {
+                last_ascii_break(&cur).map(|at| cur.split_off(at))
+            } else {
+                None
+            };
+            out.push(
+                cur.iter()
+                    .map(|(s, _)| *s)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string(),
+            );
+            cur = carry.unwrap_or_default();
+            w = cur.iter().map(|(_, w)| w).sum();
+            if g.trim().is_empty() && cur.is_empty() {
+                continue;
+            }
+        }
+        cur.push((g, gw));
+        w += gw;
+    }
+    if !cur.is_empty() {
+        out.push(cur.iter().map(|(s, _)| *s).collect());
+    }
+    out
+}
+
+/// `cur` 末尾那段连续 ASCII 里最后一个断点之后的位置；末尾不是 ASCII token、或这段里
+/// 没有断点、或断点就在末尾（等于没有可带走的部分）时返回 `None`。
+fn last_ascii_break(cur: &[(&str, usize)]) -> Option<usize> {
+    for (i, (g, _)) in cur.iter().enumerate().rev() {
+        if is_break_char(g) {
+            return (i + 1 < cur.len() && i > 0).then_some(i + 1);
+        }
+        if !g.is_ascii() || g.trim().is_empty() {
+            return None;
+        }
+    }
+    None
 }
 
 /// 逐字上下文里气泡专属的变量。`None` = 不是这里的变量（交给下一层）。
@@ -985,6 +1074,125 @@ mod tests {
             .collect();
         assert_eq!(lines, [("aaaaa", 0), ("aaaaa", 0), ("aa", 0), ("bb", 1)]);
         assert_eq!(r.raw, [vec!["aaaaaaaaaaaa".to_string(), "bb".to_string()]]);
+    }
+
+    fn texts(r: &RenderedTooltip, sec: usize) -> Vec<(&str, u16)> {
+        r.doc.sections[sec]
+            .lines
+            .iter()
+            .map(|l| (l.text.as_str(), l.raw))
+            .collect()
+    }
+
+    /// 原始行保真：段内空行、行首缩进（空格 / `\t`）、行尾空白都原样保留，按 `\n` 连回去
+    /// 就是完整原文。显示行照旧跳过空行。
+    #[test]
+    fn raw_lines_round_trip_the_full_text() {
+        let t = limited(0, 0, &[section("完整原文", "", "${full_text}")]);
+        for full in [
+            "第一段\n\n\t第二段 缩进\n  第三段 ",
+            "\t首行就是制表符缩进",
+            "  两个空格缩进\n\n\n隔两空行",
+        ] {
+            let r = render_limited(&t, &truncated("第…", full));
+            assert_eq!(r.raw[0].join("\n"), full);
+            assert!(
+                r.doc.sections[0]
+                    .lines
+                    .iter()
+                    .all(|l| !l.text.trim().is_empty())
+            );
+        }
+        // 首尾的空白行不算内容；整段全是空白即空段。
+        let r = render_limited(&t, &truncated("第…", "\n  \n正文\n\t\n"));
+        assert_eq!(r.raw[0], ["正文"]);
+        assert!(
+            render_limited(&t, &truncated("第…", " \n\t "))
+                .doc
+                .is_empty()
+        );
+    }
+
+    /// 只有模板字面写了 `\t` 的分列段才免折；完整原文里自带的 `\t` 照常折。
+    #[test]
+    fn tab_from_variable_value_is_still_wrapped() {
+        let t = limited(0, 6, &[section("", "", "${full_text}")]);
+        let r = render_limited(&t, &truncated("a…", "abc\tdefghij"));
+        assert_eq!(r.doc.to_plain_text(), "abc\tde\nfghij");
+    }
+
+    /// 截断与折行都按字素簇计：ZWJ 序列、组合字符不会被切开，emoji 记 2 列。
+    #[test]
+    fn truncation_and_wrap_respect_grapheme_clusters() {
+        let family = "👨\u{200D}👩\u{200D}👧";
+        let t = limited(1, 0, &[section("", "", "${full_text}")]);
+        let r = render_limited(&t, &truncated("a…", &format!("{family}x")));
+        assert_eq!(r.doc.to_plain_text(), format!("{family}…"));
+
+        let t = limited(0, 4, &[section("", "", "${full_text}")]);
+        let r = render_limited(&t, &truncated("a…", &format!("ab{family}cd")));
+        assert_eq!(
+            r.doc.to_plain_text(),
+            format!("ab{family}\ncd"),
+            "emoji 记 2 列"
+        );
+        let r = render_limited(
+            &t,
+            &truncated("a…", "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"),
+        );
+        assert_eq!(
+            r.doc.to_plain_text(),
+            "e\u{301}e\u{301}e\u{301}e\u{301}\ne\u{301}",
+            "组合字符随基字走"
+        );
+    }
+
+    /// 连续 ASCII 优先在空格、`/`、`·` 之后断开；全是空白的显示行丢掉。
+    #[test]
+    fn wrap_prefers_ascii_break_points() {
+        let t = limited(0, 10, &[section("", "", "${full_text}")]);
+        let lines = |full: &str| {
+            render_limited(&t, &truncated("a…", full))
+                .doc
+                .to_plain_text()
+        };
+        assert_eq!(lines("a/ab/abc/abcd/abcde"), "a/ab/abc/\nabcd/abcde");
+        assert_eq!(lines("hello world foo"), "hello\nworld foo");
+        assert_eq!(lines("abc·defghijk"), "abc·\ndefghijk");
+        // 找不到断点才硬折。
+        assert_eq!(lines("abcdefghijklm"), "abcdefghij\nklm");
+        // 溢出点是汉字时不回退找 ASCII 断点。
+        assert_eq!(lines("ab/cdefgh你好"), "ab/cdefgh\n你好");
+        // 空格恰落在折点：不留下只有空白的行，也不把空格带到下一行行首。
+        assert_eq!(lines("abcdefghij          k"), "abcdefghij\nk");
+    }
+
+    /// inline 按原始行数判：一条长内容折成多条显示行仍写成 `标题: …`，前缀宽度计入首行。
+    #[test]
+    fn inline_counts_raw_lines_and_prefix_width() {
+        let mut s = section("码", "", "${full_text}");
+        s.inline = true;
+        let t = limited(0, 10, &[s]);
+        let r = render_limited(&t, &truncated("a…", "abcdefghijkl"));
+        assert!(r.doc.sections[0].inline);
+        assert_eq!(texts(&r, 0), [("abcdef", 0), ("ghijkl", 0)]);
+        assert_eq!(r.doc.to_plain_text(), "码: abcdef\nghijkl");
+        let r = render_limited(&t, &truncated("a…", "ab\ncd"));
+        assert!(!r.doc.sections[0].inline, "两条原始行就不 inline");
+        assert_eq!(r.doc.to_plain_text(), "[码]\nab\ncd");
+    }
+
+    /// 截断标记与候选窗同源：拿 `truncate_display` 的真实产物喂进来，逐字段不为 … 出行。
+    #[test]
+    fn real_truncate_display_output_yields_no_mark_row() {
+        let mut cfg = wind_config::Config::default().ui.candidate;
+        cfg.max_chars = 2;
+        let full = "好人们";
+        let disp = cfg.truncate_display(full);
+        let s = [section("Unicode", "char", "${char}：${unicode}")];
+        let out = render_new(&ReverseLookup::default(), &s, &truncated(&disp, full));
+        assert_eq!(out, "[Unicode]\n好：U+597D\n人：U+4EBA");
+        assert!(!out.contains("U+2026"));
     }
 
     /// 出厂口径（200 字 / 40 列）端到端：超长短语的完整原文先截到 200 字，再每 20 个汉字一行。

@@ -2477,6 +2477,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "tracing",
+ "unicode-segmentation",
  "wind-assoc",
  "wind-aux-code",
  "wind-bridge",

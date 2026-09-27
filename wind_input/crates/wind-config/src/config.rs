@@ -6191,7 +6191,7 @@ impl UiCandidateConfig {
         }
     }
 
-    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 `…`
+    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 [`TRUNCATION_MARK`]
     /// 提示"过长"（仅影响显示；上屏用完整原文，见 coordinator 候选下发）。
     pub fn truncate_display(&self, text: &str) -> String {
         if self.max_chars == 0 {
@@ -6202,10 +6202,14 @@ impl UiCandidateConfig {
             text.to_string()
         } else {
             let head: String = chars[..self.max_chars].iter().collect();
-            format!("{head}…")
+            format!("{head}{TRUNCATION_MARK}")
         }
     }
 }
+
+/// 显示截断追加的标记。候选窗（[`UiCandidateConfig::truncate_display`]）与悬停提示共用：
+/// 悬停提示的逐字段要认出并跳过它（它不是候选的字），两处写成各自的字面量迟早漂移。
+pub const TRUNCATION_MARK: char = '…';
 
 /// 字体配置（[ui.font]）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
