@@ -51,9 +51,10 @@ use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, LPARAM, LRESULT, POINT, RECT, WM_MOUSELEAVE, WM_MOUSEMOVE,
     WM_RBUTTONDOWN, WPARAM,
 };
-use crate::text::dwrite::TextRenderer;
+use crate::text::dwrite::{ColorRun, TextRenderer};
 use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
 use crate::window::{LayeredWindow, WindowMouse};
+use wind_theme::RvNode;
 use wind_ui_types::{TooltipDoc, TooltipHit};
 
 /// 当前显示内容的命中信息（`Tooltip` 写、`TooltipMouse` 读）。
@@ -499,6 +500,8 @@ pub struct Tooltip {
     hits: Rc<RefCell<HitState>>,
     /// 鼠标处理器本体：菜单关闭时要重挂它的离开跟踪、菜单外右键要借它请求菜单。
     mouse: Rc<RefCell<TooltipMouse>>,
+    /// 当前内容的分段颜色（[`Self::set_doc`] 按当前主题现求，等于正文色的已丢弃）。
+    runs: Vec<ColorRun>,
 }
 
 impl Tooltip {
@@ -543,6 +546,7 @@ impl Tooltip {
             suppress_hide,
             hits,
             mouse,
+            runs: Vec::new(),
         })
     }
 
@@ -618,6 +622,7 @@ impl Tooltip {
     ) -> (Vec<u8>, u32, u32, u32, u32, u32, u32, u32, u32, bool) {
         let s = self.scale;
         let mut tip = View::leaf(text, self.fg)
+            .color_runs(self.runs.clone())
             .bg(self.bg)
             .pad(Edges::xy(8.0 * s, 4.0 * s))
             .text_align(Align::Center);
@@ -805,7 +810,10 @@ impl Tooltip {
         self.suppress_hide.get()
     }
 
-    /// 记下当前内容（命中换算要用），返回要画的纯文本。
+    /// 记下当前内容（命中换算要用），求好分段颜色，返回要画的纯文本。
+    ///
+    /// 颜色在这里按**当前**主题现求：片段带的是角色 / 颜色引用，换主题、切明暗后重画即取到
+    /// 新颜色。正文色兜底与 [`Self::set_theme`] 同源（palette `tooltip_text` → 节点文字色）。
     fn set_doc(&mut self, doc: &TooltipDoc, candidate: i32) -> String {
         // 伪离开后等复查期间换了内容（光标移到别的候选，协调器重绘直接 show 新气泡，不经
         // `hide`）：光标已不在气泡上，复查到期会把新气泡当「离开」藏掉——就此归位。光标
@@ -816,11 +824,23 @@ impl Tooltip {
                 m.settle_hidden();
             }
         }
+        let styled = doc.to_styled();
+        self.runs = match &self.theme {
+            Some(t) => crate::span_runs::color_runs(
+                t,
+                t.views.tooltip.as_ref().unwrap_or(&RvNode::default()),
+                true,
+                wind_theme::TextState::Normal,
+                t.color("tooltip_text", FG),
+                &styled,
+            ),
+            None => Vec::new(),
+        };
         let mut h = self.hits.borrow_mut();
         h.doc = doc.clone();
         h.candidate = candidate;
         h.text_box = None;
-        doc.to_plain_text()
+        styled.into_string()
     }
 
     /// 将当前渲染帧保存为 PNG 文件（截图用）。
@@ -1722,5 +1742,40 @@ mod tests {
     fn client_point_is_signed_16_bit_pairs() {
         assert_eq!(client_point(LPARAM((20 << 16) | 10)), (10, 20));
         assert_eq!(client_point(LPARAM(0xFFFF_FFFF)), (-1, -1));
+    }
+
+    /// 片段按主题求色后接到气泡叶子：内联色那段走 draw_runs，气泡里名字先查 `tooltip_<名>`。
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn inline_color_reaches_the_tooltip_leaf() {
+        use wind_ui_types::{SpanStyle, StyledText};
+        let mut t = tooltip();
+        let mut theme = wind_theme::Resolved::default();
+        theme.palette.insert("error".into(), [1, 1, 1, 255]);
+        theme.palette.insert("tooltip_error".into(), [2, 2, 2, 255]);
+        t.set_theme(&theme);
+        let mut text = StyledText::from("你：");
+        text.push(
+            "nǐ",
+            &SpanStyle {
+                color: Some(wind_theme::InlineColor::parse("error")),
+                ..Default::default()
+            },
+        );
+        let doc = TooltipDoc {
+            sections: vec![TooltipSection {
+                title: None,
+                inline: false,
+                lines: vec![TooltipLine { text, raw: 0 }],
+            }],
+        };
+        let (_, _, _, log) = t.golden_frame(&doc);
+        assert_eq!(log.len(), 1);
+        assert!(
+            log[0].starts_with("draw_runs ")
+                && log[0].contains("ColorRun { start: 6, end: 9, rgba: [2, 2, 2, 255] }"),
+            "{}",
+            log[0]
+        );
     }
 }

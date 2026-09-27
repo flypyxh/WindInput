@@ -19,7 +19,7 @@
 
 use super::*;
 use std::path::PathBuf;
-use wind_ui_types::{TooltipDoc, TooltipLine, TooltipSection};
+use wind_ui_types::{SpanStyle, StyledText, TooltipDoc, TooltipLine, TooltipSection};
 
 /// 出厂主题目录下的主题（含两个抽象 base：它们同样可加载，且是其余主题的公共祖先）。
 const THEMES: &[&str] = &[
@@ -57,37 +57,76 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// 一段带角色的文字（协调器模板引擎产出的片段形态）。
+fn piece(out: &mut StyledText, text: &str, role: &str, in_title: bool) {
+    out.push(
+        text,
+        &SpanStyle {
+            role: Some(role.into()),
+            in_title,
+            color: None,
+        },
+    );
+}
+
+fn role_text(text: &str, role: &str) -> StyledText {
+    let mut t = StyledText::new();
+    piece(&mut t, text, role, false);
+    t
+}
+
 /// 出厂注释模板 `${code_hint|code_rev|shuangpin}` 渲染出的样子：短编码、空注释、多字词编码。
+///
+/// ★ 带着协调器真实产出的**片段角色**（P2 起模板引擎恒产出片段）：出厂主题不配角色，
+/// 这些片段必须全部解析到正文色而被丢弃，golden 才能与分段着色之前逐字节相同（§6.4）。
 fn candidates() -> Vec<CandidateItem> {
-    let c = |text: &str, comment: &str| CandidateItem {
+    let c = |text: &str, comment: StyledText| CandidateItem {
         text: text.to_string(),
         code: String::new(),
         label: String::new(),
         tooltip: TooltipDoc::default(),
-        comment: comment.into(),
+        comment,
         no_index: false,
     };
     // 下标 0 选中、1 悬停、2/3 常态（一条无注释、一条有）。
-    vec![c("好", "vb"), c("号", "kg"), c("浩", ""), c("你好", "wqvb")]
+    vec![
+        c("好", role_text("vb", "code_hint")),
+        c("号", role_text("kg", "code_rev")),
+        c("浩", StyledText::new()),
+        c("你好", role_text("wqvb", "shuangpin")),
+    ]
 }
 
-/// 出厂气泡段（完整原文关、编码、拼音逐字）渲染出的样子。
+/// 出厂气泡段（完整原文关、编码、拼音逐字）渲染出的样子，带协调器产出的片段角色
+/// （段名字面 title、段名里的变量 in_title、逐字行 char / literal / readings）。
 fn tooltip_doc() -> TooltipDoc {
-    let line = |t: &str, raw| TooltipLine {
-        text: t.into(),
-        raw,
+    let per_char = |ch: &str, readings: &str, raw| {
+        let mut t = StyledText::new();
+        piece(&mut t, ch, "char", false);
+        piece(&mut t, "：", "literal", false);
+        piece(&mut t, readings, "readings", false);
+        TooltipLine { text: t, raw }
     };
+    let mut code_title = StyledText::new();
+    piece(&mut code_title, "编码(", "title", true);
+    piece(&mut code_title, "五笔", "code_source", true);
+    piece(&mut code_title, ")", "title", true);
+    let mut pinyin_title = StyledText::new();
+    piece(&mut pinyin_title, "拼音", "title", true);
     TooltipDoc {
         sections: vec![
             TooltipSection {
-                title: Some("编码(五笔)".into()),
+                title: Some(code_title),
                 inline: false,
-                lines: vec![line("wqvb", 0)],
+                lines: vec![TooltipLine {
+                    text: role_text("wqvb", "word_code"),
+                    raw: 0,
+                }],
             },
             TooltipSection {
-                title: Some("拼音".into()),
+                title: Some(pinyin_title),
                 inline: false,
-                lines: vec![line("你：nǐ", 0), line("好：hǎo/hào", 1)],
+                lines: vec![per_char("你", "nǐ", 0), per_char("好", "hǎo/hào", 1)],
             },
         ],
     }
@@ -199,6 +238,12 @@ fn golden_covers_comments_and_tooltip() {
     ] {
         assert!(got.contains(needle), "golden 里找不到 {needle}");
     }
+    // 出厂路径没有任何调用走 runs：片段全部解析到正文色、被丢弃。
+    assert!(!got.contains("draw_runs"), "出厂路径不应出现 draw_runs");
+    assert!(!got.contains(" runs="), "出厂 View 树不应带颜色区间");
+    // 防空转：输入确实带着片段。
+    assert!(!candidates()[0].comment.spans().is_empty());
+    assert!(!tooltip_doc().to_styled().spans().is_empty());
     // 直立态注释逐格切：`wqvb` 在直立段里是四个单字母叶子。
     let upright = got.split("== 候选窗 直立 ==").nth(1).unwrap();
     assert!(upright.contains("text=\"w\""), "直立态注释应逐格切开");

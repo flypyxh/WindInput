@@ -18,7 +18,7 @@ use crate::sys::{
     SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
-use crate::text::dwrite::{TextRenderer, TextStyle};
+use crate::text::dwrite::{ColorRun, TextRenderer, TextStyle};
 use crate::text::font_resolve::{FontNameSource, ResolvedFont, resolve_font_name};
 use crate::text::script::{FontPlan, ScriptClass};
 use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
@@ -74,6 +74,20 @@ fn apply_scheme_text_font(views: &mut wind_theme::RvViews, scheme_family: &str) 
 /// （`ui.candidate.font_size` 的 0 = 跟随主题）。
 fn effective_base_font_size(user: f32, theme: i32) -> f32 {
     if user > 0.0 { user } else { theme as f32 }
+}
+
+/// 注释节点没配文字色时的渲染层兜底（分段着色求色的 `body_fallback` 与之同源）。
+const COMMENT_FALLBACK: [u8; 4] = [150, 150, 150, 255];
+
+/// 候选的文字状态：选中优先于悬停（与 `eff_text` / `wind_theme::span_color` 同一口径）。
+fn text_state(sel: bool, hov: bool) -> wind_theme::TextState {
+    if sel {
+        wind_theme::TextState::Selected
+    } else if hov {
+        wind_theme::TextState::Hover
+    } else {
+        wind_theme::TextState::Normal
+    }
 }
 
 /// 把 `[ui.font]` 的三个键折成渲染层的 [`FontPlan`]。
@@ -2532,15 +2546,9 @@ impl CandidateWindow {
             |p: &Option<Box<RvNode>>, d: [u8; 4]| p.as_ref().and_then(|n| n.bg_color).unwrap_or(d);
         // 状态文字色（与 Go effectiveNode 对齐）：选中优先于悬停；选中/悬停 patch 未给文字色
         // → 回退基态色（不跨态借色）。index/text/comment 同一套消费。
+        // 与分段着色的求色共用 `wind_theme::body_color`，两处同一口径（`base` 已是节点基态色）。
         let eff_text = |node: &RvNode, base: [u8; 4], sel: bool, hov: bool| -> [u8; 4] {
-            let st = if sel {
-                node.selected.as_deref()
-            } else if hov {
-                node.hover.as_deref()
-            } else {
-                None
-            };
-            st.and_then(|n| n.text_color).unwrap_or(base)
+            wind_theme::body_color(node, text_state(sel, hov), base)
         };
         // 有效字重（与 eff_text 同构）：节点/item 的状态 patch 字重优先，回退节点/item 基态；0=继承默认。
         // item 参与是因为主题常把"选中加粗"配在 [item.selected].font_weight（如 jidian），需作用到候选文本。
@@ -2885,7 +2893,7 @@ impl CandidateWindow {
         let sel_bg = patch_bg(&v.item.selected, [230, 240, 255, 255]);
         let hover_bg = patch_bg(&v.item.hover, [238, 242, 247, 255]);
         let index_color = col(v.index.text_color, [66, 133, 244, 255]);
-        let comment_color = col(v.comment.text_color, [150, 150, 150, 255]);
+        let comment_color = col(v.comment.text_color, COMMENT_FALLBACK);
         let comment_fs = node_fs(&v.comment);
         let index_circle = v.index.bg_shape == "circle";
         let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
@@ -3569,12 +3577,23 @@ impl CandidateWindow {
                 // 推翻（旋转态是一切都转、自洽；直立态混排看不懂）。
                 let cmt_weight = eff_weight(&v.comment, &v.item, is_sel, is_hover);
                 let cmt_family = v.comment.font_family.clone();
+                // 分段颜色：按当前主题与本候选的状态现求（悬停只有 UI 知道），等于正文色的丢弃。
+                let cmt_runs = crate::span_runs::color_runs(
+                    &self.theme,
+                    &v.comment,
+                    false,
+                    text_state(is_sel, is_hover),
+                    COMMENT_FALLBACK,
+                    &cand.comment,
+                );
                 let mut cleaf = self
-                    .upright_text(cand.comment.as_str(), None, |seg, _, _| {
+                    .upright_text(cand.comment.as_str(), None, |seg, _, off| {
+                        // 直立态逐格切叶子：每格只拿自己那几段颜色，平移到格内偏移。
                         View::leaf(seg.to_string(), cmt_color)
                             .font_size(comment_fs)
                             .font_weight(cmt_weight)
                             .font_family(cmt_family.clone())
+                            .color_runs(ColorRun::slice(&cmt_runs, off, off + seg.len()))
                     })
                     .pad(edges_or(&v.comment.padding, [0.0; 4]))
                     .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]));
@@ -7462,6 +7481,132 @@ mod upright_color_run_tests {
                 ("a", one(1, RED).as_slice()),
                 ("你", one(3, RED).as_slice()),
                 ("b", one(1, BLUE).as_slice()),
+            ]
+        );
+    }
+}
+
+// 注释的分段颜色：按主题与候选状态求色，接到注释叶子的 color_runs（设计 text-span-colors.md §6）。
+#[cfg(test)]
+mod comment_color_tests {
+    use super::*;
+    use wind_ui_types::{SpanStyle, StyledText};
+
+    const RED: [u8; 4] = [0xC0, 0, 0, 255];
+
+    /// 「wq(nǐ)」：`wq` 带内联色 `#C00000`（选中态改用 `selected=` 给的色），其余无色。
+    fn comment(spec: &str) -> StyledText {
+        let mut t = StyledText::new();
+        t.push(
+            "wq",
+            &SpanStyle {
+                role: Some("code_rev".into()),
+                color: Some(wind_theme::InlineColor::parse(spec)),
+                ..Default::default()
+            },
+        );
+        t.push(
+            "(nǐ)",
+            &SpanStyle {
+                role: Some("literal".into()),
+                ..Default::default()
+            },
+        );
+        t
+    }
+
+    fn window(theme: wind_theme::Resolved, upright: bool) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_theme(theme);
+        w.set_orientation(false, upright, upright);
+        w
+    }
+
+    fn cand(c: StyledText) -> CandidateItem {
+        CandidateItem {
+            text: "你".into(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: Default::default(),
+            comment: c,
+            no_index: false,
+        }
+    }
+
+    /// 树里所有带颜色区间的叶子：`(文字, 区间)`。
+    fn colored(v: &View, out: &mut Vec<(String, Vec<ColorRun>)>) {
+        if let Some(t) = &v.text
+            && !v.color_runs.is_empty()
+        {
+            out.push((t.clone(), v.color_runs.clone()));
+        }
+        for c in &v.children {
+            colored(c, out);
+        }
+    }
+
+    fn runs_of(
+        w: &mut CandidateWindow,
+        comment_spec: &str,
+        selected: usize,
+    ) -> Vec<(String, Vec<ColorRun>)> {
+        w.update(
+            "ni",
+            2,
+            "",
+            vec![cand(comment(comment_spec))],
+            selected,
+            -1,
+            1,
+            1,
+        );
+        let mut out = Vec::new();
+        colored(&w.build_tree(false), &mut out);
+        out
+    }
+
+    fn run(start: u32, end: u32, rgba: [u8; 4]) -> ColorRun {
+        ColorRun { start, end, rgba }
+    }
+
+    #[test]
+    fn inline_color_reaches_the_comment_leaf() {
+        let mut w = window(wind_theme::Resolved::default(), false);
+        // 候选 0 不是选中（selected 越界）⇒ 常态。
+        assert_eq!(
+            runs_of(&mut w, "#C00000", 9),
+            vec![("wq(nǐ)".to_string(), vec![run(0, 2, RED)])]
+        );
+    }
+
+    /// 规则 3：主题把选中态注释正文色改了 ⇒ 内联色回落该态正文色（区间被丢）；
+    /// `selected=` 单列的照用。
+    #[test]
+    fn selected_state_falls_back_unless_inline_says_selected() {
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.comment.selected = Some(Box::new(wind_theme::RvNode {
+            text_color: Some([255, 255, 255, 255]),
+            ..Default::default()
+        }));
+        let mut w = window(theme, false);
+        assert_eq!(runs_of(&mut w, "#C00000", 0), vec![], "选中态回落正文色");
+        assert_eq!(
+            runs_of(&mut w, "#C00000,selected=#00FF00", 0),
+            vec![("wq(nǐ)".to_string(), vec![run(0, 2, [0, 255, 0, 255])])]
+        );
+    }
+
+    /// 直立态逐格切：`w`、`q` 两格各得一段，其余格没有区间。
+    #[test]
+    fn upright_cells_get_their_slices() {
+        let mut w = window(wind_theme::Resolved::default(), true);
+        assert_eq!(
+            runs_of(&mut w, "#C00000", 9),
+            vec![
+                ("w".to_string(), vec![run(0, 1, RED)]),
+                ("q".to_string(), vec![run(0, 1, RED)]),
             ]
         );
     }
