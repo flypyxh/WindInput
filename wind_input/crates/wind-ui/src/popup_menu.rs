@@ -503,7 +503,7 @@ impl PopupMenu {
         self.renderer.set_base_size(self.font_px * self.scale);
         let s = self.scale;
         if let Some(node) = &theme.views.menu_root {
-            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             // 背景色/边框色/宽/圆角从 menu.root 节点读取（权威，px/dp 经 Dim 区分）；
             // bg_color / border_color 默认已带 menu_bg / menu_border token 兜底（resolve build 传入）。

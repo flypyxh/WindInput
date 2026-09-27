@@ -2176,7 +2176,7 @@ impl CandidateWindow {
 
     /// RvImage → 渲染用 ViewImage（委托共享 theme_assets）。
     fn rv_image(&self, im: Option<&wind_theme::RvImage>) -> Option<ViewImage> {
-        crate::theme_assets::rv_image(&self.theme, im)
+        crate::theme_assets::rv_image(&self.theme, im, self.scale)
     }
 
     /// footer 翻页箭头图标（SVG + tint）。无 prev/next_image 时 None（回退文字箭头）。
@@ -2198,6 +2198,7 @@ impl CandidateWindow {
             slice_repeat: [false; 2],
             opacity: 1.0,
             tint,
+            place: None,
         })
     }
 

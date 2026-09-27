@@ -78,7 +78,7 @@ impl Toast {
         self.renderer.set_base_size(self.base_logical * self.scale);
         if let Some(node) = &theme.views.toast {
             let s = self.scale;
-            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             self.shadow = crate::view::SoftShadow::build(
                 node.shadow_offset_x,

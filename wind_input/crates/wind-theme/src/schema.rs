@@ -162,7 +162,7 @@ pub struct ViewPoint {
     pub y: Option<Dim>,
 }
 
-/// 覆盖图尺寸（逻辑像素）；0=原图尺寸。
+/// 图片定位尺寸（逻辑像素）；0=该维取原图尺寸。
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct ViewSize {
     #[serde(default)]
@@ -190,7 +190,8 @@ pub struct ViewImage {
     /// 仅 layers[]：内容基准 0，<0 在内容下、>0 在上。
     #[serde(default)]
     pub z: i32,
-    /// 仅覆盖图：top-left | top | … | center | … | bottom-right。
+    /// 定位锚点：top-left | top | … | center | … | bottom-right。覆盖图恒按它定位；
+    /// 背景图配了 anchor / 非零 offset / 非零 size 任一项即改为按定位摆放（否则铺满）。
     #[serde(default)]
     pub anchor: String,
     #[serde(default)]
