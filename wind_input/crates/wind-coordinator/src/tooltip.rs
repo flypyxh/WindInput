@@ -233,6 +233,7 @@ mod tests {
     /// | 㐀 | 丿一 [tgd] | —— | 无拼音有拆字：合并行不带 `\t` |
     /// | 𠀀 | 一丨 [ghk] | hē | 扩展 B（代理对） |
     /// | 龘 | —— | —— | 两表都没有 |
+    /// | 丂 | （空） [gnv] | kǎo | 有编码无字根：只有用户自备拆字库会出现（出厂库 0 条） |
     fn fixture_reverse() -> ReverseLookup {
         // 每次调用独占一个目录：测试并行跑，共用目录会被别的用例的 remove_dir_all 删掉。
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -243,19 +244,45 @@ mod tests {
         let chaizi = dir.join("chaizi.txt");
         std::fs::write(
             &chaizi,
-            "好\t女子\tvbg\n重\t丿一日一土\ttgjf\n人\t人\t\n㐀\t丿一\ttgd\n𠀀\t一丨\tghk\n",
+            "好\t女子\tvbg\n重\t丿一日一土\ttgjf\n人\t人\t\n㐀\t丿一\ttgd\n𠀀\t一丨\tghk\n丂\t\tgnv\n",
         )
         .unwrap();
         let pinyin = dir.join("pinyin_map.txt");
         std::fs::write(
             &pinyin,
             "U+597D: hǎo,hào  # 好\nU+91CD: zhòng,chóng,tóng  # 重\nU+4F60: nǐ  # 你\n\
-             U+4EBA: rén  # 人\nU+20000: hē  # 𠀀\n",
+             U+4EBA: rén  # 人\nU+20000: hē  # 𠀀\nU+4E02: kǎo  # 丂\n",
         )
         .unwrap();
         let rl = ReverseLookup::load(Some(&pinyin), Some(&chaizi));
         let _ = std::fs::remove_dir_all(&dir);
         rl
+    }
+
+    /// 夹具取数的字面量锚：对拍的新旧两侧共用 `readings_of` / `radicals_of` /
+    /// `chaizi_code_of`，这几个函数自己错了两侧会一起错、对拍照样绿。这里钉死它们在
+    /// 典型字上的输出，取数层的回归由这条报出来。
+    #[test]
+    fn fixture_lookups_are_pinned() {
+        let rl = fixture_reverse();
+        assert_eq!(
+            rl.readings_of('重', 0, "/"),
+            "zhòng/chóng/tóng",
+            "多音字按表序"
+        );
+        assert_eq!(rl.readings_of('重', 2, "/"), "zhòng/chóng");
+        assert_eq!(rl.readings_of('你', 0, "/"), "nǐ", "单读音");
+        assert_eq!(rl.readings_of('𠀀', 0, "/"), "hē", "扩展 B");
+        assert_eq!(rl.readings_of('㐀', 0, "/"), "");
+        assert_eq!(rl.radicals_of("好", ""), "女子");
+        assert_eq!(rl.chaizi_code_of("好"), "vbg");
+        assert_eq!(rl.radicals_of("𠀀", ""), "一丨");
+        assert_eq!(rl.chaizi_code_of("𠀀"), "ghk");
+        assert_eq!(rl.radicals_of("人", ""), "人");
+        assert_eq!(rl.chaizi_code_of("人"), "", "有字根无编码");
+        assert_eq!(rl.radicals_of("丂", ""), "", "有编码无字根");
+        assert_eq!(rl.chaizi_code_of("丂"), "gnv");
+        assert_eq!(rl.radicals_of("你", ""), "");
     }
 
     /// 生产同一份的逐字求值（去掉只有协调器才有的引擎类变量，对拍的段列表用不到它们）。
@@ -471,6 +498,7 @@ mod tests {
             c("𠀀", Some("ghk"), None),
             c("好𠀀你", None, Some("五笔")),
             c("龘", Some("xyz"), None), // 两表都没有，只剩编码
+            c("丂", None, None),        // 有编码无字根
             c("好a人", Some("x"), None),
             c("你好…", None, None),      // 截断后的显示文本
             c("abc", Some("abc"), None), // 纯非 CJK：只可能有调试段
@@ -478,9 +506,27 @@ mod tests {
         ]
     }
 
-    /// 旧开关只有一边有内容时，旧实现不合并、保留那一边的标题（`[拼音]` / `[拆字]`），
-    /// 而迁移出的合并段标题恒为「拆字 / 拼音」。内容行逐字节一致，差异只在这一行标题。
-    fn expected(old: &str, f: LegacyTooltipFlags) -> String {
+    /// 新渲染的预期：旧输出，外加设计 §8.3 已确认的两条差异。
+    ///
+    /// 1. 旧开关只有一边有内容时，旧实现不合并、保留那一边的标题（`[拼音]` / `[拆字]`），
+    ///    而迁移出的合并段标题恒为「拆字 / 拼音」。内容行逐字节一致，差异只在这一行标题。
+    /// 2. 拆字库里「字根空、编码非空」的字（夹具「丂」）：旧实现按字根判存在、整行跳过；
+    ///    新模板 `${chaizi}{ [${chaizi_code}]}` 表达不了「编码只跟着字根出现」，于是多出
+    ///    ` [gnv]`。只有用户自备拆字库会出现（出厂库 0 条），且显示的信息更多而非更少。
+    ///    这类用例不走「旧输出 + 改写」，直接逐字节写出新输出。
+    fn expected(old: &str, f: LegacyTooltipFlags, c: &Cand) -> String {
+        if c.disp == "丂" && f.chaizi {
+            let body = if f.pinyin {
+                "[拆字 / 拼音]\n丂： [gnv]\tkǎo"
+            } else {
+                "[拆字]\n丂： [gnv]"
+            };
+            return if f.debug {
+                format!("{body}\n[调试]\n{}", c.debug)
+            } else {
+                body.to_string()
+            };
+        }
         if f.chaizi && f.pinyin {
             old.replacen("[拼音]\n", "[拆字 / 拼音]\n", 1).replacen(
                 "[拆字]\n",
@@ -498,13 +544,13 @@ mod tests {
     fn migrated_sections_reproduce_legacy_tooltip_byte_for_byte() {
         let rl = fixture_reverse();
         let mut checked = 0;
-        let mut title_only = 0;
+        let mut deviations = 0;
         for f in all_flags() {
             let sections = tooltip_sections_from_legacy(f);
             for c in fixtures() {
                 let old = legacy(&rl, f, &c);
                 let new = render_new(&rl, &sections, &c);
-                let want = expected(&old, f);
+                let want = expected(&old, f, &c);
                 assert_eq!(
                     new, want,
                     "\n开关 {f:?}\n候选 {:?} word_code={:?} code_source={:?}\n旧输出:\n{old}\n",
@@ -512,14 +558,14 @@ mod tests {
                 );
                 checked += 1;
                 if want != old {
-                    title_only += 1;
+                    deviations += 1;
                 }
             }
         }
         assert_eq!(checked, 96 * fixtures().len());
         // 标题差异只出现在「拆字、拼音同开」且某一边整段为空的组合上；夹具里有这种候选
         // （㐀 无读音、你/龘 无拆字……），数目为零说明夹具退化了，对拍不再覆盖那条分支。
-        assert!(title_only > 0);
+        assert!(deviations > 0);
     }
 
     /// ★ 已确认的唯一标题差异（2026-09-27 用户确认，设计 §8.3）：拆字、拼音同开而某一边
