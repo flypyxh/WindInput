@@ -330,6 +330,14 @@ impl AuxCodeSettings {
     }
 }
 
+/// 设置页「辅助码来源」的可选项。
+pub struct AuxCodeSourceOptions {
+    /// (方案 id, 方案名)：已安装的码表方案，含隐藏、不看是否启用。
+    pub schemas: Vec<(String, String)>,
+    /// (相对 schemas 的路径, 绝对路径)：各层 `schemas/aux_code/*.txt`，靠前的层遮蔽同名者。
+    pub files: Vec<(String, std::path::PathBuf)>,
+}
+
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 /// 某个码位区间在词库里的命中情况，[`EngineManager::scan_chars_in_range`] 的产出。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -4323,6 +4331,27 @@ impl EngineManager {
             max_phrase_len: resolved.max_phrase_len,
             sources,
         }
+    }
+
+    /// 设置页「辅助码来源」的可选项：码表方案（排除 `exclude`，即请求方自己）+ 码表文件。
+    pub fn aux_code_source_options(&self, exclude: &str) -> AuxCodeSourceOptions {
+        let schemas = self
+            .installed_schemas()
+            .into_iter()
+            .filter(|id| {
+                id != exclude && self.schema_engine_type(id).as_deref() == Some("codetable")
+            })
+            .map(|id| {
+                let name = self.schema_name(&id);
+                (id, name)
+            })
+            .collect();
+        let files = wind_config::Config::list_schema_resource_dir(
+            self.data_dir.as_deref(),
+            "aux_code",
+            ".txt",
+        );
+        AuxCodeSourceOptions { schemas, files }
     }
 
     /// 活跃方案的词频排序设置。等价于 `freq_settings_for(active_schema_id())`。

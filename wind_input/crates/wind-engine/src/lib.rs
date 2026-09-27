@@ -23,7 +23,8 @@ pub use engine::{
 };
 pub use english::EnglishEngine;
 pub use manager::{
-    AuxCodeSettings, AuxSource, EngineManager, FreqSettings, FreqStrategy, SchemaDictFile,
+    AuxCodeSettings, AuxCodeSourceOptions, AuxSource, EngineManager, FreqSettings, FreqStrategy,
+    SchemaDictFile,
 };
 pub use pinyin::PinyinEngine;
 pub use text_codes::TextCodeView;

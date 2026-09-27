@@ -369,6 +369,7 @@ pub trait WebDataRpc: WebDataHost {
             // 全局页「已被 N 个方案覆盖」的反查：全局键 → 覆盖它的方案 id 列表（R8.6）。
             "schema.overrideSummary" => self.web_schema_override_summary(),
             "schema.saveConfig" => self.web_schema_save_config(params),
+            "schema.auxCodeSources" => self.web_schema_aux_code_sources(params),
             "schema.resetConfig" => self.web_schema_reset_config(params),
             "schema.setDictEnabled" => self.web_schema_set_dict_enabled(params),
             // 失效方案的引擎缓存（未加载时安全 no-op）：CLI `schema set/reset` 后
@@ -1567,6 +1568,32 @@ pub trait WebDataRpc: WebDataHost {
         // 里，不在此重建就要等重启 / 下次改全局设置才生效（GH#144）。
         self.refresh_schema_derived_config();
         Ok(json!({ "ok": true }))
+    }
+
+    /// 设置页「辅助码来源」下拉的两组可选项，见 `docs/design/aux-code-schema-source.md` §6。
+    ///
+    /// 码表名只读文件首行（`read_name`），缺头时退回文件名——列出来比滤掉好查。
+    fn web_schema_aux_code_sources(&self, params: &Value) -> anyhow::Result<Value> {
+        let exclude = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let o = self.engine_mgr().aux_code_source_options(exclude);
+        let schemas: Vec<Value> = o
+            .schemas
+            .iter()
+            .map(|(id, name)| json!({ "id": id, "name": name }))
+            .collect();
+        let files: Vec<Value> = o
+            .files
+            .iter()
+            .map(|(rel, abs)| {
+                let label = wind_aux_code::read_name(abs).unwrap_or_else(|| {
+                    abs.file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+                json!({ "path": rel, "label": label })
+            })
+            .collect();
+        Ok(json!({ "schemas": schemas, "files": files }))
     }
 
     fn web_schema_reset_config(&self, params: &Value) -> anyhow::Result<Value> {
@@ -8402,6 +8429,65 @@ short_code_yield_level = 2
         assert_eq!(hid["hidden"], true, "隐藏方案应带 hidden = true");
         let vis = arr2.iter().find(|s| s["id"] == "en_test").unwrap();
         assert_eq!(vis["hidden"], false, "非隐藏方案的 hidden 应为 false");
+    }
+
+    /// 设置页「辅助码来源」的可选项：码表方案（不含请求方自己、不含非码表方案）+ aux_code/*.txt。
+    #[test]
+    fn schema_aux_code_sources_lists_codetable_schemas_and_tables() {
+        let dir = std::env::temp_dir().join(format!("wind_webdata_aux_src_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(schemas.join("aux_code")).unwrap();
+        std::fs::write(
+            schemas.join("pinyin.schema.toml"),
+            "[schema]\nid = \"pinyin\"\nname = \"拼\"\n[engine]\ntype = \"pinyin\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("zz_wb.schema.toml"),
+            "[schema]\nid = \"zz_wb\"\nname = \"测五\"\nhidden = true\n[engine]\ntype = \"codetable\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("aux_code/zz_named.txt"),
+            "# name: 小鹤\n李=mz\n",
+        )
+        .unwrap();
+        std::fs::write(schemas.join("aux_code/zz_plain.txt"), "李=mz\n").unwrap();
+        let store_path = dir.join("s.redb");
+        let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+        let c = Coordinator::new_headless_with_store_override(
+            wind_config::Config::default(),
+            Some(&dir),
+            store,
+            None,
+        );
+        let v = c
+            .web_data_rpc("schema.auxCodeSources", &json!({ "id": "pinyin" }))
+            .unwrap();
+        let schemas_v = v["schemas"].as_array().unwrap();
+        assert!(
+            schemas_v
+                .iter()
+                .any(|s| s["id"] == "zz_wb" && s["name"] == "测五"),
+            "隐藏的码表方案也列出"
+        );
+        assert!(
+            !schemas_v.iter().any(|s| s["id"] == "pinyin"),
+            "请求方自己 / 非码表不列"
+        );
+        let files = v["files"].as_array().unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f["path"] == "aux_code/zz_named.txt" && f["label"] == "小鹤")
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f["path"] == "aux_code/zz_plain.txt" && f["label"] == "zz_plain"),
+            "无头时退回文件名"
+        );
     }
 
     #[test]
