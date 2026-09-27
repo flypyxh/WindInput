@@ -885,7 +885,8 @@ impl CandidateWindow {
     }
 
     /// 渲染器默认字重：用户 `ui.font.weight` > 旧字体名里带的字重 > 常规。
-    /// 主题节点显式的 `font_weight`（含「选中加粗」）在 layout 层仍胜过它。
+    /// 主题节点显式的 `font_weight` 在 layout 层胜过它；用户字重非 0 时主题节点的普通字重
+    /// 已在 [`Self::refresh_effective_theme`] 里清掉，只剩强调字重（见 `apply_user_font_weight`）。
     fn apply_default_weight(&mut self) {
         let w = if self.user_font_weight > 0 {
             self.user_font_weight
@@ -1173,10 +1174,12 @@ impl CandidateWindow {
         apply_scheme_text_font(&mut t.views, &self.text_family_override);
         // 主题节点与方案级字族换成渲染端认得的名字（旧 GDI face name → family + 字重）。
         // 缓存已由上面的告警检查填好，这里不会再问一遍字体集。
-        // 字重优先级：节点显式 font_weight > 用户 ui.font.weight（非 0）> 名字拆出的字重 > 常规。
-        // 用户指定了字重时丢弃名字里的字重，节点保持 0 = 继承渲染器默认（即用户字重）；
-        // 每次都从 theme_source 重算，故这里填进节点的只可能是名字字重、不会污染原始主题。
+        // 字重优先级：用户 ui.font.weight（非 0）是基准——主题普通字重让位于它、主题强调字重
+        // （≥ 600 或比基态重，如选中 700）取 max(主题, 用户)；用户未指定时节点显式字重 >
+        // 名字拆出的字重 > 常规。用户指定了字重时也丢弃名字里的字重，节点保持 0 = 继承
+        // 渲染器默认（即用户字重）。每次都从 theme_source 重算，不会污染原始主题。
         let user_weight = self.user_font_weight;
+        t.views.apply_user_font_weight(user_weight);
         t.views.resolve_font_families(|f| {
             let r = self.resolve_font(f);
             (r.family, if user_weight > 0 { 0 } else { r.weight })
@@ -6320,7 +6323,43 @@ mod font_name_resolve_tests {
         assert_eq!(v.text.font_weight, 600);
     }
 
-    /// 用户 `ui.font.weight` 压过主题旧字体名拆出的字重，但不压节点显式字重。
+    /// 靶机复现（维护者实测「字重无效」）：主题「Switch风格」给 `[text]` 写了 500、
+    /// `[text.selected]` 写了 700，用户 `ui.font.weight = 900` 对候选文字一个字都不生效。
+    /// 用户字重是候选文字的**基准**：普通字重让位（节点回 0 = 继承渲染器默认 900），
+    /// 强调节点（≥ 600 或比基态重）取 max(主题, 用户)。
+    #[test]
+    fn user_weight_replaces_plain_theme_weight_and_raises_emphasis() {
+        let mut w = win();
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.text.font_weight = 500;
+        theme.views.text.selected = Some(Box::new(wind_theme::RvNode {
+            font_weight: 700,
+            ..Default::default()
+        }));
+        w.set_theme(theme);
+        assert_eq!(w.theme.views.text.font_weight, 500, "无用户字重：主题原样");
+        w.set_font_weight(900);
+        let v = &w.theme.views;
+        assert_eq!(v.text.font_weight, 0, "普通字重让位给用户字重");
+        assert_eq!(w.text_renderer.default_weight(), 900);
+        assert_eq!(
+            v.text.selected.as_ref().unwrap().font_weight,
+            900,
+            "强调取 max"
+        );
+        w.set_font_weight(300);
+        let v = &w.theme.views;
+        assert_eq!(v.text.font_weight, 0);
+        assert_eq!(
+            v.text.selected.as_ref().unwrap().font_weight,
+            700,
+            "用户字重更细时强调保持主题值，仍比普通粗"
+        );
+        w.set_font_weight(0);
+        assert_eq!(w.theme.views.text.font_weight, 500, "清掉用户字重后原样");
+    }
+
+    /// 用户 `ui.font.weight` 压过主题旧字体名拆出的字重；节点显式的强调字重（800）取 max 仍保留。
     #[test]
     fn user_weight_beats_name_weight_but_not_explicit_node_weight() {
         let mut w = win();
@@ -6337,7 +6376,7 @@ mod font_name_resolve_tests {
         let v = &w.theme.views;
         assert_eq!(v.comment.font_weight, 0, "用户字重生效：节点继承渲染器默认");
         assert_eq!(w.text_renderer.default_weight(), 300);
-        assert_eq!(v.text.font_weight, 800, "节点显式字重仍最优先");
+        assert_eq!(v.text.font_weight, 800, "节点显式强调字重比用户重，保留");
         w.set_font_weight(0);
         assert_eq!(
             w.theme.views.comment.font_weight, 500,
