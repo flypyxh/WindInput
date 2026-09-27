@@ -306,7 +306,7 @@ impl UiManager {
             }
 
             // 推进鼠标悬停防抖（稳定后才发出 Hover）
-            candidate_window.tick();
+            candidate_window.tick(popup_menu.as_ref().is_some_and(|m| m.is_visible()));
             // 推进工具栏悬停高亮（按光标位置本地重绘）
             if let Some(t) = &mut toolbar {
                 t.tick();
@@ -314,6 +314,13 @@ impl UiManager {
             // 推进菜单（脏重绘 / 关闭）
             if let Some(m) = &mut popup_menu {
                 m.tick();
+                // 关掉菜单的那次菜单外按下转给气泡：菜单开着时气泡收不到鼠标消息，在它上面
+                // 再右键只有这里看得见（见 `Tooltip::on_menu_outside_press`）。必须紧跟 tick：
+                // 协调器回应 MenuClose 的 SetTooltipMenuOpen(false) 此时还没轮到本线程处理，
+                // 气泡的「菜单打开中」标志仍在，据此认出关掉的是它的菜单。
+                if let Some(p) = m.take_outside_press() {
+                    candidate_window.tooltip_menu_outside_press(p.x, p.y, p.right);
+                }
             }
             // 推进软键盘（点击派发 / 长按重复 / 悬停重绘）
             if let Some(k) = &mut soft_keyboard {

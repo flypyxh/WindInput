@@ -10,6 +10,18 @@
 //! 公式），再按行数均分——渲染器的行距钉成 UNIFORM（见 `text::dwrite` 的
 //! `create_layout_with`），每行等高。点中的行经 `TooltipDoc::hit_at_line` 换算回
 //! `(段, 原始行)`，随 `RequestTooltipMenu` 交给协调器。
+//!
+//! # 右键菜单打开期间
+//!
+//! 菜单一开就 `SetCapture`，同线程的气泡从此收不到鼠标消息（`WM_MOUSEMOVE` / 按键都没有），
+//! 而鼠标移向菜单时 `WM_MOUSELEAVE` 已经把 `mouse_over` 清掉、离开跟踪也随之失效。所以
+//! 菜单关闭时 `mouse_over` 是**陈旧**的，不能拿来判「鼠标还在不在气泡上」——点回气泡关菜单
+//! 时气泡会被当成「鼠标已离开」而隐藏。几件事因此都改问真实光标（[`menu_step`] 是判据）：
+//! - 菜单关闭（任何方式）：光标在气泡上就留下并重挂离开跟踪，否则隐藏；
+//! - 菜单外按下落在气泡上且是右键：菜单轮询看见了这次按下（气泡自己收不到），转给这里
+//!   按新位置重新请求菜单，相当于「重新右键」；
+//! - 气泡自己的 `WM_RBUTTONDOWN` 在菜单打开期间一律不理，只认轮询那一路，免得同一次
+//!   右键请求两遍菜单。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -17,7 +29,8 @@ use std::sync::mpsc::Sender;
 
 use crate::manager::UiEvent;
 use crate::sys::{
-    GetCursorPos, HWND, LPARAM, LRESULT, POINT, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_RBUTTONDOWN, WPARAM,
+    GetCursorPos, GetWindowRect, HWND, LPARAM, LRESULT, POINT, RECT, WM_MOUSELEAVE, WM_MOUSEMOVE,
+    WM_RBUTTONDOWN, WPARAM,
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
@@ -70,6 +83,45 @@ fn client_point(lparam: LPARAM) -> (i32, i32) {
     )
 }
 
+/// 右键菜单相关时刻气泡要回答的事件（见模块文档「右键菜单打开期间」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuEvent {
+    /// 气泡自己收到 `WM_RBUTTONDOWN`。
+    OwnRightDown,
+    /// 菜单轮询到一次菜单外按下（菜单已随之关闭）。
+    OutsidePress { right: bool },
+    /// 菜单已关闭（协调器 `SetTooltipMenuOpen(false)`）。
+    Closed,
+}
+
+/// 气泡对 [`MenuEvent`] 的反应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuStep {
+    /// 什么都不做。
+    Ignore,
+    /// 按命中位置请求菜单（首次右键，或菜单开着时在气泡上再右键）。
+    RequestMenu,
+    /// 留下气泡，并重挂离开跟踪。
+    Keep,
+    /// 隐藏气泡。
+    Hide,
+}
+
+/// 判据：`menu_open` 是气泡的菜单是否开着，`on_tip` 是光标此刻是否真在气泡上
+/// （问系统得来，不是 `mouse_over`——菜单开着期间那个值是陈旧的）。
+fn menu_step(event: MenuEvent, menu_open: bool, on_tip: bool) -> MenuStep {
+    match event {
+        // 菜单开着时这次右键由轮询那一路负责；两路都认会请求两遍菜单。
+        MenuEvent::OwnRightDown if menu_open => MenuStep::Ignore,
+        MenuEvent::OwnRightDown => MenuStep::RequestMenu,
+        MenuEvent::OutsidePress { right: true } if menu_open && on_tip => MenuStep::RequestMenu,
+        // 左键点气泡 / 点别处：菜单已由轮询关掉，气泡去留等 Closed 再定。
+        MenuEvent::OutsidePress { .. } => MenuStep::Ignore,
+        MenuEvent::Closed if on_tip => MenuStep::Keep,
+        MenuEvent::Closed => MenuStep::Hide,
+    }
+}
+
 /// 鼠标跟踪器：检测鼠标是否悬停在 tooltip 上（WM_MOUSELEAVE 触发时直接隐藏窗口）；
 /// 右键弹出菜单（按段 / 按行复制、上屏，复制全部，截图此窗口）。
 struct TooltipMouse {
@@ -104,6 +156,29 @@ impl TooltipMouse {
     }
     #[cfg(not(windows))]
     fn arm_leave(&self) {}
+
+    /// 光标在气泡上、离开跟踪却已失效时（菜单关闭后）重新挂上，之后移出照常隐藏。
+    fn rearm(&mut self) {
+        self.mouse_over.set(true);
+        self.tracking = true;
+        self.arm_leave();
+    }
+
+    /// 按屏幕坐标 `(sx, sy)` / 客户区坐标 `(cx, cy)` 请求右键菜单。
+    fn request_menu(&self, (sx, sy): (i32, i32), (cx, cy): (i32, i32)) {
+        let hits = self.hits.borrow();
+        let hit: Option<TooltipHit> = hits
+            .text_box
+            .and_then(|b| b.line_at(cx, cy))
+            .and_then(|i| hits.doc.hit_at_line(i));
+        let _ = self.events.send(UiEvent::RequestTooltipMenu {
+            x: sx,
+            y: sy,
+            candidate: hits.candidate,
+            hit,
+            doc_fingerprint: hits.doc.fingerprint(),
+        });
+    }
 }
 
 impl WindowMouse for TooltipMouse {
@@ -138,25 +213,18 @@ impl WindowMouse for TooltipMouse {
                 None
             }
             WM_RBUTTONDOWN => {
+                // on_tip 对 OwnRightDown 不参与判定（消息投到这里，光标自然在气泡上）。
+                let step = menu_step(MenuEvent::OwnRightDown, self.suppress_hide.get(), true);
+                if step != MenuStep::RequestMenu {
+                    return None;
+                }
                 self.suppress_hide.set(true);
                 let (sx, sy) = unsafe {
                     let mut p = POINT::default();
                     let _ = GetCursorPos(&mut p);
                     (p.x, p.y)
                 };
-                let (cx, cy) = client_point(lparam);
-                let hits = self.hits.borrow();
-                let hit: Option<TooltipHit> = hits
-                    .text_box
-                    .and_then(|b| b.line_at(cx, cy))
-                    .and_then(|i| hits.doc.hit_at_line(i));
-                let _ = self.events.send(UiEvent::RequestTooltipMenu {
-                    x: sx,
-                    y: sy,
-                    candidate: hits.candidate,
-                    hit,
-                    doc_fingerprint: hits.doc.fingerprint(),
-                });
+                self.request_menu((sx, sy), client_point(lparam));
                 None
             }
             _ => None,
@@ -192,6 +260,8 @@ pub struct Tooltip {
     suppress_hide: Rc<Cell<bool>>,
     /// 当前内容的命中信息（与 TooltipMouse 共享）。
     hits: Rc<RefCell<HitState>>,
+    /// 鼠标处理器本体：菜单关闭时要重挂它的离开跟踪、菜单外右键要借它请求菜单。
+    mouse: Rc<RefCell<TooltipMouse>>,
 }
 
 impl Tooltip {
@@ -203,14 +273,15 @@ impl Tooltip {
         let suppress_hide = Rc::new(Cell::new(false));
         let hits = Rc::new(RefCell::new(HitState::default()));
         // 注册鼠标跟踪：鼠标进入 tooltip 时保持可见；WM_MOUSELEAVE 触发时自动隐藏；右键弹出菜单。
-        window.register_mouse(Rc::new(RefCell::new(TooltipMouse {
+        let mouse = Rc::new(RefCell::new(TooltipMouse {
             hwnd: window.hwnd(),
             mouse_over: mouse_over.clone(),
             tracking: false,
             events,
             suppress_hide: suppress_hide.clone(),
             hits: hits.clone(),
-        })));
+        }));
+        window.register_mouse(mouse.clone());
         Ok(Self {
             window,
             renderer,
@@ -227,6 +298,7 @@ impl Tooltip {
             mouse_over,
             suppress_hide,
             hits,
+            mouse,
         })
     }
 
@@ -451,12 +523,70 @@ impl Tooltip {
         }
     }
 
-    /// 设置右键菜单打开状态：开启时抑制 WM_MOUSELEAVE 自动隐藏；关闭时若鼠标已不在
-    /// tooltip 上则立即隐藏（避免菜单关掉后 tooltip 永久赖着不走）。
+    /// 设置右键菜单打开状态：开启时抑制 WM_MOUSELEAVE 自动隐藏；关闭时光标仍在气泡上
+    /// 就留下并重挂离开跟踪，否则立即隐藏（避免菜单关掉后 tooltip 永久赖着不走）。
+    ///
+    /// 「在不在气泡上」问真实光标而不看 `mouse_over`：菜单开着期间气泡收不到鼠标消息，
+    /// 那个值停在鼠标移向菜单时的 false，用它判会把「点回气泡关菜单」误当成离开。
     pub fn set_menu_open(&mut self, open: bool) {
         self.suppress_hide.set(open);
-        if !open && !self.mouse_over.get() {
-            self.hide();
+        if open {
+            return;
+        }
+        match menu_step(MenuEvent::Closed, false, self.cursor_on_tip()) {
+            MenuStep::Keep => self.mouse.borrow_mut().rearm(),
+            _ => {
+                self.mouse_over.set(false);
+                self.hide();
+            }
+        }
+    }
+
+    /// 菜单轮询到的一次菜单外按下（菜单已随之关闭）：落在气泡上的右键 = 重新右键，
+    /// 按新命中位置请求菜单。须在本线程处理协调器回来的 `SetTooltipMenuOpen(false)`
+    /// 之前调用——此时 `suppress_hide` 还是 true，它就是「关掉的正是气泡的菜单」的证据。
+    pub fn on_menu_outside_press(&mut self, x: i32, y: i32, right: bool) {
+        let on_tip = self.window_at(x, y);
+        let step = menu_step(
+            MenuEvent::OutsidePress { right },
+            self.suppress_hide.get(),
+            on_tip,
+        );
+        if step == MenuStep::RequestMenu {
+            self.mouse_over.set(true);
+            let (ox, oy) = self.window_origin();
+            self.mouse.borrow().request_menu((x, y), (x - ox, y - oy));
+        }
+    }
+
+    /// 光标此刻是否在气泡上。
+    fn cursor_on_tip(&self) -> bool {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return false;
+        }
+        self.window_at(p.x, p.y)
+    }
+
+    /// 屏幕点 `(x, y)` 处最上层的窗口是不是气泡。用 `WindowFromPoint` 而非比窗口矩形：
+    /// 它与鼠标消息同一套命中（隐藏窗口不算、分层窗口全透明的阴影扩边穿透），
+    /// 被 `WM_MOUSELEAVE` 直接藏掉的气泡也不会被误判成「还在上面」。
+    #[cfg(windows)]
+    fn window_at(&self, x: i32, y: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+        unsafe { WindowFromPoint(POINT { x, y }) == self.window.hwnd() }
+    }
+    #[cfg(not(windows))]
+    fn window_at(&self, _x: i32, _y: i32) -> bool {
+        false
+    }
+
+    /// 窗口左上角屏幕坐标（分层窗口无非客户区，客户区原点即窗口原点）。
+    fn window_origin(&self) -> (i32, i32) {
+        let mut r = RECT::default();
+        match unsafe { GetWindowRect(self.window.hwnd(), &mut r) } {
+            Ok(()) => (r.left, r.top),
+            Err(_) => (0, 0),
         }
     }
 
@@ -730,6 +860,62 @@ mod tests {
         assert_eq!(b.line_at((b.x - 1.0) as i32, (b.y + 1.0) as i32), None);
         assert_eq!(b.line_at(b.x as i32, (b.y + b.h + 1.0) as i32), None);
         assert_eq!(h.candidate, 3);
+    }
+
+    /// 菜单交互时序的判据表（设计 §7.6）。
+    #[test]
+    fn menu_step_table() {
+        use MenuEvent::*;
+        use MenuStep::*;
+        // 首次右键：请求菜单；菜单开着时自己收到的右键不理（轮询那一路负责）。
+        assert_eq!(menu_step(OwnRightDown, false, true), RequestMenu);
+        assert_eq!(menu_step(OwnRightDown, true, true), Ignore);
+        // 菜单开着、右键点在气泡另一处：重新请求菜单。
+        assert_eq!(
+            menu_step(OutsidePress { right: true }, true, true),
+            RequestMenu
+        );
+        // 左键点气泡：只关菜单，气泡去留由 Closed 决定。
+        assert_eq!(menu_step(OutsidePress { right: false }, true, true), Ignore);
+        // 右键点在气泡外 / 开着的不是气泡的菜单：不归气泡管。
+        assert_eq!(menu_step(OutsidePress { right: true }, true, false), Ignore);
+        assert_eq!(menu_step(OutsidePress { right: true }, false, true), Ignore);
+        // 菜单关闭：光标在气泡上就留下，否则隐藏。
+        assert_eq!(menu_step(Closed, false, true), Keep);
+        assert_eq!(menu_step(Closed, false, false), Hide);
+    }
+
+    /// 菜单开着时气泡自己的 `WM_RBUTTONDOWN` 不再请求菜单：若 Windows 真把这次按下投到
+    /// 气泡上，它与菜单轮询转来的那次是同一次右键，两路都认会请求两遍菜单。
+    #[test]
+    fn own_right_down_requests_menu_only_when_closed() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Tooltip::new(tx).expect("mock 气泡");
+        let press = |t: &Tooltip| {
+            t.mouse
+                .borrow_mut()
+                .on_message(HWND::default(), WM_RBUTTONDOWN, WPARAM(0), LPARAM(0));
+        };
+        press(&t);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiEvent::RequestTooltipMenu { .. })
+        ));
+        assert!(t.suppress_hide.get(), "右键即抑制离开隐藏");
+        press(&t);
+        assert!(rx.try_recv().is_err(), "菜单开着时不再请求");
+    }
+
+    /// 菜单关闭时光标不在气泡上（非 Windows 恒如此）：`mouse_over` 即便残留 true 也要隐藏，
+    /// 并解除抑制。
+    #[test]
+    fn menu_closed_off_tip_hides_even_with_stale_mouse_over() {
+        let mut t = tooltip();
+        t.set_menu_open(true);
+        t.mouse_over.set(true);
+        t.set_menu_open(false);
+        assert!(!t.suppress_hide.get());
+        assert!(!t.mouse_over.get());
     }
 
     #[test]
