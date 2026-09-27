@@ -5316,7 +5316,7 @@ impl EngineManager {
                 // 逆切分：同为方案级引擎固定参数。切点有效性与「与整句同开」的告警在
                 // `CodeTableEngine::new` 里（那里才同时握着 max_code_length 与两个开关）。
                 //
-                // ⚠️ 下面三个旋钮取的是**本次构建的这份 schema**，混输下那就是
+                // ⚠️ `split_input` 之后的三个旋钮取的是**本次构建的这份 schema**，混输下那就是
                 // `primary_schema` 的值而非混输方案自己的 —— 之所以不必像 `split_input`
                 // 那样经 `MixedRole` 收敛，是因为混输下 `split_input` 已恒为 false，
                 // 三个旋钮读到什么都不会被用到。⚠️ 将来若给混输接上逆切分，**这三行必须
@@ -5396,7 +5396,7 @@ impl EngineManager {
                 .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema));
             // 逆切分的两段由引擎自己查，协调器的候选调整够不着，须另行注入（论坛 t231）。
             // 归属 id 取方案自身：码表的 `data_schema_id` 就是自身 id（只有拼音族折叠），
-            // 混输下逆切分恒关、注入了也不会被读。
+            // 混输下 `split_input` 恒为 false（见 `resolve_split_input`），不会注入。
             if commit_opts.split_input
                 && let Some(store) = &store
             {

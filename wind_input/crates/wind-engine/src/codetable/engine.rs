@@ -1991,17 +1991,28 @@ mod tests {
         assert_eq!(SplitAltDisplay::parse("bogus"), SplitAltDisplay::Back);
     }
 
-    fn split_store(tag: &str) -> Arc<wind_store::Store> {
-        let root = std::env::temp_dir().join(format!("wind_split_shadow_{tag}"));
+    /// 用例结束时删掉临时目录（Linux 上删已打开的 redb 文件无妨）。
+    struct TempRoot(std::path::PathBuf);
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 目录名带 pid：并发会话 / 并行的两次 `cargo test` 共用 temp 时不互相删库。
+    fn split_store(tag: &str) -> (TempRoot, Arc<wind_store::Store>) {
+        let root =
+            std::env::temp_dir().join(format!("wind_split_shadow_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        Arc::new(wind_store::Store::open(root.join("user_data.db")).unwrap())
+        let store = Arc::new(wind_store::Store::open(root.join("user_data.db")).unwrap());
+        (TempRoot(root), store)
     }
 
     /// 论坛 t231：候选调整里删掉的词不得被拼进组合（`n` 删「内容」后 `kpn` 出了「恐怕内容」）。
     #[test]
     fn split_segment_respects_shadow_delete() {
-        let store = split_store("del");
+        let (_dir, store) = split_store("del");
         store.delete_shadow("xh", "kn", "能").unwrap();
         let e = split_engine(&[], split_opts()).with_segment_shadow(store.clone(), "xh");
         assert_eq!(texts(&e.convert("hfkn", 50).unwrap()), vec!["很可难"]);
@@ -2023,7 +2034,7 @@ mod tests {
     /// 段首选跟着候选调整的置顶走：用户在 `kn` 上把「难」置顶，组合首选随之变成「很可难」。
     #[test]
     fn split_segment_respects_shadow_pin() {
-        let store = split_store("pin");
+        let (_dir, store) = split_store("pin");
         store.pin_shadow("xh", "kn", "难", None, 0).unwrap();
         let e = split_engine(&[], split_opts()).with_segment_shadow(store, "xh");
         assert_eq!(
@@ -2035,7 +2046,7 @@ mod tests {
     /// 某段被用户删光 ⇒ 视同空码，整体不产出。
     #[test]
     fn split_segment_deleted_empty_means_no_split() {
-        let store = split_store("empty");
+        let (_dir, store) = split_store("empty");
         store.delete_shadow("xh", "xt", "学").unwrap();
         let e = split_engine(&[], split_opts()).with_segment_shadow(store, "xh");
         assert!(e.convert("xtkn", 50).unwrap().candidates.is_empty());

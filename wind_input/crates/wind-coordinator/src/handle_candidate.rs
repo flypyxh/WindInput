@@ -3755,7 +3755,9 @@ impl Coordinator {
             let ch = runes[char_index].to_string();
             match Self::select_char_freq_code(&cand, runes.len(), char_index) {
                 Some(freq_code) => self.record_selection(&freq_code, &ch, cand.source),
-                None => self.push_commit_history(&ch),
+                // 被隐藏的前段是这条候选自己的上屏内容，历史要记全（「很困」而非「困」）；
+                // 已确认段前缀 `committed_text` 照旧不记，口径不变。
+                None => self.push_commit_history(&format!("{split_front}{ch}")),
             }
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
