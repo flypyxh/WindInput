@@ -608,8 +608,9 @@ mod imp {
 
         /// TextFormat 实际承载的字重。
         fn format_weight(&self) -> i32 {
+            // 上游已钳过；此处再钳一次，越界值传给 CreateTextFormat 会直接失败。
             if self.default_weight > 0 {
-                self.default_weight
+                self.default_weight.clamp(1, 950)
             } else {
                 400
             }

@@ -244,6 +244,8 @@ impl RvViews {
     /// `resolve` 返回 `(family, 字重)`，字重 `0` = 名字里没带字重。存量主题里的旧 GDI face
     /// name（「思源宋体 SemiBold」）靠它拆成 family「思源宋体」+ 600（看板 A2-1）：
     /// 节点**自己没写** `font_weight`（0 = 继承）时才采用名字里的字重，写了的以节点为准。
+    /// 用户 `ui.font.weight` 非 0 时名字字重应让位——由调用方让 `resolve` 返回字重 0 实现
+    /// （见 wind-ui `CandidateWindow::refresh_effective_theme`）。
     pub fn resolve_font_families(&mut self, mut resolve: impl FnMut(&str) -> (String, i32)) {
         for (_, n) in self.font_nodes_mut() {
             resolve_node_font_family(n, &mut resolve);

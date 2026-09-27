@@ -872,9 +872,16 @@ impl CandidateWindow {
     }
 
     /// 设置全局字重（来自 `ui.font.weight`；0 = 不指定）。
+    ///
+    /// `<= 0` 视为不指定；其余钳到 DirectWrite 接受的 1..=950，越界记 warn。
     pub fn set_font_weight(&mut self, weight: i32) {
-        self.user_font_weight = weight.max(0);
+        self.user_font_weight = if weight <= 0 { 0 } else { weight.clamp(1, 950) };
+        if weight > 950 {
+            tracing::warn!("ui.font.weight = {weight} 超出 1..=950，已按 950 处理");
+        }
         self.apply_default_weight();
+        // 主题节点里旧字体名拆出的字重让位于用户字重，需重算生效主题。
+        self.refresh_effective_theme();
     }
 
     /// 渲染器默认字重：用户 `ui.font.weight` > 旧字体名里带的字重 > 常规。
@@ -1166,9 +1173,13 @@ impl CandidateWindow {
         apply_scheme_text_font(&mut t.views, &self.text_family_override);
         // 主题节点与方案级字族换成渲染端认得的名字（旧 GDI face name → family + 字重）。
         // 缓存已由上面的告警检查填好，这里不会再问一遍字体集。
+        // 字重优先级：节点显式 font_weight > 用户 ui.font.weight（非 0）> 名字拆出的字重 > 常规。
+        // 用户指定了字重时丢弃名字里的字重，节点保持 0 = 继承渲染器默认（即用户字重）；
+        // 每次都从 theme_source 重算，故这里填进节点的只可能是名字字重、不会污染原始主题。
+        let user_weight = self.user_font_weight;
         t.views.resolve_font_families(|f| {
             let r = self.resolve_font(f);
-            (r.family, r.weight)
+            (r.family, if user_weight > 0 { 0 } else { r.weight })
         });
         self.base_font_logical =
             effective_base_font_size(self.font_size_override, t.behavior.font_size);
@@ -6261,6 +6272,17 @@ mod font_name_resolve_tests {
     }
 
     #[test]
+    fn font_weight_is_clamped_to_dwrite_range() {
+        let mut w = win();
+        w.set_font_weight(5000);
+        assert_eq!(w.text_renderer.default_weight(), 950);
+        w.set_font_weight(-3);
+        assert_eq!(w.text_renderer.default_weight(), 0, "负数 = 不指定");
+        w.set_font_weight(1);
+        assert_eq!(w.text_renderer.default_weight(), 1);
+    }
+
+    #[test]
     fn explicit_weight_beats_the_weight_in_the_name() {
         let mut w = win();
         w.set_font_family("思源宋体 SemiBold");
@@ -6296,6 +6318,31 @@ mod font_name_resolve_tests {
         assert_eq!(v.comment.font_weight, 500);
         assert_eq!(v.text.font_family.as_deref(), Some("思源宋体"));
         assert_eq!(v.text.font_weight, 600);
+    }
+
+    /// 用户 `ui.font.weight` 压过主题旧字体名拆出的字重，但不压节点显式字重。
+    #[test]
+    fn user_weight_beats_name_weight_but_not_explicit_node_weight() {
+        let mut w = win();
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.comment.font_family = Some("霞鹜文楷 Medium".to_string());
+        theme.views.text.font_family = Some("思源宋体 SemiBold".to_string());
+        theme.views.text.font_weight = 800;
+        w.set_theme(theme);
+        assert_eq!(
+            w.theme.views.comment.font_weight, 500,
+            "无用户字重：名字字重生效"
+        );
+        w.set_font_weight(300);
+        let v = &w.theme.views;
+        assert_eq!(v.comment.font_weight, 0, "用户字重生效：节点继承渲染器默认");
+        assert_eq!(w.text_renderer.default_weight(), 300);
+        assert_eq!(v.text.font_weight, 800, "节点显式字重仍最优先");
+        w.set_font_weight(0);
+        assert_eq!(
+            w.theme.views.comment.font_weight, 500,
+            "清掉用户字重后回到名字字重"
+        );
     }
 }
 
