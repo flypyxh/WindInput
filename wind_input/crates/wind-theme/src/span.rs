@@ -713,4 +713,125 @@ mod tests {
             "选中 patch 未给色 → 基态"
         );
     }
+
+    // ───────────── 与主题编辑器的共用期望表（span-roles 测试主题）─────────────
+    //
+    // 主题编辑器是引擎的「前端孪生」，它的 roles 求值与求色必须与这里逐项相同。两边共用
+    // `testdata/themes/span-roles/theme.toml` 这份测试数据；引擎把求值结果导出成
+    // `expected.json` 检入，编辑器在主仓在场时读它逐项断言。期望值因此出自引擎、不是手写。
+    // 引擎行为有意改变时 `WIND_THEME_BLESS=1 cargo test -p wind-theme span_roles_expected` 重录。
+
+    fn hex8(c: Rgba) -> String {
+        format!("\"#{:02X}{:02X}{:02X}{:02X}\"", c[0], c[1], c[2], c[3])
+    }
+
+    fn roles_json(r: &HashMap<String, Rgba>) -> String {
+        let mut keys: Vec<&String> = r.keys().collect();
+        keys.sort();
+        let items: Vec<String> = keys
+            .iter()
+            .map(|k| format!("\"{k}\": {}", hex8(r[*k])))
+            .collect();
+        format!("{{{}}}", items.join(", "))
+    }
+
+    fn state_json(n: Option<&RvNode>) -> String {
+        match n {
+            None => "null".into(),
+            Some(n) => format!(
+                "{{\"text\": {}, \"roles\": {}}}",
+                n.text_color.map_or("null".into(), hex8),
+                roles_json(&n.roles)
+            ),
+        }
+    }
+
+    const COMMENT_FALLBACK: Rgba = [150, 150, 150, 255];
+    const PROBE_ROLES: &[Option<&str>] = &[
+        Some("code_rev"),
+        Some("pinyin"),
+        Some("literal"),
+        Some("chaizi"),
+        Some("dict"),
+        Some("title"),
+        Some("code_source"),
+        Some("readings"),
+        None,
+    ];
+
+    fn span_roles_expected() -> String {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dirs = [
+            root.join("testdata/themes"),
+            root.join("../../../data/themes"),
+        ];
+        let mut modes = Vec::new();
+        for (mode, dark) in [("light", false), ("dark", true)] {
+            let t = crate::load_resolved_dirs(&dirs, "span-roles", dark).unwrap();
+            let c = &t.views.comment;
+            let tip = t.views.tooltip.clone().unwrap_or_default();
+            let tip_fb = t.color("tooltip_text", [255, 255, 255, 255]);
+            let mut spans = Vec::new();
+            for (st_name, st) in [
+                ("normal", TextState::Normal),
+                ("selected", TextState::Selected),
+                ("hover", TextState::Hover),
+            ] {
+                for role in PROBE_ROLES {
+                    let col = span_color(&t, c, false, st, COMMENT_FALLBACK, *role, false, None);
+                    spans.push(format!(
+                        "{{\"node\": \"comment\", \"state\": \"{st_name}\", \"role\": {}, \"in_title\": false, \"color\": {}}}",
+                        role.map_or("null".into(), |r| format!("\"{r}\"")),
+                        hex8(col)
+                    ));
+                }
+            }
+            for in_title in [false, true] {
+                for role in PROBE_ROLES {
+                    let col = span_color(
+                        &t,
+                        &tip,
+                        true,
+                        TextState::Normal,
+                        tip_fb,
+                        *role,
+                        in_title,
+                        None,
+                    );
+                    spans.push(format!(
+                        "{{\"node\": \"tooltip\", \"state\": \"normal\", \"role\": {}, \"in_title\": {in_title}, \"color\": {}}}",
+                        role.map_or("null".into(), |r| format!("\"{r}\"")),
+                        hex8(col)
+                    ));
+                }
+            }
+            modes.push(format!(
+                "  \"{mode}\": {{\n    \"comment\": {{\"text\": {}, \"roles\": {}, \"selected\": {}, \"hover\": {}}},\n    \"tooltip\": {{\"text\": {}, \"roles\": {}}},\n    \"span\": [\n      {}\n    ]\n  }}",
+                c.text_color.map_or("null".into(), hex8),
+                roles_json(&c.roles),
+                state_json(c.selected.as_deref()),
+                state_json(c.hover.as_deref()),
+                hex8(tip_fb),
+                roles_json(&tip.roles),
+                spans.join(",\n      ")
+            ));
+        }
+        format!("{{\n{}\n}}\n", modes.join(",\n"))
+    }
+
+    #[test]
+    fn span_roles_expected_table_is_current() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/themes/span-roles/expected.json");
+        let got = span_roles_expected();
+        if std::env::var_os("WIND_THEME_BLESS").is_some() {
+            std::fs::write(&path, &got).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(&path).expect("读 expected.json");
+        assert_eq!(
+            got, want,
+            "引擎求值与检入的期望表不一致；有意改变时 WIND_THEME_BLESS=1 重录"
+        );
+    }
 }

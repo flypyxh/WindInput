@@ -22,16 +22,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use wind_ui_types::{SpanStyle, StyledText, TooltipDoc, TooltipLine, TooltipSection};
 
-/// 出厂主题目录下的主题（含两个抽象 base：它们同样可加载，且是其余主题的公共祖先）。
-const THEMES: &[&str] = &[
-    "_base",
-    "_qingfeng",
-    "default",
-    "amber",
-    "jade",
-    "violet",
-    "msime",
-];
+/// 出厂主题：`data/themes` 下的全部主题（含两个抽象 base：它们同样可加载，且是其余主题的
+/// 公共祖先）。按目录枚举而非硬编码，新加的出厂主题缺 golden 文件时对拍直接报出来。
+fn themes() -> Vec<String> {
+    let ids = wind_theme::list_theme_ids(&themes_dir());
+    for must in [
+        "_base",
+        "_qingfeng",
+        "default",
+        "amber",
+        "jade",
+        "violet",
+        "msime",
+    ] {
+        assert!(
+            ids.iter().any(|i| i == must),
+            "出厂主题枚举漏了 {must}：{ids:?}"
+        );
+    }
+    ids
+}
 
 /// 排布：`(名字, vertical, rotated, upright, 内联编码)`。前三位的合法组合只有四个（见
 /// `set_orientation`）；内联编码另走 `preedit_view` 的 build 回调，直立态下它也逐格扶正。
@@ -187,7 +197,7 @@ fn factory_render_matches_golden() {
     let bless = std::env::var_os("WIND_UI_BLESS_GOLDEN").is_some();
     let dir = golden_dir();
     let mut failed = Vec::new();
-    for &name in THEMES {
+    for name in &themes() {
         for dark in [false, true] {
             let got = render_theme(name, dark);
             let file = dir.join(format!(

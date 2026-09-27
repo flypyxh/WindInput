@@ -304,14 +304,9 @@ fn resolve_state(
             || rc(&n.border.color).is_some()
             || n.border.width.is_some()
             || n.font_weight.is_some()
-            // 只写了 `[comment.selected.roles]` 的 patch 也算「有覆盖」，否则被整体丢弃。
-            || !resolve_roles(&n.roles, palette, is_dark).is_empty()
         {
             has = true;
         }
-    }
-    if !has {
-        return None;
     }
     let default_node;
     let n = match node {
@@ -321,9 +316,10 @@ fn resolve_state(
             &default_node
         }
     };
-    Some(Box::new(resolve_view_node(
-        n, palette, is_dark, def_bg, None, def_text,
-    )))
+    // 先求值再判：角色色表只解析一次（它的 warn 不该因门控多打一遍）；只写了
+    // `[comment.selected.roles]` 的 patch 也算「有覆盖」，否则被整体丢弃。
+    let out = resolve_view_node(n, palette, is_dark, def_bg, None, def_text);
+    (has || !out.roles.is_empty()).then(|| Box::new(out))
 }
 
 /// 解析图片路径：data: URI / 绝对路径原样；相对路径拼到 theme 目录。
@@ -1237,34 +1233,51 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
     /// 出厂主题一律不配 roles（零变化的前提）；角色色表对其余节点也是空的。
     #[test]
     fn factory_themes_have_no_roles() {
-        for name in [
-            "_base",
-            "_qingfeng",
-            "default",
-            "amber",
-            "jade",
-            "violet",
-            "msime",
-        ] {
+        let ids = crate::list_theme_ids(&data_dir_for_roles());
+        for must in ["_base", "_qingfeng", "default", "msime"] {
+            assert!(ids.iter().any(|i| i == must), "枚举漏了 {must}：{ids:?}");
+        }
+        for name in &ids {
             for dark in [false, true] {
-                let t = roles_theme(name, dark);
-                let v = &t.views;
-                assert!(v.comment.roles.is_empty(), "{name}");
-                assert!(
-                    v.comment
-                        .selected
-                        .as_ref()
-                        .is_none_or(|n| n.roles.is_empty()),
-                    "{name}"
-                );
-                assert!(
-                    v.comment.hover.as_ref().is_none_or(|n| n.roles.is_empty()),
-                    "{name}"
-                );
-                assert!(
-                    v.tooltip.as_ref().is_none_or(|n| n.roles.is_empty()),
-                    "{name}"
-                );
+                let v = roles_theme(name, dark).views;
+                let mut nodes = vec![
+                    ("window", &v.window),
+                    ("preedit_bar", &v.preedit_bar),
+                    ("candidate_list", &v.candidate_list),
+                    ("item", &v.item),
+                    ("index", &v.index),
+                    ("text", &v.text),
+                    ("comment", &v.comment),
+                    ("accent_bar", &v.accent_bar),
+                    ("footer_bar", &v.footer_bar),
+                    ("mode_label", &v.mode_label),
+                ];
+                for (k, n) in [
+                    ("status", &v.status),
+                    ("tooltip", &v.tooltip),
+                    ("toast", &v.toast),
+                    ("menu.root", &v.menu_root),
+                    ("menu.item", &v.menu_item),
+                    ("menu.separator", &v.menu_separator),
+                ] {
+                    if let Some(n) = n {
+                        nodes.push((k, n));
+                    }
+                }
+                for (k, n) in nodes {
+                    let states = [
+                        Some(n),
+                        n.selected.as_deref(),
+                        n.hover.as_deref(),
+                        n.disabled.as_deref(),
+                    ];
+                    for st in states.into_iter().flatten() {
+                        assert!(
+                            st.roles.is_empty(),
+                            "{name} dark={dark} {k}：出厂主题不配 roles"
+                        );
+                    }
+                }
             }
         }
     }

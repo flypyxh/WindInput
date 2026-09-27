@@ -25,6 +25,11 @@ pub fn parse_hex(s: &str) -> Option<Rgba> {
         return Some([n(0)?, n(1)?, n(2)?, 255]);
     }
     let s = s.trim_start_matches('#');
+    // 逐字符先验十六进制位：下面按两位一组交给 `from_str_radix`，它认前导 `+`
+    // （`#+F+F+F` 会被当成白色）。只收紧非法输入，合法写法不受影响。
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     // 先挡非 ASCII：下面按字节切片，多字节字符会让切点落在字中间而 panic。
     if !s.is_ascii() {
         return None;
@@ -157,6 +162,15 @@ mod tests {
         assert_eq!(parse_hex("#GG0"), None);
         // 「红」恰是 3 字节：不先挡非 ASCII 的话，按字节切片会切在字中间而 panic。
         assert_eq!(parse_hex("#红"), None);
+    }
+
+    /// `from_str_radix` 认前导 `+`：逐字符先验十六进制位，`#+F+F+F` 不是白色。
+    #[test]
+    fn plus_signs_are_not_hex_digits() {
+        for bad in ["#+F+F+F", "+F+F+F", "#+FFFFF", "#FF+FFF80"] {
+            assert_eq!(parse_hex(bad), None, "{bad}");
+        }
+        assert_eq!(parse_hex("#ffFFff"), Some([255, 255, 255, 255]));
     }
 
     /// 3 位不带 `#` 一律不认：语言栏配置与内联色里，`bad` / `fed` / `ace` 是词不是颜色。

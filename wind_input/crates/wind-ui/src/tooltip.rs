@@ -1832,7 +1832,9 @@ mod tests {
         };
         let (_, _, _, log) = t.golden_frame(&Arc::new(doc));
         let accent = theme.palette["accent"];
-        // "[编码(五笔)]\nhǎo"：`[编码(` 与 `五笔`（回落 title）同为 accent，`]` 也是；readings 自有色。
+        // 整块文字是 "[编码(五笔]\nhǎo"（样例段名只拼了「编码(」与「五笔」，没有右括号）：
+        // 装饰 `[` 与字面 `编码(` 同为 title 角色、合成一段；`五笔` 是段名里的变量，回落 title；
+        // 装饰 `]` 是 title；换行不着色；readings 用自有色。
         let want = format!(
             "runs=[ColorRun {{ start: 0, end: 8, rgba: {accent:?} }}, ColorRun {{ start: 8, end: 14, rgba: {accent:?} }}, \
              ColorRun {{ start: 14, end: 15, rgba: {accent:?} }}, ColorRun {{ start: 16, end: 20, rgba: [154, 208, 255, 255] }}]"

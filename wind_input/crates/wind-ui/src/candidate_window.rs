@@ -7683,7 +7683,7 @@ mod comment_color_tests {
         );
     }
 
-    /// 直立态逐格切：`w`、`q` 两格各得一段，其余格没有区间。    /// 直立态逐格切：`w`、`q` 两格各得一段，其余格没有区间。
+    /// 直立态逐格切：`w`、`q` 两格各得一段，其余格没有区间。
     #[test]
     fn upright_cells_get_their_slices() {
         let mut w = window(wind_theme::Resolved::default(), true);

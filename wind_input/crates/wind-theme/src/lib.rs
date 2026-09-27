@@ -18,4 +18,6 @@ pub use resolve::{
 pub use rvnode::{DEFAULT_ACCENT_BAR_HEIGHT_RATIO, RvGradient, RvImage, RvNode, RvViews};
 pub use schema::Meta;
 pub use span::{Atom, ColorRef, InlineColor, TextState, body_color, span_color};
-pub use theme::{find_theme_dir, load_merged_dirs, meta_from_text, read_meta, validate_text};
+pub use theme::{
+    find_theme_dir, list_theme_ids, load_merged_dirs, meta_from_text, read_meta, validate_text,
+};
