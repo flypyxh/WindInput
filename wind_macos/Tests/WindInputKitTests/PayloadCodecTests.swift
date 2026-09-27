@@ -178,4 +178,63 @@ final class PayloadCodecTests: XCTestCase {
         XCTAssertEqual(attrs[.markedClauseSegment] as? Int, 3)
         XCTAssertEqual(attrs[.underlineStyle] as? Int, 9)
     }
+
+    // MARK: - CmdTooltipShow (0x0508): fontPath / runs 两段后加尾段的新旧兼容
+
+    /// 按 Rust `encode_tooltip_show` 的布局拼 payload: 若干长度前缀字符串 + 可选 runs 尾段。
+    private func tooltipPayload(_ strings: [String],
+                                runs: [(UInt32, UInt32, [UInt8])]? = nil) -> Data {
+        var buf = Data()
+        func u32(_ v: UInt32) {
+            var d = Data(count: 4); d.writeUInt32LE(v, at: 0); buf.append(d)
+        }
+        for s in strings { u32(UInt32(s.utf8.count)); buf.append(contentsOf: s.utf8) }
+        if let runs = runs {
+            u32(UInt32(runs.count))
+            for (start, len, rgba) in runs { u32(start); u32(len); buf.append(contentsOf: rgba) }
+        }
+        return buf
+    }
+
+    /// 旧服务 (无 fontPath、无 runs): 两个尾段都缺省, 退化为单色。
+    func testDecodeTooltip_OldestFormHasNoTail() throws {
+        let p = try BinaryCodec.decodeTooltipPayload(tooltipPayload(["[拼音]\n好：hǎo", "#3C3C3CF0", "#FFFFFFFF"]))
+        XCTAssertEqual(p.text, "[拼音]\n好：hǎo")
+        XCTAssertEqual(p.fontPath, "")
+        XCTAssertEqual(p.runs, [])
+    }
+
+    /// 分段着色之前的服务 (有 fontPath、无 runs): runs 为空。
+    func testDecodeTooltip_FontPathWithoutRuns() throws {
+        let p = try BinaryCodec.decodeTooltipPayload(tooltipPayload(["abc", "", "", "/p.ttf"]))
+        XCTAssertEqual(p.fontPath, "/p.ttf")
+        XCTAssertEqual(p.runs, [])
+    }
+
+    /// 新服务: runs 尾段, UTF-16 区间 + rgba 小端 u32 (字节依次 R、G、B、A)。
+    func testDecodeTooltip_RunsTail() throws {
+        let buf = tooltipPayload(["[拼音]\n你", "", "", ""],
+                                 runs: [(0, 4, [0x11, 0x22, 0x33, 0x44]), (5, 1, [0xFF, 0x00, 0x80, 0xFF])])
+        let p = try BinaryCodec.decodeTooltipPayload(buf)
+        XCTAssertEqual(p.runs, [
+            TooltipColorRun(start: 0, length: 4, r: 0x11, g: 0x22, b: 0x33, a: 0x44),
+            TooltipColorRun(start: 5, length: 1, r: 0xFF, g: 0x00, b: 0x80, a: 0xFF),
+        ])
+    }
+
+    /// 空 runs (Rust 端恒写 count=0) 与没有尾段等价。
+    func testDecodeTooltip_EmptyRunsCount() throws {
+        let p = try BinaryCodec.decodeTooltipPayload(tooltipPayload(["abc", "", "", ""], runs: []))
+        XCTAssertEqual(p.runs, [])
+    }
+
+    /// 声明了 2 段却只给 1 段: 报 payloadTooShort, 不越界读。
+    func testDecodeTooltip_TruncatedRunsThrows() {
+        var buf = tooltipPayload(["abc", "", "", ""], runs: [(0, 1, [1, 2, 3, 4])])
+        let countAt = buf.count - 16
+        buf.writeUInt32LE(2, at: countAt)
+        XCTAssertThrowsError(try BinaryCodec.decodeTooltipPayload(buf)) { error in
+            if case .payloadTooShort = error as? IPCError {} else { XCTFail("wrong: \(error)") }
+        }
+    }
 }

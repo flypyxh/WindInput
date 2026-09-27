@@ -232,7 +232,7 @@ public final class CandidatePanelHost {
             return
         }
         tooltip.show(text: p.text, bgHex: p.bgColor, fgHex: p.fgColor,
-                     fontPath: p.fontPath, anchorScreenRect: rect)
+                     fontPath: p.fontPath, runs: p.runs, anchorScreenRect: rect)
     }
 
     private func openSHMIfNeeded() {

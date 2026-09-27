@@ -51,7 +51,9 @@ final class TooltipPanel: NSPanel {
     /// 显示 tooltip。anchorScreenRect 为悬停候选在屏幕坐标系下的矩形 (y 向上);
     /// 默认贴候选下方, 下方空间不足时翻到上方; 水平居中对齐并夹进屏幕可见区。
     /// fontPath 非空时注册该字根字体并以级联回退渲染 PUA 字根字符 (五笔拆字)。
-    func show(text: String, bgHex: String, fgHex: String, fontPath: String = "", anchorScreenRect: NSRect) {
+    /// runs 非空时按 UTF-16 区间逐段改前景色 (分段着色); 只改颜色, 不改字体与度量。
+    func show(text: String, bgHex: String, fgHex: String, fontPath: String = "",
+              runs: [TooltipColorRun] = [], anchorScreenRect: NSRect) {
         guard !text.isEmpty else { hidePanel(); return }
 
         let bg = NSColor(windHex: bgHex) ?? NSColor(calibratedWhite: 0.235, alpha: 0.94)
@@ -61,9 +63,11 @@ final class TooltipPanel: NSPanel {
         let font = Self.tooltipFont(size: 13, chaiziFontPath: fontPath)
         let para = NSMutableParagraphStyle()
         para.lineSpacing = 2
-        label.attributedStringValue = NSAttributedString(string: text, attributes: [
+        let attributed = NSMutableAttributedString(string: text, attributes: [
             .font: font, .foregroundColor: fg, .paragraphStyle: para,
         ])
+        Self.applyColorRuns(runs, to: attributed)
+        label.attributedStringValue = attributed
 
         label.sizeToFit()
         let textSize = label.frame.size
@@ -96,6 +100,22 @@ final class TooltipPanel: NSPanel {
 
     func hidePanel() {
         orderOut(nil)
+    }
+
+    /// 逐段覆盖前景色。区间以 UTF-16 计, 越界部分截掉——服务端与 .app 版本不一致或文本
+    /// 被改过时, 越界的 NSRange 会让 addAttribute 抛 Objective-C 异常直接崩进程。
+    /// 颜色按 sRGB 建, 与 Rust 侧 CoreText 渲染候选窗所用色彩空间一致, 同一色两处看起来相同。
+    static func applyColorRuns(_ runs: [TooltipColorRun], to s: NSMutableAttributedString) {
+        let total = s.length
+        for r in runs {
+            let start = max(0, r.start)
+            let end = min(total, start + max(0, r.length))
+            guard start < end else { continue }
+            let color = NSColor(srgbRed: CGFloat(r.r) / 255, green: CGFloat(r.g) / 255,
+                                blue: CGFloat(r.b) / 255, alpha: CGFloat(r.a) / 255)
+            s.addAttribute(.foregroundColor, value: color,
+                           range: NSRange(location: start, length: end - start))
+        }
     }
 
     private func screenForRect(_ r: NSRect) -> NSScreen? {

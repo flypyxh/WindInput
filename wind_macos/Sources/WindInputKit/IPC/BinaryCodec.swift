@@ -414,7 +414,10 @@ public enum BinaryCodec {
 
     /// 解 CmdMenuShow (0x0506): count(u32) + count×item; item = id(i32)+flags(u8)
     /// +labelLen(u32)+label+childCount(u32)+children(递归)。flags: 0x01 分隔/0x02 勾选/0x04 禁用。
-    /// 解码 CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg, 均 UTF-8。
+    /// 解码 CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
+    /// (均 UTF-8) + runCount(u32) + runCount×(start u32 + len u32 + rgba u32)。
+    /// fontPath 与 runs 都是后加尾段, 缺省时分别为空串 / 空数组 (旧服务 → 单色)。
+    /// rgba 为小端 u32, 字节依次 R、G、B、A; start/len 以 UTF-16 码元计。
     public static func decodeTooltipPayload(_ buf: Data) throws -> TooltipPayload {
         var off = 0
         func readStr() throws -> String {
@@ -436,7 +439,27 @@ public enum BinaryCodec {
         let fg = try readStr()
         // fontPath 为后加字段; off 已到末尾 (旧服务无此段) 时容忍缺省为空。
         let fontPath = off < buf.count ? try readStr() : ""
-        return TooltipPayload(text: text, bgColor: bg, fgColor: fg, fontPath: fontPath)
+        // runs 同理 (分段着色): 没有尾段 = 单色。
+        var runs: [TooltipColorRun] = []
+        if off < buf.count {
+            guard buf.count >= off + 4 else {
+                throw IPCError.payloadTooShort(expected: off + 4, got: buf.count)
+            }
+            let n = Int(buf.readUInt32LE(at: off)); off += 4
+            guard buf.count >= off + n * 12 else {
+                throw IPCError.payloadTooShort(expected: off + n * 12, got: buf.count)
+            }
+            runs.reserveCapacity(n)
+            for _ in 0..<n {
+                let start = Int(buf.readUInt32LE(at: off))
+                let len = Int(buf.readUInt32LE(at: off + 4))
+                let i = buf.startIndex + off + 8
+                runs.append(TooltipColorRun(start: start, length: len,
+                                            r: buf[i], g: buf[i + 1], b: buf[i + 2], a: buf[i + 3]))
+                off += 12
+            }
+        }
+        return TooltipPayload(text: text, bgColor: bg, fgColor: fg, fontPath: fontPath, runs: runs)
     }
 
     public static func decodeStatusBubblePayload(_ buf: Data) throws -> StatusBubblePayload {

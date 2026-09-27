@@ -694,11 +694,13 @@ impl Forwarder {
                 ));
                 self.sink.push_frame(&encode_candidate_rects(&rects));
                 match &tip {
+                    // 分段颜色：协调器尚不产出片段（text-span-colors.md §15 P2 接入），恒单色。
                     Some(t) => self.sink.push_frame(&encode_tooltip_show(
                         t,
                         &self.tips.tooltip_bg,
                         &self.tips.tooltip_fg,
                         &self.chaizi_font,
+                        &[],
                     )),
                     None => self.sink.push_frame(&encode_tooltip_hide()),
                 }

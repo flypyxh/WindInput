@@ -178,12 +178,36 @@ public struct TooltipPayload {
     public let bgColor: String
     public let fgColor: String
     public let fontPath: String   // 拆字字根字体文件绝对路径, 空=无需特殊字体
+    /// 分段颜色 (后加尾段); 空 = 整段 fgColor。旧服务不发此段, 解码为空。
+    public let runs: [TooltipColorRun]
 
-    public init(text: String, bgColor: String, fgColor: String, fontPath: String = "") {
+    public init(text: String, bgColor: String, fgColor: String, fontPath: String = "",
+                runs: [TooltipColorRun] = []) {
         self.text = text
         self.bgColor = bgColor
         self.fgColor = fgColor
         self.fontPath = fontPath
+        self.runs = runs
+    }
+}
+
+/// tooltip 的一段分段颜色: text 里 UTF-16 区间 [start, start+length) (直接当 NSRange 用)
+/// 改用 (r,g,b,a) 画。颜色已由服务端按主题解析好, 按 sRGB 解释 (与候选窗 CoreText 渲染同色)。
+public struct TooltipColorRun: Equatable {
+    public let start: Int
+    public let length: Int
+    public let r: UInt8
+    public let g: UInt8
+    public let b: UInt8
+    public let a: UInt8
+
+    public init(start: Int, length: Int, r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
+        self.start = start
+        self.length = length
+        self.r = r
+        self.g = g
+        self.b = b
+        self.a = a
     }
 }
 
