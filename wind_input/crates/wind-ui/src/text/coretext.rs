@@ -709,6 +709,40 @@ mod tests {
         }
     }
 
+    /// 区间全取基色时，`draw_runs` 与 `draw` 的缓冲逐字节相同。
+    ///
+    /// 两条路径的 line 不同（前者 `FromContext` + 逐 CTRun 的 `CTRunDraw`，后者整行
+    /// `CTLineDraw`），位置或基线若有一点漂移——例如 run 的原点没对上行原点——就在这里现形。
+    /// 含 CJK 与 emoji，覆盖回退字体切出的多个 CTRun。
+    #[test]
+    fn base_color_runs_equal_plain_draw() {
+        let r = TextRenderer::new("Helvetica", 24.0).unwrap();
+        let (w, h) = (240u32, 48u32);
+        let ts = TextStyle::new(24.0);
+        let text = "ab 你好 😀 cd";
+        let black = [0, 0, 0, 255];
+        let bg = [255u8, 255, 255, 255].repeat((w * h) as usize);
+        let mut plain = bg.clone();
+        r.draw(&mut plain, w, h, 4.5, 6.0, text, &ts, black)
+            .unwrap();
+        assert_ne!(plain, bg, "应画出字形");
+        let runs: Vec<ColorRun> = [(0usize, 2usize), (3, 9), (15, text.len())]
+            .iter()
+            .map(|&(s, e)| ColorRun {
+                start: s as u32,
+                end: e as u32,
+                rgba: black,
+            })
+            .collect();
+        let mut colored = bg.clone();
+        r.draw_runs(&mut colored, w, h, 4.5, 6.0, text, &ts, black, &runs)
+            .unwrap();
+        let diff = (0..(w * h) as usize)
+            .filter(|&i| plain[i * 4..i * 4 + 4] != colored[i * 4..i * 4 + 4])
+            .count();
+        assert_eq!(diff, 0, "全取基色的 draw_runs 应与 draw 逐字节相同");
+    }
+
     /// 真按区间上了色：红 `ab` + 蓝 `cd`，各自 x 区间内改动像素以本段色为主；并且非空。
     #[test]
     fn draw_runs_colors_each_range() {

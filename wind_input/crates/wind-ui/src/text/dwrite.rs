@@ -108,7 +108,6 @@ impl ColorRun {
 ///
 /// 丢弃空区间、越界区间与不在字符边界上的区间：颜色只是装饰，坏区间让那段回落基色，
 /// 不该让整段文字画不出来。
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn utf16_runs(text: &str, runs: &[ColorRun]) -> Vec<(u32, u32, [u8; 4])> {
     let u16_at = |byte: usize| text[..byte].encode_utf16().count() as u32;
     runs.iter()
@@ -333,6 +332,9 @@ mod imp {
         /// 全局默认字重（`ui.font.weight`，或旧 GDI 字体名里带的字重）；0 = 常规 400。
         /// 承载在 TextFormat 上，叶子字重（主题节点 `font_weight`）非 0 时在 layout 层覆盖它。
         default_weight: i32,
+        /// 测试开关：让 [`Self::effect_key`] 恒错位（见其文档）。
+        #[cfg(test)]
+        pub(crate) break_effect_lookup: std::cell::Cell<bool>,
     }
 
     /// [`TextRenderer::line_heights`] 的键：(字号取整, 字重, base family)。
@@ -377,6 +379,8 @@ mod imp {
                     fallback: RefCell::new(None),
                     fallback_failed: std::cell::Cell::new(false),
                     default_weight: 0,
+                    #[cfg(test)]
+                    break_effect_lookup: std::cell::Cell::new(false),
                 })
             }
         }
@@ -1368,6 +1372,17 @@ mod imp {
             Ok(())
         }
 
+        /// effect 在 [`DrawCtx`] 反查表里的键：它的 `IUnknown` 指针。测试可让它恒错位，
+        /// 模拟「运行时换了 effect 指针、反查全部失败」。
+        fn effect_key(&self, e: &windows::core::IUnknown) -> usize {
+            let p = e.as_raw() as usize;
+            #[cfg(test)]
+            if self.break_effect_lookup.get() {
+                return p ^ 1;
+            }
+            p
+        }
+
         /// 分段着色绘制：`runs` 覆盖的区间改用各自的颜色，其余用 `color`。`runs` 为空（或全被
         /// 判为非法区间）时就是 [`Self::draw`]——出厂路径一个字节都不变。
         ///
@@ -1504,7 +1519,7 @@ mod imp {
                     }
                 }
 
-                for &a in &alphas {
+                for (pass, &a) in alphas.iter().enumerate() {
                     // 1) 草稿区按不透明拷进 DIB。
                     for row in cy0..cy1 {
                         for col in cx0..cx1 {
@@ -1518,10 +1533,11 @@ mod imp {
                     let dc = DrawCtx {
                         base: colorref(color),
                         base_on: base_used && color[3] == a,
+                        fallback_on: pass == 0,
                         effects: colors
                             .iter()
                             .zip(&effects)
-                            .map(|(c, e)| (e.as_raw() as usize, colorref(*c), c[3] == a))
+                            .map(|(c, e)| (self.effect_key(e), colorref(*c), c[3] == a))
                             .collect(),
                     };
                     layout
@@ -1583,6 +1599,9 @@ mod imp {
         base: u32,
         /// 本遍画不画基色字形（多遍绘制按 alpha 分组，见 [`TextRenderer::draw_runs`]）。
         base_on: bool,
+        /// 反查不到的 effect 本遍画不画（按基色）。只在第一遍为真：区间全覆盖时基色那组
+        /// 根本不存在，`base_on` 恒假，没有这一位的话反查失败的字形哪一遍都不画。
+        fallback_on: bool,
         /// `(effect 的 IUnknown 指针, COLORREF, 本遍画不画)`，按指针身份反查。
         effects: Vec<(usize, u32, bool)>,
     }
@@ -1593,20 +1612,22 @@ mod imp {
             Self {
                 base: colorref,
                 base_on: true,
+                fallback_on: true,
                 effects: Vec::new(),
             }
         }
 
         /// 某个字形段该用的颜色；`None` = 本遍不画它。
         ///
-        /// 表里查不到的 effect（理论上不会出现：effect 只有 `draw_runs` 设）按基色处理，
-        /// 宁可颜色不对也不丢字。
+        /// 表里查不到的 effect（理论上不会出现：effect 只有 `draw_runs` 设；真出现了多半是
+        /// 运行时把 effect 包了一层、指针变了）按基色、在第一遍画，宁可颜色不对也不丢字。
         fn pick(&self, effect: Option<&windows::core::IUnknown>) -> Option<u32> {
             if let Some(e) = effect {
                 let p = e.as_raw() as usize;
-                if let Some(&(_, c, on)) = self.effects.iter().find(|x| x.0 == p) {
-                    return on.then_some(c);
-                }
+                return match self.effects.iter().find(|x| x.0 == p) {
+                    Some(&(_, c, on)) => on.then_some(c),
+                    None => self.fallback_on.then_some(self.base),
+                };
             }
             self.base_on.then_some(self.base)
         }
@@ -2323,8 +2344,9 @@ mod imp {
             Ok(())
         }
 
-        /// mock：同 [`Self::draw`] 不出像素。`runs` 为空时就是 `draw`（记录也与之逐字相同），
-        /// 非空时记一行 `draw_runs`——golden 据此断言出厂路径「没有任何调用走 runs」。
+        /// mock：同 [`Self::draw`] 不出像素。与真实后端同一口径先过 [`super::utf16_runs`]：
+        /// 没有合法区间时就是 `draw`（记录也与之逐字相同），否则记一行 `draw_runs`——golden
+        /// 据此断言出厂路径「没有任何调用走 runs」。
         #[allow(clippy::too_many_arguments)]
         #[cfg_attr(not(test), allow(unused_variables))]
         pub fn draw_runs(
@@ -2339,7 +2361,7 @@ mod imp {
             color: [u8; 4],
             runs: &[ColorRun],
         ) -> Result<(), String> {
-            if runs.is_empty() {
+            if super::utf16_runs(text, runs).is_empty() {
                 return self.draw(buf, buf_width, buf_height, x, y, text, ts, color);
             }
             #[cfg(test)]
@@ -2728,6 +2750,33 @@ mod span_color_tests {
         assert!(
             !diff_px(&expected, &naive).is_empty(),
             "逐遍预乘回写的错误做法应与参照不同，否则本用例没有鉴别力"
+        );
+    }
+
+    /// effect 反查全部失败（运行时换了指针）且区间全覆盖时，字仍按基色画出来。
+    ///
+    /// 全覆盖时基色那组不存在，只靠「反查不到按基色」兜底；这条兜底若只挂在基色组上，
+    /// 整段文字会一个像素都不画——宁可颜色不对也不丢字。
+    #[test]
+    fn failed_effect_lookup_still_draws_in_base_color() {
+        let r = tr();
+        let text = "ab cd";
+        let black = [0, 0, 0, 255];
+        let bg = canvas([255, 255, 255, 255]);
+        let mut plain = bg.clone();
+        r.draw(&mut plain, W, H, 4.0, 4.0, text, &ts(), black)
+            .expect("draw");
+        r.break_effect_lookup.set(true);
+        let mut buf = bg.clone();
+        // 区间边界落在空格上，理由同 `base_color_effects_equal_plain_draw`。
+        draw_runs(&r, &mut buf, 4.0, text, &[run(0, 2, RED), run(2, 5, BLUE)]);
+        assert!(!diff_px(&bg, &buf).is_empty(), "反查失败时字不能丢");
+        // 判「按基色画」直接对拍整段基色的 draw：按色相判会被 ClearType 的彩边误伤
+        // （真 Windows 上黑字边缘本就偏红偏蓝）。
+        assert_eq!(
+            diff_px(&plain, &buf),
+            Vec::<usize>::new(),
+            "反查失败应按基色画，与整段基色的 draw 逐字节相同"
         );
     }
 
@@ -3416,6 +3465,27 @@ mod tests {
             tr.draw_text(&mut buf, 8, 8, 0.0, 0.0, "x", [0, 0, 0, 255])
                 .is_ok()
         );
+    }
+
+    /// mock 的 `draw_runs` 与真实后端同口径：区间全部非法时退回 `draw`，不记 `draw_runs` 行。
+    #[test]
+    fn mock_draw_runs_with_only_invalid_runs_is_plain_draw() {
+        use super::{ColorRun, TextStyle};
+        let tr = TextRenderer::new("any", 16.0).unwrap();
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        let bad = [ColorRun {
+            start: 1,
+            end: 2, // 切在「你」中间
+            rgba: [255, 0, 0, 255],
+        }];
+        let ts = TextStyle::new(16.0);
+        tr.draw_runs(&mut buf, 8, 8, 0.0, 0.0, "你", &ts, [0; 4], &bad)
+            .unwrap();
+        tr.draw(&mut buf, 8, 8, 0.0, 0.0, "你", &ts, [0; 4])
+            .unwrap();
+        let log = tr.take_draw_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0], log[1], "全非法区间应与 draw 记录逐字相同");
     }
 }
 
