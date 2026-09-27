@@ -1,4 +1,4 @@
-//! 候选**悬停提示**（气泡）的段渲染——`ui.tooltip.sections` 的唯一消费点。
+//! 候选**悬停提示**（气泡）的段渲染——`ui.tooltip.*` 的唯一消费点。
 //!
 //! 气泡 = 有序段列表，每段 = 段名模板 + 段内容模板，语法与变量沿用注释段（[`crate::comment`]），
 //! 不另起一套。本模块只加两样注释段没有的东西：
@@ -9,17 +9,28 @@
 //! - **`promote`**：按某变量是否非空把逐字行稳定分成两组。合并段靠它复现旧行序（有拆字的字
 //!   在前，拆字库未收录的补在末尾）。
 //!
-//! 变量分三层取值，先到先得：本模块的气泡专属变量（[`char_var`] / [`candidate_var`]）→
-//! 调用方注入的候选上下文变量（`word_code` / `code_source` / `debug`）→ 注释段那套词汇。
-//! 逐字上下文取不到的再回落候选上下文（设计 §4.1：允许但通常没有意义，不报错）。
+//! 变量分层取值，先到先得：只依赖候选文本的气泡变量（`full_text` / `unicode_all`，本模块
+//! 自答）→ 逐字专属变量（[`char_var`]）→ 调用方注入的候选上下文变量（`word_code` /
+//! `code_source` / `debug`）→ 注释段那套词汇。逐字上下文取不到的再回落候选上下文
+//! （设计 §4.1：允许但通常没有意义，不报错）。
+//!
+//! # 原始行与显示行
+//!
+//! 段内容先求出**原始行**，再经「单行截断（`max_chars`）→ 折行（`wrap_width`）」得到
+//! **显示行**（[`TooltipLine`]，`raw` 指回原始行下标）。截断与折行只是给人看的：原始行随
+//! [`RenderedTooltip::raw`] 一并返回，复制 / 上屏取它。原始行**不进** [`TooltipDoc`]——
+//! 它要下发给 UI，而原始行可能很长（完整原文），没必要每次按键都给 UI 复制一份。
 //!
 //! 解析在配置快照里做一次（[`CompiledTooltip::compile`]，随 `ConfigBundle` 重建），
 //! 候选循环里只渲染。设计见 `docs/design/candidate-tooltip-sections.md`。
 
 use crate::comment::Template;
 use tracing::warn;
-use wind_config::config::TooltipSection as SectionConfig;
+use wind_config::config::{TooltipConfig, TooltipSection as SectionConfig, is_wide_char};
 use wind_ui_types::{TooltipDoc, TooltipLine, TooltipSection};
+
+/// 候选显示截断追加的标记，与 `CandidateConfig::truncate_display` 同一个字符。
+const TRUNC_MARK: char = '…';
 
 /// 逐字段遍历的「汉字」口径：≥ U+3400（扩展 A 起）。与段列表引入前的气泡一致。
 fn is_han(c: char) -> bool {
@@ -45,18 +56,31 @@ struct CompiledSection {
     inline: bool,
 }
 
-/// 预解析的段列表（只含启用的段）。
+/// 预解析的段列表（只含启用的段）+ 显示行的长度保护。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CompiledTooltip {
     sections: Vec<CompiledSection>,
+    /// 单行显示上限（字符数），0 = 不限。
+    max_chars: usize,
+    /// 折行宽度（显示列），0 = 不折。
+    wrap_width: usize,
+}
+
+/// 一个候选的气泡：给 UI 的显示结构 + 协调器自留的原始行。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenderedTooltip {
+    pub(crate) doc: TooltipDoc,
+    /// `raw[段][原始行]`，与 `doc.sections` 一一对应；`TooltipLine::raw` 是第二维下标。
+    pub(crate) raw: Vec<Vec<String>>,
 }
 
 impl CompiledTooltip {
-    pub(crate) fn compile(cfg: &[SectionConfig]) -> Self {
+    pub(crate) fn compile(cfg: &TooltipConfig) -> Self {
         let sections = cfg
+            .sections
             .iter()
             .filter(|s| s.enabled)
-            .map(|s| CompiledSection {
+            .map(|s: &SectionConfig| CompiledSection {
                 label: Template::parse(&s.label),
                 template: Template::parse(&s.template),
                 each: match s.each.trim() {
@@ -75,7 +99,11 @@ impl CompiledTooltip {
                 inline: s.inline,
             })
             .collect();
-        Self { sections }
+        Self {
+            sections,
+            max_chars: cfg.max_chars,
+            wrap_width: cfg.wrap_width,
+        }
     }
 
     /// 启用的段里是否引用了变量 `name`（段名、内容、`promote` 任一处）。调用方据此决定要不要
@@ -88,31 +116,47 @@ impl CompiledTooltip {
         })
     }
 
-    /// 按段列表渲染一个候选的气泡。
+    /// 按段列表渲染一个候选的气泡。有任一非空段就有气泡，不看候选是不是汉字。
     ///
-    /// - `disp`：候选的**显示文本**（截断后）。逐字段只遍历它，规模因此受 `ui.candidate.max_chars` 控制。
+    /// - `disp` / `full`：候选的显示文本（按 `ui.candidate.max_chars` 截断后）与完整原文。
+    ///   两者不同即「被截断了」：`${full_text}` 此时才有值。逐字段遍历的是 `disp` 去掉
+    ///   截断标记 `…` 的部分——那个 `…` 不是候选的字，不该出一行 Unicode。规模因此受
+    ///   `ui.candidate.max_chars` 控制，完整原文不会让逐字段展开成几十行。
     /// - `cand`：候选上下文求值，`None` = 未知变量名（渲染层原样回显，拼错看得见）。
-    /// - `per_char`：逐字上下文求值；返回 `None` 时回落 `cand`。
-    ///
-    /// ★ 显示文本里一个 ≥U+3400 的字都没有时，除 `${debug}` 外的变量一律按空处理——即非汉字
-    /// 候选只可能出调试段。这是段列表引入前气泡的口径（`tooltip_for` 先滤 CJK、滤空即返回空，
-    /// 调试段在外面另行追加），迁移后外观不变靠它。
+    /// - `per_char`：逐字上下文求值；返回 `None` 时回落候选上下文。
     pub(crate) fn render(
         &self,
         disp: &str,
+        full: &str,
         cand: &impl Fn(&str, Option<&str>) -> Option<String>,
         per_char: &impl Fn(char, &str, Option<&str>) -> Option<String>,
-    ) -> TooltipDoc {
-        let has_han = disp.chars().any(is_han);
-        let gate = |name: &str, v: Option<String>| -> Option<String> {
-            if has_han || name == "debug" {
-                v
-            } else {
-                v.map(|_| String::new())
+    ) -> RenderedTooltip {
+        let truncated = disp != full;
+        let shown = if truncated {
+            disp.strip_suffix(TRUNC_MARK).unwrap_or(disp)
+        } else {
+            disp
+        };
+        let cand_eval = |name: &str, arg: Option<&str>| -> Option<String> {
+            match name {
+                "full_text" => Some(if truncated {
+                    full.to_string()
+                } else {
+                    String::new()
+                }),
+                // `${unicode_all[:分隔符]}` —— 逐字码位（跳过空白），默认空格连接。
+                "unicode_all" => Some(
+                    shown
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .map(unicode_of)
+                        .collect::<Vec<_>>()
+                        .join(arg.unwrap_or(" ")),
+                ),
+                _ => cand(name, arg),
             }
         };
-        let cand_eval = |name: &str, arg: Option<&str>| gate(name, cand(name, arg));
-        let mut doc = TooltipDoc::default();
+        let mut out = RenderedTooltip::default();
         for sec in &self.sections {
             let rows = match sec.each {
                 Each::Whole => {
@@ -120,14 +164,14 @@ impl CompiledTooltip {
                     if filled { vec![text] } else { Vec::new() }
                 }
                 Each::Han | Each::Char => {
-                    let chars = disp.chars().filter(|&c| match sec.each {
+                    let chars = shown.chars().filter(|&c| match sec.each {
                         Each::Han => is_han(c),
                         _ => !c.is_whitespace(),
                     });
                     let mut rows: Vec<(bool, String)> = Vec::new();
                     for c in chars {
                         let eval = |name: &str, arg: Option<&str>| {
-                            gate(name, per_char(c, name, arg).or_else(|| cand(name, arg)))
+                            per_char(c, name, arg).or_else(|| cand_eval(name, arg))
                         };
                         // `${char}` 恒非空，不能让它撑起一行：查不到读音的字不该剩下 `好：`。
                         let (text, filled) = sec.template.render(&eval, &|n| n != "char");
@@ -147,28 +191,66 @@ impl CompiledTooltip {
                     rows.into_iter().map(|(_, text)| text).collect()
                 }
             };
-            let lines: Vec<TooltipLine> = rows
+            let raw: Vec<String> = rows
                 .iter()
                 .flat_map(|r| r.split('\n'))
                 .filter(|l| !l.trim().is_empty())
-                .enumerate()
-                .map(|(i, l)| TooltipLine {
-                    text: l.to_string(),
-                    raw: u16::try_from(i).unwrap_or(u16::MAX),
-                })
+                .map(str::to_string)
                 .collect();
-            if lines.is_empty() {
+            if raw.is_empty() {
                 continue;
             }
+            let lines = raw
+                .iter()
+                .enumerate()
+                .flat_map(|(i, l)| {
+                    let idx = u16::try_from(i).unwrap_or(u16::MAX);
+                    self.display_lines(l)
+                        .into_iter()
+                        .map(move |text| TooltipLine { text, raw: idx })
+                })
+                .collect();
             // 段名的字面文字不随变量全空而消失：`编码{(${code_source})}` 直接输入时就是 `编码`。
             let (title, _) = sec.label.render(&cand_eval, &|_| true);
-            doc.sections.push(TooltipSection {
+            out.doc.sections.push(TooltipSection {
                 title: (!title.is_empty()).then_some(title),
                 inline: sec.inline,
                 lines,
             });
+            out.raw.push(raw);
         }
-        doc
+        out
+    }
+
+    /// 原始行 → 显示行：先按 `max_chars` 截断（超出加 `…`），再按 `wrap_width` 硬折。
+    ///
+    /// 含 `\t` 的行不折：那是分列行（「拆字 / 拼音」合并段），渲染端按 `\t` 列对齐，
+    /// 从中间折开会把第二列甩到下一行行首，对不齐反而更难读。
+    fn display_lines(&self, raw: &str) -> Vec<String> {
+        let line = if self.max_chars > 0 && raw.chars().count() > self.max_chars {
+            let head: String = raw.chars().take(self.max_chars).collect();
+            format!("{head}{TRUNC_MARK}")
+        } else {
+            raw.to_string()
+        };
+        if self.wrap_width == 0 || line.contains('\t') {
+            return vec![line];
+        }
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut w = 0usize;
+        for c in line.chars() {
+            let cw = if is_wide_char(c) { 2 } else { 1 };
+            // 当前行非空才折：宽度不足一个全角字（wrap_width = 1）时，那个字独占一行而不是死循环。
+            if w + cw > self.wrap_width && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                w = 0;
+            }
+            cur.push(c);
+            w += cw;
+        }
+        out.push(cur);
+        out
     }
 }
 
@@ -191,21 +273,6 @@ pub(crate) fn char_var(
             reverse.readings_of(c, max, "/")
         }
         "unicode" => unicode_of(c),
-        _ => return None,
-    })
-}
-
-/// 候选上下文里气泡专属、且只依赖显示文本的变量。`None` = 不是这里的变量。
-///
-/// - `unicode_all[:分隔符]` —— 显示文本逐字码位（跳过空白），默认空格连接。
-pub(crate) fn candidate_var(name: &str, arg: Option<&str>, disp: &str) -> Option<String> {
-    Some(match name {
-        "unicode_all" => disp
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .map(unicode_of)
-            .collect::<Vec<_>>()
-            .join(arg.unwrap_or(" ")),
         _ => return None,
     })
 }
@@ -295,25 +362,39 @@ mod tests {
 
     struct Cand<'a> {
         disp: &'a str,
+        /// 完整原文；与 `disp` 不同即「显示被截断」。
+        full: &'a str,
         word_code: Option<&'a str>,
         code_source: Option<&'a str>,
         debug: &'a str,
     }
 
     fn cand_eval<'a>(c: &'a Cand<'a>) -> impl Fn(&str, Option<&str>) -> Option<String> + 'a {
-        move |name, arg| {
+        move |name, _arg| {
             Some(match name {
                 "word_code" => c.word_code.unwrap_or_default().to_string(),
                 "code_source" => c.code_source.unwrap_or_default().to_string(),
                 "debug" => c.debug.to_string(),
-                _ => return candidate_var(name, arg, c.disp),
+                // 注释库只给英文词配一条，够测「非汉字候选靠注释库出气泡」。
+                "dict" if c.full == "hello" => "问候".to_string(),
+                "dict" => String::new(),
+                _ => return None,
             })
         }
     }
 
+    /// 出厂的长度保护（200 字 / 40 列）+ 给定段列表：对拍按生产实际口径跑。
+    fn compile(sections: &[SectionConfig]) -> CompiledTooltip {
+        CompiledTooltip::compile(&TooltipConfig {
+            sections: sections.to_vec(),
+            ..TooltipConfig::default()
+        })
+    }
+
     fn render_new(rl: &ReverseLookup, sections: &[SectionConfig], c: &Cand) -> String {
-        CompiledTooltip::compile(sections)
-            .render(c.disp, &cand_eval(c), &per_char(rl))
+        compile(sections)
+            .render(c.disp, c.full, &cand_eval(c), &per_char(rl))
+            .doc
             .to_plain_text()
     }
 
@@ -482,6 +563,7 @@ mod tests {
     fn fixtures() -> Vec<Cand<'static>> {
         let c = |disp, word_code, code_source| Cand {
             disp,
+            full: disp,
             word_code,
             code_source,
             debug: DEBUG,
@@ -500,13 +582,16 @@ mod tests {
             c("龘", Some("xyz"), None), // 两表都没有，只剩编码
             c("丂", None, None),        // 有编码无字根
             c("好a人", Some("x"), None),
-            c("你好…", None, None),      // 截断后的显示文本
-            c("abc", Some("abc"), None), // 纯非 CJK：只可能有调试段
+            Cand {
+                full: "你好世界",
+                ..c("你好…", None, None) // 截断：多出「完整原文」段，逐字段不含 …
+            },
+            c("abc", Some("abc"), None), // 纯非 CJK：P2 起也有气泡
             c("", None, None),
         ]
     }
 
-    /// 新渲染的预期：旧输出，外加设计 §8.3 已确认的两条差异。
+    /// 新渲染的预期：旧输出，外加设计 §8.3 已确认的差异。
     ///
     /// 1. 旧开关只有一边有内容时，旧实现不合并、保留那一边的标题（`[拼音]` / `[拆字]`），
     ///    而迁移出的合并段标题恒为「拆字 / 拼音」。内容行逐字节一致，差异只在这一行标题。
@@ -514,20 +599,36 @@ mod tests {
     ///    新模板 `${chaizi}{ [${chaizi_code}]}` 表达不了「编码只跟着字根出现」，于是多出
     ///    ` [gnv]`。只有用户自备拆字库会出现（出厂库 0 条），且显示的信息更多而非更少。
     ///    这类用例不走「旧输出 + 改写」，直接逐字节写出新输出。
+    /// 3. （P2）非汉字候选不再整体没有气泡：编码段照常出（逐字段本就没有汉字可出）。
+    /// 4. （P2）候选显示被截断时，首段多出「完整原文」。
+    ///
+    /// 3、4 同样直接写出新输出，不从旧输出改写；中文且未截断的夹具仍须与旧输出逐字节一致。
     fn expected(old: &str, f: LegacyTooltipFlags, c: &Cand) -> String {
-        if c.disp == "丂" && f.chaizi {
+        let debug = f.debug.then(|| format!("[调试]\n{}", c.debug));
+        let body = if !c.disp.chars().any(is_han) {
+            let code = c.word_code.filter(|w| f.code && !w.is_empty()).map(|w| {
+                match c.code_source.filter(|s| !s.is_empty()) {
+                    Some(src) => format!("[编码({src})]\n{w}"),
+                    None => format!("[编码]\n{w}"),
+                }
+            });
+            [code, debug]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else if c.disp == "丂" && f.chaizi {
             let body = if f.pinyin {
                 "[拆字 / 拼音]\n丂： [gnv]\tkǎo"
             } else {
                 "[拆字]\n丂： [gnv]"
             };
-            return if f.debug {
-                format!("{body}\n[调试]\n{}", c.debug)
-            } else {
-                body.to_string()
-            };
-        }
-        if f.chaizi && f.pinyin {
+            [Some(body.to_string()), debug]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else if f.chaizi && f.pinyin {
             old.replacen("[拼音]\n", "[拆字 / 拼音]\n", 1).replacen(
                 "[拆字]\n",
                 "[拆字 / 拼音]\n",
@@ -535,6 +636,15 @@ mod tests {
             )
         } else {
             old.to_string()
+        };
+        if c.disp != c.full {
+            [format!("[完整原文]\n{}", c.full), body]
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            body
         }
     }
 
@@ -563,8 +673,8 @@ mod tests {
             }
         }
         assert_eq!(checked, 96 * fixtures().len());
-        // 标题差异只出现在「拆字、拼音同开」且某一边整段为空的组合上；夹具里有这种候选
-        // （㐀 无读音、你/龘 无拆字……），数目为零说明夹具退化了，对拍不再覆盖那条分支。
+        // 差异只出现在 [`expected`] 列出的几类用例上（标题、丂、非汉字、截断）；数目为零
+        // 说明夹具退化了，对拍不再覆盖那些分支。
         assert!(deviations > 0);
     }
 
@@ -588,6 +698,7 @@ mod tests {
         ] {
             let c = Cand {
                 disp,
+                full: disp,
                 word_code: None,
                 code_source: None,
                 debug: "",
@@ -610,6 +721,7 @@ mod tests {
         };
         let c = Cand {
             disp: "你好人㐀",
+            full: "你好人㐀",
             word_code: None,
             code_source: None,
             debug: "",
@@ -636,6 +748,7 @@ mod tests {
     fn cand(disp: &str) -> Cand<'_> {
         Cand {
             disp,
+            full: disp,
             word_code: Some("vbg"),
             code_source: Some("五笔"),
             debug: "来源: 拼音",
@@ -695,18 +808,202 @@ mod tests {
         assert_eq!(render_new(&rl, &s, &cand("龘")), "");
     }
 
+    /// P2 起非汉字候选与汉字候选同一口径：有任一非空段就有气泡。多行变量天然拆成多行。
     #[test]
-    fn debug_var_is_multiline_and_survives_non_cjk_gate() {
+    fn non_cjk_candidate_gets_every_non_empty_section() {
         let rl = ReverseLookup::default();
         let s = [
             section("编码", "", "${word_code}"),
+            section("Unicode", "char", "${char}：${unicode}"),
             section("调试", "", "${debug}"),
         ];
         let c = Cand {
             debug: "来源: 英文\n码 abc",
-            ..cand("abc")
+            ..cand("ab")
         };
-        assert_eq!(render_new(&rl, &s, &c), "[调试]\n来源: 英文\n码 abc");
+        assert_eq!(
+            render_new(&rl, &s, &c),
+            "[编码]\nvbg\n[Unicode]\na：U+0061\nb：U+0062\n[调试]\n来源: 英文\n码 abc"
+        );
+    }
+
+    /// 英文候选配了注释库变量就能出气泡（旧口径下非汉字一律没有气泡）。
+    #[test]
+    fn english_candidate_with_dict_gets_a_tooltip() {
+        let rl = ReverseLookup::default();
+        let s = [section("释义", "", "${dict}")];
+        let c = Cand {
+            word_code: None,
+            ..cand("hello")
+        };
+        assert_eq!(render_new(&rl, &s, &c), "[释义]\n问候");
+        let other = Cand {
+            word_code: None,
+            ..cand("world")
+        };
+        assert_eq!(render_new(&rl, &s, &other), "", "查不到就没有气泡");
+    }
+
+    // ───────────────────────── P2：完整原文、截断、折行 ─────────────────────────
+
+    fn truncated<'a>(disp: &'a str, full: &'a str) -> Cand<'a> {
+        Cand {
+            full,
+            word_code: None,
+            code_source: None,
+            ..cand(disp)
+        }
+    }
+
+    /// 出厂段列表：未截断时没有完整原文段，截断时置首出现、原始行就是完整原文。
+    #[test]
+    fn full_text_section_appears_only_when_truncated() {
+        let rl = fixture_reverse();
+        let t = CompiledTooltip::compile(&TooltipConfig::default());
+        let plain = cand("你好");
+        let r = t.render(plain.disp, plain.full, &cand_eval(&plain), &per_char(&rl));
+        assert_eq!(
+            r.doc.to_plain_text(),
+            "[编码(五笔)]\nvbg\n[拼音]\n你：nǐ\n好：hǎo/hào"
+        );
+
+        let c = truncated("你好…", "你好世界");
+        let r = t.render(c.disp, c.full, &cand_eval(&c), &per_char(&rl));
+        assert_eq!(
+            r.doc.to_plain_text(),
+            "[完整原文]\n你好世界\n[拼音]\n你：nǐ\n好：hǎo/hào",
+            "逐字段只遍历显示出来的字，… 不出行"
+        );
+        assert_eq!(r.raw[0], ["你好世界"]);
+    }
+
+    /// 截断标记不是候选的字：逐字段（含 each=char）不为它出行，`${unicode_all}` 也不含它。
+    #[test]
+    fn truncation_mark_is_not_a_character_of_the_candidate() {
+        let rl = ReverseLookup::default();
+        let s = [
+            section("Unicode", "char", "${char}：${unicode}"),
+            section("", "", "${unicode_all}"),
+        ];
+        assert_eq!(
+            render_new(&rl, &s, &truncated("好人…", "好人们")),
+            "[Unicode]\n好：U+597D\n人：U+4EBA\nU+597D U+4EBA"
+        );
+        // 未截断时原文里自带的 … 是真字符，照常出行。
+        assert_eq!(
+            render_new(&rl, &s[..1], &cand("好…")),
+            "[Unicode]\n好：U+597D\n…：U+2026"
+        );
+    }
+
+    fn limited(max_chars: usize, wrap_width: usize, sections: &[SectionConfig]) -> CompiledTooltip {
+        CompiledTooltip::compile(&TooltipConfig {
+            max_chars,
+            wrap_width,
+            sections: sections.to_vec(),
+            ..TooltipConfig::default()
+        })
+    }
+
+    fn render_limited(t: &CompiledTooltip, c: &Cand) -> RenderedTooltip {
+        t.render(
+            c.disp,
+            c.full,
+            &cand_eval(c),
+            &per_char(&ReverseLookup::default()),
+        )
+    }
+
+    /// 超过 `max_chars` 的原始行显示时截断加 …，原始行保持完整。
+    #[test]
+    fn max_chars_truncates_display_only() {
+        let t = limited(5, 0, &[section("完整原文", "", "${full_text}")]);
+        let r = render_limited(&t, &truncated("一二…", "一二三四五六七"));
+        assert_eq!(r.doc.to_plain_text(), "[完整原文]\n一二三四五…");
+        assert_eq!(r.raw[0], ["一二三四五六七"]);
+        let off = limited(0, 0, &[section("完整原文", "", "${full_text}")]);
+        let r = render_limited(&off, &truncated("一二…", "一二三四五六七"));
+        assert_eq!(
+            r.doc.to_plain_text(),
+            "[完整原文]\n一二三四五六七",
+            "0 = 不限"
+        );
+    }
+
+    /// 折行按显示列：汉字 2 列、ASCII 1 列；折出的显示行都指回同一条原始行。
+    #[test]
+    fn wrap_counts_display_columns_for_mixed_text() {
+        let t = limited(0, 10, &[section("", "", "${full_text}")]);
+        let r = render_limited(&t, &truncated("a…", "abc你好defg世界"));
+        let lines: Vec<(&str, u16)> = r.doc.sections[0]
+            .lines
+            .iter()
+            .map(|l| (l.text.as_str(), l.raw))
+            .collect();
+        assert_eq!(lines, [("abc你好def", 0), ("g世界", 0)]);
+        // 宽度不足一个全角字时，那个字独占一行（不丢字、不死循环）。
+        let narrow = limited(0, 1, &[section("", "", "${full_text}")]);
+        let r = render_limited(&narrow, &truncated("a…", "你a"));
+        assert_eq!(r.doc.to_plain_text(), "你\na");
+    }
+
+    /// 含 `\t` 的分列行不折：折开会把第二列甩到下一行行首。
+    #[test]
+    fn tab_separated_rows_are_not_wrapped() {
+        let rl = fixture_reverse();
+        let merged = tooltip_sections_from_legacy(LegacyTooltipFlags {
+            code: false,
+            chaizi: true,
+            ..Default::default()
+        });
+        let t = CompiledTooltip::compile(&TooltipConfig {
+            wrap_width: 4,
+            sections: merged,
+            ..TooltipConfig::default()
+        });
+        let c = cand("好");
+        let r = t.render(c.disp, c.full, &cand_eval(&c), &per_char(&rl));
+        assert_eq!(
+            r.doc.to_plain_text(),
+            "[拆字 / 拼音]\n好：女子 [vbg]\thǎo/hào"
+        );
+    }
+
+    /// `raw` 下标：多行变量拆出的每条原始行各有下标，折行产生的显示行共用所属原始行的下标。
+    #[test]
+    fn raw_index_maps_display_lines_back_to_raw_lines() {
+        let t = limited(0, 5, &[section("调试", "", "${debug}")]);
+        let c = Cand {
+            debug: "aaaaaaaaaaaa\nbb",
+            ..cand("x")
+        };
+        let r = render_limited(&t, &c);
+        let lines: Vec<(&str, u16)> = r.doc.sections[0]
+            .lines
+            .iter()
+            .map(|l| (l.text.as_str(), l.raw))
+            .collect();
+        assert_eq!(lines, [("aaaaa", 0), ("aaaaa", 0), ("aa", 0), ("bb", 1)]);
+        assert_eq!(r.raw, [vec!["aaaaaaaaaaaa".to_string(), "bb".to_string()]]);
+    }
+
+    /// 出厂口径（200 字 / 40 列）端到端：超长短语的完整原文先截到 200 字，再每 20 个汉字一行。
+    #[test]
+    fn factory_limits_apply_end_to_end() {
+        let t = CompiledTooltip::compile(&TooltipConfig::default());
+        let long: String = "长".repeat(250);
+        let c = truncated("长…", &long);
+        let r = render_limited(&t, &c);
+        let first = &r.doc.sections[0];
+        assert_eq!(first.title.as_deref(), Some("完整原文"));
+        assert_eq!(
+            first.lines.len(),
+            11,
+            "200 字 ÷ 20 字/行 = 10 行，另加 … 落在第 11 行"
+        );
+        assert!(first.lines.iter().all(|l| l.raw == 0));
+        assert_eq!(first.lines[10].text, "…");
+        assert_eq!(r.raw[0][0].chars().count(), 250, "原始行不截断");
     }
 
     #[test]
@@ -749,16 +1046,13 @@ mod tests {
     fn references_sees_label_template_and_promote() {
         let mut s = section("编码{(${code_source})}", "han", "${a|debug}");
         s.promote = "chaizi".into();
-        let t = CompiledTooltip::compile(&[s]);
+        let t = compile(&[s]);
         assert!(t.references("code_source"));
         assert!(t.references("debug"));
         assert!(t.references("chaizi"));
         assert!(!t.references("word_code"));
         let mut off = section("", "", "${debug}");
         off.enabled = false;
-        assert!(
-            !CompiledTooltip::compile(&[off]).references("debug"),
-            "关着的段不算"
-        );
+        assert!(!compile(&[off]).references("debug"), "关着的段不算");
     }
 }

@@ -614,6 +614,8 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.theme.style", Str),
     f("ui.mode_indicator.style", Enum(&["short", "full", "none"])),
     f("ui.tooltip.delay", Int),
+    f("ui.tooltip.max_chars", Int),
+    f("ui.tooltip.wrap_width", Int),
     // 悬停提示段列表：结构体数组，整体作不透明叶子（同 ui.langbar.badges）。
     // 段字段（label/template/each/promote/inline/enabled）是条目属性，不单独登记。
     f("ui.tooltip.sections", StructList),
@@ -1299,6 +1301,25 @@ mod tests {
             l1, l2,
             "ui.tooltip.sections 的 L1 默认值与 L2 出厂文件不一致"
         );
+    }
+
+    /// L1↔L2 同源：气泡的单行上限与折行宽度（取值守门在 config.rs `test_tooltip_defaults`，
+    /// 行为守门在协调器 `tooltip` 模块的出厂配置用例）。
+    #[test]
+    fn tooltip_limits_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.tooltip;
+        let tip = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("tooltip"))
+            .cloned()
+            .expect("data/config.toml 缺少 [ui.tooltip]");
+        let int = |k: &str| {
+            tip.get(k)
+                .and_then(toml::Value::as_integer)
+                .unwrap_or_else(|| panic!("data/config.toml 缺少 ui.tooltip.{k}"))
+        };
+        assert_eq!(int("max_chars"), l1.max_chars as i64);
+        assert_eq!(int("wrap_width"), l1.wrap_width as i64);
     }
 
     /// 解析仓库内系统预置 `data/config.toml`。

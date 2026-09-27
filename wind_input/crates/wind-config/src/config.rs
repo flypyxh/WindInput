@@ -5394,7 +5394,7 @@ pub(crate) fn display_width_trunc(raw: &str, max_width: usize) -> String {
 /// ⚠️ emoji 记 1 是有代价的：它占 2 个 UTF-16 code unit，图标主字上限 2 因此蕴含
 /// 「最坏 4 wchar」，C++ 侧 `_inputTypeLabel` 的容量按这个最坏值取。若要把 emoji
 /// 划进双宽，先看 `schema::icon_label_limit_counts_scalar_values` 那条断言。
-fn is_wide_char(c: char) -> bool {
+pub fn is_wide_char(c: char) -> bool {
     matches!(c as u32,
         0x1100..=0x115F      // 谚文字母
         | 0x2E80..=0x303E    // CJK 部首补充 / 康熙部首 / CJK 符号与标点
@@ -6292,6 +6292,17 @@ pub struct TooltipConfig {
     /// 提示延迟显示时间（毫秒）。
     #[serde(default = "default_tooltip_delay")]
     pub delay: i32,
+    /// 单行显示上限（字符数），超出截断加 `…`；0 = 不限。只管显示，复制 / 上屏取原文。
+    ///
+    /// 气泡里最长的是「完整原文」段——长短语可达上千字，不截会把气泡撑到屏幕外。
+    #[serde(default = "default_tooltip_max_chars")]
+    pub max_chars: usize,
+    /// 折行宽度（显示列，CJK / 全角计 2、其余计 1）；0 = 不折。含 `\t` 的分列行不折。
+    ///
+    /// 折行在协调器里硬插换行，而不是交给渲染层：View 引擎不支持文本折行，自绘、宿主渲染、
+    /// macOS 三端因此都不用改就一致。
+    #[serde(default = "default_tooltip_wrap_width")]
+    pub wrap_width: usize,
     /// 气泡的段，按数组顺序自上而下排列。整体是一个不透明叶子（REGISTRY `StructList`），
     /// 用户层写了就整表替换出厂列表。
     #[serde(default = "default_tooltip_sections")]
@@ -6347,6 +6358,14 @@ impl TooltipSection {
     }
 }
 
+fn default_tooltip_max_chars() -> usize {
+    200
+}
+
+fn default_tooltip_wrap_width() -> usize {
+    40
+}
+
 /// 出厂段名：迁移按段名找段（见 [`Config::migrate_tooltip_sections_value`]），
 /// 出厂列表与迁移共用这组常量，改名只改一处。
 const TIP_CODE: &str = "编码{(${code_source})}";
@@ -6357,10 +6376,12 @@ const TIP_DEBUG: &str = "调试";
 /// 出厂段列表。与 `data/config.toml` 的 `[[ui.tooltip.sections]]` 逐项相同（L1/L2 同源，
 /// 守门测试 `tooltip_sections_l1_matches_l2`）。
 ///
-/// 前四段复现旧出厂外观：`[编码]`（非直接输入时带来源方案名）、`[拼音]` 逐字全读音，
+/// 「完整原文」置首：只在候选显示被截断时有值，平时整段不出现；出现时正是用户最想看的。
+/// 其后复现旧出厂外观：`[编码]`（非直接输入时带来源方案名）、`[拼音]` 逐字全读音，
 /// 拆字、调试关着。Unicode 段是新增能力，出厂关。
 pub fn default_tooltip_sections() -> Vec<TooltipSection> {
     vec![
+        TooltipSection::new("完整原文", "", "${full_text}"),
         TooltipSection::new(TIP_CODE, "", "${word_code}"),
         TooltipSection::new(TIP_PINYIN, "han", "${char}：${readings}"),
         TooltipSection::new(TIP_CHAIZI, "han", "${char}：${chaizi}{ [${chaizi_code}]}").disabled(),
@@ -6394,7 +6415,7 @@ impl Default for LegacyTooltipFlags {
 }
 
 /// 旧开关组合 → 与之外观一致的段列表（设计 §8.1）。以出厂列表为底改写，因而老用户也拿到
-/// 新增的（关着的）Unicode 段。
+/// 新增的「完整原文」段（开）与 Unicode 段（关）。
 ///
 /// 独立成 pub 函数而不是埋在 Value 层迁移里：协调器的对拍测试要拿同一份映射去比对
 /// 「旧实现输出 == 迁移出的段列表的新渲染输出」，映射若在测试里另写一份，对拍就只证明了
@@ -6448,6 +6469,8 @@ impl Default for TooltipConfig {
     fn default() -> Self {
         Self {
             delay: default_tooltip_delay(),
+            max_chars: default_tooltip_max_chars(),
+            wrap_width: default_tooltip_wrap_width(),
             sections: default_tooltip_sections(),
         }
     }
@@ -11091,7 +11114,13 @@ active = "x"
             .filter(|s| s.enabled)
             .map(|s| s.label.as_str())
             .collect();
-        assert_eq!(on, ["编码{(${code_source})}", "拼音"], "出厂只开编码与拼音");
+        assert_eq!(
+            on,
+            ["完整原文", "编码{(${code_source})}", "拼音"],
+            "出厂开完整原文、编码、拼音"
+        );
+        assert_eq!(t.max_chars, 200, "单行显示上限默认 200 字");
+        assert_eq!(t.wrap_width, 40, "折行宽度默认 40 列");
         // 旧出厂开关（全缺省）迁出来必须恰是出厂段列表：否则从没碰过气泡设置、却在用户层
         // 留着旧键的老用户，升级后会拿到一份与新装用户不同的段列表。
         assert_eq!(
@@ -11124,7 +11153,7 @@ active = "x"
         let (secs, user) = tooltip_after_migration("[ui.tooltip]\nchaizi_enabled = true\n");
         assert_eq!(
             enabled_labels(&secs),
-            ["编码{(${code_source})}", "拆字 / 拼音"]
+            ["完整原文", "编码{(${code_source})}", "拆字 / 拼音"]
         );
         let merged = secs.iter().find(|s| s.label == "拆字 / 拼音").unwrap();
         assert_eq!(merged.each, "han");
@@ -11148,7 +11177,10 @@ active = "x"
         let (secs, _) = tooltip_after_migration(
             "[ui.tooltip]\nchaizi_enabled = true\npinyin_enabled = false\n",
         );
-        assert_eq!(enabled_labels(&secs), ["编码{(${code_source})}", "拆字"]);
+        assert_eq!(
+            enabled_labels(&secs),
+            ["完整原文", "编码{(${code_source})}", "拆字"]
+        );
     }
 
     /// `heteronyms = false` 先于 `max_readings` 判定（旧实现即如此），迁成 `${readings:1}`。
@@ -11179,7 +11211,7 @@ active = "x"
     fn migrate_tooltip_code_and_debug_switches() {
         let (secs, _) =
             tooltip_after_migration("[ui.tooltip]\ncode_enabled = false\ndebug_enabled = true\n");
-        assert_eq!(enabled_labels(&secs), ["拼音", "调试"]);
+        assert_eq!(enabled_labels(&secs), ["完整原文", "拼音", "调试"]);
     }
 
     /// 用户已写 `sections` 时以它为准，旧键只清不迁。

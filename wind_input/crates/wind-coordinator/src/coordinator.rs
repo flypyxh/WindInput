@@ -6186,10 +6186,11 @@ impl Coordinator {
                 // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
                 // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
                 let disp = cand_cfg.truncate_display(&full);
-                // 悬停提示按段列表渲染（见 `crate::tooltip`）。逐字段遍历**截断后**的显示文本：
-                // 超长候选（如长短语）逐字展开会撑爆气泡，只提示实际显示出的字（… 非汉字，
-                // 逐字段自动跳过）。`${word_code}` 则按候选**完整原文**查词库（截断/繁化文本
-                // 词库里没有；查不到=空，段随之消失）。
+                // 悬停提示按段列表渲染（见 `crate::tooltip`）。逐字段遍历**截断后**的显示文本、
+                // 且不含截断追加的 `…`：超长候选（如长短语）逐字展开会撑爆气泡，只提示实际
+                // 显示出的字；被截掉的部分由「完整原文」段（`${full_text}`）整段给出。
+                // `${word_code}` 则按候选**完整原文**查词库（截断/繁化文本词库里没有；
+                // 查不到=空，段随之消失）。
                 //
                 // ⚠️ 曾改成按显示文本（`full`）查编码，动机是「气泡三段应同属一个域」——已回退。
                 // 拼音段/拆字段吃显示文本是**它们**的事（拆字库覆盖繁体字，查得到），而编码段
@@ -6221,9 +6222,14 @@ impl Coordinator {
                             })
                             .unwrap_or_default(),
                         _ => {
-                            return crate::tooltip::candidate_var(name, arg, &disp).or_else(|| {
-                                self.eval_var(name, arg, c, &reverse, hint_source, &dict_schema)
-                            });
+                            return self.eval_var(
+                                name,
+                                arg,
+                                c,
+                                &reverse,
+                                hint_source,
+                                &dict_schema,
+                            );
                         }
                     })
                 };
@@ -6231,7 +6237,11 @@ impl Coordinator {
                     crate::tooltip::char_var(name, arg, ch, &reverse)
                         .or_else(|| self.eval_text_var(name, arg, &ch.to_string(), &reverse))
                 };
-                let tooltip = tip.render(&disp, &cand_eval, &char_eval).to_plain_text();
+                // 原始行（`.raw`）暂无消费者：右键按段 / 按行复制、上屏落地时由协调器按页缓存。
+                let tooltip = tip
+                    .render(&disp, &full, &cand_eval, &char_eval)
+                    .doc
+                    .to_plain_text();
                 // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
                 // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
                 // `ui.tooltip.sections`，塞了会与之重复。

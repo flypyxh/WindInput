@@ -213,6 +213,8 @@ pub struct TooltipLine {
   换页/重算时覆盖）。UI 只需回报命中位置，取值在协调器侧完成——值可能很长（完整原文），
   没必要每次按键都复制一份给 UI。
 - 模板在配置加载时解析一次、随配置快照缓存，不在候选循环里解析。
+- P2 实施：原始行由 `wind-coordinator` 的 `tooltip::RenderedTooltip.raw`（`raw[段][原始行]`，
+  与 `doc.sections` 一一对应）随渲染结果返回，**不进** `TooltipDoc`；P3 由协调器按页缓存它。
 
 ## 7 右键：识别与动作
 

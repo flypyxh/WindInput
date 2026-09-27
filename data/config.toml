@@ -1344,6 +1344,11 @@ items = ["schema", "punct", "full_width", "s2t", "caps"]
 # 悬停提示（鼠标停在候选上弹出的气泡）
 [ui.tooltip]
 delay = 200   # 悬停多久后显示（毫秒）
+# 单行最多显示多少字，超出截断加 …（0 = 不限）。只影响显示，不影响复制 / 上屏取到的原文。
+max_chars = 200
+# 折行宽度：一行显示多宽就换行，按列计（汉字、全角字符算 2 列，其余算 1 列；0 = 不折行）。
+# 含制表符的分列行（如「拆字 / 拼音」合并段）不折。
+wrap_width = 40
 
 # 气泡由下面这些段自上而下组成，数组顺序即显示顺序。每段：
 # enabled   段开关（默认 true）。关着的段保留在这里，想看时改成 true 即可。
@@ -1356,10 +1361,19 @@ delay = 200   # 悬停多久后显示（毫秒）
 #           一行里除 ${char} 外全空（如某字查不到读音）则整行不显示。
 # promote   仅逐字段：填一个变量名，该变量非空的行排在前面（各组内保持原文顺序）。
 # inline    内容恰为一行时写成「段名: 内容」，不单独占一行标题。
-# 气泡专属变量：${word_code} 该词在编码来源方案里的全部编码（a/ab/abc）；${code_source} 编码来源
+# 气泡专属变量：${full_text} 候选显示被截断时的完整原文（未截断时为空）；
+# ${word_code} 该词在编码来源方案里的全部编码（a/ab/abc）；${code_source} 编码来源
 # 方案名（直接用该方案输入时为空）；${readings} / ${readings:N} 当前字的全部读音 / 前 N 个；
 # ${unicode} 当前字码位；${unicode_all} / ${unicode_all:分隔符} 逐字码位；${debug} 调试信息。
 # 注释模板的变量（${pinyin}、${chaizi}、${chaizi_code}、${dict}……）同样可用。
+[[ui.tooltip.sections]]
+enabled = true
+label = "完整原文"
+template = "${full_text}"   # 仅候选显示被截断（超出 ui.candidate.max_chars）时有值，平时整段不出现
+each = ""
+promote = ""
+inline = false
+
 [[ui.tooltip.sections]]
 enabled = true
 label = "编码{(${code_source})}"
