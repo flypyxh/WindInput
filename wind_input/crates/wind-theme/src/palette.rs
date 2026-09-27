@@ -167,10 +167,22 @@ mod tests {
     /// `from_str_radix` 认前导 `+`：逐字符先验十六进制位，`#+F+F+F` 不是白色。
     #[test]
     fn plus_signs_are_not_hex_digits() {
-        for bad in ["#+F+F+F", "+F+F+F", "#+FFFFF", "#FF+FFF80"] {
+        for bad in [
+            "#+F+F+F",
+            "+F+F+F",
+            "+FFFFF",
+            "#+FFFFF",
+            "#+FF0000",
+            "#FF+FFF80",
+        ] {
             assert_eq!(parse_hex(bad), None, "{bad}");
         }
         assert_eq!(parse_hex("#ffFFff"), Some([255, 255, 255, 255]));
+        // 既有宽容保留：多个前导 `#`、6 / 8 位裸写（用户主题里的老写法，收紧会静默回落默认色）。
+        assert_eq!(parse_hex("##FFFFFF"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_hex("FFFFFF"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_hex("#FFF"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_hex("#FFFFFF80"), Some([255, 255, 255, 0x80]));
     }
 
     /// 3 位不带 `#` 一律不认：语言栏配置与内联色里，`bad` / `fed` / `ace` 是词不是颜色。

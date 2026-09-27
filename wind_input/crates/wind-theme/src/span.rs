@@ -38,9 +38,9 @@ impl Atom {
     fn parse(s: &str) -> Self {
         let s = s.trim();
         if let Some(hex) = s.strip_prefix('#') {
-            // 恰好一个 `#`、其后全是十六进制位，才交给 parse_hex 换算。不能直接喂它：它会先
-            // 削掉**全部**前导 `#`（`##C00000` 照认），且按 `from_str_radix` 逐两位解析，
-            // 那个函数认前导 `+`（`#+F+F+F` 照认）——内联色要的是写法严格。
+            // 恰好一个 `#`、其后全是十六进制位，才交给 parse_hex 换算。不能直接喂它：它为兼容
+            // 老主题会削掉**全部**前导 `#`（`##C00000` 照认）、也认不带 `#` 的 6 / 8 位裸写——
+            // 内联色要的是写法严格。（`from_str_radix` 认前导 `+` 的问题 parse_hex 已自己挡掉。）
             let strict =
                 matches!(hex.len(), 3 | 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit());
             return if strict {
