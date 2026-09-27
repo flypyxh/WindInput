@@ -1029,6 +1029,7 @@ CTextService::CTextService()
     , _hHotkeyWnd(nullptr)
     , _hotkeyWndClass(0)
     , _hotkeysActive(FALSE)
+    , _candidatesVisible(FALSE)
     , _addWordHotkeysActive(FALSE)
     , _focusIsPassword(false)
     , _focusInputScopeMask(0)
@@ -1960,10 +1961,19 @@ void CTextService::_DoReevaluateAddWordHotkey()
     // _isProcessForeground 与 _hasThreadFocus 并列：理由见 _RegisterCandidateHotkeys。
     BOOL want = _hasThreadFocus && _isProcessForeground
                 && _bChineseMode && _hasTextInputContext && !_focusIsPassword;
-    // 候选热键同样以中文模式为门卫：候选可见期间切到英文，立即还给宿主。
-    if (!_bChineseMode && _hotkeysActive)
+    // 候选热键同样以中文模式为门卫：候选可见期间切到英文，立即还给宿主；
+    // 候选可见期间切回中文，候选显隐不会再变，只能在这里补注册。
+    switch (wind::candhotkey::OnModeReevaluate(_bChineseMode != FALSE, _candidatesVisible != FALSE,
+                                               _hotkeysActive != FALSE))
     {
+    case wind::candhotkey::Action::Register:
+        _RegisterCandidateHotkeys();
+        break;
+    case wind::candhotkey::Action::Unregister:
         _UnregisterCandidateHotkeys();
+        break;
+    case wind::candhotkey::Action::None:
+        break;
     }
     if (want && !_addWordHotkeysActive)
     {
@@ -2653,6 +2663,7 @@ void CTextService::NotifyCandidatesVisibilityChanged(BOOL hasCandidates)
     // keys.delete_candidate，见 _RegisterCandidateHotkeys）；候选消失 → 卸载，
     // 让宿主重新获得这些键。这是第三方输入法使用的成熟机制，规避 Chromium 类宿主
     // 的加速键双处理。
+    _candidatesVisible = hasCandidates;
     if (hasCandidates && !_hotkeysActive)
     {
         _RegisterCandidateHotkeys();

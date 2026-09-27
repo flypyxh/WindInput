@@ -570,6 +570,7 @@ private:
     HWND  _hHotkeyWnd;                // 隐藏消息窗口，接收 WM_HOTKEY
     ATOM  _hotkeyWndClass;            // RegisterClassEx 返回的窗口类原子
     BOOL  _hotkeysActive;             // 当前是否已 RegisterHotKey 候选热键（组合键取自服务端 SESSION 热键表）
+    BOOL  _candidatesVisible;         // 最近一次 NotifyCandidatesVisibilityChanged 的值；模式切回中文时据此补注册
     // 加词热键（Ctrl+= 等）全局拦截：门卫比候选热键更严——中文模式 + 焦点在可编辑文本框 +
     // 非密码框 + 持有 thread focus 才注册，让抢占面积最小化，不干扰非文本框处的宿主快捷键。
     BOOL  _addWordHotkeysActive;      // 当前是否已 RegisterHotKey 加词热键
