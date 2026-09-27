@@ -118,10 +118,9 @@ pub fn is_cmdbar_text(s: &str) -> bool {
 ///
 /// 刻意比 [`is_cmdbar_text`] 窄：后者单凭顶层 `{` 就成立，而 `{` 可以是某些方案编码
 /// 字符集里的正经键位，拿它当对调依据会把合法行翻成镜像垃圾。
+/// marker 表与命令栏解析器同源（`wind_cmdbar::contains_marker_call`）。
 pub fn is_misplaced_cmdbar_code(code: &str) -> bool {
-    ["$CC(", "$CC1(", "$SS(", "$AA("]
-        .iter()
-        .any(|m| code.contains(m))
+    wind_cmdbar::contains_marker_call(code)
 }
 
 pub fn format_bool(b: bool) -> &'static str {

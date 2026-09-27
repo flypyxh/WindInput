@@ -27,7 +27,7 @@ pub use eval::{ArrayElement, ArrayExpansion, Evaluated, evaluate, expand_array};
 pub use funcs::action::validate_toast_args;
 pub use funcs::value::generate_uuid;
 pub use lint::{Hint, lint_parsed, lint_phrase};
-pub use parser::parse;
+pub use parser::{contains_marker_call, parse};
 pub use phrase::{PhraseEval, evaluate_phrase, is_cmdbar_grammar, run_actions};
 pub use registry::{Category, FuncSpec, Registry, default_registry};
 pub use services::{
