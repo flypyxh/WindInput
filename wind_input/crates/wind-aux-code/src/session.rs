@@ -15,7 +15,7 @@
 use wind_candidate::{Candidate, CandidateStore};
 
 use crate::filter::{AuxCodeFilterOptions, aux_code_matches};
-use crate::table::AuxCodeTable;
+use crate::lookup::AuxCodeLookup;
 
 /// 辅助码会话：进入时建立、退出/上屏时销毁，随 `ModeKind::AuxCode` 独占存在。
 ///
@@ -70,7 +70,7 @@ impl AuxCodeSession {
     /// [`aux_code_matches`] 内部 passthrough（原样放行全部候选）。
     pub fn apply(
         &mut self,
-        table: &AuxCodeTable,
+        table: &dyn AuxCodeLookup,
         options: &AuxCodeFilterOptions,
     ) -> Vec<Candidate> {
         self.store

@@ -31,10 +31,12 @@
 
 pub mod filter;
 pub mod loader;
+pub mod lookup;
 pub mod session;
 pub mod table;
 
 pub use filter::{AuxCodeFilterOptions, aux_code_matches, filter_by_aux_code};
-pub use loader::{load_from_file, load_merged};
+pub use loader::{load_from_file, load_merged, read_name};
+pub use lookup::AuxCodeLookup;
 pub use session::AuxCodeSession;
 pub use table::AuxCodeTable;

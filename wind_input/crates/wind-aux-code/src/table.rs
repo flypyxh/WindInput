@@ -57,7 +57,7 @@ pub struct AuxCodeTable {
 
 /// 某字的辅助码列表视图：按需从 arena 切片，取用不额外分配
 #[derive(Clone, Copy)]
-struct CodeListView<'a> {
+pub(crate) struct CodeListView<'a> {
     table: &'a AuxCodeTable,
     /// code_ends 下标区间 [start, end)
     start: usize,
@@ -72,7 +72,7 @@ impl<'a> CodeListView<'a> {
     }
 
     /// 按优先级遍历所有辅助码
-    fn iter(self) -> impl Iterator<Item = &'a str> {
+    pub(crate) fn iter(self) -> impl Iterator<Item = &'a str> {
         (self.start..self.end).map(move |i| self.table.code_at(i))
     }
 }
@@ -232,7 +232,7 @@ impl AuxCodeTable {
     // ------------------------------------------------------------------
 
     /// 二分查找某字的辅助码列表视图；未收录返回 None
-    fn view_codes(&self, ch: char) -> Option<CodeListView<'_>> {
+    pub(crate) fn view_codes(&self, ch: char) -> Option<CodeListView<'_>> {
         let i = self.entries.binary_search_by_key(&ch, |e| e.ch).ok()?;
         let start = if i == 0 {
             0

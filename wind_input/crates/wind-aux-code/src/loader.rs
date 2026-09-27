@@ -50,6 +50,15 @@ pub fn load_merged(paths: &[std::path::PathBuf]) -> AuxCodeTable {
     AuxCodeTable::merge(paths.iter().map(|p| load_from_file(p)))
 }
 
+/// 只读首行取码表名（`# name: 小鹤`）。设置页列可选码表时用：为了一个名字整张读入四万行不值。
+pub fn read_name(path: &std::path::Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(f).read_line(&mut line).ok()?;
+    parse_name_from_first_line(line.trim_start_matches('\u{feff}').trim_end())
+}
+
 /// 从首行提取 `# name: X` / `#name: X`（`#` 后空格可有可无，value 两侧去空白）。
 fn parse_name_from_first_line(first_line: &str) -> Option<String> {
     let rest = first_line.trim_start().strip_prefix('#')?.trim_start();
@@ -230,6 +239,19 @@ mod tests {
         assert_eq!(t.codes_of('李').collect::<Vec<_>>(), vec!["mz"]);
         assert_eq!(t.codes_of('河').collect::<Vec<_>>(), vec!["sk", "dk"]);
         assert_eq!(t.codes_of('樱').collect::<Vec<_>>(), vec!["mn"]);
+    }
+
+    #[test]
+    fn read_name_reads_only_first_line() {
+        let dir = std::env::temp_dir().join(format!("wind-aux-read-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "# name: 小鹤\n# version: 1\n阿=ek\n").unwrap();
+        let b = dir.join("b.txt");
+        std::fs::write(&b, "阿=ek\n# name: 不算\n").unwrap();
+        assert_eq!(read_name(&a).as_deref(), Some("小鹤"));
+        assert_eq!(read_name(&b), None);
+        assert_eq!(read_name(&dir.join("missing.txt")), None);
     }
 
     /// 行尾不挑食：同一份表无论 LF / CRLF / 孤立 CR，解析结果必须一致。

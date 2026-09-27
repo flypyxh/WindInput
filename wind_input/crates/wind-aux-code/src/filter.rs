@@ -25,7 +25,7 @@
 
 use wind_candidate::{Candidate, FilterOutcome};
 
-use crate::table::AuxCodeTable;
+use crate::lookup::AuxCodeLookup;
 
 /// 辅助码过滤选项
 #[derive(Debug, Clone, Default)]
@@ -67,7 +67,7 @@ fn single_char(text: &str) -> Option<char> {
 /// 不做纯汉字判断：含英文/数字/标点的字符同样按表查询——表里有码（如「多啦A梦」里
 /// A 的码是 a）则可参与匹配；表里无码则查表未收录、自然过滤。判断交给查表结果，
 /// 无需显式拦截。
-fn phrase_matches_per_char_prefix(text: &str, table: &AuxCodeTable, aux_input: &str) -> bool {
+fn phrase_matches_per_char_prefix(text: &str, table: &dyn AuxCodeLookup, aux_input: &str) -> bool {
     let mut text_chars = text.chars();
     let mut input_chars = aux_input.chars();
     // 逐字对齐：第 i 个字查第 i 位输入的首码；输入在字前耗尽 = 前缀态（位数不足 N），
@@ -100,7 +100,7 @@ fn phrase_matches_per_char_prefix(text: &str, table: &AuxCodeTable, aux_input: &
 /// - 辅助码输入为空或码表为空时返回 `true`（passthrough 语义）
 pub fn aux_code_matches(
     c: &Candidate,
-    table: &AuxCodeTable,
+    table: &dyn AuxCodeLookup,
     aux_input: &str,
     options: &AuxCodeFilterOptions,
 ) -> bool {
@@ -133,10 +133,10 @@ pub fn aux_code_matches(
 /// 词组候选在按逐字首码匹配裁决前先受 **`max_phrase_len`** 长度上限约束
 /// （字数 > 上限的句子/长组合词直接排除，见 [`AuxCodeFilterOptions`]）。
 ///
-/// 参数 `table` 建议使用 [`AuxCodeTable::merge`] 预构建（单张表也可直接传 from_rows 的结果）。
+/// 参数 `table` 任何 [`AuxCodeLookup`] 实现均可（文件表、方案视图、按序拼接的多来源）。
 pub fn filter_by_aux_code(
     candidates: Vec<Candidate>,
-    table: &AuxCodeTable,
+    table: &dyn AuxCodeLookup,
     aux_input: &str,
     options: &AuxCodeFilterOptions,
 ) -> FilterOutcome {
