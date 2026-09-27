@@ -433,7 +433,9 @@ public:
 
     // direct_commit 顶码：真提交后，余码新组合延迟到触发键 keyup（或兜底定时器）才开。
     // 与 HoldComposition 计时器状态并列、互不干扰。见 top-commit-mode 设计文档 §5。
-    void StashDeferredComposition(const std::wstring& composition, UINT fallbackMs);
+    // triggerVk：触发这次提交的键（空格 / 顶码键），keyup 只认它（见 DeferredCompositionPolicy.h）；0=不限。
+    void StashDeferredComposition(const std::wstring& composition, UINT fallbackMs, UINT triggerVk = 0);
+    UINT DeferredTriggerVk() const { return _deferredTriggerVk; }
     void StartDeferredCompositionIfPending();   // keyup / 兜底定时器 / flush 统一入口
     void CancelDeferredComposition();
     BOOL HasDeferredComposition() const { return !_deferredCompText.empty(); }
@@ -840,6 +842,7 @@ private:
     // direct_commit 顶码：真提交后，余码新组合延迟到触发键 keyup（或兜底定时器）才开。
     // 与 HoldComposition 计时器状态并列、互不干扰。见 top-commit-mode 设计文档 §5。
     std::wstring   _deferredCompText;        // 待重开的余码组合；空=无待重开
+    UINT           _deferredTriggerVk = 0;   // 延迟组合的触发键；0=任意 keyup 均可开
     UINT_PTR       _hDeferredTimer = 0;      // keyup 兜底定时器 id；0=无
     static VOID CALLBACK DeferredTimerProc(HWND, UINT, UINT_PTR idEvent, DWORD);
 

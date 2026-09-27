@@ -7597,12 +7597,13 @@ void CTextService::OnHoldTimerExpired(BOOL nonKeyContext)
 // 延迟组合（direct_commit 顶码）定时器的 thread_local 实例指针。
 static thread_local CTextService* g_deferredTimerInstance = nullptr;
 
-void CTextService::StashDeferredComposition(const std::wstring& composition, UINT fallbackMs)
+void CTextService::StashDeferredComposition(const std::wstring& composition, UINT fallbackMs, UINT triggerVk)
 {
     // 异常保护：若已有待重开的余码，先把旧的落定，避免丢失。
     StartDeferredCompositionIfPending();
 
     _deferredCompText = composition;
+    _deferredTriggerVk = triggerVk;
     g_deferredTimerInstance = this;
     _hDeferredTimer = SetTimer(NULL, 0, fallbackMs, DeferredTimerProc);
 
@@ -7614,8 +7615,8 @@ void CTextService::StashDeferredComposition(const std::wstring& composition, UIN
         return;
     }
 
-    WIND_LOG_DEBUG_FMT(L"StashDeferredComposition: text=%s fallbackMs=%u timer=%llu\n",
-                       composition.c_str(), fallbackMs,
+    WIND_LOG_DEBUG_FMT(L"StashDeferredComposition: text=%s fallbackMs=%u triggerVk=0x%02X timer=%llu\n",
+                       composition.c_str(), fallbackMs, triggerVk,
                        static_cast<unsigned long long>(_hDeferredTimer));
 }
 

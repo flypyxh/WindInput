@@ -555,6 +555,9 @@ private:
     void _CancelPendingToggle(WPARAM wParam, const wchar_t* reason);
     BOOL _SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint8_t eventType);
     BOOL _HandleServiceResponse(); // Returns TRUE if key was handled, FALSE to pass through
+    // 正在处理其应答的 keydown 的 VK（仅 OnKeyDown 主路径置位，其余路径为 0）。
+    // CommitThenDefer 用它登记延迟组合的触发键，见 DeferredCompositionPolicy.h。
+    UINT _responseKeyVk = 0;
 
     // Context state checking (for browser non-editable area detection)
     BOOL _IsContextReadOnly(ITfContext* pContext);

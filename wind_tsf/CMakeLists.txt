@@ -178,6 +178,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME passthrough_note COMMAND passthrough_note_test)
 
+    add_executable(deferred_composition_policy_test tests/deferred_composition_policy_test.cpp)
+    target_include_directories(deferred_composition_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(deferred_composition_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME deferred_composition_policy COMMAND deferred_composition_policy_test)
+
     add_executable(candidate_hotkey_policy_test tests/candidate_hotkey_policy_test.cpp)
     target_include_directories(candidate_hotkey_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

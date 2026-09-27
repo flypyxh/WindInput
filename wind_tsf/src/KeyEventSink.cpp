@@ -1,4 +1,5 @@
 #include "KeyEventSink.h"
+#include "DeferredCompositionPolicy.h"
 #include "TextService.h"
 #include "IPCClient.h"
 #include "HotkeyManager.h"
@@ -1485,7 +1486,10 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // This is simpler and matches Weasel's architecture
     // 先清零重放标志：只有本次响应置的位才算数（见其声明处说明）。
     _pendingReplayToHost = FALSE;
+    // 记下本次应答对应的按键：CommitThenDefer 据此只让**这个键**的 keyup 开延迟组合。
+    _responseKeyVk = (UINT)wParam;
     *pfEaten = _HandleServiceResponse();
+    _responseKeyVk = 0;
 
     // ── 联想态透传：组合已收口，把这一键还给宿主 ────────────────────────────────
     // 覆盖联想态下**全部**落到透传的键（回车/退格各有开关，Del/Home/End/←→/Insert 等
@@ -1631,9 +1635,18 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     if (_pTextService->IsKeyboardDisabled())
         return S_OK;
 
-    // direct_commit 顶码：余码新组合在触发键 keyup 才开（下一个 keyup 即触发键 keyup）。
-    // 先到者开组合，另一处 HasDeferredComposition()==FALSE 后自然 no-op。
-    if (_pTextService->HasDeferredComposition())
+    // direct_commit 顶码：余码新组合在**触发键**的 keyup 才开。先到者开组合，另一处
+    // HasDeferredComposition()==FALSE 后自然 no-op。
+    // ⚠️ 不能是「下一个 keyup」：快打时按下触发键那一刻前一个编码键常还按着，它的 keyup
+    // 紧跟着到，组合在提交后 0ms 就开了——Tabby 里联想占位空格因此并进上屏文本（见
+    // DeferredCompositionPolicy.h）。别的键的 keyup 交给下一次 keydown / 兜底定时器。
+    if (_pTextService->HasDeferredComposition()
+        && !wind::deferredcomp::ShouldOpenOnKeyUp(_pTextService->DeferredTriggerVk(), (uint32_t)wParam))
+    {
+        WIND_LOG_DEBUG_FMT(L"DeferredComposition: keyup vk=0x%02X 不是触发键 0x%02X，暂不开组合\n",
+                           (UINT)wParam, _pTextService->DeferredTriggerVk());
+    }
+    else if (_pTextService->HasDeferredComposition())
     {
         _pTextService->StartDeferredCompositionIfPending();
         _isComposing = TRUE;
@@ -1688,9 +1701,18 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
         return S_OK;
     }
 
-    // direct_commit 顶码：余码新组合在触发键 keyup 才开（下一个 keyup 即触发键 keyup）。
-    // 先到者开组合，另一处 HasDeferredComposition()==FALSE 后自然 no-op。
-    if (_pTextService->HasDeferredComposition())
+    // direct_commit 顶码：余码新组合在**触发键**的 keyup 才开。先到者开组合，另一处
+    // HasDeferredComposition()==FALSE 后自然 no-op。
+    // ⚠️ 不能是「下一个 keyup」：快打时按下触发键那一刻前一个编码键常还按着，它的 keyup
+    // 紧跟着到，组合在提交后 0ms 就开了——Tabby 里联想占位空格因此并进上屏文本（见
+    // DeferredCompositionPolicy.h）。别的键的 keyup 交给下一次 keydown / 兜底定时器。
+    if (_pTextService->HasDeferredComposition()
+        && !wind::deferredcomp::ShouldOpenOnKeyUp(_pTextService->DeferredTriggerVk(), (uint32_t)wParam))
+    {
+        WIND_LOG_DEBUG_FMT(L"DeferredComposition: keyup vk=0x%02X 不是触发键 0x%02X，暂不开组合\n",
+                           (UINT)wParam, _pTextService->DeferredTriggerVk());
+    }
+    else if (_pTextService->HasDeferredComposition())
     {
         _pTextService->StartDeferredCompositionIfPending();
         _isComposing = TRUE;
@@ -2523,7 +2545,8 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             _isComposing = FALSE;
             _hasCandidates = FALSE;
             _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
-            _pTextService->StashDeferredComposition(response.newComposition, response.holdTimeoutMs);
+            _pTextService->StashDeferredComposition(response.newComposition, response.holdTimeoutMs,
+                                                    _responseKeyVk);
         }
         return TRUE;
 
