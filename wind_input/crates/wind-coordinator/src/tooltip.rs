@@ -522,6 +522,38 @@ mod tests {
         assert!(title_only > 0);
     }
 
+    /// ★ 已确认的唯一标题差异（2026-09-27 用户确认，设计 §8.3）：拆字、拼音同开而某一边
+    /// 整段为空时，旧实现不合并、保留那一边的标题；合并段标题恒为「拆字 / 拼音」。
+    /// 两种退化各断言一次：标题按新口径，**内容行仍须与旧实现逐字节一致**。
+    #[test]
+    fn merged_section_degenerate_cases_differ_only_in_title() {
+        let rl = fixture_reverse();
+        let f = LegacyTooltipFlags {
+            code: false,
+            chaizi: true,
+            ..Default::default()
+        };
+        let sections = tooltip_sections_from_legacy(f);
+        for (disp, old_title, body) in [
+            // 显示的字全都没有拆字（当前方案没配拆字库时的常态）→ 旧标题 [拼音]
+            ("你", "[拼音]", "你：nǐ"),
+            // 显示的字全都没有读音 → 旧标题 [拆字]，且行尾不留 `\t`
+            ("㐀", "[拆字]", "㐀：丿一 [tgd]"),
+        ] {
+            let c = Cand {
+                disp,
+                word_code: None,
+                code_source: None,
+                debug: "",
+            };
+            assert_eq!(legacy(&rl, f, &c), format!("{old_title}\n{body}"));
+            assert_eq!(
+                render_new(&rl, &sections, &c),
+                format!("[拆字 / 拼音]\n{body}")
+            );
+        }
+    }
+
     /// 行序专项（用户明确要求不变）：「你好」里「你」无拆字，旧实现先出「好」再补「你」。
     #[test]
     fn merged_section_keeps_legacy_row_order() {
