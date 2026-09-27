@@ -247,6 +247,23 @@ impl PushServer {
         self.clients.clone()
     }
 
+    /// 挂一个内存客户端并设为活动客户端，返回它收到的全部推送（**测试接缝**）。
+    ///
+    /// 给下游 crate 的测试用（`#[cfg(test)]` 跨不了 crate）：协调器里经 push 投递的
+    /// 上屏（鼠标点选、菜单上屏）没有按键应答可断言，只能在这里截获实际编出的字节。
+    /// 生产代码不调用；它不开管道、不起线程，只往客户端表里加一项。
+    #[doc(hidden)]
+    pub fn attach_capture_client(&self, token: u64) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.clients.lock().unwrap().push(PushClient {
+            token,
+            tx,
+            hooked: true,
+        });
+        self.active_token.store(token, Ordering::Relaxed);
+        rx
+    }
+
     /// 向所有连接客户端广播消息（用于状态/激活同步，幂等无副作用）
     pub fn push_to_active(&self, data: &[u8]) {
         let clients = self.clients.lock().unwrap();

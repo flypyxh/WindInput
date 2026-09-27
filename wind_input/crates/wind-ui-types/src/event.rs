@@ -84,8 +84,21 @@ pub enum UiEvent {
     CandidateDoubleClick,
     /// 右键状态提示气泡请求弹出菜单（屏幕坐标）
     RequestStatusMenu { x: i32, y: i32 },
-    /// 右键悬停提示（编码反查气泡）请求弹出菜单（屏幕坐标）
-    RequestTooltipMenu { x: i32, y: i32 },
+    /// 右键悬停提示请求弹出菜单。
+    ///
+    /// - `x`/`y`：屏幕坐标（菜单锚点）；
+    /// - `candidate`：气泡属于当前页的第几个候选（页内下标）。右键时鼠标已在气泡上、
+    ///   不在候选上，协调器的悬停目标此刻未必还指着它，故由显示气泡的一方带上；
+    /// - `hit`：点中的段 / 原始行（见 `TooltipDoc::hit_at_line`）；点在内边距为 `None`；
+    /// - `doc_fingerprint`：UI 当前所画气泡的 `TooltipDoc::fingerprint`。`hit` 是按 UI 所见
+    ///   换算的，协调器缓存若已换成另一份结构，段下标就对不上——两边指纹不等时不给按段操作。
+    RequestTooltipMenu {
+        x: i32,
+        y: i32,
+        candidate: i32,
+        hit: Option<crate::TooltipHit>,
+        doc_fingerprint: u64,
+    },
     /// 输入诊断 HUD 上右键：请求其上下文菜单（复制 / 显示分类 / 停止刷新 / 置顶）。
     RequestInputDiagMenu { x: i32, y: i32 },
     /// 系统「浅色/深色模式」已切换（Win32 `WM_SETTINGCHANGE`/`ImmersiveColorSet`）。

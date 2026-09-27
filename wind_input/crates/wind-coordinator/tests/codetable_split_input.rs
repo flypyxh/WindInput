@@ -50,10 +50,19 @@ fn press(coord: &Coordinator, code: &str) {
     }
 }
 
-/// 每个用例独立的 store 与 override 目录（并发写同一文件会撕裂）。
+/// 用例结束时删掉临时目录（Linux 上删已打开的 redb 文件无妨）。
+struct TempRoot(PathBuf);
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 每个用例独立的 store 与 override 目录（并发写同一文件会撕裂）；目录名带 pid，
+/// 并发会话 / 并行的两次 `cargo test` 共用 temp 时不互相删库。
 /// `extra` 追加到 `[engine.codetable]` 段。
-fn coord_with(tag: &str, extra: &str) -> (Arc<Coordinator>, Arc<Store>) {
-    let root = std::env::temp_dir().join(format!("wind_split_e2e_{tag}"));
+fn coord_with(tag: &str, extra: &str) -> (Arc<Coordinator>, Arc<Store>, TempRoot) {
+    let root = std::env::temp_dir().join(format!("wind_split_e2e_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let ov = root.join("overrides");
     std::fs::create_dir_all(&ov).unwrap();
@@ -74,7 +83,7 @@ fn coord_with(tag: &str, extra: &str) -> (Arc<Coordinator>, Arc<Store>) {
         store.clone(),
         Some(ov),
     );
-    (coord, store)
+    (coord, store, TempRoot(root))
 }
 
 const INPUT: &str = "aaab";
@@ -85,7 +94,7 @@ fn alt_candidates_show_back_segment_but_commit_whole() {
         eprintln!("跳过：缺 build_dev 词库");
         return;
     }
-    let (coord, _store) = coord_with("alt", "");
+    let (coord, _store, _dir) = coord_with("alt", "");
     press(&coord, INPUT);
     let texts = coord.debug_page_texts();
     let shown = coord.debug_page_display_texts();
@@ -114,14 +123,14 @@ fn full_display_keeps_whole_text() {
         eprintln!("跳过：缺 build_dev 词库");
         return;
     }
-    let (coord, _store) = coord_with("full", "split_alt_display = \"full\"\n");
+    let (coord, _store, _dir) = coord_with("full", "split_alt_display = \"full\"\n");
     press(&coord, INPUT);
     let texts = coord.debug_page_texts();
     assert!(texts.len() >= 2, "前提：应有 ≥2 条组合，实际 {texts:?}");
     assert_eq!(coord.debug_page_display_texts(), texts);
     // ★ 前提对照：同一现场在默认档下**确实**分叉——否则 `aaab` 哪天不再走切分（词库加了
     // 条目），本条会因为「根本没有组合候选」而假绿。
-    let (back, _store) = coord_with("full_ctl", "");
+    let (back, _store2, _dir2) = coord_with("full_ctl", "");
     press(&back, INPUT);
     assert_ne!(
         back.debug_page_display_texts()[1],
@@ -136,7 +145,7 @@ fn deleted_segment_word_is_not_composed() {
         eprintln!("跳过：缺 build_dev 词库");
         return;
     }
-    let (coord, store) = coord_with("del", "");
+    let (coord, store, _dir) = coord_with("del", "");
     press(&coord, INPUT);
     let before = coord.debug_page_texts();
     let shown = coord.debug_page_display_texts();
@@ -162,7 +171,7 @@ fn pinned_segment_word_leads_composition() {
         eprintln!("跳过：缺 build_dev 词库");
         return;
     }
-    let (coord, store) = coord_with("pin", "");
+    let (coord, store, _dir) = coord_with("pin", "");
     press(&coord, INPUT);
     let before = coord.debug_page_texts();
     let shown = coord.debug_page_display_texts();
@@ -193,7 +202,7 @@ fn select_char_on_alt_uses_shown_back_segment() {
     }
     const VK_COMMA: u32 = 0xBC;
     const VK_DOWN: u32 = 0x28;
-    let (coord, _store) = coord_with("selchar", "");
+    let (coord, _store, _dir) = coord_with("selchar", "");
     press(&coord, INPUT);
     let texts = coord.debug_page_texts();
     let shown = coord.debug_page_display_texts();
@@ -206,4 +215,36 @@ fn select_char_on_alt_uses_shown_back_segment() {
         KeyAction::InsertText { text, .. } => assert_eq!(text, format!("{front}{first_shown}")),
         other => panic!("以词定字应上屏，实际 {other:?}"),
     }
+}
+
+/// 前段多取时，前段**非首选**的行被顶到首位（这里用整串码上的置顶；词频重排同形）：
+/// 首条展示的是另一个前段，其余行若仍只显示后段，「① 戒节 ② 节」的 ② 读起来是「戒节」、
+/// 上屏却是「式节」⇒ 此时全部显示整串。
+#[test]
+fn other_front_on_top_shows_every_row_whole() {
+    if !has_data() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let (coord, store, _dir) = coord_with("front2", "split_front_candidates = 2\n");
+    press(&coord, INPUT);
+    let before = coord.debug_page_texts();
+    let shown = coord.debug_page_display_texts();
+    // 前段非首选的行：显示与整串相同的那几条里，排在首条之后的第一条。
+    let other = (1..before.len())
+        .find(|&i| shown[i] == before[i])
+        .map(|i| before[i].clone())
+        .expect("前提：前段多取时应有前段非首选的行（整串显示）");
+    assert_ne!(shown[1], before[1], "前提：前段首选行的次选只显示后段");
+    store.pin_shadow("wubi86", INPUT, &other, None, 0).unwrap();
+
+    coord.handle_key_event(&key(0x1B));
+    press(&coord, INPUT);
+    let after = coord.debug_page_texts();
+    assert_eq!(after[0], other, "前提：置顶生效");
+    assert_eq!(
+        coord.debug_page_display_texts(),
+        after,
+        "首条是另一个前段时，每一行都要显示整串"
+    );
 }

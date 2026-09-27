@@ -690,8 +690,7 @@ impl UiManager {
                             );
                         }
                     }
-                    UiCommand::CopyTooltipText => {
-                        let text = candidate_window.tooltip_text().to_string();
+                    UiCommand::CopyTooltipText(text) => {
                         let (msg, kind) = if !text.is_empty() {
                             crate::popup_menu::set_clipboard_text(&text);
                             ("提示内容已复制".to_string(), ToastKind::Success)
@@ -1509,6 +1508,10 @@ mod menu_id_tests {
             MenuCmd::StatusToggleShowOnFocus,
             MenuCmd::TooltipCopy,
             MenuCmd::TooltipScreenshot,
+            MenuCmd::TooltipCopySection,
+            MenuCmd::TooltipCommitSection,
+            MenuCmd::TooltipCopyLine,
+            MenuCmd::TooltipCommitLine,
             MenuCmd::InputDiagCopy,
             MenuCmd::InputDiagToggleFreeze,
             MenuCmd::InputDiagToggleTopmost,

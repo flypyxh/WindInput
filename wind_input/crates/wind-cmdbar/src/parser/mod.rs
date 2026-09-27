@@ -7,4 +7,4 @@ pub mod lexer;
 pub mod parser;
 
 pub use lexer::{Lexer, RawStringPart, Token, TokenKind};
-pub use parser::{is_cmdbar_grammar, parse};
+pub use parser::{contains_marker_call, is_cmdbar_grammar, parse};

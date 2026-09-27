@@ -614,12 +614,11 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.theme.style", Str),
     f("ui.mode_indicator.style", Enum(&["short", "full", "none"])),
     f("ui.tooltip.delay", Int),
-    f("ui.tooltip.code_enabled", Bool),
-    f("ui.tooltip.pinyin_enabled", Bool),
-    f("ui.tooltip.pinyin_heteronyms", Bool),
-    f("ui.tooltip.pinyin_max_readings", Int),
-    f("ui.tooltip.chaizi_enabled", Bool),
-    f("ui.tooltip.debug_enabled", Bool),
+    f("ui.tooltip.max_chars", Int),
+    f("ui.tooltip.wrap_width", Int),
+    // 悬停提示段列表：结构体数组，整体作不透明叶子（同 ui.langbar.badges）。
+    // 段字段（label/template/each/promote/inline/enabled）是条目属性，不单独登记。
+    f("ui.tooltip.sections", StructList),
     f("ui.status.enabled", Bool),
     f("ui.status.duration", Int),
     f("ui.status.display_mode", Enum(&["temp", "always"])),
@@ -1280,6 +1279,47 @@ mod tests {
                 "出厂 items 含未登记条目 {k:?}"
             );
         }
+    }
+
+    /// L1↔L2 同源：`ui.tooltip.sections` 的出厂段列表在 Rust 默认值与 `data/config.toml` 里
+    /// 必须逐段、逐字段相同（`config-design-rules.md` §R4）。
+    ///
+    /// 数组在预置文件里是**整体覆盖**：L2 少写一段 = 成品里没有那一段，改了模板而 L1 没跟 =
+    /// 「恢复默认」与新装用户看到的不是同一份气泡。两种都不会有别的测试报出来。
+    #[test]
+    fn tooltip_sections_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.tooltip.sections;
+        let l2: Vec<crate::config::TooltipSection> = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("tooltip"))
+            .and_then(|t| t.get("sections"))
+            .cloned()
+            .expect("data/config.toml 缺少 ui.tooltip.sections")
+            .try_into()
+            .expect("ui.tooltip.sections 须能反序列化");
+        assert_eq!(
+            l1, l2,
+            "ui.tooltip.sections 的 L1 默认值与 L2 出厂文件不一致"
+        );
+    }
+
+    /// L1↔L2 同源：气泡的单行上限与折行宽度（取值守门在 config.rs `test_tooltip_defaults`，
+    /// 行为守门在协调器 `tooltip` 模块的出厂配置用例）。
+    #[test]
+    fn tooltip_limits_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.tooltip;
+        let tip = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("tooltip"))
+            .cloned()
+            .expect("data/config.toml 缺少 [ui.tooltip]");
+        let int = |k: &str| {
+            tip.get(k)
+                .and_then(toml::Value::as_integer)
+                .unwrap_or_else(|| panic!("data/config.toml 缺少 ui.tooltip.{k}"))
+        };
+        assert_eq!(int("max_chars"), l1.max_chars as i64);
+        assert_eq!(int("wrap_width"), l1.wrap_width as i64);
     }
 
     /// 解析仓库内系统预置 `data/config.toml`。

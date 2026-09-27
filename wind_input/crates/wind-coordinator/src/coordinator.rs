@@ -1942,6 +1942,10 @@ pub struct Coordinator {
     /// tooltip 只有几种取值，而状态推送远比它频繁（全半角、标点、方案切换都会推状态却
     /// 不改 tooltip）。不去重的话每次状态变化都白发一条 IPC 给所有宿主。
     pub(crate) last_langbar_tooltip: Mutex<String>,
+    /// 当前页每个候选的悬停提示（含原始行），每次候选页组装时整体覆盖。
+    pub(crate) tooltip_page: Mutex<Vec<crate::handle_tooltip::TooltipPageEntry>>,
+    /// 悬停提示右键菜单弹出时的目标快照；菜单动作执行前拿它核对候选有没有变。
+    pub(crate) tooltip_menu_target: Mutex<Option<crate::handle_tooltip::TooltipMenuTarget>>,
     /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
@@ -1963,6 +1967,53 @@ pub struct Coordinator {
 pub(crate) struct ChaiziAssets {
     pub(crate) db: Option<std::path::PathBuf>,
     pub(crate) font: Option<(String, String)>,
+}
+
+/// 字根字体从 `sent` 变到 `want` 时要下发的 `(路径, 家族名)`；不用发时 `None`。
+///
+/// 变为「没有」时下发**空路径**＝撤掉，而不是什么都不发：渲染端的私用区字体位只有一个，
+/// 且压过方案级 `[candidate] font_family`。以前只停发不撤，五笔（黑体字根）切到蒙古文
+/// 方案后，蒙文的私用区码位仍被切到字根字体，画成字根或空白。
+fn chaizi_font_to_send(
+    sent: &Option<(String, String)>,
+    want: &Option<(String, String)>,
+) -> Option<(String, String)> {
+    if sent == want {
+        return None;
+    }
+    Some(want.clone().unwrap_or_default())
+}
+
+#[cfg(test)]
+mod chaizi_font_to_send_tests {
+    use super::chaizi_font_to_send;
+
+    fn font(p: &str) -> Option<(String, String)> {
+        Some((p.to_string(), "F".to_string()))
+    }
+
+    #[test]
+    fn switching_to_a_schema_without_chaizi_font_clears_it() {
+        assert_eq!(
+            chaizi_font_to_send(&font("wubi86/HeiTiZiGen.ttf"), &None),
+            Some((String::new(), String::new()))
+        );
+    }
+
+    #[test]
+    fn a_new_font_is_sent() {
+        assert_eq!(chaizi_font_to_send(&None, &font("a.ttf")), font("a.ttf"));
+        assert_eq!(
+            chaizi_font_to_send(&font("a.ttf"), &font("b.ttf")),
+            font("b.ttf")
+        );
+    }
+
+    #[test]
+    fn unchanged_sends_nothing() {
+        assert_eq!(chaizi_font_to_send(&None, &None), None);
+        assert_eq!(chaizi_font_to_send(&font("a.ttf"), &font("a.ttf")), None);
+    }
 }
 
 /// 一次候选刷新后的输入结局（码表全码/空码策略，仅正向输入字母时消费）。
@@ -2653,6 +2704,8 @@ impl Coordinator {
             last_input_diag: Mutex::new(Default::default()),
             input_block_gate: Mutex::new(InputBlockGate::default()),
             last_langbar_tooltip: Mutex::new(String::new()),
+            tooltip_page: Mutex::new(Vec::new()),
+            tooltip_menu_target: Mutex::new(None),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
             password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -3676,21 +3729,21 @@ impl Coordinator {
                 .reload_chaizi(new_db.as_deref());
             assets.db = new_db;
         }
-        if new_font != assets.font {
-            // 变为 None 时仅不再重发（字体集无撤销接口；旧字体仅影响 PUA 段渲染，无害）。
-            if let Some((path, family)) = &new_font {
+        if let Some((path, family)) = chaizi_font_to_send(&assets.font, &new_font) {
+            if path.is_empty() {
+                info!("撤下字根字体（当前方案无可用的 [engine.chaizi] 字体）");
+            } else {
                 // 打成 info 而不是 debug：「字根字体到底下发过没有」是这条链路上唯一能把
                 // 「没解析到」「解析到但渲染端加载失败」「一切正常」三态分开的观测点，
                 // 而渲染端的失败告警在另一个日志域里（wind-ui）。缺了这一行，日志上
                 // 「没有任何字根字体相关记录」既可能是没配、也可能是没走到这里。
                 info!("下发字根字体: {path}（家族名 {family}）");
-                let _ = self.ui_tx.send(UiCommand::SetTooltipChaiziFont {
-                    path: path.clone(),
-                    family: family.clone(),
-                });
             }
-            assets.font = new_font;
+            let _ = self
+                .ui_tx
+                .send(UiCommand::SetTooltipChaiziFont { path, family });
         }
+        assets.font = new_font;
     }
 
     /// 同步注释词库（`[[ui.comment_dicts]]`）到反查表：解析路径列表，与上次生效的比对，
@@ -4370,7 +4423,11 @@ impl Coordinator {
         let index_ready = self.engine_mgr.reverse_index_if_ready(schema_id).is_some();
         let single_char_ready =
             !with_single_char || self.engine_mgr.single_char_codes_ready(schema_id);
+        // 已被 build_guard 放弃的方案不再起线程：构建线程结束时会通知重绘，重绘又回到这里，
+        // 不挡住就是「每次重绘起一个线程」的无限循环。造词缺了反查索引也做不了查重，
+        // 故单字全码表一并不建。
         if (index_ready && single_char_ready)
+            || self.engine_mgr.reverse_index_skipped(schema_id)
             || self.engine_mgr.is_building_reverse_index(schema_id)
         {
             return;
@@ -6076,7 +6133,7 @@ impl Coordinator {
         // 悬停提示/候选微调配置（热重载快照）
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
-        let tip_cfg = &rt.config.ui.tooltip;
+        let tip = &rt.tooltip;
         // 命令直通车候选前缀标注（features.cmdbar.candidate_prefix）：仅命令候选(is_command)显示。
         let cmd_prefix = rt.config.input.cmdbar.candidate_prefix.as_str();
         // 检索范围放宽（自动补充）候选的前缀标注，见 docs/design/smart-filter-scope-relax.md
@@ -6089,15 +6146,9 @@ impl Coordinator {
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
         let force_hint = Self::forces_code_hint(state);
         let hint_source = self.comment_hint_source(state);
-        let tip_opts = wind_reverse::TooltipOptions {
-            code: tip_cfg.code_enabled,
-            pinyin: tip_cfg.pinyin_enabled,
-            heteronyms: tip_cfg.pinyin_heteronyms,
-            max_readings: tip_cfg.pinyin_max_readings,
-            chaizi: tip_cfg.chaizi_enabled,
-        };
-        // 调试提示上下文：仅开启调试段时解析一次（mixed 归属 / 方案 id），循环内按候选来源选用。
-        let dbg_ctx = if tip_cfg.debug_enabled {
+        // 调试提示上下文：仅有段引用 `${debug}` 时解析一次（mixed 归属 / 方案 id），
+        // 循环内按候选来源选用。
+        let dbg_ctx = if tip.references("debug") {
             // 归属与读写两端同源（`effective_data_schema`）：特殊模式下若这里仍按 active 解析，
             // 调试段显示的计数与排序实际用的不是同一个 key——排查时会被它带偏，
             // 而这正是最难察觉的一种不一致。
@@ -6136,13 +6187,13 @@ impl Coordinator {
         // 「哪个候选算哪个成员」的判据就是第二个真相源，漂移后的表现是「词频记进 A 桶、
         // 注释查的是 B 桶」这类只在多成员配置下才现形的错配。
         let mix_comment_scope = matches!(state.active, Some(ModeKind::Mix(_)));
-        // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
-        // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_display），
-        // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
-        // 临时拼音/快捷输入反查模式）标题带来源方案名：[编码(五笔)]。
-        // 含用户层：自己造的词也显示编码（text-code-lookup.md）。
-        let code_schema = tip_cfg
-            .code_enabled
+        // `${word_code}` / `${code_source}` 的来源方案（循环外解析一次，没有段引用就不碰）：
+        // 码表方案=自身全部编码（码长升序 a/ab/abc）、混输=其主码表成员、拼音=全局主码表。
+        // 编码按词查方案词库反查索引（word_codes_display），不按取码规则生成；含用户层：
+        // 自己造的词也显示编码（text-code-lookup.md）。候选并非用该编码方案
+        // 直接输入时（来源方案≠活跃方案，或处于临时拼音/快捷输入反查模式）`${code_source}`
+        // 才有值，出厂段名据此显示为 [编码(五笔)]。
+        let code_schema = (tip.references("word_code") || tip.references("code_source"))
             .then(|| self.engine_mgr.code_source_schema())
             .filter(|s| !s.is_empty());
         // 反查索引没就绪就**在后台建**，本次先不显示编码段（绝不在此等）。
@@ -6162,6 +6213,9 @@ impl Coordinator {
                 }
             })
         });
+        // 本页每个候选的气泡原文，右键菜单按段 / 按行复制、上屏时从这里取（见 handle_tooltip）。
+        let mut tip_page: Vec<crate::handle_tooltip::TooltipPageEntry> =
+            Vec::with_capacity(end.saturating_sub(start));
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -6170,11 +6224,13 @@ impl Coordinator {
                 // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
                 // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
                 let disp = cand_cfg.truncate_display(&full);
-                // 反查提示按截断后文本生成：超长候选（如长短语）逐字反查会撑爆气泡且显示不全，
-                // 只提示实际显示出的字（… 为非 CJK，tooltip_for 自动滤除，不影响反查内容）。
-                // [编码] 段按候选**完整原文**查词库（截断/繁化文本词库里没有；查不到=None 不显示）。
+                // 悬停提示按段列表渲染（见 `crate::tooltip`）。逐字段遍历**截断后**的显示文本、
+                // 且不含截断追加的 `…`：超长候选（如长短语）逐字展开会撑爆气泡，只提示实际
+                // 显示出的字；被截掉的部分由「完整原文」段（`${full_text}`）整段给出。
+                // `${word_code}` 则按候选**完整原文**查词库（截断/繁化文本词库里没有；
+                // 查不到=空，段随之消失）。
                 //
-                // ⚠️ 曾改成按显示文本（`full`）查，动机是「气泡三段应同属一个域」——已回退。
+                // ⚠️ 曾改成按显示文本（`full`）查编码，动机是「气泡三段应同属一个域」——已回退。
                 // 拼音段/拆字段吃显示文本是**它们**的事（拆字库覆盖繁体字，查得到），而编码段
                 // 回答的是「这个候选怎么打出来」，用户实际敲的就是内部文本那个码；改成查繁化
                 // 文本只会让它查不到而整段消失，是拿一个**已经正确**的段去换取形式上的一致。
@@ -6184,18 +6240,50 @@ impl Coordinator {
                 let word_code = code_schema
                     .as_deref()
                     .and_then(|sid| self.engine_mgr.word_codes_display(sid, &c.text))
-                    .filter(|s| !s.is_empty());
-                let mut tooltip = reverse.tooltip_for(
-                    &disp,
-                    &tip_opts,
-                    word_code.as_deref(),
-                    code_source_name.as_deref(),
-                );
-                // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
-                // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
-                // `ui.tooltip.*` 三段（编码/拼音/拆字），塞了会与之重复。
+                    .unwrap_or_default();
                 let dict_schema =
                     self.comment_dict_scope(state, c, mix_comment_scope, &comment_dict_schema);
+                // 调试正文要点查 redb 词频，按需算且一个候选只算一次。
+                let debug_body = std::cell::OnceCell::new();
+                let cand_eval = |name: &str, arg: Option<&str>| -> Option<String> {
+                    Some(match name {
+                        "word_code" => word_code.clone(),
+                        "code_source" => code_source_name.clone().unwrap_or_default(),
+                        "debug" => dbg_ctx
+                            .as_ref()
+                            .map(|ctx| {
+                                debug_body
+                                    .get_or_init(|| {
+                                        self.debug_tooltip_body(c, &state.input_buffer, ctx)
+                                    })
+                                    .clone()
+                            })
+                            .unwrap_or_default(),
+                        _ => {
+                            return self.eval_var(
+                                name,
+                                arg,
+                                c,
+                                &reverse,
+                                hint_source,
+                                &dict_schema,
+                            );
+                        }
+                    })
+                };
+                let char_eval = |ch: char, name: &str, arg: Option<&str>| {
+                    crate::tooltip::char_var(name, arg, ch, &reverse)
+                        .or_else(|| self.eval_text_var(name, arg, &ch.to_string(), &reverse))
+                };
+                let rendered = tip.render(&disp, &full, &cand_eval, &char_eval);
+                let tooltip = rendered.doc.clone();
+                tip_page.push(crate::handle_tooltip::TooltipPageEntry {
+                    text: c.text.clone(),
+                    rendered,
+                });
+                // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
+                // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
+                // `ui.tooltip.sections`，塞了会与之重复。
                 let comment = self.comment_for(
                     c,
                     comment_tpl,
@@ -6204,15 +6292,6 @@ impl Coordinator {
                     hint_source,
                     &dict_schema,
                 );
-                // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
-                // （tooltip 各 provider 全关即真正为空，不显示气泡）。
-                if let Some(ctx) = &dbg_ctx {
-                    let dbg = self.debug_tooltip_section(c, &state.input_buffer, ctx);
-                    if !tooltip.is_empty() {
-                        tooltip.push('\n');
-                    }
-                    tooltip.push_str(&dbg);
-                }
                 CandidateItem {
                     // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
                     // 检索范围放宽补进来的候选同理加标注（`input.scope_relax.prefix`），让用户
@@ -6236,6 +6315,7 @@ impl Coordinator {
                 }
             })
             .collect();
+        *self.tooltip_page.lock().unwrap_or_else(|e| e.into_inner()) = tip_page;
         // 翻页信息改为结构化字段传给候选窗（窗口内渲染独立的页码指示）
         let total_pages = self.total_pages(state);
         let selected = state.selected_index.min(items.len().saturating_sub(1));
@@ -6505,7 +6585,13 @@ impl Coordinator {
             UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),
             UiEvent::CandidateDoubleClick => self.on_candidate_double_click(),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
-            UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
+            UiEvent::RequestTooltipMenu {
+                x,
+                y,
+                candidate,
+                hit,
+                doc_fingerprint,
+            } => self.show_tooltip_menu(x, y, candidate, hit, doc_fingerprint),
             UiEvent::RequestInputDiagMenu { x, y } => self.show_input_diag_menu(x, y),
             UiEvent::SystemThemeChanged => self.on_system_theme_changed(),
             UiEvent::CandidateFlipped(v) => self
@@ -6667,6 +6753,8 @@ impl Coordinator {
     /// 是最后一道防线，接的是那两处都够不着的入口。
     /// 启动期归一（见 [`Self::normalize_conversion_exclusivity`]）：读自己的运行时配置，
     /// 不像 reload 那样有一份现成的 `new_cfg`。
+    // 唯一调用方是 construct::new（desktop-ui 特性）；wind-webdata 等不带该特性的依赖方编译时它无人调用。
+    #[cfg_attr(not(feature = "desktop-ui"), allow(dead_code))]
     pub(crate) fn normalize_conversion_exclusivity_on_start(&self) {
         if self.rt().config.input.has_conversion_conflict() {
             warn!("启动时 input.s2t 与 input.t2s 同时开启，已关闭 input.t2s（两个方向互斥）");
@@ -8609,14 +8697,9 @@ impl Coordinator {
             .unwrap_or(0)
     }
 
-    /// 候选调试信息段：`[调试]` 独占一行 + 来源行 + 合并的（编码/权重/序/词频/标记）行。
-    /// 保持约 3 行；来源区分系统/用户短语、用户/临时词库、码表(方案)、拼音、英文。
-    fn debug_tooltip_section(
-        &self,
-        c: &Candidate,
-        input_code: &str,
-        ctx: &DebugSchemaCtx,
-    ) -> String {
+    /// 候选调试信息（悬停提示 `${debug}` 的值）：来源行 + 合并的（编码/权重/序/词频/标记）行。
+    /// 来源区分系统/用户短语、用户/临时词库、码表(方案)、拼音、英文。`[调试]` 标题归段名。
+    fn debug_tooltip_body(&self, c: &Candidate, input_code: &str, ctx: &DebugSchemaCtx) -> String {
         let source = self.debug_source_label(c, ctx);
         let count = self.debug_freq_count(c, input_code, ctx);
         let mut parts: Vec<String> = Vec::new();
@@ -8635,7 +8718,7 @@ impl Coordinator {
         if c.has_shadow {
             parts.push("✎已调整".to_string());
         }
-        format!("[调试]\n来源: {source}\n{}", parts.join(" · "))
+        format!("来源: {source}\n{}", parts.join(" · "))
     }
 }
 

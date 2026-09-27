@@ -167,7 +167,16 @@ impl TextRenderer {
 
     /// 加载拆字字根字体（TTF）作级联回退；失败返回 Err（不影响普通文本渲染）。
     /// `_family` 为 DWrite 家族名（Windows 侧用），CoreText 直接从字体文件字节建描述符，故忽略。
+    /// `path` 为空 = 撤掉字根字体，不再挂级联回退。
+    ///
+    /// 先撤旧的再加载：加载失败的结局是「没有字根字体」而不是沿用上一个方案的（理由见
+    /// `dwrite.rs` 的同名方法）。
     pub fn set_chaizi_font(&mut self, path: &str, _family: &str) -> Result<(), String> {
+        self.chaizi = None;
+        self.fonts.borrow_mut().clear();
+        if path.is_empty() {
+            return Ok(());
+        }
         let bytes = std::fs::read(path).map_err(|e| format!("read chaizi font {path}: {e}"))?;
         let desc = core_text::font_manager::create_font_descriptor(&bytes)
             .map_err(|_| format!("create_font_descriptor failed for {path}"))?;

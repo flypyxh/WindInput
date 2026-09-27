@@ -320,6 +320,8 @@ impl Coordinator {
     ///
     /// ⚠️ 只做**过期**清理，不做容量淘汰——容量上限是按方案定义的（`evict_drafts`
     /// 的语义是「这个方案保留 N 条」），全表跨方案套同一个上限会把小方案连坐清空。
+    // 唯一调用方是 construct::new（desktop-ui 特性）；wind-webdata 等不带该特性的依赖方编译时它无人调用。
+    #[cfg_attr(not(feature = "desktop-ui"), allow(dead_code))]
     pub(crate) fn purge_drafts_on_start(&self) {
         let Some(store) = &self.store else { return };
         let ttl = self.draft_ttl_secs();

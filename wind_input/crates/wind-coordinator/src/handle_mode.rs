@@ -946,7 +946,7 @@ impl Coordinator {
     /// 显示就会与上屏对不上。转换改变了字数（罕见）时退回后段单独转。
     pub(crate) fn cand_display_text(&self, state: &State, c: &Candidate) -> String {
         let full = self.cand_convert_text(state, c);
-        if c.display_text.is_empty() || Self::is_first_split(state, c) {
+        if !Self::split_back_only(state, c) {
             return full;
         }
         let tail = c.display_text.chars().count();
@@ -961,8 +961,7 @@ impl Coordinator {
     /// 逆切分次选的 `(被隐藏的前段, 所见的后段)`；不是只显示后段的候选 ⇒ `("", text)`。
     /// 内部文本域（未做简繁），供以词定字按所见取字。`c` 须借自 `state.candidates`。
     pub(crate) fn split_front_and_shown(&self, state: &State, c: &Candidate) -> (String, String) {
-        if !c.display_text.is_empty()
-            && !Self::is_first_split(state, c)
+        if Self::split_back_only(state, c)
             && let Some(front) = c.text.strip_suffix(c.display_text.as_str())
         {
             return (front.to_string(), c.display_text.clone());
@@ -970,13 +969,22 @@ impl Coordinator {
         (String::new(), c.text.clone())
     }
 
-    /// `c` 是不是列表里**第一条**逆切分组合候选（组合区：显示整串）。
-    fn is_first_split(state: &State, c: &Candidate) -> bool {
-        state
-            .candidates
-            .iter()
-            .find(|x| x.is_split_composed)
-            .is_some_and(|x| std::ptr::eq(x, c))
+    /// `c` 该不该**只显示后段**：它带后段文本，且列表里**第一条**组合（组合区，显示整串）
+    /// 是另一条、并且也带后段文本。
+    ///
+    /// 第二个条件不能省：只有前段首选那一行带后段文本，所以「首条带后段文本」等价于「首条的
+    /// 前段就是 `c` 的前段」。前段多取（`split_front_candidates` > 1）时，词频重排或整串码上的
+    /// 置顶能把前段非首选的行（「很能」）顶到首位——那时首条展示的是另一个前段，其余行若只
+    /// 显示后段，「① 很能 ② 能」里的 ② 读起来是「很能」、上屏却是「很可能」。⇒ 全部显示整串。
+    ///
+    /// 按地址认首条，`c` 须借自 `state.candidates`。
+    fn split_back_only(state: &State, c: &Candidate) -> bool {
+        !c.display_text.is_empty()
+            && state
+                .candidates
+                .iter()
+                .find(|x| x.is_split_composed)
+                .is_some_and(|first| !std::ptr::eq(first, c) && !first.display_text.is_empty())
     }
 
     /// **上屏与显示的唯一文本变换出口**：按当前开着的方向做简繁转换，都没开（或数据

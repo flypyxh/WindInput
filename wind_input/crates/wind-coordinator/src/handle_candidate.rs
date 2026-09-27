@@ -3755,7 +3755,9 @@ impl Coordinator {
             let ch = runes[char_index].to_string();
             match Self::select_char_freq_code(&cand, runes.len(), char_index) {
                 Some(freq_code) => self.record_selection(&freq_code, &ch, cand.source),
-                None => self.push_commit_history(&ch),
+                // 被隐藏的前段是这条候选自己的上屏内容，历史要记全（「很困」而非「困」）；
+                // 已确认段前缀 `committed_text` 照旧不记，口径不变。
+                None => self.push_commit_history(&format!("{split_front}{ch}")),
             }
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
@@ -4735,11 +4737,21 @@ impl Coordinator {
             debug!("alt_commit: 候选 #{idx} 没有可上屏的内容（{kind:?}），吞键");
             return Some(KeyAction::Consumed);
         }
-        let prefix = self.take_committed(&mut state);
-        let mut out = self.maybe_convert(&state, &prefix);
-        out.push_str(&text);
-        let _ = self.cancel_session(&mut state);
-        Some(Self::commit_action(out, true))
+        Some(self.commit_text_ending_session(&mut state, &text))
+    }
+
+    /// 上屏一段**不是候选本身**的文本并结束会话：已确认前缀（拼音分步上屏那段）连同 `text`
+    /// 一并上屏，组合与候选窗清掉（同 Esc 的退出路径）。未被消费的余码随之丢弃。
+    ///
+    /// **不记词频、不进联想**：上屏的不是这个候选；自动造词的投喂挂在按键出口
+    /// （`handle_key_event_policed`），菜单经 push 投递时本就不经过它。
+    /// 两个调用方：上屏注释 / 拼音（Alt+数字）、悬停提示右键「上屏」。
+    pub(crate) fn commit_text_ending_session(&self, state: &mut State, text: &str) -> KeyAction {
+        let prefix = self.take_committed(state);
+        let mut out = self.maybe_convert(state, &prefix);
+        out.push_str(text);
+        let _ = self.cancel_session(state);
+        Self::commit_action(out, true)
     }
 
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。

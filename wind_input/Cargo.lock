@@ -2477,6 +2477,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "tracing",
+ "unicode-segmentation",
  "wind-assoc",
  "wind-aux-code",
  "wind-bridge",
@@ -2509,6 +2510,7 @@ name = "wind-dict"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "memmap2",
  "serde",
  "serde_yaml",

@@ -50,6 +50,17 @@ pub fn is_cmdbar_grammar(src: &str) -> bool {
 /// 顶层 marker 表（最长前缀优先；`$CC1` 必须排在 `$CC` 前）。
 const MARKER_TABLE: &[&str] = &["$CC1", "$CC", "$SS", "$AA"];
 
+/// 文本里任意位置（**不论是否顶层**）出现 `<marker>(` 调用。
+///
+/// 给「这一列像不像命令栏短语」一类粗判用（如词库列序纠错），与解析器共用
+/// [`MARKER_TABLE`]，新增 marker 时两边不会漂移。
+pub fn contains_marker_call(s: &str) -> bool {
+    MARKER_TABLE.iter().any(|m| {
+        s.match_indices(m)
+            .any(|(i, _)| s.as_bytes().get(i + m.len()) == Some(&b'('))
+    })
+}
+
 /// 扫描首个不在字符串内的 marker，返回 (marker, '$' 偏移, '(' 偏移)。
 fn find_top_level_marker(src: &str) -> Option<(&'static str, usize, usize)> {
     let b = src.as_bytes();
@@ -907,6 +918,15 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_marker_call_covers_every_marker() {
+        for m in MARKER_TABLE {
+            assert!(contains_marker_call(&format!("x{m}(1)")), "{m}");
+            assert!(!contains_marker_call(m), "{m} 无括号不算调用");
+        }
+        assert!(!contains_marker_call("{abc}"), "顶层 {{ 不算 marker");
+    }
 
     fn pp(src: &str) -> Phrase {
         parse(src).unwrap_or_else(|e| panic!("parse {src:?} failed: {e}"))

@@ -156,6 +156,15 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // [`Config::migrate_font_size_follow_theme_value`] 的结果落盘，清的时候它已对生效值
     // 毫无影响。新增同类条目须照此先落盘迁移。
     &["ui", "candidate", "font_size_follow_theme"],
+    // 悬停提示的六个旧开关，并入 `ui.tooltip.sections`。与上一条同一判据：
+    // [`Config::prune_user_config`] 先把 [`Config::migrate_tooltip_sections_value`] 的结果
+    // （`sections`）落盘、再清这六个键，清的时候它们已对生效值毫无影响。
+    &["ui", "tooltip", "code_enabled"],
+    &["ui", "tooltip", "pinyin_enabled"],
+    &["ui", "tooltip", "pinyin_heteronyms"],
+    &["ui", "tooltip", "pinyin_max_readings"],
+    &["ui", "tooltip", "chaizi_enabled"],
+    &["ui", "tooltip", "debug_enabled"],
     // ⛔ `ui.candidate.comment_max_chars`（已拆成 `_vertical` / `_horizontal`）**刻意不登记**。
     //
     // 本清单的不变量是上一段那句「删掉不改变任何生效值」，而该键**仍在被读取**——
@@ -5385,7 +5394,7 @@ pub(crate) fn display_width_trunc(raw: &str, max_width: usize) -> String {
 /// ⚠️ emoji 记 1 是有代价的：它占 2 个 UTF-16 code unit，图标主字上限 2 因此蕴含
 /// 「最坏 4 wchar」，C++ 侧 `_inputTypeLabel` 的容量按这个最坏值取。若要把 emoji
 /// 划进双宽，先看 `schema::icon_label_limit_counts_scalar_values` 那条断言。
-fn is_wide_char(c: char) -> bool {
+pub fn is_wide_char(c: char) -> bool {
     matches!(c as u32,
         0x1100..=0x115F      // 谚文字母
         | 0x2E80..=0x303E    // CJK 部首补充 / 康熙部首 / CJK 符号与标点
@@ -6182,7 +6191,7 @@ impl UiCandidateConfig {
         }
     }
 
-    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 `…`
+    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 [`TRUNCATION_MARK`]
     /// 提示"过长"（仅影响显示；上屏用完整原文，见 coordinator 候选下发）。
     pub fn truncate_display(&self, text: &str) -> String {
         if self.max_chars == 0 {
@@ -6193,10 +6202,14 @@ impl UiCandidateConfig {
             text.to_string()
         } else {
             let head: String = chars[..self.max_chars].iter().collect();
-            format!("{head}…")
+            format!("{head}{TRUNCATION_MARK}")
         }
     }
 }
+
+/// 显示截断追加的标记。候选窗（[`UiCandidateConfig::truncate_display`]）与悬停提示共用：
+/// 悬停提示的逐字段要认出并跳过它（它不是候选的字），两处写成各自的字面量迟早漂移。
+pub const TRUNCATION_MARK: char = '…';
 
 /// 字体配置（[ui.font]）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -6271,31 +6284,186 @@ impl Default for UiThemeConfig {
     }
 }
 
-/// 悬停提示配置（[ui.tooltip]）。原 ui.tooltip.{code,pinyin,chaizi,debug}.* 子表拍平为平铺字段
-/// （三级上限：ui.tooltip.<字段>）。
+/// 悬停提示配置（[ui.tooltip]）：延迟 + 有序段列表。
+///
+/// 段列表取代了旧的六个开关（`code_enabled` / `pinyin_enabled` / `pinyin_heteronyms` /
+/// `pinyin_max_readings` / `chaizi_enabled` / `debug_enabled`）——那些开关只能选「哪几段」，
+/// 段的内容、顺序、标题、拆字与拼音的合并方式全写死在代码里。旧键由
+/// [`Config::migrate_tooltip_sections_value`] 迁成段列表。设计见
+/// `docs/design/candidate-tooltip-sections.md`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TooltipConfig {
     /// 提示延迟显示时间（毫秒）。
     #[serde(default = "default_tooltip_delay")]
     pub delay: i32,
-    /// 编码提示（原 code.enabled）。默认开。
+    /// 单行显示上限（按字素簇计，emoji 组合序列算一个），超出截断加 `…`；0 = 不限。只管显示，复制 / 上屏取原文。
+    ///
+    /// 气泡里最长的是「完整原文」段——长短语可达上千字，不截会把气泡撑到屏幕外。
+    #[serde(default = "default_tooltip_max_chars")]
+    pub max_chars: usize,
+    /// 折行宽度（显示列，CJK / 全角 / emoji 计 2、其余计 1）；0 = 不折。模板字面量里写了 `\t` 的
+    /// 分列段，其含 `\t` 的行不折；由变量值带进来的 `\t` 照常折。
+    ///
+    /// 折行在协调器里硬插换行，而不是交给渲染层：View 引擎不支持文本折行，自绘、宿主渲染、
+    /// macOS 三端因此都不用改就一致。
+    #[serde(default = "default_tooltip_wrap_width")]
+    pub wrap_width: usize,
+    /// 气泡的段，按数组顺序自上而下排列。整体是一个不透明叶子（REGISTRY `StructList`），
+    /// 用户层写了就整表替换出厂列表。
+    #[serde(default = "default_tooltip_sections")]
+    pub sections: Vec<TooltipSection>,
+}
+
+/// 气泡的一段：段名 + 段内容，都是注释模板（语法与变量同 `ui.candidate.comment_template_*`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TooltipSection {
+    /// 段开关。保留「内置段关着」这种状态：设置页一键就能打开，不必删了再加。
     #[serde(default = "default_true")]
-    pub code_enabled: bool,
-    /// 拼音提示（原 pinyin.enabled）。默认开。
-    #[serde(default = "default_true")]
-    pub pinyin_enabled: bool,
-    /// 显示多音字所有读音（原 pinyin.heteronyms）。默认开。
-    #[serde(default = "default_true")]
-    pub pinyin_heteronyms: bool,
-    /// 每字最多显示读音数（原 pinyin.max_readings，0=不限）。
+    pub enabled: bool,
+    /// 段名，**本身也是模板**（`编码{(${code_source})}`）。求值后为空 = 无标题行。
+    ///
+    /// 与段内容不同，段名里的字面文字**不随变量全空而消失**：`编码{(${code_source})}`
+    /// 在直接输入时就是 `编码`，不是空标题。
     #[serde(default)]
-    pub pinyin_max_readings: usize,
-    /// 拆字提示（原 chaizi.enabled）。默认关。
+    pub label: String,
+    /// 段内容模板。结果按 `\n` 拆行、空行丢弃；全空则整段不显示。
     #[serde(default)]
-    pub chaizi_enabled: bool,
-    /// 调试提示（原 debug.enabled）。默认关。
+    pub template: String,
+    /// 求值粒度：`""` 整个候选一次；`"han"` 显示文本里每个 ≥U+3400 的字一次；
+    /// `"char"` 每个非空白字符一次。逐字时每字一行，`${char}` 不计入「这行有值」。
+    /// 未知取值按 `""` 处理并告警（在协调器编译段列表处）。
     #[serde(default)]
-    pub debug_enabled: bool,
+    pub each: String,
+    /// 仅逐字段：按该变量（逐字上下文求值）是否非空把行**稳定**分成两组，非空组在前。
+    /// 空 = 不分组，保持原文顺序。
+    #[serde(default)]
+    pub promote: String,
+    /// 仅当内容恰为一行时生效：渲染成 `标签: 内容`，而非 `[标签]` 独占一行。
+    #[serde(default)]
+    pub inline: bool,
+}
+
+impl TooltipSection {
+    fn new(label: &str, each: &str, template: &str) -> Self {
+        Self {
+            enabled: true,
+            label: label.to_string(),
+            template: template.to_string(),
+            each: each.to_string(),
+            promote: String::new(),
+            inline: false,
+        }
+    }
+
+    fn disabled(self) -> Self {
+        Self {
+            enabled: false,
+            ..self
+        }
+    }
+}
+
+fn default_tooltip_max_chars() -> usize {
+    200
+}
+
+fn default_tooltip_wrap_width() -> usize {
+    40
+}
+
+/// 出厂段名：迁移按段名找段（见 [`Config::migrate_tooltip_sections_value`]），
+/// 出厂列表与迁移共用这组常量，改名只改一处。
+const TIP_CODE: &str = "编码{(${code_source})}";
+const TIP_PINYIN: &str = "拼音";
+const TIP_CHAIZI: &str = "拆字";
+const TIP_DEBUG: &str = "调试";
+
+/// 出厂段列表。与 `data/config.toml` 的 `[[ui.tooltip.sections]]` 逐项相同（L1/L2 同源，
+/// 守门测试 `tooltip_sections_l1_matches_l2`）。
+///
+/// 「完整原文」置首：只在候选显示被截断时有值，平时整段不出现；出现时正是用户最想看的。
+/// 其后复现旧出厂外观：`[编码]`（非直接输入时带来源方案名）、`[拼音]` 逐字全读音，
+/// 拆字、调试关着。Unicode 段是新增能力，出厂关。
+pub fn default_tooltip_sections() -> Vec<TooltipSection> {
+    vec![
+        TooltipSection::new("完整原文", "", "${full_text}"),
+        TooltipSection::new(TIP_CODE, "", "${word_code}"),
+        TooltipSection::new(TIP_PINYIN, "han", "${char}：${readings}"),
+        TooltipSection::new(TIP_CHAIZI, "han", "${char}：${chaizi}{ [${chaizi_code}]}").disabled(),
+        TooltipSection::new("Unicode", "char", "${char}：${unicode}").disabled(),
+        TooltipSection::new(TIP_DEBUG, "", "${debug}").disabled(),
+    ]
+}
+
+/// 旧版 `[ui.tooltip]` 的六个开关（缺省值即旧出厂值）。只供迁移使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyTooltipFlags {
+    pub code: bool,
+    pub pinyin: bool,
+    pub heteronyms: bool,
+    pub max_readings: usize,
+    pub chaizi: bool,
+    pub debug: bool,
+}
+
+impl Default for LegacyTooltipFlags {
+    fn default() -> Self {
+        Self {
+            code: true,
+            pinyin: true,
+            heteronyms: true,
+            max_readings: 0,
+            chaizi: false,
+            debug: false,
+        }
+    }
+}
+
+/// 旧开关组合 → 与之外观一致的段列表（设计 §8.1）。以出厂列表为底改写，因而老用户也拿到
+/// 新增的「完整原文」段（开）与 Unicode 段（关）。
+///
+/// 独立成 pub 函数而不是埋在 Value 层迁移里：协调器的对拍测试要拿同一份映射去比对
+/// 「旧实现输出 == 迁移出的段列表的新渲染输出」，映射若在测试里另写一份，对拍就只证明了
+/// 两份手写映射彼此一致。
+pub fn tooltip_sections_from_legacy(f: LegacyTooltipFlags) -> Vec<TooltipSection> {
+    // 读音数：旧实现 heteronyms=false 时只取首音，**先于** max_readings 判定。
+    let readings = if !f.heteronyms {
+        "${readings:1}".to_string()
+    } else if f.max_readings > 0 {
+        format!("${{readings:{}}}", f.max_readings)
+    } else {
+        "${readings}".to_string()
+    };
+    let mut out = default_tooltip_sections();
+    for s in &mut out {
+        match s.label.as_str() {
+            TIP_CODE => s.enabled = f.code,
+            TIP_PINYIN => {
+                s.enabled = f.pinyin;
+                s.template = format!("${{char}}：{readings}");
+            }
+            TIP_CHAIZI => s.enabled = f.chaizi,
+            TIP_DEBUG => s.enabled = f.debug,
+            _ => {}
+        }
+    }
+    if f.chaizi && f.pinyin {
+        // 两段合成一段（旧 `merge_chaizi_pinyin`）：拆字部分包在可选段里——无拆字的字整段
+        // 消失得 `好：hǎo`；无读音时末尾 `\t` 被空变量吞掉得 `好：女子 [vbg]`。
+        // `promote = "chaizi"` 复现旧行序：有拆字的字按原文序在前，拆字库未收录的补在末尾。
+        out.retain(|s| s.label != TIP_CHAIZI);
+        if let Some(p) = out.iter_mut().find(|s| s.label == TIP_PINYIN) {
+            *p = TooltipSection {
+                enabled: true,
+                label: "拆字 / 拼音".to_string(),
+                template: format!("${{char}}：{{${{chaizi}}{{ [${{chaizi_code}}]}}\t}}{readings}"),
+                each: "han".to_string(),
+                promote: "chaizi".to_string(),
+                inline: false,
+            };
+        }
+    }
+    out
 }
 
 fn default_tooltip_delay() -> i32 {
@@ -6306,12 +6474,9 @@ impl Default for TooltipConfig {
     fn default() -> Self {
         Self {
             delay: default_tooltip_delay(),
-            code_enabled: true,
-            pinyin_enabled: true,
-            pinyin_heteronyms: true,
-            pinyin_max_readings: 0,
-            chaizi_enabled: false,
-            debug_enabled: false,
+            max_chars: default_tooltip_max_chars(),
+            wrap_width: default_tooltip_wrap_width(),
+            sections: default_tooltip_sections(),
         }
     }
 }
@@ -7620,6 +7785,69 @@ impl Config {
         Self::migrate_comment_max_chars_value(layer);
         Self::migrate_font_size_follow_theme_value(layer);
         Self::migrate_langbar_badge_colors_value(layer);
+        Self::migrate_tooltip_sections_value(layer);
+    }
+
+    /// 存量迁移（**层内**、须在反序列化前跑）：`[ui.tooltip]` 的六个旧开关 → `sections`。
+    ///
+    /// 按**这一层**写了什么判（判据同 [`Self::migrate_user_layer_value`] 的文档）：
+    /// - 本层没写任何旧键 → 不动；
+    /// - 本层已写 `sections` → 以它为准，旧键只清不迁（用户在新形态上的编辑比旧开关新）；
+    /// - 否则按 [`tooltip_sections_from_legacy`] 生成段列表写入本层。本层没写的旧键取旧出厂值，
+    ///   与旧版「缺键即默认」的生效值一致。
+    ///
+    /// 旧键从本层移除。用户文件里的旧键另由 [`Config::prune_user_config`] 先迁移**落盘**、
+    /// 再按 [`RETIRED_KEYS`] 清除——只清不迁会把开过拆字、关过拼音的设置丢掉。
+    ///
+    /// 已知近似（同 [`Self::migrate_font_size_follow_theme_value`]）：本层缺的旧键按旧出厂值补，
+    /// 不去看下层（L2.5 定制层）写过什么。只在「定制版改过气泡开关 + 用户层也改过其中一部分」
+    /// 时有差别，结果是那几个开关回到出厂值。
+    fn migrate_tooltip_sections_value(layer: &mut toml::Value) {
+        const LEGACY_KEYS: [&str; 6] = [
+            "code_enabled",
+            "pinyin_enabled",
+            "pinyin_heteronyms",
+            "pinyin_max_readings",
+            "chaizi_enabled",
+            "debug_enabled",
+        ];
+        let Some(tip) = layer
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("tooltip"))
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return;
+        };
+        let old: BTreeMap<&str, toml::Value> = LEGACY_KEYS
+            .iter()
+            .filter_map(|&k| tip.remove(k).map(|v| (k, v)))
+            .collect();
+        if old.is_empty() || tip.contains_key("sections") {
+            return;
+        }
+        let d = LegacyTooltipFlags::default();
+        let flag =
+            |k: &str, default: bool| old.get(k).and_then(toml::Value::as_bool).unwrap_or(default);
+        let flags = LegacyTooltipFlags {
+            code: flag("code_enabled", d.code),
+            pinyin: flag("pinyin_enabled", d.pinyin),
+            heteronyms: flag("pinyin_heteronyms", d.heteronyms),
+            max_readings: old
+                .get("pinyin_max_readings")
+                .and_then(toml::Value::as_integer)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(d.max_readings),
+            chaizi: flag("chaizi_enabled", d.chaizi),
+            debug: flag("debug_enabled", d.debug),
+        };
+        match toml::Value::try_from(tooltip_sections_from_legacy(flags)) {
+            Ok(v) => {
+                tip.insert("sections".to_string(), v);
+                info!("Migrated ui.tooltip legacy switches {flags:?} → sections");
+            }
+            // 段列表自己序列化不了属于代码 bug；旧键已摘，本层回落出厂段列表。
+            Err(e) => error!("ui.tooltip 旧开关迁移失败（{e}），本层回落出厂段列表"),
+        }
     }
 
     /// 存量迁移（**层内**）：`[[ui.langbar.badges]]` 的色值哨兵拆成「色值 + 不透明度」两键。
@@ -7910,6 +8138,7 @@ impl Config {
         let before = root.clone();
         Self::migrate_font_size_follow_theme_value(&mut root);
         Self::migrate_langbar_badge_colors_value(&mut root);
+        Self::migrate_tooltip_sections_value(&mut root);
         let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
         // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
@@ -8929,6 +9158,10 @@ impl Config {
         // 否则写入 `font_size = 0`（等于出厂值 ⇒ 被剪掉）后，残留的 `follow = false` 会在
         // 下次 load 被迁成 18，用户刚选的「跟随主题」被打回。
         Self::migrate_font_size_follow_theme_value(&mut root);
+        // 气泡旧开关同理：用户把 `sections` 改回出厂值时，写入等于默认 ⇒ 被剪掉，文件里
+        // 残留的旧开关（比如 `chaizi_enabled = true`）会在下次 load 被迁回一份合并段，
+        // 用户刚选的出厂段列表被打回。
+        Self::migrate_tooltip_sections_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -10874,33 +11107,156 @@ active = "x"
     }
 
     #[test]
-    fn test_tooltip_defaults_match_go() {
+    fn test_tooltip_defaults() {
         let t = Config::default().ui.tooltip;
         assert_eq!(
             t.delay, 200,
             "delay 按 data/config.toml 预置默认 200（偏离 Go 的 100）"
         );
-        assert!(t.code_enabled, "code 默认开");
-        assert!(
-            t.pinyin_enabled && t.pinyin_heteronyms,
-            "pinyin 默认开+全读音"
+        let on: Vec<&str> = t
+            .sections
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(
+            on,
+            ["完整原文", "编码{(${code_source})}", "拼音"],
+            "出厂开完整原文、编码、拼音"
         );
-        assert_eq!(t.pinyin_max_readings, 0);
-        assert!(!t.chaizi_enabled, "chaizi 默认关");
-        assert!(!t.debug_enabled, "debug 默认关");
+        assert_eq!(t.max_chars, 200, "单行显示上限默认 200 字");
+        assert_eq!(t.wrap_width, 40, "折行宽度默认 40 列");
+        // 旧出厂开关（全缺省）迁出来必须恰是出厂段列表：否则从没碰过气泡设置、却在用户层
+        // 留着旧键的老用户，升级后会拿到一份与新装用户不同的段列表。
+        assert_eq!(
+            tooltip_sections_from_legacy(LegacyTooltipFlags::default()),
+            default_tooltip_sections()
+        );
+    }
+
+    /// 旧开关迁移：跑真实链路（用户层迁移 → ⊕ L1 默认 → 反序列化），返回生效段列表与迁移后的本层。
+    fn tooltip_after_migration(user_toml: &str) -> (Vec<TooltipSection>, toml::Value) {
+        let mut user: toml::Value = toml::from_str(user_toml).unwrap();
+        Config::migrate_user_layer_value(&mut user);
+        let mut merged = toml::Value::try_from(Config::default()).unwrap();
+        merge_value(&mut merged, user.clone());
+        let cfg: Config = merged.try_into().expect("反序列化");
+        (cfg.ui.tooltip.sections, user)
+    }
+
+    fn enabled_labels(sections: &[TooltipSection]) -> Vec<&str> {
+        sections
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.label.as_str())
+            .collect()
+    }
+
+    /// ★★ 拆字 + 拼音同开 → 一个合并段（`promote` 复现旧行序），不再有独立的拼音、拆字段。
+    #[test]
+    fn migrate_tooltip_chaizi_with_pinyin_becomes_merged_section() {
+        let (secs, user) = tooltip_after_migration("[ui.tooltip]\nchaizi_enabled = true\n");
+        assert_eq!(
+            enabled_labels(&secs),
+            ["完整原文", "编码{(${code_source})}", "拆字 / 拼音"]
+        );
+        let merged = secs.iter().find(|s| s.label == "拆字 / 拼音").unwrap();
+        assert_eq!(merged.each, "han");
+        assert_eq!(merged.promote, "chaizi");
+        assert_eq!(
+            merged.template,
+            "${char}：{${chaizi}{ [${chaizi_code}]}\t}${readings}"
+        );
+        assert!(
+            !secs.iter().any(|s| s.label == "拆字" || s.label == "拼音"),
+            "被合并的两段不留关着的残壳"
+        );
+        assert!(
+            get_nested(&user, &["ui", "tooltip", "chaizi_enabled"]).is_none(),
+            "旧键须从本层移除"
+        );
     }
 
     #[test]
-    fn test_tooltip_merge_override() {
-        let cfg = merged_with(
-            "[ui.tooltip]\nchaizi_enabled = true\npinyin_heteronyms = false\npinyin_max_readings = 2\n",
+    fn migrate_tooltip_chaizi_without_pinyin_enables_chaizi_section() {
+        let (secs, _) = tooltip_after_migration(
+            "[ui.tooltip]\nchaizi_enabled = true\npinyin_enabled = false\n",
         );
-        assert!(cfg.ui.tooltip.chaizi_enabled);
-        assert!(!cfg.ui.tooltip.pinyin_heteronyms);
-        assert_eq!(cfg.ui.tooltip.pinyin_max_readings, 2);
-        // 未指定字段保留默认
-        assert!(cfg.ui.tooltip.code_enabled, "code 未指定应保留默认开");
-        assert_eq!(cfg.ui.tooltip.delay, 200);
+        assert_eq!(
+            enabled_labels(&secs),
+            ["完整原文", "编码{(${code_source})}", "拆字"]
+        );
+    }
+
+    /// `heteronyms = false` 先于 `max_readings` 判定（旧实现即如此），迁成 `${readings:1}`。
+    #[test]
+    fn migrate_tooltip_reading_count_switches() {
+        let tpl = |toml: &str| {
+            let (secs, _) = tooltip_after_migration(toml);
+            secs.into_iter()
+                .find(|s| s.label == "拼音")
+                .unwrap()
+                .template
+        };
+        assert_eq!(
+            tpl("[ui.tooltip]\npinyin_heteronyms = false\npinyin_max_readings = 3\n"),
+            "${char}：${readings:1}"
+        );
+        assert_eq!(
+            tpl("[ui.tooltip]\npinyin_max_readings = 2\n"),
+            "${char}：${readings:2}"
+        );
+        assert_eq!(
+            tpl("[ui.tooltip]\npinyin_max_readings = 0\n"),
+            "${char}：${readings}"
+        );
+    }
+
+    #[test]
+    fn migrate_tooltip_code_and_debug_switches() {
+        let (secs, _) =
+            tooltip_after_migration("[ui.tooltip]\ncode_enabled = false\ndebug_enabled = true\n");
+        assert_eq!(enabled_labels(&secs), ["完整原文", "拼音", "调试"]);
+    }
+
+    /// 用户已写 `sections` 时以它为准，旧键只清不迁。
+    #[test]
+    fn migrate_tooltip_existing_sections_win_over_legacy_switches() {
+        let (secs, user) = tooltip_after_migration(
+            "[ui.tooltip]\nchaizi_enabled = true\n\n[[ui.tooltip.sections]]\nlabel = \"只要这段\"\ntemplate = \"${word_code}\"\n",
+        );
+        assert_eq!(enabled_labels(&secs), ["只要这段"]);
+        assert!(get_nested(&user, &["ui", "tooltip", "chaizi_enabled"]).is_none());
+    }
+
+    /// 没写旧键的层原样不动（不凭空写出一份 `sections`，否则出厂段列表再也送达不了该用户）。
+    #[test]
+    fn migrate_tooltip_leaves_untouched_layer_alone() {
+        let (_, user) = tooltip_after_migration("[ui.tooltip]\ndelay = 300\n");
+        assert_eq!(
+            user,
+            toml::from_str::<toml::Value>("[ui.tooltip]\ndelay = 300\n").unwrap()
+        );
+    }
+
+    /// 迁移落盘后再清退役键，生效值不变（`prune_user_config` 的顺序）；幂等。
+    #[test]
+    fn migrate_tooltip_then_prune_retired_keeps_effective_sections() {
+        let src = "[ui.tooltip]\nchaizi_enabled = true\npinyin_max_readings = 2\n";
+        let (before, _) = tooltip_after_migration(src);
+        let mut root: toml::Value = toml::from_str(src).unwrap();
+        Config::migrate_tooltip_sections_value(&mut root);
+        assert_eq!(prune_retired(&mut root), 0, "迁移已摘掉旧键，清单无事可做");
+        let (after, _) = tooltip_after_migration(&toml::to_string(&root).unwrap());
+        assert_eq!(before, after);
+        let again = root.clone();
+        Config::migrate_tooltip_sections_value(&mut root);
+        assert_eq!(root, again, "幂等");
+        // 反向：只清不迁会丢设置——这正是必须先落盘迁移的理由。
+        let mut raw: toml::Value = toml::from_str(src).unwrap();
+        assert_eq!(prune_retired(&mut raw), 2);
+        let (lost, _) = tooltip_after_migration(&toml::to_string(&raw).unwrap());
+        assert_ne!(lost, before);
     }
 
     #[test]

@@ -116,6 +116,8 @@ pub(crate) struct ConfigBundle {
     /// 取值就成了「切方案反复装卸」。同 `schema_bound_modifier_vks` 那条理由，只是它
     /// 落在 Rust 侧而非 C++ 边界。
     pub(crate) schema_session_vks: std::collections::BTreeSet<u32>,
+    /// 悬停提示（`ui.tooltip.*`）的预解析形态：段模板在这里解析一次，候选循环里只渲染。
+    pub(crate) tooltip: crate::tooltip::CompiledTooltip,
 }
 
 /// 所有方案 `[key_actions]` 里绑过的纯修饰键 VK（并集）。
@@ -517,6 +519,7 @@ impl ConfigBundle {
         //
         // ★ 全进程只装配一份 registry。在这里再解析一次的话，同一个 key 可能在免词频
         // 和生僻准入下解析出不同的类，而这种不一致没有任何报错。
+        let tooltip = crate::tooltip::CompiledTooltip::compile(&config.ui.tooltip);
         Self {
             config,
             compiled_hotkeys,
@@ -532,6 +535,7 @@ impl ConfigBundle {
             en_passthrough_punct_chars,
             key_resolver,
             schema_session_vks,
+            tooltip,
         }
     }
 }

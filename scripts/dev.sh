@@ -850,6 +850,8 @@ deploy_guard_close() {
 #   .old_*）面前恒真，见 remote_deploy_guard。
 #   期望值取**远端**安装目录里的 exe，不取本地产物：只推 tsf（pm1/pdm1）时远端 exe 本就
 #   不是本地这份，拿本地比会把好好的进程当旧版本杀掉；全量/core 推送后远端那份即新文件。
+#   但只比远端会漏掉「scp 静默没覆盖上」（远端仍是旧 exe，进程与它一致照样判通过）：故
+#   core/全量推送时传第 2 参 = 本地产物路径，先校验远端 exe 的 MD5 == 本地那份；只推 tsf 不传。
 #   不一致就把该变体进程全停掉再起，最多 3 轮，仍不一致返回 1。
 #   映像路径读不到（权限不足时 Path 为 null）的进程无从比对，单独报出、不当版本不符去杀。
 remote_start_main() {
@@ -857,6 +859,14 @@ remote_start_main() {
     local name="wind_input${sfx}" exe="$REMOTE_DIR/wind_input${sfx}.exe"
     local want; want="$(remote_ps "(Get-FileHash -Algorithm MD5 -LiteralPath '$exe' -EA Stop).Hash" 2>/dev/null | tr -d '\r' | tail -1)"
     [[ "$want" =~ ^[0-9A-F]{32}$ ]] || { err "读不到远端 $exe 的 MD5，无法校验运行中的版本"; return 1; }
+    if [ -n "${2:-}" ]; then
+        local local_md5; local_md5="$(md5sum "$2" | cut -d' ' -f1 | tr 'a-f' 'A-F')"
+        if [ "$want" != "$local_md5" ]; then
+            err "远端 $exe 与本地 $2 不一致（远端 MD5 $want ≠ 本地 $local_md5）—— 推送没覆盖上，别按新版本测。"
+            return 1
+        fi
+        say "远端 exe = 本地产物（MD5 ${want:0:8}…）。"
+    fi
     local try out known
     for try in 1 2 3; do
         say "启动远端主进程 $name.exe (计划任务,脱离 SSH 会话；第 $try 轮)..."
@@ -967,7 +977,8 @@ _push_full_body() {
     if scp -r "$outdir"/* "$WIND_REMOTE:$REMOTE_DIR/"; then
         # ★ 与 do_push_module 同理：不同步系统副本，新 TSF DLL 不会被任何宿主加载。
         remote_sync_tsf_system_copy "$profile" || return 1
-        remote_start_main "$profile" || return 1
+        local sfx=""; [ "$profile" = dev ] && sfx="_dev"
+        remote_start_main "$profile" "$outdir/wind_input${sfx}.exe" || return 1
         remote_cleanup_old
         say "已全量部署并启动（$profile）。"
     else
@@ -1034,7 +1045,11 @@ _push_module_body() {
             tsf) remote_sync_tsf_system_copy "$profile" || return 1 ;;
         esac
         # 推了核心/TSF 则重启主进程让其立即生效
-        case "$mod" in core|tsf) remote_start_main "$profile" || return 1 ;; esac
+        # core 推了 exe：再校验远端 exe == 本地产物；只推 tsf 时远端 exe 本就不是本地这份。
+        case "$mod" in
+            core) remote_start_main "$profile" "$outdir/${files[0]}" || return 1 ;;
+            tsf)  remote_start_main "$profile" || return 1 ;;
+        esac
         remote_cleanup_old
         say "模块部署完成（$profile/$mod）。"
     else

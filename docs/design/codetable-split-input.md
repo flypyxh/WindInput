@@ -169,7 +169,7 @@ sm'a  →  sm(什么) + a(啊)  →  「什么啊」     ← 2+1，不是对半�
 Candidate {
     text: format!("{}{}", front.text, back.text),
     code: input.to_string(),           // 整串，供 decide_auto_commit 认作精确
-    weight: front.weight.min(back.weight),  // 组合的可信度不高于最弱的那一段 → §4.2
+    weight: front.weight.min(back.weight),  // 组合的可信度不高于最弱的那一段，随后沿构造序压成单调不增 → §4.2
     natural_order: 构造序,                  // 同权重时的末级键；base_sort=natural 的方案也靠它
     source: CandidateSource::CodeTable,
     is_split_composed: true,           // ★ 新增字段，不借 is_sentence → §4.4
@@ -185,22 +185,26 @@ Candidate {
 ### 4.2 组合与排序
 
 ```
-front = dm.search(&input[..split_at], front_n)       // 默认 front_n = 1
-back  = dm.search(&input[split_at..], BACK_LIMIT)    // BACK_LIMIT = 8，同 completion_hints 的取数口径
-产物 = front × back，前段外层、后段内层，各自保持词典返回序
+front = split_segment(&input[..split_at], front_n)     // 默认 front_n = 1
+back  = split_segment(&input[split_at..], BACK_LIMIT)  // BACK_LIMIT = 8，同 completion_hints 的取数口径
+  split_segment = dm.search(段码, 16) → 候选调整（删除/置顶）→ 剔除含 `$`/`{` 的特殊语法值 → 截断（§3.2）
+产物 = front × back，前段外层、后段内层，各自保持段内次序
+weight 沿构造序压成单调不增 ⇒ 协调器重排后仍是构造序
 ```
 
 - **一律 `append` 到候选列表末尾**，不 `insert(0)`。默认档下列表为空 ⇒ append 即全部；
   预留档下自然排在既有候选之后。**两档共用一套代码、零分支**，这是选 append 的全部理由。
-- **`weight` 取两段的较小值**：组合的可信度不高于最弱的那一段。前段恒取首选时（默认）
-  `front.weight` 是常量，于是 `min` 退化为「按后段权重序」——与构造序一致。
-  `natural_order` 填构造序作为同权重时的末级键，`base_sort = "natural"`（忽略权重）的方案
-  也因此拿到同一个序。
-- ⚠️ **「前段外层、后段内层」只是引擎内的构造序，不是屏幕序**：协调器的
-  `candidate_display_order` 会无条件全量重排，而 `by_weight` 排在 `natural_order` 之前
-  ⇒ `split_front_candidates >= 2` 时实际呈现按 `min` 权重降序、**按后段分组**
-  （很可能 / 困能 / 很可难 / 困难），而不是按前段聚拢。默认档（取 1）两者重合，不受影响。
-  这是已知取舍：要让分组在屏幕上成立，得把前段序编进 weight，那会污染它与其它候选的竞争。
+- **`weight` 取两段的较小值**：组合的可信度不高于最弱的那一段。随后**沿构造序压成单调不增**
+  （后一条不高于前一条），`natural_order` 填构造序作同权重时的末级键——协调器的
+  `candidate_display_order` 全量重排（`by_weight` 先于 `natural_order`）之后，屏幕序仍是
+  构造序；`base_sort = "natural"` 的方案也拿到同一个序。
+- **单调化是 2026-09-27 加的**（t231 审查实测）。此前只取 `min`，构造序在协调器那里只是
+  末级键，两件事因此失效：① 段内的候选调整（`split_segment` 按置顶改了段内次序，段权重
+  却还是词库原值，到协调器又被按权重排回）；② `split_front_candidates >= 2` 时屏幕按 `min`
+  权重**按后段分组**交错（很可能 / 很能 / 很可难 / 很难），而次选只显示后段后，「② 很能 ③ 难」
+  会被读成「很难」。旧版把 ② 记为「已知取舍：得把前段序编进 weight，会污染与其它候选的竞争」
+  ——实际影响可忽略：组合候选只在空码（默认档，列表里只有它）或已沉底（`no_exact` 档）时出现，
+  压低的只是后续组合行自己的权重。
 - ⚠️ `append` 的位置必须在 `truncate(max_candidates)` **之前**：`handle_top_code` 以
   `convert(prefix, 1)` 取顶码首选，放到 truncate 之后会让那次调用拿回超过 limit 条候选，
   破坏 `max_candidates` 契约。同时也必须在 `is_empty` 求值之前，否则 `should_clear` 会
@@ -702,6 +706,17 @@ diff 两份输出 → 逐字相同（各 91 行、56 条候选行）
 「安装」而上屏「什么安装」，用户无从判断上屏结果，右键「移到首位 / 删除」这类按候选文本
 定位的操作也会对不上号。**这是显示层的取舍，改起来只动候选文本、不动上屏内容**——真机
 反馈若指出只显示后段更好用，再改不迟。
+
+**已知限制（2026-09-27 最终审查记下，本轮不修）**：
+- **翻页后看不到前段**：「首条组合显示整串」按整张列表判定。后段重码多到翻页时，第 2 页
+  只剩后段（「⑥ 难」），前段只在第 1 页与组合区 `hf'kn` 的编码上可见。后段取数上限 8、
+  每页通常 5–9 条，少见；有反馈再改成按页判定（移动端连续滚动那条出口仍按整表）。
+- **段候选不吃词频重排**：只吃候选调整（删除/置顶）。用户在 `kn` 上常选「难」、单打 `kn`
+  时它靠词频排第一，切分里仍按词库序。词频重排是协调器按输入码位做的，段码不是输入码位，
+  要接得另开一路读词频。
+- **前段多取时被顶到首位的是前段非首选行**（词频重排或整串码上的置顶）：此时全部行显示整串，
+  「次选只显示后段」暂时不生效——只显示后段的前提是首条展示的正是这些行的前段，见
+  `split_back_only`。
 
 **仍待做**：真机验证（清单见 §8.2）；混输下的档位归属；§9 表里 #9 那条手工验。
 

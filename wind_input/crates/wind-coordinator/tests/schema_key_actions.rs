@@ -899,6 +899,102 @@ fn z_fallback_mix_accepts_operators_after_hijack() {
     let _ = std::fs::remove_dir_all(&dd);
 }
 
+/// 在 `make_data_dir_with_z_code` 基础上让 `zzbd` 有两条候选——真机上它是一整屏分组，
+/// 只有一条的话 4 码唯一会自动上屏，候选列表根本留不住，测不到选词。
+fn make_data_dir_with_zz_group(tag: &str) -> PathBuf {
+    let dir = make_data_dir_with_z_code(tag);
+    std::fs::write(
+        dir.join("schemas/zt/zt.dict.yaml"),
+        "---\nname: zt\nversion: \"1\"\n...\n阿\ta\n甲\tzzbd\n丙\tzzbd\n乙\tzzsz\n",
+    )
+    .unwrap();
+    dir
+}
+
+fn inserted_text(act: &KeyAction) -> Option<&str> {
+    match act {
+        KeyAction::InsertText { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+/// ★ 缓冲沿活码长到 `zzbd`、候选已列出后，数字是**选词键**，不能被 z 夺取吃成 mix 残余码。
+///
+/// 现场：`z = "mix:quick_mix"`，打 `zzbd` 出标点分组后按数字选不了——`zzbd2` 破前缀，
+/// 夺取把 `2` 连同 `zbd` 塞进快捷输入缓冲。与快捷输入的 `free_input` 无关（还没进模式）。
+#[test]
+fn z_fallback_keeps_digit_select_when_candidates_listed() {
+    let dd = make_data_dir_with_zz_group("zzgroupdigit");
+    let ov = make_override("zzgroupdigit", "zt", "z = \"mix:quick_mix\"");
+    let coord =
+        Coordinator::new_headless_with_override(cfg_for_z_schema(), Some(&dd), Some(ov.clone()));
+
+    for vk in [VK_Z, VK_Z, 'B' as u32, 'D' as u32] {
+        coord.handle_key_event(&key(vk));
+    }
+    assert_eq!(
+        coord.debug_all_candidate_texts(),
+        vec!["甲", "丙"],
+        "前提：zzbd 应列出两条候选"
+    );
+    let act = coord.handle_key_event(&key(0x32)); // 数字 2
+    assert_eq!(coord.debug_active_mode(), None, "不该夺取进 mix");
+    assert_eq!(
+        inserted_text(&act),
+        Some("丙"),
+        "2 应选第二候选，实际: {act:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// 同一守卫对 `temp_english` 目标同样生效（`z_fallback_accepts` 里它与 mix 同一分支）。
+#[test]
+fn z_fallback_temp_english_keeps_digit_select_when_candidates_listed() {
+    let dd = make_data_dir_with_zz_group("zzgroupten");
+    let ov = make_override("zzgroupten", "zt", "z = \"temp_english\"");
+    let mut cfg = cfg_for_z_schema();
+    cfg.input.temp_english.enabled = true;
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&dd), Some(ov.clone()));
+
+    for vk in [VK_Z, VK_Z, 'B' as u32, 'D' as u32] {
+        coord.handle_key_event(&key(vk));
+    }
+    let act = coord.handle_key_event(&key(0x32)); // 数字 2
+    assert_eq!(coord.debug_active_mode(), None, "不该夺取进临英");
+    assert_eq!(
+        inserted_text(&act),
+        Some("丙"),
+        "2 应选第二候选，实际: {act:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// 同一守卫的标点面：候选已列出时标点走顶屏，不夺取。
+#[test]
+fn z_fallback_keeps_punct_top_commit_when_candidates_listed() {
+    let dd = make_data_dir_with_zz_group("zzgrouppunct");
+    let ov = make_override("zzgrouppunct", "zt", "z = \"mix:quick_mix\"");
+    let mut cfg = cfg_for_z_schema();
+    // 出厂 punct_commit 关（有编码时标点吞键），关着就测不出顶屏。
+    cfg.schema.codetable.punct_commit = true;
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&dd), Some(ov.clone()));
+
+    for vk in [VK_Z, VK_Z, 'B' as u32, 'D' as u32] {
+        coord.handle_key_event(&key(vk));
+    }
+    // 用 `/` 而不用 `,`：出厂 `,` `.` 是以词定字键，走不到标点顶屏。
+    let act = coord.handle_key_event(&key(0xBF)); // /
+    assert_eq!(coord.debug_active_mode(), None, "不该夺取进 mix");
+    assert!(
+        inserted_text(&act).is_some_and(|t| t.starts_with('甲')),
+        "`/` 应顶屏首选，实际: {act:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
 /// ★ 临拼的残余码只可能是拼音字母，故数字**不该**夺取——`z1` 里的 1 仍是选词键。
 /// 判据按目标模式的「残余码语义」分，与设计文档 §4.2 那张表同源。
 #[test]
