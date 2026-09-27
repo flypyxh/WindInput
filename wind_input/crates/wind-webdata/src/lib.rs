@@ -7840,7 +7840,7 @@ moved = [{ id = 'date.lunar', position = 0 }]
             "[engine.aux_code]\nfiles = [\"schema:wubi86\"]\n",
         )
         .unwrap();
-        let store = std::sync::Arc::new(wind_store::Store::open(&dir.join("s.redb")).unwrap());
+        let store = std::sync::Arc::new(wind_store::Store::open(dir.join("s.redb")).unwrap());
         let c = Coordinator::new_headless_with_store_override(
             wind_config::Config::default(),
             Some(&dir),
