@@ -915,11 +915,12 @@ fn parse_rime_line(
     // 它的位置；音节库靠**列内**空格分音节，剥尾不动边界），而 text 列末尾的空白可能是词条
     // 内容。TextFirst 布局下 code 在末列，这一步接住了从前由整行 trim 承担的活。
     //
-    // **命令栏语法条目逐行纠正列序**（t172）：`$CC(` / `$SS(` 一类串（及顶层 `{..}` 插值）绝不可能
+    // **命令栏语法条目逐行纠正列序**（t172）：编码列里的 `$CC(` / `$SS(` / `$AA(` 绝不可能
     // 是编码，它落在 code 列只说明这一行的列序与全文相反——用户照着文档里 `zzgo = $SS(...)`
     // 的「编码在前」写法手写进「文本在前」的词库，文件级判定按多数票不会为这一行让步，
     // 结果 text=`u`、code=`$SS(...)`，这条短语永远打不出来，也没有任何提示。
-    let (code_col, text_col) = if wind_store::wdict::is_cmdbar_text(parts[spec.code_col])
+    // 只认 marker、不单凭 `{`：`{` 可以是编码字符集里的正经键位。
+    let (code_col, text_col) = if wind_store::wdict::is_misplaced_cmdbar_code(parts[spec.code_col])
         && !wind_store::wdict::is_cmdbar_text(parts[spec.text_col])
     {
         (spec.text_col, spec.code_col)
@@ -2266,5 +2267,30 @@ columns:
             "少数派 ASCII 行须服从文件级列序"
         );
         assert_eq!(collect(&e, "字0"), vec![("code0".to_string(), 0)]);
+    }
+
+    /// 列序纠错（t172）只认编码列里的 `$SS(` 类 marker：单凭 `{` 不对调（反例）；
+    /// 真有 marker 时照旧对调（正例）。
+    #[test]
+    fn cmdbar_swap_requires_marker_not_bare_brace() {
+        let path =
+            std::env::temp_dir().join(format!("wind_cmdbar_swap_{}.dict.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            "---\nname: t\ncolumns:\n  - text\n  - code\n...\n甲\t{ab}\n$SS(\"x\", \"y\")\tuu\n",
+        )
+        .unwrap();
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            collect(&e, "甲"),
+            vec![("{ab}".to_string(), 0)],
+            "{{ 不是对调依据"
+        );
+        assert_eq!(
+            collect(&e, "$SS(\"x\", \"y\")"),
+            vec![("uu".to_string(), 0)],
+            "marker 在编码列 ⇒ 对调"
+        );
     }
 }

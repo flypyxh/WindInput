@@ -1178,14 +1178,23 @@ impl EngineManager {
     ///
     /// 只给「宁可等、也不能拿到错误答案」的调用方用——目前只有加词去重。
     /// ⚠️ **绝不可用在按键处理链路上**：TSF→服务是同步 IPC，那一等就是整机卡顿。
-    pub fn word_codes_in_blocking(&self, schema_id: &str, text: &str) -> String {
+    ///
+    /// 索引本次建不出来（build_guard 退避）时返回 `Err(可读原因)`——**不能**当作查无此词，
+    /// 那等于去重失效；调用方应中止加词并把原因告诉用户。
+    pub fn word_codes_in_blocking(&self, schema_id: &str, text: &str) -> Result<String, String> {
         if schema_id.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
-        self.reverse_index_for(schema_id)
+        let idx = self.reverse_index_for(schema_id).ok_or_else(|| {
+            format!(
+                "方案 {schema_id} 的反查索引此前多次构建失败（常见原因是内存不足），\
+                 暂时无法校验重复，已取消本次加词。释放内存后可在设置里重建词库缓存再试。"
+            )
+        })?;
+        Ok(idx
             .codes_of(text)
             .map(|codes| codes.join("/"))
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// **词语联想的词源方案**：从哪本词库里捞「以上文为前缀的更长的词」。
@@ -1403,7 +1412,12 @@ impl EngineManager {
     /// ⚠️ **只该在两种场合调用**：后台预热线程，或用户主动发起、本就预期要等的操作
     /// （如加词去重校验——那里返回空表会导致**重复加词**，是正确性问题，不能降级）。
     /// 打字链路一律用 [`Self::reverse_index_if_ready`]。
-    fn reverse_index_for(&self, schema_id: &str) -> Arc<ReverseIndex> {
+    ///
+    /// 返回 `None` ＝ 本次构建被 build_guard 跳过（见 [`Self::build_reverse_index_for`]）。
+    /// 此时**不写缓存**：否则一张空表会被当成真结果一直用到进程结束。
+    ///
+    /// 走 `index_build_locks` 单飞：并发调用只有一个真在建，其余等它建完后复查即返回。
+    fn reverse_index_for(&self, schema_id: &str) -> Option<Arc<ReverseIndex>> {
         // primary 在 reverse_index 锁外取,避免嵌套锁。
         let primary = self
             .primary_codetable
@@ -1412,21 +1426,21 @@ impl EngineManager {
             .clone();
         // 快路径：已建好直接返回。
         if let Some(m) = self.reverse_index_if_ready(schema_id) {
-            return m;
+            return Some(m);
         }
-        // ★ 构建**必须在锁外**：这是一次秒级、且要分配上百 MB 的操作，握着锁做等于
-        //   让所有线程（包括查别的方案的）一起排队。此前正是持锁构建。
-        //   代价是两个线程可能同时建同一份（少见且无害，各自算完最后一个写入者生效）。
-        let m = Arc::new(self.build_reverse_index_for(schema_id));
+        // ★ 构建**不能握 `reverse_index` 锁**：这是一次秒级、且要分配上百 MB 的操作，
+        //   握着它等于让查别的方案的线程一起排队。只握本方案自己的构建锁。
+        let lock = self.index_build_lock_for(schema_id);
+        let _build = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 抢到锁后复查：等待期间可能已被另一线程建好。
+        if let Some(m) = self.reverse_index_if_ready(schema_id) {
+            return Some(m);
+        }
+        let m = Arc::new(self.build_reverse_index_for(schema_id)?);
         let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
-        // 复查：等待期间别的线程可能已经建好并写入，此时沿用它，避免同一份索引在内存里
-        // 存在两个副本（各 95MB 量级）。
-        if let Some(existing) = guard.get(schema_id) {
-            return existing.clone();
-        }
         guard.insert(schema_id.to_string(), m.clone());
         guard.retain(|k, _| k == schema_id || k == &primary);
-        m
+        Some(m)
     }
 
     /// 后台预热反查索引：把「首次使用时才建」提前到预热线程。
@@ -1437,16 +1451,9 @@ impl EngineManager {
     ///
     /// 幂等；返回是否真的执行了构建（供调用方计时/记日志）。
     ///
-    /// 走 `index_build_locks` 单飞：并发调用只有一个真在建，其余等它建完后看到已就绪即返回。
-    /// 与 `ensure_loaded` 同一套「取锁 → 复查」形态。
+    /// 单飞在 [`Self::reverse_index_for`] 里（`index_build_locks`）。
     pub fn prewarm_reverse_index(&self, schema_id: &str) -> bool {
         if schema_id.is_empty() || self.reverse_index_if_ready(schema_id).is_some() {
-            return false;
-        }
-        let lock = self.index_build_lock_for(schema_id);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        // 抢到锁后复查：等待期间可能已被另一线程建好。
-        if self.reverse_index_if_ready(schema_id).is_some() {
             return false;
         }
         let _ = self.reverse_index_for(schema_id);
@@ -1685,19 +1692,21 @@ impl EngineManager {
         scan
     }
 
-    fn build_reverse_index_for(&self, schema_id: &str) -> ReverseIndex {
+    /// 返回 `None` 仅当构建被 build_guard 跳过（同一份输入已连续死在构建中）：
+    /// 这**不是**「查无此词」，调用方不得把它当空表缓存或使用。
+    fn build_reverse_index_for(&self, schema_id: &str) -> Option<ReverseIndex> {
         let Some(data_dir) = self.data_dir.as_deref() else {
-            return ReverseIndex::default();
+            return Some(ReverseIndex::default());
         };
         let schemas = data_dir.join("schemas");
         let Some(schema) =
             Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
         else {
-            return ReverseIndex::default();
+            return Some(ReverseIndex::default());
         };
         let dicts = Self::load_dicts_individually(&schema, &schemas);
         if dicts.is_empty() {
-            return ReverseIndex::default();
+            return Some(ReverseIndex::default());
         }
         // 顺手清掉旧版留下的合并缓存（本方案已不再需要它）。
         Self::purge_legacy_combined(&schema, &schemas);
@@ -1725,7 +1734,7 @@ impl EngineManager {
                         idx.data_bytes() as f64 / 1024.0 / 1024.0,
                         idx.resident_bytes() as f64 / 1024.0 / 1024.0,
                     );
-                    return idx;
+                    return Some(idx);
                 }
                 // 指纹说新鲜但打不开＝文件被截断/损坏。落到下面重建即可，但要留痕：
                 // 静默重建会让「每次启动都慢」这类故障失去唯一的外部线索。
@@ -1743,7 +1752,7 @@ impl EngineManager {
                 wind_dict::build_guard::Gate::Proceed(a) => Some(a),
                 wind_dict::build_guard::Gate::Skip { reason } => {
                     error!("方案 {schema_id} 的反查索引本次不可用：{reason}");
-                    return ReverseIndex::default();
+                    return None;
                 }
             },
             _ => None,
@@ -1776,7 +1785,7 @@ impl EngineManager {
                                 idx.resident_bytes() as f64 / 1024.0 / 1024.0,
                                 built
                             );
-                            return idx;
+                            return Some(idx);
                         }
                         Err(e) => warn!("刚写好的反查索引 {} 打不开（{e}）", c.display()),
                     }
@@ -1797,7 +1806,7 @@ impl EngineManager {
             idx.data_bytes() as f64 / 1024.0 / 1024.0,
             built
         );
-        idx
+        Some(idx)
     }
 
     /// 取 `schema_id` 的单字全码表，缺则构建并缓存（只留一份，见字段注释）。
@@ -5288,10 +5297,10 @@ impl EngineManager {
                 // 逆切分：同为方案级引擎固定参数。切点有效性与「与整句同开」的告警在
                 // `CodeTableEngine::new` 里（那里才同时握着 max_code_length 与两个开关）。
                 //
-                // ⚠️ 下面两个旋钮取的是**本次构建的这份 schema**，混输下那就是
+                // ⚠️ 下面三个旋钮取的是**本次构建的这份 schema**，混输下那就是
                 // `primary_schema` 的值而非混输方案自己的 —— 之所以不必像 `split_input`
                 // 那样经 `MixedRole` 收敛，是因为混输下 `split_input` 已恒为 false，
-                // 两个旋钮读到什么都不会被用到。⚠️ 将来若给混输接上逆切分，**这两行必须
+                // 三个旋钮读到什么都不会被用到。⚠️ 将来若给混输接上逆切分，**这三行必须
                 // 一并收敛**，否则会得到「混输方案里写的档位静默失效、却继承了主码表的」。
                 split_input: resolve_split_input(mixed_role, schema.engine.codetable.split_input),
                 split_front_candidates: schema.engine.codetable.split_front_candidates,
@@ -8461,6 +8470,17 @@ input_chars = \"a-z;\"
     /// 跳过这次必败的构建而不是再死一次；源文件一变就恢复尝试。
     #[test]
     fn merged_pinyin_build_skipped_after_repeated_deaths() {
+        /// 无论断言成败都清掉：源目录，以及 merged 缓存那一组（`CACHE_DIR` 若已被同进程别的
+        /// 用例设成共享缓存根，它们就不在源目录下）。
+        struct Cleanup(Vec<std::path::PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = std::fs::remove_dir_all(p);
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
         let dir = std::env::temp_dir().join(format!("wind_eng_a17-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -8468,14 +8488,29 @@ input_chars = \"a-z;\"
         std::fs::write(&dict, "---\nname: py\n...\n你好\tni hao\t100\n").unwrap();
         let merged = cache_path(&dict, "merged.wdat");
         let key = wind_dict::cache_fp::build_key(&[dict.as_path()], MERGED_CACHE_TAG);
-
-        // 模拟前 MAX_ATTEMPTS 次启动都死在构建里：登记了尝试、却没走到 finish。
-        for _ in 0..wind_dict::build_guard::MAX_ATTEMPTS {
-            match wind_dict::build_guard::begin(&merged, &key) {
-                wind_dict::build_guard::Gate::Proceed(a) => drop(a),
-                wind_dict::build_guard::Gate::Skip { .. } => panic!("尚未到退避阈值"),
-            }
+        let sibling = |suffix: &str| {
+            let mut s = merged.clone().into_os_string();
+            s.push(suffix);
+            std::path::PathBuf::from(s)
+        };
+        let marker = sibling(".building");
+        let _cleanup = Cleanup(vec![
+            dir.clone(),
+            merged.clone(),
+            marker.clone(),
+            sibling(".fp"),
+        ]);
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent).unwrap();
         }
+
+        // 模拟前 MAX_ATTEMPTS 次启动都死在构建里：标记留在盘上、且没有活着的持有者
+        // （无持有者行＝持有者已死；本进程自己登记的会被判为「在建」而不计数）。
+        std::fs::write(
+            &marker,
+            format!("{key}\n{}\n", wind_dict::build_guard::MAX_ATTEMPTS),
+        )
+        .unwrap();
         assert!(
             EngineManager::load_rime_pinyin_dict(&dict).is_none(),
             "同一输入已连续死在构建中，本次应降级而不是再建"
@@ -8485,11 +8520,7 @@ input_chars = \"a-z;\"
         // 源变了 → 重新尝试并成功，且成功后不再留记录。
         std::fs::write(&dict, "---\nname: py\n...\n你好\tni hao\t200\n").unwrap();
         assert!(EngineManager::load_rime_pinyin_dict(&dict).is_some());
-        let mut marker = merged.clone().into_os_string();
-        marker.push(".building");
-        assert!(!std::path::Path::new(&marker).exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!marker.exists());
     }
 
     #[test]

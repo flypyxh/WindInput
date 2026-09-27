@@ -5073,7 +5073,20 @@ outside: rare
         assert_eq!(past["total"], json!(0));
 
         // ④ 词频记录里的最近使用优先于加入时间：选过一次的那条 lastUsed 取词频那份。
-        store.record_freq("pinyin", "nihao", "你好").unwrap();
+        //    写一个确定的、远在加入时间之后的时间戳，才能断言「取的就是词频那份」——
+        //    用 record_freq 取当前时间，与加入时间常落在同一秒，`>=` 恒真、测不出东西。
+        let freq_ts = now + 7 * 86400;
+        store
+            .import_freq_rows(
+                "pinyin",
+                &[wind_store::wdict::FreqIo {
+                    code: "nihao".into(),
+                    text: "你好".into(),
+                    count: 1,
+                    last_used: freq_ts,
+                }],
+            )
+            .unwrap();
         let v = call(json!({ "schemaId": "pinyin", "offset": 0, "limit": 100,
             "sortBy": "lastUsed", "sortOrder": "desc" }));
         assert_eq!(texts(&v).len(), 3);
@@ -5087,10 +5100,8 @@ outside: rare
                 .as_i64()
                 .unwrap()
         };
-        assert!(
-            last("你好") >= last("好呀"),
-            "词频的最近使用不应早于加入时间"
-        );
+        assert_eq!(last("你好"), freq_ts, "有词频记录时 lastUsed 须取词频那份");
+        assert!(last("好呀") < freq_ts, "无词频记录的仍取加入时间");
 
         // ⑤ 两个过滤条件取交集。
         let both = call(

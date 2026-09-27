@@ -161,7 +161,7 @@ pub fn parse_words_rime(text: &str, policy: CodePolicy) -> Result<(Vec<WordIo>, 
         };
         let (mut word, mut code_raw) = (get("text"), get("code"));
         // 命令栏语法条目列序写反时逐行对调（t172），与码表加载 `parse_rime_line` 同判据。
-        if crate::wdict::is_cmdbar_text(code_raw) && !crate::wdict::is_cmdbar_text(word) {
+        if crate::wdict::is_misplaced_cmdbar_code(code_raw) && !crate::wdict::is_cmdbar_text(word) {
             std::mem::swap(&mut word, &mut code_raw);
         }
         if word.is_empty() || code_raw.is_empty() {
@@ -231,7 +231,7 @@ pub fn parse_words_tsv(text: &str, policy: CodePolicy) -> Result<(Vec<WordIo>, u
         }
         let (mut code_raw, mut word) = (fields[0].trim(), fields[1].trim());
         // 同 Rime 路径：命令栏语法条目写在编码位时对调（t172）。
-        if crate::wdict::is_cmdbar_text(code_raw) && !crate::wdict::is_cmdbar_text(word) {
+        if crate::wdict::is_misplaced_cmdbar_code(code_raw) && !crate::wdict::is_cmdbar_text(word) {
             std::mem::swap(&mut word, &mut code_raw);
         }
         if code_raw.is_empty() || word.is_empty() || !is_valid_code(code_raw) {
@@ -369,6 +369,24 @@ mod tests {
         let (rows, skipped) = parse_words_tsv(&tsv, CodePolicy::CODETABLE).unwrap();
         assert_eq!(skipped, 0, "列序写反的 $SS 行不该被当非法行丢掉");
         assert_eq!((rows[1].code.as_str(), rows[1].text.as_str()), ("uu", ss));
+    }
+
+    /// 反例：编码列只含 `{`（无 marker）不算列序写反，两条路径都不得对调。
+    #[test]
+    fn import_does_not_swap_on_bare_brace_code() {
+        let rime = "---\nname: t\n...\n甲\t{a}\n";
+        let (rows, _) = parse_words_rime(rime, CodePolicy::CODETABLE).unwrap();
+        assert!(
+            rows.iter().all(|r| r.text != "{a}"),
+            "不该把 {{a}} 当文本: {rows:?}"
+        );
+
+        let tsv = "{a}\t甲\n";
+        let (rows, _) = parse_words_tsv(tsv, CodePolicy::CODETABLE).unwrap();
+        assert!(
+            rows.iter().all(|r| r.text != "{a}"),
+            "不该把 {{a}} 当文本: {rows:?}"
+        );
     }
 
     /// 反转义必须发生在 trim **之后**：转义序列在 trim 阶段是可见字符，剥不掉；

@@ -10,10 +10,14 @@
 //!
 //! # 机制
 //!
-//! 构建前在缓存旁写 `<cache>.building`（内容：输入键 + 已尝试次数），构建阶段完成后删掉。
-//! 进程若死在中间，标记留在盘上。下次启动：
+//! 构建前在缓存旁写 `<cache>.building`（内容：输入键 + 已登记次数 + 持有者身份），构建阶段
+//! 完成后删掉。进程若死在中间，标记留在盘上。下次启动：
 //! - 标记的输入键与本次相同、且已连续失败 [`MAX_ATTEMPTS`] 次 → **跳过构建**，调用方降级
 //!   （该词库本次不可用），并给出可读原因；
+//! - 标记的持有者**仍然活着** → 那是别的进程/线程正在建，不是死亡，**不计数**、照常放行
+//!   （各自构建，最后写入者生效）。只有持有者已死，它那次登记才算一次失败。
+//!   持有者身份 = pid + 进程启动时间（防 pid 复用）；判活失败时保守当作活着——
+//!   宁可少退避一次，也不能把并发的在建构建误判成死亡而让词库不可用；
 //! - 输入键不同（源文件变了）→ 计数归零，重新尝试；
 //! - 手动删掉标记文件 → 重新尝试。
 //!
@@ -30,13 +34,141 @@ fn marker_path(cache: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 读标记：`(输入键, 已尝试次数)`。不存在或内容残缺都当作没有记录。
-fn read_marker(marker: &Path) -> Option<(String, u32)> {
+/// 进程身份：pid + 启动时间。只比 pid 会被复用的 pid 骗过去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Holder {
+    pid: u32,
+    start: u64,
+}
+
+impl Holder {
+    fn current() -> Option<Holder> {
+        let pid = std::process::id();
+        Some(Holder {
+            pid,
+            start: process_start_time(pid)?,
+        })
+    }
+
+    /// 持有者是否仍在运行。**判不了就当活着**（见模块文档）。
+    fn is_alive(self) -> bool {
+        match process_start_time(self.pid) {
+            Some(start) => start == self.start,
+            None => !process_definitely_gone(self.pid),
+        }
+    }
+}
+
+/// 进程启动时间（单位各平台自定，只用于相等比较）。取不到返回 `None`。
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm 字段可含空格与括号，从最后一个 ')' 之后数：state 是第 3 字段，starttime 是第 22 个。
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(windows)]
+fn process_start_time(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: 只查询、句柄当场关闭。
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut c, mut e, mut k, mut u) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        let mut code = 0u32;
+        let times = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u).is_ok();
+        // 已退出但句柄仍被别人持有的进程还能打开，要看退出码。
+        let running = GetExitCodeProcess(h, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(h);
+        if !times {
+            return None;
+        }
+        // 已退出：返回一个不可能等于任何记录值的启动时间，让比较判为已死。
+        if !running {
+            return Some(u64::MAX);
+        }
+        Some(((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// 取不到启动时间时，能否**确定**该进程已不存在。确定不了一律 `false`（=当作活着）。
+#[cfg(target_os = "linux")]
+fn process_definitely_gone(pid: u32) -> bool {
+    // /proc 本身可读而该 pid 目录不存在 ⇒ 进程确实没了。
+    Path::new("/proc/self").exists() && !Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(windows)]
+fn process_definitely_gone(pid: u32) -> bool {
+    use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: 只探测能否打开；成功则立即关闭。
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+                false
+            }
+            // pid 不存在时 OpenProcess 报 ERROR_INVALID_PARAMETER；拒绝访问等则判不了。
+            Err(e) => e.code() == ERROR_INVALID_PARAMETER.to_hresult(),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn process_definitely_gone(_pid: u32) -> bool {
+    false
+}
+
+/// 盘上的标记。`count` 是已登记的尝试次数（**含**持有者自己那次）；
+/// `holder` 缺失（旧格式或取不到身份）当作已死。
+struct Marker {
+    key: String,
+    count: u32,
+    holder: Option<Holder>,
+}
+
+/// 读标记。不存在或内容残缺都当作没有记录。
+fn read_marker(marker: &Path) -> Option<Marker> {
     let text = std::fs::read_to_string(marker).ok()?;
     let mut lines = text.lines();
     let key = lines.next()?.to_string();
     let count = lines.next()?.trim().parse().ok()?;
-    Some((key, count))
+    let holder = lines.next().and_then(|l| {
+        let (pid, start) = l.trim().split_once(' ')?;
+        Some(Holder {
+            pid: pid.parse().ok()?,
+            start: start.parse().ok()?,
+        })
+    });
+    Some(Marker { key, count, holder })
+}
+
+/// 进程内按标记路径串行化 `begin` 的读-改-写，免得同进程两个线程读到同一计数。
+fn marker_lock(marker: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(marker.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// 一次已登记的构建尝试。构建阶段结束后必须调 [`BuildAttempt::finish`]；
@@ -74,8 +206,18 @@ pub enum Gate {
 /// 退避机制失效只是退回改动前的行为，不能因此让词库无法构建。
 pub fn begin(cache: &Path, key: &str) -> Gate {
     let marker = marker_path(cache);
+    let lock = marker_lock(&marker);
+    let _serial = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // prev = 已确认死在构建中的次数。持有者还活着 ⇒ 它那次登记是「在建」而非「死亡」。
     let prev = match read_marker(&marker) {
-        Some((k, n)) if k == key => n,
+        Some(m) if m.key == key => {
+            let holder_alive = m.holder.is_some_and(Holder::is_alive);
+            if holder_alive {
+                m.count.saturating_sub(1)
+            } else {
+                m.count
+            }
+        }
         _ => 0,
     };
     if prev >= MAX_ATTEMPTS {
@@ -98,7 +240,10 @@ pub fn begin(cache: &Path, key: &str) -> Gate {
     if let Some(dir) = marker.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(&marker, format!("{key}\n{}\n", prev + 1)) {
+    let holder = Holder::current()
+        .map(|h| format!("{} {}\n", h.pid, h.start))
+        .unwrap_or_default();
+    if let Err(e) = std::fs::write(&marker, format!("{key}\n{}\n{holder}", prev + 1)) {
         tracing::warn!(
             "无法写入构建标记 {}: {e}。若本次构建因内存不足崩溃，下次启动无法识别、会再次重试。",
             marker.display()
@@ -135,12 +280,39 @@ mod tests {
         }
     }
 
+    /// 模拟一次「进程死在构建中」：登记后不 finish，再把持有者改成一个已死的进程。
+    fn die_in_build(cache: &Path, key: &str) {
+        drop(proceed(begin(cache, key)));
+        let marker = marker_path(cache);
+        let m = read_marker(&marker).expect("begin 应已写入标记");
+        std::fs::write(
+            &marker,
+            format!("{}\n{}\n{} 1\n", m.key, m.count, dead_pid()),
+        )
+        .unwrap();
+    }
+
+    /// 一个肯定已退出的进程的 pid：起一个立即结束的子进程并回收。
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
     /// 连续死在构建里 MAX_ATTEMPTS 次后，同一份输入不再尝试。
     #[test]
     fn skips_after_repeated_deaths_with_same_input() {
         let (_d, cache) = cache_in("skips");
         for _ in 0..MAX_ATTEMPTS {
-            drop(proceed(begin(&cache, "k1"))); // 模拟进程死在构建中：不 finish
+            die_in_build(&cache, "k1");
         }
         match begin(&cache, "k1") {
             Gate::Skip { reason } => {
@@ -159,7 +331,7 @@ mod tests {
     fn retries_when_input_changes() {
         let (_d, cache) = cache_in("input_changes");
         for _ in 0..MAX_ATTEMPTS {
-            drop(proceed(begin(&cache, "k1")));
+            die_in_build(&cache, "k1");
         }
         proceed(begin(&cache, "k2")).finish();
     }
@@ -179,9 +351,66 @@ mod tests {
     fn deleting_marker_forces_retry() {
         let (_d, cache) = cache_in("delete");
         for _ in 0..MAX_ATTEMPTS {
-            drop(proceed(begin(&cache, "k1")));
+            die_in_build(&cache, "k1");
         }
         std::fs::remove_file(marker_path(&cache)).unwrap();
         proceed(begin(&cache, "k1")).finish();
+    }
+
+    /// ★ 回归（审查 H1）：持有者还活着的登记是「别人在建」，不是死亡。
+    /// 同 key 两个活着的 begin 都不 finish，第三次仍须放行。
+    #[test]
+    fn live_concurrent_builds_are_not_counted_as_deaths() {
+        let (_d, cache) = cache_in("live");
+        let a = proceed(begin(&cache, "k1"));
+        let b = proceed(begin(&cache, "k1"));
+        let c = proceed(begin(&cache, "k1"));
+        drop((a, b));
+        c.finish();
+    }
+
+    /// 持有者已死一次还不够，第二次死才跳过。
+    #[test]
+    fn skips_only_after_holder_died_max_times() {
+        let (_d, cache) = cache_in("dead_twice");
+        die_in_build(&cache, "k1");
+        drop(proceed(begin(&cache, "k1"))); // 第一次死后仍放行
+        let marker = marker_path(&cache);
+        let m = read_marker(&marker).unwrap();
+        std::fs::write(
+            &marker,
+            format!("{}\n{}\n{} 1\n", m.key, m.count, dead_pid()),
+        )
+        .unwrap();
+        assert!(matches!(begin(&cache, "k1"), Gate::Skip { .. }));
+    }
+
+    /// 旧格式标记（无持有者行）按已死处理，与改动前语义一致。
+    #[test]
+    fn legacy_marker_without_holder_counts_as_dead() {
+        let (_d, cache) = cache_in("legacy");
+        std::fs::write(marker_path(&cache), format!("k1\n{MAX_ATTEMPTS}\n")).unwrap();
+        assert!(matches!(begin(&cache, "k1"), Gate::Skip { .. }));
+    }
+
+    #[test]
+    fn current_process_is_alive_and_dead_child_is_not() {
+        let me = Holder::current().expect("本平台应能取到自身身份");
+        assert!(me.is_alive());
+        assert!(
+            !Holder {
+                pid: dead_pid(),
+                start: 1
+            }
+            .is_alive()
+        );
+        assert!(
+            !Holder {
+                start: me.start ^ 1,
+                ..me
+            }
+            .is_alive(),
+            "pid 复用要识破"
+        );
     }
 }

@@ -107,6 +107,10 @@ fn reverse_index_is_persisted_then_reused_without_rewriting() {
     if let Some(p) = &stale {
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(fp_of(p));
+        // 连同构建标记：别的测试进程若在构建中途被杀，残留标记会让本方案被退避跳过。
+        let mut b = p.as_os_str().to_os_string();
+        b.push(".building");
+        let _ = std::fs::remove_file(b);
     }
     let m1 = mgr(&dir);
     // 注意：返回值只说明「本次预热做了事」，**区分不了重建与复用**——
