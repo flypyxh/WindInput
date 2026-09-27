@@ -2356,13 +2356,16 @@ impl CandidateWindow {
     ///
     /// ⚠️ 独立编码栏（非内联）**不**走它：那一栏在旋转包裹层**外面**，本就没转过。
     ///
-    /// `leaf(片段, 该片段内的 caret 字节位)` 由调用方构造——各处的字号/字重/字族/颜色
-    /// 都不同，把它们全收成参数会得到一个七参数函数。
+    /// `leaf(片段, 该片段内的 caret 字节位, 该片段在整串里的字节偏移)` 由调用方构造——各处的
+    /// 字号/字重/字族/颜色都不同，把它们全收成参数会得到一个七参数函数。不切格时偏移为 0。
+    ///
+    /// 偏移是给分段颜色用的：着色区间按整串的字节偏移给出，逐格切开后每格要取落在自己范围内的
+    /// 那几段、平移到格内偏移（[`crate::text::dwrite::ColorRun::slice`]）。
     fn upright_text(
         &self,
         text: &str,
         caret: Option<usize>,
-        leaf: impl Fn(&str, Option<usize>) -> View,
+        leaf: impl Fn(&str, Option<usize>, usize) -> View,
     ) -> View {
         let cells = if self.upright {
             crate::text::script::upright_cells(text)
@@ -2370,7 +2373,7 @@ impl CandidateWindow {
             Vec::new()
         };
         if cells.is_empty() {
-            return leaf(text, caret);
+            return leaf(text, caret, 0);
         }
         // 局部空间里是个 Row（左→右），经外层顺时针转完才是屏幕上的一列（上→下）。
         // 跨轴居中让宽窄不一的格（半角/全角混排）在列内对齐。
@@ -2383,7 +2386,7 @@ impl CandidateWindow {
             let local = caret
                 .filter(|c| *c >= off && (*c < end || i == last))
                 .map(|c| c - off);
-            row = row.child(View::rotated_ccw(leaf(cell, local)));
+            row = row.child(View::rotated_ccw(leaf(cell, local, off)));
             off = end;
         }
         row
@@ -2408,7 +2411,7 @@ impl CandidateWindow {
         let caret_w = self.scale.max(1.0);
         // 直立态逐格切时 caret 由 `upright_text` 分派到它落进的那一格；转完是格间的一条
         // **横**线，正是纵排里插入符该有的样子。整块不切时行为与此前逐字节一致。
-        let build = |seg: &str, caret: Option<usize>| {
+        let build = |seg: &str, caret: Option<usize>, _off: usize| {
             let mut leaf = View::leaf(seg.to_string(), color)
                 .font_size(fs)
                 .font_weight(weight)
@@ -2422,7 +2425,7 @@ impl CandidateWindow {
         if upright {
             self.upright_text(&display, Some(self.preedit_caret), build)
         } else {
-            build(&display, Some(self.preedit_caret))
+            build(&display, Some(self.preedit_caret), 0)
         }
     }
 
@@ -3350,7 +3353,7 @@ impl CandidateWindow {
             let ml_weight = v.mode_label.font_weight;
             let ml_family = v.mode_label.font_family.clone();
             let chip = decorate_mode_chip(
-                self.upright_text(&self.mode_label, None, |seg, _| {
+                self.upright_text(&self.mode_label, None, |seg, _, _| {
                     View::leaf(seg.to_string(), ml_color)
                         .font_size(ml_fs)
                         .font_weight(ml_weight)
@@ -3535,7 +3538,7 @@ impl CandidateWindow {
             // 直立态逐格扶正（见 `upright_text`）。装饰（底色/边框/内外边距）留在**外层
             // 容器**上，整段文字仍是一个整体，不会每个字各画一个药丸。
             let mut tleaf = self
-                .upright_text(&display_text, None, |seg, _| {
+                .upright_text(&display_text, None, |seg, _, _| {
                     View::leaf(seg.to_string(), txt_color)
                         .font_size(text_fs)
                         .font_weight(text_weight)
@@ -3567,7 +3570,7 @@ impl CandidateWindow {
                 let cmt_weight = eff_weight(&v.comment, &v.item, is_sel, is_hover);
                 let cmt_family = v.comment.font_family.clone();
                 let mut cleaf = self
-                    .upright_text(&cand.comment, None, |seg, _| {
+                    .upright_text(&cand.comment, None, |seg, _, _| {
                         View::leaf(seg.to_string(), cmt_color)
                             .font_size(comment_fs)
                             .font_weight(cmt_weight)
@@ -7383,6 +7386,84 @@ mod tip_hold_tests {
         w.hover = -1;
         w.update_tooltip(0, 0);
         assert_eq!(w.tip_for.get(), -1);
+    }
+}
+
+// 直立态逐格切叶子时，分段颜色跟着格走（设计 text-span-colors.md §7.1）。
+#[cfg(test)]
+mod upright_color_run_tests {
+    use super::*;
+    use crate::text::dwrite::ColorRun;
+
+    fn window(upright: bool) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.set_orientation(false, upright, upright);
+        w
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    /// 「a你b」：红 `a你`（0..4）、蓝 `b`（4..5）。
+    fn runs() -> Vec<ColorRun> {
+        vec![
+            ColorRun {
+                start: 0,
+                end: 4,
+                rgba: RED,
+            },
+            ColorRun {
+                start: 4,
+                end: 5,
+                rgba: BLUE,
+            },
+        ]
+    }
+
+    fn build(w: &CandidateWindow) -> View {
+        let runs = runs();
+        w.upright_text("a你b", None, |seg, _, off| {
+            View::leaf(seg, [0, 0, 0, 255]).color_runs(ColorRun::slice(&runs, off, off + seg.len()))
+        })
+    }
+
+    /// 不切格：偏移为 0，一个叶子拿全部区间，原样。
+    #[test]
+    fn unsplit_leaf_keeps_all_runs() {
+        let v = build(&window(false));
+        assert_eq!(v.text.as_deref(), Some("a你b"));
+        assert_eq!(v.color_runs, runs());
+    }
+
+    /// 直立态逐格切：每格拿到自己范围内的那段、平移到格内偏移。
+    #[test]
+    fn upright_cells_get_their_own_slice() {
+        let v = build(&window(true));
+        // 每格是扶正包裹层（旋转节点）里的一个叶子。
+        let cells: Vec<(&str, &[ColorRun])> = v
+            .children
+            .iter()
+            .map(|c| {
+                let leaf = &c.children[0];
+                (leaf.text.as_deref().unwrap(), leaf.color_runs.as_slice())
+            })
+            .collect();
+        let one = |end, rgba| {
+            vec![ColorRun {
+                start: 0,
+                end,
+                rgba,
+            }]
+        };
+        assert_eq!(
+            cells,
+            vec![
+                ("a", one(1, RED).as_slice()),
+                ("你", one(3, RED).as_slice()),
+                ("b", one(1, BLUE).as_slice()),
+            ]
+        );
     }
 }
 

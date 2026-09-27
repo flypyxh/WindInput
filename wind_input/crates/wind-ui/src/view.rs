@@ -7,7 +7,7 @@
 //!
 //! 九宫格图 / 阴影模糊 / z 分层 / 渐变背景均已支持。
 
-use crate::text::dwrite::{TextRenderer, TextStyle};
+use crate::text::dwrite::{ColorRun, TextRenderer, TextStyle};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::{
@@ -432,6 +432,12 @@ pub struct View {
     pub border: Option<([u8; 4], f32)>,
     pub text: Option<String>,
     pub text_color: [u8; 4],
+    /// 分段颜色：按字节区间覆盖 `text_color`。空 = 整段 `text_color`（出厂路径）。
+    ///
+    /// **只在 paint 消费，不参与 measure/布局**，理由同 [`View::caret_at`]：着色边界若拆成
+    /// 多个节点各自测量，`measure(a+b) != measure(a)+measure(b)`，宽度会随颜色边界抖动。
+    /// 整串一次整形，颜色只作用于绘制（见 [`TextRenderer::draw_runs`]）。
+    pub color_runs: Vec<ColorRun>,
     /// 文本字号（设备像素）；None=用渲染器基准字号。序号/注释按相对偏移设具体值。
     pub font_size: Option<f32>,
     /// 文本字重（400/500/700…）；None/0=继承渲染器默认（NORMAL）。
@@ -526,6 +532,7 @@ impl Default for View {
             border: None,
             text: None,
             text_color: [0, 0, 0, 255],
+            color_runs: Vec::new(),
             font_size: None,
             font_weight: None,
             font_family: None,
@@ -626,6 +633,12 @@ impl View {
         self.border = Some((c, w));
         self
     }
+    /// 设置分段颜色（字节区间，见 [`View::color_runs`]）。
+    pub fn color_runs(mut self, runs: Vec<ColorRun>) -> Self {
+        self.color_runs = runs;
+        self
+    }
+
     /// 在文本的 `byte_pos` 处画插入符（覆盖层，不影响布局；见 [`View::caret_at`] 字段说明）。
     /// 位置自动夹到字符边界——越界截到末尾、落在字符中间退回前一边界，故 paint 的切片恒安全。
     pub fn caret_at(mut self, byte_pos: usize, width: f32) -> Self {
@@ -986,6 +999,7 @@ impl View {
         f!("border", border);
         f!("text", text);
         f!("color", text_color);
+        f!("runs", color_runs);
         f!("size", font_size);
         f!("weight", font_weight);
         f!("family", font_family);
@@ -1188,16 +1202,31 @@ impl View {
                 Align::End => cx0 + content_w - m.width,
             };
             let ty = r.y + self.padding.t + (content_h - m.height) * 0.5;
-            let _ = tr.draw(
-                buf,
-                buf_w,
-                buf_h,
-                tx.max(r.x),
-                ty.max(r.y),
-                t,
-                &ts,
-                self.text_color,
-            );
+            // 没有分段颜色就走原来的 `draw`，出厂路径一个调用都不变（golden 对拍守着）。
+            let _ = if self.color_runs.is_empty() {
+                tr.draw(
+                    buf,
+                    buf_w,
+                    buf_h,
+                    tx.max(r.x),
+                    ty.max(r.y),
+                    t,
+                    &ts,
+                    self.text_color,
+                )
+            } else {
+                tr.draw_runs(
+                    buf,
+                    buf_w,
+                    buf_h,
+                    tx.max(r.x),
+                    ty.max(r.y),
+                    t,
+                    &ts,
+                    self.text_color,
+                    &self.color_runs,
+                )
+            };
             // 插入符：覆盖在已绘文本之上，按前半段宽度定位。前半段单独整形与其在整串中的
             // 实际推进有极小字距差异，但只偏移竖线自身、不动文本（布局恒用整串 m.width）。
             if let Some(cp) = self.caret_at {
@@ -3637,5 +3666,42 @@ mod bg_place_tests {
         assert_eq!(rgb(&full, w, 27, 6), [0, 0, 255], "没有拉伸铺满");
         assert_eq!(alpha(&full, w, 0, 0), 0);
         assert!(full == placed, "铺满与等尺寸定位不一致");
+    }
+}
+
+// 分段颜色的接线：有区间走 `draw_runs`、没有走原来的 `draw`，且区间不影响布局。
+// 只有 mock 后端记绘制调用，故限 Linux。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod color_runs_paint_tests {
+    use super::*;
+
+    fn paint_log(v: &mut View) -> Vec<String> {
+        let tr = TextRenderer::new("test", 20.0).unwrap();
+        v.layout(0.0, 0.0, &tr);
+        let mut buf = vec![0u8; 200 * 50 * 4];
+        v.paint(&mut buf, 200, 50, &tr);
+        tr.take_draw_log()
+    }
+
+    #[test]
+    fn runs_route_to_draw_runs_and_plain_stays_on_draw() {
+        let run = ColorRun {
+            start: 0,
+            end: 1,
+            rgba: [255, 0, 0, 255],
+        };
+        let mut colored = View::leaf("ab", [0, 0, 0, 255]).color_runs(vec![run]);
+        let mut plain = View::leaf("ab", [0, 0, 0, 255]);
+        let c = paint_log(&mut colored);
+        let p = paint_log(&mut plain);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].starts_with("draw_runs ") && c[0].contains("runs=[ColorRun"));
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("draw "), "无区间必须仍走 draw：{}", p[0]);
+        assert_eq!(
+            colored.measured_size(),
+            plain.measured_size(),
+            "颜色不参与布局"
+        );
     }
 }
