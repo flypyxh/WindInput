@@ -170,7 +170,10 @@ impl Coordinator {
             }
             // 空格选候选、回车上屏原文（分工见 `mode_completion.rs` 文件头）。
             // ⛔ 不要把这两个键并回一条 —— 那样打了一半的邮箱就再也上不了屏。
-            keymap::VK_SPACE => self.commit_email(state, true),
+            // 有候选那一支与 `commit_highlighted` 动词同一出口；无候选上屏原文。
+            keymap::VK_SPACE => self
+                .commit_highlighted(state)
+                .unwrap_or_else(|| self.commit_email(state, true)),
             keymap::VK_RETURN => self.commit_email(state, false),
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;

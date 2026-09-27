@@ -1905,7 +1905,7 @@ impl Coordinator {
     ///
     /// 抽成方法而不是在两处各写一遍，就是因为它已经漂移过一次：空格臂与⑥标点臂绕开了，
     /// 中间那条没有。护栏见 `tests/mix_repeat_no_freq.rs`。
-    fn commit_mix_repeat(&self, state: &mut State, text: String) -> KeyAction {
+    pub(crate) fn commit_mix_repeat(&self, state: &mut State, text: String) -> KeyAction {
         // 一个键重出上次全部内容：字数如实计，但速度分子按「1 击键」封顶，否则一键几十字
         // 会把速度顶穿（本路径 code_len 恒 0，不显式传就漏封）。
         self.record_commit_ks(&text, 0, 1, 0, wind_store::stats::CommitSource::Mix);
@@ -2745,47 +2745,38 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 重复上屏：整体上屏上次内容，不记选词/不造词（该候选无对应编码）。
-                if state.mix_repeat && !state.candidates.is_empty() {
-                    let text = state.candidates[0].text.clone();
-                    return self.commit_mix_repeat(state, text);
+                // 空格：选当前高亮候选（文本透镜逐步转换；重复上屏态整体上屏上次内容），
+                // 与 `commit_highlighted` 动词同一出口。
+                if let Some(act) = self.commit_highlighted(state) {
+                    return act;
                 }
-                // 空格：选当前高亮候选（文本透镜逐步转换）
-                if state.candidates.is_empty() {
-                    // 空码空格：按 space_on_empty_behavior，与主路同一判据——"clear" 连已选段
-                    // 一起丢；否则上屏「引导字母 + 已选段 + 剩余原码」。字母引导键
-                    // （z_key_action = "mix:<id>"）归还同回车，见 `guide_to_return`。
-                    if self.rt().config.input.space_on_empty_behavior == "clear" {
-                        return commit_text(self, state, String::new());
-                    }
-                    let guide = Self::guide_to_return(&state.mix_prefix, &state.committed_text);
-                    // committed 段已在各次选词记过，此处只记本次实际上屏的原码避免重复。
-                    let raw = format!("{}{}", guide, state.mix_buffer);
-                    self.record_commit(
-                        &raw,
-                        raw.len() as u32,
-                        -1,
-                        wind_store::stats::CommitSource::Mix,
-                    );
-                    let raw_text = format!("{}{}{}", guide, state.committed_text, state.mix_buffer);
-                    // 原码类上屏也进上屏历史（转换前形态、不含补的空格，同回车）；原码不记词频。
-                    self.push_commit_history(&raw_text);
-                    let out = self.maybe_convert(state, &raw_text);
-                    // 含英文成员的实例对齐临英空格兜底（A2-3b）：全角态转全角、按临英开关
-                    // 补空格。数字透镜（算式无结果）不算英文，原样上屏。
-                    let out = if self.mix_raw_counts_as_english(state) {
-                        Self::mix_english_width(state, &out) + self.mix_english_space(state)
-                    } else {
-                        out
-                    };
-                    commit_text(self, state, out)
+                // 空码空格：按 space_on_empty_behavior，与主路同一判据——"clear" 连已选段
+                // 一起丢；否则上屏「引导字母 + 已选段 + 剩余原码」。字母引导键
+                // （z_key_action = "mix:<id>"）归还同回车，见 `guide_to_return`。
+                if self.rt().config.input.space_on_empty_behavior == "clear" {
+                    return commit_text(self, state, String::new());
+                }
+                let guide = Self::guide_to_return(&state.mix_prefix, &state.committed_text);
+                // committed 段已在各次选词记过，此处只记本次实际上屏的原码避免重复。
+                let raw = format!("{}{}", guide, state.mix_buffer);
+                self.record_commit(
+                    &raw,
+                    raw.len() as u32,
+                    -1,
+                    wind_store::stats::CommitSource::Mix,
+                );
+                let raw_text = format!("{}{}{}", guide, state.committed_text, state.mix_buffer);
+                // 原码类上屏也进上屏历史（转换前形态、不含补的空格，同回车）；原码不记词频。
+                self.push_commit_history(&raw_text);
+                let out = self.maybe_convert(state, &raw_text);
+                // 含英文成员的实例对齐临英空格兜底（A2-3b）：全角态转全角、按临英开关
+                // 补空格。数字透镜（算式无结果）不算英文，原样上屏。
+                let out = if self.mix_raw_counts_as_english(state) {
+                    Self::mix_english_width(state, &out) + self.mix_english_space(state)
                 } else {
-                    let (start, _) = self.page_range(state);
-                    let gi = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
-                    self.mix_select(state, gi - start)
-                }
+                    out
+                };
+                commit_text(self, state, out)
             }
             keymap::VK_RETURN => {
                 // clear 模式：整段放弃，不上屏任何内容（含已选词的 committed_text）。

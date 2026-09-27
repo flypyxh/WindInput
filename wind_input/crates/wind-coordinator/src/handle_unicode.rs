@@ -242,7 +242,12 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
-            keymap::VK_SPACE | keymap::VK_RETURN => self.commit_unicode(state),
+            // 空格有候选那一支与 `commit_highlighted` 动词同一出口；回车与无候选空格同为
+            // `commit_unicode`（它自己处置「码点不合法、无候选」那一格）。
+            keymap::VK_SPACE => self
+                .commit_highlighted(state)
+                .unwrap_or_else(|| self.commit_unicode(state)),
+            keymap::VK_RETURN => self.commit_unicode(state),
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 // 小键盘（direct 语义）回退 `numpad_char`：十六进制含 0-9，与主键盘同待遇。

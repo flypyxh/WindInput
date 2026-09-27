@@ -4741,6 +4741,13 @@ impl Coordinator {
                 // 内容，用户正在打的那串码要原样留着。
                 return Some(KeyAction::Consumed);
             }
+            // 上屏高亮：与各模式空格臂**同一个函数**，副作用逐字一致（见 `commit_highlighted`）。
+            // 不走空格臂本身——那里有 `space_as_input` 这类**空格键**的变体，本动词不跟；
+            // 联想 `space_commits = false` 则跟（判据在 `commit_highlighted` 里）。
+            // 无候选已被上面的 `requires_candidates` 放行。
+            wind_config::SessionAction::CommitHighlighted => {
+                return self.commit_highlighted(state);
+            }
             // 表里只存启用项（`ConfigBundle::build` 过滤过），None 到不了这里。
             wind_config::SessionAction::None => return None,
         };
@@ -5362,6 +5369,7 @@ impl Coordinator {
                     wind_config::SessionAction::AuxCode(wind_config::AuxCodeShare::PageNext) => {
                         "辅助码/翻页键"
                     }
+                    wind_config::SessionAction::CommitHighlighted => "上屏键",
                     _ => "翻页/高亮键",
                 });
             }

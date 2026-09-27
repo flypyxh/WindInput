@@ -746,12 +746,9 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 空格：选当前高亮候选（逐步转换）
-                if !state.candidates.is_empty() {
-                    let (start, _) = self.page_range(state);
-                    let idx = (start + state.selected_index).min(state.candidates.len() - 1);
-                    let cand = state.candidates[idx].clone();
-                    self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
+                // 空格：选当前高亮候选（逐步转换），与 `commit_highlighted` 动词同一出口。
+                if let Some(act) = self.commit_highlighted(state) {
+                    act
                 } else {
                     // 无候选（空码空格）：按 space_on_empty_behavior，与主路同一判据——
                     // "clear" 连已选段一起丢；否则上屏「引导字母 + 已选段 + 剩余原码」，
@@ -1624,12 +1621,11 @@ impl Coordinator {
                 if self.rt().config.input.temp_english.space_as_input {
                     Self::temp_english_insert(state, ' ');
                     refresh(self, state)
-                } else if !state.candidates.is_empty() {
+                } else if let Some(act) = self.commit_highlighted(state) {
                     // 空格：上屏当前高亮候选（首候选=原始输入）；命令候选执行动作。
-                    let idx = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
-                    self.commit_temp_english_selected(state, idx)
+                    // 与 `commit_highlighted` 动词同一出口——那个动词**不跟** `space_as_input`
+                    // 这个变体，恒为上屏高亮，故开关判在本臂而不在出口里。
+                    act
                 } else {
                     // 无候选（`show_candidates` 关闭 / 原文与变形都不产 / `in_dict` 未命中且词库无命中）：上屏缓冲原文。这正是英文方案
                     // 「空格上屏原码」的对应出口，故同样补空格。

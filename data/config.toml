@@ -1134,6 +1134,10 @@ key_actions = {}
 #       single_char / single_char:on / :off / :toggle / :follow(开关单字输入，动词与上面的
 #           key_actions 完全一样。按下即开关并就地重出候选，不会把正在打的码上屏。
 #           ⚠️ 空闲时不吞键：绑在 Tab 上，没打字时 Tab 仍是宿主的制表符)
+#       commit_highlighted(上屏当前高亮候选，与按空格选词完全相同：词频、上屏历史、补空格
+#           都一样。只在有候选时生效，没候选时这个键照常。临时英文里开了「空格作输入」
+#           时它仍是上屏高亮——想用别的键代替空格选词，就绑这个。联想候选跟随
+#           [input.association] space_commits：那里关掉时它也不选联想)
 # 例（Tab 向下翻页、CapsLock 向上翻页）：
 #   session_actions = { tab = "page_next", "shift+tab" = "page_prev", capslock = "page_prev" }
 # 例（Tab 一键两用：第一次按进辅助码筛选，之后按继续翻页）：

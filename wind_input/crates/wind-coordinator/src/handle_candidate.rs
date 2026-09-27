@@ -2435,6 +2435,67 @@ impl Coordinator {
         })
     }
 
+    /// 上屏当前高亮候选，按当前活跃模式派发——**各模式空格键「有候选」那一支的唯一实现**，
+    /// 也是会话态动词 `commit_highlighted` 的执行体。无候选返回 `None`（空码空格各模式另有
+    /// 处置，那不属于「上屏高亮」）。
+    ///
+    /// # 为什么空格臂也改成调它，而不是本函数照着空格臂再写一份
+    ///
+    /// 动词的承诺是「与按空格**完全同一出口**」——词频、上屏历史、统计来源、造词、补空格。
+    /// 这些副作用各模式出口各有一套（临拼要分步转换、mix 有重复上屏特判、辅助码要按消费
+    /// 长度决定留不留在模式内），照抄一份就是两处要同步维护的派发，漂移时表现为「按空格和
+    /// 按绑定键，上屏的字一样、词频却不一样」，没人会去对比。
+    ///
+    /// 与 [`Self::select_page_candidate`] 的分野：那个按**页内序号**选（二三候选键），本函数
+    /// 按**高亮**选，且网址 / 邮箱 / Unicode 三个模式在这里**有**出口（空格本就上屏它们的
+    /// 高亮补全项），在那里没有（数字是它们的合法字符）。
+    pub(crate) fn commit_highlighted(&self, state: &mut State) -> Option<KeyAction> {
+        if state.candidates.is_empty() {
+            return None;
+        }
+        // 联想态 + `space_commits = false`：联想的高亮是输入法猜的，用户明说了「空格不选
+        // 联想」，绑定键同样不选——返回 `None`，键回落它原本的语义（不吞键）。
+        //
+        // 与空格臂的分工：空格臂在调本函数**之前**自己判这一条，因为它那一格还有下文
+        // （收窗后照常出空格）；那是空格这个键的原语义，不是「上屏高亮」的一部分。
+        if state.assoc_active() && !self.assoc_config().space_commits {
+            return None;
+        }
+        let (start, _) = self.page_range(state);
+        let gi = self
+            .highlighted_global_index(state)
+            .min(state.candidates.len() - 1);
+        let offset = gi - start;
+        Some(match state.active {
+            None => {
+                let cand = state.candidates[gi].clone();
+                self.commit_selected(state, &cand, offset as i32)
+            }
+            Some(ModeKind::TempPinyin) => {
+                let cand = state.candidates[gi].clone();
+                self.commit_temp_pinyin_selected(state, &cand, offset as i32)
+            }
+            Some(ModeKind::TempEnglish) => self.commit_temp_english_selected(state, gi),
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+                self.commit_special_candidate(state, gi)
+            }
+            // 重复上屏：整体上屏上次内容，不记选词/不造词（该候选无对应编码）。
+            Some(ModeKind::Mix(_)) if state.mix_repeat => {
+                let text = state.candidates[0].text.clone();
+                self.commit_mix_repeat(state, text)
+            }
+            Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
+            // 部分消费时要留在模式内继续筛，见 `select_page_candidate` 的同名分支。
+            Some(ModeKind::AuxCode) => {
+                let cand = state.candidates[gi].clone();
+                self.aux_code_committed(state, cand, offset as i32)
+            }
+            Some(ModeKind::Url) => self.commit_url(state, true),
+            Some(ModeKind::Email) => self.commit_email(state, true),
+            Some(ModeKind::Unicode) => self.commit_unicode(state),
+        })
+    }
+
     /// 修饰键（`select_key_groups` 里的 `lrshift` / `lrctrl`）作二三候选键的 **keyup** 入口。
     ///
     /// 为什么在 keyup：见 `hotkey::compile_select_modifier_group`——纯修饰键的 keydown 既不能

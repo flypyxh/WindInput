@@ -325,11 +325,9 @@ impl Coordinator {
             }
             keymap::VK_SPACE | keymap::VK_RETURN => {
                 // 空格/回车：选当前高亮候选（正常拼音上屏路径），然后退出辅助码。
-                if let Some((cand, offset)) = self.highlighted_candidate(state) {
-                    self.aux_code_committed(state, cand, offset)
-                } else {
-                    self.aux_code_exited(state)
-                }
+                // 与 `commit_highlighted` 动词同一出口。
+                self.commit_highlighted(state)
+                    .unwrap_or_else(|| self.aux_code_exited(state))
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
                 // 数字选当前页第 N 个。

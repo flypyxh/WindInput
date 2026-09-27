@@ -1745,6 +1745,7 @@ impl BoundAction {
 /// - `"select_candidate:N"`：选中当前页第 N 个候选（N 从 1 起、至多 10，`2` 即次选键）
 /// - `"select_char:N"`：以词定字，取当前高亮候选词的第 N 个字（N 从 1 起）
 /// - `"aux_code"` / `"aux_code:page_next"`：进辅助码筛选（后者与下翻页共键）
+/// - `"commit_highlighted"`：上屏当前高亮候选（即空格的「选词」功能）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     /// 未启用 / 显式禁用。
@@ -1801,6 +1802,21 @@ pub enum SessionAction {
     /// 载荷 [`AuxCodeShare`] 是**这个动词的参数**（共键降级目标），不是第二条绑定，
     /// 理由见那里。
     AuxCode(AuxCodeShare),
+    /// 上屏当前高亮候选——空格在「有候选」时做的那件事，换一个键来按。
+    ///
+    /// 执行体与各模式空格臂是**同一个函数**（`Coordinator::commit_highlighted`），词频、
+    /// 上屏历史、统计、造词、补空格等副作用逐字一致。
+    ///
+    /// ⚠️ 两个空格变体，取舍相反：
+    ///
+    /// - 临英 `space_as_input`（空格作输入字符）**不跟**：那是「空格这个键拿去干别的」，
+    ///   上屏职责移交给了别的键，绑本动词的用户要的正是「上屏高亮」这个动作本身。
+    /// - 联想态 `space_commits = false`（空格不选联想）**跟**：它表达的是「联想的高亮是
+    ///   输入法猜的，别替我选」，这个意愿与用哪个键无关。此时本动词不吞键、回落原语义。
+    ///
+    /// 只在有候选时生效（[`Self::requires_candidates`]）：没有高亮可上屏时按键回落原语义，
+    /// 空码空格的那套处置（`space_on_empty_behavior`）不属于本动词。
+    CommitHighlighted,
 }
 
 /// 辅助码触发键的「共键」参数：**进不去辅助码时，这个键改做什么**。
@@ -1896,6 +1912,7 @@ impl SessionAction {
             // 用户把配置从一张表挪到另一张就会静默失效。
             // （`key_actions` 那张表没有共键形态：它只认符号键与字母 z，翻页键压根解析不出来。）
             "aux_code" => Self::AuxCode(AuxCodeShare::Solo),
+            "commit_highlighted" => Self::CommitHighlighted,
             // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
             "cancel" | "clear" => Self::Cancel,
             _ => Self::None,
@@ -1976,6 +1993,7 @@ impl std::fmt::Display for SessionAction {
             Self::AuxCode(AuxCodeShare::Solo) => f.write_str("aux_code"),
             Self::AuxCode(AuxCodeShare::PageNext) => f.write_str("aux_code:page_next"),
             Self::SingleChar(a) => write!(f, "single_char:{}", a.as_payload()),
+            Self::CommitHighlighted => f.write_str("commit_highlighted"),
         }
     }
 }
@@ -9559,6 +9577,23 @@ mod tests {
             !SessionAction::Cancel.requires_candidates(),
             "cancel 在有编码无候选时必须生效，否则网址模式里按了没反应"
         );
+    }
+
+    /// `commit_highlighted`：解析与回写互逆，且**要候选**——没有高亮可上屏时按键回落原语义。
+    #[test]
+    fn commit_highlighted_round_trips_and_requires_candidates() {
+        let a = SessionAction::parse(" Commit_Highlighted ");
+        assert_eq!(a, SessionAction::CommitHighlighted);
+        assert_eq!(
+            SessionAction::parse(&a.to_string()),
+            a,
+            "Display 与 parse 须互逆"
+        );
+        assert_eq!(
+            SessionAction::parse_checked("commit_highlighted"),
+            Some(SessionAction::CommitHighlighted)
+        );
+        assert!(a.requires_candidates(), "无候选时无高亮可上屏，须放行按键");
     }
 
     /// 存量迁移：`trigger_keys` 里的 z → `z_key_action`，其余字母丢弃。

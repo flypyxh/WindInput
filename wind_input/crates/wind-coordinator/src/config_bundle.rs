@@ -156,7 +156,7 @@ fn warn_unknown_session_actions(config: &Config) {
                  可选 page_prev / page_next / highlight_up / highlight_down / cancel / \
                  select_candidate:N / select_char:N / aux_code / aux_code:page_next / \
                  single_char / single_char:on / single_char:off / single_char:toggle / \
-                 single_char:follow / none",
+                 single_char:follow / commit_highlighted / none",
             );
             continue;
         }

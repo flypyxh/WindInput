@@ -138,6 +138,7 @@ capslock = "page_prev"
 | 选择 | `select_candidate:2` `select_candidate:3` `select_char:1` `select_char:2` | 收编 `select_key_groups` / `select_char_keys` |
 | 处置 | `cancel`（别名 `clear`） | 收编六处 Esc |
 | 筛选 | `aux_code` `aux_code:page_next` | 辅助码（拼音候选的字形二次筛选） |
+| 上屏 | `commit_highlighted` | 空格「有候选」那一支（上屏当前高亮候选） |
 | — | `none` | 禁用该键在本态的绑定 |
 
 ### ★ 与翻页共键做成 `aux_code` 的**参数**，不是新动词、更不是通用降级链
@@ -211,6 +212,25 @@ capslock = "page_prev"
 
 `commit_raw` / `commit_first` 未实施：没有对应的用户诉求，且它们与 `input.enter_behavior`
 的取值域正面重叠（§6.1 已论证那属于 Enter 的参数）。真要做，得先想清楚两者的关系。
+
+### ★ `commit_highlighted` 是空格的**动作**，不是空格的**参数**
+
+它与 `commit_first` 的区别正是 §6.1 那条判据：「上屏当前高亮候选」在所有模式都是**同一个
+动作**（各模式空格臂有候选那一支），不是某个键的取值域。实现上各模式空格臂与本动词调的是
+**同一个函数** `Coordinator::commit_highlighted`——另写一份派发的话，上屏的字对得上、词频 /
+上屏历史 / 统计来源却可能悄悄分叉，没人会去对比。
+
+- **两个空格变体，取舍相反**：
+  - 临英 `space_as_input`（空格作输入字符）**不跟**：那是空格这个键被拿去干别的、上屏
+    职责移交给了别的键；用户绑本动词要的恰恰是「上屏高亮」这个动作本身。
+  - 联想态 `space_commits = false`（空格不选联想）**跟**：它表达的是「联想的高亮是输入法
+    猜的，别替我选」，与用哪个键无关。此时本动词返回 `None`、不吞键，键回落原语义
+    （判据写在 `commit_highlighted` 里；空格臂在调它之前自判，因为空格那一格还有「收窗后
+    照常出空格」的下文，那是空格键的原语义）。
+- **要候选**（`requires_candidates`）：无候选时按键回落原语义。空码空格的那套处置
+  （`space_on_empty_behavior`）不属于「上屏高亮」。
+- 网址 / 邮箱 / Unicode 三个模式在这里**有**出口（空格本就上屏它们的高亮补全项），
+  与 `select_candidate:N` 在那里没有出口（数字是它们的合法字符）不矛盾——本动词不按序号选。
 
 ### ★★ 判据挂在动作上，不挂在消费点上
 

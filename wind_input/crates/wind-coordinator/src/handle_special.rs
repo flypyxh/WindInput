@@ -655,12 +655,10 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 空格：有候选选高亮上屏（命令候选执行动作）；无候选退出
-                if !state.candidates.is_empty() {
-                    let idx = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
-                    self.commit_special_candidate(state, idx)
+                // 空格：有候选选高亮上屏（命令候选执行动作，与 `commit_highlighted` 动词同一
+                // 出口）；无候选退出
+                if let Some(act) = self.commit_highlighted(state) {
+                    act
                 } else {
                     self.exit_special_mode(state);
                     self.notify_ui_hide();

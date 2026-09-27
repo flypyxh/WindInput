@@ -1428,12 +1428,10 @@ impl MessageHandler for Coordinator {
                     self.record_commit(&text, 0, -1, CommitSource::Punctuation);
                     return Self::commit_action(text, true);
                 }
-                // Space：选当前高亮候选 / 上屏编码
-                if !state.candidates.is_empty() {
-                    let (start, _) = self.page_range(&state);
-                    let idx = (start + state.selected_index).min(state.candidates.len() - 1);
-                    let cand = state.candidates[idx].clone();
-                    self.commit_selected(&mut state, &cand, (idx - start) as i32)
+                // Space：选当前高亮候选 / 上屏编码。有候选那一支与会话态动词
+                // `commit_highlighted` 同一个出口（见 `commit_highlighted`）。
+                if let Some(act) = self.commit_highlighted(&mut state) {
+                    act
                 } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
                     // 空码空格：按 space_on_empty_behavior（对齐 Go handleSpace 空码分支）——
                     // "clear" 清空编码；否则上屏「已转换前缀 + 剩余拼音原码」。

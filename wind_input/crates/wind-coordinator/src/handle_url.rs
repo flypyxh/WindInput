@@ -315,7 +315,10 @@ impl Coordinator {
             // 空格选候选、回车上屏原文（分工见 `mode_completion.rs` 文件头）。都不做
             // 全半角/标点转换。回车这一支与加补全之前逐字相同——那时恒无候选，回车本
             // 就是上屏原文。收口在 `commit_url`，与邮箱模式共用同一段语义。
-            keymap::VK_SPACE => self.commit_url(state, true),
+            // 有候选那一支与 `commit_highlighted` 动词同一出口；无候选上屏原文。
+            keymap::VK_SPACE => self
+                .commit_highlighted(state)
+                .unwrap_or_else(|| self.commit_url(state, true)),
             keymap::VK_RETURN => self.commit_url(state, false),
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
