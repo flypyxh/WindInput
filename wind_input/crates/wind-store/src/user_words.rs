@@ -518,6 +518,7 @@ impl Store {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
             let txn = db.begin_write()?;
+            let structural;
             {
                 let mut t = txn.open_table(USER_WORDS)?;
                 // 不存在则创建 weight=0 记录（隐性造词路径）：此处只有扁平 code，无边界可算 → 0。
@@ -541,6 +542,7 @@ impl Store {
                     key.as_str(),
                     enc_val_ordered(nw, nc, ca, b, order).as_slice(),
                 )?;
+                structural = is_new || nw != w;
                 // ⚠️ **本路径会凭空造出用户词**（上面那句注释说的「隐性造词」），故必须建索引。
                 // 改权重不用动索引（value 空），但新增必须——漏了这一处，靠选词自动产生的
                 // 词就永远进不了简拼索引，且只在「用过一段时间后」才显形。
@@ -549,7 +551,11 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            // 只有新造词、权重变化才动联想索引；纯 count +1（绝大多数选词）不算——用户词在
+            // 联想里按权重排，count 不参与。
+            if structural {
+                self.bump_words_gen();
+            }
             Ok(())
         })
     }

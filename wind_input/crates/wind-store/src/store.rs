@@ -131,15 +131,22 @@ pub struct Store {
     /// 累计丢弃页缓存的次数。供测试断言与诊断——「缓存到底有没有被回收」在外部
     /// 不可观测（RSS 不降，见 `tests/redb_cache_high_water.rs`），只能由内部报数。
     drops: std::sync::atomic::AtomicU64,
-    /// 用户词 / 临时词两表的**写代次**：凡写这两张表的函数在进 `with_db` 前 +1，
+    /// 用户词 / 临时词两表的**结构代次**：增删词、改权重（排序键）的事务 commit 后 +1，
     /// `resume`（备份还原换了整个文件）也 +1。只增不减、进程内有效。
     ///
     /// 供按文本前缀取用户词的内存索引（词语联想，见 `wind-engine` 的 `UserAssocIndex`）
     /// 判「缓存是否过期」——store 的键是 `schema\0code\0text`，没有按文本的次序，
     /// 每次联想都扫全表在按键路径上付不起（用户词库可达十九万条）。
     ///
+    /// ⚠️ **只改 count 的写不进这里**（见 `words_count_gen`）：选词几乎每次都给某条词
+    /// count +1，若也算结构变化，开着联想时几乎每次上屏都会触发一次后台全表重建。
+    ///
     /// 宁多勿少：多 +1 只是多一次后台重建，漏 +1 则联想里永远缺那个词。
     words_gen: std::sync::atomic::AtomicU64,
+    /// **临时词** count 变化的代次（commit 后 +1）。临时词的 count 决定联想分档（门槛 2）
+    /// 与档内排序，但它随选词频繁变化，消费方应节流地跟（见 `UserAssocIndex`）。
+    /// 用户词的 count 不影响联想，不计入。
+    words_count_gen: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -166,6 +173,7 @@ impl Store {
             touched: std::sync::atomic::AtomicBool::new(false),
             drops: std::sync::atomic::AtomicU64::new(0),
             words_gen: std::sync::atomic::AtomicU64::new(0),
+            words_count_gen: std::sync::atomic::AtomicU64::new(0),
         };
         store.run_migrations()?;
         store.backfill_abbrev_indexes();
@@ -248,13 +256,24 @@ impl Store {
         }
     }
 
-    /// 用户词 / 临时词两表的写代次，见字段 `words_gen`。
+    /// 用户词 / 临时词两表的结构代次，见字段 `words_gen`。
     pub fn words_generation(&self) -> u64 {
         self.words_gen.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn bump_words_gen(&self) {
         self.words_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// 临时词 count 代次，见字段 `words_count_gen`。
+    pub fn words_count_generation(&self) -> u64 {
+        self.words_count_gen
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_words_count_gen(&self) {
+        self.words_count_gen
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 

@@ -128,10 +128,22 @@ bridge 回 `StatusUpdate`，而 C++ 的 StatusUpdate 分支**明确不结束组�
 §3.1.2）。
 
 同文本先到先得。store 的键按编码排、按文本前缀只能全表扫（用户词库可达十九万条），
-故另建内存文本索引 `wind_engine::user_assoc`：按 store 写代次
-（`Store::words_generation`，凡写用户词 / 临时词两表的事务提交后 +1）判过期，过期时
-**本次照用旧索引**、后台单飞重建，按键线程上零扫描。代价是刚写入的词要到重建完成后的
-下一次上屏才进联想。联想开着才在启动预热里建它。
+故另建内存文本索引 `wind_engine::user_assoc`，按两个代次判过期：
+
+- **结构代次**（`Store::words_generation`：增删词、改权重的事务 commit 后 +1）——一变即过期；
+- **临时词计数代次**（`Store::words_count_generation`：已有临时词 count +1）——变了且索引
+  已建成满 `COUNT_REBUILD_MIN_INTERVAL = 5s` 才过期。
+
+拆开的理由：选词几乎每次都给某条用户词 / 临时词 count +1，早先一律算写代次 ⇒ 开着联想时
+几乎每次上屏都在后台全表重建一遍（用户词库可达十九万条）。用户词在联想里按权重排、count
+不参与，故用户词纯 count +1 不记任何代次（每 `count_threshold` 次的权重 boost 才算结构
+变化）；临时词的 count 决定分档（门槛 2）与档内排序，必须跟，但节流——代价是跨过门槛的
+那一刻起最多几秒内仍按旧档排。备选的「查询时对临时词批量点查 count」要给每条临时词命中
+多一次 redb 读，且改不了池子截断时用的旧排序键，不如节流简单。
+
+过期时**本次照用旧索引**、后台单飞重建（重建线程用 Drop guard 复位单飞标记，panic 也
+不会卡死），按键线程上零扫描。代价是刚写入的词要到重建完成后的下一次上屏才进联想。
+联想开着才在启动预热里建它。
 
 ### 3.1.2 联想历史（History 来源）与实测
 
@@ -143,7 +155,24 @@ bridge 回 `StatusUpdate`，而 C++ 的 StatusUpdate 分支**明确不结束组�
 源内按它降序；与 Prefix 按文本去重、先到先得（同一个词出现在 History 里，Prefix 那条
 就不再出）。词语联想档（`AssocKind::Word`）放行 History：它只出上文的延长，与 Prefix 同形。
 归属 id = `data_schema_id(assoc_word_schema())`。不进用户词文本索引，不 bump 写代次。
-随「清空词频」、删方案级联清除；备份里作 `assoc_history` 条目，归「freq」段。
+随「清空词频」、删方案级联清除；备份里作 `assoc_history` 条目，归「freq」段。以 Replace
+还原 freq 段、或 `.wdict` 的 Freq 段以 replace 导入时，一并清空该方案的联想历史（备份里
+没有 `assoc_history` 条目也清——旧备份不带它，留着本机旧历史会与新 FREQ 不同源）。
+
+**存在性在读端过滤**：删词（用户词 / 临时词）不级联清理历史表，`HistoryWords` 对每条命中
+调 `EngineManager::assoc_word_known`——用户词文本索引、系统反查索引里都查不到就丢弃。任一
+索引未就绪则放行（判不了宁可照出）；用户词索引在后台重建期间略旧，删词后最多多出一轮。
+选读端而不选级联：删词入口多（设置页、候选删除、淘汰、晋升、导入替换），漏一处就是脏数据，
+读端一处兜全；代价是每条历史命中两次内存二分。
+
+**设计取舍：从补位档选中的临时词经 History 前置。** count = 1 的临时词只在第 3 档补位，
+但用户在某上文后从联想里选了它，下次同一上文它就经 History 排第一——这是有意的：History
+记的是「在这个上文后你要过它」，这一维比「它是不是噪声词」更直接。选联想候选**不**给临时词
+count +1（`from_assoc` 不走造词 / 临时词记账），它在其他上文下仍留在补位档。
+
+写入端与 FREQ 对齐：`record_freq` 与 `record_assoc_pick` 都是同步单写事务（`freq.rs` 注释里
+的「内存累积 + 批量 flush」尚未实现）。选联想候选不记 FREQ（`from_assoc` 跳过
+`record_selection`），故那条链路上只有这一次写事务，无可合并。
 
 **离线评测**（`tests/assoc_eval.rs::assoc_rank_eval`，ignored；语料 = 文档站 content，
 wubi86 最大匹配切词，上文 = 词首字，前半训练后半测量 4000 条，max_count = 9）：

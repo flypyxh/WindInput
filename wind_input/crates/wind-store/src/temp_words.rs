@@ -42,6 +42,7 @@ impl Store {
         self.with_db(|db| {
             let txn = db.begin_write()?;
             let new_count;
+            let is_new;
             {
                 let mut t = txn.open_table(TEMP_WORDS)?;
                 let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
@@ -58,6 +59,7 @@ impl Store {
                     ),
                 };
                 new_count = c;
+                is_new = existing.is_none();
                 t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
                 // count++ 不影响索引（value 空），但**新增**与**边界补齐**都要落索引。
                 let old_b = existing.map(|(_, _, _, ob)| ob);
@@ -71,7 +73,12 @@ impl Store {
                 )?;
             }
             txn.commit()?;
-            self.bump_words_gen();
+            // 新词是结构变化；已有词只是 count +1（边界补齐不进联想索引）。
+            if is_new {
+                self.bump_words_gen();
+            } else {
+                self.bump_words_count_gen();
+            }
             Ok(new_count)
         })
     }
@@ -117,7 +124,9 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen();
+            if result.0 {
+                self.bump_words_count_gen();
+            }
             Ok(result)
         })
     }

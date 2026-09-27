@@ -222,6 +222,9 @@ impl Store {
                         wdict::parse_freq_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
                     if replace {
                         self.clear_freq(schema)?;
+                        // 联想历史与词频同属「选词学习」，.wdict 不带它：替换词频即一并清空，
+                        // 免得留下与新词频不同源的旧历史（同备份还原的 freq 段）。
+                        self.clear_assoc_history(schema)?;
                     }
                     let n = self.import_freq_rows(schema, &rows)?;
                     rep.sections.push(SectionImport {
@@ -431,6 +434,43 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
+    }
+
+    /// .wdict 不带联想历史：Freq 段 replace 导入时一并清空该方案的联想历史，merge 不动。
+    #[test]
+    fn freq_replace_clears_assoc_history() {
+        let path = tmp("wind_dict_freq_assoc.redb");
+        let s = Store::open(&path).unwrap();
+        s.record_freq("wb", "a", "工").unwrap();
+        let text = s
+            .export_dict_sections_wdict(
+                "wb",
+                &[DictSection::Freq],
+                "2026-07-15T00:00:00+08:00",
+                "codetable",
+            )
+            .unwrap();
+        s.record_assoc_pick("wb", "荷", "荷花").unwrap();
+        s.record_assoc_pick("py", "荷", "荷花").unwrap();
+        s.import_dict_sections_wdict("wb", &text, &[DictSection::Freq], false, &mut pass_through)
+            .unwrap();
+        assert_eq!(
+            s.assoc_history("wb", "荷", 0).unwrap().len(),
+            1,
+            "merge 不清"
+        );
+        s.import_dict_sections_wdict("wb", &text, &[DictSection::Freq], true, &mut pass_through)
+            .unwrap();
+        assert!(
+            s.assoc_history("wb", "荷", 0).unwrap().is_empty(),
+            "replace 清本方案"
+        );
+        assert_eq!(
+            s.assoc_history("py", "荷", 0).unwrap().len(),
+            1,
+            "别的方案不动"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

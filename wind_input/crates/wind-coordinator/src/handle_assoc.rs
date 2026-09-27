@@ -297,8 +297,14 @@ impl AssocProvider for PrefixWords<'_> {
 ///
 /// 读 store 的 `assoc_history` 表（一次范围扫描）；写在 [`Coordinator::record_assoc_pick`]。
 /// 分值 = 选中次数的衰减分（与 FREQ 同一套 `pinyin_score`），源内按它降序。
+///
+/// ★ 读端过滤存在性：历史表不随删词级联清理，选过的词被删掉之后，这里按
+/// [`wind_engine::EngineManager::assoc_word_known`] 丢掉它。
 struct HistoryWords<'a> {
     store: &'a wind_store::Store,
+    mgr: &'a wind_engine::EngineManager,
+    /// 联想词源方案（查存在性用，见 `assoc_word_schema`）。
+    word_schema: String,
     schema: String,
     profile: wind_store::freq::FreqProfile,
 }
@@ -321,6 +327,7 @@ impl AssocProvider for HistoryWords<'_> {
         rows.into_iter()
             // 只收「上文的严格延长」：今天写入端只记前缀延伸类的选择（见 `record_assoc_pick`），
             // 这里再守一道，免得导入的脏数据把「上屏补剩余部分」算错。
+            .filter(|(word, _)| self.mgr.assoc_word_known(&self.word_schema, word))
             .filter_map(|(word, rec)| {
                 let rest = word
                     .strip_prefix(ctx.text)
@@ -412,6 +419,8 @@ impl Coordinator {
         // 这类问题有两个答案。
         let history = self.store.as_deref().map(|store| HistoryWords {
             store,
+            mgr: &self.engine_mgr,
+            word_schema: self.engine_mgr.assoc_word_schema(),
             schema: self.assoc_data_schema(),
             profile: self.engine_mgr.pinyin_freq_profile(),
         });

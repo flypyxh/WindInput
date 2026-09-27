@@ -11,13 +11,26 @@
 //!
 //! # 何时过期
 //!
-//! store 的写代次（[`wind_store::Store::words_generation`]）一变就过期。过期时**本次
-//! 照用旧索引**，另起后台线程重建（单飞）——绝不在按键线程上扫表。代价是刚写入的词
-//! 要到重建完成后的下一次上屏才进联想（毫秒级到百毫秒级），换来按键路径零扫描。
+//! 两个代次：
+//!
+//! - **结构代次**（[`wind_store::Store::words_generation`]：增删词、改权重）一变就过期；
+//! - **临时词计数代次**（[`wind_store::Store::words_count_generation`]）变了，且本索引
+//!   已建成满 [`COUNT_REBUILD_MIN_INTERVAL`] 才过期。临时词的 count 决定分档（门槛 2）
+//!   与档内排序，但选词时它几乎每次都在变——若每变必重建，开着联想时几乎每次上屏都
+//!   在后台全表扫一遍用户词库。节流的代价：临时词 count 的变化最多晚几秒才反映到联想
+//!   分档上（跨过门槛那一刻的那一轮联想可能还按旧档排）。用户词的 count 不参与联想，
+//!   store 根本不记代次。
+//!
+//! 过期时**本次照用旧索引**，另起后台线程重建（单飞）——绝不在按键线程上扫表。代价是
+//! 刚写入的词要到重建完成后的下一次上屏才进联想（毫秒级到百毫秒级），换来按键路径零扫描。
 //!
 //! 只收两字及以上的词：联想要的是「上文的严格延长」，上文至少一个字，单字永远轮不到。
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// 只因临时词 count 变化而重建的最短间隔，见模块文档「何时过期」。
+pub const COUNT_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 一条命中：词、它的一个记录码（供查 FREQ）、层内排序键与使用次数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +101,13 @@ impl TextTable {
         }
     }
 
+    fn contains(&self, text: &str) -> bool {
+        let i = self.entries.partition_point(|e| self.hit(e).text < text);
+        self.entries
+            .get(i)
+            .is_some_and(|e| self.hit(e).text == text)
+    }
+
     /// 以 `prefix` 开头且严格更长、且过 `keep` 的词，按排序键降序（同键按文本）取前 `limit` 条。
     fn with_prefix(
         &self,
@@ -111,8 +131,11 @@ impl TextTable {
 /// 某个数据方案（store 归属 id）的用户词 + 临时词文本索引。
 pub struct UserAssocIndex {
     data_schema: String,
-    /// 建索引**之前**读到的写代次。先读后扫：扫描期间若有写入，代次已前进，下次必判过期。
+    /// 建索引**之前**读到的结构代次与计数代次。先读后扫：扫描期间若有写入，代次已前进，
+    /// 下次必判过期。
     generation: u64,
+    count_generation: u64,
+    built_at: Instant,
     user: TextTable,
     temp: TextTable,
 }
@@ -124,6 +147,7 @@ impl UserAssocIndex {
     /// `LEARN_ADD_WEIGHT`），按权重排等于按字典序排。
     pub fn build(store: &wind_store::Store, data_schema: &str) -> Self {
         let generation = store.words_generation();
+        let count_generation = store.words_count_generation();
         let (mut user, mut temp): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
         let multi = |t: &str| t.chars().nth(1).is_some();
         let r = store
@@ -148,9 +172,24 @@ impl UserAssocIndex {
         UserAssocIndex {
             data_schema: data_schema.to_string(),
             generation,
+            count_generation,
+            built_at: Instant::now(),
             user: TextTable::build(user),
             temp: TextTable::build(temp),
         }
+    }
+
+    /// 相对 store 当前状态是否过期。`count_interval`：仅临时词 count 变化时，建成多久后
+    /// 才算过期（按键路径传 [`COUNT_REBUILD_MIN_INTERVAL`]，预热 / 测试传 0）。
+    fn is_stale(&self, store: &wind_store::Store, count_interval: Duration) -> bool {
+        self.generation != store.words_generation()
+            || (self.count_generation != store.words_count_generation()
+                && self.built_at.elapsed() >= count_interval)
+    }
+
+    /// 用户词或临时词里有没有这个词（精确匹配，只含两字及以上）。
+    pub fn contains(&self, text: &str) -> bool {
+        self.user.contains(text) || self.temp.contains(text)
     }
 
     pub fn user_with_prefix(&self, prefix: &str, limit: usize) -> Vec<UserHit<'_>> {
@@ -191,19 +230,19 @@ pub(crate) fn get_or_refresh(
         .as_ref()
         .filter(|i| i.data_schema == data_schema)
         .cloned();
-    let fresh = current
+    let stale = current
         .as_ref()
-        .is_some_and(|i| i.generation == store.words_generation());
-    if !fresh && !g.building {
+        .is_none_or(|i| i.is_stale(store, COUNT_REBUILD_MIN_INTERVAL));
+    if stale && !g.building {
         g.building = true;
         let (slot2, store2, schema2) = (slot.clone(), store.clone(), data_schema.to_string());
         let spawned = std::thread::Builder::new()
             .name("user-assoc-index".into())
             .spawn(move || {
+                // 建索引中途 panic 也要复位 `building`，否则单飞标记卡死、此后永不重建。
+                let _reset = BuildingGuard(slot2.clone());
                 let idx = Arc::new(UserAssocIndex::build(&store2, &schema2));
-                let mut g = slot2.lock().unwrap_or_else(|e| e.into_inner());
-                g.index = Some(idx);
-                g.building = false;
+                slot2.lock().unwrap_or_else(|e| e.into_inner()).index = Some(idx);
             });
         if let Err(e) = spawned {
             tracing::warn!("联想用户词索引：起重建线程失败: {e}");
@@ -213,13 +252,23 @@ pub(crate) fn get_or_refresh(
     current
 }
 
+/// 后台重建线程退出（含 panic 展开）时复位单飞标记。
+struct BuildingGuard(SharedSlot);
+
+impl Drop for BuildingGuard {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).building = false;
+    }
+}
+
 /// 阻塞地建好并放进槽（预热 / 测试用）。已是最新则不重建。
 pub(crate) fn prewarm(slot: &SharedSlot, store: &wind_store::Store, data_schema: &str) -> bool {
     {
         let g = slot.lock().unwrap_or_else(|e| e.into_inner());
-        if g.index.as_ref().is_some_and(|i| {
-            i.data_schema == data_schema && i.generation == store.words_generation()
-        }) {
+        if g.index
+            .as_ref()
+            .is_some_and(|i| i.data_schema == data_schema && !i.is_stale(store, Duration::ZERO))
+        {
             return false;
         }
     }
@@ -266,5 +315,64 @@ mod tests {
         assert_eq!(texts(t.with_prefix("荷", 1, |_| true)), vec![("荷载", 9)]);
         assert!(t.with_prefix("荷", 10, |h| h.count > 5).is_empty());
         assert!(t.with_prefix("无", 10, |_| true).is_empty());
+    }
+
+    fn tmp_store(tag: &str) -> wind_store::Store {
+        let p = std::env::temp_dir().join(format!("wind_user_assoc_{tag}.redb"));
+        let _ = std::fs::remove_file(&p);
+        wind_store::Store::open(&p).unwrap()
+    }
+
+    /// ★ 连续选词（用户词 count +1、已有临时词 count +1）不让索引过期 ⇒ 不触发后台全表重建。
+    #[test]
+    fn repeated_picks_do_not_invalidate_index() {
+        let s = tmp_store("picks");
+        s.add_user_word("wb", "awfa", "荷载", 0, 0).unwrap();
+        s.learn_temp_word("wb", "awgg", "荷叶田田", 800, 0).unwrap();
+        let idx = UserAssocIndex::build(&s, "wb");
+        for _ in 0..10 {
+            s.on_word_selected("wb", "awfa", "荷载", 0, 0).unwrap();
+            s.learn_temp_word("wb", "awgg", "荷叶田田", 800, 0).unwrap();
+            s.increment_temp_if_exists("wb", "awgg", "荷叶田田")
+                .unwrap();
+            assert!(
+                !idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL),
+                "选词后按键路径不该判过期"
+            );
+        }
+        // 但临时词 count 确实变了：节流窗口过后（这里用 0 模拟）要跟上。
+        assert!(idx.is_stale(&s, Duration::ZERO));
+        // 结构变化（新词）立即过期。
+        let idx = UserAssocIndex::build(&s, "wb");
+        s.learn_temp_word("wb", "awhh", "荷塘月色", 800, 0).unwrap();
+        assert!(idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL));
+    }
+
+    /// 用户词权重变化（每 count_threshold 次 boost）是结构变化：排序键变了。
+    #[test]
+    fn user_weight_boost_invalidates_index() {
+        let s = tmp_store("boost");
+        s.add_user_word("wb", "awfa", "荷载", 0, 0).unwrap();
+        let idx = UserAssocIndex::build(&s, "wb");
+        s.on_word_selected("wb", "awfa", "荷载", 5, 2).unwrap();
+        assert!(
+            !idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL),
+            "count=1 未到阈值"
+        );
+        s.on_word_selected("wb", "awfa", "荷载", 5, 2).unwrap();
+        assert!(
+            idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL),
+            "count=2 权重 +5"
+        );
+    }
+
+    #[test]
+    fn contains_is_exact() {
+        let s = tmp_store("contains");
+        s.add_user_word("wb", "awfa", "荷载", 0, 0).unwrap();
+        s.learn_temp_word("wb", "awgg", "荷叶田田", 800, 0).unwrap();
+        let idx = UserAssocIndex::build(&s, "wb");
+        assert!(idx.contains("荷载") && idx.contains("荷叶田田"));
+        assert!(!idx.contains("荷") && !idx.contains("荷叶"));
     }
 }

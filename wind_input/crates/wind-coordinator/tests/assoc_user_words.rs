@@ -373,3 +373,106 @@ fn assoc_history_is_keyed_by_context() {
             .is_empty()
     );
 }
+
+/// ★ History 读端过滤存在性：从补位档选过的临时词经 History 前置；删掉它之后不再出现
+/// （历史表本身不随删词级联清理）。
+#[test]
+fn assoc_history_drops_deleted_words() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, store) = coord("h_del", "word", false, |s| {
+        s.learn_temp_word("wubi86", "awgg", "荷叶田田", 800, 0)
+            .unwrap();
+    });
+    let got = assoc_after_he(&c);
+    assert_eq!(
+        got.last().map(String::as_str),
+        Some("荷叶田田"),
+        "前提：count=1 的临时词只在补位档 {got:?}"
+    );
+    // 它在第二页：PageDown 翻过去再选。
+    press(&c, 0x22);
+    pick_assoc(&c, "荷叶田田");
+    let got = assoc_after_he(&c);
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some("荷叶田田"),
+        "前提：选过一次后经 History 前置 {got:?}"
+    );
+    assert_eq!(
+        store.get_temp_word("wubi86", "awgg", "荷叶田田").unwrap(),
+        Some(1),
+        "选联想候选不给临时词记次数（它在别的上文下仍是补位档）"
+    );
+
+    store
+        .remove_temp_word("wubi86", "awgg", "荷叶田田")
+        .unwrap();
+    // 生产里删词后用户词索引在后台重建；这里同步建好再看。
+    c.prewarm_indexes();
+    let got = assoc_after_he(&c);
+    assert!(
+        !got.iter().any(|t| t == "荷叶田田"),
+        "删掉的临时词仍从 History 冒出来：{got:?}"
+    );
+    assert!(
+        !store.assoc_history("wubi86", "荷", 10).unwrap().is_empty(),
+        "反向对照：历史行还在，是读端挡住的"
+    );
+}
+
+/// ★ 拼音方案：FREQ 的键是候选码（无分隔的全拼，如 `zhongguowenhua`），联想查 FREQ 用的
+/// 反查索引码与之同形 ⇒ 正常打字选过的词在联想里上浮。
+#[test]
+fn pinyin_freq_reranks_assoc() {
+    if !data_dir()
+        .join("schemas/pinyin/rime_frost.dict.yaml")
+        .exists()
+    {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_assoc_user_py_freq.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["pinyin".into()];
+    cfg.schema.active = "pinyin".into();
+    cfg.schema.pinyin.frequency.enabled = true;
+    cfg.input.default.chinese_mode = true;
+    cfg.input.symbol.smart_mode = false;
+    cfg.input.association.kind = "word".into();
+    cfg.input.association.mode = "continuous".into();
+    let c = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    c.prewarm_indexes();
+    let after_zhongguo = |c: &Coordinator| {
+        press(c, 0x1B);
+        type_code(c, "zhongguo");
+        let act = press(c, 0x20);
+        assert_eq!(committed(&act), Some("中国"));
+        c.debug_assoc_texts()
+    };
+    let base = after_zhongguo(&c);
+    let target = "中国文化";
+    assert!(
+        base.iter().position(|t| t == target).is_some_and(|p| p > 0),
+        "前提：系统序里「{target}」在联想页上但不在首位 {base:?}"
+    );
+    for _ in 0..3 {
+        press(&c, 0x1B);
+        type_code(&c, "zhongguowenhua");
+        let idx = c
+            .debug_page_texts()
+            .iter()
+            .position(|t| t == target)
+            .expect("前提：zhongguowenhua 首页有「中国文化」");
+        let act = press(&c, 0x31 + idx as u32);
+        assert_eq!(committed(&act), Some(target));
+    }
+    let got = after_zhongguo(&c);
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some(target),
+        "正常打字选过的词应在联想里上浮：{got:?}"
+    );
+}

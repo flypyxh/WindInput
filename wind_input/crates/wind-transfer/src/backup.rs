@@ -402,6 +402,12 @@ pub fn restore_backup(
                 if replace && cleared.insert(format!("freq:{schema}")) {
                     store.clear_freq(schema)?;
                 }
+                // 联想历史归「freq」段：替换词频时一并清掉，**备份里没有它的条目也清**
+                // （旧备份不带 assoc_history）——否则还原后留着本机的旧历史，与 FREQ 不同源。
+                // 与下面 `assoc_history` 臂共用去重键：谁先到谁清，后到的只导入不再清。
+                if replace && cleared.insert(format!("assoc_history:{schema}")) {
+                    store.clear_assoc_history(schema)?;
+                }
                 store.import_freq_jsonl(schema, &text())?;
                 schemas_touched.insert(schema.to_string());
                 restored.push(e.path.clone());
@@ -1048,6 +1054,51 @@ mod tests {
         let got = s2.assoc_history("wb", "荷", 0).unwrap();
         assert_eq!(got.len(), 1, "Replace 清掉本地旧记录：{got:?}");
         assert_eq!((got[0].0.as_str(), got[0].1.count), ("荷枪实弹", 2));
+    }
+
+    /// 备份里**没有**联想历史条目（源库无历史 / 旧备份）时，Replace 还原 freq 段也清空本地历史。
+    #[test]
+    fn freq_replace_clears_assoc_history_even_without_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let s = seed_store(t.path());
+        let out = t.path().join("b.zip");
+        let src = BackupSources {
+            user_config_file: None,
+            compat_file: None,
+            user_schemas_dir: None,
+            user_schema_overrides_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        let opts = BackupOptions {
+            include_stats: false,
+            include_state: false,
+        };
+        create_backup(&s, &src, &out, "1.0.0", "windows", "t", &opts).unwrap();
+
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
+        s2.record_assoc_pick("wb", "荷", "荷花").unwrap(); // 本地旧记录
+        let targets = RestoreTargets {
+            user_config_file: None,
+            compat_file: None,
+            user_schemas_dir: None,
+            user_schema_overrides_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        let sections = vec!["freq".to_string()];
+        restore_backup(
+            &out,
+            &s2,
+            &targets,
+            crate::merge::Strategy::Replace,
+            Some(&sections),
+        )
+        .unwrap();
+        assert_eq!(s2.get_freq("wb", "a", "工").unwrap().unwrap().count, 1);
+        let got = s2.assoc_history("wb", "荷", 0).unwrap();
+        assert!(got.is_empty(), "Replace freq 段应清掉本地联想历史：{got:?}");
     }
 
     #[test]

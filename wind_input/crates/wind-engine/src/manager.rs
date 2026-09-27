@@ -1332,6 +1332,25 @@ impl EngineManager {
             .collect()
     }
 
+    /// 词语联想里这个词**还在不在**（用户词 / 临时词 / 系统词任一有它）。
+    ///
+    /// 供联想历史（History）读端过滤：历史表只记「上文 → 词」，删词时不级联清理，
+    /// 靠这里把已删掉的词挡在外面。两份索引**任一没就绪就放行**（判不了宁可照出，
+    /// 不能把正常的历史全吞掉）；用户词索引可能略旧（后台重建中），删词后最多多出一轮。
+    pub fn assoc_word_known(&self, schema_id: &str, text: &str) -> bool {
+        let user = self.store.as_ref().and_then(|store| {
+            crate::user_assoc::get_or_refresh(
+                &self.user_assoc,
+                store,
+                &self.data_schema_id(schema_id),
+            )
+        });
+        match (user, self.reverse_index_if_ready(schema_id)) {
+            (Some(u), Some(sys)) => u.contains(text) || sys.codes_of(text).is_some(),
+            _ => true,
+        }
+    }
+
     /// 联想候选的选词次数分（方案 A）：一次批量点查 FREQ，同词多码合并后按拼音衰减打分。
     /// 无 store / 查询失败 ⇒ 全 0（退化为静态序）。
     fn assoc_freq_scores(
