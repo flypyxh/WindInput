@@ -774,12 +774,26 @@ impl Coordinator {
         }
     }
 
-    /// 切换密码框强制英文抑制策略（高级菜单，临时测试入口）：关闭时立即解除当前生效的强制英文。
+    /// 高级菜单「密码框强制英文」：翻转 `input.password_force_english` 并落盘（t197 / A2-37）。
+    ///
+    /// 此前只改内存，重启服务即复原——对「宿主把普通输入框误报成密码框」的用户，每次开机
+    /// 都得再关一次。写法同 `status_toggle_show_on_focus`：先写用户层，再刷新内存配置。
     pub(crate) fn toggle_password_suppress(&self) {
+        let next = !self.rt().config.input.password_force_english;
+        let _ = Config::set_user_value(
+            &["input", "password_force_english"],
+            toml::Value::Boolean(next),
+        );
+        self.refresh_config_in_memory(|c| c.input.password_force_english = next);
+        self.set_password_suppress_enabled(next);
+    }
+
+    /// 把密码框抑制策略开关同步到运行时：关闭时立即解除当前生效的强制英文。
+    /// 菜单切换与配置热重载共用——两条路少回灌一处，就是「改了没反应、重启才好」。
+    pub(crate) fn set_password_suppress_enabled(&self, enabled: bool) {
         use std::sync::atomic::Ordering::Relaxed;
-        let now = !self.password_suppress_enabled.load(Relaxed);
-        self.password_suppress_enabled.store(now, Relaxed);
-        if !now {
+        self.password_suppress_enabled.store(enabled, Relaxed);
+        if !enabled {
             self.password_suppress.store(false, Relaxed);
         }
         // 同步给 DLL：吃键门控在 TSF 侧本地判定（早于 IPC），不推则开关对 DLL 无效——

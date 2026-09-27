@@ -1945,7 +1945,8 @@ pub struct Coordinator {
     pub(crate) tooltip_page: Mutex<Vec<crate::handle_tooltip::TooltipPageEntry>>,
     /// 悬停提示右键菜单弹出时的目标快照；菜单动作执行前拿它核对候选有没有变。
     pub(crate) tooltip_menu_target: Mutex<Option<crate::handle_tooltip::TooltipMenuTarget>>,
-    /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
+    /// 密码框抑制策略开关，`input.password_force_english` 的运行时镜像（构造与热重载时回灌，
+    /// 见 `set_password_suppress_enabled`）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
     pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
@@ -2461,6 +2462,9 @@ impl Coordinator {
         // 候选窗显隐运行时初值（ui.candidate.hide_window；此前恒为 false，配置不生效）。
         let hide_candidate_window_init = config.ui.candidate.hide_window;
 
+        // 密码框强制英文开关初值（input.password_force_english；此前恒为 true，菜单关掉重启即复原，t197）。
+        let password_suppress_enabled_init = config.input.password_force_english;
+
         // 统计采集器：与 store 共享 Arc，内存聚合 + 后台定时 flush。
         let stat_collector = store
             .clone()
@@ -2707,7 +2711,9 @@ impl Coordinator {
             tooltip_menu_target: Mutex::new(None),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
-            password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
+            password_suppress_enabled: std::sync::atomic::AtomicBool::new(
+                password_suppress_enabled_init,
+            ),
             input_diag_hud_visible: std::sync::atomic::AtomicBool::new(false),
             input_diag_sections: Mutex::new(Default::default()),
             input_diag_frozen: std::sync::atomic::AtomicBool::new(false),
@@ -4190,7 +4196,8 @@ impl Coordinator {
                 // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
                 self.push_english_pair_config(0);
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
-                self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
+                // 密码框抑制策略：内存开关随配置回灌（关掉即解除当前抑制）+ 推给 DLL 吃键门控。
+                self.set_password_suppress_enabled(new_cfg.input.password_force_english);
                 self.push_custom_en_punct_config(0); // 英半列自定义标点：DLL 据此吃键转发
                 self.push_cn_passthrough_punct_config(0); // 中文模式该透传的标点：DLL 据此**不**吃
                 self.push_en_passthrough_punct_config(0); // 同上，英文标点态那份（超集）
@@ -15580,13 +15587,38 @@ mod input_diag_tests {
         assert!(!c.input_diag_hud_visible.load(Relaxed));
     }
 
+    /// 开关的初值取自配置（`input.password_force_english`，t197）：配置关掉时，构造出的
+    /// 协调器遇到密码位也不抑制——此前构造处硬编码 `true`，菜单关掉后重启服务又勾回。
+    ///
+    /// 菜单切换写盘 / 热重载保持见 `tests/password_force_english_persist.rs`（要重定向用户
+    /// 目录，只能单开测试二进制；本模块的用例一律不走写盘路径，免得改到真实用户配置）。
     #[test]
-    fn toggle_password_suppress_flips_enabled() {
+    fn config_off_constructs_without_suppress() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cfg = Config::default();
+        assert!(cfg.input.password_force_english, "前置条件：出厂开");
+        cfg.input.password_force_english = false;
+        let c = Coordinator::new_headless(cfg, None);
+        assert!(!c.password_suppress_enabled.load(Relaxed));
+
+        c.apply_input_diag(1, false, 2, 0x8000_0001); // IS_DEFAULT + IS_PASSWORD（t197 的掩码）
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "配置关闭时密码位不应强制英文"
+        );
+    }
+
+    /// 关掉开关须立即解除**已生效**的抑制，不能等下一次焦点上报——用户正对着那个
+    /// 被误判的框点菜单，点完就要能打中文。
+    #[test]
+    fn switching_off_clears_active_suppress() {
         use std::sync::atomic::Ordering::Relaxed;
         let c = test_coordinator();
-        assert!(c.password_suppress_enabled.load(Relaxed)); // 默认开
-        c.toggle_password_suppress();
+        c.apply_input_diag(1, false, 2, 0x8000_0001);
+        assert!(c.password_suppress.load(Relaxed), "前置条件：抑制已生效");
+        c.set_password_suppress_enabled(false);
         assert!(!c.password_suppress_enabled.load(Relaxed));
+        assert!(!c.password_suppress.load(Relaxed), "关掉开关应立即解除抑制");
     }
 
     #[test]
@@ -15678,7 +15710,7 @@ mod input_diag_tests {
     fn disabled_switch_defeats_password_scope() {
         use std::sync::atomic::Ordering::Relaxed;
         let c = test_coordinator();
-        c.toggle_password_suppress();
+        c.set_password_suppress_enabled(false);
         assert!(
             !c.password_suppress_enabled.load(Relaxed),
             "前置条件：开关已关"

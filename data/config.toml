@@ -647,6 +647,11 @@ top_commit_mode = "direct_commit"
 # 高亮是分步候选（只消费前缀）时顶屏只推晋升计数、不造词。词频与上屏历史不受本项影响。
 # 例外：临时拼音里按非标点键被吞掉时选中高亮候选，那是选词不是顶屏，恒造词、不读本项。
 top_commit_learn = true
+# 密码框强制英文（内部项，设置页不暴露；入口是托盘/工具栏右键「高级」菜单，勾选会被记住）。
+# 宿主报出密码类 InputScope 时强制英文输入，输入法图标显示「英」。
+# 个别应用会把普通输入框也报成密码框（t197），导致那里打不出中文——此时关掉本项即可；
+# 关掉后 TSF 侧的吃键门控同步放行，输入诊断 HUD 仍照常显示宿主报的 InputScope。
+password_force_english = true
 
 # 检索范围放宽（filter_mode = "smart" 时的增强，见 docs/design/smart-filter-scope-relax.md）
 #

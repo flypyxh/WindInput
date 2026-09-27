@@ -3774,6 +3774,22 @@ pub struct InputConfig {
     /// 例外：临拼兜底臂（非标点键被吞、选中高亮候选）是选词不是顶屏，恒造词、不读本项。
     #[serde(default = "default_true")]
     pub top_commit_learn: bool,
+    /// 密码框强制英文：宿主报出的 InputScope 含密码位（掩码 bit31）时，输入闸强制英文透传，
+    /// 不改 `chinese_mode` 持久值（内部配置，不进设置页；入口是托盘/工具栏右键的「高级」菜单）。
+    ///
+    /// 出厂开：真密码框里出中文候选既打不对密码、又可能把明文露在候选窗里。
+    ///
+    /// 为什么必须能关：有的宿主把普通输入框也报成 `IS_DEFAULT + IS_PASSWORD`（掩码
+    /// `0x80000001`，t197），开着就是「这个框里永远打不出中文」。菜单开关原本只改内存、
+    /// 重启服务即复原，本键让它落盘。
+    ///
+    /// 关掉时两侧一起放行：协调器不再置位 `password_suppress`（输入闸与工具栏/语言栏的
+    /// 「英」呈现都跟着解除），DLL 侧的本地吃键门控经 `push_password_suppress_config`
+    /// 同步关闭——只关 core 不推 DLL，DLL 仍按密码框全放行，开关形同虚设。
+    /// 输入诊断 HUD 的 InputScope 显示与本项无关：关掉后照样能看到宿主报的是不是密码位，
+    /// 那正是判断「是不是误报」的依据。
+    #[serde(default = "default_true")]
+    pub password_force_english: bool,
     /// 联想（上屏后按上文推荐下一个词/标点）。默认关。
     #[serde(default)]
     pub association: AssociationConfig,
@@ -3842,6 +3858,7 @@ impl Default for InputConfig {
             phrase: PhraseConfig::default(),
             top_commit_mode: TopCommitMode::default(),
             top_commit_learn: true,
+            password_force_english: true,
             association: AssociationConfig::default(),
             caret: CaretPlacementConfig::default(),
         }

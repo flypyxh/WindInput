@@ -193,7 +193,8 @@ impl Coordinator {
     /// 下发密码框抑制策略开关给 DLL。DLL 据此 + 自身持有的 InputScope 掩码在
     /// `OnTestKeyDown` 本地判定是否放行；判据两侧必须一致（见 `apply_input_diag` 与
     /// C++ `IsPasswordSuppressActive`），漂移即「吃了再吐」丢键。
-    /// 开关是会话级运行时态（右键菜单「高级」可切），故握手时与每次切换后都要推。
+    /// 开关持久化在 `input.password_force_english`（右键菜单「高级」可切），握手时、每次切换与
+    /// 配置重载后都要推。
     pub fn push_password_suppress_config(&self, client_token: u64) {
         let enabled = self
             .password_suppress_enabled
