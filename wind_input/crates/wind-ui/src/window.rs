@@ -479,6 +479,8 @@ mod platform {
                     | crate::sys::WM_MOUSELEAVE
                     | WM_MOUSEWHEEL
                     | WM_SETCURSOR
+                    // 计时器：气泡伪离开后的复查（见 `tooltip::RECHECK_MS`）。
+                    | crate::sys::WM_TIMER
             ) {
                 let key = hwnd.0 as isize;
                 let handler = MOUSE_HANDLERS.with(|m| m.borrow().get(&key).cloned());
