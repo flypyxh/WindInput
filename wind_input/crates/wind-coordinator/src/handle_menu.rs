@@ -3607,4 +3607,32 @@ mod menu_close_tests {
         );
         assert!(!c.is_menu_open());
     }
+
+    /// 菜单刚打开（仍在焦点守卫期内，`menu_close_on_focus_change` 不会动它）时走一条收菜单的
+    /// 焦点 / 组合路径，返回这期间下发的命令。
+    fn close_via(f: impl FnOnce(&Coordinator)) -> Vec<UiCommand> {
+        let (c, rx) = Coordinator::new_headless_with_ui(Config::default(), None);
+        c.mark_menu_open(0, String::new());
+        while rx.try_recv().is_ok() {}
+        f(&c);
+        rx.try_iter().collect()
+    }
+
+    fn releases_suppress(cmds: &[UiCommand]) -> bool {
+        cmds.iter()
+            .any(|m| matches!(m, UiCommand::SetTooltipMenuOpen(false)))
+    }
+
+    /// 失焦（清输入态的 reason）、切走输入法、组合被终止：这三条都经 `HideCandidates` 收掉
+    /// 菜单，必须一并解除气泡抑制。
+    #[test]
+    fn focus_and_composition_closes_release_tooltip_suppress() {
+        use wind_bridge::handler::{FocusLostReason, MessageHandler};
+        let lost = close_via(|c| c.handle_focus_lost(0, FocusLostReason::Thread));
+        assert!(releases_suppress(&lost), "失焦：{lost:?}");
+        let deact = close_via(|c| c.handle_ime_deactivated(0));
+        assert!(releases_suppress(&deact), "切走输入法：{deact:?}");
+        let term = close_via(|c| c.handle_composition_terminated());
+        assert!(releases_suppress(&term), "组合被终止：{term:?}");
+    }
 }

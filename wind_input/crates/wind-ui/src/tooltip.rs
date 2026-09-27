@@ -94,8 +94,9 @@ fn client_point(lparam: LPARAM) -> (i32, i32) {
 /// 是陈旧的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuEvent {
-    /// 气泡自己收到 `WM_RBUTTONDOWN`。`any_menu` = 此刻有弹出菜单可见（不论是谁的）。
-    OwnRightDown { any_menu: bool },
+    /// 气泡自己收到 `WM_RBUTTONDOWN`。`any_menu` = 此刻有弹出菜单可见（不论是谁的）；
+    /// `in_flight` = 气泡已发出的菜单请求还没回应。
+    OwnRightDown { any_menu: bool, in_flight: bool },
     /// 菜单轮询到一次菜单外按下（菜单已随之关闭）。`own_menu` = 关掉的是气泡的菜单。
     OutsidePress {
         right: bool,
@@ -123,8 +124,12 @@ enum MenuStep {
 fn menu_step(event: MenuEvent) -> MenuStep {
     match event {
         // 菜单开着时这次右键由轮询那一路负责；两路都认会请求两遍菜单。
-        MenuEvent::OwnRightDown { any_menu: true } => MenuStep::Ignore,
-        MenuEvent::OwnRightDown { any_menu: false } => MenuStep::RequestMenu,
+        // 请求在途同理：同一次右键合成的那次已经发出了请求。
+        MenuEvent::OwnRightDown {
+            any_menu: false,
+            in_flight: false,
+        } => MenuStep::RequestMenu,
+        MenuEvent::OwnRightDown { .. } => MenuStep::Ignore,
         MenuEvent::OutsidePress {
             right: true,
             own_menu: true,
@@ -151,9 +156,20 @@ struct TooltipMouse {
     /// 触发 WM_MOUSELEAVE，若不抑制 tooltip 会当场消失，菜单就指向一个已不存在的窗口。
     suppress_hide: Rc<Cell<bool>>,
     hits: Rc<RefCell<HitState>>,
+    /// 最近一次发出菜单请求的时刻，协调器回 `SetTooltipMenuOpen(true)` 即清。「请求在途」
+    /// 期间自己的右键不理：菜单轮询合成的那次先发出请求、菜单还没出现，同一次右键的真实
+    /// 消息随后才到，不挡就请求两遍、菜单重弹。超过 `MENU_REPLY_TIMEOUT` 视为请求已丢。
+    requested_at: Cell<Option<std::time::Instant>>,
 }
 
 impl TooltipMouse {
+    /// 是否有菜单请求在途（发出后协调器尚未回应，且未超时）。
+    fn request_in_flight(&self, now: std::time::Instant) -> bool {
+        self.requested_at
+            .get()
+            .is_some_and(|at| now.duration_since(at) < crate::popup_menu::MENU_REPLY_TIMEOUT)
+    }
+
     #[cfg(windows)]
     fn arm_leave(&self) {
         unsafe {
@@ -181,6 +197,7 @@ impl TooltipMouse {
 
     /// 按屏幕坐标 `(sx, sy)` / 客户区坐标 `(cx, cy)` 请求右键菜单。
     fn request_menu(&self, (sx, sy): (i32, i32), (cx, cy): (i32, i32)) {
+        self.requested_at.set(Some(std::time::Instant::now()));
         let hits = self.hits.borrow();
         let hit: Option<TooltipHit> = hits
             .text_box
@@ -228,8 +245,11 @@ impl WindowMouse for TooltipMouse {
                 None
             }
             WM_RBUTTONDOWN => {
-                let any_menu = crate::popup_menu::menu_visible();
-                if menu_step(MenuEvent::OwnRightDown { any_menu }) != MenuStep::RequestMenu {
+                let event = MenuEvent::OwnRightDown {
+                    any_menu: crate::popup_menu::menu_visible(),
+                    in_flight: self.request_in_flight(std::time::Instant::now()),
+                };
+                if menu_step(event) != MenuStep::RequestMenu {
                     return None;
                 }
                 self.suppress_hide.set(true);
@@ -296,6 +316,7 @@ impl Tooltip {
             events,
             suppress_hide: suppress_hide.clone(),
             hits: hits.clone(),
+            requested_at: Cell::new(None),
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -515,6 +536,12 @@ impl Tooltip {
         self.visible
     }
 
+    /// 是否处于「菜单打开中」的隐藏抑制（测试用）。
+    #[cfg(test)]
+    pub(crate) fn menu_suppressed(&self) -> bool {
+        self.suppress_hide.get()
+    }
+
     /// 记下当前内容（命中换算要用），返回要画的纯文本。
     fn set_doc(&mut self, doc: &TooltipDoc, candidate: i32) -> String {
         let mut h = self.hits.borrow_mut();
@@ -554,6 +581,8 @@ impl Tooltip {
     pub fn set_menu_open(&mut self, open: bool) {
         self.suppress_hide.set(open);
         if open {
+            // 协调器已回应这次请求（菜单随后就到）。
+            self.mouse.borrow().requested_at.set(None);
             return;
         }
         let on_tip = self.cursor_on_tip();
@@ -899,8 +928,13 @@ mod tests {
             on_tip,
         };
         // 首次右键：请求菜单；任何菜单开着时自己收到的右键不理（轮询那一路负责）。
-        assert_eq!(menu_step(OwnRightDown { any_menu: false }), RequestMenu);
-        assert_eq!(menu_step(OwnRightDown { any_menu: true }), Ignore);
+        let own = |any_menu, in_flight| OwnRightDown {
+            any_menu,
+            in_flight,
+        };
+        assert_eq!(menu_step(own(false, false)), RequestMenu);
+        assert_eq!(menu_step(own(true, false)), Ignore);
+        assert_eq!(menu_step(own(false, true)), Ignore, "请求在途");
         // 气泡菜单开着、右键点在气泡另一处：重新请求菜单。
         assert_eq!(menu_step(press(true, true, true)), RequestMenu);
         // 左键点气泡：只关菜单，气泡去留由 Closed 决定。
@@ -944,10 +978,35 @@ mod tests {
         own_right_down(&t);
         assert!(menu_requested(&rx));
         assert!(t.suppress_hide.get(), "右键即抑制离开隐藏");
+        // 协调器回应（请求不再在途），菜单随后可见。
+        t.mouse.borrow().requested_at.set(None);
         crate::popup_menu::set_menu_visible(true);
         own_right_down(&t);
         crate::popup_menu::set_menu_visible(false);
         assert!(!menu_requested(&rx), "菜单开着时不再请求");
+    }
+
+    /// 请求在途时自己的右键不理：菜单轮询合成的那次已发出请求、菜单还没出现，同一次右键的
+    /// 真实消息随后才到。协调器回应（`SetTooltipMenuOpen(true)`）或超时后恢复。
+    #[test]
+    fn own_right_down_ignored_while_request_in_flight() {
+        let (mut t, rx) = tooltip_with_rx(true);
+        crate::popup_menu::set_menu_visible(false);
+        t.set_menu_open(true);
+        assert!(t.on_menu_outside_press(10, 10, true), "合成那一路发出请求");
+        assert!(menu_requested(&rx));
+        own_right_down(&t);
+        assert!(!menu_requested(&rx), "同一次右键的真实消息不得再请求");
+        // 协调器回应 → 在途清掉；菜单关闭后再右键照常。
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        own_right_down(&t);
+        assert!(menu_requested(&rx));
+        // 请求被丢：超过回应时限后不再挡。
+        let stale = std::time::Instant::now() - crate::popup_menu::MENU_REPLY_TIMEOUT * 2;
+        t.mouse.borrow().requested_at.set(Some(stale));
+        own_right_down(&t);
+        assert!(menu_requested(&rx), "超时后恢复");
     }
 
     /// 气泡菜单开着时在气泡上再右键（气泡自己收不到，由菜单轮询转来）：按新位置重新请求。

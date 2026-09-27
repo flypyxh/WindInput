@@ -1168,6 +1168,12 @@ impl CandidateWindow {
             .right_click((x - ox) as f32, (y - oy) as f32, (x, y));
     }
 
+    /// 悬停气泡（测试用）。
+    #[cfg(test)]
+    pub(crate) fn tooltip_mut(&mut self) -> Option<&mut crate::tooltip::Tooltip> {
+        self.tooltip.as_mut()
+    }
+
     /// UI 循环收掉了一个可见菜单（协调器 `HideMenu` / `HideCandidates`），转给气泡。
     pub fn tooltip_menu_dismissed(&mut self) {
         if let Some(t) = self.tooltip.as_mut() {
@@ -3843,11 +3849,9 @@ pub struct CandidateMouse {
     tip_released: bool,
 }
 
-/// 「等菜单」阶段的兜底超时。右键到菜单可见要走一个 UI → 协调器 → UI 的来回，正常是毫秒
-/// 级；协调器处理鼠标事件的线程可能短暂卡在状态锁上（重载配置、建反查索引），1.5 秒足够
-/// 宽。再久多半是请求被丢了（候选已清空时协调器不弹菜单），这时不该让气泡一直压着——
-/// 超时按「菜单已关闭」处理。万一菜单来得比这还晚，出现时照样进 [`TipHold::InMenu`]。
-const HOLD_MENU_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 「等菜单」阶段的兜底超时（取值理由见 `popup_menu::MENU_REPLY_TIMEOUT`）：超时按「菜单已
+/// 关闭」处理，不让气泡一直压着。万一菜单来得比这还晚，出现时照样进 [`TipHold::InMenu`]。
+const HOLD_MENU_TIMEOUT: Duration = crate::popup_menu::MENU_REPLY_TIMEOUT;
 
 /// 候选窗右键对悬停气泡的压制（设计 §7.6 A）。
 ///
@@ -4188,8 +4192,11 @@ impl WindowMouse for CandidateMouse {
             }
             WM_RBUTTONDOWN => {
                 // 菜单开着时这次右键由菜单轮询那一路合成（`CandidateWindow::menu_outside_press`），
-                // 两路都认会请求两遍菜单。
-                if crate::popup_menu::menu_visible() {
+                // 两路都认会请求两遍菜单。「等菜单」阶段同理：已有一个请求在路上——合成那一路
+                // 先走、这条真实消息后到时，菜单已被轮询收起、还看不出「开着」，只能靠它挡。
+                if crate::popup_menu::menu_visible()
+                    || matches!(self.tip_hold, TipHold::AwaitMenu { .. })
+                {
                     return Some(LRESULT(0));
                 }
                 let (x, y) = mouse_pos(lparam);
@@ -6968,6 +6975,21 @@ mod tip_hold_tests {
         right_click(&mut m, 5);
         assert_eq!(menu_requests(&rx), 0);
         assert!(!m.tip_hold.active());
+    }
+
+    /// 「等菜单」阶段自己的右键不理：合成那一路已发出请求、菜单还没出现（轮询已把旧菜单
+    /// 收起，看不出「开着」），同一次右键的真实消息随后才到——不挡就请求两遍、菜单重弹。
+    /// 超时转入「等重新移动」后恢复。
+    #[test]
+    fn own_right_click_ignored_while_awaiting_menu() {
+        let (mut m, rx) = mouse(DELAY);
+        m.right_click(5.0, 5.0, (5, 5));
+        assert_eq!(menu_requests(&rx), 1);
+        right_click(&mut m, 5);
+        assert_eq!(menu_requests(&rx), 0, "请求在途不得重发");
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, -1);
+        right_click(&mut m, 5);
+        assert_eq!(menu_requests(&rx), 1, "超时后恢复");
     }
 
     /// 组合结束 / 窗口重新出现：压制随悬停状态一并清掉，不带进下一轮。

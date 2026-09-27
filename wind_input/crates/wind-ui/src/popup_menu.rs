@@ -187,6 +187,12 @@ pub struct OutsidePress {
     pub right: bool,
 }
 
+/// 菜单请求的回应时限：右键发出菜单请求到菜单可见要走一个 UI → 协调器 → UI 的来回，正常是
+/// 毫秒级；协调器处理鼠标事件的线程可能短暂卡在状态锁上（重载配置、建反查索引），1.5 秒足够
+/// 宽。再久多半是请求被丢了（候选已清空时协调器不弹菜单），据此放弃等待的一方不该把状态
+/// 一直挂着。候选窗的右键压制（`candidate_window::TipHold`）与气泡的「请求在途」共用。
+pub(crate) const MENU_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 thread_local! {
     /// 弹出菜单此刻是否可见（UI 线程内共享）。
     static MENU_VISIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1810,6 +1816,22 @@ mod outside_press_tests {
     #[test]
     fn idle_is_not_a_press() {
         assert!(!press_edge(false, false));
+    }
+
+    /// `menu_visible()` 随菜单显隐：候选窗 / 气泡在 wnd_proc 里据它决定右键归谁，
+    /// hide 后不复位的话它们会一直以为菜单开着，右键永远被当成「由轮询接手」而丢掉。
+    #[test]
+    fn menu_visible_tracks_show_and_hide() {
+        let (tx, _rx) = channel();
+        let mut m = PopupMenu::new(tx).expect("mock 菜单");
+        set_menu_visible(false);
+        m.show(
+            vec![MenuItemSpec::leaf("x", MenuKind::Copy, true, false)],
+            MenuAnchor::at_point(10, 10),
+        );
+        assert!(menu_visible());
+        m.hide();
+        assert!(!menu_visible());
     }
 
     /// 在气泡上右键 = 重新右键；左键 / 左右同按只关菜单。左右手互换时物理左键才是右键。
