@@ -354,6 +354,48 @@ fn quick_input_repeat_commits_like_space() {
     );
 }
 
+/// ★ 重复上屏态下候选**恒只有一条**——`commit_highlighted` 的 mix 臂不为重复态另开
+/// 分支（交给 `mix_select_at` 的 `mix_repeat` 判断）所依赖的前提。
+///
+/// 用最可能破坏它的情形压：简入繁出开着、上次上屏是个 1 对多的字（「出」→ 出 / 齣）。
+/// 普通候选区里这种字会被 `expand_s2t_variants` 就地展开成多条；若重复态也被展开，高亮就能
+/// 移到第 2 条，空格取首条还是取高亮就成了两个结果，那个被删掉的分支就不再冗余。
+#[test]
+fn quick_input_repeat_holds_a_single_candidate_even_with_s2t_variants() {
+    skip_without_data!();
+    let coord = open_with(|c| c.schema.active = "pinyin".into());
+    if !coord.debug_set_s2t(true) {
+        eprintln!("跳过：缺少 opencc 数据");
+        return;
+    }
+    type_str(&coord, "chu");
+    let texts = coord.debug_page_texts();
+    let p = texts
+        .iter()
+        .position(|t| t == "出")
+        .expect("前提：chu 的候选里应有「出」");
+    assert!(
+        coord.debug_page_texts().len() > p + 1 && coord.debug_page_texts()[p + 1] == "出",
+        "前提：普通候选区里「出」会被展开出变体（内部 text 同为「出」），实际 {texts:?}"
+    );
+    coord.handle_key_event(&key(0x31 + p as u32, 0)); // 选「出」上屏，进上屏历史
+
+    coord.handle_key_event(&key(VK_SEMICOLON, 0));
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "前提：`;` 进快捷输入"
+    );
+    assert_eq!(
+        coord.debug_page_texts(),
+        vec!["出".to_string()],
+        "重复上屏态下只应有一条候选（不做变体展开）"
+    );
+    coord.handle_key_event(&key(VK_DOWN, 0));
+    let (_, sel, _) = coord.debug_page_info();
+    assert_eq!(sel, 0, "只有一条候选，高亮移不走");
+}
+
 // ───────────────────────── 联想态：跟随 space_commits ─────────────────────────
 
 fn assoc_dict_ready() -> bool {

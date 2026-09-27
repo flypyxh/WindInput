@@ -2479,11 +2479,11 @@ impl Coordinator {
             Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
                 self.commit_special_candidate(state, gi)
             }
-            // 重复上屏：整体上屏上次内容，不记选词/不造词（该候选无对应编码）。
-            Some(ModeKind::Mix(_)) if state.mix_repeat => {
-                let text = state.candidates[0].text.clone();
-                self.commit_mix_repeat(state, text)
-            }
+            // 重复上屏态不另开分支：`mix_select_at` 自己先判 `mix_repeat` 转交
+            // `commit_mix_repeat`，而重复态下候选恒只有一条（`inject_mix_repeat_candidate`
+            // 整体替换候选后 `update_mix_candidates` 当场返回，不做变体展开等追加），高亮
+            // 只能停在它上面——在这里再判一次与那边逐值等价，是测不到的冗余分支。
+            // 前提由 `tests/commit_highlighted_key.rs` 的 `quick_input_repeat_*` 钉住。
             Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
             // 部分消费时要留在模式内继续筛，见 `select_page_candidate` 的同名分支。
             Some(ModeKind::AuxCode) => {
