@@ -98,10 +98,10 @@ impl RenderedTooltip {
         let mut out: Vec<String> = Vec::new();
         for (sec, raw) in self.doc.sections.iter().zip(&self.raw) {
             match (&sec.title, raw.as_slice()) {
-                (Some(t), [only]) if sec.inline => out.push(format!("{t}: {only}")),
+                (Some(t), [only]) if sec.inline => out.push(format!("{}: {only}", t.as_str())),
                 (title, lines) => {
                     if let Some(t) = title {
-                        out.push(format!("[{t}]"));
+                        out.push(format!("[{}]", t.as_str()));
                     }
                     out.extend(lines.iter().cloned());
                 }
@@ -258,11 +258,14 @@ impl CompiledTooltip {
                     let idx = u16::try_from(i).unwrap_or(u16::MAX);
                     self.display_lines(l, sec.columns, if i == 0 { prefix } else { 0 })
                         .into_iter()
-                        .map(move |text| TooltipLine { text, raw: idx })
+                        .map(move |text| TooltipLine {
+                            text: text.into(),
+                            raw: idx,
+                        })
                 })
                 .collect();
             out.doc.sections.push(TooltipSection {
-                title: (!title.is_empty()).then_some(title),
+                title: (!title.is_empty()).then(|| title.into()),
                 inline,
                 lines,
             });
@@ -1268,14 +1271,14 @@ mod tests {
         let c = truncated("长…", &long);
         let r = render_limited(&t, &c);
         let first = &r.doc.sections[0];
-        assert_eq!(first.title.as_deref(), Some("完整原文"));
+        assert_eq!(first.title.as_ref().map(|t| t.as_str()), Some("完整原文"));
         assert_eq!(
             first.lines.len(),
             11,
             "200 字 ÷ 20 字/行 = 10 行，另加 … 落在第 11 行"
         );
         assert!(first.lines.iter().all(|l| l.raw == 0));
-        assert_eq!(first.lines[10].text, "…");
+        assert_eq!(first.lines[10].text.as_str(), "…");
         assert_eq!(r.raw[0][0].chars().count(), 250, "原始行不截断");
     }
 

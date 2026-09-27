@@ -1,5 +1,7 @@
 //! 候选词条数据。
 
+use crate::styled::{SpanStyle, StyledText};
+
 /// 候选词数据
 #[derive(Debug, Clone)]
 pub struct CandidateItem {
@@ -9,8 +11,9 @@ pub struct CandidateItem {
     pub label: String,
     /// 悬停提示（结构化，段 → 显示行）。空文档 = 不显示气泡。
     pub tooltip: TooltipDoc,
-    /// 候选注释（编码后缀/短语提示等），非空时在候选词右侧以注释样式内联显示；空则不显示
-    pub comment: String,
+    /// 候选注释（编码后缀/短语提示等），非空时在候选词右侧以注释样式内联显示；空则不显示。
+    /// 模板渲染出的注释带分段样式（角色 / 内联色）；其余来源 `String::into()` 即无样式。
+    pub comment: StyledText,
     /// 为 true 时完全不渲染序号节点（用于非候选的提示行，如快捷加词预览），
     /// 避免默认主题下出现空的序号圆圈。
     pub no_index: bool,
@@ -31,7 +34,7 @@ pub struct TooltipDoc {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TooltipSection {
     /// 已求值的段名；`None` = 无标题行。
-    pub title: Option<String>,
+    pub title: Option<StyledText>,
     /// 渲染成 `标题: 第一条显示行`（其余显示行照常另起），而非标题独占一行。
     ///
     /// 由协调器按**原始内容恰为一行**判定后置位：一条长内容折成多条显示行仍算一行，
@@ -44,7 +47,7 @@ pub struct TooltipSection {
 /// 气泡的一条显示行。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TooltipLine {
-    pub text: String,
+    pub text: StyledText,
     /// 所属原始行在本段中的下标。现在一条原始行恰对应一条显示行；将来单行截断 / 折行
     /// 会把一条原始行拆成多条显示行，它们指向同一个下标，复制 / 上屏据此取回原文。
     pub raw: u16,
@@ -67,11 +70,25 @@ impl TooltipDoc {
     /// 同一个候选的气泡可能在菜单弹出前刷新过（如反查索引后台建好，前面多出一段），
     /// 段下标一错位，「上屏此行」就会取到别的段。
     ///
+    /// 只 hash **文字与 `raw` 下标**（段名文字、inline、每行文字与 `raw`），不含分段样式：
+    /// 右键核对防的是段下标错位，只与文字结构有关。颜色也进指纹的话，只改了颜色的刷新
+    /// （设置页改了模板里的 `$[…]`）会让菜单弹出前后指纹不等、菜单退化成只剩「截图此窗口」，
+    /// 而此时取值其实完全正确。「含颜色都相同」直接比 `PartialEq`。
+    ///
     /// `DefaultHasher::new()` 的键是固定的，同一进程内结果稳定——UI 与协调器同进程，够用。
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.hash(&mut h);
+        self.sections.len().hash(&mut h);
+        for sec in &self.sections {
+            sec.title.as_ref().map(StyledText::as_str).hash(&mut h);
+            sec.inline.hash(&mut h);
+            sec.lines.len().hash(&mut h);
+            for l in &sec.lines {
+                l.text.as_str().hash(&mut h);
+                l.raw.hash(&mut h);
+            }
+        }
         h.finish()
     }
 
@@ -79,7 +96,15 @@ impl TooltipDoc {
     /// [`Self::hit_at_line`] 都从这里取——画出来的行与命中换算的行必须是同一份排列。
     ///
     /// inline 段的首行既是标题也是内容，按内容算（命中该段第一条原始行）。
-    fn plain_lines(&self) -> Vec<(String, TooltipHit)> {
+    ///
+    /// 段名的装饰 `[` `]` 与 inline 的 `: ` 由这里拼出、不是模板字面，带 `title` 角色
+    /// （设计 text-span-colors.md §3.2）：主题给段名配色时，括号跟段名同色。
+    fn plain_lines(&self) -> Vec<(StyledText, TooltipHit)> {
+        let deco = SpanStyle {
+            role: Some(std::sync::Arc::from("title")),
+            in_title: true,
+            color: None,
+        };
         let mut out = Vec::new();
         for (si, sec) in self.sections.iter().enumerate() {
             let section = u16::try_from(si).unwrap_or(u16::MAX);
@@ -89,12 +114,19 @@ impl TooltipDoc {
             };
             match (&sec.title, sec.lines.as_slice()) {
                 (Some(t), [first, rest @ ..]) if sec.inline => {
-                    out.push((format!("{t}: {}", first.text), hit(Some(first.raw))));
+                    let mut line = t.clone();
+                    line.push(": ", &deco);
+                    line.append(&first.text);
+                    out.push((line, hit(Some(first.raw))));
                     out.extend(rest.iter().map(|l| (l.text.clone(), hit(Some(l.raw)))));
                 }
                 (title, lines) => {
                     if let Some(t) = title {
-                        out.push((format!("[{t}]"), hit(None)));
+                        let mut line = StyledText::new();
+                        line.push("[", &deco);
+                        line.append(t);
+                        line.push("]", &deco);
+                        out.push((line, hit(None)));
                     }
                     out.extend(lines.iter().map(|l| (l.text.clone(), hit(Some(l.raw)))));
                 }
@@ -113,8 +145,14 @@ impl TooltipDoc {
     ///
     /// 这是气泡、「复制全部」与 macOS 下发共用的格式，与段列表引入前的输出逐字节相同。
     pub fn to_plain_text(&self) -> String {
-        let lines: Vec<String> = self.plain_lines().into_iter().map(|(t, _)| t).collect();
-        lines.join("\n")
+        self.to_styled().into_string()
+    }
+
+    /// 与 [`Self::to_plain_text`] 同一份排列的带样式整块文字（自绘气泡与 macOS 下发用）。
+    /// 画出来的行、命中换算的行、下发的行都从 `plain_lines` 取，必然一致。
+    pub fn to_styled(&self) -> StyledText {
+        let lines: Vec<StyledText> = self.plain_lines().into_iter().map(|(t, _)| t).collect();
+        StyledText::join(&lines, "\n")
     }
 }
 
@@ -124,13 +162,13 @@ mod tests {
 
     fn sec(title: Option<&str>, inline: bool, lines: &[&str]) -> TooltipSection {
         TooltipSection {
-            title: title.map(str::to_string),
+            title: title.map(StyledText::from),
             inline,
             lines: lines
                 .iter()
                 .enumerate()
                 .map(|(i, t)| TooltipLine {
-                    text: t.to_string(),
+                    text: (*t).into(),
                     raw: i as u16,
                 })
                 .collect(),
@@ -193,5 +231,56 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         b.sections.insert(0, sec(Some("编码"), false, &["wqvb"]));
         assert_ne!(a.fingerprint(), b.fingerprint(), "前面插入一段即不同");
+    }
+
+    /// 只改颜色（片段样式）时指纹不变、`PartialEq` 却不等；改 raw 下标则指纹变。
+    #[test]
+    fn fingerprint_ignores_styles_but_not_raw() {
+        let a = TooltipDoc {
+            sections: vec![sec(Some("拼音"), false, &["你：nǐ"])],
+        };
+        let mut styled = a.clone();
+        let mut t = StyledText::new();
+        t.push(
+            "你",
+            &SpanStyle {
+                role: Some("char".into()),
+                ..Default::default()
+            },
+        );
+        t.push("：nǐ", &SpanStyle::default());
+        styled.sections[0].lines[0].text = t;
+        assert_eq!(a.fingerprint(), styled.fingerprint(), "只改颜色，指纹不变");
+        assert_ne!(a, styled, "含样式的判等要能看出不同");
+        let mut raw = a.clone();
+        raw.sections[0].lines[0].raw = 3;
+        assert_ne!(a.fingerprint(), raw.fingerprint());
+    }
+
+    /// 段名装饰 `[` `]`、inline 的 `: ` 带 title 角色；样式整块与纯文本同一排列。
+    #[test]
+    fn styled_decorations_are_title() {
+        let doc = TooltipDoc {
+            sections: vec![
+                sec(Some("编码"), false, &["vbg"]),
+                sec(Some("U"), true, &["x"]),
+            ],
+        };
+        let s = doc.to_styled();
+        assert_eq!(s.as_str(), doc.to_plain_text());
+        let roles: Vec<(u32, u32, Option<&str>)> = s
+            .spans()
+            .iter()
+            .map(|sp| (sp.start, sp.end, sp.role.as_deref()))
+            .collect();
+        // "[编码]\nvbg\nU: x"：[ 在 0..1，] 在 7..8，": " 在 14..16。
+        assert_eq!(
+            roles,
+            vec![
+                (0, 1, Some("title")),
+                (7, 8, Some("title")),
+                (14, 16, Some("title"))
+            ]
+        );
     }
 }

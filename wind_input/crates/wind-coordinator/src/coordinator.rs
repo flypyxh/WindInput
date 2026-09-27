@@ -6288,7 +6288,7 @@ impl Coordinator {
                         self.resolve_index_label(cand_cfg, i)
                     },
                     tooltip,
-                    comment,
+                    comment: comment.into(),
                     no_index: hide_index,
                 }
             })
@@ -9380,7 +9380,7 @@ mod mode_comment_e2e_tests {
         // 排空取**最后**一条：一次刷新会发多条 UI 命令，取第一条会拿到上一轮残留。
         while let Ok(cmd) = rx.try_recv() {
             if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
-                found = candidates.first().map(|c| c.comment.clone());
+                found = candidates.first().map(|c| c.comment.as_str().to_string());
             }
         }
         found

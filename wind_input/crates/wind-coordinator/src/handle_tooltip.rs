@@ -84,7 +84,7 @@ pub(crate) fn tooltip_menu_items(
     if let (Some(e), Some(h)) = (entry, hit) {
         let s = usize::from(h.section);
         if let Some(sec) = e.rendered.doc.sections.get(s) {
-            let name = section_label(sec.title.as_deref(), s);
+            let name = section_label(sec.title.as_ref().map(wind_ui_types::StyledText::as_str), s);
             items.push(M::leaf(
                 format!("复制「{name}」"),
                 cmd(MenuCmd::TooltipCopySection),
@@ -266,13 +266,13 @@ mod tests {
 
     fn section(title: Option<&str>, lines: &[&str]) -> TooltipSection {
         TooltipSection {
-            title: title.map(str::to_string),
+            title: title.map(Into::into),
             inline: false,
             lines: lines
                 .iter()
                 .enumerate()
                 .map(|(i, t)| TooltipLine {
-                    text: t.to_string(),
+                    text: (*t).into(),
                     raw: i as u16,
                 })
                 .collect(),

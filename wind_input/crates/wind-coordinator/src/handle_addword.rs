@@ -1363,7 +1363,7 @@ impl Coordinator {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment,
+            comment: comment.into(),
             no_index: true,
         };
         // 来源后缀与 Tab 提示**恒显示**，不随哪一侧有没有内容变化：面板在两个来源下必须
@@ -2343,7 +2343,7 @@ mod tests {
             rows[2].text.is_empty(),
             "提示必须留在 comment 走注释色，放 text 会比标题还抢眼"
         );
-        assert!(rows[2].comment.contains("Tab切换来源"));
+        assert!(rows[2].comment.as_str().contains("Tab切换来源"));
         assert!(rows.iter().all(|r| r.no_index), "三行都不显序号");
     }
 
@@ -2357,17 +2357,22 @@ mod tests {
         let rows = c.add_word_panel_rows(&st);
         assert_eq!(rows[0].text, "快捷加词 · 最近输入", "空也要标来源");
         assert_eq!(rows[1].text, "无最近输入");
-        assert_eq!(rows[2].comment, "Tab切换来源  Esc关闭");
+        assert_eq!(rows[2].comment.as_str(), "Tab切换来源  Esc关闭");
 
         c.toggle_add_word_source(&mut st);
         let rows = c.add_word_panel_rows(&st);
         assert_eq!(rows[0].text, "快捷加词 · 剪贴板");
         assert_eq!(rows[1].text, "剪贴板无可用内容");
         assert_eq!(
-            rows[1].comment, "需要单行文本",
+            rows[1].comment.as_str(),
+            "需要单行文本",
             "空态须交代准入条件，否则用户以为复制没生效"
         );
-        assert_eq!(rows[2].comment, "Tab切换来源  Esc关闭", "两侧提示同形");
+        assert_eq!(
+            rows[2].comment.as_str(),
+            "Tab切换来源  Esc关闭",
+            "两侧提示同形"
+        );
     }
 
     /// Ctrl+Shift+= 的来源优先级与 Ctrl+= **相反**：剪贴板优先、整段作词。

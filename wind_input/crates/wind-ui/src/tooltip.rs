@@ -1108,7 +1108,7 @@ mod tests {
 
     fn doc() -> TooltipDoc {
         let line = |t: &str, raw| TooltipLine {
-            text: t.to_string(),
+            text: t.into(),
             raw,
         };
         TooltipDoc {

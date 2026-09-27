@@ -775,7 +775,7 @@ mod tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }

@@ -3000,7 +3000,7 @@ impl CandidateWindow {
                     let cm = edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]);
                     self.text_renderer
                         .measure(
-                            &cand.comment,
+                            cand.comment.as_str(),
                             &Self::measure_style(
                                 comment_fs,
                                 eff_weight(&v.comment, &v.item, is_sel, is_hover),
@@ -3570,7 +3570,7 @@ impl CandidateWindow {
                 let cmt_weight = eff_weight(&v.comment, &v.item, is_sel, is_hover);
                 let cmt_family = v.comment.font_family.clone();
                 let mut cleaf = self
-                    .upright_text(&cand.comment, None, |seg, _, _| {
+                    .upright_text(cand.comment.as_str(), None, |seg, _, _| {
                         View::leaf(seg.to_string(), cmt_color)
                             .font_size(comment_fs)
                             .font_weight(cmt_weight)
@@ -4373,7 +4373,7 @@ mod min_size_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: comment.to_string(),
+            comment: comment.into(),
             no_index: false,
         }
     }
@@ -4959,7 +4959,7 @@ mod pager_inline_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -5498,7 +5498,7 @@ mod width_budget_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -5841,7 +5841,7 @@ mod width_budget_tests {
             w.scale = 1.0;
             w.set_orientation(false, true, upright);
             let mut item = cand("甲");
-            item.comment = comment.to_string();
+            item.comment = comment.into();
             w.update("", 0, "", vec![item], 0, -1, 1, 1);
             let mut root = w.build_tree(false);
             root.layout(0.0, 0.0, &w.text_renderer);
@@ -5975,7 +5975,7 @@ mod schema_font_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -6730,7 +6730,7 @@ mod font_precedence_tests {
                 code: String::new(),
                 label: String::new(),
                 tooltip: Default::default(),
-                comment: "注".to_string(),
+                comment: "注".into(),
                 no_index: false,
             })
             .collect();
@@ -7148,7 +7148,7 @@ mod tip_hold_tests {
             code: String::new(),
             label: String::new(),
             tooltip: doc(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         };
         w.candidates = vec![item("你"), item("拟")];

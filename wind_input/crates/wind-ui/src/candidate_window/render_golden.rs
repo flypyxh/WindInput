@@ -64,7 +64,7 @@ fn candidates() -> Vec<CandidateItem> {
         code: String::new(),
         label: String::new(),
         tooltip: TooltipDoc::default(),
-        comment: comment.to_string(),
+        comment: comment.into(),
         no_index: false,
     };
     // 下标 0 选中、1 悬停、2/3 常态（一条无注释、一条有）。
@@ -74,7 +74,7 @@ fn candidates() -> Vec<CandidateItem> {
 /// 出厂气泡段（完整原文关、编码、拼音逐字）渲染出的样子。
 fn tooltip_doc() -> TooltipDoc {
     let line = |t: &str, raw| TooltipLine {
-        text: t.to_string(),
+        text: t.into(),
         raw,
     };
     TooltipDoc {
