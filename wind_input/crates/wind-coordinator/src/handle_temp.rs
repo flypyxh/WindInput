@@ -178,6 +178,18 @@ impl Coordinator {
         if !Self::z_fallback_accepts(&action, ch) {
             return None;
         }
+        // 缓冲已沿活码长过让位帧（`zzbd`）且候选已列出 ⇒ 非字母键是在对这些候选下手
+        // （数字选词 / 二三候选键 / 标点顶屏），不是残余码。不拦的话 `zzbd2` 破前缀被夺取，
+        // `2` 连同 `zbd` 塞进目标模式缓冲，系统短语分组选不了词。
+        //
+        // **让位帧**（缓冲恰为 `z`）不在此列，维持原行为：`z1+2` 必须照样夺取进 mix 算数，
+        // 而那一帧常见的候选只是「重复上屏」反馈（`leading_letter_repeat_text`，但开了
+        // `z_key_repeat` 且 z 本身有候选时两者会并存——豁免靠的是原行为，不是候选单一）。
+        // 字母不受限——它本就是编码，破前缀即夺取是原设计。
+        if state.input_buffer.len() > 1 && !state.candidates.is_empty() && !ch.is_ascii_alphabetic()
+        {
+            return None;
+        }
         let combined = format!("{}{}", state.input_buffer, ch);
         // 加新键后仍是活码前缀（如 zhang 存在时的 "zh"，或系统短语 `zzbd` 的 "zz"）→ 不夺取，
         // 继续正常码表。这条同时保住了出厂那 37 条 `zz*` 标点短语。
