@@ -998,7 +998,9 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   组码中进入，**只筛选不改排序**。
 - **加载**：`EngineManager::aux_code_settings` 一次 `read_schema` 出齐 `enabled` /
   `max_phrase_len` / 已解析的 `files`（用户目录同名优先；**关闭时不解析路径**）；首进时
-  `ensure_aux_code_table` 懒加载 + `merge`（先出现 = 高优），**不参与预热**。缓存是全局一份，
+  `ensure_aux_code_runtime`（`aux_code_source.rs`）懒加载：相邻文件来源 `merge` 成一层
+  （先出现 = 高优），`schema:<id>` 方案来源各占一层、查询时取 `text_codes` 视图——后者的
+  反查索引由 `prewarm_indexes` / 切方案后台预热，文件表**不参与预热**。缓存是全局一份，
   各方案码表不同（拼音笔画表 vs 双拼小鹤全码表），**切方案必须失效重挂**
   （`invalidate_aux_code_table`，随 `sync_chaizi_assets`/`sync_comment_dicts` 一起）。表格式：
   UTF-8 `字=码` 一行一条（`=` 分隔，与 rime-lua-aux-code `aux_code` 目录一致），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），

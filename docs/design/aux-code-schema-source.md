@@ -81,8 +81,9 @@ AuxCodeSources = [来源 1, 来源 2, …]      // 按 files 顺序
 codes_of(ch) = 各来源依次给出的码（先出现的在前，去重）
 ```
 
-多来源不再预先 `merge` 成一张表：方案来源的用户层会频繁变，合成放在查询时做。候选一页只有几十个字，
-成本可忽略。
+方案来源不预先 `merge` 进表：它的用户层会频繁变，合成放在查询时做。候选一页只有几十个字，
+成本可忽略。**相邻的文件来源仍 `merge` 成一层**（`wind-aux-code` 的「多表坍缩成单表」规矩照旧），
+层数只随方案来源数增长；被方案来源隔开的文件段各自合并，清单顺序即优先级不变。
 
 ### 4.1 方案来源 = 「按词查编码」统一入口的一个使用方
 
@@ -102,11 +103,23 @@ codes_of(ch) = 各来源依次给出的码（先出现的在前，去重）
 
 今天的加载点是 `enter_aux_code` → `ensure_aux_code_table`，在按键线程上同步读 txt。方案来源不能照搬。
 
-- **后台预热**：折叠后 `enabled = true` 且有方案来源时，把被引用方案加入反查索引的在用集合，
-  并在启动预热（`prewarm_indexes`）、切方案、`schema.saveConfig` / `resetConfig`、全局配置重载后
-  预热它的反查索引（复用 `prewarm_reverse_index` 的单飞）。用户层按统一入口的规则「用到时检查」。
+- **后台预热**：「在用」的方案来源 = 活跃方案 ∪ 临拼目标方案各自 `[engine.aux_code]` 里的
+  `schema:` 条目（`EngineManager::aux_code_schemas_in_use`，辅助码关闭时为空；临拼目标只解析 id、
+  不加载其引擎）。它既钉进反查索引的在用集合（`reverse_index_pins`），也是预热对象：启动预热
+  （`prewarm_indexes`，阻塞在预热线程里）、全局配置重载（`reload_user_config` 的 schema_dirty
+  分支同样走 `prewarm_indexes`——在用集合只随 `schema` 段与 `input.temp_pinyin` 变，二者都标脏）、
+  切方案（`finish_user_schema_switch`）与 `schema.saveConfig` / `resetConfig`
+  （`refresh_schema_derived_config`）后各派一次后台预热（`warm_aux_code_sources` →
+  `spawn_index_warm`，自带去重与延迟提示）。用户层按统一入口的规则「用到时检查」。
 - **按键线程只读不建**：`enter_aux_code` 发现方案来源的系统层未就绪时不进入、不吞键，
-  提示一次「辅助码表加载中」（每次失效后最多一次）。文件来源仍可同步加载，行为不退化。
+  派 `spawn_index_warm` 后台构建（构建超过延迟阈值才弹「正在建立词库索引…」，建好后重渲染）。
+  文件来源仍可同步加载，行为不退化。
+- **会话中途索引被清**（改方案设置、词库启用集变更、主码表重载都会整表清反查索引）：
+  `refresh_aux_code_candidates` 发现任一方案层系统层未就绪时，本次原样放行（`restore_original`）
+  并派后台重建，不拿仅剩的用户层去筛——那会把候选滤到几乎全空。
+- **已知限制**：被引用方案的反查索引若被 `build_guard` 判为「反复死在构建中」而永久跳过，
+  它永远不会就绪，辅助码也就一直进不去（只有日志里那条 build_guard 的记录）。与悬停编码等其它
+  反查索引使用方同一处境，不单独处理。
 - **缓存键**：缓存记住「由哪组来源建成」（`files` 原文 + 解析后的路径）。来源不变就不重建，
   来源变了才重建——不再只靠「切方案清空」，§1 第 4 条的 bug 随之消失。
 - **被引用方案的词库变了**（改启用词库、`schema.invalidate` / `rebuildCache`）：反查索引已有的
@@ -154,7 +167,7 @@ R8.1 勾选行：
 | 期 | 内容 | 仓 | 提交（分支 feat/aux-code-source） |
 |---|---|---|---|
 | 0 | 前置：「按词查编码」统一入口第一期（`text-code-lookup.md`） | 主仓 | `8b99d7a7`、`d5fa0499`、`d000b8e6` |
-| 1 | `AuxCodeLookup` 接口与来源拼接；`schema:` 条目解析；方案来源接统一入口；后台预热与缓存键（修 saveConfig 不失效）；`schema.auxCodeSources` | 主仓 | `9ab878f4`、`31cd04c8`、`09e1459d`、`51595c94` |
+| 1 | `AuxCodeLookup` 接口与来源拼接；`schema:` 条目解析；方案来源接统一入口；后台预热与缓存键（修 saveConfig 不失效）；`schema.auxCodeSources` | 主仓 | `9ab878f4`、`31cd04c8`、`09e1459d`、`51595c94`；终审修复 `12406518`、`d8a8b03d`（预热落地、会话中失效放行、文件来源合层） |
 | 2 | 笔画码表方案、全拼默认改引用、NOTICE | 主仓（工具 + 数据） | - |
 | 3 | 「辅助码来源」勾选行、mock、渲染与写回测试 | wind-setting | - |
 | 4 | 文档：`[engine.aux_code].files` 的 `schema:` 写法；「用五笔 / 笔画方案作拼音辅助码」 | 文档站 | - |

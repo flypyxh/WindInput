@@ -43,7 +43,8 @@ pub fn load_from_file(path: &std::path::Path) -> AuxCodeTable {
 
 /// **合并加载多张码表**：`merge(paths.iter().map(load_from_file))`（先出现 = 高优）。
 ///
-/// 供协调器「首次辅助码输入时，把所有已解析路径一次性坍缩成一张表」的懒加载调用。
+/// 供协调器「首次辅助码输入时，把每段相邻的文件来源一次性坍缩成一张表」的懒加载调用
+/// （`aux_code_source.rs`；方案来源 `schema:<id>` 不经此处，见 [`crate::AuxCodeLookup`]）。
 /// 路径由调用方解析后整体传入，本函数只负责「逐张读入 + 跨表去重/优先级坍缩」，
 /// 空文件（读失败/空内容）经 `merge` 自动跳过。
 pub fn load_merged(paths: &[std::path::PathBuf]) -> AuxCodeTable {
@@ -219,7 +220,7 @@ mod tests {
     }
 
     /// load_merged：多路径按序合并（先出现 = 高优）、跨文件同码去重、缺失文件跳过。
-    /// 即协调器 `ensure_aux_code_table` 的懒加载组合路径。
+    /// 即协调器 `ensure_aux_code_runtime`（`aux_code_source.rs`）合并相邻文件来源的路径。
     #[test]
     fn load_merged_combines_files() {
         let dir =

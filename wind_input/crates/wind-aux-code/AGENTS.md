@@ -25,9 +25,10 @@
 
 | File | Description |
 |------|-------------|
-| `src/lib.rs` | 模块文档 + 统一导出：`AuxCodeTable`、`AuxCodeFilterOptions`、`aux_code_matches`、`filter_by_aux_code`、`AuxCodeSession`、`load_from_file`、`load_merged` |
+| `src/lib.rs` | 模块文档 + 统一导出：`AuxCodeTable`、`AuxCodeLookup`、`AuxCodeFilterOptions`、`aux_code_matches`、`filter_by_aux_code`、`AuxCodeSession`、`load_from_file`、`load_merged`、`read_name` |
+| `src/lookup.rs` | `AuxCodeLookup` trait：筛选取码的唯一接口（`any_code` 按优先级回调、`is_empty` 决定 passthrough，前缀匹配为默认方法）。`AuxCodeTable` 实现它；协调器的方案来源运行时（`aux_code_source.rs`，文件表 + 方案视图分层）也实现它 |
 | `src/table.rs` | `AuxCodeTable`：三段式紧凑布局（`entries` + `code_ends` + `arena`，与 `wind-reverse::PinyinTable` 同构）；`from_rows` 单表构建、`merge`/`append` 多表坍缩、查询（`any_code_starts_with`/`any_code_starts_with_char`）、状态（`is_empty`/`char_count`）。`codes_of`/`first_code`/`code_count` 仅测试用（`#[cfg(test)]`）。**纯内存，不碰 `std::path`/文件** |
-| `src/loader.rs` | `parse_str`（`pub(crate)`）/ `load_from_file` / `load_merged`：txt 格式 → 表。**`=` 分隔**（UTF-8，每行一条 `字=码`，同字多码分列多行，与 rime-lua-aux-code `aux_code` 目录一致）；处理 BOM/注释/空行/非单字行；**只从第 1 行提取方法名**（`# name: 笔画` / `#name: 笔画`），`load_from_file` 空名回落文件主干名；`load_merged` = `merge(paths.iter().map(load_from_file))`（协调器懒加载路径） |
+| `src/loader.rs` | `parse_str`（`pub(crate)`）/ `load_from_file` / `load_merged`：txt 格式 → 表。**`=` 分隔**（UTF-8，每行一条 `字=码`，同字多码分列多行，与 rime-lua-aux-code `aux_code` 目录一致）；处理 BOM/注释/空行/非单字行；**只从第 1 行提取方法名**（`# name: 笔画` / `#name: 笔画`），`load_from_file` 空名回落文件主干名；`load_merged` = `merge(paths.iter().map(load_from_file))`（协调器合并相邻文件来源的路径）；`read_name` 只读首行取名（设置页列可选码表用，不整张读入） |
 | `src/filter.rs` | `aux_code_matches`（单候选谓词，供 `CandidateStore::set_filter` 等组合使用）+ `filter_by_aux_code`（批量筛选，输出 `FilterOutcome`）。逐字首码匹配**零分配**（字符迭代器，勿退化成 `Vec<char>`/前缀串） |
 | `src/session.rs` | `AuxCodeSession`：辅助码**筛选会话状态机**——内部持 `CandidateStore`（原始候选快照 + 筛选视图）+ 辅助码缓冲；`apply`（通过 `CandidateStore::set_filter` 从快照重筛，**只返回命中者**）、`restore_original`（通过 `CandidateStore::clear_filter` 还原）。**不含显示态**：组合区（preedit）拼接/光标是协调器职责，分隔符前缀在协调器进入时拼一次。协调器 `State.aux_code` 只持它（含显示态一并打包在 `AuxCodeOverlay`），按键路由/UI 更新留在协调器 |
 
@@ -57,6 +58,10 @@
 - **多表挂载一律 `merge`/`append` 坍缩成单表**：不要引入「多表 Vec + flat_map/HashSet」
   的查询路径。`merge` 迭代序 = 挂载优先级（先出现 = 高优），跨表 first-seen 去重，
   同字异码并存、同码只留高优首次出现。查询阶段零额外开销。
+  **方案来源（`schema:<id>`）例外**：它的码随用户层（造词）变化，只能查询时取视图，
+  不能预先坍缩；协调器的 `aux_code_source.rs` 按层顺序查询，但**相邻文件来源仍 `merge`
+  成一层**，层数只随方案来源数增长。筛选经 `AuxCodeLookup`（`lookup.rs`）取码，不假定
+  背后是一张静态表。
 - **数据文件格式与 rime-lua-aux-code `aux_code` 目录一致用 `=` 分隔**（`字=码`，一行
    一条，UTF-8）：新增解析逻辑放 `loader.rs`，
    保持 `parse_str` 纯函数（可测）+ `load_from_file` 薄封装
@@ -71,9 +76,10 @@
 - **名称只从第 1 行解析**（`# name: 笔画` / `#name: 笔画`）：`parse_str` 填
    `AuxCodeTable.name`，空则 `load_from_file` 回落文件主干名；`merge` 取首个非空
    （先出现 = 高优）。version/source 一律当注释，不解析。
-- **懒加载由调用方（协调器）触发**：本 crate 不持加载状态/锁/路径。调用方持
-  `Option<AuxCodeTable>`，首次辅助码输入时 `load_merged(paths)`（内部 = `merge`
-  `load_from_file`，先出现 = 高优），空表用 `is_empty()` 门决定不启用过滤。
+- **懒加载由调用方（协调器）触发**：本 crate 不持加载状态/锁/路径。协调器
+  `ensure_aux_code_runtime`（`aux_code_source.rs`）首次进入时对每段相邻文件来源调
+  `load_merged(paths)`（内部 = `merge` `load_from_file`，先出现 = 高优），空表经
+  `AuxCodeLookup::is_empty()` 走 passthrough。
 - **会话筛选状态聚合在本 crate**：`AuxCodeSession`（`session.rs`）持有原始候选快照 +
    缓冲，`apply` 通过 `CandidateStore::set_filter` 重筛、`restore_original` 清除筛选视图。
    协调器只做按键路由与 UI 更新，**不要把重筛逻辑搬回 `handle_aux_code.rs`**。组合区

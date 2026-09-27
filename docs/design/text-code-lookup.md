@@ -65,7 +65,7 @@ impl TextCodeView {
 两份的上限会让它们互相顶掉、反复秒级重建。改为保留**当前在用集合**：
 
 ```
-在用集合 = { code_source_schema, assoc_word_schema, 活跃方案折叠后的辅助码引用方案… }
+在用集合 = { code_source_schema, assoc_word_schema, 辅助码在用的方案来源（活跃方案 ∪ 临拼目标方案，见 aux_code_schemas_in_use） }
 ```
 
 在用集合在切方案 / 配置重载时重算，不在集合里的索引释放。内存上限的顾虑仍在（大方案一份上百 MB，
@@ -112,7 +112,9 @@ impl TextCodeView {
 | 辅助码（新） | SYSTEM + USER | 字 → 编码，见辅助码来源设计 §4 |
 | 候选注释 `${code}` / 悬停 [编码] / `codetable_reverse_hint` | SYSTEM + USER | 自己造的词、加的字开始显示编码 |
 
-`codetable_reverse_hint` 取「最长码」的口径不变：按层拼接后仍取全部码里最长的那个。
+`codetable_reverse_hint` 取「最长码」的口径不变：取全部码里的最大码长；该长度上**系统码优先**
+（取其中最后一个，同改前），系统在该长度没有码才取用户码——否则用户给「工」加个与全码同长的码，
+提示就从词库全码变成了它。
 
 ## 5. 以后再迁的使用方（逐个核实口径）
 
