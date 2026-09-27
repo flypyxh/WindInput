@@ -798,6 +798,37 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
   - 可求值测试走真实 `notify_ui_update`：每个契约变量写进注释与气泡模板都不得回显 `${…}`。它当场发现
     `${emoji}` 在功能未开 / 非 comment 档 / 未命中时原样回显字面（`eval_var` 用了 `?`），已另行修复。
 
+**P3 执行记录（2026-09-27）**：
+
+- 引擎：`ViewNode.roles` → `RvNode.roles`；`""` / 未解析 token 不入表，`transparent` 与 alpha 0 拒收
+  并 warn；`resolve_state` 的 nil 门控加上「有角色色」。出厂主题一律不配 roles（全部出厂主题 × 亮暗断言
+  各节点与状态 patch 的 roles 为空），渲染 golden 逐字节不变。
+- 非出厂测试主题 `wind-theme/testdata/themes/span-roles`（+ 派生 `span-roles-child`）：token 与亮暗、
+  拒收、只写 roles 的 hover patch、派生逐键深合并与 `""` 撤销；wind-ui 层注释三态区间与气泡段名回落。
+- 主题编辑器（WindInputThemeEditor `feat/span-colors`）：roles 读写往返、求值与门控、`spanColor.ts`
+  （span_color 角色分支移植）、`TEXT_ROLES` 副本（主仓在场时逐项对拍）、严格模式报未知角色 / 不消费的
+  节点与状态 / 全透明 / `rgb()`、新 token 中文名与两组、面板与预览、「改了 primary 未改 tooltip_accent」
+  提示；`bake:theme` 后 `check:base` / `check:theme` / `check:engine` 绿。`wind-theme-kit` 的示例与
+  `schema.md` 不在本仓，未同步。
+
+**靶机验证判据**（部署含 P1～P3 的构建后，由用户人工核对；同时核 Windows 候选窗与 TSF 宿主渲染窗口）：
+
+1. **出厂零变化**：出厂主题（清风蓝、msime 各亮暗）下，候选窗注释、悬停提示的颜色、位置、宽度与升级前
+   截图逐像素一致（横排、竖排各看一次）。
+2. **软键盘激活键**（唯一有意的出厂变化）：`_base` / msime / 清风系下，软键盘激活键（如 Shift 锁定）的
+   文字是**白色**压强调色底，不再同色看不见（清风系此前是深蓝字，也变为白字）。
+3. **内联色**：把全局注释模板临时改成 `$[error]{${code_hint|code_rev|shuangpin}}`：注释编码显示为红色
+   （亮色 `#D93025`、暗色 `#F28B82`）；切明暗后不打字、直接看候选窗，颜色即随之切换。改成
+   `$[#F80]{…}` 显示橙色 `#FF8800`；改成 `$[红]{…}` 显示原灰色、不出现字面 `$[`。
+4. **气泡作用域**：给悬停提示「拼音」段模板写 `${char}：$[error]{${readings}}`：气泡里读音为浅红
+   `#F28B82`（取 `tooltip_error`，不是候选窗的深红）；删掉 `$[error]{` `}` 后读音恢复白色。
+5. **选中态**：注释模板 `$[accent,selected=error]{…}`：未选中的候选注释为蓝色，高亮候选的注释为红色。
+6. **主题角色色**：把 `span-roles` 测试主题（`wind-theme/testdata/themes/span-roles/theme.toml`）复制到
+   用户主题目录并切换过去：拼音方案下注释反查编码为 `#C00000`，选中候选的该编码变 `#FFE08A`；
+   悬停提示段名 `[编码(五笔)]` 整体为强调色、读音 `#9AD0FF`。
+7. **复制不带颜色**：在第 4 条的气泡上右键「复制全部」，粘贴出的纯文本与改模板前完全相同。
+8. **宿主渲染**：在带 TSF 宿主渲染的应用（如 Windows 搜索框）里重复第 3 条，颜色与普通窗口一致。
+
 ### 13.3 性能
 
 - 协调器：每次按键为整页（≤10）候选各渲染一次注释、一份气泡。**出厂配置下也会产出片段**——协调器不知道
