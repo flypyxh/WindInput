@@ -4381,20 +4381,59 @@ fn keys_overview_of(cfg: &wind_config::Config, schema_cfg: &Value) -> (Vec<Value
 /// ★ 方案层的**显式 `none` 也是表态**（＝本方案禁用），不回落全局。这与内核
 /// `Coordinator::session_action_for` / `bound_action_with_source` 的处置逐条一致；
 /// 若在这里改成「none 视同没配」，总览显示的就与实际行为相反。
+///
+/// # `ineffective`：方案层 `[key_actions]` 的组合键**没有消费通路**
+///
+/// 组合键只由 `Compiler::compile` 从全局 `keys.key_actions` 编进热键表；方案层那张表只在
+/// 按键链上按**单键** VK 查（修饰键轻敲 / 有字符的引导键）。于是方案文件里写的
+/// `"ctrl+alt+j" = …` 按下去什么都不发生——对**所有**动词都成立。补这条通路要让方案级组合键
+/// 进 C++ 的转发集并按活跃方案分派，会破「C++ 吃键集 ⊆ Rust 出字集」，故不补，只如实标出。
+///
+/// 这类条目带 `ineffective: true` 照常列出（用户写了什么就显示什么），且**不遮盖**同名的
+/// 全局条目——全局那条照常列出，它才是实际生效的那一条。判据用 core 的
+/// `route_of_key_action`（与热键编译器同一个分流口），设置端不另判。
+///
+/// ★ 字段恒在（其余条目为 `false`）：跨仓契约无编译期约束，「字段不存在」与「这版 core
+/// 还没实现」在设置端看来完全一样。
 fn push_overview_layer(
     out: &mut Vec<Value>,
     table: &str,
     global: &std::collections::BTreeMap<String, String>,
     schema: &std::collections::BTreeMap<String, String>,
 ) {
+    let schema_ineffective = |k: &str| {
+        table == "lead"
+            && wind_config::hotkey::route_of_key_action(k)
+                == Some(wind_config::hotkey::KeyActionRoute::Hotkey)
+    };
+    let row = |k: &str, action: &str, from: &str, ineffective: bool| {
+        json!({
+            "key": k,
+            "table": table,
+            "action": action,
+            "from": from,
+            "ineffective": ineffective,
+        })
+    };
     let mut keys: std::collections::BTreeSet<&String> = global.keys().collect();
     keys.extend(schema.keys());
     for k in keys {
-        let (action, from) = match schema.get(k) {
-            Some(v) => (v.as_str(), "schema"),
-            None => (global.get(k).map(String::as_str).unwrap_or(""), "global"),
-        };
-        out.push(json!({ "key": k, "table": table, "action": action, "from": from }));
+        match schema.get(k) {
+            Some(v) if schema_ineffective(k) => {
+                // 不生效的方案条目不遮盖全局：全局那条先列（它才是实际生效的）。
+                if let Some(g) = global.get(k) {
+                    out.push(row(k, g, "global", false));
+                }
+                out.push(row(k, v, "schema", true));
+            }
+            Some(v) => out.push(row(k, v, "schema", false)),
+            None => out.push(row(
+                k,
+                global.get(k).map(String::as_str).unwrap_or(""),
+                "global",
+                false,
+            )),
+        }
     }
 }
 
@@ -9094,6 +9133,74 @@ short_code_yield_level = 2
     /// ① 坏表的全局层消失；② 好表的全局层**一条不少**（一起清会把完好的那张也变空白）；
     /// ③ 方案层照常列出（它来自方案文件，不受 `Config` 降级影响）。
     /// 只测 ① 的话，「两张表全清」这种过头的实现照样绿。
+    /// ★ 方案层 `[key_actions]` 的组合键没有消费通路：列出但标 `ineffective: true`，且
+    /// **不遮盖**同名全局条目（全局那条照常列出、`ineffective: false`）。
+    ///
+    /// 对照：方案层的单键 / 修饰键条目照旧遮盖全局（`semicolon`）；会话表不受影响。
+    #[test]
+    fn keys_overview_marks_schema_combo_keys_ineffective_without_shadowing_global() {
+        let schema_cfg = json!({
+            "key_actions": {
+                "ctrl+alt+shift+j": "command:open(\"https://example.com\")",
+                "ctrl+shift+r": "toggle_mode",
+                "semicolon": "special:emoji",
+            },
+            "session_actions": { "comma": "page_prev" },
+        });
+        let mut cfg = wind_config::Config::default();
+        cfg.keys
+            .key_actions
+            .insert("ctrl+alt+shift+j".into(), "toggle_punct".into());
+        cfg.keys
+            .key_actions
+            .insert("semicolon".into(), "mix:quick_mix".into());
+
+        let (rows, _) = keys_overview_of(&cfg, &schema_cfg);
+        let pick = |key: &str| -> Vec<&Value> {
+            rows.iter()
+                .filter(|r| r["table"] == json!("lead") && r["key"] == json!(key))
+                .collect()
+        };
+
+        // 同名组合键：全局那条照常列出且生效，方案那条列出但不生效。
+        let j = pick("ctrl+alt+shift+j");
+        assert_eq!(j.len(), 2, "全局与方案两条都应列出：{j:?}");
+        assert!(
+            j.iter().any(|r| r["from"] == json!("global")
+                && r["action"] == json!("toggle_punct")
+                && r["ineffective"] == json!(false)),
+            "全局那条不得被遮盖：{j:?}"
+        );
+        assert!(
+            j.iter()
+                .any(|r| r["from"] == json!("schema") && r["ineffective"] == json!(true)),
+            "方案那条应标不生效：{j:?}"
+        );
+
+        // 只有方案层有的组合键：同样标不生效。
+        let r = pick("ctrl+shift+r");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["ineffective"], json!(true));
+
+        // 对照：方案层单键照旧遮盖全局，且生效。
+        let semi = pick("semicolon");
+        assert_eq!(semi.len(), 1, "单键方案条目照旧遮盖全局：{semi:?}");
+        assert_eq!(semi[0]["from"], json!("schema"));
+        assert_eq!(semi[0]["ineffective"], json!(false));
+
+        // 字段恒在：每一条都带 `ineffective`（布尔）。
+        assert!(
+            rows.iter().all(|r| r["ineffective"].is_boolean()),
+            "ineffective 须恒在：{rows:?}"
+        );
+        // 会话表不受影响。
+        assert!(
+            rows.iter()
+                .filter(|r| r["table"] == json!("session"))
+                .all(|r| r["ineffective"] == json!(false))
+        );
+    }
+
     #[test]
     fn keys_overview_marks_degraded_table_and_spares_the_healthy_one() {
         let schema_cfg = json!({

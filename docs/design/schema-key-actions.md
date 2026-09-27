@@ -43,6 +43,7 @@
 | **B 模式进入** | `temp_pinyin` `temp_english` `mix:<id>` `special:<id>` | overlay，打完退回 | **最高**——快符按方案分流即此类 |
 | **C 方案切换** | `toggle_schema:<id>` | 持久，带回程 | 高，但**有锁死风险**，见 §5 |
 | **D 禁用** | `none` | — | 屏蔽全局绑定的第三态 |
+| **E 命令直通** | `command:<cmdbar 表达式>` | 瞬时 | 同 A 类（后加，见 §7 七期） |
 
 > `switch_schema:<id>`（单向，无回程）**不进方案级表**，只保留在全局热键（已拍板）。
 > 全局层已经提供了单向切换的完整能力，方案级表的定位是「在此基础上提供更多选择」，
@@ -697,6 +698,33 @@ special → switch_schema → toggle_schema → softkeyboard 的追加顺序）�
 
 它们要返回占位 composition 激活 C++ 转发全部按键，不符 `dispatch_hotkey` 的 `bool` 契约，
 本就不在 `BoundAction` 值域内。这两个在「按键 → 功能快捷键」页配。
+
+### ✅ 七期：命令直通 `command:<表达式>`（2026-09-27）
+
+`command:proc.run("charmap.exe")` / `command:open("https://…")` / `command:key.tap("Ctrl+Shift+P")`
+——把工具栏自定义按钮那套 cmdbar 表达式挂到键上。两张表都收（本表与会话态
+`keys.session_actions`，后者见 session-key-actions.md）。
+
+- **执行通路与工具栏按钮同一个**（`Coordinator::spawn_user_command` → `wrap_command_source`
+  + `spawn_command`）：裸表达式与已写成 `$CC(...)` 的都收，求值失败弹 toast。两处对写法的
+  容忍度因此永远一致——工具栏那边栽过「缺 `$CC` 标记一个动作都不跑且不报错」。
+- **表达式原样保留大小写与内部空白**（只 trim 首尾）：`SessionAction::parse` 一上来就整串
+  小写化，command 必须在那之前剥出来（两张表共用 `parse_command_verb`）。空表达式落 `None`。
+- **策略位全无**：`only_in_chinese_mode = false`（英文态下也该按得动）、`requires_modifier_key
+  = false`、不给 `GLOBAL`（槽位只有 16 个，命令被宿主加速键抢走时换个组合键即可）。
+- **归「锁外」一类**（`is_lock_free_bound`）：不建 overlay、不要 `&mut State`，三条通路
+  （组合键 / 修饰键轻敲 / 单个有字符的键）都经 `run_lock_free_bound_action` 执行并吞键。
+  有字符的键与 A 类同约束：只在空缓冲时触发，英文态下那个字符照常出（分水岭之后）。
+- **日志**：info 只记「执行了按键绑定的命令」，表达式原文只进 debug——它是用户写的内容，
+  可能含本机路径。
+- **方案级 `[key_actions]` 的组合键不生效**（所有动词都如此，既有缺口）：组合键只由
+  `Compiler::compile` 从全局表编进热键表，方案层只按单键 VK 查。补通路要让方案级组合键进
+  C++ 转发集（取并集）并按活跃方案分派，没绑的方案里 C++ 吃了键 Rust 却不出字，破「吃键集
+  ⊆ 出字集」，故不补。按键总览（`keysOverview`）给这类条目标 `ineffective: true` 照常列出，
+  且不遮盖同名全局条目；设置端据此显示「不生效」。
+- **C++ 侧零改动**：三条通路的登记（key_down 策略位 / key_up `schema_bound` / 引导键不登记）
+  都是按键的形态决定的，与动词无关；Rust 侧三条路命中即恒吞键，「C++ 吃键集 ⊆ Rust 出字集」
+  不受影响。
 
 
 ## 8. 相关文档

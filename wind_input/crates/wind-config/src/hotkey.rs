@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 /// | `toggle_full_width` / `toggle_toolbar` / `open_settings` / `open_dictionary` / `take_screenshot` | 无 | 两模式下都该生效，与固定字段那段同档 |
 /// | `toggle_punct` / `toggle_s2t` / `toggle_t2s` / `single_char` | `CHINESE_ONLY` | 只在中文态有意义；**不带 `GLOBAL`**，避免不必要地抢占宿主快捷键 |
 /// | 进 overlay 的（`temp_pinyin` / `temp_english` / `aux_code` / `rare_char` / `mix:` / `special:`） | `CHINESE_ONLY \| GLOBAL` | 进 overlay 只在中文输入中途有意义；`GLOBAL` 让 TSF 用 `RegisterHotKey` 抢占，穿透 QQNT/Tabby 等 Chromium 宿主的同名加速键 |
+/// | `command:<表达式>` | 无 | 跑的是用户的命令，与中英态无关（英文态下也该按得动）；不改输入状态，不需要抢占 |
 /// | `softkeyboard[:<id>]` | `GLOBAL` | 面板画的是「键位 → 符号」，与中英文态无关（英文态想打个 ℃ 同样合理），C++ 侧为此专设了软键盘总闸 `IsSoftKeyboard()`；带上 `CHINESE_ONLY` 英文态连开都开不出来 |
 ///
 /// ⚠️ `GLOBAL` 有**容量上限 16**（`TextService.cpp` 的 `kHotkeyIdAddWordBase + 16`，
@@ -86,11 +87,14 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
         | BA::SoftKeyboard(_) => true,
         // 不抢占：这些不进 overlay，被宿主同名加速键抢走的代价也小（最多是这一次没切成），
         // 而 GLOBAL 的槽位只有 16 个（见下方 `warn_global_hotkey_overflow`）。
+        //
+        // `Command` 同档：跑的是用户自己的命令，被宿主加速键抢走时换个组合键即可。
         BA::None
         | BA::SingleChar(_)
         | BA::ToggleSchema(_)
         | BA::SwitchSchema(_)
-        | BA::Action(_) => false,
+        | BA::Action(_)
+        | BA::Command(_) => false,
     };
     if needs_global {
         policy |= HOTKEY_POLICY_GLOBAL;
@@ -1836,6 +1840,8 @@ mod tests {
             // C 类切方案
             "toggle_schema:english",
             "switch_schema:wubi",
+            // 命令直通
+            r#"command:proc.run("charmap.exe")"#,
         ];
         for verb in verbs {
             let mut cfg = Config::default();
@@ -1884,6 +1890,7 @@ mod tests {
             ("mix:quick_mix", true, true),
             ("special:fuhao", true, true),
             ("softkeyboard", false, true),
+            (r#"command:open("https://example.com")"#, false, false),
         ];
         for (verb, want_chinese, want_global) in cases {
             let mut cfg = Config::default();

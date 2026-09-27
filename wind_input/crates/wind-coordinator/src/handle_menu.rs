@@ -2081,7 +2081,16 @@ impl Coordinator {
             tracing::warn!("工具栏自定义按钮 {:?} 未配置 action", btn.id);
             return;
         }
-        self.spawn_command(wrap_command_source(action), String::new());
+        self.spawn_user_command(action);
+    }
+
+    /// 执行一段**用户写的** cmdbar 表达式：工具栏自定义按钮与按键绑定 `command:<表达式>`
+    /// 共用这一个入口，于是两处对写法的容忍度（裸表达式 / 已带 `$CC(...)`）永远一致。
+    ///
+    /// 经 `spawn_command` 起独立线程执行（`run_command_candidate` 要求未持 state 锁），
+    /// 故持锁的调用方（会话态按键分派）也可以直接调，不会死锁。
+    pub(crate) fn spawn_user_command(&self, expr: &str) {
+        self.spawn_command(wrap_command_source(expr), String::new());
     }
 
     /// 焦点/激活切换路径专用：先用缓存值立即同步通知（无阻塞），

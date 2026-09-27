@@ -4748,6 +4748,19 @@ impl Coordinator {
             wind_config::SessionAction::CommitHighlighted => {
                 return self.commit_highlighted(state);
             }
+            // 命令：执行，**当前组合原样不动**（不清空、不上屏），吞键。
+            //
+            // 无会话放行，判据与 `Cancel` / `SingleChar` 同侧：本表收的 Tab / 翻页键那一批
+            // 宿主另有原义，空闲时必须还给宿主。想空闲时也能按 → 绑到 `keys.key_actions`。
+            //
+            // 持 state 锁调用是安全的：`run_bound_command` 只起线程，不等它跑完。
+            wind_config::SessionAction::Command(expr) => {
+                if !Self::has_input_session(state) {
+                    return None;
+                }
+                self.run_bound_command(&expr);
+                return Some(KeyAction::Consumed);
+            }
             // 表里只存启用项（`ConfigBundle::build` 过滤过），None 到不了这里。
             wind_config::SessionAction::None => return None,
         };
@@ -5370,6 +5383,7 @@ impl Coordinator {
                         "辅助码/翻页键"
                     }
                     wind_config::SessionAction::CommitHighlighted => "上屏键",
+                    wind_config::SessionAction::Command(_) => "命令键",
                     _ => "翻页/高亮键",
                 });
             }
@@ -5769,6 +5783,19 @@ impl Coordinator {
         } else {
             "候选窗:显示"
         });
+    }
+
+    /// 候选窗是否被 `ime.toggle("candwin")` 隐藏（测试/诊断用）。
+    ///
+    /// 住在这里而非 `debug_support.rs`：字段私有，以本模块为界。
+    ///
+    /// 命令类绑定的端到端测试拿它当探针：这个开关**只改一个内存位**——不写盘、不碰组合区，
+    /// 于是「命令执行了」与「当前组合原样不动」可以在同一条用例里同时断言。
+    pub fn debug_candidate_window_hidden(&self) -> bool {
+        *self
+            .hide_candidate_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// 切换候选布局方向（横排 ↔ 竖排），下发 UI 并持久化。命令栏 ime.toggle("layout")。

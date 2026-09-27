@@ -220,7 +220,7 @@ impl SessionKey {
     }
 }
 
-impl<A: Copy> KeyBinds<A> {
+impl<A: Clone> KeyBinds<A> {
     /// 从 (键名, 动作) 对编译。键名解析走 [`session_key_name_to_vk`]。
     ///
     /// 数据源是 `keys.session_actions`（旧的 `page_keys` / `highlight_keys` 组名已在
@@ -259,7 +259,7 @@ impl<A: Copy> KeyBinds<A> {
                 b.as_session_key()
                     .matches(key_code, shift, include_printable)
             })
-            .map(|b| b.action)
+            .map(|b| b.action.clone())
     }
 }
 

@@ -1103,6 +1103,11 @@ global_hotkeys = []
 #                           切的是临时状态，不写配置——重启或切方案后回到
 #                           [schema.codetable] / [schema.pinyin] 的 single_char
 #                           （或码表方案 [engine.codetable] single_char）配的值。
+#   command:<表达式>        执行一段命令，写法同工具栏自定义按钮的 action，如
+#                           command:proc.run("charmap.exe")、command:open("https://…")、
+#                           command:key.tap("Ctrl+Shift+P")。组合键与修饰键轻敲在
+#                           中英文状态下都能按；单个有字符的键只在中文态、未打字时
+#                           生效（英文态或打字中途按它照常出字符）。
 #   none                    禁用这个键。用来关掉**更低层**（本文件、或定制版的
 #                           data_custom/config.toml）预置的绑定：本表逐键深合并，
 #                           删掉一行压不住下层那行，写 none 才是「本层表态：别干活」。
@@ -1138,6 +1143,8 @@ key_actions = {}
 #           都一样。只在有候选时生效，没候选时这个键照常。临时英文里开了「空格作输入」
 #           时它仍是上屏高亮——想用别的键代替空格选词，就绑这个。联想候选跟随
 #           [input.association] space_commits：那里关掉时它也不选联想)
+#       command:<表达式>(执行一段命令，写法同上面 key_actions 的 command:。正在打的码原样
+#           留着，不上屏也不清空；打了码还没出候选时也能按，没在打字时这个键照常)
 # 例（Tab 向下翻页、CapsLock 向上翻页）：
 #   session_actions = { tab = "page_next", "shift+tab" = "page_prev", capslock = "page_prev" }
 # 例（Tab 一键两用：第一次按进辅助码筛选，之后按继续翻页）：

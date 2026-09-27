@@ -1470,6 +1470,7 @@ impl Default for PinyinGlobalConfig {
 /// - `"special:<id>"`：进指定特殊模式
 /// - `"toggle_schema:<id>"`：切到指定方案，再按回来
 /// - `"switch_schema:<id>"`：切到指定方案，单向（仅全局 `keys.key_actions`，见该变体说明）
+/// - `"command:<cmdbar 表达式>"`：执行一段命令（同工具栏自定义按钮），见 [`BoundAction::Command`]
 ///
 /// 未知值一律解析成 [`BoundAction::None`]（不静默变成别的功能）；指向不存在的 id 由消费端
 /// 的门卫拦下（`mix_members` / `ensure_schema`），并在加载期 `warn`。
@@ -1531,6 +1532,34 @@ pub enum BoundAction {
     /// 携带动词原文，由协调器转交 `dispatch_hotkey` ——那里是这批动作的既有单点，
     /// 复制一份实现只会让两处慢慢漂移。值域见 [`Self::DISPATCH_ACTIONS`]。
     Action(String),
+    /// 执行一段 cmdbar 表达式（`command:<表达式>`，如 `command:proc.run("charmap.exe")`）。
+    ///
+    /// 执行通路与工具栏自定义按钮**同一条**（`wrap_command_source` + `spawn_command`），故
+    /// 裸表达式与已写成 `$CC(...)` 的都收，求值失败同样弹 toast。载荷是用户原文（只 trim
+    /// 首尾，大小写与内部空白原样保留——`proc.run` 的路径、`open` 的网址都区分大小写）；
+    /// 表达式为空解析成 [`Self::None`]。
+    ///
+    /// 与中英态无关（`only_in_chinese_mode = false`）、不限修饰键
+    /// （`requires_modifier_key = false`）：它不改输入状态，英文态下想开个字符映射表同样合理。
+    /// 目标函数经独立线程执行（`run_command_candidate` 要求未持 `State` 锁），归「锁外」一类。
+    Command(String),
+}
+
+/// `command:<表达式>` 的前缀。两张表（[`BoundAction`] / [`SessionAction`]）共用。
+const COMMAND_VERB_PREFIX: &str = "command:";
+
+/// 解析 `command:<表达式>`：不是这个动词返回 `None`；是但表达式为空返回 `Some(None)`。
+///
+/// ★ 两张表共用这一份：`SessionAction::parse` 一上来就整串小写化，command 必须在那之前
+/// 剥出来——表达式里的路径与网址区分大小写。前缀本身大小写不敏感，与其余动词同口径。
+fn parse_command_verb(s: &str) -> Option<Option<String>> {
+    let s = s.trim();
+    let head = s.get(..COMMAND_VERB_PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(COMMAND_VERB_PREFIX) {
+        return None;
+    }
+    let expr = s[COMMAND_VERB_PREFIX.len()..].trim();
+    Some((!expr.is_empty()).then(|| expr.to_string()))
 }
 
 impl BoundAction {
@@ -1619,9 +1648,12 @@ impl BoundAction {
             | Self::Special(_) => true,
             // 字词范围切的是「这一码出什么」，没有中文候选就无从谈起。
             Self::SingleChar(_) => true,
-            Self::None | Self::SoftKeyboard(_) | Self::ToggleSchema(_) | Self::SwitchSchema(_) => {
-                false
-            }
+            // 命令不改输入状态，英文态下照样该按得动。
+            Self::None
+            | Self::SoftKeyboard(_)
+            | Self::ToggleSchema(_)
+            | Self::SwitchSchema(_)
+            | Self::Command(_) => false,
             // A 类：只有这三个是「中文态才有意义」，其余（`toggle_mode` / `switch_engine` /
             // `toggle_full_width` / `toggle_toolbar` / `open_settings` / `take_screenshot`）
             // 两模式都吃。分组与 `hotkey.rs` 里固定字段那两段逐条一致。
@@ -1637,8 +1669,13 @@ impl BoundAction {
     }
 
     /// 解析配置字符串。大小写与首尾空白不敏感；未知值 → [`Self::None`]。
+    ///
+    /// 例外是 `command:` 的表达式：原样保留大小写与内部空白，见 [`Self::Command`]。
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
+        if let Some(expr) = parse_command_verb(s) {
+            return expr.map_or(Self::None, Self::Command);
+        }
         if let Some(id) = s.strip_prefix("mix:") {
             let id = id.trim();
             return if id.is_empty() {
@@ -1746,7 +1783,8 @@ impl BoundAction {
 /// - `"select_char:N"`：以词定字，取当前高亮候选词的第 N 个字（N 从 1 起）
 /// - `"aux_code"` / `"aux_code:page_next"`：进辅助码筛选（后者与下翻页共键）
 /// - `"commit_highlighted"`：上屏当前高亮候选（即空格的「选词」功能）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// - `"command:<cmdbar 表达式>"`：执行一段命令，当前组合不动（同 [`BoundAction::Command`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAction {
     /// 未启用 / 显式禁用。
     None,
@@ -1817,6 +1855,12 @@ pub enum SessionAction {
     /// 只在有候选时生效（[`Self::requires_candidates`]）：没有高亮可上屏时按键回落原语义，
     /// 空码空格的那套处置（`space_on_empty_behavior`）不属于本动词。
     CommitHighlighted,
+    /// 执行一段 cmdbar 表达式，**当前组合原样不动**（不清空、不上屏），吞键。
+    /// 写法、载荷与执行通路都与 [`BoundAction::Command`] 逐字一致。
+    ///
+    /// 不要候选（[`Self::requires_candidates`] 为假）：打了码还没出候选时也能按；判据与
+    /// `cancel` 同侧——有会话即可，空闲时放行（绑在 Tab 上，没打字时 Tab 仍是制表符）。
+    Command(String),
 }
 
 /// 辅助码触发键的「共键」参数：**进不去辅助码时，这个键改做什么**。
@@ -1866,6 +1910,10 @@ impl SessionAction {
     /// 后表现为「这个键在会话态没绑定」，与「没配」同形——所以调用方在加载期要 `warn`
     /// （见 [`Self::parse_checked`]）。
     pub fn parse(s: &str) -> Self {
+        // `command:` 必须在小写化**之前**剥出来：表达式原样保留大小写（路径 / 网址）。
+        if let Some(expr) = parse_command_verb(s) {
+            return expr.map_or(Self::None, Self::Command);
+        }
         let t = s.trim().to_lowercase();
         // 带载荷的两个动词。序号从 1 起——`select_candidate` 上限随每页候选数上限（10，
         // 数字键 0 选第 10 个，见 coordinator 的 `handle_number_key_select`）到 10；
@@ -1931,7 +1979,11 @@ impl SessionAction {
         // `SingleChar` 与 `Cancel` 同侧：切换在「打了码还没出候选」时**恰恰最该生效**
         // ——单字模式下某个码本来就可能一条候选都不剩，那时按键若被判成「无事可做」而放行，
         // 用户就再也关不掉它了。
-        !matches!(self, Self::None | Self::Cancel | Self::SingleChar(_))
+        // `Command` 同侧：命令与候选无关，打了码没出候选时照样要能执行。
+        !matches!(
+            self,
+            Self::None | Self::Cancel | Self::SingleChar(_) | Self::Command(_)
+        )
     }
 
     /// 选中第几个候选（1 起）——非选词动词返回 `None`。
@@ -1956,11 +2008,12 @@ impl SessionAction {
     /// 静默忽略拼写错误与「功能坏了」完全同形，用户无从分辨——同
     /// `is_supported_key_action` 立的口径。
     pub fn parse_checked(s: &str) -> Option<Self> {
-        let t = s.trim().to_lowercase();
-        if t.is_empty() || t == "none" {
+        let t = s.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("none") {
             return Some(Self::None);
         }
-        match Self::parse(&t) {
+        // 传原串而非小写化的副本：`command:` 的表达式要原样保留大小写。
+        match Self::parse(t) {
             Self::None => None,
             a => Some(a),
         }
@@ -1994,6 +2047,7 @@ impl std::fmt::Display for SessionAction {
             Self::AuxCode(AuxCodeShare::PageNext) => f.write_str("aux_code:page_next"),
             Self::SingleChar(a) => write!(f, "single_char:{}", a.as_payload()),
             Self::CommitHighlighted => f.write_str("commit_highlighted"),
+            Self::Command(expr) => write!(f, "{COMMAND_VERB_PREFIX}{expr}"),
         }
     }
 }
@@ -9594,6 +9648,67 @@ mod tests {
             Some(SessionAction::CommitHighlighted)
         );
         assert!(a.requires_candidates(), "无候选时无高亮可上屏，须放行按键");
+    }
+
+    /// `command:<表达式>`：两张表同一套解析，表达式**原样保留大小写与内部空白**。
+    ///
+    /// ★ `SessionAction::parse` 一上来就整串小写化，command 若排在那之后，
+    /// `proc.run("C:\\Tools\\CharMap.exe")` 会被改写成全小写路径——Windows 上碰巧能跑，
+    /// 网址与 `key.tap("Ctrl+Shift+P")` 就不行了。`parse_checked` 曾把小写化的副本传给
+    /// `parse`，是同一个洞的第二个入口。
+    #[test]
+    fn command_verb_keeps_expression_verbatim_in_both_tables() {
+        let raw = r#"  Command:proc.run("C:\\Tools\\Char Map.exe")  "#;
+        let want = r#"proc.run("C:\\Tools\\Char Map.exe")"#.to_string();
+        assert_eq!(BoundAction::parse(raw), BoundAction::Command(want.clone()));
+        assert_eq!(
+            SessionAction::parse(raw),
+            SessionAction::Command(want.clone())
+        );
+        assert_eq!(
+            SessionAction::parse_checked(raw),
+            Some(SessionAction::Command(want.clone())),
+            "parse_checked 不得在交给 parse 之前小写化"
+        );
+        let a = SessionAction::Command(want);
+        assert_eq!(
+            SessionAction::parse(&a.to_string()),
+            a,
+            "Display 与 parse 须互逆"
+        );
+
+        // 网址区分大小写，且内部连续空白要原样保留（设置端核对项）。
+        let url = r#"command:open("https://Example.com/A  B")"#;
+        let want = r#"open("https://Example.com/A  B")"#.to_string();
+        assert_eq!(BoundAction::parse(url), BoundAction::Command(want.clone()));
+        assert_eq!(
+            SessionAction::parse(url),
+            SessionAction::Command(want.clone())
+        );
+        assert_eq!(
+            SessionAction::parse_checked(url),
+            Some(SessionAction::Command(want))
+        );
+    }
+
+    /// 表达式为空不是合法绑定：落 `None`，`parse_checked` 报「不认识」供加载期告警。
+    #[test]
+    fn command_verb_with_empty_expression_is_rejected() {
+        for bad in ["command:", "command:   ", " COMMAND: "] {
+            assert_eq!(BoundAction::parse(bad), BoundAction::None, "{bad:?}");
+            assert_eq!(SessionAction::parse(bad), SessionAction::None, "{bad:?}");
+            assert_eq!(SessionAction::parse_checked(bad), None, "{bad:?}");
+        }
+    }
+
+    /// 命令与中英态无关、不限修饰键、会话态下不要候选。
+    #[test]
+    fn command_verb_policy() {
+        let b = BoundAction::parse(r#"command:open("https://example.com")"#);
+        assert!(!b.only_in_chinese_mode(), "英文态下也该按得动");
+        assert!(!b.requires_modifier_key(), "有字符的键上也能绑");
+        let s = SessionAction::parse(r#"command:open("https://example.com")"#);
+        assert!(!s.requires_candidates(), "打了码没候选时也能按");
     }
 
     /// 存量迁移：`trigger_keys` 里的 z → `z_key_action`，其余字母丢弃。

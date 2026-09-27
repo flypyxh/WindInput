@@ -1299,8 +1299,10 @@ impl MessageHandler for Coordinator {
         // 标点走同一段代码，日后标点臂再改也不会漏掉它们。
         //
         // 放行安全的依据（改这一段前请重新核一遍）：本行到标点臂之间还有三道拦截，空码下
-        // 都够不着——`apply_session_action` 只在**有候选**时生效；`numpad_char` 不认这几个
-        // 键；`try_z_fallback` 要求缓冲以 z 开头且破活码前缀。
+        // 都够不着——`apply_session_action` 对这几个键查到的是 `select_char:N`，一律返回
+        // `None`（一个键只有一个会话态绑定；其余动词里，导航与上屏类只在有候选时生效，
+        // `cancel` / `single_char` / `command` 在有会话时即生效，但它们占不到以词定字键）；
+        // `numpad_char` 不认这几个键；`try_z_fallback` 要求缓冲以 z 开头且破活码前缀。
         if data.modifiers & MOD_SHIFT == 0
             && !state.candidates.is_empty()
             && let Some(char_index) = self.select_char_index(data.key_code)

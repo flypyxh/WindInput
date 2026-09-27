@@ -139,6 +139,7 @@ capslock = "page_prev"
 | 处置 | `cancel`（别名 `clear`） | 收编六处 Esc |
 | 筛选 | `aux_code` `aux_code:page_next` | 辅助码（拼音候选的字形二次筛选） |
 | 上屏 | `commit_highlighted` | 空格「有候选」那一支（上屏当前高亮候选） |
+| 命令 | `command:<cmdbar 表达式>` | 与 `keys.key_actions` 的同名动词逐字一致（见 schema-key-actions.md §7 七期） |
 | — | `none` | 禁用该键在本态的绑定 |
 
 ### ★ 与翻页共键做成 `aux_code` 的**参数**，不是新动词、更不是通用降级链
@@ -231,6 +232,15 @@ capslock = "page_prev"
   （`space_on_empty_behavior`）不属于「上屏高亮」。
 - 网址 / 邮箱 / Unicode 三个模式在这里**有**出口（空格本就上屏它们的高亮补全项），
   与 `select_candidate:N` 在那里没有出口（数字是它们的合法字符）不矛盾——本动词不按序号选。
+
+### `command:<表达式>`：执行命令，当前组合原样不动
+
+会话态下按键执行一段 cmdbar 表达式，**不清空、不上屏**正在打的内容，吞键。判据与 `cancel`
+同侧：**有会话即可**（`requires_candidates = false`，打了码没出候选时也能按），空闲时放行——
+本表收的 Tab / 翻页键宿主另有原义。想空闲时也能按，绑到 `keys.key_actions`。
+
+`SessionAction` 因此从 `Copy` 降为 `Clone`（载荷是 `String`）；`KeyBinds<A>` 的约束随之
+从 `A: Copy` 放宽到 `A: Clone`。
 
 ### ★★ 判据挂在动作上，不挂在消费点上
 

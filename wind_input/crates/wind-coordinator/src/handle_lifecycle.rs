@@ -682,8 +682,8 @@ impl Coordinator {
             }
             // A 类同样不在这里执行：`dispatch_hotkey` 自加锁，本函数持锁。
             // keydown 走 `bound_lock_free_action_for_keydown`（判定后 drop 锁），
-            // keyup 走 `handle_bound_modifier_key_up`，两条都在锁外。
-            BoundAction::Action(_) => None,
+            // keyup 走 `handle_bound_modifier_key_up`，两条都在锁外。命令同一分流口。
+            BoundAction::Action(_) | BoundAction::Command(_) => None,
         }
     }
 
@@ -792,10 +792,12 @@ impl Coordinator {
     /// 结果是**死锁**，且只在那个动词被真的绑上时才复现。列全的话新增变体编译不过。
     pub(crate) fn is_lock_free_bound(&self, action: &BoundAction) -> bool {
         match action {
-            // 目标函数自取 `State` 锁 ⇒ 必须锁外。
+            // 目标函数自取 `State` 锁 ⇒ 必须锁外。命令虽经独立线程执行、持锁调也不死锁，
+            // 但它不建 overlay、不要 `&mut State`，归这一类才与「A/C 类」的分流口同形。
             BoundAction::ToggleSchema(_)
             | BoundAction::SwitchSchema(_)
-            | BoundAction::Action(_) => true,
+            | BoundAction::Action(_)
+            | BoundAction::Command(_) => true,
             // 建 overlay，要 `&mut State` ⇒ 调用方持锁。
             //
             // ★ `SoftKeyboard` 在这里是 `false`，但它**也要在锁外执行**：
@@ -824,8 +826,24 @@ impl Coordinator {
             BoundAction::ToggleSchema(id) => self.run_toggle_schema_action(id, trigger_vk),
             BoundAction::SwitchSchema(id) => self.run_switch_schema_action(id, trigger_vk),
             BoundAction::Action(a) => self.run_dispatch_action(a),
+            BoundAction::Command(expr) => {
+                self.run_bound_command(expr);
+                Some(KeyAction::Consumed)
+            }
             _ => None,
         }
+    }
+
+    /// 执行按键绑定的命令（`command:<表达式>`，`key_actions` 与 `session_actions` 两张表共用）。
+    ///
+    /// 执行体与工具栏自定义按钮同一个（`spawn_user_command`）。异步执行，**不等结果**：
+    /// 按键应答只表达「这个键归我了」，命令的成败由 cmdbar 自己弹 toast。
+    ///
+    /// ⚠️ 日志分级：表达式是用户写的内容（可能含路径 / 网址），只进 debug；info 只记事件本身。
+    pub(crate) fn run_bound_command(&self, expr: &str) {
+        info!("执行了按键绑定的命令");
+        debug!("按键绑定命令: {expr}");
+        self.spawn_user_command(expr);
     }
 
     /// **组合键热键**命中后的分派：与单键、修饰键两条通路同一个值域（[`BoundAction`]）。
@@ -935,7 +953,8 @@ impl Coordinator {
             | BoundAction::SoftKeyboard(_)
             | BoundAction::ToggleSchema(_)
             | BoundAction::SwitchSchema(_)
-            | BoundAction::Action(_) => return None,
+            | BoundAction::Action(_)
+            | BoundAction::Command(_) => return None,
         })
     }
 
@@ -970,7 +989,7 @@ impl Coordinator {
             );
             return None;
         }
-        matches!(action, BoundAction::Action(_)).then_some(action)
+        matches!(action, BoundAction::Action(_) | BoundAction::Command(_)).then_some(action)
     }
 
     /// 纯修饰键 keyup 上的方案级绑定分派（`rshift = "toggle_schema:english"` 这类）。
