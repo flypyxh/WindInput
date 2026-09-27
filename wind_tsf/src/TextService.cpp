@@ -1,5 +1,6 @@
 #include "TextService.h"
 #include "EditableContextPolicy.h"
+#include "CandidateHotkeyPolicy.h"
 #include "KeyEventSink.h"
 #include "IPCClient.h"
 #include "LangBarItemButton.h"
@@ -1886,7 +1887,10 @@ void CTextService::_RegisterCandidateHotkeys()
     // ERROR_HOTKEY_ALREADY_REGISTERED (1409)，让前台应用 IME 实例反而注册不上。
     // 两个条件都要：本应用在前台（TSF 信号）**且**本进程就是前台窗口所属进程。
     // 多进程宿主（WebView 类）下后者为假，热键该让给真正拥有前台窗口的那个进程。
-    if (!_hasThreadFocus || !_isProcessForeground || _pHotkeyManager == nullptr) return;
+    // 英文模式也不注册：表里的键服务端只在中文模式认领（英文补全有候选时 Alt+数字 会被
+    // 吞掉而无人处理）。不置 _hotkeysActive，切回中文后下一次候选出现时自然重试。
+    if (!wind::candhotkey::ShouldRegister(_hasThreadFocus, _isProcessForeground, _bChineseMode)
+        || _pHotkeyManager == nullptr) return;
 
     const auto& session = _pHotkeyManager->SessionHotkeys();
     // 表还没同步过来就**不要**置 _hotkeysActive：置了就等于宣称「已注册」，
@@ -1956,6 +1960,11 @@ void CTextService::_DoReevaluateAddWordHotkey()
     // _isProcessForeground 与 _hasThreadFocus 并列：理由见 _RegisterCandidateHotkeys。
     BOOL want = _hasThreadFocus && _isProcessForeground
                 && _bChineseMode && _hasTextInputContext && !_focusIsPassword;
+    // 候选热键同样以中文模式为门卫：候选可见期间切到英文，立即还给宿主。
+    if (!_bChineseMode && _hotkeysActive)
+    {
+        _UnregisterCandidateHotkeys();
+    }
     if (want && !_addWordHotkeysActive)
     {
         _RegisterAddWordHotkeys();

@@ -178,6 +178,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME passthrough_note COMMAND passthrough_note_test)
 
+    add_executable(candidate_hotkey_policy_test tests/candidate_hotkey_policy_test.cpp)
+    target_include_directories(candidate_hotkey_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(candidate_hotkey_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME candidate_hotkey_policy COMMAND candidate_hotkey_policy_test)
+
     add_executable(installer_guard_test tests/installer_guard_test.cpp)
     target_include_directories(installer_guard_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)
