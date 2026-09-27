@@ -6642,6 +6642,8 @@ impl Coordinator {
     /// 是最后一道防线，接的是那两处都够不着的入口。
     /// 启动期归一（见 [`Self::normalize_conversion_exclusivity`]）：读自己的运行时配置，
     /// 不像 reload 那样有一份现成的 `new_cfg`。
+    // 唯一调用方是 construct::new（desktop-ui 特性）；wind-webdata 等不带该特性的依赖方编译时它无人调用。
+    #[cfg_attr(not(feature = "desktop-ui"), allow(dead_code))]
     pub(crate) fn normalize_conversion_exclusivity_on_start(&self) {
         if self.rt().config.input.has_conversion_conflict() {
             warn!("启动时 input.s2t 与 input.t2s 同时开启，已关闭 input.t2s（两个方向互斥）");
