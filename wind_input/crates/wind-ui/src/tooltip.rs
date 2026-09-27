@@ -120,8 +120,9 @@ enum MenuEvent {
         on_tip: bool,
         spurious: u8,
     },
-    /// 伪离开后的复查定时器到期（见 [`RECHECK_MS`]）。
-    Recheck { on_tip: bool },
+    /// 伪离开后的复查定时器到期（见 [`RECHECK_MS`]）。`suppress` 同 `Leave`：光标没动就
+    /// 右键气泡时，菜单请求已发出、抑制已开，复查不该再来定去留。
+    Recheck { suppress: bool, on_tip: bool },
 }
 
 /// 气泡对 [`MenuEvent`] 的反应。
@@ -184,8 +185,9 @@ fn menu_step(event: MenuEvent) -> MenuStep {
             ..
         } if spurious < MAX_SPURIOUS_LEAVES => MenuStep::AwaitMove,
         MenuEvent::Leave { .. } => MenuStep::Hide,
-        MenuEvent::Recheck { on_tip: true } => MenuStep::Retrack,
-        MenuEvent::Recheck { on_tip: false } => MenuStep::Hide,
+        MenuEvent::Recheck { suppress: true, .. } => MenuStep::Ignore,
+        MenuEvent::Recheck { on_tip: true, .. } => MenuStep::Retrack,
+        MenuEvent::Recheck { on_tip: false, .. } => MenuStep::Hide,
     }
 }
 
@@ -354,7 +356,11 @@ impl WindowMouse for TooltipMouse {
                     on_tip: self.cursor_on_tip(),
                     spurious: self.spurious,
                 };
-                match menu_step(event) {
+                let step = menu_step(event);
+                if !self.suppress_hide.get() {
+                    tracing::info!("[tip-leave] 离开 {event:?} → {step:?}");
+                }
+                match step {
                     MenuStep::AwaitMove => {
                         self.spurious += 1;
                         self.mouse_over.set(true);
@@ -371,11 +377,19 @@ impl WindowMouse for TooltipMouse {
                     return Some(LRESULT(0));
                 }
                 self.cancel_recheck();
-                match menu_step(MenuEvent::Recheck {
+                let event = MenuEvent::Recheck {
+                    suppress: self.suppress_hide.get(),
                     on_tip: self.cursor_on_tip(),
-                }) {
+                };
+                let step = menu_step(event);
+                tracing::info!(
+                    "[tip-leave] 复查到期 {event:?} spurious={} → {step:?}",
+                    self.spurious
+                );
+                match step {
                     MenuStep::Retrack => self.retrack(),
-                    _ => self.hide_now(),
+                    MenuStep::Hide => self.hide_now(),
+                    _ => {}
                 }
                 Some(LRESULT(0))
             }
@@ -691,6 +705,15 @@ impl Tooltip {
 
     /// 记下当前内容（命中换算要用），返回要画的纯文本。
     fn set_doc(&mut self, doc: &TooltipDoc, candidate: i32) -> String {
+        // 伪离开后等复查期间换了内容（光标移到别的候选，协调器重绘直接 show 新气泡，不经
+        // `hide`）：光标已不在气泡上，复查到期会把新气泡当「离开」藏掉——就此归位。光标
+        // 仍在气泡上、只是内容原地刷新的，复查照旧。
+        {
+            let mut m = self.mouse.borrow_mut();
+            if m.recheck_pending && !m.cursor_on_tip() {
+                m.settle_hidden();
+            }
+        }
         let mut h = self.hits.borrow_mut();
         h.doc = doc.clone();
         h.candidate = candidate;
@@ -1115,8 +1138,12 @@ mod tests {
         );
         assert_eq!(menu_step(leave(false, true, MAX_SPURIOUS_LEAVES)), Hide);
         // 复查定时器到期：光标仍在气泡上就补挂跟踪，否则隐藏。
-        assert_eq!(menu_step(Recheck { on_tip: true }), Retrack);
-        assert_eq!(menu_step(Recheck { on_tip: false }), Hide);
+        let recheck = |suppress, on_tip| Recheck { suppress, on_tip };
+        assert_eq!(menu_step(recheck(false, true)), Retrack);
+        assert_eq!(menu_step(recheck(false, false)), Hide);
+        // 抑制中（光标没动就右键了气泡，菜单请求已发出）：复查不定去留。
+        assert_eq!(menu_step(recheck(true, true)), Ignore);
+        assert_eq!(menu_step(recheck(true, false)), Ignore);
     }
 
     fn tooltip_with_rx(on_tip: bool) -> (Tooltip, std::sync::mpsc::Receiver<UiEvent>) {
@@ -1411,6 +1438,80 @@ mod tests {
         set_on_tip(&t, false);
         recheck_fires(&t);
         assert!(t.shown());
+    }
+
+    /// 伪离开等复查期间光标移到另一个候选，协调器重绘直接 `show` 新内容（不经 `hide`）：
+    /// 复查到期时光标在候选窗上，不得把刚显示的新气泡当「离开」藏掉。
+    #[test]
+    fn probe_show_after_spurious_leave_survives_recheck() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        set_on_tip(&t, false);
+        t.show(&doc(), 1, 10, 10, 20);
+        recheck_fires(&t);
+        assert!(t.shown(), "新气泡不得被旧复查藏掉");
+    }
+
+    /// 内容原地刷新（光标仍在气泡上）：复查照旧在走。
+    #[test]
+    fn show_on_tip_keeps_recheck() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        t.show(&doc(), 0, 10, 10, 20);
+        assert!(t.mouse.borrow().recheck_pending);
+    }
+
+    /// 光标没动就右键气泡：请求发出、抑制已开，协调器回应晚于复查时复查不得把气泡藏掉。
+    #[test]
+    fn recheck_during_menu_request_is_ignored() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        crate::popup_menu::set_menu_visible(false);
+        own_right_down(&t);
+        set_on_tip(&t, false);
+        recheck_fires(&t);
+        assert!(t.shown());
+    }
+
+    /// 伪离开计数在真实移动时清零（不经菜单关闭的 rearm）：此后又能再容忍满额的伪离开。
+    #[test]
+    fn real_move_resets_spurious_count() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        t.mouse
+            .borrow_mut()
+            .on_message(HWND::default(), WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
+        for i in 0..MAX_SPURIOUS_LEAVES {
+            mouse_leave(&t);
+            assert!(t.shown(), "移动后第 {} 条伪离开仍留下", i + 1);
+            recheck_fires(&t);
+        }
+    }
+
+    /// `mouse_over` 已清（如菜单关闭判定隐藏）时 `hide()` 也撤掉复查，免得它到期后再动气泡。
+    #[test]
+    fn hide_without_mouse_over_cancels_recheck() {
+        let (mut t, _rx) = tooltip_with_rx(true);
+        t.visible.set(true);
+        t.set_menu_open(true);
+        t.set_menu_open(false);
+        mouse_leave(&t);
+        assert!(t.mouse.borrow().recheck_pending);
+        t.mouse_over.set(false);
+        t.hide();
+        assert!(!t.mouse.borrow().recheck_pending);
     }
 
     /// 抑制未开（关闭的是工具栏 / 状态等别人的菜单）时 `SetTooltipMenuOpen(false)` 不动气泡：
