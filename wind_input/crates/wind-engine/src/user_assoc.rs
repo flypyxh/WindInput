@@ -19,45 +19,90 @@
 
 use std::sync::{Arc, Mutex};
 
+/// 一条命中：词、它的一个记录码（供查 FREQ）、层内排序键与使用次数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserHit<'a> {
+    pub text: &'a str,
+    pub code: &'a str,
+    /// 层内排序键（降序）：用户词 = 权重；临时词 = `count << 32 | created_at`。
+    pub rank: i64,
+    /// store 记录的使用次数（临时词的门槛看它；用户词仅作参考）。
+    pub count: u32,
+}
+
+/// 建表输入的一行：(词, 码, 排序键, 次数)。
+type Row = (String, String, i64, u32);
+
 /// 一层（用户词或临时词）按文本排序的紧凑表。
 #[derive(Default)]
 struct TextTable {
-    /// 全部词文本首尾相接。
+    /// 全部「词 + 码」首尾相接。
     buf: String,
-    /// (在 `buf` 中的起点, 字节长, 权重)，按文本字节序升序、文本唯一。
-    entries: Vec<(u32, u32, i32)>,
+    /// 按文本字节序升序、文本唯一。
+    entries: Vec<Entry>,
+}
+
+struct Entry {
+    off: u32,
+    text_len: u16,
+    code_len: u16,
+    rank: i64,
+    count: u32,
 }
 
 impl TextTable {
-    /// `words` 可重复、可乱序；同文本多码时取最大权重。
-    fn build(mut words: Vec<(String, i32)>) -> Self {
-        words.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        words.dedup_by(|b, a| a.0 == b.0);
-        let mut t = TextTable {
-            buf: String::with_capacity(words.iter().map(|w| w.0.len()).sum()),
-            entries: Vec::with_capacity(words.len()),
-        };
-        for (text, w) in words {
-            t.entries.push((t.buf.len() as u32, text.len() as u32, w));
+    /// `rows` 可重复、可乱序；同文本多码时取排序键最大的那条（次数取和）。
+    fn build(mut rows: Vec<Row>) -> Self {
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
+        let mut t = TextTable::default();
+        for (text, code, rank, count) in rows {
+            if text.len() > u16::MAX as usize || code.len() > u16::MAX as usize {
+                continue;
+            }
+            if let Some(last) = t.entries.last_mut()
+                && t.buf[last.off as usize..last.off as usize + last.text_len as usize] == *text
+            {
+                last.count = last.count.saturating_add(count);
+                continue;
+            }
+            t.entries.push(Entry {
+                off: t.buf.len() as u32,
+                text_len: text.len() as u16,
+                code_len: code.len() as u16,
+                rank,
+                count,
+            });
             t.buf.push_str(&text);
+            t.buf.push_str(&code);
         }
         t
     }
 
-    fn text(&self, e: &(u32, u32, i32)) -> &str {
-        &self.buf[e.0 as usize..(e.0 + e.1) as usize]
+    fn hit(&self, e: &Entry) -> UserHit<'_> {
+        let (o, tl, cl) = (e.off as usize, e.text_len as usize, e.code_len as usize);
+        UserHit {
+            text: &self.buf[o..o + tl],
+            code: &self.buf[o + tl..o + tl + cl],
+            rank: e.rank,
+            count: e.count,
+        }
     }
 
-    /// 以 `prefix` 开头且严格更长的词，按权重降序（同权按文本）取前 `limit` 条。
-    fn with_prefix(&self, prefix: &str, limit: usize) -> Vec<(&str, i32)> {
-        let start = self.entries.partition_point(|e| self.text(e) < prefix);
-        let mut hits: Vec<(&str, i32)> = self.entries[start..]
+    /// 以 `prefix` 开头且严格更长、且过 `keep` 的词，按排序键降序（同键按文本）取前 `limit` 条。
+    fn with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+        keep: impl Fn(&UserHit<'_>) -> bool,
+    ) -> Vec<UserHit<'_>> {
+        let start = self.entries.partition_point(|e| self.hit(e).text < prefix);
+        let mut hits: Vec<UserHit<'_>> = self.entries[start..]
             .iter()
-            .map(|e| (self.text(e), e.2))
-            .take_while(|(t, _)| t.starts_with(prefix))
-            .filter(|(t, _)| t.len() > prefix.len())
+            .map(|e| self.hit(e))
+            .take_while(|h| h.text.starts_with(prefix))
+            .filter(|h| h.text.len() > prefix.len() && keep(h))
             .collect();
-        hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        hits.sort_by(|a, b| b.rank.cmp(&a.rank).then(a.text.cmp(b.text)));
         hits.truncate(limit);
         hits
     }
@@ -74,36 +119,52 @@ pub struct UserAssocIndex {
 
 impl UserAssocIndex {
     /// 全量扫 store 建索引（**会扫整张用户词表**，只在后台线程 / 预热 / 测试里调）。
+    ///
+    /// ★ 临时词的排序键以 **count** 打头：临时词权重是写入时的定值（自动造词恒为
+    /// `LEARN_ADD_WEIGHT`），按权重排等于按字典序排。
     pub fn build(store: &wind_store::Store, data_schema: &str) -> Self {
         let generation = store.words_generation();
-        let (mut user, mut temp) = (Vec::new(), Vec::new());
-        let keep = |v: &mut Vec<(String, i32)>, w: wind_store::user_words::UserWordView<'_>| {
-            if w.text.chars().nth(1).is_some() {
-                v.push((w.text.to_string(), w.weight));
-            }
-            true
-        };
+        let (mut user, mut temp): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
+        let multi = |t: &str| t.chars().nth(1).is_some();
         let r = store
-            .for_each_user_word(data_schema, "", &mut |w| keep(&mut user, w))
-            .and_then(|_| store.for_each_temp_word(data_schema, "", &mut |w| keep(&mut temp, w)));
+            .for_each_user_word(data_schema, "", &mut |w| {
+                if multi(w.text) {
+                    user.push((w.text.into(), w.code.into(), w.weight as i64, w.count));
+                }
+                true
+            })
+            .and_then(|_| {
+                store.for_each_temp_word(data_schema, "", &mut |w| {
+                    if multi(w.text) {
+                        let rank = ((w.count as i64) << 32) | (w.created_at & 0xFFFF_FFFF);
+                        temp.push((w.text.into(), w.code.into(), rank, w.count));
+                    }
+                    true
+                })
+            });
         if let Err(e) = r {
             tracing::warn!("联想用户词索引：读 store 失败 schema={data_schema}: {e}");
         }
-        let (user, temp) = (TextTable::build(user), TextTable::build(temp));
         UserAssocIndex {
             data_schema: data_schema.to_string(),
             generation,
-            user,
-            temp,
+            user: TextTable::build(user),
+            temp: TextTable::build(temp),
         }
     }
 
-    pub fn user_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(&str, i32)> {
-        self.user.with_prefix(prefix, limit)
+    pub fn user_with_prefix(&self, prefix: &str, limit: usize) -> Vec<UserHit<'_>> {
+        self.user.with_prefix(prefix, limit, |_| true)
     }
 
-    pub fn temp_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(&str, i32)> {
-        self.temp.with_prefix(prefix, limit)
+    /// 临时词；`keep` 按次数分档（个人档 / 补位档）。
+    pub fn temp_with_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+        keep: impl Fn(&UserHit<'_>) -> bool,
+    ) -> Vec<UserHit<'_>> {
+        self.temp.with_prefix(prefix, limit, keep)
     }
 }
 
@@ -171,22 +232,39 @@ pub(crate) fn prewarm(slot: &SharedSlot, store: &wind_store::Store, data_schema:
 mod tests {
     use super::*;
 
+    fn texts<'a>(v: Vec<UserHit<'a>>) -> Vec<(&'a str, i64)> {
+        v.iter().map(|h| (h.text, h.rank)).collect()
+    }
+
+    fn row(t: &str, rank: i64, count: u32) -> Row {
+        (t.into(), "c".into(), rank, count)
+    }
+
     #[test]
-    fn prefix_is_strict_sorted_by_weight_and_deduped() {
+    fn prefix_is_strict_sorted_by_rank_and_deduped() {
         let t = TextTable::build(vec![
-            ("荷载".into(), 5),
-            ("荷".into(), 99),
-            ("荷载效应".into(), 7),
-            ("荷载".into(), 9),
-            ("花卉".into(), 100),
-            ("荷包".into(), 1),
+            row("荷载", 5, 1),
+            row("荷", 99, 1),
+            row("荷载效应", 7, 1),
+            row("荷载", 9, 2),
+            row("花卉", 100, 1),
+            row("荷包", 1, 1),
         ]);
         assert_eq!(
-            t.with_prefix("荷", 10),
+            texts(t.with_prefix("荷", 10, |_| true)),
             vec![("荷载", 9), ("荷载效应", 7), ("荷包", 1)]
         );
-        assert_eq!(t.with_prefix("荷载", 10), vec![("荷载效应", 7)]);
-        assert_eq!(t.with_prefix("荷", 1), vec![("荷载", 9)]);
-        assert!(t.with_prefix("无", 10).is_empty());
+        assert_eq!(
+            t.with_prefix("荷", 10, |_| true)[0].count,
+            3,
+            "同文本多码次数取和"
+        );
+        assert_eq!(
+            texts(t.with_prefix("荷载", 10, |_| true)),
+            vec![("荷载效应", 7)]
+        );
+        assert_eq!(texts(t.with_prefix("荷", 1, |_| true)), vec![("荷载", 9)]);
+        assert!(t.with_prefix("荷", 10, |h| h.count > 5).is_empty());
+        assert!(t.with_prefix("无", 10, |_| true).is_empty());
     }
 }

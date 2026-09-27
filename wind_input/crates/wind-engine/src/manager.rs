@@ -367,6 +367,11 @@ impl RangeScan {
 /// 只能由调用方注入。
 type EnglishProvider<'a> = &'a dyn Fn() -> Option<Arc<dyn Engine>>;
 
+/// 词语联想：临时词进「个人档」的使用次数门槛。新建即 count=1，达到 2 = 建出来之后又用过。
+pub const ASSOC_TEMP_MIN_COUNT: u32 = 2;
+/// 词语联想：每档先取 `limit ×` 本值作重排池。
+pub const ASSOC_POOL_FACTOR: usize = 4;
+
 pub struct EngineManager {
     /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
     engines: Mutex<HashMap<String, Arc<dyn Engine>>>,
@@ -1210,22 +1215,30 @@ impl EngineManager {
         }
     }
 
-    /// **词语联想**取数：以 `prefix` 开头、且严格更长的词，按下述分档合并后取前 `limit` 条。
-    /// 返回 (整词, 该词在自己那一层里的权重)，**顺序即最终顺序**（跨层权重量纲不同，
-    /// 调用方不得再按权重重排）。
+    /// **词语联想**取数：以 `prefix` 开头、且严格更长的词，分档合并、档内按使用重排后
+    /// 取前 `limit` 条。返回 (整词, 档内排序分)，**顺序即最终顺序**（跨档分数量纲不同，
+    /// 调用方不得再按分数重排）。
     ///
-    /// # 三层怎么合并（论坛 t185）
+    /// # 分档（论坛 t185）
     ///
-    /// 1. **用户词**（store 用户词库）——用户自己造 / 导入 / 晋升的词，是「我的词汇」，
-    ///    排最前。层内按用户词权重降序。
-    /// 2. **系统词**（`schema_id` 词库的反查索引）——层内按词库权重降序。
-    /// 3. **临时词**（自动造词 / 自学习尚未晋升的）——**补位**，排在系统词之后：
-    ///    它们未经确认、码表自动造词会产出噪声，放前面会把系统词挤掉；但系统词不够填满
-    ///    时（「荷载」这类专业词的延长）正好补上。
+    /// 0. **用户词**——「我的词汇」，排最前；
+    /// 1. **常用临时词**（`count ≥` [`ASSOC_TEMP_MIN_COUNT`]）——建出来之后用户**又用过**，
+    ///    与用户词同属个人档、排其后；
+    /// 2. **系统词**（`schema_id` 词库的反查索引）；
+    /// 3. **其余临时词**——只补位。自动造词的噪声词新建即 count=1，用户不再选它就停在这里。
     ///
-    /// 同文本先到先得（用户词里有的系统词不再重复）。
+    /// 同文本先到先得（按档序）。
     ///
-    /// 用户词 / 临时词按 `data_schema_id(schema_id)` 归属取（拼音系方案共享 `"pinyin"`）。
+    /// # 档内排序：静态序 + 选词次数（方案 A）
+    ///
+    /// 档内键 = (`p` 降序, 静态名次)。`p` 取 FREQ 表里该词被**正常打字选中**的记录
+    /// （码表 = 输入码，拼音 = 候选码；码取自用户词 / 临时词记录与反查索引，同词多码合并：
+    /// 次数求和、最近取大），打分沿用拼音那套 [`FreqProfile::pinyin_score`]
+    /// （`log2(count+1)` × 半衰期衰减）。每档先取 `limit ×` [`ASSOC_POOL_FACTOR`] 条作池子，
+    /// 让静态名次靠后但常用的词有机会浮上来。
+    ///
+    /// FREQ 查询是**一次读事务的批量点查**（几十个 key），在按键路径上。
+    ///
     /// 两份索引都**不在按键线程上构建**：没就绪就这一层这次不出。
     pub fn assoc_prefix_words(
         &self,
@@ -1236,37 +1249,126 @@ impl EngineManager {
         if schema_id.is_empty() || prefix.is_empty() || limit == 0 {
             return Vec::new();
         }
+        let pool = limit.saturating_mul(ASSOC_POOL_FACTOR);
+        let data_schema = self.data_schema_id(schema_id);
         let user_idx = self.store.as_ref().and_then(|store| {
-            crate::user_assoc::get_or_refresh(
-                &self.user_assoc,
-                store,
-                &self.data_schema_id(schema_id),
-            )
+            crate::user_assoc::get_or_refresh(&self.user_assoc, store, &data_schema)
         });
-        let mut out: Vec<(String, i32)> = Vec::with_capacity(limit);
-        let mut push = |t: &str, w: i32| {
-            if out.len() < limit && !out.iter().any(|(o, _)| o == t) {
-                out.push((t.to_string(), w));
+        // 索引没就绪就这次不联想系统词（**不阻塞按键线程**）。
+        let sys_idx = self.reverse_index_if_ready(schema_id);
+
+        // (档, 静态名次, 词, 查 FREQ 用的码)
+        let mut items: Vec<(u8, usize, String, Vec<String>)> = Vec::new();
+        let mut push = |tier: u8, rank: usize, text: &str, codes: Vec<String>| {
+            if !items.iter().any(|(_, _, t, _)| t == text) {
+                items.push((tier, rank, text.to_string(), codes));
             }
         };
+        let sys_codes = |t: &str| -> Vec<String> {
+            sys_idx
+                .as_ref()
+                .and_then(|i| i.codes_of(t))
+                .map(|l| l.iter().map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        let with_sys = |code: &str, t: &str| {
+            let mut v = sys_codes(t);
+            if !v.iter().any(|c| c == code) {
+                v.push(code.to_string());
+            }
+            v
+        };
         if let Some(u) = &user_idx {
-            for (t, w) in u.user_with_prefix(prefix, limit) {
-                push(t, w);
+            for (i, h) in u.user_with_prefix(prefix, pool).into_iter().enumerate() {
+                push(0, i, h.text, with_sys(h.code, h.text));
+            }
+            let personal = |h: &crate::user_assoc::UserHit<'_>| h.count >= ASSOC_TEMP_MIN_COUNT;
+            for (i, h) in u
+                .temp_with_prefix(prefix, pool, personal)
+                .into_iter()
+                .enumerate()
+            {
+                push(1, i, h.text, with_sys(h.code, h.text));
             }
         }
-        // 索引没就绪就这次不联想（**不阻塞按键线程**）。联想是锦上添花，且
-        // `maybe_enter_assoc` 在无候选时直接返回、不改任何状态，降级完全无副作用。
-        if let Some(idx) = self.reverse_index_if_ready(schema_id) {
-            for (t, w) in idx.texts_with_prefix(prefix, limit) {
-                push(t, w);
+        if let Some(idx) = &sys_idx {
+            for (i, (t, _)) in idx.texts_with_prefix(prefix, pool).into_iter().enumerate() {
+                push(2, i, t, sys_codes(t));
             }
         }
         if let Some(u) = &user_idx {
-            for (t, w) in u.temp_with_prefix(prefix, limit) {
-                push(t, w);
+            let filler = |h: &crate::user_assoc::UserHit<'_>| h.count < ASSOC_TEMP_MIN_COUNT;
+            for (i, h) in u
+                .temp_with_prefix(prefix, pool, filler)
+                .into_iter()
+                .enumerate()
+            {
+                push(3, i, h.text, with_sys(h.code, h.text));
             }
         }
-        out
+
+        let scores = self.assoc_freq_scores(&data_schema, &items);
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by(|&a, &b| {
+            items[a]
+                .0
+                .cmp(&items[b].0)
+                .then(scores[b].total_cmp(&scores[a]))
+                .then(items[a].1.cmp(&items[b].1))
+        });
+        order
+            .into_iter()
+            .take(limit)
+            .map(|i| (items[i].2.clone(), scores[i].round() as i32))
+            .collect()
+    }
+
+    /// 联想候选的选词次数分（方案 A）：一次批量点查 FREQ，同词多码合并后按拼音衰减打分。
+    /// 无 store / 查询失败 ⇒ 全 0（退化为静态序）。
+    fn assoc_freq_scores(
+        &self,
+        data_schema: &str,
+        items: &[(u8, usize, String, Vec<String>)],
+    ) -> Vec<f64> {
+        let Some(store) = &self.store else {
+            return vec![0.0; items.len()];
+        };
+        let keys: Vec<(String, String, String)> = items
+            .iter()
+            .flat_map(|(_, _, t, codes)| {
+                codes
+                    .iter()
+                    .map(move |c| (data_schema.to_string(), c.clone(), t.clone()))
+            })
+            .collect();
+        let recs = match store.get_freq_batch(&keys) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("联想查词频失败（退化为静态序）: {e}");
+                return vec![0.0; items.len()];
+            }
+        };
+        let profile = self.pinyin_freq_profile();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let mut it = recs.into_iter();
+        items
+            .iter()
+            .map(|(_, _, _, codes)| {
+                let merged = it.by_ref().take(codes.len()).flatten().fold(
+                    wind_store::freq::FreqRecord {
+                        count: 0,
+                        last_used: 0,
+                    },
+                    |acc, r| wind_store::freq::FreqRecord {
+                        count: acc.count.saturating_add(r.count),
+                        last_used: acc.last_used.max(r.last_used),
+                    },
+                );
+                profile.pinyin_score(&merged, now)
+            })
+            .collect()
     }
 
     /// 阻塞地建好词语联想的用户词文本索引（预热线程 / 测试用，**不可进按键链路**）。

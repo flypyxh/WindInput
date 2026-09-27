@@ -208,3 +208,108 @@ fn temp_word_joins_word_assoc() {
         "临时词应出现在联想里，实得 {texts:?}"
     );
 }
+
+/// 上屏「荷」（awsk + 空格）后的联想列表。
+fn assoc_after_he(c: &Coordinator) -> Vec<String> {
+    press(c, 0x1B);
+    type_code(c, "awsk");
+    let act = press(c, 0x20);
+    assert_eq!(committed(&act), Some("荷"));
+    c.debug_assoc_texts()
+}
+
+/// ★ 方案 A：选词次数（FREQ）在档内重排。系统序「荷兰(1633) > 荷花(1298)」，
+/// 用户平时打过十次「荷花」⇒ 联想里「荷花」到「荷兰」前面。
+#[test]
+fn freq_reranks_system_words_within_tier() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, _) = coord("f_base", "word", false, |_| {});
+    let base = assoc_after_he(&c);
+    assert_eq!(
+        base.first().map(String::as_str),
+        Some("荷兰"),
+        "反向对照：无词频时 {base:?}"
+    );
+
+    let (c, _) = coord("f_used", "word", false, |s| {
+        for _ in 0..10 {
+            s.record_freq("wubi86", "awaw", "荷花").unwrap();
+        }
+    });
+    let got = assoc_after_he(&c);
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some("荷花"),
+        "实得 {got:?}"
+    );
+    assert!(got.iter().any(|t| t == "荷兰"), "荷兰仍在：{got:?}");
+}
+
+/// ★ 临时词门槛：count=1 只在系统词之后补位；count≥2 进个人档（用户词之后、系统词之前）。
+#[test]
+fn temp_word_needs_reuse_to_enter_personal_tier() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, _) = coord("t_once", "word", false, |s| {
+        s.learn_temp_word("wubi86", "awgg", "荷叶田田", 800, 0)
+            .unwrap();
+    });
+    let got = assoc_after_he(&c);
+    // 「荷」的系统延长词只有 8 条，第 9 个名额空着 ⇒ count=1 的临时词可以补位，但只能在最后。
+    let pos = got.iter().position(|t| t == "荷叶田田");
+    assert!(
+        pos.is_none_or(|p| p == got.len() - 1 && got[..p].iter().any(|t| t == "荷兰")),
+        "count=1 只能排在全部系统词之后补位：{got:?}"
+    );
+
+    let (c, _) = coord("t_twice", "word", false, |s| {
+        s.add_user_word("wubi86", "awfa", "荷载", 0, 0).unwrap();
+        s.learn_temp_word("wubi86", "awgg", "荷叶田田", 800, 0)
+            .unwrap();
+        s.learn_temp_word("wubi86", "awgg", "荷叶田田", 800, 0)
+            .unwrap();
+    });
+    let got = assoc_after_he(&c);
+    assert_eq!(
+        got.iter().take(2).map(String::as_str).collect::<Vec<_>>(),
+        vec!["荷载", "荷叶田田"],
+        "用户词 → count≥2 临时词 → 系统词，实得 {got:?}"
+    );
+}
+
+/// ★ 自动造词噪声（一堆 count=1 的临时词）不挤掉系统词；个人档内按 count 而非字典序排。
+#[test]
+fn temp_noise_does_not_displace_system_words() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, _) = coord("t_noise", "word", false, |s| {
+        for i in 0..12 {
+            s.learn_temp_word("wubi86", "awzz", &format!("荷噪{i:02}"), 800, 0)
+                .unwrap();
+        }
+        // 两条 count≥2：「荷乙」用得更多，应排在字典序靠前的「荷甲」之前。
+        for _ in 0..2 {
+            s.learn_temp_word("wubi86", "awyy", "荷甲词", 800, 0)
+                .unwrap();
+        }
+        for _ in 0..4 {
+            s.learn_temp_word("wubi86", "awyy", "荷乙词", 800, 0)
+                .unwrap();
+        }
+    });
+    let got = assoc_after_he(&c);
+    assert!(
+        !got.iter().any(|t| t.starts_with("荷噪")),
+        "噪声挤进来了：{got:?}"
+    );
+    assert!(got.iter().any(|t| t == "荷兰"), "系统词被挤掉：{got:?}");
+    assert_eq!(
+        got.iter().take(2).map(String::as_str).collect::<Vec<_>>(),
+        vec!["荷乙词", "荷甲词"],
+        "个人档按 count 降序，实得 {got:?}"
+    );
+}
