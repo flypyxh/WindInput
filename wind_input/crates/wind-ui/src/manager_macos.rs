@@ -232,7 +232,7 @@ impl Forwarder {
                 let tip = if hover >= 0 {
                     candidates
                         .get(hover as usize)
-                        .map(|c| c.tooltip.clone())
+                        .map(|c| c.tooltip.to_plain_text())
                         .filter(|s| !s.is_empty())
                 } else {
                     None
@@ -496,9 +496,9 @@ impl Forwarder {
                     ));
                 });
             }
-            UiCommand::CopyTooltipText => {
-                // 提示气泡由 .app 渲染，但文本是本进程随帧下发的，故复制无需 .app 参与。
-                let (msg, kind) = match self.last_tip.as_deref().filter(|s| !s.is_empty()) {
+            UiCommand::CopyTooltipText(text) => {
+                // 文本由协调器按原始行拼好随命令下发，复制无需 .app 参与。
+                let (msg, kind) = match Some(text.as_str()).filter(|s| !s.is_empty()) {
                     Some(t) => {
                         crate::popup_menu::set_clipboard_text(t);
                         ("提示内容已复制".to_string(), ToastKind::Success)
@@ -772,7 +772,7 @@ mod tests {
             text: t.into(),
             code: String::new(),
             label: String::new(),
-            tooltip: String::new(),
+            tooltip: Default::default(),
             comment: String::new(),
             no_index: false,
         }
@@ -1099,7 +1099,7 @@ mod tests {
         let (mut f, _ev) = mk(cap.clone(), "_t_tip");
         show_two(&mut f); // hover=-1 → 无 tooltip
         cap.lock().unwrap().clear();
-        f.handle(UiCommand::CopyTooltipText);
+        f.handle(UiCommand::CopyTooltipText(String::new()));
         let texts = toast_texts(&cap.lock().unwrap());
         assert!(
             texts.iter().any(|t| t.contains("为空")),

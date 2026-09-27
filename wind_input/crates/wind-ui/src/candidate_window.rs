@@ -1111,11 +1111,6 @@ impl CandidateWindow {
         }
     }
 
-    /// 悬停提示当前（或最近一次）显示的文本内容（右键菜单「复制内容」用）；无实例返回空串。
-    pub fn tooltip_text(&self) -> &str {
-        self.tooltip.as_ref().map(|t| t.text()).unwrap_or("")
-    }
-
     /// 将悬停提示窗口当前渲染帧保存为 PNG 文件（截图用）。
     pub fn tooltip_capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
         match self.tooltip.as_ref() {
@@ -1846,6 +1841,7 @@ impl CandidateWindow {
                         // tooltip 显示在候选项右侧，空间不足时改左侧，不遮挡下方候选。
                         tip.show_beside(
                             &code,
+                            hover,
                             wx + r.x as i32,         // 候选项左边界
                             wx + (r.x + r.w) as i32, // 候选项右边界
                             wy + r.y as i32,
@@ -1854,6 +1850,7 @@ impl CandidateWindow {
                     } else {
                         tip.show(
                             &code,
+                            hover,
                             wx + r.x as i32,
                             wy + r.y as i32,
                             wy + (r.y + r.h) as i32,
@@ -1899,6 +1896,7 @@ impl CandidateWindow {
                 if self.vertical || self.rotated {
                     tip.render_frame_beside(
                         &code,
+                        hover,
                         wx + r.x as i32,
                         wx + (r.x + r.w) as i32,
                         wy + r.y as i32,
@@ -1907,6 +1905,7 @@ impl CandidateWindow {
                 } else {
                     tip.render_frame(
                         &code,
+                        hover,
                         wx + r.x as i32,
                         wy + r.y as i32,
                         wy + (r.y + r.h) as i32,
@@ -4072,7 +4071,7 @@ mod min_size_tests {
             text: text.to_string(),
             code: String::new(),
             label: String::new(),
-            tooltip: String::new(),
+            tooltip: Default::default(),
             comment: comment.to_string(),
             no_index: false,
         }
@@ -4658,7 +4657,7 @@ mod pager_inline_tests {
             text: text.to_string(),
             code: String::new(),
             label: String::new(),
-            tooltip: String::new(),
+            tooltip: Default::default(),
             comment: String::new(),
             no_index: false,
         }
@@ -5197,7 +5196,7 @@ mod width_budget_tests {
             text: text.to_string(),
             code: String::new(),
             label: String::new(),
-            tooltip: String::new(),
+            tooltip: Default::default(),
             comment: String::new(),
             no_index: false,
         }
@@ -5674,7 +5673,7 @@ mod schema_font_tests {
             text: text.to_string(),
             code: String::new(),
             label: String::new(),
-            tooltip: String::new(),
+            tooltip: Default::default(),
             comment: String::new(),
             no_index: false,
         }
@@ -6429,7 +6428,7 @@ mod font_precedence_tests {
                 text: t.to_string(),
                 code: String::new(),
                 label: String::new(),
-                tooltip: String::new(),
+                tooltip: Default::default(),
                 comment: "注".to_string(),
                 no_index: false,
             })

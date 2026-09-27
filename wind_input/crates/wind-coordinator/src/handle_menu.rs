@@ -267,9 +267,11 @@ impl Coordinator {
                     });
                 }
             }
-            MenuCmd::TooltipCopy => {
-                let _ = self.ui_tx.send(UiCommand::CopyTooltipText);
-            }
+            MenuCmd::TooltipCopy
+            | MenuCmd::TooltipCopySection
+            | MenuCmd::TooltipCommitSection
+            | MenuCmd::TooltipCopyLine
+            | MenuCmd::TooltipCommitLine => self.tooltip_menu_action(cmd),
             MenuCmd::InputDiagCopy => {
                 let _ = self.ui_tx.send(UiCommand::CopyInputDiagText);
             }
@@ -655,25 +657,6 @@ impl Coordinator {
                 false,
             ),
             M::leaf("截图此窗口", cmd(MenuCmd::StatusScreenshot), true, false),
-        ];
-        self.mark_menu_open(0, String::new());
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
-            items,
-            anchor: MenuAnchor::at_point(x, y),
-        });
-    }
-
-    /// 右键悬停提示（编码反查气泡）请求的功能菜单：复制内容 / 截图此窗口。
-    /// **先**发 SetTooltipMenuOpen(true) 抑制 tooltip 的 WM_MOUSELEAVE 自动隐藏——
-    /// 右键弹出菜单后鼠标会移到菜单窗口上，若不抑制 tooltip 会当场消失，菜单就指向一个
-    /// 已不存在的窗口，「截图此窗口」会截空。抑制标志在菜单关闭时由 menu_close 统一清除。
-    pub(crate) fn show_tooltip_menu(&self, x: i32, y: i32) {
-        use wind_ui_types::MenuItemSpec as M;
-        let _ = self.ui_tx.send(UiCommand::SetTooltipMenuOpen(true));
-        let cmd = |c: MenuCmd| MenuKind::Command(c);
-        let items = vec![
-            M::leaf("复制内容", cmd(MenuCmd::TooltipCopy), true, false),
-            M::leaf("截图此窗口", cmd(MenuCmd::TooltipScreenshot), true, false),
         ];
         self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
@@ -1591,7 +1574,7 @@ impl Coordinator {
     /// 单独抽出来是因为 `menu_open` 与 `menu_opened_at` **必须成对写入**，而置位点有四个
     /// （主菜单 / 候选右键 / 状态气泡 / tooltip）。靠"记得两行都写"在第五个入口出现时必然
     /// 失守，且失守的表现是「菜单偶尔一弹就没」这种极难复现的时序问题。
-    fn mark_menu_open(&self, page_local: usize, text: String) {
+    pub(crate) fn mark_menu_open(&self, page_local: usize, text: String) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.menu_open = true;
         s.menu_opened_at = Some(std::time::Instant::now());

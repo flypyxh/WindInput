@@ -1362,7 +1362,7 @@ impl Coordinator {
             text,
             code: String::new(),
             label: String::new(),
-            tooltip: String::new(),
+            tooltip: Default::default(),
             comment,
             no_index: true,
         };

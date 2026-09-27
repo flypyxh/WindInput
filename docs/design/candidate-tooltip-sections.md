@@ -207,28 +207,41 @@ pub struct TooltipLine {
 }
 ```
 
-- `CandidateItem.tooltip: String` → `TooltipDoc`。`tooltip_text()`（「复制全部」）与 macOS
-  下发改为调用 `TooltipDoc::to_plain_text()`，输出与现行格式相同。
+- `CandidateItem.tooltip: String` → `TooltipDoc`（P3 实施）。气泡渲染与 macOS 下发调用
+  `TooltipDoc::to_plain_text()`，输出与现行格式相同；自绘气泡仍是**一个**文本叶节点，
+  外观逐像素不变（`wind-ui` 测试 `doc_renders_exactly_like_the_legacy_string`）。
+- 「复制全部」不再取 UI 手里的显示文本（已截断、已折行），改由协调器按**原始行**拼：
+  段落格式照 `to_plain_text`（`[段名]` 独占一行、inline 段 `段名: 内容`、段间换行），
+  内容换成原始行（`RenderedTooltip::raw_plain_text`）。拼好的文本经
+  `UiCommand::CopyTooltipText(String)` 交 UI 写剪贴板并 Toast。
 - **原始行不下发 UI**：协调器保留本页每个候选的原始段内容（`Vec<Vec<String>>`，按页缓存，
   换页/重算时覆盖）。UI 只需回报命中位置，取值在协调器侧完成——值可能很长（完整原文），
   没必要每次按键都复制一份给 UI。
 - 模板在配置加载时解析一次、随配置快照缓存，不在候选循环里解析。
-- P2 实施：原始行由 `wind-coordinator` 的 `tooltip::RenderedTooltip.raw`（`raw[段][原始行]`，
-  与 `doc.sections` 一一对应）随渲染结果返回，**不进** `TooltipDoc`；P3 由协调器按页缓存它。
+- 原始行由 `wind-coordinator` 的 `tooltip::RenderedTooltip.raw`（`raw[段][原始行]`，
+  与 `doc.sections` 一一对应）随渲染结果返回，**不进** `TooltipDoc`；协调器在候选页组装时
+  把本页每个候选的 `RenderedTooltip` 连同候选原文缓存进 `Coordinator::tooltip_page`
+  （P3 实施，`handle_tooltip.rs`）。
 
 ## 7 右键：识别与动作
 
 ### 7.1 命中
 
-气泡由「标题行 + 内容行」逐行排布。UI 在渲染时记下每条显示行的纵向区间，
-`WM_RBUTTONDOWN` 时用客户区 y 坐标换算出 `(section, line)`：
+气泡由「标题行 + 内容行」逐行排布。`WM_RBUTTONDOWN` 时用客户区坐标换算出 `(section, line)`：
 
 ```rust
-UiEvent::RequestTooltipMenu { x, y, hit: Option<TooltipHit> }
+UiEvent::RequestTooltipMenu { x, y, candidate: i32, hit: Option<TooltipHit> }
 pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在标题行 raw_line = None
 ```
 
-点在内边距或段间空白 ⇒ `hit = None`，菜单退化为现行两项。
+- **行区间怎么来**（P3 实施）：不改成逐行布局——整块文本仍是一个叶节点，这样外观才能
+  逐像素不变。渲染时按 `View` 画叶节点文本的同一套定位公式算出文本块矩形，再按行数
+  均分（渲染器行距钉成 UNIFORM，每行等高）；第 i 行经 `TooltipDoc::hit_at_line(i)` 换算回
+  `(段, 原始行)`，与 `to_plain_text` 共用同一份行排列。inline 段的首行按内容算。
+- **`candidate`**：气泡属于当前页第几个候选。右键时鼠标已在气泡上，协调器的悬停目标
+  未必还指着那个候选，故由显示气泡的 UI 一方带上。
+- 点在内边距（文本块外） ⇒ `hit = None`，菜单只有「复制全部 · 截图此窗口」。段与段之间
+  没有空白行，不存在「段间空白」。
 
 ### 7.2 菜单
 
@@ -238,7 +251,9 @@ pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在�
 | 命中逐字段的某一行 | 另加：复制此行 · 上屏此行 |
 | 恒有 | 复制全部 · 截图此窗口（现行两项） |
 
-段名为空时用序号兜底（「第 2 段」）。菜单项文字过长时截断段名。
+段名为空时用序号兜底（「第 2 段」）。段名超过 8 个字截断加 `…`。命中项与恒有项之间
+一条分隔线。菜单命令编号：`TooltipCopySection` 133 / `TooltipCommitSection` 134 /
+`TooltipCopyLine` 135 / `TooltipCommitLine` 136（与 118 复制全部、119 截图同一张表）。
 
 ### 7.3 取值
 
@@ -249,16 +264,25 @@ pub struct TooltipHit { pub section: u16, pub raw_line: Option<u16> } // 点在�
 
 ### 7.4 上屏语义
 
-- 上屏走「直接上屏文本」那条路：清空当前组合、提交该文本、退出候选。
-- **不计词频、不触发造词/联想**：用户选的是提示里的一段信息，不是这个候选。
+- 上屏走 `Coordinator::commit_text_ending_session`（与 Alt+数字「上屏注释 / 拼音」共用）：
+  已确认前缀连同该文本一并上屏、结束会话（清组合、退候选），经 push 管道投递。
+- **不计词频、不触发造词/联想**：用户选的是提示里的一段信息，不是这个候选。该出口不写
+  词频；自动造词的投喂挂在按键出口，push 投递不经过它。
 - 执行前校验悬停目标仍是弹菜单时那个候选（按页缓存里的候选文本比对）；不一致则放弃并
-  提示，避免菜单打开期间候选刷新导致上屏错位。
+  记日志（warn，不含候选原文）。候选会话已结束（菜单打开期间已上屏 / 取消）时上屏也放弃。
 
 ### 7.5 平台覆盖
 
 - Windows 自绘气泡：本设计完整覆盖。
-- 宿主渲染（TSF 带窗口）：气泡帧由 UI 进程渲染后写入共享内存，行区间同样可得；需确认该
-  窗口的右键是否已转发到 `RequestTooltipMenu`，未转发则本轮保持现状并记入待办。
+- 宿主渲染（TSF 带窗口）：**右键未转发，本轮保持现状**（2026-09-27 核实）。
+  `wind_tsf/src/HostWindow.cpp` 的窗口过程只对候选窗处理鼠标（`WM_LBUTTONDOWN` /
+  `WM_MOUSEMOVE` / `WM_MOUSELEAVE` / `WM_MOUSEWHEEL`，注释写明「Tooltip/status are pure-display
+  band windows」），气泡窗口的鼠标消息全交 `DefWindowProc`；wind-bridge 的宿主渲染协议也
+  没有从宿主回传气泡鼠标事件的消息。要接上需改三处：① HostWindow 对 `HOST_WINDOW_TOOLTIP`
+  处理 `WM_RBUTTONDOWN`，把客户区坐标 + 屏幕坐标经 IPC 发回服务；② wind-bridge 加一条
+  上行消息并转成 `UiEvent::RequestTooltipMenu`；③ UI 进程渲染宿主帧时（`render_tooltip_frame`）
+  已记下文本块矩形与 `TooltipDoc`，命中换算可直接复用 `Tooltip` 里那一份。另需处理菜单
+  打开期间宿主气泡的隐藏抑制（自绘气泡靠 `SetTooltipMenuOpen`）。
 - macOS：原生 .app 自绘气泡，只下发纯文本；右键不在本轮范围。
 
 ## 8 迁移与零回归

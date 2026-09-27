@@ -1941,6 +1941,10 @@ pub struct Coordinator {
     /// tooltip 只有几种取值，而状态推送远比它频繁（全半角、标点、方案切换都会推状态却
     /// 不改 tooltip）。不去重的话每次状态变化都白发一条 IPC 给所有宿主。
     pub(crate) last_langbar_tooltip: Mutex<String>,
+    /// 当前页每个候选的悬停提示（含原始行），每次候选页组装时整体覆盖。
+    pub(crate) tooltip_page: Mutex<Vec<crate::handle_tooltip::TooltipPageEntry>>,
+    /// 悬停提示右键菜单弹出时的目标快照；菜单动作执行前拿它核对候选有没有变。
+    pub(crate) tooltip_menu_target: Mutex<Option<crate::handle_tooltip::TooltipMenuTarget>>,
     /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
@@ -2699,6 +2703,8 @@ impl Coordinator {
             last_input_diag: Mutex::new(Default::default()),
             input_block_gate: Mutex::new(InputBlockGate::default()),
             last_langbar_tooltip: Mutex::new(String::new()),
+            tooltip_page: Mutex::new(Vec::new()),
+            tooltip_menu_target: Mutex::new(None),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
             password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
@@ -6178,6 +6184,9 @@ impl Coordinator {
                 }
             })
         });
+        // 本页每个候选的气泡原文，右键菜单按段 / 按行复制、上屏时从这里取（见 handle_tooltip）。
+        let mut tip_page: Vec<crate::handle_tooltip::TooltipPageEntry> =
+            Vec::with_capacity(end.saturating_sub(start));
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -6237,11 +6246,12 @@ impl Coordinator {
                     crate::tooltip::char_var(name, arg, ch, &reverse)
                         .or_else(|| self.eval_text_var(name, arg, &ch.to_string(), &reverse))
                 };
-                // 原始行（`.raw`）暂无消费者：右键按段 / 按行复制、上屏落地时由协调器按页缓存。
-                let tooltip = tip
-                    .render(&disp, &full, &cand_eval, &char_eval)
-                    .doc
-                    .to_plain_text();
+                let rendered = tip.render(&disp, &full, &cand_eval, &char_eval);
+                let tooltip = rendered.doc.clone();
+                tip_page.push(crate::handle_tooltip::TooltipPageEntry {
+                    text: c.text.clone(),
+                    rendered,
+                });
                 // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
                 // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
                 // `ui.tooltip.sections`，塞了会与之重复。
@@ -6276,6 +6286,7 @@ impl Coordinator {
                 }
             })
             .collect();
+        *self.tooltip_page.lock().unwrap_or_else(|e| e.into_inner()) = tip_page;
         // 翻页信息改为结构化字段传给候选窗（窗口内渲染独立的页码指示）
         let total_pages = self.total_pages(state);
         let selected = state.selected_index.min(items.len().saturating_sub(1));
@@ -6545,7 +6556,12 @@ impl Coordinator {
             UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),
             UiEvent::CandidateDoubleClick => self.on_candidate_double_click(),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
-            UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
+            UiEvent::RequestTooltipMenu {
+                x,
+                y,
+                candidate,
+                hit,
+            } => self.show_tooltip_menu(x, y, candidate, hit),
             UiEvent::RequestInputDiagMenu { x, y } => self.show_input_diag_menu(x, y),
             UiEvent::SystemThemeChanged => self.on_system_theme_changed(),
             UiEvent::CandidateFlipped(v) => self

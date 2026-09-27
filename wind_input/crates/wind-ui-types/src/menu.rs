@@ -130,8 +130,16 @@ pub enum MenuCmd {
     InputDiagToggleFreeze,
     /// 输入诊断 HUD：切换窗口置顶（关掉可让 HUD 沉到被观察窗口之下）
     InputDiagToggleTopmost,
-    /// 悬停提示（编码反查气泡）：复制内容
+    /// 悬停提示：复制全部（取原始行，未截断、未折行）
     TooltipCopy,
+    /// 悬停提示：复制右键点中的那一段（原始行，不含段名）
+    TooltipCopySection,
+    /// 悬停提示：上屏右键点中的那一段
+    TooltipCommitSection,
+    /// 悬停提示：复制右键点中的那一行（仅逐字段）
+    TooltipCopyLine,
+    /// 悬停提示：上屏右键点中的那一行（仅逐字段）
+    TooltipCommitLine,
     /// 悬停提示（编码反查气泡）：截图此窗口
     TooltipScreenshot,
     /// 状态提示气泡：切换固定位置（position_mode fixed/follow_caret）
@@ -254,6 +262,10 @@ impl MenuKind {
                 MenuCmd::ToggleCaretOverlay => 130,
                 MenuCmd::ToggleSoftKeyboard => 131,
                 MenuCmd::OpenMainMenu => 132,
+                MenuCmd::TooltipCopySection => 133,
+                MenuCmd::TooltipCommitSection => 134,
+                MenuCmd::TooltipCopyLine => 135,
+                MenuCmd::TooltipCommitLine => 136,
                 MenuCmd::IconBadgeStyle(i) => 10000 + i as i32,
                 MenuCmd::SoftKeyboardPage(i) => 11000 + i as i32,
                 MenuCmd::InputDiagToggleSection(i) => 8000 + i as i32,
@@ -314,6 +326,10 @@ impl MenuKind {
             130 => MenuCmd::ToggleCaretOverlay,
             131 => MenuCmd::ToggleSoftKeyboard,
             132 => MenuCmd::OpenMainMenu,
+            133 => MenuCmd::TooltipCopySection,
+            134 => MenuCmd::TooltipCommitSection,
+            135 => MenuCmd::TooltipCopyLine,
+            136 => MenuCmd::TooltipCommitLine,
             10000..=10099 => MenuCmd::IconBadgeStyle((id - 10000) as u8),
             11000..=11999 => MenuCmd::SoftKeyboardPage((id - 11000) as usize),
             8000..=8999 => MenuCmd::InputDiagToggleSection((id - 8000) as u8),

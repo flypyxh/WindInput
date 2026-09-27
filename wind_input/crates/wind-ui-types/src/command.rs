@@ -233,8 +233,11 @@ pub enum UiCommand {
     ScreenshotCandidateToClipboard,
     /// 截图状态提示气泡到文件（状态提示右键菜单「截图此窗口」）。
     ScreenshotStatusTip { dir: std::path::PathBuf },
-    /// 复制悬停提示（编码反查气泡）文本到剪贴板（其右键菜单「复制内容」）。
-    CopyTooltipText,
+    /// 把悬停提示的内容复制到剪贴板并 Toast 结果（其右键菜单的各「复制」项）。
+    ///
+    /// 文本由协调器按**原始行**拼好（未截断、未折行，见 `RenderedTooltip`）——气泡上画的是
+    /// 显示行，UI 侧手里没有原文。空串 = 没有可复制的内容，UI 提示「为空」。
+    CopyTooltipText(String),
     /// 截图悬停提示到文件（其右键菜单「截图此窗口」）。
     ScreenshotTooltip { dir: std::path::PathBuf },
     /// 设置悬停提示右键菜单打开状态（开启时抑制其 WM_MOUSELEAVE 自动隐藏）。

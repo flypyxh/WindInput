@@ -74,6 +74,41 @@ pub(crate) struct RenderedTooltip {
     pub(crate) doc: TooltipDoc,
     /// `raw[段][原始行]`，与 `doc.sections` 一一对应；`TooltipLine::raw` 是第二维下标。
     pub(crate) raw: Vec<Vec<String>>,
+    /// 每段是否逐字段（`each = han | char`），与 `doc.sections` 一一对应。右键菜单只对
+    /// 逐字段给「复制此行 / 上屏此行」：整段求值的多行（调试信息、多段落原文）不是
+    /// 彼此独立的条目。
+    pub(crate) per_char: Vec<bool>,
+}
+
+impl RenderedTooltip {
+    /// 第 `section` 段的原始内容（原始行以 `\n` 连接，不含段名）。越界为 `None`。
+    pub(crate) fn section_text(&self, section: usize) -> Option<String> {
+        self.raw.get(section).map(|lines| lines.join("\n"))
+    }
+
+    /// 第 `section` 段第 `line` 条原始行。越界为 `None`。
+    pub(crate) fn line_text(&self, section: usize, line: usize) -> Option<&str> {
+        self.raw.get(section)?.get(line).map(String::as_str)
+    }
+
+    /// 「复制全部」：段落格式照 `TooltipDoc::to_plain_text`（`[段名]` 独占一行、inline 段
+    /// 写成 `段名: 内容`、段间换行），但内容取**原始行**——完整原文不带截断的 `…`、
+    /// 也不带折行插进去的换行。复制出去的是信息，不是气泡的排版。
+    pub(crate) fn raw_plain_text(&self) -> String {
+        let mut out: Vec<String> = Vec::new();
+        for (sec, raw) in self.doc.sections.iter().zip(&self.raw) {
+            match (&sec.title, raw.as_slice()) {
+                (Some(t), [only]) if sec.inline => out.push(format!("{t}: {only}")),
+                (title, lines) => {
+                    if let Some(t) = title {
+                        out.push(format!("[{t}]"));
+                    }
+                    out.extend(lines.iter().cloned());
+                }
+            }
+        }
+        out.join("\n")
+    }
 }
 
 impl CompiledTooltip {
@@ -232,6 +267,7 @@ impl CompiledTooltip {
                 lines,
             });
             out.raw.push(raw);
+            out.per_char.push(sec.each != Each::Whole);
         }
         out
     }
