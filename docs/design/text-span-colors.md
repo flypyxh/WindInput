@@ -738,7 +738,9 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
   - 实现（`dialogs/template_assist.rs`）：触发器与色块用富文本可点 span（不请求焦点），外套
     `preserves_focus` 容器，插完输入框仍持焦点。光标用合成按键（Home + →/Shift+→）摆，不用
     `TextInput::set_selection`——它记成预置选区，对话框每次重开都会再兑现一次。输入框节点靠
-    `on_click` 记下（windui 没有按 Element 查节点的入口）：用户没点过输入框时追加到末尾。
+    `on_click` 记下（windui 没有按 Element 查节点的入口，也没有聚焦通知）；没点过（键盘 Tab 进来）的，
+    用时从触发控件往上找最近的、正文相同的输入框。「自定义 #hex」例外：焦点在那个小输入框里，插完回不到
+    模板输入框（windui 无跨节点移交焦点的入口）。
 - 参考区（可复制的变量表 / 示例）补一行 `$[颜色]{内容}` 与一个示例。**未做**：两处对话框现在都没有
   参考区（注释对话框改成了「查看文档」链接），语法说明在文档站。
 - 新文案过设置项 label 的拼音检索表（「插入颜色」「预览」若进检索索引）。
@@ -816,6 +818,33 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
   节点与状态 / 全透明 / `rgb()`、新 token 中文名与两组、面板与预览、「改了 primary 未改 tooltip_accent」
   提示；`bake:theme` 后 `check:base` / `check:theme` / `check:engine` 绿。`wind-theme-kit` 的示例与
   `schema.md` 不在本仓，未同步。
+
+**P4 执行记录（2026-09-28）**：
+
+- core：`wind-coordinator` 的 `template_preview`（固定样例「你好」求值 + 模板偏移诊断）与
+  `WebDataHost::template_sample`；wind-webdata `appearance.previewTemplate`（回包见 §11，另收 `swatches`
+  给「插入颜色」的色块着色）。
+  - **变量按场景放行**：注释只认 `eval_var` 的变量，段名 / 整段再加气泡候选级的 `word_code`、`code_source`、
+    `debug`、`full_text`、`unicode_all`，逐字段再加 `char`、`readings`、`unicode` 与裸文本那两层。各组取自
+    求值入口旁的常量表（`EVAL_VAR_NAMES` 等），测试扫源码逐表核对 match 分支；场景外的变量与真实渲染一样
+    原样回显，并报「此处不可用」。
+  - **入参防护**：模板解析加嵌套上限 32 层（超出的 `{` / `$[…]{` 按字面文字），花括号配对改为一次线性
+    扫描（`Pairs`）——此前 5000 层嵌套即栈溢出、20 万个未闭合 `{` 要 37 秒，且这条路径在**配置**上就存在
+    （这样的模板存进配置，候选渲染即让服务崩溃），不只是预览。配对与旧的逐次重扫按随机模板对拍。
+    RPC 层另限模板 4KB、`swatches` 32 个。
+  - 诊断与引擎口径对齐：气泡里的 `selected=` 提示不生效（不查名字）；名字解析出 alpha 0 报全透明；
+    没写 `=` 的 `selected`、多余逗号与未知 key 逐条说明；主题加载失败只给一条总提示。兜底色（注释文字、
+    窗口底、选中底、气泡底 / 字）收进 `wind_theme::fallback`，wind-ui 与预览共用。
+  - 共用期望表（`span-roles/expected.json`）补 `inline` 一节：内联色的 `tooltip_` 作用域、`selected=`、
+    没写 `=` 的 selected、查不到 / transparent / alpha 0 的回落；编辑器 `inlineColor` 逐项对拍。
+- 设置端（wind-setting `dialogs/template_assist.rs`）：注释对话框（横排、竖排）与提示段表单的预览行、
+  「插入颜色」；旧 core 静默隐藏预览。有意的外观变化：横排注释输入框宽 240 → 200（旁边要放「插入颜色」）；
+  竖排注释改由专用 builder 建（行外观经 `field_row` 与通用字段一致，占位文字沿用清单 hint，不变）。
+- **已知局限**：
+  - 每次预览都重新从磁盘解析一次当前主题（设置页低频操作，不挂缓存）。
+  - 自定义 `#hex` 插入后焦点留在那个小输入框，回不到模板输入框：windui 的 `request_focus` 只能给回调
+    自己所在的节点，没有移交焦点的入口。光标位置照样摆好。
+  - 输入框节点靠点击记下，键盘 Tab 进来的在用时从触发控件往上找最近的、正文相同的输入框。
 
 **靶机验证判据**（部署含 P1～P3 的构建后，由用户人工核对；同时核 Windows 候选窗与 TSF 宿主渲染窗口）：
 
