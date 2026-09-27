@@ -846,7 +846,8 @@ impl crate::coordinator::Coordinator {
     /// `${emoji}` 变量的取值：该词的 emoji（空格分隔，至多 `max_per_word` 个）。
     ///
     /// 只在 `show_as = "comment"` 档返回非空 —— 理由见调用点的注释（四档互斥，避免同一个
-    /// emoji 既进候选又进注释）。功能关、表没加载、没命中一律 `None`，模板据此整段消失。
+    /// emoji 既进候选又进注释）。功能关、表没加载、没命中一律 `None`；调用点把它换成空串，
+    /// 模板据此整段消失。
     fn emoji_comment_of(&self, text: &str) -> Option<String> {
         let (max_per_word, min_chars) = {
             let rt = self.rt();
@@ -890,7 +891,10 @@ impl crate::coordinator::Coordinator {
             // 注释里，而两处都「按配置办事」，没人觉得自己错了。
             //
             // 本变量为空时按模板的可选段规则整段消失，故绝大多数候选不会留下空括号。
-            "emoji" => self.emoji_comment_of(&c.text)?,
+            // ★ 取不到给空串而不是 `?`：`None` 在渲染层是「未知变量名」，会原样回显
+            // `${emoji}`——功能没开 / 不是 comment 档 / 没命中都属于「已知变量、这次为空」，
+            // 应让所在可选段整段消失（同下面 `code_rev` 那条）。
+            "emoji" => self.emoji_comment_of(&c.text).unwrap_or_default(),
             // ★ `unwrap_or_default()` 而不是 `?`：`None` 在渲染层的含义是**未知变量名**
             // （`render_nodes` 会原样输出 `${code_rev}` 并计作已填充，好让拼错的变量名
             // 显示出来）。反查索引没就绪属于「已知变量，这一次算不出」，给空串才对 ——
