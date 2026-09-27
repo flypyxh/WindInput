@@ -3024,7 +3024,9 @@ pub type CommentTemplateOverride = Option<String>;
 /// 自由输入（字面输入）模式：让 mix 能打出 `GetTestData()` / `test_data` / `<TAB>`
 /// 这类**任何 member 都无法接受**的内容。
 ///
-/// - `Off`：完全维持既有行为（越界字符仍走「顶屏候选 + 上屏标点 + 退出」）。
+/// - `Off`：完全维持既有行为（越界字符仍走「顶屏候选 + 上屏标点 + 退出」）。唯一例外是
+///   含英文成员的实例里 Shift+字母：大写照样进缓冲、候选只给英文段（同 `Auto`），但数字 /
+///   符号键仍是功能键（选词、翻页、顶屏），见 `MixLens::English`（A2-50）。
 /// - `Auto`（**默认**）：由缓冲内容自动推导，见 `MixLens`。
 /// - `Always`：本实例恒为自由输入——用于新建一个专做字面输入的融合模式。
 ///
@@ -4163,9 +4165,9 @@ pub struct TempEnglishConfig {
     /// 旧实现是**整串套形**（不管词库原文长什么样），本项是**逐位投影且单向**
     /// （只覆盖用户按了 Shift 的那几位，词库自带的大写一律保留）。
     ///
-    /// ★ 也作用于**快捷输入里的英文**：Shift+字母让缓冲带上大写（落自由输入透镜）时，
-    /// 纯字母缓冲在所打原文之后追加英文段，其词库候选按本项投影（见
-    /// `Coordinator::mix_free_english_segment`）。
+    /// ★ 也作用于**快捷输入里的英文**：Shift+字母让缓冲带上大写（`free_input = auto` 落自由
+    /// 输入透镜；`off` 且含英文成员时落大写英文词透镜）时，纯字母缓冲在所打原文之后追加
+    /// 英文段，其词库候选按本项投影（见 `Coordinator::mix_free_english_segment`）。
     #[serde(default = "default_true")]
     pub case_follow_input: bool,
     /// 临英选词上屏后自动补一个空格。

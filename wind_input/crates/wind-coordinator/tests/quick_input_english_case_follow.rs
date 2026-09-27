@@ -9,12 +9,16 @@
 //! 含英文成员且 `free_input = auto` 时，Free 透镜在原文之后追加英文段。原文仍钉首位，
 //! 数字 / 符号照旧字面入缓冲，拼音 / 数字透镜不受影响（缓冲里一有大写就不是它们的编码）。
 //!
+//! `free_input = off` 的实例（A2-50 / t235）：含英文成员时大写同样进缓冲、候选是同一份英文段，
+//! 但数字 / 符号键保持功能键身份（选词、翻页、顶屏）；不含英文成员时恒小写，维持原状。
+//!
 //! ⚠️ 依赖 `build_dev/data` 真实词库；缺失时**静默跳过**（判据是耗时 0.00s）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
+use wind_config::config::FreeInputMode;
 use wind_coordinator::Coordinator;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_SHIFT};
 use wind_store::Store;
@@ -325,5 +329,187 @@ fn free_literal_with_symbols_is_not_taken() {
         !coord.debug_cycle_english_case(),
         "字面输入不该被档位循环夺取"
     );
+    let _ = std::fs::remove_file(&db);
+}
+
+// ── 自由输入关闭（`free_input = off`，A2-50 / t235）──
+//
+// off 的语义是「数字 / 符号键保持功能键身份」。含英文成员的实例里 Shift+字母仍以大写进
+// 缓冲，候选只给英文段（与 auto 下同一份逻辑），但数字键照旧选词、`-`/`=` 照旧翻页——
+// 不能因为缓冲进了大写就把整个会话拖进字面输入。
+
+fn open_off(tag: &str, edit: impl FnOnce(&mut Config)) -> (Arc<Coordinator>, Arc<Store>, PathBuf) {
+    open(tag, |c| {
+        c.schema.mix_modes[0].free_input = FreeInputMode::Off;
+        edit(c);
+    })
+}
+
+/// off + 含英文成员：Shift 打 `Hel` 出英文段，原文钉首位、词库词跟随大小写；中文成员不参与。
+#[test]
+fn off_uppercase_projects_english_segment() {
+    skip_without_data!();
+    let (coord, _store, db) = open_off("off_follow", |_| {});
+    let all = quick_hel(&coord);
+    assert_eq!(
+        all.first().map(String::as_str),
+        Some("Hel"),
+        "原文钉首位：{all:?}"
+    );
+    assert!(
+        all.iter().any(|t| t == "Hello"),
+        "词库词跟随大小写：{all:?}"
+    );
+    assert!(all.iter().all(|t| t.is_ascii()), "中文成员不参与：{all:?}");
+    assert!(coord.debug_preedit().ends_with("Hel"), "缓冲保留大写");
+    let _ = std::fs::remove_file(&db);
+}
+
+/// off 下大写缓冲按数字键是**选词**，不是字面输入。
+#[test]
+fn off_uppercase_digit_still_selects() {
+    skip_without_data!();
+    let (coord, _store, db) = open_off("off_digit", |_| {});
+    quick_hel(&coord);
+    let page = coord.debug_page_texts();
+    assert!(page.len() >= 2, "前提：至少两条候选：{page:?}");
+    match coord.handle_key_event(&key(0x32, 0)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text.trim_end(), page[1]),
+        other => panic!("数字键应选第 2 候选，实际: {other:?}"),
+    }
+    let _ = std::fs::remove_file(&db);
+}
+
+/// off 下大写缓冲按 `-`：翻页键，不是字面（缓冲不变）。
+#[test]
+fn off_uppercase_minus_is_not_literal() {
+    skip_without_data!();
+    let (coord, _store, db) = open_off("off_minus", |_| {});
+    let before = quick_hel(&coord);
+    coord.handle_key_event(&key(0xBD, 0)); // `-`
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "`-` 不该顶屏退出（它是翻页键）"
+    );
+    assert!(coord.debug_preedit().ends_with("Hel"), "缓冲不变");
+    assert_eq!(coord.debug_all_candidate_texts(), before);
+    let _ = std::fs::remove_file(&db);
+}
+
+/// off 且不含英文成员：维持现状，Shift 被丢弃、缓冲恒小写。
+#[test]
+fn off_without_english_member_stays_lowercase() {
+    skip_without_data!();
+    let (coord, _store, db) = open_off("off_noen", |c| {
+        c.schema.mix_modes[0].members.retain(|m| m != "english");
+    });
+    coord.handle_key_event(&key(VK_SEMICOLON, 0));
+    type_str(&coord, "Nihao");
+    let preedit = coord.debug_preedit();
+    assert!(
+        !preedit.chars().any(|c| c.is_ascii_uppercase()),
+        "缓冲恒小写：{preedit}"
+    );
+    assert!(
+        coord
+            .debug_all_candidate_texts()
+            .iter()
+            .any(|t| t == "你好"),
+        "照旧出中文候选"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 大小写混合（先小写 `m` 再 Shift+A）：与 auto 下同样输入的候选逐条一致。
+#[test]
+fn off_mixed_case_matches_auto() {
+    skip_without_data!();
+    let run = |coord: &Coordinator| {
+        coord.handle_key_event(&key(VK_SEMICOLON, 0));
+        type_str(coord, "mA");
+        coord.debug_all_candidate_texts()
+    };
+    let (off, _s1, db1) = open_off("off_mixed", |_| {});
+    let (auto, _s2, db2) = open("auto_mixed", |_| {});
+    let (a, b) = (run(&off), run(&auto));
+    assert_eq!(a.first().map(String::as_str), Some("mA"), "{a:?}");
+    assert_eq!(a, b, "off 与 auto 的英文段应一致");
+    let _ = std::fs::remove_file(&db1);
+    let _ = std::fs::remove_file(&db2);
+}
+
+/// 退格删到没有大写：回到普通文本透镜（中文成员重新参与）。
+#[test]
+fn off_backspace_to_lowercase_restores_text_lens() {
+    skip_without_data!();
+    let (coord, _store, db) = open_off("off_back", |_| {});
+    coord.handle_key_event(&key(VK_SEMICOLON, 0));
+    type_str(&coord, "niH");
+    assert!(
+        coord
+            .debug_all_candidate_texts()
+            .iter()
+            .all(|t| t.is_ascii())
+    );
+    coord.handle_key_event(&key(0x08, 0));
+    let all = coord.debug_all_candidate_texts();
+    assert!(all.iter().any(|t| !t.is_ascii()), "中文候选应回来：{all:?}");
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 对照：auto 下大写缓冲按数字键仍是字面（Free 语义不变）。
+#[test]
+fn auto_uppercase_digit_is_literal() {
+    skip_without_data!();
+    let (coord, _store, db) = open("auto_digit", |_| {});
+    quick_hel(&coord);
+    coord.handle_key_event(&key(0x32, 0));
+    assert!(
+        coord.debug_preedit().ends_with("Hel2"),
+        "{}",
+        coord.debug_preedit()
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// off 下选中投影词：词频按词库原文（小写码）记进英文桶，与 auto 同口径。
+#[test]
+fn off_selecting_projected_word_records_dict_freq() {
+    skip_without_data!();
+    let (coord, store, db) = open_off("off_select", |_| {});
+    let all = quick_hel(&coord);
+    let pos = all
+        .iter()
+        .position(|t| t == "Hello")
+        .unwrap_or_else(|| panic!("前提：有 `Hello`：{all:?}"));
+    for _ in 0..pos {
+        coord.handle_key_event(&key(VK_DOWN, 0));
+    }
+    match coord.handle_key_event(&key(VK_SPACE, 0)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text.trim_end(), "Hello"),
+        other => panic!("空格应上屏高亮，实际: {other:?}"),
+    }
+    assert!(
+        store
+            .get_freq("english", "hello", "hello")
+            .unwrap()
+            .is_some(),
+        "词频按词库原文 `hello` 记"
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// off 下大写缓冲按 `,`：照旧顶屏高亮候选 + 标点并退出（不是字面）。
+#[test]
+fn off_uppercase_punct_commits_highlight() {
+    skip_without_data!();
+    let (coord, _store, db) = open_off("off_punct", |_| {});
+    quick_hel(&coord);
+    match coord.handle_key_event(&key(0xBC, 0)) {
+        KeyAction::InsertText { text, .. } => assert!(text.starts_with("Hel"), "{text}"),
+        other => panic!("`,` 应顶屏，实际: {other:?}"),
+    }
+    assert_ne!(coord.debug_active_mode(), Some("mix"));
     let _ = std::fs::remove_file(&db);
 }

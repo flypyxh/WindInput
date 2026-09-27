@@ -475,6 +475,9 @@ code 是 query 前缀 → 只消费前缀长度，剩余拼音继续转换；否
   （`mix_free_english_segment`，仅 `free_input = auto` 且含英文成员）：变形 + 词库候选，词库候选按
   `input.temp_english.case_follow_input` 跟随输入大小写，`english_case_cycle_key` 档位循环只套英文段。
   透镜判据不动——大写并进 `Text` 会让拼音 / 码表成员拿到非编码串，并牵动 A2-23 / t157 的 Free 语义。
+- `free_input = off` 且含英文成员时（A2-50 / t235），同样的缓冲落 `MixLens::English`：候选是同一份英文段
+  （中文成员不参与），但按键分派同 `Text`——数字选词、`-`/`=` 翻页、标点顶屏，不因缓冲有大写变字面。
+  不含英文成员的实例 Shift 仍被丢弃（恒小写）；退格删到没有大写即回 `Text`。
 - 头部候选（原文 / 大小写变形）与**英文词库**候选字面相同时，由词库那条占据头部那一格（保留来源 /
   编码 / 释义），不再另出一条无来源的原文（`english_candidates::merge_head_with_dict`，英文方案 /
   临英 / 快捷输入三路共用）；同名的短语、命令照旧被头部吃掉。
