@@ -628,14 +628,17 @@ assemble_data() {
     fi
 
     # 7. 辅助码表（Rust 工具 gen_aux_code）：小鹤/自然码原样透传，笔画表 YAML→`字=码` + 字集裁剪。
+    # --schema-out 另从同一份笔画数据产出「笔画」码表方案的词库 schemas/stroke/stroke.dict.yaml
+    # （权重取 rime-frost 单字字频；方案文件 stroke.schema.toml 入库、已随第 1 步复制）。
+    # 全拼默认辅助码引用的就是这个方案（schema:stroke）；stroke.txt 照旧产出，供旧写法的用户 override。
     # 与五笔同理：产物只进 build 目录、不入版本库（rime-stroke 是 LGPL-3.0，见 NOTICE.md）。
-    # 功能出厂关闭，故缺表只是「辅助码用不了」，不影响其它一切 —— 用 warn 不中断构建。
+    # 功能出厂关闭，故缺表只是「辅助码 / 笔画方案用不了」，不影响其它一切 —— 用 warn 不中断构建。
     if [ -f "$CACHE_DIR/aux-code/stroke.dict.yaml" ]; then
-        gray "生成辅助码表 (gen_aux_code) ..."
+        gray "生成辅助码表 + 笔画方案词库 (gen_aux_code) ..."
         mkdir -p "$schemas/aux_code"
         ( cd "$RUST_WORKSPACE" && cargo run -q -p wind-tools --bin gen_aux_code -- \
-            --cache "$CACHE_DIR" --out "$schemas/aux_code" ) \
-            || warn "辅助码表生成失败（辅助码功能不可用）"
+            --cache "$CACHE_DIR" --out "$schemas/aux_code" --schema-out "$schemas" ) \
+            || warn "辅助码表生成失败（辅助码功能与笔画方案不可用）"
     else
         warn "缺 .cache/aux-code/，辅助码不可用（运行 gen-data 下载）"
     fi
@@ -1207,6 +1210,9 @@ verify_dist_data() {
         "schemas/wubi86/wubi86_jidian_extra.dict.yaml|10000"
         "schemas/wubi86/wubi86_jidian_emoji.dict.yaml|1000"
         "schemas/wubi86/wubi86_jidian_extra_district.dict.yaml|10000"
+        # 笔画方案词库同为 gen_aux_code 生成物（实测约 1MB）；全拼默认辅助码经 schema:stroke
+        # 引用它，缺了则笔画方案与全拼辅助码都用不了，且用户只看得到「没反应」
+        "schemas/stroke/stroke.dict.yaml|500000"
     )
     say "\n校验发布数据完整性 → $data"
     local entry path min sz

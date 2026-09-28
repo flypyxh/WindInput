@@ -48,6 +48,7 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 - **许可证**: GPL-3.0
 - **使用的文件**: `rime_frost.dict.yaml`、`cn_dicts/`（8105 / 41448 / base /
   ext / others / corrections / tencent）、`en_dicts/`（en / en_ext）
+- **另用于**: 笔画输入方案词库的权重（取 `cn_dicts/8105`、`41448` 的单字字频，见 rime-stroke 条目）
 
 #### pinyin-data
 
@@ -92,15 +93,20 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 - **⛔ 不得嵌入可执行文件**: 一旦 `include_bytes!` 进 exe 即构成 LGPL §4 的 Combined Work，
   需另行提供让用户替换该部分的机制；保持独立数据文件则该节整节不适用
 
-#### rime-stroke（笔画辅助码）
+#### rime-stroke（笔画辅助码 / 笔画输入方案）
 
-- **用途**: 辅助码功能的笔画码表（拼音候选的字形二次筛选，出厂关闭）
+- **用途**: 辅助码功能的笔画码表（拼音候选的字形二次筛选，出厂关闭）；「笔画」输入方案的码表
+  （装着但不在出厂切换列表里）。全拼默认辅助码即引用该方案（`schema:stroke`）
 - **仓库**: https://github.com/rime/rime-stroke
 - **许可证**: **LGPL-3.0**
 - **使用的文件**: `stroke.dict.yaml`（`字<TAB>笔画码`，h/s/p/n/z 表横竖撇捺折）
-- **加工方式**: 由 `wind-tools/gen_aux_code` 剥去 YAML 头、`<TAB>` 转 `=`，并按常用
-  字集裁剪后写入构建产物 `data/schemas/aux_code/stroke.txt`。**码本身不作任何改动**
-  （同字多码保留上游行序 = 优先级）。裁剪字集见下方 hanzi-chars 条目
+- **加工方式**: 由 `wind-tools/gen_aux_code` 按常用字集裁剪后写出两份构建产物，
+  字集与每字的码序逐一相同。**码本身不作任何改动**（同字多码保留上游行序 = 优先级）。
+  裁剪字集见下方 hanzi-chars 条目
+  - `data/schemas/aux_code/stroke.txt`：剥去 YAML 头、`<TAB>` 转 `=`（辅助码表格式）
+  - `data/schemas/stroke/stroke.dict.yaml`（笔画输入方案词库）：保留 librime 词库格式，
+    另加一列权重。上游不带权重，权重取自 rime-frost（GPL-3.0，见上方条目）单字表
+    `cn_dicts/8105` 与 `41448` 的字频（同字多音取最大，按对数压进 0~10000，无字频为 0）
 
 #### rime-lua-aux-code（小鹤 / 自然码形码）
 

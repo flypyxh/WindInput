@@ -621,16 +621,19 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
     } else { Warn "缺 .cache\rime-wubi\, 五笔词库不可用 (运行 gen-data 下载)" }
 
     # 7. 辅助码表 (Rust 工具 gen_aux_code): 小鹤/自然码原样透传, 笔画表 YAML→`字=码` + 字集裁剪。
+    #    -schema-out 另从同一份笔画数据产出「笔画」码表方案的词库 schemas\stroke\stroke.dict.yaml
+    #    (权重取 rime-frost 单字字频; 方案文件 stroke.schema.toml 入库、随 data\ 一起复制)。
+    #    全拼默认辅助码引用的就是这个方案 (schema:stroke); stroke.txt 照旧产出, 供旧写法的用户 override。
     #    与五笔同理: 产物只进 build 目录, 不入版本库 (rime-stroke 是 LGPL-3.0, 见 NOTICE.md)。
-    #    功能出厂关闭, 故缺表只是「辅助码用不了」, 不影响其它一切 —— 用 Warn 不中断构建。
+    #    功能出厂关闭, 故缺表只是「辅助码 / 笔画方案用不了」, 不影响其它一切 —— 用 Warn 不中断构建。
     $auxCache = "$CacheDir\aux-code"
     if (Test-Path "$auxCache\stroke.dict.yaml") {
-        Gray "生成辅助码表 (gen_aux_code) ..."
+        Gray "生成辅助码表 + 笔画方案词库 (gen_aux_code) ..."
         New-Item -ItemType Directory -Path "$schemas\aux_code" -Force | Out-Null
         Push-Location $ProjectRoot
         try {
-            cargo run -q -p wind-tools --bin gen_aux_code -- --cache $CacheDir --out "$schemas\aux_code"
-            if ($LASTEXITCODE -ne 0) { Warn "辅助码表生成失败 (辅助码功能不可用)" }
+            cargo run -q -p wind-tools --bin gen_aux_code -- --cache $CacheDir --out "$schemas\aux_code" --schema-out $schemas
+            if ($LASTEXITCODE -ne 0) { Warn "辅助码表生成失败 (辅助码功能与笔画方案不可用)" }
         } finally { Pop-Location }
     } else { Warn "缺 .cache\aux-code\, 辅助码不可用 (运行 gen-data 下载)" }
 
@@ -710,7 +713,9 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
         # 辅助码表同为生成物、同样不入库。功能虽出厂关闭, 缺表的后果仍是「用户在设置里
         # 打开了却毫无反应」—— 门卫只 warn 一行日志, 用户看不到。故照样在此硬拦。
         @{ Path = "schemas\aux_code\stroke.txt";     Min = 500000 },
-        @{ Path = "schemas\aux_code\flypy_full.txt"; Min = 50000 }
+        @{ Path = "schemas\aux_code\flypy_full.txt"; Min = 50000 },
+        # 笔画方案词库同为 gen_aux_code 生成物; 全拼默认辅助码经 schema:stroke 引用它
+        @{ Path = "schemas\stroke\stroke.dict.yaml"; Min = 500000 }
     )
     Say "`n校验发布数据完整性 → $data"
     foreach ($c in $checks) {

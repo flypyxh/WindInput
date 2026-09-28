@@ -894,14 +894,17 @@ assemble_data() {
     fi
 
     # 7. 辅助码表 (Rust 工具 gen_aux_code): 小鹤/自然码原样透传, 笔画表 YAML→`字=码` + 字集裁剪。
+    # --schema-out 另从同一份笔画数据产出「笔画」码表方案的词库 schemas/stroke/stroke.dict.yaml
+    # (权重取 rime-frost 单字字频; 方案文件 stroke.schema.toml 入库、随 data/ 一起复制)。
+    # 全拼默认辅助码引用的就是这个方案 (schema:stroke); stroke.txt 照旧产出, 供旧写法的用户 override。
     # 与五笔同理: 产物只进 build 目录、不入版本库 (rime-stroke 是 LGPL-3.0, 见 NOTICE.md)。
-    # 功能出厂关闭, 故缺表只是「辅助码用不了」, 不影响其它一切 —— 用 warn 不中断构建。
+    # 功能出厂关闭, 故缺表只是「辅助码 / 笔画方案用不了」, 不影响其它一切 —— 用 warn 不中断构建。
     if [[ -f "$CACHE_DIR/aux-code/stroke.dict.yaml" ]]; then
-        info "生成辅助码表 (gen_aux_code) ..."
+        info "生成辅助码表 + 笔画方案词库 (gen_aux_code) ..."
         mkdir -p "$data/schemas/aux_code"
         ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_aux_code -- \
-            --cache "$CACHE_DIR" --out "$data/schemas/aux_code" ) \
-            || warn "辅助码表生成失败 (辅助码功能不可用)"
+            --cache "$CACHE_DIR" --out "$data/schemas/aux_code" --schema-out "$data/schemas" ) \
+            || warn "辅助码表生成失败 (辅助码功能与笔画方案不可用)"
     else
         warn "缺 .cache/aux-code/, 辅助码不可用 (先跑 gd 下载)"
     fi
@@ -962,6 +965,8 @@ verify_dist_data() {
     _check_min "schemas/wubi86/wubi86_jidian_extra.dict.yaml"          10000
     _check_min "schemas/wubi86/wubi86_jidian_emoji.dict.yaml"          1000
     _check_min "schemas/wubi86/wubi86_jidian_extra_district.dict.yaml" 10000
+    # 笔画方案词库同为 gen_aux_code 生成物; 全拼默认辅助码经 schema:stroke 引用它
+    _check_min "schemas/stroke/stroke.dict.yaml"                       500000
     local oc; oc=$(ls "$data/opencc"/*.octrie 2>/dev/null | wc -l | tr -d ' ')
     if (( oc < 1 )); then err "  ✗ 缺失: opencc/*.octrie (简繁转换编译失败)"; ok=0
     else info "  ✓ opencc/*.octrie ($oc 个)"; fi

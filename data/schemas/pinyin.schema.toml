@@ -12,16 +12,19 @@ type = "pinyin"
 [engine.pinyin]
 scheme = "full"
 
-# 辅助码：拼音候选的字形二次筛选（笔画码，由 rime-stroke 笔画表按常用字集转换）。
-# 路径相对 schemas 目录；文件由构建脚本从上游拉取并转换，不入版本库（见 NOTICE.md）。
+# 辅助码：拼音候选的字形二次筛选（笔画码，h/s/p/n/z = 横竖撇捺折）。
 # 词组逐字首码匹配为固定语义（第 i 位命中第 i 字任一码的首字符；短于词字数 = 前缀态保留）。
 #
 # ⚠️ 本段只声明「全拼推荐哪张辅助码表」，**不代表功能开启**。
 # 总开关是 config.toml 的 [schema.pinyin.aux_code].enabled（出厂 false）。
 [engine.aux_code]
-# files 也可写 "schema:<码表方案 id>"，取该方案系统词库 + 用户词库里的编码，如
-# files = ["schema:wubi86"]。
-files = ["aux_code/stroke.txt"]
+# "schema:<码表方案 id>" = 取该方案系统词库 + 用户词库里的编码。这里引用内置的「笔画」
+# 码表方案（stroke.schema.toml，不在出厂切换列表里，但装着），它的词库与
+# aux_code/stroke.txt 由同一次转换产出、码逐字相同，引用方案的好处是用户给笔画方案
+# 加的字也能拿来筛。换成别的码表如 files = ["schema:wubi86"]；也可写码表文件路径
+# （相对 schemas 目录，如 "aux_code/stroke.txt"，旧写法继续有效）。
+# 两种来源的数据都由构建脚本从上游拉取并转换，不入版本库（见 NOTICE.md）。
+files = ["schema:stroke"]
 
 # ★ 全拼出厂**不设**辅助码触发键，且这不是「暂时没配」——是键位预算不够。
 #

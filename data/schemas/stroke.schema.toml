@@ -1,0 +1,30 @@
+[schema]
+id = "stroke"
+name = "笔画"
+icon_label = "笔"
+version = "1.0"
+author = "内置"
+description = "五笔画输入方案：h/s/p/n/z 依次为横、竖、撇、捺、折，按笔顺输入"
+
+[engine]
+type = "codetable"
+
+# 引擎固定参数。行为类选项（顶码、调频、造词等）一律跟随全局 [schema.codetable]，
+# 这里只放笔画码的结构决定、跟随全局会出错的两项。
+[engine.codetable]
+# 笔画码不定长（1~52 码）。顶码上屏、满码自动上屏、满码空码清空都只在「码长到达本值」时
+# 触发，为定长码表而设；笔画没有满码的概念，故取一个大于最长码的值让它们永不触发。
+# 本值不截断输入，只是「满码」的判据。
+max_code_length = 64
+# 全局出厂开着「z 键重复上屏」（空缓冲按 z，首选是上一次上屏的内容）。那是为五笔设计的——
+# z 在五笔里不是编码。笔画的 z 是「折」，一个真正的笔画码，重复上屏会占掉它的首选。
+z_key_repeat = false
+
+[[dictionaries]]
+id = "stroke_main"
+label = "笔画码表"
+description = "rime-stroke 笔画码，权重取 rime-frost 单字字频"
+path = "stroke/stroke.dict.yaml"
+type = "rime_codetable"
+default = true
+base_order = 0
