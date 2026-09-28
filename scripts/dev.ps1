@@ -555,6 +555,12 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
     # 1. 复制 data/ 源文件 (configs、五笔词库、主题等)
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
     Copy-Item "$ProductRoot\data" -Destination $outdir -Recurse -Force
+    # AI 工具在会话 cwd 下落的运行时状态 (.omc\state\… 等) 会随复制混进产物、进安装包/靶机。
+    # 它们被 .gitignore 挡着, git 里看不见, 只能在组装时剥掉。清单与 dev.sh 的 TOOL_STATE_DIRS 同源。
+    $ToolStateDirs = @('.omc', '.omx', '.claude', '.remember')
+    Get-ChildItem -LiteralPath $data -Recurse -Force -Directory -EA SilentlyContinue |
+        Where-Object { $ToolStateDirs -contains $_.Name } |
+        Remove-Item -Recurse -Force -EA SilentlyContinue
 
     # 1b. 合并 wind_input\data\settings\ (manifest.toml 等 RPC 元数据)
     if (Test-Path "$ProjectRoot\data\settings") {

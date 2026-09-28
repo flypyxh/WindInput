@@ -18,7 +18,7 @@
 | 4 | config.toml | `schema.mix_modes[].comment_template_*` | 实例级三态 |
 | 5 | 方案文件 | `[overlay].comment_template_*` | overlay **激活期间** |
 | 6 | config.toml | `[[ui.comment_dicts]]`（含 `schemas`） | 全局表 + 方案过滤 |
-| 7 | config.toml | `schema.pinyin.code_hint_source` | 全局四档，门控 `${code_rev}` / `${shuangpin}` 的**求值** |
+| 7 | config.toml | `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` | 四档，门控 `${code_rev}` / `${shuangpin}` 的**求值**；前者只管拼音方案（含双拼），临拼/快捷输入读后者（2026-09-28 拆分，见 §1.1 第 5 条） |
 | 8 | 方案文件 | `[engine.codetable].show_code_hint` | 方案级，门控 `${code_hint}` 的**生产** |
 | 9 | 主题 | `[comment]` ViewNode | 主题级（样式） |
 | 10 | config.toml | `ui.tooltip.*` | 全局，相邻但独立的悬停提示 |
@@ -26,7 +26,7 @@
 ★ **散的是配置面，不是代码面**：`comment.rs` 始终是模板的唯一消费点，`comment_for` 是唯一
 渲染入口。这决定了本轮是**加一层**而不是拆重构。
 
-### 1.1 四条真缺陷
+### 1.1 五条真缺陷
 
 1. **没有方案级层**。`[overlay]` 那两份填不了这个坑——它的语义是「本方案**被叠加激活期间**」，
    有进入/退出生命周期；「本方案作为**常驻 active 方案**期间」在方案文件里无处表达。
@@ -44,6 +44,16 @@
    编码（本方案击键）得先有人决定「允许它出现吗」，而模板只能决定「出现的话摆哪」。
    现在的分工是「开关管允许哪些来源求值、模板管按什么顺序和格式摆」，两层不重叠，
    谁也不是谁的重复。
+5. ~~**编码来源开关被两类用户共用**~~ ✅ **已消解**（2026-09-28）。7 原本一份开关管所有
+   拼音类场景，临拼/快捷输入那头还硬编码「至少放行反查」（`CodeHintSource::forcing_reverse`
+   并集式强制，对齐 Go AddCodeHintsForced）。两类用户习惯相反：纯拼音/双拼用户多半不认识
+   码表编码、也不需要；临拼则正是码表用户借拼音反查编码的典型场景。一份开关只能顾一头，
+   出厂 `auto` 让拼音用户看到一串看不懂的字母，而临拼那头又关不掉。
+
+   决策：临拼/快捷输入拆出独立字段 `input.temp_pinyin.code_hint_source`，出厂 `auto`；
+   `schema.pinyin.code_hint_source` 只管拼音方案（含双拼），出厂改 `off`。`forcing_reverse`
+   退役，临拼的开关原样生效——现在可以被真正关掉。两份各有各的默认值函数，临拼那份
+   **不能**复用拼音方案的，否则会被一并拖成 `off`。
 
 ### 1.2 三条「看着散但不要合并」
 

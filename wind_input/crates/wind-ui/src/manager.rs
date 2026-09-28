@@ -153,19 +153,14 @@ impl UiManager {
         // 而软键盘可能在那之后很久才第一次打开，不缓存就会永远停在内置默认配色。
         let mut last_theme: Option<wind_theme::Resolved> = None;
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
-        // 载荷：(text, x, y, caret_height, offset_x, offset_y)
-        // payload: (text, x, y, caret_h, off_x, off_y, duration_ms, fixed, fixed_x, fixed_y)
+        // 载荷：(text, x, y, caret_height, duration_ms, placement)
         let mut tip_debounce = crate::debounce::Debouncer::<(
             String,
             i32,
             i32,
             i32,
-            i32,
-            i32,
             u64,
-            bool,
-            i32,
-            i32,
+            wind_ui_types::StatusTipPlacement,
         )>::new(60);
         // 工具栏显隐迟滞闸门（两侧都有迟滞，理由不同，见 toolbar_gate 模块文档）。
         let mut toolbar_gate = crate::toolbar_gate::ToolbarGate::new();
@@ -314,6 +309,13 @@ impl UiManager {
             // 推进菜单（脏重绘 / 关闭）
             if let Some(m) = &mut popup_menu {
                 m.tick();
+                // 关掉菜单的那次菜单外按下转给候选窗 / 气泡：菜单开着时它们收不到鼠标消息，在
+                // 上面再右键只有这里看得见（见 `CandidateWindow::menu_outside_press`）。必须紧跟 tick：
+                // 协调器回应 MenuClose 的 SetTooltipMenuOpen(false) 此时还没轮到本线程处理，
+                // 气泡的「菜单打开中」标志仍在，据此认出关掉的是它的菜单。
+                if let Some(p) = m.take_outside_press() {
+                    candidate_window.menu_outside_press(p.x, p.y, p.right);
+                }
             }
             // 推进软键盘（点击派发 / 长按重复 / 悬停重绘）
             if let Some(k) = &mut soft_keyboard {
@@ -321,7 +323,7 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll()
+            if let Some((text, x, y, ch, dur, placement)) = tip_debounce.poll()
                 && let Some(t) = &mut status_tip
             {
                 // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
@@ -333,11 +335,7 @@ impl UiManager {
                 {
                     use wind_bridge::shared_render_frame::FrameParams;
                     use wind_ipc::protocol::HOST_WINDOW_STATUS;
-                    let fo = if fixed {
-                        t.render_frame_fixed(&text, fx, fy, x, y)
-                    } else {
-                        t.render_frame(&text, x, y, ch, ox, oy)
-                    };
+                    let fo = t.render_frame_placed(&text, x, y, ch, placement);
                     if let Some((bgra, w, h, sx, sy, sw)) = fo {
                         let p = FrameParams {
                             sequence: 0,
@@ -367,10 +365,8 @@ impl UiManager {
                 if !host_ok {
                     if blocked_by_exclusive_fullscreen("status_tip") {
                         t.hide();
-                    } else if fixed {
-                        t.show_fixed(&text, fx, fy, x, y);
                     } else {
-                        t.show(&text, x, y, ch, ox, oy);
+                        t.show_placed(&text, x, y, ch, placement);
                     }
                 }
                 // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
@@ -477,9 +473,7 @@ impl UiManager {
                             hr.hide_kind(HOST_WINDOW_TOOLTIP);
                         }
                         candidate_window.hide();
-                        if let Some(m) = &mut popup_menu {
-                            m.hide();
-                        }
+                        hide_popup_menu(&mut popup_menu, &mut candidate_window);
                     }
                     UiCommand::ShowCandidateMenu { items, anchor } => {
                         debug!(
@@ -499,9 +493,7 @@ impl UiManager {
                         }
                     }
                     UiCommand::HideMenu => {
-                        if let Some(m) = &mut popup_menu {
-                            m.hide();
-                        }
+                        hide_popup_menu(&mut popup_menu, &mut candidate_window);
                     }
                     UiCommand::CopyToClipboard(text) => {
                         crate::popup_menu::set_clipboard_text(&text);
@@ -768,27 +760,15 @@ impl UiManager {
                         x,
                         y,
                         caret_height,
-                        offset_x,
-                        offset_y,
                         duration_ms,
-                        fixed,
-                        fixed_x,
-                        fixed_y,
+                        placement,
                     } => {
-                        debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
+                        debug!(
+                            "UI: ShowStatusTip '{}' at ({},{}) {:?}",
+                            text, x, y, placement
+                        );
                         // 经防抖：合并快速连续提示，避免气泡闪烁
-                        tip_debounce.trigger((
-                            text,
-                            x,
-                            y,
-                            caret_height,
-                            offset_x,
-                            offset_y,
-                            duration_ms,
-                            fixed,
-                            fixed_x,
-                            fixed_y,
-                        ));
+                        tip_debounce.trigger((text, x, y, caret_height, duration_ms, placement));
                     }
                     UiCommand::HideStatusTip => {
                         // 取消待显示的防抖项 + 立即隐藏 + 清隐藏计时(常驻模式失焦)。
@@ -1219,6 +1199,22 @@ impl Drop for UiManager {
     }
 }
 
+/// 协调器命令收菜单（`HideMenu` / `HideCandidates`）。真收掉了一个**可见**菜单时告诉气泡：
+/// 协调器有几条收菜单的路不补发 `SetTooltipMenuOpen(false)`，气泡的抑制标志要在这里收口
+/// （见 `Tooltip::on_menu_dismissed`）。菜单已由自己 tick 收起（点了菜单项）时不算——那条路
+/// 协调器会在派发完菜单命令后才解除，「截图此窗口」靠的就是这个先后。
+fn hide_popup_menu(
+    popup_menu: &mut Option<crate::popup_menu::PopupMenu>,
+    candidate_window: &mut crate::candidate_window::CandidateWindow,
+) {
+    if let Some(m) = popup_menu
+        && m.is_visible()
+    {
+        m.hide();
+        candidate_window.tooltip_menu_dismissed();
+    }
+}
+
 /// host-render 候选分流：有活跃目标时渲染候选帧（含悬停 tooltip 帧联动）写 SHM，
 /// 本地窗口互斥隐藏（hide_local_window_only，保留跨帧防抖/粘滞状态）。
 /// 返回 true = 已由 host 路径处理（调用方跳过本地 show）；false = 无目标/写帧失败 → 走本地路径。
@@ -1462,6 +1458,70 @@ mod wakeup_registration_tests {
     }
 }
 
+/// `hide_popup_menu` 只在真收掉一个可见菜单时才通知气泡（见其文档）。
+#[cfg(test)]
+mod hide_popup_menu_tests {
+    use super::*;
+    use crate::candidate_window::{CandidateWindow, CandidateWindowConfig};
+    use wind_ui_types::TooltipDoc;
+
+    fn doc() -> TooltipDoc {
+        TooltipDoc {
+            sections: vec![wind_ui_types::TooltipSection {
+                title: None,
+                inline: false,
+                lines: vec![wind_ui_types::TooltipLine {
+                    text: "nǐ".into(),
+                    raw: 0,
+                }],
+            }],
+        }
+    }
+
+    /// 候选窗 + 已显示、气泡菜单「开着」（抑制中）的气泡 + 一个菜单窗口。
+    fn setup() -> (CandidateWindow, Option<crate::popup_menu::PopupMenu>) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx.clone()).unwrap();
+        let t = w.tooltip_mut().expect("mock 气泡");
+        t.show(&std::sync::Arc::new(doc()), 0, 0, 0, 10);
+        t.set_menu_open(true);
+        let m = crate::popup_menu::PopupMenu::new(tx).expect("mock 菜单");
+        (w, Some(m))
+    }
+
+    fn tip_state(w: &mut CandidateWindow) -> (bool, bool) {
+        let t = w.tooltip_mut().unwrap();
+        (t.shown(), t.menu_suppressed())
+    }
+
+    /// 菜单已不可见（点菜单项时由它自己的 tick 收起）：协调器随后的 `HideMenu` 不得调到
+    /// `on_menu_dismissed`——否则气泡在「截图此窗口」处理之前就被藏掉。
+    #[test]
+    fn invisible_menu_does_not_dismiss_tooltip() {
+        let (mut w, mut m) = setup();
+        hide_popup_menu(&mut m, &mut w);
+        assert_eq!(tip_state(&mut w), (true, true), "气泡与抑制都应原样保留");
+    }
+
+    /// 真收掉一个可见菜单（打字 / 失焦等路径）：按「菜单已关闭」处理，抑制不得残留。
+    #[test]
+    fn visible_menu_dismisses_tooltip() {
+        let (mut w, mut m) = setup();
+        m.as_mut().unwrap().show(
+            vec![MenuItemSpec::leaf(
+                "x",
+                wind_ui_types::MenuKind::Copy,
+                true,
+                false,
+            )],
+            MenuAnchor::at_point(10, 10),
+        );
+        hide_popup_menu(&mut m, &mut w);
+        // 非 Windows 下光标恒不在气泡上 → 隐藏。
+        assert_eq!(tip_state(&mut w), (false, false));
+    }
+}
+
 #[cfg(test)]
 mod menu_id_tests {
     use super::*;
@@ -1519,6 +1579,19 @@ mod menu_id_tests {
             MenuCmd::InputDiagToggleSection(3),
             MenuCmd::AutoPairRule(0),
             MenuCmd::AutoPairRule(2),
+            MenuCmd::PasswordForceEnglishRule(0),
+            MenuCmd::PasswordForceEnglishRule(1),
+            MenuCmd::PasswordForceEnglishRule(2),
+            MenuCmd::AppSchemaRule(0),
+            MenuCmd::AppSchemaRule(1),
+            MenuCmd::AppSchemaRule(2),
+            MenuCmd::AppSchemaRule(999),
+            MenuCmd::StatusPositionRule(0),
+            MenuCmd::StatusPositionRule(2),
+            MenuCmd::StatusPositionRule(9),
+            MenuCmd::StatusFallbackRule(0),
+            MenuCmd::StatusFallbackRule(2),
+            MenuCmd::StatusFallbackRule(9),
             MenuCmd::IconToggleSizeMarks,
             MenuCmd::IconBadgeStyle(0),
             MenuCmd::IconBadgeStyle(1),
@@ -1549,5 +1622,21 @@ mod menu_id_tests {
         assert_eq!(MenuKind::Submenu.to_menu_id(), 0);
         assert_eq!(MenuKind::Label.to_menu_id(), 0);
         assert!(MenuKind::from_menu_id(0).is_none());
+    }
+
+    /// 载荷是 `u8` 的号段只收 `base..=base+255`：`as u8` 会把越界 id 截断回段内
+    /// （`14256` → `PasswordForceEnglishRule(0)`），一个不认识的 id 就这样变成了「跟随全局」。
+    #[test]
+    fn u8_payload_ranges_reject_ids_past_255() {
+        for base in [14000, 16000, 17000] {
+            assert!(
+                MenuKind::from_menu_id(base + 255).is_some(),
+                "{base}+255 仍在段内"
+            );
+            assert!(
+                MenuKind::from_menu_id(base + 256).is_none(),
+                "{base}+256 超出 u8 载荷，不得截断成段内命令"
+            );
+        }
     }
 }

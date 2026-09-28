@@ -14,6 +14,42 @@ import WindInputKit
 //   mouseDown 命中 → onSelect(pageLocalIndex)。nonactivating panel 仍收 mouseDown,
 //   acceptsFirstMouse=true 让首次点击 (panel 非 key 时) 也生效。
 
+/// 候选框右键菜单的「焦点闪断期」。
+///
+/// `NSMenu.popUp` 会向 WindowServer 申请 stealKeyFocus：菜单跟踪期间键盘焦点被菜单拿走，
+/// 收起时再还回去。普通前台 app（Edge 等）不受影响，但 Spotlight / 「应用程序」列表搜索
+/// 这类靠 keyThief 拿焦点的宿主会因此被 IMK 连发「Deactivate → Activate」——弹出时一对，
+/// 收起后约 10ms 又一对（2026-09-28 系统日志实测）。若照常处理 Deactivate（清 marked text
+/// + FocusLost），服务端就把候选收掉，菜单挂在候选窗上也跟着消失。
+/// InputController 据此把这段时间里的 Deactivate 延后，见 `deactivateServer`。
+enum CandidateMenuTracking {
+    /// 菜单收起后仍算闪断期的时长：收起后那对 Deactivate/Activate 实测晚 5~10ms 到。
+    /// 别放太宽——这段时间里真实的失焦（收起菜单后立刻切走）也会被延后到它结束才处理。
+    static let trailingGrace: TimeInterval = 0.15
+    /// 仅主线程访问（popUp 在主线程同步跑完整个跟踪循环，IMK 回调也在主线程）。
+    private(set) static var isTracking = false
+    private static var endedAt: TimeInterval?   // 单调时钟（systemUptime），不受改系统时间影响
+
+    static var inFocusBlip: Bool {
+        if isTracking { return true }
+        guard let t = endedAt else { return false }
+        return ProcessInfo.processInfo.systemUptime - t < trailingGrace
+    }
+
+    /// 菜单收起且尾随闪断也过去后回调（主线程）。由 CandidatePanelHost 接到当前 controller。
+    static var didSettle: (() -> Void)?
+
+    static func popUp(_ menu: NSMenu, at point: NSPoint, in view: NSView) {
+        isTracking = true
+        defer {
+            isTracking = false
+            endedAt = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.asyncAfter(deadline: .now() + trailingGrace) { didSettle?() }
+        }
+        menu.popUp(positioning: nil, at: point, in: view)
+    }
+}
+
 /// 自绘候选框 bitmap + 处理鼠标命中的内容视图。
 final class CandidateContentView: NSView {
     private var image: NSImage?
@@ -129,7 +165,7 @@ final class CandidateContentView: NSView {
         guard let idx = hitIndex(event), idx >= 0 else {
             if let items = unifiedMenuProvider?(), !items.isEmpty {
                 let menu = unifiedMenuBuilder.build(items, dispatch: .inProcess { [weak self] id in self?.onUnifiedAction?(id) })
-                menu.popUp(positioning: nil, at: convert(event.locationInWindow, from: nil), in: self)
+                CandidateMenuTracking.popUp(menu, at: convert(event.locationInWindow, from: nil), in: self)
             }
             return
         }
@@ -145,7 +181,7 @@ final class CandidateContentView: NSView {
         addContextItem(menu, "恢复默认", "reset_default", disabled: f & 0x10 != 0)
         menu.addItem(.separator())
         addContextItem(menu, "复制", "copy", disabled: false)
-        menu.popUp(positioning: nil, at: convert(event.locationInWindow, from: nil), in: self)
+        CandidateMenuTracking.popUp(menu, at: convert(event.locationInWindow, from: nil), in: self)
     }
 
     private func addContextItem(_ menu: NSMenu, _ title: String, _ action: String, disabled: Bool) {
@@ -258,8 +294,11 @@ final class CandidatePanel: NSPanel {
         self.isOpaque = false
         self.backgroundColor = .clear
         self.hasShadow = true
+        // ⚠️ 不要再设 `isFloatingPanel = true`：它的 setter 会把 level 改回 floating(3)，
+        // 写在这行后面等于把 `.popUpMenu` 冲掉。3 只压得住普通窗口（layer 0），压不住
+        // Spotlight / 「应用程序」列表搜索（layer 23）、Alfred 这类高层宿主，候选窗画了却
+        // 被整个盖住（A2-53 / GH#158，26.5.1 实测）。Tooltip / StatusBubble / Toast 同理。
         self.level = .popUpMenu
-        self.isFloatingPanel = true
         self.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         self.hidesOnDeactivate = false
         self.becomesKeyOnlyIfNeeded = true

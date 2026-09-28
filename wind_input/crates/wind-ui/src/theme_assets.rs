@@ -1,7 +1,7 @@
 //! 主题图片资产解析（各窗口共享）：把 RvImage 的 ref 解析为绝对路径，转成 View 渲染用的
 //! ViewImage / ViewLayer。背景图/层的实际绘制由 view.rs 的 paint（线程局部 image_cache）完成。
 
-use crate::view::{ViewImage, ViewLayer};
+use crate::view::{ImagePlace, ViewImage, ViewLayer};
 use wind_theme::{Resolved, RvImage};
 
 /// 把 image ref 解析为可读绝对路径：resources 注册表 → data:/绝对 → 在 asset_dirs（base 链目录）
@@ -26,7 +26,9 @@ pub fn asset_path(theme: &Resolved, reference: &str) -> Option<String> {
 }
 
 /// RvImage → 渲染用 ViewImage（reference 解析为绝对路径）。
-pub fn rv_image(theme: &Resolved, im: Option<&RvImage>) -> Option<ViewImage> {
+///
+/// 配了定位字段（见 [`positioned`]）才带 `place`，否则铺满节点——与改前逐像素一致。
+pub fn rv_image(theme: &Resolved, im: Option<&RvImage>, scale: f32) -> Option<ViewImage> {
     let im = im?;
     let path = asset_path(theme, &im.reference)?;
     Some(ViewImage {
@@ -36,11 +38,28 @@ pub fn rv_image(theme: &Resolved, im: Option<&RvImage>) -> Option<ViewImage> {
         slice_repeat: im.slice_repeat,
         opacity: im.opacity,
         tint: im.tint,
+        place: positioned(im).then(|| image_place(im, scale)),
     })
 }
 
-/// RvImage[] → ViewLayer[]：解析路径 + 偏移分流（dp×scale / 百分比）+ 尺寸×scale。
+/// RvImage[] → ViewLayer[]：解析路径 + 定位（见 [`image_place`]）。
 pub fn rv_layers(theme: &Resolved, layers: &[RvImage], scale: f32) -> Vec<ViewLayer> {
+    layers
+        .iter()
+        .filter_map(|im| {
+            let path = asset_path(theme, &im.reference)?;
+            Some(ViewLayer {
+                path,
+                z: im.z,
+                place: image_place(im, scale),
+                opacity: im.opacity,
+            })
+        })
+        .collect()
+}
+
+/// 定位字段 → 渲染形态：偏移分流（dp×scale / 百分比）+ 尺寸×scale。背景图与覆盖图共用。
+fn image_place(im: &RvImage, scale: f32) -> ImagePlace {
     use wind_theme::schema::Dim;
     let split = |d: Option<Dim>| match d {
         Some(Dim::Dp(v)) => (v * scale, 0.0),
@@ -48,26 +67,30 @@ pub fn rv_layers(theme: &Resolved, layers: &[RvImage], scale: f32) -> Vec<ViewLa
         Some(Dim::Pct(v)) => (0.0, v),
         None => (0.0, 0.0),
     };
-    layers
-        .iter()
-        .filter_map(|im| {
-            let path = asset_path(theme, &im.reference)?;
-            let (off_x, off_x_pct) = split(im.offset_x);
-            let (off_y, off_y_pct) = split(im.offset_y);
-            Some(ViewLayer {
-                path,
-                z: im.z,
-                anchor: im.anchor.clone(),
-                off_x,
-                off_y,
-                off_x_pct,
-                off_y_pct,
-                w: if im.w > 0 { im.w as f32 * scale } else { 0.0 },
-                h: if im.h > 0 { im.h as f32 * scale } else { 0.0 },
-                opacity: im.opacity,
-            })
-        })
-        .collect()
+    let (off_x, off_x_pct) = split(im.offset_x);
+    let (off_y, off_y_pct) = split(im.offset_y);
+    ImagePlace {
+        anchor: im.anchor.clone(),
+        off_x,
+        off_y,
+        off_x_pct,
+        off_y_pct,
+        w: if im.w > 0 { im.w as f32 * scale } else { 0.0 },
+        h: if im.h > 0 { im.h as f32 * scale } else { 0.0 },
+    }
+}
+
+/// 背景图是否按定位绘制：配了 anchor、任一非零偏移或非零尺寸。
+///
+/// 逐条对齐主题编辑器预览的 `bgPositioned()`（candidateBox.ts）——两边判据一旦分叉，
+/// 就是「预览摆在角上、实机铺满整窗」（t238 / A2-52 正是 Rust 端缺了这一判）。
+fn positioned(im: &RvImage) -> bool {
+    use wind_theme::schema::Dim;
+    let nonzero = |d: Option<Dim>| match d {
+        Some(Dim::Dp(v) | Dim::Px(v) | Dim::Pct(v)) => v != 0.0,
+        None => false,
+    };
+    !im.anchor.is_empty() || nonzero(im.offset_x) || nonzero(im.offset_y) || im.w != 0 || im.h != 0
 }
 
 #[cfg(test)]
@@ -92,7 +115,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = rv_image(&theme, Some(&im)).expect("有 ref 就该出图");
+        let out = rv_image(&theme, Some(&im), 1.0).expect("有 ref 就该出图");
 
         assert_eq!(out.mode, "nine_slice");
         assert_eq!(out.slice, [1.0, 2.0, 3.0, 4.0]);
@@ -100,10 +123,70 @@ mod tests {
         assert_eq!(out.opacity, 0.5);
     }
 
+    /// 背景图何时走定位，逐条对齐编辑器 `bgPositioned()`：anchor / 任一非零偏移 / 非零尺寸。
+    /// 什么都没配（或偏移写成 0）必须仍是铺满——既有主题一个像素都不能变。
+    #[test]
+    fn rv_image_places_only_when_positioning_is_configured() {
+        use wind_theme::schema::Dim;
+        let theme = Resolved::default();
+        let base = RvImage {
+            reference: "girl.png".to_string(),
+            ..Default::default()
+        };
+        let placed = |im: RvImage| rv_image(&theme, Some(&im), 2.0).unwrap().place;
+
+        assert_eq!(placed(base.clone()), None, "没配定位却不再铺满");
+        let zero_off = RvImage {
+            offset_x: Some(Dim::Dp(0.0)),
+            offset_y: Some(Dim::Pct(0.0)),
+            ..base.clone()
+        };
+        assert_eq!(placed(zero_off), None, "零偏移不算配了定位");
+        for im in [
+            RvImage {
+                anchor: "right".to_string(),
+                ..base.clone()
+            },
+            RvImage {
+                offset_y: Some(Dim::Pct(-3.0)),
+                ..base.clone()
+            },
+            RvImage {
+                h: 5,
+                ..base.clone()
+            },
+        ] {
+            assert!(placed(im).is_some(), "配了定位字段却仍铺满");
+        }
+
+        // 换算与覆盖图同一套：dp×scale、百分比原样、尺寸×scale。
+        let full = RvImage {
+            anchor: "bottom-right".to_string(),
+            offset_x: Some(Dim::Dp(-4.0)),
+            offset_y: Some(Dim::Pct(10.0)),
+            w: 24,
+            ..base.clone()
+        };
+        let p = placed(full.clone()).unwrap();
+        assert_eq!(
+            p,
+            ImagePlace {
+                anchor: "bottom-right".to_string(),
+                off_x: -8.0,
+                off_y: 0.0,
+                off_x_pct: 0.0,
+                off_y_pct: 10.0,
+                w: 48.0,
+                h: 0.0,
+            }
+        );
+        assert_eq!(rv_layers(&theme, &[full], 2.0)[0].place, p);
+    }
+
     /// 空 ref = 没有图，不能凭空造一个（调用方据此跳过整层绘制）。
     #[test]
     fn rv_image_rejects_empty_reference() {
-        assert!(rv_image(&Resolved::default(), Some(&RvImage::default())).is_none());
-        assert!(rv_image(&Resolved::default(), None).is_none());
+        assert!(rv_image(&Resolved::default(), Some(&RvImage::default()), 1.0).is_none());
+        assert!(rv_image(&Resolved::default(), None, 1.0).is_none());
     }
 }

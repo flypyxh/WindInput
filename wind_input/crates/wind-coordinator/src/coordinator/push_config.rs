@@ -126,8 +126,21 @@ impl Coordinator {
     /// 目标客户端未必是当前焦点进程（新客户端握手、配置变更广播都会推给后台进程）。
     /// 拿焦点槽的值会把焦点应用的规则套到别人头上——同 `host_render` 的既有纪律。
     pub(super) fn auto_pair_allowed_for_pid(&self, pid: u32) -> bool {
+        self.compat_bool_for_pid(pid, |r| r.auto_pair)
+            .unwrap_or(true)
+    }
+
+    /// 按 PID 直查 per-app 规则里的某个 `Option<bool>` 字段；pid / 进程名未知或未配 = `None`。
+    ///
+    /// 与 [`Self::auto_pair_allowed_for_pid`] 同一纪律：**不走 `active_compat` 焦点槽**，
+    /// 调用方多是推送路径，目标客户端未必是焦点进程。
+    fn compat_bool_for_pid(
+        &self,
+        pid: u32,
+        pick: impl Fn(&wind_config::app_compat::AppCompatRule) -> Option<bool>,
+    ) -> Option<bool> {
         if pid == 0 {
-            return true;
+            return None;
         }
         let name = {
             let cached = self
@@ -139,14 +152,29 @@ impl Coordinator {
             cached.unwrap_or_else(|| process_name(pid))
         };
         if name.is_empty() {
-            return true;
+            return None;
         }
         self.app_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_rule(&name)
-            .and_then(|r| r.auto_pair)
-            .unwrap_or(true)
+            .and_then(pick)
+    }
+
+    /// 指定 PID 的进程密码框是否强制英文：per-app 规则优先，未配则跟随全局
+    /// `input.password_force_english`（运行时镜像 `password_suppress_enabled`）。
+    ///
+    /// ★★ **本函数是这项判定的唯一出处**：服务端 `apply_input_diag` 算 suppress、
+    /// [`Self::push_password_suppress_config`] 推给 DLL 的吃键门控，两边都只能调它。
+    /// 两边各算各的，迟早出现「规则只进了一边」⇒ core 抑制而 DLL 照吃 ⇒ 密码框丢键
+    /// （不变量 core.suppress ⊆ C++.suppress，见 `apply_input_diag` 与 C++
+    /// `IsPasswordSuppressActive`）。
+    pub(crate) fn password_force_english_for_pid(&self, pid: u32) -> bool {
+        self.compat_bool_for_pid(pid, |r| r.password_force_english)
+            .unwrap_or_else(|| {
+                self.password_suppress_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
     }
 
     /// 推送英文自动配对配置到指定客户端（或逐个推给所有活跃客户端）。
@@ -193,20 +221,25 @@ impl Coordinator {
     /// 下发密码框抑制策略开关给 DLL。DLL 据此 + 自身持有的 InputScope 掩码在
     /// `OnTestKeyDown` 本地判定是否放行；判据两侧必须一致（见 `apply_input_diag` 与
     /// C++ `IsPasswordSuppressActive`），漂移即「吃了再吐」丢键。
-    /// 开关是会话级运行时态（右键菜单「高级」可切），故握手时与每次切换后都要推。
+    /// 开关持久化在 `input.password_force_english`（右键菜单「高级」可切），握手时、每次切换与
+    /// 配置重载后都要推。
+    ///
+    /// 取值按**目标进程**现算（compat.toml 的 per-app `password_force_english` 优先），故
+    /// `client_token=0` 时逐客户端推而不是广播同一个值——同 [`Self::push_english_pair_config`]。
     pub fn push_password_suppress_config(&self, client_token: u64) {
-        let enabled = self
-            .password_suppress_enabled
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let value = wind_ipc::codec::encode_password_suppress_value(enabled);
-        let msg = wind_ipc::codec::encode_sync_config(
-            wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
-            &value,
-        );
+        let make = |token: u64| {
+            let enabled = self.password_force_english_for_pid((token >> 32) as u32);
+            let value = wind_ipc::codec::encode_password_suppress_value(enabled);
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+                &value,
+            )
+        };
         if client_token != 0 {
-            self.push_server.push_to_token(client_token, &msg);
+            self.push_server
+                .push_to_token(client_token, &make(client_token));
         } else {
-            self.push_server.push_to_active(&msg);
+            self.push_server.push_per_client(make);
         }
     }
 

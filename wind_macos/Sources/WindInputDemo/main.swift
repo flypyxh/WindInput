@@ -93,7 +93,7 @@ final class DemoCandidatePanel: NSPanel {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 200, height: 60),
                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         isOpaque = false; backgroundColor = .clear; hasShadow = true
-        level = .popUpMenu; isFloatingPanel = true
+        level = .popUpMenu // 勿再设 isFloatingPanel：会把 level 冲回 3
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         hidesOnDeactivate = false; becomesKeyOnlyIfNeeded = true
         contentView = view

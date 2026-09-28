@@ -23,6 +23,10 @@ public protocol PushResponder: AnyObject {
     /// 供**绕过 router 直接改文档**的路径调用：合成按键往宿主打字符/退格，文档变了而
     /// 我们的记账一无所知。这类路径拿不到「改成了什么」，只能作废，回落默认行为。
     func invalidateDigitTracking()
+
+    /// 候选框右键菜单收起、焦点闪断平息后调用: 核对宿主里的 marked text 是否还在
+    /// (见 CandidateMenuTracking)。
+    func menuTrackingDidSettle()
 }
 
 public final class CandidatePanelHost {
@@ -78,6 +82,7 @@ public final class CandidatePanelHost {
         statusBubble.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posStatusTip, x, y) }
         panel.unifiedMenuProvider = { [weak self] in self?.requestUnifiedMenu() }
         panel.onUnifiedAction = { [weak self] id in self?.sendMenuAction(id) }
+        CandidateMenuTracking.didSettle = { [weak self] in self?.activeResponder?.menuTrackingDidSettle() }
         // 菜单栏状态菜单复用候选框空白处右键的同一统一菜单树与回发路径, 保证两处一致。
         ModeStatusController.shared.unifiedMenuProvider = { [weak self] in self?.requestUnifiedMenu() }
         ModeStatusController.shared.onUnifiedAction = { [weak self] id in self?.sendMenuAction(id) }
@@ -232,7 +237,7 @@ public final class CandidatePanelHost {
             return
         }
         tooltip.show(text: p.text, bgHex: p.bgColor, fgHex: p.fgColor,
-                     fontPath: p.fontPath, anchorScreenRect: rect)
+                     fontPath: p.fontPath, runs: p.runs, anchorScreenRect: rect)
     }
 
     private func openSHMIfNeeded() {
@@ -394,7 +399,8 @@ public final class CandidatePanelHost {
             if let p = try? BinaryCodec.decodeStatusBubblePayload(frame.payload) {
                 DispatchQueue.main.async { [weak self] in
                     self?.statusBubble.show(text: p.text, bgHex: p.bgColor, fgHex: p.fgColor,
-                                            wireX: p.x, wireY: p.y, durationMs: p.durationMs)
+                                            wireX: p.x, wireY: p.y, durationMs: p.durationMs,
+                                            anchor: p.anchor)
                 }
             }
         case DownstreamCmd.statusHide:

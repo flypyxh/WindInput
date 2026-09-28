@@ -283,6 +283,18 @@ impl PushServer {
         }
     }
 
+    /// 某个宿主进程的全部推送客户端 token（token 高 32 位是 pid）。一个进程可能有多个
+    /// TSF 实例、各连一条，故返回列表。用于「只重推给这个进程」的 per-app 配置。
+    pub fn tokens_of_pid(&self, pid: u32) -> Vec<u64> {
+        self.clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.token)
+            .filter(|t| (t >> 32) as u32 == pid)
+            .collect()
+    }
+
     /// 仅向活动客户端投递（用于 commit 等带副作用的消息，避免广播导致多次上屏）。
     /// 优先按活动 token 匹配；无匹配且仅一个客户端时兜底发它；否则跳过。
     /// 返回是否已投入某客户端的发送队列（false = 无客户端/无匹配/通道已断，

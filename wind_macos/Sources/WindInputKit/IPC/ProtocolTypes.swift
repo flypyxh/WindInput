@@ -178,18 +178,43 @@ public struct TooltipPayload {
     public let bgColor: String
     public let fgColor: String
     public let fontPath: String   // 拆字字根字体文件绝对路径, 空=无需特殊字体
+    /// 分段颜色 (后加尾段); 空 = 整段 fgColor。旧服务不发此段, 解码为空。
+    public let runs: [TooltipColorRun]
 
-    public init(text: String, bgColor: String, fgColor: String, fontPath: String = "") {
+    public init(text: String, bgColor: String, fgColor: String, fontPath: String = "",
+                runs: [TooltipColorRun] = []) {
         self.text = text
         self.bgColor = bgColor
         self.fgColor = fgColor
         self.fontPath = fontPath
+        self.runs = runs
+    }
+}
+
+/// tooltip 的一段分段颜色: text 里 UTF-16 区间 [start, start+length) (直接当 NSRange 用)
+/// 改用 (r,g,b,a) 画。颜色已由服务端按主题解析好, 按 sRGB 解释 (与候选窗 CoreText 渲染同色)。
+public struct TooltipColorRun: Equatable {
+    public let start: Int
+    public let length: Int
+    public let r: UInt8
+    public let g: UInt8
+    public let b: UInt8
+    public let a: UInt8
+
+    public init(start: Int, length: Int, r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
+        self.start = start
+        self.length = length
+        self.r = r
+        self.g = g
+        self.b = b
+        self.a = a
     }
 }
 
 /// 状态提示气泡 (CmdStatusShow 0x050A 解码结果)。模式切换时近 caret 弹出的瞬态气泡。
 /// text 为合并短文 (如 "中 ，"); bgColor/fgColor 为 #RRGGBBAA; x/y 为 caret 屏幕坐标
 /// (wire top-left); durationMs>0 时到点自动隐藏 (temp), ==0 常驻 (always)。
+/// anchor 为尾段 (C2-33 / GH#148), 取值见 `StatusAnchor`; 旧服务不发 → 0 (按 x/y 摆)。
 public struct StatusBubblePayload {
     public let text: String
     public let bgColor: String
@@ -197,14 +222,39 @@ public struct StatusBubblePayload {
     public let x: Int32
     public let y: Int32
     public let durationMs: Int32
+    public let anchor: Int32
 
-    public init(text: String, bgColor: String, fgColor: String, x: Int32, y: Int32, durationMs: Int32) {
+    public init(text: String, bgColor: String, fgColor: String, x: Int32, y: Int32, durationMs: Int32,
+                anchor: Int32 = 0) {
         self.text = text
         self.bgColor = bgColor
         self.fgColor = fgColor
         self.x = x
         self.y = y
         self.durationMs = durationMs
+        self.anchor = anchor
+    }
+}
+
+/// 状态气泡锚点 (CmdStatusShow 尾段)。与 Rust `wind_ipc::protocol::status_anchor` **同值**,
+/// 改一边必须改另一边。`none` = 按 x/y 摆 (跟随光标 / 固定坐标, 服务端已算定)。
+public enum StatusAnchor: Int32 {
+    case none = 0
+    case screenCenter = 1
+    case screenTopLeft = 2
+    case screenTopRight = 3
+    case screenBottomLeft = 4
+    case screenBottomRight = 5
+    case windowCenter = 6
+    case windowBottomLeft = 7
+
+    /// 拿不到宿主窗口边框时的降级: 窗口锚点换成同位置的屏幕锚点, 其余原样。
+    public var screenEquivalent: StatusAnchor {
+        switch self {
+        case .windowCenter: return .screenCenter
+        case .windowBottomLeft: return .screenBottomLeft
+        default: return self
+        }
     }
 }
 

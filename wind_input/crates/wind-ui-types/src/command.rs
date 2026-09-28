@@ -4,6 +4,7 @@ use crate::candidate::CandidateItem;
 use crate::diag::{CaretOverlayView, InputDiagView};
 use crate::menu::{MenuAnchor, MenuItemSpec};
 use crate::softkeyboard::SoftKeyCap;
+use crate::status_tip::StatusTipPlacement;
 use crate::toast::{ToastKind, ToastPosition};
 use crate::toolbar::{ToolbarItem, ToolbarState};
 
@@ -59,20 +60,16 @@ pub enum UiCommand {
         accent: Option<[u8; 4]>,
     },
     /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏。
-    /// (x,y)=光标点(y 为底端)，caret_height 上翻定位用，offset_x/y 用户位置微调。
+    /// (x,y)=光标点(y 为底端)，caret_height 上翻定位用；怎么用它们由 `placement` 决定。
     ShowStatusTip {
         text: String,
         x: i32,
         y: i32,
         caret_height: i32,
-        offset_x: i32,
-        offset_y: i32,
         /// 自动隐藏时长（毫秒）；0=常驻不自动隐藏（display_mode=always）。
         duration_ms: u64,
-        /// 固定位置模式（position_mode=fixed）：用 fixed_x/fixed_y 作屏幕坐标，忽略光标。
-        fixed: bool,
-        fixed_x: i32,
-        fixed_y: i32,
+        /// 定位方式：跟随光标（含用户偏移）/ 固定坐标 / 锚点。
+        placement: StatusTipPlacement,
     },
     /// 隐藏状态提示气泡（常驻模式失焦/切走输入法时）。
     HideStatusTip,

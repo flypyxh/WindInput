@@ -23,6 +23,8 @@
 //! # 只治「字符串写错」，不治「类型写错」
 //!
 //! `text_orientation = 3` 这类**类型**错误照旧返回 `Err`，交给段级降级处理。
+//! 例外是只服务 `compat.toml` 的几个函数（`tolerant_opt` / `tolerant_opt_bool` /
+//! `tolerant_bool` / `tolerant_i32`）：那个载体没有段级降级，类型错也只能在字段上吞。
 //! 分工清晰：值域层只回答「这个字符串在不在值域里」，把它扩张成「什么都吞」会连
 //! 真正的配置结构错误一起掩盖掉。
 
@@ -109,13 +111,26 @@ where
 /// `Some(T::default())` 就等于**替用户显式配了一个默认档**——per-app 覆盖凭空长出来，
 /// 用户改全局默认时这些应用不跟着变，且他从没配过、无从撤销。
 /// 见 `AppCompatRule::first_show_mode` 的字段文档。
+///
+/// ⚠️ 与 [`tolerant`] 不同，本函数**连类型错也吞**（`smart_method = true` 回落 `None`
+/// 并 WARN）：它只用在 `compat.toml` 上，那里没有段级降级可交，理由同 [`tolerant_opt_bool`]。
 pub fn tolerant_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    let Some(raw) = Option::<String>::deserialize(d)? else {
-        return Ok(None);
+    let raw = match Option::<toml::Value>::deserialize(d)? {
+        None => return Ok(None),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => {
+            let raw = other.to_string();
+            warn!(
+                "配置值 {raw} 不是字符串（{}），本项按「未设置」处理",
+                std::any::type_name::<T>()
+            );
+            record_fallback(&raw);
+            return Ok(None);
+        }
     };
     let sd: StrDeserializer<'_, D::Error> = raw.as_str().into_deserializer();
     match T::deserialize(sd) {
@@ -127,6 +142,62 @@ where
             );
             record_fallback(&raw);
             Ok(None)
+        }
+    }
+}
+
+/// 容错反序列化 `Option<bool>`：非布尔值（`"yes"`、`1`）回落 **`None`** 并 WARN。
+///
+/// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**例外**（连同其裸 `bool` 版
+/// [`tolerant_bool`]、整数版 [`tolerant_i32`]、[`tolerant_opt`]），只给没有段级降级的载体用（`compat.toml`：
+/// `load_file` 解析失败即整份丢弃）。在那里，类型错并没有下一层兜底可交——不在字段上吞掉，就是所有应用的所有
+/// 规则一起静默失效。
+/// 回落 `None` 而非 `Some(false)`，理由同 [`tolerant_opt`]：认不出 = 没配过。
+pub fn tolerant_opt_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(toml::Value::Boolean(b)) => Ok(Some(b)),
+        Some(other) => {
+            let raw = other.to_string();
+            warn!("配置值 {raw} 不是布尔值（true / false），本项按「未设置」处理");
+            record_fallback(&raw);
+            Ok(None)
+        }
+    }
+}
+
+/// 容错反序列化裸 `bool`：非布尔值回落 **`false`**（这类字段的「未配置」）并 WARN。
+///
+/// 与 [`tolerant_opt_bool`] 同一个例外、同一个载体（`compat.toml`）：那里的裸 `bool` 字段
+/// 都是 `default + skip_serializing_if = "is_false"`，`false` 就是「没配」，回落到它与
+/// `Option` 版回落 `None` 同义。
+pub fn tolerant_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(tolerant_opt_bool(d)?.unwrap_or(false))
+}
+
+/// 容错反序列化裸 `i32`：非整数（`"12"`、`1.5`、`true`）或超出 `i32` 范围的整数回落 **`0`**
+/// 并 WARN。
+///
+/// 与 [`tolerant_bool`] 同一个例外、同一个载体（`compat.toml`）：那里的 `i32` 字段（坐标校正、
+/// 固定落点）都是 `default + skip_serializing_if = "is_zero_i32"`，`0` 就是「没配」。
+pub fn tolerant_i32<'de, D>(d: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(0),
+        Some(toml::Value::Integer(n)) if i32::try_from(n).is_ok() => Ok(n as i32),
+        Some(other) => {
+            let raw = other.to_string();
+            warn!("配置值 {raw} 不是 32 位整数，本项按「未设置」（0）处理");
+            record_fallback(&raw);
+            Ok(0)
         }
     }
 }
@@ -184,5 +255,71 @@ mod tests {
     #[test]
     fn wrong_type_still_errors() {
         assert!(toml::from_str::<Holder>("v = 3").is_err());
+    }
+
+    /// `Option` 版只服务 compat.toml（无段级降级），类型错也回落 `None`，不得整份失败。
+    #[test]
+    fn option_version_swallows_wrong_type() {
+        for bad in ["3", "true", "[\"upright\"]", "{ a = 1 }"] {
+            let h: OptHolder = toml::from_str(&format!("v = {bad}"))
+                .unwrap_or_else(|e| panic!("v = {bad} 不得整份失败：{e}"));
+            assert_eq!(h.v, None, "v = {bad}");
+        }
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct OptBoolHolder {
+        #[serde(default, deserialize_with = "tolerant_opt_bool")]
+        v: Option<bool>,
+        #[serde(default)]
+        other: i32,
+    }
+
+    #[test]
+    fn opt_bool_keeps_booleans_and_absence() {
+        let h: OptBoolHolder = toml::from_str("v = false").unwrap();
+        assert_eq!(h.v, Some(false));
+        let h: OptBoolHolder = toml::from_str("v = true").unwrap();
+        assert_eq!(h.v, Some(true));
+        let h: OptBoolHolder = toml::from_str("other = 1").unwrap();
+        assert_eq!(h.v, None);
+    }
+
+    /// 非布尔值回落 `None`（= 没配过），且不牵连同表其它字段。
+    #[test]
+    fn opt_bool_non_boolean_falls_back_to_none() {
+        for bad in [r#""yes""#, "1", "1.5", "[true]", "{ a = 1 }"] {
+            let h: OptBoolHolder = toml::from_str(&format!("v = {bad}\nother = 7"))
+                .unwrap_or_else(|e| panic!("{bad}: 不得整份失败：{e}"));
+            assert_eq!(h.v, None, "{bad}");
+            assert_eq!(h.other, 7, "{bad}: 同表其它字段照常");
+        }
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct I32Holder {
+        #[serde(default, deserialize_with = "tolerant_i32")]
+        v: i32,
+        #[serde(default)]
+        other: i32,
+    }
+
+    #[test]
+    fn i32_keeps_integers_and_absence() {
+        let h: I32Holder = toml::from_str("v = -12").unwrap();
+        assert_eq!(h.v, -12);
+        let h: I32Holder = toml::from_str("other = 1").unwrap();
+        assert_eq!(h.v, 0);
+    }
+
+    /// 非整数与越界整数回落 `0`（= 没配过），且不牵连同表其它字段。
+    #[test]
+    fn i32_wrong_type_or_overflow_falls_back_to_zero() {
+        for bad in [r#""12""#, "1.5", "true", "[1]", "{ a = 1 }", "4294967296"] {
+            let h: I32Holder = toml::from_str(&format!("v = {bad}\nother = 7"))
+                .unwrap_or_else(|e| panic!("{bad}: 不得整份失败：{e}"));
+            assert_eq!(h.v, 0, "{bad}");
+            assert_eq!(h.other, 7, "{bad}: 同表其它字段照常");
+        }
     }
 }

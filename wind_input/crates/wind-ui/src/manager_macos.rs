@@ -15,8 +15,23 @@ use wind_bridge::HostRenderSink;
 use wind_bridge::shared_memory_posix::PosixSharedMemory;
 use wind_ipc::codec::*;
 use wind_ipc::protocol::*;
+use wind_ui_types::{StatusTipAnchor, StatusTipPlacement, TooltipDoc};
 
 const SHM_MAX: usize = MAX_SHARED_RENDER_SIZE;
+
+/// 气泡锚点 → wire 编码（[`wind_ipc::protocol::status_anchor`]）。
+fn status_anchor_code(a: StatusTipAnchor) -> i32 {
+    use StatusTipAnchor as A;
+    match a {
+        A::ScreenCenter => status_anchor::SCREEN_CENTER,
+        A::ScreenTopLeft => status_anchor::SCREEN_TOP_LEFT,
+        A::ScreenTopRight => status_anchor::SCREEN_TOP_RIGHT,
+        A::ScreenBottomLeft => status_anchor::SCREEN_BOTTOM_LEFT,
+        A::ScreenBottomRight => status_anchor::SCREEN_BOTTOM_RIGHT,
+        A::WindowCenter => status_anchor::WINDOW_CENTER,
+        A::WindowBottomLeft => status_anchor::WINDOW_BOTTOM_LEFT,
+    }
+}
 
 /// 把 `Rgba` 编成 wire 用的 `#RRGGBBAA`（Swift `NSColor(windHex:)` 认 6/8 位）。
 fn hex(c: wind_theme::Rgba) -> String {
@@ -130,8 +145,14 @@ pub struct Forwarder {
     ev_tx: Sender<UiEvent>,
     /// 候选窗当前是否有帧在显示。外观类命令（主题/字号/布局…）只在**显示中**才重推帧。
     visible: bool,
-    /// 最近一帧随附的 hover tooltip 文本。重推时须一并带上，否则换主题会把气泡弄丢。
-    last_tip: Option<String>,
+    /// 最近一帧随附的 hover tooltip。重推时须一并带上，否则换主题会把气泡弄丢。
+    ///
+    /// ★ 存结构化的 `TooltipDoc` 而不是算好颜色的结果：换主题 / 换明暗时 `handle` 用它重推
+    /// 当前帧（`affects_appearance` 分支），每次推送都按**当前**主题现算分段颜色——存颜色的话，
+    /// 重推出去的气泡仍是旧主题的颜色。
+    last_tip: Option<Arc<TooltipDoc>>,
+    /// 当前主题（`SetTheme` 留一份），推气泡时现算分段颜色用。
+    theme: Option<Box<wind_theme::Resolved>>,
 }
 
 impl Forwarder {
@@ -149,6 +170,7 @@ impl Forwarder {
             ev_tx,
             visible: false,
             last_tip: None,
+            theme: None,
         }
     }
 
@@ -228,12 +250,12 @@ impl Forwarder {
                     caret_height,
                     caret_valid
                 );
-                // hover tooltip 文本（反查码在 CandidateItem.tooltip）。
+                // hover tooltip（反查码在 CandidateItem.tooltip）。
                 let tip = if hover >= 0 {
                     candidates
                         .get(hover as usize)
-                        .map(|c| c.tooltip.to_plain_text())
-                        .filter(|s| !s.is_empty())
+                        .map(|c| c.tooltip.clone())
+                        .filter(|d| !d.sections.is_empty())
                 } else {
                     None
                 };
@@ -286,20 +308,22 @@ impl Forwarder {
                 x,
                 y,
                 caret_height,
-                offset_x,
-                offset_y,
                 duration_ms,
-                fixed,
-                fixed_x,
-                fixed_y,
+                placement,
             } => {
-                // wire 仅传最终屏幕 (x,y)；fixed/offset 在此算定。
+                // wire 传屏幕 (x,y) + 锚点编码；跟随光标 / 固定坐标在此算定最终 (x,y)。
                 // 跟随光标时 y 是 caret 顶端，须 +caret_height 落到 caret 底端下方，否则气泡
                 // 贴在 caret 顶端盖住输入位（与候选窗 render_frame 的 y+caret_height 对齐）。
-                let (fx, fy) = if fixed {
-                    (fixed_x, fixed_y)
-                } else {
-                    (x + offset_x, y + offset_y + caret_height)
+                // 锚点由 `.app` 在焦点所在屏上落位（前台窗口 / 屏幕几何只有那边拿得到），
+                // 此时 (x,y) 只是选屏参考，照跟随光标的算法给出光标底端。
+                let (fx, fy, anchor) = match placement {
+                    StatusTipPlacement::Fixed { x: px, y: py } => (px, py, status_anchor::NONE),
+                    StatusTipPlacement::Caret { offset_x, offset_y } => (
+                        x + offset_x,
+                        y + offset_y + caret_height,
+                        status_anchor::NONE,
+                    ),
+                    StatusTipPlacement::Anchor(a) => (x, y + caret_height, status_anchor_code(a)),
                 };
                 self.sink.push_frame(&encode_status_show(
                     &text,
@@ -308,6 +332,7 @@ impl Forwarder {
                     fx,
                     fy,
                     duration_ms as i32,
+                    anchor,
                 ));
             }
             UiCommand::HideStatusTip => {
@@ -354,6 +379,7 @@ impl Forwarder {
                 };
                 // 面板是惰性建窗的，主题得在本模块之外留一份底，理由见 `SkCmd::Theme`。
                 self.push_softkeyboard(sk::SkCmd::Theme(t.clone()));
+                self.theme = Some(t.clone());
                 self.win.set_theme(*t);
             }
             UiCommand::SetCandidateTextFamily(f) => self.win.set_text_family_override(&f),
@@ -639,7 +665,7 @@ impl Forwarder {
     ///
     /// 内容更新（`UpdateCandidates`）与纯外观变更（换主题/字号…）共用此路径——后者若不
     /// 走这里重推一帧，显示中的候选窗就会停在旧样子。
-    fn push_current_frame(&mut self, tip: Option<String>) {
+    fn push_current_frame(&mut self, tip: Option<Arc<TooltipDoc>>) {
         match self.win.render_frame() {
             Some(f) => {
                 let (sx, sy, w, h, scale, soft, absolute) = (
@@ -694,12 +720,16 @@ impl Forwarder {
                 ));
                 self.sink.push_frame(&encode_candidate_rects(&rects));
                 match &tip {
-                    Some(t) => self.sink.push_frame(&encode_tooltip_show(
-                        t,
-                        &self.tips.tooltip_bg,
-                        &self.tips.tooltip_fg,
-                        &self.chaizi_font,
-                    )),
+                    Some(doc) => {
+                        let (text, runs) = self.tooltip_payload(doc);
+                        self.sink.push_frame(&encode_tooltip_show(
+                            &text,
+                            &self.tips.tooltip_bg,
+                            &self.tips.tooltip_fg,
+                            &self.chaizi_font,
+                            &runs,
+                        ))
+                    }
                     None => self.sink.push_frame(&encode_tooltip_hide()),
                 }
                 self.visible = true;
@@ -719,6 +749,34 @@ impl Forwarder {
                 self.hide_frame();
             }
         }
+    }
+
+    /// 气泡的纯文本 + 按当前主题现算的分段颜色（UTF-16 区间，直接当 `NSRange`）。
+    ///
+    /// 正文色兜底与 `SetTheme` 里下发的 `tooltip_fg` 同源（palette `tooltip_text` → 节点文字色，
+    /// 编译期默认同 `node_colors` 的兜底）；等于正文色的区间已丢弃，出厂下恒为空。
+    fn tooltip_payload(&self, doc: &TooltipDoc) -> (String, Vec<TooltipColorRun>) {
+        let styled = doc.to_styled();
+        let runs = match &self.theme {
+            Some(t) => {
+                let default_node = wind_theme::RvNode::default();
+                let node = t.views.tooltip.as_ref().unwrap_or(&default_node);
+                let runs = crate::span_runs::color_runs(
+                    t,
+                    node,
+                    true,
+                    wind_theme::TextState::Normal,
+                    t.color("tooltip_text", [240, 240, 245, 255]),
+                    &styled,
+                );
+                crate::text::dwrite::utf16_runs(styled.as_str(), &runs)
+                    .into_iter()
+                    .map(|(start, len, rgba)| TooltipColorRun { start, len, rgba })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        (styled.into_string(), runs)
     }
 
     fn hide_frame(&mut self) {
@@ -773,7 +831,7 @@ mod tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -1165,12 +1223,8 @@ mod tests {
             x: 10,
             y: 20,
             caret_height: 18,
-            offset_x: 3,
-            offset_y: 4,
             duration_ms: 1000,
-            fixed: true,
-            fixed_x: 500,
-            fixed_y: 600,
+            placement: StatusTipPlacement::Fixed { x: 500, y: 600 },
         });
         let v = cap.lock().unwrap();
         let fr = v
@@ -1188,6 +1242,10 @@ mod tests {
             i32::from_le_bytes(fr[off + 4..off + 8].try_into().unwrap()),
             600
         ); // fixed_y
+        assert_eq!(
+            i32::from_le_bytes(fr[off + 12..off + 16].try_into().unwrap()),
+            status_anchor::NONE
+        );
     }
 
     #[test]
@@ -1199,12 +1257,11 @@ mod tests {
             x: 10,
             y: 20,
             caret_height: 0,
-            offset_x: 3,
-            offset_y: 4,
             duration_ms: 0,
-            fixed: false,
-            fixed_x: 0,
-            fixed_y: 0,
+            placement: StatusTipPlacement::Caret {
+                offset_x: 3,
+                offset_y: 4,
+            },
         });
         let v = cap.lock().unwrap();
         let fr = v
@@ -1218,6 +1275,36 @@ mod tests {
             i32::from_le_bytes(fr[off + 4..off + 8].try_into().unwrap()),
             24
         ); // 20+4
+    }
+
+    /// 锚点：编码随帧下发，(x,y) 是光标底端（选屏参考），不叠加用户偏移。
+    #[test]
+    fn status_tip_anchor_is_encoded() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t5a");
+        f.handle(UiCommand::ShowStatusTip {
+            text: "x".into(),
+            x: 10,
+            y: 20,
+            caret_height: 18,
+            duration_ms: 0,
+            placement: StatusTipPlacement::Anchor(StatusTipAnchor::WindowBottomLeft),
+        });
+        let v = cap.lock().unwrap();
+        let fr = v
+            .iter()
+            .find(|x| cmd_of(x) == wind_ipc::protocol::CMD_STATUS_SHOW)
+            .unwrap();
+        let off = 8 + 13;
+        assert_eq!(i32::from_le_bytes(fr[off..off + 4].try_into().unwrap()), 10);
+        assert_eq!(
+            i32::from_le_bytes(fr[off + 4..off + 8].try_into().unwrap()),
+            38
+        );
+        assert_eq!(
+            i32::from_le_bytes(fr[off + 12..off + 16].try_into().unwrap()),
+            status_anchor::WINDOW_BOTTOM_LEFT
+        );
     }
 
     #[test]
@@ -1262,5 +1349,107 @@ mod tests {
             v.iter()
                 .any(|x| cmd_of(x) == wind_ipc::protocol::CMD_MODE_STATUS)
         ); // HideToolbar → mode_status
+    }
+
+    /// 气泡的分段颜色随帧下发，且按**推送时**的主题现算：换明暗后重推，颜色跟着换。
+    #[test]
+    fn tooltip_runs_are_recomputed_on_theme_change() {
+        use wind_ui_types::{SpanStyle, StyledText, TooltipDoc, TooltipLine, TooltipSection};
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_runs");
+        // `error` 在气泡里先查 `tooltip_error`（§6.2 作用域查找），两档各给一个值。
+        let theme = |dark: bool| {
+            let mut palette = std::collections::HashMap::new();
+            palette.insert("error".to_string(), [1, 1, 1, 255]);
+            palette.insert(
+                "tooltip_error".to_string(),
+                if dark { [3, 3, 3, 255] } else { [2, 2, 2, 255] },
+            );
+            Box::new(wind_theme::Resolved {
+                is_dark: dark,
+                palette,
+                ..Default::default()
+            })
+        };
+        f.handle(UiCommand::SetTheme(theme(false)));
+        // 「你：nǐ !」里 `nǐ` 带亮 / 暗两色的字面内联色，`!` 带名字写的内联色 `error`。
+        let mut text = StyledText::from("你：");
+        text.push(
+            "nǐ",
+            &SpanStyle {
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(
+                    "#C00000/#FF8080",
+                ))),
+                ..Default::default()
+            },
+        );
+        text.push(" ", &SpanStyle::default());
+        text.push(
+            "!",
+            &SpanStyle {
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse("error"))),
+                ..Default::default()
+            },
+        );
+        let mut cand = item("你");
+        cand.tooltip = Arc::new(TooltipDoc {
+            sections: vec![TooltipSection {
+                title: None,
+                inline: false,
+                lines: vec![TooltipLine { text, raw: 0 }],
+            }],
+        });
+        f.handle(UiCommand::UpdateCandidates {
+            preedit: "a".into(),
+            preedit_caret: 1,
+            preedit_host_owned: false,
+            mode_label: "".into(),
+            candidates: vec![cand],
+            selected: 0,
+            hover: 0,
+            page: 1,
+            total_pages: 1,
+            caret_x: 100,
+            caret_y: 200,
+            caret_height: 20,
+            caret_valid: true,
+            fixed: false,
+            fixed_x: 0,
+            fixed_y: 0,
+        });
+        // 取最后一帧 tooltip 的 runs 尾段：(start, len, rgba)。
+        let last_runs = |cap: &Arc<Mutex<Vec<Vec<u8>>>>| -> Vec<(u32, u32, [u8; 4])> {
+            let v = cap.lock().unwrap();
+            let fr = v
+                .iter()
+                .rev()
+                .find(|f| cmd_of(f) == CMD_TOOLTIP_SHOW)
+                .expect("应推出气泡");
+            let p = &fr[8..];
+            let mut off = 0usize;
+            for _ in 0..4 {
+                let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
+                off += 4 + n;
+            }
+            let u = |i: usize| u32::from_le_bytes(p[i..i + 4].try_into().unwrap());
+            (0..u(off) as usize)
+                .map(|k| {
+                    let b = off + 4 + k * 12;
+                    (u(b), u(b + 4), p[b + 8..b + 12].try_into().unwrap())
+                })
+                .collect()
+        };
+        // 「你：」是 2 个 UTF-16 码元，`nǐ` 从 2 起、长 2。
+        assert_eq!(
+            last_runs(&cap),
+            vec![(2, 2, [0xC0, 0, 0, 255]), (5, 1, [2, 2, 2, 255])],
+            "名字写的颜色在气泡里取 tooltip_error 而不是 error"
+        );
+        f.handle(UiCommand::SetTheme(theme(true)));
+        assert_eq!(
+            last_runs(&cap),
+            vec![(2, 2, [0xFF, 0x80, 0x80, 255]), (5, 1, [3, 3, 3, 255])],
+            "换明暗重推的气泡必须按新主题现算颜色"
+        );
     }
 }

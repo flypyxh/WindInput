@@ -69,6 +69,59 @@ impl<'a> TextStyle<'a> {
     }
 }
 
+/// 分段颜色的一段：文本里 `[start, end)` 这段字节区间改用 `rgba`（`[R, G, B, A]`）画。
+///
+/// **只作用于绘制，不参与测量**——整串仍一次整形，理由同 `View::caret_at`：拆开各自排版会让
+/// 宽度随着色边界抖动。三个后端都按这条实现：DirectWrite 用 drawing effect（格式属性，
+/// 不参与整形），CoreText 整形一次后按字形子区间换填充色。
+///
+/// 区间须落在字符边界上、互不重叠；不满足的区间被后端丢弃（见 [`utf16_runs`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorRun {
+    pub start: u32,
+    pub end: u32,
+    pub rgba: [u8; 4],
+}
+
+impl ColorRun {
+    /// 取 `runs` 落在 `[start, end)` 内的部分，并平移成以 `start` 为 0 的偏移。
+    ///
+    /// 直立态把一段文字逐格切成多个叶子（`candidate_window::upright_text`），每格只拿
+    /// 属于自己的那几段颜色。
+    pub fn slice(runs: &[ColorRun], start: usize, end: usize) -> Vec<ColorRun> {
+        let (s, e) = (start as u32, end as u32);
+        runs.iter()
+            .filter_map(|r| {
+                let (a, b) = (r.start.max(s), r.end.min(e));
+                (a < b).then(|| ColorRun {
+                    start: a - s,
+                    end: b - s,
+                    rgba: r.rgba,
+                })
+            })
+            .collect()
+    }
+}
+
+/// 把字节区间的 [`ColorRun`] 换算成 UTF-16 码元区间 `(起点, 长度, 颜色)`——DirectWrite 的
+/// `DWRITE_TEXT_RANGE` 与 CoreText 的 string index 都以 UTF-16 计（同 [`pua_runs`] 口径）。
+///
+/// 丢弃空区间、越界区间与不在字符边界上的区间：颜色只是装饰，坏区间让那段回落基色，
+/// 不该让整段文字画不出来。
+pub(crate) fn utf16_runs(text: &str, runs: &[ColorRun]) -> Vec<(u32, u32, [u8; 4])> {
+    let u16_at = |byte: usize| text[..byte].encode_utf16().count() as u32;
+    runs.iter()
+        .filter(|r| {
+            let (s, e) = (r.start as usize, r.end as usize);
+            s < e && e <= text.len() && text.is_char_boundary(s) && text.is_char_boundary(e)
+        })
+        .map(|r| {
+            let s = u16_at(r.start as usize);
+            (s, u16_at(r.end as usize) - s, r.rgba)
+        })
+        .collect()
+}
+
 /// 测量缓存容量上限；超过即整体清空。
 ///
 /// 不做 LRU：候选窗每帧的文本集合高度重复（同一批候选、序号、注释反复测量），
@@ -162,7 +215,7 @@ pub use imp::{GlyphRunFont, TextRenderer};
 /// Windows 实现（DirectWrite）。非 Windows 平台见文件末尾的 mock。
 #[cfg(windows)]
 mod imp {
-    use super::{MEASURE_CACHE_CAP, TextMetrics, TextStyle, measure_key};
+    use super::{ColorRun, MEASURE_CACHE_CAP, TextMetrics, TextStyle, measure_key};
     use crate::text::script::{FontPlan, font_runs};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -279,6 +332,9 @@ mod imp {
         /// 全局默认字重（`ui.font.weight`，或旧 GDI 字体名里带的字重）；0 = 常规 400。
         /// 承载在 TextFormat 上，叶子字重（主题节点 `font_weight`）非 0 时在 layout 层覆盖它。
         default_weight: i32,
+        /// 测试开关：让 [`Self::effect_key`] 恒错位（见其文档）。
+        #[cfg(test)]
+        pub(crate) break_effect_lookup: std::cell::Cell<bool>,
     }
 
     /// [`TextRenderer::line_heights`] 的键：(字号取整, 字重, base family)。
@@ -323,6 +379,8 @@ mod imp {
                     fallback: RefCell::new(None),
                     fallback_failed: std::cell::Cell::new(false),
                     default_weight: 0,
+                    #[cfg(test)]
+                    break_effect_lookup: std::cell::Cell::new(false),
                 })
             }
         }
@@ -905,6 +963,11 @@ mod imp {
         /// [`Self::create_layout`] 的全参版本。`uniform_spacing = false` 只给测试用：
         /// 回退链的那几条测试靠「哪款字体渲染了『中』」的**自然行高**做判据，钉了行距就
         /// 看不出来了；生产路径恒为 `true`。
+        ///
+        /// ⚠️ layout 目前**不缓存**：测量未命中与每次绘制各建一个，[`Self::draw_runs`] 的
+        /// drawing effect 只设在绘制那个一次性 layout 上、用完即弃。将来若给绘制加 layout
+        /// 缓存，effect 必须每次取出后重设、用后清掉，或带 effect 的 layout 不入缓存——否则
+        /// 上一帧的颜色会残留到下一帧同一段文字上。
         fn create_layout_with(
             &self,
             text: &str,
@@ -1224,10 +1287,8 @@ mod imp {
                 let bits = ds.dsBm.bmBits as *mut u8;
                 let dib = std::slice::from_raw_parts_mut(bits, stride * h);
 
-                // 颜色经 clientDrawingContext 透传给字形回调。
-                // 入参 color 约定为 [R,G,B,A]；COLORREF = 0x00BBGGRR。
-                let colorref: u32 =
-                    (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
+                // 颜色经 clientDrawingContext 透传给字形回调（整段一色：无 effect 表）。
+                let dc = DrawCtx::solid(colorref(color));
                 let layout = self.create_layout(text, ts, buf_width as f32, buf_height as f32)?;
 
                 // 关键优化：用文本度量算出包围盒，后续两遍逐像素操作只在盒内进行
@@ -1263,7 +1324,7 @@ mod imp {
                 // 2) 渲染文本（绝对坐标 x,y，不受 DIB 实际尺寸影响）。
                 layout
                     .Draw(
-                        Some(&colorref as *const u32 as *const c_void),
+                        Some(&dc as *const DrawCtx as *const c_void),
                         &surface.renderer,
                         x,
                         y,
@@ -1310,6 +1371,270 @@ mod imp {
             }
             Ok(())
         }
+
+        /// effect 在 [`DrawCtx`] 反查表里的键：它的 `IUnknown` 指针。测试可让它恒错位，
+        /// 模拟「运行时换了 effect 指针、反查全部失败」。
+        fn effect_key(&self, e: &windows::core::IUnknown) -> usize {
+            let p = e.as_raw() as usize;
+            #[cfg(test)]
+            if self.break_effect_lookup.get() {
+                return p ^ 1;
+            }
+            p
+        }
+
+        /// 分段着色绘制：`runs` 覆盖的区间改用各自的颜色，其余用 `color`。`runs` 为空（或全被
+        /// 判为非法区间）时就是 [`Self::draw`]——出厂路径一个字节都不变。
+        ///
+        /// # 按区间上色：drawing effect
+        ///
+        /// 每种颜色建一个 effect 对象、`SetDrawingEffect` 到它的区间；[`GlyphRenderer`] 的
+        /// `DrawGlyphRun` 拿到 effect 后按**指针身份**在 [`DrawCtx`] 的表里反查颜色。effect 是
+        /// 格式属性，不参与整形——带 effect 的 layout 与测量用的 layout 字形位置相同（像素测试
+        /// `span_color_tests` 钉住）。不必自定义 COM 接口：effect 只要是个活着的 `IUnknown`，
+        /// 这里借 `CreateTypography` 造一个最轻的对象，只活到本次绘制结束。
+        ///
+        /// # 按 alpha 分组、多遍绘制
+        ///
+        /// 文字 alpha 不交给 DirectWrite（`DrawGlyphRun` 只收不含 alpha 的 COLORREF），而是在
+        /// 回写时按 `fa` 与底色再混一次（见 [`Self::draw`] 步骤 3）；那一步已分不出哪个像素属于
+        /// 哪段。故按 alpha 分组，每组一遍 `Draw`（不属本组的字形在回调里跳过）。不透明色与
+        /// 基色同组，常见情形仍是一遍。
+        ///
+        /// ⚠️ 多遍时**不能**每遍都「拷底 → 预乘回写缓冲」：回写的是按窗口 alpha 预乘后的值，
+        /// 下一遍又把它当直通值拷进 DIB，半透明底（`_base` 气泡 `F0`）上已画的字会被二次预乘、
+        /// 发暗。做法：包围盒内的底先拷进一块直通值草稿区，各遍都在草稿区上「画 → 按本组 `fa`
+        /// 混合」累积，最后统一按窗口 alpha 预乘、回写缓冲**一次**。被任一遍改动过的像素才回写
+        /// ——单遍时与 [`Self::draw`] 的判据、算术逐字节相同。
+        #[allow(clippy::too_many_arguments)]
+        pub fn draw_runs(
+            &self,
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            ts: &TextStyle,
+            color: [u8; 4],
+            runs: &[ColorRun],
+        ) -> Result<(), String> {
+            let spans = super::utf16_runs(text, runs);
+            if spans.is_empty() {
+                return self.draw(buf, buf_width, buf_height, x, y, text, ts, color);
+            }
+            if buf_width == 0 || buf_height == 0 {
+                return Ok(());
+            }
+            let w = buf_width as usize;
+            let h = buf_height as usize;
+            if buf.len() < w * h * 4 {
+                return Err("buffer too small".into());
+            }
+
+            self.ensure_surface(buf_width, buf_height)?;
+            let surface = self.surface.borrow();
+            let surface = surface.as_ref().ok_or("no surface")?;
+
+            unsafe {
+                let memdc = surface.target.GetMemoryDC();
+                let hbmp = GetCurrentObject(memdc, OBJ_BITMAP);
+                let mut ds = DIBSECTION::default();
+                let n = GetObjectW(
+                    hbmp,
+                    std::mem::size_of::<DIBSECTION>() as i32,
+                    Some(&mut ds as *mut _ as *mut c_void),
+                );
+                if n == 0 || ds.dsBm.bmBits.is_null() {
+                    return Err("GetObjectW(DIBSECTION) failed".into());
+                }
+                let stride = ds.dsBm.bmWidthBytes as usize;
+                let dib = std::slice::from_raw_parts_mut(ds.dsBm.bmBits as *mut u8, stride * h);
+
+                let layout = self.create_layout(text, ts, buf_width as f32, buf_height as f32)?;
+                // 每种颜色一个 effect；同色区间共用，分组与反查都按颜色而非区间。
+                let mut colors: Vec<[u8; 4]> = Vec::new();
+                let mut effects: Vec<windows::core::IUnknown> = Vec::new();
+                let total = text.encode_utf16().count();
+                let mut covered = vec![false; total];
+                for &(start, len, rgba) in &spans {
+                    let i = match colors.iter().position(|c| *c == rgba) {
+                        Some(i) => i,
+                        None => {
+                            let e = self
+                                .factory
+                                .CreateTypography()
+                                .and_then(|t| t.cast::<windows::core::IUnknown>())
+                                .map_err(|e| format!("CreateTypography: {e}"))?;
+                            colors.push(rgba);
+                            effects.push(e);
+                            colors.len() - 1
+                        }
+                    };
+                    let range = DWRITE_TEXT_RANGE {
+                        startPosition: start,
+                        length: len,
+                    };
+                    layout
+                        .SetDrawingEffect(&effects[i], range)
+                        .map_err(|e| format!("SetDrawingEffect: {e}"))?;
+                    covered[start as usize..(start + len) as usize].fill(true);
+                }
+                // 没被任何区间覆盖的字形用基色；全覆盖时基色那组根本没有字形，不为它多画一遍。
+                let base_used = covered.iter().any(|c| !c);
+                let mut alphas: Vec<u8> = Vec::new();
+                for a in base_used
+                    .then_some(color[3])
+                    .into_iter()
+                    .chain(colors.iter().map(|c| c[3]))
+                {
+                    // alpha 0 的字画了也看不见：跳过，连「改动过」都不算，免得底色被预乘一次。
+                    if a > 0 && !alphas.contains(&a) {
+                        alphas.push(a);
+                    }
+                }
+
+                let mut tm = DWRITE_TEXT_METRICS::default();
+                let _ = layout.GetMetrics(&mut tm);
+                const MARGIN: f32 = 2.0;
+                let cx0 = (x + tm.left - MARGIN).floor().max(0.0) as usize;
+                let cy0 = (y + tm.top - MARGIN).floor().max(0.0) as usize;
+                let cx1 = (((x + tm.left + tm.widthIncludingTrailingWhitespace + MARGIN).ceil())
+                    .max(0.0) as usize)
+                    .min(w);
+                let cy1 = (((y + tm.top + tm.height + MARGIN).ceil()).max(0.0) as usize).min(h);
+                if cx0 >= cx1 || cy0 >= cy1 {
+                    return Ok(());
+                }
+                let bw = cx1 - cx0;
+
+                // 直通值草稿区（BGR）：初值取 buf 现值，与 [`Self::draw`] 步骤 1 同一口径。
+                let mut scratch = vec![0u8; bw * (cy1 - cy0) * 3];
+                let mut touched = vec![false; bw * (cy1 - cy0)];
+                for row in cy0..cy1 {
+                    for col in cx0..cx1 {
+                        let s = (row * w + col) * 4;
+                        let k = ((row - cy0) * bw + col - cx0) * 3;
+                        scratch[k..k + 3].copy_from_slice(&buf[s..s + 3]);
+                    }
+                }
+
+                for (pass, &a) in alphas.iter().enumerate() {
+                    // 1) 草稿区按不透明拷进 DIB。
+                    for row in cy0..cy1 {
+                        for col in cx0..cx1 {
+                            let d = row * stride + col * 4;
+                            let k = ((row - cy0) * bw + col - cx0) * 3;
+                            dib[d..d + 3].copy_from_slice(&scratch[k..k + 3]);
+                            dib[d + 3] = 255;
+                        }
+                    }
+                    // 2) 只画本组的字形。
+                    let dc = DrawCtx {
+                        base: colorref(color),
+                        base_on: base_used && color[3] == a,
+                        fallback_on: pass == 0,
+                        effects: colors
+                            .iter()
+                            .zip(&effects)
+                            .map(|(c, e)| (self.effect_key(e), colorref(*c), c[3] == a))
+                            .collect(),
+                    };
+                    layout
+                        .Draw(
+                            Some(&dc as *const DrawCtx as *const c_void),
+                            &surface.renderer,
+                            x,
+                            y,
+                        )
+                        .map_err(|e| format!("TextLayout::Draw: {e}"))?;
+                    // 3) 按本组 fa 混进草稿区（仍是直通值），记下改动过的像素。
+                    let fa = a as u32;
+                    let mix = |n: u8, b: u8| ((n as u32 * fa + b as u32 * (255 - fa)) / 255) as u8;
+                    for row in cy0..cy1 {
+                        for col in cx0..cx1 {
+                            let d = row * stride + col * 4;
+                            let i = (row - cy0) * bw + col - cx0;
+                            let k = i * 3;
+                            if dib[d..d + 3] == scratch[k..k + 3] {
+                                continue;
+                            }
+                            for c in 0..3 {
+                                scratch[k + c] = mix(dib[d + c], scratch[k + c]);
+                            }
+                            touched[i] = true;
+                        }
+                    }
+                }
+
+                // 4) 统一按窗口 alpha 预乘、回写一次。
+                for row in cy0..cy1 {
+                    for col in cx0..cx1 {
+                        let i = (row - cy0) * bw + col - cx0;
+                        if !touched[i] {
+                            continue;
+                        }
+                        let s = (row * w + col) * 4;
+                        let a = buf[s + 3] as u32;
+                        for c in 0..3 {
+                            buf[s + c] = (scratch[i * 3 + c] as u32 * a / 255) as u8;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// 入参色 `[R,G,B,A]` → GDI COLORREF（0x00BBGGRR，丢 alpha：alpha 由回写时混合处理）。
+    fn colorref(c: [u8; 4]) -> u32 {
+        (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16)
+    }
+
+    /// 一次 `Draw` 的颜色表，经 `clientDrawingContext` 交给 [`GlyphRenderer`]。
+    ///
+    /// 颜色不存于渲染器对象内（它按表面尺寸缓存、跨绘制复用），而是每次绘制现传，避免可变状态。
+    struct DrawCtx {
+        /// 没有 drawing effect 的字形用的颜色（COLORREF）。
+        base: u32,
+        /// 本遍画不画基色字形（多遍绘制按 alpha 分组，见 [`TextRenderer::draw_runs`]）。
+        base_on: bool,
+        /// 反查不到的 effect 本遍画不画（按基色）。只在第一遍为真：区间全覆盖时基色那组
+        /// 根本不存在，`base_on` 恒假，没有这一位的话反查失败的字形哪一遍都不画。
+        fallback_on: bool,
+        /// `(effect 的 IUnknown 指针, COLORREF, 本遍画不画)`，按指针身份反查。
+        effects: Vec<(usize, u32, bool)>,
+    }
+
+    impl DrawCtx {
+        /// 整段一色。
+        fn solid(colorref: u32) -> Self {
+            Self {
+                base: colorref,
+                base_on: true,
+                fallback_on: true,
+                effects: Vec::new(),
+            }
+        }
+
+        /// 某个字形段该用的颜色；`None` = 本遍不画它。
+        ///
+        /// 表里查不到的 effect（理论上不会出现：effect 只有 `draw_runs` 设；真出现了多半是
+        /// 运行时把 effect 包了一层、指针变了）按基色、在第一遍画，宁可颜色不对也不丢字。
+        ///
+        /// ⚠️ 第一遍是按**首个 alpha 组**混合的：基色的 alpha 与首组不同时（例如基色半透明、
+        /// 区间全覆盖且首组不透明），兜底画出的字用的是首组的 alpha，而不是基色自己的。
+        /// 这只影响「反查失败」这个本不该发生的兜底，不为它多画一遍。
+        fn pick(&self, effect: Option<&windows::core::IUnknown>) -> Option<u32> {
+            if let Some(e) = effect {
+                let p = e.as_raw() as usize;
+                return match self.effects.iter().find(|x| x.0 == p) {
+                    Some(&(_, c, on)) => on.then_some(c),
+                    None => self.fallback_on.then_some(self.base),
+                };
+            }
+            self.base_on.then_some(self.base)
+        }
     }
 
     /// DWRITE_COLOR_F（0..1 各通道）→ GDI COLORREF（0x00BBGGRR）。
@@ -1320,7 +1645,8 @@ mod imp {
     }
 
     /// 自定义字形渲染器：优先把字形拆成彩色层逐层着色（emoji），否则以文字色单色绘制。
-    /// 颜色不存于对象内，而是每次 Draw 经 clientDrawingContext 透传，避免可变状态。
+    /// 颜色不存于对象内，而是每次 Draw 经 clientDrawingContext 透传 [`DrawCtx`]，避免可变状态；
+    /// 彩色 emoji 的前景哨兵层同样取该字形段的颜色。
     #[implement(IDWriteTextRenderer)]
     struct GlyphRenderer {
         target: IDWriteBitmapRenderTarget,
@@ -1371,12 +1697,16 @@ mod imp {
             measuring_mode: DWRITE_MEASURING_MODE,
             glyph_run: *const DWRITE_GLYPH_RUN,
             desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-            _effect: Option<&windows::core::IUnknown>,
+            effect: Option<&windows::core::IUnknown>,
         ) -> windows::core::Result<()> {
             let colorref = if ctx.is_null() {
                 0u32
             } else {
-                unsafe { *(ctx as *const u32) }
+                // 不属于本遍的字形段直接跳过（多遍按 alpha 分组，见 `TextRenderer::draw_runs`）。
+                match unsafe { &*(ctx as *const DrawCtx) }.pick(effect) {
+                    Some(c) => c,
+                    None => return Ok(()),
+                }
             };
 
             // 优先：把字形拆成彩色层（COLR/CPAL，如 emoji）逐层着色叠加。
@@ -1676,6 +2006,130 @@ mod imp {
             );
         }
     }
+
+    /// wine 与真 Windows 的 DirectWrite 都得把 drawing effect 原样传进 `DrawGlyphRun`，
+    /// 且按 effect 边界切开字形段——[`TextRenderer::draw_runs`] 整个建立在这一点上。
+    ///
+    /// 断言落在**指针身份**上：反查表按 `as_raw()` 比对，若运行时把 effect 包了一层或
+    /// QueryInterface 出另一个指针，颜色会整段退回基色而不报错。本仓 2026-09-27 在
+    /// wine 9.0 上实测通过（effect 原样传入，两段各 2 个字形）。
+    #[cfg(test)]
+    mod effect_passthrough_tests {
+        use super::*;
+
+        /// 只记 `(字形数, effect 指针)` 的渲染器。
+        #[implement(IDWriteTextRenderer)]
+        #[derive(Default)]
+        struct EffectRecorder {
+            seen: std::rc::Rc<RefCell<Vec<(u32, usize)>>>,
+        }
+
+        #[allow(non_snake_case)]
+        impl IDWritePixelSnapping_Impl for EffectRecorder_Impl {
+            fn IsPixelSnappingDisabled(&self, _ctx: *const c_void) -> windows::core::Result<BOOL> {
+                Ok(FALSE)
+            }
+            fn GetCurrentTransform(
+                &self,
+                _ctx: *const c_void,
+                transform: *mut DWRITE_MATRIX,
+            ) -> windows::core::Result<()> {
+                unsafe {
+                    if !transform.is_null() {
+                        *transform = DWRITE_MATRIX {
+                            m11: 1.0,
+                            m22: 1.0,
+                            ..Default::default()
+                        };
+                    }
+                }
+                Ok(())
+            }
+            fn GetPixelsPerDip(&self, _ctx: *const c_void) -> windows::core::Result<f32> {
+                Ok(1.0)
+            }
+        }
+
+        #[allow(non_snake_case)]
+        impl IDWriteTextRenderer_Impl for EffectRecorder_Impl {
+            fn DrawGlyphRun(
+                &self,
+                _ctx: *const c_void,
+                _x: f32,
+                _y: f32,
+                _mode: DWRITE_MEASURING_MODE,
+                glyph_run: *const DWRITE_GLYPH_RUN,
+                _desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+                effect: Option<&windows::core::IUnknown>,
+            ) -> windows::core::Result<()> {
+                let n = unsafe { glyph_run.as_ref() }.map_or(0, |r| r.glyphCount);
+                let p = effect.map_or(0, |e| e.as_raw() as usize);
+                self.seen.borrow_mut().push((n, p));
+                Ok(())
+            }
+            fn DrawUnderline(
+                &self,
+                _ctx: *const c_void,
+                _x: f32,
+                _y: f32,
+                _u: *const DWRITE_UNDERLINE,
+                _effect: Option<&windows::core::IUnknown>,
+            ) -> windows::core::Result<()> {
+                Ok(())
+            }
+            fn DrawStrikethrough(
+                &self,
+                _ctx: *const c_void,
+                _x: f32,
+                _y: f32,
+                _s: *const DWRITE_STRIKETHROUGH,
+                _effect: Option<&windows::core::IUnknown>,
+            ) -> windows::core::Result<()> {
+                Ok(())
+            }
+            fn DrawInlineObject(
+                &self,
+                _ctx: *const c_void,
+                _x: f32,
+                _y: f32,
+                _obj: Option<&IDWriteInlineObject>,
+                _sideways: BOOL,
+                _rtl: BOOL,
+                _effect: Option<&windows::core::IUnknown>,
+            ) -> windows::core::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn effect_reaches_draw_glyph_run_by_identity() {
+            let r = TextRenderer::new("Microsoft YaHei UI", 16.0).expect("建 TextRenderer");
+            let layout = r
+                .create_layout("abcd", &TextStyle::new(16.0), 500.0, 100.0)
+                .expect("create_layout");
+            let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+            let (p1, p2) = unsafe {
+                let mk = || -> windows::core::IUnknown {
+                    r.factory.CreateTypography().unwrap().cast().unwrap()
+                };
+                let (e1, e2) = (mk(), mk());
+                let range = |s: u32| DWRITE_TEXT_RANGE {
+                    startPosition: s,
+                    length: 2,
+                };
+                layout.SetDrawingEffect(&e1, range(0)).unwrap();
+                layout.SetDrawingEffect(&e2, range(2)).unwrap();
+                let rec: IDWriteTextRenderer = EffectRecorder { seen: seen.clone() }.into();
+                layout.Draw(None, &rec, 0.0, 0.0).unwrap();
+                (e1.as_raw() as usize, e2.as_raw() as usize)
+            };
+            assert_eq!(
+                *seen.borrow(),
+                vec![(2, p1), (2, p2)],
+                "effect 应原样（同一指针）传进 DrawGlyphRun，且在 effect 边界切开字形段"
+            );
+        }
+    }
 } // mod imp (windows)
 
 // macOS：真字形渲染走 CoreText（text/coretext.rs），re-export 为本模块的 TextRenderer。
@@ -1690,7 +2144,7 @@ pub use imp::TextRenderer;
 /// 让候选窗/工具栏/菜单等布局逻辑能在 Linux 上编译与跑测试。
 #[cfg(all(not(windows), not(target_os = "macos")))]
 mod imp {
-    use super::{TextMetrics, TextStyle};
+    use super::{ColorRun, TextMetrics, TextStyle};
     use crate::text::script::FontPlan;
 
     pub struct TextRenderer {
@@ -1706,6 +2160,12 @@ mod imp {
         family: String,
         /// 最近一次 [`Self::set_default_weight`] 设进来的字重（接线测试读回）。
         default_weight: i32,
+        /// 绘制调用记录（每次 draw 一行），供渲染 golden 对拍。见 [`Self::take_draw_log`]。
+        ///
+        /// mock 不出像素，「画了什么、画在哪、用什么色」就只剩这份记录能对拍；只在测试构建
+        /// 存在，生产路径（Linux 本就没有真实渲染）不付任何代价。
+        #[cfg(test)]
+        draw_log: std::cell::RefCell<Vec<String>>,
     }
 
     impl TextRenderer {
@@ -1717,7 +2177,15 @@ mod imp {
                 mock_families: None,
                 family: String::new(),
                 default_weight: 0,
+                #[cfg(test)]
+                draw_log: std::cell::RefCell::new(Vec::new()),
             })
+        }
+
+        /// 取走至今的绘制调用记录（取后清空）。
+        #[cfg(test)]
+        pub fn take_draw_log(&self) -> Vec<String> {
+            std::mem::take(&mut *self.draw_log.borrow_mut())
         }
 
         /// 测试用：声明 mock 的「系统字体集」。之后 `family_exists` 按它回答 `Some(..)`。
@@ -1813,45 +2281,99 @@ mod imp {
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text(
             &self,
-            _buf: &mut [u8],
-            _buf_width: u32,
-            _buf_height: u32,
-            _x: f32,
-            _y: f32,
-            _text: &str,
-            _color: [u8; 4],
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            color: [u8; 4],
         ) -> Result<(), String> {
-            Ok(())
+            self.draw_text_sized(
+                buf,
+                buf_width,
+                buf_height,
+                x,
+                y,
+                text,
+                self.font_size,
+                color,
+            )
         }
 
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text_sized(
             &self,
-            _buf: &mut [u8],
-            _buf_width: u32,
-            _buf_height: u32,
-            _x: f32,
-            _y: f32,
-            _text: &str,
-            _size: f32,
-            _color: [u8; 4],
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            size: f32,
+            color: [u8; 4],
         ) -> Result<(), String> {
-            Ok(())
+            self.draw(
+                buf,
+                buf_width,
+                buf_height,
+                x,
+                y,
+                text,
+                &TextStyle::new(size),
+                color,
+            )
         }
 
-        /// mock：绘制空操作（样式忽略）。
+        /// mock：不出像素（样式忽略）；测试构建下记一行绘制调用。
         #[allow(clippy::too_many_arguments)]
+        #[cfg_attr(not(test), allow(unused_variables))]
         pub fn draw(
             &self,
             _buf: &mut [u8],
             _buf_width: u32,
             _buf_height: u32,
-            _x: f32,
-            _y: f32,
-            _text: &str,
-            _ts: &TextStyle,
-            _color: [u8; 4],
+            x: f32,
+            y: f32,
+            text: &str,
+            ts: &TextStyle,
+            color: [u8; 4],
         ) -> Result<(), String> {
+            #[cfg(test)]
+            self.draw_log.borrow_mut().push(format!(
+                "draw text={text:?} at=({x:?},{y:?}) size={:?} weight={} family={:?} \
+                 color={color:?}",
+                ts.size, ts.weight, ts.family,
+            ));
+            Ok(())
+        }
+
+        /// mock：同 [`Self::draw`] 不出像素。与真实后端同一口径先过 [`super::utf16_runs`]：
+        /// 没有合法区间时就是 `draw`（记录也与之逐字相同），否则记一行 `draw_runs`——golden
+        /// 据此断言出厂路径「没有任何调用走 runs」。
+        #[allow(clippy::too_many_arguments)]
+        #[cfg_attr(not(test), allow(unused_variables))]
+        pub fn draw_runs(
+            &self,
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            ts: &TextStyle,
+            color: [u8; 4],
+            runs: &[ColorRun],
+        ) -> Result<(), String> {
+            if super::utf16_runs(text, runs).is_empty() {
+                return self.draw(buf, buf_width, buf_height, x, y, text, ts, color);
+            }
+            #[cfg(test)]
+            self.draw_log.borrow_mut().push(format!(
+                "draw_runs text={text:?} at=({x:?},{y:?}) size={:?} weight={} family={:?} \
+                 color={color:?} runs={runs:?}",
+                ts.size, ts.weight, ts.family,
+            ));
             Ok(())
         }
     }
@@ -2037,6 +2559,250 @@ mod alpha_text_tests {
     }
 }
 
+// 分段着色的**像素级**验证（设计 text-span-colors.md §13.2 P1）：需要真实 DirectWrite 出字形，
+// gate 到 Windows。wine 9.0 的 DirectWrite 会把 drawing effect 传进回调（见
+// `imp::effect_passthrough_tests`），故本组在 Linux 上可经 `cargo xwin test` + wine 跑
+// （wine 下须 `--test-threads=1`：多线程并发建 COM 工厂会让 wine 进程异常退出）。
+#[cfg(all(test, windows))]
+mod span_color_tests {
+    use super::{ColorRun, TextRenderer, TextStyle};
+
+    const W: u32 = 200;
+    const H: u32 = 60;
+    const SIZE: f32 = 32.0;
+    const RED: [u8; 4] = [220, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 220, 255];
+
+    fn tr() -> TextRenderer {
+        TextRenderer::new("Microsoft YaHei UI", SIZE).expect("建 TextRenderer")
+    }
+
+    fn ts() -> TextStyle<'static> {
+        TextStyle::new(SIZE)
+    }
+
+    /// 整块填同一个 BGRA 预乘像素。
+    fn canvas(px: [u8; 4]) -> Vec<u8> {
+        px.repeat((W * H) as usize)
+    }
+
+    fn run(start: u32, end: u32, rgba: [u8; 4]) -> ColorRun {
+        ColorRun { start, end, rgba }
+    }
+
+    fn draw_runs(r: &TextRenderer, buf: &mut [u8], x: f32, text: &str, runs: &[ColorRun]) {
+        r.draw_runs(buf, W, H, x, 4.0, text, &ts(), [0, 0, 0, 255], runs)
+            .expect("draw_runs");
+    }
+
+    /// 两块缓冲里不同的像素下标。
+    fn diff_px(a: &[u8], b: &[u8]) -> Vec<usize> {
+        (0..(W * H) as usize)
+            .filter(|&i| a[i * 4..i * 4 + 4] != b[i * 4..i * 4 + 4])
+            .collect()
+    }
+
+    /// ① 非空：画了东西。后面几条「相等」断言在什么都没画时会平凡成立，先把这条钉住。
+    #[test]
+    fn draw_runs_changes_pixels() {
+        let r = tr();
+        let bg = canvas([255, 255, 255, 255]);
+        let mut buf = bg.clone();
+        draw_runs(
+            &r,
+            &mut buf,
+            4.0,
+            "abcd",
+            &[run(0, 2, RED), run(2, 4, BLUE)],
+        );
+        assert!(!diff_px(&bg, &buf).is_empty(), "draw_runs 应改动像素");
+    }
+
+    /// ② 多个 effect 全取基色 ⇒ 与不带 effect 的 `draw` 逐字节相同，不透明底与半透明底都比。
+    ///
+    /// 区间边界落在空格上：effect 会把一个字形段切成几段分别光栅化，相邻两字的抗锯齿边若
+    /// 落进同一像素，「一段一次混合」与「两段先后混合」在那一个像素上可以差 1——那是
+    /// DirectWrite 自身的分段行为，不是本实现要守的东西。空格隔开后字形墨迹互不相邻。
+    #[test]
+    fn base_color_effects_equal_plain_draw() {
+        let r = tr();
+        let text = "ab cd ef";
+        let black = [0, 0, 0, 255];
+        for bg_px in [[255, 255, 255, 255], [90, 90, 90, 200]] {
+            let mut plain = canvas(bg_px);
+            r.draw(&mut plain, W, H, 4.0, 4.0, text, &ts(), black)
+                .expect("draw");
+            let mut runs = canvas(bg_px);
+            draw_runs(
+                &r,
+                &mut runs,
+                4.0,
+                text,
+                &[run(0, 2, black), run(3, 5, black), run(6, 8, black)],
+            );
+            assert!(!diff_px(&canvas(bg_px), &plain).is_empty(), "应画出字形");
+            assert_eq!(
+                diff_px(&plain, &runs),
+                Vec::<usize>::new(),
+                "底色 {bg_px:?}：全取基色的 effect 必须与无 effect 逐字节相同"
+            );
+        }
+    }
+
+    /// ③ 色相：红 `ab` + 蓝 `cd`，各自字形的 x 区间内，改动像素以本段颜色为主。
+    ///
+    /// 这条挡的是「effect 设上了但颜色反查错位 / 全退回基色」——那种情况下两半同色，
+    /// ①②都照样绿。
+    #[test]
+    fn each_run_is_drawn_in_its_own_hue() {
+        let r = tr();
+        let x0 = 4.0;
+        let split = x0 + r.measure("ab", &ts()).width;
+        let bg = canvas([255, 255, 255, 255]);
+        let mut buf = bg.clone();
+        draw_runs(&r, &mut buf, x0, "abcd", &[run(0, 2, RED), run(2, 4, BLUE)]);
+        // (偏红, 偏蓝) 像素数，按左右半分开。BGRA：[0]=B、[2]=R。
+        let (mut left, mut right) = ((0, 0), (0, 0));
+        for i in diff_px(&bg, &buf) {
+            let (b, red) = (buf[i * 4] as i32, buf[i * 4 + 2] as i32);
+            let side = if ((i as u32 % W) as f32) < split {
+                &mut left
+            } else {
+                &mut right
+            };
+            if red > b + 30 {
+                side.0 += 1;
+            } else if b > red + 30 {
+                side.1 += 1;
+            }
+        }
+        assert!(
+            left.0 > 20 && left.0 > left.1 * 4,
+            "左半（红段）应以红为主：红 {} 蓝 {}",
+            left.0,
+            left.1
+        );
+        assert!(
+            right.1 > 20 && right.1 > right.0 * 4,
+            "右半（蓝段）应以蓝为主：红 {} 蓝 {}",
+            right.0,
+            right.1
+        );
+    }
+
+    /// ④ 半透明底 + 两种 alpha：多遍绘制 ≡ 「逐段单独画在不透明底上、合成后再统一预乘一次」。
+    ///
+    /// 守的是 `draw_runs` 文档里的二次预乘：每遍都「拷底 → 预乘回写」的实现，下一遍会把
+    /// 已预乘的字当直通值再混一次。参照全程在不透明底（预乘即直通）上合成，最后一次性
+    /// 按窗口 alpha 预乘，不经过这个坑。
+    ///
+    /// 底取「半透明黑」：预乘值恒为 0，参照里「被改动过」与「终值 ≠ 底」两种判据重合，
+    /// 比对可以逐字节。
+    ///
+    /// 二次预乘只在「后一遍碰到前一遍的像素」处显形，没有这种像素本用例就测不出东西，
+    /// 故先断言它存在，再断言错误做法确实会被抓到。文本取 `_j`：`j` 的下伸部回勾到
+    /// 下划线底下，墨迹必然相交。别换成「两个全块字紧挨着、从半像素起画」——wine 的
+    /// DirectWrite 不做抗锯齿，字形按整像素落位，那样一个共同像素都没有（实测）。
+    #[test]
+    fn multi_pass_equals_per_run_composite() {
+        let r = tr();
+        let text = "_j";
+        let x0 = 4.0;
+        let red_half = [220, 0, 0, 128];
+        let hide = |c: [u8; 4]| [c[0], c[1], c[2], 0];
+        let only_a = [run(0, 1, red_half), run(1, 2, hide(BLUE))];
+        let only_c = [run(0, 1, hide(red_half)), run(1, 2, BLUE)];
+        let both = [run(0, 1, red_half), run(1, 2, BLUE)];
+
+        // 参照：不透明黑底上先画 A、再在其上画 C，然后统一按 alpha 128 预乘。
+        let opaque = canvas([0, 0, 0, 255]);
+        let mut comp = opaque.clone();
+        draw_runs(&r, &mut comp, x0, text, &only_a);
+        draw_runs(&r, &mut comp, x0, text, &only_c);
+        let translucent = canvas([0, 0, 0, 128]);
+        let mut expected = translucent.clone();
+        for i in diff_px(&opaque, &comp) {
+            for c in 0..3 {
+                expected[i * 4 + c] = (comp[i * 4 + c] as u32 * 128 / 255) as u8;
+            }
+        }
+
+        // 前提：两段确有共同覆盖的像素。
+        let mut a_alone = opaque.clone();
+        draw_runs(&r, &mut a_alone, x0, text, &only_a);
+        let mut c_alone = opaque.clone();
+        draw_runs(&r, &mut c_alone, x0, text, &only_c);
+        let a_px = diff_px(&opaque, &a_alone);
+        let shared = diff_px(&opaque, &c_alone)
+            .into_iter()
+            .filter(|i| a_px.contains(i))
+            .count();
+        assert!(shared > 0, "两段应有共同覆盖的像素，否则测不出二次预乘");
+
+        let mut got = translucent.clone();
+        draw_runs(&r, &mut got, x0, text, &both);
+        assert_eq!(
+            diff_px(&expected, &got),
+            Vec::<usize>::new(),
+            "多遍绘制应等于逐段合成后统一预乘一次"
+        );
+
+        // 错误做法（每遍各自预乘回写）确实会被本用例抓到。
+        let mut naive = translucent.clone();
+        draw_runs(&r, &mut naive, x0, text, &only_a);
+        draw_runs(&r, &mut naive, x0, text, &only_c);
+        assert!(
+            !diff_px(&expected, &naive).is_empty(),
+            "逐遍预乘回写的错误做法应与参照不同，否则本用例没有鉴别力"
+        );
+    }
+
+    /// effect 反查全部失败（运行时换了指针）且区间全覆盖时，字仍按基色画出来。
+    ///
+    /// 全覆盖时基色那组不存在，只靠「反查不到按基色」兜底；这条兜底若只挂在基色组上，
+    /// 整段文字会一个像素都不画——宁可颜色不对也不丢字。
+    #[test]
+    fn failed_effect_lookup_still_draws_in_base_color() {
+        let r = tr();
+        let text = "ab cd";
+        let black = [0, 0, 0, 255];
+        let bg = canvas([255, 255, 255, 255]);
+        let mut plain = bg.clone();
+        r.draw(&mut plain, W, H, 4.0, 4.0, text, &ts(), black)
+            .expect("draw");
+        r.break_effect_lookup.set(true);
+        let mut buf = bg.clone();
+        // 区间边界落在空格上，理由同 `base_color_effects_equal_plain_draw`。
+        draw_runs(&r, &mut buf, 4.0, text, &[run(0, 2, RED), run(2, 5, BLUE)]);
+        assert!(!diff_px(&bg, &buf).is_empty(), "反查失败时字不能丢");
+        // 判「按基色画」直接对拍整段基色的 draw：按色相判会被 ClearType 的彩边误伤
+        // （真 Windows 上黑字边缘本就偏红偏蓝）。
+        assert_eq!(
+            diff_px(&plain, &buf),
+            Vec::<usize>::new(),
+            "反查失败应按基色画，与整段基色的 draw 逐字节相同"
+        );
+    }
+
+    /// ⑤ 颜色只进绘制：`draw_runs` 不改测量结果，也不往测量缓存里塞条目。
+    #[test]
+    fn draw_runs_leaves_measure_untouched() {
+        let r = tr();
+        let text = "abcd你好";
+        let before = r.measure(text, &ts());
+        let entries = r.measure_cache_len();
+        let mut buf = canvas([255, 255, 255, 255]);
+        draw_runs(&r, &mut buf, 4.0, text, &[run(0, 2, RED), run(4, 7, BLUE)]);
+        assert_eq!(r.measure_cache_len(), entries, "draw_runs 不应写测量缓存");
+        let after = r.measure(text, &ts());
+        assert_eq!(
+            (before.width, before.height),
+            (after.width, after.height),
+            "draw_runs 前后测量应相同"
+        );
+    }
+}
+
 // 测量缓存的**接线**测试：键函数再正确，没接进 `TextRenderer::measure` 也是白搭，
 // 而 `measure_key_tests` 直接调键函数，接线断了它照样全绿。这里从公开的测量入口进，
 // 用缓存条目数确认它真的被查过、被写过。
@@ -2183,6 +2949,58 @@ mod measure_key_tests {
             "空串字体族应归一为 None"
         );
         assert_eq!(s.with_family(Some("  ")).family, None, "纯空白也应归一");
+    }
+}
+
+// 分段颜色区间的纯逻辑（不依赖任何后端），同 `pua_runs` 不限平台。
+#[cfg(test)]
+mod color_run_tests {
+    use super::{ColorRun, utf16_runs};
+
+    fn run(start: u32, end: u32, tag: u8) -> ColorRun {
+        ColorRun {
+            start,
+            end,
+            rgba: [tag, 0, 0, 255],
+        }
+    }
+
+    /// 字节区间换 UTF-16：`你`（3 字节 / 1 码元）、`😀`（4 字节 / 2 码元，代理对）各占多少都要算对。
+    #[test]
+    fn utf16_ranges_count_code_units() {
+        let text = "你😀ab";
+        let got = utf16_runs(text, &[run(0, 3, 1), run(3, 7, 2), run(7, 9, 3)]);
+        assert_eq!(
+            got,
+            vec![
+                (0, 1, [1, 0, 0, 255]),
+                (1, 2, [2, 0, 0, 255]),
+                (3, 2, [3, 0, 0, 255])
+            ]
+        );
+    }
+
+    /// 坏区间丢弃、好区间照留：空、越界、切在字中间。
+    #[test]
+    fn invalid_ranges_are_dropped() {
+        let text = "你好";
+        let got = utf16_runs(
+            text,
+            &[run(0, 0, 1), run(3, 99, 2), run(1, 3, 3), run(3, 6, 4)],
+        );
+        assert_eq!(got, vec![(1, 1, [4, 0, 0, 255])]);
+    }
+
+    /// 直立态逐格切：每格只拿自己范围内那部分，并平移到格内偏移；跨格的区间两边各得一截。
+    #[test]
+    fn slice_clips_and_shifts() {
+        let runs = [run(0, 2, 1), run(2, 7, 2)];
+        assert_eq!(
+            ColorRun::slice(&runs, 0, 3),
+            vec![run(0, 2, 1), run(2, 3, 2)]
+        );
+        assert_eq!(ColorRun::slice(&runs, 3, 6), vec![run(0, 3, 2)]);
+        assert_eq!(ColorRun::slice(&runs, 7, 9), vec![]);
     }
 }
 
@@ -2651,6 +3469,27 @@ mod tests {
             tr.draw_text(&mut buf, 8, 8, 0.0, 0.0, "x", [0, 0, 0, 255])
                 .is_ok()
         );
+    }
+
+    /// mock 的 `draw_runs` 与真实后端同口径：区间全部非法时退回 `draw`，不记 `draw_runs` 行。
+    #[test]
+    fn mock_draw_runs_with_only_invalid_runs_is_plain_draw() {
+        use super::{ColorRun, TextStyle};
+        let tr = TextRenderer::new("any", 16.0).unwrap();
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        let bad = [ColorRun {
+            start: 1,
+            end: 2, // 切在「你」中间
+            rgba: [255, 0, 0, 255],
+        }];
+        let ts = TextStyle::new(16.0);
+        tr.draw_runs(&mut buf, 8, 8, 0.0, 0.0, "你", &ts, [0; 4], &bad)
+            .unwrap();
+        tr.draw(&mut buf, 8, 8, 0.0, 0.0, "你", &ts, [0; 4])
+            .unwrap();
+        let log = tr.take_draw_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0], log[1], "全非法区间应与 draw 记录逐字相同");
     }
 }
 

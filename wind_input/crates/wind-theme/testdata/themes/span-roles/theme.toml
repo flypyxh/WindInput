@@ -1,0 +1,34 @@
+# 测试主题（非出厂）：分段着色的角色色（设计 text-span-colors.md §5）。
+# 继承出厂 _base，配注释常态 / 选中态 / 悬停态角色色与气泡角色色，供 wind-theme 求值与
+# wind-ui 渲染两层验证「角色色真的生效、状态回落正确」。_base 自带的出厂角色色（§18）照常
+# 继承进来，这里写的同名角色逐个覆盖它（如气泡 readings）。
+base = "_base"
+
+[meta]
+name = "分段着色测试"
+version = "1.0"
+
+[colors]
+code_color = { light = "#C00000", dark = "#FF8080" }
+
+[comment.roles]
+code_rev = "${code_color}"
+pinyin = "#008000"
+literal = { light = "#B0B0B0", dark = "#606060" }
+chaizi = "transparent"
+dict = "#12345600"
+
+# 选中态改了注释正文色 ⇒ 未单列的角色回落该色；code_rev 单列、保留高亮。
+[comment.selected]
+color = "#FFFFFF"
+
+[comment.selected.roles]
+code_rev = "#FFE08A"
+
+# 悬停态只写 roles（不改正文色）：这个 patch 不能因为「没有色 / 图 / 边框」被丢掉。
+[comment.hover.roles]
+pinyin = "#0000FF"
+
+[tooltip.roles]
+title = "${accent}"
+readings = "#9AD0FF"

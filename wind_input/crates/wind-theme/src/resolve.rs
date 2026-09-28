@@ -244,6 +244,7 @@ fn resolve_view_node(
     if let Some(img) = &n.next_image {
         out.next_image = Some(to_rv_image(img, palette, is_dark));
     }
+    out.roles = resolve_roles(&n.roles, palette, is_dark);
     if let Some(sh) = &n.shadow {
         out.shadow_offset_x = sh.offset_x;
         out.shadow_offset_y = sh.offset_y;
@@ -256,8 +257,29 @@ fn resolve_view_node(
     out
 }
 
+/// 角色色表求值：`""`（未设置）与未解析的 token 不入表（后者沿用 `resolve_color` 的 warn）；
+/// `transparent` 与 alpha 为 0 的颜色拒收并 warn——文字占着宽度却看不见，只会是误用，与内联色
+/// 同一口径（§4.5、§5.1）。
+fn resolve_roles(
+    roles: &HashMap<String, Ld>,
+    palette: &HashMap<String, Rgba>,
+    is_dark: bool,
+) -> HashMap<String, Rgba> {
+    roles
+        .iter()
+        .filter_map(|(role, ld)| {
+            let c = resolve_color(Some(ld), palette, is_dark)?;
+            if c[3] == 0 {
+                tracing::warn!("主题角色色 {role} 是全透明色，按未设置处理");
+                return None;
+            }
+            Some((role.clone(), c))
+        })
+        .collect()
+}
+
 /// 状态 patch ViewNode → 递归 RVNode（与 Go resolveState 对齐）。
-/// nil-gating：仅当显式给了 bg/图/渐变/层/text/border 色/border 宽/字重，或有 palette 默认色，
+/// nil-gating：仅当显式给了 bg/图/渐变/层/text/border 色/border 宽/字重/角色色，或有 palette 默认色，
 /// 才算「有覆盖」返回 Some；**不看几何**（状态改几何会致候选框跳动，state_geometry unsupported）。
 fn resolve_state(
     node: Option<&ViewNode>,
@@ -286,9 +308,6 @@ fn resolve_state(
             has = true;
         }
     }
-    if !has {
-        return None;
-    }
     let default_node;
     let n = match node {
         Some(n) => n,
@@ -297,9 +316,10 @@ fn resolve_state(
             &default_node
         }
     };
-    Some(Box::new(resolve_view_node(
-        n, palette, is_dark, def_bg, None, def_text,
-    )))
+    // 先求值再判：角色色表只解析一次（它的 warn 不该因门控多打一遍）；只写了
+    // `[comment.selected.roles]` 的 patch 也算「有覆盖」，否则被整体丢弃。
+    let out = resolve_view_node(n, palette, is_dark, def_bg, None, def_text);
+    (has || !out.roles.is_empty()).then(|| Box::new(out))
 }
 
 /// 解析图片路径：data: URI / 绝对路径原样；相对路径拼到 theme 目录。
@@ -344,6 +364,10 @@ pub fn resolve(theme: &Theme, is_dark: bool, asset_dirs: &[std::path::PathBuf]) 
         Some(v) => resolve_views(v, &palette, is_dark),
         None => RvViews::default(),
     };
+    // 2b. 补主题没写的标准色契约名。排在 views 之后：节点的 palette 默认色（`tk("text")` 之类）
+    // 仍只看主题自己写的，兜底只服务于按名求色（内联色）与按名取色的渲染层。
+    let mut palette = palette;
+    crate::contract::fill_missing(theme.colors.as_ref(), &mut palette, is_dark);
     // 3. behavior（基线 ⊕ 主题）。
     let behavior = merge_behavior(theme);
     // 4. resources（按 is_dark 选变体 + 相对路径解析）。
@@ -1140,5 +1164,151 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
             resolve_state(Some(&color_patch), &palette, false, None, None).is_some(),
             "改色 patch 应保留"
         );
+    }
+
+    // ───────────────────── 文字角色色（分段着色 §5）─────────────────────
+
+    fn roles_theme(name: &str, dark: bool) -> Resolved {
+        crate::load_resolved_dirs(&[testdata_dir(), data_dir_for_roles()], name, dark)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    fn data_dir_for_roles() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes")
+    }
+
+    fn hex(s: &str) -> Rgba {
+        parse_hex(s).unwrap()
+    }
+
+    #[test]
+    fn comment_roles_resolve_tokens_and_light_dark() {
+        let l = roles_theme("span-roles", false);
+        let d = roles_theme("span-roles", true);
+        assert_eq!(l.views.comment.roles["code_rev"], hex("#C00000"));
+        assert_eq!(d.views.comment.roles["code_rev"], hex("#FF8080"));
+        assert_eq!(l.views.comment.roles["literal"], hex("#B0B0B0"));
+        assert_eq!(d.views.comment.roles["literal"], hex("#606060"));
+        assert_eq!(l.views.comment.roles["pinyin"], hex("#008000"));
+        let tip = l.views.tooltip.as_ref().unwrap();
+        assert_eq!(tip.roles["title"], l.palette["accent"]);
+        assert_eq!(tip.roles["readings"], hex("#9AD0FF"));
+    }
+
+    /// transparent 与 alpha 为 0 的角色色拒收（按未设置）。
+    #[test]
+    fn transparent_roles_are_rejected() {
+        let t = roles_theme("span-roles", false);
+        assert!(!t.views.comment.roles.contains_key("chaizi"));
+        assert!(!t.views.comment.roles.contains_key("dict"));
+    }
+
+    /// 状态 patch：选中态有正文色 + 单列角色；悬停态**只**写了 roles 也不能被丢。
+    #[test]
+    fn state_roles_survive_nil_gating() {
+        let t = roles_theme("span-roles", false);
+        let sel = t.views.comment.selected.as_ref().expect("selected");
+        assert_eq!(sel.text_color, Some(hex("#FFFFFF")));
+        assert_eq!(sel.roles["code_rev"], hex("#FFE08A"));
+        let hov = t
+            .views
+            .comment
+            .hover
+            .as_ref()
+            .expect("只写 roles 的 hover patch 不能被丢");
+        assert_eq!(hov.roles["pinyin"], hex("#0000FF"));
+        assert_eq!(hov.text_color, None);
+    }
+
+    /// 派生主题逐键深合并：改一个、`""` 撤销一个、其余继承。
+    #[test]
+    fn derived_theme_merges_roles_per_key() {
+        let t = roles_theme("span-roles-child", false);
+        let r = &t.views.comment.roles;
+        assert_eq!(r["pinyin"], hex("#00AA00"));
+        assert!(!r.contains_key("literal"), "`\"\"` 撤销 base 的角色");
+        assert_eq!(r["code_rev"], hex("#C00000"), "未提及的角色继承 base");
+        assert_eq!(
+            t.views.comment.selected.as_ref().unwrap().roles["code_rev"],
+            hex("#FFE08A")
+        );
+    }
+
+    /// 出厂角色色表（设计 §18）：`_base` 配、全部出厂主题继承且不改——只有气泡配，取本主题的
+    /// `tooltip_*`（主题 roles 里的 `${token}` 按字面解析，不做 `tooltip_` 作用域查找，§6.2，
+    /// 故必须显式写 `tooltip_*`）。注释不配（用户要求保持原外观），状态 patch 与其余节点也一律不配。
+    #[test]
+    fn factory_theme_roles_are_the_base_table() {
+        let ids = crate::list_theme_ids(&data_dir_for_roles());
+        for must in ["_base", "_qingfeng", "default", "msime"] {
+            assert!(ids.iter().any(|i| i == must), "枚举漏了 {must}：{ids:?}");
+        }
+        for name in &ids {
+            for dark in [false, true] {
+                let t = roles_theme(name, dark);
+                let v = &t.views;
+                let mut nodes = vec![
+                    ("window", &v.window),
+                    ("preedit_bar", &v.preedit_bar),
+                    ("candidate_list", &v.candidate_list),
+                    ("item", &v.item),
+                    ("index", &v.index),
+                    ("text", &v.text),
+                    ("comment", &v.comment),
+                    ("accent_bar", &v.accent_bar),
+                    ("footer_bar", &v.footer_bar),
+                    ("mode_label", &v.mode_label),
+                ];
+                for (k, n) in [
+                    ("status", &v.status),
+                    ("tooltip", &v.tooltip),
+                    ("toast", &v.toast),
+                    ("menu.root", &v.menu_root),
+                    ("menu.item", &v.menu_item),
+                    ("menu.separator", &v.menu_separator),
+                ] {
+                    if let Some(n) = n {
+                        nodes.push((k, n));
+                    }
+                }
+                let pal = |k: &str| t.palette[k];
+                let want_tooltip: std::collections::HashMap<String, Rgba> = [
+                    ("full_text", "tooltip_accent_text"),
+                    ("readings", "tooltip_accent_text"),
+                    ("word_code", "tooltip_success"),
+                    ("code_source", "tooltip_info"),
+                    ("chaizi", "tooltip_warning"),
+                    ("chaizi_all", "tooltip_warning"),
+                    ("chaizi_code", "tooltip_info"),
+                    ("chaizi_code_all", "tooltip_info"),
+                    ("unicode", "tooltip_error"),
+                    ("unicode_all", "tooltip_error"),
+                ]
+                .map(|(r, k)| (r.to_string(), pal(k)))
+                .into();
+                for (k, n) in nodes {
+                    let states = [
+                        Some(n),
+                        n.selected.as_deref(),
+                        n.hover.as_deref(),
+                        n.disabled.as_deref(),
+                    ];
+                    for (i, st) in states.into_iter().enumerate() {
+                        let Some(st) = st else { continue };
+                        let want = match (k, i) {
+                            ("tooltip", 0) => &want_tooltip,
+                            _ => {
+                                assert!(
+                                    st.roles.is_empty(),
+                                    "{name} dark={dark} {k}[{i}]：出厂只在注释 / 气泡常态配 roles"
+                                );
+                                continue;
+                            }
+                        };
+                        assert_eq!(&st.roles, want, "{name} dark={dark} {k}");
+                    }
+                }
+            }
+        }
     }
 }

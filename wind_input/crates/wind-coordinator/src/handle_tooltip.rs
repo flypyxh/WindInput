@@ -84,7 +84,7 @@ pub(crate) fn tooltip_menu_items(
     if let (Some(e), Some(h)) = (entry, hit) {
         let s = usize::from(h.section);
         if let Some(sec) = e.rendered.doc.sections.get(s) {
-            let name = section_label(sec.title.as_deref(), s);
+            let name = section_label(sec.title.as_ref().map(wind_ui_types::StyledText::as_str), s);
             items.push(M::leaf(
                 format!("复制「{name}」"),
                 cmd(MenuCmd::TooltipCopySection),
@@ -266,13 +266,13 @@ mod tests {
 
     fn section(title: Option<&str>, lines: &[&str]) -> TooltipSection {
         TooltipSection {
-            title: title.map(str::to_string),
+            title: title.map(Into::into),
             inline: false,
             lines: lines
                 .iter()
                 .enumerate()
                 .map(|(i, t)| TooltipLine {
-                    text: t.to_string(),
+                    text: (*t).into(),
                     raw: i as u16,
                 })
                 .collect(),
@@ -284,13 +284,13 @@ mod tests {
         TooltipPageEntry {
             text: "你好世界".into(),
             rendered: RenderedTooltip {
-                doc: TooltipDoc {
+                doc: std::sync::Arc::new(TooltipDoc {
                     sections: vec![
                         section(Some("完整原文"), &["你好…"]),
                         section(Some("拼音"), &["你：nǐ", "好：hǎo/hào"]),
                         section(None, &["x"]),
                     ],
-                },
+                }),
                 raw: vec![
                     vec!["你好世界".into()],
                     vec!["你：nǐ".into(), "好：hǎo/hào".into()],
@@ -458,7 +458,7 @@ mod tests {
         let Some((c, rx, _u)) = typed("cache") else {
             return;
         };
-        let sent: Vec<TooltipDoc> = drain(&rx)
+        let sent: Vec<std::sync::Arc<TooltipDoc>> = drain(&rx)
             .into_iter()
             .filter_map(|cmd| match cmd {
                 UiCommand::UpdateCandidates { candidates, .. } => Some(
@@ -508,7 +508,7 @@ mod tests {
     fn prepend_code_section(c: &Coordinator) {
         let mut page = c.tooltip_page.lock().unwrap();
         let r = &mut page[0].rendered;
-        r.doc.sections.insert(
+        std::sync::Arc::make_mut(&mut r.doc).sections.insert(
             0,
             wind_ui_types::TooltipSection {
                 title: Some("编码".into()),
@@ -635,7 +635,7 @@ mod tests {
         {
             let mut page = c.tooltip_page.lock().unwrap();
             let r = &mut page[0].rendered;
-            r.doc.sections.insert(
+            std::sync::Arc::make_mut(&mut r.doc).sections.insert(
                 0,
                 wind_ui_types::TooltipSection {
                     title: Some("完整原文".into()),

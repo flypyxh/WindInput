@@ -5,7 +5,7 @@
 //! measure/arrange 算出尺寸与每候选的绝对矩形（供鼠标命中），再 paint 到 BGRA 缓冲区。
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
@@ -18,7 +18,7 @@ use crate::sys::{
     SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
-use crate::text::dwrite::{TextRenderer, TextStyle};
+use crate::text::dwrite::{ColorRun, TextRenderer, TextStyle};
 use crate::text::font_resolve::{FontNameSource, ResolvedFont, resolve_font_name};
 use crate::text::script::{FontPlan, ScriptClass};
 use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
@@ -74,6 +74,20 @@ fn apply_scheme_text_font(views: &mut wind_theme::RvViews, scheme_family: &str) 
 /// （`ui.candidate.font_size` 的 0 = 跟随主题）。
 fn effective_base_font_size(user: f32, theme: i32) -> f32 {
     if user > 0.0 { user } else { theme as f32 }
+}
+
+/// 注释节点没配文字色时的渲染层兜底（分段着色求色的 `body_fallback` 与之同源）。
+const COMMENT_FALLBACK: [u8; 4] = wind_theme::fallback::COMMENT_TEXT;
+
+/// 候选的文字状态：选中优先于悬停（与 `eff_text` / `wind_theme::span_color` 同一口径）。
+fn text_state(sel: bool, hov: bool) -> wind_theme::TextState {
+    if sel {
+        wind_theme::TextState::Selected
+    } else if hov {
+        wind_theme::TextState::Hover
+    } else {
+        wind_theme::TextState::Normal
+    }
 }
 
 /// 把 `[ui.font]` 的三个键折成渲染层的 [`FontPlan`]。
@@ -326,6 +340,11 @@ pub struct CandidateWindow {
     mouse: Rc<RefCell<CandidateMouse>>,
     /// 悬停编码反查气泡
     tooltip: Option<crate::tooltip::Tooltip>,
+    /// 气泡此刻跟着哪个候选（页内下标；-1 = 无），与 [`CandidateMouse`] 共享，悬停宽限据此
+    /// 判「移开的正是气泡所属的候选」。本地显示与宿主渲染两路都在这里记。
+    tip_for: Rc<Cell<i32>>,
+    /// 「屏幕点处最上层是不是这个窗口」，默认 [`crate::window::window_at`]；测试换桩。
+    window_at: fn(HWND, i32, i32) -> bool,
     /// **生效**主题：[`Self::theme_source`] 叠上外观覆盖（字体 / 字号）之后的那份。
     /// 渲染与测量一律只读它，由 [`Self::refresh_effective_theme`] 单点产出。
     theme: wind_theme::Resolved,
@@ -422,6 +441,7 @@ impl CandidateWindow {
         let text_renderer = TextRenderer::new(DEFAULT_FONT_FAMILY, config.font_size)?;
         let tooltip_events = events.clone();
         let self_events = events.clone();
+        let tip_for = Rc::new(Cell::new(-1));
         let mouse = Rc::new(RefCell::new(CandidateMouse {
             hit_rects: Vec::new(),
             events,
@@ -438,6 +458,10 @@ impl CandidateWindow {
             drag_pin: None,
             margin: (0, 0, 0, 0),
             double_click: crate::double_click::DoubleClick::new(),
+            tip_hold: TipHold::Off,
+            tip_released: false,
+            tip_for: tip_for.clone(),
+            deferred: None,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -460,7 +484,9 @@ impl CandidateWindow {
             text_renderer,
             hit_rects: Vec::new(),
             mouse,
+            tip_for,
             tooltip: crate::tooltip::Tooltip::new(tooltip_events).ok(),
+            window_at: crate::window::window_at,
             theme: wind_theme::Resolved::default(),
             theme_source: wind_theme::Resolved::default(),
             user_font_family: String::new(),
@@ -1142,6 +1168,40 @@ impl CandidateWindow {
         }
     }
 
+    /// 关掉菜单的那次菜单外按下（菜单轮询所见，见 `popup_menu::OutsidePress`）。
+    ///
+    /// 菜单开着时同线程的候选窗、气泡都收不到鼠标消息，这次按下只有轮询看得见。右键落在
+    /// 气泡上交给气泡（重开气泡菜单，见其 `on_menu_outside_press`）；落在候选窗上则合成一次
+    /// 候选窗右键——「关旧开新」，与在没有菜单时右键同一效果。左键只关菜单。
+    pub fn menu_outside_press(&mut self, x: i32, y: i32, right: bool) {
+        if let Some(t) = self.tooltip.as_mut()
+            && t.on_menu_outside_press(x, y, right)
+        {
+            return;
+        }
+        if !right || !self.visible || !(self.window_at)(self.window.hwnd(), x, y) {
+            return;
+        }
+        let origin = self.mouse.borrow().window_origin();
+        let (ox, oy) = origin.unwrap_or((0, 0));
+        self.mouse
+            .borrow_mut()
+            .right_click((x - ox) as f32, (y - oy) as f32, (x, y));
+    }
+
+    /// 悬停气泡（测试用）。
+    #[cfg(test)]
+    pub(crate) fn tooltip_mut(&mut self) -> Option<&mut crate::tooltip::Tooltip> {
+        self.tooltip.as_mut()
+    }
+
+    /// UI 循环收掉了一个可见菜单（协调器 `HideMenu` / `HideCandidates`），转给气泡。
+    pub fn tooltip_menu_dismissed(&mut self) {
+        if let Some(t) = self.tooltip.as_mut() {
+            t.on_menu_dismissed();
+        }
+    }
+
     /// 应用主题（协调器下发）。同步更新悬停 tooltip 配色。
     pub fn set_theme(&mut self, theme: wind_theme::Resolved) {
         self.theme_source = theme;
@@ -1809,12 +1869,21 @@ impl CandidateWindow {
         })
     }
 
+    /// 气泡该跟哪个悬停目标：候选右键压制期间一律「无」（高亮照旧，只是不弹气泡）。
+    fn tooltip_hover(&self) -> i32 {
+        if self.mouse.borrow().tip_hold.active() {
+            -1
+        } else {
+            self.hover
+        }
+    }
+
     /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。
     /// `(wx, wy)` 为候选窗口屏幕原点（命中矩形坐标的基准）。
     /// 横排：tooltip 在候选行下方（不足时上翻）。
     /// 竖排：tooltip 在候选窗右侧（不足时左侧），纵向对齐悬停候选行，避免遮挡下方候选。
     fn update_tooltip(&mut self, wx: i32, wy: i32) {
-        let hover = self.hover;
+        let hover = self.tooltip_hover();
         // 仅候选项（非翻页器 tag）显示反查提示
         let info = if (0..TAG_PAGE_PREV).contains(&hover) {
             let code = self
@@ -1836,6 +1905,13 @@ impl CandidateWindow {
                 Some((code, r)) => {
                     // 旋转态一并走「侧边」：它的候选项是又高又窄的一列，
                     // 按横排的「上方/下方」放会离得很远。
+                    self.tip_for.set(hover);
+                    tip.set_anchor((
+                        wx + r.x as i32,
+                        wy + r.y as i32,
+                        wx + (r.x + r.w) as i32,
+                        wy + (r.y + r.h) as i32,
+                    ));
                     if self.vertical || self.rotated {
                         // 竖排：以悬停候选项自身宽度为锚点（hit rect 已含阴影偏移，wx+r.x 即屏幕坐标）。
                         // tooltip 显示在候选项右侧，空间不足时改左侧，不遮挡下方候选。
@@ -1857,7 +1933,10 @@ impl CandidateWindow {
                         );
                     }
                 }
-                None => tip.hide(),
+                None => {
+                    self.tip_for.set(-1);
+                    tip.hide();
+                }
             }
         }
     }
@@ -1871,7 +1950,7 @@ impl CandidateWindow {
         wx: i32,
         wy: i32,
     ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
-        let hover = self.hover;
+        let hover = self.tooltip_hover();
         let info = if (0..TAG_PAGE_PREV).contains(&hover) {
             let code = self
                 .candidates
@@ -1888,6 +1967,7 @@ impl CandidateWindow {
             None
         };
 
+        self.tip_for.set(if info.is_some() { hover } else { -1 });
         let tip = self.tooltip.as_mut()?;
         match info {
             Some((code, r)) => {
@@ -2176,7 +2256,7 @@ impl CandidateWindow {
 
     /// RvImage → 渲染用 ViewImage（委托共享 theme_assets）。
     fn rv_image(&self, im: Option<&wind_theme::RvImage>) -> Option<ViewImage> {
-        crate::theme_assets::rv_image(&self.theme, im)
+        crate::theme_assets::rv_image(&self.theme, im, self.scale)
     }
 
     /// footer 翻页箭头图标（SVG + tint）。无 prev/next_image 时 None（回退文字箭头）。
@@ -2198,6 +2278,7 @@ impl CandidateWindow {
             slice_repeat: [false; 2],
             opacity: 1.0,
             tint,
+            place: None,
         })
     }
 
@@ -2289,13 +2370,16 @@ impl CandidateWindow {
     ///
     /// ⚠️ 独立编码栏（非内联）**不**走它：那一栏在旋转包裹层**外面**，本就没转过。
     ///
-    /// `leaf(片段, 该片段内的 caret 字节位)` 由调用方构造——各处的字号/字重/字族/颜色
-    /// 都不同，把它们全收成参数会得到一个七参数函数。
+    /// `leaf(片段, 该片段内的 caret 字节位, 该片段在整串里的字节偏移)` 由调用方构造——各处的
+    /// 字号/字重/字族/颜色都不同，把它们全收成参数会得到一个七参数函数。不切格时偏移为 0。
+    ///
+    /// 偏移是给分段颜色用的：着色区间按整串的字节偏移给出，逐格切开后每格要取落在自己范围内的
+    /// 那几段、平移到格内偏移（[`crate::text::dwrite::ColorRun::slice`]）。
     fn upright_text(
         &self,
         text: &str,
         caret: Option<usize>,
-        leaf: impl Fn(&str, Option<usize>) -> View,
+        leaf: impl Fn(&str, Option<usize>, usize) -> View,
     ) -> View {
         let cells = if self.upright {
             crate::text::script::upright_cells(text)
@@ -2303,7 +2387,7 @@ impl CandidateWindow {
             Vec::new()
         };
         if cells.is_empty() {
-            return leaf(text, caret);
+            return leaf(text, caret, 0);
         }
         // 局部空间里是个 Row（左→右），经外层顺时针转完才是屏幕上的一列（上→下）。
         // 跨轴居中让宽窄不一的格（半角/全角混排）在列内对齐。
@@ -2316,7 +2400,7 @@ impl CandidateWindow {
             let local = caret
                 .filter(|c| *c >= off && (*c < end || i == last))
                 .map(|c| c - off);
-            row = row.child(View::rotated_ccw(leaf(cell, local)));
+            row = row.child(View::rotated_ccw(leaf(cell, local, off)));
             off = end;
         }
         row
@@ -2341,7 +2425,7 @@ impl CandidateWindow {
         let caret_w = self.scale.max(1.0);
         // 直立态逐格切时 caret 由 `upright_text` 分派到它落进的那一格；转完是格间的一条
         // **横**线，正是纵排里插入符该有的样子。整块不切时行为与此前逐字节一致。
-        let build = |seg: &str, caret: Option<usize>| {
+        let build = |seg: &str, caret: Option<usize>, _off: usize| {
             let mut leaf = View::leaf(seg.to_string(), color)
                 .font_size(fs)
                 .font_weight(weight)
@@ -2355,7 +2439,7 @@ impl CandidateWindow {
         if upright {
             self.upright_text(&display, Some(self.preedit_caret), build)
         } else {
-            build(&display, Some(self.preedit_caret))
+            build(&display, Some(self.preedit_caret), 0)
         }
     }
 
@@ -2462,15 +2546,9 @@ impl CandidateWindow {
             |p: &Option<Box<RvNode>>, d: [u8; 4]| p.as_ref().and_then(|n| n.bg_color).unwrap_or(d);
         // 状态文字色（与 Go effectiveNode 对齐）：选中优先于悬停；选中/悬停 patch 未给文字色
         // → 回退基态色（不跨态借色）。index/text/comment 同一套消费。
+        // 与分段着色的求色共用 `wind_theme::body_color`，两处同一口径（`base` 已是节点基态色）。
         let eff_text = |node: &RvNode, base: [u8; 4], sel: bool, hov: bool| -> [u8; 4] {
-            let st = if sel {
-                node.selected.as_deref()
-            } else if hov {
-                node.hover.as_deref()
-            } else {
-                None
-            };
-            st.and_then(|n| n.text_color).unwrap_or(base)
+            wind_theme::body_color(node, text_state(sel, hov), base)
         };
         // 有效字重（与 eff_text 同构）：节点/item 的状态 patch 字重优先，回退节点/item 基态；0=继承默认。
         // item 参与是因为主题常把"选中加粗"配在 [item.selected].font_weight（如 jidian），需作用到候选文本。
@@ -2688,7 +2766,7 @@ impl CandidateWindow {
             .max(min_text_w);
 
         let mut root = View::container(Layout::Column)
-            .bg(col(v.window.bg_color, [255, 255, 255, 255]))
+            .bg(col(v.window.bg_color, wind_theme::fallback::WINDOW_BG))
             .border(
                 col(v.window.border_color, [200, 200, 200, 200]),
                 dim(v.window.border_width, 1.0).max(1.0),
@@ -2812,10 +2890,10 @@ impl CandidateWindow {
 
         // 候选项颜色（基态）。状态色（选中/悬停）逐项经 eff_text 计算。
         let text_color = col(v.text.text_color, [30, 30, 30, 255]);
-        let sel_bg = patch_bg(&v.item.selected, [230, 240, 255, 255]);
-        let hover_bg = patch_bg(&v.item.hover, [238, 242, 247, 255]);
+        let sel_bg = patch_bg(&v.item.selected, wind_theme::fallback::SELECTED_BG);
+        let hover_bg = patch_bg(&v.item.hover, wind_theme::fallback::HOVER_BG);
         let index_color = col(v.index.text_color, [66, 133, 244, 255]);
-        let comment_color = col(v.comment.text_color, [150, 150, 150, 255]);
+        let comment_color = col(v.comment.text_color, COMMENT_FALLBACK);
         let comment_fs = node_fs(&v.comment);
         let index_circle = v.index.bg_shape == "circle";
         let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
@@ -2930,7 +3008,7 @@ impl CandidateWindow {
                     let cm = edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]);
                     self.text_renderer
                         .measure(
-                            &cand.comment,
+                            cand.comment.as_str(),
                             &Self::measure_style(
                                 comment_fs,
                                 eff_weight(&v.comment, &v.item, is_sel, is_hover),
@@ -3283,7 +3361,7 @@ impl CandidateWindow {
             let ml_weight = v.mode_label.font_weight;
             let ml_family = v.mode_label.font_family.clone();
             let chip = decorate_mode_chip(
-                self.upright_text(&self.mode_label, None, |seg, _| {
+                self.upright_text(&self.mode_label, None, |seg, _, _| {
                     View::leaf(seg.to_string(), ml_color)
                         .font_size(ml_fs)
                         .font_weight(ml_weight)
@@ -3468,7 +3546,7 @@ impl CandidateWindow {
             // 直立态逐格扶正（见 `upright_text`）。装饰（底色/边框/内外边距）留在**外层
             // 容器**上，整段文字仍是一个整体，不会每个字各画一个药丸。
             let mut tleaf = self
-                .upright_text(&display_text, None, |seg, _| {
+                .upright_text(&display_text, None, |seg, _, _| {
                     View::leaf(seg.to_string(), txt_color)
                         .font_size(text_fs)
                         .font_weight(text_weight)
@@ -3499,12 +3577,23 @@ impl CandidateWindow {
                 // 推翻（旋转态是一切都转、自洽；直立态混排看不懂）。
                 let cmt_weight = eff_weight(&v.comment, &v.item, is_sel, is_hover);
                 let cmt_family = v.comment.font_family.clone();
+                // 分段颜色：按当前主题与本候选的状态现求（悬停只有 UI 知道），等于正文色的丢弃。
+                let cmt_runs = crate::span_runs::color_runs(
+                    &self.theme,
+                    &v.comment,
+                    false,
+                    text_state(is_sel, is_hover),
+                    COMMENT_FALLBACK,
+                    &cand.comment,
+                );
                 let mut cleaf = self
-                    .upright_text(&cand.comment, None, |seg, _| {
+                    .upright_text(cand.comment.as_str(), None, |seg, _, off| {
+                        // 直立态逐格切叶子：每格只拿自己那几段颜色，平移到格内偏移。
                         View::leaf(seg.to_string(), cmt_color)
                             .font_size(comment_fs)
                             .font_weight(cmt_weight)
                             .font_family(cmt_family.clone())
+                            .color_runs(ColorRun::slice(&cmt_runs, off, off + seg.len()))
                     })
                     .pad(edges_or(&v.comment.padding, [0.0; 4]))
                     .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]));
@@ -3677,8 +3766,10 @@ impl CandidateWindow {
             // 注意 hide_local_window_only()（host-render 分流）刻意不走这里，落位状态须保留。
             m.reset_drag();
         }
+        // 候选窗收起：气泡失去依附对象，光标停在它上面也得收（Esc / 上屏 / 失焦 ...）。
+        self.tip_for.set(-1);
         if let Some(t) = self.tooltip.as_mut() {
-            t.hide();
+            t.hide_force();
         }
     }
 
@@ -3688,23 +3779,55 @@ impl CandidateWindow {
     #[cfg(windows)]
     pub fn hide_local_window_only(&mut self) {
         self.window.hide();
+        // 宿主接管绘制：本地气泡无条件收（光标在上面也一样），宽限只按候选悬停走。
         if let Some(t) = self.tooltip.as_mut() {
-            t.hide();
+            t.hide_force();
         }
     }
 
-    /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件）。
-    pub fn tick(&self) {
-        self.mouse.borrow_mut().flush();
+    /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件），并推进候选右键对气泡的
+    /// 压制（见 [`TipHold`]）。
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        // 悬停宽限：光标已进入气泡就撤掉待发的悬停变化，到期未进则照发（见 [`hover_move`]）。
+        if self.mouse.borrow().deferred.is_some() {
+            let on_tip = self.tooltip.as_ref().is_some_and(|t| t.cursor_on_tip_now());
+            self.mouse.borrow_mut().resolve_deferred(now, on_tip);
+        }
+        let (hold, released) = {
+            let mut m = self.mouse.borrow_mut();
+            m.flush(now, self.hover);
+            (m.tip_hold.active(), std::mem::take(&mut m.tip_released))
+        };
+        // 右键那一刻已显示的气泡就在这里收掉：消息泵刚派发完 WM_RBUTTONDOWN，本轮即生效，
+        // 赶在菜单弹出之前。hide 幂等，压制期间每轮调用也只是一次判断。
+        if hold && let Some(t) = self.tooltip.as_mut() {
+            t.hide();
+        }
+        // 压制解除时 UI 画着的悬停就是光标下的目标 → 协调器不会重绘，气泡得在这里自己补显示。
+        if released && self.visible {
+            let origin = self.mouse.borrow().window_origin();
+            if let Some((wx, wy)) = origin {
+                self.update_tooltip(wx, wy);
+            }
+        }
     }
 
-    /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无待到期的悬停闸门。
+    /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无待到期者。
     ///
-    /// 消息循环据此安排唤醒。唯一的到期源是悬停激活闸门（`engage_at`）：它在用户首次真实
-    /// 移动鼠标到候选窗上时武装，到期后悬停才开始响应。激活之后悬停走 `on_message` 即时
-    /// 发出，不再需要唤醒。
+    /// 消息循环据此安排唤醒。两个到期源：悬停激活闸门（`engage_at`，用户首次真实移动鼠标到
+    /// 候选窗上时武装，到期后悬停才开始响应；激活之后悬停走 `on_message` 即时发出，不再需要
+    /// 唤醒），以及右键压制「等菜单」阶段的兜底超时（见 [`TipHold::AwaitMenu`]）。
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.mouse.borrow().engage_deadline()
+        let m = self.mouse.borrow();
+        let hold = match m.tip_hold {
+            TipHold::AwaitMenu { until } => Some(until),
+            _ => None,
+        };
+        [m.engage_deadline(), hold, m.deferred]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -3771,6 +3894,114 @@ pub struct CandidateMouse {
     margin: (i32, i32, i32, i32),
     /// 空白处双击判定（截图用，见 `UiEvent::CandidateDoubleClick`）。
     double_click: crate::double_click::DoubleClick,
+    /// 候选窗右键对悬停气泡的压制阶段，见 [`TipHold`]。
+    tip_hold: TipHold,
+    /// 压制刚解除且 UI 画着的悬停正是光标下的目标：待 [`CandidateWindow::tick`] 取走并
+    /// 本地补显示气泡。
+    tip_released: bool,
+    /// 气泡此刻跟着哪个候选（与 [`CandidateWindow`] 共享，见其同名字段）。
+    tip_for: Rc<Cell<i32>>,
+    /// 悬停宽限：待发的悬停变化（`pending_raw`）到期时刻，见 [`hover_move`]。
+    deferred: Option<Instant>,
+}
+
+/// 光标离开气泡所属候选、去往「无」（空隙 / 内边距 / 翻页器）的宽限：与气泡那侧的
+/// [`crate::tooltip::LEAVE_GRACE_MS`] 同值——从候选行穿过空隙进入气泡要这么久。
+const TIP_GRACE: Duration = Duration::from_millis(crate::tooltip::LEAVE_GRACE_MS as u64);
+
+/// 气泡显示中、光标移到**另一个**候选的切换延迟。气泡在旁侧时，从候选 A 斜着去 A 的气泡
+/// 会擦过相邻行 B；立刻切到 B，A 的气泡就被换掉、永远够不着。150ms 够手速正常地穿过一行
+/// （三四十像素），而在候选间正常移动时高亮只慢这么一点，不显得迟钝。比宽限短：去往另一个
+/// 候选多半是真想看它。
+const TIP_SWITCH: Duration = Duration::from_millis(150);
+
+/// 悬停从 `last` 变到 `raw` 时是即时发出还是延后（设计 §7.6 C）。只有 `last` 的气泡正显示
+/// （`tip_for == last`）时才延后：去往「无」按 [`TIP_GRACE`]，去往另一个候选按 [`TIP_SWITCH`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoverMove {
+    Now,
+    Defer(Duration),
+}
+
+fn hover_move(last: i32, raw: i32, tip_for: i32) -> HoverMove {
+    let tip_up = (0..TAG_PAGE_PREV).contains(&last) && tip_for == last;
+    if !tip_up {
+        HoverMove::Now
+    } else if (0..TAG_PAGE_PREV).contains(&raw) {
+        HoverMove::Defer(TIP_SWITCH)
+    } else {
+        HoverMove::Defer(TIP_GRACE)
+    }
+}
+
+/// 待发的悬停变化此刻该怎么办：光标进了气泡 → 撤掉（悬停留在原候选，气泡自己的离开跟踪
+/// 接手）；到期 → 发出；否则再等。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deferred {
+    Wait,
+    Cancel,
+    Fire,
+}
+
+fn resolve_deferred(now: Instant, until: Instant, on_tip: bool) -> Deferred {
+    if on_tip {
+        Deferred::Cancel
+    } else if now >= until {
+        Deferred::Fire
+    } else {
+        Deferred::Wait
+    }
+}
+
+/// 「等菜单」阶段的兜底超时（取值理由见 `popup_menu::MENU_REPLY_TIMEOUT`）：超时按「菜单已
+/// 关闭」处理，不让气泡一直压着。万一菜单来得比这还晚，出现时照样进 [`TipHold::InMenu`]。
+const HOLD_MENU_TIMEOUT: Duration = crate::popup_menu::MENU_REPLY_TIMEOUT;
+
+/// 候选窗右键对悬停气泡的压制（设计 §7.6 A）。
+///
+/// 不压的话气泡会盖在菜单上：① 右键时气泡已显示，它不会自己消失；② 右键时激活延迟还没
+/// 到期，到期后照发 `Hover`，气泡在菜单弹出**之后**冒出来、叠在菜单上面（z 序后来者居上）。
+///
+/// 做成阶段而不是一个布尔：右键到菜单可见之间，「菜单开着」还是 false，只靠它挡闸门的话，
+/// 这段来回里鼠标动 1px 就会重新武装闸门，到期时菜单已弹出，气泡照样叠上去；
+/// `ui.tooltip.delay=0` 时气泡甚至抢在菜单之前出来。
+///
+/// 只压气泡、不清悬停：悬停高亮还指着右键的那个候选，是「菜单作用于谁」的唯一提示。
+/// 清了（发 `Hover(-1)`）高亮会跳回键盘选中项，看上去像是菜单对着别的候选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TipHold {
+    /// 不压。
+    Off,
+    /// 已右键、菜单还没出现。闸门既不武装也不到期。`until` 为兜底超时时刻。
+    AwaitMenu { until: Instant },
+    /// 菜单开着。闸门既不武装也不到期。
+    InMenu,
+    /// 菜单已关：等一次真实移动武装闸门、再走完一次延迟才解除。
+    AwaitMove,
+}
+
+impl TipHold {
+    /// 按「菜单此刻是否可见」与时间推进阶段。
+    fn advance(self, now: Instant, menu_visible: bool) -> Self {
+        match self {
+            TipHold::Off => TipHold::Off,
+            TipHold::AwaitMenu { .. } if menu_visible => TipHold::InMenu,
+            TipHold::AwaitMenu { until } if now >= until => TipHold::AwaitMove,
+            TipHold::InMenu if !menu_visible => TipHold::AwaitMove,
+            // 迟到的菜单（超时之后才出现）同样要压住。
+            TipHold::AwaitMove if menu_visible => TipHold::InMenu,
+            other => other,
+        }
+    }
+
+    /// 本阶段是否挡住激活闸门（不武装、不到期）。
+    fn blocks_gate(self) -> bool {
+        matches!(self, TipHold::AwaitMenu { .. } | TipHold::InMenu)
+    }
+
+    fn active(self) -> bool {
+        self != TipHold::Off
+    }
 }
 
 impl CandidateMouse {
@@ -3785,20 +4016,91 @@ impl CandidateMouse {
         self.engage_at
     }
 
-    /// 悬停激活闸门到期时由 UI 循环调用：激活并补发当前悬停。
-    fn flush(&mut self) {
+    /// UI 循环每轮调用：推进右键压制阶段；悬停激活闸门到期则激活并补发当前悬停。
+    ///
+    /// `drawn_hover` 是 UI 此刻画着的悬停（`CandidateWindow::hover`，协调器最近一次下发的值）。
+    /// 解除压制时拿它而不是 `last_hover` 比：压制期间候选若重绘过（协调器重置悬停），
+    /// `last_hover` 还是旧值，与光标下的目标相等就不发 `Hover`，而 UI 画的已经是 -1，
+    /// 气泡便再也不回来。
+    fn flush(&mut self, now: Instant, drawn_hover: i32) {
+        self.tip_hold = self
+            .tip_hold
+            .advance(now, crate::popup_menu::menu_visible());
+        if self.tip_hold.blocks_gate() {
+            // 进入「等菜单 / 菜单中」前武装的闸门一律作废（迟到的菜单从 AwaitMove 进来时
+            // 闸门可能已在走）。
+            self.engage_at = None;
+            return;
+        }
         if self.engaged {
             return; // 已激活：悬停在 on_message 内即时发出
         }
         if let Some(at) = self.engage_at
-            && Instant::now() >= at
+            && now >= at
         {
             self.engaged = true;
             self.engage_at = None;
-            if self.pending_raw != self.last_hover {
+            if self.tip_hold == TipHold::AwaitMove {
+                self.tip_hold = TipHold::Off;
+                self.last_hover = self.pending_raw;
+                if self.pending_raw == drawn_hover {
+                    // UI 画着的就是它：协调器不会重绘，由窗口本地补显示气泡。
+                    self.tip_released = true;
+                } else {
+                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
+                }
+            } else if self.pending_raw != self.last_hover {
                 self.last_hover = self.pending_raw;
                 let _ = self.events.send(UiEvent::Hover(self.pending_raw));
             }
+        }
+    }
+
+    /// 推进悬停宽限（见 [`resolve_deferred`]）。`on_tip` = 光标此刻在气泡上。
+    fn resolve_deferred(&mut self, now: Instant, on_tip: bool) {
+        let Some(until) = self.deferred else {
+            return;
+        };
+        match resolve_deferred(now, until, on_tip) {
+            Deferred::Wait => {}
+            Deferred::Cancel => self.deferred = None,
+            Deferred::Fire => {
+                self.deferred = None;
+                if self.pending_raw != self.last_hover {
+                    self.last_hover = self.pending_raw;
+                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
+                }
+            }
+        }
+    }
+
+    /// 候选窗上右键（候选菜单 / 空白处主菜单）：进入压制「等菜单」阶段，并把激活闸门打回
+    /// 未激活，见 [`TipHold`]。
+    fn hold_tooltip(&mut self, now: Instant) {
+        self.deferred = None;
+        self.tip_hold = TipHold::AwaitMenu {
+            until: now + HOLD_MENU_TIMEOUT,
+        };
+        self.tip_released = false;
+        self.engaged = false;
+        self.engage_at = None;
+    }
+
+    /// 候选窗右键：客户区 `(x, y)` 定命中，屏幕 `screen` 定菜单位置。命中候选 → 词条菜单，
+    /// 空白处 → 功能主菜单（光标处向下弹）。`WM_RBUTTONDOWN` 与菜单外右键合成共用。
+    fn right_click(&mut self, x: f32, y: f32, (sx, sy): (i32, i32)) {
+        let i = self.hit(x, y);
+        self.hold_tooltip(Instant::now());
+        if i >= 0 {
+            let _ = self.events.send(UiEvent::RequestCandidateMenu {
+                page_local: i as usize,
+                x: sx,
+                y: sy,
+            });
+        } else {
+            let _ = self
+                .events
+                .send(UiEvent::RequestMainMenu(MenuAnchor::at_point(sx, sy)));
         }
     }
 
@@ -3810,10 +4112,13 @@ impl CandidateMouse {
     /// - [`CandidateWindow::hide`]：清掉闸门与残留悬停，使下一轮从未激活态起步。它顺带采的
     ///   那次基线到下次显示时多半已经过时（用户在这期间移动了鼠标），**不能当作基线的来源**。
     fn reset_hover(&mut self) {
+        self.deferred = None;
         self.last_hover = -1;
         self.engaged = false;
         self.engage_at = None;
         self.pending_raw = -1;
+        self.tip_hold = TipHold::Off;
+        self.tip_released = false;
         let (sx, sy) = unsafe {
             let mut p = POINT::default();
             let _ = GetCursorPos(&mut p);
@@ -3990,41 +4295,56 @@ impl WindowMouse for CandidateMouse {
                 let (x, y) = mouse_pos(lparam);
                 let raw = self.hit(x, y);
                 self.pending_raw = raw;
+                // 先按此刻的菜单可见性推进压制阶段：菜单在上一次 tick 之后才收起时，关后的
+                // 第一次移动就该能武装闸门，不必再等一轮。
+                self.tip_hold = self
+                    .tip_hold
+                    .advance(Instant::now(), crate::popup_menu::menu_visible());
                 if self.engaged {
-                    // 已激活：即时高亮/显示 tooltip，无逐项延迟
-                    if raw != self.last_hover {
-                        self.last_hover = raw;
-                        let _ = self.events.send(UiEvent::Hover(raw));
+                    // 已激活：即时高亮/显示 tooltip，无逐项延迟——除非正移开气泡所属的
+                    // 候选（悬停宽限，见 `hover_move`）。
+                    if raw == self.last_hover {
+                        // 回到原候选：待发的变化作废。
+                        self.deferred = None;
+                    } else {
+                        match hover_move(self.last_hover, raw, self.tip_for.get()) {
+                            HoverMove::Now => {
+                                self.deferred = None;
+                                self.last_hover = raw;
+                                let _ = self.events.send(UiEvent::Hover(raw));
+                            }
+                            HoverMove::Defer(d) => {
+                                // 取较早者：宽限里又移到另一个候选时按切换延迟收紧，不顺延。
+                                let at = Instant::now() + d;
+                                self.deferred = Some(self.deferred.map_or(at, |u| u.min(at)));
+                            }
+                        }
                     }
-                } else if self.engage_at.is_none() {
-                    // 首次真实移动：启动窗口级激活闸门（仅一次，~60ms）
+                } else if self.engage_at.is_none() && !self.tip_hold.blocks_gate() {
+                    // 首次真实移动：启动窗口级激活闸门（仅一次，~60ms）。
+                    // 右键压制「等菜单 / 菜单中」不武装，见 TipHold。
                     self.engage_at =
                         Some(Instant::now() + Duration::from_millis(self.engage_delay_ms));
                 }
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
+                // 菜单开着时这次右键由菜单轮询那一路合成（`CandidateWindow::menu_outside_press`），
+                // 两路都认会请求两遍菜单。「等菜单」阶段同理：已有一个请求在路上——合成那一路
+                // 先走、这条真实消息后到时，菜单已被轮询收起、还看不出「开着」，只能靠它挡。
+                if crate::popup_menu::menu_visible()
+                    || matches!(self.tip_hold, TipHold::AwaitMenu { .. })
+                {
+                    return Some(LRESULT(0));
+                }
                 let (x, y) = mouse_pos(lparam);
-                let i = self.hit(x, y);
                 // 用屏幕光标坐标定位菜单
-                let (sx, sy) = unsafe {
+                let screen = unsafe {
                     let mut p = POINT::default();
                     let _ = GetCursorPos(&mut p);
                     (p.x, p.y)
                 };
-                if i >= 0 {
-                    // 命中候选 → 词条菜单
-                    let _ = self.events.send(UiEvent::RequestCandidateMenu {
-                        page_local: i as usize,
-                        x: sx,
-                        y: sy,
-                    });
-                } else {
-                    // 空白处 → 功能主菜单（光标处向下弹）
-                    let _ = self
-                        .events
-                        .send(UiEvent::RequestMainMenu(MenuAnchor::at_point(sx, sy)));
-                }
+                self.right_click(x, y, screen);
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
@@ -4072,7 +4392,7 @@ mod min_size_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: comment.to_string(),
+            comment: comment.into(),
             no_index: false,
         }
     }
@@ -4658,7 +4978,7 @@ mod pager_inline_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -5197,7 +5517,7 @@ mod width_budget_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -5540,7 +5860,7 @@ mod width_budget_tests {
             w.scale = 1.0;
             w.set_orientation(false, true, upright);
             let mut item = cand("甲");
-            item.comment = comment.to_string();
+            item.comment = comment.into();
             w.update("", 0, "", vec![item], 0, -1, 1, 1);
             let mut root = w.build_tree(false);
             root.layout(0.0, 0.0, &w.text_renderer);
@@ -5674,7 +5994,7 @@ mod schema_font_tests {
             code: String::new(),
             label: String::new(),
             tooltip: Default::default(),
-            comment: String::new(),
+            comment: Default::default(),
             no_index: false,
         }
     }
@@ -6429,7 +6749,7 @@ mod font_precedence_tests {
                 code: String::new(),
                 label: String::new(),
                 tooltip: Default::default(),
-                comment: "注".to_string(),
+                comment: "注".into(),
                 no_index: false,
             })
             .collect();
@@ -6569,3 +6889,814 @@ mod font_precedence_tests {
         assert_eq!(w.text_renderer.base_size(), 22.0, "换主题后基准字号没跟上");
     }
 }
+
+/// 候选右键对悬停气泡的压制（设计 `candidate-tooltip-sections.md` §7.6 规则 A）。
+///
+/// 非 Windows 下 `GetCursorPos` 是 mock（恒 (0,0)），物理移动门控靠每次移动前把
+/// `last_cursor` 拨开来模拟「鼠标真动了」。时间一律显式传入 `flush`，不依赖真实流逝；
+/// 「菜单是否可见」是线程局部，测试线程各自一份。
+#[cfg(test)]
+mod tip_hold_tests {
+    use super::*;
+    use crate::popup_menu::set_menu_visible;
+    use std::sync::mpsc::{Receiver, channel};
+
+    const DELAY: u64 = 60;
+
+    fn mouse(delay_ms: u64) -> (CandidateMouse, Receiver<UiEvent>) {
+        set_menu_visible(false);
+        let (tx, rx) = channel();
+        let r = |x| Rect {
+            x,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        let m = CandidateMouse {
+            hit_rects: vec![(0, r(0.0)), (1, r(20.0))],
+            events: tx,
+            last_hover: -1,
+            last_cursor: (i32::MIN, i32::MIN),
+            engaged: false,
+            engage_at: None,
+            pending_raw: -1,
+            engage_delay_ms: delay_ms,
+            hwnd: HWND::default(),
+            dragging: false,
+            drag_anchor: (0, 0),
+            drag_origin: (0, 0),
+            drag_pin: None,
+            margin: (0, 0, 0, 0),
+            double_click: crate::double_click::DoubleClick::new(),
+            tip_hold: TipHold::Off,
+            tip_released: false,
+            tip_for: Rc::new(Cell::new(-1)),
+            deferred: None,
+        };
+        (m, rx)
+    }
+
+    fn lp(x: i32, y: i32) -> LPARAM {
+        LPARAM(((y << 16) | x) as isize)
+    }
+
+    fn real_move(m: &mut CandidateMouse, x: i32) {
+        m.last_cursor = (i32::MIN, i32::MIN);
+        m.on_message(HWND::default(), WM_MOUSEMOVE, WPARAM(0), lp(x, 5));
+    }
+
+    fn right_click(m: &mut CandidateMouse, x: i32) {
+        m.on_message(HWND::default(), WM_RBUTTONDOWN, WPARAM(0), lp(x, 5));
+    }
+
+    /// 远在任何延迟之后（但早于「等菜单」的兜底超时）。
+    fn later() -> Instant {
+        Instant::now() + Duration::from_millis(1000)
+    }
+
+    fn hovers(rx: &Receiver<UiEvent>) -> Vec<i32> {
+        rx.try_iter()
+            .filter_map(|e| match e {
+                UiEvent::Hover(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn menu_requests(rx: &Receiver<UiEvent>) -> usize {
+        rx.try_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    UiEvent::RequestCandidateMenu { .. } | UiEvent::RequestMainMenu(_)
+                )
+            })
+            .count()
+    }
+
+    /// 已激活、悬停在候选 0 上（UI 画着的悬停也是 0）。
+    fn engaged_on_first(delay_ms: u64) -> (CandidateMouse, Receiver<UiEvent>) {
+        let (mut m, rx) = mouse(delay_ms);
+        real_move(&mut m, 5);
+        m.flush(later(), -1);
+        assert_eq!(hovers(&rx), vec![0]);
+        (m, rx)
+    }
+
+    /// 右键时激活延迟还没到期：到期后不能再发 Hover——那正是「气泡在菜单弹出后冒出来、
+    /// 叠在菜单上」的来路。
+    #[test]
+    fn right_click_cancels_pending_engage() {
+        let (mut m, rx) = mouse(DELAY);
+        real_move(&mut m, 5);
+        assert!(m.engage_at.is_some(), "首次真实移动武装闸门");
+        right_click(&mut m, 5);
+        m.flush(later(), -1);
+        assert!(m.tip_hold.active());
+        assert!(m.engage_at.is_none());
+        assert!(hovers(&rx).is_empty(), "闸门已撤，不应再发悬停");
+    }
+
+    /// 审查探针（H1）：右键 → 菜单可见之前鼠标动了 → 菜单可见 → 到期。整段都不得发 Hover。
+    /// 右键到菜单可见之间「菜单开着」还是 false，只靠它挡闸门时这里会漏。
+    fn probe_right_move_menu_flush(delay_ms: u64) {
+        let (mut m, rx) = engaged_on_first(delay_ms);
+        right_click(&mut m, 5);
+        real_move(&mut m, 25);
+        m.flush(later(), 0);
+        assert!(hovers(&rx).is_empty(), "等菜单阶段不得发悬停");
+        set_menu_visible(true);
+        m.flush(later(), 0);
+        real_move(&mut m, 6);
+        m.flush(later(), 0);
+        assert_eq!(m.tip_hold, TipHold::InMenu);
+        assert!(m.engage_at.is_none(), "菜单中不武装");
+        assert!(hovers(&rx).is_empty(), "菜单中不得发悬停");
+    }
+
+    #[test]
+    fn move_before_menu_shows_does_not_rearm() {
+        probe_right_move_menu_flush(DELAY);
+    }
+
+    /// `ui.tooltip.delay=0`：闸门一武装就到期，没有「等菜单」阶段时气泡会抢在菜单之前出来。
+    #[test]
+    fn move_before_menu_shows_does_not_rearm_with_zero_delay() {
+        probe_right_move_menu_flush(0);
+    }
+
+    /// 菜单关闭后要重新移动、再走一次延迟才解除；UI 画着的悬停就是光标下的目标时由窗口
+    /// 本地补显示（不发 Hover，协调器不会因同值重绘）。
+    #[test]
+    fn release_after_fresh_engage_same_target() {
+        let (mut m, rx) = engaged_on_first(DELAY);
+        right_click(&mut m, 5);
+        set_menu_visible(true);
+        m.flush(Instant::now(), 0);
+        set_menu_visible(false);
+        m.flush(later(), 0);
+        assert_eq!(m.tip_hold, TipHold::AwaitMove, "菜单一关、鼠标没动：仍压着");
+        real_move(&mut m, 6);
+        let armed = m.engage_at.expect("真实移动武装闸门");
+        m.flush(armed - Duration::from_millis(1), 0);
+        assert!(m.tip_hold.active(), "延迟没走完不解除");
+        m.flush(armed, 0);
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(m.tip_released, "UI 画着的就是它，须本地补显示");
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 解除时目标变了：发 Hover，由协调器重绘带出气泡。
+    #[test]
+    fn release_after_fresh_engage_new_target() {
+        let (mut m, rx) = engaged_on_first(DELAY);
+        right_click(&mut m, 5);
+        m.flush(later(), 0);
+        real_move(&mut m, 25);
+        // 没有菜单出现：等兜底超时后才算关闭。
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, 0);
+        real_move(&mut m, 26);
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 3, 0);
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(!m.tip_released);
+        assert_eq!(hovers(&rx), vec![1]);
+    }
+
+    /// M1：压制期间候选重绘过、协调器把悬停清成 -1（UI 画的是 -1），而 `last_hover` 还是 0。
+    /// 解除时回到同一候选，必须发 Hover(0)——按 `last_hover` 判会以为「没变」，气泡不再回来。
+    #[test]
+    fn release_after_repaint_resends_hover() {
+        let (mut m, rx) = engaged_on_first(DELAY);
+        right_click(&mut m, 5);
+        set_menu_visible(true);
+        m.flush(Instant::now(), 0);
+        set_menu_visible(false);
+        real_move(&mut m, 6);
+        m.flush(later(), -1);
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(!m.tip_released);
+        assert_eq!(hovers(&rx), vec![0]);
+    }
+
+    /// 兜底超时：请求被丢、菜单始终没出现，压制不能永久持续。
+    #[test]
+    fn await_menu_times_out_to_await_move() {
+        let (mut m, _rx) = mouse(DELAY);
+        right_click(&mut m, 5);
+        let TipHold::AwaitMenu { until } = m.tip_hold else {
+            panic!("右键后应在等菜单：{:?}", m.tip_hold);
+        };
+        m.flush(until - Duration::from_millis(1), -1);
+        assert!(m.tip_hold.blocks_gate());
+        m.flush(until, -1);
+        assert_eq!(m.tip_hold, TipHold::AwaitMove);
+    }
+
+    /// 迟到的菜单（超时之后才出现）照样压住，已武装的闸门作废。
+    #[test]
+    fn late_menu_reenters_in_menu() {
+        let (mut m, rx) = mouse(DELAY);
+        right_click(&mut m, 5);
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, -1);
+        real_move(&mut m, 6);
+        assert!(m.engage_at.is_some());
+        set_menu_visible(true);
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 3, -1);
+        assert_eq!(m.tip_hold, TipHold::InMenu);
+        assert!(m.engage_at.is_none());
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 菜单开着时候选窗自己收到的右键不理：这次按下由菜单轮询合成，两路都认会请求两遍。
+    #[test]
+    fn own_right_click_ignored_while_menu_visible() {
+        let (mut m, rx) = mouse(DELAY);
+        set_menu_visible(true);
+        right_click(&mut m, 5);
+        assert_eq!(menu_requests(&rx), 0);
+        assert!(!m.tip_hold.active());
+    }
+
+    /// 「等菜单」阶段自己的右键不理：合成那一路已发出请求、菜单还没出现（轮询已把旧菜单
+    /// 收起，看不出「开着」），同一次右键的真实消息随后才到——不挡就请求两遍、菜单重弹。
+    /// 超时转入「等重新移动」后恢复。
+    #[test]
+    fn own_right_click_ignored_while_awaiting_menu() {
+        let (mut m, rx) = mouse(DELAY);
+        m.right_click(5.0, 5.0, (5, 5));
+        assert_eq!(menu_requests(&rx), 1);
+        right_click(&mut m, 5);
+        assert_eq!(menu_requests(&rx), 0, "请求在途不得重发");
+        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, -1);
+        right_click(&mut m, 5);
+        assert_eq!(menu_requests(&rx), 1, "超时后恢复");
+    }
+
+    /// 组合结束 / 窗口重新出现：压制随悬停状态一并清掉，不带进下一轮。
+    #[test]
+    fn reset_hover_clears_hold() {
+        let (mut m, _rx) = mouse(DELAY);
+        right_click(&mut m, 5);
+        m.reset_hover();
+        assert_eq!(m.tip_hold, TipHold::Off);
+        assert!(!m.tip_released);
+    }
+
+    // ---- 窗口层：气泡真的被收起 / 补回（M2），菜单外右键合成（L1） ----
+
+    fn doc() -> wind_ui_types::TooltipDoc {
+        wind_ui_types::TooltipDoc {
+            sections: vec![wind_ui_types::TooltipSection {
+                title: None,
+                inline: false,
+                lines: vec![wind_ui_types::TooltipLine {
+                    text: "nǐ".into(),
+                    raw: 0,
+                }],
+            }],
+        }
+    }
+
+    /// 候选窗（mock）：两个带气泡的候选，UI 悬停在候选 0 上，气泡已显示。
+    fn window() -> (CandidateWindow, Receiver<UiEvent>) {
+        set_menu_visible(false);
+        let (tx, rx) = channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        let item = |t: &str| CandidateItem {
+            text: t.into(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: std::sync::Arc::new(doc()),
+            comment: Default::default(),
+            no_index: false,
+        };
+        w.candidates = vec![item("你"), item("拟")];
+        let r = |x| Rect {
+            x,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        w.hit_rects = vec![(0, r(0.0)), (1, r(20.0))];
+        w.mouse.borrow_mut().hit_rects = w.hit_rects.clone();
+        w.hover = 0;
+        w.visible = true;
+        w.update_tooltip(0, 0);
+        assert!(tip_shown(&w), "前提：气泡已显示");
+        (w, rx)
+    }
+
+    fn tip_shown(w: &CandidateWindow) -> bool {
+        w.tooltip.as_ref().is_some_and(|t| t.shown())
+    }
+
+    /// 右键当轮 tick 就收起已显示的气泡；压制期间重绘不再弹出；解除后补回。
+    #[test]
+    fn hold_hides_tip_and_repaint_keeps_it_hidden() {
+        let (mut w, _rx) = window();
+        w.mouse.borrow_mut().right_click(5.0, 5.0, (5, 5));
+        w.tick();
+        assert!(!tip_shown(&w), "右键后气泡须收起");
+        w.update_tooltip(0, 0);
+        assert!(!tip_shown(&w), "压制期间重绘不得弹出气泡");
+        // 菜单出现又关闭，随后重新移动、走完延迟。
+        set_menu_visible(true);
+        w.tick();
+        set_menu_visible(false);
+        w.tick();
+        {
+            let mut m = w.mouse.borrow_mut();
+            m.engage_delay_ms = 0;
+            real_move(&mut m, 6);
+        }
+        w.tick();
+        assert!(tip_shown(&w), "解除后同一候选的气泡须补回");
+    }
+
+    /// L1：菜单开着时在候选窗上右键（候选窗收不到，由菜单轮询转来）→ 关旧开新。
+    #[test]
+    fn outside_right_press_on_candidate_window_reopens_menu() {
+        let (mut w, rx) = window();
+        w.window_at = |_, _, _| true;
+        w.menu_outside_press(25, 5, true);
+        let evs: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, UiEvent::RequestCandidateMenu { page_local: 1, .. })),
+            "命中候选 1 应请求其词条菜单：{evs:?}"
+        );
+        assert!(w.mouse.borrow().tip_hold.active(), "合成右键同样压住气泡");
+        // 左键：只关菜单。
+        w.menu_outside_press(25, 5, false);
+        assert_eq!(menu_requests(&rx), 0);
+    }
+
+    /// 右键落在候选窗外（且不在气泡上）：不合成。
+    #[test]
+    fn outside_right_press_elsewhere_is_ignored() {
+        let (mut w, rx) = window();
+        w.window_at = |_, _, _| false;
+        w.menu_outside_press(25, 5, true);
+        assert_eq!(menu_requests(&rx), 0);
+    }
+
+    // ---- 悬停宽限与强制隐藏（设计 §7.6 C）----
+
+    #[test]
+    fn hover_move_table() {
+        use HoverMove::*;
+        // 气泡跟着候选 0：去往「无」宽限，去往候选 1 切换延迟。
+        assert_eq!(hover_move(0, -1, 0), Defer(TIP_GRACE));
+        assert_eq!(
+            hover_move(0, TAG_PAGE_PREV, 0),
+            Defer(TIP_GRACE),
+            "翻页器按「无」"
+        );
+        assert_eq!(hover_move(0, 1, 0), Defer(TIP_SWITCH));
+        // 气泡不跟着移开的那个候选（没显示 / 跟着别的）：即时。
+        assert_eq!(hover_move(0, -1, -1), Now);
+        assert_eq!(hover_move(0, 1, 1), Now);
+        assert_eq!(hover_move(-1, 0, -1), Now);
+        assert_eq!(
+            hover_move(TAG_PAGE_PREV, 0, TAG_PAGE_PREV),
+            Now,
+            "翻页器没有气泡"
+        );
+        assert!(TIP_SWITCH < TIP_GRACE);
+    }
+
+    #[test]
+    fn resolve_deferred_table() {
+        let t0 = Instant::now();
+        let until = t0 + TIP_GRACE;
+        assert_eq!(resolve_deferred(t0, until, false), Deferred::Wait);
+        assert_eq!(resolve_deferred(until, until, false), Deferred::Fire);
+        assert_eq!(
+            resolve_deferred(t0, until, true),
+            Deferred::Cancel,
+            "进了气泡就撤"
+        );
+        assert_eq!(resolve_deferred(until, until, true), Deferred::Cancel);
+    }
+
+    /// 已激活、悬停在候选 0 上且气泡跟着它。
+    fn engaged_on_0() -> (CandidateMouse, Receiver<UiEvent>) {
+        let (mut m, rx) = mouse(0);
+        m.engaged = true;
+        m.last_hover = 0;
+        m.tip_for.set(0);
+        (m, rx)
+    }
+
+    /// 候选 → 空隙 → 气泡：穿过空隙时不发 `Hover(-1)`；进了气泡则整个撤掉，悬停留在 0。
+    #[test]
+    fn gap_on_the_way_to_tip_keeps_hover() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        assert!(hovers(&rx).is_empty(), "空隙里不得立刻清悬停");
+        assert!(m.deferred.is_some());
+        m.resolve_deferred(later(), true);
+        assert!(hovers(&rx).is_empty(), "进了气泡：撤掉");
+        assert!(m.deferred.is_none());
+        assert_eq!(m.last_hover, 0);
+    }
+
+    /// 宽限到期仍不在气泡上（也没回来）：照发。
+    #[test]
+    fn gap_fires_after_grace() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        m.resolve_deferred(Instant::now(), false);
+        assert!(hovers(&rx).is_empty(), "未到期不发");
+        m.resolve_deferred(later(), false);
+        assert_eq!(hovers(&rx), vec![-1]);
+        assert_eq!(m.last_hover, -1);
+    }
+
+    /// 宽限期内回到原候选：待发作废，到期也不发。
+    #[test]
+    fn return_to_same_candidate_cancels() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        real_move(&mut m, 5);
+        assert!(m.deferred.is_none());
+        m.resolve_deferred(later(), false);
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 擦过相邻候选：不立刻切换，切换延迟到期才发；期间进了气泡则不切。
+    #[test]
+    fn crossing_neighbour_defers_switch() {
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 25);
+        assert!(hovers(&rx).is_empty(), "擦过候选 1 不立刻切");
+        let until = m.deferred.expect("延后");
+        assert!(until <= Instant::now() + TIP_SWITCH);
+        m.resolve_deferred(until, false);
+        assert_eq!(hovers(&rx), vec![1]);
+        // 进了气泡的那种。
+        let (mut m, rx) = engaged_on_0();
+        real_move(&mut m, 25);
+        m.resolve_deferred(later(), true);
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// 先进空隙（宽限）、再到另一个候选：按较早的切换延迟收紧，不顺延。
+    #[test]
+    fn switch_after_gap_tightens_deadline() {
+        let (mut m, _rx) = engaged_on_0();
+        real_move(&mut m, 15);
+        let grace = m.deferred.unwrap();
+        real_move(&mut m, 25);
+        assert!(m.deferred.unwrap() < grace);
+    }
+
+    /// 气泡没跟着移开的候选：悬停照旧即时。
+    #[test]
+    fn no_tip_no_grace() {
+        let (mut m, rx) = engaged_on_0();
+        m.tip_for.set(-1);
+        real_move(&mut m, 15);
+        assert_eq!(hovers(&rx), vec![-1]);
+        assert!(m.deferred.is_none());
+    }
+
+    /// 窗口层：tick 在光标进了气泡时撤掉待发；到期时间进入 next_deadline。
+    #[test]
+    fn window_tick_cancels_when_cursor_on_tip() {
+        let (mut w, rx) = window();
+        assert_eq!(w.tip_for.get(), 0, "显示气泡即记下它跟着谁");
+        {
+            let mut m = w.mouse.borrow_mut();
+            m.engaged = true;
+            m.last_hover = 0;
+            real_move(&mut m, 15);
+        }
+        let _ = hovers(&rx);
+        let until = w.mouse.borrow().deferred.expect("延后");
+        assert_eq!(w.next_deadline(), Some(until));
+        w.tooltip_mut().unwrap().stub_on_tip(true);
+        w.tick();
+        assert!(w.mouse.borrow().deferred.is_none());
+        assert!(hovers(&rx).is_empty());
+    }
+
+    /// Esc / 上屏 / 失焦（候选窗收起）：光标就停在气泡上、跟踪挂着，气泡也得收；待发的
+    /// 悬停与「气泡跟着谁」一并清掉。
+    #[test]
+    fn candidate_hide_force_hides_tip_under_cursor() {
+        let (mut w, _rx) = window();
+        {
+            let t = w.tooltip_mut().unwrap();
+            t.stub_on_tip(true);
+            t.simulate_move();
+        }
+        w.mouse.borrow_mut().deferred = Some(later());
+        w.hide();
+        assert!(!tip_shown(&w), "候选窗收起，气泡不得残留");
+        assert_eq!(w.tip_for.get(), -1);
+        assert!(w.mouse.borrow().deferred.is_none());
+    }
+
+    /// 悬停变成「无」（协调器重绘）：`tip_for` 随之清掉，不再对后续移动延后。
+    #[test]
+    fn tip_for_clears_when_tip_goes_away() {
+        let (mut w, _rx) = window();
+        w.hover = -1;
+        w.update_tooltip(0, 0);
+        assert_eq!(w.tip_for.get(), -1);
+    }
+}
+
+// 直立态逐格切叶子时，分段颜色跟着格走（设计 text-span-colors.md §7.1）。
+#[cfg(test)]
+mod upright_color_run_tests {
+    use super::*;
+    use crate::text::dwrite::ColorRun;
+
+    fn window(upright: bool) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.set_orientation(false, upright, upright);
+        w
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    /// 「a你b」：红 `a你`（0..4）、蓝 `b`（4..5）。
+    fn runs() -> Vec<ColorRun> {
+        vec![
+            ColorRun {
+                start: 0,
+                end: 4,
+                rgba: RED,
+            },
+            ColorRun {
+                start: 4,
+                end: 5,
+                rgba: BLUE,
+            },
+        ]
+    }
+
+    fn build(w: &CandidateWindow) -> View {
+        let runs = runs();
+        w.upright_text("a你b", None, |seg, _, off| {
+            View::leaf(seg, [0, 0, 0, 255]).color_runs(ColorRun::slice(&runs, off, off + seg.len()))
+        })
+    }
+
+    /// 不切格：偏移为 0，一个叶子拿全部区间，原样。
+    #[test]
+    fn unsplit_leaf_keeps_all_runs() {
+        let v = build(&window(false));
+        assert_eq!(v.text.as_deref(), Some("a你b"));
+        assert_eq!(v.color_runs, runs());
+    }
+
+    /// 直立态逐格切：每格拿到自己范围内的那段、平移到格内偏移。
+    #[test]
+    fn upright_cells_get_their_own_slice() {
+        let v = build(&window(true));
+        // 每格是扶正包裹层（旋转节点）里的一个叶子。
+        let cells: Vec<(&str, &[ColorRun])> = v
+            .children
+            .iter()
+            .map(|c| {
+                let leaf = &c.children[0];
+                (leaf.text.as_deref().unwrap(), leaf.color_runs.as_slice())
+            })
+            .collect();
+        let one = |end, rgba| {
+            vec![ColorRun {
+                start: 0,
+                end,
+                rgba,
+            }]
+        };
+        assert_eq!(
+            cells,
+            vec![
+                ("a", one(1, RED).as_slice()),
+                ("你", one(3, RED).as_slice()),
+                ("b", one(1, BLUE).as_slice()),
+            ]
+        );
+    }
+}
+
+// 注释的分段颜色：按主题与候选状态求色，接到注释叶子的 color_runs（设计 text-span-colors.md §6）。
+#[cfg(test)]
+mod comment_color_tests {
+    use super::*;
+    use wind_ui_types::{SpanStyle, StyledText};
+
+    const RED: [u8; 4] = [0xC0, 0, 0, 255];
+
+    /// 「wq(nǐ)」：`wq` 带内联色 `#C00000`（选中态改用 `selected=` 给的色），其余无色。
+    fn comment(spec: &str) -> StyledText {
+        let mut t = StyledText::new();
+        t.push(
+            "wq",
+            &SpanStyle {
+                role: Some("code_rev"),
+                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(spec))),
+                ..Default::default()
+            },
+        );
+        t.push(
+            "(nǐ)",
+            &SpanStyle {
+                role: Some("literal"),
+                ..Default::default()
+            },
+        );
+        t
+    }
+
+    fn window(theme: wind_theme::Resolved, upright: bool) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_theme(theme);
+        w.set_orientation(false, upright, upright);
+        w
+    }
+
+    fn cand(c: StyledText) -> CandidateItem {
+        CandidateItem {
+            text: "你".into(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: Default::default(),
+            comment: c,
+            no_index: false,
+        }
+    }
+
+    /// 树里所有带颜色区间的叶子：`(文字, 区间)`。
+    fn colored(v: &View, out: &mut Vec<(String, Vec<ColorRun>)>) {
+        if let Some(t) = &v.text
+            && !v.color_runs.is_empty()
+        {
+            out.push((t.clone(), v.color_runs.clone()));
+        }
+        for c in &v.children {
+            colored(c, out);
+        }
+    }
+
+    fn runs_of(
+        w: &mut CandidateWindow,
+        comment_spec: &str,
+        selected: usize,
+    ) -> Vec<(String, Vec<ColorRun>)> {
+        w.update(
+            "ni",
+            2,
+            "",
+            vec![cand(comment(comment_spec))],
+            selected,
+            -1,
+            1,
+            1,
+        );
+        let mut out = Vec::new();
+        colored(&w.build_tree(false), &mut out);
+        out
+    }
+
+    fn run(start: u32, end: u32, rgba: [u8; 4]) -> ColorRun {
+        ColorRun { start, end, rgba }
+    }
+
+    #[test]
+    fn inline_color_reaches_the_comment_leaf() {
+        let mut w = window(wind_theme::Resolved::default(), false);
+        // 候选 0 不是选中（selected 越界）⇒ 常态。
+        assert_eq!(
+            runs_of(&mut w, "#C00000", 9),
+            vec![("wq(nǐ)".to_string(), vec![run(0, 2, RED)])]
+        );
+    }
+
+    /// 规则 3：主题把选中态注释正文色改了 ⇒ 内联色回落该态正文色（区间被丢）；
+    /// `selected=` 单列的照用。
+    #[test]
+    fn selected_state_falls_back_unless_inline_says_selected() {
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.comment.selected = Some(Box::new(wind_theme::RvNode {
+            text_color: Some([255, 255, 255, 255]),
+            ..Default::default()
+        }));
+        let mut w = window(theme, false);
+        assert_eq!(runs_of(&mut w, "#C00000", 0), vec![], "选中态回落正文色");
+        assert_eq!(
+            runs_of(&mut w, "#C00000,selected=#00FF00", 0),
+            vec![("wq(nǐ)".to_string(), vec![run(0, 2, [0, 255, 0, 255])])]
+        );
+    }
+
+    /// 非出厂测试主题 `span-roles`（wind-theme testdata）：主题角色色真的接到注释叶子，
+    /// 且选中 / 悬停态按 §6.3 回落。
+    fn roles_theme() -> wind_theme::Resolved {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        wind_theme::load_resolved_dirs(
+            &[
+                root.join("../wind-theme/testdata/themes"),
+                root.join("../../../data/themes"),
+            ],
+            "span-roles",
+            false,
+        )
+        .unwrap()
+    }
+
+    /// 「wq nǐ」：`wq` 角色 code_rev、` ` 字面、`nǐ` 角色 pinyin。
+    fn roles_comment() -> StyledText {
+        let mut t = StyledText::new();
+        t.push(
+            "wq",
+            &SpanStyle {
+                role: Some("code_rev"),
+                ..Default::default()
+            },
+        );
+        t.push(
+            " ",
+            &SpanStyle {
+                role: Some("literal"),
+                ..Default::default()
+            },
+        );
+        t.push(
+            "nǐ",
+            &SpanStyle {
+                role: Some("pinyin"),
+                ..Default::default()
+            },
+        );
+        t
+    }
+
+    fn roles_runs(w: &mut CandidateWindow, selected: usize, hover: i32) -> Vec<ColorRun> {
+        w.update(
+            "ni",
+            2,
+            "",
+            vec![cand(roles_comment())],
+            selected,
+            hover,
+            1,
+            1,
+        );
+        let mut out = Vec::new();
+        colored(&w.build_tree(false), &mut out);
+        out.into_iter().flat_map(|(_, r)| r).collect()
+    }
+
+    #[test]
+    fn theme_roles_color_the_comment_per_state() {
+        let mut w = window(roles_theme(), false);
+        const CODE: [u8; 4] = [0xC0, 0, 0, 255];
+        const LIT: [u8; 4] = [0xB0, 0xB0, 0xB0, 255];
+        const PY: [u8; 4] = [0, 0x80, 0, 255];
+        // 常态：三个角色各自的色。
+        assert_eq!(
+            roles_runs(&mut w, 9, -1),
+            vec![run(0, 2, CODE), run(2, 3, LIT), run(3, 6, PY)]
+        );
+        // 选中：主题改了选中态正文色 ⇒ 未单列的回落正文色（区间被丢）；code_rev 单列保留。
+        assert_eq!(
+            roles_runs(&mut w, 0, -1),
+            vec![run(0, 2, [0xFF, 0xE0, 0x8A, 255])]
+        );
+        // 悬停：正文色没改 ⇒ 常态角色色照用；pinyin 在悬停态单列。
+        assert_eq!(
+            roles_runs(&mut w, 9, 0),
+            vec![
+                run(0, 2, CODE),
+                run(2, 3, LIT),
+                run(3, 6, [0, 0, 0xFF, 255])
+            ]
+        );
+    }
+
+    /// 直立态逐格切：`w`、`q` 两格各得一段，其余格没有区间。
+    #[test]
+    fn upright_cells_get_their_slices() {
+        let mut w = window(wind_theme::Resolved::default(), true);
+        assert_eq!(
+            runs_of(&mut w, "#C00000", 9),
+            vec![
+                ("w".to_string(), vec![run(0, 1, RED)]),
+                ("q".to_string(), vec![run(0, 1, RED)]),
+            ]
+        );
+    }
+}
+
+// 渲染 golden 对拍（Linux mock 后端才有绘制调用记录）。见模块文档。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod render_golden;

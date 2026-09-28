@@ -147,7 +147,7 @@ const RARE_PHRASE_VALUES: &[&str] = &["keep", "filter"];
 const PUNCT_EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear", "clear_no_input"];
 
 /// 码表词频应用策略。
-/// `schema.pinyin.code_hint_source` 的值域。
+/// `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` 共用的值域。
 ///
 /// ⚠️ 必须与 [`wind_config::config::CodeHintSource::from_config`] 的 match 臂**逐项对齐**。
 /// 不对齐的表现是第二种漂移：注册表说某个值非法（CLI/设置页据此校验、生成下拉），
@@ -452,6 +452,10 @@ static REGISTRY: &[ConfigField] = &[
         "input.temp_pinyin.candidate_layout",
         Enum(LAYOUT_INTENT_VALUES),
     ),
+    f(
+        "input.temp_pinyin.code_hint_source",
+        Enum(CODE_HINT_SOURCE_VALUES),
+    ),
     f("input.url.enabled", Bool),
     f("input.url.prefixes", StrList),
     // 网址历史：独立于 url.enabled 的第二道开关（前者只改输入行为，后者开始落盘用户
@@ -498,6 +502,8 @@ static REGISTRY: &[ConfigField] = &[
     ),
     // 顶屏类上屏是否造词 + 推 6b（内部配置）
     f("input.top_commit_learn", Bool),
+    // 密码框强制英文（内部配置，入口是高级菜单）
+    f("input.password_force_english", Bool),
     // 联想。kind 兼任开关与类型（"off" 即关）。本段是**桌面基线**，移动端的差异走
     // [mobile.association]——值域里不留平台哨兵。
     f("input.association.kind", Enum(&["off", "word", "smart"])),
@@ -624,7 +630,14 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.status.display_mode", Enum(&["temp", "always"])),
     f("ui.status.show_on_focus", Bool),
     f("ui.status.schema_name_style", Enum(&["full", "short"])),
-    f("ui.status.position_mode", Enum(&["follow_caret", "fixed"])),
+    f(
+        "ui.status.position_mode",
+        Enum(&crate::app_compat::STATUS_POSITION_MODES),
+    ),
+    f(
+        "ui.status.fallback_position",
+        Enum(&crate::app_compat::STATUS_FALLBACK_POSITIONS),
+    ),
     f("ui.status.offset_x", Int),
     f("ui.status.offset_y", Int),
     f("ui.status.custom_x", Int),
@@ -1301,6 +1314,31 @@ mod tests {
             l1, l2,
             "ui.tooltip.sections 的 L1 默认值与 L2 出厂文件不一致"
         );
+    }
+
+    /// L1↔L2 同源：全局注释模板（横竖两份）。`default_comment_template()` 与
+    /// `data/config.toml` 是同一个出厂事实的两份写法，分叉的表现是「删掉配置文件后注释栏变了样」。
+    #[test]
+    fn comment_template_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.candidate;
+        let cand = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("candidate"))
+            .cloned()
+            .expect("data/config.toml 缺少 [ui.candidate]");
+        for (k, v) in [
+            ("comment_template_vertical", &l1.comment_template_vertical),
+            (
+                "comment_template_horizontal",
+                &l1.comment_template_horizontal,
+            ),
+        ] {
+            assert_eq!(
+                cand.get(k).and_then(toml::Value::as_str),
+                Some(v.as_str()),
+                "ui.candidate.{k} 的 L1 默认值与 L2 出厂文件不一致"
+            );
+        }
     }
 
     /// L1↔L2 同源：气泡的单行上限与折行宽度（取值守门在 config.rs `test_tooltip_defaults`，

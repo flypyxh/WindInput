@@ -197,16 +197,18 @@ draft_max_entries = 50000
 draft_flush_batch = 64
 
 # 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
+# （例外：编码来源 code_hint_source 临时拼音/快捷输入另有一份，见 [input.temp_pinyin]。）
 [schema.pinyin]
-# 拼音方案下，候选注释里的编码从哪来。四档：
-#   off        两种都不显示
+# 拼音方案（含双拼）下，候选注释里的编码从哪来。四档：
+#   off        两种都不显示（出厂）
 #   codetable  只显示主码表反查编码（${code_rev} / ${code_rev_all}）
 #   shuangpin  只显示双拼编码（${shuangpin}）
-#   auto       两者都允许，谁先出由下方注释模板的回退链决定（出厂）
+#   auto       两者都允许，谁先出由下方注释模板的回退链决定
 # 开关管「允许哪些来源求值」，模板管「按什么顺序和格式摆」——两层不重叠。
-# 认不出的值按出厂档处理。
+# 出厂 off：编码反查是给码表用户的，纯拼音/双拼用户多半用不上；需要的话改成 codetable/auto。
+# 临时拼音/快捷输入不读这里，读 [input.temp_pinyin] 的同名键。认不出的值按 auto 处理。
 # 旧的 show_code_hint 已改名：升级时 true 自动迁移为 codetable（严格零回归）、false 为 off。
-code_hint_source = "auto"
+code_hint_source = "off"
 use_smart_compose = true
 # 让**你上屏过的词**（用户词库 + 临时词库）参与整句解码（智能组句）。
 #
@@ -647,6 +649,11 @@ top_commit_mode = "direct_commit"
 # 高亮是分步候选（只消费前缀）时顶屏只推晋升计数、不造词。词频与上屏历史不受本项影响。
 # 例外：临时拼音里按非标点键被吞掉时选中高亮候选，那是选词不是顶屏，恒造词、不读本项。
 top_commit_learn = true
+# 密码框强制英文（内部项，设置页不暴露；入口是托盘/工具栏右键「高级」菜单，勾选会被记住）。
+# 宿主报出密码类 InputScope 时强制英文输入，输入法图标显示「英」。
+# 个别应用会把普通输入框也报成密码框（t197），导致那里打不出中文——此时关掉本项即可；
+# 关掉后 TSF 侧的吃键门控同步放行，输入诊断 HUD 仍照常显示宿主报的 InputScope。
+password_force_english = true
 
 # 检索范围放宽（filter_mode = "smart" 时的增强，见 docs/design/smart-filter-scope-relax.md）
 #
@@ -903,6 +910,9 @@ trigger_keys = ["backtick"]
 # 用热键进入时组合区不写引导符。
 hotkey = ""
 candidate_layout = "follow"
+# 临时拼音与快捷输入期间，拼音候选注释里的编码从哪来。值域同 [schema.pinyin] 的同名键，
+# 但两者独立：这里是码表用户借拼音反查编码的场景，出厂 auto；设 off 即不显示。
+code_hint_source = "auto"
 
 [input.auto_pair]
 chinese = false
@@ -1225,7 +1235,7 @@ min_window_height_vertical = 0
 # 只稳住候选区：翻页栏/编码栏的出现消失不在其量程内，要连这些一并罩住用
 # min_window_height_vertical（两项可同时配，取较大者）。
 min_rows = 0
-# 候选注释段（候选右侧灰字）模板。横排/竖排各一份、互不影响——两种排布能放的宽度差一个
+# 候选注释段（候选右侧的小字）模板。横排/竖排各一份、互不影响——两种排布能放的宽度差一个
 # 数量级（竖排每行独占，横排全部候选共享一行）。
 #
 # 语法：
@@ -1236,7 +1246,8 @@ min_rows = 0
 #
 # 可用变量：
 #   code_hint          引擎产的编码提示（码表前缀候选的剩余编码 si→sikao 标 kao；混输标记「拼」）
-#   code_rev           主码表整词反查编码（仅拼音来源候选，受 schema.pinyin.code_hint_source 门控）
+#   code_rev           主码表整词反查编码（仅拼音来源候选，受 schema.pinyin.code_hint_source 门控；
+#                      临时拼音/快捷输入期间改受 input.temp_pinyin.code_hint_source 门控）
 #   shuangpin          双拼编码（你好 → 小鹤 nihc）。同受上述门控。
 #                      **全拼方案下照样有值**：布局按「活跃方案→主拼音方案→已装的首个
 #                      双拼方案」回退，一个双拼方案都没装才恒空
@@ -1251,6 +1262,8 @@ min_rows = 0
 # 没有就显示主码表反查编码，再没有（例如没配主码表的用户）就显示双拼编码。
 # 前两段等价于本功能引入前的固定行为，故配了主码表的用户升级后所见不变。
 # ${code} / ${code_all} 是 ${code_rev} / ${code_rev_all} 的兼容别名，老模板照常可用。
+# 颜色：出厂注释整段是主题的注释色；主题可按变量配「角色色」，模板里也能直接写 $[颜色]{…}
+# （优先于主题），如 "$[info]{${code_hint|code_rev|shuangpin}}"。详见下方链接的「内联颜色」一节。
 # 例：竖排显示字根与注音 → "{〔${chaizi}〕}{ ${pinyin}}"
 # 例：同时看码表码与双拼码 → "${code_hint|code_rev}{ [${shuangpin}]}"
 # 完整说明与更多示例：https://windinput.com/docs/settings/appearance/candidate-comment
@@ -1332,7 +1345,13 @@ display_mode = "temp"
 # follow_caret 定位模式下，只有取到 TSF 权威坐标才显示——拿不到宁可不显示，也不弹在错位置。
 show_on_focus = false
 schema_name_style = "full"
+# 位置：follow_caret（跟随光标）/ fixed（固定在 custom_x/custom_y，拖动气泡定位）/
+# 锚点 screen_center、screen_top_left、screen_top_right、screen_bottom_left、screen_bottom_right
+# （前台窗口所在屏幕的工作区）、window_center、window_bottom_left（前台窗口边框）。
 position_mode = "follow_caret"
+# 光标坐标拿不到时放哪（只在 follow_caret 下生效）：last（最近一次有效位置）/ hide（不显示）/
+# 上面 7 个锚点之一。给 Illustrator 这类不报光标坐标的应用用锚点，气泡就不会停在别处。
+fallback_position = "last"
 offset_x = 0
 offset_y = 0
 custom_x = 0

@@ -30,7 +30,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use wind_config::config::{
     TRUNCATION_MARK, TooltipConfig, TooltipSection as SectionConfig, is_wide_char,
 };
-use wind_ui_types::{TooltipDoc, TooltipLine, TooltipSection};
+use wind_ui_types::{StyledText, TooltipDoc, TooltipLine, TooltipSection};
 
 /// 逐字段遍历的「汉字」口径：≥ U+3400（扩展 A 起）。与段列表引入前的气泡一致。
 fn is_han(c: char) -> bool {
@@ -71,7 +71,8 @@ pub(crate) struct CompiledTooltip {
 /// 一个候选的气泡：给 UI 的显示结构 + 协调器自留的原始行。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenderedTooltip {
-    pub(crate) doc: TooltipDoc,
+    /// 与下发给 UI 的 `CandidateItem::tooltip` 共享同一份。
+    pub(crate) doc: std::sync::Arc<TooltipDoc>,
     /// `raw[段][原始行]`，与 `doc.sections` 一一对应；`TooltipLine::raw` 是第二维下标。
     pub(crate) raw: Vec<Vec<String>>,
     /// 每段是否逐字段（`each = han | char`），与 `doc.sections` 一一对应。右键菜单只对
@@ -98,10 +99,10 @@ impl RenderedTooltip {
         let mut out: Vec<String> = Vec::new();
         for (sec, raw) in self.doc.sections.iter().zip(&self.raw) {
             match (&sec.title, raw.as_slice()) {
-                (Some(t), [only]) if sec.inline => out.push(format!("{t}: {only}")),
+                (Some(t), [only]) if sec.inline => out.push(format!("{}: {only}", t.as_str())),
                 (title, lines) => {
                     if let Some(t) = title {
-                        out.push(format!("[{t}]"));
+                        out.push(format!("[{}]", t.as_str()));
                     }
                     out.extend(lines.iter().cloned());
                 }
@@ -198,7 +199,7 @@ impl CompiledTooltip {
         for sec in &self.sections {
             let rows = match sec.each {
                 Each::Whole => {
-                    let (text, filled) = sec.template.render(&cand_eval, &|_| true);
+                    let (text, filled) = sec.template.render_styled(&cand_eval, &|_| true, false);
                     if filled { vec![text] } else { Vec::new() }
                 }
                 Each::Han | Each::Char => {
@@ -206,13 +207,14 @@ impl CompiledTooltip {
                         Each::Han => is_han(c),
                         _ => !c.is_whitespace(),
                     });
-                    let mut rows: Vec<(bool, String)> = Vec::new();
+                    let mut rows: Vec<(bool, StyledText)> = Vec::new();
                     for c in chars {
                         let eval = |name: &str, arg: Option<&str>| {
                             per_char(c, name, arg).or_else(|| cand_eval(name, arg))
                         };
                         // `${char}` 恒非空，不能让它撑起一行：查不到读音的字不该剩下 `好：`。
-                        let (text, filled) = sec.template.render(&eval, &|n| n != "char");
+                        let (text, filled) =
+                            sec.template.render_styled(&eval, &|n| n != "char", false);
                         if !filled {
                             continue;
                         }
@@ -230,29 +232,34 @@ impl CompiledTooltip {
                 }
             };
             // 原始行是复制 / 上屏的取值来源，必须保真：不 trim、保留段内空行（多段落原文），
-            // 只去掉首尾的空白行；全是空白即空段。
-            let mut raw: Vec<String> = rows
-                .iter()
-                .flat_map(|r| r.split('\n'))
-                .map(str::to_string)
-                .collect();
-            while raw.last().is_some_and(|l| l.trim().is_empty()) {
-                raw.pop();
+            // 只去掉首尾的空白行；全是空白即空段。样式跟着行走：原始行存纯文本（复制 / 上屏），
+            // 同形的带样式行供显示。
+            let mut styled: Vec<StyledText> = rows.into_iter().flat_map(split_lines).collect();
+            while styled.last().is_some_and(|l| l.as_str().trim().is_empty()) {
+                styled.pop();
             }
-            let head = raw.iter().take_while(|l| l.trim().is_empty()).count();
-            raw.drain(..head);
-            if raw.is_empty() {
+            let head = styled
+                .iter()
+                .take_while(|l| l.as_str().trim().is_empty())
+                .count();
+            styled.drain(..head);
+            if styled.is_empty() {
                 continue;
             }
+            let raw: Vec<String> = styled.iter().map(|l| l.as_str().to_string()).collect();
             // 段名的字面文字不随变量全空而消失：`编码{(${code_source})}` 直接输入时就是 `编码`。
-            let (title, _) = sec.label.render(&cand_eval, &|_| true);
-            let title = title.trim().to_string();
+            let (title, _) = sec.label.render_styled(&cand_eval, &|_| true, true);
+            let title = title.trim();
             // inline 按**原始行数**判：一条长原文折成多条显示行仍是「一行内容」，照样写成
             // `标题: 内容`；此时 `标题: ` 占掉第一条显示行的宽度。
             let inline = sec.inline && raw.len() == 1 && !title.is_empty();
-            let prefix = if inline { str_width(&title) + 2 } else { 0 };
-            let lines = raw
-                .iter()
+            let prefix = if inline {
+                str_width(title.as_str()) + 2
+            } else {
+                0
+            };
+            let lines = styled
+                .into_iter()
                 .enumerate()
                 .flat_map(|(i, l)| {
                     let idx = u16::try_from(i).unwrap_or(u16::MAX);
@@ -261,11 +268,13 @@ impl CompiledTooltip {
                         .map(move |text| TooltipLine { text, raw: idx })
                 })
                 .collect();
-            out.doc.sections.push(TooltipSection {
-                title: (!title.is_empty()).then_some(title),
-                inline,
-                lines,
-            });
+            std::sync::Arc::make_mut(&mut out.doc)
+                .sections
+                .push(TooltipSection {
+                    title: (!title.is_empty()).then_some(title),
+                    inline,
+                    lines,
+                });
             out.raw.push(raw);
             out.per_char.push(sec.each != Each::Whole);
         }
@@ -274,38 +283,84 @@ impl CompiledTooltip {
 
     /// 原始行 → 显示行：先按 `max_chars` 截断（超出加 `…`），再按 `wrap_width` 折行，
     /// 丢掉全是空白的显示行。都按**字素簇**计，不会把 emoji 序列、组合字符从中间切开。
+    /// 样式跟着字走：截断的 `…` 继承被截处前一簇的样式，折行按字节区间切带样式的行。
     ///
     /// - `columns`：分列段（模板字面写了 `\t`）里含 `\t` 的行不折——渲染端按 `\t` 列对齐，
     ///   从中间折开会把第二列甩到下一行行首。变量值带进来的 `\t` 只是内容，照常折。
     /// - `first_offset`：第一条显示行已被占掉的宽度（inline 段的 `标题: `）。
-    fn display_lines(&self, raw: &str, columns: bool, first_offset: usize) -> Vec<String> {
+    fn display_lines(
+        &self,
+        raw: StyledText,
+        columns: bool,
+        first_offset: usize,
+    ) -> Vec<StyledText> {
         // DirectWrite 除 `\n` 外还在 `\r`、U+0085、U+2028、U+2029 处断行。不先归一，这些字符
         // 会在渲染时多折出行来，而行数是命中换算的前提（每行等高、按 `\n` 计行）——点第 3 行
         // 会命中第 2 行。只改显示行；原始行（复制 / 上屏的取值）保留原字符。
-        let normalized = raw
-            .replace("\r\n", "\n")
-            .replace(['\r', '\u{85}', '\u{2028}', '\u{2029}'], "\n");
+        let normalized = normalize_breaks(raw);
         let mut out = Vec::new();
-        for (i, part) in normalized.split('\n').enumerate() {
-            let line = if self.max_chars > 0 && part.graphemes(true).count() > self.max_chars {
-                let head: String = part.graphemes(true).take(self.max_chars).collect();
-                format!("{head}{TRUNCATION_MARK}")
-            } else {
-                part.to_string()
+        for (i, part) in split_lines(normalized).into_iter().enumerate() {
+            let line = match part.as_str().grapheme_indices(true).nth(self.max_chars) {
+                Some((cut, _)) if self.max_chars > 0 => {
+                    part.cut_with_mark(cut, TRUNCATION_MARK.encode_utf8(&mut [0; 4]))
+                }
+                _ => part,
             };
-            if self.wrap_width == 0 || (columns && line.contains('\t')) {
+            if self.wrap_width == 0 || (columns && line.as_str().contains('\t')) {
                 out.push(line);
             } else {
-                out.extend(wrap(
-                    &line,
+                let ranges = wrap(
+                    line.as_str(),
                     self.wrap_width,
                     if i == 0 { first_offset } else { 0 },
-                ));
+                );
+                // 常见情形一行放得下：原样搬走，不切片、不分配。
+                if let [(0, e)] = ranges.as_slice()
+                    && *e == line.len()
+                {
+                    out.push(line);
+                } else {
+                    out.extend(ranges.into_iter().map(|(s, e)| line.slice(s, e)));
+                }
             }
         }
-        out.retain(|l| !l.trim().is_empty());
+        out.retain(|l| !l.as_str().trim().is_empty());
         out
     }
+}
+
+/// 按 `\n` 切成多行（带样式），同 `str::split('\n')`。没有换行时原样返回、不分配。
+fn split_lines(t: StyledText) -> Vec<StyledText> {
+    if !t.as_str().contains('\n') {
+        return vec![t];
+    }
+    let s = t.as_str();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for (i, _) in s.match_indices('\n') {
+        out.push(t.slice(at, i));
+        at = i + 1;
+    }
+    out.push(t.slice(at, s.len()));
+    out
+}
+
+/// 断行符归一为 `\n`：`\r\n` 本就是一个字素簇，逐簇映射，样式跟着该簇走。
+fn normalize_breaks(t: StyledText) -> StyledText {
+    let is_break = |c: char| matches!(c, '\r' | '\u{85}' | '\u{2028}' | '\u{2029}');
+    if !t.as_str().contains(is_break) {
+        return t;
+    }
+    let mut out = StyledText::new();
+    for (i, g) in t.as_str().grapheme_indices(true) {
+        let g = if g == "\r\n" || g.chars().all(is_break) {
+            "\n"
+        } else {
+            g
+        };
+        out.push(g, &t.style_at(i));
+    }
+    out
 }
 
 /// 字素簇的显示宽度：CJK / 全角记 2（口径同 `is_wide_char`），emoji 也记 2——含 ZWJ 或
@@ -330,16 +385,27 @@ fn is_break_char(g: &str) -> bool {
     matches!(g, " " | "/" | "·")
 }
 
-/// 按显示宽度折行。溢出发生在一段连续 ASCII（编码列表 `a/ab/abc`、英文单词）中间时，
+/// 按显示宽度折行，返回各显示行在 `line` 里的字节区间（样式由调用方按区间切）。
+/// 溢出发生在一段连续 ASCII（编码列表 `a/ab/abc`、英文单词）中间时，
 /// 优先退回到这段里最后一个空格、`/`、`·` 之后断开，把被切的 token 整个带到下一行；
 /// 这段里没有断点（或溢出点不在 ASCII 里，如汉字）才硬折。
 ///
 /// 当前行为空时不折：宽度不足一个全角字（`width = 1`）时，那个字独占一行而不是死循环。
-fn wrap(line: &str, width: usize, first_offset: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur: Vec<(&str, usize)> = Vec::new();
+fn wrap(line: &str, width: usize, first_offset: usize) -> Vec<(usize, usize)> {
+    // 一段连续字素簇 → 字节区间（去掉尾部空白，同旧版的 `trim_end`）。
+    let range = |cur: &[(usize, &str, usize)], trim: bool| -> (usize, usize) {
+        let start = cur[0].0;
+        let end = cur.last().map_or(start, |(o, g, _)| o + g.len());
+        if trim {
+            (start, start + line[start..end].trim_end().len())
+        } else {
+            (start, end)
+        }
+    };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Vec<(usize, &str, usize)> = Vec::new();
     let mut w = 0usize;
-    for g in line.graphemes(true) {
+    for (off, g) in line.grapheme_indices(true) {
         // 折出来的续行不以空白开头：那串空白就是断点（第一行的缩进是内容，照留）。
         if cur.is_empty() && !out.is_empty() && g.trim().is_empty() {
             continue;
@@ -357,32 +423,26 @@ fn wrap(line: &str, width: usize, first_offset: usize) -> Vec<String> {
             } else {
                 None
             };
-            out.push(
-                cur.iter()
-                    .map(|(s, _)| *s)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string(),
-            );
+            out.push(range(&cur, true));
             cur = carry.unwrap_or_default();
-            w = cur.iter().map(|(_, w)| w).sum();
+            w = cur.iter().map(|(_, _, w)| w).sum();
             if g.trim().is_empty() && cur.is_empty() {
                 continue;
             }
         }
-        cur.push((g, gw));
+        cur.push((off, g, gw));
         w += gw;
     }
     if !cur.is_empty() {
-        out.push(cur.iter().map(|(s, _)| *s).collect());
+        out.push(range(&cur, false));
     }
     out
 }
 
 /// `cur` 末尾那段连续 ASCII 里最后一个断点之后的位置；末尾不是 ASCII token、或这段里
 /// 没有断点、或断点就在末尾（等于没有可带走的部分）时返回 `None`。
-fn last_ascii_break(cur: &[(&str, usize)]) -> Option<usize> {
-    for (i, (g, _)) in cur.iter().enumerate().rev() {
+fn last_ascii_break(cur: &[(usize, &str, usize)]) -> Option<usize> {
+    for (i, (_, g, _)) in cur.iter().enumerate().rev() {
         if is_break_char(g) {
             return (i + 1 < cur.len() && i > 0).then_some(i + 1);
         }
@@ -392,6 +452,16 @@ fn last_ascii_break(cur: &[(&str, usize)]) -> Option<usize> {
     }
     None
 }
+
+/// [`char_var`] 认得的变量名（与 match 分支一一对应，见 comment.rs 的 `EVAL_VAR_NAMES` 一节）。
+pub(crate) const CHAR_VAR_NAMES: &[&str] = &["readings", "unicode"];
+
+/// 气泡整段求值（`TooltipSections::render` 里的 `cand_eval`）自己认得的变量名。
+pub(crate) const TOOLTIP_CAND_VAR_NAMES: &[&str] = &["full_text", "unicode_all"];
+
+/// 协调器给气泡的候选级求值（coordinator.rs 候选循环里的 `cand_eval`）自己认得的变量名，
+/// 其余回落 `eval_var`。
+pub(crate) const TOOLTIP_COORD_VAR_NAMES: &[&str] = &["word_code", "code_source", "debug"];
 
 /// 逐字上下文里气泡专属的变量。`None` = 不是这里的变量（交给下一层）。
 ///
@@ -1268,14 +1338,14 @@ mod tests {
         let c = truncated("长…", &long);
         let r = render_limited(&t, &c);
         let first = &r.doc.sections[0];
-        assert_eq!(first.title.as_deref(), Some("完整原文"));
+        assert_eq!(first.title.as_ref().map(|t| t.as_str()), Some("完整原文"));
         assert_eq!(
             first.lines.len(),
             11,
             "200 字 ÷ 20 字/行 = 10 行，另加 … 落在第 11 行"
         );
         assert!(first.lines.iter().all(|l| l.raw == 0));
-        assert_eq!(first.lines[10].text, "…");
+        assert_eq!(first.lines[10].text.as_str(), "…");
         assert_eq!(r.raw[0][0].chars().count(), 250, "原始行不截断");
     }
 
@@ -1327,5 +1397,112 @@ mod tests {
         let mut off = section("", "", "${debug}");
         off.enabled = false;
         assert!(!compile(&[off]).references("debug"), "关着的段不算");
+    }
+
+    // ───────────────────── 分段样式跟着字走（§8.2）─────────────────────
+
+    /// `(文字, 角色)` 逐段。
+    fn roles(t: &StyledText) -> Vec<(&str, Option<&str>)> {
+        t.spans()
+            .iter()
+            .map(|s| (&t.as_str()[s.start as usize..s.end as usize], s.role))
+            .collect()
+    }
+
+    /// 折行按字节区间切带样式的行：每条显示行的区间都落在自己那一截上。
+    #[test]
+    fn wrap_carries_styles_to_each_display_line() {
+        let t = limited(0, 6, &[section("", "", "${debug}：${word_code}")]);
+        let c = Cand {
+            debug: "aaaa bbbb",
+            word_code: Some("cc"),
+            ..cand("好")
+        };
+        let r = render_limited(&t, &c);
+        let lines: Vec<&StyledText> = r.doc.sections[0].lines.iter().map(|l| &l.text).collect();
+        assert_eq!(
+            lines.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+            vec!["aaaa", "bbbb：", "cc"]
+        );
+        assert_eq!(roles(lines[0]), vec![("aaaa", Some("debug"))]);
+        assert_eq!(
+            roles(lines[1]),
+            vec![("bbbb", Some("debug")), ("：", Some("literal"))]
+        );
+        assert_eq!(roles(lines[2]), vec![("cc", Some("word_code"))]);
+    }
+
+    /// 单行截断的 `…` 继承被截处前一簇的样式。
+    #[test]
+    fn truncation_mark_inherits_previous_grapheme_style() {
+        let t = limited(3, 0, &[section("", "", "${debug}")]);
+        let c = Cand {
+            debug: "abcdef",
+            ..cand("好")
+        };
+        let r = render_limited(&t, &c);
+        let line = &r.doc.sections[0].lines[0].text;
+        assert_eq!(line.as_str(), "abc…");
+        assert_eq!(roles(line), vec![("abc…", Some("debug"))]);
+    }
+
+    /// 断行符归一逐簇映射，样式不丢；原始行保留原字符。
+    #[test]
+    fn break_normalization_keeps_styles() {
+        let t = limited(0, 0, &[section("", "", "${debug}")]);
+        let c = Cand {
+            debug: "ab\u{2028}cd",
+            ..cand("好")
+        };
+        let r = render_limited(&t, &c);
+        let texts: Vec<&str> = r.doc.sections[0]
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["ab", "cd"]);
+        assert_eq!(
+            roles(&r.doc.sections[0].lines[1].text),
+            vec![("cd", Some("debug"))]
+        );
+        assert_eq!(r.raw[0][0], "ab\u{2028}cd");
+    }
+
+    /// 段名：字面 title、变量 in_title；逐字段 `${char}` 角色 char。
+    #[test]
+    fn titles_and_per_char_rows_carry_roles() {
+        let rl = fixture_reverse();
+        let t = limited(
+            0,
+            0,
+            &[section(
+                "编码{(${code_source})}",
+                "han",
+                "${char}：${readings}",
+            )],
+        );
+        let c = cand("好");
+        let r = t.render(c.disp, c.full, &cand_eval(&c), &per_char(&rl));
+        let sec = &r.doc.sections[0];
+        let title = sec.title.as_ref().unwrap();
+        assert_eq!(
+            roles(title),
+            vec![
+                ("编码(", Some("title")),
+                ("五笔", Some("code_source")),
+                (")", Some("title"))
+            ]
+        );
+        assert!(title.spans().iter().all(|s| s.in_title));
+        assert_eq!(
+            roles(&sec.lines[0].text),
+            vec![
+                ("好", Some("char")),
+                ("：", Some("literal")),
+                ("hǎo/hào", Some("readings"))
+            ]
+        );
+        // 纯文本（复制 / 上屏）不含任何样式信息之外的东西。
+        assert_eq!(r.doc.to_plain_text(), "[编码(五笔)]\n好：hǎo/hào");
     }
 }

@@ -1035,7 +1035,8 @@ impl Default for EnglishFrequency {
     }
 }
 
-/// `schema.pinyin.code_hint_source` 的值域：**拼音方案下**，候选注释里的编码从哪来。
+/// `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` 的值域：
+/// 拼音来源候选的注释里，编码从哪来。两个键各管一摊（拼音方案 vs 临拼/快捷输入），值域相同。
 ///
 /// 分工是「开关管允许哪些来源求值、模板管按什么顺序和格式摆」，两层不重叠。用户在模板里
 /// 写了某个变量却把它的来源关掉时，该变量恒空——按配置办事。
@@ -1088,24 +1089,27 @@ pub enum CodeHintSource {
     CodeTable,
     /// 只显示双拼编码。
     Shuangpin,
-    /// 两者都求值，谁先出由模板的回退链决定。出厂档。
+    /// 两者都求值，谁先出由模板的回退链决定。临拼的出厂档。
     #[default]
     Auto,
 }
 
 impl CodeHintSource {
-    /// 认不出的值回落出厂档。与仓里其它字符串枚举（`first_show_mode` 等）同一取舍：
-    /// 配置是用户手打的，写错一个字母不该让整个功能消失，更不该弹错误框。
+    /// 认不出的值回落 `fallback`，由调用方传入**该字段自己的出厂档**：
+    /// `schema.pinyin.code_hint_source` 传 `Off`，`input.temp_pinyin.code_hint_source` 传 `Auto`。
+    /// 两份出厂值不同，函数内写死单一兜底的话，拼音方案用户手滑写错一个字母就会
+    /// 意外看到编码。写错不弹错误框、不让功能消失，与仓里其它字符串枚举同一取舍。
     ///
     /// ⚠️ match 臂必须与 `config_schema::CODE_HINT_SOURCE_VALUES` **逐项对齐**。这里多认
     /// 一个别名（比如让 `none` 也算 `off`），就会变成「注册表说它非法、运行时却认」——
     /// CLI 校验与设置页下拉都按注册表办事，用户会撞上「明明能用却填不进去」。
-    pub fn from_config(s: &str) -> Self {
+    pub fn from_config(s: &str, fallback: Self) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => Self::Off,
             "codetable" => Self::CodeTable,
             "shuangpin" => Self::Shuangpin,
-            _ => Self::Auto,
+            "auto" => Self::Auto,
+            _ => fallback,
         }
     }
 
@@ -1118,36 +1122,27 @@ impl CodeHintSource {
     pub fn allows_shuangpin(self) -> bool {
         matches!(self, Self::Shuangpin | Self::Auto)
     }
-
-    /// 在本档基础上**强制放行反查**，其余照旧。
-    ///
-    /// 给 overlay 反查模式（临时拼音 / 快捷输入内拼音）用：那些模式本身就是「用拼音反查
-    /// 码表编码」，出不了码就失去意义，所以无视用户把来源关掉的配置。
-    ///
-    /// ★ 是**并集**不是替换。直接改写成 `CodeTable` 的话，一个把来源设成 `Shuangpin`
-    /// （「我只要看双拼码」）的用户一进快捷输入，看到的反而只剩他选择不看的那种码。
-    /// 强制放行 A 不该顺手关掉 B —— 旧的 `pinyin_hint = force_hint || ...` 也只做加法。
-    pub fn forcing_reverse(self) -> Self {
-        match self {
-            Self::Off | Self::CodeTable => Self::CodeTable,
-            Self::Shuangpin | Self::Auto => Self::Auto,
-        }
-    }
 }
 
-/// 出厂档：两种编码都允许，由模板回退链决定谁先出。
+/// 拼音方案的出厂档：`off`，两种编码都不显示。
 ///
-/// 新装用户因此一上手就能看到编码——有主码表时是反查码，没有时是本方案击键。
+/// 编码反查提示是给码表用户设计的；绝大多数纯拼音/双拼用户不熟悉也不需要，出厂开着
+/// 只会让候选旁多一串看不懂的字母。码表用户照样可以在设置里打开。
 /// 老用户走 [`Config::migrate_show_code_hint_value`]，映到 `codetable` 保持原样。
+///
+/// ⚠️ 临拼/快捷输入不再共用本字段，出厂值也不同，见 `input.temp_pinyin.code_hint_source`
+/// （[`default_temp_pinyin_code_hint_source`]）。
 fn default_code_hint_source() -> String {
-    "auto".to_string()
+    "off".to_string()
 }
 
-/// 全局拼音配置（[schema.pinyin]）。所有拼音类方案共用，无方案级 override。
+/// 全局拼音配置（[schema.pinyin]）。所有拼音类方案（全拼/双拼/混输拼音子方案）共用，
+/// 无方案级 override。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinyinGlobalConfig {
-    /// 拼音方案下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
-    /// 认不出的值回落出厂档（`auto`）。
+    /// 拼音方案（含双拼）下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
+    /// 出厂 `off`（理由见 `default_code_hint_source`）；认不出的值同样回落 `off`。
+    /// 临拼/快捷输入不读本字段，读 `input.temp_pinyin.code_hint_source`。
     #[serde(default = "default_code_hint_source")]
     pub code_hint_source: String,
     #[serde(default = "default_true")]
@@ -3024,7 +3019,9 @@ pub type CommentTemplateOverride = Option<String>;
 /// 自由输入（字面输入）模式：让 mix 能打出 `GetTestData()` / `test_data` / `<TAB>`
 /// 这类**任何 member 都无法接受**的内容。
 ///
-/// - `Off`：完全维持既有行为（越界字符仍走「顶屏候选 + 上屏标点 + 退出」）。
+/// - `Off`：完全维持既有行为（越界字符仍走「顶屏候选 + 上屏标点 + 退出」）。唯一例外是
+///   含英文成员的实例里 Shift+字母：大写照样进缓冲、候选只给英文段（同 `Auto`），但数字 /
+///   符号键仍是功能键（选词、翻页、顶屏），见 `MixLens::English`（A2-50）。
 /// - `Auto`（**默认**）：由缓冲内容自动推导，见 `MixLens`。
 /// - `Always`：本实例恒为自由输入——用于新建一个专做字面输入的融合模式。
 ///
@@ -3774,6 +3771,22 @@ pub struct InputConfig {
     /// 例外：临拼兜底臂（非标点键被吞、选中高亮候选）是选词不是顶屏，恒造词、不读本项。
     #[serde(default = "default_true")]
     pub top_commit_learn: bool,
+    /// 密码框强制英文：宿主报出的 InputScope 含密码位（掩码 bit31）时，输入闸强制英文透传，
+    /// 不改 `chinese_mode` 持久值（内部配置，不进设置页；入口是托盘/工具栏右键的「高级」菜单）。
+    ///
+    /// 出厂开：真密码框里出中文候选既打不对密码、又可能把明文露在候选窗里。
+    ///
+    /// 为什么必须能关：有的宿主把普通输入框也报成 `IS_DEFAULT + IS_PASSWORD`（掩码
+    /// `0x80000001`，t197），开着就是「这个框里永远打不出中文」。菜单开关原本只改内存、
+    /// 重启服务即复原，本键让它落盘。
+    ///
+    /// 关掉时两侧一起放行：协调器不再置位 `password_suppress`（输入闸与工具栏/语言栏的
+    /// 「英」呈现都跟着解除），DLL 侧的本地吃键门控经 `push_password_suppress_config`
+    /// 同步关闭——只关 core 不推 DLL，DLL 仍按密码框全放行，开关形同虚设。
+    /// 输入诊断 HUD 的 InputScope 显示与本项无关：关掉后照样能看到宿主报的是不是密码位，
+    /// 那正是判断「是不是误报」的依据。
+    #[serde(default = "default_true")]
+    pub password_force_english: bool,
     /// 联想（上屏后按上文推荐下一个词/标点）。默认关。
     #[serde(default)]
     pub association: AssociationConfig,
@@ -3842,6 +3855,7 @@ impl Default for InputConfig {
             phrase: PhraseConfig::default(),
             top_commit_mode: TopCommitMode::default(),
             top_commit_learn: true,
+            password_force_english: true,
             association: AssociationConfig::default(),
             caret: CaretPlacementConfig::default(),
         }
@@ -4146,9 +4160,9 @@ pub struct TempEnglishConfig {
     /// 旧实现是**整串套形**（不管词库原文长什么样），本项是**逐位投影且单向**
     /// （只覆盖用户按了 Shift 的那几位，词库自带的大写一律保留）。
     ///
-    /// ★ 也作用于**快捷输入里的英文**：Shift+字母让缓冲带上大写（落自由输入透镜）时，
-    /// 纯字母缓冲在所打原文之后追加英文段，其词库候选按本项投影（见
-    /// `Coordinator::mix_free_english_segment`）。
+    /// ★ 也作用于**快捷输入里的英文**：Shift+字母让缓冲带上大写（`free_input = auto` 落自由
+    /// 输入透镜；`off` 且含英文成员时落大写英文词透镜）时，纯字母缓冲在所打原文之后追加
+    /// 英文段，其词库候选按本项投影（见 `Coordinator::mix_free_english_segment`）。
     #[serde(default = "default_true")]
     pub case_follow_input: bool,
     /// 临英选词上屏后自动补一个空格。
@@ -4357,10 +4371,24 @@ pub struct TempPinyinConfig {
     /// 临拼期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_template_horizontal: CommentTemplateOverride,
+    /// 临拼与快捷输入（mix）期间，拼音候选注释里的编码从哪来。值域同 [`CodeHintSource`]。
+    ///
+    /// 独立于拼音方案那份 `schema.pinyin.code_hint_source`：临拼正是码表用户借拼音反查
+    /// 编码的典型场景，出厂 `auto`；拼音方案面向的是纯拼音/双拼用户，出厂 `off`。
+    /// 两类用户习惯相反，共用一份就只能顾一头。设成 `off` 即真正关掉（旧实现强制放行反查、
+    /// 关不掉）。
+    #[serde(default = "default_temp_pinyin_code_hint_source")]
+    pub code_hint_source: String,
 }
 
 fn default_temp_pinyin_triggers() -> Vec<String> {
     vec!["backtick".to_string()]
+}
+
+/// 临拼的编码来源出厂档：`auto`。⛔ 不能复用 [`default_code_hint_source`]——那份出厂是
+/// `off`，复用会把码表用户的反查场景一并关掉。
+fn default_temp_pinyin_code_hint_source() -> String {
+    "auto".to_string()
 }
 
 impl Default for TempPinyinConfig {
@@ -4372,6 +4400,7 @@ impl Default for TempPinyinConfig {
             candidate_layout: LayoutIntent::default(),
             comment_template_vertical: None,
             comment_template_horizontal: None,
+            code_hint_source: default_temp_pinyin_code_hint_source(),
         }
     }
 }
@@ -5690,9 +5719,18 @@ pub struct StatusIndicatorConfig {
     /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
     #[serde(default = "default_schema_name_style")]
     pub schema_name_style: String,
-    /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）。
+    /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）|
+    /// 锚点 `screen_center` / `screen_top_left` / `screen_top_right` / `screen_bottom_left` /
+    /// `screen_bottom_right`（前台窗口所在显示器工作区）、`window_center` / `window_bottom_left`
+    /// （前台窗口可见边框）。值域 = [`crate::app_compat::STATUS_POSITION_MODES`]；读取请走
+    /// [`Self::position`]（写错回落跟随光标）。
     #[serde(default = "default_status_position_mode")]
     pub position_mode: String,
+    /// 光标坐标不可信时的兜底位置（只在 follow_caret 下生效）："last"（最近一次有效坐标,
+    /// 默认,= 本项引入前的行为）| "hide"（不显示）| 上面 7 个锚点。值域 =
+    /// [`crate::app_compat::STATUS_FALLBACK_POSITIONS`]；读取请走 [`Self::fallback`]（写错回落 last）。
+    #[serde(default = "default_status_fallback_position")]
+    pub fallback_position: String,
     /// follow_caret 下相对默认位置（光标下方、左边缘对齐光标）的水平偏移（像素，正=右）。
     #[serde(default)]
     pub offset_x: i32,
@@ -5734,6 +5772,24 @@ fn default_status_display_mode() -> String {
 fn default_status_position_mode() -> String {
     "follow_caret".to_string()
 }
+fn default_status_fallback_position() -> String {
+    "last".to_string()
+}
+
+impl StatusIndicatorConfig {
+    /// 解析后的定位方式；值域外的字符串回落出厂默认（跟随光标）——字段是自由字符串，
+    /// 写错不会让配置加载失败，这里负责把它落回默认档。
+    pub fn position(&self) -> crate::app_compat::StatusPositionMode {
+        crate::app_compat::StatusPositionMode::from_config(&self.position_mode)
+            .unwrap_or(crate::app_compat::StatusPositionMode::FollowCaret)
+    }
+
+    /// 解析后的兜底位置；值域外的字符串回落出厂默认（`last`）。
+    pub fn fallback(&self) -> crate::app_compat::StatusFallback {
+        crate::app_compat::StatusFallback::from_config(&self.fallback_position)
+            .unwrap_or(crate::app_compat::StatusFallback::Last)
+    }
+}
 
 impl Default for StatusIndicatorConfig {
     fn default() -> Self {
@@ -5744,6 +5800,7 @@ impl Default for StatusIndicatorConfig {
             show_on_focus: false,
             schema_name_style: default_schema_name_style(),
             position_mode: default_status_position_mode(),
+            fallback_position: default_status_fallback_position(),
             offset_x: 0,
             offset_y: 0,
             custom_x: 0,
@@ -7793,6 +7850,7 @@ impl Config {
     /// 按**这一层**写了什么判（判据同 [`Self::migrate_user_layer_value`] 的文档）：
     /// - 本层没写任何旧键 → 不动；
     /// - 本层已写 `sections` → 以它为准，旧键只清不迁（用户在新形态上的编辑比旧开关新）；
+    /// - 旧键的值全等于旧出厂值 → 只清不迁：用户没改过气泡，本层不该出现段列表；
     /// - 否则按 [`tooltip_sections_from_legacy`] 生成段列表写入本层。本层没写的旧键取旧出厂值，
     ///   与旧版「缺键即默认」的生效值一致。
     ///
@@ -7801,7 +7859,9 @@ impl Config {
     ///
     /// 已知近似（同 [`Self::migrate_font_size_follow_theme_value`]）：本层缺的旧键按旧出厂值补，
     /// 不去看下层（L2.5 定制层）写过什么。只在「定制版改过气泡开关 + 用户层也改过其中一部分」
-    /// 时有差别，结果是那几个开关回到出厂值。
+    /// 时有差别，结果是那几个开关回到出厂值。同理，「全等于旧出厂值即只清不迁」也不看下层：
+    /// 定制版开了拆字、用户在本层显式关掉（`chaizi_enabled = false`）时，本层不写段列表，生效的是
+    /// 定制层那份（拆字又开了）。仓内没有写这些旧键的定制层，按近似接受。
     fn migrate_tooltip_sections_value(layer: &mut toml::Value) {
         const LEGACY_KEYS: [&str; 6] = [
             "code_enabled",
@@ -7840,6 +7900,15 @@ impl Config {
             chaizi: flag("chaizi_enabled", d.chaizi),
             debug: flag("debug_enabled", d.debug),
         };
+        // 旧开关全是旧出厂值 = 用户从没改过气泡：只摘旧键、不写段列表，让本层跟随出厂（含 L2.5
+        // 定制层）。写进去的话，set_user_value 只剪本次那一个键、会把整份出厂段列表原样落盘，
+        // 下次出厂段列表一变它就成了删不掉的「自定义」。
+        if flags == d {
+            info!(
+                "ui.tooltip legacy switches all at old defaults → dropped, following factory sections"
+            );
+            return;
+        }
         match toml::Value::try_from(tooltip_sections_from_legacy(flags)) {
             Ok(v) => {
                 tip.insert("sections".to_string(), v);
@@ -11134,6 +11203,49 @@ active = "x"
         );
     }
 
+    /// ★ 只写过「与旧出厂相同」的旧开关的老用户：迁移不给本层写段列表，这批用户继续跟随出厂，
+    /// 而不是被钉在一份自定义段列表上。反向：真改过开关的用户，迁出的段列表留在用户层。
+    #[test]
+    fn default_legacy_switches_leave_no_sections_custom_ones_kept() {
+        let all_default = "[ui.tooltip]\ncode_enabled = true\npinyin_enabled = true\n\
+                           pinyin_heteronyms = true\npinyin_max_readings = 0\n\
+                           chaizi_enabled = false\ndebug_enabled = false\n";
+        // 迁移本身（三条写盘 / 加载路径共用）就不写段列表：set_user_value 只剪本次那个键，
+        // 迁移若写了，整份出厂段列表会原样落盘。
+        let mut root: toml::Value = toml::from_str(all_default).unwrap();
+        Config::migrate_tooltip_sections_value(&mut root);
+        assert!(
+            get_nested(&root, &["ui", "tooltip", "sections"]).is_none(),
+            "全缺省旧开关不得在本层留下段列表：{root:?}"
+        );
+        assert!(
+            get_nested(&root, &["ui", "tooltip", "code_enabled"]).is_none(),
+            "旧键照样摘掉"
+        );
+        // 真改过开关的用户，迁出的段列表留在本层，prune 也不删（与出厂不等）。
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data");
+        let preset = Config::system_preset_value(Some(&data)).unwrap();
+        let mut root: toml::Value =
+            toml::from_str("[ui.tooltip]\nchaizi_enabled = true\n").unwrap();
+        Config::migrate_tooltip_sections_value(&mut root);
+        prune_redundant(&mut root, &preset);
+        assert!(
+            get_nested(&root, &["ui", "tooltip", "sections"]).is_some(),
+            "开过拆字的用户，合并段必须留在用户层"
+        );
+        // 用户层里原样躺着一份出厂段列表的，按冗余删——preset 取真实的 L1⊕L2（Value 层合并），
+        // 不只是 L1：L2 少写一个字段（如 `promote = ""`）会让两边在 Value 层对不上。
+        let mut user = toml::Value::Table(Default::default());
+        if let toml::Value::Table(t) = &mut user {
+            set_nested(
+                t,
+                &["ui", "tooltip", "sections"],
+                toml::Value::try_from(default_tooltip_sections()).unwrap(),
+            );
+        }
+        assert_eq!(prune_redundant(&mut user, &preset), 1);
+    }
+
     /// 旧开关迁移：跑真实链路（用户层迁移 → ⊕ L1 默认 → 反序列化），返回生效段列表与迁移后的本层。
     fn tooltip_after_migration(user_toml: &str) -> (Vec<TooltipSection>, toml::Value) {
         let mut user: toml::Value = toml::from_str(user_toml).unwrap();
@@ -12309,33 +12421,40 @@ scripts = { latin = 42 }
         );
     }
 
-    /// 没有旧键就不动，让出厂值 `auto` 生效（新装用户一上手就能看到编码）。
+    /// 没有旧键就不动，让出厂值 `off` 生效（纯拼音/双拼用户默认不看编码反查）。
     #[test]
     fn migrate_show_code_hint_leaves_fresh_config_alone() {
         let mut v: toml::Value = toml::from_str("[schema.pinyin]\nseparator = \"auto\"\n").unwrap();
         let before = v.clone();
         Config::migrate_show_code_hint_value(&mut v);
         assert_eq!(v, before);
-        assert_eq!(PinyinGlobalConfig::default().code_hint_source, "auto");
+        assert_eq!(PinyinGlobalConfig::default().code_hint_source, "off");
     }
 
-    /// `forcing_reverse` 是并集：强制放行反查，但不动 schema 那一列。
+    /// ★ 两份编码来源开关各有各的出厂值：拼音方案 `off`、临时拼音 `auto`。
     ///
-    /// 替换式实现（恒返回 `CodeTable`）会让「只要双拼码」的用户一进快捷输入模式，
-    /// 看到的反而只剩他明确选择不看的码表反查码。
+    /// 临拼那份若复用 `default_code_hint_source`，拼音方案改 off 时会被一并拖成 off——
+    /// 码表用户借临拼反查编码的典型场景就此静默失效。代码默认与 serde 缺键两条路都钉。
     #[test]
-    fn forcing_reverse_is_a_union_not_a_replacement() {
-        use CodeHintSource::*;
-        for src in [Off, CodeTable, Shuangpin, Auto] {
-            let forced = src.forcing_reverse();
-            assert!(forced.allows_reverse(), "{src:?}：强制后必须放行反查");
-            assert!(
-                !src.allows_shuangpin() || forced.allows_shuangpin(),
-                "{src:?}：强制放行反查不该顺手关掉 shuangpin"
-            );
-        }
-        assert_eq!(Shuangpin.forcing_reverse(), Auto);
-        assert_eq!(Off.forcing_reverse(), CodeTable);
+    fn temp_pinyin_code_hint_source_defaults_to_auto_independently() {
+        let c = Config::default();
+        assert_eq!(c.schema.pinyin.code_hint_source, "off");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
+        assert_eq!(
+            CodeHintSource::from_config(&c.input.temp_pinyin.code_hint_source, CodeHintSource::Off),
+            CodeHintSource::Auto,
+            "出厂 auto 须是认出来的 auto，不是兜底落出来的"
+        );
+        // 写了 [input.temp_pinyin] 段但没写本键 → serde default 兜底，仍是 auto。
+        let c = merged_with("[input.temp_pinyin]\nenabled = true\n");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
+        // 只改拼音方案那份，不连带临拼。
+        let c = merged_with("[schema.pinyin]\ncode_hint_source = \"shuangpin\"\n");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
+        // 临拼那份可以显式关掉。
+        let c = merged_with("[input.temp_pinyin]\ncode_hint_source = \"off\"\n");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "off");
+        assert_eq!(c.schema.pinyin.code_hint_source, "off");
     }
 
     /// 四档各自允许哪些变量求值——「开关管允许哪些来源、模板管怎么摆」的全部含义。
@@ -12353,23 +12472,33 @@ scripts = { latin = 42 }
         }
     }
 
-    /// 认不出的值回落出厂档，不是静默关闭。
+    /// 认不出的值回落调用方传入的 `fallback`（各字段自己的出厂档），不是函数内写死的某一档。
     ///
-    /// 配置是用户手打的：把 `schema` 拼成 `schama` 就整个功能消失，是那种「配了没反应」
-    /// 的静默失效——本仓记忆里反复出现的那一类。
+    /// 两份字段出厂值不同（拼音方案 `off`、临拼 `auto`）：写死一档的话，总有一份字段写错
+    /// 后会落到别人的出厂档上——拼音方案用户手滑就意外看到编码。
     #[test]
-    fn unknown_code_hint_source_falls_back_to_auto() {
+    fn unknown_code_hint_source_falls_back_to_given_fallback() {
+        use CodeHintSource::*;
+        for fallback in [Off, CodeTable, Shuangpin, Auto] {
+            assert_eq!(
+                CodeHintSource::from_config("shuangping", fallback),
+                fallback
+            );
+            assert_eq!(CodeHintSource::from_config("", fallback), fallback);
+        }
+        // 大小写与空白不敏感（设置页写回的值与用户手打的都认），且认出来的值不看 fallback。
         assert_eq!(
-            CodeHintSource::from_config("shuangping"),
-            CodeHintSource::Auto
-        );
-        assert_eq!(CodeHintSource::from_config(""), CodeHintSource::Auto);
-        // 大小写与空白不敏感（设置页写回的值与用户手打的都认）。
-        assert_eq!(
-            CodeHintSource::from_config("  CodeTable "),
+            CodeHintSource::from_config("  CodeTable ", Off),
             CodeHintSource::CodeTable
         );
-        assert_eq!(CodeHintSource::from_config("OFF"), CodeHintSource::Off);
+        assert_eq!(
+            CodeHintSource::from_config("OFF", Auto),
+            CodeHintSource::Off
+        );
+        assert_eq!(
+            CodeHintSource::from_config(" Auto", Off),
+            CodeHintSource::Auto
+        );
     }
 
     /// 注册表值域与 `from_config` 的 match 臂必须逐项对齐。
@@ -12378,14 +12507,16 @@ scripts = { latin = 42 }
     /// 办事，漂移的表现是「明明能用却填不进去」，或「填进去了却没反应」。
     #[test]
     fn code_hint_source_values_match_registry() {
+        use CodeHintSource::*;
         for v in crate::config_schema::CODE_HINT_SOURCE_VALUES {
-            let parsed = CodeHintSource::from_config(v);
-            assert_ne!(
-                (parsed, *v),
-                (CodeHintSource::Auto, "off"),
+            let parsed = CodeHintSource::from_config(v, Off);
+            // 换两个不同的 fallback 结果不变 = 这个值是被 match 臂认出来的，没落到兜底。
+            assert_eq!(
+                CodeHintSource::from_config(v, Auto),
+                parsed,
                 "注册表列出的 {v} 不该落到兜底档"
             );
-            // 每个列出的值都要能被解析回它自己（`auto` 兜底档同样成立）。
+            // 每个列出的值都要能被解析回它自己。
             assert_eq!(
                 format!("{parsed:?}").to_ascii_lowercase(),
                 v.replace('_', ""),
@@ -12459,7 +12590,7 @@ scripts = { latin = 42 }
     #[test]
     fn pinyin_global_config_defaults() {
         let c = Config::default();
-        assert_eq!(c.schema.pinyin.code_hint_source, "auto");
+        assert_eq!(c.schema.pinyin.code_hint_source, "off");
         assert!(c.schema.pinyin.use_smart_compose);
         assert_eq!(c.schema.pinyin.separator, "auto");
         assert!(!c.schema.pinyin.fuzzy.enabled);
@@ -12517,7 +12648,7 @@ scripts = { latin = 42 }
         assert!(!c.schema.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
         // 未覆盖的 pinyin 顶层字段：保留默认值
         assert_eq!(
-            c.schema.pinyin.code_hint_source, "auto",
+            c.schema.pinyin.code_hint_source, "off",
             "code_hint_source 未覆盖，应保留出厂档"
         );
         assert!(
@@ -13055,5 +13186,47 @@ mod email_config_tests {
         assert!(u.enabled);
         assert!(!u.history_enabled, "老配置没有 history_enabled ⇒ 关闭");
         assert_eq!(u.history_max, 200);
+    }
+}
+
+#[cfg(test)]
+mod status_position_tests {
+    use super::*;
+    use crate::app_compat::{StatusAnchor, StatusFallback, StatusPositionMode};
+
+    /// 出厂默认 = 本功能引入前的行为：跟随光标、坐标不可信时用最近一次有效坐标。
+    #[test]
+    fn defaults_keep_previous_behavior() {
+        let si = StatusIndicatorConfig::default();
+        assert_eq!(si.position(), StatusPositionMode::FollowCaret);
+        assert_eq!(si.fallback(), StatusFallback::Last);
+    }
+
+    #[test]
+    fn anchors_parse() {
+        let si = StatusIndicatorConfig {
+            position_mode: "window_center".into(),
+            fallback_position: "screen_bottom_left".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            si.position(),
+            StatusPositionMode::Anchor(StatusAnchor::WindowCenter)
+        );
+        assert_eq!(
+            si.fallback(),
+            StatusFallback::Anchor(StatusAnchor::ScreenBottomLeft)
+        );
+    }
+
+    /// 手写配置拼错：加载照常成功，解析回落出厂默认，而不是报错或当成别的档。
+    #[test]
+    fn typos_fall_back_to_defaults() {
+        let cfg: Config = toml::from_str(
+            "[ui.status]\nposition_mode = \"screen_centre\"\nfallback_position = \"hidden\"\n",
+        )
+        .expect("拼错不得让配置加载失败");
+        assert_eq!(cfg.ui.status.position(), StatusPositionMode::FollowCaret);
+        assert_eq!(cfg.ui.status.fallback(), StatusFallback::Last);
     }
 }

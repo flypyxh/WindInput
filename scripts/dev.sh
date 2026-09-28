@@ -556,6 +556,9 @@ assemble_data() {
 
     # 1. 复制 data/ 源文件（configs、五笔词库、主题等）
     cp -rf "$PRODUCT_ROOT/data" "$data"
+    # AI 工具在会话 cwd 下落的运行时状态（.omc/state/… 等）会随 cp 混进产物、被推到靶机
+    # 安装目录。它们都被 .gitignore 挡着，git 里看不见，只能在组装时剥掉。
+    strip_tool_state "$data"
 
     # 1b. 合并 wind_input/data/settings/（manifest.toml 等 RPC 元数据）。
     # wind-rpc 运行时优先读 data_dir()/settings/manifest.toml；
@@ -946,6 +949,25 @@ if(\$fail -gt 0){ exit 1 }" || {
 }
 
 # 清理历史改名残留 .old_*（仍被占用的会自动跳过，下次部署再清）。
+# AI 工具（Claude Code / oh-my-claudecode 等）在会话 cwd 下落的运行时状态目录。
+# 与 lib/remote-build.sh 的 RBUILD_EXCLUDE_DIRS 里那几项同源：那边挡的是「上传到编译机」，
+# 这边挡的是「组装进产物 / 推到靶机」。dev.ps1 的 $ToolStateDirs 是同一份清单。
+TOOL_STATE_DIRS=".omc .omx .claude .remember"
+
+strip_tool_state() {
+    local root="$1" d
+    for d in $TOOL_STATE_DIRS; do
+        find "$root" -type d -name "$d" -prune -exec rm -rf {} + 2>/dev/null || true
+    done
+}
+
+# 靶机安装目录里此前推上去的同类残留（scp 只叠加不删除，光停止推送清不掉）。
+remote_cleanup_tool_state() {
+    local names="" d
+    for d in $TOOL_STATE_DIRS; do names+="${names:+,}'$d'"; done
+    remote_ps "Get-ChildItem -LiteralPath '$REMOTE_DIR' -Recurse -Force -Directory -EA SilentlyContinue | Where-Object { @($names) -contains \$_.Name } | Remove-Item -Recurse -Force -EA SilentlyContinue" >/dev/null 2>&1 || true
+}
+
 remote_cleanup_old() {
     remote_ps "Get-ChildItem -Path '$REMOTE_DIR' -Filter '*.old_*' -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue" >/dev/null 2>&1 || true
 }
@@ -973,6 +995,8 @@ _push_full_body() {
     local bins; mapfile -t bins < <(bins_for "$profile")
     say "改名让路（加载中的 DLL/EXE）..."
     remote_rename_aside "${bins[@]}"
+    # 产物可能是编译机回传的、或本机旧组装留下的，推送前再剥一次，不依赖组装那一步。
+    strip_tool_state "$outdir"
     say "全量推送 $outdir/ → $WIND_REMOTE:$REMOTE_DIR/"
     if scp -r "$outdir"/* "$WIND_REMOTE:$REMOTE_DIR/"; then
         # ★ 与 do_push_module 同理：不同步系统副本，新 TSF DLL 不会被任何宿主加载。
@@ -980,6 +1004,7 @@ _push_full_body() {
         local sfx=""; [ "$profile" = dev ] && sfx="_dev"
         remote_start_main "$profile" "$outdir/wind_input${sfx}.exe" || return 1
         remote_cleanup_old
+        remote_cleanup_tool_state
         say "已全量部署并启动（$profile）。"
     else
         err "scp 失败：检查 $([ "$profile" = dev ] && echo WIND_REMOTE_DIR_DEV || echo WIND_REMOTE_DIR_RELEASE) 路径(正斜杠)、SSH、磁盘。"

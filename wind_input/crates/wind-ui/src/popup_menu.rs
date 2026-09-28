@@ -139,11 +139,75 @@ fn press_edge(was_down: bool, now_down: bool) -> bool {
 /// **进程级共享**状态，任何一次调用都会把它清零——多处消费必然互相偷事件，绝不能用；
 /// 边沿一律由调用方自己保存上一轮状态来判定。
 fn any_mouse_button_down() -> bool {
+    [VK_LBUTTON, VK_MBUTTON, VK_RBUTTON]
+        .iter()
+        .any(|vk| key_down(vk.0 as i32))
+}
+
+/// 某个键当前是否按着（只取 `0x8000` 位，理由见 [`any_mouse_button_down`]）。
+fn key_down(vk: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+/// 这次按下是不是**逻辑上的**右键（只按了右键；左右同按算左键，只关菜单）。
+///
+/// `GetAsyncKeyState` 问的是**物理**键位：左右手互换（`SM_SWAPBUTTON`）后，物理左键
+/// 才是逻辑右键。单独成函数是为了让这条换算可测。
+fn is_right_press(phys_left: bool, phys_right: bool, swapped: bool) -> bool {
+    let (left, right) = if swapped {
+        (phys_right, phys_left)
+    } else {
+        (phys_left, phys_right)
+    };
+    right && !left
+}
+
+/// 系统是否左右手互换了鼠标键。
+fn mouse_buttons_swapped() -> bool {
+    #[cfg(windows)]
     unsafe {
-        [VK_LBUTTON, VK_MBUTTON, VK_RBUTTON]
-            .iter()
-            .any(|vk| (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0)
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+        GetSystemMetrics(SM_SWAPBUTTON) != 0
     }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 一次关掉了菜单的「菜单外按下」：屏幕坐标 + 是否逻辑右键。
+///
+/// 菜单开着时同线程的其它窗口收不到鼠标消息（见 [`PopupMenu::poll_outside_press`]），
+/// 这次按下就只有轮询看得见。交给 UI 循环转给气泡：在气泡上右键要当作「重新右键」，
+/// 否则用户第二次右键只会把菜单关掉，气泡自己一无所知。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutsidePress {
+    pub x: i32,
+    pub y: i32,
+    pub right: bool,
+}
+
+/// 菜单请求的回应时限：右键发出菜单请求到菜单可见要走一个 UI → 协调器 → UI 的来回，正常是
+/// 毫秒级；协调器处理鼠标事件的线程可能短暂卡在状态锁上（重载配置、建反查索引），1.5 秒足够
+/// 宽。再久多半是请求被丢了（候选已清空时协调器不弹菜单），据此放弃等待的一方不该把状态
+/// 一直挂着。候选窗的右键压制（`candidate_window::TipHold`）与气泡的「请求在途」共用。
+pub(crate) const MENU_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+thread_local! {
+    /// 弹出菜单此刻是否可见（UI 线程内共享）。
+    static MENU_VISIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 弹出菜单此刻是否可见。候选窗 / 气泡在 wnd_proc 里就要问（菜单开着时它们的右键由菜单
+/// 轮询那一路接管），故做成线程局部而非由 UI 循环每轮传值：传值要到下一轮 tick 才更新，
+/// 菜单关掉后紧跟着的那条鼠标消息会读到过时的「开着」。菜单与这些窗口同在 UI 线程。
+pub(crate) fn menu_visible() -> bool {
+    MENU_VISIBLE.with(|v| v.get())
+}
+
+/// 写 [`menu_visible`]。仅 `PopupMenu::show` / `hide` 与测试调用。
+pub(crate) fn set_menu_visible(visible: bool) {
+    MENU_VISIBLE.with(|v| v.set(visible));
 }
 
 /// 菜单交互状态（与 wnd_proc 共享）。只做结构变更，dirty 触发 PopupMenu 协调重绘。
@@ -380,6 +444,8 @@ pub struct PopupMenu {
     /// 上一轮轮询看到的「有鼠标键按着」状态，供 [`Self::poll_outside_press`] 做边沿检测。
     /// **必须在 `show()` 里按当前真实状态初始化**，理由见该处注释。
     mouse_was_down: bool,
+    /// 最近一次关掉菜单的菜单外按下，待 UI 循环经 [`Self::take_outside_press`] 取走。
+    outside_press: Option<OutsidePress>,
 }
 
 impl PopupMenu {
@@ -416,6 +482,7 @@ impl PopupMenu {
             shadow: None,
             theme: None,
             mouse_was_down: false,
+            outside_press: None,
         };
         // 预创建根窗口并绑定鼠标处理器（捕获后只有根窗口收消息）
         menu.ensure_windows(1)?;
@@ -503,7 +570,7 @@ impl PopupMenu {
         self.renderer.set_base_size(self.font_px * self.scale);
         let s = self.scale;
         if let Some(node) = &theme.views.menu_root {
-            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             // 背景色/边框色/宽/圆角从 menu.root 节点读取（权威，px/dp 经 Dim 区分）；
             // bg_color / border_color 默认已带 menu_bg / menu_border token 兜底（resolve build 传入）。
@@ -579,6 +646,7 @@ impl PopupMenu {
         }
         self.reconcile();
         self.visible = true;
+        set_menu_visible(true);
         unsafe {
             // 捕获前先把光标掰正：SetCapture 期间系统不再发 WM_SETCURSOR，光标会
             // 冻结在捕获瞬间的形状，下方 wnd_proc 的 WM_SETCURSOR 分支收不到消息。
@@ -596,6 +664,7 @@ impl PopupMenu {
         // 键正按着。填 false 会让下一轮轮询把这枚"旧"按下当成一次新的菜单外点击，
         // 表现为菜单弹出即消失。
         self.mouse_was_down = any_mouse_button_down();
+        self.outside_press = None;
     }
 
     /// UI 循环每轮调用：轮询菜单外点击；脏则协调重绘；请求关闭则隐藏。
@@ -675,10 +744,24 @@ impl PopupMenu {
             return;
         }
         tracing::debug!("PopupMenu: 检测到菜单外按下 → 关闭");
+        self.outside_press = Some(OutsidePress {
+            x: p.x,
+            y: p.y,
+            right: is_right_press(
+                key_down(VK_LBUTTON.0 as i32),
+                key_down(VK_RBUTTON.0 as i32),
+                mouse_buttons_swapped(),
+            ),
+        });
         // 走 MenuState::close() 而非直接 self.hide()：它会发 UiEvent::MenuClose，
         // 协调器据此复位服务端的 menu_open。少了这一步，菜单窗口没了但键仍被
         // forward_menu_key 吞掉（同类不一致见 coordinator 的 clears_input 分支注释）。
         self.state.borrow_mut().close();
+    }
+
+    /// 取走最近一次关掉菜单的菜单外按下（见 [`OutsidePress`]）。
+    pub fn take_outside_press(&mut self) -> Option<OutsidePress> {
+        self.outside_press.take()
     }
 
     /// 键盘转发（协调器在组合期拦截方向键/回车/ESC 后下发）。
@@ -984,6 +1067,7 @@ impl PopupMenu {
                 }
             }
             self.visible = false;
+            set_menu_visible(false);
             // 全部窗口已 SW_HIDE，基线随之作废——否则下次弹出时内容碰巧相同的层
             // 会被判为「无变化」而跳过 show，结果是根本不出现。
             self.invalidate_rendered();
@@ -1732,6 +1816,36 @@ mod outside_press_tests {
     #[test]
     fn idle_is_not_a_press() {
         assert!(!press_edge(false, false));
+    }
+
+    /// `menu_visible()` 随菜单显隐：候选窗 / 气泡在 wnd_proc 里据它决定右键归谁，
+    /// hide 后不复位的话它们会一直以为菜单开着，右键永远被当成「由轮询接手」而丢掉。
+    #[test]
+    fn menu_visible_tracks_show_and_hide() {
+        let (tx, _rx) = channel();
+        let mut m = PopupMenu::new(tx).expect("mock 菜单");
+        set_menu_visible(false);
+        m.show(
+            vec![MenuItemSpec::leaf("x", MenuKind::Copy, true, false)],
+            MenuAnchor::at_point(10, 10),
+        );
+        assert!(menu_visible());
+        m.hide();
+        assert!(!menu_visible());
+    }
+
+    /// 在气泡上右键 = 重新右键；左键 / 左右同按只关菜单。左右手互换时物理左键才是右键。
+    #[test]
+    fn right_press_follows_logical_buttons() {
+        assert!(is_right_press(false, true, false));
+        assert!(!is_right_press(true, false, false));
+        assert!(!is_right_press(true, true, false), "左右同按算左键");
+        assert!(!is_right_press(false, false, false), "中键");
+        assert!(
+            is_right_press(true, false, true),
+            "互换后物理左键是逻辑右键"
+        );
+        assert!(!is_right_press(false, true, true));
     }
 
     fn state_with_panel_at(ox: i32, oy: i32, w: u32, h: u32) -> MenuState {

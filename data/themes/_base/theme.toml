@@ -26,6 +26,17 @@ accent = "${primary}"
 on_accent = "#FFFFFF"
 shadow = { light = "#0000000F", dark = "#0000001A" }
 
+# 标准色契约：候选注释 / 悬停提示模板的内联色 `$[名]{…}` 写这些名字即跟随主题与明暗，
+# 所有继承 _base 的主题都保证能解析（设计 text-span-colors.md §5.4，含取值依据与对比度）。
+# 出厂视图节点只在下方的 [tooltip.roles] 里引用它们（气泡角色色）。
+# accent_text 两档都等于 accent：_base 没有「强调色不可读」要另调，只为让名字在所有主题里存在；
+# 清风系自带调好的值，照旧覆盖。
+accent_text = "${accent}"
+success = { light = "#1E8E3E", dark = "#81C995" }
+warning = { light = "#B06000", dark = "#FDD663" }
+error = { light = "#D93025", dark = "#F28B82" }
+info = { light = "#1A73E8", dark = "#8AB4F8" }
+
 selection = { light = "#E6F0FF", dark = "#3D4A5C" }
 selection_text = "${text}"
 hover = "${selection}"
@@ -40,6 +51,19 @@ menu_separator = { light = "#DBDBDB", dark = "${border}" }
 
 tooltip_bg = { light = "#3C3C3CF0", dark = "#1E1E1EF0" }
 tooltip_text = { light = "#FFFFFF", dark = "${text}" }
+# 气泡里的标准色：内联色在气泡里写 `x` 先取 `tooltip_x`（为深色气泡底调过），契约里每个名字
+# 都有一份。气泡底两档都是深色，故亮暗同值；没有语境意义的 on_accent / selection_text 等于
+# tooltip_text，保证写了也可读。清风系按各自强调色覆盖 tooltip_accent。
+tooltip_text_dim = { light = "#BDBDBD", dark = "#BDBDBD" }
+tooltip_text_hint = { light = "#A0A0A0", dark = "#A0A0A0" }
+tooltip_accent = { light = "#8AB4F8", dark = "#8AB4F8" }
+tooltip_accent_text = "${tooltip_accent}"
+tooltip_on_accent = "${tooltip_text}"
+tooltip_selection_text = "${tooltip_text}"
+tooltip_success = { light = "#81C995", dark = "#81C995" }
+tooltip_warning = { light = "#FDD663", dark = "#FDD663" }
+tooltip_error = { light = "#F28B82", dark = "#F28B82" }
+tooltip_info = { light = "#8AB4F8", dark = "#8AB4F8" }
 status_bg = { light = "#323232E6", dark = "#1E1E1EE6" }
 status_text = { light = "#FFFFFF", dark = "${text}" }
 status_border = "${accent}"
@@ -104,6 +128,8 @@ color = "${text}"
 margin = { left = 6 }
 color = "${text_hint}"
 font_size = -4
+# 注释刻意不配角色色（设计 text-span-colors.md §18）：出厂注释保持 text_hint 的原外观（用户验收时
+# 要求）。想分色的主题自己写 [comment.roles]，用户也可在模板里写 $[颜色]{…}。
 
 [footer_bar]
 font_size = -4
@@ -121,6 +147,21 @@ color = "${status_text}"
 [tooltip]
 background = "${tooltip_bg}"
 color = "${tooltip_text}"
+
+# 气泡的角色色。⚠ 这里的 ${token} 按字面解析、不做 tooltip_ 作用域查找（§6.2），故显式写
+# tooltip_*（为深色气泡底调过的那组）。段名里的变量（「编码(五笔)」的 code_source）同样取角色色；
+# 段名的字面文字（title）与 ${char}、调试、词库注释不配色，保持气泡文字色。
+[tooltip.roles]
+full_text = "${tooltip_accent_text}"
+readings = "${tooltip_accent_text}"
+word_code = "${tooltip_success}"
+code_source = "${tooltip_info}"
+chaizi = "${tooltip_warning}"
+chaizi_all = "${tooltip_warning}"
+chaizi_code = "${tooltip_info}"
+chaizi_code_all = "${tooltip_info}"
+unicode = "${tooltip_error}"
+unicode_all = "${tooltip_error}"
 
 [toast]
 background = "${toast_bg}"

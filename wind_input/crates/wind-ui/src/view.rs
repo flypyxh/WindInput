@@ -7,12 +7,12 @@
 //!
 //! 九宫格图 / 阴影模糊 / z 分层 / 渐变背景均已支持。
 
-use crate::text::dwrite::{TextRenderer, TextStyle};
+use crate::text::dwrite::{ColorRun, TextRenderer, TextStyle};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
-    PixmapMut, PixmapPaint, Point, RadialGradient, SpreadMode, Transform,
+    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, PathBuilder,
+    Pattern, PixmapMut, PixmapPaint, Point, RadialGradient, SpreadMode, Transform,
 };
 use wind_theme::schema::Dim;
 
@@ -203,13 +203,15 @@ pub struct ViewImage {
     pub opacity: f32,
     /// 单色染色（None=图原样）；非 None 时把图当 alpha mask、用此色填充（单色 SVG/图标随主题变色）。
     pub tint: Option<[u8; 4]>,
+    /// None=铺满节点（mode 作用于整个节点盒）；Some=按定位摆成一块，mode 作用于这块，
+    /// 超出节点圆角盒的部分裁掉。
+    pub place: Option<ImagePlace>,
 }
 
-/// z 层级覆盖图（按 anchor 九宫定位 + offset + size 绘于 host 内）。
-#[derive(Clone, Debug)]
-pub struct ViewLayer {
-    pub path: String,
-    pub z: i32,
+/// 图片在 host 内的定位：九宫锚点 + 偏移 + 目标尺寸。背景图与覆盖图共用。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ImagePlace {
+    /// top-left | top | … | center | … | bottom-right；空=top-left。
     pub anchor: String,
     /// dp 偏移（已 ×scale，px）。
     pub off_x: f32,
@@ -217,9 +219,42 @@ pub struct ViewLayer {
     /// 百分比偏移（相对 host 宽/高；paint 期换算）。与 dp 偏移叠加。
     pub off_x_pct: f32,
     pub off_y_pct: f32,
-    /// 目标尺寸 px（0=原图尺寸）。
+    /// 目标尺寸 px；≤0 的那一维取原图尺寸（两维各自独立，与主题编辑器预览同口径）。
     pub w: f32,
     pub h: f32,
+}
+
+impl ImagePlace {
+    /// host 内的目标矩形 `(x, y, w, h)`（已取整）：anchor 九宫基位 + offset（dp px + 百分比
+    /// 相对 host 宽/高）。`src` 取原图尺寸，只在有一维没给 size 时才调用（免得白解码）。
+    fn rect(
+        &self,
+        host: Rect,
+        src: impl FnOnce() -> Option<(u32, u32)>,
+    ) -> Option<(f32, f32, f32, f32)> {
+        let (w, h) = if self.w > 0.0 && self.h > 0.0 {
+            (self.w, self.h)
+        } else {
+            let (sw, sh) = src()?;
+            (
+                if self.w > 0.0 { self.w } else { sw as f32 },
+                if self.h > 0.0 { self.h } else { sh as f32 },
+            )
+        };
+        let (w, h) = (w.round().max(1.0), h.round().max(1.0));
+        let (ax, ay) = anchor_pos(&self.anchor, host, w, h);
+        let x = (ax + self.off_x + self.off_x_pct / 100.0 * host.w).round();
+        let y = (ay + self.off_y + self.off_y_pct / 100.0 * host.h).round();
+        Some((x, y, w, h))
+    }
+}
+
+/// z 层级覆盖图（按 anchor 九宫定位 + offset + size 绘于 host 内）。
+#[derive(Clone, Debug)]
+pub struct ViewLayer {
+    pub path: String,
+    pub z: i32,
+    pub place: ImagePlace,
     pub opacity: f32,
 }
 
@@ -234,7 +269,7 @@ pub struct ViewGradient {
 }
 
 /// 四边内/外边距
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Edges {
     pub l: f32,
     pub t: f32,
@@ -268,14 +303,14 @@ impl Edges {
 }
 
 /// 主轴方向
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     Row,
     Column,
 }
 
 /// 对齐方式（交叉轴 / 文本水平）
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Align {
     Start,
     Center,
@@ -397,6 +432,12 @@ pub struct View {
     pub border: Option<([u8; 4], f32)>,
     pub text: Option<String>,
     pub text_color: [u8; 4],
+    /// 分段颜色：按字节区间覆盖 `text_color`。空 = 整段 `text_color`（出厂路径）。
+    ///
+    /// **只在 paint 消费，不参与 measure/布局**，理由同 [`View::caret_at`]：着色边界若拆成
+    /// 多个节点各自测量，`measure(a+b) != measure(a)+measure(b)`，宽度会随颜色边界抖动。
+    /// 整串一次整形，颜色只作用于绘制（见 [`TextRenderer::draw_runs`]）。
+    pub color_runs: Vec<ColorRun>,
     /// 文本字号（设备像素）；None=用渲染器基准字号。序号/注释按相对偏移设具体值。
     pub font_size: Option<f32>,
     /// 文本字重（400/500/700…）；None/0=继承渲染器默认（NORMAL）。
@@ -491,6 +532,7 @@ impl Default for View {
             border: None,
             text: None,
             text_color: [0, 0, 0, 255],
+            color_runs: Vec::new(),
             font_size: None,
             font_weight: None,
             font_family: None,
@@ -591,6 +633,12 @@ impl View {
         self.border = Some((c, w));
         self
     }
+    /// 设置分段颜色（字节区间，见 [`View::color_runs`]）。
+    pub fn color_runs(mut self, runs: Vec<ColorRun>) -> Self {
+        self.color_runs = runs;
+        self
+    }
+
     /// 在文本的 `byte_pos` 处画插入符（覆盖层，不影响布局；见 [`View::caret_at`] 字段说明）。
     /// 位置自动夹到字符边界——越界截到末尾、落在字符中间退回前一边界，故 paint 的切片恒安全。
     pub fn caret_at(mut self, byte_pos: usize, width: f32) -> Self {
@@ -912,6 +960,72 @@ impl View {
         (self.mw, self.mh)
     }
 
+    /// 整棵树逐节点的文本转储（每节点一行，按深度缩进），供渲染 golden 对拍。
+    ///
+    /// 每行只列**与默认值不同**的字段（布局结果 `m`/`rect` 恒列）。手写而不 `#[derive(Debug)]`：
+    /// 派生输出会随新增字段整体变形，而 golden 要守的恰恰是「加了新能力、出厂路径的树逐字节
+    /// 不变」——新字段取默认值时不出现，出厂路径的转储就与加字段前相同。
+    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    pub(crate) fn debug_dump(&self) -> String {
+        let mut out = String::new();
+        self.dump_into(&mut out, 0, &View::default());
+        out
+    }
+
+    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    fn dump_into(&self, out: &mut String, depth: usize, d: &View) {
+        let mut line = format!("{:indent$}{:?}", "", self.layout, indent = depth * 2);
+        let mut field = |name: &str, v: String, dv: String| {
+            if v != dv {
+                line.push_str(&format!(" {name}={v}"));
+            }
+        };
+        macro_rules! f {
+            ($name:literal, $($field:tt)+) => {
+                field($name, format!("{:?}", self.$($field)+), format!("{:?}", d.$($field)+))
+            };
+        }
+        f!("margin", margin);
+        f!("padding", padding);
+        f!("gap", gap);
+        f!("cross", cross_align);
+        f!("main", main_align);
+        f!("fixed_w", fixed_w);
+        f!("fixed_h", fixed_h);
+        f!("min_w", min_w);
+        f!("min_h", min_h);
+        f!("bg", bg);
+        f!("radius", corner_radius);
+        f!("border", border);
+        f!("text", text);
+        f!("color", text_color);
+        f!("runs", color_runs);
+        f!("size", font_size);
+        f!("weight", font_weight);
+        f!("family", font_family);
+        f!("align", text_align);
+        f!("caret", caret_at);
+        f!("caret_w", caret_w);
+        f!("bar", left_bar);
+        f!("circle", circle_bg);
+        f!("image", bg_image);
+        f!("gradient", bg_gradient);
+        f!("layers", layers);
+        f!("grow", grow);
+        f!("fill", fill_cross);
+        f!("clip", clip);
+        f!("tag", tag);
+        f!("rot", rot);
+        line.push_str(&format!(
+            " m=({:?},{:?}) rect={:?}\n",
+            self.mw, self.mh, self.rect
+        ));
+        out.push_str(&line);
+        for c in &self.children {
+            c.dump_into(out, depth + 1, d);
+        }
+    }
+
     /// 排布后的绝对矩形（layout 后有效）。仅供测试断言「某节点实际占多宽」——
     /// `measured_size` 是撑开前的量，被 `fill_cross` 拉宽的部分看不到。
     #[cfg(test)]
@@ -1088,16 +1202,31 @@ impl View {
                 Align::End => cx0 + content_w - m.width,
             };
             let ty = r.y + self.padding.t + (content_h - m.height) * 0.5;
-            let _ = tr.draw(
-                buf,
-                buf_w,
-                buf_h,
-                tx.max(r.x),
-                ty.max(r.y),
-                t,
-                &ts,
-                self.text_color,
-            );
+            // 没有分段颜色就走原来的 `draw`，出厂路径一个调用都不变（golden 对拍守着）。
+            let _ = if self.color_runs.is_empty() {
+                tr.draw(
+                    buf,
+                    buf_w,
+                    buf_h,
+                    tx.max(r.x),
+                    ty.max(r.y),
+                    t,
+                    &ts,
+                    self.text_color,
+                )
+            } else {
+                tr.draw_runs(
+                    buf,
+                    buf_w,
+                    buf_h,
+                    tx.max(r.x),
+                    ty.max(r.y),
+                    t,
+                    &ts,
+                    self.text_color,
+                    &self.color_runs,
+                )
+            };
             // 插入符：覆盖在已绘文本之上，按前半段宽度定位。前半段单独整形与其在整串中的
             // 实际推进有极小字距差异，但只偏移竖线自身、不动文本（布局恒用整串 m.width）。
             if let Some(cp) = self.caret_at {
@@ -1324,6 +1453,10 @@ fn paint_bg_gradient(
 }
 
 fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, img: &ViewImage) {
+    if let Some(place) = &img.place {
+        paint_placed_bg_image(buf, buf_w, buf_h, r, radius, img, place);
+        return;
+    }
     let (x, y, rw, rh) = snap_to_pixels(r.x, r.y, r.w, r.h);
     let (rw, rh) = (rw.max(1.0), rh.max(1.0));
     let spec = fill_spec_of(img);
@@ -1362,6 +1495,93 @@ fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, 
     });
 }
 
+/// 定位背景图：按 place 摆成一块、mode 作用于这块，超出节点圆角盒的部分裁掉——
+/// 与主题编辑器预览「定位 + 裁到边框盒」同一画法。填充缓存按这块的尺寸取，
+/// 与铺满同一张图的缓存各占各的键。
+fn paint_placed_bg_image(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    r: Rect,
+    radius: f32,
+    img: &ViewImage,
+    place: &ImagePlace,
+) {
+    let (x, y, rw, rh) = snap_to_pixels(r.x, r.y, r.w, r.h);
+    let Some(node_path) = round_rect_path(x, y, rw.max(1.0), rh.max(1.0), radius.round().max(0.0))
+    else {
+        return;
+    };
+    let spec = fill_spec_of(img);
+    let tint = img.tint.unwrap_or([0, 0, 0, 0]);
+    IMAGE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let Some((lx, ly, lw, lh)) = place.rect(r, || cache.src_size(&img.path)) else {
+            return;
+        };
+        let Some(fill) = cache.fill(&img.path, spec, lw as u32, lh as u32, tint) else {
+            return;
+        };
+        draw_clipped(
+            buf,
+            buf_w,
+            buf_h,
+            fill,
+            (lx, ly, lw, lh),
+            img.opacity,
+            Some(&node_path),
+        );
+    });
+}
+
+/// 把已按目标尺寸备好的填充位图贴到 `(x, y, w, h)`，只留 `clip` 路径内的部分（None=不裁）。
+/// 定位背景图（裁到节点圆角盒）与覆盖图（裁到节点矩形）共用。
+fn draw_clipped(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    fill: &tiny_skia::Pixmap,
+    (x, y, w, h): (f32, f32, f32, f32),
+    opacity: f32,
+    clip: Option<&tiny_skia::Path>,
+) {
+    let Some(img_path) = round_rect_path(x, y, w, h, 0.0) else {
+        return;
+    };
+    let mask = match clip {
+        Some(clip) => {
+            let Some(mut mask) = Mask::new(buf_w, buf_h) else {
+                return;
+            };
+            mask.fill_path(clip, FillRule::Winding, true, Transform::identity());
+            Some(mask)
+        }
+        None => None,
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    let shader = Pattern::new(
+        fill.as_ref(),
+        SpreadMode::Pad,
+        FilterQuality::Nearest,
+        opacity.clamp(0.0, 1.0),
+        Transform::from_translate(x, y),
+    );
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+    pm.fill_path(
+        &img_path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        mask.as_ref(),
+    );
+}
+
 /// `ViewImage` → 填充规格。
 ///
 /// 单拎出来是为了能直接测：这是主题数据走到光栅化前的**最后一环**，而绘制本身在单测里
@@ -1380,23 +1600,16 @@ fn fill_spec_of(img: &ViewImage) -> crate::image_cache::FillSpec {
     }
 }
 
-/// 绘制 z 层覆盖图：按 anchor 九宫定位 + offset（dp + 百分比）置于 host 内，stretch 到目标尺寸 + opacity。
+/// 绘制 z 层覆盖图：按 place 定位（见 [`ImagePlace::rect`]）置于 host 内，stretch 到目标尺寸 + opacity；
+/// 超出 host 矩形（不带圆角）的部分裁掉，内容上下两层同一口径——对齐编辑器预览 `paintLayers`。
 fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewLayer) {
+    let (x, y, rw, rh) = snap_to_pixels(host.x, host.y, host.w, host.h);
+    let (rw, rh) = (rw.max(1.0), rh.max(1.0));
     IMAGE_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
-        // 目标尺寸：指定则用之，否则用原图尺寸。
-        let (lw, lh) = if layer.w > 0.0 && layer.h > 0.0 {
-            (layer.w.round().max(1.0), layer.h.round().max(1.0))
-        } else {
-            let Some((sw, sh)) = cache.src_size(&layer.path) else {
-                return;
-            };
-            (sw as f32, sh as f32)
+        let Some((lx, ly, lw, lh)) = layer.place.rect(host, || cache.src_size(&layer.path)) else {
+            return;
         };
-        // anchor 九宫基位（host 内）+ offset（dp px + 百分比相对 host 宽/高）。
-        let (ax, ay) = anchor_pos(&layer.anchor, host, lw, lh);
-        let lx = (ax + layer.off_x + layer.off_x_pct / 100.0 * host.w).round();
-        let ly = (ay + layer.off_y + layer.off_y_pct / 100.0 * host.h).round();
         let Some(fill) = cache.fill(
             &layer.path,
             crate::image_cache::FillSpec::stretch(),
@@ -1406,30 +1619,24 @@ fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewL
         ) else {
             return;
         };
-        let Some(path) = round_rect_path(lx, ly, lw, lh, 0.0) else {
+        // 整块落在 host 内就不必建蒙版（逐帧每层一张整缓冲大小的蒙版不便宜）。
+        let inside = lx >= x && ly >= y && lx + lw <= x + rw && ly + lh <= y + rh;
+        let host_path = if inside {
+            None
+        } else {
+            round_rect_path(x, y, rw, rh, 0.0)
+        };
+        if !inside && host_path.is_none() {
             return;
-        };
-        let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
-            return;
-        };
-        let shader = Pattern::new(
-            fill.as_ref(),
-            SpreadMode::Pad,
-            FilterQuality::Nearest,
-            layer.opacity.clamp(0.0, 1.0),
-            Transform::from_translate(lx, ly),
-        );
-        let paint = Paint {
-            shader,
-            anti_alias: true,
-            ..Default::default()
-        };
-        pm.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
+        }
+        draw_clipped(
+            buf,
+            buf_w,
+            buf_h,
+            fill,
+            (lx, ly, lw, lh),
+            layer.opacity,
+            host_path.as_ref(),
         );
     });
 }
@@ -2080,6 +2287,7 @@ mod fill_spec_tests {
             slice_repeat: [true, false],
             opacity: 1.0,
             tint: None,
+            place: None,
         };
 
         let spec = fill_spec_of(&img);
@@ -2100,6 +2308,7 @@ mod fill_spec_tests {
             slice_repeat: [false; 2],
             opacity: 1.0,
             tint: None,
+            place: None,
         };
         assert_eq!(fill_spec_of(&img), crate::image_cache::FillSpec::stretch());
     }
@@ -3132,6 +3341,7 @@ mod paint_order_tests {
                 slice_repeat: [false; 2],
                 opacity: 1.0,
                 tint: None,
+                place: None,
             });
         v.layout(0.0, 0.0, &tr);
         let (w, h) = (20usize, 20usize);
@@ -3145,5 +3355,353 @@ mod paint_order_tests {
         };
         assert_eq!(at(1, 10), [255, 0, 0], "边框被背景图盖住了");
         assert_eq!(at(10, 10), [0, 255, 0], "背景图本身没画出来");
+    }
+}
+
+/// 背景图定位（t238 / A2-52）：配了 anchor/offset/size 的背景图摆成一块、裁到节点圆角盒内；
+/// 不配则铺满节点，与改前一致。覆盖图的尺寸口径（只给一维）一并钉在这里。
+///
+/// 不 gate 平台：只用定宽定高与纯色位图，不碰文本测量。
+#[cfg(test)]
+mod bg_place_tests {
+    use super::*;
+    use crate::text::dwrite::TextRenderer;
+    use base64::Engine as _;
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const WHITE: [u8; 3] = [255, 255, 255];
+
+    fn data_uri(img: image::RgbaImage) -> String {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("PNG 编码");
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        )
+    }
+
+    fn png_uri(rgba: [u8; 4], w: u32, h: u32) -> String {
+        data_uri(image::RgbaImage::from_pixel(w, h, image::Rgba(rgba)))
+    }
+
+    /// 左半红、右半蓝：拿来对拍铺满结果，纯色图看不出拉伸方式变没变。
+    fn two_tone_uri() -> String {
+        data_uri(image::RgbaImage::from_fn(8, 4, |x, _| {
+            if x < 4 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        }))
+    }
+
+    fn image(path: String, place: Option<ImagePlace>) -> ViewImage {
+        ViewImage {
+            path,
+            mode: String::new(),
+            slice: [0.0; 4],
+            slice_repeat: [false; 2],
+            opacity: 1.0,
+            tint: None,
+            place,
+        }
+    }
+
+    fn place(anchor: &str) -> ImagePlace {
+        ImagePlace {
+            anchor: anchor.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 节点 `nw×nh` 置于 `bw×bh` 缓冲左上角，白底；返回 BGRA 缓冲。
+    fn paint(v: View, nw: f32, nh: f32, bw: usize, bh: usize) -> Vec<u8> {
+        let tr = TextRenderer::new("test", 20.0).unwrap();
+        let mut v = v.fixed_w(nw).fixed_h(nh);
+        v.layout(0.0, 0.0, &tr);
+        let mut buf = vec![0u8; bw * bh * 4];
+        v.paint(&mut buf, bw as u32, bh as u32, &tr);
+        buf
+    }
+
+    fn node() -> View {
+        View::container(Layout::Row).bg([255, 255, 255, 255])
+    }
+
+    fn rgb(buf: &[u8], bw: usize, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * bw + x) * 4;
+        [buf[i + 2], buf[i + 1], buf[i]]
+    }
+
+    fn alpha(buf: &[u8], bw: usize, x: usize, y: usize) -> u8 {
+        buf[(y * bw + x) * 4 + 3]
+    }
+
+    /// 楼主的场景：候选窗最右侧钉一张小图。anchor=right + 向左 4px，落点之外不得被涂。
+    #[test]
+    fn anchored_bg_image_lands_at_anchor_plus_offset() {
+        let p = ImagePlace {
+            off_x: -4.0,
+            w: 10.0,
+            h: 10.0,
+            ..place("right")
+        };
+        let buf = paint(
+            node().bg_image(image(png_uri(RED, 10, 10), Some(p))),
+            100.0,
+            40.0,
+            100,
+            40,
+        );
+        // 期望 x∈[86,96)、y∈[15,25)。
+        assert_eq!(
+            rgb(&buf, 100, 86, 15),
+            [255, 0, 0],
+            "左上角没落在锚点+偏移处"
+        );
+        assert_eq!(
+            rgb(&buf, 100, 95, 24),
+            [255, 0, 0],
+            "右下角没落在锚点+偏移处"
+        );
+        assert_eq!(rgb(&buf, 100, 5, 20), WHITE, "背景图仍铺满了整个节点");
+        assert_eq!(rgb(&buf, 100, 85, 20), WHITE, "图左侧被涂");
+        assert_eq!(rgb(&buf, 100, 97, 20), WHITE, "偏移没生效：右缘留白被涂");
+        assert_eq!(rgb(&buf, 100, 90, 13), WHITE, "图上方被涂");
+        assert_eq!(rgb(&buf, 100, 90, 26), WHITE, "图下方被涂");
+    }
+
+    /// 百分比偏移相对节点宽高：50% × 100 = 50，25% × 40 = 10。
+    #[test]
+    fn bg_image_pct_offset_is_relative_to_node() {
+        let p = ImagePlace {
+            off_x_pct: 50.0,
+            off_y_pct: 25.0,
+            w: 10.0,
+            h: 10.0,
+            ..place("top-left")
+        };
+        let buf = paint(
+            node().bg_image(image(png_uri(RED, 10, 10), Some(p))),
+            100.0,
+            40.0,
+            100,
+            40,
+        );
+        assert_eq!(rgb(&buf, 100, 50, 10), [255, 0, 0]);
+        assert_eq!(rgb(&buf, 100, 59, 19), [255, 0, 0]);
+        assert_eq!(rgb(&buf, 100, 49, 15), WHITE);
+        assert_eq!(rgb(&buf, 100, 55, 9), WHITE);
+        assert_eq!(rgb(&buf, 100, 60, 15), WHITE);
+    }
+
+    /// 不给 size = 原图像素尺寸（与覆盖图一致）。
+    #[test]
+    fn bg_image_without_size_uses_source_pixels() {
+        let buf = paint(
+            node().bg_image(image(png_uri(RED, 6, 4), Some(place("bottom-right")))),
+            40.0,
+            20.0,
+            40,
+            20,
+        );
+        assert_eq!(rgb(&buf, 40, 34, 16), [255, 0, 0]);
+        assert_eq!(rgb(&buf, 40, 39, 19), [255, 0, 0]);
+        assert_eq!(rgb(&buf, 40, 33, 18), WHITE);
+        assert_eq!(rgb(&buf, 40, 36, 15), WHITE);
+    }
+
+    /// 只给一维 size：另一维取原图尺寸（编辑器预览对背景图与覆盖图同此口径）。
+    #[test]
+    fn single_axis_size_takes_other_axis_from_source() {
+        let p = ImagePlace {
+            w: 20.0,
+            ..place("top-left")
+        };
+        let bg = paint(
+            node().bg_image(image(png_uri(RED, 10, 6), Some(p.clone()))),
+            40.0,
+            20.0,
+            40,
+            20,
+        );
+        let layer = paint(
+            node().layers(vec![ViewLayer {
+                path: png_uri(RED, 10, 6),
+                z: 1,
+                place: p,
+                opacity: 1.0,
+            }]),
+            40.0,
+            20.0,
+            40,
+            20,
+        );
+        for (name, buf) in [("背景图", &bg), ("覆盖图", &layer)] {
+            assert_eq!(rgb(buf, 40, 19, 5), [255, 0, 0], "{name}：宽没取 size.w");
+            assert_eq!(rgb(buf, 40, 20, 3), WHITE, "{name}：宽超出 size.w");
+            assert_eq!(rgb(buf, 40, 5, 6), WHITE, "{name}：高没取原图 6px");
+        }
+    }
+
+    /// 定位图超出节点的部分裁掉：圆角外、节点右缘外都不能有图。
+    #[test]
+    fn positioned_bg_image_is_clipped_to_rounded_node() {
+        // 节点 40×40（圆角 12）放在 60×40 缓冲里；图 16×16 贴右上角再向右挪 6px，一半出界。
+        let p = ImagePlace {
+            off_x: 6.0,
+            ..place("top-right")
+        };
+        let buf = paint(
+            node()
+                .radius(12.0)
+                .bg_image(image(png_uri(RED, 16, 16), Some(p))),
+            40.0,
+            40.0,
+            60,
+            40,
+        );
+        assert_eq!(rgb(&buf, 60, 32, 8), [255, 0, 0], "盒内那半没画");
+        assert_eq!(alpha(&buf, 60, 42, 8), 0, "节点右缘外被涂");
+        assert_eq!(alpha(&buf, 60, 39, 0), 0, "圆角外被涂");
+    }
+
+    fn layer(path: String, z: i32, place: ImagePlace) -> ViewLayer {
+        ViewLayer {
+            path,
+            z,
+            place,
+            opacity: 1.0,
+        }
+    }
+
+    /// 覆盖图超出节点的部分裁掉，裁到节点**矩形**（不带圆角）——对齐编辑器预览
+    /// `paintLayers` 的 `ctx.rect` 硬裁；内容上下两层同一口径。
+    #[test]
+    fn layer_overflow_is_clipped_to_node_rect() {
+        for z in [-1, 1] {
+            // 节点 40×40（圆角 12）放在 60×40 缓冲里；图 16×16 贴右上角再向右挪 6px，一半出界。
+            let p = ImagePlace {
+                off_x: 6.0,
+                ..place("top-right")
+            };
+            let buf = paint(
+                View::container(Layout::Row).radius(12.0).layers(vec![layer(
+                    png_uri(RED, 16, 16),
+                    z,
+                    p,
+                )]),
+                40.0,
+                40.0,
+                60,
+                40,
+            );
+            assert_eq!(rgb(&buf, 60, 32, 8), [255, 0, 0], "z={z}：盒内那半没画");
+            assert_eq!(alpha(&buf, 60, 40, 8), 0, "z={z}：节点右缘外被涂");
+            assert_eq!(alpha(&buf, 60, 45, 8), 0, "z={z}：节点右缘外被涂");
+            assert_eq!(
+                rgb(&buf, 60, 39, 0),
+                [255, 0, 0],
+                "z={z}：覆盖图只裁矩形，圆角处照画（编辑器口径）"
+            );
+        }
+    }
+
+    /// 完全落在节点内的覆盖图不受裁剪影响：同一位置、节点大小不同，画出来逐像素一致。
+    #[test]
+    fn layer_inside_node_is_not_trimmed() {
+        let p = ImagePlace {
+            off_x: 5.0,
+            off_y: 5.0,
+            ..place("top-left")
+        };
+        let at = |n: f32| {
+            paint(
+                View::container(Layout::Row).layers(vec![layer(two_tone_uri(), 1, p.clone())]),
+                n,
+                n,
+                60,
+                60,
+            )
+        };
+        let small = at(13.0);
+        assert_eq!(rgb(&small, 60, 5, 5), [255, 0, 0]);
+        assert_eq!(
+            rgb(&small, 60, 12, 8),
+            [0, 0, 255],
+            "贴着节点边的那列被裁了"
+        );
+        assert!(small == at(60.0), "节点内的覆盖图被裁剪改了像素");
+    }
+
+    /// 不配定位 = 铺满节点。对拍：铺满结果与「左上锚点、尺寸恰为节点」的定位结果逐像素一致，
+    /// 且圆角外保持透明。
+    #[test]
+    fn unpositioned_bg_image_fills_node_as_before() {
+        let (w, h) = (30usize, 12usize);
+        let full = paint(
+            node().radius(4.0).bg_image(image(two_tone_uri(), None)),
+            w as f32,
+            h as f32,
+            w,
+            h,
+        );
+        let exact = ImagePlace {
+            w: w as f32,
+            h: h as f32,
+            ..place("top-left")
+        };
+        let placed = paint(
+            node()
+                .radius(4.0)
+                .bg_image(image(two_tone_uri(), Some(exact))),
+            w as f32,
+            h as f32,
+            w,
+            h,
+        );
+        assert_eq!(rgb(&full, w, 2, 6), [255, 0, 0]);
+        assert_eq!(rgb(&full, w, 27, 6), [0, 0, 255], "没有拉伸铺满");
+        assert_eq!(alpha(&full, w, 0, 0), 0);
+        assert!(full == placed, "铺满与等尺寸定位不一致");
+    }
+}
+
+// 分段颜色的接线：有区间走 `draw_runs`、没有走原来的 `draw`，且区间不影响布局。
+// 只有 mock 后端记绘制调用，故限 Linux。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod color_runs_paint_tests {
+    use super::*;
+
+    fn paint_log(v: &mut View) -> Vec<String> {
+        let tr = TextRenderer::new("test", 20.0).unwrap();
+        v.layout(0.0, 0.0, &tr);
+        let mut buf = vec![0u8; 200 * 50 * 4];
+        v.paint(&mut buf, 200, 50, &tr);
+        tr.take_draw_log()
+    }
+
+    #[test]
+    fn runs_route_to_draw_runs_and_plain_stays_on_draw() {
+        let run = ColorRun {
+            start: 0,
+            end: 1,
+            rgba: [255, 0, 0, 255],
+        };
+        let mut colored = View::leaf("ab", [0, 0, 0, 255]).color_runs(vec![run]);
+        let mut plain = View::leaf("ab", [0, 0, 0, 255]);
+        let c = paint_log(&mut colored);
+        let p = paint_log(&mut plain);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].starts_with("draw_runs ") && c[0].contains("runs=[ColorRun"));
+        assert_eq!(p.len(), 1);
+        assert!(p[0].starts_with("draw "), "无区间必须仍走 draw：{}", p[0]);
+        assert_eq!(
+            colored.measured_size(),
+            plain.measured_size(),
+            "颜色不参与布局"
+        );
     }
 }

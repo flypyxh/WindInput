@@ -117,8 +117,10 @@ impl Coordinator {
                 return Vec::new();
             }
         };
-        let palette: HashMap<String, Rgba> =
+        let mut palette: HashMap<String, Rgba> =
             wind_theme::palette::resolve_palette(merged.get("colors"), is_dark);
+        // 与桌面 `wind_theme::resolve` 同一口径：补主题没写的标准色契约名。
+        wind_theme::contract::fill_missing(merged.get("colors"), &mut palette, is_dark);
 
         let mut out: Vec<(String, u32)> = palette
             .into_iter()

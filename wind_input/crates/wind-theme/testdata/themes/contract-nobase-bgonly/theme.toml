@@ -1,0 +1,12 @@
+# 测试主题（非出厂）：标准色契约的引擎兜底（设计 text-span-colors.md §5.4「引擎兜底」）。
+# 不写 base，只写了窗口底色与气泡底色：accent、text 都没有。钉住「引用到的契约名本主题也没写」
+# 这一支——accent_text = ${accent} 取兜底的 accent，tooltip_text 暗档 ${text} 取兜底的 text。
+# 主题编辑器的「打开式预置」在这里把它们写成字面兜底值（accent、text 不自动写入），与本表对拍。
+
+[meta]
+name = "契约兜底测试（无 base、只有底色）"
+version = "1.0"
+
+[colors]
+bg = "#FFFFFF"
+tooltip_bg = "#202020F0"

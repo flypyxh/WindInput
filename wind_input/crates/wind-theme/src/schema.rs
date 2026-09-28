@@ -162,7 +162,7 @@ pub struct ViewPoint {
     pub y: Option<Dim>,
 }
 
-/// 覆盖图尺寸（逻辑像素）；0=原图尺寸。
+/// 图片定位尺寸（逻辑像素）；0=该维取原图尺寸。
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct ViewSize {
     #[serde(default)]
@@ -190,7 +190,8 @@ pub struct ViewImage {
     /// 仅 layers[]：内容基准 0，<0 在内容下、>0 在上。
     #[serde(default)]
     pub z: i32,
-    /// 仅覆盖图：top-left | top | … | center | … | bottom-right。
+    /// 定位锚点：top-left | top | … | center | … | bottom-right。覆盖图恒按它定位；
+    /// 背景图配了 anchor / 非零 offset / 非零 size 任一项即改为按定位摆放（否则铺满）。
     #[serde(default)]
     pub anchor: String,
     #[serde(default)]
@@ -308,6 +309,12 @@ pub struct ViewNode {
     pub line_spacing: Option<Dim>,
     pub col_gap: Option<Dim>,
     pub title_gap: Option<Dim>,
+
+    /// 文字角色色（分段着色，设计 text-span-colors.md §5）：角色名 → 颜色，值的写法同 `color`。
+    /// `""` = 未设置（派生主题借此撤销 base 配的某个角色）。只有 `comment`（含 `selected` /
+    /// `hover`）与 `tooltip` 消费；角色名不校验——更新版本的主题在旧引擎上应静默忽略。
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, Ld>,
 
     // 状态态 patch（递归）。
     pub selected: Option<Box<ViewNode>>,

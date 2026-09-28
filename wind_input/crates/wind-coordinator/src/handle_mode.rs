@@ -90,6 +90,26 @@ pub(crate) enum MixLens {
     /// 选词键与 Text 同（数字键 1-9）。整体上屏（`commits_whole`）——词组没有可分段的编码，
     /// 不走拼音那种分步确认。
     Phrase,
+    /// 大写英文词（A2-50 / t235）：`free_input = off`、本实例含英文成员、缓冲是带大写的
+    /// 纯 ASCII 字母。
+    ///
+    /// # 为什么不复用 [`MixLens::Free`]
+    ///
+    /// `auto` 下同一串缓冲落 Free（大写越界），候选是「原文 + 英文段」。`off` 的语义却是
+    /// 「数字 / 符号键保持功能键身份」——用户关自由输入正是为了躲开「数字、标点变字面」
+    /// （t240）。落进 Free 就会让①把一切可打印键收成字面、③④的选词键全部失效。
+    ///
+    /// # 为什么也不塞进 [`MixLens::Text`]
+    ///
+    /// Text 会把缓冲喂给**所有**成员，而带大写的串对拼音 / 码表成员不是编码；它的记账支
+    /// 还会拿缓冲原样当码（词库码恒小写）、做分步确认与造词。
+    ///
+    /// # 于是它自成一档
+    ///
+    /// 候选与 auto 的 Free 英文段**同一份**（`mix_free_english_segment`：原文钉首位 + 英文
+    /// 词库候选，跟随大小写）；按键分派与 Text 同（字母入缓冲并保留 Shift 形态、数字选词、
+    /// `-`/`=` 翻页、标点顶屏）。它是缓冲的纯函数：退格删到没有大写即回到 Text。
+    English,
 }
 
 impl MixLens {
@@ -117,6 +137,9 @@ impl MixLens {
             // 不另写一份，否则给求值器加运算符时这里会静默落后）。
             MixLens::Numeric => wind_quick_input::is_expr_char(c),
             MixLens::Free => true,
+            // 只在 `free_input = off` 下出现，而 `accepts` 只在 auto 的越界判定里被问；
+            // 写成穷尽 `match` 是为了让新变体自己回答这个问题（理由同 `commits_whole`）。
+            MixLens::English => c.is_ascii_alphabetic(),
         }
     }
 
@@ -135,6 +158,8 @@ impl MixLens {
             // Phrase 落 `true` 恰好是对的（英文候选 `consumed_length = 0`，分步确认要求
             // `consumed > 0`），但那是巧合不是设计——巧合不该当判据用。
             MixLens::Phrase => true,
+            // 大写英文词：候选是整词（同 Free 英文段），没有可分段消费的编码。
+            MixLens::English => true,
         }
     }
 
@@ -145,6 +170,10 @@ impl MixLens {
         match self {
             MixLens::Text | MixLens::Phrase => true,
             MixLens::Numeric | MixLens::Free => false,
+            // 有码可记，但码**不是缓冲本身**：缓冲带大写，词库码恒小写。通用记账支会拿缓冲
+            // 原样当码、还会造词，故它不走那支，而走与 Free 英文段同一条专用记账
+            // （`record_mix_english_word`：码取缓冲小写化）。
+            MixLens::English => false,
         }
     }
 }
@@ -624,6 +653,10 @@ impl Coordinator {
             return MixLens::Phrase;
         }
         if free == FreeInputMode::Off {
+            // 大写英文词（A2-50）：auto 下它因越界进 Free，off 下另成一档，见 [`MixLens::English`]。
+            if base == MixLens::Text && self.mix_free_is_english_word(state) {
+                return MixLens::English;
+            }
             return base;
         }
         if state.mix_buffer.chars().any(|c| !base.accepts(c, sep)) {
@@ -889,7 +922,7 @@ impl Coordinator {
         // 布局无需在此恢复：active 已清空，下一次 notify_ui_update 会自动算回全局基线。
     }
 
-    /// 快捷输入此刻的**高亮候选**是不是英文候选（英文成员 / Free 英文段 / 词组透镜）——
+    /// 快捷输入此刻的**高亮候选**是不是英文候选（英文成员 / 英文段 / 词组透镜）——
     /// 大小写档位循环（`input.english_case_cycle_key`）在快捷输入里的夺取判据，对齐临英。
     ///
     /// 只看高亮：档位键可能配成 Space / Enter / Esc / Tab，高亮是中文候选时它们必须保持原功能
@@ -908,11 +941,19 @@ impl Coordinator {
         self.mix_candidate_is_english(state, cand)
     }
 
-    /// Free 透镜下这串缓冲是不是「英文词」：`free_input = auto`、含英文成员、纯 ASCII 字母
-    /// （只因含大写才越界）。Free 英文段的生成（`mix_free_english_segment`）、按英文记词频、
-    /// 档位键夺取三处共用，判据只此一份。
+    /// 这串缓冲是不是「英文词」：含英文成员、纯 ASCII 字母，且
+    /// - `free_input = auto`：用在 Free 透镜下（只因含大写才越界）；
+    /// - `free_input = off`：须含大写——它正是 [`MixLens::English`] 的判据（全小写仍是 Text）。
+    ///
+    /// 英文段的生成（`mix_free_english_segment`）、按英文记词频、档位键夺取、off 下的透镜
+    /// 判定四处共用，判据只此一份。
     pub(crate) fn mix_free_is_english_word(&self, state: &State) -> bool {
-        self.mix_free_input(state.mix_id) == FreeInputMode::Auto
+        let mode_ok = match self.mix_free_input(state.mix_id) {
+            FreeInputMode::Auto => true,
+            FreeInputMode::Off => state.mix_buffer.chars().any(|c| c.is_ascii_uppercase()),
+            FreeInputMode::Always => false,
+        };
+        mode_ok
             && !state.mix_buffer.is_empty()
             && state.mix_buffer.chars().all(|c| c.is_ascii_alphabetic())
             && self.mix_has_english(state.mix_id)
@@ -1903,6 +1944,12 @@ impl Coordinator {
         self.show_status();
         self.notify_toolbar();
         info!("{}: {}", log_verb, schema_id);
+        // 手切分流（按应用方案，C0-7）：焦点应用配了 schema 规则 ⇒ 这次手切只属于它
+        // （`@remember` 另记记忆表），**不写** `schema.active`；否则是全局手切，照旧持久化。
+        // 上面的归位与气泡两边都要：手切的语义前提「我要用这个方案打字」与在哪个应用无关。
+        if self.route_manual_schema_switch(schema_id) {
+            return;
+        }
         if let Err(e) = Config::set_user_string(&["schema", "active"], schema_id) {
             warn!("{}: 持久化 schema.active 失败: {}", log_verb, e);
         }
@@ -2139,18 +2186,11 @@ impl Coordinator {
                         }
                     }
                 }
-            } else if lens == MixLens::Free && english && self.mix_free_is_english_word(state) {
-                // Free 透镜里的英文段（见 `mix_free_english_segment`）：词库词按词库原文记词频、
-                // 头部候选找回对应词库词记（同临英）；都不是词库词时只记历史。不分段、不造词。
-                match self.mix_freq_candidate(state, &cand) {
-                    Some(freq_cand) => {
-                        let code = state.mix_buffer.to_lowercase();
-                        let freq_code = self.freq_code(&code, &freq_cand);
-                        let owner = self.mix_candidate_owner(state, &freq_cand);
-                        self.record_selection_cand_in(owner.as_deref(), &freq_code, &freq_cand);
-                    }
-                    None => self.push_commit_history(&cand.text),
-                }
+            } else if matches!(lens, MixLens::Free | MixLens::English)
+                && english
+                && self.mix_free_is_english_word(state)
+            {
+                self.record_mix_english_word(state, &cand);
             } else {
                 // 数字透镜（计算/日期/金额）与自由输入原文无编码可记词频，但同样是一次上屏：
                 // 单独记历史，使「算完再按 ; 空格」能重复刚上屏的结果。
@@ -2181,6 +2221,21 @@ impl Coordinator {
         }
     }
 
+    /// 英文段（`mix_free_english_segment`：auto 的 Free 透镜 / off 的 [`MixLens::English`]）
+    /// 选中的记账：词库词按词库原文记词频、头部候选找回对应词库词记（同临英）；都不是
+    /// 词库词时只记历史。码取缓冲**小写化**（词库码恒小写）。不分段、不造词。
+    fn record_mix_english_word(&self, state: &State, cand: &Candidate) {
+        match self.mix_freq_candidate(state, cand) {
+            Some(freq_cand) => {
+                let code = state.mix_buffer.to_lowercase();
+                let freq_code = self.freq_code(&code, &freq_cand);
+                let owner = self.mix_candidate_owner(state, &freq_cand);
+                self.record_selection_cand_in(owner.as_deref(), &freq_code, &freq_cand);
+            }
+            None => self.push_commit_history(&cand.text),
+        }
+    }
+
     /// 刷新 mix 候选：按配置成员序逐个查询、合并、按文本去重。
     ///
     /// 成员分三类：快捷输入内置来源（`quick_input.calc/.date/.number`，由
@@ -2205,7 +2260,9 @@ impl Coordinator {
             return;
         }
         let lens = self.mix_lens(state);
-        if lens == MixLens::Free {
+        // 大写英文词透镜（off）与 Free 共用这一支：英文段恒有（判据即透镜判据），中文成员
+        // 不参与，见 [`MixLens::English`]。
+        if matches!(lens, MixLens::Free | MixLens::English) {
             // 自由输入：缓冲不是任何成员的合法编码，查谁都只会得到噪声。唯一候选＝所打原文，
             // 保证「打什么上屏什么」。候选文本保持半角原样；全角转换与补空格在上屏出口
             // `mix_select_at` 做（含英文成员的实例对齐临英，A2-3b 定案），这里不转——
@@ -2460,9 +2517,10 @@ impl Coordinator {
                 // `phrase_seg_does_not_break_apostrophe_free_input` 钉的正是「开关两档逐条一致」。
                 //
                 // mix 文本缓冲恒小写，故变形只有首字母大写 / 全大写两条，大小写跟随输入在
-                // 这里无事可做；带大写的缓冲落 Free 透镜，那里的英文段按临英开关投影（见
-                // `mix_free_english_segment`）。大小写档位（`english_case_cycle_key`）在下面
-                // 并入头部之后只套本段，夺取判据见 `mix_highlight_is_english`。
+                // 这里无事可做；带大写的缓冲落 Free 透镜（auto）或大写英文词透镜（off），
+                // 那里的英文段按临英开关投影（见 `mix_free_english_segment`）。
+                // 大小写档位（`english_case_cycle_key`）在下面并入头部之后只套本段，
+                // 夺取判据见 `mix_highlight_is_english`。
                 if member == "english" {
                     let te = &self.rt().config.input.temp_english;
                     let raw_mode = crate::english_candidates::raw_mode_under_phrase_seg(
@@ -2538,6 +2596,9 @@ impl Coordinator {
     /// Free 透镜下的**英文段**：缓冲是纯 ASCII 字母（Free 只因含大写才越界）、本实例含英文
     /// 成员且 `free_input = auto` 时，按临英口径给出「原文 + 大小写变形 + 词库候选」；
     /// 否则 `None`（调用方照旧只给原文）。
+    ///
+    /// `free_input = off` 下带大写的纯字母缓冲落 [`MixLens::English`]，候选同样由本函数给出
+    /// （判据共用 [`Self::mix_free_is_english_word`]），两档逐条一致；区别只在按键分派。
     ///
     /// # 为什么落在 Free 里而不是改透镜判据
     ///
@@ -2922,8 +2983,9 @@ impl Coordinator {
                         None
                     }
                     MixLens::Numeric => Self::mix_numeric_input_char(data.key_code, shift),
-                    // 文本透镜：字母入缓冲。自由输入关闭时 Shift 被丢弃（既有行为，恒小写）；
-                    // 开启时大写字母即越界字符，字面入缓冲并把透镜带进 Free。
+                    // 文本透镜：字母入缓冲。自由输入开启时大写字母即越界字符，字面入缓冲并把
+                    // 透镜带进 Free；关闭时本实例含英文成员则同样保留大写，缓冲随即落
+                    // [`MixLens::English`]（A2-50 / t235），不含英文成员时 Shift 被丢弃（恒小写）。
                     // 词组透镜与 Text 同：字母入缓冲。分词符本身由下面专门的臂收，
                     // 不走这里（`mix_input_char` 只认字母/表达式字符）。
                     MixLens::Phrase if is_letter => {
@@ -2933,13 +2995,22 @@ impl Coordinator {
                     MixLens::Phrase => None,
                     MixLens::Text if is_letter => {
                         let base = (data.key_code - keymap::VK_A) as u8;
-                        Some(if free_on && shift {
-                            (b'A' + base) as char
-                        } else {
-                            (b'a' + base) as char
-                        })
+                        Some(
+                            if shift && (free_on || self.mix_has_english(state.mix_id)) {
+                                (b'A' + base) as char
+                            } else {
+                                (b'a' + base) as char
+                            },
+                        )
                     }
                     MixLens::Text => None,
+                    // 大写英文词：字母保留 Shift 形态入缓冲；其余键落到②③④⑥，维持 off 下的
+                    // 功能键身份（数字选词、`-`/`=` 翻页、标点顶屏）。
+                    MixLens::English if is_letter => {
+                        let base = (data.key_code - keymap::VK_A) as u8;
+                        Some(if shift { b'A' + base } else { b'a' + base } as char)
+                    }
+                    MixLens::English => None,
                 };
                 if let Some(ch) = input {
                     preedit_cursor::BufEdit::new(&mut state.mix_buffer, &mut state.mix_cursor)
@@ -3106,7 +3177,12 @@ impl Coordinator {
                         // 主输入路 `commit_highlight_then_char`。必须在 `exit_mix_mode` 清缓冲前。
                         // 重复上屏候选已由 `has_head` 排除；数字透镜无编码可记，只记历史。
                         let cand = state.candidates[idx].clone();
-                        let code_len = if !self.mix_lens(state).has_code() {
+                        let lens = self.mix_lens(state);
+                        let code_len = if lens == MixLens::English {
+                            // 大写英文词：专用记账（小写化码），同 `mix_select_at`。
+                            self.record_mix_english_word(state, &cand);
+                            0
+                        } else if !lens.has_code() {
                             self.push_commit_history(&cand.text);
                             0
                         } else {

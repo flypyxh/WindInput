@@ -2392,6 +2392,15 @@ impl MessageHandler for Coordinator {
             // 「同进程」，它配的 initial_mode 永远不会生效（实测缺陷，见字段注释）。
             *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = (new_pid, new_has_rule);
         }
+        // 按应用方案（compat.toml `schema`）：与 initial_mode 同一个判据——跨进程切入才重算，
+        // 同进程内焦点跳转不动，尊重用户在应用内的手切；作用域外的过渡窗口（任务栏）也不动，
+        // 否则「点任务栏再回来」就把 mode_scope 之外的方案切走了。
+        // 放在 apply_initial_mode **之前**：切方案会让方案级标点意图在下一次状态推送时落地，
+        // 显式 `initial_punct` 规则要在它之后再落一次才压得住。
+        // ⛔ 不得挪进 get_current_mode（DLL 同步阻塞路径），见 `coordinator/app_schema.rs`。
+        if crossed && !out_of_scope {
+            self.apply_app_schema_on_focus(&proc_name);
+        }
         if should_reapply_initial(
             crossed,
             self.rt().config.input.default.per_app_scope(),
@@ -2526,6 +2535,10 @@ impl MessageHandler for Coordinator {
         self.notify_toolbar_async(); // 防抖，异步避免阻塞 bridge 线程
         if clears_input {
             self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
+            // 只收菜单、不解除气泡 / 状态气泡的隐藏抑制会让它残留（气泡从此移出不隐藏、右键被当成
+            // 「菜单开着」）。这里之后没有菜单命令要派发，不受 clear_tooltip_menu_flag 的截图时序
+            // 约束，可以立即解除。UI 侧另有兜底（Tooltip::on_menu_dismissed），两处幂等叠加。
+            self.clear_tooltip_menu_flag();
             self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
             self.terminate_auto_phrase("focus_lost"); // 换窗口 = 一段输入结束
         }
@@ -2683,6 +2696,8 @@ impl MessageHandler for Coordinator {
         }
         self.notify_toolbar_async(); // 非激活态 → notify_toolbar 内部下发 HideToolbar（异步）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
+        // 同 handle_focus_lost：只收菜单不解除抑制会残留；此后无菜单命令派发，可立即解除。
+        self.clear_tooltip_menu_flag();
         self.hide_tip(); // 切走本输入法隐藏状态提示
         self.terminate_auto_phrase("ime_deactivated"); // 切走输入法 = 一段输入结束
     }
@@ -2857,6 +2872,8 @@ impl MessageHandler for Coordinator {
         drop(state);
         self.clear_pair_tracker(); // 组合意外终止：配对上下文失效，清栈防跳出键误判
         self.notify_ui_hide();
+        // 同 handle_focus_lost：只收菜单不解除抑制会残留；此后无菜单命令派发，可立即解除。
+        self.clear_tooltip_menu_flag();
     }
 
     fn handle_caret_update(&self, data: &CaretData) {
@@ -2919,13 +2936,19 @@ impl MessageHandler for Coordinator {
         // 放在闸门之后等于永远不执行（而且完全静默）。
         //
         // 只认 TSF 域：本闸门存在的全部意义就是不拿 GUI 回退坐标定位气泡。
-        if self
-            .pending_focus_tip
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && wind_ipc::protocol::caret_source::is_tsf(data.source)
+        // compare_exchange 而非 load + store：与锚点超时（`fire_focus_tip_timeout`）同时到达时
+        // 只让一方显示。
+        if wind_ipc::protocol::caret_source::is_tsf(data.source)
+            && self
+                .pending_focus_tip
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
         {
-            self.pending_focus_tip
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             debug!(
                 "focus_tip → 补显示: 等到权威坐标 ({},{}) src={}",
                 data.x,

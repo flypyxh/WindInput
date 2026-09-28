@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 # 仅为 UiCommand::SetTheme(Box<Resolved>)；wind-theme 无平台依赖。
 wind-theme = { path = "../wind-theme" }
+# StyledText 的区间表：出厂模板下每段注释 / 气泡行只有一两个片段，内联存放免得每行一次堆分配
+# （每次按键满页候选 × 每条数行，§13.3 的 < 5% 预算）。纯 Rust，过 android check。
+smallvec = "1"
 
 [target.'cfg(windows)'.dependencies]
 # 仅为 UiCommand::SetHostRender(HostRenderArc)；该变体本身 #[cfg(windows)]，

@@ -28,6 +28,14 @@ public final class BridgeResponseRouter {
     /// app 层注入: 执行 host 光标移动。见 CursorMove。
     public var moveHostCursor: ((CursorMove) -> Void)?
 
+    /// 接手另一个 router 的组字状态。IMKit 焦点闪回时可能换一个 controller 实例来 Activate
+    /// (Spotlight 里右键候选实测如此), 新实例本端 composition 为空会误判「没在组字」:
+    /// 失焦时不清 marked text、按键前乱报 caret。
+    public func adoptState(from other: BridgeResponseRouter) {
+        composition = other.composition
+        heldSymbol = other.heldSymbol
+    }
+
     /// 智能符号 HoldComposition 挂着的待定标点 (作为组合预览显示, 语义 = **待提交**)。
     ///
     /// 服务端在下发 PassThrough / UpdateComposition 时会同步清掉自己的 `held_text`

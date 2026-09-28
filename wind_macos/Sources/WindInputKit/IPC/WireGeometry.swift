@@ -38,6 +38,27 @@ public enum WireGeometry {
         CGPoint(x: wireX, y: flipY(wireY, screenHeight: screenHeight) - size.height)
     }
 
+    /// 状态气泡锚点 → Cocoa 左下角（未钳制）。`target` 为参照矩形（Cocoa 坐标，y 向上），
+    /// `margin` 为距参照边缘的留白（居中两档不用）。与 Rust `wind-ui` 的 `anchor_origin` 同一套
+    /// 定义，只是换成了 y 向上：「顶」是 `maxY`。窗口锚点与同名屏幕锚点公式相同，差别只在
+    /// 调用方给的参照矩形；`.none` 按居中处理（调用方本不该拿它来问）。
+    public static func anchorOrigin(anchor: StatusAnchor, target t: CGRect, size: CGSize,
+                                    margin m: CGFloat) -> CGPoint {
+        let (w, h) = (size.width, size.height)
+        switch anchor {
+        case .screenTopLeft:
+            return CGPoint(x: t.minX + m, y: t.maxY - m - h)
+        case .screenTopRight:
+            return CGPoint(x: t.maxX - m - w, y: t.maxY - m - h)
+        case .screenBottomLeft, .windowBottomLeft:
+            return CGPoint(x: t.minX + m, y: t.minY + m)
+        case .screenBottomRight:
+            return CGPoint(x: t.maxX - m - w, y: t.minY + m)
+        case .screenCenter, .windowCenter, .none:
+            return CGPoint(x: (t.midX - w / 2).rounded(), y: (t.midY - h / 2).rounded())
+        }
+    }
+
     /// 把窗口矩形钳进可见区 `visibleFrame`（避开菜单栏/Dock）；返回钳后的左下角。
     /// 内容比屏幕还大时保证**左上角**可见（先按右/下回拉，再按左/上兜底）。
     public static func clamp(origin: CGPoint, size: CGSize, visibleFrame vf: CGRect) -> CGPoint {

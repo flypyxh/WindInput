@@ -19,6 +19,8 @@ pub mod diag;
 pub mod event;
 pub mod menu;
 pub mod softkeyboard;
+pub mod status_tip;
+pub mod styled;
 pub mod toast;
 pub mod toolbar;
 
@@ -28,5 +30,7 @@ pub use diag::*;
 pub use event::*;
 pub use menu::*;
 pub use softkeyboard::*;
+pub use status_tip::*;
+pub use styled::*;
 pub use toast::*;
 pub use toolbar::*;

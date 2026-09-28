@@ -92,6 +92,22 @@ pub fn validate_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 目录下全部主题 id（含 `theme.toml` 的子目录名，含 `_` 开头的抽象 base），按名排序。
+///
+/// 出厂主题的逐个测试（渲染 golden、角色色为空、标准色契约）都从这里枚举，新加一个出厂
+/// 主题不会因为谁忘了改一张硬编码清单而漏测。
+pub fn list_theme_ids(dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("theme.toml").is_file())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// 加载并 base 深合并主题，解析为类型化 `Theme`（未求值的原始 schema）。
 /// 合并在 Value 层完成（逐层归一化 → 合并 → 完整归一化 → 类型化），未知字段忽略（前向兼容）。
 pub fn load_typed(themes_dir: &Path, name: &str) -> anyhow::Result<Theme> {

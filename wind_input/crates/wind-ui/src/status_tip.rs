@@ -10,6 +10,7 @@ use crate::window::LayeredWindow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
+use wind_ui_types::{StatusTipAnchor, StatusTipPlacement};
 
 /// 状态提示气泡的鼠标处理器：左键拖动移动位置，右键请求功能菜单。
 /// 抓取偏移模型（同 `input_diag_hud::DragState`）：按下时记录光标−窗口左上偏移，
@@ -346,7 +347,7 @@ impl StatusTip {
         self.renderer.set_base_size(self.base_logical * self.scale);
         if let Some(node) = &theme.views.status {
             let s = self.scale;
-            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             self.shadow = crate::view::SoftShadow::build(
                 node.shadow_offset_x,
@@ -491,6 +492,44 @@ impl StatusTip {
         self.window.show(ax - ml as i32, ay - mt as i32);
     }
 
+    /// 锚点显示（C2-33 / GH#148）：前台窗口所在屏的工作区 / 前台窗口边框上的锚点，不跟随光标。
+    /// `caret_*` 只在取不到前台窗口时用于选屏，见 [`anchor_frames`]。
+    pub fn show_anchor(&mut self, text: &str, anchor: StatusTipAnchor, caret_x: i32, caret_y: i32) {
+        let frames = anchor_frames(caret_x, caret_y);
+        let (probe_x, probe_y) = anchor_probe_point(frames, caret_x, caret_y);
+        // ★ 顺序契约同 `show_fixed`：scale → 尺寸 → 落点。
+        self.ensure_scale(probe_x, probe_y);
+        let margin = (ANCHOR_MARGIN_DP * self.scale).round() as i32;
+        let (cw, ch, ml, mt) = self.render_bubble(text);
+        self.mouse.borrow_mut().margin = (ml as i32, mt as i32);
+        let m = self.mouse.borrow();
+        if m.dragging && m.drag_pin.is_some() {
+            return;
+        }
+        drop(m);
+        let (ax, ay) = anchor_target(frames, anchor, (cw, ch), margin, caret_x, caret_y);
+        self.mark_visible();
+        self.window.show(ax - ml as i32, ay - mt as i32);
+    }
+
+    /// 按 [`StatusTipPlacement`] 分派到三种本地显示。`(x, y, caret_h)` 为光标。
+    pub fn show_placed(
+        &mut self,
+        text: &str,
+        x: i32,
+        y: i32,
+        caret_h: i32,
+        placement: StatusTipPlacement,
+    ) {
+        match placement {
+            StatusTipPlacement::Caret { offset_x, offset_y } => {
+                self.show(text, x, y, caret_h, offset_x, offset_y)
+            }
+            StatusTipPlacement::Fixed { x: fx, y: fy } => self.show_fixed(text, fx, fy, x, y),
+            StatusTipPlacement::Anchor(a) => self.show_anchor(text, a, x, y),
+        }
+    }
+
     /// 将当前渲染帧保存为 PNG 文件（截图用）。
     pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
         self.window.capture_to_file(path)
@@ -593,6 +632,139 @@ impl StatusTip {
         let (ax, ay) = fixed_anchor(fx, fy, caret_x, caret_y, cw, ch);
         Some((buf, w, h, ax - ml as i32, ay - mt as i32, has_shadow))
     }
+
+    /// host-render：锚点模式。与 [`Self::show_anchor`] 同一套落点解析，两条渲染路径必须一致。
+    #[cfg(windows)]
+    pub fn render_frame_anchor(
+        &mut self,
+        text: &str,
+        anchor: StatusTipAnchor,
+        caret_x: i32,
+        caret_y: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        if text.is_empty() {
+            return None;
+        }
+        let frames = anchor_frames(caret_x, caret_y);
+        let (probe_x, probe_y) = anchor_probe_point(frames, caret_x, caret_y);
+        self.ensure_scale(probe_x, probe_y);
+        let margin = (ANCHOR_MARGIN_DP * self.scale).round() as i32;
+        let (buf, w, h, cw, ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
+        let (ax, ay) = anchor_target(frames, anchor, (cw, ch), margin, caret_x, caret_y);
+        Some((buf, w, h, ax - ml as i32, ay - mt as i32, has_shadow))
+    }
+
+    /// host-render：按 [`StatusTipPlacement`] 分派，与 [`Self::show_placed`] 一一对应。
+    #[cfg(windows)]
+    pub fn render_frame_placed(
+        &mut self,
+        text: &str,
+        x: i32,
+        y: i32,
+        caret_h: i32,
+        placement: StatusTipPlacement,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        match placement {
+            StatusTipPlacement::Caret { offset_x, offset_y } => {
+                self.render_frame(text, x, y, caret_h, offset_x, offset_y)
+            }
+            StatusTipPlacement::Fixed { x: fx, y: fy } => {
+                self.render_frame_fixed(text, fx, fy, x, y)
+            }
+            StatusTipPlacement::Anchor(a) => self.render_frame_anchor(text, a, x, y),
+        }
+    }
+}
+
+/// 锚点距参照矩形边缘的留白（逻辑像素，按目标屏 DPI 缩放）。
+const ANCHOR_MARGIN_DP: f32 = 16.0;
+
+/// 锚点的参照矩形：`(工作区, 前台窗口边框)`，均为 `(left, top, right, bottom)`。
+type AnchorFrames = Option<((i32, i32, i32, i32), Option<(i32, i32, i32, i32)>)>;
+
+/// 取锚点的参照矩形（平台层）：前台窗口所在屏的工作区 + 前台窗口可见边框。
+/// 取不到前台窗口时退到**光标所在屏**的工作区（无窗口边框 ⇒ 窗口锚点降级为屏幕锚点）；
+/// 连工作区都查不到时返回 `None`，调用方按光标点夹回。非 Windows 恒 `None`（macOS 的气泡在
+/// `.app` 侧定位，不走本模块）。
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn anchor_frames(caret_x: i32, caret_y: i32) -> AnchorFrames {
+    #[cfg(windows)]
+    {
+        if let Some(g) = wind_keys::foreground::foreground_window_geometry() {
+            return Some((g.work_area, g.frame));
+        }
+        crate::sys::work_area_at(caret_x, caret_y).map(|w| (w, None))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// `ensure_scale` 的探测点：取工作区中心（锚点都落在这块屏上），查不到时退回光标。
+fn anchor_probe_point(frames: AnchorFrames, caret_x: i32, caret_y: i32) -> (i32, i32) {
+    match frames {
+        Some(((l, t, r, b), _)) => ((l + r) / 2, (t + b) / 2),
+        None => (caret_x, caret_y),
+    }
+}
+
+/// 锚点落点（内容左上）：有参照矩形走纯函数 [`place_anchor`]，否则按光标点夹回工作区。
+fn anchor_target(
+    frames: AnchorFrames,
+    anchor: StatusTipAnchor,
+    size: (u32, u32),
+    margin: i32,
+    caret_x: i32,
+    caret_y: i32,
+) -> (i32, i32) {
+    match frames {
+        Some((work, frame)) => place_anchor(anchor, work, frame, size, margin),
+        None => crate::sys::clamp_to_work_area(caret_x, caret_y, size.0, size.1),
+    }
+}
+
+/// 锚点 → 气泡内容左上角（纯几何，未夹回）。`target` 为参照矩形 `(left, top, right, bottom)`，
+/// `margin` 为距参照边缘的留白（居中两档不用它）。
+///
+/// 窗口锚点与同名屏幕锚点公式相同，差别只在调用方给的参照矩形。
+fn anchor_origin(
+    target: (i32, i32, i32, i32),
+    size: (u32, u32),
+    margin: i32,
+    anchor: StatusTipAnchor,
+) -> (i32, i32) {
+    use StatusTipAnchor as A;
+    let (l, t, r, b) = target;
+    let (w, h) = (size.0 as i32, size.1 as i32);
+    let center = ((l + r) / 2 - w / 2, (t + b) / 2 - h / 2);
+    match anchor {
+        A::ScreenCenter | A::WindowCenter => center,
+        A::ScreenTopLeft => (l + margin, t + margin),
+        A::ScreenTopRight => (r - margin - w, t + margin),
+        A::ScreenBottomLeft | A::WindowBottomLeft => (l + margin, b - margin - h),
+        A::ScreenBottomRight => (r - margin - w, b - margin - h),
+    }
+}
+
+/// 锚点定位的完整纯函数：选参照矩形 → [`anchor_origin`] → 夹回工作区。
+///
+/// - 窗口锚点拿不到窗口边框（`frame = None`，如最小化）⇒ 降级为同位置的屏幕锚点；
+/// - 最后一律夹回 `work`：窗口可能一半在屏外（拖出屏幕、跨屏），锚点跟着出去气泡就看不见了。
+fn place_anchor(
+    anchor: StatusTipAnchor,
+    work: (i32, i32, i32, i32),
+    frame: Option<(i32, i32, i32, i32)>,
+    size: (u32, u32),
+    margin: i32,
+) -> (i32, i32) {
+    let (anchor, target) = match (anchor.is_window(), frame) {
+        (true, Some(f)) => (anchor, f),
+        (true, None) => (anchor.screen_equivalent(), work),
+        (false, _) => (anchor, work),
+    };
+    let (x, y) = anchor_origin(target, size, margin, anchor);
+    crate::sys::clamp_rect_in_bounds(x, y, size.0, size.1, work)
 }
 
 /// `custom_x/custom_y` 的「从未设定」哨兵。配置默认即 0，而 (0,0) 恰是**主显示器**左上角
@@ -872,5 +1044,109 @@ mod place_tests {
         let short = (0, 0, 1920, 30);
         let (_, y) = place_below_or_above(100, 20, TIP, 10, 10, GAP, short);
         assert_eq!(y, short.1, "上翻也放不下 → 贴下沿后再被上边界兜回 top");
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    //! 锚点几何（C2-33 / GH#148）：参照矩形 → 气泡左上角，含边距与夹回。
+    use super::{anchor_origin, place_anchor};
+    use wind_ui_types::StatusTipAnchor as A;
+
+    /// 主屏工作区（任务栏在底部，40px）。
+    const WORK: (i32, i32, i32, i32) = (0, 0, 2560, 1400);
+    /// 左侧副屏：整块负坐标。
+    const LEFT_WORK: (i32, i32, i32, i32) = (-1920, 0, 0, 1040);
+    const TIP: (u32, u32) = (120, 34);
+    const M: i32 = 16;
+
+    #[test]
+    fn screen_anchors_on_work_area() {
+        assert_eq!(anchor_origin(WORK, TIP, M, A::ScreenCenter), (1220, 683));
+        assert_eq!(anchor_origin(WORK, TIP, M, A::ScreenTopLeft), (16, 16));
+        assert_eq!(
+            anchor_origin(WORK, TIP, M, A::ScreenTopRight),
+            (2560 - 16 - 120, 16)
+        );
+        assert_eq!(
+            anchor_origin(WORK, TIP, M, A::ScreenBottomLeft),
+            (16, 1400 - 16 - 34)
+        );
+        assert_eq!(
+            anchor_origin(WORK, TIP, M, A::ScreenBottomRight),
+            (2560 - 16 - 120, 1400 - 16 - 34)
+        );
+    }
+
+    /// 窗口锚点用窗口边框作参照，而不是工作区。
+    #[test]
+    fn window_anchors_use_frame() {
+        let frame = (400, 300, 1400, 900);
+        assert_eq!(
+            place_anchor(A::WindowCenter, WORK, Some(frame), TIP, M),
+            (900 - 60, 600 - 17)
+        );
+        assert_eq!(
+            place_anchor(A::WindowBottomLeft, WORK, Some(frame), TIP, M),
+            (416, 900 - 16 - 34)
+        );
+    }
+
+    /// 屏幕锚点不看窗口边框——即便给了也不用。
+    #[test]
+    fn screen_anchor_ignores_frame() {
+        let frame = (400, 300, 1400, 900);
+        assert_eq!(
+            place_anchor(A::ScreenTopLeft, WORK, Some(frame), TIP, M),
+            (16, 16)
+        );
+    }
+
+    /// 边距参与计算：边距为 0 时贴边。
+    #[test]
+    fn margin_is_applied() {
+        assert_eq!(anchor_origin(WORK, TIP, 0, A::ScreenTopLeft), (0, 0));
+        assert_eq!(
+            anchor_origin(WORK, TIP, 0, A::ScreenBottomRight),
+            (2560 - 120, 1400 - 34)
+        );
+        assert_ne!(
+            anchor_origin(WORK, TIP, 0, A::ScreenBottomRight),
+            anchor_origin(WORK, TIP, M, A::ScreenBottomRight)
+        );
+    }
+
+    /// 拿不到窗口边框 ⇒ 降级为同位置的屏幕锚点。
+    #[test]
+    fn window_anchor_without_frame_degrades_to_screen() {
+        assert_eq!(
+            place_anchor(A::WindowCenter, WORK, None, TIP, M),
+            anchor_origin(WORK, TIP, M, A::ScreenCenter)
+        );
+        assert_eq!(
+            place_anchor(A::WindowBottomLeft, WORK, None, TIP, M),
+            anchor_origin(WORK, TIP, M, A::ScreenBottomLeft)
+        );
+    }
+
+    /// 窗口一半拖出屏幕：锚点落在屏外的部分夹回工作区。
+    #[test]
+    fn window_anchor_outside_work_area_is_clamped() {
+        let frame = (-600, 1200, 400, 1800);
+        let (x, y) = place_anchor(A::WindowBottomLeft, WORK, Some(frame), TIP, M);
+        assert_eq!((x, y), (0, 1400 - 34), "左、下越界都应夹回工作区内");
+    }
+
+    /// 副屏负坐标原样保留，不被拉回主屏（同 place_tests 的同名性质）。
+    #[test]
+    fn negative_work_area_survives() {
+        assert_eq!(
+            place_anchor(A::ScreenTopLeft, LEFT_WORK, None, TIP, M),
+            (-1920 + 16, 16)
+        );
+        assert_eq!(
+            place_anchor(A::ScreenBottomRight, LEFT_WORK, None, TIP, M),
+            (-16 - 120, 1040 - 16 - 34)
+        );
     }
 }

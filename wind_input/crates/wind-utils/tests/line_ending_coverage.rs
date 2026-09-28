@@ -87,10 +87,6 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     // ---- 按行处理的不是「用户的文本文件」----
     (
-        "crates/wind-config/src/value_domain_guard.rs",
-        "扫的是我们自己仓里的 .rs 源码（找 AppCompatRule 的字段定义），不是用户文件",
-    ),
-    (
         "crates/wind-coordinator/src/handle_cmdbar.rs",
         "取的是子进程输出的首/末非空行做 toast 文案，不是文件解析；\
          最坏情况是提示里多个字符，不涉及数据丢失",
@@ -105,6 +101,12 @@ const ALLOWED: &[(&str, &str)] = &[
         "它的 .lines() 是 print_block——把多行文案按行打出来做缩进对齐，不是文件解析；\
          读文件那条是 read_toml，同 config.rs 的理由。\
          （2026-09-17 审查曾把它列为待修，是判错了，核对代码后移到这里。）",
+    ),
+    (
+        "crates/wind-ui/src/candidate_window/render_golden.rs",
+        "整个文件是测试模块（#[cfg(test)] 挂在父模块的 mod 声明上，守卫的 strip_tests 看不到）。\
+         .lines() 只用来在 golden 对不上时定位首个不同行、写进失败信息；判等比的是整串，\
+         检入的 golden 由本仓自己生成，不是用户文件。",
     ),
     // ---- 另案：修法与其余几处不同 ----
     (

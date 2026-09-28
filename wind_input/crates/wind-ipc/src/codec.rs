@@ -1554,11 +1554,38 @@ pub fn encode_key_type(text: &str) -> Vec<u8> {
     frame(CMD_KEY_TYPE, text.as_bytes().to_vec())
 }
 
+/// macOS 原生气泡的一段分段颜色：`text` 里 UTF-16 码元区间 `[start, start + len)`
+/// （直接对应 `NSRange`）改用 `rgba`（`[R, G, B, A]`，已在服务端按主题解析好）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooltipColorRun {
+    pub start: u32,
+    pub len: u32,
+    pub rgba: [u8; 4],
+}
+
 /// CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
-pub fn encode_tooltip_show(text: &str, bg: &str, fg: &str, font_path: &str) -> Vec<u8> {
+/// + runCount:u32 + runCount×(start:u32 + len:u32 + rgba:u32)。
+///
+/// `runs` 是分段着色的后加尾段（区间以 UTF-16 计）。`rgba` 按小端 u32 写出，字节依次为
+/// R、G、B、A（即 `R | G<<8 | B<<16 | A<<24`）。新旧两端都兼容：旧 `.app` 读完四段字符串
+/// 就不再往下读，多出的尾段被忽略、退化为单色；新 `.app` 遇到旧服务（没有尾段）同样单色。
+/// 故空 `runs` 也照写一个 `count = 0`，不省略。
+pub fn encode_tooltip_show(
+    text: &str,
+    bg: &str,
+    fg: &str,
+    font_path: &str,
+    runs: &[TooltipColorRun],
+) -> Vec<u8> {
     let mut p = Vec::new();
     for s in [text, bg, fg, font_path] {
         push_string(&mut p, s);
+    }
+    p.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    for r in runs {
+        p.extend_from_slice(&r.start.to_le_bytes());
+        p.extend_from_slice(&r.len.to_le_bytes());
+        p.extend_from_slice(&r.rgba);
     }
     frame(CMD_TOOLTIP_SHOW, p)
 }
@@ -1569,6 +1596,11 @@ pub fn encode_tooltip_hide() -> Vec<u8> {
 }
 
 /// CmdStatusShow (0x050A): textLen+text + bgLen+bg + fgLen+fg + x:i32 + y:i32 + duration_ms:i32
+/// + anchor:i32（[`crate::protocol::status_anchor`]）。
+///
+/// `anchor` 是尾部追加段：旧 `.app` 读到 duration 就停，忽略它（锚点退化成按 x/y 摆）；
+/// 新 `.app` 读不到它时按 `NONE` 处理。两端互容，同 tooltip 的 `runs` 尾段。
+#[allow(clippy::too_many_arguments)]
 pub fn encode_status_show(
     text: &str,
     bg: &str,
@@ -1576,6 +1608,7 @@ pub fn encode_status_show(
     x: i32,
     y: i32,
     duration_ms: i32,
+    anchor: i32,
 ) -> Vec<u8> {
     let mut p = Vec::new();
     for s in [text, bg, fg] {
@@ -1584,6 +1617,7 @@ pub fn encode_status_show(
     p.extend_from_slice(&x.to_le_bytes());
     p.extend_from_slice(&y.to_le_bytes());
     p.extend_from_slice(&duration_ms.to_le_bytes());
+    p.extend_from_slice(&anchor.to_le_bytes());
     frame(CMD_STATUS_SHOW, p)
 }
 
@@ -1845,24 +1879,57 @@ mod darwin_push_tests {
         assert_eq!(sub[2].flags & 0x04, 0x04); // disabled
     }
 
-    #[test]
-    fn tooltip_show_four_length_prefixed_strings() {
-        let f = encode_tooltip_show("abc", "#fff", "#000", "/p.ttf");
-        assert_eq!(cmd_of(&f), CMD_TOOLTIP_SHOW);
-        let p = &f[8..];
+    /// 读完四段字符串后的偏移（旧 `.app` 只读到这里）。
+    fn after_strings(p: &[u8], expect: [&str; 4]) -> usize {
         let mut off = 0usize;
-        for s in ["abc", "#fff", "#000", "/p.ttf"] {
+        for s in expect {
             let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
             assert_eq!(n, s.len());
             assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
             off += 4 + n;
         }
-        assert_eq!(off, p.len());
+        off
     }
 
     #[test]
-    fn status_show_three_strings_then_three_i32() {
-        let f = encode_status_show("中 ，", "#111", "#eee", 50, 80, 1000);
+    fn tooltip_show_four_strings_then_empty_runs() {
+        let f = encode_tooltip_show("abc", "#fff", "#000", "/p.ttf", &[]);
+        assert_eq!(cmd_of(&f), CMD_TOOLTIP_SHOW);
+        let p = &f[8..];
+        let off = after_strings(p, ["abc", "#fff", "#000", "/p.ttf"]);
+        assert_eq!(&p[off..], &0u32.to_le_bytes(), "空 runs 也写一个 count = 0");
+    }
+
+    /// runs 尾段：UTF-16 区间 + rgba 小端 u32（字节依次 R、G、B、A）。
+    #[test]
+    fn tooltip_show_runs_tail_layout() {
+        let runs = [
+            TooltipColorRun {
+                start: 0,
+                len: 4,
+                rgba: [0x11, 0x22, 0x33, 0x44],
+            },
+            TooltipColorRun {
+                start: 5,
+                len: 2,
+                rgba: [0xFF, 0x00, 0x80, 0xFF],
+            },
+        ];
+        let f = encode_tooltip_show("[拼音]\n你", "", "", "", &runs);
+        let p = &f[8..];
+        let off = after_strings(p, ["[拼音]\n你", "", "", ""]);
+        let u32_at = |i: usize| u32::from_le_bytes(p[off + i..off + i + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 2);
+        assert_eq!((u32_at(4), u32_at(8)), (0, 4));
+        assert_eq!(u32_at(12), 0x4433_2211, "R | G<<8 | B<<16 | A<<24");
+        assert_eq!((u32_at(16), u32_at(20)), (5, 2));
+        assert_eq!(&p[off + 24..off + 28], &[0xFF, 0x00, 0x80, 0xFF]);
+        assert_eq!(off + 28, p.len());
+    }
+
+    #[test]
+    fn status_show_three_strings_then_four_i32() {
+        let f = encode_status_show("中 ，", "#111", "#eee", 50, 80, 1000, 6);
         assert_eq!(cmd_of(&f), CMD_STATUS_SHOW);
         let p = &f[8..];
         let mut off = 0usize;
@@ -1880,6 +1947,12 @@ mod darwin_push_tests {
             i32::from_le_bytes(p[off + 8..off + 12].try_into().unwrap()),
             1000
         );
+        assert_eq!(
+            i32::from_le_bytes(p[off + 12..off + 16].try_into().unwrap()),
+            6,
+            "锚点编码是尾部追加段"
+        );
+        assert_eq!(off + 16, p.len());
     }
 
     #[test]

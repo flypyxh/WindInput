@@ -14,12 +14,14 @@ use crate::handle_mode::MixLens;
 use crate::pipeline::{ModeKind, Rewind};
 // 子模块（src/coordinator/ 目录）：这批切片重度访问本模块**私有**字段/函数，
 // 子模块对父私有项可见，平级模块则须放开可见性——归属判据即「是否需要碰私有态」。
+mod app_schema;
 mod first_show;
 pub(crate) mod fullscreen_watch;
 mod langbar_icon;
 mod message_handler;
 mod push_config;
 mod state_writer;
+mod status_placement;
 
 // 平移到子模块的项以原路径保真（handle_* 均经 `crate::coordinator::` 引用，勿改回直连）。
 pub(crate) use crate::config_bundle::{ConfigBundle, schema_key_union};
@@ -1627,9 +1629,12 @@ pub struct Coordinator {
     /// 直接拿它定位就是用户反馈的「还没输入时定位非常不准」。故置位挂起，由
     /// [`Coordinator::handle_caret_update`] 在权威坐标到来时消费并补显示。
     ///
-    /// **刻意不配兜底 timer**：超时后能做的只有「拿不可信坐标显示」，正是本机制要挡的事。
-    /// 等不到就不显示，失焦/下一次焦点事件清位。
+    /// **不配「拿现有坐标显示」的兜底 timer**：超时后那样做只能用不可信坐标，正是本机制要挡的
+    /// 事。等不到就不显示，失焦/下一次焦点事件清位。唯一的超时是兜底为**锚点**时（锚点不读
+    /// 光标，不在上述反对理由之列），见 `status_placement::park_focus_tip`。
     pending_focus_tip: std::sync::atomic::AtomicBool,
+    /// 焦点气泡挂起的代际：每次挂起 +1。锚点超时到期时比对它，被新的挂起取代则作废。
+    pending_focus_tip_gen: std::sync::atomic::AtomicU64,
     /// 上一次弹过焦点气泡的宿主（`client_token`，DLL 实例级 = 每进程一个）。
     ///
     /// **气泡的语义是「切到了新的输入宿主」，不是「换了 docMgr」**。一个宿主内部可以有多个
@@ -1946,7 +1951,9 @@ pub struct Coordinator {
     pub(crate) tooltip_page: Mutex<Vec<crate::handle_tooltip::TooltipPageEntry>>,
     /// 悬停提示右键菜单弹出时的目标快照；菜单动作执行前拿它核对候选有没有变。
     pub(crate) tooltip_menu_target: Mutex<Option<crate::handle_tooltip::TooltipMenuTarget>>,
-    /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
+    /// 密码框抑制策略开关，`input.password_force_english` 的运行时镜像（构造与热重载时回灌，
+    /// 见 `set_password_suppress_enabled`）。这是**全局**值：未配 per-app 规则的进程跟随它；
+    /// 判定一律经 `password_force_english_for_pid`，不要直接读本字段做抑制决策。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
     pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
@@ -1959,6 +1966,9 @@ pub struct Coordinator {
     pub(crate) input_diag_frozen: std::sync::atomic::AtomicBool,
     /// HUD 窗口置顶（右键菜单）。默认开——诊断浮窗被盖住就失去意义。
     pub(crate) input_diag_topmost: std::sync::atomic::AtomicBool,
+    /// 按应用方案（compat.toml `schema`）的运行时态：全局方案、`@remember` 记忆表等，
+    /// 见 `coordinator/app_schema.rs`。
+    pub(crate) app_schema: app_schema::AppSchemaState,
 }
 
 /// 拆字资产当前生效状态：库的解析后绝对路径 + 已下发的字根字体（路径, DWrite 家族名）。
@@ -2427,6 +2437,9 @@ impl Coordinator {
         // 在 `store` 被 move 进结构体之前取：字段字面量按书写顺序求值，`state_writer`
         // 排在 `store` 之后，那时已经借不到了。
         let persists_state = store.is_some();
+        // 全局方案初值取引擎解析后的活跃方案（含定制版隐藏降级），而不是 `schema.active` 原值。
+        let global_schema_init = engine_mgr.active_schema_id();
+        let app_schemas_init = runtime_state.app_schemas.clone();
         // 软键盘上次停在哪一面：按**面 id** 还原（面表来自配置，两次运行之间可能增删面，
         // 存下标必然指到别处）。id 找不到就当没记录过、开在第一面——那比默默开到一个
         // 陌生的面好。
@@ -2461,6 +2474,9 @@ impl Coordinator {
 
         // 候选窗显隐运行时初值（ui.candidate.hide_window；此前恒为 false，配置不生效）。
         let hide_candidate_window_init = config.ui.candidate.hide_window;
+
+        // 密码框强制英文开关初值（input.password_force_english；此前恒为 true，菜单关掉重启即复原，t197）。
+        let password_suppress_enabled_init = config.input.password_force_english;
 
         // 统计采集器：与 store 共享 Arc，内存聚合 + 后台定时 flush。
         let stat_collector = store
@@ -2657,6 +2673,7 @@ impl Coordinator {
             last_sane_caret_height: std::sync::atomic::AtomicI32::new(FALLBACK_LINE_HEIGHT),
             first_show_extended: std::sync::atomic::AtomicBool::new(false),
             pending_focus_tip: std::sync::atomic::AtomicBool::new(false),
+            pending_focus_tip_gen: std::sync::atomic::AtomicU64::new(0),
             last_focus_tip_token: Mutex::new(0),
             app_compat: Mutex::new(app_compat),
             compat_dirs: (
@@ -2708,11 +2725,14 @@ impl Coordinator {
             tooltip_menu_target: Mutex::new(None),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
-            password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
+            password_suppress_enabled: std::sync::atomic::AtomicBool::new(
+                password_suppress_enabled_init,
+            ),
             input_diag_hud_visible: std::sync::atomic::AtomicBool::new(false),
             input_diag_sections: Mutex::new(Default::default()),
             input_diag_frozen: std::sync::atomic::AtomicBool::new(false),
             input_diag_topmost: std::sync::atomic::AtomicBool::new(true),
+            app_schema: app_schema::AppSchemaState::new(global_schema_init, app_schemas_init),
         });
         // CapsLock 钩子的动作消费线程。钩子回调只做非阻塞投递（它超时会被系统静默移除且
         // 无从察觉），真正的动作在这里执行，可安全加锁。未装钩子时它一直阻塞在 channel 上。
@@ -2934,25 +2954,41 @@ impl Coordinator {
     ///
     /// ⚠ 现查为空时**保留缓存**：macOS 的服务进程 `process_name` 恒返回空串，那边的名字
     /// 由 `.app` 随焦点事件送进缓存。清掉会让 compat 规则在下一次 focus_gained 之前全部失配。
+    ///
+    /// ★ 真的改写了缓存时，给该进程的推送客户端**补推**按 pid 现算的 DLL 配置（密码框吃键
+    /// 门控、英文自动配对）：推送通道的握手可能早于主管道的这次校正，那时推过去的值是按
+    /// **旧名**算的——密码框门控错了就打破 core.suppress ⊆ C++.suppress（密码框丢键）。
+    /// 首次落缓存（`None` 分支）不用补推：缓存为空时握手现查的就是真名。
     #[cfg(any(windows, test))]
     pub(crate) fn revalidate_pid_name(&self, pid: u32, live_name: &str) {
         if pid == 0 || live_name.is_empty() {
             return;
         }
         let live = live_name.to_lowercase();
-        let mut names = self.pid_names.lock().unwrap_or_else(|e| e.into_inner());
-        match names.get(&pid) {
-            Some(cached) if *cached == live => {}
-            Some(cached) => {
-                // 这条 WARN 就是 PID 复用的现场证据。缓存过一个名字、现查却是另一个，
-                // 只可能是那个 pid 换了进程——在此之前它一直是静默错配。
-                tracing::warn!(
-                    "pid_names 校正：pid={pid} 缓存={cached} 实际={live}（PID 已被复用，此前按缓存匹配的 per-app 规则是错的）"
-                );
-                names.insert(pid, live);
+        let rewritten = {
+            let mut names = self.pid_names.lock().unwrap_or_else(|e| e.into_inner());
+            match names.get(&pid) {
+                Some(cached) if *cached == live => false,
+                Some(cached) => {
+                    // 这条 WARN 就是 PID 复用的现场证据。缓存过一个名字、现查却是另一个，
+                    // 只可能是那个 pid 换了进程——在此之前它一直是静默错配。
+                    tracing::warn!(
+                        "pid_names 校正：pid={pid} 缓存={cached} 实际={live}（PID 已被复用，此前按缓存匹配的 per-app 规则是错的）"
+                    );
+                    names.insert(pid, live);
+                    true
+                }
+                None => {
+                    names.insert(pid, live);
+                    false
+                }
             }
-            None => {
-                names.insert(pid, live);
+        };
+        // 放掉 `pid_names` 锁之后再推：推送内容现算时要再取它。
+        if rewritten {
+            for token in self.push_server.tokens_of_pid(pid) {
+                self.push_password_suppress_config(token);
+                self.push_english_pair_config(token);
             }
         }
     }
@@ -3086,7 +3122,8 @@ impl Coordinator {
     }
 
     /// 消费一次输入诊断上报（compartment 禁用态 + InputScope 掩码）：更新 `last_input_diag`
-    /// 快照，并按 `password_suppress_enabled` 开关决定是否强制英文抑制（密码框场景）。
+    /// 快照，并按 `password_force_english_for_pid`（per-app 规则优先，否则全局开关）决定是否
+    /// 强制英文抑制（密码框场景）。
     pub(crate) fn apply_input_diag(&self, pid: u32, disabled: bool, reason_byte: u8, mask: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let reason = crate::input_diag::reason_from(disabled, mask);
@@ -3112,8 +3149,11 @@ impl Coordinator {
         // OnTestKeyDown 开头就全放行了，一个键都不会送到引擎，suppress 取值无从被观测。
         // 危险的只有反方向（core 抑制而 DLL 吃键 → 「吃了再吐」丢键），故不变量是
         // **core.suppress ⊆ C++.suppress**，见 C++ `IsPasswordSuppressActive`。
-        let suppress = crate::input_diag::is_password_scope(mask)
-            && self.password_suppress_enabled.load(Relaxed);
+        //
+        // 开关取值按 pid 走 `password_force_english_for_pid`（per-app 规则优先，否则全局）——
+        // 与推给该 DLL 的值**同一个函数**，这是上面那条不变量在按应用覆盖下成立的前提。
+        let suppress =
+            crate::input_diag::is_password_scope(mask) && self.password_force_english_for_pid(pid);
         self.password_suppress.store(suppress, Relaxed);
         {
             let mut d = self
@@ -4124,6 +4164,10 @@ impl Coordinator {
                     //
                     // ⚠️ 必须后台：`prewarm_indexes` 阻塞秒级，而本函数是设置页 RPC 调过来的。
                     // 与启动线程、测试、移动端 prepare() 共用同一个 `prewarm_indexes`。
+                    // 重建把活跃方案重置成了磁盘上的 `schema.active`（= 全局方案）。焦点若在
+                    // 配了 schema 规则的应用里，要把它对齐回去，否则设置页保存一次就把该应用
+                    // 冲回全局。按应用方案的自动切换不写盘，本身不会走到这里。
+                    self.resync_app_schema_after_reload();
                     if let Some(weak) = self.self_weak.get().cloned() {
                         let _ = std::thread::Builder::new()
                             .name("reload-prewarm".into())
@@ -4195,7 +4239,8 @@ impl Coordinator {
                 // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
                 self.push_english_pair_config(0);
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
-                self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
+                // 密码框抑制策略：内存开关随配置回灌（关掉即解除当前抑制）+ 推给 DLL 吃键门控。
+                self.set_password_suppress_enabled(new_cfg.input.password_force_english);
                 self.push_custom_en_punct_config(0); // 英半列自定义标点：DLL 据此吃键转发
                 self.push_cn_passthrough_punct_config(0); // 中文模式该透传的标点：DLL 据此**不**吃
                 self.push_en_passthrough_punct_config(0); // 同上，英文标点态那份（超集）
@@ -6140,9 +6185,9 @@ impl Coordinator {
         let scope_prefix = rt.config.input.scope_relax.prefix.as_str();
         // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
         // 受 source==Pinyin 守卫)。门控两类:
-        //  - 普通拼音/混输方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource);
-        //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):**无视开关强制显示**
-        //    (对齐 Go AddCodeHintsForced)——这些模式本身就是"用拼音反查码表编码",必须出码。
+        //  - 普通拼音/混输方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource,出厂 off);
+        //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):跟随独立的
+        //    input.temp_pinyin.code_hint_source(出厂 auto,可关),见 comment_hint_source。
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
         let force_hint = Self::forces_code_hint(state);
         let hint_source = self.comment_hint_source(state);
@@ -6168,8 +6213,13 @@ impl Coordinator {
         // 这是「旋转态的 vertical 恒为 false ⇒ 所有按方向分叉的配置走横排支」这条总规则的
         // 一个实例，不是遗漏；要给旋转态单独的模板，用方案级 `[candidate]` 那两个键。
         let comment_vertical = self.desired_orientation(state).vertical;
-        let comment_tpl =
-            self.comment_template_for(&rt.config, state, &schema_behavior, comment_vertical);
+        // 解析一次、循环里逐候选只渲染（模板串对整页相同）。
+        let comment_tpl = crate::comment::Template::parse(self.comment_template_for(
+            &rt.config,
+            state,
+            &schema_behavior,
+            comment_vertical,
+        ));
         // 注释段长度预算横竖各一份：横排全部候选共享一行宽度，竖排每行独占。
         let comment_max = cand_cfg.comment_max_chars(comment_vertical);
         // 注释**库**的 `schemas` 白名单作用域：与词频/短语同源取 `effective_data_schema`
@@ -6286,7 +6336,7 @@ impl Coordinator {
                 // `ui.tooltip.sections`，塞了会与之重复。
                 let comment = self.comment_for(
                     c,
-                    comment_tpl,
+                    &comment_tpl,
                     comment_max,
                     &reverse,
                     hint_source,
@@ -7179,6 +7229,28 @@ impl Coordinator {
 
     /// 状态泡的发送本体（caret 由调用方给出）。**不取 state 锁**。
     fn show_tip_at(&self, text: &str, raw_x: i32, raw_y: i32, raw_h: i32) {
+        self.show_tip_with(text, raw_x, raw_y, raw_h, None);
+    }
+
+    /// 以指定定位弹状态泡（焦点气泡的锚点超时用），光标仍从 state 里取（选屏参考）。
+    pub(crate) fn show_tip_placed(&self, text: &str, placement: wind_ui_types::StatusTipPlacement) {
+        let (raw_x, raw_y, raw_h) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.caret_x, s.caret_y, s.caret_height)
+        };
+        self.show_tip_with(text, raw_x, raw_y, raw_h, Some(placement));
+    }
+
+    /// `forced = None` 时按 [`Self::status_position`] + 原始坐标可信度解析定位（见
+    /// [`Self::placement_for`]），解析为「不显示」就直接返回。**不取 state 锁**。
+    fn show_tip_with(
+        &self,
+        text: &str,
+        raw_x: i32,
+        raw_y: i32,
+        raw_h: i32,
+        forced: Option<wind_ui_types::StatusTipPlacement>,
+    ) {
         let bundle = self.rt();
         let si = &bundle.config.ui.status;
         if !si.enabled {
@@ -7191,6 +7263,10 @@ impl Coordinator {
         if text.trim().is_empty() {
             return;
         }
+        // 原始坐标的可信度必须在 resolve 之前取：resolve 会回退到最近一次有效坐标、并把
+        // valid 报成 true，拿它判就分不出「这次坐标本身不可信」（兜底的触发条件）。
+        let raw_valid = Self::caret_is_valid(raw_x, raw_y, raw_h);
+        // resolve 照调：它顺带刷新 last_valid_caret，兜底 `last` 依赖这份记录。
         let (x, y, caret_height, _valid) = self.resolve_caret_for_ui(raw_x, raw_y, raw_h);
         // 常驻(always)→ duration_ms=0(UI 不自动隐藏);否则按 duration 自动隐藏。对齐 Go display_mode。
         let duration_ms = if si.display_mode.eq_ignore_ascii_case("always") {
@@ -7198,19 +7274,23 @@ impl Coordinator {
         } else {
             si.duration.max(1) as u64
         };
-        // 位置模式 fixed:用固定屏幕坐标 custom_x/custom_y;否则跟随光标(caret + offset)。
-        let fixed = si.position_mode.eq_ignore_ascii_case("fixed");
+        // 定位：固定坐标 / 锚点 / 跟随光标（坐标不可信时按兜底）。规则优先回落全局。
+        let placement = match forced.or_else(|| {
+            Self::placement_for(self.status_position(), raw_valid, si.offset_x, si.offset_y)
+        }) {
+            Some(p) => p,
+            None => {
+                debug!("status_tip → 不显示: 光标坐标不可信且兜底为 hide");
+                return;
+            }
+        };
         let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
             text: text.to_string(),
             x,
             y,
             caret_height,
-            offset_x: si.offset_x,
-            offset_y: si.offset_y,
             duration_ms,
-            fixed,
-            fixed_x: si.custom_x,
-            fixed_y: si.custom_y,
+            placement,
         });
         // 记录实际显示出去的文本，供 show_status 去重。临时提示（模式标记/主题名等）
         // 也记在这里：它们会覆盖掉旧的状态文本，从而使随后的同名状态气泡照常显示，
@@ -7259,7 +7339,7 @@ impl Coordinator {
     /// 而弹在错误位置是实实在在的负价值。DLL 侧排队档会在 1~2ms 内补一条 TSF 坐标，
     /// 由 [`Self::handle_caret_update`] 消费本次挂起并补显示，故绝大多数宿主上并不会真的落空。
     ///
-    /// `fixed` 模式不读 caret（用 custom_x/custom_y），故不受本闸门约束，一律直接显示。
+    /// `fixed` 与锚点模式不读 caret，故不受本闸门约束，一律直接显示。
     /// `client_token` 用于按**宿主**去重，见 [`Self::last_focus_tip_token`]：同一宿主内部换
     /// docMgr（Excel 单元格 ↔ 公式编辑栏）不该重复弹。
     pub(crate) fn show_focus_status_if_enabled(&self, client_token: u64) {
@@ -7285,7 +7365,12 @@ impl Coordinator {
         if si.display_mode.eq_ignore_ascii_case("always") {
             return;
         }
-        if si.position_mode.eq_ignore_ascii_case("fixed") {
+        // fixed / 锚点不读 caret，不受可信度闸门约束，直接显示。清掉可能残留的上一次挂起，
+        // 免得它的锚点超时在这之后把气泡又摆到别处。
+        let pos = self.status_position();
+        if pos.mode != wind_config::app_compat::StatusPositionMode::FollowCaret {
+            self.pending_focus_tip
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             self.show_tip(&self.status_indicator_text());
             return;
         }
@@ -7298,14 +7383,16 @@ impl Coordinator {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.show_tip(&self.status_indicator_text());
         } else {
-            // 挂起，等 DLL 补来的 TSF 坐标。挂起在下次焦点事件/失焦时作废，不设超时兜底——
-            // 超时到期只能拿现有的不可信坐标显示，那正是本闸门要挡的东西。
+            // 挂起，等 DLL 补来的 TSF 坐标。挂起在下次焦点事件/失焦时作废。
+            //
+            // 兜底为 `last` / `hide` 时**不设超时**：超时到期只能拿现有的不可信坐标显示，那正是
+            // 本闸门要挡的东西。兜底为**锚点**时设约 150ms 超时——锚点不是光标坐标，不在这条
+            // 反对理由之列，到期仍无 TSF 坐标就显示在锚点（C2-33 / GH#148）。
             debug!(
                 "focus_tip → 挂起: 坐标来源 {} 非 TSF 域，等待权威坐标",
                 wind_ipc::protocol::caret_source::name(source)
             );
-            self.pending_focus_tip
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.park_focus_tip(pos.fallback);
         }
     }
 
@@ -9402,7 +9489,7 @@ mod mode_comment_e2e_tests {
         // 排空取**最后**一条：一次刷新会发多条 UI 命令，取第一条会拿到上一轮残留。
         while let Ok(cmd) = rx.try_recv() {
             if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
-                found = candidates.first().map(|c| c.comment.clone());
+                found = candidates.first().map(|c| c.comment.as_str().to_string());
             }
         }
         found
@@ -9436,6 +9523,79 @@ mod mode_comment_e2e_tests {
             Some("临英码".to_string()),
             "临英期间必须改用模式级模板——只测 template_for 抓不到消费端没接线"
         );
+    }
+
+    /// `TEXT_ROLES` 契约清单（设计 text-span-colors.md §3.1）里每个变量名都能被某个求值入口
+    /// 求出值（空串也算）：候选上下文（`eval_var`）、气泡附加（`cand_eval`）、逐字上下文。
+    ///
+    /// 判据落在「写进模板不会原样回显 `${…}`」上——那正是求值入口不认这个名字时的表现。
+    /// 走真实的 `notify_ui_update`，气泡附加那几个变量只在它的闭包里，单测够不着。
+    #[test]
+    fn every_text_role_is_evaluable_somewhere() {
+        const PER_CHAR: &[&str] = &["char", "readings", "unicode"];
+        let vars: Vec<&str> = wind_ui_types::TEXT_ROLES
+            .iter()
+            .copied()
+            .filter(|r| !matches!(*r, "title" | "literal"))
+            .collect();
+        let whole: String = vars
+            .iter()
+            .filter(|v| !PER_CHAR.contains(v))
+            .map(|v| format!("${{{v}}}"))
+            .collect();
+        let per_char: String = PER_CHAR.iter().map(|v| format!("${{{v}}}")).collect();
+        // 注释段只有候选上下文（`eval_var`）；气泡的整段求值再加上气泡附加变量。
+        const BUBBLE_ONLY: &[&str] = &[
+            "word_code",
+            "code_source",
+            "debug",
+            "full_text",
+            "unicode_all",
+        ];
+        let cand_ctx: String = vars
+            .iter()
+            .filter(|v| !PER_CHAR.contains(v) && !BUBBLE_ONLY.contains(v))
+            .map(|v| format!("${{{v}}}"))
+            .collect();
+        let tooltip_of = |comment_tpl: &str, whole_tpl: &str| {
+            let mut cfg = Config::default();
+            cfg.ui.candidate.comment_template_vertical = format!("${{code_hint}}{comment_tpl}");
+            cfg.ui.candidate.comment_template_horizontal = format!("${{code_hint}}{comment_tpl}");
+            let sec = |each: &str, template: &str| wind_config::config::TooltipSection {
+                enabled: true,
+                label: "段".into(),
+                template: template.into(),
+                each: each.into(),
+                promote: String::new(),
+                inline: false,
+            };
+            cfg.ui.tooltip.sections =
+                vec![sec("", &format!("整{whole_tpl}")), sec("char", &per_char)];
+            let (c, rx) = coord_with_ui(cfg);
+            emit(&c, None);
+            let mut got = None;
+            while let Ok(cmd) = rx.try_recv() {
+                if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                    got = candidates
+                        .first()
+                        .map(|c| (c.comment.as_str().to_string(), c.tooltip.to_plain_text()));
+                }
+            }
+            got.expect("应下发候选")
+        };
+        let (comment, tooltip) = tooltip_of(&cand_ctx, &whole);
+        assert!(
+            !comment.contains("${"),
+            "注释里有求值入口不认的变量：{comment}"
+        );
+        assert!(
+            !tooltip.contains("${"),
+            "气泡里有求值入口不认的变量：{tooltip}"
+        );
+        // 防空转：逐字段的 `${unicode}` 恒有值，气泡一定在；拼错的名字一定会回显。
+        assert!(tooltip.contains("U+6D4B"), "气泡应含逐字段：{tooltip}");
+        let (comment, tooltip) = tooltip_of("${no_such_var}", "${no_such_var}");
+        assert!(comment.contains("${no_such_var}") && tooltip.contains("${no_such_var}"));
     }
 
     /// ★ 空串 = 本模式不显示注释（与「跟随全局」是两回事），且这条语义要一路走到 UI。
@@ -15609,13 +15769,38 @@ mod input_diag_tests {
         assert!(!c.input_diag_hud_visible.load(Relaxed));
     }
 
+    /// 开关的初值取自配置（`input.password_force_english`，t197）：配置关掉时，构造出的
+    /// 协调器遇到密码位也不抑制——此前构造处硬编码 `true`，菜单关掉后重启服务又勾回。
+    ///
+    /// 菜单切换写盘 / 热重载保持见 `tests/password_force_english_persist.rs`（要重定向用户
+    /// 目录，只能单开测试二进制；本模块的用例一律不走写盘路径，免得改到真实用户配置）。
     #[test]
-    fn toggle_password_suppress_flips_enabled() {
+    fn config_off_constructs_without_suppress() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cfg = Config::default();
+        assert!(cfg.input.password_force_english, "前置条件：出厂开");
+        cfg.input.password_force_english = false;
+        let c = Coordinator::new_headless(cfg, None);
+        assert!(!c.password_suppress_enabled.load(Relaxed));
+
+        c.apply_input_diag(1, false, 2, 0x8000_0001); // IS_DEFAULT + IS_PASSWORD（t197 的掩码）
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "配置关闭时密码位不应强制英文"
+        );
+    }
+
+    /// 关掉开关须立即解除**已生效**的抑制，不能等下一次焦点上报——用户正对着那个
+    /// 被误判的框点菜单，点完就要能打中文。
+    #[test]
+    fn switching_off_clears_active_suppress() {
         use std::sync::atomic::Ordering::Relaxed;
         let c = test_coordinator();
-        assert!(c.password_suppress_enabled.load(Relaxed)); // 默认开
-        c.toggle_password_suppress();
+        c.apply_input_diag(1, false, 2, 0x8000_0001);
+        assert!(c.password_suppress.load(Relaxed), "前置条件：抑制已生效");
+        c.set_password_suppress_enabled(false);
         assert!(!c.password_suppress_enabled.load(Relaxed));
+        assert!(!c.password_suppress.load(Relaxed), "关掉开关应立即解除抑制");
     }
 
     #[test]
@@ -15707,7 +15892,7 @@ mod input_diag_tests {
     fn disabled_switch_defeats_password_scope() {
         use std::sync::atomic::Ordering::Relaxed;
         let c = test_coordinator();
-        c.toggle_password_suppress();
+        c.set_password_suppress_enabled(false);
         assert!(
             !c.password_suppress_enabled.load(Relaxed),
             "前置条件：开关已关"
@@ -15723,6 +15908,249 @@ mod input_diag_tests {
             !c.password_suppress.load(Relaxed),
             "数字密码位同样受开关约束"
         );
+    }
+
+    // ── 按应用覆盖（compat.toml 的 password_force_english，A2-37 / t197）──
+
+    /// 给 pid 登记进程名并装上该进程的 `password_force_english` 规则。
+    fn pfe_rule(c: &Coordinator, pid: u32, name: &str, v: Option<bool>) {
+        c.pid_names.lock().unwrap().insert(pid, name.to_string());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_password_force_english(&mut rules, name, v);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+    }
+
+    /// 规则 false：该进程的密码框不再强制英文；别的进程照旧跟随全局（开）。
+    #[test]
+    fn per_app_rule_false_exempts_only_that_process() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+
+        c.apply_input_diag(700, false, 2, 0x8000_0001);
+        assert!(!c.password_suppress.load(Relaxed), "规则关掉的进程不应抑制");
+
+        c.pid_names.lock().unwrap().insert(701, "other.exe".into());
+        c.apply_input_diag(701, false, 2, 0x8000_0001);
+        assert!(
+            c.password_suppress.load(Relaxed),
+            "无规则的进程跟随全局（开）"
+        );
+    }
+
+    /// 规则 true 压过全局关。
+    #[test]
+    fn per_app_rule_true_overrides_global_off() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        c.set_password_suppress_enabled(false);
+        pfe_rule(&c, 800, "bank.exe", Some(true));
+
+        c.apply_input_diag(800, false, 2, 1 << 31);
+        assert!(c.password_suppress.load(Relaxed), "规则开应压过全局关");
+
+        c.pid_names.lock().unwrap().insert(801, "other.exe".into());
+        c.apply_input_diag(801, false, 2, 1 << 31);
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "无规则的进程跟随全局（关）"
+        );
+    }
+
+    /// 无规则（含规则存在但本字段未配）一律跟随全局，两个方向都验。
+    #[test]
+    fn per_app_no_rule_follows_global() {
+        let c = test_coordinator();
+        pfe_rule(&c, 900, "plain.exe", None);
+        assert!(c.password_force_english_for_pid(900), "全局开 → 开");
+        assert!(c.password_force_english_for_pid(0), "pid 未知 → 全局");
+        assert!(c.password_force_english_for_pid(12345), "名字未知 → 全局");
+        c.set_password_suppress_enabled(false);
+        assert!(!c.password_force_english_for_pid(900), "全局关 → 关");
+        assert!(!c.password_force_english_for_pid(0));
+    }
+
+    /// ★ 不变量 core.suppress ⊆ C++.suppress：逐客户端推给 DLL 的值与服务端判定出自
+    /// 同一个函数。这里对每个客户端比对「推送值」与「同 pid 下服务端算出的 suppress」。
+    #[test]
+    fn per_client_push_matches_server_judgement() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+        c.pid_names.lock().unwrap().insert(701, "other.exe".into());
+        let tok_a = (700u64 << 32) | 1;
+        let tok_b = (701u64 << 32) | 1;
+        let cap_a = c.push_server.attach_capture_client(tok_a);
+        let cap_b = c.push_server.attach_capture_client(tok_b);
+
+        let msg = |v: bool| {
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+                &wind_ipc::codec::encode_password_suppress_value(v),
+            )
+        };
+        for global in [true, false] {
+            c.set_password_suppress_enabled(global); // 内部广播一轮
+            for (pid, cap) in [(700u32, &cap_a), (701u32, &cap_b)] {
+                let got: Vec<Vec<u8>> = cap.try_iter().collect();
+                let pushed = if got.contains(&msg(true)) {
+                    assert!(!got.contains(&msg(false)), "pid={pid} 同一轮收到两种值");
+                    true
+                } else {
+                    assert!(got.contains(&msg(false)), "pid={pid} 没收到密码框配置");
+                    false
+                };
+                c.apply_input_diag(pid, false, 2, 1 << 31);
+                assert_eq!(
+                    c.password_suppress.load(Relaxed),
+                    pushed,
+                    "global={global} pid={pid}：服务端 suppress 必须等于推给该 DLL 的值"
+                );
+            }
+        }
+        // 规则进程恒不开，与全局无关。
+        assert!(!c.password_force_english_for_pid(700));
+    }
+
+    /// 定向推送（握手）同样按目标 pid 取值，不拿全局值。
+    #[test]
+    fn handshake_push_uses_target_pid_rule() {
+        let c = test_coordinator();
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+        let tok = (700u64 << 32) | 3;
+        let cap = c.push_server.attach_capture_client(tok);
+        c.push_password_suppress_config(tok);
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert_eq!(
+            got,
+            vec![wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+                &wind_ipc::codec::encode_password_suppress_value(false),
+            )]
+        );
+    }
+
+    fn pfe_msg(v: bool) -> Vec<u8> {
+        wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+            &wind_ipc::codec::encode_password_suppress_value(v),
+        )
+    }
+
+    /// 从一个客户端这一轮收到的推送里取出密码框门控的值（没收到 = `None`）。
+    fn pushed_pfe(cap: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<bool> {
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        match (got.contains(&pfe_msg(true)), got.contains(&pfe_msg(false))) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+            (true, true) => panic!("同一轮收到两种值"),
+        }
+    }
+
+    /// PID 复用：推送通道握手早于主管道校正进程名时，握手按**旧名**算了门控。校正真的
+    /// 改写了缓存 ⇒ 必须给该进程的客户端补推按新名算的值；别的进程不受打扰。
+    #[test]
+    fn revalidated_pid_name_repushes_password_gate_to_that_process() {
+        let c = test_coordinator();
+        // 新进程 misreport.exe 配了 false，但 pid 700 在缓存里还是上一任 plain.exe（无规则）。
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+        c.pid_names.lock().unwrap().insert(700, "plain.exe".into());
+        c.pid_names.lock().unwrap().insert(701, "other.exe".into());
+        let tok = (700u64 << 32) | 1;
+        let bystander = (701u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(tok);
+        let cap_other = c.push_server.attach_capture_client(bystander);
+
+        // 握手（按旧名算 ⇒ 跟随全局 = 开）。
+        c.push_password_suppress_config(tok);
+        assert_eq!(pushed_pfe(&cap), Some(true), "前置：握手按旧名算");
+
+        c.revalidate_pid_name(700, "MisReport.exe");
+        assert_eq!(
+            pushed_pfe(&cap),
+            Some(c.password_force_english_for_pid(700)),
+            "校正了进程名就得按新名补推，DLL 与服务端判定必须一致"
+        );
+        assert_eq!(pushed_pfe(&cap), None, "补推一次即可");
+        assert_eq!(pushed_pfe(&cap_other), None, "别的进程的客户端不该收到补推");
+
+        // 名字没变（同进程重连）不补推。
+        c.revalidate_pid_name(700, "misreport.exe");
+        assert_eq!(pushed_pfe(&cap), None, "名字没变不补推");
+    }
+
+    /// ★ 任何一次整表重载（不只是密码框那一项菜单）都要重推门控：用户手写了
+    /// `password_force_english`，随后点了一个**别的**菜单项 / 拖了一下候选窗，服务端判定
+    /// 已按新规则走，推给该客户端的值必须跟上——否则打破 core.suppress ⊆ C++.suppress。
+    #[test]
+    fn any_compat_reload_repushes_password_gate_for_hand_written_rule() {
+        let dir = std::env::temp_dir().join(format!("wind_pfe_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ui_tx, _rx) = std::sync::mpsc::channel();
+        let push_server = Arc::new(PushServer::new(wind_bridge::push::PushConfig {
+            suffix: String::new(),
+            write_timeout_ms: 30_000,
+        }));
+        // 用户目录只给 compat 用；store = None ⇒ state_writer 不写本机状态。
+        let c = Coordinator::build(
+            Config::default(),
+            None,
+            push_server,
+            crate::UiSender::without_wake(ui_tx),
+            Some(dir.clone()),
+            None,
+            None,
+        );
+        c.pid_names.lock().unwrap().insert(700, "bank.exe".into());
+        c.active_compat.lock().unwrap().pid = 700;
+        let tok = (700u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(tok);
+
+        // 每一轮：先「手写」翻转规则（只改文件，内存表不知道），再触发一个非密码类的重载。
+        type Reload<'a> = (&'a str, &'a dyn Fn(&Coordinator));
+        let reloads: [Reload; 7] = [
+            ("set_first_show_mode", &|c| c.set_first_show_mode(1)),
+            ("set_candidate_position_rule", &|c| {
+                c.set_candidate_position_rule(1)
+            }),
+            ("set_ignore_host_ime_close_rule", &|c| {
+                c.set_ignore_host_ime_close_rule(1)
+            }),
+            ("set_auto_pair_rule", &|c| c.set_auto_pair_rule(2)),
+            ("set_status_fallback_rule", &|c| {
+                c.set_status_fallback_rule(2)
+            }),
+            ("set_status_position_rule", &|c| {
+                c.set_status_position_rule(1)
+            }),
+            ("set_initial_state_rule", &|c| {
+                c.set_initial_state_rule(false, 2)
+            }),
+        ];
+        for (i, (what, reload)) in reloads.iter().enumerate() {
+            let hand_written = i % 2 == 0; // 在 false / true 间来回翻，两个方向都验
+            wind_config::app_compat::set_user_password_force_english(
+                &dir,
+                "bank.exe",
+                Some(hand_written),
+            )
+            .unwrap();
+            let _ = pushed_pfe(&cap);
+            reload(&c);
+            assert_eq!(
+                c.password_force_english_for_pid(700),
+                hand_written,
+                "{what}: 前置——重载后服务端按手写规则判定"
+            );
+            assert_eq!(
+                pushed_pfe(&cap),
+                Some(hand_written),
+                "{what}: 推给该客户端的门控必须等于服务端判定"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

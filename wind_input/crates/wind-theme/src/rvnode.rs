@@ -55,12 +55,12 @@ pub struct RvImage {
     pub opacity: f32,
     /// 仅 layers：内容基准 0，<0 在内容下、>0 在上。
     pub z: i32,
-    /// 仅覆盖图：九宫锚点。
+    /// 九宫锚点（覆盖图恒用；背景图配了任一定位字段才用，见 schema::ViewImage::anchor）。
     pub anchor: String,
-    /// 仅覆盖图偏移：dp 或百分比（paint 期相对 host 求值）。
+    /// 定位偏移：dp 或百分比（paint 期相对 host 求值）。
     pub offset_x: Option<Dim>,
     pub offset_y: Option<Dim>,
-    /// 仅覆盖图尺寸（逻辑像素）；0=原尺寸。
+    /// 定位尺寸（逻辑像素）；0=该维取原图尺寸。
     pub w: i32,
     pub h: i32,
     /// 单色染色（None=图原样）；非 None 时把图当 alpha mask 用此色填充。
@@ -123,6 +123,10 @@ pub struct RvNode {
     pub shadow_spread_offset_x: Option<Dim>,
     pub shadow_spread_offset_y: Option<Dim>,
     pub shadow_color: Option<Rgba>,
+    /// 文字角色色（分段着色，`[comment.roles]` / `[tooltip.roles]`）：角色名 → 已解析颜色。
+    /// 空 = 没配，片段一律按正文色。只有 `comment`（含状态 patch）与 `tooltip` 消费，
+    /// 求色见 [`crate::span::span_color`]。
+    pub roles: std::collections::HashMap<String, Rgba>,
     /// 状态 patch（递归）。仅合并色/图/边框/字体/层，不合并几何（state_geometry unsupported）。
     pub selected: Option<Box<RvNode>>,
     pub hover: Option<Box<RvNode>>,

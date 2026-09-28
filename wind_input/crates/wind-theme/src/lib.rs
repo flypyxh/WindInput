@@ -3,11 +3,14 @@
 //! 与 Go 版本 `wind_input/pkg/theme/` 对齐（schema v3）；存储格式为 TOML（扁平人写形态，
 //! 经 `normalize` 归一化为内存形态，见 `normalize.rs`）。
 
+pub mod contract;
+pub mod fallback;
 pub mod normalize;
 pub mod palette;
 pub mod resolve;
 pub mod rvnode;
 pub mod schema;
+pub mod span;
 pub mod theme;
 
 pub use palette::Rgba;
@@ -16,4 +19,7 @@ pub use resolve::{
 };
 pub use rvnode::{DEFAULT_ACCENT_BAR_HEIGHT_RATIO, RvGradient, RvImage, RvNode, RvViews};
 pub use schema::Meta;
-pub use theme::{find_theme_dir, load_merged_dirs, meta_from_text, read_meta, validate_text};
+pub use span::{Atom, ColorRef, InlineColor, TextState, body_color, span_color};
+pub use theme::{
+    find_theme_dir, list_theme_ids, load_merged_dirs, meta_from_text, read_meta, validate_text,
+};

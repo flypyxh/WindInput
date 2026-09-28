@@ -357,9 +357,11 @@ pub trait WebDataRpc: WebDataHost {
             "schema.layouts" => self.web_schema_layouts(),
             "schema.active" => Ok(json!({ "id": self.engine_mgr().active_schema_id() })),
             "schema.setActive" => {
-                let ok = self.engine_mgr().switch_schema(str_param(params, "id")?);
+                let id = str_param(params, "id")?;
+                let ok = self.engine_mgr().switch_schema(id);
                 if ok {
                     self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换
+                    self.note_global_schema_set(id); // 设置页是全局意图：按应用方案的全局方案跟随
                     // 注释库不随方案变化，见 `Coordinator::sync_comment_dicts`。
                 }
                 Ok(json!({ "ok": ok }))
@@ -592,6 +594,9 @@ pub trait WebDataRpc: WebDataHost {
             "stats.daily" => self.web_stats_daily(params),
             "stats.clear" => self.web_stats_clear(),
             "stats.pruneBefore" => self.web_stats_prune(params),
+
+            // ── appearance.*（设置页预览，text-span-colors.md §11）──
+            "appearance.previewTemplate" => self.web_appearance_preview_template(params),
 
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
@@ -4081,6 +4086,215 @@ pub trait WebDataRpc: WebDataHost {
         }
     }
 
+    /// `appearance.previewTemplate`：模板在当前主题下的渲染效果（设置页输入框下方的预览行）。
+    ///
+    /// 入参 `{ template, scene: "comment" | "label" | "content", each?, swatches?: [名字] }`。回包：
+    /// ```text
+    /// { text, fg, bg, runs: [{start, end, rgba}],
+    ///   selected: { fg, bg, runs } | null,      // 仅 comment：高亮候选里的样子
+    ///   problems: [{start, end, message}],
+    ///   swatches: { 名字: rgba } }              // 入参 swatches 里每个名字写成 `$[名字]` 的实际颜色
+    /// ```
+    /// `swatches` 给设置页「插入颜色」的色块着色：求法与模板里的内联色完全相同（气泡场景先查
+    /// `tooltip_<名>`），色块因此就是插进去以后的样子。
+    /// ⚠️ 两类区间坐标系不同：`runs` 是**输出偏移**（`text` 里的 UTF-8 字节区间，给预览上色）；
+    /// `problems` 是**模板偏移**（入参 `template` 里的 UTF-8 字节区间，给输入框标位置）。设置端
+    /// 的输入框显示转义后的模板（`\t` 以两个字符显示），要把 `problems` 换算到显示文本上再标。
+    /// 颜色一律 `[R, G, B, A]`。等于正文色的区间不下发（与渲染层同一口径）。
+    fn web_appearance_preview_template(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_coordinator::template_preview::TemplateScene;
+        use wind_theme::fallback;
+        use wind_theme::{Atom, Rgba, TextState};
+        let template = str_param(params, "template")?;
+        // 入参上限：设置页的模板输入框是单行，真实模板几十字节；上限只为挡住异常入参
+        // （引擎本身已有嵌套上限与线性配对，这里再省掉无意义的大块求值）。
+        anyhow::ensure!(
+            template.len() <= PREVIEW_TEMPLATE_MAX,
+            "模板过长（{} 字节，上限 {PREVIEW_TEMPLATE_MAX}）",
+            template.len()
+        );
+        let swatch_names: Vec<&str> = params
+            .get("swatches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        anyhow::ensure!(
+            swatch_names.len() <= PREVIEW_SWATCHES_MAX,
+            "swatches 过多（{} 个，上限 {PREVIEW_SWATCHES_MAX}）",
+            swatch_names.len()
+        );
+        let scene = match str_param(params, "scene")? {
+            "comment" => TemplateScene::Comment,
+            "label" => TemplateScene::TooltipLabel,
+            "content" => TemplateScene::TooltipContent {
+                each: params
+                    .get("each")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            other => anyhow::bail!("未知 scene：{other}"),
+        };
+        let is_tooltip = scene != TemplateScene::Comment;
+        let sample = self.template_sample(template, &scene);
+        // 主题现取：与候选窗同一条搜索链、同一个当前主题与明暗。每次预览都从磁盘解析一次
+        // （设计 §11 已知局限：低频的设置页操作，不值得为它挂一份缓存）。取不到（主题文件坏了）
+        // 时退化为兜底色的预览，并给一条总的提示——不逐个把颜色名误报成「当前主题没有」。
+        let loaded = wind_theme::load_resolved_dirs(
+            &self.theme_search_dirs(),
+            &self.current_theme_name(),
+            self.current_theme_is_dark(),
+        );
+        let theme_ok = loaded.is_ok();
+        let theme = loaded.unwrap_or_default();
+        let default_node = wind_theme::RvNode::default();
+        // 兜底色与渲染层（wind-ui 候选窗 / 气泡）取同一组常量。
+        let (node, fallback): (&wind_theme::RvNode, Rgba) = if is_tooltip {
+            (
+                theme.views.tooltip.as_ref().unwrap_or(&default_node),
+                theme.color("tooltip_text", fallback::TOOLTIP_TEXT),
+            )
+        } else {
+            (&theme.views.comment, fallback::COMMENT_TEXT)
+        };
+        let runs_of = |state: TextState| -> (Value, Rgba) {
+            let body = wind_theme::body_color(node, state, fallback);
+            let runs: Vec<Value> = sample
+                .text
+                .spans()
+                .iter()
+                .filter_map(|sp| {
+                    let c = wind_theme::span_color(
+                        &theme,
+                        node,
+                        is_tooltip,
+                        state,
+                        fallback,
+                        sp.role,
+                        sp.in_title,
+                        sp.color.as_deref(),
+                    );
+                    (c != body).then(|| json!({"start": sp.start, "end": sp.end, "rgba": c}))
+                })
+                .collect();
+            (Value::Array(runs), body)
+        };
+        let (runs, fg) = runs_of(TextState::Normal);
+        let bg = if is_tooltip {
+            // 同 wind-ui 气泡：调色板兜底，节点底色覆盖。
+            node.bg_color
+                .unwrap_or(theme.color("tooltip_bg", fallback::TOOLTIP_BG))
+        } else {
+            theme.views.window.bg_color.unwrap_or(fallback::WINDOW_BG)
+        };
+        let selected = (!is_tooltip).then(|| {
+            let (runs, fg) = runs_of(TextState::Selected);
+            let bg = theme
+                .views
+                .item
+                .selected
+                .as_ref()
+                .and_then(|n| n.bg_color)
+                .unwrap_or(fallback::SELECTED_BG);
+            json!({"fg": fg, "bg": bg, "runs": runs})
+        });
+
+        // 问题：变量（主题无关，含场景外变量）+ 内联色（写法 / 当前主题查不查得到 / 全透明 /
+        // 被忽略的 SPEC 片段）。
+        let mut problems: Vec<Value> = sample
+            .problems
+            .iter()
+            .map(|p| json!({"start": p.start, "end": p.end, "message": p.message}))
+            .collect();
+        if !theme_ok && !sample.colors.is_empty() {
+            problems.push(json!({
+                "start": 0, "end": 0,
+                "message": "当前主题加载失败，预览按兜底色显示，颜色名无法核对",
+            }));
+        }
+        // 名字在当前场景下查到的颜色：气泡先查 `tooltip_<名>`（与 span_color 同一顺序）。
+        let lookup = |n: &str| -> Option<Rgba> {
+            is_tooltip
+                .then(|| theme.palette.get(&format!("tooltip_{n}")))
+                .flatten()
+                .or_else(|| theme.palette.get(n))
+                .copied()
+        };
+        let transparent = "全透明的颜色看不见，按正文色显示".to_string();
+        for c in &sample.colors {
+            let mut msgs: Vec<String> = Vec::new();
+            let mut refs = vec![&c.color.normal];
+            match &c.color.selected {
+                // `selected=` 只在候选注释里有意义：气泡没有选中态，引擎忽略它，不必查名字。
+                Some(_) if is_tooltip => msgs.push("「selected=」在气泡里不生效，已忽略".into()),
+                Some(sel) => refs.push(sel),
+                None => {}
+            }
+            for r in refs {
+                for atom in [&r.light, &r.dark] {
+                    let m = match atom {
+                        Atom::Invalid => Some(
+                            "颜色写法不对：写 #RGB / #RRGGBB / #RRGGBBAA 或调色板颜色名"
+                                .to_string(),
+                        ),
+                        Atom::Rgba(rgba) if rgba[3] == 0 => Some(transparent.clone()),
+                        Atom::Rgba(_) => None,
+                        Atom::Name(n) if &**n == "transparent" => Some(transparent.clone()),
+                        // 主题没加载成功：上面已给总提示，不逐个误报。
+                        Atom::Name(_) if !theme_ok => None,
+                        Atom::Name(n) => match lookup(n) {
+                            None => Some(format!("当前主题没有颜色「{n}」，按正文色显示")),
+                            Some(rgba) if rgba[3] == 0 => {
+                                Some(format!("「{n}」在当前主题里是全透明，按正文色显示"))
+                            }
+                            Some(_) => None,
+                        },
+                    };
+                    if let Some(m) = m
+                        && !msgs.contains(&m)
+                    {
+                        msgs.push(m);
+                    }
+                }
+            }
+            msgs.extend(c.notes.iter().cloned());
+            for m in msgs {
+                problems.push(json!({"start": c.start, "end": c.end, "message": m}));
+            }
+        }
+        problems.sort_by_key(|p| p["start"].as_u64());
+
+        let swatches: serde_json::Map<String, Value> = swatch_names
+            .into_iter()
+            .map(|name| {
+                let c = wind_theme::InlineColor::parse(name);
+                let rgba = wind_theme::span_color(
+                    &theme,
+                    node,
+                    is_tooltip,
+                    TextState::Normal,
+                    fallback,
+                    None,
+                    false,
+                    Some(&c),
+                );
+                (name.to_string(), json!(rgba))
+            })
+            .collect();
+
+        Ok(json!({
+            "text": sample.text.as_str(),
+            "fg": fg,
+            "bg": bg,
+            "runs": runs,
+            "selected": selected,
+            "problems": problems,
+            "swatches": swatches,
+        }))
+    }
+
     fn web_theme_list(&self) -> anyhow::Result<Value> {
         // 复用右键菜单的 list_themes_full 顺序，保证与菜单一致 (#5/主题)。
         let dirs = self.theme_search_dirs();
@@ -4176,6 +4390,11 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
 }
 
 /// 稀疏 diff：返回 `cfg` 相对 `base` 的变化项（仅含改动的叶子/键）；无变化返回 None。
+/// `appearance.previewTemplate` 的模板长度上限（字节）。设置页输入框是单行，真实模板几十字节。
+pub const PREVIEW_TEMPLATE_MAX: usize = 4096;
+/// `appearance.previewTemplate` 一次最多求几个色块（设置页用 8 个）。
+pub const PREVIEW_SWATCHES_MAX: usize = 32;
+
 /// 对象逐键递归；数组/标量按整体比较（不同则取 cfg）。用于 schema override 最小化。
 /// `getConfig` 附带的只读旁路字段——回传 `saveConfig` 时必须剥掉。
 ///

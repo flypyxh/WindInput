@@ -86,6 +86,17 @@ pub struct RuntimeState {
     /// 界面便利，与 [`Self::toolbar_anchors`] 同类：没有人会想要「每次都跳回第一面」。
     #[serde(default)]
     pub last_softkeyboard_page: String,
+    /// 按应用方案的记忆表：进程名（小写；macOS 为 bundle id）→ 方案 id。
+    ///
+    /// 只服务 compat.toml 里 `schema = "@remember"` 的应用（C0-7 / C3-3，GH#80）：
+    /// 在这类应用里手切方案时记下，焦点再切入时恢复。协调器持内存镜像，经 `StateWriter`
+    /// 整表写回（闭包自带完整目标值）。
+    ///
+    /// 读取时记录的 id 已不在 `schema.available` ⇒ 当没记过（**不主动清理**：方案可能被
+    /// 重新启用）。与 `last_*` 三态不同，**不受** `remember_last_state` 门控——用户配
+    /// `@remember` 本身就是在要求记住。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub app_schemas: HashMap<String, String>,
 }
 
 impl Default for RuntimeState {
@@ -98,6 +109,7 @@ impl Default for RuntimeState {
             toolbar_anchors: HashMap::new(),
             softkeyboard_anchors: HashMap::new(),
             last_softkeyboard_page: String::new(),
+            app_schemas: HashMap::new(),
         }
     }
 }
@@ -126,6 +138,27 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 按应用方案记忆表：旧 state.toml 缺字段 = 空表；写出再读回不丢；空表不写进文件。
+    #[test]
+    fn app_schemas_roundtrip_and_default_empty() {
+        let old: RuntimeState = toml::from_str("last_chinese_mode = false\n").unwrap();
+        assert!(old.app_schemas.is_empty());
+        let empty = toml::to_string_pretty(&RuntimeState::default()).unwrap();
+        assert!(!empty.contains("app_schemas"), "空表不应写进文件:\n{empty}");
+
+        let mut rs = RuntimeState::default();
+        rs.app_schemas.insert("weixin.exe".into(), "wubi86".into());
+        rs.app_schemas
+            .insert("com.tencent.xinwechat".into(), "english".into());
+        let dir =
+            std::env::temp_dir().join(format!("wind_state_app_schemas_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        rs.save(&dir).unwrap();
+        let back = RuntimeState::load(&dir);
+        assert_eq!(back.app_schemas, rs.app_schemas);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 旧 state.toml（无 last_* 三字段）反序列化应落到语义默认：中文/半角/中文标点。
     #[test]

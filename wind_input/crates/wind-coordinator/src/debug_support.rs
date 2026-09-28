@@ -248,4 +248,21 @@ impl Coordinator {
     pub fn debug_softkeyboard(&self) -> &wind_softkeyboard::SoftKeyboardTable {
         &self.softkeyboard
     }
+
+    /// 走一次菜单命令分派（测试用），与右键菜单点选是同一个入口。
+    ///
+    /// 存在理由：会写盘的菜单项（如「密码框强制英文」）要在重定向了用户目录的独立测试
+    /// 二进制里测，而那里够不着 crate 内部的 `run_menu_cmd`。
+    pub fn debug_run_menu_cmd(&self, cmd: wind_ui_types::MenuCmd) {
+        self.run_menu_cmd(cmd);
+    }
+
+    /// 密码框强制英文的运行时两态：`(策略开关, 当前是否正在抑制)`（测试/诊断用）。
+    pub fn debug_password_suppress(&self) -> (bool, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.password_suppress_enabled.load(Relaxed),
+            self.password_suppress.load(Relaxed),
+        )
+    }
 }
