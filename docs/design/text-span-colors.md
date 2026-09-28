@@ -1014,7 +1014,8 @@ P1～P3 与设置仓 P4 同版发布（同 `candidate-tooltip-sections.md` 的�
   不补角色表——补角色表等于替第三方主题改外观，与兜底「不动布局与其它颜色」的原则相悖。
 
 落地见 §18。那一版模板着色里与方向无关的收获留下了：气泡旧开关全是旧出厂值时迁移不再写段列表
-（`40441e93`），全局注释模板的 L1↔L2 同源守门（`6db6e945`）。
+（守门 `default_legacy_switches_leave_no_sections_custom_ones_kept`），全局注释模板的 L1↔L2 同源守门
+（`comment_template_l1_matches_l2`）。
 
 ## 16 已确认（2026-09-27）
 
@@ -1049,29 +1050,37 @@ P1～P3 与设置仓 P4 同版发布（同 `candidate-tooltip-sections.md` 的�
 ```toml
 # data/themes/_base/theme.toml
 [comment.roles]
-code_hint = "${info}"
-code_rev  = "${info}"
-shuangpin = "${info}"
+code_hint    = "${info}"
+code_rev     = "${info}"
+code_rev_all = "${info}"
+shuangpin    = "${info}"
 
 [tooltip.roles]
 full_text   = "${tooltip_accent_text}"
 readings    = "${tooltip_accent_text}"
 word_code   = "${tooltip_success}"
 code_source = "${tooltip_info}"
-chaizi      = "${tooltip_warning}"
-chaizi_code = "${tooltip_info}"
-unicode     = "${tooltip_error}"
+chaizi          = "${tooltip_warning}"
+chaizi_all      = "${tooltip_warning}"
+chaizi_code     = "${tooltip_info}"
+chaizi_code_all = "${tooltip_info}"
+unicode         = "${tooltip_error}"
+unicode_all     = "${tooltip_error}"
 ```
 
-- **都是 `TEXT_ROLES` 里的角色**，且在对应求值入口产出：注释的三个来自 `Coordinator::eval_var`
-  （`${code_hint|code_rev|shuangpin}` 的角色是实际取到值的那个变量，旧名 `${code}` 归一为 `code_rev`）；
-  `full_text` / `word_code` / `code_source` 是气泡候选上下文，`readings` / `unicode` 是逐字上下文，
-  `chaizi` / `chaizi_code` 两种上下文都有。
+- **都是 `TEXT_ROLES` 里的角色**，且在对应求值入口产出：注释的来自 `Coordinator::eval_var`
+  （`${code_hint|code_rev|shuangpin}` 的角色是实际取到值的那个变量，旧名 `${code}` / `${code_all}` 归一为
+  `code_rev` / `code_rev_all`）；`full_text` / `word_code` / `code_source` / `unicode_all` 是气泡候选上下文，
+  `readings` / `unicode` 是逐字上下文，`chaizi*` 两种上下文都有。
+- **单值与 `_all` 版同色**：`code_rev` 与 `code_rev_all`、`unicode` 与 `unicode_all`、`chaizi(_code)` 与
+  `chaizi(_code)_all` 是同一类信息的两种写法，只配一个会让老模板里 `${code}` 变色而 `${code_all}` 不变。
+- **`code_hint` 不只是编码**：它取自引擎的 `Candidate::comment`，混输时带来源标记（「拼」「拼|kao」），
+  整段同染 `info`——标记本身也是「说明」性质，按此接受。
 - **气泡角色必须显式写 `tooltip_*`**：主题 roles 里的 `${token}` 在 resolve 期按字面解析，`tooltip_` 作用域
   查找只作用于模板内联色的名字（§6.2）。写成 `${info}` 会拿到为白底调的 `#1A73E8`，压在深色气泡上看不清。
 - **段名里的变量**：§6.2 顺序里 ③（常态角色色）先于 ④（段名回落 `title`），所以「编码(五笔)」里的 `五笔`
   取 `code_source` 的 `tooltip_info`；`编码`、括号等字面文字是 `title` 角色，出厂未配，保持气泡文字色。
-- **不配色的**：`${char}`、字面文字（`literal` / `title`）、`debug`、`dict`、`pinyin` / `chaizi_all` 等未列出的角色——
+- **不配色的**：`${char}`、字面文字（`literal` / `title`）、`debug`、`dict`、`pinyin`、`emoji`——
   前缀与标签保持正文色，颜色只用来区分信息种类；调试与词库注释是长文本，整段染色反而难读。
 - **状态**：不写 `[comment.selected.roles]` / `[comment.hover.roles]`。出厂主题都没改选中 / 悬停态的注释正文色，
   规则 3 不触发，角色色在三态下照常显示（下表逐格核过可读）；将来某主题改了选中态注释色，角色色自动回落该色。
@@ -1111,7 +1120,8 @@ wind-ui golden（重录差异只有颜色区间，布局与像素摘要不变）
   彩色 / 背景图却没覆盖 `info` 的亮色主题，注释可能看不清——主题作者覆盖 `info` 或撤销这几个角色即可。
   没继承 `_base` 的主题不显色（§15 执行记录）。
 - **用户**：模板里写 `$[…]{}` 的照旧优先于角色色；想要以往的灰色注释，把注释模板改成
-  `$[text_hint]{${code_hint|code_rev|shuangpin}}`，或换一个撤销了这些角色的主题。
+  `$[text_hint]{${code_hint|code_rev|shuangpin}}`（出厂主题的注释色就是 `text_hint`；注释色另配过的第三方主题
+  这样写会被压成 `text_hint`，该在主题 roles 里写 `""` 撤销），或换一个撤销了这些角色的主题。
 - **主题编辑器**（WindInputThemeEditor）重新烘焙 `_base`，预览的注释与气泡按角色求色，已与实机一致。
 - **Android** 拉取调色板（`theme_palette`）不含角色表，移动端注释的着色另行跟进。
 - 发版说明写一句：「候选注释与悬停提示默认按主题上色」。
