@@ -7821,7 +7821,9 @@ impl Config {
     ///
     /// 已知近似（同 [`Self::migrate_font_size_follow_theme_value`]）：本层缺的旧键按旧出厂值补，
     /// 不去看下层（L2.5 定制层）写过什么。只在「定制版改过气泡开关 + 用户层也改过其中一部分」
-    /// 时有差别，结果是那几个开关回到出厂值。
+    /// 时有差别，结果是那几个开关回到出厂值。同理，「全等于旧出厂值即只清不迁」也不看下层：
+    /// 定制版开了拆字、用户在本层显式关掉（`chaizi_enabled = false`）时，本层不写段列表，生效的是
+    /// 定制层那份（拆字又开了）。仓内没有写这些旧键的定制层，按近似接受。
     fn migrate_tooltip_sections_value(layer: &mut toml::Value) {
         const LEGACY_KEYS: [&str; 6] = [
             "code_enabled",
