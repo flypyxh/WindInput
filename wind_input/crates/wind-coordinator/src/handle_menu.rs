@@ -256,6 +256,8 @@ impl Coordinator {
             MenuCmd::IgnoreHostImeCloseRule(m) => self.set_ignore_host_ime_close_rule(m),
             MenuCmd::PasswordForceEnglishRule(m) => self.set_password_force_english_rule(m),
             MenuCmd::AppSchemaRule(m) => self.set_app_schema_rule(m),
+            MenuCmd::StatusPositionRule(m) => self.set_status_position_rule(m),
+            MenuCmd::StatusFallbackRule(m) => self.set_status_fallback_rule(m),
             MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
             MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
@@ -405,7 +407,16 @@ impl Coordinator {
     }
 
     /// 状态提示气泡右键菜单「恢复默认位置」：改回跟随光标，custom_x/y 归零。
+    ///
+    /// 当前焦点应用配了气泡定位规则时改**规则**（写成跟随光标、坐标清零），不碰全局——
+    /// 读取侧规则压过全局，只改全局用户看不到任何变化（C2-33 / GH#148）。
     pub(crate) fn status_reset_position(&self) {
+        let name = self.active_process_name();
+        if self.rule_status_position(&name).is_some() {
+            use wind_config::app_compat::StatusPositionMode as SP;
+            self.write_status_position_rule(&name, Some(SP::FollowCaret), 0, 0);
+            return;
+        }
         let _ = Config::set_user_string(&["ui", "status", "position_mode"], "follow_caret");
         let _ = Config::set_user_value(&["ui", "status", "custom_x"], toml::Value::Integer(0));
         let _ = Config::set_user_value(&["ui", "status", "custom_y"], toml::Value::Integer(0));
@@ -424,15 +435,21 @@ impl Coordinator {
     ///   松手后的 `show()` 会照常按光标重新定位，无需在此做任何清理。
     ///
     /// 这样两种模式各自语义自洽：跟随模式拖动是临时的，固定模式拖动才是"重新摆放"。
+    /// 锚点模式同跟随模式：拖动是临时的，不落盘。
+    ///
+    /// per-app 规则配了气泡定位方式时**落到该应用自己的那份坐标**（方式 + 坐标一起写），
+    /// 不碰全局——判据与读取侧 `status_position` 同源，照 `save_candidate_pos`。
     pub(crate) fn save_status_tip_pos(&self, x: i32, y: i32) {
-        if !self
-            .rt()
-            .config
-            .ui
-            .status
-            .position_mode
-            .eq_ignore_ascii_case("fixed")
-        {
+        use wind_config::app_compat::StatusPositionMode as SP;
+        let name = self.active_process_name();
+        if let Some((mode, _, _)) = self.rule_status_position(&name) {
+            if mode == SP::Fixed {
+                let (x, y) = avoid_unset_sentinel(x, y);
+                self.write_status_position_rule(&name, Some(SP::Fixed), x, y);
+            }
+            return;
+        }
+        if self.rt().config.ui.status.position() != SP::Fixed {
             return;
         }
         // 与候选窗同款哨兵规避：状态气泡的 UI 侧同样用 (0,0) 表示"尚未设定"。
@@ -604,14 +621,23 @@ impl Coordinator {
     /// 否则用户拖到某处后点「固定位置」，气泡会跳到上次保存的（往往是 0,0）坐标。
     /// 做法：先把模式改成 fixed，再请 UI 上报当前位置，回来的 `StatusTipMoved`
     /// 经 `save_status_tip_pos` 落盘（该函数只在 fixed 模式下持久化，此时条件已满足）。
+    ///
+    /// 当前焦点应用配了气泡定位规则时翻转**规则**（固定 ↔ 跟随光标），随后的落盘也走规则。
     pub(crate) fn status_toggle_pinned(&self) {
-        let now_fixed = !self
-            .rt()
-            .config
-            .ui
-            .status
-            .position_mode
-            .eq_ignore_ascii_case("fixed");
+        use wind_config::app_compat::StatusPositionMode as SP;
+        let name = self.active_process_name();
+        if let Some((mode, x, y)) = self.rule_status_position(&name) {
+            let now_fixed = mode != SP::Fixed;
+            if now_fixed {
+                // 先落方式（坐标沿用旧值，多半是 0 哨兵），再请 UI 报当前位置覆盖之。
+                self.write_status_position_rule(&name, Some(SP::Fixed), x, y);
+                let _ = self.ui_tx.send(UiCommand::ReportStatusTipPos);
+            } else {
+                self.write_status_position_rule(&name, Some(SP::FollowCaret), 0, 0);
+            }
+            return;
+        }
+        let now_fixed = self.rt().config.ui.status.position() != SP::Fixed;
         let mode = if now_fixed { "fixed" } else { "follow_caret" };
         let _ = Config::set_user_string(&["ui", "status", "position_mode"], mode);
         self.refresh_config_in_memory(|c| c.ui.status.position_mode = mode.to_string());
@@ -630,7 +656,9 @@ impl Coordinator {
         {
             let si = &self.rt().config.ui.status;
             si_always = si.display_mode.eq_ignore_ascii_case("always");
-            si_fixed = si.position_mode.eq_ignore_ascii_case("fixed");
+            // 勾选态看**生效的**定位（规则优先回落全局），与落盘分流同一判据。
+            si_fixed =
+                self.status_position().mode == wind_config::app_compat::StatusPositionMode::Fixed;
             si_on_focus = si.show_on_focus;
         }
         // 菜单打开期间抑制气泡自动隐藏，否则临时模式下菜单还开着气泡就没了。
@@ -1021,6 +1049,124 @@ impl Coordinator {
         );
         self.notify_toolbar();
         self.show_status();
+    }
+
+    /// 写当前应用的气泡定位规则（方式 + 坐标）并重载规则表。**不弹 toast / 不弹气泡**：拖动
+    /// 落盘走这里，是高频手势（同 `save_candidate_pos_for_app`）。
+    fn write_status_position_rule(
+        &self,
+        name: &str,
+        mode: Option<wind_config::app_compat::StatusPositionMode>,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("status_position: 无用户配置目录，无法持久化 process={name}");
+            return false;
+        };
+        if let Err(e) =
+            wind_config::app_compat::set_user_status_position(&user_dir, name, mode, x, y)
+        {
+            tracing::error!("status_position: 写用户 compat.toml 失败: {e}");
+            return false;
+        }
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        tracing::debug!(
+            "状态气泡定位 for process={name}: {} ({x},{y})",
+            mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
+        );
+        true
+    }
+
+    /// 为当前焦点应用设置状态气泡定位，并写入用户层 compat.toml（C2-33 / GH#148）。
+    /// `code`：0=跟随全局（清除规则）1=跟随光标 2=固定 3+i=`StatusAnchor::ALL[i]`；越界忽略。
+    ///
+    /// 模板同 [`Self::set_candidate_position_rule`]：写盘 → 重载整表。本项不进 `active_compat`
+    /// （`status_position` 按进程名现查），下次显示即用新策略。
+    ///
+    /// 「固定」取气泡**当前位置**：先把方式落成 fixed（坐标沿用规则里已有的，没有就是 0 哨兵
+    /// ——UI 落到光标所在屏），再请 UI 报当前位置，回来的 `StatusTipMoved` 经
+    /// `save_status_tip_pos` 覆盖成实际落点。气泡此刻不可见（多半如此，菜单是从工具栏/语言栏
+    /// 开的）时 UI 不回报，留在哨兵，拖一次即定——与候选窗按应用固定同一口径。
+    pub(crate) fn set_status_position_rule(&self, code: u8) {
+        use wind_config::app_compat::{StatusAnchor, StatusPositionMode as SP};
+        let mode = match code {
+            0 => None,
+            1 => Some(SP::FollowCaret),
+            2 => Some(SP::Fixed),
+            n => match StatusAnchor::ALL.get(n as usize - 3) {
+                Some(a) => Some(SP::Anchor(*a)),
+                None => {
+                    tracing::warn!("set_status_position_rule: 未知编号 {n}，忽略");
+                    return;
+                }
+            },
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_status_position_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let (x, y) = match self.rule_status_position(&name) {
+            Some((SP::Fixed, x, y)) => (x, y),
+            _ => (0, 0),
+        };
+        if !self.write_status_position_rule(&name, mode, x, y) {
+            return;
+        }
+        tracing::info!(
+            "状态气泡定位 for process={name}: {}",
+            mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
+        );
+        if mode == Some(SP::Fixed) {
+            let _ = self.ui_tx.send(UiCommand::ReportStatusTipPos);
+        }
+    }
+
+    /// 为当前焦点应用设置「坐标不可用时」气泡放哪，并写入用户层 compat.toml（C2-33 / GH#148）。
+    /// `code`：0=跟随全局（清除规则）1=上次位置 2=不显示 3+i=`StatusAnchor::ALL[i]`；越界忽略。
+    pub(crate) fn set_status_fallback_rule(&self, code: u8) {
+        use wind_config::app_compat::{StatusAnchor, StatusFallback as SF};
+        let fallback = match code {
+            0 => None,
+            1 => Some(SF::Last),
+            2 => Some(SF::Hide),
+            n => match StatusAnchor::ALL.get(n as usize - 3) {
+                Some(a) => Some(SF::Anchor(*a)),
+                None => {
+                    tracing::warn!("set_status_fallback_rule: 未知编号 {n}，忽略");
+                    return;
+                }
+            },
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_status_fallback_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_status_fallback_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        if let Err(e) =
+            wind_config::app_compat::set_user_status_fallback(&user_dir, &name, fallback)
+        {
+            tracing::error!("set_status_fallback_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        tracing::info!(
+            "状态气泡兜底位置 for process={name}: {}",
+            fallback.map(|f| f.as_config()).unwrap_or("(follow-global)")
+        );
     }
 
     /// 为当前焦点应用设置输入方案，并写入用户层 compat.toml（C0-7 / C3-3，GH#80）。
@@ -1488,7 +1634,7 @@ impl Coordinator {
             use wind_config::app_compat::InitialMode as IM;
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
-            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema) = {
+            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) = {
                 let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
                 let rule = table.get_rule(&proc);
                 (
@@ -1496,6 +1642,8 @@ impl Coordinator {
                     rule.and_then(|r| r.ignore_host_ime_close),
                     rule.and_then(|r| r.password_force_english),
                     rule.and_then(|r| r.schema.clone()),
+                    rule.and_then(|r| r.status_position_mode),
+                    rule.and_then(|r| r.status_fallback_position),
                 )
             };
             let cur_first_show = self.rule_first_show_mode(&proc);
@@ -1554,6 +1702,74 @@ impl Coordinator {
                         fixed.as_deref() == Some(id.as_str()),
                     ));
                 }
+                v
+            };
+            // 状态提示位置：跟随全局 / 跟随光标 / 固定 / ── / 各锚点 / 子菜单「坐标不可用时」。
+            // 勾选看**规则**（不是生效值），「跟随全局」独立一档，理由见上面 `tri`。
+            let status_children = {
+                use wind_config::app_compat::{
+                    StatusAnchor, StatusFallback as SF, StatusPositionMode as SP,
+                };
+                let mut v = vec![
+                    M::leaf(
+                        "跟随全局",
+                        cmd(MenuCmd::StatusPositionRule(0)),
+                        enabled,
+                        cur_status.is_none(),
+                    ),
+                    M::leaf(
+                        "跟随光标",
+                        cmd(MenuCmd::StatusPositionRule(1)),
+                        enabled,
+                        cur_status == Some(SP::FollowCaret),
+                    ),
+                    M::leaf(
+                        "固定（取当前位置）",
+                        cmd(MenuCmd::StatusPositionRule(2)),
+                        enabled,
+                        cur_status == Some(SP::Fixed),
+                    ),
+                    M::separator(),
+                ];
+                for (i, a) in StatusAnchor::ALL.iter().enumerate() {
+                    v.push(M::leaf(
+                        status_anchor_label(*a),
+                        cmd(MenuCmd::StatusPositionRule(i as u8 + 3)),
+                        enabled,
+                        cur_status == Some(SP::Anchor(*a)),
+                    ));
+                }
+                let mut fb = vec![
+                    M::leaf(
+                        "跟随全局",
+                        cmd(MenuCmd::StatusFallbackRule(0)),
+                        enabled,
+                        cur_status_fb.is_none(),
+                    ),
+                    M::leaf(
+                        "上次位置",
+                        cmd(MenuCmd::StatusFallbackRule(1)),
+                        enabled,
+                        cur_status_fb == Some(SF::Last),
+                    ),
+                    M::leaf(
+                        "不显示",
+                        cmd(MenuCmd::StatusFallbackRule(2)),
+                        enabled,
+                        cur_status_fb == Some(SF::Hide),
+                    ),
+                    M::separator(),
+                ];
+                for (i, a) in StatusAnchor::ALL.iter().enumerate() {
+                    fb.push(M::leaf(
+                        status_anchor_label(*a),
+                        cmd(MenuCmd::StatusFallbackRule(i as u8 + 3)),
+                        enabled,
+                        cur_status_fb == Some(SF::Anchor(*a)),
+                    ));
+                }
+                v.push(M::separator());
+                v.push(M::submenu("坐标不可用时", fb));
                 v
             };
             vec![
@@ -1615,6 +1831,7 @@ impl Coordinator {
                 // 「固定位置」给 caret 坐标本就报不准的宿主。位置**不在这里选**——切到固定
                 // 档只是打开它，落点由用户拖一次候选窗定下（存进该应用自己的规则）。
                 // 与全局那个开关同一决策：业界（搜狗、Google 拼音）也只给开关不给坐标框。
+                M::submenu("状态提示位置", status_children),
                 M::submenu(
                     "候选窗定位",
                     vec![
@@ -2806,6 +3023,20 @@ fn screenshots_dir() -> Option<String> {
 /// 落盘值就撞上哨兵，下次显示被判为"没设过"而跳回默认锚点，表现为"位置没被记住"。
 ///
 /// 哨兵值与合法值域重叠是根因；这里在落盘侧下移 1px 避开：视觉不可察觉，语义无歧义。
+/// 状态气泡锚点的菜单文案。
+fn status_anchor_label(a: wind_config::app_compat::StatusAnchor) -> &'static str {
+    use wind_config::app_compat::StatusAnchor as A;
+    match a {
+        A::ScreenCenter => "屏幕中央",
+        A::ScreenTopLeft => "屏幕左上角",
+        A::ScreenTopRight => "屏幕右上角",
+        A::ScreenBottomLeft => "屏幕左下角",
+        A::ScreenBottomRight => "屏幕右下角",
+        A::WindowCenter => "窗口中央",
+        A::WindowBottomLeft => "窗口左下角",
+    }
+}
+
 fn avoid_unset_sentinel(x: i32, y: i32) -> (i32, i32) {
     if (x, y) == (0, 0) { (0, 1) } else { (x, y) }
 }

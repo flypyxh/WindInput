@@ -2936,13 +2936,19 @@ impl MessageHandler for Coordinator {
         // 放在闸门之后等于永远不执行（而且完全静默）。
         //
         // 只认 TSF 域：本闸门存在的全部意义就是不拿 GUI 回退坐标定位气泡。
-        if self
-            .pending_focus_tip
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && wind_ipc::protocol::caret_source::is_tsf(data.source)
+        // compare_exchange 而非 load + store：与锚点超时（`fire_focus_tip_timeout`）同时到达时
+        // 只让一方显示。
+        if wind_ipc::protocol::caret_source::is_tsf(data.source)
+            && self
+                .pending_focus_tip
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
         {
-            self.pending_focus_tip
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             debug!(
                 "focus_tip → 补显示: 等到权威坐标 ({},{}) src={}",
                 data.x,

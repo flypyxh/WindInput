@@ -12,7 +12,8 @@
 | `src/lib.rs` | 模块导出（`Coordinator`/重启信号/设置 URL 提供者）；`is_foreground_fullscreen()` 全屏检测（供工具栏全屏隐藏） |
 | `src/coordinator.rs` | 核心：`State`（全部输入态）/`Coordinator` 定义、`build`（83 字段装配点，私有字段以本模块为界不外迁）、会话键统一分发 `apply_session_action`、配置热重载 `reload_user_config`。平移出去的项经 `pub(crate) use` 保真，handle_* 仍从 `crate::coordinator::` 引用 |
 | `src/coordinator/message_handler.rs` | **子模块**：`impl MessageHandler`（TSF 全部事件入口，含**按键主入口 `handle_key_event`（优先级链）**）+ 失焦归属校验 `is_stale_focus_event` + ext 信封解码。子模块可见父私有字段——重度碰私有态的切片进 `src/coordinator/`，不进平级模块 |
-| `src/coordinator/first_show.rs` | **子模块**：候选窗首显闸门（延迟首显判定/释放 + `FirstShowTimer` 共享兜底 timer） |
+| `src/coordinator/first_show.rs` | **子模块**：候选窗首显闸门（延迟首显判定/释放 + `OneShotTimer` 共享兜底 timer，按协调器分槽；焦点气泡锚点超时也用它的另一个实例） |
+| `src/coordinator/status_placement.rs` | **子模块**：状态气泡定位（C2-33 / GH#148）——`status_position`（compat 规则优先回落全局，方式与坐标同层）、`placement_for`（坐标不可信时按 `fallback_position` 兜底，`last` = 引入前行为）、焦点气泡挂起的锚点超时（仅兜底为锚点时） |
 | `src/coordinator/push_config.rs` | **子模块**：push 通道推送（activation status / 各配置帧 / `push_state_update`） |
 | `src/coordinator/langbar_icon.rs` | **子模块**：语言栏图标 SHM 发布（`ICON_PUBLISHER` 进程级单例 + 状态角标） |
 | `src/coordinator/app_schema.rs` | **子模块**：按应用方案（compat.toml `schema`）——焦点跨进程切入的轻量切换（冷方案后台加载）、手切分流（规则应用不写 `schema.active`）、全局方案 `AppSchemaState::global`（**不读** `rt().config.schema.active`：手切只写盘、内存 config 不刷新）、`@remember` 记忆表（state.toml `app_schemas`） |

@@ -181,6 +181,13 @@ pub enum MenuCmd {
     ///
     /// 下标而非 id：菜单 id 是整数（macOS 经 `NSMenuItem.tag` 回传），与 `SchemaSelect` 同理。
     AppSchemaRule(u16),
+    /// 为当前焦点应用设置状态气泡定位（compat.toml 的 status_position_mode，C2-33 / GH#148）。
+    /// 参数：0=跟随全局（清除规则）1=跟随光标 2=固定（取气泡当前位置）3+i=锚点表第 i 个
+    /// （`wind_config::app_compat::StatusAnchor::ALL` 的顺序）。
+    StatusPositionRule(u8),
+    /// 为当前焦点应用设置「坐标不可用时」气泡放哪（compat.toml 的 status_fallback_position）。
+    /// 参数：0=跟随全局（清除规则）1=上次位置 2=不显示 3+i=锚点表第 i 个。
+    StatusFallbackRule(u8),
     /// 语言栏图标：角标总开关。参数为 `wind_ui::langbar_icon::BadgeStyle::ALL` 的下标。
     ///
     /// 只有「不显示 / 角标」两档——具体画哪些状态、什么颜色、在哪个角，是
@@ -226,7 +233,8 @@ impl MenuKind {
     /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜
     /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点｜8000+ 诊断 HUD 分区｜
     /// 9000+ 自动配对｜10000+ 语言栏图标角标形状｜11000+ 软键盘面｜12000+ 候选窗定位｜
-    /// 13000+ 忽略宿主关闭输入法｜14000+ 密码框强制英文｜15000+ 按应用方案。
+    /// 13000+ 忽略宿主关闭输入法｜14000+ 密码框强制英文｜15000+ 按应用方案｜
+    /// 16000+ 按应用状态气泡定位｜17000+ 按应用状态气泡兜底位置。
     pub fn to_menu_id(self) -> i32 {
         match self {
             MenuKind::Separator | MenuKind::Submenu | MenuKind::Label => 0,
@@ -287,6 +295,8 @@ impl MenuKind {
                 MenuCmd::IgnoreHostImeCloseRule(m) => 13000 + m as i32,
                 MenuCmd::PasswordForceEnglishRule(m) => 14000 + m as i32,
                 MenuCmd::AppSchemaRule(m) => 15000 + m as i32,
+                MenuCmd::StatusPositionRule(m) => 16000 + m as i32,
+                MenuCmd::StatusFallbackRule(m) => 17000 + m as i32,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -357,6 +367,8 @@ impl MenuKind {
             13000..=13999 => MenuCmd::IgnoreHostImeCloseRule((id - 13000) as u8),
             14000..=14999 => MenuCmd::PasswordForceEnglishRule((id - 14000) as u8),
             15000..=15999 => MenuCmd::AppSchemaRule((id - 15000) as u16),
+            16000..=16255 => MenuCmd::StatusPositionRule((id - 16000) as u8),
+            17000..=17255 => MenuCmd::StatusFallbackRule((id - 17000) as u8),
             _ => return None,
         };
         Some(MenuKind::Command(cmd))

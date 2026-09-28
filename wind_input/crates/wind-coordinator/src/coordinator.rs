@@ -21,6 +21,7 @@ mod langbar_icon;
 mod message_handler;
 mod push_config;
 mod state_writer;
+mod status_placement;
 
 // 平移到子模块的项以原路径保真（handle_* 均经 `crate::coordinator::` 引用，勿改回直连）。
 pub(crate) use crate::config_bundle::{ConfigBundle, schema_key_union};
@@ -1627,9 +1628,12 @@ pub struct Coordinator {
     /// 直接拿它定位就是用户反馈的「还没输入时定位非常不准」。故置位挂起，由
     /// [`Coordinator::handle_caret_update`] 在权威坐标到来时消费并补显示。
     ///
-    /// **刻意不配兜底 timer**：超时后能做的只有「拿不可信坐标显示」，正是本机制要挡的事。
-    /// 等不到就不显示，失焦/下一次焦点事件清位。
+    /// **不配「拿现有坐标显示」的兜底 timer**：超时后那样做只能用不可信坐标，正是本机制要挡的
+    /// 事。等不到就不显示，失焦/下一次焦点事件清位。唯一的超时是兜底为**锚点**时（锚点不读
+    /// 光标，不在上述反对理由之列），见 `status_placement::park_focus_tip`。
     pending_focus_tip: std::sync::atomic::AtomicBool,
+    /// 焦点气泡挂起的代际：每次挂起 +1。锚点超时到期时比对它，被新的挂起取代则作废。
+    pending_focus_tip_gen: std::sync::atomic::AtomicU64,
     /// 上一次弹过焦点气泡的宿主（`client_token`，DLL 实例级 = 每进程一个）。
     ///
     /// **气泡的语义是「切到了新的输入宿主」，不是「换了 docMgr」**。一个宿主内部可以有多个
@@ -2668,6 +2672,7 @@ impl Coordinator {
             last_sane_caret_height: std::sync::atomic::AtomicI32::new(FALLBACK_LINE_HEIGHT),
             first_show_extended: std::sync::atomic::AtomicBool::new(false),
             pending_focus_tip: std::sync::atomic::AtomicBool::new(false),
+            pending_focus_tip_gen: std::sync::atomic::AtomicU64::new(0),
             last_focus_tip_token: Mutex::new(0),
             app_compat: Mutex::new(app_compat),
             compat_dirs: (
@@ -7179,6 +7184,28 @@ impl Coordinator {
 
     /// 状态泡的发送本体（caret 由调用方给出）。**不取 state 锁**。
     fn show_tip_at(&self, text: &str, raw_x: i32, raw_y: i32, raw_h: i32) {
+        self.show_tip_with(text, raw_x, raw_y, raw_h, None);
+    }
+
+    /// 以指定定位弹状态泡（焦点气泡的锚点超时用），光标仍从 state 里取（选屏参考）。
+    pub(crate) fn show_tip_placed(&self, text: &str, placement: wind_ui_types::StatusTipPlacement) {
+        let (raw_x, raw_y, raw_h) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.caret_x, s.caret_y, s.caret_height)
+        };
+        self.show_tip_with(text, raw_x, raw_y, raw_h, Some(placement));
+    }
+
+    /// `forced = None` 时按 [`Self::status_position`] + 原始坐标可信度解析定位（见
+    /// [`Self::placement_for`]），解析为「不显示」就直接返回。**不取 state 锁**。
+    fn show_tip_with(
+        &self,
+        text: &str,
+        raw_x: i32,
+        raw_y: i32,
+        raw_h: i32,
+        forced: Option<wind_ui_types::StatusTipPlacement>,
+    ) {
         let bundle = self.rt();
         let si = &bundle.config.ui.status;
         if !si.enabled {
@@ -7191,6 +7218,10 @@ impl Coordinator {
         if text.trim().is_empty() {
             return;
         }
+        // 原始坐标的可信度必须在 resolve 之前取：resolve 会回退到最近一次有效坐标、并把
+        // valid 报成 true，拿它判就分不出「这次坐标本身不可信」（兜底的触发条件）。
+        let raw_valid = Self::caret_is_valid(raw_x, raw_y, raw_h);
+        // resolve 照调：它顺带刷新 last_valid_caret，兜底 `last` 依赖这份记录。
         let (x, y, caret_height, _valid) = self.resolve_caret_for_ui(raw_x, raw_y, raw_h);
         // 常驻(always)→ duration_ms=0(UI 不自动隐藏);否则按 duration 自动隐藏。对齐 Go display_mode。
         let duration_ms = if si.display_mode.eq_ignore_ascii_case("always") {
@@ -7198,16 +7229,14 @@ impl Coordinator {
         } else {
             si.duration.max(1) as u64
         };
-        // 位置模式 fixed:用固定屏幕坐标 custom_x/custom_y;否则跟随光标(caret + offset)。
-        let placement = if si.position_mode.eq_ignore_ascii_case("fixed") {
-            wind_ui_types::StatusTipPlacement::Fixed {
-                x: si.custom_x,
-                y: si.custom_y,
-            }
-        } else {
-            wind_ui_types::StatusTipPlacement::Caret {
-                offset_x: si.offset_x,
-                offset_y: si.offset_y,
+        // 定位：固定坐标 / 锚点 / 跟随光标（坐标不可信时按兜底）。规则优先回落全局。
+        let placement = match forced.or_else(|| {
+            Self::placement_for(self.status_position(), raw_valid, si.offset_x, si.offset_y)
+        }) {
+            Some(p) => p,
+            None => {
+                debug!("status_tip → 不显示: 光标坐标不可信且兜底为 hide");
+                return;
             }
         };
         let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
@@ -7265,7 +7294,7 @@ impl Coordinator {
     /// 而弹在错误位置是实实在在的负价值。DLL 侧排队档会在 1~2ms 内补一条 TSF 坐标，
     /// 由 [`Self::handle_caret_update`] 消费本次挂起并补显示，故绝大多数宿主上并不会真的落空。
     ///
-    /// `fixed` 模式不读 caret（用 custom_x/custom_y），故不受本闸门约束，一律直接显示。
+    /// `fixed` 与锚点模式不读 caret，故不受本闸门约束，一律直接显示。
     /// `client_token` 用于按**宿主**去重，见 [`Self::last_focus_tip_token`]：同一宿主内部换
     /// docMgr（Excel 单元格 ↔ 公式编辑栏）不该重复弹。
     pub(crate) fn show_focus_status_if_enabled(&self, client_token: u64) {
@@ -7291,7 +7320,12 @@ impl Coordinator {
         if si.display_mode.eq_ignore_ascii_case("always") {
             return;
         }
-        if si.position_mode.eq_ignore_ascii_case("fixed") {
+        // fixed / 锚点不读 caret，不受可信度闸门约束，直接显示。清掉可能残留的上一次挂起，
+        // 免得它的锚点超时在这之后把气泡又摆到别处。
+        let pos = self.status_position();
+        if pos.mode != wind_config::app_compat::StatusPositionMode::FollowCaret {
+            self.pending_focus_tip
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             self.show_tip(&self.status_indicator_text());
             return;
         }
@@ -7304,14 +7338,16 @@ impl Coordinator {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.show_tip(&self.status_indicator_text());
         } else {
-            // 挂起，等 DLL 补来的 TSF 坐标。挂起在下次焦点事件/失焦时作废，不设超时兜底——
-            // 超时到期只能拿现有的不可信坐标显示，那正是本闸门要挡的东西。
+            // 挂起，等 DLL 补来的 TSF 坐标。挂起在下次焦点事件/失焦时作废。
+            //
+            // 兜底为 `last` / `hide` 时**不设超时**：超时到期只能拿现有的不可信坐标显示，那正是
+            // 本闸门要挡的东西。兜底为**锚点**时设约 150ms 超时——锚点不是光标坐标，不在这条
+            // 反对理由之列，到期仍无 TSF 坐标就显示在锚点（C2-33 / GH#148）。
             debug!(
                 "focus_tip → 挂起: 坐标来源 {} 非 TSF 域，等待权威坐标",
                 wind_ipc::protocol::caret_source::name(source)
             );
-            self.pending_focus_tip
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.park_focus_tip(pos.fallback);
         }
     }
 
