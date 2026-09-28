@@ -229,6 +229,73 @@ fn english_merge_vetoes_top_code_on_codetable() {
     );
 }
 
+fn cand(code: &str, text: &str) -> wind_candidate::Candidate {
+    wind_candidate::Candidate {
+        code: code.to_string(),
+        text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+/// `recheck_auto_commit_for`（overlay/特殊模式自动上屏复评的按方案版本，供快符等特殊模式
+/// 使用）必须应用英文否决，且要按**它复评的那个方案**取 `english_merge` 配置，而不是当前
+/// 活跃方案的——否则要么否决对这条通路完全失效（回归审查发现：新增时漏接），要么读错方案
+/// （活跃方案是 pinyin，否决却按 pinyin 的配置去判特殊模式引用的 wubi86）。
+///
+/// ★ 活跃方案故意选 pinyin 而非 wubi86：复现「特殊模式引用的方案不是活跃方案」这个现场——
+/// 若代码退化成读 `active_schema_id()` 的配置，本用例「否决生效」的断言应失败。
+#[test]
+fn recheck_auto_commit_for_applies_schema_scoped_english_veto() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") || !english_dict_ready(&dir) {
+        eprintln!("跳过：wubi86 schema 或英文词库不存在");
+        return;
+    }
+    let build = |block: bool| {
+        let mut cfg = make_config(&["pinyin"]);
+        cfg.schema.available.push("wubi86".to_string());
+        // english_merge 写在 wubi86 自己的方案覆盖里，而不是全局 cfg.schema.codetable——
+        // 这正是要锁住的差异：全局镜像按活跃方案（pinyin）折叠，读不到这条。
+        let override_dir =
+            std::env::temp_dir().join(format!("wind_recheck_english_veto_ov_{}", block));
+        let _ = std::fs::remove_dir_all(&override_dir);
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(
+            override_dir.join("wubi86.toml"),
+            format!(
+                "[engine.codetable]\nauto_commit_at_full = true\nenglish_merge = {{ enable = true, block_commit = {block} }}\n"
+            ),
+        )
+        .unwrap();
+        EngineManager::with_store_override(&cfg, Some(&dir), None, Some(override_dir))
+    };
+
+    // 候选本身是否精确匹配由调用方保证（复评不查词库，只看传入的候选+否决）：随便造一个
+    // code=input 的唯一精确候选即可，够不够上屏另有 `recheck_auto_commit_unique_after_filter`
+    // 之类的用例守，本用例只关心否决本身。
+    let candidates = [cand("github", "随便一个候选")];
+
+    // 前提：关掉否决时，这个唯一精确候选确实会被复评放行——否则测不到否决，断言空转。
+    let unguarded = build(false);
+    assert!(unguarded.ensure_schema("wubi86"), "wubi86 方案应可加载");
+    assert!(
+        unguarded
+            .recheck_auto_commit_for("wubi86", "github", &candidates)
+            .is_some(),
+        "前提：关闭英文否决时唯一精确候选应复评放行，否则测不到否决本身"
+    );
+
+    let guarded = build(true);
+    assert!(guarded.ensure_schema("wubi86"), "wubi86 方案应可加载");
+    assert!(
+        guarded
+            .recheck_auto_commit_for("wubi86", "github", &candidates)
+            .is_none(),
+        "存在英文候选时，特殊模式引用方案（wubi86）自己的 english_merge.block_commit \
+         应否决复评上屏——按活跃方案(pinyin)取配置的话，这条否决对 wubi86 永远读不到"
+    );
+}
+
 #[test]
 fn test_wubi_engine_candidates() {
     let dir = data_dir();

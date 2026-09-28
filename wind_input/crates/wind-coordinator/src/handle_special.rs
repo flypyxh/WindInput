@@ -520,7 +520,7 @@ impl Coordinator {
         // **快符引用的方案**取引擎（`recheck_auto_commit_for`），否则会拿主方案的引擎去判
         // 快符方案的候选——同类坑见 `engine_for` 的注释。
         let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
-            Some(result.commit_text.clone())
+            Some(result.commit_text)
         } else {
             self.engine_mgr.recheck_auto_commit_for(
                 &schema,

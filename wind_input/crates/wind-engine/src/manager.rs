@@ -3620,6 +3620,15 @@ impl EngineManager {
         Some((self.shared_english_engine()?, cfg))
     }
 
+    /// 取本次转换该用哪份英文混入配置的活跃方案版本；实现与详细说明见
+    /// [`Self::english_merge_cfg_for`]。
+    fn english_merge_cfg(
+        &self,
+        active: &Arc<dyn Engine>,
+    ) -> Option<crate::english_merge::Effective> {
+        self.english_merge_cfg_for(&self.active_schema_id(), active)
+    }
+
     /// 取本次转换该用哪份英文混入配置——**按引擎类型分流，两份互不共享取值**。
     ///
     /// 「码表方案要不要捎带英文」与「拼音方案要不要」是两件独立的事（见
@@ -3627,21 +3636,26 @@ impl EngineManager {
     /// 全拼的英文词与拼音串大面积重叠（`hen`/`men`/`she` 都既是音节又是英文词），
     /// 用户可能宁可不开。一个总开关只会逼人在「两个都开」和「两个都关」之间二选一。
     ///
-    /// ⚠️ 码表侧走 [`Self::codetable_settings`] 而**不是**读全局镜像：那个函数按**活跃方案**
-    /// 折叠了方案级 `[engine.codetable.english_merge]`。直接读镜像的话，用户在方案里写的
-    /// 覆盖没人读——`CodetableGlobal::resolved` 的注释里记着同款教训（「光在这里折叠、
-    /// freq_settings 仍读全局镜像的话，方案文件里写了也没人读」）。
+    /// ⚠️ 码表侧走 [`Self::codetable_settings_of`] 而**不是**读全局镜像：那个函数按
+    /// **指定方案**折叠了方案级 `[engine.codetable.english_merge]`。直接读镜像的话，用户在
+    /// 方案里写的覆盖没人读——`CodetableGlobal::resolved` 的注释里记着同款教训（「光在这里
+    /// 折叠、freq_settings 仍读全局镜像的话，方案文件里写了也没人读」）。
     ///
     /// ⚠️ 拼音侧**暂无方案级覆盖**：`PinyinGlobalConfig` 没有 `resolved()`、`PinyinSpec` 也
     /// 没有对应字段，整套机制在拼音侧尚不存在。故这里直读全局镜像；将来补上方案级时，
     /// 这一行要跟着换成 resolved 版本，否则表现就是「方案里写了不生效」。
-    fn english_merge_cfg(
+    ///
+    /// 按方案而非活跃方案取值：供 overlay/特殊模式的自动上屏复评使用
+    /// （[`Self::recheck_auto_commit_for`]）——特殊模式引用的方案往往不是活跃方案，
+    /// [`Self::english_merge_cfg`] 固定按活跃方案取，会拿错方案的配置。
+    fn english_merge_cfg_for(
         &self,
+        schema_id: &str,
         active: &Arc<dyn Engine>,
     ) -> Option<crate::english_merge::Effective> {
         match active.engine_type() {
             EngineType::CodeTable => {
-                let c = self.codetable_settings().english_merge;
+                let c = self.codetable_settings_of(schema_id).english_merge;
                 Some(crate::english_merge::Effective {
                     enable: c.enable,
                     min_length: c.min_length,
@@ -3708,10 +3722,30 @@ impl EngineManager {
         built
     }
 
-    /// 存在英文候选时是否否决上屏。**三条通路共用这一个判据**（`AGENTS.md`：任何否决开关
-    /// 必须三处都接，漏一处该开关对那条路径就等于完全失效，且日志与设置页均无痕迹）。
+    /// 存在英文候选时是否否决上屏（活跃方案版本）。**三条通路共用这一个判据**（`AGENTS.md`：
+    /// 任何否决开关必须三处都接，漏一处该开关对那条路径就等于完全失效，且日志与设置页均
+    /// 无痕迹）；overlay/特殊模式的第四条通路见 [`Self::english_vetoes_commit_for`]。
     fn english_vetoes_commit(&self, active: &Arc<dyn Engine>, input: &str) -> bool {
-        let Some((eng, cfg)) = self.english_merge_ctx(active) else {
+        self.english_vetoes_commit_for(&self.active_schema_id(), active, input)
+    }
+
+    /// [`Self::english_vetoes_commit`] 的按方案版本：`english_merge_ctx` 内部走
+    /// `english_merge_cfg`（活跃方案），故这里不能直接复用它，改走
+    /// [`Self::english_merge_cfg_for`] + 共享英文引擎（后者本就是进程级单例，
+    /// 与方案无关，不需要参数化）。
+    fn english_vetoes_commit_for(
+        &self,
+        schema_id: &str,
+        active: &Arc<dyn Engine>,
+        input: &str,
+    ) -> bool {
+        let Some(cfg) = self.english_merge_cfg_for(schema_id, active) else {
+            return false;
+        };
+        if !cfg.enable {
+            return false;
+        }
+        let Some(eng) = self.shared_english_engine() else {
             return false;
         };
         cfg.block_commit && crate::english_merge::has_any(eng.as_ref(), input, cfg.min_length)
@@ -3755,24 +3789,19 @@ impl EngineManager {
 
     /// 满码自动上屏「显示态」复评（透传到活跃引擎）：据已过滤/重排/shadow 的显示候选复评，
     /// 引擎按未过滤候选因生僻同码字判不唯一而否决时，智能过滤后剩唯一精确全码则放行上屏。
+    /// 活跃方案版本；overlay/特殊模式见 [`Self::recheck_auto_commit_for`]。
     pub fn recheck_auto_commit(
         &self,
         input: &str,
         candidates: &[wind_candidate::Candidate],
     ) -> Option<String> {
-        let engine = self.active_engine()?;
-        let r = engine.recheck_auto_commit(input, candidates)?;
-        // 通路②：显示态复评。**刻意仍走词库判据**而不是看传入的 `candidates` 里有没有
-        // 英文候选——那批候选已经过过滤/重排/shadow，与通路①③ 的判据不同源，三条路
-        // 各判各的正是 `AGENTS.md` 反复记载的翻车方式。
-        if self.english_vetoes_commit(&engine, input) {
-            return None;
-        }
-        Some(r)
+        self.recheck_auto_commit_for(&self.active_schema_id(), input, candidates)
     }
 
     /// [`Self::recheck_auto_commit`] 的 overlay/特殊模式版本：按**指定方案**取引擎而非
-    /// `active_engine()`（后者问的是主方案）。
+    /// `active_engine()`（后者问的是主方案）。活跃方案版本即 `recheck_auto_commit_for(&
+    /// active_schema_id(), ..)`——两者共用同一份逻辑，不会各判各的（`engine_for` 在
+    /// `schema_id == active_schema_id()` 时与 `active_engine()` 等价）。
     ///
     /// 回归背景（论坛 #211）：快符等特殊模式引用的方案（如 wubi86）往往不是主方案（如
     /// 拼音），`update_special_candidates` 靠这条補齐与主路径 `handle_candidate.rs` 对称的
@@ -3780,8 +3809,13 @@ impl EngineManager {
     /// **之前**的候选上：用户在设置页把某个码位的内置词条替换成自定义词条（新增用户词 +
     /// shadow 隐藏旧词条），改码瞬间码位下变成两条精确候选、引擎判「不唯一」拒绝自动上屏；
     /// shadow 生效后其实只剩一条，若无人回头复评，这个「不唯一」的否决会永久生效——用户看
-    /// 到的候选窗明明只有一条，却上不了屏。不接英文否决（`english_vetoes_commit`）：那是
-    /// 主方案通路的概念，特殊模式候选不含英文头部候选。
+    /// 到的候选窗明明只有一条，却上不了屏。
+    ///
+    /// ⚠️ 英文否决（`english_vetoes_commit_for`）**必须接**：它按 `input` 原串查独立的英文
+    /// 引擎，与「候选列表里有没有英文候选」无关，overlay 方案照样可能命中（比如快符引用的
+    /// 码表方案自己开了 `[engine.codetable.english_merge].block_commit`）。三条通路的否决
+    /// 铁律（见 `english_vetoes_commit` 的文档）在此不因为是第四条通路就例外，否则会是
+    /// 「这个开关对快符完全不生效」的静默失效——`AGENTS.md` 明确记载过两次同类回归。
     pub fn recheck_auto_commit_for(
         &self,
         schema_id: &str,
@@ -3789,7 +3823,11 @@ impl EngineManager {
         candidates: &[wind_candidate::Candidate],
     ) -> Option<String> {
         let engine = self.engine_for(schema_id)?;
-        engine.recheck_auto_commit(input, candidates)
+        let r = engine.recheck_auto_commit(input, candidates)?;
+        if self.english_vetoes_commit_for(schema_id, &engine, input) {
+            return None;
+        }
+        Some(r)
     }
 
     /// 活跃引擎是否存在比 `input` 更长的后继编码（码表前缀扫描；拼音等默认 false）。
@@ -4087,20 +4125,32 @@ impl EngineManager {
     }
 
     pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
-        let id = self.active_schema_id();
+        self.codetable_settings_of(&self.active_schema_id())
+    }
+
+    /// [`Self::codetable_settings`] 的按方案版本：供 overlay/特殊模式取**指定方案**的码表
+    /// 全局设置，而不是当前活跃方案的——`codetable_settings()` 内部固定读
+    /// `active_schema_id()`，特殊模式引用的方案往往不是活跃方案，同类坑见 `engine_for`
+    /// 的注释。用 `loaded_engine_type(schema_id)` 而非 `current_engine_type()` 判混输，
+    /// 理由同上：后者也是问活跃方案。
+    fn codetable_settings_of(&self, schema_id: &str) -> wind_config::CodetableGlobal {
         let global = self
             .codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         // 混输方案自身无独立 codetable 配置，override 从其 primary_schema（主码表方案）读取
-        let resolve_id = if matches!(self.current_engine_type(), Some(EngineType::Mixed)) {
-            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
-                .map(|s| s.engine.mixed.primary_schema)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| id.clone())
+        let resolve_id = if matches!(self.loaded_engine_type(schema_id), Some(EngineType::Mixed)) {
+            Self::read_schema(
+                schema_id,
+                self.data_dir.as_deref(),
+                self.override_dir.as_deref(),
+            )
+            .map(|s| s.engine.mixed.primary_schema)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| schema_id.to_string())
         } else {
-            id
+            schema_id.to_string()
         };
         Self::resolve_codetable(
             &resolve_id,
