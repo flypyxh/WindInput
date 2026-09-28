@@ -130,12 +130,14 @@ color = "${text_hint}"
 font_size = -4
 
 # 文字角色色（设计 text-span-colors.md §18）：注释里的编码类变量用标准色「说明」，与候选字一眼分开。
+# 单值变量与它的 _all 版（逐字 / 全部码位）同色：同一类信息不因写法不同而一个有色一个没色。
 # 全部出厂主题都继承这里；info 在各出厂主题的窗口底 / 选中底 / 悬停底上都比 text_hint 易读。
 # 选中、悬停态不单列：状态没改注释正文色时角色色照常显示，改了则回落该状态正文色（§6.3 规则 3）。
 # 注释模板里写的内联色 $[…]{} 优先于这里；派生主题写 "" 可撤销某个角色。
 [comment.roles]
 code_hint = "${info}"
 code_rev = "${info}"
+code_rev_all = "${info}"
 shuangpin = "${info}"
 
 [footer_bar]
@@ -164,8 +166,11 @@ readings = "${tooltip_accent_text}"
 word_code = "${tooltip_success}"
 code_source = "${tooltip_info}"
 chaizi = "${tooltip_warning}"
+chaizi_all = "${tooltip_warning}"
 chaizi_code = "${tooltip_info}"
+chaizi_code_all = "${tooltip_info}"
 unicode = "${tooltip_error}"
+unicode_all = "${tooltip_error}"
 
 [toast]
 background = "${toast_bg}"

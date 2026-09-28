@@ -644,17 +644,28 @@ mod tests {
     /// - 每个出厂角色都真的着了色（≠ 正文色）：角色表丢了一项、token 写错解析不出，都在这里红。
     #[test]
     fn factory_role_colors_are_readable() {
-        const COMMENT_ROLES: &[&str] = &["code_hint", "code_rev", "shuangpin"];
+        const COMMENT_ROLES: &[&str] = &["code_hint", "code_rev", "code_rev_all", "shuangpin"];
         const TOOLTIP_ROLES: &[&str] = &[
             "full_text",
             "readings",
             "word_code",
             "code_source",
             "chaizi",
+            "chaizi_all",
             "chaizi_code",
+            "chaizi_code_all",
             "unicode",
+            "unicode_all",
         ];
-        for name in FACTORY {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes");
+        let ids = crate::list_theme_ids(&dir);
+        for must in FACTORY {
+            assert!(
+                ids.iter().any(|i| i == must),
+                "出厂主题枚举漏了 {must}：{ids:?}"
+            );
+        }
+        for name in &ids {
             for dark in [false, true] {
                 let t = factory(name, dark);
                 let v = &t.views;

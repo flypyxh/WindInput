@@ -1273,7 +1273,7 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
                 }
                 let pal = |k: &str| t.palette[k];
                 let want_comment: std::collections::HashMap<String, Rgba> =
-                    ["code_hint", "code_rev", "shuangpin"]
+                    ["code_hint", "code_rev", "code_rev_all", "shuangpin"]
                         .map(|r| (r.to_string(), pal("info")))
                         .into();
                 let want_tooltip: std::collections::HashMap<String, Rgba> = [
@@ -1282,8 +1282,11 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
                     ("word_code", "tooltip_success"),
                     ("code_source", "tooltip_info"),
                     ("chaizi", "tooltip_warning"),
+                    ("chaizi_all", "tooltip_warning"),
                     ("chaizi_code", "tooltip_info"),
+                    ("chaizi_code_all", "tooltip_info"),
                     ("unicode", "tooltip_error"),
+                    ("unicode_all", "tooltip_error"),
                 ]
                 .map(|(r, k)| (r.to_string(), pal(k)))
                 .into();

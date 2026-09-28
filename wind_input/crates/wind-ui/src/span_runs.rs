@@ -8,9 +8,10 @@ use wind_ui_types::StyledText;
 
 /// 按当前主题把 `text` 的片段解析成颜色区间，**丢掉颜色等于正文色的区间**。
 ///
-/// 丢弃是「出厂零变化」的构造保证：出厂主题不配角色、出厂模板不含内联色 ⇒ 每个片段都解析到
-/// 正文色 ⇒ 全被丢弃 ⇒ 叶子不带颜色区间，走与分段着色之前**同一条**绘制路径（`draw` 而非
+/// 丢弃是「零变化」的构造保证：主题不配角色、模板不含内联色 ⇒ 每个片段都解析到正文色 ⇒
+/// 全被丢弃 ⇒ 叶子不带颜色区间，走与分段着色之前**同一条**绘制路径（`draw` 而非
 /// `draw_runs`），View 树逐字段相同。零回归因此是结构性质，golden 对拍只是确认。
+/// （首发时出厂主题即如此；2026-09-28 起 `_base` 配了角色色，设计 §18。）
 pub(crate) fn color_runs(
     theme: &Resolved,
     node: &RvNode,
@@ -103,9 +104,9 @@ mod tests {
         );
     }
 
-    /// 出厂形态（有角色、无内联色、主题不配角色）一段都不留。
+    /// 不配角色的主题 × 无色模板（有角色、无内联色）一段都不留。
     #[test]
-    fn factory_shape_yields_no_runs() {
+    fn unroled_theme_yields_no_runs() {
         let mut t = StyledText::new();
         t.push(
             "kao",
