@@ -580,10 +580,18 @@ pub struct AppCompatRule {
     ///
     /// ⚠ 消费点有**两处**（`apply_focus_caret` / `handle_caret_update`），与 `caret_use_top`
     /// 同层同处；漏一处的症状是「有时生效有时不生效」。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub caret_offset_x: i32,
     /// 光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下）。语义见 [`Self::caret_offset_x`]。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub caret_offset_y: i32,
     /// 该应用的候选窗定位方式；`None` = 不干预，沿用全局 `ui.candidate.position_mode`。
     ///
@@ -608,10 +616,18 @@ pub struct AppCompatRule {
     /// ⚠ 不分显示器：与全局那份保持同一口径。换屏后落点由 `clamp_to_work_area` 兜住，
     /// 不会飞到不可见区域（工具栏/软键盘那套按屏分桶的模型**不适用**——它们是常驻窗口，
     /// 候选窗是临时浮层且随时可以拖）。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub candidate_x: i32,
     /// 固定模式下该应用自己的候选窗落点 Y。语义见 [`Self::candidate_x`]。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub candidate_y: i32,
     /// 忽略该宿主「关闭输入法」的请求（写 OPENCLOSE / CONVERSION compartment 关 IME）。
     ///
@@ -2045,6 +2061,59 @@ mod tests {
                     "{field} = {bad}: 同文件其它规则必须照常生效"
                 );
             }
+        }
+    }
+
+    /// `AppCompatRule` 的每个 `i32` 字段类型写错（`"12"` / `1.5` / `true`）或越界都**不得**让
+    /// 整份 compat.toml 失效，只让该字段回落「未配置」（0），同文件其它规则照常生效。
+    ///
+    /// 字段表取自源码，理由同 [`every_bool_field_wrong_type_does_not_sink_the_file`]：新加一个
+    /// 坐标字段忘了挂 `tolerant_i32`，用户手写一个 `"12"` 就是所有应用的所有规则一起失效。
+    #[test]
+    fn every_i32_field_wrong_type_does_not_sink_the_file() {
+        let src = include_str!("app_compat.rs");
+        let start = src.find("pub struct AppCompatRule {").unwrap();
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split_once(": "))
+            .filter(|(_, ty)| *ty == "i32,")
+            .map(|(name, _)| name)
+            .collect();
+        assert!(fields.len() >= 4, "字段扫描失灵：{fields:?}");
+        for field in &fields {
+            for bad in [r#""12""#, "1.5", "true", "[1]", "4294967296"] {
+                let text = format!(
+                    "[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\n\n\
+                     [[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n"
+                );
+                let file = toml::from_str::<AppCompatFile>(&text)
+                    .unwrap_or_else(|e| panic!("{field} = {bad}: 类型写错不得让整份失败：{e}"));
+                let compat = AppCompat::from_rules(file.apps);
+                let typo = toml::Value::try_from(compat.get_rule("typo.exe").unwrap()).unwrap();
+                assert!(
+                    typo.get(*field).is_none(),
+                    "{field} = {bad}: 认不出 = 没配过，实际 {typo:?}"
+                );
+                assert_eq!(
+                    compat.get_rule("other.exe").unwrap().auto_pair,
+                    Some(false),
+                    "{field} = {bad}: 同文件其它规则必须照常生效"
+                );
+            }
+            // 正常值不受影响
+            let file = toml::from_str::<AppCompatFile>(&format!(
+                "[[apps]]\nprocess = \"ok.exe\"\n{field} = -7\n"
+            ))
+            .unwrap();
+            let ok = toml::Value::try_from(&file.apps[0]).unwrap();
+            assert_eq!(
+                ok.get(*field).and_then(|v| v.as_integer()),
+                Some(-7),
+                "{field}"
+            );
         }
     }
 

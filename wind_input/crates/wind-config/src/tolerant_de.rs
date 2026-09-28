@@ -134,8 +134,8 @@ where
 /// 容错反序列化 `Option<bool>`：非布尔值（`"yes"`、`1`）回落 **`None`** 并 WARN。
 ///
 /// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**唯一例外**（连同其裸 `bool` 版
-/// [`tolerant_bool`]），只给没有段级降级的载体用（`compat.toml`：`load_file` 解析失败即
-/// 整份丢弃）。在那里，类型错并没有下一层兜底可交——不在字段上吞掉，就是所有应用的所有
+/// [`tolerant_bool`]、整数版 [`tolerant_i32`]），只给没有段级降级的载体用（`compat.toml`：
+/// `load_file` 解析失败即整份丢弃）。在那里，类型错并没有下一层兜底可交——不在字段上吞掉，就是所有应用的所有
 /// 规则一起静默失效。
 /// 回落 `None` 而非 `Some(false)`，理由同 [`tolerant_opt`]：认不出 = 没配过。
 pub fn tolerant_opt_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
@@ -164,6 +164,27 @@ where
     D: Deserializer<'de>,
 {
     Ok(tolerant_opt_bool(d)?.unwrap_or(false))
+}
+
+/// 容错反序列化裸 `i32`：非整数（`"12"`、`1.5`、`true`）或超出 `i32` 范围的整数回落 **`0`**
+/// 并 WARN。
+///
+/// 与 [`tolerant_bool`] 同一个例外、同一个载体（`compat.toml`）：那里的 `i32` 字段（坐标校正、
+/// 固定落点）都是 `default + skip_serializing_if = "is_zero_i32"`，`0` 就是「没配」。
+pub fn tolerant_i32<'de, D>(d: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(0),
+        Some(toml::Value::Integer(n)) if i32::try_from(n).is_ok() => Ok(n as i32),
+        Some(other) => {
+            let raw = other.to_string();
+            warn!("配置值 {raw} 不是 32 位整数，本项按「未设置」（0）处理");
+            record_fallback(&raw);
+            Ok(0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +267,33 @@ mod tests {
             let h: OptBoolHolder = toml::from_str(&format!("v = {bad}\nother = 7"))
                 .unwrap_or_else(|e| panic!("{bad}: 不得整份失败：{e}"));
             assert_eq!(h.v, None, "{bad}");
+            assert_eq!(h.other, 7, "{bad}: 同表其它字段照常");
+        }
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct I32Holder {
+        #[serde(default, deserialize_with = "tolerant_i32")]
+        v: i32,
+        #[serde(default)]
+        other: i32,
+    }
+
+    #[test]
+    fn i32_keeps_integers_and_absence() {
+        let h: I32Holder = toml::from_str("v = -12").unwrap();
+        assert_eq!(h.v, -12);
+        let h: I32Holder = toml::from_str("other = 1").unwrap();
+        assert_eq!(h.v, 0);
+    }
+
+    /// 非整数与越界整数回落 `0`（= 没配过），且不牵连同表其它字段。
+    #[test]
+    fn i32_wrong_type_or_overflow_falls_back_to_zero() {
+        for bad in [r#""12""#, "1.5", "true", "[1]", "{ a = 1 }", "4294967296"] {
+            let h: I32Holder = toml::from_str(&format!("v = {bad}\nother = 7"))
+                .unwrap_or_else(|e| panic!("{bad}: 不得整份失败：{e}"));
+            assert_eq!(h.v, 0, "{bad}");
             assert_eq!(h.other, 7, "{bad}: 同表其它字段照常");
         }
     }
