@@ -600,13 +600,16 @@ mod tests {
         s.remove_temp_word("py", "xianning", "西安宁").unwrap();
         assert!(hit("xan").is_empty(), "remove 应删索引");
 
-        // ④ evict_temp_words（按权重淘汰最低者）
+        // ④ evict_temp_words：淘汰排序键是 (count, created_at, weight)，主键 count。
+        // 让"你好"的 count 领先"好呀"一次，淘汰结果就不再依赖两次 learn 是否落在同一秒——
+        // 否则 created_at 打平时才退到 weight 比大小，慢 CI（如 macOS 共享 runner）跨秒即可打破这个假设而偶发翻车。
+        s.learn_temp_word("py", "nihao", "你好", 0, 0b101).unwrap();
         s.learn_temp_word("py", "haoya", "好呀", 10, 0b1001)
             .unwrap();
         assert_eq!(hit("hy"), vec!["好呀"]);
         s.evict_temp_words("py", 1).unwrap();
         assert!(hit("hy").is_empty(), "evict 应同步删索引");
-        assert_eq!(hit("nh"), vec!["你好"], "权重高者留下，索引也应留下");
+        assert_eq!(hit("nh"), vec!["你好"], "count 更高者留下，索引也应留下");
 
         // ⑤ promote_temp_word：临时索引删、**用户索引建**
         assert!(s.promote_temp_word("py", "nihao", "你好").unwrap());
