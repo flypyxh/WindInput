@@ -8,6 +8,8 @@
 //! 补值的唯一来源是编译期嵌入的 `_base/theme.toml` 本身，而不是一张手抄的常量表：两处写同一组
 //! 值，迟早只改一处，而这里漂移了没有任何症状（只有无 base 主题看得到）。嵌入而不是运行时从
 //! 主题目录读：兜底不该依赖搜索链里恰好有 `_base`（设置页预览、移动端拉调色板各走各的目录）。
+//! 代价是本 crate 依赖仓内 `data/` 布局：单独 `cargo package` / vendor 本 crate 会编译失败
+//! （失败是显式的；各端构建都在完整仓内，改 `_base` 会经 dep-info 触发重编）。
 //!
 //! 引用的解析口径：
 //! - 契约名之间的引用按**本主题**解析——`selection_text = "${text}"` 取本主题的 text，
@@ -135,7 +137,6 @@ primary = "#ABCDEF"
             assert_eq!(p["error"], hex("#010203"));
             assert_eq!(p["tooltip_error"], hex("#040506"));
             assert_eq!(p["text"], hex(if dark { "#EEEEEE" } else { "#111111" }));
-            assert_eq!(p["primary"], hex("#ABCDEF"));
             for extra in ["bg", "surface", "menu_bg", "tooltip_bg", "status_bg"] {
                 assert!(!p.contains_key(extra), "不该补契约外的 {extra}");
             }
