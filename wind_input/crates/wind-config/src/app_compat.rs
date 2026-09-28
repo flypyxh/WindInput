@@ -317,6 +317,56 @@ where
     Ok(raw.as_deref().and_then(NewlineStyle::from_config))
 }
 
+/// [`AppCompatRule::schema`] 里「记住本应用上次用的方案」的保留值。
+///
+/// `@` 前缀是保留标记空间：方案 id 来自文件名，不以 `@` 开头。以 `@` 开头的值只认这一个，
+/// 其余在解析时按未配置处理（见 [`de_app_schema`]）。
+pub const APP_SCHEMA_REMEMBER: &str = "@remember";
+
+/// [`AppCompatRule::schema`] 解析后的语义视图，见 [`AppCompatRule::app_schema`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSchema<'a> {
+    /// 固定为该方案 id（是否在 `schema.available` 内由协调器按当时的 available 判）。
+    Fixed(&'a str),
+    /// 记住本应用上次用的方案（记忆表在 `state.toml` 的 `app_schemas`）。
+    Remember,
+}
+
+/// 容错反序列化 [`AppCompatRule::schema`]：类型写错（`1` / 数组）、空串、`@` 开头但不是
+/// [`APP_SCHEMA_REMEMBER`] 的值一律回落 `None`（＝跟随全局）并 WARN。
+///
+/// ⚠ 理由同 [`de_initial_mode`]：`load_file` 没有段级降级，不在字段上吞掉就是整份
+/// compat.toml 静默失效。「id 是否在 `schema.available` 内」**不在这里判**：available 可热重载，
+/// 解析层只收字符串，由协调器按当时的 available 校验。
+fn de_app_schema<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = match Option::<toml::Value>::deserialize(d)? {
+        None => return Ok(None),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: schema = {raw} 不是字符串，本项按「跟随全局」处理");
+            crate::tolerant_de::record_fallback(&raw);
+            return Ok(None);
+        }
+    };
+    let v = raw.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if v.starts_with('@') && v != APP_SCHEMA_REMEMBER {
+        tracing::warn!(
+            "compat.toml: schema = \"{v}\" 不是已知标记（只认 {APP_SCHEMA_REMEMBER}），\
+             本项按「跟随全局」处理"
+        );
+        crate::tolerant_de::record_fallback(v);
+        return Ok(None);
+    }
+    Ok(Some(v.to_string()))
+}
+
 /// 单个应用的兼容性规则。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AppCompatRule {
@@ -465,6 +515,21 @@ pub struct AppCompatRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub password_force_english: Option<bool>,
+    /// 该应用使用的输入方案；`None` = 跟随全局（最近一次全局手切的结果 / `schema.active`）
+    /// （C0-7 / C3-3，GH#80）。
+    ///
+    /// - 具体方案 id ⇒ 焦点跨进程切入时固定切到它；
+    /// - [`APP_SCHEMA_REMEMBER`] ⇒ 切入时恢复本应用上次用的方案（无记录则用全局）。
+    ///
+    /// 规则应用内的手切只改本应用的方案，不写 `schema.active`。用户偏好 ⇒ **不进**
+    /// [`ProtocolFields`]。消费点在协调器 `app_schema_rule`（按当时的 available 校验）。
+    /// 读取请走 [`Self::app_schema`]，不要直接比较字符串。
+    #[serde(
+        default,
+        deserialize_with = "de_app_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub schema: Option<String>,
     /// 该应用的智能符号替换方案；`None` = 沿用全局 `input.symbol.smart_method`。
     ///
     /// `DeleteReplace`（全局默认）依赖对宿主做删改，在 Tabby 一类终端上会出严重错误；
@@ -586,6 +651,16 @@ pub struct AppCompatRule {
     pub host_drawn_candidates: Option<bool>,
 }
 
+impl AppCompatRule {
+    /// [`Self::schema`] 的语义视图；`None` = 未配置（跟随全局）。
+    pub fn app_schema(&self) -> Option<AppSchema<'_>> {
+        match self.schema.as_deref()? {
+            APP_SCHEMA_REMEMBER => Some(AppSchema::Remember),
+            id => Some(AppSchema::Fixed(id)),
+        }
+    }
+}
+
 fn is_zero_i32(v: &i32) -> bool {
     *v == 0
 }
@@ -694,6 +769,12 @@ pub fn set_password_force_english(
     enabled: Option<bool>,
 ) {
     upsert_rule(rules, process, |r| r.password_force_english = enabled);
+}
+
+/// 在一组规则上设置指定进程的输入方案（`None` = 清除规则，回到跟随全局）。
+/// 值语义见 [`AppCompatRule::schema`]。
+pub fn set_schema(rules: &mut Vec<AppCompatRule>, process: &str, schema: Option<String>) {
+    upsert_rule(rules, process, |r| r.schema = schema);
 }
 
 /// 在一组规则上设置指定进程的智能符号替换方案（`None` = 清除规则，回到跟随全局）。
@@ -830,6 +911,15 @@ pub fn set_user_password_force_english(
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
     update_user_rule(user_dir, process, |r| r.password_force_english = enabled)
+}
+
+/// 设置用户层 compat.toml 中指定进程的输入方案（`None` = 清除规则）。
+pub fn set_user_schema(
+    user_dir: &Path,
+    process: &str,
+    schema: Option<String>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.schema = schema)
 }
 
 /// 设置用户层 compat.toml 中指定进程的候选窗定位方式（`None` = 清除规则，含坐标）。
@@ -1880,6 +1970,125 @@ mod tests {
             compat.get_rule("misreport.exe").is_none(),
             "只剩 process 的空壳规则应被剔除"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn parse_rules(toml: &str) -> AppCompat {
+        AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps)
+    }
+
+    /// `schema` 三态：未配 = 跟随全局；具体 id = 固定；`@remember` = 记住上次。
+    #[test]
+    fn parse_app_schema_fixed_and_remember() {
+        let compat = parse_rules(
+            r#"
+            [[apps]]
+            process = "code.exe"
+            schema = "english"
+
+            [[apps]]
+            process = "weixin.exe"
+            schema = "@remember"
+
+            [[apps]]
+            process = "plain.exe"
+            auto_pair = false
+            "#,
+        );
+        assert_eq!(
+            compat.get_rule("CODE.EXE").unwrap().app_schema(),
+            Some(AppSchema::Fixed("english"))
+        );
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().app_schema(),
+            Some(AppSchema::Remember)
+        );
+        assert_eq!(compat.get_rule("plain.exe").unwrap().schema, None);
+        assert_eq!(compat.get_rule("plain.exe").unwrap().app_schema(), None);
+    }
+
+    /// `@` 前缀是保留标记空间：只认 `@remember`，其余（拼错、将来的新标记）按未配置处理；
+    /// 空串同理。**同文件其它规则必须照常生效**。
+    #[test]
+    fn unknown_app_schema_marker_degrades_to_none() {
+        for bad in [r#""@remeber""#, r#""@global""#, r#""""#, r#""   ""#] {
+            let compat = parse_rules(&format!(
+                r#"
+                [[apps]]
+                process = "typo.exe"
+                schema = {bad}
+
+                [[apps]]
+                process = "other.exe"
+                auto_pair = false
+                "#
+            ));
+            assert_eq!(
+                compat.get_rule("typo.exe").and_then(|r| r.schema.clone()),
+                None,
+                "{bad}: 认不出 = 没配过"
+            );
+            assert_eq!(
+                compat.get_rule("other.exe").unwrap().auto_pair,
+                Some(false),
+                "{bad}: 同文件其它规则必须照常生效"
+            );
+        }
+    }
+
+    /// 类型写错（`schema = 1` / 数组）不得让整份 compat.toml 失效：`load_file` 没有段级降级。
+    #[test]
+    fn app_schema_wrong_type_does_not_sink_the_file() {
+        for bad in ["1", "true", r#"["pinyin"]"#] {
+            let text = format!(
+                r#"
+                [[apps]]
+                process = "typo.exe"
+                schema = {bad}
+
+                [[apps]]
+                process = "other.exe"
+                schema = "pinyin"
+                "#
+            );
+            let file = toml::from_str::<AppCompatFile>(&text)
+                .unwrap_or_else(|e| panic!("{bad}: 类型写错不得让整份失败：{e}"));
+            let compat = AppCompat::from_rules(file.apps);
+            assert_eq!(
+                compat.get_rule("typo.exe").and_then(|r| r.schema.clone()),
+                None
+            );
+            assert_eq!(
+                compat.get_rule("other.exe").unwrap().app_schema(),
+                Some(AppSchema::Fixed("pinyin"))
+            );
+        }
+    }
+
+    /// 写回稀疏 + 落盘往返：显式值落盘，清回「跟随全局」后整键消失、空壳规则剔除。
+    #[test]
+    fn set_user_app_schema_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wind_compat_schema_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_user_schema(&dir, "Weixin.exe", Some(APP_SCHEMA_REMEMBER.to_string())).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().app_schema(),
+            Some(AppSchema::Remember)
+        );
+
+        set_user_schema(&dir, "WEIXIN.EXE", Some("wubi86".to_string())).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().app_schema(),
+            Some(AppSchema::Fixed("wubi86"))
+        );
+
+        set_user_schema(&dir, "weixin.exe", None).unwrap();
+        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
+        assert!(!text.contains("schema"), "清除后不应残留该键: {text}");
+        let compat = AppCompat::load(None, Some(&dir));
+        assert!(compat.get_rule("weixin.exe").is_none(), "空壳规则应被剔除");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
