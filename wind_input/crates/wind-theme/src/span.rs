@@ -607,8 +607,102 @@ mod tests {
                     let tip = format!("tooltip_{n}");
                     assert!(t.palette.contains_key(&tip), "{name} dark={dark}: 缺 {tip}");
                 }
-                // 出厂节点不配角色：零变化的前提之一。
-                assert!(t.views.comment.roles.is_empty());
+            }
+        }
+    }
+
+    /// WCAG 相对亮度对比度。
+    fn contrast(a: Rgba, b: Rgba) -> f64 {
+        fn lum(c: Rgba) -> f64 {
+            let f = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+        }
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// `top` 按 alpha 叠在不透明的 `under` 上（清风系选中底是半透明的 `accent_soft`）。
+    fn over(top: Rgba, under: Rgba) -> Rgba {
+        let a = f64::from(top[3]) / 255.0;
+        let mix =
+            |i: usize| (f64::from(top[i]) * a + f64::from(under[i]) * (1.0 - a)).round() as u8;
+        [mix(0), mix(1), mix(2), 255]
+    }
+
+    /// ★ `_base` 的出厂角色色（§18）在**全部出厂主题** × 亮暗 × 注释常态 / 选中 / 悬停（气泡只有
+    /// 常态，段名里的变量另算一遍）下可读，按与渲染同一口径的 `span_color` 逐格求色：
+    /// - 注释 ≥ 3.5，且不低于它取代的注释正文色（`text_hint`，出厂白底上只有 2.96）。门槛低于
+    ///   WCAG AA 的 4.5 是有意的：`info` 在出厂选中底上最低 3.85，要 4.5 只能放弃选中态着色；
+    /// - 气泡按不透明底 ≥ 4.5（同 §5.4 的对比度表），半透明底叠在纯白桌面上的最坏情况 ≥ 3.5；
+    /// - 每个出厂角色都真的着了色（≠ 正文色）：角色表丢了一项、token 写错解析不出，都在这里红。
+    #[test]
+    fn factory_role_colors_are_readable() {
+        const COMMENT_ROLES: &[&str] = &["code_hint", "code_rev", "shuangpin"];
+        const TOOLTIP_ROLES: &[&str] = &[
+            "full_text",
+            "readings",
+            "word_code",
+            "code_source",
+            "chaizi",
+            "chaizi_code",
+            "unicode",
+        ];
+        for name in FACTORY {
+            for dark in [false, true] {
+                let t = factory(name, dark);
+                let v = &t.views;
+                let win = v.window.bg_color.unwrap_or(crate::fallback::WINDOW_BG);
+                let patch_bg = |p: &Option<Box<RvNode>>, what: &str| {
+                    let c = p
+                        .as_ref()
+                        .and_then(|n| n.bg_color)
+                        .unwrap_or_else(|| panic!("{name} dark={dark}: item.{what} 没有底色"));
+                    over(c, win)
+                };
+                for (state, bg) in [
+                    (Normal, win),
+                    (TextState::Selected, patch_bg(&v.item.selected, "selected")),
+                    (TextState::Hover, patch_bg(&v.item.hover, "hover")),
+                ] {
+                    let fb = crate::fallback::COMMENT_TEXT;
+                    let body = body_color(&v.comment, state, fb);
+                    for role in COMMENT_ROLES {
+                        let got =
+                            span_color(&t, &v.comment, false, state, fb, Some(role), false, None);
+                        let (r, base) = (contrast(got, bg), contrast(body, bg));
+                        assert_ne!(
+                            got, body,
+                            "{name} dark={dark} {state:?}: 注释 {role} 没着色"
+                        );
+                        assert!(
+                            r >= 3.5 && r >= base,
+                            "{name} dark={dark} {state:?}: 注释 {role} 对比度 {r:.2}（正文色 {base:.2}）"
+                        );
+                    }
+                }
+                let tip = v.tooltip.as_ref().expect("出厂主题都有 [tooltip]");
+                let raw_bg = tip.bg_color.unwrap_or(crate::fallback::TOOLTIP_BG);
+                let bg = [raw_bg[0], raw_bg[1], raw_bg[2], 255];
+                let white = over(raw_bg, [255, 255, 255, 255]);
+                let fb = t.color("tooltip_text", crate::fallback::TOOLTIP_TEXT);
+                for role in TOOLTIP_ROLES {
+                    for in_title in [false, true] {
+                        let got = span_color(&t, tip, true, Normal, fb, Some(role), in_title, None);
+                        let (r, worst) = (contrast(got, bg), contrast(got, white));
+                        assert_ne!(got, fb, "{name} dark={dark}: 气泡 {role} 没着色");
+                        assert!(
+                            r >= 4.5 && worst >= 3.5,
+                            "{name} dark={dark}: 气泡 {role}（段名里={in_title}）对比度 {r:.2}（叠白底 {worst:.2}）"
+                        );
+                    }
+                }
             }
         }
     }

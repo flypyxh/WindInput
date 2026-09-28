@@ -28,7 +28,7 @@ shadow = { light = "#0000000F", dark = "#0000001A" }
 
 # 标准色契约：候选注释 / 悬停提示模板的内联色 `$[名]{…}` 写这些名字即跟随主题与明暗，
 # 所有继承 _base 的主题都保证能解析（设计 text-span-colors.md §5.4，含取值依据与对比度）。
-# 不被任何出厂视图节点引用，外观零变化。
+# 出厂视图节点只在下方的 [comment.roles] / [tooltip.roles] 里引用它们（角色色）。
 # accent_text 两档都等于 accent：_base 没有「强调色不可读」要另调，只为让名字在所有主题里存在；
 # 清风系自带调好的值，照旧覆盖。
 accent_text = "${accent}"
@@ -129,6 +129,15 @@ margin = { left = 6 }
 color = "${text_hint}"
 font_size = -4
 
+# 文字角色色（设计 text-span-colors.md §18）：注释里的编码类变量用标准色「说明」，与候选字一眼分开。
+# 全部出厂主题都继承这里；info 在各出厂主题的窗口底 / 选中底 / 悬停底上都比 text_hint 易读。
+# 选中、悬停态不单列：状态没改注释正文色时角色色照常显示，改了则回落该状态正文色（§6.3 规则 3）。
+# 注释模板里写的内联色 $[…]{} 优先于这里；派生主题写 "" 可撤销某个角色。
+[comment.roles]
+code_hint = "${info}"
+code_rev = "${info}"
+shuangpin = "${info}"
+
 [footer_bar]
 font_size = -4
 margin = { left = 8 }
@@ -145,6 +154,18 @@ color = "${status_text}"
 [tooltip]
 background = "${tooltip_bg}"
 color = "${tooltip_text}"
+
+# 气泡的角色色。⚠ 这里的 ${token} 按字面解析、不做 tooltip_ 作用域查找（§6.2），故显式写
+# tooltip_*（为深色气泡底调过的那组）。段名里的变量（「编码(五笔)」的 code_source）同样取角色色；
+# 段名的字面文字（title）与 ${char}、调试、词库注释不配色，保持气泡文字色。
+[tooltip.roles]
+full_text = "${tooltip_accent_text}"
+readings = "${tooltip_accent_text}"
+word_code = "${tooltip_success}"
+code_source = "${tooltip_info}"
+chaizi = "${tooltip_warning}"
+chaizi_code = "${tooltip_info}"
+unicode = "${tooltip_error}"
 
 [toast]
 background = "${toast_bg}"

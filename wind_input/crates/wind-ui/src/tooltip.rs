@@ -1832,11 +1832,14 @@ mod tests {
         };
         let (_, _, _, log) = t.golden_frame(&Arc::new(doc));
         let accent = theme.palette["accent"];
+        let info = theme.palette["tooltip_info"];
         // 整块文字是 "[编码(五笔]\nhǎo"（样例段名只拼了「编码(」与「五笔」，没有右括号）：
-        // 装饰 `[` 与字面 `编码(` 同为 title 角色、合成一段；`五笔` 是段名里的变量，回落 title；
-        // 装饰 `]` 是 title；换行不着色；readings 用自有色。
+        // 装饰 `[` 与字面 `编码(` 同为 title 角色、合成一段；`五笔` 是段名里的变量，有自己的角色色
+        // （继承 `_base` 的 code_source = tooltip_info，§18）就不回落 title——回落 title 的分支由
+        // wind-theme `in_title_falls_back_to_title_role` 守；装饰 `]` 是 title；换行不着色；
+        // readings 用本主题自有色（压过 `_base` 的）。
         let want = format!(
-            "runs=[ColorRun {{ start: 0, end: 8, rgba: {accent:?} }}, ColorRun {{ start: 8, end: 14, rgba: {accent:?} }}, \
+            "runs=[ColorRun {{ start: 0, end: 8, rgba: {accent:?} }}, ColorRun {{ start: 8, end: 14, rgba: {info:?} }}, \
              ColorRun {{ start: 14, end: 15, rgba: {accent:?} }}, ColorRun {{ start: 16, end: 20, rgba: [154, 208, 255, 255] }}]"
         );
         assert!(log[0].contains(&want), "{}\n期望含 {want}", log[0]);
