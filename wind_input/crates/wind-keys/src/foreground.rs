@@ -83,6 +83,66 @@ fn foreground_window() -> Option<windows::Win32::Foundation::HWND> {
     }
 }
 
+/// 前台窗口的几何：它所在显示器的**工作区**，与它的**可见边框**（`(left, top, right, bottom)`，
+/// 物理像素，与 `GetWindowRect` 同一参照系）。供状态气泡的锚点定位用（C2-33 / GH#148）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForegroundGeometry {
+    /// 前台窗口所在显示器（`MonitorFromWindow`，`NEAREST`）的工作区。
+    pub work_area: (i32, i32, i32, i32),
+    /// 前台窗口的可见边框；最小化等拿不到有意义边框时为 `None`（调用方降级为屏幕锚点）。
+    pub frame: Option<(i32, i32, i32, i32)>,
+}
+
+/// 取前台窗口的几何。没有可判的前台窗口（桌面 / Shell）或查不到显示器时返回 `None`。
+///
+/// 边框取 `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`：Win10 起窗口四周有一圈
+/// 不可见的缩放边（约 7px 阴影区），`GetWindowRect` 把它算进去，锚点会贴不到看得见的边上；
+/// DWM 查询失败（合成关闭等）才退回 `GetWindowRect`。全是 user32/dwmapi 的本地调用，可以在
+/// UI 线程上同步调。
+#[cfg(windows)]
+pub fn foreground_window_geometry() -> Option<ForegroundGeometry> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic};
+    let hwnd = foreground_window()?;
+    unsafe {
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return None;
+        }
+        let wa = mi.rcWork;
+        let frame = if IsIconic(hwnd).as_bool() {
+            // 最小化窗口的矩形在 (-32000,-32000) 一带，拿它当锚点只会被夹到屏幕角上。
+            None
+        } else {
+            let mut r = RECT::default();
+            let dwm_ok = DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut r as *mut RECT as *mut core::ffi::c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_ok();
+            if dwm_ok || GetWindowRect(hwnd, &mut r).is_ok() {
+                Some((r.left, r.top, r.right, r.bottom))
+            } else {
+                None
+            }
+        };
+        Some(ForegroundGeometry {
+            work_area: (wa.left, wa.top, wa.right, wa.bottom),
+            frame,
+        })
+    }
+}
+
 /// `hwnd` 的矩形是否铺满 `m` 所描述的显示器 —— 判据②的**唯一实现**，两个调用点共用。
 ///
 /// ⛔ 别再在别处重写这个谓词：几何比较只是它的一半，下面两道守卫才是它能用的原因，

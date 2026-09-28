@@ -1596,6 +1596,11 @@ pub fn encode_tooltip_hide() -> Vec<u8> {
 }
 
 /// CmdStatusShow (0x050A): textLen+text + bgLen+bg + fgLen+fg + x:i32 + y:i32 + duration_ms:i32
+/// + anchor:i32（[`crate::protocol::status_anchor`]）。
+///
+/// `anchor` 是尾部追加段：旧 `.app` 读到 duration 就停，忽略它（锚点退化成按 x/y 摆）；
+/// 新 `.app` 读不到它时按 `NONE` 处理。两端互容，同 tooltip 的 `runs` 尾段。
+#[allow(clippy::too_many_arguments)]
 pub fn encode_status_show(
     text: &str,
     bg: &str,
@@ -1603,6 +1608,7 @@ pub fn encode_status_show(
     x: i32,
     y: i32,
     duration_ms: i32,
+    anchor: i32,
 ) -> Vec<u8> {
     let mut p = Vec::new();
     for s in [text, bg, fg] {
@@ -1611,6 +1617,7 @@ pub fn encode_status_show(
     p.extend_from_slice(&x.to_le_bytes());
     p.extend_from_slice(&y.to_le_bytes());
     p.extend_from_slice(&duration_ms.to_le_bytes());
+    p.extend_from_slice(&anchor.to_le_bytes());
     frame(CMD_STATUS_SHOW, p)
 }
 
@@ -1921,8 +1928,8 @@ mod darwin_push_tests {
     }
 
     #[test]
-    fn status_show_three_strings_then_three_i32() {
-        let f = encode_status_show("中 ，", "#111", "#eee", 50, 80, 1000);
+    fn status_show_three_strings_then_four_i32() {
+        let f = encode_status_show("中 ，", "#111", "#eee", 50, 80, 1000, 6);
         assert_eq!(cmd_of(&f), CMD_STATUS_SHOW);
         let p = &f[8..];
         let mut off = 0usize;
@@ -1940,6 +1947,12 @@ mod darwin_push_tests {
             i32::from_le_bytes(p[off + 8..off + 12].try_into().unwrap()),
             1000
         );
+        assert_eq!(
+            i32::from_le_bytes(p[off + 12..off + 16].try_into().unwrap()),
+            6,
+            "锚点编码是尾部追加段"
+        );
+        assert_eq!(off + 16, p.len());
     }
 
     #[test]

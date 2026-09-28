@@ -7199,18 +7199,24 @@ impl Coordinator {
             si.duration.max(1) as u64
         };
         // 位置模式 fixed:用固定屏幕坐标 custom_x/custom_y;否则跟随光标(caret + offset)。
-        let fixed = si.position_mode.eq_ignore_ascii_case("fixed");
+        let placement = if si.position_mode.eq_ignore_ascii_case("fixed") {
+            wind_ui_types::StatusTipPlacement::Fixed {
+                x: si.custom_x,
+                y: si.custom_y,
+            }
+        } else {
+            wind_ui_types::StatusTipPlacement::Caret {
+                offset_x: si.offset_x,
+                offset_y: si.offset_y,
+            }
+        };
         let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
             text: text.to_string(),
             x,
             y,
             caret_height,
-            offset_x: si.offset_x,
-            offset_y: si.offset_y,
             duration_ms,
-            fixed,
-            fixed_x: si.custom_x,
-            fixed_y: si.custom_y,
+            placement,
         });
         // 记录实际显示出去的文本，供 show_status 去重。临时提示（模式标记/主题名等）
         // 也记在这里：它们会覆盖掉旧的状态文本，从而使随后的同名状态气泡照常显示，

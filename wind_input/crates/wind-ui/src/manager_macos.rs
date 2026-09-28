@@ -15,11 +15,25 @@ use wind_bridge::HostRenderSink;
 use wind_bridge::shared_memory_posix::PosixSharedMemory;
 use wind_ipc::codec::*;
 use wind_ipc::protocol::*;
-use wind_ui_types::TooltipDoc;
+use wind_ui_types::{StatusTipAnchor, StatusTipPlacement, TooltipDoc};
 
 const SHM_MAX: usize = MAX_SHARED_RENDER_SIZE;
 
 /// 把 `Rgba` 编成 wire 用的 `#RRGGBBAA`（Swift `NSColor(windHex:)` 认 6/8 位）。
+/// 气泡锚点 → wire 编码（[`wind_ipc::protocol::status_anchor`]）。
+fn status_anchor_code(a: StatusTipAnchor) -> i32 {
+    use StatusTipAnchor as A;
+    match a {
+        A::ScreenCenter => status_anchor::SCREEN_CENTER,
+        A::ScreenTopLeft => status_anchor::SCREEN_TOP_LEFT,
+        A::ScreenTopRight => status_anchor::SCREEN_TOP_RIGHT,
+        A::ScreenBottomLeft => status_anchor::SCREEN_BOTTOM_LEFT,
+        A::ScreenBottomRight => status_anchor::SCREEN_BOTTOM_RIGHT,
+        A::WindowCenter => status_anchor::WINDOW_CENTER,
+        A::WindowBottomLeft => status_anchor::WINDOW_BOTTOM_LEFT,
+    }
+}
+
 fn hex(c: wind_theme::Rgba) -> String {
     format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3])
 }
@@ -294,20 +308,22 @@ impl Forwarder {
                 x,
                 y,
                 caret_height,
-                offset_x,
-                offset_y,
                 duration_ms,
-                fixed,
-                fixed_x,
-                fixed_y,
+                placement,
             } => {
-                // wire 仅传最终屏幕 (x,y)；fixed/offset 在此算定。
+                // wire 传屏幕 (x,y) + 锚点编码；跟随光标 / 固定坐标在此算定最终 (x,y)。
                 // 跟随光标时 y 是 caret 顶端，须 +caret_height 落到 caret 底端下方，否则气泡
                 // 贴在 caret 顶端盖住输入位（与候选窗 render_frame 的 y+caret_height 对齐）。
-                let (fx, fy) = if fixed {
-                    (fixed_x, fixed_y)
-                } else {
-                    (x + offset_x, y + offset_y + caret_height)
+                // 锚点由 `.app` 在焦点所在屏上落位（前台窗口 / 屏幕几何只有那边拿得到），
+                // 此时 (x,y) 只是选屏参考，照跟随光标的算法给出光标底端。
+                let (fx, fy, anchor) = match placement {
+                    StatusTipPlacement::Fixed { x: px, y: py } => (px, py, status_anchor::NONE),
+                    StatusTipPlacement::Caret { offset_x, offset_y } => (
+                        x + offset_x,
+                        y + offset_y + caret_height,
+                        status_anchor::NONE,
+                    ),
+                    StatusTipPlacement::Anchor(a) => (x, y + caret_height, status_anchor_code(a)),
                 };
                 self.sink.push_frame(&encode_status_show(
                     &text,
@@ -316,6 +332,7 @@ impl Forwarder {
                     fx,
                     fy,
                     duration_ms as i32,
+                    anchor,
                 ));
             }
             UiCommand::HideStatusTip => {
@@ -1206,12 +1223,8 @@ mod tests {
             x: 10,
             y: 20,
             caret_height: 18,
-            offset_x: 3,
-            offset_y: 4,
             duration_ms: 1000,
-            fixed: true,
-            fixed_x: 500,
-            fixed_y: 600,
+            placement: StatusTipPlacement::Fixed { x: 500, y: 600 },
         });
         let v = cap.lock().unwrap();
         let fr = v
@@ -1229,6 +1242,10 @@ mod tests {
             i32::from_le_bytes(fr[off + 4..off + 8].try_into().unwrap()),
             600
         ); // fixed_y
+        assert_eq!(
+            i32::from_le_bytes(fr[off + 12..off + 16].try_into().unwrap()),
+            status_anchor::NONE
+        );
     }
 
     #[test]
@@ -1240,12 +1257,11 @@ mod tests {
             x: 10,
             y: 20,
             caret_height: 0,
-            offset_x: 3,
-            offset_y: 4,
             duration_ms: 0,
-            fixed: false,
-            fixed_x: 0,
-            fixed_y: 0,
+            placement: StatusTipPlacement::Caret {
+                offset_x: 3,
+                offset_y: 4,
+            },
         });
         let v = cap.lock().unwrap();
         let fr = v
@@ -1259,6 +1275,36 @@ mod tests {
             i32::from_le_bytes(fr[off + 4..off + 8].try_into().unwrap()),
             24
         ); // 20+4
+    }
+
+    /// 锚点：编码随帧下发，(x,y) 是光标底端（选屏参考），不叠加用户偏移。
+    #[test]
+    fn status_tip_anchor_is_encoded() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t5a");
+        f.handle(UiCommand::ShowStatusTip {
+            text: "x".into(),
+            x: 10,
+            y: 20,
+            caret_height: 18,
+            duration_ms: 0,
+            placement: StatusTipPlacement::Anchor(StatusTipAnchor::WindowBottomLeft),
+        });
+        let v = cap.lock().unwrap();
+        let fr = v
+            .iter()
+            .find(|x| cmd_of(x) == wind_ipc::protocol::CMD_STATUS_SHOW)
+            .unwrap();
+        let off = 8 + 13;
+        assert_eq!(i32::from_le_bytes(fr[off..off + 4].try_into().unwrap()), 10);
+        assert_eq!(
+            i32::from_le_bytes(fr[off + 4..off + 8].try_into().unwrap()),
+            38
+        );
+        assert_eq!(
+            i32::from_le_bytes(fr[off + 12..off + 16].try_into().unwrap()),
+            status_anchor::WINDOW_BOTTOM_LEFT
+        );
     }
 
     #[test]

@@ -153,19 +153,14 @@ impl UiManager {
         // 而软键盘可能在那之后很久才第一次打开，不缓存就会永远停在内置默认配色。
         let mut last_theme: Option<wind_theme::Resolved> = None;
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
-        // 载荷：(text, x, y, caret_height, offset_x, offset_y)
-        // payload: (text, x, y, caret_h, off_x, off_y, duration_ms, fixed, fixed_x, fixed_y)
+        // 载荷：(text, x, y, caret_height, duration_ms, placement)
         let mut tip_debounce = crate::debounce::Debouncer::<(
             String,
             i32,
             i32,
             i32,
-            i32,
-            i32,
             u64,
-            bool,
-            i32,
-            i32,
+            wind_ui_types::StatusTipPlacement,
         )>::new(60);
         // 工具栏显隐迟滞闸门（两侧都有迟滞，理由不同，见 toolbar_gate 模块文档）。
         let mut toolbar_gate = crate::toolbar_gate::ToolbarGate::new();
@@ -328,7 +323,7 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll()
+            if let Some((text, x, y, ch, dur, placement)) = tip_debounce.poll()
                 && let Some(t) = &mut status_tip
             {
                 // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
@@ -340,11 +335,7 @@ impl UiManager {
                 {
                     use wind_bridge::shared_render_frame::FrameParams;
                     use wind_ipc::protocol::HOST_WINDOW_STATUS;
-                    let fo = if fixed {
-                        t.render_frame_fixed(&text, fx, fy, x, y)
-                    } else {
-                        t.render_frame(&text, x, y, ch, ox, oy)
-                    };
+                    let fo = t.render_frame_placed(&text, x, y, ch, placement);
                     if let Some((bgra, w, h, sx, sy, sw)) = fo {
                         let p = FrameParams {
                             sequence: 0,
@@ -374,10 +365,8 @@ impl UiManager {
                 if !host_ok {
                     if blocked_by_exclusive_fullscreen("status_tip") {
                         t.hide();
-                    } else if fixed {
-                        t.show_fixed(&text, fx, fy, x, y);
                     } else {
-                        t.show(&text, x, y, ch, ox, oy);
+                        t.show_placed(&text, x, y, ch, placement);
                     }
                 }
                 // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
@@ -771,27 +760,15 @@ impl UiManager {
                         x,
                         y,
                         caret_height,
-                        offset_x,
-                        offset_y,
                         duration_ms,
-                        fixed,
-                        fixed_x,
-                        fixed_y,
+                        placement,
                     } => {
-                        debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
+                        debug!(
+                            "UI: ShowStatusTip '{}' at ({},{}) {:?}",
+                            text, x, y, placement
+                        );
                         // 经防抖：合并快速连续提示，避免气泡闪烁
-                        tip_debounce.trigger((
-                            text,
-                            x,
-                            y,
-                            caret_height,
-                            offset_x,
-                            offset_y,
-                            duration_ms,
-                            fixed,
-                            fixed_x,
-                            fixed_y,
-                        ));
+                        tip_debounce.trigger((text, x, y, caret_height, duration_ms, placement));
                     }
                     UiCommand::HideStatusTip => {
                         // 取消待显示的防抖项 + 立即隐藏 + 清隐藏计时(常驻模式失焦)。
