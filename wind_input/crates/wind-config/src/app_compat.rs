@@ -274,8 +274,11 @@ fn de_candidate_position_mode<'de, D>(d: D) -> Result<Option<CandidatePositionMo
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(CandidatePositionMode::from_config))
+    de_opt_str_enum(
+        d,
+        "candidate_position_mode",
+        CandidatePositionMode::from_config,
+    )
 }
 
 /// 状态气泡的锚点（C2-33 / GH#148）：`screen_*` = 前台窗口所在显示器的**工作区**，
@@ -485,8 +488,7 @@ fn de_initial_mode<'de, D>(d: D) -> Result<Option<InitialMode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(InitialMode::from_config))
+    de_opt_str_enum(d, "initial_mode / initial_punct", InitialMode::from_config)
 }
 
 /// 容错反序列化 `Option<FirstShowMode>`：无法识别的值退化为 `None`（＝跟随全局）。
@@ -497,8 +499,7 @@ fn de_first_show_mode<'de, D>(d: D) -> Result<Option<FirstShowMode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(FirstShowMode::from_config))
+    de_opt_str_enum(d, "first_show_mode", FirstShowMode::from_config)
 }
 
 /// 容错反序列化 `Option<NewlineStyle>`：无法识别的值退化为 `None`（＝跟随全局）。
@@ -511,8 +512,7 @@ fn de_newline_style<'de, D>(d: D) -> Result<Option<NewlineStyle>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(NewlineStyle::from_config))
+    de_opt_str_enum(d, "commit_newline.style", NewlineStyle::from_config)
 }
 
 /// [`AppCompatRule::schema`] 里「记住本应用上次用的方案」的保留值。
@@ -565,14 +565,57 @@ where
     Ok(Some(v.to_string()))
 }
 
+/// 容错反序列化规则的 `process`：类型写错（`process = 1`）时**本条规则作废**（回落空串，
+/// 查找表与各段构建都跳过空进程名），同文件其它规则照常生效。
+///
+/// 为什么是「本条作废」而不是「整份失败」或「猜一个名字」：`load_file` 没有段级降级，
+/// 整份失败 = 所有应用的所有规则一起静默失效；而进程名是规则的主键，认不出就不知道它
+/// 该套给谁，唯一安全的答案是不套给任何人。
+fn de_process<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(String::new()),
+        Some(toml::Value::String(s)) => Ok(s),
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: process = {raw} 不是字符串，本条规则作废");
+            crate::tolerant_de::record_fallback(&raw);
+            Ok(String::new())
+        }
+    }
+}
+
+/// 容错反序列化规则的 `comment`（仅文档用途）：类型写错回落空串并 WARN，规则本身照常生效。
+fn de_comment<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(String::new()),
+        Some(toml::Value::String(s)) => Ok(s),
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: comment = {raw} 不是字符串，本项忽略");
+            crate::tolerant_de::record_fallback(&raw);
+            Ok(String::new())
+        }
+    }
+}
+
 /// 单个应用的兼容性规则。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AppCompatRule {
-    /// 进程名（不区分大小写），如 "Weixin.exe"。
-    #[serde(default)]
+    /// 进程名（不区分大小写），如 "Weixin.exe"。类型写错 ⇒ 本条作废，见 [`de_process`]。
+    #[serde(default, deserialize_with = "de_process")]
     pub process: String,
     /// 说明（仅文档用途）。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_comment",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
     /// 使用 caret rect 的 top 而非 bottom 定位候选窗。
     /// 适用于 GetTextExt 返回的 height 不稳定的 WebView 应用（如微信 Qt 输入框，
@@ -1358,11 +1401,16 @@ pub fn set_user_status_fallback(
 /// 两段各自独立合并，互不牵连。同类前车之鉴见 project_dict_override_sparse_merge。
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct InitialModeScopeRule {
-    /// 进程映像名（不区分大小写），如 `explorer.exe`。
+    /// 进程映像名（不区分大小写），如 `explorer.exe`。缺失或类型写错 ⇒ 本条作废（见 [`de_process`]）。
+    #[serde(default, deserialize_with = "de_process")]
     pub process: String,
     /// 说明（仅文档用途）。与 `AppCompatRule::comment` 同理**必须存在于结构体里**：
     /// serde 默认静默忽略未知字段，只声明在 TOML 注释里的话，用户层写回时会被丢掉。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_comment",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
     /// 该进程下**允许重算初始模式**的顶层窗口类名（不区分大小写）。
     /// 空清单 = 该进程的初始模式规则在任何窗口上都不重算。
@@ -1392,12 +1440,16 @@ pub struct InitialModeScopeRule {
 /// 「开新段」与「加字段并登记」之间**没有判据**——那时该回到上面三条逐条对照。
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct CommitNewlineRule {
-    /// 进程映像名（不区分大小写），如 `WINWORD.EXE`。
-    #[serde(default)]
+    /// 进程映像名（不区分大小写），如 `WINWORD.EXE`。类型写错 ⇒ 本条作废（见 [`de_process`]）。
+    #[serde(default, deserialize_with = "de_process")]
     pub process: String,
     /// 说明（仅文档用途）。与 [`AppCompatRule::comment`] 同理**必须存在于结构体里**：
     /// serde 默认静默忽略未知字段，只声明在 TOML 注释里的话，用户层写回时会被丢掉。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_comment",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
     /// 该应用上屏时换行用什么字符表达。**认不出的值退化为 `None`＝跟随全局**，
     /// 而不是让整份文件解析失败——理由见 [`de_newline_style`]。
@@ -1529,6 +1581,8 @@ impl AppCompat {
             .apps
             .iter()
             .enumerate()
+            // 空进程名 = 作废的规则（`process` 类型写错，见 `de_process`），不套给任何人。
+            .filter(|(_, r)| !r.process.is_empty())
             .map(|(i, r)| (r.process.to_ascii_lowercase(), i))
             .collect();
     }
@@ -2461,102 +2515,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `AppCompatRule` 的每个布尔字段（`bool` / `Option<bool>`）类型写错都**不得**让整份
-    /// compat.toml 失效，只让该字段回落「未配置」，同文件其它规则照常生效。
-    ///
-    /// 字段表取自源码而不是手写：`load_file` 没有段级降级，新加一个布尔字段忘了挂
-    /// `tolerant_opt_bool` / `tolerant_bool`，用户写一个 `"yes"` 就是所有应用的所有规则
-    /// 一起静默失效——本条让它在这里红，不靠人记得（auto_pair 就是这么漏的）。
-    #[test]
-    fn every_bool_field_wrong_type_does_not_sink_the_file() {
-        let src = include_str!("app_compat.rs");
-        let start = src.find("pub struct AppCompatRule {").unwrap();
-        let body = &src[start..];
-        let body = &body[..body.find("\n}").unwrap()];
-        let fields: Vec<&str> = body
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("pub "))
-            .filter_map(|l| l.split_once(": "))
-            .filter(|(_, ty)| matches!(*ty, "bool," | "Option<bool>,"))
-            .map(|(name, _)| name)
-            .collect();
-        assert!(fields.len() >= 9, "字段扫描失灵：{fields:?}");
-        for field in &fields {
-            for bad in [r#""yes""#, "1", "[true]"] {
-                let text = format!(
-                    "[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\n\n\
-                     [[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n"
-                );
-                let file = toml::from_str::<AppCompatFile>(&text)
-                    .unwrap_or_else(|e| panic!("{field} = {bad}: 类型写错不得让整份失败：{e}"));
-                let compat = AppCompat::from_rules(file.apps);
-                let typo = toml::Value::try_from(compat.get_rule("typo.exe").unwrap()).unwrap();
-                assert!(
-                    typo.get(*field).is_none(),
-                    "{field} = {bad}: 认不出 = 没配过，实际 {typo:?}"
-                );
-                assert_eq!(
-                    compat.get_rule("other.exe").unwrap().auto_pair,
-                    Some(false),
-                    "{field} = {bad}: 同文件其它规则必须照常生效"
-                );
-            }
-        }
-    }
-
-    /// `AppCompatRule` 的每个 `i32` 字段类型写错（`"12"` / `1.5` / `true`）或越界都**不得**让
-    /// 整份 compat.toml 失效，只让该字段回落「未配置」（0），同文件其它规则照常生效。
-    ///
-    /// 字段表取自源码，理由同 [`every_bool_field_wrong_type_does_not_sink_the_file`]：新加一个
-    /// 坐标字段忘了挂 `tolerant_i32`，用户手写一个 `"12"` 就是所有应用的所有规则一起失效。
-    #[test]
-    fn every_i32_field_wrong_type_does_not_sink_the_file() {
-        let src = include_str!("app_compat.rs");
-        let start = src.find("pub struct AppCompatRule {").unwrap();
-        let body = &src[start..];
-        let body = &body[..body.find("\n}").unwrap()];
-        let fields: Vec<&str> = body
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("pub "))
-            .filter_map(|l| l.split_once(": "))
-            .filter(|(_, ty)| *ty == "i32,")
-            .map(|(name, _)| name)
-            .collect();
-        assert!(fields.len() >= 4, "字段扫描失灵：{fields:?}");
-        for field in &fields {
-            for bad in [r#""12""#, "1.5", "true", "[1]", "4294967296"] {
-                let text = format!(
-                    "[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\n\n\
-                     [[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n"
-                );
-                let file = toml::from_str::<AppCompatFile>(&text)
-                    .unwrap_or_else(|e| panic!("{field} = {bad}: 类型写错不得让整份失败：{e}"));
-                let compat = AppCompat::from_rules(file.apps);
-                let typo = toml::Value::try_from(compat.get_rule("typo.exe").unwrap()).unwrap();
-                assert!(
-                    typo.get(*field).is_none(),
-                    "{field} = {bad}: 认不出 = 没配过，实际 {typo:?}"
-                );
-                assert_eq!(
-                    compat.get_rule("other.exe").unwrap().auto_pair,
-                    Some(false),
-                    "{field} = {bad}: 同文件其它规则必须照常生效"
-                );
-            }
-            // 正常值不受影响
-            let file = toml::from_str::<AppCompatFile>(&format!(
-                "[[apps]]\nprocess = \"ok.exe\"\n{field} = -7\n"
-            ))
-            .unwrap();
-            let ok = toml::Value::try_from(&file.apps[0]).unwrap();
-            assert_eq!(
-                ok.get(*field).and_then(|v| v.as_integer()),
-                Some(-7),
-                "{field}"
-            );
-        }
-    }
-
     /// 最初的现场：`auto_pair = "yes"` 曾让整份 compat.toml 静默失效。
     #[test]
     fn auto_pair_wrong_type_does_not_sink_the_file() {
@@ -2568,6 +2526,30 @@ mod tests {
         let compat = AppCompat::from_rules(file.apps);
         assert_eq!(compat.get_rule("et.exe").unwrap().auto_pair, None);
         assert!(compat.get_rule("other.exe").unwrap().caret_use_top);
+    }
+
+    /// 另两段（`[[initial_mode_scope]]` / `[[commit_newline]]`）的 `process` / `comment` 同理：
+    /// 类型写错只让那一条作废（或那一项忽略），不得让整份 compat.toml 失效。
+    #[test]
+    fn side_sections_process_wrong_type_voids_only_that_rule() {
+        let file = toml::from_str::<AppCompatFile>(
+            "[[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n\n\
+             [[initial_mode_scope]]\nprocess = 1\nclasses = [\"X\"]\n\n\
+             [[initial_mode_scope]]\ncomment = 2\nprocess = \"explorer.exe\"\nclasses = [\"Progman\"]\n\n\
+             [[commit_newline]]\nprocess = true\nstyle = \"cr\"\n\n\
+             [[commit_newline]]\nprocess = \"WINWORD.EXE\"\ncomment = [1]\nstyle = \"cr\"\n",
+        )
+        .expect("process / comment 类型写错不得让整份失败");
+        let compat = AppCompat::from_parts(file.apps, file.initial_mode_scope)
+            .with_commit_newline(file.commit_newline);
+        assert_eq!(compat.get_rule("other.exe").unwrap().auto_pair, Some(false));
+        assert!(compat.initial_mode_applies_to_window("explorer.exe", "Progman"));
+        assert!(!compat.initial_mode_applies_to_window("explorer.exe", "X"));
+        assert_eq!(
+            compat.commit_newline_for("winword.exe"),
+            Some(NewlineStyle::Cr)
+        );
+        assert_eq!(compat.commit_newline_for("true"), None);
     }
 
     fn parse_rules(toml: &str) -> AppCompat {

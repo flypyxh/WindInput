@@ -23,6 +23,8 @@
 //! # 只治「字符串写错」，不治「类型写错」
 //!
 //! `text_orientation = 3` 这类**类型**错误照旧返回 `Err`，交给段级降级处理。
+//! 例外是只服务 `compat.toml` 的几个函数（`tolerant_opt` / `tolerant_opt_bool` /
+//! `tolerant_bool` / `tolerant_i32`）：那个载体没有段级降级，类型错也只能在字段上吞。
 //! 分工清晰：值域层只回答「这个字符串在不在值域里」，把它扩张成「什么都吞」会连
 //! 真正的配置结构错误一起掩盖掉。
 
@@ -109,13 +111,26 @@ where
 /// `Some(T::default())` 就等于**替用户显式配了一个默认档**——per-app 覆盖凭空长出来，
 /// 用户改全局默认时这些应用不跟着变，且他从没配过、无从撤销。
 /// 见 `AppCompatRule::first_show_mode` 的字段文档。
+///
+/// ⚠️ 与 [`tolerant`] 不同，本函数**连类型错也吞**（`smart_method = true` 回落 `None`
+/// 并 WARN）：它只用在 `compat.toml` 上，那里没有段级降级可交，理由同 [`tolerant_opt_bool`]。
 pub fn tolerant_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    let Some(raw) = Option::<String>::deserialize(d)? else {
-        return Ok(None);
+    let raw = match Option::<toml::Value>::deserialize(d)? {
+        None => return Ok(None),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => {
+            let raw = other.to_string();
+            warn!(
+                "配置值 {raw} 不是字符串（{}），本项按「未设置」处理",
+                std::any::type_name::<T>()
+            );
+            record_fallback(&raw);
+            return Ok(None);
+        }
     };
     let sd: StrDeserializer<'_, D::Error> = raw.as_str().into_deserializer();
     match T::deserialize(sd) {
@@ -133,8 +148,8 @@ where
 
 /// 容错反序列化 `Option<bool>`：非布尔值（`"yes"`、`1`）回落 **`None`** 并 WARN。
 ///
-/// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**唯一例外**（连同其裸 `bool` 版
-/// [`tolerant_bool`]、整数版 [`tolerant_i32`]），只给没有段级降级的载体用（`compat.toml`：
+/// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**例外**（连同其裸 `bool` 版
+/// [`tolerant_bool`]、整数版 [`tolerant_i32`]、[`tolerant_opt`]），只给没有段级降级的载体用（`compat.toml`：
 /// `load_file` 解析失败即整份丢弃）。在那里，类型错并没有下一层兜底可交——不在字段上吞掉，就是所有应用的所有
 /// 规则一起静默失效。
 /// 回落 `None` 而非 `Some(false)`，理由同 [`tolerant_opt`]：认不出 = 没配过。
@@ -240,6 +255,16 @@ mod tests {
     #[test]
     fn wrong_type_still_errors() {
         assert!(toml::from_str::<Holder>("v = 3").is_err());
+    }
+
+    /// `Option` 版只服务 compat.toml（无段级降级），类型错也回落 `None`，不得整份失败。
+    #[test]
+    fn option_version_swallows_wrong_type() {
+        for bad in ["3", "true", "[\"upright\"]", "{ a = 1 }"] {
+            let h: OptHolder = toml::from_str(&format!("v = {bad}"))
+                .unwrap_or_else(|e| panic!("v = {bad} 不得整份失败：{e}"));
+            assert_eq!(h.v, None, "v = {bad}");
+        }
     }
 
     #[derive(Debug, Deserialize, PartialEq)]
