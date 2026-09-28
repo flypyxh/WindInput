@@ -1305,6 +1305,31 @@ mod tests {
         );
     }
 
+    /// L1↔L2 同源：全局注释模板（横竖两份）。`default_comment_template()` 与
+    /// `data/config.toml` 是同一个出厂事实的两份写法，分叉的表现是「删掉配置文件后注释栏变了样」。
+    #[test]
+    fn comment_template_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.candidate;
+        let cand = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("candidate"))
+            .cloned()
+            .expect("data/config.toml 缺少 [ui.candidate]");
+        for (k, v) in [
+            ("comment_template_vertical", &l1.comment_template_vertical),
+            (
+                "comment_template_horizontal",
+                &l1.comment_template_horizontal,
+            ),
+        ] {
+            assert_eq!(
+                cand.get(k).and_then(toml::Value::as_str),
+                Some(v.as_str()),
+                "ui.candidate.{k} 的 L1 默认值与 L2 出厂文件不一致"
+            );
+        }
+    }
+
     /// L1↔L2 同源：气泡的单行上限与折行宽度（取值守门在 config.rs `test_tooltip_defaults`，
     /// 行为守门在协调器 `tooltip` 模块的出厂配置用例）。
     #[test]
