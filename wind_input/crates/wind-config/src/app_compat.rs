@@ -278,6 +278,204 @@ where
     Ok(raw.as_deref().and_then(CandidatePositionMode::from_config))
 }
 
+/// 状态气泡的锚点（C2-33 / GH#148）：`screen_*` = 前台窗口所在显示器的**工作区**，
+/// `window_*` = 前台窗口的可见边框。几何换算在 UI 层（wind-ui 的 `anchor_origin`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAnchor {
+    ScreenCenter,
+    ScreenTopLeft,
+    ScreenTopRight,
+    ScreenBottomLeft,
+    ScreenBottomRight,
+    WindowCenter,
+    WindowBottomLeft,
+}
+
+impl StatusAnchor {
+    /// 全部锚点，顺序即菜单顺序。
+    pub const ALL: [StatusAnchor; 7] = [
+        Self::ScreenCenter,
+        Self::ScreenTopLeft,
+        Self::ScreenTopRight,
+        Self::ScreenBottomLeft,
+        Self::ScreenBottomRight,
+        Self::WindowCenter,
+        Self::WindowBottomLeft,
+    ];
+
+    /// 枚举 → 配置串。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::ScreenCenter => "screen_center",
+            Self::ScreenTopLeft => "screen_top_left",
+            Self::ScreenTopRight => "screen_top_right",
+            Self::ScreenBottomLeft => "screen_bottom_left",
+            Self::ScreenBottomRight => "screen_bottom_right",
+            Self::WindowCenter => "window_center",
+            Self::WindowBottomLeft => "window_bottom_left",
+        }
+    }
+
+    /// 配置串 → 枚举；认不出返回 `None`。查的是 [`Self::ALL`] + [`Self::as_config`]，值域只有一份。
+    pub fn from_config(s: &str) -> Option<Self> {
+        let s = s.trim();
+        Self::ALL
+            .into_iter()
+            .find(|a| a.as_config().eq_ignore_ascii_case(s))
+    }
+}
+
+/// 状态气泡定位方式：全局 `ui.status.position_mode` 与按应用 `status_position_mode` 共用取值
+/// （见 [`STATUS_POSITION_MODES`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPositionMode {
+    /// 跟随光标（出厂默认）。光标坐标不可信时按 [`StatusFallback`] 兜底。
+    FollowCaret,
+    /// 固定屏幕坐标（全局 `custom_x/y`；按应用 `status_x/y`）。
+    Fixed,
+    /// 固定在某个锚点，不读光标。
+    Anchor(StatusAnchor),
+}
+
+/// [`StatusPositionMode`] 的全部配置串，同时是配置注册表 `ui.status.position_mode` 的值域。
+pub const STATUS_POSITION_MODES: [&str; 9] = [
+    "follow_caret",
+    "fixed",
+    "screen_center",
+    "screen_top_left",
+    "screen_top_right",
+    "screen_bottom_left",
+    "screen_bottom_right",
+    "window_center",
+    "window_bottom_left",
+];
+
+impl StatusPositionMode {
+    /// 配置串 → 枚举；认不出返回 `None`（调用方回落：全局取出厂默认，按应用取跟随全局）。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "follow_caret" => Some(Self::FollowCaret),
+            "fixed" => Some(Self::Fixed),
+            other => StatusAnchor::from_config(other).map(Self::Anchor),
+        }
+    }
+    /// 枚举 → 配置串。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::FollowCaret => "follow_caret",
+            Self::Fixed => "fixed",
+            Self::Anchor(a) => a.as_config(),
+        }
+    }
+}
+
+/// 状态气泡的兜底位置：只在 `follow_caret` 且光标坐标不可信时生效。全局
+/// `ui.status.fallback_position` 与按应用 `status_fallback_position` 共用取值
+/// （见 [`STATUS_FALLBACK_POSITIONS`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFallback {
+    /// 最近一次有效坐标（出厂默认 = 本功能引入前的行为）。
+    Last,
+    /// 不显示。
+    Hide,
+    /// 显示在锚点。
+    Anchor(StatusAnchor),
+}
+
+/// [`StatusFallback`] 的全部配置串，同时是配置注册表 `ui.status.fallback_position` 的值域。
+pub const STATUS_FALLBACK_POSITIONS: [&str; 9] = [
+    "last",
+    "hide",
+    "screen_center",
+    "screen_top_left",
+    "screen_top_right",
+    "screen_bottom_left",
+    "screen_bottom_right",
+    "window_center",
+    "window_bottom_left",
+];
+
+impl StatusFallback {
+    /// 配置串 → 枚举；认不出返回 `None`。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "last" => Some(Self::Last),
+            "hide" => Some(Self::Hide),
+            other => StatusAnchor::from_config(other).map(Self::Anchor),
+        }
+    }
+    /// 枚举 → 配置串。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Last => "last",
+            Self::Hide => "hide",
+            Self::Anchor(a) => a.as_config(),
+        }
+    }
+}
+
+// 两个带载荷的枚举在 compat.toml 里都是**扁平字符串**（`"screen_center"`），derive 表达不了，
+// 故手写：序列化走 `as_config`，反序列化走下面的容错函数（不实现 `Deserialize`，免得有人
+// 绕过容错直接 derive 进别的结构）。
+impl Serialize for StatusPositionMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_config())
+    }
+}
+
+impl Serialize for StatusFallback {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_config())
+    }
+}
+
+/// compat.toml 字符串枚举字段的通用容错：类型写错（非字符串）或值域外的字符串一律回落
+/// `None`（= 跟随全局）并 WARN、记入回落清单。理由同 [`de_initial_mode`]；与它不同的是
+/// **类型错也吞**（同 [`de_app_schema`]）：`load_file` 没有段级降级。
+fn de_opt_str_enum<'de, D, T>(
+    d: D,
+    field: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = match Option::<toml::Value>::deserialize(d)? {
+        None => return Ok(None),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: {field} = {raw} 不是字符串，本项按「跟随全局」处理");
+            crate::tolerant_de::record_fallback(&raw);
+            return Ok(None);
+        }
+    };
+    match parse(&raw) {
+        Some(v) => Ok(Some(v)),
+        None => {
+            tracing::warn!(
+                "compat.toml: {field} = \"{raw}\" 不在取值范围内，本项按「跟随全局」处理"
+            );
+            crate::tolerant_de::record_fallback(&raw);
+            Ok(None)
+        }
+    }
+}
+
+fn de_status_position_mode<'de, D>(d: D) -> Result<Option<StatusPositionMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_opt_str_enum(d, "status_position_mode", StatusPositionMode::from_config)
+}
+
+fn de_status_fallback<'de, D>(d: D) -> Result<Option<StatusFallback>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_opt_str_enum(d, "status_fallback_position", StatusFallback::from_config)
+}
+
 /// 容错反序列化 `Option<InitialMode>`：无法识别的值退化为 `None`（＝不干预）。
 ///
 /// ⚠ 不能直接 `#[derive(Deserialize)]` 让 serde 自己认字符串：`load_file` 解析失败时
@@ -629,6 +827,41 @@ pub struct AppCompatRule {
         skip_serializing_if = "is_zero_i32"
     )]
     pub candidate_y: i32,
+    /// 该应用的状态气泡定位方式；`None` = 跟随全局 `ui.status.position_mode`（C2-33 / GH#148）。
+    ///
+    /// 与 [`Self::candidate_position_mode`] 同构：必须是 `Option`（「没配过」与「显式配了
+    /// follow_caret」要能区分），且坐标 [`Self::status_x`]/[`Self::status_y`] 与它**同层取**
+    /// ——规则配了定位方式就用规则自己的那份坐标，没配才整套回落全局。用户偏好 ⇒ **不进**
+    /// [`ProtocolFields`]。消费点在协调器 `status_position`。
+    #[serde(
+        default,
+        deserialize_with = "de_status_position_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status_position_mode: Option<StatusPositionMode>,
+    /// `fixed` 下该应用自己的状态气泡落点 X（内容左上屏幕坐标，物理像素）。`(0,0)` = 已开固定
+    /// 但还没摆过，由 UI 落到光标所在屏——与全局 `ui.status.custom_x/y` 同一套哨兵约定。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
+    pub status_x: i32,
+    /// `fixed` 下该应用自己的状态气泡落点 Y。语义见 [`Self::status_x`]。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
+    pub status_y: i32,
+    /// 该应用光标坐标不可信时状态气泡的兜底位置；`None` = 跟随全局 `ui.status.fallback_position`。
+    /// 只在（规则或全局解析出的）定位方式为 `follow_caret` 时生效。
+    #[serde(
+        default,
+        deserialize_with = "de_status_fallback",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status_fallback_position: Option<StatusFallback>,
     /// 忽略该宿主「关闭输入法」的请求（写 OPENCLOSE / CONVERSION compartment 关 IME）。
     ///
     /// 背景：WinForms 的 `ImeMode.Disable`、WPF 的 `InputMethod.IsInputMethodEnabled=False`
@@ -842,6 +1075,40 @@ pub fn set_caret_offset(rules: &mut Vec<AppCompatRule>, process: &str, dx: i32, 
     });
 }
 
+/// 在一组规则上设置指定进程的状态气泡定位（**方式与坐标一起写**；`None` = 清除，回到跟随
+/// 全局，坐标一并清零——理由同 [`set_candidate_position_mode`]）。
+pub fn set_status_position(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    mode: Option<StatusPositionMode>,
+    x: i32,
+    y: i32,
+) {
+    upsert_rule(rules, process, |r| apply_status_position(r, mode, x, y));
+}
+
+/// 在一组规则上设置指定进程的状态气泡兜底位置（`None` = 清除，回到跟随全局）。
+pub fn set_status_fallback(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    fallback: Option<StatusFallback>,
+) {
+    upsert_rule(rules, process, |r| r.status_fallback_position = fallback);
+}
+
+/// 定位方式与坐标的同层写入：清除方式时坐标归零；非 `fixed` 方式不用坐标，也归零，
+/// 免得留一对孤儿坐标、下次开固定跳到老位置。
+fn apply_status_position(r: &mut AppCompatRule, mode: Option<StatusPositionMode>, x: i32, y: i32) {
+    r.status_position_mode = mode;
+    let (x, y) = if mode == Some(StatusPositionMode::Fixed) {
+        (x, y)
+    } else {
+        (0, 0)
+    };
+    r.status_x = x;
+    r.status_y = y;
+}
+
 /// 一条规则是否「什么都没覆盖」——序列化后除 `process` 外不剩任何键。
 ///
 /// ⚠ 判据走序列化而**不是**逐字段比较：本结构的可选字段全带 `skip_serializing_if`，
@@ -1040,6 +1307,30 @@ pub fn set_user_caret_offset(
         r.caret_offset_x = dx;
         r.caret_offset_y = dy;
     })
+}
+
+/// 设置用户层 compat.toml 中指定进程的状态气泡定位：**方式与坐标一起写**（理由同
+/// [`set_user_candidate_fixed_pos`]：本字段不进 [`ProtocolFields`]，只写坐标会让用户层规则
+/// 整条盖掉出厂那档定位方式）。`None` = 清除（坐标一并清零）。
+///
+/// ⚠ `fixed` 的坐标由调用方先做 `(0,0)` 哨兵规避（协调器的 `avoid_unset_sentinel`）。
+pub fn set_user_status_position(
+    user_dir: &Path,
+    process: &str,
+    mode: Option<StatusPositionMode>,
+    x: i32,
+    y: i32,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| apply_status_position(r, mode, x, y))
+}
+
+/// 设置用户层 compat.toml 中指定进程的状态气泡兜底位置（`None` = 清除规则）。
+pub fn set_user_status_fallback(
+    user_dir: &Path,
+    process: &str,
+    fallback: Option<StatusFallback>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.status_fallback_position = fallback)
 }
 
 /// 「初始模式作用域」规则：某进程的 per-app **初始模式**只在哪些**窗口类**上重算。
@@ -2016,6 +2307,155 @@ mod tests {
         let compat = AppCompat::load(None, Some(&dir));
         assert!(
             compat.get_rule("misreport.exe").is_none(),
+            "只剩 process 的空壳规则应被剔除"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 状态气泡定位（C2-33 / GH#148）────────────────────────────────────────────
+
+    /// 两个值域表与解析/回写同源：表里每一项都能解析、且回写成同一个串。
+    #[test]
+    fn status_value_tables_roundtrip() {
+        for v in STATUS_POSITION_MODES {
+            let m = StatusPositionMode::from_config(v).unwrap_or_else(|| panic!("{v}"));
+            assert_eq!(m.as_config(), v);
+        }
+        for v in STATUS_FALLBACK_POSITIONS {
+            let f = StatusFallback::from_config(v).unwrap_or_else(|| panic!("{v}"));
+            assert_eq!(f.as_config(), v);
+        }
+        for a in StatusAnchor::ALL {
+            assert!(STATUS_POSITION_MODES.contains(&a.as_config()));
+            assert!(STATUS_FALLBACK_POSITIONS.contains(&a.as_config()));
+        }
+        // 两张表只有前两档不同：定位方式没有 last/hide，兜底没有 follow_caret/fixed。
+        assert_eq!(StatusPositionMode::from_config("last"), None);
+        assert_eq!(StatusFallback::from_config("fixed"), None);
+    }
+
+    #[test]
+    fn status_rule_fields_parse() {
+        let c = parse_rules(
+            "[[apps]]\nprocess = \"ai.exe\"\nstatus_position_mode = \"window_bottom_left\"\n\
+             status_fallback_position = \"screen_top_right\"\n\n\
+             [[apps]]\nprocess = \"fx.exe\"\nstatus_position_mode = \"fixed\"\n\
+             status_x = 120\nstatus_y = -40\n",
+        );
+        let ai = c.get_rule("ai.exe").unwrap();
+        assert_eq!(
+            ai.status_position_mode,
+            Some(StatusPositionMode::Anchor(StatusAnchor::WindowBottomLeft))
+        );
+        assert_eq!(
+            ai.status_fallback_position,
+            Some(StatusFallback::Anchor(StatusAnchor::ScreenTopRight))
+        );
+        let fx = c.get_rule("fx.exe").unwrap();
+        assert_eq!(fx.status_position_mode, Some(StatusPositionMode::Fixed));
+        assert_eq!((fx.status_x, fx.status_y), (120, -40));
+        assert_eq!(fx.status_fallback_position, None);
+    }
+
+    /// 锚点拼错 / fallback 拼错 / 类型写错：只让该项回落「跟随全局」，同条规则的其它字段与
+    /// 同文件其它规则照常生效。
+    #[test]
+    fn status_rule_typos_only_drop_that_field() {
+        for (field, bad) in [
+            ("status_position_mode", r#""screen_centre""#),
+            ("status_position_mode", "3"),
+            ("status_position_mode", r#""last""#),
+            ("status_fallback_position", r#""hidden""#),
+            ("status_fallback_position", "true"),
+            ("status_fallback_position", r#""fixed""#),
+        ] {
+            let text = format!(
+                "[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\nstatus_x = 5\n\
+                 initial_mode = \"english\"\n\n\
+                 [[apps]]\nprocess = \"other.exe\"\nstatus_position_mode = \"screen_center\"\n"
+            );
+            let file = toml::from_str::<AppCompatFile>(&text)
+                .unwrap_or_else(|e| panic!("{field} = {bad}: 不得整份失败：{e}"));
+            let c = AppCompat::from_rules(file.apps);
+            let typo = c.get_rule("typo.exe").unwrap();
+            assert_eq!(typo.status_position_mode, None, "{field} = {bad}");
+            assert_eq!(typo.status_fallback_position, None, "{field} = {bad}");
+            assert_eq!(typo.status_x, 5, "{field} = {bad}: 同条其它字段照常");
+            assert_eq!(typo.initial_mode, Some(InitialMode::English));
+            assert_eq!(
+                c.get_rule("other.exe").unwrap().status_position_mode,
+                Some(StatusPositionMode::Anchor(StatusAnchor::ScreenCenter)),
+                "{field} = {bad}: 同文件其它规则必须照常生效"
+            );
+        }
+    }
+
+    /// 方式与坐标同层写：固定写坐标；改成别的方式或清除时坐标归零（不留孤儿坐标）。
+    #[test]
+    fn status_position_writes_mode_and_coords_together() {
+        let mut rules = Vec::new();
+        set_status_position(
+            &mut rules,
+            "a.exe",
+            Some(StatusPositionMode::Fixed),
+            300,
+            200,
+        );
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(out.contains(r#"status_position_mode = "fixed""#), "{out}");
+        assert!(
+            out.contains("status_x = 300") && out.contains("status_y = 200"),
+            "{out}"
+        );
+
+        let anchor = StatusPositionMode::Anchor(StatusAnchor::ScreenBottomRight);
+        set_status_position(&mut rules, "A.EXE", Some(anchor), 999, 999);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].status_position_mode, Some(anchor));
+        assert_eq!((rules[0].status_x, rules[0].status_y), (0, 0));
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(
+            out.contains(r#"status_position_mode = "screen_bottom_right""#),
+            "{out}"
+        );
+
+        set_status_fallback(&mut rules, "a.exe", Some(StatusFallback::Hide));
+        set_status_position(&mut rules, "a.exe", None, 1, 1);
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(!out.contains("status_position_mode"), "{out}");
+        assert!(!out.contains("status_x"), "{out}");
+        assert!(
+            out.contains(r#"status_fallback_position = "hide""#),
+            "{out}"
+        );
+    }
+
+    /// 落盘包装往返：写入后读得回；两项都清回跟随全局后空壳规则被剔除。
+    #[test]
+    fn set_user_status_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wind_compat_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_user_status_position(&dir, "ai.exe", Some(StatusPositionMode::Fixed), 10, 20).unwrap();
+        set_user_status_fallback(
+            &dir,
+            "ai.exe",
+            Some(StatusFallback::Anchor(StatusAnchor::WindowCenter)),
+        )
+        .unwrap();
+        let c = AppCompat::load(None, Some(&dir));
+        let r = c.get_rule("ai.exe").unwrap();
+        assert_eq!(r.status_position_mode, Some(StatusPositionMode::Fixed));
+        assert_eq!((r.status_x, r.status_y), (10, 20));
+        assert_eq!(
+            r.status_fallback_position,
+            Some(StatusFallback::Anchor(StatusAnchor::WindowCenter))
+        );
+
+        set_user_status_position(&dir, "ai.exe", None, 0, 0).unwrap();
+        set_user_status_fallback(&dir, "ai.exe", None).unwrap();
+        let c = AppCompat::load(None, Some(&dir));
+        assert!(
+            c.get_rule("ai.exe").is_none(),
             "只剩 process 的空壳规则应被剔除"
         );
         let _ = std::fs::remove_dir_all(&dir);

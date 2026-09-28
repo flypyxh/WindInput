@@ -5709,9 +5709,18 @@ pub struct StatusIndicatorConfig {
     /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
     #[serde(default = "default_schema_name_style")]
     pub schema_name_style: String,
-    /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）。
+    /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）|
+    /// 锚点 `screen_center` / `screen_top_left` / `screen_top_right` / `screen_bottom_left` /
+    /// `screen_bottom_right`（前台窗口所在显示器工作区）、`window_center` / `window_bottom_left`
+    /// （前台窗口可见边框）。值域 = [`crate::app_compat::STATUS_POSITION_MODES`]；读取请走
+    /// [`Self::position`]（写错回落跟随光标）。
     #[serde(default = "default_status_position_mode")]
     pub position_mode: String,
+    /// 光标坐标不可信时的兜底位置（只在 follow_caret 下生效）："last"（最近一次有效坐标,
+    /// 默认,= 本项引入前的行为）| "hide"（不显示）| 上面 7 个锚点。值域 =
+    /// [`crate::app_compat::STATUS_FALLBACK_POSITIONS`]；读取请走 [`Self::fallback`]（写错回落 last）。
+    #[serde(default = "default_status_fallback_position")]
+    pub fallback_position: String,
     /// follow_caret 下相对默认位置（光标下方、左边缘对齐光标）的水平偏移（像素，正=右）。
     #[serde(default)]
     pub offset_x: i32,
@@ -5753,6 +5762,24 @@ fn default_status_display_mode() -> String {
 fn default_status_position_mode() -> String {
     "follow_caret".to_string()
 }
+fn default_status_fallback_position() -> String {
+    "last".to_string()
+}
+
+impl StatusIndicatorConfig {
+    /// 解析后的定位方式；值域外的字符串回落出厂默认（跟随光标）——字段是自由字符串，
+    /// 写错不会让配置加载失败，这里负责把它落回默认档。
+    pub fn position(&self) -> crate::app_compat::StatusPositionMode {
+        crate::app_compat::StatusPositionMode::from_config(&self.position_mode)
+            .unwrap_or(crate::app_compat::StatusPositionMode::FollowCaret)
+    }
+
+    /// 解析后的兜底位置；值域外的字符串回落出厂默认（`last`）。
+    pub fn fallback(&self) -> crate::app_compat::StatusFallback {
+        crate::app_compat::StatusFallback::from_config(&self.fallback_position)
+            .unwrap_or(crate::app_compat::StatusFallback::Last)
+    }
+}
 
 impl Default for StatusIndicatorConfig {
     fn default() -> Self {
@@ -5763,6 +5790,7 @@ impl Default for StatusIndicatorConfig {
             show_on_focus: false,
             schema_name_style: default_schema_name_style(),
             position_mode: default_status_position_mode(),
+            fallback_position: default_status_fallback_position(),
             offset_x: 0,
             offset_y: 0,
             custom_x: 0,
@@ -13129,5 +13157,47 @@ mod email_config_tests {
         assert!(u.enabled);
         assert!(!u.history_enabled, "老配置没有 history_enabled ⇒ 关闭");
         assert_eq!(u.history_max, 200);
+    }
+}
+
+#[cfg(test)]
+mod status_position_tests {
+    use super::*;
+    use crate::app_compat::{StatusAnchor, StatusFallback, StatusPositionMode};
+
+    /// 出厂默认 = 本功能引入前的行为：跟随光标、坐标不可信时用最近一次有效坐标。
+    #[test]
+    fn defaults_keep_previous_behavior() {
+        let si = StatusIndicatorConfig::default();
+        assert_eq!(si.position(), StatusPositionMode::FollowCaret);
+        assert_eq!(si.fallback(), StatusFallback::Last);
+    }
+
+    #[test]
+    fn anchors_parse() {
+        let si = StatusIndicatorConfig {
+            position_mode: "window_center".into(),
+            fallback_position: "screen_bottom_left".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            si.position(),
+            StatusPositionMode::Anchor(StatusAnchor::WindowCenter)
+        );
+        assert_eq!(
+            si.fallback(),
+            StatusFallback::Anchor(StatusAnchor::ScreenBottomLeft)
+        );
+    }
+
+    /// 手写配置拼错：加载照常成功，解析回落出厂默认，而不是报错或当成别的档。
+    #[test]
+    fn typos_fall_back_to_defaults() {
+        let cfg: Config = toml::from_str(
+            "[ui.status]\nposition_mode = \"screen_centre\"\nfallback_position = \"hidden\"\n",
+        )
+        .expect("拼错不得让配置加载失败");
+        assert_eq!(cfg.ui.status.position(), StatusPositionMode::FollowCaret);
+        assert_eq!(cfg.ui.status.fallback(), StatusFallback::Last);
     }
 }

@@ -1339,7 +1339,13 @@ display_mode = "temp"
 # follow_caret 定位模式下，只有取到 TSF 权威坐标才显示——拿不到宁可不显示，也不弹在错位置。
 show_on_focus = false
 schema_name_style = "full"
+# 位置：follow_caret（跟随光标）/ fixed（固定在 custom_x/custom_y，拖动气泡定位）/
+# 锚点 screen_center、screen_top_left、screen_top_right、screen_bottom_left、screen_bottom_right
+# （前台窗口所在屏幕的工作区）、window_center、window_bottom_left（前台窗口边框）。
 position_mode = "follow_caret"
+# 光标坐标拿不到时放哪（只在 follow_caret 下生效）：last（最近一次有效位置）/ hide（不显示）/
+# 上面 7 个锚点之一。给 Illustrator 这类不报光标坐标的应用用锚点，气泡就不会停在别处。
+fallback_position = "last"
 offset_x = 0
 offset_y = 0
 custom_x = 0

@@ -626,7 +626,14 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.status.display_mode", Enum(&["temp", "always"])),
     f("ui.status.show_on_focus", Bool),
     f("ui.status.schema_name_style", Enum(&["full", "short"])),
-    f("ui.status.position_mode", Enum(&["follow_caret", "fixed"])),
+    f(
+        "ui.status.position_mode",
+        Enum(&crate::app_compat::STATUS_POSITION_MODES),
+    ),
+    f(
+        "ui.status.fallback_position",
+        Enum(&crate::app_compat::STATUS_FALLBACK_POSITIONS),
+    ),
     f("ui.status.offset_x", Int),
     f("ui.status.offset_y", Int),
     f("ui.status.custom_x", Int),
