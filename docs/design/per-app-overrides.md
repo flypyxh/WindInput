@@ -107,6 +107,15 @@ schema = "@remember"    # 记住本应用上次用的方案
   pid / 进程名——加载期间用户在该应用里手切过，延后切换同样要作废。
 - **菜单「记住上次」**：记忆表里还没有该应用时，先把**当前方案**记进去再生效，否则刚点完
   就被切到全局方案。
+- **并发**：切入（焦点线程）、冷加载收尾（后台线程）、菜单、设置页 RPC 会并发走到轻量切换。
+  「比较/检查 + 切换」整段持 `AppSchemaState::switch_lock`（最外层锁）；往返记录的两把锁
+  （`schema_toggle_origin` / `parked_toggle`）是叶子锁、永不嵌套。锁序写在
+  `coordinator/app_schema.rs` 模块文档。
+- **编码处置**：焦点切入触发的轻量切换**只丢弃**缓冲（那一刻 active token 已是新宿主，按
+  `commit_on_switch` 上屏会把旧应用的码打进新应用）；上屏语义只留给冷方案加载完成那条路。
+- **compat 重载**：所有「写盘 → 整表重载」都经 `reload_app_compat`，它顺带重推密码框门控与
+  英文配对配置——重载拿到的是整份文件，用户手写的 `password_force_english` 会随任何一次
+  菜单/拖动生效，不重推就打破 core.suppress ⊆ C++.suppress。
 - 已知遗留：`set_shuangpin_layout`（选双拼布局）用内存里陈旧的 config 调
   `reload_from_config`，会把活跃方案重置为**启动时**的 `schema.active`——全局场景下本就
   如此（先于本功能存在），规则应用里同样会被冲掉，未随本轮修。
