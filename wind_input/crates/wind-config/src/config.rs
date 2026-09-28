@@ -7986,21 +7986,24 @@ impl Config {
     /// 存量迁移（**层内**、须在反序列化前跑）：`ui.candidate.font_size_follow_theme`（bool）
     /// + `font_size` 两处表达 → 只剩 `font_size`（0 = 跟随主题，>0 = 用户指定）。
     ///
-    /// 按**这一层**写了什么判（判据同 [`Self::migrate_user_layer_value`] 的文档）：
+    /// 只在**旧键 `font_size_follow_theme` 真的还在这一层**时才动手：
     /// - 写了 `follow = true`                → `font_size = 0`（旧语义下本层的字号被忽略）；
     /// - 写了 `follow = false`               → 保留本层 `font_size`；本层没写则补旧出厂值 18
     ///   （见 [`Self::LEGACY_FONT_SIZE_DEFAULT`] 的理由）；
-    /// - 没写 `follow`、但写了 `font_size`   → 旧默认即跟随，那个字号从未生效 ⇒ `font_size = 0`；
-    /// - 两者都没写                          → 不动（新出厂值 0 本就是跟随）。
+    /// - 旧键不存在                          → 不动，`font_size`（如果有）原样留给新语义读。
     ///
     /// 迁移后旧键从本层移除。用户文件里的旧键另由 [`Config::prune_user_config`] 先迁移
     /// **落盘**、再按 [`RETIRED_KEYS`] 清除——只清不迁会把 `follow = false` 用户的字号丢掉。
     ///
-    /// 已知近似：「没写 follow 就按旧默认 true」没去看下层（L2.5 定制层）是否写过 false。
-    /// 定制层关跟随、用户层只改字号这一组合下，迁移会把用户字号归 0。
-    /// 反方向同理：定制层写了 `font_size = 20`、用户层只剩 `follow = false` 时，本层补的是
-    /// 旧出厂 18 而非定制层的 20。两者都只出现在「定制版 + 用户改过跟随」的组合里，且
-    /// 结果只是字号回到某个出厂值，不值得为此让层内迁移去读别的层。
+    /// ⚠️ 曾经有一档「没写 `follow`、但写了 `font_size`」→ 当作旧格式清零的分支（猜「旧默认
+    /// 即跟随，那个字号从未生效」）。这个判据在旧键刚退役时对真·旧文件成立，但迁移**没有
+    /// 一次性开关**、每次 `prune_user_config`/`load()` 都会重跑：新语义下用户自定义字号后落盘
+    /// 的形状——`font_size` 有值、`font_size_follow_theme` 键从未存在过——与「真旧文件缺 follow
+    /// 键」在字面上完全一样。于是任何人在设置页把字号改成非 0，下次启动都会被这档分支当成
+    /// 旧文件清回 0（`prune_user_config` 还会把清零结果写回磁盘），表现为「设置页改字号，
+    /// 保存当时生效、重启后又变回跟随主题」。旧键存在与否才是唯一站得住的判据——它是旧键，
+    /// 现行代码不会再写它，缺席即代表这一层要么从未配过字号、要么已经是新格式，两种情况都
+    /// 不该猜着清零。
     fn migrate_font_size_follow_theme_value(layer: &mut toml::Value) {
         let Some(cand) = layer
             .get_mut("ui")
@@ -8009,11 +8012,10 @@ impl Config {
         else {
             return;
         };
-        let follow = match cand.remove("font_size_follow_theme") {
-            Some(v) => v.as_bool().unwrap_or(Self::LEGACY_FONT_SIZE_FOLLOW_DEFAULT),
-            None if cand.contains_key("font_size") => Self::LEGACY_FONT_SIZE_FOLLOW_DEFAULT,
-            None => return,
+        let Some(v) = cand.remove("font_size_follow_theme") else {
+            return;
         };
+        let follow = v.as_bool().unwrap_or(Self::LEGACY_FONT_SIZE_FOLLOW_DEFAULT);
         let size = if follow {
             toml::Value::Float(0.0)
         } else {
@@ -12223,11 +12225,15 @@ scripts = { latin = 42 }
         );
     }
 
-    /// 旧出厂默认即 follow=true：缺该键时写着的字号同样从未生效。
+    /// 没写 `follow` 键、但写了 `font_size`：不能再当「旧格式、从未生效」清零——
+    /// 新格式下用户自定义字号后落盘的正是这个形状（`font_size` 有值、`follow` 键
+    /// 从未存在过），迁移不区分的话会把用户刚设的字号在下次启动时清成 0（本条测试
+    /// 之前断言 `fs == 0.0`，编码的就是这个已修复的 bug：`prune_user_config` 每次
+    /// 启动都跑迁移，导致「设置页改字号、保存生效，重启后又变回跟随主题」）。
     #[test]
-    fn migrate_font_size_missing_follow_means_follow_theme() {
-        let (fs, _) = font_size_after_migration("[ui.candidate]\nfont_size = 22\n");
-        assert_eq!(fs, 0.0);
+    fn migrate_font_size_missing_follow_keeps_new_format_value() {
+        let (fs, _user) = font_size_after_migration("[ui.candidate]\nfont_size = 22\n");
+        assert_eq!(fs, 22.0, "没有旧键就不是旧格式，字号原样保留");
     }
 
     #[test]
