@@ -2392,6 +2392,15 @@ impl MessageHandler for Coordinator {
             // 「同进程」，它配的 initial_mode 永远不会生效（实测缺陷，见字段注释）。
             *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = (new_pid, new_has_rule);
         }
+        // 按应用方案（compat.toml `schema`）：与 initial_mode 同一个判据——跨进程切入才重算，
+        // 同进程内焦点跳转不动，尊重用户在应用内的手切；作用域外的过渡窗口（任务栏）也不动，
+        // 否则「点任务栏再回来」就把 mode_scope 之外的方案切走了。
+        // 放在 apply_initial_mode **之前**：切方案会让方案级标点意图在下一次状态推送时落地，
+        // 显式 `initial_punct` 规则要在它之后再落一次才压得住。
+        // ⛔ 不得挪进 get_current_mode（DLL 同步阻塞路径），见 `coordinator/app_schema.rs`。
+        if crossed && !out_of_scope {
+            self.apply_app_schema_on_focus(&proc_name);
+        }
         if should_reapply_initial(
             crossed,
             self.rt().config.input.default.per_app_scope(),

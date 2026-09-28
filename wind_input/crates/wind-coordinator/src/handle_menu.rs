@@ -255,6 +255,7 @@ impl Coordinator {
             MenuCmd::CandidatePositionRule(m) => self.set_candidate_position_rule(m),
             MenuCmd::IgnoreHostImeCloseRule(m) => self.set_ignore_host_ime_close_rule(m),
             MenuCmd::PasswordForceEnglishRule(m) => self.set_password_force_english_rule(m),
+            MenuCmd::AppSchemaRule(m) => self.set_app_schema_rule(m),
             MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
             MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
@@ -1022,6 +1023,65 @@ impl Coordinator {
         self.show_status();
     }
 
+    /// 为当前焦点应用设置输入方案，并写入用户层 compat.toml（C0-7 / C3-3，GH#80）。
+    /// `code`：0=跟随全局（清除规则）1=记住上次（`@remember`）2+i=固定为可用方案表第 i 个；
+    /// 越界的下标忽略（菜单构建与点击之间 available 被热重载缩短了）。
+    ///
+    /// 模板同 [`Self::set_initial_state_rule`]：写盘 → 重载整表 → 当场对当前焦点生效一次。
+    /// 本项不进 `active_compat`（规则按进程名现查，见 `app_schema_rule`），没有焦点槽要刷。
+    ///
+    /// 「记住上次」且记忆表里还没有这个应用时，先把**当前方案**记进去：否则目标回落全局，
+    /// 用户刚点完菜单，正在用的方案就被切走了——而他选的恰恰是「记住（我现在用的）」。
+    pub(crate) fn set_app_schema_rule(&self, code: u16) {
+        let value = match code {
+            0 => None,
+            1 => Some(wind_config::app_compat::APP_SCHEMA_REMEMBER.to_string()),
+            n => {
+                let list = self.engine_mgr.available_schemas();
+                match list.get(usize::from(n - 2)) {
+                    Some(id) => Some(id.clone()),
+                    None => {
+                        tracing::warn!("set_app_schema_rule: 方案下标 {} 越界，忽略", n - 2);
+                        return;
+                    }
+                }
+            }
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_app_schema_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_app_schema_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        // 1）写用户层 compat.toml。
+        if let Err(e) = wind_config::app_compat::set_user_schema(&user_dir, &name, value.clone()) {
+            tracing::error!("set_app_schema_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
+        // 3）当场对当前焦点生效一次（按新规则算目标方案，不同就轻量切换）。
+        if code == 1 && !self.has_remembered_schema(&name) {
+            self.remember_app_schema(&name, &self.engine_mgr.active_schema_id());
+        }
+        self.apply_app_schema_on_focus(&name);
+        tracing::info!(
+            "应用独立方案 for process={name}: {}",
+            value.as_deref().unwrap_or("(follow-global)")
+        );
+        self.notify_toolbar();
+        self.show_status();
+    }
+
     /// 为当前焦点应用设置初始中英状态（`is_punct=false`）或初始标点（`is_punct=true`），
     /// 并写入用户层 compat.toml。`mode_id`：0=跟随全局（清除规则）1=英文 2=中文。
     ///
@@ -1428,13 +1488,14 @@ impl Coordinator {
             use wind_config::app_compat::InitialMode as IM;
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
-            let (cur_cand_pos, cur_ignore_close, cur_pfe) = {
+            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema) = {
                 let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
                 let rule = table.get_rule(&proc);
                 (
                     rule.and_then(|r| r.candidate_position_mode),
                     rule.and_then(|r| r.ignore_host_ime_close),
                     rule.and_then(|r| r.password_force_english),
+                    rule.and_then(|r| r.schema.clone()),
                 )
             };
             let cur_first_show = self.rule_first_show_mode(&proc);
@@ -1459,11 +1520,48 @@ impl Coordinator {
                     M::leaf("中文", cmd(mk(2)), enabled, cur == Some(IM::Chinese)),
                 ]
             };
+            // 方案：跟随全局 / 记住上次 / ── / 各可用方案（选中即固定）。勾选看的是**规则**
+            // 而非当前活跃方案——「固定五笔」的应用里临时手切到拼音，勾仍在五笔上。
+            // 固定的 id 不在 available 时协调器按未配置处理，这里同样勾「跟随全局」。
+            let app_schema_children = {
+                use wind_config::app_compat::APP_SCHEMA_REMEMBER;
+                let schemas = self.engine_mgr.available_schemas();
+                let remember = cur_schema.as_deref() == Some(APP_SCHEMA_REMEMBER);
+                let fixed = cur_schema
+                    .as_ref()
+                    .filter(|id| schemas.contains(id))
+                    .cloned();
+                let mut v = vec![
+                    M::leaf(
+                        "跟随全局（默认）",
+                        cmd(MenuCmd::AppSchemaRule(0)),
+                        enabled,
+                        !remember && fixed.is_none(),
+                    ),
+                    M::leaf(
+                        "记住上次",
+                        cmd(MenuCmd::AppSchemaRule(1)),
+                        enabled,
+                        remember,
+                    ),
+                    M::separator(),
+                ];
+                for (i, id) in schemas.iter().enumerate() {
+                    v.push(M::leaf(
+                        self.engine_mgr.schema_name(id),
+                        cmd(MenuCmd::AppSchemaRule(i as u16 + 2)),
+                        enabled,
+                        fixed.as_deref() == Some(id.as_str()),
+                    ));
+                }
+                v
+            };
             vec![
                 M::label(header),
                 M::separator(),
                 M::submenu("初始输入模式", tri(cur_mode, MenuCmd::InitialMode)),
                 M::submenu("初始标点模式", tri(cur_punct, MenuCmd::InitialPunct)),
+                M::submenu("方案", app_schema_children),
                 M::separator(),
                 // 三档**互斥**，做成子菜单单选：布尔开关时代它们能同时打开，实测就因此出过
                 // 「fast 配了却从未生效」——instant 抢先放行，fast 的判据根本没机会跑。

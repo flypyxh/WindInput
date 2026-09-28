@@ -14,6 +14,7 @@ use crate::handle_mode::MixLens;
 use crate::pipeline::{ModeKind, Rewind};
 // 子模块（src/coordinator/ 目录）：这批切片重度访问本模块**私有**字段/函数，
 // 子模块对父私有项可见，平级模块则须放开可见性——归属判据即「是否需要碰私有态」。
+mod app_schema;
 mod first_show;
 pub(crate) mod fullscreen_watch;
 mod langbar_icon;
@@ -1960,6 +1961,9 @@ pub struct Coordinator {
     pub(crate) input_diag_frozen: std::sync::atomic::AtomicBool,
     /// HUD 窗口置顶（右键菜单）。默认开——诊断浮窗被盖住就失去意义。
     pub(crate) input_diag_topmost: std::sync::atomic::AtomicBool,
+    /// 按应用方案（compat.toml `schema`）的运行时态：全局方案、`@remember` 记忆表等，
+    /// 见 `coordinator/app_schema.rs`。
+    pub(crate) app_schema: app_schema::AppSchemaState,
 }
 
 /// 拆字资产当前生效状态：库的解析后绝对路径 + 已下发的字根字体（路径, DWrite 家族名）。
@@ -2428,6 +2432,9 @@ impl Coordinator {
         // 在 `store` 被 move 进结构体之前取：字段字面量按书写顺序求值，`state_writer`
         // 排在 `store` 之后，那时已经借不到了。
         let persists_state = store.is_some();
+        // 全局方案初值取引擎解析后的活跃方案（含定制版隐藏降级），而不是 `schema.active` 原值。
+        let global_schema_init = engine_mgr.active_schema_id();
+        let app_schemas_init = runtime_state.app_schemas.clone();
         // 软键盘上次停在哪一面：按**面 id** 还原（面表来自配置，两次运行之间可能增删面，
         // 存下标必然指到别处）。id 找不到就当没记录过、开在第一面——那比默默开到一个
         // 陌生的面好。
@@ -2719,6 +2726,7 @@ impl Coordinator {
             input_diag_sections: Mutex::new(Default::default()),
             input_diag_frozen: std::sync::atomic::AtomicBool::new(false),
             input_diag_topmost: std::sync::atomic::AtomicBool::new(true),
+            app_schema: app_schema::AppSchemaState::new(global_schema_init, app_schemas_init),
         });
         // CapsLock 钩子的动作消费线程。钩子回调只做非阻塞投递（它超时会被系统静默移除且
         // 无从察觉），真正的动作在这里执行，可安全加锁。未装钩子时它一直阻塞在 channel 上。
@@ -4130,6 +4138,10 @@ impl Coordinator {
                     //
                     // ⚠️ 必须后台：`prewarm_indexes` 阻塞秒级，而本函数是设置页 RPC 调过来的。
                     // 与启动线程、测试、移动端 prepare() 共用同一个 `prewarm_indexes`。
+                    // 重建把活跃方案重置成了磁盘上的 `schema.active`（= 全局方案）。焦点若在
+                    // 配了 schema 规则的应用里，要把它对齐回去，否则设置页保存一次就把该应用
+                    // 冲回全局。按应用方案的自动切换不写盘，本身不会走到这里。
+                    self.resync_app_schema_after_reload();
                     if let Some(weak) = self.self_weak.get().cloned() {
                         let _ = std::thread::Builder::new()
                             .name("reload-prewarm".into())

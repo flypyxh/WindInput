@@ -1942,6 +1942,12 @@ impl Coordinator {
         self.show_status();
         self.notify_toolbar();
         info!("{}: {}", log_verb, schema_id);
+        // 手切分流（按应用方案，C0-7）：焦点应用配了 schema 规则 ⇒ 这次手切只属于它
+        // （`@remember` 另记记忆表），**不写** `schema.active`；否则是全局手切，照旧持久化。
+        // 上面的归位与气泡两边都要：手切的语义前提「我要用这个方案打字」与在哪个应用无关。
+        if self.route_manual_schema_switch(schema_id) {
+            return;
+        }
         if let Err(e) = Config::set_user_string(&["schema", "active"], schema_id) {
             warn!("{}: 持久化 schema.active 失败: {}", log_verb, e);
         }
