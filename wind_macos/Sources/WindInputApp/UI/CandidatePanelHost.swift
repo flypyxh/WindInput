@@ -399,7 +399,8 @@ public final class CandidatePanelHost {
             if let p = try? BinaryCodec.decodeStatusBubblePayload(frame.payload) {
                 DispatchQueue.main.async { [weak self] in
                     self?.statusBubble.show(text: p.text, bgHex: p.bgColor, fgHex: p.fgColor,
-                                            wireX: p.x, wireY: p.y, durationMs: p.durationMs)
+                                            wireX: p.x, wireY: p.y, durationMs: p.durationMs,
+                                            anchor: p.anchor)
                 }
             }
         case DownstreamCmd.statusHide:

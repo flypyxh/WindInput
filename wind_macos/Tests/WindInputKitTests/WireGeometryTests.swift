@@ -61,4 +61,35 @@ final class WireGeometryTests: XCTestCase {
         XCTAssertEqual(out.x, vf.minX)
         XCTAssertEqual(out.y + huge.height, vf.minY + huge.height, "左上角须落在可见区内")
     }
+
+    // MARK: - 状态气泡锚点 (C2-33 / GH#148)
+
+    /// 可见区 (Cocoa, y 向上): 左下 (0,0), 顶部让出 25pt 菜单栏。
+    private let tip = CGSize(width: 120, height: 34)
+
+    func testAnchorOriginScreenCorners() {
+        let m: CGFloat = 16
+        XCTAssertEqual(WireGeometry.anchorOrigin(anchor: .screenTopLeft, target: vf, size: tip, margin: m),
+                       CGPoint(x: 16, y: 1055 - 16 - 34), "「顶」是 maxY")
+        XCTAssertEqual(WireGeometry.anchorOrigin(anchor: .screenTopRight, target: vf, size: tip, margin: m),
+                       CGPoint(x: 1920 - 16 - 120, y: 1055 - 16 - 34))
+        XCTAssertEqual(WireGeometry.anchorOrigin(anchor: .screenBottomLeft, target: vf, size: tip, margin: m),
+                       CGPoint(x: 16, y: 16))
+        XCTAssertEqual(WireGeometry.anchorOrigin(anchor: .screenBottomRight, target: vf, size: tip, margin: m),
+                       CGPoint(x: 1920 - 16 - 120, y: 16))
+    }
+
+    func testAnchorOriginCenterIgnoresMargin() {
+        let c0 = WireGeometry.anchorOrigin(anchor: .screenCenter, target: vf, size: tip, margin: 0)
+        let c16 = WireGeometry.anchorOrigin(anchor: .screenCenter, target: vf, size: tip, margin: 16)
+        XCTAssertEqual(c0, c16)
+        XCTAssertEqual(c0, CGPoint(x: 900, y: (527.5 - 17).rounded()))
+    }
+
+    /// 窗口锚点拿不到宿主窗口边框 ⇒ 降级为同位置的屏幕锚点。
+    func testWindowAnchorsDegradeToScreen() {
+        XCTAssertEqual(StatusAnchor.windowCenter.screenEquivalent, .screenCenter)
+        XCTAssertEqual(StatusAnchor.windowBottomLeft.screenEquivalent, .screenBottomLeft)
+        XCTAssertEqual(StatusAnchor.screenTopRight.screenEquivalent, .screenTopRight)
+    }
 }

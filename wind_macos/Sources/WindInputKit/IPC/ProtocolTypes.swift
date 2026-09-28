@@ -214,6 +214,7 @@ public struct TooltipColorRun: Equatable {
 /// 状态提示气泡 (CmdStatusShow 0x050A 解码结果)。模式切换时近 caret 弹出的瞬态气泡。
 /// text 为合并短文 (如 "中 ，"); bgColor/fgColor 为 #RRGGBBAA; x/y 为 caret 屏幕坐标
 /// (wire top-left); durationMs>0 时到点自动隐藏 (temp), ==0 常驻 (always)。
+/// anchor 为尾段 (C2-33 / GH#148), 取值见 `StatusAnchor`; 旧服务不发 → 0 (按 x/y 摆)。
 public struct StatusBubblePayload {
     public let text: String
     public let bgColor: String
@@ -221,14 +222,39 @@ public struct StatusBubblePayload {
     public let x: Int32
     public let y: Int32
     public let durationMs: Int32
+    public let anchor: Int32
 
-    public init(text: String, bgColor: String, fgColor: String, x: Int32, y: Int32, durationMs: Int32) {
+    public init(text: String, bgColor: String, fgColor: String, x: Int32, y: Int32, durationMs: Int32,
+                anchor: Int32 = 0) {
         self.text = text
         self.bgColor = bgColor
         self.fgColor = fgColor
         self.x = x
         self.y = y
         self.durationMs = durationMs
+        self.anchor = anchor
+    }
+}
+
+/// 状态气泡锚点 (CmdStatusShow 尾段)。与 Rust `wind_ipc::protocol::status_anchor` **同值**,
+/// 改一边必须改另一边。`none` = 按 x/y 摆 (跟随光标 / 固定坐标, 服务端已算定)。
+public enum StatusAnchor: Int32 {
+    case none = 0
+    case screenCenter = 1
+    case screenTopLeft = 2
+    case screenTopRight = 3
+    case screenBottomLeft = 4
+    case screenBottomRight = 5
+    case windowCenter = 6
+    case windowBottomLeft = 7
+
+    /// 拿不到宿主窗口边框时的降级: 窗口锚点换成同位置的屏幕锚点, 其余原样。
+    public var screenEquivalent: StatusAnchor {
+        switch self {
+        case .windowCenter: return .screenCenter
+        case .windowBottomLeft: return .screenBottomLeft
+        default: return self
+        }
     }
 }
 

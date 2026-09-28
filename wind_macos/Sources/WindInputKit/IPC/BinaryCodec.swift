@@ -486,8 +486,11 @@ public enum BinaryCodec {
         }
         let x = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
         let y = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
-        let dur = Int32(bitPattern: buf.readUInt32LE(at: off))
-        return StatusBubblePayload(text: text, bgColor: bg, fgColor: fg, x: x, y: y, durationMs: dur)
+        let dur = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
+        // 锚点尾段 (C2-33 / GH#148): 旧服务不发, 缺省 0 = 按 x/y 摆。
+        let anchor = buf.count >= off + 4 ? Int32(bitPattern: buf.readUInt32LE(at: off)) : 0
+        return StatusBubblePayload(text: text, bgColor: bg, fgColor: fg, x: x, y: y, durationMs: dur,
+                                   anchor: anchor)
     }
 
     public static func decodeToastPayload(_ buf: Data) throws -> ToastPayload {

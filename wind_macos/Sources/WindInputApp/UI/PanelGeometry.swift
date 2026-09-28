@@ -34,6 +34,23 @@ enum PanelGeometry {
         return referenceScreen
     }
 
+    /// 状态气泡锚点用的「焦点所在屏」（C2-33 / GH#148）。
+    ///
+    /// 取**鼠标所在屏**，其次才是 `(wireX, wireY)`（服务端给的光标点）所在屏，都不中回退参照屏：
+    /// - `NSScreen.main`（key window 所在屏）用不上：它问的是**本 .app** 的 key window，输入法
+    ///   没有 key window，宿主的又拿不到；
+    /// - 光标点在锚点**兜底**场景下恰恰不可信（那正是走兜底的原因，可能是上一个应用里的旧
+    ///   坐标），而用户点进输入框时鼠标就在那块屏上，单屏/常规多屏下两者一致。
+    static func anchorScreen(wireX: CGFloat, wireY: CGFloat) -> NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        if let s = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) { return s }
+        if let ref = referenceScreen {
+            let p = NSPoint(x: wireX, y: WireGeometry.flipY(wireY, screenHeight: ref.frame.height))
+            if let s = NSScreen.screens.first(where: { $0.frame.contains(p) }) { return s }
+        }
+        return referenceScreen
+    }
+
     /// 窗口矩形 → wire 左上角；取不到屏幕时返回 nil。
     static func wireTopLeft(of frame: NSRect) -> (x: Int32, y: Int32)? {
         guard let s = referenceScreen else { return nil }
