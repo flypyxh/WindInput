@@ -7812,6 +7812,7 @@ impl Config {
     /// 按**这一层**写了什么判（判据同 [`Self::migrate_user_layer_value`] 的文档）：
     /// - 本层没写任何旧键 → 不动；
     /// - 本层已写 `sections` → 以它为准，旧键只清不迁（用户在新形态上的编辑比旧开关新）；
+    /// - 旧键的值全等于旧出厂值 → 只清不迁：用户没改过气泡，本层不该出现段列表；
     /// - 否则按 [`tooltip_sections_from_legacy`] 生成段列表写入本层。本层没写的旧键取旧出厂值，
     ///   与旧版「缺键即默认」的生效值一致。
     ///
@@ -7859,6 +7860,15 @@ impl Config {
             chaizi: flag("chaizi_enabled", d.chaizi),
             debug: flag("debug_enabled", d.debug),
         };
+        // 旧开关全是旧出厂值 = 用户从没改过气泡：只摘旧键、不写段列表，让本层跟随出厂（含 L2.5
+        // 定制层）。写进去的话，set_user_value 只剪本次那一个键、会把整份出厂段列表原样落盘，
+        // 下次出厂段列表一变它就成了删不掉的「自定义」。
+        if flags == d {
+            info!(
+                "ui.tooltip legacy switches all at old defaults → dropped, following factory sections"
+            );
+            return;
+        }
         match toml::Value::try_from(tooltip_sections_from_legacy(flags)) {
             Ok(v) => {
                 tip.insert("sections".to_string(), v);
@@ -11151,6 +11161,49 @@ active = "x"
             tooltip_sections_from_legacy(LegacyTooltipFlags::default()),
             default_tooltip_sections()
         );
+    }
+
+    /// ★ 只写过「与旧出厂相同」的旧开关的老用户：迁移不给本层写段列表，这批用户继续跟随出厂，
+    /// 而不是被钉在一份自定义段列表上。反向：真改过开关的用户，迁出的段列表留在用户层。
+    #[test]
+    fn default_legacy_switches_leave_no_sections_custom_ones_kept() {
+        let all_default = "[ui.tooltip]\ncode_enabled = true\npinyin_enabled = true\n\
+                           pinyin_heteronyms = true\npinyin_max_readings = 0\n\
+                           chaizi_enabled = false\ndebug_enabled = false\n";
+        // 迁移本身（三条写盘 / 加载路径共用）就不写段列表：set_user_value 只剪本次那个键，
+        // 迁移若写了，整份出厂段列表会原样落盘。
+        let mut root: toml::Value = toml::from_str(all_default).unwrap();
+        Config::migrate_tooltip_sections_value(&mut root);
+        assert!(
+            get_nested(&root, &["ui", "tooltip", "sections"]).is_none(),
+            "全缺省旧开关不得在本层留下段列表：{root:?}"
+        );
+        assert!(
+            get_nested(&root, &["ui", "tooltip", "code_enabled"]).is_none(),
+            "旧键照样摘掉"
+        );
+        // 真改过开关的用户，迁出的段列表留在本层，prune 也不删（与出厂不等）。
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data");
+        let preset = Config::system_preset_value(Some(&data)).unwrap();
+        let mut root: toml::Value =
+            toml::from_str("[ui.tooltip]\nchaizi_enabled = true\n").unwrap();
+        Config::migrate_tooltip_sections_value(&mut root);
+        prune_redundant(&mut root, &preset);
+        assert!(
+            get_nested(&root, &["ui", "tooltip", "sections"]).is_some(),
+            "开过拆字的用户，合并段必须留在用户层"
+        );
+        // 用户层里原样躺着一份出厂段列表的，按冗余删——preset 取真实的 L1⊕L2（Value 层合并），
+        // 不只是 L1：L2 少写一个字段（如 `promote = ""`）会让两边在 Value 层对不上。
+        let mut user = toml::Value::Table(Default::default());
+        if let toml::Value::Table(t) = &mut user {
+            set_nested(
+                t,
+                &["ui", "tooltip", "sections"],
+                toml::Value::try_from(default_tooltip_sections()).unwrap(),
+            );
+        }
+        assert_eq!(prune_redundant(&mut user, &preset), 1);
     }
 
     /// 旧开关迁移：跑真实链路（用户层迁移 → ⊕ L1 默认 → 反序列化），返回生效段列表与迁移后的本层。
