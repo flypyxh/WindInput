@@ -14,6 +14,18 @@
 //!
 //! ⛔ 本模块的任何函数都不得进 `get_current_mode`（DLL 同步阻塞路径）：切方案可能要构建
 //! 引擎，冷方案还要起后台线程。
+//!
+//! # 锁序（本模块的函数被焦点线程、`app-schema-load` 后台线程、设置页 RPC、菜单线程并发调用）
+//!
+//! 1. [`AppSchemaState::switch_lock`] 是**最外层**：「比对/检查 + 轻量切换」整段持有它。
+//!    ⛔ 持有任何别的锁时不得去取它；持有它期间可以取下面任何一把。
+//! 2. `Coordinator::schema_toggle_origin` 与 [`AppSchemaState::parked_toggle`] 是**叶子锁**：
+//!    两者**永不嵌套**——一边 take 出值、放锁，再取另一边写入。曾经一段先 origin 后 parked、
+//!    另一段先 parked 后 origin，两条线程各走一段即死锁。
+//! 3. `remembered` → `state_writer` 的内部锁：写记忆表时持 `remembered` 调 `schedule`
+//!    （见 [`Coordinator::remember_app_schema`]）；`schedule` 只取它自己的 `pending` 锁，
+//!    写盘闭包在 writer 线程上跑、不碰 `remembered`，故不成环。
+//! 4. 其余（`global` / `pending_load` / `warned_invalid`）只在单独一句里取、取完即放。
 
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +52,16 @@ pub(crate) struct AppSchemaState {
     parked_toggle: Mutex<Option<(String, SchemaToggleOrigin)>>,
     /// 最近一次冷方案后台加载的线程句柄，只供测试等它完成（生产不 join）。
     pending_load: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 自动切换的互斥：[`Coordinator::apply_app_schema_on_focus`] 的「比较 + 切换」与
+    /// [`Coordinator::finish_deferred_app_schema`] 的「检查意图代际 + 切换」都整段持有它。
+    ///
+    /// 没有它时后者是 check-then-act：后台线程比对代际通过之后、真正切换之前，焦点线程
+    /// 可以完成下一次切入（代际 +1、切到新目标），随后后台线程把方案切回**旧**目标。
+    /// 锁序：最外层，见模块文档。
+    switch_lock: Mutex<()>,
+    /// 已报过「固定 id 不在 available」的 `(进程名, id)`：每次切入/手切都会问规则，不去重
+    /// 就是同一条 WARN 刷满日志。available 热重载后仍不在的组合也不再重报（配置没变）。
+    warned_invalid: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 impl AppSchemaState {
@@ -50,8 +72,21 @@ impl AppSchemaState {
             intent_gen: AtomicU64::new(0),
             parked_toggle: Mutex::new(None),
             pending_load: Mutex::new(None),
+            switch_lock: Mutex::new(()),
+            warned_invalid: Mutex::new(std::collections::HashSet::new()),
         }
     }
+}
+
+/// 轻量切换时对未上屏编码的处置，见 [`Coordinator::switch_schema_light`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingInput {
+    /// 只丢弃，不上屏、不推任何东西给宿主。**焦点切入**用：此刻 active token 已指向新宿主，
+    /// 缓冲里若还有旧宿主的编码，按 `commit_on_switch` 上屏就会把 A 应用的码打进 B 应用。
+    Discard,
+    /// 与手切同一条策略（`keys.commit_on_switch`：开则上屏原码，关则丢弃）。只给**冷方案
+    /// 加载完成**那条路用：那时焦点仍在该应用（意图代际未变），缓冲属于它。
+    CommitPerPolicy,
 }
 
 /// 经 available 校验后的按应用方案规则。
@@ -81,9 +116,17 @@ impl Coordinator {
         if self.engine_mgr.available_schemas().contains(&raw) {
             Some(AppSchemaRule::Fixed(raw))
         } else {
-            warn!(
-                "compat.toml: {proc} 的 schema = \"{raw}\" 不在 schema.available 中，按未配置处理"
-            );
+            let first = self
+                .app_schema
+                .warned_invalid
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((proc.to_string(), raw.clone()));
+            if first {
+                warn!(
+                    "compat.toml: {proc} 的 schema = \"{raw}\" 不在 schema.available 中，按未配置处理"
+                );
+            }
             None
         }
     }
@@ -129,14 +172,25 @@ impl Coordinator {
     ///
     /// 目标方案没加载好（开机预热未完）⇒ **不阻塞**：保持当前方案，后台加载，完成时若
     /// 意图代际未变（焦点没离开、用户没手切）再切。焦点路径上同步构建一个大词库会卡住宿主。
+    ///
+    /// 同步切换时缓冲**只丢弃**（[`PendingInput::Discard`]）：焦点切入那一刻 active token 已是
+    /// 新宿主，上屏会把旧应用的码打进新应用。菜单改规则、热重载对齐也走这里，那两处缓冲
+    /// 本就已被菜单/重载清掉，丢弃与上屏同效。
     pub(crate) fn apply_app_schema_on_focus(&self, proc: &str) {
+        // 「比较 + 切换」整段互斥，见 `AppSchemaState::switch_lock`。代际 +1 也放在锁内：
+        // 后台线程持锁检查时看到的代际与它随后切换时一致。
+        let _switch = self
+            .app_schema
+            .switch_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let generation = self.app_schema.intent_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let target = self.app_schema_target(proc);
         if target.is_empty() || target == self.engine_mgr.active_schema_id() {
             return;
         }
         if self.engine_mgr.is_loaded(&target) {
-            self.switch_schema_light(&target, proc);
+            self.switch_schema_light(&target, proc, PendingInput::Discard);
             return;
         }
         let Some(weak) = self.self_weak.get().cloned() else {
@@ -170,7 +224,15 @@ impl Coordinator {
 
     /// 冷方案加载完成后的收尾：意图代际未变才切，且按**此刻**的规则重算目标——加载期间
     /// 菜单可能改过规则，拿旧目标会切到一个已被撤销的方案。
+    ///
+    /// 「检查 + 切换」整段持 `switch_lock`：否则检查通过后、切换之前焦点线程可以完成下一次
+    /// 切入，本函数再把方案切回已作废的旧目标。
     pub(crate) fn finish_deferred_app_schema(&self, generation: u64, proc: &str, target: &str) {
+        let _switch = self
+            .app_schema
+            .switch_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.app_schema.intent_gen.load(Ordering::SeqCst) != generation {
             debug!("按应用方案: {target} 加载完成，但焦点已离开 {proc} 或期间手切过，不切换");
             return;
@@ -178,7 +240,7 @@ impl Coordinator {
         if self.app_schema_target(proc) != target {
             return;
         }
-        self.switch_schema_light(target, proc);
+        self.switch_schema_light(target, proc, PendingInput::CommitPerPolicy);
     }
 
     /// **轻量切换**：换引擎 + 方案绑定的运行期同步，是 `finish_user_schema_switch` 去掉
@@ -195,29 +257,34 @@ impl Coordinator {
     /// 英文、切到一个固定五笔的应用再切回 A，A 会被自动切回英文，但再按往返键却没反应。
     /// 故自动切走时把仍有效的记录**挂起**，之后某次自动切换又落回同一个方案时按新代际
     /// 恢复；任何手切都丢弃挂起的记录（见 [`Self::route_manual_schema_switch`]）。
-    fn switch_schema_light(&self, target: &str, proc: &str) {
+    ///
+    /// ⚠ 两段都是「从一把锁 take 出值、放锁，再取另一把写入」，`schema_toggle_origin` 与
+    /// `parked_toggle` **永不同时持有**（锁序见模块文档）。
+    ///
+    /// `pending` 决定未上屏编码怎么处置，见 [`PendingInput`]。
+    pub(crate) fn switch_schema_light(&self, target: &str, proc: &str, pending: PendingInput) {
         let from = self.engine_mgr.active_schema_id();
-        {
-            let generation = self.engine_mgr.schema_generation();
-            let mut origin = self
-                .schema_toggle_origin
+        let generation = self.engine_mgr.schema_generation();
+        let still_valid = self
+            .schema_toggle_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_if(|r| r.landing.generation == generation);
+        if let Some(rec) = still_valid {
+            *self
+                .app_schema
+                .parked_toggle
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if origin
-                .as_ref()
-                .is_some_and(|r| r.landing.generation == generation)
-                && let Some(rec) = origin.take()
-            {
-                *self
-                    .app_schema
-                    .parked_toggle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some((from.clone(), rec));
-            }
+                .unwrap_or_else(|e| e.into_inner()) = Some((from.clone(), rec));
         }
-        // 与手切同一条编码处置（上屏记账取的是切换前的方案，故必须早于 switch_schema）。
-        // 焦点切入时缓冲通常已空，这里主要照顾「冷方案加载完成时用户正在打字」的那一刻。
-        let commit = self.take_input_on_schema_switch();
+        // 编码处置必须早于 switch_schema：上屏记账取的是切换前的方案。
+        let commit = match pending {
+            PendingInput::CommitPerPolicy => self.take_input_on_schema_switch(),
+            PendingInput::Discard => {
+                self.discard_input_on_schema_switch();
+                SwitchCommit::default()
+            }
+        };
         if !self.engine_mgr.switch_schema(target) {
             self.push_switch_commit(&commit);
             return;
@@ -228,23 +295,30 @@ impl Coordinator {
         self.push_state_update();
         self.notify_toolbar();
         self.push_switch_commit(&commit);
-        {
-            let mut parked = self
-                .app_schema
-                .parked_toggle
+        let resumed = self
+            .app_schema
+            .parked_toggle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_if(|(id, _)| id == target);
+        if let Some((_, mut rec)) = resumed {
+            rec.landing.generation = self.engine_mgr.schema_generation();
+            *self
+                .schema_toggle_origin
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if parked.as_ref().is_some_and(|(id, _)| id == target)
-                && let Some((_, mut rec)) = parked.take()
-            {
-                rec.landing.generation = self.engine_mgr.schema_generation();
-                *self
-                    .schema_toggle_origin
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(rec);
-            }
+                .unwrap_or_else(|e| e.into_inner()) = Some(rec);
         }
         info!("按应用方案: {proc} {from} -> {target}");
+    }
+
+    /// 丢弃未上屏的编码与一切独占模式缓冲，不上屏、不记上屏统计、不推任何东西给宿主。
+    /// 与失焦清输入同一组动作（`reset_exclusive_modes` 已含主缓冲、候选、preedit、逐步
+    /// 转换前缀）。旧宿主里残留的组合由它自己的 DLL 在失焦时结束，不归这里管。
+    fn discard_input_on_schema_switch(&self) {
+        self.terminate_auto_phrase("switch_schema");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.exit_assoc(&mut state, crate::handle_assoc::AssocExit::ModeSwitch);
+        self.reset_exclusive_modes(&mut state);
     }
 
     /// 手切收尾的分流（`finish_user_schema_switch` 调）：返回 `true` = 当前焦点应用有方案
@@ -284,16 +358,19 @@ impl Coordinator {
     }
 
     /// 写记忆表并经 `state_writer` 落盘。闭包带**整张表**（覆盖语义，见 `state_writer` 模块文档）。
+    ///
+    /// ★ **持 `remembered` 锁调 `schedule`**：快照与登记必须是同一个原子步骤。放锁后再
+    /// 登记的话，两条线程并发时后取的（更新的）快照可能先登记、先取的（更旧的）后登记，
+    /// 而 `schedule` 是同种覆盖语义 ⇒ 落盘的是旧表。持锁保证「登记顺序 = 快照顺序」。
+    /// 不成环：`schedule` 只取 writer 自己的 `pending` 锁，写盘闭包在 writer 线程上跑。
     pub(crate) fn remember_app_schema(&self, proc: &str, schema_id: &str) {
-        let snapshot = {
-            let mut m = self
-                .app_schema
-                .remembered
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            m.insert(proc.to_string(), schema_id.to_string());
-            m.clone()
-        };
+        let mut m = self
+            .app_schema
+            .remembered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        m.insert(proc.to_string(), schema_id.to_string());
+        let snapshot = m.clone();
         self.state_writer.schedule("app_schemas", move |rs| {
             rs.app_schemas = snapshot.clone();
         });
@@ -366,6 +443,11 @@ mod tests {
 
     /// 两个自造码表方案 za / zb 的数据目录 + 空 override 目录（不碰真实用户目录）。
     fn fixture(tag: &str) -> (Arc<Coordinator>, PathBuf) {
+        fixture_with(tag, |_| {})
+    }
+
+    /// 同 [`fixture`]，另可改配置。
+    fn fixture_with(tag: &str, tweak: impl FnOnce(&mut Config)) -> (Arc<Coordinator>, PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("wind_app_schema_unit_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -392,6 +474,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.schema.available = vec!["za".into(), "zb".into()];
         cfg.schema.active = "za".into();
+        tweak(&mut cfg);
         let c = Coordinator::new_headless_with_override(
             cfg,
             Some(&dir.join("data")),
@@ -449,6 +532,170 @@ mod tests {
         let current = c.app_schema.intent_gen.load(Ordering::SeqCst);
         c.finish_deferred_app_schema(current, "code.exe", "zb");
         assert_eq!(c.engine_mgr.active_schema_id(), "zb");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 把 zb 暖好（冷加载一次）再回到 za：之后切入 code.exe 走同步轻量切换。
+    fn warm_zb_then_back_to_za(c: &Arc<Coordinator>) {
+        c.apply_app_schema_on_focus("code.exe");
+        c.debug_wait_app_schema_load();
+        c.apply_app_schema_on_focus("plain.exe");
+        assert_eq!(c.engine_mgr.active_schema_id(), "za", "前置：回到全局 za");
+        assert!(c.engine_mgr.is_loaded("zb"), "前置：zb 已暖");
+    }
+
+    /// 等 `cond` 成立，最多 2s。**只用来给旧实现的反例留出显现的时间**：各测试在新实现下的
+    /// 通过与否不取决于它等了多久（见各用例的说明），故不是靠时序碰运气的测试。
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// ★ 锁序：`schema_toggle_origin` 与 `parked_toggle` 永不同时持有。
+    ///
+    /// 复现旧实现的死锁形状：一条线程持着 `parked_toggle`（旧实现后段的持锁形态），另一条
+    /// 线程跑 `switch_schema_light`。旧实现前段 take 走记录后**仍持着 origin** 去等 parked，
+    /// 于是 origin 在主线程放掉 parked 之前永远取不到——主线程若此时去取 origin 就是死锁；
+    /// 这里用 `try_lock` 观察而不真的去等。新实现 take 完即放锁：只要后台线程被调度到，
+    /// 主线程必然看到「origin 可取且记录已被取走」，与等待时长无关。
+    #[test]
+    fn toggle_record_locks_are_never_held_together() {
+        let (c, dir) = fixture("locks");
+        warm_zb_then_back_to_za(&c);
+        *c.schema_toggle_origin.lock().unwrap() = Some(SchemaToggleOrigin {
+            origin: "zb".into(),
+            landing: ToggleLanding {
+                generation: c.engine_mgr.schema_generation(),
+                chinese_mode: true,
+                caps_lock: false,
+            },
+            trigger_vk: 0,
+        });
+        let parked = c.app_schema.parked_toggle.lock().unwrap();
+        let c2 = c.clone();
+        let h = std::thread::spawn(move || {
+            c2.switch_schema_light("zb", "code.exe", PendingInput::Discard)
+        });
+        let released = wait_until(|| match c.schema_toggle_origin.try_lock() {
+            Ok(g) => g.is_none(),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("origin 锁中毒: {e}"),
+        });
+        drop(parked);
+        h.join().unwrap();
+        assert!(
+            released,
+            "switch_schema_light 持着 schema_toggle_origin 去等 parked_toggle——与另一段的反向锁序构成死锁"
+        );
+        assert_eq!(c.engine_mgr.active_schema_id(), "zb");
+        assert!(
+            c.app_schema
+                .parked_toggle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(id, _)| id == "za"),
+            "仍有效的去程记录被挂起到来源方案 za 名下"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 冷方案延后切换的「检查 + 切换」与焦点切入互斥。
+    ///
+    /// 主线程持 `switch_lock` 扮演「焦点线程正处在一次切入的比较 + 切换中」，后台线程带着
+    /// 此刻仍有效的代际来做延后切换；随后焦点线程完成这次切入（代际 +1，目标仍是 za）。
+    /// 旧实现不等锁：代际检查早已通过、直接切到 zb——把方案切回一个已作废的目标。
+    /// 新实现被锁挡住，拿到锁时代际已变，放弃。无论后台线程何时被调度，新实现的结论都
+    /// 相同（它只可能在主线程放锁之后做检查）。
+    #[test]
+    fn deferred_switch_cannot_interleave_with_a_focus_switch() {
+        let (c, dir) = fixture("race");
+        warm_zb_then_back_to_za(&c);
+        let stale = c.app_schema.intent_gen.load(Ordering::SeqCst);
+        let focus_in_progress = c.app_schema.switch_lock.lock().unwrap();
+        let c2 = c.clone();
+        let h = std::thread::spawn(move || c2.finish_deferred_app_schema(stale, "code.exe", "zb"));
+        // 旧实现下后台线程不等锁，这段时间里就跑完了；新实现下它一直卡在锁上。
+        let _ = wait_until(|| h.is_finished());
+        // 焦点线程完成这次切入：代际 +1（目标 za = 当前，无需切）。
+        c.app_schema.intent_gen.fetch_add(1, Ordering::SeqCst);
+        drop(focus_in_progress);
+        h.join().unwrap();
+        assert_eq!(
+            c.engine_mgr.active_schema_id(),
+            "za",
+            "延后切换的检查与切换之间插进了一次焦点切入，不得再切回旧目标"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 焦点切入触发的轻量切换**只丢弃**缓冲：那一刻 active token 已是新宿主，按
+    /// `commit_on_switch` 上屏会把旧应用的码打进新应用。上屏语义只留给冷方案加载完成那条路。
+    #[test]
+    fn focus_switch_discards_pending_input_but_deferred_switch_commits() {
+        let (c, dir) = fixture_with("discard", |cfg| cfg.keys.commit_on_switch = true);
+        warm_zb_then_back_to_za(&c);
+        let cap = c.push_server.attach_capture_client((42u64 << 32) | 1);
+        let commit_a = wind_ipc::codec::encode_commit_text("a", None, false, true, false);
+        let clear = wind_ipc::codec::encode_clear_composition();
+
+        c.state.lock().unwrap().input_buffer = "a".into();
+        c.apply_app_schema_on_focus("code.exe");
+        assert_eq!(c.engine_mgr.active_schema_id(), "zb");
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert!(
+            !got.contains(&commit_a),
+            "焦点切入不得把旧缓冲按 commit_on_switch 上屏到新宿主"
+        );
+        assert!(!got.contains(&clear), "也不该给新宿主推清组合");
+        assert!(
+            c.state.lock().unwrap().input_buffer.is_empty(),
+            "缓冲必须丢弃"
+        );
+
+        // 对照：冷方案加载完成（焦点仍在该应用）那条路照 commit_on_switch 上屏——
+        // 否则上面几条断言在「一律不上屏」的实现下也会绿。
+        c.apply_app_schema_on_focus("plain.exe");
+        c.state.lock().unwrap().input_buffer = "a".into();
+        let _ = cap.try_iter().count();
+        let current = c.app_schema.intent_gen.load(Ordering::SeqCst);
+        c.finish_deferred_app_schema(current, "code.exe", "zb");
+        assert_eq!(c.engine_mgr.active_schema_id(), "zb");
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert!(
+            got.contains(&commit_a),
+            "冷方案加载完成时缓冲属于该应用，按策略上屏"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 固定 id 不在 available：同一 `(进程名, id)` 只 WARN 一次（每次切入/手切都会问规则）。
+    #[test]
+    fn invalid_fixed_id_is_reported_once_per_process_and_id() {
+        let (c, dir) = fixture("warn");
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_schema(&mut rules, "code.exe", Some("gone".into()));
+        wind_config::app_compat::set_schema(&mut rules, "vim.exe", Some("gone".into()));
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+        for _ in 0..3 {
+            assert_eq!(
+                c.app_schema_rule("code.exe"),
+                None,
+                "不在 available ⇒ 未配置"
+            );
+        }
+        let reported = || c.app_schema.warned_invalid.lock().unwrap().len();
+        assert_eq!(reported(), 1, "同一 (进程, id) 只报一次");
+        assert_eq!(c.app_schema_rule("vim.exe"), None);
+        assert_eq!(reported(), 2, "换一个进程要另报");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
