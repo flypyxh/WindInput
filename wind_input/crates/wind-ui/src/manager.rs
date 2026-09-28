@@ -1623,4 +1623,20 @@ mod menu_id_tests {
         assert_eq!(MenuKind::Label.to_menu_id(), 0);
         assert!(MenuKind::from_menu_id(0).is_none());
     }
+
+    /// 载荷是 `u8` 的号段只收 `base..=base+255`：`as u8` 会把越界 id 截断回段内
+    /// （`14256` → `PasswordForceEnglishRule(0)`），一个不认识的 id 就这样变成了「跟随全局」。
+    #[test]
+    fn u8_payload_ranges_reject_ids_past_255() {
+        for base in [14000, 16000, 17000] {
+            assert!(
+                MenuKind::from_menu_id(base + 255).is_some(),
+                "{base}+255 仍在段内"
+            );
+            assert!(
+                MenuKind::from_menu_id(base + 256).is_none(),
+                "{base}+256 超出 u8 载荷，不得截断成段内命令"
+            );
+        }
+    }
 }

@@ -365,7 +365,7 @@ impl MenuKind {
             9000..=9999 => MenuCmd::AutoPairRule((id - 9000) as u8),
             12000..=12999 => MenuCmd::CandidatePositionRule((id - 12000) as u8),
             13000..=13999 => MenuCmd::IgnoreHostImeCloseRule((id - 13000) as u8),
-            14000..=14999 => MenuCmd::PasswordForceEnglishRule((id - 14000) as u8),
+            14000..=14255 => MenuCmd::PasswordForceEnglishRule((id - 14000) as u8),
             15000..=15999 => MenuCmd::AppSchemaRule((id - 15000) as u16),
             16000..=16255 => MenuCmd::StatusPositionRule((id - 16000) as u8),
             17000..=17255 => MenuCmd::StatusFallbackRule((id - 17000) as u8),
