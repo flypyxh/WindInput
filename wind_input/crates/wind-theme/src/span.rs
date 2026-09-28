@@ -936,8 +936,13 @@ mod tests {
     // 标准色契约的引擎兜底（§5.4「引擎兜底」）。编辑器读同一份 theme.toml 与 expected.json 对拍。
     // 搜索链里**刻意不放** `data/themes`：兜底不依赖运行时能找到 `_base`。
 
-    /// 共用期望表的测试主题：写了气泡底色的一例、没写的一例（`tooltip_text` 兜底规则不同）。
-    const CONTRACT_FIXTURES: [&str; 2] = ["contract-nobase", "contract-nobase-nobg"];
+    /// 共用期望表的测试主题：写了气泡底色的一例、没写的一例（`tooltip_text` 兜底规则不同），
+    /// 以及 accent / text 也没写、引用型兜底全靠兜底值的一例。
+    const CONTRACT_FIXTURES: [&str; 3] = [
+        "contract-nobase",
+        "contract-nobase-nobg",
+        "contract-nobase-bgonly",
+    ];
 
     fn contract_expected(fixture: &str) -> String {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
