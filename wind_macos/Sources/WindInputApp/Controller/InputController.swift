@@ -57,6 +57,13 @@ public class InputController: IMKInputController {
     // 的盲区(见 syncSecureInputIfChanged)。
     private var lastReportedSecureInput = false
 
+    // 候选框右键菜单闪断期里被延后的 Deactivate (见 CandidateMenuTracking / deactivateServer)。
+    // 进程内至多一份: 闪断只发生在菜单所属的那个 client 上。仅主线程访问。
+    private static weak var blipDeferred: InputController?
+    private var blipSender: Any?     // 延后清 marked text 时要用的 client, 须强持
+    private var blipBundleID = ""    // 停用时的宿主, 用来认闪回 (见 activateServer)
+    private var blipGeneration = 0   // 兜底定时器据此判断自己是否已过期
+
     public override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
         super.init(server: server, delegate: delegate, client: inputClient)
 
@@ -88,6 +95,8 @@ public class InputController: IMKInputController {
     }
 
     deinit {
+        // 欠着延后的失焦就被释放 (菜单开着时宿主关了): 服务端那边补上, client 已不必再碰。
+        if blipSender != nil { sendEmpty(UpstreamCmd.focusLost) }
         bridge?.close()
     }
 
@@ -97,6 +106,25 @@ public class InputController: IMKInputController {
     /// 从而驱动工具栏 reducer 显示模式指示器 (CmdModeStatus → 菜单栏)。
     public override func activateServer(_ sender: Any!) {
         super.activateServer(sender)
+        if let pending = Self.blipDeferred {
+            Self.blipDeferred = nil
+            // 闪回不一定落在同一个 controller 上: Spotlight 实测第二对 D/A 换了个新实例来
+            // Activate (2026-09-28 日志)。所以闪断期内同一宿主的 Activate 都算闪回。
+            let bundleID = (sender as? IMKTextInput)?.bundleIdentifier() ?? ""
+            let sameHost = !bundleID.isEmpty && bundleID == pending.blipBundleID
+            if pending === self || (CandidateMenuTracking.inFocusBlip && sameHost) {
+                // 右键菜单造成的闪回: 服务端从没收到 FocusLost, 这次 Activate 也就不必再报,
+                // 组合与候选原样保留。
+                pending.blipSender = nil
+                if pending !== self { router.adoptState(from: pending.router) }
+                currentClient = sender as? (IMKTextInput & NSObjectProtocol)
+                CandidatePanelHost.shared.activeResponder = self
+                ensureConnected()   // 菜单开着期间服务可能重启过; 连着时是空操作
+                return
+            }
+            // 菜单开着时用户点去了别的文本框: 先把旧 client 欠下的失焦补上, 再走正常激活。
+            pending.flushDeferredDeactivation()
+        }
         currentClient = sender as? (IMKTextInput & NSObjectProtocol)
         CandidatePanelHost.shared.activeResponder = self
         // 数字后智能标点的记账只对「这一个文本框里我们自己打出去的东西」有效，换了焦点
@@ -116,13 +144,56 @@ public class InputController: IMKInputController {
         // 像 Win TSF 那样自动收回), 且与 Go 端不一致 (HandleFocusLost 对普通焦点切换
         // 已 clearState 清空 inputBuffer)。两端一致后, 切回该文本框是全新一轮输入。
         // 必须在 super.deactivateServer 之前做: 此时 sender client 仍可接收 setMarkedText。
+        //
+        // 例外是候选框右键菜单的闪断期 (A2-53 追记): 菜单抢键盘焦点会让 Spotlight 这类宿主
+        // 连发 Deactivate/Activate, 照常处理就把候选连同菜单一起收掉。此时先记账不动手,
+        // 紧跟着的同 client Activate 把它抵消; 等不到就由兜底定时器补做。补做时已在
+        // super.deactivateServer 之后, 清 marked text 只能尽力而为——所以闪断期要短。
+        if CandidateMenuTracking.inFocusBlip {
+            deferDeactivation(sender)
+        } else {
+            performDeactivation(sender)
+        }
+        super.deactivateServer(sender)
+    }
+
+    private func performDeactivation(_ sender: Any?) {
         if !composition.isEmpty {
             let imkClient = sender as? IMKTextInput
             let adapter = imkClient.map { IMKClientAdapter(imkClient: $0, controller: self) }
             router.applyClearComposition(client: adapter)
         }
         sendEmpty(UpstreamCmd.focusLost)
-        super.deactivateServer(sender)
+    }
+
+    private func deferDeactivation(_ sender: Any?) {
+        if let other = Self.blipDeferred, other !== self { other.flushDeferredDeactivation() }
+        Self.blipDeferred = self
+        blipSender = sender
+        blipBundleID = (sender as? IMKTextInput)?.bundleIdentifier() ?? ""
+        blipGeneration &+= 1
+        scheduleBlipFallback(generation: blipGeneration)
+    }
+
+    /// 闪断期过去仍没等到同 client 的 Activate (如点桌面收起菜单、宿主随之关闭),
+    /// 就当真失焦补做。菜单还开着则顺延——跟踪循环多长都不该在中途误判。
+    private func scheduleBlipFallback(generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + CandidateMenuTracking.trailingGrace) { [weak self] in
+            guard let self = self, Self.blipDeferred === self, self.blipGeneration == generation else { return }
+            if CandidateMenuTracking.inFocusBlip {
+                self.scheduleBlipFallback(generation: generation)
+            } else {
+                Self.blipDeferred = nil
+                self.flushDeferredDeactivation()
+            }
+        }
+    }
+
+    private func flushDeferredDeactivation() {
+        if Self.blipDeferred === self { Self.blipDeferred = nil }
+        let sender = blipSender
+        blipSender = nil
+        performDeactivation(sender)
     }
 
     /// 发 FocusGained 帧, 携带 InputScope bitmask。读掉 ack, 失败仅 log。
