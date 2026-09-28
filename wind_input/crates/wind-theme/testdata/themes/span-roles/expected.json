@@ -1,6 +1,6 @@
 {
   "light": {
-    "comment": {"text": "#969696FF", "roles": {"code_hint": "#1A73E8FF", "code_rev": "#C00000FF", "code_rev_all": "#1A73E8FF", "literal": "#B0B0B0FF", "pinyin": "#008000FF", "shuangpin": "#1A73E8FF"}, "selected": {"text": "#FFFFFFFF", "roles": {"code_rev": "#FFE08AFF"}}, "hover": {"text": null, "roles": {"pinyin": "#0000FFFF"}}},
+    "comment": {"text": "#969696FF", "roles": {"code_rev": "#C00000FF", "literal": "#B0B0B0FF", "pinyin": "#008000FF"}, "selected": {"text": "#FFFFFFFF", "roles": {"code_rev": "#FFE08AFF"}}, "hover": {"text": null, "roles": {"pinyin": "#0000FFFF"}}},
     "tooltip": {"text": "#FFFFFFFF", "roles": {"chaizi": "#FDD663FF", "chaizi_all": "#FDD663FF", "chaizi_code": "#8AB4F8FF", "chaizi_code_all": "#8AB4F8FF", "code_source": "#8AB4F8FF", "full_text": "#8AB4F8FF", "readings": "#9AD0FFFF", "title": "#4285F4FF", "unicode": "#F28B82FF", "unicode_all": "#F28B82FF", "word_code": "#81C995FF"}},
     "span": [
       {"node": "comment", "state": "normal", "role": "code_rev", "in_title": false, "color": "#C00000FF"},
@@ -93,7 +93,7 @@
     ]
   },
   "dark": {
-    "comment": {"text": "#808080FF", "roles": {"code_hint": "#8AB4F8FF", "code_rev": "#FF8080FF", "code_rev_all": "#8AB4F8FF", "literal": "#606060FF", "pinyin": "#008000FF", "shuangpin": "#8AB4F8FF"}, "selected": {"text": "#FFFFFFFF", "roles": {"code_rev": "#FFE08AFF"}}, "hover": {"text": null, "roles": {"pinyin": "#0000FFFF"}}},
+    "comment": {"text": "#808080FF", "roles": {"code_rev": "#FF8080FF", "literal": "#606060FF", "pinyin": "#008000FF"}, "selected": {"text": "#FFFFFFFF", "roles": {"code_rev": "#FFE08AFF"}}, "hover": {"text": null, "roles": {"pinyin": "#0000FFFF"}}},
     "tooltip": {"text": "#E0E0E0FF", "roles": {"chaizi": "#FDD663FF", "chaizi_all": "#FDD663FF", "chaizi_code": "#8AB4F8FF", "chaizi_code_all": "#8AB4F8FF", "code_source": "#8AB4F8FF", "full_text": "#8AB4F8FF", "readings": "#9AD0FFFF", "title": "#4285F4FF", "unicode": "#F28B82FF", "unicode_all": "#F28B82FF", "word_code": "#81C995FF"}},
     "span": [
       {"node": "comment", "state": "normal", "role": "code_rev", "in_title": false, "color": "#FF8080FF"},

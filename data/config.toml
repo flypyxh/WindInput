@@ -1256,8 +1256,8 @@ min_rows = 0
 # 没有就显示主码表反查编码，再没有（例如没配主码表的用户）就显示双拼编码。
 # 前两段等价于本功能引入前的固定行为，故配了主码表的用户升级后所见不变。
 # ${code} / ${code_all} 是 ${code_rev} / ${code_rev_all} 的兼容别名，老模板照常可用。
-# 颜色：各变量的文字按主题的「角色色」上色（出厂主题给 code_hint / code_rev / code_rev_all / shuangpin
-# 配了标准色 info）；模板里也能直接写 $[颜色]{…}，优先于主题。详见下方链接的「内联颜色」一节。
+# 颜色：出厂注释整段是主题的注释色；主题可按变量配「角色色」，模板里也能直接写 $[颜色]{…}
+# （优先于主题），如 "$[info]{${code_hint|code_rev|shuangpin}}"。详见下方链接的「内联颜色」一节。
 # 例：竖排显示字根与注音 → "{〔${chaizi}〕}{ ${pinyin}}"
 # 例：同时看码表码与双拼码 → "${code_hint|code_rev}{ [${shuangpin}]}"
 # 完整说明与更多示例：https://windinput.com/docs/settings/appearance/candidate-comment

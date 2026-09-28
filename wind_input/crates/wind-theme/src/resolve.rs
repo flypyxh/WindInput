@@ -1234,9 +1234,9 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
         );
     }
 
-    /// 出厂角色色表（设计 §18）：`_base` 配、全部出厂主题继承且不改——注释三个编码类角色取
-    /// 本主题 `info`，气泡七个角色取本主题的 `tooltip_*`（主题 roles 里的 `${token}` 按字面解析，
-    /// 不做 `tooltip_` 作用域查找，§6.2，故必须显式写 `tooltip_*`）。状态 patch 与其余节点一律不配。
+    /// 出厂角色色表（设计 §18）：`_base` 配、全部出厂主题继承且不改——只有气泡配，取本主题的
+    /// `tooltip_*`（主题 roles 里的 `${token}` 按字面解析，不做 `tooltip_` 作用域查找，§6.2，
+    /// 故必须显式写 `tooltip_*`）。注释不配（用户要求保持原外观），状态 patch 与其余节点也一律不配。
     #[test]
     fn factory_theme_roles_are_the_base_table() {
         let ids = crate::list_theme_ids(&data_dir_for_roles());
@@ -1272,10 +1272,6 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
                     }
                 }
                 let pal = |k: &str| t.palette[k];
-                let want_comment: std::collections::HashMap<String, Rgba> =
-                    ["code_hint", "code_rev", "code_rev_all", "shuangpin"]
-                        .map(|r| (r.to_string(), pal("info")))
-                        .into();
                 let want_tooltip: std::collections::HashMap<String, Rgba> = [
                     ("full_text", "tooltip_accent_text"),
                     ("readings", "tooltip_accent_text"),
@@ -1300,7 +1296,6 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
                     for (i, st) in states.into_iter().enumerate() {
                         let Some(st) = st else { continue };
                         let want = match (k, i) {
-                            ("comment", 0) => &want_comment,
                             ("tooltip", 0) => &want_tooltip,
                             _ => {
                                 assert!(

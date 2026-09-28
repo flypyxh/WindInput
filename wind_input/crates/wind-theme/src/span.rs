@@ -636,15 +636,27 @@ mod tests {
         [mix(0), mix(1), mix(2), 255]
     }
 
-    /// ★ `_base` 的出厂角色色（§18）在**全部出厂主题** × 亮暗 × 注释常态 / 选中 / 悬停（气泡只有
-    /// 常态，段名里的变量另算一遍）下可读，按与渲染同一口径的 `span_color` 逐格求色：
-    /// - 注释 ≥ 3.5，且不低于它取代的注释正文色（`text_hint`，出厂白底上只有 2.96）。门槛低于
-    ///   WCAG AA 的 4.5 是有意的：`info` 在出厂选中底上最低 3.85，要 4.5 只能放弃选中态着色；
-    /// - 气泡按不透明底 ≥ 4.5（同 §5.4 的对比度表），半透明底叠在纯白桌面上的最坏情况 ≥ 3.5；
-    /// - 每个出厂角色都真的着了色（≠ 正文色）：角色表丢了一项、token 写错解析不出，都在这里红。
+    /// ★ `_base` 的出厂角色色（§18），按与渲染同一口径的 `span_color` 在**全部出厂主题** × 亮暗下逐格求色：
+    /// - 注释**不上色**（用户要求保持原外观）：各变量角色在常态 / 选中 / 悬停都等于注释正文色；
+    /// - 气泡各角色真的着了色（≠ 正文色），且按不透明底 ≥ 4.5（同 §5.4 的对比度表）、半透明底叠在
+    ///   纯白桌面上的最坏情况 ≥ 3.5；段名里的变量另算一遍。
     #[test]
     fn factory_role_colors_are_readable() {
-        const COMMENT_ROLES: &[&str] = &["code_hint", "code_rev", "code_rev_all", "shuangpin"];
+        // 注释模板可用的全部变量角色 + 字面文字（wind-ui-types `TEXT_ROLES` 的注释那部分）。
+        const COMMENT_ROLES: &[&str] = &[
+            "code_hint",
+            "emoji",
+            "code_rev",
+            "code_rev_all",
+            "shuangpin",
+            "pinyin",
+            "chaizi",
+            "chaizi_code",
+            "chaizi_all",
+            "chaizi_code_all",
+            "dict",
+            "literal",
+        ];
         const TOOLTIP_ROLES: &[&str] = &[
             "full_text",
             "readings",
@@ -669,32 +681,15 @@ mod tests {
             for dark in [false, true] {
                 let t = factory(name, dark);
                 let v = &t.views;
-                let win = v.window.bg_color.unwrap_or(crate::fallback::WINDOW_BG);
-                let patch_bg = |p: &Option<Box<RvNode>>, what: &str| {
-                    let c = p
-                        .as_ref()
-                        .and_then(|n| n.bg_color)
-                        .unwrap_or_else(|| panic!("{name} dark={dark}: item.{what} 没有底色"));
-                    over(c, win)
-                };
-                for (state, bg) in [
-                    (Normal, win),
-                    (TextState::Selected, patch_bg(&v.item.selected, "selected")),
-                    (TextState::Hover, patch_bg(&v.item.hover, "hover")),
-                ] {
+                for state in [Normal, TextState::Selected, TextState::Hover] {
                     let fb = crate::fallback::COMMENT_TEXT;
                     let body = body_color(&v.comment, state, fb);
                     for role in COMMENT_ROLES {
                         let got =
                             span_color(&t, &v.comment, false, state, fb, Some(role), false, None);
-                        let (r, base) = (contrast(got, bg), contrast(body, bg));
-                        assert_ne!(
+                        assert_eq!(
                             got, body,
-                            "{name} dark={dark} {state:?}: 注释 {role} 没着色"
-                        );
-                        assert!(
-                            r >= 3.5 && r >= base,
-                            "{name} dark={dark} {state:?}: 注释 {role} 对比度 {r:.2}（正文色 {base:.2}）"
+                            "{name} dark={dark} {state:?}: 注释 {role} 出厂不该上色"
                         );
                     }
                 }

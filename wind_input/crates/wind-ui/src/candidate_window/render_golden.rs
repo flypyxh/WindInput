@@ -17,9 +17,9 @@
 //! 只在**有意**改变出厂外观时才重录：`WIND_UI_BLESS_GOLDEN=1 cargo test -p wind-ui --lib
 //! render_golden`，然后在提交里说明为什么变。改渲染层时 golden 红了，默认是回归。
 //!
-//! 重录记录：2026-09-28 `_base` 配了注释与气泡的角色色（设计 §18），出厂外观有意改变。
-//! 那次重录的差异**只有**注释 / 气泡文字多出颜色区间（`runs=` / `draw_runs`），布局、字号、
-//! 像素摘要逐字节不变。
+//! 重录记录：2026-09-28 `_base` 配了气泡的角色色（设计 §18），出厂外观有意改变。重录的差异
+//! **只有**气泡文字多出颜色区间（`runs=` / `draw_runs`），布局、字号、像素摘要逐字节不变；
+//! 候选窗部分（含注释）与分段着色之前逐字节相同——注释出厂不上色。
 
 use super::*;
 use std::path::PathBuf;
@@ -92,8 +92,8 @@ fn role_text(text: &str, role: &'static str) -> StyledText {
 
 /// 出厂注释模板 `${code_hint|code_rev|shuangpin}` 渲染出的样子：短编码、空注释、多字词编码。
 ///
-/// ★ 带着协调器真实产出的**片段角色**（P2 起模板引擎恒产出片段）：`_base` 给这三个编码类
-/// 角色配了 `info`（§18），出厂主题下它们画成颜色区间；角色色一旦失效，golden 就红。
+/// ★ 带着协调器真实产出的**片段角色**（P2 起模板引擎恒产出片段）：出厂主题不给注释配角色
+/// （§18），这些片段必须全部解析到正文色而被丢弃，候选窗部分才与分段着色之前逐字节相同（§6.4）。
 fn candidates() -> Vec<CandidateItem> {
     let c = |text: &str, comment: StyledText| CandidateItem {
         text: text.to_string(),
@@ -253,13 +253,11 @@ fn golden_covers_comments_and_tooltip() {
     ] {
         assert!(got.contains(needle), "golden 里找不到 {needle}");
     }
-    // `_base` 的角色色（§18）：注释编码是 `info`（亮档 #1A73E8），气泡编码是 `tooltip_success`。
-    let info = "rgba: [26, 115, 232, 255]";
-    assert!(
-        got.lines()
-            .any(|l| l.starts_with("draw_runs text=\"vb\"") && l.contains(info)),
-        "注释编码应按 _base 的 code_hint 角色画成 info"
-    );
+    // 候选窗（含注释）没有任何调用走 runs：注释出厂不上色，片段全部解析到正文色、被丢弃。
+    let window = got.split("== 气泡 ==").next().unwrap();
+    assert!(!window.contains("draw_runs"), "候选窗不应出现 draw_runs");
+    assert!(!window.contains(" runs="), "候选窗 View 树不应带颜色区间");
+    // `_base` 的气泡角色色（§18）：编码是 `tooltip_success`。
     assert!(
         got.contains("rgba: [129, 201, 149, 255]"),
         "气泡编码应按 _base 的 word_code 角色画成 tooltip_success"
