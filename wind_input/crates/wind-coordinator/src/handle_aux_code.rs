@@ -2122,4 +2122,126 @@ mod tests {
             "合并层里低优表的码同样生效"
         );
     }
+
+    /// ★ 全拼默认辅助码从 `aux_code/stroke.txt` 改为引用笔画码表方案（`schema:stroke`）后，
+    /// 筛选结果必须**逐字一致**——两份数据由 `gen_aux_code` 同一次解析产出，这里用真实产物
+    /// 对拍：同一组拼音候选、`hspnz` 上全部 1~3 码的辅助码输入，两种来源留下的候选相同。
+    ///
+    /// 数据取 `build_dev/data`（gen-data 产物，不入库），缺则跳过（全仓惯例）。方案文件取
+    /// 仓库里入库的 `data/schemas/stroke.schema.toml`，只把 id 换成本进程唯一的（反查索引的
+    /// 磁盘缓存按 id 落在共享目录，见 [`write_wbx`]）。
+    #[test]
+    fn stroke_schema_source_filters_like_stroke_txt() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let built = root.join("build_dev/data/schemas");
+        let (txt, dict) = (
+            built.join("aux_code/stroke.txt"),
+            built.join("stroke/stroke.dict.yaml"),
+        );
+        if !txt.is_file() || !dict.is_file() {
+            eprintln!(
+                "跳过 stroke_schema_source_filters_like_stroke_txt：缺 {} 或 {}（先跑 gen-data）",
+                txt.display(),
+                dict.display()
+            );
+            return;
+        }
+        let schema_text = std::fs::read_to_string(root.join("data/schemas/stroke.schema.toml"))
+            .expect("入库的 stroke.schema.toml");
+        let id = wbx_id("stroke");
+        let (dir, _g) = data_dir_with_files("stroke", r#"["aux_code/stroke.txt"]"#, &id);
+        let schemas = dir.join("schemas");
+        std::fs::copy(&txt, schemas.join("aux_code/stroke.txt")).unwrap();
+        std::fs::create_dir_all(schemas.join("stroke")).unwrap();
+        std::fs::copy(&dict, schemas.join("stroke/stroke.dict.yaml")).unwrap();
+        let replaced = schema_text.replace("id = \"stroke\"", &format!("id = \"{id}\""));
+        assert_ne!(replaced, schema_text, "方案文件里应有 id = \"stroke\"");
+        std::fs::write(schemas.join(format!("{id}.schema.toml")), replaced).unwrap();
+        // 第二份 data_dir：同一套文件，只把 pinyin 的来源换成方案引用。
+        let dir_schema = dir.with_file_name(format!(
+            "{}_schema",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&dir_schema);
+        copy_dir(&dir, &dir_schema);
+        let _g2 = Cleanup {
+            id: id.clone(),
+            dir: dir_schema.clone(),
+        };
+        let pinyin = dir_schema.join("schemas/pinyin.schema.toml");
+        let text = std::fs::read_to_string(&pinyin).unwrap();
+        let swapped = text.replace(r#"["aux_code/stroke.txt"]"#, &format!(r#"["schema:{id}"]"#));
+        assert_ne!(swapped, text, "pinyin 的来源应已换成方案引用");
+        std::fs::write(&pinyin, swapped).unwrap();
+
+        let by_file = coord_with_data("stroke_file", dir);
+        let by_schema = coord_with_data("stroke_schema", dir_schema);
+        by_schema.engine_mgr.prewarm_text_codes(&id);
+
+        // 「li」一页的常见候选 + 几个词组（词组走逐字首码）+ 一个无码字符。
+        let texts = [
+            "李", "里", "理", "力", "利", "立", "离", "例", "历", "丽", "礼", "黎", "粒", "莉",
+            "梨", "璃", "哩", "栗", "历史", "利用", "理解", "力量", "里面", "A",
+        ];
+        let letters = ['h', 's', 'p', 'n', 'z'];
+        let mut inputs: Vec<String> = Vec::new();
+        for a in letters {
+            for b in letters {
+                for c in letters {
+                    inputs.push([a, b, c].iter().collect());
+                }
+            }
+        }
+        let mut narrowed = 0usize;
+        for input in &inputs {
+            let run = |c: &Arc<Coordinator>| -> Vec<Vec<String>> {
+                let mut st = seed(c, &texts);
+                assert!(c.enter_aux_code(&mut st, keymap::VK_BACKTICK).is_some());
+                let steps = input
+                    .chars()
+                    .map(|ch| {
+                        let vk = vk_letter(ch.to_ascii_uppercase());
+                        let _ = c.handle_aux_code_key(&mut st, &key(vk, 0));
+                        kept(&st)
+                    })
+                    .collect();
+                let _ = c.handle_aux_code_key(&mut st, &key(keymap::VK_ESCAPE, 0));
+                steps
+            };
+            let (a, b) = (run(&by_file), run(&by_schema));
+            assert_eq!(a, b, "辅助码 {input}：文件来源与方案来源筛出的候选不同");
+            narrowed += a
+                .iter()
+                .filter(|k| !k.is_empty() && k.len() < texts.len())
+                .count();
+        }
+        // 反向保证：确实在筛（不是两边都原样放行而恒等）。
+        assert!(
+            narrowed > 100,
+            "有效筛选步数过少（{narrowed}），对拍多半没测到东西"
+        );
+        // 抽查一条已知码：「力」的上游笔画码是 zp（折撇）。
+        let mut st = seed(&by_schema, &texts);
+        assert!(
+            by_schema
+                .enter_aux_code(&mut st, keymap::VK_BACKTICK)
+                .is_some()
+        );
+        let _ = by_schema.handle_aux_code_key(&mut st, &key(vk_letter('Z'), 0));
+        let _ = by_schema.handle_aux_code_key(&mut st, &key(vk_letter('P'), 0));
+        assert!(kept(&st).contains(&"力".to_string()), "{:?}", kept(&st));
+    }
+
+    /// 递归复制目录（测试夹具用）。
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let dst = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &dst);
+            } else {
+                std::fs::copy(e.path(), dst).unwrap();
+            }
+        }
+    }
 }
