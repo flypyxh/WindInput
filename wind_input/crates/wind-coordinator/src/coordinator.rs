@@ -6157,9 +6157,9 @@ impl Coordinator {
         let scope_prefix = rt.config.input.scope_relax.prefix.as_str();
         // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
         // 受 source==Pinyin 守卫)。门控两类:
-        //  - 普通拼音/混输方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource);
-        //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):**无视开关强制显示**
-        //    (对齐 Go AddCodeHintsForced)——这些模式本身就是"用拼音反查码表编码",必须出码。
+        //  - 普通拼音/混输方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource,出厂 off);
+        //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):跟随独立的
+        //    input.temp_pinyin.code_hint_source(出厂 auto,可关),见 comment_hint_source。
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
         let force_hint = Self::forces_code_hint(state);
         let hint_source = self.comment_hint_source(state);

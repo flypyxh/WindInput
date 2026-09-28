@@ -197,16 +197,18 @@ draft_max_entries = 50000
 draft_flush_batch = 64
 
 # 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
+# （例外：编码来源 code_hint_source 临时拼音/快捷输入另有一份，见 [input.temp_pinyin]。）
 [schema.pinyin]
-# 拼音方案下，候选注释里的编码从哪来。四档：
-#   off        两种都不显示
+# 拼音方案（含双拼）下，候选注释里的编码从哪来。四档：
+#   off        两种都不显示（出厂）
 #   codetable  只显示主码表反查编码（${code_rev} / ${code_rev_all}）
 #   shuangpin  只显示双拼编码（${shuangpin}）
-#   auto       两者都允许，谁先出由下方注释模板的回退链决定（出厂）
+#   auto       两者都允许，谁先出由下方注释模板的回退链决定
 # 开关管「允许哪些来源求值」，模板管「按什么顺序和格式摆」——两层不重叠。
-# 认不出的值按出厂档处理。
+# 出厂 off：编码反查是给码表用户的，纯拼音/双拼用户多半用不上；需要的话改成 codetable/auto。
+# 临时拼音/快捷输入不读这里，读 [input.temp_pinyin] 的同名键。认不出的值按 auto 处理。
 # 旧的 show_code_hint 已改名：升级时 true 自动迁移为 codetable（严格零回归）、false 为 off。
-code_hint_source = "auto"
+code_hint_source = "off"
 use_smart_compose = true
 # 让**你上屏过的词**（用户词库 + 临时词库）参与整句解码（智能组句）。
 #
@@ -908,6 +910,9 @@ trigger_keys = ["backtick"]
 # 用热键进入时组合区不写引导符。
 hotkey = ""
 candidate_layout = "follow"
+# 临时拼音与快捷输入期间，拼音候选注释里的编码从哪来。值域同 [schema.pinyin] 的同名键，
+# 但两者独立：这里是码表用户借拼音反查编码的场景，出厂 auto；设 off 即不显示。
+code_hint_source = "auto"
 
 [input.auto_pair]
 chinese = false
@@ -1241,7 +1246,8 @@ min_rows = 0
 #
 # 可用变量：
 #   code_hint          引擎产的编码提示（码表前缀候选的剩余编码 si→sikao 标 kao；混输标记「拼」）
-#   code_rev           主码表整词反查编码（仅拼音来源候选，受 schema.pinyin.code_hint_source 门控）
+#   code_rev           主码表整词反查编码（仅拼音来源候选，受 schema.pinyin.code_hint_source 门控；
+#                      临时拼音/快捷输入期间改受 input.temp_pinyin.code_hint_source 门控）
 #   shuangpin          双拼编码（你好 → 小鹤 nihc）。同受上述门控。
 #                      **全拼方案下照样有值**：布局按「活跃方案→主拼音方案→已装的首个
 #                      双拼方案」回退，一个双拼方案都没装才恒空

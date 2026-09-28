@@ -1035,7 +1035,8 @@ impl Default for EnglishFrequency {
     }
 }
 
-/// `schema.pinyin.code_hint_source` 的值域：**拼音方案下**，候选注释里的编码从哪来。
+/// `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` 的值域：
+/// 拼音来源候选的注释里，编码从哪来。两个键各管一摊（拼音方案 vs 临拼/快捷输入），值域相同。
 ///
 /// 分工是「开关管允许哪些来源求值、模板管按什么顺序和格式摆」，两层不重叠。用户在模板里
 /// 写了某个变量却把它的来源关掉时，该变量恒空——按配置办事。
@@ -1088,13 +1089,13 @@ pub enum CodeHintSource {
     CodeTable,
     /// 只显示双拼编码。
     Shuangpin,
-    /// 两者都求值，谁先出由模板的回退链决定。出厂档。
+    /// 两者都求值，谁先出由模板的回退链决定。临拼的出厂档，也是认不出的值的兜底档。
     #[default]
     Auto,
 }
 
 impl CodeHintSource {
-    /// 认不出的值回落出厂档。与仓里其它字符串枚举（`first_show_mode` 等）同一取舍：
+    /// 认不出的值回落 `auto`。与仓里其它字符串枚举（`first_show_mode` 等）同一取舍：
     /// 配置是用户手打的，写错一个字母不该让整个功能消失，更不该弹错误框。
     ///
     /// ⚠️ match 臂必须与 `config_schema::CODE_HINT_SOURCE_VALUES` **逐项对齐**。这里多认
@@ -1118,36 +1119,27 @@ impl CodeHintSource {
     pub fn allows_shuangpin(self) -> bool {
         matches!(self, Self::Shuangpin | Self::Auto)
     }
-
-    /// 在本档基础上**强制放行反查**，其余照旧。
-    ///
-    /// 给 overlay 反查模式（临时拼音 / 快捷输入内拼音）用：那些模式本身就是「用拼音反查
-    /// 码表编码」，出不了码就失去意义，所以无视用户把来源关掉的配置。
-    ///
-    /// ★ 是**并集**不是替换。直接改写成 `CodeTable` 的话，一个把来源设成 `Shuangpin`
-    /// （「我只要看双拼码」）的用户一进快捷输入，看到的反而只剩他选择不看的那种码。
-    /// 强制放行 A 不该顺手关掉 B —— 旧的 `pinyin_hint = force_hint || ...` 也只做加法。
-    pub fn forcing_reverse(self) -> Self {
-        match self {
-            Self::Off | Self::CodeTable => Self::CodeTable,
-            Self::Shuangpin | Self::Auto => Self::Auto,
-        }
-    }
 }
 
-/// 出厂档：两种编码都允许，由模板回退链决定谁先出。
+/// 拼音方案的出厂档：`off`，两种编码都不显示。
 ///
-/// 新装用户因此一上手就能看到编码——有主码表时是反查码，没有时是本方案击键。
+/// 编码反查提示是给码表用户设计的；绝大多数纯拼音/双拼用户不熟悉也不需要，出厂开着
+/// 只会让候选旁多一串看不懂的字母。码表用户照样可以在设置里打开。
 /// 老用户走 [`Config::migrate_show_code_hint_value`]，映到 `codetable` 保持原样。
+///
+/// ⚠️ 临拼/快捷输入不再共用本字段，出厂值也不同，见 `input.temp_pinyin.code_hint_source`
+/// （[`default_temp_pinyin_code_hint_source`]）。
 fn default_code_hint_source() -> String {
-    "auto".to_string()
+    "off".to_string()
 }
 
-/// 全局拼音配置（[schema.pinyin]）。所有拼音类方案共用，无方案级 override。
+/// 全局拼音配置（[schema.pinyin]）。所有拼音类方案（全拼/双拼/混输拼音子方案）共用，
+/// 无方案级 override。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinyinGlobalConfig {
-    /// 拼音方案下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
-    /// 认不出的值回落出厂档（`auto`）。
+    /// 拼音方案（含双拼）下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
+    /// 出厂 `off`（理由见 `default_code_hint_source`）；认不出的值回落 `auto`。
+    /// 临拼/快捷输入不读本字段，读 `input.temp_pinyin.code_hint_source`。
     #[serde(default = "default_code_hint_source")]
     pub code_hint_source: String,
     #[serde(default = "default_true")]
@@ -4376,10 +4368,24 @@ pub struct TempPinyinConfig {
     /// 临拼期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_template_horizontal: CommentTemplateOverride,
+    /// 临拼与快捷输入（mix）期间，拼音候选注释里的编码从哪来。值域同 [`CodeHintSource`]。
+    ///
+    /// 独立于拼音方案那份 `schema.pinyin.code_hint_source`：临拼正是码表用户借拼音反查
+    /// 编码的典型场景，出厂 `auto`；拼音方案面向的是纯拼音/双拼用户，出厂 `off`。
+    /// 两类用户习惯相反，共用一份就只能顾一头。设成 `off` 即真正关掉（旧实现强制放行反查、
+    /// 关不掉）。
+    #[serde(default = "default_temp_pinyin_code_hint_source")]
+    pub code_hint_source: String,
 }
 
 fn default_temp_pinyin_triggers() -> Vec<String> {
     vec!["backtick".to_string()]
+}
+
+/// 临拼的编码来源出厂档：`auto`。⛔ 不能复用 [`default_code_hint_source`]——那份出厂是
+/// `off`，复用会把码表用户的反查场景一并关掉。
+fn default_temp_pinyin_code_hint_source() -> String {
+    "auto".to_string()
 }
 
 impl Default for TempPinyinConfig {
@@ -4391,6 +4397,7 @@ impl Default for TempPinyinConfig {
             candidate_layout: LayoutIntent::default(),
             comment_template_vertical: None,
             comment_template_horizontal: None,
+            code_hint_source: default_temp_pinyin_code_hint_source(),
         }
     }
 }
@@ -12411,33 +12418,39 @@ scripts = { latin = 42 }
         );
     }
 
-    /// 没有旧键就不动，让出厂值 `auto` 生效（新装用户一上手就能看到编码）。
+    /// 没有旧键就不动，让出厂值 `off` 生效（纯拼音/双拼用户默认不看编码反查）。
     #[test]
     fn migrate_show_code_hint_leaves_fresh_config_alone() {
         let mut v: toml::Value = toml::from_str("[schema.pinyin]\nseparator = \"auto\"\n").unwrap();
         let before = v.clone();
         Config::migrate_show_code_hint_value(&mut v);
         assert_eq!(v, before);
-        assert_eq!(PinyinGlobalConfig::default().code_hint_source, "auto");
+        assert_eq!(PinyinGlobalConfig::default().code_hint_source, "off");
     }
 
-    /// `forcing_reverse` 是并集：强制放行反查，但不动 schema 那一列。
+    /// ★ 两份编码来源开关各有各的出厂值：拼音方案 `off`、临时拼音 `auto`。
     ///
-    /// 替换式实现（恒返回 `CodeTable`）会让「只要双拼码」的用户一进快捷输入模式，
-    /// 看到的反而只剩他明确选择不看的码表反查码。
+    /// 临拼那份若复用 `default_code_hint_source`，拼音方案改 off 时会被一并拖成 off——
+    /// 码表用户借临拼反查编码的典型场景就此静默失效。代码默认与 serde 缺键两条路都钉。
     #[test]
-    fn forcing_reverse_is_a_union_not_a_replacement() {
-        use CodeHintSource::*;
-        for src in [Off, CodeTable, Shuangpin, Auto] {
-            let forced = src.forcing_reverse();
-            assert!(forced.allows_reverse(), "{src:?}：强制后必须放行反查");
-            assert!(
-                !src.allows_shuangpin() || forced.allows_shuangpin(),
-                "{src:?}：强制放行反查不该顺手关掉 shuangpin"
-            );
-        }
-        assert_eq!(Shuangpin.forcing_reverse(), Auto);
-        assert_eq!(Off.forcing_reverse(), CodeTable);
+    fn temp_pinyin_code_hint_source_defaults_to_auto_independently() {
+        let c = Config::default();
+        assert_eq!(c.schema.pinyin.code_hint_source, "off");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
+        assert_eq!(
+            CodeHintSource::from_config(&c.input.temp_pinyin.code_hint_source),
+            CodeHintSource::Auto
+        );
+        // 写了 [input.temp_pinyin] 段但没写本键 → serde default 兜底，仍是 auto。
+        let c = merged_with("[input.temp_pinyin]\nenabled = true\n");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
+        // 只改拼音方案那份，不连带临拼。
+        let c = merged_with("[schema.pinyin]\ncode_hint_source = \"shuangpin\"\n");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
+        // 临拼那份可以显式关掉。
+        let c = merged_with("[input.temp_pinyin]\ncode_hint_source = \"off\"\n");
+        assert_eq!(c.input.temp_pinyin.code_hint_source, "off");
+        assert_eq!(c.schema.pinyin.code_hint_source, "off");
     }
 
     /// 四档各自允许哪些变量求值——「开关管允许哪些来源、模板管怎么摆」的全部含义。
@@ -12455,7 +12468,7 @@ scripts = { latin = 42 }
         }
     }
 
-    /// 认不出的值回落出厂档，不是静默关闭。
+    /// 认不出的值回落 `auto`，不是静默关闭。
     ///
     /// 配置是用户手打的：把 `schema` 拼成 `schama` 就整个功能消失，是那种「配了没反应」
     /// 的静默失效——本仓记忆里反复出现的那一类。
@@ -12561,7 +12574,7 @@ scripts = { latin = 42 }
     #[test]
     fn pinyin_global_config_defaults() {
         let c = Config::default();
-        assert_eq!(c.schema.pinyin.code_hint_source, "auto");
+        assert_eq!(c.schema.pinyin.code_hint_source, "off");
         assert!(c.schema.pinyin.use_smart_compose);
         assert_eq!(c.schema.pinyin.separator, "auto");
         assert!(!c.schema.pinyin.fuzzy.enabled);
@@ -12619,7 +12632,7 @@ scripts = { latin = 42 }
         assert!(!c.schema.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
         // 未覆盖的 pinyin 顶层字段：保留默认值
         assert_eq!(
-            c.schema.pinyin.code_hint_source, "auto",
+            c.schema.pinyin.code_hint_source, "off",
             "code_hint_source 未覆盖，应保留出厂档"
         );
         assert!(

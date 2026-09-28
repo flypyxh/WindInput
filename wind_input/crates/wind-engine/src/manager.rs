@@ -789,15 +789,29 @@ impl EngineManager {
         mgr
     }
 
-    /// 拼音方案下，候选注释里的编码从哪来（`schema.pinyin.code_hint_source`）。
+    /// 拼音方案（含双拼）下，候选注释里的编码从哪来（`schema.pinyin.code_hint_source`）。
     ///
-    /// 直接读全局 `[schema.pinyin]`，没有方案级 override。
+    /// 直接读全局 `[schema.pinyin]`，没有方案级 override。临拼 / 快捷输入不读这份，
+    /// 见 [`Self::temp_pinyin_code_hint_source`]。
     /// （码表类方案的「剩余编码」由码表引擎在 convert 内处理，走的是
     /// `schema.codetable.show_code_hint`，与本键同名过一阵子，现已各归各名。）
     pub fn code_hint_source(&self) -> wind_config::config::CodeHintSource {
         wind_config::config::CodeHintSource::from_config(
             &self
                 .pinyin
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .code_hint_source,
+        )
+    }
+
+    /// 临拼 / 快捷输入期间，候选注释里的编码从哪来（`input.temp_pinyin.code_hint_source`）。
+    ///
+    /// 与 [`Self::code_hint_source`] 各管一摊、出厂值不同（这份 `auto`、那份 `off`）。
+    pub fn temp_pinyin_code_hint_source(&self) -> wind_config::config::CodeHintSource {
+        wind_config::config::CodeHintSource::from_config(
+            &self
+                .temp_pinyin
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .code_hint_source,

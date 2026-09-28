@@ -147,7 +147,7 @@ const RARE_PHRASE_VALUES: &[&str] = &["keep", "filter"];
 const PUNCT_EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear", "clear_no_input"];
 
 /// 码表词频应用策略。
-/// `schema.pinyin.code_hint_source` 的值域。
+/// `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` 共用的值域。
 ///
 /// ⚠️ 必须与 [`wind_config::config::CodeHintSource::from_config`] 的 match 臂**逐项对齐**。
 /// 不对齐的表现是第二种漂移：注册表说某个值非法（CLI/设置页据此校验、生成下拉），
@@ -451,6 +451,10 @@ static REGISTRY: &[ConfigField] = &[
     f(
         "input.temp_pinyin.candidate_layout",
         Enum(LAYOUT_INTENT_VALUES),
+    ),
+    f(
+        "input.temp_pinyin.code_hint_source",
+        Enum(CODE_HINT_SOURCE_VALUES),
     ),
     f("input.url.enabled", Bool),
     f("input.url.prefixes", StrList),

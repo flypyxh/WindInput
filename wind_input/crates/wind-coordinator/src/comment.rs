@@ -858,7 +858,11 @@ impl crate::coordinator::Coordinator {
         )
     }
 
-    /// overlay 反查模式（临时拼音 / 快捷输入）：无视 `code_hint_source` 强制出码。
+    /// overlay 反查模式（临时拼音 / 快捷输入）：码表用户借拼音反查编码的场景。
+    ///
+    /// 编码来源读 `input.temp_pinyin.code_hint_source`（见 [`Self::comment_hint_source`]），
+    /// `${code_source}` 也据此视作「间接输入」。名字是旧「强制出码」时代的遗留——现在它
+    /// 只判模式，不再无视配置强制放行。
     pub(crate) fn forces_code_hint(state: &State) -> bool {
         matches!(
             state.active,
@@ -869,16 +873,15 @@ impl crate::coordinator::Coordinator {
     /// 注释段求值用的编码来源档。候选窗渲染与「上屏注释」（`input.alt_commit`）共用，
     /// 两处各算一份的话，同一条候选显示的注释与上屏的注释会不一样。
     ///
-    /// overlay 反查模式强制放行反查：这些模式本身就是「用拼音反查码表编码」，出不了码
-    /// 就失去了意义（对齐 Go AddCodeHintsForced）。
-    /// ★ 并集而非替换，见 `CodeHintSource::forcing_reverse` —— 改写成恒 CodeTable 会把
-    /// 「只要双拼码」的用户在快捷输入里想看的那一列一并关掉。
+    /// 两份开关按模式分：临拼 / 快捷输入读 `input.temp_pinyin.code_hint_source`（出厂
+    /// `auto`，码表用户反查编码的场景），其余（拼音 / 双拼主方案）读
+    /// `schema.pinyin.code_hint_source`（出厂 `off`）。两类用户习惯相反，所以拆开。
+    /// ★ 临拼那份原样生效、**可以关掉**——旧实现在这里无视配置并集式强制放行反查。
     pub(crate) fn comment_hint_source(&self, state: &State) -> CodeHintSource {
-        let configured = self.engine_mgr.code_hint_source();
         if Self::forces_code_hint(state) {
-            configured.forcing_reverse()
+            self.engine_mgr.temp_pinyin_code_hint_source()
         } else {
-            configured
+            self.engine_mgr.code_hint_source()
         }
     }
 
@@ -2143,6 +2146,94 @@ mod eval_var_tests {
             eval(&co, "code_rev_typo", &nihao(), CodeHintSource::Auto),
             None
         );
+    }
+
+    /// 拼音方案 / 临时拼音两份编码来源各配一值，建一个码表常驻的协调器。
+    fn hint_coord(schema_src: &str, temp_src: &str) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["pinyin".to_string(), "wubi86".to_string()];
+        cfg.schema.active = "wubi86".to_string();
+        cfg.schema.pinyin.code_hint_source = schema_src.to_string();
+        cfg.input.temp_pinyin.code_hint_source = temp_src.to_string();
+        Coordinator::new_headless(cfg, Some(&data_dir()))
+    }
+
+    fn hint_in(co: &Coordinator, active: Option<ModeKind>) -> CodeHintSource {
+        let st = State {
+            active,
+            ..Default::default()
+        };
+        co.comment_hint_source(&st)
+    }
+
+    const ALL_SOURCES: [(&str, CodeHintSource); 4] = [
+        ("off", CodeHintSource::Off),
+        ("codetable", CodeHintSource::CodeTable),
+        ("shuangpin", CodeHintSource::Shuangpin),
+        ("auto", CodeHintSource::Auto),
+    ];
+
+    /// 临拼 / 快捷输入读 `input.temp_pinyin.code_hint_source`，原样取值、不做并集。
+    ///
+    /// 拼音方案那份刻意配成与之不同的值：两份若还串着读，这里会拿到对方的档位。
+    #[test]
+    fn overlay_modes_follow_temp_pinyin_source() {
+        for (temp, want) in ALL_SOURCES {
+            for schema in ["off", "auto"] {
+                let co = hint_coord(schema, temp);
+                for active in [Some(ModeKind::TempPinyin), Some(ModeKind::Mix(0))] {
+                    assert_eq!(
+                        hint_in(&co, active),
+                        want,
+                        "{active:?}：temp_pinyin={temp}, schema.pinyin={schema}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 主方案（含双拼）读 `schema.pinyin.code_hint_source`，不受临拼那份影响。
+    #[test]
+    fn main_schema_follows_schema_pinyin_source() {
+        for (schema, want) in ALL_SOURCES {
+            for temp in ["off", "auto"] {
+                let co = hint_coord(schema, temp);
+                assert_eq!(
+                    hint_in(&co, None),
+                    want,
+                    "主方案：schema.pinyin={schema}, temp_pinyin={temp}"
+                );
+            }
+        }
+    }
+
+    /// ★ 行为变化：临拼配成 `off` 时反查提示**真的关掉**。
+    ///
+    /// 旧实现对临拼 / 快捷输入无视配置、并集式强制放行反查（`forcing_reverse`），
+    /// 用户关不掉；拆成独立开关后 off 必须生效，哪怕拼音方案那份开着。
+    #[test]
+    fn temp_pinyin_off_really_disables_reverse_hint() {
+        let co = hint_coord("auto", "off");
+        for active in [Some(ModeKind::TempPinyin), Some(ModeKind::Mix(0))] {
+            let src = hint_in(&co, active);
+            assert!(!src.allows_reverse(), "{active:?}：临拼 off 仍放行了反查");
+            assert!(!src.allows_shuangpin(), "{active:?}：临拼 off 仍放行了双拼");
+        }
+    }
+
+    /// 出厂：拼音方案不显示编码，临拼 / 快捷输入两种都放行。
+    #[test]
+    fn factory_defaults_split_by_mode() {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["pinyin".to_string(), "wubi86".to_string()];
+        cfg.schema.active = "wubi86".to_string();
+        let co = Coordinator::new_headless(cfg, Some(&data_dir()));
+        assert_eq!(hint_in(&co, None), CodeHintSource::Off);
+        assert_eq!(
+            hint_in(&co, Some(ModeKind::TempPinyin)),
+            CodeHintSource::Auto
+        );
+        assert_eq!(hint_in(&co, Some(ModeKind::Mix(0))), CodeHintSource::Auto);
     }
 }
 
