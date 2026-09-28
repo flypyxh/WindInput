@@ -180,6 +180,37 @@ password_force_english = false
   各锚点 / 子菜单「坐标不可用时」（跟随全局 / 上次位置 / 不显示 / 各锚点）。
 - 设置页（wind-setting）：状态提示段的「位置」下拉补锚点档，新增「坐标不可用时」下拉。
 
+### 实施补注（与上文的差异与细化）
+
+- **协议形状**：`ShowStatusTip` 的光标坐标 `x/y/caret_height` 仍留在顶层，`placement` 枚举是
+  `Caret{offset_x, offset_y}` / `Fixed{x, y}` / `Anchor(StatusTipAnchor)`。没有把光标塞进
+  `Caret`：固定坐标未摆过（`(0,0)` 哨兵）要拿光标选屏，锚点在取不到前台窗口时也拿光标选屏，
+  三个变体都要它。
+- **值域同源**：全局两个键仍是自由字符串（写错回落出厂默认，经 `StatusIndicatorConfig::position()`
+  / `fallback()` 解析）；注册表的值域直接引用 `app_compat::STATUS_POSITION_MODES` /
+  `STATUS_FALLBACK_POSITIONS`，与解析函数同一份。
+- **兜底判据是原始坐标**：`hide` / 锚点兜底看的是本次原始坐标 `caret_is_valid`，不是
+  `resolve_caret_for_ui` 回退后的 `valid`（后者有最近一次有效坐标就报 true）。`last` 下仍调
+  resolve，行为逐字不变（`last_fallback_keeps_previous_behavior_for_invalid_caret` 钉住）。
+- **锚点边距**：16dp（Windows 按目标屏 DPI 缩放；macOS 16pt），居中两档不用边距；最后夹回
+  前台窗口所在屏的工作区。前台窗口最小化视为无边框，窗口锚点降级为屏幕锚点。
+- **焦点气泡超时**：共享定时器（原 `FirstShowTimer`，改名 `OneShotTimer`）另起一个实例，
+  并改为**按协调器分槽**——全进程一个槽时，同进程的多个协调器（并行测试）会互相顶掉待办。
+  作废点：挂起位被清（TSF 坐标到达 / 失焦 / 下次焦点直接显示）或代际变化（下次焦点重新挂起），
+  到期回调两者都校验，并按**此刻**的定位重算（兜底已不是锚点就放弃）。TSF 坐标与超时的
+  消费都用 `compare_exchange`，只让一方显示。
+- **落盘分流**：拖动落盘、气泡右键菜单的「固定位置」「恢复默认位置」在当前应用配了定位方式
+  规则时都写规则（方式 + 坐标一起写，非 fixed 坐标清零），否则写全局；勾选态看生效值。
+- **菜单**：`MenuCmd::StatusPositionRule` 占 16000+（0 跟随全局 / 1 跟随光标 / 2 固定 /
+  3+i 锚点），`StatusFallbackRule` 占 17000+（0 跟随全局 / 1 上次位置 / 2 不显示 / 3+i 锚点），
+  锚点下标按 `StatusAnchor::ALL`。「固定（取当前位置）」经 `ReportStatusTipPos` 取气泡当前
+  位置；气泡此刻不可见时 UI 不回报，坐标留在 `(0,0)` 哨兵（落到光标所在屏），拖一次即定。
+- **macOS**：`CMD_STATUS_SHOW` 尾部追加 `anchor:i32`（旧 `.app` 忽略，互容）。`.app` 的
+  「焦点所在屏」取**鼠标所在屏**，其次光标点所在屏：`NSScreen.main` 问的是 `.app` 自己的
+  key window（输入法没有），而锚点兜底场景下光标点恰恰不可信。窗口锚点降级为屏幕锚点。
+- 未做：文档站（WindInputDocs）的 `guides/compat.mdx` / `settings/menu.mdx` / `guides/config`
+  补注，与设置页（wind-setting）两个下拉，留给后续阶段。
+
 ---
 
 ## 共同约定
