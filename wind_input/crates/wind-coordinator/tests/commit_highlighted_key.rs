@@ -311,6 +311,12 @@ fn special_mode_commits_highlighted_like_space() {
 
 /// 辅助码：拼音打 `shi`、`\` 进辅助码（全局开关须拨开）、筛一码 `h`（笔画「横」）后移高亮。
 /// 走的是 `aux_code_committed`——部分消费时要留在模式内，派发不能套主路的 `commit_selected`。
+///
+/// ⚠️ 必须先 `prewarm_indexes`：全拼默认辅助码 2a9193ba 起从文件（`aux_code/stroke.txt`，
+/// 进程内同步读，无需反查索引）改成引用码表方案（`schema:stroke`），`enter_aux_code` 门卫
+/// 要求该方案反查索引已就绪、按键线程绝不现建（见 `coordinator.rs::prewarm_indexes` 的注释）。
+/// 真机由 `Coordinator::new` 起的后台线程预热，headless 不跑那个线程，不手动补这一句，
+/// 本用例会在索引未就绪的那次按键上静默不进模式（`enter_aux_code` 直接返回 `None`）。
 #[test]
 fn aux_code_commits_highlighted_like_space() {
     skip_without_data!();
@@ -326,6 +332,7 @@ fn aux_code_commits_highlighted_like_space() {
         edit,
         |_| {},
         |c| {
+            c.prewarm_indexes();
             type_str(c, "shi");
             c.handle_key_event(&key(0xDC, 0));
             type_str(c, "h");
