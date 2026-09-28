@@ -397,6 +397,11 @@ readings = "#9AD0FF"
   `#FF4554`），`tooltip_accent_text` / `tooltip_on_accent` / `tooltip_selection_text` 同理；本主题也没写，
   再取兜底值。**契约外的名字只取 `_base` 自己的值**：主题连 `accent` 也没写时，`accent = ${primary}` 取
   `_base` 的 `#4285F4`，不借主题的 `primary`——它不在契约里，第三方主题的同名色未必是同一个意思。
+- **例外（2026-09-28 确认）**：主题连 `tooltip_bg` 也没写时，`tooltip_text` 取渲染层原常量
+  `fallback::TOOLTIP_TEXT`（亮暗同值），引用它的 `tooltip_on_accent` / `tooltip_selection_text` 随之。气泡底是
+  渲染层的深灰常量，`_base` 暗档的 `${text}` 是配它自己深色气泡底的；借过来，只调了浅色、`text` 写成单个
+  深色值的主题在暗色下就是深字压深底。这样这类主题的气泡外观与没有兜底时完全一致。写了 `tooltip_bg`
+  才按 `_base` 规则。
 - 「写没写」按 `[colors]` 的键判，不按解析结果：主题写了却解析不出（坏值、`transparent`、断链）是作者自己的
   选择，不替它换成 `_base` 的色；引用它的兜底（如 `selection_text`）也随之解析不出，与主题里写 `${它}` 一致。
 - 补在 views 求值**之后**：节点的调色板默认色（`tk("text")`、注释默认 `text_hint` 等）仍只看主题自己写的，
@@ -409,9 +414,9 @@ readings = "#9AD0FF"
 
 **有意的外观变化**（只影响没写对应名字的无 base 主题）：
 
-- 气泡正文色：`theme.color("tooltip_text", 兜底)` 原先落渲染层兜底 `[240,240,245]`，现在是契约值——亮档
-  `#FFFFFF`，暗档本主题的 `text`。主题暗档 `text` 是深色（只调了浅色的主题写单值深色 `text`）而又没写
-  `tooltip_bg` 时，暗色模式下气泡字会变暗、难读；这类主题应自己写 `tooltip_text`。
+- 气泡正文色：`theme.color("tooltip_text", 兜底)` 原先落渲染层兜底 `[240,240,245]`。没写 `tooltip_bg` 的主题
+  兜底仍是这个值（见上「例外」），不变；写了 `tooltip_bg`、没写 `tooltip_text` 的，现在是契约值——亮档
+  `#FFFFFF`，暗档本主题的 `text`。
 - 候选窗翻页箭头的禁用色（`text_hint`）与页码色（`text_dim`，翻页栏没配文字色时）原先落渲染层兜底，现在取契约值。
 
 **已知局限**：`tooltip_*` 兜底按深色气泡底调（`_base` 的气泡底亮暗两档都是深色）。第三方主题若把气泡底
@@ -743,7 +748,8 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 | `src/lib/theme3/presets/baseChain.ts` | `_base` / `_qingfeng` 改动后跑 `pnpm bake:theme` 重新烘焙（勿手改） |
 | `src/lib/color.ts` | 已支持 `#RGB`，无需改；§5.5 修的是引擎一侧 |
 | `src/components/form/ViewsEditorV3.vue` | 注释、提示框节点加「文字角色色」面板：常态 / 选中 / 悬停三栏（提示框只有常态）；文案写明回落规则 §6.3；配色页在「改了 `primary`、未改 `tooltip_accent`」时提示（§5.4） |
-| `src/lib/theme3/contract.ts`（2026-09-28） | 标准色契约兜底（§5.4「引擎兜底」）：`contractLookup` 按名取色含兜底，源头是烘焙的 `BASE_CHAIN_V3._base`；提示框正文色按名取 `tooltip_text` 时同样含兜底；与引擎共用期望表 `contract-nobase/expected.json` 对拍 |
+| `src/lib/theme3/contract.ts`（2026-09-28） | 标准色契约兜底（§5.4「引擎兜底」）：`contractLookup` 按名取色含兜底，源头是烘焙的 `BASE_CHAIN_V3._base`；提示框正文色按名取 `tooltip_text` 时同样含兜底；与引擎共用期望表 `contract-nobase{,-nobg}/expected.json` 对拍 |
+| `src/stores/theme3.ts`、`contract.ts`、`VariantColorField.vue`、`ViewsEditorV3.vue`（2026-09-28） | 预置与保护：方案进编辑器（导入 / 切换 / 载入 / 新建 / 重置 / 撤销）时，继承合并后仍缺的契约名按兜底同一规则写进本层 [colors]（`fillContract`，保留契约名之间的 `${引用}`），标「已按默认补齐」，保存（写回工作区 / 推送 / 导出 .wtheme）才落盘；base 链有未知一环时不补。契约名删不掉（`setField` 拒绝、整块替换与 TOML 面板删掉的补回）；颜色面板「标准色」徽标 + 说明、置灰删除按钮；「恢复默认」= 本层不写时生效的值（继承来的或兜底值，内置方案仍是源预设值）；导入时缺色给一条诊断（toast / TOML 面板 / 工作区 report.md） |
 | `src/lib/preview/candidateBox.ts`、`src/lib/preview/otherWindows.ts` | 预览样例带片段（如注释 `kao` 标 `code_hint`、气泡段名标 `title`），按 §6.2 求色，否则配了角色在预览里看不出来 |
 
 ## 11 设置端（wind-setting）
@@ -898,6 +904,9 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
   在注释 / 气泡里的内联色求色；编辑器按同一规则补齐后逐项对拍，另断言两边契约名清单相同。已知差异（早于
   本改动）：编辑器 `resolveColor` 对 `{ light, dark = "" }` 缺侧回退、不认裸写 hex，引擎调色板层反之，这类
   写法下「写了却解析不出」的判定两边不同，未纳入期望表。
+- 追加（同日）：没写 `tooltip_bg` 时 `tooltip_text` 取渲染层常量（上文「例外」），新增测试主题
+  `contract-nobase-nobg` 与其期望表，`contract-nobase` 去掉自己的 `tooltip_text` 以覆盖「写了 `tooltip_bg`」一支；
+  去掉这条例外 → 3 条红。编辑器预置与保护见 §10。
 - 变异：去掉 `resolve` 里的兜底 → 2 条红；`_base` 垫在主题之上（盖掉自有值）→ 7 条红；`accent` 不按本
   主题解析（`accent_text` 不借主题强调色）→ 3 条红；去掉 `theme_palette` 里的兜底 → 拉取面用例红。
   另试过「最后一步对全部契约名无条件写入」：因为主题写了的名字在兜底表里就是本主题的终值，写回去值不变，

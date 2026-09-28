@@ -1,8 +1,9 @@
 # 测试主题（非出厂）：标准色契约的引擎兜底（设计 text-span-colors.md §5.4「引擎兜底」）。
 # **刻意不写 base**，仿用户靶机上的第三方主题「Switch风格」：自己配了强调色与正文色，
 # 契约里的状态色与气泡色一个没写。验证：没写的契约名补 _base 的值、引用型的按本主题解析、
-# 自己写了的（error、tooltip_text）一个不动、契约外的名字（bg 之外的 _base 条目）不带进来；
-# 写了却解析不出的（text_dim 全透明、info 断链）不补。
+# 自己写了的（error）一个不动、契约外的名字（bg 之外的 _base 条目）不带进来；
+# 写了却解析不出的（text_dim 全透明、info 断链）不补。写了气泡底色、没写 tooltip_text：
+# tooltip_text 按 _base 规则（暗档借本主题 text）。没写气泡底色的一例见 contract-nobase-nobg。
 
 [meta]
 name = "契约兜底测试（无 base）"
@@ -18,4 +19,3 @@ error = { light = "#AA0000", dark = "#FF7070" }
 text_dim = "transparent"
 info = "${nowhere}"
 tooltip_bg = { light = "#111827F0", dark = "#0B0E13F0" }
-tooltip_text = "#FFFFFF"

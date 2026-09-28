@@ -1,0 +1,13 @@
+# 测试主题（非出厂）：标准色契约的引擎兜底（设计 text-span-colors.md §5.4「引擎兜底」）。
+# 不写 base，也**不写气泡底色 tooltip_bg**：气泡底是渲染层常量，tooltip_text 兜底取渲染层原常量
+# （亮暗同值），而不是 _base 的「暗档借本主题 text」——text 在这里是单个深色值，借过来就是
+# 深字压深底。tooltip_on_accent / tooltip_selection_text 跟着它走。
+
+[meta]
+name = "契约兜底测试（无 base、无气泡底色）"
+version = "1.0"
+
+[colors]
+accent = "#FF4554"
+bg = "#FFFFFF"
+text = "#1F2937"

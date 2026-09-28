@@ -16,12 +16,15 @@
 //!   `accent_text = "${accent}"` 取本主题的强调色；本主题也没有，再取兜底值。
 //! - 契约外的名字（`accent = "${primary}"` 里的 `primary`）只取 `_base` 自己的值：它不在契约
 //!   里，第三方主题的同名色未必是同一个意思。
+//! - 例外：主题没写 `tooltip_bg` 时，`tooltip_text` 取渲染层常量
+//!   [`fallback::TOOLTIP_TEXT`](crate::fallback::TOOLTIP_TEXT)，理由见 [`fill_missing`]。
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use toml::Value;
 
+use crate::fallback::TOOLTIP_TEXT;
 use crate::palette::{Rgba, resolve_palette};
 
 /// 候选窗用的契约名；每个在气泡里另有 `tooltip_<名>`（§5.4）。
@@ -69,12 +72,19 @@ pub fn fill_missing(colors: Option<&Value>, palette: &mut HashMap<String, Rgba>,
     let written = |n: &str| own.is_some_and(|t| t.contains_key(n));
     // `_base` 原表垫底，主题写了的契约名换成本主题的终值（解析不出的删掉，引用它的也跟着
     // 解析不出，与主题里写 `${它}` 的结果一致）；契约外的名字保持 `_base` 的原样。
+    let hex = |c: &Rgba| format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
     let mut table = base_colors().clone();
+    // 主题连气泡底色也没写：气泡底是渲染层常量（深灰），`tooltip_text` 兜底取渲染层原来的
+    // 常量，外观与没有兜底时完全一致。`_base` 的暗档 `${text}` 是配它自己的深色气泡底的，
+    // 借本主题 text 在这里会出问题：只调了浅色、text 写成单个深色值的主题，暗色下成了深字压
+    // 深底（2026-09-28 确认）。引用它的 tooltip_on_accent 等随之取同一个值。
+    if !written("tooltip_bg") && !written("tooltip_text") {
+        table.insert("tooltip_text".into(), Value::String(hex(&TOOLTIP_TEXT)));
+    }
     for n in all_names().filter(|n| written(n)) {
         match palette.get(&n) {
             Some(c) => {
-                let hex = format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
-                table.insert(n, Value::String(hex));
+                table.insert(n, Value::String(hex(c)));
             }
             None => {
                 table.remove(&n);
@@ -110,16 +120,42 @@ mod tests {
         resolve_palette(Some(&Value::Table(base_colors().clone())), dark)
     }
 
-    /// 空主题：契约名全数补齐，值等于 `_base` 的。
+    /// 跟着气泡正文色走的三个名字（`tooltip_on_accent` / `tooltip_selection_text` 引用它）。
+    const TOOLTIP_TEXT_FAMILY: [&str; 3] = [
+        "tooltip_text",
+        "tooltip_on_accent",
+        "tooltip_selection_text",
+    ];
+
+    /// 写了气泡底色的空主题：契约名全数补齐，值等于 `_base` 的。
     #[test]
-    fn empty_theme_gets_every_contract_name_from_base() {
+    fn theme_with_tooltip_bg_gets_every_contract_name_from_base() {
         for dark in [false, true] {
-            let p = fill("", dark);
+            let p = fill(r##"tooltip_bg = "#202020""##, dark);
             let b = base(dark);
             for n in all_names() {
                 assert_eq!(p.get(&n), b.get(&n), "dark={dark}: {n}");
             }
-            assert_eq!(p.len(), 22, "只补契约名，不带进 _base 的其它名字");
+            assert_eq!(p.len(), 23, "只补契约名，不带进 _base 的其它名字");
+        }
+    }
+
+    /// 连气泡底色也没写：气泡正文色取渲染层原常量（亮暗同值），外观与没有兜底时一致；
+    /// 其余契约名照旧取 `_base` 的。
+    #[test]
+    fn theme_without_tooltip_bg_keeps_render_layer_tooltip_text() {
+        for dark in [false, true] {
+            let p = fill(r##"text = "#333333""##, dark);
+            let b = base(dark);
+            for n in TOOLTIP_TEXT_FAMILY {
+                assert_eq!(p[n], TOOLTIP_TEXT, "dark={dark}: {n}");
+            }
+            for n in all_names().filter(|n| !TOOLTIP_TEXT_FAMILY.contains(&n.as_str())) {
+                if n != "text" && n != "selection_text" {
+                    assert_eq!(p.get(&n), b.get(&n), "dark={dark}: {n}");
+                }
+            }
+            assert_eq!(p.len(), 22);
         }
     }
 
@@ -174,8 +210,8 @@ tooltip_text = "#FAFAFA"
             assert_eq!(p["tooltip_on_accent"], hex("#FAFAFA"));
             assert_eq!(p["tooltip_selection_text"], hex("#FAFAFA"));
         }
-        // tooltip_text 没写：暗档 = ${text}，取本主题的 text。
-        let p = fill(r##"text = "#123456""##, true);
+        // 写了气泡底色、没写 tooltip_text：暗档 = ${text}，取本主题的 text。
+        let p = fill("text = \"#123456\"\ntooltip_bg = \"#202020\"", true);
         assert_eq!(p["tooltip_text"], hex("#123456"));
     }
 

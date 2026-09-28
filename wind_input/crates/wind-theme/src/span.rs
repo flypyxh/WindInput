@@ -710,11 +710,25 @@ mod tests {
                 "气泡先查 tooltip_error"
             );
             assert_eq!(
-                tip("on_accent"),
-                pick("#FFFFFF", "#FFFFFF"),
-                "= 本主题 tooltip_text"
+                tip("text"),
+                pick("#FFFFFF", "#F6FAFD"),
+                "写了气泡底色：tooltip_text 按 _base 规则，暗档借本主题 text"
             );
             assert_eq!(c("surface"), BODY, "契约外的名字不补");
+        }
+    }
+
+    /// 没写气泡底色：tooltip_text 兜底取渲染层原常量，气泡正文与没有兜底时一致。
+    #[test]
+    fn theme_without_tooltip_bg_keeps_render_layer_tooltip_text() {
+        let dirs = [std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/themes")];
+        for dark in [false, true] {
+            let t = crate::load_resolved_dirs(&dirs, "contract-nobase-nobg", dark).unwrap();
+            let fg = crate::fallback::TOOLTIP_TEXT;
+            assert_eq!(t.color("tooltip_text", [0; 4]), fg, "dark={dark}");
+            let tip = |spec: &str| sc(&t, &node(), true, Normal, None, false, Some(spec));
+            assert_eq!(tip("text"), fg);
+            assert_eq!(tip("on_accent"), fg);
         }
     }
 
@@ -917,12 +931,15 @@ mod tests {
         format!("{{\n{}\n}}\n", modes.join(",\n"))
     }
 
-    // ───────────── 与主题编辑器的共用期望表（contract-nobase 测试主题）─────────────
+    // ─────── 与主题编辑器的共用期望表（contract-nobase / contract-nobase-nobg 测试主题）───────
     //
     // 标准色契约的引擎兜底（§5.4「引擎兜底」）。编辑器读同一份 theme.toml 与 expected.json 对拍。
     // 搜索链里**刻意不放** `data/themes`：兜底不依赖运行时能找到 `_base`。
 
-    fn contract_expected() -> String {
+    /// 共用期望表的测试主题：写了气泡底色的一例、没写的一例（`tooltip_text` 兜底规则不同）。
+    const CONTRACT_FIXTURES: [&str; 2] = ["contract-nobase", "contract-nobase-nobg"];
+
+    fn contract_expected(fixture: &str) -> String {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dirs = [root.join("testdata/themes")];
         // 全部契约名，加两个契约外的：主题写了的 primary、主题没写的 surface。
@@ -931,7 +948,7 @@ mod tests {
         probes.extend(["primary".to_string(), "surface".to_string()]);
         let mut modes = Vec::new();
         for (mode, dark) in [("light", false), ("dark", true)] {
-            let t = crate::load_resolved_dirs(&dirs, "contract-nobase", dark).unwrap();
+            let t = crate::load_resolved_dirs(&dirs, fixture, dark).unwrap();
             let c = &t.views.comment;
             let tip = t.views.tooltip.clone().unwrap_or_default();
             let tip_fb = t.color("tooltip_text", crate::fallback::TOOLTIP_TEXT);
@@ -978,18 +995,20 @@ mod tests {
 
     #[test]
     fn contract_expected_table_is_current() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata/themes/contract-nobase/expected.json");
-        let got = contract_expected();
-        if std::env::var_os("WIND_THEME_BLESS").is_some() {
-            std::fs::write(&path, &got).unwrap();
-            return;
+        for fixture in CONTRACT_FIXTURES {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("testdata/themes/{fixture}/expected.json"));
+            let got = contract_expected(fixture);
+            if std::env::var_os("WIND_THEME_BLESS").is_some() {
+                std::fs::write(&path, &got).unwrap();
+                continue;
+            }
+            let want = std::fs::read_to_string(&path).expect("读 expected.json");
+            assert_eq!(
+                got, want,
+                "{fixture}：引擎求值与检入的期望表不一致；有意改变时 WIND_THEME_BLESS=1 重录"
+            );
         }
-        let want = std::fs::read_to_string(&path).expect("读 expected.json");
-        assert_eq!(
-            got, want,
-            "引擎求值与检入的期望表不一致；有意改变时 WIND_THEME_BLESS=1 重录"
-        );
     }
 
     #[test]
