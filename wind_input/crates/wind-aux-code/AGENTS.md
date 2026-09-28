@@ -73,6 +73,9 @@
    （同 GPL-3.0 的 rime-frost）只下载不入库。要改码表内容就改 `gen_aux_code`，
    **别把生成物手工编辑后提交**：PR #68 最初那版 `stroke.txt` 正是手工产物，
    其裁剪字集比对 hanzi-chars 全部 81 张表也复原不出来，上游一更新就再没人能重做。
+   同一次解析还产出「笔画」码表方案的词库 `schemas/stroke/stroke.dict.yaml`（`--schema-out`），
+   全拼出厂引用的是这个方案（`schema:stroke`）而非 `stroke.txt`；`stroke.txt` 照旧生成，
+   供 override 里写死旧路径的用户。两份的字与码必须逐一相同，别只改其中一条输出路径。
 - **名称只从第 1 行解析**（`# name: 笔画` / `#name: 笔画`）：`parse_str` 填
    `AuxCodeTable.name`，空则 `load_from_file` 回落文件主干名；`merge` 取首个非空
    （先出现 = 高优）。version/source 一律当注释，不解析。

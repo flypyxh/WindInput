@@ -976,7 +976,8 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 
 - **配置（三层，同 `[schema.codetable]` 那套 tri-state，见 schema-config-layering.md §4）**：
   全局基线 `[schema.pinyin.aux_code]`（`enabled` **出厂 false** / `max_phrase_len`）；
-  方案段 `[engine.aux_code]` 放 `files`（方案属性：全拼配笔画、双拼配小鹤形码），并可用
+  方案段 `[engine.aux_code]` 放 `files`（方案属性：全拼配笔画——出厂引用「笔画」码表方案
+  `schema:stroke`，双拼配小鹤形码文件 `aux_code/flypy_full.txt`），并可用
   同名 `enabled` / `max_phrase_len` 逐字段覆盖全局；`schema_overrides/{id}.toml` 用**相同段名**
   经 `read_schema` 的 `merge_toml` 深合并（设置页写入点）。折叠在
   `AuxCodeGlobal::resolved`，取值出口只有 `EngineManager::aux_code_settings` 一个。
@@ -1008,7 +1009,10 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   （`invalidate_aux_code_table`，随 `sync_chaizi_assets`/`sync_comment_dicts` 一起）。表格式：
   UTF-8 `字=码` 一行一条（`=` 分隔，与 rime-lua-aux-code `aux_code` 目录一致），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），
   version/source 当普通注释不解析。码表文件是 `wind-tools/gen_aux_code` 的构建产物、
-  **不入版本库**（rime-stroke 为 LGPL-3.0，见 NOTICE.md）。
+  **不入版本库**（rime-stroke 为 LGPL-3.0，见 NOTICE.md）。笔画方案词库
+  `schemas/stroke/stroke.dict.yaml` 与 `aux_code/stroke.txt` 由它同一次解析产出（字与码序逐一
+  相同，另带 rime-frost 字频权重），故全拼引用方案与引用文件筛选结果一致——
+  `handle_aux_code.rs::stroke_schema_source_filters_like_stroke_txt` 用真实产物对拍把守。
 - **筛选**（`wind-aux-code/src/filter.rs`）：`aux_code_matches` 谓词判断单个候选是否匹配；
   `filter_by_aux_code` 批量筛选，`kept` 是输入候选的**子序列**（不变量，绝不重排）；
   单字任一码前缀匹配 `aux_input` 则留；词组**逐字首码匹配**（固定语义，无模式选项）——第 i 位

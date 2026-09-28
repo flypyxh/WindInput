@@ -156,9 +156,17 @@ R8.1 勾选行：
 
 ## 7. 笔画改为码表方案（第 2 期）
 
-- `gen_aux_code` 从 `.cache/aux-code/` 的 rime-stroke 原档另外产出 `schemas/stroke/stroke.dict.yaml`
-  与 `schemas/stroke.schema.toml`（`type = "codetable"`、名称「笔画」）。**字集裁剪规则不变**
-  （GB 18030-2000 ∪ 通用规范汉字表 ∪ 〇）。许可同今天：构建期下载、不入库（NOTICE.md 更新措辞）。
+- `gen_aux_code --schema-out <schemas>` 从 `.cache/aux-code/` 的 rime-stroke 原档另外产出
+  `schemas/stroke/stroke.dict.yaml`，与 `stroke.txt` 出自同一次解析（字与码序逐一相同）。
+  **字集裁剪规则不变**（GB 18030-2000 ∪ 通用规范汉字表 ∪ 〇）。许可同今天：词库构建期下载、
+  不入库（NOTICE.md 已更新措辞）。方案文件 `data/schemas/stroke.schema.toml`（`type = "codetable"`、
+  名称「笔画」）不含上游数据，**入库**，不由工具生成。
+- **权重**：上游不带权重，全 0 时既排不出序、wdat 前缀检索也无从剪枝（打 `h` 走完整棵子树）。
+  取 rime-frost 单字表 `8105` / `41448` 的字频（同字多音取最大），按对数压进约定值域
+  `0~10000`——原始值最大 1537 万，直接写入每次加载都会触发越界告警。无字频的字为 0。
+- 方案段两项结构参数：`max_code_length = 64`（笔画码 1~52 码不定长，取大于最长码的值，
+  顶码 / 满码上屏 / 满码空码清空都不会触发）；`z_key_repeat = false`（z 是「折」，全局出厂的
+  z 键重复上屏会占掉它的首选）。
 - 不进出厂 `schema.available`：方案管理里能看到、能启用，默认不在切换列表。
 - 全拼 `pinyin.schema.toml` 改为 `files = ["schema:stroke"]`。
 - **兼容**：用户 override 里已写的 `files = ["aux_code/stroke.txt"]` 不能失效——继续生成
@@ -170,8 +178,8 @@ R8.1 勾选行：
 |---|---|---|---|
 | 0 | 前置：「按词查编码」统一入口第一期（`text-code-lookup.md`） | 主仓 | `8b99d7a7`、`d5fa0499`、`d000b8e6` |
 | 1 | `AuxCodeLookup` 接口与来源拼接；`schema:` 条目解析；方案来源接统一入口；后台预热与缓存键（修 saveConfig 不失效）；`schema.auxCodeSources` | 主仓 | `9ab878f4`、`31cd04c8`、`09e1459d`、`51595c94`；终审修复 `12406518`、`d8a8b03d`（预热落地、会话中失效放行、文件来源合层） |
-| 2 | 笔画码表方案、全拼默认改引用、NOTICE | 主仓（工具 + 数据） | - |
-| 3 | 「辅助码来源」勾选行、mock、渲染与写回测试 | wind-setting | - |
+| 2 | 笔画码表方案、全拼默认改引用、NOTICE | 主仓（工具 + 数据） | `ad350315`、`2a9193ba`、`951a6b5c`（直接在 main） |
+| 3 | 「辅助码来源」勾选行、mock、渲染与写回测试 | wind-setting + 主仓 | wind-setting `26a2c60`、`b7cd3bc`、`c2c4198`；主仓 `ec3e1c8b` |
 | 4 | 文档：`[engine.aux_code].files` 的 `schema:` 写法；「用五笔 / 笔画方案作拼音辅助码」 | 文档站 | - |
 
 触发键与分隔符冲突警示（原 P2 第 6 条）不在本文范围。
