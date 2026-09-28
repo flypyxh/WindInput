@@ -594,19 +594,7 @@ mod tests {
     ];
 
     /// 候选窗用的契约名（已有 + 新增）；每个在气泡里都有 `tooltip_<名>`。
-    const NAMES: &[&str] = &[
-        "text",
-        "text_dim",
-        "text_hint",
-        "accent",
-        "on_accent",
-        "selection_text",
-        "accent_text",
-        "success",
-        "warning",
-        "error",
-        "info",
-    ];
+    const NAMES: &[&str] = &crate::contract::NAMES;
 
     /// 全部出厂主题 × 亮暗：契约名与其 `tooltip_*` 都能解析。
     #[test]
@@ -673,6 +661,60 @@ mod tests {
                     "{name}: tooltip_accent 应等于 accent_text 暗档"
                 );
             }
+        }
+    }
+
+    /// 出厂主题都继承 `_base`、契约名本来就全：兜底必须是空操作，调色板逐项不变。
+    #[test]
+    fn contract_fallback_is_a_no_op_for_factory_themes() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes");
+        for name in FACTORY {
+            let merged = crate::load_merged_dirs(std::slice::from_ref(&dir), name, 0).unwrap();
+            for dark in [false, true] {
+                let raw = crate::palette::resolve_palette(merged.get("colors"), dark);
+                assert_eq!(factory(name, dark).palette, raw, "{name} dark={dark}");
+            }
+        }
+    }
+
+    /// 没写 base 的主题（仿「Switch风格」）：契约名照样能用。自己写了的用自己的，没写的补
+    /// `_base` 的，accent_text 借本主题的强调色；气泡里同样先 `tooltip_<名>`。
+    #[test]
+    fn theme_without_base_still_resolves_contract_names() {
+        let dirs = [std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/themes")];
+        for dark in [false, true] {
+            let t = crate::load_resolved_dirs(&dirs, "contract-nobase", dark).unwrap();
+            let n = node();
+            let pick = |l: &str, d: &str| parse_hex(if dark { d } else { l }).unwrap();
+            let c = |spec: &str| sc(&t, &n, false, Normal, None, false, Some(spec));
+            let tip = |spec: &str| sc(&t, &n, true, Normal, None, false, Some(spec));
+            assert_eq!(c("error"), pick("#AA0000", "#FF7070"), "自有值不被覆盖");
+            assert_eq!(
+                c("warning"),
+                pick("#B06000", "#FDD663"),
+                "没写的补 _base 的"
+            );
+            assert_eq!(
+                c("accent_text"),
+                pick("#FF4554", "#FF4554"),
+                "借本主题 accent"
+            );
+            assert_eq!(
+                c("selection_text"),
+                pick("#111827", "#F6FAFD"),
+                "借本主题 text"
+            );
+            assert_eq!(
+                tip("error"),
+                pick("#F28B82", "#F28B82"),
+                "气泡先查 tooltip_error"
+            );
+            assert_eq!(
+                tip("on_accent"),
+                pick("#FFFFFF", "#FFFFFF"),
+                "= 本主题 tooltip_text"
+            );
+            assert_eq!(c("surface"), BODY, "契约外的名字不补");
         }
     }
 
@@ -873,6 +915,81 @@ mod tests {
             ));
         }
         format!("{{\n{}\n}}\n", modes.join(",\n"))
+    }
+
+    // ───────────── 与主题编辑器的共用期望表（contract-nobase 测试主题）─────────────
+    //
+    // 标准色契约的引擎兜底（§5.4「引擎兜底」）。编辑器读同一份 theme.toml 与 expected.json 对拍。
+    // 搜索链里**刻意不放** `data/themes`：兜底不依赖运行时能找到 `_base`。
+
+    fn contract_expected() -> String {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dirs = [root.join("testdata/themes")];
+        // 全部契约名，加两个契约外的：主题写了的 primary、主题没写的 surface。
+        let mut probes: Vec<String> = crate::contract::all_names().collect();
+        probes.sort();
+        probes.extend(["primary".to_string(), "surface".to_string()]);
+        let mut modes = Vec::new();
+        for (mode, dark) in [("light", false), ("dark", true)] {
+            let t = crate::load_resolved_dirs(&dirs, "contract-nobase", dark).unwrap();
+            let c = &t.views.comment;
+            let tip = t.views.tooltip.clone().unwrap_or_default();
+            let tip_fb = t.color("tooltip_text", crate::fallback::TOOLTIP_TEXT);
+            let palette: Vec<String> = probes
+                .iter()
+                .map(|n| {
+                    let v = t.palette.get(n).map_or("null".into(), |c| hex8(*c));
+                    format!("\"{n}\": {v}")
+                })
+                .collect();
+            let mut inline = Vec::new();
+            for spec in probes.iter().filter(|n| !n.starts_with("tooltip_")) {
+                let ic = InlineColor::parse(spec);
+                for (node, n, tooltip, fb) in [
+                    ("comment", c, false, COMMENT_FALLBACK),
+                    ("tooltip", &tip, true, tip_fb),
+                ] {
+                    let col = span_color(
+                        &t,
+                        n,
+                        tooltip,
+                        TextState::Normal,
+                        fb,
+                        None,
+                        false,
+                        Some(&ic),
+                    );
+                    inline.push(format!(
+                        "{{\"node\": \"{node}\", \"spec\": \"{spec}\", \"color\": {}}}",
+                        hex8(col)
+                    ));
+                }
+            }
+            modes.push(format!(
+                "  \"{mode}\": {{\n    \"comment\": {{\"text\": {}}},\n    \"tooltip\": {{\"text\": {}}},\n    \"palette\": {{\n      {}\n    }},\n    \"inline\": [\n      {}\n    ]\n  }}",
+                c.text_color.map_or("null".into(), hex8),
+                hex8(tip_fb),
+                palette.join(",\n      "),
+                inline.join(",\n      ")
+            ));
+        }
+        format!("{{\n{}\n}}\n", modes.join(",\n"))
+    }
+
+    #[test]
+    fn contract_expected_table_is_current() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/themes/contract-nobase/expected.json");
+        let got = contract_expected();
+        if std::env::var_os("WIND_THEME_BLESS").is_some() {
+            std::fs::write(&path, &got).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(&path).expect("读 expected.json");
+        assert_eq!(
+            got, want,
+            "引擎求值与检入的期望表不一致；有意改变时 WIND_THEME_BLESS=1 重录"
+        );
     }
 
     #[test]

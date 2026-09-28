@@ -177,6 +177,13 @@ fn hidden_themes_vanish_from_list_and_from_resolution() {
         argb(0xAA0000),
         "前置条件：两个主题的 bg 必须不同，否则上一条断言恒真"
     );
+    // 顺带钉住拉取面的标准色契约兜底（与桌面 `wind_theme::resolve` 同一口径）：夹具主题没写
+    // base、也没写 error，照样拉得到 `_base` 的亮档 error。
+    assert_eq!(
+        palette.iter().find(|(k, _)| k == "error").map(|(_, v)| *v),
+        Some(argb(0xD93025)),
+        "无 base 主题拉调色板也应补上契约名"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
