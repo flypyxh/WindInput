@@ -511,12 +511,28 @@ impl Coordinator {
         // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。`$CC` 命令词条经
         // finalize_candidates 展开后 text 已改写为 display 标签，而引擎意向 commit_text 是原始
         // `$CC` 源 → 按 phrase_template 补匹配，返回命中候选整条供调用方按命令/文本分流。
-        if result.should_commit && !result.commit_text.is_empty() {
-            let t = &result.commit_text;
+        //
+        // 引擎首轮意向（上方 convert_with_opts）判在 shadow **生效之前**的候选上：设置页把某
+        // 码位的内置词条替换成自定义词条（新增用户词 + shadow 隐藏旧词条）时，改码瞬间该码位
+        // 下同时存在新旧两条精确候选，引擎判「不唯一」拒绝自动上屏；shadow 生效后其实只剩一
+        // 条，若不回头复评，这个否决会一直生效（论坛 #211）。与主路径 `handle_candidate.rs`
+        // 的 `recheck_auto_commit` 对称：那里读的是主方案 `active_engine()`，这里必须按
+        // **快符引用的方案**取引擎（`recheck_auto_commit_for`），否则会拿主方案的引擎去判
+        // 快符方案的候选——同类坑见 `engine_for` 的注释。
+        let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
+            Some(result.commit_text.clone())
+        } else {
+            self.engine_mgr.recheck_auto_commit_for(
+                &schema,
+                &state.special_buffer,
+                &state.candidates,
+            )
+        };
+        if let Some(t) = auto_commit {
             return state
                 .candidates
                 .iter()
-                .find(|c| &c.text == t || (c.is_command && &c.phrase_template == t))
+                .find(|c| c.text == t || (c.is_command && c.phrase_template == t))
                 .cloned();
         }
         None

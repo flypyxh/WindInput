@@ -7173,6 +7173,91 @@ fn special_mode_effect_command_auto_commit_executes() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// 回归论坛 #211：快符改码（新增用户词 + shadow 隐藏旧词条）后自动上屏应恢复。
+///
+/// 复现改码瞬间的两阶段：① 码位下新旧两条精确候选并存 → 歧义、不应自动上屏；
+/// ② shadow 隐藏旧候选后只剩一条 → 应恢复自动上屏。此前 `update_special_candidates`
+/// 的自动上屏判定只看 `convert_with_opts` 在 shadow 生效**之前**算出的意向，shadow 删除
+/// 的效果对这一判定永远不可见——候选窗看着只剩一条，却上不了屏。
+#[test]
+fn special_mode_auto_commit_recovers_after_shadow_resolves_ambiguity() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_special_autocommit_shadow.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // 用一个真实词库必然没有的 5 码占位（wubi86 max_code_length=4，见 schema toml），
+    // 避免与内置词库任何真实编码/更长后继冲突——`has_longer_code` 是跨层原样探测，
+    // 若沿用真实短码会被真实数据的更长编码挡住，测不出「shadow 消歧」这件事。
+    store
+        .add_user_word("wubi86", "zzzzq", "甲", 200, 0)
+        .unwrap();
+    store
+        .add_user_word("wubi86", "zzzzq", "乙", 100, 0)
+        .unwrap();
+    let mut cfg = config_with("pinyin");
+    // ★ 自动上屏写在方案名下：overlay 方案不继承全局 schema.codetable。
+    let ov = overlay_override_dir_with_codetable(
+        "special_mode_auto_commit_recovers_after_s",
+        &[("wubi86", false)],
+        "auto_commit_at_full = true\n",
+    );
+    bind_special(&mut cfg, "backslash", "wubi86");
+    let coord = Coordinator::new_headless_with_store_override(
+        cfg,
+        Some(&data_dir()),
+        store.clone(),
+        Some(ov),
+    );
+
+    enter_special_mode_via_backslash(&coord);
+    let mut last = press_letter(&coord, 'z');
+    for c in ['z', 'z', 'z', 'q'] {
+        last = press_letter(&coord, c);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        texts.contains(&"甲".to_string()) && texts.contains(&"乙".to_string()),
+        "改码前该码位应有两条精确候选（否则用例前提不成立），实际: {:?}",
+        texts
+    );
+    assert!(
+        matches!(last, KeyAction::UpdateComposition { .. }),
+        "两条精确候选歧义未消，不应自动上屏，实际: {:?}",
+        last
+    );
+
+    // 设置页「改码」的第二步：shadow 隐藏旧词条，只留新词条——直接写规则模拟设置页操作，
+    // 不经候选窗右键（右键写端已由 special_mode_candidate_delete_writes_to_own_schema_bucket
+    // 等用例单独锁住，本用例只关心读端对 shadow 结果的复评）。
+    store.delete_shadow("wubi86", "zzzzq", "乙").unwrap();
+
+    // 退出重进，模拟改码后用户重新打字（真实场景里改码与输入是两次独立操作）。
+    coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN));
+    enter_special_mode_via_backslash(&coord);
+    let mut last = press_letter(&coord, 'z');
+    for c in ['z', 'z', 'z', 'q'] {
+        last = press_letter(&coord, c);
+    }
+    match last {
+        KeyAction::InsertText { ref text, .. } => {
+            assert_eq!(
+                text, "甲",
+                "shadow 消歧后该码位只剩一条精确候选，应自动上屏，实际: {:?}",
+                last
+            );
+        }
+        other => panic!(
+            "shadow 隐藏旧候选后码位下只剩唯一候选，应恢复自动上屏，实际: {:?}",
+            other
+        ),
+    }
+
+    let _ = std::fs::remove_file(&store_path);
+}
+
 #[test]
 fn special_mode_exact_completion_shows_longer_code() {
     if !has_schemas() {

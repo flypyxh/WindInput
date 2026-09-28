@@ -3771,6 +3771,27 @@ impl EngineManager {
         Some(r)
     }
 
+    /// [`Self::recheck_auto_commit`] 的 overlay/特殊模式版本：按**指定方案**取引擎而非
+    /// `active_engine()`（后者问的是主方案）。
+    ///
+    /// 回归背景（论坛 #211）：快符等特殊模式引用的方案（如 wubi86）往往不是主方案（如
+    /// 拼音），`update_special_candidates` 靠这条補齐与主路径 `handle_candidate.rs` 对称的
+    /// 「shadow 之后回头复核唯一性」——引擎首轮意向（`convert_with_opts`）判在 shadow 生效
+    /// **之前**的候选上：用户在设置页把某个码位的内置词条替换成自定义词条（新增用户词 +
+    /// shadow 隐藏旧词条），改码瞬间码位下变成两条精确候选、引擎判「不唯一」拒绝自动上屏；
+    /// shadow 生效后其实只剩一条，若无人回头复评，这个「不唯一」的否决会永久生效——用户看
+    /// 到的候选窗明明只有一条，却上不了屏。不接英文否决（`english_vetoes_commit`）：那是
+    /// 主方案通路的概念，特殊模式候选不含英文头部候选。
+    pub fn recheck_auto_commit_for(
+        &self,
+        schema_id: &str,
+        input: &str,
+        candidates: &[wind_candidate::Candidate],
+    ) -> Option<String> {
+        let engine = self.engine_for(schema_id)?;
+        engine.recheck_auto_commit(input, candidates)
+    }
+
     /// 活跃引擎是否存在比 `input` 更长的后继编码（码表前缀扫描；拼音等默认 false）。
     /// 供短语自动上屏的「无更长后继」判据（码表侧），与短语层 `has_longer_code` 并用。
     pub fn has_longer_code(&self, input: &str) -> bool {
