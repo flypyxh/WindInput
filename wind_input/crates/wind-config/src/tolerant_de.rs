@@ -133,9 +133,10 @@ where
 
 /// 容错反序列化 `Option<bool>`：非布尔值（`"yes"`、`1`）回落 **`None`** 并 WARN。
 ///
-/// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**唯一例外**，只给没有段级降级的
-/// 载体用（`compat.toml`：`load_file` 解析失败即整份丢弃）。在那里，类型错并没有下一层
-/// 兜底可交——不在字段上吞掉，就是所有应用的所有规则一起静默失效。
+/// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**唯一例外**（连同其裸 `bool` 版
+/// [`tolerant_bool`]），只给没有段级降级的载体用（`compat.toml`：`load_file` 解析失败即
+/// 整份丢弃）。在那里，类型错并没有下一层兜底可交——不在字段上吞掉，就是所有应用的所有
+/// 规则一起静默失效。
 /// 回落 `None` 而非 `Some(false)`，理由同 [`tolerant_opt`]：认不出 = 没配过。
 pub fn tolerant_opt_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
 where
@@ -151,6 +152,18 @@ where
             Ok(None)
         }
     }
+}
+
+/// 容错反序列化裸 `bool`：非布尔值回落 **`false`**（这类字段的「未配置」）并 WARN。
+///
+/// 与 [`tolerant_opt_bool`] 同一个例外、同一个载体（`compat.toml`）：那里的裸 `bool` 字段
+/// 都是 `default + skip_serializing_if = "is_false"`，`false` 就是「没配」，回落到它与
+/// `Option` 版回落 `None` 同义。
+pub fn tolerant_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(tolerant_opt_bool(d)?.unwrap_or(false))
 }
 
 #[cfg(test)]

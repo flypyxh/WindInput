@@ -379,7 +379,11 @@ pub struct AppCompatRule {
     /// 使用 caret rect 的 top 而非 bottom 定位候选窗。
     /// 适用于 GetTextExt 返回的 height 不稳定的 WebView 应用（如微信 Qt 输入框，
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
     pub caret_use_top: bool,
     /// 拦截「组合期间上报的 caret rect 仍停在上一次组合位置」的宿主。
     ///
@@ -396,7 +400,11 @@ pub struct AppCompatRule {
     ///
     /// 同一份位置关系推不出该信谁，任何位置判据都不可能同时答对两者。这是宿主缺陷，
     /// 按宿主处理——与隔壁 `caret_use_top`（同样为微信而加）同一个理由。
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
     pub stale_probe_guard: bool,
     /// 把连续的 `TSF_COMPOSITION`（selection 无效、以组合起点降级）→ `TSF_SELECTION`
     /// 识别为同一次布局采样的两阶段结果，禁止后半帧把当前 caret 误重锁成组合起点。
@@ -414,7 +422,11 @@ pub struct AppCompatRule {
     /// 通过菜单给 `QQ.exe` 写了只含 `first_show_mode` 的稀疏规则；若用 bool 的缺省
     /// `false` 做整条覆盖，升级后会静默屏蔽系统层新增的 QQ 修复。`None` 表示继承
     /// 低层，`Some(false)` 仍保留显式关闭的逃生口。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub composition_start_pair_guard: Option<bool>,
     /// 宿主报的组合起点跟着插入点漂移时，把候选窗锚点**钉在首帧起点**而不是让大偏移
     /// 逃生阀跟着走；`None` / `Some(false)` = 不干预，逃生阀照常。
@@ -433,7 +445,11 @@ pub struct AppCompatRule {
     ///   把锚点推过去。给它们钉住反而是回归（2026-09-05 实测确认）。
     ///
     /// ⇒ 数据分不出两者，只能按宿主声明。**不要试图改成全局判据**。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pin_anchor_when_start_drifts: Option<bool>,
     /// 候选窗首显策略；`None` = 不干预，跟随全局 `ui.candidate.first_show_mode`。
     ///
@@ -479,7 +495,11 @@ pub struct AppCompatRule {
     /// （`HostRenderManager::is_process_whitelisted`），不得经 `ActiveCompat` 全局焦点槽缓存
     /// ——开始菜单弹出会连带激活兄弟进程，焦点槽会被污染，详见
     /// `docs/redesign/host-render-windows-port.md` §11.2。
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
     pub host_render: bool,
     /// 该应用是否启用符号自动配对；`None` = 不干预，沿用全局 `input.auto_pair.*`。
     ///
@@ -494,7 +514,11 @@ pub struct AppCompatRule {
     /// ⚠ 消费点有**三条**，缺一即半截修复：`active_pairs()`（中文标点态）、
     /// `english_pairs_via_pipeline()`（英文标点流水线）、`push_english_pair_config()`
     /// （纯英文模式由 C++ `_englishPairEngine` 独立处理，协调器根本收不到那些键）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_pair: Option<bool>,
     /// 该应用的密码框是否强制英文；`None` = 跟随全局 `input.password_force_english`（A2-37 / t197）。
     ///
@@ -606,7 +630,11 @@ pub struct AppCompatRule {
     /// 时 Ctrl 正被按住，宿主自己写则没有任何按键（同款判据已在 C++ 的 CapsLock 联动
     /// 抑制窗用过并实测过）。判据由 DLL 在发消息时一并交代（`MODE_SWITCH_CTRL_HELD`），
     /// 服务端不去猜。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ignore_host_ime_close: Option<bool>,
     /// 这个宿主读走候选串时，是否当它在自绘、从而收起我们的候选窗。
     /// `None` = 否（默认），`Some(true)` = 是，`Some(false)` = **显式关闭**。
@@ -647,7 +675,11 @@ pub struct AppCompatRule {
     /// 规则查两层：本进程名一条，以及 `process = "*"` 的通配一条（通配现在的用途是反方向
     /// ——某类宿主普遍需要收窗时一行开到全局）。查表见
     /// `Coordinator::uielement_host_draws_by_inference`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_drawn_candidates: Option<bool>,
 }
 
@@ -1971,6 +2003,62 @@ mod tests {
             "只剩 process 的空壳规则应被剔除"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `AppCompatRule` 的每个布尔字段（`bool` / `Option<bool>`）类型写错都**不得**让整份
+    /// compat.toml 失效，只让该字段回落「未配置」，同文件其它规则照常生效。
+    ///
+    /// 字段表取自源码而不是手写：`load_file` 没有段级降级，新加一个布尔字段忘了挂
+    /// `tolerant_opt_bool` / `tolerant_bool`，用户写一个 `"yes"` 就是所有应用的所有规则
+    /// 一起静默失效——本条让它在这里红，不靠人记得（auto_pair 就是这么漏的）。
+    #[test]
+    fn every_bool_field_wrong_type_does_not_sink_the_file() {
+        let src = include_str!("app_compat.rs");
+        let start = src.find("pub struct AppCompatRule {").unwrap();
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split_once(": "))
+            .filter(|(_, ty)| matches!(*ty, "bool," | "Option<bool>,"))
+            .map(|(name, _)| name)
+            .collect();
+        assert!(fields.len() >= 9, "字段扫描失灵：{fields:?}");
+        for field in &fields {
+            for bad in [r#""yes""#, "1", "[true]"] {
+                let text = format!(
+                    "[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\n\n\
+                     [[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n"
+                );
+                let file = toml::from_str::<AppCompatFile>(&text)
+                    .unwrap_or_else(|e| panic!("{field} = {bad}: 类型写错不得让整份失败：{e}"));
+                let compat = AppCompat::from_rules(file.apps);
+                let typo = toml::Value::try_from(compat.get_rule("typo.exe").unwrap()).unwrap();
+                assert!(
+                    typo.get(*field).is_none(),
+                    "{field} = {bad}: 认不出 = 没配过，实际 {typo:?}"
+                );
+                assert_eq!(
+                    compat.get_rule("other.exe").unwrap().auto_pair,
+                    Some(false),
+                    "{field} = {bad}: 同文件其它规则必须照常生效"
+                );
+            }
+        }
+    }
+
+    /// 最初的现场：`auto_pair = "yes"` 曾让整份 compat.toml 静默失效。
+    #[test]
+    fn auto_pair_wrong_type_does_not_sink_the_file() {
+        let file = toml::from_str::<AppCompatFile>(
+            "[[apps]]\nprocess = \"et.exe\"\nauto_pair = \"yes\"\n\n\
+             [[apps]]\nprocess = \"other.exe\"\ncaret_use_top = true\n",
+        )
+        .expect("auto_pair 写错不得让整份失败");
+        let compat = AppCompat::from_rules(file.apps);
+        assert_eq!(compat.get_rule("et.exe").unwrap().auto_pair, None);
+        assert!(compat.get_rule("other.exe").unwrap().caret_use_top);
     }
 
     fn parse_rules(toml: &str) -> AppCompat {
