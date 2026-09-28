@@ -283,8 +283,8 @@ readings = "#9AD0FF"
 ### 5.4 标准色契约
 
 内联色写名字才能「跟随主题 + 明暗」。下列名字由 `_base` 给默认，所有出厂主题都继承 `_base`，
-故**保证可解析**；第三方主题只要 `base` 链上有 `_base` 同样保证。契约写进文档站（§12），
-主题编辑器按此给中文名与分组。清单于 2026-09-27 确认（不加 `link`）。
+故**保证可解析**；没继承 `_base` 的第三方主题由引擎兜底补齐（见本节末「引擎兜底」），同样保证。
+契约写进文档站（§12），主题编辑器按此给中文名与分组。清单于 2026-09-27 确认（不加 `link`）。
 
 #### 已有、纳入契约
 
@@ -380,6 +380,41 @@ readings = "#9AD0FF"
 `_base` / `msime` 的激活键会变成强调色字压强调色底。P2 把这一级改为 `on_accent`（§15）；`_qingfeng` 系
 今天就已是 `accent_text` 字压 `accent` 底，改后变为白字，属顺带修正，靶机核对一眼。`Resolved.palette`
 多出十几项，Android 拉取调色板（`theme_palette`）会多拿到这些键，无害。
+
+#### 引擎兜底：没继承 `_base` 的主题（2026-09-28）
+
+**起因**：用户靶机上的第三方主题「Switch风格」没写 `base`（主题继承只认显式 `base`，`load_merged_dirs_at`），
+契约名一个也没有，`$[error]{…}` 查不到名字、回落正文色，看起来像「颜色失效」。
+
+**规则**：调色板解析后，把主题 `[colors]` **没写**的契约名补进 `Resolved.palette`；写了的一个不动，
+契约外的名字一个不加。不是隐式继承 `_base`——那会连带改掉第三方主题的布局与其它颜色（已否决）。
+
+- 补值来源是编译期嵌入的 `_base/theme.toml` 本身（`wind_theme::contract`，`include_str!`），不是手抄的常量表：
+  两处写同一组值迟早只改一处，而这里漂移了没有任何症状（只有无 base 主题看得到）。嵌入而不是运行时读盘：
+  兜底不该依赖搜索链里恰好有 `_base`（测试刻意不把 `data/themes` 放进搜索链）。
+- 引用的解析口径：**契约名之间的引用按本主题解析**——`selection_text = ${text}`、`tooltip_text` 暗档
+  `${text}` 取本主题的 `text`，`accent_text = ${accent}` 取本主题的强调色（「Switch风格」得到它的红
+  `#FF4554`），`tooltip_accent_text` / `tooltip_on_accent` / `tooltip_selection_text` 同理；本主题也没写，
+  再取兜底值。**契约外的名字只取 `_base` 自己的值**：主题连 `accent` 也没写时，`accent = ${primary}` 取
+  `_base` 的 `#4285F4`，不借主题的 `primary`——它不在契约里，第三方主题的同名色未必是同一个意思。
+- 「写没写」按 `[colors]` 的键判，不按解析结果：主题写了却解析不出（坏值、`transparent`、断链）是作者自己的
+  选择，不替它换成 `_base` 的色；引用它的兜底（如 `selection_text`）也随之解析不出，与主题里写 `${它}` 一致。
+- 补在 views 求值**之后**：节点的调色板默认色（`tk("text")`、注释默认 `text_hint` 等）仍只看主题自己写的，
+  候选窗节点外观不变。按名取色的渲染层会看到补上的名字，见下「有意的外观变化」。
+- 两个出口同一口径：桌面 `wind_theme::resolve`（候选窗、气泡、设置页预览 `previewTemplate`）与移动端拉取的
+  `Coordinator::theme_palette`（它不走 `resolve`，单独接一次）。出厂主题都继承 `_base`，兜底是空操作，
+  调色板逐项不变（有用例对拍）。
+
+**有意的外观变化**（只影响没写对应名字的无 base 主题）：
+
+- 气泡正文色：`theme.color("tooltip_text", 兜底)` 原先落渲染层兜底 `[240,240,245]`，现在是契约值——亮档
+  `#FFFFFF`，暗档本主题的 `text`。主题暗档 `text` 是深色（只调了浅色的主题写单值深色 `text`）而又没写
+  `tooltip_bg` 时，暗色模式下气泡字会变暗、难读；这类主题应自己写 `tooltip_text`。
+- 候选窗翻页箭头的禁用色（`text_hint`）与页码分隔色（`text_dim`）原先落渲染层兜底，现在取契约值。
+
+**已知局限**：`tooltip_*` 兜底按深色气泡底调（`_base` 的气泡底亮暗两档都是深色）。第三方主题若把气泡底
+配成浅色（`tooltip_bg`），兜底补的 `tooltip_*` 在上面看不清，需自己定义 `tooltip_*`。同理，兜底的
+`tooltip_accent` 是 `_base` 的蓝，不随主题强调色变（与 §5.4 上文「改了 primary 未改 tooltip_accent」同一情形）。
 
 ### 5.5 `#RGB`
 
@@ -706,6 +741,7 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 | `src/lib/theme3/presets/baseChain.ts` | `_base` / `_qingfeng` 改动后跑 `pnpm bake:theme` 重新烘焙（勿手改） |
 | `src/lib/color.ts` | 已支持 `#RGB`，无需改；§5.5 修的是引擎一侧 |
 | `src/components/form/ViewsEditorV3.vue` | 注释、提示框节点加「文字角色色」面板：常态 / 选中 / 悬停三栏（提示框只有常态）；文案写明回落规则 §6.3；配色页在「改了 `primary`、未改 `tooltip_accent`」时提示（§5.4） |
+| `src/lib/theme3/contract.ts`（2026-09-28） | 标准色契约兜底（§5.4「引擎兜底」）：`contractLookup` 按名取色含兜底，源头是烘焙的 `BASE_CHAIN_V3._base`；提示框正文色按名取 `tooltip_text` 时同样含兜底；与引擎共用期望表 `contract-nobase/expected.json` 对拍 |
 | `src/lib/preview/candidateBox.ts`、`src/lib/preview/otherWindows.ts` | 预览样例带片段（如注释 `kao` 标 `code_hint`、气泡段名标 `title`），按 §6.2 求色，否则配了角色在预览里看不出来 |
 
 ## 11 设置端（wind-setting）
@@ -751,7 +787,7 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 |---|---|
 | `settings/appearance/candidate-comment.mdx` | 「语法」加 `$[颜色]{内容}` 小节（§4 的颜色值表、与可选段的关系、写错的表现、选中态回落）；加 `<Since>` |
 | `settings/appearance/candidate-tooltip.mdx` | 同上一句带过并链到注释页；「平台支持与已知局限」里「段名没有单独的样式（加粗、颜色）」改为「段名可由主题配色（`title` 角色），不能加粗」；macOS 旧版 `.app` 单色的说明 |
-| `settings/appearance/themes.mdx` | 新增「文字角色色」节：`[comment.roles]` / `[tooltip.roles]`、状态写法、回落规则、角色名全表（§3.2 + `TEXT_ROLES`）；新增「标准色」节：§5.4 表（写明第三方主题要继承 `_base` 才有保证）；「颜色格式」处 `#RGB` 与实现对齐 |
+| `settings/appearance/themes.mdx` | 新增「文字角色色」节：`[comment.roles]` / `[tooltip.roles]`、状态写法、回落规则、角色名全表（§3.2 + `TEXT_ROLES`）；新增「标准色」节：§5.4 表（没继承 `_base` 的主题由引擎兜底补齐，写明兜底规则与已知局限，2026-09-28 改）；「颜色格式」处 `#RGB` 与实现对齐 |
 | 配方 | 「选中时保留编码高亮」「淡化装饰、突出信息」「派生主题只改角色色」 |
 
 ## 13 兼容与零回归
@@ -845,6 +881,22 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
   - 自定义 `#hex` 插入后焦点留在那个小输入框，回不到模板输入框：windui 的 `request_focus` 只能给回调
     自己所在的节点，没有移交焦点的入口。光标位置照样摆好。
   - 输入框节点靠点击记下，键盘 Tab 进来的在用时从触发控件往上找最近的、正文相同的输入框。
+
+**契约兜底执行记录（2026-09-28）**（§5.4「引擎兜底」）：
+
+- wind-theme 新增 `contract` 模块：`NAMES`（11 个候选窗契约名，另各有 `tooltip_*`，共 22 个）与
+  `fill_missing`；`resolve` 在 views 求值之后调用，`Coordinator::theme_palette` 同样接上。补值来自嵌入的
+  `_base/theme.toml`，契约表测试（`span.rs`）的 `NAMES` 改为引用同一常量。
+- 测试：空主题补齐全部 22 名且值等于 `_base`、自有值不被覆盖、契约外不加、写了却解析不出的不补、引用按
+  本主题解析、缺 `accent` 时不借主题 `primary`；出厂七个主题 × 亮暗兜底前后调色板逐项相等；无 base 测试
+  主题 `testdata/themes/contract-nobase`（仿「Switch风格」）的内联色求色；移动端拉取面用例（夹具主题本就
+  没写 base）断言拿到 `_base` 的 `error`。
+- 与编辑器共用的期望表 `contract-nobase/expected.json`：22 个契约名与两个契约外名字的调色板终值，及其
+  在注释 / 气泡里的内联色求色；编辑器按同一规则补齐后逐项对拍。
+- 变异：去掉 `resolve` 里的兜底 → 2 条红；`_base` 垫在主题之上（盖掉自有值）→ 7 条红；`accent` 不按本
+  主题解析（`accent_text` 不借主题强调色）→ 3 条红；去掉 `theme_palette` 里的兜底 → 拉取面用例红。
+  另试过「最后一步对全部契约名无条件写入」：因为主题写了的名字在兜底表里就是本主题的终值，写回去值不变，
+  是等价变异，不算漏测。
 
 **靶机验证判据**（部署含 P1～P3 的构建后，由用户人工核对；同时核 Windows 候选窗与 TSF 宿主渲染窗口）：
 
