@@ -74,11 +74,13 @@ pub fn fill_missing(colors: Option<&Value>, palette: &mut HashMap<String, Rgba>,
     // 解析不出，与主题里写 `${它}` 的结果一致）；契约外的名字保持 `_base` 的原样。
     let hex = |c: &Rgba| format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3]);
     let mut table = base_colors().clone();
-    // 主题连气泡底色也没写：气泡底是渲染层常量（深灰），`tooltip_text` 兜底取渲染层原来的
-    // 常量，外观与没有兜底时完全一致。`_base` 的暗档 `${text}` 是配它自己的深色气泡底的，
-    // 借本主题 text 在这里会出问题：只调了浅色、text 写成单个深色值的主题，暗色下成了深字压
-    // 深底（2026-09-28 确认）。引用它的 tooltip_on_accent 等随之取同一个值。
-    if !written("tooltip_bg") && !written("tooltip_text") {
+    // 主题没有可用的气泡底色（没写，或写了解析不出）：气泡底是渲染层常量（深灰），`tooltip_text`
+    // 兜底取渲染层原来的常量，外观与没有兜底时完全一致。`_base` 的暗档 `${text}` 是配它自己的
+    // 深色气泡底的，借本主题 text 在这里会出问题：只调了浅色、text 写成单个深色值的主题，暗色下
+    // 成了深字压深底（2026-09-28 确认）。引用它的 tooltip_on_accent 等随之取同一个值。主题自己写了
+    // tooltip_text 的，下面的循环照常换回本主题的值。
+    // 判「可用」看解析结果而不是写没写：渲染层取底色也是按解析结果（`theme.color("tooltip_bg")`）。
+    if !palette.contains_key("tooltip_bg") {
         table.insert("tooltip_text".into(), Value::String(hex(&TOOLTIP_TEXT)));
     }
     for n in all_names().filter(|n| written(n)) {
@@ -137,6 +139,15 @@ mod tests {
                 assert_eq!(p.get(&n), b.get(&n), "dark={dark}: {n}");
             }
             assert_eq!(p.len(), 23, "只补契约名，不带进 _base 的其它名字");
+        }
+    }
+
+    /// 气泡底色写了但解析不出：渲染层照样用常量底色，气泡正文色也取渲染层原常量。
+    #[test]
+    fn unresolvable_tooltip_bg_counts_as_absent() {
+        for bg in [r#""transparent""#, r#""${nowhere}""#] {
+            let p = fill(&format!("tooltip_bg = {bg}\ntext = \"#333333\""), true);
+            assert_eq!(p["tooltip_text"], TOOLTIP_TEXT, "tooltip_bg = {bg}");
         }
     }
 
