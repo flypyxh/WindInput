@@ -36,9 +36,16 @@ enum CandidateMenuTracking {
         return ProcessInfo.processInfo.systemUptime - t < trailingGrace
     }
 
+    /// 菜单收起且尾随闪断也过去后回调（主线程）。由 CandidatePanelHost 接到当前 controller。
+    static var didSettle: (() -> Void)?
+
     static func popUp(_ menu: NSMenu, at point: NSPoint, in view: NSView) {
         isTracking = true
-        defer { isTracking = false; endedAt = ProcessInfo.processInfo.systemUptime }
+        defer {
+            isTracking = false
+            endedAt = ProcessInfo.processInfo.systemUptime
+            DispatchQueue.main.asyncAfter(deadline: .now() + trailingGrace) { didSettle?() }
+        }
         menu.popUp(positioning: nil, at: point, in: view)
     }
 }

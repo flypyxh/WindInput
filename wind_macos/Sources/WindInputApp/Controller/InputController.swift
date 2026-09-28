@@ -3,6 +3,7 @@ import InputMethodKit
 import WindInputKit
 import Carbon.HIToolbox // IsSecureEventInputEnabled (密码框/安全输入检测)
 import ApplicationServices // AXUIElement (前台窗口标题, 命令直通车 title())
+import os
 
 // InputController — IMKit 为每个文本框/会话实例化一个本类对象 (PR-1 设计 方案 A).
 //
@@ -187,6 +188,29 @@ public class InputController: IMKInputController {
                 self.flushDeferredDeactivation()
             }
         }
+    }
+
+    /// 统一日志里 NSLog 的插值一律是 `<private>`, 现场看不到; 这类要靠真机日志定位的
+    /// 诊断点改走 Logger 并显式标 public (只打长度/区间, 不打用户输入的内容)。
+    private static let diagLog = Logger(subsystem: "to.feng.inputmethod.WindInput", category: "menu")
+
+    /// 右键菜单收起后核对宿主的 marked text, 没了就让两端一起收场。
+    ///
+    /// Spotlight 在菜单抢焦点那一刻会结束输入会话 (日志 `didSessionEnd`): 我们的 marked text
+    /// 随之作废, 手里的 client 也失效 (markedRange / selectedRange 全回 NSNotFound, 补不回去)。
+    /// 此后它不再把 Esc 交给输入法, 而服务端仍在组字、候选窗留在屏幕上 (2026-09-28 实测)。
+    /// 这里发现 marked text 没了就清本端、让服务端清组字收候选, 不碰宿主文本。
+    /// 根治要让菜单不抢键盘焦点 (自绘非激活面板代替 NSMenu), 另记待办。
+    public func menuTrackingDidSettle() {
+        guard !composition.isEmpty, let client = currentClient else { return }
+        let marked = client.markedRange()
+        Self.diagLog.info("menu settle: marked=\(marked.location, privacy: .public)/\(marked.length, privacy: .public) comp=\(self.composition.utf16Length, privacy: .public)")
+        if marked.location != NSNotFound && marked.length > 0 { return }
+        // 失焦再获焦 = 服务端清组字、收候选, 但仍认这个框是焦点 (只发 FocusLost 会让它
+        // 以为输入法已不在前台)。
+        router.applyClearComposition(client: nil)
+        sendEmpty(UpstreamCmd.focusLost)
+        sendFocusGained()
     }
 
     private func flushDeferredDeactivation() {
