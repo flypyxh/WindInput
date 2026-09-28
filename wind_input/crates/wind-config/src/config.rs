@@ -1089,24 +1089,27 @@ pub enum CodeHintSource {
     CodeTable,
     /// 只显示双拼编码。
     Shuangpin,
-    /// 两者都求值，谁先出由模板的回退链决定。临拼的出厂档，也是认不出的值的兜底档。
+    /// 两者都求值，谁先出由模板的回退链决定。临拼的出厂档。
     #[default]
     Auto,
 }
 
 impl CodeHintSource {
-    /// 认不出的值回落 `auto`。与仓里其它字符串枚举（`first_show_mode` 等）同一取舍：
-    /// 配置是用户手打的，写错一个字母不该让整个功能消失，更不该弹错误框。
+    /// 认不出的值回落 `fallback`，由调用方传入**该字段自己的出厂档**：
+    /// `schema.pinyin.code_hint_source` 传 `Off`，`input.temp_pinyin.code_hint_source` 传 `Auto`。
+    /// 两份出厂值不同，函数内写死单一兜底的话，拼音方案用户手滑写错一个字母就会
+    /// 意外看到编码。写错不弹错误框、不让功能消失，与仓里其它字符串枚举同一取舍。
     ///
     /// ⚠️ match 臂必须与 `config_schema::CODE_HINT_SOURCE_VALUES` **逐项对齐**。这里多认
     /// 一个别名（比如让 `none` 也算 `off`），就会变成「注册表说它非法、运行时却认」——
     /// CLI 校验与设置页下拉都按注册表办事，用户会撞上「明明能用却填不进去」。
-    pub fn from_config(s: &str) -> Self {
+    pub fn from_config(s: &str, fallback: Self) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => Self::Off,
             "codetable" => Self::CodeTable,
             "shuangpin" => Self::Shuangpin,
-            _ => Self::Auto,
+            "auto" => Self::Auto,
+            _ => fallback,
         }
     }
 
@@ -1138,7 +1141,7 @@ fn default_code_hint_source() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinyinGlobalConfig {
     /// 拼音方案（含双拼）下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
-    /// 出厂 `off`（理由见 `default_code_hint_source`）；认不出的值回落 `auto`。
+    /// 出厂 `off`（理由见 `default_code_hint_source`）；认不出的值同样回落 `off`。
     /// 临拼/快捷输入不读本字段，读 `input.temp_pinyin.code_hint_source`。
     #[serde(default = "default_code_hint_source")]
     pub code_hint_source: String,
@@ -12438,8 +12441,9 @@ scripts = { latin = 42 }
         assert_eq!(c.schema.pinyin.code_hint_source, "off");
         assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
         assert_eq!(
-            CodeHintSource::from_config(&c.input.temp_pinyin.code_hint_source),
-            CodeHintSource::Auto
+            CodeHintSource::from_config(&c.input.temp_pinyin.code_hint_source, CodeHintSource::Off),
+            CodeHintSource::Auto,
+            "出厂 auto 须是认出来的 auto，不是兜底落出来的"
         );
         // 写了 [input.temp_pinyin] 段但没写本键 → serde default 兜底，仍是 auto。
         let c = merged_with("[input.temp_pinyin]\nenabled = true\n");
@@ -12468,23 +12472,33 @@ scripts = { latin = 42 }
         }
     }
 
-    /// 认不出的值回落 `auto`，不是静默关闭。
+    /// 认不出的值回落调用方传入的 `fallback`（各字段自己的出厂档），不是函数内写死的某一档。
     ///
-    /// 配置是用户手打的：把 `schema` 拼成 `schama` 就整个功能消失，是那种「配了没反应」
-    /// 的静默失效——本仓记忆里反复出现的那一类。
+    /// 两份字段出厂值不同（拼音方案 `off`、临拼 `auto`）：写死一档的话，总有一份字段写错
+    /// 后会落到别人的出厂档上——拼音方案用户手滑就意外看到编码。
     #[test]
-    fn unknown_code_hint_source_falls_back_to_auto() {
+    fn unknown_code_hint_source_falls_back_to_given_fallback() {
+        use CodeHintSource::*;
+        for fallback in [Off, CodeTable, Shuangpin, Auto] {
+            assert_eq!(
+                CodeHintSource::from_config("shuangping", fallback),
+                fallback
+            );
+            assert_eq!(CodeHintSource::from_config("", fallback), fallback);
+        }
+        // 大小写与空白不敏感（设置页写回的值与用户手打的都认），且认出来的值不看 fallback。
         assert_eq!(
-            CodeHintSource::from_config("shuangping"),
-            CodeHintSource::Auto
-        );
-        assert_eq!(CodeHintSource::from_config(""), CodeHintSource::Auto);
-        // 大小写与空白不敏感（设置页写回的值与用户手打的都认）。
-        assert_eq!(
-            CodeHintSource::from_config("  CodeTable "),
+            CodeHintSource::from_config("  CodeTable ", Off),
             CodeHintSource::CodeTable
         );
-        assert_eq!(CodeHintSource::from_config("OFF"), CodeHintSource::Off);
+        assert_eq!(
+            CodeHintSource::from_config("OFF", Auto),
+            CodeHintSource::Off
+        );
+        assert_eq!(
+            CodeHintSource::from_config(" Auto", Off),
+            CodeHintSource::Auto
+        );
     }
 
     /// 注册表值域与 `from_config` 的 match 臂必须逐项对齐。
@@ -12493,14 +12507,16 @@ scripts = { latin = 42 }
     /// 办事，漂移的表现是「明明能用却填不进去」，或「填进去了却没反应」。
     #[test]
     fn code_hint_source_values_match_registry() {
+        use CodeHintSource::*;
         for v in crate::config_schema::CODE_HINT_SOURCE_VALUES {
-            let parsed = CodeHintSource::from_config(v);
-            assert_ne!(
-                (parsed, *v),
-                (CodeHintSource::Auto, "off"),
+            let parsed = CodeHintSource::from_config(v, Off);
+            // 换两个不同的 fallback 结果不变 = 这个值是被 match 臂认出来的，没落到兜底。
+            assert_eq!(
+                CodeHintSource::from_config(v, Auto),
+                parsed,
                 "注册表列出的 {v} 不该落到兜底档"
             );
-            // 每个列出的值都要能被解析回它自己（`auto` 兜底档同样成立）。
+            // 每个列出的值都要能被解析回它自己。
             assert_eq!(
                 format!("{parsed:?}").to_ascii_lowercase(),
                 v.replace('_', ""),

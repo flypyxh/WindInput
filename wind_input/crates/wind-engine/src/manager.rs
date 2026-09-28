@@ -802,6 +802,8 @@ impl EngineManager {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .code_hint_source,
+            // 认不出的值回落本字段出厂档 `off`（`default_code_hint_source`）。
+            wind_config::config::CodeHintSource::Off,
         )
     }
 
@@ -815,6 +817,8 @@ impl EngineManager {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .code_hint_source,
+            // 认不出的值回落本字段出厂档 `auto`（`default_temp_pinyin_code_hint_source`）。
+            wind_config::config::CodeHintSource::Auto,
         )
     }
 
@@ -6955,6 +6959,31 @@ mod tests {
         cfg.schema.english.frequency.code_scope = "candidate".to_string();
         let mgr2 = EngineManager::new(&cfg, None);
         assert!(!mgr2.freq_settings().english_code_by_input);
+    }
+
+    /// ★ 两份编码来源开关写错时各自回落**自己的**出厂档，互不串：拼音方案 → `off`、
+    /// 临拼 → `auto`。共用一个写死的兜底时，拼音方案写错值会意外显示编码。
+    #[test]
+    fn code_hint_source_unknown_value_falls_back_per_field() {
+        use wind_config::config::CodeHintSource;
+        // 前提：兜底档与各自的出厂值字面一致。改了出厂值却忘了改兜底，这里先红。
+        let def = Config::default();
+        assert_eq!(def.schema.pinyin.code_hint_source, "off");
+        assert_eq!(def.input.temp_pinyin.code_hint_source, "auto");
+
+        let mut cfg = Config::default();
+        cfg.schema.pinyin.code_hint_source = "shuangping".to_string();
+        cfg.input.temp_pinyin.code_hint_source = "shuangping".to_string();
+        let mgr = EngineManager::new(&cfg, None);
+        assert_eq!(mgr.code_hint_source(), CodeHintSource::Off);
+        assert_eq!(mgr.temp_pinyin_code_hint_source(), CodeHintSource::Auto);
+
+        // 反向对照：合法值照认，证明上面落的是兜底而非两个方法碰巧固定返回这两档。
+        cfg.schema.pinyin.code_hint_source = "auto".to_string();
+        cfg.input.temp_pinyin.code_hint_source = "off".to_string();
+        let mgr = EngineManager::new(&cfg, None);
+        assert_eq!(mgr.code_hint_source(), CodeHintSource::Auto);
+        assert_eq!(mgr.temp_pinyin_code_hint_source(), CodeHintSource::Off);
     }
 
     #[test]
