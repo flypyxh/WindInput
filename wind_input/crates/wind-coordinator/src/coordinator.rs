@@ -2953,25 +2953,41 @@ impl Coordinator {
     ///
     /// ⚠ 现查为空时**保留缓存**：macOS 的服务进程 `process_name` 恒返回空串，那边的名字
     /// 由 `.app` 随焦点事件送进缓存。清掉会让 compat 规则在下一次 focus_gained 之前全部失配。
+    ///
+    /// ★ 真的改写了缓存时，给该进程的推送客户端**补推**按 pid 现算的 DLL 配置（密码框吃键
+    /// 门控、英文自动配对）：推送通道的握手可能早于主管道的这次校正，那时推过去的值是按
+    /// **旧名**算的——密码框门控错了就打破 core.suppress ⊆ C++.suppress（密码框丢键）。
+    /// 首次落缓存（`None` 分支）不用补推：缓存为空时握手现查的就是真名。
     #[cfg(any(windows, test))]
     pub(crate) fn revalidate_pid_name(&self, pid: u32, live_name: &str) {
         if pid == 0 || live_name.is_empty() {
             return;
         }
         let live = live_name.to_lowercase();
-        let mut names = self.pid_names.lock().unwrap_or_else(|e| e.into_inner());
-        match names.get(&pid) {
-            Some(cached) if *cached == live => {}
-            Some(cached) => {
-                // 这条 WARN 就是 PID 复用的现场证据。缓存过一个名字、现查却是另一个，
-                // 只可能是那个 pid 换了进程——在此之前它一直是静默错配。
-                tracing::warn!(
-                    "pid_names 校正：pid={pid} 缓存={cached} 实际={live}（PID 已被复用，此前按缓存匹配的 per-app 规则是错的）"
-                );
-                names.insert(pid, live);
+        let rewritten = {
+            let mut names = self.pid_names.lock().unwrap_or_else(|e| e.into_inner());
+            match names.get(&pid) {
+                Some(cached) if *cached == live => false,
+                Some(cached) => {
+                    // 这条 WARN 就是 PID 复用的现场证据。缓存过一个名字、现查却是另一个，
+                    // 只可能是那个 pid 换了进程——在此之前它一直是静默错配。
+                    tracing::warn!(
+                        "pid_names 校正：pid={pid} 缓存={cached} 实际={live}（PID 已被复用，此前按缓存匹配的 per-app 规则是错的）"
+                    );
+                    names.insert(pid, live);
+                    true
+                }
+                None => {
+                    names.insert(pid, live);
+                    false
+                }
             }
-            None => {
-                names.insert(pid, live);
+        };
+        // 放掉 `pid_names` 锁之后再推：推送内容现算时要再取它。
+        if rewritten {
+            for token in self.push_server.tokens_of_pid(pid) {
+                self.push_password_suppress_config(token);
+                self.push_english_pair_config(token);
             }
         }
     }
@@ -15983,6 +15999,129 @@ mod input_diag_tests {
                 &wind_ipc::codec::encode_password_suppress_value(false),
             )]
         );
+    }
+
+    fn pfe_msg(v: bool) -> Vec<u8> {
+        wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+            &wind_ipc::codec::encode_password_suppress_value(v),
+        )
+    }
+
+    /// 从一个客户端这一轮收到的推送里取出密码框门控的值（没收到 = `None`）。
+    fn pushed_pfe(cap: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<bool> {
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        match (got.contains(&pfe_msg(true)), got.contains(&pfe_msg(false))) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+            (true, true) => panic!("同一轮收到两种值"),
+        }
+    }
+
+    /// PID 复用：推送通道握手早于主管道校正进程名时，握手按**旧名**算了门控。校正真的
+    /// 改写了缓存 ⇒ 必须给该进程的客户端补推按新名算的值；别的进程不受打扰。
+    #[test]
+    fn revalidated_pid_name_repushes_password_gate_to_that_process() {
+        let c = test_coordinator();
+        // 新进程 misreport.exe 配了 false，但 pid 700 在缓存里还是上一任 plain.exe（无规则）。
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+        c.pid_names.lock().unwrap().insert(700, "plain.exe".into());
+        c.pid_names.lock().unwrap().insert(701, "other.exe".into());
+        let tok = (700u64 << 32) | 1;
+        let bystander = (701u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(tok);
+        let cap_other = c.push_server.attach_capture_client(bystander);
+
+        // 握手（按旧名算 ⇒ 跟随全局 = 开）。
+        c.push_password_suppress_config(tok);
+        assert_eq!(pushed_pfe(&cap), Some(true), "前置：握手按旧名算");
+
+        c.revalidate_pid_name(700, "MisReport.exe");
+        assert_eq!(
+            pushed_pfe(&cap),
+            Some(c.password_force_english_for_pid(700)),
+            "校正了进程名就得按新名补推，DLL 与服务端判定必须一致"
+        );
+        assert_eq!(pushed_pfe(&cap), None, "补推一次即可");
+        assert_eq!(pushed_pfe(&cap_other), None, "别的进程的客户端不该收到补推");
+
+        // 名字没变（同进程重连）不补推。
+        c.revalidate_pid_name(700, "misreport.exe");
+        assert_eq!(pushed_pfe(&cap), None, "名字没变不补推");
+    }
+
+    /// ★ 任何一次整表重载（不只是密码框那一项菜单）都要重推门控：用户手写了
+    /// `password_force_english`，随后点了一个**别的**菜单项 / 拖了一下候选窗，服务端判定
+    /// 已按新规则走，推给该客户端的值必须跟上——否则打破 core.suppress ⊆ C++.suppress。
+    #[test]
+    fn any_compat_reload_repushes_password_gate_for_hand_written_rule() {
+        let dir = std::env::temp_dir().join(format!("wind_pfe_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ui_tx, _rx) = std::sync::mpsc::channel();
+        let push_server = Arc::new(PushServer::new(wind_bridge::push::PushConfig {
+            suffix: String::new(),
+            write_timeout_ms: 30_000,
+        }));
+        // 用户目录只给 compat 用；store = None ⇒ state_writer 不写本机状态。
+        let c = Coordinator::build(
+            Config::default(),
+            None,
+            push_server,
+            crate::UiSender::without_wake(ui_tx),
+            Some(dir.clone()),
+            None,
+            None,
+        );
+        c.pid_names.lock().unwrap().insert(700, "bank.exe".into());
+        c.active_compat.lock().unwrap().pid = 700;
+        let tok = (700u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(tok);
+
+        // 每一轮：先「手写」翻转规则（只改文件，内存表不知道），再触发一个非密码类的重载。
+        type Reload<'a> = (&'a str, &'a dyn Fn(&Coordinator));
+        let reloads: [Reload; 7] = [
+            ("set_first_show_mode", &|c| c.set_first_show_mode(1)),
+            ("set_candidate_position_rule", &|c| {
+                c.set_candidate_position_rule(1)
+            }),
+            ("set_ignore_host_ime_close_rule", &|c| {
+                c.set_ignore_host_ime_close_rule(1)
+            }),
+            ("set_auto_pair_rule", &|c| c.set_auto_pair_rule(2)),
+            ("set_status_fallback_rule", &|c| {
+                c.set_status_fallback_rule(2)
+            }),
+            ("set_status_position_rule", &|c| {
+                c.set_status_position_rule(1)
+            }),
+            ("set_initial_state_rule", &|c| {
+                c.set_initial_state_rule(false, 2)
+            }),
+        ];
+        for (i, (what, reload)) in reloads.iter().enumerate() {
+            let hand_written = i % 2 == 0; // 在 false / true 间来回翻，两个方向都验
+            wind_config::app_compat::set_user_password_force_english(
+                &dir,
+                "bank.exe",
+                Some(hand_written),
+            )
+            .unwrap();
+            let _ = pushed_pfe(&cap);
+            reload(&c);
+            assert_eq!(
+                c.password_force_english_for_pid(700),
+                hand_written,
+                "{what}: 前置——重载后服务端按手写规则判定"
+            );
+            assert_eq!(
+                pushed_pfe(&cap),
+                Some(hand_written),
+                "{what}: 推给该客户端的门控必须等于服务端判定"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

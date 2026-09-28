@@ -523,11 +523,7 @@ impl Coordinator {
             tracing::error!("save_candidate_pos: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::debug!("候选窗固定位置 for process={name}: ({x},{y})");
     }
 
@@ -560,11 +556,7 @@ impl Coordinator {
             tracing::error!("set_candidate_position_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::info!(
             "候选窗定位方式 for process={name}: {}",
             mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
@@ -599,11 +591,7 @@ impl Coordinator {
             tracing::error!("set_ignore_host_ime_close_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::info!(
             "忽略宿主关闭输入法 for process={name}: {}",
             match enabled {
@@ -894,6 +882,35 @@ impl Coordinator {
         ]
     };
 
+    /// 从磁盘整表重载 `app_compat`（系统层 + 定制层 + 用户层，与启动时同一口径），并把
+    /// **所有**依赖这张表、又在别处缓存了结果的东西一并对齐。菜单写规则、拖动落盘等全部
+    /// 重载点都只许调这一个函数。
+    ///
+    /// ★ 为什么收成一处：重载拿到的是**整份文件的当前内容**，不只是本次菜单改的那一项。
+    /// 用户手写了 `password_force_english = false` 之后随便点一次别的菜单（甚至只是拖一下
+    /// 候选窗），服务端的判定就按新规则走了；若这里不重推，DLL 手里还是旧值 ⇒ 打破
+    /// core.suppress ⊆ C++.suppress ⇒ 密码框丢键。此前只有密码框那一项的菜单会重推。
+    ///
+    /// 对齐项（顺序有意义）：
+    /// 1. HostRender 白名单（Windows）；
+    /// 2. 当前焦点的密码框抑制态（只降不升，理由见 [`Self::relax_password_suppress_for_focus`]）；
+    /// 3. 逐客户端重推 DLL 的密码框吃键门控（与 2 出自同一判定函数）；
+    /// 4. 逐客户端重推英文自动配对配置（DLL 的 `_englishPairEngine` 只认推过去的值）。
+    ///
+    /// 3、4 是幂等的逐客户端推送，值没变时 DLL 收到同值，无副作用。
+    pub(crate) fn reload_app_compat(&self) {
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            self.compat_dirs.1.as_deref(),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
+        self.relax_password_suppress_for_focus();
+        self.push_password_suppress_config(0);
+        self.push_english_pair_config(0);
+    }
+
     /// 为当前焦点应用设置候选窗首显策略，并写入用户层 compat.toml。
     ///
     /// 三步收口，缺一不可：
@@ -928,13 +945,7 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）当前应用立即生效。
         self.active_compat
             .lock()
@@ -950,10 +961,10 @@ impl Coordinator {
     /// 为当前焦点应用设置符号自动配对开关，并写入用户层 compat.toml。
     /// `mode_id`：0=跟随全局（清除规则）1=启用 2=禁用。
     ///
-    /// 前三步与 [`Self::set_first_show_mode`] 完全同构，缺一不可，理由见那里的注释。
-    /// **第四步是本项特有**：还要把英文配对配置重推给 DLL——纯英文模式的配对由 C++ 侧
-    /// `_englishPairEngine` 独立处理，它只认握手/配置变更时推过去的那份值。不重推的症状是
-    /// 「中文模式关掉了，切到英文又配上了」，且要等下次重连才好，极难归因。
+    /// 三步与 [`Self::set_first_show_mode`] 完全同构，缺一不可，理由见那里的注释。
+    /// 英文配对配置的重推（纯英文模式的配对由 C++ 侧 `_englishPairEngine` 独立处理，它只认
+    /// 推过去的那份值）不在这里单做，收在 [`Self::reload_app_compat`]：任何一次整表重载都
+    /// 可能改变它（用户手写的 `auto_pair` 随别的菜单项一起生效）。
     pub(crate) fn set_auto_pair_rule(&self, mode_id: u8) {
         let enabled = match mode_id {
             1 => Some(true),
@@ -974,20 +985,12 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）。
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .auto_pair = enabled;
-        // 4）重推英文配对配置：逐客户端按各自 PID 现算，本进程拿到新值、别的进程不受影响。
-        self.push_english_pair_config(0);
         tracing::info!(
             "符号自动配对 for process={name}: {}",
             match enabled {
@@ -1002,11 +1005,10 @@ impl Coordinator {
     /// 为当前焦点应用设置「密码框强制英文」，并写入用户层 compat.toml（A2-37 / t197）。
     /// `mode_id`：0=跟随全局（清除规则）1=开 2=关；认不出的编号按「跟随全局」处理。
     ///
-    /// 前两步与 [`Self::set_first_show_mode`] 同构（写盘 → 重载整表）。本项不进
+    /// 两步与 [`Self::set_first_show_mode`] 同构（写盘 → 重载整表）。本项不进
     /// `active_compat`：判定按 pid 直查规则表（`password_force_english_for_pid`），没有焦点槽
-    /// 缓存要刷。第三步是本项特有：重算当前焦点的抑制态（只降不升，理由见
-    /// [`Self::relax_password_suppress_for_focus`]），并逐客户端重推 DLL 的吃键门控——
-    /// 两边出自同一个判定函数，否则就是「密码框丢键」。
+    /// 缓存要刷。重算当前焦点的抑制态与逐客户端重推 DLL 的吃键门控收在
+    /// [`Self::reload_app_compat`]——任何一次整表重载都要做，不只是本项。
     pub(crate) fn set_password_force_english_rule(&self, mode_id: u8) {
         let enabled = match mode_id {
             1 => Some(true),
@@ -1028,17 +1030,8 @@ impl Coordinator {
             tracing::error!("set_password_force_english_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
-        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
-        // 3）当前焦点立即解除（若新判定为不抑制），再按各客户端 pid 重推。
-        self.relax_password_suppress_for_focus();
-        self.push_password_suppress_config(0);
+        // 2）重载整表；当前焦点的抑制态重算与逐客户端重推门控都在 `reload_app_compat` 里。
+        self.reload_app_compat();
         tracing::info!(
             "密码框强制英文 for process={name}: {}",
             match enabled {
@@ -1070,11 +1063,7 @@ impl Coordinator {
             tracing::error!("status_position: 写用户 compat.toml 失败: {e}");
             return false;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::debug!(
             "状态气泡定位 for process={name}: {} ({x},{y})",
             mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
@@ -1158,11 +1147,7 @@ impl Coordinator {
             tracing::error!("set_status_fallback_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::info!(
             "状态气泡兜底位置 for process={name}: {}",
             fallback.map(|f| f.as_config()).unwrap_or("(follow-global)")
@@ -1208,13 +1193,7 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）当场对当前焦点生效一次（按新规则算目标方案，不同就轻量切换）。
         if code == 1 && !self.has_remembered_schema(&name) {
             self.remember_app_schema(&name, &self.engine_mgr.active_schema_id());
@@ -1264,13 +1243,7 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）刷新 active 缓存的判据位：同 pid 时 update_active_compat 提前 return，不会自己刷。
         //    漏掉这步会让「切出本应用时是否重算」用上过期的判据。
         //    注意先取值再持 active_compat 锁，避免与 app_compat 锁形成嵌套顺序。
