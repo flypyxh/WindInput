@@ -2989,13 +2989,6 @@ fn screenshots_dir() -> Option<String> {
     Config::user_config_dir().map(|d| d.join("screenshots").display().to_string())
 }
 
-/// 固定位置落盘前的哨兵规避（候选窗与状态气泡共用）。
-///
-/// UI 侧用 `(0, 0)` 表示"已开启固定但尚未设定位置"（落到屏幕默认锚点），可主屏工作区
-/// 的左上角**往往正是** `(0, 0)`（任务栏在底部时）——用户真把候选窗拖到屏幕最左上角，
-/// 落盘值就撞上哨兵，下次显示被判为"没设过"而跳回默认锚点，表现为"位置没被记住"。
-///
-/// 哨兵值与合法值域重叠是根因；这里在落盘侧下移 1px 避开：视觉不可察觉，语义无歧义。
 /// 状态气泡锚点的菜单文案。
 fn status_anchor_label(a: wind_config::app_compat::StatusAnchor) -> &'static str {
     use wind_config::app_compat::StatusAnchor as A;
@@ -3010,6 +3003,13 @@ fn status_anchor_label(a: wind_config::app_compat::StatusAnchor) -> &'static str
     }
 }
 
+/// 固定位置落盘前的哨兵规避（候选窗与状态气泡共用）。
+///
+/// UI 侧用 `(0, 0)` 表示"已开启固定但尚未设定位置"（落到屏幕默认锚点），可主屏工作区
+/// 的左上角**往往正是** `(0, 0)`（任务栏在底部时）——用户真把候选窗拖到屏幕最左上角，
+/// 落盘值就撞上哨兵，下次显示被判为"没设过"而跳回默认锚点，表现为"位置没被记住"。
+///
+/// 哨兵值与合法值域重叠是根因；这里在落盘侧下移 1px 避开：视觉不可察觉，语义无歧义。
 fn avoid_unset_sentinel(x: i32, y: i32) -> (i32, i32) {
     if (x, y) == (0, 0) { (0, 1) } else { (x, y) }
 }

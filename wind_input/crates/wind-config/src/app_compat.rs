@@ -4,8 +4,9 @@
 //! 定位 / 光标获取等兼容修正。文件格式为 TOML 的 `[[apps]]` 数组表，加载顺序：
 //! 系统预置（`{data_dir}/compat.toml`）→ 定制版（`data_custom/compat.toml`）→
 //! 用户覆盖（`{user_config_dir}/compat.toml`），靠后层的同进程名规则整条覆盖靠前层。
-//! 唯一例外是宿主协议级的 `composition_start_pair_guard`：后层未写时继承，
-//! 显式 `false` 才关闭，避免菜单生成的稀疏规则无意抹掉已知宿主修复。
+//! 例外是登记在 `ProtocolFields` 里的一组宿主协议级字段：后层未写时继承，
+//! 显式 `false` 才关闭，避免菜单生成的稀疏规则无意抹掉已知宿主修复。字段清单只在
+//! `ProtocolFields` 一处，这里不列（列了就会随新增字段过期）。
 
 use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ const USER_COMPAT_HEADER: &str = "\
 #   手写的注释与排版不会保留。需要长期留存的说明请写在系统层 compat.toml。
 #
 # 合并语义：同名进程（不区分大小写）整条覆盖系统层，系统层其余规则保留。
-# 例外：composition_start_pair_guard 未写时继承系统层，显式 false 才关闭。
+# 例外：系统层注明「继承出厂值」的宿主修正字段，未写时继承系统层，显式 false 才关闭。
 # 字段说明见系统层 data/compat.toml 顶部注释。
 
 ";

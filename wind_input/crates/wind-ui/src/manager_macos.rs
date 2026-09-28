@@ -19,7 +19,6 @@ use wind_ui_types::{StatusTipAnchor, StatusTipPlacement, TooltipDoc};
 
 const SHM_MAX: usize = MAX_SHARED_RENDER_SIZE;
 
-/// 把 `Rgba` 编成 wire 用的 `#RRGGBBAA`（Swift `NSColor(windHex:)` 认 6/8 位）。
 /// 气泡锚点 → wire 编码（[`wind_ipc::protocol::status_anchor`]）。
 fn status_anchor_code(a: StatusTipAnchor) -> i32 {
     use StatusTipAnchor as A;
@@ -34,6 +33,7 @@ fn status_anchor_code(a: StatusTipAnchor) -> i32 {
     }
 }
 
+/// 把 `Rgba` 编成 wire 用的 `#RRGGBBAA`（Swift `NSColor(windHex:)` 认 6/8 位）。
 fn hex(c: wind_theme::Rgba) -> String {
     format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3])
 }

@@ -14,6 +14,11 @@
 #                         只给已实测存在该交替序列的宿主开启；普通宿主保持原有大偏移
 #                         自愈，不能仅凭非零 compStart 全局开启。用户层同名规则若
 #                         未写本字段会继承出厂值；显式 false 才关闭。
+#   pin_anchor_when_start_drifts:
+#                         宿主报的组合起点跟着插入点漂移时，把候选窗锚点钉在首帧起点。
+#                         必须逐宿主开启（WPS 文字 / Word 需要；Excel / WPS 表格开了反而
+#                         回归），不能全局开。用户层同名规则若未写本字段会继承出厂值；
+#                         显式 false 才关闭。
 #   first_show_mode:      候选框首显策略，三档互斥；不写=跟随全局
 #                         config.toml 的 [ui.candidate] first_show_mode（出厂 "fast"）。
 #                         "fast"    默认。仍等坐标，但等到「可信」即放行。DLL 在首帧

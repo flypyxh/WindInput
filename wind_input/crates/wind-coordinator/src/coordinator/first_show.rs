@@ -321,6 +321,9 @@ impl Coordinator {
 
 // ———————————————— 首显兜底 timer（进程内共享单线程）————————————————
 
+/// 一条待办：`(到期时刻, token, 协调器弱引用)`。
+type TimerEntry = (std::time::Instant, u64, std::sync::Weak<Coordinator>);
+
 /// 覆盖式定时器：**每个协调器**只保留最近一次 arm 的待触发任务。首显兜底与焦点气泡的锚点
 /// 超时（`status_placement`）各用一个实例，互不顶替——两者的待办同时存在是常态。
 ///
@@ -330,13 +333,10 @@ impl Coordinator {
 ///
 /// 此前每次 arm 都 `thread::spawn` 一个线程去 `sleep`，靠 token 让被取代的那些醒来后自行
 /// 放弃——日志实测一小时创建两千余个线程。既然 token 已经保证「只有最新一次有效」，被作废
-/// 的任务就没有理由继续占着线程；改成覆盖式待办后语义反而更直白：待办本身只有一个。
+/// 的任务就没有理由继续占着线程；改成覆盖式待办后语义反而更直白：每个协调器至多一条待办。
 ///
 /// 本线程只做「等到点 + 回调」，**绝不在此执行可能阻塞的调用**（如前台窗口探测）——
 /// 一次慢调用就会拖垮兜底的 150ms 时限。需要后台跑阻塞探测的场景另行处理。
-/// 一条待办：`(到期时刻, token, 协调器弱引用)`。
-type TimerEntry = (std::time::Instant, u64, std::sync::Weak<Coordinator>);
-
 struct OneShotTimer {
     /// 各协调器的待办（每个协调器至多一条）；空 = 空闲。
     pending: Mutex<Vec<TimerEntry>>,
