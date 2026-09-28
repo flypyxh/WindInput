@@ -1946,7 +1946,8 @@ pub struct Coordinator {
     /// 悬停提示右键菜单弹出时的目标快照；菜单动作执行前拿它核对候选有没有变。
     pub(crate) tooltip_menu_target: Mutex<Option<crate::handle_tooltip::TooltipMenuTarget>>,
     /// 密码框抑制策略开关，`input.password_force_english` 的运行时镜像（构造与热重载时回灌，
-    /// 见 `set_password_suppress_enabled`）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
+    /// 见 `set_password_suppress_enabled`）。这是**全局**值：未配 per-app 规则的进程跟随它；
+    /// 判定一律经 `password_force_english_for_pid`，不要直接读本字段做抑制决策。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
     pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
@@ -3091,7 +3092,8 @@ impl Coordinator {
     }
 
     /// 消费一次输入诊断上报（compartment 禁用态 + InputScope 掩码）：更新 `last_input_diag`
-    /// 快照，并按 `password_suppress_enabled` 开关决定是否强制英文抑制（密码框场景）。
+    /// 快照，并按 `password_force_english_for_pid`（per-app 规则优先，否则全局开关）决定是否
+    /// 强制英文抑制（密码框场景）。
     pub(crate) fn apply_input_diag(&self, pid: u32, disabled: bool, reason_byte: u8, mask: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let reason = crate::input_diag::reason_from(disabled, mask);
@@ -3117,8 +3119,11 @@ impl Coordinator {
         // OnTestKeyDown 开头就全放行了，一个键都不会送到引擎，suppress 取值无从被观测。
         // 危险的只有反方向（core 抑制而 DLL 吃键 → 「吃了再吐」丢键），故不变量是
         // **core.suppress ⊆ C++.suppress**，见 C++ `IsPasswordSuppressActive`。
-        let suppress = crate::input_diag::is_password_scope(mask)
-            && self.password_suppress_enabled.load(Relaxed);
+        //
+        // 开关取值按 pid 走 `password_force_english_for_pid`（per-app 规则优先，否则全局）——
+        // 与推给该 DLL 的值**同一个函数**，这是上面那条不变量在按应用覆盖下成立的前提。
+        let suppress =
+            crate::input_diag::is_password_scope(mask) && self.password_force_english_for_pid(pid);
         self.password_suppress.store(suppress, Relaxed);
         {
             let mut d = self
@@ -15803,6 +15808,126 @@ mod input_diag_tests {
         assert!(
             !c.password_suppress.load(Relaxed),
             "数字密码位同样受开关约束"
+        );
+    }
+
+    // ── 按应用覆盖（compat.toml 的 password_force_english，A2-37 / t197）──
+
+    /// 给 pid 登记进程名并装上该进程的 `password_force_english` 规则。
+    fn pfe_rule(c: &Coordinator, pid: u32, name: &str, v: Option<bool>) {
+        c.pid_names.lock().unwrap().insert(pid, name.to_string());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_password_force_english(&mut rules, name, v);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+    }
+
+    /// 规则 false：该进程的密码框不再强制英文；别的进程照旧跟随全局（开）。
+    #[test]
+    fn per_app_rule_false_exempts_only_that_process() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+
+        c.apply_input_diag(700, false, 2, 0x8000_0001);
+        assert!(!c.password_suppress.load(Relaxed), "规则关掉的进程不应抑制");
+
+        c.pid_names.lock().unwrap().insert(701, "other.exe".into());
+        c.apply_input_diag(701, false, 2, 0x8000_0001);
+        assert!(
+            c.password_suppress.load(Relaxed),
+            "无规则的进程跟随全局（开）"
+        );
+    }
+
+    /// 规则 true 压过全局关。
+    #[test]
+    fn per_app_rule_true_overrides_global_off() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        c.set_password_suppress_enabled(false);
+        pfe_rule(&c, 800, "bank.exe", Some(true));
+
+        c.apply_input_diag(800, false, 2, 1 << 31);
+        assert!(c.password_suppress.load(Relaxed), "规则开应压过全局关");
+
+        c.pid_names.lock().unwrap().insert(801, "other.exe".into());
+        c.apply_input_diag(801, false, 2, 1 << 31);
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "无规则的进程跟随全局（关）"
+        );
+    }
+
+    /// 无规则（含规则存在但本字段未配）一律跟随全局，两个方向都验。
+    #[test]
+    fn per_app_no_rule_follows_global() {
+        let c = test_coordinator();
+        pfe_rule(&c, 900, "plain.exe", None);
+        assert!(c.password_force_english_for_pid(900), "全局开 → 开");
+        assert!(c.password_force_english_for_pid(0), "pid 未知 → 全局");
+        assert!(c.password_force_english_for_pid(12345), "名字未知 → 全局");
+        c.set_password_suppress_enabled(false);
+        assert!(!c.password_force_english_for_pid(900), "全局关 → 关");
+        assert!(!c.password_force_english_for_pid(0));
+    }
+
+    /// ★ 不变量 core.suppress ⊆ C++.suppress：逐客户端推给 DLL 的值与服务端判定出自
+    /// 同一个函数。这里对每个客户端比对「推送值」与「同 pid 下服务端算出的 suppress」。
+    #[test]
+    fn per_client_push_matches_server_judgement() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+        c.pid_names.lock().unwrap().insert(701, "other.exe".into());
+        let tok_a = (700u64 << 32) | 1;
+        let tok_b = (701u64 << 32) | 1;
+        let cap_a = c.push_server.attach_capture_client(tok_a);
+        let cap_b = c.push_server.attach_capture_client(tok_b);
+
+        let msg = |v: bool| {
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+                &wind_ipc::codec::encode_password_suppress_value(v),
+            )
+        };
+        for global in [true, false] {
+            c.set_password_suppress_enabled(global); // 内部广播一轮
+            for (pid, cap) in [(700u32, &cap_a), (701u32, &cap_b)] {
+                let got: Vec<Vec<u8>> = cap.try_iter().collect();
+                let pushed = if got.contains(&msg(true)) {
+                    assert!(!got.contains(&msg(false)), "pid={pid} 同一轮收到两种值");
+                    true
+                } else {
+                    assert!(got.contains(&msg(false)), "pid={pid} 没收到密码框配置");
+                    false
+                };
+                c.apply_input_diag(pid, false, 2, 1 << 31);
+                assert_eq!(
+                    c.password_suppress.load(Relaxed),
+                    pushed,
+                    "global={global} pid={pid}：服务端 suppress 必须等于推给该 DLL 的值"
+                );
+            }
+        }
+        // 规则进程恒不开，与全局无关。
+        assert!(!c.password_force_english_for_pid(700));
+    }
+
+    /// 定向推送（握手）同样按目标 pid 取值，不拿全局值。
+    #[test]
+    fn handshake_push_uses_target_pid_rule() {
+        let c = test_coordinator();
+        pfe_rule(&c, 700, "misreport.exe", Some(false));
+        let tok = (700u64 << 32) | 3;
+        let cap = c.push_server.attach_capture_client(tok);
+        c.push_password_suppress_config(tok);
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert_eq!(
+            got,
+            vec![wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+                &wind_ipc::codec::encode_password_suppress_value(false),
+            )]
         );
     }
 }

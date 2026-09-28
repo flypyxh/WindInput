@@ -254,6 +254,7 @@ impl Coordinator {
             MenuCmd::AutoPairRule(m) => self.set_auto_pair_rule(m),
             MenuCmd::CandidatePositionRule(m) => self.set_candidate_position_rule(m),
             MenuCmd::IgnoreHostImeCloseRule(m) => self.set_ignore_host_ime_close_rule(m),
+            MenuCmd::PasswordForceEnglishRule(m) => self.set_password_force_english_rule(m),
             MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
             MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
@@ -793,12 +794,34 @@ impl Coordinator {
     pub(crate) fn set_password_suppress_enabled(&self, enabled: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         self.password_suppress_enabled.store(enabled, Relaxed);
-        if !enabled {
-            self.password_suppress.store(false, Relaxed);
-        }
+        self.relax_password_suppress_for_focus();
         // 同步给 DLL：吃键门控在 TSF 侧本地判定（早于 IPC），不推则开关对 DLL 无效——
         // 关掉抑制后 DLL 仍会放行所有键，这个「误置位时用来救场」的逃生阀就成了摆设。
+        // 逐客户端按各自 pid 现算（per-app 规则优先），见 `push_password_suppress_config`。
         self.push_password_suppress_config(0);
+    }
+
+    /// 按最近一次输入诊断（焦点 pid + InputScope 掩码）重算抑制态，**只降不升**：
+    /// 判定变成「不抑制」就立即解除；变成「抑制」则留给下一次诊断上报去置位。
+    ///
+    /// 为什么只降：不变量是 core.suppress ⊆ C++.suppress，而新开关值要经 push 管道异步到达
+    /// DLL。解除方向先于 DLL 生效是安全的（core 照常出字、DLL 还在放行）；置位方向若抢在
+    /// DLL 前面，就是「DLL 吃键、core 回 PassThrough」——密码框丢键。置位等 DLL 下一次上报
+    /// 诊断（那时它手里必然已有新值）再做，与此前全局开关只在关闭时立即清除同一口径。
+    pub(crate) fn relax_password_suppress_for_focus(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (pid, mask) = {
+            let d = self
+                .last_input_diag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (d.pid, d.mask)
+        };
+        let want =
+            crate::input_diag::is_password_scope(mask) && self.password_force_english_for_pid(pid);
+        if !want {
+            self.password_suppress.store(false, Relaxed);
+        }
     }
 
     /// 当前焦点进程名（小写，取自 `pid_names` 缓存）。未解析出进程时返回空串。
@@ -944,6 +967,58 @@ impl Coordinator {
                 None => "跟随全局",
             }
         );
+        self.show_status();
+    }
+
+    /// 为当前焦点应用设置「密码框强制英文」，并写入用户层 compat.toml（A2-37 / t197）。
+    /// `mode_id`：0=跟随全局（清除规则）1=开 2=关；认不出的编号按「跟随全局」处理。
+    ///
+    /// 前两步与 [`Self::set_first_show_mode`] 同构（写盘 → 重载整表）。本项不进
+    /// `active_compat`：判定按 pid 直查规则表（`password_force_english_for_pid`），没有焦点槽
+    /// 缓存要刷。第三步是本项特有：重算当前焦点的抑制态（只降不升，理由见
+    /// [`Self::relax_password_suppress_for_focus`]），并逐客户端重推 DLL 的吃键门控——
+    /// 两边出自同一个判定函数，否则就是「密码框丢键」。
+    pub(crate) fn set_password_force_english_rule(&self, mode_id: u8) {
+        let enabled = match mode_id {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_password_force_english_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_password_force_english_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        if let Err(e) =
+            wind_config::app_compat::set_user_password_force_english(&user_dir, &name, enabled)
+        {
+            tracing::error!("set_password_force_english_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
+        // 3）当前焦点立即解除（若新判定为不抑制），再按各客户端 pid 重推。
+        self.relax_password_suppress_for_focus();
+        self.push_password_suppress_config(0);
+        tracing::info!(
+            "密码框强制英文 for process={name}: {}",
+            match enabled {
+                Some(true) => "开",
+                Some(false) => "关",
+                None => "跟随全局",
+            }
+        );
+        self.notify_toolbar();
         self.show_status();
     }
 
@@ -1353,12 +1428,13 @@ impl Coordinator {
             use wind_config::app_compat::InitialMode as IM;
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
-            let (cur_cand_pos, cur_ignore_close) = {
+            let (cur_cand_pos, cur_ignore_close, cur_pfe) = {
                 let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
                 let rule = table.get_rule(&proc);
                 (
                     rule.and_then(|r| r.candidate_position_mode),
                     rule.and_then(|r| r.ignore_host_ime_close),
+                    rule.and_then(|r| r.password_force_english),
                 )
             };
             let cur_first_show = self.rule_first_show_mode(&proc);
@@ -1493,6 +1569,31 @@ impl Coordinator {
                             cmd(MenuCmd::IgnoreHostImeCloseRule(2)),
                             enabled,
                             cur_ignore_close == Some(false),
+                        ),
+                    ],
+                ),
+                // 给「宿主把普通输入框误报成密码框」的应用单独关掉（全局照旧保护真密码框），
+                // 或在全局关掉时只给某个应用开。「跟随全局」独立一档，理由见上面 `tri`。
+                M::submenu(
+                    "密码框强制英文",
+                    vec![
+                        M::leaf(
+                            "跟随全局",
+                            cmd(MenuCmd::PasswordForceEnglishRule(0)),
+                            enabled,
+                            cur_pfe.is_none(),
+                        ),
+                        M::leaf(
+                            "开",
+                            cmd(MenuCmd::PasswordForceEnglishRule(1)),
+                            enabled,
+                            cur_pfe == Some(true),
+                        ),
+                        M::leaf(
+                            "关",
+                            cmd(MenuCmd::PasswordForceEnglishRule(2)),
+                            enabled,
+                            cur_pfe == Some(false),
                         ),
                     ],
                 ),

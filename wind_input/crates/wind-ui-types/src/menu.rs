@@ -171,6 +171,11 @@ pub enum MenuCmd {
     /// 给 WinForms `ImeMode.Disable` / WPF `IsInputMethodEnabled=False` 这类宿主：它们在
     /// 焦点落到按钮等控件时关掉的是**全局**中英状态，于是「点一下按钮就变成英文」。
     IgnoreHostImeCloseRule(u8),
+    /// 为当前焦点应用设置「密码框强制英文」（compat.toml 的 password_force_english）。
+    /// 参数：0=跟随全局（清除规则）1=开 2=关。
+    ///
+    /// 给「宿主把普通输入框误报成密码框」的应用单独关掉，全局仍保护真密码框（A2-37）。
+    PasswordForceEnglishRule(u8),
     /// 语言栏图标：角标总开关。参数为 `wind_ui::langbar_icon::BadgeStyle::ALL` 的下标。
     ///
     /// 只有「不显示 / 角标」两档——具体画哪些状态、什么颜色、在哪个角，是
@@ -216,7 +221,7 @@ impl MenuKind {
     /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜
     /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点｜8000+ 诊断 HUD 分区｜
     /// 9000+ 自动配对｜10000+ 语言栏图标角标形状｜11000+ 软键盘面｜12000+ 候选窗定位｜
-    /// 13000+ 忽略宿主关闭输入法。
+    /// 13000+ 忽略宿主关闭输入法｜14000+ 密码框强制英文。
     pub fn to_menu_id(self) -> i32 {
         match self {
             MenuKind::Separator | MenuKind::Submenu | MenuKind::Label => 0,
@@ -275,6 +280,7 @@ impl MenuKind {
                 MenuCmd::AutoPairRule(m) => 9000 + m as i32,
                 MenuCmd::CandidatePositionRule(m) => 12000 + m as i32,
                 MenuCmd::IgnoreHostImeCloseRule(m) => 13000 + m as i32,
+                MenuCmd::PasswordForceEnglishRule(m) => 14000 + m as i32,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -343,6 +349,7 @@ impl MenuKind {
             9000..=9999 => MenuCmd::AutoPairRule((id - 9000) as u8),
             12000..=12999 => MenuCmd::CandidatePositionRule((id - 12000) as u8),
             13000..=13999 => MenuCmd::IgnoreHostImeCloseRule((id - 13000) as u8),
+            14000..=14999 => MenuCmd::PasswordForceEnglishRule((id - 14000) as u8),
             _ => return None,
         };
         Some(MenuKind::Command(cmd))
