@@ -237,4 +237,35 @@ final class PayloadCodecTests: XCTestCase {
             if case .payloadTooShort = error as? IPCError {} else { XCTFail("wrong: \(error)") }
         }
     }
+
+    // MARK: - CmdStatusShow (0x050A): anchor 尾段的新旧兼容 (C2-33 / GH#148)
+
+    /// 按 Rust `encode_status_show` 的布局拼 payload: 三段字符串 + x/y/dur (+ 可选 anchor)。
+    private func statusPayload(anchor: Int32?) -> Data {
+        var buf = Data()
+        func u32(_ v: UInt32) {
+            var d = Data(count: 4); d.writeUInt32LE(v, at: 0); buf.append(d)
+        }
+        for s in ["中", "#111", "#eee"] { u32(UInt32(s.utf8.count)); buf.append(contentsOf: s.utf8) }
+        u32(UInt32(bitPattern: 50)); u32(UInt32(bitPattern: -80)); u32(1000)
+        if let a = anchor { u32(UInt32(bitPattern: a)) }
+        return buf
+    }
+
+    /// 旧服务 (无 anchor 尾段): 缺省 0 = 按 x/y 摆。
+    func testDecodeStatusBubble_WithoutAnchorTail() throws {
+        let p = try BinaryCodec.decodeStatusBubblePayload(statusPayload(anchor: nil))
+        XCTAssertEqual(p.text, "中")
+        XCTAssertEqual(p.x, 50)
+        XCTAssertEqual(p.y, -80)
+        XCTAssertEqual(p.durationMs, 1000)
+        XCTAssertEqual(p.anchor, 0)
+    }
+
+    /// 新服务: anchor 尾段原样读出, 与 Rust `status_anchor` 同值。
+    func testDecodeStatusBubble_AnchorTail() throws {
+        let p = try BinaryCodec.decodeStatusBubblePayload(statusPayload(anchor: 7))
+        XCTAssertEqual(p.durationMs, 1000)
+        XCTAssertEqual(StatusAnchor(rawValue: p.anchor), .windowBottomLeft)
+    }
 }

@@ -4,8 +4,9 @@
 //! 定位 / 光标获取等兼容修正。文件格式为 TOML 的 `[[apps]]` 数组表，加载顺序：
 //! 系统预置（`{data_dir}/compat.toml`）→ 定制版（`data_custom/compat.toml`）→
 //! 用户覆盖（`{user_config_dir}/compat.toml`），靠后层的同进程名规则整条覆盖靠前层。
-//! 唯一例外是宿主协议级的 `composition_start_pair_guard`：后层未写时继承，
-//! 显式 `false` 才关闭，避免菜单生成的稀疏规则无意抹掉已知宿主修复。
+//! 例外是登记在 `ProtocolFields` 里的一组宿主协议级字段：后层未写时继承，
+//! 显式 `false` 才关闭，避免菜单生成的稀疏规则无意抹掉已知宿主修复。字段清单只在
+//! `ProtocolFields` 一处，这里不列（列了就会随新增字段过期）。
 
 use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ const USER_COMPAT_HEADER: &str = "\
 #   手写的注释与排版不会保留。需要长期留存的说明请写在系统层 compat.toml。
 #
 # 合并语义：同名进程（不区分大小写）整条覆盖系统层，系统层其余规则保留。
-# 例外：composition_start_pair_guard 未写时继承系统层，显式 false 才关闭。
+# 例外：系统层注明「继承出厂值」的宿主修正字段，未写时继承系统层，显式 false 才关闭。
 # 字段说明见系统层 data/compat.toml 顶部注释。
 
 ";
@@ -274,8 +275,209 @@ fn de_candidate_position_mode<'de, D>(d: D) -> Result<Option<CandidatePositionMo
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(CandidatePositionMode::from_config))
+    de_opt_str_enum(
+        d,
+        "candidate_position_mode",
+        CandidatePositionMode::from_config,
+    )
+}
+
+/// 状态气泡的锚点（C2-33 / GH#148）：`screen_*` = 前台窗口所在显示器的**工作区**，
+/// `window_*` = 前台窗口的可见边框。几何换算在 UI 层（wind-ui 的 `anchor_origin`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAnchor {
+    ScreenCenter,
+    ScreenTopLeft,
+    ScreenTopRight,
+    ScreenBottomLeft,
+    ScreenBottomRight,
+    WindowCenter,
+    WindowBottomLeft,
+}
+
+impl StatusAnchor {
+    /// 全部锚点，顺序即菜单顺序。
+    pub const ALL: [StatusAnchor; 7] = [
+        Self::ScreenCenter,
+        Self::ScreenTopLeft,
+        Self::ScreenTopRight,
+        Self::ScreenBottomLeft,
+        Self::ScreenBottomRight,
+        Self::WindowCenter,
+        Self::WindowBottomLeft,
+    ];
+
+    /// 枚举 → 配置串。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::ScreenCenter => "screen_center",
+            Self::ScreenTopLeft => "screen_top_left",
+            Self::ScreenTopRight => "screen_top_right",
+            Self::ScreenBottomLeft => "screen_bottom_left",
+            Self::ScreenBottomRight => "screen_bottom_right",
+            Self::WindowCenter => "window_center",
+            Self::WindowBottomLeft => "window_bottom_left",
+        }
+    }
+
+    /// 配置串 → 枚举；认不出返回 `None`。查的是 [`Self::ALL`] + [`Self::as_config`]，值域只有一份。
+    pub fn from_config(s: &str) -> Option<Self> {
+        let s = s.trim();
+        Self::ALL
+            .into_iter()
+            .find(|a| a.as_config().eq_ignore_ascii_case(s))
+    }
+}
+
+/// 状态气泡定位方式：全局 `ui.status.position_mode` 与按应用 `status_position_mode` 共用取值
+/// （见 [`STATUS_POSITION_MODES`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPositionMode {
+    /// 跟随光标（出厂默认）。光标坐标不可信时按 [`StatusFallback`] 兜底。
+    FollowCaret,
+    /// 固定屏幕坐标（全局 `custom_x/y`；按应用 `status_x/y`）。
+    Fixed,
+    /// 固定在某个锚点，不读光标。
+    Anchor(StatusAnchor),
+}
+
+/// [`StatusPositionMode`] 的全部配置串，同时是配置注册表 `ui.status.position_mode` 的值域。
+pub const STATUS_POSITION_MODES: [&str; 9] = [
+    "follow_caret",
+    "fixed",
+    "screen_center",
+    "screen_top_left",
+    "screen_top_right",
+    "screen_bottom_left",
+    "screen_bottom_right",
+    "window_center",
+    "window_bottom_left",
+];
+
+impl StatusPositionMode {
+    /// 配置串 → 枚举；认不出返回 `None`（调用方回落：全局取出厂默认，按应用取跟随全局）。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "follow_caret" => Some(Self::FollowCaret),
+            "fixed" => Some(Self::Fixed),
+            other => StatusAnchor::from_config(other).map(Self::Anchor),
+        }
+    }
+    /// 枚举 → 配置串。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::FollowCaret => "follow_caret",
+            Self::Fixed => "fixed",
+            Self::Anchor(a) => a.as_config(),
+        }
+    }
+}
+
+/// 状态气泡的兜底位置：只在 `follow_caret` 且光标坐标不可信时生效。全局
+/// `ui.status.fallback_position` 与按应用 `status_fallback_position` 共用取值
+/// （见 [`STATUS_FALLBACK_POSITIONS`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFallback {
+    /// 最近一次有效坐标（出厂默认 = 本功能引入前的行为）。
+    Last,
+    /// 不显示。
+    Hide,
+    /// 显示在锚点。
+    Anchor(StatusAnchor),
+}
+
+/// [`StatusFallback`] 的全部配置串，同时是配置注册表 `ui.status.fallback_position` 的值域。
+pub const STATUS_FALLBACK_POSITIONS: [&str; 9] = [
+    "last",
+    "hide",
+    "screen_center",
+    "screen_top_left",
+    "screen_top_right",
+    "screen_bottom_left",
+    "screen_bottom_right",
+    "window_center",
+    "window_bottom_left",
+];
+
+impl StatusFallback {
+    /// 配置串 → 枚举；认不出返回 `None`。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "last" => Some(Self::Last),
+            "hide" => Some(Self::Hide),
+            other => StatusAnchor::from_config(other).map(Self::Anchor),
+        }
+    }
+    /// 枚举 → 配置串。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Last => "last",
+            Self::Hide => "hide",
+            Self::Anchor(a) => a.as_config(),
+        }
+    }
+}
+
+// 两个带载荷的枚举在 compat.toml 里都是**扁平字符串**（`"screen_center"`），derive 表达不了，
+// 故手写：序列化走 `as_config`，反序列化走下面的容错函数（不实现 `Deserialize`，免得有人
+// 绕过容错直接 derive 进别的结构）。
+impl Serialize for StatusPositionMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_config())
+    }
+}
+
+impl Serialize for StatusFallback {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_config())
+    }
+}
+
+/// compat.toml 字符串枚举字段的通用容错：类型写错（非字符串）或值域外的字符串一律回落
+/// `None`（= 跟随全局）并 WARN、记入回落清单。理由同 [`de_initial_mode`]；与它不同的是
+/// **类型错也吞**（同 [`de_app_schema`]）：`load_file` 没有段级降级。
+fn de_opt_str_enum<'de, D, T>(
+    d: D,
+    field: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = match Option::<toml::Value>::deserialize(d)? {
+        None => return Ok(None),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: {field} = {raw} 不是字符串，本项按「跟随全局」处理");
+            crate::tolerant_de::record_fallback(&raw);
+            return Ok(None);
+        }
+    };
+    match parse(&raw) {
+        Some(v) => Ok(Some(v)),
+        None => {
+            tracing::warn!(
+                "compat.toml: {field} = \"{raw}\" 不在取值范围内，本项按「跟随全局」处理"
+            );
+            crate::tolerant_de::record_fallback(&raw);
+            Ok(None)
+        }
+    }
+}
+
+fn de_status_position_mode<'de, D>(d: D) -> Result<Option<StatusPositionMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_opt_str_enum(d, "status_position_mode", StatusPositionMode::from_config)
+}
+
+fn de_status_fallback<'de, D>(d: D) -> Result<Option<StatusFallback>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_opt_str_enum(d, "status_fallback_position", StatusFallback::from_config)
 }
 
 /// 容错反序列化 `Option<InitialMode>`：无法识别的值退化为 `None`（＝不干预）。
@@ -287,8 +489,7 @@ fn de_initial_mode<'de, D>(d: D) -> Result<Option<InitialMode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(InitialMode::from_config))
+    de_opt_str_enum(d, "initial_mode / initial_punct", InitialMode::from_config)
 }
 
 /// 容错反序列化 `Option<FirstShowMode>`：无法识别的值退化为 `None`（＝跟随全局）。
@@ -299,8 +500,7 @@ fn de_first_show_mode<'de, D>(d: D) -> Result<Option<FirstShowMode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(FirstShowMode::from_config))
+    de_opt_str_enum(d, "first_show_mode", FirstShowMode::from_config)
 }
 
 /// 容错反序列化 `Option<NewlineStyle>`：无法识别的值退化为 `None`（＝跟随全局）。
@@ -313,23 +513,119 @@ fn de_newline_style<'de, D>(d: D) -> Result<Option<NewlineStyle>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<String>::deserialize(d)?;
-    Ok(raw.as_deref().and_then(NewlineStyle::from_config))
+    de_opt_str_enum(d, "commit_newline.style", NewlineStyle::from_config)
+}
+
+/// [`AppCompatRule::schema`] 里「记住本应用上次用的方案」的保留值。
+///
+/// `@` 前缀是保留标记空间：方案 id 来自文件名，不以 `@` 开头。以 `@` 开头的值只认这一个，
+/// 其余在解析时按未配置处理（见 [`de_app_schema`]）。
+pub const APP_SCHEMA_REMEMBER: &str = "@remember";
+
+/// [`AppCompatRule::schema`] 解析后的语义视图，见 [`AppCompatRule::app_schema`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppSchema<'a> {
+    /// 固定为该方案 id（是否在 `schema.available` 内由协调器按当时的 available 判）。
+    Fixed(&'a str),
+    /// 记住本应用上次用的方案（记忆表在 `state.toml` 的 `app_schemas`）。
+    Remember,
+}
+
+/// 容错反序列化 [`AppCompatRule::schema`]：类型写错（`1` / 数组）、空串、`@` 开头但不是
+/// [`APP_SCHEMA_REMEMBER`] 的值一律回落 `None`（＝跟随全局）并 WARN。
+///
+/// ⚠ 理由同 [`de_initial_mode`]：`load_file` 没有段级降级，不在字段上吞掉就是整份
+/// compat.toml 静默失效。「id 是否在 `schema.available` 内」**不在这里判**：available 可热重载，
+/// 解析层只收字符串，由协调器按当时的 available 校验。
+fn de_app_schema<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = match Option::<toml::Value>::deserialize(d)? {
+        None => return Ok(None),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: schema = {raw} 不是字符串，本项按「跟随全局」处理");
+            crate::tolerant_de::record_fallback(&raw);
+            return Ok(None);
+        }
+    };
+    let v = raw.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if v.starts_with('@') && v != APP_SCHEMA_REMEMBER {
+        tracing::warn!(
+            "compat.toml: schema = \"{v}\" 不是已知标记（只认 {APP_SCHEMA_REMEMBER}），\
+             本项按「跟随全局」处理"
+        );
+        crate::tolerant_de::record_fallback(v);
+        return Ok(None);
+    }
+    Ok(Some(v.to_string()))
+}
+
+/// 容错反序列化规则的 `process`：类型写错（`process = 1`）时**本条规则作废**（回落空串，
+/// 查找表与各段构建都跳过空进程名），同文件其它规则照常生效。
+///
+/// 为什么是「本条作废」而不是「整份失败」或「猜一个名字」：`load_file` 没有段级降级，
+/// 整份失败 = 所有应用的所有规则一起静默失效；而进程名是规则的主键，认不出就不知道它
+/// 该套给谁，唯一安全的答案是不套给任何人。
+fn de_process<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(String::new()),
+        Some(toml::Value::String(s)) => Ok(s),
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: process = {raw} 不是字符串，本条规则作废");
+            crate::tolerant_de::record_fallback(&raw);
+            Ok(String::new())
+        }
+    }
+}
+
+/// 容错反序列化规则的 `comment`（仅文档用途）：类型写错回落空串并 WARN，规则本身照常生效。
+fn de_comment<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(String::new()),
+        Some(toml::Value::String(s)) => Ok(s),
+        Some(other) => {
+            let raw = other.to_string();
+            tracing::warn!("compat.toml: comment = {raw} 不是字符串，本项忽略");
+            crate::tolerant_de::record_fallback(&raw);
+            Ok(String::new())
+        }
+    }
 }
 
 /// 单个应用的兼容性规则。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AppCompatRule {
-    /// 进程名（不区分大小写），如 "Weixin.exe"。
-    #[serde(default)]
+    /// 进程名（不区分大小写），如 "Weixin.exe"。类型写错 ⇒ 本条作废，见 [`de_process`]。
+    #[serde(default, deserialize_with = "de_process")]
     pub process: String,
     /// 说明（仅文档用途）。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_comment",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
     /// 使用 caret rect 的 top 而非 bottom 定位候选窗。
     /// 适用于 GetTextExt 返回的 height 不稳定的 WebView 应用（如微信 Qt 输入框，
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
     pub caret_use_top: bool,
     /// 拦截「组合期间上报的 caret rect 仍停在上一次组合位置」的宿主。
     ///
@@ -346,7 +642,11 @@ pub struct AppCompatRule {
     ///
     /// 同一份位置关系推不出该信谁，任何位置判据都不可能同时答对两者。这是宿主缺陷，
     /// 按宿主处理——与隔壁 `caret_use_top`（同样为微信而加）同一个理由。
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
     pub stale_probe_guard: bool,
     /// 把连续的 `TSF_COMPOSITION`（selection 无效、以组合起点降级）→ `TSF_SELECTION`
     /// 识别为同一次布局采样的两阶段结果，禁止后半帧把当前 caret 误重锁成组合起点。
@@ -364,7 +664,11 @@ pub struct AppCompatRule {
     /// 通过菜单给 `QQ.exe` 写了只含 `first_show_mode` 的稀疏规则；若用 bool 的缺省
     /// `false` 做整条覆盖，升级后会静默屏蔽系统层新增的 QQ 修复。`None` 表示继承
     /// 低层，`Some(false)` 仍保留显式关闭的逃生口。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub composition_start_pair_guard: Option<bool>,
     /// 宿主报的组合起点跟着插入点漂移时，把候选窗锚点**钉在首帧起点**而不是让大偏移
     /// 逃生阀跟着走；`None` / `Some(false)` = 不干预，逃生阀照常。
@@ -383,7 +687,11 @@ pub struct AppCompatRule {
     ///   把锚点推过去。给它们钉住反而是回归（2026-09-05 实测确认）。
     ///
     /// ⇒ 数据分不出两者，只能按宿主声明。**不要试图改成全局判据**。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pin_anchor_when_start_drifts: Option<bool>,
     /// 候选窗首显策略；`None` = 不干预，跟随全局 `ui.candidate.first_show_mode`。
     ///
@@ -429,7 +737,11 @@ pub struct AppCompatRule {
     /// （`HostRenderManager::is_process_whitelisted`），不得经 `ActiveCompat` 全局焦点槽缓存
     /// ——开始菜单弹出会连带激活兄弟进程，焦点槽会被污染，详见
     /// `docs/redesign/host-render-windows-port.md` §11.2。
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
     pub host_render: bool,
     /// 该应用是否启用符号自动配对；`None` = 不干预，沿用全局 `input.auto_pair.*`。
     ///
@@ -444,8 +756,46 @@ pub struct AppCompatRule {
     /// ⚠ 消费点有**三条**，缺一即半截修复：`active_pairs()`（中文标点态）、
     /// `english_pairs_via_pipeline()`（英文标点流水线）、`push_english_pair_config()`
     /// （纯英文模式由 C++ `_englishPairEngine` 独立处理，协调器根本收不到那些键）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_pair: Option<bool>,
+    /// 该应用的密码框是否强制英文；`None` = 跟随全局 `input.password_force_english`（A2-37 / t197）。
+    ///
+    /// 典型用途是「宿主把普通输入框误报成密码框」：全局开着保护真密码框，只对误报的那个
+    /// 应用关掉；反过来也可以在全局关掉时只给某个应用开。
+    ///
+    /// **必须是 `Option`**（理由同 `initial_mode`）：`None` 与「显式配了恰好等于全局的值」
+    /// 是两件事，后者不随全局开关变。用户偏好 ⇒ **不进** [`ProtocolFields`]。
+    ///
+    /// ★ 消费点必须只有一个判定函数（协调器 `password_force_english_for_pid`）：服务端的
+    /// 抑制态与推给 DLL 的吃键门控出自同一处，否则 core.suppress ⊄ C++.suppress ⇒ 密码框丢键。
+    ///
+    /// 类型写错（`"yes"` / `1`）只让本字段回落 `None`：compat.toml 没有段级降级，
+    /// 不容错就是整份文件静默失效，见 [`crate::tolerant_de::tolerant_opt_bool`]。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub password_force_english: Option<bool>,
+    /// 该应用使用的输入方案；`None` = 跟随全局（最近一次全局手切的结果 / `schema.active`）
+    /// （C0-7 / C3-3，GH#80）。
+    ///
+    /// - 具体方案 id ⇒ 焦点跨进程切入时固定切到它；
+    /// - [`APP_SCHEMA_REMEMBER`] ⇒ 切入时恢复本应用上次用的方案（无记录则用全局）。
+    ///
+    /// 规则应用内的手切只改本应用的方案，不写 `schema.active`。用户偏好 ⇒ **不进**
+    /// [`ProtocolFields`]。消费点在协调器 `app_schema_rule`（按当时的 available 校验）。
+    /// 读取请走 [`Self::app_schema`]，不要直接比较字符串。
+    #[serde(
+        default,
+        deserialize_with = "de_app_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub schema: Option<String>,
     /// 该应用的智能符号替换方案；`None` = 沿用全局 `input.symbol.smart_method`。
     ///
     /// `DeleteReplace`（全局默认）依赖对宿主做删改，在 Tabby 一类终端上会出严重错误；
@@ -472,10 +822,18 @@ pub struct AppCompatRule {
     ///
     /// ⚠ 消费点有**两处**（`apply_focus_caret` / `handle_caret_update`），与 `caret_use_top`
     /// 同层同处；漏一处的症状是「有时生效有时不生效」。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub caret_offset_x: i32,
     /// 光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下）。语义见 [`Self::caret_offset_x`]。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub caret_offset_y: i32,
     /// 该应用的候选窗定位方式；`None` = 不干预，沿用全局 `ui.candidate.position_mode`。
     ///
@@ -500,11 +858,54 @@ pub struct AppCompatRule {
     /// ⚠ 不分显示器：与全局那份保持同一口径。换屏后落点由 `clamp_to_work_area` 兜住，
     /// 不会飞到不可见区域（工具栏/软键盘那套按屏分桶的模型**不适用**——它们是常驻窗口，
     /// 候选窗是临时浮层且随时可以拖）。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub candidate_x: i32,
     /// 固定模式下该应用自己的候选窗落点 Y。语义见 [`Self::candidate_x`]。
-    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
     pub candidate_y: i32,
+    /// 该应用的状态气泡定位方式；`None` = 跟随全局 `ui.status.position_mode`（C2-33 / GH#148）。
+    ///
+    /// 与 [`Self::candidate_position_mode`] 同构：必须是 `Option`（「没配过」与「显式配了
+    /// follow_caret」要能区分），且坐标 [`Self::status_x`]/[`Self::status_y`] 与它**同层取**
+    /// ——规则配了定位方式就用规则自己的那份坐标，没配才整套回落全局。用户偏好 ⇒ **不进**
+    /// [`ProtocolFields`]。消费点在协调器 `status_position`。
+    #[serde(
+        default,
+        deserialize_with = "de_status_position_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status_position_mode: Option<StatusPositionMode>,
+    /// `fixed` 下该应用自己的状态气泡落点 X（内容左上屏幕坐标，物理像素）。`(0,0)` = 已开固定
+    /// 但还没摆过，由 UI 落到光标所在屏——与全局 `ui.status.custom_x/y` 同一套哨兵约定。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
+    pub status_x: i32,
+    /// `fixed` 下该应用自己的状态气泡落点 Y。语义见 [`Self::status_x`]。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_i32",
+        skip_serializing_if = "is_zero_i32"
+    )]
+    pub status_y: i32,
+    /// 该应用光标坐标不可信时状态气泡的兜底位置；`None` = 跟随全局 `ui.status.fallback_position`。
+    /// 只在（规则或全局解析出的）定位方式为 `follow_caret` 时生效。
+    #[serde(
+        default,
+        deserialize_with = "de_status_fallback",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub status_fallback_position: Option<StatusFallback>,
     /// 忽略该宿主「关闭输入法」的请求（写 OPENCLOSE / CONVERSION compartment 关 IME）。
     ///
     /// 背景：WinForms 的 `ImeMode.Disable`、WPF 的 `InputMethod.IsInputMethodEnabled=False`
@@ -522,7 +923,11 @@ pub struct AppCompatRule {
     /// 时 Ctrl 正被按住，宿主自己写则没有任何按键（同款判据已在 C++ 的 CapsLock 联动
     /// 抑制窗用过并实测过）。判据由 DLL 在发消息时一并交代（`MODE_SWITCH_CTRL_HELD`），
     /// 服务端不去猜。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ignore_host_ime_close: Option<bool>,
     /// 这个宿主读走候选串时，是否当它在自绘、从而收起我们的候选窗。
     /// `None` = 否（默认），`Some(true)` = 是，`Some(false)` = **显式关闭**。
@@ -563,8 +968,22 @@ pub struct AppCompatRule {
     /// 规则查两层：本进程名一条，以及 `process = "*"` 的通配一条（通配现在的用途是反方向
     /// ——某类宿主普遍需要收窗时一行开到全局）。查表见
     /// `Coordinator::uielement_host_draws_by_inference`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_drawn_candidates: Option<bool>,
+}
+
+impl AppCompatRule {
+    /// [`Self::schema`] 的语义视图；`None` = 未配置（跟随全局）。
+    pub fn app_schema(&self) -> Option<AppSchema<'_>> {
+        match self.schema.as_deref()? {
+            APP_SCHEMA_REMEMBER => Some(AppSchema::Remember),
+            id => Some(AppSchema::Fixed(id)),
+        }
+    }
 }
 
 fn is_zero_i32(v: &i32) -> bool {
@@ -668,6 +1087,21 @@ pub fn set_auto_pair(rules: &mut Vec<AppCompatRule>, process: &str, enabled: Opt
     upsert_rule(rules, process, |r| r.auto_pair = enabled);
 }
 
+/// 在一组规则上设置指定进程的密码框强制英文（`None` = 清除规则，回到跟随全局）。
+pub fn set_password_force_english(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    enabled: Option<bool>,
+) {
+    upsert_rule(rules, process, |r| r.password_force_english = enabled);
+}
+
+/// 在一组规则上设置指定进程的输入方案（`None` = 清除规则，回到跟随全局）。
+/// 值语义见 [`AppCompatRule::schema`]。
+pub fn set_schema(rules: &mut Vec<AppCompatRule>, process: &str, schema: Option<String>) {
+    upsert_rule(rules, process, |r| r.schema = schema);
+}
+
 /// 在一组规则上设置指定进程的智能符号替换方案（`None` = 清除规则，回到跟随全局）。
 pub fn set_smart_method(
     rules: &mut Vec<AppCompatRule>,
@@ -683,6 +1117,40 @@ pub fn set_caret_offset(rules: &mut Vec<AppCompatRule>, process: &str, dx: i32, 
         r.caret_offset_x = dx;
         r.caret_offset_y = dy;
     });
+}
+
+/// 在一组规则上设置指定进程的状态气泡定位（**方式与坐标一起写**；`None` = 清除，回到跟随
+/// 全局，坐标一并清零——理由同 [`set_candidate_position_mode`]）。
+pub fn set_status_position(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    mode: Option<StatusPositionMode>,
+    x: i32,
+    y: i32,
+) {
+    upsert_rule(rules, process, |r| apply_status_position(r, mode, x, y));
+}
+
+/// 在一组规则上设置指定进程的状态气泡兜底位置（`None` = 清除，回到跟随全局）。
+pub fn set_status_fallback(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    fallback: Option<StatusFallback>,
+) {
+    upsert_rule(rules, process, |r| r.status_fallback_position = fallback);
+}
+
+/// 定位方式与坐标的同层写入：清除方式时坐标归零；非 `fixed` 方式不用坐标，也归零，
+/// 免得留一对孤儿坐标、下次开固定跳到老位置。
+fn apply_status_position(r: &mut AppCompatRule, mode: Option<StatusPositionMode>, x: i32, y: i32) {
+    r.status_position_mode = mode;
+    let (x, y) = if mode == Some(StatusPositionMode::Fixed) {
+        (x, y)
+    } else {
+        (0, 0)
+    };
+    r.status_x = x;
+    r.status_y = y;
 }
 
 /// 一条规则是否「什么都没覆盖」——序列化后除 `process` 外不剩任何键。
@@ -795,6 +1263,24 @@ pub fn set_user_auto_pair(
     update_user_rule(user_dir, process, |r| r.auto_pair = enabled)
 }
 
+/// 设置用户层 compat.toml 中指定进程的密码框强制英文（`None` = 清除规则）。
+pub fn set_user_password_force_english(
+    user_dir: &Path,
+    process: &str,
+    enabled: Option<bool>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.password_force_english = enabled)
+}
+
+/// 设置用户层 compat.toml 中指定进程的输入方案（`None` = 清除规则）。
+pub fn set_user_schema(
+    user_dir: &Path,
+    process: &str,
+    schema: Option<String>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.schema = schema)
+}
+
 /// 设置用户层 compat.toml 中指定进程的候选窗定位方式（`None` = 清除规则，含坐标）。
 /// 清除时一并清坐标，理由见 [`set_candidate_position_mode`]。
 pub fn set_user_candidate_position_mode(
@@ -867,6 +1353,30 @@ pub fn set_user_caret_offset(
     })
 }
 
+/// 设置用户层 compat.toml 中指定进程的状态气泡定位：**方式与坐标一起写**（理由同
+/// [`set_user_candidate_fixed_pos`]：本字段不进 [`ProtocolFields`]，只写坐标会让用户层规则
+/// 整条盖掉出厂那档定位方式）。`None` = 清除（坐标一并清零）。
+///
+/// ⚠ `fixed` 的坐标由调用方先做 `(0,0)` 哨兵规避（协调器的 `avoid_unset_sentinel`）。
+pub fn set_user_status_position(
+    user_dir: &Path,
+    process: &str,
+    mode: Option<StatusPositionMode>,
+    x: i32,
+    y: i32,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| apply_status_position(r, mode, x, y))
+}
+
+/// 设置用户层 compat.toml 中指定进程的状态气泡兜底位置（`None` = 清除规则）。
+pub fn set_user_status_fallback(
+    user_dir: &Path,
+    process: &str,
+    fallback: Option<StatusFallback>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.status_fallback_position = fallback)
+}
+
 /// 「初始模式作用域」规则：某进程的 per-app **初始模式**只在哪些**窗口类**上重算。
 ///
 /// 为什么需要它：per-app 规则（`[[apps]]`）的身份是**进程映像名**，而 `explorer.exe`
@@ -892,11 +1402,16 @@ pub fn set_user_caret_offset(
 /// 两段各自独立合并，互不牵连。同类前车之鉴见 project_dict_override_sparse_merge。
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct InitialModeScopeRule {
-    /// 进程映像名（不区分大小写），如 `explorer.exe`。
+    /// 进程映像名（不区分大小写），如 `explorer.exe`。缺失或类型写错 ⇒ 本条作废（见 [`de_process`]）。
+    #[serde(default, deserialize_with = "de_process")]
     pub process: String,
     /// 说明（仅文档用途）。与 `AppCompatRule::comment` 同理**必须存在于结构体里**：
     /// serde 默认静默忽略未知字段，只声明在 TOML 注释里的话，用户层写回时会被丢掉。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_comment",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
     /// 该进程下**允许重算初始模式**的顶层窗口类名（不区分大小写）。
     /// 空清单 = 该进程的初始模式规则在任何窗口上都不重算。
@@ -926,12 +1441,16 @@ pub struct InitialModeScopeRule {
 /// 「开新段」与「加字段并登记」之间**没有判据**——那时该回到上面三条逐条对照。
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct CommitNewlineRule {
-    /// 进程映像名（不区分大小写），如 `WINWORD.EXE`。
-    #[serde(default)]
+    /// 进程映像名（不区分大小写），如 `WINWORD.EXE`。类型写错 ⇒ 本条作废（见 [`de_process`]）。
+    #[serde(default, deserialize_with = "de_process")]
     pub process: String,
     /// 说明（仅文档用途）。与 [`AppCompatRule::comment`] 同理**必须存在于结构体里**：
     /// serde 默认静默忽略未知字段，只声明在 TOML 注释里的话，用户层写回时会被丢掉。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_comment",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
     /// 该应用上屏时换行用什么字符表达。**认不出的值退化为 `None`＝跟随全局**，
     /// 而不是让整份文件解析失败——理由见 [`de_newline_style`]。
@@ -1063,6 +1582,8 @@ impl AppCompat {
             .apps
             .iter()
             .enumerate()
+            // 空进程名 = 作废的规则（`process` 类型写错，见 `de_process`），不套给任何人。
+            .filter(|(_, r)| !r.process.is_empty())
             .map(|(i, r)| (r.process.to_ascii_lowercase(), i))
             .collect();
     }
@@ -1731,6 +2252,424 @@ mod tests {
 
         let qq = compat.get_rule("qq.exe").unwrap();
         assert_eq!(qq.composition_start_pair_guard, Some(true));
+    }
+
+    /// `password_force_english` 三态解析：未配 = `None`（跟随全局），显式 true/false 原样保留。
+    #[test]
+    fn parse_password_force_english_tristate() {
+        let toml = r#"
+            [[apps]]
+            process = "misreport.exe"
+            password_force_english = false
+
+            [[apps]]
+            process = "strict.exe"
+            password_force_english = true
+
+            [[apps]]
+            process = "plain.exe"
+            caret_use_top = true
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps);
+        assert_eq!(
+            compat
+                .get_rule("MISREPORT.EXE")
+                .unwrap()
+                .password_force_english,
+            Some(false)
+        );
+        assert_eq!(
+            compat
+                .get_rule("strict.exe")
+                .unwrap()
+                .password_force_english,
+            Some(true)
+        );
+        assert_eq!(
+            compat.get_rule("plain.exe").unwrap().password_force_english,
+            None,
+            "未配 = 跟随全局，不能被 bool 默认值污染"
+        );
+    }
+
+    /// 类型写错只让本字段回落 `None`，**不得让整份 compat.toml 失效**：`load_file` 没有
+    /// 段级降级，一个 `"yes"` 就会连带所有应用的所有规则静默消失。
+    #[test]
+    fn password_force_english_wrong_type_does_not_sink_the_file() {
+        for bad in [r#""yes""#, "1", "[true]"] {
+            let toml = format!(
+                r#"
+                [[apps]]
+                process = "typo.exe"
+                password_force_english = {bad}
+
+                [[apps]]
+                process = "other.exe"
+                auto_pair = false
+                "#
+            );
+            let file = toml::from_str::<AppCompatFile>(&toml)
+                .unwrap_or_else(|e| panic!("{bad}: 类型写错不得让整份失败：{e}"));
+            let compat = AppCompat::from_rules(file.apps);
+            assert_eq!(
+                compat.get_rule("typo.exe").unwrap().password_force_english,
+                None,
+                "{bad}: 认不出 = 没配过"
+            );
+            assert_eq!(
+                compat.get_rule("other.exe").unwrap().auto_pair,
+                Some(false),
+                "{bad}: 同文件其它规则必须照常生效"
+            );
+        }
+    }
+
+    /// 写回稀疏：显式值落盘，清除后整键消失（而不是写成 `= true`）。
+    #[test]
+    fn password_force_english_writeback_is_sparse() {
+        let mut rules = Vec::new();
+        set_password_force_english(&mut rules, "Misreport.exe", Some(false));
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(out.contains("password_force_english = false"), "{out}");
+
+        set_password_force_english(&mut rules, "MISREPORT.EXE", Some(true));
+        assert_eq!(rules.len(), 1, "进程名不区分大小写，应改同一条");
+        assert_eq!(rules[0].password_force_english, Some(true));
+
+        set_password_force_english(&mut rules, "misreport.exe", None);
+        let cleared = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(
+            !cleared.contains("password_force_english"),
+            "清除后不应残留该键: {cleared}"
+        );
+    }
+
+    /// 落盘包装往返：写入后 `AppCompat::load` 读得回；清回「跟随全局」后空壳规则被剔除。
+    #[test]
+    fn set_user_password_force_english_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wind_compat_pfe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_user_password_force_english(&dir, "misreport.exe", Some(false)).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert_eq!(
+            compat
+                .get_rule("misreport.exe")
+                .and_then(|r| r.password_force_english),
+            Some(false)
+        );
+
+        set_user_password_force_english(&dir, "misreport.exe", None).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert!(
+            compat.get_rule("misreport.exe").is_none(),
+            "只剩 process 的空壳规则应被剔除"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 状态气泡定位（C2-33 / GH#148）────────────────────────────────────────────
+
+    /// 两个值域表与解析/回写同源：表里每一项都能解析、且回写成同一个串。
+    #[test]
+    fn status_value_tables_roundtrip() {
+        for v in STATUS_POSITION_MODES {
+            let m = StatusPositionMode::from_config(v).unwrap_or_else(|| panic!("{v}"));
+            assert_eq!(m.as_config(), v);
+        }
+        for v in STATUS_FALLBACK_POSITIONS {
+            let f = StatusFallback::from_config(v).unwrap_or_else(|| panic!("{v}"));
+            assert_eq!(f.as_config(), v);
+        }
+        for a in StatusAnchor::ALL {
+            assert!(STATUS_POSITION_MODES.contains(&a.as_config()));
+            assert!(STATUS_FALLBACK_POSITIONS.contains(&a.as_config()));
+        }
+        // 两张表只有前两档不同：定位方式没有 last/hide，兜底没有 follow_caret/fixed。
+        assert_eq!(StatusPositionMode::from_config("last"), None);
+        assert_eq!(StatusFallback::from_config("fixed"), None);
+    }
+
+    #[test]
+    fn status_rule_fields_parse() {
+        let c = parse_rules(
+            "[[apps]]\nprocess = \"ai.exe\"\nstatus_position_mode = \"window_bottom_left\"\n\
+             status_fallback_position = \"screen_top_right\"\n\n\
+             [[apps]]\nprocess = \"fx.exe\"\nstatus_position_mode = \"fixed\"\n\
+             status_x = 120\nstatus_y = -40\n",
+        );
+        let ai = c.get_rule("ai.exe").unwrap();
+        assert_eq!(
+            ai.status_position_mode,
+            Some(StatusPositionMode::Anchor(StatusAnchor::WindowBottomLeft))
+        );
+        assert_eq!(
+            ai.status_fallback_position,
+            Some(StatusFallback::Anchor(StatusAnchor::ScreenTopRight))
+        );
+        let fx = c.get_rule("fx.exe").unwrap();
+        assert_eq!(fx.status_position_mode, Some(StatusPositionMode::Fixed));
+        assert_eq!((fx.status_x, fx.status_y), (120, -40));
+        assert_eq!(fx.status_fallback_position, None);
+    }
+
+    /// 锚点拼错 / fallback 拼错 / 类型写错：只让该项回落「跟随全局」，同条规则的其它字段与
+    /// 同文件其它规则照常生效。
+    #[test]
+    fn status_rule_typos_only_drop_that_field() {
+        for (field, bad) in [
+            ("status_position_mode", r#""screen_centre""#),
+            ("status_position_mode", "3"),
+            ("status_position_mode", r#""last""#),
+            ("status_fallback_position", r#""hidden""#),
+            ("status_fallback_position", "true"),
+            ("status_fallback_position", r#""fixed""#),
+        ] {
+            let text = format!(
+                "[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\nstatus_x = 5\n\
+                 initial_mode = \"english\"\n\n\
+                 [[apps]]\nprocess = \"other.exe\"\nstatus_position_mode = \"screen_center\"\n"
+            );
+            let file = toml::from_str::<AppCompatFile>(&text)
+                .unwrap_or_else(|e| panic!("{field} = {bad}: 不得整份失败：{e}"));
+            let c = AppCompat::from_rules(file.apps);
+            let typo = c.get_rule("typo.exe").unwrap();
+            assert_eq!(typo.status_position_mode, None, "{field} = {bad}");
+            assert_eq!(typo.status_fallback_position, None, "{field} = {bad}");
+            assert_eq!(typo.status_x, 5, "{field} = {bad}: 同条其它字段照常");
+            assert_eq!(typo.initial_mode, Some(InitialMode::English));
+            assert_eq!(
+                c.get_rule("other.exe").unwrap().status_position_mode,
+                Some(StatusPositionMode::Anchor(StatusAnchor::ScreenCenter)),
+                "{field} = {bad}: 同文件其它规则必须照常生效"
+            );
+        }
+    }
+
+    /// 方式与坐标同层写：固定写坐标；改成别的方式或清除时坐标归零（不留孤儿坐标）。
+    #[test]
+    fn status_position_writes_mode_and_coords_together() {
+        let mut rules = Vec::new();
+        set_status_position(
+            &mut rules,
+            "a.exe",
+            Some(StatusPositionMode::Fixed),
+            300,
+            200,
+        );
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(out.contains(r#"status_position_mode = "fixed""#), "{out}");
+        assert!(
+            out.contains("status_x = 300") && out.contains("status_y = 200"),
+            "{out}"
+        );
+
+        let anchor = StatusPositionMode::Anchor(StatusAnchor::ScreenBottomRight);
+        set_status_position(&mut rules, "A.EXE", Some(anchor), 999, 999);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].status_position_mode, Some(anchor));
+        assert_eq!((rules[0].status_x, rules[0].status_y), (0, 0));
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(
+            out.contains(r#"status_position_mode = "screen_bottom_right""#),
+            "{out}"
+        );
+
+        set_status_fallback(&mut rules, "a.exe", Some(StatusFallback::Hide));
+        set_status_position(&mut rules, "a.exe", None, 1, 1);
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(!out.contains("status_position_mode"), "{out}");
+        assert!(!out.contains("status_x"), "{out}");
+        assert!(
+            out.contains(r#"status_fallback_position = "hide""#),
+            "{out}"
+        );
+    }
+
+    /// 落盘包装往返：写入后读得回；两项都清回跟随全局后空壳规则被剔除。
+    #[test]
+    fn set_user_status_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wind_compat_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_user_status_position(&dir, "ai.exe", Some(StatusPositionMode::Fixed), 10, 20).unwrap();
+        set_user_status_fallback(
+            &dir,
+            "ai.exe",
+            Some(StatusFallback::Anchor(StatusAnchor::WindowCenter)),
+        )
+        .unwrap();
+        let c = AppCompat::load(None, Some(&dir));
+        let r = c.get_rule("ai.exe").unwrap();
+        assert_eq!(r.status_position_mode, Some(StatusPositionMode::Fixed));
+        assert_eq!((r.status_x, r.status_y), (10, 20));
+        assert_eq!(
+            r.status_fallback_position,
+            Some(StatusFallback::Anchor(StatusAnchor::WindowCenter))
+        );
+
+        set_user_status_position(&dir, "ai.exe", None, 0, 0).unwrap();
+        set_user_status_fallback(&dir, "ai.exe", None).unwrap();
+        let c = AppCompat::load(None, Some(&dir));
+        assert!(
+            c.get_rule("ai.exe").is_none(),
+            "只剩 process 的空壳规则应被剔除"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 最初的现场：`auto_pair = "yes"` 曾让整份 compat.toml 静默失效。
+    #[test]
+    fn auto_pair_wrong_type_does_not_sink_the_file() {
+        let file = toml::from_str::<AppCompatFile>(
+            "[[apps]]\nprocess = \"et.exe\"\nauto_pair = \"yes\"\n\n\
+             [[apps]]\nprocess = \"other.exe\"\ncaret_use_top = true\n",
+        )
+        .expect("auto_pair 写错不得让整份失败");
+        let compat = AppCompat::from_rules(file.apps);
+        assert_eq!(compat.get_rule("et.exe").unwrap().auto_pair, None);
+        assert!(compat.get_rule("other.exe").unwrap().caret_use_top);
+    }
+
+    /// 另两段（`[[initial_mode_scope]]` / `[[commit_newline]]`）的 `process` / `comment` 同理：
+    /// 类型写错只让那一条作废（或那一项忽略），不得让整份 compat.toml 失效。
+    #[test]
+    fn side_sections_process_wrong_type_voids_only_that_rule() {
+        let file = toml::from_str::<AppCompatFile>(
+            "[[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n\n\
+             [[initial_mode_scope]]\nprocess = 1\nclasses = [\"X\"]\n\n\
+             [[initial_mode_scope]]\ncomment = 2\nprocess = \"explorer.exe\"\nclasses = [\"Progman\"]\n\n\
+             [[commit_newline]]\nprocess = true\nstyle = \"cr\"\n\n\
+             [[commit_newline]]\nprocess = \"WINWORD.EXE\"\ncomment = [1]\nstyle = \"cr\"\n",
+        )
+        .expect("process / comment 类型写错不得让整份失败");
+        let compat = AppCompat::from_parts(file.apps, file.initial_mode_scope)
+            .with_commit_newline(file.commit_newline);
+        assert_eq!(compat.get_rule("other.exe").unwrap().auto_pair, Some(false));
+        assert!(compat.initial_mode_applies_to_window("explorer.exe", "Progman"));
+        assert!(!compat.initial_mode_applies_to_window("explorer.exe", "X"));
+        assert_eq!(
+            compat.commit_newline_for("winword.exe"),
+            Some(NewlineStyle::Cr)
+        );
+        assert_eq!(compat.commit_newline_for("true"), None);
+    }
+
+    fn parse_rules(toml: &str) -> AppCompat {
+        AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps)
+    }
+
+    /// `schema` 三态：未配 = 跟随全局；具体 id = 固定；`@remember` = 记住上次。
+    #[test]
+    fn parse_app_schema_fixed_and_remember() {
+        let compat = parse_rules(
+            r#"
+            [[apps]]
+            process = "code.exe"
+            schema = "english"
+
+            [[apps]]
+            process = "weixin.exe"
+            schema = "@remember"
+
+            [[apps]]
+            process = "plain.exe"
+            auto_pair = false
+            "#,
+        );
+        assert_eq!(
+            compat.get_rule("CODE.EXE").unwrap().app_schema(),
+            Some(AppSchema::Fixed("english"))
+        );
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().app_schema(),
+            Some(AppSchema::Remember)
+        );
+        assert_eq!(compat.get_rule("plain.exe").unwrap().schema, None);
+        assert_eq!(compat.get_rule("plain.exe").unwrap().app_schema(), None);
+    }
+
+    /// `@` 前缀是保留标记空间：只认 `@remember`，其余（拼错、将来的新标记）按未配置处理；
+    /// 空串同理。**同文件其它规则必须照常生效**。
+    #[test]
+    fn unknown_app_schema_marker_degrades_to_none() {
+        for bad in [r#""@remeber""#, r#""@global""#, r#""""#, r#""   ""#] {
+            let compat = parse_rules(&format!(
+                r#"
+                [[apps]]
+                process = "typo.exe"
+                schema = {bad}
+
+                [[apps]]
+                process = "other.exe"
+                auto_pair = false
+                "#
+            ));
+            assert_eq!(
+                compat.get_rule("typo.exe").and_then(|r| r.schema.clone()),
+                None,
+                "{bad}: 认不出 = 没配过"
+            );
+            assert_eq!(
+                compat.get_rule("other.exe").unwrap().auto_pair,
+                Some(false),
+                "{bad}: 同文件其它规则必须照常生效"
+            );
+        }
+    }
+
+    /// 类型写错（`schema = 1` / 数组）不得让整份 compat.toml 失效：`load_file` 没有段级降级。
+    #[test]
+    fn app_schema_wrong_type_does_not_sink_the_file() {
+        for bad in ["1", "true", r#"["pinyin"]"#] {
+            let text = format!(
+                r#"
+                [[apps]]
+                process = "typo.exe"
+                schema = {bad}
+
+                [[apps]]
+                process = "other.exe"
+                schema = "pinyin"
+                "#
+            );
+            let file = toml::from_str::<AppCompatFile>(&text)
+                .unwrap_or_else(|e| panic!("{bad}: 类型写错不得让整份失败：{e}"));
+            let compat = AppCompat::from_rules(file.apps);
+            assert_eq!(
+                compat.get_rule("typo.exe").and_then(|r| r.schema.clone()),
+                None
+            );
+            assert_eq!(
+                compat.get_rule("other.exe").unwrap().app_schema(),
+                Some(AppSchema::Fixed("pinyin"))
+            );
+        }
+    }
+
+    /// 写回稀疏 + 落盘往返：显式值落盘，清回「跟随全局」后整键消失、空壳规则剔除。
+    #[test]
+    fn set_user_app_schema_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wind_compat_schema_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_user_schema(&dir, "Weixin.exe", Some(APP_SCHEMA_REMEMBER.to_string())).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().app_schema(),
+            Some(AppSchema::Remember)
+        );
+
+        set_user_schema(&dir, "WEIXIN.EXE", Some("wubi86".to_string())).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().app_schema(),
+            Some(AppSchema::Fixed("wubi86"))
+        );
+
+        set_user_schema(&dir, "weixin.exe", None).unwrap();
+        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
+        assert!(!text.contains("schema"), "清除后不应残留该键: {text}");
+        let compat = AppCompat::load(None, Some(&dir));
+        assert!(compat.get_rule("weixin.exe").is_none(), "空壳规则应被剔除");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 写回只落被触碰的字段，且 `None`/0 不进 TOML（`skip_serializing_if`）——

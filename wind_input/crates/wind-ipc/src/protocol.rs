@@ -205,6 +205,19 @@ pub const CMD_TOOLTIP_SHOW: u16 = 0x0508; // 候选悬停 tooltip
 pub const CMD_TOOLTIP_HIDE: u16 = 0x0509;
 pub const CMD_STATUS_SHOW: u16 = 0x050A; // 模式状态气泡
 pub const CMD_STATUS_HIDE: u16 = 0x050B;
+/// `CMD_STATUS_SHOW` 尾部的锚点编码（C2-33 / GH#148）。`NONE` = 按 x/y 定位（跟随光标 / 固定
+/// 坐标，服务端已算定）；其余 = `.app` 按锚点在焦点所在屏自行落位，此时 x/y 只作选屏参考。
+/// 窗口两档在 `.app` 拿不到宿主窗口边框时降级为同位置的屏幕锚点。
+pub mod status_anchor {
+    pub const NONE: i32 = 0;
+    pub const SCREEN_CENTER: i32 = 1;
+    pub const SCREEN_TOP_LEFT: i32 = 2;
+    pub const SCREEN_TOP_RIGHT: i32 = 3;
+    pub const SCREEN_BOTTOM_LEFT: i32 = 4;
+    pub const SCREEN_BOTTOM_RIGHT: i32 = 5;
+    pub const WINDOW_CENTER: i32 = 6;
+    pub const WINDOW_BOTTOM_LEFT: i32 = 7;
+}
 pub const CMD_TOAST_SHOW: u16 = 0x050C; // Toast 通知
 pub const CMD_TOAST_HIDE: u16 = 0x050D;
 // 命令直通车按键合成（darwin 下行）：服务进程无辅助功能授权无法 post CGEvent，

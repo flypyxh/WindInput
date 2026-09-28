@@ -184,32 +184,49 @@ fn schema_seed() -> toml::Value {
     toml::Value::try_from(Schema::default()).expect("Schema::default 必须可序列化")
 }
 
-/// `AppCompatFile` 的种子。
+/// `AppCompatFile` 的种子：一条**每个字段都会被序列化出来**的规则。
 ///
 /// # ⚠️ 两个盲区，都必须在这里显式补掉
 ///
 /// 1. `apps` 默认是**空数组**，直接 `default()` 一个规则字段都扫不到。
-/// 2. 规则里的枚举字段全是 `Option` + `skip_serializing_if = "Option::is_none"`，
-///    `None` 时序列化后**那个键根本不出现**——而 tri-state 覆盖字段恰恰全是这个形状，
-///    正是最容易漏容错的一类（`smart_method` 就是这么漏的）。
+/// 2. 规则字段几乎都带 `skip_serializing_if`（`Option::is_none` / `is_false` / `is_zero_i32` /
+///    `String::is_empty`），取默认值时序列化后**那个键根本不出现**——而 tri-state 覆盖字段
+///    恰恰全是这个形状，正是最容易漏容错的一类（`smart_method` 就是这么漏的）。
 ///
-/// 故这里逐个把 `Option` 字段填成 `Some`。**新增 `Option` 字段时必须在这里补一笔**——
-/// 忘了补会被 [`app_compat_seed_covers_every_optional_field`] 拦下，不靠人记得。
+/// 故这里把每个字段都填成「会被写出来」的值。**新增字段时必须在这里补一笔**——忘了补会被
+/// [`app_compat_seed_covers_every_field`] 拦下，不靠人记得。
 fn app_compat_seed() -> toml::Value {
-    use crate::app_compat::{AppCompatRule, CandidatePositionMode, FirstShowMode, InitialMode};
+    use crate::app_compat::{
+        AppCompatRule, CandidatePositionMode, FirstShowMode, InitialMode, StatusAnchor,
+        StatusFallback, StatusPositionMode,
+    };
     use crate::config::SmartMethod;
     let rule = AppCompatRule {
+        process: "seed.exe".to_string(),
+        comment: "seed".to_string(),
+        caret_use_top: true,
+        stale_probe_guard: true,
+        host_render: true,
+        caret_offset_x: 1,
+        caret_offset_y: 2,
+        candidate_x: 3,
+        candidate_y: 4,
+        status_x: 5,
+        status_y: 6,
         first_show_mode: Some(FirstShowMode::default()),
         initial_mode: Some(InitialMode::Chinese),
         initial_punct: Some(InitialMode::Chinese),
         smart_method: Some(SmartMethod::default()),
         auto_pair: Some(true),
+        password_force_english: Some(true),
+        schema: Some("pinyin".to_string()),
         composition_start_pair_guard: Some(true),
         pin_anchor_when_start_drifts: Some(true),
         candidate_position_mode: Some(CandidatePositionMode::Fixed),
+        status_position_mode: Some(StatusPositionMode::Anchor(StatusAnchor::ScreenCenter)),
+        status_fallback_position: Some(StatusFallback::Hide),
         ignore_host_ime_close: Some(true),
         host_drawn_candidates: Some(true),
-        ..Default::default()
     };
     let file = AppCompatFile {
         apps: vec![rule],
@@ -218,48 +235,137 @@ fn app_compat_seed() -> toml::Value {
     toml::Value::try_from(file).expect("AppCompatFile 必须可序列化")
 }
 
-/// 守 [`app_compat_seed`] 的覆盖率：`AppCompatRule` 的每个 `Option` 字段都必须出现在
-/// 种子序列化的产物里，否则 [`compat_toml_survives_any_single_bad_string`] 会**假绿**
-/// ——扫不到的字段永远不会被投毒，测试照常通过。
-///
-/// 判据取自源码而不是类型系统：Rust 没有字段反射，而这类「漏一个」正是本测试要防的。
-#[test]
-fn app_compat_seed_covers_every_optional_field() {
-    let src = include_str!("app_compat.rs");
-    let seed = app_compat_seed();
-    let rule = seed
+/// 种子里那条规则（键 → 值）。
+fn seed_rule() -> toml::map::Map<String, toml::Value> {
+    app_compat_seed()
         .get("apps")
         .and_then(|a| a.as_array())
         .and_then(|a| a.first())
         .and_then(|r| r.as_table())
-        .expect("种子里必须有一条规则");
+        .cloned()
+        .expect("种子里必须有一条规则")
+}
 
-    // `AppCompatRule` 的字段区间：从结构体定义开始到它的右花括号。
-    let start = src
-        .find("pub struct AppCompatRule {")
-        .expect("找不到 AppCompatRule 定义");
-    let body = &src[start..];
-    let end = body.find("\n}").expect("找不到 AppCompatRule 的结尾");
-    let body = &body[..end];
+/// `AppCompatRule` 的全部字段名，取自 **serde derive 生成的字段表**（`deserialize_struct`
+/// 的 `fields` 参数）——与反序列化实际认的键同源，不扫源码、不依赖排版。
+fn app_compat_rule_fields() -> &'static [&'static str] {
+    use serde::de::{Deserializer, Error as _, Visitor};
+    type E = serde::de::value::Error;
 
-    let mut missing = Vec::new();
-    for line in body.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("pub ") else {
-            continue;
-        };
-        let Some((name, ty)) = rest.split_once(": ") else {
-            continue;
-        };
-        if ty.starts_with("Option<") && !rule.contains_key(name) {
-            missing.push(name.to_string());
+    /// 只为截获 `fields` 的探针：记下字段表后立即报错退出。
+    struct Probe<'a>(&'a mut &'static [&'static str]);
+    impl<'de> Deserializer<'de> for Probe<'_> {
+        type Error = E;
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, E> {
+            Err(E::custom("probe"))
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, E> {
+            *self.0 = fields;
+            Err(E::custom("probe"))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
         }
     }
+    let mut fields: &'static [&'static str] = &[];
+    let _ =
+        <crate::app_compat::AppCompatRule as serde::Deserialize>::deserialize(Probe(&mut fields));
+    fields
+}
+
+/// 守 [`app_compat_seed`] 的覆盖率：`AppCompatRule` 的每个字段都必须出现在种子序列化的
+/// 产物里，否则 [`compat_toml_survives_any_single_bad_string`] 与
+/// [`compat_rule_any_field_wrong_type_does_not_sink_the_file`] 会**假绿**——扫不到的字段
+/// 永远不会被投毒，测试照常通过。
+#[test]
+fn app_compat_seed_covers_every_field() {
+    let fields = app_compat_rule_fields();
+    assert!(fields.len() >= 20, "字段表截获失灵：{fields:?}");
+    let rule = seed_rule();
+    let missing: Vec<&str> = fields
+        .iter()
+        .copied()
+        .filter(|f| !rule.contains_key(*f))
+        .collect();
     assert!(
         missing.is_empty(),
-        "AppCompatRule 新增了 Option 字段但没进 app_compat_seed，\
-         这些字段不会被投毒、守门测试会假绿：{missing:?}"
+        "AppCompatRule 新增了字段但没进 app_compat_seed（或种子值恰好被 skip_serializing_if \
+         省略），这些字段不会被投毒、守门测试会假绿：{missing:?}"
     );
+}
+
+/// `AppCompatRule` 的**任何一个字段**写成错误类型（bool 写成字符串/整数、整数写成字符串/
+/// 浮点/越界、字符串写成整数/布尔/数组/表）都**不得**让整份 compat.toml 失效：只让该字段
+/// 回落「未配置」，同文件其它规则照常生效。
+///
+/// 字段表取自种子序列化出的键，注入值按该键的值类型选——新增字段只要进了种子（上一条测试
+/// 强制），就自动进入覆盖范围。`load_file` 没有段级降级，漏一个字段 = 用户手写一个类型错，
+/// 所有应用的所有规则一起静默失效（auto_pair、smart_method、initial_mode 都这么漏过）。
+///
+/// `process` 是主键，语义不同：类型错 ⇒ **本条规则作废**（不套给任何进程），见 `de_process`。
+#[test]
+fn compat_rule_any_field_wrong_type_does_not_sink_the_file() {
+    use crate::app_compat::AppCompat;
+
+    const OTHER: &str = "[[apps]]\nprocess = \"other.exe\"\nauto_pair = false\n";
+    let other_still_works = |compat: &AppCompat, ctx: &str| {
+        assert_eq!(
+            compat.get_rule("other.exe").and_then(|r| r.auto_pair),
+            Some(false),
+            "{ctx}: 同文件其它规则必须照常生效"
+        );
+    };
+
+    let rule = seed_rule();
+    for (field, v) in &rule {
+        let bads: &[&str] = match v {
+            toml::Value::Boolean(_) => &[r#""yes""#, "1", "[true]"],
+            toml::Value::Integer(_) => &[r#""12""#, "1.5", "true", "[1]", "4294967296"],
+            toml::Value::String(_) => &["1", "true", r#"["x"]"#, "{ a = 1 }"],
+            other => panic!("种子里 {field} 是新的值类型 {other:?}，给它补一组错误类型的注入值"),
+        };
+        for bad in bads {
+            let ctx = format!("{field} = {bad}");
+            let text = if field == "process" {
+                format!("[[apps]]\nprocess = {bad}\nauto_pair = true\n\n{OTHER}")
+            } else {
+                format!("[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\n\n{OTHER}")
+            };
+            let file = toml::from_str::<AppCompatFile>(&text)
+                .unwrap_or_else(|e| panic!("{ctx}: 类型写错不得让整份失败：{e}"));
+            let compat = AppCompat::from_rules(file.apps);
+            other_still_works(&compat, &ctx);
+            if field == "process" {
+                assert!(
+                    compat.get_rule("").is_none(),
+                    "{ctx}: 进程名认不出的规则必须作废，不得以空名进查找表"
+                );
+                continue;
+            }
+            let typo = toml::Value::try_from(
+                compat
+                    .get_rule("typo.exe")
+                    .unwrap_or_else(|| panic!("{ctx}: 只写错一个字段，本条规则不得作废")),
+            )
+            .unwrap();
+            assert!(
+                typo.get(field).is_none(),
+                "{ctx}: 认不出 = 没配过，实际 {typo:?}"
+            );
+        }
+    }
+
+    // 正常值不受影响：种子本身往返一遍逐键不变（容错函数不得吞掉合法值）。
+    let back: AppCompatFile = app_compat_seed().try_into().expect("种子必须可反序列化");
+    let back = toml::Value::try_from(&back.apps[0]).unwrap();
+    assert_eq!(back.as_table(), Some(&rule), "合法值往返必须逐键不变");
 }
 
 /// ⚠️ 两条断言的强度**刻意不同**，别顺手合并成一条。

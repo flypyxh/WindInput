@@ -38,6 +38,9 @@ pub trait WebDataHost {
     /// 词库自带 `comment` 列自动派生出的注释源（设置页据此列出只读条目）。
     fn auto_comment_sources(&self) -> Vec<crate::coordinator::AutoCommentSource>;
     fn sync_chaizi_assets(&self);
+    /// 设置页「设为当前」直接切了引擎：通知宿主那是全局意图（按应用方案的全局方案随之更新），
+    /// 见 `Coordinator::note_global_schema_set`。
+    fn note_global_schema_set(&self, schema_id: &str);
     fn reload_user_config(&self) -> bool;
     /// 方案 override 落盘后重建跨方案派生集合并下发 DLL（吃键集等），见
     /// `Coordinator::refresh_schema_derived_config`。
@@ -265,6 +268,9 @@ impl WebDataHost for Coordinator {
     }
     fn sync_chaizi_assets(&self) {
         Coordinator::sync_chaizi_assets(self);
+    }
+    fn note_global_schema_set(&self, schema_id: &str) {
+        Coordinator::note_global_schema_set(self, schema_id);
     }
     fn reload_user_config(&self) -> bool {
         Coordinator::reload_user_config(self)

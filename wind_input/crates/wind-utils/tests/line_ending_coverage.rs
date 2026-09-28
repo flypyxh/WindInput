@@ -87,10 +87,6 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     // ---- 按行处理的不是「用户的文本文件」----
     (
-        "crates/wind-config/src/value_domain_guard.rs",
-        "扫的是我们自己仓里的 .rs 源码（找 AppCompatRule 的字段定义），不是用户文件",
-    ),
-    (
         "crates/wind-coordinator/src/handle_cmdbar.rs",
         "取的是子进程输出的首/末非空行做 toast 文案，不是文件解析；\
          最坏情况是提示里多个字符，不涉及数据丢失",

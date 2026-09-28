@@ -254,6 +254,10 @@ impl Coordinator {
             MenuCmd::AutoPairRule(m) => self.set_auto_pair_rule(m),
             MenuCmd::CandidatePositionRule(m) => self.set_candidate_position_rule(m),
             MenuCmd::IgnoreHostImeCloseRule(m) => self.set_ignore_host_ime_close_rule(m),
+            MenuCmd::PasswordForceEnglishRule(m) => self.set_password_force_english_rule(m),
+            MenuCmd::AppSchemaRule(m) => self.set_app_schema_rule(m),
+            MenuCmd::StatusPositionRule(m) => self.set_status_position_rule(m),
+            MenuCmd::StatusFallbackRule(m) => self.set_status_fallback_rule(m),
             MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
             MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
@@ -403,7 +407,16 @@ impl Coordinator {
     }
 
     /// 状态提示气泡右键菜单「恢复默认位置」：改回跟随光标，custom_x/y 归零。
+    ///
+    /// 当前焦点应用配了气泡定位规则时改**规则**（写成跟随光标、坐标清零），不碰全局——
+    /// 读取侧规则压过全局，只改全局用户看不到任何变化（C2-33 / GH#148）。
     pub(crate) fn status_reset_position(&self) {
+        let name = self.active_process_name();
+        if self.rule_status_position(&name).is_some() {
+            use wind_config::app_compat::StatusPositionMode as SP;
+            self.write_status_position_rule(&name, Some(SP::FollowCaret), 0, 0);
+            return;
+        }
         let _ = Config::set_user_string(&["ui", "status", "position_mode"], "follow_caret");
         let _ = Config::set_user_value(&["ui", "status", "custom_x"], toml::Value::Integer(0));
         let _ = Config::set_user_value(&["ui", "status", "custom_y"], toml::Value::Integer(0));
@@ -422,15 +435,21 @@ impl Coordinator {
     ///   松手后的 `show()` 会照常按光标重新定位，无需在此做任何清理。
     ///
     /// 这样两种模式各自语义自洽：跟随模式拖动是临时的，固定模式拖动才是"重新摆放"。
+    /// 锚点模式同跟随模式：拖动是临时的，不落盘。
+    ///
+    /// per-app 规则配了气泡定位方式时**落到该应用自己的那份坐标**（方式 + 坐标一起写），
+    /// 不碰全局——判据与读取侧 `status_position` 同源，照 `save_candidate_pos`。
     pub(crate) fn save_status_tip_pos(&self, x: i32, y: i32) {
-        if !self
-            .rt()
-            .config
-            .ui
-            .status
-            .position_mode
-            .eq_ignore_ascii_case("fixed")
-        {
+        use wind_config::app_compat::StatusPositionMode as SP;
+        let name = self.active_process_name();
+        if let Some((mode, _, _)) = self.rule_status_position(&name) {
+            if mode == SP::Fixed {
+                let (x, y) = avoid_unset_sentinel(x, y);
+                self.write_status_position_rule(&name, Some(SP::Fixed), x, y);
+            }
+            return;
+        }
+        if self.rt().config.ui.status.position() != SP::Fixed {
             return;
         }
         // 与候选窗同款哨兵规避：状态气泡的 UI 侧同样用 (0,0) 表示"尚未设定"。
@@ -504,11 +523,7 @@ impl Coordinator {
             tracing::error!("save_candidate_pos: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::debug!("候选窗固定位置 for process={name}: ({x},{y})");
     }
 
@@ -541,11 +556,7 @@ impl Coordinator {
             tracing::error!("set_candidate_position_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::info!(
             "候选窗定位方式 for process={name}: {}",
             mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
@@ -580,11 +591,7 @@ impl Coordinator {
             tracing::error!("set_ignore_host_ime_close_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.reload_app_compat();
         tracing::info!(
             "忽略宿主关闭输入法 for process={name}: {}",
             match enabled {
@@ -602,14 +609,23 @@ impl Coordinator {
     /// 否则用户拖到某处后点「固定位置」，气泡会跳到上次保存的（往往是 0,0）坐标。
     /// 做法：先把模式改成 fixed，再请 UI 上报当前位置，回来的 `StatusTipMoved`
     /// 经 `save_status_tip_pos` 落盘（该函数只在 fixed 模式下持久化，此时条件已满足）。
+    ///
+    /// 当前焦点应用配了气泡定位规则时翻转**规则**（固定 ↔ 跟随光标），随后的落盘也走规则。
     pub(crate) fn status_toggle_pinned(&self) {
-        let now_fixed = !self
-            .rt()
-            .config
-            .ui
-            .status
-            .position_mode
-            .eq_ignore_ascii_case("fixed");
+        use wind_config::app_compat::StatusPositionMode as SP;
+        let name = self.active_process_name();
+        if let Some((mode, x, y)) = self.rule_status_position(&name) {
+            let now_fixed = mode != SP::Fixed;
+            if now_fixed {
+                // 先落方式（坐标沿用旧值，多半是 0 哨兵），再请 UI 报当前位置覆盖之。
+                self.write_status_position_rule(&name, Some(SP::Fixed), x, y);
+                let _ = self.ui_tx.send(UiCommand::ReportStatusTipPos);
+            } else {
+                self.write_status_position_rule(&name, Some(SP::FollowCaret), 0, 0);
+            }
+            return;
+        }
+        let now_fixed = self.rt().config.ui.status.position() != SP::Fixed;
         let mode = if now_fixed { "fixed" } else { "follow_caret" };
         let _ = Config::set_user_string(&["ui", "status", "position_mode"], mode);
         self.refresh_config_in_memory(|c| c.ui.status.position_mode = mode.to_string());
@@ -628,7 +644,9 @@ impl Coordinator {
         {
             let si = &self.rt().config.ui.status;
             si_always = si.display_mode.eq_ignore_ascii_case("always");
-            si_fixed = si.position_mode.eq_ignore_ascii_case("fixed");
+            // 勾选态看**生效的**定位（规则优先回落全局），与落盘分流同一判据。
+            si_fixed =
+                self.status_position().mode == wind_config::app_compat::StatusPositionMode::Fixed;
             si_on_focus = si.show_on_focus;
         }
         // 菜单打开期间抑制气泡自动隐藏，否则临时模式下菜单还开着气泡就没了。
@@ -793,12 +811,34 @@ impl Coordinator {
     pub(crate) fn set_password_suppress_enabled(&self, enabled: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         self.password_suppress_enabled.store(enabled, Relaxed);
-        if !enabled {
-            self.password_suppress.store(false, Relaxed);
-        }
+        self.relax_password_suppress_for_focus();
         // 同步给 DLL：吃键门控在 TSF 侧本地判定（早于 IPC），不推则开关对 DLL 无效——
         // 关掉抑制后 DLL 仍会放行所有键，这个「误置位时用来救场」的逃生阀就成了摆设。
+        // 逐客户端按各自 pid 现算（per-app 规则优先），见 `push_password_suppress_config`。
         self.push_password_suppress_config(0);
+    }
+
+    /// 按最近一次输入诊断（焦点 pid + InputScope 掩码）重算抑制态，**只降不升**：
+    /// 判定变成「不抑制」就立即解除；变成「抑制」则留给下一次诊断上报去置位。
+    ///
+    /// 为什么只降：不变量是 core.suppress ⊆ C++.suppress，而新开关值要经 push 管道异步到达
+    /// DLL。解除方向先于 DLL 生效是安全的（core 照常出字、DLL 还在放行）；置位方向若抢在
+    /// DLL 前面，就是「DLL 吃键、core 回 PassThrough」——密码框丢键。置位等 DLL 下一次上报
+    /// 诊断（那时它手里必然已有新值）再做，与此前全局开关只在关闭时立即清除同一口径。
+    pub(crate) fn relax_password_suppress_for_focus(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (pid, mask) = {
+            let d = self
+                .last_input_diag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (d.pid, d.mask)
+        };
+        let want =
+            crate::input_diag::is_password_scope(mask) && self.password_force_english_for_pid(pid);
+        if !want {
+            self.password_suppress.store(false, Relaxed);
+        }
     }
 
     /// 当前焦点进程名（小写，取自 `pid_names` 缓存）。未解析出进程时返回空串。
@@ -842,6 +882,35 @@ impl Coordinator {
         ]
     };
 
+    /// 从磁盘整表重载 `app_compat`（系统层 + 定制层 + 用户层，与启动时同一口径），并把
+    /// **所有**依赖这张表、又在别处缓存了结果的东西一并对齐。菜单写规则、拖动落盘等全部
+    /// 重载点都只许调这一个函数。
+    ///
+    /// ★ 为什么收成一处：重载拿到的是**整份文件的当前内容**，不只是本次菜单改的那一项。
+    /// 用户手写了 `password_force_english = false` 之后随便点一次别的菜单（甚至只是拖一下
+    /// 候选窗），服务端的判定就按新规则走了；若这里不重推，DLL 手里还是旧值 ⇒ 打破
+    /// core.suppress ⊆ C++.suppress ⇒ 密码框丢键。此前只有密码框那一项的菜单会重推。
+    ///
+    /// 对齐项（顺序有意义）：
+    /// 1. HostRender 白名单（Windows）；
+    /// 2. 当前焦点的密码框抑制态（只降不升，理由见 [`Self::relax_password_suppress_for_focus`]）；
+    /// 3. 逐客户端重推 DLL 的密码框吃键门控（与 2 出自同一判定函数）；
+    /// 4. 逐客户端重推英文自动配对配置（DLL 的 `_englishPairEngine` 只认推过去的值）。
+    ///
+    /// 3、4 是幂等的逐客户端推送，值没变时 DLL 收到同值，无副作用。
+    pub(crate) fn reload_app_compat(&self) {
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            self.compat_dirs.1.as_deref(),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
+        self.relax_password_suppress_for_focus();
+        self.push_password_suppress_config(0);
+        self.push_english_pair_config(0);
+    }
+
     /// 为当前焦点应用设置候选窗首显策略，并写入用户层 compat.toml。
     ///
     /// 三步收口，缺一不可：
@@ -876,13 +945,7 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）当前应用立即生效。
         self.active_compat
             .lock()
@@ -898,10 +961,10 @@ impl Coordinator {
     /// 为当前焦点应用设置符号自动配对开关，并写入用户层 compat.toml。
     /// `mode_id`：0=跟随全局（清除规则）1=启用 2=禁用。
     ///
-    /// 前三步与 [`Self::set_first_show_mode`] 完全同构，缺一不可，理由见那里的注释。
-    /// **第四步是本项特有**：还要把英文配对配置重推给 DLL——纯英文模式的配对由 C++ 侧
-    /// `_englishPairEngine` 独立处理，它只认握手/配置变更时推过去的那份值。不重推的症状是
-    /// 「中文模式关掉了，切到英文又配上了」，且要等下次重连才好，极难归因。
+    /// 三步与 [`Self::set_first_show_mode`] 完全同构，缺一不可，理由见那里的注释。
+    /// 英文配对配置的重推（纯英文模式的配对由 C++ 侧 `_englishPairEngine` 独立处理，它只认
+    /// 推过去的那份值）不在这里单做，收在 [`Self::reload_app_compat`]：任何一次整表重载都
+    /// 可能改变它（用户手写的 `auto_pair` 随别的菜单项一起生效）。
     pub(crate) fn set_auto_pair_rule(&self, mode_id: u8) {
         let enabled = match mode_id {
             1 => Some(true),
@@ -922,20 +985,12 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）。
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .auto_pair = enabled;
-        // 4）重推英文配对配置：逐客户端按各自 PID 现算，本进程拿到新值、别的进程不受影响。
-        self.push_english_pair_config(0);
         tracing::info!(
             "符号自动配对 for process={name}: {}",
             match enabled {
@@ -944,6 +999,211 @@ impl Coordinator {
                 None => "跟随全局",
             }
         );
+        self.show_status();
+    }
+
+    /// 为当前焦点应用设置「密码框强制英文」，并写入用户层 compat.toml（A2-37 / t197）。
+    /// `mode_id`：0=跟随全局（清除规则）1=开 2=关；认不出的编号按「跟随全局」处理。
+    ///
+    /// 两步与 [`Self::set_first_show_mode`] 同构（写盘 → 重载整表）。本项不进
+    /// `active_compat`：判定按 pid 直查规则表（`password_force_english_for_pid`），没有焦点槽
+    /// 缓存要刷。重算当前焦点的抑制态与逐客户端重推 DLL 的吃键门控收在
+    /// [`Self::reload_app_compat`]——任何一次整表重载都要做，不只是本项。
+    pub(crate) fn set_password_force_english_rule(&self, mode_id: u8) {
+        let enabled = match mode_id {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_password_force_english_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_password_force_english_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        if let Err(e) =
+            wind_config::app_compat::set_user_password_force_english(&user_dir, &name, enabled)
+        {
+            tracing::error!("set_password_force_english_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        // 2）重载整表；当前焦点的抑制态重算与逐客户端重推门控都在 `reload_app_compat` 里。
+        self.reload_app_compat();
+        tracing::info!(
+            "密码框强制英文 for process={name}: {}",
+            match enabled {
+                Some(true) => "开",
+                Some(false) => "关",
+                None => "跟随全局",
+            }
+        );
+        self.notify_toolbar();
+        self.show_status();
+    }
+
+    /// 写当前应用的气泡定位规则（方式 + 坐标）并重载规则表。**不弹 toast / 不弹气泡**：拖动
+    /// 落盘走这里，是高频手势（同 `save_candidate_pos_for_app`）。
+    fn write_status_position_rule(
+        &self,
+        name: &str,
+        mode: Option<wind_config::app_compat::StatusPositionMode>,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("status_position: 无用户配置目录，无法持久化 process={name}");
+            return false;
+        };
+        if let Err(e) =
+            wind_config::app_compat::set_user_status_position(&user_dir, name, mode, x, y)
+        {
+            tracing::error!("status_position: 写用户 compat.toml 失败: {e}");
+            return false;
+        }
+        self.reload_app_compat();
+        tracing::debug!(
+            "状态气泡定位 for process={name}: {} ({x},{y})",
+            mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
+        );
+        true
+    }
+
+    /// 为当前焦点应用设置状态气泡定位，并写入用户层 compat.toml（C2-33 / GH#148）。
+    /// `code`：0=跟随全局（清除规则）1=跟随光标 2=固定 3+i=`StatusAnchor::ALL[i]`；越界忽略。
+    ///
+    /// 模板同 [`Self::set_candidate_position_rule`]：写盘 → 重载整表。本项不进 `active_compat`
+    /// （`status_position` 按进程名现查），下次显示即用新策略。
+    ///
+    /// 「固定」取气泡**当前位置**：先把方式落成 fixed（坐标沿用规则里已有的，没有就是 0 哨兵
+    /// ——UI 落到光标所在屏），再请 UI 报当前位置，回来的 `StatusTipMoved` 经
+    /// `save_status_tip_pos` 覆盖成实际落点。气泡此刻不可见（多半如此，菜单是从工具栏/语言栏
+    /// 开的）时 UI 不回报，留在哨兵，拖一次即定——与候选窗按应用固定同一口径。
+    pub(crate) fn set_status_position_rule(&self, code: u8) {
+        use wind_config::app_compat::{StatusAnchor, StatusPositionMode as SP};
+        let mode = match code {
+            0 => None,
+            1 => Some(SP::FollowCaret),
+            2 => Some(SP::Fixed),
+            n => match StatusAnchor::ALL.get(n as usize - 3) {
+                Some(a) => Some(SP::Anchor(*a)),
+                None => {
+                    tracing::warn!("set_status_position_rule: 未知编号 {n}，忽略");
+                    return;
+                }
+            },
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_status_position_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let (x, y) = match self.rule_status_position(&name) {
+            Some((SP::Fixed, x, y)) => (x, y),
+            _ => (0, 0),
+        };
+        if !self.write_status_position_rule(&name, mode, x, y) {
+            return;
+        }
+        tracing::info!(
+            "状态气泡定位 for process={name}: {}",
+            mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
+        );
+        if mode == Some(SP::Fixed) {
+            let _ = self.ui_tx.send(UiCommand::ReportStatusTipPos);
+        }
+    }
+
+    /// 为当前焦点应用设置「坐标不可用时」气泡放哪，并写入用户层 compat.toml（C2-33 / GH#148）。
+    /// `code`：0=跟随全局（清除规则）1=上次位置 2=不显示 3+i=`StatusAnchor::ALL[i]`；越界忽略。
+    pub(crate) fn set_status_fallback_rule(&self, code: u8) {
+        use wind_config::app_compat::{StatusAnchor, StatusFallback as SF};
+        let fallback = match code {
+            0 => None,
+            1 => Some(SF::Last),
+            2 => Some(SF::Hide),
+            n => match StatusAnchor::ALL.get(n as usize - 3) {
+                Some(a) => Some(SF::Anchor(*a)),
+                None => {
+                    tracing::warn!("set_status_fallback_rule: 未知编号 {n}，忽略");
+                    return;
+                }
+            },
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_status_fallback_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_status_fallback_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        if let Err(e) =
+            wind_config::app_compat::set_user_status_fallback(&user_dir, &name, fallback)
+        {
+            tracing::error!("set_status_fallback_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        self.reload_app_compat();
+        tracing::info!(
+            "状态气泡兜底位置 for process={name}: {}",
+            fallback.map(|f| f.as_config()).unwrap_or("(follow-global)")
+        );
+    }
+
+    /// 为当前焦点应用设置输入方案，并写入用户层 compat.toml（C0-7 / C3-3，GH#80）。
+    /// `code`：0=跟随全局（清除规则）1=记住上次（`@remember`）2+i=固定为可用方案表第 i 个；
+    /// 越界的下标忽略（菜单构建与点击之间 available 被热重载缩短了）。
+    ///
+    /// 模板同 [`Self::set_initial_state_rule`]：写盘 → 重载整表 → 当场对当前焦点生效一次。
+    /// 本项不进 `active_compat`（规则按进程名现查，见 `app_schema_rule`），没有焦点槽要刷。
+    ///
+    /// 「记住上次」且记忆表里还没有这个应用时，先把**当前方案**记进去：否则目标回落全局，
+    /// 用户刚点完菜单，正在用的方案就被切走了——而他选的恰恰是「记住（我现在用的）」。
+    pub(crate) fn set_app_schema_rule(&self, code: u16) {
+        let value = match code {
+            0 => None,
+            1 => Some(wind_config::app_compat::APP_SCHEMA_REMEMBER.to_string()),
+            n => {
+                let list = self.engine_mgr.available_schemas();
+                match list.get(usize::from(n - 2)) {
+                    Some(id) => Some(id.clone()),
+                    None => {
+                        tracing::warn!("set_app_schema_rule: 方案下标 {} 越界，忽略", n - 2);
+                        return;
+                    }
+                }
+            }
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_app_schema_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_app_schema_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        // 1）写用户层 compat.toml。
+        if let Err(e) = wind_config::app_compat::set_user_schema(&user_dir, &name, value.clone()) {
+            tracing::error!("set_app_schema_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
+        self.reload_app_compat();
+        // 3）当场对当前焦点生效一次（按新规则算目标方案，不同就轻量切换）。
+        if code == 1 && !self.has_remembered_schema(&name) {
+            self.remember_app_schema(&name, &self.engine_mgr.active_schema_id());
+        }
+        self.apply_app_schema_on_focus(&name);
+        tracing::info!(
+            "应用独立方案 for process={name}: {}",
+            value.as_deref().unwrap_or("(follow-global)")
+        );
+        self.notify_toolbar();
         self.show_status();
     }
 
@@ -983,13 +1243,7 @@ impl Coordinator {
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
-        let reloaded = wind_config::app_compat::AppCompat::load(
-            self.compat_dirs.0.as_deref(),
-            Some(user_dir.as_path()),
-        );
-        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
-        #[cfg(windows)]
-        self.sync_host_render_whitelist();
+        self.reload_app_compat();
         // 3）刷新 active 缓存的判据位：同 pid 时 update_active_compat 提前 return，不会自己刷。
         //    漏掉这步会让「切出本应用时是否重算」用上过期的判据。
         //    注意先取值再持 active_compat 锁，避免与 app_compat 锁形成嵌套顺序。
@@ -1353,12 +1607,16 @@ impl Coordinator {
             use wind_config::app_compat::InitialMode as IM;
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
-            let (cur_cand_pos, cur_ignore_close) = {
+            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) = {
                 let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
                 let rule = table.get_rule(&proc);
                 (
                     rule.and_then(|r| r.candidate_position_mode),
                     rule.and_then(|r| r.ignore_host_ime_close),
+                    rule.and_then(|r| r.password_force_english),
+                    rule.and_then(|r| r.schema.clone()),
+                    rule.and_then(|r| r.status_position_mode),
+                    rule.and_then(|r| r.status_fallback_position),
                 )
             };
             let cur_first_show = self.rule_first_show_mode(&proc);
@@ -1383,11 +1641,116 @@ impl Coordinator {
                     M::leaf("中文", cmd(mk(2)), enabled, cur == Some(IM::Chinese)),
                 ]
             };
+            // 方案：跟随全局 / 记住上次 / ── / 各可用方案（选中即固定）。勾选看的是**规则**
+            // 而非当前活跃方案——「固定五笔」的应用里临时手切到拼音，勾仍在五笔上。
+            // 固定的 id 不在 available 时协调器按未配置处理，这里同样勾「跟随全局」。
+            let app_schema_children = {
+                use wind_config::app_compat::APP_SCHEMA_REMEMBER;
+                let schemas = self.engine_mgr.available_schemas();
+                let remember = cur_schema.as_deref() == Some(APP_SCHEMA_REMEMBER);
+                let fixed = cur_schema
+                    .as_ref()
+                    .filter(|id| schemas.contains(id))
+                    .cloned();
+                let mut v = vec![
+                    M::leaf(
+                        "跟随全局（默认）",
+                        cmd(MenuCmd::AppSchemaRule(0)),
+                        enabled,
+                        !remember && fixed.is_none(),
+                    ),
+                    M::leaf(
+                        "记住上次",
+                        cmd(MenuCmd::AppSchemaRule(1)),
+                        enabled,
+                        remember,
+                    ),
+                    M::separator(),
+                ];
+                for (i, id) in schemas.iter().enumerate() {
+                    v.push(M::leaf(
+                        self.engine_mgr.schema_name(id),
+                        cmd(MenuCmd::AppSchemaRule(i as u16 + 2)),
+                        enabled,
+                        fixed.as_deref() == Some(id.as_str()),
+                    ));
+                }
+                v
+            };
+            // 状态提示位置：跟随全局 / 跟随光标 / 固定 / ── / 各锚点 / 子菜单「坐标不可用时」。
+            // 勾选看**规则**（不是生效值），「跟随全局」独立一档，理由见上面 `tri`。
+            let status_children = {
+                use wind_config::app_compat::{
+                    StatusAnchor, StatusFallback as SF, StatusPositionMode as SP,
+                };
+                let mut v = vec![
+                    M::leaf(
+                        "跟随全局",
+                        cmd(MenuCmd::StatusPositionRule(0)),
+                        enabled,
+                        cur_status.is_none(),
+                    ),
+                    M::leaf(
+                        "跟随光标",
+                        cmd(MenuCmd::StatusPositionRule(1)),
+                        enabled,
+                        cur_status == Some(SP::FollowCaret),
+                    ),
+                    M::leaf(
+                        "固定（取当前位置）",
+                        cmd(MenuCmd::StatusPositionRule(2)),
+                        enabled,
+                        cur_status == Some(SP::Fixed),
+                    ),
+                    M::separator(),
+                ];
+                for (i, a) in StatusAnchor::ALL.iter().enumerate() {
+                    v.push(M::leaf(
+                        status_anchor_label(*a),
+                        cmd(MenuCmd::StatusPositionRule(i as u8 + 3)),
+                        enabled,
+                        cur_status == Some(SP::Anchor(*a)),
+                    ));
+                }
+                let mut fb = vec![
+                    M::leaf(
+                        "跟随全局",
+                        cmd(MenuCmd::StatusFallbackRule(0)),
+                        enabled,
+                        cur_status_fb.is_none(),
+                    ),
+                    M::leaf(
+                        "上次位置",
+                        cmd(MenuCmd::StatusFallbackRule(1)),
+                        enabled,
+                        cur_status_fb == Some(SF::Last),
+                    ),
+                    M::leaf(
+                        "不显示",
+                        cmd(MenuCmd::StatusFallbackRule(2)),
+                        enabled,
+                        cur_status_fb == Some(SF::Hide),
+                    ),
+                    M::separator(),
+                ];
+                for (i, a) in StatusAnchor::ALL.iter().enumerate() {
+                    fb.push(M::leaf(
+                        status_anchor_label(*a),
+                        cmd(MenuCmd::StatusFallbackRule(i as u8 + 3)),
+                        enabled,
+                        cur_status_fb == Some(SF::Anchor(*a)),
+                    ));
+                }
+                v.push(M::separator());
+                v.push(M::submenu("坐标不可用时", fb));
+                v
+            };
             vec![
                 M::label(header),
                 M::separator(),
                 M::submenu("初始输入模式", tri(cur_mode, MenuCmd::InitialMode)),
                 M::submenu("初始标点模式", tri(cur_punct, MenuCmd::InitialPunct)),
+                M::submenu("方案", app_schema_children),
                 M::separator(),
                 // 三档**互斥**，做成子菜单单选：布尔开关时代它们能同时打开，实测就因此出过
                 // 「fast 配了却从未生效」——instant 抢先放行，fast 的判据根本没机会跑。
@@ -1441,6 +1804,7 @@ impl Coordinator {
                 // 「固定位置」给 caret 坐标本就报不准的宿主。位置**不在这里选**——切到固定
                 // 档只是打开它，落点由用户拖一次候选窗定下（存进该应用自己的规则）。
                 // 与全局那个开关同一决策：业界（搜狗、Google 拼音）也只给开关不给坐标框。
+                M::submenu("状态提示位置", status_children),
                 M::submenu(
                     "候选窗定位",
                     vec![
@@ -1493,6 +1857,31 @@ impl Coordinator {
                             cmd(MenuCmd::IgnoreHostImeCloseRule(2)),
                             enabled,
                             cur_ignore_close == Some(false),
+                        ),
+                    ],
+                ),
+                // 给「宿主把普通输入框误报成密码框」的应用单独关掉（全局照旧保护真密码框），
+                // 或在全局关掉时只给某个应用开。「跟随全局」独立一档，理由见上面 `tri`。
+                M::submenu(
+                    "密码框强制英文",
+                    vec![
+                        M::leaf(
+                            "跟随全局",
+                            cmd(MenuCmd::PasswordForceEnglishRule(0)),
+                            enabled,
+                            cur_pfe.is_none(),
+                        ),
+                        M::leaf(
+                            "开",
+                            cmd(MenuCmd::PasswordForceEnglishRule(1)),
+                            enabled,
+                            cur_pfe == Some(true),
+                        ),
+                        M::leaf(
+                            "关",
+                            cmd(MenuCmd::PasswordForceEnglishRule(2)),
+                            enabled,
+                            cur_pfe == Some(false),
                         ),
                     ],
                 ),
@@ -2598,6 +2987,20 @@ pub(crate) fn focus_monitor() -> Option<MonitorInfo> {
 /// 返回 None 表示无法确定用户目录（portable 模式但找不到 exe 路径等极罕见情况）。
 fn screenshots_dir() -> Option<String> {
     Config::user_config_dir().map(|d| d.join("screenshots").display().to_string())
+}
+
+/// 状态气泡锚点的菜单文案。
+fn status_anchor_label(a: wind_config::app_compat::StatusAnchor) -> &'static str {
+    use wind_config::app_compat::StatusAnchor as A;
+    match a {
+        A::ScreenCenter => "屏幕中央",
+        A::ScreenTopLeft => "屏幕左上角",
+        A::ScreenTopRight => "屏幕右上角",
+        A::ScreenBottomLeft => "屏幕左下角",
+        A::ScreenBottomRight => "屏幕右下角",
+        A::WindowCenter => "窗口中央",
+        A::WindowBottomLeft => "窗口左下角",
+    }
 }
 
 /// 固定位置落盘前的哨兵规避（候选窗与状态气泡共用）。

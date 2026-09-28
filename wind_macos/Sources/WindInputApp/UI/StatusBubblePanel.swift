@@ -128,8 +128,13 @@ final class StatusBubblePanel: NSPanel {
         return (p.x, p.y)
     }
 
+    /// 锚点距屏幕可见区边缘的留白 (pt)。与 Windows 侧 `ANCHOR_MARGIN_DP` 同值。
+    private let anchorMargin: CGFloat = 16
+
     /// 显示气泡。x/y 为 caret 屏幕坐标 (wire top-left, y 向下); durationMs>0 时到点自动隐藏。
-    func show(text: String, bgHex: String, fgHex: String, wireX: Int32, wireY: Int32, durationMs: Int32) {
+    /// `anchor` 非 0 时按锚点落位 (见 `StatusAnchor`), x/y 只作选屏的次选参考。
+    func show(text: String, bgHex: String, fgHex: String, wireX: Int32, wireY: Int32, durationMs: Int32,
+              anchor: Int32 = 0) {
         guard !text.isEmpty else { hidePanel(); return }
         hideTimer?.invalidate()
         lastDurationMs = durationMs
@@ -148,6 +153,23 @@ final class StatusBubblePanel: NSPanel {
         let h = ceil(textSize.height) + vPad * 2
         label.frame = NSRect(x: hPad, y: vPad, width: ceil(textSize.width), height: ceil(textSize.height))
         setContentSize(NSSize(width: w, height: h))
+
+        if let a = StatusAnchor(rawValue: anchor), a != .none {
+            // 窗口锚点: IMK 的 client (IMKTextInput) 只给字符矩形, 拿不到宿主窗口的 frame,
+            // 故降级为同位置的屏幕锚点 (window_center → screen_center,
+            // window_bottom_left → screen_bottom_left)。设计稿「④ 几何」一节注明了这条降级。
+            let eff = a.screenEquivalent
+            guard let screen = PanelGeometry.anchorScreen(wireX: CGFloat(wireX), wireY: CGFloat(wireY)) else {
+                orderFrontRegardless(); armHideTimer(durationMs); return
+            }
+            let vf = screen.visibleFrame
+            let size = NSSize(width: w, height: h)
+            let o = WireGeometry.anchorOrigin(anchor: eff, target: vf, size: size, margin: anchorMargin)
+            setFrameOrigin(WireGeometry.clamp(origin: o, size: size, visibleFrame: vf))
+            orderFrontRegardless()
+            armHideTimer(durationMs)
+            return
+        }
 
         guard let screen = PanelGeometry.referenceScreen else {
             orderFrontRegardless(); return

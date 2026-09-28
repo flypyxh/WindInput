@@ -357,9 +357,11 @@ pub trait WebDataRpc: WebDataHost {
             "schema.layouts" => self.web_schema_layouts(),
             "schema.active" => Ok(json!({ "id": self.engine_mgr().active_schema_id() })),
             "schema.setActive" => {
-                let ok = self.engine_mgr().switch_schema(str_param(params, "id")?);
+                let id = str_param(params, "id")?;
+                let ok = self.engine_mgr().switch_schema(id);
                 if ok {
                     self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换
+                    self.note_global_schema_set(id); // 设置页是全局意图：按应用方案的全局方案跟随
                     // 注释库不随方案变化，见 `Coordinator::sync_comment_dicts`。
                 }
                 Ok(json!({ "ok": ok }))

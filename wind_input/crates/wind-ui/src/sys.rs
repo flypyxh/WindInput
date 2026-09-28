@@ -230,9 +230,8 @@ fn clamp_content_in_bounds(
 /// **钳制有损且不可逆**：拿错误的 `w/h` 钳一次，正确坐标就再也回不来了（见本模块测试
 /// `stale_size_destroys_a_flush_corner_position`）。
 ///
-/// 非 Windows 下唯一的调用者是本模块的测试，理由同 [`clamp_content_in_bounds`]。
-#[cfg_attr(not(windows), allow(dead_code))]
-fn clamp_rect_in_bounds(
+/// 也是状态气泡锚点落点（`status_tip::place_anchor`）的夹回步骤。
+pub(crate) fn clamp_rect_in_bounds(
     x: i32,
     y: i32,
     w: u32,
@@ -289,6 +288,31 @@ pub fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
         }
     }
     (x, y)
+}
+
+/// 给定屏幕坐标所在显示器（`MONITOR_DEFAULTTONEAREST`）的工作区 `(left, top, right, bottom)`。
+/// 与 [`clamp_to_work_area`] 同源；非 Windows 恒 `None`。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn work_area_at(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT { x, y };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                return Some((wa.left, wa.top, wa.right, wa.bottom));
+            }
+        }
+    }
+    None
 }
 
 /// 给定屏幕坐标所在显示器的工作区宽度（设备 px），供候选窗内容宽度的「屏幕安全上限」使用——

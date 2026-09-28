@@ -321,54 +321,89 @@ impl Coordinator {
 
 // ———————————————— 首显兜底 timer（进程内共享单线程）————————————————
 
-/// 首显兜底的共享定时器：只保留**最近一次** arm 的待触发任务。
+/// 一条待办：`(到期时刻, token, 协调器弱引用)`。
+type TimerEntry = (std::time::Instant, u64, std::sync::Weak<Coordinator>);
+
+/// 覆盖式定时器：**每个协调器**只保留最近一次 arm 的待触发任务。首显兜底与焦点气泡的锚点
+/// 超时（`status_placement`）各用一个实例，互不顶替——两者的待办同时存在是常态。
+///
+/// 按协调器分槽（`Weak::ptr_eq`）而不是全进程一个槽：生产里只有一个协调器，两者等价；但
+/// 同进程多个协调器（并行跑的测试）共用一个槽时，后 arm 的会把别人的待办顶掉，那边的超时
+/// 就永远不来。
 ///
 /// 此前每次 arm 都 `thread::spawn` 一个线程去 `sleep`，靠 token 让被取代的那些醒来后自行
 /// 放弃——日志实测一小时创建两千余个线程。既然 token 已经保证「只有最新一次有效」，被作废
-/// 的任务就没有理由继续占着线程；改成覆盖式待办后语义反而更直白：待办本身只有一个。
+/// 的任务就没有理由继续占着线程；改成覆盖式待办后语义反而更直白：每个协调器至多一条待办。
 ///
 /// 本线程只做「等到点 + 回调」，**绝不在此执行可能阻塞的调用**（如前台窗口探测）——
 /// 一次慢调用就会拖垮兜底的 150ms 时限。需要后台跑阻塞探测的场景另行处理。
-struct FirstShowTimer {
-    /// `(到期时刻, token, 协调器弱引用)`；`None` = 空闲。
-    pending: Mutex<Option<(std::time::Instant, u64, std::sync::Weak<Coordinator>)>>,
+struct OneShotTimer {
+    /// 各协调器的待办（每个协调器至多一条）；空 = 空闲。
+    pending: Mutex<Vec<TimerEntry>>,
     cv: std::sync::Condvar,
+    /// 到期回调（token 校验由回调自己做）。
+    fire: fn(&Coordinator, u64),
 }
 
-static FIRST_SHOW_TIMER: std::sync::OnceLock<Arc<FirstShowTimer>> = std::sync::OnceLock::new();
+static FIRST_SHOW_TIMER: std::sync::OnceLock<Arc<OneShotTimer>> = std::sync::OnceLock::new();
+static FOCUS_TIP_TIMER: std::sync::OnceLock<Arc<OneShotTimer>> = std::sync::OnceLock::new();
 
-/// 取共享定时器，首次调用时懒启动其线程。
-fn first_show_timer() -> &'static Arc<FirstShowTimer> {
-    FIRST_SHOW_TIMER.get_or_init(|| {
-        let timer = Arc::new(FirstShowTimer {
-            pending: Mutex::new(None),
-            cv: std::sync::Condvar::new(),
-        });
-        let worker = timer.clone();
-        let _ = std::thread::Builder::new()
-            .name("first-show-timer".into())
-            .spawn(move || worker.run());
-        timer
-    })
+/// 懒启动一个定时器线程。
+fn spawn_timer(name: &str, fire: fn(&Coordinator, u64)) -> Arc<OneShotTimer> {
+    let timer = Arc::new(OneShotTimer {
+        pending: Mutex::new(Vec::new()),
+        cv: std::sync::Condvar::new(),
+        fire,
+    });
+    let worker = timer.clone();
+    let _ = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || worker.run());
+    timer
 }
 
-impl FirstShowTimer {
-    /// 覆盖式登记：新的 arm 直接顶掉旧的（与原先"旧线程靠 token 自行作废"等价）。
+/// 取首显兜底的共享定时器，首次调用时懒启动其线程。
+fn first_show_timer() -> &'static Arc<OneShotTimer> {
+    FIRST_SHOW_TIMER
+        .get_or_init(|| spawn_timer("first-show-timer", Coordinator::fire_pending_first_show))
+}
+
+/// 焦点气泡锚点超时的登记入口（`status_placement` 用）：到期回调
+/// [`Coordinator::fire_focus_tip_timeout`]。
+pub(super) fn arm_focus_tip_timer(
+    deadline: std::time::Instant,
+    token: u64,
+    coord: std::sync::Weak<Coordinator>,
+) {
+    FOCUS_TIP_TIMER
+        .get_or_init(|| spawn_timer("focus-tip-timer", Coordinator::fire_focus_tip_timeout))
+        .arm(deadline, token, coord);
+}
+
+impl OneShotTimer {
+    /// 覆盖式登记：同一协调器新的 arm 直接顶掉它旧的那条（与原先"旧线程靠 token 自行作废"
+    /// 等价）；别的协调器的待办不受影响。
     fn arm(&self, deadline: std::time::Instant, token: u64, coord: std::sync::Weak<Coordinator>) {
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some((deadline, token, coord));
+        let mut g = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|(_, _, w)| !w.ptr_eq(&coord));
+        g.push((deadline, token, coord));
+        drop(g);
         self.cv.notify_one();
     }
 
     fn run(&self) {
         let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let deadline = match guard.as_ref() {
-                Some((d, _, _)) => *d,
-                None => {
-                    // 空闲：睡到下一次 arm
-                    guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-                    continue;
-                }
+            // 最早到期的那条
+            let Some((idx, deadline)) = guard
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (d, _, _))| *d)
+                .map(|(i, (d, _, _))| (i, *d))
+            else {
+                // 空闲：睡到下一次 arm
+                guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                continue;
             };
             let now = std::time::Instant::now();
             if now < deadline {
@@ -380,13 +415,11 @@ impl FirstShowTimer {
                 guard = g;
                 continue;
             }
-            let Some((_, token, coord)) = guard.take() else {
-                continue;
-            };
+            let (_, token, coord) = guard.swap_remove(idx);
             // 回调期间释放锁，否则回调里若触发新的 arm 会自锁
             drop(guard);
             if let Some(c) = coord.upgrade() {
-                c.fire_pending_first_show(token);
+                (self.fire)(&c, token);
             }
             guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         }
@@ -398,10 +431,11 @@ mod first_show_timer_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn idle_timer() -> FirstShowTimer {
-        FirstShowTimer {
-            pending: Mutex::new(None),
+    fn idle_timer() -> OneShotTimer {
+        OneShotTimer {
+            pending: Mutex::new(Vec::new()),
             cv: std::sync::Condvar::new(),
+            fire: |_, _| {},
         }
     }
 
@@ -418,13 +452,30 @@ mod first_show_timer_tests {
         t.arm(base + Duration::from_secs(30), 3, dead);
 
         let g = t.pending.lock().unwrap();
-        let (deadline, token, _) = g.as_ref().expect("应有待办");
+        assert_eq!(g.len(), 1, "同一协调器只应有一条待办");
+        let (deadline, token, _) = &g[0];
         assert_eq!(*token, 3, "只应保留最近一次 arm 的 token");
         assert_eq!(
             *deadline,
             base + Duration::from_secs(30),
             "到期时刻也应随最近一次 arm 更新"
         );
+    }
+
+    /// 按协调器分槽：别的协调器的 arm 不得顶掉这一个的待办（并行测试里就是这么丢超时的）。
+    #[test]
+    fn arm_keeps_other_coordinators_pending() {
+        let t = idle_timer();
+        let a = Coordinator::new_headless(Config::default(), None);
+        let b = Coordinator::new_headless(Config::default(), None);
+        let base = Instant::now();
+        t.arm(base + Duration::from_secs(10), 1, Arc::downgrade(&a));
+        t.arm(base + Duration::from_secs(20), 2, Arc::downgrade(&b));
+        t.arm(base + Duration::from_secs(30), 3, Arc::downgrade(&a));
+        let g = t.pending.lock().unwrap();
+        let mut tokens: Vec<u64> = g.iter().map(|(_, tok, _)| *tok).collect();
+        tokens.sort();
+        assert_eq!(tokens, vec![2, 3], "a 的旧待办被 a 自己顶掉，b 的保留");
     }
 
     /// 线程真的会在到期后回调；且协调器已释放时安全跳过（不 panic）。
@@ -442,6 +493,6 @@ mod first_show_timer_tests {
 
         // 到期后待办应被取走（说明线程确实醒来处理了），且不 panic
         std::thread::sleep(Duration::from_millis(200));
-        assert!(t.pending.lock().unwrap().is_none(), "到期后待办应已被消费");
+        assert!(t.pending.lock().unwrap().is_empty(), "到期后待办应已被消费");
     }
 }
