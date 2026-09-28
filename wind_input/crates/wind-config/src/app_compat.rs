@@ -446,6 +446,25 @@ pub struct AppCompatRule {
     /// （纯英文模式由 C++ `_englishPairEngine` 独立处理，协调器根本收不到那些键）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_pair: Option<bool>,
+    /// 该应用的密码框是否强制英文；`None` = 跟随全局 `input.password_force_english`（A2-37 / t197）。
+    ///
+    /// 典型用途是「宿主把普通输入框误报成密码框」：全局开着保护真密码框，只对误报的那个
+    /// 应用关掉；反过来也可以在全局关掉时只给某个应用开。
+    ///
+    /// **必须是 `Option`**（理由同 `initial_mode`）：`None` 与「显式配了恰好等于全局的值」
+    /// 是两件事，后者不随全局开关变。用户偏好 ⇒ **不进** [`ProtocolFields`]。
+    ///
+    /// ★ 消费点必须只有一个判定函数（协调器 `password_force_english_for_pid`）：服务端的
+    /// 抑制态与推给 DLL 的吃键门控出自同一处，否则 core.suppress ⊄ C++.suppress ⇒ 密码框丢键。
+    ///
+    /// 类型写错（`"yes"` / `1`）只让本字段回落 `None`：compat.toml 没有段级降级，
+    /// 不容错就是整份文件静默失效，见 [`crate::tolerant_de::tolerant_opt_bool`]。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub password_force_english: Option<bool>,
     /// 该应用的智能符号替换方案；`None` = 沿用全局 `input.symbol.smart_method`。
     ///
     /// `DeleteReplace`（全局默认）依赖对宿主做删改，在 Tabby 一类终端上会出严重错误；
@@ -668,6 +687,15 @@ pub fn set_auto_pair(rules: &mut Vec<AppCompatRule>, process: &str, enabled: Opt
     upsert_rule(rules, process, |r| r.auto_pair = enabled);
 }
 
+/// 在一组规则上设置指定进程的密码框强制英文（`None` = 清除规则，回到跟随全局）。
+pub fn set_password_force_english(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    enabled: Option<bool>,
+) {
+    upsert_rule(rules, process, |r| r.password_force_english = enabled);
+}
+
 /// 在一组规则上设置指定进程的智能符号替换方案（`None` = 清除规则，回到跟随全局）。
 pub fn set_smart_method(
     rules: &mut Vec<AppCompatRule>,
@@ -793,6 +821,15 @@ pub fn set_user_auto_pair(
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
     update_user_rule(user_dir, process, |r| r.auto_pair = enabled)
+}
+
+/// 设置用户层 compat.toml 中指定进程的密码框强制英文（`None` = 清除规则）。
+pub fn set_user_password_force_english(
+    user_dir: &Path,
+    process: &str,
+    enabled: Option<bool>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.password_force_english = enabled)
 }
 
 /// 设置用户层 compat.toml 中指定进程的候选窗定位方式（`None` = 清除规则，含坐标）。
@@ -1731,6 +1768,119 @@ mod tests {
 
         let qq = compat.get_rule("qq.exe").unwrap();
         assert_eq!(qq.composition_start_pair_guard, Some(true));
+    }
+
+    /// `password_force_english` 三态解析：未配 = `None`（跟随全局），显式 true/false 原样保留。
+    #[test]
+    fn parse_password_force_english_tristate() {
+        let toml = r#"
+            [[apps]]
+            process = "misreport.exe"
+            password_force_english = false
+
+            [[apps]]
+            process = "strict.exe"
+            password_force_english = true
+
+            [[apps]]
+            process = "plain.exe"
+            caret_use_top = true
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps);
+        assert_eq!(
+            compat
+                .get_rule("MISREPORT.EXE")
+                .unwrap()
+                .password_force_english,
+            Some(false)
+        );
+        assert_eq!(
+            compat
+                .get_rule("strict.exe")
+                .unwrap()
+                .password_force_english,
+            Some(true)
+        );
+        assert_eq!(
+            compat.get_rule("plain.exe").unwrap().password_force_english,
+            None,
+            "未配 = 跟随全局，不能被 bool 默认值污染"
+        );
+    }
+
+    /// 类型写错只让本字段回落 `None`，**不得让整份 compat.toml 失效**：`load_file` 没有
+    /// 段级降级，一个 `"yes"` 就会连带所有应用的所有规则静默消失。
+    #[test]
+    fn password_force_english_wrong_type_does_not_sink_the_file() {
+        for bad in [r#""yes""#, "1", "[true]"] {
+            let toml = format!(
+                r#"
+                [[apps]]
+                process = "typo.exe"
+                password_force_english = {bad}
+
+                [[apps]]
+                process = "other.exe"
+                auto_pair = false
+                "#
+            );
+            let file = toml::from_str::<AppCompatFile>(&toml)
+                .unwrap_or_else(|e| panic!("{bad}: 类型写错不得让整份失败：{e}"));
+            let compat = AppCompat::from_rules(file.apps);
+            assert_eq!(
+                compat.get_rule("typo.exe").unwrap().password_force_english,
+                None,
+                "{bad}: 认不出 = 没配过"
+            );
+            assert_eq!(
+                compat.get_rule("other.exe").unwrap().auto_pair,
+                Some(false),
+                "{bad}: 同文件其它规则必须照常生效"
+            );
+        }
+    }
+
+    /// 写回稀疏：显式值落盘，清除后整键消失（而不是写成 `= true`）。
+    #[test]
+    fn password_force_english_writeback_is_sparse() {
+        let mut rules = Vec::new();
+        set_password_force_english(&mut rules, "Misreport.exe", Some(false));
+        let out = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(out.contains("password_force_english = false"), "{out}");
+
+        set_password_force_english(&mut rules, "MISREPORT.EXE", Some(true));
+        assert_eq!(rules.len(), 1, "进程名不区分大小写，应改同一条");
+        assert_eq!(rules[0].password_force_english, Some(true));
+
+        set_password_force_english(&mut rules, "misreport.exe", None);
+        let cleared = render_user_compat(&rules, &[], &[]).unwrap();
+        assert!(
+            !cleared.contains("password_force_english"),
+            "清除后不应残留该键: {cleared}"
+        );
+    }
+
+    /// 落盘包装往返：写入后 `AppCompat::load` 读得回；清回「跟随全局」后空壳规则被剔除。
+    #[test]
+    fn set_user_password_force_english_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wind_compat_pfe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        set_user_password_force_english(&dir, "misreport.exe", Some(false)).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert_eq!(
+            compat
+                .get_rule("misreport.exe")
+                .and_then(|r| r.password_force_english),
+            Some(false)
+        );
+
+        set_user_password_force_english(&dir, "misreport.exe", None).unwrap();
+        let compat = AppCompat::load(None, Some(&dir));
+        assert!(
+            compat.get_rule("misreport.exe").is_none(),
+            "只剩 process 的空壳规则应被剔除"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 写回只落被触碰的字段，且 `None`/0 不进 TOML（`skip_serializing_if`）——

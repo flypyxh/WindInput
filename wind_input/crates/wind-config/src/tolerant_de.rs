@@ -131,6 +131,28 @@ where
     }
 }
 
+/// 容错反序列化 `Option<bool>`：非布尔值（`"yes"`、`1`）回落 **`None`** 并 WARN。
+///
+/// ⚠️ 这是模块头部「只治字符串写错，不治类型写错」的**唯一例外**，只给没有段级降级的
+/// 载体用（`compat.toml`：`load_file` 解析失败即整份丢弃）。在那里，类型错并没有下一层
+/// 兜底可交——不在字段上吞掉，就是所有应用的所有规则一起静默失效。
+/// 回落 `None` 而非 `Some(false)`，理由同 [`tolerant_opt`]：认不出 = 没配过。
+pub fn tolerant_opt_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<toml::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(toml::Value::Boolean(b)) => Ok(Some(b)),
+        Some(other) => {
+            let raw = other.to_string();
+            warn!("配置值 {raw} 不是布尔值（true / false），本项按「未设置」处理");
+            record_fallback(&raw);
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +206,34 @@ mod tests {
     #[test]
     fn wrong_type_still_errors() {
         assert!(toml::from_str::<Holder>("v = 3").is_err());
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct OptBoolHolder {
+        #[serde(default, deserialize_with = "tolerant_opt_bool")]
+        v: Option<bool>,
+        #[serde(default)]
+        other: i32,
+    }
+
+    #[test]
+    fn opt_bool_keeps_booleans_and_absence() {
+        let h: OptBoolHolder = toml::from_str("v = false").unwrap();
+        assert_eq!(h.v, Some(false));
+        let h: OptBoolHolder = toml::from_str("v = true").unwrap();
+        assert_eq!(h.v, Some(true));
+        let h: OptBoolHolder = toml::from_str("other = 1").unwrap();
+        assert_eq!(h.v, None);
+    }
+
+    /// 非布尔值回落 `None`（= 没配过），且不牵连同表其它字段。
+    #[test]
+    fn opt_bool_non_boolean_falls_back_to_none() {
+        for bad in [r#""yes""#, "1", "1.5", "[true]", "{ a = 1 }"] {
+            let h: OptBoolHolder = toml::from_str(&format!("v = {bad}\nother = 7"))
+                .unwrap_or_else(|e| panic!("{bad}: 不得整份失败：{e}"));
+            assert_eq!(h.v, None, "{bad}");
+            assert_eq!(h.other, 7, "{bad}: 同表其它字段照常");
+        }
     }
 }
