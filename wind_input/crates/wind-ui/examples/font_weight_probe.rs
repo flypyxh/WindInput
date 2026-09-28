@@ -91,7 +91,12 @@ fn main() {
             let mut buf = vec![255u8; (bw * bh * 4) as usize];
             let ink = match tr.draw(&mut buf, bw, bh, 4.0, 8.0, &text, &ts, [0, 0, 0, 255]) {
                 Ok(()) => {
-                    let s: u64 = buf.chunks_exact(4).map(|p| 255 - p[1] as u64).sum();
+                    let s: u64 = buf
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|p| 255 - p[1] as u64)
+                        .sum();
                     format!("{:.0}", s as f64 / 255.0)
                 }
                 Err(e) => format!("失败：{e}"),

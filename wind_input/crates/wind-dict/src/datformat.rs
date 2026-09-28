@@ -313,12 +313,11 @@ const POOL_INITIAL_SLOTS: usize = 1024;
 fn pool_hash(bytes: &[u8]) -> u64 {
     const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
     let mut h: u64 = 0;
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        let v = u64::from_le_bytes(c.try_into().expect("chunks_exact(8)"));
+    let (chunks, rest) = bytes.as_chunks::<8>();
+    for c in chunks {
+        let v = u64::from_le_bytes(*c);
         h = (h.rotate_left(5) ^ v).wrapping_mul(SEED);
     }
-    let rest = chunks.remainder();
     if !rest.is_empty() {
         let mut b = [0u8; 8];
         b[..rest.len()].copy_from_slice(rest);

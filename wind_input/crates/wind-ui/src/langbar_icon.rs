@@ -2595,7 +2595,12 @@ mod tests {
 
     /// 取整张图 alpha 最大的那个像素的 BGR（非预乘，即该处的实际颜色）。
     fn densest_bgr(buf: &[u8]) -> [u8; 3] {
-        let px = buf.chunks_exact(4).max_by_key(|p| p[3]).expect("空图");
+        let px = buf
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .max_by_key(|p| p[3])
+            .expect("空图");
         assert!(px[3] > 0, "整张图没有任何墨迹");
         [px[0], px[1], px[2]]
     }
