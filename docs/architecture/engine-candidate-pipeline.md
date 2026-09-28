@@ -240,7 +240,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 | ②c **残码整句** | 尾部残码作为**待定音节**入图（`add_partial_final_nodes`），Viterbi 选最优单字：`buzhidaok`→「不知道**看**」。在**含残码的整串**上重建图——step ② 的 `nodes` 只到 `completed.len()+1`，残码末端没有槽位。对齐 librime `enable_completion` / fcitx5 不完整拼音。门槛：≥2 完整音节、非双拼、非分隔符、**非混输**（`enable_partial_final`） | `is_sentence` + `is_sentence_unanchored` |
 | ③ DAG 子短语 | 前 6 音节的各前缀子段查词（分段上屏候选） | `is_partial` |
 | ④ 前缀补全 | `search_prefix(query, 30)` | `is_prefix` |
-| — | **用户词入词图（S2）**：②/②b/②c 三条建图通路在 `build` 之后各追加一次 `add_store_nodes`，由 `schema.pinyin.sentence_uses_user_words` 把关（**出厂 false**）。全拼降级支路刻意不接 | 见下方说明 |
+| — | **用户词入词图（S2）**：②/②b/②c 三条建图通路在 `build` 之后各追加一次 `add_store_nodes`，由 `schema.pinyin.sentence_uses_user_words` 把关（**出厂 true**，2026-09-28 起；只在 `use_smart_compose` 开着时有效）。全拼降级支路刻意不接 | 见下方说明 |
 | ⑤ 简拼 | `AbbrevMatcher` 判定（每字母为音节首字母且非完整音节序列）→ `search_abbrev(query, ABBREV_INDEX_LIMIT)` | natural_order=999999 沉底 |
 | ⑤b 混合简拼 | `mixed_abbrev::mixed_patterns` 枚举「声母段 + 音节段」的解释（`nhao` = n\|hao、`zhge` = zh\|ge），投影成声母键点查同一张 `AbbrevSection`，再逐段校验 | `is_abbrev` |
 | ⑥ 用户/临时造词层 | store_layers 整串精确 + 子码 + 前缀，整串与子码另查模糊变体码（同 ①③，前缀不做），按 text 与系统词典去重（精确先到先占位） | — |
@@ -1070,7 +1070,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | `schema.mix.show_source_hint` | false | 拼音候选「拼」标记 |
 | `schema.codetable.*`（auto_commit_at_full / auto_commit_min_len / clear_on_empty_max / top_code_commit / show_code_hint / single_code_input / single_code_complete 等） | 见 config.toml | 可被 `schema_overrides/{id}.toml [codetable]` 按方案覆盖 |
 | `schema.pinyin.use_smart_compose` | — | Viterbi 整句开关 |
-| `schema.pinyin.sentence_uses_user_words` | **false** | 用户词与临时词进整句词图（S2，简拼段也认），不接草稿层。出厂关的理由是结构性的：出厂只出一条整句 ⇒ 赢者通吃 |
+| `schema.pinyin.sentence_uses_user_words` | **true**（2026-09-28 起，此前 false） | 用户词与临时词进整句词图（S2，简拼段也认），不接草稿层。只在 `use_smart_compose` 开着时有效，UI 的 `enabled_when` 挂在它上面 |
 | `schema.pinyin.sentence_count` / `sentence_max_count` | 1 / 1 | 整句 N-best：露几条 / 算几条（上限 8，算的不少于露的）。露 >1 时协调器把整句块强制摆到最前（`place_sentence_block`）；混输辅助引擎钉成 1/1 |
 | `schema.pinyin.sentence_cycle_key` | ""（关） | 整句切换键，**键即开关**。只在整句池 ≥ 2 条时夺取，窗口在池中滚动一格并回卷；其余时候按键照旧（Tab 出厂是高亮/翻页键）。撞车启动告警 |
 | `schema.pinyin.fuzzy.*` | — | 模糊音 11 对开关 |

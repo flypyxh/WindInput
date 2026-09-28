@@ -284,8 +284,8 @@ static REGISTRY: &[ConfigField] = &[
         Enum(CODE_HINT_SOURCE_VALUES),
     ),
     f("schema.pinyin.use_smart_compose", Bool),
-    // 用户词进整句词图（S2）。**出厂 false**，且只接已晋升的用户词（不接临时词/草稿层）。
-    // 整句没有 N-best ⇒ 赢者通吃，故它是一个真正会改变所有老用户整句结果的开关。
+    // 用户词进整句词图（S2）。**出厂 true**（2026-09-28 起），接用户词与临时词
+    // （不接草稿层）。只在 use_smart_compose 开着时有效，UI 侧 enabled_when 挂在它上面。
     f("schema.pinyin.sentence_uses_user_words", Bool),
     // 整句 N-best：露几条 / 算几条（切换键的池子）。出厂 1/1 = 单条整句。
     f("schema.pinyin.sentence_count", Int),

@@ -32,13 +32,14 @@
 - **整句词图的来源有两个，不是一个**（S2，2026-09-23）：系统词库走 `self.dict`（`CachedDict`），
   用户上屏过的词（用户词 + 临时词）走 `store_layers` + `lattice::add_store_nodes`（全拼段）/
   `add_store_abbrev_nodes`（②b 的简拼段，查用户层简拼索引），由 `schema.pinyin.sentence_uses_user_words`
-  把关（**出厂 false**）。三条建图通路（②主 / ②b 混合 / ②c 残码）各在 `build` 之后追加一次，
-  全拼降级支路刻意不接。**收用户词与临时词、不收草稿层**（滑窗草稿会造大量杂词；临时词曾被一并挡掉，
-  系统库没有的「拜城县」手打过后 `bcxrmzf` 整句仍不认），
+  把关（**出厂 true**，2026-09-28 起；此前出厂 false）。三条建图通路（②主 / ②b 混合 / ②c 残码）各在
+  `build` 之后追加一次，全拼降级支路刻意不接。**收用户词与临时词、不收草稿层**（滑窗草稿会造大量杂词；
+  临时词曾被一并挡掉，系统库没有的「拜城县」手打过后 `bcxrmzf` 整句仍不认），
   **`boundary == 0` 不进图**（与 `build` 的降级放行相反：整句节点必须有真值切分），
   **同词同起点取 `log_prob` 较大者**（GH#93 要的是「我调过的权重整句也得认」）。
-  出厂关的原因：用户词进图会换掉唯一那条整句。现在有 N-best 可以看见它输给了谁（见下条），
-  但出厂仍是露 1 算 1，所以默认仍是赢者通吃。
+  曾经出厂关的原因：用户词进图会换掉唯一那条整句，出厂仍是露 1 算 1（赢者通吃）、且用户词
+  weight 标定只做了截断没做分布对齐——这些是已知局限，不再作为出厂值的否决理由。只在
+  `use_smart_compose`（智能组词）开着时才生效，设置页的 `enabled_when` 因此挂在它上面。
 - **整句 N-best**（2026-09-23）：`Viterbi::decode_nbest` 在 `dp[i]` 上保留 top-K（带 `prev_idx`），
   **K=1 与原解码逐位相同**；有 grammar（`decode_beam`）时只返回 1 条。`schema.pinyin.sentence_count`
   （露几条）/ `sentence_max_count`（算几条，= 切换键的池子）由 `Config::sentence_counts` 夹到

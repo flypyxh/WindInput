@@ -1147,14 +1147,21 @@ pub struct PinyinGlobalConfig {
     pub code_hint_source: String,
     #[serde(default = "default_true")]
     pub use_smart_compose: bool,
-    /// 让**用户上屏过的词**（用户词 + 临时词）参与整句解码（S2）。**出厂 false**。
+    /// 让**用户上屏过的词**（用户词 + 临时词）参与整句解码（S2）。**出厂 true**
+    /// （2026-09-28 起；此前出厂 false）。
     ///
     /// 关闭时整句词图只从系统词库建，自造词永远不会成为整句的一段：「盖伦」单独打得出、
     /// 「有盖伦吗」却被打散（t134）；手动调过权重的词在整句里同样不认（GH#93）。
     ///
-    /// ★ 出厂关的三条理由都是结构性的，不是「怕有 bug」：出厂只出**一条**整句（赢者通吃，
-    /// 调大 `sentence_count` 才看得到备选）；它会改变**所有**老用户的整句结果（含从未造过词的
-    /// —— wdict 导入词也进图）；用户词 weight 的标定只做了上限截断、没做分布对齐。
+    /// ★ 曾经出厂关，理由是三条结构事实：出厂只出**一条**整句（赢者通吃，调大
+    /// `sentence_count` 才看得到备选）；它会改变**所有**老用户的整句结果（含从未造过词的
+    /// —— wdict 导入词也进图）；用户词 weight 的标定只做了上限截断、没做分布对齐。这三条
+    /// 仍然成立、仍是用户词进图质量的已知局限，但不再作为出厂值的否决理由——翻开的判断是
+    /// 「用户造过的词该在整句里认得出」比「结果不变」更贴近预期。
+    ///
+    /// ⚠️ 设置页里本项 `enabled_when` 挂在 `use_smart_compose`（智能组词）：智能组词关闭时
+    /// 三条整句建图通路都不会跑（`pinyin::mod.rs` 的三处调用点），本项在引擎侧是死代码，
+    /// UI 必须同步置灰，否则用户会以为开着却看不到效果。
     ///
     /// ⚠️ 接用户词与临时词，**不接草稿层**——滑窗草稿会造大量杂词，「用过即转正」
     /// （草稿 → 临时）是它的质量闸；但临时层也收自动造词直接写入的分步拼接与合成整句，
@@ -1164,7 +1171,7 @@ pub struct PinyinGlobalConfig {
     /// ⚠️ 默认值与 `wind_engine::pinyin::Config::default()` 那份**必须同值**
     ///（同 completion 两项的先例：两处分叉会让「引擎单测通过、协调器行为不同」这类假绿
     /// 有可乘之机）。
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub sentence_uses_user_words: bool,
     /// 整句 N-best：候选列表里**露**几条整句。出厂 1 = 单条整句（改动前的行为）。
     ///
@@ -1429,8 +1436,9 @@ impl Default for PinyinGlobalConfig {
         Self {
             code_hint_source: default_code_hint_source(),
             use_smart_compose: true,
-            // 出厂关，理由见字段文档的三条结构事实。与引擎侧 `pinyin::Config::default()` 同值。
-            sentence_uses_user_words: false,
+            // 出厂开（2026-09-28 起）。与引擎侧 `pinyin::Config::default()` 同值，
+            // UI 侧靠 enabled_when 挂在 use_smart_compose 上防止关了智能组词还显得开着。
+            sentence_uses_user_words: true,
             sentence_count: default_sentence_count(),
             sentence_max_count: default_sentence_count(),
             sentence_cycle_key: String::new(),
