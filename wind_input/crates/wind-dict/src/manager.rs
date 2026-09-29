@@ -63,6 +63,18 @@ impl DictManager {
         self.composite.has_longer_code(prefix)
     }
 
+    /// 通配查询（跨层，见 `DictLayer::search_pattern` / `CompositeDict::search_pattern`）。
+    pub fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<Candidate> {
+        self.composite
+            .search_pattern(pattern, wildcard, limit, with_prefix)
+    }
+
     /// 全量枚举各启用层的 `(code, text, weight)`，供离线索引构建。
     /// ⚠️ O(全表)，只在索引构建这类一次性场合调用，绝不能进按键链路。
     pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {

@@ -24,6 +24,8 @@ enum Query {
     Abbrev,
     /// 声母串恰为本组、不含无边界词（整句词图用，见 `DictLayer::search_abbrev_exact`）
     AbbrevExact,
+    /// 通配（见 `DictLayer::search_pattern`）：按 `(text, code)` 去重、等长档优先。
+    Pattern { wildcard: char, with_prefix: bool },
 }
 
 impl CompositeDict {
@@ -92,6 +94,25 @@ impl CompositeDict {
         self.merge_search(abbrev, limit, Query::AbbrevExact)
     }
 
+    /// 通配查询：跨层合并。与其它查询的两处不同——去重键是 `(text, code)`（同字不同码各留
+    /// 一条，学码要看到每个码位；同码才合并取更高权重），排序等长档优先（`cmp_pattern`）。
+    pub fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<Candidate> {
+        self.merge_search(
+            pattern,
+            limit,
+            Query::Pattern {
+                wildcard,
+                with_prefix,
+            },
+        )
+    }
+
     /// 是否存在**严格长于** `prefix` 的编码：任一**启用**层命中即 true，命中即短路。
     ///
     /// 刻意不经 `merge_search`——那条路会按 text 去重并「同 text 取最短码」
@@ -135,6 +156,7 @@ impl CompositeDict {
         // 简拼尤其不能换：候选的 code 必须留全拼码，词频记账走的正是它
         // （见 step6「保留全拼码」那段——换成别层的码会让同一个词在两条流下各记各的）。
         let is_prefix = matches!(kind, Query::Prefix);
+        let by_code = matches!(kind, Query::Pattern { .. });
 
         for layer in layers.iter() {
             // 禁用层（如关闭的码表扩展词库）跳过。
@@ -146,12 +168,21 @@ impl CompositeDict {
                 Query::Prefix => layer.search_prefix(query, limit),
                 Query::Abbrev => layer.search_abbrev(query, limit),
                 Query::AbbrevExact => layer.search_abbrev_exact(query, limit),
+                Query::Pattern {
+                    wildcard,
+                    with_prefix,
+                } => layer.search_pattern(query, wildcard, limit, with_prefix),
             };
             // 层级基序档位：写入候选的 base_order 字段（独立排序层级，不折进 natural_order）。
             let layer_base_order = layer.base_order();
             for mut cand in layer_results {
                 cand.base_order = layer_base_order;
-                if let Some(&idx) = seen.get(&cand.text) {
+                let key = if by_code {
+                    format!("{}\u{0}{}", cand.text, cand.code)
+                } else {
+                    cand.text.clone()
+                };
+                if let Some(&idx) = seen.get(&key) {
                     // 同 text 已存在：**编码也相同**时才继承更高权重。
                     //
                     // ## 权重属于 `(code, text)` 这个词条，不属于「字」
@@ -208,12 +239,17 @@ impl CompositeDict {
                     }
                     continue;
                 }
-                seen.insert(cand.text.clone(), results.len());
+                seen.insert(key, results.len());
                 results.push(cand);
             }
         }
 
-        results.sort_by(wind_candidate::better);
+        if by_code {
+            let n = query.chars().count();
+            results.sort_by(|a, b| crate::layer::cmp_pattern(n, a, b));
+        } else {
+            results.sort_by(wind_candidate::better);
+        }
         // limit==0 视为「无上限」（与各 DictLayer::search 的 `if limit>0` 守卫、Go
         // searchInternal 一致），仅在 limit>0 时截断。调用方需要空结果时不应传 0。
         if limit > 0 && results.len() > limit {
@@ -248,6 +284,19 @@ mod tests {
     impl DictLayer for MockLayer {
         fn name(&self) -> &str {
             &self.name
+        }
+        fn search_pattern(
+            &self,
+            pattern: &str,
+            wildcard: char,
+            _limit: usize,
+            with_prefix: bool,
+        ) -> Vec<Candidate> {
+            self.items
+                .iter()
+                .filter(|c| crate::layer::pattern_matches(pattern, wildcard, &c.code, with_prefix))
+                .cloned()
+                .collect()
         }
         fn layer_type(&self) -> LayerType {
             self.ltype
@@ -920,5 +969,47 @@ mod tests {
         assert!(c.set_layer_enabled("main", false));
         let r2 = c.search("h", 10);
         assert_eq!(r2[0].base_order, 5, "主库不参与后，档位落到扩展库");
+    }
+
+    /// 通配合并：**同 text 同 code** 才合并（取更高权重）；同字不同码各留一条——学码要看到
+    /// 每个码位。排序等长档在前，高权重的更长编码也排不到等长之前。
+    #[test]
+    fn pattern_merges_by_text_and_code_equal_length_first() {
+        let slot = crate::layer::WILDCARD_SLOT;
+        let c = CompositeDict::new();
+        c.register_layer(Box::new(MockLayer {
+            name: "user".into(),
+            ltype: LayerType::User,
+            items: vec![cand("工", "aaaa", 50, 0)],
+        }));
+        c.register_layer(Box::new(MockLayer {
+            name: "sys".into(),
+            ltype: LayerType::System,
+            items: vec![
+                cand("工", "aaaa", 80, 0),
+                cand("工", "abaa", 70, 1),
+                cand("字", "abaaq", 9999, 2),
+                cand("式", "aa", 10, 3),
+            ],
+        }));
+        let p = format!("a{slot}{slot}a");
+        let got: Vec<(String, String, i32)> = c
+            .search_pattern(&p, slot, 10, true)
+            .into_iter()
+            .map(|x| (x.text, x.code, x.weight))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("工".to_string(), "aaaa".to_string(), 80),
+                ("工".to_string(), "abaa".to_string(), 70),
+                ("字".to_string(), "abaaq".to_string(), 9999),
+            ]
+        );
+        assert_eq!(
+            c.search_pattern(&p, slot, 10, false).len(),
+            2,
+            "不带补全时无更长档"
+        );
     }
 }
