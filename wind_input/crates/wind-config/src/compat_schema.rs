@@ -533,7 +533,8 @@ pub fn option_label(id: &str) -> Option<&'static str> {
 
 /// `compat.schema` 的响应体。
 pub fn schema_json() -> Value {
-    let mut fields = serde_json::to_value(COMPAT_FIELDS).unwrap_or(Value::Null);
+    // 编译期固定的数据，序列化不可能失败；出错就该响亮地报，别悄悄变成空 schema。
+    let mut fields = serde_json::to_value(COMPAT_FIELDS).expect("COMPAT_FIELDS 序列化");
     if let Some(list) = fields.as_array_mut() {
         for (f, meta) in list.iter_mut().zip(COMPAT_FIELDS) {
             if meta.options.is_empty() {

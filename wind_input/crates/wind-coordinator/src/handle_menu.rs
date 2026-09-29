@@ -1658,6 +1658,22 @@ impl Coordinator {
             use wind_config::app_compat::InitialMode as IM;
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
+            // 整条规则的开关：没有规则（系统层与用户层都没有）时没有可开关的东西，置灰。
+            // 勾选 = 规则在生效；点它 = 切到相反的状态（参数是目标状态，不是「切换」，
+            // 避免菜单快照与实际状态错开时点一下反而做反）。
+            let rule_switch = if enabled {
+                self.compat_dirs
+                    .1
+                    .as_deref()
+                    .map(|u| wind_config::app_compat::menu_rule_switch(u, &proc))
+                    .unwrap_or(wind_config::app_compat::RuleSwitch::NoRule)
+            } else {
+                wind_config::app_compat::RuleSwitch::NoRule
+            };
+            // 整条规则被禁用时，规则行不进规则表：下面各项读到的都是「跟随全局」，此时选了也写得进去
+            // 却不生效，还会显示成没选。所以先置灰，让用户先启用这条规则再逐项设置。
+            let has_proc = enabled;
+            let enabled = enabled && rule_switch != wind_config::app_compat::RuleSwitch::Disabled;
             let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) = {
                 let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
                 let rule = table.get_rule(&proc);
@@ -1678,23 +1694,12 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .auto_pair;
-            let header = if enabled {
+            let header = if has_proc {
                 proc.clone()
             } else {
                 "当前应用未知".to_string()
             };
-            // 整条规则的开关：没有规则（系统层与用户层都没有）时没有可开关的东西，置灰。
-            // 勾选 = 规则在生效；点它 = 切到相反的状态（参数是目标状态，不是「切换」，
-            // 避免菜单快照与实际状态错开时点一下反而做反）。
-            let rule_switch = if enabled {
-                self.compat_dirs
-                    .1
-                    .as_deref()
-                    .map(|u| wind_config::app_compat::menu_rule_switch(u, &proc))
-                    .unwrap_or(wind_config::app_compat::RuleSwitch::NoRule)
-            } else {
-                wind_config::app_compat::RuleSwitch::NoRule
-            };
+
             // 三档单选。「跟随全局」必须是独立一档，不能靠"取消勾选"表达——否则用户设了
             // 规则之后无从撤销。它对应写盘时的 None，即从 compat.toml 里清掉该字段。
             let tri = |cur: Option<IM>, mk: fn(u8) -> MenuCmd| {
