@@ -23,6 +23,7 @@ use crate::text::font_resolve::{FontNameSource, ResolvedFont, resolve_font_name}
 use crate::text::script::{FontPlan, ScriptClass};
 use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
 use wind_theme::DEFAULT_ACCENT_BAR_HEIGHT_RATIO;
+use wind_ui_types::StyledText;
 
 /// 内置默认字族：`ui.font.family` 为空时用它。
 ///
@@ -87,6 +88,22 @@ fn text_state(sel: bool, hov: bool) -> wind_theme::TextState {
         wind_theme::TextState::Hover
     } else {
         wind_theme::TextState::Normal
+    }
+}
+
+/// 右侧注释实际显示的内容。`merge_above`（旋转 / 直立态）不支持上方注释条（设计
+/// candidate-comment-above-line.md §3.3），上段以 `\n` 接回下段之前，内容不丢；否则原样借用
+/// `comment`——上方条关闭或该候选无上段时一律走借用，与改动前逐字节一致。
+fn right_comment(c: &CandidateItem, merge_above: bool) -> Cow<'_, StyledText> {
+    if !merge_above || c.comment_above.is_empty() {
+        Cow::Borrowed(&c.comment)
+    } else if c.comment.is_empty() {
+        Cow::Borrowed(&c.comment_above)
+    } else {
+        Cow::Owned(StyledText::join(
+            &[c.comment_above.clone(), c.comment.clone()],
+            "\n",
+        ))
     }
 }
 
@@ -3001,14 +3018,15 @@ impl CandidateWindow {
                     };
                     base + ip.l + ip.r + im.l + im.r
                 };
-                let comment_w = if cand.comment.is_empty() {
+                let comment = right_comment(cand, self.rotated);
+                let comment_w = if comment.is_empty() {
                     0.0
                 } else {
                     let cp = edges_or(&v.comment.padding, [0.0; 4]);
                     let cm = edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]);
                     self.text_renderer
                         .measure(
-                            cand.comment.as_str(),
+                            comment.as_str(),
                             &Self::measure_style(
                                 comment_fs,
                                 eff_weight(&v.comment, &v.item, is_sel, is_hover),
@@ -3112,6 +3130,12 @@ impl CandidateWindow {
         } else {
             0.0
         };
+        // 横排内联编码在候选行里的固定开销（下面的分配与上方注释条的余量计算共用）。
+        let preedit_fixed = if preedit_competes {
+            preedit_pad.l + 16.0 * s + box_gap // 左缩进 + 装配段右留白 + 间隙
+        } else {
+            0.0
+        };
         // 分配：参与者 = [内联编码(仅横排下与候选同行)] + 候选们。
         let (inline_preedit_budget_px, cand_text_budgets) = if list_vertical {
             // 竖排：内联编码与每个候选各占一行、互不竞争，都用满整行预算（保持既有行为）。
@@ -3125,11 +3149,6 @@ impl CandidateWindow {
                     .collect::<Vec<f32>>(),
             )
         } else {
-            let preedit_fixed = if preedit_competes {
-                preedit_pad.l + 16.0 * s + box_gap // 左缩进 + 装配段右留白 + 间隙
-            } else {
-                0.0
-            };
             let fixed_sum: f32 = cand_metrics.iter().map(|(f, _)| *f).sum();
             let avail = row_budget - mode_label_row_w - pager_row_w - fixed_sum - preedit_fixed;
             let mut demands: Vec<f32> = Vec::with_capacity(cand_metrics.len() + 1);
@@ -3143,6 +3162,140 @@ impl CandidateWindow {
             } else {
                 ((row_budget - preedit_pad.l).max(min_text_w), alloc)
             }
+        };
+
+        // ══ 上方注释条（设计 candidate-comment-above-line.md §3.3）══
+        // 页级判定：本页任一候选带上段，整页 item 都改成 Column[上方条, 主行]，没有上段的候选
+        // 放透明占位叶子——整页等高，竖排不出现行高锯齿。旋转 / 直立态不支持，上段已由
+        // `right_comment` 合回右侧注释。`has_above` 为假时以下各处一行都不走，树与改动前逐字节一致。
+        let has_above =
+            !self.rotated && self.candidates.iter().any(|c| !c.comment_above.is_empty());
+        let above_fs = node_fs(&v.comment_above);
+        let above_family = v.comment_above.font_family.clone();
+        let above_pad = edges_or(&v.comment_above.padding, [0.0; 4]);
+        let above_margin = edges_or(&v.comment_above.margin, [0.0; 4]);
+        // 每候选（与 `order` 同序）：(左缩进, 上段文字宽度上限)。
+        // · 左缩进 = item 内容区起点到候选文字字形起点：序号外框 + 文字左外边距 + 文字左内边距。
+        // · 上段只做 UI 兜底截断，**不参与**候选文字的 water_fill（文字预算与无上方条时相同）：
+        //   竖排每行独占 row_budget；横排只能用主行排完后整行剩下的余量（多条超长上段之间再按
+        //   water_fill 公平分），故上段再长也不会把窗口顶出 row_budget。
+        let above_cols: Vec<(f32, f32)> = if has_above {
+            let per: Vec<(f32, f32, f32, f32)> = order
+                .iter()
+                .zip(&cand_metrics)
+                .zip(&cand_text_budgets)
+                .map(|(((i, cand), (fixed, natural)), budget)| {
+                    let is_sel = *i == self.selected;
+                    let is_hover = self.hover >= 0 && self.hover as usize == *i;
+                    let (idx_box, tm_l) = if cand.no_index {
+                        (0.0, 0.0)
+                    } else {
+                        let ip = edges_or(&v.index.padding, [0.0; 4]);
+                        let im = edges_or(&v.index.margin, [0.0; 4]);
+                        let marker = if cand.label.is_empty() {
+                            (i + 1).to_string()
+                        } else {
+                            cand.label.clone()
+                        };
+                        // 与装配段同构：圆圈序号 `fixed_w` 覆盖含内边距的整宽。
+                        let core = if index_circle {
+                            (index_fs * 1.5).round()
+                        } else {
+                            self.text_renderer
+                                .measure(
+                                    &marker,
+                                    &Self::measure_style(
+                                        index_fs,
+                                        eff_weight(&v.index, &v.item, is_sel, is_hover),
+                                        v.index.font_family.as_deref(),
+                                    ),
+                                )
+                                .width
+                                + ip.l
+                                + ip.r
+                        };
+                        (
+                            core + im.l + im.r,
+                            edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0]).l,
+                        )
+                    };
+                    let indent = idx_box + tm_l + text_pad.l;
+                    // 上方条除文字外的横向开销（item 左右内边距 + 缩进 + 上方条自身边距）。
+                    let over = item_pad.l
+                        + item_pad.r
+                        + indent
+                        + above_pad.l
+                        + above_pad.r
+                        + above_margin.l
+                        + above_margin.r;
+                    let above_w = if cand.comment_above.is_empty() {
+                        0.0
+                    } else {
+                        self.text_renderer
+                            .measure(
+                                cand.comment_above.as_str(),
+                                &Self::measure_style(
+                                    above_fs,
+                                    eff_weight(&v.comment_above, &v.item, is_sel, is_hover),
+                                    above_family.as_deref(),
+                                ),
+                            )
+                            .width
+                    };
+                    // 主行实宽（不含横排间隙）：文字按分到的预算截、放得下就是自然宽。
+                    let main_w = fixed - gap_w + natural.min(*budget);
+                    (indent, over, above_w, main_w)
+                })
+                .collect();
+            if list_vertical {
+                per.iter()
+                    .map(|&(indent, over, _, _)| (indent, row_budget - over))
+                    .collect()
+            } else {
+                let used: f32 = cand_metrics
+                    .iter()
+                    .zip(&cand_text_budgets)
+                    .map(|((fixed, natural), budget)| fixed + natural.min(*budget))
+                    .sum::<f32>()
+                    + mode_label_row_w
+                    + pager_row_w
+                    + preedit_fixed
+                    + if preedit_competes {
+                        preedit_natural.min(inline_preedit_budget_px)
+                    } else {
+                        0.0
+                    };
+                let extra_demands: Vec<f32> = per
+                    .iter()
+                    .map(|&(_, over, above_w, main_w)| (over + above_w - main_w).max(0.0))
+                    .collect();
+                let extra = Self::water_fill(&extra_demands, (row_budget - used).max(0.0), 0.0);
+                per.iter()
+                    .zip(extra)
+                    .map(|(&(indent, over, _, main_w), e)| (indent, main_w + e - over))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        // 没有上段的候选 / 占位行用的透明占位叶子：字号、字重、字族、边距与真实上方条同构，
+        // 只为撑出同样的行高（真实后端行高取自字族 line metrics，缺一项就矮一截）。
+        let above_ghost = |sel: bool, hov: bool| {
+            View::leaf(" ".to_string(), [0, 0, 0, 0])
+                .font_size(above_fs)
+                .font_weight(eff_weight(&v.comment_above, &v.item, sel, hov))
+                .font_family(above_family.clone())
+                .pad(above_pad)
+                .margin(above_margin)
+        };
+        // 把已装好 [序号, 文字, 注释] 的 Row 型 item 改成 Column[上方条, 主行]：
+        // item 自身的装饰（内外边距 / 圆角 / tag / 背景 / 边框 / 选中条）原样留在外层，包住两行。
+        let stack_above = |mut item: View, above: View| {
+            let mut main = View::container(Layout::Row).cross(Align::Center);
+            main.children = std::mem::take(&mut item.children);
+            item.layout = Layout::Column;
+            item.cross_align = Align::Start;
+            item.child(above).child(main)
         };
 
         // 【构建位置】翻页器在此提前构建（原先在候选项装配之后）：竖排内联编码要把它作为
@@ -3430,14 +3583,20 @@ impl CandidateWindow {
             }
             ph = ph.child(idx);
             // 不设 tag（默认 -1）：占位行不进命中收集，鼠标划过或点击都不该有反应。
-            ph.child(
+            let ph = ph.child(
                 View::leaf(" ".to_string(), [0, 0, 0, 0])
                     .font_size(text_fs)
                     .font_weight(eff_weight(&v.text, &v.item, false, false))
                     .font_family(text_family.clone())
                     .pad(edges_or(&v.text.padding, [0.0; 4]))
                     .margin(edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])),
-            )
+            );
+            // 本页带上方条时真实行是 Column[上方条, 主行]，占位行同构。
+            if has_above {
+                stack_above(ph, above_ghost(false, false))
+            } else {
+                ph
+            }
         };
         // 反转排列时占位行补在**顶部**：窗口上翻后底边贴光标、候选 1 在最下，空行若压在
         // 候选 1 下面会把它顶离光标，候选 1 的位置反而随候选数抖动——正是本功能要消除的。
@@ -3571,7 +3730,8 @@ impl CandidateWindow {
             item = item.child(tleaf);
             // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
             // 内/外边距完整消费：comment.padding 四边 + comment.margin 四边（左默认 6dp 兜底间距）。
-            if !cand.comment.is_empty() {
+            let comment = right_comment(cand, self.rotated);
+            if !comment.is_empty() {
                 // 直立态同样逐格扶正：只让候选文字立起来、注释仍躺着的话，同一列里会有
                 // 两种阅读方向。⚠️ 拉丁编码也照切——「英文横着读反而对」那条取舍已被真机
                 // 推翻（旋转态是一切都转、自洽；直立态混排看不懂）。
@@ -3584,10 +3744,10 @@ impl CandidateWindow {
                     false,
                     text_state(is_sel, is_hover),
                     COMMENT_FALLBACK,
-                    &cand.comment,
+                    &comment,
                 );
                 let mut cleaf = self
-                    .upright_text(cand.comment.as_str(), None, |seg, _, off| {
+                    .upright_text(comment.as_str(), None, |seg, _, off| {
                         // 直立态逐格切叶子：每格只拿自己那几段颜色，平移到格内偏移。
                         View::leaf(seg.to_string(), cmt_color)
                             .font_size(comment_fs)
@@ -3611,6 +3771,50 @@ impl CandidateWindow {
                     cleaf = cleaf.border(bc, bw).radius(br);
                 }
                 item = item.child(cleaf);
+            }
+            // 上方注释条：左缩进到候选文字字形起点；超出宽度上限（见 `above_cols`）时截断加 `…`，
+            // 截的是显示副本，颜色区间随 `cut_with_mark` 一起裁。
+            if has_above {
+                let above = if cand.comment_above.is_empty() {
+                    above_ghost(is_sel, is_hover)
+                } else {
+                    let (indent, max_w) = above_cols[k];
+                    let weight = eff_weight(&v.comment_above, &v.item, is_sel, is_hover);
+                    let src = &cand.comment_above;
+                    let shown = self.truncate_text_for_width(
+                        src.as_str(),
+                        &Self::measure_style(above_fs, weight, above_family.as_deref()),
+                        max_w,
+                    );
+                    let text = if shown == src.as_str() {
+                        src.clone()
+                    } else {
+                        src.cut_with_mark(shown.len() - '…'.len_utf8(), "…")
+                    };
+                    let runs = crate::span_runs::color_runs(
+                        &self.theme,
+                        &v.comment_above,
+                        false,
+                        text_state(is_sel, is_hover),
+                        COMMENT_FALLBACK,
+                        &text,
+                    );
+                    let base = col(v.comment_above.text_color, COMMENT_FALLBACK);
+                    View::leaf(
+                        text.into_string(),
+                        eff_text(&v.comment_above, base, is_sel, is_hover),
+                    )
+                    .font_size(above_fs)
+                    .font_weight(weight)
+                    .font_family(above_family.clone())
+                    .color_runs(runs)
+                    .pad(above_pad)
+                    .margin(Edges {
+                        l: above_margin.l + indent,
+                        ..above_margin
+                    })
+                };
+                item = stack_above(item, above);
             }
             // 候选项基态底色：此前只在选中/悬停时调 .bg()，`[item] background = "…"` 从不生效，
             // 而同级的背景图/渐变基态是读的（见下），三者本该同级。选中/悬停底色随后覆盖。
@@ -7701,6 +7905,352 @@ mod comment_color_tests {
                 ("q".to_string(), vec![run(0, 1, RED)]),
             ]
         );
+    }
+}
+
+// 上方注释条（`CandidateItem.comment_above`，设计 candidate-comment-above-line.md §3.3）。
+//
+// ⚠️ host 上文本测量是 mock 近似（字宽 0.6em、行高只看字号），下面凡涉及尺寸的断言都写成
+// 相对关系（等高、同一 x、差值 == 某叶子外框），不钉像素——它们测的是**盒模型结构**，
+// 真实后端下结构不变、关系照样成立。唯一只在 mock 下成立的前提见各测试注释。
+#[cfg(test)]
+mod comment_above_tests {
+    use super::*;
+    use wind_ui_types::{SpanStyle, StyledText};
+
+    fn cand_above(text: &str, above: &str, comment: &str) -> CandidateItem {
+        CandidateItem {
+            text: text.to_string(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: Default::default(),
+            comment: comment.into(),
+            comment_above: above.into(),
+            no_index: false,
+        }
+    }
+
+    fn mk(vertical: bool, rotated: bool, upright: bool, rows: u32) -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_orientation(vertical, rotated, upright);
+        w.set_min_size(0, 0, 0, 0, rows);
+        w
+    }
+
+    fn win(vertical: bool, items: Vec<CandidateItem>) -> CandidateWindow {
+        let mut w = mk(vertical, false, false, 0);
+        w.update("", 0, "", items, 0, -1, 1, 1);
+        w
+    }
+
+    fn laid(w: &CandidateWindow) -> View {
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        root
+    }
+
+    fn find_list(v: &View) -> Option<&View> {
+        if v.children.iter().any(|c| c.tag >= 0) {
+            return Some(v);
+        }
+        v.children.iter().find_map(find_list)
+    }
+
+    /// 候选 item（按 tag 升序）。
+    fn items(root: &View) -> Vec<&View> {
+        let list = find_list(root).expect("未找到候选列表容器");
+        let mut out: Vec<&View> = list.children.iter().filter(|c| c.tag >= 0).collect();
+        out.sort_by_key(|c| c.tag);
+        out
+    }
+
+    fn all_leaves<'a>(v: &'a View, out: &mut Vec<&'a View>) {
+        if v.text.is_some() {
+            out.push(v);
+        }
+        for c in &v.children {
+            all_leaves(c, out);
+        }
+    }
+
+    /// 带上方条的 item：`(上方条叶子, 主行)`。
+    fn split_item(item: &View) -> (&View, &View) {
+        assert!(
+            matches!(item.layout, Layout::Column),
+            "带上方条的 item 应是 Column"
+        );
+        assert_eq!(item.children.len(), 2, "Column[上方条, 主行]");
+        (&item.children[0], &item.children[1])
+    }
+
+    /// 有上段 vs 无上段：item 恰好高出上方条叶子的外框高度（主行不变）。
+    #[test]
+    fn above_line_adds_one_row_height() {
+        for vertical in [true, false] {
+            let plain = laid(&win(vertical, vec![cand_above("你好", "", "wq")]));
+            let with = laid(&win(vertical, vec![cand_above("你好", "ni hao", "wq")]));
+            let h0 = items(&plain)[0].laid_rect().h;
+            let item = items(&with)[0];
+            let (above, _) = split_item(item);
+            let ar = above.laid_rect();
+            let above_box = ar.h + above.margin.t + above.margin.b;
+            assert!(above_box > 0.0);
+            assert!(
+                (item.laid_rect().h - h0 - above_box).abs() < 0.5,
+                "vertical={vertical}：item 应恰好高出一条上方条（{} vs {h0} + {above_box}）",
+                item.laid_rect().h
+            );
+        }
+    }
+
+    /// 按页预留：3 条里只有第 2 条有上段，三个 item 等高，且都高于「整页无上段」。
+    #[test]
+    fn above_line_reserves_height_page_wide() {
+        for vertical in [true, false] {
+            let root = laid(&win(
+                vertical,
+                vec![
+                    cand_above("一", "", "a"),
+                    cand_above("二", "er", "b"),
+                    cand_above("三", "", ""),
+                ],
+            ));
+            let hs: Vec<f32> = items(&root).iter().map(|i| i.laid_rect().h).collect();
+            assert_eq!(hs.len(), 3);
+            assert!(
+                hs.iter().all(|h| (h - hs[1]).abs() < 0.01),
+                "vertical={vertical}：整页 item 须等高（{hs:?}）"
+            );
+            let plain = laid(&win(vertical, vec![cand_above("一", "", "a")]));
+            assert!(
+                hs[0] > items(&plain)[0].laid_rect().h,
+                "无上段的候选也要预留"
+            );
+            // 无上段的候选放的是透明占位叶子，看不见。
+            let (ghost, _) = split_item(items(&root)[0]);
+            assert_eq!(ghost.text_color[3], 0, "占位叶子须透明");
+        }
+    }
+
+    /// 上方条字形起点 == 候选文字字形起点（≥ 序号右缘），含圆圈序号与无序号行。
+    #[test]
+    fn above_line_starts_at_text_origin() {
+        for circle in [false, true] {
+            for vertical in [true, false] {
+                let mut w = mk(vertical, false, false, 0);
+                if circle {
+                    w.theme.views.index.bg_shape = "circle".to_string();
+                }
+                let mut no_idx = cand_above("丙", "bing", "");
+                no_idx.no_index = true;
+                w.update(
+                    "",
+                    0,
+                    "",
+                    vec![
+                        cand_above("你好", "ni hao", "wq"),
+                        cand_above("甲", "jia", ""),
+                        no_idx,
+                    ],
+                    0,
+                    -1,
+                    1,
+                    1,
+                );
+                let root = laid(&w);
+                for item in items(&root) {
+                    let (above, main) = split_item(item);
+                    let text = if item.tag == 2 {
+                        &main.children[0]
+                    } else {
+                        let idx = &main.children[0];
+                        let text = &main.children[1];
+                        let ir = idx.laid_rect();
+                        assert!(
+                            above.laid_rect().x + 0.01 >= ir.x + ir.w,
+                            "上方条不得压到序号上（circle={circle}, vertical={vertical}）"
+                        );
+                        text
+                    };
+                    let a0 = above.laid_rect().x + above.padding.l;
+                    let t0 = text.laid_rect().x + text.padding.l;
+                    assert!(
+                        (a0 - t0).abs() < 1.0,
+                        "上方条起点 {a0} 应对齐文字起点 {t0}（tag={}, circle={circle}, vertical={vertical}）",
+                        item.tag
+                    );
+                }
+            }
+        }
+    }
+
+    /// 整页无上段：item 保持原来的 Row[序号, 文字, 注释]，没有任何 Column / 占位叶子。
+    /// （逐字节不变由 `render_golden` 的出厂对拍钉死，这条是本模块内的结构兜底。）
+    #[test]
+    fn no_above_keeps_tree_identical() {
+        for vertical in [true, false] {
+            let root = laid(&win(
+                vertical,
+                vec![cand_above("一", "", "a"), cand_above("二", "", "")],
+            ));
+            let its = items(&root);
+            assert!(its.iter().all(|i| matches!(i.layout, Layout::Row)));
+            assert_eq!(its[0].children.len(), 3, "序号 + 文字 + 注释");
+            assert_eq!(its[1].children.len(), 2, "序号 + 文字");
+        }
+    }
+
+    /// 上段极长：以 `…` 结尾，窗口不超过屏幕安全宽；文字本身不被上段挤截。
+    #[test]
+    fn above_line_overlong_is_ellipsized() {
+        let long = "x".repeat(2000);
+        for vertical in [true, false] {
+            let w = win(
+                vertical,
+                vec![
+                    cand_above("你好", &long, "wq"),
+                    cand_above("世界", &long, ""),
+                ],
+            );
+            let root = laid(&w);
+            let cap = w.screen_safety_max_width_px() as f32;
+            assert!(
+                root.measured_size().0 <= cap + 0.5,
+                "vertical={vertical}：窗口宽 {} 超出上限 {cap}",
+                root.measured_size().0
+            );
+            for item in items(&root) {
+                let (above, main) = split_item(item);
+                let t = above.text.as_deref().unwrap();
+                assert!(t.ends_with('…'), "上段应被截断加省略号");
+                assert!(t.len() < long.len());
+                assert_eq!(
+                    main.children[1].text.as_deref(),
+                    Some(if item.tag == 0 { "你好" } else { "世界" }),
+                    "候选文字不因上段而被截"
+                );
+            }
+        }
+    }
+
+    /// 旋转 / 直立态不支持上方条：无 Column，上段以 `\n` 合回右侧注释。
+    #[test]
+    fn upright_merges_above_into_comment() {
+        for upright in [false, true] {
+            let mut w = mk(false, true, upright, 0);
+            w.update(
+                "",
+                0,
+                "",
+                vec![cand_above("你", "ni", "亻尔"), cand_above("好", "hao", "")],
+                0,
+                -1,
+                1,
+                1,
+            );
+            let root = laid(&w);
+            for item in items(&root) {
+                assert!(
+                    matches!(item.layout, Layout::Row),
+                    "upright={upright}：不应出现 Column"
+                );
+            }
+            let mut leaves = Vec::new();
+            all_leaves(&root, &mut leaves);
+            let texts: Vec<&str> = leaves.iter().filter_map(|l| l.text.as_deref()).collect();
+            if upright {
+                // 直立态逐格切：上段的每个字都在。
+                for ch in ["n", "i", "亻", "尔", "h", "a", "o"] {
+                    assert!(texts.contains(&ch), "直立态缺 {ch}：{texts:?}");
+                }
+            } else {
+                assert!(
+                    texts.contains(&"ni\n亻尔"),
+                    "上下段应以 \\n 合并：{texts:?}"
+                );
+                assert!(texts.contains(&"hao"), "下段空时只剩上段：{texts:?}");
+            }
+        }
+    }
+
+    /// `min_rows` 补的占位行与带上方条的真实行同构、等高。
+    #[test]
+    fn placeholder_rows_match_real_rows_when_above() {
+        let five = |n: usize| {
+            let mut w = mk(true, false, false, 5);
+            w.theme.views.index.bg_shape = "circle".to_string();
+            let texts = ["一", "二", "三", "四", "五"];
+            let items: Vec<CandidateItem> = texts[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| cand_above(t, if i == 1 { "er" } else { "" }, ""))
+                .collect();
+            w.update("", 0, "", items, 0, -1, 1, 1);
+            w
+        };
+        let full = laid(&five(5)).measured_size().1;
+        let padded_w = five(3);
+        let padded = laid(&padded_w);
+        assert_eq!(
+            padded.measured_size().1,
+            full,
+            "3 候选补 2 空行须与 5 条等高"
+        );
+        let list = find_list(&padded).unwrap();
+        let ph = list.children.iter().find(|c| c.tag < 0).expect("占位行");
+        let real = list.children.iter().find(|c| c.tag == 1).unwrap();
+        let (ph_above, ph_main) = split_item(ph);
+        let (real_above, real_main) = split_item(real);
+        assert_eq!(ph_above.font_size, real_above.font_size);
+        assert_eq!(ph_above.font_family, real_above.font_family);
+        assert_eq!(ph_above.font_weight, real_above.font_weight);
+        let tb = |e: Edges| (e.t, e.b);
+        assert_eq!(tb(ph_above.padding), tb(real_above.padding));
+        assert_eq!(tb(ph_above.margin), tb(real_above.margin));
+        assert_eq!(ph_main.children.len(), real_main.children.len());
+        assert!((ph.laid_rect().h - real.laid_rect().h).abs() < 0.01);
+    }
+
+    /// `[comment_above.roles]` 只作用于上方条，右侧注释不受影响。
+    #[test]
+    fn above_line_colors_follow_comment_above_theme() {
+        const GREEN: [u8; 4] = [0, 0x80, 0, 255];
+        let py = |s: &str| {
+            let mut t = StyledText::new();
+            t.push(
+                s,
+                &SpanStyle {
+                    role: Some("pinyin"),
+                    ..Default::default()
+                },
+            );
+            t
+        };
+        let mut w = mk(true, false, false, 0);
+        w.theme
+            .views
+            .comment_above
+            .roles
+            .insert("pinyin".to_string(), GREEN);
+        let mut c = cand_above("你", "", "");
+        c.comment_above = py("ni");
+        c.comment = py("nn");
+        w.update("", 0, "", vec![c], 9, -1, 1, 1);
+        let root = laid(&w);
+        let (above, main) = split_item(items(&root)[0]);
+        assert_eq!(
+            above.color_runs,
+            vec![ColorRun {
+                start: 0,
+                end: 2,
+                rgba: GREEN
+            }]
+        );
+        let cmt = &main.children[2];
+        assert_eq!(cmt.text.as_deref(), Some("nn"));
+        assert!(cmt.color_runs.is_empty(), "右侧注释不该吃到上方条的角色色");
     }
 }
 

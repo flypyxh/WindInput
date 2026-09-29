@@ -148,12 +148,14 @@ fn tooltip_doc() -> TooltipDoc {
     }
 }
 
-/// 一个主题（亮或暗）的全部用例，拼成一份文本。
-fn render_theme(name: &str, dark: bool) -> String {
-    let theme = wind_theme::load_resolved(&themes_dir(), name, dark)
-        .unwrap_or_else(|e| panic!("加载出厂主题 {name}（dark={dark}）失败：{e}"));
+/// 候选窗在给定排布下的用例（选中 0、悬停 1），逐排布拼成文本。
+fn render_windows(
+    theme: &wind_theme::Resolved,
+    layouts: &[(&str, bool, bool, bool, bool)],
+    cands: fn() -> Vec<CandidateItem>,
+) -> String {
     let mut out = String::new();
-    for &(label, vertical, rotated, upright, embedded) in LAYOUTS {
+    for &(label, vertical, rotated, upright, embedded) in layouts {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
         w.scale = 1.0;
@@ -161,7 +163,7 @@ fn render_theme(name: &str, dark: bool) -> String {
         w.set_orientation(vertical, rotated, upright);
         w.set_preedit_embedded(embedded);
         // 选中 0、悬停 1：一帧里三态俱全。模式徽标给一个，直立态下它也逐格扶正。
-        w.update("nihao", 3, "拼", candidates(), 0, 1, 1, 2);
+        w.update("nihao", 3, "拼", cands(), 0, 1, 1, 2);
         let mut root = w.build_tree(false);
         root.layout(0.0, 0.0, &w.text_renderer);
         let (mw, mh) = root.measured_size();
@@ -180,6 +182,14 @@ fn render_theme(name: &str, dark: bool) -> String {
             out.push('\n');
         }
     }
+    out
+}
+
+/// 一个主题（亮或暗）的全部用例，拼成一份文本。
+fn render_theme(name: &str, dark: bool) -> String {
+    let theme = wind_theme::load_resolved(&themes_dir(), name, dark)
+        .unwrap_or_else(|e| panic!("加载出厂主题 {name}（dark={dark}）失败：{e}"));
+    let mut out = render_windows(&theme, LAYOUTS, candidates);
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut tip = crate::tooltip::Tooltip::new(tx).unwrap();
     tip.set_theme(&theme);
@@ -269,4 +279,116 @@ fn golden_covers_comments_and_tooltip() {
     // 直立态注释逐格切：`wqvb` 在直立段里是四个单字母叶子。
     let upright = got.split("== 候选窗 直立 ==").nth(1).unwrap();
     assert!(upright.contains("text=\"w\""), "直立态注释应逐格切开");
+}
+
+/// 上方注释条（设计 candidate-comment-above-line.md §3.3）：出厂 `default` 主题下横排 / 竖排
+/// 各一帧（选中 0、悬停 1 ⇒ 常态 / 选中 / 悬停俱全；下标 2「浩」没有上段 ⇒ 占位叶子），外加直立态
+/// 一帧钉「不支持上方条、上段合回右侧注释」。首录于上方条落地时（此前无此功能，参照即新代码
+/// 产物，守的是之后的回归）。
+fn above_candidates() -> Vec<CandidateItem> {
+    let c = |text: &str, above: StyledText, comment: StyledText| CandidateItem {
+        text: text.to_string(),
+        code: String::new(),
+        label: String::new(),
+        tooltip: Default::default(),
+        comment,
+        comment_above: above,
+        no_index: false,
+    };
+    vec![
+        c(
+            "好",
+            role_text("hǎo", "pinyin"),
+            role_text("vb", "code_hint"),
+        ),
+        c(
+            "号",
+            role_text("hào", "pinyin"),
+            role_text("kg", "code_rev"),
+        ),
+        c("浩", StyledText::new(), StyledText::new()),
+        c(
+            "你好",
+            role_text("nǐ hǎo", "pinyin"),
+            role_text("wqvb", "shuangpin"),
+        ),
+    ]
+}
+
+fn render_above() -> String {
+    let theme = wind_theme::load_resolved(&themes_dir(), "default", false).unwrap();
+    let layouts: &[(&str, bool, bool, bool, bool)] = &[
+        ("横排", false, false, false, false),
+        ("竖排", true, false, false, false),
+        ("直立", false, true, true, false),
+    ];
+    let dir = themes_dir().to_string_lossy().into_owned();
+    render_windows(&theme, layouts, above_candidates).replace(&dir, "<themes>")
+}
+
+#[test]
+fn comment_above_render_matches_golden() {
+    let got = render_above();
+    let file = golden_dir().join("comment_above-default-light.txt");
+    if std::env::var_os("WIND_UI_BLESS_GOLDEN").is_some() {
+        std::fs::create_dir_all(golden_dir()).unwrap();
+        std::fs::write(&file, &got).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("读 golden {} 失败：{e}", file.display()));
+    if got != want {
+        let line = got
+            .lines()
+            .zip(want.lines())
+            .position(|(a, b)| a != b)
+            .map_or(got.lines().count().min(want.lines().count()), |i| i);
+        panic!(
+            "上方注释条渲染与 golden 不一致（第 {} 行起）\n  实得 {:?}\n  参照 {:?}",
+            line + 1,
+            got.lines().nth(line),
+            want.lines().nth(line)
+        );
+    }
+}
+
+/// 守上面那份 golden 不是空转：横 / 竖排真有 Column 与上段文字、第 3 条是透明占位；
+/// 直立态没有 Column、上段逐格切进了右侧注释。
+#[test]
+fn comment_above_golden_covers_the_feature() {
+    let got = render_above();
+    let upright = got.split("== 候选窗 直立 ==").nth(1).unwrap();
+    for label in ["横排", "竖排"] {
+        let sec = got
+            .split(&format!("== 候选窗 {label} =="))
+            .nth(1)
+            .unwrap()
+            .split("== 候选窗")
+            .next()
+            .unwrap();
+        assert!(
+            (0..4).all(|i| column_item(sec, i)),
+            "{label} 的 4 个 item 都应是 Column"
+        );
+        for needle in [
+            "text=\"hǎo\"",
+            "text=\"nǐ hǎo\"",
+            "text=Some(\" \") color=[0, 0, 0, 0]",
+        ] {
+            assert!(sec.contains(needle), "{label} 缺 {needle}");
+        }
+    }
+    assert!(
+        !(0..4).any(|i| column_item(upright, i)),
+        "直立态 item 不应是 Column"
+    );
+    assert!(!upright.contains("text=\"hǎo\""), "直立态不应有整段上方条");
+    assert!(upright.contains("text=\"ǎ\""), "直立态上段应逐格合进注释");
+}
+
+/// 转储里 tag 为 `i` 的候选 item 是不是 Column 容器。
+fn column_item(dump: &str, i: usize) -> bool {
+    let tag = format!(" tag={i} ");
+    dump.lines()
+        .any(|l| l.trim_start().starts_with("Column") && l.contains(&tag))
 }
