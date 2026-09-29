@@ -1102,6 +1102,8 @@ fn update_user_raw(
     std::fs::create_dir_all(user_dir)?;
     let text = render_raw(USER_COMPAT_HEADER, &user).map_err(std::io::Error::other)?;
     write_atomic(&path, &text)?;
+    // 菜单写入不经 RPC，设置端此前无从得知；写成功后通知（经 RPC 的写入由 dispatch 广播）。
+    crate::change_hook::notify_compat_changed("menu", user_dir);
     Ok(())
 }
 
@@ -1681,7 +1683,7 @@ impl AppCompat {
 /// 一层原始键值参与叠加之前的清理：无效的值当成「没写」剔掉（返回清理后的副本与每处剔除的说明）。
 ///
 /// 必须在叠加**之前**做：错值若先参与叠加、事后才被容错回落成 `None`，会把下层的好值一起盖没。
-pub(crate) fn sanitize_raw(raw: &Raw) -> (Raw, Vec<String>) {
+pub(crate) fn sanitize_raw(raw: &Raw) -> (Raw, Vec<crate::compat_overlay::Problem>) {
     let (apps, mut report) = sanitize::<AppCompatRule>("apps", &raw.apps);
     let (initial_mode_scope, r2) =
         sanitize::<InitialModeScopeRule>("initial_mode_scope", &raw.initial_mode_scope);
@@ -3362,6 +3364,40 @@ mod layering_tests {
         );
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&u);
+    }
+
+    /// 菜单写入不经 RPC：写成功后必须通过钩子通知（设置端据此刷新），失败的写入不通知。
+    #[test]
+    fn menu_writes_notify_the_compat_hook_only_on_success() {
+        use std::sync::{Arc, Mutex};
+        static SEEN: Mutex<Vec<(String, std::path::PathBuf)>> = Mutex::new(Vec::new());
+        crate::change_hook::set_compat_change_hook(Arc::new(|src, dir| {
+            SEEN.lock()
+                .unwrap()
+                .push((src.to_string(), dir.to_path_buf()));
+        }));
+        let dir = tmp("m_hook");
+        with_system("", || {
+            set_user_first_show_mode(&dir, "a.exe", Some(FirstShowMode::Fast)).unwrap()
+        });
+        let mine =
+            |d: &std::path::Path| SEEN.lock().unwrap().iter().filter(|(_, p)| p == d).count();
+        assert_eq!(mine(&dir), 1, "成功的菜单写入通知一次");
+        with_system("", || {
+            set_user_first_show_mode(&dir, "a.exe", None).unwrap()
+        });
+        assert_eq!(mine(&dir), 2);
+        // 写不进去（目录位置被一个文件占着）⇒ 不通知
+        let blocked = tmp("m_hook_blocked");
+        let file_as_dir = blocked.join("f");
+        std::fs::write(&file_as_dir, "x").unwrap();
+        let res = with_system("", || {
+            set_user_first_show_mode(&file_as_dir, "a.exe", Some(FirstShowMode::Fast))
+        });
+        assert!(res.is_err());
+        assert_eq!(mine(&file_as_dir), 0, "失败的写入不通知");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&blocked);
     }
 
     /// 系统层读不到（菜单路径拿不到系统预置文件）时，清除字段不能凭「系统里没有」就省掉 unset。

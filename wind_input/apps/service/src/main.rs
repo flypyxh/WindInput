@@ -425,6 +425,14 @@ fn main() {
             // 快捷键/托盘/RPC 任一路径切方案，设置界面都能收到通知（此前只有候选窗的
             // push 通道收得到，而那条载荷里没有方案 id）。
             let sink = rpc_server.event_sink();
+            // 右键菜单改兼容规则不经 RPC：写成功后在此广播，设置端的「应用兼容」页据此刷新。
+            // 经 `compat.*` RPC 的写入由 dispatch 自己广播，钩子只覆盖菜单路径，不会重复。
+            wind_config::change_hook::set_compat_change_hook(std::sync::Arc::new({
+                let sink = sink.clone();
+                move |source: &str, _user_dir: &std::path::Path| {
+                    sink.emit_compat_changed(serde_json::json!({ "method": source }));
+                }
+            }));
             wind_engine::active_hook::set_active_schema_hook(std::sync::Arc::new({
                 let sink = sink.clone();
                 move |id: &str| {

@@ -13,16 +13,17 @@ use crate::app_compat::{
     AppCompatRule, COMPAT_FILE_NAME, CommitNewlineRule, InitialModeScopeRule, USER_COMPAT_HEADER,
     load_raw, sanitize_raw, write_atomic,
 };
+pub use crate::compat_overlay::Problem;
 use crate::compat_overlay::{
     FieldEdit, META_KEYS, Obj, Raw, apply_edits, compose, effective_keys, field_value_problem,
     has_registered_diff, is_disabled, normalize, overlay, overlay_raw, parse_raw, process_of,
     render_raw, same_process, sanitize,
 };
-use crate::compat_schema::known_keys;
+use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// 三段规则。
@@ -92,8 +93,39 @@ pub enum RuleState {
     Disabled,
 }
 
+/// 某个字段的值是谁定的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldSource {
+    /// 系统与用户都没设，走全局 / 默认。
+    Default,
+    /// 出厂设了，用户没动。
+    System,
+    /// 用户覆盖了（一处真正的、与系统不同的差异）。
+    User,
+    /// 出厂设了，用户用 `unset` 取消了它（回到跟随全局）。
+    Cleared,
+}
+
+/// 某个字段的逐字段视图：界面据此显示「谁定的」与可做的操作，不必自己从 `effective` / `system` /
+/// `user` 三份数据推导——`effective` 会省略裸 bool 的 `false` 与 `0`，「用户设为关」与「用户清除」
+/// 在里面长得一样，自己推导极易写错。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldView {
+    pub source: FieldSource,
+    /// 运行时生效的值，按控件类型给**类型化的默认值**（Bool = false，Int = 0，TextList = []，
+    /// 其余未设为 null），界面不必知道「序列化省略默认值」这回事。
+    pub value: Value,
+    /// 系统层设的值；系统层没设为 `null`。
+    pub system_value: Value,
+    /// 用户层真正起作用的值；没有为 `null`（写错的、与系统一致的冗余都不算）。
+    pub user_value: Value,
+}
+
 /// 一条规则的视图。
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuleView {
     pub process: String,
     pub state: RuleState,
@@ -111,6 +143,8 @@ pub struct RuleView {
     /// 用户层这一条里认不出的键（手写拼错的、或更新版本才有的字段）。它们对运行时没有任何效果，
     /// 所以不影响 `state` / `overridden`；单独列出让界面能提示，也保证写回时原样保留。
     pub unknown_keys: Vec<String>,
+    /// 本段每个已登记字段的逐字段视图（键 = 字段名，齐全，不遗漏）。
+    pub fields: BTreeMap<String, FieldView>,
 }
 
 /// 进程名校验：trim 后非空、不含路径分隔符与控制字符。返回 trim 后的名字。
@@ -231,6 +265,63 @@ fn view_in<T: DeserializeOwned + Serialize>(
                         .collect()
                 })
                 .unwrap_or_default();
+            let typed = typed_obj::<T>(&eff);
+            let user_keys: BTreeSet<String> = normalized
+                .as_ref()
+                .map(|r| effective_keys::<T>(sec_name, r).into_iter().collect())
+                .unwrap_or_default();
+            let cleared: BTreeSet<String> = normalized
+                .as_ref()
+                .and_then(|r| r.get("unset"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let fields = COMPAT_FIELDS
+                .iter()
+                .filter(|f| f.section == sec_name)
+                .map(|meta| {
+                    let key = meta.key;
+                    let system_value = s.and_then(|r| r.get(key)).cloned().unwrap_or(Value::Null);
+                    let user_value = if user_keys.contains(key) {
+                        normalized
+                            .as_ref()
+                            .and_then(|r| r.get(key))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    let source = if !user_value.is_null() {
+                        FieldSource::User
+                    } else if cleared.contains(key) {
+                        FieldSource::Cleared
+                    } else if !system_value.is_null() {
+                        FieldSource::System
+                    } else {
+                        FieldSource::Default
+                    };
+                    let value = typed.get(key).cloned().unwrap_or_else(|| match meta.kind {
+                        Kind::Bool => Value::Bool(false),
+                        Kind::Int => Value::from(0),
+                        Kind::TextList => Value::Array(Vec::new()),
+                        Kind::TriBool | Kind::Enum | Kind::Text => Value::Null,
+                    });
+                    (
+                        key.to_string(),
+                        FieldView {
+                            source,
+                            value,
+                            system_value,
+                            user_value,
+                        },
+                    )
+                })
+                .collect();
             RuleView {
                 process: name,
                 state,
@@ -240,6 +331,7 @@ fn view_in<T: DeserializeOwned + Serialize>(
                 has_user_entry: u.is_some(),
                 user: u.map(|r| Value::Object(r.clone())),
                 unknown_keys,
+                fields,
             }
         })
         .collect()
@@ -253,7 +345,7 @@ pub struct Layers {
     /// 用户层**原始**内容（要写回的那份，不能清理，见 [`sanitize`]）。
     user: Raw,
     /// 各层里被当成「没写」忽略的无效值的说明（`compat.list` 的 `warnings`）。
-    warnings: Vec<String>,
+    warnings: Vec<Problem>,
 }
 
 fn rows(raw: &Raw, sec: Section) -> &Vec<Obj> {
@@ -315,7 +407,7 @@ impl Layers {
     }
 
     /// 各层里被当成「没写」忽略的无效值的说明。
-    pub fn warnings(&self) -> &[String] {
+    pub fn warnings(&self) -> &[Problem] {
         &self.warnings
     }
 
@@ -901,7 +993,7 @@ pub fn rpc(
         }
         Err(e) => return Err(e),
     };
-    let warnings = layers.warnings().to_vec();
+    let warnings = serde_json::to_value(layers.warnings()).unwrap_or(Value::Null);
 
     let wrote = |value: Value| Ok(RpcOutcome { value, wrote: true });
     match method {
@@ -2339,11 +2431,21 @@ composition_start_pair_guard = true
             std::fs::write(dir.join(COMPAT_FILE_NAME), text).unwrap();
         }
         let l = Layers::load(Some(&d), None, Some(&u)).unwrap();
-        let w = l.warnings().join("\n");
+        let w = l.warnings();
+        assert_eq!(w.len(), 2, "{w:?}");
+        let keys: Vec<_> = w
+            .iter()
+            .map(|p| (p.section.as_str(), p.process.as_str(), p.key.as_str()))
+            .collect();
         assert!(
-            w.contains("wiat") && w.contains("englsh"),
-            "两层的无效值都要报: {w}"
+            keys.contains(&("apps", "A.exe", "first_show_mode")),
+            "带上段 / 进程 / 键: {keys:?}"
         );
+        assert!(
+            keys.contains(&("apps", "A.exe", "initial_mode")),
+            "{keys:?}"
+        );
+        assert!(w.iter().all(|p| !p.message.is_empty()));
         let r = rpc(
             "compat.list",
             &json!({"section": "apps"}),
@@ -2459,5 +2561,182 @@ composition_start_pair_guard = true
             .is_ok()
         );
         cleanup(&d, &u);
+    }
+
+    // ───────────── 逐字段视图 fields（设置端渲染的唯一依据） ─────────────
+
+    fn field_of(l: &Layers, process: &str, key: &str) -> FieldView {
+        l.view_of(Section::Apps, process)
+            .unwrap_or_else(|| panic!("规则 {process} 应存在"))
+            .fields
+            .get(key)
+            .unwrap_or_else(|| panic!("fields 缺少 {key}"))
+            .clone()
+    }
+
+    #[test]
+    fn fields_source_system_shows_factory_value_and_nothing_from_the_user() {
+        let l = layers(SYS, "");
+        let f = field_of(&l, "Weixin.exe", "caret_use_top");
+        assert_eq!(f.source, FieldSource::System);
+        assert_eq!(f.value, json!(true));
+        assert_eq!(f.system_value, json!(true));
+        assert_eq!(f.user_value, Value::Null);
+    }
+
+    #[test]
+    fn fields_source_user_when_the_user_really_differs() {
+        let l = layers(
+            SYS,
+            "[[apps]]\nprocess = \"Weixin.exe\"\nfirst_show_mode = \"wait\"\n",
+        );
+        let f = field_of(&l, "Weixin.exe", "first_show_mode");
+        assert_eq!(f.source, FieldSource::User);
+        assert_eq!(
+            (f.value, f.user_value, f.system_value),
+            (json!("wait"), json!("wait"), Value::Null)
+        );
+    }
+
+    /// 用户显式关掉出厂打开的开关：`effective` 里这个键会消失，`fields` 必须仍然说清「用户设为关」。
+    #[test]
+    fn fields_distinguish_user_off_from_user_cleared() {
+        let l = layers(
+            SYS,
+            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = false\nunset = [\"stale_probe_guard\"]\n",
+        );
+        let off = field_of(&l, "Weixin.exe", "caret_use_top");
+        assert_eq!(off.source, FieldSource::User, "显式关 = 用户改写");
+        assert_eq!(off.value, json!(false));
+        assert_eq!(off.user_value, json!(false));
+        assert_eq!(off.system_value, json!(true));
+        let cleared = field_of(&l, "Weixin.exe", "stale_probe_guard");
+        assert_eq!(cleared.source, FieldSource::Cleared, "unset = 取消出厂设定");
+        assert_eq!(
+            cleared.value,
+            json!(false),
+            "Bool 的生效值是类型化默认值 false，不是 null"
+        );
+        assert_eq!(cleared.system_value, json!(true));
+        assert_eq!(cleared.user_value, Value::Null);
+    }
+
+    #[test]
+    fn fields_source_default_when_nobody_set_it_and_values_are_typed() {
+        let l = layers(SYS, "");
+        let sec_fields = l.view_of(Section::Apps, "Weixin.exe").unwrap().fields;
+        let f = &sec_fields["first_show_mode"];
+        assert_eq!(
+            (f.source, &f.value),
+            (FieldSource::Default, &Value::Null),
+            "Enum 未设为 null"
+        );
+        assert_eq!(
+            sec_fields["caret_offset_x"].value,
+            json!(0),
+            "Int 的默认值是 0"
+        );
+        assert_eq!(
+            sec_fields["auto_pair"].value,
+            Value::Null,
+            "TriBool 未设为 null"
+        );
+        assert_eq!(
+            sec_fields["host_render"].value,
+            json!(false),
+            "Bool 的默认值是 false"
+        );
+        let scope = layers(
+            "",
+            "[[initial_mode_scope]]\nprocess = \"x.exe\"\nclasses = [\"A\"]\n",
+        );
+        assert_eq!(
+            scope
+                .view_of(Section::InitialModeScope, "x.exe")
+                .unwrap()
+                .fields["classes"]
+                .value,
+            json!(["A"])
+        );
+    }
+
+    #[test]
+    fn fields_ignore_invalid_and_redundant_user_values() {
+        let l = layers(
+            SYS,
+            "[[apps]]\nprocess = \"Weixin.exe\"\nfirst_show_mode = \"wiat\"\ncaret_use_top = true\n",
+        );
+        assert_eq!(
+            field_of(&l, "Weixin.exe", "first_show_mode").source,
+            FieldSource::Default,
+            "写错的值当没写"
+        );
+        let same = field_of(&l, "Weixin.exe", "caret_use_top");
+        assert_eq!(
+            same.source,
+            FieldSource::System,
+            "与系统一致的冗余不算用户改写"
+        );
+        assert_eq!(same.user_value, Value::Null);
+    }
+
+    /// 每条规则的 `fields` 必须包含本段**全部**已登记字段，界面据此逐行渲染，不能漏。
+    #[test]
+    fn fields_cover_every_registered_field_of_the_section() {
+        let l = layers(SYS, USER_A);
+        for sec in [
+            Section::Apps,
+            Section::InitialModeScope,
+            Section::CommitNewline,
+        ] {
+            let want: BTreeSet<_> = known_keys(sec.as_str())
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            for v in l.view(sec) {
+                let got: BTreeSet<_> = v.fields.keys().cloned().collect();
+                assert_eq!(got, want, "{} / {}", sec.as_str(), v.process);
+            }
+        }
+        let l2 = layers(
+            "",
+            "[[commit_newline]]\nprocess = \"W.exe\"\nstyle = \"cr\"\n",
+        );
+        assert!(l2.view_of(Section::CommitNewline, "W.exe").is_some());
+    }
+
+    /// 对外 JSON 统一 camelCase（与导入预览、`dryRun` 参数一致）：界面不必猜每个键是哪种写法。
+    #[test]
+    fn view_and_schema_serialize_in_camel_case() {
+        let l = layers(SYS, USER_A);
+        let v = serde_json::to_value(l.view_of(Section::Apps, "Weixin.exe").unwrap()).unwrap();
+        for k in [
+            "hasUserEntry",
+            "unknownKeys",
+            "fields",
+            "overridden",
+            "effective",
+        ] {
+            assert!(v.get(k).is_some(), "缺少 {k}: {v}");
+        }
+        assert!(
+            v.get("has_user_entry").is_none() && v.get("unknown_keys").is_none(),
+            "不得留下 snake_case: {v}"
+        );
+        assert!(
+            v["fields"]["caret_use_top"].get("systemValue").is_some(),
+            "{v}"
+        );
+        let schema = crate::compat_schema::schema_json();
+        let dep = schema["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == "candidate_x")
+            .unwrap();
+        assert!(
+            dep.get("dependsOn").is_some() && dep.get("depends_on").is_none(),
+            "{dep}"
+        );
     }
 }

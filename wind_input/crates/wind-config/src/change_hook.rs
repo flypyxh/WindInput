@@ -37,3 +37,24 @@ pub(crate) fn notify_changed(path: &[&str], value: &toml::Value) {
         hook(path, value);
     }
 }
+
+/// 兼容规则（`compat.toml` 用户层）落盘后的回调：参数为写入来源（如 `"menu"`）与被写的用户目录。
+///
+/// 只覆盖**不经 RPC 的写入**（右键菜单）：经 `compat.*` RPC 的写入已由 wind-rpc 的 dispatch 广播，
+/// 这里再发就是重复。带上用户目录是为了让测试能只认自己那一次写入（钩子是进程级的，
+/// 并行测试共享它）。
+pub type CompatChangeHook = Arc<dyn Fn(&str, &std::path::Path) + Send + Sync>;
+
+static COMPAT_HOOK: OnceLock<CompatChangeHook> = OnceLock::new();
+
+/// 注册回调（进程内仅首次生效，重复注册静默忽略）。
+pub fn set_compat_change_hook(hook: CompatChangeHook) {
+    let _ = COMPAT_HOOK.set(hook);
+}
+
+/// 通知兼容规则已落盘。仅在写入**成功**后调用。
+pub(crate) fn notify_compat_changed(source: &str, user_dir: &std::path::Path) {
+    if let Some(hook) = COMPAT_HOOK.get() {
+        hook(source, user_dir);
+    }
+}

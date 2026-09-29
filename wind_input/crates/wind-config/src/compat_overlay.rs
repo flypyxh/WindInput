@@ -291,6 +291,16 @@ pub(crate) fn field_value_problem<T: DeserializeOwned>(
     (!fallbacks.is_empty()).then(|| format!("字段 {key} 的值 {v} 无效"))
 }
 
+/// 一处被当成「没写」忽略的无效内容：哪一段、哪个进程、哪个键、原因。
+/// （`compat.list` 的 `warnings`；带上下文是为了让界面能定位到具体规则。）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Problem {
+    pub section: String,
+    pub process: String,
+    pub key: String,
+    pub message: String,
+}
+
 /// 参与叠加之前先把无效的值当成「没写」剔掉。返回（清理后的行，每处剔除的说明）。
 ///
 /// 只清理**会参与叠加的副本**：调用方持有的原始行（要写回文件的那份）不动，
@@ -298,7 +308,7 @@ pub(crate) fn field_value_problem<T: DeserializeOwned>(
 pub(crate) fn sanitize<T: DeserializeOwned>(
     section: &str,
     rows: &[Obj],
-) -> (Vec<Obj>, Vec<String>) {
+) -> (Vec<Obj>, Vec<Problem>) {
     let mut report = Vec::new();
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
@@ -328,14 +338,19 @@ pub(crate) fn sanitize<T: DeserializeOwned>(
                 _ => field_value_problem::<T>(section, &k, &row[&k]),
             };
             if let Some(p) = problem {
-                report.push(format!("{section}.{name}: {p}，已忽略"));
+                report.push(Problem {
+                    section: section.to_string(),
+                    process: name.clone(),
+                    key: k.clone(),
+                    message: format!("{p}，已忽略"),
+                });
                 row.remove(&k);
             }
         }
         out.push(row);
     }
-    for line in &report {
-        tracing::warn!("compat.toml: {line}");
+    for p in &report {
+        tracing::warn!("compat.toml: {}.{}: {}", p.section, p.process, p.message);
     }
     (out, report)
 }

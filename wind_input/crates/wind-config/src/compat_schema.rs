@@ -40,6 +40,7 @@ pub struct Dep {
 
 /// 一个字段的元数据。
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FieldMeta {
     /// 所属段：`apps` / `initial_mode_scope` / `commit_newline`。
     pub section: &'static str,
