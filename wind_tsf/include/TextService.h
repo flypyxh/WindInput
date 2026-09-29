@@ -788,6 +788,11 @@ private:
     // 失败或无 InputScope 时返回 0。随 focus_gained 上报给 Go 端做密码框等决策。
     UINT64 _QueryInputScopeMask(ITfDocumentMgr* pDocMgr);
 
+    // 激活（含切回本输入法）时补读一次当前焦点的 InputScope / context 级 KEYBOARD_DISABLED，
+    // 更新自留掩码并上报 input_state_report。原因：切换输入法不会重发 OnSetFocus，
+    // 新实例若不补读，服务端会一直沿用上一实例留下的密码态。
+    void _ReportFocusInputStateOnActivate();
+
     // 判断焦点 context 是否被宿主置 GUID_COMPARTMENT_KEYBOARD_DISABLED（禁用输入法）。
     // Weasel/小狼毫用此判定密码框：Chromium 密码框置位、无痕普通框不置位，精确区分。
     bool _IsFocusKeyboardDisabled(ITfDocumentMgr* pDocMgr);

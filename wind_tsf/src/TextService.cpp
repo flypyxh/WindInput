@@ -1363,6 +1363,12 @@ STDAPI CTextService::ActivateEx(ITfThreadMgr* pThreadMgr, TfClientId tfClientId,
     // still be starting after first install).
     _DoFullStateSync(); // 内含 UIElement 状态上报（UI-less 线程从激活起就不弹窗）
 
+    // 切换输入法不会重发 OnSetFocus：不在这里补读，服务端就沿用上一个实例留下的密码态
+    // （实测 Zen：页面无焦点时 context 级 KEYBOARD_DISABLED 被折成 IS_PASSWORD，
+    // 切走再切回后图标一直显「英」）。必须排在 IMEActivated 之后——同一 bridge 线程按序处理，
+    // 服务端先清旧态、再收到这份新读数。
+    _ReportFocusInputStateOnActivate();
+
     // NOTE: Using synchronous IPC mode (no reader thread)
     // Reference: Weasel uses sync IPC with librime and it works well
     // The reader thread is not started - responses are received synchronously in OnKeyDown
@@ -5069,6 +5075,38 @@ static bool ReadContextCompartmentBool(ITfContext* pContext, REFGUID guid, const
     }
     WIND_LOG_DEBUG_FMT(L"compartment %s = %d", name, value ? 1 : 0);
     return value;
+}
+
+// 激活时补读当前焦点的密码信号并上报，语义与 OnSetFocus 的读取段一致（rawScope + context 级
+// KEYBOARD_DISABLED 折成 IS_PASSWORD 位）。拿不到焦点文档 / 不可编辑时不上报：服务端在
+// handle_ime_activated 里已把诊断态清零，「没有信号」就是「非密码」。
+void CTextService::_ReportFocusInputStateOnActivate()
+{
+    if (_pThreadMgr == nullptr || _pIPCClient == nullptr || !_pIPCClient->IsConnected())
+        return;
+
+    ITfDocumentMgr* pDocMgr = nullptr;
+    if (FAILED(_pThreadMgr->GetFocus(&pDocMgr)) || pDocMgr == nullptr)
+        return;
+
+    UINT64 mask = 0;
+    bool ctxDisabled = false;
+    if (_DocMgrHasEditableContext(pDocMgr))
+    {
+        mask = _QueryInputScopeMask(pDocMgr);
+        ctxDisabled = _IsFocusKeyboardDisabled(pDocMgr);
+    }
+    pDocMgr->Release();
+
+    _focusIsPassword = ctxDisabled;
+    if (ctxDisabled)
+        mask |= kScopeBitPassword;
+    _focusInputScopeMask = mask;
+
+    WIND_LOG_DEBUG_FMT(L"compat.activate.signals rawScopeWithPwd=0x%llX ctxKbdDisabled=%d threadKbdDisabled=%d",
+                       mask, ctxDisabled ? 1 : 0, _bKeyboardDisabled ? 1 : 0);
+    _pIPCClient->SendInputStateReport(GetCurrentProcessId(), _bKeyboardDisabled != FALSE,
+                                      ComputeInputReason(_bKeyboardDisabled != FALSE, mask), mask);
 }
 
 // 判断焦点 context 是否被宿主标记为"禁用输入法"（GUID_COMPARTMENT_KEYBOARD_DISABLED）。

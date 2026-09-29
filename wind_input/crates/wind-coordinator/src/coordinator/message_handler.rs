@@ -2669,6 +2669,10 @@ impl MessageHandler for Coordinator {
             s.has_edit_context = true;
             s.focus_no_edit_ctx = false;
         }
+        // 输入诊断态（密码抑制 / 禁用）是按焦点采的读数，切走本输入法后不会有人更新它；
+        // 不清就会让新实例沿用上一实例留下的密码态（实测 Zen：无焦点态被判成密码，切回后图标恒显「英」）。
+        // 清零后由 DLL 随后补发的 input_state_report 覆盖（同一 bridge 线程按序处理）。
+        self.apply_input_diag((client_token >> 32) as u32, false, 0, 0);
         let status = self.build_status();
         self.push_activation_status(client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 foreground_fullscreen_kind 阻塞 bridge 线程）
