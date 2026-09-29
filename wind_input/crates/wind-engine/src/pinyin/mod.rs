@@ -4275,11 +4275,12 @@ impl Engine for PinyinEngine {
         // 已经输入的字母）在类型上同为「不精确」，方向却相反。按类型禁用会把正在输入中的
         // `wanl` 一并打死 —— 实测过滤后 `wanl` 仍有 151 条候选，正是这条判据的价值。
         //
-        // 基准取 `input.len()` 而非 `query.len()`：上一段刚把 `consumed_length` 回映射到
-        // **原始输入空间**（双拼 → 击键数、含分隔符 → 含 `'` 的串），`query`（剥除分隔符后）
-        // 与它不同域。无分隔符的全拼下二者相等，取错只在双拼/分隔符场景静默失效。
+        // 基准取 `raw_input.len()`：上一段刚把 `consumed_length` 回映射到**原始输入空间**
+        // （双拼 → 击键数、含分隔符 → 含 `'` 的串）。`query`（剥除分隔符后）与它不同域；
+        // ⚠️ `input` 也不行——双拼下它早被换成转换后的全拼（`nihc` → `nihao`，5 > 4 键），
+        // 曾因此把双拼的整串候选全部当成半截丢光。全拼下 `raw_input == input`，行为不变。
         if require_full_match {
-            candidates.retain(|c| c.consumed_length == 0 || c.consumed_length >= input.len());
+            candidates.retain(|c| c.consumed_length == 0 || c.consumed_length >= raw_input.len());
         }
 
         // ⚠️ **引擎侧刻意不用「消费长度优先」排序**（协调器 `candidate_display_order` 用）。
@@ -6021,6 +6022,30 @@ mod tests {
             "「你好」consumed_length 应为双拼键数 4（\"nihc\" 的长度），实际为 {}",
             nihao.consumed_length
         );
+    }
+
+    /// `require_full_match` 在双拼下按**击键数**判「吃满整串」：`consumed_length` 已回映射到
+    /// 击键域（`nihc` 的「你好」= 4），基准若取转换后的全拼（`nihao` = 5）会把整串候选
+    /// 全部当成半截丢光。直接辅助码对前缀单独解码时依赖这一条（`docs/design/aux-code-direct.md`）。
+    #[test]
+    fn require_full_match_uses_keystroke_length_under_shuangpin() {
+        let eng = sp_fp_engine(
+            "rfm",
+            &[
+                ("你好", "ni hao", 1000),
+                ("你", "ni", 900),
+                ("拟", "ni", 800),
+            ],
+            false,
+        );
+        let opts = ConvertOptions {
+            require_full_match: true,
+            ..Default::default()
+        };
+        let r = eng.convert_with_opts("nihc", 50, opts).unwrap();
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"你好"), "吃满整串的词必须留下：{texts:?}");
+        assert!(!texts.contains(&"你"), "只吃 2 键的单字应被丢弃：{texts:?}");
     }
 
     // ===== 全拼降级支路（双拼方案下允许全拼输入，`allow_full_pinyin`）=====
