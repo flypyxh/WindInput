@@ -6098,9 +6098,12 @@ pub struct UiCandidateConfig {
     /// 横竖各一份，与模板同理：横排全部候选共享一行宽度，竖排每行独占，长度预算差一个
     /// 数量级。共用一份的话，为竖排放宽必然把横排也放宽。旧键 `comment_max_chars`
     /// （横竖共用）已退役，值经 [`Config::migrate_comment_max_chars_value`] 抄进两份。
+    ///
+    /// 开启 [`Self::comment_above`] 后，上限按上下两段各自计算（两段互不挤占）。
     #[serde(default)]
     pub comment_max_chars_vertical: usize,
-    /// **横排**注释段的最大字数（0=不限）。见 [`Self::comment_max_chars_vertical`]。
+    /// **横排**注释段的最大字数（0=不限）。见 [`Self::comment_max_chars_vertical`]；
+    /// 开启 [`Self::comment_above`] 后同样按上下两段各自计算。
     #[serde(default)]
     pub comment_max_chars_horizontal: usize,
     /// 自定义序号标签，一槽一项（如 `["a","s","d"]`、`["Ⅰ","Ⅱ","Ⅲ"]`；空表=全部默认 1-9）。

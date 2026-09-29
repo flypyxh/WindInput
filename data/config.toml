@@ -1293,11 +1293,12 @@ min_rows = 0
 comment_template_vertical = "${code_hint|code_rev|shuangpin}"
 comment_template_horizontal = "${code_hint|code_rev|shuangpin}"
 # 注释段最大字数（0=不限），超出截断并加省略号。横竖各一份：横排全部候选共享一行宽度，
-# 竖排每行独占，能放多少本就不是同一个答案。
+# 竖排每行独占，能放多少本就不是同一个答案。开启下方 comment_above 后，上限按上下两段各自计算。
 comment_max_chars_vertical = 0
 comment_max_chars_horizontal = 0
 # 上方注释条：开启后，注释模板里的第一个字面 \n 把注释拆成上下两段，上段显示在候选上方一行，
 # 下段仍在候选右侧。\n 要写在 {…} 之外（{…} 内的 \n 在该段为空时随之消失）。关闭时不拆分。
+# 开启后 comment_max_chars_* 按上下两段各自计算；上段里变量值自带的换行会折成空格（上方条恒单行）。
 # 例：拼音放上方、拆字放右侧 → "${pinyin}\n${chaizi}"
 comment_above = false
 # 词库自带 comment 列时自动当注释源用（供 ${dict} 查询），无需手工挂载。

@@ -22,6 +22,7 @@
 | 8 | 方案文件 | `[engine.codetable].show_code_hint` | 方案级，门控 `${code_hint}` 的**生产** |
 | 9 | 主题 | `[comment]` ViewNode | 主题级（样式） |
 | 10 | config.toml | `ui.tooltip.*` | 全局，相邻但独立的悬停提示 |
+| 11 | config.toml + 主题 | `ui.candidate.comment_above` + 主题 `[comment_above]` ViewNode | 全局开关（不进三态）+ 主题级样式；见 `candidate-comment-above-line.md` |
 
 ★ **散的是配置面，不是代码面**：`comment.rs` 始终是模板的唯一消费点，`comment_for` 是唯一
 渲染入口。这决定了本轮是**加一层**而不是拆重构。
