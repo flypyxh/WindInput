@@ -4124,6 +4124,21 @@ mod compat_reload_tests {
     use wind_config::Config;
 
     /// 设置端写完规则后，前台进程必须立即按新规则重算，而不是等切走再切回。
+    /// 右键菜单与设置端「应用兼容」的候选窗首显文案必须一致（设置端取的是核心登记的
+    /// `compat_schema::OPTION_LABELS`）：两边各写一份，改一边漏一边用户就会看到两套说法。
+    #[test]
+    fn first_show_menu_labels_match_the_settings_option_labels() {
+        for (_, mode, label) in Coordinator::FIRST_SHOW_MENU {
+            let Some(mode) = mode else { continue };
+            assert_eq!(
+                wind_config::compat_schema::option_label(mode.as_config()),
+                Some(label),
+                "{} 的菜单文案与设置端不一致",
+                mode.as_config()
+            );
+        }
+    }
+
     #[test]
     fn reload_compat_and_refresh_applies_new_rule_to_the_focused_process_immediately() {
         let user = std::env::temp_dir().join(format!("wind_compat_reload_{}", std::process::id()));
