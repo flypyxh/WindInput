@@ -6399,6 +6399,7 @@ impl Coordinator {
                     },
                     tooltip,
                     comment,
+                    comment_above: Default::default(),
                     no_index: hide_index,
                 }
             })

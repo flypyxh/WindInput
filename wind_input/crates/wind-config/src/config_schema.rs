@@ -600,6 +600,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.comment_template_horizontal", Str),
     f("ui.candidate.comment_max_chars_vertical", Int),
     f("ui.candidate.comment_max_chars_horizontal", Int),
+    f("ui.candidate.comment_above", Bool),
     f("ui.candidate.auto_comment_dicts", Bool),
     f("ui.comment_dicts", StructList),
     f("ui.candidate.index_labels", StrList),

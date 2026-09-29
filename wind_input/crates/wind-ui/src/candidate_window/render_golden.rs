@@ -101,6 +101,7 @@ fn candidates() -> Vec<CandidateItem> {
         label: String::new(),
         tooltip: Default::default(),
         comment,
+        comment_above: Default::default(),
         no_index: false,
     };
     // 下标 0 选中、1 悬停、2/3 常态（一条无注释、一条有）。

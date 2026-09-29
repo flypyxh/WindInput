@@ -6071,6 +6071,13 @@ pub struct UiCandidateConfig {
     /// **横排**候选的注释段模板。见 [`Self::comment_template_vertical`]。
     #[serde(default = "default_comment_template")]
     pub comment_template_horizontal: String,
+    /// 上方注释条（默认关）：开启后注释模板里的**第一个字面 `\n`**（写在 `{…}` 之外）把注释
+    /// 拆成上下两段，上段显示在候选上方一行，下段仍在候选右侧。关闭时不拆分，行为与本项
+    /// 引入前逐字节一致。
+    ///
+    /// 全局一份：不进模式级 / 方案级三态，也不分横竖。
+    #[serde(default)]
+    pub comment_above: bool,
     /// 自动把**词库自带的 `comment` 列**当注释源用（默认开）。
     ///
     /// 方案声明的词库里若显式写了 `columns: [text, code, comment]`，那份注释本就是随词库
@@ -6248,6 +6255,7 @@ impl Default for UiCandidateConfig {
             min_rows: 0,
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),
+            comment_above: false,
             auto_comment_dicts: true,
             comment_max_chars_vertical: 0,
             comment_max_chars_horizontal: 0,
@@ -12641,6 +12649,14 @@ scripts = { latin = 42 }
                 "{v} 解析结果与自身不符"
             );
         }
+    }
+
+    #[test]
+    fn comment_above_defaults_off_and_round_trips() {
+        let cfg = Config::default();
+        assert!(!cfg.ui.candidate.comment_above);
+        let v: Config = toml::from_str("[ui.candidate]\ncomment_above = true\n").unwrap();
+        assert!(v.ui.candidate.comment_above);
     }
 
     /// ★ `comment_max_chars`（横竖共用）→ 两个方向各一份。配过非 0 值的用户升级后

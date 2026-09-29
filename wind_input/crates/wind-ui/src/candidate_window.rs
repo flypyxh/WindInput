@@ -4393,6 +4393,7 @@ mod min_size_tests {
             label: String::new(),
             tooltip: Default::default(),
             comment: comment.into(),
+            comment_above: Default::default(),
             no_index: false,
         }
     }
@@ -4979,6 +4980,7 @@ mod pager_inline_tests {
             label: String::new(),
             tooltip: Default::default(),
             comment: Default::default(),
+            comment_above: Default::default(),
             no_index: false,
         }
     }
@@ -5518,6 +5520,7 @@ mod width_budget_tests {
             label: String::new(),
             tooltip: Default::default(),
             comment: Default::default(),
+            comment_above: Default::default(),
             no_index: false,
         }
     }
@@ -5995,6 +5998,7 @@ mod schema_font_tests {
             label: String::new(),
             tooltip: Default::default(),
             comment: Default::default(),
+            comment_above: Default::default(),
             no_index: false,
         }
     }
@@ -6750,6 +6754,7 @@ mod font_precedence_tests {
                 label: String::new(),
                 tooltip: Default::default(),
                 comment: "注".into(),
+                comment_above: Default::default(),
                 no_index: false,
             })
             .collect();
@@ -7168,6 +7173,7 @@ mod tip_hold_tests {
             label: String::new(),
             tooltip: std::sync::Arc::new(doc()),
             comment: Default::default(),
+            comment_above: Default::default(),
             no_index: false,
         };
         w.candidates = vec![item("你"), item("拟")];
@@ -7531,6 +7537,7 @@ mod comment_color_tests {
             label: String::new(),
             tooltip: Default::default(),
             comment: c,
+            comment_above: Default::default(),
             no_index: false,
         }
     }

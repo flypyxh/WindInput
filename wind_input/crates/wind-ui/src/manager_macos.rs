@@ -832,6 +832,7 @@ mod tests {
             label: String::new(),
             tooltip: Default::default(),
             comment: Default::default(),
+            comment_above: Default::default(),
             no_index: false,
         }
     }

@@ -17,6 +17,8 @@ pub struct CandidateItem {
     /// 候选注释（编码后缀/短语提示等），非空时在候选词右侧以注释样式内联显示；空则不显示。
     /// 模板渲染出的注释带分段样式（角色 / 内联色）；其余来源 `String::into()` 即无样式。
     pub comment: StyledText,
+    /// 上方注释条（`ui.candidate.comment_above` 开启且模板含字面 `\n` 时的上段）；空 = 无上方条。
+    pub comment_above: StyledText,
     /// 为 true 时完全不渲染序号节点（用于非候选的提示行，如快捷加词预览），
     /// 避免默认主题下出现空的序号圆圈。
     pub no_index: bool,

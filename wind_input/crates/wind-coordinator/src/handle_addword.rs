@@ -1364,6 +1364,7 @@ impl Coordinator {
             label: String::new(),
             tooltip: Default::default(),
             comment: comment.into(),
+            comment_above: Default::default(),
             no_index: true,
         };
         // 来源后缀与 Tab 提示**恒显示**，不随哪一侧有没有内容变化：面板在两个来源下必须
