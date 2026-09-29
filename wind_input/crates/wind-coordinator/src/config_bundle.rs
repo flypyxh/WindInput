@@ -239,7 +239,13 @@ pub(crate) struct SchemaKeyUnion {
 }
 
 /// 算一次跨方案并集。
-pub(crate) fn schema_key_union(mgr: &EngineManager) -> SchemaKeyUnion {
+///
+/// `codetable` 是**即将生效**那份配置的全局码表设置（`config.schema.codetable`）。显式传入
+/// 而不从 `mgr` 取：热重载里本函数先于 `reload_from_config` 执行，管理器手里还是旧值。
+pub(crate) fn schema_key_union(
+    mgr: &EngineManager,
+    codetable: &wind_config::CodetableGlobal,
+) -> SchemaKeyUnion {
     SchemaKeyUnion {
         modifier_vks: schema_bound_modifier_vks(mgr),
         session_key_names: mgr.all_session_action_keys(),
@@ -251,7 +257,7 @@ pub(crate) fn schema_key_union(mgr: &EngineManager) -> SchemaKeyUnion {
             .filter_map(|name| crate::key_resolver::key_action_name_to_vk(name))
             .collect(),
         custom_covered_chars: schema_custom_covered_punct_chars(mgr),
-        wildcard_keys: mgr.installed_wildcard_keys(),
+        wildcard_keys: mgr.installed_wildcard_keys(codetable),
     }
 }
 
@@ -595,11 +601,6 @@ mod reload_tests {
         );
     }
 
-    /// ★ 去重：方案绑的键若全局已登记，不再追加第二条。
-    ///
-    /// 重复条目不改变行为（`.find()` 先到先得且两条一模一样），但会让推给 C++ 的表随方案
-    /// 数量膨胀，也让「切方案前后推送字节不变」这条验证手段失去意义——那正是并集策略是否
-    /// 生效的唯一凭据。
     /// 开了通配的方案以 `/` 为键 ⇒ `/` 从中英两份透传集里减去（否则空缓冲时 C++ 不吃，
     /// 首位通配到不了 core）。对照：未开（并集为空）时 `/` 照旧透传，两份集合与出厂逐字节相同。
     #[test]
@@ -623,6 +624,11 @@ mod reload_tests {
         assert_eq!(on.cn_passthrough_punct_chars, expect_cn, "只减通配键一个");
     }
 
+    /// ★ 去重：方案绑的键若全局已登记，不再追加第二条。
+    ///
+    /// 重复条目不改变行为（`.find()` 先到先得且两条一模一样），但会让推给 C++ 的表随方案
+    /// 数量膨胀，也让「切方案前后推送字节不变」这条验证手段失去意义——那正是并集策略是否
+    /// 生效的唯一凭据。
     #[test]
     fn schema_session_key_already_registered_globally_is_not_duplicated() {
         let mut cfg = Config::default();

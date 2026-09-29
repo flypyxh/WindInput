@@ -246,6 +246,32 @@ mod tests {
         assert!(!c.wildcard_enters(&st, 'z'), "overlay 激活时不作通配");
     }
 
+    /// `refresh_config_in_memory` 改了全局通配开关 ⇒ 透传集按**新**配置重算。
+    /// 从管理器自身的全局副本取的话，这里拿到的仍是构造时的旧开关。
+    #[test]
+    fn refresh_config_in_memory_recomputes_wildcard_passthrough() {
+        let Some(c) = wubi_z(|cfg| {
+            cfg.schema.codetable.wildcard = false;
+            cfg.schema.codetable.wildcard_key = "/".into();
+        }) else {
+            return;
+        };
+        assert!(
+            c.rt().cn_passthrough_punct_chars.contains(&'/'),
+            "前置：关闭时透传"
+        );
+        c.refresh_config_in_memory(|cfg| cfg.schema.codetable.wildcard = true);
+        assert!(
+            !c.rt().cn_passthrough_punct_chars.contains(&'/'),
+            "开启后 `/` 不再透传"
+        );
+        c.refresh_config_in_memory(|cfg| cfg.schema.codetable.wildcard = false);
+        assert!(
+            c.rt().cn_passthrough_punct_chars.contains(&'/'),
+            "关回后恢复透传"
+        );
+    }
+
     /// `z_key_repeat` 按**配置开关**让位，与有无上屏历史无关（新建协调器无历史）。
     /// 按 `z_key_repeat_text()` 判的话这里会得 Enter，同一串缓冲前后解释不一。
     #[test]

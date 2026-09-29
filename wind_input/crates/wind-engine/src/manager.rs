@@ -4098,12 +4098,14 @@ impl EngineManager {
     /// 而那些键在拼音下产物不变——吃了再吐会撞非 TSF 宿主的虚拟键码表。
     ///
     /// 非法键直接跳过、**不告警**：告警只在 `build_engine` 出一次，这里随每次配置重建会重复。
-    pub fn installed_wildcard_keys(&self) -> std::collections::BTreeSet<char> {
-        let global = self
-            .codetable
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+    ///
+    /// ★ 全局基线 `global` 由调用方**显式传入**（即将生效的那份配置的 `schema.codetable`），
+    /// 不读 `self.codetable`：热重载先建配置快照、后 `reload_from_config` 刷新本管理器，
+    /// 读自身副本拿到的是**上一版**全局开关——设置里开关通配后透传集要等下一次重建才跟上。
+    pub fn installed_wildcard_keys(
+        &self,
+        global: &wind_config::CodetableGlobal,
+    ) -> std::collections::BTreeSet<char> {
         let data_dir = self.data_dir.as_deref();
         let ov = self.override_dir.as_deref();
         let mut out = std::collections::BTreeSet::new();
@@ -4114,7 +4116,7 @@ impl EngineManager {
             if s.is_pinyin() || s.is_mixed() {
                 continue;
             }
-            let ct = Self::resolve_codetable(&id, data_dir, &global, ov);
+            let ct = Self::resolve_codetable(&id, data_dir, global, ov);
             if ct.wildcard
                 && let Some(k) = wind_config::config::parse_wildcard_key(&ct.wildcard_key)
             {
