@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 const CONFIG_LOAD_SITES: &[(&str, usize, &str)] = &[
     ("apps/repl/src/main.rs", 1, "只读：REPL 内存消费，不写盘"),
     (
+        "crates/wind-engine/src/pinyin/step4_skip_tests.rs",
+        1,
+        "只读：忽略测试里读真实词库目录的配置来构造引擎做对拍，内存消费，不写盘",
+    ),
+    (
         "apps/service/src/config_cli.rs",
         2,
         "cmd_export 已闸（is_degraded ⇒ 拒绝导出）；load_value 只读单键显示",
