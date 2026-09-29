@@ -1252,7 +1252,7 @@ pub struct PinyinGlobalConfig {
 /// （schema-config-layering.md §4）：那里放 `files`（这个方案配哪张码表，属方案属性），
 /// 本段放「这台机器怎么用辅助码」的行为基线，方案可用 tri-state `Option` 逐字段覆盖。
 ///
-/// 两个字段的出厂值恰好都是类型默认值（`false` / `0`），故用 `derive(Default)`
+/// 全部字段的出厂值恰好都是类型默认值（`false` / `0`），故用 `derive(Default)`
 /// 而非手写 `impl`——**这不是巧合而是设计**：出厂值必须是「什么都不发生」。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AuxCodeGlobal {
@@ -1272,6 +1272,15 @@ pub struct AuxCodeGlobal {
     /// 单字恒参与匹配，不受此限。
     #[serde(default)]
     pub max_phrase_len: usize,
+    /// 直接辅助码（**仅双拼**）：不按引导键，输入末 1～2 位自动当辅码，字形对得上的字词
+    /// 提到前面（`docs/design/aux-code-direct.md`）。**出厂 `false`**。
+    ///
+    /// 只在 [`Self::enabled`] 也生效时起作用：`enabled` 是总闸（码表加载），本项只决定
+    /// 「末尾字母要不要自动判为辅码」。它改变了末尾字母的语义，要用户表态，故出厂关——
+    /// 与 `enabled` 同一条「默认什么都不发生」。全拼方案写了也不生效（`lim` 既可能是
+    /// li+m 也可能是「厘米」简拼），见 `EngineManager::aux_code_settings_of`。
+    #[serde(default)]
+    pub direct: bool,
 }
 
 impl AuxCodeGlobal {
@@ -1289,6 +1298,9 @@ impl AuxCodeGlobal {
         }
         if let Some(v) = o.max_phrase_len {
             out.max_phrase_len = v;
+        }
+        if let Some(v) = o.direct {
+            out.direct = v;
         }
         out
     }

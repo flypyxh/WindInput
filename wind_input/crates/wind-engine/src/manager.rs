@@ -316,6 +316,10 @@ pub struct AuxCodeSettings {
     pub enabled: bool,
     /// 词组长度上限（0 = 不限）。
     pub max_phrase_len: usize,
+    /// 直接辅助码最终是否生效：`enabled` 生效、`direct` 经方案 tri-state 折叠为真，且方案
+    /// **是双拼**（`[engine] type = "pinyin"` + `[engine.pinyin] scheme = "shuangpin"`）。
+    /// 全拼写了 `direct = true` 这里为 false 并告警一次（设计 §7）。
+    pub direct: bool,
     /// 已解析的来源，顺序即优先级。**`enabled == false` 时恒空**（关闭即不解析）。
     pub sources: Vec<AuxSource>,
 }
@@ -4435,11 +4439,22 @@ impl EngineManager {
             .aux_code
             .clone();
         let id = schema_id.to_string();
-        let spec = (!id.is_empty())
+        let schema = (!id.is_empty())
             .then(|| Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref()))
-            .flatten()
-            .map(|s| s.engine.aux_code);
+            .flatten();
+        let is_shuangpin = schema.as_ref().is_some_and(|s| {
+            s.engine.engine_type.eq_ignore_ascii_case("pinyin")
+                && s.engine.pinyin.scheme.eq_ignore_ascii_case("shuangpin")
+        });
+        let spec = schema.map(|s| s.engine.aux_code);
         let resolved = global.resolved(spec.as_ref());
+        // 直接辅助码只做双拼（设计 §2：全拼 `lim` 既可能是 li+m 也可能是「厘米」简拼）。
+        // 全拼写了 `direct = true` 不生效——这是配置错误，报一次足够定位（与来源告警同一节流）。
+        let direct = resolved.enabled && resolved.direct;
+        if direct && !is_shuangpin && self.first_aux_source_warn(schema_id, "\0direct") {
+            tracing::warn!("直接辅助码只支持双拼方案，方案 {schema_id} 的 direct = true 不生效");
+        }
+        let direct = direct && is_shuangpin;
         // 关闭时不解析路径：省掉 N 次目录探测，也避免为一个用不上的功能刷 warn。
         let sources = if resolved.enabled {
             spec.map(|c| {
@@ -4484,6 +4499,7 @@ impl EngineManager {
         AuxCodeSettings {
             enabled: resolved.enabled,
             max_phrase_len: resolved.max_phrase_len,
+            direct,
             sources,
         }
     }
