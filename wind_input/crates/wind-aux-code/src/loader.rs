@@ -88,7 +88,7 @@ fn parse_name_from_first_line(first_line: &str) -> Option<String> {
 /// `阿=ek`、`厑=ib`、`厑=ii`。
 ///
 /// - 空行与 `#` 注释行跳过；无 `=`、左侧非单字或右侧为空码的行整行跳过
-/// - 右侧按空白拆成多个码（`七=a p` = `七=a` + `七=p`）
+/// - 右侧按空白拆成多个码（`七=a p` = `七=a` + `七=p`），行内 `#` 起的注释先剥掉
 /// - 开头剥掉 UTF-8 BOM、孤立 `\r` 行尾折成 `\n`（见 [`wind_utils::text::normalize_input`]）：
 ///   前者避免首行字被当成非单字跳掉，后者避免整份文件被当成一行——带 `# name:` 头的
 ///   出厂表在那种情况下会被整个当成一条注释，0 条且无任何提示
@@ -115,7 +115,9 @@ pub(crate) fn parse_str(content: &str) -> AuxCodeTable {
             continue; // 无 =：不是 `字=码` 形态
         };
         let head = head.trim();
-        let code = code.trim();
+        // 行内 `#` 注释先剥掉再拆码（码只有字母，`#` 不会是码的一部分）：否则 `七=a # 注`
+        // 按空白一拆，`#`、`注` 都成了码。
+        let code = code.split('#').next().unwrap_or_default().trim();
         if code.is_empty() {
             continue; // 空码 = 没码
         }
@@ -156,6 +158,15 @@ mod tests {
         let t = parse_str("七=a p\n八=b\tq  r\n七=p\n七=s\n");
         assert_eq!(t.codes_of('七').collect::<Vec<_>>(), vec!["a", "p", "s"]);
         assert_eq!(t.codes_of('八').collect::<Vec<_>>(), vec!["b", "q", "r"]);
+    }
+
+    /// 行内 `#` 注释在拆码之前剥掉：`七=a # 注` 只有码 `a`，不能把 `#`、`注` 也当成码。
+    #[test]
+    fn parse_str_strips_inline_comment_before_splitting() {
+        let t = parse_str("七=a p # 手心\n八=b#注\n九= # 只有注释\n");
+        assert_eq!(t.codes_of('七').collect::<Vec<_>>(), vec!["a", "p"]);
+        assert_eq!(t.codes_of('八').collect::<Vec<_>>(), vec!["b"]);
+        assert!(t.first_code('九').is_none(), "剥完注释是空码：整行跳过");
     }
 
     /// 非 UTF-8 文件（手心表常见 GBK）：告警「请转存为 UTF-8」并产出空表，不 panic、不乱码入表。
