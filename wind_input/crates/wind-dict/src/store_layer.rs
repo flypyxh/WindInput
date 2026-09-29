@@ -59,6 +59,44 @@ fn sort_trunc(mut v: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
     v
 }
 
+/// 通配结果的排序截断：等长档在前（[`crate::layer::cmp_pattern`]）。
+fn sort_trunc_pattern(mut v: Vec<Candidate>, pattern_len: usize, limit: usize) -> Vec<Candidate> {
+    v.sort_by(|a, b| crate::layer::cmp_pattern(pattern_len, a, b));
+    if limit > 0 {
+        v.truncate(limit);
+    }
+    v
+}
+
+/// 两层共用：字面前缀扫描（`limit = 0` 不截断）→ 过滤 → 排序截断。
+///
+/// ⚠️ **不能把 `limit` 传进 redb**：`search_*_words_prefix` 按 key 字典序数够就停，
+/// 通配过滤发生在那之后，于是「数够的那一批里没有匹配项」就会整批落空——比
+/// `search_prefix` 那条「先截断后排序」的已知局限（见 `StoreUserLayer::search_prefix`）
+/// 严重得多。用户词 / 临时词表规模小，按字面前缀全扫可接受；首位通配时即全方案扫描。
+fn pattern_from_records(
+    recs: Vec<UserWordRecord>,
+    pattern: &str,
+    wildcard: char,
+    limit: usize,
+    with_prefix: bool,
+    is_temp: bool,
+) -> Vec<Candidate> {
+    if pattern.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let n = pattern.chars().count();
+    let cands = recs
+        .into_iter()
+        .filter(|r| crate::layer::pattern_matches(pattern, wildcard, &r.code, with_prefix))
+        .map(|r| {
+            let longer = r.code.chars().count() > n;
+            record_to_candidate(r, is_temp, longer)
+        })
+        .collect();
+    sort_trunc_pattern(cands, n, limit)
+}
+
 /// 用户造词层（redb 后端，可变；写经 Store 的 add/remove/update）。
 pub struct StoreUserLayer {
     store: Arc<Store>,
@@ -150,6 +188,24 @@ impl DictLayer for StoreUserLayer {
             .collect();
         sort_trunc(cands, limit)
     }
+
+    fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<Candidate> {
+        if pattern.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let lit = crate::layer::literal_prefix(pattern, wildcard);
+        let recs = self
+            .store
+            .search_user_words_prefix(&self.schema_id, lit, 0)
+            .unwrap_or_default();
+        pattern_from_records(recs, pattern, wildcard, limit, with_prefix, false)
+    }
 }
 
 /// 临时学习词层（redb 后端，可变）。
@@ -229,6 +285,24 @@ impl DictLayer for StoreTempLayer {
             .collect();
         sort_trunc(cands, limit)
     }
+
+    fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<Candidate> {
+        if pattern.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let lit = crate::layer::literal_prefix(pattern, wildcard);
+        let recs = self
+            .store
+            .search_temp_words_prefix(&self.schema_id, lit, 0)
+            .unwrap_or_default();
+        pattern_from_records(recs, pattern, wildcard, limit, with_prefix, true)
+    }
 }
 
 /// 自动造词的**草稿层**（redb 后端，只读）。
@@ -247,6 +321,8 @@ impl DictLayer for StoreTempLayer {
 /// [`search_abbrev`](DictLayer::search_abbrev) 走 trait 的默认实现（返回空、不回退全表扫）：
 /// 草稿表**刻意没有简拼索引**，那是为了不让写放大跟着草稿的写入量翻上去。
 /// 简拼召回等草稿跃迁进临时词库之后自然就有。
+///
+/// 通配查询（`search_pattern`）同样走默认空实现，理由相同。
 pub struct StoreDraftLayer {
     store: Arc<Store>,
     schema_id: String,
@@ -315,6 +391,57 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wind_storelayer_{name}.redb"));
         let _ = std::fs::remove_file(&p);
         Arc::new(Store::open(&p).unwrap())
+    }
+
+    /// 用户层 / 临时层回答通配查询：字面前缀扫描后过滤（**不带 limit 进 redb**——先截断再
+    /// 过滤会把匹配项整批截掉），等长档在前；草稿层恒不参与。
+    #[test]
+    fn store_layers_answer_pattern_queries_and_drafts_stay_out() {
+        let s = store("pattern");
+        s.add_user_word("wb", "ab", "甲", 10, 0).unwrap();
+        s.add_user_word("wb", "ac", "乙", 20, 0).unwrap();
+        s.add_user_word("wb", "abcd", "丙", 99, 0).unwrap();
+        s.learn_temp_word("wb", "bb", "丁", 30, 0).unwrap();
+        s.add_drafts("wb", &[("ad".to_string(), "草".to_string())])
+            .unwrap();
+        let slot = crate::layer::WILDCARD_SLOT;
+        let p = format!("a{slot}");
+
+        let ul = StoreUserLayer::new(s.clone(), "wb");
+        let got: Vec<(String, String, bool)> = ul
+            .search_pattern(&p, slot, 10, true)
+            .into_iter()
+            .map(|c| (c.code, c.text, c.is_prefix))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ac".to_string(), "乙".to_string(), false),
+                ("ab".to_string(), "甲".to_string(), false),
+                ("abcd".to_string(), "丙".to_string(), true),
+            ]
+        );
+        let exact_only: Vec<String> = ul
+            .search_pattern(&p, slot, 10, false)
+            .into_iter()
+            .map(|c| c.code)
+            .collect();
+        assert_eq!(exact_only, ["ac", "ab"]);
+        assert_eq!(ul.search_pattern(&p, slot, 1, true).len(), 1, "limit 生效");
+
+        let tl = StoreTempLayer::new(s.clone(), "wb");
+        let lead: Vec<String> = tl
+            .search_pattern(&format!("{slot}b"), slot, 10, false)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(lead, ["丁"], "首位通配：字面前缀为空，扫本方案全部临时词");
+
+        let dl = StoreDraftLayer::new(s.clone(), "wb", 0);
+        assert!(
+            dl.search_pattern(&p, slot, 10, true).is_empty(),
+            "草稿层不参与通配"
+        );
     }
 
     /// ★ **草稿绝不能进前缀召回** —— 钉在 `CompositeDict` 这个跨层合并的消费点上。
