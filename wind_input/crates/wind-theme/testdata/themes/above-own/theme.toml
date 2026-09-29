@@ -1,0 +1,28 @@
+# 测试主题（非出厂）：comment_above 自己写了的字段不回退；roles 里 "" 撤销继承。
+base = "_base"
+
+[meta]
+name = "上方条自有值测试"
+version = "1.0"
+
+[comment]
+font_size = -2
+color = "#112233"
+margin = { left = 6 }
+
+[comment.roles]
+pinyin = "#008000"
+code_rev = "#C00000"
+
+[comment.selected.roles]
+code_rev = "#FFE08A"
+
+[comment_above]
+font_size = -6
+padding = { bottom = 3 }
+
+[comment_above.roles]
+pinyin = ""
+
+[comment_above.selected.roles]
+code_rev = "#00FF00"

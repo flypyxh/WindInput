@@ -322,6 +322,41 @@ pub struct ViewNode {
     pub disabled: Option<Box<ViewNode>>,
 }
 
+impl ViewNode {
+    /// 缺省回退：自己没写的 `font_family / font_weight / font_size / color / roles / selected / hover`
+    /// 取 `base` 的；**不碰 margin / padding**（`comment.margin.left` 是给右侧注释留的间距）。
+    ///
+    /// `roles` 按键回退：自己写了的键（含 `""` = 显式撤销）保留，`base` 独有的键补进来。
+    /// 状态 patch 递归回退：两边都有则逐字段合并，只有 base 有则整个取来。
+    pub fn inherit_from(&mut self, base: &ViewNode) {
+        if self.font_family.is_none() {
+            self.font_family = base.font_family.clone();
+        }
+        if self.font_weight.is_none() {
+            self.font_weight = base.font_weight;
+        }
+        if self.font_size.is_none() {
+            self.font_size = base.font_size;
+        }
+        if self.color.is_none() {
+            self.color = base.color.clone();
+        }
+        for (k, v) in &base.roles {
+            self.roles.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (own, from) in [
+            (&mut self.selected, &base.selected),
+            (&mut self.hover, &base.hover),
+        ] {
+            match (own.as_mut(), from) {
+                (Some(o), Some(b)) => o.inherit_from(b),
+                (None, Some(b)) => *own = Some(b.clone()),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// 工具栏 schema：button base + mode 状态覆盖 + settings 齿轮色 + 几何（None=内置默认）。
 #[derive(Deserialize, Debug, Default)]
 pub struct ToolbarViews {
@@ -400,6 +435,9 @@ pub struct Views {
     pub text: ViewNode,
     #[serde(default)]
     pub comment: ViewNode,
+    /// 上方注释条：字体 / 颜色 / roles / 状态 patch 缺省回退 `comment`，margin / padding 不继承。
+    #[serde(default)]
+    pub comment_above: ViewNode,
     #[serde(default)]
     pub accent_bar: ViewNode,
     #[serde(default)]

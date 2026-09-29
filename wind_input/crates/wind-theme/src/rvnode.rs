@@ -144,6 +144,9 @@ pub struct RvViews {
     pub index: RvNode,
     pub text: RvNode,
     pub comment: RvNode,
+    /// 上方注释条（`views.comment_above`）：回退 comment 的字体 / 颜色 / roles 已在 resolve 阶段做完，
+    /// 渲染只读它；margin / padding 不继承。
+    pub comment_above: RvNode,
     pub accent_bar: RvNode,
     pub footer_bar: RvNode,
     pub mode_label: RvNode,
@@ -285,6 +288,7 @@ impl RvViews {
             ("views.index", &mut self.index),
             ("views.text", &mut self.text),
             ("views.comment", &mut self.comment),
+            ("views.comment_above", &mut self.comment_above),
             ("views.accent_bar", &mut self.accent_bar),
             ("views.footer_bar", &mut self.footer_bar),
             ("views.mode_label", &mut self.mode_label),

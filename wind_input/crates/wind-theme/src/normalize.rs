@@ -26,6 +26,7 @@ const VIEW_NODE_KEYS: &[&str] = &[
     "index",
     "text",
     "comment",
+    "comment_above",
     "accent_bar",
     "footer_bar",
     "mode_label",

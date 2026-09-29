@@ -424,6 +424,11 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         resolve_view_node(n, palette, is_dark, bg, border, text)
     };
 
+    // 上方注释条：字体 / 颜色 / roles / 状态 patch 缺省回退 comment，margin / padding 不继承
+    // （设计 candidate-comment-above-line §3.4）。回退在 build 之前做，渲染层只读解析后的值。
+    let mut above = v.comment_above.clone();
+    above.inherit_from(&v.comment);
+
     let mut rv = RvViews {
         window: build(&v.window, tk("bg"), tk("border"), None),
         preedit_bar: build(&v.preedit_bar, tk("surface"), None, tk("text_dim")),
@@ -432,6 +437,7 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         index: build(&v.index, tk("accent"), None, tk("on_accent")),
         text: build(&v.text, None, None, tk("text")),
         comment: build(&v.comment, None, None, tk("text_hint")),
+        comment_above: build(&above, None, None, tk("text_hint")),
         accent_bar: build(&v.accent_bar, tk("accent"), None, None),
         footer_bar: build(&v.footer_bar, None, None, None),
         mode_label: build(&v.mode_label, None, None, tk("text_hint")),
@@ -462,6 +468,9 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
     rv.comment.selected =
         resolve_state(v.comment.selected.as_deref(), palette, is_dark, None, None);
     rv.comment.hover = resolve_state(v.comment.hover.as_deref(), palette, is_dark, None, None);
+    rv.comment_above.selected =
+        resolve_state(above.selected.as_deref(), palette, is_dark, None, None);
+    rv.comment_above.hover = resolve_state(above.hover.as_deref(), palette, is_dark, None, None);
     // footer_bar 的禁用态（首页的「上一页」/末页的「下一页」）：主题编辑器「禁用态」面板
     // 配的就是它，此前这里不建、渲染层硬用全局 text_hint，于是面板上配了没反应、预览又
     // 照配置画 —— 预览与实机因此对不上。
@@ -1232,6 +1241,58 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
             t.views.comment.selected.as_ref().unwrap().roles["code_rev"],
             hex("#FFE08A")
         );
+    }
+
+    // ───────────────── comment_above 回退（candidate-comment-above-line §3.4）─────────────────
+
+    fn edges_unset(e: &crate::rvnode::RvEdges) -> bool {
+        e.top.is_none() && e.right.is_none() && e.bottom.is_none() && e.left.is_none()
+    }
+
+    /// 全空 ⇒ 字体 / 颜色 / roles / 选中态回退 comment；margin / padding 不继承。light/dark 各取各的。
+    #[test]
+    fn comment_above_inherits_font_color_roles_but_not_edges() {
+        for dark in [false, true] {
+            let t = roles_theme("above-inherit", dark);
+            let (c, a) = (&t.views.comment, &t.views.comment_above);
+            assert_eq!(a.font_size, -2.0);
+            assert_eq!(a.font_weight, 300);
+            assert_eq!(a.text_color, c.text_color);
+            assert_eq!(
+                a.text_color,
+                Some(hex(if dark { "#AABBCC" } else { "#112233" }))
+            );
+            assert_eq!(
+                a.roles["code_rev"],
+                hex(if dark { "#FF8080" } else { "#C00000" })
+            );
+            assert_eq!(a.roles["pinyin"], hex("#008000"));
+            let sel = a.selected.as_ref().expect("selected 回退 comment 的");
+            assert_eq!(sel.text_color, Some(hex("#FFFFFF")));
+            assert_eq!(sel.roles["code_rev"], hex("#FFE08A"));
+            assert!(c.margin.left.is_some() && c.padding.bottom.is_some());
+            assert!(edges_unset(&a.margin), "margin 不继承");
+            assert!(edges_unset(&a.padding), "padding 不继承");
+        }
+    }
+
+    /// 自己写了的字段用自己的，没写的仍继承；roles 里 `""` 撤销继承；状态 roles 逐键覆盖。
+    #[test]
+    fn comment_above_own_values_win_and_empty_role_revokes() {
+        for dark in [false, true] {
+            let t = roles_theme("above-own", dark);
+            let (c, a) = (&t.views.comment, &t.views.comment_above);
+            assert_eq!(a.font_size, -6.0, "自己写的字号");
+            assert_eq!(c.font_size, -2.0);
+            assert_eq!(a.text_color, c.text_color, "没写的颜色仍继承");
+            assert_eq!(a.padding.bottom, Some(Dim::Dp(3.0)));
+            assert!(edges_unset(&a.margin));
+            assert!(!a.roles.contains_key("pinyin"), "\"\" 撤销、不再回退");
+            assert_eq!(a.roles["code_rev"], hex("#C00000"), "未提及的角色继承");
+            assert!(c.roles.contains_key("pinyin"), "comment 自身不受影响");
+            let sel = a.selected.as_ref().unwrap();
+            assert_eq!(sel.roles["code_rev"], hex("#00FF00"), "选中态自己写的胜出");
+        }
     }
 
     /// 出厂角色色表（设计 §18）：`_base` 配、全部出厂主题继承且不改——只有气泡配，取本主题的

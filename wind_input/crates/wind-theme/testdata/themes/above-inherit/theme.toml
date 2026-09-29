@@ -1,0 +1,26 @@
+# 测试主题（非出厂）：comment_above 全空 ⇒ 字体 / 颜色 / roles / 状态 patch 回退 comment，
+# margin / padding 不继承。
+base = "_base"
+
+[meta]
+name = "上方条继承测试"
+version = "1.0"
+
+[comment]
+font_size = -2
+font_weight = 300
+color = { light = "#112233", dark = "#AABBCC" }
+margin = { left = 6 }
+padding = { left = 2, bottom = 1 }
+
+[comment.roles]
+pinyin = "#008000"
+code_rev = { light = "#C00000", dark = "#FF8080" }
+
+[comment.selected]
+color = "#FFFFFF"
+
+[comment.selected.roles]
+code_rev = "#FFE08A"
+
+[comment_above]
