@@ -129,3 +129,38 @@ fn direct_requires_enabled_and_shuangpin() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 逐键路径用的缓存版：设置页写方案覆盖层、重载全局配置之后立即看到新值（不能拿着旧值）。
+#[test]
+fn cached_settings_follow_override_writes_and_reload() {
+    let dir = std::env::temp_dir().join(format!("wind_aux_cache_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let schemas = dir.join("schemas");
+    let ov = dir.join("overrides");
+    std::fs::create_dir_all(schemas.join("aux_code")).unwrap();
+    std::fs::create_dir_all(&ov).unwrap();
+    std::fs::write(schemas.join("aux_code/t.txt"), "李=mz\n").unwrap();
+    std::fs::write(
+        schemas.join("sp.schema.toml"),
+        "[schema]\nid = \"sp\"\nname = \"sp\"\n[engine]\ntype = \"pinyin\"\n\
+         [engine.pinyin]\nscheme = \"shuangpin\"\n\
+         [engine.aux_code]\nfiles = [\"aux_code/t.txt\"]\nenabled = true\n",
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["sp".into()];
+    cfg.schema.active = "sp".into();
+    let m = EngineManager::with_store_override(&cfg, Some(&dir), None, Some(ov.clone()));
+    assert!(!m.aux_code_settings_cached().direct, "出厂关");
+    // 设置页写覆盖层（`write_schema_override` → `invalidate_schema`）。
+    let v: toml::Value = toml::from_str("[engine.aux_code]\ndirect = true\n").unwrap();
+    m.write_schema_override("sp", &v).unwrap();
+    assert!(m.aux_code_settings_cached().direct, "写覆盖层后立即生效");
+    m.delete_schema_override("sp").unwrap();
+    assert!(!m.aux_code_settings_cached().direct, "删覆盖层后回落");
+    // 全局配置重载。
+    cfg.schema.pinyin.aux_code.direct = true;
+    m.reload_from_config(&cfg);
+    assert!(m.aux_code_settings_cached().direct, "重载全局后立即生效");
+    let _ = std::fs::remove_dir_all(&dir);
+}

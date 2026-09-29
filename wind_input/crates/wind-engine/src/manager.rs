@@ -459,6 +459,12 @@ pub struct EngineManager {
     charsets: Mutex<Arc<wind_candidate::CharsetRegistry>>,
     /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
     freq_cache: Mutex<HashMap<String, FreqSettings>>,
+    /// 辅助码生效设置缓存（schema_id -> AuxCodeSettings），**只供逐键路径**
+    /// （[`EngineManager::aux_code_settings_cached`]，直接辅助码每个双拼按键都要问）。与
+    /// `freq_cache` 同生命周期：`invalidate_schema`（方案覆盖层写入 / 删除 / 重建都走它）与
+    /// `reload_from_config` 时清。任一方案失效都**整表清**——`schema:` 来源会引用别的方案，
+    /// 按 id 局部清会漏掉引用方。进入引导键辅助码仍走不带缓存的 `aux_code_settings_of`。
+    aux_settings_cache: Mutex<HashMap<String, AuxCodeSettings>>,
     /// 方案引擎类型缓存（`schema_engine_type`）。**按 id 缓存，reload/invalidate 时清**，
     /// 与 `freq_cache`/`name_cache` 同生命周期。
     ///
@@ -798,6 +804,7 @@ impl EngineManager {
             ))),
             store,
             freq_cache: Mutex::new(HashMap::new()),
+            aux_settings_cache: Mutex::new(HashMap::new()),
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             session_actions_cache: Mutex::new(HashMap::new()),
@@ -3296,6 +3303,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        self.aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.schema_type_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3493,6 +3504,10 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.aux_settings_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -4431,6 +4446,29 @@ impl EngineManager {
     /// `self.data_dir`，故方案从哪读、码表也从哪解析；缺失逐条 warn，不中断其余文件。
     pub fn aux_code_settings(&self) -> AuxCodeSettings {
         self.aux_code_settings_of(&self.active_schema_id())
+    }
+
+    /// 同 [`Self::aux_code_settings`]，但走缓存：**逐键路径专用**（直接辅助码每个双拼按键都要
+    /// 问一次，未开的用户也一样）。不带缓存的那个每次读盘 + 解析 TOML + 探测来源文件。
+    ///
+    /// 失效点见 `aux_settings_cache`：设置页写方案覆盖层、重载配置都会清；**绕过这些入口直接改
+    /// 磁盘文件**（手改 `schema_overrides`）要等下一次重载才生效，与 `freq_settings_for` 同口径。
+    pub fn aux_code_settings_cached(&self) -> AuxCodeSettings {
+        let id = self.active_schema_id();
+        if let Some(s) = self
+            .aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return s.clone();
+        }
+        let s = self.aux_code_settings_of(&id);
+        self.aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, s.clone());
+        s
     }
 
     /// 同 [`Self::aux_code_settings`]，但取**指定方案**。
