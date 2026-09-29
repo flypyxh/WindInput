@@ -230,6 +230,22 @@ mod tests {
         assert_eq!(c.wildcard_decision("a", 'z'), Enter, "对照：a 起头照常通配");
     }
 
+    /// overlay 激活时通配不生效（`wildcard_enters` 的 `state.active` 门）。
+    /// 现有分派里 overlay 在两个接线点之前就 return，集成层测不到这道门，故在此直接钉。
+    #[test]
+    fn overlay_active_blocks_wildcard() {
+        let Some(c) = wubi_z(|_| {}) else { return };
+        let mut st = c.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.input_buffer = "a".into();
+        st.active = None;
+        assert!(
+            c.wildcard_enters(&st, 'z'),
+            "对照：无 overlay 时 a 后的 z 作通配"
+        );
+        st.active = Some(crate::pipeline::ModeKind::TempPinyin);
+        assert!(!c.wildcard_enters(&st, 'z'), "overlay 激活时不作通配");
+    }
+
     /// `z_key_repeat` 按**配置开关**让位，与有无上屏历史无关（新建协调器无历史）。
     /// 按 `z_key_repeat_text()` 判的话这里会得 Enter，同一串缓冲前后解释不一。
     #[test]

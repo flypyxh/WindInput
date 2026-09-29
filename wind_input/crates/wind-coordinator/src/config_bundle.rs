@@ -231,6 +231,11 @@ pub(crate) struct SchemaKeyUnion {
     /// （连 `custom_enabled` 一起换），全局表完全不参与 ⇒ 只看全局表的话，方案配的键会被
     /// 透传掉、方案里那一格静默失效且零日志。同 `punct_en_chars` 已经接上的那条链。
     pub(crate) custom_covered_chars: std::collections::BTreeSet<char>,
+    /// 任一**已安装**码表方案里**已开启**的通配键（并集）。第四个减数，与
+    /// [`Self::leading_code_chars`] 同一条理由：首位无绑定的通配键空缓冲按下要进缓冲，透传
+    /// 掉就是「通配开了、首位按了没反应」。通配关闭时为空 ⇒ 透传集与未引入通配时逐字节相同。
+    /// 见 `EngineManager::installed_wildcard_keys`。
+    pub(crate) wildcard_keys: std::collections::BTreeSet<char>,
 }
 
 /// 算一次跨方案并集。
@@ -246,6 +251,7 @@ pub(crate) fn schema_key_union(mgr: &EngineManager) -> SchemaKeyUnion {
             .filter_map(|name| crate::key_resolver::key_action_name_to_vk(name))
             .collect(),
         custom_covered_chars: schema_custom_covered_punct_chars(mgr),
+        wildcard_keys: mgr.installed_wildcard_keys(),
     }
 }
 
@@ -490,6 +496,10 @@ impl ConfigBundle {
             if schema_keys.leading_code_chars.contains(&ch) {
                 return false;
             }
+            // 任一方案开了以它为键的通配 ⇒ 首位可能作通配进缓冲，同上必须吃。
+            if schema_keys.wildcard_keys.contains(&ch) {
+                return false;
+            }
             let Some(vk) = crate::key_convert::punct_source_vk(ch) else {
                 // 反查不到说明它不是主键盘标点键产出的，来路不明就别透传。
                 return false;
@@ -590,6 +600,29 @@ mod reload_tests {
     /// 重复条目不改变行为（`.find()` 先到先得且两条一模一样），但会让推给 C++ 的表随方案
     /// 数量膨胀，也让「切方案前后推送字节不变」这条验证手段失去意义——那正是并集策略是否
     /// 生效的唯一凭据。
+    /// 开了通配的方案以 `/` 为键 ⇒ `/` 从中英两份透传集里减去（否则空缓冲时 C++ 不吃，
+    /// 首位通配到不了 core）。对照：未开（并集为空）时 `/` 照旧透传，两份集合与出厂逐字节相同。
+    #[test]
+    fn wildcard_key_is_removed_from_passthrough_sets() {
+        let cfg = Config::default();
+        let bare = ConfigBundle::build(cfg.clone(), &Default::default());
+        assert!(
+            bare.cn_passthrough_punct_chars.contains(&'/')
+                && bare.en_passthrough_punct_chars.contains(&'/'),
+            "前置条件：出厂 `/` 在两份透传集里，否则测不到「减去」"
+        );
+        let union = SchemaKeyUnion {
+            wildcard_keys: ['/'].into_iter().collect(),
+            ..Default::default()
+        };
+        let on = ConfigBundle::build(cfg, &union);
+        assert!(!on.cn_passthrough_punct_chars.contains(&'/'));
+        assert!(!on.en_passthrough_punct_chars.contains(&'/'));
+        let mut expect_cn = bare.cn_passthrough_punct_chars.clone();
+        expect_cn.remove(&'/');
+        assert_eq!(on.cn_passthrough_punct_chars, expect_cn, "只减通配键一个");
+    }
+
     #[test]
     fn schema_session_key_already_registered_globally_is_not_duplicated() {
         let mut cfg = Config::default();

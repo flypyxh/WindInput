@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
+use wind_host::KeyProbe;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_SHIFT};
 
 fn data_dir() -> PathBuf {
@@ -276,5 +277,29 @@ fn overlay_mode_ignores_wildcard() {
         coord.debug_all_candidate_texts().iter().any(|t| t == "中"),
         "临拼 zhong 应出「中」，实际 {:?}",
         coord.debug_all_candidate_texts()
+    );
+}
+
+/// 首位符号通配键不得在透传集里：空缓冲时 C++ 对透传集里的键不吃，`/` 到不了 core，
+/// 首位通配静默失效。`should_handle_key` 读的正是推给 DLL 的那两份集合（`key_gate.rs`）。
+/// 对照：关闭通配时 `/` 照旧透传（出厂中文标点表对 `/` 无映射）。
+#[test]
+fn lead_symbol_wildcard_key_is_not_passed_through() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi(true, "/"), Some(&data_dir()));
+    assert!(
+        coord.should_handle_key(&KeyProbe::new(VK_SLASH)),
+        "开启通配：空缓冲时 `/` 必须送到服务端"
+    );
+    press_vk(&coord, VK_SLASH, false);
+    assert_eq!(coord.debug_input_buffer(), "/", "首位无绑定 ⇒ 作通配进缓冲");
+
+    let coord = Coordinator::new_headless(wubi(false, "/"), Some(&data_dir()));
+    assert!(
+        !coord.should_handle_key(&KeyProbe::new(VK_SLASH)),
+        "对照：关闭时 `/` 透传给宿主"
     );
 }

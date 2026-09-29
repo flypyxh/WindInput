@@ -4085,6 +4085,45 @@ impl EngineManager {
         keys
     }
 
+    /// **所有已安装**码表方案里**已开启**的通配键（并集）。供协调器从「该透传的标点集合」
+    /// 里减去：空缓冲时 C++ 对透传集里的键不吃，符号通配键（如 `/`）到不了 core，首位通配
+    /// 就静默失效。
+    ///
+    /// 与 [`Self::installed_key_action_keys`] / `schema_code_char_set` 同为**纯 TOML 读**
+    /// （不 `build_engine`，理由见协调器 `schema_leading_code_chars`），折叠走与
+    /// `build_engine` 同一条 `resolve_codetable`（全局基线 + 方案覆盖；overlay 取内置基线）。
+    ///
+    /// 只收码表方案：通配只在码表引擎生效（混输代理的是主码表，而主码表方案本身也在
+    /// `installed_schemas()` 里被单独扫到）。拼音方案沿用全局开关会把 `?` 一类键白吃，
+    /// 而那些键在拼音下产物不变——吃了再吐会撞非 TSF 宿主的虚拟键码表。
+    ///
+    /// 非法键直接跳过、**不告警**：告警只在 `build_engine` 出一次，这里随每次配置重建会重复。
+    pub fn installed_wildcard_keys(&self) -> std::collections::BTreeSet<char> {
+        let global = self
+            .codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let data_dir = self.data_dir.as_deref();
+        let ov = self.override_dir.as_deref();
+        let mut out = std::collections::BTreeSet::new();
+        for id in self.installed_schemas() {
+            let Some(s) = Self::read_schema(&id, data_dir, ov) else {
+                continue;
+            };
+            if s.is_pinyin() || s.is_mixed() {
+                continue;
+            }
+            let ct = Self::resolve_codetable(&id, data_dir, &global, ov);
+            if ct.wildcard
+                && let Some(k) = wind_config::config::parse_wildcard_key(&ct.wildcard_key)
+            {
+                out.insert(k);
+            }
+        }
+        out
+    }
+
     /// 不走 `key_actions_cache`：该缓存按活跃方案 id 存单份，而这里要的是跨方案的并集。
     pub fn all_key_action_keys(&self) -> std::collections::BTreeSet<String> {
         self.all_action_keys().0
