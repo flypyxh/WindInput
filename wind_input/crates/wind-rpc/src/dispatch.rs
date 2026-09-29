@@ -226,8 +226,29 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
                 .emit_config_changed(json!({ "reason": "reload" }));
             Ok(json!({ "ok": true }))
         }
+        // compat.*：转发到宿主；写方法成功后广播 compat.changed，
+        // 让设置页与右键菜单并存时互相看得见对方的改动。
+        m if m.starts_with("compat.") => {
+            let out = state.core.data_rpc(m, params)?;
+            if compat_method_writes(m, params) {
+                state.events.emit_compat_changed(json!({ "method": m }));
+            }
+            Ok(out)
+        }
         // schema/dict/temp/freq/shadow/stats/theme/phrase 等数据类 RPC 转发到宿主 core。
         _ => state.core.data_rpc(method, params),
+    }
+}
+
+/// `compat.*` 里哪些会改用户层文件：只读方法与 dryRun 导入不广播。
+fn compat_method_writes(method: &str, params: &Value) -> bool {
+    match method {
+        "compat.list" | "compat.schema" | "compat.export" => false,
+        "compat.import" => !params
+            .get("dryRun")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => true,
     }
 }
 
@@ -547,6 +568,9 @@ mod tests {
         fn data_rpc(&self, method: &str, _params: &Value) -> anyhow::Result<Value> {
             match method {
                 "dict.stats" => Ok(json!([])),
+                "compat.list" | "compat.schema" | "compat.export" => Ok(json!({ "ok": true })),
+                "compat.upsert" | "compat.import" | "compat.reset" => Ok(json!({ "ok": true })),
+                "compat.broken" => anyhow::bail!("写入失败"),
                 // 两层错误：外层是人话主语，内层才是真正的原因。用来钉住出口不截断
                 // （见 `dispatch` 的文档注释）。
                 "test.layered" => Err(anyhow::anyhow!("底层真正的原因").context("外层的人话")),
@@ -1016,5 +1040,59 @@ mod tests {
         );
         assert!(bad.result.is_none());
         assert!(bad.error.is_some());
+    }
+
+    // ── compat.changed：写方法成功后广播，只读 / dryRun / 失败都不广播 ──
+
+    fn state_with_events() -> (DispatchState, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let sink = crate::events::EventSink::new();
+        let rx = sink.subscribe();
+        let st = DispatchState::with_events(FakeCore::new(), "dev", sink)
+            .expect("capabilities 应能加载");
+        (st, rx)
+    }
+
+    /// 取走已广播的事件名（帧 = 4 字节长度前缀 + JSON）。
+    fn drain_events(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<String> {
+        rx.try_iter()
+            .map(|b| {
+                let v: Value = serde_json::from_slice(&b[4..]).expect("事件应是合法 JSON");
+                v["event"].as_str().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compat_write_method_emits_compat_changed_and_forwards_the_result() {
+        let (st, rx) = state_with_events();
+        for m in ["compat.upsert", "compat.reset", "compat.import"] {
+            let resp = dispatch(&st, req(m, json!({})));
+            assert!(resp.error.is_none(), "{m}");
+            assert_eq!(resp.result.unwrap()["ok"], json!(true), "结果要原样透传");
+        }
+        assert_eq!(
+            drain_events(&rx),
+            vec!["compat.changed"; 3],
+            "每次写入各广播一次"
+        );
+    }
+
+    #[test]
+    fn compat_read_methods_and_dry_run_import_do_not_emit() {
+        let (st, rx) = state_with_events();
+        for m in ["compat.list", "compat.schema", "compat.export"] {
+            assert!(dispatch(&st, req(m, json!({}))).error.is_none());
+        }
+        let dry = dispatch(&st, req("compat.import", json!({ "dryRun": true })));
+        assert!(dry.error.is_none());
+        assert!(drain_events(&rx).is_empty(), "只读与 dryRun 不应广播");
+    }
+
+    #[test]
+    fn compat_failed_write_does_not_emit() {
+        let (st, rx) = state_with_events();
+        let resp = dispatch(&st, req("compat.broken", json!({})));
+        assert!(resp.error.is_some());
+        assert!(drain_events(&rx).is_empty(), "失败的写入不应广播");
     }
 }

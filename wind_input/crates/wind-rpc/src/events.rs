@@ -76,6 +76,12 @@ impl EventSink {
         self.broadcast("config.changed", data);
     }
 
+    /// 兼容规则变更事件（`compat.*` 写方法成功后）。设置端据此刷新列表，
+    /// 右键菜单与设置页并存时两边不会互相看不见对方的改动。
+    pub fn emit_compat_changed(&self, data: Value) {
+        self.broadcast("compat.changed", data);
+    }
+
     /// 词库变更事件（dict.* 写操作后，宿主按需调用）。
     pub fn emit_dict_changed(&self, data: Value) {
         self.broadcast("dict.changed", data);
