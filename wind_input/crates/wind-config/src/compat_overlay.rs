@@ -2,7 +2,8 @@
 //!
 //! # 整体原则：用户层只记差异，逐字段叠加在系统层之上
 //!
-//! 层序 `data/compat.toml` < `data_custom` < 用户层。**每一层都是相对下一层的差异**：
+//! 层序 `data/compat.toml` < `data_custom` < 用户层。**每一层都是相对下一层的差异**，
+//! 同名进程内逐字段叠加：
 //! - 条目里写了的字段覆盖下层的值，没写的字段继承下层；
 //! - 想取消下层设定的字段，用 `unset = ["字段名", …]` 显式表达（回到「没设置 / 跟随全局」）；
 //! - 想关掉下层打开的开关，显式写 `false`；
@@ -13,8 +14,19 @@
 //! 字段序列化时会省略默认值，「没写」和「显式写了 false」在结构体里是同一个东西；而叠加需要
 //! 区分它们（用户显式关掉出厂打开的开关）。所以先在原始表上叠加，最后才一次性反序列化成结构体。
 //!
+//! # 两条必须守住的纪律
+//!
+//! 1. **写错的值 = 没写**：叠加之前先 [`sanitize`]。若让错值先参与叠加、事后才被容错回落成
+//!    `None`，它会把下层的好值一起盖没（连出厂的作用域清单整行丢失都实测出现过）。
+//! 2. **用户层里不认识的东西原样保留**：认不出的键、认不出的值、认不出的顶层段，在写回时
+//!    都不能被悄悄删掉（新版本写下的内容被旧版本读写时尤其如此）。读不进来的内容
+//!    （[`Raw::skipped`]）则由写入路径当作「文件已损坏」处理，先留 `.bad`。
+//!
 //! 设计见 `docs/design/compat-settings-ui.md` 第 11 节。
 
+use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
@@ -25,17 +37,51 @@ pub(crate) type Obj = Map<String, Value>;
 /// 是叠加语法本身。它们不进 `overridden`，也不允许被补丁 / 还原当成普通字段触碰。
 pub(crate) const META_KEYS: [&str; 4] = ["process", "comment", "disabled", "unset"];
 
-/// 三段规则的原始键值。
-#[derive(Debug, Clone, Default)]
+/// 三段规则的原始键值，外加原样保留的其它顶层内容。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Raw {
     pub(crate) apps: Vec<Obj>,
     pub(crate) initial_mode_scope: Vec<Obj>,
     pub(crate) commit_newline: Vec<Obj>,
+    /// 三段之外的顶层键（比如更新版本新增的段）：不认识但**原样保留**，写回时照写。
+    pub(crate) extra: toml::Table,
+    /// 读不进来（因而写回时会丢）的内容的说明：三段之一不是数组表（`[apps]` 写成了单括号）、
+    /// 数组里有不是表的元素。写入路径见到它要当作「文件已损坏」，先留 `.bad` 再重建。
+    pub(crate) skipped: Vec<String>,
+}
+
+fn to_json(v: &toml::Value) -> Value {
+    match v {
+        // 日期时间没有对应的 JSON 类型；写成它的文本形式，至少保住内容且写回仍是合法 TOML。
+        toml::Value::Datetime(d) => Value::String(d.to_string()),
+        toml::Value::Array(a) => Value::Array(a.iter().map(to_json).collect()),
+        toml::Value::Table(t) => Value::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), to_json(v)))
+                .collect::<Obj>(),
+        ),
+        other => serde_json::to_value(other).unwrap_or(Value::Null),
+    }
+}
+
+/// 同一段里同名进程的多行，按先后顺序叠成一行（后写的赢）。与运行时逐行叠加的结果一致，
+/// 但让后续的编辑与视图只面对「每个进程一行」。
+fn coalesce(rows: Vec<Obj>) -> Vec<Obj> {
+    let mut out: Vec<Obj> = Vec::new();
+    for r in rows {
+        let name = process_of(&r).to_string();
+        let same = (!name.trim().is_empty())
+            .then(|| out.iter().position(|o| same_process(process_of(o), &name)))
+            .flatten();
+        match same {
+            Some(i) => out[i] = compose(&out[i], &r),
+            None => out.push(r),
+        }
+    }
+    out
 }
 
 /// 解析 compat.toml 全文成原始键值。语法错 ⇒ `Err`（带行列号）。
-///
-/// 只认三个顶层数组表；数组里不是表的元素、类型不对的顶层键一律跳过并留 WARN。
 pub(crate) fn parse_raw(text: &str) -> Result<Raw, String> {
     let root: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
     let mut raw = Raw::default();
@@ -47,19 +93,35 @@ pub(crate) fn parse_raw(text: &str) -> Result<Raw, String> {
             "apps" => &mut raw.apps,
             "initial_mode_scope" => &mut raw.initial_mode_scope,
             "commit_newline" => &mut raw.commit_newline,
-            _ => continue,
+            _ => {
+                raw.extra.insert(name.clone(), value.clone());
+                continue;
+            }
         };
         let Some(items) = value.as_array() else {
-            tracing::warn!("compat.toml: {name} 不是数组表，整段跳过");
+            let msg = format!("{name} 不是数组表（应写成 [[{name}]]）");
+            tracing::warn!("compat.toml: {msg}，整段跳过");
+            raw.skipped.push(msg);
             continue;
         };
-        for item in items {
-            match serde_json::to_value(item) {
-                Ok(Value::Object(o)) => dst.push(o),
-                _ => tracing::warn!("compat.toml: {name} 里有不是表的元素，已跳过"),
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                toml::Value::Table(t) => dst.push(
+                    t.iter()
+                        .map(|(k, v)| (k.clone(), to_json(v)))
+                        .collect::<Obj>(),
+                ),
+                _ => {
+                    let msg = format!("{name}[{i}] 不是表");
+                    tracing::warn!("compat.toml: {msg}，已跳过");
+                    raw.skipped.push(msg);
+                }
             }
         }
     }
+    raw.apps = coalesce(std::mem::take(&mut raw.apps));
+    raw.initial_mode_scope = coalesce(std::mem::take(&mut raw.initial_mode_scope));
+    raw.commit_newline = coalesce(std::mem::take(&mut raw.commit_newline));
     Ok(raw)
 }
 
@@ -67,26 +129,37 @@ pub(crate) fn process_of(o: &Obj) -> &str {
     o.get("process").and_then(Value::as_str).unwrap_or("")
 }
 
-/// 进程名相等：两边 trim、不区分大小写（与运行时查表的 `to_ascii_lowercase` 一致）。
+/// 进程名相等：两边 trim、不区分大小写（与运行时查表一致，运行时在读入时就 trim）。
 pub(crate) fn same_process(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+/// `unset` 清单：接受字符串数组，也宽容地接受单个字符串（`unset = "first_show_mode"`）。
+/// 不是这两种形态返回 `None`。清单里的非字符串元素丢弃，`process` / `unset` 自身不能被 unset。
+fn parse_unset(v: &Value) -> Option<Vec<String>> {
+    let list: Vec<String> = match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => return None,
+    };
+    Some(
+        list.into_iter()
+            .filter(|k| !matches!(k.as_str(), "process" | "unset"))
+            .collect(),
+    )
+}
+
 fn unset_of(o: &Obj) -> Vec<String> {
-    o.get("unset")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    o.get("unset").and_then(parse_unset).unwrap_or_default()
 }
 
 /// 把 `layer` 这一条叠加到 `base` 上，得到新的一条。
 ///
-/// 1. `layer.unset` 里列的字段先从 `base` 里拿掉；
+/// 1. `layer.unset` 里列的字段先从 `base` 里拿掉（含 `disabled`：`unset = ["disabled"]` 即解除下层的禁用）；
 /// 2. `layer` 自己写了的字段覆盖 `base`（同一条里既 `unset` 又写了同名字段 = 写了的赢）；
 /// 3. `unset` 清单向上**累积**（`base` 的并 `layer` 的，再减去 `layer` 自己写了的字段）：
 ///    叠加结果同样是一份「相对更下一层的差异」，更高层还要能读到它。
@@ -95,9 +168,7 @@ pub(crate) fn compose(base: &Obj, layer: &Obj) -> Obj {
     let mut out = base.clone();
     let layer_unset = unset_of(layer);
     for k in &layer_unset {
-        if !META_KEYS.contains(&k.as_str()) {
-            out.remove(k);
-        }
+        out.remove(k);
     }
     let mut carried: BTreeSet<String> = unset_of(base).into_iter().collect();
     carried.extend(layer_unset);
@@ -139,12 +210,13 @@ pub(crate) fn overlay(mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
     base
 }
 
-/// 三段一起叠加。
+/// 三段一起叠加（只带三段，`extra` / `skipped` 对叠加结果没有意义）。
 pub(crate) fn overlay_raw(base: Raw, layer: &Raw) -> Raw {
     Raw {
         apps: overlay(base.apps, &layer.apps),
         initial_mode_scope: overlay(base.initial_mode_scope, &layer.initial_mode_scope),
         commit_newline: overlay(base.commit_newline, &layer.commit_newline),
+        ..Default::default()
     }
 }
 
@@ -155,9 +227,9 @@ pub(crate) fn is_disabled(o: &Obj) -> bool {
 
 /// 叠加结果 → 运行时结构体：跳过被禁用的行，剥掉 `unset`，逐行容错反序列化。
 ///
-/// 单行结构性失败（如 `classes = "x"`）只丢这一行并留 WARN，不牵连同文件的其它规则。
-/// （字段值域外 / 类型错由各字段的 `deserialize_with` 就地回落，走不到这里。）
-pub(crate) fn materialize<T: serde::de::DeserializeOwned>(rows: &[Obj]) -> Vec<T> {
+/// 单行结构性失败只丢这一行并留 WARN，不牵连同文件的其它规则。（字段值域外 / 类型错在这之前
+/// 已由 [`sanitize`] 当成「没写」处理掉了，正常走不到这里。）
+pub(crate) fn materialize<T: DeserializeOwned>(rows: &[Obj]) -> Vec<T> {
     rows.iter()
         .filter(|r| !is_disabled(r))
         .filter_map(|r| {
@@ -175,6 +247,97 @@ pub(crate) fn materialize<T: serde::de::DeserializeOwned>(rows: &[Obj]) -> Vec<T
             }
         })
         .collect()
+}
+
+// ───────────────────────── 值校验 ─────────────────────────
+
+/// 一个**已登记**字段的值是否有问题（类型不对 / 值域外）。没问题返回 `None`；
+/// 未登记的键不归这里管（返回 `None`，由调用方决定原样保留还是拒绝）。
+///
+/// 值域校验的办法：把这个键单独放进一个最小行里反序列化，看容错反序列化有没有把它回落掉——
+/// 它对值域外的取值不报错、只记一条「回落」。别名（`en` / `zh`）与带空白的文本运行时本就接受，
+/// 不算有问题。
+pub(crate) fn field_value_problem<T: DeserializeOwned>(
+    section: &str,
+    key: &str,
+    v: &Value,
+) -> Option<String> {
+    let meta = COMPAT_FIELDS
+        .iter()
+        .find(|f| f.section == section && f.key == key)?;
+    if v.is_null() {
+        return None;
+    }
+    let type_ok = match meta.kind {
+        Kind::Bool | Kind::TriBool => v.is_boolean(),
+        Kind::Int => v.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
+        // 枚举不许空串：空串会被当成「没写」吞掉，想清除请用 unset / null。
+        Kind::Enum => v.as_str().is_some_and(|t| !t.trim().is_empty()),
+        Kind::Text => v.is_string(),
+        Kind::TextList => v.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
+    };
+    if !type_ok {
+        return Some(format!("字段 {key} 的值 {v} 类型不对"));
+    }
+    let mut o = Obj::new();
+    o.insert("process".into(), Value::String("probe.exe".into()));
+    o.insert(key.to_string(), v.clone());
+    crate::tolerant_de::clear_fallbacks();
+    let parsed = serde_json::from_value::<T>(Value::Object(o));
+    let fallbacks = crate::tolerant_de::take_fallbacks();
+    if let Err(e) = parsed {
+        return Some(format!("字段 {key} 的值 {v} 无效: {e}"));
+    }
+    (!fallbacks.is_empty()).then(|| format!("字段 {key} 的值 {v} 无效"))
+}
+
+/// 参与叠加之前先把无效的值当成「没写」剔掉。返回（清理后的行，每处剔除的说明）。
+///
+/// 只清理**会参与叠加的副本**：调用方持有的原始行（要写回文件的那份）不动，
+/// 免得旧版本读写时把新版本写下的、自己认不出的值删掉。
+pub(crate) fn sanitize<T: DeserializeOwned>(
+    section: &str,
+    rows: &[Obj],
+) -> (Vec<Obj>, Vec<String>) {
+    let mut report = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let name = process_of(r).to_string();
+        let mut row = r.clone();
+        let keys: Vec<String> = row.keys().cloned().collect();
+        for k in keys {
+            let problem = match k.as_str() {
+                "process" | "comment" => None,
+                "disabled" => {
+                    (!row[&k].is_boolean()).then(|| format!("disabled = {} 不是布尔值", row[&k]))
+                }
+                "unset" => match parse_unset(&row[&k]) {
+                    Some(list) => {
+                        if list.is_empty() {
+                            row.remove(&k);
+                        } else {
+                            row.insert(
+                                k.clone(),
+                                Value::Array(list.into_iter().map(Value::String).collect()),
+                            );
+                        }
+                        None
+                    }
+                    None => Some(format!("unset = {} 不是字段名清单", row[&k])),
+                },
+                _ => field_value_problem::<T>(section, &k, &row[&k]),
+            };
+            if let Some(p) = problem {
+                report.push(format!("{section}.{name}: {p}，已忽略"));
+                row.remove(&k);
+            }
+        }
+        out.push(row);
+    }
+    for line in &report {
+        tracing::warn!("compat.toml: {line}");
+    }
+    (out, report)
 }
 
 // ───────────────────────── 用户层的写入侧 ─────────────────────────
@@ -197,11 +360,24 @@ fn unset_array(keys: &BTreeSet<String>) -> Value {
     Value::Array(keys.iter().cloned().map(Value::String).collect())
 }
 
+/// 窗口类名运行时不区分大小写、也与顺序无关：只改这两样不算「有差异」。
+fn normalize_classes(view: &mut Obj) {
+    if let Some(Value::Array(items)) = view.get_mut("classes") {
+        let mut v: Vec<String> = items
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_ascii_lowercase))
+            .collect();
+        v.sort();
+        v.dedup();
+        *items = v.into_iter().map(Value::String).collect();
+    }
+}
+
 /// 某条用户行叠加到系统行之后，运行时真正看到的内容（经结构体往返，省略默认值）。
 ///
 /// 冗余判定必须比**这个**，而不是比原始键值：`caret_use_top = false` 在系统层没有该字段时
 /// 与「没写」运行时完全等价，前者是冗余；而系统层为 `true` 时它就是必要的显式覆盖。
-fn effective_view<T: serde::de::DeserializeOwned + serde::Serialize>(
+fn effective_view<T: DeserializeOwned + Serialize>(
     sys: Option<&Obj>,
     user: &Obj,
     unset: &BTreeSet<String>,
@@ -226,17 +402,30 @@ fn effective_view<T: serde::de::DeserializeOwned + serde::Serialize>(
         },
         Err(_) => composed,
     };
-    // 窗口类名运行时不区分大小写、也与顺序无关：只改这两样不算「有差异」。
-    if let Some(Value::Array(items)) = view.get_mut("classes") {
-        let mut v: Vec<String> = items
-            .iter()
-            .filter_map(|x| x.as_str().map(str::to_ascii_lowercase))
-            .collect();
-        v.sort();
-        v.dedup();
-        *items = v.into_iter().map(Value::String).collect();
-    }
+    normalize_classes(&mut view);
     view
+}
+
+/// 这一行里**参与运行时**的键：已登记且值有效的字段、布尔的 `disabled`。
+/// 认不出的键、写错的值对运行时都没有效果（前者原样保留、后者被当成没写），不算差异。
+pub(crate) fn effective_keys<T: DeserializeOwned>(section: &str, row: &Obj) -> Vec<String> {
+    let known = known_keys(section);
+    row.iter()
+        .filter(|(k, v)| {
+            if k.as_str() == "disabled" {
+                v.is_boolean()
+            } else {
+                known.contains(&k.as_str()) && field_value_problem::<T>(section, k, v).is_none()
+            }
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// 这一行里有没有**参与运行时**的差异（见 [`effective_keys`]，外加非空的 `unset`）：
+/// 视图据此判断「已修改」。
+pub(crate) fn has_registered_diff<T: DeserializeOwned>(section: &str, row: &Obj) -> bool {
+    !effective_keys::<T>(section, row).is_empty() || !unset_of(row).is_empty()
 }
 
 /// 规范化一条用户行：去掉不起作用的键与不必要的 `unset`。返回这一行是否还有内容
@@ -245,9 +434,12 @@ fn effective_view<T: serde::de::DeserializeOwned + serde::Serialize>(
 /// 空壳不是无害的：它让「已修改」状态凭空出现，也让人无从判断还原按钮有没有东西可还原。
 /// 「用户层只记差异」这条原则的落地点就在这里——任何写入路径最后都要过它。
 ///
-/// `prune_unset = false`：调用方**不知道**系统层的真实内容（右键菜单路径读不到系统文件时），
+/// 只修剪**已登记且值有效**的字段：认不出的键、认不出的值（比如新版本写下的枚举值）经结构体
+/// 往返本来就「看不见」，按效果判断它必然是冗余，会被静默删掉——用户层里的东西不是我们的，原样留着。
+///
+/// `prune_unset = false`：调用方**不知道**系统层的真实内容（数据目录解析不出来时），
 /// 此时不能凭「系统里没有这个字段」去掉 `unset`——它可能只是没读到。
-pub(crate) fn normalize<T: serde::de::DeserializeOwned + serde::Serialize>(
+pub(crate) fn normalize<T: DeserializeOwned + Serialize>(
     section: &str,
     sys: Option<&Obj>,
     user: &mut Obj,
@@ -255,22 +447,13 @@ pub(crate) fn normalize<T: serde::de::DeserializeOwned + serde::Serialize>(
 ) -> bool {
     let mut unset: BTreeSet<String> = unset_of(user)
         .into_iter()
-        .filter(|k| !META_KEYS.contains(&k.as_str()) && !user.contains_key(k))
+        .filter(|k| !user.contains_key(k))
         .collect();
     user.remove("unset");
 
     let full = effective_view::<T>(sys, user, &unset);
     // 1) 字段与 disabled：去掉后运行时效果不变的就是冗余。
-    //
-    // 只修剪**已登记**的字段：认不出的键（比如新版本写下的字段）经结构体往返本来就「看不见」，
-    // 按效果判断它必然是冗余，会被静默删掉——用户层里的东西不是我们的，原样留着。
-    let known = crate::compat_schema::known_keys(section);
-    let keys: Vec<String> = user
-        .keys()
-        .filter(|k| k.as_str() == "disabled" || known.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    for k in keys {
+    for k in effective_keys::<T>(section, user) {
         let mut without = user.clone();
         without.remove(&k);
         if effective_view::<T>(sys, &without, &unset) == full {
@@ -304,7 +487,7 @@ pub(crate) fn normalize<T: serde::de::DeserializeOwned + serde::Serialize>(
 
 /// 把一批字段编辑应用到用户层某一段：找到（或新建）该进程的差异行，逐项编辑，规范化，
 /// 落回（没内容就删掉这一行）。`sys_rows` 是**已叠加好的系统层**该段。
-pub(crate) fn apply_edits<T: serde::de::DeserializeOwned + serde::Serialize>(
+pub(crate) fn apply_edits<T: DeserializeOwned + Serialize>(
     section: &str,
     sys_rows: &[Obj],
     user_rows: &mut Vec<Obj>,
@@ -328,7 +511,7 @@ pub(crate) fn apply_edits<T: serde::de::DeserializeOwned + serde::Serialize>(
                 .map(process_of)
                 .filter(|n| !n.is_empty())
                 .unwrap_or(process);
-            o.insert("process".into(), Value::String(name.to_string()));
+            o.insert("process".into(), Value::String(name.trim().to_string()));
             o
         }
     };
@@ -378,10 +561,7 @@ fn ordered_keys(section: &str, o: &Obj) -> Vec<String> {
             out.push(k.to_string());
         }
     }
-    for f in crate::compat_schema::COMPAT_FIELDS
-        .iter()
-        .filter(|f| f.section == section)
-    {
+    for f in COMPAT_FIELDS.iter().filter(|f| f.section == section) {
         if o.contains_key(f.key) {
             out.push(f.key.to_string());
         }
@@ -392,28 +572,55 @@ fn ordered_keys(section: &str, o: &Obj) -> Vec<String> {
     out
 }
 
-fn render_section(out: &mut String, section: &str, rows: &[Obj]) {
-    for row in rows {
-        out.push_str(&format!("[[{section}]]\n"));
-        for k in ordered_keys(section, row) {
-            let v = &row[&k];
-            match toml::Value::try_from(v) {
-                Ok(tv) => out.push_str(&format!("{k} = {tv}\n")),
-                Err(e) => tracing::warn!("compat.toml: 键 {k} 的值无法写成 TOML，已跳过: {e}"),
-            }
-        }
-        out.push('\n');
+/// TOML 键：纯 ASCII 字母数字 / 下划线 / 连字符可以裸写，其它（非 ASCII、含点、含空格……）必须加引号，
+/// 否则手写的一个 `"备注" = "x"` 写回后就成了非法 TOML，整个用户层随之失效。
+fn toml_key(k: &str) -> String {
+    if !k.is_empty()
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        k.to_string()
+    } else {
+        toml::Value::String(k.to_string()).to_string()
     }
 }
 
-/// 把三段原始键值渲染成用户层 compat.toml 全文（文件头由调用方给）。三段一并渲染，
-/// 整份重写时漏段就等于把那一段删了。
-pub(crate) fn render_raw(header: &str, raw: &Raw) -> String {
+fn render_section(out: &mut String, section: &str, rows: &[Obj]) -> Result<(), String> {
+    for row in rows {
+        out.push_str(&format!("[[{section}]]\n"));
+        for k in ordered_keys(section, row) {
+            let tv = toml::Value::try_from(&row[&k])
+                .map_err(|e| format!("{section} 里的键 {k} 的值无法写成 TOML: {e}"))?;
+            out.push_str(&format!("{} = {tv}\n", toml_key(&k)));
+        }
+        out.push('\n');
+    }
+    Ok(())
+}
+
+/// 把三段原始键值（连同原样保留的其它顶层内容）渲染成用户层 compat.toml 全文（文件头由调用方给）。
+///
+/// 渲染完**必须自检**：重新解析后与内存里的内容一致才放行，否则拒绝落盘。写回失真的后果是整份
+/// 用户层失效并在下一次菜单操作时被重建，宁可这次写入失败。
+pub(crate) fn render_raw(header: &str, raw: &Raw) -> Result<String, String> {
     let mut out = String::from(header);
-    render_section(&mut out, "apps", &raw.apps);
-    render_section(&mut out, "initial_mode_scope", &raw.initial_mode_scope);
-    render_section(&mut out, "commit_newline", &raw.commit_newline);
-    out
+    render_section(&mut out, "apps", &raw.apps)?;
+    render_section(&mut out, "initial_mode_scope", &raw.initial_mode_scope)?;
+    render_section(&mut out, "commit_newline", &raw.commit_newline)?;
+    if !raw.extra.is_empty() {
+        out.push_str(
+            &toml::to_string(&raw.extra).map_err(|e| format!("其它顶层内容无法写回: {e}"))?,
+        );
+    }
+    let back = parse_raw(&out).map_err(|e| format!("渲染结果无法重新解析: {e}"))?;
+    if back.apps != coalesce(raw.apps.clone())
+        || back.initial_mode_scope != coalesce(raw.initial_mode_scope.clone())
+        || back.commit_newline != coalesce(raw.commit_newline.clone())
+        || back.extra != raw.extra
+    {
+        return Err("写回后的内容与内存中不一致，已拒绝落盘（防止改坏用户文件）".into());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -742,7 +949,7 @@ mod tests {
             }))],
             ..Default::default()
         };
-        let text = render_raw("# header\n\n", &raw);
+        let text = render_raw("# header\n\n", &raw).unwrap();
         let process_at = text.find("process =").unwrap();
         let mode_at = text.find("first_show_mode =").unwrap();
         assert!(process_at < mode_at, "process 必须排在字段前: {text}");
@@ -756,5 +963,96 @@ mod tests {
             json!(false),
             "显式 false 必须写出来"
         );
+    }
+
+    // ───────────── 审查（第二轮）补的回归 ─────────────
+
+    #[test]
+    fn parse_raw_preserves_unknown_sections_and_flags_unreadable_content() {
+        let raw = parse_raw("[future]\nk = 1\n\n[apps]\nprocess = \"x.exe\"\n\n[[commit_newline]]\nprocess = \"w.exe\"\n").unwrap();
+        assert_eq!(
+            raw.extra["future"]["k"].as_integer(),
+            Some(1),
+            "不认识的顶层段原样保留"
+        );
+        assert_eq!(
+            raw.skipped.len(),
+            1,
+            "`[apps]` 单括号读不进来，必须被记下: {:?}",
+            raw.skipped
+        );
+        assert!(raw.apps.is_empty());
+        assert_eq!(raw.commit_newline.len(), 1);
+        let raw = parse_raw("apps = [1, 2]\n").unwrap();
+        assert!(!raw.skipped.is_empty(), "数组里不是表的元素也要记下");
+    }
+
+    #[test]
+    fn parse_raw_merges_duplicate_rows_of_one_process_in_order() {
+        let raw = parse_raw("[[apps]]\nprocess = \"x.exe\"\na = 1\nb = 2\n\n[[apps]]\nprocess = \" X.EXE \"\na = 9\n").unwrap();
+        assert_eq!(raw.apps.len(), 1);
+        assert_eq!(raw.apps[0]["a"], json!(9), "后写的赢");
+        assert_eq!(raw.apps[0]["b"], json!(2), "先写的其它字段保留");
+    }
+
+    #[test]
+    fn datetime_values_survive_as_text_and_the_file_stays_valid() {
+        let raw =
+            parse_raw("[[apps]]\nprocess = \"x.exe\"\nwhen = 2020-01-02T03:04:05Z\n").unwrap();
+        assert_eq!(raw.apps[0]["when"], json!("2020-01-02T03:04:05Z"));
+        assert!(render_raw("", &raw).is_ok(), "写回必须仍是合法 TOML");
+    }
+
+    /// 渲染结果自检：内存里的内容无法无损写成 TOML 时必须拒绝落盘，而不是写一份失真的文件。
+    #[test]
+    fn render_refuses_content_it_cannot_write_faithfully() {
+        let mut row = Obj::new();
+        row.insert("process".into(), json!("x.exe"));
+        row.insert("bad".into(), Value::Null);
+        let raw = Raw {
+            apps: vec![row],
+            ..Default::default()
+        };
+        assert!(render_raw("", &raw).is_err());
+    }
+
+    #[test]
+    fn render_quotes_keys_that_are_not_bare() {
+        let mut row = Obj::new();
+        row.insert("process".into(), json!("x.exe"));
+        row.insert("备注".into(), json!("说明"));
+        row.insert("a.b".into(), json!(1));
+        row.insert("with space".into(), json!(true));
+        let raw = Raw {
+            apps: vec![row],
+            ..Default::default()
+        };
+        let text = render_raw("", &raw).unwrap();
+        assert_eq!(parse_raw(&text).unwrap().apps, raw.apps, "{text}");
+    }
+
+    #[test]
+    fn sanitize_drops_invalid_values_and_reports_them_but_keeps_unknown_keys() {
+        use crate::app_compat::AppCompatRule;
+        let rows = vec![obj(json!({
+            "process": "a.exe", "first_show_mode": "wiat", "auto_pair": true, "caret_offset_x": "12",
+            "future_key": [1, 2], "disabled": "yes", "unset": "auto_pair"
+        }))];
+        let (clean, report) = sanitize::<AppCompatRule>("apps", &rows);
+        let c = &clean[0];
+        assert!(
+            c.get("first_show_mode").is_none()
+                && c.get("caret_offset_x").is_none()
+                && c.get("disabled").is_none()
+        );
+        assert_eq!(c["auto_pair"], json!(true));
+        assert_eq!(c["future_key"], json!([1, 2]), "认不出的键不归清理管");
+        assert_eq!(
+            c["unset"],
+            json!(["auto_pair"]),
+            "单个字符串形态的 unset 归一成数组"
+        );
+        assert_eq!(report.len(), 3, "{report:?}");
+        assert_eq!(rows[0]["first_show_mode"], json!("wiat"), "原始行不被改动");
     }
 }

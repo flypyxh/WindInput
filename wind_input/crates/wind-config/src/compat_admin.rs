@@ -11,13 +11,14 @@
 
 use crate::app_compat::{
     AppCompatRule, COMPAT_FILE_NAME, CommitNewlineRule, InitialModeScopeRule, USER_COMPAT_HEADER,
-    load_raw, write_atomic,
+    load_raw, sanitize_raw, write_atomic,
 };
 use crate::compat_overlay::{
-    FieldEdit, META_KEYS, Obj, Raw, apply_edits, compose, is_disabled, normalize, overlay,
-    overlay_raw, parse_raw, process_of, render_raw, same_process,
+    FieldEdit, META_KEYS, Obj, Raw, apply_edits, compose, effective_keys, field_value_problem,
+    has_registered_diff, is_disabled, normalize, overlay, overlay_raw, parse_raw, process_of,
+    render_raw, same_process, sanitize,
 };
-use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
+use crate::compat_schema::known_keys;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -107,6 +108,9 @@ pub struct RuleView {
     /// 用户层里这一条的原始内容（含 `disabled` / `unset`）；没有则 `None`。
     /// 禁用状态下用它才能看出「禁用前用户改过哪些字段」。
     pub user: Option<Value>,
+    /// 用户层这一条里认不出的键（手写拼错的、或更新版本才有的字段）。它们对运行时没有任何效果，
+    /// 所以不影响 `state` / `overridden`；单独列出让界面能提示，也保证写回时原样保留。
+    pub unknown_keys: Vec<String>,
 }
 
 /// 进程名校验：trim 后非空、不含路径分隔符与控制字符。返回 trim 后的名字。
@@ -137,69 +141,36 @@ fn typed_obj<T: DeserializeOwned + Serialize>(row: &Obj) -> Obj {
     }
 }
 
-/// 补丁里一个键的静态校验：不许碰元键、必须是登记过的字段、JSON 类型要与控件类型相符。
+/// 补丁里一个键的校验：不许碰元键、必须是登记过的字段，值的类型与值域过 [`field_value_problem`]。
 ///
 /// 只靠反序列化是不够的：容错反序列化会把错类型 / 错取值悄悄吞成「跟随全局」，
 /// 键名拼错则被 serde 直接忽略——两者都会让调用方以为写成功了。
-fn check_patch_key(section: &str, key: &str, v: &Value) -> Result<(), String> {
+fn check_patch_key<T: DeserializeOwned>(section: &str, key: &str, v: &Value) -> Result<(), String> {
     if META_KEYS.contains(&key) {
         return Err(format!("字段 {key} 不能通过补丁修改"));
     }
-    let meta = COMPAT_FIELDS
-        .iter()
-        .find(|f| f.section == section && f.key == key)
-        .ok_or_else(|| format!("未知字段 {key}"))?;
-    if v.is_null() {
-        return Ok(());
+    if !known_keys(section).contains(&key) {
+        return Err(format!("未知字段 {key}"));
     }
-    let ok = match meta.kind {
-        Kind::Bool | Kind::TriBool => v.is_boolean(),
-        Kind::Int => v.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
-        // 枚举不许空串：空串会被当成「没写」吞掉，想清除请传 null。
-        Kind::Enum => v.as_str().is_some_and(|t| !t.trim().is_empty()),
-        Kind::Text => v.is_string(),
-        Kind::TextList => v.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("字段 {key} 的值 {v} 类型不对"))
+    match field_value_problem::<T>(section, key, v) {
+        Some(problem) => Err(problem),
+        None => Ok(()),
     }
 }
 
-/// 值域校验：单独把这个键放进一个最小行里反序列化，看容错反序列化有没有把它回落掉。
-///
-/// 容错反序列化对值域外的取值（`first_show_mode = "bogus"`）不报错、只记一条「回落」，
-/// 所以必须检查回落记录才能识破。别名（`en` / `zh`）与带空白的文本运行时本就接受，不算无效。
-fn probe_value<T: DeserializeOwned>(key: &str, v: &Value) -> Result<(), String> {
-    let mut o = Obj::new();
-    o.insert("process".into(), Value::String("probe.exe".into()));
-    o.insert(key.to_string(), v.clone());
-    crate::tolerant_de::clear_fallbacks();
-    let parsed = serde_json::from_value::<T>(Value::Object(o));
-    let fallbacks = crate::tolerant_de::take_fallbacks();
-    parsed.map_err(|e| format!("字段 {key} 的值 {v} 无效: {e}"))?;
-    if fallbacks.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("字段 {key} 的值 {v} 无效"))
-    }
-}
-
-/// 补丁 → 字段编辑。`null` = 清除（回到跟随全局）；非 null 先过静态校验与值域校验。
+/// 补丁 → 字段编辑。`null` = 清除（回到跟随全局）；非 null 先过校验。
 fn patch_to_edits<T: DeserializeOwned>(
     section: &str,
     patch: &Map<String, Value>,
 ) -> Result<Vec<FieldEdit>, String> {
     let mut edits = Vec::new();
     for (k, v) in patch {
-        check_patch_key(section, k, v)?;
-        if v.is_null() {
-            edits.push(FieldEdit::Clear(k.clone()));
+        check_patch_key::<T>(section, k, v)?;
+        edits.push(if v.is_null() {
+            FieldEdit::Clear(k.clone())
         } else {
-            probe_value::<T>(k, v)?;
-            edits.push(FieldEdit::Set(k.clone(), v.clone()));
-        }
+            FieldEdit::Set(k.clone(), v.clone())
+        });
     }
     Ok(edits)
 }
@@ -209,17 +180,24 @@ fn view_in<T: DeserializeOwned + Serialize>(
     sys: &[Obj],
     user: &[Obj],
 ) -> Vec<RuleView> {
-    overlay(sys.to_vec(), user)
+    // 叠加用清理后的副本（无效值当成没写），差异与冗余判断仍看用户层原始内容。
+    let (clean_user, _) = sanitize::<T>(sec_name, user);
+    let known = known_keys(sec_name);
+    overlay(sys.to_vec(), &clean_user)
         .into_iter()
         .map(|eff| {
             let name = process_of(&eff).to_string();
             let s = sys.iter().find(|r| same_process(process_of(r), &name));
             let u = user.iter().find(|r| same_process(process_of(r), &name));
-            // 规范化后还有内容，才算「用户层有真正的差异」。
+            // 规范化后还有**已登记字段层面**的差异，才算「用户层有真正的差异」；
+            // 认不出的键对运行时没有效果，不能让规则显示成已修改。
             let mut normalized = u.cloned();
+            if let Some(row) = normalized.as_mut() {
+                normalize::<T>(sec_name, s, row, true);
+            }
             let has_diff = normalized
-                .as_mut()
-                .is_some_and(|row| normalize::<T>(sec_name, s, row, true));
+                .as_ref()
+                .is_some_and(|row| has_registered_diff::<T>(sec_name, row));
             let state = if is_disabled(&eff) {
                 RuleState::Disabled
             } else if s.is_none() {
@@ -238,13 +216,21 @@ fn view_in<T: DeserializeOwned + Serialize>(
             });
             let mut overridden = BTreeSet::new();
             if has_diff && let Some(row) = &normalized {
-                for k in row.keys().filter(|k| !META_KEYS.contains(&k.as_str())) {
-                    overridden.insert(k.clone());
-                }
+                overridden.extend(effective_keys::<T>(sec_name, row));
                 if let Some(items) = row.get("unset").and_then(Value::as_array) {
                     overridden.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
                 }
             }
+            let unknown_keys: Vec<String> = u
+                .map(|r| {
+                    r.keys()
+                        .filter(|k| {
+                            !META_KEYS.contains(&k.as_str()) && !known.contains(&k.as_str())
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             RuleView {
                 process: name,
                 state,
@@ -253,6 +239,7 @@ fn view_in<T: DeserializeOwned + Serialize>(
                 overridden: overridden.into_iter().collect(),
                 has_user_entry: u.is_some(),
                 user: u.map(|r| Value::Object(r.clone())),
+                unknown_keys,
             }
         })
         .collect()
@@ -261,8 +248,12 @@ fn view_in<T: DeserializeOwned + Serialize>(
 /// 系统层（`data` + `data_custom` 叠加）与用户层的两层快照。
 #[derive(Clone)]
 pub struct Layers {
+    /// 已 [`sanitize_raw`] 的系统层（系统层永不写回，可以直接用清理后的）。
     system: Raw,
+    /// 用户层**原始**内容（要写回的那份，不能清理，见 [`sanitize`]）。
     user: Raw,
+    /// 各层里被当成「没写」忽略的无效值的说明（`compat.list` 的 `warnings`）。
+    warnings: Vec<String>,
 }
 
 fn rows(raw: &Raw, sec: Section) -> &Vec<Obj> {
@@ -273,13 +264,24 @@ fn rows(raw: &Raw, sec: Section) -> &Vec<Obj> {
     }
 }
 
-/// 严格读用户层：不存在 ⇒ 空；读到但语法错 ⇒ `Err`（带路径与行列号）。
+/// 严格读用户层：不存在 ⇒ 空；读到但语法错、或有内容读不进来（会在重写时丢掉）⇒ `Err`。
 ///
-/// 运行时加载（`AppCompat::load`）对语法错是整份跳过的；管理界面的写操作不能这样——
-/// 静默按空集重写会抹掉用户已有的全部覆盖。
+/// 运行时加载（`AppCompat::load`）对这两种情况都是跳过并留 WARN；管理界面的写操作不能这样——
+/// 静默按空集重写会抹掉用户已有的内容。
 fn read_user(path: &Path) -> Result<Raw, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => parse_raw(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Ok(text) => {
+            let raw = parse_raw(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            if raw.skipped.is_empty() {
+                Ok(raw)
+            } else {
+                Err(format!(
+                    "{}: 有内容无法读入（{}）",
+                    path.display(),
+                    raw.skipped.join("；")
+                ))
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Raw::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
@@ -292,16 +294,29 @@ impl Layers {
         user_dir: Option<&Path>,
     ) -> Result<Self, String> {
         let mut system = Raw::default();
+        let mut warnings = Vec::new();
         for dir in [data_dir, custom_dir].into_iter().flatten() {
             if let Some(layer) = load_raw(&dir.join(COMPAT_FILE_NAME)) {
-                system = overlay_raw(system, &layer);
+                let (clean, report) = sanitize_raw(&layer);
+                warnings.extend(report);
+                system = overlay_raw(system, &clean);
             }
         }
         let user = match user_dir {
             Some(u) => read_user(&u.join(COMPAT_FILE_NAME))?,
             None => Raw::default(),
         };
-        Ok(Self { system, user })
+        warnings.extend(sanitize_raw(&user).1);
+        Ok(Self {
+            system,
+            user,
+            warnings,
+        })
+    }
+
+    /// 各层里被当成「没写」忽略的无效值的说明。
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     pub fn view(&self, sec: Section) -> Vec<RuleView> {
@@ -391,16 +406,18 @@ impl Layers {
         self.user = Raw::default();
     }
 
-    /// 用户层渲染成文件全文（含固定文件头）。三段一并渲染，防止整份重写时漏段。
-    pub fn render_user(&self) -> String {
+    /// 用户层渲染成文件全文（含固定文件头）。三段一并渲染，防止整份重写时漏段；
+    /// 渲染结果自检不通过时返回 `Err`，绝不落盘一份失真的文件。
+    pub fn render_user(&self) -> Result<String, String> {
         render_raw(USER_COMPAT_HEADER, &self.user)
     }
 
     /// 落盘用户层：唯一临时名 → 写满 → fsync → rename（见 [`write_atomic`]）。
     /// 调用方须在读到写完的全程持有 [`crate::app_compat::lock_user_compat`]。
     pub fn save(&self, user_dir: &Path) -> std::io::Result<()> {
+        let text = self.render_user().map_err(std::io::Error::other)?;
         std::fs::create_dir_all(user_dir)?;
-        write_atomic(&user_dir.join(COMPAT_FILE_NAME), &self.render_user())
+        write_atomic(&user_dir.join(COMPAT_FILE_NAME), &text)
     }
 }
 
@@ -557,13 +574,12 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
                         inc.ignored.push(format!("{}.{k}", sec.as_str()));
                     }
                     _ => {
-                        let checked = check_patch_key(sec.as_str(), k, v)
-                            .and_then(|_| with_section!(sec, T => probe_value::<T>(k, v)));
-                        match checked {
-                            Ok(()) => {
+                        match with_section!(sec, T => field_value_problem::<T>(sec.as_str(), k, v))
+                        {
+                            None => {
                                 fields.insert(k.clone(), v.clone());
                             }
-                            Err(_) => inc.fallbacks.push(v.to_string()),
+                            Some(_) => inc.fallbacks.push(v.to_string()),
                         }
                     }
                 }
@@ -585,20 +601,26 @@ struct ImportPlan {
     items: Vec<ImportItem>,
 }
 
+/// 用户层某一段清理后的副本（无效值当成没写），用来和系统层叠加。
+fn sanitize_rows(l: &Layers, sec: Section) -> Vec<Obj> {
+    with_section!(sec, T => sanitize::<T>(sec.as_str(), rows(&l.user, sec)).0)
+}
+
 impl Layers {
     /// 导出成 `compat.toml` 文本。用户层导出的是差异（可直接放进用户层），生效导出是叠加后的全貌。
-    pub fn export(&self, scope: ExportScope) -> String {
+    pub fn export(&self, scope: ExportScope) -> Result<String, String> {
         match scope {
             ExportScope::User => self.render_user(),
             ExportScope::Effective => {
                 let mut raw = Raw::default();
                 for sec in ALL_SECTIONS {
+                    // 保留 `unset`：它是「系统层设了、叠加后没有」的记号，缺了它，把这份导出
+                    // 在同一套系统层上重新导入，被取消的字段会又继承回来。
                     let eff: Vec<Obj> =
-                        overlay(rows(&self.system, sec).clone(), rows(&self.user, sec))
+                        overlay(rows(&self.system, sec).clone(), &sanitize_rows(self, sec))
                             .into_iter()
                             .filter(|r| !is_disabled(r))
                             .map(|mut r| {
-                                r.remove("unset");
                                 r.remove("disabled");
                                 r
                             })
@@ -860,14 +882,17 @@ pub fn rpc(
         _ => false,
     };
     let _guard = writes.then(crate::app_compat::lock_user_compat);
+    // 用户目录与数据目录 / 定制目录是同一个位置时（拿不到用户配置目录的兜底），「用户层」就是系统预置
+    // 文件本身：写入会把被判为冗余的出厂字段当场删掉。拒绝。
+    if writes && user_dir.is_some_and(|u| Some(u) == data_dir || Some(u) == custom_dir) {
+        return Err("用户配置目录与系统预置目录相同，拒绝改写".into());
+    }
 
     // 「全部还原」与 replace 导入本来就要丢弃用户层现有内容，不该被一份读不出来的旧文件拦住——
     // 那正是用户最需要这两个按钮的时候（原文件会先备份）。其它方法要保留现有内容，只能报错。
     let recoverable = method == "compat.resetAll"
         || import_args.is_some_and(|(_, mode, _)| mode == ImportMode::Replace);
 
-    // 先 clear 再加载再 take：`list` 要把「加载时被回落的值」作为告警带回去。
-    crate::tolerant_de::clear_fallbacks();
     let mut layers = match Layers::load(data_dir, custom_dir, user_dir) {
         Ok(l) => l,
         Err(e) if recoverable => {
@@ -876,7 +901,7 @@ pub fn rpc(
         }
         Err(e) => return Err(e),
     };
-    let warnings = crate::tolerant_de::take_fallbacks();
+    let warnings = layers.warnings().to_vec();
 
     let wrote = |value: Value| Ok(RpcOutcome { value, wrote: true });
     match method {
@@ -889,7 +914,7 @@ pub fn rpc(
                 None => ExportScope::User,
                 Some(s) => ExportScope::parse(s).ok_or_else(|| "scope 无效".to_string())?,
             };
-            let content = layers.export(scope);
+            let content = layers.export(scope)?;
             read(json!({ "content": content }))
         }
         "compat.upsert" => {
@@ -973,6 +998,7 @@ mod tests {
         Layers {
             system: parse_raw(sys).expect("测试夹具必须是合法 TOML"),
             user: parse_raw(usr).expect("测试夹具必须是合法 TOML"),
+            warnings: Vec::new(),
         }
     }
 
@@ -1403,7 +1429,7 @@ auto_pair = true
         let usr = "[[apps]]\nprocess = \"Mine.exe\"\nauto_pair = true\n\n[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"X\"]\n\n[[commit_newline]]\nprocess = \"W.exe\"\nstyle = \"cr\"\n";
         let mut l = layers(SYS, usr);
         l.reset_all();
-        let text = l.render_user();
+        let text = l.render_user().unwrap();
         assert!(!text.contains("[["), "{text}");
     }
 
@@ -1588,7 +1614,7 @@ auto_pair = true
     #[test]
     fn export_user_contains_only_the_diff() {
         let l = layers(SYS, USER_A);
-        let text = l.export(ExportScope::User);
+        let text = l.export(ExportScope::User).unwrap();
         assert!(text.contains("auto_pair = true"), "{text}");
         assert!(
             !text.contains("caret_use_top") && !text.contains("Feishu"),
@@ -1597,24 +1623,32 @@ auto_pair = true
     }
 
     #[test]
-    fn export_effective_expands_the_overlay_and_drops_disabled_and_syntax() {
+    fn export_effective_expands_the_overlay_and_drops_disabled_but_keeps_unset() {
         let usr = format!(
             "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\n\n[[apps]]\nprocess = \"Feishu.exe\"\nunset = [\"composition_start_pair_guard\"]\n"
         );
-        let text = layers(SYS, &usr).export(ExportScope::Effective);
+        let l = layers(SYS, &usr);
+        let text = l.export(ExportScope::Effective).unwrap();
         assert!(
             text.contains("caret_use_top = true") && text.contains("auto_pair = true"),
             "叠加后的全貌: {text}"
         );
-        assert!(!text.contains("Dota"), "被禁用的不导出: {text}");
         assert!(
-            !text.contains("disabled") && !text.contains("unset"),
-            "叠加语法不该出现在生效导出里: {text}"
+            !text.contains("Dota") && !text.contains("disabled"),
+            "被禁用的不导出: {text}"
         );
         assert!(
-            !text.contains("composition_start_pair_guard"),
-            "unset 掉的字段不该出现: {text}"
+            !text.contains("composition_start_pair_guard = "),
+            "unset 掉的字段不该以取值形式出现: {text}"
         );
+        // 保留 unset 记号：同一套系统层上重新导入，被取消的字段不能又继承回来。
+        let mut b = layers(SYS, "");
+        b.import_apply(&text, ImportMode::Replace).unwrap();
+        let (va, vb) = (
+            l.view_of(Section::Apps, "Feishu.exe").unwrap(),
+            b.view_of(Section::Apps, "Feishu.exe").unwrap(),
+        );
+        assert_eq!(va.effective, vb.effective, "生效导出回导后结果必须一致");
     }
 
     #[test]
@@ -1623,7 +1657,7 @@ auto_pair = true
             "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\n\n[[apps]]\nprocess = \"Feishu.exe\"\nunset = [\"composition_start_pair_guard\"]\n"
         );
         let a = layers(SYS, &usr);
-        let text = a.export(ExportScope::User);
+        let text = a.export(ExportScope::User).unwrap();
         let mut b = layers(SYS, "");
         b.import_apply(&text, ImportMode::Replace).unwrap();
         for p in ["Feishu.exe", "Weixin.exe", "Dota.exe"] {
@@ -2288,6 +2322,142 @@ composition_start_pair_guard = true
         .expect("dryRun 类型不对必须报错");
         assert!(err.contains("dryRun"), "{err}");
         assert!(!u.join(COMPAT_FILE_NAME).exists());
+        cleanup(&d, &u);
+    }
+
+    // ───────────── 审查（第二轮）补的回归 ─────────────
+
+    /// `compat.list` 的 warnings 曾恒为空（加载不再经反序列化，回落记录取不到）。
+    #[test]
+    fn warnings_report_invalid_values_from_every_layer() {
+        let sys = "[[apps]]\nprocess = \"A.exe\"\nfirst_show_mode = \"wiat\"\n";
+        let usr = "[[apps]]\nprocess = \"A.exe\"\ninitial_mode = \"englsh\"\n";
+        let (d, u) = (tmp("warn_d"), tmp("warn_u"));
+        for (dir, text) in [(&d, sys), (&u, usr)] {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(COMPAT_FILE_NAME), text).unwrap();
+        }
+        let l = Layers::load(Some(&d), None, Some(&u)).unwrap();
+        let w = l.warnings().join("\n");
+        assert!(
+            w.contains("wiat") && w.contains("englsh"),
+            "两层的无效值都要报: {w}"
+        );
+        let r = rpc(
+            "compat.list",
+            &json!({"section": "apps"}),
+            Some(&d),
+            None,
+            Some(&u),
+        )
+        .unwrap();
+        assert_eq!(
+            r.value["warnings"].as_array().unwrap().len(),
+            2,
+            "{}",
+            r.value
+        );
+        cleanup(&d, &u);
+    }
+
+    /// 用户层写错的值在视图里也当成没写：不能盖掉下层的好值。
+    #[test]
+    fn an_invalid_user_value_does_not_hide_the_system_value_in_the_view() {
+        let l = layers(
+            "[[apps]]\nprocess = \"A.exe\"\nfirst_show_mode = \"wait\"\n",
+            "[[apps]]\nprocess = \"A.exe\"\nfirst_show_mode = \"wiat\"\n",
+        );
+        let v = l.view_of(Section::Apps, "A.exe").unwrap();
+        assert_eq!(v.effective["first_show_mode"], json!("wait"));
+        assert_eq!(v.state, RuleState::System, "写错的值不算差异");
+    }
+
+    /// 认不出的键不该让规则显示成「已修改」，也不进 overridden；单独列在 unknown_keys 里。
+    #[test]
+    fn unknown_keys_do_not_make_a_rule_modified() {
+        let l = layers(
+            SYS,
+            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_tpo = true\n",
+        );
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert_eq!(v.state, RuleState::System);
+        assert!(v.overridden.is_empty(), "{:?}", v.overridden);
+        assert_eq!(v.unknown_keys, vec!["caret_use_tpo".to_string()]);
+    }
+
+    /// 下层禁用、用户层显式 `disabled = false` 重新启用：状态是 Modified，overridden 里要有 disabled。
+    #[test]
+    fn re_enabling_a_lower_layer_disable_is_listed_as_an_override() {
+        let l = layers(
+            "[[apps]]\nprocess = \"A.exe\"\ndisabled = true\ncaret_use_top = true\n",
+            "[[apps]]\nprocess = \"A.exe\"\ndisabled = false\n",
+        );
+        let v = l.view_of(Section::Apps, "A.exe").unwrap();
+        assert_eq!(v.state, RuleState::Modified);
+        assert_eq!(v.overridden, vec!["disabled".to_string()]);
+    }
+
+    /// 用户层有读不进来的内容（`[apps]` 单括号）：写操作 / 列表报错，恢复类操作照常。
+    #[test]
+    fn unreadable_user_content_is_an_error_but_reset_all_recovers() {
+        let (d, u) = rpc_dirs("skipped");
+        std::fs::create_dir_all(&u).unwrap();
+        let text = "[apps]\nprocess = \"lost.exe\"\n";
+        std::fs::write(u.join(COMPAT_FILE_NAME), text).unwrap();
+        let err = call("compat.list", json!({"section": "apps"}), &d, &u)
+            .err()
+            .expect("必须报错");
+        assert!(err.contains("无法读入"), "{err}");
+        assert!(
+            call(
+                "compat.upsert",
+                json!({"section": "apps", "process": "A.exe", "patch": {"auto_pair": true}}),
+                &d,
+                &u
+            )
+            .is_err()
+        );
+        call("compat.resetAll", json!({}), &d, &u).expect("resetAll 必须能恢复");
+        assert!(
+            backups(&u)
+                .iter()
+                .any(|p| std::fs::read_to_string(p).ok().as_deref() == Some(text)),
+            "原文件必须被备份"
+        );
+        cleanup(&d, &u);
+    }
+
+    /// 用户目录与系统预置目录相同（拿不到用户配置目录的兜底）时拒绝写入，免得删掉出厂字段。
+    #[test]
+    fn writes_are_refused_when_the_user_dir_is_the_system_dir() {
+        let (d, u) = rpc_dirs("samedir");
+        let err = rpc(
+            "compat.upsert",
+            &json!({"section": "apps", "process": "Weixin.exe", "patch": {"auto_pair": true}}),
+            Some(&d),
+            None,
+            Some(&d),
+        )
+        .err()
+        .expect("必须拒绝");
+        assert!(err.contains("相同"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(d.join(COMPAT_FILE_NAME)).unwrap(),
+            SYS,
+            "系统预置文件一个字节都不能动"
+        );
+        // 只读方法不受限。
+        assert!(
+            rpc(
+                "compat.list",
+                &json!({"section": "apps"}),
+                Some(&d),
+                None,
+                Some(&d)
+            )
+            .is_ok()
+        );
         cleanup(&d, &u);
     }
 }

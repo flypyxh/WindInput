@@ -339,9 +339,8 @@ fn compat_rule_any_field_wrong_type_does_not_sink_the_file() {
             } else {
                 format!("[[apps]]\nprocess = \"typo.exe\"\n{field} = {bad}\n\n{OTHER}")
             };
-            let file = toml::from_str::<AppCompatFile>(&text)
-                .unwrap_or_else(|e| panic!("{ctx}: 类型写错不得让整份失败：{e}"));
-            let compat = AppCompat::from_rules(file.apps);
+            // 走生产路径（解析 → 清理 → 叠加 → 反序列化），而不是直接反序列化结构体。
+            let compat = AppCompat::from_single_layer_text(&text);
             other_still_works(&compat, &ctx);
             if field == "process" {
                 assert!(
