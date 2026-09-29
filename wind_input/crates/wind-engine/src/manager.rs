@@ -2595,6 +2595,26 @@ impl EngineManager {
         }
     }
 
+    /// 活跃方案的通配键（关闭 / 非码表 / 键非法时 `None`；混输取主码表的）。
+    ///
+    /// 与 [`Self::active_input_chars`] 同一归属理由：方案级引擎固定参数挂在引擎上，方案切换
+    /// 自然跟着换。协调器**只从这里取**，不读 `codetable_settings()`——那份每次调用都重新折叠，
+    /// 且非法键的告警只该在构建期出一次。
+    pub fn active_wildcard_key(&self) -> Option<char> {
+        self.active_engine().and_then(|e| e.wildcard_key())
+    }
+
+    /// 通配转换（透传活跃引擎）。**不**叠英文混入：通配是查码，不是打英文。
+    pub fn convert_wildcard(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.active_engine()?
+            .convert_wildcard(input, pattern, max_candidates)
+    }
+
     /// 同 [`Self::active_is_code_char`]，但取**指定方案**（overlay 用，见 [`Self::engine_for`]）。
     ///
     /// ⚠️ 拼音引擎的码元集**完全由双拼布局推导**（`PinyinEngine::input_chars`）：全拼恒
@@ -5706,6 +5726,9 @@ impl EngineManager {
                 split_alt_display: crate::codetable::SplitAltDisplay::parse(
                     &schema.engine.codetable.split_alt_display,
                 ),
+                // 通配：与上屏行为同源于 `eff`（全局基线 + 方案折叠；overlay 方案取内置基线，
+                // 默认关）。非法键在此告警一次并视为关闭，协调器经 `active_wildcard_key` 取用。
+                wildcard: eff.wildcard_char(schema_id),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -7749,6 +7772,65 @@ mod tests {
         assert_eq!(np.top_code_commit, global.top_code_commit);
 
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 通配两项与其它码表行为同一条折叠链：方案写了覆盖、没写回落全局；overlay 方案
+    /// 取内置基线，**不继承**全局开关（快符那类小符号表里 `z` 多半是正经编码）。
+    #[test]
+    fn wildcard_folds_from_schema_and_overlay_does_not_inherit() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_wildcard_fold");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        for (id, body) in [
+            ("wc_inline", "[engine.codetable]\nwildcard_key = \"?\"\n"),
+            ("wc_follow", ""),
+            ("wc_overlay", "[overlay]\n"),
+        ] {
+            let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"{id}\"\n[engine]\ntype = \"codetable\"\n{body}"
+            )
+            .unwrap();
+        }
+        let global = wind_config::CodetableGlobal {
+            wildcard: true,
+            ..Default::default()
+        };
+        let ov = std::env::temp_dir().join("wind_eng_wildcard_fold_ov");
+        let _ = std::fs::remove_dir_all(&ov);
+        let key = |id: &str| {
+            EngineManager::resolve_codetable(id, Some(&base_dir), &global, Some(&ov))
+                .wildcard_char(id)
+        };
+        assert_eq!(
+            key("wc_inline"),
+            Some('?'),
+            "方案写了键 ⇒ 覆盖；开关回落全局 true"
+        );
+        assert_eq!(key("wc_follow"), Some('z'), "都没写 ⇒ 全局");
+        assert_eq!(key("wc_overlay"), None, "overlay 方案不继承全局开关");
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 出厂笔画方案显式 `wildcard = false`：它的 `z` 是「折」，全局开了通配（出厂键 `z`）也
+    /// 不跟随。读的是仓库 `data/` 里的出厂方案文件本身。对照：同一全局下五笔 86 跟随开启。
+    #[test]
+    fn factory_stroke_schema_opts_out_of_wildcard() {
+        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data");
+        let ov = std::env::temp_dir().join("wind_eng_wildcard_stroke_ov");
+        let _ = std::fs::remove_dir_all(&ov);
+        let global = wind_config::CodetableGlobal {
+            wildcard: true,
+            ..Default::default()
+        };
+        let key = |id: &str| {
+            EngineManager::resolve_codetable(id, Some(&data), &global, Some(&ov)).wildcard_char(id)
+        };
+        assert_eq!(key("stroke"), None, "笔画方案不得继承全局通配");
+        assert_eq!(key("wubi86"), Some('z'), "对照：五笔 86 跟随全局");
     }
 
     /// ★ 基线判据是 `[overlay]` 段而**不是** `hidden`：钉住两个「反对角」组合。

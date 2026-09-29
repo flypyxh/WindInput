@@ -265,4 +265,24 @@ impl Coordinator {
             self.password_suppress.load(Relaxed),
         )
     }
+
+    /// 当前输入缓冲（测试/诊断用）。通配用例要断言「键进没进缓冲」，组合区文本会混入已上屏前缀。
+    pub fn debug_input_buffer(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .input_buffer
+            .clone()
+    }
+
+    /// 全部候选的 `(text, code, comment)`（测试/诊断用）。通配要断言「注释是完整编码」。
+    pub fn debug_candidate_triples(&self) -> Vec<(String, String, String)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .candidates
+            .iter()
+            .map(|c| (c.text.clone(), c.code.clone(), c.comment.clone()))
+            .collect()
+    }
 }

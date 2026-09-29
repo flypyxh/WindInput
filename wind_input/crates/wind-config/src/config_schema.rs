@@ -231,6 +231,9 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.english_merge.block_commit", Bool),
     // 带参数的值域（`mix:<id>` / `special:<id>`）故用 Str 而非 Enum；解析与校验见 `BoundAction`。
     f("schema.codetable.z_key_action", Str),
+    // 通配输入（万能键）。键是单个字面字符，值域无法枚举故用 Str；合法性见 `parse_wildcard_key`。
+    f("schema.codetable.wildcard", Bool),
+    f("schema.codetable.wildcard_key", Str),
     // 码元字符集：范围+字面的自由文本（如 `a-x/`、`a-z0-9`），值域无法枚举故用 Str；
     // 解析与非法回落见 `CodeCharSet`。空 = 内置默认 `a-z`。
     f("schema.codetable.input_chars", Str),
@@ -902,6 +905,8 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         ("schema.codetable.single_char", ct.single_char.is_some()),
         ("schema.codetable.z_key_repeat", ct.z_key_repeat.is_some()),
         ("schema.codetable.z_key_action", ct.z_key_action.is_some()),
+        ("schema.codetable.wildcard", ct.wildcard.is_some()),
+        ("schema.codetable.wildcard_key", ct.wildcard_key.is_some()),
         // 码元字符集用空串表达「未设置」（见 `CodetableGlobal::resolved`）。
         ("schema.codetable.input_chars", !ct.input_chars.is_empty()),
         (

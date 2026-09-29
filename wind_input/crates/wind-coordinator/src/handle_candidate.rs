@@ -1199,12 +1199,23 @@ impl Coordinator {
         // N-best 条数——混输下整句块置顶、切换键夺键都不该出现（引擎侧只把混输辅助钉成 1/1，
         // 管不到这条路），故在这里一并关掉（审查查出）。
         let via_mixed_pinyin = pinyin_schema.is_some();
-        let result = match pinyin_schema {
-            Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
-                self.engine_mgr
-                    .convert_with(&ps, &state.input_buffer, limit)
+        // 通配组码（spec §5.3）：只查码表，不走短语 / 整句 / 逆切分 / 混输拼音 / 英文混入。
+        // pattern 由协调器按 §3.3 从缓冲重算（首位让位的字面通配键不在其中）。
+        // 它同时是本函数下面各处短路（短语、自动上屏复评、清空复核、短语自动上屏、
+        // 显示层去重口径、出简让全）的唯一判据。
+        let wildcard_pattern = self.wildcard_pattern(&state.input_buffer);
+        let result = if let Some(p) = &wildcard_pattern {
+            self.engine_mgr
+                .convert_wildcard(&state.input_buffer, p, limit)
+                .unwrap_or_default()
+        } else {
+            match pinyin_schema {
+                Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
+                    self.engine_mgr
+                        .convert_with(&ps, &state.input_buffer, limit)
+                }
+                _ => self.engine_mgr.convert(&state.input_buffer, limit),
             }
-            _ => self.engine_mgr.convert(&state.input_buffer, limit),
         };
         // 拼音音节拆分形态（供「混输高亮跟随」按高亮候选类型选择显示原始码 / 拆分串）。
         // 码表 / 无拼音 → 空串（恒原始码）。state.preedit 本身由 sync_preedit_to_highlight
@@ -1259,7 +1270,7 @@ impl Coordinator {
         let phrase_spec = self.phrase_spec_of(state);
         let phrase_scope = crate::schema_scope::phrase_scope(&phrase_spec);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
-        if !phrases.is_empty() && !phrase_scope.is_closed() {
+        if wildcard_pattern.is_none() && !phrases.is_empty() && !phrase_scope.is_closed() {
             let recent = self.recent_commits_snapshot();
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
             // 含 {clip()}（如 coad）时按需读取；非 windows 返回空。
@@ -1502,14 +1513,24 @@ impl Coordinator {
         // 按 text 去重。**不能用 `retain` + `HashSet`**：被丢弃那条所占的码位要并进幸存者，
         // 否则下一步的检索范围过滤按 (source, code) 分组时会丢掉「该码位下有常用字」这一事实
         // ——同一个字打前缀出、打全码反而不出（见 `Candidate::merged_codes`）。
+        //
+        // 通配组码改按 `(text, code)` 去重（spec §3.1，与 `CompositeDict` 通配合并同口径）：
+        // 通配是「查码」，同字不同码（简码与全码）要各留一条让用户看到每个码位。键里的
+        // `\u{1}` 是槽位字符，不会出现在码里。非通配走借用、与原先逐字节相同。
+        let dedup_by_code = wildcard_pattern.is_some();
         let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut deduped: Vec<Candidate> = Vec::with_capacity(candidates.len());
         for c in std::mem::take(&mut candidates) {
-            if let Some(&idx) = seen.get(&c.text) {
+            let key: std::borrow::Cow<str> = if dedup_by_code {
+                format!("{}\u{1}{}", c.text, c.code).into()
+            } else {
+                c.text.as_str().into()
+            };
+            if let Some(&idx) = seen.get(key.as_ref()) {
                 deduped[idx].absorb_codes_from(&c);
                 continue;
             }
-            seen.insert(c.text.clone(), deduped.len());
+            seen.insert(key.into_owned(), deduped.len());
             deduped.push(c);
         }
         candidates = deduped;
@@ -1617,22 +1638,32 @@ impl Coordinator {
         //
         // 判据取自本次输入沿途记录的各级简码位首选（见 `short_code_yield`），零查询——
         // 打 khtk 必然逐键经过 k/kh/kht，那时的首选已经记下了。
-        let yield_level = self.engine_mgr.codetable_settings().short_code_yield_level;
-        // `user_pinned`：用户右键调过这个码的顺序就整码停手——**候选调整优先于出简让全**。
-        // 让位没法简单地挪到 `apply_shadow` 之前来表达这个优先级：它被 `apply_freq_rerank`
-        // 钉在后面（4 码位 `ProtectPolicy.fallback = 0`，先让位会被调频原样顶回去），
-        // 于是优先级只能写成判据。详见 `short_code_yield::apply` 内的论证。
-        short_code_yield::apply(
-            &mut candidates,
-            &state.input_buffer,
-            &state.shortcode_tops,
-            yield_level,
-            user_pinned,
-        );
-        // 记在让位**之后**：记的是用户实际看到的首条，让位本身也是用户所见的一部分。
-        // 简码位因此可能记到词（该级被让位了），而更短那级仍记着字——`apply` 扫全部级别，
-        // 故链式让位不会把自己的前提擦掉。
-        short_code_yield::record_top(&mut state.shortcode_tops, &state.input_buffer, &candidates);
+        //
+        // 通配组码两步都跳过：通配结果是「查码」列表，不是某个码位的首选之争——让位会把
+        // 沿途简码位的首选从查询结果里挪走；记录则会把 `az` 这种查询串当成二简码位记下，
+        // 续打 `azzz` 时反过来触发让位。
+        if wildcard_pattern.is_none() {
+            let yield_level = self.engine_mgr.codetable_settings().short_code_yield_level;
+            // `user_pinned`：用户右键调过这个码的顺序就整码停手——**候选调整优先于出简让全**。
+            // 让位没法简单地挪到 `apply_shadow` 之前来表达这个优先级：它被 `apply_freq_rerank`
+            // 钉在后面（4 码位 `ProtectPolicy.fallback = 0`，先让位会被调频原样顶回去），
+            // 于是优先级只能写成判据。详见 `short_code_yield::apply` 内的论证。
+            short_code_yield::apply(
+                &mut candidates,
+                &state.input_buffer,
+                &state.shortcode_tops,
+                yield_level,
+                user_pinned,
+            );
+            // 记在让位**之后**：记的是用户实际看到的首条，让位本身也是用户所见的一部分。
+            // 简码位因此可能记到词（该级被让位了），而更短那级仍记着字——`apply` 扫全部级别，
+            // 故链式让位不会把自己的前提擦掉。
+            short_code_yield::record_top(
+                &mut state.shortcode_tops,
+                &state.input_buffer,
+                &candidates,
+            );
+        }
         // ── 英文方案：头部候选（输入原文 + 大小写变形）──────────────────────────
         //
         // 英文引擎的「输入即内容」：输入串本身就是可上屏文本，而调频一旦把某个词顶到首位，
@@ -1718,10 +1749,15 @@ impl Coordinator {
         // 满码自动上屏「显示态」复评：引擎按未过滤候选判唯一（生僻同码字致不唯一被否决），
         // 但智能过滤后可能只剩唯一精确全码码表候选 → 据显示候选复评放行（逻辑与显示一致）。
         // 惰性：仅在引擎未给出上屏意向时复评。
-        let auto_commit = auto_commit.or_else(|| {
-            self.engine_mgr
-                .recheck_auto_commit(&state.input_buffer, &state.candidates)
-        });
+        // 通配结果不自动上屏（spec §3.2）：引擎意向本就为空，这里连复评一起跳过。
+        let auto_commit = if wildcard_pattern.is_some() {
+            None
+        } else {
+            auto_commit.or_else(|| {
+                self.engine_mgr
+                    .recheck_auto_commit(&state.input_buffer, &state.candidates)
+            })
+        };
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
         // 词库 `$CC` 命令词条经 finalize_candidates 展开后 text 已改写为 display 标签，而引擎
         // 意向 commit_text 是原始 `$CC` 源 → 按 phrase_template 补匹配（否则意向恒被误否决）。
@@ -1767,7 +1803,9 @@ impl Coordinator {
             }
             // 满码空码清空：`should_clear` 由引擎在追加短语**之前**计算，故此处须以叠加短语后的
             // 最终候选复查（判据见 `clear_blocked_by_candidates`——不是简单的「列表非空」）。
+            // 通配组码不清空（spec §3.2）：`convert_wildcard` 本就不给清空意向，这里是双保险。
             None if should_clear
+                && wildcard_pattern.is_none()
                 && !clear_blocked_by_candidates(
                     &state.candidates,
                     state.input_buffer.chars().count(),
@@ -1779,8 +1817,9 @@ impl Coordinator {
         };
         // 短语自动上屏：码表未给出上屏意向（Normal）时，补齐短语侧——引擎判据看不到短语，
         // 唯一精确码短语 + 无更长后继时也应自动上屏（与码表「全码唯一自动上屏」对齐）。
+        // 通配组码不参与短语（上面整块跳过），这里同样不补。
         let outcome = match outcome {
-            InputOutcome::Normal => self
+            InputOutcome::Normal if wildcard_pattern.is_none() => self
                 .phrase_auto_commit(state)
                 .unwrap_or(InputOutcome::Normal),
             other => other,
@@ -3476,7 +3515,7 @@ impl Coordinator {
         // 拼音/英文按候选码（分段时为前缀码，如「ni」而非整串「nihao」）。
         // 上面的 `code` 仍供 `record_commit` 统计码长使用，那是另一套语义。
         if !from_assoc {
-            self.record_selection_cand(&self.freq_code(&state.input_buffer, cand), cand);
+            self.record_selection_cand(&self.main_freq_code(&state.input_buffer, cand), cand);
         }
         // 输入统计：每次选词记一段（分段逐字选各段各记一次，不重复整串）；
         // 在 partial 分支之前，两分支都经此处一次。
@@ -4141,8 +4180,9 @@ impl Coordinator {
             return (!out.is_empty()).then_some(out);
         };
         let (start, _) = self.page_range(state);
-        // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-        let freq_code = self.freq_code(&state.input_buffer, &cand);
+        // 记账码：码表按输入码（码位独立），拼音/英文按候选码；通配组码记全码。
+        // 见 `main_freq_code`。
+        let freq_code = self.main_freq_code(&state.input_buffer, &cand);
         self.record_selection_cand(&freq_code, &cand);
         // 顶屏上屏的是一条来源候选（prefix 段已在选词时记过）。
         // `saturating_sub`：`page_range` 保证 start < len，钳制后 idx < start 不可达，

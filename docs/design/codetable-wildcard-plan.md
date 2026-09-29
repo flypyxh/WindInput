@@ -14,7 +14,7 @@
 
 - 出厂 `wildcard = false`；关闭时一切行为与现状逐键相同（对照组：`az`、首位 `z`、`zzbd` 短语）。
 - 出厂 `wildcard_key = "z"`。
-- 通配键 = 单个字面 ASCII 可打印字符（与 `input_chars` 同一词表）；非法（空、多字符、非 ASCII 可打印）⇒ 告警并视为关闭。本计划另把**空格与数字**判为非法（理由见文末「与 spec 的偏离」）。
+- 通配键 = 单个字面 ASCII 可打印字符（与 `input_chars` 同一词表）；非法（空、多字符、非 ASCII 可打印）⇒ 告警并视为关闭。空格与数字亦非法（spec §4）。
 - 一个通配键 = **恰好一个码元**，可出现多个（`azzd`）；不做 `*` 任意长度，不做末尾通配匹配更短码。
 - 结果 = 等长匹配为主；未开 `single_code_input` 时追加更长编码的前缀补全，**等长优先**，同档按现有基础排序。
 - 结果上限：常量 100（`WILDCARD_RESULT_LIMIT`），不开放配置。
@@ -24,11 +24,12 @@
 - 首位（`input_buffer.is_empty()`）：通配键已绑定任何功能 / 模式（`key_actions`、`z_key_action`、`z_key_repeat`、临拼·快捷输入等 `trigger_keys`、本方案活码前缀 `has_code_prefix`）即让位；全无绑定才作通配进缓冲。
 - 非首位：通配键是组码中途功能键（选词键、翻页键、以词定字键、音节分隔符、辅助码引导键）⇒ 让位给原功能并启动告警；否则作通配进缓冲，优先于兜底标点顶屏与「顶字 + 进模式」。
 - 首位字母判定必须晚于 `try_activate_mode` 与 `try_z_fallback`（`codetable-input-chars.md` §3.4 顺序铁律）。
-- 通配键是方案真实码元时照样按通配处理，启动告警一次。
+- 通配键是方案真实码元时照样按通配处理；**仅当方案显式配置 `input_chars` 且含该键**时启动告警（spec §3.3），文案单列（意思是「该码元被通配吞掉」，与非首位让位告警相反）。
 - 冲突告警复用 `code_char_conflicts` 的体检形状；首位让位不告警，非首位让位才告警。
 - 提交纪律：禁止 `git add -A` / `git add .` / `git commit -a` / `git stash`；新文件先 `git add -- <path>`；提交一律 `git commit -F - --only -- <自己的路径…>`；提交前 `git diff --cached --name-status` 核对暂存区。开局快照里 `wind_input/Cargo.lock` 已是别人的改动，任何提交都不带它。
 - 格式化：禁止 `cargo fmt` / `cargo fmt --all`；只对自己的文件 `rustfmt --edition 2024 <file>`（本仓 workspace edition 是 2024，见 `wind_input/Cargo.toml:39`）。共享文件先 `--check`，只采纳落在自己 hunk 内的改动。
-- 测试环境：cargo 命令都在 `wind_input/` 下跑，带隔离 TMPDIR（`mkdir -p /tmp/wct-wcard && TMPDIR=/tmp/wct-wcard cargo test …`，路径要短，别用 scratchpad）；跑全量用 `--no-fail-fast`。coordinator 集成测试依赖 `build_dev/data`，缺失时静默跳过、计数照绿——以 `--test codetable_wildcard` 耗时 ≥ 1s 且输出里没有「跳过」为数据在位判据。
+- 测试环境：cargo 命令都在 `wind_input/` 下跑，带隔离 TMPDIR（`mkdir -p /tmp/wct-wcard && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test …`，路径要短，别用 scratchpad）；跑全量用 `--no-fail-fast`。coordinator 集成测试依赖 `build_dev/data`，缺失时静默跳过、计数照绿——以 `--test codetable_wildcard` 耗时 ≥ 1s 且输出里没有「跳过」为数据在位判据。
+- 所有 cargo 命令带 `CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard`（本 worktree 专用）；每次提交前 `git -C <仓> branch --show-current` 须为 `feat/codetable-wildcard`。
 - 日志：`info!` 不得含用户输入 / 候选；通配键本身是配置值，可以进 `warn!`。
 
 ## Review Focus
@@ -150,7 +151,7 @@ mod tests {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && mkdir -p /tmp/wct-wcard && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib layer::tests`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && mkdir -p /tmp/wct-wcard && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib layer::tests`
 Expected: 编译失败，`cannot find function pattern_matches` / `literal_prefix` / `cmp_pattern`。
 
 - [ ] **Step 3: 最小实现**
@@ -232,13 +233,13 @@ pub use layer::{DictLayer, LayerType, MutableLayer, WILDCARD_SLOT};
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib layer::tests`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib layer::tests`
 Expected: `test result: ok. 3 passed`。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-dict/src/layer.rs wind_input/crates/wind-dict/src/lib.rs
 git diff --cached --name-status   # 应为空；非空说明有别人的暂存，靠下面的 --only 隔离
 git commit -F - --only -- wind_input/crates/wind-dict/src/layer.rs wind_input/crates/wind-dict/src/lib.rs <<'EOF'
@@ -386,7 +387,7 @@ git show --stat HEAD   # 文件数应为 2
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib datformat::tests::search_pattern`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib datformat::tests::search_pattern`
 Expected: 编译失败，`no method named search_pattern found for struct WdatReader`。
 
 - [ ] **Step 3: 重构 `search_prefix_inner` 抽出 `bnb_collect`（行为不变）**
@@ -455,7 +456,7 @@ Expected: 编译失败，`no method named search_pattern found for struct WdatRe
 ```
 
 > 核对点：搬运循环体时 `arena.push(...)` / `arena.len()` 对 `&mut Vec` 照写即可；`stats.states_visited += 1` 不变。搬完先单独跑一次既有用例确认零行为变化：
-> `TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib datformat::tests` —— 除两条新用例（仍缺 `search_pattern`，编译不过就先注释掉那两条再跑）外全绿，尤其 `topn_prefix_*`、`bnb_actually_prunes_when_weights_differ`、`pruning_bound_must_be_strictly_less`。
+> `CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib datformat::tests` —— 除两条新用例（仍缺 `search_pattern`，编译不过就先注释掉那两条再跑）外全绿，尤其 `topn_prefix_*`、`bnb_actually_prunes_when_weights_differ`、`pruning_bound_must_be_strictly_less`。
 
 - [ ] **Step 4: 实现 `search_pattern`**
 
@@ -617,13 +618,13 @@ Expected: 编译失败，`no method named search_pattern found for struct WdatRe
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib datformat::tests`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib datformat::tests`
 Expected: 全绿，含 `search_pattern_matches_full_scan`、`search_pattern_equal_length_never_crowded_out` 与全部既有 `topn_prefix_*` / `bnb_*`。
 
 - [ ] **Step 6: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-dict/src/datformat.rs   # 只采纳落在自己 hunk 内的改动
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-dict/src/datformat.rs <<'EOF'
@@ -639,6 +640,8 @@ git show --stat HEAD
 ---
 
 ### Task 3: BTreeMap 与系统层（`CodetableDict` / `CachedDict` / `SystemDictLayer`）
+
+> **控制者裁决（预检 #15）**：本任务另加一条 `CodetableDict::search_pattern` 与「`for_each_entry` 全遍历 + `pattern_matches` 过滤 + 同口径排序截断」的对拍测试（随机/多组 pattern：单通配、多通配、首位通配、`with_prefix` 开关），与 Task 2 的 DAT 对拍同形。
 
 **Files:**
 - Modify: `wind_input/crates/wind-dict/src/codetable.rs`（`search_prefix` ~786 之后新增方法；`mod tests` ~1284 追加用例）
@@ -708,7 +711,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib search_pattern`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib search_pattern`
 Expected: 编译失败，`no method named search_pattern found for struct CodetableDict`。
 
 - [ ] **Step 3: 最小实现**
@@ -847,13 +850,13 @@ Expected: 编译失败，`no method named search_pattern found for struct Codeta
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib search_pattern`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib search_pattern`
 Expected: `search_pattern_scans_literal_prefix_and_tiers_equal_length_first`、`system_layer_answers_pattern_queries` 及 Task 2 两条全过。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-dict/src/codetable.rs wind_input/crates/wind-dict/src/cached.rs wind_input/crates/wind-dict/src/manager.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-dict/src/codetable.rs wind_input/crates/wind-dict/src/cached.rs wind_input/crates/wind-dict/src/manager.rs <<'EOF'
@@ -931,7 +934,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib store_layer::tests::store_layers_answer_pattern`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib store_layer::tests::store_layers_answer_pattern`
 Expected: FAIL（trait 默认实现返回空，第一条 `assert_eq!` 左侧为 `[]`）。
 
 - [ ] **Step 3: 最小实现**
@@ -1017,13 +1020,13 @@ fn pattern_from_records(
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib store_layer::tests`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib store_layer::tests`
 Expected: 全绿（含既有 `drafts_never_surface_through_prefix_queries` 等）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-dict/src/store_layer.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-dict/src/store_layer.rs <<'EOF'
@@ -1113,7 +1116,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib composite::tests::pattern_merges`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --lib composite::tests::pattern_merges`
 Expected: 编译失败，`no method named search_pattern found for struct CompositeDict`。
 
 - [ ] **Step 3: 最小实现**
@@ -1202,13 +1205,13 @@ Expected: 编译失败，`no method named search_pattern found for struct Compos
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --no-fail-fast`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-dict --no-fail-fast`
 Expected: wind-dict 全绿（既有 `dedup_same_text_merges_source_flags` 等不受影响，因为非 Pattern 查询的去重键仍是 text）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-dict/src/composite.rs wind_input/crates/wind-dict/src/manager.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-dict/src/composite.rs wind_input/crates/wind-dict/src/manager.rs <<'EOF'
@@ -1360,7 +1363,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib codetable::engine::tests::wildcard`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib codetable::engine::tests::wildcard`
 Expected: 编译失败，`struct CommitOptions has no field named wildcard` / `no method named convert_wildcard`。
 
 - [ ] **Step 3: 最小实现**
@@ -1454,13 +1457,13 @@ pub const WILDCARD_RESULT_LIMIT: usize = 100;
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib codetable::engine::tests`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib codetable::engine::tests`
 Expected: 五条 `wildcard_*` 全过，既有用例全绿。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-engine/src/engine.rs wind_input/crates/wind-engine/src/codetable/engine.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-engine/src/engine.rs wind_input/crates/wind-engine/src/codetable/engine.rs wind_input/crates/wind-engine/src/manager.rs <<'EOF'
@@ -1534,7 +1537,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib mixed::engine::tests::wildcard_goes_to_primary_only`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib mixed::engine::tests::wildcard_goes_to_primary_only`
 Expected: FAIL，`assert_eq!(e.wildcard_key(), Some('z'))` 左侧为 `None`（trait 默认实现）。
 
 - [ ] **Step 3: 最小实现**
@@ -1583,13 +1586,13 @@ Expected: FAIL，`assert_eq!(e.wildcard_key(), Some('z'))` 左侧为 `None`（tr
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib --no-fail-fast`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib --no-fail-fast`
 Expected: 全绿。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-engine/src/mixed/engine.rs wind_input/crates/wind-engine/src/manager.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-engine/src/mixed/engine.rs wind_input/crates/wind-engine/src/manager.rs <<'EOF'
@@ -1667,7 +1670,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-config --lib codetable_wildcard`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-config --lib codetable_wildcard`
 Expected: 编译失败，`no field wildcard on type CodetableGlobal` / `cannot find function parse_wildcard_key`。
 
 - [ ] **Step 3: 最小实现**
@@ -1787,16 +1790,16 @@ wildcard_key = "z"
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-config --no-fail-fast`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-config --no-fail-fast`
 Expected: 全绿，含 `codetable_wildcard_folds_from_schema_and_validates_key`、`registry_covers_every_config_key`、`data_config_toml_covers_registry`、`data_config_toml_has_no_orphan_keys`、`data_config_toml_values_pass_validation`、`overridden_keys_covers_every_schema_override_entry`。
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-rpc --test wind_setting_assets`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-rpc --test wind_setting_assets`
 Expected: **预期红**（`capabilities_snapshot_matches_core` / `mock_config_has_every_preset_key` / `every_core_key_is_either_in_the_manifest_or_exempt` 报缺 `schema.codetable.wildcard*`），由 Task 12 在 wind-setting 侧转绿。记下失败条目名，Task 12 结束时逐条确认转绿。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-config/src/config.rs wind_input/crates/wind-config/src/schema.rs wind_input/crates/wind-config/src/config_schema.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-config/src/config.rs wind_input/crates/wind-config/src/schema.rs wind_input/crates/wind-config/src/config_schema.rs data/config.toml <<'EOF'
@@ -1812,6 +1815,8 @@ git show --stat HEAD
 ---
 
 ### Task 9: `build_engine` 注入通配键
+
+> **控制者裁决（预检 #5）**：本任务新测试在实现前即绿，接受；`build_engine` 接线的真值由 **Task 10** 的集成用例钉住（非 Task 11），说明文字按此理解。
 
 **Files:**
 - Modify: `wind_input/crates/wind-engine/src/manager.rs`（`build_engine` 内 `CommitOptions { … }` ~5615：把 Task 6 的 `wildcard: None,` 改为真值；`mod tests` ~6733 追加用例，紧挨 `overlay_schema_does_not_inherit_global_codetable`）
@@ -1865,7 +1870,7 @@ git show --stat HEAD
 
 - [ ] **Step 2: 跑测试确认失败 / 通过情况**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib wildcard_folds_from_schema`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --lib wildcard_folds_from_schema`
 Expected: **本条会直接通过**——它锁的是 `resolve_codetable`（即 `codetable_settings()` 那条折叠点），在 Task 8 之后已成立。它的作用是给下一步的 `build_engine` 改动立一个「两处折叠点同判据」的基准；`build_engine` 的真值接线由 Task 11 的协调器集成用例（`wildcard_off_by_default_changes_nothing` 的开启组）钉住：本步不改 `build_engine` 的话那条会红。
 
 - [ ] **Step 3: 最小实现**
@@ -1880,13 +1885,13 @@ Expected: **本条会直接通过**——它锁的是 `resolve_codetable`（即 
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --no-fail-fast`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-engine --no-fail-fast`
 Expected: 全绿。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 --check wind_input/crates/wind-engine/src/manager.rs
 git diff --cached --name-status
 git commit -F - --only -- wind_input/crates/wind-engine/src/manager.rs <<'EOF'
@@ -1901,6 +1906,8 @@ git show --stat HEAD
 ---
 
 ### Task 10: 协调器按键裁决与冲突体检
+
+> **控制者裁决（预检 #8/#9）**：①「通配键是方案真实码元」单列一条告警，文案表达「该码元将被通配吞掉」，**仅当方案显式配置 `input_chars` 且含该键**时报；非首位冲突告警的归属照 `code_char_conflicts` 的细分写法（同一键不重复报成「会话键」与「次选键」两条）。② `wildcard_pattern` 的定义与其单测**移到 Task 11**（本任务提交时它尚无调用者，会出 dead_code 警告）。
 
 **Files:**
 - Create: `wind_input/crates/wind-coordinator/src/wildcard.rs`
@@ -2143,7 +2150,7 @@ fn leading_z_yields_to_z_key_action() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard`
 Expected: 编译失败，`no method named wildcard_conflicts found for struct Arc<Coordinator>`。
 
 - [ ] **Step 3: 最小实现**
@@ -2364,16 +2371,16 @@ impl Coordinator {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && time TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard -- --nocapture`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && time CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard -- --nocapture`
 Expected: 5 passed；输出里**没有**「跳过：五笔词库不存在」，测试段耗时 ≥ 1s。若出现「跳过」，先按 AGENTS.md 备好 `build_dev/data` 再判定（worktree 下 `build_dev/data` 要么全拷要么别放）。
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test input_flow --test codetable_input_chars`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test input_flow --test codetable_input_chars`
 Expected: 全绿、零断言修改（出厂 `wildcard = false` 零回归锁）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 git add -- wind_input/crates/wind-coordinator/src/wildcard.rs wind_input/crates/wind-coordinator/tests/codetable_wildcard.rs
 rustfmt --edition 2024 wind_input/crates/wind-coordinator/src/wildcard.rs wind_input/crates/wind-coordinator/tests/codetable_wildcard.rs
 rustfmt --edition 2024 --check wind_input/crates/wind-coordinator/src/lib.rs wind_input/crates/wind-coordinator/src/handle_lifecycle.rs wind_input/crates/wind-coordinator/src/coordinator.rs wind_input/crates/wind-coordinator/src/coordinator/message_handler.rs wind_input/crates/wind-coordinator/src/debug_support.rs
@@ -2391,6 +2398,8 @@ git show --stat HEAD
 ---
 
 ### Task 11: 协调器候选管线（分流、短路、记账）
+
+> **控制者裁决（预检 #2/#6/#7/#9）**：① 本任务定义 `wildcard_pattern`（及其单测，自 Task 10 移入）。② `build_candidates` 排序后的**显示层去重**（`handle_candidate.rs` ~1502-1514 按 text）在有通配位时改为按 `(text, code)` 去重，并补集成用例：同字不同码（如简码与全码）在通配结果里两条都在。③ 通配记账**不改 `freq_code` 本身**，只在主输入路的上屏记账点对通配组码用 `c.code`；mix / 临拼缓冲与读侧调频不动。④ 有通配位时跳过 `short_code_yield`（出简让全）；shadow 与读侧调频保持现状。
 
 **Files:**
 - Modify: `wind_input/crates/wind-coordinator/src/handle_candidate.rs`（`build_candidates` ~1162：`let result = match pinyin_schema` ~1203 分流；短语块条件 ~1262；自动上屏复评 ~1717；清空复核 ~1766；短语自动上屏 ~1778；`freq_code` ~3350）
@@ -2624,8 +2633,8 @@ mod tests {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard; TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --lib wildcard::tests`
-Expected: FAIL 的有 `wildcard_off_by_default_changes_nothing`（开启组 `az` 无候选）、`multiple_wildcards_*`、`leading_wildcard_*`、`zz_phrases_survive_*`（对照组 `az` 无候选）、`wildcard_never_top_commits`、`wildcard_full_length_does_not_auto_commit`（`aaaz` 被满码空码清空）、`symbol_wildcard_listed_*`、`freq_code_under_wildcard_*`；`leading_z_yields_to_z_key_repeat` 与 `z_fallback_still_hijacks_*` 此时已绿（它们是护栏：锁住 Task 11 不得改坏）；Task 10 的五条仍绿。
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard; CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --lib wildcard::tests`
+Expected: FAIL 的有 `wildcard_off_by_default_changes_nothing`（开启组 `az` 无候选）、`multiple_wildcards_*`、`leading_wildcard_*`、`zz_phrases_survive_*`（对照组 `az` 无候选）、`wildcard_full_length_does_not_auto_commit`（`aaaz` 被满码空码清空）、`symbol_wildcard_listed_*`、`freq_code_under_wildcard_*`；`leading_z_yields_to_z_key_repeat` 与 `z_fallback_still_hijacks_*` 与 `wildcard_never_top_commits`（实现前 `aaaz` 无候选、顶码自然放弃）此时已绿（它们是护栏：锁住 Task 11 不得改坏）；Task 10 的五条仍绿。
 
 - [ ] **Step 3: 最小实现**
 
@@ -2730,16 +2739,16 @@ Expected: FAIL 的有 `wildcard_off_by_default_changes_nothing`（开启组 `az`
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && time TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard -- --nocapture && TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --lib wildcard::tests -- --nocapture`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && time CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --test codetable_wildcard -- --nocapture && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --lib wildcard::tests -- --nocapture`
 Expected: 集成 14 passed，单测 1 passed；输出无「跳过」，集成耗时 ≥ 1s。
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --no-fail-fast`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-coordinator --no-fail-fast`
 Expected: 全绿（`every_record_selection_call_goes_through_freq_code` 等守门不受影响；`input_flow` 零断言修改）。
 
 - [ ] **Step 5: 提交**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 rustfmt --edition 2024 wind_input/crates/wind-coordinator/src/wildcard.rs wind_input/crates/wind-coordinator/tests/codetable_wildcard.rs
 rustfmt --edition 2024 --check wind_input/crates/wind-coordinator/src/handle_candidate.rs wind_input/crates/wind-coordinator/src/coordinator.rs
 git diff --cached --name-status
@@ -2758,6 +2767,8 @@ git show --stat HEAD
 ## P4 — 设置端与文档
 
 ### Task 12: wind-setting 两项设置 + 检入产物
+
+> **控制者裁决（预检 #11）**：manifest 注释不得写「不与出厂键位冲突」（反引号是出厂临拼引导键），改为如实说明各选项与出厂键位的关系；方案对话框遇选项外值回显的问题与 `z_key_action` 现状相同，本计划不修。
 
 **Files:**
 - Modify: `../wind-setting/src/assets/settings_manifest.toml`（`schema.codetable.z_key_action` 条目 ~167-180 之后）
@@ -2804,7 +2815,7 @@ options = [
 ]
 ```
 
-Run: `cd /home/dufeng/develop/windinput/WindInput && ./scripts/dev.sh st`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput && ./scripts/dev.sh st`
 Expected: FAIL —— `manifest_keys_match_spec_fields`（清单比 `SPEC_BEHAVIOR_FIELDS` 多两项）与 `table_covers_every_title_char`（label 里的「通」不在 `pinyin_initials.txt`）。
 
 - [ ] **Step 2: 补 `SPEC_BEHAVIOR_FIELDS`**
@@ -2823,18 +2834,18 @@ Expected: FAIL —— `manifest_keys_match_spec_fields`（清单比 `SPEC_BEHAVI
 表头写明「请勿手改」，按项目记忆的等价做法重算（本机无 pwsh）：
 
 ```bash
-cd /home/dufeng/develop/windinput/wind-setting
+cd /home/dufeng/develop/windinput/wt-wildcard/wind-setting
 . ../WindInput/scripts/lib/xwin-env.sh && setup_xwin_env
 cargo xwin test --target x86_64-pc-windows-msvc dump_title_chars -- --ignored --nocapture 2>&1 | grep -A1 '<<<TITLE_CHARS>>>' | tail -1 > /tmp/wct-wcard/title_chars.txt
 ```
 
-再按 `../WindInput/build/data/pinyin_map.txt`（`U+XXXX: pīn,yīn` 格式）每字取前两读的首字母（零声母带调首字母归一 `ā→a` 等）、按字符码位排序写表，表头三行、第三行 `# 字数: N`。
+再按 `../WindInput/build_dev/data/pinyin_map.txt`（`U+XXXX: pīn,yīn` 格式）每字取前两读的首字母（零声母带调首字母归一 `ā→a` 等）、按字符码位排序写表，表头三行、第三行 `# 字数: N`。
 Expected diff（只应有这两处）：在 `透 t` 之后插入 `通 t`（U+901A，读音 `tōng,tòng` ⇒ `t`），`# 字数: 334` → `# 字数: 335`。多出别的行说明语料或归一化走偏，重来。
 
 - [ ] **Step 4: 重生成检入产物并跑邻仓测试**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 ./scripts/dev.sh sg
 cd ../wind-setting
 # sg 会顺带把 appVersion 改成 docs/VERSION 的值——与本改动无关，还原它
@@ -2845,7 +2856,7 @@ for f in src/assets/capabilities.snapshot.json src/mockdata/config.json; do
 done
 git diff --stat
 cd ../WindInput && ./scripts/dev.sh st
-cd wind_input && TMPDIR=/tmp/wct-wcard cargo test -p wind-rpc --test wind_setting_assets
+cd wind_input && CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test -p wind-rpc --test wind_setting_assets
 ```
 
 Expected: `git diff --stat` 只列 5 个文件（manifest、schema_codetable.rs、pinyin_initials.txt、snapshot、mockdata）；`st` 全绿；`wind_setting_assets` 三条（Task 8 记下的）转绿。
@@ -2853,7 +2864,7 @@ Expected: `git diff --stat` 只列 5 个文件（manifest、schema_codetable.rs�
 - [ ] **Step 5: 提交（wind-setting 仓）**
 
 ```bash
-cd /home/dufeng/develop/windinput/wind-setting
+cd /home/dufeng/develop/windinput/wt-wildcard/wind-setting
 git diff --cached --name-status
 git commit -F - --only -- src/assets/settings_manifest.toml src/dialogs/schema_codetable.rs src/assets/pinyin_initials.txt src/assets/capabilities.snapshot.json src/mockdata/config.json <<'EOF'
 feat(settings): 码表通配输入两项（开关 + 通配键）
@@ -2925,13 +2936,13 @@ git show --stat HEAD
 
 > 版本号：`<Since>` 取 `WindInputDocs/data/releases.json` 最新版本的下一个小版本（写本计划时最新为 0.123，故 `0.124`）；实施时若已发过 0.124 就顺延。
 
-Run: `cd /home/dufeng/develop/windinput/WindInputDocs && pnpm lint`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInputDocs && pnpm install --frozen-lockfile && pnpm lint`
 Expected: 通过（`check-mdx` 不报 Since 锚点与未发布标注位置）。
 
 - [ ] **Step 4: 提交（两个仓各自提交）**
 
 ```bash
-cd /home/dufeng/develop/windinput/WindInput
+cd /home/dufeng/develop/windinput/wt-wildcard/WindInput
 git diff --cached --name-status
 git commit -F - --only -- docs/architecture/engine-candidate-pipeline.md docs/design/codetable-wildcard.md <<'EOF'
 docs(design): 码表通配输入落地——架构文档 §3.4 与设计稿回写偏离
@@ -2954,17 +2965,17 @@ EOF
 
 - [ ] **Step 1: 全量测试**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && time TMPDIR=/tmp/wct-wcard cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/wct-wcard/full.log | grep -E "^test result|FAILED|panicked" | tail -60`
-Expected: 无 FAILED；按 `test result` 行求和，与开工前同命令的基线相比只多出本计划新增的用例数（主仓 ~4600 量级，worktree 下 ~1700 量级——差的是 `build_dev/data` 那批）。`codetable_wildcard` 那一行耗时 ≥ 1s。
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && time CARGO_TARGET_DIR=/home/dufeng/.cache/wi-tgt-wcard TMPDIR=/tmp/wct-wcard cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/wct-wcard/full.log | grep -E "^test result|FAILED|panicked" | tail -60`
+Expected: 无 FAILED；按 `test result` 行求和，与开工前同命令的基线相比只多出本计划新增的用例数（本 worktree 已拷全 `build_dev/data`，基线取开工前实测值，见账本 Baseline 行）。`codetable_wildcard` 那一行耗时 ≥ 1s。
 
 - [ ] **Step 2: 编译门**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput/wind_input && cargo check-headless && cd .. && ./scripts/dev.sh k`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput/wind_input && cargo check-headless && cd .. && ./scripts/dev.sh k`
 Expected: 均通过（新增代码零平台依赖；`wildcard.rs` 不引用 wind-ui）。
 
 - [ ] **Step 3: 占位与格式自查**
 
-Run: `cd /home/dufeng/develop/windinput/WindInput && git diff HEAD~12 --stat && git diff HEAD~12 | grep -nE "TODO|todo!|unimplemented!|\.only\(|#\[ignore" || echo clean`
+Run: `cd /home/dufeng/develop/windinput/wt-wildcard/WindInput && git diff HEAD~12 --stat && git diff HEAD~12 | grep -nE "TODO|todo!|unimplemented!|\.only\(|#\[ignore" || echo clean`
 Expected: `clean`（`HEAD~12` 以实际提交数为准，范围只含本计划的提交）；`rustfmt --edition 2024 --check` 对本计划新建的两个文件无输出。
 
 ---

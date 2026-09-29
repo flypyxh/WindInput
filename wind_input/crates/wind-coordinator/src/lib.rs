@@ -72,6 +72,7 @@ pub mod tsf_profile_name;
 pub mod ui_sender;
 pub mod watchdog;
 pub mod web_host;
+pub(crate) mod wildcard;
 
 pub use coordinator::{Coordinator, request_restart, restart_signal, set_settings_url_provider};
 pub use ui_sender::UiSender;

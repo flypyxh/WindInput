@@ -1412,15 +1412,35 @@ impl WdatReader {
             return (Vec::new(), stats); // 子树无任何条目
         }
 
-        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
         let mut pq: BinaryHeap<Pending> = BinaryHeap::new();
-        let mut arena: Vec<PathNode> = Vec::new();
         pq.push(Pending {
             bound: root_bound,
             state: start,
             path: u32::MAX,
         });
+        let mut arena: Vec<PathNode> = Vec::new();
+        let out = self.bnb_collect(v, pq, &mut arena, prefix, limit, filter, &mut stats);
+        (out, stats)
+    }
 
+    /// 分支限界主循环：从 `pq` 里的起点（可以不止一个）出发按上界降序展开，取前 `limit` 条。
+    ///
+    /// 各起点的完整 code = `prefix` + 其 `path` 在 `arena` 上回溯出的字节。单起点
+    /// （`search_prefix`）传查询前缀、`path = u32::MAX`；多起点（`search_pattern`）传
+    /// `prefix = ""`，并把各起点自身的码预先铺进 `arena`——`build_code` 的「单前缀」假设
+    /// 由此解除，而无需改它的签名。剪枝判据与正确性论证不变，见 `search_prefix` 文档。
+    #[allow(clippy::too_many_arguments)]
+    fn bnb_collect(
+        &self,
+        v: &DatView,
+        mut pq: BinaryHeap<Pending>,
+        arena: &mut Vec<PathNode>,
+        prefix: &str,
+        limit: usize,
+        filter: Option<(u32, usize)>,
+        stats: &mut PrefixSearchStats,
+    ) -> Vec<DictEntry> {
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
         while let Some(node) = pq.pop() {
             // 剪枝（见函数文档要害 1）：严格小于才终止，且是 break 而非 continue——
             // 出队顺序保证剩余各项上界都 <= 本项。
@@ -1434,7 +1454,7 @@ impl WdatReader {
 
             // 本状态自身若成词，收集其条目（一码多词）。
             if let Some(leaf) = self.terminal_leaf(v, node.state) {
-                let code = Self::build_code(prefix, &arena, node.path);
+                let code = Self::build_code(prefix, &arena[..], node.path);
                 let mut slot: u16 = 0;
                 let entries_read = &mut stats.entries_read;
                 self.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
@@ -1501,12 +1521,162 @@ impl WdatReader {
                 });
             }
         }
-        let out = heap
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|r| r.entry)
+            .collect()
+    }
+
+    /// 通配查询（`docs/design/codetable-wildcard.md` §5.1）：`pattern` 中等于 `wildcard`
+    /// 的字节位匹配**恰好一个**任意码元，其余位字面匹配。
+    ///
+    /// 1. **逐位推进前沿**：通配位遍历该状态全部有效转移（`1..=max_code`，稀疏，`NO_MAXW`
+    ///    子树直接跳过），字面位走一次转移；
+    /// 2. **等长档**：前沿各状态的终止叶按 `RankKey` 取前 `limit`；
+    /// 3. **更长档**（`with_prefix`）：余额 `limit - 等长条数` 交给 [`Self::bnb_collect`]，
+    ///    以全部前沿状态的子节点为多起点入队。
+    ///
+    /// 两档分开取额的理由见 [`crate::layer::DictLayer::search_pattern`]。首位即通配时
+    /// 前沿从根展开，靠 `limit` 与分支限界兜底。`pattern` / `wildcard` 须为 ASCII，否则返回空。
+    pub fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<DictEntry> {
+        let v = &self.main;
+        if v.dat_size == 0
+            || limit == 0
+            || pattern.is_empty()
+            || !pattern.is_ascii()
+            || !wildcard.is_ascii()
+        {
+            return Vec::new();
+        }
+        let wb = wildcard as u8;
+        let mut arena: Vec<PathNode> = Vec::new();
+        // 前沿：(状态, 该状态完整码在 arena 上的末节点)。根的码为空，记 u32::MAX。
+        let mut frontier: Vec<(i32, u32)> = vec![(0, u32::MAX)];
+        for &pb in pattern.as_bytes() {
+            let mut next: Vec<(i32, u32)> = Vec::new();
+            for &(s, path) in &frontier {
+                let bs = self.base(v, s);
+                if bs < 0 {
+                    continue; // 叶状态无出边
+                }
+                if pb == wb {
+                    for c in 1..=v.max_code {
+                        let t = bs + c;
+                        if !Self::in_range(v, t)
+                            || self.check(v, t) != s
+                            || self.maxw(v, t) == NO_MAXW
+                        {
+                            continue;
+                        }
+                        arena.push(PathNode {
+                            parent: path,
+                            byte: v.rev_map[c as usize],
+                        });
+                        next.push((t, arena.len() as u32 - 1));
+                    }
+                } else {
+                    let c = v.char_map[pb as usize];
+                    if c < 0 {
+                        continue; // 该字节不在本词库的码元里（同 `walk`）
+                    }
+                    let t = bs + c;
+                    if !Self::in_range(v, t) || self.check(v, t) != s {
+                        continue;
+                    }
+                    arena.push(PathNode {
+                        parent: path,
+                        byte: pb,
+                    });
+                    next.push((t, arena.len() as u32 - 1));
+                }
+            }
+            if next.is_empty() {
+                return Vec::new();
+            }
+            frontier = next;
+        }
+
+        // 等长档。
+        let mut exact: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+        for &(s, path) in &frontier {
+            let Some(leaf) = self.terminal_leaf(v, s) else {
+                continue;
+            };
+            let code = Self::build_code("", &arena[..], path);
+            let mut slot: u16 = 0;
+            self.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
+                let key = RankKey {
+                    weight,
+                    order,
+                    leaf,
+                    slot,
+                };
+                slot += 1;
+                if exact.len() >= limit {
+                    match exact.peek() {
+                        Some(worst) if key >= worst.key => return,
+                        _ => {}
+                    }
+                    exact.pop();
+                }
+                exact.push(Ranked {
+                    key,
+                    entry: DictEntry {
+                        code: code.clone(),
+                        text: text.to_string(),
+                        weight,
+                        order,
+                        boundary,
+                    },
+                });
+            });
+        }
+        let mut out: Vec<DictEntry> = exact
             .into_sorted_vec()
             .into_iter()
             .map(|r| r.entry)
             .collect();
-        (out, stats)
+        let rest = limit - out.len();
+        if !with_prefix || rest == 0 {
+            return out;
+        }
+
+        // 更长档：前沿各状态的子节点（紧凑码 ≥1）作多起点。
+        let mut pq: BinaryHeap<Pending> = BinaryHeap::new();
+        for &(s, path) in &frontier {
+            let bs = self.base(v, s);
+            if bs < 0 {
+                continue;
+            }
+            for c in 1..=v.max_code {
+                let t = bs + c;
+                if !Self::in_range(v, t) || self.check(v, t) != s {
+                    continue;
+                }
+                let bound = self.maxw(v, t);
+                if bound == NO_MAXW {
+                    continue;
+                }
+                arena.push(PathNode {
+                    parent: path,
+                    byte: v.rev_map[c as usize],
+                });
+                pq.push(Pending {
+                    bound,
+                    state: t,
+                    path: arena.len() as u32 - 1,
+                });
+            }
+        }
+        let mut stats = PrefixSearchStats::default();
+        out.extend(self.bnb_collect(v, pq, &mut arena, "", rest, None, &mut stats));
+        out
     }
 
     /// 前缀查找的**全遍历参考实现**（v6 之前的行为）：DFS 整棵子树 + top-N 堆。
@@ -1665,6 +1835,128 @@ mod tests {
         out.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
         out.truncate(limit);
         out
+    }
+
+    /// 通配查询的**全遍历参考实现**：全树 DFS 收集全部条目 → 按 pattern 过滤 →
+    /// 等长 / 更长两档各自按 (weight 降, order 升) 稳定排序 → 等长先取满 `limit`，余额给更长档。
+    /// DFS 序即叶号序（构建期按 code 字典序分配），故稳定排序的 tie-break 与 `RankKey` 一致。
+    fn reference_pattern(
+        r: &WdatReader,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<DictEntry> {
+        let v = &r.main;
+        let n = pattern.len();
+        let mut exact: Vec<DictEntry> = Vec::new();
+        let mut longer: Vec<DictEntry> = Vec::new();
+        let mut path: Vec<u8> = Vec::new();
+        r.for_each_leaf(v, 0, &mut path, &mut |code, leaf| {
+            if !crate::layer::pattern_matches(pattern, wildcard, code, with_prefix) {
+                return;
+            }
+            let bucket = if code.len() == n {
+                &mut exact
+            } else {
+                &mut longer
+            };
+            r.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
+                bucket.push(DictEntry {
+                    code: code.to_string(),
+                    text: text.to_string(),
+                    weight,
+                    order,
+                    boundary,
+                });
+            });
+        });
+        let key =
+            |a: &DictEntry, b: &DictEntry| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order));
+        exact.sort_by(key);
+        longer.sort_by(key);
+        exact.truncate(limit);
+        let rest = limit - exact.len();
+        longer.truncate(rest);
+        exact.extend(longer);
+        exact
+    }
+
+    /// 通配查询 == 全遍历参考实现，逐条相同（含顺序）。覆盖多通配、首位通配、`with_prefix`、
+    /// 转移空洞（`i % 5` 挖掉的码）与大量等权 tie-break。
+    #[test]
+    fn search_pattern_matches_full_scan() {
+        let alphabet = ['a', 'b', 'c'];
+        let mut data: Vec<(String, Vec<(String, i32)>)> = Vec::new();
+        let mut i = 0u32;
+        for len in 1..=4u32 {
+            for k in 0..3usize.pow(len) {
+                let mut code = String::new();
+                let mut x = k;
+                for _ in 0..len {
+                    code.push(alphabet[x % 3]);
+                    x /= 3;
+                }
+                i += 1;
+                if i.is_multiple_of(5) {
+                    continue; // 挖空洞：逼出「该位无此转移」的分支
+                }
+                let w = ((i * 7919) % 7) as i32 * 100; // 权重大量重复，逼出 tie-break
+                let mut ents = vec![(format!("甲{i}"), w)];
+                if i.is_multiple_of(4) {
+                    ents.push((format!("乙{i}"), w)); // 一码多词
+                }
+                data.push((code, ents));
+            }
+        }
+        let p = build_owned("wdat_pattern_full_scan.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+        for pat in ["?", "a?", "?b", "??", "a?c", "??c?", "????", "c??a", "?a"] {
+            for with_prefix in [false, true] {
+                for limit in [1usize, 3, 10, 1000] {
+                    assert_same(
+                        &r.search_pattern(pat, '?', limit, with_prefix),
+                        &reference_pattern(&r, pat, '?', limit, with_prefix),
+                        &format!("pat={pat} with_prefix={with_prefix} limit={limit}"),
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ★ 等长档不得被更长的高权重编码挤出配额（Review Focus 第 5 条）。
+    #[test]
+    fn search_pattern_equal_length_never_crowded_out() {
+        let p = build(
+            "wdat_pattern_quota.wdat",
+            &[
+                ("ab", &[("等长", 1)]),
+                ("abcd", &[("长码", 9999)]),
+                ("ac", &[("等长二", 2)]),
+            ],
+        );
+        let r = WdatReader::open(&p).unwrap();
+        let texts = |v: Vec<DictEntry>| v.into_iter().map(|e| e.text).collect::<Vec<_>>();
+        assert_eq!(
+            texts(r.search_pattern("a?", '?', 1, true)),
+            ["等长二"],
+            "limit=1 时名额先给等长档"
+        );
+        assert_eq!(
+            texts(r.search_pattern("a?", '?', 3, true)),
+            ["等长二", "等长", "长码"]
+        );
+        assert_eq!(
+            texts(r.search_pattern("a?", '?', 3, false)),
+            ["等长二", "等长"],
+            "不带前缀补全时只出等长"
+        );
+        assert!(
+            r.search_pattern("x?", '?', 3, true).is_empty(),
+            "字面位无转移 ⇒ 空"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     fn assert_same(actual: &[DictEntry], expect: &[DictEntry], ctx: &str) {

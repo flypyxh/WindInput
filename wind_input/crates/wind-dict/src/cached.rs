@@ -446,6 +446,31 @@ impl CachedDict {
         }
     }
 
+    /// 通配查询。两个后端语义一致（等长档先取满），见
+    /// [`crate::datformat::WdatReader::search_pattern`]。
+    pub fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<DictHit> {
+        match self {
+            Self::Mmap(reader) => reader
+                .search_pattern(pattern, wildcard, limit, with_prefix)
+                .into_iter()
+                .map(|e| DictHit {
+                    code: e.code,
+                    text: e.text,
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                })
+                .collect(),
+            Self::Memory(dict) => dict.search_pattern(pattern, wildcard, limit, with_prefix),
+        }
+    }
+
     /// 简拼查找（声母缩写，如 `nh`）：返回该简拼对应的**全拼码**列表，已按权重降序、截断。
     /// 仅 wdat(Mmap) 的独立 AbbrevSection 支持；内存回退（yaml 未建简拼）返回空。
     ///

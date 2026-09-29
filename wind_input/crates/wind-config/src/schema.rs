@@ -482,6 +482,12 @@ pub struct CodeTableSpec {
     /// 值域与语义见 `wind_config::config::BoundAction`。
     #[serde(default)]
     pub z_key_action: Option<String>,
+    /// 通配输入开关（`None` = 跟随全局 `schema.codetable.wildcard`）。
+    #[serde(default)]
+    pub wildcard: Option<bool>,
+    /// 通配键（`None` = 跟随全局）。合法性见 `wind_config::config::parse_wildcard_key`。
+    #[serde(default)]
+    pub wildcard_key: Option<String>,
     /// 方案级调频覆盖（`[engine.codetable.frequency]`）。
     ///
     /// 缺省 = 整段跟随基线。特殊方案的基线是内置默认（不继承全局 `schema.codetable`，

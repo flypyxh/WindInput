@@ -831,6 +831,29 @@ impl Engine for MixedEngine {
         self.primary.input_chars()
     }
 
+    /// 有拼音子引擎时通配**关闭**（spec §3.1：五笔拼音混输不参与）：通配键多为字母 `z`，
+    /// 非首位的 `z` 在拼音里是正经字母（`hanzi` / `xianzai`），作通配会把整串变成只查
+    /// 主码表的查询、拼音候选全灭。无拼音子引擎时代理主码表。
+    fn wildcard_key(&self) -> Option<char> {
+        if self.secondary.is_some() {
+            return None;
+        }
+        self.primary.wildcard_key()
+    }
+
+    fn convert_wildcard(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        if self.secondary.is_some() {
+            return None;
+        }
+        self.primary
+            .convert_wildcard(input, pattern, max_candidates)
+    }
+
     /// 热插拔扩展词库：转发到主/次/英文子引擎（码表子引擎承载 codetable-extra 层，
     /// 英文子引擎承载 `en_ext` 一类扩展层）。三个都要转：漏掉哪个，那个方案的扩展库开关
     /// 在混输下就只会翻到独立引擎那份、看着生效实际没有。
@@ -2402,5 +2425,46 @@ mod tests {
         let r = e.convert("good", 50).unwrap();
         assert!(r.should_commit, "英文守护关时应放行全码上屏");
         assert_eq!(r.commit_text, "工");
+    }
+
+    /// 有拼音子引擎 ⇒ 通配关闭（spec §3.1「五笔拼音混输不参与」）：键与转换都不给，
+    /// 否则非首位 `z` 会把 `hanzi` 变成只查主码表的查询。对照：无拼音子引擎时代理主码表，
+    /// 且结果只来自主码表。
+    #[test]
+    fn wildcard_off_when_pinyin_present() {
+        let primary = || {
+            let mut d = CodetableDict::empty();
+            d.merge_single("ab".into(), "甲".into(), 10, 0);
+            let dm = DictManager::new();
+            dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
+            Box::new(CodeTableEngine::new(
+                4,
+                CommitOptions {
+                    wildcard: Some('z'),
+                    ..Default::default()
+                },
+                Arc::new(dm),
+            ))
+        };
+        let pattern = format!("a{}", wind_dict::WILDCARD_SLOT);
+        let mixed = MixedEngine::new(
+            primary(),
+            Some(Box::new(FakePinyin {
+                word: "拼音",
+                syllables: 1,
+            })),
+            None,
+            MixConfig::default(),
+        );
+        assert_eq!(mixed.wildcard_key(), None, "有拼音子引擎 ⇒ 通配关闭");
+        assert!(mixed.convert_wildcard("az", &pattern, 10).is_none());
+
+        let solo = MixedEngine::new(primary(), None, None, MixConfig::default());
+        assert_eq!(solo.wildcard_key(), Some('z'), "对照：无拼音时代理主码表");
+        let r = solo
+            .convert_wildcard("az", &pattern, 10)
+            .expect("主码表开了通配");
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["甲"]);
     }
 }
