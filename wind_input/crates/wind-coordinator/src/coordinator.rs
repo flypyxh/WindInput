@@ -582,6 +582,12 @@ pub(crate) struct State {
     /// 高亮到码表整句候选时 preedit 用它；其余情形不读。
     /// 空串 = 本次没有整句解（或方案未开整句）。每次 build_candidates 重置。
     pub(crate) preedit_codetable_body: String,
+    /// **直接辅助码**命中时的组码区形态：前缀的双拼音节分段 + 空格 + 辅码（`ui'du p`）。
+    /// 高亮到 `is_direct_aux` 的候选时 preedit 用它，让人看出末尾被当成了辅码；其余情形不读。
+    /// 空串 = 本键没有直接辅助命中。每次 build_candidates 重置（见 `apply_direct_aux`）。
+    pub(crate) direct_aux_body: String,
+    /// 直接辅助码：上一个整音节输入的主候选快照，供后面的键当前缀候选（见 `DirectAuxPrev`）。
+    pub(crate) direct_aux_prev: Option<crate::handle_direct_aux::DirectAuxPrev>,
     /// 候选调整（shadow）规则的**归一编码**；空串 = 落回 `input_buffer`（击键原样）。
     ///
     /// 取自 `ConvertResult::shadow_code`，与 `preedit_split_body` 同生命周期（每次
@@ -2527,6 +2533,8 @@ impl Coordinator {
                 preedit_fp_body: String::new(),
                 preedit_abbrev_body: String::new(),
                 preedit_codetable_body: String::new(),
+                direct_aux_body: String::new(),
+                direct_aux_prev: None,
                 shadow_code: String::new(),
                 sentence_pool: Vec::new(),
                 sentence_window: 0,
@@ -5766,6 +5774,8 @@ impl Coordinator {
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
         state.preedit_abbrev_body.clear();
+        state.direct_aux_body.clear();
+        state.direct_aux_prev = None;
         state.shadow_code.clear();
         state.candidates.clear();
         self.reset_candidate_view(state);

@@ -33,6 +33,7 @@ pub mod handle_cmdbar;
 pub mod handle_cmdbar_macos;
 pub mod handle_common_chars;
 pub mod handle_config;
+pub mod handle_direct_aux;
 pub mod handle_draft;
 pub mod handle_email;
 pub mod handle_key;

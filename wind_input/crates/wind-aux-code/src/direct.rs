@@ -357,6 +357,52 @@ mod tests {
         assert!(!m("释", "plx"), "超过 2 位不命中");
     }
 
+    /// 2 位辅码的命中集 ⊆ 其首字母 1 位的命中集。协调器据此按首字母给引擎下推准入、
+    /// 并让奇数键取的前缀池在紧随其后的偶数键复用——这条不成立，复用就会漏命中。
+    #[test]
+    fn two_letter_hits_are_subset_of_first_letter_hits() {
+        let t = table();
+        let texts = [
+            "释",
+            "湿",
+            "适",
+            "十",
+            "试",
+            "读",
+            "度",
+            "国",
+            "庆",
+            "情",
+            "释读",
+            "湿度",
+            "国庆",
+            "国情",
+            "读释",
+            "释读度",
+            "李",
+        ];
+        let letters = ['p', 'l', 'd', 'y', 'g', 'k', 'x', 'o', 'a', 'z'];
+        let mut two_letter_hits = 0;
+        for text in texts {
+            for a in letters {
+                for b in letters {
+                    let ab: String = [a, b].iter().collect();
+                    for max in [0, 2] {
+                        let r = DirectPhraseRule::Any;
+                        if direct_matches(text, &t, &ab, r, max) {
+                            two_letter_hits += 1;
+                            assert!(
+                                direct_matches(text, &t, &a.to_string(), r, max),
+                                "{text} 中 {ab} 却不中 {a}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(two_letter_hits > 20, "样本太少：{two_letter_hits}");
+    }
+
     #[test]
     fn max_phrase_len_excludes_long_phrases_only() {
         let t = table();

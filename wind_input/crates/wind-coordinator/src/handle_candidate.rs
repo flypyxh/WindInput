@@ -1548,6 +1548,10 @@ impl Coordinator {
         // Shadow 的取码口与写端 `candidate_op_scope` 同源（见 `shadow_code_of`）——双拼下
         // 是归一后的全拼码，其余恒为击键。⚠️ 与上一行的词频记账**刻意不同域**：那条链有
         // 自己的 `freq_code`（码表按输入码、拼音按候选码），两者别互相照抄。
+        // 直接辅助码（双拼，末 1～2 位自动当辅码）：命中项并入主候选。位置钉在全部重排
+        // **之后**、shadow **之前**（设计 §6）：插在重排之前会被按消费长度 / 调频重新排走；
+        // 而本函数也被翻页扩容调用，放进 `update_candidates` 会在翻页时丢失命中项。
+        self.apply_direct_aux(state, &mut candidates, limit);
         let shadow_code = Self::shadow_code_of(state).to_string();
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）。
         //
@@ -2169,6 +2173,7 @@ impl Coordinator {
         state.preedit_fp_body.clear();
         state.preedit_abbrev_body.clear();
         state.preedit_codetable_body.clear();
+        state.direct_aux_body.clear();
         state.shadow_code.clear();
         state.sentence_pool.clear();
         state.sentence_window = 0;
@@ -2708,6 +2713,16 @@ impl Coordinator {
             state.candidates.get(self.highlighted_global_index(state)),
         ) {
             return &state.preedit_codetable_body;
+        }
+        // 直接辅助码命中项：`前缀音节 + 空格 + 辅码`，让人看出末尾被当成了辅码。排在
+        // 「分段上屏中恒拆分」那条之前：分段后剩余缓冲同样可以带辅码。
+        if !state.direct_aux_body.is_empty()
+            && state
+                .candidates
+                .get(self.highlighted_global_index(state))
+                .is_some_and(|c| c.is_direct_aux)
+        {
+            return &state.direct_aux_body;
         }
         if state.preedit_split_body.is_empty() {
             return &state.input_buffer;
