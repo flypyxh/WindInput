@@ -2578,6 +2578,26 @@ impl EngineManager {
         }
     }
 
+    /// 活跃方案的通配键（关闭 / 非码表 / 键非法时 `None`；混输取主码表的）。
+    ///
+    /// 与 [`Self::active_input_chars`] 同一归属理由：方案级引擎固定参数挂在引擎上，方案切换
+    /// 自然跟着换。协调器**只从这里取**，不读 `codetable_settings()`——那份每次调用都重新折叠，
+    /// 且非法键的告警只该在构建期出一次。
+    pub fn active_wildcard_key(&self) -> Option<char> {
+        self.active_engine().and_then(|e| e.wildcard_key())
+    }
+
+    /// 通配转换（透传活跃引擎）。**不**叠英文混入：通配是查码，不是打英文。
+    pub fn convert_wildcard(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.active_engine()?
+            .convert_wildcard(input, pattern, max_candidates)
+    }
+
     /// 同 [`Self::active_is_code_char`]，但取**指定方案**（overlay 用，见 [`Self::engine_for`]）。
     ///
     /// ⚠️ 拼音引擎的码元集**完全由双拼布局推导**（`PinyinEngine::input_chars`）：全拼恒

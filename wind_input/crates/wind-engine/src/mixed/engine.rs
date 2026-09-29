@@ -831,6 +831,21 @@ impl Engine for MixedEngine {
         self.primary.input_chars()
     }
 
+    /// 通配只走主码表（spec §3.1：五笔拼音混输不参与），拼音 / 英文子引擎一概不问。
+    fn wildcard_key(&self) -> Option<char> {
+        self.primary.wildcard_key()
+    }
+
+    fn convert_wildcard(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.primary
+            .convert_wildcard(input, pattern, max_candidates)
+    }
+
     /// 热插拔扩展词库：转发到主/次/英文子引擎（码表子引擎承载 codetable-extra 层，
     /// 英文子引擎承载 `en_ext` 一类扩展层）。三个都要转：漏掉哪个，那个方案的扩展库开关
     /// 在混输下就只会翻到独立引擎那份、看着生效实际没有。
@@ -2402,5 +2417,43 @@ mod tests {
         let r = e.convert("good", 50).unwrap();
         assert!(r.should_commit, "英文守护关时应放行全码上屏");
         assert_eq!(r.commit_text, "工");
+    }
+
+    /// 通配只走主码表：拼音子引擎不参与（spec §3.1「五笔拼音混输不参与」）。
+    /// 对照：同一引擎走普通 convert 时拼音候选照常出现，证明 FakePinyin 确实有货。
+    #[test]
+    fn wildcard_goes_to_primary_only() {
+        let mut d = CodetableDict::empty();
+        d.merge_single("ab".into(), "甲".into(), 10, 0);
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
+        let primary = Box::new(CodeTableEngine::new(
+            4,
+            CommitOptions {
+                wildcard: Some('z'),
+                ..Default::default()
+            },
+            Arc::new(dm),
+        ));
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "拼音",
+                syllables: 1,
+            })),
+            None,
+            MixConfig::default(),
+        );
+        assert_eq!(e.wildcard_key(), Some('z'));
+        let r = e
+            .convert_wildcard("az", &format!("a{}", wind_dict::WILDCARD_SLOT), 10)
+            .expect("主码表开了通配");
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["甲"], "拼音子引擎不得参与通配");
+        let plain = e.convert("ab", 10).unwrap();
+        assert!(
+            plain.candidates.iter().any(|c| c.text == "拼音"),
+            "对照：普通 convert 下拼音照常出现"
+        );
     }
 }
