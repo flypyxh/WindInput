@@ -2112,6 +2112,13 @@ pub struct CodetableGlobal {
     /// 可作**首码**的字符集（`input_chars` 的子集）。空=与 `input_chars` 相同。
     #[serde(default)]
     pub leading_chars: String,
+    /// 通配输入（万能键）：组码时通配键代替**恰好一个**码元，候选显示完整编码；
+    /// 通配结果不自动上屏、不顶字、不清空。见 `docs/design/codetable-wildcard.md`。
+    #[serde(default)]
+    pub wildcard: bool,
+    /// 通配键：单个字面字符（字母或 ASCII 符号）。合法性见 [`parse_wildcard_key`]。
+    #[serde(default = "default_wildcard_key")]
+    pub wildcard_key: String,
     /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
     /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
     ///
@@ -2170,6 +2177,23 @@ fn default_short_code_yield_level() -> usize {
     0
 }
 
+fn default_wildcard_key() -> String {
+    "z".to_string()
+}
+
+/// 通配键的合法性：恰好一个字符、ASCII 可打印（不含空格）、**不是数字**；字母归一小写。
+///
+/// 数字排除的理由：空缓冲时 C++ 不吃数字键（到不了 core），组码中数字恒是选词键（按 §3.3
+/// 恒让位）——两个位置都当不了通配，配上只会「开了没反应」。
+pub fn parse_wildcard_key(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    let c = it.next()?;
+    if it.next().is_some() || !c.is_ascii_graphic() || c.is_ascii_digit() {
+        return None;
+    }
+    Some(c.to_ascii_lowercase())
+}
+
 impl Default for CodetableGlobal {
     fn default() -> Self {
         Self {
@@ -2197,6 +2221,8 @@ impl Default for CodetableGlobal {
             // 结构体零值与 TOML 缺省两处是同一个值，避免两套默认源不一致。
             input_chars: String::new(),
             leading_chars: String::new(),
+            wildcard: false,
+            wildcard_key: default_wildcard_key(),
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -2259,6 +2285,12 @@ impl CodetableGlobal {
         if let Some(v) = &o.z_key_action {
             out.z_key_action = v.clone();
         }
+        if let Some(v) = o.wildcard {
+            out.wildcard = v;
+        }
+        if let Some(v) = &o.wildcard_key {
+            out.wildcard_key = v.clone();
+        }
         // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
         //
         // ⚠️ 这一段的消费方是 `EngineManager::freq_settings`，与上面那些上屏行为字段的
@@ -2306,6 +2338,25 @@ impl CodetableGlobal {
             }
         }
         out
+    }
+
+    /// 生效的通配键：关闭 ⇒ `None`；键非法 ⇒ 告警并视为关闭（spec §4）。
+    ///
+    /// 只在**构建引擎时**调用一次（`EngineManager::build_engine`），协调器经
+    /// `EngineManager::active_wildcard_key` 取引擎上的值——按键热路径上反复折叠会反复告警。
+    pub fn wildcard_char(&self, schema_id: &str) -> Option<char> {
+        if !self.wildcard {
+            return None;
+        }
+        let parsed = parse_wildcard_key(&self.wildcard_key);
+        if parsed.is_none() {
+            tracing::warn!(
+                "方案 {} 的 wildcard_key = {:?} 非法（须为单个字母或 ASCII 符号），通配输入已关闭",
+                schema_id,
+                self.wildcard_key
+            );
+        }
+        parsed
     }
 }
 
@@ -9483,6 +9534,47 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codetable_wildcard_folds_from_schema_and_validates_key() {
+        let g = CodetableGlobal::default();
+        assert!(!g.wildcard, "出厂关闭");
+        assert_eq!(g.wildcard_key, "z");
+        assert_eq!(g.wildcard_char("t"), None, "关闭时恒 None，不看键");
+
+        let spec = crate::schema::CodeTableSpec {
+            wildcard: Some(true),
+            wildcard_key: Some("?".into()),
+            ..Default::default()
+        };
+        assert_eq!(g.resolved(Some(&spec)).wildcard_char("t"), Some('?'));
+
+        let on = CodetableGlobal {
+            wildcard: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            on.resolved(Some(&crate::schema::CodeTableSpec::default()))
+                .wildcard_char("t"),
+            Some('z'),
+            "方案没写 ⇒ 回落全局"
+        );
+
+        for bad in ["", "ab", "中", " ", "1", "\t"] {
+            let c = CodetableGlobal {
+                wildcard: true,
+                wildcard_key: bad.into(),
+                ..Default::default()
+            };
+            assert_eq!(c.wildcard_char("t"), None, "非法键 {bad:?} 应视为关闭");
+        }
+        assert_eq!(
+            parse_wildcard_key("Z"),
+            Some('z'),
+            "字母归一小写：缓冲恒存小写"
+        );
+        assert_eq!(parse_wildcard_key("`"), Some('`'));
+    }
 
     /// ★ 便携闸门**只许挡便携这一侧**：非便携下 `user_config_marker_path()` 必须仍给出路径。
     ///
