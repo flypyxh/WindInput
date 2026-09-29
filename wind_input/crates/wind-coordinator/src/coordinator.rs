@@ -16007,6 +16007,15 @@ mod input_diag_tests {
         // 宿主真报了 IS_PASSWORD：reason 字节 2，仍是密码框。
         c.apply_input_diag(1, false, 2, 0x8000_0001);
         assert_eq!(c.input_block(), InputBlock::Password);
+
+        // Chromium 网页密码框：context 禁用 + IS_PRIVATE（rawScope=0x2000000000000000，靶机实测），
+        // 宿主虽没明说密码，两个信号同时出现按密码框展示——图标提示不能说「被应用禁用」。
+        c.apply_input_diag(1, false, 4, 0x8000_0000 | (1 << 61));
+        assert_eq!(
+            c.last_input_diag.lock().unwrap().reason,
+            InputDiagReason::ContextPassword
+        );
+        assert_eq!(c.input_block(), InputBlock::Password);
     }
 
     #[test]

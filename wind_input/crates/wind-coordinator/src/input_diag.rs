@@ -3,6 +3,8 @@
 /// InputScope 位：与 C++ kScopeBitPassword / Go 端一致。
 const IS_PASSWORD_BIT: u64 = 1 << 31;
 const IS_NUMERIC_PASSWORD_BIT: u64 = 1 << 63;
+/// `IS_PRIVATE`（枚举值 61）。Chromium 密码框的指纹之一：context 级禁用 + 宿主原始 scope 带此位。
+const IS_PRIVATE_BIT: u64 = 1 << 61;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InputDiagReason {
@@ -15,6 +17,11 @@ pub enum InputDiagReason {
     /// 与 `InputScopePassword` 是两回事：前者是宿主明说「这是密码框」，后者只是宿主说「此处禁用输入法」
     /// （Chromium 密码框会这么置，Gecko 系无输入焦点时也会——t197）。抑制行为相同，展示与提示语不同。
     ContextDisabled,
+    /// context 级禁用 + 宿主原始 scope 带 `IS_PRIVATE`：Chromium 系网页密码框的指纹
+    /// （2026-09-30 靶机实测：Chrome 密码框 rawScope=0x2000000000000000 且 ctxKbdDisabled=1；
+    /// Zen 无输入焦点态 rawScope=0x1 且 ctxKbdDisabled=1；Chrome 无痕普通框只有 IS_PRIVATE、
+    /// 不置 context 禁用）。宿主没有明说「密码」，但两个信号同时出现足以认定，展示按密码框处理。
+    ContextPassword,
 }
 
 /// DLL 上报的 `reason` 字节里「context 级禁用、宿主未报密码 scope」这一档
@@ -43,14 +50,22 @@ pub fn reason_from(disabled: bool, mask: u64) -> InputDiagReason {
 /// 退回按 mask 推导——展示会把 context 级禁用说成「密码」，但那是旧行为，不比以前更差。
 pub fn reason_from_report(disabled: bool, reason_byte: u8, mask: u64) -> InputDiagReason {
     if !disabled && reason_byte == REPORT_REASON_CONTEXT_DISABLED && is_password_scope(mask) {
-        return InputDiagReason::ContextDisabled;
+        // 折位摘掉后才是宿主原始 scope：IS_PRIVATE 只看它，不看折进去的位。
+        return if mask & IS_PRIVATE_BIT != 0 {
+            InputDiagReason::ContextPassword
+        } else {
+            InputDiagReason::ContextDisabled
+        };
     }
     reason_from(disabled, mask)
 }
 
 /// 展示用的 InputScope：context 级禁用那档要把折进去的 IS_PASSWORD 位摘掉，还原**宿主原始报的值**。
 pub fn display_mask(reason: InputDiagReason, mask: u64) -> u64 {
-    if reason == InputDiagReason::ContextDisabled {
+    if matches!(
+        reason,
+        InputDiagReason::ContextDisabled | InputDiagReason::ContextPassword
+    ) {
         mask & !IS_PASSWORD_BIT
     } else {
         mask
@@ -69,6 +84,7 @@ pub fn reason_label(r: InputDiagReason) -> &'static str {
         InputDiagReason::InputScopePassword => "宿主报密码",
         InputDiagReason::NumericPassword => "宿主报数字密码",
         InputDiagReason::ContextDisabled => "context 禁用",
+        InputDiagReason::ContextPassword => "密码框(context 禁用+私密)",
     }
 }
 
@@ -149,6 +165,15 @@ mod tests {
             reason_from_report(true, REPORT_REASON_CONTEXT_DISABLED, folded),
             InputDiagReason::CompartmentDisabled
         );
+        // Chromium 密码框：context 禁用 + 宿主原始 scope 带 IS_PRIVATE ⇒ 按密码框展示。
+        assert_eq!(
+            reason_from_report(
+                false,
+                REPORT_REASON_CONTEXT_DISABLED,
+                0x8000_0000 | (1 << 61)
+            ),
+            InputDiagReason::ContextPassword
+        );
         // 谎报 4 但 mask 里没有密码位：不采信（抑制与展示不应自相矛盾）。
         assert_eq!(
             reason_from_report(false, REPORT_REASON_CONTEXT_DISABLED, 0x1),
@@ -161,6 +186,10 @@ mod tests {
         assert_eq!(
             display_mask(InputDiagReason::ContextDisabled, 0x8000_0001),
             0x1
+        );
+        assert_eq!(
+            display_mask(InputDiagReason::ContextPassword, 0x8000_0000 | (1 << 61)),
+            1 << 61
         );
         assert_eq!(
             display_mask(InputDiagReason::InputScopePassword, 0x8000_0001),
