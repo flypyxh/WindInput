@@ -1,7 +1,6 @@
 # 直接辅助码（双拼）
 
-状态：设计已确认（2026-09-29）；第 1 期（主仓）已实施（分支 `feat/aux-code-direct`，提交见 §10），
-与本文的出入见 §12。第 2、3 期待做。
+状态：三期均已实施并合入 main（2026-09-29，提交见 §10），与本文的出入见 §12。
 来源：[GH#129](https://github.com/huanfeng/WindInput/issues/129)、论坛 [t181](https://forum.windinput.com/topic/181)。
 前置：`aux-code-schema-source.md`（取码接口 `AuxCodeLookup`、方案来源、后台预热），其附录 A 是本文的调研输入。
 
@@ -145,8 +144,8 @@ direct = true         # 可选；不写 = 跟随全局
 | 期 | 仓 | 内容 | 提交 |
 |---|---|---|---|
 | 1 | 主仓 | 配置；码表一行多码；切分、筛选、排序、上屏；组码区 | `9af1e83c`、`d49a8f6b`、`0d693d91`、`9cc246d3`、`a3867b6b`、`2c79ed58`、`ce71d704`；审查修复 `ccb85297`、`7a31c45e`、`e0f5ca65`、`d3faec1e` |
-| 2 | wind-setting | 设置端两行 | - |
-| 3 | 文档站 | 拼音设置页「直接辅助码」小节、配置参考 `direct`、码表格式 | - |
+| 2 | wind-setting | 设置端两行 | wind-setting `212acf8` |
+| 3 | 文档站 | 拼音设置页「直接辅助码」小节、配置参考 `direct`、码表格式 | WindInputDocs `bc8d1be` |
 
 GH#129 / t181 回帖在发版后。
 
