@@ -911,6 +911,27 @@ impl Coordinator {
         self.push_english_pair_config(0);
     }
 
+    /// 设置端 `compat.*` 写入之后的收口：重载规则表，再让当前前台进程的 `active_compat`
+    /// 立即按新表重算。
+    ///
+    /// 只重载不刷新是不够的：同 pid 时 `update_active_compat` 提前 return，缓存里还是旧值，
+    /// 用户在设置页点了却要切走再切回才生效，且完全看不出为什么（右键菜单路径在
+    /// `set_first_show_mode` 里手工补了这一步，这里是同一件事的通用版）。
+    /// 不动 `.pid` / `.has_initial_rule`：它们同时是「上一次真实 FOCUS_GAINED 落在哪」，
+    /// 见 `refresh_active_compat_rule_fields`。
+    pub(crate) fn reload_compat_and_refresh(&self) {
+        self.reload_app_compat();
+        #[cfg(any(windows, test))]
+        {
+            let pid = self
+                .active_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pid;
+            self.refresh_active_compat_rule_fields(pid);
+        }
+    }
+
     /// 为当前焦点应用设置候选窗首显策略，并写入用户层 compat.toml。
     ///
     /// 三步收口，缺一不可：
@@ -4037,5 +4058,48 @@ mod menu_close_tests {
         assert!(releases_suppress(&deact), "切走输入法：{deact:?}");
         let term = close_via(|c| c.handle_composition_terminated());
         assert!(releases_suppress(&term), "组合被终止：{term:?}");
+    }
+}
+
+#[cfg(test)]
+mod compat_reload_tests {
+    use super::*;
+    use wind_config::Config;
+
+    /// 设置端写完规则后，前台进程必须立即按新规则重算，而不是等切走再切回。
+    #[test]
+    fn reload_compat_and_refresh_applies_new_rule_to_the_focused_process_immediately() {
+        let user = std::env::temp_dir().join(format!("wind_compat_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user);
+        std::fs::create_dir_all(&user).unwrap();
+        let (c, _rx) = Coordinator::new_headless_with_ui_at(Config::default(), None, Some(&user));
+
+        // 前台是 feishu.exe（pid 4242），此时还没有任何规则。
+        c.active_compat.lock().unwrap().pid = 4242;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(4242, "feishu.exe".into());
+        assert!(!c.active_compat.lock().unwrap().stale_probe_guard);
+
+        std::fs::write(
+            user.join("compat.toml"),
+            "[[apps]]\nprocess = \"Feishu.exe\"\nstale_probe_guard = true\npin_anchor_when_start_drifts = true\n",
+        )
+        .unwrap();
+
+        // 对照：只重载规则表，缓存仍是旧的——这正是需要 refresh 的原因。
+        c.reload_app_compat();
+        assert!(
+            !c.active_compat.lock().unwrap().stale_probe_guard,
+            "对照失效：只重载就已经生效，说明 refresh 这一步没有存在的理由"
+        );
+
+        c.reload_compat_and_refresh();
+        let ac = *c.active_compat.lock().unwrap();
+        assert!(ac.stale_probe_guard, "前台进程应立即拿到新规则");
+        assert!(ac.pin_anchor_when_start_drifts, "协议字段也要一并刷新");
+        assert_eq!(ac.pid, 4242, "不得改动 pid：它同时是上一次真实焦点的身份");
+        let _ = std::fs::remove_dir_all(&user);
     }
 }

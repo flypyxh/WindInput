@@ -3033,7 +3033,7 @@ impl Coordinator {
     /// 没有身份缓存可用；接受每次连接都重新 `OpenProcess` 一次（<1ms，且连接本就是低频
     /// 事件，不是按键路径）。
     #[cfg(any(windows, test))]
-    fn refresh_active_compat_rule_fields(&self, pid: u32) {
+    pub(crate) fn refresh_active_compat_rule_fields(&self, pid: u32) {
         if pid == 0 {
             return;
         }
@@ -3050,6 +3050,7 @@ impl Coordinator {
             caret_use_top,
             stale_probe_guard,
             composition_start_pair_guard,
+            pin_anchor_when_start_drifts,
             first_show_mode,
             auto_pair,
             smart_method,
@@ -3062,6 +3063,8 @@ impl Coordinator {
                 rule.map(|r| r.caret_use_top).unwrap_or(false),
                 rule.map(|r| r.stale_probe_guard).unwrap_or(false),
                 rule.and_then(|r| r.composition_start_pair_guard)
+                    .unwrap_or(false),
+                rule.and_then(|r| r.pin_anchor_when_start_drifts)
                     .unwrap_or(false),
                 rule.and_then(|r| r.first_show_mode),
                 rule.and_then(|r| r.auto_pair),
@@ -3094,6 +3097,7 @@ impl Coordinator {
             ac.caret_use_top = caret_use_top;
             ac.stale_probe_guard = stale_probe_guard;
             ac.composition_start_pair_guard = composition_start_pair_guard;
+            ac.pin_anchor_when_start_drifts = pin_anchor_when_start_drifts;
             ac.first_show_mode = first_show_mode;
             ac.auto_pair = auto_pair;
             ac.smart_method = smart_method;
