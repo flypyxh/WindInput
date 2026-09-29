@@ -2410,6 +2410,9 @@ impl Coordinator {
         let (engine_count, _) = self.build_candidates(state, new_limit);
         // 重建后立刻重新展开变体（列表整份重建，变体须随之重展）。
         self.expand_s2t_variants(state);
+        // 可见列表可能变短（同组常用字进来、先前放行的生僻字被滤走），页码/高亮须夹回范围，
+        // 下面两条出口都要——见 `clamp_candidate_view`。
+        self.clamp_candidate_view(state);
         // ★ 到底判据看**引擎条数**，不看可见条数（spec codetable-wildcard §11 契约 3，对所有
         // 引擎生效）：新增的一批若全被检索范围滤掉，可见条数不变，而引擎后面可能还有常用字
         // ——按可见条数判会在这里误判到底，后面的字永远翻不出来。
@@ -2422,7 +2425,7 @@ impl Coordinator {
         }
         state.candidate_limit = new_limit;
         state.has_more = engine_count >= new_limit;
-        // 保持当前页/高亮不变（build_candidates 未改动它们）；按当前高亮重算组合区
+        // 保持当前页/高亮（build_candidates 未改动它们，上面只在越界时夹回）；按当前高亮重算组合区
         // （输入/高亮未变 → 形态不变，仅防御性同步）。
         self.sync_preedit_to_highlight(state);
     }
@@ -2739,8 +2742,11 @@ impl Coordinator {
     /// 当前页候选切片的 [start, end) 区间
     pub(crate) fn page_range(&self, state: &State) -> (usize, usize) {
         let pp = self.per_page(state.active);
-        let start = state.current_page * pp;
-        let end = (start + pp).min(state.candidates.len());
+        let len = state.candidates.len();
+        // 起点也夹到 len：页码万一越界（本应由 `clamp_candidate_view` 挡住），得到空页而不是
+        // `start > end` 的切片 panic。页码在范围内时 start < len，行为不变。
+        let start = (state.current_page * pp).min(len);
+        let end = (start + pp).min(len);
         (start, end)
     }
 
@@ -7509,6 +7515,7 @@ mod expand_stop_tests {
 
     const VK_A: u32 = 0x41;
     const VK_NEXT: u32 = 0x22; // PageDown，出厂翻页键组 "pageupdown"
+    const VK_Z: u32 = 0x5A;
 
     /// 清掉夹具目录与码表方案在共享缓存根下的产物（同 `handle_aux_code` 的 `Cleanup`）。
     struct Cleanup {
@@ -7563,6 +7570,28 @@ mod expand_stop_tests {
     /// - `ac` 150 个生僻字 → 与上面那个常用字同组，智能档全滤（第 2 批引擎 +100、可见 +0）；
     /// - `ad` 50 个常用字 → 第 3 批才出现。
     fn coord(tag: &str) -> (Arc<Coordinator>, Cleanup) {
+        coord_with(tag, false, |common, rare| {
+            let mut dict = String::new();
+            for (i, ch) in common[..99].iter().enumerate() {
+                dict += &format!("ab\t{ch}\t{}\n", 10_000 - i);
+            }
+            dict += &format!("ac\t{}\t9800\n", common[99]);
+            for (i, ch) in rare.iter().enumerate() {
+                dict += &format!("ac\t{ch}\t{}\n", 5_000 - i);
+            }
+            for (i, ch) in common[100..150].iter().enumerate() {
+                dict += &format!("ad\t{ch}\t{}\n", 100 - i);
+            }
+            dict
+        })
+    }
+
+    /// 自造码表夹具：`dict` 拿（常用 150 字，生僻 150 字）写词条；`wildcard` 开通配（键 `z`）。
+    fn coord_with(
+        tag: &str,
+        wildcard: bool,
+        dict: impl FnOnce(&[char], &[char]) -> String,
+    ) -> (Arc<Coordinator>, Cleanup) {
         let id = format!("zz_expand_{tag}_{}", std::process::id());
         let dir =
             std::env::temp_dir().join(format!("wind_expand_stop_{tag}_{}", std::process::id()));
@@ -7573,17 +7602,7 @@ mod expand_stop_tests {
         };
         copy_factory_charsets(&dir);
         let (common, rare) = common_and_rare(&dir, 150);
-        let mut dict = String::new();
-        for (i, ch) in common[..99].iter().enumerate() {
-            dict += &format!("ab\t{ch}\t{}\n", 10_000 - i);
-        }
-        dict += &format!("ac\t{}\t9800\n", common[99]);
-        for (i, ch) in rare.iter().enumerate() {
-            dict += &format!("ac\t{ch}\t{}\n", 5_000 - i);
-        }
-        for (i, ch) in common[100..150].iter().enumerate() {
-            dict += &format!("ad\t{ch}\t{}\n", 100 - i);
-        }
+        let dict = dict(&common, &rare);
         let schemas = dir.join("schemas");
         std::fs::create_dir_all(schemas.join(&id)).unwrap();
         std::fs::write(
@@ -7611,6 +7630,8 @@ mod expand_stop_tests {
         cfg.input.rare_phrase = "keep".into();
         // 关掉末页放宽：本用例只看扩容，不许「翻到底再按一次」把被滤的生僻字追加回来。
         cfg.input.scope_relax.page_end_key = false;
+        cfg.schema.codetable.wildcard = wildcard;
+        cfg.schema.codetable.wildcard_key = "z".into();
         (Coordinator::new_headless(cfg, Some(&dir)), guard)
     }
 
@@ -7657,5 +7678,61 @@ mod expand_stop_tests {
             "第 2 批全被滤，第 3 批带出 ad 下 50 个常用字"
         );
         assert!(!c.debug_has_more(), "引擎 300 条 < 上限 400，到底");
+    }
+
+    /// ★ 扩容后可见列表**变短**时页码/高亮须夹回范围（Task 2 审查 Important）。
+    /// 通配 `a?`：`ab` 150 个生僻字在前、`ac` 1 个常用字垫底，全是同一通配组。首批 100 条
+    /// 组里没有常用字 ⇒ 全放行；翻到倒数第二页触发扩容，第 2 批带进那个常用字 ⇒ 整组生僻字
+    /// 被滤、只剩 1 条。旧实现页码停在十几页上，按页切片 `start > end` 当场 panic。
+    #[test]
+    fn expansion_that_shrinks_the_list_clamps_page_and_selection() {
+        let (c, _guard) = coord_with("shrink", true, |common, rare| {
+            let mut dict = String::new();
+            for (i, ch) in rare.iter().enumerate() {
+                dict += &format!("ab\t{ch}\t{}\n", 10_000 - i);
+            }
+            dict += &format!("ac\t{}\t1\n", common[0]);
+            dict
+        });
+        press(&c, VK_A);
+        press(&c, VK_Z);
+        assert_eq!(
+            c.debug_candidate_count(),
+            100,
+            "前置：首批 100 条全是生僻字、全放行"
+        );
+        assert!(c.debug_has_more(), "前置：首批回满 100 ⇒ 还有更多");
+        let first_pages = c.debug_page_info().2;
+        assert!(
+            first_pages > 2,
+            "前置：首批要多于两页才能停在非首页：{first_pages}"
+        );
+        for _ in 0..first_pages {
+            if c.debug_candidate_count() != 100 {
+                break;
+            }
+            press(&c, VK_NEXT);
+        }
+        assert_eq!(
+            c.debug_candidate_count(),
+            1,
+            "第 2 批带进同组常用字，生僻字整组被滤"
+        );
+        // 先按页切片（同渲染路径）：不夹页码时这里 `start > end` panic。
+        assert_eq!(c.debug_page_texts().len(), 1, "当页可渲染、不越界");
+        let (page, sel, total) = c.debug_page_info();
+        assert_eq!(total, 1);
+        assert_eq!((page, sel), (0, 0), "页码/高亮夹回新列表范围内");
+
+        // 高亮单独越界（页码在范围内）也要夹：键盘路径上扩容总发生在高亮 0 的时刻，
+        // 走不到这一支，故直接喂越界状态。
+        let mut st = c.state.lock().unwrap();
+        st.selected_index = 7;
+        c.clamp_candidate_view(&mut st);
+        assert_eq!(
+            (st.current_page, st.selected_index),
+            (0, 0),
+            "高亮夹到当页末项"
+        );
     }
 }

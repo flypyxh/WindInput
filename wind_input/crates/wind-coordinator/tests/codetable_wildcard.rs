@@ -1011,3 +1011,18 @@ fn pure_wildcard_first_batch_is_100_and_expands() {
     let grown = page_until_more_than(&coord, first);
     assert!(grown > first, "翻到边界应扩充：{first} -> {grown}");
 }
+
+/// 控制者裁决：首批 100 只作用于纯码表；混输有通配 pattern 时维持原首批 300（缩到 100 会让
+/// 拼音保底只剩 20 席）。「全部字符」档不滤，首批条数直接反映引擎上限：多于 100 即未被缩。
+#[test]
+fn mixed_wildcard_keeps_original_first_batch() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔拼音混输方案不存在");
+        return;
+    }
+    let coord =
+        Coordinator::new_headless(with_filter(wubi_pinyin(true), "gb18030"), Some(&data_dir()));
+    press(&coord, "azz");
+    let first = coord.debug_candidate_count();
+    assert!(first > 100, "混输通配首批应沿用 300 档，实际 {first}");
+}
