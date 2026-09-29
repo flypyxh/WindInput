@@ -209,37 +209,61 @@ fn filter_common_only(candidates: Vec<Candidate>, phrase: RarePhrasePolicy) -> F
     FilterOutcome { kept, filtered }
 }
 
-/// 按 (来源, code) 分组统计「该组是否存在常用词」。
+/// 智能档的分组键：按 `(来源, 码)`，通配结果除外。
 ///
 /// **必须带来源**：混输下码表（五笔码）与拼音候选常共用同一 code 字符串（原始输入，如
 /// "wang"），但属不同编码体系；若仅按 code 分组，常用的拼音候选会误使同 code 的生僻码表字
-/// （如 佢）被过滤，导致混输码表主方案与纯五笔表现不一致。按来源隔离后，码表候选只受同来源
-/// 候选影响，混输码表与纯五笔一致。
-fn build_has_common(
-    candidates: &[Candidate],
-) -> std::collections::HashMap<(CandidateSource, String), bool> {
+/// （如 佢）被过滤，导致混输码表主方案与纯五笔表现不一致。
+///
+/// **通配结果（[`Candidate::is_wildcard`]）整份一组**（spec `codetable-wildcard.md` §11）：
+/// 用户没有打出那些码，按码分组时「某码下只有生僻字」会被当孤儿码位放行，首页于是全是
+/// 生僻字。一次构建只有一个 pattern，故「按 pattern 分组」＝「通配结果一组」，不必把
+/// pattern 传进来。`is_wildcard` 只由码表通配入口置位，非通配候选的键与原 `(source, code)`
+/// 一一对应——非通配路径的分组逐字节不变。
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum SmartGroup {
+    Code(CandidateSource, String),
+    Wildcard(CandidateSource),
+}
+
+impl SmartGroup {
+    fn of(c: &Candidate) -> Self {
+        if c.is_wildcard {
+            Self::Wildcard(c.source)
+        } else {
+            Self::Code(c.source, c.code.clone())
+        }
+    }
+}
+
+/// 统计每个 [`SmartGroup`]「是否存在常用词」。
+fn build_has_common(candidates: &[Candidate]) -> std::collections::HashMap<SmartGroup, bool> {
     use std::collections::HashMap;
-    let mut has_common: HashMap<(CandidateSource, String), bool> = HashMap::new();
+    let mut has_common: HashMap<SmartGroup, bool> = HashMap::new();
     for c in candidates {
+        let group = SmartGroup::of(c);
         // 先建组（哪怕非常用），使「该码位下无常用词」与「该码位没出现过」区分开。
-        has_common
-            .entry((c.source, c.code.clone()))
-            .or_insert(false);
+        has_common.entry(group.clone()).or_insert(false);
         if !is_common_like(c) {
             continue;
         }
-        has_common.insert((c.source, c.code.clone()), true);
+        has_common.insert(group, true);
+        // ⚠️ 通配候选只写自己那一组：它的码位（含 merged_codes）若写进按码分组，同码位的
+        // 非通配生僻字会被一条通配常用字遮蔽，「非通配分组不变」就破了。
+        if c.is_wildcard {
+            continue;
+        }
         // 去重吃掉的同文本码位一并遮蔽（见 `Candidate::merged_codes`）：「档」以简码 siv 命中时，
         // 它在 sivg 的那条已被去重丢弃，若不还原这层归属，sivg 组只剩生僻的「桜」而当孤儿码
         // 放行 —— 同一个字打 siv 出、打全 sivg 反而不出。非常用候选无需还原：它不遮蔽任何人。
         for code in &c.merged_codes {
-            has_common.insert((c.source, code.clone()), true);
+            has_common.insert(SmartGroup::Code(c.source, code.clone()), true);
         }
     }
     has_common
 }
 
-/// 智能过滤：同一来源+编码下有常用词则过滤非常用词
+/// 智能过滤：同一组（来源+编码；通配结果整份一组，见 [`SmartGroup`]）下有常用词则过滤非常用词
 fn filter_smart(candidates: Vec<Candidate>, phrase: RarePhrasePolicy) -> FilterOutcome {
     // ⚠️ 「该组有没有常用词」的统计**不吃词豁免**（`build_has_common` 只问 `is_common_like`）。
     // 若把放行的词也算作「常用」，它就会遮蔽同码位的生僻**单字**，把孤儿码位保底顶掉——
@@ -265,11 +289,8 @@ fn filter_smart(candidates: Vec<Candidate>, phrase: RarePhrasePolicy) -> FilterO
         if c.user_rare {
             return false;
         }
-        let common_exists = has_common
-            .get(&(c.source, c.code.clone()))
-            .copied()
-            .unwrap_or(false);
-        // 同来源同编码下存在常用词则只保留常用词；否则保留全部（孤儿编码）
+        let common_exists = has_common.get(&SmartGroup::of(c)).copied().unwrap_or(false);
+        // 同组存在常用词则只保留常用词；否则保留全部（孤儿编码 / 全无常用字的通配结果）
         !common_exists || is_common_like(c)
     });
     FilterOutcome { kept, filtered }
@@ -789,5 +810,70 @@ mod tests {
                 "常用字照留（反向对照，防止把上一条写成「凡 is_common 皆滤」）"
             );
         }
+    }
+
+    fn wc(text: &str, code: &str, is_common: bool) -> Candidate {
+        Candidate {
+            is_wildcard: true,
+            ..cand(text, code, CandidateSource::CodeTable, is_common)
+        }
+    }
+
+    fn wc_texts(v: &[Candidate]) -> Vec<&str> {
+        v.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// spec codetable-wildcard §11：通配结果整份一组——有常用字就滤生僻字，不因散在不同码位
+    /// 而各自当孤儿放行。现场：混输 `hanz` 首页全是 `han?` 下只有生僻字的码位。
+    #[test]
+    fn smart_treats_all_wildcard_results_as_one_group() {
+        let out = filter_candidates(
+            vec![
+                wc("虑", "hand", true),
+                wc("眓", "hanf", false),
+                wc("虙", "hanm", false),
+            ],
+            FilterMode::Smart,
+        );
+        assert_eq!(wc_texts(&out.kept), ["虑"]);
+        assert_eq!(
+            wc_texts(&out.filtered),
+            ["眓", "虙"],
+            "被滤的仍进 filtered——末页放宽靠它追加回来"
+        );
+    }
+
+    /// 通配组里一个常用字都没有 ⇒ 整组保底放行（与按码分组的孤儿码位同一条保底）。
+    /// 这也是 spec §11「扩充后前页可能移位」的来源：后一批带进常用字，这些生僻字就被滤走。
+    /// 本用例钉住现状（实现前即绿的那半是锁）。
+    #[test]
+    fn smart_wildcard_group_without_common_keeps_all_until_common_arrives() {
+        let rare = vec![wc("眓", "hanf", false), wc("虙", "hanm", false)];
+        assert_eq!(
+            kept_of(rare.clone(), FilterMode::Smart).len(),
+            2,
+            "无常用字：整组保底"
+        );
+        let mut more = rare;
+        more.push(wc("虑", "hand", true));
+        assert_eq!(wc_texts(&kept_of(more, FilterMode::Smart)), ["虑"]);
+    }
+
+    /// ★ Review Focus 1：通配组与按码分组互不串。通配常用字的 `merged_codes` 不得往
+    /// `(source, code)` 组里写，否则同码位的非通配生僻字（孤儿码位）会被它遮蔽；
+    /// 拼音孤儿码位同样不受通配常用字影响。
+    #[test]
+    fn wildcard_group_does_not_leak_into_code_groups() {
+        let mut common = wc("虑", "hand", true);
+        common.merged_codes = vec!["hanf".into()];
+        let out = kept_of(
+            vec![
+                common,
+                cand("佢", "hanf", CandidateSource::CodeTable, false),
+                cand("尪", "hanz", CandidateSource::Pinyin, false),
+            ],
+            FilterMode::Smart,
+        );
+        assert_eq!(wc_texts(&out), ["虑", "佢", "尪"]);
     }
 }

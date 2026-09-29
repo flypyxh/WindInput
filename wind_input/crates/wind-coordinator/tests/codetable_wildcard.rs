@@ -929,3 +929,41 @@ fn pure_wubi_wildcard_fifth_key_never_top_commits() {
         );
     }
 }
+
+// ─────────────────────── 常用字过滤与翻页扩充（spec §11） ───────────────────────
+
+/// 显式钉住检索范围档与词豁免档（`Config::default()` 的出厂档将来变了，语义会静默换掉）。
+fn with_filter(mut cfg: Config, mode: &str) -> Config {
+    cfg.input.filter_mode = mode.into();
+    cfg.input.rare_phrase = "keep".into();
+    cfg
+}
+
+fn triples_with(cfg: Config, keys: &str) -> Vec<(String, String, String)> {
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, keys);
+    coord.debug_candidate_triples()
+}
+
+/// spec §11 契约 1：智能档把通配结果当一组——有常用字就滤掉生僻字，与「常用字」档结果相同。
+/// 旧实现按 `(来源, 码)` 分组，`han?` / `a??` 下只含生僻字的码位当孤儿放行。
+/// 对照：「全部字符」档条数更多，证明这些输入下首批确有生僻字可滤。
+#[test]
+fn pure_wildcard_smart_filters_like_general() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    for keys in ["hanz", "azz"] {
+        let all = triples_with(with_filter(wubi(true, "z"), "gb18030"), keys);
+        let general = triples_with(with_filter(wubi(true, "z"), "general"), keys);
+        let smart = triples_with(with_filter(wubi(true, "z"), "smart"), keys);
+        assert!(
+            all.len() > general.len(),
+            "前置：{keys} 首批应有生僻字（全部 {} / 常用 {}）",
+            all.len(),
+            general.len()
+        );
+        assert_eq!(smart, general, "{keys}: 智能档的通配结果应与常用字档相同");
+    }
+}
