@@ -2,7 +2,8 @@
 //!
 //! 行格式与 rime-lua-aux-code `aux_code` 目录一致用 **`=` 分隔**（UTF-8，每行一条
 //! `字=码`，同一汉字多编码分列多行，如 `阿=ek` / `厑=ib` / `厑=ii`）；空行与 `#`
-//! 注释行跳过。
+//! 注释行跳过。`=` 右侧也可**按空白写多个码**（`七=a p`，手心表的写法），与分列多行等价。
+//! 文件必须是 UTF-8：非 UTF-8（如 GBK）整张忽略并告警「请转存为 UTF-8」。
 //!
 //! ## 名称（唯一解析的元数据）
 //! 只从**文件第 1 行**读取方法名（`# name: 笔画` 或 `#name: 笔画`，`#` 后空格可有可无、
@@ -18,7 +19,7 @@ use crate::table::AuxCodeTable;
 /// 从辅助码 txt 文件构建**单张**码表。
 ///
 /// 路径由调用方解析（用户目录同名文件优先），本 crate 不负责定位——与 `wind-reverse`
-/// 同一约定。文件读不出来（路径错、无权限）返回空表并告警，不 panic。
+/// 同一约定。文件读不出来（路径错、无权限、非 UTF-8）返回空表并告警，不 panic。
 ///
 /// 辅助码表普遍很小，直接整体读入即可，无需缓存 / mmap；懒加载（首次输入辅助码时才
 /// 读取）由调用方控制触发时机，本函数是一次性构造。
@@ -33,6 +34,15 @@ pub fn load_from_file(path: &std::path::Path) -> AuxCodeTable {
                     .unwrap_or_default();
             }
             t
+        }
+        // 非 UTF-8（手心等表常见 GBK）：全仓不带 GBK 解码依赖，不为一张表引入 `encoding_rs`，
+        // 明确告诉用户怎么办，产出空表（筛选随之 passthrough）。
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            tracing::warn!(
+                "辅助码文件不是 UTF-8 编码，已忽略，请转存为 UTF-8: {}",
+                path.display()
+            );
+            AuxCodeTable::new()
         }
         Err(e) => {
             tracing::warn!("读取辅助码文件失败 {}: {}", path.display(), e);
@@ -78,6 +88,7 @@ fn parse_name_from_first_line(first_line: &str) -> Option<String> {
 /// `阿=ek`、`厑=ib`、`厑=ii`。
 ///
 /// - 空行与 `#` 注释行跳过；无 `=`、左侧非单字或右侧为空码的行整行跳过
+/// - 右侧按空白拆成多个码（`七=a p` = `七=a` + `七=p`）
 /// - 开头剥掉 UTF-8 BOM、孤立 `\r` 行尾折成 `\n`（见 [`wind_utils::text::normalize_input`]）：
 ///   前者避免首行字被当成非单字跳掉，后者避免整份文件被当成一行——带 `# name:` 头的
 ///   出厂表在那种情况下会被整个当成一条注释，0 条且无任何提示
@@ -115,7 +126,8 @@ pub(crate) fn parse_str(content: &str) -> AuxCodeTable {
         if chars.next().is_some() {
             continue; // 等号左侧必须是单个汉字，多字行跳过
         }
-        rows.push((c, code));
+        // 一行多码：`七=a p`（手心表的写法）按空白拆开，与分列多行等价。
+        rows.extend(code.split_whitespace().map(|code| (c, code)));
     }
     AuxCodeTable::from_rows(rows).with_name(name)
 }
@@ -135,6 +147,27 @@ mod tests {
         assert!(t.first_code('王').is_none(), "空码行跳过");
         assert!(t.first_code('a').is_none(), "非单字行跳过");
         assert_eq!(t.code_count(), 4, "阿1 + 厑2 + 李1 = 4 码");
+    }
+
+    /// 一行多码：`=` 右侧按空白拆成多个码（手心表 `七=a p` 的形态）。此前整段 `a p` 被当成
+    /// 一个码，`p` 永远匹配不上。与「同字多码分列多行」等价，且两种写法可混用、跨行去重。
+    #[test]
+    fn parse_str_splits_whitespace_separated_codes() {
+        let t = parse_str("七=a p\n八=b\tq  r\n七=p\n七=s\n");
+        assert_eq!(t.codes_of('七').collect::<Vec<_>>(), vec!["a", "p", "s"]);
+        assert_eq!(t.codes_of('八').collect::<Vec<_>>(), vec!["b", "q", "r"]);
+    }
+
+    /// 非 UTF-8 文件（手心表常见 GBK）：告警「请转存为 UTF-8」并产出空表，不 panic、不乱码入表。
+    #[test]
+    fn load_from_file_non_utf8_returns_empty() {
+        let path =
+            std::env::temp_dir().join(format!("wind-aux-code-gbk-test-{}.txt", std::process::id()));
+        // 「七=a」的 GBK 编码：C6 DF 3D 61。
+        std::fs::write(&path, [0xC6u8, 0xDF, b'=', b'a', b'\n']).unwrap();
+        let t = load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(t.is_empty());
     }
 
     /// 同字重复码经 from_rows 的 first-seen 去重（load 路径同样适用）
