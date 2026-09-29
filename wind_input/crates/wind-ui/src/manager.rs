@@ -1579,6 +1579,8 @@ mod menu_id_tests {
             MenuCmd::InputDiagToggleSection(3),
             MenuCmd::AutoPairRule(0),
             MenuCmd::AutoPairRule(2),
+            MenuCmd::CompatRuleEnabled(0),
+            MenuCmd::CompatRuleEnabled(1),
             MenuCmd::PasswordForceEnglishRule(0),
             MenuCmd::PasswordForceEnglishRule(1),
             MenuCmd::PasswordForceEnglishRule(2),

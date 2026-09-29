@@ -1195,6 +1195,41 @@ fn clear(key: &str) -> FieldEdit {
     FieldEdit::Clear(key.to_string())
 }
 
+/// 某进程在 `[[apps]]` 里的整条规则开关状态（右键菜单的「启用兼容规则」用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleSwitch {
+    /// 系统层与用户层都没有这个进程的规则：没有可开关的东西。
+    NoRule,
+    Enabled,
+    Disabled,
+}
+
+/// 读某进程整条规则的开关状态（系统层 ⊕ 用户层叠加后判定）。
+pub fn menu_rule_switch(user_dir: &Path, process: &str) -> RuleSwitch {
+    let (system, _) = system_layer_for_menu();
+    let user = load_raw(&user_dir.join(COMPAT_FILE_NAME)).unwrap_or_default();
+    let merged = overlay_raw(system, &user);
+    match merged
+        .apps
+        .iter()
+        .find(|r| same_process(process_of(r), process))
+    {
+        None => RuleSwitch::NoRule,
+        Some(r) if is_disabled(r) => RuleSwitch::Disabled,
+        Some(_) => RuleSwitch::Enabled,
+    }
+}
+
+/// 启用 / 禁用某进程的整条规则（写用户层 `disabled`；启用 = 去掉这条差异，
+/// 系统层自己就禁用的规则则写显式 `disabled = false`，由 `apply_edits` 统一处理）。
+pub fn set_user_rule_disabled(
+    user_dir: &Path,
+    process: &str,
+    disabled: bool,
+) -> Result<(), std::io::Error> {
+    edit_user_apps(user_dir, process, &[set_value("disabled", disabled)])
+}
+
 /// 设置用户层 compat.toml 中指定进程的首显策略（`None` = 清除，回到跟随全局）。
 pub fn set_user_first_show_mode(
     user_dir: &Path,
@@ -3254,6 +3289,33 @@ mod layering_tests {
             !read(&dir).contains("[[apps]]"),
             "清除后整条消失: {}",
             read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 右键菜单的「启用兼容规则」：没有规则时不可开关；禁用 / 启用往返，且不动别的字段。
+    #[test]
+    fn menu_rule_switch_round_trips_and_keeps_the_other_fields() {
+        let dir = tmp("m_switch");
+        let sys = "[[apps]]\nprocess = \"Feishu.exe\"\nstale_probe_guard = true\n";
+        with_system(sys, || {
+            assert_eq!(menu_rule_switch(&dir, "nobody.exe"), RuleSwitch::NoRule);
+            assert_eq!(menu_rule_switch(&dir, "feishu.EXE"), RuleSwitch::Enabled);
+
+            set_user_rule_disabled(&dir, "Feishu.exe", true).unwrap();
+            assert_eq!(menu_rule_switch(&dir, "Feishu.exe"), RuleSwitch::Disabled);
+
+            set_user_rule_disabled(&dir, "Feishu.exe", false).unwrap();
+            assert_eq!(menu_rule_switch(&dir, "Feishu.exe"), RuleSwitch::Enabled);
+        });
+        let body: String = read(&dir)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("disabled"),
+            "启用 = 去掉用户层的禁用差异: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
