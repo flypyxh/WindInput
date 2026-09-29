@@ -2,7 +2,8 @@
 //!
 //! 与 Go 版本 `wind_input/internal/dict/layer.go` 对齐。
 
-use wind_candidate::Candidate;
+use std::cmp::Ordering;
+use wind_candidate::{Candidate, better};
 
 /// 词典层类型（数值越小优先级越高）。
 /// 注：Shadow（置顶/删除）**不是查询层**，而是 ShadowProvider，在引擎排序后应用
@@ -96,6 +97,25 @@ pub trait DictLayer: Send + Sync {
     /// 与 [`Self::search`] 返回的候选同域——否则索引里的权重与查询结果对不上。
     fn for_each_entry(&self, _f: &mut dyn FnMut(&str, &str, i32)) {}
 
+    /// **通配查询**（`docs/design/codetable-wildcard.md` §5.1）：`pattern` 中等于 `wildcard`
+    /// 的位匹配**恰好一个**任意码元，其余位字面匹配。`with_prefix` 时追加更长编码
+    /// （前 `pattern` 位匹配即可）的前缀补全。
+    ///
+    /// 结果**等长档优先**（[`cmp_pattern`]），各层自己先按两档取额再返回：更长编码的权重
+    /// 常高于等长单字（词频 vs 字频），混排后截断会把等长结果挤出配额。
+    ///
+    /// 默认返回空——与 [`Self::search_abbrev`] 同一取舍：不支持的层（草稿层即刻意不支持，
+    /// 见 `StoreDraftLayer` 文档）召不回，而不是静默全表扫。
+    fn search_pattern(
+        &self,
+        _pattern: &str,
+        _wildcard: char,
+        _limit: usize,
+        _with_prefix: bool,
+    ) -> Vec<Candidate> {
+        Vec::new()
+    }
+
     /// 该层当前是否启用：禁用层在 composite 查询时被跳过（不出候选）。默认始终启用。
     /// 用于码表扩展词库的运行时热插拔——禁用的扩展层仍常驻（已 mmap），仅不参与查询。
     fn enabled(&self) -> bool {
@@ -140,4 +160,94 @@ pub trait MutableLayer: DictLayer {
 
     /// 保存到持久化存储
     fn save(&self) -> anyhow::Result<()>;
+}
+
+/// 协调器交给引擎的通配占位符。
+///
+/// 通配键本身（`z`、`?`）不能直接当 pattern 的通配符：首位让位后进缓冲的 `z` 是**字面**
+/// 码元，与后续作通配的 `z` 同形。协调器按裁决把「作通配的那几位」替换成本字符，
+/// 它不可能出现在任何码表编码里（码元来自物理按键，`\u{1}` 按不出来）。
+pub const WILDCARD_SLOT: char = '\u{1}';
+
+/// `code` 是否匹配 `pattern`：逐位比较（`wildcard` 位任意），等长即匹配；
+/// `with_prefix` 时更长的 `code` 只要前 `pattern.len()` 位匹配也算。更短的 `code` 恒不匹配。
+pub fn pattern_matches(pattern: &str, wildcard: char, code: &str, with_prefix: bool) -> bool {
+    let mut cs = code.chars();
+    for pc in pattern.chars() {
+        match cs.next() {
+            Some(cc) if pc == wildcard || pc == cc => {}
+            _ => return false,
+        }
+    }
+    with_prefix || cs.next().is_none()
+}
+
+/// 首个通配位之前的字面前缀（有序结构据此做 range 扫描）。首位即通配时为空串。
+pub fn literal_prefix(pattern: &str, wildcard: char) -> &str {
+    match pattern.find(wildcard) {
+        Some(i) => &pattern[..i],
+        None => pattern,
+    }
+}
+
+/// 通配结果的排序：等长（`code` 字符数 == `pattern_len`）档恒在前，档内按 [`better`]。
+pub fn cmp_pattern(pattern_len: usize, a: &Candidate, b: &Candidate) -> Ordering {
+    let ea = a.code.chars().count() == pattern_len;
+    let eb = b.code.chars().count() == pattern_len;
+    eb.cmp(&ea).then_with(|| better(a, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pattern_matches_exact_length_and_prefix() {
+        let w = '?';
+        assert!(pattern_matches("a?c", w, "abc", false));
+        assert!(!pattern_matches("a?c", w, "abd", false));
+        assert!(
+            !pattern_matches("a?c", w, "ab", false),
+            "短于 pattern 不匹配：不做王码「末尾通配匹配更短码」"
+        );
+        assert!(
+            !pattern_matches("a?c", w, "abcd", false),
+            "更长码只在 with_prefix 时匹配"
+        );
+        assert!(pattern_matches("a?c", w, "abcd", true));
+        assert!(pattern_matches("??", w, "zz", false), "首位通配");
+        assert!(
+            !pattern_matches("??", w, "z", true),
+            "with_prefix 也不放行更短码"
+        );
+    }
+
+    #[test]
+    fn literal_prefix_stops_at_first_wildcard() {
+        let w = '?';
+        assert_eq!(literal_prefix("ab?d", w), "ab");
+        assert_eq!(
+            literal_prefix("?b", w),
+            "",
+            "首位通配 ⇒ 字面前缀为空（退化全表扫描）"
+        );
+        assert_eq!(literal_prefix("abc", w), "abc");
+    }
+
+    #[test]
+    fn cmp_pattern_puts_equal_length_first_then_better() {
+        let c = |code: &str, w: i32| Candidate {
+            code: code.into(),
+            weight: w,
+            ..Default::default()
+        };
+        let mut v = vec![c("abcd", 9999), c("ab", 10), c("ac", 20)];
+        v.sort_by(|a, b| cmp_pattern(2, a, b));
+        let codes: Vec<&str> = v.iter().map(|x| x.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["ac", "ab", "abcd"],
+            "等长档恒在前，档内按 better（权重降序）"
+        );
+    }
 }
