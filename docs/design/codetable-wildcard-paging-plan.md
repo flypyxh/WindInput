@@ -4,7 +4,7 @@
 
 **Goal:** 通配结果在「智能」检索范围下整份算一组（有常用字就先滤掉生僻字），通配首批 100 条、翻到边界按现有机制 ×2 扩充到 5000；翻页扩容的「到底」判据对所有引擎改看引擎条数。
 
-**Architecture:** 过滤：`wind-candidate/src/filter.rs` 的智能档分组键从 `(source, code)` 改成私有枚举 `SmartGroup`——`is_wildcard` 候选归 `SmartGroup::Wildcard(source)` 一组，其余仍是 `SmartGroup::Code(source, code)`（与原键逐字节同义），通配候选不往按码分组里写任何东西（含 `merged_codes`）。协调器 `apply_filter` 不改签名。数量：新增 `wind_engine::engine::CANDIDATE_LIMIT_CAP = 5000`，码表 `WILDCARD_RESULT_LIMIT` 改为它的别名，`convert_wildcard` 按 `max_candidates.min(上限)` 查且 0 不下传；`expand_candidates` 的 `.min(5000)` 改用同一常量。协调器 `update_candidates` 在 `wildcard_pattern_of(state).is_some()` 时首批取 `WILDCARD_INITIAL_LIMIT = 100`。到底判据：`expand_candidates` 由「可见条数未增」改为 `engine_count <= prev_limit`（「引擎条数未增」的等价写法，理由见 Task 2 Step 3 注释）。
+**Architecture:** 过滤：`wind-candidate/src/filter.rs` 的智能档分组键从 `(source, code)` 改成私有枚举 `SmartGroup`——`is_wildcard` 候选归 `SmartGroup::Wildcard(source)` 一组，其余仍是 `SmartGroup::Code(source, code)`（与原键逐字节同义），通配候选不往按码分组里写任何东西（含 `merged_codes`）。协调器 `apply_filter` 不改签名。数量：新增 `wind_engine::engine::CANDIDATE_LIMIT_CAP = 5000`，码表 `WILDCARD_RESULT_LIMIT` 改为它的别名，`convert_wildcard` 按 `max_candidates.min(上限)` 查且 0 不下传；`expand_candidates` 的 `.min(5000)` 改用同一常量。协调器 `update_candidates` 在 `wildcard_pattern_of(state).is_some()` 且非混输时首批取 `WILDCARD_INITIAL_LIMIT = 100`（混输维持 300）。到底判据：`expand_candidates` 由「可见条数未增」改为 `engine_count <= prev_limit`（「引擎条数未增」的等价写法，理由见 Task 2 Step 3 注释）。
 
 **Tech Stack:** Rust workspace（wind-candidate / wind-engine / wind-coordinator）+ WindInputDocs 仓（文档站）
 
@@ -31,7 +31,7 @@
 
 - **通配组不得漏进按码分组**：若只改查表键、`build_has_common` 仍把通配常用字的 `code` / `merged_codes` 写进 `(source, code)` 组，同码位的非通配生僻字会被一条通配常用字遮蔽，「非通配路径分组不变」就破了。规则：`is_wildcard` 候选只写 `SmartGroup::Wildcard`，`merged_codes` 循环只对非通配候选跑。测试：Task 1 `wildcard_group_does_not_leak_into_code_groups`。
 - **到底判据看引擎条数，且是普通引擎的回归**：新一批全被检索范围滤掉时可见条数不变，旧判据当场判到底，后面的常用字永远翻不出来——这对普通码表同样成立，不是通配专属。规则：`expand_candidates` 以 `engine_count <= prev_limit` 判到底。测试：Task 2 `expand_stop_tests::expansion_continues_past_an_all_filtered_batch`（非通配自造码表）。
-- **首批上限必须与引擎条数对得上，否则 `has_more` 恒假**：码表码长 ≥ 3 的首批上限是 1000（`handle_candidate.rs:1066-1069`），通配引擎原先至多回 100，`engine_count >= limit` 永不成立。规则：有 pattern 时首批固定 `WILDCARD_INITIAL_LIMIT = 100`。测试：Task 2 `pure_wildcard_first_batch_is_100_and_expands`（`azz`）。
+- **首批上限必须与引擎条数对得上，否则 `has_more` 恒假**：码表码长 ≥ 3 的首批上限是 1000（`handle_candidate.rs:1066-1069`），通配引擎原先至多回 100，`engine_count >= limit` 永不成立。规则：纯码表有 pattern 时首批固定 `WILDCARD_INITIAL_LIMIT = 100`；混输维持原首批 300（控制者裁决）。测试：Task 2 `pure_wildcard_first_batch_is_100_and_expands`（`azz`）。
 - **硬上限单一来源、0 不下传**：扩容上限与通配硬上限各写一个 5000 的话，改一处另一处静默失配（扩容要 8000、引擎只回 5000 ⇒ `has_more` 恒假）；`max_candidates = 0` 若下传，Composite 当「不限」、各层当「空」。规则：`WILDCARD_RESULT_LIMIT = crate::engine::CANDIDATE_LIMIT_CAP`，`expand_candidates` 用同一常量；`limit == 0` 不调 `search_pattern`。测试：Task 2 `wildcard_hard_cap_matches_expansion_cap_and_zero_is_empty`。
 - **混输首批缩小后，等长通配仍在最前、拼音仍有席位**：混输首批从 300 降到 100（有 pattern 即 100），字面半边只剩 `merge_wildcard` 的保底配额；扩充后整份重查、重新合并。规则：显示序靠 `cmp_exact_first` + `source_tier` 档 0（§10 已落地），截断靠 `truncate_with_pinyin_quota`。测试：Task 3 `mixed_expansion_keeps_equal_length_wildcard_first`。
 
@@ -320,6 +320,8 @@ git show --stat HEAD
 ---
 
 ## Task 2: 引擎按 `max_candidates` 查、通配首批 100、到底判据改看引擎条数
+
+> **控制者裁决（2026-09-29）**：首批 100 只作用于**纯码表**；混输维持原首批 300（`EngineManager::active_wildcard_mixes_pinyin()` 为真时走原 `initial_candidate_limit`）。混输相关断言按首批 300 写；若某条计划用例假设混输首批 100，改按 300 并在报告说明。
 
 **Files:**
 - Modify: `wind_input/crates/wind-engine/src/engine.rs`（`ConvertResult` 之前加常量）
@@ -726,8 +728,11 @@ pub(crate) const WILDCARD_INITIAL_LIMIT: usize = 100;
 改为：
 
 ```rust
-        // 通配组码首批固定 100 条（spec codetable-wildcard §11），见 `WILDCARD_INITIAL_LIMIT`。
-        let limit = if self.wildcard_pattern_of(state).is_some() {
+        // 纯码表通配组码首批固定 100 条（spec codetable-wildcard §11），见 `WILDCARD_INITIAL_LIMIT`；
+        // 混输维持原首批（控制者裁决：缩到 100 会让拼音保底只剩 20 席）。
+        let limit = if self.wildcard_pattern_of(state).is_some()
+            && !self.engine_mgr.active_wildcard_mixes_pinyin()
+        {
             crate::wildcard::WILDCARD_INITIAL_LIMIT
         } else {
             self.initial_candidate_limit(&state.input_buffer)
@@ -805,6 +810,8 @@ git show --stat HEAD
 ---
 
 ## Task 3: 真实数据验收（纯码表 / 混输 / 常用字档 / 末页放宽）
+
+> **控制者裁决（2026-09-29）**：首批 100 只作用于**纯码表**；混输维持原首批 300（`EngineManager::active_wildcard_mixes_pinyin()` 为真时走原 `initial_candidate_limit`）。混输相关断言按首批 300 写；若某条计划用例假设混输首批 100，改按 300 并在报告说明。
 
 **Files:**
 - Modify: `wind_input/crates/wind-coordinator/tests/codetable_wildcard.rs`（改写 `leading_wildcard_when_unbound_scans_whole_table` ~596-611；§11 一节追加）
