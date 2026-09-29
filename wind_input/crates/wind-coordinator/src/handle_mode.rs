@@ -1878,7 +1878,7 @@ impl Coordinator {
             if flip {
                 state.chinese_mode = true;
                 if follow {
-                    state.chinese_punct = true;
+                    self.set_punct_below_schema_intent(&mut state, true);
                 }
             }
             flip
@@ -1927,7 +1927,7 @@ impl Coordinator {
         if to_chinese {
             state.chinese_mode = true;
             if follow {
-                state.chinese_punct = true;
+                self.set_punct_below_schema_intent(&mut state, true);
             }
         }
         // 编码/候选的清理**不在这里**：它属于「上屏还是丢弃」这一策略，已前移到

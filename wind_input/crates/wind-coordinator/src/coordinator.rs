@@ -3606,7 +3606,7 @@ impl Coordinator {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if reset_aux && !d.remember_last_state {
             s.full_width = d.full_width;
-            s.chinese_punct = d.chinese_punct;
+            self.set_punct_below_schema_intent(&mut s, d.chinese_punct);
         }
         if s.chinese_mode != chinese {
             // 模式变更的四个入口都打一条同形日志（见 `handle_system_mode_switch`）。
@@ -3621,7 +3621,7 @@ impl Coordinator {
             s.chinese_mode = chinese;
             // 标点随中英文切换（对齐 handle_toggle_mode/handle_system_mode_switch）。
             if follow {
-                s.chinese_punct = chinese;
+                self.set_punct_below_schema_intent(&mut s, chinese);
             }
         }
         // per-app 标点规则**最后**落地，压过 follow_mode 的推导与 reset_aux 的重置。

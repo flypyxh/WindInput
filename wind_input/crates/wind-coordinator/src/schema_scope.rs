@@ -92,6 +92,35 @@ impl Coordinator {
         }
     }
 
+    /// 「非用户手动」的入口要改标点态时走这里：`value` 是该入口想设的值，但**活跃方案声明了
+    /// `[punct]` 意图就以意图为准**（GH#164：范围更小的意图优先）。
+    ///
+    /// 适用入口：`follow_mode` 的中英跟随、IME 激活对全局默认的重置。用户手动 `toggle_punct`
+    /// 不走这里——它本来就该在本代际内压过方案意图。
+    ///
+    /// # 为什么先 sync 再写
+    ///
+    /// 方案意图只在代际变化时落地。这些入口可能恰好发生在「代际已变、还没 sync」的窗口里：
+    /// 直接写会让随后的 sync 把**本入口写的值**记成 `punct_before_schema` 基线，切回 Follow
+    /// 方案时还原出错值。先 sync 让基线取到进方案前的真值。
+    ///
+    /// # 有意图时基线跟着走
+    ///
+    /// 意图压住了 `value`，但 `value` 仍是「不受方案影响时该有的值」——记进基线，切回 Follow
+    /// 方案时还原到它，而不是进方案前的旧值。
+    ///
+    /// ⚠️ 调用方已持 `state` 锁（同 [`Self::sync_schema_scope`]）。
+    pub(crate) fn set_punct_below_schema_intent(&self, state: &mut State, value: bool) {
+        self.sync_schema_scope(state);
+        match self.engine_mgr.active_behavior().punct.resolve() {
+            Some(intent) => {
+                state.punct_before_schema = Some(value);
+                state.chinese_punct = intent;
+            }
+            None => state.chinese_punct = value,
+        }
+    }
+
     /// 不持 state 锁的调用点用的包装。
     ///
     /// ⚠️ 调用方必须**没有**持有 `self.state` 锁——本仓的 state 锁不可重入。

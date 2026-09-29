@@ -1314,7 +1314,7 @@ impl Coordinator {
             {
                 s.chinese_mode = c;
                 if follow {
-                    s.chinese_punct = c;
+                    self.set_punct_below_schema_intent(&mut s, c);
                 }
             }
             // 与 apply_initial_mode 同序：显式标点规则最后落地，压过 follow 推导。
