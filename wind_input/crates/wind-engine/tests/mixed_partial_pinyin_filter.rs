@@ -230,3 +230,47 @@ fn filtered_pinyin_no_longer_feeds_the_commit_guard() {
         "反向对照：开关开时拼音候选在场"
     );
 }
+
+/// ★ 次方案为**双拼**时，「消费整串」要按**击键数**判。
+///
+/// 双拼候选的 `consumed_length` 已回映射到击键域（`nihc` 的「你好」= 4），而引擎曾拿转换后
+/// 的全拼长度（`nihao` = 5）当基准，把双拼的整串候选全部当成半截丢光——混输（次方案双拼、
+/// 出厂 `pinyin_partial_candidates = false`）下 `nihc` 一条拼音候选都不剩（`9cc246d3` 修）。
+#[test]
+fn shuangpin_secondary_keeps_full_buffer_candidates() {
+    use wind_engine::pinyin::shuangpin::{Layout, ShuangpinConverter};
+    let layout = Layout::from_toml(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin/xiaohe.toml"),
+    )
+    .expect("加载小鹤布局");
+    let mut d = CodetableDict::empty();
+    d.merge_single("nihao".into(), "你好".into(), 9000, 0);
+    d.merge_single("ni".into(), "你".into(), 8000, 0);
+    let sp = PinyinEngine::new(
+        PinyinConfig {
+            enable_abbrev: false,
+            ..Default::default()
+        },
+        CachedDict::Memory(d),
+    )
+    .with_shuangpin(ShuangpinConverter::new(layout));
+    let e = MixedEngine::new(
+        wubi_engine(),
+        Some(Box::new(sp)),
+        None,
+        MixConfig {
+            pinyin_partial_candidates: false,
+            ..Default::default()
+        },
+    );
+    let t = texts(&e, "nihc");
+    assert!(
+        t.contains(&"你好".to_string()),
+        "消费整串的双拼候选必须留下: {t:?}"
+    );
+    assert!(
+        !t.contains(&"你".to_string()),
+        "只吃 2 键的仍按设置丢弃: {t:?}"
+    );
+}
