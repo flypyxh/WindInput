@@ -404,7 +404,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
         key: "host_render",
         kind: Kind::Bool,
         group: "host",
-        label: "由服务代绘候选窗",
+        label: "宿主渲染模式",
         summary: "候选窗由输入法服务绘制，再交给软件内的组件显示。",
         problem: "Win11 开始菜单、任务栏搜索这类受限进程，普通候选窗盖不住它们的窗口层级。改由服务渲染后经共享内存转交，\
                   才能正常显示。",
