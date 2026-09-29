@@ -23,7 +23,13 @@ layout = "xiaohe"
 # 用户要单独在双拼开启，写 %APPDATA%\WindInput\schema_overrides\shuangpin.toml：
 #     [engine.aux_code]
 #     enabled = true
-# 行为字段（enabled / max_phrase_len）在此留空 = 回落全局，见 schema-config-layering.md §4。
+# 行为字段（enabled / max_phrase_len / direct）在此留空 = 回落全局，见 schema-config-layering.md §4。
+#
+# 直接辅助码（不按引导键，末 1～2 位自动当辅码：uidu + p → 「释读」）同样出厂关，开启写：
+#     [engine.aux_code]
+#     enabled = true
+#     direct = true
+# 引导键（下方反引号）与直接辅助码并存：直接辅助的结果上仍可按反引号进筛选。
 [engine.aux_code]
 # files 也可写 "schema:<码表方案 id>"，取该方案系统词库 + 用户词库里的编码，如
 # files = ["schema:wubi86"]。

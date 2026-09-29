@@ -461,6 +461,13 @@ pub trait Engine: Send + Sync {
         0
     }
 
+    /// 双拼下 `keys` 恰好切成完整音节时返回音节数；非双拼、切不完整（含 `'`、尾部落单键、
+    /// 不成音节的键对）返回 `None`。直接辅助码的前缀闸门（`docs/design/aux-code-direct.md` §4）。
+    /// 双拼拼音引擎实现；其余（含混输）默认 `None`。
+    fn shuangpin_full_syllable_count(&self, _keys: &str) -> Option<usize> {
+        None
+    }
+
     /// 满码自动上屏「显示态」复评（对齐 Go recheckAutoCommit）：给定已过滤/重排/shadow 的
     /// 显示候选，若满码上屏开、存在唯一精确全码码表候选且无更长后继 → 返回上屏文本。
     /// 引擎按未过滤候选判唯一时可能因生僻同码字被否决，智能过滤后据显示候选复评放行。

@@ -6,6 +6,7 @@
 //! 来源各占一层，层数 = 方案来源数 + 被它们隔开的文件段数。设计见
 //! `docs/design/aux-code-schema-source.md` §4、§5。
 
+use std::sync::Arc;
 use wind_aux_code::{AuxCodeLookup, AuxCodeTable};
 use wind_engine::{AuxSource, EngineManager, TextCodeView};
 
@@ -86,60 +87,73 @@ impl AuxCodeRuntime {
     }
 
     /// 本次筛选用的查询对象：方案层取当下视图（用户层过期会在这里触发后台重建）。
-    pub(crate) fn lookup(&self, engine: &EngineManager) -> AuxLookupNow<'_> {
+    ///
+    /// 持有运行时的 `Arc` 而不是借用：直接辅助码要把它装进交给引擎的准入闭包
+    /// （`ConvertOptions::admit`，`'static`），借用版本进不去。
+    pub(crate) fn lookup(self: &Arc<Self>, engine: &EngineManager) -> AuxLookupNow {
         AuxLookupNow {
-            layers: self
+            views: self
                 .layers
                 .iter()
                 .map(|l| match l {
-                    Layer::Table(t) => Now::Table(t),
-                    Layer::Schema(id) => Now::View(id, engine.text_codes(id)),
+                    Layer::Table(_) => None,
+                    Layer::Schema(id) => Some(engine.text_codes(id)),
                 })
                 .collect(),
+            rt: self.clone(),
         }
     }
 }
 
-pub(crate) struct AuxLookupNow<'a> {
-    layers: Vec<Now<'a>>,
+/// 一次查询用的来源快照：运行时各层 + 方案层当下的视图（与 `rt.layers` 一一对应，文件层为 `None`）。
+pub(crate) struct AuxLookupNow {
+    rt: Arc<AuxCodeRuntime>,
+    views: Vec<Option<TextCodeView>>,
 }
 
-enum Now<'a> {
-    Table(&'a AuxCodeTable),
-    View(&'a str, TextCodeView),
-}
-
-impl AuxLookupNow<'_> {
+impl AuxLookupNow {
     /// 系统层（反查索引）没就绪的方案来源。
     ///
     /// 进入时门卫已要求它们就绪，但会话中途索引可能被清掉（改了方案设置、词库启用集变了、
     /// 主码表重载都会整表清空反查索引）。这时只剩用户层的码可比，几乎所有候选都会被滤掉
     /// ——调用方据此把本次当「未就绪」处理：原样放行 + 后台重建。
     pub(crate) fn unready_schemas(&self) -> Vec<&str> {
-        self.layers
+        self.rt
+            .layers
             .iter()
-            .filter_map(|l| match l {
-                Now::View(id, v) if !v.system_ready() => Some(*id),
+            .zip(&self.views)
+            .filter_map(|(l, v)| match (l, v) {
+                (Layer::Schema(id), Some(v)) if !v.system_ready() => Some(id.as_str()),
                 _ => None,
             })
             .collect()
     }
 }
 
-impl AuxCodeLookup for AuxLookupNow<'_> {
+impl AuxCodeLookup for AuxLookupNow {
     fn any_code(&self, ch: char, pred: &mut dyn FnMut(&str) -> bool) -> bool {
         let mut buf = [0u8; 4];
         let text: &str = ch.encode_utf8(&mut buf);
-        self.layers.iter().any(|l| match l {
-            Now::Table(t) => t.any_code(ch, pred),
-            Now::View(_, v) => v.any_code(text, pred),
-        })
+        self.rt
+            .layers
+            .iter()
+            .zip(&self.views)
+            .any(|(l, v)| match (l, v) {
+                (Layer::Table(t), _) => t.any_code(ch, pred),
+                (Layer::Schema(_), Some(v)) => v.any_code(text, pred),
+                (Layer::Schema(_), None) => false,
+            })
     }
 
     fn is_empty(&self) -> bool {
-        self.layers.iter().all(|l| match l {
-            Now::Table(t) => AuxCodeLookup::is_empty(*t),
-            Now::View(_, v) => !v.has_any(),
-        })
+        self.rt
+            .layers
+            .iter()
+            .zip(&self.views)
+            .all(|(l, v)| match (l, v) {
+                (Layer::Table(t), _) => AuxCodeLookup::is_empty(t),
+                (Layer::Schema(_), Some(v)) => !v.has_any(),
+                (Layer::Schema(_), None) => true,
+            })
     }
 }

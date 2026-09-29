@@ -545,7 +545,7 @@ impl crate::Coordinator {
         }
     }
 
-    /// 存一份调整：空壳则删记录（与 `compat.toml` 的 `update_user_rule` 同一条纪律：
+    /// 存一份调整：空壳则删记录（与 `compat.toml` 的 `update_user_raw` 同一条纪律：
     /// 「恢复默认」之后不能留一条只有 key 的记录）。
     fn save_user_doc(&self, doc: &CharsetDoc) -> anyhow::Result<()> {
         let store = self.charset_store()?;

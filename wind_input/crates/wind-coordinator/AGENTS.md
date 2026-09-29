@@ -29,6 +29,7 @@
 | `src/handle_url.rs` | 网址模式（夺取缓冲 + 边界退格回退）**兼前缀夺取骨架** |
 | `src/handle_email.rs` | 邮箱模式（`@` 后缀触发，共用上面那套骨架） |
 | `src/mode_completion.rs` | 网址/邮箱**共用**的补全候选源与上屏收尾（学习数据在 wind-store 的 `completion` 表） |
+| `src/handle_direct_aux.rs` | 直接辅助码（双拼）：`build_candidates` 在 `apply_shadow` 前调 `apply_direct_aux`——门卫、前缀候选（取几键前整音节输入的主候选快照 `State.direct_aux_prev`；那一键被截断过 / 过滤状态变了 / 缓冲换段时不可用，改对前缀单独解码并留给下一键）、命中项标整串消费 + `is_direct_aux`、组码区 `direct_aux_body`。纯逻辑在 `wind-aux-code/src/direct.rs` |
 | `src/handle_special.rs` | 引导键特殊模式（自带码表 + 全码上屏策略） |
 | `src/handle_mode.rs` | 中英 / 简繁 / 方案 / 主题 / mix 融合模式切换 |
 | `src/handle_punct.rs` | 标点编排 + 智能符号同键连按替换状态机（武装/触发/解除） |

@@ -585,6 +585,8 @@ pub trait WebDataRpc: WebDataHost {
             "quick.add" => self.web_quick_add(params),
             "quick.setText" => self.web_quick_set_text(params),
             "quick.delete" => self.web_quick_delete(params),
+            // ── compat.*：应用兼容规则的分层管理（逻辑全在 wind_config::compat_admin）──
+            m if m.starts_with("compat.") => self.web_compat_rpc(m, params),
             "quick.export" => self.web_quick_export(),
             "quick.import" => self.web_quick_import(params),
             "quick.previewImport" => self.web_quick_preview_import(params),
@@ -3450,6 +3452,26 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({ "ok": true }))
     }
 
+    /// `compat.*` 的薄分派：纯逻辑在 `compat_admin::rpc`，这里只负责取目录、
+    /// 写成功后让宿主重载。
+    fn web_compat_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
+        let data_dir = wind_config::Config::data_dir();
+        let custom_dir = wind_config::Config::custom_data_dir();
+        let user_dir = wind_config::Config::user_config_dir();
+        let out = wind_config::compat_admin::rpc(
+            method,
+            params,
+            data_dir.as_deref(),
+            custom_dir.as_deref(),
+            user_dir.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if out.wrote {
+            self.reload_compat();
+        }
+        Ok(out.value)
+    }
+
     fn web_quick_export(&self) -> anyhow::Result<Value> {
         Ok(json!({ "content": self.quick_format_export()? }))
     }
@@ -4437,7 +4459,7 @@ pub const READONLY_SIDECAR_FIELDS: &[&str] = &[
 ///
 /// - `layout`：与运行时同一裁决（`Orientation::from_layout_str`），只出 `horizontal`/`vertical`；
 /// - `fontFamily`：全局 `ui.font.family`，空（= 跟随主题）则取主题字体，再空为 `""`；
-/// - `auxEnabled` / `auxMaxPhraseLen`：全局 `schema.pinyin.aux_code`。
+/// - `auxEnabled` / `auxMaxPhraseLen` / `auxDirect`：全局 `schema.pinyin.aux_code`。
 fn followed_behavior_of(cfg: &wind_config::Config, theme_font: Option<String>) -> Value {
     let font = if cfg.ui.font.family.is_empty() {
         theme_font.unwrap_or_default()
@@ -4450,6 +4472,7 @@ fn followed_behavior_of(cfg: &wind_config::Config, theme_font: Option<String>) -
         "fontFamily": font,
         "auxEnabled": aux.enabled,
         "auxMaxPhraseLen": aux.max_phrase_len,
+        "auxDirect": aux.direct,
     })
 }
 
@@ -10014,6 +10037,7 @@ mod followed_behavior_tests {
         cfg.ui.font.family = "霞鹜文楷".into();
         cfg.schema.pinyin.aux_code.enabled = true;
         cfg.schema.pinyin.aux_code.max_phrase_len = 3;
+        cfg.schema.pinyin.aux_code.direct = true;
         let v = followed_behavior_of(&cfg, Some("主题字体".into()));
         assert_eq!(
             v,
@@ -10022,6 +10046,7 @@ mod followed_behavior_tests {
                 "fontFamily": "霞鹜文楷",
                 "auxEnabled": true,
                 "auxMaxPhraseLen": 3,
+                "auxDirect": true,
             })
         );
     }

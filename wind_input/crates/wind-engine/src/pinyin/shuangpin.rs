@@ -562,6 +562,19 @@ impl ShuangpinConverter {
         result
     }
 
+    /// `keys` 恰好切成完整双拼音节时返回音节数，否则 `None`。
+    ///
+    /// 直接辅助码（`docs/design/aux-code-direct.md` §4）的前缀闸门：前缀含手动分隔符 `'`、
+    /// 尾部落单键、或有任一键对不成音节（原样回写，如小鹤的 `pl`）都不算——那样的前缀单独
+    /// 解码出来的不是「这几个音节的字词」，拿辅码去筛没有意义。
+    pub fn full_syllable_count(&self, keys: &str) -> Option<usize> {
+        if keys.is_empty() || keys.contains(SEPARATOR) {
+            return None;
+        }
+        let r = self.convert(keys);
+        (!r.has_partial && r.syllables.len() * 2 == keys.len()).then_some(r.syllables.len())
+    }
+
     /// 建立音节 → 双拼键对的反向表（见 [`ShuangpinReverse`]）。
     ///
     /// 建表成本是 O(首码键 × 韵母键) 次 `convert_pair`（现有布局约 676 次，每次含若干
@@ -1065,6 +1078,19 @@ mod converter_tests {
                 "convert({input:?}).has_partial"
             );
         }
+    }
+
+    /// 直接辅助码的前缀闸门：整串恰好切成完整双拼音节才给出音节数。
+    #[test]
+    fn full_syllable_count_requires_whole_pairs() {
+        let c = conv("xiaohe");
+        assert_eq!(c.full_syllable_count("uidu"), Some(2), "shi du");
+        assert_eq!(c.full_syllable_count("goqk"), Some(2), "guo qing");
+        assert_eq!(c.full_syllable_count("xl"), Some(1));
+        assert_eq!(c.full_syllable_count("uidupl"), None, "pl 不是小鹤合法音节");
+        assert_eq!(c.full_syllable_count("uid"), None, "尾部落单键");
+        assert_eq!(c.full_syllable_count("ui'du"), None, "含手动分隔符");
+        assert_eq!(c.full_syllable_count(""), None);
     }
 
     // --- TestXiaoheSyllables ---

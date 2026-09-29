@@ -124,6 +124,9 @@ pub trait WebDataHost {
     /// 重新装配字符类 registry。备份还原写了库之后必须调，否则运行时还是旧的。
     fn reload_charsets(&self);
 
+    /// 兼容规则（`compat.toml`）被设置端写过之后调：重载规则表并让前台进程立即生效。
+    fn reload_compat(&self);
+
     /// 清理压在某个类上的冗余逐条覆盖（方向与当前默认相同的那些）。
     fn charset_clear_redundant(
         &self,
@@ -347,6 +350,9 @@ impl WebDataHost for Coordinator {
     }
     fn reload_charsets(&self) {
         Coordinator::reload_charsets(self)
+    }
+    fn reload_compat(&self) {
+        Coordinator::reload_compat_and_refresh(self)
     }
     fn charset_clear_redundant(
         &self,

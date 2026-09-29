@@ -2,23 +2,46 @@
 # 针对特定应用的候选框定位、光标获取等兼容性修正。
 # 用户可在 %APPDATA%\WindInput\compat.toml 中覆盖或添加规则。
 #
+# 叠加语义（整体原则）：每一层（本文件 < data_custom < 用户层）都是相对下一层的**差异**，
+# 同名进程（不区分大小写）内**逐字段叠加**：
+#   - 写了的字段覆盖下层的值，没写的字段继承下层；
+#   - unset = ["字段名", …] 取消下层设定的字段（回到「没设置 / 跟随全局」）；
+#   - 想关掉下层打开的开关，显式写 false（不写只会继承）；
+#   - disabled = true 禁用整条规则，更高层可用 disabled = false 重新启用；
+#   - 没有「同名整条替换」，也没有哪个字段享有特殊的继承待遇。
+# 所以用户层里只需要写想改的那一两项，出厂对该进程的其它修正会自动保留，出厂以后新增的修正也会自动送达。
+#
 # 可用字段:
 #   process:              进程名（不区分大小写）
 #   comment:              说明（仅文档用途）
 #   caret_use_top:        使用 caret rect 的 top 而非 bottom 定位候选框
 #                         适用于 GetTextExt 返回的 height 不稳定的 WebView 应用
+#   stale_probe_guard:    拦截「组合期间上报的光标位置仍停在上一次组合」的宿主：probe 若与
+#                         组合前宿主主动上报的空闲坐标矛盾即不予采信，首显改用空闲坐标。
+#                         微信、飞书在线表格换单元格首键候选窗从旧位置跳到新位置就是它。
+#                         必须逐宿主开启：WindTerm 一类宿主正确答案相反（probe 才是新的）。
+#   password_force_english:
+#                         该应用的密码框是否强制英文；不写 = 跟随全局。宿主把普通输入框误
+#                         报成密码框时对它关掉，或全局关闭时只对某应用开启。
+#   schema:               该应用固定使用的输入方案 id；写 "@remember" 则记住它上次用的方案。
+#                         应用内手动切换只改本应用，不写全局方案。
+#   status_position_mode / status_x / status_y / status_fallback_position:
+#                         状态气泡定位：跟随光标 / 固定 / 屏幕或窗口锚点；固定模式下
+#                         status_x/y 是该应用自己的落点；status_fallback_position 是
+#                         光标不可信时的兜底位置。不写 = 跟随全局 ui.status.*。
+#   disabled:             仅用户层使用。写 disabled = true 即禁用同名的系统规则（该进程
+#                         合并后没有这条规则）；条目里的其它字段照常保留，去掉本行即恢复。
+#                         [[initial_mode_scope]] / [[commit_newline]] 同样支持。
 #   composition_start_pair_guard:
 #                         将 TSF_COMPOSITION（selection 无效、以组合起点降级）紧接
 #                         TSF_SELECTION 且 compStart 不变的两帧识别为同一次采样，禁止
 #                         把正常的“组合起点→当前插入点”跨度当成锚点整体错误。
 #                         只给已实测存在该交替序列的宿主开启；普通宿主保持原有大偏移
-#                         自愈，不能仅凭非零 compStart 全局开启。用户层同名规则若
-#                         未写本字段会继承出厂值；显式 false 才关闭。
+#                         自愈，不能仅凭非零 compStart 全局开启。
 #   pin_anchor_when_start_drifts:
 #                         宿主报的组合起点跟着插入点漂移时，把候选窗锚点钉在首帧起点。
 #                         必须逐宿主开启（WPS 文字 / Word 需要；Excel / WPS 表格开了反而
-#                         回归），不能全局开。用户层同名规则若未写本字段会继承出厂值；
-#                         显式 false 才关闭。
+#                         回归），不能全局开。
 #   first_show_mode:      候选框首显策略，三档互斥；不写=跟随全局
 #                         config.toml 的 [ui.candidate] first_show_mode（出厂 "fast"）。
 #                         "fast"    默认。仍等坐标，但等到「可信」即放行。DLL 在首帧
@@ -71,13 +94,12 @@
 #                         中英状态，表现为「点一下按钮就变成英文，回到输入框也不恢复」。
 #                         开启后这类请求不再采纳，中文状态保持不变。
 #                         Ctrl+Space 不受影响（按住 Ctrl 时一律放行），仍可正常切中英。
-#                         用户层同名规则若未写本字段会继承出厂值；显式 false 才关闭。
 #   host_drawn_candidates:
 #                         这个宿主把候选串读走时，是否当它在自己画候选、从而收起我们的框：
 #                         不写=否（默认）｜true=是｜false=显式关闭。
 #                         ⚠ **`false` 与「不写」不是一回事**，两条机制让它们不同：
-#                           ① 用户层规则**不写**本字段时会**继承出厂**同名规则的值；写了
-#                              `false` 才挡得住继承。出厂已给 MapleStory.exe 配了 true，
+#                           ① 用户层**不写**本字段 = 继承出厂同名规则的值；写了 `false`
+#                              才挡得住继承。出厂已给 MapleStory.exe 配了 true，
 #                              想关掉它就只能显式写 false —— 删掉那一行是没用的。
 #                           ② 写了 `false` 还会压过 process = "*" 的通配规则；不写则会
 #                              回落去查通配。
@@ -100,7 +122,6 @@
 #                             host_drawn_candidates = true
 #                         通配只对本字段生效，不会把别的字段也套到所有应用上；
 #                         本进程自己的规则优先于通配。
-#                         用户层同名规则若未写本字段会继承出厂值。
 #   caret_offset_x:       光标坐标水平校正（dp，96dpi 基准逻辑像素，正=右，默认 0）。
 #   caret_offset_y:       光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下，默认 0）。
 #                         用于宿主报告的光标坐标**系统性偏移**的场景（如 Windows Terminal，
@@ -110,6 +131,9 @@
 #                         单位是 dp 不是物理像素：会按目标点所在显示器的当前 DPI 换算成
 #                         物理像素后再叠加，故同一份数值在 100%/150%/200% 缩放的屏幕上
 #                         观感一致，多屏不同缩放也不必分别配置。
+#
+# 设置端「应用兼容性」页统一管理本文件与用户层 compat.toml（改写、禁用、还原、导入导出），
+# 逐字段的功能与解决的问题以 wind-config 的 compat_schema 为准，帮助页读的也是它。
 #
 # first_show_mode / initial_mode / initial_punct / auto_pair / candidate_position_mode /
 # ignore_host_ime_close 对应右键菜单：「应用独立配置（<进程名>）」子菜单，各自单选。
@@ -251,13 +275,13 @@ first_show_mode = "wait"
 #   classes:  该进程下**允许重算初始模式**的顶层窗口类名（不区分大小写）
 #             空清单 = 该进程的初始模式规则在任何窗口上都不重算
 #
-# 合并语义：用户层同名进程**整条覆盖**本段（与 [[apps]] 一致）。想增删其中一项时，
-# 请把下面的 classes 整份抄进用户层 compat.toml 再改，只写要加的那一项会让其余几项失效。
+# 合并语义：与 [[apps]] 一致，逐字段叠加。classes 是列表，按**整个字段**替换（不做元素级合并）：
+# 想增删其中一项时，请把下面的 classes 整份抄进用户层 compat.toml 再改，只写要加的那一项会让其余几项失效。
 # 例：想让资源管理器窗口也套用 explorer 的 initial_mode，就在用户层写
 #     classes = ["Progman", "WorkerW", "CabinetWClass"]
 #
-# ⚠ 刻意不放进 [[apps]] 的字段里：那边同名进程是整条覆盖，用户只要为 explorer.exe
-#   写任何一条自己的规则（哪怕只调 caret_offset），本清单就会连带消失。
+# 独立成段而不是 [[apps]] 的字段：它描述的是「规则在哪些窗口上生效」，是进程规则的适用范围，
+#   不是又一个行为开关；分开写也让本清单与 explorer.exe 的 [[apps]] 行为规则各自叠加、互不牵连。
 #
 # ⚠ 未在本段出现的进程**完全不受限制**（绝大多数应用），行为与本机制引入前一致。
 

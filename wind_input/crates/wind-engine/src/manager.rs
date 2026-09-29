@@ -316,6 +316,10 @@ pub struct AuxCodeSettings {
     pub enabled: bool,
     /// 词组长度上限（0 = 不限）。
     pub max_phrase_len: usize,
+    /// 直接辅助码最终是否生效：`enabled` 生效、`direct` 经方案 tri-state 折叠为真，且方案
+    /// **是双拼**（`[engine] type = "pinyin"` + `[engine.pinyin] scheme = "shuangpin"`）。
+    /// 全拼写了 `direct = true` 这里为 false 并告警一次（设计 §7）。
+    pub direct: bool,
     /// 已解析的来源，顺序即优先级。**`enabled == false` 时恒空**（关闭即不解析）。
     pub sources: Vec<AuxSource>,
 }
@@ -455,6 +459,12 @@ pub struct EngineManager {
     charsets: Mutex<Arc<wind_candidate::CharsetRegistry>>,
     /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
     freq_cache: Mutex<HashMap<String, FreqSettings>>,
+    /// 辅助码生效设置缓存（schema_id -> AuxCodeSettings），**只供逐键路径**
+    /// （[`EngineManager::aux_code_settings_cached`]，直接辅助码每个双拼按键都要问）。与
+    /// `freq_cache` 同生命周期：`invalidate_schema`（方案覆盖层写入 / 删除 / 重建都走它）与
+    /// `reload_from_config` 时清。任一方案失效都**整表清**——`schema:` 来源会引用别的方案，
+    /// 按 id 局部清会漏掉引用方。进入引导键辅助码仍走不带缓存的 `aux_code_settings_of`。
+    aux_settings_cache: Mutex<HashMap<String, AuxCodeSettings>>,
     /// 方案引擎类型缓存（`schema_engine_type`）。**按 id 缓存，reload/invalidate 时清**，
     /// 与 `freq_cache`/`name_cache` 同生命周期。
     ///
@@ -794,6 +804,7 @@ impl EngineManager {
             ))),
             store,
             freq_cache: Mutex::new(HashMap::new()),
+            aux_settings_cache: Mutex::new(HashMap::new()),
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             session_actions_cache: Mutex::new(HashMap::new()),
@@ -2518,6 +2529,12 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
+    /// 活跃引擎下 `keys` 恰好切成完整双拼音节时的音节数；非双拼（全拼 / 码表 / 混输）、
+    /// 切不完整时 `None`。见 [`Engine::shuangpin_full_syllable_count`]。纯内存，无 IO。
+    pub fn shuangpin_full_syllable_count(&self, keys: &str) -> Option<usize> {
+        self.active_engine()?.shuangpin_full_syllable_count(keys)
+    }
+
     /// 当前活跃引擎是否为**纯码表**类型（混输 `Mixed` 不算——其拼音半边恒前缀匹配，
     /// 精确匹配语义只对纯码表方案自洽；供协调器判定短语是否随「精确匹配模式」抑制前缀枚举）。
     pub fn is_codetable(&self) -> bool {
@@ -3306,6 +3323,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        self.aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.schema_type_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3503,6 +3524,10 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.aux_settings_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -4443,6 +4468,29 @@ impl EngineManager {
         self.aux_code_settings_of(&self.active_schema_id())
     }
 
+    /// 同 [`Self::aux_code_settings`]，但走缓存：**逐键路径专用**（直接辅助码每个双拼按键都要
+    /// 问一次，未开的用户也一样）。不带缓存的那个每次读盘 + 解析 TOML + 探测来源文件。
+    ///
+    /// 失效点见 `aux_settings_cache`：设置页写方案覆盖层、重载配置都会清；**绕过这些入口直接改
+    /// 磁盘文件**（手改 `schema_overrides`）要等下一次重载才生效，与 `freq_settings_for` 同口径。
+    pub fn aux_code_settings_cached(&self) -> AuxCodeSettings {
+        let id = self.active_schema_id();
+        if let Some(s) = self
+            .aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return s.clone();
+        }
+        let s = self.aux_code_settings_of(&id);
+        self.aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, s.clone());
+        s
+    }
+
     /// 同 [`Self::aux_code_settings`]，但取**指定方案**。
     ///
     /// 辅助码可以从临拼进入，而临拼在五笔方案下引用的是拼音方案——码表配在那个方案的
@@ -4455,11 +4503,22 @@ impl EngineManager {
             .aux_code
             .clone();
         let id = schema_id.to_string();
-        let spec = (!id.is_empty())
+        let schema = (!id.is_empty())
             .then(|| Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref()))
-            .flatten()
-            .map(|s| s.engine.aux_code);
+            .flatten();
+        let is_shuangpin = schema.as_ref().is_some_and(|s| {
+            s.engine.engine_type.eq_ignore_ascii_case("pinyin")
+                && s.engine.pinyin.scheme.eq_ignore_ascii_case("shuangpin")
+        });
+        let spec = schema.map(|s| s.engine.aux_code);
         let resolved = global.resolved(spec.as_ref());
+        // 直接辅助码只做双拼（设计 §2：全拼 `lim` 既可能是 li+m 也可能是「厘米」简拼）。
+        // 全拼写了 `direct = true` 不生效——这是配置错误，报一次足够定位（与来源告警同一节流）。
+        let direct = resolved.enabled && resolved.direct;
+        if direct && !is_shuangpin && self.first_aux_source_warn(schema_id, "\0direct") {
+            tracing::warn!("直接辅助码只支持双拼方案，方案 {schema_id} 的 direct = true 不生效");
+        }
+        let direct = direct && is_shuangpin;
         // 关闭时不解析路径：省掉 N 次目录探测，也避免为一个用不上的功能刷 warn。
         let sources = if resolved.enabled {
             spec.map(|c| {
@@ -4504,6 +4563,7 @@ impl EngineManager {
         AuxCodeSettings {
             enabled: resolved.enabled,
             max_phrase_len: resolved.max_phrase_len,
+            direct,
             sources,
         }
     }

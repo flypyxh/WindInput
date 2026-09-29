@@ -582,6 +582,12 @@ pub(crate) struct State {
     /// 高亮到码表整句候选时 preedit 用它；其余情形不读。
     /// 空串 = 本次没有整句解（或方案未开整句）。每次 build_candidates 重置。
     pub(crate) preedit_codetable_body: String,
+    /// **直接辅助码**命中时的组码区形态：前缀的双拼音节分段 + 空格 + 辅码（`ui'du p`）。
+    /// 高亮到 `is_direct_aux` 的候选时 preedit 用它，让人看出末尾被当成了辅码；其余情形不读。
+    /// 空串 = 本键没有直接辅助命中。每次 build_candidates 重置（见 `apply_direct_aux`）。
+    pub(crate) direct_aux_body: String,
+    /// 直接辅助码：上一个整音节输入的主候选快照，供后面的键当前缀候选（见 `DirectAuxPrev`）。
+    pub(crate) direct_aux_prev: Option<crate::handle_direct_aux::DirectAuxPrev>,
     /// 候选调整（shadow）规则的**归一编码**；空串 = 落回 `input_buffer`（击键原样）。
     ///
     /// 取自 `ConvertResult::shadow_code`，与 `preedit_split_body` 同生命周期（每次
@@ -2527,6 +2533,8 @@ impl Coordinator {
                 preedit_fp_body: String::new(),
                 preedit_abbrev_body: String::new(),
                 preedit_codetable_body: String::new(),
+                direct_aux_body: String::new(),
+                direct_aux_prev: None,
                 shadow_code: String::new(),
                 sentence_pool: Vec::new(),
                 sentence_window: 0,
@@ -3035,7 +3043,7 @@ impl Coordinator {
     /// 没有身份缓存可用；接受每次连接都重新 `OpenProcess` 一次（<1ms，且连接本就是低频
     /// 事件，不是按键路径）。
     #[cfg(any(windows, test))]
-    fn refresh_active_compat_rule_fields(&self, pid: u32) {
+    pub(crate) fn refresh_active_compat_rule_fields(&self, pid: u32) {
         if pid == 0 {
             return;
         }
@@ -3052,6 +3060,7 @@ impl Coordinator {
             caret_use_top,
             stale_probe_guard,
             composition_start_pair_guard,
+            pin_anchor_when_start_drifts,
             first_show_mode,
             auto_pair,
             smart_method,
@@ -3064,6 +3073,8 @@ impl Coordinator {
                 rule.map(|r| r.caret_use_top).unwrap_or(false),
                 rule.map(|r| r.stale_probe_guard).unwrap_or(false),
                 rule.and_then(|r| r.composition_start_pair_guard)
+                    .unwrap_or(false),
+                rule.and_then(|r| r.pin_anchor_when_start_drifts)
                     .unwrap_or(false),
                 rule.and_then(|r| r.first_show_mode),
                 rule.and_then(|r| r.auto_pair),
@@ -3096,6 +3107,7 @@ impl Coordinator {
             ac.caret_use_top = caret_use_top;
             ac.stale_probe_guard = stale_probe_guard;
             ac.composition_start_pair_guard = composition_start_pair_guard;
+            ac.pin_anchor_when_start_drifts = pin_anchor_when_start_drifts;
             ac.first_show_mode = first_show_mode;
             ac.auto_pair = auto_pair;
             ac.smart_method = smart_method;
@@ -5785,6 +5797,8 @@ impl Coordinator {
         state.preedit_split_body.clear();
         state.preedit_fp_body.clear();
         state.preedit_abbrev_body.clear();
+        state.direct_aux_body.clear();
+        state.direct_aux_prev = None;
         state.shadow_code.clear();
         state.candidates.clear();
         self.reset_candidate_view(state);
@@ -10676,8 +10690,11 @@ mod caret_compat_tests {
             .lock()
             .unwrap()
             .insert(pid, "windowsterminal.exe".to_string());
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_caret_offset(&mut rules, "windowsterminal.exe", 0, 12);
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "windowsterminal.exe".into(),
+            caret_offset_y: 12,
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
 
         c.handle_focus_gained(&FocusData {
@@ -13839,9 +13856,12 @@ mod caret_compat_tests {
             .lock()
             .unwrap()
             .insert(pid, "alacritty.exe".to_string());
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_caret_offset(&mut rules, "alacritty.exe", 0, 12);
-        rules[0].composition_start_pair_guard = Some(true);
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "alacritty.exe".into(),
+            caret_offset_y: 12,
+            composition_start_pair_guard: Some(true),
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
 
         c.apply_connected_pid_compat(pid, pid);
@@ -13872,12 +13892,11 @@ mod caret_compat_tests {
             .unwrap()
             .insert(pid, "x60_toolbox.exe".to_string());
         c.active_compat.lock().unwrap().pid = pid;
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_ignore_host_ime_close(
-            &mut rules,
-            "x60_toolbox.exe",
-            Some(true),
-        );
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "x60_toolbox.exe".into(),
+            ignore_host_ime_close: Some(true),
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
 
         // 宿主写 compartment 关 IME、无伴随按键 ⇒ 拦。这就是「点一下按钮就变英文」那条。
@@ -13926,29 +13945,26 @@ mod caret_compat_tests {
         );
 
         // per-app：固定但还没拖过 ⇒ (0,0) 交给 UI 落默认锚点，**不得**借用全局坐标。
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_candidate_position_mode(
-            &mut rules,
-            "x60_toolbox.exe",
-            Some(wind_config::app_compat::CandidatePositionMode::Fixed),
-        );
+        let mut rule = wind_config::app_compat::AppCompatRule {
+            process: "x60_toolbox.exe".into(),
+            candidate_position_mode: Some(wind_config::app_compat::CandidatePositionMode::Fixed),
+            ..Default::default()
+        };
         *c.app_compat.lock().unwrap() =
-            wind_config::app_compat::AppCompat::from_rules(rules.clone());
+            wind_config::app_compat::AppCompat::from_rules(vec![rule.clone()]);
         assert_eq!(c.candidate_fixed_pos(), (true, 0, 0));
 
         // 拖过之后用它自己那份。
-        wind_config::app_compat::set_candidate_pos(&mut rules, "x60_toolbox.exe", 320, 480);
+        rule.candidate_x = 320;
+        rule.candidate_y = 480;
         *c.app_compat.lock().unwrap() =
-            wind_config::app_compat::AppCompat::from_rules(rules.clone());
+            wind_config::app_compat::AppCompat::from_rules(vec![rule.clone()]);
         assert_eq!(c.candidate_fixed_pos(), (true, 320, 480));
 
         // 规则显式写 follow_caret ⇒ 压过全局的 fixed（这正是「独立一档」的意义）。
-        wind_config::app_compat::set_candidate_position_mode(
-            &mut rules,
-            "x60_toolbox.exe",
-            Some(wind_config::app_compat::CandidatePositionMode::FollowCaret),
-        );
-        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+        rule.candidate_position_mode =
+            Some(wind_config::app_compat::CandidatePositionMode::FollowCaret);
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![rule]);
         assert!(!c.candidate_fixed_pos().0);
     }
 
@@ -13968,8 +13984,11 @@ mod caret_compat_tests {
             .lock()
             .unwrap()
             .insert(pid, "alacritty.exe".to_string());
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_caret_offset(&mut rules, "alacritty.exe", 0, 12);
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "alacritty.exe".into(),
+            caret_offset_y: 12,
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
 
         c.apply_connected_pid_compat(pid, pid);
@@ -13993,8 +14012,11 @@ mod caret_compat_tests {
             .lock()
             .unwrap()
             .insert(background_pid, "alacritty.exe".to_string());
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_caret_offset(&mut rules, "alacritty.exe", 0, 12);
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "alacritty.exe".into(),
+            caret_offset_y: 12,
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
 
         // background_pid 建立连接，但当前前台窗口仍是 focused_pid。
@@ -14031,12 +14053,11 @@ mod caret_compat_tests {
             .lock()
             .unwrap()
             .insert(pid, "com.apple.textedit".into());
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_first_show_mode(
-            &mut rules,
-            "com.apple.textedit",
-            Some(wind_config::app_compat::FirstShowMode::Fast),
-        );
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "com.apple.textedit".into(),
+            first_show_mode: Some(wind_config::app_compat::FirstShowMode::Fast),
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
         c.update_active_compat(token);
         assert_eq!(
@@ -14295,6 +14316,7 @@ mod initial_mode_tests {
                 vec![InitialModeScopeRule {
                     process: "explorer.exe".into(),
                     comment: String::new(),
+                    disabled: false,
                     classes: vec!["Progman".into()],
                 }],
             );
@@ -14395,6 +14417,7 @@ mod initial_mode_tests {
             vec![InitialModeScopeRule {
                 process: "explorer.exe".into(),
                 comment: String::new(),
+                disabled: false,
                 classes: vec!["Progman".into()],
             }],
         );
@@ -15934,8 +15957,11 @@ mod input_diag_tests {
     /// 给 pid 登记进程名并装上该进程的 `password_force_english` 规则。
     fn pfe_rule(c: &Coordinator, pid: u32, name: &str, v: Option<bool>) {
         c.pid_names.lock().unwrap().insert(pid, name.to_string());
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_password_force_english(&mut rules, name, v);
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: name.into(),
+            password_force_english: v,
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
     }
 

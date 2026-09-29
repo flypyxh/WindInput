@@ -344,6 +344,8 @@ static REGISTRY: &[ConfigField] = &[
     // `files`（码表清单）不在此：它是方案属性，只住在 `[engine.aux_code]` 里。
     f("schema.pinyin.aux_code.enabled", Bool),
     f("schema.pinyin.aux_code.max_phrase_len", Int),
+    // 直接辅助码（仅双拼，末 1～2 位自动当辅码）。出厂关；只在 enabled 也生效时起作用。
+    f("schema.pinyin.aux_code.direct", Bool),
     // 全局混输（融合策略）
     f("schema.mix.show_source_hint", Bool),
     f("schema.mix.enable_english", Bool),
@@ -797,6 +799,11 @@ pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
         note: "方案可覆盖这一项；方案没写则用这里的值。",
     },
     SchemaOverride {
+        key: "schema.pinyin.aux_code.direct",
+        section: "[engine.aux_code]",
+        note: "方案可覆盖这一项；方案没写则用这里的值。只对双拼方案生效。",
+    },
+    SchemaOverride {
         key: "input.punct.custom_mappings",
         section: "[punct]",
         note: "声明了自己标点表的方案**整表**不用这里的表——不是逐条合并。",
@@ -952,6 +959,7 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
             "schema.pinyin.aux_code.max_phrase_len",
             aux.max_phrase_len.is_some(),
         ),
+        ("schema.pinyin.aux_code.direct", aux.direct.is_some()),
         // ── [punct]：整表替换连总开关一起换掉，两条登记由同一个字段判定 ──
         ("input.punct.custom_mappings", punct_table),
         ("input.punct.custom_enabled", punct_table),
@@ -2063,6 +2071,7 @@ mod overridden_keys_tests {
         match key {
             "schema.pinyin.aux_code.enabled" => "[engine.aux_code]\nenabled = true\n",
             "schema.pinyin.aux_code.max_phrase_len" => "[engine.aux_code]\nmax_phrase_len = 3\n",
+            "schema.pinyin.aux_code.direct" => "[engine.aux_code]\ndirect = true\n",
             // 方案级没有 `custom_enabled`（见 `PunctSpec::custom_mappings` 的 ⛔）：声明了自己的
             // 表就整表替换、连全局开关一起换掉。于是两条登记由同一个字段判定，这是登记语义
             // 本身（见 SCHEMA_OVERRIDES 那条 note），不是豁免。

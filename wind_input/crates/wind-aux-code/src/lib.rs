@@ -32,12 +32,17 @@
 //! > 注：主排序的首要键是消费长度（`by_consumed`，librime 对齐），会让低
 //! > 词频长子短语排在短单字前——这是主排序的有意行为，本模块不纠正（见 filter 模块文档）。
 
+pub mod direct;
 pub mod filter;
 pub mod loader;
 pub mod lookup;
 pub mod session;
 pub mod table;
 
+pub use direct::{
+    DirectPhraseRule, DirectPlacement, DirectSplit, direct_matches, direct_placement,
+    is_direct_source, mark_direct_hit, merge_direct_hits, split_direct,
+};
 pub use filter::{AuxCodeFilterOptions, aux_code_matches, filter_by_aux_code};
 pub use loader::{load_from_file, load_merged, read_name};
 pub use lookup::AuxCodeLookup;

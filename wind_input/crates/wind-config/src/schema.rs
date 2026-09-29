@@ -294,7 +294,7 @@ pub const AUX_SCHEMA_SOURCE_PREFIX: &str = "schema:";
 ///
 /// 与 [`CodeTableSpec`] 同构（见 schema-config-layering.md §4）：
 /// - `files` 是方案属性（全拼配笔画、双拼配小鹤形码——换表不换方案），留在方案文件；
-/// - `enabled` / `max_phrase_len` 是用户可配行为，tri-state `Option`：
+/// - `enabled` / `max_phrase_len` / `direct` 是用户可配行为，tri-state `Option`：
 ///   `Some` 覆盖、`None` 回落全局 `[schema.pinyin.aux_code]`。
 ///
 /// ⚠️ **`files` 非空不等于功能开启**。总闸是 `enabled`（出厂 `false`），
@@ -326,6 +326,11 @@ pub struct AuxCodeSpec {
     /// 单字恒参与匹配，不受此限。见 wind-aux-code 的 `AuxCodeFilterOptions::max_phrase_len`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_phrase_len: Option<usize>,
+    /// 本方案是否开直接辅助码（末尾 1～2 位自动当辅码，**仅双拼**）。`None` = 回落全局
+    /// `[schema.pinyin.aux_code].direct`。只在 `enabled` 也生效时起作用；全拼方案写了
+    /// `true` 不生效、日志告警一次。见 `docs/design/aux-code-direct.md` §7。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<bool>,
 }
 
 impl AuxCodeSpec {

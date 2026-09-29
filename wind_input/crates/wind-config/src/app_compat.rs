@@ -3,11 +3,16 @@
 //! 与 Go 版本 `wind_input/pkg/config/compat.go` 对齐：按进程名为特定应用提供候选窗
 //! 定位 / 光标获取等兼容修正。文件格式为 TOML 的 `[[apps]]` 数组表，加载顺序：
 //! 系统预置（`{data_dir}/compat.toml`）→ 定制版（`data_custom/compat.toml`）→
-//! 用户覆盖（`{user_config_dir}/compat.toml`），靠后层的同进程名规则整条覆盖靠前层。
-//! 例外是登记在 `ProtocolFields` 里的一组宿主协议级字段：后层未写时继承，
-//! 显式 `false` 才关闭，避免菜单生成的稀疏规则无意抹掉已知宿主修复。字段清单只在
-//! `ProtocolFields` 一处，这里不列（列了就会随新增字段过期）。
+//! 用户覆盖（`{user_config_dir}/compat.toml`）。
+//!
+//! **整体原则：每一层都是相对下一层的差异，逐字段叠加**（同名进程内：写了的字段覆盖、没写的继承、
+//! `unset` 取消、`disabled` 禁用）。没有「同名整条替换」，也没有哪个字段享有特殊的继承待遇——
+//! 叠加引擎与全部语义见 [`crate::compat_overlay`]，本模块负责把叠加结果变成运行时结构体。
 
+use crate::compat_overlay::{
+    FieldEdit, Raw, apply_edits, is_disabled, materialize, overlay_raw, parse_raw, process_of,
+    render_raw, same_process, sanitize,
+};
 use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -22,14 +27,17 @@ pub const COMPAT_FILE_NAME: &str = "compat.toml";
 /// 用户层由右键菜单自动管理，每次切换都会**整份重写**（TOML 序列化不保留注释），
 /// 故必须在文件里就把这件事讲明白，否则用户手写的说明被吞掉时无从得知原因。
 /// 完整的字段文档留在系统层 `data/compat.toml`——那份不会被程序改写。
-const USER_COMPAT_HEADER: &str = "\
-# 用户层应用兼容规则（覆盖 / 追加系统层 data/compat.toml）
+pub(crate) const USER_COMPAT_HEADER: &str = "\
+# 用户层应用兼容规则（相对系统层 data/compat.toml 的差异）
 #
-# ⚠ 本文件由输入法右键菜单自动管理，每次通过菜单切换开关都会整份重写，
+# ⚠ 本文件由输入法（右键菜单 / 设置页）自动管理，每次改动都会整份重写，
 #   手写的注释与排版不会保留。需要长期留存的说明请写在系统层 compat.toml。
 #
-# 合并语义：同名进程（不区分大小写）整条覆盖系统层，系统层其余规则保留。
-# 例外：系统层注明「继承出厂值」的宿主修正字段，未写时继承系统层，显式 false 才关闭。
+# 叠加语义：每条规则只记与系统层不同的字段，逐字段叠加在同名进程的系统规则之上：
+#   - 写了的字段覆盖系统值，没写的字段继承系统值；
+#   - unset = [\"字段名\", …] 取消系统设定的字段（回到「跟随全局」）；
+#   - 显式写 false 可以关掉系统打开的开关；
+#   - disabled = true 禁用整条系统规则。
 # 字段说明见系统层 data/compat.toml 顶部注释。
 
 ";
@@ -37,6 +45,48 @@ const USER_COMPAT_HEADER: &str = "\
 /// `skip_serializing_if` 用：省略默认为 false 的开关，避免写回时铺满一堆 `= false`。
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// 用户层 `compat.toml` 的进程内写锁。
+///
+/// 写用户层是「读整份 → 改 → 整份写回」，两个写入方（右键菜单在协调器线程、设置端 RPC 在
+/// 各自的连接线程）交错时，后写的会把先写的改动整份覆盖掉。所有写入路径
+/// （[`update_user_raw`]、`compat_admin::rpc` 的写方法）必须在读到写完的**全程**持有它。
+static USER_COMPAT_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn lock_user_compat() -> std::sync::MutexGuard<'static, ()> {
+    // 持锁线程 panic 只会让锁中毒，数据本身在磁盘上，不该让之后所有写入都失败。
+    USER_COMPAT_WRITE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 落盘：唯一临时名 → 写满 → `fsync` → rename。
+///
+/// 只 rename 不 `fsync` 的话，断电后可能留下 0 长度或半截的正式文件；而运行时对语法错的
+/// compat.toml 是**整份静默跳过**，下一次菜单操作还会按空集重写，等于用户层全丢。
+/// 临时名带 pid 与序号，两个写入方即便没经过 [`lock_user_compat`] 也不会写同一个临时文件。
+pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| COMPAT_FILE_NAME.to_string());
+    let tmp = path.with_file_name(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 候选窗首显策略：新组合的候选窗**何时**显示。
@@ -578,7 +628,9 @@ where
 {
     match Option::<toml::Value>::deserialize(d)? {
         None => Ok(String::new()),
-        Some(toml::Value::String(s)) => Ok(s),
+        // 读入时就 trim：叠加与管理层匹配进程名都 trim，运行时查表若不 trim，
+        // 用户手写的 ` Foo.exe ` 就会被菜单写进一条运行时永远匹配不上的行。
+        Some(toml::Value::String(s)) => Ok(s.trim().to_string()),
         Some(other) => {
             let raw = other.to_string();
             tracing::warn!("compat.toml: process = {raw} 不是字符串，本条规则作废");
@@ -618,6 +670,14 @@ pub struct AppCompatRule {
         skip_serializing_if = "String::is_empty"
     )]
     pub comment: String,
+    /// 用户层专用：禁用同名的系统规则（合并后该进程视为没有这条规则）。
+    /// 条目里的其它字段照常保留，去掉本标记即恢复到禁用前的状态。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub disabled: bool,
     /// 使用 caret rect 的 top 而非 bottom 定位候选窗。
     /// 适用于 GetTextExt 返回的 height 不稳定的 WebView 应用（如微信 Qt 输入框，
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
@@ -660,10 +720,8 @@ pub struct AppCompatRule {
     /// 原有 caret 大偏移自愈，甚至把候选窗重锁到异常坐标。协调器还会核对来源顺序、
     /// 前帧降级点、reported compStart 与当前锁四者一致，单独一个非零值不构成放行理由。
     ///
-    /// **必须是 `Option<bool>`**：这是宿主协议级修正，不是一般用户偏好。用户可能已经
-    /// 通过菜单给 `QQ.exe` 写了只含 `first_show_mode` 的稀疏规则；若用 bool 的缺省
-    /// `false` 做整条覆盖，升级后会静默屏蔽系统层新增的 QQ 修复。`None` 表示继承
-    /// 低层，`Some(false)` 仍保留显式关闭的逃生口。
+    /// 三态：未写 = 继承下层，`Some(true)` = 开，`Some(false)` = 显式关闭。（所有字段的继承
+    /// 都由叠加引擎在原始键值上统一处理，见 [`crate::compat_overlay`]，本字段没有特殊待遇。）
     #[serde(
         default,
         deserialize_with = "crate::tolerant_de::tolerant_opt_bool",
@@ -768,7 +826,7 @@ pub struct AppCompatRule {
     /// 应用关掉；反过来也可以在全局关掉时只给某个应用开。
     ///
     /// **必须是 `Option`**（理由同 `initial_mode`）：`None` 与「显式配了恰好等于全局的值」
-    /// 是两件事，后者不随全局开关变。用户偏好 ⇒ **不进** [`ProtocolFields`]。
+    /// 是两件事，后者不随全局开关变。
     ///
     /// ★ 消费点必须只有一个判定函数（协调器 `password_force_english_for_pid`）：服务端的
     /// 抑制态与推给 DLL 的吃键门控出自同一处，否则 core.suppress ⊄ C++.suppress ⇒ 密码框丢键。
@@ -787,8 +845,8 @@ pub struct AppCompatRule {
     /// - 具体方案 id ⇒ 焦点跨进程切入时固定切到它；
     /// - [`APP_SCHEMA_REMEMBER`] ⇒ 切入时恢复本应用上次用的方案（无记录则用全局）。
     ///
-    /// 规则应用内的手切只改本应用的方案，不写 `schema.active`。用户偏好 ⇒ **不进**
-    /// [`ProtocolFields`]。消费点在协调器 `app_schema_rule`（按当时的 available 校验）。
+    /// 规则应用内的手切只改本应用的方案，不写 `schema.active`。消费点在协调器
+    /// `app_schema_rule`（按当时的 available 校验）。
     /// 读取请走 [`Self::app_schema`]，不要直接比较字符串。
     #[serde(
         default,
@@ -875,8 +933,8 @@ pub struct AppCompatRule {
     ///
     /// 与 [`Self::candidate_position_mode`] 同构：必须是 `Option`（「没配过」与「显式配了
     /// follow_caret」要能区分），且坐标 [`Self::status_x`]/[`Self::status_y`] 与它**同层取**
-    /// ——规则配了定位方式就用规则自己的那份坐标，没配才整套回落全局。用户偏好 ⇒ **不进**
-    /// [`ProtocolFields`]。消费点在协调器 `status_position`。
+    /// ——规则配了定位方式就用规则自己的那份坐标，没配才整套回落全局。消费点在协调器
+    /// `status_position`。
     #[serde(
         default,
         deserialize_with = "de_status_position_mode",
@@ -933,8 +991,8 @@ pub struct AppCompatRule {
     /// `None` = 否（默认），`Some(true)` = 是，`Some(false)` = **显式关闭**。
     ///
     /// ⚠ `Some(false)` 与 `None` **不同义**，别按「反正默认也是否」来理解：
-    /// ① [`ProtocolFields::inherit_into`] 只填 `None` 的位置 ⇒ 用户层不写会**继承出厂**
-    ///    同名规则（出厂已有 `MapleStory.exe = true`），写 `false` 才挡得住；
+    /// ① 用户层不写 = 继承出厂同名规则（出厂已有 `MapleStory.exe = true`），显式写 `false`
+    ///    才挡得住；
     /// ② 查表时 `Some(false)` 会短路掉 `process = "*"` 通配的 `or_else` 回落，`None` 不会
     ///    （`a_wildcard_rule_applies_everywhere_and_a_process_rule_wins` 正是靠这点成立）。
     ///
@@ -990,322 +1048,240 @@ fn is_zero_i32(v: &i32) -> bool {
     *v == 0
 }
 
-/// 在一组规则上就地修改指定进程的**某一个**字段。
+/// 用户层（右键菜单）写入的入口：读用户层 → 交给 `f` 改 → 整份写回。
 ///
-/// 纯函数（不碰文件系统），故可直接单测——本仓凡涉 `%APPDATA%` 落盘的逻辑都要这样
-/// 抽出来，否则端到端测试会真写用户配置目录（见 project_dict_override_sparse_merge 的教训）。
+/// 只读写**用户层**：系统层 `data/compat.toml` 不受影响。文件或目录不存在时自动创建。
+/// 用户层里记的是**相对系统层的差异**，`f` 拿到已叠加好的系统层（用来判断哪些值冗余、
+/// 哪些字段清除时需要 `unset`）以及「系统层是否真的读到了」。
 ///
-/// 进程名不区分大小写匹配；命中则只改 `edit` 触碰的字段、其余保持不动；未命中则**追加**
-/// 一条只带该字段的新规则（不是整表快照，避免把系统层的其它字段冻结进用户层）。
-pub fn upsert_rule(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    edit: impl FnOnce(&mut AppCompatRule),
-) {
-    let key = process.to_ascii_lowercase();
-    for r in rules.iter_mut() {
-        if r.process.to_ascii_lowercase() == key {
-            edit(r);
-            return;
-        }
-    }
-    let mut fresh = AppCompatRule {
-        process: process.to_string(),
-        ..Default::default()
-    };
-    edit(&mut fresh);
-    rules.push(fresh);
-}
-
-/// 在一组规则上设置指定进程的首显策略（`None` = 清除规则，回到跟随全局）。语义见 [`upsert_rule`]。
-pub fn set_first_show_mode(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    mode: Option<FirstShowMode>,
-) {
-    upsert_rule(rules, process, |r| r.first_show_mode = mode);
-}
-
-/// 在一组规则上设置指定进程的初始中英状态（`None` = 清除规则，回到跟随全局）。
-pub fn set_initial_mode(rules: &mut Vec<AppCompatRule>, process: &str, mode: Option<InitialMode>) {
-    upsert_rule(rules, process, |r| r.initial_mode = mode);
-}
-
-/// 在一组规则上设置指定进程的初始中英标点（`None` = 清除规则，回到跟随全局）。
-pub fn set_initial_punct(rules: &mut Vec<AppCompatRule>, process: &str, mode: Option<InitialMode>) {
-    upsert_rule(rules, process, |r| r.initial_punct = mode);
-}
-
-/// 在一组规则上设置指定进程的候选窗定位方式（`None` = 清除，回到跟随全局）。
-///
-/// ⚠ 清除定位方式时**一并清坐标**：留着一份孤儿坐标，下次用户重新开固定就会跳到
-/// 上一次的老位置，而他刚刚才关掉它——「关了又开，位置从哪来的」无从解释。
-pub fn set_candidate_position_mode(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    mode: Option<CandidatePositionMode>,
-) {
-    upsert_rule(rules, process, |r| {
-        r.candidate_position_mode = mode;
-        if mode.is_none() {
-            r.candidate_x = 0;
-            r.candidate_y = 0;
-        }
-    });
-}
-
-/// 在一组规则上设置指定进程的候选窗固定落点（内容左上，物理像素）。
-///
-/// 只改坐标、不碰定位方式。落盘路径请用 [`set_user_candidate_fixed_pos`]——它把两者一起
-/// 写，理由见那里（只写坐标会让用户层规则整条盖掉出厂的 `candidate_position_mode`）。
-///
-/// 调用方须自行做 `(0,0)` 哨兵规避（`avoid_unset_sentinel`）——与全局那条落盘路径同源。
-pub fn set_candidate_pos(rules: &mut Vec<AppCompatRule>, process: &str, x: i32, y: i32) {
-    upsert_rule(rules, process, |r| {
-        r.candidate_x = x;
-        r.candidate_y = y;
-    });
-}
-
-/// 在一组规则上设置「忽略该宿主关闭输入法的请求」（`None` = 清除，回到默认采纳）。
-/// 语义与代价见 [`AppCompatRule::ignore_host_ime_close`]。
-pub fn set_ignore_host_ime_close(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    enabled: Option<bool>,
-) {
-    upsert_rule(rules, process, |r| r.ignore_host_ime_close = enabled);
-}
-
-/// 在一组规则上设置指定进程是否加入 HostRender 白名单。语义见 [`upsert_rule`]。
-pub fn set_host_render(rules: &mut Vec<AppCompatRule>, process: &str, enabled: bool) {
-    upsert_rule(rules, process, |r| r.host_render = enabled);
-}
-
-/// 在一组规则上设置指定进程的符号自动配对开关（`None` = 清除规则，回到跟随全局）。
-pub fn set_auto_pair(rules: &mut Vec<AppCompatRule>, process: &str, enabled: Option<bool>) {
-    upsert_rule(rules, process, |r| r.auto_pair = enabled);
-}
-
-/// 在一组规则上设置指定进程的密码框强制英文（`None` = 清除规则，回到跟随全局）。
-pub fn set_password_force_english(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    enabled: Option<bool>,
-) {
-    upsert_rule(rules, process, |r| r.password_force_english = enabled);
-}
-
-/// 在一组规则上设置指定进程的输入方案（`None` = 清除规则，回到跟随全局）。
-/// 值语义见 [`AppCompatRule::schema`]。
-pub fn set_schema(rules: &mut Vec<AppCompatRule>, process: &str, schema: Option<String>) {
-    upsert_rule(rules, process, |r| r.schema = schema);
-}
-
-/// 在一组规则上设置指定进程的智能符号替换方案（`None` = 清除规则，回到跟随全局）。
-pub fn set_smart_method(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    method: Option<SmartMethod>,
-) {
-    upsert_rule(rules, process, |r| r.smart_method = method);
-}
-
-/// 在一组规则上设置指定进程的光标坐标校正偏移（dp，正=右/下；0 = 不偏移）。
-pub fn set_caret_offset(rules: &mut Vec<AppCompatRule>, process: &str, dx: i32, dy: i32) {
-    upsert_rule(rules, process, |r| {
-        r.caret_offset_x = dx;
-        r.caret_offset_y = dy;
-    });
-}
-
-/// 在一组规则上设置指定进程的状态气泡定位（**方式与坐标一起写**；`None` = 清除，回到跟随
-/// 全局，坐标一并清零——理由同 [`set_candidate_position_mode`]）。
-pub fn set_status_position(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    mode: Option<StatusPositionMode>,
-    x: i32,
-    y: i32,
-) {
-    upsert_rule(rules, process, |r| apply_status_position(r, mode, x, y));
-}
-
-/// 在一组规则上设置指定进程的状态气泡兜底位置（`None` = 清除，回到跟随全局）。
-pub fn set_status_fallback(
-    rules: &mut Vec<AppCompatRule>,
-    process: &str,
-    fallback: Option<StatusFallback>,
-) {
-    upsert_rule(rules, process, |r| r.status_fallback_position = fallback);
-}
-
-/// 定位方式与坐标的同层写入：清除方式时坐标归零；非 `fixed` 方式不用坐标，也归零，
-/// 免得留一对孤儿坐标、下次开固定跳到老位置。
-fn apply_status_position(r: &mut AppCompatRule, mode: Option<StatusPositionMode>, x: i32, y: i32) {
-    r.status_position_mode = mode;
-    let (x, y) = if mode == Some(StatusPositionMode::Fixed) {
-        (x, y)
-    } else {
-        (0, 0)
-    };
-    r.status_x = x;
-    r.status_y = y;
-}
-
-/// 一条规则是否「什么都没覆盖」——序列化后除 `process` 外不剩任何键。
-///
-/// ⚠ 判据走序列化而**不是**逐字段比较：本结构的可选字段全带 `skip_serializing_if`，
-/// 新增字段自动纳入判断；逐字段手写一遍就是第二份真相，加字段时必然漏一个，而漏掉的
-/// 后果是「这条规则被当成空壳删掉、用户配的那项静默消失」。
-fn is_empty_override(rule: &AppCompatRule) -> bool {
-    toml::Value::try_from(rule)
-        .ok()
-        .and_then(|v| v.as_table().map(|t| t.len() <= 1))
-        .unwrap_or(false)
-}
-
-/// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
-///
-/// ⚠ 除 `[[apps]]` 之外的每一段都必须原样带回：本函数是**整份重写**，漏掉哪一段哪一段
-/// 就没了。用户手写的 `[[initial_mode_scope]]` / `[[commit_newline]]` 覆盖会在下一次菜单
-/// 开关时静默消失，而那种缺陷「配置改了不生效」的现场与写回路径隔着一次重启，极难归因。
-///
-/// ⛔ 新增段时**改本函数的签名**，不要另开一个「完整版」而把旧签名留着转发：留着的那个
-/// 就是个漏段陷阱，下一个调用方照着它写，新段当场丢失。
-pub fn render_user_compat(
-    rules: &[AppCompatRule],
-    initial_mode_scope: &[InitialModeScopeRule],
-    commit_newline: &[CommitNewlineRule],
-) -> Result<String, toml::ser::Error> {
-    let file = AppCompatFile {
-        apps: rules.to_vec(),
-        initial_mode_scope: initial_mode_scope.to_vec(),
-        commit_newline: commit_newline.to_vec(),
-    };
-    Ok(format!("{USER_COMPAT_HEADER}{}", toml::to_string(&file)?))
-}
-
-/// 就地修改用户层 compat.toml 中指定进程的规则（load-modify-save）。
-///
-/// 只读写**用户层**：系统层 `data/compat.toml` 不受影响（合并时用户层同名进程整条覆盖它）。
-/// 文件或目录不存在时自动创建；解析失败按空规则集处理（宁可重建也不要把菜单卡死，
-/// 用户手改坏了 TOML 时仍能通过菜单恢复到可用状态）。
-pub fn update_user_rule(
+/// 解析失败仍然重建（不让菜单卡死，用户手改坏了 TOML 时仍能通过菜单恢复到可用状态），
+/// 但先把损坏的原文件留一份 `.bad`：手改坏了的内容往往还能救，静默抹掉就是白丢。
+/// 读到写完的全程持有 [`lock_user_compat`]：右键菜单与设置端 RPC 会交错写同一个文件。
+fn update_user_raw(
     user_dir: &Path,
-    process: &str,
-    edit: impl FnOnce(&mut AppCompatRule),
+    f: impl FnOnce(&mut Raw, &Raw, bool),
 ) -> Result<(), std::io::Error> {
+    let _guard = lock_user_compat();
+    // 用户目录退化成数据目录时（拿不到用户配置目录的兜底），「用户层」与「系统层」是同一个文件：
+    // 此时写入会把系统预置里被判为「冗余」的字段当场删掉。拒绝比改坏出厂文件好。
+    #[cfg(not(test))]
+    if crate::config::Config::data_dir().is_some_and(|d| d == user_dir) {
+        return Err(std::io::Error::other(
+            "用户配置目录与数据目录相同，拒绝改写系统预置的 compat.toml",
+        ));
+    }
     let path = user_dir.join(COMPAT_FILE_NAME);
-    let mut file = load_file(&path).unwrap_or_default();
-    upsert_rule(&mut file.apps, process, edit);
-    // ★ 剔除空壳规则：菜单把某一项改回「跟随全局」后，这条规则可能一个字段都不剩。
-    //
-    // 留着它**不是无害的**——合并语义是「同名进程整条覆盖系统层」，一条空壳会把系统层
-    // 的出厂规则连同**以后新增的**一起整条屏蔽掉。实测：给 et.exe（WPS 表格）出厂配了
-    // first_show_mode="wait"，而用户层残留的空壳让它读出来仍是「跟随全局」，用户只能
-    // 手动再配一次才生效，且完全看不出为什么。
-    //
-    // 「跟随全局」必须真的等于「这条规则不存在」，否则它就是个静默的屏蔽器。同一个病
-    // 在 config.toml 那层记过一次：写回不剔除「等于默认」的键 ⇒ 默认值升级对老用户失效。
-    file.apps.retain(|r| !is_empty_override(r));
-    // 其余各段原样透传：菜单只管 [[apps]]，别的段不属于它，不能顺手抹掉。
-    let text = render_user_compat(&file.apps, &file.initial_mode_scope, &file.commit_newline)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut user = match std::fs::read_to_string(&path) {
+        Ok(text) => match parse_raw(&text) {
+            // 「读得进来」还不够：有内容被跳过（`[apps]` 写成单括号之类）时，重写会把它们丢掉，
+            // 同样按损坏处理——先留一份 `.bad`。
+            Ok(r) if r.skipped.is_empty() => r,
+            Ok(r) => {
+                tracing::warn!(
+                    "用户层 compat.toml 有内容无法读入（{}），将重建（原文件留作 {COMPAT_FILE_NAME}.bad）",
+                    r.skipped.join("；")
+                );
+                let _ = std::fs::copy(&path, user_dir.join(format!("{COMPAT_FILE_NAME}.bad")));
+                Raw {
+                    skipped: Vec::new(),
+                    ..r
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "用户层 compat.toml 解析失败，将重建（原文件留作 {COMPAT_FILE_NAME}.bad）: {e}"
+                );
+                let _ = std::fs::copy(&path, user_dir.join(format!("{COMPAT_FILE_NAME}.bad")));
+                Raw::default()
+            }
+        },
+        Err(_) => Raw::default(),
+    };
+    let (system, known) = system_layer_for_menu();
+    f(&mut user, &system, known);
     std::fs::create_dir_all(user_dir)?;
-    std::fs::write(&path, text)?;
+    let text = render_raw(USER_COMPAT_HEADER, &user).map_err(std::io::Error::other)?;
+    write_atomic(&path, &text)?;
     Ok(())
 }
 
-/// 设置用户层 compat.toml 中指定进程的首显策略（`None` = 清除规则，回到跟随全局）。
-/// 语义见 [`update_user_rule`]。
+/// 菜单路径看到的系统层（`data` ⊕ `data_custom`）。第二个返回值 = 系统层是否**确定**：
+/// 只有数据目录本身解析不出来时才算未知——目录在、文件缺失或解析失败，运行时看到的就是
+/// 「系统层为空」，这是确定的答案。未知时清除字段不能凭「系统里没有」就省掉 `unset`。
+#[cfg(not(test))]
+fn system_layer_for_menu() -> (Raw, bool) {
+    let data = crate::config::Config::data_dir();
+    let known = data.is_some();
+    let mut raw = Raw::default();
+    for dir in [data, crate::config::Config::custom_data_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(layer) = load_raw(&dir.join(COMPAT_FILE_NAME)) {
+            raw = overlay_raw(raw, &layer);
+        }
+    }
+    (raw, known)
+}
+
+/// 测试构建里菜单路径的系统层由测试显式注入（读真实数据目录会让测试依赖本机环境）；
+/// 没注入 = 系统层未知。
+#[cfg(test)]
+fn system_layer_for_menu() -> (Raw, bool) {
+    TEST_MENU_SYSTEM
+        .with(|c| c.borrow().clone())
+        .unwrap_or((Raw::default(), false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MENU_SYSTEM: std::cell::RefCell<Option<(Raw, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 测试：在 `f` 期间让右键菜单的写入路径看到指定的系统层。
+#[cfg(test)]
+pub(crate) fn with_menu_system<R>(system: Raw, known: bool, f: impl FnOnce() -> R) -> R {
+    TEST_MENU_SYSTEM.with(|c| *c.borrow_mut() = Some((system, known)));
+    let r = f();
+    TEST_MENU_SYSTEM.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+/// 对某进程的 `[[apps]]` 差异行做一批字段编辑。
+fn edit_user_apps(
+    user_dir: &Path,
+    process: &str,
+    edits: &[FieldEdit],
+) -> Result<(), std::io::Error> {
+    update_user_raw(user_dir, |user, system, known| {
+        // 下层（系统 / data_custom）把这个进程的规则禁用了，而用户在菜单里给它选了一个选项：
+        // 这是明确的「我要配置它」，不带重新启用的话规则仍是禁用，选项存了却永远不生效。
+        // 用户自己在设置页禁用的（用户层有 `disabled`）则不动，那是他的明确决定。
+        let lower_disabled = system
+            .apps
+            .iter()
+            .any(|r| same_process(process_of(r), process) && is_disabled(r));
+        let user_decided = user
+            .apps
+            .iter()
+            .any(|r| same_process(process_of(r), process) && r.contains_key("disabled"));
+        let mut all = edits.to_vec();
+        if lower_disabled && !user_decided {
+            all.push(FieldEdit::Set(
+                "disabled".into(),
+                serde_json::Value::Bool(false),
+            ));
+        }
+        apply_edits::<AppCompatRule>("apps", &system.apps, &mut user.apps, process, &all, known)
+    })
+}
+
+/// `Some(v)` ⇒ 设置；`None` ⇒ 清除（回到没设置 / 跟随全局，系统层设了它时写 `unset`）。
+fn set_or_clear<T: Serialize>(key: &str, v: Option<T>) -> FieldEdit {
+    match v.map(|v| serde_json::to_value(v)) {
+        Some(Ok(v)) if !v.is_null() => FieldEdit::Set(key.to_string(), v),
+        _ => FieldEdit::Clear(key.to_string()),
+    }
+}
+
+fn set_value(key: &str, v: impl Into<serde_json::Value>) -> FieldEdit {
+    FieldEdit::Set(key.to_string(), v.into())
+}
+
+fn clear(key: &str) -> FieldEdit {
+    FieldEdit::Clear(key.to_string())
+}
+
+/// 设置用户层 compat.toml 中指定进程的首显策略（`None` = 清除，回到跟随全局）。
 pub fn set_user_first_show_mode(
     user_dir: &Path,
     process: &str,
     mode: Option<FirstShowMode>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.first_show_mode = mode)
+    edit_user_apps(user_dir, process, &[set_or_clear("first_show_mode", mode)])
 }
 
-/// 设置用户层 compat.toml 中指定进程的初始中英状态（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的初始中英状态（`None` = 清除）。
 pub fn set_user_initial_mode(
     user_dir: &Path,
     process: &str,
     mode: Option<InitialMode>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.initial_mode = mode)
+    edit_user_apps(user_dir, process, &[set_or_clear("initial_mode", mode)])
 }
 
-/// 设置用户层 compat.toml 中指定进程的初始中英标点（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的初始中英标点（`None` = 清除）。
 pub fn set_user_initial_punct(
     user_dir: &Path,
     process: &str,
     mode: Option<InitialMode>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.initial_punct = mode)
+    edit_user_apps(user_dir, process, &[set_or_clear("initial_punct", mode)])
 }
 
 /// 设置用户层 compat.toml 中指定进程是否加入 HostRender 白名单。
+/// `false` 写成显式覆盖（系统层打开时它才是「从白名单里去掉」；系统层没有时会被当作冗余丢掉）。
 pub fn set_user_host_render(
     user_dir: &Path,
     process: &str,
     enabled: bool,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.host_render = enabled)
+    edit_user_apps(user_dir, process, &[set_value("host_render", enabled)])
 }
 
-/// 设置用户层 compat.toml 中指定进程的符号自动配对开关（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的符号自动配对开关（`None` = 清除）。
 pub fn set_user_auto_pair(
     user_dir: &Path,
     process: &str,
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.auto_pair = enabled)
+    edit_user_apps(user_dir, process, &[set_or_clear("auto_pair", enabled)])
 }
 
-/// 设置用户层 compat.toml 中指定进程的密码框强制英文（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的密码框强制英文（`None` = 清除）。
 pub fn set_user_password_force_english(
     user_dir: &Path,
     process: &str,
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.password_force_english = enabled)
+    edit_user_apps(
+        user_dir,
+        process,
+        &[set_or_clear("password_force_english", enabled)],
+    )
 }
 
-/// 设置用户层 compat.toml 中指定进程的输入方案（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的输入方案（`None` = 清除）。
 pub fn set_user_schema(
     user_dir: &Path,
     process: &str,
     schema: Option<String>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.schema = schema)
+    edit_user_apps(user_dir, process, &[set_or_clear("schema", schema)])
 }
 
-/// 设置用户层 compat.toml 中指定进程的候选窗定位方式（`None` = 清除规则，含坐标）。
-/// 清除时一并清坐标，理由见 [`set_candidate_position_mode`]。
+/// 设置用户层 compat.toml 中指定进程的候选窗定位方式（`None` = 清除，含坐标）。
+///
+/// ⚠ 清除定位方式时**一并清坐标**：留着一份孤儿坐标，下次用户重新开固定就会跳到
+/// 上一次的老位置，而他刚刚才关掉它——「关了又开，位置从哪来的」无从解释。
 pub fn set_user_candidate_position_mode(
     user_dir: &Path,
     process: &str,
     mode: Option<CandidatePositionMode>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| {
-        r.candidate_position_mode = mode;
-        if mode.is_none() {
-            r.candidate_x = 0;
-            r.candidate_y = 0;
-        }
-    })
+    let mut edits = vec![set_or_clear("candidate_position_mode", mode)];
+    if mode.is_none() {
+        edits.push(clear("candidate_x"));
+        edits.push(clear("candidate_y"));
+    }
+    edit_user_apps(user_dir, process, &edits)
 }
 
 /// 记住指定进程的候选窗固定落点：**定位方式与坐标一起写**（内容左上，物理像素）。
 ///
-/// ★ 为什么必须连 `candidate_position_mode` 一起写：本字段**不在** [`ProtocolFields`] 里
-/// （它是用户偏好不是宿主协议事实），用户层同名规则整条覆盖系统层。只写坐标的话，出厂
-/// 若给某个宿主配了 `candidate_position_mode = "fixed"`，用户拖一次窗口，用户层规则就只剩
-/// `process` + 坐标 ⇒ 出厂那档 fixed 被整条盖掉，候选窗当场变回跟随光标，只留下一对
-/// 谁也用不上的孤儿坐标。
-///
-/// 语义上这也更直白：拖动本身就是「这个应用就固定在这儿」的确认，两件事本是一件。
+/// 拖动本身就是「这个应用就固定在这儿」的确认，方式与坐标本是一件事，所以一起写；
+/// 这也让用户层的这条差异自成一体，不依赖系统层恰好配了什么。
 ///
 /// ⚠ 调用方须先做 `(0,0)` 哨兵规避，与全局那条落盘路径同源；这里不代劳，
 /// 因为规避函数在协调器侧（与状态气泡共用），下沉到配置层会变成第二份实现。
@@ -1315,29 +1291,44 @@ pub fn set_user_candidate_fixed_pos(
     x: i32,
     y: i32,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| {
-        r.candidate_position_mode = Some(CandidatePositionMode::Fixed);
-        r.candidate_x = x;
-        r.candidate_y = y;
-    })
+    edit_user_apps(
+        user_dir,
+        process,
+        &[
+            set_or_clear(
+                "candidate_position_mode",
+                Some(CandidatePositionMode::Fixed),
+            ),
+            set_value("candidate_x", x),
+            set_value("candidate_y", y),
+        ],
+    )
 }
 
-/// 设置用户层 compat.toml 中指定进程的「忽略宿主关闭输入法」（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的「忽略宿主关闭输入法」。
+///
+/// **`None` = 还原（继承内置规则），不是「清除」**：这一项没有全局设置项，菜单第一档写的是
+/// 「跟随内置规则」，它的下层就是出厂 compat.toml。写成清除会给出厂打开的宿主写一条 `unset`，
+/// 把内置规则整个去掉——与菜单文案相反。显式 `Some(false)` / `Some(true)` 才是用户的覆盖。
 pub fn set_user_ignore_host_ime_close(
     user_dir: &Path,
     process: &str,
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.ignore_host_ime_close = enabled)
+    let edit = match enabled {
+        Some(v) => set_value("ignore_host_ime_close", v),
+        None => FieldEdit::Inherit("ignore_host_ime_close".to_string()),
+    };
+    edit_user_apps(user_dir, process, &[edit])
 }
 
-/// 设置用户层 compat.toml 中指定进程的智能符号替换方案（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的智能符号替换方案（`None` = 清除）。
 pub fn set_user_smart_method(
     user_dir: &Path,
     process: &str,
     method: Option<SmartMethod>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.smart_method = method)
+    edit_user_apps(user_dir, process, &[set_or_clear("smart_method", method)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的光标坐标校正偏移（像素，正=右/下）。
@@ -1347,15 +1338,18 @@ pub fn set_user_caret_offset(
     dx: i32,
     dy: i32,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| {
-        r.caret_offset_x = dx;
-        r.caret_offset_y = dy;
-    })
+    edit_user_apps(
+        user_dir,
+        process,
+        &[
+            set_value("caret_offset_x", dx),
+            set_value("caret_offset_y", dy),
+        ],
+    )
 }
 
-/// 设置用户层 compat.toml 中指定进程的状态气泡定位：**方式与坐标一起写**（理由同
-/// [`set_user_candidate_fixed_pos`]：本字段不进 [`ProtocolFields`]，只写坐标会让用户层规则
-/// 整条盖掉出厂那档定位方式）。`None` = 清除（坐标一并清零）。
+/// 设置用户层 compat.toml 中指定进程的状态气泡定位：**方式与坐标一起写**。`None` = 清除
+/// （坐标一并清掉）；非 `fixed` 的方式不用坐标，也清掉，免得留一对孤儿坐标、下次开固定跳到老位置。
 ///
 /// ⚠ `fixed` 的坐标由调用方先做 `(0,0)` 哨兵规避（协调器的 `avoid_unset_sentinel`）。
 pub fn set_user_status_position(
@@ -1365,16 +1359,28 @@ pub fn set_user_status_position(
     x: i32,
     y: i32,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| apply_status_position(r, mode, x, y))
+    let mut edits = vec![set_or_clear("status_position_mode", mode)];
+    if mode == Some(StatusPositionMode::Fixed) {
+        edits.push(set_value("status_x", x));
+        edits.push(set_value("status_y", y));
+    } else {
+        edits.push(clear("status_x"));
+        edits.push(clear("status_y"));
+    }
+    edit_user_apps(user_dir, process, &edits)
 }
 
-/// 设置用户层 compat.toml 中指定进程的状态气泡兜底位置（`None` = 清除规则）。
+/// 设置用户层 compat.toml 中指定进程的状态气泡兜底位置（`None` = 清除）。
 pub fn set_user_status_fallback(
     user_dir: &Path,
     process: &str,
     fallback: Option<StatusFallback>,
 ) -> Result<(), std::io::Error> {
-    update_user_rule(user_dir, process, |r| r.status_fallback_position = fallback)
+    edit_user_apps(
+        user_dir,
+        process,
+        &[set_or_clear("status_fallback_position", fallback)],
+    )
 }
 
 /// 「初始模式作用域」规则：某进程的 per-app **初始模式**只在哪些**窗口类**上重算。
@@ -1396,10 +1402,9 @@ pub fn set_user_status_fallback(
 /// 反过来做白名单，两种失效同时消失——「不知道在哪」与「新出现的类」都自动落在作用域外，
 /// 也就是**保持现状**，而保持现状恰是这两种情况下唯一安全的答案。
 ///
-/// ⚠ **刻意独立成段，不做成 `[[apps]]` 的字段**：`merge_rules` 是「同名进程整条覆盖」
-/// 而非字段级合并，塞进 apps 的话，用户只要为 `explorer.exe` 写任何一条自己的规则
-/// （哪怕只调 `caret_offset`），内置的作用域清单就会整条消失、症状复发且极难查。
-/// 两段各自独立合并，互不牵连。同类前车之鉴见 project_dict_override_sparse_merge。
+/// 独立成段而不是 `[[apps]]` 的字段：它描述的是「规则在哪些窗口上生效」，是进程规则的
+/// 适用范围而不是又一个行为开关；分开写也让 `explorer.exe` 的作用域清单与它的 `[[apps]]`
+/// 行为规则各自叠加、互不牵连。
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct InitialModeScopeRule {
     /// 进程映像名（不区分大小写），如 `explorer.exe`。缺失或类型写错 ⇒ 本条作废（见 [`de_process`]）。
@@ -1413,6 +1418,14 @@ pub struct InitialModeScopeRule {
         skip_serializing_if = "String::is_empty"
     )]
     pub comment: String,
+    /// 用户层专用：禁用同名的系统规则（合并后该进程视为没有这条规则）。
+    /// 条目里的其它字段照常保留，去掉本标记即恢复到禁用前的状态。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub disabled: bool,
     /// 该进程下**允许重算初始模式**的顶层窗口类名（不区分大小写）。
     /// 空清单 = 该进程的初始模式规则在任何窗口上都不重算。
     #[serde(default)]
@@ -1423,22 +1436,12 @@ pub struct InitialModeScopeRule {
 ///
 /// **为什么独立成段而不是做成 `[[apps]]` 的字段**
 ///
-/// ⚠️ 先澄清一个**不成立**的理由，免得下一个维护者照着推理：本项并非「因为
-/// `merge_rules` 是整条覆盖所以只能独立成段」。`merge_rules` 有 [`ProtocolFields`] 这条
-/// 字段级继承通道，而且 `protocol_fields_cover_every_host_protocol_option` 那条扫源码的守门测试**强制**
-/// 新增的宿主协议级字段必须登记进去。按本仓的分类法，「Word 的文档存储段落边界是 CR」
-/// 是已确认的宿主行为形态、不是用户偏好 ⇒ `commit_newline` 确实够格做成 `[[apps]]` 字段
-/// 并登记 `ProtocolFields`，那是一条现成的、有守门测试保护的路。
+/// 与合并语义无关（所有段都是逐字段叠加，没有哪个字段享有特殊待遇），理由只有两条：
+/// 1. 本项与候选窗定位毫无关系，`AppCompatRule` 已有 20+ 字段，再塞一个文本项只会更难读；
+/// 2. 本项不参与右键菜单的写回，放进 `[[apps]]` 会让菜单路径的编辑面多一个不相干的字段。
 ///
-/// 真正的理由是三条与合并语义无关的事：
-/// 1. 本项的值域是**四态枚举**，而 `ProtocolFields` 那组处理的是 `Option<bool>` 三态；
-/// 2. 本项不参与右键菜单的写回（`update_user_rule` 只管 `[[apps]]`），塞进去会让
-///    `is_empty_override` 的「空壳规则」判定多一个要考虑的字段；
-/// 3. `AppCompatRule` 已有 20+ 字段，再加一个与候选窗定位毫无关系的文本项只会让它更难读。
-///
-/// ⚠️ **代价要记清楚**：独立成段绕开了 `protocol_fields_cover_every_host_protocol_option` 的守门测试，
-/// 同一个进程的配置也从此分散在两个 section。将来再加宿主协议级的 per-app 项时，
-/// 「开新段」与「加字段并登记」之间**没有判据**——那时该回到上面三条逐条对照。
+/// 代价：同一个进程的配置分散在两个 section。将来再加 per-app 项时，「开新段」与「加字段」
+/// 之间没有硬判据，按上面两条逐条对照。
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 pub struct CommitNewlineRule {
     /// 进程映像名（不区分大小写），如 `WINWORD.EXE`。类型写错 ⇒ 本条作废（见 [`de_process`]）。
@@ -1452,6 +1455,14 @@ pub struct CommitNewlineRule {
         skip_serializing_if = "String::is_empty"
     )]
     pub comment: String,
+    /// 用户层专用：禁用同名的系统规则（合并后该进程视为没有这条规则）。
+    /// 条目里的其它字段照常保留，去掉本标记即恢复到禁用前的状态。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub disabled: bool,
     /// 该应用上屏时换行用什么字符表达。**认不出的值退化为 `None`＝跟随全局**，
     /// 而不是让整份文件解析失败——理由见 [`de_newline_style`]。
     #[serde(default, deserialize_with = "de_newline_style")]
@@ -1478,7 +1489,8 @@ pub struct AppCompat {
 /// 它要遍历本结构体的每个字符串字段逐个投毒，而集成测试只看得见 pub API。
 /// ⛔ 不要因此把它当成对外类型：`compat.toml` 的读写入口仍只有 `load_file` /
 /// `render_user_compat`。
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[cfg(test)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub(crate) struct AppCompatFile {
     #[serde(default)]
     pub(crate) apps: Vec<AppCompatRule>,
@@ -1619,179 +1631,93 @@ impl AppCompat {
         )
     }
 
-    /// 三层显式加载，层序 `data < data_custom < user`，靠后者覆盖靠前者。
+    /// 三层显式加载，层序 `data < data_custom < user`：每一层都是相对下一层的差异，
+    /// 在**原始键值**上逐字段叠加（见 [`crate::compat_overlay`]），最后一次性变成运行时结构体。
+    ///
+    /// 三段（`[[apps]]` / `[[initial_mode_scope]]` / `[[commit_newline]]`）各自独立叠加，
+    /// 互不牵连：为某进程写 `[[apps]]` 规则不会让更低层给它配的作用域或换行规则消失。
     pub fn load_layered(
         data_dir: Option<&Path>,
         custom_dir: Option<&Path>,
         user_dir: Option<&Path>,
     ) -> Self {
-        let mut apps: Vec<AppCompatRule> = Vec::new();
-        let mut scope: Vec<InitialModeScopeRule> = Vec::new();
-        let mut newline: Vec<CommitNewlineRule> = Vec::new();
-        if let Some(d) = data_dir
-            && let Some(sys) = load_file(&d.join(COMPAT_FILE_NAME))
-        {
-            apps = sys.apps;
-            scope = sys.initial_mode_scope;
-            newline = sys.commit_newline;
+        let mut raw = Raw::default();
+        for dir in [data_dir, custom_dir, user_dir].into_iter().flatten() {
+            if let Some(layer) = load_raw(&dir.join(COMPAT_FILE_NAME)) {
+                raw = overlay_raw(raw, &sanitize_raw(&layer).0);
+            }
         }
-        // ⚠️ 两段**各自独立**合并（下同）：用户/定制者为某进程写 [[apps]] 规则不会连带
-        // 丢掉更低层给该进程配的 [[initial_mode_scope]]，反之亦然。合并语义相同
-        // （同名进程整条覆盖），但**刻意不合并成一段** —— 见 `merge_mode_scope` 的文档。
-        if let Some(c) = custom_dir
-            && let Some(custom) = load_file(&c.join(COMPAT_FILE_NAME))
-        {
-            apps = merge_rules(apps, custom.apps);
-            scope = merge_mode_scope(scope, custom.initial_mode_scope);
-            newline = merge_commit_newline(newline, custom.commit_newline);
-        }
-        if let Some(u) = user_dir
-            && let Some(user) = load_file(&u.join(COMPAT_FILE_NAME))
-        {
-            apps = merge_rules(apps, user.apps);
-            scope = merge_mode_scope(scope, user.initial_mode_scope);
-            newline = merge_commit_newline(newline, user.commit_newline);
-        }
-        Self::from_parts(apps, scope).with_commit_newline(newline)
+        Self::from_raw(&raw)
+    }
+
+    /// 测试用：把一份 compat.toml 文本当作**唯一一层**，走与生产 `load_layered` 完全相同的路径
+    /// （解析 → 清理 → 叠加 → 反序列化）。容错类测试必须走它而不是直接反序列化结构体，
+    /// 否则测的不是生产路径。
+    #[cfg(test)]
+    pub(crate) fn from_single_layer_text(text: &str) -> Self {
+        let raw = parse_raw(text).expect("测试夹具必须是合法 TOML");
+        Self::from_raw(&overlay_raw(Raw::default(), &sanitize_raw(&raw).0))
+    }
+
+    /// 叠加好的原始键值 → 运行时表（跳过禁用行、逐行容错反序列化）。
+    pub(crate) fn from_raw(raw: &Raw) -> Self {
+        // 没有 `classes` 的作用域规则没有意义，直接作废：反序列化会把它变成空清单，而空清单的含义
+        // 是「该进程的初始模式在任何窗口上都不重算」——写错 / 漏写一个字段不能静默变成「全挡」。
+        // （想全挡要显式写 `classes = []`。）
+        let scopes: Vec<_> = raw
+            .initial_mode_scope
+            .iter()
+            .filter(|r| r.contains_key("classes"))
+            .cloned()
+            .collect();
+        Self::from_parts(
+            materialize::<AppCompatRule>(&raw.apps),
+            materialize::<InitialModeScopeRule>(&scopes),
+        )
+        .with_commit_newline(materialize::<CommitNewlineRule>(&raw.commit_newline))
     }
 }
 
-/// 解析单个 compat.toml；文件不存在或解析失败返回 None。
-fn load_file(path: &Path) -> Option<AppCompatFile> {
-    let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str::<AppCompatFile>(&text).ok()
+/// 一层原始键值参与叠加之前的清理：无效的值当成「没写」剔掉（返回清理后的副本与每处剔除的说明）。
+///
+/// 必须在叠加**之前**做：错值若先参与叠加、事后才被容错回落成 `None`，会把下层的好值一起盖没。
+pub(crate) fn sanitize_raw(raw: &Raw) -> (Raw, Vec<String>) {
+    let (apps, mut report) = sanitize::<AppCompatRule>("apps", &raw.apps);
+    let (initial_mode_scope, r2) =
+        sanitize::<InitialModeScopeRule>("initial_mode_scope", &raw.initial_mode_scope);
+    let (commit_newline, r3) = sanitize::<CommitNewlineRule>("commit_newline", &raw.commit_newline);
+    report.extend(r2);
+    report.extend(r3);
+    (
+        Raw {
+            apps,
+            initial_mode_scope,
+            commit_newline,
+            ..Default::default()
+        },
+        report,
+    )
 }
 
-/// 合并两组规则：user 中同名进程（不区分大小写）覆盖 base，其余 base 规则保留，
-/// 末尾追加全部 user 规则（与 Go `mergeCompatRules` 对齐）。
-///
-/// 「宿主协议级」字段组：描述已确认的宿主 TSF 行为形态，与用户偏好无关。
-///
-/// 这些字段在 [`merge_rules`] 里享有**字段级继承**：后层同名进程的稀疏规则未写它们时，
-/// 从低层继承而不是被 `None` 整条覆盖。理由见 `merge_rules` 的文档。
-///
-/// ⚠ 新增此类字段时**必须同时在这里登记**，否则用户层已有的同名规则会把它整条吞掉——
-/// 表现是「日志里 matched=true 但开关恒为 false」，修复看似部署了实际从未生效。
-struct ProtocolFields {
-    composition_start_pair_guard: Option<bool>,
-    pin_anchor_when_start_drifts: Option<bool>,
-    /// 「这个宿主会自作主张关 IME」是已确认的宿主行为形态（WinForms `ImeMode.Disable` /
-    /// WPF `IsInputMethodEnabled=False`），不是用户偏好 ⇒ 属于本组。出厂给某个已知宿主
-    /// 配上之后，用户层若已有该进程的稀疏规则（比如只配过 `initial_mode`），不登记就会
-    /// 把出厂值整条吞掉——`pin_anchor_when_start_drifts` 2026-09-05 正是这么白测一轮的。
-    ignore_host_ime_close: Option<bool>,
-    /// 「这个宿主自己画候选」是宿主 TSF 行为形态，不是用户偏好 ⇒ 属于本组。
-    host_drawn_candidates: Option<bool>,
-}
-
-impl ProtocolFields {
-    fn of(rule: &AppCompatRule) -> Self {
-        Self {
-            composition_start_pair_guard: rule.composition_start_pair_guard,
-            pin_anchor_when_start_drifts: rule.pin_anchor_when_start_drifts,
-            ignore_host_ime_close: rule.ignore_host_ime_close,
-            host_drawn_candidates: rule.host_drawn_candidates,
+/// 读一层 compat.toml 的原始键值；文件不存在返回 `None`（不告警），读取 / 解析失败也返回
+/// `None` 但**留 WARN**：整份跳过意味着这一层所有规则一起失效，必须在日志里留下痕迹。
+pub(crate) fn load_raw(path: &Path) -> Option<Raw> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("compat.toml 读取失败，整份跳过: {}: {e}", path.display());
+            }
+            return None;
+        }
+    };
+    match parse_raw(&text) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!("compat.toml 解析失败，整份跳过: {}: {e}", path.display());
+            None
         }
     }
-
-    /// 把本组字段填进 `rule` 中仍为 `None` 的位置（显式 `Some(false)` 不被覆盖）。
-    fn inherit_into(&self, rule: &mut AppCompatRule) {
-        if rule.composition_start_pair_guard.is_none() {
-            rule.composition_start_pair_guard = self.composition_start_pair_guard;
-        }
-        if rule.pin_anchor_when_start_drifts.is_none() {
-            rule.pin_anchor_when_start_drifts = self.pin_anchor_when_start_drifts;
-        }
-        if rule.ignore_host_ime_close.is_none() {
-            rule.ignore_host_ime_close = self.ignore_host_ime_close;
-        }
-        if rule.host_drawn_candidates.is_none() {
-            rule.host_drawn_candidates = self.host_drawn_candidates;
-        }
-    }
-}
-
-/// 字段级例外是一**组**「宿主协议级」字段（见 [`ProtocolFields`]）：它们描述已确认的
-/// 宿主 TSF 行为形态，不是用户偏好，后层稀疏规则未写时应继承低层；显式 `false` 仍可关闭。
-/// 若照其它字段用 `Default::default()` 的 `false` 整条覆盖，用户曾经从菜单写过的稀疏
-/// 规则会让新版出厂修复**永远无法生效**。
-///
-/// ⚠ 2026-09-05 实证：新增 `pin_anchor_when_start_drifts` 时只加了字段没加进本组，
-/// 用户层已有的 `wps.exe` / `winword.exe` 规则整条覆盖，日志里读到的恒是 `false`，
-/// 修复看起来部署了、实际从未生效，白测了一轮。
-/// ⇒ **新增任何「宿主协议级」字段，必须同时加进 [`ProtocolFields`]**，
-/// 元测试 `protocol_fields_cover_every_host_protocol_option` 会守住这条。
-fn merge_rules(base: Vec<AppCompatRule>, mut user: Vec<AppCompatRule>) -> Vec<AppCompatRule> {
-    if user.is_empty() {
-        return base;
-    }
-    let inherited: HashMap<String, ProtocolFields> = base
-        .iter()
-        .map(|r| (r.process.to_ascii_lowercase(), ProtocolFields::of(r)))
-        .collect();
-    for rule in &mut user {
-        if let Some(base_fields) = inherited.get(&rule.process.to_ascii_lowercase()) {
-            base_fields.inherit_into(rule);
-        }
-    }
-    let user_keys: std::collections::HashSet<String> = user
-        .iter()
-        .map(|r| r.process.to_ascii_lowercase())
-        .collect();
-    let mut merged: Vec<AppCompatRule> = base
-        .into_iter()
-        .filter(|r| !user_keys.contains(&r.process.to_ascii_lowercase()))
-        .collect();
-    merged.extend(user);
-    merged
-}
-
-/// 合并两组初始模式作用域规则：语义与 [`merge_rules`] 完全一致（同名进程整条覆盖）。
-///
-/// 「整条覆盖」意味着用户想在内置清单上**增删一项**时要把整份 `classes` 抄一遍。
-/// 这是刻意与 `[[apps]]` 保持一致——两段用两套合并语义会更难解释，而系统层
-/// `data/compat.toml` 里已把内置值完整列出，抄一遍的成本很低。
-fn merge_mode_scope(
-    base: Vec<InitialModeScopeRule>,
-    user: Vec<InitialModeScopeRule>,
-) -> Vec<InitialModeScopeRule> {
-    if user.is_empty() {
-        return base;
-    }
-    let user_keys: std::collections::HashSet<String> = user
-        .iter()
-        .map(|r| r.process.to_ascii_lowercase())
-        .collect();
-    let mut merged: Vec<InitialModeScopeRule> = base
-        .into_iter()
-        .filter(|r| !user_keys.contains(&r.process.to_ascii_lowercase()))
-        .collect();
-    merged.extend(user);
-    merged
-}
-
-/// 合并两组上屏换行规则：结构上同 [`merge_mode_scope`]——同名进程整条覆盖，没有
-/// [`merge_rules`] 那套 [`ProtocolFields`] 字段级继承。
-///
-/// 本段每条只有一个有效字段（`style`），所以「整条覆盖」与「字段级合并」在这里恰好
-/// 同结果；保持与另外两段一致的语义，是为了不给用户第三套心智模型。
-fn merge_commit_newline(
-    base: Vec<CommitNewlineRule>,
-    user: Vec<CommitNewlineRule>,
-) -> Vec<CommitNewlineRule> {
-    if user.is_empty() {
-        return base;
-    }
-    let user_keys: std::collections::HashSet<String> = user
-        .iter()
-        .map(|r| r.process.to_ascii_lowercase())
-        .collect();
-    let mut merged: Vec<CommitNewlineRule> = base
-        .into_iter()
-        .filter(|r| !user_keys.contains(&r.process.to_ascii_lowercase()))
-        .collect();
-    merged.extend(user);
-    merged
 }
 
 #[cfg(test)]
@@ -1802,6 +1728,7 @@ mod commit_newline_rule_tests {
         CommitNewlineRule {
             process: process.into(),
             comment: String::new(),
+            disabled: false,
             style: Some(style),
         }
     }
@@ -1825,133 +1752,6 @@ mod commit_newline_rule_tests {
         let c =
             AppCompat::default().with_commit_newline(vec![rule("winword.exe", NewlineStyle::Cr)]);
         assert_eq!(c.commit_newline_for("WINWORD.EXE"), Some(NewlineStyle::Cr));
-    }
-
-    /// 两段互不牵连：用户为某进程写 `[[apps]]` 规则，不会把出厂给同一进程配的
-    /// `[[commit_newline]]` 一起顶掉。
-    ///
-    /// ⚠️ 这条**不是**「必须独立成段」的证据——做成 `[[apps]]` 字段并登记进
-    /// `ProtocolFields` 的话它照样绿（那组字段享有字段级继承）。它钉的只是当前实现的
-    /// 合并行为本身。选择独立成段的真实理由见 [`CommitNewlineRule`] 的文档。
-    #[test]
-    fn user_apps_override_does_not_drop_commit_newline() {
-        let sys_newline = vec![rule("WINWORD.EXE", NewlineStyle::Cr)];
-        let user_apps = vec![AppCompatRule {
-            process: "WINWORD.EXE".into(),
-            caret_offset_y: 3,
-            ..Default::default()
-        }];
-        let merged = AppCompat::from_parts(merge_rules(Vec::new(), user_apps), Vec::new())
-            .with_commit_newline(merge_commit_newline(sys_newline, Vec::new()));
-        assert_eq!(
-            merged.commit_newline_for("winword.exe"),
-            Some(NewlineStyle::Cr),
-            "用户只调了 caret_offset，出厂的换行设置必须还在"
-        );
-    }
-
-    /// 反方向同样成立：用户配换行，不能把出厂给该进程的 `[[apps]]` 修正顶掉。
-    #[test]
-    fn user_commit_newline_does_not_drop_apps_rule() {
-        let sys_apps = vec![AppCompatRule {
-            process: "WINWORD.EXE".into(),
-            caret_offset_y: 3,
-            ..Default::default()
-        }];
-        let merged = AppCompat::from_parts(merge_rules(sys_apps, Vec::new()), Vec::new())
-            .with_commit_newline(merge_commit_newline(
-                Vec::new(),
-                vec![rule("WINWORD.EXE", NewlineStyle::Crlf)],
-            ));
-        assert_eq!(
-            merged.get_rule("winword.exe").map(|r| r.caret_offset_y),
-            Some(3),
-            "用户只配了换行，出厂的 caret 修正必须还在"
-        );
-        assert_eq!(
-            merged.commit_newline_for("winword.exe"),
-            Some(NewlineStyle::Crlf)
-        );
-    }
-
-    /// 同名进程整条覆盖，语义与另外两段一致。
-    #[test]
-    fn user_layer_overrides_same_process() {
-        let merged = merge_commit_newline(
-            vec![
-                rule("WINWORD.EXE", NewlineStyle::Cr),
-                rule("Code.exe", NewlineStyle::Keep),
-            ],
-            vec![rule("winword.exe", NewlineStyle::Crlf)],
-        );
-        let c = AppCompat::default().with_commit_newline(merged);
-        assert_eq!(
-            c.commit_newline_for("WINWORD.EXE"),
-            Some(NewlineStyle::Crlf),
-            "用户层应覆盖系统层"
-        );
-        assert_eq!(
-            c.commit_newline_for("Code.exe"),
-            Some(NewlineStyle::Keep),
-            "没被用户提到的进程不受影响"
-        );
-    }
-
-    /// ★★★ 写回是**整份重写**：用户手写的 `[[commit_newline]]` 必须原样回到文件里。
-    ///
-    /// 漏掉这一段的症状是「配了一次，开关一下菜单就没了」，现场与写回路径隔着一次重启。
-    #[test]
-    fn write_back_preserves_commit_newline_section() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_nl_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(COMPAT_FILE_NAME),
-            "[[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n",
-        )
-        .unwrap();
-
-        // 菜单改的是 [[apps]]，不该碰另一段。
-        set_user_first_show_mode(&dir, "et.exe", Some(FirstShowMode::Wait)).unwrap();
-
-        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(
-            text.contains("commit_newline") && text.contains("WINWORD.EXE"),
-            "菜单开关一次就把用户写的 [[commit_newline]] 抹掉了：\n{text}"
-        );
-        let reloaded = AppCompat::load_layered(None, None, Some(&dir));
-        assert_eq!(
-            reloaded.commit_newline_for("winword.exe"),
-            Some(NewlineStyle::Cr)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 守随发布的 `data/compat.toml` 里的 `[[commit_newline]]` 段。
-    ///
-    /// 必要性同 `shipped_system_compat_parses_and_scopes_explorer_to_desktop`：段名或值域串
-    /// 写错不会报错，只会**静默地什么都不做**——Word 里的换行照旧不对，而配置文件看上去
-    /// 完全正常。这条测试是那种缺陷唯一的早期信号。
-    #[test]
-    fn shipped_system_compat_configures_word() {
-        let data_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data"));
-        let file = load_file(&data_dir.join(COMPAT_FILE_NAME))
-            .expect("随发布的 data/compat.toml 必须能解析");
-        let c = AppCompat::from_parts(file.apps, file.initial_mode_scope)
-            .with_commit_newline(file.commit_newline);
-
-        assert_eq!(
-            c.commit_newline_for("winword.exe"),
-            Some(NewlineStyle::Cr),
-            "Word 的文档存储段落边界是 CR，出厂必须给它配上（2026-08-23 真机实测）"
-        );
-        // ⚠ 同一次实测说的是「记事本与 WPS 文字正常分段」——按「富文本模型」推理很容易
-        // 想当然地把 wps.exe 也加进来，实测恰恰相反。这条断言钉住那个反直觉的事实。
-        assert_eq!(
-            c.commit_newline_for("wps.exe"),
-            None,
-            "WPS 文字实测用 LF 正常分段，不该出现在出厂名单里"
-        );
     }
 
     /// ★★★ 拼错的 `style` 不得让整份 compat.toml 失效。
@@ -1990,20 +1790,6 @@ mod commit_newline_rule_tests {
         // 认不出/没写的条目进不了查找表，等于这条规则不存在。
         let c = AppCompat::default().with_commit_newline(file.commit_newline);
         assert_eq!(c.commit_newline_for("bar.exe"), None);
-    }
-
-    /// TOML 往返：值域用 snake_case 字符串，和别的枚举一致。
-    #[test]
-    fn toml_roundtrip_uses_config_strings() {
-        let text = render_user_compat(&[], &[], &[rule("WINWORD.EXE", NewlineStyle::Crlf)])
-            .expect("渲染失败");
-        assert!(
-            text.contains("style = \"crlf\""),
-            "应写成配置串而非枚举名：\n{text}"
-        );
-        let parsed: AppCompatFile = toml::from_str(&text).expect("回读失败");
-        assert_eq!(parsed.commit_newline.len(), 1);
-        assert_eq!(parsed.commit_newline[0].style, Some(NewlineStyle::Crlf));
     }
 }
 
@@ -2131,84 +1917,6 @@ mod newline_style_tests {
 mod tests {
     use super::*;
 
-    /// ★★★「跟随全局」必须真的等于「这条规则不存在」。
-    ///
-    /// 菜单把某项改回跟随全局后若留下空壳条目（只剩 `process`），合并语义「同名进程整条
-    /// 覆盖系统层」会让它把系统层出厂规则**连同以后新增的**一起屏蔽掉。实测：出厂给
-    /// et.exe（WPS 表格）配了 `first_show_mode = "wait"`，用户层残留的空壳让它读出来仍是
-    /// 「跟随全局」，用户只能手动再配一次才生效，且完全看不出为什么。
-    #[test]
-    fn clearing_the_last_field_removes_the_rule_entirely() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_empty_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        set_user_first_show_mode(&dir, "et.exe", Some(FirstShowMode::Wait)).unwrap();
-        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(text.contains("et.exe"), "配上时应写入该规则");
-
-        set_user_first_show_mode(&dir, "et.exe", None).unwrap();
-        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(
-            !text.contains("et.exe"),
-            "改回跟随全局后整条规则必须消失——留下空壳会静默屏蔽系统层的出厂规则"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 拖动落盘必须把定位方式一起写，否则用户层规则会整条盖掉出厂的
-    /// `candidate_position_mode`——候选窗当场变回跟随光标，只留下一对孤儿坐标。
-    ///
-    /// ★ 与 `ignore_host_ime_close` 的修法**刻意不同**：那个登记进 `ProtocolFields` 走字段级
-    /// 继承（它是宿主协议事实），这个是用户偏好，让继承接管会使菜单的「跟随全局」档失效
-    /// （点了之后仍被出厂值顶回来）。同一个症状、两个字段、两种正确修法。
-    #[test]
-    fn dragging_persists_position_mode_together_with_coords() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_drag_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        set_user_candidate_fixed_pos(&dir, "X60_Toolbox.exe", 320, 480).unwrap();
-        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(
-            text.contains(r#"candidate_position_mode = "fixed""#),
-            "只写坐标会让出厂的 fixed 被整条覆盖掉：\n{text}"
-        );
-
-        // 系统层出厂 fixed + 用户层拖动结果 ⇒ 合并后仍是 fixed，且用的是用户拖的坐标。
-        let sys = vec![AppCompatRule {
-            process: "X60_Toolbox.exe".into(),
-            candidate_position_mode: Some(CandidatePositionMode::Fixed),
-            ..Default::default()
-        }];
-        let user: AppCompatFile = toml::from_str(&text).unwrap();
-        let merged = AppCompat::from_rules(merge_rules(sys, user.apps));
-        let rule = merged.get_rule("x60_toolbox.exe").unwrap();
-        assert_eq!(
-            rule.candidate_position_mode,
-            Some(CandidatePositionMode::Fixed)
-        );
-        assert_eq!((rule.candidate_x, rule.candidate_y), (320, 480));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 反向：还在覆盖别的字段时，整条规则不得被当成空壳删掉——那会让用户配的另一项
-    /// 静默消失，现场与写回路径隔着一次重启，极难归因。
-    #[test]
-    fn clearing_one_field_keeps_a_rule_that_still_overrides_something() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_keep_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        set_user_auto_pair(&dir, "excel.exe", Some(false)).unwrap();
-        set_user_first_show_mode(&dir, "excel.exe", Some(FirstShowMode::Wait)).unwrap();
-        set_user_first_show_mode(&dir, "excel.exe", None).unwrap();
-        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(
-            text.contains("excel.exe") && text.contains("auto_pair"),
-            "auto_pair 仍在覆盖，整条规则不能删：\n{text}"
-        );
-        assert!(
-            !text.contains("first_show_mode"),
-            "被清掉的那一项本身要消失"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// 三个新增 per-app 字段的解析。`auto_pair` / `smart_method` 是 `Option`，
     /// **未配置必须是 `None` 而不是 `Some(false)`/`Some(默认值)`**——那是「跟随全局」
     /// 与「显式关掉」的分界，退化成 bool 就等于给所有未配规则的应用都关掉了功能。
@@ -2324,49 +2032,6 @@ mod tests {
         }
     }
 
-    /// 写回稀疏：显式值落盘，清除后整键消失（而不是写成 `= true`）。
-    #[test]
-    fn password_force_english_writeback_is_sparse() {
-        let mut rules = Vec::new();
-        set_password_force_english(&mut rules, "Misreport.exe", Some(false));
-        let out = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(out.contains("password_force_english = false"), "{out}");
-
-        set_password_force_english(&mut rules, "MISREPORT.EXE", Some(true));
-        assert_eq!(rules.len(), 1, "进程名不区分大小写，应改同一条");
-        assert_eq!(rules[0].password_force_english, Some(true));
-
-        set_password_force_english(&mut rules, "misreport.exe", None);
-        let cleared = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(
-            !cleared.contains("password_force_english"),
-            "清除后不应残留该键: {cleared}"
-        );
-    }
-
-    /// 落盘包装往返：写入后 `AppCompat::load` 读得回；清回「跟随全局」后空壳规则被剔除。
-    #[test]
-    fn set_user_password_force_english_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_pfe_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        set_user_password_force_english(&dir, "misreport.exe", Some(false)).unwrap();
-        let compat = AppCompat::load(None, Some(&dir));
-        assert_eq!(
-            compat
-                .get_rule("misreport.exe")
-                .and_then(|r| r.password_force_english),
-            Some(false)
-        );
-
-        set_user_password_force_english(&dir, "misreport.exe", None).unwrap();
-        let compat = AppCompat::load(None, Some(&dir));
-        assert!(
-            compat.get_rule("misreport.exe").is_none(),
-            "只剩 process 的空壳规则应被剔除"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     // ── 状态气泡定位（C2-33 / GH#148）────────────────────────────────────────────
 
     /// 两个值域表与解析/回写同源：表里每一项都能解析、且回写成同一个串。
@@ -2445,77 +2110,6 @@ mod tests {
         }
     }
 
-    /// 方式与坐标同层写：固定写坐标；改成别的方式或清除时坐标归零（不留孤儿坐标）。
-    #[test]
-    fn status_position_writes_mode_and_coords_together() {
-        let mut rules = Vec::new();
-        set_status_position(
-            &mut rules,
-            "a.exe",
-            Some(StatusPositionMode::Fixed),
-            300,
-            200,
-        );
-        let out = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(out.contains(r#"status_position_mode = "fixed""#), "{out}");
-        assert!(
-            out.contains("status_x = 300") && out.contains("status_y = 200"),
-            "{out}"
-        );
-
-        let anchor = StatusPositionMode::Anchor(StatusAnchor::ScreenBottomRight);
-        set_status_position(&mut rules, "A.EXE", Some(anchor), 999, 999);
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].status_position_mode, Some(anchor));
-        assert_eq!((rules[0].status_x, rules[0].status_y), (0, 0));
-        let out = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(
-            out.contains(r#"status_position_mode = "screen_bottom_right""#),
-            "{out}"
-        );
-
-        set_status_fallback(&mut rules, "a.exe", Some(StatusFallback::Hide));
-        set_status_position(&mut rules, "a.exe", None, 1, 1);
-        let out = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(!out.contains("status_position_mode"), "{out}");
-        assert!(!out.contains("status_x"), "{out}");
-        assert!(
-            out.contains(r#"status_fallback_position = "hide""#),
-            "{out}"
-        );
-    }
-
-    /// 落盘包装往返：写入后读得回；两项都清回跟随全局后空壳规则被剔除。
-    #[test]
-    fn set_user_status_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_status_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        set_user_status_position(&dir, "ai.exe", Some(StatusPositionMode::Fixed), 10, 20).unwrap();
-        set_user_status_fallback(
-            &dir,
-            "ai.exe",
-            Some(StatusFallback::Anchor(StatusAnchor::WindowCenter)),
-        )
-        .unwrap();
-        let c = AppCompat::load(None, Some(&dir));
-        let r = c.get_rule("ai.exe").unwrap();
-        assert_eq!(r.status_position_mode, Some(StatusPositionMode::Fixed));
-        assert_eq!((r.status_x, r.status_y), (10, 20));
-        assert_eq!(
-            r.status_fallback_position,
-            Some(StatusFallback::Anchor(StatusAnchor::WindowCenter))
-        );
-
-        set_user_status_position(&dir, "ai.exe", None, 0, 0).unwrap();
-        set_user_status_fallback(&dir, "ai.exe", None).unwrap();
-        let c = AppCompat::load(None, Some(&dir));
-        assert!(
-            c.get_rule("ai.exe").is_none(),
-            "只剩 process 的空壳规则应被剔除"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// 最初的现场：`auto_pair = "yes"` 曾让整份 compat.toml 静默失效。
     #[test]
     fn auto_pair_wrong_type_does_not_sink_the_file() {
@@ -2554,7 +2148,7 @@ mod tests {
     }
 
     fn parse_rules(toml: &str) -> AppCompat {
-        AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps)
+        AppCompat::from_single_layer_text(toml)
     }
 
     /// `schema` 三态：未配 = 跟随全局；具体 id = 固定；`@remember` = 记住上次。
@@ -2645,62 +2239,6 @@ mod tests {
         }
     }
 
-    /// 写回稀疏 + 落盘往返：显式值落盘，清回「跟随全局」后整键消失、空壳规则剔除。
-    #[test]
-    fn set_user_app_schema_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("wind_compat_schema_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        set_user_schema(&dir, "Weixin.exe", Some(APP_SCHEMA_REMEMBER.to_string())).unwrap();
-        let compat = AppCompat::load(None, Some(&dir));
-        assert_eq!(
-            compat.get_rule("weixin.exe").unwrap().app_schema(),
-            Some(AppSchema::Remember)
-        );
-
-        set_user_schema(&dir, "WEIXIN.EXE", Some("wubi86".to_string())).unwrap();
-        let compat = AppCompat::load(None, Some(&dir));
-        assert_eq!(
-            compat.get_rule("weixin.exe").unwrap().app_schema(),
-            Some(AppSchema::Fixed("wubi86"))
-        );
-
-        set_user_schema(&dir, "weixin.exe", None).unwrap();
-        let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(!text.contains("schema"), "清除后不应残留该键: {text}");
-        let compat = AppCompat::load(None, Some(&dir));
-        assert!(compat.get_rule("weixin.exe").is_none(), "空壳规则应被剔除");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 写回只落被触碰的字段，且 `None`/0 不进 TOML（`skip_serializing_if`）——
-    /// 否则用户层会把「未配置」冻结成显式值，日后改全局默认对老用户静默失效。
-    #[test]
-    fn per_app_writeback_is_sparse() {
-        let mut rules = Vec::new();
-        set_auto_pair(&mut rules, "EXCEL.EXE", Some(false));
-        set_caret_offset(&mut rules, "WindowsTerminal.exe", 0, -4);
-
-        let out = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(out.contains("auto_pair = false"));
-        assert!(out.contains("caret_offset_y = -4"));
-        // dx 为 0：不落盘。
-        assert!(
-            !out.contains("caret_offset_x"),
-            "0 偏移不应写进 TOML: {out}"
-        );
-        // 没碰过的字段一律不出现。
-        assert!(!out.contains("smart_method"), "未触碰字段不应落盘: {out}");
-        assert!(!out.contains("caret_use_top"), "未触碰字段不应落盘: {out}");
-
-        // 清除规则（回到跟随全局）后该字段整个消失，而不是写成 auto_pair = true。
-        set_auto_pair(&mut rules, "EXCEL.EXE", None);
-        let cleared = render_user_compat(&rules, &[], &[]).unwrap();
-        assert!(
-            !cleared.contains("auto_pair"),
-            "清除后不应残留该键: {cleared}"
-        );
-    }
-
     #[test]
     fn parse_apps_array_and_lookup_case_insensitive() {
         let toml = r#"
@@ -2787,237 +2325,6 @@ mod tests {
     }
 
     #[test]
-    fn user_rules_override_system_by_process_name() {
-        let base = vec![AppCompatRule {
-            process: "Weixin.exe".into(),
-            caret_use_top: true,
-            ..Default::default()
-        }];
-        let user = vec![AppCompatRule {
-            process: "weixin.exe".into(), // 大小写不同仍视为同进程
-            caret_use_top: false,
-            ..Default::default()
-        }];
-        let merged = AppCompat::from_rules(merge_rules(base, user));
-        // 用户层关闭了 caret_use_top，应覆盖系统层。
-        assert!(!merged.get_rule("Weixin.exe").unwrap().caret_use_top);
-        // 合并后只剩一条（同进程去重）。
-        assert_eq!(merged.apps.len(), 1);
-    }
-
-    /// ★★★ 守 [`ProtocolFields`] 的覆盖率：新增「宿主协议级」字段忘了登记，用户层已有的
-    /// 同名规则会把它整条吞掉——表现是「日志里 matched=true 但开关恒为 false」，修复看似
-    /// 部署了实际从未生效。
-    ///
-    /// 2026-09-05 真踩过一次：`pin_anchor_when_start_drifts` 只加了字段没进本组，用户层
-    /// 已有 `wps.exe` / `winword.exe` 规则，白测了一轮才从日志发现开关恒为 false。
-    ///
-    /// 判据取自源码而非类型系统：Rust 没有字段反射，而这类「漏一个」正是本测试要防的。
-    #[test]
-    fn protocol_fields_cover_every_host_protocol_option() {
-        let src = include_str!("app_compat.rs");
-
-        // `ProtocolFields` 结构体里登记了哪些字段
-        let start = src
-            .find("struct ProtocolFields {")
-            .expect("找不到 ProtocolFields 定义");
-        let body = &src[start..];
-        let end = body
-            .find(
-                "
-}",
-            )
-            .expect("找不到 ProtocolFields 结尾");
-        let registered: Vec<&str> = body[..end]
-            .lines()
-            .filter_map(|l| l.trim().split_once(": Option<bool>,").map(|(n, _)| n))
-            .collect();
-
-        // 每个登记字段都必须在 inherit_into 里真正被继承——只登记不继承等于没登记
-        let inherit = {
-            let s = src.find("fn inherit_into(").expect("找不到 inherit_into");
-            let rest = &src[s..];
-            let e = rest
-                .find(
-                    "
-    }",
-                )
-                .expect("找不到 inherit_into 结尾");
-            &rest[..e]
-        };
-        for f in &registered {
-            assert!(
-                inherit.contains(&format!("rule.{f}.is_none()")),
-                "字段 {f} 登记进了 ProtocolFields 却没在 inherit_into 里继承"
-            );
-        }
-
-        // 本组当前应覆盖的字段。新增宿主协议级字段时**两处一起改**：
-        // 加进 ProtocolFields，并在此列出。纯用户偏好字段（first_show_mode / auto_pair 等）
-        // 不属于本组——它们本就该被用户层整条覆盖。
-        const HOST_PROTOCOL_FIELDS: &[&str] = &[
-            "composition_start_pair_guard",
-            "pin_anchor_when_start_drifts",
-            "ignore_host_ime_close",
-            "host_drawn_candidates",
-        ];
-        for f in HOST_PROTOCOL_FIELDS {
-            assert!(
-                registered.contains(f),
-                "宿主协议级字段 {f} 没有登记进 ProtocolFields——用户层同名规则会把它整条吞掉，修复将永远无法生效"
-            );
-        }
-    }
-
-    /// 用户层的稀疏规则不得吞掉系统层新增的宿主协议修正。
-    ///
-    /// 复现 2026-09-05 的实际形态：用户层通过菜单写过 `wps.exe` 的 first_show_mode，
-    /// 系统层随后新增 `pin_anchor_when_start_drifts = true`。
-    #[test]
-    fn a_sparse_user_rule_inherits_newly_shipped_protocol_fixes() {
-        let base = vec![AppCompatRule {
-            process: "wps.exe".into(),
-            pin_anchor_when_start_drifts: Some(true),
-            composition_start_pair_guard: Some(true),
-            ..Default::default()
-        }];
-        // 用户层只写了偏好字段，两个协议字段都没提
-        let user = vec![AppCompatRule {
-            process: "wps.exe".into(),
-            first_show_mode: Some(FirstShowMode::Wait),
-            ..Default::default()
-        }];
-
-        let merged = merge_rules(base, user);
-        let rule = merged
-            .iter()
-            .find(|r| r.process.eq_ignore_ascii_case("wps.exe"))
-            .expect("合并后应保留 wps.exe 规则");
-
-        assert_eq!(
-            rule.pin_anchor_when_start_drifts,
-            Some(true),
-            "用户层稀疏规则未写该字段时必须继承系统层——否则新版修复对老用户永远不生效"
-        );
-        assert_eq!(rule.composition_start_pair_guard, Some(true));
-        assert_eq!(
-            rule.first_show_mode,
-            Some(FirstShowMode::Wait),
-            "用户偏好照常生效"
-        );
-    }
-
-    /// 显式 `false` 仍然是逃生口——继承只填 `None`，不覆盖用户的明确关闭。
-    #[test]
-    fn an_explicit_false_still_disables_an_inherited_protocol_fix() {
-        let base = vec![AppCompatRule {
-            process: "wps.exe".into(),
-            pin_anchor_when_start_drifts: Some(true),
-            ..Default::default()
-        }];
-        let user = vec![AppCompatRule {
-            process: "wps.exe".into(),
-            pin_anchor_when_start_drifts: Some(false),
-            ..Default::default()
-        }];
-
-        let merged = merge_rules(base, user);
-        let rule = merged
-            .iter()
-            .find(|r| r.process.eq_ignore_ascii_case("wps.exe"))
-            .expect("合并后应保留 wps.exe 规则");
-        assert_eq!(
-            rule.pin_anchor_when_start_drifts,
-            Some(false),
-            "显式关闭必须被尊重，否则用户无法撤销一条不适合自己的宿主修正"
-        );
-    }
-
-    /// `composition_start_pair_guard` 是已确认的宿主协议修正，不能因为用户
-    /// 曾经从菜单给同一应用写了另一个字段，就被稀疏规则的缺省值静默抹掉。
-    /// 同时保留显式 `false` 逃生口，新版宿主行为改变时不必改代码才能关闭。
-    #[test]
-    fn protocol_guard_inherits_through_sparse_override_but_false_can_disable_it() {
-        let base_rule = AppCompatRule {
-            process: "QQ.exe".into(),
-            composition_start_pair_guard: Some(true),
-            ..Default::default()
-        };
-        let sparse_user = AppCompatRule {
-            process: "qq.exe".into(),
-            first_show_mode: Some(FirstShowMode::Wait),
-            ..Default::default()
-        };
-        let merged = AppCompat::from_rules(merge_rules(vec![base_rule.clone()], vec![sparse_user]));
-        let inherited = merged.get_rule("QQ.exe").unwrap();
-        assert_eq!(inherited.composition_start_pair_guard, Some(true));
-        assert_eq!(inherited.first_show_mode, Some(FirstShowMode::Wait));
-
-        let explicit_off = AppCompatRule {
-            process: "qq.exe".into(),
-            composition_start_pair_guard: Some(false),
-            ..Default::default()
-        };
-        let merged = AppCompat::from_rules(merge_rules(vec![base_rule], vec![explicit_off]));
-        assert_eq!(
-            merged
-                .get_rule("QQ.exe")
-                .unwrap()
-                .composition_start_pair_guard,
-            Some(false),
-            "显式 false 必须压过系统层，作为宿主升级后的逃生口"
-        );
-    }
-
-    #[test]
-    fn empty_user_keeps_base() {
-        let base = vec![AppCompatRule {
-            process: "Weixin.exe".into(),
-            caret_use_top: true,
-            ..Default::default()
-        }];
-        let merged = merge_rules(base, vec![]);
-        assert_eq!(merged.len(), 1);
-        assert!(merged[0].caret_use_top);
-    }
-
-    #[test]
-    fn set_mode_on_existing_rule_keeps_other_fields() {
-        // 命中已有规则：只改 first_show_mode，caret_use_top / comment 不得被动。
-        let mut rules = vec![AppCompatRule {
-            process: "Weixin.exe".into(),
-            comment: "微信".into(),
-            caret_use_top: true,
-            ..Default::default()
-        }];
-        set_first_show_mode(&mut rules, "weixin.exe", Some(FirstShowMode::Fast)); // 大小写无关
-        assert_eq!(rules.len(), 1, "命中时不得追加新规则");
-        assert_eq!(rules[0].first_show_mode, Some(FirstShowMode::Fast));
-        assert!(rules[0].caret_use_top, "其它字段不得被连带修改");
-        assert_eq!(rules[0].comment, "微信");
-        // 三档互斥：再设一次直接覆盖，不存在「两档同时生效」的中间态
-        // ——正是布尔开关时代那个「fast 配了却从未生效」的成因。
-        set_first_show_mode(&mut rules, "Weixin.EXE", Some(FirstShowMode::Instant));
-        assert_eq!(rules[0].first_show_mode, Some(FirstShowMode::Instant));
-        // 第四档「跟随全局」＝清除该字段，用户才有撤销 per-app 覆盖的出路。
-        set_first_show_mode(&mut rules, "Weixin.EXE", None);
-        assert_eq!(rules[0].first_show_mode, None);
-        assert!(rules[0].caret_use_top, "清除首显档不得连带清掉其它字段");
-    }
-
-    #[test]
-    fn set_mode_appends_minimal_rule_when_absent() {
-        // 未命中：追加**只带该字段**的最小规则，不做整表快照（否则会把系统层其它字段
-        // 冻结进用户层，正是 project_dict_override_sparse_merge 记录过的坑）。
-        let mut rules: Vec<AppCompatRule> = Vec::new();
-        set_first_show_mode(&mut rules, "EverEdit.exe", Some(FirstShowMode::Fast));
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].process, "EverEdit.exe", "应保留原始大小写");
-        assert_eq!(rules[0].first_show_mode, Some(FirstShowMode::Fast));
-        assert!(!rules[0].caret_use_top);
-    }
-
-    #[test]
     fn mode_parses_from_config_and_rejects_unknown() {
         assert_eq!(
             FirstShowMode::from_config("fast"),
@@ -3075,112 +2382,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_omits_false_flags_and_roundtrips() {
-        // 渲染产物：false 开关与空 comment 全部省略（不铺 `= false`），且能被自己解析回来。
-        let rules = vec![AppCompatRule {
-            process: "EverEdit.exe".into(),
-            first_show_mode: Some(FirstShowMode::Fast),
-            ..Default::default()
-        }];
-        let text = render_user_compat(&rules, &[], &[]).expect("渲染失败");
-        assert!(text.contains(r#"first_show_mode = "fast""#), "产物: {text}");
-        assert!(
-            !text.contains("caret_use_top"),
-            "false 开关不应写出: {text}"
-        );
-        assert!(!text.contains("comment"), "空 comment 不应写出: {text}");
-        assert!(text.starts_with("# 用户层应用兼容规则"), "缺少文件头警示");
-
-        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
-        assert_eq!(parsed.apps.len(), 1);
-        assert_eq!(parsed.apps[0].first_show_mode, Some(FirstShowMode::Fast));
-        assert_eq!(parsed.apps[0].process, "EverEdit.exe");
-    }
-
-    #[test]
-    fn set_initial_mode_upserts_and_clears() {
-        let mut rules = vec![AppCompatRule {
-            process: "Everything.exe".into(),
-            comment: "搜索框默认英文".into(),
-            caret_use_top: true,
-            ..Default::default()
-        }];
-        // 命中：只改 initial_mode，其它字段不得被连带修改。
-        set_initial_mode(&mut rules, "everything.exe", Some(InitialMode::English));
-        assert_eq!(rules.len(), 1, "命中时不得追加新规则");
-        assert_eq!(rules[0].initial_mode, Some(InitialMode::English));
-        assert!(rules[0].caret_use_top, "其它字段不得被连带修改");
-        assert_eq!(rules[0].comment, "搜索框默认英文");
-
-        // 标点是独立维度，设置它不得动中英。
-        set_initial_punct(&mut rules, "Everything.EXE", Some(InitialMode::English));
-        assert_eq!(rules[0].initial_punct, Some(InitialMode::English));
-        assert_eq!(rules[0].initial_mode, Some(InitialMode::English));
-
-        // None = 清除规则，回到跟随全局（菜单的「跟随全局」档走这条）。
-        set_initial_mode(&mut rules, "Everything.exe", None);
-        assert_eq!(rules[0].initial_mode, None);
-        assert_eq!(
-            rules[0].initial_punct,
-            Some(InitialMode::English),
-            "只清中英"
-        );
-
-        // 未命中：追加只带该字段的最小规则。
-        set_initial_mode(&mut rules, "cmd.exe", Some(InitialMode::English));
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[1].process, "cmd.exe", "应保留原始大小写");
-        assert_eq!(rules[1].initial_mode, Some(InitialMode::English));
-        assert!(!rules[1].caret_use_top);
-    }
-
-    /// 清掉定位方式必须**连坐标一起清**：留下孤儿坐标的话，用户关掉固定再打开，
-    /// 候选窗会跳到他上一次摆的位置——而那次摆放已经被他自己撤销了。
-    #[test]
-    fn clearing_candidate_position_mode_also_clears_coords() {
-        let mut rules = vec![AppCompatRule {
-            process: "X60_Toolbox.exe".into(),
-            caret_use_top: true,
-            ..Default::default()
-        }];
-        set_candidate_position_mode(
-            &mut rules,
-            "x60_toolbox.exe",
-            Some(CandidatePositionMode::Fixed),
-        );
-        set_candidate_pos(&mut rules, "X60_TOOLBOX.EXE", 900, 640);
-        assert_eq!(rules.len(), 1, "同名进程不得追加第二条规则");
-        assert_eq!((rules[0].candidate_x, rules[0].candidate_y), (900, 640));
-        assert!(rules[0].caret_use_top, "其它字段不得被连带修改");
-
-        set_candidate_position_mode(&mut rules, "x60_toolbox.exe", None);
-        assert_eq!(rules[0].candidate_position_mode, None);
-        assert_eq!(
-            (rules[0].candidate_x, rules[0].candidate_y),
-            (0, 0),
-            "清定位方式必须一并清坐标"
-        );
-        assert!(rules[0].caret_use_top, "清除只针对这一项");
-    }
-
-    /// per-app 坐标是**每个应用一份**：给 A 设置不得影响 B。
-    /// 共用一份坐标的话只有第一个配的应用是对的，这条断言锁住这个决策。
-    #[test]
-    fn candidate_pos_is_per_app() {
-        let mut rules = Vec::new();
-        set_candidate_position_mode(&mut rules, "a.exe", Some(CandidatePositionMode::Fixed));
-        set_candidate_pos(&mut rules, "a.exe", 100, 200);
-        set_candidate_position_mode(&mut rules, "b.exe", Some(CandidatePositionMode::Fixed));
-        set_candidate_pos(&mut rules, "b.exe", 300, 400);
-
-        let compat = AppCompat::from_rules(rules);
-        let a = compat.get_rule("a.exe").unwrap();
-        let b = compat.get_rule("b.exe").unwrap();
-        assert_eq!((a.candidate_x, a.candidate_y), (100, 200));
-        assert_eq!((b.candidate_x, b.candidate_y), (300, 400));
-    }
-
     /// 缺字段 = 不干预。若退化成 `Some(默认档)`，等于给所有未配置的应用都写死了一份
     /// per-app 覆盖，用户改全局 `ui.candidate.position_mode` 时会全部失效。
     #[test]
@@ -3222,150 +2423,13 @@ mod tests {
         );
     }
 
-    /// `ignore_host_ime_close` 的三态在**两层之间**才分得出来，这条锁住它。
-    ///
-    /// ★ 没有字段级继承的话，`None`（跟随内置）与 `Some(false)`（采纳）行为完全一致，
-    /// 菜单第三档就是个多余选项；有了继承，三档各有唯一语义：
-    ///   跟随内置 = 听出厂的｜忽略 = 不管出厂说什么都忽略｜采纳 = 不管出厂说什么都采纳。
-    #[test]
-    fn ignore_host_ime_close_inherits_from_lower_layer() {
-        let sys = vec![AppCompatRule {
-            process: "X60_Toolbox.exe".into(),
-            ignore_host_ime_close: Some(true),
-            ..Default::default()
-        }];
-
-        // 用户层稀疏规则（只配过初始模式）**不得**吞掉出厂的宿主协议级字段。
-        let mut user = Vec::new();
-        set_initial_mode(&mut user, "x60_toolbox.exe", Some(InitialMode::Chinese));
-        let merged = AppCompat::from_rules(merge_rules(sys.clone(), user));
-        let rule = merged.get_rule("x60_toolbox.exe").unwrap();
-        assert_eq!(
-            rule.ignore_host_ime_close,
-            Some(true),
-            "用户层没写这一项 ⇒ 继承出厂值，否则出厂修复对老用户永远不生效"
-        );
-        assert_eq!(rule.initial_mode, Some(InitialMode::Chinese));
-
-        // 显式 `Some(false)`（菜单的「采纳」档）必须盖住出厂的 true——这正是它存在的理由。
-        let mut user = Vec::new();
-        set_ignore_host_ime_close(&mut user, "x60_toolbox.exe", Some(false));
-        let merged = AppCompat::from_rules(merge_rules(sys, user));
-        assert_eq!(
-            merged
-                .get_rule("x60_toolbox.exe")
-                .unwrap()
-                .ignore_host_ime_close,
-            Some(false),
-            "显式采纳必须能覆盖出厂的忽略，否则用户无从撤销"
-        );
-    }
-
-    /// 只配了 `ignore_host_ime_close` 的规则不是空壳，不能被 `is_empty_override` 剔掉
-    /// ——那会让用户刚在菜单里点的开关下一次写盘时静默消失。
-    #[test]
-    fn ignore_host_ime_close_only_rule_survives_render() {
-        let mut rules = Vec::new();
-        set_ignore_host_ime_close(&mut rules, "X60_Toolbox.exe", Some(true));
-        assert!(!is_empty_override(&rules[0]), "配了这一项就不是空壳");
-
-        let text = render_user_compat(&rules, &[], &[]).expect("渲染失败");
-        assert!(
-            text.contains("ignore_host_ime_close = true"),
-            "产物: {text}"
-        );
-        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
-        assert_eq!(parsed.apps[0].ignore_host_ime_close, Some(true));
-    }
-
-    #[test]
-    fn render_omits_none_initial_mode_and_roundtrips() {
-        let rules = vec![AppCompatRule {
-            process: "Everything.exe".into(),
-            initial_mode: Some(InitialMode::English),
-            ..Default::default()
-        }];
-        let text = render_user_compat(&rules, &[], &[]).expect("渲染失败");
-        assert!(text.contains(r#"initial_mode = "english""#), "产物: {text}");
-        assert!(!text.contains("initial_punct"), "None 字段不应写出: {text}");
-
-        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
-        assert_eq!(parsed.apps[0].initial_mode, Some(InitialMode::English));
-        assert_eq!(parsed.apps[0].initial_punct, None);
-    }
-
-    #[test]
-    fn host_render_defaults_false_and_omitted_from_render() {
-        let toml = r#"
-            [[apps]]
-            process = "Foo.exe"
-        "#;
-        let file: AppCompatFile = toml::from_str(toml).unwrap();
-        let compat = AppCompat::from_rules(file.apps);
-        assert!(!compat.get_rule("foo.exe").unwrap().host_render);
-
-        let rules = vec![AppCompatRule {
-            process: "Foo.exe".into(),
-            ..Default::default()
-        }];
-        let text = render_user_compat(&rules, &[], &[]).expect("渲染失败");
-        assert!(!text.contains("host_render"), "false 开关不应写出: {text}");
-    }
-
-    #[test]
-    fn set_host_render_upserts_and_host_render_processes_collects_only_enabled() {
-        let mut rules = vec![
-            AppCompatRule {
-                process: "Weixin.exe".into(),
-                caret_use_top: true,
-                ..Default::default()
-            },
-            AppCompatRule {
-                process: "SearchHost.exe".into(),
-                ..Default::default()
-            },
-        ];
-        set_host_render(&mut rules, "searchhost.exe", true); // 大小写无关命中
-        assert_eq!(rules.len(), 2, "命中时不得追加新规则");
-        assert!(rules[1].host_render);
-        assert!(rules[0].caret_use_top, "其它规则不受牵连");
-
-        let compat = AppCompat::from_rules(rules);
-        assert_eq!(
-            compat.host_render_processes(),
-            vec!["SearchHost.exe".to_string()],
-            "只收集 host_render=true 的进程，且保留原始大小写"
-        );
-    }
-
-    #[test]
-    fn render_omits_false_host_render_but_keeps_true() {
-        let rules = vec![
-            AppCompatRule {
-                process: "A.exe".into(),
-                host_render: true,
-                ..Default::default()
-            },
-            AppCompatRule {
-                process: "B.exe".into(),
-                host_render: false,
-                ..Default::default()
-            },
-        ];
-        let text = render_user_compat(&rules, &[], &[]).expect("渲染失败");
-        assert!(text.contains("host_render = true"), "产物: {text}");
-
-        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
-        let compat = AppCompat::from_rules(parsed.apps);
-        assert_eq!(compat.host_render_processes(), vec!["A.exe".to_string()]);
-    }
-
     // ── [[initial_mode_scope]] ──
 
     fn sample_scope() -> Vec<InitialModeScopeRule> {
         vec![InitialModeScopeRule {
             process: "explorer.exe".into(),
             comment: String::new(),
+            disabled: false,
             classes: vec!["Progman".into(), "WorkerW".into()],
         }]
     }
@@ -3411,109 +2475,359 @@ mod tests {
             vec![InitialModeScopeRule {
                 process: "explorer.exe".into(),
                 comment: String::new(),
+                disabled: false,
                 classes: Vec::new(),
             }],
         );
         assert!(!c.initial_mode_applies_to_window("explorer.exe", "Progman"));
         assert!(c.initial_mode_applies_to_window("notepad.exe", "Notepad"));
     }
+}
 
-    /// ★ 本文件最重要的一条回归：两段**独立合并**。
-    ///
-    /// 用户只为 explorer.exe 写了一条 `[[apps]]`（比如调 caret_offset），系统层给
-    /// explorer.exe 配的 `[[initial_mode_scope]]` 必须原样保留。若哪天有人把作用域清单
-    /// 挪进 `[[apps]]` 的字段里，本测试会红——那正是要防的设计退化。
-    #[test]
-    fn user_apps_override_does_not_drop_system_mode_scope() {
-        let apps = merge_rules(
-            vec![AppCompatRule {
-                process: "explorer.exe".into(),
-                caret_use_top: true,
-                ..Default::default()
-            }],
-            vec![AppCompatRule {
-                process: "explorer.exe".into(),
-                caret_offset_x: 3,
-                ..Default::default()
-            }],
-        );
-        let scope = merge_mode_scope(sample_scope(), Vec::new());
-        let c = AppCompat::from_parts(apps, scope);
+#[cfg(test)]
+mod disabled_rule_tests {
+    use super::*;
 
-        // [[apps]] 确实被用户层整条覆盖了（caret_use_top 丢失是既有的预期语义）
-        let rule = c.get_rule("explorer.exe").expect("规则应存在");
-        assert_eq!(rule.caret_offset_x, 3);
-        assert!(!rule.caret_use_top);
-        // 但 [[initial_mode_scope]] 毫发无损
-        assert!(c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wind_compat_dis_{tag}_{}", std::process::id()))
+    }
+    fn write(dir: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(COMPAT_FILE_NAME), text).unwrap();
     }
 
     #[test]
-    fn user_mode_scope_overrides_whole_entry_for_that_process() {
-        let merged = merge_mode_scope(
-            sample_scope(),
-            vec![InitialModeScopeRule {
-                process: "EXPLORER.EXE".into(),
-                comment: String::new(),
-                classes: vec!["CabinetWClass".into()],
-            }],
+    fn user_disabled_entry_removes_the_system_rule() {
+        let (sys, usr) = (tmp("a_sys"), tmp("a_usr"));
+        write(
+            &sys,
+            "[[apps]]\nprocess = \"Feishu.exe\"\ncomposition_start_pair_guard = true\n\
+             [[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\n",
         );
-        let c = AppCompat::from_parts(Vec::new(), merged);
-        assert!(c.initial_mode_applies_to_window("explorer.exe", "CabinetWClass"));
-        // 整条覆盖：内置那两项不再保留（语义与 [[apps]] 一致，见 merge_mode_scope 注释）
-        assert!(!c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+        write(
+            &usr,
+            "[[apps]]\nprocess = \"feishu.exe\"\ndisabled = true\n",
+        );
+        let c = AppCompat::load_layered(Some(&sys), None, Some(&usr));
+        assert!(
+            c.get_rule("Feishu.exe").is_none(),
+            "被禁用的进程不应再有规则"
+        );
+        assert!(c.get_rule("Weixin.exe").is_some(), "禁用只影响指名的进程");
+        let _ = std::fs::remove_dir_all(&sys);
+        let _ = std::fs::remove_dir_all(&usr);
     }
 
-    /// 菜单写回是**整份重写**，漏渲染哪一段哪一段就没了。
     #[test]
-    fn user_writeback_preserves_mode_scope() {
-        let rules = vec![AppCompatRule {
-            process: "notepad.exe".into(),
+    fn disabled_is_omitted_when_false_and_written_when_true() {
+        let off = toml::to_string(&AppCompatRule {
+            process: "a.exe".into(),
             caret_use_top: true,
             ..Default::default()
-        }];
-        let text = render_user_compat(&rules, &sample_scope(), &[]).expect("渲染失败");
-        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
-        assert_eq!(parsed.initial_mode_scope, sample_scope());
-
-        let c = AppCompat::from_parts(parsed.apps, parsed.initial_mode_scope);
-        assert!(c.initial_mode_applies_to_window("explorer.exe", "WorkerW"));
+        })
+        .unwrap();
+        assert!(!off.contains("disabled"), "false 不应落盘: {off}");
+        let on = toml::to_string(&AppCompatRule {
+            process: "a.exe".into(),
+            disabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(on.contains("disabled = true"), "true 必须落盘: {on}");
     }
 
-    /// 没有作用域时不该在用户层文件里留下空的 `[[initial_mode_scope]]` 噪声。
     #[test]
-    fn empty_mode_scope_is_not_serialized() {
-        let text = render_user_compat(&[], &[], &[]).expect("渲染失败");
-        assert!(!text.contains("initial_mode_scope"), "产物: {text}");
+    fn wrong_typed_disabled_falls_back_to_enabled() {
+        let (sys, usr) = (tmp("c_sys"), tmp("c_usr"));
+        write(
+            &sys,
+            "[[apps]]\nprocess = \"Feishu.exe\"\ncaret_use_top = true\n",
+        );
+        write(
+            &usr,
+            "[[apps]]\nprocess = \"Feishu.exe\"\ndisabled = \"yes\"\ncaret_use_top = true\n",
+        );
+        let c = AppCompat::load_layered(Some(&sys), None, Some(&usr));
+        assert!(
+            c.get_rule("Feishu.exe").is_some(),
+            "写错类型按未禁用处理，不能整条丢"
+        );
+        let _ = std::fs::remove_dir_all(&sys);
+        let _ = std::fs::remove_dir_all(&usr);
     }
 
-    /// 守随发布的系统层 `data/compat.toml`（路径写法同 config.rs 的既有先例）。
-    ///
-    /// 必要性：`load_file` 解析失败是**静默跳过整份文件**——一个 TOML 笔误就会让所有
-    /// 应用的所有兼容规则一起失效，且日志里毫无痕迹。这条测试是那种缺陷唯一的早期信号。
-    /// 同时钉住内置作用域的两侧：桌面在内（用户为桌面配的 initial_mode 必须生效，那正是
-    /// 他们配它的目的），任务栏与"拿不到窗口类"在外。
     #[test]
-    fn shipped_system_compat_parses_and_scopes_explorer_to_desktop() {
+    fn disabled_applies_to_scope_and_newline_sections() {
+        let (sys, usr) = (tmp("d_sys"), tmp("d_usr"));
+        write(
+            &sys,
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"CabinetWClass\"]\n\
+             [[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n",
+        );
+        write(
+            &usr,
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\ndisabled = true\n\
+             [[commit_newline]]\nprocess = \"WINWORD.EXE\"\ndisabled = true\n",
+        );
+        let c = AppCompat::load_layered(Some(&sys), None, Some(&usr));
+        assert!(c.commit_newline_for("WINWORD.EXE").is_none());
+        // 作用域规则被禁用 = 进程不在表内 = 不受限制
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "AnyOtherClass"));
+        let _ = std::fs::remove_dir_all(&sys);
+        let _ = std::fs::remove_dir_all(&usr);
+    }
+}
+
+/// 分层叠加语义（整体原则：每一层都是相对下一层的差异，逐字段叠加）与菜单写入路径。
+#[cfg(test)]
+mod layering_tests {
+    use super::*;
+    use crate::compat_overlay::parse_raw;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wind_compat_lay_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    fn write(dir: &std::path::Path, text: &str) {
+        std::fs::write(dir.join(COMPAT_FILE_NAME), text).unwrap();
+    }
+    fn read(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap_or_default()
+    }
+    fn raw(text: &str) -> Raw {
+        parse_raw(text).expect("测试夹具必须是合法 TOML")
+    }
+    fn load(sys: &str, user: &str, tag: &str) -> AppCompat {
+        let (d, u) = (tmp(&format!("{tag}_d")), tmp(&format!("{tag}_u")));
+        write(&d, sys);
+        write(&u, user);
+        let c = AppCompat::load_layered(Some(&d), None, Some(&u));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&u);
+        c
+    }
+
+    const WECHAT: &str =
+        "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\nstale_probe_guard = true\n";
+
+    /// ★ 靶机实测的真实事故：微信的用户规则只有菜单写的一项 first_show_mode，
+    /// 旧的「整条覆盖」让出厂的 caret_use_top / stale_probe_guard 运行时全丢。
+    #[test]
+    fn a_sparse_user_rule_keeps_every_other_system_field() {
+        let c = load(
+            WECHAT,
+            "[[apps]]\nprocess = \"weixin.exe\"\nfirst_show_mode = \"instant\"\n",
+            "wechat",
+        );
+        let r = c.get_rule("Weixin.exe").unwrap();
+        assert!(r.caret_use_top, "出厂的 caret_use_top 不能丢");
+        assert!(r.stale_probe_guard, "出厂的 stale_probe_guard 不能丢");
+        assert_eq!(r.first_show_mode, Some(FirstShowMode::Instant));
+    }
+
+    #[test]
+    fn explicit_false_in_the_user_layer_turns_off_a_system_switch() {
+        let c = load(
+            WECHAT,
+            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = false\n",
+            "off",
+        );
+        let r = c.get_rule("Weixin.exe").unwrap();
+        assert!(!r.caret_use_top, "显式 false 必须能关掉出厂打开的开关");
+        assert!(r.stale_probe_guard, "没提到的字段照旧继承");
+    }
+
+    #[test]
+    fn unset_returns_a_system_field_to_follow_global() {
+        let c = load(
+            "[[apps]]\nprocess = \"EXCEL.EXE\"\nfirst_show_mode = \"wait\"\nauto_pair = false\n",
+            "[[apps]]\nprocess = \"excel.exe\"\nunset = [\"first_show_mode\"]\n",
+            "unset",
+        );
+        let r = c.get_rule("EXCEL.EXE").unwrap();
+        assert_eq!(
+            r.first_show_mode, None,
+            "unset 后回到跟随全局，而不是继承出厂的 wait"
+        );
+        assert_eq!(r.auto_pair, Some(false), "别的字段不受影响");
+    }
+
+    #[test]
+    fn three_layers_each_overlay_the_one_below() {
+        let (d, c, u) = (tmp("3_d"), tmp("3_c"), tmp("3_u"));
+        write(
+            &d,
+            "[[apps]]\nprocess = \"A.exe\"\ncaret_use_top = true\nauto_pair = true\n",
+        );
+        write(
+            &c,
+            "[[apps]]\nprocess = \"A.exe\"\nauto_pair = false\ncaret_offset_x = 4\n",
+        );
+        write(&u, "[[apps]]\nprocess = \"A.exe\"\ncaret_offset_x = 9\n");
+        let rt = AppCompat::load_layered(Some(&d), Some(&c), Some(&u));
+        let r = rt.get_rule("A.exe").unwrap();
+        assert!(r.caret_use_top, "data 层的字段被继承到最上层");
+        assert_eq!(r.auto_pair, Some(false), "custom 层覆盖 data 层");
+        assert_eq!(r.caret_offset_x, 9, "user 层覆盖 custom 层");
+        for x in [&d, &c, &u] {
+            let _ = std::fs::remove_dir_all(x);
+        }
+    }
+
+    /// 三段各自独立叠加：为某进程写 `[[apps]]` 不会让更低层给它配的作用域 / 换行规则消失，反之亦然。
+    #[test]
+    fn sections_overlay_independently() {
+        let sys = "[[apps]]\nprocess = \"WINWORD.EXE\"\ncaret_offset_y = 3\n\n\
+                   [[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n\n\
+                   [[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"Progman\", \"WorkerW\"]\n";
+        let user = "[[apps]]\nprocess = \"WINWORD.EXE\"\nauto_pair = false\n\n\
+                    [[apps]]\nprocess = \"explorer.exe\"\ncaret_use_top = true\n";
+        let c = load(sys, user, "sections");
+        assert_eq!(
+            c.commit_newline_for("winword.exe"),
+            Some(NewlineStyle::Cr),
+            "用户改 apps 不能顶掉换行段"
+        );
+        assert_eq!(c.get_rule("winword.exe").map(|r| r.caret_offset_y), Some(3));
+        assert!(
+            c.initial_mode_applies_to_window("explorer.exe", "Progman"),
+            "作用域段不受 apps 段影响"
+        );
+        assert!(!c.initial_mode_applies_to_window("explorer.exe", "Shell_TrayWnd"));
+
+        let c2 = load(
+            sys,
+            "[[commit_newline]]\nprocess = \"winword.exe\"\nstyle = \"crlf\"\n",
+            "sections2",
+        );
+        assert_eq!(
+            c2.commit_newline_for("WINWORD.EXE"),
+            Some(NewlineStyle::Crlf),
+            "换行段逐字段叠加"
+        );
+        assert_eq!(
+            c2.get_rule("WINWORD.EXE").map(|r| r.caret_offset_y),
+            Some(3),
+            "用户配换行不能顶掉 apps 段"
+        );
+    }
+
+    /// 列表字段按整个字段替换，不做元素级合并。
+    #[test]
+    fn a_list_field_is_replaced_as_a_whole() {
+        let c = load(
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"Progman\", \"WorkerW\"]\n",
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"CabinetWClass\"]\n",
+            "list",
+        );
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "CabinetWClass"));
+        assert!(
+            !c.initial_mode_applies_to_window("explorer.exe", "Progman"),
+            "整个列表被替换，旧元素不保留"
+        );
+    }
+
+    /// 一行结构错只丢这一行，同文件其它规则照常；语法错则整份跳过（且有 WARN）。
+    #[test]
+    fn a_structurally_bad_row_only_loses_itself() {
+        let c = load(
+            "",
+            "[[apps]]\nprocess = \"good.exe\"\ncaret_use_top = true\n\n[[initial_mode_scope]]\nprocess = \"bad.exe\"\nclasses = \"nope\"\n\n[[initial_mode_scope]]\nprocess = \"ok.exe\"\nclasses = [\"A\"]\n",
+            "badrow",
+        );
+        assert!(c.get_rule("good.exe").is_some());
+        assert!(
+            !c.initial_mode_applies_to_window("ok.exe", "B"),
+            "好的那行正常生效"
+        );
+        assert!(
+            c.initial_mode_applies_to_window("bad.exe", "B"),
+            "坏的那行作废 = 不受限制"
+        );
+        let broken = load("", "[[apps\nprocess=", "syntax");
+        assert!(broken.get_rule("anything.exe").is_none());
+    }
+
+    #[test]
+    fn disabling_and_reenabling_across_layers() {
+        let (d, c, u) = (tmp("dis_d"), tmp("dis_c"), tmp("dis_u"));
+        write(&d, "[[apps]]\nprocess = \"A.exe\"\ncaret_use_top = true\n");
+        write(&c, "[[apps]]\nprocess = \"A.exe\"\ndisabled = true\n");
+        let off = AppCompat::load_layered(Some(&d), Some(&c), None);
+        assert!(off.get_rule("A.exe").is_none(), "custom 层禁用");
+        write(&u, "[[apps]]\nprocess = \"A.exe\"\ndisabled = false\n");
+        let on = AppCompat::load_layered(Some(&d), Some(&c), Some(&u));
+        assert!(
+            on.get_rule("A.exe").is_some_and(|r| r.caret_use_top),
+            "更高层显式 disabled = false 重新启用，字段照常继承"
+        );
+        for x in [&d, &c, &u] {
+            let _ = std::fs::remove_dir_all(x);
+        }
+    }
+
+    /// 每个登记过的字段都必须能穿过「叠加 → 结构体」而不丢：稀疏的上层条目不得吞掉任何一个下层字段。
+    /// 取代旧的「协议字段登记」源码扫描守门测试——现在没有任何字段享有特殊继承待遇，
+    /// 这条对全部登记字段一视同仁地钉住。
+    #[test]
+    fn every_registered_field_survives_layering() {
+        use crate::compat_schema::{COMPAT_FIELDS, Kind};
+        use serde_json::json;
+        for f in COMPAT_FIELDS.iter().filter(|f| f.section == "apps") {
+            let sample = match f.kind {
+                Kind::Bool | Kind::TriBool => json!(true),
+                Kind::Enum => json!(f.options[0]),
+                Kind::Int => json!(7),
+                Kind::Text => json!("sample"),
+                Kind::TextList => json!(["A"]),
+            };
+            let sys =
+                vec![serde_json::from_value(json!({"process": "p.exe", f.key: sample})).unwrap()];
+            let user = vec![
+                serde_json::from_value(json!({"process": "P.EXE", "comment": "稀疏条目"})).unwrap(),
+            ];
+            let rules: Vec<AppCompatRule> =
+                materialize(&crate::compat_overlay::overlay(sys, &user));
+            let out = serde_json::to_value(&rules[0]).unwrap();
+            assert!(
+                out.get(f.key).is_some(),
+                "字段 {} 被稀疏的上层条目吞掉了（或根本没能反序列化）: {out}",
+                f.key
+            );
+        }
+    }
+
+    /// 守随发布的系统层 `data/compat.toml`：解析失败会**整份静默跳过**，所有应用的所有规则一起失效。
+    #[test]
+    fn shipped_system_compat_configures_word_and_scopes_explorer_to_desktop() {
         let data_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data"));
-        let file = load_file(&data_dir.join(COMPAT_FILE_NAME))
-            .expect("随发布的 data/compat.toml 必须能解析（失败会静默吞掉全部规则）");
-        let c = AppCompat::from_parts(file.apps, file.initial_mode_scope);
-
+        assert!(
+            load_raw(&data_dir.join(COMPAT_FILE_NAME)).is_some(),
+            "随发布的 data/compat.toml 必须能解析（失败会静默吞掉全部规则）"
+        );
+        let c = AppCompat::load_layered(Some(data_dir), None, None);
+        assert_eq!(
+            c.commit_newline_for("winword.exe"),
+            Some(NewlineStyle::Cr),
+            "Word 的段落边界是 CR（2026-08-23 真机实测）"
+        );
+        assert_eq!(
+            c.commit_newline_for("wps.exe"),
+            None,
+            "WPS 文字实测用 LF 正常分段，不该在出厂名单里"
+        );
         assert!(
             c.get_rule("qq.exe")
-                .is_some_and(|r| r.composition_start_pair_guard == Some(true)),
-            "随发布的 QQ.exe 规则必须启用 composition_start_pair_guard"
+                .is_some_and(|r| r.composition_start_pair_guard == Some(true))
         );
-
-        // 桌面：规则必须照常生效
         for class in ["Progman", "WorkerW"] {
             assert!(
                 c.initial_mode_applies_to_window("explorer.exe", class),
-                "{class} 是桌面，排除它会让用户为桌面配的 initial_mode 彻底失效"
+                "{class} 是桌面"
             );
         }
-        // 作用域外：路过型窗口 + 拿不到窗口类
         for class in [
             "Shell_TrayWnd",
             "Shell_SecondaryTrayWnd",
@@ -3524,10 +2838,565 @@ mod tests {
         ] {
             assert!(
                 !c.initial_mode_applies_to_window("explorer.exe", class),
-                "class={class:?} 不该重算初始模式（每次切应用的必经之路）"
+                "class={class:?} 不该重算初始模式"
             );
         }
-        // 其它进程不受任何影响
         assert!(c.initial_mode_applies_to_window("notepad.exe", ""));
+    }
+
+    /// ★ 审查实测：写错的值先参与叠加、事后才回落成 None，会把下层的好值一起盖没——
+    /// `classes` 里混进一个非字符串甚至让出厂的 explorer 作用域整行丢失。写错 = 没写。
+    #[test]
+    fn an_invalid_value_in_a_higher_layer_never_hides_a_valid_lower_one() {
+        let c = load(
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"Progman\", \"WorkerW\"]\n",
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"Progman\", 3]\n",
+            "badclasses",
+        );
+        assert!(
+            c.initial_mode_applies_to_window("explorer.exe", "WorkerW"),
+            "出厂作用域必须保住"
+        );
+        assert!(
+            !c.initial_mode_applies_to_window("explorer.exe", "Shell_TrayWnd"),
+            "explorer 不能变成不受限制"
+        );
+
+        let c = load(
+            "[[apps]]\nprocess = \"X60_Toolbox.exe\"\nignore_host_ime_close = true\nfirst_show_mode = \"wait\"\n",
+            "[[apps]]\nprocess = \"x60_toolbox.exe\"\nignore_host_ime_close = \"yes\"\nfirst_show_mode = \"instnat\"\n",
+            "badvals",
+        );
+        let r = c.get_rule("X60_Toolbox.exe").unwrap();
+        assert_eq!(
+            r.ignore_host_ime_close,
+            Some(true),
+            "布尔写成字符串 = 没写，继承出厂"
+        );
+        assert_eq!(
+            r.first_show_mode,
+            Some(FirstShowMode::Wait),
+            "枚举拼错 = 没写，继承出厂"
+        );
+    }
+
+    /// 一个没写（或写错而被忽略）`classes` 的作用域规则作废，不能变成「任何窗口都不重算」。
+    #[test]
+    fn a_scope_rule_without_classes_is_void_not_block_all() {
+        let c = load(
+            "",
+            "[[initial_mode_scope]]\nprocess = \"x.exe\"\n",
+            "noclasses",
+        );
+        assert!(c.initial_mode_applies_to_window("x.exe", "AnyClass"));
+        let c = load(
+            "",
+            "[[initial_mode_scope]]\nprocess = \"x.exe\"\nclasses = []\n",
+            "emptyclasses",
+        );
+        assert!(
+            !c.initial_mode_applies_to_window("x.exe", "AnyClass"),
+            "显式写空清单才是全挡"
+        );
+    }
+
+    /// 同一层里同名进程写了多行：后写的赢，与逐行叠加一致。
+    #[test]
+    fn duplicate_rows_for_one_process_in_a_layer_overlay_in_order() {
+        let c = load(
+            "",
+            "[[apps]]\nprocess = \"x.exe\"\nfirst_show_mode = \"wait\"\nauto_pair = true\n\n[[apps]]\nprocess = \"X.EXE\"\nfirst_show_mode = \"fast\"\n",
+            "dups",
+        );
+        let r = c.get_rule("x.exe").unwrap();
+        assert_eq!(r.first_show_mode, Some(FirstShowMode::Fast), "后写的赢");
+        assert_eq!(r.auto_pair, Some(true), "先写的其它字段保留");
+    }
+
+    /// 进程名带首尾空格：读入时就 trim，运行时查表才匹配得上。
+    #[test]
+    fn process_names_with_padding_are_trimmed_on_load() {
+        let c = load(
+            "",
+            "[[apps]]\nprocess = \" Foo.exe \"\nauto_pair = true\n",
+            "pad",
+        );
+        assert!(
+            c.get_rule("foo.exe").is_some(),
+            "带空格的进程名必须能被查到"
+        );
+    }
+
+    /// `unset` 写成单个字符串也要生效；`unset = ["disabled"]` 能解除下层的禁用。
+    #[test]
+    fn unset_accepts_a_bare_string_and_can_lift_a_disable() {
+        let c = load(
+            "[[apps]]\nprocess = \"A.exe\"\nfirst_show_mode = \"wait\"\n",
+            "[[apps]]\nprocess = \"A.exe\"\nunset = \"first_show_mode\"\nauto_pair = true\n",
+            "unsetstr",
+        );
+        assert_eq!(c.get_rule("A.exe").unwrap().first_show_mode, None);
+        let (d, cu, u) = (tmp("lift_d"), tmp("lift_c"), tmp("lift_u"));
+        write(&d, "[[apps]]\nprocess = \"A.exe\"\ncaret_use_top = true\n");
+        write(&cu, "[[apps]]\nprocess = \"A.exe\"\ndisabled = true\n");
+        write(
+            &u,
+            "[[apps]]\nprocess = \"A.exe\"\nunset = [\"disabled\"]\n",
+        );
+        let rt = AppCompat::load_layered(Some(&d), Some(&cu), Some(&u));
+        assert!(
+            rt.get_rule("A.exe").is_some_and(|r| r.caret_use_top),
+            "unset disabled 解除禁用"
+        );
+        for x in [&d, &cu, &u] {
+            let _ = std::fs::remove_dir_all(x);
+        }
+    }
+
+    // ───────────── 写回不得丢用户的东西 ─────────────
+
+    /// ★ 审查实测：非 ASCII / 带点的键写回时必须加引号，否则整个用户层文件失效。
+    #[test]
+    fn write_back_quotes_exotic_keys_so_the_file_stays_valid() {
+        let dir = tmp("quote");
+        write(
+            &dir,
+            "[[apps]]\nprocess = \"a.exe\"\n\"备注\" = \"x\"\n\"a.b\" = 1\n",
+        );
+        with_system("", || {
+            set_user_first_show_mode(&dir, "a.exe", Some(FirstShowMode::Fast)).unwrap()
+        });
+        let back = parse_raw(&read(&dir)).expect("写回后的文件必须仍是合法 TOML");
+        assert_eq!(back.apps[0]["备注"], serde_json::json!("x"));
+        assert_eq!(
+            back.apps[0]["a.b"],
+            serde_json::json!(1),
+            "带点的键不能被写成嵌套表"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 审查实测：`[apps]` 手误写成单括号，`parse_raw` 只留一条 WARN 就当它不存在，
+    /// 下一次重写这条规则就彻底消失。必须按损坏处理：先留 `.bad`。
+    #[test]
+    fn skipped_content_is_treated_as_damage_and_backed_up() {
+        let dir = tmp("skipped");
+        let text = "[apps]\nprocess = \"lost.exe\"\nauto_pair = true\n";
+        write(&dir, text);
+        with_system("", || {
+            set_user_first_show_mode(&dir, "a.exe", Some(FirstShowMode::Fast)).unwrap()
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{COMPAT_FILE_NAME}.bad"))).unwrap(),
+            text,
+            "读不进来的内容必须被留档，而不是静默丢掉"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 更新版本新增的顶层段：不认识但必须原样保留，降级后第一次写回不能删掉它。
+    #[test]
+    fn unknown_top_level_sections_survive_a_write_back() {
+        let dir = tmp("extra");
+        write(&dir, "[future_section]\nkey = \"value\"\nn = 3\n");
+        with_system("", || {
+            set_user_first_show_mode(&dir, "a.exe", Some(FirstShowMode::Fast)).unwrap()
+        });
+        let back = parse_raw(&read(&dir)).unwrap();
+        assert_eq!(back.extra["future_section"]["key"].as_str(), Some("value"));
+        assert_eq!(back.extra["future_section"]["n"].as_integer(), Some(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 认不出的枚举值（新版本写下的）经结构体往返本来是「看不见」的，按效果判冗余会被静默删掉。
+    #[test]
+    fn a_value_this_version_cannot_parse_is_kept_untouched_by_other_edits() {
+        let dir = tmp("keepval");
+        write(
+            &dir,
+            "[[apps]]\nprocess = \"a.exe\"\nfirst_show_mode = \"turbo\"\n",
+        );
+        with_system("", || {
+            set_user_auto_pair(&dir, "a.exe", Some(true)).unwrap()
+        });
+        assert!(
+            read(&dir).contains("first_show_mode = \"turbo\""),
+            "{}",
+            read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 下层（系统 / data_custom）把这个进程的规则禁用了，用户在菜单里给它选了一项：
+    /// 这是明确的「我要配置它」，要带上重新启用，否则存了却永远不生效。
+    #[test]
+    fn a_menu_choice_re_enables_a_rule_disabled_by_a_lower_layer() {
+        let (d, u) = (tmp("m_dis_d"), tmp("m_dis_u"));
+        let sys = "[[apps]]\nprocess = \"A.exe\"\ndisabled = true\ncaret_use_top = true\n";
+        write(&d, sys);
+        with_system(sys, || {
+            set_user_first_show_mode(&u, "a.exe", Some(FirstShowMode::Wait)).unwrap()
+        });
+        let r = AppCompat::load_layered(Some(&d), None, Some(&u));
+        assert_eq!(
+            r.get_rule("A.exe").map(|r| r.first_show_mode),
+            Some(Some(FirstShowMode::Wait))
+        );
+        // 用户在设置页自己禁用的，菜单不能悄悄改掉他的决定。
+        let (d2, u2) = (tmp("m_dis2_d"), tmp("m_dis2_u"));
+        write(&d2, "[[apps]]\nprocess = \"B.exe\"\ncaret_use_top = true\n");
+        write(&u2, "[[apps]]\nprocess = \"B.exe\"\ndisabled = true\n");
+        with_system(
+            "[[apps]]\nprocess = \"B.exe\"\ncaret_use_top = true\n",
+            || set_user_first_show_mode(&u2, "b.exe", Some(FirstShowMode::Wait)).unwrap(),
+        );
+        assert!(
+            AppCompat::load_layered(Some(&d2), None, Some(&u2))
+                .get_rule("B.exe")
+                .is_none()
+        );
+        for x in [&d, &u, &d2, &u2] {
+            let _ = std::fs::remove_dir_all(x);
+        }
+    }
+
+    /// HostRender 白名单只收 `host_render = true` 的进程，保留原始大小写，被禁用的不算。
+    #[test]
+    fn host_render_processes_collects_only_enabled_ones_with_original_case() {
+        let c = load(
+            "[[apps]]\nprocess = \"SearchHost.exe\"\nhost_render = true\n\n[[apps]]\nprocess = \"Other.exe\"\ncaret_use_top = true\n\n[[apps]]\nprocess = \"Off.exe\"\nhost_render = true\ndisabled = true\n",
+            "",
+            "hr",
+        );
+        assert_eq!(
+            c.host_render_processes(),
+            vec!["SearchHost.exe".to_string()]
+        );
+    }
+
+    // ───────────── 右键菜单写入路径 ─────────────
+
+    fn with_system<R>(text: &str, f: impl FnOnce() -> R) -> R {
+        with_menu_system(raw(text), true, f)
+    }
+
+    #[test]
+    fn menu_set_stores_only_the_changed_field() {
+        let dir = tmp("m_set");
+        with_system(WECHAT, || {
+            set_user_first_show_mode(&dir, "weixin.exe", Some(FirstShowMode::Instant)).unwrap();
+        });
+        let text = read(&dir);
+        assert!(text.contains("first_show_mode = \"instant\""), "{text}");
+        assert!(
+            !text.contains("caret_use_top") && !text.contains("stale_probe_guard"),
+            "不得把系统字段拷进用户层: {text}"
+        );
+        assert!(
+            text.contains("process = \"Weixin.exe\""),
+            "沿用系统层写法: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_clear_of_a_system_field_writes_unset_and_runtime_follows_global() {
+        let (d, u) = (tmp("m_clr_d"), tmp("m_clr_u"));
+        let sys =
+            "[[apps]]\nprocess = \"EXCEL.EXE\"\nfirst_show_mode = \"wait\"\nauto_pair = false\n";
+        write(&d, sys);
+        with_system(sys, || {
+            set_user_first_show_mode(&u, "excel.exe", None).unwrap()
+        });
+        assert!(
+            read(&u).contains("unset = [\"first_show_mode\"]"),
+            "{}",
+            read(&u)
+        );
+        let rt = AppCompat::load_layered(Some(&d), None, Some(&u));
+        let r = rt.get_rule("EXCEL.EXE").unwrap();
+        assert_eq!(
+            r.first_show_mode, None,
+            "菜单选「跟随全局」必须真的跟随全局，不能被出厂值顶回来"
+        );
+        assert_eq!(r.auto_pair, Some(false));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&u);
+    }
+
+    #[test]
+    fn menu_clear_of_a_field_the_system_lacks_leaves_no_trace() {
+        let dir = tmp("m_noop");
+        with_system(WECHAT, || {
+            set_user_first_show_mode(&dir, "weixin.exe", Some(FirstShowMode::Fast)).unwrap();
+            set_user_first_show_mode(&dir, "weixin.exe", None).unwrap();
+        });
+        assert!(
+            !read(&dir).contains("[[apps]]"),
+            "清掉最后一项后整条应消失，不留空壳: {}",
+            read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_value_equal_to_the_system_leaves_no_entry() {
+        let dir = tmp("m_same");
+        with_system(WECHAT, || {
+            set_user_host_render(&dir, "Weixin.exe", false).unwrap()
+        });
+        with_system(
+            "[[apps]]\nprocess = \"S.exe\"\nfirst_show_mode = \"wait\"\n",
+            || {
+                set_user_first_show_mode(&dir, "s.exe", Some(FirstShowMode::Wait)).unwrap();
+            },
+        );
+        assert!(
+            !read(&dir).contains("[[apps]]"),
+            "与系统一致 / 与默认一致都不该落盘: {}",
+            read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_host_render_false_overrides_a_system_true() {
+        let (d, u) = (tmp("m_hr_d"), tmp("m_hr_u"));
+        let sys = "[[apps]]\nprocess = \"SearchHost.exe\"\nhost_render = true\n";
+        write(&d, sys);
+        with_system(sys, || {
+            set_user_host_render(&u, "searchhost.exe", false).unwrap()
+        });
+        let rt = AppCompat::load_layered(Some(&d), None, Some(&u));
+        assert!(
+            rt.host_render_processes().is_empty(),
+            "用户把它从白名单里去掉必须生效"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&u);
+    }
+
+    /// 拖动落盘把定位方式与坐标一起写，让这条差异自成一体，不依赖系统层恰好配了什么。
+    #[test]
+    fn dragging_persists_position_mode_together_with_coords() {
+        let (d, u) = (tmp("m_drag_d"), tmp("m_drag_u"));
+        let sys = "[[apps]]\nprocess = \"X60_Toolbox.exe\"\nfirst_show_mode = \"wait\"\n";
+        write(&d, sys);
+        with_system(sys, || {
+            set_user_candidate_fixed_pos(&u, "X60_Toolbox.exe", 320, 480).unwrap()
+        });
+        let text = read(&u);
+        assert!(
+            text.contains("candidate_position_mode = \"fixed\""),
+            "{text}"
+        );
+        let r = AppCompat::load_layered(Some(&d), None, Some(&u))
+            .get_rule("x60_toolbox.exe")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            r.candidate_position_mode,
+            Some(CandidatePositionMode::Fixed)
+        );
+        assert_eq!((r.candidate_x, r.candidate_y), (320, 480));
+        assert_eq!(
+            r.first_show_mode,
+            Some(FirstShowMode::Wait),
+            "拖动不能顶掉系统层的别的字段"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&u);
+    }
+
+    #[test]
+    fn clearing_candidate_position_mode_also_clears_coords() {
+        let dir = tmp("m_cpm");
+        with_system("", || {
+            set_user_candidate_fixed_pos(&dir, "a.exe", 10, 20).unwrap();
+            set_user_candidate_position_mode(&dir, "a.exe", None).unwrap();
+        });
+        assert!(
+            !read(&dir).contains("candidate_"),
+            "清除定位方式要一并清坐标，免得留孤儿坐标: {}",
+            read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_position_writes_mode_and_coords_together() {
+        let dir = tmp("m_sp");
+        with_system("", || {
+            set_user_status_position(&dir, "a.exe", Some(StatusPositionMode::Fixed), 5, 6).unwrap();
+        });
+        let t = read(&dir);
+        assert!(
+            t.contains("status_position_mode = \"fixed\"")
+                && t.contains("status_x = 5")
+                && t.contains("status_y = 6"),
+            "{t}"
+        );
+        with_system("", || {
+            set_user_status_position(&dir, "a.exe", Some(StatusPositionMode::FollowCaret), 5, 6)
+                .unwrap();
+        });
+        let t = read(&dir);
+        assert!(
+            t.contains("follow_caret") && !t.contains("status_x"),
+            "非 fixed 不用坐标，要清掉: {t}"
+        );
+        with_system("", || {
+            set_user_status_position(&dir, "a.exe", None, 0, 0).unwrap()
+        });
+        assert!(
+            !read(&dir).contains("[[apps]]"),
+            "清除后整条消失: {}",
+            read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_write_preserves_other_rules_other_sections_and_unknown_keys() {
+        let dir = tmp("m_keep");
+        write(
+            &dir,
+            "[[apps]]\nprocess = \"other.exe\"\nauto_pair = true\nfuture_field = 7\n\n\
+             [[commit_newline]]\nprocess = \"w.exe\"\nstyle = \"cr\"\n\n\
+             [[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"A\"]\n",
+        );
+        with_system("", || {
+            set_user_first_show_mode(&dir, "new.exe", Some(FirstShowMode::Fast)).unwrap()
+        });
+        let t = read(&dir);
+        for needle in [
+            "other.exe",
+            "future_field = 7",
+            "[[commit_newline]]",
+            "style = \"cr\"",
+            "[[initial_mode_scope]]",
+            "new.exe",
+        ] {
+            assert!(t.contains(needle), "写回后丢了 {needle}: {t}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 各包装函数写出的值都要能被运行时读回来（往返）。
+    #[test]
+    fn every_menu_wrapper_roundtrips_through_the_runtime_loader() {
+        let u = tmp("m_all");
+        let d = tmp("m_all_d");
+        write(&d, "");
+        with_system("", || {
+            set_user_initial_mode(&u, "a.exe", Some(InitialMode::English)).unwrap();
+            set_user_initial_punct(&u, "a.exe", Some(InitialMode::Chinese)).unwrap();
+            set_user_auto_pair(&u, "a.exe", Some(false)).unwrap();
+            set_user_password_force_english(&u, "a.exe", Some(true)).unwrap();
+            set_user_schema(&u, "a.exe", Some("@remember".into())).unwrap();
+            set_user_ignore_host_ime_close(&u, "a.exe", Some(true)).unwrap();
+            set_user_smart_method(&u, "a.exe", Some(SmartMethod::HoldComposition)).unwrap();
+            set_user_caret_offset(&u, "a.exe", 3, -4).unwrap();
+            set_user_status_fallback(&u, "a.exe", Some(StatusFallback::Hide)).unwrap();
+        });
+        let rt = AppCompat::load_layered(Some(&d), None, Some(&u));
+        let r = rt.get_rule("a.exe").expect("菜单写入后运行时必须读得到");
+        assert_eq!(r.initial_mode, Some(InitialMode::English));
+        assert_eq!(r.initial_punct, Some(InitialMode::Chinese));
+        assert_eq!(r.auto_pair, Some(false), "显式 false 必须落盘");
+        assert_eq!(r.password_force_english, Some(true));
+        assert_eq!(r.app_schema(), Some(AppSchema::Remember));
+        assert_eq!(r.ignore_host_ime_close, Some(true));
+        assert_eq!(r.smart_method, Some(SmartMethod::HoldComposition));
+        assert_eq!((r.caret_offset_x, r.caret_offset_y), (3, -4));
+        assert_eq!(r.status_fallback_position, Some(StatusFallback::Hide));
+        let _ = std::fs::remove_dir_all(&u);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 菜单「宿主关闭输入法」第一档是「跟随内置规则」：`None` 必须是还原（继承出厂），
+    /// 而不是清除——清除会给出厂打开的宿主写 unset，把内置规则整个去掉。
+    #[test]
+    fn menu_ignore_host_ime_close_none_inherits_the_builtin_rule() {
+        let (d, u) = (tmp("m_ihc_d"), tmp("m_ihc_u"));
+        let sys = "[[apps]]\nprocess = \"X60_Toolbox.exe\"\nignore_host_ime_close = true\n";
+        write(&d, sys);
+        with_system(sys, || {
+            set_user_ignore_host_ime_close(&u, "x60_toolbox.exe", Some(false)).unwrap();
+        });
+        let off = AppCompat::load_layered(Some(&d), None, Some(&u));
+        assert_eq!(
+            off.get_rule("X60_Toolbox.exe")
+                .unwrap()
+                .ignore_host_ime_close,
+            Some(false),
+            "用户显式不采纳"
+        );
+        with_system(sys, || {
+            set_user_ignore_host_ime_close(&u, "x60_toolbox.exe", None).unwrap()
+        });
+        assert!(
+            parse_raw(&read(&u))
+                .unwrap()
+                .apps
+                .iter()
+                .all(|r| !r.contains_key("unset")),
+            "还原不该留 unset: {}",
+            read(&u)
+        );
+        let back = AppCompat::load_layered(Some(&d), None, Some(&u));
+        assert_eq!(
+            back.get_rule("X60_Toolbox.exe")
+                .unwrap()
+                .ignore_host_ime_close,
+            Some(true),
+            "继承回内置规则"
+        );
+        with_system(sys, || {
+            set_user_ignore_host_ime_close(&u, "x60_toolbox.exe", Some(true)).unwrap()
+        });
+        assert!(
+            !read(&u).contains("[[apps]]"),
+            "显式写成与内置相同属冗余: {}",
+            read(&u)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&u);
+    }
+
+    /// 系统层读不到（菜单路径拿不到系统预置文件）时，清除字段不能凭「系统里没有」就省掉 unset。
+    #[test]
+    fn menu_clear_with_unknown_system_layer_still_writes_unset() {
+        let dir = tmp("m_unknown");
+        with_menu_system(Raw::default(), false, || {
+            set_user_first_show_mode(&dir, "a.exe", None).unwrap();
+        });
+        assert!(
+            parse_raw(&read(&dir))
+                .unwrap()
+                .apps
+                .iter()
+                .any(|r| r.contains_key("unset")),
+            "读不到系统层时保守地写 unset: {}",
+            read(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 菜单路径遇到损坏的用户层：仍然重建（不让菜单卡死），但先把原文件留一份 .bad。
+    #[test]
+    fn menu_write_on_a_broken_file_keeps_a_copy_of_the_original() {
+        let dir = tmp("m_bad");
+        let broken = "[[apps\nprocess=";
+        write(&dir, broken);
+        with_system("", || {
+            set_user_first_show_mode(&dir, "a.exe", Some(FirstShowMode::Fast)).unwrap()
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{COMPAT_FILE_NAME}.bad"))).unwrap(),
+            broken
+        );
+        assert!(read(&dir).contains("a.exe"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
