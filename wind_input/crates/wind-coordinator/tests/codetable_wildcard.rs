@@ -873,3 +873,59 @@ fn phrases_do_not_join_wildcard_results() {
         assert_eq!(has, !on, "wildcard={on}：短语出现与否不符");
     }
 }
+
+/// §3.2 回归：出厂 `top_code_commit = true` 下，满码通配串再敲第 5 键不得把通配结果顶上屏，
+/// 且通配开 / 关行为逐字一致（混输与纯五笔都钉）。
+fn fifth_key_outcome(cfg: Config, keys: &str, fifth: &str) -> (Option<String>, String) {
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, keys);
+    let act = press(&coord, fifth);
+    (
+        committed(&act).map(str::to_string),
+        coord.debug_input_buffer(),
+    )
+}
+
+#[test]
+fn mixed_wildcard_fifth_key_never_top_commits() {
+    if !mixed_ready() {
+        eprintln!("跳过：混输方案数据不存在");
+        return;
+    }
+    for (keys, fifth) in [("wqvz", "x"), ("gzzz", "a")] {
+        let mut results = vec![];
+        for on in [true, false] {
+            let mut cfg = wubi_pinyin(on);
+            cfg.schema.codetable.top_code_commit = true;
+            results.push(fifth_key_outcome(cfg, keys, fifth));
+        }
+        let want = (None, format!("{keys}{fifth}"));
+        assert_eq!(results[0], want, "混输通配开：{keys}+{fifth} 不得顶字");
+        assert_eq!(
+            results[0], results[1],
+            "混输通配开/关须一致：{keys}+{fifth}"
+        );
+    }
+}
+
+#[test]
+fn pure_wubi_wildcard_fifth_key_never_top_commits() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    for (keys, fifth) in [("wqvz", "x"), ("gzzz", "a")] {
+        let mut results = vec![];
+        for on in [true, false] {
+            let mut cfg = wubi(on, "z");
+            cfg.schema.codetable.top_code_commit = true;
+            results.push(fifth_key_outcome(cfg, keys, fifth));
+        }
+        let want = (None, format!("{keys}{fifth}"));
+        assert_eq!(results[0], want, "纯五笔通配开：{keys}+{fifth}");
+        assert_eq!(
+            results[0], results[1],
+            "纯五笔通配开/关须一致：{keys}+{fifth}"
+        );
+    }
+}
