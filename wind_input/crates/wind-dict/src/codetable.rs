@@ -806,6 +806,59 @@ impl CodetableDict {
         results
     }
 
+    /// 通配查询（内存路径对应 [`crate::datformat::WdatReader::search_pattern`]）：以首个通配前的
+    /// 字面前缀做 range 扫描、逐条过滤，等长档先取满 `limit`、余额给更长档。
+    /// 首位即通配时字面前缀为空，退化为全表扫描（内存模式只在无 wdat 缓存时出现）。
+    pub fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<crate::cached::DictHit> {
+        if limit == 0 || pattern.is_empty() {
+            return Vec::new();
+        }
+        let lit = crate::layer::literal_prefix(pattern, wildcard);
+        let n = pattern.chars().count();
+        let mut exact: Vec<crate::cached::DictHit> = Vec::new();
+        let mut longer: Vec<crate::cached::DictHit> = Vec::new();
+        for (code, entries) in self.entries.range(lit.to_string()..) {
+            if !code.starts_with(lit) {
+                break;
+            }
+            if !crate::layer::pattern_matches(pattern, wildcard, code, with_prefix) {
+                continue;
+            }
+            let bucket = if code.chars().count() == n {
+                &mut exact
+            } else {
+                &mut longer
+            };
+            for e in entries {
+                bucket.push(crate::cached::DictHit {
+                    code: code.clone(),
+                    text: e.text.clone(),
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                });
+            }
+        }
+        let key = |a: &crate::cached::DictHit, b: &crate::cached::DictHit| {
+            b.weight
+                .cmp(&a.weight)
+                .then(a.order.cmp(&b.order))
+                .then_with(|| a.code.cmp(&b.code))
+        };
+        exact.sort_by(key);
+        longer.sort_by(key);
+        exact.truncate(limit);
+        longer.truncate(limit - exact.len());
+        exact.extend(longer);
+        exact
+    }
+
     /// 遍历全部条目(供反查索引构建):对每个 (code, text, weight) 调用 `f`。
     pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
         for (code, entries) in &self.entries {
@@ -2292,5 +2345,113 @@ columns:
             vec![("uu".to_string(), 0)],
             "marker 在编码列 ⇒ 对调"
         );
+    }
+
+    /// BTreeMap 通配：以首个通配前的字面前缀 range 扫描 + 逐条过滤；等长档先取满。
+    #[test]
+    fn search_pattern_scans_literal_prefix_and_tiers_equal_length_first() {
+        let mut d = CodetableDict::empty();
+        for (code, text, w) in [
+            ("ab", "甲", 10),
+            ("ac", "乙", 20),
+            ("abcd", "丙", 9999),
+            ("bb", "丁", 30),
+            ("abd", "戊", 5),
+        ] {
+            d.merge_single(code.into(), text.into(), w, 0);
+        }
+        let got = |p: &str, lim: usize, wp: bool| -> Vec<String> {
+            d.search_pattern(p, '?', lim, wp)
+                .into_iter()
+                .map(|h| h.text)
+                .collect()
+        };
+        assert_eq!(got("a?", 10, false), ["乙", "甲"]);
+        assert_eq!(got("a?", 10, true), ["乙", "甲", "丙", "戊"]);
+        assert_eq!(got("a?", 1, true), ["乙"], "名额先给等长档");
+        assert_eq!(
+            got("?b", 10, false),
+            ["丁", "甲"],
+            "首位通配：字面前缀为空，全表扫"
+        );
+        assert_eq!(got("??d", 10, false), ["戊"]);
+        assert!(got("x?", 10, true).is_empty());
+    }
+
+    /// 对拍：`search_pattern` == `for_each_entry` 全遍历 + `pattern_matches` 过滤 + 同口径排序截断。
+    #[test]
+    fn search_pattern_matches_full_scan() {
+        let alphabet = ['a', 'b', 'c'];
+        let mut d = CodetableDict::empty();
+        let mut i = 0i32;
+        for len in 1..=4u32 {
+            for k in 0..3usize.pow(len) {
+                let mut code = String::new();
+                let mut x = k;
+                for _ in 0..len {
+                    code.push(alphabet[x % 3]);
+                    x /= 3;
+                }
+                i += 1;
+                if i % 5 == 0 {
+                    continue;
+                }
+                let w = (i * 7919) % 7 * 100; // 权重大量重复，逼出 tie-break
+                d.merge_single(code.clone(), format!("甲{i}"), w, 0);
+                if i % 4 == 0 {
+                    d.merge_single(code, format!("乙{i}"), w, 0);
+                }
+            }
+        }
+        let reference =
+            |pat: &str, limit: usize, with_prefix: bool| -> Vec<(String, String, i32, i32)> {
+                let n = pat.chars().count();
+                let mut seq = std::collections::HashMap::<String, i32>::new();
+                let (mut exact, mut longer) = (Vec::new(), Vec::new());
+                d.for_each_entry(&mut |code, text, weight| {
+                    // for_each_entry 按码内顺序给出，序号即 order
+                    let order = seq.entry(code.to_string()).or_insert(0);
+                    let o = *order;
+                    *order += 1;
+                    if !crate::layer::pattern_matches(pat, '?', code, with_prefix) {
+                        return;
+                    }
+                    let row = (code.to_string(), text.to_string(), weight, o);
+                    if code.chars().count() == n {
+                        exact.push(row);
+                    } else {
+                        longer.push(row);
+                    }
+                });
+                let key = |a: &(String, String, i32, i32), b: &(String, String, i32, i32)| {
+                    b.2.cmp(&a.2)
+                        .then(a.3.cmp(&b.3))
+                        .then_with(|| a.0.cmp(&b.0))
+                };
+                exact.sort_by(key);
+                longer.sort_by(key);
+                exact.truncate(limit);
+                longer.truncate(limit - exact.len());
+                exact.extend(longer);
+                exact
+            };
+        for pat in [
+            "?", "a?", "?b", "??", "a?c", "??c?", "????", "c??a", "?a", "abc",
+        ] {
+            for with_prefix in [false, true] {
+                for limit in [1usize, 3, 10, 1000] {
+                    let got: Vec<_> = d
+                        .search_pattern(pat, '?', limit, with_prefix)
+                        .into_iter()
+                        .map(|h| (h.code, h.text, h.weight, h.order))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        reference(pat, limit, with_prefix),
+                        "pat={pat} with_prefix={with_prefix} limit={limit}"
+                    );
+                }
+            }
+        }
     }
 }

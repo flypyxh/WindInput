@@ -307,6 +307,45 @@ impl DictLayer for SystemDictLayer {
     fn has_longer_code(&self, prefix: &str) -> bool {
         self.dict.has_longer_code(prefix)
     }
+
+    /// 通配查询：委托底层有序索引，权重按本层口径换算，等长档在前。
+    fn search_pattern(
+        &self,
+        pattern: &str,
+        wildcard: char,
+        limit: usize,
+        with_prefix: bool,
+    ) -> Vec<Candidate> {
+        let n = pattern.chars().count();
+        let mut v: Vec<Candidate> = self
+            .dict
+            .search_pattern(pattern, wildcard, limit, with_prefix)
+            .into_iter()
+            .map(|hit| {
+                let is_prefix = hit.code.chars().count() > n;
+                Candidate {
+                    text: hit.text,
+                    code: hit.code,
+                    weight: self.effective_weight(hit.weight),
+                    meta: CandidateMeta {
+                        raw_weight: hit.weight,
+                        weight_layer: Some(self.name.clone()),
+                        ..Default::default()
+                    },
+                    natural_order: hit.order,
+                    boundary: hit.boundary,
+                    is_prefix,
+                    source: CandidateSource::None,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| crate::layer::cmp_pattern(n, a, b));
+        if limit > 0 {
+            v.truncate(limit);
+        }
+        v
+    }
 }
 
 #[cfg(test)]
@@ -493,5 +532,25 @@ mod tests {
             Some("main"),
             "来源标注须跟着回退，不得残留已关闭的 ext"
         );
+    }
+
+    /// 系统层把通配命中转成候选：带完整 code、更长码标 `is_prefix`、等长档在前。
+    #[test]
+    fn system_layer_answers_pattern_queries() {
+        let mut d = CodetableDict::empty();
+        d.merge_single("ab".into(), "甲".into(), 10, 0);
+        d.merge_single("abcd".into(), "丙".into(), 9999, 0);
+        let layer = SystemDictLayer::new(CachedDict::Memory(d), "sys");
+        let r = layer.search_pattern(
+            &format!("a{}", crate::WILDCARD_SLOT),
+            crate::WILDCARD_SLOT,
+            10,
+            true,
+        );
+        let got: Vec<(&str, &str, bool)> = r
+            .iter()
+            .map(|c| (c.text.as_str(), c.code.as_str(), c.is_prefix))
+            .collect();
+        assert_eq!(got, [("甲", "ab", false), ("丙", "abcd", true)]);
     }
 }
