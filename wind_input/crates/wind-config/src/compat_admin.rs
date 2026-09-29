@@ -890,6 +890,29 @@ style = \"cr\"
         );
     }
 
+    /// 元数据里登记的每个枚举可选值都必须被真实解析器接受并原样往返；
+    /// 否则设置端下拉框里会出现「选了却写不进去」的选项。
+    #[test]
+    fn every_registered_enum_option_roundtrips_through_the_real_parser() {
+        use crate::compat_schema::{COMPAT_FIELDS, Kind};
+        for f in COMPAT_FIELDS.iter().filter(|f| f.kind == Kind::Enum) {
+            let sec = Section::parse(f.section).unwrap();
+            for opt in f.options {
+                let mut l = layers("", "");
+                l.upsert(sec, "probe.exe", &patch(json!({ f.key: opt })))
+                    .unwrap_or_else(|e| panic!("{}.{} = {opt} 被拒绝: {e}", f.section, f.key));
+                let v = l.view_of(sec, "probe.exe").unwrap();
+                assert_eq!(
+                    v.effective[f.key],
+                    json!(opt),
+                    "{}.{} = {opt} 往返后不一致",
+                    f.section,
+                    f.key
+                );
+            }
+        }
+    }
+
     fn tmp(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("wind_compat_adm_{tag}_{}", std::process::id()))
     }
