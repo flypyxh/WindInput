@@ -14,7 +14,7 @@
 | `src/lib.rs` | 对外导出 `CoreRpc`、`DispatchState`、`dispatch`、`EventSink`、`RpcServer`、`ctrl_endpoint`、`events_endpoint` |
 | `src/dispatch.rs` | 传输无关的 JSON-RPC 分发：`system.*` / `config.*` 本地处理，其余转发 `CoreRpc::data_rpc`；含 `FakeCore` stub 单测 |
 | `src/server.rs` | `RpcServer` 句柄：`start()` 启动 ctrl + events 两个后台线程；`ctrl_endpoint` / `events_endpoint` 管道/套接字路径生成 |
-| `src/events.rs` | `EventSink`：可 Clone 的广播句柄，`emit_config_changed` / `emit_dict_changed` / `emit_needs_restart` |
+| `src/events.rs` | `EventSink`：可 Clone 的广播句柄，`emit_config_changed` / `emit_dict_changed` / `emit_compat_changed` / `emit_needs_restart` |
 | `src/client.rs` | 最小同步客户端（单次请求-响应），供 `wind_input config` CLI 向运行中 core 触发热重载 |
 | `src/capabilities.rs` | 从 `config_schema::REGISTRY` + L1⊕L2 系统预置配置动态生成 `system.capabilities`，替代退役的 manifest.toml |
 
@@ -27,6 +27,7 @@
 - **新增 RPC 方法**：在 `dispatch.rs` 的 `handle()` match 新增一个 arm 即可，**无需手动注册**（与 Go 版的 RegisterMethod 不同）；数据类方法只需在宿主的 `data_rpc` 里加 arm。
 - **capabilities 缓存**：`DispatchState` 构造时调 `capabilities::generate()` 一次性生成并缓存，变更 `config_schema::REGISTRY` 或 `Config::default()` 后需重启才刷新。
 - **EventSink 使用**：core 在 dict 写操作后调 `event_sink().emit_dict_changed(...)`, `config.setItems` 和 `config.reload` 会自动广播 `"config.changed"`，宿主无需手动触发。
+- **`compat.*`（应用兼容规则）**：dispatch 把 `compat.` 前缀整体转发给宿主 `data_rpc`（实现在 `wind-webdata` → `wind_config::compat_admin::rpc`），方法：`list` / `schema` / `upsert` / `resetField` / `setDisabled` / `reset` / `resetAll` / `export` / `import`。写方法成功后 dispatch 自动广播 `"compat.changed"`（`{method}`），**只读方法（list/schema/export）与 `dryRun` 导入不广播**，失败也不广播——见 `compat_method_writes`。宿主不要自己再发一次。新增 `compat.*` 方法时，若它会改用户层文件，无需改这里（默认按写处理）；若是只读，必须加进 `compat_method_writes` 的只读名单，否则设置页每次读取都会触发一次刷新循环。
 - **平台传输**：Windows 管道路径由 `ctrl_endpoint(suffix)` / `events_endpoint(suffix)` 生成（`suffix` 来自 `variant::pipe_suffix()`）；传输实现代码以 `#[path = "transport_*.rs"]` 按平台切换，dispatch/协议层平台无关。
 - **client.rs 失败语义**：连不上（core 未运行）立即返回 `Err`，调用方应回退到离线直写配置文件，不得重试。
 

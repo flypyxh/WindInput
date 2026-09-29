@@ -204,6 +204,7 @@ fn app_compat_seed() -> toml::Value {
     let rule = AppCompatRule {
         process: "seed.exe".to_string(),
         comment: "seed".to_string(),
+        disabled: true,
         caret_use_top: true,
         stale_probe_guard: true,
         host_render: true,

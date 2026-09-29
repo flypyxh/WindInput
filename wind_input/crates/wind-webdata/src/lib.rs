@@ -585,6 +585,8 @@ pub trait WebDataRpc: WebDataHost {
             "quick.add" => self.web_quick_add(params),
             "quick.setText" => self.web_quick_set_text(params),
             "quick.delete" => self.web_quick_delete(params),
+            // ── compat.*：应用兼容规则的分层管理（逻辑全在 wind_config::compat_admin）──
+            m if m.starts_with("compat.") => self.web_compat_rpc(m, params),
             "quick.export" => self.web_quick_export(),
             "quick.import" => self.web_quick_import(params),
             "quick.previewImport" => self.web_quick_preview_import(params),
@@ -3448,6 +3450,26 @@ pub trait WebDataRpc: WebDataHost {
         let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
         self.quick_format_delete(kind, id)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// `compat.*` 的薄分派：纯逻辑在 `compat_admin::rpc`，这里只负责取目录、
+    /// 写成功后让宿主重载。
+    fn web_compat_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
+        let data_dir = wind_config::Config::data_dir();
+        let custom_dir = wind_config::Config::custom_data_dir();
+        let user_dir = wind_config::Config::user_config_dir();
+        let out = wind_config::compat_admin::rpc(
+            method,
+            params,
+            data_dir.as_deref(),
+            custom_dir.as_deref(),
+            user_dir.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if out.wrote {
+            self.reload_compat();
+        }
+        Ok(out.value)
     }
 
     fn web_quick_export(&self) -> anyhow::Result<Value> {

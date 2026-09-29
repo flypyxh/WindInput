@@ -7,6 +7,22 @@
 #   comment:              说明（仅文档用途）
 #   caret_use_top:        使用 caret rect 的 top 而非 bottom 定位候选框
 #                         适用于 GetTextExt 返回的 height 不稳定的 WebView 应用
+#   stale_probe_guard:    拦截「组合期间上报的光标位置仍停在上一次组合」的宿主：probe 若与
+#                         组合前宿主主动上报的空闲坐标矛盾即不予采信，首显改用空闲坐标。
+#                         微信、飞书在线表格换单元格首键候选窗从旧位置跳到新位置就是它。
+#                         必须逐宿主开启：WindTerm 一类宿主正确答案相反（probe 才是新的）。
+#   password_force_english:
+#                         该应用的密码框是否强制英文；不写 = 跟随全局。宿主把普通输入框误
+#                         报成密码框时对它关掉，或全局关闭时只对某应用开启。
+#   schema:               该应用固定使用的输入方案 id；写 "@remember" 则记住它上次用的方案。
+#                         应用内手动切换只改本应用，不写全局方案。
+#   status_position_mode / status_x / status_y / status_fallback_position:
+#                         状态气泡定位：跟随光标 / 固定 / 屏幕或窗口锚点；固定模式下
+#                         status_x/y 是该应用自己的落点；status_fallback_position 是
+#                         光标不可信时的兜底位置。不写 = 跟随全局 ui.status.*。
+#   disabled:             仅用户层使用。写 disabled = true 即禁用同名的系统规则（该进程
+#                         合并后没有这条规则）；条目里的其它字段照常保留，去掉本行即恢复。
+#                         [[initial_mode_scope]] / [[commit_newline]] 同样支持。
 #   composition_start_pair_guard:
 #                         将 TSF_COMPOSITION（selection 无效、以组合起点降级）紧接
 #                         TSF_SELECTION 且 compStart 不变的两帧识别为同一次采样，禁止
@@ -110,6 +126,9 @@
 #                         单位是 dp 不是物理像素：会按目标点所在显示器的当前 DPI 换算成
 #                         物理像素后再叠加，故同一份数值在 100%/150%/200% 缩放的屏幕上
 #                         观感一致，多屏不同缩放也不必分别配置。
+#
+# 设置端「应用兼容性」页统一管理本文件与用户层 compat.toml（改写、禁用、还原、导入导出），
+# 逐字段的功能与解决的问题以 wind-config 的 compat_schema 为准，帮助页读的也是它。
 #
 # first_show_mode / initial_mode / initial_punct / auto_pair / candidate_position_mode /
 # ignore_host_ime_close 对应右键菜单：「应用独立配置（<进程名>）」子菜单，各自单选。
