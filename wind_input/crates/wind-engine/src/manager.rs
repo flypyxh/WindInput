@@ -5666,8 +5666,9 @@ impl EngineManager {
                 split_alt_display: crate::codetable::SplitAltDisplay::parse(
                     &schema.engine.codetable.split_alt_display,
                 ),
-                // 通配配置接线在后续任务；此处占位保持行为不变。
-                wildcard: None,
+                // 通配：与上屏行为同源于 `eff`（全局基线 + 方案折叠；overlay 方案取内置基线，
+                // 默认关）。非法键在此告警一次并视为关闭，协调器经 `active_wildcard_key` 取用。
+                wildcard: eff.wildcard_char(schema_id),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -7710,6 +7711,47 @@ mod tests {
         assert_eq!(np.z_key_repeat, global.z_key_repeat);
         assert_eq!(np.top_code_commit, global.top_code_commit);
 
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 通配两项与其它码表行为同一条折叠链：方案写了覆盖、没写回落全局；overlay 方案
+    /// 取内置基线，**不继承**全局开关（快符那类小符号表里 `z` 多半是正经编码）。
+    #[test]
+    fn wildcard_folds_from_schema_and_overlay_does_not_inherit() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_wildcard_fold");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        for (id, body) in [
+            ("wc_inline", "[engine.codetable]\nwildcard_key = \"?\"\n"),
+            ("wc_follow", ""),
+            ("wc_overlay", "[overlay]\n"),
+        ] {
+            let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"{id}\"\n[engine]\ntype = \"codetable\"\n{body}"
+            )
+            .unwrap();
+        }
+        let global = wind_config::CodetableGlobal {
+            wildcard: true,
+            ..Default::default()
+        };
+        let ov = std::env::temp_dir().join("wind_eng_wildcard_fold_ov");
+        let _ = std::fs::remove_dir_all(&ov);
+        let key = |id: &str| {
+            EngineManager::resolve_codetable(id, Some(&base_dir), &global, Some(&ov))
+                .wildcard_char(id)
+        };
+        assert_eq!(
+            key("wc_inline"),
+            Some('?'),
+            "方案写了键 ⇒ 覆盖；开关回落全局 true"
+        );
+        assert_eq!(key("wc_follow"), Some('z'), "都没写 ⇒ 全局");
+        assert_eq!(key("wc_overlay"), None, "overlay 方案不继承全局开关");
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
