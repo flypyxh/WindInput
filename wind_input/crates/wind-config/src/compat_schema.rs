@@ -493,14 +493,68 @@ pub fn known_keys(section: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// 枚举可选值的中文显示名（界面只显示中文，取值本身写在配置文件里、不翻译）。
+///
+/// 按取值 id 全局统一：同一个 id 在各字段里含义一致（`english` / `chinese` 在初始模式与初始标点里
+/// 都是英文 / 中文）。新增枚举取值必须在这里登记，[`tests::every_enum_option_has_a_chinese_label`]
+/// 守着——漏登记界面就会露出裸英文 id。
+pub const OPTION_LABELS: &[(&str, &str)] = &[
+    ("wait", "等定位准再显示"),
+    ("fast", "尽快显示"),
+    ("instant", "立即显示"),
+    ("follow_caret", "跟随光标"),
+    ("fixed", "固定位置"),
+    ("screen_center", "屏幕中央"),
+    ("screen_top_left", "屏幕左上"),
+    ("screen_top_right", "屏幕右上"),
+    ("screen_bottom_left", "屏幕左下"),
+    ("screen_bottom_right", "屏幕右下"),
+    ("window_center", "窗口中央"),
+    ("window_bottom_left", "窗口左下"),
+    ("last", "沿用上次位置"),
+    ("hide", "隐藏"),
+    ("english", "英文"),
+    ("chinese", "中文"),
+    ("delete_replace", "删除后替换"),
+    ("hold_composition", "保持组合串"),
+    ("keep", "保持原样"),
+    ("cr", "回车（CR）"),
+    ("lf", "换行（LF）"),
+    ("crlf", "回车换行（CRLF）"),
+];
+
+/// 取值 id 的中文名；没登记返回 `None`。
+pub fn option_label(id: &str) -> Option<&'static str> {
+    OPTION_LABELS
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, v)| *v)
+}
+
 /// `compat.schema` 的响应体。
 pub fn schema_json() -> Value {
+    // 编译期固定的数据，序列化不可能失败；出错就该响亮地报，别悄悄变成空 schema。
+    let mut fields = serde_json::to_value(COMPAT_FIELDS).expect("COMPAT_FIELDS 序列化");
+    if let Some(list) = fields.as_array_mut() {
+        for (f, meta) in list.iter_mut().zip(COMPAT_FIELDS) {
+            if meta.options.is_empty() {
+                continue;
+            }
+            // `optionLabels` 与 `options` 同序同长：界面按下标取，缺失的退回原 id。
+            f["optionLabels"] = json!(
+                meta.options
+                    .iter()
+                    .map(|o| option_label(o).unwrap_or(o))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
     json!({
         "groups": GROUPS
             .iter()
             .map(|(id, label)| json!({ "id": id, "label": label }))
             .collect::<Vec<_>>(),
-        "fields": COMPAT_FIELDS,
+        "fields": fields,
     })
 }
 
@@ -572,6 +626,31 @@ mod tests {
                 f.key
             );
         }
+    }
+
+    #[test]
+    fn every_enum_option_has_a_chinese_label() {
+        for f in COMPAT_FIELDS {
+            for o in f.options {
+                let zh = option_label(o)
+                    .unwrap_or_else(|| panic!("{}.{} 的取值 {o} 没有登记中文名", f.section, f.key));
+                assert!(
+                    zh.chars().any(|c| !c.is_ascii()),
+                    "{o} 的显示名 {zh:?} 里没有中文"
+                );
+            }
+        }
+        let v = schema_json();
+        let f = v["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == "first_show_mode")
+            .unwrap();
+        assert_eq!(
+            f["options"].as_array().unwrap().len(),
+            f["optionLabels"].as_array().unwrap().len()
+        );
     }
 
     #[test]

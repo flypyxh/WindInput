@@ -147,6 +147,10 @@ pub enum MenuCmd {
     /// 为当前焦点应用设置候选窗首显策略（compat.toml 的 first_show_mode）。
     /// 参数：0=跟随全局（清除规则）1=fast 2=wait 3=instant。三档互斥，UI 上呈现为子菜单单选。
     FirstShowMode(u8),
+    /// 启用 / 禁用当前焦点应用的**整条**兼容规则（compat.toml 的 `disabled`）。
+    /// 参数：0=禁用 1=启用。与设置端「应用兼容」里的「禁用 / 启用」同一件事：字段都留着，
+    /// 只是整条不生效，方便排查「是不是兼容规则导致的」。
+    CompatRuleEnabled(u8),
     /// 为当前焦点应用设置初始中英状态（compat.toml 的 initial_mode）。
     /// 参数：0=跟随全局（清除规则）1=英文 2=中文。
     InitialMode(u8),
@@ -234,7 +238,7 @@ impl MenuKind {
     /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点｜8000+ 诊断 HUD 分区｜
     /// 9000+ 自动配对｜10000+ 语言栏图标角标形状｜11000+ 软键盘面｜12000+ 候选窗定位｜
     /// 13000+ 忽略宿主关闭输入法｜14000+ 密码框强制英文｜15000+ 按应用方案｜
-    /// 16000+ 按应用状态气泡定位｜17000+ 按应用状态气泡兜底位置。
+    /// 16000+ 按应用状态气泡定位｜17000+ 按应用状态气泡兜底位置｜18000+ 按应用整条规则启用 / 禁用。
     pub fn to_menu_id(self) -> i32 {
         match self {
             MenuKind::Separator | MenuKind::Submenu | MenuKind::Label => 0,
@@ -297,6 +301,7 @@ impl MenuKind {
                 MenuCmd::AppSchemaRule(m) => 15000 + m as i32,
                 MenuCmd::StatusPositionRule(m) => 16000 + m as i32,
                 MenuCmd::StatusFallbackRule(m) => 17000 + m as i32,
+                MenuCmd::CompatRuleEnabled(m) => 18000 + m as i32,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -369,6 +374,7 @@ impl MenuKind {
             15000..=15999 => MenuCmd::AppSchemaRule((id - 15000) as u16),
             16000..=16255 => MenuCmd::StatusPositionRule((id - 16000) as u8),
             17000..=17255 => MenuCmd::StatusFallbackRule((id - 17000) as u8),
+            18000..=18001 => MenuCmd::CompatRuleEnabled((id - 18000) as u8),
             _ => return None,
         };
         Some(MenuKind::Command(cmd))

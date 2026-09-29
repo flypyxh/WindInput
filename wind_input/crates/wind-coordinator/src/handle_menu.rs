@@ -252,6 +252,7 @@ impl Coordinator {
             MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
             MenuCmd::FirstShowMode(m) => self.set_first_show_mode(m),
             MenuCmd::AutoPairRule(m) => self.set_auto_pair_rule(m),
+            MenuCmd::CompatRuleEnabled(m) => self.set_compat_rule_enabled(m == 1),
             MenuCmd::CandidatePositionRule(m) => self.set_candidate_position_rule(m),
             MenuCmd::IgnoreHostImeCloseRule(m) => self.set_ignore_host_ime_close_rule(m),
             MenuCmd::PasswordForceEnglishRule(m) => self.set_password_force_english_rule(m),
@@ -979,6 +980,35 @@ impl Coordinator {
         self.show_status();
     }
 
+    /// 启用 / 禁用当前焦点应用的整条兼容规则，并写入用户层 compat.toml（`disabled`）。
+    ///
+    /// 与设置端「应用兼容」窗里的「禁用 / 启用」是同一件事；字段都留着，只是整条不生效——
+    /// 用来快速判断「是不是兼容规则导致的问题」。写盘走 `app_compat::set_user_rule_disabled`
+    /// （与设置端同一套叠加语义），之后走 `reload_compat_and_refresh`：重载规则表并让当前
+    /// 前台进程的缓存立刻按新表重算（同 pid 时 `update_active_compat` 提前 return）。
+    pub(crate) fn set_compat_rule_enabled(&self, enabled: bool) {
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_compat_rule_enabled: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_compat_rule_enabled: 无用户配置目录，无法持久化");
+            return;
+        };
+        if let Err(e) = wind_config::app_compat::set_user_rule_disabled(&user_dir, &name, !enabled)
+        {
+            tracing::error!("set_compat_rule_enabled: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        self.reload_compat_and_refresh();
+        tracing::info!(
+            "兼容规则 for process={name}: {}",
+            if enabled { "启用" } else { "禁用" }
+        );
+        self.show_status();
+    }
+
     /// 为当前焦点应用设置符号自动配对开关，并写入用户层 compat.toml。
     /// `mode_id`：0=跟随全局（清除规则）1=启用 2=禁用。
     ///
@@ -1628,6 +1658,22 @@ impl Coordinator {
             use wind_config::app_compat::InitialMode as IM;
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
+            // 整条规则的开关：没有规则（系统层与用户层都没有）时没有可开关的东西，置灰。
+            // 勾选 = 规则在生效；点它 = 切到相反的状态（参数是目标状态，不是「切换」，
+            // 避免菜单快照与实际状态错开时点一下反而做反）。
+            let rule_switch = if enabled {
+                self.compat_dirs
+                    .1
+                    .as_deref()
+                    .map(|u| wind_config::app_compat::menu_rule_switch(u, &proc))
+                    .unwrap_or(wind_config::app_compat::RuleSwitch::NoRule)
+            } else {
+                wind_config::app_compat::RuleSwitch::NoRule
+            };
+            // 整条规则被禁用时，规则行不进规则表：下面各项读到的都是「跟随全局」，此时选了也写得进去
+            // 却不生效，还会显示成没选。所以先置灰，让用户先启用这条规则再逐项设置。
+            let has_proc = enabled;
+            let enabled = enabled && rule_switch != wind_config::app_compat::RuleSwitch::Disabled;
             let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) = {
                 let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
                 let rule = table.get_rule(&proc);
@@ -1648,11 +1694,12 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .auto_pair;
-            let header = if enabled {
+            let header = if has_proc {
                 proc.clone()
             } else {
                 "当前应用未知".to_string()
             };
+
             // 三档单选。「跟随全局」必须是独立一档，不能靠"取消勾选"表达——否则用户设了
             // 规则之后无从撤销。它对应写盘时的 None，即从 compat.toml 里清掉该字段。
             let tri = |cur: Option<IM>, mk: fn(u8) -> MenuCmd| {
@@ -1768,6 +1815,15 @@ impl Coordinator {
             };
             vec![
                 M::label(header),
+                M::separator(),
+                M::leaf(
+                    "启用此应用的兼容规则",
+                    cmd(MenuCmd::CompatRuleEnabled(
+                        (rule_switch != wind_config::app_compat::RuleSwitch::Enabled) as u8,
+                    )),
+                    rule_switch != wind_config::app_compat::RuleSwitch::NoRule,
+                    rule_switch == wind_config::app_compat::RuleSwitch::Enabled,
+                ),
                 M::separator(),
                 M::submenu("初始输入模式", tri(cur_mode, MenuCmd::InitialMode)),
                 M::submenu("初始标点模式", tri(cur_punct, MenuCmd::InitialPunct)),
