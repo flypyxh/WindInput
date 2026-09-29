@@ -174,7 +174,7 @@ wildcard_key = "z"
 - **首位字母判定必须晚于** `try_activate_mode` 与 `try_z_fallback`（沿用 `codetable-input-chars.md`
   §3.4 的顺序铁律）——让位本就是它们先赢。
 - 缓冲含通配时：`accumulate_code_char` 跳过顶码；`build_candidates` 跳过自动上屏复评与清空复核；
-  跳过五笔拼音混输。
+  混输见 §10。
 - 启动体检：`wildcard_conflicts()`，与 `code_char_conflicts` 并列输出。
 
 ---
@@ -233,10 +233,10 @@ wildcard_key = "z"
   - overlay 模式（临拼 / 快捷输入）永不作通配，门控在 `wildcard_enters`。
 - **待定（需用户拍板）**：五笔拼音混输方案开通配且键为 `z` 时，非首位的 `z`（如 `hanzi`）被当通配，
   该串只查主码表、拼音混输被跳过。现按 §3.1「混输只走主码表」暂保留，未决定是否对混输另作处理。
-  （已由下条终审修正裁决。）
+  （已由下条终审修正裁决；该裁决与本条均已被 §10 作废。）
 
 - **2026-09-29 终审修正**（全分支终审）：
-  - **混输关闭通配**：`MixedEngine` 有拼音子引擎时 `wildcard_key()` / `convert_wildcard` 返回 `None`，
+  - **混输关闭通配**（已被 §10 作废）：`MixedEngine` 有拼音子引擎时 `wildcard_key()` / `convert_wildcard` 返回 `None`，
     五笔拼音混输方案下通配不生效（§3.1「拼音不参与」）。非首位 `z` 吞掉 `hanzi` / `xianzai` 的拼音候选
     不可接受；混输用户要通配可切到纯码表方案。
   - **首位符号键一律让位**（§3.3）：符号键的标点产物即是它绑定的功能，对应用户原始要求「键已启动
