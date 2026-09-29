@@ -4163,6 +4163,8 @@ impl Coordinator {
                         s.input_buffer.clear();
                         s.candidates.clear();
                         s.preedit.clear();
+                        // 引擎换了：直接辅助码的前缀快照是旧引擎的候选，一并丢弃。
+                        s.direct_aux_prev = None;
                     }
                     self.notify_ui_hide();
                     self.push_state_update();

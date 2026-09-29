@@ -413,6 +413,8 @@ impl crate::Coordinator {
             return;
         }
         let before = state.candidates.len();
+        // 直接辅助码的前缀快照带着旧的常用字判定（过滤与排序都吃它），原地重建前作废。
+        state.direct_aux_prev = None;
         // 重建候选：`is_common` 一变，过滤（智能 / 常用字档）与**排序**都会跟着变——
         // 后者容易被忘：混输的拼音精确档拿 `is_common` 当提档准入（`is_pinyin_exact_tier`），
         // 只重绘不重建的话，用户会看到「标记了，但候选顺序还是老样子」。

@@ -4481,6 +4481,9 @@ impl Coordinator {
             }
         }
 
+        // 原地重建（输入没变）：直接辅助码的前缀快照是写库前算的，作废（删用户词后不作废，
+        // 删掉的词照样被当命中项提到首位）。`words_generation` 那道比对是通用兜底，这里显式丢。
+        state.direct_aux_prev = None;
         // 重新构建候选（会重新应用 Shadow）并重绘。
         // **必须按模式分派**：主路径的 `update_candidates` 读 `input_buffer`，而特殊模式下它
         // 恒为空 —— 在快符里走主路径的后果不是「不刷新」而是候选窗当场被清空。

@@ -38,6 +38,10 @@ pub(crate) struct DirectAuxPrev {
     /// （`set_single_char_in` / `set_filter_mode` 会原地重建候选），快照就与当下的过滤链对不上，
     /// 不能复用——否则词会绕过单字过滤、生僻字会绕过检索范围被提到前面。
     filters: (wind_candidate::FilterMode, bool, bool),
+    /// 取快照时用户词 / 临时词的结构代次（`Store::words_generation`，无 store 为 0）。输入不变
+    /// 而词库变了（候选右键删用户词、设置页加词…）快照就过期了，不能复用——否则删掉的用户词
+    /// 照样被当命中项提到首位。常用字标记不走词库，由写端（`toggle_common_char`）直接丢快照。
+    data_gen: u64,
     /// `None` = 整音节那一键的主候选快照（未截断，前缀下有资格的候选一条不缺）。
     /// `Some((字母, 上限))` = 兜底解码的产出，引擎按辅码首字母准入过、按该上限取的——只能给
     /// 同首字母、同上限的键复用（奇数键算的给紧随其后的偶数键：2 位辅码命中集是首字母的子集）。
@@ -102,6 +106,7 @@ impl Coordinator {
         if let Some(list) = pre_merge {
             state.direct_aux_prev = (!truncated).then(|| DirectAuxPrev {
                 filters: self.direct_aux_filters(state),
+                data_gen: self.direct_aux_data_gen(),
                 admit: None,
                 input,
                 candidates: list,
@@ -134,12 +139,14 @@ impl Coordinator {
         let prefix = split.prefix;
         let letter = split.aux.chars().next().unwrap_or_default();
         let filters = self.direct_aux_filters(state);
+        let data_gen = self.direct_aux_data_gen();
         let snapshot = state
             .direct_aux_prev
             .as_ref()
             .filter(|p| {
                 p.input == prefix
                     && p.filters == filters
+                    && p.data_gen == data_gen
                     && p.admit.is_none_or(|a| a == (letter, limit))
             })
             .map(|p| {
@@ -159,6 +166,7 @@ impl Coordinator {
                 state.direct_aux_prev = Some(DirectAuxPrev {
                     input: prefix.to_string(),
                     filters,
+                    data_gen,
                     admit: Some((letter, limit)),
                     candidates: pool.clone(),
                     preedit: preedit.clone(),
@@ -211,6 +219,10 @@ impl Coordinator {
     }
 
     /// 快照复用的前提：候选裁剪状态与取快照时相同（见 [`DirectAuxPrev::filters`]）。
+    fn direct_aux_data_gen(&self) -> u64 {
+        self.store.as_ref().map_or(0, |s| s.words_generation())
+    }
+
     fn direct_aux_filters(&self, state: &State) -> (wind_candidate::FilterMode, bool, bool) {
         (
             state.filter_mode,
@@ -476,6 +488,56 @@ mod tests {
         type_str(&c, "p");
         assert_eq!(texts(&c), via_snapshot, "兜底解码与快照给出同样的候选");
         assert_eq!(via_snapshot.first().map(String::as_str), Some("释读"));
+    }
+
+    /// ★ 输入不变而词库变了：候选右键删掉一个是命中项的用户词，原地重建（输入没变）时
+    /// 前缀快照还是删之前那份，不作废的话删掉的词照样顶在首位。
+    #[test]
+    fn deleting_user_word_hit_drops_prefix_snapshot() {
+        let (dir, _f) = fixture("deluser", "shuangpin", ON);
+        let (c, store) = coord("deluser", &dir);
+        // 释毒：用户词，释=pl 命中辅码 p；权重垫底，不开直接辅助时排不到前面。
+        store
+            .add_user_word("pinyin", "shidu", "释毒", 0, 0)
+            .unwrap();
+        type_str(&c, "uidup");
+        let t = texts(&c);
+        let idx = t
+            .iter()
+            .position(|x| x == "释毒")
+            .expect("用户词应是命中项");
+        assert!(
+            c.state.lock().unwrap().candidates[idx].is_direct_aux,
+            "{t:?}"
+        );
+        c.candidate_op(wind_ui_types::CandidateOp::Delete, idx);
+        let t = texts(&c);
+        assert!(
+            !t.contains(&"释毒".to_string()),
+            "删掉的用户词不得再出现：{t:?}"
+        );
+        assert_eq!(t.first().map(String::as_str), Some("释读"), "{t:?}");
+    }
+
+    /// 同上的通用一面：组合中途词库被别处写了（设置页加词），下一键不得复用旧快照。
+    #[test]
+    fn store_write_mid_composition_invalidates_snapshot() {
+        let (dir, _f) = fixture("addmid", "shuangpin", ON);
+        let (c, store) = coord("addmid", &dir);
+        type_str(&c, "uidu");
+        store
+            .add_user_word("pinyin", "shidu", "释毒", 0, 0)
+            .unwrap();
+        type_str(&c, "p");
+        let t = texts(&c);
+        let hit = c
+            .state
+            .lock()
+            .unwrap()
+            .candidates
+            .iter()
+            .any(|x| x.text == "释毒" && x.is_direct_aux);
+        assert!(hit, "新加的用户词应是命中项：{t:?}");
     }
 
     /// ★ 输入不变而切了单字模式：命中项同样要过单字过滤。快照只按前缀串认的话，会拿
