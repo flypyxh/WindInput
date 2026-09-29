@@ -2522,6 +2522,12 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
+    /// 活跃引擎下 `keys` 恰好切成完整双拼音节时的音节数；非双拼（全拼 / 码表 / 混输）、
+    /// 切不完整时 `None`。见 [`Engine::shuangpin_full_syllable_count`]。纯内存，无 IO。
+    pub fn shuangpin_full_syllable_count(&self, keys: &str) -> Option<usize> {
+        self.active_engine()?.shuangpin_full_syllable_count(keys)
+    }
+
     /// 当前活跃引擎是否为**纯码表**类型（混输 `Mixed` 不算——其拼音半边恒前缀匹配，
     /// 精确匹配语义只对纯码表方案自洽；供协调器判定短语是否随「精确匹配模式」抑制前缀枚举）。
     pub fn is_codetable(&self) -> bool {

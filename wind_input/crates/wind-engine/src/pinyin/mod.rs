@@ -4623,6 +4623,10 @@ impl Engine for PinyinEngine {
             .0
             .len()
     }
+
+    fn shuangpin_full_syllable_count(&self, keys: &str) -> Option<usize> {
+        self.shuangpin.as_ref()?.full_syllable_count(keys)
+    }
 }
 
 #[cfg(test)]
