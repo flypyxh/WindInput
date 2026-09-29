@@ -4085,47 +4085,6 @@ impl EngineManager {
         keys
     }
 
-    /// **所有已安装**码表方案里**已开启**的通配键（并集）。供协调器从「该透传的标点集合」
-    /// 里减去：空缓冲时 C++ 对透传集里的键不吃，符号通配键（如 `/`）到不了 core，首位通配
-    /// 就静默失效。
-    ///
-    /// 与 [`Self::installed_key_action_keys`] / `schema_code_char_set` 同为**纯 TOML 读**
-    /// （不 `build_engine`，理由见协调器 `schema_leading_code_chars`），折叠走与
-    /// `build_engine` 同一条 `resolve_codetable`（全局基线 + 方案覆盖；overlay 取内置基线）。
-    ///
-    /// 只收码表方案：通配只在码表引擎生效（混输代理的是主码表，而主码表方案本身也在
-    /// `installed_schemas()` 里被单独扫到）。拼音方案沿用全局开关会把 `?` 一类键白吃，
-    /// 而那些键在拼音下产物不变——吃了再吐会撞非 TSF 宿主的虚拟键码表。
-    ///
-    /// 非法键直接跳过、**不告警**：告警只在 `build_engine` 出一次，这里随每次配置重建会重复。
-    ///
-    /// ★ 全局基线 `global` 由调用方**显式传入**（即将生效的那份配置的 `schema.codetable`），
-    /// 不读 `self.codetable`：热重载先建配置快照、后 `reload_from_config` 刷新本管理器，
-    /// 读自身副本拿到的是**上一版**全局开关——设置里开关通配后透传集要等下一次重建才跟上。
-    pub fn installed_wildcard_keys(
-        &self,
-        global: &wind_config::CodetableGlobal,
-    ) -> std::collections::BTreeSet<char> {
-        let data_dir = self.data_dir.as_deref();
-        let ov = self.override_dir.as_deref();
-        let mut out = std::collections::BTreeSet::new();
-        for id in self.installed_schemas() {
-            let Some(s) = Self::read_schema(&id, data_dir, ov) else {
-                continue;
-            };
-            if s.is_pinyin() || s.is_mixed() {
-                continue;
-            }
-            let ct = Self::resolve_codetable(&id, data_dir, global, ov);
-            if ct.wildcard
-                && let Some(k) = wind_config::config::parse_wildcard_key(&ct.wildcard_key)
-            {
-                out.insert(k);
-            }
-        }
-        out
-    }
-
     /// 不走 `key_actions_cache`：该缓存按活跃方案 id 存单份，而这里要的是跨方案的并集。
     pub fn all_key_action_keys(&self) -> std::collections::BTreeSet<String> {
         self.all_action_keys().0
@@ -7794,6 +7753,24 @@ mod tests {
         assert_eq!(key("wc_follow"), Some('z'), "都没写 ⇒ 全局");
         assert_eq!(key("wc_overlay"), None, "overlay 方案不继承全局开关");
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 出厂笔画方案显式 `wildcard = false`：它的 `z` 是「折」，全局开了通配（出厂键 `z`）也
+    /// 不跟随。读的是仓库 `data/` 里的出厂方案文件本身。对照：同一全局下五笔 86 跟随开启。
+    #[test]
+    fn factory_stroke_schema_opts_out_of_wildcard() {
+        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data");
+        let ov = std::env::temp_dir().join("wind_eng_wildcard_stroke_ov");
+        let _ = std::fs::remove_dir_all(&ov);
+        let global = wind_config::CodetableGlobal {
+            wildcard: true,
+            ..Default::default()
+        };
+        let key = |id: &str| {
+            EngineManager::resolve_codetable(id, Some(&data), &global, Some(&ov)).wildcard_char(id)
+        };
+        assert_eq!(key("stroke"), None, "笔画方案不得继承全局通配");
+        assert_eq!(key("wubi86"), Some('z'), "对照：五笔 86 跟随全局");
     }
 
     /// ★ 基线判据是 `[overlay]` 段而**不是** `hidden`：钉住两个「反对角」组合。

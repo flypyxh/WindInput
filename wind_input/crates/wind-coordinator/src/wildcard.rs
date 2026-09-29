@@ -54,7 +54,9 @@ impl Coordinator {
     /// `codetable-input-chars.md` §3.4）：首位让位本就是它们先赢；这里的首位判据只处理
     /// 「它们都没接手」之后的去向。
     pub(crate) fn wildcard_decision(&self, buffer: &str, key: char) -> WildcardDecision {
-        let yield_ = if buffer.is_empty() {
+        let yield_ = if self.wildcard_past_full(buffer.chars().count()) {
+            true
+        } else if buffer.is_empty() {
             self.wildcard_lead_yields(key)
         } else {
             // 首字符是让位进来的字面通配键 ⇒ 整轮都是字面（否则 `zzbd` 变 `z?bd`，
@@ -68,8 +70,26 @@ impl Coordinator {
         }
     }
 
+    /// 满码判据（spec §3.3「满码」一行）：落在第 `pos` 位（0 起）的通配键，若此时缓冲已达
+    /// `max_code_length` ⇒ 按字面，与关闭通配时逐键相同（`aaaa` + `z` 照常顶字）。
+    /// 作通配的话只会得到一条比任何码都长的死串：无候选、又因通配不顶字。
+    ///
+    /// ★ 按键裁决与 [`Self::wildcard_pattern`] 共用本判据：同一串缓冲前后两次重算须得出
+    /// 同一结论（见模块文档）。`max_code_length` 为 0（无满码概念）时恒 `false`。
+    fn wildcard_past_full(&self, pos: usize) -> bool {
+        let max = self.engine_mgr.active_max_code_length();
+        max > 0 && pos >= max
+    }
+
     /// 首位：通配键已绑定任何功能 / 模式即让位（spec §3.3 首位一行）。
+    ///
+    /// **符号键在首位一律让位**：空缓冲下符号键本就产出标点，这份产物即是它绑定的功能——
+    /// 对应用户原始要求「键已启动别的功能 / 模式时不做首键模糊匹配」。首位通配属 spec §8
+    /// 延后的专门模式。顺带不必把符号键从 C++ 透传集里剔除（剔除曾让 `/` 跨方案被白吃）。
     fn wildcard_lead_yields(&self, key: char) -> bool {
+        if !key.is_ascii_lowercase() {
+            return true;
+        }
         let Some((vk, _)) = wildcard_key_vk(key) else {
             return true;
         };
@@ -137,7 +157,7 @@ impl Coordinator {
     ///
     /// 与 [`Self::wildcard_decision`] 同一套规则重算（见模块文档）：首位字面 ⇒ 整轮字面；
     /// 非首位存在冲突 ⇒ 非首位的通配键一律字面（冲突时它们只可能经让位进来，spec §3.3
-    /// 非首位一行）。
+    /// 非首位一行）；落在满码之后的通配键一律字面（[`Self::wildcard_past_full`]）。
     ///
     /// 通配关闭时 `active_wildcard_key()` 为 `None`，在任何缓冲扫描与分配之前返回。
     pub(crate) fn wildcard_pattern(&self, buffer: &str) -> Option<String> {
@@ -151,7 +171,7 @@ impl Coordinator {
             .chars()
             .enumerate()
             .map(|(i, c)| {
-                if c == key && (i == 0 || mid_ok) {
+                if c == key && (i == 0 || mid_ok) && !self.wildcard_past_full(i) {
                     any = true;
                     WILDCARD_SLOT
                 } else {
@@ -298,32 +318,6 @@ mod tests {
         assert!(!c.wildcard_enters(&st, 'z'), "overlay 激活时不作通配");
     }
 
-    /// `refresh_config_in_memory` 改了全局通配开关 ⇒ 透传集按**新**配置重算。
-    /// 从管理器自身的全局副本取的话，这里拿到的仍是构造时的旧开关。
-    #[test]
-    fn refresh_config_in_memory_recomputes_wildcard_passthrough() {
-        let Some(c) = wubi_z(|cfg| {
-            cfg.schema.codetable.wildcard = false;
-            cfg.schema.codetable.wildcard_key = "/".into();
-        }) else {
-            return;
-        };
-        assert!(
-            c.rt().cn_passthrough_punct_chars.contains(&'/'),
-            "前置：关闭时透传"
-        );
-        c.refresh_config_in_memory(|cfg| cfg.schema.codetable.wildcard = true);
-        assert!(
-            !c.rt().cn_passthrough_punct_chars.contains(&'/'),
-            "开启后 `/` 不再透传"
-        );
-        c.refresh_config_in_memory(|cfg| cfg.schema.codetable.wildcard = false);
-        assert!(
-            c.rt().cn_passthrough_punct_chars.contains(&'/'),
-            "关回后恢复透传"
-        );
-    }
-
     /// `z_key_repeat` 按**配置开关**让位，与有无上屏历史无关（新建协调器无历史）。
     /// 按 `z_key_repeat_text()` 判的话这里会得 Enter，同一串缓冲前后解释不一。
     #[test]
@@ -388,21 +382,52 @@ mod tests {
         );
     }
 
-    /// 非首位有冲突（通配键 `=` 是出厂翻页键）⇒ 非首位的通配键只可能是经让位进来的字面，
-    /// 只有首位（全无绑定时）作通配。
+    /// 非首位有冲突（通配键 `=` 是出厂翻页键）⇒ 非首位的通配键只可能是经让位进来的字面。
+    /// 首位是符号键 ⇒ 让位（它是字面），整轮字面。
     #[test]
     fn pattern_keeps_mid_positions_literal_on_conflict() {
         let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard_key = "=".into()) else {
             return;
         };
-        assert_eq!(c.wildcard_decision("", '='), Enter, "前置：首位无绑定");
+        assert_eq!(c.wildcard_decision("", '='), Yield, "前置：首位符号键让位");
         assert_eq!(
             c.wildcard_decision("a", '='),
             Yield,
             "前置：非首位让位给翻页"
         );
         assert_eq!(c.wildcard_pattern("a="), None);
-        assert_eq!(c.wildcard_pattern("=a="), Some(format!("{S}a=")));
+        assert_eq!(c.wildcard_pattern("=a="), None, "首位字面 ⇒ 整轮字面");
+    }
+
+    /// 符号通配键在首位一律让位（它的标点产物即是绑定的功能）；组码中照常作通配。
+    /// 对照：字母通配键首位全无绑定时仍作通配。
+    #[test]
+    fn symbol_wildcard_always_yields_at_lead() {
+        let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard_key = "?".into()) else {
+            return;
+        };
+        assert_eq!(c.wildcard_decision("", '?'), Yield);
+        assert_eq!(c.wildcard_decision("a", '?'), Enter, "组码中照常作通配");
+        assert_eq!(c.wildcard_pattern("a?"), Some(format!("a{S}")));
+        assert_eq!(c.wildcard_pattern("?a"), None, "首位字面 ⇒ 整轮字面");
+
+        let Some(c) = wubi_z(|_| {}) else { return };
+        assert_eq!(
+            c.wildcard_decision("", 'z'),
+            Enter,
+            "对照：字母键首位无绑定"
+        );
+    }
+
+    /// 满码后通配键按字面：`aaaa` + `z` 让位，`aaaaz` 不是通配组码；按键裁决与 pattern
+    /// 同一判据。对照：未满码时照常通配，满码前的通配位不受影响。
+    #[test]
+    fn wildcard_past_full_length_is_literal() {
+        let Some(c) = wubi_z(|_| {}) else { return };
+        assert_eq!(c.wildcard_decision("aaa", 'z'), Enter, "对照：未满码");
+        assert_eq!(c.wildcard_decision("aaaa", 'z'), Yield);
+        assert_eq!(c.wildcard_pattern("aaaaz"), None);
+        assert_eq!(c.wildcard_pattern("azaaz"), Some(format!("a{S}aaz")));
     }
 
     /// ★ Review Focus 3：主输入路的上屏记账对通配组码下的码表候选记**候选全码**，不记

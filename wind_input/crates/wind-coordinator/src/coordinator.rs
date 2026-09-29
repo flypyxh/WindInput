@@ -2227,7 +2227,7 @@ impl Coordinator {
         // （如微信 caret_use_top）。
         let app_compat = wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
         // 配置的轻量派生缓存集中到 ConfigBundle（支持运行时热替换）。
-        let schema_keys = schema_key_union(&engine_mgr, &config.schema.codetable);
+        let schema_keys = schema_key_union(&engine_mgr);
         let bundle = ConfigBundle::build(config.clone(), &schema_keys);
         info!(
             "Compiled hotkeys: {} key_down, {} key_up",
@@ -4082,7 +4082,7 @@ impl Coordinator {
     pub(crate) fn refresh_config_in_memory(&self, mutate: impl FnOnce(&mut Config)) {
         let mut cfg = self.rt().config.clone();
         mutate(&mut cfg);
-        let keys = schema_key_union(&self.engine_mgr, &cfg.schema.codetable);
+        let keys = schema_key_union(&self.engine_mgr);
         let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &keys));
         // 字符类 registry 由配置派生，**不在 schema_dirty 分支内**：
         // `input.rare_char.include_blocks` 在 input 段，改它不会把 schema 标脏，
@@ -4108,8 +4108,7 @@ impl Coordinator {
                 let cand_was_fixed = old.config.ui.candidate.is_fixed_position();
                 drop(old);
 
-                // 全局码表设置取**新**配置的：`reload_from_config` 在下面才刷新管理器。
-                let keys = schema_key_union(&self.engine_mgr, &cfg.schema.codetable);
+                let keys = schema_key_union(&self.engine_mgr);
                 let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &keys));
                 let new_cfg = bundle.config.clone();
                 // 同 `refresh_config_in_memory`：字符类 registry 不受 schema_dirty 门控。

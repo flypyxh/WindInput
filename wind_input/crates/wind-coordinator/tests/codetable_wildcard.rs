@@ -14,7 +14,6 @@ use std::sync::Arc;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
-use wind_host::KeyProbe;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_SHIFT};
 use wind_store::Store;
 
@@ -146,21 +145,34 @@ fn symbol_wildcard_enters_buffer_instead_of_punct() {
     assert_ne!(coord.debug_input_buffer(), "a?", "对照：关闭时 ? 不进缓冲");
 }
 
-/// 空缓冲下未绑定任何功能的符号通配键作通配进缓冲（首位一行的「全无绑定」分支）。
-/// 对照：关闭时同一键走标点流水线，缓冲保持为空。
+/// 空缓冲下符号通配键一律让位（其标点产物即绑定的功能）：与关闭通配时逐键相同，
+/// 中文标点下出全角「？」、缓冲保持为空。组码中同一键照常作通配。
 #[test]
-fn unbound_symbol_wildcard_enters_buffer_at_lead() {
+fn lead_symbol_wildcard_yields_to_punct() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
-    let coord = Coordinator::new_headless(wubi(true, "?"), Some(&data_dir()));
-    press_vk(&coord, VK_SLASH, true);
-    assert_eq!(coord.debug_input_buffer(), "?");
+    let lead = |on: bool| {
+        let coord = Coordinator::new_headless(wubi(on, "?"), Some(&data_dir()));
+        let act = press_vk(&coord, VK_SLASH, true);
+        (
+            committed(&act).map(str::to_string),
+            coord.debug_input_buffer(),
+        )
+    };
+    let off = lead(false);
+    assert_eq!(
+        off,
+        (Some("？".to_string()), String::new()),
+        "前置：关闭时出全角问号"
+    );
+    assert_eq!(lead(true), off, "开启时首位 ? 与关闭时逐键相同");
 
-    let coord = Coordinator::new_headless(wubi(false, "?"), Some(&data_dir()));
+    let coord = Coordinator::new_headless(wubi(true, "?"), Some(&data_dir()));
+    press(&coord, "a");
     press_vk(&coord, VK_SLASH, true);
-    assert_eq!(coord.debug_input_buffer(), "", "对照：关闭时 ? 走标点");
+    assert_eq!(coord.debug_input_buffer(), "a?", "对照：组码中照常作通配");
 }
 
 /// 非首位通配键与次选键冲突 ⇒ 让位（`;` 照常选第 2 个候选）且体检报冲突。
@@ -286,27 +298,69 @@ fn overlay_mode_ignores_wildcard() {
     );
 }
 
-/// 首位符号通配键不得在透传集里：空缓冲时 C++ 对透传集里的键不吃，`/` 到不了 core，
-/// 首位通配静默失效。`should_handle_key` 读的正是推给 DLL 的那两份集合（`key_gate.rs`）。
-/// 对照：关闭通配时 `/` 照旧透传（出厂中文标点表对 `/` 无映射）。
+/// 满码后通配键按字面：`aaaa` + `z` 与关闭通配时逐键相同（顶字上屏「工」、余码续打），
+/// 而不是变成一条无候选又不顶字的 5 码死串。对照：未满码时 `aaaz` 照常是通配组码。
 #[test]
-fn lead_symbol_wildcard_key_is_not_passed_through() {
+fn full_length_wildcard_key_is_literal() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
-    let coord = Coordinator::new_headless(wubi(true, "/"), Some(&data_dir()));
-    assert!(
-        coord.should_handle_key(&KeyProbe::new(VK_SLASH)),
-        "开启通配：空缓冲时 `/` 必须送到服务端"
-    );
-    press_vk(&coord, VK_SLASH, false);
-    assert_eq!(coord.debug_input_buffer(), "/", "首位无绑定 ⇒ 作通配进缓冲");
+    let run = |on: bool| {
+        let mut cfg = wubi(on, "z");
+        cfg.schema.codetable.top_code_commit = true;
+        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+        press(&coord, "aaaa");
+        let act = press(&coord, "z");
+        (
+            committed(&act).map(str::to_string),
+            coord.debug_input_buffer(),
+        )
+    };
+    let off = run(false);
+    assert!(off.0.is_some(), "前置：关闭时 aaaa+z 顶字，实际 {off:?}");
+    assert_eq!(run(true), off, "满码后 z 与关闭时逐键相同");
 
-    let coord = Coordinator::new_headless(wubi(false, "/"), Some(&data_dir()));
+    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    press(&coord, "aaaz");
     assert!(
-        !coord.should_handle_key(&KeyProbe::new(VK_SLASH)),
-        "对照：关闭时 `/` 透传给宿主"
+        !coord.debug_candidate_triples().is_empty(),
+        "对照：未满码的 aaaz 仍是通配"
+    );
+}
+
+/// 五笔拼音混输方案不参与通配（spec §3.1）：全局开了通配（键 `z`），`hanzi` 里非首位的 `z`
+/// 仍是拼音字母，照出「汉字」，候选与关闭时相同。对照：同一全局配置下纯五笔 `az` 是通配。
+#[test]
+fn mixed_pinyin_scheme_ignores_wildcard() {
+    if !dict_ready()
+        || !data_dir()
+            .join("schemas/wubi86_pinyin.schema.toml")
+            .exists()
+    {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let mixed = |on: bool| {
+        let mut cfg = wubi(on, "z");
+        cfg.schema.available = vec!["wubi86_pinyin".into()];
+        cfg.schema.active = "wubi86_pinyin".into();
+        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+        press(&coord, "hanzi");
+        coord.debug_all_candidate_texts()
+    };
+    let on = mixed(true);
+    assert!(
+        on.iter().any(|t| t == "汉字"),
+        "hanzi 应出「汉字」，实际 {on:?}"
+    );
+    assert_eq!(on, mixed(false), "开关不影响混输候选");
+
+    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    press(&coord, "az");
+    assert!(
+        !coord.debug_candidate_triples().is_empty(),
+        "对照：同一全局配置下纯五笔 az 是通配"
     );
 }
 
