@@ -378,6 +378,28 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// 通配键（`[engine.codetable].wildcard_key`；开关关闭或键非法时 `None`）。
+    /// 只有码表引擎返回 `Some`，混输代理主码表。见 `docs/design/codetable-wildcard.md`。
+    fn wildcard_key(&self) -> Option<char> {
+        None
+    }
+
+    /// 通配转换。`pattern` 是把**作通配的那几位**替换成 [`wind_dict::WILDCARD_SLOT`] 后的输入，
+    /// 哪几位作通配由协调器裁决（首位让位时首位是字面码元，spec §3.3）；`input` 是原始缓冲，
+    /// 只用于组合区显示。不支持通配的引擎返回 `None`。
+    ///
+    /// ★ 与 [`Self::convert`] 分开而不是让 `convert` 按内容自判：`convert` 还被协调器当作
+    /// 「活码前缀」探针（`has_code_prefix` / z 夺取），那里的 `z` 必须是字面码元——自判会把
+    /// `zh` 当 `?h` 判活，`z_key_action` 的夺取在开通配后静默失效。
+    fn convert_wildcard(
+        &self,
+        _input: &str,
+        _pattern: &str,
+        _max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        None
+    }
+
     /// 候选排序是否**忽略权重**（`[engine.codetable].base_sort = "natural"`）：码表引擎在 natural
     /// 模式下返回 true。供协调器合并短语后按**同一维度**重排——否则协调器仍以 weight 优先，会与
     /// 引擎的 `candidate::by_natural`（纯 base_order→natural_order、忽略权重）发散。其余引擎默认

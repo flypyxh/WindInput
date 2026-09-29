@@ -87,6 +87,9 @@ const SPLIT_SEGMENT_POOL: usize = 16;
 /// 不做成配置项的理由不变：多一个自由参数只会制造「配出来不报错、打起来全是错」的状态。
 const SPLIT_FRONT_LEN: usize = 2;
 
+/// 通配结果上限（spec §3.1：常量，不开放配置）。首位即通配会退化成全表扫描，靠它兜底。
+pub const WILDCARD_RESULT_LIMIT: usize = 100;
+
 /// 逆切分的触发档（`[engine.codetable].split_trigger`）：满码长时「空到什么程度」才切分。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SplitTrigger {
@@ -209,6 +212,9 @@ pub struct CommitOptions {
     pub split_trigger: SplitTrigger,
     /// 逆切分次选的显示形态。见 [`SplitAltDisplay`]。
     pub split_alt_display: SplitAltDisplay,
+    /// 通配键（`[engine.codetable].wildcard` + `.wildcard_key` 折叠后；关闭或键非法为 `None`）。
+    /// 引擎只拿它回答 [`Engine::wildcard_key`]；哪几位作通配由协调器定，见 `convert_wildcard`。
+    pub wildcard: Option<char>,
 }
 
 /// 码表引擎
@@ -886,6 +892,51 @@ impl Engine for CodeTableEngine {
 
     fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
         Some(&self.charset)
+    }
+
+    fn wildcard_key(&self) -> Option<char> {
+        self.opts.wildcard
+    }
+
+    /// 通配转换（spec §5.2）：只查词库（系统 / 用户 / 临时；草稿层不参与），不走整句、
+    /// 逆切分、英文混入；「精确」改判「等长」（落在 `is_exact_code` 上，协调器重排沿用）；
+    /// 注释恒为完整编码（学码价值所在，不受 `show_code_hint` 门控）；
+    /// `should_commit` / `should_clear` 恒 false（spec §3.2）。
+    fn convert_wildcard(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.opts.wildcard?;
+        let n = pattern.chars().count();
+        let with_prefix = !self.opts.single_code_input;
+        let mut candidates: Vec<Candidate> = self
+            .dm
+            .search_pattern(
+                pattern,
+                wind_dict::WILDCARD_SLOT,
+                WILDCARD_RESULT_LIMIT,
+                with_prefix,
+            )
+            .into_iter()
+            .map(|mut c| {
+                c.source = CandidateSource::CodeTable;
+                c.is_exact_code = c.code.chars().count() == n;
+                c.comment = c.code.clone();
+                c
+            })
+            .collect();
+        let base_cmp = self.opts.base_sort.cmp();
+        candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
+        candidates.truncate(max_candidates.min(WILDCARD_RESULT_LIMIT));
+        let is_empty = candidates.is_empty();
+        Some(ConvertResult {
+            candidates,
+            preedit_display: input.to_string(),
+            is_empty,
+            ..Default::default()
+        })
     }
 
     /// natural 模式（`base_sort = "natural"`）忽略权重：协调器据此对齐 `by_natural` 重排。
@@ -2319,5 +2370,150 @@ mod tests {
         let c8 = r8.candidates.first().expect("8 码应有整句候选");
         assert!(c8.is_sentence && !c8.is_split_composed, "超码长那格归整句");
         assert_eq!(c8.text, "工作工作");
+    }
+
+    fn wildcard_opts(extra: CommitOptions) -> CommitOptions {
+        CommitOptions {
+            wildcard: Some('z'),
+            ..extra
+        }
+    }
+
+    fn slot_pattern(p: &str) -> String {
+        p.replace('?', &wind_dict::WILDCARD_SLOT.to_string())
+    }
+
+    /// §3.1 / §3.2：等长优先（更长码权重再高也排后）、注释是完整编码、源标码表。
+    #[test]
+    fn wildcard_equal_length_first_and_full_code_comment() {
+        let e = engine_opts(
+            &[
+                ("ab", "甲", 10),
+                ("ac", "乙", 20),
+                ("abcd", "丙", 9999),
+                ("bb", "丁", 50),
+            ],
+            wildcard_opts(CommitOptions::default()),
+        );
+        assert_eq!(e.wildcard_key(), Some('z'));
+        let r = e.convert_wildcard("az", &slot_pattern("a?"), 50).unwrap();
+        let got: Vec<(&str, &str, &str, bool)> = r
+            .candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.text.as_str(),
+                    c.code.as_str(),
+                    c.comment.as_str(),
+                    c.is_exact_code,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("乙", "ac", "ac", true),
+                ("甲", "ab", "ab", true),
+                ("丙", "abcd", "abcd", false),
+            ]
+        );
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| c.source == CandidateSource::CodeTable)
+        );
+        assert_eq!(
+            r.preedit_display, "az",
+            "组合区显示用户所打的原串，不是占位串"
+        );
+    }
+
+    /// §3.2：通配下满码唯一也不自动上屏。反向对照：同一词库字面打全码照常上屏。
+    #[test]
+    fn wildcard_never_auto_commits() {
+        let opts = CommitOptions {
+            auto_commit_at_full: true,
+            auto_commit_min_len: 4,
+            ..Default::default()
+        };
+        let e = engine_opts(&[("aaaa", "工", 100)], wildcard_opts(opts));
+        let r = e
+            .convert_wildcard("azza", &slot_pattern("a??a"), 50)
+            .unwrap();
+        assert_eq!(r.candidates.len(), 1, "前置：通配唯一命中");
+        assert!(
+            !r.should_commit && r.commit_text.is_empty(),
+            "通配结果不自动上屏"
+        );
+        let lit = e.convert("aaaa", 50).unwrap();
+        assert!(lit.should_commit, "对照：字面全码仍自动上屏");
+    }
+
+    /// §3.2：通配满码无匹配也不请求清空。反向对照：字面满码空码照常清空。
+    #[test]
+    fn wildcard_never_requests_clear() {
+        let opts = CommitOptions {
+            clear_on_empty_max: true,
+            ..Default::default()
+        };
+        let e = engine_opts(&[("aaaa", "工", 100)], wildcard_opts(opts));
+        let r = e
+            .convert_wildcard("bzzz", &slot_pattern("b???"), 50)
+            .unwrap();
+        assert!(r.is_empty && !r.should_clear, "通配空码不清空");
+        let lit = e.convert("bbbb", 50).unwrap();
+        assert!(
+            lit.is_empty && lit.should_clear,
+            "对照：字面满码空码照常清空"
+        );
+    }
+
+    /// §3.1：精确匹配模式下不追加更长编码；上限常量 100。
+    #[test]
+    fn wildcard_respects_single_code_input_and_result_cap() {
+        let e = engine_opts(
+            &[("ab", "甲", 10), ("abcd", "丙", 9999)],
+            wildcard_opts(CommitOptions {
+                single_code_input: true,
+                ..Default::default()
+            }),
+        );
+        let r = e.convert_wildcard("az", &slot_pattern("a?"), 50).unwrap();
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["甲"]);
+
+        let many: Vec<(String, String, i32)> = (0..150u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                (format!("q{c1}{c2}"), format!("字{i}"), 1)
+            })
+            .collect();
+        let refs: Vec<(&str, &str, i32)> = many
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = engine_opts(&refs, wildcard_opts(CommitOptions::default()));
+        let r = e
+            .convert_wildcard("qzz", &slot_pattern("q??"), 1000)
+            .unwrap();
+        assert_eq!(
+            r.candidates.len(),
+            WILDCARD_RESULT_LIMIT,
+            "结果上限是常量 100"
+        );
+    }
+
+    /// 关闭通配时引擎不接通配请求；`convert` 永远是字面语义（它还被当活码探针用）。
+    #[test]
+    fn wildcard_off_means_no_wildcard_path_and_convert_stays_literal() {
+        let e = engine_opts(&[("ab", "甲", 10)], CommitOptions::default());
+        assert_eq!(e.wildcard_key(), None);
+        assert!(e.convert_wildcard("az", &slot_pattern("a?"), 50).is_none());
+        let on = engine_opts(&[("ab", "甲", 10)], wildcard_opts(CommitOptions::default()));
+        assert!(
+            on.convert("az", 50).unwrap().candidates.is_empty(),
+            "开了通配，convert(\"az\") 仍按字面查——`z` 不是通配"
+        );
     }
 }

@@ -5646,6 +5646,8 @@ impl EngineManager {
                 split_alt_display: crate::codetable::SplitAltDisplay::parse(
                     &schema.engine.codetable.split_alt_display,
                 ),
+                // 通配配置接线在后续任务；此处占位保持行为不变。
+                wildcard: None,
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
