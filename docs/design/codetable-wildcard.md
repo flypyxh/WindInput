@@ -4,7 +4,8 @@
 > 「恰好一个码元」，候选显示完整编码，供不确定字根时查字/学码用。
 > **不做**专门的通配/反查模式（需要时另立设计）。
 >
-> **状态：设计已定，未实施。** 分期见 §6。
+> **状态：设计已定，未实施。** 分期见 §6，实施计划见 `codetable-wildcard-plan.md`。
+> 2026-09-29 读码后修正 §3.1/§3.3/§4/§5 多处（见 §9），以本版为准。
 
 ---
 
@@ -54,6 +55,8 @@
 - 结果 = **等长匹配**为主；未开 `single_code_input` 时追加更长编码的前缀补全（与现有逐码提示
   一致），**等长优先**，同档按现有基础排序。
 - 结果上限：常量 100（不开放配置，YAGNI）。
+- 各层按「等长 / 更长」两档分别取名额，合并按 `(text, code)` 去重、等长优先——
+  否则更长高权重编码会挤掉等长结果，按 text 去重会吞掉同字不同码。
 - **参与**：系统词库、用户层、临时层。**不参与**：短语、Draft 层（只做精确查询）、整句、逆切分、
   五笔拼音混输。
 
@@ -64,7 +67,8 @@
 | 满码自动上屏（`decide_auto_commit` 及协调器复评） | **不触发** |
 | 顶字（`handle_top_code` / `accumulate_code_char` 前置顶码） | **不触发** |
 | 空码清空（`should_clear` / 清空复核） | **不触发** |
-| 编码提示 `comment` | **完整编码** `c.code`（复用 `${code_hint}`，模板不改） |
+| 编码提示 `comment` | **完整编码** `c.code`，**不受 `show_code_hint` 门控**（功能本意即学码；复用 `${code_hint}`，模板不改） |
+| 词频记账码 | 记候选**自身完整编码**，不记输入缓冲（否则把 `azzd` 写进词频表，永不命中） |
 | 空格 / 选词键 | 照常上屏所选候选 |
 
 ### 3.3 按键裁决（核心）
@@ -74,13 +78,26 @@
 | **首位**（`input_buffer.is_empty()`） | 通配键**已绑定任何功能/模式**即让位、不作通配：`key_actions` / `z_key_action` / `z_key_repeat` / 临拼·快捷输入等 `trigger_keys` / 是本方案活码前缀（`has_code_prefix`）。全无绑定才进缓冲。 |
 | **非首位**（组码中） | 通配键是**组码中途功能**键（选词键、翻页键、以词定字键、音节分隔符、辅助码引导键）⇒ **让位给原功能**，仅启动告警；否则作通配进缓冲，**优先于**兜底标点顶屏与「顶字+进模式」。 |
 
+**首位让位即整串字面**：首字符是让位进来的通配键（如五笔 86 首位 z 作 `zz*` 短语码元）⇒ 本串后续的
+通配键**一律按字面处理**，否则 `zzbd` 会变成 `z?bd`、短语全灭。首位判据用配置开关
+（`z_key_repeat` 是否开启等），不用与上屏历史相关的 `z_key_repeat_text()`。
+
+**`convert` 永远按字面**：`has_code_prefix` / `try_z_fallback` 靠 `engine_mgr.convert` 探测活码
+（`handle_temp.rs:71`），若 `convert` 按内容识别通配，`zh` 会被判成 `?h` 的活码、z 进临拼失效。
+故通配是否生效由协调器按位裁决，作通配的位替换成内部占位符后走独立入口（§5.2）。
+
 **与 `input_chars` 契约方向相反，是有意为之**：码元是方案的一部分，组码中必须归码表；
 通配是用户可选的辅助功能，不应废掉已配好的选词/翻页键——冲突时保留原功能、告警提示改键。
 
 **冲突告警**：复用 `code_char_conflicts` 的体检形状，启动时逐条日志告警（首位让位不告警，
 那是设计内行为；非首位让位才告警，因为它意味着通配在该方案下实际不可用）。
 
-**通配键是方案真实码元时**：照样按通配处理（用户显式选择），启动告警一次。
+**通配键是方案真实码元时**：照样按通配处理（用户显式选择）；**仅当方案显式配置了 `input_chars`
+且含该键**时启动告警——五笔 86 未配 `input_chars`（默认 a-z 含 z）但词库无 z 码，按字面判定会让
+出厂主用例每次启动误报。
+
+**字面符号判定须排除通配键**：符号通配键若同在 `input.buffer_symbol_chars`，会被当普通符号
+清空候选（`coordinator.rs` 的 `char_is_literal_symbol`）。
 
 ### 3.4 进缓冲闸门
 
@@ -107,7 +124,11 @@ wildcard_key = "z"
 同步点（`wind-config/AGENTS.md`「新增配置字段」）：`CodetableGlobal` 字段 + `Default`；
 `CodeTableSpec` 的 `Option` 字段；`resolved()` 折叠；`REGISTRY`；`schema_overridden_keys`；
 `data/config.toml` 显式写出；`CommitOptions` 带入引擎（`build_engine` 与 `codetable_settings()` 两处
-折叠点判据一致）。`wildcard_key` 非法（空、多字符、非 ASCII 可打印）⇒ 告警并视为关闭。
+折叠点判据一致）。`wildcard_key` 非法（空、多字符、非 ASCII 可打印、**数字、空格**）⇒ 告警并视为关闭。数字不可：
+空缓冲时 C++ 不把数字送到 core（`codetable-input-chars.md` §2.3），组码中数字恒为选词键。
+
+设置端方案对话框的 `make_sig` 不支持自由文本，通配键做成**下拉选择**；设置项 label 的「通」字
+不在拼音检索表 `pinyin_initials.txt` 中，需重算。
 
 **wind-setting**：`settings_manifest.toml` 两项（文案写明首位/非首位让位规则）、
 `SPEC_BEHAVIOR_FIELDS`、`capabilities.snapshot.json`、`mockdata/config.json`。
@@ -119,26 +140,32 @@ wildcard_key = "z"
 ### 5.1 词库层（wind-dict）
 
 - `DictLayer::search_pattern(pattern: &str, wildcard: char, limit: usize, with_prefix: bool)`，
-  默认实现返回空；`CompositeDict` 的 `Query` 加 `Pattern` 变体，去重按精确查询语义（同 text 同 code 合并）。
+  默认实现返回空；`CompositeDict` 的 `Query` 加 `Pattern` 变体。现有 `merge_search` 只按 text 去重
+  并按 `better` 截断，通配查询需独立合并：`(text, code)` 去重、等长优先。
+- 系统层适配点：`CachedDict` 分派（`cached.rs:160`）与 `SystemDictLayer`（`wind-dict/src/manager.rs:212`）。
 - **DAT**（`datformat.rs`）：DFS 逐位走，通配位遍历该状态全部有效转移（`1..=max_code`，稀疏）；
   到达末位取 `terminal_leaf`；`with_prefix` 时以所有末位状态为多起点压入现有分支限界 `pq`
   （需改 `build_code` 的单前缀假设，`datformat.rs:1321`）。
 - **BTreeMap**（`codetable.rs`）：以首个通配前的字面前缀 range 扫描 + 逐条过滤。
-- **redb**（`store_layer.rs`）：同上；沿用已知的「limit 先截断后排序」局限，不在本期修。
+- **redb**（`store_layer.rs`）：按字面前缀**全扫**（limit 传 0）再过滤——若把 limit 传给
+  `search_user_words_prefix`，会在过滤前截断，匹配项可能整批丢失。
 - 首位即通配 ⇒ 字面前缀为空、退化全表扫描；仅首位无冲突时可达，靠 `limit` 兜底。
 
 ### 5.2 引擎（`codetable/engine.rs`）
 
 - `CommitOptions.wildcard: Option<char>`（关闭时 `None`）。
-- `convert`：输入含通配 ⇒ 走 `search_pattern` 分支，跳过整句/逆切分；`comment = c.code`；
-  排序 `cmp_exact_first` 的「精确」改判「等长」。
-- `decide_auto_commit` / `should_clear` / `handle_top_code`：输入含通配即短路返回不触发。
+- **独立入口** `convert_wildcard(input, pattern, max)`：协调器把作通配的位替换成内部占位符
+  `WILDCARD_SLOT = '\u{1}'` 后传入；`convert` 保持纯字面不变（见 §3.3）。走 `search_pattern`，
+  跳过整句/逆切分；`comment = c.code`；排序「精确」改判「等长」。混输只走主码表。
+- 三处上屏短路（自动上屏 / 顶字 / 清空）**不放在引擎**：引擎不知首位 z 是否字面码元，按内容短路
+  会误伤 `zz*` 短语的顶码切点。改由协调器在 `build_candidates` 与 `accumulate_code_char` 中按
+  「本串是否有通配位」短路。
 
 ### 5.3 协调器
 
-- 新增 `Coordinator::wildcard_decision(key, buffer_empty) -> Yield | Enter`，集中实现 §3.3，
-  调用点：`try_code_char_gate`（符号）、字母分支 `can_enter_buffer` 前（字母）、
-  缓冲非空的「顶字+进模式」入口（`message_handler.rs` ~1810）前。
+- 新增 `wildcard.rs`：`wildcard_decision(buffer, key)`，集中实现 §3.3（需要整串以判断
+  「首位让位即整串字面」），调用点：`try_code_char_gate`（符号）、字母分支 `can_enter_buffer` 前（字母）。
+  符号键更早经过 `try_code_char_gate`，缓冲非空的「顶字+进模式」入口（`message_handler.rs` ~1810）无需另接。
 - **首位字母判定必须晚于** `try_activate_mode` 与 `try_z_fallback`（沿用 `codetable-input-chars.md`
   §3.4 的顺序铁律）——让位本就是它们先赢。
 - 缓冲含通配时：`accumulate_code_char` 跳过顶码；`build_candidates` 跳过自动上屏复评与清空复核；
@@ -160,13 +187,15 @@ wildcard_key = "z"
 
 ## 7. 测试
 
-- **wind-dict**：`search_pattern` 与 `for_each_entry` 全遍历过滤结果对拍（仿 `bnb_matches_full_scan`）。
+- **wind-dict**：`search_pattern` 与 `for_each_entry` 全遍历过滤结果对拍（仿 `datformat.rs` 的
+  `topn_prefix_matches_full_sort_*` 与 `reference_prefix`）。
 - **引擎单测**（`engine.rs` 内联，`engine_with` 夹具）：§3.2 表逐行；超码长含通配不顶字（回归 §2 的误判）。
 - **协调器集成**（`wind-coordinator/tests/`，五笔 86 真实数据；注意 `build_dev/data` 缺失时静默跳过，
   以耗时判断数据在位）：
   - **默认关闭 ⇒ 行为完全不变**（对照组：`az`、首位 z、`zzbd` 短语）；
   - 开启：`az` 出候选且注释为全码；`azzd` 多通配；
-  - 首位 z 让位给 `zz*` 短语 / `z_key_action` / `z_key_repeat`；
+  - 首位 z 让位给 `zz*` 短语 / `z_key_action` / `z_key_repeat`，且 `zzbd` 整串字面、短语照出；
+  - 开启后 z 进临拼（`try_z_fallback`）不受影响；通配选词后词频记在完整编码上；
   - 26 码元方案配符号通配键能出候选、组码中不触发标点顶屏；
   - 非首位通配键与选词键冲突 ⇒ 让位且有告警；
   - 通配键不在 `input_chars`（`a-y`）时组码中仍能进缓冲。
@@ -178,3 +207,13 @@ wildcard_key = "z"
 - 专门的通配 / 反查模式（首位也想通配时的出口），留待后续。
 - `*` 任意长度通配；末尾通配匹配更短码（王码原义）。
 - 结果上限可配置；短语参与通配。
+
+---
+
+## 9. 修订记录
+
+- **2026-09-29 读码后修正**（写实施计划时发现）：补「首位让位即整串字面」与「`convert` 永远字面」
+  两条规则（§3.3）；上屏短路从引擎移到协调器、引擎改独立入口 `convert_wildcard`（§5.2）；
+  合并按 `(text, code)` 分档去重、redb 全扫再过滤、补系统层适配点（§5.1）；通配键禁数字/空格、
+  真实码元告警限显式 `input_chars`、字面符号判定排除通配键、记账码用完整编码、注释不受
+  `show_code_hint` 门控（§3–§4）；`wildcard_decision` 参数改为整串（§5.3）。
