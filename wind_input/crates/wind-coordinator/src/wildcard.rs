@@ -12,6 +12,8 @@
 use crate::coordinator::{Coordinator, State};
 use crate::key_convert::{punct_char, punct_source_vk};
 use tracing::warn;
+use wind_candidate::{Candidate, CandidateSource};
+use wind_dict::WILDCARD_SLOT;
 use wind_keys::keymap;
 
 /// 通配键此刻的去向。
@@ -129,6 +131,56 @@ impl Coordinator {
             owners.push("音节分隔符");
         }
         owners
+    }
+
+    /// 当前缓冲若是通配组码，返回交给引擎的 pattern（作通配的位替换成 `WILDCARD_SLOT`）。
+    ///
+    /// 与 [`Self::wildcard_decision`] 同一套规则重算（见模块文档）：首位字面 ⇒ 整轮字面；
+    /// 非首位存在冲突 ⇒ 非首位的通配键一律字面（冲突时它们只可能经让位进来，spec §3.3
+    /// 非首位一行）。
+    ///
+    /// 通配关闭时 `active_wildcard_key()` 为 `None`，在任何缓冲扫描与分配之前返回。
+    pub(crate) fn wildcard_pattern(&self, buffer: &str) -> Option<String> {
+        let key = self.engine_mgr.active_wildcard_key()?;
+        if !buffer.contains(key) || self.wildcard_lead_literal(buffer, key) {
+            return None;
+        }
+        let mid_ok = self.wildcard_mid_owners(key).is_empty();
+        let mut any = false;
+        let pattern: String = buffer
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if c == key && (i == 0 || mid_ok) {
+                    any = true;
+                    WILDCARD_SLOT
+                } else {
+                    c
+                }
+            })
+            .collect();
+        any.then_some(pattern)
+    }
+
+    /// 主输入路**上屏记账点**用的记账码：通配组码下的码表候选记候选**全码**，其余同
+    /// [`Self::freq_code`]。
+    ///
+    /// 通配组码的缓冲（`azzd`）是查询串，不是任何词条的码位——按它记账会写出读端永远查不中
+    /// 的孤儿键。改记候选自己的全码，即该字在正常输入时所在的码位。
+    ///
+    /// ★ 只接在主输入路的上屏记账点，`freq_code` 本体不动：mix / 临拼缓冲用的是别的方案，
+    /// 通配键不适用于它们（同 `wildcard_enters` 的 overlay 门）；读侧调频
+    /// （`apply_freq_rerank`）按通配串查，查无记录 ⇒ 通配结果不参与调频，是有意的。
+    ///
+    /// 先判来源与码再问通配：非码表候选（拼音 / 短语…）不碰引擎管理器。
+    pub(crate) fn main_freq_code(&self, buf: &str, cand: &Candidate) -> String {
+        if cand.source == CandidateSource::CodeTable
+            && !cand.code.is_empty()
+            && self.wildcard_pattern(buf).is_some()
+        {
+            return cand.code.clone();
+        }
+        self.freq_code(buf, cand)
     }
 
     /// 通配键与既有按键功能的冲突清单（只告警）。空 = 无冲突或通配关闭。
@@ -282,5 +334,105 @@ mod tests {
         assert_eq!(c.wildcard_decision("", 'z'), Yield);
         assert_eq!(c.wildcard_decision("z", 'z'), Yield, "首位让位 ⇒ 整轮字面");
         assert_eq!(c.wildcard_decision("a", 'z'), Enter);
+    }
+
+    fn seed(code: &str, text: &str) -> wind_phrase::PhraseSeed {
+        wind_phrase::PhraseSeed {
+            code: code.into(),
+            text: text.into(),
+            weight: 0,
+            position: 0,
+            is_system: true,
+            category: String::new(),
+        }
+    }
+
+    const S: char = wind_dict::WILDCARD_SLOT;
+
+    /// 作通配的位换成槽位；无通配键的缓冲不是通配组码。
+    #[test]
+    fn pattern_marks_every_wildcard_position() {
+        let Some(c) = wubi_z(|_| {}) else { return };
+        assert_eq!(c.wildcard_pattern("az"), Some(format!("a{S}")));
+        assert_eq!(c.wildcard_pattern("azzd"), Some(format!("a{S}{S}d")));
+        assert_eq!(
+            c.wildcard_pattern("z"),
+            Some(S.to_string()),
+            "首位无绑定 ⇒ 首位即通配"
+        );
+        assert_eq!(c.wildcard_pattern("aaaa"), None);
+        assert_eq!(c.wildcard_pattern(""), None);
+    }
+
+    /// 通配关闭 ⇒ 恒 `None`（缓冲里的 `z` 是字面码元）。
+    #[test]
+    fn pattern_is_none_when_wildcard_off() {
+        let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard = false) else {
+            return;
+        };
+        assert_eq!(c.wildcard_pattern("az"), None);
+        assert_eq!(c.wildcard_pattern("z"), None);
+    }
+
+    /// 首位字面（`zz*` 活码让位进来的 `z`）⇒ 整轮字面，与 `wildcard_decision` 同一规则。
+    #[test]
+    fn pattern_is_none_when_lead_is_literal() {
+        let Some(c) = wubi_z(|_| {}) else { return };
+        c.debug_install_phrases(vec![seed("zzbd", "、")]);
+        assert_eq!(c.wildcard_pattern("zzbd"), None);
+        assert_eq!(c.wildcard_pattern("zz"), None);
+        assert_eq!(
+            c.wildcard_pattern("az"),
+            Some(format!("a{S}")),
+            "对照：a 起头照常"
+        );
+    }
+
+    /// 非首位有冲突（通配键 `=` 是出厂翻页键）⇒ 非首位的通配键只可能是经让位进来的字面，
+    /// 只有首位（全无绑定时）作通配。
+    #[test]
+    fn pattern_keeps_mid_positions_literal_on_conflict() {
+        let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard_key = "=".into()) else {
+            return;
+        };
+        assert_eq!(c.wildcard_decision("", '='), Enter, "前置：首位无绑定");
+        assert_eq!(
+            c.wildcard_decision("a", '='),
+            Yield,
+            "前置：非首位让位给翻页"
+        );
+        assert_eq!(c.wildcard_pattern("a="), None);
+        assert_eq!(c.wildcard_pattern("=a="), Some(format!("{S}a=")));
+    }
+
+    /// ★ Review Focus 3：主输入路的上屏记账对通配组码下的码表候选记**候选全码**，不记
+    /// `azzz` 这种通配串（读端永远查不中的孤儿键）。`freq_code` 本身不变（mix / 临拼缓冲
+    /// 与读侧调频沿用它）。对照：非通配组码沿用缓冲；非码表来源不受影响。
+    #[test]
+    fn main_freq_code_under_wildcard_is_candidate_full_code() {
+        use wind_candidate::{Candidate, CandidateSource};
+        let Some(c) = wubi_z(|_| {}) else { return };
+        let cand = Candidate {
+            text: "工".into(),
+            code: "aaaa".into(),
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        };
+        assert_eq!(c.main_freq_code("azzz", &cand), "aaaa");
+        assert_eq!(
+            c.main_freq_code("aaa", &cand),
+            "aaa",
+            "对照：非通配沿用缓冲"
+        );
+        assert_eq!(c.freq_code("azzz", &cand), "azzz", "freq_code 本体不变");
+        let phrase = Candidate {
+            text: "、".into(),
+            source: CandidateSource::Phrase,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.main_freq_code("azzz", &phrase),
+            c.freq_code("azzz", &phrase)
+        );
     }
 }

@@ -5109,32 +5109,38 @@ impl Coordinator {
         // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
         // 短语侧否决：整串已是精确码短语 / 还能续打成更长短语 → 不是「溢出」，放弃顶码
         // 继续组合（见 `phrase_vetoes_top_code`：引擎的两道闸只问码表，够不着短语层）。
-        let top_code = self
-            .engine_mgr
-            .handle_top_code(&state.input_buffer)
-            .filter(|_| !self.phrase_vetoes_top_code(state, &state.input_buffer))
-            // 缓冲里混进了入缓冲符号 ⇒ 这串不是本方案的编码，没有「码长溢出」可言。
-            // 不否决的话，码表方案下打 `sun-panel` 到第 5 个字符就会把 `sun` 顶上屏、
-            // 余码续打，用户正打的标识符当场被拆两半。判据与候选侧同源，见
-            // `buffer_has_literal_symbol`。
-            .filter(|_| !self.buffer_has_literal_symbol(state))
-            // 切点修正：引擎把 prefix 固定切在 `max_code_length`，而**短语码长不受方案满码长
-            // 约束**（5 码短语 `zzsfz` 落在 4 码五笔里）。顶码前的缓冲若恰是一条精确码短语，
-            // 就以短语码为切点。不修则 `zzsfza` 被切成 `zzsf` + `za`，与 `pre_buf` 对不上而
-            // 落进「多级溢出」分支，又因 `zzsf` 在码表无字放弃顶码——表现为「进空码不顶码」。
-            // pre_buf 长度恰为满码长时两种切法本就重合（`zzbd` 一类），行为不变。
-            .map(|(engine_top, remainder)| {
-                if self.phrase_has_exact_code(state, &pre_buf) {
-                    let rem: String = state
-                        .input_buffer
-                        .chars()
-                        .skip(pre_buf.chars().count())
-                        .collect();
-                    (engine_top, rem)
-                } else {
-                    (engine_top, remainder)
-                }
-            });
+        //
+        // 通配组码不顶字（spec §3.2）。引擎的 `handle_top_code` 是字面语义（`aaaza` 在它看来
+        // 是「超码长 + 无匹配 + 无后继」的典型溢出），故短路必须落在这里。
+        let top_code = if self.wildcard_pattern(&state.input_buffer).is_some() {
+            None
+        } else {
+            self.engine_mgr
+                .handle_top_code(&state.input_buffer)
+                .filter(|_| !self.phrase_vetoes_top_code(state, &state.input_buffer))
+                // 缓冲里混进了入缓冲符号 ⇒ 这串不是本方案的编码，没有「码长溢出」可言。
+                // 不否决的话，码表方案下打 `sun-panel` 到第 5 个字符就会把 `sun` 顶上屏、
+                // 余码续打，用户正打的标识符当场被拆两半。判据与候选侧同源，见
+                // `buffer_has_literal_symbol`。
+                .filter(|_| !self.buffer_has_literal_symbol(state))
+                // 切点修正：引擎把 prefix 固定切在 `max_code_length`，而**短语码长不受方案满码长
+                // 约束**（5 码短语 `zzsfz` 落在 4 码五笔里）。顶码前的缓冲若恰是一条精确码短语，
+                // 就以短语码为切点。不修则 `zzsfza` 被切成 `zzsf` + `za`，与 `pre_buf` 对不上而
+                // 落进「多级溢出」分支，又因 `zzsf` 在码表无字放弃顶码——表现为「进空码不顶码」。
+                // pre_buf 长度恰为满码长时两种切法本就重合（`zzbd` 一类），行为不变。
+                .map(|(engine_top, remainder)| {
+                    if self.phrase_has_exact_code(state, &pre_buf) {
+                        let rem: String = state
+                            .input_buffer
+                            .chars()
+                            .skip(pre_buf.chars().count())
+                            .collect();
+                        (engine_top, rem)
+                    } else {
+                        (engine_top, remainder)
+                    }
+                })
+        };
         if let Some((engine_top, remainder)) = top_code {
             let buf = state.input_buffer.clone();
             let prefix: String = buf[..buf.len().saturating_sub(remainder.len())].to_string();
@@ -5370,6 +5376,11 @@ impl Coordinator {
     ///   把它们算进来等于把自己让出去的那条路又堵死一次。
     fn char_is_literal_symbol(&self, c: char) -> bool {
         if self.engine_mgr.active_is_code_char(c) {
+            return false;
+        }
+        // 通配键进缓冲走的是通配闸门，不是本闸门；它是查询的一部分，不是字面符号。
+        // 同时列在 `buffer_symbol_chars` 里也一样——否则候选被清空、通配形同虚设。
+        if self.engine_mgr.active_wildcard_key() == Some(c) {
             return false;
         }
         match char_to_main_vk(c) {
@@ -5619,8 +5630,9 @@ impl Coordinator {
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let cand = state.candidates[idx].clone();
-            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let freq_code = self.freq_code(&state.input_buffer, &cand);
+            // 记账码：码表按输入码（码位独立），拼音/英文按候选码；通配组码记全码。
+            // 见 `main_freq_code`。
+            let freq_code = self.main_freq_code(&state.input_buffer, &cand);
             self.record_selection_cand(&freq_code, &cand);
             out.push_str(&self.cand_convert_text(state, &cand));
         }

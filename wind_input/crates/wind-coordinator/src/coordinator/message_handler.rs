@@ -1994,8 +1994,9 @@ impl MessageHandler for Coordinator {
                                 let idx =
                                     (start + state.selected_index).min(state.candidates.len() - 1);
                                 let cand = state.candidates[idx].clone();
-                                // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-                                let freq_code = self.freq_code(&state.input_buffer, &cand);
+                                // 记账码：码表按输入码（码位独立），拼音/英文按候选码；
+                                // 通配组码记全码。见 `main_freq_code`。
+                                let freq_code = self.main_freq_code(&state.input_buffer, &cand);
                                 self.record_selection_cand(&freq_code, &cand);
                                 self.record_commit(
                                     &cand.text,
@@ -2099,8 +2100,9 @@ impl MessageHandler for Coordinator {
                         let (start, _) = self.page_range(&state);
                         let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                         let cand = state.candidates[idx].clone();
-                        // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-                        let freq_code = self.freq_code(&state.input_buffer, &cand);
+                        // 记账码：码表按输入码（码位独立），拼音/英文按候选码；通配组码记全码。
+                        // 见 `main_freq_code`。
+                        let freq_code = self.main_freq_code(&state.input_buffer, &cand);
                         self.record_selection_cand(&freq_code, &cand);
                         // 标点上屏前先记被顶出的高亮候选（来源候选）。
                         self.record_commit(
@@ -3963,12 +3965,12 @@ impl MessageHandler for Coordinator {
         let tk = data.trigger_key as u32; // 协议为 u16，统一按 VK(u32) 比对
         // 取上屏文本、来源与记账码：命中候选取候选 source，退回原码分支为 None（不可归因）。
         // 记账码按来源分流（见 `freq_code`）——码表按输入码、拼音/英文按候选码；退回原码的
-        // 分支上屏的就是缓冲本身，无候选可依，用输入码。
+        // 分支上屏的就是缓冲本身，无候选可依，用输入码。通配组码记全码，见 `main_freq_code`。
         let cand_meta = |c: &Candidate| {
             (
                 c.text.clone(),
                 c.source,
-                self.freq_code(&state.input_buffer, c),
+                self.main_freq_code(&state.input_buffer, c),
             )
         };
         let raw = || {

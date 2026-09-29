@@ -10,11 +10,13 @@
 //! 与输出里有没有「跳过」。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::Config;
 use wind_coordinator::Coordinator;
 use wind_host::KeyProbe;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_SHIFT};
+use wind_store::Store;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -57,10 +59,14 @@ fn press_vk(coord: &Coordinator, vk: u32, shift: bool) -> KeyAction {
 
 const VK_SLASH: u32 = 0xBF; // `/`，Shift 即 `?`
 const VK_SEMICOLON: u32 = 0xBA; // `;`（出厂次选键）
+const VK_SPACE: u32 = 0x20;
 
+/// 本键上屏的文本。顶字在出厂 `direct_commit` 档下返回的是 `CommitThenDeferComposition`，
+/// 只认 `InsertText` 的话「不顶字」断言恒真。
 fn committed(a: &KeyAction) -> Option<&str> {
     match a {
         KeyAction::InsertText { text, .. } => Some(text.as_str()),
+        KeyAction::CommitThenDeferComposition { commit_text, .. } => Some(commit_text.as_str()),
         _ => None,
     }
 }
@@ -302,4 +308,336 @@ fn lead_symbol_wildcard_key_is_not_passed_through() {
         !coord.should_handle_key(&KeyProbe::new(VK_SLASH)),
         "对照：关闭时 `/` 透传给宿主"
     );
+}
+
+// ─────────────────────────── 候选管线（Task 11） ───────────────────────────
+
+/// 默认关闭 ⇒ 行为不变（`az` 无候选）；开启 ⇒ `az` 出候选、注释为全码、等长在前。
+#[test]
+fn wildcard_off_by_default_changes_nothing() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let off = Coordinator::new_headless(wubi(false, "z"), Some(&data_dir()));
+    press(&off, "az");
+    assert!(
+        off.debug_all_candidate_texts().is_empty(),
+        "对照：关闭时 az 是空码"
+    );
+
+    let on = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    press(&on, "az");
+    let tri = on.debug_candidate_triples();
+    assert!(!tri.is_empty(), "开启后 az 应出候选");
+    for (text, code, comment) in &tri {
+        assert!(
+            code.starts_with('a') && code.chars().count() >= 2,
+            "{text} 的码 {code} 不匹配 a?"
+        );
+        assert_eq!(comment, code, "{text} 的注释应是完整编码");
+    }
+    assert_eq!(tri[0].1.chars().count(), 2, "等长档在前");
+}
+
+/// 多通配：`azzd` 只出第 1 位 a、第 4 位 d 的 4 码。
+#[test]
+fn multiple_wildcards_match_exactly_one_code_char_each() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    press(&coord, "azzd");
+    let tri = coord.debug_candidate_triples();
+    assert!(!tri.is_empty(), "azzd 应有候选");
+    for (text, code, _) in tri.iter().filter(|(_, c, _)| c.chars().count() == 4) {
+        let cs: Vec<char> = code.chars().collect();
+        assert!(
+            cs[0] == 'a' && cs[3] == 'd',
+            "{text} 的码 {code} 不匹配 a??d"
+        );
+    }
+}
+
+/// 首位无任何绑定时首位即可通配（退化全表扫描，靠上限兜底）。
+#[test]
+fn leading_wildcard_when_unbound_scans_whole_table() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    press(&coord, "z");
+    let tri = coord.debug_candidate_triples();
+    assert!(
+        !tri.is_empty() && tri.len() <= 100,
+        "首位通配应出候选且不超上限：{}",
+        tri.len()
+    );
+    assert!(tri.iter().all(|(_, c, m)| c == m));
+}
+
+/// ★ Review Focus 1：首位 z 让位给 `zz*` 短语后，整轮都是字面——`zzbd` 仍出「、」。
+/// 对照：同配置下 `az` 仍是通配（证明通配确实开着）。
+#[test]
+fn zz_phrases_survive_when_wildcard_on() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    coord.debug_install_phrases(zz_phrases());
+    press(&coord, "zzbd");
+    assert_eq!(
+        coord
+            .debug_all_candidate_texts()
+            .first()
+            .map(String::as_str),
+        Some("、"),
+        "zzbd 短语应照常命中"
+    );
+    press_vk(&coord, 0x1B, false); // Esc 清空
+    press(&coord, "az");
+    assert!(
+        !coord.debug_candidate_triples().is_empty(),
+        "对照：az 仍是通配"
+    );
+}
+
+/// 首位 z 让位给 `z_key_repeat`：首选是上一次上屏内容，不是通配结果。
+#[test]
+fn leading_z_yields_to_z_key_repeat() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi(true, "z");
+    cfg.schema.codetable.z_key_repeat = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, "a");
+    let first = committed(&press_vk(&coord, VK_SPACE, false))
+        .expect("前置：空格上屏")
+        .to_string();
+    press(&coord, "z");
+    assert_eq!(
+        coord.debug_all_candidate_texts().first(),
+        Some(&first),
+        "首位 z 应让位给重复上屏"
+    );
+}
+
+/// ★ Review Focus 2：开着通配，`z_key_action = temp_pinyin` 的 z 夺取仍然成立
+/// （`has_code_prefix("zh")` 走字面 convert，不会被当成 `?h` 判活）。
+#[test]
+fn z_fallback_still_hijacks_when_wildcard_on() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi(true, "z");
+    cfg.schema.available.push("pinyin".into());
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.debug_install_phrases(zz_phrases()); // 首键 z 让位（活码），靠夺取进临拼
+    press(&coord, "z");
+    assert!(!coord.debug_in_temp_pinyin(), "前置：首键 z 让位");
+    press(&coord, "h");
+    assert!(coord.debug_in_temp_pinyin(), "zh 破活码前缀应被夺取进临拼");
+}
+
+/// §3.2：通配下超码长不顶字。对照：关闭时 `aaaa` + `a` 照常顶字。
+#[test]
+fn wildcard_never_top_commits() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut on = wubi(true, "z");
+    on.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless(on, Some(&data_dir()));
+    let act = press(&coord, "aaaza");
+    assert!(committed(&act).is_none(), "通配组码不顶字，实际 {act:?}");
+    assert_eq!(coord.debug_input_buffer(), "aaaza");
+
+    let mut off = wubi(false, "z");
+    off.schema.codetable.top_code_commit = true;
+    let coord = Coordinator::new_headless(off, Some(&data_dir()));
+    let act = press(&coord, "aaaaa");
+    assert!(committed(&act).is_some(), "对照：字面超码长照常顶字");
+}
+
+/// §3.2：通配下满码唯一也不自动上屏（结果多于一条时本就不会上屏，故此处断言的是
+/// 「最后一键没有上屏」这一弱形态；强形态见引擎单测 `wildcard_never_auto_commits`）。
+#[test]
+fn wildcard_full_length_does_not_auto_commit() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi(true, "z");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    cfg.schema.codetable.clear_on_empty_max = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = press(&coord, "aaaz");
+    assert!(
+        committed(&act).is_none(),
+        "通配满码不自动上屏，实际 {act:?}"
+    );
+    assert_eq!(coord.debug_input_buffer(), "aaaz", "也不清空");
+}
+
+/// ★ Review Focus 4：符号通配键同时在 `input.buffer_symbol_chars` 里，仍按通配查候选。
+#[test]
+fn symbol_wildcard_listed_in_buffer_symbol_chars_still_queries() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi(true, "?");
+    cfg.input.buffer_symbol_chars = "-?".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, "a");
+    press_vk(&coord, VK_SLASH, true);
+    assert_eq!(coord.debug_input_buffer(), "a?");
+    assert!(
+        !coord.debug_candidate_triples().is_empty(),
+        "通配键不是「字面符号」，不得清空候选"
+    );
+}
+
+/// spec §3.1：同字不同码在通配结果里各留一条（学码时要看到每个码位）。
+/// 「工」在五笔 86 里有 `aaa`（三简）与 `aaaa`（全码），`aaz` 的等长档与更长档各命中一条；
+/// 协调器显示层若仍按 text 去重，后一条会被并进前一条。
+#[test]
+fn same_text_different_codes_both_listed() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    press(&coord, "aaz");
+    let tri = coord.debug_candidate_triples();
+    let gong: Vec<&str> = tri
+        .iter()
+        .filter(|(t, _, _)| t == "工")
+        .map(|(_, c, _)| c.as_str())
+        .collect();
+    assert!(
+        gong.contains(&"aaa") && gong.contains(&"aaaa"),
+        "「工」应以 aaa 与 aaaa 各出一条，实际 {gong:?}"
+    );
+}
+
+/// 出简让全在通配组码下不施加：通配结果是「查码」列表，不是某个码位的首选之争。
+/// 现场：档位 3 下沿途记下 `a`/`aaa` 的首选「工」，`aaaz` 的首条（「工」，全码 `aaaa`）
+/// 若照常让位就会被挪走。对照：档位 0 同一操作的首条。
+#[test]
+fn short_code_yield_skipped_under_wildcard() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let first_at = |level: usize| {
+        let ov = std::env::temp_dir().join(format!("wind_wcard_scy_{level}"));
+        std::fs::create_dir_all(&ov).expect("建 override 目录失败");
+        std::fs::write(
+            ov.join("wubi86.toml"),
+            format!("[engine.codetable]\nshort_code_yield_level = {level}\n"),
+        )
+        .expect("写 override 失败");
+        let coord =
+            Coordinator::new_headless_with_override(wubi(true, "z"), Some(&data_dir()), Some(ov));
+        press(&coord, "aaaz");
+        coord.debug_all_candidate_texts().first().cloned()
+    };
+    let base = first_at(0);
+    assert_eq!(
+        base.as_deref(),
+        Some("工"),
+        "前置：档位 0 时 aaaz 首条是「工」"
+    );
+    assert_eq!(first_at(3), base, "通配组码不出简让全");
+}
+
+/// ★ Review Focus 3（端到端）：主输入路两个上屏出口（空格选词、标点顶屏）在通配组码下
+/// 以**候选全码**记词频，不记 `aaaz` 这种查询串（读端永远查不中的孤儿键）。
+/// 单测只钉 `main_freq_code` 本身；这里钉的是出口确实接上了它。
+#[test]
+fn commit_under_wildcard_records_freq_by_full_code() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    // 标点顶屏取 Shift+1（「！」）：出厂 `,` `.` 在组码中是翻页键；码表的标点顶屏
+    // 开关（`punct_commit`）出厂关，这里打开。
+    for (tag, vk, shift) in [("space", VK_SPACE, false), ("bang", 0x31, true)] {
+        let base =
+            std::env::temp_dir().join(format!("wind_wcard_freq_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ov = base.join("override");
+        std::fs::create_dir_all(&ov).unwrap();
+        std::fs::write(
+            ov.join("wubi86.toml"),
+            "[engine.codetable.frequency]\nenabled = true\n",
+        )
+        .unwrap();
+        let store = Arc::new(Store::open(base.join("user.redb")).unwrap());
+        let mut cfg = wubi(true, "z");
+        cfg.schema.codetable.punct_commit = true;
+        let coord = Coordinator::new_headless_with_store_override(
+            cfg,
+            Some(&data_dir()),
+            Arc::clone(&store),
+            Some(ov),
+        );
+        press(&coord, "aaaz");
+        let (text, code, _) = coord
+            .debug_candidate_triples()
+            .first()
+            .cloned()
+            .expect("前置：aaaz 有候选");
+        let act = press_vk(&coord, vk, shift);
+        assert!(
+            committed(&act).is_some_and(|t| t.starts_with(&text)),
+            "{tag}：前置：上屏首选，实际 {act:?}"
+        );
+        assert!(
+            store.get_freq("wubi86", &code, &text).unwrap().is_some(),
+            "{tag}：应按全码 {code} 记「{text}」"
+        );
+        assert!(
+            store.get_freq("wubi86", "aaaz", &text).unwrap().is_none(),
+            "{tag}：不得按通配串记账"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// spec §5.3：短语不参与通配组码。现场：一条码恰为 `az` 的短语——通配下 `az` 是查询
+/// `a?`，不是这条短语的码。对照：关闭时同一操作照出该短语。
+#[test]
+fn phrases_do_not_join_wildcard_results() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let seed = wind_phrase::PhraseSeed {
+        code: "az".into(),
+        text: "短语甲".into(),
+        weight: 0,
+        position: 0,
+        is_system: true,
+        category: String::new(),
+    };
+    for on in [false, true] {
+        let coord = Coordinator::new_headless(wubi(on, "z"), Some(&data_dir()));
+        coord.debug_install_phrases(vec![seed.clone()]);
+        press(&coord, "az");
+        let has = coord
+            .debug_all_candidate_texts()
+            .iter()
+            .any(|t| t == "短语甲");
+        assert_eq!(has, !on, "wildcard={on}：短语出现与否不符");
+    }
 }
