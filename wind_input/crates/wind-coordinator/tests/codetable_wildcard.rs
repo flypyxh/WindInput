@@ -329,39 +329,217 @@ fn full_length_wildcard_key_is_literal() {
     );
 }
 
-/// 五笔拼音混输方案不参与通配（spec §3.1）：全局开了通配（键 `z`），`hanzi` 里非首位的 `z`
-/// 仍是拼音字母，照出「汉字」，候选与关闭时相同。对照：同一全局配置下纯五笔 `az` 是通配。
-#[test]
-fn mixed_pinyin_scheme_ignores_wildcard() {
-    if !dict_ready()
-        || !data_dir()
+// ─────────────────────────── 五笔拼音混输（spec §10） ───────────────────────────
+
+fn mixed_ready() -> bool {
+    dict_ready()
+        && data_dir()
             .join("schemas/wubi86_pinyin.schema.toml")
             .exists()
-    {
+}
+
+fn wubi_pinyin(wildcard: bool) -> Config {
+    let mut cfg = wubi(wildcard, "z");
+    cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
+    cfg.schema.active = "wubi86_pinyin".into();
+    cfg
+}
+
+/// `code` 是否为 `pattern`（`z` 作通配位）的五笔命中。五笔词库没有含 `z` 的码，
+/// 故带 `z` 的码只可能是拼音 / 字面串——借此从 `(text, code, comment)` 里认出来源。
+fn wubi_hit(pattern: &str, code: &str, equal: bool) -> bool {
+    let len_ok = if equal {
+        code.len() == pattern.len()
+    } else {
+        code.len() > pattern.len()
+    };
+    len_ok
+        && !code.contains('z')
+        && pattern
+            .chars()
+            .zip(code.chars())
+            .all(|(p, c)| p == 'z' || p == c)
+}
+
+fn mixed_triples(on: bool, keys: &str) -> Vec<(String, String, String)> {
+    let coord = Coordinator::new_headless(wubi_pinyin(on), Some(&data_dir()));
+    press(&coord, keys);
+    coord.debug_candidate_triples()
+}
+
+/// `gz`：通配出 `g` 开头的二码字，首位是等长结果，注释是完整编码。
+/// 对照：关闭时没有任何 `g?` 五笔命中。
+#[test]
+fn mixed_gz_lists_two_code_chars() {
+    if !mixed_ready() {
         eprintln!("跳过：五笔 / 混输方案数据不存在");
         return;
     }
-    let mixed = |on: bool| {
-        let mut cfg = wubi(on, "z");
-        cfg.schema.available = vec!["wubi86_pinyin".into()];
-        cfg.schema.active = "wubi86_pinyin".into();
-        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
-        press(&coord, "hanzi");
-        coord.debug_all_candidate_texts()
-    };
-    let on = mixed(true);
+    let on = mixed_triples(true, "gz");
+    let (text, code, comment) = on.first().expect("gz 应有候选");
     assert!(
-        on.iter().any(|t| t == "汉字"),
-        "hanzi 应出「汉字」，实际 {on:?}"
+        wubi_hit("gz", code, true),
+        "首选应是 g? 等长命中，实际 {text} {code}"
     );
-    assert_eq!(on, mixed(false), "开关不影响混输候选");
+    assert_eq!(comment, code, "注释是完整编码");
+    let off = mixed_triples(false, "gz");
+    assert!(
+        !off.iter().any(|(_, c, _)| wubi_hit("gz", c, true)),
+        "对照：关闭时无通配命中，实际 {off:?}"
+    );
+}
 
-    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
-    press(&coord, "az");
+/// `hanz`：通配（`han?` 的五笔字）与拼音（「汉字」这类补全）并存，等长通配排在拼音之前。
+#[test]
+fn mixed_hanz_merges_wildcard_and_pinyin() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let off = mixed_triples(false, "hanz");
     assert!(
-        !coord.debug_candidate_triples().is_empty(),
-        "对照：同一全局配置下纯五笔 az 是通配"
+        off.iter().any(|(t, _, _)| t == "汉字"),
+        "前置：关闭时 hanz 应有拼音补全「汉字」，实际 {off:?}"
     );
+    let on = mixed_triples(true, "hanz");
+    let hanzi = on
+        .iter()
+        .position(|(t, _, _)| t == "汉字")
+        .unwrap_or_else(|| panic!("开启后拼音「汉字」仍在，实际 {on:?}"));
+    let last_equal = on
+        .iter()
+        .rposition(|(_, c, _)| wubi_hit("hanz", c, true))
+        .unwrap_or_else(|| panic!("应有 han? 五笔命中，实际 {on:?}"));
+    assert!(
+        wubi_hit("hanz", &on[0].1, true),
+        "首选是等长通配，实际 {:?}",
+        on[0]
+    );
+    assert!(last_equal < hanzi, "等长通配全部排在拼音之前：{on:?}");
+}
+
+/// `hanzi` / `xianzai`：超码长整串字面，与关闭时逐条相同。
+#[test]
+fn mixed_overlength_is_identical_to_off() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    for (keys, word) in [("hanzi", "汉字"), ("xianzai", "现在")] {
+        let on = mixed_triples(true, keys);
+        assert!(
+            on.iter().any(|(t, _, _)| t == word),
+            "{keys} 应出「{word}」，实际 {on:?}"
+        );
+        assert_eq!(on, mixed_triples(false, keys), "{keys} 与关闭时相同");
+    }
+}
+
+/// ★ Review Focus 5：`zhang` 首位字面，装不装 `zz*` 短语都与关闭时相同。
+#[test]
+fn mixed_lead_z_is_literal_with_and_without_zz_phrases() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    for phrases in [false, true] {
+        let run = |on: bool| {
+            let coord = Coordinator::new_headless(wubi_pinyin(on), Some(&data_dir()));
+            if phrases {
+                coord.debug_install_phrases(zz_phrases());
+            }
+            press(&coord, "zhang");
+            (coord.debug_input_buffer(), coord.debug_candidate_triples())
+        };
+        let on = run(true);
+        assert_eq!(on.0, "zhang");
+        assert!(
+            on.1.iter().any(|(t, _, _)| t == "张"),
+            "短语 {phrases}：zhang 应出「张」，实际 {:?}",
+            on.1
+        );
+        assert_eq!(on, run(false), "短语 {phrases}：与关闭时相同");
+    }
+}
+
+/// `azi` 撞车串：通配等长（`a?i` 的五笔字）在前，拼音精确「阿紫」随后，通配更长补全在其后。
+#[test]
+fn mixed_azi_wildcard_first_then_pinyin() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let off = mixed_triples(false, "azi");
+    assert!(
+        off.iter().any(|(t, _, _)| t == "阿紫"),
+        "前置：关闭时 azi 应出拼音「阿紫」，实际 {off:?}"
+    );
+    let on = mixed_triples(true, "azi");
+    let azi = on
+        .iter()
+        .position(|(t, _, _)| t == "阿紫")
+        .unwrap_or_else(|| panic!("开启后「阿紫」仍在，实际 {on:?}"));
+    assert_eq!(
+        on.iter().filter(|(t, _, _)| t == "阿紫").count(),
+        1,
+        "拼音不重复"
+    );
+    let last_equal = on
+        .iter()
+        .rposition(|(_, c, _)| wubi_hit("azi", c, true))
+        .unwrap_or_else(|| panic!("应有 a?i 五笔命中，实际 {on:?}"));
+    assert!(last_equal < azi, "等长通配全部排在「阿紫」之前：{on:?}");
+    if let Some(first_longer) = on.iter().position(|(_, c, _)| wubi_hit("azi", c, false)) {
+        assert!(azi < first_longer, "通配更长补全排在拼音精确之后：{on:?}");
+    }
+}
+
+/// ★ Review Focus 4：拼音分段续转的剩余串按字面续转拼音，与关闭时逐条相同。
+/// `woaizi` 选「我」后剩 `aizi`（4 码、z 非首位）——这条才测得到续转规则；
+/// spec 给的 `woaizhongguo` 剩余串超码长，走的是超码长规则，一并保留。
+#[test]
+fn mixed_segment_continuation_stays_literal() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    for (keys, rest) in [("woaizi", "aizi"), ("woaizhongguo", "aizhongguo")] {
+        let run = |on: bool| {
+            let coord = Coordinator::new_headless(wubi_pinyin(on), Some(&data_dir()));
+            press(&coord, keys);
+            let texts = coord.debug_all_candidate_texts();
+            let wo = texts
+                .iter()
+                .position(|t| t == "我")
+                .unwrap_or_else(|| panic!("前置：{keys} 应有部分候选「我」，实际 {texts:?}"));
+            let _ = coord.select_candidate(wo);
+            (coord.debug_input_buffer(), coord.debug_candidate_triples())
+        };
+        let on = run(true);
+        assert_eq!(on.0, rest, "选「我」后剩余 {rest}");
+        assert!(
+            !on.1.iter().any(|(_, c, _)| wubi_hit(rest, c, true)),
+            "续转态不出五笔通配命中：{:?}",
+            on.1
+        );
+        assert_eq!(on, run(false), "{keys}：续转与关闭时相同");
+    }
+}
+
+/// 开着通配、但串里没有通配键 ⇒ 与关闭时逐条相同（引擎放开 `wildcard_key` 不得波及字面路径）。
+#[test]
+fn mixed_without_wildcard_key_is_identical_to_off() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    for keys in ["wo", "xian", "aawt", "yijga"] {
+        assert_eq!(
+            mixed_triples(true, keys),
+            mixed_triples(false, keys),
+            "{keys}：无通配键时与关闭相同"
+        );
+    }
 }
 
 // ─────────────────────────── 候选管线（Task 11） ───────────────────────────
@@ -693,5 +871,61 @@ fn phrases_do_not_join_wildcard_results() {
             .iter()
             .any(|t| t == "短语甲");
         assert_eq!(has, !on, "wildcard={on}：短语出现与否不符");
+    }
+}
+
+/// §3.2 回归：出厂 `top_code_commit = true` 下，满码通配串再敲第 5 键不得把通配结果顶上屏，
+/// 且通配开 / 关行为逐字一致（混输与纯五笔都钉）。
+fn fifth_key_outcome(cfg: Config, keys: &str, fifth: &str) -> (Option<String>, String) {
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, keys);
+    let act = press(&coord, fifth);
+    (
+        committed(&act).map(str::to_string),
+        coord.debug_input_buffer(),
+    )
+}
+
+#[test]
+fn mixed_wildcard_fifth_key_never_top_commits() {
+    if !mixed_ready() {
+        eprintln!("跳过：混输方案数据不存在");
+        return;
+    }
+    for (keys, fifth) in [("wqvz", "x"), ("gzzz", "a")] {
+        let mut results = vec![];
+        for on in [true, false] {
+            let mut cfg = wubi_pinyin(on);
+            cfg.schema.codetable.top_code_commit = true;
+            results.push(fifth_key_outcome(cfg, keys, fifth));
+        }
+        let want = (None, format!("{keys}{fifth}"));
+        assert_eq!(results[0], want, "混输通配开：{keys}+{fifth} 不得顶字");
+        assert_eq!(
+            results[0], results[1],
+            "混输通配开/关须一致：{keys}+{fifth}"
+        );
+    }
+}
+
+#[test]
+fn pure_wubi_wildcard_fifth_key_never_top_commits() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    for (keys, fifth) in [("wqvz", "x"), ("gzzz", "a")] {
+        let mut results = vec![];
+        for on in [true, false] {
+            let mut cfg = wubi(on, "z");
+            cfg.schema.codetable.top_code_commit = true;
+            results.push(fifth_key_outcome(cfg, keys, fifth));
+        }
+        let want = (None, format!("{keys}{fifth}"));
+        assert_eq!(results[0], want, "纯五笔通配开：{keys}+{fifth}");
+        assert_eq!(
+            results[0], results[1],
+            "纯五笔通配开/关须一致：{keys}+{fifth}"
+        );
     }
 }

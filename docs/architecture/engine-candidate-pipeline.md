@@ -190,13 +190,19 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   等长档取满后余额交给多起点分支限界（`bnb_collect`）；BTreeMap / redb 按首个通配前的字面
   前缀扫描后过滤；草稿层不参与；Composite 按 `(text, code)` 去重、`cmp_pattern` 等长优先。
 - **引擎**：`is_exact_code` 改判等长，`comment = code`，`should_commit` / `should_clear` 恒 false，
-  上限 `WILDCARD_RESULT_LIMIT = 100`。混输有拼音子引擎时通配关闭（`wildcard_key()` 为 `None`），
-  否则代理主码表。
+  上限 `WILDCARD_RESULT_LIMIT = 100`；结果带 `is_wildcard`，`source_tier` 把「通配 + 等长」放档 0。
+  混输代理主码表的通配键；有拼音子引擎时 `MixedEngine::convert_wildcard` = 字面 `convert(input)`
+  ⊕ 主码表通配，`merge_wildcard` 按「通配等长 → 字面 → 通配更长」合并、码表间 `(text, code)`
+  去重、拼音 / 英文与码表同字即丢、带拼音保底截断。通配码长走 `Engine::wildcard_code_length`
+  （混输取主码表码长；混输 `max_code_length` 仍为 0，免得改动短语自动上屏门槛）。
 - **协调器**：`build_candidates` 通配时不查短语、跳过自动上屏复评 / 清空复核 / 短语自动上屏；
   `accumulate_code_char` 不顶字；通配键不算字面符号。另有三处随通配调整：
   - 显示层去重改按 `(text, code)`（同字不同码各留一条，学码用）；
   - 记账：`freq_code` 不变，主输入上屏点改用 `main_freq_code`，通配组码记候选的完整编码；
   - `short_code_yield`（出简让全）通配时整体跳过（让位与记录都不做）。
+  - 五笔拼音混输（`wildcard_mixes_pinyin`）另有三种整串字面：首位、整串超主码表码长
+    （`wildcard_mixed_overflow`）、拼音分段续转（`wildcard_pattern_of`，与 `build_candidates`
+    的续转判据同源 `last_seg_is_pinyin`；`build_candidates` 先判续转再判通配）。
 - **overlay 门控**：临拼 / 快捷输入等 overlay 激活时 `wildcard_enters` 恒 false，不作通配。
 - **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位一律让位（照常出标点），故不动 C++
   透传标点集；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与

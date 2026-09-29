@@ -557,6 +557,48 @@ impl MixedEngine {
         cands.extend(extra);
     }
 
+    /// 通配合并（spec §10）：主码表通配结果 ⊕ 字面混输结果。
+    ///
+    /// 次序即**存活优先级**（截断时谁先活；显示序由协调器 `candidate_display_order` 重排）：
+    /// 通配等长 → 字面混输结果（其内部已按 `truncation_tier` 排好）→ 通配更长补全。
+    ///
+    /// 去重分两种口径：码表候选之间按 `(text, code)`（同字不同码各留，学码用，同 spec §3.1）；
+    /// 拼音 / 英文候选与**任一**码表候选同字即丢（沿用 `sort_dedup_truncate`「码表留下」）。
+    /// ⚠️ 跨来源去重只能在这里做：协调器通配下按 `(text, code)` 去重，拼音「蒸」与码表「蒸」
+    /// 码不同，到那里两条都留。码表文本须**先收齐**再过滤：通配更长补全排在字面之后，
+    /// 边走边收会漏掉与它同字的拼音。
+    fn merge_wildcard(
+        wildcard: Vec<Candidate>,
+        literal: Vec<Candidate>,
+        max_candidates: usize,
+    ) -> Vec<Candidate> {
+        let (equal, longer): (Vec<Candidate>, Vec<Candidate>) =
+            wildcard.into_iter().partition(|c| c.is_exact_code);
+        let ct_texts: std::collections::HashSet<String> = equal
+            .iter()
+            .chain(&literal)
+            .chain(&longer)
+            .filter(|c| c.source == CandidateSource::CodeTable)
+            .map(|c| c.text.clone())
+            .collect();
+        let mut ct_keys: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut merged: Vec<Candidate> =
+            Vec::with_capacity(equal.len() + literal.len() + longer.len());
+        for c in equal.into_iter().chain(literal).chain(longer) {
+            let keep = if c.source == CandidateSource::CodeTable {
+                ct_keys.insert((c.text.clone(), c.code.clone()))
+            } else {
+                !ct_texts.contains(&c.text)
+            };
+            if keep {
+                merged.push(c);
+            }
+        }
+        Self::truncate_with_pinyin_quota(&mut merged, max_candidates);
+        merged
+    }
+
     /// 组合区**默认**形态（`preedit_display`）：≥2 完成音节且有 preedit 时才用拼音拆分串。
     /// 单音节不拆——纯五笔码更不该被拆（cang 显示 cang，不是 cang）。
     fn pinyin_preedit_of(py: &ConvertResult) -> Option<String> {
@@ -831,27 +873,48 @@ impl Engine for MixedEngine {
         self.primary.input_chars()
     }
 
-    /// 有拼音子引擎时通配**关闭**（spec §3.1：五笔拼音混输不参与）：通配键多为字母 `z`，
-    /// 非首位的 `z` 在拼音里是正经字母（`hanzi` / `xianzai`），作通配会把整串变成只查
-    /// 主码表的查询、拼音候选全灭。无拼音子引擎时代理主码表。
+    /// 混输代理主码表的通配键（spec §10：码长内两路同查）。哪几位作通配、何时整串字面
+    /// 由协调器裁决（首位 / 超码长 / 拼音分段续转，见 `wind-coordinator/src/wildcard.rs`）。
     fn wildcard_key(&self) -> Option<char> {
-        if self.secondary.is_some() {
-            return None;
-        }
         self.primary.wildcard_key()
     }
 
+    /// 通配转换（spec §10）。无拼音子引擎 ⇒ 代理主码表；有 ⇒ 字面 `convert(input)`
+    /// ⊕ 主码表通配，见 [`Self::merge_wildcard`]。
+    ///
+    /// 前提：协调器只在整串 ≤ 主码表码长时给 pattern（超码长整串字面），故这里的字面
+    /// `convert` 恒走码长内分支。上屏 / 清空意向一律不给（§3.2）；组合区显示原始缓冲，
+    /// 拼音拆分形态沿用字面结果，供高亮拼音候选时的「高亮跟随」。
     fn convert_wildcard(
         &self,
         input: &str,
         pattern: &str,
         max_candidates: usize,
     ) -> Option<ConvertResult> {
-        if self.secondary.is_some() {
-            return None;
+        let wc = self
+            .primary
+            .convert_wildcard(input, pattern, max_candidates)?;
+        if self.secondary.is_none() {
+            return Some(wc);
         }
-        self.primary
-            .convert_wildcard(input, pattern, max_candidates)
+        let lit = self.convert(input, max_candidates).unwrap_or_default();
+        let candidates = Self::merge_wildcard(wc.candidates, lit.candidates, max_candidates);
+        let is_empty = candidates.is_empty();
+        Some(ConvertResult {
+            candidates,
+            preedit_pinyin: lit.preedit_pinyin,
+            preedit_display: input.to_string(),
+            is_empty,
+            ..Default::default()
+        })
+    }
+
+    fn wildcard_code_length(&self) -> usize {
+        self.max_code_len
+    }
+
+    fn wildcard_mixes_pinyin(&self) -> bool {
+        self.secondary.is_some()
     }
 
     /// 热插拔扩展词库：转发到主/次/英文子引擎（码表子引擎承载 codetable-extra 层，
@@ -2427,42 +2490,183 @@ mod tests {
         assert_eq!(r.commit_text, "工");
     }
 
-    /// 有拼音子引擎 ⇒ 通配关闭（spec §3.1「五笔拼音混输不参与」）：键与转换都不给，
-    /// 否则非首位 `z` 会把 `hanzi` 变成只查主码表的查询。对照：无拼音子引擎时代理主码表，
-    /// 且结果只来自主码表。
-    #[test]
-    fn wildcard_off_when_pinyin_present() {
-        let primary = || {
-            let mut d = CodetableDict::empty();
-            d.merge_single("ab".into(), "甲".into(), 10, 0);
-            let dm = DictManager::new();
-            dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
-            Box::new(CodeTableEngine::new(
-                4,
-                CommitOptions {
-                    wildcard: Some('z'),
+    /// 带通配键 `z` 的内存码表（码长 4）。
+    fn ct_wildcard(entries: &[(&str, &str, i32)]) -> Box<dyn Engine> {
+        let mut d = CodetableDict::empty();
+        for (i, (code, text, w)) in entries.iter().enumerate() {
+            d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
+        Box::new(CodeTableEngine::new(
+            4,
+            CommitOptions {
+                wildcard: Some('z'),
+                ..Default::default()
+            },
+            Arc::new(dm),
+        ))
+    }
+
+    /// 按输入查表的假拼音（`FakePinyin` 不看输入、恒出同一条，测不了「字面串走拼音」）。
+    struct FakePinyinTable {
+        entries: Vec<(&'static str, &'static str)>,
+    }
+    impl Engine for FakePinyinTable {
+        fn convert(&self, input: &str, _max: usize) -> anyhow::Result<ConvertResult> {
+            let candidates = self
+                .entries
+                .iter()
+                .filter(|(k, _)| *k == input)
+                .enumerate()
+                .map(|(i, (_, t))| Candidate {
+                    text: t.to_string(),
+                    code: input.to_string(),
+                    weight: 1000 - i as i32,
+                    consumed_length: input.len(),
+                    source: CandidateSource::Pinyin,
                     ..Default::default()
-                },
-                Arc::new(dm),
-            ))
-        };
-        let pattern = format!("a{}", wind_dict::WILDCARD_SLOT);
-        let mixed = MixedEngine::new(
-            primary(),
-            Some(Box::new(FakePinyin {
-                word: "拼音",
-                syllables: 1,
-            })),
+                })
+                .collect();
+            Ok(ConvertResult {
+                candidates,
+                ..Default::default()
+            })
+        }
+        fn reset(&self) {}
+        fn engine_type(&self) -> EngineType {
+            EngineType::Pinyin
+        }
+    }
+
+    fn mixed_wc(ct: &[(&str, &str, i32)], py: Vec<(&'static str, &'static str)>) -> MixedEngine {
+        MixedEngine::new(
+            ct_wildcard(ct),
+            Some(Box::new(FakePinyinTable { entries: py })),
+            None,
+            MixConfig::default(),
+        )
+    }
+
+    fn slot(p: &str) -> String {
+        p.replace('?', &wind_dict::WILDCARD_SLOT.to_string())
+    }
+
+    /// spec §10：字面混输 ⊕ 主码表通配。引擎次序 = 存活优先级：通配等长 → 字面 → 通配更长。
+    /// 通配结果不给上屏 / 清空意向；组合区是原始缓冲。
+    #[test]
+    fn wildcard_merges_literal_mixed_with_primary_pattern() {
+        let e = mixed_wc(
+            &[
+                ("abi", "蒸", 9000),
+                ("adi", "藉", 8000),
+                ("abic", "蒸笼", 500),
+            ],
+            vec![("azi", "阿紫")],
+        );
+        let r = e
+            .convert_wildcard("azi", &slot("a?i"), 50)
+            .expect("有拼音子引擎时也接通配请求");
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["蒸", "藉", "阿紫", "蒸笼"]);
+        assert!(!r.should_commit && r.commit_text.is_empty() && !r.should_clear);
+        assert_eq!(r.preedit_display, "azi");
+        assert!(
+            r.candidates
+                .iter()
+                .filter(|c| c.source == CandidateSource::CodeTable)
+                .all(|c| c.is_wildcard),
+            "码表侧全部来自通配"
+        );
+    }
+
+    /// ★ Review Focus 1：码表之间按 (text, code) 去重（同字不同码各留），拼音与**任一**
+    /// 码表候选同字即丢——包括与排在字面之后的通配**更长**补全同字。
+    #[test]
+    fn wildcard_merge_drops_pinyin_same_text_keeps_codetable_codes() {
+        let e = mixed_wc(
+            &[
+                ("abi", "蒸", 9000),
+                ("aci", "蒸", 100),
+                ("abic", "蒸笼", 500),
+            ],
+            vec![("azi", "蒸"), ("azi", "蒸笼"), ("azi", "阿紫")],
+        );
+        let r = e.convert_wildcard("azi", &slot("a?i"), 50).unwrap();
+        let pairs: Vec<(&str, &str, CandidateSource)> = r
+            .candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c.code.as_str(), c.source))
+            .collect();
+        let zheng: Vec<&str> = pairs.iter().filter(|p| p.0 == "蒸").map(|p| p.1).collect();
+        assert_eq!(zheng, ["abi", "aci"], "同字不同码各留，拼音「蒸」被丢");
+        assert!(
+            pairs
+                .iter()
+                .filter(|p| p.0 == "蒸笼")
+                .all(|p| p.2 == CandidateSource::CodeTable),
+            "与通配更长补全同字的拼音也被丢：{pairs:?}"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.0 == "阿紫" && p.2 == CandidateSource::Pinyin)
+        );
+    }
+
+    /// ★ Review Focus 3：通配结果全排在字面之前，截断后拼音仍有保底席位。
+    #[test]
+    fn wildcard_merge_keeps_pinyin_quota() {
+        let e = mixed_wc(
+            &[
+                ("aai", "甲", 900),
+                ("abi", "乙", 800),
+                ("aci", "丙", 700),
+                ("adi", "丁", 600),
+                ("aei", "戊", 500),
+                ("afi", "己", 400),
+            ],
+            vec![("azi", "阿紫"), ("azi", "阿姊")],
+        );
+        let r = e.convert_wildcard("azi", &slot("a?i"), 5).unwrap();
+        assert_eq!(r.candidates.len(), 5);
+        let py = r
+            .candidates
+            .iter()
+            .filter(|c| c.source == CandidateSource::Pinyin)
+            .count();
+        assert!(py >= 1, "5 / PINYIN_QUOTA_DIVISOR = 1 席保底，实际 {py}");
+    }
+
+    /// 通配码长取主码表的，但 `max_code_length` 不代理（它还决定短语自动上屏门槛）。
+    /// 对照：无拼音子引擎时只代理主码表、不混拼音。
+    #[test]
+    fn wildcard_code_length_is_primary_max_without_proxying_max_code_length() {
+        let mixed = mixed_wc(&[("ab", "甲", 10)], vec![]);
+        assert_eq!(mixed.wildcard_code_length(), 4);
+        assert_eq!(
+            Engine::max_code_length(&mixed),
+            0,
+            "混输 max_code_length 维持 0"
+        );
+        assert!(mixed.wildcard_mixes_pinyin());
+        assert_eq!(
+            mixed.wildcard_key(),
+            Some('z'),
+            "混输代理主码表的通配键（spec §10）"
+        );
+
+        let solo = MixedEngine::new(
+            ct_wildcard(&[("ab", "甲", 10)]),
+            None,
             None,
             MixConfig::default(),
         );
-        assert_eq!(mixed.wildcard_key(), None, "有拼音子引擎 ⇒ 通配关闭");
-        assert!(mixed.convert_wildcard("az", &pattern, 10).is_none());
-
-        let solo = MixedEngine::new(primary(), None, None, MixConfig::default());
+        assert!(!solo.wildcard_mixes_pinyin());
+        assert_eq!(solo.wildcard_code_length(), 4);
         assert_eq!(solo.wildcard_key(), Some('z'), "对照：无拼音时代理主码表");
         let r = solo
-            .convert_wildcard("az", &pattern, 10)
+            .convert_wildcard("az", &slot("a?"), 10)
             .expect("主码表开了通配");
         let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, ["甲"]);

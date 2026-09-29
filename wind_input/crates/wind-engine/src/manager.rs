@@ -2608,6 +2608,21 @@ impl EngineManager {
         self.active_engine().and_then(|e| e.wildcard_key())
     }
 
+    /// 活跃方案的通配码长（[`Engine::wildcard_code_length`]；混输取主码表的）。
+    /// 协调器判「满码后通配键按字面」只从这里取，**不**用 [`Self::active_max_code_length`]
+    /// ——混输那个值刻意为 0。
+    pub fn active_wildcard_code_length(&self) -> usize {
+        self.active_engine()
+            .map(|e| e.wildcard_code_length())
+            .unwrap_or(0)
+    }
+
+    /// 活跃方案的通配是否与拼音共用输入（五笔拼音混输且有拼音子引擎）。
+    pub fn active_wildcard_mixes_pinyin(&self) -> bool {
+        self.active_engine()
+            .is_some_and(|e| e.wildcard_mixes_pinyin())
+    }
+
     /// 通配转换（透传活跃引擎）。**不**叠英文混入：通配是查码，不是打英文。
     pub fn convert_wildcard(
         &self,

@@ -446,6 +446,14 @@ pub struct Candidate {
     /// 协调器内部用，不推送 UI。
     #[serde(skip)]
     pub is_direct_aux: bool,
+    /// 该候选来自码表**通配查询**（`CodeTableEngine::convert_wildcard`）。
+    ///
+    /// 只服务显示档位：通配下 `is_exact_code` 的语义是「与 pattern 等长」，`code` 必然 ≠ 输入
+    /// （输入里带着通配键），[`source_tier`] 的 `code == input` 认不出它。见
+    /// `docs/design/codetable-wildcard.md` §10「通配等长结果与码表精确同档」。
+    /// 引擎内部用，不推送 UI。
+    #[serde(skip)]
+    pub is_wildcard: bool,
     /// 前缀补全比**输入自身表达的音节数**多出几个音节（`0` = 音节数恰好对齐 / 非补全候选）。
     ///
     /// 「输入自身表达的音节数」= 完整音节数 + (有尾部残码 ? 1 : 0)，即 `pinyin` 引擎里的
@@ -585,6 +593,7 @@ impl Default for Candidate {
             is_draft: false,
             is_promoted_completion: false,
             is_direct_aux: false,
+            is_wildcard: false,
             completion_extra_syllables: 0,
             consumed_length: 0,
             boundary: 0,
@@ -1087,8 +1096,11 @@ pub fn source_tier(c: &Candidate, input: &str) -> u8 {
     }
     match c.source {
         CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
-        CodeTable => 2,                    // 码表前缀补全
-        Pinyin => 4,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
+        // 通配等长结果与码表精确同档（spec §10：非首位按通配键是明确意图）。只认
+        // `is_wildcard`：非通配路径上 `is_exact_code` 与 `code == input` 同义，不另开口子。
+        CodeTable if c.is_wildcard && c.is_exact_code => 0,
+        CodeTable => 2, // 码表前缀补全
+        Pinyin => 4,    // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
         English => 4,
         // 其余来源（主要是 `CandidateSource::None`，即引擎未标注来源的候选）。
         // 与前缀短语同档是**沿袭**而非设计——二者都属「说不清置信度」，放在码表补全之后、
@@ -1466,5 +1478,77 @@ mod match_layer_tests {
         };
         assert_eq!(cmp_match_layers(&zero_weight, &abbrev), Ordering::Equal);
         assert_eq!(cmp_match_layers(&exact, &zero_weight), Ordering::Less);
+    }
+}
+
+#[cfg(test)]
+mod wildcard_tier_tests {
+    use super::*;
+
+    fn ct(code: &str, exact: bool, wildcard: bool) -> Candidate {
+        Candidate {
+            text: "蒸".into(),
+            code: code.into(),
+            is_exact_code: exact,
+            is_wildcard: wildcard,
+            is_common: true,
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        }
+    }
+
+    /// spec §10：通配等长结果与码表精确同档。`freq_tier` 以本函数为首要键，
+    /// 档 2 的话开调频时拼音精确档（1）会整体压过它。
+    /// 对照：非通配候选只认 `code == input`，`is_exact_code` 不单独提档。
+    #[test]
+    fn wildcard_equal_length_shares_tier_with_codetable_exact() {
+        assert_eq!(
+            source_tier(&ct("abi", true, true), "azi"),
+            0,
+            "通配等长 = 档 0"
+        );
+        assert_eq!(
+            source_tier(&ct("abic", false, true), "azi"),
+            2,
+            "通配更长 = 码表前缀档"
+        );
+        assert_eq!(
+            source_tier(&ct("azi", true, false), "azi"),
+            0,
+            "对照：字面精确"
+        );
+        assert_eq!(
+            source_tier(&ct("abi", true, false), "azi"),
+            2,
+            "对照：非通配候选不因 is_exact_code 提档"
+        );
+    }
+
+    /// 锁（实现前即绿）：混输显示序「通配等长 → 拼音精确 → 通配更长」。
+    /// 等长靠 `cmp_exact_first` 领先，更长补全靠 `source_tier` 落在拼音精确之后。
+    #[test]
+    fn mixed_display_order_wildcard_equal_then_pinyin_exact_then_longer() {
+        let equal = Candidate {
+            weight: 1,
+            ..ct("abi", true, true)
+        };
+        let longer = Candidate {
+            text: "蒸笼".into(),
+            weight: 9000,
+            ..ct("abic", false, true)
+        };
+        let py = Candidate {
+            text: "阿紫".into(),
+            code: "azi".into(),
+            weight: 169,
+            is_common: true,
+            consumed_length: 3,
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        };
+        let mut v = vec![longer, py, equal];
+        v.sort_by(|a, b| candidate_display_order(a, b, false, true, "azi"));
+        let order: Vec<&str> = v.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(order, ["蒸", "阿紫", "蒸笼"]);
     }
 }

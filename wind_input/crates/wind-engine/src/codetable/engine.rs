@@ -924,6 +924,7 @@ impl Engine for CodeTableEngine {
                 c.source = CandidateSource::CodeTable;
                 c.is_exact_code = c.code.chars().count() == n;
                 c.comment = c.code.clone();
+                c.is_wildcard = true;
                 c
             })
             .collect();
@@ -2514,6 +2515,23 @@ mod tests {
         assert!(
             on.convert("az", 50).unwrap().candidates.is_empty(),
             "开了通配，convert(\"az\") 仍按字面查——`z` 不是通配"
+        );
+    }
+    /// `is_wildcard` 只由通配入口置位；字面 `convert` 的结果恒不带（`source_tier` 靠它区分）。
+    #[test]
+    fn wildcard_results_carry_is_wildcard_and_literal_does_not() {
+        let e = engine_opts(
+            &[("ab", "甲", 10), ("abcd", "丙", 5)],
+            wildcard_opts(CommitOptions::default()),
+        );
+        let r = e.convert_wildcard("az", &slot_pattern("a?"), 50).unwrap();
+        assert!(!r.candidates.is_empty(), "前置：通配有命中");
+        assert!(r.candidates.iter().all(|c| c.is_wildcard));
+        let lit = e.convert("ab", 50).unwrap();
+        assert!(!lit.candidates.is_empty(), "前置：字面有命中");
+        assert!(
+            lit.candidates.iter().all(|c| !c.is_wildcard),
+            "字面结果不带通配标记"
         );
     }
 }
