@@ -1010,7 +1010,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   各方案码表不同（拼音笔画表 vs 双拼小鹤全码表），**切方案必须失效重挂**
   （`invalidate_aux_code_table`，随 `sync_chaizi_assets`/`sync_comment_dicts` 一起）。表格式：
   UTF-8 `字=码` 一行一条（`=` 分隔，与 rime-lua-aux-code `aux_code` 目录一致；`=` 右侧也可按空白写多个码，
-  如手心表 `七=a p`；非 UTF-8 整张忽略并告警「请转存为 UTF-8」），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），
+  如手心表 `七=a p`，行内 `#` 注释先剥掉；非 UTF-8 整张忽略并告警「请转存为 UTF-8」），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），
   version/source 当普通注释不解析。码表文件是 `wind-tools/gen_aux_code` 的构建产物、
   **不入版本库**（rime-stroke 为 LGPL-3.0，见 NOTICE.md）。笔画方案词库
   `schemas/stroke/stroke.dict.yaml` 与 `aux_code/stroke.txt` 由它同一次解析产出（字与码序逐一
@@ -1047,8 +1047,10 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   （`Engine::shuangpin_full_syllable_count`，纯内存；全拼 / 码表 / 混输恒 `None`）、方案来源系统层
   就绪（否则本键原样 + `spawn_index_warm`，与引导键进入同一处理）。
 - **前缀候选**：连打时前缀恰是几键前的整个输入，直接取那一键**并入之前、shadow 之前**的主候选快照
-  （`State.direct_aux_prev`，只在整音节输入时更新）；快照缺失（退格改前缀、光标中间编辑）才对前缀
-  单独 `convert_with_opts`（`require_full_match` + 按辅码首字母 `admit`），走同一条加工链。
+  （`State.direct_aux_prev`，只在整音节输入时更新、只存有资格的拼音候选）；那一键被截断过（单音节前缀
+  几乎总是）、检索范围 / 单字 / 放宽状态与当时不同、退格改前缀、分段上屏时不可用，改对前缀单独
+  `convert_with_opts`（`require_full_match` + 按辅码首字母 `admit`，截断前准入），走同一条加工链，
+  结果留给紧随其后的偶数键。方案设置走 `aux_code_settings_cached`，不逐键读盘。
   取完整覆盖前缀的拼音词与单字（`is_direct_source`：非合成整句、非补全 / 子短语 / 简拼 / 草稿）。
 - **并入**（`merge_direct_hits`）：奇数且前缀 < 3 音节 → 命中项排最前；奇数前缀 ≥ 3 音节 → 保留首选；
   偶数 → 开头最多 2 个覆盖全部输入的完整候选在前。命中项 `consumed_length` = 整串、`code` 仍是
