@@ -592,22 +592,30 @@ fn multiple_wildcards_match_exactly_one_code_char_each() {
     }
 }
 
-/// 首位无任何绑定时首位即可通配（退化全表扫描，靠上限兜底）。
+/// 首位无任何绑定时首位即可通配（退化全表扫描）：首批至多 100 条，翻到边界照常扩充
+/// （spec §11；旧实现写死 100 条，扩容后可见条数不变即判到底）。
 #[test]
 fn leading_wildcard_when_unbound_scans_whole_table() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
-    let coord = Coordinator::new_headless(wubi(true, "z"), Some(&data_dir()));
+    let coord = Coordinator::new_headless(no_relax(wubi(true, "z")), Some(&data_dir()));
     press(&coord, "z");
     let tri = coord.debug_candidate_triples();
     assert!(
         !tri.is_empty() && tri.len() <= 100,
-        "首位通配应出候选且不超上限：{}",
+        "首批至多 100 条：{}",
         tri.len()
     );
     assert!(tri.iter().all(|(_, c, m)| c == m));
+    assert!(coord.debug_has_more(), "全表远超 100 条");
+    let grown = page_until_more_than(&coord, tri.len());
+    assert!(
+        grown > tri.len(),
+        "翻到边界应扩充：{} -> {grown}",
+        tri.len()
+    );
 }
 
 /// ★ Review Focus 1：首位 z 让位给 `zz*` 短语后，整轮都是字面——`zzbd` 仍出「、」。
@@ -1025,4 +1033,153 @@ fn mixed_wildcard_keeps_original_first_batch() {
     press(&coord, "azz");
     let first = coord.debug_candidate_count();
     assert!(first > 100, "混输通配首批应沿用 300 档，实际 {first}");
+}
+
+/// 通配命中（等长或更长，码里没有 `z`——五笔词库无 z 码，带 z 的只可能是拼音 / 字面串）。
+fn wc_hits(pattern: &str, tri: &[(String, String, String)]) -> Vec<(String, String)> {
+    tri.iter()
+        .filter(|(_, c, _)| wubi_hit(pattern, c, true) || wubi_hit(pattern, c, false))
+        .map(|(t, c, _)| (t.clone(), c.clone()))
+        .collect()
+}
+
+/// 混输同 `pure_wildcard_smart_filters_like_general`：通配那一截与「常用字」档相同，首选仍是
+/// 等长通配。拼音候选按 `(拼音, 码)` 照旧分组，不在比较范围内。缺 Task 1 时红。
+#[test]
+fn mixed_wildcard_smart_filters_like_general() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    for keys in ["hanz", "azz"] {
+        let all = wc_hits(
+            keys,
+            &triples_with(with_filter(wubi_pinyin(true), "gb18030"), keys),
+        );
+        let general = wc_hits(
+            keys,
+            &triples_with(with_filter(wubi_pinyin(true), "general"), keys),
+        );
+        let smart = triples_with(with_filter(wubi_pinyin(true), "smart"), keys);
+        assert!(
+            all.len() > general.len(),
+            "前置：{keys} 首批通配结果应有生僻字（全部 {} / 常用 {}）",
+            all.len(),
+            general.len()
+        );
+        assert_eq!(
+            wc_hits(keys, &smart),
+            general,
+            "{keys}: 通配那一截与常用字档相同"
+        );
+        assert!(
+            wubi_hit(keys, &smart[0].1, true),
+            "{keys}: 首选是等长通配，实际 {:?}",
+            smart[0]
+        );
+    }
+}
+
+/// ★ Review Focus 5：混输首批回满、翻页扩充后，等长通配仍全部排在最前，字面候选仍在。
+/// 控制者裁决：混输首批维持 300（非计划原文的 100），故上限断言按 300。
+/// 键用 `yiz` 而非计划的 `azz`：真实数据里 `azz` 无任何拼音候选（`zz` 不成音节）；`yiz` 首批
+/// 299 条、拼音 189 条、`has_more` 为真，拼音保底配额（300/5 = 60 席）确实在起作用。
+/// 缺 Task 2 时红在 `has_more` 或扩充不生效；配额 / 合并序被破坏时红在后几条。
+#[test]
+fn mixed_expansion_keeps_equal_length_wildcard_first() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let keys = "yiz";
+    let coord = Coordinator::new_headless(no_relax(wubi_pinyin(true)), Some(&data_dir()));
+    press(&coord, keys);
+    let first = coord.debug_candidate_count();
+    assert!(first <= 300, "混输首批至多 300 条：{first}");
+    assert!(coord.debug_has_more(), "前置：混输首批回满，还有更多");
+    let is_literal = |c: &str| !wubi_hit(keys, c, true) && !wubi_hit(keys, c, false);
+    let literal_first = coord
+        .debug_candidate_triples()
+        .iter()
+        .filter(|(_, c, _)| is_literal(c))
+        .count();
+    assert!(
+        literal_first >= 300 / 5,
+        "前置：拼音保底 60 席：{literal_first}"
+    );
+    let grown = page_until_more_than(&coord, first);
+    assert!(grown > first, "翻到边界应扩充：{first} -> {grown}");
+    let tri = coord.debug_candidate_triples();
+    let first_other = tri
+        .iter()
+        .position(|(_, c, _)| !wubi_hit(keys, c, true))
+        .unwrap_or(tri.len());
+    assert!(first_other > 0, "扩充后首位是等长通配");
+    assert!(
+        tri[first_other..]
+            .iter()
+            .all(|(_, c, _)| !wubi_hit(keys, c, true)),
+        "扩充后等长通配仍全部在最前"
+    );
+    let literal_grown = tri.iter().filter(|(_, c, _)| is_literal(c)).count();
+    assert!(
+        literal_grown >= literal_first,
+        "字面（拼音）候选扩充后不减：{literal_first} -> {literal_grown}"
+    );
+}
+
+/// 「常用字」档：首批被滤掉一部分，翻页照样扩充补足可见结果。缺 Task 2 时红在 `has_more`。
+#[test]
+fn general_mode_wildcard_pages_fill_up() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        no_relax(with_filter(wubi(true, "z"), "general")),
+        Some(&data_dir()),
+    );
+    press(&coord, "azz");
+    let first = coord.debug_candidate_count();
+    assert!(first < 100, "前置：首批 100 条里有被滤的生僻字：{first}");
+    assert!(coord.debug_has_more());
+    let grown = page_until_more_than(&coord, first);
+    assert!(grown > first, "翻页应补足可见结果：{first} -> {grown}");
+}
+
+/// 智能档被滤的通配生僻字经「翻到末页再按一次」追加在末尾，原有候选顺序不动。
+/// `hanz` 纯码表只有 9 条（`han?`，4 码满码无更长补全），一页即末页。缺 Task 1 时红
+/// （无被滤候选可追加）。
+#[test]
+fn page_end_relax_appends_filtered_wildcard_results() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let pair = |t: &(String, String, String)| (t.0.clone(), t.1.clone());
+    let all: Vec<(String, String)> = triples_with(with_filter(wubi(true, "z"), "gb18030"), "hanz")
+        .iter()
+        .map(pair)
+        .collect();
+    let coord = Coordinator::new_headless(with_filter(wubi(true, "z"), "smart"), Some(&data_dir()));
+    press(&coord, "hanz");
+    let before: Vec<(String, String)> = coord.debug_candidate_triples().iter().map(pair).collect();
+    assert!(all.len() > before.len(), "前置：hanz 有被滤的生僻字");
+    assert!(!coord.debug_has_more(), "前置：9 条一批取完");
+    for _ in 0..20 {
+        let (cur, _, total) = coord.debug_page_info();
+        if cur + 1 >= total {
+            break;
+        }
+        press_vk(&coord, VK_NEXT, false);
+    }
+    press_vk(&coord, VK_NEXT, false); // 末页再按一次 = 放宽
+    let after: Vec<(String, String)> = coord.debug_candidate_triples().iter().map(pair).collect();
+    assert_eq!(&after[..before.len()], &before[..], "原有候选顺序不动");
+    let mut appended = after[before.len()..].to_vec();
+    appended.sort();
+    let mut expected: Vec<(String, String)> =
+        all.into_iter().filter(|p| !before.contains(p)).collect();
+    expected.sort();
+    assert_eq!(appended, expected, "被滤的通配生僻字全部追加在末尾");
 }
