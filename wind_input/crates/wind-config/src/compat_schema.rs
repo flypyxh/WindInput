@@ -4,7 +4,7 @@
 //! 已知宿主、联动条件、是否协议字段。设置端按它通用渲染，不逐字段手写界面。
 //!
 //! ⛔ 新增兼容字段时**必须同时在这里补一条**：`tests` 里的守护测试扫描 `app_compat.rs`
-//! 的结构体源码，漏登记即红；`protocol` 标记还要与 `ProtocolFields` 一致。
+//! 的结构体源码，漏登记即红。
 //! 文案写给不懂 TSF 的用户看：说现象与后果，不说内部机制名。
 //!
 //! 设计见 `docs/design/compat-settings-ui.md`。
@@ -21,9 +21,6 @@ pub enum Kind {
     Bool,
     /// 三态：跟随全局 / 开 / 关。
     TriBool,
-    /// 宿主协议级三态：**出厂 / 开 / 关**。不写 = 继承系统层（出厂）的值，不是「跟随全局」，
-    /// 界面文案必须区分；「出厂」这一档不要送 `null` 过来，而是送系统值或走「还原」。
-    InheritBool,
     /// 枚举（未配 = 跟随全局 / 不干预）。
     Enum,
     /// 整数。
@@ -60,7 +57,8 @@ pub struct FieldMeta {
     /// 枚举可选值（`Kind::Enum` 必填）。
     pub options: &'static [&'static str],
     pub depends_on: Option<Dep>,
-    /// 宿主协议级字段：用户层未写时继承系统层，显式 `false` 才关闭（见 `ProtocolFields`）。
+    /// 宿主缺陷修正（描述已确认的宿主行为，不是用户偏好）。界面可据此提示「一般不需要改」。
+    /// 与合并语义无关：所有字段一视同仁地逐字段继承，没有哪个字段享有特殊待遇。
     pub protocol: bool,
     /// 折叠进「高级」。
     pub advanced: bool,
@@ -372,7 +370,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "composition_start_pair_guard",
-        kind: Kind::InheritBool,
+        kind: Kind::TriBool,
         group: "host",
         label: "识别成对的组合帧",
         summary: "把连续两帧「组合起点」与「当前光标」识别为同一次布局采样。",
@@ -387,7 +385,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "pin_anchor_when_start_drifts",
-        kind: Kind::InheritBool,
+        kind: Kind::TriBool,
         group: "host",
         label: "起点漂移时钉住锚点",
         summary: "宿主报的组合起点跟着光标一起漂移时，把候选窗锚点钉在首帧位置。",
@@ -422,7 +420,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "ignore_host_ime_close",
-        kind: Kind::InheritBool,
+        kind: Kind::TriBool,
         group: "host",
         label: "忽略软件关闭输入法的请求",
         summary: "软件自己要求关闭输入法时忽略它（按住 Ctrl 的系统热键仍然放行）。",
@@ -437,7 +435,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "host_drawn_candidates",
-        kind: Kind::InheritBool,
+        kind: Kind::TriBool,
         group: "host",
         label: "软件自绘候选窗",
         summary: "软件把候选串读走时，视为它在自己画候选窗，并收起本输入法的候选窗。",
@@ -531,7 +529,7 @@ mod tests {
     fn check(section: &str, struct_name: &str) {
         let src = include_str!("app_compat.rs");
         let mut fields = struct_fields(src, struct_name);
-        fields.retain(|f| !crate::compat_admin::META_KEYS.contains(&f.as_str()));
+        fields.retain(|f| !crate::compat_overlay::META_KEYS.contains(&f.as_str()));
         assert!(!fields.is_empty(), "{struct_name} 字段表截获失灵");
         let registered = known_keys(section);
         for f in &fields {
@@ -561,46 +559,6 @@ mod tests {
     #[test]
     fn every_newline_field_has_metadata() {
         check("commit_newline", "CommitNewlineRule");
-    }
-
-    #[test]
-    fn protocol_flags_match_protocol_fields() {
-        let src = include_str!("app_compat.rs");
-        let start = src
-            .find("struct ProtocolFields {")
-            .expect("找不到 ProtocolFields");
-        let body = &src[start..];
-        let end = body.find("\n}").expect("找不到 ProtocolFields 结尾");
-        let mut proto: Vec<&str> = body[..end]
-            .lines()
-            .filter_map(|l| l.trim().split_once(": Option<bool>,").map(|(n, _)| n))
-            .collect();
-        proto.sort_unstable();
-        let mut flagged: Vec<&str> = COMPAT_FIELDS
-            .iter()
-            .filter(|f| f.protocol)
-            .map(|f| f.key)
-            .collect();
-        flagged.sort_unstable();
-        assert_eq!(
-            proto, flagged,
-            "元数据的 protocol 标记必须与 ProtocolFields 一致"
-        );
-    }
-
-    /// 协议字段的三态语义是「出厂 / 开 / 关」，与「跟随全局 / 开 / 关」不同，必须用不同的
-    /// 控件类型表达，否则界面会把「继承出厂」显示成「跟随全局」。
-    #[test]
-    fn protocol_fields_use_the_inherit_kind_and_only_they_do() {
-        for f in COMPAT_FIELDS {
-            assert_eq!(
-                f.protocol,
-                f.kind == Kind::InheritBool,
-                "{}.{}：protocol 与 Kind::InheritBool 必须一一对应",
-                f.section,
-                f.key
-            );
-        }
     }
 
     #[test]

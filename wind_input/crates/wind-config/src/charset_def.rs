@@ -820,7 +820,7 @@ pub fn is_valid_key(key: &str) -> bool {
 /// 这份调整是不是**空壳**（除 `key` 外什么都没说）。
 ///
 /// ★ 空壳必须从库里删掉而不是留一条只有 key 的记录：留着的话，「恢复默认」之后列表里
-/// 仍标着「已调整」，下次读还会走一遍合并——`compat.toml` 的 `update_user_rule` 是同一条。
+/// 仍标着「已调整」，下次读还会走一遍合并——`compat.toml` 的 `update_user_raw` 是同一条。
 pub fn is_empty_override(doc: &CharsetDoc) -> bool {
     let d = &doc.def;
     doc.added.is_empty()

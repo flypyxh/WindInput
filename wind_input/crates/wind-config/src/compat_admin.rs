@@ -1,18 +1,25 @@
-//! 兼容规则的分层管理：视图 + 写时复制补丁 + 禁用 + 还原（设置端 `compat.*` RPC 的纯逻辑层）。
+//! 兼容规则的分层管理：视图 + 字段级差异写入 + 禁用 + 还原（设置端 `compat.*` RPC 的纯逻辑层）。
 //!
-//! 只写**用户层**；系统层（`data/compat.toml`、`data_custom`）永不写。三段
-//! （`[[apps]]` / `[[initial_mode_scope]]` / `[[commit_newline]]`）共用一套泛型实现。
-//! 合并语义复用 `app_compat` 里的 `merge_*`，这里不复制。
+//! 只写**用户层**；系统层（`data/compat.toml`、`data_custom`）永不写。用户层记的是**相对系统层的
+//! 差异**（原则与语法见 [`crate::compat_overlay`]），所以：
+//! - 改一个字段只写这一个字段，系统规则的其余字段继续继承（出厂新增的修复自动送达）；
+//! - 改成与系统一致的值，这个键（乃至整条）自动消失；
+//! - 「还原」= 删掉用户层的痕迹，「清除」= 显式 `unset`（回到跟随全局），两者不同。
 //!
-//! 设计见 `docs/design/compat-settings-ui.md`。
+//! 三段（`[[apps]]` / `[[initial_mode_scope]]` / `[[commit_newline]]`）共用一套逻辑，只有字段校验
+//! 用到各自的结构体类型。设计见 `docs/design/compat-settings-ui.md`。
 
 use crate::app_compat::{
-    AppCompatFile, AppCompatRule, COMPAT_FILE_NAME, CommitNewlineRule, InitialModeScopeRule,
-    load_file, merge_commit_newline, merge_mode_scope, merge_rules, render_user_compat,
-    write_atomic,
+    AppCompatRule, COMPAT_FILE_NAME, CommitNewlineRule, InitialModeScopeRule, USER_COMPAT_HEADER,
+    load_raw, write_atomic,
 };
-use crate::compat_schema::{COMPAT_FIELDS, Kind};
+use crate::compat_overlay::{
+    FieldEdit, META_KEYS, Obj, Raw, apply_edits, compose, is_disabled, normalize, overlay,
+    overlay_raw, parse_raw, process_of, render_raw, same_process,
+};
+use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -44,17 +51,43 @@ impl Section {
     }
 }
 
+const ALL_SECTIONS: [Section; 3] = [
+    Section::Apps,
+    Section::InitialModeScope,
+    Section::CommitNewline,
+];
+
+/// 按段选出对应的结构体类型，在 `$body` 里以 `$T` 引用。
+macro_rules! with_section {
+    ($sec:expr, $T:ident => $body:expr) => {
+        match $sec {
+            Section::Apps => {
+                type $T = AppCompatRule;
+                $body
+            }
+            Section::InitialModeScope => {
+                type $T = InitialModeScopeRule;
+                $body
+            }
+            Section::CommitNewline => {
+                type $T = CommitNewlineRule;
+                $body
+            }
+        }
+    };
+}
+
 /// 一条规则在分层视图里的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleState {
-    /// 只来自系统层，未被动过（或用户层有一条与系统完全一致的冗余覆盖）。
+    /// 只来自系统层，未被动过（或用户层的差异全是冗余）。
     System,
-    /// 系统规则被用户改写。
+    /// 系统规则被用户改写（用户层有真正的差异）。
     Modified,
-    /// 用户新增。
+    /// 用户新增（系统层没有这个进程）。
     User,
-    /// 被用户禁用。
+    /// 被禁用（用户层或更下层写了 `disabled = true`）。
     Disabled,
 }
 
@@ -63,64 +96,17 @@ pub enum RuleState {
 pub struct RuleView {
     pub process: String,
     pub state: RuleState,
-    /// 合并后的生效内容（对象，只含非默认字段；不含 `disabled`）。
+    /// 叠加后的生效内容（运行时真正看到的；对象，只含非默认字段；不含 `disabled`）。
     pub effective: Value,
     /// 系统层的原貌；用户新增的规则为 `None`。
     pub system: Option<Value>,
-    /// 生效内容与系统层取值不同的字段名（用户新增的规则 = 它的全部字段）。
+    /// 用户层真正起作用的差异字段名（含 `unset` 里的）。用户新增的规则 = 它的全部字段。
     pub overridden: Vec<String>,
-    /// 用户层里是否有这一条。`state = system` 时也可能为 true（与系统完全相同的冗余拷贝），
-    /// 「还原」按钮据此判断有没有东西可还原。
+    /// 用户层里是否有这一条（`state = system` 时也可能为 true：全是冗余差异的旧文件）。
     pub has_user_entry: bool,
-    /// 用户层里这一条的原始内容（含 `disabled`）；没有则 `None`。
+    /// 用户层里这一条的原始内容（含 `disabled` / `unset`）；没有则 `None`。
     /// 禁用状态下用它才能看出「禁用前用户改过哪些字段」。
     pub user: Option<Value>,
-}
-
-/// 三段规则的共同面：泛型写操作只依赖这几个访问器和 serde。
-pub(crate) trait Rule: Clone + Default + Serialize + serde::de::DeserializeOwned {
-    fn process(&self) -> &str;
-    fn set_process(&mut self, p: &str);
-    fn disabled(&self) -> bool;
-    fn set_disabled(&mut self, v: bool);
-    /// 按运行时合并（`merge_rules`）同一套规则从低层继承。只有 `[[apps]]` 有宿主协议级字段，
-    /// 其余两段没有可继承的东西，默认什么也不做。
-    fn inherit_from(&mut self, _base: &Self) {}
-}
-
-macro_rules! impl_rule {
-    ($t:ty $(, inherit: |$s:ident, $b:ident| $body:expr)?) => {
-        impl Rule for $t {
-            fn process(&self) -> &str {
-                &self.process
-            }
-            fn set_process(&mut self, p: &str) {
-                self.process = p.to_string();
-            }
-            fn disabled(&self) -> bool {
-                self.disabled
-            }
-            fn set_disabled(&mut self, v: bool) {
-                self.disabled = v;
-            }
-            $(
-                fn inherit_from(&mut self, base: &Self) {
-                    let ($s, $b) = (self, base);
-                    $body
-                }
-            )?
-        }
-    };
-}
-impl_rule!(AppCompatRule, inherit: |s, b| s.inherit_protocol_from(b));
-impl_rule!(InitialModeScopeRule);
-impl_rule!(CommitNewlineRule);
-
-/// 不属于「兼容取值」的键：不进 `overridden`，也不允许被补丁 / 还原触碰。
-pub(crate) const META_KEYS: [&str; 3] = ["process", "comment", "disabled"];
-
-fn same(a: &str, b: &str) -> bool {
-    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 /// 进程名校验：trim 后非空、不含路径分隔符与控制字符。返回 trim 后的名字。
@@ -138,39 +124,17 @@ pub fn validate_process(raw: &str) -> Result<String, String> {
     Ok(p.to_string())
 }
 
-fn to_obj<T: Rule>(r: &T) -> Map<String, Value> {
-    match serde_json::to_value(r) {
-        Ok(Value::Object(m)) => m,
-        _ => Map::new(),
+/// 一行经结构体往返后的样子（运行时真正看到的；省略默认值；不含 `unset`）。
+fn typed_obj<T: DeserializeOwned + Serialize>(row: &Obj) -> Obj {
+    let mut r = row.clone();
+    r.remove("unset");
+    match serde_json::from_value::<T>(Value::Object(r.clone())) {
+        Ok(t) => match serde_json::to_value(&t) {
+            Ok(Value::Object(o)) => o,
+            _ => r,
+        },
+        Err(_) => r,
     }
-}
-
-/// 序列化后除 `process` 外一个键都没有 ⇒ 空壳。
-///
-/// 判据走序列化而不是逐字段比较：可选字段全带 `skip_serializing_if`，新增字段自动纳入。
-fn is_empty<T: Rule>(r: &T) -> bool {
-    to_obj(r).keys().all(|k| k == "process")
-}
-
-/// 两条规则的「生效内容」是否相同（忽略 `comment`：它只是文档）。
-fn same_content<T: Rule>(a: &T, b: &T) -> bool {
-    let strip = |r: &T| {
-        let mut m = to_obj(r);
-        m.remove("comment");
-        m.remove("process");
-        // 窗口类名运行时不区分大小写、也与顺序无关：只改这两样不算「已修改」。
-        if let Some(Value::Array(items)) = m.get_mut("classes") {
-            let mut v: Vec<String> = items
-                .iter()
-                .filter_map(|x| x.as_str().map(str::to_ascii_lowercase))
-                .collect();
-            v.sort();
-            v.dedup();
-            *items = v.into_iter().map(Value::String).collect();
-        }
-        m
-    };
-    strip(a) == strip(b)
 }
 
 /// 补丁里一个键的静态校验：不许碰元键、必须是登记过的字段、JSON 类型要与控件类型相符。
@@ -189,7 +153,7 @@ fn check_patch_key(section: &str, key: &str, v: &Value) -> Result<(), String> {
         return Ok(());
     }
     let ok = match meta.kind {
-        Kind::Bool | Kind::TriBool | Kind::InheritBool => v.is_boolean(),
+        Kind::Bool | Kind::TriBool => v.is_boolean(),
         Kind::Int => v.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
         // 枚举不许空串：空串会被当成「没写」吞掉，想清除请传 null。
         Kind::Enum => v.as_str().is_some_and(|t| !t.trim().is_empty()),
@@ -203,191 +167,120 @@ fn check_patch_key(section: &str, key: &str, v: &Value) -> Result<(), String> {
     }
 }
 
-/// 把补丁应用到 `base`。`null` 表示清除该字段。
+/// 值域校验：单独把这个键放进一个最小行里反序列化，看容错反序列化有没有把它回落掉。
 ///
-/// 逐键试算：容错反序列化对值域外的取值（`first_show_mode = "bogus"`）不报错、只记一条
-/// 「回落」，所以每个键都要单独反序列化一次并检查回落记录，才能把它明确拒绝掉。
-/// 别名（`en` / `zh`）与带空白的文本运行时本就接受，不算无效。
-fn apply_patch_to<T: Rule>(
+/// 容错反序列化对值域外的取值（`first_show_mode = "bogus"`）不报错、只记一条「回落」，
+/// 所以必须检查回落记录才能识破。别名（`en` / `zh`）与带空白的文本运行时本就接受，不算无效。
+fn probe_value<T: DeserializeOwned>(key: &str, v: &Value) -> Result<(), String> {
+    let mut o = Obj::new();
+    o.insert("process".into(), Value::String("probe.exe".into()));
+    o.insert(key.to_string(), v.clone());
+    crate::tolerant_de::clear_fallbacks();
+    let parsed = serde_json::from_value::<T>(Value::Object(o));
+    let fallbacks = crate::tolerant_de::take_fallbacks();
+    parsed.map_err(|e| format!("字段 {key} 的值 {v} 无效: {e}"))?;
+    if fallbacks.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("字段 {key} 的值 {v} 无效"))
+    }
+}
+
+/// 补丁 → 字段编辑。`null` = 清除（回到跟随全局）；非 null 先过静态校验与值域校验。
+fn patch_to_edits<T: DeserializeOwned>(
     section: &str,
-    base: &T,
     patch: &Map<String, Value>,
-) -> Result<T, String> {
-    let mut obj = to_obj(base);
+) -> Result<Vec<FieldEdit>, String> {
+    let mut edits = Vec::new();
     for (k, v) in patch {
         check_patch_key(section, k, v)?;
         if v.is_null() {
-            obj.remove(k);
-            continue;
+            edits.push(FieldEdit::Clear(k.clone()));
+        } else {
+            probe_value::<T>(k, v)?;
+            edits.push(FieldEdit::Set(k.clone(), v.clone()));
         }
-        let mut probe = obj.clone();
-        probe.insert(k.clone(), v.clone());
-        crate::tolerant_de::clear_fallbacks();
-        let parsed = serde_json::from_value::<T>(Value::Object(probe));
-        let fallbacks = crate::tolerant_de::take_fallbacks();
-        if let Err(e) = parsed {
-            return Err(format!("字段 {k} 的值 {v} 无效: {e}"));
-        }
-        if !fallbacks.is_empty() {
-            return Err(format!("字段 {k} 的值 {v} 无效"));
-        }
-        obj.insert(k.clone(), v.clone());
     }
-    serde_json::from_value(Value::Object(obj)).map_err(|e| e.to_string())
+    Ok(edits)
 }
 
-/// 该进程写操作的起点：用户条目 > 系统条目的完整拷贝（写时复制）> `None`。
-///
-/// 写时复制是必须的：合并语义是「同名整条覆盖」，只写被改的那一个字段会让系统规则的
-/// 其余字段（协议字段除外）掉回默认。
-fn base_for<T: Rule>(system: &[T], user: &[T], process: &str) -> Option<T> {
-    user.iter()
-        .find(|r| same(r.process(), process))
-        .or_else(|| system.iter().find(|r| same(r.process(), process)))
-        .cloned()
-}
-
-/// 落回用户层：与系统一致（且未禁用）或空壳 ⇒ 删除条目；否则替换 / 追加。
-fn commit_entry<T: Rule>(system: &[T], user: &mut Vec<T>, entry: T) {
-    let key = entry.process().to_string();
-    user.retain(|r| !same(r.process(), &key));
-    let redundant = match system.iter().find(|r| same(r.process(), &key)) {
-        Some(s) => {
-            // 运行时看到的是**继承之后**的结果：协议字段置空 = 继承出厂值。只比继承之前的
-            // 条目，会把「协议字段置 null」误判成有差异而留下一条隐形空壳，而空壳会把以后
-            // 出厂新增的修复整条挡掉。
-            let mut effective = entry.clone();
-            effective.inherit_from(s);
-            !entry.disabled() && same_content(&effective, s)
-        }
-        None => is_empty(&entry),
-    };
-    if !redundant {
-        user.push(entry);
-    }
-}
-
-fn upsert_in<T: Rule>(
-    section: &str,
-    system: &[T],
-    user: &mut Vec<T>,
-    process: &str,
-    patch: &Map<String, Value>,
-) -> Result<(), String> {
-    let process = validate_process(process)?;
-    let base = base_for(system, user, &process).unwrap_or_else(|| {
-        let mut t = T::default();
-        t.set_process(&process);
-        t
-    });
-    let entry = apply_patch_to(section, &base, patch)?;
-    commit_entry(system, user, entry);
-    Ok(())
-}
-
-fn reset_field_in<T: Rule>(
-    section: &str,
-    system: &[T],
-    user: &mut Vec<T>,
-    process: &str,
-    key: &str,
-) -> Result<(), String> {
-    if META_KEYS.contains(&key) {
-        return Err(format!("字段 {key} 不可还原"));
-    }
-    let process = validate_process(process)?;
-    if base_for(system, user, &process).is_none() {
-        return Err("无此规则".into());
-    }
-    let sys_val = system
-        .iter()
-        .find(|r| same(r.process(), &process))
-        .and_then(|s| to_obj(s).get(key).cloned())
-        .unwrap_or(Value::Null);
-    let mut patch = Map::new();
-    patch.insert(key.to_string(), sys_val);
-    upsert_in(section, system, user, &process, &patch)
-}
-
-fn set_disabled_in<T: Rule>(
-    system: &[T],
-    user: &mut Vec<T>,
-    process: &str,
-    flag: bool,
-) -> Result<(), String> {
-    let process = validate_process(process)?;
-    let mut entry = base_for(system, user, &process).ok_or_else(|| "无此规则".to_string())?;
-    entry.set_disabled(flag);
-    commit_entry(system, user, entry);
-    Ok(())
-}
-
-fn reset_in<T: Rule>(user: &mut Vec<T>, process: &str) -> bool {
-    let before = user.len();
-    user.retain(|r| !same(r.process(), process.trim()));
-    user.len() != before
-}
-
-fn view_in<T: Rule>(
-    system: &[T],
-    user: &[T],
-    merge: fn(Vec<T>, Vec<T>) -> Vec<T>,
+fn view_in<T: DeserializeOwned + Serialize>(
+    sec_name: &str,
+    sys: &[Obj],
+    user: &[Obj],
 ) -> Vec<RuleView> {
-    merge(system.to_vec(), user.to_vec())
+    overlay(sys.to_vec(), user)
         .into_iter()
-        .filter(|r| !r.process().is_empty())
         .map(|eff| {
-            let sys = system.iter().find(|r| same(r.process(), eff.process()));
-            let usr = user.iter().find(|r| same(r.process(), eff.process()));
-            let state = if usr.is_some_and(|u| u.disabled()) {
+            let name = process_of(&eff).to_string();
+            let s = sys.iter().find(|r| same_process(process_of(r), &name));
+            let u = user.iter().find(|r| same_process(process_of(r), &name));
+            // 规范化后还有内容，才算「用户层有真正的差异」。
+            let mut normalized = u.cloned();
+            let has_diff = normalized
+                .as_mut()
+                .is_some_and(|row| normalize::<T>(sec_name, s, row, true));
+            let state = if is_disabled(&eff) {
                 RuleState::Disabled
-            } else if let Some(s) = sys {
-                if usr.is_some() && !same_content(&eff, s) {
-                    RuleState::Modified
-                } else {
-                    RuleState::System
-                }
-            } else {
+            } else if s.is_none() {
                 RuleState::User
+            } else if has_diff {
+                RuleState::Modified
+            } else {
+                RuleState::System
             };
-            let mut e = to_obj(&eff);
-            e.remove("disabled");
-            let mut s = sys.map(to_obj).unwrap_or_default();
-            s.remove("disabled");
-            let mut keys = BTreeSet::new();
-            for k in e.keys().chain(s.keys()) {
-                if !META_KEYS.contains(&k.as_str()) && e.get(k) != s.get(k) {
-                    keys.insert(k.clone());
+            let mut effective = typed_obj::<T>(&eff);
+            effective.remove("disabled");
+            let system = s.map(|r| {
+                let mut o = typed_obj::<T>(r);
+                o.remove("disabled");
+                Value::Object(o)
+            });
+            let mut overridden = BTreeSet::new();
+            if has_diff && let Some(row) = &normalized {
+                for k in row.keys().filter(|k| !META_KEYS.contains(&k.as_str())) {
+                    overridden.insert(k.clone());
+                }
+                if let Some(items) = row.get("unset").and_then(Value::as_array) {
+                    overridden.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
                 }
             }
             RuleView {
-                process: eff.process().to_string(),
+                process: name,
                 state,
-                effective: Value::Object(e),
-                system: sys.map(|_| Value::Object(s)),
-                overridden: keys.into_iter().collect(),
-                has_user_entry: usr.is_some(),
-                user: usr.map(|u| Value::Object(to_obj(u))),
+                effective: Value::Object(effective),
+                system,
+                overridden: overridden.into_iter().collect(),
+                has_user_entry: u.is_some(),
+                user: u.map(|r| Value::Object(r.clone())),
             }
         })
         .collect()
 }
 
-/// 系统层（`data` + `data_custom` 合并）与用户层的两层快照。
+/// 系统层（`data` + `data_custom` 叠加）与用户层的两层快照。
 #[derive(Clone)]
 pub struct Layers {
-    system: AppCompatFile,
-    user: AppCompatFile,
+    system: Raw,
+    user: Raw,
+}
+
+fn rows(raw: &Raw, sec: Section) -> &Vec<Obj> {
+    match sec {
+        Section::Apps => &raw.apps,
+        Section::InitialModeScope => &raw.initial_mode_scope,
+        Section::CommitNewline => &raw.commit_newline,
+    }
 }
 
 /// 严格读用户层：不存在 ⇒ 空；读到但语法错 ⇒ `Err`（带路径与行列号）。
 ///
-/// 运行时加载（`AppCompat::load`）对语法错是静默跳过整份的；管理界面的写操作不能这样——
+/// 运行时加载（`AppCompat::load`）对语法错是整份跳过的；管理界面的写操作不能这样——
 /// 静默按空集重写会抹掉用户已有的全部覆盖。
-fn read_user(path: &Path) -> Result<AppCompatFile, String> {
+fn read_user(path: &Path) -> Result<Raw, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppCompatFile::default()),
+        Ok(text) => parse_raw(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Raw::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
@@ -398,163 +291,116 @@ impl Layers {
         custom_dir: Option<&Path>,
         user_dir: Option<&Path>,
     ) -> Result<Self, String> {
-        let mut system = AppCompatFile::default();
-        if let Some(d) = data_dir
-            && let Some(f) = load_file(&d.join(COMPAT_FILE_NAME))
-        {
-            system = f;
+        let mut system = Raw::default();
+        for dir in [data_dir, custom_dir].into_iter().flatten() {
+            if let Some(layer) = load_raw(&dir.join(COMPAT_FILE_NAME)) {
+                system = overlay_raw(system, &layer);
+            }
         }
-        if let Some(c) = custom_dir
-            && let Some(f) = load_file(&c.join(COMPAT_FILE_NAME))
-        {
-            system.apps = merge_rules(system.apps, f.apps);
-            system.initial_mode_scope =
-                merge_mode_scope(system.initial_mode_scope, f.initial_mode_scope);
-            system.commit_newline = merge_commit_newline(system.commit_newline, f.commit_newline);
-        }
-        // 系统层（含 data_custom）里被 `disabled` 的规则运行时就是不存在的：`load_layered` 对
-        // 合并结果统一过滤。视图必须与它一致，否则列表里显示「生效」、实际根本没有。
-        system.apps.retain(|r| !r.disabled);
-        system.initial_mode_scope.retain(|r| !r.disabled);
-        system.commit_newline.retain(|r| !r.disabled);
         let user = match user_dir {
             Some(u) => read_user(&u.join(COMPAT_FILE_NAME))?,
-            None => AppCompatFile::default(),
+            None => Raw::default(),
         };
         Ok(Self { system, user })
     }
 
     pub fn view(&self, sec: Section) -> Vec<RuleView> {
-        match sec {
-            Section::Apps => view_in(&self.system.apps, &self.user.apps, merge_rules),
-            Section::InitialModeScope => view_in(
-                &self.system.initial_mode_scope,
-                &self.user.initial_mode_scope,
-                merge_mode_scope,
-            ),
-            Section::CommitNewline => view_in(
-                &self.system.commit_newline,
-                &self.user.commit_newline,
-                merge_commit_newline,
-            ),
-        }
+        with_section!(sec, T => view_in::<T>(sec.as_str(), rows(&self.system, sec), rows(&self.user, sec)))
     }
 
     /// 单条规则的视图（进程名不区分大小写）。
     pub fn view_of(&self, sec: Section, process: &str) -> Option<RuleView> {
         self.view(sec)
             .into_iter()
-            .find(|v| same(&v.process, process.trim()))
+            .find(|v| same_process(&v.process, process))
     }
 
+    fn exists(&self, sec: Section, process: &str) -> bool {
+        rows(&self.system, sec)
+            .iter()
+            .chain(rows(&self.user, sec))
+            .any(|r| same_process(process_of(r), process))
+    }
+
+    fn apply(&mut self, sec: Section, process: &str, edits: &[FieldEdit]) {
+        let (sys, user) = match sec {
+            Section::Apps => (&self.system.apps, &mut self.user.apps),
+            Section::InitialModeScope => (
+                &self.system.initial_mode_scope,
+                &mut self.user.initial_mode_scope,
+            ),
+            Section::CommitNewline => (&self.system.commit_newline, &mut self.user.commit_newline),
+        };
+        with_section!(sec, T => apply_edits::<T>(sec.as_str(), sys, user, process, edits, true));
+    }
+
+    /// 按字段补丁写入：只写补丁里的字段（`null` = 清除），其余字段照旧继承系统层。
     pub fn upsert(
         &mut self,
         sec: Section,
         process: &str,
         patch: &Map<String, Value>,
     ) -> Result<(), String> {
-        match sec {
-            Section::Apps => upsert_in(
-                sec.as_str(),
-                &self.system.apps,
-                &mut self.user.apps,
-                process,
-                patch,
-            ),
-            Section::InitialModeScope => upsert_in(
-                sec.as_str(),
-                &self.system.initial_mode_scope,
-                &mut self.user.initial_mode_scope,
-                process,
-                patch,
-            ),
-            Section::CommitNewline => upsert_in(
-                sec.as_str(),
-                &self.system.commit_newline,
-                &mut self.user.commit_newline,
-                process,
-                patch,
-            ),
-        }
+        let process = validate_process(process)?;
+        let edits = with_section!(sec, T => patch_to_edits::<T>(sec.as_str(), patch))?;
+        self.apply(sec, &process, &edits);
+        Ok(())
     }
 
+    /// 还原单个字段：删掉用户层关于它的一切痕迹（值与 `unset`），继承系统层。
     pub fn reset_field(&mut self, sec: Section, process: &str, key: &str) -> Result<(), String> {
-        match sec {
-            Section::Apps => reset_field_in(
-                sec.as_str(),
-                &self.system.apps,
-                &mut self.user.apps,
-                process,
-                key,
-            ),
-            Section::InitialModeScope => reset_field_in(
-                sec.as_str(),
-                &self.system.initial_mode_scope,
-                &mut self.user.initial_mode_scope,
-                process,
-                key,
-            ),
-            Section::CommitNewline => reset_field_in(
-                sec.as_str(),
-                &self.system.commit_newline,
-                &mut self.user.commit_newline,
-                process,
-                key,
-            ),
+        if META_KEYS.contains(&key) {
+            return Err(format!("字段 {key} 不可还原"));
         }
+        let process = validate_process(process)?;
+        if !self.exists(sec, &process) {
+            return Err("无此规则".into());
+        }
+        self.apply(sec, &process, &[FieldEdit::Inherit(key.to_string())]);
+        Ok(())
     }
 
+    /// 禁用 / 启用。启用 = 去掉用户层的禁用差异；系统层自己就禁用的规则则写显式 `disabled = false`。
     pub fn set_disabled(&mut self, sec: Section, process: &str, flag: bool) -> Result<(), String> {
-        match sec {
-            Section::Apps => set_disabled_in(&self.system.apps, &mut self.user.apps, process, flag),
-            Section::InitialModeScope => set_disabled_in(
-                &self.system.initial_mode_scope,
-                &mut self.user.initial_mode_scope,
-                process,
-                flag,
-            ),
-            Section::CommitNewline => set_disabled_in(
-                &self.system.commit_newline,
-                &mut self.user.commit_newline,
-                process,
-                flag,
-            ),
+        let process = validate_process(process)?;
+        if !self.exists(sec, &process) {
+            return Err("无此规则".into());
         }
+        self.apply(
+            sec,
+            &process,
+            &[FieldEdit::Set("disabled".into(), Value::Bool(flag))],
+        );
+        Ok(())
     }
 
     /// 还原单条：删掉用户层同名条目。用户新增的规则等于删除。返回是否删除过。
     pub fn reset(&mut self, sec: Section, process: &str) -> bool {
-        match sec {
-            Section::Apps => reset_in(&mut self.user.apps, process),
-            Section::InitialModeScope => reset_in(&mut self.user.initial_mode_scope, process),
-            Section::CommitNewline => reset_in(&mut self.user.commit_newline, process),
-        }
+        let list = match sec {
+            Section::Apps => &mut self.user.apps,
+            Section::InitialModeScope => &mut self.user.initial_mode_scope,
+            Section::CommitNewline => &mut self.user.commit_newline,
+        };
+        let before = list.len();
+        list.retain(|r| !same_process(process_of(r), process));
+        list.len() != before
     }
 
     /// 清空用户层三段。
     pub fn reset_all(&mut self) {
-        self.user.apps.clear();
-        self.user.initial_mode_scope.clear();
-        self.user.commit_newline.clear();
+        self.user = Raw::default();
     }
 
     /// 用户层渲染成文件全文（含固定文件头）。三段一并渲染，防止整份重写时漏段。
-    pub fn render_user(&self) -> Result<String, toml::ser::Error> {
-        render_user_compat(
-            &self.user.apps,
-            &self.user.initial_mode_scope,
-            &self.user.commit_newline,
-        )
+    pub fn render_user(&self) -> String {
+        render_raw(USER_COMPAT_HEADER, &self.user)
     }
 
     /// 落盘用户层：唯一临时名 → 写满 → fsync → rename（见 [`write_atomic`]）。
     /// 调用方须在读到写完的全程持有 [`crate::app_compat::lock_user_compat`]。
     pub fn save(&self, user_dir: &Path) -> std::io::Result<()> {
-        let text = self
-            .render_user()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::create_dir_all(user_dir)?;
-        write_atomic(&user_dir.join(COMPAT_FILE_NAME), &text)
+        write_atomic(&user_dir.join(COMPAT_FILE_NAME), &self.render_user())
     }
 }
 
@@ -563,9 +409,9 @@ impl Layers {
 /// 导出范围。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportScope {
-    /// 仅用户层（我的改动）。方便分享，也是默认。
+    /// 仅用户层（我的差异）。方便分享，也是默认。
     User,
-    /// 系统层与用户层合并后的全部生效规则（剔除已禁用的）。
+    /// 系统层与用户层叠加后的全部生效规则（剔除已禁用的）。
     Effective,
 }
 
@@ -582,7 +428,7 @@ impl ExportScope {
 /// 导入模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportMode {
-    /// 同名整条覆盖，用户层里没被提到的条目保留。
+    /// 按字段叠加到用户层同名规则上，用户层里没被提到的条目和字段保留。
     Merge,
     /// 先清空用户层再导入。
     Replace,
@@ -615,87 +461,118 @@ pub struct ImportPreview {
     pub items: Vec<ImportItem>,
     /// 不认识的键（`<段>.<键>`）或整段。它们不会生效。
     pub ignored_keys: Vec<String>,
-    /// 值写错、被容错回落成「跟随全局」的原值。
+    /// 值写错、被丢弃的原值。
     pub fallbacks: Vec<String>,
-    /// 被整条拒绝、不会导入的规则及原因（进程名非法、字段类型错等）。
+    /// 被整条拒绝、不会导入的规则及原因（进程名非法等）。
     pub rejected: Vec<String>,
 }
 
-/// 导入文本里的一条规则：保留**原始键值**，不经容错反序列化。
-///
-/// 必须保留原始键：`caret_use_top = false` 序列化时会被省略，若只看反序列化后的结构体，
-/// 「显式写 false 来覆盖出厂的 true」这层意思就丢了。
+/// 导入文本里的一条规则（已剔除不认识的键与无效取值）。
 struct IncomingRule {
     section: Section,
     process: String,
-    fields: Map<String, Value>,
+    fields: Obj,
 }
 
 struct Incoming {
     rules: Vec<IncomingRule>,
     ignored: Vec<String>,
+    fallbacks: Vec<String>,
     rejected: Vec<String>,
 }
 
-/// 严格解析导入文本：语法错 ⇒ `Err`（带行号）。同时收集不认识的键与被拒绝的规则。
+/// 严格解析导入文本：语法错 ⇒ `Err`（带行号）。同时收集不认识的键、无效取值与被拒绝的规则。
+///
+/// 导入的每个键都要过与补丁同样的值域校验，但**不整条拒绝**：无效取值只丢这一个键并报告，
+/// 因为分享的片段里混进一个写错的值很常见。否则写错的值会原样落进用户层文件。
 fn parse_incoming(text: &str) -> Result<Incoming, String> {
-    let raw: toml::Value =
-        toml::from_str(text).map_err(|e| format!("导入内容不是合法的 TOML: {e}"))?;
+    let raw = parse_raw(text).map_err(|e| format!("导入内容不是合法的 TOML: {e}"))?;
     let mut inc = Incoming {
         rules: Vec::new(),
         ignored: Vec::new(),
+        fallbacks: Vec::new(),
         rejected: Vec::new(),
     };
-    if let Some(top) = raw.as_table() {
-        for (name, value) in top {
-            let Some(sec) = Section::parse(name) else {
+    // 顶层不认识的整段也要报告（parse_raw 只认三段，别的被跳过）。
+    if let Ok(root) = toml::from_str::<toml::Table>(text) {
+        for name in root.keys() {
+            if Section::parse(name).is_none() {
                 inc.ignored.push(name.clone());
-                continue;
+            }
+        }
+    }
+    for sec in ALL_SECTIONS {
+        let known = known_keys(sec.as_str());
+        for row in rows(&raw, sec) {
+            let process = match row.get("process").and_then(Value::as_str) {
+                Some(p) => match validate_process(p) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        inc.rejected.push(format!("{}: {p:?} {e}", sec.as_str()));
+                        continue;
+                    }
+                },
+                None => {
+                    inc.rejected.push(format!("{}: 缺少 process", sec.as_str()));
+                    continue;
+                }
             };
-            let known = crate::compat_schema::known_keys(sec.as_str());
-            for tbl in value
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|t| t.as_table())
-            {
-                let process = match tbl.get("process").and_then(toml::Value::as_str) {
-                    Some(p) => match validate_process(p) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            inc.rejected.push(format!("{}: {p:?} {e}", sec.as_str()));
-                            continue;
+            let mut fields = Obj::new();
+            fields.insert("process".into(), Value::String(process.clone()));
+            for (k, v) in row {
+                if k == "process" {
+                    continue;
+                }
+                match k.as_str() {
+                    "comment" => {
+                        if v.is_string() {
+                            fields.insert(k.clone(), v.clone());
                         }
-                    },
-                    None => {
-                        inc.rejected.push(format!("{}: 缺少 process", sec.as_str()));
-                        continue;
                     }
-                };
-                let mut fields = Map::new();
-                for (k, v) in tbl {
-                    if k == "process" {
-                        continue;
+                    "disabled" => {
+                        if v.is_boolean() {
+                            fields.insert(k.clone(), v.clone());
+                        } else {
+                            inc.fallbacks.push(v.to_string());
+                        }
                     }
-                    if !META_KEYS.contains(&k.as_str()) && !known.contains(&k.as_str()) {
+                    "unset" => {
+                        let mut keep = Vec::new();
+                        for item in v.as_array().into_iter().flatten() {
+                            match item.as_str() {
+                                Some(name) if known.contains(&name) => {
+                                    keep.push(Value::String(name.to_string()))
+                                }
+                                Some(name) => {
+                                    inc.ignored.push(format!("{}.unset:{name}", sec.as_str()))
+                                }
+                                None => inc.fallbacks.push(item.to_string()),
+                            }
+                        }
+                        if !keep.is_empty() {
+                            fields.insert(k.clone(), Value::Array(keep));
+                        }
+                    }
+                    _ if !known.contains(&k.as_str()) => {
                         inc.ignored.push(format!("{}.{k}", sec.as_str()));
-                        continue;
                     }
-                    match serde_json::to_value(v) {
-                        Ok(j) => {
-                            fields.insert(k.clone(), j);
+                    _ => {
+                        let checked = check_patch_key(sec.as_str(), k, v)
+                            .and_then(|_| with_section!(sec, T => probe_value::<T>(k, v)));
+                        match checked {
+                            Ok(()) => {
+                                fields.insert(k.clone(), v.clone());
+                            }
+                            Err(_) => inc.fallbacks.push(v.to_string()),
                         }
-                        Err(e) => inc
-                            .rejected
-                            .push(format!("{}.{process}.{k}: {e}", sec.as_str())),
                     }
                 }
-                inc.rules.push(IncomingRule {
-                    section: sec,
-                    process,
-                    fields,
-                });
             }
+            inc.rules.push(IncomingRule {
+                section: sec,
+                process,
+                fields,
+            });
         }
     }
     inc.ignored.sort();
@@ -703,83 +580,79 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
     Ok(inc)
 }
 
-/// 把导入的一条规则**按字段合并**到同名规则上：底子是用户条目，其次是系统条目的完整拷贝
-/// （写时复制），导入里写了的键覆盖它、没写的键保留。
-///
-/// 不能整条覆盖：论坛里常见的分享片段只写一两个字段，整条覆盖会让系统规则里的其余字段
-/// （出厂的宿主修复）静默丢失。想整条替换请用 replace 模式（先清空用户层，此时底子就是系统条目）。
-/// 值域外的取值走容错反序列化回落成「未配」，由调用方从回落记录里告警；结构性错误（类型错）
-/// 则整条拒绝。
-fn import_one<T: Rule>(
-    system: &[T],
-    user: &mut Vec<T>,
-    process: &str,
-    fields: &Map<String, Value>,
-) -> Result<(), String> {
-    let base = base_for(system, user, process).unwrap_or_else(|| {
-        let mut t = T::default();
-        t.set_process(process);
-        t
-    });
-    let mut obj = to_obj(&base);
-    for (k, v) in fields {
-        obj.insert(k.clone(), v.clone());
-    }
-    let entry: T = serde_json::from_value(Value::Object(obj)).map_err(|e| e.to_string())?;
-    commit_entry(system, user, entry);
-    Ok(())
-}
-
 struct ImportPlan {
     after: Layers,
     items: Vec<ImportItem>,
-    fallbacks: Vec<String>,
-    rejected: Vec<String>,
 }
 
 impl Layers {
-    /// 导出成 `compat.toml` 文本。内容与落盘走同一个渲染函数，保证互相能导入。
-    pub fn export(&self, scope: ExportScope) -> Result<String, toml::ser::Error> {
+    /// 导出成 `compat.toml` 文本。用户层导出的是差异（可直接放进用户层），生效导出是叠加后的全貌。
+    pub fn export(&self, scope: ExportScope) -> String {
         match scope {
             ExportScope::User => self.render_user(),
             ExportScope::Effective => {
-                let mut apps = merge_rules(self.system.apps.clone(), self.user.apps.clone());
-                let mut scopes = merge_mode_scope(
-                    self.system.initial_mode_scope.clone(),
-                    self.user.initial_mode_scope.clone(),
-                );
-                let mut newline = merge_commit_newline(
-                    self.system.commit_newline.clone(),
-                    self.user.commit_newline.clone(),
-                );
-                apps.retain(|r| !r.disabled);
-                scopes.retain(|r| !r.disabled);
-                newline.retain(|r| !r.disabled);
-                render_user_compat(&apps, &scopes, &newline)
+                let mut raw = Raw::default();
+                for sec in ALL_SECTIONS {
+                    let eff: Vec<Obj> =
+                        overlay(rows(&self.system, sec).clone(), rows(&self.user, sec))
+                            .into_iter()
+                            .filter(|r| !is_disabled(r))
+                            .map(|mut r| {
+                                r.remove("unset");
+                                r.remove("disabled");
+                                r
+                            })
+                            .collect();
+                    match sec {
+                        Section::Apps => raw.apps = eff,
+                        Section::InitialModeScope => raw.initial_mode_scope = eff,
+                        Section::CommitNewline => raw.commit_newline = eff,
+                    }
+                }
+                render_raw(
+                    "# 生效中的全部应用兼容规则（系统层与用户层叠加后的结果）\n\n",
+                    &raw,
+                )
             }
         }
     }
 
-    fn import_rule(&mut self, r: &IncomingRule) -> Result<(), String> {
-        match r.section {
-            Section::Apps => import_one(
-                &self.system.apps,
-                &mut self.user.apps,
-                &r.process,
-                &r.fields,
-            ),
-            Section::InitialModeScope => import_one(
+    /// 把一条导入规则**叠加**到用户层同名差异行上（不是整条替换），再规范化。
+    fn import_rule(&mut self, r: &IncomingRule) {
+        let (sys, user) = match r.section {
+            Section::Apps => (&self.system.apps, &mut self.user.apps),
+            Section::InitialModeScope => (
                 &self.system.initial_mode_scope,
                 &mut self.user.initial_mode_scope,
-                &r.process,
-                &r.fields,
             ),
-            Section::CommitNewline => import_one(
-                &self.system.commit_newline,
-                &mut self.user.commit_newline,
-                &r.process,
-                &r.fields,
-            ),
+            Section::CommitNewline => (&self.system.commit_newline, &mut self.user.commit_newline),
+        };
+        let idx = user
+            .iter()
+            .position(|u| same_process(process_of(u), &r.process));
+        let base = match idx {
+            Some(i) => user[i].clone(),
+            None => {
+                let mut o = Obj::new();
+                let name = sys
+                    .iter()
+                    .find(|s| same_process(process_of(s), &r.process))
+                    .map(process_of)
+                    .unwrap_or(&r.process);
+                o.insert("process".into(), Value::String(name.to_string()));
+                o
+            }
+        };
+        let mut row = compose(&base, &r.fields);
+        let sys_row = sys.iter().find(|s| same_process(process_of(s), &r.process));
+        let keep = with_section!(r.section, T => normalize::<T>(r.section.as_str(), sys_row, &mut row, true));
+        match (idx, keep) {
+            (Some(i), true) => user[i] = row,
+            (Some(i), false) => {
+                user.remove(i);
+            }
+            (None, true) => user.push(row),
+            (None, false) => {}
         }
     }
 
@@ -789,14 +662,9 @@ impl Layers {
         if mode == ImportMode::Replace {
             after.reset_all();
         }
-        let mut rejected = incoming.rejected.clone();
         let mut items = Vec::new();
-        crate::tolerant_de::clear_fallbacks();
         for r in &incoming.rules {
-            if let Err(e) = after.import_rule(r) {
-                rejected.push(format!("{}.{}: {e}", r.section.as_str(), r.process));
-                continue;
-            }
+            after.import_rule(r);
             let disabled = r
                 .fields
                 .get("disabled")
@@ -821,18 +689,13 @@ impl Layers {
                 action,
             });
         }
-        let fallbacks = crate::tolerant_de::take_fallbacks();
         if mode == ImportMode::Replace {
-            for sec in [
-                Section::Apps,
-                Section::InitialModeScope,
-                Section::CommitNewline,
-            ] {
+            for sec in ALL_SECTIONS {
                 for v in self.view(sec).into_iter().filter(|v| v.has_user_entry) {
                     let mentioned = incoming
                         .rules
                         .iter()
-                        .any(|r| r.section == sec && same(&r.process, &v.process));
+                        .any(|r| r.section == sec && same_process(&r.process, &v.process));
                     if !mentioned {
                         items.push(ImportItem {
                             section: sec.as_str(),
@@ -843,12 +706,7 @@ impl Layers {
                 }
             }
         }
-        ImportPlan {
-            after,
-            items,
-            fallbacks,
-            rejected,
-        }
+        ImportPlan { after, items }
     }
 
     /// 导入预览：不落盘，不改 `self`。
@@ -858,8 +716,8 @@ impl Layers {
         Ok(ImportPreview {
             items: plan.items,
             ignored_keys: incoming.ignored,
-            fallbacks: plan.fallbacks,
-            rejected: plan.rejected,
+            fallbacks: incoming.fallbacks,
+            rejected: incoming.rejected,
         })
     }
 
@@ -871,8 +729,8 @@ impl Layers {
         Ok(ImportPreview {
             items: plan.items,
             ignored_keys: incoming.ignored,
-            fallbacks: plan.fallbacks,
-            rejected: plan.rejected,
+            fallbacks: incoming.fallbacks,
+            rejected: incoming.rejected,
         })
     }
 }
@@ -1031,7 +889,7 @@ pub fn rpc(
                 None => ExportScope::User,
                 Some(s) => ExportScope::parse(s).ok_or_else(|| "scope 无效".to_string())?,
             };
-            let content = layers.export(scope).map_err(|e| e.to_string())?;
+            let content = layers.export(scope);
             read(json!({ "content": content }))
         }
         "compat.upsert" => {
@@ -1108,15 +966,13 @@ pub fn rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn file(text: &str) -> AppCompatFile {
-        toml::from_str(text).expect("测试夹具必须是合法 TOML")
-    }
+    use crate::compat_overlay::parse_raw;
+    use serde_json::json;
 
     fn layers(sys: &str, usr: &str) -> Layers {
         Layers {
-            system: file(sys),
-            user: file(usr),
+            system: parse_raw(sys).expect("测试夹具必须是合法 TOML"),
+            user: parse_raw(usr).expect("测试夹具必须是合法 TOML"),
         }
     }
 
@@ -1128,6 +984,17 @@ mod tests {
         l.view_of(Section::Apps, p).expect("规则应存在").state
     }
 
+    fn user_row(l: &Layers, sec: Section, p: &str) -> Option<Obj> {
+        rows(&l.user, sec)
+            .iter()
+            .find(|r| same_process(process_of(r), p))
+            .cloned()
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wind_compat_adm_{tag}_{}", std::process::id()))
+    }
+
     const SYS: &str = "\
 [[apps]]
 process = \"Feishu.exe\"
@@ -1136,24 +1003,27 @@ composition_start_pair_guard = true
 [[apps]]
 process = \"Weixin.exe\"
 caret_use_top = true
+stale_probe_guard = true
 
 [[apps]]
 process = \"Dota.exe\"
 host_render = true
 ";
 
+    const USER_A: &str = "[[apps]]\nprocess = \"Weixin.exe\"\nauto_pair = true\n";
+
+    // ───────────── 视图 ─────────────
+
     #[test]
     fn view_marks_system_modified_user_disabled() {
         let usr = "\
 [[apps]]
 process = \"Weixin.exe\"
-caret_use_top = true
 first_show_mode = \"wait\"
 
 [[apps]]
 process = \"Dota.exe\"
 disabled = true
-host_render = true
 
 [[apps]]
 process = \"Mine.exe\"
@@ -1167,12 +1037,21 @@ auto_pair = true
     }
 
     #[test]
-    fn overridden_lists_only_fields_that_differ_from_system() {
-        let usr = "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\nauto_pair = true\n";
+    fn overridden_lists_only_the_meaningful_diff_including_unset() {
+        let usr = "[[apps]]\nprocess = \"Weixin.exe\"\nauto_pair = true\ncaret_use_top = true\nunset = [\"stale_probe_guard\"]\n";
         let l = layers(SYS, usr);
         let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
-        assert_eq!(v.overridden, vec!["auto_pair".to_string()]);
+        assert_eq!(
+            v.overridden,
+            vec!["auto_pair".to_string(), "stale_probe_guard".to_string()],
+            "caret_use_top 与系统一致是冗余，不算差异；unset 的字段算差异"
+        );
         assert!(v.system.is_some());
+        assert!(
+            v.effective.get("stale_probe_guard").is_none(),
+            "unset 后运行时没有它"
+        );
+        assert_eq!(v.effective["caret_use_top"], json!(true), "没提到的继承");
     }
 
     #[test]
@@ -1189,29 +1068,69 @@ auto_pair = true
         assert!(v.system.is_none());
     }
 
+    /// 旧文件里与系统层完全一致的冗余条目：状态是 System，但用户层里确实有这一条（还原按钮据此判断）。
     #[test]
-    fn patch_on_system_rule_copies_the_rest_first() {
+    fn a_redundant_user_entry_is_reported_as_system_but_still_has_a_user_entry() {
+        let l = layers(
+            SYS,
+            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\n",
+        );
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert_eq!(v.state, RuleState::System);
+        assert!(v.has_user_entry);
+        assert!(v.overridden.is_empty());
+    }
+
+    #[test]
+    fn view_exposes_whether_a_user_entry_exists_and_its_raw_content() {
+        let mut l = layers(SYS, "");
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert!(!v.has_user_entry && v.user.is_none());
+        l.upsert(
+            Section::Apps,
+            "Weixin.exe",
+            &patch(json!({"auto_pair": true})),
+        )
+        .unwrap();
+        l.set_disabled(Section::Apps, "Weixin.exe", true).unwrap();
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert_eq!(v.state, RuleState::Disabled);
+        let user = v.user.expect("禁用状态下要能看到用户层原始条目");
+        assert_eq!(user["auto_pair"], json!(true), "禁用前的改写要可见");
+        assert_eq!(user["disabled"], json!(true));
+    }
+
+    // ───────────── 差异写入 ─────────────
+
+    /// 整体原则的核心：改一个字段只写这一个字段，系统规则的其余字段继续继承。
+    #[test]
+    fn patch_on_a_system_rule_stores_only_the_diff() {
         let mut l = layers(SYS, "");
         l.upsert(
             Section::Apps,
-            "Feishu.exe",
+            "weixin.exe",
             &patch(json!({"first_show_mode": "wait"})),
         )
         .unwrap();
-        let u = &l.user.apps[0];
-        assert_eq!(
-            u.composition_start_pair_guard,
-            Some(true),
-            "写时复制：系统字段必须带过来"
+        let row = user_row(&l, Section::Apps, "Weixin.exe").unwrap();
+        assert_eq!(row["first_show_mode"], json!("wait"));
+        assert!(
+            row.get("caret_use_top").is_none() && row.get("stale_probe_guard").is_none(),
+            "不得拷贝系统字段: {row:?}"
         );
-        let v = l.view_of(Section::Apps, "Feishu.exe").unwrap();
+        assert_eq!(row["process"], json!("Weixin.exe"), "沿用系统层的写法");
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
         assert_eq!(v.state, RuleState::Modified);
-        assert_eq!(v.effective["composition_start_pair_guard"], json!(true));
+        assert_eq!(
+            v.effective["caret_use_top"],
+            json!(true),
+            "系统字段照旧生效"
+        );
         assert_eq!(v.effective["first_show_mode"], json!("wait"));
     }
 
     #[test]
-    fn patch_equal_to_system_removes_the_user_entry() {
+    fn patch_equal_to_the_system_value_removes_the_entry() {
         let mut l = layers(SYS, "");
         l.upsert(
             Section::Apps,
@@ -1226,8 +1145,83 @@ auto_pair = true
             &patch(json!({"auto_pair": null})),
         )
         .unwrap();
-        assert!(l.user.apps.is_empty(), "改回系统值后不应留下冗余的用户条目");
+        assert!(
+            user_row(&l, Section::Apps, "Weixin.exe").is_none(),
+            "回到与系统一致，条目应消失"
+        );
         assert_eq!(state_of(&l, "Weixin.exe"), RuleState::System);
+        l.upsert(
+            Section::Apps,
+            "Weixin.exe",
+            &patch(json!({"caret_use_top": true})),
+        )
+        .unwrap();
+        assert!(
+            user_row(&l, Section::Apps, "Weixin.exe").is_none(),
+            "写成与系统相同的值也是冗余"
+        );
+    }
+
+    /// `null` = 清除 = 回到「跟随全局」：系统层设了它就要写 unset，否则只会继承回系统值。
+    #[test]
+    fn null_on_a_system_field_writes_unset_and_reset_field_undoes_it() {
+        let mut l = layers(SYS, "");
+        l.upsert(
+            Section::Apps,
+            "Feishu.exe",
+            &patch(json!({"composition_start_pair_guard": null})),
+        )
+        .unwrap();
+        let row = user_row(&l, Section::Apps, "Feishu.exe").unwrap();
+        assert_eq!(row["unset"], json!(["composition_start_pair_guard"]));
+        let v = l.view_of(Section::Apps, "Feishu.exe").unwrap();
+        assert_eq!(v.state, RuleState::Modified, "unset 是真正的差异");
+        assert!(v.effective.get("composition_start_pair_guard").is_none());
+
+        l.reset_field(Section::Apps, "Feishu.exe", "composition_start_pair_guard")
+            .unwrap();
+        assert!(
+            user_row(&l, Section::Apps, "Feishu.exe").is_none(),
+            "还原 = 继承出厂，痕迹全清"
+        );
+        assert_eq!(state_of(&l, "Feishu.exe"), RuleState::System);
+    }
+
+    #[test]
+    fn null_on_a_field_the_system_lacks_leaves_no_trace() {
+        let mut l = layers(SYS, "");
+        l.upsert(
+            Section::Apps,
+            "Weixin.exe",
+            &patch(json!({"auto_pair": null})),
+        )
+        .unwrap();
+        assert!(
+            user_row(&l, Section::Apps, "Weixin.exe").is_none(),
+            "空操作不该留噪声条目"
+        );
+    }
+
+    #[test]
+    fn explicit_false_over_a_system_true_is_kept() {
+        let mut l = layers(SYS, "");
+        l.upsert(
+            Section::Apps,
+            "Feishu.exe",
+            &patch(json!({"composition_start_pair_guard": false})),
+        )
+        .unwrap();
+        assert_eq!(
+            user_row(&l, Section::Apps, "Feishu.exe").unwrap()["composition_start_pair_guard"],
+            json!(false)
+        );
+        let v = l.view_of(Section::Apps, "Feishu.exe").unwrap();
+        assert_eq!(
+            v.effective["composition_start_pair_guard"],
+            json!(false),
+            "显式关闭必须生效"
+        );
+        assert_eq!(v.state, RuleState::Modified);
     }
 
     #[test]
@@ -1245,7 +1239,45 @@ auto_pair = true
     }
 
     #[test]
-    fn patch_accepts_false_for_bool() {
+    fn patch_rejects_typos_wrong_types_and_empty_enum() {
+        let bad = [
+            json!({"caret_use_tpo": false}),
+            json!({"auto_pair": 0}),
+            json!({"caret_use_top": "yes"}),
+            json!({"first_show_mode": ""}),
+            json!({"first_show_mode": 0}),
+            json!({"caret_offset_x": "12"}),
+        ];
+        for p in bad {
+            let mut l = layers(SYS, "");
+            assert!(
+                l.upsert(Section::Apps, "Weixin.exe", &patch(p.clone()))
+                    .is_err(),
+                "补丁 {p} 应被拒绝"
+            );
+            assert!(l.user.apps.is_empty(), "被拒绝的补丁不得落任何东西: {p}");
+        }
+    }
+
+    #[test]
+    fn patch_rejects_meta_keys() {
+        for p in [
+            json!({"disabled": true}),
+            json!({"comment": "x"}),
+            json!({"process": "O.exe"}),
+            json!({"unset": ["auto_pair"]}),
+        ] {
+            let mut l = layers(SYS, "");
+            assert!(
+                l.upsert(Section::Apps, "Weixin.exe", &patch(p.clone()))
+                    .is_err(),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn false_over_nothing_is_redundant_but_accepted() {
         let mut l = layers(SYS, "");
         l.upsert(
             Section::Apps,
@@ -1253,64 +1285,22 @@ auto_pair = true
             &patch(json!({"auto_pair": true, "caret_use_top": false})),
         )
         .expect("bool false 是合法值");
-        assert!(l.view_of(Section::Apps, "Mine.exe").is_some());
-    }
-
-    #[test]
-    fn patch_rejects_wrong_type() {
-        let mut l = layers(SYS, "");
+        let row = user_row(&l, Section::Apps, "Mine.exe").unwrap();
         assert!(
-            l.upsert(
-                Section::Apps,
-                "Mine.exe",
-                &patch(json!({"caret_offset_x": "12"}))
-            )
-            .is_err()
+            row.get("caret_use_top").is_none(),
+            "系统没有它时 false 与没写等价，属冗余: {row:?}"
         );
+        assert_eq!(row["auto_pair"], json!(true));
     }
 
     #[test]
-    fn patch_null_clears_the_field() {
-        let mut l = layers(
-            SYS,
-            "[[apps]]\nprocess = \"Mine.exe\"\nfirst_show_mode = \"wait\"\nauto_pair = true\n",
-        );
-        l.upsert(
-            Section::Apps,
-            "Mine.exe",
-            &patch(json!({"first_show_mode": null})),
-        )
-        .unwrap();
-        let v = l.view_of(Section::Apps, "Mine.exe").unwrap();
-        assert!(v.effective.get("first_show_mode").is_none());
-        assert_eq!(v.effective["auto_pair"], json!(true));
-    }
-
-    #[test]
-    fn patch_rejects_changing_process_key() {
-        let mut l = layers(SYS, "");
-        assert!(
-            l.upsert(
-                Section::Apps,
-                "Weixin.exe",
-                &patch(json!({"process": "Other.exe"}))
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn process_validation() {
+    fn process_validation_and_matching() {
         assert!(validate_process("").is_err());
         assert!(validate_process("   ").is_err());
         assert!(validate_process("a/b.exe").is_err());
         assert!(validate_process("a\\b.exe").is_err());
         assert!(validate_process("a\u{7}b.exe").is_err());
         assert_eq!(validate_process(" x.exe ").unwrap(), "x.exe");
-    }
-
-    #[test]
-    fn process_is_matched_case_insensitively_and_trimmed() {
         let mut l = layers(SYS, "");
         l.upsert(
             Section::Apps,
@@ -1320,13 +1310,56 @@ auto_pair = true
         .unwrap();
         assert_eq!(l.user.apps.len(), 1);
         assert_eq!(
-            l.user.apps[0].process, "Weixin.exe",
+            process_of(&l.user.apps[0]),
+            "Weixin.exe",
             "沿用系统层的写法，不新增一条"
         );
     }
 
+    /// 窗口类只改大小写或顺序，运行时等价，不算差异。
     #[test]
-    fn reset_field_restores_system_value_and_keeps_other_edits() {
+    fn classes_differing_only_in_case_or_order_are_not_a_modification() {
+        let sys = "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"Progman\", \"WorkerW\"]\n";
+        let mut l = layers(sys, "");
+        l.upsert(
+            Section::InitialModeScope,
+            "explorer.exe",
+            &patch(json!({"classes": ["workerw", "progman"]})),
+        )
+        .unwrap();
+        assert!(
+            l.user.initial_mode_scope.is_empty(),
+            "{:?}",
+            l.user.initial_mode_scope
+        );
+    }
+
+    /// 元数据里登记的每个枚举可选值都必须被真实解析器接受并原样往返。
+    #[test]
+    fn every_registered_enum_option_roundtrips_through_the_real_parser() {
+        use crate::compat_schema::{COMPAT_FIELDS, Kind};
+        for f in COMPAT_FIELDS.iter().filter(|f| f.kind == Kind::Enum) {
+            let sec = Section::parse(f.section).unwrap();
+            for opt in f.options {
+                let mut l = layers("", "");
+                l.upsert(sec, "probe.exe", &patch(json!({ f.key: opt })))
+                    .unwrap_or_else(|e| panic!("{}.{} = {opt} 被拒绝: {e}", f.section, f.key));
+                let v = l.view_of(sec, "probe.exe").unwrap();
+                assert_eq!(
+                    v.effective[f.key],
+                    json!(opt),
+                    "{}.{} = {opt} 往返后不一致",
+                    f.section,
+                    f.key
+                );
+            }
+        }
+    }
+
+    // ───────────── 还原 / 禁用 ─────────────
+
+    #[test]
+    fn reset_field_inherits_the_system_value_and_keeps_other_edits() {
         let mut l = layers(SYS, "");
         l.upsert(
             Section::Apps,
@@ -1356,6 +1389,25 @@ auto_pair = true
     }
 
     #[test]
+    fn reset_removes_the_user_entry_and_reports_whether_it_existed() {
+        let mut l = layers(SYS, USER_A);
+        assert!(l.reset(Section::Apps, "weixin.exe"));
+        assert_eq!(state_of(&l, "Weixin.exe"), RuleState::System);
+        assert!(!l.reset(Section::Apps, "Weixin.exe"));
+        let mut u = layers(SYS, "[[apps]]\nprocess = \" x.exe \"\nauto_pair = true\n");
+        assert!(u.reset(Section::Apps, "x.exe"), "已存的名字带空白也要能删");
+    }
+
+    #[test]
+    fn reset_all_clears_all_three_sections() {
+        let usr = "[[apps]]\nprocess = \"Mine.exe\"\nauto_pair = true\n\n[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"X\"]\n\n[[commit_newline]]\nprocess = \"W.exe\"\nstyle = \"cr\"\n";
+        let mut l = layers(SYS, usr);
+        l.reset_all();
+        let text = l.render_user();
+        assert!(!text.contains("[["), "{text}");
+    }
+
+    #[test]
     fn set_disabled_roundtrip_restores_prior_edits() {
         let mut l = layers(SYS, "");
         l.upsert(
@@ -1366,11 +1418,21 @@ auto_pair = true
         .unwrap();
         l.set_disabled(Section::Apps, "Weixin.exe", true).unwrap();
         assert_eq!(state_of(&l, "Weixin.exe"), RuleState::Disabled);
+        assert_eq!(
+            user_row(&l, Section::Apps, "Weixin.exe").unwrap()["auto_pair"],
+            json!(true),
+            "禁用期间改写还在"
+        );
         l.set_disabled(Section::Apps, "Weixin.exe", false).unwrap();
         let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
         assert_eq!(v.state, RuleState::Modified, "启用后回到禁用前的改写状态");
         assert_eq!(v.effective["auto_pair"], json!(true));
-        assert!(l.user.apps.iter().all(|r| !r.disabled));
+        assert!(
+            user_row(&l, Section::Apps, "Weixin.exe")
+                .unwrap()
+                .get("disabled")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1378,83 +1440,31 @@ auto_pair = true
         let mut l = layers(SYS, "");
         l.set_disabled(Section::Apps, "Weixin.exe", true).unwrap();
         l.set_disabled(Section::Apps, "Weixin.exe", false).unwrap();
-        assert!(l.user.apps.is_empty(), "与系统一致就不该留条目");
+        assert!(
+            user_row(&l, Section::Apps, "Weixin.exe").is_none(),
+            "与系统一致就不该留条目"
+        );
         assert_eq!(state_of(&l, "Weixin.exe"), RuleState::System);
     }
 
     #[test]
-    fn set_disabled_on_unknown_process_errors() {
-        let mut l = layers(SYS, "");
+    fn set_disabled_on_unknown_process_errors_and_user_only_rules_are_allowed() {
+        let mut l = layers(SYS, "[[apps]]\nprocess = \"Mine.exe\"\nauto_pair = true\n");
         assert_eq!(
             l.set_disabled(Section::Apps, "Nope.exe", true).unwrap_err(),
             "无此规则"
         );
-    }
-
-    #[test]
-    fn set_disabled_on_user_only_rule_is_allowed() {
-        let mut l = layers(SYS, "[[apps]]\nprocess = \"Mine.exe\"\nauto_pair = true\n");
         l.set_disabled(Section::Apps, "Mine.exe", true).unwrap();
         assert_eq!(state_of(&l, "Mine.exe"), RuleState::Disabled);
         l.set_disabled(Section::Apps, "Mine.exe", false).unwrap();
         assert_eq!(state_of(&l, "Mine.exe"), RuleState::User);
     }
 
-    #[test]
-    fn reset_removes_user_entry_and_returns_whether_it_existed() {
-        let mut l = layers(SYS, "");
-        l.upsert(
-            Section::Apps,
-            "Weixin.exe",
-            &patch(json!({"auto_pair": true})),
-        )
-        .unwrap();
-        assert!(l.reset(Section::Apps, "weixin.exe"));
-        assert_eq!(state_of(&l, "Weixin.exe"), RuleState::System);
-        assert!(!l.reset(Section::Apps, "Weixin.exe"));
-    }
-
-    #[test]
-    fn reset_of_user_only_rule_deletes_it() {
-        let mut l = layers(SYS, "[[apps]]\nprocess = \"Mine.exe\"\nauto_pair = true\n");
-        assert!(l.reset(Section::Apps, "Mine.exe"));
-        assert!(l.view_of(Section::Apps, "Mine.exe").is_none());
-    }
-
-    #[test]
-    fn reset_all_clears_all_three_sections() {
-        let usr = "\
-[[apps]]
-process = \"Mine.exe\"
-auto_pair = true
-
-[[initial_mode_scope]]
-process = \"explorer.exe\"
-classes = [\"CabinetWClass\"]
-
-[[commit_newline]]
-process = \"WINWORD.EXE\"
-style = \"cr\"
-";
-        let mut l = layers(SYS, usr);
-        l.reset_all();
-        let text = l.render_user().unwrap();
-        assert!(!text.contains("[[apps]]"), "{text}");
-        assert!(!text.contains("[[initial_mode_scope]]"), "{text}");
-        assert!(!text.contains("[[commit_newline]]"), "{text}");
-    }
+    // ───────────── 段之间 ─────────────
 
     #[test]
     fn sections_are_independent() {
-        let sys = "\
-[[apps]]
-process = \"explorer.exe\"
-auto_pair = true
-
-[[initial_mode_scope]]
-process = \"explorer.exe\"
-classes = [\"CabinetWClass\"]
-";
+        let sys = "[[apps]]\nprocess = \"explorer.exe\"\nauto_pair = true\n\n[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"CabinetWClass\"]\n";
         let mut l = layers(sys, "");
         l.upsert(
             Section::Apps,
@@ -1476,15 +1486,7 @@ classes = [\"CabinetWClass\"]
 
     #[test]
     fn scope_and_newline_sections_support_patch_and_disable() {
-        let sys = "\
-[[initial_mode_scope]]
-process = \"explorer.exe\"
-classes = [\"CabinetWClass\"]
-
-[[commit_newline]]
-process = \"WINWORD.EXE\"
-style = \"cr\"
-";
+        let sys = "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"CabinetWClass\"]\n\n[[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n";
         let mut l = layers(sys, "");
         l.upsert(
             Section::InitialModeScope,
@@ -1516,32 +1518,7 @@ style = \"cr\"
         );
     }
 
-    /// 元数据里登记的每个枚举可选值都必须被真实解析器接受并原样往返；
-    /// 否则设置端下拉框里会出现「选了却写不进去」的选项。
-    #[test]
-    fn every_registered_enum_option_roundtrips_through_the_real_parser() {
-        use crate::compat_schema::{COMPAT_FIELDS, Kind};
-        for f in COMPAT_FIELDS.iter().filter(|f| f.kind == Kind::Enum) {
-            let sec = Section::parse(f.section).unwrap();
-            for opt in f.options {
-                let mut l = layers("", "");
-                l.upsert(sec, "probe.exe", &patch(json!({ f.key: opt })))
-                    .unwrap_or_else(|e| panic!("{}.{} = {opt} 被拒绝: {e}", f.section, f.key));
-                let v = l.view_of(sec, "probe.exe").unwrap();
-                assert_eq!(
-                    v.effective[f.key],
-                    json!(opt),
-                    "{}.{} = {opt} 往返后不一致",
-                    f.section,
-                    f.key
-                );
-            }
-        }
-    }
-
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("wind_compat_adm_{tag}_{}", std::process::id()))
-    }
+    // ───────────── 读写与文件 ─────────────
 
     #[test]
     fn strict_load_reports_syntax_error_with_path() {
@@ -1552,26 +1529,32 @@ style = \"cr\"
             Err(e) => e,
             Ok(_) => panic!("语法错必须报错，而不是静默按空集处理"),
         };
-        assert!(err.contains(COMPAT_FILE_NAME), "应带路径: {err}");
-        assert!(err.contains("line"), "应带行号: {err}");
+        assert!(
+            err.contains(COMPAT_FILE_NAME) && err.contains("line"),
+            "应带路径与行号: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn missing_user_file_is_an_empty_layer() {
-        let dir = tmp("missing");
-        let l = Layers::load(None, None, Some(&dir)).unwrap();
-        assert!(l.user.apps.is_empty());
+        assert!(
+            Layers::load(None, None, Some(&tmp("missing")))
+                .unwrap()
+                .user
+                .apps
+                .is_empty()
+        );
     }
 
     #[test]
-    fn save_is_atomic_and_preserves_other_sections() {
+    fn save_is_atomic_and_preserves_other_sections_and_unknown_keys() {
         let dir = tmp("save");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(COMPAT_FILE_NAME),
-            "[[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n",
+            "[[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n\n[[apps]]\nprocess = \"Old.exe\"\nfuture_key = 3\nauto_pair = true\n",
         )
         .unwrap();
         let mut l = Layers::load(None, None, Some(&dir)).unwrap();
@@ -1583,11 +1566,14 @@ style = \"cr\"
         .unwrap();
         l.save(&dir).unwrap();
         let text = std::fs::read_to_string(dir.join(COMPAT_FILE_NAME)).unwrap();
-        assert!(
-            text.contains("[[commit_newline]]"),
-            "别的段必须原样带回: {text}"
-        );
-        assert!(text.contains("Mine.exe"), "{text}");
+        for needle in [
+            "[[commit_newline]]",
+            "Mine.exe",
+            "Old.exe",
+            "future_key = 3",
+        ] {
+            assert!(text.contains(needle), "写回后丢了 {needle}: {text}");
+        }
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1599,43 +1585,45 @@ style = \"cr\"
 
     // ───────────── 导出 / 导入 ─────────────
 
-    const USER_A: &str =
-        "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\nauto_pair = true\n";
-
     #[test]
-    fn export_user_contains_only_user_layer() {
+    fn export_user_contains_only_the_diff() {
         let l = layers(SYS, USER_A);
-        let text = l.export(ExportScope::User).unwrap();
-        assert!(text.contains("Weixin.exe"), "{text}");
+        let text = l.export(ExportScope::User);
+        assert!(text.contains("auto_pair = true"), "{text}");
         assert!(
-            !text.contains("Feishu.exe"),
-            "仅用户层不应含系统规则: {text}"
+            !text.contains("caret_use_top") && !text.contains("Feishu"),
+            "用户导出只含差异: {text}"
         );
     }
 
     #[test]
-    fn export_effective_merges_and_drops_disabled() {
+    fn export_effective_expands_the_overlay_and_drops_disabled_and_syntax() {
         let usr = format!(
-            "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\nhost_render = true\n"
+            "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\n\n[[apps]]\nprocess = \"Feishu.exe\"\nunset = [\"composition_start_pair_guard\"]\n"
         );
-        let l = layers(SYS, &usr);
-        let text = l.export(ExportScope::Effective).unwrap();
-        assert!(text.contains("Feishu.exe"), "系统规则应在: {text}");
+        let text = layers(SYS, &usr).export(ExportScope::Effective);
         assert!(
-            text.contains("auto_pair = true"),
-            "合并后的改写应在: {text}"
+            text.contains("caret_use_top = true") && text.contains("auto_pair = true"),
+            "叠加后的全貌: {text}"
         );
-        assert!(!text.contains("Dota.exe"), "被禁用的不应导出: {text}");
-        assert!(!text.contains("disabled"), "{text}");
+        assert!(!text.contains("Dota"), "被禁用的不导出: {text}");
+        assert!(
+            !text.contains("disabled") && !text.contains("unset"),
+            "叠加语法不该出现在生效导出里: {text}"
+        );
+        assert!(
+            !text.contains("composition_start_pair_guard"),
+            "unset 掉的字段不该出现: {text}"
+        );
     }
 
     #[test]
     fn export_then_import_replace_roundtrips() {
         let usr = format!(
-            "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\nhost_render = true\n"
+            "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\n\n[[apps]]\nprocess = \"Feishu.exe\"\nunset = [\"composition_start_pair_guard\"]\n"
         );
         let a = layers(SYS, &usr);
-        let text = a.export(ExportScope::User).unwrap();
+        let text = a.export(ExportScope::User);
         let mut b = layers(SYS, "");
         b.import_apply(&text, ImportMode::Replace).unwrap();
         for p in ["Feishu.exe", "Weixin.exe", "Dota.exe"] {
@@ -1643,8 +1631,7 @@ style = \"cr\"
                 a.view_of(Section::Apps, p).unwrap(),
                 b.view_of(Section::Apps, p).unwrap(),
             );
-            assert_eq!(va.state, vb.state, "{p}");
-            assert_eq!(va.effective, vb.effective, "{p}");
+            assert_eq!((va.state, &va.effective), (vb.state, &vb.effective), "{p}");
         }
     }
 
@@ -1657,21 +1644,20 @@ auto_pair = true
 
 [[apps]]
 process = \"Weixin.exe\"
-caret_use_top = true
 auto_pair = true
 
 [[apps]]
 process = \"Dota.exe\"
 disabled = true
-host_render = true
 
 [[apps]]
 process = \"Feishu.exe\"
 composition_start_pair_guard = true
 ";
-        let l = layers(SYS, "");
-        let p = l.import_preview(incoming, ImportMode::Merge).unwrap();
-        let act = |name: &str| p.items.iter().find(|i| i.process == name).map(|i| i.action);
+        let p = layers(SYS, "")
+            .import_preview(incoming, ImportMode::Merge)
+            .unwrap();
+        let act = |n: &str| p.items.iter().find(|i| i.process == n).map(|i| i.action);
         assert_eq!(act("Brand.exe"), Some("add"));
         assert_eq!(act("Weixin.exe"), Some("override"));
         assert_eq!(act("Dota.exe"), Some("disable"));
@@ -1704,34 +1690,72 @@ composition_start_pair_guard = true
         assert_eq!(before, after);
     }
 
+    /// 导入按字段叠加：稀疏片段不得让系统规则里的其它字段丢失，显式 false 能覆盖出厂的 true。
     #[test]
-    fn import_merge_keeps_unmentioned_user_entries() {
-        let mut l = layers(SYS, "[[apps]]\nprocess = \"E.exe\"\nauto_pair = true\n");
+    fn import_sparse_snippet_keeps_the_system_fields_and_explicit_false_overrides() {
+        let mut l = layers(SYS, "");
         l.import_apply(
+            "[[apps]]\nprocess = \"weixin.exe\"\nfirst_show_mode = \"wait\"\n",
+            ImportMode::Merge,
+        )
+        .unwrap();
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert_eq!(v.effective["caret_use_top"], json!(true), "出厂修复不能丢");
+        assert_eq!(v.effective["stale_probe_guard"], json!(true));
+        assert_eq!(v.effective["first_show_mode"], json!("wait"));
+        l.import_apply(
+            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = false\n",
+            ImportMode::Merge,
+        )
+        .unwrap();
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert!(
+            v.effective.get("caret_use_top").is_none(),
+            "显式 false 应生效: {:?}",
+            v.effective
+        );
+        assert_eq!(
+            v.effective["first_show_mode"],
+            json!("wait"),
+            "之前导入的字段仍在（叠加而非替换）"
+        );
+    }
+
+    #[test]
+    fn import_understands_unset() {
+        let mut l = layers(SYS, "");
+        l.import_apply(
+            "[[apps]]\nprocess = \"Weixin.exe\"\nunset = [\"caret_use_top\"]\n",
+            ImportMode::Merge,
+        )
+        .unwrap();
+        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
+        assert!(v.effective.get("caret_use_top").is_none());
+        assert_eq!(v.state, RuleState::Modified);
+    }
+
+    #[test]
+    fn import_merge_keeps_unmentioned_user_entries_and_replace_drops_them() {
+        let mut m = layers(SYS, "[[apps]]\nprocess = \"E.exe\"\nauto_pair = true\n");
+        m.import_apply(
             "[[apps]]\nprocess = \"C.exe\"\nauto_pair = true\n",
             ImportMode::Merge,
         )
         .unwrap();
         assert!(
-            l.view_of(Section::Apps, "E.exe").is_some(),
-            "Merge 不能动没被提到的条目"
+            m.view_of(Section::Apps, "E.exe").is_some()
+                && m.view_of(Section::Apps, "C.exe").is_some()
         );
-        assert!(l.view_of(Section::Apps, "C.exe").is_some());
-    }
-
-    #[test]
-    fn import_replace_drops_unmentioned_user_entries() {
-        let mut l = layers(SYS, "[[apps]]\nprocess = \"E.exe\"\nauto_pair = true\n");
-        l.import_apply(
+        let mut r = layers(SYS, "[[apps]]\nprocess = \"E.exe\"\nauto_pair = true\n");
+        r.import_apply(
             "[[apps]]\nprocess = \"C.exe\"\nauto_pair = true\n",
             ImportMode::Replace,
         )
         .unwrap();
         assert!(
-            l.view_of(Section::Apps, "E.exe").is_none(),
+            r.view_of(Section::Apps, "E.exe").is_none(),
             "Replace 要先清空用户层"
         );
-        assert!(l.view_of(Section::Apps, "C.exe").is_some());
     }
 
     #[test]
@@ -1752,17 +1776,32 @@ composition_start_pair_guard = true
         );
     }
 
+    /// 无效取值只丢这一个键并报告，**且不能原样落进用户层文件**。
     #[test]
-    fn import_reports_value_fallbacks() {
+    fn import_drops_invalid_values_reports_them_and_never_persists_them() {
         let text = "[[apps]]\nprocess = \"A.exe\"\nfirst_show_mode = \"bogus\"\nauto_pair = true\n";
-        let p = layers(SYS, "")
-            .import_preview(text, ImportMode::Merge)
-            .unwrap();
+        let mut l = layers(SYS, "");
+        let p = l.import_apply(text, ImportMode::Merge).unwrap();
         assert!(
             p.fallbacks.iter().any(|f| f.contains("bogus")),
             "{:?}",
             p.fallbacks
         );
+        let row = user_row(&l, Section::Apps, "A.exe").unwrap();
+        assert!(
+            row.get("first_show_mode").is_none(),
+            "无效值不得落盘: {row:?}"
+        );
+        assert_eq!(row["auto_pair"], json!(true), "同一条里的有效字段照常导入");
+    }
+
+    #[test]
+    fn import_rejects_invalid_process_names_and_reports_them() {
+        let mut l = layers(SYS, "");
+        let p = l.import_apply("[[apps]]\nprocess = \" a/b.exe \"\nauto_pair = true\n\n[[apps]]\nprocess = \"ok.exe\"\nauto_pair = true\n", ImportMode::Merge).unwrap();
+        assert_eq!(p.rejected.len(), 1, "{:?}", p.rejected);
+        assert!(l.user.apps.iter().all(|r| !process_of(r).contains('/')));
+        assert!(l.view_of(Section::Apps, "ok.exe").is_some());
     }
 
     #[test]
@@ -1771,6 +1810,20 @@ composition_start_pair_guard = true
             .import_preview("[[apps\nprocess=", ImportMode::Merge)
             .unwrap_err();
         assert!(err.contains("line"), "应带行号: {err}");
+    }
+
+    #[test]
+    fn importing_the_same_content_twice_is_idempotent() {
+        let text = "[[apps]]\nprocess = \"Weixin.exe\"\nauto_pair = true\n";
+        let mut l = layers(SYS, "");
+        assert_eq!(
+            l.import_apply(text, ImportMode::Merge).unwrap().items[0].action,
+            "override"
+        );
+        assert_eq!(
+            l.import_apply(text, ImportMode::Merge).unwrap().items[0].action,
+            "unchanged"
+        );
     }
 
     // ───────────── RPC ─────────────
@@ -2019,83 +2072,9 @@ composition_start_pair_guard = true
 
     // ───────────── 独立审查（2026-09-29）提出的回归 ─────────────
 
-    /// M1：对协议字段写 null，不得留下「视图显示系统、文件里却躺着空壳」的隐形条目。
-    /// 空壳会把以后出厂新增的修复整条挡掉（`update_user_rule` 文档里记过同款事故）。
+    /// data_custom 层禁用的规则：视图与运行时一致（运行时没有它），且可以在用户层重新启用。
     #[test]
-    fn null_on_protocol_field_leaves_no_ghost_entry() {
-        let mut l = layers(SYS, "");
-        l.upsert(
-            Section::Apps,
-            "Feishu.exe",
-            &patch(json!({"composition_start_pair_guard": null})),
-        )
-        .unwrap();
-        assert!(
-            l.user.apps.is_empty(),
-            "协议字段置 null 后与系统一致，不应留用户条目: {:?}",
-            l.user.apps
-        );
-        assert_eq!(state_of(&l, "Feishu.exe"), RuleState::System);
-    }
-
-    /// M1 的反方向：显式关闭协议字段（Some(false)）必须留得住，运行时读到的是 false。
-    #[test]
-    fn explicit_false_on_protocol_field_is_kept_and_wins_at_runtime() {
-        let mut l = layers(SYS, "");
-        l.upsert(
-            Section::Apps,
-            "Feishu.exe",
-            &patch(json!({"composition_start_pair_guard": false})),
-        )
-        .unwrap();
-        assert_eq!(l.user.apps.len(), 1, "显式关闭不能被当成冗余删掉");
-        assert_eq!(l.user.apps[0].composition_start_pair_guard, Some(false));
-        assert_eq!(state_of(&l, "Feishu.exe"), RuleState::Modified);
-    }
-
-    /// M2：导入稀疏片段不得让出厂规则里的其它字段静默丢失。
-    #[test]
-    fn import_sparse_snippet_keeps_the_system_fields() {
-        let sys =
-            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\nstale_probe_guard = true\n";
-        let mut l = layers(sys, "");
-        l.import_apply(
-            "[[apps]]\nprocess = \"weixin.exe\"\nfirst_show_mode = \"wait\"\n",
-            ImportMode::Merge,
-        )
-        .unwrap();
-        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
-        assert_eq!(v.effective["caret_use_top"], json!(true), "出厂修复不能丢");
-        assert_eq!(
-            v.effective["stale_probe_guard"],
-            json!(true),
-            "出厂修复不能丢"
-        );
-        assert_eq!(v.effective["first_show_mode"], json!("wait"));
-    }
-
-    /// M2：导入片段里显式写 false 必须能覆盖出厂的 true（不能因为 false 被序列化省略而丢）。
-    #[test]
-    fn import_explicit_false_overrides_a_system_true() {
-        let sys = "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\n";
-        let mut l = layers(sys, "");
-        l.import_apply(
-            "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = false\n",
-            ImportMode::Merge,
-        )
-        .unwrap();
-        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
-        assert_eq!(v.state, RuleState::Modified);
-        assert!(
-            v.effective.get("caret_use_top").is_none(),
-            "false 应生效: {:?}",
-            v.effective
-        );
-    }
-
-    /// S1：data_custom 层禁用的规则，视图里不得再显示成「生效」（运行时它确实没有）。
-    #[test]
-    fn rule_disabled_in_custom_layer_is_absent_in_view_and_at_runtime() {
+    fn rule_disabled_in_custom_layer_is_disabled_in_view_and_at_runtime() {
         let (d, c) = (tmp("cust_d"), tmp("cust_c"));
         for dir in [&d, &c] {
             let _ = std::fs::remove_dir_all(dir);
@@ -2107,36 +2086,31 @@ composition_start_pair_guard = true
             "[[apps]]\nprocess = \"Weixin.exe\"\ndisabled = true\n",
         )
         .unwrap();
-        let l = Layers::load(Some(&d), Some(&c), None).unwrap();
-        assert!(
-            l.view_of(Section::Apps, "Weixin.exe").is_none(),
-            "视图与运行时必须一致"
+        let mut l = Layers::load(Some(&d), Some(&c), None).unwrap();
+        assert_eq!(
+            state_of(&l, "Weixin.exe"),
+            RuleState::Disabled,
+            "视图必须反映它被禁用"
         );
-        let rt = crate::app_compat::AppCompat::load_layered(Some(&d), Some(&c), None);
-        assert!(rt.get_rule("Weixin.exe").is_none());
+        assert!(
+            crate::app_compat::AppCompat::load_layered(Some(&d), Some(&c), None)
+                .get_rule("Weixin.exe")
+                .is_none(),
+            "运行时确实没有它"
+        );
+        l.set_disabled(Section::Apps, "Weixin.exe", false).unwrap();
+        assert_eq!(
+            state_of(&l, "Weixin.exe"),
+            RuleState::Modified,
+            "用户层显式 disabled = false 重新启用"
+        );
+        assert!(
+            user_row(&l, Section::Apps, "Weixin.exe")
+                .unwrap()
+                .get("disabled")
+                == Some(&json!(false))
+        );
         cleanup(&d, &c);
-    }
-
-    /// S2：错值必须被拒绝，而不是被容错反序列化吞成「跟随全局」后假装成功。
-    #[test]
-    fn patch_rejects_typos_wrong_types_and_empty_enum() {
-        let bad = [
-            json!({"caret_use_tpo": false}),
-            json!({"auto_pair": 0}),
-            json!({"caret_use_top": "yes"}),
-            json!({"first_show_mode": ""}),
-            json!({"first_show_mode": 0}),
-            json!({"caret_offset_x": "12"}),
-        ];
-        for p in bad {
-            let mut l = layers(SYS, "");
-            assert!(
-                l.upsert(Section::Apps, "Weixin.exe", &patch(p.clone()))
-                    .is_err(),
-                "补丁 {p} 应被拒绝"
-            );
-            assert!(l.user.apps.is_empty(), "被拒绝的补丁不得落任何东西: {p}");
-        }
     }
 
     /// S2 的反方向：运行时接受的写法（别名、带空白）不得被误拒。
@@ -2157,36 +2131,6 @@ composition_start_pair_guard = true
         .expect("带空白的方案 id 运行时会 trim，应接受");
     }
 
-    /// S3：补丁不能碰 disabled / comment（disabled 走 setDisabled；只改 comment 会被冗余判定丢掉）。
-    #[test]
-    fn patch_rejects_meta_keys() {
-        for p in [json!({"disabled": true}), json!({"comment": "x"})] {
-            let mut l = layers(SYS, "");
-            assert!(
-                l.upsert(Section::Apps, "Weixin.exe", &patch(p.clone()))
-                    .is_err(),
-                "{p}"
-            );
-        }
-    }
-
-    /// S4：导入的进程名同样要校验；非法名字不得落盘。
-    #[test]
-    fn import_skips_invalid_process_names() {
-        let mut l = layers(SYS, "");
-        l.import_apply(
-            "[[apps]]\nprocess = \" a/b.exe \"\nauto_pair = true\n\n[[apps]]\nprocess = \"ok.exe\"\nauto_pair = true\n",
-            ImportMode::Merge,
-        )
-        .unwrap();
-        assert!(
-            l.user.apps.iter().all(|r| !r.process.contains('/')),
-            "{:?}",
-            l.user.apps
-        );
-        assert!(l.view_of(Section::Apps, "ok.exe").is_some());
-    }
-
     /// S4：replace 模式的预览要让用户看到「哪些会被删掉」。
     #[test]
     fn replace_preview_lists_entries_that_will_be_removed() {
@@ -2204,13 +2148,6 @@ composition_start_pair_guard = true
             "{:?}",
             p.items
         );
-    }
-
-    /// S4：已存的名字带空白时，reset 也要能删掉它（两边都 trim）。
-    #[test]
-    fn reset_finds_entries_stored_with_padding() {
-        let mut l = layers(SYS, "[[apps]]\nprocess = \" x.exe \"\nauto_pair = true\n");
-        assert!(l.reset(Section::Apps, "x.exe"));
     }
 
     /// S5：用户层语法坏了，界面仍要有恢复手段：resetAll 与 replace 导入不依赖解析用户层。
@@ -2292,44 +2229,6 @@ composition_start_pair_guard = true
         cleanup(&d, &u);
     }
 
-    /// M3：右键菜单的写入路径遇到损坏的用户层时，可以重建，但必须先把原文件留一份。
-    #[test]
-    fn menu_write_on_broken_file_keeps_a_copy_of_the_original() {
-        let dir = tmp("menu_bad");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let broken = "[[apps\nprocess=";
-        std::fs::write(dir.join(COMPAT_FILE_NAME), broken).unwrap();
-        crate::app_compat::set_user_first_show_mode(
-            &dir,
-            "a.exe",
-            Some(crate::app_compat::FirstShowMode::Wait),
-        )
-        .unwrap();
-        let kept = std::fs::read_to_string(dir.join(format!("{COMPAT_FILE_NAME}.bad")))
-            .expect("损坏的原文件应被留作 .bad");
-        assert_eq!(kept, broken);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 可选 4：classes 只改大小写 / 顺序，运行时等价，不应算「已修改」。
-    #[test]
-    fn classes_differing_only_in_case_or_order_are_not_a_modification() {
-        let sys = "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"Progman\", \"WorkerW\"]\n";
-        let mut l = layers(sys, "");
-        l.upsert(
-            Section::InitialModeScope,
-            "explorer.exe",
-            &patch(json!({"classes": ["workerw", "progman"]})),
-        )
-        .unwrap();
-        assert!(
-            l.user.initial_mode_scope.is_empty(),
-            "{:?}",
-            l.user.initial_mode_scope
-        );
-    }
-
     /// 可选 7：`reset` 什么也没删时不该报告写入（否则白白写盘、重载、广播）。
     #[test]
     fn reset_of_nonexistent_user_entry_reports_no_write() {
@@ -2373,55 +2272,6 @@ composition_start_pair_guard = true
             "最新一份应是最后一次导入前的内容: {newest}"
         );
         cleanup(&d, &u);
-    }
-
-    /// S10：视图要能让界面判断「用户层有没有这一条」「禁用前用户改过什么」。
-    #[test]
-    fn view_exposes_whether_a_user_entry_exists_and_its_raw_content() {
-        let mut l = layers(SYS, "");
-        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
-        assert!(!v.has_user_entry);
-        assert!(v.user.is_none());
-
-        l.upsert(
-            Section::Apps,
-            "Weixin.exe",
-            &patch(json!({"auto_pair": true})),
-        )
-        .unwrap();
-        l.set_disabled(Section::Apps, "Weixin.exe", true).unwrap();
-        let v = l.view_of(Section::Apps, "Weixin.exe").unwrap();
-        assert_eq!(v.state, RuleState::Disabled);
-        assert!(v.has_user_entry);
-        let user = v.user.expect("禁用状态下要能看到用户层原始条目");
-        assert_eq!(user["auto_pair"], json!(true), "禁用前的改写要可见");
-        assert_eq!(user["disabled"], json!(true));
-    }
-
-    /// 导入里字段类型错的规则整条拒绝并报出来，而不是悄悄丢或写坏。
-    #[test]
-    fn import_reports_rejected_rules() {
-        let text = "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = \"CabinetWClass\"\n\n[[apps]]\nprocess = \" a/b.exe \"\nauto_pair = true\n";
-        let p = layers(SYS, "")
-            .import_preview(text, ImportMode::Merge)
-            .unwrap();
-        assert_eq!(p.rejected.len(), 2, "{:?}", p.rejected);
-        assert!(
-            p.items.is_empty(),
-            "被拒绝的不应出现在动作清单里: {:?}",
-            p.items
-        );
-    }
-
-    /// 导入同一份内容第二次应当全是「无变化」（幂等），不能每次都报「覆盖」。
-    #[test]
-    fn importing_the_same_content_twice_is_idempotent() {
-        let text = "[[apps]]\nprocess = \"Weixin.exe\"\nauto_pair = true\n";
-        let mut l = layers(SYS, "");
-        let first = l.import_apply(text, ImportMode::Merge).unwrap();
-        assert_eq!(first.items[0].action, "override");
-        let second = l.import_apply(text, ImportMode::Merge).unwrap();
-        assert_eq!(second.items[0].action, "unchanged", "{:?}", second.items);
     }
 
     /// dryRun 传了非布尔值必须报错，不能悄悄当成 false 而真的写入。

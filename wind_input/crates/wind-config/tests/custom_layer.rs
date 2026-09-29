@@ -251,8 +251,8 @@ caret_use_top = true
         "定制层须覆盖 data 层的同名进程"
     );
     assert!(
-        !b.host_render,
-        "同名进程是**整条覆盖**：定制层没写 host_render 就该是 false，不做字段级合并"
+        b.host_render,
+        "同名进程逐字段叠加：定制层没写 host_render 就继承 data 层的值，不是整条覆盖"
     );
     assert!(
         compat.get_rule("c.exe").unwrap().caret_use_top,

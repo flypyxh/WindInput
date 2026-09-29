@@ -480,8 +480,11 @@ mod tests {
             Some(&dir.join("data")),
             Some(dir.join("override")),
         );
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_schema(&mut rules, "code.exe", Some("zb".into()));
+        let rules = vec![wind_config::app_compat::AppCompatRule {
+            process: "code.exe".into(),
+            schema: Some("zb".into()),
+            ..Default::default()
+        }];
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
         (c, dir)
     }
@@ -681,9 +684,14 @@ mod tests {
     #[test]
     fn invalid_fixed_id_is_reported_once_per_process_and_id() {
         let (c, dir) = fixture("warn");
-        let mut rules = Vec::new();
-        wind_config::app_compat::set_schema(&mut rules, "code.exe", Some("gone".into()));
-        wind_config::app_compat::set_schema(&mut rules, "vim.exe", Some("gone".into()));
+        let rules = ["code.exe", "vim.exe"]
+            .into_iter()
+            .map(|p| wind_config::app_compat::AppCompatRule {
+                process: p.into(),
+                schema: Some("gone".into()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
         for _ in 0..3 {
             assert_eq!(

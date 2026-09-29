@@ -78,7 +78,7 @@ impl EventSink {
 
     /// 兼容规则变更事件（`compat.*` 写方法成功后）。设置端据此刷新列表。
     ///
-    /// ⚠ 只覆盖经 RPC 的写入：右键菜单的写入（`update_user_rule`）不经过 dispatch，**不会**
+    /// ⚠ 只覆盖经 RPC 的写入：右键菜单的写入（`update_user_raw`）不经过 dispatch，**不会**
     /// 广播。设置页要看到菜单的改动，需在窗口重新获得焦点时主动重新拉取一次 `compat.list`。
     pub fn emit_compat_changed(&self, data: Value) {
         self.broadcast("compat.changed", data);
