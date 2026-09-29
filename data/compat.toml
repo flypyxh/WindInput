@@ -158,8 +158,9 @@ composition_start_pair_guard = true
 
 [[apps]]
 process = "Feishu.exe"
-comment = "飞书 - 同上；实测越阈 170 次，最大跨度 1112px。另有连发两个 TSF_COMPOSITION 帧的变体"
+comment = "飞书 - 同上；实测越阈 170 次，最大跨度 1112px。另有连发两个 TSF_COMPOSITION 帧的变体。在线表格换单元格首键：probe/pre_reflow 帧带上一格的陈旧坐标，首显画在旧位置、约 80ms 后跳到新格（实测 dx≤852 dy≤540）"
 composition_start_pair_guard = true
+stale_probe_guard = true
 
 [[apps]]
 process = "SearchHost.exe"
