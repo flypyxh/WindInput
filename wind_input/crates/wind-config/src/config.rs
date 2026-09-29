@@ -6142,6 +6142,20 @@ pub struct UiCandidateConfig {
     /// fixed 下窗口不再随光标移动，也不再上翻（flip/swap_when_above 随之失去意义）。
     #[serde(default = "default_candidate_position_mode")]
     pub position_mode: String,
+    /// 候选窗相对光标的**用户偏移**（dp，X 正值向右，Y 正值恒为「远离光标」：下方定位向下推、
+    /// 上翻定位向上推），与主题 `window.position_offset` **相加**。0 = 不偏移。
+    /// 只在跟随光标时生效；固定位置与拖动是显式意图，不叠加。
+    #[serde(default)]
+    pub offset_x: i32,
+    #[serde(default)]
+    pub offset_y: i32,
+    /// 主题阴影覆盖："follow"（默认，用主题的）/ "off"（不画阴影）。
+    ///
+    /// 主题的阴影画在窗口位图里，窗口因此比内容大一圈透明边；个别宿主对这圈透明边不兼容时
+    /// 用 "off" 让窗口回到与内容等大。定位补偿由窗口扩边自动派生，随之归零，不需另调。
+    /// 主题自带的 `position_offset` 不受影响。仅作用于候选窗（macOS 用系统原生阴影，不经此项）。
+    #[serde(default = "default_candidate_shadow")]
+    pub shadow: String,
     /// 固定模式下的**内容左上**屏幕坐标（不含阴影扩边），仅 position_mode="fixed" 生效。
     /// 由用户拖动候选窗落盘，设置页刻意不暴露：手填绝对坐标既不直观又会与拖动互相覆盖
     /// （与 ui.status.custom_x/y 同一决策）。(0,0) 视作"尚未设定"，首次显示落到屏幕默认锚点。
@@ -6153,6 +6167,10 @@ pub struct UiCandidateConfig {
 
 fn default_preedit_display() -> String {
     "app_inline".to_string()
+}
+
+fn default_candidate_shadow() -> String {
+    "follow".to_string()
 }
 
 fn default_candidate_position_mode() -> String {
@@ -6268,6 +6286,9 @@ impl Default for UiCandidateConfig {
             pager_in_preedit: false,
             double_click_screenshot: false,
             position_mode: default_candidate_position_mode(),
+            offset_x: 0,
+            offset_y: 0,
+            shadow: default_candidate_shadow(),
             custom_x: 0,
             custom_y: 0,
         }

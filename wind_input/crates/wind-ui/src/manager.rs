@@ -1032,6 +1032,12 @@ impl UiManager {
                     UiCommand::SetCandidateSwapWhenAbove(swap) => {
                         candidate_window.set_swap_preedit_when_above(swap);
                     }
+                    UiCommand::SetCandidateOffset { x, y } => {
+                        candidate_window.set_user_offset(x, y);
+                    }
+                    UiCommand::SetCandidateShadow(on) => {
+                        candidate_window.set_theme_shadow(on);
+                    }
                     UiCommand::SetPagerInPreedit(on) => {
                         candidate_window.set_pager_in_preedit(on);
                     }

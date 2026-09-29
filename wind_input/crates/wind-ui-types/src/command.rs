@@ -192,6 +192,10 @@ pub enum UiCommand {
     SetCandidateFlipWhenAbove(bool),
     /// 候选窗在光标上方时交换编码栏与候选栏位置。来自 ui.candidate.swap_preedit_when_above。
     SetCandidateSwapWhenAbove(bool),
+    /// 候选窗用户偏移（dp，与主题 position_offset 相加）。来自 ui.candidate.offset_x / offset_y。
+    SetCandidateOffset { x: i32, y: i32 },
+    /// 候选窗是否画主题阴影（false=覆盖为无阴影）。来自 ui.candidate.shadow（"off"→false）。
+    SetCandidateShadow(bool),
     /// 翻页栏并入编码所在行右对齐显示（独立编码栏 / 内联编码两种落点）。来自 ui.candidate.pager_in_preedit。
     SetPagerInPreedit(bool),
     /// 翻页栏显示覆盖（""跟随主题/"hide"/"auto"/"always"）。来自 ui.candidate.pager_bar_display。

@@ -206,6 +206,8 @@ impl Forwarder {
                 | UiCommand::SetCandidateFlipWhenAbove(_)
                 | UiCommand::SetCandidateSwapWhenAbove(_)
                 | UiCommand::SetPagerInPreedit(_)
+                | UiCommand::SetCandidateOffset { .. }
+                | UiCommand::SetCandidateShadow(_)
                 | UiCommand::SetPagerDisplay { .. }
                 | UiCommand::SetPageNumberDisplay { .. }
         )
@@ -420,6 +422,8 @@ impl Forwarder {
             UiCommand::SetTooltipDelay(d) => self.win.set_tooltip_delay(d),
             UiCommand::SetCandidateFlipWhenAbove(v) => self.win.set_flip_when_above(v),
             UiCommand::SetCandidateSwapWhenAbove(v) => self.win.set_swap_preedit_when_above(v),
+            UiCommand::SetCandidateOffset { x, y } => self.win.set_user_offset(x, y),
+            UiCommand::SetCandidateShadow(on) => self.win.set_theme_shadow(on),
             UiCommand::SetPagerInPreedit(v) => self.win.set_pager_in_preedit(v),
             UiCommand::SetPagerDisplay { h, v } => self.win.set_pager_display(h, v),
             UiCommand::SetPageNumberDisplay { h, v } => self.win.set_page_number_display(h, v),

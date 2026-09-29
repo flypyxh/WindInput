@@ -62,6 +62,19 @@ fn apply_user_font(views: &mut wind_theme::RvViews, user_family: &str) {
     }
 }
 
+/// 用户覆盖为无阴影：清掉窗口阴影的全部字段。`shadow_params` 因此得 None、`margins()` 为 0，
+/// 窗口与内容等大，`window.show(px - ml, py - mt)` 的扩边补偿自然归零。
+/// 主题的 `window_offset_*`（position_offset）刻意保留——它补偿的是发光边等装饰，与阴影无关。
+fn clear_window_shadow(views: &mut wind_theme::RvViews) {
+    views.shadow_offset_x = None;
+    views.shadow_offset_y = None;
+    views.shadow_blur = None;
+    views.shadow_spread = None;
+    views.shadow_spread_offset_x = None;
+    views.shadow_spread_offset_y = None;
+    views.shadow_color = None;
+}
+
 /// 方案级 `[candidate] font_family`（空 = 不覆盖）只作用于候选文字节点，理由见
 /// [`CandidateWindow::text_family_override`]。须在 [`apply_user_font`] 之后叠。
 fn apply_scheme_text_font(views: &mut wind_theme::RvViews, scheme_family: &str) {
@@ -433,6 +446,11 @@ pub struct CandidateWindow {
     /// 候选窗在光标上方时交换编码栏与候选栏位置（编码区整体沉底贴光标）。
     /// 与 flip_when_above 正交：可单独或叠加使用。来自 ui.candidate.swap_preedit_when_above。
     swap_preedit_when_above: bool,
+    /// 用户对候选窗位置的偏移（dp）。与主题 `window.position_offset` 相加，见 `position_offset_px`。
+    /// 来自 ui.candidate.offset_x / offset_y。
+    user_offset: (i32, i32),
+    /// 是否采用主题阴影（false = 用户覆盖为无阴影）。来自 ui.candidate.shadow。
+    theme_shadow: bool,
     /// 翻页栏并入编码栏行、右对齐显示（竖排省一行）。仅"非嵌入编码"（有独立编码栏）时生效。
     /// 来自 ui.candidate.pager_in_preedit。
     pager_in_preedit: bool,
@@ -529,6 +547,8 @@ impl CandidateWindow {
             pager_display: (String::new(), String::new()),
             page_number_display: (String::new(), String::new()),
             swap_preedit_when_above: false,
+            user_offset: (0, 0),
+            theme_shadow: true,
             pager_in_preedit: false,
             fixed_pos: None,
             min_window_width_horizontal: 0,
@@ -994,6 +1014,20 @@ impl CandidateWindow {
         self.flip_when_above = flip;
     }
 
+    /// 设置用户位置偏移（dp）。只影响下一次定位，不需重算主题。
+    pub fn set_user_offset(&mut self, x: i32, y: i32) {
+        self.user_offset = (x, y);
+    }
+
+    /// 设置是否采用主题阴影。生效主题由 [`Self::refresh_effective_theme`] 重算，
+    /// 窗口扩边、内容锚点随之自动变化。
+    pub fn set_theme_shadow(&mut self, on: bool) {
+        if self.theme_shadow != on {
+            self.theme_shadow = on;
+            self.refresh_effective_theme();
+        }
+    }
+
     /// 设置"上方时交换编码栏与候选栏位置"。来自 ui.candidate.swap_preedit_when_above。
     pub fn set_swap_preedit_when_above(&mut self, swap: bool) {
         self.swap_preedit_when_above = swap;
@@ -1236,6 +1270,9 @@ impl CandidateWindow {
     fn refresh_effective_theme(&mut self) {
         let mut t = self.theme_source.clone();
         apply_user_font(&mut t.views, &self.user_font_family);
+        if !self.theme_shadow {
+            clear_window_shadow(&mut t.views);
+        }
         // 存在性告警按**生效**字族查：被用户字体覆盖掉的主题字族不会被用到，报它缺字体
         // 只会误导。方案级覆盖在查完之后才叠上——它有自己的告警（来源名不同）。
         let declared = t.views.declared_font_families();
@@ -2321,7 +2358,7 @@ impl CandidateWindow {
         crate::theme_assets::rv_layers(&self.theme, layers, self.scale)
     }
 
-    /// 主题 `window.position_offset` → 设备像素 (x, y)。未配=(0,0)，与旧行为一致。
+    /// 主题 `window.position_offset` + 用户偏移 → 设备像素 (x, y)。都未配=(0,0)，与旧行为一致。
     ///
     /// 供边缘带装饰的主题拉开候选窗与光标的观感距离。**只喂给 place_window**——
     /// 固定位置与用户拖动是显式意图，再叠加会让窗口莫名偏离用户放的地方，
@@ -2331,7 +2368,12 @@ impl CandidateWindow {
         let px = |d: Option<wind_theme::schema::Dim>| {
             d.map(|x| x.resolve(self.scale, 0.0)).unwrap_or(0.0).round() as i32
         };
-        (px(v.window_offset_x), px(v.window_offset_y))
+        let (ux, uy) = self.user_offset;
+        let user = |d: i32| (d as f32 * self.scale).round() as i32;
+        (
+            px(v.window_offset_x) + user(ux),
+            px(v.window_offset_y) + user(uy),
+        )
     }
 
     /// RvGradient → 渲染用 ViewGradient（stop 颜色直通 [R,G,B,A]）。
@@ -8442,3 +8484,73 @@ mod comment_above_tests {
 // 渲染 golden 对拍（Linux mock 后端才有绘制调用记录）。见模块文档。
 #[cfg(all(test, not(windows), not(target_os = "macos")))]
 mod render_golden;
+
+/// 用户外观覆盖：阴影开关与位置偏移（ui.candidate.shadow / offset_x / offset_y）。
+///
+/// 只在 mock 后端下编译（要在无显示器的 host 上造出 `CandidateWindow`）。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
+mod user_shadow_offset_tests {
+    use super::*;
+    use wind_theme::schema::Dim;
+
+    fn win_with_shadow_theme() -> CandidateWindow {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.shadow_blur = Some(Dim::Dp(8.0));
+        theme.views.shadow_offset_y = Some(Dim::Dp(4.0));
+        theme.views.shadow_color = Some([0, 0, 0, 96]);
+        theme.views.window_offset_x = Some(Dim::Dp(2.0));
+        theme.views.window_offset_y = Some(Dim::Dp(3.0));
+        w.set_theme(theme);
+        w
+    }
+
+    #[test]
+    fn shadow_follows_theme_by_default() {
+        let w = win_with_shadow_theme();
+        assert!(w.shadow_params().is_some());
+    }
+
+    /// 关掉阴影后扩边归零——窗口与内容等大，`show(px - ml, py - mt)` 的补偿随之为 0。
+    #[test]
+    fn turning_shadow_off_removes_the_margins() {
+        let mut w = win_with_shadow_theme();
+        assert_ne!(w.shadow_params().unwrap().margins(), (0, 0, 0, 0));
+        w.set_theme_shadow(false);
+        assert!(w.shadow_params().is_none());
+    }
+
+    #[test]
+    fn turning_shadow_back_on_restores_it_without_a_theme_reload() {
+        let mut w = win_with_shadow_theme();
+        w.set_theme_shadow(false);
+        w.set_theme_shadow(true);
+        assert!(w.shadow_params().is_some());
+    }
+
+    /// 主题的 position_offset 补偿的是发光边等装饰，与阴影无关，关阴影时必须保留。
+    #[test]
+    fn theme_position_offset_survives_shadow_off() {
+        let mut w = win_with_shadow_theme();
+        let before = w.position_offset_px();
+        w.set_theme_shadow(false);
+        assert_eq!(w.position_offset_px(), before);
+        assert_ne!(before, (0, 0));
+    }
+
+    #[test]
+    fn user_offset_adds_to_theme_offset() {
+        let mut w = win_with_shadow_theme();
+        let (tx, ty) = w.position_offset_px();
+        w.set_user_offset(5, -7);
+        let s = w.scale;
+        assert_eq!(
+            w.position_offset_px(),
+            (
+                tx + (5.0 * s).round() as i32,
+                ty + (-7.0 * s).round() as i32
+            )
+        );
+    }
+}

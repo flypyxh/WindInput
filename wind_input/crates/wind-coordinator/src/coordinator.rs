@@ -4740,6 +4740,14 @@ impl Coordinator {
         let _ = self
             .ui_tx
             .send(UiCommand::SetPagerInPreedit(cand.pager_in_preedit));
+        // 用户偏移 / 主题阴影覆盖（ui.candidate.offset_x/y、shadow）
+        let _ = self.ui_tx.send(UiCommand::SetCandidateOffset {
+            x: cand.offset_x,
+            y: cand.offset_y,
+        });
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetCandidateShadow(cand.shadow != "off"));
         // 候选窗尺寸下限（ui.candidate.min_window_width_* / min_window_height_* / min_rows，抗抖动）
         let _ = self.ui_tx.send(UiCommand::SetCandidateMinSize {
             width_horizontal: cand.min_window_width_horizontal,
