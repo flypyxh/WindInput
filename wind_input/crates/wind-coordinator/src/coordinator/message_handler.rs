@@ -1630,6 +1630,13 @@ impl MessageHandler for Coordinator {
                 // 上移之后这条顺序仍然成立（夺取在 match 前，更早）。
                 //
                 // 默认码元集 a-z 下本判定恒不命中，与历史逐键等价（零回归）。
+                //
+                // 字母通配键（spec §3.3）：本处已晚于 `try_activate_mode` 与 z 夺取（顺序铁律）。
+                // 放在码元判定之前：五笔配 `a-y` 时 `z` 不是码元，但组码中仍要能作通配。
+                // 让位时落回下面的码元判定，与关闭通配时逐键相同。
+                if self.wildcard_enters(&state, ch) {
+                    return self.accumulate_code_char(&mut state, ch, raw);
+                }
                 if !self.can_enter_buffer(&state, ch) {
                     return self.reject_non_code_char(&mut state, raw);
                 }

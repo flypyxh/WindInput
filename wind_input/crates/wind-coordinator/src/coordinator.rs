@@ -2762,6 +2762,8 @@ impl Coordinator {
         coordinator.notify_toolbar();
         // 码元集与按键功能的冲突体检（只告警）。默认字符集下直接返回，无开销。
         coordinator.warn_code_char_conflicts();
+        // 通配键与既有按键功能的冲突体检（只告警）。通配关闭时直接返回。
+        coordinator.warn_wildcard_conflicts();
         // 档位循环触发键的撞车体检（只告警）。出厂不配 ⇒ 默认直接返回。
         coordinator.warn_english_case_cycle_conflict();
         coordinator.warn_sentence_cycle_conflict();
@@ -5257,6 +5259,11 @@ impl Coordinator {
         }
         // 缓冲恒存小写（与字母同域）；`ch` 作为原始形态进影子串。
         let lower = ch.to_ascii_lowercase();
+        // 符号通配键（spec §3.4）：在标点流水线之前截住，接线点与码元闸门同处。
+        // 让位时落回下面的码元判定，与关闭通配时逐键相同。
+        if self.wildcard_enters(state, lower) {
+            return Some(self.accumulate_code_char(state, lower, ch));
+        }
         if !self.can_enter_buffer(state, lower) {
             return None;
         }

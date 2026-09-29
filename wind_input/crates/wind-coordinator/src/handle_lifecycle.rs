@@ -86,7 +86,7 @@ impl Coordinator {
     ///
     /// z 键功能（`z_key_action`）刻意不算：它要过三重身份裁决，且字母键根本不产出标点，
     /// `punct_char` 那一关就已经把它挡在门外。
-    fn is_any_mode_trigger(&self, key_code: u32) -> bool {
+    pub(crate) fn is_any_mode_trigger(&self, key_code: u32) -> bool {
         self.is_temp_pinyin_trigger(key_code)
             || self.is_temp_english_trigger(key_code)
             || self.match_special_trigger(key_code).is_some()
