@@ -967,3 +967,47 @@ fn pure_wildcard_smart_filters_like_general() {
         assert_eq!(smart, general, "{keys}: 智能档的通配结果应与常用字档相同");
     }
 }
+
+const VK_NEXT: u32 = 0x22; // PageDown，出厂翻页键组 "pageupdown"
+
+/// 关掉末页放宽：翻页类用例只看扩容，末页多按一下的放宽会把被滤的字追加回来、把条数弄乱。
+fn no_relax(mut cfg: Config) -> Config {
+    cfg.input.scope_relax.page_end_key = false;
+    cfg
+}
+
+/// 往后翻，直到候选总数超过 `than`，或已在末页且不再有更多（此时不再按，免得触发放宽）。
+fn page_until_more_than(coord: &Coordinator, than: usize) -> usize {
+    for _ in 0..400 {
+        let n = coord.debug_candidate_count();
+        if n > than {
+            return n;
+        }
+        let (cur, _, total) = coord.debug_page_info();
+        if cur + 1 >= total && !coord.debug_has_more() {
+            return n;
+        }
+        press_vk(coord, VK_NEXT, false);
+    }
+    coord.debug_candidate_count()
+}
+
+/// ★ Review Focus 3：通配首批至多 100 条且 `has_more` 为真，翻到边界按 ×2 扩充。
+/// 旧实现码长 ≥ 3 首批上限 1000、引擎却至多回 100 ⇒ `has_more` 恒假，永不扩充。
+#[test]
+fn pure_wildcard_first_batch_is_100_and_expands() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(no_relax(wubi(true, "z")), Some(&data_dir()));
+    press(&coord, "azz");
+    let first = coord.debug_candidate_count();
+    assert!(first > 0 && first <= 100, "首批至多 100 条：{first}");
+    assert!(
+        coord.debug_has_more(),
+        "a?? 远超 100 条，首批应标记还有更多"
+    );
+    let grown = page_until_more_than(&coord, first);
+    assert!(grown > first, "翻到边界应扩充：{first} -> {grown}");
+}

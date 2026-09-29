@@ -2671,4 +2671,32 @@ mod tests {
         let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, ["甲"]);
     }
+
+    /// spec §11：混输下主码表通配按 `max_candidates` 查，不再被主码表内部的固定 100 截断。
+    #[test]
+    fn wildcard_primary_follows_max_candidates() {
+        let many: Vec<(String, String, i32)> = (0..150u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                (format!("q{c1}{c2}"), format!("字{i}"), 1)
+            })
+            .collect();
+        let refs: Vec<(&str, &str, i32)> = many
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = mixed_wc(&refs, vec![("qzz", "阿紫")]);
+        let r = e.convert_wildcard("qzz", &slot("q??"), 300).unwrap();
+        let ct = r
+            .candidates
+            .iter()
+            .filter(|c| c.source == CandidateSource::CodeTable)
+            .count();
+        assert_eq!(ct, 150, "主码表通配全部进来（旧实现截在 100）");
+        assert!(
+            r.candidates.iter().any(|c| c.text == "阿紫"),
+            "字面半边照常合并"
+        );
+    }
 }
