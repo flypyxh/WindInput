@@ -4,7 +4,7 @@
 > 「恰好一个码元」，候选显示完整编码，供不确定字根时查字/学码用。
 > **不做**专门的通配/反查模式（需要时另立设计）。
 >
-> **状态：P1–P4 已实施；§10（混输调度）已实施**（提交见 git log --grep 通配）。分期见 §6，实施计划见 `codetable-wildcard-plan.md`、`codetable-wildcard-mixed-plan.md`。
+> **状态：P1–P4、§10（混输调度）、§11（常用字过滤与翻页扩充）已实施**（提交见 git log --grep 通配）。分期见 §6，实施计划见 `codetable-wildcard-plan.md`、`codetable-wildcard-mixed-plan.md`、`codetable-wildcard-paging-plan.md`。
 > 2026-09-29 读码后修正 §3.1/§3.3/§4/§5 多处（见 §9），以本版为准。
 
 ---
@@ -253,6 +253,13 @@ wildcard_key = "z"
 - **2026-09-29 §10 实施后偏离**：无行为偏离。仅补两点实现细节：混输 `max_code_length` 仍为 0，
   通配码长走专门的 `wildcard_code_length`；用户短语在码长内、非首位带通配键时不显示
   （§3.1 / §10 实施澄清），已写入文档站说明。
+
+- **2026-09-29 §11 实施后偏离**：
+  - 首批 100 条**仅限纯码表**（`WILDCARD_INITIAL_LIMIT`）；混输维持原首批 300（控制者裁决，与契约 2 一致）。
+  - 新增 `clamp_candidate_view`：`expand_candidates` 重建后可见列表可能变短（智能档下同组常用字进来、
+    先前放行的生僻字被滤走），须把页码与高亮夹回范围，否则页起点越过列表末尾、渲染按页切片越界。
+    夹页只降不升，不算翻页（不动 `paged`）。契约 5「前页内容可能移位」的落地保护。
+  - 智能组键实为 `SmartGroup::Wildcard(source)`（按来源整份一组），非全局单组；通配只由码表入口置位，行为同契约 1。
 
 ---
 
