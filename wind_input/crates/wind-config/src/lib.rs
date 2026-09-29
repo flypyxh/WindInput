@@ -8,6 +8,7 @@ pub mod by_layout;
 pub mod change_hook;
 pub mod charset_def;
 pub mod code_charset;
+pub mod compat_admin;
 pub mod config;
 pub mod config_schema;
 pub mod dir_var;

@@ -1686,7 +1686,7 @@ impl AppCompat {
 }
 
 /// 解析单个 compat.toml；文件不存在或解析失败返回 None。
-fn load_file(path: &Path) -> Option<AppCompatFile> {
+pub(crate) fn load_file(path: &Path) -> Option<AppCompatFile> {
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str::<AppCompatFile>(&text).ok()
 }
@@ -1750,7 +1750,10 @@ impl ProtocolFields {
 /// 修复看起来部署了、实际从未生效，白测了一轮。
 /// ⇒ **新增任何「宿主协议级」字段，必须同时加进 [`ProtocolFields`]**，
 /// 元测试 `protocol_fields_cover_every_host_protocol_option` 会守住这条。
-fn merge_rules(base: Vec<AppCompatRule>, mut user: Vec<AppCompatRule>) -> Vec<AppCompatRule> {
+pub(crate) fn merge_rules(
+    base: Vec<AppCompatRule>,
+    mut user: Vec<AppCompatRule>,
+) -> Vec<AppCompatRule> {
     if user.is_empty() {
         return base;
     }
@@ -1780,7 +1783,7 @@ fn merge_rules(base: Vec<AppCompatRule>, mut user: Vec<AppCompatRule>) -> Vec<Ap
 /// 「整条覆盖」意味着用户想在内置清单上**增删一项**时要把整份 `classes` 抄一遍。
 /// 这是刻意与 `[[apps]]` 保持一致——两段用两套合并语义会更难解释，而系统层
 /// `data/compat.toml` 里已把内置值完整列出，抄一遍的成本很低。
-fn merge_mode_scope(
+pub(crate) fn merge_mode_scope(
     base: Vec<InitialModeScopeRule>,
     user: Vec<InitialModeScopeRule>,
 ) -> Vec<InitialModeScopeRule> {
@@ -1804,7 +1807,7 @@ fn merge_mode_scope(
 ///
 /// 本段每条只有一个有效字段（`style`），所以「整条覆盖」与「字段级合并」在这里恰好
 /// 同结果；保持与另外两段一致的语义，是为了不给用户第三套心智模型。
-fn merge_commit_newline(
+pub(crate) fn merge_commit_newline(
     base: Vec<CommitNewlineRule>,
     user: Vec<CommitNewlineRule>,
 ) -> Vec<CommitNewlineRule> {
