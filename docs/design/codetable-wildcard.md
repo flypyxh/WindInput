@@ -308,15 +308,18 @@ wildcard_key = "z"
 - 检索范围过滤（`input.filter_mode`，出厂 smart）本就作用于通配结果（协调器 `apply_filter`），但 smart 档
   按 `(来源, 码)` 分组：某码下有常用字才滤生僻字。通配结果散在几十个码上，许多码下只有生僻字，
   被当作「孤儿码位」放行。用户并未打出那个码，按码分组对通配没有意义。
-- 引擎 `search_pattern` 的 limit 写死 100 且先截断后过滤；首批 limit ≥ 300 而引擎至多回 100 条，
-  `has_more` 恒假，翻页永不扩充。
+- 引擎 `search_pattern` 的 limit 写死 100 且先截断后过滤。首批 limit 按码长为 100/300/1000（混输 300）：
+  ≥2 码时引擎至多回 100 条 < limit，`has_more` 恒假；1 码时 `has_more` 虽真，扩充后可见条数未增被旧判据
+  判为到底。两个原因叠加，翻页永不扩充。
 
 **契约**
-1. **过滤**：本串有通配位时，smart 档把全部通配码表结果视为**一组**（分组键用 pattern 而非 code）——
+1. **过滤**：本串有通配位时，smart 档把全部通配码表结果视为**一组**（一次构建只有一个 pattern，故以
+   `Candidate::is_wildcard` 归组，等价于按 pattern 分组）——
    只要有常用字，生僻字即被滤出；general 档照旧全滤。被滤的仍经现有「翻到末页放宽」
    （`input.scope_relax.page_end_key`）追加在末尾。非通配路径分组不变。
 2. **数量与扩充**：去掉写死的 100，引擎按协调器给的 `max_candidates` 查（硬上限 5000，与扩充上限对齐）；
-   通配首批 100 条，使 `has_more = engine_count >= limit` 自然成立；翻页沿用 `expand_candidates`
+   **纯码表**通配首批 100 条（首位通配时全表扫描代价最高），使 `has_more = engine_count >= limit` 自然成立；
+   **混输**维持原首批 300（pattern ≤ 4 码且首位字面、代价低，缩到 100 会让拼音保底只剩 20 席）；翻页沿用 `expand_candidates`
    （×2、整份重查）。混输下主码表通配与字面同拿 `max_candidates`，由 `merge_wildcard` 统一截断、拼音保底配额不变。
 3. **到底判据**：`expand_candidates` 由「可见条数未增」改判「引擎条数未增」——否则一批全是被滤生僻字时
    误判到底。此修正对所有引擎生效（通配只是更易撞上）。
