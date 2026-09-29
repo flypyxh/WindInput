@@ -190,17 +190,17 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   等长档取满后余额交给多起点分支限界（`bnb_collect`）；BTreeMap / redb 按首个通配前的字面
   前缀扫描后过滤；草稿层不参与；Composite 按 `(text, code)` 去重、`cmp_pattern` 等长优先。
 - **引擎**：`is_exact_code` 改判等长，`comment = code`，`should_commit` / `should_clear` 恒 false，
-  上限 `WILDCARD_RESULT_LIMIT = 100`。混输只代理主码表。
+  上限 `WILDCARD_RESULT_LIMIT = 100`。混输有拼音子引擎时通配关闭（`wildcard_key()` 为 `None`），
+  否则代理主码表。
 - **协调器**：`build_candidates` 通配时不查短语、跳过自动上屏复评 / 清空复核 / 短语自动上屏；
   `accumulate_code_char` 不顶字；通配键不算字面符号。另有三处随通配调整：
   - 显示层去重改按 `(text, code)`（同字不同码各留一条，学码用）；
   - 记账：`freq_code` 不变，主输入上屏点改用 `main_freq_code`，通配组码记候选的完整编码；
   - `short_code_yield`（出简让全）通配时整体跳过（让位与记录都不做）。
 - **overlay 门控**：临拼 / 快捷输入等 overlay 激活时 `wildcard_enters` 恒 false，不作通配。
-- **按键路由**：首位符号类通配键（如 `/`）须从 C++ 侧透传标点集里剔除，否则到不了 Rust。
-  `ConfigBundle` 的 `not_occupied` 减去 `SchemaKeyUnion::wildcard_keys`，其值来自
-  `EngineManager::installed_wildcard_keys(global)`（已安装且开启通配的码表方案的键并集），
-  取「即将生效」的配置重算，不读管理器旧副本。
+- **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位一律让位（照常出标点），故不动 C++
+  透传标点集；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与
+  `wildcard_pattern` 共用）。
 
 ## 4. 拼音引擎（PinyinEngine，全拼）
 
