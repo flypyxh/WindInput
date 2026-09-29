@@ -6372,14 +6372,28 @@ impl Coordinator {
                 // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
                 // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
                 // `ui.tooltip.sections`，塞了会与之重复。
-                let comment = self.comment_for(
-                    c,
-                    &comment_tpl,
-                    comment_max,
-                    &reverse,
-                    hint_source,
-                    &dict_schema,
-                );
+                // 上方注释条开关开：模板字面 `\n` 拆出上段（`comment_above`）。开关关走原路径，
+                // 不拆分、字面 `\n` 原样留在 `comment`，`comment_above` 恒空。
+                let (comment_above, comment) = if cand_cfg.comment_above {
+                    self.comment_parts_for(
+                        c,
+                        &comment_tpl,
+                        comment_max,
+                        &reverse,
+                        hint_source,
+                        &dict_schema,
+                    )
+                } else {
+                    let comment = self.comment_for(
+                        c,
+                        &comment_tpl,
+                        comment_max,
+                        &reverse,
+                        hint_source,
+                        &dict_schema,
+                    );
+                    (wind_ui_types::StyledText::new(), comment)
+                };
                 CandidateItem {
                     // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
                     // 检索范围放宽补进来的候选同理加标注（`input.scope_relax.prefix`），让用户
@@ -6399,7 +6413,7 @@ impl Coordinator {
                     },
                     tooltip,
                     comment,
-                    comment_above: Default::default(),
+                    comment_above,
                     no_index: hide_index,
                 }
             })
@@ -9540,6 +9554,42 @@ mod mode_comment_e2e_tests {
         c.ui.candidate.comment_template_vertical = "全局${code_hint}".into();
         c.ui.candidate.comment_template_horizontal = "全局${code_hint}".into();
         c
+    }
+
+    /// 上方注释条开关走到**发往 UI 的候选**上：开 ⇒ `comment_above` 拿到上段、`comment` 只剩下段；
+    /// 关 ⇒ 不拆分，字面 `\n` 原样留在 `comment`，`comment_above` 为空。
+    #[test]
+    fn comment_above_switch_reaches_ui() {
+        let run = |on: bool| {
+            let mut cfg = Config::default();
+            cfg.ui.candidate.comment_template_vertical = "上${code_hint}\n下${code_hint}".into();
+            cfg.ui.candidate.comment_template_horizontal = "上${code_hint}\n下${code_hint}".into();
+            cfg.ui.candidate.comment_above = on;
+            let (c, rx) = coord_with_ui(cfg);
+            emit(&c, None);
+            let mut found = None;
+            while let Ok(cmd) = rx.try_recv() {
+                if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                    found = candidates.first().map(|c| {
+                        (
+                            c.comment_above.as_str().to_string(),
+                            c.comment.as_str().to_string(),
+                        )
+                    });
+                }
+            }
+            found.expect("应下发候选")
+        };
+        assert_eq!(
+            run(true),
+            ("上码".to_string(), "下码".to_string()),
+            "开关开：上段进 comment_above"
+        );
+        assert_eq!(
+            run(false),
+            (String::new(), "上码\n下码".to_string()),
+            "开关关：不拆分，与改动前逐字节一致"
+        );
     }
 
     #[test]
