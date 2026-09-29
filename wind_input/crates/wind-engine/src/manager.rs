@@ -465,6 +465,9 @@ pub struct EngineManager {
     /// `reload_from_config` 时清。任一方案失效都**整表清**——`schema:` 来源会引用别的方案，
     /// 按 id 局部清会漏掉引用方。进入引导键辅助码仍走不带缓存的 `aux_code_settings_of`。
     aux_settings_cache: Mutex<HashMap<String, AuxCodeSettings>>,
+    /// `aux_settings_cache` 的失效代次：每次清表（持锁）+1。未命中时先记代次再算，回填前
+    /// （同一把锁下）代次变了就不回填——否则「算到一半被清」的旧值会被插回去，一直留到下次失效。
+    aux_settings_gen: std::sync::atomic::AtomicU64,
     /// 方案引擎类型缓存（`schema_engine_type`）。**按 id 缓存，reload/invalidate 时清**，
     /// 与 `freq_cache`/`name_cache` 同生命周期。
     ///
@@ -805,6 +808,7 @@ impl EngineManager {
             store,
             freq_cache: Mutex::new(HashMap::new()),
             aux_settings_cache: Mutex::new(HashMap::new()),
+            aux_settings_gen: std::sync::atomic::AtomicU64::new(0),
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             session_actions_cache: Mutex::new(HashMap::new()),
@@ -3323,10 +3327,7 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
-        self.aux_settings_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.invalidate_aux_settings_cache();
         self.schema_type_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3527,10 +3528,7 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.aux_settings_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.invalidate_aux_settings_cache();
         self.schema_type_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4483,12 +4481,41 @@ impl EngineManager {
         {
             return s.clone();
         }
+        let generation = self
+            .aux_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire);
         let s = self.aux_code_settings_of(&id);
-        self.aux_settings_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, s.clone());
+        self.cache_aux_settings(id, s.clone(), generation);
         s
+    }
+
+    /// 回填 `aux_settings_cache`：`generation` 是算之前记下的失效代次，期间被清过就丢弃。
+    /// 比对与插入在同一把锁下，与 [`Self::invalidate_aux_settings_cache`] 互斥。
+    fn cache_aux_settings(&self, id: String, s: AuxCodeSettings, generation: u64) -> bool {
+        let mut cache = self
+            .aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self
+            .aux_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            return false;
+        }
+        cache.insert(id, s);
+        true
+    }
+
+    /// 清 `aux_settings_cache` 并推进失效代次（持锁完成，见 `aux_settings_gen`）。
+    fn invalidate_aux_settings_cache(&self) {
+        let mut cache = self
+            .aux_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.clear();
+        self.aux_settings_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// 同 [`Self::aux_code_settings`]，但取**指定方案**。
@@ -7171,6 +7198,26 @@ mod tests {
     ///
     /// 码表段曾回落到拼音段（三级），已否决——设置页上那是两个独立控件，回落链会让用户
     /// 「把码表的留在 0、改了拼音的、发现码表跟着变」。回落链只在配置层不可见时是便利。
+    /// 辅助码设置缓存的回填竞态：未命中时先记代次再算，算的途中被清过（方案覆盖层写入 /
+    /// 重载），算出来的旧值不得回填。反向对照：代次没变时正常回填。
+    #[test]
+    fn aux_settings_cache_drops_stale_fill() {
+        let mgr = EngineManager::new(&Config::default(), None);
+        let cached = |m: &EngineManager| m.aux_settings_cache.lock().unwrap().contains_key("x");
+        let before = mgr
+            .aux_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        mgr.invalidate_aux_settings_cache();
+        assert!(!mgr.cache_aux_settings("x".into(), AuxCodeSettings::default(), before));
+        assert!(!cached(&mgr), "算之前记的代次已过期，不得回填");
+        let now = mgr
+            .aux_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(now, before, "清表推进代次");
+        assert!(mgr.cache_aux_settings("x".into(), AuxCodeSettings::default(), now));
+        assert!(cached(&mgr), "代次未变照常回填");
+    }
+
     #[test]
     fn half_life_falls_back_to_store_default_only() {
         let store_default = wind_store::freq::FreqProfile::default().half_life_hours;
