@@ -312,7 +312,7 @@ pub struct ViewNode {
 
     /// 文字角色色（分段着色，设计 text-span-colors.md §5）：角色名 → 颜色，值的写法同 `color`。
     /// `""` = 未设置（派生主题借此撤销 base 配的某个角色）。只有 `comment`（含 `selected` /
-    /// `hover`）与 `tooltip` 消费；角色名不校验——更新版本的主题在旧引擎上应静默忽略。
+    /// `hover`）、`comment_above` 与 `tooltip` 消费；角色名不校验——更新版本的主题在旧引擎上应静默忽略。
     #[serde(default)]
     pub roles: std::collections::HashMap<String, Ld>,
 
@@ -327,7 +327,8 @@ impl ViewNode {
     /// 取 `base` 的；**不碰 margin / padding**（`comment.margin.left` 是给右侧注释留的间距）。
     ///
     /// `roles` 按键回退：自己写了的键（含 `""` = 显式撤销）保留，`base` 独有的键补进来。
-    /// 状态 patch 递归回退：两边都有则逐字段合并，只有 base 有则整个取来。
+    /// 状态 patch 递归回退：两边都有则逐字段合并，只有 base 有则从空节点按同一口径回退——
+    /// 状态 patch 也只继承 字体 / 颜色 / roles / 子状态，不带 margin / padding / 背景 / 边框 / 图 / 渐变。
     pub fn inherit_from(&mut self, base: &ViewNode) {
         if self.font_family.is_none() {
             self.font_family = base.font_family.clone();
@@ -350,7 +351,11 @@ impl ViewNode {
         ] {
             match (own.as_mut(), from) {
                 (Some(o), Some(b)) => o.inherit_from(b),
-                (None, Some(b)) => *own = Some(b.clone()),
+                (None, Some(b)) => {
+                    let mut n = ViewNode::default();
+                    n.inherit_from(b);
+                    *own = Some(Box::new(n));
+                }
                 _ => {}
             }
         }

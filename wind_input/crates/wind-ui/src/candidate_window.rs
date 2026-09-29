@@ -3288,6 +3288,28 @@ impl CandidateWindow {
                 .pad(above_pad)
                 .margin(above_margin)
         };
+        // 横排里一行高的非 item 成员（翻页栏 / 模式徽标 / 内联编码）要补的上外边距 = 上方条外框高。
+        // 横排 list 是 Row.cross(Center)：它们原本相对两行高的 item 居中，会比主行高出半个上方条；
+        // 补上这一截后，其外框与 item 等高位移、内容恰好落在主行中线上。竖排它们各占一行，不受影响。
+        // 度量与 `above_ghost` 同源（字号 / 字重 / 字族 + 上下内外边距；边框不占布局尺寸）。
+        let above_lift = if has_above && !list_vertical {
+            self.text_renderer
+                .measure(
+                    " ",
+                    &Self::measure_style(
+                        above_fs,
+                        eff_weight(&v.comment_above, &v.item, false, false),
+                        above_family.as_deref(),
+                    ),
+                )
+                .height
+                + above_pad.t
+                + above_pad.b
+                + above_margin.t
+                + above_margin.b
+        } else {
+            0.0
+        };
         // 把已装好 [序号, 文字, 注释] 的 Row 型 item 改成 Column[上方条, 主行]：
         // item 自身的装饰（内外边距 / 圆角 / tag / 背景 / 边框 / 选中条）原样留在外层，包住两行。
         let stack_above = |mut item: View, above: View| {
@@ -3447,6 +3469,7 @@ impl CandidateWindow {
             } else {
                 Edges {
                     l: pe_left,
+                    t: above_lift,
                     r: 16.0 * s,
                     ..Edges::default()
                 }
@@ -3503,6 +3526,7 @@ impl CandidateWindow {
                 }
             } else {
                 Edges {
+                    t: above_lift,
                     r: trailing,
                     ..Edges::default()
                 }
@@ -3800,7 +3824,7 @@ impl CandidateWindow {
                         &text,
                     );
                     let base = col(v.comment_above.text_color, COMMENT_FALLBACK);
-                    View::leaf(
+                    let mut aleaf = View::leaf(
                         text.into_string(),
                         eff_text(&v.comment_above, base, is_sel, is_hover),
                     )
@@ -3812,7 +3836,22 @@ impl CandidateWindow {
                     .margin(Edges {
                         l: above_margin.l + indent,
                         ..above_margin
-                    })
+                    });
+                    // 装饰与右侧注释叶子同一套消费（底色 / 背景图 / 渐变 / 边框，含选中悬停态）。
+                    // 占位叶子不画这些：边框不占布局尺寸（`View::measure` 不计），不影响等高。
+                    if let Some(c) = eff_bg(&v.comment_above, is_sel, is_hover) {
+                        aleaf = aleaf.bg(c);
+                    }
+                    if let Some(vi) = self.rv_image(v.comment_above.bg_image.as_ref()) {
+                        aleaf = aleaf.bg_image(vi);
+                    }
+                    if let Some(g) = self.rv_gradient(v.comment_above.bg_gradient.as_ref()) {
+                        aleaf = aleaf.bg_gradient(g);
+                    }
+                    if let Some((bc, bw, br)) = eff_border(&v.comment_above, is_sel, is_hover) {
+                        aleaf = aleaf.border(bc, bw).radius(br);
+                    }
+                    aleaf
                 };
                 item = stack_above(item, above);
             }
@@ -3886,7 +3925,10 @@ impl CandidateWindow {
             if let (Some(band), Some(p)) = (preedit_band.take(), pager.take()) {
                 preedit_band = Some(band.child(p));
             }
-        } else if !list_vertical && let Some(p) = pager.take() {
+        } else if !list_vertical && let Some(mut p) = pager.take() {
+            if has_above {
+                p.margin.t += above_lift; // 与主行对齐，见 `above_lift`
+            }
             list = list.child(p);
         }
         // 竖排未并入的翻页栏：候选区独立行（与 list 同属候选区，随 swap 一起移动）。
@@ -8251,6 +8293,149 @@ mod comment_above_tests {
         let cmt = &main.children[2];
         assert_eq!(cmt.text.as_deref(), Some("nn"));
         assert!(cmt.color_runs.is_empty(), "右侧注释不该吃到上方条的角色色");
+    }
+
+    /// 纵向中线。
+    fn mid_y(v: &View) -> f32 {
+        let r = v.laid_rect();
+        r.y + r.h * 0.5
+    }
+
+    /// 横排：翻页栏、模式徽标、内联编码这些一行高的非 item 成员与候选**主行**对齐，而不是
+    /// 与两行高的整个 item 居中（那样会比主行高出半个上方条）。
+    #[test]
+    fn horizontal_single_line_members_align_with_main_row() {
+        // (preedit, 模式标记, 内联编码)：分别让徽标 / 内联编码落进候选行。
+        for (preedit, mode, embedded) in [("", "拼", false), ("nihao", "", true)] {
+            let mut w = mk(false, false, false, 0);
+            w.set_preedit_embedded(embedded);
+            w.update(
+                preedit,
+                preedit.len(),
+                mode,
+                vec![cand_above("好", "hǎo", "vb"), cand_above("浩", "", "")],
+                0,
+                -1,
+                1,
+                2,
+            );
+            let root = laid(&w);
+            let list = find_list(&root).unwrap();
+            let (_, main) = split_item(items(&root)[0]);
+            let want = mid_y(main);
+            let members: Vec<&View> = list.children.iter().filter(|c| c.tag < 0).collect();
+            assert!(
+                members.len() >= 2,
+                "应有翻页栏 + 徽标/内联编码：{}",
+                members.len()
+            );
+            for m in members {
+                assert!(
+                    (mid_y(m) - want).abs() <= 1.0,
+                    "非 item 成员中线 {} 应与主行中线 {want} 对齐（preedit={preedit:?} mode={mode:?}）：{:?}",
+                    mid_y(m),
+                    m.text
+                );
+            }
+        }
+    }
+
+    /// 点击上方条所在的区域命中该候选（上方条在 item 容器之内，命中区是整个 item）。
+    #[test]
+    fn click_on_above_line_hits_its_candidate() {
+        for vertical in [true, false] {
+            let root = laid(&win(
+                vertical,
+                vec![cand_above("好", "hǎo", ""), cand_above("号", "hào", "")],
+            ));
+            let mut hits = Vec::new();
+            root.collect_hits(&mut hits);
+            for item in items(&root) {
+                let (above, _) = split_item(item);
+                let r = above.laid_rect();
+                let (x, y) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+                let tag = hits
+                    .iter()
+                    .find(|(_, hr)| hr.contains(x, y))
+                    .map_or(-1, |(t, _)| *t);
+                assert_eq!(tag, item.tag, "vertical={vertical}：上方条应命中本候选");
+            }
+        }
+    }
+
+    /// `[comment_above.hover.roles]`：悬停态的角色色接到上方条。
+    #[test]
+    fn above_line_hover_role_color() {
+        const GREEN: [u8; 4] = [0, 0x80, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 0xFF, 255];
+        let mut w = mk(true, false, false, 0);
+        let ca = &mut w.theme.views.comment_above;
+        ca.roles.insert("pinyin".to_string(), GREEN);
+        let mut hov = wind_theme::RvNode::default();
+        hov.roles.insert("pinyin".to_string(), BLUE);
+        ca.hover = Some(Box::new(hov));
+        let mut c = cand_above("你", "", "");
+        let mut t = StyledText::new();
+        t.push(
+            "ni",
+            &SpanStyle {
+                role: Some("pinyin"),
+                ..Default::default()
+            },
+        );
+        c.comment_above = t;
+        let runs = |w: &mut CandidateWindow, hover: i32| {
+            w.update("", 0, "", vec![c.clone()], 9, hover, 1, 1);
+            let root = laid(w);
+            let (above, _) = split_item(items(&root)[0]);
+            above.color_runs.clone()
+        };
+        let rgba = |r: Vec<ColorRun>| r.iter().map(|r| r.rgba).collect::<Vec<_>>();
+        assert_eq!(rgba(runs(&mut w, -1)), vec![GREEN], "常态");
+        assert_eq!(rgba(runs(&mut w, 0)), vec![BLUE], "悬停");
+    }
+
+    /// `[comment_above]` 的背景 / 边框接到上方条叶子（含选中态），右侧注释不受影响；
+    /// 占位叶子不画装饰。
+    #[test]
+    fn above_line_consumes_background_and_border() {
+        const BG: [u8; 4] = [1, 2, 3, 255];
+        const SEL_BG: [u8; 4] = [4, 5, 6, 255];
+        const BORDER: [u8; 4] = [7, 8, 9, 255];
+        let mut w = mk(true, false, false, 0);
+        let ca = &mut w.theme.views.comment_above;
+        ca.bg_color = Some(BG);
+        ca.border_color = Some(BORDER);
+        ca.selected = Some(Box::new(wind_theme::RvNode {
+            bg_color: Some(SEL_BG),
+            ..Default::default()
+        }));
+        w.update(
+            "",
+            0,
+            "",
+            vec![
+                cand_above("好", "hǎo", "vb"),
+                cand_above("号", "hào", "kg"),
+                cand_above("浩", "", "hj"),
+            ],
+            0,
+            -1,
+            1,
+            1,
+        );
+        let root = laid(&w);
+        let its = items(&root);
+        let (sel_above, sel_main) = split_item(its[0]);
+        let (above, _) = split_item(its[1]);
+        let (ghost, _) = split_item(its[2]);
+        assert_eq!(sel_above.bg, Some(SEL_BG), "选中态取 selected patch 的底色");
+        assert_eq!(above.bg, Some(BG));
+        assert_eq!(above.border.map(|b| b.0), Some(BORDER));
+        assert_eq!(sel_main.children[2].bg, None, "右侧注释不吃上方条的底色");
+        assert_eq!(sel_main.children[2].border, None);
+        assert_eq!(ghost.bg, None, "占位叶子不画底色");
+        assert_eq!(ghost.border, None);
     }
 }
 

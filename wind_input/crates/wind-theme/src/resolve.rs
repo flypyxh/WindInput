@@ -1270,6 +1270,20 @@ border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
             let sel = a.selected.as_ref().expect("selected 回退 comment 的");
             assert_eq!(sel.text_color, Some(hex("#FFFFFF")));
             assert_eq!(sel.roles["code_rev"], hex("#FFE08A"));
+            // 状态 patch 同样只继承字体 / 颜色 / roles：comment.selected 的底色、边框不带过来。
+            let csel = c.selected.as_ref().unwrap();
+            assert_eq!(csel.bg_color, Some(hex("#334455")));
+            assert_eq!(csel.border_color, Some(hex("#556677")));
+            assert_eq!(sel.bg_color, None, "选中态底色不继承");
+            assert_eq!(sel.border_color, None, "选中态边框不继承");
+            // 继承来的字族：缺字体告警按字族名去重取第一个路径，须指向用户写了的 views.comment。
+            assert_eq!(a.font_family.as_deref(), Some("InheritFam"));
+            let declared = t.views.declared_font_families();
+            let first = declared.iter().find(|(_, f)| f == "InheritFam").unwrap();
+            assert_eq!(
+                first.0, "views.comment",
+                "告警不该指向没写过的 comment_above"
+            );
             assert!(c.margin.left.is_some() && c.padding.bottom.is_some());
             assert!(edges_unset(&a.margin), "margin 不继承");
             assert!(edges_unset(&a.padding), "padding 不继承");

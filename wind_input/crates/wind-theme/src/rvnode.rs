@@ -288,6 +288,9 @@ impl RvViews {
             ("views.index", &mut self.index),
             ("views.text", &mut self.text),
             ("views.comment", &mut self.comment),
+            // ⚠️ 必须排在 comment 之后：comment_above 的字族多半是从 comment 继承来的，缺字体告警
+            // （wind-ui `warn_missing_theme_families`）按字族名去重、取表里第一个路径，
+            // 这样告警指向用户真写了的 `views.comment`，而不是没写过的 `views.comment_above`。
             ("views.comment_above", &mut self.comment_above),
             ("views.accent_bar", &mut self.accent_bar),
             ("views.footer_bar", &mut self.footer_bar),

@@ -9,6 +9,7 @@ version = "1.0"
 [comment]
 font_size = -2
 font_weight = 300
+font_family = "InheritFam"
 color = { light = "#112233", dark = "#AABBCC" }
 margin = { left = 6 }
 padding = { left = 2, bottom = 1 }
@@ -19,6 +20,9 @@ code_rev = { light = "#C00000", dark = "#FF8080" }
 
 [comment.selected]
 color = "#FFFFFF"
+# 装饰不随状态 patch 继承到 comment_above（只继承字体 / 颜色 / roles）。
+background = "#334455"
+border = { color = "#556677" }
 
 [comment.selected.roles]
 code_rev = "#FFE08A"
