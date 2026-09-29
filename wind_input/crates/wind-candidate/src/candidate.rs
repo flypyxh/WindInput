@@ -435,6 +435,17 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_promoted_completion: bool,
+    /// 该候选是**直接辅助码**（双拼）的命中项：输入末 1～2 位被当作辅码，本条取自对前缀
+    /// 单独解码的结果、经字形筛选命中后并入主候选（`docs/design/aux-code-direct.md`）。
+    ///
+    /// 命中项的 `consumed_length` 已改成整串（上屏连辅码一起吃掉），`code` 仍是**前缀**的
+    /// 拼音码（调频记在前缀下）。本标记只服务**组码区**：高亮它时显示「前缀 + 空格 + 辅码」，
+    /// 让人看出末尾被当成了辅码（协调器 `effective_preedit_body`）。
+    ///
+    /// 不复用任何既有层级字段：它不参与排序（插入发生在全部排序之后），只是来源标记。
+    /// 协调器内部用，不推送 UI。
+    #[serde(skip)]
+    pub is_direct_aux: bool,
     /// 前缀补全比**输入自身表达的音节数**多出几个音节（`0` = 音节数恰好对齐 / 非补全候选）。
     ///
     /// 「输入自身表达的音节数」= 完整音节数 + (有尾部残码 ? 1 : 0)，即 `pinyin` 引擎里的
@@ -573,6 +584,7 @@ impl Default for Candidate {
             is_split_composed: false,
             is_draft: false,
             is_promoted_completion: false,
+            is_direct_aux: false,
             completion_extra_syllables: 0,
             consumed_length: 0,
             boundary: 0,
