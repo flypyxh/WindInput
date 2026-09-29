@@ -226,8 +226,8 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
                 .emit_config_changed(json!({ "reason": "reload" }));
             Ok(json!({ "ok": true }))
         }
-        // compat.*：转发到宿主；写方法成功后广播 compat.changed，
-        // 让设置页与右键菜单并存时互相看得见对方的改动。
+        // compat.*：转发到宿主；写方法成功后广播 compat.changed（右键菜单的写入不经这里，
+        // 不广播，设置页靠重获焦点时重新拉取兜底）。
         m if m.starts_with("compat.") => {
             let out = state.core.data_rpc(m, params)?;
             if compat_method_writes(m, params) {

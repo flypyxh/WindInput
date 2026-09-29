@@ -21,6 +21,9 @@ pub enum Kind {
     Bool,
     /// 三态：跟随全局 / 开 / 关。
     TriBool,
+    /// 宿主协议级三态：**出厂 / 开 / 关**。不写 = 继承系统层（出厂）的值，不是「跟随全局」，
+    /// 界面文案必须区分；「出厂」这一档不要送 `null` 过来，而是送系统值或走「还原」。
+    InheritBool,
     /// 枚举（未配 = 跟随全局 / 不干预）。
     Enum,
     /// 整数。
@@ -250,14 +253,11 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
         group: "status",
         label: "光标不可信时的气泡位置",
         summary: "拿不到可信的光标位置时，状态气泡放在上次位置、隐藏，或某个屏幕 / 窗口锚点。",
-        problem: "只在气泡定位方式为「跟随光标」时生效。避免软件刚获得焦点、光标还没报出来时，\
+        problem: "只在生效的气泡定位方式为「跟随光标」时起作用（该应用没设定位方式、由全局决定时同样适用，所以不做联动置灰）。避免软件刚获得焦点、光标还没报出来时，\
                   气泡出现在屏幕角落或上一个软件的位置。不设置则跟随全局设置。",
         hosts: &[],
         options: &STATUS_FALLBACK_POSITIONS,
-        depends_on: Some(Dep {
-            key: "status_position_mode",
-            value: "follow_caret",
-        }),
+        depends_on: None,
         protocol: false,
         advanced: true,
     },
@@ -372,7 +372,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "composition_start_pair_guard",
-        kind: Kind::TriBool,
+        kind: Kind::InheritBool,
         group: "host",
         label: "识别成对的组合帧",
         summary: "把连续两帧「组合起点」与「当前光标」识别为同一次布局采样。",
@@ -387,7 +387,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "pin_anchor_when_start_drifts",
-        kind: Kind::TriBool,
+        kind: Kind::InheritBool,
         group: "host",
         label: "起点漂移时钉住锚点",
         summary: "宿主报的组合起点跟着光标一起漂移时，把候选窗锚点钉在首帧位置。",
@@ -422,13 +422,13 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "ignore_host_ime_close",
-        kind: Kind::TriBool,
+        kind: Kind::InheritBool,
         group: "host",
         label: "忽略软件关闭输入法的请求",
         summary: "软件自己要求关闭输入法时忽略它（按住 Ctrl 的系统热键仍然放行）。",
-        problem: "部分 WinForms / WPF 软件在你点一下按钮后会把输入法整体关掉，你就被切成了英文，回到文本框还不一定恢复。\
+        problem: "部分 WinForms / WPF 编写的软件（如某些工具箱、游戏平台客户端）在你点一下按钮后会把输入法整体关掉，你就被切成了英文，回到文本框还不一定恢复。\
                   开启后忽略这类关闭请求。⚠ 不能全局启用：有的软件（如 gvim）依赖这个状态来保存和恢复。",
-        hosts: &["X60_Toolbox", "beanfun"],
+        hosts: &[],
         options: &[],
         depends_on: None,
         protocol: true,
@@ -437,7 +437,7 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         section: "apps",
         key: "host_drawn_candidates",
-        kind: Kind::TriBool,
+        kind: Kind::InheritBool,
         group: "host",
         label: "软件自绘候选窗",
         summary: "软件把候选串读走时，视为它在自己画候选窗，并收起本输入法的候选窗。",
@@ -474,8 +474,9 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
         group: "newline",
         label: "上屏换行形式",
         summary: "上屏文本里的换行用哪种字符表达：keep 原样、cr、lf、crlf。",
-        problem: "Word 内部以 CR 作为段落分隔符，直接送入 CRLF 会多出空行或断段。为这类软件指定换行形式后，\
-                  多行文本上屏的段落才正确。不设置则跟随全局设置。",
+        problem: "Word 这类富文本软件的文档里，段落分隔符就是 CR；直接送入 LF 它不认作换行，会在每个换行处显示成一段类似 Tab 的空白。\
+                  为这类软件指定 cr，多行文本上屏才会正确分段。VS Code、终端、浏览器输入框则是写什么存什么，\
+                  不要给它们转换，否则会悄悄改写你的数据。不设置则跟随全局设置。",
         hosts: &["WINWORD.EXE"],
         options: NEWLINE_STYLES,
         depends_on: None,
@@ -585,6 +586,21 @@ mod tests {
             proto, flagged,
             "元数据的 protocol 标记必须与 ProtocolFields 一致"
         );
+    }
+
+    /// 协议字段的三态语义是「出厂 / 开 / 关」，与「跟随全局 / 开 / 关」不同，必须用不同的
+    /// 控件类型表达，否则界面会把「继承出厂」显示成「跟随全局」。
+    #[test]
+    fn protocol_fields_use_the_inherit_kind_and_only_they_do() {
+        for f in COMPAT_FIELDS {
+            assert_eq!(
+                f.protocol,
+                f.kind == Kind::InheritBool,
+                "{}.{}：protocol 与 Kind::InheritBool 必须一一对应",
+                f.section,
+                f.key
+            );
+        }
     }
 
     #[test]
