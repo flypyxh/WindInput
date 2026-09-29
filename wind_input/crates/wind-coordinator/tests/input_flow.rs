@@ -436,6 +436,30 @@ fn test_overflow_number_key_commit_and_input() {
 }
 
 #[test]
+fn test_overflow_number_key_clear_and_input() {
+    if !has_schemas() {
+        return;
+    }
+    // overflow.number_key = "clear_and_input"：越界时清空输入，只上屏该数字，不顶高亮候选。
+    let mut cfg = config_with("wubi86");
+    cfg.keys.overflow.number_key = "clear_and_input".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let count = coord.debug_candidate_count();
+    if count == 0 || count >= 9 {
+        return;
+    }
+    let act = coord.handle_key_event(&key_event(0x39, EVENT_KEY_DOWN)); // 越界数字 9
+    match act {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "9", "clear_and_input 只应上屏数字，实际: {}", text)
+        }
+        other => panic!("clear_and_input 应 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(coord.debug_candidate_count(), 0, "输入应已清空");
+}
+
+#[test]
 fn test_numpad_direct_outputs_digit() {
     if !has_schemas() {
         return;

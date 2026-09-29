@@ -1089,6 +1089,29 @@ mod tests {
         assert!(!c.assoc_placeholder_orphaned.load(Ordering::Relaxed));
     }
 
+    /// 联想态下越界数字键：收掉联想、只出该数字，**与 `keys.overflow.number_key` 无关**
+    /// （论坛 t251）。三档都测：`ignore` 会吞键、`commit*` 会把联想首项顶上屏，都是错的。
+    #[test]
+    fn overflow_digit_exits_assoc_and_emits_only_the_digit() {
+        for behavior in ["ignore", "commit", "commit_and_input", "clear_and_input"] {
+            let c = coord_with(|cfg| cfg.keys.overflow.number_key = behavior.to_string());
+            assert!(enter(&c, "你好"), "{behavior}: 应进入联想态");
+            let act = {
+                let mut st = c.state.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(st.candidates.len() < 9, "前提：数字 9 必须越界");
+                c.handle_number_key_select(&mut st, 9)
+            };
+            match act {
+                KeyAction::InsertText { text, .. } => {
+                    assert_eq!(text, "9", "{behavior}: 只该出数字，不带联想首项")
+                }
+                other => panic!("{behavior}: 应 InsertText(\"9\")，实际: {other:?}"),
+            }
+            let st = c.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!st.assoc_active(), "{behavior}: 联想应已收掉");
+        }
+    }
+
     /// 孤儿在场时透传改判为「收组合 + 交还按键」——本修复的核心那一格。
     #[test]
     fn orphan_rewrites_passthrough_into_clear_then_pass() {

@@ -5149,6 +5149,7 @@ impl Default for KeysConfig {
 /// 候选无效按键策略（[keys.overflow]，对齐 Go OverflowConfig）。
 /// 每项取值："ignore"（吞键无效）/ "commit"（上屏当前高亮候选）/
 /// "commit_and_input"（上屏高亮候选 + 追加按键字符）。默认全 ignore。
+/// 仅 `number_key` 另有 "clear_and_input"（清空输入并上屏该数字，不顶高亮候选）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverflowConfig {
     /// 数字键超出当前页候选数量时

@@ -3703,11 +3703,23 @@ impl Coordinator {
     }
 
     /// 数字键超出当前页候选范围时的处理（对齐 Go handleOverflowNumberKey）。
-    /// 依 `input.overflow.number_key`：ignore 吞键 / commit 上屏高亮候选 /
-    /// commit_and_input 上屏高亮候选并追加数字字符。无候选或无有效高亮时一律吞键。
+    /// 依 `keys.overflow.number_key`：ignore 吞键 / commit 上屏高亮候选 /
+    /// commit_and_input 上屏高亮候选并追加数字字符 / clear_and_input 清空输入并上屏数字。
+    /// 无候选或无有效高亮时一律吞键；联想态例外，见函数体。
     pub(crate) fn handle_overflow_number_key(&self, state: &mut State, num: usize) -> KeyAction {
         if state.candidates.is_empty() {
             return KeyAction::Consumed;
+        }
+        // 联想态：没有「码」可言，`0` / 超出联想条数的数字键就是用户要打的数字。
+        // 收掉联想、只出该数字——**不看 `keys.overflow.number_key`**：`commit` / `commit_and_input`
+        // 会把输入法猜的首项一并顶上屏（论坛 t251：「只想上按下的那个键」），`ignore` 则让
+        // 联想窗吞键、数字打不出来。与联想态下标点键的处理同口径（见 `commit_highlight_then_char`）。
+        if state.assoc_active() {
+            self.exit_assoc(state, crate::handle_assoc::AssocExit::TopCommitKey);
+            self.notify_ui_hide();
+            let digit = self.overflow_digit_text(state, num);
+            self.record_commit(&digit, 0, -1, wind_store::stats::CommitSource::Punctuation);
+            return Self::commit_action(digit, true);
         }
         let hi = self.highlighted_global_index(state);
         if hi >= state.candidates.len() {
@@ -3720,21 +3732,35 @@ impl Coordinator {
                 self.commit_selected(state, &cand, state.selected_index as i32)
             }
             "commit_and_input" => {
-                // 小键盘恒半角：follow_main 下小键盘数字选词越界会落到这里，顶字之后
-                // 补的那个数字同样要跟着走半角。
-                let full_width = state.full_width && !self.numpad_raw_output(state);
                 let cand = state.candidates[hi].clone();
                 let act = self.commit_selected(state, &cand, state.selected_index as i32);
-                let digit = (b'0' + (num % 10) as u8) as char;
-                let digit = if full_width {
-                    wind_transform::fullwidth::to_full_width(&digit.to_string())
-                } else {
-                    digit.to_string()
-                };
+                let digit = self.overflow_digit_text(state, num);
                 Self::append_to_insert_text(act, &digit)
+            }
+            // 清空输入并上屏该数字：已打的码（含已转换前缀）与候选一并丢弃，不顶高亮候选。
+            "clear_and_input" => {
+                state.committed_text.clear();
+                state.committed_segs.clear();
+                state.input_buffer.clear();
+                state.candidates.clear();
+                self.notify_ui_hide();
+                let digit = self.overflow_digit_text(state, num);
+                self.record_commit(&digit, 0, -1, wind_store::stats::CommitSource::Punctuation);
+                Self::commit_action(digit, true)
             }
             // "ignore" 及未知值：吞键无效（保留组合，不上屏）
             _ => KeyAction::Consumed,
+        }
+    }
+
+    /// 数字键越界时要补出的那个数字（`num` 1-based，10 = `0`）。
+    /// 小键盘恒半角：follow_main 下小键盘数字选词越界会落到这里，补的数字同样要跟着走半角。
+    fn overflow_digit_text(&self, state: &State, num: usize) -> String {
+        let digit = (b'0' + (num % 10) as u8) as char;
+        if state.full_width && !self.numpad_raw_output(state) {
+            wind_transform::fullwidth::to_full_width(&digit.to_string())
+        } else {
+            digit.to_string()
         }
     }
 

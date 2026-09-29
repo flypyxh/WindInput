@@ -101,6 +101,11 @@ use FieldType::{Bool, Enum, Float, Int, LayoutEnum, Map, Str, StrList, StructLis
 /// 候选无效按键三策（number_key/select_key/select_char_key 共用）。
 const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 
+/// 数字键越界策略：三策之外多一档 `clear_and_input`（清空输入并上屏该数字，不顶高亮候选）。
+/// 只有数字键有这一档——次/三选键、以词定字键越界时那个字符本可作编码，不存在「丢码出字」的诉求。
+const NUMBER_OVERFLOW_VALUES: &[&str] =
+    &["ignore", "commit", "commit_and_input", "clear_and_input"];
+
 /// 空码（缓冲非空但无候选）时终结键怎么处置这串废码——**回车/空格两键**。
 /// **只有两态**：`commit` 上屏原码 / `clear` 丢弃。语义与实现见
 /// `docs/design/enter-behavior-clear-semantics.md`。
@@ -555,7 +560,7 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.page_keys", StrList),
     f("keys.highlight_keys", StrList),
     f("keys.select_char_keys", StrList),
-    f("keys.overflow.number_key", Enum(OVERFLOW_VALUES)),
+    f("keys.overflow.number_key", Enum(NUMBER_OVERFLOW_VALUES)),
     f("keys.overflow.select_key", Enum(OVERFLOW_VALUES)),
     f("keys.overflow.select_char_key", Enum(OVERFLOW_VALUES)),
     // -- ui（外观）--
