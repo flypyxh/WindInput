@@ -400,6 +400,21 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// 通配用的码长（spec §10）：协调器据此判「满码后通配键按字面」与混输「超码长整串字面」。
+    /// 默认即 [`Self::max_code_length`]；混输返回主码表的码长。
+    ///
+    /// ⚠️ 与 `max_code_length` 分开是有意的：混输的 `max_code_length` 刻意为 0，它还决定
+    /// 协调器的短语自动上屏门槛（`phrase_auto_commit_min_len`），代理过去会连带改变那条行为。
+    fn wildcard_code_length(&self) -> usize {
+        self.max_code_length()
+    }
+
+    /// 通配与拼音共用这串输入（五笔拼音混输且有拼音子引擎）。协调器据此把首位、整串超码长、
+    /// 拼音分段续转三种情形判为字面（spec §10）。
+    fn wildcard_mixes_pinyin(&self) -> bool {
+        false
+    }
+
     /// 候选排序是否**忽略权重**（`[engine.codetable].base_sort = "natural"`）：码表引擎在 natural
     /// 模式下返回 true。供协调器合并短语后按**同一维度**重排——否则协调器仍以 weight 优先，会与
     /// 引擎的 `candidate::by_natural`（纯 base_order→natural_order、忽略权重）发散。其余引擎默认
