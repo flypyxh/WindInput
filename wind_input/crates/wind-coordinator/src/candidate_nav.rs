@@ -66,6 +66,33 @@ impl Coordinator {
         self.clear_hover();
     }
 
+    /// 候选列表**原地重建**（不复位视图）后，把页码 / 页内高亮夹回新列表的范围内。
+    ///
+    /// 扩容（`expand_candidates`）保持当前页/高亮，但重建后的可见列表可能**变短**：智能档下
+    /// 一组先前只有生僻字（全部放行），新一批带来同组常用字后整组生僻字被滤走——通配结果
+    /// 是一整组时最容易撞上，按码分组的普通码表同样可能。不夹的话 `page_range` 的起点越过
+    /// 列表末尾，渲染按页切片当场越界。
+    ///
+    /// 夹页不是翻页：不动 `paged`（页码只降不升，见 `turn_page` 文档里「往下降」那段）。
+    /// 真夹了才清悬停——悬停下标指向的那一页已经不是屏幕上这页了。
+    pub(crate) fn clamp_candidate_view(&self, state: &mut State) {
+        let last_page = self.total_pages(state) - 1;
+        let mut changed = false;
+        if state.current_page > last_page {
+            state.current_page = last_page;
+            changed = true;
+        }
+        let (s, e) = self.page_range(state);
+        let max_sel = (e - s).saturating_sub(1);
+        if state.selected_index > max_sel {
+            state.selected_index = max_sel;
+            changed = true;
+        }
+        if changed {
+            self.clear_hover();
+        }
+    }
+
     /// 翻到第 `page` 页并记下「这批候选被翻过页」。
     ///
     /// 存在的理由只有一个：`current_page` 有五个写点（页内回卷两个、翻页键两个、

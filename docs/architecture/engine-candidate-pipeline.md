@@ -190,7 +190,9 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   等长档取满后余额交给多起点分支限界（`bnb_collect`）；BTreeMap / redb 按首个通配前的字面
   前缀扫描后过滤；草稿层不参与；Composite 按 `(text, code)` 去重、`cmp_pattern` 等长优先。
 - **引擎**：`is_exact_code` 改判等长，`comment = code`，`should_commit` / `should_clear` 恒 false，
-  上限 `WILDCARD_RESULT_LIMIT = 100`；结果带 `is_wildcard`，`source_tier` 把「通配 + 等长」放档 0。
+  按协调器给的 `max_candidates` 查，硬上限 `WILDCARD_RESULT_LIMIT` = `engine::CANDIDATE_LIMIT_CAP`
+  （5000，与翻页扩容上限同一常量；0 不下传 `search_pattern`）；结果带 `is_wildcard`，`source_tier`
+  把「通配 + 等长」放档 0。
   混输代理主码表的通配键；有拼音子引擎时 `MixedEngine::convert_wildcard` = 字面 `convert(input)`
   ⊕ 主码表通配，`merge_wildcard` 按「通配等长 → 字面 → 通配更长」合并、码表间 `(text, code)`
   去重、拼音 / 英文与码表同字即丢、带拼音保底截断。通配码长走 `Engine::wildcard_code_length`
@@ -203,6 +205,12 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   - 五笔拼音混输（`wildcard_mixes_pinyin`）另有三种整串字面：首位、整串超主码表码长
     （`wildcard_mixed_overflow`）、拼音分段续转（`wildcard_pattern_of`，与 `build_candidates`
     的续转判据同源 `last_seg_is_pinyin`；`build_candidates` 先判续转再判通配）。
+  - 条数与过滤（设计稿 §11）：**纯码表**有 pattern 时首批固定 `WILDCARD_INITIAL_LIMIT = 100`（不走码长
+    分级），**混输维持原首批 300**（缩到 100 会让拼音保底只剩 20 席）；翻到边界由 `expand_candidates`
+    ×2 扩充（上限 `CANDIDATE_LIMIT_CAP`）；检索范围智能档把全部 `is_wildcard` 候选当一组（§8.1）。
+    `expand_candidates` 的到底判据是**引擎条数未增**（`engine_count <= prev_limit`），对所有引擎生效
+    ——按可见条数判，一批全被滤掉时会误判到底；重建后可见列表可能变短，由 `clamp_candidate_view`
+    夹回页码与高亮。
 - **overlay 门控**：临拼 / 快捷输入等 overlay 激活时 `wildcard_enters` 恒 false，不作通配。
 - **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位一律让位（照常出标点），故不动 C++
   透传标点集；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与
@@ -837,6 +845,10 @@ step 2c（尾部残码参与整句解码）此前在混输下**整体关闭**（
 `wind-candidate/src/filter.rs`。`FilterMode`：`Gb18030`（不过滤）/ `General`（仅常用）/
 `Smart`（智能）。Smart 规则：**按 `(CandidateSource, code)` 分组**，同组内存在常用词
 （is_common/is_phrase/is_command/is_group）则滤掉非常用，无常用则整组保留。
+
+**通配例外**（设计稿 `codetable-wildcard.md` §11）：`is_wildcard` 候选按来源整份一组（私有键
+`SmartGroup::Wildcard`），不按码分——用户没打出那些码，按码分组会把只含生僻字的码位当孤儿
+放行。非通配候选的键仍是 `(source, code)`；通配候选也不往按码分组里写（含 `merged_codes`）。
 
 ⚠️ 这两档讲的都是**单字层**的裁剪口径。含生僻字的**多字候选**另有一根正交的轴
 `input.rare_phrase`（判据 `RarePhrasePolicy`，出厂 `keep` ＝ 整词放行），故签名是

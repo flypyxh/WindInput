@@ -14,6 +14,12 @@ pub enum EngineType {
     English,
 }
 
+/// 协调器向引擎要候选的**上限的上限**：翻页扩容（`expand_candidates`）翻倍到此为止，
+/// 码表通配的硬上限（`codetable::engine::WILDCARD_RESULT_LIMIT`）与之是同一个值
+/// （spec codetable-wildcard §11）。两处各写一个 5000 的话，改一处另一处静默失配：
+/// 扩容要 8000、引擎只回 5000 ⇒ `has_more` 恒假。
+pub const CANDIDATE_LIMIT_CAP: usize = 5000;
+
 /// 引擎转换结果
 #[derive(Debug, Clone, Default)]
 pub struct ConvertResult {

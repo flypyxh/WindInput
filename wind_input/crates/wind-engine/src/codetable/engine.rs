@@ -87,8 +87,10 @@ const SPLIT_SEGMENT_POOL: usize = 16;
 /// 不做成配置项的理由不变：多一个自由参数只会制造「配出来不报错、打起来全是错」的状态。
 const SPLIT_FRONT_LEN: usize = 2;
 
-/// 通配结果上限（spec §3.1：常量，不开放配置）。首位即通配会退化成全表扫描，靠它兜底。
-pub const WILDCARD_RESULT_LIMIT: usize = 100;
+/// 通配结果**硬上限**（spec §3.1 / §11：常量、不开放配置，与翻页扩容上限是同一个值）。
+/// 平常由协调器给的 `max_candidates` 决定条数（首批 100，翻页 ×2）；首位即通配退化成
+/// 全表扫描时靠它兜底。
+pub const WILDCARD_RESULT_LIMIT: usize = crate::engine::CANDIDATE_LIMIT_CAP;
 
 /// 逆切分的触发档（`[engine.codetable].split_trigger`）：满码长时「空到什么程度」才切分。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -911,14 +913,16 @@ impl Engine for CodeTableEngine {
         self.opts.wildcard?;
         let n = pattern.chars().count();
         let with_prefix = !self.opts.single_code_input;
-        let mut candidates: Vec<Candidate> = self
-            .dm
-            .search_pattern(
-                pattern,
-                wind_dict::WILDCARD_SLOT,
-                WILDCARD_RESULT_LIMIT,
-                with_prefix,
-            )
+        // 按协调器给的上限查（spec §11），硬上限兜底。⚠️ 永不向 `search_pattern` 传 0：
+        // Composite 把 0 当「不限」、各层把 0 当「空」，两边语义不一致。
+        let limit = max_candidates.min(WILDCARD_RESULT_LIMIT);
+        let hits = if limit == 0 {
+            Vec::new()
+        } else {
+            self.dm
+                .search_pattern(pattern, wind_dict::WILDCARD_SLOT, limit, with_prefix)
+        };
+        let mut candidates: Vec<Candidate> = hits
             .into_iter()
             .map(|mut c| {
                 c.source = CandidateSource::CodeTable;
@@ -930,7 +934,7 @@ impl Engine for CodeTableEngine {
             .collect();
         let base_cmp = self.opts.base_sort.cmp();
         candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
-        candidates.truncate(max_candidates.min(WILDCARD_RESULT_LIMIT));
+        candidates.truncate(limit);
         let is_empty = candidates.is_empty();
         Some(ConvertResult {
             candidates,
@@ -2469,9 +2473,9 @@ mod tests {
         );
     }
 
-    /// §3.1：精确匹配模式下不追加更长编码；上限常量 100。
+    /// §3.1 / §11：精确匹配模式下不追加更长编码；条数跟随 max_candidates（不再写死 100）。
     #[test]
-    fn wildcard_respects_single_code_input_and_result_cap() {
+    fn wildcard_respects_single_code_input_and_max_candidates() {
         let e = engine_opts(
             &[("ab", "甲", 10), ("abcd", "丙", 9999)],
             wildcard_opts(CommitOptions {
@@ -2500,9 +2504,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             r.candidates.len(),
-            WILDCARD_RESULT_LIMIT,
-            "结果上限是常量 100"
+            150,
+            "要 1000 给全部 150 条（旧实现截在 100）"
         );
+        let r = e
+            .convert_wildcard("qzz", &slot_pattern("q??"), 120)
+            .unwrap();
+        assert_eq!(r.candidates.len(), 120, "按协调器给的 max_candidates 截");
     }
 
     /// 关闭通配时引擎不接通配请求；`convert` 永远是字面语义（它还被当活码探针用）。
@@ -2533,5 +2541,32 @@ mod tests {
             lit.candidates.iter().all(|c| !c.is_wildcard),
             "字面结果不带通配标记"
         );
+    }
+
+    /// ★ Review Focus 4：通配硬上限与翻页扩容上限是**同一个**常量；`max_candidates = 0` 回空，
+    /// 且不把 0 传给 `search_pattern`（Composite 把 0 当不限、各层把 0 当空）。
+    #[test]
+    fn wildcard_hard_cap_matches_expansion_cap_and_zero_is_empty() {
+        assert_eq!(WILDCARD_RESULT_LIMIT, crate::engine::CANDIDATE_LIMIT_CAP);
+        let n = WILDCARD_RESULT_LIMIT + 100;
+        let many: Vec<(String, String, i32)> = (0..n as u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 676) as u8) as char;
+                let c2 = (b'a' + (i / 26 % 26) as u8) as char;
+                let c3 = (b'a' + (i % 26) as u8) as char;
+                (format!("{c1}{c2}{c3}"), format!("字{i}"), 1)
+            })
+            .collect();
+        let refs: Vec<(&str, &str, i32)> = many
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = engine_opts(&refs, wildcard_opts(CommitOptions::default()));
+        let r = e
+            .convert_wildcard("zzz", &slot_pattern("???"), usize::MAX)
+            .unwrap();
+        assert_eq!(r.candidates.len(), WILDCARD_RESULT_LIMIT, "硬上限兜底");
+        let r0 = e.convert_wildcard("zzz", &slot_pattern("???"), 0).unwrap();
+        assert!(r0.candidates.is_empty() && r0.is_empty, "max 0 ⇒ 空结果");
     }
 }

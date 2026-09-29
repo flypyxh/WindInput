@@ -16,6 +16,12 @@ use wind_candidate::{Candidate, CandidateSource};
 use wind_dict::WILDCARD_SLOT;
 use wind_keys::keymap;
 
+/// 通配组码的首批候选上限（spec §11）。不走 `initial_candidate_limit` 的码长分级
+/// （码表 1/2/≥3 码 → 100/300/1000）：那套是给前缀补全配的，通配首位即退化成全表扫描；
+/// 首批小、翻到边界再由 `expand_candidates` ×2 扩，`has_more = engine_count >= limit`
+/// 才自然成立（旧实现首批 1000、引擎至多回 100 ⇒ `has_more` 恒假）。
+pub(crate) const WILDCARD_INITIAL_LIMIT: usize = 100;
+
 /// 通配键此刻的去向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WildcardDecision {
