@@ -933,6 +933,65 @@ fn completion_syllable_cap(started: u32, min_syllables: u32, max_extra: u32) -> 
     }
 }
 
+/// step 4 的词库前缀补全在本次输入下**注定只剩精确匹配**，可整段跳过（看板 A3-14）。
+///
+/// 成立条件：整音节输入（无残码）且 `syllable_cap <= 1`（出厂 `min_syllables = 4` 下的
+/// **单音节**输入：`ni`/`xi`/`hu`/`zhong`，双拼的一个键对）。此时词库层
+/// `prefix_entry_keep` 的两半互相矛盾：对齐判据要求补全在位 0 之外、在 `completed_len`
+/// （= 整串长度）处**再开一个音节**，即至少 2 个音节；音节数判据又不许超过 1 —— 能同时
+/// 满足的只有码 == 输入的精确匹配（`code_len <= completed_len` 那条放行），而它们
+/// step 1 已全数给出（`push_unique` 按文去重，step 4 再推一遍是空操作）。
+/// 词库层放行的 `boundary == 0` 条目到 6.3 由 `effective_boundary` 补出边界后同样
+/// 过不了这两条；唯一漏口是码长 ≥ 64 字节（掩码表达不了、补出 0）的无边界条目——那种
+/// 十几个音节的「补全」本就违背 cap，真实词库里也一条没有。
+///
+/// 跳过省下的是整棵前缀子树的分支限界扫描：`xi` 约 10 万状态、38ms，`ni`/`hu` 同量级，
+/// 而结果恒为空。对拍（1~3 位字母穷举 + 全部单音节 + 多音节整词 + 手动分隔符 + 双拼，
+/// 出厂与模糊音全开）逐字段一致，见 `step4_skip_tests`。
+///
+/// ⚠️ **不能放宽到「`cap == started` 的多音节整音节输入」**，那里不是注定为空：音节切分
+/// 来自手动分隔符或双拼（真值、可以比词条的切分更细）时，词条切分更粗的补全能同时过
+/// 两条判据 —— `xi'an` 下 `xian|ren`（先人）、`xian|dai`（现代）都是 2 音节且在位 4
+/// 开新音节，改动前照样产出。多音节输入的前缀子树本就小，跳过也省不了什么。
+///
+/// ⚠️ 残码位（`trailing_partial`）绝不能跳：前缀补全存在的意义就在那里（`meiy`→「没有」）。
+/// `cap > 1`（用户把 `min_syllables` 调到 1）时单音节补全合法地多出音节，也不能跳。
+fn prefix_completion_is_exact_only(trailing_partial: bool, syllable_cap: u32) -> bool {
+    let skip = !trailing_partial && syllable_cap <= 1;
+    #[cfg(test)]
+    let skip = skip && !test_hooks::never_skip_step4();
+    skip
+}
+
+/// 仅测试用：观察 / 关闭 step 4 的跳过，供对拍与计数护栏使用（线程局部，互不串扰）。
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STEP4_PREFIX_SCANS: Cell<u32> = const { Cell::new(0) };
+        static NEVER_SKIP_STEP4: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn note_step4_prefix_scan() {
+        STEP4_PREFIX_SCANS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// 取出并清零本线程 step 4 实际发起的词库前缀扫描次数。
+    pub(crate) fn take_step4_prefix_scans() -> u32 {
+        STEP4_PREFIX_SCANS.with(|c| c.replace(0))
+    }
+
+    pub(crate) fn never_skip_step4() -> bool {
+        NEVER_SKIP_STEP4.with(Cell::get)
+    }
+
+    /// `true` = 回到改动前的行为（每次都扫），用作对拍的基线。
+    pub(crate) fn set_never_skip_step4(v: bool) {
+        NEVER_SKIP_STEP4.with(|c| c.set(v));
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -3282,7 +3341,13 @@ impl Engine for PinyinEngine {
         // 翻页翻不动。而**那个限制并没有省下成本**：wdat 前缀查询原是「遍历整棵子树 + 堆淘汰」，
         // 实测 `b` 取 30 条与取 5000 条同为 8~11ms，限制只压低了 String 分配，白白牺牲功能。
         // wdat v6 改为分支限界后（docs/design/prefix-topk-branch-and-bound.md），取数成本随条数
-        // 而非子树规模增长，放开才真正划算：`b` 现在 300 条只要 0.9ms（改造前 30 条要 8ms）。
+        // 而非子树规模增长，放开才真正划算：`b` 当时 300 条只要 0.9ms（改造前 30 条要 8ms）。
+        //
+        // ⚠️ **那个 0.9ms 已不成立**（2026-09-29 复测）：它量的是不带过滤的 `search_prefix`。
+        // 本步现走 `..._syllable_capped`，过滤不参与剪枝（见 `WdatReader::search_prefix_inner`），
+        // 合格条目凑不满 `limit` 时分支限界退化成整棵子树遍历 —— 裸声母残码 `b` 实测仍约
+        // 30ms（看板 A3-14 方案 B，未做）。单音节整音节输入（`xi` 曾 38ms）结果注定只剩精确
+        // 匹配，已由下方 `prefix_completion_is_exact_only` 整段跳过（方案 A）。
         //
         // ⚠️ **上限不能去掉**，瓶颈已从词库层转移到本函数的 `push_unique`：它按
         // `cands.iter().any(|c| c.text == text)` 线性查重，整体是 O(n²)。实测 `b`：
@@ -3320,8 +3385,14 @@ impl Engine for PinyinEngine {
         // 保留它是因为「名额按权重发」是本逻辑的**要求**，而「上游按权重返回」是上游的
         // **当前实现**，把要求寄存在别处的实现细节上，改那边的人不会知道这里依赖它。
         // 代价只有一次 ≤ completion_limit 的排序。
-        let prefix_hits: Vec<_> = dict
-            .search_prefix_with_boundary_syllable_capped(
+        // 单音节整音节输入下本步注定只剩精确匹配（step 1 已给），整段跳过，见该函数。
+        let prefix_hits: Vec<_> = if prefix_completion_is_exact_only(trailing_partial, syllable_cap)
+        {
+            Vec::new()
+        } else {
+            #[cfg(test)]
+            test_hooks::note_step4_prefix_scan();
+            dict.search_prefix_with_boundary_syllable_capped(
                 query,
                 completion_limit,
                 syllable_cap,
@@ -3334,7 +3405,8 @@ impl Engine for PinyinEngine {
                     .saturating_sub(completed_syls);
                 (h, distance)
             })
-            .collect();
+            .collect()
+        };
         // 够得着无条件上浮的那批（`w > 0` 那条门槛见下方 `demote_to_prefix_layer`），
         // 按权重降序取前 N 个名额；其余沉回前缀层。
         let near_promoted: std::collections::HashSet<usize> = {
@@ -4628,6 +4700,9 @@ impl Engine for PinyinEngine {
         self.shuangpin.as_ref()?.full_syllable_count(keys)
     }
 }
+
+#[cfg(test)]
+mod step4_skip_tests;
 
 #[cfg(test)]
 mod tests {
