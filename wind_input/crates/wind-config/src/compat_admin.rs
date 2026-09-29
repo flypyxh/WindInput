@@ -11,7 +11,7 @@ use crate::app_compat::{
     load_file, merge_commit_newline, merge_mode_scope, merge_rules, render_user_compat,
 };
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -312,6 +312,7 @@ fn view_in<T: Rule>(
 }
 
 /// 系统层（`data` + `data_custom` 合并）与用户层的两层快照。
+#[derive(Clone)]
 pub struct Layers {
     system: AppCompatFile,
     user: AppCompatFile,
@@ -478,10 +479,345 @@ impl Layers {
     }
 }
 
+// ───────────────────────── 导出 / 导入 ─────────────────────────
+
+/// 导出范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportScope {
+    /// 仅用户层（我的改动）。方便分享，也是默认。
+    User,
+    /// 系统层与用户层合并后的全部生效规则（剔除已禁用的）。
+    Effective,
+}
+
+impl ExportScope {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(Self::User),
+            "effective" => Some(Self::Effective),
+            _ => None,
+        }
+    }
+}
+
+/// 导入模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    /// 同名整条覆盖，用户层里没被提到的条目保留。
+    Merge,
+    /// 先清空用户层再导入。
+    Replace,
+}
+
+impl ImportMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "merge" => Some(Self::Merge),
+            "replace" => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
+/// 导入预览里的一条。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ImportItem {
+    pub section: &'static str,
+    pub process: String,
+    /// `add` / `override` / `disable` / `unchanged`。
+    pub action: &'static str,
+}
+
+/// 导入预览：会发生什么，以及导入文本里有哪些会被忽略 / 回落的内容。
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreview {
+    pub items: Vec<ImportItem>,
+    /// 不认识的键（`<段>.<键>`）或整段。它们不会生效。
+    pub ignored_keys: Vec<String>,
+    /// 值写错、被容错回落成「跟随全局」的原值。
+    pub fallbacks: Vec<String>,
+}
+
+/// 严格解析导入文本：语法错 ⇒ `Err`（带行号）。同时收集不认识的键与被回落的值。
+fn parse_incoming(text: &str) -> Result<(AppCompatFile, Vec<String>, Vec<String>), String> {
+    crate::tolerant_de::clear_fallbacks();
+    let file: AppCompatFile =
+        toml::from_str(text).map_err(|e| format!("导入内容不是合法的 TOML: {e}"))?;
+    let fallbacks = crate::tolerant_de::take_fallbacks();
+    let raw: toml::Value =
+        toml::from_str(text).map_err(|e| format!("导入内容不是合法的 TOML: {e}"))?;
+    let mut ignored = Vec::new();
+    if let Some(top) = raw.as_table() {
+        for (name, value) in top {
+            let Some(sec) = Section::parse(name) else {
+                ignored.push(name.clone());
+                continue;
+            };
+            let known = crate::compat_schema::known_keys(sec.as_str());
+            for tbl in value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.as_table())
+            {
+                for k in tbl.keys() {
+                    if !META_KEYS.contains(&k.as_str()) && !known.contains(&k.as_str()) {
+                        ignored.push(format!("{}.{k}", sec.as_str()));
+                    }
+                }
+            }
+        }
+    }
+    ignored.sort();
+    ignored.dedup();
+    Ok((file, ignored, fallbacks))
+}
+
+/// 把一段导入规则落进用户层：整条覆盖同名条目，再与系统层比对去冗余。
+fn import_section<T: Rule>(system: &[T], user: &mut Vec<T>, incoming: Vec<T>) {
+    for rule in incoming.into_iter().filter(|r| !r.process().is_empty()) {
+        commit_entry(system, user, rule);
+    }
+}
+
+impl Layers {
+    /// 导出成 `compat.toml` 文本。内容与落盘走同一个渲染函数，保证互相能导入。
+    pub fn export(&self, scope: ExportScope) -> Result<String, toml::ser::Error> {
+        match scope {
+            ExportScope::User => self.render_user(),
+            ExportScope::Effective => {
+                let mut apps = merge_rules(self.system.apps.clone(), self.user.apps.clone());
+                let mut scopes = merge_mode_scope(
+                    self.system.initial_mode_scope.clone(),
+                    self.user.initial_mode_scope.clone(),
+                );
+                let mut newline = merge_commit_newline(
+                    self.system.commit_newline.clone(),
+                    self.user.commit_newline.clone(),
+                );
+                apps.retain(|r| !r.disabled);
+                scopes.retain(|r| !r.disabled);
+                newline.retain(|r| !r.disabled);
+                render_user_compat(&apps, &scopes, &newline)
+            }
+        }
+    }
+
+    /// 在副本上试算导入结果，返回（导入后的层, 逐条动作）。不改 `self`。
+    fn plan_import(&self, incoming: AppCompatFile, mode: ImportMode) -> (Layers, Vec<ImportItem>) {
+        let mut after = self.clone();
+        if mode == ImportMode::Replace {
+            after.reset_all();
+        }
+        let mut touched: Vec<(Section, String, bool)> = Vec::new();
+        for r in &incoming.apps {
+            touched.push((Section::Apps, r.process.clone(), r.disabled));
+        }
+        for r in &incoming.initial_mode_scope {
+            touched.push((Section::InitialModeScope, r.process.clone(), r.disabled));
+        }
+        for r in &incoming.commit_newline {
+            touched.push((Section::CommitNewline, r.process.clone(), r.disabled));
+        }
+        import_section(&after.system.apps, &mut after.user.apps, incoming.apps);
+        import_section(
+            &after.system.initial_mode_scope,
+            &mut after.user.initial_mode_scope,
+            incoming.initial_mode_scope,
+        );
+        import_section(
+            &after.system.commit_newline,
+            &mut after.user.commit_newline,
+            incoming.commit_newline,
+        );
+        let mut items = Vec::new();
+        for (sec, process, disabled) in touched.into_iter().filter(|(_, p, _)| !p.is_empty()) {
+            let before = self.view_of(sec, &process);
+            let now = after.view_of(sec, &process);
+            let action = if disabled {
+                "disable"
+            } else {
+                match (&before, &now) {
+                    (None, Some(_)) => "add",
+                    (Some(b), Some(n)) if b.effective != n.effective || b.state != n.state => {
+                        "override"
+                    }
+                    _ => "unchanged",
+                }
+            };
+            items.push(ImportItem {
+                section: sec.as_str(),
+                process,
+                action,
+            });
+        }
+        (after, items)
+    }
+
+    /// 导入预览：不落盘，不改 `self`。
+    pub fn import_preview(&self, text: &str, mode: ImportMode) -> Result<ImportPreview, String> {
+        let (file, ignored_keys, fallbacks) = parse_incoming(text)?;
+        let (_, items) = self.plan_import(file, mode);
+        Ok(ImportPreview {
+            items,
+            ignored_keys,
+            fallbacks,
+        })
+    }
+
+    /// 应用导入到 `self`（调用方随后负责 `save`）。
+    pub fn import_apply(&mut self, text: &str, mode: ImportMode) -> Result<ImportPreview, String> {
+        let (file, ignored_keys, fallbacks) = parse_incoming(text)?;
+        let (after, items) = self.plan_import(file, mode);
+        *self = after;
+        Ok(ImportPreview {
+            items,
+            ignored_keys,
+            fallbacks,
+        })
+    }
+}
+
+// ───────────────────────── RPC 分派 ─────────────────────────
+
+/// 一次 RPC 的结果。`wrote` 告诉宿主是否需要重载规则表。
+pub struct RpcOutcome {
+    pub value: Value,
+    pub wrote: bool,
+}
+
+/// 覆盖前备份用户层文件为 `compat.toml.bak`（不存在则什么也不做）。
+fn backup_user_file(user_dir: &Path) -> Result<(), String> {
+    let path = user_dir.join(COMPAT_FILE_NAME);
+    if path.exists() {
+        std::fs::copy(&path, user_dir.join(format!("{COMPAT_FILE_NAME}.bak")))
+            .map_err(|e| format!("备份 {} 失败: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `compat.*` RPC 的全部逻辑。宿主只需：调用它、按 `wrote` 决定是否重载。
+pub fn rpc(
+    method: &str,
+    params: &Value,
+    data_dir: Option<&Path>,
+    custom_dir: Option<&Path>,
+    user_dir: Option<&Path>,
+) -> Result<RpcOutcome, String> {
+    let read = |value: Value| {
+        Ok(RpcOutcome {
+            value,
+            wrote: false,
+        })
+    };
+    if method == "compat.schema" {
+        return read(crate::compat_schema::schema_json());
+    }
+    let text_param = |k: &str| -> Result<&str, String> {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("缺少参数 {k}"))
+    };
+    let section = || -> Result<Section, String> {
+        Section::parse(text_param("section")?).ok_or_else(|| "section 无效".to_string())
+    };
+    let need_user_dir = || user_dir.ok_or_else(|| "无用户配置目录".to_string());
+
+    // 先 clear 再加载再 take：`list` 要把「加载时被回落的值」作为告警带回去。
+    crate::tolerant_de::clear_fallbacks();
+    let mut layers = Layers::load(data_dir, custom_dir, user_dir)?;
+    let warnings = crate::tolerant_de::take_fallbacks();
+
+    let wrote = |value: Value| Ok(RpcOutcome { value, wrote: true });
+    match method {
+        "compat.list" => read(json!({
+            "rules": layers.view(section()?),
+            "warnings": warnings,
+        })),
+        "compat.export" => {
+            let scope = match params.get("scope").and_then(Value::as_str) {
+                None => ExportScope::User,
+                Some(s) => ExportScope::parse(s).ok_or_else(|| "scope 无效".to_string())?,
+            };
+            let content = layers.export(scope).map_err(|e| e.to_string())?;
+            read(json!({ "content": content }))
+        }
+        "compat.upsert" => {
+            let dir = need_user_dir()?;
+            let (sec, process) = (section()?, text_param("process")?);
+            let patch = params
+                .get("patch")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "缺少参数 patch".to_string())?;
+            layers.upsert(sec, process, patch)?;
+            layers.save(dir).map_err(|e| e.to_string())?;
+            wrote(json!({ "ok": true, "rule": layers.view_of(sec, process) }))
+        }
+        "compat.resetField" => {
+            let dir = need_user_dir()?;
+            let (sec, process) = (section()?, text_param("process")?);
+            layers.reset_field(sec, process, text_param("key")?)?;
+            layers.save(dir).map_err(|e| e.to_string())?;
+            wrote(json!({ "ok": true, "rule": layers.view_of(sec, process) }))
+        }
+        "compat.setDisabled" => {
+            let dir = need_user_dir()?;
+            let (sec, process) = (section()?, text_param("process")?);
+            let flag = params
+                .get("disabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "缺少参数 disabled".to_string())?;
+            layers.set_disabled(sec, process, flag)?;
+            layers.save(dir).map_err(|e| e.to_string())?;
+            wrote(json!({ "ok": true, "rule": layers.view_of(sec, process) }))
+        }
+        "compat.reset" => {
+            let dir = need_user_dir()?;
+            let (sec, process) = (section()?, text_param("process")?);
+            let removed = layers.reset(sec, process);
+            layers.save(dir).map_err(|e| e.to_string())?;
+            wrote(json!({ "ok": true, "removed": removed, "rule": layers.view_of(sec, process) }))
+        }
+        "compat.resetAll" => {
+            let dir = need_user_dir()?;
+            backup_user_file(dir)?;
+            layers.reset_all();
+            layers.save(dir).map_err(|e| e.to_string())?;
+            wrote(json!({ "ok": true }))
+        }
+        "compat.import" => {
+            let content = text_param("content")?;
+            let mode = match params.get("mode").and_then(Value::as_str) {
+                None => ImportMode::Merge,
+                Some(s) => ImportMode::parse(s).ok_or_else(|| "mode 无效".to_string())?,
+            };
+            let dry_run = params
+                .get("dryRun")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if dry_run {
+                let preview = layers.import_preview(content, mode)?;
+                let mut v = serde_json::to_value(&preview).map_err(|e| e.to_string())?;
+                v["applied"] = json!(false);
+                return read(v);
+            }
+            let dir = need_user_dir()?;
+            let preview = layers.import_apply(content, mode)?;
+            backup_user_file(dir)?;
+            layers.save(dir).map_err(|e| e.to_string())?;
+            let mut v = serde_json::to_value(&preview).map_err(|e| e.to_string())?;
+            v["applied"] = json!(true);
+            wrote(v)
+        }
+        other => Err(format!("unknown method: {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn file(text: &str) -> AppCompatFile {
         toml::from_str(text).expect("测试夹具必须是合法 TOML")
@@ -967,5 +1303,397 @@ style = \"cr\"
             "不应残留临时文件"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────── 导出 / 导入 ─────────────
+
+    const USER_A: &str =
+        "[[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\nauto_pair = true\n";
+
+    #[test]
+    fn export_user_contains_only_user_layer() {
+        let l = layers(SYS, USER_A);
+        let text = l.export(ExportScope::User).unwrap();
+        assert!(text.contains("Weixin.exe"), "{text}");
+        assert!(
+            !text.contains("Feishu.exe"),
+            "仅用户层不应含系统规则: {text}"
+        );
+    }
+
+    #[test]
+    fn export_effective_merges_and_drops_disabled() {
+        let usr = format!(
+            "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\nhost_render = true\n"
+        );
+        let l = layers(SYS, &usr);
+        let text = l.export(ExportScope::Effective).unwrap();
+        assert!(text.contains("Feishu.exe"), "系统规则应在: {text}");
+        assert!(
+            text.contains("auto_pair = true"),
+            "合并后的改写应在: {text}"
+        );
+        assert!(!text.contains("Dota.exe"), "被禁用的不应导出: {text}");
+        assert!(!text.contains("disabled"), "{text}");
+    }
+
+    #[test]
+    fn export_then_import_replace_roundtrips() {
+        let usr = format!(
+            "{USER_A}\n[[apps]]\nprocess = \"Dota.exe\"\ndisabled = true\nhost_render = true\n"
+        );
+        let a = layers(SYS, &usr);
+        let text = a.export(ExportScope::User).unwrap();
+        let mut b = layers(SYS, "");
+        b.import_apply(&text, ImportMode::Replace).unwrap();
+        for p in ["Feishu.exe", "Weixin.exe", "Dota.exe"] {
+            let (va, vb) = (
+                a.view_of(Section::Apps, p).unwrap(),
+                b.view_of(Section::Apps, p).unwrap(),
+            );
+            assert_eq!(va.state, vb.state, "{p}");
+            assert_eq!(va.effective, vb.effective, "{p}");
+        }
+    }
+
+    #[test]
+    fn import_preview_classifies_add_override_disable_unchanged() {
+        let incoming = "\
+[[apps]]
+process = \"Brand.exe\"
+auto_pair = true
+
+[[apps]]
+process = \"Weixin.exe\"
+caret_use_top = true
+auto_pair = true
+
+[[apps]]
+process = \"Dota.exe\"
+disabled = true
+host_render = true
+
+[[apps]]
+process = \"Feishu.exe\"
+composition_start_pair_guard = true
+";
+        let l = layers(SYS, "");
+        let p = l.import_preview(incoming, ImportMode::Merge).unwrap();
+        let act = |name: &str| p.items.iter().find(|i| i.process == name).map(|i| i.action);
+        assert_eq!(act("Brand.exe"), Some("add"));
+        assert_eq!(act("Weixin.exe"), Some("override"));
+        assert_eq!(act("Dota.exe"), Some("disable"));
+        assert_eq!(
+            act("Feishu.exe"),
+            Some("unchanged"),
+            "与系统完全一致 = 无变化"
+        );
+    }
+
+    #[test]
+    fn import_preview_does_not_mutate_layers() {
+        let l = layers(SYS, USER_A);
+        let before: Vec<_> = l
+            .view(Section::Apps)
+            .into_iter()
+            .map(|v| (v.process, v.state))
+            .collect();
+        let _ = l
+            .import_preview(
+                "[[apps]]\nprocess = \"Brand.exe\"\nauto_pair = true\n",
+                ImportMode::Replace,
+            )
+            .unwrap();
+        let after: Vec<_> = l
+            .view(Section::Apps)
+            .into_iter()
+            .map(|v| (v.process, v.state))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn import_merge_keeps_unmentioned_user_entries() {
+        let mut l = layers(SYS, "[[apps]]\nprocess = \"E.exe\"\nauto_pair = true\n");
+        l.import_apply(
+            "[[apps]]\nprocess = \"C.exe\"\nauto_pair = true\n",
+            ImportMode::Merge,
+        )
+        .unwrap();
+        assert!(
+            l.view_of(Section::Apps, "E.exe").is_some(),
+            "Merge 不能动没被提到的条目"
+        );
+        assert!(l.view_of(Section::Apps, "C.exe").is_some());
+    }
+
+    #[test]
+    fn import_replace_drops_unmentioned_user_entries() {
+        let mut l = layers(SYS, "[[apps]]\nprocess = \"E.exe\"\nauto_pair = true\n");
+        l.import_apply(
+            "[[apps]]\nprocess = \"C.exe\"\nauto_pair = true\n",
+            ImportMode::Replace,
+        )
+        .unwrap();
+        assert!(
+            l.view_of(Section::Apps, "E.exe").is_none(),
+            "Replace 要先清空用户层"
+        );
+        assert!(l.view_of(Section::Apps, "C.exe").is_some());
+    }
+
+    #[test]
+    fn import_reports_unknown_keys_and_sections() {
+        let text = "[[apps]]\nprocess = \"A.exe\"\nbogus_key = 1\nauto_pair = true\n\n[[mystery]]\nx = 1\n";
+        let p = layers(SYS, "")
+            .import_preview(text, ImportMode::Merge)
+            .unwrap();
+        assert!(
+            p.ignored_keys.contains(&"apps.bogus_key".to_string()),
+            "{:?}",
+            p.ignored_keys
+        );
+        assert!(
+            p.ignored_keys.contains(&"mystery".to_string()),
+            "{:?}",
+            p.ignored_keys
+        );
+    }
+
+    #[test]
+    fn import_reports_value_fallbacks() {
+        let text = "[[apps]]\nprocess = \"A.exe\"\nfirst_show_mode = \"bogus\"\nauto_pair = true\n";
+        let p = layers(SYS, "")
+            .import_preview(text, ImportMode::Merge)
+            .unwrap();
+        assert!(
+            p.fallbacks.iter().any(|f| f.contains("bogus")),
+            "{:?}",
+            p.fallbacks
+        );
+    }
+
+    #[test]
+    fn import_syntax_error_is_an_error_not_silent() {
+        let err = layers(SYS, "")
+            .import_preview("[[apps\nprocess=", ImportMode::Merge)
+            .unwrap_err();
+        assert!(err.contains("line"), "应带行号: {err}");
+    }
+
+    // ───────────── RPC ─────────────
+
+    fn rpc_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (d, u) = (tmp(&format!("{tag}_d")), tmp(&format!("{tag}_u")));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&u);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(COMPAT_FILE_NAME), SYS).unwrap();
+        (d, u)
+    }
+
+    fn call(m: &str, p: Value, d: &Path, u: &Path) -> Result<RpcOutcome, String> {
+        rpc(m, &p, Some(d), None, Some(u))
+    }
+
+    fn cleanup(d: &Path, u: &Path) {
+        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(u);
+    }
+
+    #[test]
+    fn rpc_list_returns_views_and_warnings() {
+        let (d, u) = rpc_dirs("list");
+        let r = call("compat.list", json!({"section": "apps"}), &d, &u).unwrap();
+        assert!(!r.wrote);
+        assert_eq!(r.value["rules"].as_array().unwrap().len(), 3);
+        assert!(r.value["warnings"].is_array());
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_unknown_method_and_bad_section_error() {
+        let (d, u) = rpc_dirs("bad");
+        assert!(call("compat.bogus", json!({}), &d, &u).is_err());
+        assert!(call("compat.list", json!({"section": "x"}), &d, &u).is_err());
+        assert!(call("compat.list", json!({}), &d, &u).is_err());
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_write_methods_report_wrote_true_and_persist() {
+        let (d, u) = rpc_dirs("write");
+        let r = call(
+            "compat.upsert",
+            json!({"section": "apps", "process": "Weixin.exe", "patch": {"auto_pair": true}}),
+            &d,
+            &u,
+        )
+        .unwrap();
+        assert!(r.wrote);
+        assert_eq!(r.value["rule"]["state"], json!("modified"));
+        assert!(
+            std::fs::read_to_string(u.join(COMPAT_FILE_NAME))
+                .unwrap()
+                .contains("auto_pair")
+        );
+
+        let r = call(
+            "compat.setDisabled",
+            json!({"section": "apps", "process": "Feishu.exe", "disabled": true}),
+            &d,
+            &u,
+        )
+        .unwrap();
+        assert!(r.wrote);
+        assert_eq!(r.value["rule"]["state"], json!("disabled"));
+
+        let r = call(
+            "compat.resetField",
+            json!({"section": "apps", "process": "Weixin.exe", "key": "auto_pair"}),
+            &d,
+            &u,
+        )
+        .unwrap();
+        assert!(r.wrote);
+        assert_eq!(r.value["rule"]["state"], json!("system"));
+
+        let r = call(
+            "compat.reset",
+            json!({"section": "apps", "process": "Feishu.exe"}),
+            &d,
+            &u,
+        )
+        .unwrap();
+        assert!(r.wrote);
+        assert_eq!(r.value["removed"], json!(true));
+
+        // 只读方法不写
+        for (m, p) in [
+            ("compat.list", json!({"section": "apps"})),
+            ("compat.schema", json!({})),
+            ("compat.export", json!({"scope": "effective"})),
+        ] {
+            assert!(!call(m, p, &d, &u).unwrap().wrote, "{m} 不应报告写入");
+        }
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_upsert_rejects_bad_value_and_does_not_touch_disk() {
+        let (d, u) = rpc_dirs("reject");
+        let err = call(
+            "compat.upsert",
+            json!({"section": "apps", "process": "Weixin.exe", "patch": {"first_show_mode": "bogus"}}),
+            &d,
+            &u,
+        )
+        .err()
+        .expect("非法取值必须被拒绝");
+        assert!(err.contains("first_show_mode"), "{err}");
+        assert!(
+            !u.join(COMPAT_FILE_NAME).exists(),
+            "被拒绝的写入不应产生文件"
+        );
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_write_without_user_dir_errors() {
+        let (d, u) = rpc_dirs("nodir");
+        let r = rpc(
+            "compat.upsert",
+            &json!({"section": "apps", "process": "A.exe", "patch": {"auto_pair": true}}),
+            Some(&d),
+            None,
+            None,
+        );
+        assert_eq!(r.err().as_deref(), Some("无用户配置目录"));
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_import_dry_run_does_not_write() {
+        let (d, u) = rpc_dirs("dry");
+        let r = call(
+            "compat.import",
+            json!({"content": "[[apps]]\nprocess = \"New.exe\"\nauto_pair = true\n", "dryRun": true}),
+            &d,
+            &u,
+        )
+        .unwrap();
+        assert!(!r.wrote);
+        assert_eq!(r.value["applied"], json!(false));
+        assert_eq!(r.value["items"][0]["action"], json!("add"));
+        assert!(!u.join(COMPAT_FILE_NAME).exists());
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_import_backs_up_existing_user_file() {
+        let (d, u) = rpc_dirs("bak");
+        std::fs::create_dir_all(&u).unwrap();
+        let original = "[[apps]]\nprocess = \"Old.exe\"\nauto_pair = true\n";
+        std::fs::write(u.join(COMPAT_FILE_NAME), original).unwrap();
+        let r = call(
+            "compat.import",
+            json!({"content": "[[apps]]\nprocess = \"New.exe\"\nauto_pair = true\n", "mode": "replace"}),
+            &d,
+            &u,
+        )
+        .unwrap();
+        assert!(r.wrote);
+        assert_eq!(r.value["applied"], json!(true));
+        let bak = std::fs::read_to_string(u.join(format!("{COMPAT_FILE_NAME}.bak"))).unwrap();
+        assert_eq!(bak, original, "备份必须是导入前的原文");
+        assert!(
+            std::fs::read_to_string(u.join(COMPAT_FILE_NAME))
+                .unwrap()
+                .contains("New.exe")
+        );
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_reset_all_backs_up_and_clears() {
+        let (d, u) = rpc_dirs("all");
+        std::fs::create_dir_all(&u).unwrap();
+        let original = "[[apps]]\nprocess = \"Old.exe\"\nauto_pair = true\n";
+        std::fs::write(u.join(COMPAT_FILE_NAME), original).unwrap();
+        let r = call("compat.resetAll", json!({}), &d, &u).unwrap();
+        assert!(r.wrote);
+        assert_eq!(
+            std::fs::read_to_string(u.join(format!("{COMPAT_FILE_NAME}.bak"))).unwrap(),
+            original
+        );
+        assert!(
+            !std::fs::read_to_string(u.join(COMPAT_FILE_NAME))
+                .unwrap()
+                .contains("Old.exe")
+        );
+        cleanup(&d, &u);
+    }
+
+    #[test]
+    fn rpc_write_on_broken_user_file_errors_and_keeps_it() {
+        let (d, u) = rpc_dirs("broken");
+        std::fs::create_dir_all(&u).unwrap();
+        let broken = "[[apps\nprocess=";
+        std::fs::write(u.join(COMPAT_FILE_NAME), broken).unwrap();
+        let err = call(
+            "compat.upsert",
+            json!({"section": "apps", "process": "A.exe", "patch": {"auto_pair": true}}),
+            &d,
+            &u,
+        )
+        .err()
+        .expect("用户层语法错必须报错");
+        assert!(err.contains("line"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(u.join(COMPAT_FILE_NAME)).unwrap(),
+            broken,
+            "出错时不得改写（更不能按空集重写）用户层"
+        );
+        cleanup(&d, &u);
     }
 }

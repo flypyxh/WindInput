@@ -1502,7 +1502,7 @@ pub struct AppCompat {
 /// 它要遍历本结构体的每个字符串字段逐个投毒，而集成测试只看得见 pub API。
 /// ⛔ 不要因此把它当成对外类型：`compat.toml` 的读写入口仍只有 `load_file` /
 /// `render_user_compat`。
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub(crate) struct AppCompatFile {
     #[serde(default)]
     pub(crate) apps: Vec<AppCompatRule>,
