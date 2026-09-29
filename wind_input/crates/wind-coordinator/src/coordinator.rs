@@ -14276,6 +14276,7 @@ mod initial_mode_tests {
                 vec![InitialModeScopeRule {
                     process: "explorer.exe".into(),
                     comment: String::new(),
+                    disabled: false,
                     classes: vec!["Progman".into()],
                 }],
             );
@@ -14376,6 +14377,7 @@ mod initial_mode_tests {
             vec![InitialModeScopeRule {
                 process: "explorer.exe".into(),
                 comment: String::new(),
+                disabled: false,
                 classes: vec!["Progman".into()],
             }],
         );

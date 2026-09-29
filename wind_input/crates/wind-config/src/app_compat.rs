@@ -618,6 +618,14 @@ pub struct AppCompatRule {
         skip_serializing_if = "String::is_empty"
     )]
     pub comment: String,
+    /// 用户层专用：禁用同名的系统规则（合并后该进程视为没有这条规则）。
+    /// 条目里的其它字段照常保留，去掉本标记即恢复到禁用前的状态。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub disabled: bool,
     /// 使用 caret rect 的 top 而非 bottom 定位候选窗。
     /// 适用于 GetTextExt 返回的 height 不稳定的 WebView 应用（如微信 Qt 输入框，
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
@@ -1413,6 +1421,14 @@ pub struct InitialModeScopeRule {
         skip_serializing_if = "String::is_empty"
     )]
     pub comment: String,
+    /// 用户层专用：禁用同名的系统规则（合并后该进程视为没有这条规则）。
+    /// 条目里的其它字段照常保留，去掉本标记即恢复到禁用前的状态。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub disabled: bool,
     /// 该进程下**允许重算初始模式**的顶层窗口类名（不区分大小写）。
     /// 空清单 = 该进程的初始模式规则在任何窗口上都不重算。
     #[serde(default)]
@@ -1452,6 +1468,14 @@ pub struct CommitNewlineRule {
         skip_serializing_if = "String::is_empty"
     )]
     pub comment: String,
+    /// 用户层专用：禁用同名的系统规则（合并后该进程视为没有这条规则）。
+    /// 条目里的其它字段照常保留，去掉本标记即恢复到禁用前的状态。
+    #[serde(
+        default,
+        deserialize_with = "crate::tolerant_de::tolerant_bool",
+        skip_serializing_if = "is_false"
+    )]
+    pub disabled: bool,
     /// 该应用上屏时换行用什么字符表达。**认不出的值退化为 `None`＝跟随全局**，
     /// 而不是让整份文件解析失败——理由见 [`de_newline_style`]。
     #[serde(default, deserialize_with = "de_newline_style")]
@@ -1652,6 +1676,11 @@ impl AppCompat {
             scope = merge_mode_scope(scope, user.initial_mode_scope);
             newline = merge_commit_newline(newline, user.commit_newline);
         }
+        // 禁用项在合并之后才过滤：用户层的 `disabled = true` 要先按同名整条覆盖掉系统规则，
+        // 然后自己再被剔除，净效果是「该进程没有规则」。
+        apps.retain(|r| !r.disabled);
+        scope.retain(|r| !r.disabled);
+        newline.retain(|r| !r.disabled);
         Self::from_parts(apps, scope).with_commit_newline(newline)
     }
 }
@@ -1802,6 +1831,7 @@ mod commit_newline_rule_tests {
         CommitNewlineRule {
             process: process.into(),
             comment: String::new(),
+            disabled: false,
             style: Some(style),
         }
     }
@@ -3366,6 +3396,7 @@ mod tests {
         vec![InitialModeScopeRule {
             process: "explorer.exe".into(),
             comment: String::new(),
+            disabled: false,
             classes: vec!["Progman".into(), "WorkerW".into()],
         }]
     }
@@ -3411,6 +3442,7 @@ mod tests {
             vec![InitialModeScopeRule {
                 process: "explorer.exe".into(),
                 comment: String::new(),
+                disabled: false,
                 classes: Vec::new(),
             }],
         );
@@ -3455,6 +3487,7 @@ mod tests {
             vec![InitialModeScopeRule {
                 process: "EXPLORER.EXE".into(),
                 comment: String::new(),
+                disabled: false,
                 classes: vec!["CabinetWClass".into()],
             }],
         );
@@ -3529,5 +3562,99 @@ mod tests {
         }
         // 其它进程不受任何影响
         assert!(c.initial_mode_applies_to_window("notepad.exe", ""));
+    }
+}
+
+#[cfg(test)]
+mod disabled_rule_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("wind_compat_dis_{tag}_{}", std::process::id()))
+    }
+    fn write(dir: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(COMPAT_FILE_NAME), text).unwrap();
+    }
+
+    #[test]
+    fn user_disabled_entry_removes_the_system_rule() {
+        let (sys, usr) = (tmp("a_sys"), tmp("a_usr"));
+        write(
+            &sys,
+            "[[apps]]\nprocess = \"Feishu.exe\"\ncomposition_start_pair_guard = true\n\
+             [[apps]]\nprocess = \"Weixin.exe\"\ncaret_use_top = true\n",
+        );
+        write(
+            &usr,
+            "[[apps]]\nprocess = \"feishu.exe\"\ndisabled = true\n",
+        );
+        let c = AppCompat::load_layered(Some(&sys), None, Some(&usr));
+        assert!(
+            c.get_rule("Feishu.exe").is_none(),
+            "被禁用的进程不应再有规则"
+        );
+        assert!(c.get_rule("Weixin.exe").is_some(), "禁用只影响指名的进程");
+        let _ = std::fs::remove_dir_all(&sys);
+        let _ = std::fs::remove_dir_all(&usr);
+    }
+
+    #[test]
+    fn disabled_is_omitted_when_false_and_written_when_true() {
+        let off = toml::to_string(&AppCompatRule {
+            process: "a.exe".into(),
+            caret_use_top: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!off.contains("disabled"), "false 不应落盘: {off}");
+        let on = toml::to_string(&AppCompatRule {
+            process: "a.exe".into(),
+            disabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(on.contains("disabled = true"), "true 必须落盘: {on}");
+    }
+
+    #[test]
+    fn wrong_typed_disabled_falls_back_to_enabled() {
+        let (sys, usr) = (tmp("c_sys"), tmp("c_usr"));
+        write(
+            &sys,
+            "[[apps]]\nprocess = \"Feishu.exe\"\ncaret_use_top = true\n",
+        );
+        write(
+            &usr,
+            "[[apps]]\nprocess = \"Feishu.exe\"\ndisabled = \"yes\"\ncaret_use_top = true\n",
+        );
+        let c = AppCompat::load_layered(Some(&sys), None, Some(&usr));
+        assert!(
+            c.get_rule("Feishu.exe").is_some(),
+            "写错类型按未禁用处理，不能整条丢"
+        );
+        let _ = std::fs::remove_dir_all(&sys);
+        let _ = std::fs::remove_dir_all(&usr);
+    }
+
+    #[test]
+    fn disabled_applies_to_scope_and_newline_sections() {
+        let (sys, usr) = (tmp("d_sys"), tmp("d_usr"));
+        write(
+            &sys,
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"CabinetWClass\"]\n\
+             [[commit_newline]]\nprocess = \"WINWORD.EXE\"\nstyle = \"cr\"\n",
+        );
+        write(
+            &usr,
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\ndisabled = true\n\
+             [[commit_newline]]\nprocess = \"WINWORD.EXE\"\ndisabled = true\n",
+        );
+        let c = AppCompat::load_layered(Some(&sys), None, Some(&usr));
+        assert!(c.commit_newline_for("WINWORD.EXE").is_none());
+        // 作用域规则被禁用 = 进程不在表内 = 不受限制
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "AnyOtherClass"));
+        let _ = std::fs::remove_dir_all(&sys);
+        let _ = std::fs::remove_dir_all(&usr);
     }
 }
