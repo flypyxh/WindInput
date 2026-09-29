@@ -72,7 +72,8 @@ pub fn split_direct(input: &str) -> Option<DirectSplit<'_>> {
 ///
 /// 排除：没吃满前缀的（子短语 / 半截）、预测了没打的音节的（前缀补全）、引擎新合成的
 /// 整句（`is_synthesized`——词库里有的词即便同时是整句解，也照常参与）、简拼与全拼降级
-/// （都不是双拼的全音节解读）、草稿层猜测词（恒沉底，辅码不该把它顶上来）、短语 / 命令 / 组。
+/// （都不是双拼的全音节解读）、草稿层猜测词（恒沉底，辅码不该把它顶上来）、短语 / 命令 / 组，
+/// 以及检索范围临时放宽补进来的候选（`is_scope_filtered`：自动补充的恒沉底，是硬约束）。
 pub fn is_direct_source(c: &Candidate, prefix_len: usize) -> bool {
     !c.text.is_empty()
         && effective_consumed(c, prefix_len) == prefix_len
@@ -86,6 +87,21 @@ pub fn is_direct_source(c: &Candidate, prefix_len: usize) -> bool {
         && !c.is_phrase
         && !c.is_command
         && !c.is_group
+        && !c.is_scope_filtered
+}
+
+/// 把一条前缀候选标成直接辅助命中项：消费整串（上屏连辅码一起吃掉）、带来源标记；
+/// `code` 保留前缀的拼音码（调频记在前缀下）。
+///
+/// 整句相关的标记一并清掉：它们描述的是**前缀**那次解码（「释读」在 `uidu` 下可能正是整句
+/// 最优解、`sentence_rank = 1`），搬到整串输入下就是错的——整句切换键会把它当成本次的整句
+/// N-best 去滚动。
+pub fn mark_direct_hit(c: &mut Candidate, input_len: usize) {
+    c.consumed_length = input_len;
+    c.is_direct_aux = true;
+    c.is_sentence = false;
+    c.is_sentence_demoted = false;
+    c.sentence_rank = 0;
 }
 
 /// 候选文本是否与辅码 `aux`（1～2 位）字形相符。
@@ -469,6 +485,13 @@ mod tests {
                 },
             ),
             (
+                "检索范围放宽补进来的",
+                Candidate {
+                    is_scope_filtered: true,
+                    ..cand("释读")
+                },
+            ),
+            (
                 "草稿",
                 Candidate {
                     is_draft: true,
@@ -478,6 +501,24 @@ mod tests {
         ] {
             assert!(!is_direct_source(&c, 4), "{why}");
         }
+    }
+
+    #[test]
+    fn mark_direct_hit_drops_prefix_sentence_identity() {
+        let mut c = Candidate {
+            is_sentence: true,
+            is_sentence_demoted: true,
+            sentence_rank: 1,
+            consumed_length: 4,
+            code: "shidu".into(),
+            ..cand("释读")
+        };
+        mark_direct_hit(&mut c, 5);
+        assert_eq!(c.consumed_length, 5);
+        assert!(c.is_direct_aux);
+        assert!(!c.is_sentence && !c.is_sentence_demoted);
+        assert_eq!(c.sentence_rank, 0, "不能冒充本次整句 N-best");
+        assert_eq!(c.code, "shidu", "码仍是前缀的拼音码");
     }
 
     // ── 排序：§6 三种情况与无命中 ──

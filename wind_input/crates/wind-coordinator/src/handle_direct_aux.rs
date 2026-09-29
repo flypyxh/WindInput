@@ -4,9 +4,11 @@
 //!
 //! - **门卫**（§4）：主输入路、双拼、`enabled` + `direct`、前缀恰好切成完整双拼音节、
 //!   辅码来源就绪（方案来源的系统层未就绪 → 本键原样、派后台构建，与引导键进入同一处理）；
-//! - **前缀解码**：对前缀单独调一次引擎（`convert_with_opts`，引擎无状态，不碰本次会话），
-//!   走与主候选同一条加工链（展开 / 常用字标记 / 显示序 / 检索范围 / 单字 / 调频 / shadow），
-//!   所以「命中项之间的顺序」就是用户单打前缀时看到的顺序；
+//! - **前缀候选**：连打时前缀恰是几键前的整个输入，直接取那一键的主候选快照
+//!   （[`DirectAuxPrev`]，只留有资格的拼音候选；那一键被截断过、或检索范围 / 单字 / 放宽状态
+//!   与当时不同都不用）；否则对前缀单独调一次引擎（`convert_with_opts`，引擎无状态，不碰本次
+//!   会话），走与主候选同一条加工链（展开 / 常用字标记 / 显示序 / 检索范围 / 单字 / 调频 /
+//!   shadow），所以「命中项之间的顺序」就是用户单打前缀时看到的顺序；
 //! - **标记**：命中项的 `consumed_length` 改成整串（上屏连辅码一起吃掉），`code` 保留前缀
 //!   的拼音码（调频与学习记在前缀下，「释读」记 `shidu`）；组码区形态存 `direct_aux_body`。
 //!
@@ -25,9 +27,22 @@ use wind_candidate::{Candidate, CandidateSource, candidate_display_order};
 /// 存的是那一键**并入命中项之前、shadow 之前**的主候选：已走完展开 / 常用字 / 显示序 / 检索
 /// 范围 / 单字 / 调频（调频的码就是那时的输入 = 现在的前缀），也就是用户单打前缀时所见的
 /// 顺序（shadow 在取用时按前缀的码补上）。只在输入恰好切成完整双拼音节时才更新；奇数键不动它，
-/// 留给紧随其后的偶数键。组合复位（上屏 / 清空）时丢弃。
+/// 留给紧随其后的偶数键。组合复位（上屏 / 清空）、分段上屏、退回已上屏段时丢弃。
+///
+/// ★ 那一键的引擎产出**到了上限**（被截断过）就不存：兜底解码按辅码首字母在截断**前**准入，
+/// 截断过的快照会漏掉排在后面的命中（单音节前缀 `wu` 数百个同音字，`wuk` 曾少了 喔 呒 圄），
+/// 于是连打与退格重打给出的命中项不一样。
 pub(crate) struct DirectAuxPrev {
     input: String,
+    /// 取快照时的候选裁剪状态：检索范围档位、单字模式、末页放宽。输入不变而切了其中任一项
+    /// （`set_single_char_in` / `set_filter_mode` 会原地重建候选），快照就与当下的过滤链对不上，
+    /// 不能复用——否则词会绕过单字过滤、生僻字会绕过检索范围被提到前面。
+    filters: (wind_candidate::FilterMode, bool, bool),
+    /// `None` = 整音节那一键的主候选快照（未截断，前缀下有资格的候选一条不缺）。
+    /// `Some((字母, 上限))` = 兜底解码的产出，引擎按辅码首字母准入过、按该上限取的——只能给
+    /// 同首字母、同上限的键复用（奇数键算的给紧随其后的偶数键：2 位辅码命中集是首字母的子集）。
+    admit: Option<(char, usize)>,
+    /// 只存**有资格**的拼音候选（`is_direct_source`），不整表克隆。
     candidates: Vec<Candidate>,
     /// 那一键的双拼音节分段（`ui'du`），组码区用。
     preedit: String,
@@ -43,6 +58,7 @@ impl Coordinator {
         state: &mut State,
         candidates: &mut Vec<Candidate>,
         limit: usize,
+        truncated: bool,
     ) {
         state.direct_aux_body.clear();
         // 主输入路：临拼 / 混输 / 引导键辅助码态都不做（引导键态本就筛的是现成候选表）。
@@ -62,18 +78,31 @@ impl Coordinator {
         if !whole && syllables.is_none() {
             return;
         }
-        let settings = self.engine_mgr.aux_code_settings();
+        // 缓存版：每个双拼按键都走到这里，未开的用户也一样，不能逐键读盘解析方案文件。
+        let settings = self.engine_mgr.aux_code_settings_cached();
         if !settings.direct || settings.sources.is_empty() {
             state.direct_aux_prev = None;
             return;
         }
-        let pre_merge = whole.then(|| candidates.clone());
+        // 只留有资格的拼音候选（命中项只会从它们里出），不整表克隆。
+        let pre_merge = whole.then(|| {
+            candidates
+                .iter()
+                .filter(|c| {
+                    c.source == CandidateSource::Pinyin
+                        && wind_aux_code::is_direct_source(c, input.len())
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        });
         if let (Some(split), Some(syllables)) = (split, syllables) {
             self.merge_direct_hits_into(state, candidates, limit, split, syllables, &settings);
         }
         // 奇数键（或前缀以外的不成音节输入）不动快照，留给后面的键。
         if let Some(list) = pre_merge {
-            state.direct_aux_prev = Some(DirectAuxPrev {
+            state.direct_aux_prev = (!truncated).then(|| DirectAuxPrev {
+                filters: self.direct_aux_filters(state),
+                admit: None,
                 input,
                 candidates: list,
                 preedit: state.preedit_split_body.clone(),
@@ -103,10 +132,16 @@ impl Coordinator {
             return;
         }
         let prefix = split.prefix;
+        let letter = split.aux.chars().next().unwrap_or_default();
+        let filters = self.direct_aux_filters(state);
         let snapshot = state
             .direct_aux_prev
             .as_ref()
-            .filter(|p| p.input == prefix)
+            .filter(|p| {
+                p.input == prefix
+                    && p.filters == filters
+                    && p.admit.is_none_or(|a| a == (letter, limit))
+            })
             .map(|p| {
                 (
                     p.candidates.clone(),
@@ -116,9 +151,21 @@ impl Coordinator {
             });
         let (mut pool, preedit, shadow_code) = match snapshot {
             Some(s) => s,
-            // 没有现成快照（退格改了前缀、光标中间编辑、刚开启…）：对前缀单独解码一次，
-            // 走与主候选同一条加工链。
-            None => self.decode_direct_prefix(state, prefix, limit, split.aux, settings, &lookup),
+            // 没有可用的快照（前缀那一键被截断过、退格改了前缀、光标中间编辑、切了过滤…）：
+            // 对前缀单独解码一次，走与主候选同一条加工链；结果留作快照给紧随其后的偶数键。
+            None => {
+                let (pool, preedit, shadow_code) =
+                    self.decode_direct_prefix(state, prefix, limit, split.aux, settings, &lookup);
+                state.direct_aux_prev = Some(DirectAuxPrev {
+                    input: prefix.to_string(),
+                    filters,
+                    admit: Some((letter, limit)),
+                    candidates: pool.clone(),
+                    preedit: preedit.clone(),
+                    shadow_code: shadow_code.clone(),
+                });
+                (pool, preedit, shadow_code)
+            }
         };
         // 用户在前缀下隐藏的词，当辅码命中项也不该冒出来（置顶同理保留其次序）。
         let prefix_shadow = if shadow_code.is_empty() {
@@ -143,8 +190,7 @@ impl Coordinator {
                     )
             })
             .map(|mut c| {
-                c.consumed_length = input_len;
-                c.is_direct_aux = true;
+                wind_aux_code::mark_direct_hit(&mut c, input_len);
                 c
             })
             .collect();
@@ -162,6 +208,15 @@ impl Coordinator {
         // 同口径地用空白隔开辅码；仍是「缓冲按序插入分隔符」的形态，光标换算照常成立。
         let body = if preedit.is_empty() { prefix } else { &preedit };
         state.direct_aux_body = format!("{body} {}", split.aux);
+    }
+
+    /// 快照复用的前提：候选裁剪状态与取快照时相同（见 [`DirectAuxPrev::filters`]）。
+    fn direct_aux_filters(&self, state: &State) -> (wind_candidate::FilterMode, bool, bool) {
+        (
+            state.filter_mode,
+            self.effective_single_char(state),
+            state.scope_relaxed,
+        )
     }
 
     /// 对前缀单独解码（快照缺失时的兜底）：`convert_with_opts` 不碰本次会话（引擎无状态），
@@ -204,8 +259,19 @@ impl Coordinator {
         self.mark_common(&mut pool);
         let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
         pool.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false, prefix));
-        let mut seen = std::collections::HashSet::new();
-        pool.retain(|c| seen.insert(c.text.clone()));
+        // 去重同主路径：被弃条目的码位要并进幸存者（`merged_codes`），检索范围按码位分组时
+        // 才不会丢掉「该码位下有常用字」这一事实（见 `build_candidates` 同处注释）。
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut deduped: Vec<Candidate> = Vec::with_capacity(pool.len());
+        for c in pool {
+            if let Some(&idx) = seen.get(&c.text) {
+                deduped[idx].absorb_codes_from(&c);
+                continue;
+            }
+            seen.insert(c.text.clone(), deduped.len());
+            deduped.push(c);
+        }
+        let mut pool = deduped;
         self.apply_filter(state, &mut pool);
         self.apply_single_char(state, &mut pool);
         let rerank_len = pool.iter().take_while(|c| !c.is_scope_filtered).count();
@@ -218,7 +284,7 @@ impl Coordinator {
 mod tests {
     //! 小词库 + 小码表夹具的无头集成测试：真实的小鹤双拼引擎（布局取入库的
     //! `data/schemas/shuangpin/xiaohe.toml`）、rime 源格式的迷你词库、`字=码` 码表，按键走
-    //! `handle_key_event` 入口。真实数据（`build_dev/data`）那组在 `tests/aux_code_direct_real.rs`。
+    //! `handle_key_event` 入口。真实数据（`build_dev/data`）那组在下方 `real_data_tests`。
     use crate::coordinator::Coordinator;
     use crate::pipeline::ModeKind;
     use std::sync::Arc;
@@ -412,6 +478,55 @@ mod tests {
         assert_eq!(via_snapshot.first().map(String::as_str), Some("释读"));
     }
 
+    /// ★ 输入不变而切了单字模式：命中项同样要过单字过滤。快照只按前缀串认的话，会拿
+    /// 切换前那份（含词）直接复用，「释读」照样顶在单字模式的首位。
+    #[test]
+    fn single_char_toggle_filters_hits_too() {
+        let (dir, _f) = fixture("single", "shuangpin", ON);
+        let (c, _) = coord("single", &dir);
+        type_str(&c, "uidup");
+        assert_eq!(texts(&c).first().map(String::as_str), Some("释读"));
+        c.set_single_char(true);
+        let t = texts(&c);
+        assert!(
+            t.iter().all(|x| x.chars().count() == 1),
+            "单字模式下不得有词：{t:?}"
+        );
+        // 反向对照：单字模式下直接辅助照常工作（`uip` 前缀 shi，释 = pl 中 p）。
+        press(&c, keymap::VK_ESCAPE);
+        type_str(&c, "uip");
+        let t = texts(&c);
+        assert_eq!(
+            t.first().map(String::as_str),
+            Some("释"),
+            "单字命中项照常提前：{t:?}"
+        );
+    }
+
+    /// 分段上屏后缓冲换了一段，旧快照不再对应任何前缀，作废。
+    #[test]
+    fn partial_commit_drops_prefix_snapshot() {
+        let (dir, _f) = fixture("partial", "shuangpin", ON);
+        let (c, _) = coord("partial", &dir);
+        // 奇数长度收尾：上屏后剩 `gok`，不是整音节输入，不会顺手覆盖快照。
+        type_str(&c, "uidugok");
+        let mut st = c.state.lock().unwrap();
+        let shi = st
+            .candidates
+            .iter()
+            .find(|c| c.text == "湿度")
+            .cloned()
+            .expect("湿度");
+        assert_eq!(shi.consumed_length, 4, "分段候选");
+        c.commit_selected(&mut st, &shi, 0);
+        assert_eq!(st.input_buffer, "gok");
+        let stale = st
+            .direct_aux_prev
+            .as_ref()
+            .is_some_and(|p| !st.input_buffer.starts_with(&p.input));
+        assert!(!stale, "分段上屏后不得留着上屏前的快照");
+    }
+
     /// 高亮移到非命中项时组码区回到普通双拼分段。
     #[test]
     fn preedit_follows_highlight() {
@@ -505,7 +620,7 @@ mod tests {
             text: "湿度".into(),
             ..Default::default()
         }];
-        c.apply_direct_aux(&mut st, &mut cands, 50);
+        c.apply_direct_aux(&mut st, &mut cands, 50, false);
         assert_eq!(cands.len(), 1);
         assert!(st.direct_aux_body.is_empty());
         st.active = None;
@@ -722,6 +837,39 @@ mod real_data_tests {
         assert!(lm.iter().any(|(t, hit)| t == "架" && *hit), "{lm:?}");
     }
 
+    /// 连打（取几键前的快照）与退格重打（快照作废、对前缀单独解码）给出**同一批**命中项。
+    ///
+    /// 单音节前缀是高危区：`wu` 有数百个同音字，主候选在 limit 处被截断，而兜底解码按辅码
+    /// 首字母在截断**前**准入——截断过的快照会漏掉排在后面的命中（`wuk` 曾少了 喔 呒 圄）。
+    #[test]
+    fn typed_through_and_retyped_hits_agree() {
+        if !has_data() {
+            return;
+        }
+        let on = coord(true);
+        let hits = |c: &Coordinator| -> Vec<String> {
+            cands(c)
+                .into_iter()
+                .filter(|(_, h)| *h)
+                .map(|(t, _)| t)
+                .collect()
+        };
+        for input in [
+            "wuk", "jip", "yuy", "jib", "yiy", "yil", "lik", "uiy", "uidup", "goqkk", "uidupl",
+            "jxlm",
+        ] {
+            type_each(&on, input, |_| {});
+            let through = hits(&on);
+            press(&on, keymap::VK_BACK);
+            on.state.lock().unwrap().direct_aux_prev = None;
+            let last = input.chars().last().unwrap();
+            press(&on, keymap::VK_A + (last as u32 - 'a' as u32));
+            let retyped = hits(&on);
+            assert_eq!(through, retyped, "{input}: 连打与退格重打的命中项不一致");
+            assert!(!through.is_empty(), "{input}: 没有命中，对照没测到东西");
+        }
+    }
+
     /// 6 音节整句逐键输入：**偶数键**首选与关闭直接辅助码时逐键一致（全音节解析优先），
     /// 前缀 ≥ 3 音节的**奇数键**亦然（长句保首选）。
     ///
@@ -801,16 +949,24 @@ mod real_data_tests {
             }
         }
         let rounds = 20;
-        for (name, c) in [("off", &off), ("on", &on), ("off", &off), ("on", &on)] {
-            let mut keys = 0u32;
-            let t = std::time::Instant::now();
-            for _ in 0..rounds {
-                for s in inputs {
-                    type_each(c, s, |_| keys += 1);
+        // 分两组报：长句（单音节前缀的兜底解码每句只摊一次）与短词（每个词都要摊一次）。
+        let groups: [(&str, &[&str]); 3] = [
+            ("全部", &inputs),
+            ("整句", &inputs[..3]),
+            ("短词", &inputs[3..]),
+        ];
+        for (group, list) in groups {
+            for (name, c) in [("off", &off), ("on", &on), ("off", &off), ("on", &on)] {
+                let mut keys = 0u32;
+                let t = std::time::Instant::now();
+                for _ in 0..rounds {
+                    for s in list {
+                        type_each(c, s, |_| keys += 1);
+                    }
                 }
+                let per = t.elapsed() / keys;
+                eprintln!("direct {name} [{group}]: {keys} 键，平均 {per:?}/键");
             }
-            let per = t.elapsed() / keys;
-            eprintln!("direct {name}: {keys} 键，平均 {per:?}/键");
         }
     }
 }

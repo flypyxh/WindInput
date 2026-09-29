@@ -41,7 +41,7 @@ pub mod table;
 
 pub use direct::{
     DirectPhraseRule, DirectPlacement, DirectSplit, direct_matches, direct_placement,
-    is_direct_source, merge_direct_hits, split_direct,
+    is_direct_source, mark_direct_hit, merge_direct_hits, split_direct,
 };
 pub use filter::{AuxCodeFilterOptions, aux_code_matches, filter_by_aux_code};
 pub use loader::{load_from_file, load_merged, read_name};
