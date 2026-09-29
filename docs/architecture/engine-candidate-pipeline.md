@@ -795,6 +795,8 @@ step 2c（尾部残码参与整句解码）此前在混输下**整体关闭**（
      这个按候选长度裁剪。豁免判据是 `is_user_authored`（短语/命令/分组），⛔ **不是**
      `is_common_like`（那个连常用词一起豁免 ⇒ 功能失效）。见 design/single-char-mode.md
 ⑥ apply_freq_rerank：用户词频重排（独立维度，绝不改 weight）
+⑥' apply_direct_aux：直接辅助码（仅双拼，出厂关，§9.1）——末 1～2 位当辅码，命中项并入。
+     钉在全部重排之后、shadow 之前；翻页扩容只重跑本函数，故不能挪到 update_candidates
 ⑦ apply_shadow：shadow 规则删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
 ⑧ 自动上屏复评与守护：
      引擎意向 or recheck_auto_commit（显示态复评，惰性）
@@ -975,7 +977,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 + 纯筛选，不碰文件系统，路径由调用方解析）。
 
 - **配置（三层，同 `[schema.codetable]` 那套 tri-state，见 schema-config-layering.md §4）**：
-  全局基线 `[schema.pinyin.aux_code]`（`enabled` **出厂 false** / `max_phrase_len`）；
+  全局基线 `[schema.pinyin.aux_code]`（`enabled` **出厂 false** / `max_phrase_len` / `direct`（§9.1，出厂 false））；
   方案段 `[engine.aux_code]` 放 `files`（方案属性：全拼配笔画——出厂引用「笔画」码表方案
   `schema:stroke`，双拼配小鹤形码文件 `aux_code/flypy_full.txt`），并可用
   同名 `enabled` / `max_phrase_len` 逐字段覆盖全局；`schema_overrides/{id}.toml` 用**相同段名**
@@ -1007,7 +1009,8 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   反查索引由 `prewarm_indexes` / 切方案后台预热，文件表**不参与预热**。缓存是全局一份，
   各方案码表不同（拼音笔画表 vs 双拼小鹤全码表），**切方案必须失效重挂**
   （`invalidate_aux_code_table`，随 `sync_chaizi_assets`/`sync_comment_dicts` 一起）。表格式：
-  UTF-8 `字=码` 一行一条（`=` 分隔，与 rime-lua-aux-code `aux_code` 目录一致），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），
+  UTF-8 `字=码` 一行一条（`=` 分隔，与 rime-lua-aux-code `aux_code` 目录一致；`=` 右侧也可按空白写多个码，
+  如手心表 `七=a p`；非 UTF-8 整张忽略并告警「请转存为 UTF-8」），`#` 注释跳过，第 1 行可选 `# name:`（缺省回落文件主干名），
   version/source 当普通注释不解析。码表文件是 `wind-tools/gen_aux_code` 的构建产物、
   **不入版本库**（rime-stroke 为 LGPL-3.0，见 NOTICE.md）。笔画方案词库
   `schemas/stroke/stroke.dict.yaml` 与 `aux_code/stroke.txt` 由它同一次解析产出（字与码序逐一
@@ -1032,6 +1035,25 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
   `overlay_ctrl_alt_guard`。退出 `exit_aux_code` 刻意不 `ClearComposition`（筛选非放弃组合）。
 - **表名**：`mode_indicator_names` 的 AuxCode 分支读表 `name`（如「笔画」）显示在指示位，
   未命名/未加载则沿用主路径。
+
+### 9.1 直接辅助码（双拼，不按引导键）
+
+设计 `docs/design/aux-code-direct.md`。不进 overlay、**无状态**：每键在 `build_candidates` 的⑥'
+（`handle_direct_aux.rs::apply_direct_aux`）按奇偶把输入拆成「前缀 + 末 1～2 位」，前缀候选里
+字形对得上的并入主候选；纯逻辑（切分 / 任意字匹配 / 并入排序）在 `wind-aux-code/src/direct.rs`。
+
+- **门卫**：主输入路（`state.active == None`；临拼 / 混输 / 引导键态都不做）、`enabled` 且 `direct`
+  （`AuxCodeSettings::direct` 已折叠「只认双拼」）、输入 ≥ 3 键、不含 `'`、前缀恰好切成完整双拼音节
+  （`Engine::shuangpin_full_syllable_count`，纯内存；全拼 / 码表 / 混输恒 `None`）、方案来源系统层
+  就绪（否则本键原样 + `spawn_index_warm`，与引导键进入同一处理）。
+- **前缀候选**：连打时前缀恰是几键前的整个输入，直接取那一键**并入之前、shadow 之前**的主候选快照
+  （`State.direct_aux_prev`，只在整音节输入时更新）；快照缺失（退格改前缀、光标中间编辑）才对前缀
+  单独 `convert_with_opts`（`require_full_match` + 按辅码首字母 `admit`），走同一条加工链。
+  取完整覆盖前缀的拼音词与单字（`is_direct_source`：非合成整句、非补全 / 子短语 / 简拼 / 草稿）。
+- **并入**（`merge_direct_hits`）：奇数且前缀 < 3 音节 → 命中项排最前；奇数前缀 ≥ 3 音节 → 保留首选；
+  偶数 → 开头最多 2 个覆盖全部输入的完整候选在前。命中项 `consumed_length` = 整串、`code` 仍是
+  前缀拼音码（调频记前缀下），`is_direct_aux` 标记供组码区显示 `ui'du p`（`State.direct_aux_body`，
+  `effective_preedit_body` 按高亮切换）。
 
 ---
 
@@ -1101,4 +1123,5 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 | 词库（格式/缓存/多层） | `wind-dict/src/{codetable,binformat,datformat,cached,composite,manager,layer,store_layer}.rs` |
 | 后处理管线 / 顶码守护 | `wind-coordinator/src/handle_candidate.rs`、`coordinator.rs`（VK_A..Z 顶码段） |
 | 辅助码（overlay 模式 / 纯筛选 / 三段式表 / 表格式） | `wind-coordinator/src/handle_aux_code.rs`、`wind-aux-code/src/{table,loader,filter}.rs`、`data/schemas/aux_code/*.txt` |
+| 直接辅助码（双拼，候选后处理） | `wind-coordinator/src/handle_direct_aux.rs`、`wind-aux-code/src/direct.rs` |
 | 配置结构与注册 | `wind-config/src/{config,schema,config_schema}.rs`、`data/config.toml` |

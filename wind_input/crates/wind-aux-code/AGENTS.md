@@ -28,8 +28,9 @@
 | `src/lib.rs` | 模块文档 + 统一导出：`AuxCodeTable`、`AuxCodeLookup`、`AuxCodeFilterOptions`、`aux_code_matches`、`filter_by_aux_code`、`AuxCodeSession`、`load_from_file`、`load_merged`、`read_name` |
 | `src/lookup.rs` | `AuxCodeLookup` trait：筛选取码的唯一接口（`any_code` 按优先级回调、`is_empty` 决定 passthrough，前缀匹配为默认方法）。`AuxCodeTable` 实现它；协调器的方案来源运行时（`aux_code_source.rs`，文件表 + 方案视图分层）也实现它 |
 | `src/table.rs` | `AuxCodeTable`：三段式紧凑布局（`entries` + `code_ends` + `arena`，与 `wind-reverse::PinyinTable` 同构）；`from_rows` 单表构建、`merge`/`append` 多表坍缩、查询（`any_code_starts_with`/`any_code_starts_with_char`）、状态（`is_empty`/`char_count`）。`codes_of`/`first_code`/`code_count` 仅测试用（`#[cfg(test)]`）。**纯内存，不碰 `std::path`/文件** |
-| `src/loader.rs` | `parse_str`（`pub(crate)`）/ `load_from_file` / `load_merged`：txt 格式 → 表。**`=` 分隔**（UTF-8，每行一条 `字=码`，同字多码分列多行，与 rime-lua-aux-code `aux_code` 目录一致）；处理 BOM/注释/空行/非单字行；**只从第 1 行提取方法名**（`# name: 笔画` / `#name: 笔画`），`load_from_file` 空名回落文件主干名；`load_merged` = `merge(paths.iter().map(load_from_file))`（协调器合并相邻文件来源的路径）；`read_name` 只读首行取名（设置页列可选码表用，不整张读入） |
+| `src/loader.rs` | `parse_str`（`pub(crate)`）/ `load_from_file` / `load_merged`：txt 格式 → 表。**`=` 分隔**（UTF-8，每行一条 `字=码`，同字多码分列多行，与 rime-lua-aux-code `aux_code` 目录一致；`=` 右侧也可按空白写多个码 `七=a p`（手心表）；非 UTF-8 告警「请转存为 UTF-8」并产出空表）；处理 BOM/注释/空行/非单字行；**只从第 1 行提取方法名**（`# name: 笔画` / `#name: 笔画`），`load_from_file` 空名回落文件主干名；`load_merged` = `merge(paths.iter().map(load_from_file))`（协调器合并相邻文件来源的路径）；`read_name` 只读首行取名（设置页列可选码表用，不整张读入） |
 | `src/filter.rs` | `aux_code_matches`（单候选谓词，供 `CandidateStore::set_filter` 等组合使用）+ `filter_by_aux_code`（批量筛选，输出 `FilterOutcome`）。逐字首码匹配**零分配**（字符迭代器，勿退化成 `Vec<char>`/前缀串） |
+| `src/direct.rs` | **直接辅助码**（双拼，不按引导键、末 1～2 位自动当辅码）的纯函数：`split_direct`（奇偶切分）、`is_direct_source`（前缀候选资格）、`direct_matches` + `DirectPhraseRule::Any`（单字按码开头；词组 1 位任一字、2 位「任一字码以 ab 开头或 i<j 分别以 a、b 开头」）、`direct_placement` + `merge_direct_hits`（并入排序；常量 `ODD_KEEP_TOP_MIN_SYLLABLES` = 3、`EVEN_KEEP_FULL_COVER` = 2）。它是「提」不是「筛」，不受 `filter_by_aux_code` 的子序列不变量约束；协调器侧在 `handle_direct_aux.rs` |
 | `src/session.rs` | `AuxCodeSession`：辅助码**筛选会话状态机**——内部持 `CandidateStore`（原始候选快照 + 筛选视图）+ 辅助码缓冲；`apply`（通过 `CandidateStore::set_filter` 从快照重筛，**只返回命中者**）、`restore_original`（通过 `CandidateStore::clear_filter` 还原）。**不含显示态**：组合区（preedit）拼接/光标是协调器职责，分隔符前缀在协调器进入时拼一次。协调器 `State.aux_code` 只持它（含显示态一并打包在 `AuxCodeOverlay`），按键路由/UI 更新留在协调器 |
 
 ## For AI Agents
@@ -42,6 +43,10 @@
   ⚠️ 主排序首要键是消费长度（`by_consumed`，librime 对齐），会让低词频长子短语排在短单字
   前（如 `没时间` 池的 `没试` w=30 在 `没` w=60230 前）——**这是主排序的有意行为**，
   本 crate 不纠正、也不在辅助码侧叠按词频的排序。
+- **直接辅助码与引导键模式的防御语义相反**：`direct_matches` 空辅码 / 空表 / 超过 2 位一律
+  **不命中**——命中的后果是被提前，防御态应当什么都不做；而引导键筛选的防御态是 passthrough。
+  **2 位命中集 ⊆ 其首字母 1 位命中集**（守护测试 `two_letter_hits_are_subset_of_first_letter_hits`）：
+  协调器据此按首字母给引擎下推准入，改匹配规则时这条必须仍成立。
 - **空输入 / 空表 = 不过滤（passthrough）**：`aux_input` 为空或表未挂载时原样放行
   全部候选。这是防御语义（辅助码模式由触发键进入，正常不会空手筛选），**禁止**改回
   旧行为「全部滤掉」——那会把候选窗整个滤光。
