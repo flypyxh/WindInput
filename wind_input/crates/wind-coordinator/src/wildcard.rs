@@ -34,6 +34,19 @@ fn wildcard_key_vk(key: char) -> Option<(u32, bool)> {
     Some((vk, punct_char(vk, false) != Some(key)))
 }
 
+/// 拼音分段续转态：最后一段是拼音选词，剩余编码按混输的拼音子方案转换（`build_candidates`）。
+/// 该态下通配一律字面（spec §10）——剩余串是拼音的后半截，不是码表码。
+///
+/// ★ 与 `build_candidates` 选拼音子方案用的是同一个函数：两处各写一份，改一处另一处就会
+/// 出现「续转走拼音、却又按通配查码表」。本判据看会话状态（已上屏段），退格回退段时随之
+/// 失效，仍满足模块文档「同一状态前后两次重算结论相同」。
+pub(crate) fn last_seg_is_pinyin(state: &State) -> bool {
+    state
+        .committed_segs
+        .last()
+        .is_some_and(|s| s.source == CandidateSource::Pinyin)
+}
+
 impl Coordinator {
     /// 按下的字符 `ch` 此刻是否作通配进缓冲——两个接线点（字母臂、`try_code_char_gate`）
     /// 的唯一入口。
@@ -44,6 +57,7 @@ impl Coordinator {
     /// 就 return 了，这里是结构性兜底：日后哪条 overlay 路径复用了这两个接线点，不会静默带上通配。
     pub(crate) fn wildcard_enters(&self, state: &State, ch: char) -> bool {
         state.active.is_none()
+            && !last_seg_is_pinyin(state)
             && self.engine_mgr.active_wildcard_key() == Some(ch)
             && self.wildcard_decision(&state.input_buffer, ch) == WildcardDecision::Enter
     }
@@ -75,9 +89,9 @@ impl Coordinator {
     /// 作通配的话只会得到一条比任何码都长的死串：无候选、又因通配不顶字。
     ///
     /// ★ 按键裁决与 [`Self::wildcard_pattern`] 共用本判据：同一串缓冲前后两次重算须得出
-    /// 同一结论（见模块文档）。`max_code_length` 为 0（无满码概念）时恒 `false`。
+    /// 同一结论（见模块文档）。通配码长（`wildcard_code_length`，混输取主码表的）为 0 时恒 `false`。
     fn wildcard_past_full(&self, pos: usize) -> bool {
-        let max = self.engine_mgr.active_max_code_length();
+        let max = self.engine_mgr.active_wildcard_code_length();
         max > 0 && pos >= max
     }
 
@@ -87,6 +101,12 @@ impl Coordinator {
     /// 对应用户原始要求「键已启动别的功能 / 模式时不做首键模糊匹配」。首位通配属 spec §8
     /// 延后的专门模式。顺带不必把符号键从 C++ 透传集里剔除（剔除曾让 `/` 跨方案被白吃）。
     fn wildcard_lead_yields(&self, key: char) -> bool {
+        // 五笔拼音混输：首位一律字面（spec §10）。z 是拼音声母（`zhang` / `zai`），而混输下
+        // `has_code_prefix("z")` 只在装了 `zz*` 短语时成立（单字母够不着 `min_pinyin_length`，
+        // 五笔主库无 z 码），靠它让位的话没装短语的用户打 `zhang` 会变成 `?hang`。
+        if self.engine_mgr.active_wildcard_mixes_pinyin() {
+            return true;
+        }
         if !key.is_ascii_lowercase() {
             return true;
         }
@@ -158,11 +178,16 @@ impl Coordinator {
     /// 与 [`Self::wildcard_decision`] 同一套规则重算（见模块文档）：首位字面 ⇒ 整轮字面；
     /// 非首位存在冲突 ⇒ 非首位的通配键一律字面（冲突时它们只可能经让位进来，spec §3.3
     /// 非首位一行）；落在满码之后的通配键一律字面（[`Self::wildcard_past_full`]）。
+    /// 混输下整串超过主码表码长 ⇒ 整串字面（[`Self::wildcard_mixed_overflow`]）；拼音分段
+    /// 续转态见 [`Self::wildcard_pattern_of`]。
     ///
     /// 通配关闭时 `active_wildcard_key()` 为 `None`，在任何缓冲扫描与分配之前返回。
     pub(crate) fn wildcard_pattern(&self, buffer: &str) -> Option<String> {
         let key = self.engine_mgr.active_wildcard_key()?;
-        if !buffer.contains(key) || self.wildcard_lead_literal(buffer, key) {
+        if !buffer.contains(key)
+            || self.wildcard_lead_literal(buffer, key)
+            || self.wildcard_mixed_overflow(buffer)
+        {
             return None;
         }
         let mid_ok = self.wildcard_mid_owners(key).is_empty();
@@ -180,6 +205,25 @@ impl Coordinator {
             })
             .collect();
         any.then_some(pattern)
+    }
+
+    /// 混输：整串长度超过主码表码长 ⇒ 码表不可能配上，整串归拼音、按字面（spec §10）。
+    /// 纯码表不走这条：那里按位判满码（`azaaz` 前段仍是通配，见 [`Self::wildcard_past_full`]）。
+    fn wildcard_mixed_overflow(&self, buffer: &str) -> bool {
+        let max = self.engine_mgr.active_wildcard_code_length();
+        self.engine_mgr.active_wildcard_mixes_pinyin() && max > 0 && buffer.chars().count() > max
+    }
+
+    /// [`Self::wildcard_pattern`] 再加一条**看会话状态**的判据：拼音分段续转态一律字面
+    /// （spec §10，[`last_seg_is_pinyin`]）。手里有 `State` 的调用点一律走这里。
+    ///
+    /// `main_freq_code` 仍按缓冲调 `wildcard_pattern`：续转态的转换走纯拼音子方案，不产出
+    /// 码表候选，而 `main_freq_code` 只对码表候选改记全码，两者结论一致。
+    pub(crate) fn wildcard_pattern_of(&self, state: &State) -> Option<String> {
+        if last_seg_is_pinyin(state) {
+            return None;
+        }
+        self.wildcard_pattern(&state.input_buffer)
     }
 
     /// 主输入路**上屏记账点**用的记账码：通配组码下的码表候选记候选**全码**，其余同
@@ -459,5 +503,84 @@ mod tests {
             c.main_freq_code("azzz", &phrase),
             c.freq_code("azzz", &phrase)
         );
+    }
+
+    /// 五笔拼音混输 + 通配键 `z`；缺数据返回 `None`。
+    fn wubi_pinyin_z(tweak: impl FnOnce(&mut Config)) -> Option<Arc<Coordinator>> {
+        if !data_dir()
+            .join("schemas/wubi86_pinyin.schema.toml")
+            .exists()
+        {
+            eprintln!("跳过：混输方案不存在");
+            return None;
+        }
+        wubi_z(|cfg| {
+            cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
+            cfg.schema.active = "wubi86_pinyin".into();
+            tweak(cfg);
+        })
+    }
+
+    /// ★ Review Focus 5：混输首位一律字面（z 是拼音声母），不靠 `zz*` 短语——这里**不装**
+    /// 短语，混输下 `has_code_prefix("z")` 为假，旧规则会判 Enter。首位字面 ⇒ 整串字面。
+    #[test]
+    fn mixed_lead_is_always_literal() {
+        let Some(c) = wubi_pinyin_z(|_| {}) else {
+            return;
+        };
+        assert_eq!(c.wildcard_decision("", 'z'), Yield, "混输首位 z 是拼音声母");
+        assert_eq!(c.wildcard_decision("z", 'z'), Yield, "首位字面 ⇒ 整轮字面");
+        assert_eq!(c.wildcard_pattern("zhan"), None);
+        assert_eq!(c.wildcard_pattern("zaz"), None);
+        assert_eq!(
+            c.wildcard_decision("a", 'z'),
+            Enter,
+            "对照：非首位码长内照常通配"
+        );
+    }
+
+    /// 混输：整串 > 主码表码长 ⇒ 整串字面（连前段通配位一起）；码长取主码表的 4，
+    /// 不是混输 `max_code_length` 的 0。对照纯五笔 `azaaz` → `a?aaz`（`wildcard_past_full_length_is_literal`）。
+    #[test]
+    fn mixed_overlength_buffer_is_literal() {
+        let Some(c) = wubi_pinyin_z(|_| {}) else {
+            return;
+        };
+        assert_eq!(c.wildcard_pattern("hanz"), Some(format!("han{S}")));
+        assert_eq!(c.wildcard_pattern("gz"), Some(format!("g{S}")));
+        assert_eq!(c.wildcard_pattern("hanzi"), None, "超码长整串字面");
+        assert_eq!(c.wildcard_pattern("azaaz"), None, "前段通配位也随整串字面");
+        assert_eq!(c.wildcard_decision("xian", 'z'), Yield, "码长取主码表的 4");
+        assert_eq!(c.wildcard_decision("han", 'z'), Enter);
+    }
+
+    /// ★ Review Focus 4：拼音分段续转态（最后一段是拼音选词）剩余串一律字面，按键也不作通配。
+    #[test]
+    fn pinyin_continuation_is_literal() {
+        let Some(c) = wubi_pinyin_z(|_| {}) else {
+            return;
+        };
+        let mut st = crate::coordinator::State {
+            input_buffer: "aizi".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.wildcard_pattern_of(&st),
+            Some(format!("ai{S}i")),
+            "前置：无分段时码长内照常通配"
+        );
+        st.committed_segs.push(crate::coordinator::CommittedSeg {
+            raw_code: "wo".into(),
+            code: "wo".into(),
+            text: "我".into(),
+            source: wind_candidate::CandidateSource::Pinyin,
+            boundary: 0,
+            learn: None,
+        });
+        assert_eq!(c.wildcard_pattern_of(&st), None, "拼音分段续转 ⇒ 字面");
+        st.input_buffer = "ai".into();
+        assert!(!c.wildcard_enters(&st, 'z'), "续转态按键也不作通配");
+        st.committed_segs.clear();
+        assert!(c.wildcard_enters(&st, 'z'), "对照：无分段时作通配");
     }
 }

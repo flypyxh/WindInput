@@ -1182,10 +1182,7 @@ impl Coordinator {
         // `convert_overflow`），码表也会进入分段态。沿用旧判据的话，`yijga` 选「就是」后剩下的
         // `a` 会被强制按拼音解释，用户看到五笔码出拼音候选。改看**最后一段的来源**：谁刚被选走，
         // 剩余编码就大概率还是谁的。
-        let last_seg_is_pinyin = state
-            .committed_segs
-            .last()
-            .is_some_and(|s| s.source == CandidateSource::Pinyin);
+        let last_seg_is_pinyin = crate::wildcard::last_seg_is_pinyin(state);
         let pinyin_schema = if last_seg_is_pinyin {
             let active = self.engine_mgr.active_schema_id();
             self.engine_mgr
@@ -1199,23 +1196,26 @@ impl Coordinator {
         // N-best 条数——混输下整句块置顶、切换键夺键都不该出现（引擎侧只把混输辅助钉成 1/1，
         // 管不到这条路），故在这里一并关掉（审查查出）。
         let via_mixed_pinyin = pinyin_schema.is_some();
-        // 通配组码（spec §5.3）：只查码表，不走短语 / 整句 / 逆切分 / 混输拼音 / 英文混入。
-        // pattern 由协调器按 §3.3 从缓冲重算（首位让位的字面通配键不在其中）。
+        // 通配组码（spec §5.3 / §10）：纯码表只查码表；五笔拼音混输码长内是「字面混输 ⊕
+        // 主码表通配」（合并在 `MixedEngine::convert_wildcard`）。两者都不走短语 / 整句 / 逆切分。
+        // pattern 由协调器按 §3.3 / §10 重算：首位字面、混输超码长、拼音分段续转都不给 pattern。
         // 它同时是本函数下面各处短路（短语、自动上屏复评、清空复核、短语自动上屏、
         // 显示层去重口径、出简让全）的唯一判据。
-        let wildcard_pattern = self.wildcard_pattern(&state.input_buffer);
-        let result = if let Some(p) = &wildcard_pattern {
-            self.engine_mgr
-                .convert_wildcard(&state.input_buffer, p, limit)
-                .unwrap_or_default()
-        } else {
-            match pinyin_schema {
-                Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
-                    self.engine_mgr
-                        .convert_with(&ps, &state.input_buffer, limit)
-                }
-                _ => self.engine_mgr.convert(&state.input_buffer, limit),
+        let wildcard_pattern = self.wildcard_pattern_of(state);
+        // ★ 分段续转排在通配之前（spec §10）：续转态的剩余串是拼音后半截。
+        // `wildcard_pattern_of` 在续转态本就给 `None`，这里的先后是第二道保险。
+        let result = match pinyin_schema {
+            Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
+                self.engine_mgr
+                    .convert_with(&ps, &state.input_buffer, limit)
             }
+            _ => match &wildcard_pattern {
+                Some(p) => self
+                    .engine_mgr
+                    .convert_wildcard(&state.input_buffer, p, limit)
+                    .unwrap_or_default(),
+                None => self.engine_mgr.convert(&state.input_buffer, limit),
+            },
         };
         // 拼音音节拆分形态（供「混输高亮跟随」按高亮候选类型选择显示原始码 / 拆分串）。
         // 码表 / 无拼音 → 空串（恒原始码）。state.preedit 本身由 sync_preedit_to_highlight

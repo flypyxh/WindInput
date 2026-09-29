@@ -5125,7 +5125,7 @@ impl Coordinator {
         //
         // 通配组码不顶字（spec §3.2）。引擎的 `handle_top_code` 是字面语义（`aaaza` 在它看来
         // 是「超码长 + 无匹配 + 无后继」的典型溢出），故短路必须落在这里。
-        let top_code = if self.wildcard_pattern(&state.input_buffer).is_some() {
+        let top_code = if self.wildcard_pattern_of(state).is_some() {
             None
         } else {
             self.engine_mgr

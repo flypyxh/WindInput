@@ -873,13 +873,9 @@ impl Engine for MixedEngine {
         self.primary.input_chars()
     }
 
-    /// 有拼音子引擎时通配**关闭**（spec §3.1：五笔拼音混输不参与）：通配键多为字母 `z`，
-    /// 非首位的 `z` 在拼音里是正经字母（`hanzi` / `xianzai`），作通配会把整串变成只查
-    /// 主码表的查询、拼音候选全灭。无拼音子引擎时代理主码表。
+    /// 混输代理主码表的通配键（spec §10：码长内两路同查）。哪几位作通配、何时整串字面
+    /// 由协调器裁决（首位 / 超码长 / 拼音分段续转，见 `wind-coordinator/src/wildcard.rs`）。
     fn wildcard_key(&self) -> Option<char> {
-        if self.secondary.is_some() {
-            return None;
-        }
         self.primary.wildcard_key()
     }
 
@@ -2656,8 +2652,8 @@ mod tests {
         assert!(mixed.wildcard_mixes_pinyin());
         assert_eq!(
             mixed.wildcard_key(),
-            None,
-            "协调器规则落地前（Task 3）仍关闭"
+            Some('z'),
+            "混输代理主码表的通配键（spec §10）"
         );
 
         let solo = MixedEngine::new(
