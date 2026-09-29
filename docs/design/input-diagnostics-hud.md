@@ -48,10 +48,12 @@
 |---|---|
 | `pid` | 焦点进程 pid（已有，经 client_token 高 32 位） |
 | `disabled: bool` | `_bKeyboardDisabled` 当前值 |
-| `reason: u8` | 0=None / 1=CompartmentDisabled / 2=InputScopePassword / 3=NumericPassword |
+| `reason: u8` | 0=None / 1=CompartmentDisabled（线程级）/ 2=InputScopePassword / 3=NumericPassword / 4=ContextDisabled（context 级禁用、宿主未报密码 scope） |
 | `input_scope_mask: u64` | 已有字段 |
 
-`reason` 判定（DLL 侧）：compartment 置位 → `CompartmentDisabled`；否则看 mask 的 IS_PASSWORD(31) / IS_NUMERIC_PASSWORD(63) 位；都无 → `None`。
+`reason` 判定（DLL 侧）：线程级 compartment 置位 → `CompartmentDisabled`；否则看**宿主原始** InputScope 的 IS_PASSWORD(31) / IS_NUMERIC_PASSWORD(63) 位；再否则 context 级 KEYBOARD_DISABLED 置位 → `ContextDisabled`（4）；都无 → `None`。
+
+> **为什么要有 4（t197，2026-09-29）**：DLL 会把 context 级 KEYBOARD_DISABLED 折进上报 mask 的 IS_PASSWORD 位（抑制门控靠它，Chromium 密码框就是这么置的），折位后服务端分不出「宿主报了密码」与「宿主只是禁用了输入」。Gecko 系（Zen / Firefox）页面无输入焦点时也会置它，HUD 因此显示宿主根本没报过的 `0x80000001` 与「密码」，把楼主带偏。`reason=4` 把折位前的区分带过来：HUD 展示宿主原始 scope（摘掉折进去的 bit31），图标提示语说「被应用禁用输入法」而不是「密码框」。抑制行为两档一致。服务端只在 reason=4 **且** mask 含密码位时采信；旧 DLL 不发 4，退回按 mask 推导。
 
 协议落点：
 
@@ -73,8 +75,8 @@
 - **不自动隐藏**（区别于 StatusTip 的 ~1s 自隐）；由菜单开关控制显隐。
 - 显示内容（多行）：
   - `进程名 (pid)`
-  - `禁用态: 是 / 否`
-  - `原因: compartment / 密码 / 数字密码 / 无`
+  - `线程禁用: 是 / 否`（线程级 KEYBOARD_DISABLED）
+  - `原因: 线程级禁用 / 宿主报密码 / 宿主报数字密码 / context 禁用 / 无`
   - `InputScope: 0x…（解码位名）`
 - 交互：**单击/拖动 = 移动窗口**；**双击 = 复制当前诊断到剪贴板**（满足「用户可上报」，避免与拖动冲突）。
 - 每次 `last_input_diag` 更新且 HUD 可见 → 重绘，保证实时。

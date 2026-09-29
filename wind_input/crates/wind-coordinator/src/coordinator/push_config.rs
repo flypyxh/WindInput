@@ -455,6 +455,9 @@ impl Coordinator {
         match block {
             crate::coordinator::InputBlock::KeyboardDisabled => format!("{NAME} - 已禁用"),
             crate::coordinator::InputBlock::Password => format!("{NAME} - 密码框，已切英文"),
+            crate::coordinator::InputBlock::ContextDisabled => {
+                format!("{NAME} - 当前输入区被应用禁用输入法，已切英文")
+            }
             // NoEditContext 不进这里：它已不再让图标显「英」（是日常状态，见 shows_english），
             // tooltip 自然也不该提，否则悬停时说的与看到的对不上。
             _ if chinese && !caps => format!("{NAME} - 中文模式"),

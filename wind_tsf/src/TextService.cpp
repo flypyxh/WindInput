@@ -38,12 +38,19 @@ static const UINT64 kPasswordScopeBits = kScopeBitPassword | kScopeBitNumericPas
 
 // 输入诊断 HUD（Task 7）：由 disabled + InputScope mask 计算上报 reason，语义与 Rust
 // coordinator 侧 reason_from 完全一致。reason: 0 None / 1 CompartmentDisabled /
-// 2 InputScopePassword / 3 NumericPassword。disabled（compartment 命中）优先级最高。
-static inline uint8_t ComputeInputReason(bool disabled, UINT64 mask)
+// 2 InputScopePassword / 3 NumericPassword / 4 ContextDisabled。disabled（线程级 compartment
+// 命中）优先级最高。
+//
+// ★ `rawMask` 必须是**折位之前**宿主原始报的 InputScope：context 级 KEYBOARD_DISABLED 会被折进
+// mask 的 IS_PASSWORD 位（抑制门控靠它），折位后就分不出「宿主报了密码」与「宿主只是禁用了输入」。
+// 4 这一档正是把折位前的区分带给服务端，让 HUD / 图标提示说真话（t197：Zen 无输入焦点时也置
+// context 级禁用，被说成「密码框」）。服务端见 reason=4 且 mask 含密码位才采信。
+static inline uint8_t ComputeInputReason(bool disabled, UINT64 rawMask, bool ctxDisabled)
 {
     if (disabled) return 1;
-    if (mask & (1ULL << 63)) return 3; // IS_NUMERIC_PASSWORD
-    if (mask & (1ULL << 31)) return 2; // IS_PASSWORD
+    if (rawMask & (1ULL << 63)) return 3; // IS_NUMERIC_PASSWORD
+    if (rawMask & (1ULL << 31)) return 2; // IS_PASSWORD
+    if (ctxDisabled) return 4;            // context 级 KEYBOARD_DISABLED，宿主未报密码 scope
     return 0;
 }
 
@@ -3053,7 +3060,7 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             // SendInputStateReport 同源），语义＝「系统禁用了输入法，DLL 已全放行」。
             // 密码框（context 级）不走这个字段，它已折进 mask 的 IS_PASSWORD 位——此前这里
             // 传 _focusIsPassword，让 core 把「密码框」误读成「键已放行」，抑制被自我否决。
-            uint8_t inputReason = ComputeInputReason(_bKeyboardDisabled != FALSE, inputScopeMask);
+            uint8_t inputReason = ComputeInputReason(_bKeyboardDisabled != FALSE, rawScopeMask, _focusIsPassword);
             // 焦点顶层窗口类：服务端据此区分 explorer.exe 的过渡型窗口（任务栏 /
             // Alt+Tab 切换器，用户点它是为了去别处）与停留型窗口（桌面 / 文件管理器）。
             // 二者进程名相同，per-app 规则仅凭进程名分不开。
@@ -3667,7 +3674,7 @@ STDAPI CTextService::OnChange(REFGUID rguid)
             // 与 core 同步更新自留掩码：本路径是「焦点未变但禁用态翻转」（SPA 原地跳到
             // 密码框），不走 OnSetFocus，不更新则抑制门控会一直用旧焦点的掩码。
             _focusInputScopeMask = curMask;
-            uint8_t curReason = ComputeInputReason(bDisabled != FALSE, curMask);
+            uint8_t curReason = ComputeInputReason(bDisabled != FALSE, curMask, false);
             _pIPCClient->SendInputStateReport(GetCurrentProcessId(), bDisabled != FALSE, curReason, curMask);
             // 同一现场的窗口/上下文快照也补一份：本路径「焦点未变但禁用态翻转」不走
             // OnSetFocus，不补的话 HUD 的输入态那半会更新、窗口那半停在上一次焦点，
@@ -4371,7 +4378,7 @@ void CTextService::TryRecoverFocusState()
         recoveryMask = _QueryInputScopeMask(pDocMgrRecover);
         pDocMgrRecover->Release();
     }
-    uint8_t recoveryReason = ComputeInputReason(_bKeyboardDisabled != FALSE, recoveryMask);
+    uint8_t recoveryReason = ComputeInputReason(_bKeyboardDisabled != FALSE, recoveryMask, false);
     if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask,
                                      _bKeyboardDisabled != FALSE, recoveryReason, caretSource))
     {
@@ -5098,6 +5105,7 @@ void CTextService::_ReportFocusInputStateOnActivate()
     }
     pDocMgr->Release();
 
+    const UINT64 rawMask = mask; // 折位前：reason 要靠它区分「宿主报密码」与「context 级禁用」
     _focusIsPassword = ctxDisabled;
     if (ctxDisabled)
         mask |= kScopeBitPassword;
@@ -5106,7 +5114,7 @@ void CTextService::_ReportFocusInputStateOnActivate()
     WIND_LOG_DEBUG_FMT(L"compat.activate.signals rawScopeWithPwd=0x%llX ctxKbdDisabled=%d threadKbdDisabled=%d",
                        mask, ctxDisabled ? 1 : 0, _bKeyboardDisabled ? 1 : 0);
     _pIPCClient->SendInputStateReport(GetCurrentProcessId(), _bKeyboardDisabled != FALSE,
-                                      ComputeInputReason(_bKeyboardDisabled != FALSE, mask), mask);
+                                      ComputeInputReason(_bKeyboardDisabled != FALSE, rawMask, ctxDisabled), mask);
 }
 
 // 判断焦点 context 是否被宿主标记为"禁用输入法"（GUID_COMPARTMENT_KEYBOARD_DISABLED）。

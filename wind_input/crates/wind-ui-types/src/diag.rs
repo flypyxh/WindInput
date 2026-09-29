@@ -302,7 +302,7 @@ pub fn format_diag_lines(v: &InputDiagView) -> Vec<String> {
     if s.input {
         lines.push(format!("{} ({})", name, v.pid));
         lines.push(format!(
-            "禁用态: {}  原因: {}",
+            "线程禁用: {}  原因: {}",
             yn(v.disabled),
             v.reason_text
         ));
@@ -421,7 +421,7 @@ mod tests {
             process_name: "chrome.exe".into(),
             pid: 4242,
             disabled: true,
-            reason_text: "compartment".into(),
+            reason_text: "线程级禁用".into(),
             mask: 1 << 31,
             ime_active: true,
             has_edit_context: false,
@@ -436,8 +436,8 @@ mod tests {
         let text = lines.join("\n");
         assert!(lines[0].contains("chrome.exe"));
         assert!(lines[0].contains("4242"));
-        assert!(lines[1].contains("禁用态: 是"));
-        assert!(lines[1].contains("compartment"));
+        assert!(lines[1].contains("线程禁用: 是"));
+        assert!(lines[1].contains("线程级禁用"));
         assert!(lines[2].contains("0x")); // mask 十六进制
         // 两个状态位取值不同，确保没有把同一个变量渲染两遍
         assert!(lines[3].contains("激活: 是"));

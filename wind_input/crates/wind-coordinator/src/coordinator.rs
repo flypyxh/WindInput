@@ -966,8 +966,13 @@ pub(crate) enum InputBlock {
     /// 线程级 `GUID_COMPARTMENT_KEYBOARD_DISABLED`：系统把输入法整个禁用了。
     /// 罕见且严重，是唯一配得上「图标变淡」这种呈现的一档。
     KeyboardDisabled,
-    /// 密码框：context 级 KEYBOARD_DISABLED 或 `IS_PASSWORD` InputScope。
+    /// 宿主明说的密码框：`IS_PASSWORD` / `IS_NUMERIC_PASSWORD` InputScope。
     Password,
+    /// 焦点 context 上的 KEYBOARD_DISABLED 置位，但宿主**没报**密码 scope。
+    /// 与 `Password` 同样强制英文（Chromium 密码框就靠这一信号），但成因不同：Gecko 系
+    /// （Zen / Firefox）在页面无输入焦点时也会置它（t197）。分开只为让提示语说真话——
+    /// 把「宿主禁用了输入」说成「密码框」，就会让用户在普通页面上找不到密码框。
+    ContextDisabled,
     /// 焦点不在可编辑控件里（CAD 绘图区、浏览器非输入区、QQ 的 READONLY DocMgr）。
     NoEditContext,
 }
@@ -991,7 +996,10 @@ impl InputBlock {
     /// C++ 侧表达后者的是 `_hasTextInputContext`，且它在 `OnSetThreadFocus` 里会**重新
     /// 权威查询**。真要恢复这一档，得让 DLL 把那个状态如实上报，而不是从失焦事件反推。
     pub(crate) fn shows_english(self) -> bool {
-        matches!(self, Self::KeyboardDisabled | Self::Password)
+        matches!(
+            self,
+            Self::KeyboardDisabled | Self::Password | Self::ContextDisabled
+        )
     }
     /// 是否该变淡。**只留给线程级禁用**，理由同上。
     ///
@@ -3140,10 +3148,11 @@ impl Coordinator {
     /// 强制英文抑制（密码框场景）。
     pub(crate) fn apply_input_diag(&self, pid: u32, disabled: bool, reason_byte: u8, mask: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        let reason = crate::input_diag::reason_from(disabled, mask);
-        // 本地一律以 mask/disabled 经 reason_from 推导 reason 作准；上报的 reason_byte
-        // 仅供展示/日志参考，不参与本地决策（避免"双重来源"歧义）。
-        let _ = reason_byte; // 上游已按 mask/disabled 推导 reason；保留形参对齐上报字段序。
+        // 展示原因 = mask/disabled 推导，再叠加 DLL 上报的 reason_byte 里「context 级禁用」这一档：
+        // DLL 把 context 级 KEYBOARD_DISABLED 折进了 mask 的 IS_PASSWORD 位，折位前的区分只有
+        // 它知道（见 `reason_from_report`）。reason 只管展示与提示语，**不参与**下面的抑制决策
+        // ——抑制仍只看 mask，两种来源行为一致，避免「双重来源」歧义。
+        let reason = crate::input_diag::reason_from_report(disabled, reason_byte, mask);
         let name = if pid != 0 {
             self.cached_proc_name((pid as u64) << 32)
         } else {
@@ -3322,7 +3331,9 @@ impl Coordinator {
             pid,
             disabled,
             reason_text: crate::input_diag::reason_label(reason).to_string(),
-            mask,
+            // 展示宿主**原始**报的 scope：context 级禁用那档要摘掉 DLL 折进去的 IS_PASSWORD 位，
+            // 否则 HUD 上会出现宿主根本没报过的 0x80000001（t197 楼主被它误导成「scope 变密码」）。
+            mask: crate::input_diag::display_mask(reason, mask),
             ime_active,
             has_edit_context,
             window,
@@ -3665,7 +3676,18 @@ impl Coordinator {
             .password_suppress
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            return InputBlock::Password;
+            // 同一个抑制态，成因分两档展示（见 `InputBlock::ContextDisabled`）。
+            let ctx_only = self
+                .last_input_diag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reason
+                == crate::input_diag::InputDiagReason::ContextDisabled;
+            return if ctx_only {
+                InputBlock::ContextDisabled
+            } else {
+                InputBlock::Password
+            };
         }
         if no_edit_ctx {
             return InputBlock::NoEditContext;
@@ -15951,6 +15973,47 @@ mod input_diag_tests {
             c.state.lock().unwrap().chinese_mode,
             "抑制不应改动 chinese_mode 持久值（图标保持不变）"
         );
+    }
+
+    /// t197：Gecko 系（Zen）页面无输入焦点时置 context 级 KEYBOARD_DISABLED，宿主原始 scope 只有
+    /// IS_DEFAULT。DLL 折位后 mask=0x80000001、reason 字节=4。展示与提示语必须说「被禁用」而不是
+    /// 「密码框」，抑制行为则与密码框一致（Chromium 密码框靠同一信号）。
+    #[test]
+    fn context_disabled_is_shown_apart_from_host_password() {
+        use crate::input_diag::InputDiagReason;
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        c.state.lock().unwrap().ime_active = true;
+
+        c.apply_input_diag(1, false, 4, 0x8000_0001);
+        assert_eq!(
+            c.last_input_diag.lock().unwrap().reason,
+            InputDiagReason::ContextDisabled
+        );
+        assert!(
+            c.password_suppress.load(Relaxed),
+            "抑制行为不因成因分档而变"
+        );
+        assert_eq!(c.input_block(), InputBlock::ContextDisabled);
+
+        // 宿主真报了 IS_PASSWORD：reason 字节 2，仍是密码框。
+        c.apply_input_diag(1, false, 2, 0x8000_0001);
+        assert_eq!(c.input_block(), InputBlock::Password);
+    }
+
+    #[test]
+    fn context_disabled_tooltip_does_not_claim_password() {
+        let c = test_coordinator();
+        c.state.lock().unwrap().ime_active = true;
+        c.apply_input_diag(1, false, 4, 0x8000_0001);
+        let _ = c.langbar_tooltip(); // 起计时
+        std::thread::sleep(INPUT_BLOCK_DELAY + std::time::Duration::from_millis(30));
+        let tip = c.langbar_tooltip();
+        assert!(
+            !tip.contains("密码"),
+            "context 级禁用不该被说成密码框: {tip}"
+        );
+        assert!(tip.contains("禁用"), "应说明是被应用禁用: {tip}");
     }
 
     /// disabled 只参与 `reason_from` 的展示推导，**不参与** suppress 决策——单一来源。
