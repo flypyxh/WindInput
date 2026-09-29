@@ -583,7 +583,12 @@ impl Template {
         };
         // 上段里剩下的 `\n` 只可能来自变量值（字面的第一个就是拆分点）：折成空格，上方条恒单行，
         // 否则会撑破按页等高。下段不动，行为同开关关。
-        let above = part(b.out.slice(0, s).replace_ascii('\n', ' '));
+        let above = part(
+            b.out
+                .slice(0, s)
+                .replace_ascii('\n', ' ')
+                .replace_ascii('\r', ' '),
+        );
         let below = part(b.out.slice(s + 1, b.out.len()));
         (above, below)
     }
@@ -2101,6 +2106,15 @@ mod split_tests {
         let s = Template::parse("${dict}\n${chaizi}")
             .render_whole(0, &ev(&[("dict", "a\nb"), ("chaizi", "c")]));
         assert_eq!(s.into_string(), "a\nb\nc");
+    }
+
+    #[test]
+    fn carriage_return_in_upper_var_value_becomes_space() {
+        // DirectWrite 把 `\r` 也当换行：CRLF 词条若留下 `\r`，上方条会变两行、破坏按页等高。
+        assert_eq!(
+            split("${dict}\n${chaizi}", &[("dict", "a\r\nb"), ("chaizi", "c")]),
+            pair("a  b", "c")
+        );
     }
 
     #[test]

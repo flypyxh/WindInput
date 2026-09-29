@@ -108,7 +108,7 @@ margin / padding 不继承的原因：基础主题里 `comment.margin.left = 6` 
 
 内联色 `$[色]{…}` 与 `[comment.roles]` 对上方条同样生效——不同注释配不同颜色不需要新工作。
 
-上方条叶子同样消费 `background` / `border` / `bg_image` / `bg_gradient`（含选中 / 悬停态），
+上方条叶子同样消费 `background` / `border` / `bg_image` / `bg_gradient`（底色 / 边框含选中 / 悬停态；背景图 / 渐变仅基态），
 与右侧注释同一套；这些装饰**不继承** `views.comment`。状态 patch 的回退口径与基态相同：
 `comment.selected` 等只贡献字体 / 颜色 / `roles`，其底色、边框、边距不带到 `comment_above.selected`。
 无上段的占位叶子不画装饰（边框不占布局尺寸，不影响等高）。

@@ -312,7 +312,7 @@ impl StyledText {
 
     /// 把每个 `from` 换成 `to`。两者须同为 ASCII（单字节），字节长度不变，区间因而原样有效。
     pub fn replace_ascii(mut self, from: char, to: char) -> StyledText {
-        assert!(
+        debug_assert!(
             from.is_ascii() && to.is_ascii(),
             "replace_ascii 只接受 ASCII"
         );
