@@ -581,7 +581,9 @@ impl Template {
         let Some(s) = b.split_at else {
             return (StyledText::new(), part(b.out));
         };
-        let above = part(b.out.slice(0, s));
+        // 上段里剩下的 `\n` 只可能来自变量值（字面的第一个就是拆分点）：折成空格，上方条恒单行，
+        // 否则会撑破按页等高。下段不动，行为同开关关。
+        let above = part(b.out.slice(0, s).replace_ascii('\n', ' '));
         let below = part(b.out.slice(s + 1, b.out.len()));
         (above, below)
     }
@@ -2077,6 +2079,28 @@ mod split_tests {
         let (a, b) =
             Template::parse("${p}\n${q}").render_split(3, &ev(&[("p", "abcdef"), ("q", "uvwxyz")]));
         assert_eq!((a.into_string(), b.into_string()), pair("abc…", "uvw…"));
+    }
+
+    /// 上段里变量值自带的换行折成空格：上方条恒单行，否则按页等高就被撑破。下段不动。
+    #[test]
+    fn newline_in_upper_var_value_becomes_space() {
+        assert_eq!(
+            split(
+                "${dict}\n${chaizi}",
+                &[("dict", "a\nb"), ("chaizi", "c\nd")]
+            ),
+            pair("a b", "c\nd")
+        );
+        // 样式不丢：替换等长，区间原样。
+        let (a, _) = Template::parse("${dict}\n${chaizi}")
+            .render_split(0, &ev(&[("dict", "a\nb"), ("chaizi", "")]));
+        assert_eq!(a.spans().len(), 1);
+        assert_eq!((a.spans()[0].start, a.spans()[0].end), (0, 3));
+        assert_eq!(a.spans()[0].role, Some("dict"));
+        // 开关关（render_whole）不受影响。
+        let s = Template::parse("${dict}\n${chaizi}")
+            .render_whole(0, &ev(&[("dict", "a\nb"), ("chaizi", "c")]));
+        assert_eq!(s.into_string(), "a\nb\nc");
     }
 
     #[test]

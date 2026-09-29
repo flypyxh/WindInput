@@ -310,6 +310,18 @@ impl StyledText {
         out
     }
 
+    /// 把每个 `from` 换成 `to`。两者须同为 ASCII（单字节），字节长度不变，区间因而原样有效。
+    pub fn replace_ascii(mut self, from: char, to: char) -> StyledText {
+        assert!(
+            from.is_ascii() && to.is_ascii(),
+            "replace_ascii 只接受 ASCII"
+        );
+        if self.text.contains(from) {
+            self.text = self.text.replace(from, to.encode_utf8(&mut [0; 1]));
+        }
+        self
+    }
+
     /// 以 `sep` 连接多段。
     pub fn join(parts: &[StyledText], sep: &str) -> StyledText {
         let mut out = StyledText::new();
@@ -413,6 +425,20 @@ mod tests {
         assert_eq!(
             ranges(&j),
             vec![(0, 1, Some("title")), (2, 3, Some("title"))]
+        );
+    }
+
+    #[test]
+    fn replace_ascii_keeps_spans() {
+        let mut t = StyledText::new();
+        t.push("a\nb", &role("dict"));
+        t.push("\n", &SpanStyle::default());
+        t.push("拆", &role("chaizi"));
+        let r = t.replace_ascii('\n', ' ');
+        assert_eq!(r.as_str(), "a b 拆");
+        assert_eq!(
+            ranges(&r),
+            vec![(0, 3, Some("dict")), (4, 7, Some("chaizi"))]
         );
     }
 }
