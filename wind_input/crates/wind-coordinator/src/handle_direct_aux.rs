@@ -592,3 +592,225 @@ mod tests {
         assert_eq!(st.candidates.first().map(|c| c.text.as_str()), Some("释读"));
     }
 }
+
+#[cfg(test)]
+mod real_data_tests {
+    //! 真实数据（`build_dev/data`：小鹤双拼 + 雾凇词库 + `flypy_full.txt`），缺数据跳过。
+    //! 放在 crate 内而不是 `tests/`：要看候选的 `is_direct_aux` 标记，区分「被直接辅助提上来」
+    //! 与「本来就排在那儿」。
+    use crate::coordinator::Coordinator;
+    use std::sync::Arc;
+    use wind_bridge::handler::{KeyEventData, MessageHandler};
+    use wind_config::Config;
+    use wind_ipc::protocol::EVENT_KEY_DOWN;
+    use wind_keys::keymap;
+
+    fn data_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
+    }
+
+    fn has_data() -> bool {
+        let d = data_dir().join("schemas");
+        let ok = d.join("shuangpin.schema.toml").is_file()
+            && d.join("aux_code/flypy_full.txt").is_file()
+            && d.join("pinyin/rime_frost.dict.yaml").is_file();
+        if !ok {
+            eprintln!(
+                "跳过：build_dev/data 缺小鹤双拼方案 / flypy_full.txt / 雾凇词库（先跑 gen-data）"
+            );
+        }
+        ok
+    }
+
+    fn coord(direct: bool) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["shuangpin".into()];
+        cfg.schema.active = "shuangpin".into();
+        cfg.input.default.chinese_mode = true;
+        cfg.schema.pinyin.aux_code.enabled = true;
+        cfg.schema.pinyin.aux_code.direct = direct;
+        Coordinator::new_headless(cfg, Some(&data_dir()))
+    }
+
+    fn press(c: &Coordinator, vk: u32) {
+        c.handle_key_event(&KeyEventData {
+            key_code: vk,
+            scan_code: 0,
+            modifiers: 0,
+            event_type: EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        });
+    }
+
+    /// 清空组合后逐键敲入 `input`，每键后回调一次（参数为已敲前缀）。
+    fn type_each(c: &Coordinator, input: &str, mut each: impl FnMut(&str)) {
+        press(c, keymap::VK_ESCAPE);
+        for (i, ch) in input.char_indices() {
+            press(c, keymap::VK_A + (ch as u32 - 'a' as u32));
+            each(&input[..i + 1]);
+        }
+    }
+
+    /// 候选（文本, 是否直接辅助命中）。
+    fn cands(c: &Coordinator) -> Vec<(String, bool)> {
+        c.state
+            .lock()
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|c| (c.text.clone(), c.is_direct_aux))
+            .collect()
+    }
+
+    fn after(c: &Coordinator, input: &str) -> Vec<(String, bool)> {
+        type_each(c, input, |_| {});
+        cands(c)
+    }
+
+    fn top5(v: &[(String, bool)]) -> Vec<String> {
+        v.iter()
+            .take(5)
+            .map(|(t, hit)| if *hit { format!("{t}*") } else { t.clone() })
+            .collect()
+    }
+
+    fn first(v: &[(String, bool)]) -> Option<&str> {
+        v.first().map(|(t, _)| t.as_str())
+    }
+
+    /// §11 真实数据示例。`*` = 直接辅助命中项。开关两侧的前 5 名打到 stderr 供报告。
+    #[test]
+    fn xiaohe_examples() {
+        if !has_data() {
+            return;
+        }
+        let (on, off) = (coord(true), coord(false));
+        for input in ["uidup", "uidupl", "goqkk", "goqkg", "xlr", "jxl", "jxlm"] {
+            eprintln!(
+                "{input}: on {:?} | off {:?}",
+                top5(&after(&on, input)),
+                top5(&after(&off, input))
+            );
+        }
+        // 释 = pl；同音的湿 dy、适 zk、十 al、试 yg 都不以 p 开头。
+        assert_eq!(first(&after(&on, "uidup")), Some("释读"));
+        assert_ne!(first(&after(&off, "uidup")), Some("释读"), "反向对照");
+        // `pl` 不是合法小鹤音节 ⇒ 无全音节候选可保留，命中项直接居首。
+        assert_eq!(first(&after(&on, "uidupl")), Some("释读"));
+        // 国 = ky：1 位 k 国庆、国情都中；庆 = gd、情 = xo：g 只中国庆。
+        let k = after(&on, "goqkk");
+        for w in ["国庆", "国情"] {
+            assert!(
+                k.iter().any(|(t, hit)| t == w && *hit),
+                "goqkk 应命中 {w}：{k:?}"
+            );
+        }
+        let g = after(&on, "goqkg");
+        assert!(g.iter().any(|(t, hit)| t == "国庆" && *hit), "{g:?}");
+        assert!(!g.iter().any(|(t, hit)| t == "国情" && *hit), "{g:?}");
+        assert_eq!(first(&g), Some("国庆"));
+        // 像 = rn、架 = lm：短前缀奇数长度，命中项居首。
+        assert_eq!(first(&after(&on, "xlr")), Some("像"));
+        // `jxl`：1 位 `l` 同时中 加 lk、甲、架 lm、驾…，架是命中项之一但未必居首。
+        // 补打第 2 位 `jxlm` 是偶数长度：「加练」「价廉」是覆盖全部输入的整词，按全音节优先
+        // 保留在前 2 位，架（lm）接在其后。
+        let l = after(&on, "jxl");
+        assert!(l.iter().any(|(t, hit)| t == "架" && *hit), "{l:?}");
+        let lm = after(&on, "jxlm");
+        assert!(lm.iter().any(|(t, hit)| t == "架" && *hit), "{lm:?}");
+    }
+
+    /// 6 音节整句逐键输入：**偶数键**首选与关闭直接辅助码时逐键一致（全音节解析优先），
+    /// 前缀 ≥ 3 音节的**奇数键**亦然（长句保首选）。
+    ///
+    /// 变异对照（设计 §11）：偶数保留数改 0、奇数门槛改 99，本用例须变红。
+    #[test]
+    fn sentences_keep_top_keystroke_by_keystroke() {
+        if !has_data() {
+            return;
+        }
+        let (on, off) = (coord(true), coord(false));
+        // 图书馆开放日 / 计算机语言学 / 动物园开门了（小鹤）。刻意挑「前 3 音节是词、第 4 音节
+        // 的首键恰是其中某字的辅码开头」的句子（图=kd 配 kai、计=yu 配 yu、园=ke 配 kai）：
+        // 第 7 键时前缀单独解码能出词且真的命中，才测得出「命中了也不抢长句首选」——前缀
+        // 不成词的句子逐键一条命中都没有，对照形同虚设。
+        let sentences = ["tuuugrkdfhri", "jisrjiyuyjxt", "dswuyrkdmfle"];
+        let mut checked = 0;
+        let mut total_hits = 0usize;
+        for s in sentences {
+            let mut want: Vec<Option<String>> = Vec::new();
+            type_each(&off, s, |_| {
+                want.push(cands(&off).first().map(|(t, _)| t.clone()))
+            });
+            let mut got: Vec<Option<String>> = Vec::new();
+            let mut hits = 0usize;
+            type_each(&on, s, |typed| {
+                let v = cands(&on);
+                let n = v.iter().filter(|(_, h)| *h).count();
+                if n > 0 {
+                    eprintln!("  {typed}: {:?}", top5(&v));
+                }
+                hits += n;
+                got.push(v.first().map(|(t, _)| t.clone()));
+            });
+            eprintln!("{s}: 整句 {:?}，逐键命中项合计 {hits}", want.last());
+            total_hits += hits;
+            for n in 3..=s.len() {
+                // 短前缀（< 3 音节）奇数键按设计让位给命中项，不在约束内。门槛写死设计值 3
+                // 而不引用常量：引用的话改常量会连带改掉本用例的检查范围，变异测不出来。
+                if n % 2 == 1 && (n - 1) / 2 < 3 {
+                    continue;
+                }
+                assert_eq!(
+                    got[n - 1],
+                    want[n - 1],
+                    "{s} 第 {n} 键（{}）首选被直接辅助改动",
+                    &s[..n]
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20);
+        assert!(total_hits > 0, "逐键一条命中都没有，对照没测到东西");
+    }
+
+    /// 单键耗时：直接辅助开 / 关各跑一遍同一批输入（3 条整句 + §11 示例逐键敲入），
+    /// 取每键平均。`cargo test … direct_aux_perf -- --ignored --nocapture`，≥ 3 次取中位。
+    #[test]
+    #[ignore]
+    fn direct_aux_perf() {
+        if !has_data() {
+            return;
+        }
+        let inputs = [
+            "wojbtmhfgcxk",
+            "tamfvgzdkdhv",
+            "mktmtmqihfhc",
+            "uidupl",
+            "goqkgd",
+            "xlrn",
+            "jxlm",
+        ];
+        let (on, off) = (coord(true), coord(false));
+        // 预热：词库 mmap、码表懒加载、各种缓存。
+        for c in [&on, &off] {
+            for s in inputs {
+                type_each(c, s, |_| {});
+            }
+        }
+        let rounds = 20;
+        for (name, c) in [("off", &off), ("on", &on), ("off", &off), ("on", &on)] {
+            let mut keys = 0u32;
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                for s in inputs {
+                    type_each(c, s, |_| keys += 1);
+                }
+            }
+            let per = t.elapsed() / keys;
+            eprintln!("direct {name}: {keys} 键，平均 {per:?}/键");
+        }
+    }
+}
