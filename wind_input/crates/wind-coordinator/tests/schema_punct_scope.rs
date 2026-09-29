@@ -170,3 +170,69 @@ fn repeated_round_trips_stay_stable() {
         assert!(c.is_chinese_punct(), "第 {round} 轮：切回五笔应是中文标点");
     }
 }
+
+// ── 方案意图 vs 其它写 `chinese_punct` 的入口（GH#164）─────────────────────────
+//
+// 方案意图只在**活跃方案换代**时由 `sync_schema_scope` 落地，代际不变就不再动。于是任何
+// 在代际内改写 `chinese_punct` 的入口（IME 激活的重置、`follow_mode` 的中英跟随）都能把
+// 它顶回中文，而没人再纠正。原则：范围更小的意图优先——方案意图压过这两者。
+// 用户手动 `toggle_punct` 不在此列（它本来就该在本代际内胜出，见上面的测试）。
+
+fn coord_follow(follow: bool) -> std::sync::Arc<Coordinator> {
+    let mut c = cfg();
+    c.input.punct.follow_mode = follow;
+    Coordinator::new_headless(c, Some(&data_dir()))
+}
+
+/// IME 激活会把标点重置成全局默认，不能顶掉英文方案自己的英文标点。
+#[test]
+fn ime_activation_does_not_override_schema_punct_intent() {
+    if !ready() {
+        eprintln!("跳过：缺少英文方案或它没声明 [punct]");
+        return;
+    }
+    let c = coord();
+    c.handle_menu_command("toggle_mode"); // 先在五笔下进英文态
+    cycle(&c);
+    assert_eq!(c.active_schema_id(), "english");
+    assert!(!c.is_chinese_punct(), "前提：英文方案下是英文标点");
+
+    c.handle_ime_activated(1);
+    assert!(
+        !c.is_chinese_punct(),
+        "★ IME 激活的标点重置不得压过方案意图（GH#164）"
+    );
+}
+
+/// `follow_mode` 下英文方案里中英来回切，标点仍以方案意图为准。
+#[test]
+fn follow_mode_does_not_override_schema_punct_intent() {
+    if !ready() {
+        eprintln!("跳过：缺少英文方案或它没声明 [punct]");
+        return;
+    }
+    let c = coord_follow(true);
+    cycle(&c);
+    assert!(!c.is_chinese_punct(), "前提：英文方案下是英文标点");
+    c.handle_menu_command("toggle_mode"); // → 英文态
+    c.handle_menu_command("toggle_mode"); // → 中文态
+    assert!(c.is_chinese_mode());
+    assert!(
+        !c.is_chinese_punct(),
+        "★ follow_mode 切回中文态不得把英文方案的英文标点顶成中文"
+    );
+}
+
+/// 上面的优先级只对**声明了意图**的方案成立：Follow 方案里 follow_mode 照常跟随。
+#[test]
+fn follow_mode_still_works_in_a_schema_without_intent() {
+    if !ready() {
+        eprintln!("跳过：缺少英文方案或它没声明 [punct]");
+        return;
+    }
+    let c = coord_follow(true);
+    c.handle_menu_command("toggle_mode"); // 五笔英文态
+    assert!(!c.is_chinese_punct());
+    c.handle_menu_command("toggle_mode"); // 回中文态
+    assert!(c.is_chinese_punct(), "无方案意图时 follow_mode 行为不变");
+}

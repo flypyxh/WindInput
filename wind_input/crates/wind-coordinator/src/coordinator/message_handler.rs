@@ -2760,7 +2760,7 @@ impl MessageHandler for Coordinator {
         let chinese = state.chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
         if self.rt().config.input.punct.follow_mode {
-            state.chinese_punct = chinese;
+            self.set_punct_below_schema_intent(&mut state, chinese);
         }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
         drop(state);
@@ -2832,7 +2832,7 @@ impl MessageHandler for Coordinator {
         state.chinese_mode = chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。
         if self.rt().config.input.punct.follow_mode {
-            state.chinese_punct = chinese_mode;
+            self.set_punct_below_schema_intent(&mut state, chinese_mode);
         }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
         drop(state);
