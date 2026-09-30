@@ -21,13 +21,13 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
 | `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
-| `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：中英模式镜像（托盘图标 `windinput-zh/en`，从服务端四种状态帧学）、应用内预编辑过滤掉单空格占位组合 |
+| `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：模式镜像（托盘图标：服务端按主字运行时渲染的 `windinput-lbl-<状态>-<主字十六进制>`，没写出时退回种子 `windinput-zh/en/caps`；中英、大写锁定位与标签从服务端四种状态帧学）、addon 加载时预建用户图标目录、大写锁定的本端判定（`CapsLockTracker`）、应用内预编辑过滤掉单空格占位组合 |
 | `include/OverlayInput.h` + `src/core/OverlayInput.cpp` | 光栅浮层与候选悬停的鼠标交互纯逻辑：按键 → 动作（拖动 / 菜单 / 关闭）、菜单 target、悬停门控、提示的悬停延后与离开重定、拖动落位 |
 | `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |
 | `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层 + 自绘菜单：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮/右键回传、浮层的悬停保持 / 拖动 / 右键 / 点击关闭与自动隐藏计时、菜单打开期间抓指针并回报 |
 | `data/*.conf.in` | addon / 输入法描述文件模板（构建时生成到 `build/…/share/fcitx5/`） |
-| `data/icons/hicolor` | 图标成品（`windinput`、`windinput-zh`、`windinput-en`），CMake 装到 `share/icons`；由 `scripts/linux/gen-icons.py` 一次性生成 |
+| `data/icons/hicolor` | 图标成品，CMake 装到 `share/icons`。`windinput`（应用图标）由 `scripts/linux/gen-icons.py` 拆自 wind-setting 的 ico；托盘图标的种子 `windinput-zh` / `-en` / `-caps`（运行时图标还没写出时的降级）由 `wind_input/crates/wind-ui/examples/gen_tray_icons.rs` 生成，与运行时图标同一个 `tray_icon::render`（`host_ui_test` 核对文件齐全）。运行时图标不在这里，在用户的 `$XDG_DATA_HOME/icons/hicolor` |
 | `tests/*_test.cpp` | 纯 C++17 单测（不需要 Fcitx5），与 `wind_tsf/tests` 同风格 |
 
 `src/core` 与 `include` 不依赖 Fcitx5，能单独编、单独测——这条边界别破。
@@ -95,7 +95,11 @@ e2e 的坑，都踩过：
   出字集」天然成立——吃不吃完全由响应决定。按下被吃的键，其松开也吃掉（按硬件键码记）。
 - 修饰键本身的按下不上报；**干净单击**（按下→无别的键→500ms 内松开，同 Windows
   `TOGGLE_TAP_THRESHOLD_MS`）时发一帧 `eventType=UP` 的 KeyEvent（`VK_LSHIFT` 等）。协调器
-  只在 keyup 分支处理切换键。
+  只在 keyup 分支处理切换键。这一帧的 `toggles` 必须是真实锁定态：服务端拿**每一帧**的 toggles
+  校准大写锁定镜像，发 0 就是告诉它「大写锁定关了」。
+- CapsLock：按下不上报，松开发 `VK_CAPITAL` keyup、toggles 带**新**锁定态（同 Windows 的状态通知）。
+  X11 事件的 state 是事件之前的，关大写那次的松开 state **仍带 Lock**，新状态只能按「按下时没锁 ⇒
+  松开后锁上」推（`CapsLockTracker`，实测与取舍见设计文档 §5d「大写锁定的判定」）。
 - 焦点：Fcitx5 的 `activate` 同时承载「切到本输入法」与「焦点进入文本框」，按事件类型分开——
   `InputContextSwitchInputMethod` 才发 `CMD_IME_ACTIVATED`（服务端据此套用激活初始状态），
   普通焦点进入只发 `CMD_FOCUS_GAINED`。每次聚焦都报 IME_ACTIVATED 会让「不记忆中英状态」的
@@ -225,7 +229,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
 | 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
 | 出厂命令短语（`system.phrases.toml` 的 `$CC`） | 按平台取舍 | `cono` / `coca` 在 Linux 上是 `proc.any` 多候选（装了哪个编辑器 / 计算器就开哪个），`cohm` 走 `xdg-open`；`codl`（删行，`key.seq`）已有 Linux 条目，但**依赖上一行的按键合成**，addon 接上前选中无效果。审计清单与取舍见设计文档 §5e。e2e 仅在 `linux-host` 形态下验证（假程序放进 PATH）；各真实桌面上的程序名没有逐个验过 |
-| 中英模式指示 | 托盘 / 面板图标（`subModeIcon`） | 见设计文档 §5d。e2e 经 kimpanel 验了图标名随 Shift / 菜单切换；notificationitem（SNI）取的是同一个值但未单独验，真机托盘（GNOME AppIndicator、Deepin dde-dock）的实际显示未验 |
+| 模式指示 | 托盘 / 面板图标（`subModeIcon`）按模式主字运行时渲染，同 Windows 语言栏：中文为方案标签、英文「英」、大写锁定「A」，自定义方案标签 / `[ui.labels]` 同样上图 | 见设计文档 §5d（含 Windows 状态对照表、宿主图标缓存）。e2e 经 kimpanel 验了图标名与标签随 Shift / CapsLock / 切方案 / 菜单切换、换焦点不回退，并验文件在用户图标目录、是合法 PNG；notificationitem（SNI）取的是同一个值但未单独验，真机托盘（GNOME AppIndicator、KDE、Deepin dde-dock）的实际显示与图标缓存时序未验。缺：角标（全角 / 标点）；密码框里不换「英」；首次安装时若用户图标目录此前不存在，托盘要重启 Fcitx5 后才看得见运行时图标（之前显示种子） |
 | 系统输入法配置里的「配置」按钮 | ExternalOption → 设置程序 | e2e 验了 `Controller1.GetConfig` 的描述与命令可启动；fcitx5-configtool 5.1.6+ 直接启动，22.04（5.0.x）显示一页一个按钮；真机点按钮与 Deepin 配置界面未验 |
 | 非嵌入模式的占位组合 | 不写进应用（addon 过滤） | 见设计文档 §5d |
 | 工具栏 / 软键盘 / 输入诊断 HUD | 不做 | 产品决策：与 macOS 精简范围一致。设置端已按平台门控相应设置项（wind-setting README「按平台屏蔽的设置项」）；主菜单里的对应项也按平台摘掉 |
@@ -236,7 +240,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | 全局热键 | 不做 | 设置端藏掉热键对话框的「全局」勾选；热键只在输入法激活、有焦点时经按键通路生效 |
 | Shift 单击切中英 | **需清 Fcitx5 的 AltTriggerKeys** | 出厂 `Shift_L` 被 Fcitx5 截走。安装脚本应改 `~/.config/fcitx5/config`，或在 AGENTS 外的用户文档里写明 |
 | 「Shift+鼠标拖选不算单击」 | 缺 | Windows 靠 ToggleTapPolicy 的四个鼠标信号；Fcitx5 引擎收不到鼠标事件 |
-| CapsLock 状态通知（`VK_CAPITAL` keyup） | 不发 | 服务端靠每键 `toggles` 校准 CapsLock 镜像，功能不缺；只是按 CapsLock 本身不会即时刷新状态 |
+| CapsLock 状态通知（`VK_CAPITAL` keyup） | 已发 | 松开时发，服务端同步镜像、弹状态气泡、托盘换「A」；另由每键 `toggles` 校准 |
 | 英文输入统计（`CMD_INPUT_STATS`） | 不发 | 同 macOS |
 | 小键盘 / 符号键映射 | keysym 走 US 布局反查 | 非 US 布局的 Shift 符号键（如德语 `§`）没有 VK，透传给宿主 |
 | 彩色 emoji | 已接（服务端文字后端） | CBDT（Noto Color Emoji）、COLR v0/v1、OpenType-SVG 实测可画；肤色 / ZWJ / 国旗 / 键帽按字体 GSUB 合成一个字形。依赖系统装彩色 emoji 字体（`.deb` Recommends `fonts-noto-color-emoji`），没有时画单色字形或方框。sbix 未实测、COLR v1 扫掠渐变降级为纯色，见 `wind-ui/src/text/linux/mod.rs` 模块头 |

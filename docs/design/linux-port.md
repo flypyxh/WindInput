@@ -121,15 +121,14 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 ## 5d. 与 Fcitx5 自身 UI 的衔接
 
 - **输入法图标**：条目 `Icon=windinput`（`wind_linux/data/icons/hicolor`，16…256 各尺寸，出自
-  wind-setting 的 `wind_setting.ico`）。**托盘 / 面板图标随中英模式切换**：引擎实现
-  `subModeIconImpl` / `subModeLabelImpl`，返回 `windinput-zh` / `windinput-en`（带底色圆角方块 +
-  白字「中」「英」，深浅面板都看得清；PNG 16…64 + scalable SVG，字形已转路径）与「中」/「英」。
-  Fcitx5 的 classicui 托盘、notificationitem（StatusNotifierItem，Deepin / KDE / GNOME 的
-  AppIndicator 扩展）、kimpanel 都经 `Instance::inputMethodIcon` 取这个值。模式来源是服务端的
-  四种帧：焦点进入的 `MODE_PUSH`、按键响应的 `STATUS_UPDATE`、push 通道的 `STATE_PUSH`（菜单等
-  别处切换）、带 `MODE_CHANGED` 的上屏；变了就 `updateUserInterface(StatusArea)` 让各 UI 模块重取。
-  不用 `CMD_MODE_STATUS`：那条由工具栏可见性驱动，Linux 不显示工具栏。图标产物入库，生成脚本
-  `scripts/linux/gen-icons.py` 只在改图标时跑，打包不依赖它。
+  wind-setting 的 `wind_setting.ico`，`scripts/linux/gen-icons.py` 拆出）。**托盘 / 面板图标随模式
+  切换**：引擎实现 `subModeIconImpl` / `subModeLabelImpl`（`HostUi.h` 的 `ModeIndicator`）。Fcitx5 的
+  classicui 托盘、notificationitem（StatusNotifierItem，Deepin / KDE / GNOME 的 AppIndicator 扩展）、
+  kimpanel 都经 `Instance::inputMethodIcon` 取这个值。模式来源是服务端的四种帧：焦点进入的
+  `MODE_PUSH`、按键响应的 `STATUS_UPDATE`、push 通道的 `STATE_PUSH`（菜单等别处切换）、带
+  `MODE_CHANGED` 的上屏；变了就 `updateUserInterface(StatusArea)` 让各 UI 模块重取。不用
+  `CMD_MODE_STATUS`：那条由工具栏可见性驱动，Linux 不显示工具栏。
+
 - **系统输入法配置里的「配置」**：输入法与 addon 都是 `Configurable=True`，addon 的配置只有一项
   `fcitx::ExternalOption`（指向设置程序，`WIND_INPUT_SETTING` 可覆盖）。依据：fcitx5-mozc /
   fcitx5-anthy 的包里**没有**静态 `configdesc/*.desc`，Fcitx5 5 的配置描述是 addon 运行时
@@ -144,6 +143,110 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   当成组合结束；② 占位的来源不止 `with_composition_placeholder` 一处（联想态 `ASSOC_COMPOSITION`、
   加词、临时模式各自直接发），服务端要逐处加 cfg，addon 一处全收；③ Windows / macOS 零改动。
   常量与服务端同值由 `host_ui_test` 读 `handler.rs` 对账。
+
+### Windows 语言栏图标：状态 → 主字 / 角标（对照基准）
+
+出处：主字 `Coordinator::mode_icon_label`（唯一产地）、图标规格 `coordinator/langbar_icon.rs`
+`publish_langbar_icon`、渲染 `wind-ui/src/langbar_icon.rs`、配置 `docs/design/mode-icon-label-config.md`。
+
+| 状态 | 主字 | 主字色格（`TextColors`） | 角标（`[ui.langbar] badge`，出厂 `none` = 都不画） |
+|---|---|---|---|
+| 有效中文（`chinese_mode && !caps_lock`） | 方案 `[schema] icon_label`：全拼「拼」、五笔「五」、笔画「笔」、双拼「双」、五笔拼音「中」、英文方案「英」；未配 →「中」 | 中文格 | 右下：中文标点 / 英文标点；右上：全角 |
+| 英文（`!chinese_mode`，大写锁定关） | `[ui.labels] english`，出厂「英」 | 英文格 | 右上：全角（英文态不画标点角标） |
+| 大写锁定（**无论中英**） | `[ui.labels] caps_lock`，出厂「A」 | 英文格 | 同英文 |
+| 不可输入（密码框 / 无编辑上下文，`InputBlock::shows_english`） | 英文标签（只覆盖图标，不动 `icon_label`） | 英文格 | 不画 |
+| 线程级 `KEYBOARD_DISABLED` | 同上 | 同上，整体变淡 | 不画 |
+
+主字色出厂中英同色（浅色任务栏黑、深色白），区分中英靠字；标签宽度上限 2（汉字记 2，双汉字截首字）。
+
+### Linux 托盘图标：按主字运行时渲染（同 Windows）
+
+**主路径**：服务端按（状态档, 主字）渲染 PNG，写进用户图标目录，addon 把图标名交给 Fcitx5。
+主字就是上表那一份（`mode_icon_label`），所以切方案、第三方方案标签、改 `[ui.labels]` 都会上托盘。
+
+| 状态档 | 底色 | 主字 | 图标名 |
+|---|---|---|---|
+| 有效中文 | 蓝 `#2F86E6` | 方案标签（未配为「中」；英文方案在中文模式下是**蓝底**「英」，同 Windows 取中文色格） | `windinput-lbl-zh-<主字 UTF-8 十六进制>` |
+| 英文 | 灰 `#5E6B78` | `[ui.labels] english` | `windinput-lbl-en-…` |
+| 大写锁定（无论中英） | 橙 `#E08A1E` | `[ui.labels] caps_lock` | `windinput-lbl-caps-…` |
+
+- **落点**：`$XDG_DATA_HOME/icons/hicolor/<N>x<N>/apps/`（缺省 `~/.local/share`；N = 16/22/24/32/48/64）。
+  XDG 图标主题规范的用户基目录，用户目录下不必有 `index.theme`（Fcitx5 / GTK / Qt 都合并各基目录的
+  hicolor，子目录表取系统那份）。名字用十六进制编码主字：图标名要进 kimpanel 以冒号分段的属性串、
+  进文件名，只用 ASCII 最稳。编码规则两侧各一份（`wind_ui::tray_icon::icon_name` /
+  `ModeIndicator::dynamicIconName`），两边单测钉同一组样例。
+- **时序由数据依赖保证**：`Coordinator::build_status` 返回之前确保本状态用得到的图标已在盘上
+  （`coordinator/tray_icon.rs`，`not(test)`），任何带新标签的状态帧到 addon 时文件必然已写完。
+  每次一并备好中文 / 英文 / 大写三组：addon 本端判定大写锁定翻转时不等服务端的帧。
+  写入原子（同目录临时文件 + rename），按尺寸从小到大、64 最后；addon 以 64 那张在不在判断「这组写完」，
+  不在就用随包**种子** `windinput-zh` / `-en` / `-caps`（服务没起来、目录不可写、缺字体）。
+- **协议不变**：标签本来就在 `STATUS_UPDATE` / `STATE_PUSH` / `ACTIVATION_STATUS_PUSH` 的尾部
+  （Windows 的 `_inputTypeLabel` 用的就是它），addon 以前没读。没有新增 cmd、没有扩展信封，
+  Windows / macOS 帧格式一字不变。
+- **文字标签**：`subModeLabelImpl` 返回同一个主字。Fcitx5 的 classicui / notificationitem 有
+  `PreferTextIcon`（用户在 Fcitx5 配置里开，我们控制不了），开了的用户看到的是 Fcitx5 按这个字画的
+  文字图标，同样正确。
+- **缓存与清理**：同一（状态, 主字）只画一次（进程内集合 + 磁盘上已齐全就跳过）。服务启动时把全部
+  可用方案的标签 + 英文 / 大写标签画好，再删掉不在其中的 `windinput-lbl-*`（别的文件不碰）；运行中
+  新出现的标签只增不删、下次启动收。上限是「可用方案数 + 2」组，不会无限增长。首轮预渲染的耗时记在
+  服务日志「托盘图标已就绪」一行（`elapsed_ms`）。
+- **字体**：fontconfig 按 `sans-serif` + Bold + 简中排序，取第一款覆盖主字全部字符的字体文件，直接读
+  轮廓（`text::linux::font_file_covering`）。机器上没有 Bold 字面（本机只有 Noto Sans CJK Regular）时
+  用 Regular，22px 起笔画偏细但清楚；Ubuntu / Deepin 的 `fonts-noto-cjk` 带 Bold。
+
+**宿主的图标主题缓存**（查的上游源码 master 分支，均未在真桌面上实测）：
+
+| 宿主 | 查找方式 | 对「刚写出的新名字」 | 我们的对策 |
+|---|---|---|---|
+| Fcitx5 classicui（XEmbed 托盘 / 面板）`IconTheme` | 每次按名 `is_regular_file` | 可见；但**构造时不存在的基目录被永久丢弃**，按名结果另有缓存 | addon 加载时先建好整棵目录树；名字与内容一一对应，不复用名字 |
+| GTK3/4 `GtkIconTheme`、GNOME Shell `StIconTheme`（AppIndicator 扩展走它） | 加载主题时快照子目录文件名；只看搜索根与主题根两层目录 mtime、至多每 5 秒重扫 | 往已有 `48x48/apps/` 加文件**不触发重扫** | 写完一组就在 `hicolor/` 根建删一个空文件推进 mtime；最坏约 5 秒后可见。启动时预渲染全部方案，日常切方案引用的都是早已存在的文件 |
+| KDE Plasma SNI（`KIconLoader`）、kimpanel（`Kirigami.Icon`，走哪条未查实） | 构造时为已存在的子目录建索引，文件实时 `exists`；找不到有 5 秒负缓存 | 子目录先在则可见 | 同上：目录先建、先写文件后给名字 |
+| Deepin dde-tray-loader（`QIcon::fromTheme`） | Qt `QIconLoader`：主题目录构造时定；「找不到」按名缓存、不自行重查 | 先写后引用可见；先引用后写会一直找不到 | 先写后给名字（数据依赖保证）；名字只在文件齐全时才给出 |
+
+不走绝对路径：Fcitx5 自己的 `IconTheme` 与 GNOME AppIndicator 放行 `/` 开头的名字，但 kimpanel 的
+`Kirigami.Icon` 与 Deepin 的 `QIcon::fromTheme` 对绝对路径的行为没查实；主题名是所有宿主都认的形式。
+遗留风险：Fcitx5 / 面板**先于** addon 构建图标主题、而用户目录此前从未存在——首次安装后要重启一次
+Fcitx5（或重新登录）托盘才看得见运行时图标，之前显示种子。
+
+**清晰度**（`wind-ui/src/tray_icon.rs`）：本仓 Linux 文本后端没有 hinting，12~13px 字身直接栅格会把
+「英」「笔」的笔画间隙糊成灰带（8 倍放大看是一团）。
+
+- 16px 的常用单字（中 英 A 拼 五 笔 双）用手绘点阵，每一笔落整像素；
+- 其余按字形轮廓栅格，在 ±½ 像素 × 字号 ±4% 内挑半透明像素最少的一版（粗粒度对格）；16px 再做一次
+  对比度拉伸（`(a − 0.3) / 0.4`）——自定义标签「虎」、两字母「En」在 16px 上由灰雾变成实笔画，代价是
+  斜笔更锯齿；「虎」这类笔画密的字在 16px 仍难辨，这是 16px 的物理上限；
+- 多字符标签按墨迹宽度回缩（同 langbar_icon：判据是实测宽度，不是字符数）。
+- 没直接调 `langbar_icon::IconRenderer`：那套是透明底 + 任务栏明暗字色 + Light 字重，托盘要的是
+  实心色块上的白字；借的是「按墨迹盒居中」「小字号按发虚与否定字重」（这里取 Bold）两条策略。
+- 肉眼验收：`gen_tray_icons --preview <目录>` 出种子与样例主字的 8 倍放大图（`zoom-16/22/24/32.png`）、
+  浅 / 深面板 1× 并排（`panel-1x.png`，另附 3 倍放大）；`--preview-from <hicolor 根>` 对服务端实际写出的
+  运行时图标出同样的图（真机上验「用那台机器的字体画出来什么样」）。种子由同一个 `render` 画，
+  Noto Sans CJK SC Bold，SVG 里是路径。
+
+其余取舍：
+
+- **角标（全角 / 标点）不做。** Windows 出厂 `badge = none`，默认观感就是只有主字；开了角标的用户在
+  Linux 上看不到它们。
+- **不可输入态（密码框）不换「英」。** 帧里的标签是 `mode_icon_label`，不含 `InputBlock` 覆盖（Windows
+  那一层只在语言栏图标发布里做）；密码框里键仍全透传，只是托盘仍显示当前模式。
+
+### 大写锁定的判定
+
+**本端判定 + 松开时报服务端**，两者读的是同一份数据（按键的 Lock 位），不是两个真相源：
+
+- X11 事件的修饰状态是事件**之前**的。Xvfb + xev 实测：开 → 按下 `state=0`、松开 `state=Lock`；
+  关 → 按下 `state=Lock`、松开**仍是** `Lock`（XKB 的 LockMods 在松开时才解锁）。所以「松开事件的
+  state 含新状态」只对「开」成立，对「关」不成立；`CapsLockTracker` 按「按下时没锁 ⇒ 松开后锁上」推。
+  其余键的 Lock 位就是当前锁定态，用来校准（在别的输入法 / 应用里切过大写，回来第一个键就对上）。
+- Caps_Lock 的按下不转发、松开发一帧 `VK_CAPITAL` keyup（toggles 带新状态），同 Windows TSF：
+  服务端据此同步镜像、按「切英文」语义处理正在打的编码、弹状态气泡，并回 `STATUS_UPDATE`
+  （`STATUS_CAPS_LOCK` + caps 标签）。此前 Linux 把 Caps_Lock 的按下当普通键发给服务端（toggles
+  是按下前的旧值），服务端什么也不做，大写锁定要等下一个键才被发现。
+- 为什么不只靠服务端回传：服务端用每一帧的 toggles **静默**校准镜像（不推送），在别处切过大写
+  后托盘会一直停在旧图，直到下一次模式变化；本端判定让图标当场换。
+- 焦点进入的 `MODE_PUSH` 只有中英 / 全角 / 标点三位，不带大写锁定——镜像沿用已知值，换 IC 不回退。
+- 顺带修了一个真坑：修饰键单击（Shift 切中英）那一帧曾发 `toggles = 0`，服务端据此把大写锁定
+  镜像校准成「关」——大写锁定时按 Shift，托盘会从「A」掉回「中」。现在带真实 Lock 位。
 
 ## 5e. 随包数据里的平台相关内容（审计）
 
