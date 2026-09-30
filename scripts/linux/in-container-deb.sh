@@ -29,6 +29,9 @@ DESTDIR="$S" cmake --install /work/cmake
 install -Dm755 /work/target/release/wind_input "$S/usr/lib/windinput/wind_input"
 mkdir -p "$S/usr/lib/windinput/data"
 cp -a /data/. "$S/usr/lib/windinput/data/"
+# 应用兼容规则是平台专属策略：Windows 版 compat.toml 里全是 Windows 宿主的修正，不能随 Linux 包带。
+# 换成「字段说明 + 零条内置规则」的 Linux 版（生成脚本自检不得残留规则表）。
+bash /src/scripts/linux/gen-compat.sh /data/compat.toml "$S/usr/lib/windinput/data/compat.toml"
 # addon / 输入法描述：cmake 只装了库，描述文件（构建目录里 configure_file 出来的）补进去。
 install -Dm644 /work/cmake/share/fcitx5/addon/windinput.conf "$S/usr/share/fcitx5/addon/windinput.conf"
 install -Dm644 /work/cmake/share/fcitx5/inputmethod/windinput.conf "$S/usr/share/fcitx5/inputmethod/windinput.conf"
