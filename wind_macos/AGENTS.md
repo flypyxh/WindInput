@@ -34,6 +34,14 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 | `SetToolbarPos` / `SetToolbarAutoHide` / `SetToolbarVertical` / `SetToolbarLayout` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地"。`SetToolbarLayout`（`ui.toolbar.items`，格的显隐与顺序）同理——菜单栏指示器只有一个主字，没有"哪几格" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
 
+### 出厂短语的 `darwin` 条目
+
+`data/system.phrases.toml` 里 `cono` / `coca` / `cohm` / `codl` 按平台各写一份。`wind-phrase`
+的过滤曾经写死只收 `windows`，所以 macOS 上出的一直是 `notepad.exe` / `calc.exe` 那一份，
+`darwin` 条目从未生效过。现已改为按编译目标选平台（`wind-phrase` 的 `CURRENT_PLATFORM`）。
+macOS 上只做了交叉 check；单测在 Linux 上跑的是同一个比对函数，真机效果（`open -a TextEdit` 等）
+尚未验证。
+
 ### 软键盘：唯一一个由**服务进程自己开窗**的浮层
 
 macOS 侧的通例是「服务进程只光栅化，窗口一律归 `.app`」——候选窗的像素在服务进程画好，

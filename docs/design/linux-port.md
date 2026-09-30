@@ -145,6 +145,40 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   加词、临时模式各自直接发），服务端要逐处加 cfg，addon 一处全收；③ Windows / macOS 零改动。
   常量与服务端同值由 `host_ui_test` 读 `handler.rs` 对账。
 
+## 5e. 随包数据里的平台相关内容（审计）
+
+范围：`data/` 下全部随包文件，查 `proc.run` / `proc.shell` / `open(` / `key.*` / `clip.paste` /
+`wind.cli` / `setting.*`、`.exe`、`%APPDATA%` 之类环境变量、反斜杠路径。
+
+| 位置 | 内容 | 归类 | 处理 |
+|---|---|---|---|
+| `system.phrases.toml` `cono` / `coca` / `cohm` | `notepad.exe` / `calc.exe` / `env("USERPROFILE")` | Windows 专属（已有 `darwin` 对应条目） | 补 `platform = 'linux'` 条目：编辑器、计算器用 `proc.any` 多候选，主目录用 `open(env("HOME"))`（`xdg-open`） |
+| `system.phrases.toml` `codl` | `key.seq("Home", "Shift+End", "Backspace")` | 需按平台写 | **Linux 不出**：addon 没接按键合成（`wind_linux/AGENTS.md` 差距表），写了也不生效 |
+| `system.phrases.toml` 其余 `$CC` | `open(URL)`、`type`、`clip.copy` / `clip.paste`、`ime.*`、`dict.add`、`dict.rev`、`setting.open` | 跨平台 | 不动（`open` → `xdg-open`；`clip.paste` 在 `ext_presenter` 下经上屏通道落文本） |
+| `system.quick.toml` / `system.softkeyboard.toml` / `config.toml` / `schemas/shuangpin.schema.toml` | 注释里的 `%APPDATA%\WindInput\…` 路径；`config.toml` 注释里的 `proc.run("charmap.exe")` 等示例 | 仅文档 | 不动：只在注释里，不执行 |
+| `compat.toml` | 全部内置规则是 Windows 宿主修正 | Windows 专属 | 已由 `scripts/lib/gen-compat.sh` 在打包时换成零规则版 |
+| cmdbar 帮助文本（`funcs/action.rs`） | `proc.run` 示例 `notepad.exe`；`clip.paste` 写着「模拟 Ctrl+V」；`verb` / `show` 已注明「仅 Windows」 | 文案偏 Windows | 不改：示例只是写法说明，Windows 的文案保持不变 |
+| cmdbar lint（`lint.rs`） | 只查「路径参数里的控制字符」（反斜杠单写） | 平台中立 | 把 `proc.any` 加进被查的函数 |
+
+**根因不在数据，在过滤。** 短语文件早就用 `platform` 字段按平台写了成对条目，但
+`wind-phrase` 的两个加载入口（`load` / `parse_system_entries`）都写死了只收 `"windows"`，
+所以 Linux 和 macOS 上显示的都是 Windows 那一份，`darwin` 条目从未生效。现在按编译目标
+取当前平台名（`windows` / `darwin` / `linux`，其它平台只收全平台条目），Windows 上的
+取舍不变。入库同步按条目哈希判断，过滤改了之后首次启动就会重新同步，旧行随之清掉。
+
+**为什么不在打包时生成变体**（`compat.toml` 用的是那种办法）：`compat.toml` 在别的平台上
+一条规则都不保留，生成器只需要截掉规则部分。短语文件不同，绝大多数条目是跨平台的，只有少数几条要按平台
+替换；打包时替换就得有第二份「哪条换成什么」的表，改 Windows 版时容易跟着漂移。
+字段机制已经存在，改成在源文件里按平台并列写，一眼能对照，也不需要改打包脚本。
+
+`proc.any(a, b, …)`（`wind-cmdbar`）：按顺序尝试启动，第一个成功的即停。「未找到」
+（`io::ErrorKind::NotFound`）和「找到了但启动失败」（权限等）都会接着试下一个，全部
+失败时两类分开列出名字。「成功」只看 spawn，程序起来后自己退出不算失败。Windows 上启动
+要转给 TSF 执行，这边拿不到结果，只会启动第一个，所以 Windows 词条仍用 `proc.run`。
+候选表按常见桌面排列：GNOME（`gnome-text-editor` / `gedit`、`gnome-calculator`）、KDE
+（`kate` / `kwrite`、`kcalc`）、Deepin、MATE、Xfce（`mousepad`、`galculator`）、Cinnamon
+（`xed`）、LXQt / LXDE，最后兜底 `xcalc`。同一台机器上装了多个时取排在前面的，不看当前桌面。
+
 ## 6. 阶段
 
 | 阶段 | 内容 | 状态 |

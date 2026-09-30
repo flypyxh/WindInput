@@ -224,6 +224,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | tooltip / 状态气泡 / toast | 已接（X11），含鼠标交互 | 见上「光栅浮层」：悬停保持、气泡拖动与右键菜单、提示右键菜单（复制 / 上屏 / 截图）、Toast 点击关闭，e2e 逐项覆盖。缺：Wayland；多显示器（拖动夹回按整块根窗口）；「截图所有窗口到文件」（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗（气泡 / 提示菜单里的「截图此窗口」已可用）；提示菜单开着时点在提示上只关菜单、不接着弹新菜单（Windows 会重新请求） |
 | 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
 | 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
+| 出厂命令短语（`system.phrases.toml` 的 `$CC`） | 按平台取舍 | `cono` / `coca` 在 Linux 上是 `proc.any` 多候选（装了哪个编辑器 / 计算器就开哪个），`cohm` 走 `xdg-open`；`codl`（删行，靠按键合成）在 Linux 上不出。审计清单与取舍见设计文档 §5e。e2e 仅在 `linux-host` 形态下验证（假程序放进 PATH）；各真实桌面上的程序名没有逐个验过 |
 | 中英模式指示 | 托盘 / 面板图标（`subModeIcon`） | 见设计文档 §5d。e2e 经 kimpanel 验了图标名随 Shift / 菜单切换；notificationitem（SNI）取的是同一个值但未单独验，真机托盘（GNOME AppIndicator、Deepin dde-dock）的实际显示未验 |
 | 系统输入法配置里的「配置」按钮 | ExternalOption → 设置程序 | e2e 验了 `Controller1.GetConfig` 的描述与命令可启动；fcitx5-configtool 5.1.6+ 直接启动，22.04（5.0.x）显示一页一个按钮；真机点按钮与 Deepin 配置界面未验 |
 | 非嵌入模式的占位组合 | 不写进应用（addon 过滤） | 见设计文档 §5d |
