@@ -1268,3 +1268,75 @@ fn mixed_single_only_keeps_pinyin_words() {
         "拼音侧词组照出：{tri:?}"
     );
 }
+
+// ─────────────── 通配含未启用扩展词库（reverse-mode spec §4） ───────────────
+// 样本：「门头沟区 uuia」只在未启用的 wubi86_xzqy（default_enabled = false），主库 / extra 无 uuia 码。
+
+fn lookup_disabled(mut cfg: Config) -> Config {
+    cfg.schema.codetable.lookup_disabled_dicts = true;
+    cfg
+}
+
+fn tri_of(cfg: Config, keys: &str) -> Vec<(String, String, String)> {
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, keys);
+    coord.debug_candidate_triples()
+}
+
+#[test]
+fn lookup_disabled_dicts_inline_wildcard_sees_xzqy() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let off = tri_of(wubi(true, "z"), "uuiz");
+    assert!(
+        off.iter().all(|(t, _, _)| t != "门头沟区"),
+        "对照：关时不可见"
+    );
+    let on = tri_of(lookup_disabled(wubi(true, "z")), "uuiz");
+    let pos = on
+        .iter()
+        .position(|(t, c, _)| t == "门头沟区" && c == "uuia")
+        .unwrap_or_else(|| panic!("开后应可见：{on:?}"));
+    let last_enabled_equal = on
+        .iter()
+        .rposition(|(t, c, _)| {
+            c.len() == 4 && t != "门头沟区" && off.iter().any(|(ot, oc, _)| ot == t && oc == c)
+        })
+        .unwrap();
+    assert!(
+        last_enabled_equal < pos,
+        "已启用的等长结果全在它之前：{on:?}"
+    );
+}
+
+/// ★ Review Focus 1（真实数据）：开关开着，普通打字的候选逐条不变（含前缀补全与活码字母）。
+#[test]
+fn lookup_disabled_dicts_leaves_plain_typing_identical() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    for keys in ["uuia", "uui", "djma", "a", "zz"] {
+        assert_eq!(
+            tri_of(lookup_disabled(wubi(true, "z")), keys),
+            tri_of(wubi(true, "z"), keys),
+            "{keys}"
+        );
+    }
+}
+
+/// spec §4.2：混输取主方案的开关，通配侧同样可见。
+#[test]
+fn mixed_lookup_disabled_dicts_follows_primary() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let on = tri_of(lookup_disabled(wubi_pinyin(true)), "uuiz");
+    assert!(
+        on.iter().any(|(t, c, _)| t == "门头沟区" && c == "uuia"),
+        "{on:?}"
+    );
+}
