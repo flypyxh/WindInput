@@ -689,3 +689,61 @@ fn leaving_url_mode_leaves_no_ghost_candidates() {
         c.debug_page_texts()
     );
 }
+
+// ───────────────────────── 临时英文转交（GH#162）─────────────────────────
+
+/// Shift+字母：起手进临时英文（五笔用户名超过四码时，正常流早已顶字上屏，只能走这条）。
+fn press_shift_letter(c: &Coordinator, ch: char) -> KeyAction {
+    c.handle_key_event(&key((ch.to_ascii_uppercase() as u32) & 0xFF, MOD_SHIFT))
+}
+
+#[test]
+fn at_sign_in_temp_english_carries_the_whole_username() {
+    let (c, _s) = coord_with("te_enter", email_cfg());
+    press_shift_letter(&c, 'z');
+    for ch in "hangsan".chars() {
+        press_letter(&c, ch);
+    }
+    assert_eq!(
+        c.debug_active_mode(),
+        Some("temp_english"),
+        "前提：已在临英"
+    );
+    let act = press_at(&c);
+    assert_eq!(
+        composition(&act).as_deref(),
+        Some("Zhangsan@"),
+        "临英里按 @ 应带着完整用户名进邮箱模式，实际 {act:?}"
+    );
+    assert_eq!(c.debug_active_mode(), Some("email"));
+    let act = press(&c, wind_keys::keymap::VK_SPACE);
+    assert_eq!(committed(&act).as_deref(), Some("Zhangsan@qq.com"));
+}
+
+#[test]
+fn backspace_at_boundary_returns_to_temp_english_not_code_buffer() {
+    let (c, _s) = coord_with("te_rewind", email_cfg());
+    press_shift_letter(&c, 'a');
+    press_letter(&c, 'b');
+    press_at(&c); // "Ab@"
+    let act = press(&c, wind_keys::keymap::VK_BACK);
+    assert_eq!(
+        c.debug_active_mode(),
+        Some("temp_english"),
+        "回退应放回临英缓冲而不是码表缓冲，实际 {act:?}"
+    );
+    assert_eq!(composition(&act).as_deref(), Some("Ab"));
+}
+
+#[test]
+fn temp_english_at_sign_is_untouched_when_email_disabled() {
+    let (c, _s) = coord_with("te_off", Config::default());
+    press_shift_letter(&c, 'a');
+    press_letter(&c, 'b');
+    press_at(&c);
+    assert_ne!(
+        c.debug_active_mode(),
+        Some("email"),
+        "关闭时不该转交邮箱模式"
+    );
+}

@@ -94,7 +94,7 @@ impl Coordinator {
             && state.committed_text.is_empty()
         {
             let buffer = format!("{}{}", state.input_buffer, crate::handle_email::EMAIL_AT);
-            return Some(self.enter_email_mode(state, buffer));
+            return Some(self.enter_email_mode(state, buffer, RewindOrigin::Normal));
         }
         None
     }

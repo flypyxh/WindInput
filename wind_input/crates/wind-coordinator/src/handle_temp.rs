@@ -1752,6 +1752,26 @@ impl Coordinator {
                         return self.enter_unicode_mode(state, probe, RewindOrigin::TempEnglish);
                     }
                 }
+                // ── 邮箱模式转交 ──
+                //
+                // 五笔用户名常超过四码，正常输入流里早已顶字上屏，`try_prefix_hijack` 的
+                // `@` 触发只对短用户名可用（GH#162）。临英缓冲本就是「攒一段英文」，
+                // 在这里认 `@` 才能带完整用户名进邮箱模式。
+                //
+                // ★ 与 Unicode 转交同理必须早于选词键 / 白名单判定：否则 `@` 会被判成
+                // 「上屏高亮候选 + 标点、退出临英」（`allow_symbols` 出厂关）。
+                // 判据与主路闸门一致：本键是 `@` 且缓冲非空；缓冲整体作为用户名。
+                if self.rt().config.input.email.enabled
+                    && !state.temp_english_buffer.is_empty()
+                    && printable_char(data.key_code, shift) == Some(crate::handle_email::EMAIL_AT)
+                {
+                    let buffer = format!(
+                        "{}{}",
+                        state.temp_english_buffer,
+                        crate::handle_email::EMAIL_AT
+                    );
+                    return self.enter_email_mode(state, buffer, RewindOrigin::TempEnglish);
+                }
                 // 二三候选键（默认 `;` `'`）→ 选候选。临英此前是**唯一**没接
                 // `select_key_offset` 的模式处理器（主流程 / 临拼 / 特殊 / mix 都接了），
                 // 于是次选键一路落到下方标点臂，被判成「上屏高亮候选 + 标点」——用户按 `;`

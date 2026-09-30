@@ -43,11 +43,27 @@ impl Coordinator {
     /// 进入邮箱模式：以 `用户名@` 作初始缓冲，清空普通输入/候选。
     ///
     /// 登记夺取回退：snapshot = 夺取前的正常输入（= 用户名），host_text = `用户名@`
-    /// （夺取边界）。退格删到只剩 `abc@` 时再按一次，就回到正常码表输入流的 `abc`。
-    pub(crate) fn enter_email_mode(&self, state: &mut State, buffer: String) -> KeyAction {
-        // 夺取前的正常 input_buffer 即回退快照（`@` 是刚按下的那一键，不在快照里）。
-        let snapshot = state.input_buffer.clone();
+    /// （夺取边界）。退格删到只剩 `abc@` 时再按一次，就回到夺取前的输入流的 `abc`。
+    ///
+    /// `origin` 决定快照从哪个缓冲取、回退放回哪条流（见 [`RewindOrigin`]）：正常输入流
+    /// 走 `try_prefix_hijack`；临时英文里打 `@` 由 `handle_temp_english_key` 转交
+    /// （与大写 `U+` 转交 Unicode 模式同构）——五笔用户名常超过四码，正常流里早已顶字上屏，
+    /// 只有临英才能把完整用户名攒到 `@`。
+    pub(crate) fn enter_email_mode(
+        &self,
+        state: &mut State,
+        buffer: String,
+        origin: RewindOrigin,
+    ) -> KeyAction {
+        // 夺取前的缓冲即回退快照（`@` 是刚按下的那一键，不在快照里）。
+        let snapshot = match origin {
+            RewindOrigin::Normal => state.input_buffer.clone(),
+            RewindOrigin::TempEnglish => state.temp_english_buffer.clone(),
+        };
         state.input_buffer.clear();
+        state.temp_english_buffer.clear();
+        state.temp_english_prefix.clear();
+        state.temp_english_cursor = 0;
         state.candidates.clear();
         state.active = Some(ModeKind::Email);
         state.email_buffer = buffer.clone();
@@ -56,7 +72,7 @@ impl Coordinator {
         state.rewind = Some(Rewind {
             snapshot,
             host_text: buffer,
-            origin: RewindOrigin::Normal, // 前缀夺取抢的是正常码表输入流
+            origin,
         });
         self.update_email_candidates(state);
         self.notify_ui_update(state);
