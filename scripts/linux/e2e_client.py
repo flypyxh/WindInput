@@ -800,6 +800,465 @@ async def menu_restart_cases(bus, im, restart):
     await typing_works(c, "服务重启")
     return c
 
+# ── 浮层交互（X11）：状态气泡 / 悬停提示 / Toast 的鼠标交互与右键菜单 ─────────────────
+# 规则对位 Windows（wind_linux/include/OverlayInput.h）：悬停 / 拖动 / 菜单开着时不自动消失；
+# 提示在指针移进它时保持、右键弹提示菜单；气泡可拖（松手报 pos.status_tip，落不落盘看定位
+# 方式）、右键弹气泡菜单；Toast 点一下就关。e2e.sh 把气泡时长调成 2 秒、放了假 xclip。
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def user_config():
+    return read_text(os.path.join(os.environ["XDG_CONFIG_HOME"], "WindInput", "config.toml"))
+
+
+def config_int(text, key):
+    import re
+    m = re.search(rf"^{key}\s*=\s*(-?\d+)", text, re.M)
+    return int(m.group(1)) if m else None
+
+
+def config_str(text, key):
+    import re
+    m = re.search(rf'^{key}\s*=\s*"([^"]*)"', text, re.M)
+    return m.group(1) if m else None
+
+
+def fcitx_log_lines():
+    return read_lines(os.path.join(os.environ["W"], "fcitx5.log"))
+
+
+def drag_reports():
+    """addon 上报 pos.status_tip 的次数（WIND_DEBUG「状态气泡拖动松手」）。"""
+    return sum("状态气泡拖动松手" in l for l in fcitx_log_lines())
+
+
+def clipboard_log():
+    return read_text(os.path.join(os.environ["W"], "clipboard.log"))
+
+
+def center(win):
+    return win[1] + win[3] // 2, win[2] + win[4] // 2
+
+
+async def pop_status(c):
+    """中英各切一次（输入状态不变），等状态气泡出现。"""
+    await c.tap_shift()
+    await c.tap_shift()
+    return await wait_window("wind-status", True)
+
+
+async def drag(x0, y0, dx, dy, steps=6):
+    """左键按在 (x0, y0) 拖 (dx, dy) 后松开（XTEST，分步移动让 addon 收到连续的移动事件）。"""
+    sh("xdotool", "mousemove", str(x0), str(y0))
+    await asyncio.sleep(0.05)
+    sh("xdotool", "mousedown", "1")
+    for i in range(1, steps + 1):
+        sh("xdotool", "mousemove", str(x0 + dx * i // steps), str(y0 + dy * i // steps))
+        await asyncio.sleep(0.03)
+    sh("xdotool", "mouseup", "1")
+    await asyncio.sleep(0.3)
+
+
+async def open_tooltip_menu(c):
+    """组字 → 悬停候选出提示 → 指针挪进提示 → 右键。返回 (菜单窗口, 提示窗口)。"""
+    await c.type("nihao")
+    await asyncio.sleep(0.4)
+    if not await hover_candidate_point(c):
+        return None, None
+    tip = candidate_window("wind-tooltip")
+    if not (tip and tip[5]):
+        return None, tip
+    tx, ty = center(tip)
+    sh("xdotool", "mousemove", str(tx), str(ty))
+    await asyncio.sleep(0.4)
+    sh("xdotool", "click", "3")
+    return await wait_window("wind-menu-0", True), tip
+
+
+async def overlay_interaction_cases(bus, im):
+    c = await new_ctx(bus, im, "e2e-overlay-ui")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    sh("xdotool", "mousemove", "5", "5")
+
+    # ── 状态气泡 ──
+    # a) 悬停保持：指针停在气泡上，过了时长（2 秒）仍在；离开后按时长消失。
+    st = await pop_status(c)
+    ok = st is not None and st[5]
+    check("气泡交互：Shift 切换后状态气泡出现", ok, f"window={st}")
+    if ok:
+        cx, cy = center(st)
+        sh("xdotool", "mousemove", str(cx), str(cy))
+        await asyncio.sleep(3.0)
+        held = candidate_window("wind-status")
+        check("气泡交互：指针悬停其上时超过时长也不消失", held is not None and held[5],
+              f"window={held}")
+        # b) 拖动（出厂跟随光标）：窗口跟手平移；松手上报 pos.status_tip；这一模式不落盘。
+        before = drag_reports()
+        await drag(cx, cy, 120, 60)
+        moved = candidate_window("wind-status")
+        ok = moved is not None and moved[5] and (moved[1] - st[1], moved[2] - st[2]) == (120, 60)
+        check("气泡交互：左键拖动跟手（窗口平移 = 指针位移）", ok, f"拖前={st} 拖后={moved}")
+        check("气泡交互：松手上报 pos.status_tip", drag_reports() == before + 1,
+              f"上报 {drag_reports() - before} 次")
+        await asyncio.sleep(0.3)
+        cfg = user_config()
+        check("气泡交互：跟随光标模式下拖动不落盘", config_int(cfg, "custom_x") is None,
+              f"config.toml 里出现了 custom_x：{cfg!r}")
+        full, _ = screenshot("status_dragged_screen")
+        print(f"  拖动后全屏截图：{full}", flush=True)
+        # c) 离开后照常消失（悬停结束重新给满一份时长）。
+        sh("xdotool", "mousemove", "5", "5")
+        gone = await wait_window("wind-status", False, timeout=5.0)
+        check("气泡交互：指针离开后按时长自动消失", gone is not None and not gone[5],
+              f"window={gone}")
+
+    # d) 右键气泡 → 气泡菜单（常驻显示 / 焦点切换时显示 / 固定位置 / 恢复默认位置 / 截图）；
+    #    菜单开着时气泡不消失；点「固定位置」→ 以气泡当前位置落盘（经 pos.status_tip.query）。
+    st = await pop_status(c)
+    menu = None
+    if st and st[5]:
+        cx, cy = center(st)
+        sh("xdotool", "mousemove", str(cx), str(cy), "click", "3")
+        menu = await wait_window("wind-menu-0", True)
+    ok = menu is not None and menu[5]
+    check("气泡菜单：右键状态气泡弹出菜单", ok, f"menu={menu} 气泡={st}")
+    if ok:
+        path, n = window_has_content(menu[0], "menu_status")
+        check("气泡菜单：菜单有绘制", n > 1, f"{n} 种颜色，截图 {path}")
+        print(f"  气泡菜单截图：{path}", flush=True)
+        full, _ = screenshot("menu_status_screen")
+        print(f"  全屏截图：{full}", flush=True)
+        await asyncio.sleep(2.6)
+        still = candidate_window("wind-status")
+        check("气泡菜单：菜单开着时气泡超过时长也不消失", still is not None and still[5],
+              f"window={still}")
+        row0 = await probe_row(menu)
+        if row0 is not None:
+            sh("xdotool", "mousemove", str(menu[1] + menu[3] // 3), str(row0 + 2 * MENU_ROW),
+               "click", "1")
+        gone = await wait_menus_gone()
+        pinned = await wait_until(
+            lambda: config_str(user_config(), "position_mode") == "fixed"
+            and config_int(user_config(), "custom_x") is not None, 3)
+        cfg = user_config()
+        fx, fy = config_int(cfg, "custom_x"), config_int(cfg, "custom_y")
+        # 落盘的是内容左上，窗口左上再往左上偏一个软阴影扩边（0～30 像素）。
+        near = (fx is not None and fy is not None and 0 <= fx - still[1] <= 30
+                and 0 <= fy - still[2] <= 30)
+        check("气泡菜单：点「固定位置」→ 以气泡当前位置落盘", gone and pinned and near,
+              f"菜单消失={gone} custom=({fx},{fy}) 气泡窗口=({still[1]},{still[2]})")
+
+        # e) 固定位置模式下拖动：落点写回 custom_x/y（位移与拖动一致）。
+        st = await pop_status(c)
+        ok = st is not None and st[5]
+        if ok:
+            check("气泡交互：固定位置模式下气泡出现在落盘位置",
+                  0 <= fx - st[1] <= 30 and 0 <= fy - st[2] <= 30, f"气泡={st} custom=({fx},{fy})")
+            cx, cy = center(st)
+            await drag(cx, cy, -100, -50)
+            ok = await wait_until(lambda: (config_int(user_config(), "custom_x"),
+                                           config_int(user_config(), "custom_y"))
+                                  == (fx - 100, fy - 50), 3)
+            cfg = user_config()
+            check("气泡交互：固定位置模式下拖动落盘（custom_x/y 随落点更新）", ok,
+                  f"拖前 ({fx},{fy}) 拖后 ({config_int(cfg, 'custom_x')},{config_int(cfg, 'custom_y')})")
+
+        # f) 恢复默认位置：回到跟随光标。
+        st = await pop_status(c)
+        if st and st[5]:
+            cx, cy = center(st)
+            sh("xdotool", "mousemove", str(cx), str(cy), "click", "3")
+            menu = await wait_window("wind-menu-0", True)
+            row0 = await probe_row(menu) if menu and menu[5] else None
+            if row0 is not None:
+                sh("xdotool", "mousemove", str(menu[1] + menu[3] // 3),
+                   str(row0 + 3 * MENU_ROW), "click", "1")
+        await wait_menus_gone()
+        # 用户配置只写非默认值：回到出厂的跟随光标后，这几个键从 config.toml 里消失（或写成默认值）。
+        back = await wait_until(
+            lambda: config_str(user_config(), "position_mode") in (None, "follow_caret")
+            and config_int(user_config(), "custom_x") in (None, 0), 3)
+        cfg = user_config()
+        check("气泡菜单：点「恢复默认位置」→ 回到跟随光标", back,
+              f"position_mode={config_str(cfg, 'position_mode')} custom_x={config_int(cfg, 'custom_x')}")
+    sh("xdotool", "mousemove", "5", "5")
+    await wait_window("wind-status", False, timeout=5.0)
+    await typing_works(c, "气泡菜单用完")
+
+    # ── 悬停提示 ──
+    # g) 指针从候选挪进提示：提示保持（Windows：光标进入气泡即撤掉候选悬停的变化）。
+    await c.type("nihao")
+    await asyncio.sleep(0.4)
+    pt = await hover_candidate_point(c)
+    tip = candidate_window("wind-tooltip")
+    kept = None
+    if pt and tip and tip[5]:
+        tx, ty = center(tip)
+        sh("xdotool", "mousemove", str(tx), str(ty))
+        await asyncio.sleep(1.2)
+        kept = candidate_window("wind-tooltip")
+    check("提示交互：指针从候选挪进提示后提示保持显示", kept is not None and kept[5],
+          f"提示={tip} 1.2 秒后={kept}")
+    # h) 离开提示到别处：宽限后收起。
+    sh("xdotool", "mousemove", "5", "5")
+    gone = await wait_window("wind-tooltip", False, timeout=2.0)
+    check("提示交互：指针离开提示后提示收起", gone is not None and not gone[5], f"提示={gone}")
+    await c.key("Escape")
+    c.take()
+
+    # i) 右键提示 → 提示菜单（复制「段」/ 上屏「段」/ … / 复制全部 / 截图此窗口）；菜单开着时
+    #    提示不消失；点第一项（复制类）→ 剪贴板里是提示内容，并弹「提示内容已复制」。
+    menu, tip = await open_tooltip_menu(c)
+    ok = menu is not None and menu[5]
+    check("提示菜单：右键悬停提示弹出菜单", ok, f"menu={menu} 提示={tip}")
+    if ok:
+        path, n = window_has_content(menu[0], "menu_tooltip")
+        check("提示菜单：菜单有绘制", n > 1, f"{n} 种颜色，截图 {path}")
+        print(f"  提示菜单截图：{path}", flush=True)
+        full, _ = screenshot("menu_tooltip_screen")
+        print(f"  全屏截图：{full}", flush=True)
+        await asyncio.sleep(0.6)
+        t2 = candidate_window("wind-tooltip")
+        check("提示菜单：菜单开着时提示不消失", t2 is not None and t2[5], f"提示={t2}")
+        clip0 = len(clipboard_log())
+        row0 = await probe_row(menu)
+        if row0 is not None:
+            sh("xdotool", "mousemove", str(menu[1] + menu[3] // 3), str(row0), "click", "1")
+        gone = await wait_menus_gone()
+        copied = await wait_until(lambda: len(clipboard_log()) > clip0, 3)
+        got = clipboard_log()[clip0:]
+        text = "\n".join(l for l in got.splitlines() if not l.startswith("== ")).strip()
+        check("提示菜单：点「复制…」→ 剪贴板里是提示内容", gone and copied and text != "",
+              f"菜单消失={gone} 剪贴板新增={got!r}")
+        print(f"  复制到剪贴板：{text!r}", flush=True)
+        toast = await wait_window("wind-toast", True, timeout=2.0)
+        check("提示菜单：复制后弹 Toast 反馈", toast is not None and toast[5], f"toast={toast}")
+        if toast and toast[5]:
+            path, _ = window_has_content(toast[0], "toast_tooltip_copied")
+            print(f"  复制反馈 Toast 截图：{path}", flush=True)
+    await c.key("Escape")
+    c.take()
+    sh("xdotool", "mousemove", "5", "5")
+    await typing_works(c, "提示菜单用完")
+
+    # ── Toast ──
+    svc = os.path.join(os.environ.get("W", ""), "svc", "wind_input")
+
+    async def toast(text, ms):
+        await asyncio.to_thread(subprocess.run, [svc, "ui", "toast", text, "--pos", "top_right",
+                                                 "--ms", str(ms)], capture_output=True)
+        return await wait_window("wind-toast", True)
+
+    await wait_window("wind-toast", False, timeout=5.0)
+    # j) 悬停暂停：指针停在 Toast 上时过了时长仍在；离开后照常消失。
+    t = await toast("悬停不消失", 1500)
+    if t and t[5]:
+        tx, ty = center(t)
+        sh("xdotool", "mousemove", str(tx), str(ty))
+        await asyncio.sleep(2.5)
+        held = candidate_window("wind-toast")
+        check("Toast：指针悬停其上时超过时长也不消失", held is not None and held[5], f"toast={held}")
+        sh("xdotool", "mousemove", "5", "5")
+        gone = await wait_window("wind-toast", False, timeout=4.0)
+        check("Toast：指针离开后照常消失", gone is not None and not gone[5], f"toast={gone}")
+    else:
+        check("Toast：ui toast 后出现", False, f"toast={t}")
+    # k) 点击提前关闭。
+    t = await toast("点我关闭", 10000)
+    if t and t[5]:
+        tx, ty = center(t)
+        sh("xdotool", "mousemove", str(tx), str(ty), "click", "1")
+        gone = await wait_window("wind-toast", False, timeout=1.0)
+        check("Toast：点击后立即关闭（不等 10 秒）", gone is not None and not gone[5],
+              f"toast={gone}")
+    else:
+        check("Toast：ui toast 后出现", False, f"toast={t}")
+    sh("xdotool", "mousemove", "5", "5")
+
+    # ── 复位路径：浮层交互进行中被打断，之后立刻能正常打字 ──
+    # 1) 提示菜单开着 → Esc
+    menu, _ = await open_tooltip_menu(c)
+    ok = menu is not None and menu[5]
+    await c.key("Escape")
+    check("提示菜单关闭：Esc", ok and await wait_menus_gone(), f"开={ok}")
+    await c.key("Escape")
+    c.take()
+    await typing_works(c, "提示菜单 Esc 关闭")
+    # 2) 提示菜单开着 → 组合被宿主终止（Reset）：提示依附于候选，菜单随之收
+    menu, _ = await open_tooltip_menu(c)
+    ok = menu is not None and menu[5]
+    await c.ic.call_reset()
+    check("提示菜单关闭：组合被宿主终止时一并收起", ok and await wait_menus_gone(), f"开={ok}")
+    c.preedits.clear()
+    await typing_works(c, "提示菜单随组合终止")
+    # 3) 提示菜单开着 → 失焦
+    menu, _ = await open_tooltip_menu(c)
+    ok = menu is not None and menu[5]
+    await asyncio.sleep(0.3)
+    await c.ic.call_focus_out()
+    check("提示菜单关闭：失焦", ok and await wait_menus_gone(), f"开={ok}")
+    await c.ic.call_focus_in()
+    await asyncio.sleep(0.2)
+    await typing_works(c, "提示菜单失焦关闭")
+    # 4) 气泡菜单开着 → 失焦：菜单收起，气泡的「菜单开着」保持随之解除（随后按时长消失）
+    sh("xdotool", "mousemove", "5", "5")
+    st = await pop_status(c)
+    menu = None
+    if st and st[5]:
+        cx, cy = center(st)
+        sh("xdotool", "mousemove", str(cx), str(cy), "click", "3")
+        menu = await wait_window("wind-menu-0", True)
+    ok = menu is not None and menu[5]
+    await asyncio.sleep(0.3)
+    await c.ic.call_focus_out()
+    closed = await wait_menus_gone()
+    sh("xdotool", "mousemove", "5", "5")
+    gone = await wait_window("wind-status", False, timeout=5.0)
+    check("气泡菜单关闭：失焦（菜单收起、气泡随后按时长消失）",
+          ok and closed and gone is not None and not gone[5], f"开={ok} 菜单关={closed} 气泡={gone}")
+    await c.ic.call_focus_in()
+    await asyncio.sleep(0.2)
+    await typing_works(c, "气泡菜单失焦关闭")
+    # 5) 拖动中失焦：服务端失焦即收状态提示（同 Windows），气泡被摘 → 拖动随之作废、不上报
+    #    （用户没松手，谈不上摆到了哪）；松手不卡，之后照常打字、还能再拖。
+    st = await pop_status(c)
+    if st and st[5]:
+        cx, cy = center(st)
+        before = drag_reports()
+        sh("xdotool", "mousemove", str(cx), str(cy))
+        await asyncio.sleep(0.05)
+        sh("xdotool", "mousedown", "1")
+        sh("xdotool", "mousemove", str(cx + 40), str(cy + 20))
+        await c.ic.call_focus_out()
+        gone = await wait_window("wind-status", False, timeout=2.0)
+        sh("xdotool", "mousemove", str(cx + 80), str(cy + 40))
+        sh("xdotool", "mouseup", "1")
+        await asyncio.sleep(0.3)
+        check("气泡拖动中失焦：气泡随失焦收起、拖动作废不上报",
+              gone is not None and not gone[5] and drag_reports() == before,
+              f"气泡={gone} 上报 {drag_reports() - before} 次")
+        await c.ic.call_focus_in()
+        await asyncio.sleep(0.2)
+        st = await pop_status(c)
+        if st and st[5]:
+            before = drag_reports()
+            await drag(*center(st), 30, 10)
+            check("气泡拖动中失焦：之后还能再拖（上报一次）", drag_reports() == before + 1,
+                  f"上报 {drag_reports() - before} 次")
+    else:
+        check("气泡拖动中失焦：气泡出现", False, f"window={st}")
+    sh("xdotool", "mousemove", "5", "5")
+    await typing_works(c, "拖动中失焦")
+    await wait_window("wind-status", False, timeout=5.0)
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
+async def wait_push(c, timeout=10.0):
+    """服务（重）启后请求通道先通（按键被吃），push 通道每秒重连一次、要晚一点——在那之前推下来
+    的帧（候选窗、浮层）全丢。打一个字等候选窗出现、Esc 等它消失：两步都靠 push，才算通了
+    （服务被杀时候选窗可能还挂着旧帧，只看「出现」会被它骗过）。"""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        await c.key("a")
+        shown = await wait_window("wind-candidate", True, timeout=1.0)
+        await c.key("Escape")
+        hidden = await wait_window("wind-candidate", False, timeout=1.0)
+        c.take()
+        c.preedits.clear()
+        if shown and shown[5] and hidden is not None and not hidden[5]:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+
+
+async def overlay_restart_cases(bus, im, restart):
+    """浮层交互进行中服务没了（被杀 / 重启）：拖动态、菜单、气泡的保持都得归位，之后照常打字、
+    还能再拖。仅在 e2e 自己管服务时跑。"""
+    c = await new_ctx(bus, im, "e2e-overlay-restart")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    sh("xdotool", "mousemove", "5", "5")
+    w = os.environ["W"]
+    # 上一组用例刚重启过服务：先等请求与 push 两条通道都通。
+    await wait_ready(c)
+    await wait_push(c)
+
+    # a) 拖动中服务重启（SERVICE_READY → addon 收掉全部浮层）：拖动态随窗口归位、这次不上报。
+    st = await pop_status(c)
+    ok = st is not None and st[5]
+    before = drag_reports()
+    if ok:
+        cx, cy = center(st)
+        sh("xdotool", "mousemove", str(cx), str(cy))
+        sh("xdotool", "mousedown", "1")
+        sh("xdotool", "mousemove", str(cx + 30), str(cy + 15))
+        rc = await asyncio.to_thread(subprocess.run, [restart])
+        gone = await wait_window("wind-status", False, timeout=5.0)
+        sh("xdotool", "mousemove", str(cx + 60), str(cy + 30))
+        sh("xdotool", "mouseup", "1")
+        await asyncio.sleep(0.3)
+        check("气泡拖动中服务重启：气泡收起、拖动作废不上报",
+              rc.returncode == 0 and gone is not None and not gone[5] and drag_reports() == before,
+              f"rc={rc.returncode} 气泡={gone} 上报 {drag_reports() - before} 次")
+    else:
+        check("气泡拖动中服务重启：气泡出现", False, f"window={st}")
+    await c.ic.call_focus_in()
+    await wait_ready(c)
+    await wait_push(c)
+    await typing_works(c, "拖动中服务重启")
+    st = await pop_status(c)
+    if st and st[5]:
+        cx, cy = center(st)
+        before = drag_reports()
+        await drag(cx, cy, 50, 20)
+        moved = candidate_window("wind-status")
+        check("气泡拖动中服务重启：之后还能再拖（上报一次、跟手）",
+              drag_reports() == before + 1 and moved and (moved[1] - st[1], moved[2] - st[2]) == (50, 20),
+              f"上报 {drag_reports() - before} 次 拖前={st} 拖后={moved}")
+    sh("xdotool", "mousemove", "5", "5")
+
+    # b) 提示菜单开着时服务重启：菜单收起，之后照常打字。
+    menu, _ = await open_tooltip_menu(c)
+    opened = menu is not None and menu[5]
+    rc = await asyncio.to_thread(subprocess.run, [restart])
+    gone = await wait_menus_gone(5)
+    check("提示菜单关闭：服务重启", opened and gone, f"开={opened} 关={gone}")
+    await c.ic.call_focus_in()
+    await wait_ready(c)
+    await wait_push(c)
+    await typing_works(c, "提示菜单开着时服务重启")
+
+    # c) 拖动中服务被杀：push 断线，没人再推隐藏帧——松手不卡，气泡随后按时长自己消失。
+    st = await pop_status(c)
+    if st and st[5]:
+        cx, cy = center(st)
+        sh("xdotool", "mousemove", str(cx), str(cy))
+        sh("xdotool", "mousedown", "1")
+        sh("xdotool", "mousemove", str(cx + 30), str(cy + 15))
+        pid = open(os.path.join(w, "svc.pid")).read().strip()
+        subprocess.run(["kill", "-9", pid], capture_output=True)
+        await asyncio.sleep(0.5)
+        sh("xdotool", "mousemove", str(cx + 60), str(cy + 30))
+        sh("xdotool", "mouseup", "1")
+        sh("xdotool", "mousemove", "5", "5")
+        gone = await wait_window("wind-status", False, timeout=5.0)
+        check("气泡拖动中服务被杀：松手不卡、气泡按时长消失", gone is not None and not gone[5],
+              f"气泡={gone}")
+    else:
+        check("气泡拖动中服务被杀：气泡出现", False, f"window={st}")
+    rc = await asyncio.to_thread(subprocess.run, [restart])
+    await c.ic.call_focus_in()
+    ready = await wait_ready(c)
+    check("气泡拖动中服务被杀：重启后按键恢复", rc.returncode == 0 and ready, f"rc={rc.returncode}")
+    await typing_works(c, "拖动中服务被杀并重启")
+    return c
+
 
 def settings_windows():
     """设置程序的顶层窗口（WM_CLASS 实例名 = 可执行文件名 wind_setting.bin，见 windui
@@ -1180,6 +1639,7 @@ async def main():
         await x11_cases(bus, im)
         await overlay_cases(bus, im)
         await menu_cases(bus, im)
+        await overlay_interaction_cases(bus, im)
         await mode_icon_cases(bus, im)
         await settings_cases(bus, im)
         await a.ic.call_focus_in()
@@ -1200,6 +1660,7 @@ async def main():
         if os.environ.get("DISPLAY"):
             await a.ic.call_focus_out()
             await menu_restart_cases(bus, im, restart)
+            await overlay_restart_cases(bus, im, restart)
 
     ok = all(results)
     print(f"{'PASS' if ok else 'FAIL'} 总计 {sum(results)}/{len(results)}", flush=True)

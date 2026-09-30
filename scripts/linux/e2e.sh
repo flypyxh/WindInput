@@ -79,7 +79,26 @@ cat >"$W/xdg/config/WindInput/config.toml" <<'EOF'
 [schema]
 active = "pinyin"
 available = ["pinyin", "wubi86"]
+
+# 出厂 800ms：浮层交互用例（悬停保持 / 拖动 / 右键菜单）要在气泡消失前把指针挪上去。
+[ui.status]
+duration = 2000
 EOF
+# 假剪贴板：服务写剪贴板走外部命令（X11 下 xclip），e2e 环境没有、也不该碰本机剪贴板。
+# 记下每次写入（参数 + 内容），`-o` 读回最近一次文本。服务与 fcitx5（自动拉起模式下由它
+# 拉服务）都继承下面导出的 PATH。
+mkdir -p "$W/fakebin"
+cat >"$W/fakebin/xclip" <<XCLIP
+#!/usr/bin/env bash
+if [[ " \$* " == *" -o "* ]]; then cat "$W/clipboard.last" 2>/dev/null; exit 0; fi
+if [[ " \$* " == *" image/png "* ]]; then
+    printf '== %s (%s 字节)\\n' "\$*" "\$(wc -c)" >>"$W/clipboard.log"
+    exit 0
+fi
+cat >"$W/clipboard.last"
+{ printf '== %s\\n' "\$*"; cat "$W/clipboard.last"; printf '\\n'; } >>"$W/clipboard.log"
+XCLIP
+chmod +x "$W/fakebin/xclip"
 
 # fcitx5 配置：输入法组里只放本引擎（Fcitx5 把组里第一个当「非激活态」输入法，只有一个
 # 就恒为它，省掉触发键激活这一步）；清空 AltTriggerKeys——出厂是 Shift_L，会在我们之前把
@@ -123,6 +142,31 @@ export WIND_INPUT_RUNTIME_DIR="$W/rt"
 export XDG_RUNTIME_DIR="$W/rt"
 export XDG_CONFIG_HOME="$W/xdg/config" XDG_DATA_HOME="$W/xdg/data" XDG_CACHE_HOME="$W/xdg/cache"
 export TMPDIR=/tmp/wi-linux
+# X 先于服务起：服务要继承 DISPLAY（剪贴板走 xclip，按 DISPLAY 选后端）。
+export PATH="$W/fakebin:$PATH"
+unset DISPLAY WAYLAND_DISPLAY
+# 候选窗（X11）：私有 Xvfb。WIND_E2E_X11=0 关掉则只测输入通路。WIND_E2E_COMPOSITOR=1 再起
+# xcompmgr，走 ARGB 真透明那条路；默认无合成器，走 XShape 抠形那条路。
+XVFB=""
+COMP=""
+if [[ "${WIND_E2E_X11:-1}" != 0 ]]; then
+    XN=$(( 60 + $$ % 30 ))
+    while [[ -e /tmp/.X11-unix/X$XN ]]; do XN=$((XN + 1)); done
+    Xvfb-wind ":$XN" -screen 0 1280x800x24 -nolisten tcp -xkbdir /usr/share/X11/xkb \
+        >"$W/xvfb.log" 2>&1 &
+    XVFB=$!
+    for _ in $(seq 1 50); do [[ -e /tmp/.X11-unix/X$XN ]] && break; sleep 0.1; done
+    export DISPLAY=":$XN"
+    echo "[e2e] Xvfb 已就绪 (DISPLAY=$DISPLAY)"
+    if [[ "${WIND_E2E_COMPOSITOR:-0}" != 0 ]]; then
+        xcompmgr >"$W/xcompmgr.log" 2>&1 &
+        COMP=$!
+        sleep 0.5
+        echo "[e2e] xcompmgr 已起（ARGB 路径）"
+    fi
+    mkdir -p "$W/shots"
+    export WIND_E2E_SHOTS="$W/shots"
+fi
 
 # 服务由 restart-service.sh 起停：用例里要验「服务重启后 addon 自愈重连」，得能在客户端
 # 进程里重启它（环境变量随进程树继承，重启出来的服务与首启同一套隔离目录）。
@@ -165,29 +209,6 @@ export FCITX_CONFIG_HOME="$W/fcitx"
 export WIND_INPUT_SETTING="$W/svc/wind_setting"
 export FCITX_ADDON_DIRS="$ADDON_BUILD:$SDK_ROOT/usr/lib/$MULTIARCH/fcitx5"
 export FCITX_DATA_DIRS="$ADDON_BUILD/share/fcitx5:$SDK_ROOT/usr/share/fcitx5"
-unset DISPLAY WAYLAND_DISPLAY
-# 候选窗（X11）：私有 Xvfb。WIND_E2E_X11=0 关掉则只测输入通路。WIND_E2E_COMPOSITOR=1 再起
-# xcompmgr，走 ARGB 真透明那条路；默认无合成器，走 XShape 抠形那条路。
-XVFB=""
-COMP=""
-if [[ "${WIND_E2E_X11:-1}" != 0 ]]; then
-    XN=$(( 60 + $$ % 30 ))
-    while [[ -e /tmp/.X11-unix/X$XN ]]; do XN=$((XN + 1)); done
-    Xvfb-wind ":$XN" -screen 0 1280x800x24 -nolisten tcp -xkbdir /usr/share/X11/xkb \
-        >"$W/xvfb.log" 2>&1 &
-    XVFB=$!
-    for _ in $(seq 1 50); do [[ -e /tmp/.X11-unix/X$XN ]] && break; sleep 0.1; done
-    export DISPLAY=":$XN"
-    echo "[e2e] Xvfb 已就绪 (DISPLAY=$DISPLAY)"
-    if [[ "${WIND_E2E_COMPOSITOR:-0}" != 0 ]]; then
-        xcompmgr >"$W/xcompmgr.log" 2>&1 &
-        COMP=$!
-        sleep 0.5
-        echo "[e2e] xcompmgr 已起（ARGB 路径）"
-    fi
-    mkdir -p "$W/shots"
-    export WIND_E2E_SHOTS="$W/shots"
-fi
 # kimpanel：客户端扮演 KDE/GNOME 的面板，点状态区动作「清风输入法设置」、听当前输入法图标
 # （随中英模式切换的 windinput-zh / windinput-en）。
 # 菜单空闲超时调短到 5 秒，好让「超时自动收起」这条兜底在 e2e 里跑得到（出厂 60 秒）。
