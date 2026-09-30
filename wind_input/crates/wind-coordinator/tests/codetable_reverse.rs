@@ -11,6 +11,7 @@ const VK_BACKSLASH: u32 = 0xDC;
 const VK_ESCAPE: u32 = 0x1B;
 const VK_NEXT: u32 = 0x22;
 const VK_BACK: u32 = 0x08;
+const VK_OEM_MINUS: u32 = 0xBD;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -318,4 +319,35 @@ fn reverse_focus_lost_after_relax_leaves_no_residue() {
     letters(&c, "a");
     assert_eq!(c.debug_input_buffer(), "a", "主路径照常组码");
     assert!(!c.debug_scope_relaxed(), "失焦后的新组码不继承放宽");
+}
+
+/// 反查模式里 `handle_candidate_nav` 排在通配键进缓冲之前（Task 17 审查 M2）：通配键配成
+/// 翻页 / 选词键时模式内它先被导航吃掉，通配进不了缓冲。不改按键顺序，由体检报出。
+/// 对照：出厂通配键 `z` 不报；反查总开关关时不报（模式进不去，谈不上模式内冲突）。
+#[test]
+fn reverse_wildcard_key_on_nav_key_is_reported() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let with_key = |k: &str, enabled: bool| {
+        let mut cfg = wubi_rev();
+        cfg.schema.codetable.wildcard_key = k.into();
+        cfg.input.reverse.enabled = enabled;
+        Coordinator::new_headless(cfg, Some(&data_dir())).reverse_wildcard_conflicts()
+    };
+    assert_eq!(with_key("-", true), vec!["翻页键"]);
+    assert_eq!(with_key(";", true), vec!["次选键"]);
+    assert!(with_key("z", true).is_empty(), "对照：出厂 z 无冲突");
+    assert!(with_key("-", false).is_empty(), "对照：总开关关不报");
+
+    // 报的是真冲突：模式内按 `-` 被翻页吃掉，不进缓冲。
+    let mut cfg = wubi_rev();
+    cfg.schema.codetable.wildcard_key = "-".into();
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    letters(&c, "a");
+    key(&c, VK_OEM_MINUS, false);
+    assert_eq!(c.debug_active_mode(), Some("reverse"));
+    assert_eq!(c.debug_preedit(), "\\a", "`-` 被导航吃掉，没进缓冲");
 }
