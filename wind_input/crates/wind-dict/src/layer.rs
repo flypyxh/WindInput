@@ -241,7 +241,7 @@ mod tests {
             weight: w,
             ..Default::default()
         };
-        let mut v = vec![c("abcd", 9999), c("ab", 10), c("ac", 20)];
+        let mut v = [c("abcd", 9999), c("ab", 10), c("ac", 20)];
         v.sort_by(|a, b| cmp_pattern(2, a, b));
         let codes: Vec<&str> = v.iter().map(|x| x.code.as_str()).collect();
         assert_eq!(

@@ -688,10 +688,7 @@ mod tests {
             for o in f.options {
                 let zh = option_label(o)
                     .unwrap_or_else(|| panic!("{}.{} 的取值 {o} 没有登记中文名", f.section, f.key));
-                assert!(
-                    zh.chars().any(|c| !c.is_ascii()),
-                    "{o} 的显示名 {zh:?} 里没有中文"
-                );
+                assert!(!zh.is_ascii(), "{o} 的显示名 {zh:?} 里没有中文");
             }
         }
         let v = schema_json();

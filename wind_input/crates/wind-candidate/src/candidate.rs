@@ -1546,7 +1546,7 @@ mod wildcard_tier_tests {
             source: CandidateSource::Pinyin,
             ..Default::default()
         };
-        let mut v = vec![longer, py, equal];
+        let mut v = [longer, py, equal];
         v.sort_by(|a, b| candidate_display_order(a, b, false, true, "azi"));
         let order: Vec<&str> = v.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(order, ["蒸", "阿紫", "蒸笼"]);
