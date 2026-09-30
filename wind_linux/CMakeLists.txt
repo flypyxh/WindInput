@@ -79,7 +79,8 @@ if(WIND_BUILD_ADDON)
         DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5/addon)
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/share/fcitx5/inputmethod/windinput.conf
         DESTINATION ${CMAKE_INSTALL_DATADIR}/fcitx5/inputmethod)
-    # 图标（输入法条目 `windinput`、托盘随模式切换的 `windinput-zh/en`）：成品入库，由
-    # scripts/linux/gen-icons.py 一次性生成，构建与打包都不需要额外工具。
+    # 图标（输入法条目 `windinput`、托盘随模式切换的 `windinput-zh*` / `-en` / `-caps`）：成品入库，
+    # 分别由 scripts/linux/gen-icons.py 与 wind-ui 的 gen_tray_icons 例子一次性生成，构建与打包都
+    # 不需要额外工具。
     install(DIRECTORY data/icons/hicolor DESTINATION ${CMAKE_INSTALL_DATADIR}/icons)
 endif()

@@ -83,11 +83,15 @@ private:
     void sendFocusGained(fcitx::InputContext* ic);
     void sendCaretUpdate(fcitx::InputContext* ic);
     uint16_t prevCharFor(fcitx::InputContext* ic);
-    /// 修饰键单击：发一帧 eventType=UP 的 KeyEvent 并应用其响应。
-    void sendModifierTap(fcitx::InputContext* ic, uint32_t vk);
+    /// 修饰键单击 / CapsLock 状态通知：发一帧 eventType=UP 的 KeyEvent 并应用其响应。
+    /// `toggles` 必须是真实锁定态——服务端拿**每一帧**的 toggles 校准大写锁定镜像，
+    /// 发 0 等于告诉它「大写锁定关了」。
+    void sendKeyUp(fcitx::InputContext* ic, uint32_t vk, uint32_t mods, uint8_t toggles);
     bool applyResponse(fcitx::InputContext* ic, const Frame& resp, bool hostShortcut);
     /// 帧里带中英模式就记下；变了则让 Fcitx5 的 UI 模块重取图标。
     void noteMode(const Frame& frame);
+    /// 托盘图标 / 标签变了：让 Fcitx5 的 UI 模块重取。
+    void refreshModeIcon();
 
     // ── push ──
     void onPushFrame(Frame frame);
@@ -107,6 +111,7 @@ private:
     BridgeClient bridge_;
     ResponseRouter router_;
     ToggleTapDetector tap_;
+    CapsLockTracker caps_;
     uint16_t keySeq_ = 0;
     bool lastReportedSecure_ = false;
     bool serviceSeenOnce_ = false;

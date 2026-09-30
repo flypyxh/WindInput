@@ -25,18 +25,20 @@ IC_IFACE = "org.fcitx.Fcitx.InputContext1"
 CAP_PREEDIT = (1 << 1) | (1 << 4)
 CAP_PASSWORD = 1 << 3
 STATE_SHIFT = 1 << 0
+STATE_LOCK = 1 << 1
 STATE_CTRL = 1 << 2
 
 # X11 keysym 与 US 布局的 X keycode（evdev + 8）。
 KEYSYM = {c: ord(c) for c in "abcdefghijklmnopqrstuvwxyz0123456789 "}
 KEYSYM.update({"BackSpace": 0xFF08, "Return": 0xFF0D, "Escape": 0xFF1B, "Shift_L": 0xFFE1,
+               "Caps_Lock": 0xFFE5,
                "Left": 0xFF51, "Up": 0xFF52, "Right": 0xFF53, "Down": 0xFF54})
 KEYCODE = {
     **dict(zip("qwertyuiop", range(24, 34))),
     **dict(zip("asdfghjkl", range(38, 47))),
     **dict(zip("zxcvbnm", range(52, 59))),
     **dict(zip("1234567890", range(10, 20))),
-    " ": 65, "Return": 36, "Escape": 9, "BackSpace": 22, "Shift_L": 50,
+    " ": 65, "Return": 36, "Escape": 9, "BackSpace": 22, "Shift_L": 50, "Caps_Lock": 66,
     "Left": 113, "Up": 111, "Right": 114, "Down": 116,
 }
 
@@ -76,12 +78,22 @@ class Ctx:
     async def type(self, text):
         return [await self.key(c) for c in text]
 
-    async def tap_shift(self):
+    async def tap_shift(self, state=0):
         # 单击 Shift：按下时 state 不含 Shift，松开时含（X11 语义：state 是事件前的修饰态）。
         code = KEYCODE["Shift_L"]
         sym = KEYSYM["Shift_L"]
-        await self.ic.call_process_key_event(sym, code, 0, False, 0)
-        await self.ic.call_process_key_event(sym, code, STATE_SHIFT, True, 0)
+        await self.ic.call_process_key_event(sym, code, state, False, 0)
+        await self.ic.call_process_key_event(sym, code, state | STATE_SHIFT, True, 0)
+        await asyncio.sleep(0.15)
+
+    async def tap_caps_lock(self, locked_before):
+        # 按一下 CapsLock，state 按真实 X11 的样子给（Xvfb + xev 实测）：开 → 按下 0、松开 Lock；
+        # 关 → 按下 Lock、松开**仍是** Lock（XKB 在松开时才解锁，state 是事件之前的）。
+        code = KEYCODE["Caps_Lock"]
+        sym = KEYSYM["Caps_Lock"]
+        before = STATE_LOCK if locked_before else 0
+        await self.ic.call_process_key_event(sym, code, before, False, 0)
+        await self.ic.call_process_key_event(sym, code, STATE_LOCK, True, 0)
         await asyncio.sleep(0.15)
 
     def take(self):
@@ -654,8 +666,8 @@ async def menu_cases(bus, im):
     # 空闲时没有主菜单入口了（状态区入口改成了「清风输入法设置」），主菜单都从组字时的
     # 「更多…」进——英文态组不了字，先用 Shift 切回中文（顺带验按键这条来源的托盘图标）。
     await c.tap_shift()
-    zh = await wait_until(lambda: watch.icon() == "windinput-zh", 2)
-    check("托盘图标：Shift 切回中文 → windinput-zh", zh, f"im={watch.im()!r}")
+    zh = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
+    check("托盘图标：Shift 切回中文 → windinput-zh-pin（全拼）", zh, f"im={watch.im()!r}")
 
     # g) 主菜单的子菜单点选：输入方案 ▸ 全拼（英文、分隔线之后那一行）→ 仍是中文全拼。
     #    关掉菜单后组字还挂着，先收掉再验打字。
@@ -1396,14 +1408,15 @@ async def settings_cases(bus, im):
 
 
 async def mode_icon_cases(bus, im):
-    """托盘 / 面板图标随中英模式切换：引擎的 subModeIcon 经 kimpanel 模块报给面板。按键切换
+    """托盘 / 面板图标随模式切换：引擎的 subModeIcon 经 kimpanel 模块报给面板。按键切换
     （Shift 单击 → STATUS_UPDATE 响应）与焦点进入（FocusGained → MODE_PUSH）两条来源；
-    菜单切换（push 通道 STATE_PUSH）在 menu_cases 里验。"""
+    菜单切换（push 通道 STATE_PUSH）在 menu_cases 里验。对齐 Windows 语言栏：中文态按方案
+    标签（e2e 用全拼，「拼」）、英文态「英」、大写锁定无论中英都是「A」。"""
     watch = await kimpanel_watch(bus)
     c = await new_ctx(bus, im, "e2e-mode-icon")
-    zh = await wait_until(lambda: watch.icon() == "windinput-zh", 2)
-    check("托盘图标：中文态为 windinput-zh、标签「中」", zh and watch.im().endswith("label=中"),
-          f"im={watch.im()!r}")
+    zh = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
+    check("托盘图标：中文态按方案标签，全拼为 windinput-zh-pin、标签「拼」",
+          zh and watch.im().endswith("label=拼"), f"im={watch.im()!r}")
     await c.tap_shift()
     en = await wait_until(lambda: watch.icon() == "windinput-en", 2)
     check("托盘图标：Shift 切英文 → windinput-en、标签「英」",
@@ -1415,9 +1428,68 @@ async def mode_icon_cases(bus, im):
     await asyncio.sleep(0.3)
     check("托盘图标：换焦点后仍是 windinput-en", watch.icon() == "windinput-en",
           f"im={watch.im()!r}")
+
+    # 大写锁定（英文态）：按下 + 松开 → 「A」；服务端同步镜像并回 STATUS_CAPS_LOCK。
+    await c.tap_caps_lock(False)
+    caps = await wait_until(lambda: watch.icon() == "windinput-caps", 2)
+    check("托盘图标：英文态按 CapsLock → windinput-caps、标签「A」",
+          caps and watch.im().endswith("label=A"), f"im={watch.im()!r}")
+    # 大写锁定下打字母：服务端认得大写（英文态本就直通，这里只验不被吞、图标不动）。
+    eaten = await c.key("a", STATE_LOCK)
+    check("大写锁定：英文态字母直通、图标仍是「A」",
+          eaten is False and watch.icon() == "windinput-caps", f"eaten={eaten} im={watch.im()!r}")
+    # 换焦点：MODE_PUSH 不带大写锁定位，不能把「A」打回「英」。
+    await c.ic.call_focus_out()
+    await d.ic.call_focus_in()
+    await asyncio.sleep(0.3)
+    check("托盘图标：大写锁定时换焦点不回退", watch.icon() == "windinput-caps",
+          f"im={watch.im()!r}")
+    await d.ic.call_focus_out()
+    await c.ic.call_focus_in()
+    await asyncio.sleep(0.3)
+    # Shift 单击（带着 Lock 位）：切到中文，但大写锁定仍开着 → 仍是「A」。修的是一个真坑：
+    # 修饰键单击那一帧曾发 toggles=0，服务端据此把大写锁定镜像校准成「关」。
+    await c.tap_shift(STATE_LOCK)
+    await asyncio.sleep(0.3)
+    check("托盘图标：大写锁定时 Shift 切中文，仍是 windinput-caps（中文态也显示「A」）",
+          watch.icon() == "windinput-caps", f"im={watch.im()!r}")
+    # 中文态 + 大写锁定：字母按大写直出，不进组字。
+    eaten = await c.key("a", STATE_LOCK)
+    await asyncio.sleep(0.2)
+    check("大写锁定：中文态字母不进组字", c.preedit == "", f"eaten={eaten} preedit={c.preedit!r}")
+    c.take()
+    # 再按一次 CapsLock：回到当前模式的图标（中文 → 「拼」）。
+    await c.tap_caps_lock(True)
+    back = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
+    check("托盘图标：再按 CapsLock → 回到 windinput-zh-pin",
+          back and watch.im().endswith("label=拼"), f"im={watch.im()!r}")
+    typed = await c.type("ni")
+    check("大写锁定关掉后中文组字恢复", typed == [True, True] and c.preedit != "",
+          f"eaten={typed} preedit={c.preedit!r}")
+    await c.key("Escape")
+    c.take()
+    # 在别处开了大写锁定（本引擎没收到 Caps_Lock）：第一个带 Lock 位的键就校准回来。
+    await c.key("Left", STATE_LOCK)
+    cal = await wait_until(lambda: watch.icon() == "windinput-caps", 2)
+    check("托盘图标：别处开的大写锁定，第一个带 Lock 位的键就校准成「A」", cal,
+          f"im={watch.im()!r}")
+    await c.key("Left")
+    uncal = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
+    check("托盘图标：Lock 位消失即回到「拼」", uncal, f"im={watch.im()!r}")
+
     await c.tap_shift()
-    back = await wait_until(lambda: watch.icon() == "windinput-zh", 2)
-    check("托盘图标：再按 Shift 切回 → windinput-zh", back, f"im={watch.im()!r}")
+    en2 = await wait_until(lambda: watch.icon() == "windinput-en", 2)
+    await c.tap_shift()
+    back = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
+    check("托盘图标：再按 Shift 切英 / 切回 → windinput-en / windinput-zh-pin", en2 and back,
+          f"im={watch.im()!r}")
+    # 切方案（Ctrl+Shift+E，全拼 ⇄ 五笔）：中英不变、方案标签变，图标跟着换。
+    for want, label in (("windinput-zh-wu", "五"), ("windinput-zh-pin", "拼")):
+        await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, False, 0)
+        await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, True, 0)
+        ok = await wait_until(lambda: watch.icon() == want, 2)
+        check(f"托盘图标：Ctrl+Shift+E 切方案 → {want}、标签「{label}」",
+              ok and watch.im().endswith(f"label={label}"), f"im={watch.im()!r}")
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
 

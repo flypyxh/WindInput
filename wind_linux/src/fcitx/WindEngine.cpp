@@ -334,10 +334,14 @@ bool WindEngine::applyResponse(fcitx::InputContext* ic, const Frame& resp, bool 
 
 void WindEngine::noteMode(const Frame& frame)
 {
-    if (!mode_.update(frame)) {
-        return;
+    if (mode_.update(frame)) {
+        refreshModeIcon();
     }
-    WIND_DEBUG() << "中英模式 → " << mode_.subModeName();
+}
+
+void WindEngine::refreshModeIcon()
+{
+    WIND_DEBUG() << "模式图标 → " << mode_.iconName() << "（" << mode_.label() << "）";
     // StatusArea 这一格的 UI 更新就是 Fcitx5 各 UI 模块重取输入法图标的信号（notificationitem
     // 发 NewIcon、kimpanel 重报属性、classicui 重画托盘）。
     if (fcitx::InputContext* ic = focusedIC()) {
@@ -360,13 +364,15 @@ std::string WindEngine::subModeLabelImpl(const fcitx::InputMethodEntry&, fcitx::
     return mode_.label();
 }
 
-void WindEngine::sendModifierTap(fcitx::InputContext* ic, uint32_t vk)
+void WindEngine::sendKeyUp(fcitx::InputContext* ic, uint32_t vk, uint32_t mods, uint8_t toggles)
 {
     // 模式切换通常无组合，先刷新 caret 让状态气泡锚到当前插入点。
     sendCaretUpdate(ic);
     KeyEvent e;
     e.keyCode = vk;
-    e.eventType = KEY_EVENT_UP; // 协调器只在 keyup 分支处理切换键（TSF 惯例）
+    e.modifiers = mods;
+    e.eventType = KEY_EVENT_UP; // 协调器只在 keyup 分支处理切换键与 CapsLock（TSF 惯例）
+    e.toggles = toggles;
     e.eventSeq = ++keySeq_;
     e.prevChar = prevCharFor(ic);
     Frame resp;
@@ -394,6 +400,7 @@ void WindEngine::activate(const fcitx::InputMethodEntry&, fcitx::InputContextEve
     // 光标前字符的记账只对「这一个文本框里我们自己打出去的东西」有效，换焦点即作废。
     router_.reset();
     tap_.reset();
+    caps_.reset();
     eatenKeys_.clear();
     if (!ensureConnected()) {
         return;
@@ -464,10 +471,31 @@ void WindEngine::keyEvent(const fcitx::InputMethodEntry&, fcitx::KeyEvent& event
     uint32_t states = uint32_t(key.states());
     int code = key.code() != 0 ? key.code() : -int(sym); // 无硬件键码（DBus 合成）时退到 keysym
 
+    // 大写锁定：本端先判（托盘图标立即换，不等服务端），见 CapsLockTracker。
+    const std::optional<bool> caps = caps_.onKey(sym, states, event.isRelease());
+    if (caps && mode_.noteCapsLock(*caps)) {
+        refreshModeIcon();
+    }
+    if (sym == uint32_t(FcitxKey_Caps_Lock)) {
+        // 同 Windows：CapsLock 的按下不转发（锁定态由系统维护），松开时报一帧 VK_CAPITAL keyup
+        // 带新的锁定态——服务端据此同步镜像、处理正在打的编码、弹状态气泡，并回 STATUS_UPDATE
+        // （带 STATUS_CAPS_LOCK 与「A」标签）。键本身两个方向都交还宿主。
+        if (!event.isRelease()) {
+            tap_.onPress(sym, nowMs()); // Shift 按住时按 CapsLock：那次 Shift 不再是单击
+        } else if (caps && ensureConnected()) {
+            uint8_t toggles = statesToToggles(states) & ~TOGGLE_CAPSLOCK;
+            sendKeyUp(ic, keysymToVK(sym), statesToModifiers(states),
+                      *caps ? uint8_t(toggles | TOGGLE_CAPSLOCK) : toggles);
+        }
+        return;
+    }
+
     if (event.isRelease()) {
         if (uint32_t vk = tap_.onRelease(sym, nowMs()); vk != 0) {
             // 干净的修饰键单击：切中英等。松开事件本身照常交给宿主（宿主要看得见修饰键）。
-            sendModifierTap(ic, vk);
+            if (ensureConnected()) {
+                sendKeyUp(ic, vk, 0, statesToToggles(states));
+            }
             return;
         }
         if (eatenKeys_.erase(code) > 0) {

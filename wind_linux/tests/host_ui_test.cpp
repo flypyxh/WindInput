@@ -2,12 +2,15 @@
 
 #include "Codec.h"
 #include "HostUi.h"
+#include "KeyMap.h"
 #include "Protocol.h"
 #include "TestHarness.h"
 
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 using namespace windlinux;
 
@@ -28,6 +31,31 @@ Frame flagsFrame(uint16_t cmd, uint32_t flags)
     // STATUS_UPDATE 的真实载荷在 flags 之后还有热键计数与标签，模式只看开头。
     putU32(f.payload, 0);
     putU32(f.payload, 0);
+    return f;
+}
+
+/// 完整状态帧（STATUS_UPDATE / STATE_PUSH / ACTIVATION_STATUS_PUSH 的真实布局）：
+/// flags + keyDown 数 + keyUp 数 + 哈希 + 尾部标签。
+Frame statusFrame(uint16_t cmd, uint32_t flags, const std::string& label, uint32_t hashes = 0)
+{
+    Frame f;
+    f.cmd = cmd;
+    putU32(f.payload, flags);
+    putU32(f.payload, hashes);
+    putU32(f.payload, 0);
+    for (uint32_t i = 0; i < hashes; ++i) {
+        putU32(f.payload, 0x10000u + i);
+    }
+    f.payload.insert(f.payload.end(), label.begin(), label.end());
+    return f;
+}
+
+/// MODE_PUSH 的真实布局：只有 4 字节 flags。
+Frame modePush(uint32_t flags)
+{
+    Frame f;
+    f.cmd = CMD_MODE_PUSH;
+    putU32(f.payload, flags);
     return f;
 }
 
@@ -56,28 +84,57 @@ int main()
 {
     CASE("四种状态帧都以 flags 开头，按 STATUS_CHINESE_MODE 取模式");
     for (uint16_t cmd : {CMD_MODE_PUSH, CMD_STATUS_UPDATE, CMD_STATE_PUSH, CMD_ACTIVATION_STATUS_PUSH}) {
-        CHECK(chineseModeOf(flagsFrame(cmd, STATUS_CHINESE_MODE | STATUS_FULL_WIDTH)) == true);
-        CHECK(chineseModeOf(flagsFrame(cmd, STATUS_FULL_WIDTH)) == false);
+        CHECK(modeStatusOf(flagsFrame(cmd, STATUS_CHINESE_MODE | STATUS_FULL_WIDTH))->chinese == true);
+        CHECK(modeStatusOf(flagsFrame(cmd, STATUS_FULL_WIDTH))->chinese == false);
+    }
+
+    CASE("完整状态帧带大写锁定位与标签（跳过热键哈希取尾部）；MODE_PUSH 两样都不带");
+    for (uint16_t cmd : {CMD_STATUS_UPDATE, CMD_STATE_PUSH, CMD_ACTIVATION_STATUS_PUSH}) {
+        auto st = modeStatusOf(statusFrame(cmd, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A", 3));
+        CHECK(st.has_value());
+        CHECK(st->chinese);
+        CHECK(st->capsLock == true);
+        CHECK(st->label == std::string("A"));
+        auto st2 = modeStatusOf(statusFrame(cmd, STATUS_CHINESE_MODE, "拼"));
+        CHECK(st2->capsLock == false);
+        CHECK(st2->label == std::string("拼"));
+    }
+    {
+        auto st = modeStatusOf(modePush(STATUS_CHINESE_MODE | STATUS_CAPS_LOCK));
+        CHECK(st.has_value());
+        CHECK(!st->capsLock.has_value()); // 没有这一位，不能当「没开」
+        CHECK(!st->label.has_value());
+    }
+
+    CASE("哈希计数超出载荷的坏帧：只认模式，不认大写锁定与标签");
+    {
+        Frame f = statusFrame(CMD_STATUS_UPDATE, STATUS_CAPS_LOCK, "A");
+        uint32_t bogus = 1000;
+        std::memcpy(f.payload.data() + 4, &bogus, 4);
+        auto st = modeStatusOf(f);
+        CHECK(st.has_value());
+        CHECK(!st->capsLock.has_value());
+        CHECK(!st->label.has_value());
     }
 
     CASE("载荷不足 4 字节的状态帧不算数（不当英文）");
     {
         Frame f;
         f.cmd = CMD_STATE_PUSH; // push_unix 的测试就发过零载荷的 STATE_PUSH
-        CHECK(!chineseModeOf(f).has_value());
+        CHECK(!modeStatusOf(f).has_value());
     }
 
     CASE("上屏帧只有带 MODE_CHANGED 时才携带模式");
-    CHECK(!chineseModeOf(commitFrame(COMMIT_FLAG_CHINESE_MODE, "你好")).has_value());
-    CHECK(chineseModeOf(commitFrame(COMMIT_FLAG_MODE_CHANGED, "Hello")) == false);
-    CHECK(chineseModeOf(commitFrame(COMMIT_FLAG_MODE_CHANGED | COMMIT_FLAG_CHINESE_MODE, "")) == true);
+    CHECK(!modeStatusOf(commitFrame(COMMIT_FLAG_CHINESE_MODE, "你好")).has_value());
+    CHECK(modeStatusOf(commitFrame(COMMIT_FLAG_MODE_CHANGED, "Hello"))->chinese == false);
+    CHECK(modeStatusOf(commitFrame(COMMIT_FLAG_MODE_CHANGED | COMMIT_FLAG_CHINESE_MODE, ""))->chinese == true);
 
     CASE("与模式无关的帧不动镜像");
     {
         Frame f;
         f.cmd = CMD_UPDATE_COMPOSITION;
         putU32(f.payload, STATUS_CHINESE_MODE); // 碰巧同值的 caretPos 不能被当成 flags
-        CHECK(!chineseModeOf(f).has_value());
+        CHECK(!modeStatusOf(f).has_value());
     }
 
     CASE("镜像：未知时不给图标（退回条目图标），学到后只在变化时报变");
@@ -86,16 +143,149 @@ int main()
         CHECK(!m.known());
         CHECK_EQ(m.iconName(), std::string());
         CHECK_EQ(m.label(), std::string());
-        CHECK(m.update(flagsFrame(CMD_MODE_PUSH, STATUS_CHINESE_MODE)));
+        CHECK(m.update(modePush(STATUS_CHINESE_MODE)));
         CHECK_EQ(m.iconName(), std::string("windinput-zh"));
         CHECK_EQ(m.label(), std::string("中"));
         CHECK_EQ(m.subModeName(), std::string("中文"));
-        CHECK(!m.update(flagsFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE))); // 没变
-        CHECK(!m.update(commitFrame(0, "你好")));                            // 不带模式
-        CHECK(m.update(flagsFrame(CMD_STATE_PUSH, 0)));
+        CHECK(!m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "中"))); // 没变
+        CHECK(!m.update(commitFrame(0, "你好")));                                   // 不带模式
+        CHECK(m.update(statusFrame(CMD_STATE_PUSH, 0, "英")));
         CHECK_EQ(m.iconName(), std::string("windinput-en"));
         CHECK_EQ(m.label(), std::string("英"));
         CHECK_EQ(m.subModeName(), std::string("英文"));
+    }
+
+    CASE("大写锁定：无论中英都是「A」（对齐 Windows effective_chinese），关掉回到原态");
+    {
+        ModeIndicator m;
+        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "中"));
+        CHECK(m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A")));
+        CHECK_EQ(m.iconName(), std::string("windinput-caps"));
+        CHECK_EQ(m.label(), std::string("A"));
+        CHECK_EQ(m.subModeName(), std::string("大写锁定"));
+        CHECK(m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "中")));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh"));
+
+        m.update(statusFrame(CMD_STATUS_UPDATE, 0, "英"));
+        CHECK(m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CAPS_LOCK, "A")));
+        CHECK_EQ(m.iconName(), std::string("windinput-caps"));
+        CHECK(m.update(statusFrame(CMD_STATUS_UPDATE, 0, "英")));
+        CHECK_EQ(m.iconName(), std::string("windinput-en"));
+    }
+
+    CASE("焦点进入的 MODE_PUSH 不带大写锁定位：沿用已知状态，不回退");
+    {
+        ModeIndicator m;
+        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A"));
+        CHECK(!m.update(modePush(STATUS_CHINESE_MODE)));
+        CHECK_EQ(m.iconName(), std::string("windinput-caps"));
+        // 换到一个英文态的 IC：中英变了，但大写锁定是全局的，图标仍是「A」。
+        CHECK(!m.update(modePush(0)));
+        CHECK_EQ(m.iconName(), std::string("windinput-caps"));
+        CHECK(!m.chinese());
+    }
+
+    CASE("本端大写锁定判定：立即换图标；关掉后方案标签不丢");
+    {
+        ModeIndicator u;
+        CHECK(!u.noteCapsLock(true)); // 模式未知：不给图标，也不报变
+        u.update(modePush(STATUS_CHINESE_MODE));
+        CHECK_EQ(u.iconName(), std::string("windinput-caps")); // 刚才那次判定记着
+
+        ModeIndicator m;
+        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "拼"));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh-pin"));
+        CHECK(m.noteCapsLock(true));
+        CHECK_EQ(m.iconName(), std::string("windinput-caps"));
+        CHECK_EQ(m.label(), std::string("A"));
+        CHECK(!m.noteCapsLock(true));
+        // 大写锁定态下服务端发来的是 caps 标签，不能覆盖方案标签。
+        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A"));
+        CHECK(m.noteCapsLock(false));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh-pin"));
+        CHECK_EQ(m.label(), std::string("拼"));
+    }
+
+    CASE("方案标签：内置方案各有图标，未知 / 自定义标签回落「中」；文字标签如实");
+    {
+        CHECK_EQ(ModeIndicator::iconForLabel("中"), std::string("windinput-zh"));
+        CHECK_EQ(ModeIndicator::iconForLabel("拼"), std::string("windinput-zh-pin"));
+        CHECK_EQ(ModeIndicator::iconForLabel("五"), std::string("windinput-zh-wu"));
+        CHECK_EQ(ModeIndicator::iconForLabel("笔"), std::string("windinput-zh-bi"));
+        CHECK_EQ(ModeIndicator::iconForLabel("双"), std::string("windinput-zh-shuang"));
+        CHECK_EQ(ModeIndicator::iconForLabel("英"), std::string("windinput-zh-ying"));
+        CHECK_EQ(ModeIndicator::iconForLabel("虎"), std::string("windinput-zh"));
+        CHECK_EQ(ModeIndicator::iconForLabel(""), std::string("windinput-zh"));
+
+        ModeIndicator m;
+        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "虎"));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh"));
+        CHECK_EQ(m.label(), std::string("虎"));
+        // [ui.labels] 配了别的英文 / 大写标签：图标仍是预生成的那张，文字标签跟配置。
+        m.update(statusFrame(CMD_STATUS_UPDATE, 0, "En"));
+        CHECK_EQ(m.iconName(), std::string("windinput-en"));
+        CHECK_EQ(m.label(), std::string("En"));
+        // 切方案（标签变、中英不变）也要报变：托盘图标换了。
+        ModeIndicator k;
+        k.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "五"));
+        CHECK(k.update(statusFrame(CMD_STATE_PUSH, STATUS_CHINESE_MODE, "拼")));
+        CHECK_EQ(k.iconName(), std::string("windinput-zh-pin"));
+    }
+
+    CASE("addon 可能给出的每个图标名，hicolor 里 16…64 与 scalable 都有文件");
+    {
+        std::string rs = WIND_PROTOCOL_RS;
+        const std::string ipc = "wind_input/crates/wind-ipc/src/protocol.rs";
+        std::string root = rs.substr(0, rs.rfind(ipc)) + "wind_linux/data/icons/hicolor/";
+        std::vector<std::string> names = {"windinput-en", "windinput-caps"};
+        for (const char* l : {"中", "拼", "五", "笔", "双", "英", "虎"}) {
+            names.push_back(ModeIndicator::iconForLabel(l));
+        }
+        for (const auto& name : names) {
+            for (const char* sz : {"16x16", "22x22", "24x24", "32x32", "48x48", "64x64"}) {
+                std::string path = root + sz + "/apps/" + name + ".png";
+                if (!std::filesystem::exists(path)) {
+                    std::printf("缺图标 %s\n", path.c_str());
+                }
+                CHECK(std::filesystem::exists(path));
+            }
+            CHECK(std::filesystem::exists(root + "scalable/apps/" + name + ".svg"));
+        }
+    }
+
+    CASE("CapsLock 判定：X11 事件的 state 是事件之前的（关的那次松开仍带 Lock）");
+    {
+        constexpr uint32_t Caps = 0xffe5;
+        CapsLockTracker t;
+        // 开：按下 state=0，松开 state=Lock（xev 实测）。
+        CHECK(!t.onKey(Caps, 0, false).has_value());
+        CHECK(t.onKey(Caps, xstate::CapsLock, true) == true);
+        // 关：按下 state=Lock，松开 state 仍是 Lock。只看松开的 Lock 位会判成「还开着」。
+        CHECK(!t.onKey(Caps, xstate::CapsLock, false).has_value());
+        CHECK(t.onKey(Caps, xstate::CapsLock, true) == false);
+        // DBus 客户端若在松开时报事件之后的状态（关 → 松开 state=0），结论一样。
+        CHECK(!t.onKey(Caps, 0, false).has_value());
+        CHECK(t.onKey(Caps, 0, true) == true);
+    }
+    {
+        constexpr uint32_t Caps = 0xffe5;
+        CapsLockTracker t;
+        CASE("CapsLock 判定：别的键的 Lock 位就是当前锁定态（在别处切过大写，第一个键就校准）");
+        CHECK(t.onKey('a', xstate::CapsLock, false) == true);
+        CHECK(t.onKey('a', xstate::CapsLock | xstate::Shift, true) == true);
+        CHECK(t.onKey('a', 0, false) == false);
+        CHECK(t.onKey(0xffe1 /* Shift_L */, xstate::NumLock, true) == false);
+
+        CASE("CapsLock 判定：没见到按下的松开判不了；焦点切换作废半截的按下");
+        CHECK(!t.onKey(Caps, xstate::CapsLock, true).has_value());
+        CHECK(!t.onKey(Caps, 0, false).has_value());
+        t.reset();
+        CHECK(!t.onKey(Caps, xstate::CapsLock, true).has_value());
+
+        CASE("CapsLock 判定：按住时的自动重复不覆盖「按下之前」的状态");
+        CHECK(!t.onKey(Caps, 0, false).has_value());
+        CHECK(!t.onKey(Caps, xstate::CapsLock, false).has_value()); // 重复，已上锁
+        CHECK(t.onKey(Caps, xstate::CapsLock, true) == true);
     }
 
     CASE("预编辑：单个空格的占位组合不显示，其余原样");

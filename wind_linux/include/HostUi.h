@@ -7,42 +7,92 @@
 
 #include "Codec.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
 namespace windlinux {
 
-/// 中英模式的本端镜像，只从服务端的帧里学，不自己判定。
+/// 状态帧里与托盘图标有关的那几项。
+struct ModeStatus {
+    bool chinese = true;
+    /// 大写锁定：只有带完整状态头的帧（`STATUS_UPDATE` / `STATE_PUSH` / `ACTIVATION_STATUS_PUSH`）
+    /// 才说得上来；`MODE_PUSH` 只有中英 / 全角 / 标点三位，不能拿它的「没置位」当「没开」。
+    std::optional<bool> capsLock;
+    /// 服务端算好的模式主字（`mode_icon_label`：有效中文取方案标签、大写锁定取 `[ui.labels]
+    /// caps_lock`、英文取 `english`），同样只在完整状态帧里有。
+    std::optional<std::string> label;
+};
+
+/// 帧里携带的模式；不带模式的帧返回空。
+std::optional<ModeStatus> modeStatusOf(const Frame& frame);
+
+/// 中英 / 大写锁定 / 方案标签的本端镜像。中英与标签只从服务端的帧里学；大写锁定另认
+/// 本端按键（见 `CapsLockTracker`）——两者读的是同一个数据（按键的 Lock 位），不是两个真相源。
 ///
 /// 模式的来源有四条，都要接——漏一条，图标就停在旧态直到下一次别的途径碰巧刷新：
 /// - 焦点进入：`CMD_FOCUS_GAINED` 的响应 `CMD_MODE_PUSH`（flags u32）；
-/// - 按键切换（Shift 单击、热键）：按键响应 `CMD_STATUS_UPDATE`；
+/// - 按键切换（Shift 单击、热键、CapsLock 松开）：按键响应 `CMD_STATUS_UPDATE`；
 /// - 别处切换（菜单点「英文」、设置程序改了默认态）：push 通道的 `CMD_STATE_PUSH`；
 /// - 上屏顺带切换（自动切英等）：`CMD_COMMIT_TEXT` 带 `COMMIT_FLAG_MODE_CHANGED`。
 /// `CMD_ACTIVATION_STATUS_PUSH` 与 `STATUS_UPDATE` 同载荷，一并认。
+///
+/// 图标规则对齐 Windows 语言栏（`effective_chinese = chinese && !caps`）：大写锁定时无论中英都是
+/// 「A」；否则英文态「英」；有效中文态按方案标签取图（内置方案的标签全部预生成，未知标签回落「中」）。
 class ModeIndicator {
 public:
-    /// 帧里带模式就记下；返回模式是否**变了**（调用方据此刷新托盘图标）。
+    /// 帧里带模式就记下；返回托盘图标 / 标签是否**变了**（调用方据此刷新状态区）。
     bool update(const Frame& frame);
+
+    /// 本端判定的大写锁定态（`CapsLockTracker` 的结论）；返回图标 / 标签是否变了。
+    bool noteCapsLock(bool on);
 
     /// 还没从服务端学到过模式。此时图标用输入法条目自己的（`Icon=windinput`）。
     bool known() const { return chinese_.has_value(); }
     bool chinese() const { return chinese_.value_or(true); }
+    bool capsLock() const { return caps_; }
 
-    /// 托盘 / 面板图标名（hicolor 主题里的 `windinput-zh` / `windinput-en`）；未知时为空，
+    /// 托盘 / 面板图标名（hicolor 主题里的 `windinput-*`，见 `iconForLabel`）；未知时为空，
     /// Fcitx5 据此退回条目图标。
     std::string iconName() const;
-    /// 面板的文字标签（kimpanel、classicui 偏好文字图标时）：「中」/「英」；未知时为空。
+    /// 面板的文字标签（kimpanel、classicui 偏好文字图标时）：当前态的主字；未知时为空。
+    /// 用的是服务端下发的真实标签，`[ui.labels]` / 自定义方案标签在这里如实显示。
     std::string label() const;
     /// 子模式名（Fcitx5 输入法信息提示里跟在输入法名后面）。
     std::string subModeName() const;
 
+    /// 有效中文态的方案标签 → 图标名。内置方案之外的标签回落 `windinput-zh`。
+    static std::string iconForLabel(const std::string& schemaLabel);
+
 private:
     std::optional<bool> chinese_;
+    bool caps_ = false;
+    /// 按状态分存的标签：本端大写锁定翻转时不必等服务端再发一帧就能给出对的字；
+    /// 且大写锁定 / 英文态下服务端发的是 caps / english 标签，不能拿它覆盖方案标签。
+    std::string schemaLabel_ = "中";
+    std::string englishLabel_ = "英";
+    std::string capsLabel_ = "A";
 };
 
-/// 帧里携带的中英模式；不带模式的帧返回空。
-std::optional<bool> chineseModeOf(const Frame& frame);
+/// 大写锁定的本端判定（纯逻辑）。
+///
+/// X11 事件里的修饰状态是事件**之前**的（实测 Xvfb + xev：开 → 按下 state=0、松开 state=Lock；
+/// 关 → 按下 state=Lock、松开**仍是** Lock——XKB 的 LockMods 在按下时上锁、在松开时解锁）。
+/// 所以 Caps_Lock 本身的两个事件里都读不出「之后」的状态，只能按「按下时没锁 ⇒ 松开后锁上」
+/// 推；别的键的 Lock 位则就是当前锁定态（它们不改锁定），拿来校准（在别的输入法 / 应用里
+/// 切过大写回来，第一个键就对上）。
+class CapsLockTracker {
+public:
+    /// 喂一个按键事件（按下 / 松开都喂）；返回本事件之后的锁定态（能判定时）。
+    std::optional<bool> onKey(uint32_t keysym, uint32_t states, bool release);
+
+    /// 焦点切换：作废半截的 Caps_Lock 按下（它的松开会落到别的 IC / 根本收不到）。
+    void reset() { pressLocked_.reset(); }
+
+private:
+    /// 最近一次 Caps_Lock 按下时的 Lock 位；松开时消费。
+    std::optional<bool> pressLocked_;
+};
 
 /// 服务端下发的组合串 → 应用内预编辑该显示的文本。
 ///
