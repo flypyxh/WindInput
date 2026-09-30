@@ -60,7 +60,7 @@ class Ctx:
         self.ic.on_commit_string(lambda s: self.commits.append(s))
         self.ic.on_update_formatted_preedit(
             lambda segs, cursor: self.preedits.append("".join(s for s, _ in segs)))
-        self.ic.on_forward_key(lambda sym, state, rel: self.forwarded.append((sym, rel)))
+        self.ic.on_forward_key(lambda sym, state, rel: self.forwarded.append((sym, state, rel)))
         await self.ic.call_set_capability(caps)
 
     @property
@@ -1583,6 +1583,154 @@ async def preedit_display_cases(bus, im):
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
 
+# ── 命令直通车按键合成（CMD_KEY_TAP / SEQ / HOLD / RELEASE → forwardKey）────────────
+
+XK_HOME, XK_END, XK_BACKSPACE = 0xFF50, 0xFF57, 0xFF08
+XK_SHIFT_L, XK_CONTROL_L = 0xFFE1, 0xFFE3
+DOWN, UP = False, True
+
+
+async def run_phrase(c, code, want_events, timeout=3.0):
+    """打短语码 + 空格选首选（e2e.sh 追加的 $CC 短语，weight 2000 排第一），等 addon 经
+    forwardKey 交出 `want_events` 个事件（服务端推帧是异步的）。返回 (事件, 上屏)。
+    选词之前清空 `c.preedits`：之后收到的预编辑都是选词及其后的。"""
+    c.forwarded.clear()
+    c.take()
+    await c.type(code)
+    c.preedits.clear()
+    await c.key(" ")
+    await wait_until(lambda: len(c.forwarded) >= want_events, timeout)
+    await asyncio.sleep(0.2)  # 多出来的也收进来，好断言「恰好这些」
+    return list(c.forwarded), c.take()
+
+
+async def keysynth_cases(bus, im):
+    """按键合成走 Fcitx5 `InputContext::forwardKey`：DBus 前端把它发成 ForwardKey(sym, state,
+    isRelease) 信号，这里逐个断言按下 / 抬起的顺序与 state 位（X 语义：事件之前的修饰态）。"""
+    c = await new_ctx(bus, im, "e2e-keys")
+
+    # a) codl（Linux 出厂删行短语）：Home、Shift+End、Backspace 逐个 tap。
+    ev, got = await run_phrase(c, "codl", 8)
+    want = [(XK_HOME, 0, DOWN), (XK_HOME, 0, UP),
+            (XK_SHIFT_L, 0, DOWN), (XK_END, STATE_SHIFT, DOWN),
+            (XK_END, STATE_SHIFT, UP), (XK_SHIFT_L, STATE_SHIFT, UP),
+            (XK_BACKSPACE, 0, DOWN), (XK_BACKSPACE, 0, UP)]
+    check("按键合成：codl → Home / Shift+End / Backspace 的按下抬起序列与 state", ev == want,
+          f"收到 {ev}")
+    check("按键合成：codl 选中后不上屏候选文字", got == "", f"上屏={got!r}")
+
+    # b) key.tap("Ctrl+C")：Ctrl 按下 → c 按下 → c 抬起 → Ctrl 抬起。
+    ev, _ = await run_phrase(c, "zkcc", 4)
+    want = [(XK_CONTROL_L, 0, DOWN), (ord("c"), STATE_CTRL, DOWN),
+            (ord("c"), STATE_CTRL, UP), (XK_CONTROL_L, STATE_CTRL, UP)]
+    check("按键合成：key.tap(Ctrl+C) 修饰键先按后抬、主键居中", ev == want, f"收到 {ev}")
+
+    # d) 合成的键不回流进输入法：key.tap("a") 之后应用侧没有预编辑、服务端没有组合
+    #    （接着按空格交还宿主 = 服务端没有在组字），随后照常打字。
+    ev, got = await run_phrase(c, "zkta", 2)
+    seen = [p for p in c.preedits if p]
+    space_eaten = await c.key(" ")
+    check("按键合成：key.tap(a) 只经 forwardKey 交给应用",
+          ev == [(ord("a"), 0, DOWN), (ord("a"), 0, UP)] and got == "", f"收到 {ev} 上屏={got!r}")
+    check("按键合成：合成的 a 不回流成组字（无预编辑、空格交还宿主）",
+          not seen and space_eaten is False, f"预编辑={seen} 空格被吃={space_eaten}")
+    await c.type("nihao")
+    await c.key(" ")
+    got = c.take()
+    check("按键合成：之后照常打字", got == "你好", f"上屏={got!r}")
+
+    # 不认识的组合（Hyper+C）整条丢弃；超长 seq（65 个组合）整条丢弃。
+    ev, _ = await run_phrase(c, "zkbad", 1, timeout=1.0)
+    check("按键合成：不认识的修饰名整条丢弃（不退化成裸 c）", ev == [], f"收到 {ev}")
+    ev, _ = await run_phrase(c, "zklong", 1, timeout=1.0)
+    check("按键合成：超过 64 个组合的 key.seq 整条丢弃", ev == [], f"收到 {ev}")
+
+    # c) key.hold / key.release 成对；按住 Shift 时 tap End 带 Shift 位。
+    ev, _ = await run_phrase(c, "zkhs", 1)
+    check("按键合成：key.hold(Shift) 只按下", ev == [(XK_SHIFT_L, 0, DOWN)], f"收到 {ev}")
+    ev, _ = await run_phrase(c, "zkte", 2)
+    check("按键合成：按住 Shift 时 tap End 带 Shift 位",
+          ev == [(XK_END, STATE_SHIFT, DOWN), (XK_END, STATE_SHIFT, UP)], f"收到 {ev}")
+    ev, _ = await run_phrase(c, "zkrs", 1)
+    check("按键合成：key.release(Shift) 抬起", ev == [(XK_SHIFT_L, STATE_SHIFT, UP)], f"收到 {ev}")
+    ev, _ = await run_phrase(c, "zkrs", 1, timeout=1.0)
+    check("按键合成：没按住时 key.release 不凭空造抬起", ev == [], f"收到 {ev}")
+
+    release = [(XK_SHIFT_L, STATE_SHIFT, UP)]
+
+    # 卡键保护：失焦。
+    await run_phrase(c, "zkhs", 1)
+    c.forwarded.clear()
+    await c.ic.call_focus_out()
+    await wait_until(lambda: c.forwarded, 2.0)
+    check("卡键保护：按住 Shift 后失焦 → 补发抬起", c.forwarded == release, f"收到 {c.forwarded}")
+    await c.ic.call_focus_in()
+    await asyncio.sleep(0.2)
+
+    # 卡键保护：换 IC（焦点重叠——B 先 FocusIn、A 才 FocusOut：抬起发回 A，不发给 B）。
+    await run_phrase(c, "zkhs", 1)
+    c.forwarded.clear()
+    b = await new_ctx(bus, im, "e2e-keys-b")
+    await wait_until(lambda: c.forwarded, 2.0)
+    check("卡键保护：按住 Shift 后焦点换到另一个 IC → 抬起发回原 IC、新 IC 收不到",
+          c.forwarded == release and b.forwarded == [], f"A 收到 {c.forwarded} B 收到 {b.forwarded}")
+    await c.ic.call_focus_out()
+    await b.ic.call_focus_out()
+    await c.ic.call_focus_in()
+    await asyncio.sleep(0.2)
+
+    # 卡键保护：宿主 reset（鼠标点击挪了光标等）。
+    await run_phrase(c, "zkhs", 1)
+    c.forwarded.clear()
+    await c.ic.call_reset()
+    await wait_until(lambda: c.forwarded, 2.0)
+    check("卡键保护：按住 Shift 后宿主 reset → 补发抬起", c.forwarded == release,
+          f"收到 {c.forwarded}")
+
+    # 卡键保护：最长保持时间（e2e 调成 2 秒，出厂 10 秒）到点自动抬起。
+    await run_phrase(c, "zkhs", 1)
+    c.forwarded.clear()
+    t0 = asyncio.get_running_loop().time()
+    await asyncio.sleep(1.0)
+    early = list(c.forwarded)
+    await wait_until(lambda: c.forwarded, 3.0)
+    dt = asyncio.get_running_loop().time() - t0
+    check("卡键保护：按住超过最长保持时间自动抬起（未到点前不抬）",
+          early == [] and c.forwarded == release and 1.5 <= dt <= 3.5,
+          f"1 秒时={early} 最终={c.forwarded} 用时 {dt:.1f}s")
+
+    # 收尾后打字照常。
+    await c.type("nihao")
+    await c.key(" ")
+    got = c.take()
+    check("按键合成用例之后照常打字", got == "你好", f"上屏={got!r}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+    return c
+
+
+async def keysynth_restart_cases(bus, im, restart):
+    """卡键保护：服务重启（push 断线 + 新服务的 SERVICE_READY）补发抬起。"""
+    c = await new_ctx(bus, im, "e2e-keys-restart")
+    # 上一次重启后 push 通道每秒重连一次，通之前推下来的帧全丢：按到收到为止。
+    ev = []
+    for _ in range(10):
+        ev, _ = await run_phrase(c, "zkhs", 1, timeout=1.0)
+        if ev:
+            break
+    c.forwarded.clear()
+    rc = await asyncio.to_thread(subprocess.run, [restart])
+    await wait_until(lambda: c.forwarded, 5.0)
+    check("卡键保护：按住 Shift 后服务重启 → 补发抬起",
+          ev == [(XK_SHIFT_L, 0, DOWN)] and rc.returncode == 0
+          and c.forwarded == [(XK_SHIFT_L, STATE_SHIFT, UP)],
+          f"按下={ev} rc={rc.returncode} 之后收到 {c.forwarded}")
+    ready = await wait_ready(c)
+    check("服务重启（按键合成用例）后 addon 自愈重连", ready, "一直透传")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
 async def wait_ready(c):
     """服务的 socket 起得比引擎早：词库（首次还要建 .wdat 缓存）加载完成前，按键一律透传。
     用真实通路探活——按 a 直到被吃（= 引擎开始组字），再 Esc 撤掉。"""
@@ -1744,6 +1892,7 @@ async def main():
     # 候选窗（X11）：只在 e2e.sh 起了 Xvfb 时跑
     await p.ic.call_focus_out()
     await preedit_display_cases(bus, im)
+    await keysynth_cases(bus, im)
     if os.environ.get("DISPLAY"):
         await x11_cases(bus, im)
         await overlay_cases(bus, im)
@@ -1766,6 +1915,10 @@ async def main():
         await a.key(" ")
         got = a.take()
         check("服务重启后照常上屏「你好」", got == "你好", f"上屏={got!r}")
+        await a.ic.call_focus_out()
+        await keysynth_restart_cases(bus, im, restart)
+        await a.ic.call_focus_in()
+        await asyncio.sleep(0.2)
         if os.environ.get("DISPLAY"):
             await a.ic.call_focus_out()
             await menu_restart_cases(bus, im, restart)

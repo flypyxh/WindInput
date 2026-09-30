@@ -61,9 +61,58 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 服务按 exe 同目录找 data/：拷一份二进制、data 软链到词库。
+# 服务按 exe 同目录找 data/：拷一份二进制、data 下逐项软链到词库。system.phrases.toml 例外：
+# 取仓库 data/ 里的那份（build_dev/data 是构建时的拷贝，可能早于最近的短语改动，比如 Linux 的
+# codl），再追加 e2e 专用的按键合成短语（keysynth_cases 用，platform 限 linux）。
 cp "$SERVICE_BIN" "$W/svc/wind_input"
-ln -s "$DATA_DIR" "$W/svc/data"
+mkdir -p "$W/svc/data"
+for f in "$DATA_DIR"/*; do
+    [[ "$(basename "$f")" == system.phrases.toml ]] || ln -s "$f" "$W/svc/data/"
+done
+LONG_SEQ="$(printf '"Home", %.0s' $(seq 1 64))\"Home\"" # 65 个组合：超过 addon 的单条上限 64
+{
+    cat "$REPO/data/system.phrases.toml"
+    cat <<'PHRASES'
+
+# ── e2e 专用（scripts/linux/e2e.sh 追加）──
+[[phrases]]
+code = 'zkcc'
+text = '$CC("[e2e 复制]", key.tap("Ctrl+C"))'
+weight = 2000
+platform = 'linux'
+
+[[phrases]]
+code = 'zkta'
+text = '$CC("[e2e 按 a]", key.tap("a"))'
+weight = 2000
+platform = 'linux'
+
+[[phrases]]
+code = 'zkte'
+text = '$CC("[e2e 按 End]", key.tap("End"))'
+weight = 2000
+platform = 'linux'
+
+[[phrases]]
+code = 'zkhs'
+text = '$CC("[e2e 按住 Shift]", key.hold("Shift"))'
+weight = 2000
+platform = 'linux'
+
+[[phrases]]
+code = 'zkrs'
+text = '$CC("[e2e 松开 Shift]", key.release("Shift"))'
+weight = 2000
+platform = 'linux'
+
+[[phrases]]
+code = 'zkbad'
+text = '$CC("[e2e 坏组合]", key.tap("Hyper+C"))'
+weight = 2000
+platform = 'linux'
+PHRASES
+    printf "\n[[phrases]]\ncode = 'zklong'\ntext = '\$CC(\"[e2e 超长]\", key.seq(%s))'\nweight = 2000\nplatform = 'linux'\n" "$LONG_SEQ"
+} >"$W/svc/data/system.phrases.toml"
 # 设置程序经一层包装：先记下 addon 传来的 argv（用例据此断言深链参数），再换成真程序。
 # 它的单实例 socket 在 $XDG_RUNTIME_DIR 下，下面已指进临时目录，不会与本机开着的设置程序串台。
 ln -s "$SETTING_BIN" "$W/svc/wind_setting.bin"
@@ -213,6 +262,8 @@ export FCITX_DATA_DIRS="$ADDON_BUILD/share/fcitx5:$SDK_ROOT/usr/share/fcitx5"
 # （随中英模式切换的 windinput-zh / windinput-en）。
 # 菜单空闲超时调短到 5 秒，好让「超时自动收起」这条兜底在 e2e 里跑得到（出厂 60 秒）。
 export WIND_MENU_IDLE_TIMEOUT_MS=5000
+# key.hold 的最长保持时间调短到 2 秒（出厂 10 秒），验「超时自动抬起」这条兜底。
+export WIND_KEY_HOLD_TIMEOUT_MS=2000
 fcitx5 --disable=all --enable=keyboard,dbus,dbusfrontend,kimpanel,windinput \
     --verbose="windinput=5,default=3,key_trace=5" >"$W/fcitx5.log" 2>&1 &
 FCITX=$!
