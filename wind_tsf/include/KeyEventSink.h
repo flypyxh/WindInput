@@ -175,12 +175,10 @@ public:
     void SetCandidateSessionActive(BOOL active) { _hotkeyModeSession = active; }
 
     /// 宿主报了选区变化（`OnEndEdit`）：若此刻有 Shift/Ctrl 正等着 keyup 触发切换，
-    /// 说明按住期间发生了鼠标点选，这次不算单击（论坛 t257）。无 pending 时空操作。
-    void NoteSelectionChangedDuringToggle()
-    {
-        if (_pendingKeyUpKey != 0)
-            _pendingTapSignals.selectionChanged = true;
-    }
+    /// 且鼠标键此刻按着或按住期间按下过，说明是鼠标点选，这次不算单击（论坛 t257）。
+    /// ⚠ 选区变化本身不等于鼠标：输入法自己的编辑、宿主异步编辑都会报，必须与鼠标状态
+    /// 相与，否则会误吞真单击。无 pending 时空操作。实现在 KeyEventSink.cpp。
+    void NoteSelectionChangedDuringToggle();
 
     // 供 CTextService 的 SendInput 兜底路径（CommitText/InsertText/ReplacePrecedingChars）
     // 调用：把即将注入的按键标记为"自生成"，OnTestKeyDown/OnTestKeyUp 见到后直接放行，

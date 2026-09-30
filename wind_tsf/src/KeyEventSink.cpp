@@ -196,6 +196,20 @@ static bool AnyMousePressedSinceLastCall()
     return ((l | r | m) & 0x0001) != 0;
 }
 
+void CKeyEventSink::NoteSelectionChangedDuringToggle()
+{
+    if (_pendingKeyUpKey == 0)
+        return;
+    // OnEndEdit 是异步通知，快速单击时鼠标键可能已经抬起，故除「此刻按着」外还要看
+    // 「按下过」位；读位会清它，命中就并入 mousePressedSincePress，keyup 时不丢。
+    const bool down = AnyMouseButtonDown();
+    const bool pressed = AnyMousePressedSinceLastCall();
+    if (pressed)
+        _pendingTapSignals.mousePressedSincePress = true;
+    if (down || pressed)
+        _pendingTapSignals.selectionChanged = true;
+}
+
 // 记录「这个切换键正等着 keyup 触发切换」。
 // 由 OnTestKeyDown（放行纯修饰键时）与 OnKeyDown 共同调用；对同一个键重复调用不会
 // 重新计时（见函数内说明），因此两处都调、宿主重复发 keydown，都不会影响长按判定。
