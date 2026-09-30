@@ -836,6 +836,12 @@ assemble_data() {
     # 1. 复制 data/ 源文件 (configs、五笔/双拼方案、主题等)。
     cp -R "$DATA_SRC" "$data"
 
+    # 1a. 应用兼容规则是平台专属策略：仓库 data/compat.toml 里全是 Windows 宿主的修正
+    #     （xxx.exe、TSF/Band 行为），macOS 用不上也不成立。换成「字段说明 + 零条内置规则」的
+    #     macOS 版（用户层 compat.toml 不受影响）。
+    bash "$REPO_DIR/scripts/lib/gen-compat.sh" macos "$DATA_SRC/compat.toml" "$data/compat.toml" \
+        || { err "生成 macOS 版 compat.toml 失败"; return 1; }
+
     # 1b. 合并 wind_input/data/settings/ (manifest.toml 等 RPC 元数据; 存在才合并)。
     if [[ -d "$RUST_DIR/data/settings" ]]; then
         mkdir -p "$data/settings"

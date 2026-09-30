@@ -143,8 +143,13 @@ macOS 上跑过**。载荷现已补齐为与 Windows 同构的 39 字节 + 尾�
 随焦点事件送上来。落点是既有的 `pid_names` 缓存，`update_active_compat` 已改为
 **缓存优先于反查** —— 缓存之后的两平台路径完全一致。
 
-`compat.toml` 的 `process` 字段是小写全等匹配，故 `wechat.exe` 与
-`com.tencent.xinwechat` 可并存于同一份规则表，不需要分平台的规则文件。
+`compat.toml` 的 `process` 字段是小写全等匹配（macOS 上比的是 bundle identifier，如
+`com.tencent.xinwechat`）。**各平台的兼容策略不共用**：仓库 `data/compat.toml` 里的内置规则全是
+Windows 宿主的修正（`xxx.exe`、TSF 组合帧、Band 层级），macOS 用不上。所以 `scripts/mac/dev.sh` 的
+`assemble_data` 会用 `scripts/lib/gen-compat.sh macos` 把它换成「字段说明 + 零条内置规则」的 macOS 版
+（字段说明从 Windows 版截取以免漂移；用户层 `compat.toml` 不受影响，设置里的「应用兼容性」仍可加规则）。
+此前两平台曾共用同一份，`wechat.exe` 与 `com.tencent.xinwechat` 并存——现已改为分开。
+⚠ 该改动只改了打包组装，**未在 macOS 真机 / CI 上验证**（本机只能跑脚本语法与产物检查）。
 
 caret 段发全 0 是安全的：`apply_focus_caret` 见 `height == 0` 即返回，坐标另经
 `CmdCaretUpdate` 上报。
