@@ -12,6 +12,7 @@
 #include "Bridge.h"
 #include "KeyMap.h"
 #include "ResponseRouter.h"
+#include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/eventdispatcher.h>
@@ -27,6 +28,8 @@
 #include <unordered_set>
 
 namespace windlinux {
+
+class X11CandidatePanel;
 
 class WindEngine final : public fcitx::InputMethodEngineV2 {
 public:
@@ -62,6 +65,7 @@ private:
 
     // ── push ──
     void onPushFrame(Frame frame);
+    void onRenderFrame(const HostRenderFramePayload& p);
     fcitx::InputContext* focusedIC();
 
     fcitx::Instance* instance_;
@@ -79,6 +83,8 @@ private:
     fcitx::EventDispatcher dispatcher_;
     std::unique_ptr<fcitx::EventSourceTime> holdTimer_;
     std::unique_ptr<PushClient> push_;
+    ShmFrameReader shm_;
+    std::unique_ptr<X11CandidatePanel> panel_;
 };
 
 class WindEngineFactory : public fcitx::AddonFactory {

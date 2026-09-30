@@ -3,6 +3,7 @@
 #include "ExtProtocol.h"
 #include "Protocol.h"
 #include "Utf.h"
+#include "X11Panel.h"
 
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/log.h>
@@ -126,6 +127,14 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
         }
     });
 
+    // 候选窗交互：鼠标事件在主线程（X 连接的 fd 挂在 Fcitx5 事件循环上），与按键不会交错，
+    // 故直接复用按键那条请求连接。选词 / 翻页的结果经 push 通道异步回来。
+    X11CandidatePanel::Callbacks cb;
+    cb.select = [this](int32_t i) { sendAndDrain(encodeCandidateSelectFrame(i)); };
+    cb.hover = [this](int32_t i) { sendAndDrain(encodeCandidateHoverFrame(i)); };
+    cb.scroll = [this](int32_t d) { sendAndDrain(encodeCandidateScrollFrame(d)); };
+    panel_ = std::make_unique<X11CandidatePanel>(instance_->eventLoop(), std::move(cb));
+
     push_ = std::make_unique<PushClient>(pushSocketPath(), [this](Frame f) {
         // 推送线程 → 主线程。
         dispatcher_.schedule([this, f = std::move(f)]() mutable { onPushFrame(std::move(f)); });
@@ -138,6 +147,7 @@ WindEngine::~WindEngine()
 {
     // 顺序要紧：先停推送线程（之后不再有 schedule），再拆 dispatcher。
     push_.reset();
+    panel_.reset();
     holdTimer_.reset();
     dispatcher_.detach();
 }
@@ -434,6 +444,9 @@ void WindEngine::onPushFrame(Frame frame)
     case CMD_SERVICE_READY:
         // 服务（重）启：它丢了全部焦点状态。有焦点就重报一次，免得「服务重启后第一段输入
         // 不认宿主 / 密码框」；请求连接此时多半已是死连接，顺手换新。
+        // 服务重启会 shm_unlink + 重建 SHM 段（新 inode）：旧映射成了孤儿，候选窗会卡在旧帧。
+        shm_.close();
+        panel_->hide();
         if (serviceSeenOnce_) {
             WIND_INFO() << "服务已重启，重建连接";
             bridge_.close();
@@ -454,10 +467,43 @@ void WindEngine::onPushFrame(Frame frame)
             WIND_DEBUG() << "push cmd=" << hex(frame.cmd) << " 无焦点 IC，丢弃";
         }
         break;
+    case CMD_HOST_RENDER_FRAME:
+        if (auto p = decodeHostRenderFrame(frame.payload)) {
+            onRenderFrame(*p);
+        }
+        break;
+    case CMD_CANDIDATE_RECTS:
+        if (auto rects = decodeCandidateRects(frame.payload)) {
+            panel_->setRects(std::move(*rects));
+        }
+        break;
     default:
-        // 候选窗帧 / tooltip / 状态气泡 / toast / 按键合成：见 wind_linux/AGENTS.md 差距表。
+        // tooltip / 状态气泡 / toast / 按键合成：见 wind_linux/AGENTS.md 差距表。
         break;
     }
+}
+
+void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
+{
+    if (!p.visible() || p.width == 0 || p.height == 0) {
+        panel_->hide();
+        return;
+    }
+    if (!shm_.isOpen() && !shm_.open(shmName())) {
+        WIND_WARN() << "打不开候选窗共享内存 " << shmName();
+        return;
+    }
+    SharedFrame f;
+    if (!shm_.snapshot(f) || f.bgra.empty()) {
+        WIND_DEBUG() << "候选帧 seq=" << p.seq << " 读取失败或为空";
+        return;
+    }
+    // 通知与 SHM 之间没有锁：读到的可能已是更新的一帧（服务端连推两帧、我们只赶上第二帧的
+    // 像素）。像素与头部同帧即可显示，坐标取 SHM 头里的——与像素配套的那一份。
+    if (p.scale > 1) {
+        WIND_DEBUG() << "候选帧 scale=" << p.scale << "：X11 下按物理像素原样贴";
+    }
+    panel_->show(f, f.screenX, f.screenY, (p.flags & FRAME_FLAG_ABSOLUTE_POS) != 0);
 }
 
 } // namespace windlinux

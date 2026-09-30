@@ -7,7 +7,7 @@ addon（`libwindinput.so`），负责把按键交给清风输入法服务（`win
 ## 构建
 
 依赖：Fcitx5 5.x 开发包（`libfcitx5core-dev` `libfcitx5utils-dev` `libfcitx5config-dev`）、
-CMake ≥ 3.16、C++17 编译器。
+`libxcb1-dev` `libxcb-shape0-dev`（候选窗）、CMake ≥ 3.16、C++17 编译器。
 
 ```bash
 cmake -S wind_linux -B wind_linux/build/cmake -G Ninja

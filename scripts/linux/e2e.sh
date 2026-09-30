@@ -132,6 +132,28 @@ export FCITX_CONFIG_HOME="$W/fcitx"
 export FCITX_ADDON_DIRS="$ADDON_BUILD:$SDK_ROOT/usr/lib/$MULTIARCH/fcitx5"
 export FCITX_DATA_DIRS="$ADDON_BUILD/share/fcitx5:$SDK_ROOT/usr/share/fcitx5"
 unset DISPLAY WAYLAND_DISPLAY
+# 候选窗（X11）：私有 Xvfb。WIND_E2E_X11=0 关掉则只测输入通路。WIND_E2E_COMPOSITOR=1 再起
+# xcompmgr，走 ARGB 真透明那条路；默认无合成器，走 XShape 抠形那条路。
+XVFB=""
+COMP=""
+if [[ "${WIND_E2E_X11:-1}" != 0 ]]; then
+    XN=$(( 60 + $$ % 30 ))
+    while [[ -e /tmp/.X11-unix/X$XN ]]; do XN=$((XN + 1)); done
+    Xvfb-wind ":$XN" -screen 0 1280x800x24 -nolisten tcp -xkbdir /usr/share/X11/xkb \
+        >"$W/xvfb.log" 2>&1 &
+    XVFB=$!
+    for _ in $(seq 1 50); do [[ -e /tmp/.X11-unix/X$XN ]] && break; sleep 0.1; done
+    export DISPLAY=":$XN"
+    echo "[e2e] Xvfb 已就绪 (DISPLAY=$DISPLAY)"
+    if [[ "${WIND_E2E_COMPOSITOR:-0}" != 0 ]]; then
+        xcompmgr >"$W/xcompmgr.log" 2>&1 &
+        COMP=$!
+        sleep 0.5
+        echo "[e2e] xcompmgr 已起（ARGB 路径）"
+    fi
+    mkdir -p "$W/shots"
+    export WIND_E2E_SHOTS="$W/shots"
+fi
 fcitx5 --disable=all --enable=keyboard,dbus,dbusfrontend,windinput \
     --verbose="windinput=5,default=3,key_trace=5" >"$W/fcitx5.log" 2>&1 &
 FCITX=$!
@@ -146,7 +168,7 @@ set +e
 "$WIND_LINUX_SDK/venv/bin/python" "$REPO/scripts/linux/e2e_client.py"
 RC=$?
 set -e
-kill $FCITX "$(cat "$W/svc.pid")" 2>/dev/null || true
+kill $FCITX "$(cat "$W/svc.pid")" $COMP $XVFB 2>/dev/null || true
 wait $FCITX 2>/dev/null || true
 exit $RC
 ' && RC=0 || RC=$?

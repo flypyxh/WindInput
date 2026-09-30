@@ -24,6 +24,7 @@ add_library(windcore STATIC
     src/core/Codec.cpp
     src/core/KeyMap.cpp
     src/core/ResponseRouter.cpp
+    src/core/ShmFrame.cpp
     src/core/Utf.cpp
 )
 target_include_directories(windcore PUBLIC include)
@@ -34,7 +35,7 @@ target_link_libraries(windcore PUBLIC Threads::Threads)
 
 # ── 单测 ──
 enable_testing()
-foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test)
+foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test shm_test)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE windcore)
     target_compile_definitions(${t} PRIVATE
@@ -46,11 +47,15 @@ endforeach()
 if(WIND_BUILD_ADDON)
     find_package(Fcitx5Core 5.0 REQUIRED)
     find_package(Fcitx5Utils 5.0 REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    # 候选窗的 X11 呈现：自建 xcb 连接 + XShape（无合成器时按 alpha 抠形）。
+    pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb xcb-shape)
 
     add_library(windinput MODULE
         src/fcitx/WindEngine.cpp
+        src/fcitx/X11Panel.cpp
     )
-    target_link_libraries(windinput PRIVATE windcore Fcitx5::Core Fcitx5::Utils)
+    target_link_libraries(windinput PRIVATE windcore Fcitx5::Core Fcitx5::Utils PkgConfig::XCB)
     target_compile_options(windinput PRIVATE -Wall -Wextra)
     # Fcitx5 按 addon conf 的 Library= 找 `lib<name>.so`；MODULE 默认就带 lib 前缀。
     set_target_properties(windinput PROPERTIES PREFIX "lib")

@@ -24,15 +24,20 @@ SEED_PKGS=(
     fcitx5 fcitx5-modules fcitx5-data
     libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev fcitx5-modules-dev
     extra-cmake-modules
-    xvfb x11-apps x11-utils xdotool
+    xvfb x11-apps x11-utils xdotool xcompmgr
     libxcb1-dev libxcb-shm0-dev libxcb-render0-dev libxcb-shape0-dev
 )
+
+# 让 Xvfb-wind 找得到 xkbcomp（见下文「Xvfb 启动时」一段）。/tmp 重启即清，故每次都补。
+xvfb_shim() {
+    [[ -L /tmp/wlx || ! -e /tmp/wlx ]] && ln -sfn "$ROOT/usr/bin" /tmp/wlx
+}
 
 print_env() {
     local lib="$ROOT/usr/lib/$MULTIARCH"
     cat <<EOF
 export WIND_LINUX_SDK="$SDK"
-export PATH="$VENV/bin:$ROOT/usr/bin:\$PATH"
+export PATH="$SDK/bin:$VENV/bin:$ROOT/usr/bin:\$PATH"
 export PKG_CONFIG_PATH="$lib/pkgconfig:$ROOT/usr/lib/pkgconfig:$ROOT/usr/share/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}"
 export CMAKE_PREFIX_PATH="$ROOT/usr\${CMAKE_PREFIX_PATH:+:\$CMAKE_PREFIX_PATH}"
 export LD_LIBRARY_PATH="$lib:$lib/fcitx5\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
@@ -40,6 +45,7 @@ EOF
 }
 
 if [[ "${1:-}" == "env" ]]; then
+    xvfb_shim
     print_env
     exit 0
 fi
@@ -104,6 +110,31 @@ find "$ROOT/usr/lib" -type l -name '*.so' -print0 | while IFS= read -r -d '' l; 
         ln -sf "$ROOT$tgt" "$l"
     fi
 done
+
+# 同一个头文件目录被拆在两处：本机装了 libxcb1-dev（/usr/include/xcb/xcb.h），SDK 里解出了
+# libxcb-shape0-dev（…/include/xcb/shape.h）。shape.h 用 `#include "xcb.h"` 按**自身所在目录**
+# 找，找不到系统那份。把系统目录里缺的头补软链进来。
+if [[ -d "$ROOT/usr/include/xcb" && -d /usr/include/xcb ]]; then
+    for h in /usr/include/xcb/*.h; do
+        [[ -e "$ROOT/usr/include/xcb/$(basename "$h")" ]] || ln -s "$h" "$ROOT/usr/include/xcb/"
+    done
+fi
+
+# Xvfb 启动时按写死的 `/usr/bin` 去找 xkbcomp（键盘表编译器），没 root 装不到那里。
+# 复制一份 Xvfb，把那个字符串原地改成同样 8 字节的 `/tmp/wlx`，再由 `xvfb_shim` 把
+# /tmp/wlx 软链到解包根的 usr/bin。xkb 数据目录走 Xvfb 自带的 `-xkbdir` 参数，不用改。
+if [[ -x "$ROOT/usr/bin/Xvfb" && ! -x "$SDK/bin/Xvfb-wind" ]]; then
+    mkdir -p "$SDK/bin"
+    python3 - "$ROOT/usr/bin/Xvfb" "$SDK/bin/Xvfb-wind" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+old, new = b"\0/usr/bin\0", b"\0/tmp/wlx\0"
+assert data.count(old) >= 1, "Xvfb 里没找到 /usr/bin 字符串，版本变了？"
+open(dst, "wb").write(data.replace(old, new))
+PY
+    chmod +x "$SDK/bin/Xvfb-wind"
+fi
 
 # ── 5. cmake + e2e 用的 DBus 客户端库（venv + pip）─────────────────────
 # dbus-next 是纯 Python 的 DBus 实现：e2e 用它扮演「应用」对 Fcitx5 调 ProcessKeyEvent、
