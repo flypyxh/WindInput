@@ -37,41 +37,231 @@ fn texts_of<'a>(v: &'a [wind_phrase::SystemPhraseEntry], code: &str) -> Vec<&'a 
         .collect()
 }
 
-/// 本平台只看得到本平台那一份：非 Windows 上不得出现任何 `.exe` 词条，也不得出现
-/// Windows 专属的 `USERPROFILE`。
+fn entries_for(platform: &str) -> Vec<wind_phrase::SystemPhraseEntry> {
+    let v = wind_phrase::PhraseLayer::parse_system_entries_for(&repo_phrases(), platform);
+    assert!(!v.is_empty(), "{platform}: 出厂短语解析出 0 条");
+    v
+}
+
+const PLATFORMS: [&str; 3] = ["windows", "darwin", "linux"];
+
+/// 本机编出来的加载入口与「按本机平台名显式过滤」给出同一份条目。
 #[test]
-fn builtin_phrases_carry_no_windows_programs_off_windows() {
-    let v = entries();
-    let bad: Vec<_> = v
-        .iter()
-        .filter(|e| e.text.contains(".exe") || e.text.contains("USERPROFILE"))
-        .map(|e| format!("{} = {}", e.code, e.text))
-        .collect();
-    if cfg!(windows) {
-        assert!(!bad.is_empty(), "Windows 上应仍有 notepad.exe 等词条");
+fn host_loader_equals_explicit_platform_filter() {
+    let host = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
     } else {
-        assert!(bad.is_empty(), "本平台出现了 Windows 专属词条：{bad:?}");
+        "linux"
+    };
+    let a: Vec<_> = entries().into_iter().map(|e| (e.code, e.text)).collect();
+    let b: Vec<_> = entries_for(host)
+        .into_iter()
+        .map(|e| (e.code, e.text))
+        .collect();
+    assert_eq!(a, b);
+}
+
+/// 只有 Windows 看得到 `.exe` / `USERPROFILE` 词条。
+#[test]
+fn windows_programs_only_reach_windows() {
+    for plat in PLATFORMS {
+        let bad: Vec<_> = entries_for(plat)
+            .into_iter()
+            .filter(|e| e.text.contains(".exe") || e.text.contains("USERPROFILE"))
+            .map(|e| format!("{} = {}", e.code, e.text))
+            .collect();
+        if plat == "windows" {
+            assert!(!bad.is_empty(), "Windows 上应仍有 notepad.exe 等词条");
+        } else {
+            assert!(bad.is_empty(), "{plat} 出现了 Windows 专属词条：{bad:?}");
+        }
     }
 }
 
-/// 打开编辑器 / 计算器 / 主目录这三个码在每个桌面平台上都恰好一条，且是本平台的写法。
+/// 编辑器 / 计算器 / 主目录 / 删行这四个码在每个平台上都恰好一条，且是该平台的写法。
 #[test]
-fn launcher_codes_resolve_to_exactly_one_entry_for_this_platform() {
-    let v = entries();
-    for code in ["cono", "coca", "cohm"] {
-        let t = texts_of(&v, code);
-        assert_eq!(t.len(), 1, "{code} 在本平台应恰好一条，实际 {t:?}");
-        let t = t[0];
-        if cfg!(windows) {
-            assert!(
-                t.contains(".exe") || t.contains("USERPROFILE"),
-                "{code}: {t}"
-            );
-        } else if cfg!(target_os = "macos") {
-            assert!(t.contains("\"-a\"") || t.contains("HOME"), "{code}: {t}");
-        } else if cfg!(target_os = "linux") {
-            assert!(t.contains("proc.any(") || t.contains("HOME"), "{code}: {t}");
+fn launcher_codes_resolve_to_exactly_one_entry_per_platform() {
+    for plat in PLATFORMS {
+        let v = entries_for(plat);
+        for code in ["cono", "coca", "cohm", "codl"] {
+            let t = texts_of(&v, code);
+            assert_eq!(t.len(), 1, "{code} 在 {plat} 应恰好一条，实际 {t:?}");
+            let t = t[0];
+            let ok = match (plat, code) {
+                (_, "codl") => t.contains("key.seq("),
+                ("windows", _) => t.contains(".exe") || t.contains("USERPROFILE"),
+                ("darwin", _) => t.contains("\"-a\"") || t.contains("HOME"),
+                _ => t.contains("proc.any(") || t.contains("HOME"),
+            };
+            assert!(ok, "{plat} 的 {code} 写法不对：{t}");
         }
+    }
+}
+
+/// 改动前的过滤规则（写死只收空 / all / windows），原样抄在这里当对拍基准。
+fn old_filter_accepts(platform: Option<&str>) -> bool {
+    match platform {
+        None => true,
+        Some(p) => {
+            let p = p.to_lowercase();
+            p.is_empty() || p == "all" || p == "windows"
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RawFile {
+    phrases: Vec<RawPhrase>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPhrase {
+    code: String,
+    text: String,
+    #[serde(default)]
+    weight: Option<i32>,
+    #[serde(default)]
+    position: Option<i32>,
+    #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+}
+
+fn raw_entries() -> Vec<RawPhrase> {
+    let text = std::fs::read_to_string(repo_phrases()).unwrap();
+    toml::from_str::<RawFile>(&text).unwrap().phrases
+}
+
+/// ★ Windows 上的条目集与改动前**逐条一致**（含顺序、权重、位置、分类）。
+///
+/// 基准是旧过滤规则作用在同一份文件上：新加的 linux 条目在 Windows 上必须全被滤掉，
+/// 旧规则收的每一条新过滤也必须收。另在提交说明里记了一次与改动前那份文件的对拍。
+#[test]
+fn windows_entries_are_identical_to_the_old_filter() {
+    let old: Vec<_> = raw_entries()
+        .into_iter()
+        .filter(|r| old_filter_accepts(r.platform.as_deref()))
+        .map(|r| {
+            (
+                r.code,
+                r.text,
+                r.weight.unwrap_or(1000),
+                r.position.unwrap_or(0),
+                r.category.unwrap_or_default(),
+            )
+        })
+        .collect();
+    let new: Vec<_> = entries_for("windows")
+        .into_iter()
+        .map(|e| (e.code, e.text, e.weight, e.position, e.category))
+        .collect();
+    assert_eq!(new, old);
+}
+
+/// 出厂文件里**每个平台**的每条 `$CC` 都只调用已注册的函数、参数个数合法、具名参数在
+/// 白名单内。
+///
+/// darwin 条目此前从未在任何平台被加载过，这是它们第一次被检查；Linux / macOS 的
+/// 条目本机选不中（或选中也不跑），写错函数名的话用户侧只表现为「选了没反应」。
+#[test]
+fn every_platform_entry_calls_only_known_functions_with_valid_arity() {
+    let reg = wind_cmdbar::Registry::full();
+    let mut problems = Vec::new();
+    let mut checked = 0;
+    for r in raw_entries() {
+        if !wind_cmdbar::is_cmdbar_grammar(&r.text) {
+            continue;
+        }
+        let phrase = match wind_cmdbar::parse(&r.text) {
+            Ok(p) => p,
+            Err(e) => {
+                problems.push(format!("{} [{:?}] 解析失败：{e}", r.code, r.platform));
+                continue;
+            }
+        };
+        checked += 1;
+        let mut calls = Vec::new();
+        collect_calls_phrase(&phrase, &mut calls);
+        for (name, n, named) in calls {
+            match reg.lookup(&name) {
+                None => problems.push(format!("{} [{:?}] 未知函数 {name}", r.code, r.platform)),
+                Some(spec) => {
+                    if !spec.accepts(n) {
+                        problems.push(format!(
+                            "{} [{:?}] {name} 参数个数 {n} 不合法",
+                            r.code, r.platform
+                        ));
+                    }
+                    for k in named {
+                        if !spec.accepts_named(&k) {
+                            problems.push(format!(
+                                "{} [{:?}] {name} 不认具名参数 {k}",
+                                r.code, r.platform
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let hints = wind_cmdbar::lint_parsed(&phrase);
+        if !hints.is_empty() {
+            problems.push(format!("{} [{:?}] lint：{hints:?}", r.code, r.platform));
+        }
+    }
+    assert!(checked > 10, "只检查了 {checked} 条 $CC——解析路径可能空转");
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+type Call = (String, usize, Vec<String>);
+
+fn collect_calls_phrase(p: &wind_cmdbar::Phrase, out: &mut Vec<Call>) {
+    use wind_cmdbar::Phrase;
+    match p {
+        Phrase::Literal(_) => {}
+        Phrase::Template(e) => collect_calls(e, out),
+        Phrase::Command(c) => collect_calls_command(c, out),
+        Phrase::Array(a) => a.elements.iter().for_each(|e| collect_calls(e, out)),
+    }
+}
+
+fn collect_calls_command(c: &wind_cmdbar::CommandPhrase, out: &mut Vec<Call>) {
+    collect_calls(&c.display, out);
+    c.actions.iter().for_each(|a| collect_calls(a, out));
+}
+
+fn collect_calls(e: &wind_cmdbar::Expr, out: &mut Vec<Call>) {
+    use wind_cmdbar::Expr;
+    use wind_cmdbar::ast::StringPart;
+    match e {
+        Expr::StringLit(parts) => {
+            for p in parts {
+                if let StringPart::Interp(inner) = p {
+                    collect_calls(inner, out);
+                }
+            }
+        }
+        Expr::Ident(name) => {
+            // `type` 由 eval 拦截，不在注册表里。
+            if name != "type" {
+                out.push((name.clone(), 0, Vec::new()));
+            }
+        }
+        Expr::Call { name, args, named } => {
+            if name != "type" {
+                out.push((
+                    name.clone(),
+                    args.len(),
+                    named.iter().map(|(k, _)| k.clone()).collect(),
+                ));
+            }
+            args.iter().for_each(|a| collect_calls(a, out));
+            named.iter().for_each(|(_, v)| collect_calls(v, out));
+        }
+        Expr::Command(c) => collect_calls_command(c, out),
+        _ => {}
     }
 }
 
@@ -104,6 +294,117 @@ fn linux_launcher_phrases_parse_and_list_bare_program_names() {
             );
         }
     }
+}
+
+// ───────────────── 升级迁移：库里已有的系统短语跟着新过滤走 ─────────────────
+
+fn to_store(v: &[wind_phrase::SystemPhraseEntry]) -> Vec<wind_store::phrases::SystemPhrase> {
+    v.iter()
+        .map(|e| wind_store::phrases::SystemPhrase {
+            code: e.code.clone(),
+            text: e.text.clone(),
+            weight: e.weight,
+            position: e.position,
+            category: e.category.clone(),
+        })
+        .collect()
+}
+
+fn sys_rows(store: &wind_store::Store) -> Vec<(String, String)> {
+    let mut v: Vec<_> = store
+        .list_system_phrases()
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.code, r.text))
+        .collect();
+    v.sort();
+    v
+}
+
+fn keys_of(v: &[wind_phrase::SystemPhraseEntry]) -> Vec<(String, String)> {
+    let mut k: Vec<_> = v.iter().map(|e| (e.code.clone(), e.text.clone())).collect();
+    k.sort();
+    k
+}
+
+fn temp_root(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("wind_plat_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// ★ 非 Windows 用户升级：库里是旧过滤入库的 Windows 那一份（含 `notepad.exe`），
+/// 协调器启动按新过滤重同步后，库里只剩本平台的条目，错平台的行一条不留。
+///
+/// 走的是生产路径（构造期的哈希比对 + `sync_system_phrases`），不是直接调 store。
+#[cfg(not(windows))]
+#[test]
+fn upgrade_resyncs_stale_windows_rows_off_windows() {
+    let root = temp_root("migrate");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::copy(repo_phrases(), data.join("system.phrases.toml")).unwrap();
+    let store = std::sync::Arc::new(wind_store::Store::open(root.join("user.redb")).unwrap());
+
+    // 旧版本留下的库：Windows 那一份 + 旧版本算的哈希（与新条目集的哈希必然不同）。
+    let old = entries_for("windows");
+    store.sync_system_phrases(&to_store(&old)).unwrap();
+    store
+        .set_phrase_sys_hash("hash-written-by-old-build")
+        .unwrap();
+    assert!(sys_rows(&store).iter().any(|(_, t)| t.contains(".exe")));
+
+    let mut cfg = wind_config::Config::default();
+    cfg.schema.available = vec![];
+    let _coord =
+        wind_coordinator::Coordinator::new_headless_with_store(cfg, Some(&data), store.clone());
+
+    let rows = sys_rows(&store);
+    assert_eq!(
+        rows,
+        keys_of(&entries()),
+        "重同步后库里应恰好是本平台的条目集"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, t)| t.contains(".exe") || t.contains("USERPROFILE")),
+        "不得残留 Windows 条目：{rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// ★ Windows 用户升级：新过滤给出的条目集与旧库一致，重同步（无论是否触发）不增不删。
+#[test]
+fn windows_upgrade_keeps_every_row() {
+    let root = temp_root("win_keep");
+    let store = wind_store::Store::open(root.join("user.redb")).unwrap();
+    let old: Vec<_> = raw_entries()
+        .into_iter()
+        .filter(|r| old_filter_accepts(r.platform.as_deref()))
+        .map(|r| wind_store::phrases::SystemPhrase {
+            code: r.code,
+            text: r.text,
+            weight: r.weight.unwrap_or(1000),
+            position: r.position.unwrap_or(0),
+            category: r.category.unwrap_or_default(),
+        })
+        .collect();
+    store.sync_system_phrases(&old).unwrap();
+    let before = store.list_system_phrases().unwrap();
+
+    let new = entries_for("windows");
+    let st = store.sync_system_phrases(&to_store(&new)).unwrap();
+    // `updated` 计的是「已存在、按 TOML 刷新了一遍」的行，不代表内容有变；内容是否
+    // 一致由下面整行比对（权重 / 位置 / 开关 / 分类）回答。
+    assert_eq!((st.added, st.removed), (0, 0), "Windows 的条目集不该增删");
+    assert_eq!(
+        store.list_system_phrases().unwrap(),
+        before,
+        "Windows 的每一行都应原样保留"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ───────────────── 端到端：打 coca → 选中 → 真的 spawn 到排在后面的那个 ─────────────────

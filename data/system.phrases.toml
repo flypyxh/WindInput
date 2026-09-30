@@ -4,7 +4,8 @@
 #
 # weight: 0~10000 短语 tier 内排序权重，未设置默认 1000（中位）
 # position: 仅同 code 多条 tie-break（升序）
-# platform: ""/"all"=全平台；"windows"/"darwin"/"linux"=仅该平台
+# platform: ""/"all"=全平台；"windows"/"darwin"/"linux"=仅该平台（"macos" 同 "darwin"）。
+#   按运行平台取舍：同一个 code 要在各平台做不同的事，就每个平台各写一条。
 # 详见 docs/design/command-bar-design.md
 
 [[phrases]]
@@ -491,6 +492,15 @@ code = 'codl'
 text = '$CC("[删行]", key.seq("Ctrl+A", "Ctrl+K"))'
 weight = 2000
 platform = 'darwin'
+
+# ⚠ Linux 上的按键合成（key.tap / key.seq / key.hold / key.release）要 Fcitx5 addon 接住
+#   CMD_KEY_* 下行帧才生效，目前 addon 还丢弃这些帧（wind_linux/AGENTS.md 差距表），
+#   这条暂时选中后无效果；addon 接上后无需改这里。
+[[phrases]]
+code = 'codl'
+text = '$CC("[删行]", key.seq("Home", "Shift+End", "Backspace"))'
+weight = 2000
+platform = 'linux'
 
 [[phrases]]
 code = 'cocp'
