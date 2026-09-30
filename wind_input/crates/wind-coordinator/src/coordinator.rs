@@ -768,6 +768,11 @@ pub(crate) struct State {
     /// **必须与 `menu_open = true` 成对写入**：漏写会让守卫读到上一次打开的时间戳，
     /// 于是刚弹出的菜单被一条迟到的焦点事件当场关掉。
     pub(crate) menu_opened_at: Option<std::time::Instant>,
+    /// Linux 自绘菜单最近一次被操作（打开 / 菜单键 / 指针事件）的时刻，空闲超时兜底用
+    /// （见 `forward_menu_key`）。与 `menu_opened_at` 分开：后者是焦点守卫的「刚打开」判据，
+    /// 随操作刷新会把守卫期无限延长。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) menu_touched_at: Option<std::time::Instant>,
     /// 菜单目标候选（页内下标 + 文本），供候选词条操作/复制
     pub(crate) menu_target_page_local: usize,
     pub(crate) menu_target_text: String,
@@ -1965,6 +1970,13 @@ pub struct Coordinator {
     pub(crate) tooltip_page: Mutex<Vec<crate::handle_tooltip::TooltipPageEntry>>,
     /// 悬停提示右键菜单弹出时的目标快照；菜单动作执行前拿它核对候选有没有变。
     pub(crate) tooltip_menu_target: Mutex<Option<crate::handle_tooltip::TooltipMenuTarget>>,
+    /// Linux：开着的菜单是候选右键菜单（`State::menu_target_text` 的无锁镜像）。
+    ///
+    /// 只给 `notify_ui_hide` 用：它的不少调用点正持着 `state` 锁，在里面再取锁就是自锁死
+    /// （实测：服务端卡死、每个键 2s 超时）。所以这里只读原子量、只发命令不碰 `state`，
+    /// 复位 `menu_open` 交给 UI 回送的 `MenuClose`（见 `menu_linux::MenuHost::hide`）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) candidate_menu_open: std::sync::atomic::AtomicBool,
     /// 密码框抑制策略开关，`input.password_force_english` 的运行时镜像（构造与热重载时回灌，
     /// 见 `set_password_suppress_enabled`）。这是**全局**值：未配 per-app 规则的进程跟随它；
     /// 判定一律经 `password_force_english_for_pid`，不要直接读本字段做抑制决策。
@@ -2590,6 +2602,8 @@ impl Coordinator {
                 caret_source: wind_ipc::protocol::caret_source::UNKNOWN,
                 menu_open: false,
                 menu_opened_at: None,
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                menu_touched_at: None,
                 menu_target_page_local: 0,
                 menu_target_text: String::new(),
                 add_word_active: false,
@@ -2739,6 +2753,8 @@ impl Coordinator {
             last_langbar_tooltip: Mutex::new(String::new()),
             tooltip_page: Mutex::new(Vec::new()),
             tooltip_menu_target: Mutex::new(None),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            candidate_menu_open: std::sync::atomic::AtomicBool::new(false),
             last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
             password_suppress_enabled: std::sync::atomic::AtomicBool::new(
@@ -6666,6 +6682,16 @@ impl Coordinator {
         self.clear_hover();
         let _ = self.ui_tx.send(UiCommand::HideCandidates);
         self.reset_first_show();
+        // Linux：候选收起 ⇒ 候选右键菜单失去操作对象，一并收掉（主菜单不受影响：它可以在没有
+        // 候选时打开，一条无关的 HideCandidates 不该把它收掉——与 Windows 连带收掉任何菜单不同）。
+        // ⚠ 本函数常在持 `state` 锁时被调用，这里绝不能取锁，见 `candidate_menu_open`。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        if self
+            .candidate_menu_open
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = self.ui_tx.send(UiCommand::HideMenu);
+        }
     }
 
     // ———————————————— 鼠标交互（来自 UI 线程的反向事件）————————————————

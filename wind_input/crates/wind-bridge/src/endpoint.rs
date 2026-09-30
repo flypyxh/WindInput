@@ -85,9 +85,13 @@ pub fn shm_name(suffix: &str) -> String {
 pub fn overlay_shm_name(suffix: &str, kind: u32) -> Option<String> {
     use wind_ipc::protocol::overlay::*;
     let tail = match kind {
-        OVERLAY_KIND_TOOLTIP => "_TIP",
-        OVERLAY_KIND_STATUS => "_STS",
-        OVERLAY_KIND_TOAST => "_TST",
+        OVERLAY_KIND_TOOLTIP => "_TIP".to_string(),
+        OVERLAY_KIND_STATUS => "_STS".to_string(),
+        OVERLAY_KIND_TOAST => "_TST".to_string(),
+        // 菜单每级一段：`_MN0`、`_MN1`…
+        k if (OVERLAY_KIND_MENU..OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS).contains(&k) => {
+            format!("_MN{}", k - OVERLAY_KIND_MENU)
+        }
         _ => return None,
     };
     Some(format!("{}{tail}", shm_name(suffix)))
@@ -259,6 +263,15 @@ mod tests {
             Some("/WindInput_SHM_TST")
         );
         assert_eq!(overlay_shm_name("", 0), None, "候选窗那段不归本函数");
+        assert_eq!(
+            overlay_shm_name("_dev", OVERLAY_KIND_MENU + 2).as_deref(),
+            Some("/WindInput_SHMDev_MN2")
+        );
+        assert_eq!(
+            overlay_shm_name("", OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS),
+            None,
+            "超出菜单级数上限"
+        );
     }
 
     #[test]

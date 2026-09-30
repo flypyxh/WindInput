@@ -450,6 +450,19 @@ impl MenuAnchor {
     }
 }
 
+/// 外部宿主报上来的菜单指针事件（Linux addon 的 X11 指针抓取，见 `UiCommand::MenuPointer`）。
+///
+/// 只分出菜单关心的四种：Windows 进程内菜单对这四种的处置（`popup_menu` 的 wnd_proc 与菜单外
+/// 按下轮询）就是全部语义——移动跟手高亮；左键点条目；右键任何位置都只关菜单；中键只在菜单外
+/// 才关（菜单内忽略）。滚轮 Windows 菜单不处理，宿主不报。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuPointerEvent {
+    Move,
+    LeftPress,
+    RightPress,
+    OtherPress,
+}
+
 /// 菜单项规格（由协调器构建）。支持勾选态与子菜单。
 ///
 /// `PartialEq` 供弹出菜单的增量重绘用：`popup_menu::reconcile`（wind-ui）靠它判断

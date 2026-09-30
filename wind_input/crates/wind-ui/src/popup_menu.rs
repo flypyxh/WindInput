@@ -405,6 +405,33 @@ impl MenuState {
         self.closed = true;
         let _ = self.events.send(UiEvent::MenuClose);
     }
+
+    // —— 指针（屏幕坐标）：Windows 的 wnd_proc 与 Linux 宿主转来的事件共用 ——
+
+    /// 高亮跟手：鼠标指向哪个条目就亮哪个，没指向条目就灭。
+    /// 三条分支都只动 `selected`（不碰 `levels`），所以任何一条都不会收起
+    /// 已展开的子菜单；而 `clear_hover` 只对最深层生效，父项高亮始终保留着
+    /// 「当前展开路径」的指示作用。
+    ///
+    /// 灭高亮是廉价的：它只让对应层 `update()` 推一次像素，不会触发
+    /// `show()`（见 `plan_render`），因此不会重排 z 序、不会造成窗口闪烁。
+    fn pointer_move(&mut self, sx: i32, sy: i32) {
+        match self.find_hit(sx, sy) {
+            Some((k, Some(r))) => self.hover(k, r),
+            // 面板内非条目处（root padding / 边框 / 分隔线）→ 灭掉该层高亮。
+            Some((k, None)) => self.clear_hover(k),
+            // 菜单外 → 同样灭掉最深层高亮。鼠标都移开了还亮着，观感像卡住。
+            None => self.clear_hover(self.deepest()),
+        }
+    }
+
+    fn pointer_left_press(&mut self, sx: i32, sy: i32) {
+        match self.find_hit(sx, sy) {
+            Some((k, Some(r))) => self.click(k, r),
+            Some((_, None)) => {} // 面板空白处：忽略
+            None => self.close(), // 菜单外 → 关闭
+        }
+    }
 }
 
 /// 弹出菜单窗口（级联，窗口池按需增长）
@@ -1097,6 +1124,95 @@ impl PopupMenu {
     }
 }
 
+/// 一级菜单当前画好的一帧（外部宿主形态：像素交宿主贴图）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub(crate) struct LevelFrame<'a> {
+    /// 窗口几何 `(左, 上, 宽, 高)`，屏幕坐标，含软投影扩边。
+    pub geom: (i32, i32, u32, u32),
+    /// 本帧内容指纹：与上次推给宿主的相同就不必重推（高亮没变、没挪位）。
+    pub key: LevelKey,
+    pub buf: &'a [u8],
+    pub software_shadow: bool,
+}
+
+/// [`LevelFrame::key`]：同 [`plan_render`] 的增量判据——条目、高亮、几何三者都没变即像素没变。
+#[cfg(all(target_os = "linux", ext_presenter))]
+#[derive(Clone, PartialEq)]
+pub(crate) struct LevelKey(LevelRender);
+
+/// Linux 外部宿主（Fcitx5 addon）形态：菜单窗口不在本进程，[`LayeredWindow`] 是只持缓冲区的
+/// mock，像素由 `menu_linux` 取走经 SHM 推给 addon。菜单的状态机、渲染、定位、命中测试
+/// 与 Windows 是同一份，只是鼠标事件改由宿主报来（[`Self::on_pointer`]）、工作区改由宿主
+/// 报来（[`set_host_work_area`]）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+impl PopupMenu {
+    /// 宿主报来的指针事件（屏幕坐标）。语义对齐 Windows：移动与左键走 wnd_proc 的同一套
+    /// 处理；右键在哪都只关菜单（`WM_RBUTTONDOWN`）；中键只有落在菜单外才关（菜单外按下
+    /// 轮询看的是任意键，菜单内的中键 wnd_proc 不处理）。
+    pub(crate) fn on_pointer(&mut self, event: crate::manager::MenuPointerEvent, x: i32, y: i32) {
+        use crate::manager::MenuPointerEvent as E;
+        if !self.visible {
+            return;
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            match event {
+                E::Move => st.pointer_move(x, y),
+                E::LeftPress => st.pointer_left_press(x, y),
+                E::RightPress => st.close(),
+                E::OtherPress => {
+                    if st.find_hit(x, y).is_none() {
+                        st.close();
+                    }
+                }
+            }
+        }
+        self.tick();
+    }
+
+    /// 可见时强制重排重绘一遍（主题变了：`set_theme` 只作废基线，不会自己重画）。
+    pub(crate) fn repaint(&mut self) {
+        if self.visible {
+            self.reconcile();
+        }
+    }
+
+    /// 当前各级已画好的帧（下标 = 级）。不可见时为空。
+    pub(crate) fn level_frames(&self) -> Vec<LevelFrame<'_>> {
+        if !self.visible {
+            return Vec::new();
+        }
+        let n = self.state.borrow().levels.len();
+        self.rendered
+            .iter()
+            .zip(&self.windows)
+            .take(n)
+            .map_while(|(r, w)| {
+                let r = r.as_ref()?;
+                Some(LevelFrame {
+                    geom: r.geom,
+                    key: LevelKey(r.clone()),
+                    buf: w.buffer(),
+                    software_shadow: self.shadow.is_some(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(all(target_os = "linux", ext_presenter))]
+thread_local! {
+    /// 宿主报来的工作区（左, 上, 右, 下）。菜单与它的渲染线程同在 forwarder 线程。
+    static HOST_WORK_AREA: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 记下宿主报来的工作区，供 [`work_area_of`] 用（Linux 外部宿主形态）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub(crate) fn set_host_work_area(area: Option<(i32, i32, i32, i32)>) {
+    HOST_WORK_AREA.with(|c| c.set(area));
+}
+
 /// 勾选标记（占独立固定宽列，保证标签对齐）。
 const CHECK_MARK: &str = "✓";
 
@@ -1117,28 +1233,11 @@ impl WindowMouse for MenuState {
         let (sx, sy) = self.screen(x, y);
         match msg {
             WM_MOUSEMOVE => {
-                // 高亮跟手：鼠标指向哪个条目就亮哪个，没指向条目就灭。
-                // 三条分支都只动 `selected`（不碰 `levels`），所以任何一条都不会收起
-                // 已展开的子菜单；而 `clear_hover` 只对最深层生效，父项高亮始终保留着
-                // 「当前展开路径」的指示作用。
-                //
-                // 灭高亮是廉价的：它只让对应层 `update()` 推一次像素，不会触发
-                // `show()`（见 `plan_render`），因此不会重排 z 序、不会造成窗口闪烁。
-                match self.find_hit(sx, sy) {
-                    Some((k, Some(r))) => self.hover(k, r),
-                    // 面板内非条目处（root padding / 边框 / 分隔线）→ 灭掉该层高亮。
-                    Some((k, None)) => self.clear_hover(k),
-                    // 菜单外 → 同样灭掉最深层高亮。鼠标都移开了还亮着，观感像卡住。
-                    None => self.clear_hover(self.deepest()),
-                }
+                self.pointer_move(sx, sy);
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
-                match self.find_hit(sx, sy) {
-                    Some((k, Some(r))) => self.click(k, r),
-                    Some((_, None)) => {} // 面板空白处：忽略
-                    None => self.close(), // 菜单外 → 关闭
-                }
+                self.pointer_left_press(sx, sy);
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
@@ -1699,6 +1798,11 @@ fn work_area_of(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
                 return Some((wa.left, wa.top, wa.right, wa.bottom));
             }
         }
+    }
+    // Linux：屏幕几何只有 addon 拿得到，随「打开菜单」请求报上来（整块根窗口，不分显示器）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    if let Some(wa) = HOST_WORK_AREA.with(|c| c.get()) {
+        return Some(wa);
     }
     let _ = (x, y);
     None

@@ -19,6 +19,25 @@ use wind_ui_types::{CandidateOp, MenuAnchor, MenuCmd, MenuKind, ToolbarAction, U
 /// 「点开菜单 → 切走窗口」的最短间隔（看清菜单内容至少几百毫秒）。
 pub(crate) const MENU_FOCUS_GUARD: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Linux 自绘菜单的空闲超时：这么久没有任何菜单操作（打开 / 菜单键 / 指针）就当它已经没了。
+///
+/// 这是**服务端最后一道兜底**，不是正常关闭路径：addon 自己有同样时长的空闲计时（到点收菜单、
+/// 报 `menu.dismiss`），这里防的是 addon 那条报告丢了——`menu_open` 一旦卡在 true，方向键 /
+/// 回车 / Esc 永远被吞（macOS 早期踩过的坑，见 `docs/design/linux-port.md` §7）。所以判据放在
+/// 「下一个按键到来时」：超时后的第一个键照常处理，不被吞。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub(crate) const MENU_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`MENU_IDLE_TIMEOUT`] 的判据（纯函数，便于单测）。没有记录时不算超时——打开菜单必然会记。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub(crate) fn menu_idle_expired(
+    touched_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    timeout: std::time::Duration,
+) -> bool {
+    touched_at.is_some_and(|t| now.saturating_duration_since(t) >= timeout)
+}
+
 /// `MenuCmd::ToggleToolbar` 的菜单文案。两平台**同一个命令、不同的 UI 实体**，故文案分平台：
 /// Windows 下它显隐的是跟随光标的悬浮工具栏窗口；macOS 下 `UpdateToolbar` 被
 /// `manager_macos` 编码成 mode_status 帧，最终落到 `ModeStatusController` 的
@@ -1573,6 +1592,12 @@ impl Coordinator {
         // 高级子菜单：截图等不常用功能 + 打开各数据目录（分隔线独立成组）
         #[allow(unused_mut)]
         let mut advanced_children = vec![
+            // Linux 摘掉：这一项除了存候选窗，还要宿主截状态气泡 / 悬停提示 / Toast 并回报
+            // （`shot.panel` → `shot.result`），结果 Toast 由那条回报触发。addon 不接
+            // `shot.panel`（浮层像素其实在服务进程，但截图流程是按 macOS「像素在宿主」写的），
+            // 于是点了只悄悄存一张候选图、永远等不到反馈——比没有这一项更糟。
+            // 下面「截图候选窗口到剪贴板」在 Linux 是完整可用的，保留。
+            #[cfg(not(all(target_os = "linux", ext_presenter)))]
             M::leaf(
                 "截图所有窗口到文件",
                 cmd(MenuCmd::TakeScreenshot),
@@ -1966,13 +1991,14 @@ impl Coordinator {
             ]
         };
 
-        let items = vec![
-            M::submenu("输入方案", schema_children),
-            M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
-            M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
-            M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t),
-            M::submenu("检索范围", filter_children),
-            M::separator(),
+        // Linux 摘掉这两项（`docs/design/linux-port.md` §2 精简范围）：
+        // - 工具栏 / 状态图标开关：它只翻 `toolbar_visible`，落点是 `UpdateToolbar` → forwarder 推
+        //   `CMD_MODE_STATUS`，而 addon 不接这一帧（没有工具栏，也还没有托盘指示器）——点了没有
+        //   任何可见变化。设置端同理藏了 `ui.toolbar.visible`。
+        // - 软键盘：Linux 的 `open_softkeyboard` 直接拒绝开启（没有面板，见那里的注释），菜单项
+        //   点了同样毫无反应。
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
+        let display_toggles = vec![
             M::leaf(
                 TOOLBAR_MENU_LABEL,
                 cmd(MenuCmd::ToggleToolbar),
@@ -1980,6 +2006,22 @@ impl Coordinator {
                 toolbar_vis,
             ),
             self.soft_keyboard_menu_item(),
+        ];
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let display_toggles: Vec<wind_ui_types::MenuItemSpec> = {
+            let _ = toolbar_vis;
+            Vec::new()
+        };
+        let mut items = vec![
+            M::submenu("输入方案", schema_children),
+            M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
+            M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
+            M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t),
+            M::submenu("检索范围", filter_children),
+            M::separator(),
+        ];
+        items.extend(display_toggles);
+        items.extend([
             M::submenu("主题", theme_children),
             M::separator(),
             M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
@@ -2005,7 +2047,7 @@ impl Coordinator {
                 true,
                 false,
             ),
-        ];
+        ]);
         items
     }
 
@@ -2029,7 +2071,7 @@ impl Coordinator {
     }
 
     // macOS 用 IMK 原生菜单, 不走协调器弹出菜单键转发 (见 coordinator handle_key_event 门控)。
-    #[cfg_attr(ext_presenter, allow(dead_code))]
+    #[cfg_attr(all(ext_presenter, not(target_os = "linux")), allow(dead_code))]
     pub(crate) fn is_menu_open(&self) -> bool {
         self.state
             .lock()
@@ -2042,6 +2084,9 @@ impl Coordinator {
     /// 非 tooltip 菜单关闭时清除是无操作（tooltip 菜单未打开则标志本就是 false）。
     pub(crate) fn menu_close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.candidate_menu_open
+            .store(false, std::sync::atomic::Ordering::Release);
         if state.menu_open {
             state.menu_open = false;
             state.menu_opened_at = None;
@@ -2059,7 +2104,14 @@ impl Coordinator {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.menu_open = true;
         s.menu_opened_at = Some(std::time::Instant::now());
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            s.menu_touched_at = s.menu_opened_at;
+        }
         s.menu_target_page_local = page_local;
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.candidate_menu_open
+            .store(!text.is_empty(), std::sync::atomic::Ordering::Release);
         s.menu_target_text = text;
     }
 
@@ -2122,11 +2174,82 @@ impl Coordinator {
         let _ = self.ui_tx.send(UiCommand::SetStatusMenuOpen(false));
     }
 
+    /// 记一次菜单操作（空闲超时从这里重新起算，见 [`MENU_IDLE_TIMEOUT`]）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn touch_menu(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.menu_open {
+            s.menu_touched_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 直接写 `menu_open = false` 的清理路径（失焦清输入 / 切走输入法 / 组合被终止）调它让 UI
+    /// 也收菜单：Windows 那边靠随后的 `HideCandidates` 连带收掉，Linux 的 forwarder 不连带
+    /// （见 `notify_ui_hide`）。**不取 `state` 锁**——这几处调用时正持着它。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn hide_menu_ui_unlocked(&self) {
+        self.candidate_menu_open
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.ui_tx.send(UiCommand::HideMenu);
+    }
+
+    /// addon 报「菜单被我收掉了」（`menu.dismiss`）或连接断开：无条件复位并让 UI 收菜单。
+    ///
+    /// 不走 `menu_close` 的「开着才发 HideMenu」：两端认识错开时（协调器以为关了、UI 还挂着），
+    /// 正是这条要对齐的情形。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn menu_dismissed_by_host(&self, why: &str) {
+        let was_open = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut s.menu_open, false)
+        };
+        self.candidate_menu_open
+            .store(false, std::sync::atomic::Ordering::Release);
+        tracing::debug!("宿主收起菜单（{why}），协调器此前 menu_open={was_open}");
+        let _ = self.ui_tx.send(UiCommand::HideMenu);
+        self.clear_tooltip_menu_flag();
+    }
+
+    /// addon 请求打开菜单（`menu.open`，右键候选 / 右键候选窗空白处 / Fcitx5 状态区入口）。
+    /// `target` ≥ 0 为候选右键菜单（页内下标），否则为功能主菜单；`work` = (左, 上, 右, 下)。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn open_menu_from_host(&self, target: i32, x: i32, y: i32, work: [i32; 4]) {
+        let [left, top, right, bottom] = work;
+        // 工作区先于菜单到 UI 线程：同一条命令通道保序，`show` 定位时已是新值。
+        let _ = self.ui_tx.send(UiCommand::SetWorkArea {
+            left,
+            top,
+            right,
+            bottom,
+        });
+        if target >= 0 {
+            self.show_candidate_menu(target as usize, x, y);
+        } else {
+            self.show_main_menu(MenuAnchor::at_point(x, y));
+        }
+    }
+
     /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。
-    #[cfg_attr(ext_presenter, allow(dead_code))]
+    #[cfg_attr(all(ext_presenter, not(target_os = "linux")), allow(dead_code))]
     pub(crate) fn forward_menu_key(&self, key_code: u32) -> bool {
         if !self.is_menu_open() {
             return false;
+        }
+        // Linux：空闲超时兜底——菜单多半已不在屏上（addon 的关闭报告丢了），本键照常处理。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            let touched = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .menu_touched_at;
+            if menu_idle_expired(touched, std::time::Instant::now(), MENU_IDLE_TIMEOUT) {
+                tracing::info!("菜单空闲超时仍标记为打开，视为已关闭（按键照常处理）");
+                self.menu_close();
+                self.clear_tooltip_menu_flag();
+                return false;
+            }
+            self.touch_menu();
         }
         match key_code {
             // 方向键/回车/空格/ESC → 菜单窗口处理（导航/下钻/返回/激活/关闭）
@@ -2184,7 +2307,8 @@ impl Coordinator {
                 let a = self.quick_adjust_of(q.kind);
                 !a.is_empty()
             };
-            let items = vec![
+            #[allow(unused_mut)]
+            let mut items = vec![
                 // 「同类型内」这个限定不能省：置顶只在本类（日期/数字/计算）内生效，
                 // 类与类之间的先后由 `mix_modes.members` 决定，不归本菜单管。
                 M::leaf(
@@ -2205,6 +2329,17 @@ impl Coordinator {
                 M::separator(),
                 M::leaf("复制", MenuKind::Copy, true, false),
             ];
+            // 「更多…」理由见下方词条菜单同一处。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            items.extend([
+                M::separator(),
+                M::leaf(
+                    "更多…",
+                    MenuKind::Command(MenuCmd::OpenMainMenu),
+                    true,
+                    false,
+                ),
+            ]);
             self.mark_menu_open(page_local, word);
             let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
                 items,
@@ -2278,6 +2413,19 @@ impl Coordinator {
         // 「同一个字在临拼下右键没有这一项」——用户绝不会想到那是分支写重了。
         items.extend(common_item);
         items.push(M::leaf("复制", MenuKind::Copy, true, false));
+        // Linux 没有工具栏也没有托盘：组字时通往主菜单的只剩候选窗空白处右键，而候选窗
+        // 几乎没有空白。借候选菜单末尾给一个「更多…」（同工具栏分格菜单那一项，同一个
+        // `OpenMainMenu`，锚点取刚才点它的指针位置）。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        items.extend([
+            M::separator(),
+            M::leaf(
+                "更多…",
+                MenuKind::Command(MenuCmd::OpenMainMenu),
+                true,
+                false,
+            ),
+        ]);
         self.mark_menu_open(page_local, word);
         // 候选右键菜单在光标处向下弹出（above=false，y_bottom 不使用）。
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
@@ -3331,7 +3479,9 @@ mod tests {
     /// 回归背景：IMK 输入源菜单走精简树 `build_menu_items_macos()`、候选框右键与状态指示器
     /// 走完整树 `build_main_menu_items()`，两棵树各自维护 → 精简树当初把这项砍了，同一个
     /// 输入法在两处菜单里表现不一。这条测试同时钉住「都在」和「同名」。
-    #[cfg(ext_presenter)]
+    // 只在 macOS：Linux 的完整菜单刻意摘掉了这一项（addon 不接状态帧，见 build_main_menu_items），
+    // 由 `linux_menu_tests::main_menu_drops_items_without_a_linux_landing` 钉住。
+    #[cfg(target_os = "macos")]
     #[test]
     fn toolbar_toggle_present_in_both_macos_menu_trees() {
         use super::TOOLBAR_MENU_LABEL;
@@ -3798,6 +3948,8 @@ impl Coordinator {
     ///
     /// 面多于一个时才给子菜单——只有一面的话，子菜单里孤零零一项，点它和点父项
     /// 效果一样，纯属多一层。
+    // Linux 主菜单摘掉了软键盘项（见 `build_main_menu_items`）。
+    #[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
     pub(crate) fn soft_keyboard_menu_item(&self) -> wind_ui_types::MenuItemSpec {
         use wind_ui_types::MenuItemSpec as M;
         let on = self.softkeyboard_is_open();
@@ -4226,5 +4378,273 @@ mod compat_reload_tests {
         assert!(ac.pin_anchor_when_start_drifts, "协议字段也要一并刷新");
         assert_eq!(ac.pid, 4242, "不得改动 pid：它同时是上一次真实焦点的身份");
         let _ = std::fs::remove_dir_all(&user);
+    }
+}
+
+/// Linux 自绘菜单的协调器一侧：入口、按平台摘除的菜单项、各条关闭路径与 `menu_open` 的对齐。
+/// 渲染 / 命中 / 像素推帧在 wind-ui 的 `menu_linux` 里测，addon 与真 X 的整条链在 e2e。
+#[cfg(all(test, target_os = "linux", ext_presenter))]
+mod linux_menu_tests {
+    use super::*;
+    use crate::coordinator::Coordinator;
+    use std::sync::mpsc::Receiver;
+    use wind_bridge::handler::MessageHandler;
+    use wind_ui_types::MenuItemSpec;
+
+    fn coord() -> (std::sync::Arc<Coordinator>, Receiver<UiCommand>) {
+        Coordinator::new_headless_with_ui(Config::default(), None)
+    }
+
+    fn labels(items: &[MenuItemSpec]) -> Vec<String> {
+        let mut out = Vec::new();
+        for it in items {
+            out.push(it.label.clone());
+            out.extend(labels(&it.children));
+        }
+        out
+    }
+
+    fn drain(rx: &Receiver<UiCommand>) -> Vec<UiCommand> {
+        rx.try_iter().collect()
+    }
+
+    fn with_candidate(c: &Coordinator) {
+        let mut st = c.state.lock().unwrap();
+        st.candidates = vec![wind_candidate::Candidate {
+            text: "测".into(),
+            ..Default::default()
+        }];
+        st.input_buffer = "ce".into();
+    }
+
+    #[test]
+    fn main_menu_drops_items_without_a_linux_landing() {
+        let (c, _rx) = coord();
+        let all = labels(&c.build_main_menu_items());
+        for gone in [
+            TOOLBAR_MENU_LABEL,
+            "软键盘",
+            "截图所有窗口到文件",
+            "输入诊断 HUD",
+        ] {
+            assert!(
+                !all.iter().any(|l| l == gone),
+                "Linux 主菜单不该有「{gone}」"
+            );
+        }
+        // 邻项还在：cfg 没把整块吞掉。
+        for kept in [
+            "输入方案",
+            "全角",
+            "主题",
+            "截图候选窗口到剪贴板",
+            "打开日志目录",
+            "应用独立配置",
+            "设置...",
+            "重启服务",
+        ] {
+            assert!(
+                all.iter().any(|l| l == kept),
+                "邻项「{kept}」被误伤：{all:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_menu_ends_with_more_leading_to_main_menu() {
+        let (c, rx) = coord();
+        with_candidate(&c);
+        c.show_candidate_menu(0, 10, 20);
+        let items = drain(&rx)
+            .into_iter()
+            .find_map(|m| match m {
+                UiCommand::ShowCandidateMenu { items, .. } => Some(items),
+                _ => None,
+            })
+            .expect("候选菜单没弹");
+        let last = items.last().unwrap();
+        assert_eq!(last.label, "更多…");
+        assert_eq!(last.kind, MenuKind::Command(MenuCmd::OpenMainMenu));
+        assert!(c.is_menu_open());
+    }
+
+    /// `menu.open`：工作区先于菜单下发（同一通道保序，定位时已是新值）。
+    #[test]
+    fn host_open_request_sends_work_area_before_menu() {
+        let (c, rx) = coord();
+        c.handle_ext(
+            wind_ipc::protocol::ext_kind::MENU_OPEN,
+            br#"{"target":-1,"x":300,"y":420,"work":[0,0,1280,800]}"#,
+        );
+        let cmds = drain(&rx);
+        let wa = cmds.iter().position(|m| {
+            matches!(
+                m,
+                UiCommand::SetWorkArea {
+                    right: 1280,
+                    bottom: 800,
+                    ..
+                }
+            )
+        });
+        let show = cmds.iter().position(|m| {
+            matches!(m, UiCommand::ShowCandidateMenu { anchor, .. } if (anchor.x, anchor.y) == (300, 420))
+        });
+        assert!(
+            matches!((wa, show), (Some(a), Some(b)) if a < b),
+            "{cmds:?}"
+        );
+        assert!(c.is_menu_open());
+    }
+
+    #[test]
+    fn host_open_for_candidate_without_candidates_leaves_menu_closed() {
+        let (c, _rx) = coord();
+        c.handle_ext(
+            wind_ipc::protocol::ext_kind::MENU_OPEN,
+            br#"{"target":0,"x":1,"y":2,"work":[0,0,100,100]}"#,
+        );
+        assert!(!c.is_menu_open(), "没有候选就不弹、也不能标记为打开");
+    }
+
+    #[test]
+    fn menu_keys_are_forwarded_and_other_keys_close_and_are_swallowed() {
+        let (c, rx) = coord();
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        drain(&rx);
+        assert!(c.forward_menu_key(keymap::VK_DOWN));
+        assert!(
+            drain(&rx)
+                .iter()
+                .any(|m| matches!(m, UiCommand::MenuKey(k) if *k == keymap::VK_DOWN))
+        );
+        assert!(c.forward_menu_key(keymap::VK_A), "非菜单键也不外泄");
+        assert!(!c.is_menu_open());
+        assert!(drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
+    }
+
+    #[test]
+    fn pointer_events_are_forwarded_while_open_and_heal_when_closed() {
+        use wind_ipc::protocol::menu_pointer::*;
+        let (c, rx) = coord();
+        c.handle_menu_pointer(MENU_POINTER_MOTION, 0, 5, 6);
+        assert!(
+            drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)),
+            "菜单已关还收到指针事件：让 UI 收菜单"
+        );
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        drain(&rx);
+        c.handle_menu_pointer(MENU_POINTER_PRESS, 3, 7, 8);
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                UiCommand::MenuPointer {
+                    event: wind_ui_types::MenuPointerEvent::RightPress,
+                    x: 7,
+                    y: 8
+                }
+            )),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn host_dismiss_and_disconnect_reset_menu_open() {
+        let (c, rx) = coord();
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        c.handle_ext(
+            wind_ipc::protocol::ext_kind::MENU_DISMISS,
+            br#"{"reason":"idle"}"#,
+        );
+        assert!(!c.is_menu_open());
+        assert!(drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
+        assert!(
+            !c.forward_menu_key(keymap::VK_RETURN),
+            "关闭后回车照常交给输入流程"
+        );
+
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        c.handle_client_disconnected();
+        assert!(!c.is_menu_open(), "addon 断线：菜单态复位");
+    }
+
+    #[test]
+    fn candidate_menu_closes_with_candidates_but_main_menu_survives() {
+        let (c, rx) = coord();
+        with_candidate(&c);
+        c.show_candidate_menu(0, 10, 20);
+        drain(&rx);
+        // 持着 state 锁调用（生产里多处就是这样调的）：不得自锁死。
+        {
+            let _held = c.state.lock().unwrap();
+            c.notify_ui_hide();
+        }
+        assert!(
+            drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)),
+            "候选收起：候选菜单失去对象，让 UI 收掉"
+        );
+        // UI 收掉可见菜单后回送 MenuClose（menu_linux::MenuHost::hide），协调器据此复位。
+        c.handle_ui_event(wind_ui_types::UiEvent::MenuClose);
+        assert!(!c.is_menu_open());
+
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        drain(&rx);
+        c.notify_ui_hide();
+        assert!(
+            c.is_menu_open(),
+            "空闲时的主菜单不受一条无关的 HideCandidates 影响"
+        );
+        assert!(!drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
+    }
+
+    /// 失焦清输入 / 切走输入法 / 组合被终止：这些路径直接写 `menu_open = false` 再
+    /// `notify_ui_hide`。Windows 靠 `HideCandidates` 连带收菜单窗口，Linux 靠这里补发的 HideMenu。
+    #[test]
+    fn composition_terminated_hides_the_menu_ui_too() {
+        let (c, rx) = coord();
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        drain(&rx);
+        c.handle_composition_terminated();
+        assert!(!c.is_menu_open());
+        assert!(drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
+    }
+
+    #[test]
+    fn idle_timeout_predicate() {
+        let now = std::time::Instant::now();
+        let t = std::time::Duration::from_secs(60);
+        assert!(!menu_idle_expired(None, now, t));
+        assert!(!menu_idle_expired(Some(now), now, t));
+        let old = now.checked_sub(std::time::Duration::from_secs(61));
+        assert!(old.is_none() || menu_idle_expired(old, now, t));
+    }
+
+    /// 服务端最后一道兜底：空闲超时后菜单仍标记为打开，下一个键照常处理（不被吞）。
+    #[test]
+    fn stale_open_menu_does_not_swallow_the_next_key() {
+        let (c, rx) = coord();
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        let Some(old) = std::time::Instant::now().checked_sub(MENU_IDLE_TIMEOUT * 2) else {
+            return; // 开机不足两分钟的机器上 Instant 回退不了：此例无从构造
+        };
+        c.state.lock().unwrap().menu_touched_at = Some(old);
+        drain(&rx);
+        assert!(!c.forward_menu_key(keymap::VK_DOWN), "超时后的键照常处理");
+        assert!(!c.is_menu_open());
+        assert!(drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
+    }
+
+    #[test]
+    fn menu_keys_keep_the_idle_timer_fresh() {
+        let (c, _rx) = coord();
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        let Some(old) = std::time::Instant::now().checked_sub(MENU_IDLE_TIMEOUT / 2) else {
+            return;
+        };
+        c.state.lock().unwrap().menu_touched_at = Some(old);
+        assert!(c.forward_menu_key(keymap::VK_DOWN));
+        let touched = c.state.lock().unwrap().menu_touched_at.unwrap();
+        assert!(touched > old, "菜单键刷新空闲计时");
     }
 }

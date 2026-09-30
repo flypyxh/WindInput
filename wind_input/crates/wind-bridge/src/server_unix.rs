@@ -87,6 +87,7 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
             });
         }
     }
+    handler.handle_client_disconnected();
 }
 
 /// macOS：设 SO_NOSIGPIPE 防对端断开触发 SIGPIPE 杀进程。

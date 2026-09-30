@@ -136,6 +136,24 @@ pub const CMD_UIELEMENT_PAGE: u16 = 0x0219;
 /// （选高亮 / 定稿 / 放弃 / 翻页）。payload = [`UiElementActionPayload`]。
 pub const CMD_UIELEMENT_ACTION: u16 = 0x021A;
 
+/// 上行（**仅 Linux** Fcitx5 addon）：自绘菜单打开期间的原始指针事件。
+///
+/// Linux 的菜单与候选窗同构——服务进程光栅化、addon 只贴图（见 [`overlay::OVERLAY_KIND_MENU`]），
+/// 命中测试、悬停高亮、子菜单展开全在服务端的 `popup_menu` 里做，addon 不知道哪一行是什么。
+/// 于是 addon 在菜单打开期间抓住指针（X11 pointer grab），把每次移动 / 按下原样报上来。
+/// 移动事件每秒可达上百次，按 [`CMD_EXT`] 的两档划分属高频，故占专用码位、定长载荷。
+///
+/// payload（16 字节，小端）：`event u32`（[`menu_pointer`]）+ `button u32`（X11 按键号：
+/// 1 左 / 2 中 / 3 右；移动时 0）+ `x i32` + `y i32`（屏幕坐标 = X11 根窗口坐标）。
+/// 同步请求回 ack；菜单已关时服务端让 UI 把菜单也收掉（两端对齐的自愈）。
+pub const CMD_MENU_POINTER: u16 = 0x021B;
+
+/// [`CMD_MENU_POINTER`] 的 `event` 取值。名字全局唯一，`protocol_sync_test` 逐个比对。
+pub mod menu_pointer {
+    pub const MENU_POINTER_MOTION: u32 = 1;
+    pub const MENU_POINTER_PRESS: u32 = 2;
+}
+
 /// [`UiElementStatePayload::flags`] bit0：宿主接管绘制（`BeginUIElement` 回了 `pbShow=FALSE`，
 /// 或此后 `ITfUIElement::Show(FALSE)`）。置位 ⇒ 服务端对该 pid 不弹自己的候选窗。
 pub const UIELEMENT_FLAG_HOST_DRAWS: u32 = 0x0001;
@@ -242,6 +260,10 @@ pub mod overlay {
     pub const OVERLAY_KIND_TOOLTIP: u32 = 1;
     pub const OVERLAY_KIND_STATUS: u32 = 2;
     pub const OVERLAY_KIND_TOAST: u32 = 3;
+    /// 自绘菜单（主菜单 / 候选右键菜单）第 0 级；第 k 级子菜单是 `OVERLAY_KIND_MENU + k`，
+    /// 每级一个窗口、一段 SHM。级数上限 [`OVERLAY_MENU_LEVELS`]，更深的子菜单不显示。
+    pub const OVERLAY_KIND_MENU: u32 = 4;
+    pub const OVERLAY_MENU_LEVELS: u32 = 6;
 
     /// 落位方式（place）。坐标一律指**内容盒**左上（不含软阴影扩边），宿主减去
     /// `content_x/y` 得窗口左上。
@@ -254,6 +276,10 @@ pub mod overlay {
     pub const OVERLAY_PLACE_FLIP: u32 = 1;
     pub const OVERLAY_PLACE_FOLLOW_CANDIDATE: u32 = 2;
     pub const OVERLAY_PLACE_ANCHOR: u32 = 3;
+    /// `(x, y)` 已由服务端按宿主报来的工作区算定（菜单：翻转、子菜单左右展开、钳制都在
+    /// `popup_menu` 里做完），宿主**原样摆放、不再夹回**——命中测试在服务端按这个位置做，
+    /// 宿主挪一个像素两边就对不上。
+    pub const OVERLAY_PLACE_EXACT: u32 = 4;
 
     /// 锚点（anchor，仅 `ANCHOR` 用）。状态气泡的窗口锚点在 Linux 拿不到前台窗口边框，
     /// 服务端先降级成同位置的屏幕锚点再编码，故这里只有屏幕锚点。
@@ -327,6 +353,14 @@ pub mod ext_kind {
     pub const POS_CANDIDATE_QUERY: &str = "pos.candidate.query";
     /// 下行：问 `.app` 状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。body 空。
     pub const POS_STATUS_TIP_QUERY: &str = "pos.status_tip.query";
+    /// 上行（Linux addon）：请求打开自绘菜单。body =
+    /// `{"target":-1|<页内下标>,"x":..,"y":..,"work":[左,上,右,下]}`——`target` ≥ 0 为该候选的
+    /// 右键菜单，-1 为功能主菜单；`(x, y)` 是菜单左上角的锚点（屏幕坐标），`work` 是锚点所在
+    /// 工作区（服务端据此做翻转 / 子菜单左右展开，屏幕几何只有 addon 拿得到）。
+    pub const MENU_OPEN: &str = "menu.open";
+    /// 上行（Linux addon）：addon 自己把菜单收掉了（空闲超时、失焦、服务重启、抓不住指针…），
+    /// 服务端据此复位 `menu_open`。body = `{"reason":"…"}`，只进日志。
+    pub const MENU_DISMISS: &str = "menu.dismiss";
     //
     // 为什么这两个「位置」要一问一答，而不是服务进程自己记账：
     //

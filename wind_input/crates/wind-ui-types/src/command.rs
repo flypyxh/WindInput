@@ -2,7 +2,7 @@
 
 use crate::candidate::CandidateItem;
 use crate::diag::{CaretOverlayView, InputDiagView};
-use crate::menu::{MenuAnchor, MenuItemSpec};
+use crate::menu::{MenuAnchor, MenuItemSpec, MenuPointerEvent};
 use crate::softkeyboard::SoftKeyCap;
 use crate::status_tip::StatusTipPlacement;
 use crate::toast::{ToastKind, ToastPosition};
@@ -222,6 +222,21 @@ pub enum UiCommand {
     MenuKey(u32),
     /// 隐藏菜单
     HideMenu,
+    /// 外部宿主（Linux addon）报上来的菜单指针事件，屏幕坐标。Windows 菜单窗口自己收鼠标
+    /// 消息、从不下发本命令；Linux 的菜单只是 addon 贴出来的位图，命中测试仍在渲染端做。
+    MenuPointer {
+        event: MenuPointerEvent,
+        x: i32,
+        y: i32,
+    },
+    /// 外部宿主报告的工作区（左, 上, 右, 下，屏幕坐标）：菜单翻转 / 子菜单左右展开的依据。
+    /// Windows 渲染端自己按显示器查（`MonitorFromPoint`），不需要本命令。
+    SetWorkArea {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    },
     /// 写剪贴板（菜单"复制"由协调器驱动 → UI 侧执行）
     CopyToClipboard(String),
     /// 用资源管理器打开路径（菜单"打开配置目录"）

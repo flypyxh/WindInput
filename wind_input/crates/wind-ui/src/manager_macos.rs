@@ -168,6 +168,9 @@ pub struct Forwarder {
     /// Linux：状态气泡 / Toast / tooltip 的光栅浮层（macOS 由 `.app` 原生渲染，无此字段）。
     #[cfg(all(target_os = "linux", ext_presenter))]
     overlays: crate::overlay_linux::Overlays,
+    /// Linux：自绘菜单（macOS 由 `.app` 弹原生 NSMenu，协调器不下发菜单命令）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    menu: crate::menu_linux::MenuHost,
 }
 
 impl Forwarder {
@@ -177,6 +180,8 @@ impl Forwarder {
             .expect("create candidate window (mock/raster host)");
         #[cfg(all(target_os = "linux", ext_presenter))]
         let overlays = crate::overlay_linux::Overlays::new(ev_tx.clone(), suffix.clone());
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let menu = crate::menu_linux::MenuHost::new(ev_tx.clone(), suffix.clone());
         Self {
             win,
             shm: None,
@@ -190,6 +195,8 @@ impl Forwarder {
             theme: None,
             #[cfg(all(target_os = "linux", ext_presenter))]
             overlays,
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            menu,
         }
     }
 
@@ -425,6 +432,8 @@ impl Forwarder {
                 self.push_softkeyboard(sk::SkCmd::Theme(t.clone()));
                 #[cfg(all(target_os = "linux", ext_presenter))]
                 self.overlays.set_theme(&t);
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.menu.set_theme(&*self.sink, &t);
                 self.theme = Some(t.clone());
                 self.win.set_theme(*t);
             }
@@ -650,7 +659,35 @@ impl Forwarder {
             UiCommand::OpenPath(path) => crate::manager::open_path(&path),
             UiCommand::OpenApp { path, args } => crate::manager::open_app(&path, &args),
             UiCommand::Shutdown => {}
+            #[cfg(target_os = "macos")]
             UiCommand::CopyToClipboard(text) => crate::popup_menu::set_clipboard_text(&text),
+            // Linux 的剪贴板靠外部命令（wl-copy / xclip / xsel），缺工具是常态而不是意外：
+            // 静默失败的话用户点了「复制」毫无反应，故失败时弹 Toast 说清楚缺什么。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::CopyToClipboard(text) => {
+                if let Err(e) = crate::popup_menu::try_set_clipboard_text(&text) {
+                    tracing::warn!("写剪贴板失败: {e}");
+                    self.push_result_toast(&format!("复制失败：{e}"), ToastKind::Error);
+                }
+            }
+            // ── 自绘菜单（仅 Linux；见 `crate::menu_linux`）──
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::ShowCandidateMenu { items, anchor } => {
+                self.menu.show(&*self.sink, items, anchor)
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::MenuKey(vk) => self.menu.key(&*self.sink, vk),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::HideMenu => self.menu.hide(&*self.sink),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::MenuPointer { event, x, y } => self.menu.pointer(&*self.sink, event, x, y),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetWorkArea {
+                left,
+                top,
+                right,
+                bottom,
+            } => self.menu.set_work_area(left, top, right, bottom),
             // 其余未接的变体（截图族 / 输入诊断 HUD / 拖动落点回报 / 候选右键菜单键盘
             // 导航 / 工具栏位置）见 wind_macos/AGENTS.md「与 Windows 的功能差距」表。
             // 新接一个就从那张表里划掉一行。

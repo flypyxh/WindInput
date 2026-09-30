@@ -853,6 +853,15 @@ pub(crate) fn dispatch_command(
             }
         }
 
+        // ── Linux addon 自绘菜单的指针事件（event u32 + button u32 + x i32 + y i32，上行）──
+        CMD_MENU_POINTER => {
+            if payload.len() >= 16 {
+                let u = |o: usize| u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
+                handler.handle_menu_pointer(u(0), u(4), u(8) as i32, u(12) as i32);
+            }
+            if is_async { None } else { Some(encode_ack()) }
+        }
+
         // ── darwin .app 统一菜单项被选中（菜单 id i32 LE，上行）──
         CMD_MENU_ACTION => {
             if payload.len() >= 4 {

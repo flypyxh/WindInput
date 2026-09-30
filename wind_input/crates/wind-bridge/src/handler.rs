@@ -327,6 +327,16 @@ pub trait MessageHandler: Send + Sync {
     /// 等），否则用户得手动切一次焦点新配置才生效。
     fn handle_client_connected(&self, _pid: u32) {}
 
+    /// UDS 请求连接断开（macOS / Linux，`server_unix` 在连接线程收尾时调）。默认 no-op。
+    ///
+    /// Linux 用它兜「addon 断线」：自绘菜单开着时 addon 进程没了，没人会再报关闭，
+    /// `menu_open` 留成 true 就会吞掉下一个 addon 实例送来的方向键 / 回车 / Esc。
+    fn handle_client_disconnected(&self) {}
+
+    /// Linux addon：自绘菜单打开期间的指针事件（[`wind_ipc::protocol::CMD_MENU_POINTER`]）。
+    /// `event` 见 `protocol::menu_pointer`；`button` 为 X11 按键号；`(x, y)` 为屏幕坐标。默认空。
+    fn handle_menu_pointer(&self, _event: u32, _button: u32, _x: i32, _y: i32) {}
+
     /// 处理焦点获取（返回状态用于 ActivationStatusPush）
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData>;
 

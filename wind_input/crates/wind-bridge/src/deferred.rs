@@ -113,6 +113,20 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_front_context(app, title, sel))
     }
 
+    // 下面三个此前都落在 trait 默认的空实现上：扩展信封（`pos.*` / `shot.result` / Linux 的
+    // `menu.*`）从外部宿主上来后被本代理悄悄吞掉，Coordinator 的实现从未被调用过。
+    fn handle_ext(&self, kind: &str, body: &[u8]) {
+        self.with_handler((), |h| h.handle_ext(kind, body))
+    }
+
+    fn handle_menu_pointer(&self, event: u32, button: u32, x: i32, y: i32) {
+        self.with_handler((), |h| h.handle_menu_pointer(event, button, x, y))
+    }
+
+    fn handle_client_disconnected(&self) {
+        self.with_handler((), |h| h.handle_client_disconnected())
+    }
+
     fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
         self.with_handler(None, |h| h.handle_ime_activated(client_token))
     }
@@ -271,6 +285,21 @@ mod tests {
                 .unwrap()
                 .push("client_connected".to_string());
         }
+        fn handle_ext(&self, kind: &str, _body: &[u8]) {
+            self.calls.lock().unwrap().push(format!("ext:{kind}"));
+        }
+        fn handle_menu_pointer(&self, e: u32, b: u32, x: i32, y: i32) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("menu_pointer:{e}:{b}:{x}:{y}"));
+        }
+        fn handle_client_disconnected(&self) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("client_disconnected".to_string());
+        }
         fn handle_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
             // ⚠ 参数要进记录：只 push 一个固定字符串的话，DeferredHandler 把 host_reads
             // 丢掉也不会让任何测试变红（与 server.rs 的记录器同款做法）。
@@ -401,6 +430,24 @@ mod tests {
         assert!(
             rec.got("uielement_state") && rec.got("uielement_action") && rec.got("uielement_page"),
             "UIElement 三件套未转发 → 自绘候选的游戏拿不到候选、我们的候选窗也照弹"
+        );
+        deferred.handle_ext("menu.open", b"{}");
+        deferred.handle_menu_pointer(2, 3, -4, 5);
+        deferred.handle_client_disconnected();
+        assert!(
+            rec.got("ext:menu.open"),
+            "扩展信封未转发 → 外部宿主上行的 pos.* / shot.result / menu.* 全部石沉大海"
+        );
+        assert!(
+            rec.calls
+                .lock()
+                .unwrap()
+                .contains(&"menu_pointer:2:3:-4:5".to_string()),
+            "菜单指针事件未原样转发 → Linux 自绘菜单点不动"
+        );
+        assert!(
+            rec.got("client_disconnected"),
+            "连接断开未转发 → addon 断线后 menu_open 复位不了"
         );
         assert!(
             rec.got("key_source_pid"),

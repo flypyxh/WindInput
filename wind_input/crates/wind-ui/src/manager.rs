@@ -36,7 +36,7 @@ fn blocked_by_exclusive_fullscreen(what: &str) -> bool {
 /// 注意 DiagSections 三件套走上方 input_diag_hud 的链式转发，勿在此重复列出。
 pub use wind_ui_types::{
     CandidateOp, GlobalHotkeyEntry, HOVER_PAGE_NEXT, HOVER_PAGE_PREV, MenuAnchor, MenuCmd,
-    MenuItemSpec, MenuKind, MenuPlacement, ToolbarAction, UiCommand, UiEvent,
+    MenuItemSpec, MenuKind, MenuPlacement, MenuPointerEvent, ToolbarAction, UiCommand, UiEvent,
 };
 
 /// UI 管理器（在独立线程中运行）
@@ -495,6 +495,9 @@ impl UiManager {
                     UiCommand::HideMenu => {
                         hide_popup_menu(&mut popup_menu, &mut candidate_window);
                     }
+                    // 外部宿主（Linux addon）专用：本渲染端的菜单窗口自己收鼠标消息、按显示器
+                    // 自查工作区，协调器也只在 Linux 形态下发这两条。
+                    UiCommand::MenuPointer { .. } | UiCommand::SetWorkArea { .. } => {}
                     UiCommand::CopyToClipboard(text) => {
                         crate::popup_menu::set_clipboard_text(&text);
                     }
