@@ -22,9 +22,10 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
 | `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
 | `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：中英模式镜像（托盘图标 `windinput-zh/en`，从服务端四种状态帧学）、应用内预编辑过滤掉单空格占位组合 |
+| `include/OverlayInput.h` + `src/core/OverlayInput.cpp` | 光栅浮层与候选悬停的鼠标交互纯逻辑：按键 → 动作（拖动 / 菜单 / 关闭）、菜单 target、悬停门控、提示的悬停延后与离开重定、拖动落位 |
 | `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |
-| `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层 + 自绘菜单：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮/右键回传、浮层自动隐藏计时、菜单打开期间抓指针并回报 |
+| `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层 + 自绘菜单：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮/右键回传、浮层的悬停保持 / 拖动 / 右键 / 点击关闭与自动隐藏计时、菜单打开期间抓指针并回报 |
 | `data/*.conf.in` | addon / 输入法描述文件模板（构建时生成到 `build/…/share/fcitx5/`） |
 | `data/icons/hicolor` | 图标成品（`windinput`、`windinput-zh`、`windinput-en`），CMake 装到 `share/icons`；由 `scripts/linux/gen-icons.py` 一次性生成 |
 | `tests/*_test.cpp` | 纯 C++17 单测（不需要 Fcitx5），与 `wind_tsf/tests` 同风格 |
@@ -61,6 +62,10 @@ scripts/linux/e2e.sh                            # 端到端：真服务 + 真 fc
 Shift 切中英 / Ctrl+Shift+E 切方案后等 `wind-status` 出现再等它自己消失；Toast 用
 `wind_input ui toast`（控制 RPC 在 `$XDG_RUNTIME_DIR` 下，e2e 已把它指进临时目录）；tooltip 沿
 候选窗中线 `xdotool mousemove` 直到出现。截图存在 `$W/shots/`（`KEEP=1` 保留）。`WIND_E2E_COMPOSITOR=1` 另起 xcompmgr 走 ARGB 路径。
+浮层交互用例：`xdotool mousedown / mousemove / mouseup` 拖气泡，数 fcitx5 日志里「状态气泡拖动松手」
+验 `pos.status_tip` 上报、读隔离目录的用户 `config.toml` 验落不落盘；剪贴板是假的
+`$W/fakebin/xclip`（写入记进 `$W/clipboard.log`）——为此 Xvfb 先于服务起，服务要继承 `DISPLAY`
+才会选 xclip 后端。e2e 把 `ui.status.duration` 调到 2 秒（出厂 800ms，来不及把指针挪上去）。
 
 设置程序用例：e2e 经包装脚本（`$W/svc/wind_setting`，记下 argv 再 exec 真程序，真程序默认取
 `~/.cache/wi-tgt-setting-linux/debug/wind_setting`，`WIND_E2E_SETTING` 可覆盖，缺它 e2e 直接失败）
@@ -148,8 +153,32 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 `cfg(all(target_os = "linux", ext_presenter))` 下，macOS 仍发文本帧。
 
 - **一层一窗**：`X11CandidatePanel` 里候选窗与三层浮层各一个 `Surface`，共用一条 xcb 连接；
-  实例名 `wind-tooltip` / `wind-status` / `wind-toast`（e2e 按它找窗）。浮层**对鼠标透明**
-  （XShape 输入区置空），窗口类型 `_NET_WM_WINDOW_TYPE_TOOLTIP`；透明两条路同候选窗。
+  实例名 `wind-tooltip` / `wind-status` / `wind-toast`（e2e 按它找窗）。窗口类型
+  `_NET_WM_WINDOW_TYPE_TOOLTIP`；透明两条路同候选窗，输入区只留不透明处（无合成器时随外形裁，
+  ARGB 时另设 XShape 输入区），点阴影 / 圆角外落到下面的应用。
+- **鼠标交互**（对位 Windows 各窗口，纯逻辑在 `OverlayInput.h`）：
+  - 状态气泡：左键拖动（靠按下时的**隐式抓取**收移动 / 松开，松手即结束、不会卡住；内容盒夹进
+    工作区，同 `placeOverlay` 的末步），松手报 `pos.status_tip`（内容左上；落不落盘由服务端
+    `save_status_tip_pos` 按定位方式定）；拖动中来的新帧只换像素、不重新落位。右键 → `menu.open`
+    target `MENU_TARGET_STATUS` → 服务端弹 Windows 同款气泡菜单。应 `pos.status_tip.query`
+    报当前位置（「固定位置」以当前位置落盘）。
+  - 悬停提示：指针离开候选行时，若该候选的提示正显示，悬停变化延后（去往「无」280ms、去往另一
+    候选 150ms，同 Windows `hover_move`）；指针进了提示就撤掉，悬停留在原候选、提示不动。离开
+    提示后同样 280ms 宽限，到期按指针真实位置重定（`tipRecheckHover`）。右键 → target
+    `MENU_TARGET_TOOLTIP`，另带位图内坐标 `lx/ly`：命中（段 / 原始行）在服务端按它最近画的那一帧
+    做（`UiCommand::TooltipMenuAt` → `RequestTooltipMenu`，之后与 Windows 同一个
+    `show_tooltip_menu`）。提示菜单随候选收起（`candidate_menu_open`）。左键无动作（同 Windows）。
+  - Toast：任意键点一下立即关（Windows 没有 Toast 交互，这是 Linux 加的）。
+  - 自动隐藏的暂停：气泡在悬停 / 拖动 / 自己的菜单开着（请求发出到菜单收起）时不计时，Toast 在
+    悬停时不计时；交互结束重新给满一份时长（同 Windows `interacting()` + 边沿重新计时）。「悬停」
+    只认窗口出现之后指针真的动过（`HoverGate`）：气泡弹在静止的指针下不算，否则永不消失。
+  - 菜单收起（任何路径）后按指针真实位置重定一次：指针在提示上就留下，否则按指针处重报候选悬停
+    （提示随之收起，同 Windows 菜单关闭时「光标不在气泡上就隐藏」）；气泡 / Toast 的悬停同理。
+  - 复位：浮层被摘（隐藏帧 / `SERVICE_READY` / 连接断开）即归位拖动与悬停，被摘时正在拖的那次
+    **作废、不上报**——X 在窗口不可见时自动放掉隐式抓取，不会有松开事件。典型是拖动中失焦：服务端
+    失焦即收状态提示（同 Windows），这次拖动随之作废（Windows 的气泡窗口隐藏后仍持有鼠标捕获，
+    松手照报落点；Linux 不跟：用户没松手，谈不上摆到了哪）。气泡菜单请求 2 秒内菜单没来（服务
+    没了）就放开保持。截图（菜单里的「截图此窗口」）在服务端就地从该层 SHM 读回。
 - **落位归 addon**：服务拿不到屏幕几何，帧里只给规则（坐标都指**内容盒**，窗口 = 内容 − 阴影扩边）：
   `ABSOLUTE`（状态气泡固定位置）、`FLIP`（首选点 + 右溢/下溢时的备选点：状态气泡跟随光标）、
   `FOLLOW_CANDIDATE`（tooltip：坐标按候选窗**建议**落点算，addon 先平移「候选窗实际落点 −
@@ -192,7 +221,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | HiDPI（帧 `scale>1`） | 按物理像素原样贴 | X11 没有逻辑坐标，服务端在 Linux 上目前恒发 scale=1 |
 | 候选窗拖动 / 固定位置回报（`pos.candidate` / `pos.candidate.query`） | 未接 | 服务端问位置时不答 = 保留旧值（macOS 不可见时也不答，语义安全） |
 | 候选右键菜单 / 功能主菜单 | 已接（X11） | 见上「自绘菜单」。缺：Wayland；多显示器（工作区取整块根窗口）；点菜单外那一下被菜单吃掉（同 X11 原生菜单，Windows 会透传）；菜单开着时在候选上再右键只关菜单、不接着弹新菜单（Windows 会） |
-| tooltip / 状态气泡 / toast | 已接（X11） | 见上「光栅浮层」。缺：气泡/提示的鼠标交互（Windows 可拖动状态气泡、右键菜单、悬停 tooltip 时保持显示）——浮层对鼠标透明；截图类命令（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗 |
+| tooltip / 状态气泡 / toast | 已接（X11），含鼠标交互 | 见上「光栅浮层」：悬停保持、气泡拖动与右键菜单、提示右键菜单（复制 / 上屏 / 截图）、Toast 点击关闭，e2e 逐项覆盖。缺：Wayland；多显示器（拖动夹回按整块根窗口）；「截图所有窗口到文件」（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗（气泡 / 提示菜单里的「截图此窗口」已可用）；提示菜单开着时点在提示上只关菜单、不接着弹新菜单（Windows 会重新请求） |
 | 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
 | 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
 | 中英模式指示 | 托盘 / 面板图标（`subModeIcon`） | 见设计文档 §5d。e2e 经 kimpanel 验了图标名随 Shift / 菜单切换；notificationitem（SNI）取的是同一个值但未单独验，真机托盘（GNOME AppIndicator、Deepin dde-dock）的实际显示未验 |

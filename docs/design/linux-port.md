@@ -74,6 +74,20 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
 独立的 SHM 段，`CMD_OVERLAY_FRAME` 只带落位规则与自动隐藏时长；落位（需要屏幕几何）与计时都在
 addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 
+**鼠标交互对齐 Windows**（`wind_linux/include/OverlayInput.h`）。按「谁知道判据」分两半：
+
+| 交互 | Windows | Linux 落点 |
+|---|---|---|
+| 悬停提示：指针从候选挪进提示时保持；离开后 280ms 宽限 | `hover_move` / `TooltipMouse` 离开跟踪 | addon：候选悬停变化延后上报、指针进提示就撤掉（服务端的悬停一直指着原候选，提示照画） |
+| 悬停提示右键菜单（复制 / 上屏「段」「此行」、复制全部、截图） | `RequestTooltipMenu` → `show_tooltip_menu` | addon 报 `menu.open`（target −3 + 位图内坐标）→ 服务端按最近画的那一帧做命中 → 同一个 `show_tooltip_menu` |
+| 状态气泡拖动；松手报位置，固定位置模式落盘 | `StatusTipMouse` + `StatusTipMoved` | addon 拖（隐式抓取）→ `pos.status_tip` → 同一个 `save_status_tip_pos` |
+| 状态气泡右键菜单（常驻 / 焦点切换时显示 / 固定位置 / 恢复默认 / 截图） | `RequestStatusMenu` → `show_status_menu` | `menu.open`（target −2）→ 同一个 `show_status_menu`；「固定位置」经 `pos.status_tip.query` 取当前位置 |
+| 悬停 / 拖动 / 菜单开着时不自动消失，结束后重新计时 | UI 循环按 `interacting()` 顺延 | addon（计时本来就在 addon） |
+| Toast 点击关闭、悬停暂停 | 无（Windows Toast 不收鼠标） | addon 本地（Linux 新增） |
+| 「截图此窗口」 | 窗口自己截 | 服务端从该层 SHM 读回、就地存盘进剪贴板（macOS 的像素在 `.app`，走 `shot.panel`；Linux 不走） |
+
+不做：「悬停行高亮」——Windows 的提示气泡也没有这一项，没有可对齐的行为。
+
 ## 5c. 自绘菜单（主菜单 / 候选右键菜单，M3b）
 
 不用 Fcitx5 / 桌面的菜单：与候选窗、浮层同构，服务进程光栅化、addon 贴图，外观与 Windows 同一份。
