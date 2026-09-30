@@ -680,7 +680,7 @@ impl CodeTableEngine {
         let mut hits: Vec<Candidate> = Vec::new();
         if limit > 0 {
             // ★ 词库层自己按 `fetch` 截断（各层两档取额），过滤只能在它之后。仅单字时不够就 ×2 重取，
-            // 直到够数 / 取尽 / 硬上限（计划裁决 1，同生僻字模式的 refill）。关着时只查一轮 ⇒ 与原实现逐条相同。
+            // 直到够数 / 取尽 / 硬上限（同生僻字模式的 refill）。关着时只查一轮 ⇒ 与原实现逐条相同。
             let mut fetch = limit;
             loop {
                 let got =

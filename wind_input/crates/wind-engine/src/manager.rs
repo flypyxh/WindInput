@@ -1737,6 +1737,15 @@ impl EngineManager {
         self.reverse_index_skipped_in(schema_id, ReverseScope::Enabled)
     }
 
+    /// 仅供跨 crate 的测试模拟「连续崩溃保护已触发」；生产代码不调用。
+    #[doc(hidden)]
+    pub fn mark_reverse_index_skipped_for_test(&self, schema_id: &str, scope: ReverseScope) {
+        self.reverse_index_skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(reverse_index_key(schema_id, scope));
+    }
+
     /// [`Self::reverse_index_skipped`] 的按范围版本。
     pub fn reverse_index_skipped_in(&self, schema_id: &str, scope: ReverseScope) -> bool {
         self.reverse_index_skipped

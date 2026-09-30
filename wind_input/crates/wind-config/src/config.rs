@@ -9688,6 +9688,12 @@ mod tests {
             !global_on.resolved(Some(&off)).lookup_disabled_dicts,
             "方案显式关压过全局"
         );
+        assert!(
+            global_on
+                .resolved(Some(&crate::schema::CodeTableSpec::default()))
+                .lookup_disabled_dicts,
+            "方案没写 ⇒ 回落全局"
+        );
     }
 
     /// ★ 便携闸门**只许挡便携这一侧**：非便携下 `user_config_marker_path()` 必须仍给出路径。

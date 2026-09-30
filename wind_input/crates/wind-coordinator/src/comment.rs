@@ -3323,4 +3323,25 @@ mod comment_reverse_scope_tests {
             Some("uuia")
         );
     }
+
+    /// 常规索引已被连续崩溃保护跳过 ⇒ 变体不再构建（不起线程、不建）。
+    #[test]
+    fn variant_index_not_built_when_regular_index_skipped() {
+        use wind_engine::ReverseScope;
+        let (c, g) = coord("skip", true);
+        c.engine_mgr
+            .mark_reverse_index_skipped_for_test(&g.id, ReverseScope::Enabled);
+        c.warm_comment_reverse_index();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            c.engine_mgr
+                .reverse_index_if_ready_in(&g.id, ReverseScope::WithDisabled)
+                .is_none(),
+            "常规被跳过时变体不该被建出来"
+        );
+        assert!(
+            !c.engine_mgr
+                .is_building_reverse_index_in(&g.id, ReverseScope::WithDisabled)
+        );
+    }
 }

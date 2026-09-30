@@ -4534,7 +4534,9 @@ impl Coordinator {
     ///
     /// 变体（`WithDisabled`）的构建线程**先确保常规那份建好**再建变体：两份都是全量构建、
     /// 各有各的构建锁，并行建会让峰值内存翻倍。常规那份本就会被预热（悬停 / 查重都要），
-    /// 先建它不是白干。常规那份正在建时变体这边不起线程——建完的重渲染会再回到这里。
+    /// 先建它不是白干。常规那份正在建时变体这边不起线程——下一次重渲染或按键会再回到这里。
+    /// 常规那份已被连续崩溃保护跳过（`reverse_index_skipped`）时，变体也放弃、不再构建：
+    /// 同一批词库既然让常规索引反复崩溃，变体只会更大。
     pub(crate) fn spawn_index_warm_in(
         &self,
         schema_id: &str,
@@ -4559,6 +4561,7 @@ impl Coordinator {
             || self
                 .engine_mgr
                 .is_building_reverse_index_in(schema_id, scope)
+            || (variant && self.engine_mgr.reverse_index_skipped(schema_id))
             || (variant && self.engine_mgr.is_building_reverse_index(schema_id))
         {
             return;
@@ -4613,6 +4616,11 @@ impl Coordinator {
                 if variant {
                     // 串行：常规那份在别处建着就等它（单飞锁），没建就先建它。
                     c.engine_mgr.prewarm_reverse_index(&sid);
+                    // 常规那份被崩溃保护跳过 ⇒ 变体也放弃（起线程时它可能还没被跳过）。
+                    if c.engine_mgr.reverse_index_skipped(&sid) {
+                        done.store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
                 }
                 let built_index = c.engine_mgr.prewarm_reverse_index_in(&sid, scope);
                 if with_single_char {
