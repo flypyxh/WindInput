@@ -4440,6 +4440,18 @@ impl Coordinator {
                 debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
             }
         }
+        // 候选注释反查的「含未启用扩展库」变体（reverse-mode spec §4.2）：开关开且方案有未启用库才建。
+        // 排在上面常规索引之后、同一线程上 ⇒ 两份串行，峰值内存不叠加。
+        let sid = self.engine_mgr.code_source_schema();
+        if self.engine_mgr.comment_reverse_scope(&sid) == wind_engine::ReverseScope::WithDisabled {
+            let t0 = std::time::Instant::now();
+            if self
+                .engine_mgr
+                .prewarm_reverse_index_in(&sid, wind_engine::ReverseScope::WithDisabled)
+            {
+                debug!("预热注释反查变体索引 {} 用时 {:?}", sid, t0.elapsed());
+            }
+        }
         // 辅助码引用的码表方案（`schema:<id>`，含临拼目标方案引用的）：进入辅助码的门卫
         // 要求其反查索引已就绪、按键线程绝不现建——不预热的话每次启动后第一次按辅助码键
         // 都静默不进。辅助码关着时集合为空，不白建。
@@ -4499,19 +4511,55 @@ impl Coordinator {
         self.spawn_index_warm(schema_id, true);
     }
 
+    /// 候选注释反查（`code_rev` / `code` / `code_rev_all` / `code_all`）取不到索引时调：
+    /// 注释范围是「含未启用扩展库」变体才需另建，常规那份由既有预热负责（计划裁决 6）。
+    /// 只派活不等，去重同 [`Self::spawn_index_warm_in`]。
+    pub(crate) fn warm_comment_reverse_index(&self) {
+        let sid = self.engine_mgr.code_source_schema();
+        let scope = self.engine_mgr.comment_reverse_scope(&sid);
+        if scope == wind_engine::ReverseScope::WithDisabled {
+            self.spawn_index_warm_in(&sid, scope, false);
+        }
+    }
+
     pub(crate) fn spawn_index_warm(&self, schema_id: &str, with_single_char: bool) {
+        self.spawn_index_warm_in(
+            schema_id,
+            wind_engine::ReverseScope::Enabled,
+            with_single_char,
+        );
+    }
+
+    /// [`Self::spawn_index_warm`] 的按范围版本。
+    ///
+    /// 变体（`WithDisabled`）的构建线程**先确保常规那份建好**再建变体：两份都是全量构建、
+    /// 各有各的构建锁，并行建会让峰值内存翻倍。常规那份本就会被预热（悬停 / 查重都要），
+    /// 先建它不是白干。常规那份正在建时变体这边不起线程——建完的重渲染会再回到这里。
+    pub(crate) fn spawn_index_warm_in(
+        &self,
+        schema_id: &str,
+        scope: wind_engine::ReverseScope,
+        with_single_char: bool,
+    ) {
         if schema_id.is_empty() {
             return;
         }
-        let index_ready = self.engine_mgr.reverse_index_if_ready(schema_id).is_some();
+        let variant = scope == wind_engine::ReverseScope::WithDisabled;
+        let index_ready = self
+            .engine_mgr
+            .reverse_index_if_ready_in(schema_id, scope)
+            .is_some();
         let single_char_ready =
             !with_single_char || self.engine_mgr.single_char_codes_ready(schema_id);
         // 已被 build_guard 放弃的方案不再起线程：构建线程结束时会通知重绘，重绘又回到这里，
         // 不挡住就是「每次重绘起一个线程」的无限循环。造词缺了反查索引也做不了查重，
         // 故单字全码表一并不建。
         if (index_ready && single_char_ready)
-            || self.engine_mgr.reverse_index_skipped(schema_id)
-            || self.engine_mgr.is_building_reverse_index(schema_id)
+            || self.engine_mgr.reverse_index_skipped_in(schema_id, scope)
+            || self
+                .engine_mgr
+                .is_building_reverse_index_in(schema_id, scope)
+            || (variant && self.engine_mgr.is_building_reverse_index(schema_id))
         {
             return;
         }
@@ -4562,7 +4610,11 @@ impl Coordinator {
                     return;
                 };
                 let t0 = std::time::Instant::now();
-                let built_index = c.engine_mgr.prewarm_reverse_index(&sid);
+                if variant {
+                    // 串行：常规那份在别处建着就等它（单飞锁），没建就先建它。
+                    c.engine_mgr.prewarm_reverse_index(&sid);
+                }
+                let built_index = c.engine_mgr.prewarm_reverse_index_in(&sid, scope);
                 if with_single_char {
                     c.engine_mgr.prewarm_single_char_codes(&sid);
                 }
@@ -4572,7 +4624,12 @@ impl Coordinator {
                 if !built_index && !with_single_char {
                     return; // 等锁期间已被别的线程建好，且无别的活要干
                 }
-                debug!("后台建成词库索引 {} 用时 {:?}", sid, t0.elapsed());
+                debug!(
+                    "后台建成词库索引 {} {:?} 用时 {:?}",
+                    sid,
+                    scope,
+                    t0.elapsed()
+                );
                 // 重渲染当前这屏候选，把编码段补上——否则要等用户下一次按键。
                 // 与 reload_user_config / set_filter_mode 的「改完就地重刷」同构。
                 let s = c.state.lock().unwrap_or_else(|e| e.into_inner());

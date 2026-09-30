@@ -1091,10 +1091,16 @@ impl crate::coordinator::Coordinator {
             // `reverse_render` 的 found 判据，整条反查候选这一次照旧不出现 —— 想要的
             // 效果不变，但不会在「模板里还有别的非空变量」时把字面 `${code_rev}`
             // 混进上屏文本。索引建好后下一次按键即恢复。
-            "code_rev" | "code" => self
-                .engine_mgr
-                .codetable_reverse_hint(text)
-                .unwrap_or_default(),
+            //
+            // 未就绪时顺手后台建注释范围那份（开关开且方案有未启用扩展库时是变体，契约 5）。
+            "code_rev" | "code" => {
+                self.engine_mgr
+                    .codetable_reverse_hint(text)
+                    .unwrap_or_else(|| {
+                        self.warm_comment_reverse_index();
+                        String::new()
+                    })
+            }
             // `code_all` —— 该字在码表里的**全部**码位，默认 `/` 连接（`我` → `q/trn/trnt`）。
             //
             // 与 `code` 的分工照搬同文件 `chaizi` / `chaizi_all` 的既有惯例：不带后缀取单个，
@@ -1106,11 +1112,14 @@ impl crate::coordinator::Coordinator {
             // 恰恰是最没用的答案 —— 简码才是用户要的。
             "code_rev_all" | "code_all" => {
                 let sid = self.engine_mgr.code_source_schema();
-                // 空串的理由同上面的 `code_rev`。
+                // 空串的理由同上面的 `code_rev`；范围与预热也同它（计划裁决 6）。
                 let codes = self
                     .engine_mgr
-                    .word_codes_display(&sid, text)
-                    .unwrap_or_default();
+                    .word_codes_display_for_comment(&sid, text)
+                    .unwrap_or_else(|| {
+                        self.warm_comment_reverse_index();
+                        String::new()
+                    });
                 match arg {
                     // `word_codes_display` 固定用 `/` 连接，换分隔符只能在这里替。
                     Some(sep) if !codes.is_empty() => codes.replace('/', sep),
@@ -1242,9 +1251,13 @@ impl crate::coordinator::Coordinator {
             // `${code_rev}` 四个字符。
             "code_rev" | "code" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
+                    // 未就绪：后台建注释范围那份（契约 5），本次空着。
                     self.engine_mgr
                         .codetable_reverse_hint(&c.text)
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| {
+                            self.warm_comment_reverse_index();
+                            String::new()
+                        })
                 } else {
                     String::new()
                 }
@@ -1262,10 +1275,14 @@ impl crate::coordinator::Coordinator {
             "code_rev_all" | "code_all" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
                     let sid = self.engine_mgr.code_source_schema();
+                    // 含未启用扩展库与否看注释范围（计划裁决 6）；悬停 `[编码]` 段仍用启用集。
                     let codes = self
                         .engine_mgr
-                        .word_codes_display(&sid, &c.text)
-                        .unwrap_or_default();
+                        .word_codes_display_for_comment(&sid, &c.text)
+                        .unwrap_or_else(|| {
+                            self.warm_comment_reverse_index();
+                            String::new()
+                        });
                     match arg {
                         Some(sep) if !codes.is_empty() => codes.replace('/', sep),
                         _ => codes,
@@ -3205,5 +3222,105 @@ mod role_contract_tests {
         }"#;
         let names = entry_names(Some((FAKE, "fn fake(")));
         assert_eq!(unlisted(&names), vec!["no_such_role".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod comment_reverse_scope_tests {
+    //! 候选注释反查走「含未启用库」变体（reverse-mode spec §4.2）。自造夹具，不依赖 build_dev/data。
+    use crate::coordinator::Coordinator;
+    use std::path::PathBuf;
+    use wind_config::Config;
+
+    struct Cleanup {
+        id: String,
+        dir: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(cache) = Config::cache_dir() {
+                let _ = std::fs::remove_dir_all(cache.join(&self.id));
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn coord(tag: &str, on: bool) -> (std::sync::Arc<Coordinator>, Cleanup) {
+        let id = format!("zz_crs_{tag}_{}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("wind_crs_{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = dir.join("schemas");
+        std::fs::create_dir_all(s.join(&id)).unwrap();
+        std::fs::write(
+            s.join(format!("{id}.schema.toml")),
+            format!(
+                "[schema]\nid = \"{id}\"\nname = \"注\"\n[engine]\ntype = \"codetable\"\n\
+                 [engine.codetable]\nmax_code_length = 4\n\
+                 [[dictionaries]]\nid = \"{id}_m\"\npath = \"{id}/m.dict.yaml\"\ntype = \"rime_codetable\"\ndefault = true\n\
+                 [[dictionaries]]\nid = \"{id}_xz\"\npath = \"{id}/xz.dict.yaml\"\ntype = \"rime_codetable\"\ndefault_enabled = false\n"
+            ),
+        )
+        .unwrap();
+        let dict = |body: &str| {
+            format!(
+                "---\nname: d\nversion: \"1\"\ncolumns:\n  - code\n  - text\n  - weight\n...\n{body}"
+            )
+        };
+        std::fs::write(s.join(format!("{id}/m.dict.yaml")), dict("a\t工\t100\n")).unwrap();
+        std::fs::write(
+            s.join(format!("{id}/xz.dict.yaml")),
+            dict("uuia\t门头沟区\t0\n"),
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.available = vec![id.clone()];
+        cfg.schema.active = id.clone();
+        cfg.schema.codetable.lookup_disabled_dicts = on;
+        (
+            Coordinator::new_headless(cfg, Some(&dir)),
+            Cleanup { id, dir },
+        )
+    }
+
+    #[test]
+    fn prewarm_indexes_builds_comment_variant_when_switch_on() {
+        let (c, _g) = coord("on", true);
+        c.prewarm_indexes();
+        assert_eq!(
+            c.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
+            Some("uuia")
+        );
+        let (off, _g2) = coord("off", false);
+        off.prewarm_indexes();
+        assert_eq!(
+            off.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
+            Some("")
+        );
+    }
+
+    /// 打字线路取不到就后台建：变体建好之前，常规那份先建好（两份串行，Task 10 审查 M2）。
+    #[test]
+    fn warm_comment_reverse_index_builds_regular_then_variant_in_background() {
+        use wind_engine::ReverseScope;
+        let (c, g) = coord("lazy", true);
+        assert_eq!(c.engine_mgr.codetable_reverse_hint("门头沟区"), None);
+        c.warm_comment_reverse_index();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while c
+            .engine_mgr
+            .reverse_index_if_ready_in(&g.id, ReverseScope::WithDisabled)
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline, "变体没被后台建出来");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            c.engine_mgr.reverse_index_if_ready(&g.id).is_some(),
+            "变体之前常规那份已建好"
+        );
+        assert_eq!(
+            c.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
+            Some("uuia")
+        );
     }
 }
