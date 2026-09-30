@@ -1,11 +1,13 @@
 // SHM 帧读端与候选窗落位几何单测。SHM 用本进程建一段假装是服务端写的（布局按 Rust
 // `shared_render_frame.rs::encode_frame_into`：64 字节头 + 紧跟像素）。
 
+#include "ExtProtocol.h"
 #include "Protocol.h"
 #include "ShmFrame.h"
 #include "TestHarness.h"
 
 #include <cstring>
+#include <utility>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -140,6 +142,73 @@ void TestPlacement()
     CHECK(r.y >= 0 && r.y + 1000 <= 1080);
 }
 
+OverlayFramePayload overlay(uint32_t place, int32_t x, int32_t y, int32_t altX, int32_t altY)
+{
+    OverlayFramePayload p;
+    p.flags = 1;
+    p.place = place;
+    p.x = x;
+    p.y = y;
+    p.altX = altX;
+    p.altY = altY;
+    // 位图 120x40，内容盒 100x30 偏移 (8, 4)：软阴影扩边。
+    p.width = 120;
+    p.height = 40;
+    p.contentX = 8;
+    p.contentY = 4;
+    p.contentW = 100;
+    p.contentH = 30;
+    return p;
+}
+
+void TestOverlayPlacement()
+{
+    const Rect wa{0, 0, 1920, 1080};
+    CASE("浮层 ABSOLUTE：内容盒照搬，窗口 = 内容 − 阴影扩边");
+    Rect r = placeOverlay(overlay(OVERLAY_PLACE_ABSOLUTE, 500, 600, 0, 0), wa, 0, 0);
+    CHECK(r.x == 492 && r.y == 596 && r.w == 120 && r.h == 40);
+
+    CASE("浮层 ABSOLUTE 越界只夹回（左侧副屏之类的负坐标由工作区决定）");
+    r = placeOverlay(overlay(OVERLAY_PLACE_ABSOLUTE, 1900, -20, 0, 0), wa, 0, 0);
+    CHECK(r.x == 1920 - 100 - 8 && r.y == -4);
+
+    CASE("浮层 FLIP：放得下用首选点；下溢用备选点；备选越过上沿贴下沿");
+    r = placeOverlay(overlay(OVERLAY_PLACE_FLIP, 100, 200, 100, 150), wa, 0, 0);
+    CHECK(r.x == 92 && r.y == 196);
+    r = placeOverlay(overlay(OVERLAY_PLACE_FLIP, 100, 1070, 100, 1000), wa, 0, 0);
+    CHECK_EQ(r.y, 1000 - 4);
+    r = placeOverlay(overlay(OVERLAY_PLACE_FLIP, 100, 1070, 100, -10), wa, 0, 0);
+    CHECK_EQ(r.y, 1080 - 30 - 4);
+
+    CASE("浮层 FLIP：右溢用备选 x（竖排 tooltip 改到候选窗左侧）");
+    r = placeOverlay(overlay(OVERLAY_PLACE_FLIP, 1850, 200, 1600, 200), wa, 0, 0);
+    CHECK_EQ(r.x, 1600 - 8);
+
+    CASE("浮层 FOLLOW_CANDIDATE：随候选窗的实际位移平移后再判溢出");
+    // 候选窗被翻到光标上方（dy = -300）：tooltip 首选点跟着上移，照样放得下。
+    r = placeOverlay(overlay(OVERLAY_PLACE_FOLLOW_CANDIDATE, 100, 1060, 100, 990), wa, 20, -300);
+    CHECK(r.x == 120 - 8 && r.y == 760 - 4);
+    // FLIP 不吃平移。
+    r = placeOverlay(overlay(OVERLAY_PLACE_FLIP, 100, 200, 100, 150), wa, 20, -300);
+    CHECK(r.x == 92 && r.y == 196);
+
+    CASE("浮层 ANCHOR：七个锚点 + 留白");
+    auto anchored = [&](uint32_t a) {
+        OverlayFramePayload p = overlay(OVERLAY_PLACE_ANCHOR, 0, 0, 0, 0);
+        p.anchor = a;
+        p.margin = 12;
+        Rect w = placeOverlay(p, wa, 0, 0);
+        return std::make_pair(w.x + 8, w.y + 4); // 换回内容左上
+    };
+    CHECK(anchored(OVERLAY_ANCHOR_CENTER) == std::make_pair(960 - 50, 540 - 15));
+    CHECK(anchored(OVERLAY_ANCHOR_TOP_LEFT) == std::make_pair(12, 12));
+    CHECK(anchored(OVERLAY_ANCHOR_TOP_RIGHT) == std::make_pair(1920 - 12 - 100, 12));
+    CHECK(anchored(OVERLAY_ANCHOR_BOTTOM_LEFT) == std::make_pair(12, 1080 - 12 - 30));
+    CHECK(anchored(OVERLAY_ANCHOR_BOTTOM_RIGHT) == std::make_pair(1920 - 112, 1080 - 42));
+    CHECK(anchored(OVERLAY_ANCHOR_TOP_CENTER) == std::make_pair(910, 12));
+    CHECK(anchored(OVERLAY_ANCHOR_BOTTOM_CENTER) == std::make_pair(910, 1038));
+}
+
 void TestHitTest()
 {
     CASE("命中测试：候选下标 / 翻页 -1 -2 / 未命中");
@@ -159,6 +228,7 @@ int main()
     TestRejectBad();
     TestOpenMissing();
     TestPlacement();
+    TestOverlayPlacement();
     TestHitTest();
     TEST_MAIN_END();
 }

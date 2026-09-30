@@ -152,6 +152,33 @@ struct HostRenderFramePayload {
 /// CMD_HOST_RENDER_FRAME（push）：seq,x,y,w,h,flags 各 u32/i32（24 字节）[+ scale u32]。
 std::optional<HostRenderFramePayload> decodeHostRenderFrame(const Bytes& p);
 
+/// CMD_OVERLAY_FRAME（push，仅 Linux）：一层浮层（状态气泡 / Toast / tooltip）有新帧或该隐藏。
+/// 像素在该层自己的 SHM 段（`overlayShmName(kind)`）。68 字节，逐字段对位 Rust
+/// `codec.rs::encode_overlay_frame`：kind seq w h flags place（u32）、x y altX altY（i32）、
+/// anchor（u32）、margin contentX contentY（i32）、contentW contentH（u32）、durationMs（i32）。
+/// 坐标一律是**内容盒**左上（不含软阴影扩边）。
+struct OverlayFramePayload {
+    uint32_t kind = 0;
+    uint32_t seq = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t flags = 0;
+    uint32_t place = 0;
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t altX = 0;
+    int32_t altY = 0;
+    uint32_t anchor = 0;
+    int32_t margin = 0;
+    int32_t contentX = 0;
+    int32_t contentY = 0;
+    uint32_t contentW = 0;
+    uint32_t contentH = 0;
+    int32_t durationMs = 0; // >0 由本端计时自动隐藏；0 = 常驻到下一帧
+    bool visible() const { return (flags & 0x1) != 0; }
+};
+std::optional<OverlayFramePayload> decodeOverlayFrame(const Bytes& p);
+
 struct CandidateHitRect {
     int32_t index = 0;
     int32_t x = 0;

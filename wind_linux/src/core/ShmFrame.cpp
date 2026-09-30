@@ -1,5 +1,6 @@
 #include "ShmFrame.h"
 
+#include "ExtProtocol.h"
 #include "Protocol.h"
 
 #include <cstring>
@@ -93,6 +94,73 @@ Rect placePanel(int32_t x, int32_t y, int32_t w, int32_t h, const Rect& wa, bool
         r.y = wa.y;
     }
     return r;
+}
+
+Rect placeOverlay(const OverlayFramePayload& p, const Rect& wa, int32_t shiftX, int32_t shiftY)
+{
+    const int32_t cw = p.contentW ? int32_t(p.contentW) : int32_t(p.width);
+    const int32_t ch = p.contentH ? int32_t(p.contentH) : int32_t(p.height);
+    const int32_t left = wa.x;
+    const int32_t top = wa.y;
+    const int32_t right = wa.x + wa.w;
+    const int32_t bottom = wa.y + wa.h;
+    int32_t x = p.x;
+    int32_t y = p.y;
+    switch (p.place) {
+    case OVERLAY_PLACE_FOLLOW_CANDIDATE:
+    case OVERLAY_PLACE_FLIP: {
+        const bool follow = p.place == OVERLAY_PLACE_FOLLOW_CANDIDATE;
+        const int32_t dx = follow ? shiftX : 0;
+        const int32_t dy = follow ? shiftY : 0;
+        x = p.x + dx;
+        y = p.y + dy;
+        if (x + cw > right) {
+            x = p.altX + dx;
+        }
+        if (y + ch > bottom) {
+            int32_t alt = p.altY + dy;
+            y = alt >= top ? alt : bottom - ch;
+        }
+        break;
+    }
+    case OVERLAY_PLACE_ANCHOR: {
+        const int32_t m = p.margin;
+        const int32_t cx = (left + right) / 2 - cw / 2;
+        const int32_t cy = (top + bottom) / 2 - ch / 2;
+        const int32_t l = left + m;
+        const int32_t r = right - m - cw;
+        const int32_t t = top + m;
+        const int32_t b = bottom - m - ch;
+        switch (p.anchor) {
+        case OVERLAY_ANCHOR_TOP_LEFT: x = l; y = t; break;
+        case OVERLAY_ANCHOR_TOP_RIGHT: x = r; y = t; break;
+        case OVERLAY_ANCHOR_BOTTOM_LEFT: x = l; y = b; break;
+        case OVERLAY_ANCHOR_BOTTOM_RIGHT: x = r; y = b; break;
+        case OVERLAY_ANCHOR_TOP_CENTER: x = cx; y = t; break;
+        case OVERLAY_ANCHOR_BOTTOM_CENTER: x = cx; y = b; break;
+        case OVERLAY_ANCHOR_CENTER:
+        default: x = cx; y = cy; break;
+        }
+        break;
+    }
+    case OVERLAY_PLACE_ABSOLUTE:
+    default:
+        break;
+    }
+    // 夹回：先右/下再左/上，内容比工作区还大时保住左上角可见。
+    if (x + cw > right) {
+        x = right - cw;
+    }
+    if (x < left) {
+        x = left;
+    }
+    if (y + ch > bottom) {
+        y = bottom - ch;
+    }
+    if (y < top) {
+        y = top;
+    }
+    return Rect{x - p.contentX, y - p.contentY, int32_t(p.width), int32_t(p.height)};
 }
 
 int32_t hitTest(const std::vector<CandidateHitRect>& rects, int32_t px, int32_t py)

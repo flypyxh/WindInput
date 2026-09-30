@@ -19,9 +19,9 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/KeyMap.h` + `src/core/KeyMap.cpp` | X11 keysym / 修饰状态 → Windows VK / 协议修饰位；修饰键单击检测 |
 | `include/ResponseRouter.h` + `src/core/ResponseRouter.cpp` | 响应帧 → 宿主操作。Swift `BridgeResponseRouter` 的逐条移植（待定标点 / 定格前缀 / hold 计时器 / 数字后智能标点记账） |
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
-| `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）、命中测试 |
+| `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |
-| `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗：自建 xcb 连接、override-redirect 窗口贴帧、鼠标点击/悬停/滚轮回传 |
+| `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮回传、浮层自动隐藏计时 |
 | `data/*.conf.in` | addon / 输入法描述文件模板（构建时生成到 `build/…/share/fcitx5/`） |
 | `tests/*_test.cpp` | 纯 C++17 单测（不需要 Fcitx5），与 `wind_tsf/tests` 同风格 |
 
@@ -50,11 +50,13 @@ scripts/linux/e2e.sh                            # 端到端：真服务 + 真 fc
 `org.fcitx.Fcitx.InputContext1.ProcessKeyEvent` 送键，收 `CommitString` / `UpdateFormattedPreedit`
 信号断言。临时目录必须短（socket 路径 108 字节上限），默认 `/tmp/wi-linux/e2e.<pid>`。
 
-候选窗（X11）用例在私有 Xvfb 里跑（`WIND_E2E_X11=0` 关掉）：打字后按 `WM_CLASS` 实例名
+候选窗与浮层（X11）用例在私有 Xvfb 里跑（`WIND_E2E_X11=0` 关掉）：打字后按 `WM_CLASS` 实例名
 `wind-candidate` 找窗（`xdotool search --classname`，**不是** `--class`——后者匹配第二段
 `WindInput`），断言已映射、落在光标下方、截图里有内容、上屏/Esc/鼠标选词后隐藏、屏幕底边时
-翻到光标上方；鼠标选词因命中矩形只有服务端知道，沿窗口中线逐点点击直到有上屏。截图存在
-`$W/shots/`（`KEEP=1` 保留）。`WIND_E2E_COMPOSITOR=1` 另起 xcompmgr 走 ARGB 路径。
+翻到光标上方；鼠标选词因命中矩形只有服务端知道，沿窗口中线逐点点击直到有上屏。浮层用例：
+Shift 切中英 / Ctrl+Shift+E 切方案后等 `wind-status` 出现再等它自己消失；Toast 用
+`wind_input ui toast`（控制 RPC 在 `$XDG_RUNTIME_DIR` 下，e2e 已把它指进临时目录）；tooltip 沿
+候选窗中线 `xdotool mousemove` 直到出现。截图存在 `$W/shots/`（`KEEP=1` 保留）。`WIND_E2E_COMPOSITOR=1` 另起 xcompmgr 走 ARGB 路径。
 
 e2e 的坑，都踩过：
 
@@ -127,6 +129,29 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 - 悬停只报候选下标（≥0）：命中表里 -1/-2 是翻页按钮，而悬停协议里 -1 表示「无」。点击翻页
   按钮直接发负下标的 `CMD_CANDIDATE_SELECT`（服务端按 -1 上页 / -2 下页处理）。滚轮 ±120。
 
+## 光栅浮层：状态气泡 / Toast / 悬停提示（X11）
+
+**与 macOS 分道**：`.app` 用原生 NSPanel 排字，服务只发文本 + 配色（`CMD_STATUS_SHOW` 等）；
+本 addon 不排字，这三者与候选窗同构——服务进程按主题光栅化（`wind-ui/src/overlay_linux.rs`，
+真实字形走 `text/linux`），像素写进**各层自己的** SHM 段（`/WindInput_SHM[Dev]` + `_TIP` /
+`_STS` / `_TST`，`overlayShmName`），再推 `CMD_OVERLAY_FRAME`（0x0513，68 字节，布局见
+`Codec.h` 的 `OverlayFramePayload`）。macOS 行为不变：Linux 专属代码全在
+`cfg(all(target_os = "linux", ext_presenter))` 下，macOS 仍发文本帧。
+
+- **一层一窗**：`X11CandidatePanel` 里候选窗与三层浮层各一个 `Surface`，共用一条 xcb 连接；
+  实例名 `wind-tooltip` / `wind-status` / `wind-toast`（e2e 按它找窗）。浮层**对鼠标透明**
+  （XShape 输入区置空），窗口类型 `_NET_WM_WINDOW_TYPE_TOOLTIP`；透明两条路同候选窗。
+- **落位归 addon**：服务拿不到屏幕几何，帧里只给规则（坐标都指**内容盒**，窗口 = 内容 − 阴影扩边）：
+  `ABSOLUTE`（状态气泡固定位置）、`FLIP`（首选点 + 右溢/下溢时的备选点：状态气泡跟随光标）、
+  `FOLLOW_CANDIDATE`（tooltip：坐标按候选窗**建议**落点算，addon 先平移「候选窗实际落点 −
+  建议落点」再同 FLIP——候选窗被翻到光标上方时 tooltip 跟着走）、`ANCHOR`（Toast 七个位置、
+  状态气泡的屏幕锚点，离边 `margin`）。纯逻辑在 `placeOverlay`，公式逐条对位 Windows 各窗口的本地定位。
+  状态气泡的**窗口锚点**降级为同位置的屏幕锚点（服务端编码前就降级；Linux 拿不到前台窗口边框）。
+- **计时归 addon**（同 macOS `.app`）：帧带 `durationMs`，>0 时本端计时器到点摘窗；0 = 常驻到
+  下一帧 / 隐藏帧（常驻型状态气泡、tooltip）。服务端 forwarder 线程阻塞在命令通道上，没有到期唤醒。
+- **隐藏**：服务端对某层推 `FLAG_VISIBLE` 缺席的帧；候选窗隐藏时 tooltip 两端都会藏（服务推隐藏帧，
+  `hide()` 也兜底藏）。`SERVICE_READY` 时关掉三层 SHM 映射并藏掉全部浮层。
+
 ## 与 Windows / macOS 的差距
 
 | 能力 | 现状 | 备注 |
@@ -137,7 +162,8 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | HiDPI（帧 `scale>1`） | 按物理像素原样贴 | X11 没有逻辑坐标，服务端在 Linux 上目前恒发 scale=1 |
 | 候选窗拖动 / 固定位置回报（`pos.candidate` / `pos.candidate.query`） | 未接 | 服务端问位置时不答 = 保留旧值（macOS 不可见时也不答，语义安全） |
 | 候选右键菜单 / 统一菜单 | 不做（本阶段） | 后续由服务光栅化菜单帧自绘 |
-| tooltip / 状态气泡 / toast | 未接 | 这三者**不是帧**：协议只下发文本 + 配色（`CMD_TOOLTIP_SHOW` 等），要在 addon 里自己排字画出来（macOS 是原生 NSPanel）。push 帧收到即丢（`onPushFrame` 的 default 臂） |
+| tooltip / 状态气泡 / toast | 已接（X11） | 见上「光栅浮层」。缺：气泡/提示的鼠标交互（Windows 可拖动状态气泡、右键菜单、悬停 tooltip 时保持显示）——浮层对鼠标透明；截图类命令（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗 |
+| 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
 | 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
 | 菜单 / 工具栏 / 软键盘 / 输入诊断 HUD / 按应用独立配置 | 不做 | 产品决策：与 macOS 精简范围一致 |
 | Shift 单击切中英 | **需清 Fcitx5 的 AltTriggerKeys** | 出厂 `Shift_L` 被 Fcitx5 截走。安装脚本应改 `~/.config/fcitx5/config`，或在 AGENTS 外的用户文档里写明 |

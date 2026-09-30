@@ -1,4 +1,4 @@
-// X11 候选窗：把服务光栅化好的 BGRA 帧贴到一个 override-redirect 顶层窗口上。
+// X11 候选窗 + 光栅浮层：把服务光栅化好的 BGRA 帧贴到 override-redirect 顶层窗口上。
 //
 // 对位 macOS `CandidatePanel.swift`（NSPanel）。像素不在本进程画，这里只负责：建窗、贴图、
 // 落位（翻转/钳制规则在纯逻辑 `placePanel`）、隐藏，以及把鼠标点击/悬停/滚轮翻成
@@ -42,14 +42,42 @@ public:
     /// 命中矩形（CMD_CANDIDATE_RECTS，晚于帧到达）。坐标是位图内的像素。
     void setRects(std::vector<CandidateHitRect> rects) { rects_ = std::move(rects); }
 
+    /// 光栅浮层（CMD_OVERLAY_FRAME：tooltip / 状态气泡 / Toast）：各占一个窗口，落位见
+    /// `placeOverlay`。`durationMs > 0` 时到点自己藏（计时归宿主，同 macOS `.app`）。
+    /// 浮层窗口对鼠标透明（XShape 输入区为空）：点击穿透到下面的应用，不抢候选窗的悬停。
+    bool showOverlay(uint32_t kind, const SharedFrame& frame, const OverlayFramePayload& p);
+    void hideOverlay(uint32_t kind);
+    void hideAllOverlays();
+
 private:
+    /// 一个 override-redirect 窗口及其位图。候选窗与三层浮层各一个，共用一条 X 连接。
+    struct Surface {
+        const char* instance = ""; // WM_CLASS 实例名（xdotool search --classname）
+        bool interactive = false;  // 候选窗收鼠标；浮层对鼠标透明
+        xcb_window_t window = 0;
+        xcb_pixmap_t pixmap = 0;
+        xcb_gcontext_t gc = 0;
+        xcb_colormap_t colormap = 0;
+        bool argb = false;
+        uint8_t depth = 0;
+        uint32_t pixW = 0;
+        uint32_t pixH = 0;
+        bool mapped = false;
+        std::unique_ptr<fcitx::EventSourceTime> hideTimer;
+    };
+    static constexpr size_t kOverlayCount = 3;
+
     bool ensureConnection();
     void dropConnection();
     bool hasCompositor();
-    bool ensureWindow(bool argb);
-    void destroyWindow();
-    void upload(const SharedFrame& frame);
-    void applyShape(const SharedFrame& frame);
+    bool ensureWindow(Surface& s, bool argb);
+    void destroyWindow(Surface& s);
+    bool present(Surface& s, const SharedFrame& frame, const Rect& r);
+    void unmap(Surface& s);
+    void upload(Surface& s, const SharedFrame& frame);
+    void applyShape(Surface& s, const SharedFrame& frame);
+    Surface* overlay(uint32_t kind);
+    Rect workArea() const;
     void onReadable();
     void handleEvent(xcb_generic_event_t* ev);
     void setHover(int32_t index);
@@ -61,17 +89,13 @@ private:
     int screenNum_ = 0;
     std::unique_ptr<fcitx::EventSourceIO> ioEvent_;
     bool warnedNoDisplay_ = false;
-
-    xcb_window_t window_ = 0;
-    xcb_pixmap_t pixmap_ = 0;
-    xcb_gcontext_t gc_ = 0;
-    xcb_colormap_t colormap_ = 0;
-    bool argb_ = false;
-    uint8_t depth_ = 0;
-    uint32_t pixW_ = 0;
-    uint32_t pixH_ = 0;
-    bool mapped_ = false;
     bool shapeAvailable_ = false;
+
+    Surface cand_;
+    Surface overlays_[kOverlayCount]; // 下标 = kind - 1（OVERLAY_KIND_TOOLTIP..TOAST）
+    /// 候选窗实际落点 − 服务端建议落点（被翻转/钳制过时非零）。FOLLOW_CANDIDATE 的 tooltip 据此平移。
+    int32_t candShiftX_ = 0;
+    int32_t candShiftY_ = 0;
 
     std::vector<CandidateHitRect> rects_;
     int32_t hover_ = -1;

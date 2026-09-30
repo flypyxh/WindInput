@@ -339,6 +339,33 @@ std::optional<HostRenderFramePayload> decodeHostRenderFrame(const Bytes& p)
     return out;
 }
 
+std::optional<OverlayFramePayload> decodeOverlayFrame(const Bytes& p)
+{
+    if (p.size() < 68) {
+        return std::nullopt;
+    }
+    const uint8_t* d = p.data();
+    OverlayFramePayload o;
+    o.kind = getU32(d);
+    o.seq = getU32(d + 4);
+    o.width = getU32(d + 8);
+    o.height = getU32(d + 12);
+    o.flags = getU32(d + 16);
+    o.place = getU32(d + 20);
+    o.x = getI32(d + 24);
+    o.y = getI32(d + 28);
+    o.altX = getI32(d + 32);
+    o.altY = getI32(d + 36);
+    o.anchor = getU32(d + 40);
+    o.margin = getI32(d + 44);
+    o.contentX = getI32(d + 48);
+    o.contentY = getI32(d + 52);
+    o.contentW = getU32(d + 56);
+    o.contentH = getU32(d + 60);
+    o.durationMs = getI32(d + 64);
+    return o;
+}
+
 std::optional<std::vector<CandidateHitRect>> decodeCandidateRects(const Bytes& p)
 {
     Reader r(p);

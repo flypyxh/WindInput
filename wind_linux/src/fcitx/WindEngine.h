@@ -69,6 +69,7 @@ private:
     // ── push ──
     void onPushFrame(Frame frame);
     void onRenderFrame(const HostRenderFramePayload& p);
+    void onOverlayFrame(const OverlayFramePayload& p);
     fcitx::InputContext* focusedIC();
 
     fcitx::Instance* instance_;
@@ -87,6 +88,8 @@ private:
     std::unique_ptr<fcitx::EventSourceTime> holdTimer_;
     std::unique_ptr<PushClient> push_;
     ShmFrameReader shm_;
+    /// 光栅浮层各层的 SHM 读端（下标 = kind - 1）。与 `shm_` 同样在 SERVICE_READY 时关掉重开。
+    ShmFrameReader overlayShm_[3];
     std::unique_ptr<X11CandidatePanel> panel_;
 };
 

@@ -214,7 +214,7 @@ void TestDecodeMisc()
 
 void TestDecodeRender()
 {
-    CASE("HostRenderFrame 24/28 字节；CandidateRects；Ext 信封");
+    CASE("HostRenderFrame 24/28 字节；OverlayFrame 68 字节；CandidateRects；Ext 信封");
     Bytes f;
     for (uint32_t v : {7u, uint32_t(-10), 20u, 100u, 50u, 0x9u}) {
         append(f, le32(v));
@@ -228,6 +228,34 @@ void TestDecodeRender()
     append(f, le32(2));
     CHECK_EQ(decodeHostRenderFrame(f)->scale, 2u);
     CHECK(!decodeHostRenderFrame(Bytes(20, 0)).has_value());
+
+    // CMD_OVERLAY_FRAME：偏移按 Rust `encode_overlay_frame` 写死（布局改了两边一起改）。
+    Bytes ov;
+    for (uint32_t v : {2u, 9u, 120u, 40u, 0x5u, 1u, uint32_t(-30), 200u, uint32_t(-31), 150u, 7u,
+                       16u, 3u, 4u, 110u, 30u, 1500u}) {
+        append(ov, le32(v));
+    }
+    auto od = decodeOverlayFrame(ov);
+    CHECK(od.has_value());
+    CHECK_EQ(od->kind, 2u);
+    CHECK_EQ(od->seq, 9u);
+    CHECK_EQ(od->width, 120u);
+    CHECK_EQ(od->height, 40u);
+    CHECK(od->visible());
+    CHECK_EQ(od->place, 1u);
+    CHECK_EQ(od->x, -30);
+    CHECK_EQ(od->y, 200);
+    CHECK_EQ(od->altX, -31);
+    CHECK_EQ(od->altY, 150);
+    CHECK_EQ(od->anchor, 7u);
+    CHECK_EQ(od->margin, 16);
+    CHECK_EQ(od->contentX, 3);
+    CHECK_EQ(od->contentY, 4);
+    CHECK_EQ(od->contentW, 110u);
+    CHECK_EQ(od->contentH, 30u);
+    CHECK_EQ(od->durationMs, 1500);
+    ov.pop_back();
+    CHECK(!decodeOverlayFrame(ov).has_value());
 
     Bytes rects = le32(1);
     for (uint32_t v : {0u, 4u, 5u, 30u, 20u}) {

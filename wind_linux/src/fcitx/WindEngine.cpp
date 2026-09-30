@@ -454,7 +454,11 @@ void WindEngine::onPushFrame(Frame frame)
         // 不认宿主 / 密码框」；请求连接此时多半已是死连接，顺手换新。
         // 服务重启会 shm_unlink + 重建 SHM 段（新 inode）：旧映射成了孤儿，候选窗会卡在旧帧。
         shm_.close();
+        for (auto& r : overlayShm_) {
+            r.close();
+        }
         panel_->hide();
+        panel_->hideAllOverlays();
         if (serviceSeenOnce_) {
             WIND_INFO() << "服务已重启，重建连接";
             bridge_.close();
@@ -485,8 +489,13 @@ void WindEngine::onPushFrame(Frame frame)
             panel_->setRects(std::move(*rects));
         }
         break;
+    case CMD_OVERLAY_FRAME:
+        if (auto p = decodeOverlayFrame(frame.payload)) {
+            onOverlayFrame(*p);
+        }
+        break;
     default:
-        // tooltip / 状态气泡 / toast / 按键合成：见 wind_linux/AGENTS.md 差距表。
+        // macOS 的文本提示帧（CMD_TOOLTIP_SHOW 等，Linux 服务不发）/ 按键合成：见 AGENTS.md 差距表。
         break;
     }
 }
@@ -512,6 +521,30 @@ void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
         WIND_DEBUG() << "候选帧 scale=" << p.scale << "：X11 下按物理像素原样贴";
     }
     panel_->show(f, f.screenX, f.screenY, (p.flags & FRAME_FLAG_ABSOLUTE_POS) != 0);
+}
+
+void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
+{
+    if (p.kind < 1 || p.kind > 3) {
+        WIND_DEBUG() << "未知浮层 kind=" << p.kind << "，忽略";
+        return;
+    }
+    if (!p.visible() || p.width == 0 || p.height == 0) {
+        panel_->hideOverlay(p.kind);
+        return;
+    }
+    ShmFrameReader& shm = overlayShm_[p.kind - 1];
+    const std::string name = overlayShmName(p.kind);
+    if (!shm.isOpen() && !shm.open(name)) {
+        WIND_WARN() << "打不开浮层共享内存 " << name;
+        return;
+    }
+    SharedFrame f;
+    if (!shm.snapshot(f) || f.bgra.empty()) {
+        WIND_DEBUG() << "浮层 kind=" << p.kind << " seq=" << p.seq << " 读取失败或为空";
+        return;
+    }
+    panel_->showOverlay(p.kind, f, p);
 }
 
 } // namespace windlinux

@@ -69,6 +69,12 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
 缺工具时如实报错，不返回假成功。⚠️ 由 systemd 用户单元拉起的服务可能没有 `WAYLAND_DISPLAY`/`DISPLAY`，
 需要 `import-environment` 或由 addon 拉起服务以继承会话环境。
 
+## 5b. 提示类浮层（状态气泡 / Toast / tooltip）
+
+与 macOS 不同：`.app` 原生排字，Linux addon 不排字——服务端光栅化（与候选窗同构），像素走各层
+独立的 SHM 段，`CMD_OVERLAY_FRAME` 只带落位规则与自动隐藏时长；落位（需要屏幕几何）与计时都在
+addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
+
 ## 6. 阶段
 
 | 阶段 | 内容 | 状态 |
@@ -76,7 +82,7 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
 | M0 | `ext_presenter`/`mock_text` 别名、服务端 `linux-host` 形态、端点路径、系统能力 | 完成 |
 | M1a | Linux 真实文字后端（`wind-ui/src/text/linux`，ttf-parser + ab_glyph_rasterizer + dlopen fontconfig） | 进行中 |
 | M1b | Fcitx5 addon：输入通路（按键/上屏/预编辑/焦点/自愈），DBus 集成测试 | 进行中 |
-| M1c | addon 的 X11 候选窗呈现、鼠标回传 | 待做 |
+| M1c | addon 的 X11 候选窗呈现、鼠标回传；状态气泡 / Toast / tooltip 光栅浮层 | 进行中 |
 | M2 | Wayland：Fcitx5 UI addon + input popup surface；先做 spike 验证 popup 表面能否收鼠标事件 | 待做 |
 | M3 | 自绘菜单、设置端适配（`wind-setting` 的 `windui` 已支持 X11/Wayland，缺托盘）、打包 | 待做 |
 

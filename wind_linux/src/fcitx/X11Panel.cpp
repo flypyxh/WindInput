@@ -1,10 +1,13 @@
 #include "X11Panel.h"
 
+#include "ExtProtocol.h"
+
 #include <fcitx-utils/log.h>
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <time.h>
 #include <xcb/shape.h>
 
 FCITX_DECLARE_LOG_CATEGORY(windinput_log);
@@ -57,6 +60,11 @@ int bitsPerPixel(xcb_connection_t* c, uint8_t depth)
 X11CandidatePanel::X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb)
     : loop_(loop), cb_(std::move(cb))
 {
+    cand_.instance = "wind-candidate";
+    cand_.interactive = true;
+    overlays_[OVERLAY_KIND_TOOLTIP - 1].instance = "wind-tooltip";
+    overlays_[OVERLAY_KIND_STATUS - 1].instance = "wind-status";
+    overlays_[OVERLAY_KIND_TOAST - 1].instance = "wind-toast";
 }
 
 X11CandidatePanel::~X11CandidatePanel()
@@ -104,7 +112,10 @@ void X11CandidatePanel::dropConnection()
 {
     ioEvent_.reset();
     if (conn_) {
-        destroyWindow();
+        destroyWindow(cand_);
+        for (Surface& o : overlays_) {
+            destroyWindow(o);
+        }
         xcb_disconnect(conn_);
         conn_ = nullptr;
     }
@@ -123,28 +134,28 @@ bool X11CandidatePanel::hasCompositor()
     return owned;
 }
 
-bool X11CandidatePanel::ensureWindow(bool argb)
+bool X11CandidatePanel::ensureWindow(Surface& s, bool argb)
 {
-    if (window_ && argb_ == argb) {
+    if (s.window && s.argb == argb) {
         return true;
     }
-    destroyWindow();
+    destroyWindow(s);
     xcb_visualid_t visual = screen_->root_visual;
-    depth_ = screen_->root_depth;
-    colormap_ = 0;
+    s.depth = screen_->root_depth;
+    s.colormap = 0;
     if (argb) {
         xcb_visualtype_t* v = findArgbVisual(screen_);
         if (!v) {
             argb = false; // 有合成器却没有 32 位 visual：极少见，按无合成器处理
         } else {
             visual = v->visual_id;
-            depth_ = 32;
-            colormap_ = xcb_generate_id(conn_);
-            xcb_create_colormap(conn_, XCB_COLORMAP_ALLOC_NONE, colormap_, screen_->root, visual);
+            s.depth = 32;
+            s.colormap = xcb_generate_id(conn_);
+            xcb_create_colormap(conn_, XCB_COLORMAP_ALLOC_NONE, s.colormap, screen_->root, visual);
         }
     }
-    argb_ = argb;
-    window_ = xcb_generate_id(conn_);
+    s.argb = argb;
+    s.window = xcb_generate_id(conn_);
     // 值的顺序必须与掩码位从低到高一致：BACK_PIXEL, BORDER_PIXEL, OVERRIDE_REDIRECT,
     // EVENT_MASK, COLORMAP。ARGB visual 与根窗口深度不同，border/colormap 必须显式给，
     // 否则 CreateWindow 报 BadMatch。
@@ -154,67 +165,77 @@ bool X11CandidatePanel::ensureWindow(bool argb)
         0,
         0,
         1, // override-redirect：不归窗口管理器管，不抢焦点、不加边框
-        XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION
-            | XCB_EVENT_MASK_LEAVE_WINDOW,
-        colormap_ ? colormap_ : screen_->default_colormap,
+        s.interactive ? uint32_t(XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION
+                                 | XCB_EVENT_MASK_LEAVE_WINDOW)
+                      : 0u,
+        s.colormap ? s.colormap : screen_->default_colormap,
     };
-    xcb_create_window(conn_, depth_, window_, screen_->root, 0, 0, 1, 1, 0,
+    xcb_create_window(conn_, s.depth, s.window, screen_->root, 0, 0, 1, 1, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, visual, mask, values);
-    // 给截图 / 调试工具认窗用（`xdotool search --class wind-candidate`）。
-    static const char kClass[] = "wind-candidate\0WindInput";
-    xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, window_, XCB_ATOM_WM_CLASS,
-                        XCB_ATOM_STRING, 8, sizeof(kClass), kClass);
-    static const char kName[] = "WindInput Candidates";
-    xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, window_, XCB_ATOM_WM_NAME,
-                        XCB_ATOM_STRING, 8, sizeof(kName) - 1, kName);
+    // 给截图 / 调试工具认窗用（`xdotool search --classname wind-candidate`）。
+    std::string cls = std::string(s.instance) + '\0' + "WindInput" + '\0';
+    xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, s.window, XCB_ATOM_WM_CLASS,
+                        XCB_ATOM_STRING, 8, uint32_t(cls.size()), cls.data());
+    std::string name = std::string("WindInput ") + s.instance;
+    xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, s.window, XCB_ATOM_WM_NAME,
+                        XCB_ATOM_STRING, 8, uint32_t(name.size()), name.data());
     // 窗口类型提示：合成器据此不给它加阴影/动画（阴影已画在位图里）。
     xcb_atom_t type = internAtom(conn_, "_NET_WM_WINDOW_TYPE");
-    xcb_atom_t popup = internAtom(conn_, "_NET_WM_WINDOW_TYPE_POPUP_MENU");
-    if (type && popup) {
-        xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, window_, type, XCB_ATOM_ATOM, 32, 1,
-                            &popup);
+    xcb_atom_t kind = internAtom(conn_, s.interactive ? "_NET_WM_WINDOW_TYPE_POPUP_MENU"
+                                                      : "_NET_WM_WINDOW_TYPE_TOOLTIP");
+    if (type && kind) {
+        xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, s.window, type, XCB_ATOM_ATOM, 32, 1,
+                            &kind);
     }
-    gc_ = xcb_generate_id(conn_);
-    xcb_create_gc(conn_, gc_, window_, 0, nullptr);
-    WIND_DEBUG() << "候选窗已建：" << (argb_ ? "ARGB（有合成器）" : "根 visual + XShape（无合成器）");
+    // 浮层对鼠标透明：输入区设为空，点击穿透到下面的应用（气泡常弹在光标旁 / 屏幕角）。
+    if (!s.interactive && shapeAvailable_) {
+        xcb_shape_rectangles(conn_, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT,
+                             XCB_CLIP_ORDERING_UNSORTED, s.window, 0, 0, 0, nullptr);
+    }
+    s.gc = xcb_generate_id(conn_);
+    xcb_create_gc(conn_, s.gc, s.window, 0, nullptr);
+    WIND_DEBUG() << s.instance << " 已建："
+                 << (s.argb ? "ARGB（有合成器）" : "根 visual + XShape（无合成器）");
     return true;
 }
 
-void X11CandidatePanel::destroyWindow()
+void X11CandidatePanel::destroyWindow(Surface& s)
 {
+    s.hideTimer.reset();
     if (!conn_) {
         return;
     }
-    if (pixmap_) {
-        xcb_free_pixmap(conn_, pixmap_);
-        pixmap_ = 0;
+    if (s.pixmap) {
+        xcb_free_pixmap(conn_, s.pixmap);
+        s.pixmap = 0;
     }
-    if (gc_) {
-        xcb_free_gc(conn_, gc_);
-        gc_ = 0;
+    if (s.gc) {
+        xcb_free_gc(conn_, s.gc);
+        s.gc = 0;
     }
-    if (window_) {
-        xcb_destroy_window(conn_, window_);
-        window_ = 0;
+    if (s.window) {
+        xcb_destroy_window(conn_, s.window);
+        s.window = 0;
     }
-    if (colormap_) {
-        xcb_free_colormap(conn_, colormap_);
-        colormap_ = 0;
+    if (s.colormap) {
+        xcb_free_colormap(conn_, s.colormap);
+        s.colormap = 0;
     }
-    pixW_ = pixH_ = 0;
-    mapped_ = false;
+    s.pixW = s.pixH = 0;
+    s.mapped = false;
 }
 
-void X11CandidatePanel::upload(const SharedFrame& f)
+void X11CandidatePanel::upload(Surface& s, const SharedFrame& f)
 {
-    if (pixW_ != f.width || pixH_ != f.height) {
-        if (pixmap_) {
-            xcb_free_pixmap(conn_, pixmap_);
+    if (s.pixW != f.width || s.pixH != f.height) {
+        if (s.pixmap) {
+            xcb_free_pixmap(conn_, s.pixmap);
         }
-        pixmap_ = xcb_generate_id(conn_);
-        xcb_create_pixmap(conn_, depth_, pixmap_, window_, uint16_t(f.width), uint16_t(f.height));
-        pixW_ = f.width;
-        pixH_ = f.height;
+        s.pixmap = xcb_generate_id(conn_);
+        xcb_create_pixmap(conn_, s.depth, s.pixmap, s.window, uint16_t(f.width),
+                          uint16_t(f.height));
+        s.pixW = f.width;
+        s.pixH = f.height;
     }
     // 服务端给的是 BGRA 预乘 alpha，小端下恰好就是 32 位 ARGB visual 的像素格式（合成器
     // 也要预乘）。深度 24 的 ZPixmap 同样是每像素 4 字节 BGRx，alpha 字节被忽略。
@@ -233,16 +254,16 @@ void X11CandidatePanel::upload(const SharedFrame& f)
     uint32_t rowsPerChunk = std::max<uint32_t>(1, maxBytes / rowBytes);
     for (uint32_t y = 0; y < f.height; y += rowsPerChunk) {
         uint32_t rows = std::min(rowsPerChunk, f.height - y);
-        xcb_put_image(conn_, XCB_IMAGE_FORMAT_Z_PIXMAP, pixmap_, gc_, uint16_t(f.width),
-                      uint16_t(rows), 0, int16_t(y), 0, depth_, rows * rowBytes,
+        xcb_put_image(conn_, XCB_IMAGE_FORMAT_Z_PIXMAP, s.pixmap, s.gc, uint16_t(f.width),
+                      uint16_t(rows), 0, int16_t(y), 0, s.depth, rows * rowBytes,
                       src + size_t(y) * rowBytes);
     }
     // 位图挂成窗口背景：重绘（被遮挡后露出）由 X 服务器自己做，不用处理 Expose。
-    xcb_change_window_attributes(conn_, window_, XCB_CW_BACK_PIXMAP, &pixmap_);
-    xcb_clear_area(conn_, 0, window_, 0, 0, uint16_t(f.width), uint16_t(f.height));
+    xcb_change_window_attributes(conn_, s.window, XCB_CW_BACK_PIXMAP, &s.pixmap);
+    xcb_clear_area(conn_, 0, s.window, 0, 0, uint16_t(f.width), uint16_t(f.height));
 }
 
-void X11CandidatePanel::applyShape(const SharedFrame& f)
+void X11CandidatePanel::applyShape(Surface& s, const SharedFrame& f)
 {
     if (!shapeAvailable_) {
         return;
@@ -266,8 +287,44 @@ void X11CandidatePanel::applyShape(const SharedFrame& f)
         }
     }
     xcb_shape_rectangles(conn_, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
-                         XCB_CLIP_ORDERING_YX_SORTED, window_, 0, 0, uint32_t(rects.size()),
+                         XCB_CLIP_ORDERING_YX_SORTED, s.window, 0, 0, uint32_t(rects.size()),
                          rects.data());
+}
+
+Rect X11CandidatePanel::workArea() const
+{
+    return Rect{0, 0, screen_->width_in_pixels, screen_->height_in_pixels};
+}
+
+bool X11CandidatePanel::present(Surface& s, const SharedFrame& f, const Rect& r)
+{
+    uint32_t geo[] = {uint32_t(r.x), uint32_t(r.y), f.width, f.height, XCB_STACK_MODE_ABOVE};
+    xcb_configure_window(conn_, s.window,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH
+                             | XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_STACK_MODE,
+                         geo);
+    upload(s, f);
+    if (!s.argb) {
+        applyShape(s, f);
+    }
+    if (!s.mapped) {
+        xcb_map_window(conn_, s.window);
+        s.mapped = true;
+    }
+    xcb_flush(conn_);
+    WIND_DEBUG() << s.instance << " " << f.width << "x" << f.height << " @ (" << r.x << ","
+                 << r.y << ")";
+    return true;
+}
+
+void X11CandidatePanel::unmap(Surface& s)
+{
+    s.hideTimer.reset();
+    if (conn_ && s.window && s.mapped) {
+        xcb_unmap_window(conn_, s.window);
+        xcb_flush(conn_);
+    }
+    s.mapped = false;
 }
 
 bool X11CandidatePanel::show(const SharedFrame& f, int32_t x, int32_t y, bool absolute)
@@ -275,43 +332,84 @@ bool X11CandidatePanel::show(const SharedFrame& f, int32_t x, int32_t y, bool ab
     if (f.width == 0 || f.height == 0 || f.bgra.empty() || !ensureConnection()) {
         return false;
     }
-    bool argb = hasCompositor();
-    if (!ensureWindow(argb)) {
+    if (!ensureWindow(cand_, hasCompositor())) {
         return false;
     }
-    if (bitsPerPixel(conn_, depth_) != 32) {
-        WIND_WARN() << "深度 " << int(depth_) << " 的像素格式不是 32 bpp，候选窗不显示";
+    if (bitsPerPixel(conn_, cand_.depth) != 32) {
+        WIND_WARN() << "深度 " << int(cand_.depth) << " 的像素格式不是 32 bpp，候选窗不显示";
         return false;
     }
-    Rect wa{0, 0, screen_->width_in_pixels, screen_->height_in_pixels};
-    Rect r = placePanel(x, y, int32_t(f.width), int32_t(f.height), wa, absolute);
-    uint32_t geo[] = {uint32_t(r.x), uint32_t(r.y), f.width, f.height, XCB_STACK_MODE_ABOVE};
-    xcb_configure_window(conn_, window_,
-                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH
-                             | XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_STACK_MODE,
-                         geo);
-    upload(f);
-    if (!argb_) {
-        applyShape(f);
-    }
-    if (!mapped_) {
-        xcb_map_window(conn_, window_);
-        mapped_ = true;
-    }
-    xcb_flush(conn_);
-    WIND_DEBUG() << "候选窗 " << f.width << "x" << f.height << " @ (" << r.x << "," << r.y << ")";
-    return true;
+    Rect r = placePanel(x, y, int32_t(f.width), int32_t(f.height), workArea(), absolute);
+    candShiftX_ = r.x - x;
+    candShiftY_ = r.y - y;
+    return present(cand_, f, r);
 }
 
 void X11CandidatePanel::hide()
 {
-    if (conn_ && window_ && mapped_) {
-        xcb_unmap_window(conn_, window_);
-        xcb_flush(conn_);
-    }
-    mapped_ = false;
+    unmap(cand_);
     rects_.clear();
     hover_ = -1;
+    // tooltip 挂在候选窗上：候选窗藏了它必须一起藏（服务端也会推隐藏帧，这里兜底）。
+    hideOverlay(OVERLAY_KIND_TOOLTIP);
+}
+
+X11CandidatePanel::Surface* X11CandidatePanel::overlay(uint32_t kind)
+{
+    if (kind < 1 || kind > kOverlayCount) {
+        return nullptr;
+    }
+    return &overlays_[kind - 1];
+}
+
+bool X11CandidatePanel::showOverlay(uint32_t kind, const SharedFrame& f,
+                                    const OverlayFramePayload& p)
+{
+    Surface* s = overlay(kind);
+    if (!s || f.width == 0 || f.height == 0 || f.bgra.empty() || !ensureConnection()) {
+        return false;
+    }
+    if (!ensureWindow(*s, hasCompositor())) {
+        return false;
+    }
+    if (bitsPerPixel(conn_, s->depth) != 32) {
+        return false;
+    }
+    // 尺寸取像素那一份（通知与 SHM 间无锁，读到的可能已是更新的一帧），内容盒偏移随之不变。
+    OverlayFramePayload geo = p;
+    geo.width = f.width;
+    geo.height = f.height;
+    Rect r = placeOverlay(geo, workArea(), candShiftX_, candShiftY_);
+    present(*s, f, r);
+    s->hideTimer.reset();
+    if (p.durationMs > 0) {
+        s->hideTimer = loop_.addTimeEvent(
+            CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + uint64_t(p.durationMs) * 1000, 0,
+            [this, kind](fcitx::EventSourceTime*, uint64_t) {
+                // 回调里不能销毁正在执行的自己：只摘窗口，计时器对象留到下次 show/hide 再换。
+                if (Surface* o = overlay(kind); o && conn_ && o->window && o->mapped) {
+                    xcb_unmap_window(conn_, o->window);
+                    xcb_flush(conn_);
+                    o->mapped = false;
+                }
+                return true;
+            });
+    }
+    return true;
+}
+
+void X11CandidatePanel::hideOverlay(uint32_t kind)
+{
+    if (Surface* s = overlay(kind)) {
+        unmap(*s);
+    }
+}
+
+void X11CandidatePanel::hideAllOverlays()
+{
+    for (uint32_t k = 1; k <= kOverlayCount; ++k) {
+        hideOverlay(k);
+    }
 }
 
 void X11CandidatePanel::onReadable()
@@ -336,7 +434,7 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
     switch (ev->response_type & 0x7F) {
     case XCB_BUTTON_PRESS: {
         auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
-        if (e->event != window_) {
+        if (e->event != cand_.window) {
             break;
         }
         if (e->detail == 1) {
@@ -351,7 +449,7 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
     }
     case XCB_MOTION_NOTIFY: {
         auto* e = reinterpret_cast<xcb_motion_notify_event_t*>(ev);
-        if (e->event != window_) {
+        if (e->event != cand_.window) {
             break;
         }
         int32_t idx = hitTest(rects_, e->event_x, e->event_y);

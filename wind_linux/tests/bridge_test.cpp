@@ -2,6 +2,7 @@
 // socket 放 $TMPDIR（未设则 /tmp）下的短路径——sun_path 上限 108 字节。
 
 #include "Bridge.h"
+#include "ExtProtocol.h"
 #include "Protocol.h"
 #include "TestHarness.h"
 
@@ -228,6 +229,10 @@ void TestEndpoints()
     setenv("WIND_VARIANT", "DEV", 1);
     CHECK(runtimeDir() == "/run/user/1000/WindInputDev");
     CHECK(shmName() == "/WindInput_SHMDev");
+    CHECK(overlayShmName(OVERLAY_KIND_STATUS) == "/WindInput_SHMDev_STS");
+    CHECK(overlayShmName(OVERLAY_KIND_TOOLTIP) == "/WindInput_SHMDev_TIP");
+    CHECK(overlayShmName(OVERLAY_KIND_TOAST) == "/WindInput_SHMDev_TST");
+    CHECK(overlayShmName(0).empty());
     unsetenv("XDG_RUNTIME_DIR");
     CHECK(runtimeDir() == "/tmp/wind_input_dev");
     unsetenv("WIND_VARIANT");

@@ -33,6 +33,24 @@ constexpr uint16_t CMD_KEY_SEQ = 0x050F;
 constexpr uint16_t CMD_KEY_HOLD = 0x0510;
 constexpr uint16_t CMD_KEY_RELEASE = 0x0511;
 constexpr uint16_t CMD_KEY_TYPE = 0x0512;
+/// 光栅浮层帧（状态气泡 / Toast / tooltip），仅 Linux。布局见 Codec.h `OverlayFramePayload`。
+constexpr uint16_t CMD_OVERLAY_FRAME = 0x0513;
+
+// ── CMD_OVERLAY_FRAME 的枚举（protocol.rs `pub mod overlay`）──
+constexpr uint32_t OVERLAY_KIND_TOOLTIP = 1;
+constexpr uint32_t OVERLAY_KIND_STATUS = 2;
+constexpr uint32_t OVERLAY_KIND_TOAST = 3;
+constexpr uint32_t OVERLAY_PLACE_ABSOLUTE = 0;
+constexpr uint32_t OVERLAY_PLACE_FLIP = 1;
+constexpr uint32_t OVERLAY_PLACE_FOLLOW_CANDIDATE = 2;
+constexpr uint32_t OVERLAY_PLACE_ANCHOR = 3;
+constexpr uint32_t OVERLAY_ANCHOR_CENTER = 1;
+constexpr uint32_t OVERLAY_ANCHOR_TOP_LEFT = 2;
+constexpr uint32_t OVERLAY_ANCHOR_TOP_RIGHT = 3;
+constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_LEFT = 4;
+constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_RIGHT = 5;
+constexpr uint32_t OVERLAY_ANCHOR_TOP_CENTER = 6;
+constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_CENTER = 7;
 
 /// InputScope 的 IS_PASSWORD 位（TSF 枚举 31）。服务端据此对密码框强制英文半角直通；
 /// 与 Swift `InputController.inputScopePasswordBit`、Rust 协调器的判定同值。

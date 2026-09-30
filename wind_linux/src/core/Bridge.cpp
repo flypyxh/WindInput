@@ -1,5 +1,7 @@
 #include "Bridge.h"
 
+#include "ExtProtocol.h"
+
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -149,6 +151,20 @@ std::string pushSocketPath()
 std::string shmName()
 {
     return "/WindInput_SHM" + variantSuffix();
+}
+
+std::string overlayShmName(uint32_t kind)
+{
+    switch (kind) {
+    case OVERLAY_KIND_TOOLTIP:
+        return shmName() + "_TIP";
+    case OVERLAY_KIND_STATUS:
+        return shmName() + "_STS";
+    case OVERLAY_KIND_TOAST:
+        return shmName() + "_TST";
+    default:
+        return {};
+    }
 }
 
 // ── BridgeClient ───────────────────────────────────────────────────
