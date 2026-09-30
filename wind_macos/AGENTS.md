@@ -38,9 +38,20 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 
 `data/system.phrases.toml` 里 `cono` / `coca` / `cohm` / `codl` 按平台各写一份。`wind-phrase`
 的过滤曾经写死只收 `windows`，所以 macOS 上出的一直是 `notepad.exe` / `calc.exe` 那一份，
-`darwin` 条目从未生效过。现已改为按编译目标选平台（`wind-phrase` 的 `CURRENT_PLATFORM`）。
-macOS 上只做了交叉 check；单测在 Linux 上跑的是同一个比对函数，真机效果（`open -a TextEdit` 等）
-尚未验证。
+`darwin` 条目从未生效过。现已改为按编译目标选平台（`wind-phrase` 的 `CURRENT_PLATFORM`，
+`platform = 'macos'` 与 `'darwin'` 等价）。**macOS 行为因此变了**，以下四条从此生效、取代原来的
+Windows 版：
+
+| code | 之前（Windows 版，选中失败或行为不对） | 现在 |
+|---|---|---|
+| `cono` | `proc.run("notepad.exe")` | `proc.run("open", "-a", "TextEdit")`，显示「打开文本编辑」 |
+| `coca` | `proc.run("calc.exe")` | `proc.run("open", "-a", "Calculator")` |
+| `cohm` | `open(env("USERPROFILE"))`（macOS 上为空） | `open(env("HOME"))` |
+| `codl` | `key.seq("Home", "Shift+End", "Backspace")` | `key.seq("Ctrl+A", "Ctrl+K")`（Cocoa 文本框的行首 / 删到行尾） |
+
+本机（Linux）验到的：四条的函数名、参数个数、具名参数都合法，lint 无提示
+（`builtin_platform_phrases::every_platform_entry_calls_only_known_functions_with_valid_arity`），
+按 `darwin` 过滤时每个码恰好一条。macOS 只做了交叉 check，真机效果交 CI / 用户验证。
 
 ### 软键盘：唯一一个由**服务进程自己开窗**的浮层
 

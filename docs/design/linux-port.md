@@ -153,7 +153,7 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 | 位置 | 内容 | 归类 | 处理 |
 |---|---|---|---|
 | `system.phrases.toml` `cono` / `coca` / `cohm` | `notepad.exe` / `calc.exe` / `env("USERPROFILE")` | Windows 专属（已有 `darwin` 对应条目） | 补 `platform = 'linux'` 条目：编辑器、计算器用 `proc.any` 多候选，主目录用 `open(env("HOME"))`（`xdg-open`） |
-| `system.phrases.toml` `codl` | `key.seq("Home", "Shift+End", "Backspace")` | 需按平台写 | **Linux 不出**：addon 没接按键合成（`wind_linux/AGENTS.md` 差距表），写了也不生效 |
+| `system.phrases.toml` `codl` | `key.seq("Home", "Shift+End", "Backspace")` | 需按平台写 | 补 `platform = 'linux'` 条目（与 Windows 同写法）。**依赖按键合成**：addon 目前丢弃 `CMD_KEY_*` 帧，选中暂无效果，addon 接上后自动生效（`wind_linux/AGENTS.md` 差距表） |
 | `system.phrases.toml` 其余 `$CC` | `open(URL)`、`type`、`clip.copy` / `clip.paste`、`ime.*`、`dict.add`、`dict.rev`、`setting.open` | 跨平台 | 不动（`open` → `xdg-open`；`clip.paste` 在 `ext_presenter` 下经上屏通道落文本） |
 | `system.quick.toml` / `system.softkeyboard.toml` / `config.toml` / `schemas/shuangpin.schema.toml` | 注释里的 `%APPDATA%\WindInput\…` 路径；`config.toml` 注释里的 `proc.run("charmap.exe")` 等示例 | 仅文档 | 不动：只在注释里，不执行 |
 | `compat.toml` | 全部内置规则是 Windows 宿主修正 | Windows 专属 | 已由 `scripts/lib/gen-compat.sh` 在打包时换成零规则版 |
@@ -163,8 +163,8 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 **根因不在数据，在过滤。** 短语文件早就用 `platform` 字段按平台写了成对条目，但
 `wind-phrase` 的两个加载入口（`load` / `parse_system_entries`）都写死了只收 `"windows"`，
 所以 Linux 和 macOS 上显示的都是 Windows 那一份，`darwin` 条目从未生效。现在按编译目标
-取当前平台名（`windows` / `darwin` / `linux`，其它平台只收全平台条目），Windows 上的
-取舍不变。入库同步按条目哈希判断，过滤改了之后首次启动就会重新同步，旧行随之清掉。
+取当前平台名（`windows` / `darwin` / `linux`，`macos` 作 `darwin` 的别名；其它平台只收
+全平台条目）。Windows 上的条目集与改动前逐条一致（`builtin_platform_phrases` 用旧规则对拍）。入库同步按条目哈希判断，过滤改了之后首次启动就会重新同步，旧行随之清掉。
 
 **为什么不在打包时生成变体**（`compat.toml` 用的是那种办法）：`compat.toml` 在别的平台上
 一条规则都不保留，生成器只需要截掉规则部分。短语文件不同，绝大多数条目是跨平台的，只有少数几条要按平台
