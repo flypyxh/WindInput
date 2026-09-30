@@ -215,6 +215,9 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
     `expand_candidates` 的到底判据是**引擎条数未增**（`engine_count <= prev_limit`），对所有引擎生效
     ——按可见条数判，一批全被滤掉时会误判到底；重建后可见列表可能变短，由 `clamp_candidate_view`
     夹回页码与高亮。
+- **反查模式**：协调器 `handle_reverse` 把每个通配键位换成 `WILDCARD_SLOT`，经 `Engine::convert_reverse`
+  （同 `wildcard_query`、不看主开关、混输只查主码表），再过 `apply_filter`；翻页扩充 / 末页放宽按 active
+  分流到 `special_buffer`（反查里 `input_buffer` 恒空）。详见 `docs/design/codetable-reverse-mode.md`。
 - **overlay 门控**：临拼 / 快捷输入等 overlay 激活时 `wildcard_enters` 恒 false，不作通配。
 - **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位一律让位（照常出标点），故不动 C++
   透传标点集；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与

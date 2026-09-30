@@ -1,6 +1,6 @@
 # 码表反查模式 / 通配仅单字 / 反查含未启用扩展词库（设计）
 
-> **状态：P1、P2（C 影子层 + 反查索引变体）已实施；P3 待实施。** 实施计划见 `codetable-reverse-mode-plan.md`。承接 `codetable-wildcard.md`（行内通配，已实施）。
+> **状态：P1–P3 已实施**（提交见 git log --grep 反查 / 通配）。实施计划见 `codetable-reverse-mode-plan.md`；实施中偏离见 §8。承接 `codetable-wildcard.md`（行内通配，已实施）。
 > 该文 §8 把「专门的通配/反查模式（首位也想通配）」留待后续，本文即是。
 
 ## 1. 范围
@@ -111,3 +111,48 @@
 | 反查模式内通配不受主开关约束 | 模式本身即显式意图 | 改成受约束只是加一个判断 |
 | 影子层「已启用排前」 | 不让扩展库冲掉常用结果 | 仅调排序 |
 | `lookup_disabled_dicts` 不改普通候选 | 用户只要求反查/通配 | 需要时另立开关 |
+
+## 8. 实施后偏离
+
+实施时读码与执行中发现的、改变了上文字面的点。上文 spec 原文不改，以本节为准。
+
+### 8.1 实施前读码落定
+
+1. **A「截断之前过滤」用加倍重取实现**：词库层 `DictManager::search_pattern` 自己按 `limit` 分档截断，引擎拿到的已是截断后的列表。
+   不改 wind-dict 的 `DictLayer` 接口，在引擎 `wildcard_query` 内加倍重取：过滤后不够 `limit` 且词库未取尽时 `fetch` ×2 重查，直到够数 / 取尽 / 到硬上限
+   `WILDCARD_RESULT_LIMIT`。与生僻字模式「准入下推 + 不足则加大重取」同构；仅单字关时只查一轮，与原实现逐条相同。
+   验收串用 `azzz`（`a???` 等长 4066 条、单字 1342、权重前 100 条里只有 38 个单字），不用 `azz`（`a??` 318 条全是单字，测不出截断先后）。
+2. **命名**：本仓「shadow」已专指候选调整，spec 的「影子层」在代码里叫 `DisabledDictLayers`（`codetable/disabled_dicts.rs`），候选标记叫 `Candidate::from_disabled_dict`。
+3. **「已启用排前」的落点**：协调器 `build_candidates` 会用 `candidate_display_order` 把引擎结果整体重排，只在引擎内排好会被推翻。
+   新增布尔键 `from_disabled_dict`（false 在前），同时插进引擎通配排序与 `candidate_display_order`，位置在 `cmp_exact_first` 之后：等长 / 更长两档不变，档内先启用后未启用。
+4. **失效点**：禁用走「引擎摘层 + 返回 true、不重建」（返回 false 会触发重建，曾让已删词复活）。影子层记住本方案全部扩展库来源与当前启用集，
+   `set_dict_enabled(id, false)` 摘层后调 `mark_disabled(id)`；启用照旧整体失效重建。
+5. **注释反查的范围**：变体索引只供候选注释的 `code_rev` / `code` / `code_rev_all` / `code_all`；加词查重、辅助码来源、悬停 `[编码]`、联想、单字全码表一律用启用集
+   （查重以启用集为准，否则只在未启用库里有的码+词会被误判为已存在）。方案没有未启用扩展库时退化为常规索引，不另建文件。
+6. **反查模式的实现形态**：沿用生僻字先例，`ModeKind::Reverse` 是 special 的参数变体，复用 `special_buffer` 与 `handle_special_key`；候选另写 `build_reverse_candidates`
+   （`convert_reverse` + 常用字判定 + `apply_filter`），并给翻页扩充、末页放宽、放宽失效各补 Reverse 分支。
+7. **引擎入口**：`convert_wildcard` 首行受主开关约束，故新增 `Engine::convert_reverse` / `reverse_wildcard_key`，与 `convert_wildcard` 共用内核 `wildcard_query`；混输只代理主码表，不调拼音。
+8. **不加 `trigger_keys` 与占位组合区配置**：进入键走既有 `key_actions`（动词 `reverse`）与方案页「z 键引导功能」；直达热键的占位组合区固定按开（同生僻字出厂值）。
+   `z_key_action = "reverse"` 需在 `try_z_fallback` 补一臂，否则五笔出厂 `zz*` 短语让首键 z 恒让位、永远进不去。
+9. **词频与候选调整**：模式内上屏的记账码取候选全码；不做词频重排、不吃候选调整（通配串不是任何码位）。
+10. **退出残留**：special 族原本不写 `has_more` / `candidate_limit` / `scope_relaxed`，Reverse 会写；`exit_special_mode` 一并复位（对 Special / RareChar 是空操作）。
+11. **§4.1 措辞**：「`default=false` 即扩展库」以 `DictSpec::is_enabled()` 为准（看 `enabled` / `default` / `default_enabled`）。
+12. **`prefix-hijack-modes.md` §3 清单**的函数名已更正为现名。
+
+### 8.2 执行中新增的裁决
+
+- **首批固定 100**：反查首批恒为 100 条，混输方案也不套 300，因为反查不含拼音，没有拼音那一路要分配额度。
+- **索引串行构建**：常规索引与变体索引串行构建（避免首次开开关时两份并行、内存峰值翻倍）；常规索引被崩溃保护跳过时，变体也放弃。
+- **反查里的右键候选调整只留复制**：查询串不是码位，调整写下去会落到主路径并重建、清空候选。生僻字模式同款问题另立项。
+- **通配键体检只报导航真正吃掉的键**：翻页 / 高亮 / 取消 / 上屏 / 命令 / 单字输入；选词、以词定字、独立辅助码键不吃通配键，不报。
+- **修饰键绑定**：反查绑修饰键（如 `rshift = "reverse"`）在拼音方案里不被吞：让位判定放在「取键字符」之后，无字符的修饰键不进让位分支，照常落回全局链。
+- **失焦复位**：`reset_exclusive_modes` 补复位 `scope_relaxed`，放宽后失焦再打字不处于放宽态（主路径与临拼此前也有同样缺口）。
+- **回车上屏查询串原文**：回车上屏的是缓冲里的查询串（含通配键），不是某个候选，也不是编码；空格 / 数字才上屏候选。
+
+### 8.3 已知遗留
+
+- 通配键与导航键冲突的体检是静态判定，只看配置，不看运行时动态改键。
+- `special_id = 0` 与快符方案 0 撞车（继承自生僻字模式）。
+- 反查候选管线没有 `(text, code)` 去重，也没有「单字输入」开关的处理。
+- 「通配与反查含扩展词库」开着时，热禁用扩展库后通配会重新读入该库（重新 mmap）。
+- 变体索引文件在方案不再有未启用库后成为孤儿文件，不会自动清理。
