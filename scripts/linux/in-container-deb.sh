@@ -28,7 +28,7 @@ install -Dm755 /src/scripts/linux/pkg/windinput-setup "$S/usr/bin/windinput-setu
 install -Dm644 /src/wind_linux/README.md "$S/usr/share/doc/windinput/README.md"
 
 mkdir -p "$S/DEBIAN"
-SIZE=$(du -sk "$S" | cut -f1)
+SIZE=$(du -sk --apparent-size "$S" | cut -f1)
 cat >"$S/DEBIAN/control" <<CONTROL
 Package: windinput
 Version: $DEB_VERSION
