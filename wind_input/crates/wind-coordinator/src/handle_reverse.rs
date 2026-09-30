@@ -124,6 +124,34 @@ impl Coordinator {
         state.has_more = engine_count >= limit;
         engine_count
     }
+
+    /// 反查模式的翻页扩充（`expand_candidates` 开头按 `active` 分流到这里）：判据与主路
+    /// 逐条相同——`limit` ×2 封顶 `CANDIDATE_LIMIT_CAP`、重建后夹回页码 / 高亮、到底看
+    /// **引擎条数**是否超过上一批（spec codetable-wildcard §11 契约 3）。
+    ///
+    /// 与主路的差别只在候选来源：主路 `build_candidates` 读 `input_buffer`，在本模式恒空，
+    /// 走它会把反查候选整份清掉。组合区由 `build_reverse_candidates` 按缓冲原样重写
+    /// （本模式组合区不随高亮变），故不调 `sync_preedit_to_highlight`；也不展开繁简变体
+    /// （首批构建本就没展开，扩充须与之一致）。
+    pub(crate) fn expand_reverse_candidates(&self, state: &mut State) {
+        if !state.has_more {
+            return;
+        }
+        let new_limit =
+            (state.candidate_limit.saturating_mul(2)).min(wind_engine::engine::CANDIDATE_LIMIT_CAP);
+        if new_limit <= state.candidate_limit {
+            state.has_more = false;
+            return;
+        }
+        let prev_limit = state.candidate_limit;
+        let engine_count = self.build_reverse_candidates(state, new_limit);
+        self.clamp_candidate_view(state);
+        if engine_count <= prev_limit {
+            // 引擎没给出新东西：到底。`build_reverse_candidates` 已把 limit 写成 new_limit，还原。
+            state.has_more = false;
+            state.candidate_limit = prev_limit;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +373,30 @@ mod tests {
         assert_eq!(inserted(&act), Some("甲"));
         assert_eq!(c.debug_active_mode(), Some("reverse"));
         assert_eq!(c.debug_preedit(), "\\");
+    }
+
+    /// 扩充到底：引擎条数没超过上一批 ⇒ `has_more` 落假、`candidate_limit` 还原成上一批；
+    /// 越界的页码 / 高亮夹回范围（不 panic），且不退模式、候选不被清空（主路 `build_candidates`
+    /// 读恒空的 `input_buffer`，走它会整份清掉）。
+    #[test]
+    fn expand_reverse_stops_when_engine_gives_nothing_new() {
+        let (c, _g) = coord("exp", |_| {});
+        key(&c, VK_BACKSLASH, false);
+        letters(&c, "zb");
+        {
+            let mut st = c.state.lock().unwrap();
+            st.has_more = true; // 伪造「首批满额」
+            st.current_page = 7;
+            st.selected_index = 3;
+            c.expand_candidates(&mut st);
+            assert!(!st.has_more, "引擎只有 2 条，没超过上一批 ⇒ 到底");
+            assert_eq!(st.candidate_limit, crate::wildcard::WILDCARD_INITIAL_LIMIT);
+            assert_eq!(st.current_page, 0, "页码夹回");
+            assert!(st.selected_index < st.candidates.len(), "高亮夹回");
+        }
+        assert_eq!(c.debug_active_mode(), Some("reverse"));
+        assert_eq!(c.debug_all_candidate_texts(), ["甲", "丁"]);
+        assert_eq!(c.debug_preedit(), "\\zb");
     }
 
     /// ★ 裁决 13：退出时翻页 / 放宽三位一并复位。上面的端到端用例候选不足一批、放宽也没触发，

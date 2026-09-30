@@ -2390,6 +2390,11 @@ impl Coordinator {
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤ [`wind_engine::engine::CANDIDATE_LIMIT_CAP`]）重新加载，保持当前页/高亮。
     pub(crate) fn expand_candidates(&self, state: &mut State) {
+        // 反查模式的码在 `special_buffer`（`input_buffer` 恒空）：须在下面按 `input_buffer`
+        // 判的守卫之前分流，否则会走主路 `build_candidates` 把反查候选清空。
+        if matches!(state.active, Some(ModeKind::Reverse)) {
+            return self.expand_reverse_candidates(state);
+        }
         if !state.has_more || state.candidate_input != state.input_buffer {
             return;
         }
