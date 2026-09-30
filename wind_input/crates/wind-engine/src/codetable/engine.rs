@@ -255,6 +255,12 @@ pub struct CodeTableEngine {
     ///
     /// `None`（无 store 的测试 / CLI）⇒ 段候选不做调整，退回纯词库序。
     segment_shadow: Option<(Arc<wind_store::Store>, String)>,
+    /// 影子层：本方案未启用的扩展词库（reverse-mode spec §4.2，计划裁决 3）。
+    ///
+    /// ★ **只在 [`Self::wildcard_query`] 读**——普通 `convert`（打字候选、活码探针、顶码、自动上屏复评）
+    /// 读它就是把未启用库漏进打字候选，spec §4.2「打字候选不受影响」的保证全靠这一条。
+    /// `None` = 开关关 / 无未启用库 / 测试未注入。
+    disabled_dicts: Option<super::DisabledDictLayers>,
 }
 
 impl CodeTableEngine {
@@ -302,6 +308,7 @@ impl CodeTableEngine {
             // 空集只会让热插拔退化成「失效重建」，不会给出错误答案。
             own_extra_dicts: std::collections::HashSet::new(),
             segment_shadow: None,
+            disabled_dicts: None,
         }
     }
 
@@ -322,6 +329,17 @@ impl CodeTableEngine {
     pub fn with_own_extra_dicts<I: IntoIterator<Item = String>>(mut self, ids: I) -> Self {
         self.own_extra_dicts = ids.into_iter().collect();
         self
+    }
+
+    /// 注入影子层（未启用扩展词库，只给通配 / 反查查询用）。见 [`Self::disabled_dicts`] 字段。
+    pub fn with_disabled_dicts(mut self, d: super::DisabledDictLayers) -> Self {
+        self.disabled_dicts = Some(d);
+        self
+    }
+
+    /// 影子层（未注入为 `None`）。
+    pub fn disabled_dicts(&self) -> Option<&super::DisabledDictLayers> {
+        self.disabled_dicts.as_ref()
     }
 
     /// 指明**整句词频**的来源目录（见 `sentence::SentenceFreq`）。词库到首次整句解码时才读。
@@ -668,8 +686,17 @@ impl CodeTableEngine {
                 let got =
                     self.dm
                         .search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix);
-                let exhausted = got.len() < fetch;
-                hits = got;
+                // 影子层（未启用扩展库，spec §4.2）：只在这里读，普通 convert 不看它。
+                let disabled_hits = self
+                    .disabled_dicts
+                    .as_ref()
+                    .map(|d| {
+                        d.search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix)
+                    })
+                    .unwrap_or_default();
+                // 两边都没取满才算取尽；没有影子层时 `0 < fetch` 恒真 ⇒ 与原判据相同。
+                let exhausted = got.len() < fetch && disabled_hits.len() < fetch;
+                hits = merge_disabled_hits(got, disabled_hits);
                 if !self.opts.wildcard_single_only {
                     break;
                 }
@@ -691,7 +718,13 @@ impl CodeTableEngine {
             })
             .collect();
         let base_cmp = self.opts.base_sort.cmp();
-        candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
+        // 未启用库的键放在 `cmp_exact_first` 之后（计划裁决 4，与 `candidate_display_order` 同位）：
+        // 等长 / 更长两档不变，档内先启用后未启用；两条非未启用候选间恒 Equal ⇒ 既有次序不变。
+        candidates.sort_by(|a, b| {
+            cmp_exact_first(a, b)
+                .then(a.from_disabled_dict.cmp(&b.from_disabled_dict))
+                .then_with(|| base_cmp(a, b))
+        });
         candidates.truncate(limit);
         let is_empty = candidates.is_empty();
         ConvertResult {
@@ -701,6 +734,26 @@ impl CodeTableEngine {
             ..Default::default()
         }
     }
+}
+
+/// 通配结果合并影子层命中（spec §4.2）：以 `(text, code)` 为键先收已启用的，再追加键未出现过的
+/// 影子层命中并置 `from_disabled_dict`——同键留已启用那条（沿用 Composite 的去重语义）。
+fn merge_disabled_hits(enabled: Vec<Candidate>, disabled: Vec<Candidate>) -> Vec<Candidate> {
+    if disabled.is_empty() {
+        return enabled;
+    }
+    let mut seen: std::collections::HashSet<(String, String)> = enabled
+        .iter()
+        .map(|c| (c.text.clone(), c.code.clone()))
+        .collect();
+    let mut out = enabled;
+    for mut c in disabled {
+        if seen.insert((c.text.clone(), c.code.clone())) {
+            c.from_disabled_dict = true;
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Engine for CodeTableEngine {
@@ -736,6 +789,10 @@ impl Engine for CodeTableEngine {
         // 未启用，关闭三者后「甘蓝菜」仍在。
         self.dm
             .unregister_layer(&format!("codetable-extra-{dict_id}"));
+        // 它从此是「未启用库」：进影子层（通配 / 反查仍可查到），计划裁决 5。
+        if let Some(d) = &self.disabled_dicts {
+            d.mark_disabled(dict_id);
+        }
         true
     }
 
@@ -2662,5 +2719,133 @@ mod tests {
         let r = e.convert_wildcard("qz", &slot_pattern("q?"), 50).unwrap();
         let got: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(got, ["👨‍👩‍👧", "🇨🇳", "工"]);
+    }
+
+    fn disabled_mem(id: &str, entries: &[(&str, &str, i32)]) -> super::super::DisabledDictSource {
+        let owned: Vec<(String, String, i32)> = entries
+            .iter()
+            .map(|(c, t, w)| (c.to_string(), t.to_string(), *w))
+            .collect();
+        super::super::DisabledDictSource {
+            id: id.into(),
+            base_order: 3,
+            default_weight: None,
+            load: Arc::new(move || {
+                let mut d = CodetableDict::empty();
+                for (i, (c, t, w)) in owned.iter().enumerate() {
+                    d.merge_single(c.clone(), t.clone(), *w, i as i32);
+                }
+                Ok(CachedDict::Memory(d))
+            }),
+        }
+    }
+
+    fn with_xz(e: CodeTableEngine) -> CodeTableEngine {
+        e.with_disabled_dicts(super::super::DisabledDictLayers::new(
+            vec![disabled_mem(
+                "xz",
+                &[("uuia", "门头沟区", 9999), ("uuia", "重码", 9999)],
+            )],
+            std::iter::empty(),
+            None,
+        ))
+    }
+
+    /// ★ Review Focus 1：普通 convert（精确 / 前缀 / 活码探针同一入口）永不读影子层，连加载都不触发。
+    #[test]
+    fn plain_convert_never_touches_disabled_layers() {
+        let e = with_xz(engine_opts(
+            &[("uuif", "立法", 10)],
+            wildcard_opts(CommitOptions::default()),
+        ));
+        for input in ["uuia", "uui", "u"] {
+            let r = e.convert(input, 50).unwrap();
+            assert!(r.candidates.iter().all(|c| c.text != "门头沟区"), "{input}");
+        }
+        assert_eq!(
+            e.disabled_dicts().unwrap().load_count(),
+            0,
+            "普通 convert 不触发加载"
+        );
+        e.convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+            .unwrap();
+        assert_eq!(e.disabled_dicts().unwrap().load_count(), 1);
+        assert!(
+            e.convert("uuia", 50)
+                .unwrap()
+                .candidates
+                .iter()
+                .all(|c| c.text != "门头沟区")
+        );
+    }
+
+    /// spec §4.2：`(text, code)` 去重（同键留已启用那条），已启用排前，档内再按 base_sort。
+    #[test]
+    fn wildcard_merges_disabled_after_enabled_dedup_by_text_code() {
+        let e = with_xz(engine_opts(
+            &[("uuif", "立法", 10), ("uuia", "重码", 1)],
+            wildcard_opts(CommitOptions::default()),
+        ));
+        let r = e
+            .convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+            .unwrap();
+        let got: Vec<(&str, &str, bool)> = r
+            .candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c.code.as_str(), c.from_disabled_dict))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("立法", "uuif", false),
+                ("重码", "uuia", false),
+                ("门头沟区", "uuia", true)
+            ]
+        );
+    }
+
+    /// 计划裁决 5：禁用一个已加载的扩展库 ⇒ 主 dm 摘层（普通候选消失），同时它进影子层（通配仍可见）；
+    /// 返回值语义不变（true = 目标态已达成）。
+    #[test]
+    fn set_dict_enabled_disable_moves_dict_into_disabled_layers() {
+        let build = |entries: &[(&str, &str, i32)]| {
+            let mut d = CodetableDict::empty();
+            for (i, (code, text, w)) in entries.iter().enumerate() {
+                d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+            }
+            CachedDict::Memory(d)
+        };
+        let dm = Arc::new(DictManager::new());
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            build(&[("uuif", "立法", 10)]),
+            "codetable-system",
+        )));
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            build(&[("aaae", "甘蓝菜", 50)]),
+            "codetable-extra-ext",
+        )));
+        let e = CodeTableEngine::new(4, wildcard_opts(CommitOptions::default()), dm)
+            .with_own_extra_dicts(["ext".to_string()])
+            .with_disabled_dicts(super::super::DisabledDictLayers::new(
+                vec![disabled_mem("ext", &[("aaae", "甘蓝菜", 50)])],
+                ["ext".to_string()],
+                None,
+            ));
+        assert!(e.set_dict_enabled("ext", false));
+        assert!(
+            e.convert("aaae", 20)
+                .unwrap()
+                .candidates
+                .iter()
+                .all(|c| c.text != "甘蓝菜")
+        );
+        let r = e
+            .convert_wildcard("aaaz", &slot_pattern("aaa?"), 20)
+            .unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .any(|c| c.text == "甘蓝菜" && c.from_disabled_dict)
+        );
     }
 }
