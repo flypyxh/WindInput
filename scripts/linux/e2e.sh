@@ -188,7 +188,10 @@ if [[ "${WIND_E2E_X11:-1}" != 0 ]]; then
     mkdir -p "$W/shots"
     export WIND_E2E_SHOTS="$W/shots"
 fi
-fcitx5 --disable=all --enable=keyboard,dbus,dbusfrontend,windinput \
+# kimpanel：客户端扮演 KDE/GNOME 的面板，点状态区动作「清风输入法菜单」（空闲时的主菜单入口）。
+# 菜单空闲超时调短到 5 秒，好让「超时自动收起」这条兜底在 e2e 里跑得到（出厂 60 秒）。
+export WIND_MENU_IDLE_TIMEOUT_MS=5000
+fcitx5 --disable=all --enable=keyboard,dbus,dbusfrontend,kimpanel,windinput \
     --verbose="windinput=5,default=3,key_trace=5" >"$W/fcitx5.log" 2>&1 &
 FCITX=$!
 for _ in $(seq 1 100); do
