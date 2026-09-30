@@ -547,14 +547,18 @@ impl Coordinator {
         if !action.is_enabled() {
             return Some("显式 none");
         }
+        let ch = keymap::vk_to_prefix_char_with_letters(key_code)?;
         // 反查模式只在码表 / 五笔拼音混输方案里有意义（活跃引擎给得出反查通配键）。
         // 放在字母 / 符号分流之前：符号键在拼音方案里也让位，照常产出标点（spec §3.1）；
         // 字母键在码表里仍走下面的活码前缀判据，在混输里仍走「字母键仅码表引擎」判据。
+        //
+        // ⚠️ 必须在上一行（无字符的修饰键早退）**之后**：修饰键的 keyup 通路把 Yield 当
+        // 「显式 none」吞键，排在前面会让拼音方案里绑了反查的 RShift 连中英切换都失效；
+        // 修饰键保持原通路——Act 后门卫没过返回 None，落回全局链。
         if matches!(action, BoundAction::Reverse) && self.engine_mgr.active_reverse_key().is_none()
         {
             return Some("反查模式仅码表 / 五笔拼音混输方案生效");
         }
-        let ch = keymap::vk_to_prefix_char_with_letters(key_code)?;
         if !ch.is_ascii_alphabetic() {
             return None; // 符号键：不让位，也不限引擎
         }

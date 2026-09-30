@@ -13,6 +13,7 @@ const VK_NEXT: u32 = 0x22;
 const VK_BACK: u32 = 0x08;
 const VK_OEM_MINUS: u32 = 0xBD;
 const VK_OEM_1: u32 = 0xBA;
+const VK_RSHIFT: u32 = 0xA1;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -363,4 +364,37 @@ fn reverse_wildcard_key_on_nav_key_is_reported() {
     key(&c, VK_OEM_1, false);
     assert_eq!(c.debug_active_mode(), Some("reverse"));
     assert_eq!(c.debug_preedit(), "\\a;", "`;` 作通配进了缓冲");
+}
+
+/// 修饰键绑反查、在拼音方案里按：门卫没过必须**不吞键**，落回全局链照常切中英
+/// （出厂 `toggle_mode_keys` 含 rshift）。反查让位判据若排在修饰键早退之前，keyup 通路会把
+/// Yield 当「显式 none」吞掉，RShift 在拼音方案里彻底没反应。
+#[test]
+fn reverse_modifier_binding_in_pinyin_still_toggles_mode() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.schema.available = vec!["pinyin".into(), "wubi86".into()];
+    cfg.schema.active = "pinyin".into();
+    cfg.keys
+        .key_actions
+        .insert("rshift".into(), "reverse".into());
+    assert!(
+        cfg.keys.toggle_mode_keys.iter().any(|k| k == "rshift"),
+        "前置：rshift 出厂是 toggle_mode 键"
+    );
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    assert!(c.is_chinese_mode());
+    c.handle_key_event(&KeyEventData {
+        key_code: VK_RSHIFT,
+        scan_code: 0,
+        modifiers: 0,
+        event_type: wind_ipc::protocol::EVENT_KEY_UP,
+        toggles: 0,
+        event_seq: 0,
+        prev_char: 0,
+    });
+    assert!(!c.is_chinese_mode(), "门卫没过不吞键：RShift 照常切中英");
 }

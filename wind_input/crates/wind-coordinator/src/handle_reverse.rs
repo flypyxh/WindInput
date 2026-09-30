@@ -35,6 +35,9 @@ impl Coordinator {
     }
 
     /// 这个键是否绑了反查动词（方案 `[key_actions]` → 全局 → `z_key_action` 三层链）。
+    ///
+    /// 只查绑定，不含可用性（`input.reverse.enabled` / 活跃方案有无反查通配键），与
+    /// `is_temp_pinyin_trigger` 同口径；可用性门卫在 [`Self::reverse_mode_available`]。
     pub(crate) fn is_reverse_trigger(&self, key_code: u32) -> bool {
         matches!(
             self.bound_action_for(key_code),
