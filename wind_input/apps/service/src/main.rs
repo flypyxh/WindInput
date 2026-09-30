@@ -1032,10 +1032,42 @@ fn open_existing_mutex(wide_name: &[u16]) -> bool {
     true
 }
 
-#[cfg(not(windows))]
+/// macOS 由 launchd 保证单实例，这里不重复检查。
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn check_singleton() -> SingletonCheck {
-    // 非 Windows 平台：暂不实现单例检查
-    SingletonCheck::Acquired(SingletonGuard {})
+    SingletonCheck::Acquired(SingletonGuard { _lock: None })
+}
+
+/// Linux：运行时目录下的 `wind_input.lock` 上持 `flock`（进程退出内核自动释放，崩溃也不留脏锁）。
+///
+/// 必须有：addon 会在连不上服务时自动拉起它，而服务首次启动要建词库缓存（十几秒）才绑 socket，
+/// 期间 addon 可能再拉一次；没有单例的话第二个实例会 `remove_file` 掉第一个的 socket 再自己绑，
+/// 把第一个实例架空。
+#[cfg(target_os = "linux")]
+fn check_singleton() -> SingletonCheck {
+    use std::os::fd::AsRawFd;
+    let dir = wind_bridge::endpoint::runtime_dir(wind_config::variant::pipe_suffix());
+    let _ = std::fs::create_dir_all(&dir);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("wind_input.lock"))
+    {
+        Ok(f) => f,
+        // 建不出锁文件（目录只读等）：宁可放行也不要因此起不来；后果仅是失去单例保护。
+        Err(_) => return SingletonCheck::Acquired(SingletonGuard { _lock: None }),
+    };
+    // SAFETY: fd 在 `file` 存活期内有效；flock 只读该 fd。
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return SingletonCheck::Acquired(SingletonGuard { _lock: Some(file) });
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+        SingletonCheck::AlreadyRunning
+    } else {
+        SingletonCheck::Acquired(SingletonGuard { _lock: None })
+    }
 }
 
 /// 单例守卫：析构时释放 Mutex
@@ -1052,7 +1084,10 @@ impl Drop for SingletonGuard {
 }
 
 #[cfg(not(windows))]
-struct SingletonGuard {}
+struct SingletonGuard {
+    /// 持有即持锁（Linux）；仅靠 Drop 关闭 fd 来释放，故字段本身不被读取。
+    _lock: Option<std::fs::File>,
+}
 
 /// 非 Windows 没有 Named Mutex，guard 是空壳；这里仍显式实现 `Drop`，是为了让调用点的
 /// `drop(_singleton_guard)`（重启前先释放单例，让新实例能拿到所有权）在两个平台上表达

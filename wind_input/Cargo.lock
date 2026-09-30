@@ -2820,6 +2820,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "file-rotate",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
