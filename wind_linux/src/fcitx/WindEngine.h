@@ -12,6 +12,7 @@
 #include "Bridge.h"
 #include "KeyMap.h"
 #include "ResponseRouter.h"
+#include "ServiceLauncher.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
@@ -43,6 +44,8 @@ public:
 
 private:
     // ── 连接 ──
+    /// 连不上服务时按节流拉起它（服务自己持单例锁，重复拉起无害）。
+    ServiceLauncher launcher_;
     bool ensureConnected();
     bool reconnect();
     /// 在 request 连接上发一帧、读响应；连接失败时重连并**重试一次**（服务重启后的第一个键

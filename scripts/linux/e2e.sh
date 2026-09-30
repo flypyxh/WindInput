@@ -45,6 +45,8 @@ rm -rf "$W"
 mkdir -p "$W"/{svc,rt,xdg/config,xdg/data,xdg/cache,fcitx}
 cleanup() {
     [[ -f "$W/svc.pid" ]] && kill "$(cat "$W/svc.pid")" 2>/dev/null || true
+    # 自动拉起模式下服务由 addon 起，pid 不归我们；按本次独有的完整路径杀。
+    pkill -f -- "^$W/svc/wind_input" 2>/dev/null || true
     if [[ -z "${KEEP:-}" ]]; then rm -rf "$W"; else log "保留临时目录 $W"; fi
 }
 trap cleanup EXIT
@@ -118,15 +120,23 @@ done
 exit 1
 RESTART
 chmod +x "$W/restart-service.sh"
-export WIND_E2E_RESTART="$W/restart-service.sh"
-"$W/restart-service.sh" || true
-SVC=$(cat "$W/svc.pid")
-for _ in $(seq 1 300); do
-    [[ -S "$W/rt/bridge.sock" && -S "$W/rt/bridge_push.sock" ]] && break
-    sleep 0.1
-done
-[[ -S "$W/rt/bridge.sock" ]] || { echo "E2E FAIL: 服务 30s 内没起 socket"; tail -20 "$W/service.stdout"; exit 1; }
-echo "[e2e] 服务已就绪 (pid $SVC)"
+if [[ "${WIND_E2E_AUTOSPAWN:-0}" != 0 ]]; then
+    # 自动拉起模式：不预先起服务，验证 addon 在连不上时自己把它带起来（打包后的真实场景）。
+    # 拉起的服务不归本脚本管，故不设重启用例。
+    export WIND_INPUT_SERVICE="$W/svc/wind_input"
+    SVC=""
+    echo "[e2e] 自动拉起模式：不预启服务，由 addon 拉起 $WIND_INPUT_SERVICE"
+else
+    export WIND_E2E_RESTART="$W/restart-service.sh"
+    "$W/restart-service.sh" || true
+    SVC=$(cat "$W/svc.pid")
+    for _ in $(seq 1 300); do
+        [[ -S "$W/rt/bridge.sock" && -S "$W/rt/bridge_push.sock" ]] && break
+        sleep 0.1
+    done
+    [[ -S "$W/rt/bridge.sock" ]] || { echo "E2E FAIL: 服务 30s 内没起 socket"; tail -20 "$W/service.stdout"; exit 1; }
+    echo "[e2e] 服务已就绪 (pid $SVC)"
+fi
 
 export FCITX_CONFIG_HOME="$W/fcitx"
 export FCITX_ADDON_DIRS="$ADDON_BUILD:$SDK_ROOT/usr/lib/$MULTIARCH/fcitx5"
@@ -168,7 +178,7 @@ set +e
 "$WIND_LINUX_SDK/venv/bin/python" "$REPO/scripts/linux/e2e_client.py"
 RC=$?
 set -e
-kill $FCITX "$(cat "$W/svc.pid")" $COMP $XVFB 2>/dev/null || true
+kill $FCITX $(cat "$W/svc.pid" 2>/dev/null) $COMP $XVFB 2>/dev/null || true
 wait $FCITX 2>/dev/null || true
 exit $RC
 ' && RC=0 || RC=$?

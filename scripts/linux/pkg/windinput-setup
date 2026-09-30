@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# 清风输入法 Linux 版：一次性配置当前用户的 Fcitx5。安装 .deb 后运行一次，然后重新登录。
+#
+#   windinput-setup [--schema pinyin|wubi86] [--no-im-config]
+#
+# 做四件事（都只动当前用户的文件，且幂等）：
+#   1. Fcitx5 输入法组里加入「清风输入法」；
+#   2. 清空 Fcitx5 的 AltTriggerKeys——出厂是左 Shift，会在清风之前把 Shift 单击截走，
+#      「Shift 切中英」就永远到不了输入法；
+#   3. 用户配置里没有 config.toml 时写入初始方案（默认全拼；已有则不动）；
+#   4. 用 im-config 把当前用户的输入法框架切到 fcitx5（GTK/Qt/XIM 环境变量）。
+set -euo pipefail
+
+SCHEMA=pinyin
+IMCONFIG=1
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --schema) SCHEMA="${2:?--schema 需要参数}"; shift 2 ;;
+        --no-im-config) IMCONFIG=0; shift ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        *) echo "未知参数: $1" >&2; exit 2 ;;
+    esac
+done
+case "$SCHEMA" in pinyin|wubi86) ;; *) echo "--schema 只支持 pinyin / wubi86" >&2; exit 2 ;; esac
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
+mkdir -p "$CFG/fcitx5"
+
+python3 - "$CFG/fcitx5" <<'PY'
+import os, re, sys
+d = sys.argv[1]
+
+# ── profile：保证 Default 组里有 windinput ──
+p = os.path.join(d, "profile")
+if not os.path.exists(p):
+    open(p, "w").write("""[Groups/0]
+Name=Default
+Default Layout=us
+DefaultIM=windinput
+
+[Groups/0/Items/0]
+Name=keyboard-us
+Layout=
+
+[Groups/0/Items/1]
+Name=windinput
+Layout=
+
+[GroupOrder]
+0=Default
+""")
+    print("已创建 fcitx5 profile（键盘 us + 清风输入法）")
+else:
+    s = open(p).read()
+    if re.search(r"^Name=windinput$", s, re.M):
+        print("fcitx5 profile 里已有清风输入法")
+    else:
+        # 追加到 Groups/0 的末尾：找已有最大的 Items 序号。
+        idx = [int(m) for m in re.findall(r"^\[Groups/0/Items/(\d+)\]", s, re.M)]
+        n = (max(idx) + 1) if idx else 0
+        item = f"[Groups/0/Items/{n}]\nName=windinput\nLayout=\n\n"
+        if re.search(r"^\[GroupOrder\]", s, re.M):
+            s = re.sub(r"^\[GroupOrder\]", item + "[GroupOrder]", s, count=1, flags=re.M)
+        else:
+            s += "\n" + item
+        open(p, "w").write(s)
+        print(f"已把清风输入法加入现有 fcitx5 profile（Items/{n}）")
+
+# ── config：清空 AltTriggerKeys ──
+c = os.path.join(d, "config")
+sect = "[Hotkey/AltTriggerKeys]"
+s = open(c).read() if os.path.exists(c) else ""
+if sect in s:
+    # 该段到下一个 [ 之间的内容整个清掉
+    s2 = re.sub(r"(\[Hotkey/AltTriggerKeys\]\n)(?:(?!\[).*\n?)*", r"\1\n", s, count=1)
+else:
+    s2 = s + ("" if s.endswith("\n") or not s else "\n") + sect + "\n\n"
+if s2 != s:
+    open(c, "w").write(s2)
+    print("已清空 fcitx5 的 AltTriggerKeys（不再抢 Shift 单击）")
+else:
+    print("fcitx5 的 AltTriggerKeys 已是空")
+PY
+
+WCFG="$CFG/WindInput"
+if [[ ! -e "$WCFG/config.toml" ]]; then
+    mkdir -p "$WCFG"
+    cat >"$WCFG/config.toml" <<EOT
+[schema]
+active = "$SCHEMA"
+available = ["pinyin", "wubi86"]
+EOT
+    echo "已写入 $WCFG/config.toml（方案：$SCHEMA）"
+else
+    echo "$WCFG/config.toml 已存在，不改动"
+fi
+
+if [[ $IMCONFIG -eq 1 ]]; then
+    if command -v im-config >/dev/null; then
+        im-config -n fcitx5 && echo "已用 im-config 切到 fcitx5"
+    else
+        echo "未找到 im-config，请自行设置 GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx"
+    fi
+fi
+
+cat <<'MSG'
+
+配置完成。请【注销并重新登录】使输入法框架切换生效。登录后：
+  - Ctrl+Space 切换到清风输入法（或直接在输入法列表选择）；
+  - 首次使用服务要建词库缓存，十几秒内按键可能没有反应，属正常；
+  - 日志：~/.local/share/WindInput/logs/wind_input.1.log
+MSG

@@ -1,6 +1,7 @@
 #include "WindEngine.h"
 
 #include "ExtProtocol.h"
+#include "ServiceLauncher.h"
 #include "Protocol.h"
 #include "Utf.h"
 #include "X11Panel.h"
@@ -140,6 +141,8 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
         dispatcher_.schedule([this, f = std::move(f)]() mutable { onPushFrame(std::move(f)); });
     });
     push_->start();
+    // 引擎一加载就把服务带起来，让它趁用户还没开始打字时完成词库加载。
+    ensureConnected();
     WIND_INFO() << "WindInput 引擎已加载，服务端点 " << requestSocketPath();
 }
 
@@ -169,6 +172,11 @@ bool WindEngine::reconnect()
         return true;
     }
     WIND_DEBUG() << "连不上服务: " << bridge_.lastError();
+    // 服务没在跑（或刚被杀）：拉起它。本次仍返回 false（这一键透传），服务就绪后由下一次
+    // 按键的重连接上；首次启动要建词库缓存，期间按键都会透传，这是已知代价。
+    if (launcher_.maybeLaunch()) {
+        WIND_INFO() << "服务未运行，已尝试拉起 " << servicePath();
+    }
     return false;
 }
 
