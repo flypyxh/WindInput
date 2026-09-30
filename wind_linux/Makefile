@@ -8,10 +8,11 @@
 CXX ?= g++
 BUILD ?= build/tests
 CXXFLAGS ?= -std=c++17 -O1 -g -Wall -Wextra -Werror -pthread
-CPPFLAGS += -Iinclude -DWIND_PROTOCOL_RS=\"$(abspath ../wind_input/crates/wind-ipc/src/protocol.rs)\"
+CPPFLAGS += -Iinclude -DWIND_PROTOCOL_RS=\"$(abspath ../wind_input/crates/wind-ipc/src/protocol.rs)\" \
+	-DWIND_REPO_DIR=\"$(abspath ..)\"
 
 CORE_SRC := $(wildcard src/core/*.cpp)
-TESTS := codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test settings_launcher_test menu_test host_ui_test overlay_input_test
+TESTS := codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test settings_launcher_test menu_test host_ui_test overlay_input_test keysynth_test
 
 .PHONY: test clean
 test: $(addprefix $(BUILD)/,$(TESTS))

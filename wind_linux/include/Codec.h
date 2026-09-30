@@ -155,6 +155,19 @@ std::optional<DeferredCompositionPayload> decodeCommitAndHold(const Bytes& p);
 /// CMD_KEY_TYPE：整段 UTF-8（无长度前缀）。
 std::string decodeKeyType(const Bytes& p);
 
+/// 命令直通车按键合成的一个组合（`Ctrl+C` → key "c"、mods {"ctrl"}）。服务端
+/// `handle_cmdbar_macos.rs::split_combo` 已归一：key 小写规范名，mods ⊆ {ctrl, shift, alt, win}
+/// （未知修饰名原样小写透传）。
+struct KeyComboPayload {
+    std::string key;
+    std::vector<std::string> mods;
+};
+/// CMD_KEY_TAP / CMD_KEY_HOLD / CMD_KEY_RELEASE：keyLen u32 + key + modCount u32 +
+/// modCount × (modLen u32 + mod)。对位 Rust `codec.rs::push_key_combo`、Swift `decodeCombo`。
+std::optional<KeyComboPayload> decodeKeyCombo(const Bytes& p);
+/// CMD_KEY_SEQ：comboCount u32 + comboCount × combo（布局同上）。
+std::optional<std::vector<KeyComboPayload>> decodeKeySeq(const Bytes& p);
+
 struct HostRenderFramePayload {
     uint32_t seq = 0;
     int32_t x = 0; // 逻辑点（top-left），Linux 上 scale 恒 1 ⇒ 即物理像素

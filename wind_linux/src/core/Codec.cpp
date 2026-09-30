@@ -358,6 +358,52 @@ std::string decodeKeyType(const Bytes& p)
     return std::string(p.begin(), p.end());
 }
 
+namespace {
+
+/// 读一个 combo；计数先与剩余字节比对（每项至少 4 字节长度前缀），免得坏帧里的巨大计数
+/// 先把内存撑爆再发现读不下去。
+bool readKeyCombo(Reader& r, KeyComboPayload& out)
+{
+    out.key = r.str(r.u32());
+    uint32_t n = r.u32();
+    if (!r.has(size_t(n) * 4)) {
+        return false;
+    }
+    out.mods.reserve(n);
+    for (uint32_t i = 0; i < n && r.ok; ++i) {
+        out.mods.push_back(r.str(r.u32()));
+    }
+    return r.ok;
+}
+
+} // namespace
+
+std::optional<KeyComboPayload> decodeKeyCombo(const Bytes& p)
+{
+    Reader r(p);
+    KeyComboPayload out;
+    if (!readKeyCombo(r, out)) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+std::optional<std::vector<KeyComboPayload>> decodeKeySeq(const Bytes& p)
+{
+    Reader r(p);
+    uint32_t n = r.u32();
+    if (!r.has(size_t(n) * 8)) {
+        return std::nullopt;
+    }
+    std::vector<KeyComboPayload> out(n);
+    for (auto& c : out) {
+        if (!readKeyCombo(r, c)) {
+            return std::nullopt;
+        }
+    }
+    return out;
+}
+
 std::optional<HostRenderFramePayload> decodeHostRenderFrame(const Bytes& p)
 {
     if (p.size() < 24) {
