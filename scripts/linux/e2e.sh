@@ -99,6 +99,9 @@ export W SDK_ROOT MULTIARCH ADDON_BUILD REPO
 dbus-run-session -- bash -c '
 set -euo pipefail
 export WIND_INPUT_RUNTIME_DIR="$W/rt"
+# 控制 RPC（`wind_input ui toast` 等 CLI 走它）的 socket 在 $XDG_RUNTIME_DIR 下、不认
+# WIND_INPUT_RUNTIME_DIR：也指进临时目录，免得与本机真服务或并发的另一份 e2e 串台。
+export XDG_RUNTIME_DIR="$W/rt"
 export XDG_CONFIG_HOME="$W/xdg/config" XDG_DATA_HOME="$W/xdg/data" XDG_CACHE_HOME="$W/xdg/cache"
 export TMPDIR=/tmp/wi-linux
 

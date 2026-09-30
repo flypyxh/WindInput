@@ -112,9 +112,10 @@ def sh(*args):
     return subprocess.run(args, capture_output=True, text=True).stdout
 
 
-def candidate_window():
-    """找候选窗（WM_CLASS=wind-candidate），返回 (id, x, y, w, h, 是否可见)；没建过返回 None。"""
-    ids = sh("xdotool", "search", "--classname", "wind-candidate").split()
+def candidate_window(classname="wind-candidate"):
+    """按 WM_CLASS 实例名找窗（候选窗 wind-candidate；浮层 wind-status / wind-toast /
+    wind-tooltip），返回 (id, x, y, w, h, 是否可见)；没建过返回 None。"""
+    ids = sh("xdotool", "search", "--classname", classname).split()
     if not ids:
         return None
     wid = ids[0]
@@ -260,6 +261,124 @@ async def x11_cases(bus, im):
     if win:
         screenshot("candidate_flipped")
     await c.key("Escape")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
+async def wait_window(classname, visible, timeout=3.0):
+    """等某个窗口进入指定可见态，返回最后一次查到的窗口信息（超时也返回，由调用方断言）。"""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        win = candidate_window(classname)
+        if (win is not None and win[5]) == visible:
+            return win
+        if asyncio.get_running_loop().time() >= deadline:
+            return win
+        await asyncio.sleep(0.05)
+
+
+def window_has_content(wid, name):
+    """截窗口自身像素存 PNG，返回 (路径, 颜色种数)。"""
+    path, px = screenshot(name, wid)
+    info = sh("xwininfo", "-id", wid)
+    w = h = 0
+    for line in info.splitlines():
+        if line.strip().startswith("Width"):
+            w = int(line.split(":", 1)[1])
+        if line.strip().startswith("Height"):
+            h = int(line.split(":", 1)[1])
+    colors = {px(x, y) for x in range(0, w, max(1, w // 60)) for y in range(0, h, max(1, h // 20))}
+    return path, len(colors)
+
+
+async def overlay_cases(bus, im):
+    """光栅浮层：状态气泡 / Toast / 悬停提示。服务光栅化 → 各层 SHM → CMD_OVERLAY_FRAME →
+    addon 各自一个 override-redirect 窗口。断言窗口出现、位置合理、有像素、到点消失。
+    字形对不对要看截图（路径打印在输出里）。"""
+    c = await new_ctx(bus, im, "e2e-overlay")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+
+    # a) Shift 单击切中英：光标下方弹状态气泡，几秒后自己消失（计时在 addon）。
+    await c.tap_shift()
+    win = await wait_window("wind-status", True)
+    check("浮层：Shift 切中英后状态气泡出现", win is not None and win[5], f"window={win}")
+    if win and win[5]:
+        _, x, y, w, h, _ = win
+        print(f"  状态气泡：{w}x{h} @ ({x},{y})，光标 (300,400) 行高 20", flush=True)
+        check("浮层：状态气泡落在光标下方附近", 280 <= x <= 330 and 410 <= y <= 450,
+              f"@({x},{y})")
+        path, n = window_has_content(win[0], "status_toggle_en")
+        check("浮层：状态气泡有绘制（不是单色）", n > 1, f"{n} 种颜色，截图 {path}")
+        print(f"  状态气泡截图：{path}", flush=True)
+        win = await wait_window("wind-status", False, timeout=8.0)
+        check("浮层：状态气泡到点自动消失", win is not None and not win[5], f"window={win}")
+    await c.tap_shift()  # 切回中文
+    await wait_window("wind-status", True)
+
+    # b) Ctrl+Shift+E 切方案：气泡文字换成方案名（字形看截图）。
+    await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, False, 0)
+    await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, True, 0)
+    await asyncio.sleep(0.3)
+    win = await wait_window("wind-status", True)
+    ok = win is not None and win[5]
+    check("浮层：Ctrl+Shift+E 切方案后状态气泡出现", ok, f"window={win}")
+    if ok:
+        path, n = window_has_content(win[0], "status_switch_schema")
+        check("浮层：切方案气泡有绘制", n > 1, f"{n} 种颜色，截图 {path}")
+        print(f"  切方案气泡截图：{path}", flush=True)
+        full, _ = screenshot("status_switch_schema_screen")
+        print(f"  全屏截图：{full}", flush=True)
+    await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, False, 0)
+    await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, True, 0)
+    await asyncio.sleep(0.3)
+
+    # c) Toast：`wind_input ui toast` 经 RPC 让在线服务弹一条（右上角，1.5 秒）。
+    svc = os.path.join(os.environ.get("W", ""), "svc", "wind_input")
+    r = await asyncio.to_thread(subprocess.run,
+                                [svc, "ui", "toast", "输入法已就绪", "--pos", "top_right",
+                                 "--ms", "1500"], capture_output=True, text=True)
+    win = await wait_window("wind-toast", True)
+    ok = win is not None and win[5]
+    check("浮层：ui toast 后 Toast 出现", ok,
+          f"window={win} cli rc={r.returncode} {r.stderr.strip()[:200]}")
+    if ok:
+        _, x, y, w, h, _ = win
+        print(f"  Toast：{w}x{h} @ ({x},{y})，屏幕 1280x800", flush=True)
+        check("浮层：Toast 在右上角（离边留白）", x + w >= 1280 - 40 and y <= 40, f"@({x},{y})")
+        path, n = window_has_content(win[0], "toast_top_right")
+        check("浮层：Toast 有绘制", n > 1, f"{n} 种颜色，截图 {path}")
+        print(f"  Toast 截图：{path}", flush=True)
+        win = await wait_window("wind-toast", False, timeout=6.0)
+        check("浮层：Toast 到点自动消失", win is not None and not win[5], f"window={win}")
+
+    # d) 悬停提示：鼠标停在候选上 → 候选窗旁出现 tooltip；Esc 收掉候选窗时一起藏。
+    await c.type("nihao")
+    await asyncio.sleep(0.4)
+    cand = candidate_window()
+    tip = None
+    if cand and cand[5]:
+        _, x, y, w, h, _ = cand
+        for dx in range(6, w, 10):
+            sh("xdotool", "mousemove", str(x + dx), str(y + h // 2))
+            tip = await wait_window("wind-tooltip", True, timeout=0.6)
+            if tip and tip[5]:
+                break
+    ok = tip is not None and tip[5]
+    check("浮层：鼠标悬停候选后 tooltip 出现", ok, f"tooltip={tip} candidate={cand}")
+    if ok:
+        _, tx, ty, tw, th, _ = tip
+        print(f"  tooltip：{tw}x{th} @ ({tx},{ty})，候选窗 {cand[3]}x{cand[4]} @ ({cand[1]},{cand[2]})",
+              flush=True)
+        check("浮层：tooltip 在候选窗下方", ty >= cand[2] + cand[4] // 2, f"tooltip@({tx},{ty})")
+        path, n = window_has_content(tip[0], "tooltip_hover")
+        check("浮层：tooltip 有绘制", n > 1, f"{n} 种颜色，截图 {path}")
+        print(f"  tooltip 截图：{path}", flush=True)
+        full, _ = screenshot("tooltip_hover_screen")
+        print(f"  全屏截图：{full}", flush=True)
+    await c.key("Escape")
+    tip = await wait_window("wind-tooltip", False, timeout=2.0)
+    check("浮层：候选窗收起时 tooltip 一起隐藏", tip is None or not tip[5], f"tooltip={tip}")
+    sh("xdotool", "mousemove", "5", "5")
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
 
@@ -426,6 +545,7 @@ async def main():
     await p.ic.call_focus_out()
     if os.environ.get("DISPLAY"):
         await x11_cases(bus, im)
+        await overlay_cases(bus, im)
         await a.ic.call_focus_in()
         await asyncio.sleep(0.2)
 
