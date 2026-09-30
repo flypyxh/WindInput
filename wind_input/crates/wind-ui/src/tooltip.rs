@@ -69,6 +69,15 @@ struct HitState {
     text_box: Option<TextBox>,
 }
 
+impl HitState {
+    /// 客户区（位图内）坐标 → 点中的段 / 原始行；落在文本块外为 `None`。
+    fn hit_at(&self, cx: i32, cy: i32) -> Option<TooltipHit> {
+        self.text_box
+            .and_then(|b| b.line_at(cx, cy))
+            .and_then(|i| self.doc.hit_at_line(i))
+    }
+}
+
 /// 文本块矩形 + 行数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TextBox {
@@ -360,15 +369,11 @@ impl TooltipMouse {
     fn request_menu(&self, (sx, sy): (i32, i32), (cx, cy): (i32, i32)) {
         self.requested_at.set(Some(std::time::Instant::now()));
         let hits = self.hits.borrow();
-        let hit: Option<TooltipHit> = hits
-            .text_box
-            .and_then(|b| b.line_at(cx, cy))
-            .and_then(|i| hits.doc.hit_at_line(i));
         let _ = self.events.send(UiEvent::RequestTooltipMenu {
             x: sx,
             y: sy,
             candidate: hits.candidate,
-            hit,
+            hit: hits.hit_at(cx, cy),
             doc_fingerprint: hits.doc.fingerprint(),
         });
     }
@@ -1024,6 +1029,15 @@ impl Tooltip {
             software_shadow: has_shadow,
             place: ol::tooltip_place(row, (cw, ch), beside),
         })
+    }
+
+    /// Linux 外部宿主：addon 报来「右键点在提示位图内 `(cx, cy)`」，按最近一次渲染换算成
+    /// `RequestTooltipMenu` 要带的 `(候选页内下标, 命中, 指纹)`——与 Windows 气泡自己收到
+    /// `WM_RBUTTONDOWN` 时（`TooltipMouse::request_menu`）同一套命中。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn menu_request_at(&self, cx: i32, cy: i32) -> (i32, Option<TooltipHit>, u64) {
+        let hits = self.hits.borrow();
+        (hits.candidate, hits.hit_at(cx, cy), hits.doc.fingerprint())
     }
 }
 

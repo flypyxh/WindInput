@@ -194,11 +194,13 @@ impl Coordinator {
 ///
 /// 非法/缺字段/越界一律返回 `None` 交调用方忽略，而不是取 0 兜底：位置类消息拿默认值
 /// 比丢掉一次拖动坏得多——`(0,0)` 会被当成合法坐标落盘，候选窗就此跑到屏幕左上角。
-/// `menu.open` 的 body：`{"target":i32,"x":i32,"y":i32,"work":[左,上,右,下]}`。
+/// `menu.open` 的 body：`{"target":i32,"x":i32,"y":i32,"work":[左,上,右,下],"lx":i32,"ly":i32}`。
 /// 缺 `target` / 坐标即整条不认；`work` 缺省或不成形按「没有工作区」（全 0）处理——
-/// 菜单仍能弹，只是不做翻转，越界交给 addon 那边看得见的溢出。
+/// 菜单仍能弹，只是不做翻转，越界交给 addon 那边看得见的溢出。`lx`/`ly`（右键点在悬停提示
+/// 位图内的坐标）只有悬停提示菜单带，缺了按 `None`。
 #[cfg(all(target_os = "linux", ext_presenter))]
-fn decode_menu_open(body: &[u8]) -> Option<(i32, i32, i32, [i32; 4])> {
+fn decode_menu_open(body: &[u8]) -> Option<crate::handle_menu::MenuOpenRequest> {
+    use crate::handle_menu::MenuOpenRequest;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let int = |v: &serde_json::Value| v.as_i64().and_then(|n| i32::try_from(n).ok());
     let target = int(v.get("target")?)?;
@@ -212,7 +214,14 @@ fn decode_menu_open(body: &[u8]) -> Option<(i32, i32, i32, [i32; 4])> {
             *slot = int(n).unwrap_or(0);
         }
     }
-    Some((target, x, y, work))
+    let local = v.get("lx").and_then(int).zip(v.get("ly").and_then(int));
+    Some(MenuOpenRequest {
+        target,
+        x,
+        y,
+        work,
+        local,
+    })
 }
 
 fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
@@ -497,7 +506,7 @@ impl MessageHandler for Coordinator {
             // Linux addon：右键候选 / 候选窗空白处 / Fcitx5 状态区入口请求打开自绘菜单。
             #[cfg(all(target_os = "linux", ext_presenter))]
             ext_kind::MENU_OPEN => match decode_menu_open(body) {
-                Some((target, x, y, work)) => self.open_menu_from_host(target, x, y, work),
+                Some(req) => self.open_menu_from_host(req),
                 None => tracing::warn!("menu.open 载荷无法解析，忽略"),
             },
             // Linux addon：菜单被 addon 自己收掉了（超时 / 失焦 / 服务重启 / 抓不住指针…）。

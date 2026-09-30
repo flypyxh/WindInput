@@ -2079,6 +2079,17 @@ impl CandidateWindow {
             .render_overlay(&code, hover, row, beside)
     }
 
+    /// Linux 外部宿主：右键点在提示位图内 `(cx, cy)` → `(候选页内下标, 命中, 指纹)`，
+    /// 见 [`Tooltip::menu_request_at`]。气泡渲染器没建起来时为 `None`。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn tooltip_menu_request_at(
+        &self,
+        cx: i32,
+        cy: i32,
+    ) -> Option<(i32, Option<wind_ui_types::TooltipHit>, u64)> {
+        Some(self.tooltip.as_ref()?.menu_request_at(cx, cy))
+    }
+
     /// **内容**左上 → **窗口**左上（减去软阴影扩边）。
     ///
     /// 落盘的 custom_x/y 记的是内容左上（用户视觉上看到的窗口边缘），而 Win32 定位用的是

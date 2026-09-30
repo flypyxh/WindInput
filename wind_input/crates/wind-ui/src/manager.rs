@@ -495,9 +495,11 @@ impl UiManager {
                     UiCommand::HideMenu => {
                         hide_popup_menu(&mut popup_menu, &mut candidate_window);
                     }
-                    // 外部宿主（Linux addon）专用：本渲染端的菜单窗口自己收鼠标消息、按显示器
-                    // 自查工作区，协调器也只在 Linux 形态下发这两条。
-                    UiCommand::MenuPointer { .. } | UiCommand::SetWorkArea { .. } => {}
+                    // 外部宿主（Linux addon）专用：本渲染端的菜单 / 气泡窗口自己收鼠标消息、按
+                    // 显示器自查工作区，协调器也只在 Linux 形态下发这几条。
+                    UiCommand::MenuPointer { .. }
+                    | UiCommand::SetWorkArea { .. }
+                    | UiCommand::TooltipMenuAt { .. } => {}
                     UiCommand::CopyToClipboard(text) => {
                         crate::popup_menu::set_clipboard_text(&text);
                     }

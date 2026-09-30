@@ -154,6 +154,19 @@ pub mod menu_pointer {
     pub const MENU_POINTER_PRESS: u32 = 2;
 }
 
+/// 扩展信封 [`ext_kind::MENU_OPEN`] 的 `target` 里「不是候选」的几档（≥ 0 是候选页内下标）。
+/// 名字全局唯一，`protocol_sync_test` 逐个比对。
+pub mod menu_target {
+    /// 功能主菜单（候选窗空白处 / 翻页按钮 / Fcitx5 状态区入口）。
+    pub const MENU_TARGET_MAIN: i32 = -1;
+    /// 状态提示气泡的右键菜单（Windows `RequestStatusMenu`）。
+    pub const MENU_TARGET_STATUS: i32 = -2;
+    /// 悬停提示的右键菜单（Windows `RequestTooltipMenu`）：body 另带 `lx`/`ly`——右键点在
+    /// 提示**位图内**的坐标（含软阴影扩边，同 Windows 的客户区坐标）。按段 / 按行的命中在
+    /// 服务端做：文本块的排布只有光栅化的一方知道。
+    pub const MENU_TARGET_TOOLTIP: i32 = -3;
+}
+
 /// [`UiElementStatePayload::flags`] bit0：宿主接管绘制（`BeginUIElement` 回了 `pbShow=FALSE`，
 /// 或此后 `ITfUIElement::Show(FALSE)`）。置位 ⇒ 服务端对该 pid 不弹自己的候选窗。
 pub const UIELEMENT_FLAG_HOST_DRAWS: u32 = 0x0001;
@@ -351,11 +364,13 @@ pub mod ext_kind {
     pub const SHOT_RESULT: &str = "shot.result";
     /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 [`POS_CANDIDATE`]。body 空。
     pub const POS_CANDIDATE_QUERY: &str = "pos.candidate.query";
-    /// 下行：问 `.app` 状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。body 空。
+    /// 下行：问宿主（`.app` / Linux addon）状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。
+    /// body 空。气泡不在屏上时不答（协调器保留旧值）。
     pub const POS_STATUS_TIP_QUERY: &str = "pos.status_tip.query";
     /// 上行（Linux addon）：请求打开自绘菜单。body =
-    /// `{"target":-1|<页内下标>,"x":..,"y":..,"work":[左,上,右,下]}`——`target` ≥ 0 为该候选的
-    /// 右键菜单，-1 为功能主菜单；`(x, y)` 是菜单左上角的锚点（屏幕坐标），`work` 是锚点所在
+    /// `{"target":<页内下标>|<menu_target>,"x":..,"y":..,"work":[左,上,右,下]}`——`target` ≥ 0
+    /// 为该候选的右键菜单，负值见 [`super::menu_target`]（主菜单 / 状态气泡 / 悬停提示，后者
+    /// 另带 `"lx":..,"ly":..`）；`(x, y)` 是菜单左上角的锚点（屏幕坐标），`work` 是锚点所在
     /// 工作区（服务端据此做翻转 / 子菜单左右展开，屏幕几何只有 addon 拿得到）。
     pub const MENU_OPEN: &str = "menu.open";
     /// 上行（Linux addon）：addon 自己把菜单收掉了（空闲超时、失焦、服务重启、抓不住指针…），

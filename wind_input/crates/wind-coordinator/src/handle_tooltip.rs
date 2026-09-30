@@ -186,6 +186,11 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = target;
         self.mark_menu_open(0, String::new());
+        // Linux：气泡依附于候选，候选收起时菜单失去对象，与候选右键菜单同样随之收掉（见
+        // `notify_ui_hide`）。Windows 那边 `HideCandidates` 本就连带收掉任何菜单。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.candidate_menu_open
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
             anchor: MenuAnchor::at_point(x, y),
@@ -602,10 +607,10 @@ mod tests {
 
     /// 候选已变：复制照常（取快照），上屏放弃并 Toast。
     ///
-    /// 仅进程内自绘菜单的形态：用例靠「菜单开着时 Esc 被菜单消费」来关菜单，而外部宿主形态
-    /// （macOS / Linux `linux-host`）刻意不转发菜单键（见 message_handler 的 `forward_menu_key`
-    /// 门控——没有菜单窗口时吞键会让 `menu_open` 永不复位、输入卡死），Esc 会落到别处。
-    #[cfg(not(ext_presenter))]
+    /// 仅自绘菜单的形态（Windows / Linux `linux-host`）：用例靠「菜单开着时 Esc 被菜单消费」
+    /// 来关菜单。macOS 刻意不转发菜单键（见 message_handler 的 `forward_menu_key` 门控——
+    /// 菜单是 `.app` 的原生 NSMenu，吞键会让 `menu_open` 永不复位、输入卡死），Esc 会落到别处。
+    #[cfg(any(not(ext_presenter), target_os = "linux"))]
     #[test]
     fn changed_candidate_still_copies_but_refuses_commit() {
         let Some((c, rx, _u)) = typed("stale") else {

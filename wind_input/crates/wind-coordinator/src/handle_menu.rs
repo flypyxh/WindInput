@@ -38,6 +38,22 @@ pub(crate) fn menu_idle_expired(
     touched_at.is_some_and(|t| now.saturating_duration_since(t) >= timeout)
 }
 
+/// 解好的扩展信封 `menu.open`（Linux addon 请求打开自绘菜单），见
+/// [`Coordinator::open_menu_from_host`]。
+#[cfg(all(target_os = "linux", ext_presenter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MenuOpenRequest {
+    /// ≥ 0：候选页内下标；负值见 `wind_ipc::protocol::menu_target`。
+    pub(crate) target: i32,
+    /// 菜单锚点（屏幕坐标）。
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    /// 锚点所在工作区 (左, 上, 右, 下)；全 0 = 没报。
+    pub(crate) work: [i32; 4],
+    /// 右键点在悬停提示位图内的坐标（仅悬停提示菜单带）。
+    pub(crate) local: Option<(i32, i32)>,
+}
+
 /// `MenuCmd::ToggleToolbar` 的菜单文案。两平台**同一个命令、不同的 UI 实体**，故文案分平台：
 /// Windows 下它显隐的是跟随光标的悬浮工具栏窗口；macOS 下 `UpdateToolbar` 被
 /// `manager_macos` 编码成 mode_status 帧，最终落到 `ModeStatusController` 的
@@ -2210,11 +2226,14 @@ impl Coordinator {
         self.clear_tooltip_menu_flag();
     }
 
-    /// addon 请求打开菜单（`menu.open`，右键候选 / 右键候选窗空白处 / Fcitx5 状态区入口）。
-    /// `target` ≥ 0 为候选右键菜单（页内下标），否则为功能主菜单；`work` = (左, 上, 右, 下)。
+    /// addon 请求打开菜单（`menu.open`：右键候选 / 候选窗空白处 / 状态气泡 / 悬停提示，或
+    /// Fcitx5 状态区入口）。`target` ≥ 0 为候选右键菜单（页内下标），负值见
+    /// [`wind_ipc::protocol::menu_target`]，未知负值按主菜单；`work` = (左, 上, 右, 下)。
     #[cfg(all(target_os = "linux", ext_presenter))]
-    pub(crate) fn open_menu_from_host(&self, target: i32, x: i32, y: i32, work: [i32; 4]) {
-        let [left, top, right, bottom] = work;
+    pub(crate) fn open_menu_from_host(&self, req: MenuOpenRequest) {
+        use wind_ipc::protocol::menu_target::*;
+        let [left, top, right, bottom] = req.work;
+        let (x, y) = (req.x, req.y);
         // 工作区先于菜单到 UI 线程：同一条命令通道保序，`show` 定位时已是新值。
         let _ = self.ui_tx.send(UiCommand::SetWorkArea {
             left,
@@ -2222,10 +2241,22 @@ impl Coordinator {
             right,
             bottom,
         });
-        if target >= 0 {
-            self.show_candidate_menu(target as usize, x, y);
-        } else {
-            self.show_main_menu(MenuAnchor::at_point(x, y));
+        match req.target {
+            t if t >= 0 => self.show_candidate_menu(t as usize, x, y),
+            MENU_TARGET_STATUS => self.show_status_menu(x, y),
+            // 命中（按段 / 按行）要提示文本块的排布，只有渲染端知道：先让 UI 换算，它回
+            // `RequestTooltipMenu`，再走与 Windows 同一个 `show_tooltip_menu`。缺位图内坐标
+            // 就按 (-1, -1)——落在文本块外，等同 Windows 点在内边距上（只给整体操作）。
+            MENU_TARGET_TOOLTIP => {
+                let (local_x, local_y) = req.local.unwrap_or((-1, -1));
+                let _ = self.ui_tx.send(UiCommand::TooltipMenuAt {
+                    x,
+                    y,
+                    local_x,
+                    local_y,
+                });
+            }
+            _ => self.show_main_menu(MenuAnchor::at_point(x, y)),
         }
     }
 
@@ -4505,6 +4536,101 @@ mod linux_menu_tests {
             br#"{"target":0,"x":1,"y":2,"work":[0,0,100,100]}"#,
         );
         assert!(!c.is_menu_open(), "没有候选就不弹、也不能标记为打开");
+    }
+
+    /// 状态气泡右键（target = MENU_TARGET_STATUS）→ 与 Windows `RequestStatusMenu` 同一个菜单。
+    #[test]
+    fn host_open_on_status_tip_shows_status_menu() {
+        let (c, rx) = coord();
+        c.handle_ext(
+            wind_ipc::protocol::ext_kind::MENU_OPEN,
+            br#"{"target":-2,"x":50,"y":60,"work":[0,0,1280,800]}"#,
+        );
+        let items = drain(&rx)
+            .into_iter()
+            .find_map(|m| match m {
+                UiCommand::ShowCandidateMenu { items, anchor }
+                    if (anchor.x, anchor.y) == (50, 60) =>
+                {
+                    Some(items)
+                }
+                _ => None,
+            })
+            .expect("状态气泡菜单没弹");
+        assert_eq!(
+            labels(&items),
+            [
+                "常驻显示",
+                "焦点切换时显示",
+                "固定位置",
+                "恢复默认位置",
+                "截图此窗口"
+            ]
+        );
+        assert!(c.is_menu_open());
+    }
+
+    /// 悬停提示右键（target = MENU_TARGET_TOOLTIP）：命中要 UI 换算，先发 `TooltipMenuAt`
+    /// （带位图内坐标），菜单此时还没开；UI 回 `RequestTooltipMenu` 才弹，且菜单随候选收起。
+    #[test]
+    fn host_open_on_tooltip_asks_ui_for_the_hit_then_opens_candidate_bound_menu() {
+        let (c, rx) = coord();
+        c.handle_ext(
+            wind_ipc::protocol::ext_kind::MENU_OPEN,
+            br#"{"target":-3,"x":50,"y":60,"work":[0,0,1280,800],"lx":7,"ly":8}"#,
+        );
+        let cmds = drain(&rx);
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                UiCommand::TooltipMenuAt {
+                    x: 50,
+                    y: 60,
+                    local_x: 7,
+                    local_y: 8
+                }
+            )),
+            "{cmds:?}"
+        );
+        assert!(!c.is_menu_open(), "命中回来之前不算打开");
+
+        c.handle_ext(
+            wind_ipc::protocol::ext_kind::MENU_OPEN,
+            br#"{"target":-3,"x":1,"y":2,"work":[0,0,1280,800]}"#,
+        );
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::TooltipMenuAt {
+                    local_x: -1,
+                    local_y: -1,
+                    ..
+                }
+            )),
+            "缺位图内坐标按文本块外处理"
+        );
+
+        with_candidate(&c);
+        drain(&rx);
+        c.handle_ui_event(wind_ui_types::UiEvent::RequestTooltipMenu {
+            x: 50,
+            y: 60,
+            candidate: 0,
+            hit: None,
+            doc_fingerprint: 0,
+        });
+        assert!(
+            drain(&rx)
+                .iter()
+                .any(|m| matches!(m, UiCommand::ShowCandidateMenu { .. })),
+            "UI 回来后照 Windows 同一路弹菜单"
+        );
+        assert!(c.is_menu_open());
+        c.notify_ui_hide();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)),
+            "候选收起：提示菜单失去对象，与候选右键菜单一样收掉"
+        );
     }
 
     #[test]

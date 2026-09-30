@@ -237,6 +237,16 @@ pub enum UiCommand {
         right: i32,
         bottom: i32,
     },
+    /// 外部宿主（Linux addon）报上来的「右键悬停提示」：`(x, y)` 屏幕坐标（菜单锚点），
+    /// `(local_x, local_y)` 右键点在提示位图内的坐标。按段 / 按行的命中要文本块的排布，只有
+    /// 渲染端知道，故由渲染端换算后回送 `UiEvent::RequestTooltipMenu`——与 Windows 气泡自己
+    /// 收到右键时同一个事件。Windows 气泡窗口自己收鼠标消息，从不下发本命令。
+    TooltipMenuAt {
+        x: i32,
+        y: i32,
+        local_x: i32,
+        local_y: i32,
+    },
     /// 写剪贴板（菜单"复制"由协调器驱动 → UI 侧执行）
     CopyToClipboard(String),
     /// 用资源管理器打开路径（菜单"打开配置目录"）

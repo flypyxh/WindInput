@@ -601,8 +601,25 @@ impl Forwarder {
             // 状态气泡 / 悬停提示的截图：**像素不在本进程**（这两者是 `.app` 侧的原生
             // NSPanel，服务端只下发文本与配色），故转成一次下行请求由那边动手。
             // 文件名与随后的 Toast 文案仍留在服务端决定，与 Windows 逐字一致。
+            #[cfg(target_os = "macos")]
             UiCommand::ScreenshotStatusTip { dir } => self.request_panel_shot("status_tip", &dir),
+            #[cfg(target_os = "macos")]
             UiCommand::ScreenshotTooltip { dir } => self.request_panel_shot("tooltip", &dir),
+            // Linux 反过来：浮层是本进程光栅化的，像素就在该层 SHM 里，就地截（同候选窗）。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::ScreenshotStatusTip { dir } => self.shoot_overlay(
+                wind_ipc::protocol::overlay::OVERLAY_KIND_STATUS,
+                "status_tip",
+                "状态提示气泡",
+                &dir,
+            ),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::ScreenshotTooltip { dir } => self.shoot_overlay(
+                wind_ipc::protocol::overlay::OVERLAY_KIND_TOOLTIP,
+                "tooltip",
+                "提示气泡",
+                &dir,
+            ),
             // 协调器把定位方式切到 fixed 时问「你现在在哪」，好把当前位置落盘成 custom_x/y
             // ——否则窗口会跳到上次保存（往往是 0,0）的坐标。
             //
@@ -688,6 +705,36 @@ impl Forwarder {
                 right,
                 bottom,
             } => self.menu.set_work_area(left, top, right, bottom),
+            // 右键悬停提示：命中按本进程最近一次画的那一帧算（与 Windows 气泡自己收右键同一套），
+            // 回 `RequestTooltipMenu` 让协调器核对指纹、弹菜单。提示已不在屏上（addon 报上来
+            // 的途中被收了）就不弹——菜单会指着一个看不见的东西。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::TooltipMenuAt {
+                x,
+                y,
+                local_x,
+                local_y,
+            } => {
+                let shown = self
+                    .overlays
+                    .is_shown(wind_ipc::protocol::overlay::OVERLAY_KIND_TOOLTIP);
+                match self.win.tooltip_menu_request_at(local_x, local_y) {
+                    Some((candidate, hit, doc_fingerprint)) if shown => {
+                        let _ = self.ev_tx.send(UiEvent::RequestTooltipMenu {
+                            x,
+                            y,
+                            candidate,
+                            hit,
+                            doc_fingerprint,
+                        });
+                    }
+                    _ => tracing::debug!("右键悬停提示时提示已不在屏上，不弹菜单"),
+                }
+            }
+            // 气泡 / 提示「菜单开着时别自动消失」：Linux 上这份保持由 addon 自己做（它知道菜单
+            // 开没开、指针在哪，自动隐藏的计时也在它那边），服务端没有要跟着动的状态。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetTooltipMenuOpen(_) | UiCommand::SetStatusMenuOpen(_) => {}
             // 其余未接的变体（截图族 / 输入诊断 HUD / 拖动落点回报 / 候选右键菜单键盘
             // 导航 / 工具栏位置）见 wind_macos/AGENTS.md「与 Windows 的功能差距」表。
             // 新接一个就从那张表里划掉一行。
@@ -745,8 +792,54 @@ impl Forwarder {
         Some((f.buf, f.width, f.height))
     }
 
+    /// Linux：状态气泡 / 悬停提示右键菜单里的「截图此窗口」。像素在本进程（该层 SHM），与
+    /// 候选窗截图同一路数：存盘 + 进剪贴板在后台线程做（外部命令可能卡），文件名与 Toast
+    /// 文案与 Windows `manager.rs` 的同名分支逐字一致。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn shoot_overlay(
+        &self,
+        kind: u32,
+        file_tag: &'static str,
+        label: &'static str,
+        dir: &std::path::Path,
+    ) {
+        let shot = self.overlays.snapshot(kind);
+        let path = dir.join(format!("{file_tag}_{}.png", crate::screenshot::timestamp()));
+        let sink = Arc::clone(&self.sink);
+        let toast = self.overlays.toast_handle();
+        spawn_screenshot_work(file_tag, move || {
+            let (msg, kind) = match shot {
+                Some((buf, w, h)) => match crate::screenshot::save_bgra_to_png(&buf, w, h, &path) {
+                    Ok(()) => {
+                        tracing::info!("Screenshot saved: {:?}", path);
+                        let clip = crate::screenshot::copy_bgra_to_clipboard(&buf, w, h);
+                        if let Err(e) = &clip {
+                            tracing::warn!("Screenshot {file_tag} clipboard: {e}");
+                        }
+                        let suffix = if clip.is_ok() {
+                            "（已复制到剪贴板）"
+                        } else {
+                            ""
+                        };
+                        (
+                            format!("{label}已截图{suffix}\n{}", path.display()),
+                            ToastKind::Success,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!("Screenshot {file_tag}: {e}");
+                        (format!("截图失败：{e}"), ToastKind::Error)
+                    }
+                },
+                None => (format!("{label}未显示，无法截图"), ToastKind::Info),
+            };
+            toast.show(&*sink, &msg, ToastPosition::BottomRight, kind, 3000, None);
+        });
+    }
+
     /// 请 `.app` 截某个原生浮窗存盘。文件名在此定（与 Windows 侧同一格式），
     /// 结果经上行 `shot.result` 回来由协调器弹 Toast（见 `Coordinator::handle_ext`）。
+    #[cfg(target_os = "macos")]
     fn request_panel_shot(&self, target: &str, dir: &std::path::Path) {
         let path = dir.join(format!("{target}_{}.png", crate::screenshot::timestamp()));
         self.send_shot_request(serde_json::json!({
@@ -757,6 +850,7 @@ impl Forwarder {
 
     /// 下发截图请求。`.app` 只负责截 `items` 里的每一项，其余字段**原样回传**——
     /// 文案所需的上下文（数量、目录、候选是否已进剪贴板）因此不必在任何一边留状态。
+    #[cfg(target_os = "macos")]
     fn send_shot_request(&self, body: serde_json::Value) {
         self.sink.push_frame(&encode_ext(
             ext_kind::SHOT_PANEL,
@@ -1754,12 +1848,9 @@ mod tests {
             assert_eq!(m[0].anchor, OVERLAY_ANCHOR_BOTTOM_RIGHT);
         }
 
-        /// 悬停候选有反查内容 → tooltip 层跟着候选窗走；候选窗隐藏时 tooltip 一起藏。
-        #[test]
-        fn hover_tooltip_follows_candidate_and_hides_with_it() {
+        /// 一个带单行反查内容（「nǐ」）的候选。
+        fn tip_cand() -> CandidateItem {
             use wind_ui_types::{StyledText, TooltipDoc, TooltipLine, TooltipSection};
-            let cap = Arc::new(Mutex::new(Vec::new()));
-            let (mut f, _ev) = mk(cap.clone(), "_lo6");
             let mut cand = item("你");
             cand.tooltip = Arc::new(TooltipDoc {
                 sections: vec![TooltipSection {
@@ -1771,26 +1862,38 @@ mod tests {
                     }],
                 }],
             });
-            let update = |f: &mut Forwarder, hover: i32| {
-                f.handle(UiCommand::UpdateCandidates {
-                    preedit: "ni".into(),
-                    preedit_caret: 2,
-                    preedit_host_owned: false,
-                    mode_label: "".into(),
-                    candidates: vec![cand.clone()],
-                    selected: 0,
-                    hover,
-                    page: 1,
-                    total_pages: 1,
-                    caret_x: 100,
-                    caret_y: 200,
-                    caret_height: 20,
-                    caret_valid: true,
-                    fixed: false,
-                    fixed_x: 0,
-                    fixed_y: 0,
-                })
-            };
+            cand
+        }
+
+        /// 显示一页只含 `cand` 的候选，悬停在 `hover`。
+        fn update(f: &mut Forwarder, cand: &CandidateItem, hover: i32) {
+            f.handle(UiCommand::UpdateCandidates {
+                preedit: "ni".into(),
+                preedit_caret: 2,
+                preedit_host_owned: false,
+                mode_label: "".into(),
+                candidates: vec![cand.clone()],
+                selected: 0,
+                hover,
+                page: 1,
+                total_pages: 1,
+                caret_x: 100,
+                caret_y: 200,
+                caret_height: 20,
+                caret_valid: true,
+                fixed: false,
+                fixed_x: 0,
+                fixed_y: 0,
+            })
+        }
+
+        /// 悬停候选有反查内容 → tooltip 层跟着候选窗走；候选窗隐藏时 tooltip 一起藏。
+        #[test]
+        fn hover_tooltip_follows_candidate_and_hides_with_it() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo6");
+            let cand = tip_cand();
+            let update = |f: &mut Forwarder, hover: i32| update(f, &cand, hover);
             update(&mut f, -1);
             assert!(
                 overlays(&cap, OVERLAY_KIND_TOOLTIP).is_empty(),
@@ -1813,6 +1916,107 @@ mod tests {
             f.handle(UiCommand::HideCandidates);
             let m = overlays(&cap, OVERLAY_KIND_TOOLTIP);
             assert!(!visible(m.last().unwrap()), "候选窗藏了 tooltip 也得藏");
+        }
+
+        fn tooltip_menu_requests(
+            ev: &std::sync::mpsc::Receiver<UiEvent>,
+        ) -> Vec<(i32, i32, i32, Option<wind_ui_types::TooltipHit>, u64)> {
+            ev.try_iter()
+                .filter_map(|e| match e {
+                    UiEvent::RequestTooltipMenu {
+                        x,
+                        y,
+                        candidate,
+                        hit,
+                        doc_fingerprint,
+                    } => Some((x, y, candidate, hit, doc_fingerprint)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// addon 报「右键点在提示位图内某处」→ 按本进程画的那一帧做命中，回送与 Windows 气泡
+        /// 自己收右键时同一个事件（带候选下标与指纹，协调器据此核对）；点在文字上命中那一行，
+        /// 点在内边距上没有命中。提示不在屏上时不请求菜单。
+        #[test]
+        fn tooltip_menu_at_hits_the_drawn_frame_only_while_shown() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk(cap.clone(), "_lo7");
+            let cand = tip_cand();
+            update(&mut f, &cand, -1);
+            f.handle(UiCommand::TooltipMenuAt {
+                x: 5,
+                y: 6,
+                local_x: 10,
+                local_y: 10,
+            });
+            assert!(tooltip_menu_requests(&ev).is_empty(), "提示没显示不弹菜单");
+
+            update(&mut f, &cand, 0);
+            let m = overlays(&cap, OVERLAY_KIND_TOOLTIP);
+            let m = m.last().unwrap();
+            let center = ((m.w / 2) as i32, (m.h / 2) as i32);
+            f.handle(UiCommand::TooltipMenuAt {
+                x: 300,
+                y: 400,
+                local_x: center.0,
+                local_y: center.1,
+            });
+            f.handle(UiCommand::TooltipMenuAt {
+                x: 300,
+                y: 400,
+                local_x: 0,
+                local_y: 0,
+            });
+            let fp = cand.tooltip.fingerprint();
+            let hit = Some(wind_ui_types::TooltipHit {
+                section: 0,
+                raw_line: Some(0),
+            });
+            assert_eq!(
+                tooltip_menu_requests(&ev),
+                vec![(300, 400, 0, hit, fp), (300, 400, 0, None, fp)],
+                "位图中心是那一行文字，左上角是内边距"
+            );
+
+            f.handle(UiCommand::HideCandidates);
+            f.handle(UiCommand::TooltipMenuAt {
+                x: 300,
+                y: 400,
+                local_x: center.0,
+                local_y: center.1,
+            });
+            assert!(tooltip_menu_requests(&ev).is_empty(), "候选窗收了就不弹");
+        }
+
+        /// 气泡菜单的「截图此窗口」：像素在本进程，就地存 PNG 并弹 Windows 同款文案的 Toast；
+        /// 没在显示时只弹「未显示」。
+        #[test]
+        fn overlay_screenshot_saves_png_or_reports_not_visible() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo8");
+            let dir =
+                std::env::temp_dir().join(format!("windinput_test_ovshot_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            f.handle(UiCommand::ScreenshotStatusTip { dir: dir.clone() });
+            let toast = || overlays(&cap, OVERLAY_KIND_TOAST).len();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while toast() == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(toast(), 1, "未显示也要告诉用户");
+            assert!(!dir.exists(), "没显示就不落文件");
+
+            status(&mut f, StatusTipPlacement::Fixed { x: 1, y: 1 });
+            f.handle(UiCommand::ScreenshotStatusTip { dir: dir.clone() });
+            let files = wait_for_files(&dir, 1);
+            assert_eq!(files.len(), 1, "应存出一张 PNG，实际 {files:?}");
+            let name = files[0].to_string_lossy().to_string();
+            assert!(
+                name.starts_with("status_tip_") && name.ends_with(".png"),
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
