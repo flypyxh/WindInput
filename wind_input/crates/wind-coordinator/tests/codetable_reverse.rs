@@ -27,6 +27,10 @@ fn dict_ready() -> bool {
 /// 走生产出口 `handle_key_event_policed`（`wind-bridge` server 调的就是它）：放宽态的失效
 /// （`expire_scope_override`）挂在这个出口上，裸 `handle_key_event` 绕过它，测不到。
 fn key(c: &Coordinator, vk: u32, shift: bool) {
+    key_act(c, vk, shift);
+}
+/// 同 `key`，但取回 `KeyAction`（要断言上屏内容时用）。
+fn key_act(c: &Coordinator, vk: u32, shift: bool) -> wind_bridge::handler::KeyAction {
     c.handle_key_event_policed(&KeyEventData {
         key_code: vk,
         scan_code: 0,
@@ -35,7 +39,7 @@ fn key(c: &Coordinator, vk: u32, shift: bool) {
         toggles: 0,
         event_seq: 0,
         prev_char: 0,
-    });
+    })
 }
 fn letters(c: &Coordinator, s: &str) {
     for ch in s.chars() {
@@ -474,6 +478,13 @@ fn reverse_mode_has_no_pinyin_in_mixed() {
     let mut cfg = wubi_rev();
     cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
     cfg.schema.active = "wubi86_pinyin".into();
+    // 正向对照：同配置不进反查、走主路径时「汉字」确实在候选里，否则下面的「没有拼音」可能空过。
+    let main = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    letters(&main, "hanz");
+    assert!(
+        main.debug_all_candidate_texts().iter().any(|t| t == "汉字"),
+        "前置：主路径 hanz 含「汉字」"
+    );
     let tri = rev_triples(cfg, "hanz");
     assert!(!tri.is_empty());
     assert!(
@@ -497,6 +508,7 @@ fn reverse_esc_exits_without_residue() {
     for _ in 0..5 {
         key(&c, VK_NEXT, false); // 翻到底再按 ⇒ 放宽
     }
+    assert!(c.debug_scope_relaxed(), "前置：Esc 前放宽确实发生了");
     key(&c, VK_ESCAPE, false);
     assert_eq!(c.debug_active_mode(), None);
     assert!(!c.debug_has_more() && !c.debug_scope_relaxed());
@@ -517,15 +529,7 @@ fn reverse_space_commits_highlight() {
     key(&c, VK_BACKSLASH, false);
     letters(&c, "zuia");
     let first = c.debug_all_candidate_texts()[0].clone();
-    let act = c.handle_key_event(&KeyEventData {
-        key_code: VK_SPACE,
-        scan_code: 0,
-        modifiers: 0,
-        event_type: EVENT_KEY_DOWN,
-        toggles: 0,
-        event_seq: 0,
-        prev_char: 0,
-    });
+    let act = key_act(&c, VK_SPACE, false);
     assert!(format!("{act:?}").contains(&first), "上屏的是候选：{act:?}");
     assert_eq!(c.debug_active_mode(), None);
 }
