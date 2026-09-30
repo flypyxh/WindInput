@@ -9242,7 +9242,7 @@ mod mode_comment_e2e_tests {
     /// `WM_HOTKEY` id 段（`GlobalHotkeys()` 全集）才卡死的。判据搬到服务端之后，这里是
     /// 唯一能挡住同类错误的地方。
     #[test]
-    fn hotkey_session_flag_covers_exactly_the_four_hotkey_modes() {
+    fn hotkey_session_flag_covers_exactly_the_hotkey_modes() {
         let (c, _rx) = coord_with_ui(Config::default());
 
         // 基线：什么都没有 ⇒ 不是会话。

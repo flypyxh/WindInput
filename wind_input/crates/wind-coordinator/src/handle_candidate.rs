@@ -3234,14 +3234,18 @@ impl Coordinator {
             // 落点必须补：用户在生僻字模式里找到字之后，最想做的一件事恰恰是右键「设为
             // 常用字」——那正是常用字覆盖功能的主场景。不补落点就只剩一个复制。
             // `special = false`：它没有 `show_all_on_enter` 浏览态，空码时本就没有候选。
-            //
-            // 反查模式同理：用活跃方案的编码查字，编码在 special_buffer，归属 active。
-            Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => (
+            Some(ModeKind::RareChar) => (
                 self.engine_mgr.active_schema_id(),
                 state.special_buffer.clone(),
                 state.special_buffer.clone(),
                 false,
             ),
+            // 反查模式：**没有落点**，右键只留复制。缓冲是查询串（含通配）而不是码位，规则
+            // 写进去模式内也读不到（`build_reverse_candidates` 不吃候选调整，计划裁决 12），
+            // 查询串不含通配键时还会误伤主路同名字面输入；写端照走的话，操作完落到主路
+            // `update_candidates`（读恒空的 `input_buffer`），候选窗当场清空而模式还在。
+            // 「设为常用字」不需要落点，在 `candidate_op` 的准入之前分派，不受影响。
+            Some(ModeKind::Reverse) => return None,
             // 临时英文：归属恒是内置英文方案（与读写两端同源，见 effective_data_schema）。
             // 码取**小写化的缓冲**——临英缓冲带大写（Shift+H 进入即 `H`），而英文方案下
             // `input_buffer` 恒为全小写；不归一的话「临英里置顶的词，切到英文方案不生效」，

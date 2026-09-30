@@ -304,8 +304,36 @@ mod tests {
     #[test]
     fn reverse_disabled_does_not_enter() {
         let (c, _g) = coord("off", |cfg| cfg.input.reverse.enabled = false);
-        key(&c, VK_BACKSLASH, false);
+        let act = press(&c, VK_BACKSLASH);
         assert_eq!(c.debug_active_mode(), None);
+        // 不吞键：`\` 照常走中文标点，产出「、」。
+        assert_eq!(inserted(&act), Some("、"));
+    }
+
+    /// 反查模式里的候选调整没有落点（查询串不是码位、模式内也不读 shadow，计划裁决 12）：
+    /// 右键只留复制。写端若照走，会落到主路 `update_candidates`（读恒空的 `input_buffer`），
+    /// 候选窗当场清空而模式还在。
+    #[test]
+    fn reverse_candidate_op_is_refused_and_keeps_candidates() {
+        let (c, _g) = coord("op", |_| {});
+        key(&c, VK_BACKSLASH, false);
+        letters(&c, "zb");
+        assert_eq!(c.debug_candidate_op_scope(), None, "反查模式无词库落点");
+        c.debug_candidate_op(wind_ui_types::CandidateOp::MoveDown, 0);
+        assert_eq!(c.debug_active_mode(), Some("reverse"));
+        assert_eq!(c.debug_all_candidate_texts(), ["甲", "丁"]);
+        assert_eq!(c.debug_preedit(), "\\zb");
+    }
+
+    /// 「设为常用字」不需要词库落点，在作用域准入之前分派——反查模式里仍可用，且不清空候选。
+    #[test]
+    fn reverse_toggle_common_still_works() {
+        let (c, _g) = coord("cc", |_| {});
+        key(&c, VK_BACKSLASH, false);
+        letters(&c, "zb");
+        c.debug_candidate_op(wind_ui_types::CandidateOp::ToggleCommon, 0);
+        assert_eq!(c.debug_active_mode(), Some("reverse"));
+        assert_eq!(c.debug_all_candidate_texts(), ["甲", "丁"]);
     }
 
     /// 缓冲非空时按触发键：顶屏高亮候选再进入（commit-and-enter 通路）。
