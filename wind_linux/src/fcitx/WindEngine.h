@@ -11,6 +11,7 @@
 
 #include "Bridge.h"
 #include "KeyMap.h"
+#include "KeySynth.h"
 #include "ResponseRouter.h"
 #include "ServiceLauncher.h"
 #include "SettingsLauncher.h"
@@ -107,6 +108,16 @@ private:
     /// 请服务端打开菜单（`menu.open`）：target ≥ 0 候选右键菜单，-1 主菜单；(x, y) 锚点。
     void requestMenu(int32_t target, int32_t x, int32_t y);
 
+    // ── 命令直通车按键合成（CMD_KEY_TAP / SEQ / HOLD / RELEASE）──
+    /// 经 `forwardKey` 交给焦点 IC 的应用：不进输入法引擎，不会回流成组字。
+    void onKeySynth(const Frame& frame);
+    void forwardKeys(fcitx::InputContext* ic, const std::vector<SynthKey>& keys);
+    /// 卡键保护：key.hold 按住的全部抬起，发给当初收到按下的那个 IC（它还在的话）。
+    /// 失焦 / 换 IC / reset / 服务重启或断线 / 析构都走这里。
+    void releaseHeldKeys(const char* reason);
+    /// 按最早的到期时刻（重）设最长保持时间的计时器；没有按住的就不动它（一次性，自然停）。
+    void armKeyHoldExpiry();
+
     fcitx::Instance* instance_;
     BridgeClient bridge_;
     ResponseRouter router_;
@@ -134,6 +145,12 @@ private:
     fcitx::SimpleAction settingsAction_;
     ModeIndicator mode_;
     WindConfig config_;
+    KeyHoldTracker keyHolds_;
+    SynthRateLimiter synthRate_;
+    uint32_t keyHoldTimeoutMs_ = kDefaultKeyHoldTimeoutMs;
+    /// 收到 key.hold 按下的那个 IC：抬起要发回给它，而不是此刻的焦点。
+    fcitx::TrackableObjectReference<fcitx::InputContext> keyHoldIC_;
+    std::unique_ptr<fcitx::EventSourceTime> keyHoldExpiry_;
 };
 
 class WindEngineFactory : public fcitx::AddonFactory {

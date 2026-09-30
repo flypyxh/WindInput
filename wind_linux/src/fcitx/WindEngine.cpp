@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 
 FCITX_DEFINE_LOG_CATEGORY(windinput_log, "windinput");
@@ -117,6 +118,7 @@ bool isSwitchEvent(const fcitx::InputContextEvent& event)
 WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
 {
     dispatcher_.attach(&instance_->eventLoop());
+    keyHoldTimeoutMs_ = keyHoldTimeoutMs(std::getenv("WIND_KEY_HOLD_TIMEOUT_MS"));
     // 托盘运行时图标的目录要赶在各 UI 模块构建图标主题之前就在（见 HostUi.h ensureIconDirs）。
     if (!ensureIconDirs(userHicolorDir())) {
         WIND_WARN() << "用户图标目录建不起来，托盘退回随包的种子图标";
@@ -187,11 +189,13 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
         [this](bool connected) {
             // 服务没了（崩溃 / 被杀）：菜单是它画的，也没人再回应指针事件——就地收掉、放开
             // 指针。不报 dismiss（没人收）；新服务的 menu_open 本来就是 false。
+            // key.hold 按住的键同理：要它 release 的那个服务已经不在了。
             if (!connected) {
                 dispatcher_.schedule([this]() {
                     if (panel_) {
                         panel_->closeMenu(nullptr);
                     }
+                    releaseHeldKeys("push_lost");
                 });
             }
         });
@@ -203,6 +207,9 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
 
 WindEngine::~WindEngine()
 {
+    // addon 卸载（fcitx5 退出 / 重载）时还按着的键：抬起，别把应用留在「Shift 按住」里。
+    releaseHeldKeys("addon_unload");
+    keyHoldExpiry_.reset();
     // 顺序要紧：先停推送线程（之后不再有 schedule），再拆 dispatcher。
     push_.reset();
     panel_.reset();
@@ -392,6 +399,7 @@ void WindEngine::activate(const fcitx::InputMethodEntry&, fcitx::InputContextEve
     // 收尾。否则它迟到的 FocusLost 会被服务端当作「旧宿主的陈旧失焦」丢弃（active token 已是
     // 新 IC），留在服务端缓冲里的旧编码就会接着拼进新文本框（实测「你好你好」）。
     if (fcitx::InputContext* old = currentIC_.get(); old && old != ic) {
+        releaseHeldKeys("focus_changed");
         ICSink sink(old);
         router_.applyClearComposition(&sink);
         if (bridge_.isConnected()) {
@@ -423,6 +431,8 @@ void WindEngine::activate(const fcitx::InputMethodEntry&, fcitx::InputContextEve
 void WindEngine::deactivate(const fcitx::InputMethodEntry&, fcitx::InputContextEvent& event)
 {
     fcitx::InputContext* ic = event.inputContext();
+    // 按住的键先抬起，发给当初按下的那个 IC（通常就是正在失焦的这个）。
+    releaseHeldKeys("focus_out");
     // 失焦 / 切走输入法：菜单随之收起（服务端也会在 FocusLost 上关，但它有 250ms 的「刚打开」
     // 守卫；本端这条无条件，且先于 FocusLost 报，服务端据此复位）。
     panel_->closeMenu("focus_out");
@@ -454,6 +464,7 @@ void WindEngine::reset(const fcitx::InputMethodEntry&, fcitx::InputContextEvent&
 {
     // 宿主要求重置（鼠标点击挪了光标、宿主主动 reset）：对位 Windows 的「组合被意外终止」。
     fcitx::InputContext* ic = event.inputContext();
+    releaseHeldKeys("reset");
     if (!router_.hasComposition()) {
         return;
     }
@@ -589,6 +600,8 @@ void WindEngine::onPushFrame(Frame frame)
         }
         panel_->hide();
         panel_->hideAllOverlays();
+        // 旧服务 hold 的键没人再来 release 了。
+        releaseHeldKeys("service_ready");
         {
             // 菜单是旧服务画的：收掉、放开指针。新服务的 menu_open 本就是 false，仍补报一次
             // dismiss——两端对齐不靠「恰好一致」。
@@ -624,6 +637,12 @@ void WindEngine::onPushFrame(Frame frame)
             WIND_DEBUG() << "push cmd=" << hex(frame.cmd) << " 无焦点 IC，丢弃";
         }
         break;
+    case CMD_KEY_TAP:
+    case CMD_KEY_SEQ:
+    case CMD_KEY_HOLD:
+    case CMD_KEY_RELEASE:
+        onKeySynth(frame);
+        break;
     case CMD_HOST_RENDER_FRAME:
         if (auto p = decodeHostRenderFrame(frame.payload)) {
             onRenderFrame(*p);
@@ -645,7 +664,7 @@ void WindEngine::onPushFrame(Frame frame)
         }
         break;
     default:
-        // macOS 的文本提示帧（CMD_TOOLTIP_SHOW 等，Linux 服务不发）/ 按键合成：见 AGENTS.md 差距表。
+        // macOS 的文本提示帧（CMD_TOOLTIP_SHOW 等，Linux 服务不发）：见 AGENTS.md 差距表。
         break;
     }
 }
@@ -756,6 +775,190 @@ void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
         return;
     }
     panel_->showMenuLevel(level, f, p);
+}
+
+// ── 命令直通车按键合成 ────────────────────────────────────────────────
+
+namespace {
+
+/// 日志里的组合写法（`ctrl+shift+end`）。
+std::string describeCombo(const KeyComboPayload& c)
+{
+    std::string s;
+    for (const auto& m : c.mods) {
+        s += m + "+";
+    }
+    return s + c.key;
+}
+
+} // namespace
+
+void WindEngine::onKeySynth(const Frame& frame)
+{
+    // 与 CMD_KEY_TYPE 同：落到此刻的焦点 IC，没有就丢弃（服务端只投给活跃客户端，焦点
+    // 刚走的空窗里到达的帧没有合适的去处）。
+    fcitx::InputContext* ic = focusedIC();
+    if (!ic) {
+        WIND_DEBUG() << "按键合成 cmd=" << hex(frame.cmd) << " 无焦点 IC，丢弃";
+        return;
+    }
+    // 按住的键属于别的 IC（焦点切换时本该已抬起，这里兜底）：先抬起，再在新 IC 上干活。
+    if (!keyHolds_.empty() && keyHoldIC_.get() != ic) {
+        releaseHeldKeys("ic_changed");
+    }
+    const uint64_t now = nowMs();
+
+    if (frame.cmd == CMD_KEY_SEQ) {
+        auto seq = decodeKeySeq(frame.payload);
+        if (!seq) {
+            WIND_WARN() << "key.seq 帧解不开，丢弃";
+            return;
+        }
+        if (seq->size() > kMaxSeqCombos) {
+            WIND_WARN() << "key.seq 有 " << seq->size() << " 个组合，超过上限 " << kMaxSeqCombos
+                        << "，整条丢弃";
+            return;
+        }
+        // 先全部解析再动手：有一个不认识就整条不做（「删行」只做一半比不做更糟）。
+        std::vector<SynthKey> events;
+        for (const auto& c : *seq) {
+            auto r = resolveCombo(c);
+            if (!r) {
+                WIND_WARN() << "key.seq 里有不认识的组合 " << describeCombo(c) << "，整条丢弃";
+                return;
+            }
+            auto t = tapEvents(*r, keyHolds_.heldStates());
+            events.insert(events.end(), t.begin(), t.end());
+        }
+        if (!synthRate_.allow(events.size(), now)) {
+            WIND_WARN() << "按键合成过于频繁（每 " << kSynthWindowMs << "ms 至多 "
+                        << kMaxSynthEventsPerWindow << " 个事件），丢弃 key.seq";
+            return;
+        }
+        forwardKeys(ic, events);
+        return;
+    }
+
+    auto payload = decodeKeyCombo(frame.payload);
+    if (!payload) {
+        WIND_WARN() << "按键合成帧 cmd=" << hex(frame.cmd) << " 解不开，丢弃";
+        return;
+    }
+    auto combo = resolveCombo(*payload);
+    if (!combo) {
+        WIND_WARN() << "按键合成：不认识的组合 " << describeCombo(*payload) << "，丢弃";
+        return;
+    }
+    switch (frame.cmd) {
+    case CMD_KEY_TAP: {
+        auto events = tapEvents(*combo, keyHolds_.heldStates());
+        if (!synthRate_.allow(events.size(), now)) {
+            WIND_WARN() << "按键合成过于频繁，丢弃 key.tap " << describeCombo(*payload);
+            return;
+        }
+        forwardKeys(ic, events);
+        break;
+    }
+    case CMD_KEY_HOLD: {
+        if (!synthRate_.allow(combo->mods.size() + 1, now)) {
+            WIND_WARN() << "按键合成过于频繁，丢弃 key.hold " << describeCombo(*payload);
+            return;
+        }
+        std::vector<SynthKey> down;
+        switch (keyHolds_.hold(*combo, now, keyHoldTimeoutMs_, down)) {
+        case KeyHoldTracker::HoldResult::AlreadyHeld:
+            WIND_DEBUG() << "key.hold " << describeCombo(*payload) << " 已按住，不重复按";
+            return;
+        case KeyHoldTracker::HoldResult::Full:
+            WIND_WARN() << "已按住 " << kMaxHeldCombos << " 个组合，拒绝 key.hold "
+                        << describeCombo(*payload);
+            return;
+        case KeyHoldTracker::HoldResult::Pressed:
+            break;
+        }
+        keyHoldIC_ = ic->watch();
+        forwardKeys(ic, down);
+        armKeyHoldExpiry();
+        break;
+    }
+    case CMD_KEY_RELEASE: {
+        auto up = keyHolds_.release(*combo);
+        if (up.empty()) {
+            WIND_DEBUG() << "key.release " << describeCombo(*payload) << "：没有按住，忽略";
+            return;
+        }
+        forwardKeys(ic, up);
+        if (keyHolds_.empty()) {
+            keyHoldIC_.unwatch();
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void WindEngine::forwardKeys(fcitx::InputContext* ic, const std::vector<SynthKey>& keys)
+{
+    // 键码填 0：各前端（XIM / Wayland / GTK·Qt 模块）按 keysym 在当前键盘布局里反查键码。
+    for (const auto& k : keys) {
+        ic->forwardKey(fcitx::Key(static_cast<fcitx::KeySym>(k.sym), fcitx::KeyStates(k.states)),
+                       k.release);
+    }
+    WIND_DEBUG() << "按键合成 " << keys.size() << " 个事件 → " << ic->program();
+}
+
+void WindEngine::releaseHeldKeys(const char* reason)
+{
+    if (keyHolds_.empty()) {
+        return;
+    }
+    std::vector<SynthKey> up = keyHolds_.releaseAll();
+    if (fcitx::InputContext* ic = keyHoldIC_.get()) {
+        WIND_INFO() << "补发 key.hold 按住键的抬起（" << reason << "）";
+        forwardKeys(ic, up);
+    } else {
+        WIND_INFO() << "key.hold 按住的键所在 IC 已销毁，无处补发抬起（" << reason << "）";
+    }
+    keyHoldIC_.unwatch();
+    if (keyHoldExpiry_) {
+        keyHoldExpiry_->setEnabled(false);
+    }
+}
+
+void WindEngine::armKeyHoldExpiry()
+{
+    std::optional<uint64_t> deadline = keyHolds_.nextDeadline();
+    if (!deadline) {
+        if (keyHoldExpiry_) {
+            keyHoldExpiry_->setEnabled(false);
+        }
+        return;
+    }
+    const uint64_t now = nowMs();
+    const uint64_t at = fcitx::now(CLOCK_MONOTONIC) + (*deadline > now ? *deadline - now : 0) * 1000;
+    if (keyHoldExpiry_) {
+        // 复用同一个事件源：回调里重设自己是安全的，销毁自己则不是。
+        keyHoldExpiry_->setTime(at);
+        keyHoldExpiry_->setOneShot();
+        return;
+    }
+    keyHoldExpiry_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, at, 0, [this](fcitx::EventSourceTime*, uint64_t) {
+            std::vector<SynthKey> up = keyHolds_.releaseExpired(nowMs());
+            if (!up.empty()) {
+                if (fcitx::InputContext* ic = keyHoldIC_.get()) {
+                    WIND_INFO() << "key.hold 超过最长保持时间 " << keyHoldTimeoutMs_
+                                << "ms，自动抬起";
+                    forwardKeys(ic, up);
+                }
+            }
+            if (keyHolds_.empty()) {
+                keyHoldIC_.unwatch();
+            }
+            armKeyHoldExpiry();
+            return true;
+        });
 }
 
 void WindEngine::requestMenu(int32_t target, int32_t x, int32_t y)
