@@ -494,6 +494,9 @@ impl Coordinator {
         } else {
             self.rt().config.input.association.hint.clone()
         };
+        // 每次进联想都是宿主里一个新建的占位组合，起点已右移；不解锁的话联想连环时候选窗
+        // 会钉在第一次联想的位置（见 `unpin_composition_anchor_if_shown`）。
+        self.unpin_composition_anchor_if_shown();
         self.arm_assoc_hide(cfg.hide_after_ms);
         true
     }
@@ -1087,6 +1090,27 @@ mod tests {
             "按键路径的收口动作搭着这次应答就送到宿主了"
         );
         assert!(!c.assoc_placeholder_orphaned.load(Ordering::Relaxed));
+    }
+
+    /// 联想接龙时候选窗不能钉在第一次联想的位置：窗口已在显示时进联想要解开组合起点的两把锁，
+    /// 下一帧宿主上报的新起点才锁得上、reshow 才跟得过去。
+    #[test]
+    fn entering_assoc_unpins_composition_anchor_when_window_is_shown() {
+        let c = coord_smart();
+        c.debug_lock_anchors(true);
+        assert_eq!(c.debug_anchor_locks(), (true, true), "前提：两把锁都锁着");
+        assert!(enter(&c, "你好"));
+        assert_eq!(c.debug_anchor_locks(), (false, false));
+    }
+
+    /// 反向对照：窗口没在显示（首显流程）时不解锁——那是 `reset_first_show` 的地盘，
+    /// 本帧刚到的组合起点可能正是首显要用的坐标。
+    #[test]
+    fn entering_assoc_keeps_anchor_when_window_is_not_shown() {
+        let c = coord_smart();
+        c.debug_lock_anchors(false);
+        assert!(enter(&c, "你好"));
+        assert_eq!(c.debug_anchor_locks(), (true, true));
     }
 
     /// 联想态下越界数字键：收掉联想、只出该数字，**与 `keys.overflow.number_key` 无关**

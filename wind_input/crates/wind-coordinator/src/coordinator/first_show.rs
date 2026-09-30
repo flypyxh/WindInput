@@ -8,6 +8,70 @@
 use super::*;
 
 impl Coordinator {
+    /// 候选窗**已在显示**时，解开「组合起点」的两把锁（`composition_start` 与
+    /// `locked_rect_anchor`），**不动**显示状态（`shown_anchor` / `caret_baseline` 保留）。
+    ///
+    /// 用于联想接龙：连续打字时「打码 → 上屏 → 联想 → 又打码」，候选窗全程不隐藏，
+    /// `reset_first_show` 一次都不会被调到，可宿主那边每次上屏后都是**新建一个占位组合**、
+    /// 起点右移了一个字宽。两把锁不解，「同一组合起点只锁首个」就把候选窗钉在第一次的位置：
+    /// 日志里 `reshow: dx=24` 每次都判出来了，下发位置却恒取被钉住的旧起点，窗口越离越远
+    /// （论坛 t251 后续，2026-09-30 靶机记事本实测 1355 不动、光标走到 1466）。
+    ///
+    /// **窗口没显示时不解**：那是首显流程，锁由 `reset_first_show` 管，且本帧刚到的组合起点
+    /// 可能正是首显要用的坐标——清了会让首显闸门以为坐标未就绪。
+    ///
+    /// 解锁后下一帧宿主上报的组合矩形 / compStart 会重新锁定并 reshow 到新起点；在那一帧到达
+    /// 之前候选窗留在原处（`hold_anchor`），最多晚一个 caret_update，不会闪。
+    pub(crate) fn unpin_composition_anchor_if_shown(&self) {
+        if !*self
+            .candidate_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return;
+        }
+        *self
+            .composition_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+        *self
+            .locked_rect_anchor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+    }
+
+    /// 两把组合起点锁是否都还锁着（**仅测试用**，另一半见 `debug_mark_coords_ready`）。
+    #[cfg(test)]
+    pub(crate) fn debug_anchor_locks(&self) -> (bool, bool) {
+        (
+            self.composition_start
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .2,
+            self.locked_rect_anchor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .2,
+        )
+    }
+
+    /// 把两把锁都置成锁着，并标记候选窗已在显示（**仅测试用**）。
+    #[cfg(test)]
+    pub(crate) fn debug_lock_anchors(&self, shown: bool) {
+        *self
+            .candidate_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = shown;
+        *self
+            .composition_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (100, 200, true);
+        *self
+            .locked_rect_anchor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (100, 200, true);
+    }
+
     /// 复位首显延迟状态（候选窗隐藏 / 组合结束）：下次新组合重新延迟首显，并作废未触发的兜底 timer。
     pub(crate) fn reset_first_show(&self) {
         // ★ 上屏改变了插入点，缓存里那份是**上屏前**的——五笔满码自动上屏后立刻开新组合时
