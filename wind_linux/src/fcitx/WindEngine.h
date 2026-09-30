@@ -13,12 +13,15 @@
 #include "KeyMap.h"
 #include "ResponseRouter.h"
 #include "ServiceLauncher.h"
+#include "SettingsLauncher.h"
 #include "ExtProtocol.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/trackableobject.h>
+#include <fcitx-config/configuration.h>
+#include <fcitx-config/option.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/action.h>
@@ -34,6 +37,13 @@ namespace windlinux {
 
 class X11CandidatePanel;
 
+/// 输入法 / addon 的「配置」：只有一项外部工具（设置程序）。Fcitx5 的配置工具（fcitx5-configtool
+/// 5.1.6 起）遇到「整页只有一个 External 项」就直接启动它，不再弹一张空白配置页；更早的版本
+/// 显示一页、页上一个按钮。fcitx5-mozc 用的是同一机制（它的 addon 里没有静态 .desc）。
+FCITX_CONFIGURATION(WindConfig,
+                    fcitx::ExternalOption settings{this, "WindSetting", "清风输入法设置",
+                                                   settingsPath()};);
+
 class WindEngine final : public fcitx::InputMethodEngineV2 {
 public:
     explicit WindEngine(fcitx::Instance* instance);
@@ -43,6 +53,8 @@ public:
     void activate(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
     void deactivate(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
     void reset(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
+
+    const fcitx::Configuration* getConfig() const override { return &config_; }
 
 private:
     // ── 连接 ──
@@ -74,13 +86,13 @@ private:
     void onOverlayFrame(const OverlayFramePayload& p);
     void onExt(const ExtEnvelope& ext);
     void onMenuFrame(uint32_t level, const OverlayFramePayload& p);
+    /// 启动设置程序（`settings.open` 信封与状态区入口共用）。只启动自己的设置程序，args 只进参数位。
+    void launchSettings(const std::vector<std::string>& args);
     fcitx::InputContext* focusedIC();
 
     // ── 自绘菜单 ──
     /// 请服务端打开菜单（`menu.open`）：target ≥ 0 候选右键菜单，-1 主菜单；(x, y) 锚点。
     void requestMenu(int32_t target, int32_t x, int32_t y);
-    /// Fcitx5 状态区入口（托盘 / kimpanel 里的「清风输入法菜单」）：主菜单弹在光标下方。
-    void openMainMenuFromStatusArea(fcitx::InputContext* ic);
 
     fcitx::Instance* instance_;
     BridgeClient bridge_;
@@ -103,9 +115,10 @@ private:
     /// 自绘菜单各级的 SHM 读端（下标 = 级）。
     ShmFrameReader menuShm_[OVERLAY_MENU_LEVELS];
     std::unique_ptr<X11CandidatePanel> panel_;
-    /// 空闲时打开主菜单的入口：挂进 Fcitx5 状态区（托盘菜单 / kimpanel 面板）。Linux 没有
-    /// 工具栏和托盘图标（后期才做），组字时有候选窗右键，不组字时靠这里。
-    fcitx::SimpleAction menuAction_;
+    /// 「清风输入法设置」：挂进 Fcitx5 状态区（托盘菜单 / kimpanel 面板），点了打开设置程序。
+    /// 主菜单不从这里进（组字时候选窗右键 / 候选菜单「更多…」）。
+    fcitx::SimpleAction settingsAction_;
+    WindConfig config_;
 };
 
 class WindEngineFactory : public fcitx::AddonFactory {

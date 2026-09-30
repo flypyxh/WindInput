@@ -152,11 +152,11 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     };
     panel_ = std::make_unique<X11CandidatePanel>(instance_->eventLoop(), std::move(cb));
 
-    menuAction_.setShortText("清风输入法菜单");
-    menuAction_.setIcon("open-menu");
-    menuAction_.connect<fcitx::SimpleAction::Activated>(
-        [this](fcitx::InputContext* ic) { openMainMenuFromStatusArea(ic); });
-    instance_->userInterfaceManager().registerAction("windinput-menu", &menuAction_);
+    settingsAction_.setShortText("清风输入法设置");
+    settingsAction_.setIcon("preferences-system");
+    settingsAction_.connect<fcitx::SimpleAction::Activated>(
+        [this](fcitx::InputContext*) { launchSettings({}); });
+    instance_->userInterfaceManager().registerAction("windinput-settings", &settingsAction_);
 
     push_ = std::make_unique<PushClient>(
         pushSocketPath(),
@@ -338,7 +338,7 @@ void WindEngine::activate(const fcitx::InputMethodEntry&, fcitx::InputContextEve
     }
     currentIC_ = ic->watch();
     // 状态区入口：InputMethod 组在切换输入法时由 Fcitx5 自己清空，每次激活挂一次。
-    ic->statusArea().addAction(fcitx::StatusGroup::InputMethod, &menuAction_);
+    ic->statusArea().addAction(fcitx::StatusGroup::InputMethod, &settingsAction_);
     // 光标前字符的记账只对「这一个文本框里我们自己打出去的东西」有效，换焦点即作废。
     router_.reset();
     tap_.reset();
@@ -595,7 +595,12 @@ void WindEngine::onExt(const ExtEnvelope& ext)
         WIND_WARN() << "settings.open 的参数解析失败，不启动设置程序";
         return;
     }
-    std::vector<std::string> argv = settingsArgv(*args);
+    launchSettings(*args);
+}
+
+void WindEngine::launchSettings(const std::vector<std::string>& args)
+{
+    std::vector<std::string> argv = settingsArgv(args);
     if (access(argv[0].c_str(), X_OK) != 0) {
         WIND_WARN() << "设置程序不存在或不可执行：" << argv[0];
         return;
@@ -603,7 +608,7 @@ void WindEngine::onExt(const ExtEnvelope& ext)
     // startProcess 双 fork + setsid：设置程序脱离 fcitx5 的进程组、不留僵尸，继承 fcitx5 的
     // 环境（DISPLAY / WAYLAND_DISPLAY 靠它带过去）。已在运行时由设置程序自己的单实例
     // 转发把 argv 交给首实例（windui single_instance/unix.rs），这里不必判重。
-    WIND_INFO() << "启动设置程序 " << argv[0] << "（" << args->size() << " 个参数）";
+    WIND_INFO() << "启动设置程序 " << argv[0] << "（" << args.size() << " 个参数）";
     const std::string dir = argv[0].substr(0, argv[0].find_last_of('/') + 1);
     fcitx::startProcess(argv, dir.empty() ? "/" : dir);
 }
@@ -662,24 +667,6 @@ void WindEngine::requestMenu(int32_t target, int32_t x, int32_t y)
     Rect wa = panel_->screenWorkArea().value_or(Rect{});
     WIND_DEBUG() << "请求打开菜单 target=" << target << " @(" << x << "," << y << ")";
     sendAndDrain(encodeMenuOpenFrame(target, x, y, wa.x, wa.y, wa.x + wa.w, wa.y + wa.h));
-}
-
-void WindEngine::openMainMenuFromStatusArea(fcitx::InputContext* ic)
-{
-    // 光标下方；宿主没报过光标位置就放在指针处（刚点完托盘，指针就在那附近）。
-    std::optional<std::pair<int32_t, int32_t>> at;
-    if (ic) {
-        const fcitx::Rect& r = ic->cursorRect();
-        at = caretMenuAnchor(r.left(), r.top(), r.width(), r.height());
-    }
-    if (!at) {
-        at = panel_->pointerPosition();
-    }
-    if (!at) {
-        WIND_WARN() << "状态区菜单入口：没有 X 连接，菜单无处可画";
-        return;
-    }
-    requestMenu(-1, at->first, at->second);
 }
 
 } // namespace windlinux

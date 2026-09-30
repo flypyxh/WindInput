@@ -45,7 +45,8 @@ windinput-setup                        # 每个使用者运行一次：配置 fc
 1. 启动服务 `wind_input`（exe 同目录要有 `data/` 词库目录）。socket 在
    `$XDG_RUNTIME_DIR/WindInput/`。
 2. 在 Fcitx5 配置里把「清风输入法」加入输入法组。
-3. 设置：应用菜单「清风输入法设置」，或在输入时按 `Ctrl+Shift+]`（开发时设置程序路径可用
+3. 设置：应用菜单或 Fcitx5 托盘菜单里的「清风输入法设置」、Fcitx5 输入法配置里清风的「配置」，
+   或在输入时按 `Ctrl+Shift+]`（开发时设置程序路径可用
    `WIND_INPUT_SETTING` 覆盖，默认 `/usr/lib/windinput/wind_setting`）。
 4. 想用 Shift 单击切换中英：到 Fcitx5 全局配置里清空「临时在当前和第一个输入法之间切换」
    （`AltTriggerKeys`，出厂是左 Shift），否则 Shift 会先被 Fcitx5 截走。

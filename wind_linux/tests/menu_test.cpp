@@ -1,4 +1,4 @@
-// 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、状态区入口锚点、空闲超时配置，
+// 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时配置，
 // 以及菜单相关的上行编码（字节偏移按 Rust server.rs 的解码写死）与落位（EXACT 不夹回）。
 
 #include "Bridge.h"
@@ -47,11 +47,6 @@ int main()
     CHECK_EQ(contextMenuTarget(-1), -1);
     CHECK_EQ(contextMenuTarget(-2), -1);
     CHECK_EQ(contextMenuTarget(kNoHit), -1);
-
-    CASE("状态区入口：菜单锚在光标左下；宿主没报过光标则交调用方取指针位置");
-    CHECK(caretMenuAnchor(300, 400, 2, 20) == std::make_pair(300, 420));
-    CHECK(caretMenuAnchor(300, 400, 0, 0) == std::make_pair(300, 400));
-    CHECK(!caretMenuAnchor(0, 0, 0, 0).has_value());
 
     CASE("空闲超时：缺省 60 s，环境变量只认正整数");
     CHECK_EQ(menuIdleTimeoutMs(nullptr), kDefaultMenuIdleTimeoutMs);

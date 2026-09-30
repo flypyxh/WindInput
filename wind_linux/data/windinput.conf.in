@@ -5,4 +5,4 @@ Icon=windinput
 Label=风
 LangCode=zh_CN
 Addon=windinput
-Configurable=False
+Configurable=True

@@ -468,9 +468,78 @@ async def impanel(bus):
     return _IMPANEL
 
 
+async def open_main_menu(c, tries=1):
+    """功能主菜单的鼠标入口只剩组字时的候选窗：右键候选 → 候选菜单末行「更多…」→ 主菜单
+    （空闲时的状态区入口是「清风输入法设置」，不再开菜单）。返回主菜单窗口或 None。
+    组字（nihao）在菜单关掉后仍挂着，调用方用 end_composition 收掉再验打字。
+
+    tries > 1：服务刚重启时 socket 先于整个服务就绪，menu.open 可能被当「未就绪」丢掉，重试。"""
+    for _ in range(tries):
+        menu, _pt = await open_candidate_menu(c)
+        if menu and menu[5]:
+            last = await probe_row(menu, from_bottom=True)
+            if last is not None:
+                sh("xdotool", "mousemove", str(menu[1] + menu[3] // 3), str(last), "click", "1")
+                await asyncio.sleep(0.5)
+                main = await wait_window("wind-menu-0", True)
+                if main and main[5] and main[4] > menu[4]:
+                    return main
+        await c.key("Escape")  # 候选菜单若还开着，这一下收菜单；下面那下收组字
+        await wait_menus_gone()
+        await end_composition(c)
+    return None
+
+
+async def end_composition(c):
+    """收掉仍挂着的组字（没有组字时这一下 Esc 交还宿主，无副作用）。"""
+    await c.key("Escape")
+    c.take()
+    c.preedits.clear()
+
+
+class KimpanelWatch:
+    """听 Fcitx5 kimpanel 模块发给面板的属性：`/Fcitx/im:<名>:<图标>:<子模式>:menu,label=<标签>`
+    是当前输入法的托盘图标（取自引擎的 subModeIcon，notificationitem 的 SNI 图标取的是同一个
+    值）；`RegisterProperties` 里是状态区动作。"""
+
+    def __init__(self):
+        self.props = []
+        self.registered = []
+
+    async def start(self, bus):
+        name, path = "org.kde.kimpanel.inputmethod", "/kimpanel"
+        intro = await bus.introspect(name, path)
+        iface = bus.get_proxy_object(name, path, intro).get_interface(name)
+        iface.on_update_property(lambda p: self.props.append(p))
+        iface.on_register_properties(lambda ps: self.registered.append(list(ps)))
+
+    def im(self):
+        for p in reversed(self.props):
+            if p.startswith("/Fcitx/im:"):
+                return p
+        return ""
+
+    def icon(self):
+        parts = self.im().split(":")
+        return parts[2] if len(parts) > 2 else ""
+
+
+_KIMPANEL_WATCH = None
+
+
+async def kimpanel_watch(bus):
+    global _KIMPANEL_WATCH
+    if _KIMPANEL_WATCH is None:
+        await impanel(bus)  # kimpanel 模块看见面板在场才导出 org.kde.kimpanel.inputmethod
+        w = KimpanelWatch()
+        await w.start(bus)
+        _KIMPANEL_WATCH = w
+    return _KIMPANEL_WATCH
+
+
 class Impanel:
     """扮演 KDE / GNOME 的 kimpanel 面板：Fcitx5 kimpanel 模块据此把状态区动作挂出来，
-    面板点动作时发 `TriggerProperty("/Fcitx/<动作名>")`——就是用户点「清风输入法菜单」。"""
+    面板点动作时发 `TriggerProperty("/Fcitx/<动作名>")`——就是用户点「清风输入法设置」。"""
 
     def __init__(self, bus):
         from dbus_next.service import ServiceInterface, signal
@@ -577,20 +646,16 @@ async def menu_cases(bus, im):
                   f"菜单消失={gone} eaten={eaten}")
     await c.key("Escape")
     c.take()
+    # 空闲时没有主菜单入口了（状态区入口改成了「清风输入法设置」），主菜单都从组字时的
+    # 「更多…」进——英文态组不了字，先用 Shift 切回中文。
+    await c.tap_shift()
 
-    # g) Fcitx5 状态区入口（kimpanel 面板点「清风输入法菜单」）：空闲时主菜单弹在光标下方。
-    #    光标放高处：主菜单近 400px 高，光标在 y=400 时下方放不下，会按 Windows 同一规则翻到上方。
-    await c.ic.call_set_cursor_rect(300, 100, 2, 20)
-    panel = await impanel(bus)
-    panel.trigger("/Fcitx/windinput-menu")
-    main = await wait_window("wind-menu-0", True)
-    ok = main is not None and main[5]
-    check("菜单：状态区入口（kimpanel TriggerProperty）弹出主菜单", ok, f"menu={main}")
+    # g) 主菜单的子菜单点选：输入方案 ▸ 全拼（英文、分隔线之后那一行）→ 仍是中文全拼。
+    #    关掉菜单后组字还挂着，先收掉再验打字。
+    main = await open_main_menu(c)
+    ok = main is not None
+    check("菜单：组字中经「更多…」再开主菜单", ok, f"menu={main}")
     if ok:
-        _, mx, my, _, _, _ = main
-        check("菜单：状态区入口的主菜单在光标下方（内容左上 = 光标左下）",
-              0 <= 300 - mx <= 30 and 0 <= 120 - my <= 30, f"@({mx},{my})")
-        # h) 子菜单 + 点选恢复：输入方案 ▸ 全拼（英文、分隔线之后那一行）→ 回到中文全拼。
         await probe_row(main)
         sub = await wait_window("wind-menu-1", True)
         r0 = await probe_row(sub) if sub and sub[5] else None
@@ -600,24 +665,16 @@ async def menu_cases(bus, im):
                "click", "1")
         gone = await wait_menus_gone()
         check("菜单：点子菜单「全拼」后菜单收起", gone, f"sub={sub}")
+    await end_composition(c)
     await typing_works(c, "子菜单点选「全拼」")
 
-    # g2) 光标靠下、下方放不下：主菜单翻到上方，底边不越过光标下沿（同 Windows clamp_to_work_area）。
-    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
-    panel.trigger("/Fcitx/windinput-menu")
-    main = await wait_window("wind-menu-0", True)
-    ok = main is not None and main[5] and main[2] + main[4] <= 420 + 30 and main[2] >= 0
-    check("菜单：光标靠下时主菜单翻到上方、不出屏", ok, f"menu={main}")
-    await c.key("Escape")
-    await wait_menus_gone()
-
-    # i) 键盘驱动主菜单：↓↓ 到「全角」、回车 → 全角生效（空格上屏全角空格）。
-    panel.trigger("/Fcitx/windinput-menu")
-    await wait_window("wind-menu-0", True)
+    # h) 键盘驱动主菜单：↓↓ 到「全角」、回车 → 全角生效（空格上屏全角空格）。
+    await open_main_menu(c)
     await c.key("Down")
     await c.key("Down")
     await c.key("Return")
     gone = await wait_menus_gone()
+    await end_composition(c)
     await c.key(" ")
     got = c.take()
     check("菜单：键盘 ↓↓回车 选「全角」→ 菜单收起、空格上屏全角空格",
@@ -628,9 +685,8 @@ async def menu_cases(bus, im):
     await asyncio.sleep(0.1)
     await typing_works(c, "键盘点选")
 
-    # j) 键盘 → 展开子菜单、← 收回。
-    panel.trigger("/Fcitx/windinput-menu")
-    await wait_window("wind-menu-0", True)
+    # i) 键盘 → 展开子菜单、← 收回。
+    await open_main_menu(c)
     await c.key("Down")
     await c.key("Right")
     sub = await wait_window("wind-menu-1", True)
@@ -643,42 +699,43 @@ async def menu_cases(bus, im):
     # 1) Esc
     await c.key("Escape")
     check("菜单关闭：Esc", await wait_menus_gone(), "菜单还在")
+    await end_composition(c)
     await typing_works(c, "Esc 关闭")
 
     # 2) 点菜单外
-    panel.trigger("/Fcitx/windinput-menu")
-    await wait_window("wind-menu-0", True)
+    await open_main_menu(c)
     sh("xdotool", "mousemove", "1200", "60", "click", "1")
     check("菜单关闭：点菜单外", await wait_menus_gone(), "菜单还在")
+    await end_composition(c)
     await typing_works(c, "点菜单外关闭")
 
     # 3) 右键（任何位置都只关菜单，同 Windows）
-    panel.trigger("/Fcitx/windinput-menu")
-    main = await wait_window("wind-menu-0", True)
-    if main and main[5]:
+    main = await open_main_menu(c)
+    if main:
         sh("xdotool", "mousemove", str(main[1] + 20), str(main[2] + 20), "click", "3")
     check("菜单关闭：右键", await wait_menus_gone(), "菜单还在")
+    await end_composition(c)
     await typing_works(c, "右键关闭")
 
     # 4) 失焦
-    panel.trigger("/Fcitx/windinput-menu")
-    await wait_window("wind-menu-0", True)
+    await open_main_menu(c)
     await asyncio.sleep(0.3)  # 过服务端 250ms 的「刚打开」焦点守卫之外，addon 那条是无条件的
     await c.ic.call_focus_out()
     check("菜单关闭：失焦", await wait_menus_gone(), "菜单还在")
     await c.ic.call_focus_in()
     await asyncio.sleep(0.2)
+    await end_composition(c)
     await typing_works(c, "失焦关闭")
 
     # 5) 切换输入上下文（焦点换到另一个文本框）
-    panel.trigger("/Fcitx/windinput-menu")
-    await wait_window("wind-menu-0", True)
+    await open_main_menu(c)
     d = await new_ctx(bus, im, "e2e-menu-other")
     check("菜单关闭：焦点切到另一个文本框", await wait_menus_gone(), "菜单还在")
     await typing_works(d, "换输入上下文")
     await d.ic.call_focus_out()
     await c.ic.call_focus_in()
     await asyncio.sleep(0.2)
+    await end_composition(c)
 
     # 6) 候选被清空 / 组合结束（宿主 Reset：点了别处、挪了光标）→ 候选菜单随之关
     menu, _ = await open_candidate_menu(c)
@@ -693,10 +750,10 @@ async def menu_cases(bus, im):
     # 7) 空闲超时（e2e 把 addon 的超时调到 WIND_MENU_IDLE_TIMEOUT_MS）
     idle_ms = int(os.environ.get("WIND_MENU_IDLE_TIMEOUT_MS", "0") or 0)
     if idle_ms:
-        panel.trigger("/Fcitx/windinput-menu")
-        await wait_window("wind-menu-0", True)
+        await open_main_menu(c)
         gone = await wait_until(menus_gone, idle_ms / 1000 + 3)
         check(f"菜单关闭：空闲 {idle_ms}ms 自动收起", gone, "菜单还在")
+        await end_composition(c)
         await typing_works(c, "空闲超时")
 
     sh("xdotool", "mousemove", "5", "5")
@@ -705,28 +762,15 @@ async def menu_cases(bus, im):
     return c
 
 
-async def open_from_panel(panel, key, timeout=10.0):
-    """点状态区入口直到菜单出现：服务刚重启时 socket 先于引擎就绪，这段时间里上行的
-    menu.open 被服务端的延迟处理器按「未就绪」丢掉（按键探活过了不等于整个服务就绪）。"""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        panel.trigger(key)
-        menu = await wait_window("wind-menu-0", True, timeout=1.0)
-        if (menu and menu[5]) or asyncio.get_running_loop().time() >= deadline:
-            return menu
-
-
 async def menu_restart_cases(bus, im, restart):
     """服务一侧没了（被杀 / 重启）：菜单是它画的，addon 必须自己收掉、放开指针；新服务起来后
     照常打字。仅在 e2e 自己管服务时跑（自动拉起模式下服务不归脚本管）。"""
     c = await new_ctx(bus, im, "e2e-menu-restart")
     await c.ic.call_set_cursor_rect(300, 400, 2, 20)
-    panel_key = "/Fcitx/windinput-menu"
-    panel = await impanel(bus)
     w = os.environ["W"]
     # a) 服务被杀：push 断线 → addon 收菜单。
-    menu = await open_from_panel(panel, panel_key)
-    opened = menu is not None and menu[5]
+    menu = await open_main_menu(c, tries=5)
+    opened = menu is not None
     pid = open(os.path.join(w, "svc.pid")).read().strip()
     kr = subprocess.run(["kill", "-9", pid], capture_output=True, text=True)
     print(f"  菜单={menu} kill -9 {pid} rc={kr.returncode} {kr.stderr.strip()}", flush=True)
@@ -739,8 +783,8 @@ async def menu_restart_cases(bus, im, restart):
     await typing_works(c, "服务被杀并重启")
 
     # b) 服务正常重启（SERVICE_READY）：菜单开着时重启。
-    menu = await open_from_panel(panel, panel_key)
-    opened = menu is not None and menu[5]
+    menu = await open_main_menu(c, tries=5)
+    opened = menu is not None
     rc = await asyncio.to_thread(subprocess.run, [restart])
     gone = await wait_menus_gone(5)
     check("菜单关闭：服务重启（SERVICE_READY）", opened and gone, f"开={opened} 关={gone}")
@@ -829,10 +873,60 @@ async def settings_cases(bus, im):
     subprocess.run(["pkill", "-f", "--", "^" + os.path.join(w, "svc", "wind_setting")])
     closed = await wait_until(lambda: not settings_windows(), 5)
     check("设置：设置程序退出后窗口消失", closed, f"windows={settings_windows()}")
+
+    async def launched_again(label, before):
+        """从 before 行起又拉起一次设置程序：argv 记录多一行（无深链参数）、窗口出现；随后关掉。"""
+        ok = await wait_until(lambda: len(read_lines(argv_log)) > before, 10)
+        args = read_lines(argv_log)[before:]
+        mapped = await wait_until(lambda: len(settings_windows()) == 1, 20)
+        check(f"设置：{label} → 拉起设置程序（默认页）", ok and args[:1] == [""] and mapped,
+              f"拉起={ok} argv={args} 窗口={settings_windows()}")
+        subprocess.run(["pkill", "-f", "--", "^" + os.path.join(w, "svc", "wind_setting")])
+        await wait_until(lambda: not settings_windows(), 5)
+
+    # 空闲入口：Fcitx5 状态区动作「清风输入法设置」（托盘菜单 / kimpanel 面板里那一项）。
+    panel = await impanel(bus)
+    watch = await kimpanel_watch(bus)
+    await c.ic.call_focus_out()
+    await c.ic.call_focus_in()  # 聚焦时 kimpanel 重报一遍状态区动作
+    await asyncio.sleep(0.3)
+    regs = [p for ps in watch.registered for p in ps]
+    listed = any(p.startswith("/Fcitx/windinput-settings:清风输入法设置:") for p in regs)
+    check("设置：状态区列出「清风输入法设置」、不再有「清风输入法菜单」",
+          listed and not any("windinput-menu" in p for p in regs), f"属性={regs[-6:]}")
+    before = len(read_lines(argv_log))
+    panel.trigger("/Fcitx/windinput-settings")
+    await launched_again("状态区点「清风输入法设置」", before)
+
+    # 系统输入法配置里点清风的「配置」：配置工具经 Controller1.GetConfig 取描述。整页只有一个
+    # External 项时 fcitx5-configtool（5.1.6+）直接启动它，而不是弹一张空白配置页。
+    intro = await bus.introspect(SERVICE, "/controller")
+    ctl = bus.get_proxy_object(SERVICE, "/controller", intro).get_interface(
+        "org.fcitx.Fcitx.Controller1")
+    external = ""
+    for uri in ("fcitx://config/inputmethod/windinput", "fcitx://config/addon/windinput"):
+        try:
+            _, desc = await ctl.call_get_config(uri)
+        except Exception as e:  # noqa: BLE001 — 失败原因原样进断言信息
+            desc, err = [], repr(e)
+        else:
+            err = ""
+        opts = desc[0][1] if len(desc) == 1 else []
+        only = opts[0] if len(opts) == 1 else None
+        external = only[4]["External"].value if only and "External" in only[4] else ""
+        check(f"配置：{uri} 是唯一一项 External、指向设置程序",
+              only is not None and only[1] == "External"
+              and external == os.environ.get("WIND_INPUT_SETTING"),
+              f"desc={desc} {err}")
+    # 照配置工具的做法把 External 当命令启动（QProcess::startDetached），确认它真能拉起来。
+    if external:
+        before = len(read_lines(argv_log))
+        subprocess.Popen([external], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        await launched_again("配置工具启动 External 命令", before)
+
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
-
-
 async def wait_ready(c):
     """服务的 socket 起得比引擎早：词库（首次还要建 .wdat 缓存）加载完成前，按键一律透传。
     用真实通路探活——按 a 直到被吃（= 引擎开始组字），再 Esc 撤掉。"""

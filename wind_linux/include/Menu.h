@@ -1,4 +1,4 @@
-// 自绘菜单（主菜单 / 候选右键菜单）的纯逻辑：级与 kind 的换算、入口锚点、空闲超时配置。
+// 自绘菜单（主菜单 / 候选右键菜单）的纯逻辑：级与 kind 的换算、右键目标、空闲超时配置。
 //
 // 菜单与候选窗、浮层同构：服务进程光栅化（复用 Windows 的 popup_menu），本端只贴图、在菜单
 // 打开期间抓住指针把原始事件报回去（CMD_MENU_POINTER）。命中测试、高亮、子菜单都在服务端，
@@ -6,8 +6,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
-#include <utility>
 
 namespace windlinux {
 
@@ -17,11 +15,6 @@ int menuLevelOfKind(uint32_t kind);
 /// 候选窗上右键的命中结果 → `menu.open` 的 target：命中候选给页内下标（候选右键菜单），
 /// 翻页按钮 / 空白处给 -1（功能主菜单）——同 Windows `CandidateWindow::right_click`。
 int32_t contextMenuTarget(int32_t hit);
-
-/// Fcitx5 状态区入口打开主菜单时的锚点：光标矩形的左下角（菜单出现在光标下方）。
-/// 宿主从没报过光标位置（全 0）返回空，调用方改用当前指针位置。
-std::optional<std::pair<int32_t, int32_t>> caretMenuAnchor(int32_t left, int32_t top,
-                                                           int32_t width, int32_t height);
 
 /// 菜单空闲超时（毫秒）：这么久没有任何指针事件 / 菜单帧就本端收菜单并报 `menu.dismiss`。
 /// 默认 60000，与服务端 `MENU_IDLE_TIMEOUT` 同值；环境变量 `WIND_MENU_IDLE_TIMEOUT_MS`

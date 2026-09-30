@@ -6,4 +6,4 @@ Version=@PROJECT_VERSION@
 Library=libwindinput
 Type=SharedLibrary
 OnDemand=True
-Configurable=False
+Configurable=True

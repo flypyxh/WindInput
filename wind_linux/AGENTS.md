@@ -20,7 +20,7 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/ResponseRouter.h` + `src/core/ResponseRouter.cpp` | 响应帧 → 宿主操作。Swift `BridgeResponseRouter` 的逐条移植（待定标点 / 定格前缀 / hold 计时器 / 数字后智能标点记账） |
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
-| `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、状态区入口锚点、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
+| `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
 | `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |
 | `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层 + 自绘菜单：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮/右键回传、浮层自动隐藏计时、菜单打开期间抓指针并回报 |
@@ -172,10 +172,13 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
   照用，只是点菜单外看不见。**不抓键盘**：键要照常经宿主到服务端的 `forward_menu_key`。
 - **本端收菜单并报 `menu.dismiss`**：`deactivate`（失焦 / 换 IC / 切走输入法）、空闲超时、`SERVICE_READY`
   （补报）。push 断线（服务没了）只收不报。服务端推来的隐藏帧不报（是它关的）。
-- **入口**：候选窗右键 → `menu.open`（带工作区）；状态区动作 `windinput-menu`（「清风输入法菜单」，
-  `activate` 时挂进 `StatusGroup::InputMethod`）→ 主菜单锚在光标左下，宿主没报光标就用指针位置。
-- e2e 的状态区入口靠客户端扮演 kimpanel（持有 `org.kde.impanel`、发 `TriggerProperty`），故
-  fcitx5 要 `--enable` 上 `kimpanel`；菜单用例把空闲超时调到 5 秒以覆盖超时那条路。
+- **入口**：候选窗右键 → `menu.open`（带工作区）；主菜单经候选菜单末行「更多…」。空闲时没有
+  主菜单入口：状态区动作 `windinput-settings`（「清风输入法设置」，`activate` 时挂进
+  `StatusGroup::InputMethod`）直接启动设置程序，取舍见设计文档 §5c。
+- e2e 的菜单用例都从组字中的「更多…」开主菜单，关掉后先 Esc 收组字再验打字；菜单用例把空闲超时
+  调到 5 秒以覆盖超时那条路。客户端扮演 kimpanel（持有 `org.kde.impanel`、发 `TriggerProperty`
+  点状态区动作，听 `org.kde.kimpanel.inputmethod` 的 `UpdateProperty` 取当前输入法图标），故
+  fcitx5 要 `--enable` 上 `kimpanel`。
 
 ## 与 Windows / macOS 的差距
 

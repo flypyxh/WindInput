@@ -19,15 +19,6 @@ int32_t contextMenuTarget(int32_t hit)
     return hit >= 0 ? hit : -1;
 }
 
-std::optional<std::pair<int32_t, int32_t>> caretMenuAnchor(int32_t left, int32_t top,
-                                                           int32_t width, int32_t height)
-{
-    if (left == 0 && top == 0 && width <= 0 && height <= 0) {
-        return std::nullopt;
-    }
-    return std::make_pair(left, top + (height > 0 ? height : 0));
-}
-
 uint32_t menuIdleTimeoutMs(const char* env)
 {
     if (!env || !*env) {
