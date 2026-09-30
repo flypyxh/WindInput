@@ -5814,6 +5814,12 @@ impl EngineManager {
             // 方案级归一化：构造一次、施加到全部词库层——同一个映射函数才保序，
             // 库间相对关系因此原样保留（见 `weight_norm_of`）。
             let wnorm = weight_norm_of(&schema);
+            // 影子层的启用集取「本次实际挂上的扩展层」，须在下面消费 `layers` 之前收集。
+            let loaded_extra_ids: Vec<String> = layers
+                .iter()
+                .filter_map(|l| l.name.strip_prefix("codetable-extra-"))
+                .map(str::to_string)
+                .collect();
             for l in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(l.dict, l.name, l.enabled)
@@ -5837,6 +5843,13 @@ impl EngineManager {
             let mut engine = CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
                 .with_charset(charset)
                 .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema));
+            // 影子层（未启用扩展库，只给通配 / 反查用，spec §4.2）：开关关或无扩展库时不挂。
+            // 混输的主码表子引擎也走这里、用的是主方案的 `eff`（契约 7）；英文分支不接。
+            if eff.lookup_disabled_dicts
+                && let Some(d) = Self::disabled_dict_layers(&schema, &schemas, loaded_extra_ids)
+            {
+                engine = engine.with_disabled_dicts(d);
+            }
             // 逆切分的两段由引擎自己查，协调器的候选调整够不着，须另行注入（论坛 t231）。
             // 归属 id 取方案自身：码表的 `data_schema_id` 就是自身 id（只有拼音族折叠），
             // 混输下 `split_input` 恒为 false（见 `resolve_split_input`），不会注入。
@@ -5958,22 +5971,87 @@ impl EngineManager {
             .collect()
     }
 
+    /// 码表方案的选库口径：可用 = path 非空；主库 = 首个 `default`，无则首个可用库；其余可用库
+    /// **全是扩展库**（不看 `is_enabled`）。无可用库 ⇒ `None`。
+    ///
+    /// [`Self::load_codetable_layers`] 与 [`Self::disabled_extra_sources`] 共用这一处：两边一旦
+    /// 漂移，就会出现「某库既不在主层也不在影子层」或「主库进了影子层」。
+    fn split_codetable_dicts(schema: &Schema) -> Option<(&DictSpec, Vec<&DictSpec>)> {
+        let mut usable: Vec<&DictSpec> = schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.path.is_empty())
+            .collect();
+        if usable.is_empty() {
+            return None;
+        }
+        let main_idx = usable.iter().position(|d| d.default).unwrap_or(0);
+        let main = usable.remove(main_idx);
+        Some((main, usable))
+    }
+
+    /// 影子层（reverse-mode spec §4.2）的来源：本方案**全部**扩展库（主库除外，含已启用的——
+    /// 它们随时可能被热禁用而进影子集合，计划裁决 5）。哪些真正进影子集合由
+    /// `DisabledDictLayers` 按「声明 − 本次实际挂进主 dm 的」在查询时算，见
+    /// [`Self::disabled_dict_layers`]。用户词库 / 临时词库不在 `[[dictionaries]]` 里，天然不在内。
+    ///
+    /// `load` 闭包与 `load_codetable_layers` 同一条读盘路径（`resolve_dict_file` + `cache_path` +
+    /// `CachedDict::load_at_with`），**只返回 `Result`、不 panic**：失败由影子层 `warn!` 后跳过该库
+    /// （spec §4.3）。它在首次通配 / 反查查询时于**按键线程同步**调用（可能 mmap 或首建 wdat）——
+    /// 属设计接受：契约 4 要求「从未查询 ⇒ 零加载」，故不预热；之后复用，直到失效重建。
+    fn disabled_extra_sources(
+        schema: &Schema,
+        schemas_dir: &Path,
+    ) -> Vec<crate::codetable::DisabledDictSource> {
+        let Some((_, extras)) = Self::split_codetable_dicts(schema) else {
+            return Vec::new();
+        };
+        extras
+            .into_iter()
+            .map(|e| {
+                let full = Self::resolve_dict_file(&e.path, schemas_dir);
+                let is_english = e.dict_type == "english";
+                crate::codetable::DisabledDictSource {
+                    id: e.id.clone(),
+                    base_order: e.base_order,
+                    default_weight: e.default_weight,
+                    load: Arc::new(move || {
+                        CachedDict::load_at_with(&full, &cache_path(&full, "wdat"), is_english)
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// 组装影子层：来源见 [`Self::disabled_extra_sources`]，启用集 = 本次 `load_codetable_layers`
+    /// **实际挂上**的扩展库 id（不是 `is_enabled()`：用户覆盖启用的已挂上、不进影子；启用但加载
+    /// 失败的算未挂，影子层会再试一次、再失败也只 warn）。主库恒不在来源里。
+    /// 无扩展库 ⇒ `None`，不挂（零开销，契约 1/4）。开关由调用方判。
+    fn disabled_dict_layers(
+        schema: &Schema,
+        schemas_dir: &Path,
+        loaded_extra_ids: Vec<String>,
+    ) -> Option<crate::codetable::DisabledDictLayers> {
+        let sources = Self::disabled_extra_sources(schema, schemas_dir);
+        if sources.is_empty() {
+            return None;
+        }
+        Some(crate::codetable::DisabledDictLayers::new(
+            sources,
+            loaded_extra_ids,
+            weight_norm_of(schema),
+        ))
+    }
+
     fn load_codetable_layers(schema: &Schema, schemas_dir: &Path) -> Vec<CodetableLayer> {
         let resolve =
             |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
         let is_english =
             |e: &DictSpec| -> bool { !e.dict_type.is_empty() && e.dict_type == "english" };
 
-        let usable: Vec<&DictSpec> = schema
-            .dictionaries
-            .iter()
-            .filter(|d| !d.path.is_empty())
-            .collect();
-        if usable.is_empty() {
+        let Some((main, extras)) = Self::split_codetable_dicts(schema) else {
             return Vec::new();
-        }
-        // 主库 = 首个 default；无 default 则取首个可用库。
-        let main_idx = usable.iter().position(|d| d.default).unwrap_or(0);
+        };
 
         let load_one = |e: &DictSpec| -> Option<CachedDict> {
             let full = resolve(&e.path);
@@ -5988,19 +6066,15 @@ impl EngineManager {
 
         let mut out: Vec<CodetableLayer> = Vec::new();
         // 主库优先注册。加载失败 → 无系统层可用，放弃整方案（避免无候选）。
-        match load_one(usable[main_idx]) {
+        match load_one(main) {
             Some(d) => {
-                info!(
-                    "  codetable main: {} ({} entries)",
-                    usable[main_idx].path,
-                    d.len()
-                );
+                info!("  codetable main: {} ({} entries)", main.path, d.len());
                 out.push(CodetableLayer {
                     name: "codetable-system".to_string(),
                     dict: d,
                     enabled: true,
-                    base_order: usable[main_idx].base_order,
-                    default_weight: usable[main_idx].default_weight,
+                    base_order: main.base_order,
+                    default_weight: main.default_weight,
                 });
             }
             None => return Vec::new(),
@@ -6012,10 +6086,7 @@ impl EngineManager {
         // mmap 占着，于是用户「关掉了这个码表」之后既看不见它、又删不掉它的缓存文件。
         // 现在改为惰性：禁用的库不读、不建缓存、不映射；用户启用它时
         // `set_dict_enabled` 返回 false → 方案失效 → 下次使用重建，那一趟才去加载。
-        for (i, e) in usable.iter().enumerate() {
-            if i == main_idx {
-                continue;
-            }
+        for e in extras {
             let enabled = e.is_enabled();
             if !enabled {
                 info!(
@@ -9361,5 +9432,98 @@ input_chars = \"a-z;\"
         s.tally("\u{3105}\u{6211}", 1, 0);
         s.finish();
         assert!(s.chars.is_empty() && s.entries == 0);
+    }
+
+    /// 影子层来源与 load_codetable_layers 同口径：主库除外、扩展库全收（含已启用），
+    /// 两边选库规则一旦漂移，就会出现「某库既不在主层也不在影子层」。
+    #[test]
+    fn disabled_extra_sources_cover_every_declared_extra() {
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"t/m.dict.yaml\"\ndefault = true\n\
+             [[dictionaries]]\nid = \"on\"\npath = \"t/on.dict.yaml\"\ndefault_enabled = true\n\
+             [[dictionaries]]\nid = \"off\"\npath = \"t/off.dict.yaml\"\ndefault_enabled = false\n\
+             [[dictionaries]]\nid = \"nopath\"\npath = \"\"\n",
+        )
+        .unwrap();
+        let ids: Vec<String> =
+            EngineManager::disabled_extra_sources(&schema, Path::new("/nonexistent"))
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+        assert_eq!(ids, ["on", "off"]);
+    }
+
+    /// 无 `default` 时主库 = 首个可用库（同 load_codetable_layers），它同样不进影子层来源。
+    #[test]
+    fn disabled_extra_sources_exclude_fallback_main_without_default() {
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"nopath\"\npath = \"\"\n\
+             [[dictionaries]]\nid = \"first\"\npath = \"t/f.dict.yaml\"\n\
+             [[dictionaries]]\nid = \"off\"\npath = \"t/off.dict.yaml\"\ndefault_enabled = false\n",
+        )
+        .unwrap();
+        let ids: Vec<String> =
+            EngineManager::disabled_extra_sources(&schema, Path::new("/nonexistent"))
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+        assert_eq!(ids, ["off"]);
+    }
+
+    /// Task 8 审查 (a)：实际进影子集合的只有「本次没挂进主 dm 的扩展库」——主库、已加载的扩展库
+    /// 都不读。四个库各放一个独有词，用 `??` 通配把影子层整个掏出来比对；另有一个文件缺失的
+    /// 未启用库，证明 loader 失败只 warn 跳过、不 panic（审查 (b)）。
+    #[test]
+    fn disabled_dict_layers_load_only_unloaded_extras() {
+        let dir = std::env::temp_dir().join(format!("wind-ddl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        let dict = |name: &str, body: &str| {
+            format!(
+                "---\nname: {name}\nversion: \"1\"\ncolumns:\n  - code\n  - text\n  - weight\n...\n{body}"
+            )
+        };
+        for (f, body) in [
+            ("m", "aa\t主库\t1\n"),
+            ("on", "ab\t已启用\t1\n"),
+            ("off", "ac\t未启用\t1\n"),
+        ] {
+            std::fs::write(dir.join(format!("t/{f}.dict.yaml")), dict(f, body)).unwrap();
+        }
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"t/m.dict.yaml\"\ndefault = true\n\
+             [[dictionaries]]\nid = \"on\"\npath = \"t/on.dict.yaml\"\ndefault_enabled = true\n\
+             [[dictionaries]]\nid = \"off\"\npath = \"t/off.dict.yaml\"\ndefault_enabled = false\n\
+             [[dictionaries]]\nid = \"gone\"\npath = \"t/gone.dict.yaml\"\ndefault_enabled = false\n",
+        )
+        .unwrap();
+        let d = EngineManager::disabled_dict_layers(&schema, &dir, vec!["on".to_string()])
+            .expect("有扩展库 ⇒ 挂影子层");
+        assert_eq!(d.load_count(), 0, "构造不读盘");
+        let pat = format!("{0}{0}", wind_dict::WILDCARD_SLOT);
+        let texts: Vec<String> = d
+            .search_pattern(&pat, wind_dict::WILDCARD_SLOT, 50, true)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(texts, ["未启用"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 方案没有任何扩展库 ⇒ 不挂影子层（零开销）。
+    #[test]
+    fn disabled_dict_layers_none_without_extras() {
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"t/m.dict.yaml\"\ndefault = true\n",
+        )
+        .unwrap();
+        assert!(
+            EngineManager::disabled_dict_layers(&schema, Path::new("/nonexistent"), Vec::new())
+                .is_none()
+        );
     }
 }
