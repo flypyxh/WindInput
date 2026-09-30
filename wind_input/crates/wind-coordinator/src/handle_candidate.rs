@@ -3739,10 +3739,7 @@ impl Coordinator {
             }
             // 清空输入并上屏该数字：已打的码（含已转换前缀）与候选一并丢弃，不顶高亮候选。
             "clear_and_input" => {
-                state.committed_text.clear();
-                state.committed_segs.clear();
-                state.input_buffer.clear();
-                state.candidates.clear();
+                self.reset_pinyin_composition(state);
                 self.notify_ui_hide();
                 let digit = self.overflow_digit_text(state, num);
                 self.record_commit(&digit, 0, -1, wind_store::stats::CommitSource::Punctuation);
