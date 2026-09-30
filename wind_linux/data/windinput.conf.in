@@ -1,7 +1,7 @@
 [InputMethod]
 Name=WindInput
 Name[zh_CN]=清风输入法
-Icon=input-keyboard
+Icon=windinput
 Label=风
 LangCode=zh_CN
 Addon=windinput

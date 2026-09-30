@@ -40,8 +40,7 @@ install -Dm755 /work/target-setting/release/wind_setting "$S/usr/lib/windinput/w
 install -Dm644 /src/scripts/linux/pkg/windinput-setting.desktop "$S/usr/share/applications/windinput-setting.desktop"
 install -Dm644 /src/scripts/linux/pkg/windinput-import.desktop "$S/usr/share/applications/windinput-import.desktop"
 install -Dm644 /src/scripts/linux/pkg/windinput-mime.xml "$S/usr/share/mime/packages/windinput.xml"
-install -Dm644 /ws/wind-setting/res/wind_setting_icon.png "$S/usr/share/icons/hicolor/256x256/apps/windinput.png"
-install -Dm644 /ws/wind-setting/res/wind_setting_icon_sm.png "$S/usr/share/icons/hicolor/64x64/apps/windinput.png"
+# 图标（windinput / windinput-zh / windinput-en，各尺寸）由上面的 cmake --install 装好。
 install -Dm644 /src/wind_linux/README.md "$S/usr/share/doc/windinput/README.md"
 
 mkdir -p "$S/DEBIAN"
