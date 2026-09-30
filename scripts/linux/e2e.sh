@@ -65,14 +65,11 @@ trap cleanup EXIT
 cp "$SERVICE_BIN" "$W/svc/wind_input"
 ln -s "$DATA_DIR" "$W/svc/data"
 # 设置程序经一层包装：先记下 addon 传来的 argv（用例据此断言深链参数），再换成真程序。
-# TMPDIR 指进本次临时目录——windui 的单实例 socket 在 TMPDIR 下，不隔离会与本机开着的
-# 设置程序或并发的另一份 e2e 互相转发。
+# 它的单实例 socket 在 $XDG_RUNTIME_DIR 下，下面已指进临时目录，不会与本机开着的设置程序串台。
 ln -s "$SETTING_BIN" "$W/svc/wind_setting.bin"
-mkdir -p "$W/tmp"
 cat >"$W/svc/wind_setting" <<SETTING
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >>"$W/setting.argv"
-export TMPDIR="$W/tmp"
 exec "$W/svc/wind_setting.bin" "\$@"
 SETTING
 chmod +x "$W/svc/wind_setting"

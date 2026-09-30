@@ -32,6 +32,10 @@ windinput-setup                        # 每个使用者运行一次：配置 fc
 # 然后注销并重新登录
 ```
 
+包里带图形设置程序（`/usr/lib/windinput/wind_setting`）：应用菜单「清风输入法设置」，或输入时按
+`Ctrl+Shift+]`。构建时需要兄弟仓库 `../wind-setting` 与 `../wind-ui-rust`（`SETTING_REPO` 可指定）。
+设置程序的文件对话框依赖 xdg-desktop-portal 或 zenity（包已 Recommends）。
+
 必须在 22.04 上构建：更新的发行版编出的产物带 GLIBC_2.38+ 符号和更新的 fcitx5 ABI，22.04 上加载不了。
 服务由 addon 在连不上时自动拉起（`/usr/lib/windinput/wind_input`，可用 `WIND_INPUT_SERVICE` 覆盖），
 服务自己持 flock 单例。
@@ -41,7 +45,9 @@ windinput-setup                        # 每个使用者运行一次：配置 fc
 1. 启动服务 `wind_input`（exe 同目录要有 `data/` 词库目录）。socket 在
    `$XDG_RUNTIME_DIR/WindInput/`。
 2. 在 Fcitx5 配置里把「清风输入法」加入输入法组。
-3. 想用 Shift 单击切换中英：到 Fcitx5 全局配置里清空「临时在当前和第一个输入法之间切换」
+3. 设置：应用菜单「清风输入法设置」，或在输入时按 `Ctrl+Shift+]`（开发时设置程序路径可用
+   `WIND_INPUT_SETTING` 覆盖，默认 `/usr/lib/windinput/wind_setting`）。
+4. 想用 Shift 单击切换中英：到 Fcitx5 全局配置里清空「临时在当前和第一个输入法之间切换」
    （`AltTriggerKeys`，出厂是左 Shift），否则 Shift 会先被 Fcitx5 截走。
 
 ## 测试

@@ -84,7 +84,27 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 | M1b | Fcitx5 addon：输入通路（按键/上屏/预编辑/焦点/自愈），DBus 集成测试 | 进行中 |
 | M1c | addon 的 X11 候选窗呈现、鼠标回传；状态气泡 / Toast / tooltip 光栅浮层 | 进行中 |
 | M2 | Wayland：Fcitx5 UI addon + input popup surface；先做 spike 验证 popup 表面能否收鼠标事件 | 待做 |
-| M3 | 自绘菜单、设置端适配（`wind-setting` 的 `windui` 已支持 X11/Wayland，缺托盘）、打包 | 待做 |
+| M3a | 设置端适配：`wind-setting` Linux 原生构建、平台门控、addon 处理 `settings.open`、`.desktop` 入口、随 `.deb` 分发 | 完成（见 §6b） |
+| M3b | 自绘菜单（主菜单 / 候选右键菜单） | 待做 |
+
+## 6b. 设置端（M3a 结论）
+
+- **能用**：`wind_setting` 在 Linux 原生编译、单测全绿；windui 默认走 X11（Wayland 会话经
+  XWayland，`WINDUI_BACKEND=wayland` 才试原生 Wayland），文字经 fontconfig，中文渲染正常。
+  控制 socket、用户目录、日志目录与服务同一套规则（`$XDG_RUNTIME_DIR/wind_input[_dev]_ctrl.sock`、
+  `~/.config/WindInput[Dev]`），改设置写入用户 `config.toml` 并被服务热加载（实测）。
+- **入口**：应用菜单（`windinput-setting.desktop`，兼 `windinput://` 协议）与「打开设置」热键
+  （出厂 `Ctrl+Shift+]`）。后者：服务 `open_settings_with` 推扩展信封 `settings.open` → addon
+  （`SettingsLauncher` + `fcitx::startProcess`）启动 `/usr/lib/windinput/wind_setting`
+  （`WIND_INPUT_SETTING` 可覆盖）；只启动自己的设置程序，信封内容只当参数。e2e 覆盖整条链。
+- **门控**：清单 `platform` 字段加 `linux`；在 macOS 精简范围之上，Linux 另藏工具栏显示/切换、
+  软键盘热键、`activate_ime`、Dota2 兼容与热键的「全局」勾选。逐项依据见 wind-setting README
+  「按平台屏蔽的设置项」。应用兼容性（按应用配置）**保留**：服务按 addon 报的程序名匹配规则，
+  与 macOS 同一机制——§2「不做」指的是不为 Linux 维护内置规则，不是机制不可用。
+- **托盘 / 常驻（`run_resident`）缺失不影响设置端**：`wind_setting` 不用常驻模式也不用托盘；
+  缺的是输入法自己的状态指示（见 §2「工具栏」）。
+- **已知问题**（windui Linux 后端）：设置程序已开着时，深链转来的切页要等下一次输入事件才显示；
+  文件对话框依赖 xdg-desktop-portal 或 zenity，都没有时点了无反应。
 
 ## 7. 待验证的风险
 
