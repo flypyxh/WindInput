@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 # Linux 上作为外部宿主（Fcitx5 addon）的服务端：启用 host-render forwarder 与真实文本后端。默认关，
 # 关闭时 Linux 仍是 mock 文本（开发机 `cargo test` 行为不变），见 build.rs 的 `ext_presenter` / `mock_text`。
-linux-host = ["dep:ttf-parser", "dep:ab_glyph_rasterizer"]
+linux-host = ["dep:ttf-parser", "dep:ab_glyph_rasterizer", "dep:rustybuzz"]
 
 [dependencies]
 # 表现层协议类型（UiCommand/UiEvent 等）的定义处；本 crate 原路径 pub use 再导出。
@@ -55,6 +55,10 @@ windows-core = "0.58"
 [target.'cfg(target_os = "linux")'.dependencies]
 ttf-parser = { version = "0.24", optional = true }
 ab_glyph_rasterizer = { version = "0.1", optional = true }
+# 只给 emoji 簇整形（ZWJ 组合 / 国旗 / 键帽 / 肤色的 GSUB 连字），普通文字仍逐字排。
+# 0.18 与 ttf-parser 0.24 配套，且 resvg 的 text feature 已经把同一版本拉进依赖闭包，
+# 不多编一份。彩色字形的 PNG 解码、COLR / SVG 光栅复用已有的 image 与 resvg。
+rustybuzz = { version = "0.18", optional = true }
 
 # macOS：CoreText 真字形文本后端（text/coretext.rs）。
 # （wind-ipc 已提为通用依赖，manager_macos forwarder 的帧编码照旧可用。）

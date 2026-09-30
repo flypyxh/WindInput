@@ -200,6 +200,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | CapsLock 状态通知（`VK_CAPITAL` keyup） | 不发 | 服务端靠每键 `toggles` 校准 CapsLock 镜像，功能不缺；只是按 CapsLock 本身不会即时刷新状态 |
 | 英文输入统计（`CMD_INPUT_STATS`） | 不发 | 同 macOS |
 | 小键盘 / 符号键映射 | keysym 走 US 布局反查 | 非 US 布局的 Shift 符号键（如德语 `§`）没有 VK，透传给宿主 |
+| 彩色 emoji | 已接（服务端文字后端） | CBDT（Noto Color Emoji）、COLR v0/v1、OpenType-SVG 实测可画；肤色 / ZWJ / 国旗 / 键帽按字体 GSUB 合成一个字形。依赖系统装彩色 emoji 字体（`.deb` Recommends `fonts-noto-color-emoji`），没有时画单色字形或方框。sbix 未实测、COLR v1 扫掠渐变降级为纯色，见 `wind-ui/src/text/linux/mod.rs` 模块头 |
 | 非 X11 坐标（Wayland） | 未处理 | `cursorRect()` 在 Wayland 下是窗口相对坐标，候选窗定位要等 Wayland 阶段 |
 
 ## 协议同步铁律

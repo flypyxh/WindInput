@@ -234,6 +234,19 @@ pub(crate) fn sort(family: &str, weight: u16, lang: &str) -> Option<Vec<Candidat
         escape(family),
         fc_weight(a, weight)
     );
+    sort_query(a, &query)
+}
+
+/// 系统配置的彩色 emoji 字体：通用族名 `emoji`（fontconfig ≥ 2.13.9x 的 `45-generic.conf` /
+/// `60-generic.conf` 把它映射到 Noto Color Emoji / Twemoji 等）并要求 `color=true`。
+/// 返回排序后的候选，调用方加载后自己再核对「真有彩色表」——老 fontconfig 不认识 `emoji`
+/// 这个名字时会替换出一款普通字体，`color` 属性也可能缺席。
+pub(crate) fn sort_emoji() -> Option<Vec<Candidate>> {
+    let a = api()?;
+    sort_query(a, "emoji:color=True").or_else(|| sort_query(a, "emoji"))
+}
+
+fn sort_query(a: &Api, query: &str) -> Option<Vec<Candidate>> {
     let cq = CString::new(query).ok()?;
     unsafe {
         let pat = (a.name_parse)(cq.as_ptr() as *const u8);

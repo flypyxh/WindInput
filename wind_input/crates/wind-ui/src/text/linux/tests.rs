@@ -1,6 +1,20 @@
 //! Linux 文本后端的单测。依赖本机字体：至少一款 CJK 字体（`fc-list :lang=zh`）与一款
 //! 纯拉丁字体（DejaVu Sans，几乎所有发行版默认装）——缺哪款，对应用例会带着说明失败，
 //! 不静默跳过。
+//!
+//! 彩色 emoji 用例另要四款字体（每种彩色格式一款），放进同一个目录，用
+//! `WIND_TEST_EMOJI_DIR=<目录>` 指定（CBDT 那款也会去系统路径找）。无 root 也能备齐：
+//!
+//! ```sh
+//! mkdir -p ~/emoji-fonts && cd ~/emoji-fonts
+//! apt-get download fonts-noto-color-emoji && dpkg -x fonts-noto-color-emoji_*.deb x \
+//!   && cp x/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf .                        # CBDT
+//! curl -LO https://github.com/googlefonts/noto-emoji/raw/v2.047/fonts/Noto-COLRv1.ttf   # COLRv1
+//! curl -L -o TwemojiMozilla.ttf \
+//!   https://github.com/mozilla/twemoji-colr/releases/download/v0.7.0/Twemoji.Mozilla.ttf  # COLRv0
+//! curl -L https://github.com/13rac1/twemoji-color-font/releases/download/v15.1.0/TwitterColorEmoji-SVGinOT-Linux-15.1.0.tar.gz \
+//!   | tar xz --strip-components=1 --wildcards '*/TwitterColorEmoji-SVGinOT.ttf'         # OpenType-SVG
+//! ```
 
 use super::*;
 
@@ -538,4 +552,467 @@ fn png_candidate_window() {
             ),
         );
     }
+}
+
+// ── 彩色 emoji ────────────────────────────────────────────────────────────────────
+
+/// 取测试 emoji 字体：`WIND_TEST_EMOJI_DIR` 下的 `file`；`system` 是另外可找的系统路径。
+/// 找不到就带着备齐办法失败（见模块头）。
+fn emoji_font(file: &str, system: &[&str]) -> FaceId {
+    let dir = std::env::var_os("WIND_TEST_EMOJI_DIR").map(std::path::PathBuf::from);
+    let path = dir
+        .iter()
+        .map(|d| d.join(file))
+        .chain(system.iter().map(std::path::PathBuf::from))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "本用例需要彩色 emoji 字体 {file}：放进一个目录并设 WIND_TEST_EMOJI_DIR=<目录>\
+                 （当前 {dir:?}），备齐办法见 text/linux/tests.rs 模块头"
+            )
+        });
+    let id = store::with(|st| st.load_file(&path, 0))
+        .unwrap_or_else(|| panic!("字体解析失败：{}", path.display()));
+    assert!(
+        store::with(|st| st.face(id).color),
+        "{} 没有彩色字形表",
+        path.display()
+    );
+    id
+}
+
+/// Noto Color Emoji（CBDT/CBLC 位图）——Ubuntu / Debian / Deepin 的 `fonts-noto-color-emoji`。
+fn cbdt() -> FaceId {
+    emoji_font(
+        "NotoColorEmoji.ttf",
+        &[
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/google-noto-color-emoji/NotoColorEmoji.ttf",
+        ],
+    )
+}
+
+/// Twemoji Mozilla（COLR v0：分层纯色）。
+fn colr_v0() -> FaceId {
+    emoji_font("TwemojiMozilla.ttf", &[])
+}
+
+/// Noto-COLRv1（COLR v1：渐变、变换、裁剪）。
+fn colr_v1() -> FaceId {
+    emoji_font("Noto-COLRv1.ttf", &[])
+}
+
+/// Twitter Color Emoji SVGinOT（OpenType-SVG，另带单色 glyf 轮廓）。
+fn svg_font() -> FaceId {
+    emoji_font("TwitterColorEmoji-SVGinOT.ttf", &[])
+}
+
+/// emoji 簇只从 `face` 里找的渲染器（字体仓库进程级共享，不能改全局 emoji 字体）。
+fn emoji_renderer(face: FaceId, size: f32) -> TextRenderer {
+    let mut r = TextRenderer::new(CJK, size).unwrap();
+    r.emoji_override = Some(vec![face]);
+    r
+}
+
+/// 在透明底上画 `text`，返回 (缓冲, 宽, 高)。
+fn draw_on_clear(r: &TextRenderer, text: &str, size: f32) -> (Vec<u8>, u32, u32) {
+    let ts = TextStyle::new(size);
+    let m = r.measure(text, &ts);
+    let (w, h) = (m.width.ceil() as u32 + 8, m.height.ceil() as u32 + 8);
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    r.draw(&mut buf, w, h, 4.0, 4.0, text, &ts, [0, 0, 0, 255])
+        .unwrap();
+    (buf, w, h)
+}
+
+/// 非透明像素里「明显有彩度」的几种色相各有多少（粗分 6 档色相）。单色字形只会落进
+/// 0 档（灰），彩色 emoji 至少占两档。
+fn hue_buckets(buf: &[u8]) -> [usize; 7] {
+    let mut n = [0usize; 7];
+    for p in buf.chunks(4) {
+        if p[3] < 200 {
+            continue;
+        }
+        let (b, g, r) = (p[0] as i32, p[1] as i32, p[2] as i32);
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        if mx - mn < 60 {
+            n[0] += 1;
+            continue;
+        }
+        let h = if mx == r {
+            ((g - b) as f32 / (mx - mn) as f32).rem_euclid(6.0)
+        } else if mx == g {
+            (b - r) as f32 / (mx - mn) as f32 + 2.0
+        } else {
+            (r - g) as f32 / (mx - mn) as f32 + 4.0
+        };
+        n[1 + (h as usize).min(5)] += 1;
+    }
+    n
+}
+
+fn assert_multicolor(buf: &[u8], what: &str) {
+    let n = hue_buckets(buf);
+    let colorful = n[1..].iter().filter(|&&c| c >= 20).count();
+    assert!(colorful >= 1, "{what}：应画出彩色像素，色相分布 {n:?}");
+    assert!(
+        n.iter().filter(|&&c| c >= 20).count() >= 2,
+        "{what}：应不止一种颜色，色相分布 {n:?}"
+    );
+}
+
+/// 预乘合法性：每个色通道 ≤ alpha。
+fn assert_premultiplied(buf: &[u8]) {
+    for p in buf.chunks(4) {
+        assert!(
+            p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3],
+            "非法预乘像素 {p:?}"
+        );
+    }
+}
+
+/// 一行里真正画出来的字形数（跳过零宽不画的）。
+fn drawn_glyphs(r: &TextRenderer, text: &str) -> Vec<(FaceId, u16)> {
+    r.layout(text, &TextStyle::new(20.0)).lines[0]
+        .iter()
+        .filter_map(|g| g.glyph)
+        .collect()
+}
+
+#[test]
+fn cbdt_emoji_width_is_about_one_em() {
+    let r = emoji_renderer(cbdt(), 20.0);
+    let w = r.measure_text("😀").width;
+    // Noto Color Emoji 的 hmtx 前进宽度是 2550/2048 ≈ 1.25em（DirectWrite 的 Segoe UI
+    // Emoji 约 1.0–1.2em），两个 emoji 恰好两倍。
+    assert!((19.0..=26.0).contains(&w), "{w}");
+    assert!((r.measure_text("😀😀").width - 2.0 * w).abs() < 0.01);
+}
+
+#[test]
+fn cbdt_emoji_draws_in_color() {
+    let r = emoji_renderer(cbdt(), 32.0);
+    let (buf, ..) = draw_on_clear(&r, "😀", 32.0);
+    assert_premultiplied(&buf);
+    assert_multicolor(&buf, "CBDT 😀");
+}
+
+/// 肤色、ZWJ 组合、国旗、键帽、子区旗都整形成**一个**字形，宽度与单个 emoji 相同。
+#[test]
+fn emoji_sequences_shape_to_one_glyph() {
+    let r = emoji_renderer(cbdt(), 20.0);
+    let one = r.measure_text("😀").width;
+    for seq in [
+        "👍🏽",
+        "👨\u{200D}👩\u{200D}👧",
+        "🏳\u{FE0F}\u{200D}🌈",
+        "🇨🇳",
+        "1\u{FE0F}\u{20E3}",
+        "❤\u{FE0F}",
+        "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+    ] {
+        let glyphs = drawn_glyphs(&r, seq);
+        assert_eq!(glyphs.len(), 1, "{seq:?} 应是一个字形：{glyphs:?}");
+        let w = r.measure_text(seq).width;
+        assert!((w - one).abs() < 1.0, "{seq:?} 宽 {w}，单个 emoji 宽 {one}");
+    }
+    // 两面国旗 = 两个字形，不会把四个区域指示符两两错配。
+    assert_eq!(drawn_glyphs(&r, "🇨🇳🇺🇸").len(), 2);
+}
+
+/// 16 / 24 / 32px 都画得出、大小随字号走、边缘不糊：不透明像素占墨迹包围盒的大头。
+#[test]
+fn cbdt_emoji_scales_cleanly() {
+    let face = cbdt();
+    for px in [16.0f32, 24.0, 32.0] {
+        let r = emoji_renderer(face, px);
+        let (buf, w, _) = draw_on_clear(&r, "😀", px);
+        let inked: Vec<(usize, usize)> = buf
+            .chunks(4)
+            .enumerate()
+            .filter(|(_, p)| p[3] != 0)
+            .map(|(i, _)| (i % w as usize, i / w as usize))
+            .collect();
+        assert!(!inked.is_empty(), "{px}px 什么都没画");
+        let bw =
+            inked.iter().map(|p| p.0).max().unwrap() - inked.iter().map(|p| p.0).min().unwrap() + 1;
+        let bh =
+            inked.iter().map(|p| p.1).max().unwrap() - inked.iter().map(|p| p.1).min().unwrap() + 1;
+        for (d, name) in [(bw, "宽"), (bh, "高")] {
+            assert!(
+                d as f32 >= px * 0.8 && d as f32 <= px * 1.35,
+                "{px}px 的 emoji 墨迹{name} {d}"
+            );
+        }
+        let opaque = buf.chunks(4).filter(|p| p[3] == 255).count();
+        assert!(
+            opaque * 2 > bw * bh,
+            "{px}px：不透明像素 {opaque} 应占包围盒 {bw}×{bh} 的一半以上（笑脸是实心圆）"
+        );
+        assert_multicolor(&buf, &format!("{px}px 😀"));
+    }
+}
+
+/// 墨迹行范围（首个、末个非透明行），只看 `[x0, x1)` 列。
+fn ink_rows(buf: &[u8], w: u32, x0: usize, x1: usize) -> (usize, usize) {
+    let rows: Vec<usize> = buf
+        .chunks(4)
+        .enumerate()
+        .filter(|(i, p)| p[3] != 0 && (x0..x1).contains(&(i % w as usize)))
+        .map(|(i, _)| i / w as usize)
+        .collect();
+    (*rows.iter().min().unwrap(), *rows.iter().max().unwrap())
+}
+
+/// 中文、emoji、西文混排：emoji 与汉字在同一基线上、垂直居中大致对齐，不越出行盒太多。
+#[test]
+fn mixed_text_and_emoji_share_the_baseline() {
+    let px = 32.0;
+    let r = emoji_renderer(cbdt(), px);
+    let ts = TextStyle::new(px);
+    let text = "你好😀world";
+    let (buf, w, h) = draw_on_clear(&r, text, px);
+    let x = |s: &str| 4 + r.measure(s, &ts).width.round() as usize;
+    let (cjk0, cjk1) = ink_rows(&buf, w, x(""), x("你好"));
+    let (emo0, emo1) = ink_rows(&buf, w, x("你好") + 1, x("你好😀") - 1);
+    let (lat0, lat1) = ink_rows(&buf, w, x("你好😀") + 1, x(text));
+    let mid = |a: usize, b: usize| (a + b) as f32 / 2.0;
+    assert!(
+        (mid(cjk0, cjk1) - mid(emo0, emo1)).abs() < px * 0.15,
+        "汉字墨迹 {cjk0}..{cjk1}，emoji 墨迹 {emo0}..{emo1}"
+    );
+    // 「world」无降部：底边就是基线，汉字底边略低于基线；emoji 底边在基线下方不超过 0.3em。
+    assert!(
+        emo1 as f32 <= lat1 as f32 + px * 0.3,
+        "emoji 底 {emo1} vs 基线 {lat1}"
+    );
+    assert!(
+        emo0 as f32 >= 4.0 - px * 0.15 && (emo1 as u32) < h,
+        "emoji 越出行盒：{emo0}..{emo1}"
+    );
+    assert!(lat0 > cjk0, "西文 x 高应低于汉字顶");
+}
+
+/// emoji 不参与文字着色（着色段覆盖 emoji 时像素不变），但跟随文字的不透明度。
+#[test]
+fn emoji_ignores_text_color_but_honours_alpha() {
+    let r = emoji_renderer(cbdt(), 24.0);
+    let ts = TextStyle::new(24.0);
+    let (w, h) = (60u32, 40u32);
+    let draw = |color: [u8; 4], runs: &[ColorRun]| {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        r.draw_runs(&mut buf, w, h, 2.0, 2.0, "😀", &ts, color, runs)
+            .unwrap();
+        buf
+    };
+    let black = draw([0, 0, 0, 255], &[]);
+    let red_run = draw(
+        [0, 0, 0, 255],
+        &[ColorRun {
+            start: 0,
+            end: 2,
+            rgba: [255, 0, 0, 255],
+        }],
+    );
+    assert_eq!(black, red_run, "着色段不应改变 emoji 的颜色");
+    assert_eq!(draw([0, 0, 255, 255], &[]), black, "文字色不应改变 emoji");
+    assert!(
+        draw([0, 0, 0, 0], &[]).iter().all(|&b| b == 0),
+        "全透明文字不画"
+    );
+    let half = draw([0, 0, 0, 128], &[]);
+    let max_a = half.chunks(4).map(|p| p[3]).max().unwrap();
+    assert!(
+        (120..=129).contains(&max_a),
+        "半透明文字色下 emoji 的 alpha：{max_a}"
+    );
+}
+
+/// 没有彩色字体可用：不 panic，ZWJ 组合退化为逐字（零宽字符不占宽、不画方框），缺字画
+/// 主字体的 `.notdef`——除非回退链上本来就有能画它的字体。
+#[test]
+fn emoji_without_color_font_degrades_per_char() {
+    let mut r = TextRenderer::new(LATIN, 20.0).unwrap();
+    require(&r, LATIN);
+    r.emoji_override = Some(vec![]);
+    let family = "👨\u{200D}👩\u{200D}👧";
+    let glyphs = drawn_glyphs(&r, family);
+    assert_eq!(glyphs.len(), 3, "ZWJ 组合应拆成 3 个 emoji：{glyphs:?}");
+    for &(face, gid) in &glyphs {
+        let is_color = store::with(|st| st.face(face).color);
+        assert!(
+            is_color || gid == 0 || store::with(|st| st.face(face).has_outlines),
+            "要么是链上的字体画得出来，要么是 .notdef"
+        );
+    }
+    let m = r.measure_text(family);
+    assert!(m.width > 0.0 && m.width.is_finite(), "{m:?}");
+    let (buf, ..) = draw_on_clear(&r, family, 20.0);
+    assert!(
+        buf.chunks(4).any(|p| p[3] != 0),
+        "应画出方框或回退字形，不能整串消失"
+    );
+}
+
+#[test]
+fn colr_v0_emoji_draws_in_color_and_joins_sequences() {
+    let r = emoji_renderer(colr_v0(), 32.0);
+    let (buf, ..) = draw_on_clear(&r, "😀", 32.0);
+    assert_premultiplied(&buf);
+    assert_multicolor(&buf, "COLRv0 😀");
+    assert_eq!(drawn_glyphs(&r, "👨\u{200D}👩\u{200D}👧").len(), 1);
+    assert_eq!(drawn_glyphs(&r, "🇨🇳").len(), 1);
+    let w = r.measure_text("😀").width;
+    assert!((25.0..=42.0).contains(&w), "{w}");
+}
+
+/// 字体缺组合里的某个成分（Twemoji Mozilla 0.7 没有 Unicode 15 的 🫨）：不吞字——已有的
+/// 😀 照样画成彩色，缺的那个交给逐字路径（回退链上的字形或方框）。
+#[test]
+fn zwj_sequence_with_missing_component_keeps_every_part() {
+    let face = colr_v0();
+    let has =
+        |c: char| store::with(|st| st.face(face).face.glyph_index(c).is_some_and(|g| g.0 != 0));
+    assert!(
+        has('😀') && !has('🫨'),
+        "前提：Twemoji Mozilla 0.7 有 😀、没有 🫨"
+    );
+    let r = emoji_renderer(face, 20.0);
+    let glyphs = drawn_glyphs(&r, "😀\u{200D}🫨");
+    assert_eq!(glyphs.len(), 2, "{glyphs:?}");
+    assert_eq!(glyphs[0].0, face, "😀 应仍出自彩色字体");
+    assert_ne!(glyphs[1].0, face);
+}
+
+#[test]
+fn colr_v1_emoji_draws_in_color() {
+    let r = emoji_renderer(colr_v1(), 32.0);
+    let (buf, ..) = draw_on_clear(&r, "😀", 32.0);
+    assert_premultiplied(&buf);
+    assert_multicolor(&buf, "COLRv1 😀");
+    assert_eq!(drawn_glyphs(&r, "🏳\u{FE0F}\u{200D}🌈").len(), 1);
+}
+
+#[test]
+fn svg_emoji_draws_in_color() {
+    let r = emoji_renderer(svg_font(), 32.0);
+    let (buf, ..) = draw_on_clear(&r, "😀", 32.0);
+    assert_premultiplied(&buf);
+    assert_multicolor(&buf, "OpenType-SVG 😀");
+    assert_eq!(drawn_glyphs(&r, "👍🏽").len(), 1);
+}
+
+/// 彩色字体里的非 emoji 字（Twemoji Mozilla 里没有彩色层的普通轮廓字形）照常按轮廓画，
+/// 不会因为字体带 COLR 就画不出来。
+#[test]
+fn color_font_plain_glyph_falls_back_to_outline() {
+    let face = colr_v0();
+    let gid = store::with(|st| {
+        let f = &st.face(face).face;
+        // 找一个有轮廓、没有 COLR 层的字形。
+        (1..f.number_of_glyphs())
+            .map(ttf_parser::GlyphId)
+            .find(|&g| !f.is_color_glyph(g) && f.glyph_bounding_box(g).is_some())
+            .map(|g| g.0)
+    })
+    .expect("Twemoji Mozilla 应有不带彩色层的轮廓字形");
+    let key = GlyphKey {
+        face,
+        gid,
+        ppem64: 32 * 64,
+        phase: 0,
+        bold: false,
+    };
+    let bmp = store::with(|st| rasterize(st.face(face), key)).expect("应按轮廓画出");
+    assert!(!bmp.color);
+}
+
+#[test]
+#[ignore = "产出 PNG 供肉眼检查"]
+fn png_emoji_sample() {
+    let text = "你好😀👍🏽🏳\u{FE0F}\u{200D}🌈🇨🇳1\u{FE0F}\u{20E3}👨\u{200D}👩\u{200D}👧 Hello";
+    type FontFn = fn() -> FaceId;
+    let fonts: [(&str, FontFn); 4] = [
+        ("CBDT", cbdt),
+        ("COLRv0", colr_v0),
+        ("COLRv1", colr_v1),
+        ("SVG", svg_font),
+    ];
+    let sizes = [16.0f32, 24.0, 32.0];
+    let (w, row_h) = (560u32, 44u32);
+    let h = row_h * (fonts.len() * sizes.len()) as u32 + 8;
+    let mut buf = white(w, h);
+    let mut y = 4.0;
+    for (name, font) in fonts {
+        let face = font();
+        for px in sizes {
+            let r = emoji_renderer(face, px);
+            r.draw_text_sized(&mut buf, w, h, 8.0, y, name, 12.0, [120, 120, 120, 255])
+                .unwrap();
+            r.draw_text_sized(&mut buf, w, h, 70.0, y, text, px, [0, 0, 0, 255])
+                .unwrap();
+            y += row_h as f32;
+        }
+    }
+    save_png(&buf, w, h, "linux_emoji_sample.png");
+    // 大字号单独一张，看得清连字有没有合上、位图缩放有没有糊。
+    let (w, row_h) = (720u32, 84u32);
+    let h = row_h * fonts.len() as u32 + 8;
+    let mut buf = white(w, h);
+    for (i, (name, font)) in fonts.into_iter().enumerate() {
+        let r = emoji_renderer(font(), 64.0);
+        let y = 4.0 + (i as u32 * row_h) as f32;
+        r.draw_text_sized(&mut buf, w, h, 4.0, y, name, 12.0, [120, 120, 120, 255])
+            .unwrap();
+        r.draw_text_sized(
+            &mut buf,
+            w,
+            h,
+            60.0,
+            y,
+            "😀👍🏽🏳\u{FE0F}\u{200D}🌈🇨🇳1\u{FE0F}\u{20E3}👨\u{200D}👩\u{200D}👧",
+            64.0,
+            [0, 0, 0, 255],
+        )
+        .unwrap();
+    }
+    save_png(&buf, w, h, "linux_emoji_large.png");
+}
+
+/// 整条候选窗路径带 emoji 候选。候选窗自己建渲染器，emoji 字体走生产路径（fontconfig
+/// `emoji` 族）：跑之前让 fontconfig 看得见 emoji 字体（装了 `fonts-noto-color-emoji`，
+/// 或 `FONTCONFIG_FILE` 指向一份 `<include>` 系统配置再加 `<dir>` 的 fonts.conf）。
+#[test]
+#[ignore = "产出 PNG 供肉眼检查"]
+fn png_candidate_window_emoji() {
+    use crate::candidate_window::{CandidateItem, CandidateWindow, CandidateWindowConfig};
+    assert!(
+        store::with(|st| st.emoji_face_for('😀')).is_some(),
+        "fontconfig 找不到彩色 emoji 字体（见本用例说明）"
+    );
+    let themes = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes");
+    let theme = wind_theme::load_resolved(&themes, "default", false).expect("加载出厂主题");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+    w.set_theme(theme);
+    let item = |text: &str| CandidateItem {
+        text: text.to_string(),
+        code: String::new(),
+        label: String::new(),
+        tooltip: Default::default(),
+        comment: Default::default(),
+        comment_above: Default::default(),
+        no_index: false,
+    };
+    let cands = ["笑", "😀", "小", "😂笑哭", "👍🏽", "🇨🇳"].map(item).to_vec();
+    w.set_position(200, 200, 20, true);
+    w.update("xiao", 4, "拼", cands, 0, -1, 1, 1);
+    let f = w.render_frame().expect("有候选时应出帧");
+    let t0 = std::time::Instant::now();
+    for _ in 0..100 {
+        w.render_frame().unwrap();
+    }
+    eprintln!("render_frame（含 emoji）稳态均值 {:?}", t0.elapsed() / 100);
+    save_png(&f.buf, f.width, f.height, "linux_candidate_emoji.png");
 }

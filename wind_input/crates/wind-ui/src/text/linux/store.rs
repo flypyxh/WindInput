@@ -2,8 +2,9 @@
 //!
 //! 移植自姊妹仓 wind-ui-rust `src/text/linux/store.rs`（同一作者，MIT/Apache-2.0）。与原版
 //! 的差别：链的键是**一串**族名（`ui.font` 方案的默认链 / 脚本指派链，见 `script::FontPlan`）
-//! 而非单个族名；不做斜体；语言提示默认 `zh-cn`；只有位图、没有轮廓的字体（彩色 emoji）
-//! 不当候选（见 [`FaceData::has_outlines`]）；另可按文件加载拆字字根字体。
+//! 而非单个族名；不做斜体；语言提示默认 `zh-cn`；彩色 emoji 字体（CBDT / sbix / COLR /
+//! OpenType-SVG）另有一条专门的查找路径（[`Store::color_face_for`] / [`Store::emoji_face_for`]）
+//! 与簇整形（[`Store::shape`]）；另可按文件加载拆字字根字体。
 //!
 //! 进程级共享（一个 `Mutex` 包住）：同一个字体文件不论被几个窗口、几条链引用都只映射
 //! 一次。字体文件以 `mmap` 只读映射且**永不卸载**——映射页是文件后备的共享页，不计入
@@ -31,9 +32,11 @@ pub(crate) struct FaceData {
     pub line_gap: f32,
     /// 字体自身的字重（CSS 刻度）——判断要不要合成粗体。
     pub weight: u16,
-    /// 有没有矢量轮廓（`glyf` / `CFF` / `CFF2`）。纯位图字体（Noto Color Emoji 的 CBDT、
-    /// Apple 的 sbix）本后端画不出来，挑字时跳过它，让链上后面的单色字体接手。
+    /// 有没有矢量轮廓（`glyf` / `CFF` / `CFF2`）。
     pub has_outlines: bool,
+    /// 有没有彩色字形表（`CBDT` / `sbix` / `COLR` / `SVG `），见 `color.rs`。Noto Color Emoji
+    /// 这类纯位图字体没有轮廓，只能走彩色路径。
+    pub color: bool,
 }
 
 impl FaceData {
@@ -49,6 +52,7 @@ impl FaceData {
         }
         let t = face.tables();
         let has_outlines = t.glyf.is_some() || t.cff.is_some() || t.cff2.is_some();
+        let color = t.cbdt.is_some() || t.sbix.is_some() || t.colr.is_some() || t.svg.is_some();
         Self {
             upem,
             ascent,
@@ -56,6 +60,7 @@ impl FaceData {
             line_gap: face.line_gap().max(0) as f32,
             weight: face.weight().to_number(),
             has_outlines,
+            color,
             face,
         }
     }
@@ -90,7 +95,18 @@ impl Cand {
 struct Chain {
     cands: Vec<Cand>,
     by_char: HashMap<char, Option<(FaceId, u16)>>,
+    /// [`Store::color_face_for`] 的结果缓存。
+    color_by_char: HashMap<char, Option<FaceId>>,
 }
+
+/// 一个 emoji 簇的整形结果：[(字形, 前进宽度（字体单位）)]。
+pub(crate) type ShapedCluster = Vec<(u16, i32)>;
+
+/// emoji 簇整形缓存的条目上限，满则整体清空（同测量缓存的做法）。
+const SHAPE_CACHE_CAP: usize = 2048;
+/// 解析系统 emoji 字体时最多加载几个 fontconfig 候选（排在前面的才是 `emoji` 的映射目标，
+/// 后面是按覆盖度补上的普通字体，没必要逐个映射进来）。
+const EMOJI_CANDS_MAX: usize = 4;
 
 #[derive(Default)]
 pub(crate) struct Store {
@@ -99,6 +115,13 @@ pub(crate) struct Store {
     chains: Vec<Chain>,
     chain_keys: HashMap<(Vec<String>, u16), ChainId>,
     scanned: Option<Vec<PathBuf>>,
+    /// 系统的彩色 emoji 字体（fontconfig `emoji` 族），首次遇到 emoji 簇时解析。
+    emoji: Option<Vec<FaceId>>,
+    /// 彩色字体的整形器（按需建，只给 emoji 簇用）。
+    shapers: HashMap<FaceId, rustybuzz::Face<'static>>,
+    /// emoji 簇整形结果：字体 → 簇文本 → [(字形, 前进宽度（字体单位）)]（`None` = 字体缺字）。
+    shaped: HashMap<FaceId, HashMap<String, Option<ShapedCluster>>>,
+    shaped_len: usize,
 }
 
 pub(crate) fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
@@ -189,6 +212,7 @@ impl Store {
         self.chains.push(Chain {
             cands,
             by_char: HashMap::new(),
+            color_by_char: HashMap::new(),
         });
         self.chain_keys.insert(key, id);
         match self.primary(id) {
@@ -217,11 +241,48 @@ impl Store {
         (0..self.chains[chain].cands.len()).find_map(|i| self.load_cand(chain, i))
     }
 
-    /// 为字符 `c` 挑字体：沿链找第一个 cmap 里有它、且有矢量轮廓的。都没有时落回主字体的
-    /// `.notdef`（通常是个方框）——好过整字消失、让人以为输入没生效，与 DirectWrite /
-    /// CoreText 对无字形字符的表现一致。
+    /// 为字符 `c` 挑字体：沿链找第一个 cmap 里有它、且有矢量轮廓的**非彩色**字体；没有才用
+    /// 链上的彩色字体（这条路径走的是文本呈现的字——❤、©、带 VS15 的 emoji——彩色 emoji 字体
+    /// 排在前面也不该抢走它们）。都没有时落回主字体的 `.notdef`（通常是个方框）——好过整字
+    /// 消失、让人以为输入没生效，与 DirectWrite / CoreText 对无字形字符的表现一致。
     pub fn glyph_for(&mut self, chain: ChainId, c: char) -> Option<(FaceId, u16)> {
         if let Some(hit) = self.chains[chain].by_char.get(&c) {
+            return *hit;
+        }
+        let (mut found, mut color_hit) = (None, None);
+        for i in 0..self.chains[chain].cands.len() {
+            if !self.chains[chain].cands[i].may_have(c) {
+                continue;
+            }
+            let Some(id) = self.load_cand(chain, i) else {
+                continue;
+            };
+            let f = &self.faces[id as usize];
+            if !f.has_outlines && !f.color {
+                continue;
+            }
+            if let Some(g) = f.face.glyph_index(c)
+                && g.0 != 0
+            {
+                if !f.color {
+                    found = Some((id, g.0));
+                    break;
+                }
+                color_hit = color_hit.or(Some((id, g.0)));
+            }
+        }
+        found = found.or(color_hit);
+        if found.is_none() {
+            found = self.primary(chain).map(|id| (id, 0));
+        }
+        self.chains[chain].by_char.insert(c, found);
+        found
+    }
+
+    /// 链上第一个 cmap 里有 `c` 的**彩色**字体（emoji 簇优先用它：用户在方案里给 emoji 指派的
+    /// 字体、或 fontconfig 回退序列里排进来的 Noto Color Emoji）。
+    pub fn color_face_for(&mut self, chain: ChainId, c: char) -> Option<FaceId> {
+        if let Some(hit) = self.chains[chain].color_by_char.get(&c) {
             return *hit;
         }
         let mut found = None;
@@ -233,21 +294,107 @@ impl Store {
                 continue;
             };
             let f = &self.faces[id as usize];
-            if !f.has_outlines {
-                continue;
-            }
-            if let Some(g) = f.face.glyph_index(c)
-                && g.0 != 0
-            {
-                found = Some((id, g.0));
+            if f.color && f.face.glyph_index(c).is_some_and(|g| g.0 != 0) {
+                found = Some(id);
                 break;
             }
         }
-        if found.is_none() {
-            found = self.primary(chain).map(|id| (id, 0));
-        }
-        self.chains[chain].by_char.insert(c, found);
+        self.chains[chain].color_by_char.insert(c, found);
         found
+    }
+
+    /// 系统彩色 emoji 字体里第一个 cmap 有 `c` 的（链上没有彩色字体覆盖它时的兜底）。
+    pub fn emoji_face_for(&mut self, c: char) -> Option<FaceId> {
+        if self.emoji.is_none() {
+            self.emoji = Some(self.resolve_emoji());
+        }
+        let faces = &self.faces;
+        self.emoji.as_ref()?.iter().copied().find(|&id| {
+            faces[id as usize]
+                .face
+                .glyph_index(c)
+                .is_some_and(|g| g.0 != 0)
+        })
+    }
+
+    /// 解析系统彩色 emoji 字体：fontconfig `emoji:color=true`；没有 fontconfig 时扫字体目录里
+    /// 文件名带 `emoji` 的。只留真有彩色字形表的（老 fontconfig 不认 `emoji` 会替换出普通字体）。
+    fn resolve_emoji(&mut self) -> Vec<FaceId> {
+        let paths: Vec<(PathBuf, u32)> = match fontconfig::sort_emoji() {
+            Some(list) if !list.is_empty() => list
+                .into_iter()
+                .take(EMOJI_CANDS_MAX)
+                .map(|c| (c.path.clone(), c.index))
+                .collect(),
+            _ => self
+                .scanned
+                .get_or_insert_with(scan_font_dirs)
+                .iter()
+                .filter(|p| {
+                    normalize(&p.file_name().unwrap_or_default().to_string_lossy())
+                        .contains("emoji")
+                })
+                .map(|p| (p.clone(), 0))
+                .collect(),
+        };
+        let mut out: Vec<FaceId> = Vec::new();
+        for (p, i) in paths {
+            if let Some(id) = self.load_file(&p, i)
+                && self.faces[id as usize].color
+                && !out.contains(&id)
+            {
+                out.push(id);
+            }
+        }
+        match out.first() {
+            Some(_) => tracing::debug!("彩色 emoji 字体：{} 个", out.len()),
+            None => tracing::info!("系统里没有彩色 emoji 字体，emoji 将按单色字形或方框画出"),
+        }
+        out
+    }
+
+    /// 用彩色字体整形一个 emoji 簇（GSUB 连字把 ZWJ 组合、国旗、键帽、肤色合成一个字形）。
+    /// 返回 [(字形, 前进宽度（字体单位）)]；字体不支持的组合会原样拆成多个字形。字体不收录的
+    /// 零宽成分（VS16、ZWJ、标签）落成的 0 号字形已剔除；除此之外还有字落成 0 号字形（字体真
+    /// 缺这个字）时返回 `None`，由调用方逐字排、各自找字体，不静默吞字。
+    pub fn shape(&mut self, face: FaceId, text: &str) -> Option<ShapedCluster> {
+        if let Some(v) = self.shaped.get(&face).and_then(|m| m.get(text)) {
+            return v.clone();
+        }
+        if self.shaped_len >= SHAPE_CACHE_CAP {
+            self.shaped.clear();
+            self.shaped_len = 0;
+        }
+        let faces = &self.faces;
+        let rb = self
+            .shapers
+            .entry(face)
+            .or_insert_with(|| rustybuzz::Face::from_face(faces[face as usize].face.clone()));
+        let mut buf = rustybuzz::UnicodeBuffer::new();
+        buf.push_str(text);
+        let out = rustybuzz::shape(rb, &[], buf);
+        // 0 号字形按它来自的字（`cluster` 是 UTF-8 字节下标）分两种：零宽成分丢掉，真缺字作废。
+        let missing = |g: &rustybuzz::GlyphInfo| {
+            !text
+                .get(g.cluster as usize..)
+                .and_then(|t| t.chars().next())
+                .is_some_and(super::emoji::is_invisible_component)
+        };
+        let infos = out.glyph_infos();
+        let v = (!infos.iter().any(|g| g.glyph_id == 0 && missing(g))).then(|| {
+            infos
+                .iter()
+                .zip(out.glyph_positions())
+                .filter(|(g, _)| g.glyph_id != 0)
+                .map(|(g, p)| (g.glyph_id as u16, p.x_advance))
+                .collect::<Vec<_>>()
+        });
+        self.shaped
+            .entry(face)
+            .or_default()
+            .insert(text.to_string(), v.clone());
+        self.shaped_len += 1;
+        v
     }
 
     /// 按路径加载一个字体文件（拆字字根字体用）。失败返回 `None`。

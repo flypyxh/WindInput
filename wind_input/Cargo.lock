@@ -2743,6 +2743,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "resvg",
+ "rustybuzz",
  "serde_json",
  "thiserror",
  "tiny-skia",

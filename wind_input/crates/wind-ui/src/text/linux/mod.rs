@@ -5,7 +5,9 @@
 //! （与 CoreText 的 CGBitmapContext 同一语义：透明底上画字，字形像素的 alpha 随之升高）。
 //!
 //! 管线：fontconfig（运行期 `dlopen`）选字、排回退链 → ttf-parser 读 cmap / 前进宽度 /
-//! `kern` / 轮廓 → ab_glyph_rasterizer 出 A8 覆盖度 → 按色合成进缓冲区。
+//! `kern` / 轮廓 → ab_glyph_rasterizer 出 A8 覆盖度 → 按色合成进缓冲区。彩色 emoji 另走一条
+//! 支线：`emoji.rs` 把 emoji 序列切成簇 → 彩色字体（链上的，或 fontconfig `emoji` 族）用
+//! rustybuzz 整簇整形 → `color.rs` 光栅成预乘 BGRA → 原样合成（不跟随文字颜色）。
 //! 移植自姊妹仓 wind-ui-rust `src/text/linux/`（同一作者，MIT/Apache-2.0），去掉了本仓用
 //! 不上的自动折行与斜体，换成本仓的 `TextStyle` / `FontPlan` / 拆字字根契约。
 //!
@@ -14,18 +16,29 @@
 //! 走「小依赖」路线：不链接 HarfBuzz / FreeType（C 库，构建机要装 -dev 包），编译期不需要
 //! 任何系统库。代价写在明处：
 //! - **不做复杂文字整形**：没有连字、阿拉伯文连写、印度系字形重排、蒙古文变形；从左到右
-//!   逐字排。中文 / 西文 / 日文 / 韩文候选足够。ZWJ 组合 emoji 拆成单个 emoji 排。
+//!   逐字排。中文 / 西文 / 日文 / 韩文候选足够。唯一的例外是 emoji 簇（见下）。
 //! - **无 hinting**：灰度抗锯齿 + 4 档亚像素横向定位，观感接近 macOS 而非 ClearType。
 //! - 字距只读旧式 `kern` 表；只放在 GPOS 里的字距不生效（CJK 字体几乎都只有 GPOS，
 //!   对汉字无影响）。
 //! - 字体缺粗体字面时合成（水平加粗）。
-//! - **彩色 emoji 画不出来**：Noto Color Emoji（CBDT）、sbix 这类纯位图字体不当候选
-//!   （`store::FaceData::has_outlines`）。链上若有带轮廓的单色 emoji 字体（Noto Emoji、
-//!   Symbola 等）就用它画单色字形；一个都没有时落回主字体的 `.notdef`（方框）——与
-//!   DirectWrite / CoreText 对无字形字符的表现一致，不静默吞字。
+//! - **彩色 emoji**：CBDT/CBLC 位图（Noto Color Emoji、EmojiOne）、COLR v0（Twemoji Mozilla）、
+//!   COLR v1（Noto-COLRv1）、OpenType-SVG（Twitter Color Emoji SVGinOT）四种格式都有真字体
+//!   实测；sbix（Apple）与 CBDT 同一条代码路径，但手头没有字体、未实测。COLR v1 的扫掠渐变
+//!   按色标均值填纯色、线性渐变的第三控制点不参与，见 `color.rs`。
+//! - **emoji 序列**：肤色修饰、ZWJ 组合、国旗、键帽、子区旗、VS15/VS16 按 `emoji.rs` 切簇、
+//!   整簇交给字体的 GSUB 连字；字体没有这个组合就拆成几个 emoji 画（与字体自身能力一致）。
+//!   切簇用区段近似 emoji 属性，个别「默认文本呈现」的符号可能判错呈现方式；带了 VS15 /
+//!   VS16 的判定是精确的。整形只用在 emoji 簇上，簇内的 GPOS 偏移不生效（emoji 字体不用）。
+//! - 没有任何彩色字体覆盖某个 emoji 时：链上若有带轮廓的单色 emoji 字体（Noto Emoji、
+//!   Symbola 等）就画单色字形，组合序列逐字拆开；一个都没有时落回主字体的 `.notdef`（方框）
+//!   ——与 DirectWrite / CoreText 对无字形字符的表现一致，不静默吞字。
+//! - 位图 emoji 按字体给的前进宽度排（Noto Color Emoji 约 1.25em，比 Segoe UI Emoji 略宽），
+//!   不参与行高计算：行高仍只看基准字体（Noto Color Emoji 的位图在 Noto Sans CJK 的行盒之内）。
 //!
 //! 测量与绘制走同一条排版路径（[`TextRenderer::layout`]），宽度由构造保证一致。
 
+mod color;
+mod emoji;
 mod fontconfig;
 mod store;
 
@@ -42,6 +55,9 @@ use store::{ChainId, FaceId};
 const SUBPIXEL_PHASES: u8 = 4;
 /// 字形缓存每一代的条目上限（两代轮换，见 [`GlyphCache::get`]）。
 const GLYPH_GEN_MAX: usize = 4096;
+/// 字形缓存每一代的位图字节上限。彩色 emoji 位图是 BGRA（同尺寸是灰度字形的 4 倍），
+/// 只按条目数封顶的话大字号 emoji 多了能把一代撑到几十 MB。
+const GLYPH_GEN_BYTES: usize = 4 << 20;
 /// 测量缓存容量上限，满则整体清空（理由同 dwrite 的 `MEASURE_CACHE_CAP`）。
 const MEASURE_CACHE_CAP: usize = 4096;
 /// 单个字形位图的边长上限（像素）。超过这个量级的不是 UI 文本，直接不画。
@@ -66,6 +82,10 @@ pub struct TextRenderer {
     /// 不在键里，任何一项变更都整表清空。
     measures: RefCell<HashMap<u64, TextMetrics>>,
     glyphs: RefCell<GlyphCache>,
+    /// 测试用：指定 emoji 簇只从这几款字体里找（`None` = 链上的彩色字体 → 系统 emoji 字体）。
+    /// 字体仓库是进程级共享的，用例间不能靠改全局状态切换 emoji 字体。
+    #[cfg(test)]
+    emoji_override: Option<Vec<FaceId>>,
 }
 
 /// [`TextRenderer::chains`] 的键：(叶子字族, 字重, 脚本类)。
@@ -81,12 +101,14 @@ struct GlyphKey {
     bold: bool,
 }
 
-/// 一个字形的 A8 覆盖度位图。`left`/`top` 是位图左上角相对「笔位整数列 / 基线行」的偏移。
+/// 一个字形的位图。`left`/`top` 是位图左上角相对「笔位整数列 / 基线行」的偏移。
 struct GlyphBmp {
     left: i32,
     top: i32,
     w: usize,
     h: usize,
+    /// `true` = 彩色字形，`data` 是预乘 BGRA（`w*h*4`）；否则是 A8 覆盖度（`w*h`）。
+    color: bool,
     data: Vec<u8>,
 }
 
@@ -96,18 +118,22 @@ struct GlyphBmp {
 struct GlyphCache {
     cur: HashMap<GlyphKey, Option<GlyphBmp>>,
     old: HashMap<GlyphKey, Option<GlyphBmp>>,
+    /// 当前代的位图字节数（见 [`GLYPH_GEN_BYTES`]）。
+    cur_bytes: usize,
 }
 
 impl GlyphCache {
     fn get(&mut self, key: GlyphKey) -> Option<&GlyphBmp> {
         if !self.cur.contains_key(&key) {
-            if self.cur.len() >= GLYPH_GEN_MAX {
+            if self.cur.len() >= GLYPH_GEN_MAX || self.cur_bytes >= GLYPH_GEN_BYTES {
                 self.old = std::mem::take(&mut self.cur);
+                self.cur_bytes = 0;
             }
             let bmp = match self.old.remove(&key) {
                 Some(b) => b,
                 None => store::with(|st| rasterize(st.face(key.face), key)),
             };
+            self.cur_bytes += bmp.as_ref().map_or(0, |b| b.data.len());
             self.cur.insert(key, bmp);
         }
         self.cur.get(&key).and_then(|b| b.as_ref())
@@ -121,6 +147,8 @@ struct Shaped {
     adv: f32,
     /// 按字形**所属字体**判的合成粗体：回退字体可能有真粗体而主字体没有。
     bold: bool,
+    /// 字形出自彩色字体（见 `store::FaceData::color`）：绘制时不分亚像素相位、不合成粗体。
+    color: bool,
     /// 该字符在整串里的 UTF-16 下标（分段着色按它取色，同 [`utf16_runs`] 口径）。
     u16_idx: u32,
 }
@@ -167,6 +195,8 @@ impl TextRenderer {
             chains: RefCell::new(HashMap::new()),
             measures: RefCell::new(HashMap::new()),
             glyphs: RefCell::new(GlyphCache::default()),
+            #[cfg(test)]
+            emoji_override: None,
         })
     }
 
@@ -346,8 +376,44 @@ impl TextRenderer {
                     u16_idx += 1; // 被 split 吃掉的 '\n'
                 }
                 let mut line: Vec<Shaped> = Vec::with_capacity(para.len());
-                for ch in para.chars() {
+                let chars: Vec<char> = para.chars().collect();
+                let mut ci = 0;
+                // 整簇整形失败的簇逐字排到这里为止，期间不再切簇（否则国旗对会错位重配）。
+                let mut plain_until = 0;
+                while ci < chars.len() {
+                    let ch = chars[ci];
                     let idx = u16_idx;
+                    // emoji 序列整簇交给彩色字体整形；找不到彩色字体就照下面逐字排。
+                    let n = if ci < plain_until {
+                        0
+                    } else {
+                        emoji::cluster_len(&chars, ci)
+                    };
+                    if n > 0 {
+                        let class = classes
+                            .as_ref()
+                            .and_then(|c| c.get(idx as usize).copied().flatten());
+                        let chain = match class {
+                            Some(_) => self.chain_id(st, leaf, weight, class),
+                            None => base,
+                        };
+                        // 整簇不行（字体缺某个成分）就退到 ZWJ 组合的第一个元素，剩下的
+                        // （ZWJ 与后面的元素）下一轮照常切簇。
+                        let m = emoji::first_element_len(&chars[ci..ci + n]);
+                        let tries: &[usize] = if m < n { &[n, m] } else { &[n] };
+                        if let Some(&len) = tries.iter().find(|&&len| {
+                            self.shape_emoji(st, chain, &chars[ci..ci + len], ppem, idx, &mut line)
+                        }) {
+                            u16_idx += chars[ci..ci + len]
+                                .iter()
+                                .map(|c| c.len_utf16() as u32)
+                                .sum::<u32>();
+                            ci += len;
+                            continue;
+                        }
+                        plain_until = ci + n;
+                    }
+                    ci += 1;
                     u16_idx += ch.len_utf16() as u32;
                     if ch == '\t' {
                         // 制表符按 4 个空格宽：UI 文本里它几乎只用于对齐，没有制表位可言。
@@ -358,6 +424,7 @@ impl TextRenderer {
                             glyph: None,
                             adv: w * 4.0,
                             bold: false,
+                            color: false,
                             u16_idx: idx,
                         });
                         continue;
@@ -367,6 +434,7 @@ impl TextRenderer {
                             glyph: None,
                             adv: 0.0,
                             bold: false,
+                            color: false,
                             u16_idx: idx,
                         });
                         continue;
@@ -385,17 +453,19 @@ impl TextRenderer {
                         };
                         st.glyph_for(chain, ch)
                     });
-                    let (adv, bold) = match glyph {
+                    let (adv, bold, color) = match glyph {
                         Some((f, g)) => {
                             let fd = st.face(f);
-                            (advance(fd, g, ppem), weight >= 600 && fd.weight <= 500)
+                            let bold = weight >= 600 && fd.weight <= 500 && !fd.color;
+                            (advance(fd, g, ppem), bold, fd.color)
                         }
-                        None => (0.0, false),
+                        None => (0.0, false, false),
                     };
                     line.push(Shaped {
                         glyph,
                         adv,
                         bold,
+                        color,
                         u16_idx: idx,
                     });
                 }
@@ -405,7 +475,8 @@ impl TextRenderer {
                     else {
                         continue;
                     };
-                    if fa != fb {
+                    // 彩色字体的字形跳过：emoji 簇的前进宽度来自整形，字距已含在内。
+                    if fa != fb || line[i].color {
                         continue;
                     }
                     let f = st.face(fa);
@@ -422,6 +493,52 @@ impl TextRenderer {
                 ppem,
             }
         })
+    }
+
+    /// 用彩色字体整形一个 emoji 簇，字形追加进 `line`。字体先找本段所在链上的彩色字体（方案给
+    /// emoji 指派的、fontconfig 回退序列里的），再找系统 emoji 字体。返回 `false` = 没有彩色
+    /// 字体覆盖这个簇的首字，调用方逐字排。
+    fn shape_emoji(
+        &self,
+        st: &mut store::Store,
+        chain: ChainId,
+        cluster: &[char],
+        ppem: f32,
+        u16_idx: u32,
+        line: &mut Vec<Shaped>,
+    ) -> bool {
+        let first = emoji::key_char(cluster);
+        #[cfg(test)]
+        let face = match &self.emoji_override {
+            Some(list) => list.iter().copied().find(|&id| {
+                st.face(id)
+                    .face
+                    .glyph_index(first)
+                    .is_some_and(|g| g.0 != 0)
+            }),
+            None => st
+                .color_face_for(chain, first)
+                .or_else(|| st.emoji_face_for(first)),
+        };
+        #[cfg(not(test))]
+        let face = st
+            .color_face_for(chain, first)
+            .or_else(|| st.emoji_face_for(first));
+        let Some(face) = face else {
+            return false;
+        };
+        let Some(glyphs) = st.shape(face, &cluster.iter().collect::<String>()) else {
+            return false;
+        };
+        let k = ppem / st.face(face).upem;
+        line.extend(glyphs.iter().map(|&(gid, adv)| Shaped {
+            glyph: Some((face, gid)),
+            adv: adv as f32 * k,
+            bold: false,
+            color: true,
+            u16_idx,
+        }));
+        !glyphs.is_empty()
     }
 
     /// 测量文本。宽 = 最宽一行（含尾随空白，同 DirectWrite `widthIncludingTrailingWhitespace`），
@@ -590,10 +707,17 @@ impl TextRenderer {
             for g in line {
                 if let Some((face, gid)) = g.glyph {
                     let color = color_at(g.u16_idx);
-                    let fx = pen.floor();
                     if color[3] != 0 {
-                        let phase =
-                            (((pen - fx) * SUBPIXEL_PHASES as f32) as u8).min(SUBPIXEL_PHASES - 1);
+                        // 彩色字体的字形不分亚像素相位、不合成粗体：位图本身就不是按相位
+                        // 光栅的，存 4 份只是浪费；整像素落位，免得缩放后的位图再被插值一次。
+                        let (fx, phase) = if g.color {
+                            (pen.round(), 0)
+                        } else {
+                            let fx = pen.floor();
+                            let phase = (((pen - fx) * SUBPIXEL_PHASES as f32) as u8)
+                                .min(SUBPIXEL_PHASES - 1);
+                            (fx, phase)
+                        };
                         let key = GlyphKey {
                             face,
                             gid,
@@ -602,15 +726,13 @@ impl TextRenderer {
                             bold: g.bold,
                         };
                         if let Some(bmp) = cache.get(key) {
-                            blit(
-                                buf,
-                                w,
-                                h,
-                                bmp,
-                                fx as i32 + bmp.left,
-                                baseline + bmp.top,
-                                color,
-                            );
+                            let (x0, y0) = (fx as i32 + bmp.left, baseline + bmp.top);
+                            if bmp.color {
+                                // 彩色字形不跟随文字颜色，只继承它的不透明度。
+                                blit_color(buf, w, h, bmp, x0, y0, color[3]);
+                            } else {
+                                blit(buf, w, h, bmp, x0, y0, color);
+                            }
                         }
                     }
                 }
@@ -635,8 +757,14 @@ fn kerning(f: &store::FaceData, a: u16, b: u16) -> Option<i16> {
         .find_map(|s| s.glyphs_kerning(ttf_parser::GlyphId(a), ttf_parser::GlyphId(b)))
 }
 
-/// 光栅一个字形（未命中缓存时调用）。
+/// 光栅一个字形（未命中缓存时调用）。彩色字体先走彩色路径，该字形没有彩色数据时再按轮廓画
+/// （COLR 字体里的数字、标点就是普通轮廓）。
 fn rasterize(f: &store::FaceData, key: GlyphKey) -> Option<GlyphBmp> {
+    if f.color
+        && let Some(b) = color::render(f, key.gid, key.ppem64 as f32 / 64.0)
+    {
+        return Some(b);
+    }
     let gid = ttf_parser::GlyphId(key.gid);
     let bb = f.face.glyph_bounding_box(gid)?;
     let ppem = key.ppem64 as f32 / 64.0;
@@ -682,6 +810,7 @@ fn rasterize(f: &store::FaceData, key: GlyphKey) -> Option<GlyphBmp> {
         top,
         w,
         h,
+        color: false,
         data,
     })
 }
@@ -787,6 +916,42 @@ fn blit(buf: &mut [u8], bw: usize, bh: usize, g: &GlyphBmp, x0: i32, y0: i32, co
             d[1] = ((gg * sa + d[1] as u32 * inv + 127) / 255) as u8;
             d[2] = ((r * sa + d[2] as u32 * inv + 127) / 255) as u8;
             d[3] = ((sa * 255 + d[3] as u32 * inv + 127) / 255) as u8;
+        }
+    }
+}
+
+/// 把预乘 BGRA 彩色位图以 source-over 合成进缓冲，整体乘 `alpha`（文字色的不透明度），
+/// 裁到缓冲区内。
+fn blit_color(buf: &mut [u8], bw: usize, bh: usize, g: &GlyphBmp, x0: i32, y0: i32, alpha: u8) {
+    let gx0 = x0.max(0);
+    let gy0 = y0.max(0);
+    let gx1 = (x0 + g.w as i32).min(bw as i32);
+    let gy1 = (y0 + g.h as i32).min(bh as i32);
+    if gx0 >= gx1 || gy0 >= gy1 {
+        return;
+    }
+    let ga = alpha as u32;
+    for y in gy0..gy1 {
+        let src_row = (y - y0) as usize * g.w;
+        let dst_row = y as usize * bw * 4;
+        for x in gx0..gx1 {
+            let si = (src_row + (x - x0) as usize) * 4;
+            let s = &g.data[si..si + 4];
+            if s[3] == 0 {
+                continue;
+            }
+            let sc = |v: u8| (v as u32 * ga + 127) / 255;
+            let sa = sc(s[3]);
+            if sa == 0 {
+                continue;
+            }
+            let inv = 255 - sa;
+            let i = dst_row + x as usize * 4;
+            let d = &mut buf[i..i + 4];
+            for c in 0..3 {
+                d[c] = (sc(s[c]) + (d[c] as u32 * inv + 127) / 255).min(255) as u8;
+            }
+            d[3] = (sa + (d[3] as u32 * inv + 127) / 255).min(255) as u8;
         }
     }
 }
