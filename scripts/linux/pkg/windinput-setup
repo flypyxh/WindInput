@@ -91,8 +91,13 @@ active = "$SCHEMA"
 available = ["pinyin", "wubi86"]
 EOT
     echo "已写入 $WCFG/config.toml（方案：$SCHEMA）"
+elif ! grep -q '^\[schema\]' "$WCFG/config.toml"; then
+    # 服务先于本脚本启动时会自己生成一份 config.toml（只有键位默认值，没有 [schema]），
+    # 此时方案落在出厂默认（五笔）；补一段，不动已有内容。
+    printf '\n[schema]\nactive = "%s"\navailable = ["pinyin", "wubi86"]\n' "$SCHEMA" >>"$WCFG/config.toml"
+    echo "已在 $WCFG/config.toml 补写 [schema]（方案：$SCHEMA）；重新登录或重启服务后生效"
 else
-    echo "$WCFG/config.toml 已存在，不改动"
+    echo "$WCFG/config.toml 已含 [schema]，不改动"
 fi
 
 if [[ $IMCONFIG -eq 1 ]]; then
