@@ -998,7 +998,8 @@ include_blocks = []
 
 # 反查模式：按绑定的键进入，用本方案编码查字（通配键在任何位置都代替一个码元，首位也行），
 # 候选显示完整编码，选中上屏该字；不查拼音。出厂关，且不绑任何键——在 [keys.key_actions] 里绑，
-# 如 backslash = "reverse"（符号键：编码为空时按下进入）或 "ctrl+shift+f" = "reverse"（组合键：随时进入）。
+# 如 backslash = "reverse"（符号键：编码为空时直接进入；正在打字时先上屏高亮候选再进入）
+# 或 "ctrl+shift+f" = "reverse"（组合键：随时进入，同样先上屏正在打的高亮候选）。
 [input.reverse]
 enabled = false
 # 反查模式期间的候选窗布局（follow / vertical / horizontal，见「模式级候选布局」）。
