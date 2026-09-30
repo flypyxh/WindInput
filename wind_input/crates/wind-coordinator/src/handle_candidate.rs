@@ -2390,6 +2390,11 @@ impl Coordinator {
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤ [`wind_engine::engine::CANDIDATE_LIMIT_CAP`]）重新加载，保持当前页/高亮。
     pub(crate) fn expand_candidates(&self, state: &mut State) {
+        // 反查模式的码在 `special_buffer`（`input_buffer` 恒空）：须在下面按 `input_buffer`
+        // 判的守卫之前分流，否则会走主路 `build_candidates` 把反查候选清空。
+        if matches!(state.active, Some(ModeKind::Reverse)) {
+            return self.expand_reverse_candidates(state);
+        }
         if !state.has_more || state.candidate_input != state.input_buffer {
             return;
         }
@@ -2467,7 +2472,7 @@ impl Coordinator {
                 self.commit_temp_pinyin_selected(state, &cand, offset as i32)
             }
             Some(ModeKind::TempEnglish) => self.commit_temp_english_selected(state, gi),
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
                 self.commit_special_candidate(state, gi)
             }
             Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
@@ -2536,7 +2541,7 @@ impl Coordinator {
                 self.commit_temp_pinyin_selected(state, &cand, offset as i32)
             }
             Some(ModeKind::TempEnglish) => self.commit_temp_english_selected(state, gi),
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
                 self.commit_special_candidate(state, gi)
             }
             // 重复上屏态不另开分支：`mix_select_at` 自己先判 `mix_repeat` 转交
@@ -2847,7 +2852,7 @@ impl Coordinator {
             // 生僻字模式与 special 共用 `special_buffer`：按键处理走的是同一个
             // `handle_special_key`，缓冲另起一个字段的话，退格与光标会作用在一个没人读的
             // 字段上——组合区不动、候选不变，且没有任何报错。
-            ModeKind::Special(_) | ModeKind::RareChar => {
+            ModeKind::Special(_) | ModeKind::RareChar | ModeKind::Reverse => {
                 preedit_cursor::BufEdit::new(&mut st.special_buffer, &mut st.special_cursor)
             }
             ModeKind::Mix(_) => {
@@ -2883,7 +2888,7 @@ impl Coordinator {
                 &state.temp_english_buffer,
                 state.temp_english_cursor,
             ),
-            ModeKind::Special(_) | ModeKind::RareChar => (
+            ModeKind::Special(_) | ModeKind::RareChar | ModeKind::Reverse => (
                 state.special_prefix.clone(),
                 &state.special_buffer,
                 &state.special_buffer,
@@ -3076,9 +3081,10 @@ impl Coordinator {
         let include_printable = match state.active {
             // 生僻字模式与 special 取值必须一致：两者走的是同一个 `handle_special_key`，
             // 这里给不同的值就会出现「同一套按键处理，翻页键在两个模式里表现不同」。
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::TempPinyin) => {
-                true
-            }
+            Some(ModeKind::Special(_))
+            | Some(ModeKind::RareChar)
+            | Some(ModeKind::Reverse)
+            | Some(ModeKind::TempPinyin) => true,
             // mix 目前**不经过本函数**（`handle_mix_key` 直接调 `apply_session_action`）。保留本
             // 分支只为「日后有人把 mix 接过来时规则仍然对」，取值统一问
             // `mix_nav_include_printable`——此前这里独立写了一份且与活代码取值相反。
@@ -3239,6 +3245,12 @@ impl Coordinator {
                 state.special_buffer.clone(),
                 false,
             ),
+            // 反查模式：**没有落点**，右键只留复制。缓冲是查询串（含通配）而不是码位，规则
+            // 写进去模式内也读不到（`build_reverse_candidates` 不吃候选调整），
+            // 查询串不含通配键时还会误伤主路同名字面输入；写端照走的话，操作完落到主路
+            // `update_candidates`（读恒空的 `input_buffer`），候选窗当场清空而模式还在。
+            // 「设为常用字」不需要落点，在 `candidate_op` 的准入之前分派，不受影响。
+            Some(ModeKind::Reverse) => return None,
             // 临时英文：归属恒是内置英文方案（与读写两端同源，见 effective_data_schema）。
             // 码取**小写化的缓冲**——临英缓冲带大写（Shift+H 进入即 `H`），而英文方案下
             // `input_buffer` 恒为全小写；不归一的话「临英里置顶的词，切到英文方案不生效」，
@@ -4902,7 +4914,9 @@ impl Coordinator {
             Some(ModeKind::TempEnglish) => &state.temp_english_buffer,
             Some(ModeKind::TempPinyin) => &state.temp_pinyin_buffer,
             Some(ModeKind::Mix(_)) => &state.mix_buffer,
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => &state.special_buffer,
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
+                &state.special_buffer
+            }
             Some(ModeKind::AuxCode) => self.aux_code_source_buffer(state),
             _ => &state.input_buffer,
         }
@@ -5046,7 +5060,7 @@ impl Coordinator {
                 self.commit_temp_pinyin_selected(&mut state, &cand, page_local_pos)
             }
             Some(ModeKind::Mix(_)) => self.mix_select_at(&mut state, idx, page_local_pos),
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
                 self.commit_special_candidate(&mut state, idx)
             }
             // 网址 / 邮箱：键盘侧不按序号选词（数字是合法字符），但鼠标点选须与空格走同一个
@@ -7249,6 +7263,7 @@ mod mouse_command_overlay_tests {
             (Some(ModeKind::Mix(0)), "mx"),
             (Some(ModeKind::Special(0)), "sp"),
             (Some(ModeKind::RareChar), "sp"),
+            (Some(ModeKind::Reverse), "sp"),
         ];
         for (mode, want) in cases {
             st.active = mode;

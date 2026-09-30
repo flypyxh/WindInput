@@ -73,6 +73,18 @@ pub enum ModeKind {
     /// 无载荷：实例是单例（不像 special 那样一个引导键一份码表），身份不来自任何方案，
     /// 故也没有下标可带——同 [`Self::TempPinyin`] / [`Self::AuxCode`]。
     RareChar,
+    /// 反查模式：用户自绑键进入，**用当前活跃方案的编码**查字，缓冲里通配键在任何位置
+    /// （含首位）都作通配，不看 `schema.codetable.wildcard` 主开关（spec
+    /// `codetable-reverse-mode.md` §3）。
+    ///
+    /// 与 [`Self::RareChar`] 同理是 special 的参数变体：缓冲 / 光标 / 退格 / 选词 / 退出
+    /// 全部复用 `handle_special_key` 与 `special_buffer`，只有候选另由 `handle_reverse`
+    /// 构建（`convert_reverse` + 检索范围过滤，不做自动上屏、不吃词频重排与候选调整）。
+    /// 与 special 族不同的是它会写 `has_more` / `candidate_limit` / `scope_relaxed`，
+    /// 故 `exit_special_mode` 一并复位这三位。
+    ///
+    /// 无载荷：单例，身份不来自任何方案——同 [`Self::RareChar`]。
+    Reverse,
     /// 临时 mix：引导键触发，合并多个成员方案候选。载荷为 `features.mix_modes` 下标。
     Mix(u8),
     /// 辅助码：拼音候选的字形二次筛选。独占输入流（组码中无法同时打拼音），但候选

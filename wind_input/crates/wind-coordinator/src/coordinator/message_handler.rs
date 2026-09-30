@@ -1177,7 +1177,8 @@ impl MessageHandler for Coordinator {
             // `overlay_engine_schema` 与 `update_special_candidates` 里分流。
             // 另写一份的代价不是多写 676 行，而是两份迟早分叉——分叉的表现是
             // 「生僻字模式里退格/翻页跟别处不一样」，没人会想到去查这里。
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+            // 反查模式同族：候选构建在 `update_special_candidates` 开头分流到 `handle_reverse`。
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
                 return self.handle_special_key(&mut state, data);
             }
             Some(ModeKind::Mix(_)) => return self.handle_mix_key(&mut state, data),
@@ -4370,6 +4371,12 @@ impl Coordinator {
     pub(crate) fn rare_char_entry_composition(&self, key_code: u32, display: String) -> KeyAction {
         let on = self.rt().config.input.caret.rare_char_via_composition;
         self.hotkey_entry_composition(key_code, display, on)
+    }
+
+    /// 反查模式直达热键进入：不设开关、固定走占位 composition（与
+    /// `rare_char_via_composition` 出厂值一致，让直达热键与生僻字模式行为同构）。
+    pub(crate) fn reverse_entry_composition(&self, key_code: u32, display: String) -> KeyAction {
+        self.hotkey_entry_composition(key_code, display, true)
     }
 }
 

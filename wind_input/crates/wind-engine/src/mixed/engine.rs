@@ -879,6 +879,26 @@ impl Engine for MixedEngine {
         self.primary.wildcard_key()
     }
 
+    /// 反查模式的通配键：代理主码表（spec §3.2）。
+    fn reverse_wildcard_key(&self) -> Option<char> {
+        self.primary.reverse_wildcard_key()
+    }
+
+    /// 影子层：代理主码表（通配 / 反查只查主码表）。
+    fn disabled_dict_layers(&self) -> Option<&crate::codetable::DisabledDictLayers> {
+        self.primary.disabled_dict_layers()
+    }
+
+    /// 反查模式转换：只查主码表（字面 + 通配），拼音 / 英文不参与（spec §3.2）。
+    fn convert_reverse(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.primary.convert_reverse(input, pattern, max_candidates)
+    }
+
     /// 通配转换（spec §10）。无拼音子引擎 ⇒ 代理主码表；有 ⇒ 字面 `convert(input)`
     /// ⊕ 主码表通配，见 [`Self::merge_wildcard`]。
     ///
@@ -2492,6 +2512,10 @@ mod tests {
 
     /// 带通配键 `z` 的内存码表（码长 4）。
     fn ct_wildcard(entries: &[(&str, &str, i32)]) -> Box<dyn Engine> {
+        ct_wildcard_with(entries, false)
+    }
+
+    fn ct_wildcard_with(entries: &[(&str, &str, i32)], single_only: bool) -> Box<dyn Engine> {
         let mut d = CodetableDict::empty();
         for (i, (code, text, w)) in entries.iter().enumerate() {
             d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
@@ -2502,6 +2526,8 @@ mod tests {
             4,
             CommitOptions {
                 wildcard: Some('z'),
+                reverse_key: Some('z'),
+                wildcard_single_only: single_only,
                 ..Default::default()
             },
             Arc::new(dm),
@@ -2698,5 +2724,38 @@ mod tests {
             r.candidates.iter().any(|c| c.text == "阿紫"),
             "字面半边照常合并"
         );
+    }
+
+    /// reverse-mode spec §2：混输下仅单字只作用于通配那一侧，字面混输（拼音）的多字词照出。
+    #[test]
+    fn wildcard_single_only_spares_literal_side() {
+        let e = MixedEngine::new(
+            ct_wildcard_with(&[("qa", "甲", 10), ("qb", "乙丙", 20)], true),
+            Some(Box::new(FakePinyinTable {
+                entries: vec![("qz", "阿紫")],
+            })),
+            None,
+            MixConfig::default(),
+        );
+        let r = e.convert_wildcard("qz", &slot("q?"), 50).unwrap();
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"甲"), "{texts:?}");
+        assert!(!texts.contains(&"乙丙"), "通配侧的词组被滤：{texts:?}");
+        assert!(texts.contains(&"阿紫"), "拼音侧多字词不受影响：{texts:?}");
+    }
+    /// spec §3.2：反查模式在混输下只查主码表，拼音不参与。
+    #[test]
+    fn mixed_convert_reverse_is_primary_only() {
+        let e = mixed_wc(&[("qa", "甲", 10)], vec![("qz", "阿紫")]);
+        assert_eq!(e.reverse_wildcard_key(), Some('z'));
+        let r = e.convert_reverse("qz", &slot("q?"), 50).unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| c.source == CandidateSource::CodeTable),
+            "{:?}",
+            r.candidates
+        );
+        assert!(r.candidates.iter().any(|c| c.text == "甲"));
     }
 }

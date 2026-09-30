@@ -106,6 +106,7 @@ impl Coordinator {
             Some(ModeKind::Unicode) => Some("unicode"),
             Some(ModeKind::Special(_)) => Some("special"),
             Some(ModeKind::RareChar) => Some("rare_char"),
+            Some(ModeKind::Reverse) => Some("reverse"),
             Some(ModeKind::Mix(_)) => Some("mix"),
             Some(ModeKind::AuxCode) => Some("aux_code"),
             None => None,
@@ -129,6 +130,14 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .has_more
+    }
+
+    /// 检索范围是否处于临时放宽态（测试/诊断用）。反查模式要断言「退出后不残留」。
+    pub fn debug_scope_relaxed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scope_relaxed
     }
 
     /// 分页信息 (当前页0-based, 页内高亮0-based, 总页数)（测试/诊断用）

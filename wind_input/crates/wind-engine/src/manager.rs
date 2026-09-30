@@ -575,6 +575,10 @@ pub struct EngineManager {
     /// 与 `reverse_index` 同生命周期：凡清空那张表的地方（启用词库变更、方案失效、
     /// 配置重载、「重建词库缓存」经 invalidate_schema）一并清空，即给一次重试机会。
     reverse_index_skipped: Mutex<std::collections::HashSet<String>>,
+    /// 候选注释反查用哪份索引（[`EngineManager::comment_reverse_scope`]）：方案 id → 范围。
+    /// 判定要读方案文件，而它在按键线程上每次候选刷新都会被问到，故缓存。
+    /// 与 `reverse_index` 同批清空（启用集、方案、配置任一变动都可能改变结论）。
+    reverse_scope_cache: Mutex<HashMap<String, ReverseScope>>,
     /// 测试钩子：[`Self::build_reverse_index_for`] 被调用的次数（证明短路生效）。
     #[cfg(test)]
     reverse_index_build_calls: std::sync::atomic::AtomicUsize,
@@ -829,6 +833,7 @@ impl EngineManager {
             index_build_locks: Mutex::new(HashMap::new()),
             aux_source_warned: Mutex::default(),
             reverse_index_skipped: Mutex::new(std::collections::HashSet::new()),
+            reverse_scope_cache: Mutex::new(HashMap::new()),
             #[cfg(test)]
             reverse_index_build_calls: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1165,7 +1170,8 @@ impl EngineManager {
         if primary.is_empty() {
             return Some(String::new()); // 没有主码表＝确定没有编码可显示，不是「没就绪」
         }
-        let v = self.text_codes(&primary);
+        // 候选注释的 `code` / `code_rev` 走注释反查范围（开关开且方案有未启用扩展库时含它们）；其余消费方仍只认启用集。
+        let v = self.text_codes_in(&primary, self.comment_reverse_scope(&primary));
         if !v.system_ready() {
             return None;
         }
@@ -1262,10 +1268,27 @@ impl EngineManager {
     /// 由调用方决定要不要派后台构建（打字链路用 `Coordinator::spawn_index_warm`）。
     /// 设计见 `docs/design/text-code-lookup.md`。
     pub fn text_codes(&self, schema_id: &str) -> crate::text_codes::TextCodeView {
+        self.text_codes_in(schema_id, ReverseScope::Enabled)
+    }
+
+    /// [`Self::text_codes`] 的按范围版本：系统层取 `scope` 那份反查索引，用户层不变。
+    fn text_codes_in(
+        &self,
+        schema_id: &str,
+        scope: ReverseScope,
+    ) -> crate::text_codes::TextCodeView {
         if schema_id.is_empty() {
             return Default::default();
         }
-        let system = self.reverse_index_if_ready(schema_id);
+        // 变体（含未启用扩展库）还没建好、或被崩溃保护跳过时，回退常规那份：至少把启用集里的码
+        // 显示出来，而不是整段空白；变体建好后下一次查询自然升级。注释调用方照旧后台补建变体。
+        let system = self
+            .reverse_index_if_ready_in(schema_id, scope)
+            .or_else(|| {
+                (scope != ReverseScope::Enabled)
+                    .then(|| self.reverse_index_if_ready_in(schema_id, ReverseScope::Enabled))
+                    .flatten()
+            });
         let user = self.store.as_ref().and_then(|s| {
             crate::text_codes::get_or_refresh(&self.user_text, s, &self.data_schema_id(schema_id))
         });
@@ -1289,14 +1312,106 @@ impl EngineManager {
     /// 三态同 [`Self::word_codes_in`]：`None` = 系统层还没就绪。与它的区别只在**含用户层**——
     /// 加词去重要的是「系统词库里有没有」，那条口径刻意不变，仍用 `word_codes_in`。
     pub fn word_codes_display(&self, schema_id: &str, text: &str) -> Option<String> {
+        self.word_codes_display_scoped(schema_id, text, ReverseScope::Enabled)
+    }
+
+    /// 候选注释 `code_all` / `code_rev_all` 用的 [`Self::word_codes_display`]：系统层按
+    /// [`Self::comment_reverse_scope`] 取索引，开关开且方案有未启用扩展库时含它们。
+    /// 三态同 `word_codes_display`。变体（含未启用扩展库）没就绪时回退常规索引，故 `None` 只剩
+    /// 「常规索引也没就绪」一种情形；变体是否还欠着看 [`Self::comment_variant_pending`]。
+    pub fn word_codes_display_for_comment(&self, schema_id: &str, text: &str) -> Option<String> {
         if schema_id.is_empty() {
             return Some(String::new());
         }
-        let v = self.text_codes(schema_id);
+        self.word_codes_display_scoped(schema_id, text, self.comment_reverse_scope(schema_id))
+    }
+
+    fn word_codes_display_scoped(
+        &self,
+        schema_id: &str,
+        text: &str,
+        scope: ReverseScope,
+    ) -> Option<String> {
+        if schema_id.is_empty() {
+            return Some(String::new());
+        }
+        let v = self.text_codes_in(schema_id, scope);
         if !v.system_ready() {
             return None;
         }
         Some(v.codes_of(text).join("/"))
+    }
+
+    /// 注释反查的变体索引此刻是否还欠着：范围是变体、变体没就绪、也没被崩溃保护跳过。
+    ///
+    /// 协调器据此决定要不要派后台补建：变体没就绪时取值会回退常规索引、结果不是 `None`，
+    /// 不能再靠 `None` 判。只查内存——开关关时 [`Self::comment_reverse_scope`] 对已加载的
+    /// 码表引擎短路，其余情形首次读盘后有缓存——故可在按键线程上逐候选调用。
+    pub fn comment_variant_pending(&self, schema_id: &str) -> bool {
+        self.comment_reverse_scope(schema_id) == ReverseScope::WithDisabled
+            && self
+                .reverse_index_if_ready_in(schema_id, ReverseScope::WithDisabled)
+                .is_none()
+            && !self.reverse_index_skipped_in(schema_id, ReverseScope::WithDisabled)
+    }
+
+    /// [`Self::codetable_reverse_hint`] 那份（主码表方案）的 [`Self::comment_variant_pending`]。
+    pub fn codetable_reverse_hint_variant_pending(&self) -> bool {
+        let primary = self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        !primary.is_empty() && self.comment_variant_pending(&primary)
+    }
+
+    /// 候选注释反查该用哪份索引：`lookup_disabled_dicts` 开、且方案里至少一个扩展库未启用
+    /// ⇒ [`ReverseScope::WithDisabled`]；否则 [`ReverseScope::Enabled`]——没有未启用库时
+    /// 两份内容相同，不另建。结果按方案缓存，失效点同 `reverse_index`。
+    pub fn comment_reverse_scope(&self, schema_id: &str) -> ReverseScope {
+        if schema_id.is_empty() {
+            return ReverseScope::Enabled;
+        }
+        // 短路：该方案的码表引擎已加载、却没挂影子层 ⇒ 构建时折叠出的开关（全局 + 方案级覆盖，
+        // 与下面同一口径）是关的，或方案根本没有扩展库——两种都只能是常规范围。这条判据只看
+        // 内存，不读方案文件、不写缓存：本函数在按键线程上每次注释刷新都会走到，开关关着的
+        // 用户（出厂即关）不该为此读盘。引擎与本缓存同生命周期（`invalidate_schema` /
+        // `reload_from_config` 一并清），不会拿旧引擎判新配置。引擎未加载时照旧走下面的读盘判定。
+        if self.loaded_engine_type(schema_id) == Some(EngineType::CodeTable)
+            && self.loaded_disabled_dict_engine(schema_id).is_none()
+        {
+            return ReverseScope::Enabled;
+        }
+        if let Some(s) = self
+            .reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+        {
+            return *s;
+        }
+        let has_disabled_extra = || {
+            Self::read_schema(
+                schema_id,
+                self.data_dir.as_deref(),
+                self.override_dir.as_deref(),
+            )
+            .as_ref()
+            .and_then(Self::split_codetable_dicts)
+            .is_some_and(|(_, extras)| extras.iter().any(|d| !d.is_enabled()))
+        };
+        let scope = if self.codetable_settings_of(schema_id).lookup_disabled_dicts
+            && has_disabled_extra()
+        {
+            ReverseScope::WithDisabled
+        } else {
+            ReverseScope::Enabled
+        };
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(schema_id.to_string(), scope);
+        scope
     }
 
     /// **词语联想的词源方案**：从哪本词库里捞「以上文为前缀的更长的词」。
@@ -1518,10 +1633,19 @@ impl EngineManager {
     /// 它们宁可这一次不显示编码，也不能让按键处理停下来等一次秒级构建
     /// ——TSF→服务是**同步 IPC**，那一停就是整机卡顿（真机实测 29.5 秒）。
     pub fn reverse_index_if_ready(&self, schema_id: &str) -> Option<Arc<ReverseIndex>> {
+        self.reverse_index_if_ready_in(schema_id, ReverseScope::Enabled)
+    }
+
+    /// [`Self::reverse_index_if_ready`] 的按范围版本。
+    pub fn reverse_index_if_ready_in(
+        &self,
+        schema_id: &str,
+        scope: ReverseScope,
+    ) -> Option<Arc<ReverseIndex>> {
         self.reverse_index
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
+            .get(&reverse_index_key(schema_id, scope))
             .cloned()
     }
 
@@ -1539,7 +1663,7 @@ impl EngineManager {
     /// 此时**不写缓存**：否则一张空表会被当成真结果一直用到进程结束。
     ///
     /// 走 `index_build_locks` 单飞：并发调用只有一个真在建，其余等它建完后复查即返回。
-    fn reverse_index_for(&self, schema_id: &str) -> Option<Arc<ReverseIndex>> {
+    fn reverse_index_for(&self, schema_id: &str, scope: ReverseScope) -> Option<Arc<ReverseIndex>> {
         // primary 在 reverse_index 锁外取,避免嵌套锁。
         let primary = self
             .primary_codetable
@@ -1547,32 +1671,34 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         // 快路径：已建好直接返回。
-        if let Some(m) = self.reverse_index_if_ready(schema_id) {
+        if let Some(m) = self.reverse_index_if_ready_in(schema_id, scope) {
             return Some(m);
         }
+        let key = reverse_index_key(schema_id, scope);
         // ★ 构建**不能握 `reverse_index` 锁**：这是一次秒级、且要分配上百 MB 的操作，
-        //   握着它等于让查别的方案的线程一起排队。只握本方案自己的构建锁。
-        let lock = self.index_build_lock_for(schema_id);
+        //   握着它等于让查别的方案的线程一起排队。只握本方案（本范围）自己的构建锁。
+        let lock = self.index_build_lock_for(&key);
         let _build = lock.lock().unwrap_or_else(|e| e.into_inner());
         // 抢到锁后复查：等待期间可能已被另一线程建好。
-        if let Some(m) = self.reverse_index_if_ready(schema_id) {
+        if let Some(m) = self.reverse_index_if_ready_in(schema_id, scope) {
             return Some(m);
         }
-        if self.reverse_index_skipped(schema_id) {
+        if self.reverse_index_skipped_in(schema_id, scope) {
             return None;
         }
-        let Some(idx) = self.build_reverse_index_for(schema_id) else {
+        let Some(idx) = self.build_reverse_index_for(schema_id, scope) else {
             self.reverse_index_skipped
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(schema_id.to_string());
+                .insert(key);
             return None;
         };
         let m = Arc::new(idx);
         let pins = self.reverse_index_pins();
         let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(schema_id.to_string(), m.clone());
-        guard.retain(|k, _| reverse_index_keeps(k, schema_id, &primary, &pins));
+        guard.insert(key, m.clone());
+        // 变体随其基名同去留：护栏按方案计，不按份数计。
+        guard.retain(|k, _| reverse_index_keeps(reverse_index_base(k), schema_id, &primary, &pins));
         Some(m)
     }
 
@@ -1633,21 +1759,50 @@ impl EngineManager {
     ///
     /// 单飞在 [`Self::reverse_index_for`] 里（`index_build_locks`）。
     pub fn prewarm_reverse_index(&self, schema_id: &str) -> bool {
+        self.prewarm_reverse_index_in(schema_id, ReverseScope::Enabled)
+    }
+
+    /// [`Self::prewarm_reverse_index`] 的按范围版本。
+    pub fn prewarm_reverse_index_in(&self, schema_id: &str, scope: ReverseScope) -> bool {
         if schema_id.is_empty()
-            || self.reverse_index_if_ready(schema_id).is_some()
-            || self.reverse_index_skipped(schema_id)
+            || self.reverse_index_if_ready_in(schema_id, scope).is_some()
+            || self.reverse_index_skipped_in(schema_id, scope)
         {
             return false;
         }
-        self.reverse_index_for(schema_id).is_some()
+        self.reverse_index_for(schema_id, scope).is_some()
     }
 
     /// 该方案的反查索引本次进程是否已被 build_guard 放弃（直到缓存失效前不再尝试）。
     pub fn reverse_index_skipped(&self, schema_id: &str) -> bool {
+        self.reverse_index_skipped_in(schema_id, ReverseScope::Enabled)
+    }
+
+    /// 仅供跨 crate 的测试模拟「连续崩溃保护已触发」；生产代码不调用。
+    #[doc(hidden)]
+    pub fn mark_reverse_index_skipped_for_test(&self, schema_id: &str, scope: ReverseScope) {
         self.reverse_index_skipped
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(schema_id)
+            .insert(reverse_index_key(schema_id, scope));
+    }
+
+    /// 仅供跨 crate 的测试观察注释反查范围缓存（`None` = 未缓存）；生产代码不调用。
+    #[doc(hidden)]
+    pub fn reverse_scope_cached_for_test(&self, schema_id: &str) -> Option<ReverseScope> {
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .copied()
+    }
+
+    /// [`Self::reverse_index_skipped`] 的按范围版本。
+    pub fn reverse_index_skipped_in(&self, schema_id: &str, scope: ReverseScope) -> bool {
+        self.reverse_index_skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&reverse_index_key(schema_id, scope))
     }
 
     /// 该方案的反查索引是否**正在后台构建**。
@@ -1655,9 +1810,79 @@ impl EngineManager {
     /// 打字线路据此决定「要不要再起一个后台构建线程」——没有它，索引没建好期间的
     /// 每一次按键都会 spawn 一个新线程去建同一份东西。
     pub fn is_building_reverse_index(&self, schema_id: &str) -> bool {
+        self.is_building_reverse_index_in(schema_id, ReverseScope::Enabled)
+    }
+
+    /// [`Self::is_building_reverse_index`] 的按范围版本。
+    pub fn is_building_reverse_index_in(&self, schema_id: &str, scope: ReverseScope) -> bool {
         !schema_id.is_empty()
-            && self.reverse_index_if_ready(schema_id).is_none()
-            && self.index_build_lock_for(schema_id).try_lock().is_err()
+            && self.reverse_index_if_ready_in(schema_id, scope).is_none()
+            && self
+                .index_build_lock_for(&reverse_index_key(schema_id, scope))
+                .try_lock()
+                .is_err()
+    }
+
+    /// 已加载引擎的影子层（未启用扩展词库）；引擎未加载、或没挂影子层（开关关 / 方案无扩展库）
+    /// 时 `None`。**只看已加载的**、不触发构建——调用方在按键线程上也可能走到这里。
+    fn loaded_disabled_dict_engine(&self, schema_id: &str) -> Option<Arc<dyn Engine>> {
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .filter(|e| e.disabled_dict_layers().is_some())
+            .cloned()
+    }
+
+    /// 阻塞地把 `schema_id` 已加载引擎的影子层建好（预热线程 / 测试用，**不可进按键链路**）。
+    /// 返回是否真的建了；引擎未加载、没挂影子层或已建好时返回 false。
+    pub fn prewarm_disabled_dicts(&self, schema_id: &str) -> bool {
+        self.loaded_disabled_dict_engine(schema_id)
+            .and_then(|e| e.disabled_dict_layers().map(|d| d.warm()))
+            .unwrap_or(false)
+    }
+
+    /// 后台预热 `schema_id` 已加载引擎的影子层（未启用扩展词库，reverse-mode spec §4.2）。
+    ///
+    /// 影子层是懒加载的：没有这一步，首次通配 / 反查查询会在**按键线程**上（持协调器 state 锁）
+    /// 逐库 mmap、缺缓存时还要现建 wdat——扩展库大时整机顿住。这里把那次加载挪到后台线程。
+    ///
+    /// - **零开销前提**：开关关或方案没有扩展库时引擎根本不挂影子层，这里一查即返回、不起线程；
+    ///   只看**已加载**的引擎，不触发构建（调用点可能在按键线程上）。
+    /// - **去重**：已建好或正有线程在建（`needs_warm` 用 `try_lock` 判）就不再起。
+    /// - **与按键线程串行**：加载持影子层内部那把锁。按键线程若撞上正在进行的预热就等它建完、
+    ///   直接复用——最坏情形等同没有预热；预热失败的库照旧 `warn!` 跳过，线程不 panic。
+    ///
+    /// 调用点：活跃方案引擎（重）建好时（`ensure_loaded`）、活跃方案变更时（`on_active_changed`）、
+    /// 热禁用扩展库之后（`set_dict_enabled_live`）。
+    fn warm_disabled_dicts_async(&self, schema_id: &str) {
+        let Some(engine) = self.loaded_disabled_dict_engine(schema_id) else {
+            return;
+        };
+        if !engine
+            .disabled_dict_layers()
+            .is_some_and(|d| d.needs_warm())
+        {
+            return;
+        }
+        let sid = schema_id.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("disabled-dicts-warm".into())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                if engine.disabled_dict_layers().is_some_and(|d| d.warm()) {
+                    debug!("后台预热未启用扩展词库 {} 用时 {:?}", sid, t0.elapsed());
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("无法启动未启用扩展词库预热线程: {e}（首次通配时再加载）");
+        }
+    }
+
+    /// 影子层建过几遍（测试与诊断用）；引擎未加载或没挂影子层时 `None`。
+    pub fn disabled_dicts_load_count(&self, schema_id: &str) -> Option<usize> {
+        self.loaded_disabled_dict_engine(schema_id)
+            .and_then(|e| e.disabled_dict_layers().map(|d| d.load_count()))
     }
 
     /// 单字全码表是否已就绪。它与反查索引同为**惰性全量构建**（同一批词库、同一量级），
@@ -1681,11 +1906,12 @@ impl EngineManager {
         true
     }
 
-    fn index_build_lock_for(&self, schema_id: &str) -> Arc<Mutex<()>> {
+    /// `key` 为 [`reverse_index_key`] 的结果：常规索引与变体各一把锁，互不阻塞。
+    fn index_build_lock_for(&self, key: &str) -> Arc<Mutex<()>> {
         self.index_build_locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(schema_id.to_string())
+            .entry(key.to_string())
             .or_default()
             .clone()
     }
@@ -1716,9 +1942,16 @@ impl EngineManager {
     ///
     /// **无缓存根时返回 `None` = 本次不落盘**。刻意不像 `cache_path` 那样回退到「源文件旁」
     /// ——词库源常在只读的安装目录，而反查索引是个上百 MB 的产物，落错地方比不落更糟。
-    fn reverse_index_cache_path(schema_id: &str) -> Option<std::path::PathBuf> {
+    ///
+    /// 「含未启用扩展库」变体（[`ReverseScope::WithDisabled`]）同目录、另起文件
+    /// `<方案键>.with_disabled.wridx`：内容不同，指纹（旁边的 `.fp`）与 build_guard 记录都按
+    /// 路径分开，两份绝不互相顶掉或误复用。
+    fn reverse_index_cache_path(
+        schema_id: &str,
+        scope: ReverseScope,
+    ) -> Option<std::path::PathBuf> {
         let dir = CACHE_DIR.get()?.as_ref()?;
-        Self::reverse_index_cache_path_in(dir, schema_id)
+        Self::reverse_index_cache_path_in(dir, schema_id, scope)
     }
 
     /// [`reverse_index_cache_path`](Self::reverse_index_cache_path) 的纯函数内核：缓存根显式
@@ -1726,9 +1959,14 @@ impl EngineManager {
     fn reverse_index_cache_path_in(
         cache_root: &Path,
         schema_id: &str,
+        scope: ReverseScope,
     ) -> Option<std::path::PathBuf> {
         let key = Self::schema_cache_key(schema_id)?;
-        Some(cache_root.join(&key).join(format!("{key}.wridx")))
+        let file = match scope {
+            ReverseScope::Enabled => format!("{key}.wridx"),
+            ReverseScope::WithDisabled => format!("{key}.with_disabled.wridx"),
+        };
+        Some(cache_root.join(&key).join(file))
     }
 
     /// 单字全码表缓存路径：`<cache>/<方案键>/<方案键>.wscc`。
@@ -1856,7 +2094,7 @@ impl EngineManager {
             else {
                 continue;
             };
-            for d in &Self::load_dicts_individually(&schema, &schemas_dir) {
+            for d in &Self::load_dicts_individually(&schema, &schemas_dir, ReverseScope::Enabled) {
                 if let Some(p) = d.source_file()
                     && !seen_files.insert(p.to_path_buf())
                 {
@@ -1884,7 +2122,11 @@ impl EngineManager {
 
     /// 返回 `None` 仅当构建被 build_guard 跳过（同一份输入已连续死在构建中）：
     /// 这**不是**「查无此词」，调用方不得把它当空表缓存或使用。
-    fn build_reverse_index_for(&self, schema_id: &str) -> Option<ReverseIndex> {
+    fn build_reverse_index_for(
+        &self,
+        schema_id: &str,
+        scope: ReverseScope,
+    ) -> Option<ReverseIndex> {
         #[cfg(test)]
         self.reverse_index_build_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1897,7 +2139,7 @@ impl EngineManager {
         else {
             return Some(ReverseIndex::default());
         };
-        let dicts = Self::load_dicts_individually(&schema, &schemas);
+        let dicts = Self::load_dicts_individually(&schema, &schemas, scope);
         if dicts.is_empty() {
             return Some(ReverseIndex::default());
         }
@@ -1906,7 +2148,7 @@ impl EngineManager {
 
         // 索引落盘与否只看缓存根：「某本词库处于内存模式」这一守卫由下面的 digests 兜住，
         // 它查的是**全部**词库，比这里曾经只看首本词库的 `source_file()` 严格。
-        let cache = Self::reverse_index_cache_path(schema_id);
+        let cache = Self::reverse_index_cache_path(schema_id, scope);
         let digests = Self::reverse_index_source_digests(&dicts);
 
         // ① 复用：词库一个没变就直接开盘上的那份，连构建都不发生。
@@ -1920,12 +2162,13 @@ impl EngineManager {
             match ReverseIndex::open(c, REVERSE_INDEX_RESIDENT_MAX) {
                 Ok(idx) => {
                     info!(
-                        "Reused reverse index cache: {} ({} texts, {} dicts, {:.1} MB, 常驻 {:.1} MB)",
+                        "Reused reverse index cache: {} ({} texts, {} dicts, {:.1} MB, 常驻 {:.1} MB) scope={:?}",
                         schema_id,
                         idx.len(),
                         dicts.len(),
                         idx.data_bytes() as f64 / 1024.0 / 1024.0,
                         idx.resident_bytes() as f64 / 1024.0 / 1024.0,
+                        scope,
                     );
                     return Some(idx);
                 }
@@ -1970,13 +2213,14 @@ impl EngineManager {
                     match ReverseIndex::open(c, REVERSE_INDEX_RESIDENT_MAX) {
                         Ok(idx) => {
                             info!(
-                                "Built reverse index: {} ({} texts, {} dicts, {:.1} MB, 常驻 {:.1} MB, {:?})",
+                                "Built reverse index: {} ({} texts, {} dicts, {:.1} MB, 常驻 {:.1} MB, {:?}) scope={:?}",
                                 schema_id,
                                 idx.len(),
                                 dicts.len(),
                                 idx.data_bytes() as f64 / 1024.0 / 1024.0,
                                 idx.resident_bytes() as f64 / 1024.0 / 1024.0,
-                                built
+                                built,
+                                scope,
                             );
                             return Some(idx);
                         }
@@ -1992,12 +2236,13 @@ impl EngineManager {
         }
         let idx = ReverseIndex::from_bytes(image);
         info!(
-            "Built reverse index (未落盘，常驻内存): {} ({} texts, {} dicts, {:.1} MB, {:?})",
+            "Built reverse index (未落盘，常驻内存): {} ({} texts, {} dicts, {:.1} MB, {:?}) scope={:?}",
             schema_id,
             idx.len(),
             dicts.len(),
             idx.data_bytes() as f64 / 1024.0 / 1024.0,
-            built
+            built,
+            scope,
         );
         Some(idx)
     }
@@ -2035,7 +2280,11 @@ impl EngineManager {
             return HashMap::new();
         };
         let cap = schema.engine.codetable.max_code_length;
-        let dicts = Self::load_dicts_individually(&schema, &data_dir.join("schemas"));
+        let dicts = Self::load_dicts_individually(
+            &schema,
+            &data_dir.join("schemas"),
+            ReverseScope::Enabled,
+        );
         if dicts.is_empty() {
             return HashMap::new();
         }
@@ -2481,6 +2730,11 @@ impl EngineManager {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(schema_id.to_string(), Arc::from(engine));
+                // 活跃方案的引擎（重）建好了：影子层后台预热。非活跃方案等切过去时再热
+                // （`on_active_changed`），不为用户未必会用的方案读盘。
+                if schema_id == self.active_schema_id() {
+                    self.warm_disabled_dicts_async(schema_id);
+                }
                 true
             }
             None => {
@@ -2606,6 +2860,22 @@ impl EngineManager {
     /// 且非法键的告警只该在构建期出一次。
     pub fn active_wildcard_key(&self) -> Option<char> {
         self.active_engine().and_then(|e| e.wildcard_key())
+    }
+
+    /// 活跃方案反查模式内的通配键（非码表方案 `None`；混输取主码表的）。
+    pub fn active_reverse_key(&self) -> Option<char> {
+        self.active_engine().and_then(|e| e.reverse_wildcard_key())
+    }
+
+    /// 反查模式转换（透传活跃引擎；不看 `wildcard` 主开关，不叠英文 / 拼音）。
+    pub fn convert_reverse(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.active_engine()?
+            .convert_reverse(input, pattern, max_candidates)
     }
 
     /// 活跃方案的通配码长（[`Engine::wildcard_code_length`]；混输取主码表的）。
@@ -3209,11 +3479,20 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
         *self
             .single_char_codes
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // 禁用方向把一个库挪进了影子集合、作废了已建的影子层：趁现在后台重建，别等首次通配
+        // 在按键线程上读盘。启用方向走失效重建，新引擎建好时自会预热（见 `ensure_loaded`）。
+        if !enabled {
+            self.warm_disabled_dicts_async(&self.active_schema_id());
+        }
         // 恒 true：上面每条路都以「无需重启即可生效」收尾。保留返回值是为了兼容既有调用方
         // （web 的 `live` 字段），也给将来真出现「必须重启」的分支留个位置。
         true
@@ -3375,6 +3654,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
         *self
             .single_char_codes
@@ -3412,6 +3695,8 @@ impl EngineManager {
         self.schema_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::active_hook::notify_active_changed(id);
+        // 切到的方案若挂着影子层，趁现在后台预热（所有改 `active` 的路径都经过这里）。
+        self.warm_disabled_dicts_async(id);
     }
 
     /// 活跃方案的变更代际，见 [`Self::schema_generation`] 字段说明。
@@ -3507,6 +3792,12 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner()) = None;
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.codetable.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.codetable.clone();
+        // 注释反查范围读 `lookup_disabled_dicts`（上一行刚写入）：必须清在写入**之后**，否则
+        // 并发的 `comment_reverse_scope` 会在两者之间按旧开关重算并缓存到下次失效。
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();
         *self.english.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.english.clone();
         // 连同**引擎缓存**一起重置：开关从关到开时，缓存里躺着的可能是上次「未尝试」之外的
@@ -5771,6 +6062,9 @@ impl EngineManager {
                 // 通配：与上屏行为同源于 `eff`（全局基线 + 方案折叠；overlay 方案取内置基线，
                 // 默认关）。非法键在此告警一次并视为关闭，协调器经 `active_wildcard_key` 取用。
                 wildcard: eff.wildcard_char(schema_id),
+                wildcard_single_only: eff.wildcard_single_only,
+                // 反查模式通配键：不看主开关，非法回落 z（spec §3.2）。
+                reverse_key: Some(eff.reverse_wildcard_char()),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -5813,6 +6107,12 @@ impl EngineManager {
             // 方案级归一化：构造一次、施加到全部词库层——同一个映射函数才保序，
             // 库间相对关系因此原样保留（见 `weight_norm_of`）。
             let wnorm = weight_norm_of(&schema);
+            // 影子层的启用集取「本次实际挂上的扩展层」，须在下面消费 `layers` 之前收集。
+            let loaded_extra_ids: Vec<String> = layers
+                .iter()
+                .filter_map(|l| l.name.strip_prefix("codetable-extra-"))
+                .map(str::to_string)
+                .collect();
             for l in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(l.dict, l.name, l.enabled)
@@ -5836,6 +6136,14 @@ impl EngineManager {
             let mut engine = CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
                 .with_charset(charset)
                 .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema));
+            // 影子层（未启用扩展库，只给通配 / 反查用，spec §4.2）：开关关或无扩展库时不挂。
+            // 混输的主码表子引擎也走这里，开关取主码表方案折叠出的 `eff`（混输自身没有独立的
+            // 码表配置，与其余码表行为同一口径）；英文分支不接。
+            if eff.lookup_disabled_dicts
+                && let Some(d) = Self::disabled_dict_layers(&schema, &schemas, loaded_extra_ids)
+            {
+                engine = engine.with_disabled_dicts(d);
+            }
             // 逆切分的两段由引擎自己查，协调器的候选调整够不着，须另行注入（论坛 t231）。
             // 归属 id 取方案自身：码表的 `data_schema_id` 就是自身 id（只有拼音族折叠），
             // 混输下 `split_input` 恒为 false（见 `resolve_split_input`），不会注入。
@@ -5957,22 +6265,88 @@ impl EngineManager {
             .collect()
     }
 
+    /// 码表方案的选库口径：可用 = path 非空；主库 = 首个 `default`，无则首个可用库；其余可用库
+    /// **全是扩展库**（不看 `is_enabled`）。无可用库 ⇒ `None`。
+    ///
+    /// [`Self::load_codetable_layers`] 与 [`Self::disabled_extra_sources`] 共用这一处：两边一旦
+    /// 漂移，就会出现「某库既不在主层也不在影子层」或「主库进了影子层」。
+    fn split_codetable_dicts(schema: &Schema) -> Option<(&DictSpec, Vec<&DictSpec>)> {
+        let mut usable: Vec<&DictSpec> = schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.path.is_empty())
+            .collect();
+        if usable.is_empty() {
+            return None;
+        }
+        let main_idx = usable.iter().position(|d| d.default).unwrap_or(0);
+        let main = usable.remove(main_idx);
+        Some((main, usable))
+    }
+
+    /// 影子层（reverse-mode spec §4.2）的来源：本方案**全部**扩展库（主库除外，含已启用的——
+    /// 它们随时可能被热禁用而进影子集合）。哪些真正进影子集合由
+    /// `DisabledDictLayers` 按「声明 − 本次实际挂进主 dm 的」在查询时算，见
+    /// [`Self::disabled_dict_layers`]。用户词库 / 临时词库不在 `[[dictionaries]]` 里，天然不在内。
+    ///
+    /// `load` 闭包与 `load_codetable_layers` 同一条读盘路径（`resolve_dict_file` + `cache_path` +
+    /// `CachedDict::load_at_with`），**只返回 `Result`、不 panic**：失败由影子层 `warn!` 后跳过该库
+    /// （spec §4.3）。它可能 mmap 或首建 wdat，大扩展库上是秒级读盘，故由后台线程预热
+    /// （[`Self::warm_disabled_dicts_async`]），不留给首次通配 / 反查的按键线程；预热没赶上时
+    /// 按键线程等它建完或自己现建，之后复用，直到失效重建。开关关着时影子层不挂，从不调用。
+    fn disabled_extra_sources(
+        schema: &Schema,
+        schemas_dir: &Path,
+    ) -> Vec<crate::codetable::DisabledDictSource> {
+        let Some((_, extras)) = Self::split_codetable_dicts(schema) else {
+            return Vec::new();
+        };
+        extras
+            .into_iter()
+            .map(|e| {
+                let full = Self::resolve_dict_file(&e.path, schemas_dir);
+                let is_english = e.dict_type == "english";
+                crate::codetable::DisabledDictSource {
+                    id: e.id.clone(),
+                    base_order: e.base_order,
+                    default_weight: e.default_weight,
+                    load: Arc::new(move || {
+                        CachedDict::load_at_with(&full, &cache_path(&full, "wdat"), is_english)
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    /// 组装影子层：来源见 [`Self::disabled_extra_sources`]，启用集 = 本次 `load_codetable_layers`
+    /// **实际挂上**的扩展库 id（不是 `is_enabled()`：用户覆盖启用的已挂上、不进影子；启用但加载
+    /// 失败的算未挂，影子层会再试一次、再失败也只 warn）。主库恒不在来源里。
+    /// 无扩展库 ⇒ `None`，不挂：没有可查的未启用库，就不该为它付任何构造或预热开销。开关由调用方判。
+    fn disabled_dict_layers(
+        schema: &Schema,
+        schemas_dir: &Path,
+        loaded_extra_ids: Vec<String>,
+    ) -> Option<crate::codetable::DisabledDictLayers> {
+        let sources = Self::disabled_extra_sources(schema, schemas_dir);
+        if sources.is_empty() {
+            return None;
+        }
+        Some(crate::codetable::DisabledDictLayers::new(
+            sources,
+            loaded_extra_ids,
+            weight_norm_of(schema),
+        ))
+    }
+
     fn load_codetable_layers(schema: &Schema, schemas_dir: &Path) -> Vec<CodetableLayer> {
         let resolve =
             |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
         let is_english =
             |e: &DictSpec| -> bool { !e.dict_type.is_empty() && e.dict_type == "english" };
 
-        let usable: Vec<&DictSpec> = schema
-            .dictionaries
-            .iter()
-            .filter(|d| !d.path.is_empty())
-            .collect();
-        if usable.is_empty() {
+        let Some((main, extras)) = Self::split_codetable_dicts(schema) else {
             return Vec::new();
-        }
-        // 主库 = 首个 default；无 default 则取首个可用库。
-        let main_idx = usable.iter().position(|d| d.default).unwrap_or(0);
+        };
 
         let load_one = |e: &DictSpec| -> Option<CachedDict> {
             let full = resolve(&e.path);
@@ -5987,19 +6361,15 @@ impl EngineManager {
 
         let mut out: Vec<CodetableLayer> = Vec::new();
         // 主库优先注册。加载失败 → 无系统层可用，放弃整方案（避免无候选）。
-        match load_one(usable[main_idx]) {
+        match load_one(main) {
             Some(d) => {
-                info!(
-                    "  codetable main: {} ({} entries)",
-                    usable[main_idx].path,
-                    d.len()
-                );
+                info!("  codetable main: {} ({} entries)", main.path, d.len());
                 out.push(CodetableLayer {
                     name: "codetable-system".to_string(),
                     dict: d,
                     enabled: true,
-                    base_order: usable[main_idx].base_order,
-                    default_weight: usable[main_idx].default_weight,
+                    base_order: main.base_order,
+                    default_weight: main.default_weight,
                 });
             }
             None => return Vec::new(),
@@ -6011,10 +6381,7 @@ impl EngineManager {
         // mmap 占着，于是用户「关掉了这个码表」之后既看不见它、又删不掉它的缓存文件。
         // 现在改为惰性：禁用的库不读、不建缓存、不映射；用户启用它时
         // `set_dict_enabled` 返回 false → 方案失效 → 下次使用重建，那一趟才去加载。
-        for (i, e) in usable.iter().enumerate() {
-            if i == main_idx {
-                continue;
-            }
+        for e in extras {
             let enabled = e.is_enabled();
             if !enabled {
                 info!(
@@ -6067,6 +6434,16 @@ impl EngineManager {
             .collect()
     }
 
+    /// 方案声明的**全部**词库（path 非空，不看 `is_enabled`）：「含未启用扩展库」反查索引变体
+    /// 的选库口径（[`ReverseScope::WithDisabled`]）。只该进那一份索引，别拿去建引擎或常规索引。
+    fn all_dict_specs(schema: &Schema) -> Vec<&DictSpec> {
+        schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.path.is_empty())
+            .collect()
+    }
+
     /// 按方案加载**全部启用词库，各自独立**——不合并、不产出中间文件。
     ///
     /// # 为什么两个索引构建方要走这里而不是 [`Self::load_dictionary`]
@@ -6082,8 +6459,19 @@ impl EngineManager {
     ///
     /// 各库经 [`wind_dict::reader_pool`] 按路径共享 mmap，活跃引擎通常已持有同一批
     /// reader，故这里几乎零成本：不重新解析、不新增映射。
-    fn load_dicts_individually(schema: &Schema, schemas_dir: &Path) -> Vec<CachedDict> {
-        Self::enabled_dict_specs(schema)
+    ///
+    /// `scope = WithDisabled` 时改取 [`Self::all_dict_specs`]（含未启用扩展库，只供候选注释反查的
+    /// 变体索引）；加载逻辑两者相同，读不了的库照旧静默略过。
+    fn load_dicts_individually(
+        schema: &Schema,
+        schemas_dir: &Path,
+        scope: ReverseScope,
+    ) -> Vec<CachedDict> {
+        let specs = match scope {
+            ReverseScope::Enabled => Self::enabled_dict_specs(schema),
+            ReverseScope::WithDisabled => Self::all_dict_specs(schema),
+        };
+        specs
             .iter()
             .filter_map(|e| {
                 let full = Self::resolve_dict_file(&e.path, schemas_dir);
@@ -6822,6 +7210,33 @@ impl EngineManager {
     }
 }
 
+/// 反查索引的范围：常规（只含已启用词库）或「含未启用扩展库」变体。
+///
+/// 变体只供候选注释反查（`code` / `code_rev` / `code_all` / `code_rev_all`）；
+/// 加词查重、辅助码、悬停、联想、单字全码表一律用 `Enabled`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReverseScope {
+    Enabled,
+    WithDisabled,
+}
+
+/// 变体在内存表里的键后缀。`\u{1}` 不可能出现在方案 id 里，拼上后不会与任何真方案 id 撞。
+const WITH_DISABLED_KEY_SUFFIX: &str = "\u{1}with_disabled";
+
+/// `reverse_index` / `reverse_index_skipped` / `index_build_locks` 三张表的键。
+/// `Enabled` 就是方案 id 本身（与旧实现一致）。
+fn reverse_index_key(schema_id: &str, scope: ReverseScope) -> String {
+    match scope {
+        ReverseScope::Enabled => schema_id.to_string(),
+        ReverseScope::WithDisabled => format!("{schema_id}{WITH_DISABLED_KEY_SUFFIX}"),
+    }
+}
+
+/// [`reverse_index_key`] 的逆：去掉变体后缀，得方案 id。
+fn reverse_index_base(key: &str) -> &str {
+    key.strip_suffix(WITH_DISABLED_KEY_SUFFIX).unwrap_or(key)
+}
+
 /// 反查索引的保留判据：本次请求的、主码表、以及当前在用集合里的（联想方案、辅助码引用的方案）。
 ///
 /// 原先只留「本次 + 主码表」两份：辅助码引用五笔、联想用拼音时，三者会互相顶掉、反复秒级重建。
@@ -6917,19 +7332,56 @@ mod tests {
     #[test]
     fn reverse_index_path_is_scoped_by_schema_id_only() {
         let root = Path::new("cache");
-        let p = EngineManager::reverse_index_cache_path_in(root, "ime_wubi86").unwrap();
+        let p =
+            EngineManager::reverse_index_cache_path_in(root, "ime_wubi86", ReverseScope::Enabled)
+                .unwrap();
         assert_eq!(p, root.join("ime_wubi86").join("ime_wubi86.wridx"));
 
         // 出厂扁平方案：与旧实现逐字节一致，存量索引不失效。
         assert_eq!(
-            EngineManager::reverse_index_cache_path_in(root, "wubi86").unwrap(),
+            EngineManager::reverse_index_cache_path_in(root, "wubi86", ReverseScope::Enabled)
+                .unwrap(),
             root.join("wubi86").join("wubi86.wridx")
         );
 
         // 共用主库的两个方案（shuangpin 的主库在 pinyin/ 下）各归各的目录。
-        let a = EngineManager::reverse_index_cache_path_in(root, "pinyin").unwrap();
-        let b = EngineManager::reverse_index_cache_path_in(root, "shuangpin").unwrap();
+        let a = EngineManager::reverse_index_cache_path_in(root, "pinyin", ReverseScope::Enabled)
+            .unwrap();
+        let b =
+            EngineManager::reverse_index_cache_path_in(root, "shuangpin", ReverseScope::Enabled)
+                .unwrap();
         assert_ne!(a.parent(), b.parent());
+    }
+
+    /// ★ Review Focus 4（路径层）：变体与常规索引同目录、不同文件；常规路径与旧实现逐字节一致。
+    #[test]
+    fn reverse_index_variant_path_differs() {
+        let root = Path::new("/c");
+        let a = EngineManager::reverse_index_cache_path_in(root, "wubi86", ReverseScope::Enabled)
+            .unwrap();
+        let b =
+            EngineManager::reverse_index_cache_path_in(root, "wubi86", ReverseScope::WithDisabled)
+                .unwrap();
+        assert_eq!(a, root.join("wubi86").join("wubi86.wridx"));
+        assert_eq!(b, root.join("wubi86").join("wubi86.with_disabled.wridx"));
+    }
+
+    #[test]
+    fn reverse_index_keeps_variant_with_its_base() {
+        let k = reverse_index_key("wubi86", ReverseScope::WithDisabled);
+        assert_eq!(reverse_index_base(&k), "wubi86");
+        assert!(reverse_index_keeps(
+            reverse_index_base(&k),
+            "stroke",
+            "wubi86",
+            &[]
+        ));
+        assert!(!reverse_index_keeps(
+            reverse_index_base(&reverse_index_key("old", ReverseScope::WithDisabled)),
+            "stroke",
+            "wubi86",
+            &[]
+        ));
     }
 
     /// 单字全码表与反查索引同键同目录、只差扩展名。
@@ -6941,7 +7393,9 @@ mod tests {
         let root = Path::new("cache");
         let w = EngineManager::single_char_codes_cache_path_in(root, "ime_wubi86").unwrap();
         assert_eq!(w, root.join("ime_wubi86").join("ime_wubi86.wscc"));
-        let r = EngineManager::reverse_index_cache_path_in(root, "ime_wubi86").unwrap();
+        let r =
+            EngineManager::reverse_index_cache_path_in(root, "ime_wubi86", ReverseScope::Enabled)
+                .unwrap();
         assert_eq!(w.parent(), r.parent(), "同源的两份产物必须同目录");
         assert_ne!(w, r);
     }
@@ -9175,13 +9629,15 @@ input_chars = \"a-z;\"
         cfg.schema.active = sid.clone();
         let mgr = EngineManager::new(&cfg, Some(&base));
 
-        let Some(cache) = EngineManager::reverse_index_cache_path(&sid) else {
+        let Some(cache) = EngineManager::reverse_index_cache_path(&sid, ReverseScope::Enabled)
+        else {
             eprintln!("!!! 无缓存根，build_guard 不参与，本测试没有真正运行");
             return;
         };
         let schema = EngineManager::read_schema(&sid, Some(&base), mgr.override_dir.as_deref())
             .expect("方案可读");
-        let dicts = EngineManager::load_dicts_individually(&schema, &schemas);
+        let dicts =
+            EngineManager::load_dicts_individually(&schema, &schemas, ReverseScope::Enabled);
         let dg = EngineManager::reverse_index_source_digests(&dicts).expect("词库有源文件");
         let key =
             wind_dict::cache_fp::derived_build_key(&dg, wind_dict::cache_fp::REVERSE_INDEX_TAG);
@@ -9360,5 +9816,98 @@ input_chars = \"a-z;\"
         s.tally("\u{3105}\u{6211}", 1, 0);
         s.finish();
         assert!(s.chars.is_empty() && s.entries == 0);
+    }
+
+    /// 影子层来源与 load_codetable_layers 同口径：主库除外、扩展库全收（含已启用），
+    /// 两边选库规则一旦漂移，就会出现「某库既不在主层也不在影子层」。
+    #[test]
+    fn disabled_extra_sources_cover_every_declared_extra() {
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"t/m.dict.yaml\"\ndefault = true\n\
+             [[dictionaries]]\nid = \"on\"\npath = \"t/on.dict.yaml\"\ndefault_enabled = true\n\
+             [[dictionaries]]\nid = \"off\"\npath = \"t/off.dict.yaml\"\ndefault_enabled = false\n\
+             [[dictionaries]]\nid = \"nopath\"\npath = \"\"\n",
+        )
+        .unwrap();
+        let ids: Vec<String> =
+            EngineManager::disabled_extra_sources(&schema, Path::new("/nonexistent"))
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+        assert_eq!(ids, ["on", "off"]);
+    }
+
+    /// 无 `default` 时主库 = 首个可用库（同 load_codetable_layers），它同样不进影子层来源。
+    #[test]
+    fn disabled_extra_sources_exclude_fallback_main_without_default() {
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"nopath\"\npath = \"\"\n\
+             [[dictionaries]]\nid = \"first\"\npath = \"t/f.dict.yaml\"\n\
+             [[dictionaries]]\nid = \"off\"\npath = \"t/off.dict.yaml\"\ndefault_enabled = false\n",
+        )
+        .unwrap();
+        let ids: Vec<String> =
+            EngineManager::disabled_extra_sources(&schema, Path::new("/nonexistent"))
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+        assert_eq!(ids, ["off"]);
+    }
+
+    /// 实际进影子集合的只有「本次没挂进主 dm 的扩展库」——主库、已加载的扩展库
+    /// 都不读。四个库各放一个独有词，用 `??` 通配把影子层整个掏出来比对；另有一个文件缺失的
+    /// 未启用库，证明 loader 失败只 warn 跳过、不 panic。
+    #[test]
+    fn disabled_dict_layers_load_only_unloaded_extras() {
+        let dir = std::env::temp_dir().join(format!("wind-ddl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        let dict = |name: &str, body: &str| {
+            format!(
+                "---\nname: {name}\nversion: \"1\"\ncolumns:\n  - code\n  - text\n  - weight\n...\n{body}"
+            )
+        };
+        for (f, body) in [
+            ("m", "aa\t主库\t1\n"),
+            ("on", "ab\t已启用\t1\n"),
+            ("off", "ac\t未启用\t1\n"),
+        ] {
+            std::fs::write(dir.join(format!("t/{f}.dict.yaml")), dict(f, body)).unwrap();
+        }
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"t/m.dict.yaml\"\ndefault = true\n\
+             [[dictionaries]]\nid = \"on\"\npath = \"t/on.dict.yaml\"\ndefault_enabled = true\n\
+             [[dictionaries]]\nid = \"off\"\npath = \"t/off.dict.yaml\"\ndefault_enabled = false\n\
+             [[dictionaries]]\nid = \"gone\"\npath = \"t/gone.dict.yaml\"\ndefault_enabled = false\n",
+        )
+        .unwrap();
+        let d = EngineManager::disabled_dict_layers(&schema, &dir, vec!["on".to_string()])
+            .expect("有扩展库 ⇒ 挂影子层");
+        assert_eq!(d.load_count(), 0, "构造不读盘");
+        let pat = format!("{0}{0}", wind_dict::WILDCARD_SLOT);
+        let texts: Vec<String> = d
+            .search_pattern(&pat, wind_dict::WILDCARD_SLOT, 50, true)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(texts, ["未启用"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 方案没有任何扩展库 ⇒ 不挂影子层（零开销）。
+    #[test]
+    fn disabled_dict_layers_none_without_extras() {
+        let schema: Schema = toml::from_str(
+            "[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"t/m.dict.yaml\"\ndefault = true\n",
+        )
+        .unwrap();
+        assert!(
+            EngineManager::disabled_dict_layers(&schema, Path::new("/nonexistent"), Vec::new())
+                .is_none()
+        );
     }
 }

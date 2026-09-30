@@ -426,7 +426,9 @@ impl crate::Coordinator {
         // 候选窗当场清空。而这恰恰是生僻字模式里最常做的操作。
         if matches!(
             state.active,
-            Some(crate::pipeline::ModeKind::Special(_)) | Some(crate::pipeline::ModeKind::RareChar)
+            Some(crate::pipeline::ModeKind::Special(_))
+                | Some(crate::pipeline::ModeKind::RareChar)
+                | Some(crate::pipeline::ModeKind::Reverse)
         ) {
             // 返回值是「全码策略请求自动上屏」的意向，此处刻意丢弃：编码一个字没变，
             // 用户只是在标记字的常用性，凭空上屏是错的。

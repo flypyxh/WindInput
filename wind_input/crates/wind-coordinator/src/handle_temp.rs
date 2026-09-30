@@ -111,10 +111,10 @@ impl Coordinator {
     /// 返回 `Some` 表示已夺取，`None` 表示不夺取。混输引擎排除（避免 `zhang` 丢首字母，
     /// 对齐 Go 门禁）。
     ///
-    /// # 支持哪些目标：临拼 / 临英 / mix / 生僻字，不含快符
+    /// # 支持哪些目标：临拼 / 临英 / mix / 生僻字 / 反查，不含快符
     ///
     /// 夺取要求目标模式能**接住一段残余编码**：临拼收拼音、临英收英文原文、mix 收自由输入
-    /// （日期/计算/拼音/英文各自试）、生僻字收当前方案的编码，四者的残余码都有意义。
+    /// （日期/计算/拼音/英文各自试）、生僻字与反查收当前方案的编码，五者的残余码都有意义。
     ///
     /// `special`（快符类）刻意排除：那类表的编码是作者精心设计的短码，`zab` 抛掉 z 之后的
     /// `ab` 落到快符表里多半什么也查不到；且它常开 `show_all_on_enter`，价值在「进入即浏览
@@ -143,6 +143,7 @@ impl Coordinator {
     /// | `temp_english` | 字母+数字+符号 | 收英文原文，`z-` → `-` 是合法开头 |
     /// | `mix:<id>` | 字母+数字+符号 | 收自由输入，**算式与日期恰恰要数字和运算符** |
     /// | `rare_char` | 仅字母 | 收当前方案的编码，同临拼：数字仍该是选词键 |
+    /// | `reverse` | 仅字母 | 同生僻字：残余码是当前方案的编码 |
     ///
     /// ★ 这条判据是 2026-08-08 补的。夺取机制原本只为临拼而建（残余码只可能是字母），
     /// 故只挂在字母臂上；推广到 mix 时没跟着放开字符类别，表现是「z 进快捷输入后算不了数」
@@ -153,6 +154,8 @@ impl Coordinator {
             BA::TempPinyin => ch.is_ascii_alphabetic(),
             // 生僻字：残余码就是**当前方案**的编码，与临拼同理只收字母（数字仍是选词键）。
             BA::RareChar => ch.is_ascii_alphabetic(),
+            // 反查：残余码同样是本方案编码（通配键若是字母也在其中），数字仍是选词键。
+            BA::Reverse => ch.is_ascii_alphabetic(),
             BA::TempEnglish | BA::Mix(_) => ch.is_ascii_graphic(),
             // special 不走夺取（见本函数文档），其余动词与夺取无关。
             _ => false,
@@ -253,6 +256,22 @@ impl Coordinator {
                 state.special_prefix = "z".to_string();
                 "rare char"
             }
+            // 反查（GH#146 同构）：五笔出厂 `zz*` 短语让首键 z 恒让位，不补这条回路，
+            // `z_key_action = "reverse"` 永远进不去。字段与 `enter_reverse_mode` 同一组；
+            // 门卫同首键进入点（总开关 + 活跃方案有反查通配键），没过不夺取、不吞键。
+            wind_config::BoundAction::Reverse => {
+                if !self.reverse_mode_available() {
+                    return None;
+                }
+                state.active = Some(ModeKind::Reverse);
+                state.special_id = 0;
+                state.overlay_spec = None;
+                state.special_buffer = residual.clone();
+                state.special_cursor = state.special_buffer.len();
+                state.special_prefix = "z".to_string();
+                state.scope_relaxed = false;
+                "reverse"
+            }
             // 快符类不走夺取（残余码在符号表里查不到，且它要的是「进入即浏览」）；
             // None 表示本方案没给 z 绑任何东西。
             _ => return None,
@@ -276,6 +295,8 @@ impl Coordinator {
                     return Some(self.special_auto_commit(state, cand));
                 }
             }
+            // 反查模式不自动上屏（通配查询没有「全码唯一」一说）。
+            Some(ModeKind::Reverse) => self.update_reverse_candidates(state),
             _ => {}
         }
         let display = state.preedit.clone();

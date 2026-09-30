@@ -1,7 +1,7 @@
 # 前缀夺取式模式
 
 > 面向「要再加一个这样的模式」的人。当前实例：网址（`input.url`）、Unicode 码点
-> （`input.unicode`）、邮箱（`input.email`，**后缀触发**，见 §5.2）。
+> （`input.unicode`）、邮箱（`input.email`，**后缀触发**，见 §5.2）、反查模式（`input.reverse`，special 的参数变体，入口是 `key_actions` 与 z 夺取）。
 > z 夺取（`try_z_fallback`）复用同一套回退骨架，但入口不同。
 
 ## 1. 它是什么
@@ -57,11 +57,11 @@
 |---|---|---|
 | 1 | `pipeline.rs` `ModeKind` | 新变体 |
 | 2 | `debug_support.rs` `debug_active_mode` | 模式名字符串（测试断言用） |
-| 3 | `handle_candidate.rs` `commit_by_offset` | 序号选词的行为（多半是 `return None`） |
+| 3 | `handle_candidate.rs` `select_page_candidate` / `commit_highlighted` / `select_candidate_at` | 序号选词的行为（多半是 `return None`） |
 | 4 | `handle_candidate.rs` `overlay_buf_edit` | `BufEdit`（缓冲 + 光标） |
 | 5 | `handle_candidate.rs` `overlay_caret_parts` | caret 换算四要素 |
-| 6 | `handle_mode.rs` `mode_badge`（1124 行那个 match） | 候选窗徽标全名 + 短名 |
-| 7 | `layout.rs` `mode_layout_intent` | `candidate_layout` 配置项 |
+| 6 | `handle_mode.rs` `mode_indicator_names` | 候选窗徽标全名 + 短名 |
+| 7 | `layout.rs` `intent_for` | `candidate_layout` 配置项 |
 | 8 | `comment.rs` | 注释模板覆盖两项 |
 | 9 | `layout.rs` 测试里的 `cfg_with` 与 `MODES` | 两个都要动。只把模式加进 `MODES` 而忘了在 `cfg_with` 里给它的 `candidate_layout` 赋值，`every_mode_maps_intent_over_baseline` 会红在「Vertical 意图却得 false」上——那是 fixture 没配，不是实现错 |
 
