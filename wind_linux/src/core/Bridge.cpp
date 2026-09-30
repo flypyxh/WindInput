@@ -163,6 +163,10 @@ std::string overlayShmName(uint32_t kind)
     case OVERLAY_KIND_TOAST:
         return shmName() + "_TST";
     default:
+        // 菜单每级一段：`_MN0`、`_MN1`…
+        if (kind >= OVERLAY_KIND_MENU && kind < OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS) {
+            return shmName() + "_MN" + std::to_string(kind - OVERLAY_KIND_MENU);
+        }
         return {};
     }
 }

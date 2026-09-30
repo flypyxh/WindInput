@@ -87,6 +87,15 @@ Bytes encodeCandidateScrollFrame(int32_t delta);
 Bytes encodeMenuActionFrame(int32_t id);
 /// CMD_EXT（上行扩展信封）：kindLen u32 + kind + bodyLen u32 + body。
 Bytes encodeExtFrame(const std::string& kind, const std::string& body);
+/// CMD_MENU_POINTER：event u32 + button u32 + x i32 + y i32（16 字节，根窗口坐标）。
+/// 对位 Rust `server.rs` 的 CMD_MENU_POINTER 臂（Linux 专属，无 Swift 对位）。
+Bytes encodeMenuPointerFrame(uint32_t event, uint32_t button, int32_t x, int32_t y);
+/// 上行扩展信封 `menu.open`：body = `{"target":T,"x":X,"y":Y,"work":[左,上,右,下]}`。
+/// target ≥ 0 为该候选（页内下标）的右键菜单，-1 为功能主菜单；(x, y) 为菜单左上锚点。
+Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, int32_t top,
+                          int32_t right, int32_t bottom);
+/// 上行扩展信封 `menu.dismiss`：body = `{"reason":"…"}`（reason 只含 [a-z_]，不转义）。
+Bytes encodeMenuDismissFrame(const std::string& reason);
 /// CMD_FRONT_CONTEXT：appLen+app + titleLen+title + selLen+sel（均 UTF-8）。
 Bytes encodeFrontContextFrame(const std::string& app, const std::string& title,
                               const std::string& sel);

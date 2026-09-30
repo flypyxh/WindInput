@@ -1,6 +1,7 @@
 #include "WindEngine.h"
 
 #include "ExtProtocol.h"
+#include "Menu.h"
 #include "ServiceLauncher.h"
 #include "SettingsLauncher.h"
 #include "Protocol.h"
@@ -12,8 +13,10 @@
 #include <fcitx-utils/misc.h>
 #include <fcitx-utils/utf8.h>
 #include <fcitx/inputpanel.h>
+#include <fcitx/statusarea.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
+#include <fcitx/userinterfacemanager.h>
 
 #include <chrono>
 #include <cstdio>
@@ -137,12 +140,41 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     cb.select = [this](int32_t i) { sendAndDrain(encodeCandidateSelectFrame(i)); };
     cb.hover = [this](int32_t i) { sendAndDrain(encodeCandidateHoverFrame(i)); };
     cb.scroll = [this](int32_t d) { sendAndDrain(encodeCandidateScrollFrame(d)); };
+    // 自绘菜单：右键候选窗请求开菜单；菜单打开期间的指针事件原样报给服务端（命中测试、高亮、
+    // 子菜单都在服务端的 popup_menu 里）；本端自己收了菜单（空闲超时）要报，服务端才会复位
+    // menu_open——否则它继续吞方向键 / 回车 / Esc。
+    cb.contextMenu = [this](int32_t target, int32_t x, int32_t y) { requestMenu(target, x, y); };
+    cb.menuPointer = [this](uint32_t e, uint32_t b, int32_t x, int32_t y) {
+        sendAndDrain(encodeMenuPointerFrame(e, b, x, y));
+    };
+    cb.menuDismissed = [this](const std::string& reason) {
+        sendAndDrain(encodeMenuDismissFrame(reason));
+    };
     panel_ = std::make_unique<X11CandidatePanel>(instance_->eventLoop(), std::move(cb));
 
-    push_ = std::make_unique<PushClient>(pushSocketPath(), [this](Frame f) {
-        // 推送线程 → 主线程。
-        dispatcher_.schedule([this, f = std::move(f)]() mutable { onPushFrame(std::move(f)); });
-    });
+    menuAction_.setShortText("清风输入法菜单");
+    menuAction_.setIcon("open-menu");
+    menuAction_.connect<fcitx::SimpleAction::Activated>(
+        [this](fcitx::InputContext* ic) { openMainMenuFromStatusArea(ic); });
+    instance_->userInterfaceManager().registerAction("windinput-menu", &menuAction_);
+
+    push_ = std::make_unique<PushClient>(
+        pushSocketPath(),
+        [this](Frame f) {
+            // 推送线程 → 主线程。
+            dispatcher_.schedule([this, f = std::move(f)]() mutable { onPushFrame(std::move(f)); });
+        },
+        [this](bool connected) {
+            // 服务没了（崩溃 / 被杀）：菜单是它画的，也没人再回应指针事件——就地收掉、放开
+            // 指针。不报 dismiss（没人收）；新服务的 menu_open 本来就是 false。
+            if (!connected) {
+                dispatcher_.schedule([this]() {
+                    if (panel_) {
+                        panel_->closeMenu(nullptr);
+                    }
+                });
+            }
+        });
     push_->start();
     // 引擎一加载就把服务带起来，让它趁用户还没开始打字时完成词库加载。
     ensureConnected();
@@ -305,6 +337,8 @@ void WindEngine::activate(const fcitx::InputMethodEntry&, fcitx::InputContextEve
         }
     }
     currentIC_ = ic->watch();
+    // 状态区入口：InputMethod 组在切换输入法时由 Fcitx5 自己清空，每次激活挂一次。
+    ic->statusArea().addAction(fcitx::StatusGroup::InputMethod, &menuAction_);
     // 光标前字符的记账只对「这一个文本框里我们自己打出去的东西」有效，换焦点即作废。
     router_.reset();
     tap_.reset();
@@ -326,6 +360,9 @@ void WindEngine::activate(const fcitx::InputMethodEntry&, fcitx::InputContextEve
 void WindEngine::deactivate(const fcitx::InputMethodEntry&, fcitx::InputContextEvent& event)
 {
     fcitx::InputContext* ic = event.inputContext();
+    // 失焦 / 切走输入法：菜单随之收起（服务端也会在 FocusLost 上关，但它有 250ms 的「刚打开」
+    // 守卫；本端这条无条件，且先于 FocusLost 报，服务端据此复位）。
+    panel_->closeMenu("focus_out");
     // 失焦即清干净：残留的预编辑要从宿主里抹掉（待定标点转为提交），否则切回来时旧编码还挂着。
     if (router_.hasComposition()) {
         ICSink sink(ic);
@@ -388,6 +425,9 @@ void WindEngine::keyEvent(const fcitx::InputMethodEntry&, fcitx::KeyEvent& event
     }
 
     tap_.onPress(sym, nowMs());
+    // 菜单开着时按键由服务端转给菜单（方向键 / 回车 / Esc / 其它键关菜单并吞掉）：
+    // 键盘操作同样算菜单上的活动，空闲计时重新起算。
+    panel_->noteMenuActivity();
     // 修饰键本身的按下不上报（Windows 吃掉切换键的 keydown、macOS 走 flagsChanged 不发）：
     // 单击判定在上面，组合键的修饰状态随下一个键的 states 一起到。
     if (key.isModifier()) {
@@ -460,13 +500,25 @@ void WindEngine::onPushFrame(Frame frame)
         for (auto& r : overlayShm_) {
             r.close();
         }
+        for (auto& r : menuShm_) {
+            r.close();
+        }
         panel_->hide();
         panel_->hideAllOverlays();
-        if (serviceSeenOnce_) {
-            WIND_INFO() << "服务已重启，重建连接";
-            bridge_.close();
-            if (fcitx::InputContext* ic = focusedIC(); ic && reconnect()) {
-                sendFocusGained(ic);
+        {
+            // 菜单是旧服务画的：收掉、放开指针。新服务的 menu_open 本就是 false，仍补报一次
+            // dismiss——两端对齐不靠「恰好一致」。
+            const bool hadMenu = panel_->menuOpen();
+            panel_->closeMenu(nullptr);
+            if (serviceSeenOnce_) {
+                WIND_INFO() << "服务已重启，重建连接";
+                bridge_.close();
+                if (fcitx::InputContext* ic = focusedIC(); ic && reconnect()) {
+                    sendFocusGained(ic);
+                }
+            }
+            if (hadMenu) {
+                sendAndDrain(encodeMenuDismissFrame("service_ready"));
             }
         }
         serviceSeenOnce_ = true;
@@ -558,6 +610,10 @@ void WindEngine::onExt(const ExtEnvelope& ext)
 
 void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
 {
+    if (int level = menuLevelOfKind(p.kind); level >= 0) {
+        onMenuFrame(uint32_t(level), p);
+        return;
+    }
     if (p.kind < 1 || p.kind > 3) {
         WIND_DEBUG() << "未知浮层 kind=" << p.kind << "，忽略";
         return;
@@ -578,6 +634,52 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
         return;
     }
     panel_->showOverlay(p.kind, f, p);
+}
+
+void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
+{
+    if (!p.visible() || p.width == 0 || p.height == 0) {
+        panel_->hideMenuLevel(level);
+        return;
+    }
+    ShmFrameReader& shm = menuShm_[level];
+    const std::string name = overlayShmName(p.kind);
+    if (!shm.isOpen() && !shm.open(name)) {
+        WIND_WARN() << "打不开菜单共享内存 " << name;
+        return;
+    }
+    SharedFrame f;
+    if (!shm.snapshot(f) || f.bgra.empty()) {
+        WIND_DEBUG() << "菜单第 " << level << " 级 seq=" << p.seq << " 读取失败或为空";
+        return;
+    }
+    panel_->showMenuLevel(level, f, p);
+}
+
+void WindEngine::requestMenu(int32_t target, int32_t x, int32_t y)
+{
+    // 工作区随请求报上去：菜单的翻转 / 子菜单左右展开在服务端做，屏幕几何只有这边拿得到。
+    Rect wa = panel_->screenWorkArea().value_or(Rect{});
+    WIND_DEBUG() << "请求打开菜单 target=" << target << " @(" << x << "," << y << ")";
+    sendAndDrain(encodeMenuOpenFrame(target, x, y, wa.x, wa.y, wa.x + wa.w, wa.y + wa.h));
+}
+
+void WindEngine::openMainMenuFromStatusArea(fcitx::InputContext* ic)
+{
+    // 光标下方；宿主没报过光标位置就放在指针处（刚点完托盘，指针就在那附近）。
+    std::optional<std::pair<int32_t, int32_t>> at;
+    if (ic) {
+        const fcitx::Rect& r = ic->cursorRect();
+        at = caretMenuAnchor(r.left(), r.top(), r.width(), r.height());
+    }
+    if (!at) {
+        at = panel_->pointerPosition();
+    }
+    if (!at) {
+        WIND_WARN() << "状态区菜单入口：没有 X 连接，菜单无处可画";
+        return;
+    }
+    requestMenu(-1, at->first, at->second);
 }
 
 } // namespace windlinux

@@ -28,8 +28,8 @@ std::string requestSocketPath();
 std::string pushSocketPath();
 /// POSIX SHM 名：`/WindInput_SHM{Dev}`（与 Rust `endpoint.rs::shm_name` 对齐）。
 std::string shmName();
-/// 光栅浮层某一层的 SHM 名：`shmName()` + `_TIP` / `_STS` / `_TST`（与 Rust
-/// `endpoint.rs::overlay_shm_name` 对齐）。未知层返回空串。
+/// 光栅浮层某一层的 SHM 名：`shmName()` + `_TIP` / `_STS` / `_TST`，菜单第 k 级 `_MN<k>`
+/// （与 Rust `endpoint.rs::overlay_shm_name` 对齐）。未知层返回空串。
 std::string overlayShmName(uint32_t kind);
 
 // ── 请求/响应 ────────────────────────────────────────────────────────

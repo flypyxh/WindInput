@@ -213,6 +213,30 @@ Bytes encodeExtFrame(const std::string& kind, const std::string& body)
     return frame(CMD_EXT, p);
 }
 
+Bytes encodeMenuPointerFrame(uint32_t event, uint32_t button, int32_t x, int32_t y)
+{
+    Bytes p;
+    putU32(p, event);
+    putU32(p, button);
+    putU32(p, uint32_t(x));
+    putU32(p, uint32_t(y));
+    return frame(CMD_MENU_POINTER, p);
+}
+
+Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, int32_t top,
+                          int32_t right, int32_t bottom)
+{
+    std::string body = "{\"target\":" + std::to_string(target) + ",\"x\":" + std::to_string(x)
+        + ",\"y\":" + std::to_string(y) + ",\"work\":[" + std::to_string(left) + ","
+        + std::to_string(top) + "," + std::to_string(right) + "," + std::to_string(bottom) + "]}";
+    return encodeExtFrame(EXT_KIND_MENU_OPEN, body);
+}
+
+Bytes encodeMenuDismissFrame(const std::string& reason)
+{
+    return encodeExtFrame(EXT_KIND_MENU_DISMISS, "{\"reason\":\"" + reason + "\"}");
+}
+
 Bytes encodeFrontContextFrame(const std::string& app, const std::string& title,
                               const std::string& sel)
 {

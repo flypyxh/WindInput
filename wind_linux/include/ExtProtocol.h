@@ -15,6 +15,10 @@ namespace windlinux {
 constexpr uint16_t CMD_CANDIDATE_CONTEXT_MENU = 0x020F;
 constexpr uint16_t CMD_MENU_ACTION = 0x0210;
 constexpr uint16_t CMD_FRONT_CONTEXT = 0x0215;
+/// 自绘菜单打开期间的指针事件（仅 Linux）：event u32 + button u32 + x i32 + y i32（根窗口坐标）。
+constexpr uint16_t CMD_MENU_POINTER = 0x021B;
+constexpr uint32_t MENU_POINTER_MOTION = 1;
+constexpr uint32_t MENU_POINTER_PRESS = 2;
 
 // ── 下行 push（服务 → addon）──
 constexpr uint16_t CMD_HOST_RENDER_FRAME = 0x0502;
@@ -40,10 +44,15 @@ constexpr uint16_t CMD_OVERLAY_FRAME = 0x0513;
 constexpr uint32_t OVERLAY_KIND_TOOLTIP = 1;
 constexpr uint32_t OVERLAY_KIND_STATUS = 2;
 constexpr uint32_t OVERLAY_KIND_TOAST = 3;
+/// 自绘菜单第 0 级；第 k 级子菜单 = OVERLAY_KIND_MENU + k（k < OVERLAY_MENU_LEVELS）。
+constexpr uint32_t OVERLAY_KIND_MENU = 4;
+constexpr uint32_t OVERLAY_MENU_LEVELS = 6;
 constexpr uint32_t OVERLAY_PLACE_ABSOLUTE = 0;
 constexpr uint32_t OVERLAY_PLACE_FLIP = 1;
 constexpr uint32_t OVERLAY_PLACE_FOLLOW_CANDIDATE = 2;
 constexpr uint32_t OVERLAY_PLACE_ANCHOR = 3;
+/// 坐标已由服务端按本端报去的工作区算定：原样摆放、不夹回（命中测试在服务端按这个位置做）。
+constexpr uint32_t OVERLAY_PLACE_EXACT = 4;
 constexpr uint32_t OVERLAY_ANCHOR_CENTER = 1;
 constexpr uint32_t OVERLAY_ANCHOR_TOP_LEFT = 2;
 constexpr uint32_t OVERLAY_ANCHOR_TOP_RIGHT = 3;
@@ -51,6 +60,12 @@ constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_LEFT = 4;
 constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_RIGHT = 5;
 constexpr uint32_t OVERLAY_ANCHOR_TOP_CENTER = 6;
 constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_CENTER = 7;
+
+// ── 扩展信封 kind（protocol.rs `ext_kind`）──
+/// 上行：请求打开自绘菜单。body 见 `encodeMenuOpenFrame`。
+inline constexpr const char* EXT_KIND_MENU_OPEN = "menu.open";
+/// 上行：本端把菜单收掉了（空闲超时 / 失焦 / 服务重启…），服务端据此复位 menu_open。
+inline constexpr const char* EXT_KIND_MENU_DISMISS = "menu.dismiss";
 
 /// InputScope 的 IS_PASSWORD 位（TSF 枚举 31）。服务端据此对密码框强制英文半角直通；
 /// 与 Swift `InputController.inputScopePasswordBit`、Rust 协调器的判定同值。

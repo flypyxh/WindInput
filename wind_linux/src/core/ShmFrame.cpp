@@ -106,6 +106,10 @@ Rect placeOverlay(const OverlayFramePayload& p, const Rect& wa, int32_t shiftX, 
     const int32_t bottom = wa.y + wa.h;
     int32_t x = p.x;
     int32_t y = p.y;
+    if (p.place == OVERLAY_PLACE_EXACT) {
+        // 菜单：落位已在服务端按本端报去的工作区做完，命中测试也按这个位置——一个像素都不能挪。
+        return Rect{x - p.contentX, y - p.contentY, int32_t(p.width), int32_t(p.height)};
+    }
     switch (p.place) {
     case OVERLAY_PLACE_FOLLOW_CANDIDATE:
     case OVERLAY_PLACE_FLIP: {

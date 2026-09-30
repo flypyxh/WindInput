@@ -91,6 +91,12 @@ int main()
     SYNC("OVERLAY_KIND_TOOLTIP", windlinux::OVERLAY_KIND_TOOLTIP);
     SYNC("OVERLAY_KIND_STATUS", windlinux::OVERLAY_KIND_STATUS);
     SYNC("OVERLAY_KIND_TOAST", windlinux::OVERLAY_KIND_TOAST);
+    SYNC("OVERLAY_KIND_MENU", windlinux::OVERLAY_KIND_MENU);
+    SYNC("OVERLAY_MENU_LEVELS", windlinux::OVERLAY_MENU_LEVELS);
+    SYNC("OVERLAY_PLACE_EXACT", windlinux::OVERLAY_PLACE_EXACT);
+    SYNC("CMD_MENU_POINTER", windlinux::CMD_MENU_POINTER);
+    SYNC("MENU_POINTER_MOTION", windlinux::MENU_POINTER_MOTION);
+    SYNC("MENU_POINTER_PRESS", windlinux::MENU_POINTER_PRESS);
     SYNC("OVERLAY_PLACE_ABSOLUTE", windlinux::OVERLAY_PLACE_ABSOLUTE);
     SYNC("OVERLAY_PLACE_FLIP", windlinux::OVERLAY_PLACE_FLIP);
     SYNC("OVERLAY_PLACE_FOLLOW_CANDIDATE", windlinux::OVERLAY_PLACE_FOLLOW_CANDIDATE);
@@ -137,6 +143,8 @@ int main()
 
     CASE("下行扩展信封的 kind 字符串与 protocol.rs `ext_kind` 一致");
     CHECK_EQ(rustStr("SETTINGS_OPEN"), std::string(windlinux::EXT_KIND_SETTINGS_OPEN));
+    CHECK_EQ(rustStr("MENU_OPEN"), std::string(windlinux::EXT_KIND_MENU_OPEN));
+    CHECK_EQ(rustStr("MENU_DISMISS"), std::string(windlinux::EXT_KIND_MENU_DISMISS));
 
     TEST_MAIN_END();
 }

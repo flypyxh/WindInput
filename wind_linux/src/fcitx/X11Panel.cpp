@@ -1,6 +1,7 @@
 #include "X11Panel.h"
 
 #include "ExtProtocol.h"
+#include "Menu.h"
 
 #include <fcitx-utils/log.h>
 
@@ -13,6 +14,7 @@
 FCITX_DECLARE_LOG_CATEGORY(windinput_log);
 #define WIND_DEBUG() FCITX_LOGC(windinput_log, Debug)
 #define WIND_WARN() FCITX_LOGC(windinput_log, Warn)
+#define WIND_INFO() FCITX_LOGC(windinput_log, Info)
 
 namespace windlinux {
 
@@ -58,13 +60,20 @@ int bitsPerPixel(xcb_connection_t* c, uint8_t depth)
 } // namespace
 
 X11CandidatePanel::X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb)
-    : loop_(loop), cb_(std::move(cb))
+    : loop_(loop), cb_(std::move(cb)),
+      menuIdleMs_(menuIdleTimeoutMs(std::getenv("WIND_MENU_IDLE_TIMEOUT_MS")))
 {
     cand_.instance = "wind-candidate";
     cand_.interactive = true;
     overlays_[OVERLAY_KIND_TOOLTIP - 1].instance = "wind-tooltip";
     overlays_[OVERLAY_KIND_STATUS - 1].instance = "wind-status";
     overlays_[OVERLAY_KIND_TOAST - 1].instance = "wind-toast";
+    static const char* const kMenuNames[kMenuLevels] = {"wind-menu-0", "wind-menu-1", "wind-menu-2",
+                                                        "wind-menu-3", "wind-menu-4", "wind-menu-5"};
+    for (size_t k = 0; k < kMenuLevels; ++k) {
+        menus_[k].instance = kMenuNames[k];
+        menus_[k].interactive = true; // 收鼠标（抓指针期间事件落在菜单窗口上）
+    }
 }
 
 X11CandidatePanel::~X11CandidatePanel()
@@ -111,10 +120,17 @@ bool X11CandidatePanel::ensureConnection()
 void X11CandidatePanel::dropConnection()
 {
     ioEvent_.reset();
+    grabRetry_.reset();
+    menuIdle_.reset();
+    pointerGrabbed_ = false; // 连接一断，服务器端的抓取随之失效
+    pendingMotion_.reset();
     if (conn_) {
         destroyWindow(cand_);
         for (Surface& o : overlays_) {
             destroyWindow(o);
+        }
+        for (Surface& m : menus_) {
+            destroyWindow(m);
         }
         xcb_disconnect(conn_);
         conn_ = nullptr;
@@ -296,13 +312,15 @@ Rect X11CandidatePanel::workArea() const
     return Rect{0, 0, screen_->width_in_pixels, screen_->height_in_pixels};
 }
 
-bool X11CandidatePanel::present(Surface& s, const SharedFrame& f, const Rect& r)
+bool X11CandidatePanel::present(Surface& s, const SharedFrame& f, const Rect& r, bool raise)
 {
     uint32_t geo[] = {uint32_t(r.x), uint32_t(r.y), f.width, f.height, XCB_STACK_MODE_ABOVE};
-    xcb_configure_window(conn_, s.window,
-                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH
-                             | XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_STACK_MODE,
-                         geo);
+    uint16_t mask = XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH
+        | XCB_CONFIG_WINDOW_HEIGHT;
+    if (raise) {
+        mask |= XCB_CONFIG_WINDOW_STACK_MODE;
+    }
+    xcb_configure_window(conn_, s.window, mask, geo);
     upload(s, f);
     if (!s.argb) {
         applyShape(s, f);
@@ -421,6 +439,7 @@ void X11CandidatePanel::onReadable()
         handleEvent(ev);
         std::free(ev);
     }
+    flushMenuMotion();
     if (xcb_connection_has_error(conn_)) {
         WIND_WARN() << "X 连接断开，下一帧重连";
         // 不能在 IO 回调里销毁自己所属的 EventSourceIO，只先停掉它（断开的 fd 恒可读，
@@ -431,6 +450,10 @@ void X11CandidatePanel::onReadable()
 
 void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
 {
+    if (menuOpen() && (ev->response_type & 0x7F) != 0) {
+        handleMenuEvent(ev);
+        return;
+    }
     switch (ev->response_type & 0x7F) {
     case XCB_BUTTON_PRESS: {
         auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
@@ -442,6 +465,12 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
             if (idx != kNoHit && cb_.select) {
                 cb_.select(idx);
             }
+        } else if (e->detail == 3 && cb_.contextMenu) {
+            // 右键：命中候选 → 候选菜单，空白 / 翻页按钮 → 主菜单（同 Windows right_click）。
+            // 悬停先清掉：菜单开着时候选窗收不到移动事件，残留的高亮会一直挂着。
+            setHover(-1);
+            cb_.contextMenu(contextMenuTarget(hitTest(rects_, e->event_x, e->event_y)),
+                            e->root_x, e->root_y);
         } else if ((e->detail == 4 || e->detail == 5) && cb_.scroll) {
             cb_.scroll(e->detail == 4 ? 120 : -120);
         }
@@ -479,6 +508,224 @@ void X11CandidatePanel::setHover(int32_t index)
     if (cb_.hover) {
         cb_.hover(index);
     }
+}
+
+} // namespace windlinux
+
+// ── 自绘菜单 ──────────────────────────────────────────────────────────
+
+namespace windlinux {
+
+bool X11CandidatePanel::menuOpen() const
+{
+    for (const Surface& m : menus_) {
+        if (m.mapped) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool X11CandidatePanel::showMenuLevel(uint32_t level, const SharedFrame& f,
+                                      const OverlayFramePayload& p)
+{
+    if (level >= kMenuLevels || f.width == 0 || f.height == 0 || f.bgra.empty()
+        || !ensureConnection()) {
+        return false;
+    }
+    Surface& s = menus_[level];
+    if (!ensureWindow(s, hasCompositor()) || bitsPerPixel(conn_, s.depth) != 32) {
+        return false;
+    }
+    OverlayFramePayload geo = p;
+    geo.width = f.width;
+    geo.height = f.height;
+    const bool first = !menuOpen();
+    // 新映射的一级提到最上（更深的子菜单总是后出现，自然压在父级上面）；已在显示的只换像素 /
+    // 位置，不重排 z 序。
+    present(s, f, placeOverlay(geo, workArea(), 0, 0), !s.mapped);
+    if (first) {
+        grabAttempts_ = 0;
+        grabPointer();
+    }
+    armMenuIdle();
+    return true;
+}
+
+void X11CandidatePanel::hideMenuLevel(uint32_t level)
+{
+    if (level >= kMenuLevels) {
+        return;
+    }
+    unmap(menus_[level]);
+    if (!menuOpen()) {
+        dropMenu();
+    }
+}
+
+void X11CandidatePanel::closeMenu(const char* reason)
+{
+    if (!menuOpen()) {
+        return;
+    }
+    WIND_DEBUG() << "本端收起菜单：" << (reason ? reason : "（不报服务端）");
+    dropMenu();
+    if (reason && cb_.menuDismissed) {
+        cb_.menuDismissed(reason);
+    }
+}
+
+void X11CandidatePanel::dropMenu(bool fromIdleTimer)
+{
+    for (Surface& m : menus_) {
+        unmap(m);
+    }
+    releasePointer();
+    grabRetry_.reset();
+    pendingMotion_.reset();
+    if (!fromIdleTimer) {
+        menuIdle_.reset();
+    }
+}
+
+void X11CandidatePanel::noteMenuActivity()
+{
+    if (menuOpen()) {
+        armMenuIdle();
+    }
+}
+
+void X11CandidatePanel::armMenuIdle()
+{
+    const uint64_t due = fcitx::now(CLOCK_MONOTONIC) + uint64_t(menuIdleMs_) * 1000;
+    if (menuIdle_) {
+        menuIdle_->setTime(due);
+        menuIdle_->setOneShot();
+        return;
+    }
+    menuIdle_ = loop_.addTimeEvent(CLOCK_MONOTONIC, due, 0,
+                                   [this](fcitx::EventSourceTime*, uint64_t) {
+                                       if (menuOpen()) {
+                                           WIND_INFO() << "菜单空闲 " << menuIdleMs_
+                                                       << "ms 无操作，本端收起";
+                                           dropMenu(true);
+                                           if (cb_.menuDismissed) {
+                                               cb_.menuDismissed("idle");
+                                           }
+                                       }
+                                       return true;
+                                   });
+}
+
+void X11CandidatePanel::grabPointer()
+{
+    if (pointerGrabbed_ || !conn_ || !menus_[0].window || !menus_[0].mapped) {
+        return;
+    }
+    // owner_events = 1：指针在我们自己的窗口（各级菜单、候选窗）上时事件照常报给那个窗口，
+    // 在别处时报给抓取窗口——于是「点菜单外」看得见，且那一下不会漏给下面的应用（同原生菜单）。
+    // 只抓指针不抓键盘：键盘必须照旧走宿主 → Fcitx5 → 服务端 forward_menu_key。
+    const uint16_t mask = XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE
+        | XCB_EVENT_MASK_POINTER_MOTION;
+    auto cookie = xcb_grab_pointer(conn_, 1, menus_[0].window, mask, XCB_GRAB_MODE_ASYNC,
+                                   XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, XCB_CURRENT_TIME);
+    xcb_grab_pointer_reply_t* r = xcb_grab_pointer_reply(conn_, cookie, nullptr);
+    const uint8_t status = r ? r->status : uint8_t(0xFF);
+    std::free(r);
+    if (status == XCB_GRAB_STATUS_SUCCESS) {
+        // 不在这里销毁 grabRetry_：本函数可能正是它的回调（一次性计时器，触发后自己就停了）。
+        pointerGrabbed_ = true;
+        return;
+    }
+    // 别的客户端还抓着（典型：刚点的是托盘菜单，它的抓取要等菜单收起才放）：每 50ms 再试，
+    // 最多 1 秒。抓不住菜单照样能用——Esc / 失焦 / 空闲超时照常收，只是点菜单外看不见。
+    if (++grabAttempts_ > 20) {
+        WIND_WARN() << "抓不住指针（status=" << int(status) << "），菜单外的点击将无法收起菜单";
+        return;
+    }
+    const uint64_t due = fcitx::now(CLOCK_MONOTONIC) + 50 * 1000;
+    if (grabRetry_) {
+        grabRetry_->setTime(due);
+        grabRetry_->setOneShot();
+        return;
+    }
+    grabRetry_ = loop_.addTimeEvent(CLOCK_MONOTONIC, due, 0,
+                                    [this](fcitx::EventSourceTime*, uint64_t) {
+                                        grabPointer();
+                                        return true;
+                                    });
+}
+
+void X11CandidatePanel::releasePointer()
+{
+    if (pointerGrabbed_ && conn_) {
+        xcb_ungrab_pointer(conn_, XCB_CURRENT_TIME);
+        xcb_flush(conn_);
+    }
+    pointerGrabbed_ = false;
+}
+
+void X11CandidatePanel::handleMenuEvent(xcb_generic_event_t* ev)
+{
+    switch (ev->response_type & 0x7F) {
+    case XCB_MOTION_NOTIFY: {
+        auto* e = reinterpret_cast<xcb_motion_notify_event_t*>(ev);
+        pendingMotion_ = std::make_pair(int32_t(e->root_x), int32_t(e->root_y));
+        break;
+    }
+    case XCB_BUTTON_PRESS: {
+        auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
+        if (e->detail < 1 || e->detail > 3) {
+            break; // 滚轮（4/5）与侧键：Windows 菜单不处理，这里也不报
+        }
+        flushMenuMotion();
+        armMenuIdle();
+        if (cb_.menuPointer) {
+            cb_.menuPointer(MENU_POINTER_PRESS, e->detail, e->root_x, e->root_y);
+        }
+        break;
+    }
+    default:
+        break; // 松开 / 离开：菜单只看按下与移动（同 Windows 的 wnd_proc）
+    }
+}
+
+void X11CandidatePanel::flushMenuMotion()
+{
+    if (!pendingMotion_) {
+        return;
+    }
+    auto [x, y] = *pendingMotion_;
+    pendingMotion_.reset();
+    if (!menuOpen()) {
+        return;
+    }
+    armMenuIdle();
+    if (cb_.menuPointer) {
+        cb_.menuPointer(MENU_POINTER_MOTION, 0, x, y);
+    }
+}
+
+std::optional<Rect> X11CandidatePanel::screenWorkArea()
+{
+    if (!ensureConnection()) {
+        return std::nullopt;
+    }
+    return workArea();
+}
+
+std::optional<std::pair<int32_t, int32_t>> X11CandidatePanel::pointerPosition()
+{
+    if (!ensureConnection()) {
+        return std::nullopt;
+    }
+    auto* r = xcb_query_pointer_reply(conn_, xcb_query_pointer(conn_, screen_->root), nullptr);
+    if (!r) {
+        return std::nullopt;
+    }
+    std::pair<int32_t, int32_t> p{r->root_x, r->root_y};
+    std::free(r);
+    return p;
 }
 
 } // namespace windlinux

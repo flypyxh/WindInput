@@ -80,6 +80,7 @@ Rect placePanel(int32_t x, int32_t y, int32_t w, int32_t h, const Rect& workArea
 ///   - FOLLOW_CANDIDATE：先把四个坐标平移 (shiftX, shiftY)（候选窗实际落点 − 建议落点），再同 FLIP；
 ///   - ANCHOR：工作区内按锚点摆，离边 margin；居中两档不用留白。
 /// 最后内容盒一律夹进工作区（阴影扩边允许出屏，同 Windows）。
+///   - EXACT（菜单）：原样，**不夹回**——服务端已按工作区算定，命中测试按这个位置做。
 Rect placeOverlay(const OverlayFramePayload& p, const Rect& workArea, int32_t shiftX,
                   int32_t shiftY);
 

@@ -13,6 +13,7 @@
 #include "KeyMap.h"
 #include "ResponseRouter.h"
 #include "ServiceLauncher.h"
+#include "ExtProtocol.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
@@ -20,6 +21,7 @@
 #include <fcitx-utils/trackableobject.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
+#include <fcitx/action.h>
 #include <fcitx/addonmanager.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputmethodengine.h>
@@ -71,7 +73,14 @@ private:
     void onRenderFrame(const HostRenderFramePayload& p);
     void onOverlayFrame(const OverlayFramePayload& p);
     void onExt(const ExtEnvelope& ext);
+    void onMenuFrame(uint32_t level, const OverlayFramePayload& p);
     fcitx::InputContext* focusedIC();
+
+    // ── 自绘菜单 ──
+    /// 请服务端打开菜单（`menu.open`）：target ≥ 0 候选右键菜单，-1 主菜单；(x, y) 锚点。
+    void requestMenu(int32_t target, int32_t x, int32_t y);
+    /// Fcitx5 状态区入口（托盘 / kimpanel 里的「清风输入法菜单」）：主菜单弹在光标下方。
+    void openMainMenuFromStatusArea(fcitx::InputContext* ic);
 
     fcitx::Instance* instance_;
     BridgeClient bridge_;
@@ -91,7 +100,12 @@ private:
     ShmFrameReader shm_;
     /// 光栅浮层各层的 SHM 读端（下标 = kind - 1）。与 `shm_` 同样在 SERVICE_READY 时关掉重开。
     ShmFrameReader overlayShm_[3];
+    /// 自绘菜单各级的 SHM 读端（下标 = 级）。
+    ShmFrameReader menuShm_[OVERLAY_MENU_LEVELS];
     std::unique_ptr<X11CandidatePanel> panel_;
+    /// 空闲时打开主菜单的入口：挂进 Fcitx5 状态区（托盘菜单 / kimpanel 面板）。Linux 没有
+    /// 工具栏和托盘图标（后期才做），组字时有候选窗右键，不组字时靠这里。
+    fcitx::SimpleAction menuAction_;
 };
 
 class WindEngineFactory : public fcitx::AddonFactory {
