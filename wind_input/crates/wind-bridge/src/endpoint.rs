@@ -26,7 +26,7 @@ fn variant_suffix(pipe_suffix: &str) -> &str {
     }
 }
 
-/// runtime 目录：env 覆盖 → ~/Library/Application Support/WindInput{变体后缀} → /tmp/wind_input{管道后缀}
+/// runtime 目录：env 覆盖 → macOS: ~/Library/Application Support/WindInput{变体后缀} / Linux: $XDG_RUNTIME_DIR/WindInput{变体后缀} → /tmp/wind_input{管道后缀}
 ///
 /// 两段刻意用不同风格的后缀：Application Support 段是**面向用户的应用目录名**
 /// （与 .app、dev.sh、用户配置目录同名），/tmp 段是无 HOME 时的兜底，
@@ -37,6 +37,16 @@ pub fn runtime_dir(suffix: &str) -> PathBuf {
     {
         return PathBuf::from(env);
     }
+    // Linux（外部宿主形态）：socket 属运行时状态，放 `$XDG_RUNTIME_DIR`（tmpfs、仅本用户可访问、
+    // 登出即清）；不放 HOME 下——那里没有 `Library/Application Support`，且 socket 不该落盘。
+    // 目录名沿用变体风格（`WindInput` / `WindInputDev`），与 macOS 和 addon 侧一致。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !rt.is_empty()
+    {
+        return PathBuf::from(rt).join(format!("WindInput{}", variant_suffix(suffix)));
+    }
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     if let Some(home) = std::env::var_os("HOME")
         && !home.is_empty()
     {
@@ -118,6 +128,33 @@ mod tests {
         );
     }
 
+    /// Linux 外部宿主形态：socket 在 `$XDG_RUNTIME_DIR/WindInput[Dev]`，且绝不落到 HOME 下。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[test]
+    fn linux_runtime_dir_uses_xdg_runtime_dir() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::capture(&["WIND_INPUT_RUNTIME_DIR", "XDG_RUNTIME_DIR", "HOME"]);
+        unsafe { std::env::remove_var("WIND_INPUT_RUNTIME_DIR") };
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        assert_eq!(
+            runtime_dir(""),
+            std::path::PathBuf::from("/run/user/1000/WindInput")
+        );
+        assert_eq!(
+            request_socket_path("_dev"),
+            std::path::PathBuf::from("/run/user/1000/WindInputDev/bridge.sock")
+        );
+        // 没有 XDG_RUNTIME_DIR 时退到 /tmp，而不是 HOME 下的 macOS 式路径。
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        assert_eq!(
+            runtime_dir("_dev"),
+            std::path::PathBuf::from("/tmp/wind_input_dev")
+        );
+    }
+
+    // 以下三条断言 macOS 式的 HOME 路径，Linux 外部宿主形态不适用。
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn runtime_dir_tmp_fallback_with_suffix() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -150,6 +187,7 @@ mod tests {
     ///
     /// 这条曾经是真实故障：服务 bind 在 `WindInput_dev/bridge.sock`，
     /// .app 连 `WindInputDev/bridge.sock`，dev 变体的 IPC 从来没通过。
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn dev_runtime_dir_uses_app_dir_style_suffix() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -176,6 +214,7 @@ mod tests {
     }
 
     /// 正式变体（空后缀）不受映射影响 —— 已装机用户的 socket 路径不能因这次对齐而变。
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn release_runtime_dir_unchanged() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

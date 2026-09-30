@@ -13,6 +13,8 @@ winresource = "0.1"
 
 [features]
 default = []
+# Linux 发行形态：协调器/UI/桥接全部按外部宿主（Fcitx5 addon）呈现。
+linux-host = ["wind-coordinator/linux-host", "wind-ui/linux-host", "wind-bridge/linux-host"]
 
 [dependencies]
 wind-ipc = { path = "../../crates/wind-ipc" }

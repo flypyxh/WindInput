@@ -27,7 +27,7 @@ pub(crate) const MENU_FOCUS_GUARD: std::time::Duration = std::time::Duration::fr
 ///
 /// 常量而非各处字面量：三处菜单（IMK 输入源 / 候选框右键 / 状态指示器下拉）必须字字一致，
 /// 这正是本次统一要解决的问题，散成字面量迟早再次跑偏。
-pub(crate) const TOOLBAR_MENU_LABEL: &str = if cfg!(target_os = "macos") {
+pub(crate) const TOOLBAR_MENU_LABEL: &str = if cfg!(ext_presenter) {
     "显示状态图标"
 } else {
     "显示工具栏"
@@ -68,7 +68,7 @@ pub(crate) fn build_settings_args(pairs: &[(&str, &str)]) -> String {
 /// 仅 macOS 走 IPC argv 通路，非 macOS 下无调用点；但引号往返的单元测试要在所有平台上跑
 /// （切词规则与 `build_settings_args` 是一对，任一平台改坏都该被拦住），故不加 `cfg` 编译
 /// 掉本函数，只在非 macOS 下豁免 dead_code。
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(ext_presenter), allow(dead_code))]
 pub(crate) fn settings_argv(page: Option<&str>, extra: &str) -> Vec<String> {
     let mut argv = Vec::new();
     if let Some(p) = page {
@@ -101,7 +101,7 @@ pub(crate) fn settings_argv(page: Option<&str>, extra: &str) -> Vec<String> {
 /// `--page <p>` 与附加参数各自独立成段：附加参数**不依附于页**（`--dark` / `--soft`
 /// 这类没有页也有意义），故 `page=None` 时仍原样带上，不能因为没页就丢掉。
 /// macOS 走 IPC 裸串、无命令行概念，故仅非 macOS 使用。
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(ext_presenter))]
 pub(crate) fn settings_cmdline(page: Option<&str>, extra: &str) -> String {
     let mut out = String::new();
     if let Some(p) = page {
@@ -1369,7 +1369,7 @@ impl Coordinator {
     /// 宿主只负责拼接与投递，取值合法性由设置端自己判断（它会降级并提示，不会崩）。
     /// 内部调用方请用 [`build_settings_args`] 构造，含空白的值会被正确加引号。
     pub(crate) fn open_settings_with(&self, page: Option<&str>, extra: &str) {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         let args = settings_cmdline(page, extra);
 
         // macOS：经 CmdOpenSettings(0x0507) 让 .app 用 LaunchServices 按 bundleID 启动/激活
@@ -1377,7 +1377,7 @@ impl Coordinator {
         // macOS 恒为 None，旧路径会误落到已废弃的 web 分支并 WARN 失败，故此处直接短路。
         // payload 沿用「页名后接参数」的裸串形态（既有 add-word 路径就是这样传的），
         // Swift 侧解析方式不变。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             // 走扩展信封传结构化 argv：Swift 侧直接拿数组用，不必知道引号约定
             // （旧路径传的是「页名 + 参数」空格串，切词在 Swift 侧重做了一遍）。
@@ -1389,7 +1389,7 @@ impl Coordinator {
             );
             self.push_server.push_to_active(&encoded);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         if let Some(app) = crate::coordinator::settings_app_path() {
             if self.push_server.has_clients() {
                 // 设置程序落到它自己所在目录（app 目录），不继承宿主应用的当前目录。
@@ -1463,7 +1463,7 @@ impl Coordinator {
     /// 菜单栏状态指示器，而那个指示器的下拉菜单是完整树的两个入口之一；只留在完整树里
     /// 的话，用户一旦关掉图标就把开关本身也藏了（只剩候选框右键这个得先打字才碰得到的
     /// 入口）。IMK 输入源菜单不依赖任何 UI 可见性，是恒定可达的那个。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     pub(crate) fn build_menu_items_macos(&self) -> Vec<wind_ui_types::MenuItemSpec> {
         use wind_ui_types::MenuItemSpec as M;
         let (chinese, punct, full, s2t, toolbar_vis) = {
@@ -1608,7 +1608,7 @@ impl Coordinator {
             // 输入诊断 HUD 在 macOS 上整套未实现（`ShowInputDiag` 落在 forwarder 的兜底臂），
             // 点了没有任何反应。留一个死菜单项比没有更糟，故按平台摘掉。
             // 要在 macOS 做它得把整个浮层 UI 建在 `.app` 侧，见 wind_macos/AGENTS.md 差距表。
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(ext_presenter))]
             M::leaf(
                 "输入诊断 HUD",
                 cmd(MenuCmd::ToggleInputDiagnostics),
@@ -2010,7 +2010,7 @@ impl Coordinator {
     }
 
     /// 把 `MenuItemSpec` 树映射为线格式 `MenuNode` 树（id 由 `MenuKind::to_menu_id` 派生）。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     pub(crate) fn menu_items_to_nodes(
         items: &[wind_ui_types::MenuItemSpec],
     ) -> Vec<wind_ipc::codec::MenuNode> {
@@ -2029,7 +2029,7 @@ impl Coordinator {
     }
 
     // macOS 用 IMK 原生菜单, 不走协调器弹出菜单键转发 (见 coordinator handle_key_event 门控)。
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(ext_presenter, allow(dead_code))]
     pub(crate) fn is_menu_open(&self) -> bool {
         self.state
             .lock()
@@ -2123,7 +2123,7 @@ impl Coordinator {
     }
 
     /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(ext_presenter, allow(dead_code))]
     pub(crate) fn forward_menu_key(&self, key_code: u32) -> bool {
         if !self.is_menu_open() {
             return false;
@@ -3191,7 +3191,7 @@ mod tests {
         }
         assert_eq!(
             contains(&c.build_main_menu_items(), "输入诊断 HUD"),
-            !cfg!(target_os = "macos"),
+            !cfg!(ext_presenter),
             "HUD 菜单项的平台门控与当前平台不符"
         );
         // 同一子菜单里的邻项必须还在——防止 cfg 把整块 vec 或相邻项一起吞掉。
@@ -3331,7 +3331,7 @@ mod tests {
     /// 回归背景：IMK 输入源菜单走精简树 `build_menu_items_macos()`、候选框右键与状态指示器
     /// 走完整树 `build_main_menu_items()`，两棵树各自维护 → 精简树当初把这项砍了，同一个
     /// 输入法在两处菜单里表现不一。这条测试同时钉住「都在」和「同名」。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     #[test]
     fn toolbar_toggle_present_in_both_macos_menu_trees() {
         use super::TOOLBAR_MENU_LABEL;
@@ -3357,7 +3357,7 @@ mod tests {
     }
 
     /// 勾选态必须跟随 `toolbar_visible`，否则菜单上是个永远不打勾的死开关。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     #[test]
     fn toolbar_toggle_reflects_visibility_in_imk_menu() {
         use super::TOOLBAR_MENU_LABEL;
@@ -3439,7 +3439,7 @@ mod tests {
     }
 
     /// 附加参数不依附于页：没给页也要原样带上（`--dark`/`--soft` 无页也有意义）。
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(ext_presenter))]
     #[test]
     fn settings_cmdline_keeps_extra_without_page() {
         use super::settings_cmdline;

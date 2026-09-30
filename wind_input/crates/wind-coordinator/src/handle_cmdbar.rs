@@ -49,11 +49,11 @@ impl Coordinator {
         svc.clip = Some(Arc::new(SysClip(weak.clone())));
         // 按键合成：macOS 服务进程（LaunchAgent）无辅助功能授权无法 post CGEvent，改推 IPC 帧
         // 给 .app 侧 KeySynthesizer 合成（见 handle_cmdbar_macos）；其它平台进程内 SendInput/CGEvent。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             svc.keys = Some(crate::handle_cmdbar_macos::make_keys(weak.clone()));
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         {
             svc.keys = Some(Arc::new(wind_keys::key_inject::SysKeys));
         }
@@ -371,7 +371,7 @@ impl ProcessRunner for CoordProc {
     fn run(&self, spec: &ProcSpawn<'_>) -> anyhow::Result<()> {
         let dir = resolve_workdir("proc.run", spec.cmd, spec.cwd);
         // macOS：进程内直接 spawn（无需 IPC 转 TSF）；其它平台经 push_shell_exec 借前台权限。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             let _ = &self.0;
             // verb/show 是 ShellExecuteW 的概念，本平台没有对应物。**必须留 WARN**：
@@ -385,7 +385,7 @@ impl ProcessRunner for CoordProc {
             }
             crate::handle_cmdbar_macos::run_native(spec.cmd, spec.args, &dir)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         {
             match self.0.upgrade() {
                 Some(c) => c.push_shell_exec(
@@ -672,7 +672,7 @@ impl ConfigService for CoordConfig {
 
 /// 将 argv 列表拼成 ShellExecuteW lpParameters 字符串，含空格/引号的参数加双引号。
 /// 仅非 macOS（经 push_shell_exec 转 TSF 侧 ShellExecuteW）路径使用。
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(ext_presenter))]
 fn shell_quote_args(args: &[String]) -> String {
     args.iter()
         .map(|a| {
@@ -799,12 +799,12 @@ struct CoordOpener(Weak<Coordinator>);
 impl UrlOpener for CoordOpener {
     fn open(&self, target: &str) -> anyhow::Result<()> {
         // macOS：进程内经 `open` CLI 拉起（无需 IPC 转 TSF）；其它平台经 push_shell_exec。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             let _ = &self.0;
             crate::handle_cmdbar_macos::open_native(target)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         {
             // open 的 target 可能是 URL、文档或程序：同一套默认策略——是本地文件
             // 就落到它所在目录，否则主目录，总之不继承宿主应用的当前目录。
@@ -845,13 +845,13 @@ impl ClipboardService for SysClip {
     }
     fn paste(&self) -> anyhow::Result<()> {
         // macOS：不合成 ⌘V，经 IMKit insertText 上屏剪贴板文本（见 handle_cmdbar_macos::paste_via_ime）。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             crate::handle_cmdbar_macos::paste_via_ime(&self.0);
             Ok(())
         }
         // Windows/Linux：沿用进程内合成 Ctrl+V（有 HID 层修饰键状态，直接生效；且保留富文本粘贴）。
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         {
             let _ = &self.0;
             use wind_cmdbar::KeyInjector;

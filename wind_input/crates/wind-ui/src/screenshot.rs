@@ -259,8 +259,20 @@ pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<
     }
 }
 
+/// Linux 外部宿主形态：BGRA → PNG 字节 → wl-copy / xclip（见 `linux_host`）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<(), String> {
+    // 复用 save_bgra_to_png 的裁边/反预乘处理，保证与存盘的那张一模一样。
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("windinput_clip_{}.png", std::process::id()));
+    save_bgra_to_png(buffer, width, height, &tmp)?;
+    let png = std::fs::read(&tmp).map_err(|e| format!("读临时 PNG 失败: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    crate::linux_host::set_png(&png?).map_err(|e| e.to_string())
+}
+
 /// 其它非 Windows 平台（Linux mock）：明确报不支持，不谎报成功。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(not(any(windows, ext_presenter)))]
 pub fn copy_bgra_to_clipboard(_buffer: &[u8], _width: u32, _height: u32) -> Result<(), String> {
     Err("图片剪贴板：当前平台暂未支持".into())
 }

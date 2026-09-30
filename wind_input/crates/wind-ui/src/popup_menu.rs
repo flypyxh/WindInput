@@ -1255,12 +1255,25 @@ pub fn try_set_clipboard_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 写剪贴板（Linux 外部宿主形态：wl-clipboard / xclip，见 `linux_host`）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub fn set_clipboard_text(text: &str) {
+    if let Err(e) = try_set_clipboard_text(text) {
+        tracing::warn!("写剪贴板失败: {}", e);
+    }
+}
+
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub fn try_set_clipboard_text(text: &str) -> anyhow::Result<()> {
+    crate::linux_host::set_text(text)
+}
+
 /// 写剪贴板（其它非 Windows mock：暂不接入平台剪贴板，空操作）。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(not(any(windows, ext_presenter)))]
 pub fn set_clipboard_text(_text: &str) {}
 
 /// 写剪贴板（其它非 Windows mock）：明确报不支持。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(not(any(windows, ext_presenter)))]
 pub fn try_set_clipboard_text(_text: &str) -> anyhow::Result<()> {
     anyhow::bail!("写剪贴板：当前平台暂未支持")
 }
@@ -1557,14 +1570,27 @@ pub fn get_clipboard_text_cached() -> String {
     }
 }
 
+/// 读剪贴板文本（Linux 外部宿主形态）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub fn get_clipboard_text() -> String {
+    crate::linux_host::get_text()
+}
+
+/// Linux 外部宿主形态：没有剪贴板变更序列号可用于失效判定，且每次读都要起子进程，
+/// 故缓存版目前直接读一次。调用方（联想 / 剪贴板反查）本就是按需触发，不在热路径上。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub fn get_clipboard_text_cached() -> String {
+    crate::linux_host::get_text()
+}
+
 /// 读剪贴板文本（其它非 Windows mock：返回空串）。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(not(any(windows, ext_presenter)))]
 pub fn get_clipboard_text() -> String {
     String::new()
 }
 
 /// 其它非 Windows mock：无剪贴板可读。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(not(any(windows, ext_presenter)))]
 pub fn get_clipboard_text_cached() -> String {
     String::new()
 }

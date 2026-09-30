@@ -335,7 +335,7 @@ impl MessageHandler for Coordinator {
     /// macOS `.app` 查询功能主菜单：构建菜单树并编码为 `CmdMenuShow` 帧字节。
     /// Windows 走进程内 `show_main_menu` 渲染，不用此路径（返回空帧亦无害）。
     fn query_menu_encoded(&self, simplified: bool) -> Vec<u8> {
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             // IMK 输入源菜单用精简树(无子菜单)；候选框右键/菜单栏指示器用完整树(带子菜单，
             // 经 inProcess 直接投递，AppKit 能正确处理嵌套子菜单)。
@@ -347,7 +347,7 @@ impl MessageHandler for Coordinator {
             let nodes = Self::menu_items_to_nodes(&items);
             wind_ipc::codec::encode_menu_show(&nodes)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         {
             let _ = simplified;
             Vec::new()
@@ -521,9 +521,9 @@ impl MessageHandler for Coordinator {
         // macOS 上 IMK 频繁调 menu() → Swift 发 CMD_SHOW_CONTEXT_MENU 仅为「查询菜单项」，
         // 若在此调 show_main_menu 会把协调器置 menu_open=true 并经 forward_menu_key 吞掉后续
         // 所有按键，而 macOS 无弹窗、永不回 MenuClose → 输入被永久卡死 (打字无响应)。
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         self.show_main_menu(wind_ui_types::MenuAnchor::at_point(x, y));
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         let _ = (x, y);
     }
 
@@ -984,7 +984,7 @@ impl MessageHandler for Coordinator {
         // ── 右键菜单打开时：方向键/回车/ESC 由菜单消费（优先于一切）──
         // 仅非 macOS：弹出菜单窗口是 Windows 专有，macOS 用 IMK 原生菜单自行消费键，
         // 协调器不应吞键 (否则 menu_open 一旦被置真会永久卡死输入，见 handle_show_context_menu)。
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         if self.is_menu_open() && self.forward_menu_key(data.key_code) {
             return KeyAction::Consumed;
         }

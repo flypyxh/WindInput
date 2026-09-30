@@ -2,13 +2,15 @@
 //!
 //! Windows 侧 `ui_thread` 直接驱动 LayeredWindow 呈现；macOS 侧无进程内窗口，
 //! 候选/工具栏/提示统一光栅化进 POSIX SHM，再经 push 管道通知 .app 端取帧呈现。
-//! 用 `#[cfg(unix)]` 让本模块在 Linux/macOS 都编译，便于在开发机直接跑测试。
+//! 本模块在 `ext_presenter` 下编译：macOS，以及 Linux 的 `linux-host` 形态（宿主是 Fcitx5 addon）。
+//! 软键盘、全局热键这两块是 macOS 专属（AppKit / Carbon），Linux 不做，命令落 `other` 臂。
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::candidate_window::{CandidateWindow, CandidateWindowConfig};
 use crate::manager::{UiCommand, UiEvent};
+#[cfg(target_os = "macos")]
 use crate::softkeyboard_host_macos as sk;
 use crate::toast::{ToastKind, ToastPosition};
 use wind_bridge::HostRenderSink;
@@ -142,6 +144,7 @@ pub struct Forwarder {
     /// PUA 字根渲染成方框——对齐 Windows 64a2b50 修的同一问题。
     chaizi_font: String,
     /// 回协调器的事件通道（全局热键触发等）。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ev_tx: Sender<UiEvent>,
     /// 候选窗当前是否有帧在显示。外观类命令（主题/字号/布局…）只在**显示中**才重推帧。
     visible: bool,
@@ -380,6 +383,7 @@ impl Forwarder {
                     toast_fg,
                 };
                 // 面板是惰性建窗的，主题得在本模块之外留一份底，理由见 `SkCmd::Theme`。
+                #[cfg(target_os = "macos")]
                 self.push_softkeyboard(sk::SkCmd::Theme(t.clone()));
                 self.theme = Some(t.clone());
                 self.win.set_theme(*t);
@@ -431,6 +435,8 @@ impl Forwarder {
                 self.chaizi_font = path.clone();
                 self.win.set_chaizi_font(&path, &family)
             }
+            // 全局热键：macOS 走 Carbon；Linux 无对应通路（Wayland 无标准全局热键），落 `other` 臂。
+            #[cfg(target_os = "macos")]
             UiCommand::RegisterGlobalHotkeys(entries) => {
                 // 只入队 + 唤醒主线程；真正的 Carbon 注册在主线程做（见该模块头「线程约定」）。
                 crate::global_hotkey_macos::apply(entries, self.ev_tx.clone());
@@ -561,6 +567,8 @@ impl Forwarder {
             // 与其余浮窗相反，它**不走 SHM + `.app` 那条路**：面板由服务进程自己开窗
             // （macOS 上唯一一处），理由见 `crate::mac_panel` 模块头。这里只负责把命令
             // 从本工作线程转运到主线程——AppKit 碰不得工作线程。
+            // 软键盘仅 macOS（服务进程自开 NSPanel）；Linux 不做，落 `other` 臂。
+            #[cfg(target_os = "macos")]
             UiCommand::ShowSoftKeyboard {
                 pages,
                 current,
@@ -583,10 +591,13 @@ impl Forwarder {
                 keys,
                 send_keys,
             }),
+            #[cfg(target_os = "macos")]
             UiCommand::HideSoftKeyboard => self.push_softkeyboard(sk::SkCmd::Hide),
+            #[cfg(target_os = "macos")]
             UiCommand::SoftKeyboardKeyState { slot, down } => {
                 self.push_softkeyboard(sk::SkCmd::KeyState { slot, down })
             }
+            #[cfg(target_os = "macos")]
             UiCommand::SoftKeyboardLayer { shift } => {
                 self.push_softkeyboard(sk::SkCmd::Layer { shift })
             }
@@ -604,6 +615,7 @@ impl Forwarder {
     }
 
     /// 把一条软键盘命令转运给主线程宿主。
+    #[cfg(target_os = "macos")]
     fn push_softkeyboard(&self, cmd: sk::SkCmd) {
         sk::apply(cmd, &self.ev_tx);
     }

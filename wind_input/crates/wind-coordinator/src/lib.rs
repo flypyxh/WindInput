@@ -29,7 +29,7 @@ pub mod handle_aux_code;
 pub mod handle_candidate;
 pub mod handle_charset;
 pub mod handle_cmdbar;
-#[cfg(target_os = "macos")]
+#[cfg(ext_presenter)]
 pub mod handle_cmdbar_macos;
 pub mod handle_common_chars;
 pub mod handle_config;

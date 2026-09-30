@@ -670,7 +670,7 @@ impl Tooltip {
     }
 
     /// 渲染 golden 用：按显示路径画一帧，返回 `(缓冲, 宽, 高, 绘制调用记录)`。
-    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    #[cfg(all(test, mock_text))]
     pub(crate) fn golden_frame(
         &mut self,
         doc: &Arc<TooltipDoc>,
@@ -1750,7 +1750,7 @@ mod tests {
     }
 
     /// 片段按主题求色后接到气泡叶子：内联色那段走 draw_runs，气泡里名字先查 `tooltip_<名>`。
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(mock_text)]
     #[test]
     fn inline_color_reaches_the_tooltip_leaf() {
         use wind_ui_types::{SpanStyle, StyledText};
@@ -1785,7 +1785,7 @@ mod tests {
     }
 
     /// 非出厂测试主题的气泡角色色：段名装饰与字面走 title、段名里的变量回落 title、readings 自有色。
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[cfg(mock_text)]
     #[test]
     fn theme_roles_color_the_tooltip() {
         use wind_ui_types::{SpanStyle, StyledText};

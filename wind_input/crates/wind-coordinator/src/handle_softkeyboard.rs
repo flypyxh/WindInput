@@ -625,7 +625,7 @@ impl Coordinator {
         //
         // 这不是理论顾虑：0.121 那版就是照搬 Windows 分支直接调 `SysKeys`，
         // 表现为「软键盘上 Tab / 退格 / 回车 / Del 一个都不管用」。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         {
             let (key, mods) = crate::handle_cmdbar_macos::split_combo(combo);
             if key.is_empty() {
@@ -635,7 +635,7 @@ impl Coordinator {
             debug!("软键盘: 合成按键 {combo:?} -> .app (key={key:?} mods={mods:?})");
             self.push_cmdbar_key_frame(&wind_ipc::codec::encode_key_tap(&key, &mods));
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, ext_presenter)))]
         {
             let _ = combo;
         }

@@ -3,6 +3,11 @@ name = "wind-ui"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Linux 上作为外部宿主（Fcitx5 addon）的服务端：启用 host-render forwarder 与真实文本后端。默认关，
+# 关闭时 Linux 仍是 mock 文本（开发机 `cargo test` 行为不变），见 build.rs 的 `ext_presenter` / `mock_text`。
+linux-host = []
+
 [dependencies]
 # 表现层协议类型（UiCommand/UiEvent 等）的定义处；本 crate 原路径 pub use 再导出。
 wind-ui-types = { path = "../wind-ui-types" }
@@ -33,6 +38,9 @@ resvg = "0.44"
 base64 = "0.22"
 # 截图文件名的本地时间戳（非 Windows 分支；Windows 用 GetLocalTime）
 chrono = "0.4"
+# 外部宿主 forwarder（macOS / Linux）的扩展信封的 JSON body（`shot.panel` 等）。手拼字符串在这里不安全：路径里可能有
+# 引号或反斜杠，转义漏一处就是对端解不出的坏包。
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # 局部追加 StationsAndDesktops：诊断浮层归属的桌面/窗口站（见 window.rs 的
@@ -49,9 +57,6 @@ core-foundation-sys = "0.8"
 core-graphics = "0.25"
 core-text = "22.0.0"
 # 全局热键（global_hotkey_macos）复用 key_inject 的 VK → CGKeyCode 表（wind-keys 已是通用依赖）。
-# 扩展信封的 JSON body（`shot.panel` 等）。手拼字符串在这里不安全：路径里可能有
-# 引号或反斜杠，转义漏一处就是对端解不出的坏包。
-serde_json = { workspace = true }
 # AppKit 绑定：软键盘面板（mac_panel.rs）是本仓 macOS 上**唯一**由服务进程自己开的窗口，
 # 其余浮窗都在 `.app` 侧，理由见该模块头。
 #

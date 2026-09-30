@@ -225,7 +225,7 @@ use crate::window::{LayeredWindow, WindowMouse};
 use std::time::{Duration, Instant};
 
 /// macOS host-render：`render_frame()` 产出的离屏帧（forwarder 写 SHM + push 用）。
-#[cfg(target_os = "macos")]
+#[cfg(ext_presenter)]
 pub struct RenderedFrame {
     /// 图像屏幕左上角 X（已含软影 margin 回移）
     pub screen_x: i32,
@@ -1570,7 +1570,7 @@ impl CandidateWindow {
     /// 不依赖 Win32 Layered Window（forwarder 取此 buffer 写 POSIX SHM + push 给 .app）。
     /// 镜像 `show()` 的 build/layout/place/flip/paint 流程，但 paint 到自有 Vec。
     /// 返回 None 表示应隐藏候选窗（无候选 / 无 preedit / 无模式标记）。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     pub fn render_frame(&mut self) -> Option<RenderedFrame> {
         if self.candidates.is_empty() && self.preedit.is_empty() && self.mode_label.is_empty() {
             return None;
@@ -2061,7 +2061,7 @@ impl CandidateWindow {
     /// 在 Windows 本地开发时永远显现不出来，只有 CI 的 macOS 目标才炸。
     /// Linux（既非 windows 也非 macos，仅供跑测试）下 `place_fixed` 无调用者，故显式
     /// allow(dead_code)：它与 `window_to_content` 共用互逆契约和 round-trip 测试，必须成对存在。
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(any(windows, ext_presenter)), allow(dead_code))]
     fn content_to_window(content: (i32, i32), ml: u32, mt: u32) -> (i32, i32) {
         (content.0 - ml as i32, content.1 - mt as i32)
     }
@@ -2083,7 +2083,7 @@ impl CandidateWindow {
     /// macOS 同样走这里（`.app` 的 NSPanel 只是照搬算好的坐标）：那边不画软阴影，扩边恒 0，
     /// 且 `clamp_content_to_monitor` 在非 Windows 是恒等函数——真正的屏幕钳制由 `.app` 用
     /// `NSScreen.visibleFrame` 做，服务进程这边查不到 macOS 的显示器几何。
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(any(windows, ext_presenter)), allow(dead_code))]
     fn place_fixed(
         fixed: (i32, i32),
         caret_x: i32,
@@ -4665,7 +4665,7 @@ impl WindowMouse for CandidateMouse {
 ///
 /// 断言含文本尺寸，依赖 mock 文本测量（字符数 × 字号 × 0.6），故与 `view.rs` 的布局测试
 /// 一样 gate 掉真实文本后端。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod min_size_tests {
     use super::*;
     use crate::view::Rect;
@@ -6330,7 +6330,7 @@ mod schema_font_tests {
 
 /// `truncate_text_for_width` 像素级截断——依赖 mock 文本测量（字符数 × 字号 × 0.6），
 /// 同 [`min_size_tests`] 一样 gate 掉真实文本后端。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod truncate_text_tests {
     use super::*;
 
@@ -6804,7 +6804,7 @@ mod tests {
 /// 尚未实现，两边都没有 `asked_families()` 这个读回口。而「有没有真的去问」正是这条链唯一
 /// 钉得住的一半——它此前整个不存在，主题里把字族名写错只表现为「字体不对」，日志里一个字
 /// 都没有。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod theme_font_check_tests {
     use super::*;
     use wind_theme::RvNode;
@@ -6855,7 +6855,7 @@ mod theme_font_check_tests {
 /// 字体名解析的接线（看板 A2-1）：旧 GDI face name 在**每个**字体入口都换成 family + 字重。
 ///
 /// 只在 mock 后端下编译，理由同上：它靠 `set_mock_families` 注入「系统字体集」。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod font_name_resolve_tests {
     use super::*;
 
@@ -7001,7 +7001,7 @@ mod font_name_resolve_tests {
 /// 断言落在 `build_tree` 产出的叶子上——渲染与测量（`measure_style`）读的是同一份生效主题，
 /// 叶子字族/字号就是两条路径共同的输入。mock 后端测量不看字族，故字族只做结构断言，
 /// 字号额外做一条测量断言。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod font_precedence_tests {
     use super::*;
     use wind_theme::RvNode;
@@ -8482,13 +8482,13 @@ mod comment_above_tests {
 }
 
 // 渲染 golden 对拍（Linux mock 后端才有绘制调用记录）。见模块文档。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod render_golden;
 
 /// 用户外观覆盖：阴影开关与位置偏移（ui.candidate.shadow / offset_x / offset_y）。
 ///
 /// 只在 mock 后端下编译（要在无显示器的 host 上造出 `CandidateWindow`）。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod user_shadow_offset_tests {
     use super::*;
     use wind_theme::schema::Dim;

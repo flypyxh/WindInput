@@ -57,11 +57,11 @@ impl HostServices for DesktopHostServices {
     fn clipboard_get_text(&self) -> anyhow::Result<String> {
         // cfg 分支保真自 SysClip::get_text：mock 平台的「空串」与「报错」是两种语义
         // ——读取失败必须让 clip.get 动作报错，而不是静默拿到空串。
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, ext_presenter))]
         {
             Ok(wind_ui::popup_menu::get_clipboard_text())
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, ext_presenter)))]
         {
             anyhow::bail!("clip.get: 当前平台暂未支持")
         }

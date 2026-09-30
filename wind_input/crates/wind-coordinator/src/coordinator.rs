@@ -359,7 +359,7 @@ pub fn set_settings_url_provider(f: Box<dyn Fn() -> Option<String> + Send + Sync
 
 /// 取「设置」网页配置 URL（None=未注入或服务未就绪）。
 /// macOS 经 CmdOpenSettings(0x0507) 让 .app 直接启动设置应用，不走 URL/exe 路径，故仅非 macOS。
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(ext_presenter))]
 pub(crate) fn settings_url() -> Option<String> {
     SETTINGS_URL_PROVIDER.get().and_then(|f| f())
 }
@@ -368,7 +368,7 @@ pub(crate) fn settings_url() -> Option<String> {
 /// 由当前 exe 名推导变体：wind_input[_dev].exe → wind_setting[_dev].exe，
 /// 故无需感知编译期变体，正式/dev 版自动对应。
 /// macOS 经 CmdOpenSettings(0x0507) 由 .app 按 bundleID 启动设置应用，不需可执行路径，故仅非 macOS。
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(ext_presenter))]
 pub(crate) fn settings_app_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -6584,7 +6584,7 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner()) = true;
         // macOS：把当前页候选右键菜单的禁用位随候选更新一并推给 `.app`，供其右键即时灰显。
         // Windows 的右键菜单在进程内 `show_candidate_menu` 实时算 enabled，不走此推送。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         self.push_candidate_menu_flags(state, start, end);
         tracing::debug!(
             "notify_ui_update: build+send {:?} (n={n_items}) pos=({caret_x},{caret_y}) h={caret_height} \
@@ -6607,7 +6607,7 @@ impl Coordinator {
     /// 首项禁上移/置顶、末项禁下移；拼音普通候选禁全部调位；删除按候选来源判定；
     /// 无 shadow 规则禁恢复默认；无词库落点整页全禁。
     /// 注：macOS 端「删除」文案固定，来源动态文案（禁用短语/删除用户词…）待协议扩展后接入。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     pub(crate) fn push_candidate_menu_flags(&self, state: &State, start: usize, end: usize) {
         if !self.push_server.has_clients() || start >= end {
             return;

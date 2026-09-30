@@ -1,7 +1,7 @@
 //! 命令栏（cmdbar）宿主集成的 macOS 平台差异部分
 //!
 //! 从 [`handle_cmdbar`](crate::handle_cmdbar) 抽出，集中放置 darwin 专属实现，使主文件保持
-//! 平台无关的流程清晰。全模块 `#[cfg(target_os = "macos")]`，仅在 macOS 编译。
+//! 平台无关的流程清晰。全模块 `#[cfg(ext_presenter)]`（macOS，或 Linux 的 `linux-host` 形态）。
 //!
 //! 核心差异：服务进程（LaunchAgent）**无 GUI 事件上下文 / 辅助功能授权**，故：
 //! - `open` / `proc.run`：进程内直接经 `open` CLI / `Command::spawn`（app 侧无 shell_exec 下行分支）；
@@ -17,7 +17,13 @@ use std::sync::{Arc, Weak};
 /// 一致走进程内子进程——app 侧无 shell_exec 下行分支（0x020E 已被上行 candidateHover 占用），
 /// 走 push_shell_exec 会被丢弃，故 macOS 不经 IPC 直接执行。
 pub(crate) fn open_native(target: &str) -> anyhow::Result<()> {
-    Command::new("open").arg(target).spawn()?;
+    // Linux 的等价物是 xdg-open（同样是「按默认应用打开」，且不阻塞）。
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(opener).arg(target).spawn()?;
     Ok(())
 }
 

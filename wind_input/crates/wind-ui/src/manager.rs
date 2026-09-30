@@ -1353,7 +1353,16 @@ pub(crate) fn open_path(path: &str) {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Linux 外部宿主形态：交给 xdg-open。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub(crate) fn open_path(path: &str) {
+    match crate::linux_host::open(path) {
+        Ok(()) => debug!("open_path: {path}"),
+        Err(e) => tracing::warn!("open_path 失败 {path}: {e}"),
+    }
+}
+
+#[cfg(not(any(windows, ext_presenter)))]
 pub(crate) fn open_path(_path: &str) {}
 
 /// 启动可执行程序并传参（ShellExecute open + params）；args 为空时等价 open_path。
@@ -1387,10 +1396,10 @@ pub(crate) fn open_app(path: &str, args: &str) {
 /// 裸可执行文件直接 spawn。args 按空白切分——Windows 侧那串是拼给 ShellExecute 的
 /// 单一参数串，macOS 需要切成 argv；含空格的取值请在构造端加引号（`build_settings_args`
 /// 已如此），此处按引号成对保留。
-#[cfg(target_os = "macos")]
+#[cfg(ext_presenter)]
 pub(crate) fn open_app(path: &str, args: &str) {
     let argv = split_args(args);
-    let spawned = if path.ends_with(".app") {
+    let spawned = if cfg!(target_os = "macos") && path.ends_with(".app") {
         let mut c = std::process::Command::new("/usr/bin/open");
         c.arg("-a").arg(path);
         if !argv.is_empty() {
@@ -1408,7 +1417,7 @@ pub(crate) fn open_app(path: &str, args: &str) {
 
 /// 把 Windows 口径的单一参数串切成 argv：按空白切分，成对的 `"` 内空白不切。
 /// 不做转义处理（`\"` 之类）——构造端只会产出简单的 `--k=v` 与带引号的取值。
-#[cfg(target_os = "macos")]
+#[cfg(ext_presenter)]
 fn split_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1430,7 +1439,7 @@ fn split_args(s: &str) -> Vec<String> {
     out
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, ext_presenter)))]
 pub(crate) fn open_app(_path: &str, _args: &str) {}
 
 #[cfg(test)]

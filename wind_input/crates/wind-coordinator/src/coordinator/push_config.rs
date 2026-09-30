@@ -371,7 +371,7 @@ impl Coordinator {
     /// macOS：把命令直通车按键合成帧（CmdKeyTap/Seq/Hold/Release/Type）推给活跃 `.app`。
     /// 服务进程（LaunchAgent）无辅助功能授权无法 post CGEvent，改由 `.app` 侧 KeySynthesizer
     /// 合成（`.app` 有授权）。只投活跃前台客户端，与 commit 同队列保证与 type() 上屏文本的顺序。
-    #[cfg(target_os = "macos")]
+    #[cfg(ext_presenter)]
     pub(crate) fn push_cmdbar_key_frame(&self, encoded: &[u8]) {
         self.push_server.push_commit_to_active(encoded);
     }
@@ -380,7 +380,7 @@ impl Coordinator {
     ///
     /// `dir` = 被启动进程的工作目录（空串 = 不指定，由 TSF 侧沿用调用进程当前目录）；
     /// `verb` / `show` = ShellExecute 的动词与初始窗口状态（空串 = open / normal）。
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(ext_presenter))]
     pub(crate) fn push_shell_exec(
         &self,
         target: &str,

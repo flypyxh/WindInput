@@ -965,14 +965,14 @@ impl View {
     /// 每行只列**与默认值不同**的字段（布局结果 `m`/`rect` 恒列）。手写而不 `#[derive(Debug)]`：
     /// 派生输出会随新增字段整体变形，而 golden 要守的恰恰是「加了新能力、出厂路径的树逐字节
     /// 不变」——新字段取默认值时不出现，出厂路径的转储就与加字段前相同。
-    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    #[cfg(all(test, mock_text))]
     pub(crate) fn debug_dump(&self) -> String {
         let mut out = String::new();
         self.dump_into(&mut out, 0, &View::default());
         out
     }
 
-    #[cfg(all(test, not(windows), not(target_os = "macos")))]
+    #[cfg(all(test, mock_text))]
     fn dump_into(&self, out: &mut String, depth: usize, d: &View) {
         let mut line = format!("{:indent$}{:?}", "", self.layout, indent = depth * 2);
         let mut field = |name: &str, v: String, dv: String| {
@@ -3021,7 +3021,7 @@ mod rotate_tests {
 /// 盒模型布局测试。断言含文本尺寸，依赖 mock 文本测量
 /// （`measure_text_sized` = 字符数 × 字号 × 0.6，行高 = 字号 × 1.2）。
 /// macOS 文本后端为真 CoreText（mock 失效），故同 Windows 一并 gate 出。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod layout_tests {
     use super::*;
     use crate::text::dwrite::TextRenderer;
@@ -3671,7 +3671,7 @@ mod bg_place_tests {
 
 // 分段颜色的接线：有区间走 `draw_runs`、没有走原来的 `draw`，且区间不影响布局。
 // 只有 mock 后端记绘制调用，故限 Linux。
-#[cfg(all(test, not(windows), not(target_os = "macos")))]
+#[cfg(all(test, mock_text))]
 mod color_runs_paint_tests {
     use super::*;
 

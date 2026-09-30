@@ -16,10 +16,10 @@ use wind_config::Config;
 use wind_store::Store;
 use wind_ui_types::UiCommand;
 // UiEvent 仅 macOS forwarder 路径显式命名（其余平台由 UiManager 的通道类型推断）。
-#[cfg(all(feature = "desktop-ui", target_os = "macos"))]
+#[cfg(all(feature = "desktop-ui", ext_presenter))]
 use wind_ui_types::UiEvent;
 // UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
-#[cfg(all(feature = "desktop-ui", not(target_os = "macos")))]
+#[cfg(all(feature = "desktop-ui", not(ext_presenter)))]
 use wind_ui::manager::UiManager;
 
 use crate::coordinator::Coordinator;
@@ -36,7 +36,7 @@ impl Coordinator {
         // UI 管理器（候选窗口线程）。
         // macOS 无进程内窗口：把 UiCommand 喂给 host-render forwarder，光栅化进 POSIX SHM
         // 再经 push 管道推帧给 .app。其余平台走 Windows LayeredWindow 的 UiManager。
-        #[cfg(target_os = "macos")]
+        #[cfg(ext_presenter)]
         let (ui_tx, event_rx) = {
             let (tx, rx) = std::sync::mpsc::channel::<UiCommand>();
             // 候选/菜单的**鼠标**交互确实经 push/bridge 协议从 .app 回流，不走这里；
@@ -55,7 +55,7 @@ impl Coordinator {
             // forwarder 线程阻塞在 `recv()` 上，命令到达本身即唤醒它，无需额外的唤醒通路。
             (crate::UiSender::without_wake(tx), Some(ev_rx))
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(ext_presenter))]
         let (ui_tx, event_rx) = match UiManager::new() {
             Ok(mut ui) => {
                 // UI 线程是事件驱动的（睡到有事发生），投递命令后必须唤醒它，否则那条命令
