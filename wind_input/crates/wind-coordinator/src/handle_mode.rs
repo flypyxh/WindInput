@@ -768,6 +768,8 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::None => None,
+            // 反查模式在 Task 17 接线：暂不进入、不吞键。
+            BoundAction::Reverse => None,
             // 软键盘不是模式，没有「顶字进入」的区别——但既然本函数的语义是「先把已转换
             // 前缀和高亮候选上屏」，这里也要顶，否则开面板会把用户正在打的编码丢掉。
             BoundAction::SoftKeyboard(page) => {

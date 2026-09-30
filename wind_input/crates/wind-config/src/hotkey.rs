@@ -82,6 +82,7 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
         | BA::TempEnglish
         | BA::AuxCode
         | BA::RareChar
+        | BA::Reverse
         | BA::Mix(_)
         | BA::Special(_)
         | BA::SoftKeyboard(_) => true,
@@ -2033,5 +2034,12 @@ mod tests {
             .filter(|e| e.tsf_hash & HOTKEY_POLICY_SESSION != 0)
             .count();
         assert!(n <= 32, "SESSION 热键 {n} 个，超过 TSF 候选槽位 32");
+    }
+
+    #[test]
+    fn reverse_hotkey_policy_is_global_chinese_only() {
+        let p = hotkey_policy_for(&crate::config::BoundAction::Reverse).unwrap();
+        assert_eq!(p & HOTKEY_POLICY_CHINESE_ONLY, HOTKEY_POLICY_CHINESE_ONLY);
+        assert_eq!(p & HOTKEY_POLICY_GLOBAL, HOTKEY_POLICY_GLOBAL);
     }
 }

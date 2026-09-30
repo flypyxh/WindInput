@@ -1490,6 +1490,7 @@ impl Default for PinyinGlobalConfig {
 /// - `"temp_pinyin"`：进临时拼音
 /// - `"temp_english"`：进临时英文
 /// - `"rare_char"`：进生僻字模式（当前方案的编码，候选只留生僻字）
+/// - `"reverse"`：进反查模式（当前方案的编码，通配可在首位）
 /// - `"mix:<id>"`：进指定融合模式（`mix:quick_mix` = 内置「快捷」）
 /// - `"special:<id>"`：进指定特殊模式
 /// - `"toggle_schema:<id>"`：切到指定方案，再按回来
@@ -1512,6 +1513,9 @@ pub enum BoundAction {
     ///
     /// 无载荷——它是单例，不像 [`Self::Special`] 那样一个引导键对应一份码表方案。
     RareChar,
+    /// 进反查模式：输入**本方案编码**（含通配，任何位置都可通配），只查主码表
+    /// （reverse-mode spec §3）。无载荷，单例。
+    Reverse,
     /// 进指定融合模式（携带实例 id）。
     Mix(String),
     /// 进指定特殊模式（携带实例 id）。
@@ -1668,6 +1672,7 @@ impl BoundAction {
             | Self::TempEnglish
             | Self::AuxCode
             | Self::RareChar
+            | Self::Reverse
             | Self::Mix(_)
             | Self::Special(_) => true,
             // 字词范围切的是「这一码出什么」，没有中文候选就无从谈起。
@@ -1760,6 +1765,7 @@ impl BoundAction {
             "temp_english" => Self::TempEnglish,
             "aux_code" => Self::AuxCode,
             "rare_char" => Self::RareChar,
+            "reverse" => Self::Reverse,
             "softkeyboard" => Self::SoftKeyboard(None),
             a if Self::DISPATCH_ACTIONS.contains(&a) => Self::Action(a.to_string()),
             _ => Self::None,
@@ -2385,6 +2391,13 @@ impl CodetableGlobal {
             );
         }
         parsed
+    }
+
+    /// 反查模式内的通配键：取方案 `wildcard_key`，非法回落 `z`（spec §3.2）。
+    ///
+    /// 不看主开关 `wildcard`；也不告警——合法性告警归 [`Self::wildcard_char`]。
+    pub fn reverse_wildcard_char(&self) -> char {
+        parse_wildcard_key(&self.wildcard_key).unwrap_or('z')
     }
 }
 
@@ -3813,6 +3826,9 @@ pub struct InputConfig {
     /// 生僻字模式（用当前方案的编码输入，候选只留生僻字）。
     #[serde(default)]
     pub rare_char: RareCharConfig,
+    /// 反查模式（用本方案编码 + 通配查字，只查主码表）。
+    #[serde(default)]
+    pub reverse: ReverseConfig,
     /// Emoji 候选扩展（按候选文本查表追加，与编码域无关故所有方案通用）。
     #[serde(default)]
     pub emoji: EmojiConfig,
@@ -3931,6 +3947,7 @@ impl Default for InputConfig {
             capslock: CapslockConfig::default(),
             temp_pinyin: TempPinyinConfig::default(),
             rare_char: RareCharConfig::default(),
+            reverse: ReverseConfig::default(),
             emoji: EmojiConfig::default(),
             url: UrlConfig::default(),
             email: EmailConfig::default(),
@@ -4432,6 +4449,21 @@ pub struct RareCharConfig {
     /// 到的开关里，而不是静默消失。判据表见 `wind_candidate::charblock` 模块头。
     #[serde(default)]
     pub include_blocks: Vec<String>,
+}
+
+/// 反查模式配置（[input.reverse]，reverse-mode spec §3）。
+///
+/// 进入方式只由 `keys.key_actions` / 方案 `[key_actions]` / `z_key_action` 承载（动词
+/// `reverse`），出厂不绑任何键；`enabled` 是 spec §3.1 要求的总开关，关着时绑了键也不进
+/// （门卫在协调器 `reverse_mode_available`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReverseConfig {
+    /// 总开关。出厂关。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 反查模式期间的候选布局（默认跟随全局）。
+    #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
+    pub candidate_layout: LayoutIntent,
 }
 
 /// 临时拼音配置（[input.temp_pinyin]）。码表方案下临时切到拼音反查。全局唯一。
@@ -6997,6 +7029,7 @@ mod bound_action_chinese_only_tests {
             "temp_english",
             "aux_code",
             "rare_char",
+            "reverse",
             "mix:quick_mix",
             "special:fuhao",
             "single_char",
@@ -13462,5 +13495,50 @@ mod status_position_tests {
         .expect("拼错不得让配置加载失败");
         assert_eq!(cfg.ui.status.position(), StatusPositionMode::FollowCaret);
         assert_eq!(cfg.ui.status.fallback(), StatusFallback::Last);
+    }
+
+    #[test]
+    fn reverse_bound_action_parses() {
+        assert_eq!(BoundAction::parse("reverse"), BoundAction::Reverse);
+        assert_eq!(BoundAction::parse(" Reverse "), BoundAction::Reverse);
+        assert_eq!(
+            BoundAction::parse("reversex"),
+            BoundAction::None,
+            "未知动词仍回落 None"
+        );
+    }
+
+    #[test]
+    fn reverse_config_defaults_off_and_parses() {
+        let c = Config::default();
+        assert!(!c.input.reverse.enabled, "出厂关（reverse-mode spec §3.1）");
+        assert_eq!(c.input.reverse.candidate_layout, LayoutIntent::Follow);
+        let t: ReverseConfig =
+            toml::from_str("enabled = true\ncandidate_layout = \"vertical\"\n").unwrap();
+        assert!(t.enabled);
+        assert_eq!(t.candidate_layout, LayoutIntent::Vertical);
+        let bad: ReverseConfig = toml::from_str("candidate_layout = \"diagonal\"\n").unwrap();
+        assert_eq!(
+            bad.candidate_layout,
+            LayoutIntent::Follow,
+            "非法值容错回落（tolerant_de）"
+        );
+    }
+
+    /// spec §3.2：模式内通配键取方案键；键非法（含通配关时的出厂 "z"）一律回落 z。
+    #[test]
+    fn reverse_wildcard_char_falls_back_to_z() {
+        let g = CodetableGlobal::default();
+        assert_eq!(g.reverse_wildcard_char(), 'z');
+        let q = CodetableGlobal {
+            wildcard_key: "?".into(),
+            ..Default::default()
+        };
+        assert_eq!(q.reverse_wildcard_char(), '?', "不看主开关");
+        let bad = CodetableGlobal {
+            wildcard_key: "12".into(),
+            ..Default::default()
+        };
+        assert_eq!(bad.reverse_wildcard_char(), 'z');
     }
 }

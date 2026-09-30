@@ -589,6 +589,8 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::None => None,
+            // 反查模式在 Task 17 接线：暂不进入、不吞键（None 让 z/引导键落普通输入）。
+            BoundAction::Reverse => None,
             // 软键盘不是「模式」，没有编码缓冲也不进 ModeKind——直接开关面板即可。
             // 状态推送由按键路径顶层的 SoftKeyboardPushOnDrop 兜底。
             BoundAction::SoftKeyboard(page) => Some(self.toggle_softkeyboard(page.as_deref())),
@@ -810,6 +812,8 @@ impl Coordinator {
             | BoundAction::TempEnglish
             | BoundAction::AuxCode
             | BoundAction::RareChar
+            // 反查模式在 Task 17 接线（进 overlay，要 `&mut State`，与 RareChar 同族）。
+            | BoundAction::Reverse
             | BoundAction::Mix(_)
             | BoundAction::Special(_)
             | BoundAction::SingleChar(_)
@@ -948,7 +952,9 @@ impl Coordinator {
             BoundAction::Mix(id) => ModeKind::Mix(self.mix_mode_idx(id)?),
             // 不建 overlay ⇒ 没有可比对的模式身份。软键盘有自己的开关态，幂等由
             // `toggle_softkeyboard` 自己处理（它的语义就是「再按一次关掉」）。
+            // 反查模式在 Task 17 接线：暂无模式身份（ModeKind::Reverse 尚未引入）。
             BoundAction::None
+            | BoundAction::Reverse
             | BoundAction::SingleChar(_)
             | BoundAction::SoftKeyboard(_)
             | BoundAction::ToggleSchema(_)
