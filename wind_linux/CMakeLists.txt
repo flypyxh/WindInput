@@ -25,6 +25,7 @@ add_library(windcore STATIC
     src/core/HostUi.cpp
     src/core/KeyMap.cpp
     src/core/Menu.cpp
+    src/core/OverlayInput.cpp
     src/core/ResponseRouter.cpp
     src/core/ServiceLauncher.cpp
     src/core/SettingsLauncher.cpp
@@ -40,7 +41,7 @@ target_link_libraries(windcore PUBLIC Threads::Threads)
 # ── 单测 ──
 enable_testing()
 foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test
-        settings_launcher_test menu_test host_ui_test)
+        settings_launcher_test menu_test host_ui_test overlay_input_test)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE windcore)
     target_compile_definitions(${t} PRIVATE

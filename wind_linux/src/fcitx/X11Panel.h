@@ -2,7 +2,8 @@
 //
 // 对位 macOS `CandidatePanel.swift`（NSPanel）。像素不在本进程画，这里只负责：建窗、贴图、
 // 落位（翻转/钳制规则在纯逻辑 `placePanel`）、隐藏，以及把鼠标点击/悬停/滚轮翻成
-// CMD_CANDIDATE_SELECT/HOVER/SCROLL 交回服务（结果经 push 通道异步回来）。
+// CMD_CANDIDATE_SELECT/HOVER/SCROLL 交回服务（结果经 push 通道异步回来）。三层浮层的鼠标交互
+// （悬停保持、拖动、右键菜单、点击关闭）的规则在纯逻辑 `OverlayInput.h`。
 //
 // 自建 xcb 连接（不借 Fcitx5 的 xcb 模块）：候选窗与 Fcitx5 自己的 UI 无关，自己的连接可以
 // 在 xcb 模块未加载时照常工作；连接的 fd 挂到 Fcitx5 事件循环上，鼠标事件在主线程处理。
@@ -14,6 +15,7 @@
 
 #include "Codec.h"
 #include "ExtProtocol.h"
+#include "OverlayInput.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
@@ -41,6 +43,12 @@ public:
         std::function<void(uint32_t event, uint32_t button, int32_t x, int32_t y)> menuPointer;
         /// 本端自己把菜单收掉了（空闲超时…），reason 报给服务端复位 menu_open。
         std::function<void(const std::string& reason)> menuDismissed;
+        /// 右键状态气泡 / 悬停提示：target 为 MENU_TARGET_STATUS / MENU_TARGET_TOOLTIP，(x, y)
+        /// 根窗口坐标（菜单锚点），(lx, ly) 右键点在该浮层位图内的坐标（提示按段 / 按行命中用）。
+        std::function<void(int32_t target, int32_t x, int32_t y, int32_t lx, int32_t ly)>
+            overlayMenu;
+        /// 状态气泡拖动松手：内容左上的屏幕坐标 → `pos.status_tip`（落不落盘由服务端定）。
+        std::function<void(int32_t x, int32_t y)> statusMoved;
     };
 
     X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb);
@@ -55,10 +63,13 @@ public:
 
     /// 光栅浮层（CMD_OVERLAY_FRAME：tooltip / 状态气泡 / Toast）：各占一个窗口，落位见
     /// `placeOverlay`。`durationMs > 0` 时到点自己藏（计时归宿主，同 macOS `.app`）。
-    /// 浮层窗口对鼠标透明（XShape 输入区为空）：点击穿透到下面的应用，不抢候选窗的悬停。
+    /// 鼠标交互对位 Windows（见 OverlayInput.h）：悬停 / 拖动 / 菜单开着时暂停自动隐藏，
+    /// 悬停提示在指针移进它时保持、右键弹菜单，状态气泡可拖、可右键，Toast 点一下就关。
     bool showOverlay(uint32_t kind, const SharedFrame& frame, const OverlayFramePayload& p);
     void hideOverlay(uint32_t kind);
     void hideAllOverlays();
+    /// 状态气泡此刻内容左上的屏幕坐标（应 `pos.status_tip.query`）；不在屏上返回空。
+    std::optional<std::pair<int32_t, int32_t>> statusContentOrigin() const;
 
     /// 自绘菜单第 `level` 级（CMD_OVERLAY_FRAME kind = OVERLAY_KIND_MENU + level）：按 EXACT
     /// 原样摆放。第一级出现时抓住指针（点菜单外能看见、并且不漏给下面的应用）、起空闲计时。
@@ -80,7 +91,8 @@ private:
     /// 一个 override-redirect 窗口及其位图。候选窗与三层浮层各一个，共用一条 X 连接。
     struct Surface {
         const char* instance = ""; // WM_CLASS 实例名（xdotool search --classname）
-        bool interactive = false;  // 候选窗收鼠标；浮层对鼠标透明
+        bool interactive = false;  // 收鼠标（候选窗 / 菜单 / 浮层）
+        bool overlay = false;      // 三层光栅浮层之一：另收进入 / 松开、窗口类型是 TOOLTIP
         xcb_window_t window = 0;
         xcb_pixmap_t pixmap = 0;
         xcb_gcontext_t gc = 0;
@@ -90,7 +102,13 @@ private:
         uint32_t pixW = 0;
         uint32_t pixH = 0;
         bool mapped = false;
+        int32_t x = 0; // 窗口左上（根窗口坐标），最近一次 present / 拖动
+        int32_t y = 0;
         std::unique_ptr<fcitx::EventSourceTime> hideTimer;
+        // ── 仅浮层 ──
+        OverlayFramePayload geo; // 最近一帧（尺寸取像素那一份）：内容盒偏移、自动隐藏时长
+        HoverGate gate;          // 窗口出现那一刻的指针位置为基线
+        bool hovered = false;    // 指针真实移动到它上面、尚未离开
     };
     static constexpr size_t kOverlayCount = 3;
     static constexpr size_t kMenuLevels = OVERLAY_MENU_LEVELS;
@@ -104,13 +122,40 @@ private:
     /// 父菜单上时，父菜单一次重绘就会把它盖住（同 Windows `plan_render` 的教训）。
     bool present(Surface& s, const SharedFrame& frame, const Rect& r, bool raise = true);
     void unmap(Surface& s);
+    /// 摘窗口并归位它的交互态（悬停 / 拖动），不动它的自动隐藏计时器——计时器回调里调用时
+    /// 不能销毁正在执行的自己。
+    void unmapWindow(Surface& s);
     void upload(Surface& s, const SharedFrame& frame);
-    void applyShape(Surface& s, const SharedFrame& frame);
+    void applyShape(Surface& s, const SharedFrame& frame, uint8_t kind);
     Surface* overlay(uint32_t kind);
+    /// 哪一层浮层的窗口（不是浮层返回 0）。
+    uint32_t overlayKindOf(xcb_window_t w) const;
     Rect workArea() const;
+    static Rect rectOf(const Surface& s) { return Rect{s.x, s.y, int32_t(s.pixW), int32_t(s.pixH)}; }
     void onReadable();
     void handleEvent(xcb_generic_event_t* ev);
     void setHover(int32_t index);
+
+    // ── 浮层交互（OverlayInput.h 是纯逻辑那一半）──
+    void handleOverlayEvent(uint32_t kind, xcb_generic_event_t* ev);
+    /// 候选窗上的悬停变化：悬停提示正显示时按 `hoverDeferMs` 延后，给挪进提示留时间。
+    void candidateHover(int32_t raw);
+    void onHoverDeferred();
+    void onTipLeaveGrace();
+    void cancelTipTimers();
+    /// 自动隐藏是否暂停：悬停 / 拖动 / 右键菜单开着（Windows `StatusTip::interacting`）。
+    bool held(uint32_t kind) const;
+    /// 按 `held` 暂停或（交互结束时）重新给满一份时长。
+    void refreshHold(uint32_t kind);
+    void armHide(uint32_t kind);
+    void moveDrag(int32_t rootX, int32_t rootY);
+    void endDrag(bool report);
+    void setDragCursor(bool on);
+    /// 菜单收起后按指针的真实位置重定：悬停提示去留、候选悬停、气泡 / Toast 的悬停。
+    void resyncAfterMenu();
+    bool pointerOn(const Surface& s, const std::optional<std::pair<int32_t, int32_t>>& p) const;
+    void armTimer(std::unique_ptr<fcitx::EventSourceTime>& t, uint32_t ms,
+                  void (X11CandidatePanel::*fn)());
     /// 菜单打开期间的指针事件：移动合并到本批末尾再报，按下立即报（先把积着的移动报掉保序）。
     void handleMenuEvent(xcb_generic_event_t* ev);
     void flushMenuMotion();
@@ -137,7 +182,24 @@ private:
     int32_t candShiftY_ = 0;
 
     std::vector<CandidateHitRect> rects_;
-    int32_t hover_ = -1;
+    int32_t hover_ = -1; // 最近报给服务端的悬停
+    int32_t pendingHover_ = -1;
+    std::unique_ptr<fcitx::EventSourceTime> hoverDefer_; // 延后报的悬停变化
+    std::unique_ptr<fcitx::EventSourceTime> tipLeave_;   // 离开悬停提示后的宽限
+
+    struct Drag {
+        bool active = false;
+        int32_t grabDx = 0; // 按下时指针相对窗口左上
+        int32_t grabDy = 0;
+    } drag_;
+    xcb_cursor_t dragCursor_ = 0;
+    /// 右键状态气泡请求了菜单：菜单开着（或还在路上）期间气泡不自动消失。菜单收起时清；
+    /// 请求石沉大海（服务没了）由 statusMenuWait_ 兜底清掉，免得气泡永远不走。
+    bool statusMenuHold_ = false;
+    std::unique_ptr<fcitx::EventSourceTime> statusMenuWait_;
+    void onStatusMenuWaitExpired();
+    /// 菜单是否开过（showMenuLevel 首级 → dropMenu）：只在真有菜单收起时重定指针态。
+    bool menuActive_ = false;
 
     Surface menus_[kMenuLevels];
     bool pointerGrabbed_ = false;

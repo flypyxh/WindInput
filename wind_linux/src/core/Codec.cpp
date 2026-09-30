@@ -232,6 +232,21 @@ Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, in
     return encodeExtFrame(EXT_KIND_MENU_OPEN, body);
 }
 
+Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, int32_t top,
+                          int32_t right, int32_t bottom, int32_t lx, int32_t ly)
+{
+    std::string body = "{\"target\":" + std::to_string(target) + ",\"x\":" + std::to_string(x)
+        + ",\"y\":" + std::to_string(y) + ",\"work\":[" + std::to_string(left) + ","
+        + std::to_string(top) + "," + std::to_string(right) + "," + std::to_string(bottom)
+        + "],\"lx\":" + std::to_string(lx) + ",\"ly\":" + std::to_string(ly) + "}";
+    return encodeExtFrame(EXT_KIND_MENU_OPEN, body);
+}
+
+Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y)
+{
+    return encodeExtFrame(kind, "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + "}");
+}
+
 Bytes encodeMenuDismissFrame(const std::string& reason)
 {
     return encodeExtFrame(EXT_KIND_MENU_DISMISS, "{\"reason\":\"" + reason + "\"}");

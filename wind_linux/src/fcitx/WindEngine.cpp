@@ -152,6 +152,20 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     cb.menuDismissed = [this](const std::string& reason) {
         sendAndDrain(encodeMenuDismissFrame(reason));
     };
+    // 右键状态气泡 / 悬停提示：与候选右键同一条 `menu.open`，工作区随请求报上去；提示另带
+    // 右键点在位图内的坐标（按段 / 按行的命中在服务端做）。
+    cb.overlayMenu = [this](int32_t target, int32_t x, int32_t y, int32_t lx, int32_t ly) {
+        Rect wa = panel_->screenWorkArea().value_or(Rect{});
+        WIND_DEBUG() << "请求打开浮层菜单 target=" << target << " @(" << x << "," << y << ")";
+        sendAndDrain(target == MENU_TARGET_TOOLTIP
+                         ? encodeMenuOpenFrame(target, x, y, wa.x, wa.y, wa.x + wa.w,
+                                               wa.y + wa.h, lx, ly)
+                         : encodeMenuOpenFrame(target, x, y, wa.x, wa.y, wa.x + wa.w,
+                                               wa.y + wa.h));
+    };
+    cb.statusMoved = [this](int32_t x, int32_t y) {
+        sendAndDrain(encodePosFrame(EXT_KIND_POS_STATUS_TIP, x, y));
+    };
     panel_ = std::make_unique<X11CandidatePanel>(instance_->eventLoop(), std::move(cb));
 
     settingsAction_.setShortText("清风输入法设置");
@@ -629,6 +643,13 @@ void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
 
 void WindEngine::onExt(const ExtEnvelope& ext)
 {
+    if (ext.kind == EXT_KIND_POS_STATUS_TIP_QUERY) {
+        // 切「固定位置」时服务端问气泡此刻在哪，好以当前位置落盘。不在屏上不答（服务端保留旧值）。
+        if (auto at = panel_->statusContentOrigin()) {
+            sendAndDrain(encodePosFrame(EXT_KIND_POS_STATUS_TIP, at->first, at->second));
+        }
+        return;
+    }
     if (ext.kind != EXT_KIND_SETTINGS_OPEN) {
         // 未知 kind 安静忽略：新服务配旧 addon 时不该出错（信封的版本兼容语义）。
         WIND_DEBUG() << "未处理的扩展信封 kind=" << ext.kind;

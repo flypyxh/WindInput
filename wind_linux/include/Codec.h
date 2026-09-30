@@ -94,6 +94,13 @@ Bytes encodeMenuPointerFrame(uint32_t event, uint32_t button, int32_t x, int32_t
 /// target ≥ 0 为该候选（页内下标）的右键菜单，-1 为功能主菜单；(x, y) 为菜单左上锚点。
 Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, int32_t top,
                           int32_t right, int32_t bottom);
+/// 同上，另带 `"lx":LX,"ly":LY`：右键点在悬停提示**位图内**的坐标（target =
+/// MENU_TARGET_TOOLTIP 时用；按段 / 按行的命中在服务端按这个点做）。
+Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, int32_t top,
+                          int32_t right, int32_t bottom, int32_t lx, int32_t ly);
+/// 上行扩展信封 `pos.*`（如 `pos.status_tip`）：body = `{"x":X,"y":Y}`，**内容**左上的屏幕坐标
+/// （与配置 `ui.status.custom_x/y` 同义）。对位 Rust `decode_ext_point`。
+Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y);
 /// 上行扩展信封 `menu.dismiss`：body = `{"reason":"…"}`（reason 只含 [a-z_]，不转义）。
 Bytes encodeMenuDismissFrame(const std::string& reason);
 /// CMD_FRONT_CONTEXT：appLen+app + titleLen+title + selLen+sel（均 UTF-8）。

@@ -66,6 +66,16 @@ constexpr uint32_t OVERLAY_ANCHOR_BOTTOM_CENTER = 7;
 inline constexpr const char* EXT_KIND_MENU_OPEN = "menu.open";
 /// 上行：本端把菜单收掉了（空闲超时 / 失焦 / 服务重启…），服务端据此复位 menu_open。
 inline constexpr const char* EXT_KIND_MENU_DISMISS = "menu.dismiss";
+/// 上行：状态气泡拖动落点 / 应询回报的当前位置（内容左上）。落不落盘由服务端按定位方式定。
+inline constexpr const char* EXT_KIND_POS_STATUS_TIP = "pos.status_tip";
+/// 下行：服务端问状态气泡此刻在哪（切「固定位置」时以当前位置落盘）。气泡不在屏上不答。
+inline constexpr const char* EXT_KIND_POS_STATUS_TIP_QUERY = "pos.status_tip.query";
+
+// ── `menu.open` 的 target 里「不是候选」的几档（protocol.rs `menu_target`）──
+constexpr int32_t MENU_TARGET_MAIN = -1;
+constexpr int32_t MENU_TARGET_STATUS = -2;
+/// 悬停提示：body 另带右键点在提示位图内的坐标 `lx`/`ly`。
+constexpr int32_t MENU_TARGET_TOOLTIP = -3;
 
 /// InputScope 的 IS_PASSWORD 位（TSF 枚举 31）。服务端据此对密码框强制英文半角直通；
 /// 与 Swift `InputController.inputScopePasswordBit`、Rust 协调器的判定同值。

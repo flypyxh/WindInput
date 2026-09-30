@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <sstream>
 
@@ -23,13 +24,14 @@ namespace {
 
 std::string g_src;
 
-/// 在 protocol.rs 里找 `pub const NAME: u16 = 0x....;`，找不到返回 -1。
-long rustConst(const std::string& name)
+/// 在 protocol.rs 里找 `pub const NAME: u16 = 0x....;`（整数类型不限，可为负），找不到返回空。
+std::optional<long> rustConst(const std::string& name)
 {
-    std::regex re("pub const " + name + R"(:\s*u\d+\s*=\s*(0x[0-9A-Fa-f_]+|\d+)\s*;)");
+    std::regex re("pub const " + name
+                  + R"(:\s*[ui]\d+\s*=\s*(-?(?:0x[0-9A-Fa-f_]+|\d+))\s*;)");
     std::smatch m;
     if (!std::regex_search(g_src, m, re)) {
-        return -1;
+        return std::nullopt;
     }
     std::string v = m[1];
     v.erase(std::remove(v.begin(), v.end(), '_'), v.end());
@@ -46,10 +48,10 @@ std::string rustStr(const std::string& name)
 
 #define SYNC(name, value)                                                                \
     do {                                                                                 \
-        long rs = rustConst(name);                                                       \
+        std::optional<long> rs = rustConst(name);                                        \
         if (rs != long(value)) {                                                         \
-            std::printf("  FAIL  %s: C++=0x%04lX  protocol.rs=%s0x%04lX\n", name,        \
-                        long(value), rs < 0 ? "(未找到) " : "", rs < 0 ? 0 : rs);        \
+            std::printf("  FAIL  %s: C++=%ld  protocol.rs=%s%ld\n", name, long(value),    \
+                        rs ? "" : "(未找到) ", rs.value_or(0));                          \
             testharness::g_failures++;                                                   \
         }                                                                                \
     } while (0)
@@ -145,6 +147,14 @@ int main()
     CHECK_EQ(rustStr("SETTINGS_OPEN"), std::string(windlinux::EXT_KIND_SETTINGS_OPEN));
     CHECK_EQ(rustStr("MENU_OPEN"), std::string(windlinux::EXT_KIND_MENU_OPEN));
     CHECK_EQ(rustStr("MENU_DISMISS"), std::string(windlinux::EXT_KIND_MENU_DISMISS));
+    CHECK_EQ(rustStr("POS_STATUS_TIP"), std::string(windlinux::EXT_KIND_POS_STATUS_TIP));
+    CHECK_EQ(rustStr("POS_STATUS_TIP_QUERY"),
+             std::string(windlinux::EXT_KIND_POS_STATUS_TIP_QUERY));
+
+    CASE("menu.open 的非候选 target（有符号）与 protocol.rs `menu_target` 一致");
+    SYNC("MENU_TARGET_MAIN", windlinux::MENU_TARGET_MAIN);
+    SYNC("MENU_TARGET_STATUS", windlinux::MENU_TARGET_STATUS);
+    SYNC("MENU_TARGET_TOOLTIP", windlinux::MENU_TARGET_TOOLTIP);
 
     TEST_MAIN_END();
 }

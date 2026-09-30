@@ -45,6 +45,19 @@ xcb_visualtype_t* findArgbVisual(xcb_screen_t* s)
     return nullptr;
 }
 
+/// 停掉一个一次性计时器（不销毁：调用方可能正处在它的回调里）。
+void disarm(std::unique_ptr<fcitx::EventSourceTime>& t)
+{
+    if (t) {
+        t->setEnabled(false);
+    }
+}
+
+bool armed(const std::unique_ptr<fcitx::EventSourceTime>& t)
+{
+    return t && t->isEnabled();
+}
+
 /// 该深度的 ZPixmap 每像素位数（X 服务器声明的格式表）。
 int bitsPerPixel(xcb_connection_t* c, uint8_t depth)
 {
@@ -68,6 +81,10 @@ X11CandidatePanel::X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb)
     overlays_[OVERLAY_KIND_TOOLTIP - 1].instance = "wind-tooltip";
     overlays_[OVERLAY_KIND_STATUS - 1].instance = "wind-status";
     overlays_[OVERLAY_KIND_TOAST - 1].instance = "wind-toast";
+    for (Surface& o : overlays_) {
+        o.interactive = true;
+        o.overlay = true;
+    }
     static const char* const kMenuNames[kMenuLevels] = {"wind-menu-0", "wind-menu-1", "wind-menu-2",
                                                         "wind-menu-3", "wind-menu-4", "wind-menu-5"};
     for (size_t k = 0; k < kMenuLevels; ++k) {
@@ -124,7 +141,19 @@ void X11CandidatePanel::dropConnection()
     menuIdle_.reset();
     pointerGrabbed_ = false; // 连接一断，服务器端的抓取随之失效
     pendingMotion_.reset();
+    menuActive_ = false;
+    // 交互态随窗口一起作废（拖动中断线：隐式抓取随连接消失，不会有松开事件来收尾）。
+    // 计时器只停不毁：这里可能正是从它们的回调里（查指针 → 重连）走进来的。
+    disarm(hoverDefer_);
+    disarm(tipLeave_);
+    disarm(statusMenuWait_);
+    statusMenuHold_ = false;
+    drag_ = Drag{};
     if (conn_) {
+        if (dragCursor_) {
+            xcb_free_cursor(conn_, dragCursor_);
+            dragCursor_ = 0;
+        }
         destroyWindow(cand_);
         for (Surface& o : overlays_) {
             destroyWindow(o);
@@ -177,13 +206,21 @@ bool X11CandidatePanel::ensureWindow(Surface& s, bool argb)
     // 否则 CreateWindow 报 BadMatch。
     uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_OVERRIDE_REDIRECT
         | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP;
+    uint32_t events = 0;
+    if (s.interactive) {
+        events = XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION
+            | XCB_EVENT_MASK_LEAVE_WINDOW;
+    }
+    if (s.overlay) {
+        // 拖动靠按下时的隐式抓取收移动与松开（指针拖出窗口也照收，松手即结束——不会卡住）；
+        // 进入用于悬停提示「指针已挪进来」。
+        events |= XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_ENTER_WINDOW;
+    }
     uint32_t values[] = {
         0,
         0,
         1, // override-redirect：不归窗口管理器管，不抢焦点、不加边框
-        s.interactive ? uint32_t(XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION
-                                 | XCB_EVENT_MASK_LEAVE_WINDOW)
-                      : 0u,
+        events,
         s.colormap ? s.colormap : screen_->default_colormap,
     };
     xcb_create_window(conn_, s.depth, s.window, screen_->root, 0, 0, 1, 1, 0,
@@ -197,13 +234,14 @@ bool X11CandidatePanel::ensureWindow(Surface& s, bool argb)
                         XCB_ATOM_STRING, 8, uint32_t(name.size()), name.data());
     // 窗口类型提示：合成器据此不给它加阴影/动画（阴影已画在位图里）。
     xcb_atom_t type = internAtom(conn_, "_NET_WM_WINDOW_TYPE");
-    xcb_atom_t kind = internAtom(conn_, s.interactive ? "_NET_WM_WINDOW_TYPE_POPUP_MENU"
-                                                      : "_NET_WM_WINDOW_TYPE_TOOLTIP");
+    xcb_atom_t kind = internAtom(conn_, s.interactive && !s.overlay
+                                            ? "_NET_WM_WINDOW_TYPE_POPUP_MENU"
+                                            : "_NET_WM_WINDOW_TYPE_TOOLTIP");
     if (type && kind) {
         xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, s.window, type, XCB_ATOM_ATOM, 32, 1,
                             &kind);
     }
-    // 浮层对鼠标透明：输入区设为空，点击穿透到下面的应用（气泡常弹在光标旁 / 屏幕角）。
+    // 不收鼠标的窗口：输入区设为空，点击穿透到下面的应用。
     if (!s.interactive && shapeAvailable_) {
         xcb_shape_rectangles(conn_, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT,
                              XCB_CLIP_ORDERING_UNSORTED, s.window, 0, 0, 0, nullptr);
@@ -239,6 +277,10 @@ void X11CandidatePanel::destroyWindow(Surface& s)
     }
     s.pixW = s.pixH = 0;
     s.mapped = false;
+    s.hovered = false;
+    if (&s == &overlays_[OVERLAY_KIND_STATUS - 1]) {
+        drag_ = Drag{}; // 窗口没了，它的隐式抓取与松开事件也就没了
+    }
 }
 
 void X11CandidatePanel::upload(Surface& s, const SharedFrame& f)
@@ -279,7 +321,7 @@ void X11CandidatePanel::upload(Surface& s, const SharedFrame& f)
     xcb_clear_area(conn_, 0, s.window, 0, 0, uint16_t(f.width), uint16_t(f.height));
 }
 
-void X11CandidatePanel::applyShape(Surface& s, const SharedFrame& f)
+void X11CandidatePanel::applyShape(Surface& s, const SharedFrame& f, uint8_t kind)
 {
     if (!shapeAvailable_) {
         return;
@@ -302,9 +344,8 @@ void X11CandidatePanel::applyShape(Surface& s, const SharedFrame& f)
             }
         }
     }
-    xcb_shape_rectangles(conn_, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
-                         XCB_CLIP_ORDERING_YX_SORTED, s.window, 0, 0, uint32_t(rects.size()),
-                         rects.data());
+    xcb_shape_rectangles(conn_, XCB_SHAPE_SO_SET, kind, XCB_CLIP_ORDERING_YX_SORTED, s.window, 0,
+                         0, uint32_t(rects.size()), rects.data());
 }
 
 Rect X11CandidatePanel::workArea() const
@@ -321,11 +362,25 @@ bool X11CandidatePanel::present(Surface& s, const SharedFrame& f, const Rect& r,
         mask |= XCB_CONFIG_WINDOW_STACK_MODE;
     }
     xcb_configure_window(conn_, s.window, mask, geo);
+    s.x = r.x;
+    s.y = r.y;
     upload(s, f);
     if (!s.argb) {
-        applyShape(s, f);
+        applyShape(s, f, XCB_SHAPE_SK_BOUNDING); // 输入区随之裁掉
+    } else if (s.overlay) {
+        // 真透明时外形不裁，但阴影 / 圆角外的透明处不该接住点击（点到的是下面的应用）。
+        applyShape(s, f, XCB_SHAPE_SK_INPUT);
     }
     if (!s.mapped) {
+        if (s.overlay) {
+            // 悬停基线取「出现那一刻」的指针位置：弹在静止指针下不算悬停（见 HoverGate）。
+            s.hovered = false;
+            if (auto* p = xcb_query_pointer_reply(conn_, xcb_query_pointer(conn_, screen_->root),
+                                                  nullptr)) {
+                s.gate.rebase(p->root_x, p->root_y);
+                std::free(p);
+            }
+        }
         xcb_map_window(conn_, s.window);
         s.mapped = true;
     }
@@ -338,11 +393,22 @@ bool X11CandidatePanel::present(Surface& s, const SharedFrame& f, const Rect& r,
 void X11CandidatePanel::unmap(Surface& s)
 {
     s.hideTimer.reset();
+    unmapWindow(s);
+}
+
+void X11CandidatePanel::unmapWindow(Surface& s)
+{
     if (conn_ && s.window && s.mapped) {
         xcb_unmap_window(conn_, s.window);
         xcb_flush(conn_);
     }
     s.mapped = false;
+    s.hovered = false;
+    // 拖动中被摘掉（服务端推隐藏帧 / 服务重启）：X 在窗口不可见时自动放掉隐式抓取，不会再有
+    // 松开事件来收尾——就地归位，不报落点（用户没松手，谈不上「摆到了哪」）。
+    if (&s == &overlays_[OVERLAY_KIND_STATUS - 1]) {
+        endDrag(false);
+    }
 }
 
 bool X11CandidatePanel::show(const SharedFrame& f, int32_t x, int32_t y, bool absolute)
@@ -368,6 +434,7 @@ void X11CandidatePanel::hide()
     unmap(cand_);
     rects_.clear();
     hover_ = -1;
+    cancelTipTimers();
     // tooltip 挂在候选窗上：候选窗藏了它必须一起藏（服务端也会推隐藏帧，这里兜底）。
     hideOverlay(OVERLAY_KIND_TOOLTIP);
 }
@@ -397,37 +464,104 @@ bool X11CandidatePanel::showOverlay(uint32_t kind, const SharedFrame& f,
     OverlayFramePayload geo = p;
     geo.width = f.width;
     geo.height = f.height;
-    Rect r = placeOverlay(geo, workArea(), candShiftX_, candShiftY_);
-    present(*s, f, r);
-    s->hideTimer.reset();
-    if (p.durationMs > 0) {
-        s->hideTimer = loop_.addTimeEvent(
-            CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + uint64_t(p.durationMs) * 1000, 0,
-            [this, kind](fcitx::EventSourceTime*, uint64_t) {
-                // 回调里不能销毁正在执行的自己：只摘窗口，计时器对象留到下次 show/hide 再换。
-                if (Surface* o = overlay(kind); o && conn_ && o->window && o->mapped) {
-                    xcb_unmap_window(conn_, o->window);
-                    xcb_flush(conn_);
-                    o->mapped = false;
-                }
-                return true;
-            });
+    Rect r;
+    if (kind == OVERLAY_KIND_STATUS && drag_.active && s->mapped) {
+        // 拖动中：只换像素、不重新落位，免得状态刷新把气泡从指针下拽走（同 Windows
+        // `StatusTip::show` 的 drag_pin 分支）。内容盒偏移变了就按新偏移保住内容左上。
+        r = Rect{s->x + s->geo.contentX - geo.contentX, s->y + s->geo.contentY - geo.contentY,
+                 int32_t(f.width), int32_t(f.height)};
+    } else {
+        r = placeOverlay(geo, workArea(), candShiftX_, candShiftY_);
     }
+    s->geo = geo;
+    present(*s, f, r);
+    armHide(kind);
     return true;
+}
+
+void X11CandidatePanel::armHide(uint32_t kind)
+{
+    Surface* s = overlay(kind);
+    if (!s) {
+        return;
+    }
+    s->hideTimer.reset();
+    // 交互中不计时：交互结束时 refreshHold 再给满一份（同 Windows 的「交互结束重新计时」）。
+    if (s->geo.durationMs <= 0 || !s->mapped || held(kind)) {
+        return;
+    }
+    s->hideTimer = loop_.addTimeEvent(
+        CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + uint64_t(s->geo.durationMs) * 1000, 0,
+        [this, kind](fcitx::EventSourceTime*, uint64_t) {
+            // 回调里不能销毁正在执行的自己：只摘窗口，计时器对象留到下次 show/hide 再换。
+            if (Surface* o = overlay(kind); o && !held(kind)) {
+                unmapWindow(*o);
+            }
+            return true;
+        });
+}
+
+bool X11CandidatePanel::held(uint32_t kind) const
+{
+    const Surface& s = overlays_[kind - 1];
+    switch (kind) {
+    case OVERLAY_KIND_STATUS:
+        return s.hovered || drag_.active || statusMenuHold_;
+    case OVERLAY_KIND_TOAST:
+        return s.hovered;
+    default:
+        return false; // tooltip 常驻到下一帧，去留跟着候选悬停走
+    }
+}
+
+void X11CandidatePanel::refreshHold(uint32_t kind)
+{
+    Surface* s = overlay(kind);
+    if (!s || !s->mapped) {
+        return;
+    }
+    if (held(kind)) {
+        s->hideTimer.reset();
+    } else if (!s->hideTimer) {
+        armHide(kind);
+    }
 }
 
 void X11CandidatePanel::hideOverlay(uint32_t kind)
 {
-    if (Surface* s = overlay(kind)) {
-        unmap(*s);
+    Surface* s = overlay(kind);
+    if (!s) {
+        return;
+    }
+    unmap(*s);
+    if (kind == OVERLAY_KIND_TOOLTIP) {
+        disarm(tipLeave_);
+        // 指针停在提示上时，本端报的悬停一直留在它所属的候选。提示被服务端收掉（又打了字、
+        // 候选刷新了）之后指针不在候选窗上，就没有别的事件会纠正它——下次移回同一个候选时
+        // 会因「与上次报的相同」而不报，提示再也出不来。这里就地忘掉（服务端那边已不在悬停）。
+        if (hover_ >= 0 && !pointerOn(cand_, pointerPosition())) {
+            hover_ = -1;
+            disarm(hoverDefer_);
+        }
     }
 }
 
 void X11CandidatePanel::hideAllOverlays()
 {
+    statusMenuHold_ = false;
+    disarm(statusMenuWait_);
     for (uint32_t k = 1; k <= kOverlayCount; ++k) {
         hideOverlay(k);
     }
+}
+
+std::optional<std::pair<int32_t, int32_t>> X11CandidatePanel::statusContentOrigin() const
+{
+    const Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
+    if (!s.mapped) {
+        return std::nullopt;
+    }
+    return std::make_pair(s.x + s.geo.contentX, s.y + s.geo.contentY);
 }
 
 void X11CandidatePanel::onReadable()
@@ -454,12 +588,29 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
         handleMenuEvent(ev);
         return;
     }
+    // 浮层窗口上的事件：按下 / 松开 / 移动 / 进入 / 离开的 event 字段都在同一偏移（X11 协议里
+    // 这几种事件结构的前 16 字节同形），按 motion 读窗口即可。
+    switch (ev->response_type & 0x7F) {
+    case XCB_BUTTON_PRESS:
+    case XCB_BUTTON_RELEASE:
+    case XCB_MOTION_NOTIFY:
+    case XCB_ENTER_NOTIFY:
+    case XCB_LEAVE_NOTIFY:
+        if (uint32_t k = overlayKindOf(reinterpret_cast<xcb_motion_notify_event_t*>(ev)->event)) {
+            handleOverlayEvent(k, ev);
+            return;
+        }
+        break;
+    default:
+        break;
+    }
     switch (ev->response_type & 0x7F) {
     case XCB_BUTTON_PRESS: {
         auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
         if (e->event != cand_.window) {
             break;
         }
+        disarm(hoverDefer_); // 点下去就以点的这一处为准，别让延后的悬停随后改掉它
         if (e->detail == 1) {
             int32_t idx = hitTest(rects_, e->event_x, e->event_y);
             if (idx != kNoHit && cb_.select) {
@@ -483,11 +634,13 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
         }
         int32_t idx = hitTest(rects_, e->event_x, e->event_y);
         // 悬停只报候选（>=0）：命中表里的 -1/-2 是翻页按钮，而悬停协议里 -1 表示「无」。
-        setHover(idx >= 0 ? idx : -1);
+        candidateHover(idx >= 0 ? idx : -1);
         break;
     }
     case XCB_LEAVE_NOTIFY:
-        setHover(-1);
+        if (reinterpret_cast<xcb_leave_notify_event_t*>(ev)->event == cand_.window) {
+            candidateHover(-1);
+        }
         break;
     case 0: {
         auto* e = reinterpret_cast<xcb_generic_error_t*>(ev);
@@ -501,12 +654,282 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
 
 void X11CandidatePanel::setHover(int32_t index)
 {
+    disarm(hoverDefer_);
     if (index == hover_) {
         return;
     }
     hover_ = index;
     if (cb_.hover) {
         cb_.hover(index);
+    }
+}
+
+} // namespace windlinux
+
+// ── 浮层交互 ──────────────────────────────────────────────────────────
+
+namespace windlinux {
+
+uint32_t X11CandidatePanel::overlayKindOf(xcb_window_t w) const
+{
+    if (w == 0) {
+        return 0;
+    }
+    for (uint32_t k = 1; k <= kOverlayCount; ++k) {
+        if (overlays_[k - 1].window == w) {
+            return k;
+        }
+    }
+    return 0;
+}
+
+void X11CandidatePanel::armTimer(std::unique_ptr<fcitx::EventSourceTime>& t, uint32_t ms,
+                                 void (X11CandidatePanel::*fn)())
+{
+    const uint64_t due = fcitx::now(CLOCK_MONOTONIC) + uint64_t(ms) * 1000;
+    if (t) {
+        t->setTime(due);
+        t->setOneShot();
+        return;
+    }
+    t = loop_.addTimeEvent(CLOCK_MONOTONIC, due, 0,
+                           [this, fn](fcitx::EventSourceTime*, uint64_t) {
+                               (this->*fn)();
+                               return true;
+                           });
+}
+
+bool X11CandidatePanel::pointerOn(const Surface& s,
+                                  const std::optional<std::pair<int32_t, int32_t>>& p) const
+{
+    return p && s.mapped && rectContains(rectOf(s), p->first, p->second);
+}
+
+void X11CandidatePanel::cancelTipTimers()
+{
+    disarm(hoverDefer_);
+    disarm(tipLeave_);
+}
+
+void X11CandidatePanel::candidateHover(int32_t raw)
+{
+    if (raw == hover_) {
+        disarm(hoverDefer_); // 回到了原处：待报的变化作废
+        return;
+    }
+    const bool tipShown = overlays_[OVERLAY_KIND_TOOLTIP - 1].mapped;
+    const uint32_t ms = hoverDeferMs(hover_, raw, tipShown);
+    if (ms == 0) {
+        setHover(raw);
+        return;
+    }
+    // 已在等：只换目标、不顺延（去往「无」的宽限不能被一路擦过的候选无限拖长）。
+    pendingHover_ = raw;
+    if (!armed(hoverDefer_)) {
+        armTimer(hoverDefer_, ms, &X11CandidatePanel::onHoverDeferred);
+    }
+}
+
+void X11CandidatePanel::onHoverDeferred()
+{
+    // 到期时指针已在提示上：撤掉这次变化，悬停留在提示所属的候选（Windows resolve_deferred）。
+    if (pointerOn(overlays_[OVERLAY_KIND_TOOLTIP - 1], pointerPosition())) {
+        return;
+    }
+    setHover(pendingHover_);
+}
+
+void X11CandidatePanel::onTipLeaveGrace()
+{
+    if (menuOpen()) {
+        return; // 菜单开着：去留等菜单收起时 resyncAfterMenu 再定
+    }
+    const auto p = pointerPosition();
+    const bool onCand = pointerOn(cand_, p);
+    const int32_t hit = onCand ? hitTest(rects_, p->first - cand_.x, p->second - cand_.y) : kNoHit;
+    const int32_t h =
+        tipRecheckHover(pointerOn(overlays_[OVERLAY_KIND_TOOLTIP - 1], p), onCand, hit, hover_);
+    if (h != kKeepHover) {
+        setHover(h);
+    }
+}
+
+void X11CandidatePanel::handleOverlayEvent(uint32_t kind, xcb_generic_event_t* ev)
+{
+    Surface& s = overlays_[kind - 1];
+    switch (ev->response_type & 0x7F) {
+    case XCB_BUTTON_PRESS: {
+        auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
+        switch (overlayPressAction(kind, e->detail)) {
+        case OverlayPress::Drag:
+            drag_.active = true;
+            drag_.grabDx = e->root_x - s.x;
+            drag_.grabDy = e->root_y - s.y;
+            setDragCursor(true);
+            refreshHold(kind);
+            break;
+        case OverlayPress::Menu:
+            if (kind == OVERLAY_KIND_TOOLTIP) {
+                cancelTipTimers(); // 菜单开着期间提示去留等菜单收起再定
+            } else {
+                // 请求到菜单出现之间也不能让气泡到点消失；菜单若没来（服务没了），兜底放开。
+                statusMenuHold_ = true;
+                armTimer(statusMenuWait_, 2000, &X11CandidatePanel::onStatusMenuWaitExpired);
+                refreshHold(kind);
+            }
+            if (cb_.overlayMenu) {
+                cb_.overlayMenu(overlayMenuTarget(kind), e->root_x, e->root_y, e->event_x,
+                                e->event_y);
+            }
+            break;
+        case OverlayPress::Close:
+            WIND_DEBUG() << s.instance << " 被点击，提前收起";
+            unmap(s);
+            break;
+        case OverlayPress::None:
+            break;
+        }
+        break;
+    }
+    case XCB_BUTTON_RELEASE: {
+        auto* e = reinterpret_cast<xcb_button_release_event_t*>(ev);
+        if (kind == OVERLAY_KIND_STATUS && e->detail == 1) {
+            moveDrag(e->root_x, e->root_y);
+            endDrag(true);
+        }
+        break;
+    }
+    case XCB_MOTION_NOTIFY: {
+        auto* e = reinterpret_cast<xcb_motion_notify_event_t*>(ev);
+        if (kind == OVERLAY_KIND_STATUS && drag_.active) {
+            if (!(e->state & XCB_KEY_BUT_MASK_BUTTON_1)) {
+                endDrag(true); // 松开事件丢了（按住期间窗口被重建等）：按当下位置收尾
+            } else {
+                moveDrag(e->root_x, e->root_y);
+            }
+            break;
+        }
+        if (kind == OVERLAY_KIND_TOOLTIP) {
+            cancelTipTimers(); // 指针在提示上：待报的悬停变化与离开宽限都作废
+        }
+        if (s.gate.accept(e->root_x, e->root_y) && !s.hovered) {
+            s.hovered = true;
+            refreshHold(kind);
+        }
+        break;
+    }
+    case XCB_ENTER_NOTIFY:
+        if (kind == OVERLAY_KIND_TOOLTIP) {
+            cancelTipTimers();
+        }
+        break;
+    case XCB_LEAVE_NOTIFY: {
+        auto* e = reinterpret_cast<xcb_leave_notify_event_t*>(ev);
+        // 抓取引起的离开（菜单抓指针）不是指针离开；移进自己的子窗口也不是（浮层没有子窗口）。
+        if (e->mode != XCB_NOTIFY_MODE_NORMAL || e->detail == XCB_NOTIFY_DETAIL_INFERIOR) {
+            break;
+        }
+        if (kind == OVERLAY_KIND_TOOLTIP) {
+            if (hover_ >= 0) {
+                armTimer(tipLeave_, kTipGraceMs, &X11CandidatePanel::onTipLeaveGrace);
+            }
+        } else if (!drag_.active || kind != OVERLAY_KIND_STATUS) {
+            s.hovered = false;
+            refreshHold(kind); // 交互结束：重新给满一份时长
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void X11CandidatePanel::moveDrag(int32_t rootX, int32_t rootY)
+{
+    Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
+    if (!drag_.active || !conn_ || !s.window || !s.mapped) {
+        return;
+    }
+    const Rect r = dragOverlay(rootX, rootY, drag_.grabDx, drag_.grabDy, s.geo, workArea());
+    if (r.x == s.x && r.y == s.y) {
+        return;
+    }
+    const uint32_t xy[] = {uint32_t(r.x), uint32_t(r.y)};
+    xcb_configure_window(conn_, s.window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, xy);
+    xcb_flush(conn_);
+    s.x = r.x;
+    s.y = r.y;
+}
+
+void X11CandidatePanel::endDrag(bool report)
+{
+    if (!drag_.active) {
+        return;
+    }
+    drag_.active = false;
+    setDragCursor(false);
+    Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
+    // 松手就报（同 Windows WM_LBUTTONUP，没挪也报）：固定位置模式下它就是新的落点，跟随光标
+    // 模式下服务端不落盘——判据只在服务端（`save_status_tip_pos`）。
+    if (report && s.mapped && cb_.statusMoved) {
+        WIND_DEBUG() << "状态气泡拖动松手，上报内容左上 (" << s.x + s.geo.contentX << ","
+                     << s.y + s.geo.contentY << ")";
+        cb_.statusMoved(s.x + s.geo.contentX, s.y + s.geo.contentY);
+    }
+    refreshHold(OVERLAY_KIND_STATUS);
+}
+
+void X11CandidatePanel::setDragCursor(bool on)
+{
+    Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
+    if (!conn_ || !s.window) {
+        return;
+    }
+    if (on && !dragCursor_) {
+        // 光标字体里的 fleur（四向箭头，XC_fleur = 52，掩码是下一个字形），同 Windows IDC_SIZEALL。
+        xcb_font_t font = xcb_generate_id(conn_);
+        xcb_open_font(conn_, font, 6, "cursor");
+        dragCursor_ = xcb_generate_id(conn_);
+        xcb_create_glyph_cursor(conn_, dragCursor_, font, font, 52, 53, 0, 0, 0, 0xFFFF, 0xFFFF,
+                                0xFFFF);
+        xcb_close_font(conn_, font);
+    }
+    const uint32_t cursor = on ? dragCursor_ : uint32_t(XCB_NONE);
+    xcb_change_window_attributes(conn_, s.window, XCB_CW_CURSOR, &cursor);
+    xcb_flush(conn_);
+}
+
+void X11CandidatePanel::onStatusMenuWaitExpired()
+{
+    if (menuOpen()) {
+        return; // 菜单来了：它收起时再放开
+    }
+    statusMenuHold_ = false;
+    refreshHold(OVERLAY_KIND_STATUS);
+}
+
+void X11CandidatePanel::resyncAfterMenu()
+{
+    statusMenuHold_ = false;
+    disarm(statusMenuWait_);
+    const auto p = pointerPosition();
+    // 悬停提示：指针在它上面就留下，否则按指针处重定候选悬停（Windows `set_menu_open(false)`：
+    // 光标在气泡上留下、否则隐藏）。
+    const bool onCand = pointerOn(cand_, p);
+    const int32_t hit = onCand ? hitTest(rects_, p->first - cand_.x, p->second - cand_.y) : kNoHit;
+    const int32_t h =
+        tipRecheckHover(pointerOn(overlays_[OVERLAY_KIND_TOOLTIP - 1], p), onCand, hit, hover_);
+    if (h != kKeepHover) {
+        setHover(h);
+    }
+    // 气泡 / Toast：菜单开着期间收不到它们的移动与离开，按指针的真实位置重定悬停，再恢复计时。
+    for (uint32_t k : {OVERLAY_KIND_STATUS, OVERLAY_KIND_TOAST}) {
+        Surface& s = overlays_[k - 1];
+        s.hovered = pointerOn(s, p);
+        if (p) {
+            s.gate.rebase(p->first, p->second);
+        }
+        refreshHold(k);
     }
 }
 
@@ -547,6 +970,10 @@ bool X11CandidatePanel::showMenuLevel(uint32_t level, const SharedFrame& f,
     if (first) {
         grabAttempts_ = 0;
         grabPointer();
+        // 菜单开着期间指针事件只进菜单：悬停提示的延后 / 宽限到期也不该来动它（去留等菜单收起）。
+        menuActive_ = true;
+        cancelTipTimers();
+        disarm(statusMenuWait_); // 气泡的菜单来了，保持改由菜单收起来放开
     }
     armMenuIdle();
     return true;
@@ -585,6 +1012,10 @@ void X11CandidatePanel::dropMenu(bool fromIdleTimer)
     pendingMotion_.reset();
     if (!fromIdleTimer) {
         menuIdle_.reset();
+    }
+    if (menuActive_) {
+        menuActive_ = false;
+        resyncAfterMenu();
     }
 }
 
