@@ -159,9 +159,10 @@ impl Coordinator {
         owners
     }
 
-    /// 通配键此刻在会话表里的身份名（`None` = 会话表没占它）。组码中（[`Self::wildcard_mid_owners`]）
-    /// 与反查模式内（[`Self::reverse_wildcard_conflicts`]）共用：两处的导航都走
-    /// `session_action_for(.., include_printable = true)`。
+    /// 通配键此刻在会话表里的身份名（`None` = 会话表没占它），组码中（[`Self::wildcard_mid_owners`]）用。
+    ///
+    /// ⚠️ 反查模式内**不能**用它：组码中选词 / 以词定字键会让通配让位，是冲突；反查模式里
+    /// 它们不被导航吃掉，见 [`Self::reverse_wildcard_conflicts`]。
     fn wildcard_session_owner(&self, vk: u32, shift: bool) -> Option<&'static str> {
         use wind_config::{AuxCodeShare, SessionAction};
         match self.session_action_for(vk, shift, true)? {
@@ -278,8 +279,8 @@ impl Coordinator {
     /// 反查模式内的通配键冲突（只告警）。空 = 无冲突或反查模式不可用。
     ///
     /// 模式内的按键处理（`handle_special_key`）里导航 `handle_candidate_nav` 排在符号通配键
-    /// 进缓冲之前：通配键若同时是翻页 / 选词 / 高亮等会话键，按下去先被导航吃掉，模式里
-    /// 就再也打不出通配。按键顺序不改（改了就是另一侧的键失灵），由体检报出，让用户换键。
+    /// 进缓冲之前：通配键若同时是翻页 / 高亮 / 取消等会被导航消费的会话键，按下去先被吃掉，
+    /// 模式里就再也打不出通配。按键顺序不改（改了就是另一侧的键失灵），由体检报出，让用户换键。
     ///
     /// 与 [`Self::wildcard_conflicts`] 分开：那边只在通配主开关开时有意义，本模式不看主开关；
     /// 且组码中的冲突会让位（通配不可用），这边是导航先吃（同样不可用，但成因不同）。
@@ -294,7 +295,28 @@ impl Coordinator {
         else {
             return Vec::new();
         };
-        self.wildcard_session_owner(vk, shift).into_iter().collect()
+        use wind_config::{AuxCodeShare, SessionAction};
+        // 只报 `apply_session_action` **真正消费**的动作。选词 / 以词定字它刻意返回 None
+        // （落到各自消费点，而反查的符号通配键臂排在选词臂之前）；独立辅助码的
+        // `enter_aux_code` 在 overlay 模式里拒绝、同样返回 None——这三类键在模式内照常
+        // 作通配进缓冲，报出来是误报。共键 `aux_code:page_next` 被拒后降级为翻页，照吃。
+        let owner = match self.session_action_for(vk, shift, true) {
+            Some(SessionAction::PagePrev | SessionAction::PageNext) => Some("翻页键"),
+            Some(SessionAction::AuxCode(AuxCodeShare::PageNext)) => Some("辅助码/翻页键"),
+            Some(SessionAction::HighlightUp | SessionAction::HighlightDown) => Some("高亮键"),
+            Some(SessionAction::Cancel) => Some("取消键"),
+            Some(SessionAction::CommitHighlighted) => Some("上屏键"),
+            Some(SessionAction::Command(_)) => Some("命令键"),
+            Some(SessionAction::SingleChar(_)) => Some("单字键"),
+            Some(
+                SessionAction::SelectCandidate(_)
+                | SessionAction::SelectChar(_)
+                | SessionAction::AuxCode(AuxCodeShare::Solo)
+                | SessionAction::None,
+            )
+            | None => None,
+        };
+        owner.into_iter().collect()
     }
 
     fn wildcard_is_configured_code_char(&self, key: char) -> bool {

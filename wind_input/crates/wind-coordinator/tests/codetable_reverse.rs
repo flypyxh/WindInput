@@ -12,6 +12,7 @@ const VK_ESCAPE: u32 = 0x1B;
 const VK_NEXT: u32 = 0x22;
 const VK_BACK: u32 = 0x08;
 const VK_OEM_MINUS: u32 = 0xBD;
+const VK_OEM_1: u32 = 0xBA;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -337,7 +338,9 @@ fn reverse_wildcard_key_on_nav_key_is_reported() {
         Coordinator::new_headless(cfg, Some(&data_dir())).reverse_wildcard_conflicts()
     };
     assert_eq!(with_key("-", true), vec!["翻页键"]);
-    assert_eq!(with_key(";", true), vec!["次选键"]);
+    // 选词键不是冲突：`apply_session_action` 对选词 / 以词定字 / 独立辅助码返回 None 不吃键，
+    // 随后反查的符号通配键臂排在选词臂之前，`;` 照常进缓冲（下方实跑）。
+    assert!(with_key(";", true).is_empty(), "次选键不吃键，不报");
     assert!(with_key("z", true).is_empty(), "对照：出厂 z 无冲突");
     assert!(with_key("-", false).is_empty(), "对照：总开关关不报");
 
@@ -350,4 +353,14 @@ fn reverse_wildcard_key_on_nav_key_is_reported() {
     key(&c, VK_OEM_MINUS, false);
     assert_eq!(c.debug_active_mode(), Some("reverse"));
     assert_eq!(c.debug_preedit(), "\\a", "`-` 被导航吃掉，没进缓冲");
+
+    // 对照：次选键 `;` 作通配键时在模式内照常进缓冲。
+    let mut cfg = wubi_rev();
+    cfg.schema.codetable.wildcard_key = ";".into();
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    letters(&c, "a");
+    key(&c, VK_OEM_1, false);
+    assert_eq!(c.debug_active_mode(), Some("reverse"));
+    assert_eq!(c.debug_preedit(), "\\a;", "`;` 作通配进了缓冲");
 }

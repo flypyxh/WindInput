@@ -2778,7 +2778,8 @@ impl Coordinator {
         coordinator.notify_toolbar();
         // 码元集与按键功能的冲突体检（只告警）。默认字符集下直接返回，无开销。
         coordinator.warn_code_char_conflicts();
-        // 通配键与既有按键功能的冲突体检（只告警）。通配关闭时直接返回。
+        // 通配键与既有按键功能的冲突体检（只告警）：先查反查模式内的通配键（不看通配主开关，
+        // 反查模式不可用时跳过），再查组码中的通配键（通配关闭时跳过）。
         coordinator.warn_wildcard_conflicts();
         // 档位循环触发键的撞车体检（只告警）。出厂不配 ⇒ 默认直接返回。
         coordinator.warn_english_case_cycle_conflict();
