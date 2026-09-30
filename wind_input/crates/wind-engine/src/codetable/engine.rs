@@ -217,6 +217,9 @@ pub struct CommitOptions {
     /// 通配键（`[engine.codetable].wildcard` + `.wildcard_key` 折叠后；关闭或键非法为 `None`）。
     /// 引擎只拿它回答 [`Engine::wildcard_key`]；哪几位作通配由协调器定，见 `convert_wildcard`。
     pub wildcard: Option<char>,
+    /// 通配结果只留单字（字素簇）。行内通配与反查模式共用 `wildcard_query`，二者同受约束。
+    /// 见 reverse-mode spec §2。
+    pub wildcard_single_only: bool,
 }
 
 /// 码表引擎
@@ -648,6 +651,58 @@ fn decide_auto_commit(
     Some(first.text.clone())
 }
 
+impl CodeTableEngine {
+    /// 通配查询内核（行内通配与反查模式共用）。语义见 `convert_wildcard`。
+    fn wildcard_query(&self, input: &str, pattern: &str, max_candidates: usize) -> ConvertResult {
+        let n = pattern.chars().count();
+        let with_prefix = !self.opts.single_code_input;
+        // 按协调器给的上限查（spec §11），硬上限兜底。⚠️ 永不向 `search_pattern` 传 0：
+        // Composite 把 0 当「不限」、各层把 0 当「空」，两边语义不一致。
+        let limit = max_candidates.min(WILDCARD_RESULT_LIMIT);
+        let mut hits: Vec<Candidate> = Vec::new();
+        if limit > 0 {
+            // ★ 词库层自己按 `fetch` 截断（各层两档取额），过滤只能在它之后。仅单字时不够就 ×2 重取，
+            // 直到够数 / 取尽 / 硬上限（计划裁决 1，同生僻字模式的 refill）。关着时只查一轮 ⇒ 与原实现逐条相同。
+            let mut fetch = limit;
+            loop {
+                let got =
+                    self.dm
+                        .search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix);
+                let exhausted = got.len() < fetch;
+                hits = got;
+                if !self.opts.wildcard_single_only {
+                    break;
+                }
+                hits.retain(|c| wind_candidate::single_markable_char(&c.text).is_some());
+                if hits.len() >= limit || exhausted || fetch >= WILDCARD_RESULT_LIMIT {
+                    break;
+                }
+                fetch = fetch.saturating_mul(2).min(WILDCARD_RESULT_LIMIT);
+            }
+        }
+        let mut candidates: Vec<Candidate> = hits
+            .into_iter()
+            .map(|mut c| {
+                c.source = CandidateSource::CodeTable;
+                c.is_exact_code = c.code.chars().count() == n;
+                c.comment = c.code.clone();
+                c.is_wildcard = true;
+                c
+            })
+            .collect();
+        let base_cmp = self.opts.base_sort.cmp();
+        candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
+        candidates.truncate(limit);
+        let is_empty = candidates.is_empty();
+        ConvertResult {
+            candidates,
+            preedit_display: input.to_string(),
+            is_empty,
+            ..Default::default()
+        }
+    }
+}
+
 impl Engine for CodeTableEngine {
     /// 热插拔扩展词库。**禁用摘层、启用交给重建**，两边不对称，各有理由：
     ///
@@ -911,37 +966,7 @@ impl Engine for CodeTableEngine {
         max_candidates: usize,
     ) -> Option<ConvertResult> {
         self.opts.wildcard?;
-        let n = pattern.chars().count();
-        let with_prefix = !self.opts.single_code_input;
-        // 按协调器给的上限查（spec §11），硬上限兜底。⚠️ 永不向 `search_pattern` 传 0：
-        // Composite 把 0 当「不限」、各层把 0 当「空」，两边语义不一致。
-        let limit = max_candidates.min(WILDCARD_RESULT_LIMIT);
-        let hits = if limit == 0 {
-            Vec::new()
-        } else {
-            self.dm
-                .search_pattern(pattern, wind_dict::WILDCARD_SLOT, limit, with_prefix)
-        };
-        let mut candidates: Vec<Candidate> = hits
-            .into_iter()
-            .map(|mut c| {
-                c.source = CandidateSource::CodeTable;
-                c.is_exact_code = c.code.chars().count() == n;
-                c.comment = c.code.clone();
-                c.is_wildcard = true;
-                c
-            })
-            .collect();
-        let base_cmp = self.opts.base_sort.cmp();
-        candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
-        candidates.truncate(limit);
-        let is_empty = candidates.is_empty();
-        Some(ConvertResult {
-            candidates,
-            preedit_display: input.to_string(),
-            is_empty,
-            ..Default::default()
-        })
+        Some(self.wildcard_query(input, pattern, max_candidates))
     }
 
     /// natural 模式（`base_sort = "natural"`）忽略权重：协调器据此对齐 `by_natural` 重排。
@@ -2568,5 +2593,74 @@ mod tests {
         assert_eq!(r.candidates.len(), WILDCARD_RESULT_LIMIT, "硬上限兜底");
         let r0 = e.convert_wildcard("zzz", &slot_pattern("???"), 0).unwrap();
         assert!(r0.candidates.is_empty() && r0.is_empty, "max 0 ⇒ 空结果");
+    }
+
+    fn single_only_opts() -> CommitOptions {
+        CommitOptions {
+            wildcard: Some('z'),
+            wildcard_single_only: true,
+            ..Default::default()
+        }
+    }
+
+    /// ★ Review Focus 2：先滤后截。`q??` 下 150 条高权重词组压着 120 条低权重单字：
+    /// 词库层按 limit 截出的前 100 条全是词组，事后过滤只剩 0 条。引擎须加倍重取到凑满。
+    #[test]
+    fn wildcard_single_only_filters_before_truncation() {
+        let mut owned: Vec<(String, String, i32)> = Vec::new();
+        for i in 0..150u32 {
+            let c1 = (b'a' + (i / 26) as u8) as char;
+            let c2 = (b'a' + (i % 26) as u8) as char;
+            owned.push((format!("q{c1}{c2}"), format!("词组{i}"), 10_000 - i as i32));
+        }
+        for i in 0..120u32 {
+            let c1 = (b'a' + (i / 26) as u8) as char;
+            let c2 = (b'a' + (i % 26) as u8) as char;
+            let ch = char::from_u32(0x4E00 + i).unwrap();
+            owned.push((format!("q{c1}{c2}"), ch.to_string(), 1));
+        }
+        let refs: Vec<(&str, &str, i32)> = owned
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let off = engine_opts(&refs, wildcard_opts(CommitOptions::default()));
+        let r = off
+            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
+            .unwrap();
+        assert!(
+            r.candidates.iter().all(|c| c.text.starts_with("词组")),
+            "前置：不过滤时前 100 条全是词组"
+        );
+        let on = engine_opts(&refs, single_only_opts());
+        let r = on
+            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
+            .unwrap();
+        assert_eq!(r.candidates.len(), 100, "过滤后仍凑满 100 条");
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| wind_candidate::single_markable_char(&c.text).is_some())
+        );
+        let r = on
+            .convert_wildcard("qzz", &slot_pattern("q??"), 500)
+            .unwrap();
+        assert_eq!(r.candidates.len(), 120, "词库取尽即停，不死循环");
+    }
+
+    /// 单字判据是字素簇（UAX #29），不是 `chars().count()`：ZWJ 序列、国旗算一个字（issue #83）。
+    #[test]
+    fn wildcard_single_only_counts_grapheme_clusters() {
+        let e = engine_opts(
+            &[
+                ("qa", "👨‍👩‍👧", 40),
+                ("qb", "🇨🇳", 30),
+                ("qc", "工作", 20),
+                ("qd", "工", 10),
+            ],
+            single_only_opts(),
+        );
+        let r = e.convert_wildcard("qz", &slot_pattern("q?"), 50).unwrap();
+        let got: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(got, ["👨‍👩‍👧", "🇨🇳", "工"]);
     }
 }

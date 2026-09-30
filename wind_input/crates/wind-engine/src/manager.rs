@@ -5771,6 +5771,7 @@ impl EngineManager {
                 // 通配：与上屏行为同源于 `eff`（全局基线 + 方案折叠；overlay 方案取内置基线，
                 // 默认关）。非法键在此告警一次并视为关闭，协调器经 `active_wildcard_key` 取用。
                 wildcard: eff.wildcard_char(schema_id),
+                wildcard_single_only: eff.wildcard_single_only,
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。

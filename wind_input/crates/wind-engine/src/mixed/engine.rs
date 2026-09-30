@@ -2492,6 +2492,10 @@ mod tests {
 
     /// 带通配键 `z` 的内存码表（码长 4）。
     fn ct_wildcard(entries: &[(&str, &str, i32)]) -> Box<dyn Engine> {
+        ct_wildcard_with(entries, false)
+    }
+
+    fn ct_wildcard_with(entries: &[(&str, &str, i32)], single_only: bool) -> Box<dyn Engine> {
         let mut d = CodetableDict::empty();
         for (i, (code, text, w)) in entries.iter().enumerate() {
             d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
@@ -2502,6 +2506,7 @@ mod tests {
             4,
             CommitOptions {
                 wildcard: Some('z'),
+                wildcard_single_only: single_only,
                 ..Default::default()
             },
             Arc::new(dm),
@@ -2698,5 +2703,23 @@ mod tests {
             r.candidates.iter().any(|c| c.text == "阿紫"),
             "字面半边照常合并"
         );
+    }
+
+    /// reverse-mode spec §2：混输下仅单字只作用于通配那一侧，字面混输（拼音）的多字词照出。
+    #[test]
+    fn wildcard_single_only_spares_literal_side() {
+        let e = MixedEngine::new(
+            ct_wildcard_with(&[("qa", "甲", 10), ("qb", "乙丙", 20)], true),
+            Some(Box::new(FakePinyinTable {
+                entries: vec![("qz", "阿紫")],
+            })),
+            None,
+            MixConfig::default(),
+        );
+        let r = e.convert_wildcard("qz", &slot("q?"), 50).unwrap();
+        let texts: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"甲"), "{texts:?}");
+        assert!(!texts.contains(&"乙丙"), "通配侧的词组被滤：{texts:?}");
+        assert!(texts.contains(&"阿紫"), "拼音侧多字词不受影响：{texts:?}");
     }
 }
