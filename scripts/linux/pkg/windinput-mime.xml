@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 清风输入法的包文件类型。装到 /usr/share/mime/packages/windinput.xml，shared-mime-info
+     的 dpkg 触发器会重建 MIME 数据库。两种包各一个类型（同 Windows 各一个 ProgId）：
+     文件管理器里要分得出手上是方案还是主题。 -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-windinput-package">
+    <comment>WindInput schema package</comment>
+    <comment xml:lang="zh_CN">清风输入法方案包</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.wpkg"/>
+  </mime-type>
+  <mime-type type="application/x-windinput-theme">
+    <comment>WindInput theme package</comment>
+    <comment xml:lang="zh_CN">清风输入法主题包</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.wtheme"/>
+  </mime-type>
+</mime-info>

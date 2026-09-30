@@ -1,0 +1,13 @@
+[Desktop Entry]
+# 双击方案包（.wpkg）/ 主题包（.wtheme）导入：设置程序按扩展名认包路径参数
+# （wind-setting cli.rs::parse_import_file）。与 windinput-setting.desktop 分开是因为
+# 文件要 %f（本地路径）、协议要 %u（URL），一条 Exec 只能写一种；本条不进应用菜单。
+Type=Application
+Name=清风输入法导入
+Name[en]=WindInput Import
+Exec=/usr/lib/windinput/wind_setting %f
+Icon=windinput
+Terminal=false
+NoDisplay=true
+MimeType=application/x-windinput-package;application/x-windinput-theme;
+StartupWMClass=wind_setting
