@@ -47,7 +47,10 @@ CONTROL
 cat >"$S/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
-echo "清风输入法已安装。请对每个使用者运行一次： windinput-setup   然后注销并重新登录。"
+# 升级时旧服务还在跑旧二进制：结束它，addon 在下次连不上时会自动拉起新版。
+# （已加载进 fcitx5 的旧 addon 需重启 fcitx5 或重新登录才换新。）
+pkill -x wind_input 2>/dev/null || true
+echo "清风输入法已安装。请对每个使用者运行一次： windinput-setup   然后注销并重新登录（升级则重启 fcitx5：fcitx5 -rd）。"
 exit 0
 POSTINST
 chmod 755 "$S/DEBIAN/postinst"
