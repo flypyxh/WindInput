@@ -23,6 +23,19 @@ cd wind_input && cargo build --release -p wind_service --features linux-host
 
 没有 root 的开发机用 `scripts/linux/bootstrap-sdk.sh` 把 Fcitx5 SDK 解到用户目录。
 
+## 安装包（Ubuntu/Debian）
+
+```bash
+scripts/linux/package-deb.sh          # 在 22.04 容器里构建，产物 dist/linux/windinput_<版本>_amd64.deb
+sudo apt install ./windinput_*.deb     # 会带上 fcitx5 及 GTK/Qt 前端
+windinput-setup                        # 每个使用者运行一次：配置 fcitx5、切输入法框架
+# 然后注销并重新登录
+```
+
+必须在 22.04 上构建：更新的发行版编出的产物带 GLIBC_2.38+ 符号和更新的 fcitx5 ABI，22.04 上加载不了。
+服务由 addon 在连不上时自动拉起（`/usr/lib/windinput/wind_input`，可用 `WIND_INPUT_SERVICE` 覆盖），
+服务自己持 flock 单例。
+
 ## 使用
 
 1. 启动服务 `wind_input`（exe 同目录要有 `data/` 词库目录）。socket 在
