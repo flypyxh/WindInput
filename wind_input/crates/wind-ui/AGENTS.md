@@ -26,6 +26,7 @@
 | `src/text/dwrite.rs` | DirectWrite 文本测量/渲染（预乘 alpha 回写 BGRA）+ 非 Windows mock（0.6×em 等宽近似） |
 | `src/text/linux/` | Linux 真字形后端（仅 `linux-host` feature）：ttf-parser + ab_glyph_rasterizer，运行期 dlopen fontconfig；无整形/连字/hinting、无彩色 emoji，限制见 `mod.rs` 模块头。默认形态（feature 关）仍是 mock |
 | `src/overlay_linux.rs` | Linux 外部宿主（仅 `linux-host`）：状态气泡 / Toast / tooltip 在服务进程光栅化，各层一段 SHM + `CMD_OVERLAY_FRAME`，落位规则（首选/备选点、锚点）交 addon 按工作区定。macOS 不走这里（`.app` 原生渲染，收文本帧） |
+| `src/menu_linux.rs` | Linux 外部宿主（仅 `linux-host`）的自绘菜单：**复用 `popup_menu` 整套**，各级像素 → 各自 SHM + `CMD_OVERLAY_FRAME`（`EXACT`），addon 报来的指针事件经 `UiCommand::MenuPointer` 喂回 `PopupMenu::on_pointer`，工作区经 `SetWorkArea` 进 `work_area_of`。收掉可见菜单时回送 `MenuClose`（协调器有几处持 state 锁发 `HideMenu`，靠它复位 `menu_open`） |
 | `src/linux_host.rs` | Linux 外部宿主形态的系统能力（剪贴板 wl-clipboard/xclip、`xdg-open`），全走外部命令 |
 | `src/text/backend.rs` | `TextBackend` trait（measure/draw 抽象） |
 | `src/theme_assets.rs` | 把 wind-theme 的 `RvImage` ref 解析为绝对路径并转 `ViewImage`/`ViewLayer` |

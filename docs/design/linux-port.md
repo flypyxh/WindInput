@@ -27,7 +27,6 @@ addon 只做按键转发、上屏/预编辑写回、候选窗呈现。宿主选 
 | 工具栏 | 后续再考虑类似 macOS 的状态图标 |
 | 软键盘、输入诊断 HUD | Wayland 无法自由定位窗口；HUD 依赖 Windows 专有诊断数据 |
 | 全局热键 | Wayland 无标准方案 |
-| 主菜单 / 候选右键菜单 | 第一阶段不做；之后由**服务光栅化菜单帧自绘**（不走框架菜单） |
 
 ## 3. 平台分层：`ext_presenter` 与 `mock_text`
 
@@ -75,6 +74,36 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
 独立的 SHM 段，`CMD_OVERLAY_FRAME` 只带落位规则与自动隐藏时长；落位（需要屏幕几何）与计时都在
 addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 
+## 5c. 自绘菜单（主菜单 / 候选右键菜单，M3b）
+
+不用 Fcitx5 / 桌面的菜单：与候选窗、浮层同构，服务进程光栅化、addon 贴图，外观与 Windows 同一份。
+
+- **复用 Windows 的 `popup_menu` 整套**（级联状态机、视图树、主题、定位、命中测试、增量重绘）。
+  `wind-ui/src/menu_linux.rs` 只换两头：出——各级像素写各自的 SHM 段（`_MN0`…），推
+  `CMD_OVERLAY_FRAME`（kind = `OVERLAY_KIND_MENU + 级`，落位 `EXACT`）；进——addon 在菜单打开期间
+  **抓住指针**（X11 pointer grab，`owner_events=1`），把移动 / 按下原样报上来（`CMD_MENU_POINTER`
+  0x021B，16 字节），命中测试在服务端做。键盘仍走 `forward_menu_key`（不抓键盘）。
+- **定位在服务端**：翻转、子菜单左右展开、钳制全是 `popup_menu` 的原逻辑（有单测），工作区由
+  addon 随「打开菜单」请求（扩展信封 `menu.open`）报上来；addon 按 `EXACT` 原样摆放、不夹回——
+  两边各算各的，命中就会错位。工作区取整块根窗口（不分显示器，同候选窗）。
+- **入口**：候选窗右键（命中候选 → 候选菜单，空白 / 翻页按钮 → 主菜单，同 Windows）；候选菜单
+  末尾的「更多…」（仅 Linux：没有工具栏 / 托盘时组字中通往主菜单的路）；**空闲时**是 Fcitx5 状态区
+  动作「清风输入法菜单」——托盘菜单与 kimpanel 面板（KDE / GNOME 扩展）都会列出它，点了主菜单弹在
+  光标下方。选它而不是热键：热键要新增配置字段并同步设置端（两仓联动），而状态区是 Fcitx5 上
+  输入法功能的惯常位置、零配置；状态气泡对鼠标透明、只短暂出现，改成可点会牵动浮层的整套设计。
+  代价是依赖 Fcitx5 的 UI 模块（classicui 托盘 / kimpanel）在场，**菜单本身**仍是自绘的。
+- **按平台摘掉的主菜单项**（`build_main_menu_items`）：工具栏 / 状态图标开关（addon 不接
+  `CMD_MODE_STATUS`）、软键盘（`open_softkeyboard` 在 Linux 直接拒绝）、「截图所有窗口到文件」
+  （依赖宿主回应 `shot.panel` 才出结果 Toast，addon 不接）、输入诊断 HUD（同 macOS）。
+- **关闭路径**：Esc / 点选 / 右键 / 点菜单外（抓指针看得见）/ 其它键（关并吞掉）走服务端
+  `popup_menu`；失焦与切换输入上下文（addon `deactivate` 无条件收并报 `menu.dismiss`，服务端
+  FocusLost 另有一条带 250ms 守卫的）；候选被清空 / 组合结束（候选右键菜单随候选收起，
+  `notify_ui_hide`；组合被终止等直接复位的路径补发 `HideMenu`）；服务被杀（push 断线，addon 自收）、
+  服务重启（`SERVICE_READY`，addon 自收并补报）；addon 断线（UDS 连接断开，服务端复位）；空闲超时
+  （addon 60 秒无操作自收并报；服务端另有同时长的兜底：超时后的第一个键照常处理、不被吞）。
+  两端认识错开时自愈：菜单不在屏上却收到菜单键 / 指针事件，UI 回送 `MenuClose`；菜单已关却收到
+  指针事件，服务端让 UI 收菜单。e2e 逐条覆盖，每条之后立即打字验证。
+
 ## 6. 阶段
 
 | 阶段 | 内容 | 状态 |
@@ -85,7 +114,7 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 | M1c | addon 的 X11 候选窗呈现、鼠标回传；状态气泡 / Toast / tooltip 光栅浮层 | 进行中 |
 | M2 | Wayland：Fcitx5 UI addon + input popup surface；先做 spike 验证 popup 表面能否收鼠标事件 | 待做 |
 | M3a | 设置端适配：`wind-setting` Linux 原生构建、平台门控、addon 处理 `settings.open`、`.desktop` 入口、随 `.deb` 分发 | 完成（见 §6b） |
-| M3b | 自绘菜单（主菜单 / 候选右键菜单） | 待做 |
+| M3b | 自绘菜单（主菜单 / 候选右键菜单），见 §5c | 完成（X11） |
 
 ## 6b. 设置端（M3a 结论）
 
@@ -109,7 +138,9 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 ## 7. 待验证的风险
 
 1. Wayland input popup 表面是否收得到鼠标事件（决定候选点选/悬停/自绘菜单是否成立），GNOME 与 KDE 可能不同。
-2. 自绘菜单在 Wayland 下只能画进候选窗自己的表面；菜单外点击不可观测，
-   `menu_open` 期间协调器会吞方向键/回车/Esc，**必须有 Esc、焦点丢失、候选清空、超时四条兜底关闭**，
-   否则输入永久卡死（macOS 已踩过）。
+2. 自绘菜单在 Wayland 下只能画进候选窗自己的表面；菜单外点击不可观测（X11 靠指针抓取）。
+   `menu_open` 期间协调器会吞方向键/回车/Esc——X11 已按 §5c 补齐全部关闭路径并逐条 e2e；
+   Wayland 阶段要重新验证每一条（尤其没有抓取时的「点菜单外」只能退回失焦 / 超时）。
+   另：抓指针期间点菜单外，那一下被菜单吃掉、不传给下面的应用（同 X11 原生菜单，与 Windows
+   「点外面照常响应」不同）。
 3. `wind-coordinator` 在 macOS 目标上依赖 C 库，本机无法交叉 check，改动靠 CI 的 macOS job 兜底。

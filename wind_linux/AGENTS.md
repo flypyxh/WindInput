@@ -20,9 +20,10 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/ResponseRouter.h` + `src/core/ResponseRouter.cpp` | 响应帧 → 宿主操作。Swift `BridgeResponseRouter` 的逐条移植（待定标点 / 定格前缀 / hold 计时器 / 数字后智能标点记账） |
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
+| `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、状态区入口锚点、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
 | `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |
-| `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮回传、浮层自动隐藏计时 |
+| `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层 + 自绘菜单：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮/右键回传、浮层自动隐藏计时、菜单打开期间抓指针并回报 |
 | `data/*.conf.in` | addon / 输入法描述文件模板（构建时生成到 `build/…/share/fcitx5/`） |
 | `tests/*_test.cpp` | 纯 C++17 单测（不需要 Fcitx5），与 `wind_tsf/tests` 同风格 |
 
@@ -158,6 +159,24 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 - **隐藏**：服务端对某层推 `FLAG_VISIBLE` 缺席的帧；候选窗隐藏时 tooltip 两端都会藏（服务推隐藏帧，
   `hide()` 也兜底藏）。`SERVICE_READY` 时关掉三层 SHM 映射并藏掉全部浮层。
 
+## 自绘菜单（X11）
+
+设计与关闭路径全表见 `docs/design/linux-port.md` §5c。本端要点：
+
+- **每级一窗**：`wind-menu-0`…`wind-menu-5`（WM_CLASS 实例名，e2e 按它找窗），`OVERLAY_PLACE_EXACT`
+  原样摆放、不夹回。只有**新映射**的一级才提到最上；已显示的级只换像素 / 位置、不重排 z 序——
+  否则父菜单一次高亮重绘就会盖住翻到左侧的子菜单（Windows `plan_render` 的同一教训）。
+- **抓指针**：第 0 级出现时 `xcb_grab_pointer(owner_events=1)`，全部收起时放开。抓取期间本连接
+  上的全部指针事件（含候选窗上的）只进菜单：移动按批合并、按下立即报（先把积着的移动报掉保序），
+  松开 / 滚轮 / 离开不报。别的客户端还抓着（刚点完托盘菜单）时每 50ms 重试、最多 1 秒；抓不住菜单
+  照用，只是点菜单外看不见。**不抓键盘**：键要照常经宿主到服务端的 `forward_menu_key`。
+- **本端收菜单并报 `menu.dismiss`**：`deactivate`（失焦 / 换 IC / 切走输入法）、空闲超时、`SERVICE_READY`
+  （补报）。push 断线（服务没了）只收不报。服务端推来的隐藏帧不报（是它关的）。
+- **入口**：候选窗右键 → `menu.open`（带工作区）；状态区动作 `windinput-menu`（「清风输入法菜单」，
+  `activate` 时挂进 `StatusGroup::InputMethod`）→ 主菜单锚在光标左下，宿主没报光标就用指针位置。
+- e2e 的状态区入口靠客户端扮演 kimpanel（持有 `org.kde.impanel`、发 `TriggerProperty`），故
+  fcitx5 要 `--enable` 上 `kimpanel`；菜单用例把空闲超时调到 5 秒以覆盖超时那条路。
+
 ## 与 Windows / macOS 的差距
 
 | 能力 | 现状 | 备注 |
@@ -167,11 +186,12 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | 多显示器 | 未做 | 工作区取整个根窗口，不按 RandR 显示器切分：跨屏边缘的翻转/钳制按整块虚拟屏算 |
 | HiDPI（帧 `scale>1`） | 按物理像素原样贴 | X11 没有逻辑坐标，服务端在 Linux 上目前恒发 scale=1 |
 | 候选窗拖动 / 固定位置回报（`pos.candidate` / `pos.candidate.query`） | 未接 | 服务端问位置时不答 = 保留旧值（macOS 不可见时也不答，语义安全） |
-| 候选右键菜单 / 统一菜单 | 不做（本阶段） | 后续由服务光栅化菜单帧自绘 |
+| 候选右键菜单 / 功能主菜单 | 已接（X11） | 见上「自绘菜单」。缺：Wayland；多显示器（工作区取整块根窗口）；点菜单外那一下被菜单吃掉（同 X11 原生菜单，Windows 会透传）；菜单开着时在候选上再右键只关菜单、不接着弹新菜单（Windows 会） |
 | tooltip / 状态气泡 / toast | 已接（X11） | 见上「光栅浮层」。缺：气泡/提示的鼠标交互（Windows 可拖动状态气泡、右键菜单、悬停 tooltip 时保持显示）——浮层对鼠标透明；截图类命令（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗 |
 | 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
 | 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
-| 菜单 / 工具栏 / 软键盘 / 输入诊断 HUD | 不做 | 产品决策：与 macOS 精简范围一致。设置端已按平台门控相应设置项（wind-setting README「按平台屏蔽的设置项」） |
+| 工具栏 / 软键盘 / 输入诊断 HUD | 不做 | 产品决策：与 macOS 精简范围一致。设置端已按平台门控相应设置项（wind-setting README「按平台屏蔽的设置项」）；主菜单里的对应项也按平台摘掉 |
+| 截图所有窗口到文件（主菜单「高级」） | 摘掉 | 流程按 macOS「浮层像素在宿主」写：要宿主回应 `shot.panel` 才出结果 Toast，addon 不接。「截图候选窗口到剪贴板」可用 |
 | 按应用独立配置（compat） | 机制可用；**打包时不带 Windows 内置规则**（`scripts/lib/gen-compat.sh linux` 生成「字段说明 + 零规则」的 Linux 版系统层，各平台兼容策略不共用） | 服务按 `FOCUS_GAINED` 的 bundleId（= `InputContext::program()`）匹配规则，同 macOS；设置端的应用兼容性窗口保留 |
 | 打开设置（`settings.open` 扩展信封） | 已接 | `WindEngine::onExt` → `fcitx::startProcess`（双 fork，不留僵尸，继承 fcitx5 的会话环境）。设置程序已开着时由它自己的单实例转发参数；但**转来的切页要等设置窗口下一次输入事件才显示**（windui Linux 后端，冷启动深链正常） |
 | 全局热键 | 不做 | 设置端藏掉热键对话框的「全局」勾选；热键只在输入法激活、有焦点时经按键通路生效 |
