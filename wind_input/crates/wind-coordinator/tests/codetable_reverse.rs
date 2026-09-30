@@ -299,3 +299,23 @@ fn z_key_action_reverse_enters_via_z_fallback() {
         "uia 的等长 + 前缀结果"
     );
 }
+
+/// 放宽后失焦：`reset_exclusive_modes` 必须一并复位 `scope_relaxed`。它的失效点
+/// `expire_scope_override` 只挂在按键出口上，失焦清缓冲不经过它；不复位的话回来后
+/// 打的第一个码（缓冲非空）就继承了上一个焦点里的放宽态。主路 / 临拼同受此缺口影响。
+#[test]
+fn reverse_focus_lost_after_relax_leaves_no_residue() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let c = Coordinator::new_headless(smart_relax(), Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    letters(&c, "hanz");
+    assert!(page_until_relaxed(&c), "前置：已放宽");
+    c.handle_focus_lost(0, wind_bridge::handler::FocusLostReason::Thread);
+    assert_eq!(c.debug_active_mode(), None, "失焦退出反查模式");
+    letters(&c, "a");
+    assert_eq!(c.debug_input_buffer(), "a", "主路径照常组码");
+    assert!(!c.debug_scope_relaxed(), "失焦后的新组码不继承放宽");
+}

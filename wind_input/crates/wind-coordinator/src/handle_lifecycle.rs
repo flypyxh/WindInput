@@ -1104,9 +1104,12 @@ impl Coordinator {
         state.rewind = None;
         state.special_buffer.clear();
         state.special_cursor = 0;
-        // 反查模式会写这两位（翻页扩充的依据）；special 族其余成员不写，对它们是空操作。
+        // 翻页扩充 / 末页放宽三位：反查模式会写（special 族其余成员不写，对它们是空操作），
+        // 主路与临拼也写。`scope_relaxed` 的失效点 `expire_scope_override` 只挂在按键出口，
+        // 失焦等清缓冲的路径不经过它——不在这里复位，回来后的新组码会继承上一个焦点的放宽态。
         state.has_more = false;
         state.candidate_limit = 0;
+        state.scope_relaxed = false;
         // `[overlay]` 段快照随模式一并丢弃。消费点都先判 `active == Special`，残留本不会
         // 被读到——但那条「先判 active」是消费点的实现细节，不是这里可以依赖的契约。
         state.overlay_spec = None;
