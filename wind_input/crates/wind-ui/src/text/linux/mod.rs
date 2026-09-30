@@ -63,6 +63,17 @@ const MEASURE_CACHE_CAP: usize = 4096;
 /// 单个字形位图的边长上限（像素）。超过这个量级的不是 UI 文本，直接不画。
 const MAX_GLYPH_DIM: i32 = 2048;
 
+/// 覆盖 `text` 全部字符的一款字体文件（fontconfig 按 `sans-serif` + 字重 + 简中排序后的第一个）。
+///
+/// 给不走排版、直接读轮廓的调用方（托盘图标 `tray_icon`）用：它要的是**一个**文件，而不是回退链。
+/// 返回（路径, 集合内序号）；fontconfig 不可用或没有字体覆盖全部字符时为 `None`。
+pub(crate) fn font_file_covering(text: &str, weight: u16) -> Option<(std::path::PathBuf, u32)> {
+    fontconfig::sort("sans-serif", weight, "zh-cn")?
+        .into_iter()
+        .find(|c| text.chars().all(|ch| c.has_char(ch)))
+        .map(|c| (c.path.clone(), c.index))
+}
+
 /// 文本渲染器（Linux：fontconfig + ttf-parser + ab_glyph_rasterizer）。
 pub struct TextRenderer {
     /// 全局字族（`ui.font.family`）。

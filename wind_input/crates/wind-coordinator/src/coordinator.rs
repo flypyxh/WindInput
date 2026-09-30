@@ -22,6 +22,9 @@ mod message_handler;
 mod push_config;
 mod state_writer;
 mod status_placement;
+// 单测不碰真实用户目录（`build_status` 每次都会走到它）。
+#[cfg(all(target_os = "linux", ext_presenter, not(test)))]
+mod tray_icon;
 
 // 平移到子模块的项以原路径保真（handle_* 均经 `crate::coordinator::` 引用，勿改回直连）。
 pub(crate) use crate::config_bundle::{ConfigBundle, schema_key_union};
@@ -7165,6 +7168,9 @@ impl Coordinator {
                 .get(self.softkeyboard_page_idx())
                 .is_some_and(|p| p.send_keys);
         let icon_label = self.mode_icon_label(chinese_mode, caps_lock);
+        // Linux：托盘图标按主字运行时渲染，文件必须先于带这个标签的状态帧落盘（见子模块头）。
+        #[cfg(all(target_os = "linux", ext_presenter, not(test)))]
+        self.ensure_tray_icons();
         StatusUpdateData {
             chinese_mode,
             full_width,

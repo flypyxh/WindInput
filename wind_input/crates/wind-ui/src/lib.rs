@@ -70,6 +70,9 @@ pub mod toast;
 pub mod toolbar;
 pub mod toolbar_gate;
 pub mod tooltip;
+/// Linux 托盘 / 面板的模式图标：按主字运行时渲染进用户图标目录，见模块头。
+#[cfg(all(target_os = "linux", feature = "linux-host"))]
+pub mod tray_icon;
 pub mod view;
 /// UI 线程唤醒原语：消息循环据此「睡到有事发生」，取代原先的固定周期轮询。
 pub mod wake;
