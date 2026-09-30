@@ -3246,7 +3246,7 @@ impl Coordinator {
                 false,
             ),
             // 反查模式：**没有落点**，右键只留复制。缓冲是查询串（含通配）而不是码位，规则
-            // 写进去模式内也读不到（`build_reverse_candidates` 不吃候选调整，计划裁决 12），
+            // 写进去模式内也读不到（`build_reverse_candidates` 不吃候选调整），
             // 查询串不含通配键时还会误伤主路同名字面输入；写端照走的话，操作完落到主路
             // `update_candidates`（读恒空的 `input_buffer`），候选窗当场清空而模式还在。
             // 「设为常用字」不需要落点，在 `candidate_op` 的准入之前分派，不受影响。

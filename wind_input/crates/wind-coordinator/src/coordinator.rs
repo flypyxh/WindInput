@@ -4513,7 +4513,7 @@ impl Coordinator {
     }
 
     /// 候选注释反查（`code_rev` / `code` / `code_rev_all` / `code_all`）取不到索引时调：
-    /// 注释范围是「含未启用扩展库」变体才需另建，常规那份由既有预热负责（计划裁决 6）。
+    /// 注释范围是「含未启用扩展库」变体才需另建，常规那份由既有预热负责。
     /// 只派活不等，去重同 [`Self::spawn_index_warm_in`]。
     pub(crate) fn warm_comment_reverse_index(&self) {
         let sid = self.engine_mgr.code_source_schema();

@@ -1170,8 +1170,7 @@ impl EngineManager {
         if primary.is_empty() {
             return Some(String::new()); // 没有主码表＝确定没有编码可显示，不是「没就绪」
         }
-        // 候选注释的 `code` / `code_rev` 走注释反查范围（开关开且方案有未启用扩展库时含它们，
-        // 计划裁决 6）；其余消费方仍只认启用集。
+        // 候选注释的 `code` / `code_rev` 走注释反查范围（开关开且方案有未启用扩展库时含它们）；其余消费方仍只认启用集。
         let v = self.text_codes_in(&primary, self.comment_reverse_scope(&primary));
         if !v.system_ready() {
             return None;
@@ -1309,7 +1308,7 @@ impl EngineManager {
     }
 
     /// 候选注释 `code_all` / `code_rev_all` 用的 [`Self::word_codes_display`]：系统层按
-    /// [`Self::comment_reverse_scope`] 取索引，开关开且方案有未启用扩展库时含它们（计划裁决 6）。
+    /// [`Self::comment_reverse_scope`] 取索引，开关开且方案有未启用扩展库时含它们。
     /// 三态同 `word_codes_display`；`None` 时调用方后台预热 `comment_reverse_scope` 那份。
     pub fn word_codes_display_for_comment(&self, schema_id: &str, text: &str) -> Option<String> {
         if schema_id.is_empty() {
@@ -1336,7 +1335,7 @@ impl EngineManager {
 
     /// 候选注释反查该用哪份索引：`lookup_disabled_dicts` 开、且方案里至少一个扩展库未启用
     /// ⇒ [`ReverseScope::WithDisabled`]；否则 [`ReverseScope::Enabled`]——没有未启用库时
-    /// 两份内容相同，不另建（计划裁决 7）。结果按方案缓存，失效点同 `reverse_index`。
+    /// 两份内容相同，不另建。结果按方案缓存，失效点同 `reverse_index`。
     pub fn comment_reverse_scope(&self, schema_id: &str) -> ReverseScope {
         if schema_id.is_empty() {
             return ReverseScope::Enabled;
@@ -6159,7 +6158,7 @@ impl EngineManager {
     }
 
     /// 影子层（reverse-mode spec §4.2）的来源：本方案**全部**扩展库（主库除外，含已启用的——
-    /// 它们随时可能被热禁用而进影子集合，计划裁决 5）。哪些真正进影子集合由
+    /// 它们随时可能被热禁用而进影子集合）。哪些真正进影子集合由
     /// `DisabledDictLayers` 按「声明 − 本次实际挂进主 dm 的」在查询时算，见
     /// [`Self::disabled_dict_layers`]。用户词库 / 临时词库不在 `[[dictionaries]]` 里，天然不在内。
     ///
@@ -6334,7 +6333,7 @@ impl EngineManager {
     /// reader，故这里几乎零成本：不重新解析、不新增映射。
     ///
     /// `scope = WithDisabled` 时改取 [`Self::all_dict_specs`]（含未启用扩展库，只供候选注释反查的
-    /// 变体索引，计划裁决 6）；加载逻辑两者相同，读不了的库照旧静默略过。
+    /// 变体索引）；加载逻辑两者相同，读不了的库照旧静默略过。
     fn load_dicts_individually(
         schema: &Schema,
         schemas_dir: &Path,
@@ -7085,7 +7084,7 @@ impl EngineManager {
 
 /// 反查索引的范围：常规（只含已启用词库）或「含未启用扩展库」变体。
 ///
-/// 变体只供候选注释反查（`code` / `code_rev` / `code_all` / `code_rev_all`，计划裁决 6）；
+/// 变体只供候选注释反查（`code` / `code_rev` / `code_all` / `code_rev_all`）；
 /// 加词查重、辅助码、悬停、联想、单字全码表一律用 `Enabled`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ReverseScope {
@@ -9729,9 +9728,9 @@ input_chars = \"a-z;\"
         assert_eq!(ids, ["off"]);
     }
 
-    /// Task 8 审查 (a)：实际进影子集合的只有「本次没挂进主 dm 的扩展库」——主库、已加载的扩展库
+    /// 实际进影子集合的只有「本次没挂进主 dm 的扩展库」——主库、已加载的扩展库
     /// 都不读。四个库各放一个独有词，用 `??` 通配把影子层整个掏出来比对；另有一个文件缺失的
-    /// 未启用库，证明 loader 失败只 warn 跳过、不 panic（审查 (b)）。
+    /// 未启用库，证明 loader 失败只 warn 跳过、不 panic。
     #[test]
     fn disabled_dict_layers_load_only_unloaded_extras() {
         let dir = std::env::temp_dir().join(format!("wind-ddl-{}", std::process::id()));

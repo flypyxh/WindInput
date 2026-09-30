@@ -1113,7 +1113,7 @@ impl crate::coordinator::Coordinator {
             // 恰恰是最没用的答案 —— 简码才是用户要的。
             "code_rev_all" | "code_all" => {
                 let sid = self.engine_mgr.code_source_schema();
-                // 空串的理由同上面的 `code_rev`；范围与预热也同它（计划裁决 6）。
+                // 空串的理由同上面的 `code_rev`；范围与预热也同它（含未启用扩展库的变体索引）。
                 let codes = self
                     .engine_mgr
                     .word_codes_display_for_comment(&sid, text)
@@ -1276,7 +1276,7 @@ impl crate::coordinator::Coordinator {
             "code_rev_all" | "code_all" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
                     let sid = self.engine_mgr.code_source_schema();
-                    // 含未启用扩展库与否看注释范围（计划裁决 6）；悬停 `[编码]` 段仍用启用集。
+                    // 含未启用扩展库与否看注释范围（变体索引只供注释反查）；悬停 `[编码]` 段仍用启用集。
                     let codes = self
                         .engine_mgr
                         .word_codes_display_for_comment(&sid, &c.text)
@@ -3299,7 +3299,7 @@ mod comment_reverse_scope_tests {
         );
     }
 
-    /// 打字线路取不到就后台建：变体建好之前，常规那份先建好（两份串行，Task 10 审查 M2）。
+    /// 打字线路取不到就后台建：变体建好之前，常规那份先建好（两份串行，避免首次开开关时两份同时建、内存峰值翻倍）。
     #[test]
     fn warm_comment_reverse_index_builds_regular_then_variant_in_background() {
         use wind_engine::ReverseScope;

@@ -4373,8 +4373,8 @@ impl Coordinator {
         self.hotkey_entry_composition(key_code, display, on)
     }
 
-    /// 反查模式直达热键进入：不设开关、固定走占位 composition（计划裁决 11，与
-    /// `rare_char_via_composition` 出厂值一致）。
+    /// 反查模式直达热键进入：不设开关、固定走占位 composition（与
+    /// `rare_char_via_composition` 出厂值一致，让直达热键与生僻字模式行为同构）。
     pub(crate) fn reverse_entry_composition(&self, key_code: u32, display: String) -> KeyAction {
         self.hotkey_entry_composition(key_code, display, true)
     }

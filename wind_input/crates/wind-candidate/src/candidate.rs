@@ -1574,7 +1574,7 @@ mod wildcard_tier_tests {
         }
     }
 
-    /// reverse-mode spec §4.2 / 计划裁决 4：同一精确档内已启用的排前，未启用库的排后——
+    /// reverse-mode spec §4.2：同一精确档内已启用的排前，未启用库的排后——
     /// 不论权重；但不跨档（未启用的等长仍先于已启用的更长补全）。
     #[test]
     fn disabled_dict_sorts_after_enabled_within_exact_tier() {

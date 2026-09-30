@@ -4,7 +4,7 @@
 //! （`special_buffer` + `handle_special_key` + `exit_special_mode`），本文件只管
 //! 「进入」与「候选怎么来」。候选走 `EngineManager::convert_reverse`（与行内通配同一个
 //! `wildcard_query` 内核、不看 `wildcard` 主开关、只查主码表），再过常用字判定与检索范围
-//! 过滤；**不**自动上屏、**不**做词频重排、**不**吃候选调整（计划裁决 12：通配串不是任何
+//! 过滤；**不**自动上屏、**不**做词频重排、**不**吃候选调整（通配串不是任何
 //! 码位，读侧本就查不中）。
 
 use crate::coordinator::{Coordinator, State};
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(inserted(&act), Some("、"));
     }
 
-    /// 反查模式里的候选调整没有落点（查询串不是码位、模式内也不读 shadow，计划裁决 12）：
+    /// 反查模式里的候选调整没有落点（查询串不是码位、模式内也不读 shadow）：
     /// 右键只留复制。写端若照走，会落到主路 `update_candidates`（读恒空的 `input_buffer`），
     /// 候选窗当场清空而模式还在。
     #[test]

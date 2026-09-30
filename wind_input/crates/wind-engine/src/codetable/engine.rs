@@ -258,7 +258,7 @@ pub struct CodeTableEngine {
     ///
     /// `None`（无 store 的测试 / CLI）⇒ 段候选不做调整，退回纯词库序。
     segment_shadow: Option<(Arc<wind_store::Store>, String)>,
-    /// 影子层：本方案未启用的扩展词库（reverse-mode spec §4.2，计划裁决 3）。
+    /// 影子层：本方案未启用的扩展词库（reverse-mode spec §4.2）。
     ///
     /// ★ **只在 [`Self::wildcard_query`] 读**——普通 `convert`（打字候选、活码探针、顶码、自动上屏复评）
     /// 读它就是把未启用库漏进打字候选，spec §4.2「打字候选不受影响」的保证全靠这一条。
@@ -721,7 +721,7 @@ impl CodeTableEngine {
             })
             .collect();
         let base_cmp = self.opts.base_sort.cmp();
-        // 未启用库的键放在 `cmp_exact_first` 之后（计划裁决 4，与 `candidate_display_order` 同位）：
+        // 未启用库的键放在 `cmp_exact_first` 之后（与 `candidate_display_order` 同位）：
         // 等长 / 更长两档不变，档内先启用后未启用；两条非未启用候选间恒 Equal ⇒ 既有次序不变。
         candidates.sort_by(|a, b| {
             cmp_exact_first(a, b)
@@ -796,7 +796,7 @@ impl Engine for CodeTableEngine {
         // 未启用，关闭三者后「甘蓝菜」仍在。
         self.dm
             .unregister_layer(&format!("codetable-extra-{dict_id}"));
-        // 它从此是「未启用库」：进影子层（通配 / 反查仍可查到），计划裁决 5。
+        // 它从此是「未启用库」：进影子层（通配 / 反查仍可查到）。
         if let Some(d) = &self.disabled_dicts {
             d.mark_disabled(dict_id);
         }
@@ -2802,7 +2802,7 @@ mod tests {
         );
     }
 
-    /// Task 8 审查 (c)：仅单字 + 影子层。影子层的词组同样被滤掉；取尽判据是**双边**的——
+    /// 仅单字 + 影子层。影子层的词组同样被滤掉；取尽判据是**双边**的——
     /// 首轮影子层没取满（35 < 100）但主层取满了（100 条全是词组），必须再取一轮才能把主层
     /// 被截掉的 10 个单字捞回来。若只看任一边就判取尽，结果会只剩影子层那 30 个。
     #[test]
@@ -2881,7 +2881,7 @@ mod tests {
         );
     }
 
-    /// 计划裁决 5：禁用一个已加载的扩展库 ⇒ 主 dm 摘层（普通候选消失），同时它进影子层（通配仍可见）；
+    /// 禁用一个已加载的扩展库 ⇒ 主 dm 摘层（普通候选消失），同时它进影子层（通配仍可见）；
     /// 返回值语义不变（true = 目标态已达成）。
     #[test]
     fn set_dict_enabled_disable_moves_dict_into_disabled_layers() {

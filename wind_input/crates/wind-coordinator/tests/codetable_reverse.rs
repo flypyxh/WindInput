@@ -328,7 +328,7 @@ fn reverse_focus_lost_after_relax_leaves_no_residue() {
     assert!(!c.debug_scope_relaxed(), "失焦后的新组码不继承放宽");
 }
 
-/// 反查模式里 `handle_candidate_nav` 排在通配键进缓冲之前（Task 17 审查 M2）：通配键配成
+/// 反查模式里 `handle_candidate_nav` 排在通配键进缓冲之前：通配键配成
 /// 翻页 / 选词键时模式内它先被导航吃掉，通配进不了缓冲。不改按键顺序，由体检报出。
 /// 对照：出厂通配键 `z` 不报；反查总开关关时不报（模式进不去，谈不上模式内冲突）。
 #[test]

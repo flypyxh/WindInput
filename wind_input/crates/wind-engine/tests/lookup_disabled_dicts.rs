@@ -124,7 +124,7 @@ fn plain_convert_ignores_disabled_extra_with_switch_on() {
     }
 }
 
-/// 计划裁决 5：热禁用已启用扩展库 ⇒ 普通候选消失、通配经影子层仍可见。
+/// 热禁用已启用扩展库 ⇒ 普通候选消失、通配经影子层仍可见。
 #[test]
 fn live_disable_moves_extra_into_lookup() {
     let (m, id, _g) = setup("live", true, true, true);
@@ -151,7 +151,7 @@ fn missing_disabled_file_is_skipped() {
     assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
-/// Task 8 审查 (a)：影子层只收未启用的扩展库——主库、已启用扩展库的命中恒不带未启用标记，
+/// 影子层只收未启用的扩展库——主库、已启用扩展库的命中恒不带未启用标记，
 /// 只有 `_xz` 的带。（`(text, code)` 去重也会遮住误收；判据的直接证明在 manager 单元测试。）
 #[test]
 fn only_disabled_extra_hits_carry_the_flag() {

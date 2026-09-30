@@ -387,7 +387,7 @@ impl Coordinator {
         state.special_prefix.clear();
         state.candidates.clear();
         state.preedit.clear();
-        // 反查模式会写这三位（翻页扩充 / 末页放宽，计划裁决 13），不复位的话退出后主路径
+        // 反查模式会写这三位（翻页扩充 / 末页放宽），不复位的话退出后主路径
         // 翻页会拿残留的 `has_more` 去扩充、下一次组码直接处于放宽态。Special / RareChar
         // 从不写它们，对二者是空操作。
         state.has_more = false;
@@ -564,7 +564,7 @@ impl Coordinator {
     /// 抽出来是因为三个出口此前只有选词这一处记了：标点顶屏与自动上屏只记统计，
     /// 顶屏 / 自动上屏出去的字既不调频、`;` 也重复不出来。
     fn record_special_selection(&self, state: &State, cand: &Candidate) {
-        // 反查模式：缓冲是查询串（含通配）而非码位，记账码取候选**全码**（计划裁决 12，
+        // 反查模式：缓冲是查询串（含通配）而非码位，记账码取候选**全码**（
         // 同主路通配的 `main_freq_code`）；归属 active（`effective_data_schema` 给 None）。
         if matches!(state.active, Some(ModeKind::Reverse)) {
             let code = if cand.code.is_empty() {

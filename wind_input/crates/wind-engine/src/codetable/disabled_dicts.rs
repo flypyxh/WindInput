@@ -1,6 +1,6 @@
 //! 影子层（reverse-mode spec §4.2）：本方案**未启用**的扩展词库，只给码表通配 / 反查查询用。
 //!
-//! 代码里不叫 shadow——本仓「shadow」已专指候选调整（`apply_shadow` / `segment_shadow`），见计划裁决 3。
+//! 代码里不叫 shadow——本仓「shadow」已专指候选调整（`apply_shadow` / `segment_shadow`），避免混淆。
 //!
 //! ★ 与引擎主 `DictManager` 完全分开：影子层自己持一个独立的 `DictManager`，**从不**注册进主 `dm`。
 //! 普通打字（`convert`、活码探针、顶码、自动上屏复评）只查主 `dm`，于是未启用的库无论如何漏不进
@@ -10,8 +10,8 @@
 //! - 构造只登记来源（`declared`）与当前启用集，**不读盘**；
 //! - 首次 [`DisabledDictLayers::search_pattern`] 在锁内逐源加载「声明 − 启用」那些库，失败的
 //!   `warn!` 后跳过（不阻塞、不重试，直到下次失效）；
-//! - 禁用一个启用中的库经 [`DisabledDictLayers::mark_disabled`] 进入影子集合、已加载的作废
-//!   （计划裁决 5）；启用方向不经这里——引擎整体失效重建，影子层随之重建。
+//! - 禁用一个启用中的库经 [`DisabledDictLayers::mark_disabled`] 进入影子集合、已加载的作废；
+//!   启用方向不经这里——引擎整体失效重建，影子层随之重建。
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
