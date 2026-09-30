@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 # Linux 上作为外部宿主（Fcitx5 addon）的服务端：启用 host-render forwarder 与真实文本后端。默认关，
 # 关闭时 Linux 仍是 mock 文本（开发机 `cargo test` 行为不变），见 build.rs 的 `ext_presenter` / `mock_text`。
-linux-host = []
+linux-host = ["dep:ttf-parser", "dep:ab_glyph_rasterizer"]
 
 [dependencies]
 # 表现层协议类型（UiCommand/UiEvent 等）的定义处；本 crate 原路径 pub use 再导出。
@@ -48,6 +48,13 @@ serde_json = { workspace = true }
 windows = { workspace = true, features = ["Win32_System_StationsAndDesktops"] }
 # `#[implement]` 宏展开引用 `::windows_core`，需作为直接依赖（版本随 windows 0.58）。
 windows-core = "0.58"
+
+# Linux（linux-host）：真字形文本后端（text/linux/）。两者都是零依赖纯 Rust；字体查找运行期
+# dlopen 系统 libfontconfig，编译期不链接任何系统库、不要 -dev 包。默认构建不编它们。
+# ttf-parser 取 0.24：resvg 已经拉进同一版本，不多编一份。
+[target.'cfg(target_os = "linux")'.dependencies]
+ttf-parser = { version = "0.24", optional = true }
+ab_glyph_rasterizer = { version = "0.1", optional = true }
 
 # macOS：CoreText 真字形文本后端（text/coretext.rs）。
 # （wind-ipc 已提为通用依赖，manager_macos forwarder 的帧编码照旧可用。）

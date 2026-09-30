@@ -15,3 +15,8 @@ pub mod font_resolve;
 // target_os="macos" 下 re-export 它），让候选窗在 mac 上渲染真实汉字（非 mock 桩）。
 #[cfg(target_os = "macos")]
 pub mod coretext;
+
+// Linux 外部宿主形态（linux-host）：fontconfig + ttf-parser 的真字形后端，同上由 dwrite.rs
+// re-export。不开该 feature 时 Linux 仍是 mock（`mock_text`），开发机测试数值确定。
+#[cfg(all(target_os = "linux", feature = "linux-host"))]
+pub mod linux;

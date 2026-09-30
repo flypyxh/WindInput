@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "ab_glyph_rasterizer"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2722,6 +2728,7 @@ dependencies = [
 name = "wind-ui"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph_rasterizer",
  "anyhow",
  "base64",
  "chrono",
@@ -2740,6 +2747,7 @@ dependencies = [
  "thiserror",
  "tiny-skia",
  "tracing",
+ "ttf-parser",
  "wind-bridge",
  "wind-candidate",
  "wind-config",

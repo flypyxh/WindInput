@@ -142,7 +142,7 @@ const MEASURE_CACHE_CAP: usize = 4096;
 /// ⚠️ 给 [`TextStyle`] 加字段时**必须同步加进这里**——漏一项就是某段文本静默套用另一段
 /// 的宽度。这正是它按整个 `TextStyle` 取参、而非重新罗列各项的原因：字段列表只有一处。
 #[cfg_attr(not(windows), allow(dead_code))]
-fn measure_key(text: &str, ts: &TextStyle) -> u64 {
+pub(crate) fn measure_key(text: &str, ts: &TextStyle) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
@@ -2136,13 +2136,18 @@ mod imp {
 #[cfg(target_os = "macos")]
 pub use crate::text::coretext::TextRenderer;
 
-// Linux 等其余非 Windows 平台：保留 mock 桩（仅供编译/测试，无真实字形）。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+// Linux 外部宿主形态（linux-host）：真字形渲染走 text/linux/。
+#[cfg(all(target_os = "linux", feature = "linux-host"))]
+pub use crate::text::linux::TextRenderer;
+
+// 其余平台（含不开 linux-host 的 Linux）：保留 mock 桩（仅供编译/测试，无真实字形）。
+// `mock_text` 由 build.rs 给出，恰为上面三条 cfg 的补集。
+#[cfg(mock_text)]
 pub use imp::TextRenderer;
 
-/// 非 Windows/非 macOS mock：测量用等宽近似（字符数 × 字号 × 0.6），绘制为空操作。
+/// mock 文本后端：测量用等宽近似（字符数 × 字号 × 0.6），绘制为空操作。
 /// 让候选窗/工具栏/菜单等布局逻辑能在 Linux 上编译与跑测试。
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(mock_text)]
 mod imp {
     use super::{ColorRun, TextMetrics, TextStyle};
     use crate::text::script::FontPlan;
