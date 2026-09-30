@@ -210,12 +210,14 @@ const CURRENT_PLATFORM: &str = if cfg!(windows) {
 };
 
 /// 条目的 `platform` 是否适用于 `current`：缺省 / 空 / `"all"` = 全平台；否则按名字
-/// 比对（大小写不敏感，取值见 system.phrases.toml 文件头）。
+/// 比对（大小写不敏感，取值见 system.phrases.toml 文件头）。`"macos"` 是 `"darwin"`
+/// 的别名——两种叫法在本仓都常见，写哪个都该生效。
 fn platform_matches(platform: Option<&str>, current: &str) -> bool {
     let Some(p) = platform else {
         return true;
     };
     let p = p.to_lowercase();
+    let p = if p == "macos" { "darwin" } else { p.as_str() };
     p.is_empty() || p == "all" || p == current
 }
 
@@ -277,6 +279,17 @@ impl PhraseLayer {
     /// 解析 system.phrases.toml 为原始条目（platform 过滤，默认 weight=1000/position=0）。
     /// 供 coordinator 同步进 store；文件缺失/解析失败 → 空。
     pub fn parse_system_entries(path: &std::path::Path) -> Vec<SystemPhraseEntry> {
+        Self::parse_system_entries_for(path, CURRENT_PLATFORM)
+    }
+
+    /// 同 [`Self::parse_system_entries`]，但按指定平台（`windows` / `darwin` / `linux`）过滤。
+    ///
+    /// 供测试在任一主机上核对**别的平台**看到的条目集——Windows 上的取舍是否与改动前逐条
+    /// 一致，不能只靠 Windows 机器上跑的那份 CI 来回答。
+    pub fn parse_system_entries_for(
+        path: &std::path::Path,
+        platform: &str,
+    ) -> Vec<SystemPhraseEntry> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
@@ -290,7 +303,7 @@ impl PhraseLayer {
         };
         let mut out = Vec::new();
         for r in parsed.phrases {
-            if !platform_matches(r.platform.as_deref(), CURRENT_PLATFORM) {
+            if !platform_matches(r.platform.as_deref(), platform) {
                 continue;
             }
             out.push(SystemPhraseEntry {
@@ -968,6 +981,10 @@ mod tests {
             }
         }
         assert!(platform_matches(Some("Windows"), "windows"));
+        assert!(platform_matches(Some("macos"), "darwin"));
+        assert!(platform_matches(Some("MacOS"), "darwin"));
+        assert!(!platform_matches(Some("macos"), "linux"));
+        assert!(!platform_matches(Some("macos"), "windows"));
         assert!(!platform_matches(Some("linux"), "other"));
     }
 
