@@ -454,6 +454,11 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_wildcard: bool,
+    /// 该候选来自**未启用的扩展词库**（影子层，`DisabledDictLayers`，reverse-mode spec §4.2）。
+    /// 只由码表通配 / 反查查询置位；显示序在同一精确档内把它排在已启用候选之后。
+    /// 引擎内部用，不推送 UI。
+    #[serde(skip)]
+    pub from_disabled_dict: bool,
     /// 前缀补全比**输入自身表达的音节数**多出几个音节（`0` = 音节数恰好对齐 / 非补全候选）。
     ///
     /// 「输入自身表达的音节数」= 完整音节数 + (有尾部残码 ? 1 : 0)，即 `pinyin` 引擎里的
@@ -594,6 +599,7 @@ impl Default for Candidate {
             is_promoted_completion: false,
             is_direct_aux: false,
             is_wildcard: false,
+            from_disabled_dict: false,
             completion_extra_syllables: 0,
             consumed_length: 0,
             boundary: 0,
@@ -905,6 +911,9 @@ pub fn candidate_display_order(
         // 置于层级之后、权重之前：层内分档，不跨层提拔。见 `cmp_completion_extra`。
         .then_with(|| cmp_completion_extra(a, b))
         .then_with(|| cmp_exact_first(a, b))
+        // 全序：按布尔分两区，两条非未启用候选间恒 Equal ⇒ 不改任何既有次序（同 `is_draft` 论证）；
+        // 放在 `cmp_exact_first` 之后 ⇒ 不跨等长 / 更长两档。
+        .then(a.from_disabled_dict.cmp(&b.from_disabled_dict))
         .then(by_source_tier)
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
@@ -1550,5 +1559,46 @@ mod wildcard_tier_tests {
         v.sort_by(|a, b| candidate_display_order(a, b, false, true, "azi"));
         let order: Vec<&str> = v.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(order, ["蒸", "阿紫", "蒸笼"]);
+    }
+
+    fn dd(text: &str, exact: bool, weight: i32, disabled: bool) -> Candidate {
+        Candidate {
+            text: text.into(),
+            code: "uuia".into(),
+            source: CandidateSource::CodeTable,
+            is_exact_code: exact,
+            is_wildcard: true,
+            weight,
+            from_disabled_dict: disabled,
+            ..Default::default()
+        }
+    }
+
+    /// reverse-mode spec §4.2 / 计划裁决 4：同一精确档内已启用的排前，未启用库的排后——
+    /// 不论权重；但不跨档（未启用的等长仍先于已启用的更长补全）。
+    #[test]
+    fn disabled_dict_sorts_after_enabled_within_exact_tier() {
+        let mut v = vec![
+            dd("影等长", true, 9999, true),
+            dd("启更长", false, 9999, false),
+            dd("启等长", true, 1, false),
+        ];
+        v.sort_by(|a, b| candidate_display_order(a, b, false, false, "uuiz"));
+        let got: Vec<&str> = v.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(got, ["启等长", "影等长", "启更长"]);
+    }
+
+    /// 两条都不是未启用库候选时该键恒 Equal ⇒ 既有次序逐条不变。
+    #[test]
+    fn disabled_flag_never_reorders_enabled_candidates() {
+        let a = dd("甲", true, 10, false);
+        let b = dd("乙", true, 20, false);
+        assert_eq!(
+            a.from_disabled_dict.cmp(&b.from_disabled_dict),
+            std::cmp::Ordering::Equal
+        );
+        let mut v = vec![a, b];
+        v.sort_by(|x, y| candidate_display_order(x, y, false, false, "uuiz"));
+        assert_eq!(v[0].text, "乙", "仍按权重");
     }
 }
