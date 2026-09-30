@@ -70,6 +70,22 @@ constexpr bool IsHostDefaultPosition(const RectT& caret, bool hasCompStart, cons
            && SameRect(caret, compRect);
 }
 
+/// 二级降级（拿组合整体矩形的左上角当锚点）能不能走。
+///
+/// 前提是「宿主算完了布局、只是不填高度」：矩形有宽度、落在宿主声明的显示区内。
+///
+/// ★ `hostDefaultPos` 命中时**不走**（2026-09-30）：医疗 HIS/LIS 的 Java 客户端（CUAS 宿主）
+/// 三次查询恒为工作区右下角 (1919,1039,1920,1039)，w=1 同样 > 0；窗口一最大化，显示区
+/// (0,23,1920,1040) 就把这个角点包了进去，越界校验失守，候选窗整场钉在屏幕右缘。流放之路那次
+/// 能挡住只因角点恰好在窗外——越界校验单独挡不住，「三者全同」才是它没在答位置的证据。
+///
+/// ⚠ `hasScreenExt` 为假一律不走（失败关闭），理由见 CaretEditSession.cpp 该级注释。
+constexpr bool AllowCompositionRectFallback(bool hostDefaultPos, bool hasScreenExt, bool hasCompRect,
+                                            long compRectWidth, bool compRectInsideScreenExt)
+{
+    return !hostDefaultPos && hasScreenExt && hasCompRect && compRectWidth > 0 && compRectInsideScreenExt;
+}
+
 /// 「没有插入点」的判决现在还作不作数。
 ///
 /// 判决由 CARET_RETRY 定时器那次异步取坐标作出，用途只有一个：**同一次组合内后续按键

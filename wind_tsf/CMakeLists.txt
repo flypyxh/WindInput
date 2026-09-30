@@ -164,6 +164,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME caret_default_pos_policy COMMAND caret_default_pos_policy_test)
 
+    add_executable(imm_candidate_form_policy_test tests/imm_candidate_form_policy_test.cpp)
+    target_include_directories(imm_candidate_form_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(imm_candidate_form_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME imm_candidate_form_policy COMMAND imm_candidate_form_policy_test)
+
     add_executable(toggle_tap_policy_test tests/toggle_tap_policy_test.cpp)
     target_include_directories(toggle_tap_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

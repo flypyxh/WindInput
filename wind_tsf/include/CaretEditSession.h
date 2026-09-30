@@ -51,6 +51,10 @@ struct AsyncCaretResult
     BOOL hasCompRect;
     // caret 无效时降级用了组合起点顶替。仍属 TSF 语义域（CARET_SRC_TSF_COMPOSITION）。
     BOOL usedCompStartAsCaret;
+    // caret 无效时降级用了宿主经 IMM32 设的候选窗位置（CARET_SRC_IMM_CANDIDATE_FORM）。
+    // 为真时 usedCompStartAsCaret 恒为假，hasCompStart 恒为假（首帧多是上一次组合的旧值，
+    // 报成组合起点会被服务端锁住），见 CaretEditSession.cpp 的三级降级。
+    BOOL usedImmCandidateForm;
     CaretProbeKind kind;
     // 发起时刻的归属标记。Focus 用 _focusSessionId（回调到达时焦点可能已经切走，
     // 那份坐标属于上一个应用）；Composition 不用它，靠 _pComposition 判活。
@@ -83,7 +87,8 @@ public:
                                                  LONG compStartOffset = 0,
                                                  BOOL* pUsedCompStartAsCaret = nullptr,
                                                  RECT* pCompRect = nullptr,
-                                                 BOOL* pHasCompRect = nullptr);
+                                                 BOOL* pHasCompRect = nullptr,
+                                                 BOOL* pUsedImmCandidateForm = nullptr);
 
     // 异步取坐标：用 TF_ES_ASYNCDONTCARE 请求锁，结果经 pOwner->OnAsyncCaretRectReady 回调返回。
     //
@@ -119,6 +124,8 @@ public:
     BOOL GetCompositionRectResult(RECT* prc);
     // 本次是否走了「用组合起点顶替 caret」的降级
     BOOL UsedCompStartAsCaret() const { return _usedCompStartAsCaret; }
+    // 本次是否走了「caret 无效 → 用宿主 IMM32 CANDIDATEFORM 顶替」的三级降级
+    BOOL UsedImmCandidateForm() const { return _usedImmCandidateForm; }
     // 设为异步模式并持有 owner 强引用；见 RequestCaretRectAsync
     void SetAsyncOwner(CTextService* pOwner);
     // 异步回调的用途与归属标记，见 CaretProbeKind / AsyncCaretResult
@@ -139,6 +146,8 @@ private:
     // 本次是否走了「caret 无效 → 用组合起点顶替」的降级路径。用于给上报坐标标注来源：
     // 降级值仍属 TSF 语义域（CARET_SRC_TSF_COMPOSITION），与 GUI 回退有本质区别。
     BOOL _usedCompStartAsCaret;
+    // 本次是否走了三级降级（IMM32 CANDIDATEFORM）。见 DoEditSession 里那一级的注释。
+    BOOL _usedImmCandidateForm;
     // 非空 = 异步模式：DoEditSession 完成后直接回调它，因为异步执行时静态入口早已返回、
     // 调用方拿不到结果。持有强引用（AddRef/Release），避免回调到达前 owner 被销毁。
     CTextService* _pAsyncOwner;

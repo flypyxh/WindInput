@@ -4874,7 +4874,8 @@ static thread_local CTextService* g_holdTimerInstance = nullptr;
 
 // Get caret position using TSF APIs (for browsers and modern apps)
 BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BOOL* pUsedCompStart,
-                                           RECT* pCompRect, BOOL* pHasCompRect, BOOL* pIsDefaultPos)
+                                           RECT* pCompRect, BOOL* pHasCompRect, BOOL* pIsDefaultPos,
+                                           BOOL* pUsedImmCandidateForm)
 {
     if (pUsedCompStart)
     {
@@ -4883,6 +4884,10 @@ BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BO
     if (pIsDefaultPos)
     {
         *pIsDefaultPos = FALSE;
+    }
+    if (pUsedImmCandidateForm)
+    {
+        *pUsedImmCandidateForm = FALSE;
     }
 
     if (_pThreadMgr == nullptr)
@@ -4916,14 +4921,19 @@ BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BO
     RECT rc = {}, rcCompStart = {};
     BOOL hasCompStart = FALSE;
     BOOL usedCompStart = FALSE;
+    BOOL usedImm = FALSE;
     BOOL result = CCaretEditSession::GetCaretAndCompositionStartRect(
         pContext, _tfClientId, _pComposition, &rc, &rcCompStart, &hasCompStart,
-        (LONG)GetPendingCommitPrefixLength(), &usedCompStart, pCompRect, pHasCompRect);
+        (LONG)GetPendingCommitPrefixLength(), &usedCompStart, pCompRect, pHasCompRect, &usedImm);
     pContext->Release();
 
     if (pUsedCompStart)
     {
         *pUsedCompStart = usedCompStart;
+    }
+    if (pUsedImmCandidateForm)
+    {
+        *pUsedImmCandidateForm = usedImm;
     }
 
     if (result)
@@ -5480,13 +5490,16 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight, int* pSou
     // ITfContextView::GetTextExt provides accurate caret position in Chrome, Edge, etc.
     BOOL usedCompStart = FALSE;
     BOOL isDefaultPos = FALSE;
-    if (GetCaretPositionFromTSF(px, py, pHeight, &usedCompStart, pCompRect, pHasCompRect, &isDefaultPos))
+    BOOL usedImm = FALSE;
+    if (GetCaretPositionFromTSF(px, py, pHeight, &usedCompStart, pCompRect, pHasCompRect, &isDefaultPos,
+                                &usedImm))
     {
         if (pSource)
         {
-            // 默认位置优先：它答的是「这里没有插入点」，与另外两级的「插入点在这儿」
+            // 默认位置优先：它答的是「这里没有插入点」，与另外几级的「插入点在这儿」
             // 语义相反，标成 TSF 权威源会让服务端拿它做跟行/漂移校正。
-            *pSource = isDefaultPos ? CARET_SRC_TSF_DEFAULT_POS
+            *pSource = isDefaultPos    ? CARET_SRC_TSF_DEFAULT_POS
+                       : usedImm       ? CARET_SRC_IMM_CANDIDATE_FORM
                        : usedCompStart ? CARET_SRC_TSF_COMPOSITION
                                        : CARET_SRC_TSF_SELECTION;
         }
@@ -5989,7 +6002,8 @@ void CTextService::OnAsyncCaretRectReady(const AsyncCaretResult& result)
 
     // 默认位置优先级最高：它说的是「这里根本没有插入点」，比 selection / 组合起点降级
     // 都更靠后（走到这里两者都已退化），标错会让服务端把它当真插入点参与跟行。
-    const int source = isDefaultPos              ? CARET_SRC_TSF_DEFAULT_POS
+    const int source = isDefaultPos                  ? CARET_SRC_TSF_DEFAULT_POS
+                       : result.usedImmCandidateForm ? CARET_SRC_IMM_CANDIDATE_FORM
                        : result.usedCompStartAsCaret ? CARET_SRC_TSF_COMPOSITION
                                                      : CARET_SRC_TSF_SELECTION;
     WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady(%s): caret(%ld,%ld h=%ld) compStart=(%ld,%ld) src=%d\n",
@@ -6572,9 +6586,10 @@ STDAPI CTextService::OnLayoutChange(ITfContext* pContext, TfLayoutCode lCode, IT
                 RECT probeCs = {};
                 BOOL probeHasCs = FALSE;
                 BOOL probeUsedCs = FALSE;
+                BOOL probeUsedImm = FALSE;
                 if (CCaretEditSession::GetCaretAndCompositionStartRect(
                         pContext, _tfClientId, _pComposition,
-                        &probeCaret, &probeCs, &probeHasCs, 0, &probeUsedCs))
+                        &probeCaret, &probeCs, &probeHasCs, 0, &probeUsedCs, nullptr, nullptr, &probeUsedImm))
                 {
                     // 与 SendCaretPositionUpdate 同口径：y 取 bottom、height 由 rect 高度算。
                     LONG px = probeCaret.left;
@@ -6595,7 +6610,9 @@ STDAPI CTextService::OnLayoutChange(ITfContext* pContext, TfLayoutCode lCode, IT
                     // 症状是「第一个字正常、后续字能打但候选窗不显示、停顿一下又恢复」——因为
                     // 第一个字走的是长等待（拒绝探针、只认权威坐标），后续字才吃这份错误采样。
                     ConvertToPhysicalCoordinates(px, py, ph, csx, csy);
-                    const int probeSrc = probeUsedCs ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
+                    const int probeSrc = probeUsedImm  ? CARET_SRC_IMM_CANDIDATE_FORM
+                                         : probeUsedCs ? CARET_SRC_TSF_COMPOSITION
+                                                       : CARET_SRC_TSF_SELECTION;
                     _pIPCClient->SendCaretProbe(px, py, ph, csx, csy, probeSrc);
                 }
             }
