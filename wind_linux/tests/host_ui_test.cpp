@@ -6,11 +6,14 @@
 #include "Protocol.h"
 #include "TestHarness.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace windlinux;
 
@@ -140,6 +143,7 @@ int main()
     CASE("镜像：未知时不给图标（退回条目图标），学到后只在变化时报变");
     {
         ModeIndicator m;
+        m.setIconRoot(""); // 不看真实用户目录：只验种子回落
         CHECK(!m.known());
         CHECK_EQ(m.iconName(), std::string());
         CHECK_EQ(m.label(), std::string());
@@ -158,6 +162,7 @@ int main()
     CASE("大写锁定：无论中英都是「A」（对齐 Windows effective_chinese），关掉回到原态");
     {
         ModeIndicator m;
+        m.setIconRoot(""); // 不看真实用户目录：只验种子回落
         m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "中"));
         CHECK(m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A")));
         CHECK_EQ(m.iconName(), std::string("windinput-caps"));
@@ -176,6 +181,7 @@ int main()
     CASE("焦点进入的 MODE_PUSH 不带大写锁定位：沿用已知状态，不回退");
     {
         ModeIndicator m;
+        m.setIconRoot(""); // 不看真实用户目录：只验种子回落
         m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A"));
         CHECK(!m.update(modePush(STATUS_CHINESE_MODE)));
         CHECK_EQ(m.iconName(), std::string("windinput-caps"));
@@ -188,13 +194,16 @@ int main()
     CASE("本端大写锁定判定：立即换图标；关掉后方案标签不丢");
     {
         ModeIndicator u;
+        u.setIconRoot(""); // 不看真实用户目录：只验种子回落
         CHECK(!u.noteCapsLock(true)); // 模式未知：不给图标，也不报变
         u.update(modePush(STATUS_CHINESE_MODE));
         CHECK_EQ(u.iconName(), std::string("windinput-caps")); // 刚才那次判定记着
 
         ModeIndicator m;
+
+        m.setIconRoot(""); // 不看真实用户目录：只验种子回落
         m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "拼"));
-        CHECK_EQ(m.iconName(), std::string("windinput-zh-pin"));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh"));
         CHECK(m.noteCapsLock(true));
         CHECK_EQ(m.iconName(), std::string("windinput-caps"));
         CHECK_EQ(m.label(), std::string("A"));
@@ -202,46 +211,87 @@ int main()
         // 大写锁定态下服务端发来的是 caps 标签，不能覆盖方案标签。
         m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE | STATUS_CAPS_LOCK, "A"));
         CHECK(m.noteCapsLock(false));
-        CHECK_EQ(m.iconName(), std::string("windinput-zh-pin"));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh"));
         CHECK_EQ(m.label(), std::string("拼"));
     }
 
-    CASE("方案标签：内置方案各有图标，未知 / 自定义标签回落「中」；文字标签如实");
+    CASE("运行时图标名：状态段 + 主字 UTF-8 十六进制（与 wind_ui::tray_icon::icon_name 同一组样例）");
     {
-        CHECK_EQ(ModeIndicator::iconForLabel("中"), std::string("windinput-zh"));
-        CHECK_EQ(ModeIndicator::iconForLabel("拼"), std::string("windinput-zh-pin"));
-        CHECK_EQ(ModeIndicator::iconForLabel("五"), std::string("windinput-zh-wu"));
-        CHECK_EQ(ModeIndicator::iconForLabel("笔"), std::string("windinput-zh-bi"));
-        CHECK_EQ(ModeIndicator::iconForLabel("双"), std::string("windinput-zh-shuang"));
-        CHECK_EQ(ModeIndicator::iconForLabel("英"), std::string("windinput-zh-ying"));
-        CHECK_EQ(ModeIndicator::iconForLabel("虎"), std::string("windinput-zh"));
-        CHECK_EQ(ModeIndicator::iconForLabel(""), std::string("windinput-zh"));
-
-        ModeIndicator m;
-        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "虎"));
-        CHECK_EQ(m.iconName(), std::string("windinput-zh"));
-        CHECK_EQ(m.label(), std::string("虎"));
-        // [ui.labels] 配了别的英文 / 大写标签：图标仍是预生成的那张，文字标签跟配置。
-        m.update(statusFrame(CMD_STATUS_UPDATE, 0, "En"));
-        CHECK_EQ(m.iconName(), std::string("windinput-en"));
-        CHECK_EQ(m.label(), std::string("En"));
-        // 切方案（标签变、中英不变）也要报变：托盘图标换了。
-        ModeIndicator k;
-        k.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "五"));
-        CHECK(k.update(statusFrame(CMD_STATE_PUSH, STATUS_CHINESE_MODE, "拼")));
-        CHECK_EQ(k.iconName(), std::string("windinput-zh-pin"));
+        using V = ModeIndicator::Variant;
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::Chinese, "拼"), std::string("windinput-lbl-zh-e68bbc"));
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::English, "英"), std::string("windinput-lbl-en-e88bb1"));
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::Caps, "A"), std::string("windinput-lbl-caps-41"));
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::English, "En"), std::string("windinput-lbl-en-456e"));
     }
 
-    CASE("addon 可能给出的每个图标名，hicolor 里 16…64 与 scalable 都有文件");
+    CASE("运行时图标在（64px 那张写完）就用它，否则退回种子；文字标签如实");
+    {
+        namespace fs = std::filesystem;
+        fs::path root = fs::temp_directory_path() / ("wi-host-ui-" + std::to_string(::getpid()));
+        fs::remove_all(root);
+        auto touch = [&](const std::string& name, const char* size) {
+            fs::create_directories(root / size / "apps");
+            std::ofstream(root / size / "apps" / (name + ".png")) << "png";
+        };
+        ModeIndicator m;
+        m.setIconRoot(root.string());
+        m.update(statusFrame(CMD_STATUS_UPDATE, STATUS_CHINESE_MODE, "虎"));
+        CHECK_EQ(m.iconName(), std::string("windinput-zh")); // 还没渲染：种子
+        CHECK_EQ(m.label(), std::string("虎"));
+        touch("windinput-lbl-zh-e8998e", "16x16");
+        CHECK_EQ(m.iconName(), std::string("windinput-zh")); // 只写了一部分：仍是种子
+        touch("windinput-lbl-zh-e8998e", "64x64");
+        CHECK_EQ(m.iconName(), std::string("windinput-lbl-zh-e8998e"));
+        // 切方案：标签变、中英不变，图标名跟着变，要报变。
+        touch("windinput-lbl-zh-e4ba94", "64x64");
+        CHECK(m.update(statusFrame(CMD_STATE_PUSH, STATUS_CHINESE_MODE, "五")));
+        CHECK_EQ(m.iconName(), std::string("windinput-lbl-zh-e4ba94"));
+        // 本端判定大写锁定：caps 标签那组在就用它（服务端每次构建状态都会把 caps / 英文两组一起备好）。
+        touch("windinput-lbl-caps-41", "64x64");
+        CHECK(m.noteCapsLock(true));
+        CHECK_EQ(m.iconName(), std::string("windinput-lbl-caps-41"));
+        // [ui.labels] 改过的英文标签：图标与文字都跟配置。
+        m.noteCapsLock(false);
+        touch("windinput-lbl-en-456e", "64x64");
+        m.update(statusFrame(CMD_STATUS_UPDATE, 0, "En"));
+        CHECK_EQ(m.iconName(), std::string("windinput-lbl-en-456e"));
+        CHECK_EQ(m.label(), std::string("En"));
+        fs::remove_all(root);
+    }
+
+    CASE("预建图标目录：六个尺寸档的 apps 都建出来；空根失败");
+    {
+        namespace fs = std::filesystem;
+        fs::path root = fs::temp_directory_path() / ("wi-host-dirs-" + std::to_string(::getpid()));
+        fs::remove_all(root);
+        CHECK(ensureIconDirs((root / "icons/hicolor").string()));
+        for (const char* n : {"16x16", "22x22", "24x24", "32x32", "48x48", "64x64"}) {
+            CHECK(fs::is_directory(root / "icons/hicolor" / n / "apps"));
+        }
+        CHECK(ensureIconDirs((root / "icons/hicolor").string())); // 已存在也算成功
+        CHECK(!ensureIconDirs(""));
+        fs::remove_all(root);
+    }
+
+    CASE("用户图标目录：XDG_DATA_HOME 为绝对路径时用它，否则 HOME/.local/share");
+    {
+        ::setenv("XDG_DATA_HOME", "/x/data", 1);
+        CHECK_EQ(userHicolorDir(), std::string("/x/data/icons/hicolor"));
+        ::setenv("XDG_DATA_HOME", "relative", 1);
+        ::setenv("HOME", "/home/u", 1);
+        CHECK_EQ(userHicolorDir(), std::string("/home/u/.local/share/icons/hicolor"));
+        ::unsetenv("XDG_DATA_HOME");
+        CHECK_EQ(userHicolorDir(), std::string("/home/u/.local/share/icons/hicolor"));
+    }
+
+    CASE("种子图标：16…64 与 scalable 都随包");
     {
         std::string rs = WIND_PROTOCOL_RS;
         const std::string ipc = "wind_input/crates/wind-ipc/src/protocol.rs";
         std::string root = rs.substr(0, rs.rfind(ipc)) + "wind_linux/data/icons/hicolor/";
-        std::vector<std::string> names = {"windinput-en", "windinput-caps"};
-        for (const char* l : {"中", "拼", "五", "笔", "双", "英", "虎"}) {
-            names.push_back(ModeIndicator::iconForLabel(l));
-        }
-        for (const auto& name : names) {
+        using V = ModeIndicator::Variant;
+        for (V v : {V::Chinese, V::English, V::Caps}) {
+            const std::string name = ModeIndicator::seedIconName(v);
             for (const char* sz : {"16x16", "22x22", "24x24", "32x32", "48x48", "64x64"}) {
                 std::string path = root + sz + "/apps/" + name + ".png";
                 if (!std::filesystem::exists(path)) {

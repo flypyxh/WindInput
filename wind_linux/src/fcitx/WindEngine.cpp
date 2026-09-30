@@ -117,6 +117,10 @@ bool isSwitchEvent(const fcitx::InputContextEvent& event)
 WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
 {
     dispatcher_.attach(&instance_->eventLoop());
+    // 托盘运行时图标的目录要赶在各 UI 模块构建图标主题之前就在（见 HostUi.h ensureIconDirs）。
+    if (!ensureIconDirs(userHicolorDir())) {
+        WIND_WARN() << "用户图标目录建不起来，托盘退回随包的种子图标";
+    }
 
     router_.setTimerScheduler([this](uint32_t ms, std::function<void()> cb) {
         holdTimer_ = instance_->eventLoop().addTimeEvent(

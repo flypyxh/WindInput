@@ -509,6 +509,36 @@ async def end_composition(c):
     c.preedits.clear()
 
 
+def tray_icon(tag, label):
+    """服务端运行时渲染的托盘图标名（与 wind_ui::tray_icon::icon_name / addon 的
+    dynamicIconName 同一规则）：windinput-lbl-<zh|en|caps>-<主字 UTF-8 十六进制>。"""
+    return f"windinput-lbl-{tag}-{label.encode().hex()}"
+
+
+ICON_PIN = tray_icon("zh", "拼")
+ICON_WU = tray_icon("zh", "五")
+ICON_EN = tray_icon("en", "英")
+ICON_CAPS = tray_icon("caps", "A")
+
+
+def tray_icon_files_ok(name):
+    """这个图标名在用户图标目录（$XDG_DATA_HOME/icons/hicolor）里各尺寸都在，且是尺寸对得上的 PNG。"""
+    root = os.path.join(os.environ["XDG_DATA_HOME"], "icons", "hicolor")
+    for n in (16, 22, 24, 32, 48, 64):
+        path = os.path.join(root, f"{n}x{n}", "apps", name + ".png")
+        try:
+            with open(path, "rb") as f:
+                head = f.read(24)
+        except OSError:
+            return False, f"缺 {path}"
+        if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+            return False, f"不是 PNG：{path}"
+        w, h = int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+        if (w, h) != (n, n):
+            return False, f"{path} 尺寸 {w}x{h}"
+    return True, ""
+
+
 class KimpanelWatch:
     """听 Fcitx5 kimpanel 模块发给面板的属性：`/Fcitx/im:<名>:<图标>:<子模式>:menu,label=<标签>`
     是当前输入法的托盘图标（取自引擎的 subModeIcon，notificationitem 的 SNI 图标取的是同一个
@@ -658,16 +688,16 @@ async def menu_cases(bus, im):
                   gone and eaten == [False] * 3 and c.take() == "",
                   f"菜单消失={gone} eaten={eaten}")
             # 不经按键的切换：服务端经 push 通道推 CMD_STATE_PUSH，托盘图标要跟上。
-            en = await wait_until(lambda: watch.icon() == "windinput-en", 2)
-            check("托盘图标：菜单点「英文」→ windinput-en（push 通道的状态推送）", en,
+            en = await wait_until(lambda: watch.icon() == ICON_EN, 2)
+            check("托盘图标：菜单点「英文」→ 「英」（push 通道的状态推送）", en,
                   f"im={watch.im()!r}")
     await c.key("Escape")
     c.take()
     # 空闲时没有主菜单入口了（状态区入口改成了「清风输入法设置」），主菜单都从组字时的
     # 「更多…」进——英文态组不了字，先用 Shift 切回中文（顺带验按键这条来源的托盘图标）。
     await c.tap_shift()
-    zh = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
-    check("托盘图标：Shift 切回中文 → windinput-zh-pin（全拼）", zh, f"im={watch.im()!r}")
+    zh = await wait_until(lambda: watch.icon() == ICON_PIN, 2)
+    check("托盘图标：Shift 切回中文 → 「拼」（全拼）", zh, f"im={watch.im()!r}")
 
     # g) 主菜单的子菜单点选：输入方案 ▸ 全拼（英文、分隔线之后那一行）→ 仍是中文全拼。
     #    关掉菜单后组字还挂着，先收掉再验打字。
@@ -1414,35 +1444,39 @@ async def mode_icon_cases(bus, im):
     标签（e2e 用全拼，「拼」）、英文态「英」、大写锁定无论中英都是「A」。"""
     watch = await kimpanel_watch(bus)
     c = await new_ctx(bus, im, "e2e-mode-icon")
-    zh = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
-    check("托盘图标：中文态按方案标签，全拼为 windinput-zh-pin、标签「拼」",
+    zh = await wait_until(lambda: watch.icon() == ICON_PIN, 2)
+    check("托盘图标：中文态按方案标签运行时渲染，全拼为「拼」、标签「拼」",
           zh and watch.im().endswith("label=拼"), f"im={watch.im()!r}")
+    # 服务端每次构建状态都把中文 / 英文 / 大写三组一起备好（addon 本端判定大写时不必等帧）。
+    for name in (ICON_PIN, ICON_EN, ICON_CAPS):
+        files, why = tray_icon_files_ok(name)
+        check(f"托盘图标：{name} 各尺寸 PNG 已写进用户图标目录", files, why)
     await c.tap_shift()
-    en = await wait_until(lambda: watch.icon() == "windinput-en", 2)
-    check("托盘图标：Shift 切英文 → windinput-en、标签「英」",
+    en = await wait_until(lambda: watch.icon() == ICON_EN, 2)
+    check("托盘图标：Shift 切英文 → 「英」、标签「英」",
           en and watch.im().endswith("label=英"), f"im={watch.im()!r}")
     # 换个文本框再回来：焦点进入时服务端回的 MODE_PUSH 仍是英文，图标不被焦点事件打回中文。
     d = await new_ctx(bus, im, "e2e-mode-icon-2")
     await d.ic.call_focus_out()
     await c.ic.call_focus_in()
     await asyncio.sleep(0.3)
-    check("托盘图标：换焦点后仍是 windinput-en", watch.icon() == "windinput-en",
+    check("托盘图标：换焦点后仍是「英」", watch.icon() == ICON_EN,
           f"im={watch.im()!r}")
 
     # 大写锁定（英文态）：按下 + 松开 → 「A」；服务端同步镜像并回 STATUS_CAPS_LOCK。
     await c.tap_caps_lock(False)
-    caps = await wait_until(lambda: watch.icon() == "windinput-caps", 2)
-    check("托盘图标：英文态按 CapsLock → windinput-caps、标签「A」",
+    caps = await wait_until(lambda: watch.icon() == ICON_CAPS, 2)
+    check("托盘图标：英文态按 CapsLock → 「A」图标、标签「A」",
           caps and watch.im().endswith("label=A"), f"im={watch.im()!r}")
     # 大写锁定下打字母：服务端认得大写（英文态本就直通，这里只验不被吞、图标不动）。
     eaten = await c.key("a", STATE_LOCK)
     check("大写锁定：英文态字母直通、图标仍是「A」",
-          eaten is False and watch.icon() == "windinput-caps", f"eaten={eaten} im={watch.im()!r}")
+          eaten is False and watch.icon() == ICON_CAPS, f"eaten={eaten} im={watch.im()!r}")
     # 换焦点：MODE_PUSH 不带大写锁定位，不能把「A」打回「英」。
     await c.ic.call_focus_out()
     await d.ic.call_focus_in()
     await asyncio.sleep(0.3)
-    check("托盘图标：大写锁定时换焦点不回退", watch.icon() == "windinput-caps",
+    check("托盘图标：大写锁定时换焦点不回退", watch.icon() == ICON_CAPS,
           f"im={watch.im()!r}")
     await d.ic.call_focus_out()
     await c.ic.call_focus_in()
@@ -1451,8 +1485,8 @@ async def mode_icon_cases(bus, im):
     # 修饰键单击那一帧曾发 toggles=0，服务端据此把大写锁定镜像校准成「关」。
     await c.tap_shift(STATE_LOCK)
     await asyncio.sleep(0.3)
-    check("托盘图标：大写锁定时 Shift 切中文，仍是 windinput-caps（中文态也显示「A」）",
-          watch.icon() == "windinput-caps", f"im={watch.im()!r}")
+    check("托盘图标：大写锁定时 Shift 切中文，仍是「A」（中文态也显示「A」）",
+          watch.icon() == ICON_CAPS, f"im={watch.im()!r}")
     # 中文态 + 大写锁定：字母按大写直出，不进组字。
     eaten = await c.key("a", STATE_LOCK)
     await asyncio.sleep(0.2)
@@ -1460,8 +1494,8 @@ async def mode_icon_cases(bus, im):
     c.take()
     # 再按一次 CapsLock：回到当前模式的图标（中文 → 「拼」）。
     await c.tap_caps_lock(True)
-    back = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
-    check("托盘图标：再按 CapsLock → 回到 windinput-zh-pin",
+    back = await wait_until(lambda: watch.icon() == ICON_PIN, 2)
+    check("托盘图标：再按 CapsLock → 回到「拼」",
           back and watch.im().endswith("label=拼"), f"im={watch.im()!r}")
     typed = await c.type("ni")
     check("大写锁定关掉后中文组字恢复", typed == [True, True] and c.preedit != "",
@@ -1470,26 +1504,29 @@ async def mode_icon_cases(bus, im):
     c.take()
     # 在别处开了大写锁定（本引擎没收到 Caps_Lock）：第一个带 Lock 位的键就校准回来。
     await c.key("Left", STATE_LOCK)
-    cal = await wait_until(lambda: watch.icon() == "windinput-caps", 2)
+    cal = await wait_until(lambda: watch.icon() == ICON_CAPS, 2)
     check("托盘图标：别处开的大写锁定，第一个带 Lock 位的键就校准成「A」", cal,
           f"im={watch.im()!r}")
     await c.key("Left")
-    uncal = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
+    uncal = await wait_until(lambda: watch.icon() == ICON_PIN, 2)
     check("托盘图标：Lock 位消失即回到「拼」", uncal, f"im={watch.im()!r}")
 
     await c.tap_shift()
-    en2 = await wait_until(lambda: watch.icon() == "windinput-en", 2)
+    en2 = await wait_until(lambda: watch.icon() == ICON_EN, 2)
     await c.tap_shift()
-    back = await wait_until(lambda: watch.icon() == "windinput-zh-pin", 2)
-    check("托盘图标：再按 Shift 切英 / 切回 → windinput-en / windinput-zh-pin", en2 and back,
+    back = await wait_until(lambda: watch.icon() == ICON_PIN, 2)
+    check("托盘图标：再按 Shift 切英 / 切回 → 「英」/「拼」", en2 and back,
           f"im={watch.im()!r}")
     # 切方案（Ctrl+Shift+E，全拼 ⇄ 五笔）：中英不变、方案标签变，图标跟着换。
-    for want, label in (("windinput-zh-wu", "五"), ("windinput-zh-pin", "拼")):
+    for want, label in ((ICON_WU, "五"), (ICON_PIN, "拼")):
         await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, False, 0)
         await c.ic.call_process_key_event(0x45, 26, STATE_CTRL | STATE_SHIFT, True, 0)
         ok = await wait_until(lambda: watch.icon() == want, 2)
-        check(f"托盘图标：Ctrl+Shift+E 切方案 → {want}、标签「{label}」",
-              ok and watch.im().endswith(f"label={label}"), f"im={watch.im()!r}")
+        files, why = tray_icon_files_ok(want)
+        check(f"托盘图标：Ctrl+Shift+E 切方案 → 「{label}」的运行时图标（{want}，各尺寸 PNG 在盘上）",
+              ok and files and watch.im().endswith(f"label={label}"),
+              f"im={watch.im()!r} {why}")
+    check("托盘图标：切方案前后图标名不同", ICON_WU != ICON_PIN)
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
 

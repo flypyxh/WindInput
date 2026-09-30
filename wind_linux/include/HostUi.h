@@ -13,6 +13,18 @@
 
 namespace windlinux {
 
+/// 用户图标目录下的 hicolor 根：`$XDG_DATA_HOME/icons/hicolor`（未设或非绝对路径时
+/// `$HOME/.local/share/icons/hicolor`）。与服务端 `wind_ui::tray_icon::user_hicolor_dir` 同一规则；
+/// 拿不到时为空串。
+std::string userHicolorDir();
+
+/// 建好 `root/<N>x<N>/apps`（N = 16/22/24/32/48/64，同服务端 `tray_icon::SIZES`）。成功或已存在返回 true。
+///
+/// Fcitx5 的 `IconTheme`（classicui 托盘）、Qt 的 `QIconTheme`、KIconLoader 在构造主题时把**不存在**的
+/// 目录永久排除：服务端第一次写图标若晚于它们，就要等宿主重启才看得见。addon 随 Fcitx5 启动而加载，
+/// 在这里先建一次（服务端写之前也会建）。
+bool ensureIconDirs(const std::string& root);
+
 /// 状态帧里与托盘图标有关的那几项。
 struct ModeStatus {
     bool chinese = true;
@@ -38,7 +50,9 @@ std::optional<ModeStatus> modeStatusOf(const Frame& frame);
 /// `CMD_ACTIVATION_STATUS_PUSH` 与 `STATUS_UPDATE` 同载荷，一并认。
 ///
 /// 图标规则对齐 Windows 语言栏（`effective_chinese = chinese && !caps`）：大写锁定时无论中英都是
-/// 「A」；否则英文态「英」；有效中文态按方案标签取图（内置方案的标签全部预生成，未知标签回落「中」）。
+/// caps 标签（出厂「A」）；否则英文态 english 标签（「英」）；有效中文态是方案标签。图标是服务端按
+/// （状态, 主字）运行时渲染进用户图标目录的（`wind-ui/src/tray_icon.rs`），名字由 `dynamicIconName`
+/// 算；那组文件还不在（服务没起来、目录不可写、缺字体）就退回随包的种子 `windinput-zh/en/caps`。
 class ModeIndicator {
 public:
     /// 帧里带模式就记下；返回托盘图标 / 标签是否**变了**（调用方据此刷新状态区）。
@@ -52,8 +66,8 @@ public:
     bool chinese() const { return chinese_.value_or(true); }
     bool capsLock() const { return caps_; }
 
-    /// 托盘 / 面板图标名（hicolor 主题里的 `windinput-*`，见 `iconForLabel`）；未知时为空，
-    /// Fcitx5 据此退回条目图标。
+    /// 托盘 / 面板图标名：运行时图标（`dynamicIconName`）在就用它，否则种子（`seedIconName`）；
+    /// 未知时为空，Fcitx5 据此退回条目图标。
     std::string iconName() const;
     /// 面板的文字标签（kimpanel、classicui 偏好文字图标时）：当前态的主字；未知时为空。
     /// 用的是服务端下发的真实标签，`[ui.labels]` / 自定义方案标签在这里如实显示。
@@ -61,8 +75,17 @@ public:
     /// 子模式名（Fcitx5 输入法信息提示里跟在输入法名后面）。
     std::string subModeName() const;
 
-    /// 有效中文态的方案标签 → 图标名。内置方案之外的标签回落 `windinput-zh`。
-    static std::string iconForLabel(const std::string& schemaLabel);
+    /// 运行时图标所在的 hicolor 根（默认 `userHicolorDir()`；单测指到临时目录）。
+    void setIconRoot(std::string root) { iconRoot_ = std::move(root); }
+
+    /// 状态档：图标名里的状态段，也决定底色。
+    enum class Variant { Chinese, English, Caps };
+    Variant variant() const;
+    /// 运行时图标名：`windinput-lbl-<zh|en|caps>-<主字 UTF-8 小写十六进制>`。
+    /// **与 `wind_ui::tray_icon::icon_name` 同一规则**（两侧单测钉同一组样例）。
+    static std::string dynamicIconName(Variant v, const std::string& label);
+    /// 随包种子：`windinput-zh` / `windinput-en` / `windinput-caps`。
+    static std::string seedIconName(Variant v);
 
 private:
     std::optional<bool> chinese_;
@@ -72,7 +95,9 @@ private:
     std::string schemaLabel_ = "中";
     std::string englishLabel_ = "英";
     std::string capsLabel_ = "A";
+    std::string iconRoot_ = userHicolorDir();
 };
+
 
 /// 大写锁定的本端判定（纯逻辑）。
 ///

@@ -3,8 +3,12 @@
 #include "KeyMap.h"
 #include "Protocol.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <utility>
+
+#include <sys/stat.h>
 
 namespace windlinux {
 
@@ -109,23 +113,34 @@ bool ModeIndicator::noteCapsLock(bool on)
     return known();
 }
 
-std::string ModeIndicator::iconForLabel(const std::string& schemaLabel)
+ModeIndicator::Variant ModeIndicator::variant() const
 {
-    // 与 wind-ui/examples/gen_tray_icons.rs 的 ICONS 表一一对应；host_ui_test 核对文件在不在。
-    // 内置方案的 `[schema] icon_label`（data/schemas/*.schema.toml）。
-    static const std::pair<const char*, const char*> kTable[] = {
-        {"拼", "windinput-zh-pin"},
-        {"五", "windinput-zh-wu"},
-        {"笔", "windinput-zh-bi"},
-        {"双", "windinput-zh-shuang"},
-        {"英", "windinput-zh-ying"},
-    };
-    for (const auto& [text, icon] : kTable) {
-        if (schemaLabel == text) {
-            return icon;
-        }
+    if (caps_) {
+        return Variant::Caps;
     }
-    // 「中」（五笔拼音、方案未配标签）与一切自定义标签：托盘图标是预生成的，画不出任意字。
+    return chinese() ? Variant::Chinese : Variant::English;
+}
+
+std::string ModeIndicator::dynamicIconName(Variant v, const std::string& label)
+{
+    static const char* kHex = "0123456789abcdef";
+    std::string s = "windinput-lbl-";
+    s += v == Variant::Chinese ? "zh" : v == Variant::English ? "en" : "caps";
+    s += '-';
+    for (unsigned char c : label) {
+        s += kHex[c >> 4];
+        s += kHex[c & 0xF];
+    }
+    return s;
+}
+
+std::string ModeIndicator::seedIconName(Variant v)
+{
+    switch (v) {
+    case Variant::Chinese: return "windinput-zh";
+    case Variant::English: return "windinput-en";
+    case Variant::Caps: return "windinput-caps";
+    }
     return "windinput-zh";
 }
 
@@ -134,10 +149,17 @@ std::string ModeIndicator::iconName() const
     if (!known()) {
         return {};
     }
-    if (caps_) {
-        return "windinput-caps";
+    const Variant v = variant();
+    const std::string text = label();
+    if (!iconRoot_.empty() && !text.empty()) {
+        std::string name = dynamicIconName(v, text);
+        // 服务端按尺寸从小到大写、64 最后（`tray_icon::LAST_SIZE`），它在 = 这一组写完了。
+        struct stat st {};
+        if (::stat((iconRoot_ + "/64x64/apps/" + name + ".png").c_str(), &st) == 0) {
+            return name;
+        }
     }
-    return chinese() ? iconForLabel(schemaLabel_) : "windinput-en";
+    return seedIconName(v);
 }
 
 std::string ModeIndicator::label() const
@@ -160,6 +182,34 @@ std::string ModeIndicator::subModeName() const
         return "大写锁定";
     }
     return chinese() ? "中文" : "英文";
+}
+
+std::string userHicolorDir()
+{
+    const char* data = std::getenv("XDG_DATA_HOME");
+    if (data && data[0] == '/') {
+        return std::string(data) + "/icons/hicolor";
+    }
+    const char* home = std::getenv("HOME");
+    if (home && home[0]) {
+        return std::string(home) + "/.local/share/icons/hicolor";
+    }
+    return {};
+}
+
+bool ensureIconDirs(const std::string& root)
+{
+    if (root.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    for (const char* n : {"16x16", "22x22", "24x24", "32x32", "48x48", "64x64"}) {
+        std::filesystem::create_directories(std::filesystem::path(root) / n / "apps", ec);
+        if (ec) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::optional<bool> CapsLockTracker::onKey(uint32_t keysym, uint32_t states, bool release)
