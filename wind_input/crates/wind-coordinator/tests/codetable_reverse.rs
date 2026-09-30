@@ -14,6 +14,7 @@ const VK_BACK: u32 = 0x08;
 const VK_OEM_MINUS: u32 = 0xBD;
 const VK_OEM_1: u32 = 0xBA;
 const VK_RSHIFT: u32 = 0xA1;
+const VK_SPACE: u32 = 0x20;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
@@ -397,4 +398,134 @@ fn reverse_modifier_binding_in_pinyin_still_toggles_mode() {
         prev_char: 0,
     });
     assert!(!c.is_chinese_mode(), "门卫没过不吞键：RShift 照常切中英");
+}
+
+fn mixed_ready() -> bool {
+    dict_ready()
+        && data_dir()
+            .join("schemas/wubi86_pinyin.schema.toml")
+            .exists()
+}
+
+/// spec §3.2：首位通配（`?uia`），通配主开关关着也生效；注释是全码。
+#[test]
+fn reverse_leading_wildcard_zuia_ignores_inline_switch() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.schema.codetable.wildcard = false;
+    let tri = rev_triples(cfg, "zuia");
+    assert!(
+        tri.iter().any(|(t, c, _)| t == "平江" && c == "guia"),
+        "{tri:?}"
+    );
+    assert!(
+        tri.iter()
+            .all(|(_, c, m)| c.len() == 4 && &c[1..] == "uia" && c == m),
+        "{tri:?}"
+    );
+}
+
+/// spec §3.2 + §4：模式内同样查未启用扩展库，排在已启用之后。
+#[test]
+fn reverse_mode_sees_disabled_dicts_when_on() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let off = rev_triples(wubi_rev(), "zuia");
+    assert!(off.iter().all(|(t, _, _)| t != "门头沟区"));
+    let mut cfg = wubi_rev();
+    cfg.schema.codetable.lookup_disabled_dicts = true;
+    let on = rev_triples(cfg, "zuia");
+    let pos = on
+        .iter()
+        .position(|(t, _, _)| t == "门头沟区")
+        .unwrap_or_else(|| panic!("{on:?}"));
+    assert!(pos >= off.len(), "已启用的 {} 条全在前：{on:?}", off.len());
+}
+
+/// spec §2 作用于反查模式。
+#[test]
+fn reverse_mode_single_only() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = with_filter(wubi_rev(), "gb18030");
+    cfg.schema.codetable.wildcard_single_only = true;
+    let tri = rev_triples(cfg, "azzz");
+    assert_eq!(tri.len(), 100);
+    assert!(
+        tri.iter()
+            .all(|(t, _, _)| wind_candidate::single_markable_char(t).is_some())
+    );
+}
+
+/// spec §3.2：混输下模式内只查主码表，没有拼音候选。
+#[test]
+fn reverse_mode_has_no_pinyin_in_mixed() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
+    cfg.schema.active = "wubi86_pinyin".into();
+    let tri = rev_triples(cfg, "hanz");
+    assert!(!tri.is_empty());
+    assert!(
+        tri.iter().all(|(t, c, _)| !c.contains('z') && t != "汉字"),
+        "{tri:?}"
+    );
+}
+
+/// ★ Review Focus 5（真实数据）：翻过页、放宽过再 Esc，残留全清；随后主路径打字与新开的 coordinator 逐条相同。
+#[test]
+fn reverse_esc_exits_without_residue() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = with_filter(wubi_rev(), "smart");
+    cfg.input.scope_relax.page_end_key = true;
+    let c = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    letters(&c, "hanz");
+    for _ in 0..5 {
+        key(&c, VK_NEXT, false); // 翻到底再按 ⇒ 放宽
+    }
+    key(&c, VK_ESCAPE, false);
+    assert_eq!(c.debug_active_mode(), None);
+    assert!(!c.debug_has_more() && !c.debug_scope_relaxed());
+    letters(&c, "hanz");
+    let fresh = Coordinator::new_headless(cfg, Some(&data_dir()));
+    letters(&fresh, "hanz");
+    assert_eq!(c.debug_candidate_triples(), fresh.debug_candidate_triples());
+}
+
+/// spec §3.2：选中上屏候选文本（不上屏编码），并退出。
+#[test]
+fn reverse_space_commits_highlight() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let c = Coordinator::new_headless(wubi_rev(), Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    letters(&c, "zuia");
+    let first = c.debug_all_candidate_texts()[0].clone();
+    let act = c.handle_key_event(&KeyEventData {
+        key_code: VK_SPACE,
+        scan_code: 0,
+        modifiers: 0,
+        event_type: EVENT_KEY_DOWN,
+        toggles: 0,
+        event_seq: 0,
+        prev_char: 0,
+    });
+    assert!(format!("{act:?}").contains(&first), "上屏的是候选：{act:?}");
+    assert_eq!(c.debug_active_mode(), None);
 }
