@@ -2568,7 +2568,7 @@ mod tests {
         );
     }
 
-    /// ★ Review Focus 4：通配硬上限与翻页扩容上限是**同一个**常量；`max_candidates = 0` 回空，
+    /// 通配硬上限与翻页扩容上限是**同一个**常量；`max_candidates = 0` 回空，
     /// 且不把 0 传给 `search_pattern`（Composite 把 0 当不限、各层把 0 当空）。
     #[test]
     fn wildcard_hard_cap_matches_expansion_cap_and_zero_is_empty() {
@@ -2603,7 +2603,7 @@ mod tests {
         }
     }
 
-    /// ★ Review Focus 2：先滤后截。`q??` 下 150 条高权重词组压着 120 条低权重单字：
+    /// 先滤后截：`q??` 下 150 条高权重词组压着 120 条低权重单字：
     /// 词库层按 limit 截出的前 100 条全是词组，事后过滤只剩 0 条。引擎须加倍重取到凑满。
     #[test]
     fn wildcard_single_only_filters_before_truncation() {

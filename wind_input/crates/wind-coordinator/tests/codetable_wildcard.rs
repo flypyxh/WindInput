@@ -1258,6 +1258,12 @@ fn mixed_single_only_keeps_pinyin_words() {
         "通配侧全是单字：{tri:?}"
     );
     assert!(
+        tri.iter()
+            .any(|(t, c, _)| is_single(t)
+                && (wubi_hit("hanz", c, true) || wubi_hit("hanz", c, false))),
+        "通配侧至少有一条单字命中（防过滤后为空而空过）：{tri:?}"
+    );
+    assert!(
         tri.iter().any(|(t, _, _)| t == "汉字"),
         "拼音侧词组照出：{tri:?}"
     );
