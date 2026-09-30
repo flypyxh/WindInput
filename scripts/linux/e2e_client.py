@@ -25,6 +25,7 @@ IC_IFACE = "org.fcitx.Fcitx.InputContext1"
 CAP_PREEDIT = (1 << 1) | (1 << 4)
 CAP_PASSWORD = 1 << 3
 STATE_SHIFT = 1 << 0
+STATE_CTRL = 1 << 2
 
 # X11 keysym 与 US 布局的 X keycode（evdev + 8）。
 KEYSYM = {c: ord(c) for c in "abcdefghijklmnopqrstuvwxyz0123456789 "}
@@ -338,6 +339,38 @@ async def main():
     await a.key(" ")
     got = a.take()
     check("再按 Shift 切回中文", got == "你好", f"上屏={got!r}")
+
+    # 5b. 带修饰键的功能热键（服务的默认键位）：到得了服务、且真的生效
+    async def chord(sym, code, state):
+        eaten = await a.ic.call_process_key_event(sym, code, state, False, 0)
+        await a.ic.call_process_key_event(sym, code, state, True, 0)
+        await asyncio.sleep(0.05)
+        return eaten
+
+    # Shift+空格：全角开关。开着时无组字的空格上屏全角空格 U+3000。
+    e1 = await chord(0x20, 65, STATE_SHIFT)
+    await a.key(" ")
+    got = a.take()
+    await chord(0x20, 65, STATE_SHIFT)
+    await a.key(" ")
+    back = a.take()
+    check("Shift+空格 被服务吃掉（全角开关）", e1 is True, f"eaten={e1}")
+    check("Shift+空格 后空格上屏全角空格", got == "\u3000", f"上屏={got!r}")
+    check("再按 Shift+空格 恢复半角", back == "", f"上屏={back!r}（半角空格应交还宿主）")
+
+    # Ctrl+Shift+E：切换引擎（方案）。切走后 nihao+空格 不再是「你好」，再切回来恢复。
+    e2 = await chord(0x45, 26, STATE_CTRL | STATE_SHIFT)  # Shift 下 e 的 keysym 是 'E'
+    await a.type("nihao")
+    await a.key(" ")
+    other = a.take()
+    await a.key("Escape")
+    await chord(0x45, 26, STATE_CTRL | STATE_SHIFT)
+    await a.type("nihao")
+    await a.key(" ")
+    again = a.take()
+    check("Ctrl+Shift+E 被服务吃掉（切引擎）", e2 is True, f"eaten={e2}")
+    check("Ctrl+Shift+E 切走后不再出「你好」", other != "你好", f"上屏={other!r}")
+    check("再按 Ctrl+Shift+E 切回全拼", again == "你好", f"上屏={again!r}")
 
     # 6. 焦点切换：组字中失焦 → 宿主预编辑被清；回来后是全新一轮
     await a.type("nihao")
