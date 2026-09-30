@@ -241,6 +241,21 @@ fn variant_and_regular_indexes_use_separate_files() {
     );
 }
 
+/// 失效：启用唯一的未启用扩展库后，范围缓存作废、回到 `Enabled`（不再有「未启用」可含）。
+#[test]
+fn scope_cache_invalidated_on_dict_toggle() {
+    let (m, id, _g) = setup("scope_inval", true, true, true);
+    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
+    let xz = format!("{id}_xz");
+    let ov: toml::Value = toml::from_str(&format!(
+        "[[dictionaries]]\nid = \"{xz}\"\nenabled = true\n"
+    ))
+    .unwrap();
+    m.persist_schema_override(&id, &ov).unwrap();
+    m.set_dict_enabled_live(&id, &xz, true);
+    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::Enabled);
+}
+
 /// 裁决 7：开关关 / 方案没有未启用库 ⇒ 退化为常规索引，不另建文件。
 #[test]
 fn scope_collapses_to_enabled() {
