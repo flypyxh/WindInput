@@ -1,0 +1,92 @@
+// Fcitx5 输入法引擎：清风输入法在 Linux 上的「薄壳」。
+//
+// 与 wind_tsf（Windows TSF DLL）、wind_macos（IMKit .app）对位：按键转发给 Rust 服务、
+// 把服务的上屏/预编辑写回 InputContext、把服务光栅化好的候选窗帧显示出来。引擎/词库/
+// 候选逻辑全在服务里，这里不做任何「中英判定」。
+//
+// 线程模型：Fcitx5 在主线程（事件循环）调 keyEvent/activate/deactivate，本类在其中**同步**
+// 请求服务（UDS 往返 <1ms，2s 超时兜底）。push 通道在后台线程收帧，经 EventDispatcher
+// 转回主线程再碰 InputContext——InputContext 与 InputPanel 都不是线程安全的。
+#pragma once
+
+#include "Bridge.h"
+#include "KeyMap.h"
+#include "ResponseRouter.h"
+
+#include <fcitx-utils/event.h>
+#include <fcitx-utils/eventdispatcher.h>
+#include <fcitx-utils/trackableobject.h>
+#include <fcitx/addonfactory.h>
+#include <fcitx/addoninstance.h>
+#include <fcitx/addonmanager.h>
+#include <fcitx/inputcontext.h>
+#include <fcitx/inputmethodengine.h>
+#include <fcitx/instance.h>
+
+#include <memory>
+#include <unordered_set>
+
+namespace windlinux {
+
+class WindEngine final : public fcitx::InputMethodEngineV2 {
+public:
+    explicit WindEngine(fcitx::Instance* instance);
+    ~WindEngine() override;
+
+    void keyEvent(const fcitx::InputMethodEntry& entry, fcitx::KeyEvent& event) override;
+    void activate(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
+    void deactivate(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
+    void reset(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
+
+private:
+    // ── 连接 ──
+    bool ensureConnected();
+    bool reconnect();
+    /// 在 request 连接上发一帧、读响应；连接失败时重连并**重试一次**（服务重启后的第一个键
+    /// 就自愈、不丢字——对位 macOS `handle` 的同名策略）。
+    bool requestWithRetry(const Bytes& frame, Frame& resp);
+    /// 发一帧、读掉 ack，失败只记日志。
+    void sendAndDrain(const Bytes& frame);
+    /// 发一帧不读响应（AsyncFlag 帧）。
+    void sendAsync(const Bytes& frame);
+
+    // ── 焦点 ──
+    uint64_t clientToken(fcitx::InputContext* ic) const;
+    uint64_t inputScopeMask(fcitx::InputContext* ic) const;
+    void sendFocusGained(fcitx::InputContext* ic);
+    void sendCaretUpdate(fcitx::InputContext* ic);
+    uint16_t prevCharFor(fcitx::InputContext* ic);
+    /// 修饰键单击：发一帧 eventType=UP 的 KeyEvent 并应用其响应。
+    void sendModifierTap(fcitx::InputContext* ic, uint32_t vk);
+    bool applyResponse(fcitx::InputContext* ic, const Frame& resp, bool hostShortcut);
+
+    // ── push ──
+    void onPushFrame(Frame frame);
+    fcitx::InputContext* focusedIC();
+
+    fcitx::Instance* instance_;
+    BridgeClient bridge_;
+    ResponseRouter router_;
+    ToggleTapDetector tap_;
+    uint16_t keySeq_ = 0;
+    bool lastReportedSecure_ = false;
+    bool serviceSeenOnce_ = false;
+    /// 按下时被本输入法吃掉的键（按硬件键码记）。松开时同样吃掉，免得宿主收到一个没有
+    /// 按下的松开——多数宿主无所谓，但有的会据此触发快捷键。
+    std::unordered_set<int> eatenKeys_;
+
+    fcitx::TrackableObjectReference<fcitx::InputContext> currentIC_;
+    fcitx::EventDispatcher dispatcher_;
+    std::unique_ptr<fcitx::EventSourceTime> holdTimer_;
+    std::unique_ptr<PushClient> push_;
+};
+
+class WindEngineFactory : public fcitx::AddonFactory {
+public:
+    fcitx::AddonInstance* create(fcitx::AddonManager* manager) override
+    {
+        return new WindEngine(manager->instance());
+    }
+};
+
+} // namespace windlinux

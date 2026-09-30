@@ -1,0 +1,104 @@
+// 把服务回来的响应帧路由成对宿主文本框的操作（纯逻辑，不依赖 Fcitx5）。
+//
+// 这是 wind_macos/Sources/WindInputKit/IPC/BridgeResponseRouter.swift 的 C++ 移植，
+// 语义逐条对齐（待定标点 held / 定格前缀 / hold 计时器 / 数字后智能标点记账）。
+// 抽成纯逻辑的理由与 Swift 侧相同：单测不必起 Fcitx5。
+//
+// ⚠️ **新增下行 cmd 必须在 apply() 里显式接一臂**——default 是「消费按键但不出字」，
+// 漏接的表现是按键被吃掉、屏幕上什么都没有（macOS 的历史案例：commitThenDefer 漏接
+// 导致码表顶码上屏丢字）。判断要不要接只看**谁产出**，不看名字像不像 Windows 专有。
+#pragma once
+
+#include "Codec.h"
+
+#include <cstdint>
+#include <functional>
+#include <string>
+
+namespace windlinux {
+
+/// 宿主文本框的抽象（Fcitx5 侧由 InputContext 实现，单测用桩）。
+class TextSink {
+public:
+    virtual ~TextSink() = default;
+    /// 真上屏。
+    virtual void commitText(const std::string& utf8) = 0;
+    /// 摆组合串（预编辑）。`utf8` 为空 = 清除组合。`caretBytes` 为组合内光标的 UTF-8 字节偏移。
+    virtual void setPreedit(const std::string& utf8, size_t caretBytes) = 0;
+    /// 删除光标前 `chars` 个字符；宿主不支持（无 surrounding text 能力）时返回 false、什么都不做。
+    virtual bool deleteBeforeCursor(size_t chars) = 0;
+    /// 移动宿主光标 `chars` 个字符（负 = 左）。Fcitx5 侧合成方向键。
+    virtual void moveCursor(int chars) = 0;
+};
+
+/// 数字后智能标点的 prevChar 记账——对位 Swift `SmartPunctDigitTracker`（语义与取舍见那边
+/// 的长注释）。Linux 上若宿主支持 surrounding text，addon 优先读真实的光标前字符，本记账
+/// 只在读不到时兜底。
+class DigitTracker {
+public:
+    uint16_t prevChar() const { return prevChar_; }
+    void reset() { prevChar_ = 0; }
+    /// 这一键产出的数字字符（0 = 不产出数字）。Ctrl/Alt/Win + 数字是宿主快捷键，不记。
+    static uint16_t digitChar(uint32_t vk, uint32_t modifiers);
+    /// 按键透传回宿主：产出数字则记，否则清零。
+    void noteKeyPassthrough(uint32_t vk, uint32_t modifiers) { prevChar_ = digitChar(vk, modifiers); }
+    /// 经引擎上屏的文本：末位是 ASCII 数字则记，否则清零；空串不动。
+    void noteCommittedText(const std::string& utf8);
+
+private:
+    uint16_t prevChar_ = 0;
+};
+
+class ResponseRouter {
+public:
+    /// 计时器调度器：ms 毫秒后在**主线程**回调 cb。未注入则 hold 计时器不工作（待定标点
+    /// 只在下一次按键/失焦时收口，功能不丢，只是下划线留得久一点）。
+    using TimerScheduler = std::function<void(uint32_t ms, std::function<void()> cb)>;
+    /// 计时器到点时借用「此刻的宿主」：调用方拿当前焦点造一个 sink 交给 `use`，焦点已不在
+    /// 任何文本框时交 nullptr。借用而非返回指针：sink 是短命的适配器，生命周期归调用方。
+    using SinkProvider = std::function<void(const std::function<void(TextSink*)>& use)>;
+
+    void setTimerScheduler(TimerScheduler s) { scheduler_ = std::move(s); }
+    void setSinkProvider(SinkProvider p) { sinkProvider_ = std::move(p); }
+
+    /// 路由一帧。返回值 = 按键是否被输入法消费（false ⇒ 交还宿主）。
+    ///
+    /// `hostShortcut`：触发本帧的按键带 Ctrl/Alt/Super。此时 ClearComposition 只表示「把组合
+    /// 清掉」，不表示这个键归输入法——宿主仍须收到它去执行复制/粘贴（对位 Swift 同名参数与
+    /// macOS issue #64）。
+    bool apply(const Frame& frame, TextSink* sink, bool hostShortcut = false);
+
+    /// 结束组合（失焦 / 宿主要求 reset）。待定标点转为提交而非丢弃。
+    void applyClearComposition(TextSink* sink);
+
+    /// 焦点换了：本端状态全部作废（不碰宿主）。
+    void reset();
+
+    bool hasComposition() const { return !compositionText_.empty(); }
+    const std::string& compositionText() const { return compositionText_; }
+    DigitTracker& digitTracker() { return digits_; }
+
+private:
+    void applyCommitText(const CommitTextPayload& p, TextSink* sink);
+    void applyUpdateComposition(const UpdateCompositionPayload& p, TextSink* sink);
+    void applyCommitTextWithCursor(const CommitTextWithCursorPayload& p, TextSink* sink);
+    void insertCommitted(const std::string& text, TextSink* sink);
+    void applyMarkedText(const std::string& text, size_t caretUtf16, TextSink* sink);
+    void setCompositionRaw(const std::string& text, TextSink* sink);
+    void flushPendingPrefix(TextSink* sink);
+    void absorbHeldIntoPrefix();
+    std::string takePendingPrefix();
+    void cancelHoldTimer() { ++holdGeneration_; }
+    void armHoldTimer(uint32_t ms);
+
+    std::string compositionText_;
+    bool hasHeld_ = false;
+    std::string heldSymbol_;          // 智能符号 HoldComposition 挂着的待定标点
+    std::string pendingCommitPrefix_; // 已定格、尚未真上屏的前缀
+    uint64_t holdGeneration_ = 0;
+    DigitTracker digits_;
+    TimerScheduler scheduler_;
+    SinkProvider sinkProvider_;
+};
+
+} // namespace windlinux

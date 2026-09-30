@@ -1,0 +1,183 @@
+// 帧编解码（纯 C++17，不依赖 Fcitx5）。
+//
+// 线上格式：8 字节头（u16 version | u16 cmd | u32 length，全部小端）+ payload。
+// 帧布局真源是 Rust `wind-ipc/src/codec.rs`；Swift 对位实现是
+// wind_macos/Sources/WindInputKit/IPC/BinaryCodec.swift——本文件的每个编解码函数都在
+// 注释里写明它对位的是哪一个，改布局时三处一起看。
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace windlinux {
+
+using Bytes = std::vector<uint8_t>;
+
+struct Frame {
+    uint16_t cmd = 0;
+    bool isAsync = false;
+    Bytes payload;
+};
+
+// ── 头 ──────────────────────────────────────────────────────────────
+constexpr size_t HEADER_SIZE = 8;
+constexpr uint32_t MAX_PAYLOAD_SIZE = 1024 * 1024;
+
+Bytes encodeHeader(uint16_t cmd, uint32_t payloadLen, bool async = false);
+
+struct HeaderInfo {
+    uint16_t cmd = 0;
+    uint32_t length = 0;
+    bool isAsync = false;
+};
+
+enum class HeaderError { None, VersionMismatch, PayloadTooLarge };
+
+/// 解 8 字节头。版本只比 major（高 4 位，剥掉 AsyncFlag 之后），与 Swift/Rust 一致。
+HeaderError decodeHeader(const uint8_t* buf, HeaderInfo& out);
+
+// ── 上行编码（返回完整帧：头 + payload）────────────────────────────────
+
+Bytes encodeEmptyFrame(uint16_t cmd, bool async = false);
+
+struct KeyEvent {
+    uint32_t keyCode = 0;   // Windows VK
+    uint32_t scanCode = 0;  // Linux 不上报扫描码，恒 0（同 macOS）
+    uint32_t modifiers = 0; // KEYMOD_* 通用位
+    uint8_t eventType = 0;  // KEY_EVENT_DOWN / KEY_EVENT_UP
+    uint8_t toggles = 0;    // TOGGLE_CAPSLOCK / TOGGLE_NUMLOCK
+    uint16_t eventSeq = 0;
+    uint16_t prevChar = 0;  // 光标前一字符（UTF-16，0 = 不可用）
+};
+
+/// CMD_KEY_EVENT：18 字节 payload（KeyPayload）。对位 Swift `encodeKeyEventFrame`。
+Bytes encodeKeyEventFrame(const KeyEvent& e);
+
+/// CMD_FOCUS_GAINED：39 字节定长段 + `bundleIdLen u32 + bundleId` + `windowClassLen u32 +
+/// windowClass`。对位 Swift `encodeFocusGainedFrame`（它只发到 bundleId 段为止）。
+///
+/// ⚠ **必须发满 39 字节**：Rust `FocusGainedPayload::from_bytes` 的下限是 39（旧 38），
+/// 发短了解码恒失败，焦点重型段（按应用初始模式 / 密码框强制英文 / 焦点状态气泡）整段
+/// 不执行——macOS 早期就栽在这里（见 wind_macos/AGENTS.md「按应用配置 / 焦点重型段」）。
+///
+/// caret 段全 0：服务端 `apply_focus_caret` 见 height==0 即返回，坐标另经 CMD_CARET_UPDATE。
+Bytes encodeFocusGainedFrame(uint64_t clientToken, uint64_t inputScopeMask,
+                             const std::string& hostName, const std::string& windowClass);
+
+/// CMD_FOCUS_LOST：clientToken u64 + reason u8（9 字节）。同步发送、服务端回 ack。
+Bytes encodeFocusLostFrame(uint64_t clientToken, uint8_t reason);
+
+/// CMD_IME_ACTIVATED / CMD_IME_DEACTIVATED：clientToken u64。服务端对这两条**从不回响应**
+/// （server.rs 的对应臂恒返回 None），故一律带 AsyncFlag 发、不读响应。
+Bytes encodeClientTokenFrame(uint16_t cmd, uint64_t clientToken);
+
+/// CMD_CARET_UPDATE：x/y/height（12 字节版，同 macOS）。坐标：屏幕左上为原点、y 向下，
+/// 物理像素（X11 根窗口坐标）。同步发送，服务端回 ack。
+Bytes encodeCaretUpdateFrame(int32_t x, int32_t y, int32_t height);
+
+/// CMD_CANDIDATE_SELECT：页内下标 i32（<0 为翻页按钮：-1 上页 / -2 下页）。
+Bytes encodeCandidateSelectFrame(int32_t index);
+/// CMD_CANDIDATE_HOVER：页内下标 i32（-1 = 无）。
+Bytes encodeCandidateHoverFrame(int32_t index);
+/// CMD_CANDIDATE_SCROLL：delta i32，WHEEL_DELTA(120) 倍数，正 = 上滚。
+Bytes encodeCandidateScrollFrame(int32_t delta);
+/// CMD_MENU_ACTION：菜单 id i32。
+Bytes encodeMenuActionFrame(int32_t id);
+/// CMD_EXT（上行扩展信封）：kindLen u32 + kind + bodyLen u32 + body。
+Bytes encodeExtFrame(const std::string& kind, const std::string& body);
+/// CMD_FRONT_CONTEXT：appLen+app + titleLen+title + selLen+sel（均 UTF-8）。
+Bytes encodeFrontContextFrame(const std::string& app, const std::string& title,
+                              const std::string& sel);
+
+// ── 下行解码（只解 payload，不含头）────────────────────────────────────
+
+struct CommitTextPayload {
+    uint32_t flags = 0;
+    std::string text;
+    std::string newComposition;
+};
+/// CMD_COMMIT_TEXT：flags u32 + textLen u32 + compLen u32 + text + composition。
+std::optional<CommitTextPayload> decodeCommitText(const Bytes& p);
+
+struct UpdateCompositionPayload {
+    uint32_t caretPos = 0; // 组合内光标，UTF-16 码元
+    std::string text;
+};
+/// CMD_UPDATE_COMPOSITION：caretPos u32 + text（剩余字节）。
+std::optional<UpdateCompositionPayload> decodeUpdateComposition(const Bytes& p);
+
+struct CommitTextWithCursorPayload {
+    std::string text;
+    uint32_t cursorOffset = 0; // 从文本末尾向左偏移的字符数
+};
+/// CMD_COMMIT_TEXT_WITH_CURSOR：textLen u32 + cursorOffset u32 + text。
+std::optional<CommitTextWithCursorPayload> decodeCommitTextWithCursor(const Bytes& p);
+
+/// CMD_MOVE_CURSOR：direction u32（1 = 右）。
+std::optional<uint32_t> decodeMoveCursor(const Bytes& p);
+
+struct ReplaceBackwardPayload {
+    uint32_t count = 0;
+    std::string text;
+};
+/// CMD_REPLACE_BACKWARD：count u32 + textLen u32 + text。
+std::optional<ReplaceBackwardPayload> decodeReplaceBackward(const Bytes& p);
+
+struct DeferredCompositionPayload {
+    uint32_t timeoutMs = 0;
+    std::string commitText;
+    std::string holdText;
+};
+/// CMD_HOLD_COMPOSITION：timeoutMs u32 + textLen u32 + text（commitText 恒空）。
+std::optional<DeferredCompositionPayload> decodeHoldComposition(const Bytes& p);
+/// CMD_COMMIT_AND_HOLD / CMD_COMMIT_THEN_DEFER：timeoutMs u32 + commitLen u32 + holdLen u32 +
+/// commit + hold（两者线格式相同）。
+std::optional<DeferredCompositionPayload> decodeCommitAndHold(const Bytes& p);
+
+/// CMD_KEY_TYPE：整段 UTF-8（无长度前缀）。
+std::string decodeKeyType(const Bytes& p);
+
+struct HostRenderFramePayload {
+    uint32_t seq = 0;
+    int32_t x = 0; // 逻辑点（top-left），Linux 上 scale 恒 1 ⇒ 即物理像素
+    int32_t y = 0;
+    uint32_t width = 0; // 设备像素
+    uint32_t height = 0;
+    uint32_t flags = 0;
+    uint32_t scale = 1;
+    bool visible() const { return (flags & 0x1) != 0; }
+};
+/// CMD_HOST_RENDER_FRAME（push）：seq,x,y,w,h,flags 各 u32/i32（24 字节）[+ scale u32]。
+std::optional<HostRenderFramePayload> decodeHostRenderFrame(const Bytes& p);
+
+struct CandidateHitRect {
+    int32_t index = 0;
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t w = 0;
+    int32_t h = 0;
+    bool contains(int32_t px, int32_t py) const
+    {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+};
+/// CMD_CANDIDATE_RECTS（push）：count u32 + count × (index,x,y,w,h 各 i32)。
+std::optional<std::vector<CandidateHitRect>> decodeCandidateRects(const Bytes& p);
+
+struct ExtEnvelope {
+    std::string kind;
+    Bytes body;
+};
+/// CMD_EXT（下行扩展信封）。解不出返回空——调用方按「未知消息」安静忽略（版本兼容的根本）。
+std::optional<ExtEnvelope> decodeExt(const Bytes& p);
+
+// ── 工具 ────────────────────────────────────────────────────────────
+
+/// FNV-1a 32 位散列，结果恒非 0（空串返回 0）。宿主标识用它代替 pid：
+/// 服务端以 pid==0 表示「未知宿主」并跳过按应用逻辑；散列满足「同宿主恒等、异宿主相异」，
+/// 且宿主重启后不变。对位 Swift `InputController.stableHash`。
+uint32_t stableHash(const std::string& s);
+
+} // namespace windlinux

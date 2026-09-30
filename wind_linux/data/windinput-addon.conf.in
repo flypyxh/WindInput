@@ -1,0 +1,9 @@
+[Addon]
+Name=WindInput
+Name[zh_CN]=清风输入法
+Category=InputMethod
+Version=@PROJECT_VERSION@
+Library=libwindinput
+Type=SharedLibrary
+OnDemand=True
+Configurable=False

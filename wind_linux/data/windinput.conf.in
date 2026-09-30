@@ -1,0 +1,8 @@
+[InputMethod]
+Name=WindInput
+Name[zh_CN]=清风输入法
+Icon=input-keyboard
+Label=风
+LangCode=zh_CN
+Addon=windinput
+Configurable=False
