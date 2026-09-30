@@ -738,6 +738,10 @@ impl CodeTableEngine {
 
 /// 通配结果合并影子层命中（spec §4.2）：以 `(text, code)` 为键先收已启用的，再追加键未出现过的
 /// 影子层命中并置 `from_disabled_dict`——同键留已启用那条（沿用 Composite 的去重语义）。
+///
+/// ⚠️ 去重只对两边**本轮取到的**条目有效。开启仅单字且加倍重取一直取到硬上限时，主层可能仍被
+/// 截断，某条同时存在于主层被截段与影子层的候选会被当作影子命中，「未启用」标记在这种极端情形下
+/// 可能打错（不会产生重复候选，可接受）。
 fn merge_disabled_hits(enabled: Vec<Candidate>, disabled: Vec<Candidate>) -> Vec<Candidate> {
     if disabled.is_empty() {
         return enabled;
@@ -2777,6 +2781,60 @@ mod tests {
                 .iter()
                 .all(|c| c.text != "门头沟区")
         );
+    }
+
+    /// Task 8 审查 (c)：仅单字 + 影子层。影子层的词组同样被滤掉；取尽判据是**双边**的——
+    /// 首轮影子层没取满（35 < 100）但主层取满了（100 条全是词组），必须再取一轮才能把主层
+    /// 被截掉的 10 个单字捞回来。若只看任一边就判取尽，结果会只剩影子层那 30 个。
+    #[test]
+    fn wildcard_single_only_filters_disabled_hits_and_exhausts_on_both_sides() {
+        let code = |i: u32| {
+            let c1 = (b'a' + (i / 26) as u8) as char;
+            let c2 = (b'a' + (i % 26) as u8) as char;
+            format!("q{c1}{c2}")
+        };
+        let mut owned: Vec<(String, String, i32)> = Vec::new();
+        for i in 0..150u32 {
+            owned.push((code(i), format!("词组{i}"), 10_000 - i as i32));
+        }
+        for i in 0..10u32 {
+            owned.push((code(i), char::from_u32(0x4E00 + i).unwrap().to_string(), 1));
+        }
+        let refs: Vec<(&str, &str, i32)> = owned
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let mut xz: Vec<(String, String, i32)> = (0..30u32)
+            .map(|i| (code(i), char::from_u32(0x5E00 + i).unwrap().to_string(), 1))
+            .collect();
+        xz.extend((0..5u32).map(|i| (code(i), format!("影子词组{i}"), 9999)));
+        let xz_refs: Vec<(&str, &str, i32)> = xz
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = engine_opts(&refs, single_only_opts()).with_disabled_dicts(
+            super::super::DisabledDictLayers::new(
+                vec![disabled_mem("xz", &xz_refs)],
+                std::iter::empty(),
+                None,
+            ),
+        );
+        let r = e
+            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
+            .unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| wind_candidate::single_markable_char(&c.text).is_some()),
+            "影子层词组同样被滤掉"
+        );
+        let flags: Vec<bool> = r.candidates.iter().map(|c| c.from_disabled_dict).collect();
+        assert_eq!(
+            flags.len(),
+            40,
+            "主层 10 个单字（须重取才见）+ 影子层 30 个"
+        );
+        assert!(flags[..10].iter().all(|f| !f) && flags[10..].iter().all(|f| *f));
     }
 
     /// spec §4.2：`(text, code)` 去重（同键留已启用那条），已启用排前，档内再按 base_sort。
