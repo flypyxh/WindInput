@@ -86,7 +86,8 @@ fn page_until_more_than(c: &Coordinator, than: usize) -> usize {
     c.debug_candidate_count()
 }
 
-/// spec §3.2 + codetable-wildcard §11：首批 100、`has_more`、翻到边界 ×2 扩充。缺 Task 18 时红在扩充。
+/// spec §3.2 + codetable-wildcard §11：首批 100、`has_more`、翻到边界 ×2 扩充。翻页扩充若漏了反查
+/// 模式那一臂，红在扩充。
 #[test]
 fn reverse_azzz_first_batch_100_and_expands() {
     if !dict_ready() {
@@ -137,7 +138,7 @@ fn page_until_relaxed(c: &Coordinator) -> bool {
 
 /// 翻到末页再按一次 ⇒ 被智能档滤掉的反查生僻字追加在末尾，原有顺序不动、模式不退；
 /// 放宽态在本次按键结束后仍在（`expire_scope_override` 看的是 `special_buffer`，不是恒空的
-/// `input_buffer`——看错了会在同一键里静默撤销）。缺 Task 18 时红在「应放宽」。
+/// `input_buffer`——看错了会在同一键里静默撤销）。末页放宽若漏了反查模式那一臂，红在「应放宽」。
 #[test]
 fn reverse_page_end_relax_appends_filtered() {
     if !dict_ready() {

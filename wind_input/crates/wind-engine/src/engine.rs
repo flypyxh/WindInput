@@ -411,6 +411,13 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// 影子层（未启用扩展词库，只给通配 / 反查查询用）。只有挂了它的码表引擎返回 `Some`
+    /// （开关开且方案有扩展库），混输代理主码表。管理器据此在后台预热，见
+    /// `EngineManager::warm_disabled_dicts_async`。
+    fn disabled_dict_layers(&self) -> Option<&crate::codetable::DisabledDictLayers> {
+        None
+    }
+
     /// 反查模式转换（reverse-mode spec §3）：与 [`Self::convert_wildcard`] 同一查询内核，
     /// 但**不看** `wildcard` 主开关；`pattern` 由协调器把每个通配键位替换成 `WILDCARD_SLOT`。
     fn convert_reverse(

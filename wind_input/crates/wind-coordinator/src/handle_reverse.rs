@@ -401,7 +401,8 @@ mod tests {
         assert_eq!(c.debug_preedit(), "\\zb");
     }
 
-    /// ★ 裁决 13：退出时翻页 / 放宽三位一并复位。上面的端到端用例候选不足一批、放宽也没触发，
+    /// ★ 退出时翻页 / 放宽三位（`has_more` / `candidate_limit` / `scope_relaxed`）一并复位：
+    /// special 族原本不写这三位，反查模式会写，不复位就会漏进下一次进入的首批。上面的端到端用例候选不足一批、放宽也没触发，
     /// 三位本就是假，测不出复位——这里先把它们置脏再退出。
     #[test]
     fn exit_resets_paging_and_relax_bits() {

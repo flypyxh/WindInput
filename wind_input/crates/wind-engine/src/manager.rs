@@ -1280,7 +1280,15 @@ impl EngineManager {
         if schema_id.is_empty() {
             return Default::default();
         }
-        let system = self.reverse_index_if_ready_in(schema_id, scope);
+        // 变体（含未启用扩展库）还没建好、或被崩溃保护跳过时，回退常规那份：至少把启用集里的码
+        // 显示出来，而不是整段空白；变体建好后下一次查询自然升级。注释调用方照旧后台补建变体。
+        let system = self
+            .reverse_index_if_ready_in(schema_id, scope)
+            .or_else(|| {
+                (scope != ReverseScope::Enabled)
+                    .then(|| self.reverse_index_if_ready_in(schema_id, ReverseScope::Enabled))
+                    .flatten()
+            });
         let user = self.store.as_ref().and_then(|s| {
             crate::text_codes::get_or_refresh(&self.user_text, s, &self.data_schema_id(schema_id))
         });
@@ -1338,6 +1346,16 @@ impl EngineManager {
     /// 两份内容相同，不另建。结果按方案缓存，失效点同 `reverse_index`。
     pub fn comment_reverse_scope(&self, schema_id: &str) -> ReverseScope {
         if schema_id.is_empty() {
+            return ReverseScope::Enabled;
+        }
+        // 短路：该方案的码表引擎已加载、却没挂影子层 ⇒ 构建时折叠出的开关（全局 + 方案级覆盖，
+        // 与下面同一口径）是关的，或方案根本没有扩展库——两种都只能是常规范围。这条判据只看
+        // 内存，不读方案文件、不写缓存：本函数在按键线程上每次注释刷新都会走到，开关关着的
+        // 用户（出厂即关）不该为此读盘。引擎与本缓存同生命周期（`invalidate_schema` /
+        // `reload_from_config` 一并清），不会拿旧引擎判新配置。引擎未加载时照旧走下面的读盘判定。
+        if self.loaded_engine_type(schema_id) == Some(EngineType::CodeTable)
+            && self.loaded_disabled_dict_engine(schema_id).is_none()
+        {
             return ReverseScope::Enabled;
         }
         if let Some(s) = self
@@ -1745,6 +1763,16 @@ impl EngineManager {
             .insert(reverse_index_key(schema_id, scope));
     }
 
+    /// 仅供跨 crate 的测试观察注释反查范围缓存（`None` = 未缓存）；生产代码不调用。
+    #[doc(hidden)]
+    pub fn reverse_scope_cached_for_test(&self, schema_id: &str) -> Option<ReverseScope> {
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .copied()
+    }
+
     /// [`Self::reverse_index_skipped`] 的按范围版本。
     pub fn reverse_index_skipped_in(&self, schema_id: &str, scope: ReverseScope) -> bool {
         self.reverse_index_skipped
@@ -1769,6 +1797,68 @@ impl EngineManager {
                 .index_build_lock_for(&reverse_index_key(schema_id, scope))
                 .try_lock()
                 .is_err()
+    }
+
+    /// 已加载引擎的影子层（未启用扩展词库）；引擎未加载、或没挂影子层（开关关 / 方案无扩展库）
+    /// 时 `None`。**只看已加载的**、不触发构建——调用方在按键线程上也可能走到这里。
+    fn loaded_disabled_dict_engine(&self, schema_id: &str) -> Option<Arc<dyn Engine>> {
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .filter(|e| e.disabled_dict_layers().is_some())
+            .cloned()
+    }
+
+    /// 阻塞地把 `schema_id` 已加载引擎的影子层建好（预热线程 / 测试用，**不可进按键链路**）。
+    /// 返回是否真的建了；引擎未加载、没挂影子层或已建好时返回 false。
+    pub fn prewarm_disabled_dicts(&self, schema_id: &str) -> bool {
+        self.loaded_disabled_dict_engine(schema_id)
+            .and_then(|e| e.disabled_dict_layers().map(|d| d.warm()))
+            .unwrap_or(false)
+    }
+
+    /// 后台预热 `schema_id` 已加载引擎的影子层（未启用扩展词库，reverse-mode spec §4.2）。
+    ///
+    /// 影子层是懒加载的：没有这一步，首次通配 / 反查查询会在**按键线程**上（持协调器 state 锁）
+    /// 逐库 mmap、缺缓存时还要现建 wdat——扩展库大时整机顿住。这里把那次加载挪到后台线程。
+    ///
+    /// - **零开销前提**：开关关或方案没有扩展库时引擎根本不挂影子层，这里一查即返回、不起线程；
+    ///   只看**已加载**的引擎，不触发构建（调用点可能在按键线程上）。
+    /// - **去重**：已建好或正有线程在建（`needs_warm` 用 `try_lock` 判）就不再起。
+    /// - **与按键线程串行**：加载持影子层内部那把锁。按键线程若撞上正在进行的预热就等它建完、
+    ///   直接复用——最坏情形等同没有预热；预热失败的库照旧 `warn!` 跳过，线程不 panic。
+    ///
+    /// 调用点：活跃方案引擎（重）建好时（`ensure_loaded`）、活跃方案变更时（`on_active_changed`）、
+    /// 热禁用扩展库之后（`set_dict_enabled_live`）。
+    fn warm_disabled_dicts_async(&self, schema_id: &str) {
+        let Some(engine) = self.loaded_disabled_dict_engine(schema_id) else {
+            return;
+        };
+        if !engine
+            .disabled_dict_layers()
+            .is_some_and(|d| d.needs_warm())
+        {
+            return;
+        }
+        let sid = schema_id.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("disabled-dicts-warm".into())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                if engine.disabled_dict_layers().is_some_and(|d| d.warm()) {
+                    debug!("后台预热未启用扩展词库 {} 用时 {:?}", sid, t0.elapsed());
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("无法启动未启用扩展词库预热线程: {e}（首次通配时再加载）");
+        }
+    }
+
+    /// 影子层建过几遍（测试与诊断用）；引擎未加载或没挂影子层时 `None`。
+    pub fn disabled_dicts_load_count(&self, schema_id: &str) -> Option<usize> {
+        self.loaded_disabled_dict_engine(schema_id)
+            .and_then(|e| e.disabled_dict_layers().map(|d| d.load_count()))
     }
 
     /// 单字全码表是否已就绪。它与反查索引同为**惰性全量构建**（同一批词库、同一量级），
@@ -2616,6 +2706,11 @@ impl EngineManager {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(schema_id.to_string(), Arc::from(engine));
+                // 活跃方案的引擎（重）建好了：影子层后台预热。非活跃方案等切过去时再热
+                // （`on_active_changed`），不为用户未必会用的方案读盘。
+                if schema_id == self.active_schema_id() {
+                    self.warm_disabled_dicts_async(schema_id);
+                }
                 true
             }
             None => {
@@ -3369,6 +3464,11 @@ impl EngineManager {
             .single_char_codes
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // 禁用方向把一个库挪进了影子集合、作废了已建的影子层：趁现在后台重建，别等首次通配
+        // 在按键线程上读盘。启用方向走失效重建，新引擎建好时自会预热（见 `ensure_loaded`）。
+        if !enabled {
+            self.warm_disabled_dicts_async(&self.active_schema_id());
+        }
         // 恒 true：上面每条路都以「无需重启即可生效」收尾。保留返回值是为了兼容既有调用方
         // （web 的 `live` 字段），也给将来真出现「必须重启」的分支留个位置。
         true
@@ -3571,6 +3671,8 @@ impl EngineManager {
         self.schema_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::active_hook::notify_active_changed(id);
+        // 切到的方案若挂着影子层，趁现在后台预热（所有改 `active` 的路径都经过这里）。
+        self.warm_disabled_dicts_async(id);
     }
 
     /// 活跃方案的变更代际，见 [`Self::schema_generation`] 字段说明。
@@ -6011,7 +6113,8 @@ impl EngineManager {
                 .with_charset(charset)
                 .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema));
             // 影子层（未启用扩展库，只给通配 / 反查用，spec §4.2）：开关关或无扩展库时不挂。
-            // 混输的主码表子引擎也走这里、用的是主方案的 `eff`（契约 7）；英文分支不接。
+            // 混输的主码表子引擎也走这里，开关取主码表方案折叠出的 `eff`（混输自身没有独立的
+            // 码表配置，与其余码表行为同一口径）；英文分支不接。
             if eff.lookup_disabled_dicts
                 && let Some(d) = Self::disabled_dict_layers(&schema, &schemas, loaded_extra_ids)
             {
@@ -6164,8 +6267,9 @@ impl EngineManager {
     ///
     /// `load` 闭包与 `load_codetable_layers` 同一条读盘路径（`resolve_dict_file` + `cache_path` +
     /// `CachedDict::load_at_with`），**只返回 `Result`、不 panic**：失败由影子层 `warn!` 后跳过该库
-    /// （spec §4.3）。它在首次通配 / 反查查询时于**按键线程同步**调用（可能 mmap 或首建 wdat）——
-    /// 属设计接受：契约 4 要求「从未查询 ⇒ 零加载」，故不预热；之后复用，直到失效重建。
+    /// （spec §4.3）。它可能 mmap 或首建 wdat，大扩展库上是秒级读盘，故由后台线程预热
+    /// （[`Self::warm_disabled_dicts_async`]），不留给首次通配 / 反查的按键线程；预热没赶上时
+    /// 按键线程等它建完或自己现建，之后复用，直到失效重建。开关关着时影子层不挂，从不调用。
     fn disabled_extra_sources(
         schema: &Schema,
         schemas_dir: &Path,
@@ -6193,7 +6297,7 @@ impl EngineManager {
     /// 组装影子层：来源见 [`Self::disabled_extra_sources`]，启用集 = 本次 `load_codetable_layers`
     /// **实际挂上**的扩展库 id（不是 `is_enabled()`：用户覆盖启用的已挂上、不进影子；启用但加载
     /// 失败的算未挂，影子层会再试一次、再失败也只 warn）。主库恒不在来源里。
-    /// 无扩展库 ⇒ `None`，不挂（零开销，契约 1/4）。开关由调用方判。
+    /// 无扩展库 ⇒ `None`，不挂：没有可查的未启用库，就不该为它付任何构造或预热开销。开关由调用方判。
     fn disabled_dict_layers(
         schema: &Schema,
         schemas_dir: &Path,

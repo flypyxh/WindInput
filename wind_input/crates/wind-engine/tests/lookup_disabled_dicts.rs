@@ -171,7 +171,8 @@ fn only_disabled_extra_hits_carry_the_flag() {
     assert_eq!(flags("aaa?", "aaaz"), [("甘蓝菜".to_string(), false)]);
 }
 
-/// spec §4.2：注释反查变体含未启用库；加词查重（word_codes_in）与悬停（word_codes_display）口径不变（裁决 6）。
+/// spec §4.2：注释反查变体含未启用库；加词查重（word_codes_in）与悬停（word_codes_display）仍只认启用集
+/// ——查重若含未启用库，只在那里有的码+词会被误判为「已存在」。
 #[test]
 fn comment_reverse_variant_includes_disabled_extra() {
     let (m, id, _g) = setup("rev", true, true, true);
@@ -256,7 +257,7 @@ fn scope_cache_invalidated_on_dict_toggle() {
     assert_eq!(m.comment_reverse_scope(&id), ReverseScope::Enabled);
 }
 
-/// 裁决 7：开关关 / 方案没有未启用库 ⇒ 退化为常规索引，不另建文件。
+/// 开关关 / 方案没有未启用库 ⇒ 退化为常规索引，不另建文件（两份内容相同，另建只是白占内存与磁盘）。
 #[test]
 fn scope_collapses_to_enabled() {
     let (off, id, _g) = setup("scope_off", false, true, true);
@@ -274,5 +275,108 @@ fn variant_invalidated_on_dict_toggle() {
     assert!(
         m.reverse_index_if_ready_in(&id, ReverseScope::WithDisabled)
             .is_none()
+    );
+}
+
+/// 等后台预热线程把影子层建完（最多 10 秒）；返回最终的建表次数。
+fn wait_disabled_loaded(m: &EngineManager, id: &str) -> Option<usize> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = m.disabled_dicts_load_count(id);
+        if n != Some(0) || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// 开关开：引擎建好后影子层由后台线程预热，首次通配不再在按键线程上读盘（只建一遍）。
+#[test]
+fn disabled_layers_warm_in_background_when_switch_on() {
+    let (m, id, _g) = setup("warm_on", true, true, true);
+    assert!(m.prewarm_schema(&id));
+    assert_eq!(wait_disabled_loaded(&m, &id), Some(1), "后台预热应已建好");
+    assert!(!m.prewarm_disabled_dicts(&id), "已建好，不再建");
+    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法", "门头沟区"]);
+    assert_eq!(
+        m.disabled_dicts_load_count(&id),
+        Some(1),
+        "首次通配复用预热结果"
+    );
+}
+
+/// 开关关：引擎不挂影子层，预热无从谈起（不起线程、不读盘）。
+#[test]
+fn switch_off_never_warms_disabled_layers() {
+    let (m, id, _g) = setup("warm_off", false, true, true);
+    assert!(m.prewarm_schema(&id));
+    assert_eq!(m.disabled_dicts_load_count(&id), None);
+    assert!(!m.prewarm_disabled_dicts(&id));
+    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
+}
+
+/// 开关全关（全局与方案都没开）：注释反查范围直接判常规，不读方案文件、不写范围缓存。
+#[test]
+fn scope_short_circuits_when_switch_off() {
+    let (m, id, _g) = setup("scope_short", false, true, true);
+    assert!(m.prewarm_schema(&id));
+    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::Enabled);
+    let _ = m.codetable_reverse_hint("立法");
+    assert_eq!(m.reverse_scope_cached_for_test(&id), None, "不该落范围缓存");
+}
+
+/// 全局关、方案级开：短路不得误判，仍是含未启用库的变体范围。
+#[test]
+fn scope_follows_schema_override_when_global_off() {
+    let (m, id, _g) = setup("scope_schema_on", false, true, true);
+    let ov: toml::Value =
+        toml::from_str("[engine.codetable]\nlookup_disabled_dicts = true\n").unwrap();
+    m.write_schema_override(&id, &ov).unwrap();
+    assert!(m.prewarm_schema(&id));
+    assert!(
+        m.disabled_dicts_load_count(&id).is_some(),
+        "方案级开 ⇒ 挂影子层"
+    );
+    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
+}
+
+/// 变体还没建好、常规已就绪：注释先用常规索引出启用集里的码，不整段空白。
+#[test]
+fn comment_reverse_falls_back_to_regular_while_variant_missing() {
+    let (m, id, _g) = setup("fallback", true, true, true);
+    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
+    assert!(m.prewarm_reverse_index(&id));
+    assert!(
+        m.reverse_index_if_ready_in(&id, ReverseScope::WithDisabled)
+            .is_none()
+    );
+    assert_eq!(m.codetable_reverse_hint("立法").as_deref(), Some("uuif"));
+    assert_eq!(
+        m.word_codes_display_for_comment(&id, "立法").as_deref(),
+        Some("uuif")
+    );
+    assert_eq!(
+        m.codetable_reverse_hint("门头沟区").as_deref(),
+        Some(""),
+        "变体没就绪时未启用库的词暂缺"
+    );
+    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
+    assert_eq!(
+        m.codetable_reverse_hint("门头沟区").as_deref(),
+        Some("uuia"),
+        "变体就绪后自然升级"
+    );
+}
+
+/// 变体被崩溃保护跳过：同样回退常规索引。
+#[test]
+fn comment_reverse_falls_back_when_variant_skipped() {
+    let (m, id, _g) = setup("fallback_skip", true, true, true);
+    m.mark_reverse_index_skipped_for_test(&id, ReverseScope::WithDisabled);
+    assert!(m.prewarm_reverse_index(&id));
+    assert_eq!(m.codetable_reverse_hint("立法").as_deref(), Some("uuif"));
+    assert_eq!(
+        m.word_codes_display_for_comment(&id, "立法").as_deref(),
+        Some("uuif")
     );
 }

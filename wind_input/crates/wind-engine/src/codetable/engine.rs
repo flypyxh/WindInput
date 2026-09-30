@@ -1037,6 +1037,10 @@ impl Engine for CodeTableEngine {
         self.opts.reverse_key
     }
 
+    fn disabled_dict_layers(&self) -> Option<&super::DisabledDictLayers> {
+        self.disabled_dicts.as_ref()
+    }
+
     /// 反查模式查询（reverse-mode spec §3.2）：与 `convert_wildcard` 共用 `wildcard_query`，
     /// 但不看 `wildcard` 主开关；仅单字 / 影子层随内核自动生效。
     fn convert_reverse(

@@ -8,8 +8,10 @@
 //!
 //! 生命周期：
 //! - 构造只登记来源（`declared`）与当前启用集，**不读盘**；
-//! - 首次 [`DisabledDictLayers::search_pattern`] 在锁内逐源加载「声明 − 启用」那些库，失败的
-//!   `warn!` 后跳过（不阻塞、不重试，直到下次失效）；
+//! - [`DisabledDictLayers::warm`]（后台预热线程）或首次 [`DisabledDictLayers::search_pattern`]
+//!   在锁内逐源加载「声明 − 启用」那些库，失败的 `warn!` 后跳过（不阻塞、不重试，直到下次失效）。
+//!   两者经同一把锁串行：按键线程撞上正在进行的预热就等它建完、直接复用，不会重建第二遍；
+//!   预热没赶上（或压根没起）时退化为按键线程现建，与没有预热时相同；
 //! - 禁用一个启用中的库经 [`DisabledDictLayers::mark_disabled`] 进入影子集合、已加载的作废；
 //!   启用方向不经这里——引擎整体失效重建，影子层随之重建。
 
@@ -87,11 +89,32 @@ impl DisabledDictLayers {
         self.loads.load(Ordering::SeqCst)
     }
 
+    /// 预热：把影子集合现在就建好（阻塞读盘，**只可在后台线程调**）。返回是否真的建了——
+    /// 已建好的直接返回 false。与查询共用 [`Self::dm`] 那把锁，故与按键线程天然串行。
+    pub fn warm(&self) -> bool {
+        self.dm_built().1
+    }
+
+    /// 还没建、且此刻没有别的线程正在建 ⇒ 值得起一个预热线程。不阻塞（`try_lock`）：
+    /// 锁被占着说明有人正在建（或正取 `Arc`），不必再起第二个。
+    pub fn needs_warm(&self) -> bool {
+        match self.loaded.try_lock() {
+            Ok(g) => g.is_none(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().is_none(),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
     /// 取已加载的影子 `DictManager`，没有就在锁内现建。查询在锁外做（只克隆 `Arc`）。
     fn dm(&self) -> Arc<DictManager> {
+        self.dm_built().0
+    }
+
+    /// [`Self::dm`]，另带「这次是不是现建的」。
+    fn dm_built(&self) -> (Arc<DictManager>, bool) {
         let mut loaded = lock(&self.loaded);
         if let Some(dm) = loaded.as_ref() {
-            return dm.clone();
+            return (dm.clone(), false);
         }
         let enabled = lock(&self.enabled).clone();
         let dm = DictManager::new();
@@ -113,7 +136,7 @@ impl DisabledDictLayers {
         self.loads.fetch_add(1, Ordering::SeqCst);
         let dm = Arc::new(dm);
         *loaded = Some(dm.clone());
-        dm
+        (dm, true)
     }
 }
 
@@ -181,6 +204,26 @@ mod tests {
             1,
             "只读了影子集合里的那一个库"
         );
+    }
+
+    /// 预热建一遍、之后查询复用；已建好时 `warm` 不再建，`needs_warm` 转 false。
+    #[test]
+    fn warm_builds_once_and_query_reuses_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let d = DisabledDictLayers::new(
+            vec![mem_source("xz", &[("uuia", "门头沟区", 1)], calls.clone())],
+            std::iter::empty(),
+            None,
+        );
+        assert!(d.needs_warm());
+        assert!(d.warm(), "首次预热真的建了");
+        assert!(!d.needs_warm());
+        assert!(!d.warm(), "已建好不再建");
+        d.search_pattern(&slot("uui?"), wind_dict::WILDCARD_SLOT, 10, true);
+        assert_eq!(d.load_count(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        d.mark_disabled("xz");
+        assert!(d.needs_warm(), "作废后需要重新预热");
     }
 
     /// 禁用一个库 ⇒ 它进影子集合、已加载的作废重建。

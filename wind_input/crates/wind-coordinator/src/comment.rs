@@ -1070,6 +1070,26 @@ impl crate::coordinator::Coordinator {
         if found.get() { out } else { String::new() }
     }
 
+    /// 注释 / 反查候选的 `code` / `code_rev` 取值（注释反查范围）。系统层没就绪给空串。
+    ///
+    /// ★ 补建变体索引**不能**再以「取到 `None`」为信号：变体（含未启用扩展库）没就绪时引擎会
+    /// 回退常规索引、照常给出启用集里的码，`None` 只剩「常规那份也没就绪」一种情形。故每次都
+    /// 调 [`Self::warm_comment_reverse_index`]——已就绪 / 正在建 / 被跳过时它立刻返回。
+    fn comment_reverse_hint(&self, text: &str) -> String {
+        let v = self.engine_mgr.codetable_reverse_hint(text);
+        self.warm_comment_reverse_index();
+        v.unwrap_or_default()
+    }
+
+    /// `code_all` / `code_rev_all` 取值，范围与补建同 [`Self::comment_reverse_hint`]。
+    fn comment_reverse_codes_all(&self, schema_id: &str, text: &str) -> String {
+        let v = self
+            .engine_mgr
+            .word_codes_display_for_comment(schema_id, text);
+        self.warm_comment_reverse_index();
+        v.unwrap_or_default()
+    }
+
     /// 纯文本（无候选身份）的模板变量求值。`None` = 未知变量名。
     ///
     /// 变量语义与 [`Self::eval_var`] 逐项对齐，仅两点差异：
@@ -1093,15 +1113,9 @@ impl crate::coordinator::Coordinator {
             // 效果不变，但不会在「模板里还有别的非空变量」时把字面 `${code_rev}`
             // 混进上屏文本。索引建好后下一次按键即恢复。
             //
-            // 未就绪时顺手后台建注释范围那份（开关开且方案有未启用扩展库时是变体，契约 5）。
-            "code_rev" | "code" => {
-                self.engine_mgr
-                    .codetable_reverse_hint(text)
-                    .unwrap_or_else(|| {
-                        self.warm_comment_reverse_index();
-                        String::new()
-                    })
-            }
+            // 注释范围那份索引（开关开且方案有未启用扩展库时是变体）由 `comment_reverse_hint`
+            // 顺手在后台补建，见该函数。
+            "code_rev" | "code" => self.comment_reverse_hint(text),
             // `code_all` —— 该字在码表里的**全部**码位，默认 `/` 连接（`我` → `q/trn/trnt`）。
             //
             // 与 `code` 的分工照搬同文件 `chaizi` / `chaizi_all` 的既有惯例：不带后缀取单个，
@@ -1114,13 +1128,7 @@ impl crate::coordinator::Coordinator {
             "code_rev_all" | "code_all" => {
                 let sid = self.engine_mgr.code_source_schema();
                 // 空串的理由同上面的 `code_rev`；范围与预热也同它（含未启用扩展库的变体索引）。
-                let codes = self
-                    .engine_mgr
-                    .word_codes_display_for_comment(&sid, text)
-                    .unwrap_or_else(|| {
-                        self.warm_comment_reverse_index();
-                        String::new()
-                    });
+                let codes = self.comment_reverse_codes_all(&sid, text);
                 match arg {
                     // `word_codes_display` 固定用 `/` 连接，换分隔符只能在这里替。
                     Some(sep) if !codes.is_empty() => codes.replace('/', sep),
@@ -1252,13 +1260,8 @@ impl crate::coordinator::Coordinator {
             // `${code_rev}` 四个字符。
             "code_rev" | "code" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
-                    // 未就绪：后台建注释范围那份（契约 5），本次空着。
-                    self.engine_mgr
-                        .codetable_reverse_hint(&c.text)
-                        .unwrap_or_else(|| {
-                            self.warm_comment_reverse_index();
-                            String::new()
-                        })
+                    // 未就绪时本次空着；注释范围那份的后台补建见 `comment_reverse_hint`。
+                    self.comment_reverse_hint(&c.text)
                 } else {
                     String::new()
                 }
@@ -1277,13 +1280,7 @@ impl crate::coordinator::Coordinator {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
                     let sid = self.engine_mgr.code_source_schema();
                     // 含未启用扩展库与否看注释范围（变体索引只供注释反查）；悬停 `[编码]` 段仍用启用集。
-                    let codes = self
-                        .engine_mgr
-                        .word_codes_display_for_comment(&sid, &c.text)
-                        .unwrap_or_else(|| {
-                            self.warm_comment_reverse_index();
-                            String::new()
-                        });
+                    let codes = self.comment_reverse_codes_all(&sid, &c.text);
                     match arg {
                         Some(sep) if !codes.is_empty() => codes.replace('/', sep),
                         _ => codes,
@@ -3321,6 +3318,34 @@ mod comment_reverse_scope_tests {
         );
         assert_eq!(
             c.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
+            Some("uuia")
+        );
+    }
+
+    /// 变体没就绪时注释先回退常规索引（结果非空），仍须在后台补建变体——补建的信号不能只靠「取到 None」。
+    #[test]
+    fn comment_fallback_to_regular_still_warms_variant() {
+        use wind_engine::ReverseScope;
+        let (c, g) = coord("fallback", true);
+        assert!(c.engine_mgr.prewarm_reverse_index(&g.id));
+        let rev = wind_reverse::ReverseLookup::default();
+        assert_eq!(
+            c.eval_text_var("code_rev", None, "工", &rev).as_deref(),
+            Some("a"),
+            "变体未就绪时回退常规索引"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while c
+            .engine_mgr
+            .reverse_index_if_ready_in(&g.id, ReverseScope::WithDisabled)
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline, "变体没被后台建出来");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            c.eval_text_var("code_rev", None, "门头沟区", &rev)
+                .as_deref(),
             Some("uuia")
         );
     }
