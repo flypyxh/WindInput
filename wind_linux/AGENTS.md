@@ -17,6 +17,7 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/Codec.h` + `src/core/Codec.cpp` | 帧编解码。每个函数注明对位的 Swift `BinaryCodec` 函数 |
 | `include/Bridge.h` + `src/core/Bridge.cpp` | UDS 请求/响应客户端（2s 超时、`MSG_NOSIGNAL`）、push 监听线程（断线每秒重连）、端点路径 |
 | `include/KeyMap.h` + `src/core/KeyMap.cpp` | X11 keysym / 修饰状态 → Windows VK / 协议修饰位；修饰键单击检测 |
+| `include/KeySynth.h` + `src/core/KeySynth.cpp` | 命令直通车按键合成的纯逻辑：键名 → keysym、组合 → 按下 / 抬起事件列、key.hold 的按住记账（卡键保护）与限流。见下「命令直通车按键合成」 |
 | `include/ResponseRouter.h` + `src/core/ResponseRouter.cpp` | 响应帧 → 宿主操作。Swift `BridgeResponseRouter` 的逐条移植（待定标点 / 定格前缀 / hold 计时器 / 数字后智能标点记账） |
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
@@ -49,7 +50,8 @@ scripts/linux/e2e.sh                            # 端到端：真服务 + 真 fc
 ```
 
 `e2e.sh` 的做法（改它之前先读脚本头注释）：`dbus-run-session` 起私有会话总线；服务二进制拷进
-临时目录、`data` 软链到 `build_dev/data`，配置/数据/缓存全用 `XDG_*_HOME` 隔离，socket 走
+临时目录、`data` 下逐项软链到 `build_dev/data`（`system.phrases.toml` 例外：取仓库 `data/` 那份再追加
+e2e 专用的按键合成短语——`build_dev/data` 是构建时的拷贝，可能落后于短语改动），配置/数据/缓存全用 `XDG_*_HOME` 隔离，socket 走
 `WIND_INPUT_RUNTIME_DIR`；fcitx5 以 `--disable=all --enable=keyboard,dbus,dbusfrontend,windinput`
 起，`FCITX_ADDON_DIRS` / `FCITX_DATA_DIRS` 指到构建目录；`e2e_client.py`（dbus-next）经
 `org.fcitx.Fcitx.InputContext1.ProcessKeyEvent` 送键，收 `CommitString` / `UpdateFormattedPreedit`
@@ -215,6 +217,57 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
   点状态区动作，听 `org.kde.kimpanel.inputmethod` 的 `UpdateProperty` 取当前输入法图标），故
   fcitx5 要 `--enable` 上 `kimpanel`。
 
+## 命令直通车按键合成
+
+服务端（`ext_presenter`）不自己合成按键：`key.tap / seq / hold / release` 经
+`handle_cmdbar_macos.rs::CoordKeys` 编成 `CMD_KEY_TAP / SEQ / HOLD / RELEASE` 推给宿主，载荷是
+`split_combo` 归一过的（小写键名 + `mods ⊆ {ctrl, shift, alt, win}`）。addon 在 `onPushFrame` 接住，
+经 **Fcitx5 `InputContext::forwardKey`** 交给焦点 IC 的应用（`key.type` 另走上屏通道，不在此列）。
+
+**为什么是 forwardKey，不是 XTest**（XTest 未做，理由与限制都在这里）：
+
+| | forwardKey（采用） | XTest `xcb_test_fake_input`（未做） |
+|---|---|---|
+| 前端 | DBus / XIM / GTK·Qt 模块 / Wayland 都有 | 只对 X11 / XWayland 窗口有效 |
+| 回环 | 转发的键**不进**输入法引擎，天然不回流 | 合成键经 X 服务器回到 Fcitx5 再进我们的 `keyEvent`，得记「预期回流」防组字 |
+| 可测 | DBus 客户端收 `ForwardKey` 信号逐个断言 | 要在 Xvfb 里另写 X 客户端收事件 |
+| 作用范围 | **只到当前输入上下文所在的应用** | 系统级：窗口管理器 / 全局快捷键也看得见 |
+
+实测：DBus 前端的 `ForwardKey(sym, state, isRelease)` 序列见 e2e；XIM（Xvfb 里的 Xlib 小客户端，
+`XMODIFIERS=@im=fcitx`、fcitx5 开 `xim`）收到的是带真实键码的 KeyPress / KeyRelease——键码由
+Fcitx5 按 keysym 在当前布局里反查（Ctrl_L=37、c=54、Home=110、End=115、BackSpace=22），state 位与
+下表一致，合成的 `a` 作为文字到达应用，addon 日志里没有它的按键记录（不回流）。XTest 只在
+forwardKey 对某类应用确实无效时才值得做，目前没有这样的证据。
+
+- **键名**（`keyNameToKeysym`）：Windows `key_inject::parse_key` 的全部名字与别名（`return` / `esc` /
+  `bksp` / `del` / `ins` / `pgup` / `pgdn`、KEY_TABLE 符号键及其字符写法）∪ macOS `keyCodeMap`
+  （`capslock`、修饰键本身作主键）∪ `f1`…`f24` ∪ `vk:NN`（按 **Windows VK** 反查，十六进制、`0x`
+  可省，同 Windows）。`keysynth_test` 直接读 `KeySynthesizer.swift` / `key_inject.rs` / `keymap.rs`
+  源码逐个核对，两侧加键名这里当场红。字母 / 符号取无 Shift 的基础层 keysym，Shift 放进 state
+  （同 `xdotool key ctrl+shift+c`）；键码填 0 由各前端反查。
+- **顺序与 state**（X 语义：state 是事件之前的修饰态）：`tap Ctrl+C` = Ctrl↓(0)、c↓(Ctrl)、c↑(Ctrl)、
+  Ctrl↑(Ctrl)；多个修饰键按给出顺序按下、逆序抬起（同 Windows / macOS）。`seq` 逐个 tap。
+- **拒绝**：未知主键或未知修饰名整条丢弃并 WARN（同 Windows `parse_combo`，`Hyper+C` 不退化成裸
+  `c`；macOS 是跳过该键）；`seq` 里有一个不认识就整条不做（Windows 会做完前面的再报错）。
+- **限流**（`KeySynth.h`）：单条 `seq` 至多 **64** 个组合，超了整条丢弃（不截断）；tap / seq / hold
+  合成的事件每 **1 秒至多 1024** 个，超额的帧整条丢弃；补发的抬起不受限。
+- **key.hold 的卡键保护**：按住的组合记在 `KeyHoldTracker`（同时至多 8 个，同一组合不重复按），
+  抬起发回**当初收到按下的 IC**（不是此刻的焦点）。以下任一发生即补发全部抬起（逆序）：
+  `deactivate`（失焦 / 切走输入法）、`activate` 发现上一个 IC 还挂着（焦点重叠）、帧到达时焦点已
+  不是按下的那个 IC、宿主 `reset`、`SERVICE_READY`、push 断线、addon 析构；另有**最长保持时间**
+  兜底（默认 10 秒，`WIND_KEY_HOLD_TIMEOUT_MS` 可覆盖，给 e2e 用），到点自动抬起。按住修饰键时
+  tap / seq 的 state 叠上它（`hold Shift` 再 `tap End` = Shift+End），已按住的修饰键不再重按。
+  `release` 没按住的组合什么也不发（不凭空造抬起）。
+- **与用户真实按键的交错**：一帧（一条 seq）在主线程一次回调里全部 forwardKey 完，中间插不进
+  用户的键；但 `$CC` 里多个 key.* 是多帧，帧与帧之间用户的键可能先到。按住只是「应用收到了
+  按下」：X 服务器的真实修饰态没变，用户此时实打的键不带那个修饰位。
+- **落点**：`focusedIC()`，没有就丢弃（debug 日志），同 `CMD_KEY_TYPE`。
+- e2e：`keysynth_cases` / `keysynth_restart_cases`（测试短语由 `e2e.sh` 追加进隔离目录的
+  `system.phrases.toml`）。push 断线与 `SERVICE_READY` 两条都会补发，服务重启时先到的是断线那条；
+  `SERVICE_READY` 那条与 addon 析构那条没有单独的 e2e（析构时应用那头已看不到信号）。
+- 已知风险：GTK 等宿主在光标被程序挪动时也可能 reset IC——`hold` 之后紧跟的 `tap` 若让应用
+  挪了光标，其 reset 会提前抬起按住的键（未在真实 GTK 应用里验）。
+
 ## 与 Windows / macOS 的差距
 
 | 能力 | 现状 | 备注 |
@@ -227,8 +280,8 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | 候选右键菜单 / 功能主菜单 | 已接（X11） | 见上「自绘菜单」。缺：Wayland；多显示器（工作区取整块根窗口）；点菜单外那一下被菜单吃掉（同 X11 原生菜单，Windows 会透传）；菜单开着时在候选上再右键只关菜单、不接着弹新菜单（Windows 会） |
 | tooltip / 状态气泡 / toast | 已接（X11），含鼠标交互 | 见上「光栅浮层」：悬停保持、气泡拖动与右键菜单、提示右键菜单（复制 / 上屏 / 截图）、Toast 点击关闭，e2e 逐项覆盖。缺：Wayland；多显示器（拖动夹回按整块根窗口）；「截图所有窗口到文件」（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗（气泡 / 提示菜单里的「截图此窗口」已可用）；提示菜单开着时点在提示上只关菜单、不接着弹新菜单（Windows 会重新请求） |
 | 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
-| 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
-| 出厂命令短语（`system.phrases.toml` 的 `$CC`） | 按平台取舍 | `cono` / `coca` 在 Linux 上是 `proc.any` 多候选（装了哪个编辑器 / 计算器就开哪个），`cohm` 走 `xdg-open`；`codl`（删行，`key.seq`）已有 Linux 条目，但**依赖上一行的按键合成**，addon 接上前选中无效果。审计清单与取舍见设计文档 §5e。e2e 仅在 `linux-host` 形态下验证（假程序放进 PATH）；各真实桌面上的程序名没有逐个验过 |
+| 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 已接（`forwardKey`） | 见上「命令直通车按键合成」。与 Windows（`SendInput`，系统级）/ macOS（CGEvent 发到会话）不同：**只打进当前输入上下文所在的应用**，窗口管理器级的全局快捷键（如 Super+E）不会触发；`hold` 不改变 X 服务器的真实修饰态；`capslock` 只是把键交给应用，不切换大写锁定。e2e（DBus 前端）逐条覆盖，XIM 手工探针验过；GTK / Qt 模块、Wayland 前端、真实应用里的行为未验 |
+| 出厂命令短语（`system.phrases.toml` 的 `$CC`） | 按平台取舍 | `cono` / `coca` 在 Linux 上是 `proc.any` 多候选（装了哪个编辑器 / 计算器就开哪个），`cohm` 走 `xdg-open`；`codl`（删行，`key.seq("Home", "Shift+End", "Backspace")`）经上一行的按键合成生效，e2e 断言了它的 ForwardKey 序列。审计清单与取舍见设计文档 §5e。e2e 仅在 `linux-host` 形态下验证（假程序放进 PATH）；各真实桌面上的程序名没有逐个验过 |
 | 模式指示 | 托盘 / 面板图标（`subModeIcon`）按模式主字运行时渲染，同 Windows 语言栏：中文为方案标签、英文「英」、大写锁定「A」，自定义方案标签 / `[ui.labels]` 同样上图 | 见设计文档 §5d（含 Windows 状态对照表、宿主图标缓存）。e2e 经 kimpanel 验了图标名与标签随 Shift / CapsLock / 切方案 / 菜单切换、换焦点不回退，并验文件在用户图标目录、是合法 PNG；notificationitem（SNI）取的是同一个值但未单独验，真机托盘（GNOME AppIndicator、KDE、Deepin dde-dock）的实际显示与图标缓存时序未验。缺：角标（全角 / 标点）；密码框里不换「英」；首次安装时若用户图标目录此前不存在，托盘要重启 Fcitx5 后才看得见运行时图标（之前显示种子） |
 | 系统输入法配置里的「配置」按钮 | ExternalOption → 设置程序 | e2e 验了 `Controller1.GetConfig` 的描述与命令可启动；fcitx5-configtool 5.1.6+ 直接启动，22.04（5.0.x）显示一页一个按钮；真机点按钮与 Deepin 配置界面未验 |
 | 非嵌入模式的占位组合 | 不写进应用（addon 过滤） | 见设计文档 §5d |

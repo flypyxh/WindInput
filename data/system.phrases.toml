@@ -493,9 +493,8 @@ text = '$CC("[删行]", key.seq("Ctrl+A", "Ctrl+K"))'
 weight = 2000
 platform = 'darwin'
 
-# ⚠ Linux 上的按键合成（key.tap / key.seq / key.hold / key.release）要 Fcitx5 addon 接住
-#   CMD_KEY_* 下行帧才生效，目前 addon 还丢弃这些帧（wind_linux/AGENTS.md 差距表），
-#   这条暂时选中后无效果；addon 接上后无需改这里。
+# Linux 上的按键合成（key.tap / key.seq / key.hold / key.release）由 Fcitx5 addon 接住
+#   CMD_KEY_* 下行帧、经 forwardKey 交给当前应用（wind_linux/AGENTS.md「命令直通车按键合成」）。
 [[phrases]]
 code = 'codl'
 text = '$CC("[删行]", key.seq("Home", "Shift+End", "Backspace"))'
