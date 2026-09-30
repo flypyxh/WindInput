@@ -192,7 +192,8 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 - **引擎**：`is_exact_code` 改判等长，`comment = code`，`should_commit` / `should_clear` 恒 false，
   按协调器给的 `max_candidates` 查，硬上限 `WILDCARD_RESULT_LIMIT` = `engine::CANDIDATE_LIMIT_CAP`
   （5000，与翻页扩容上限同一常量；0 不下传 `search_pattern`）；结果带 `is_wildcard`，`source_tier`
-  把「通配 + 等长」放档 0。
+  把「通配 + 等长」放档 0。`wildcard_single_only` 开时在 `wildcard_query` 内按字素簇过滤、
+  不够则 ×2 重取（先滤后截，reverse-mode spec §2）。
   混输代理主码表的通配键；有拼音子引擎时 `MixedEngine::convert_wildcard` = 字面 `convert(input)`
   ⊕ 主码表通配，`merge_wildcard` 按「通配等长 → 字面 → 通配更长」合并、码表间 `(text, code)`
   去重、拼音 / 英文与码表同字即丢、带拼音保底截断。通配码长走 `Engine::wildcard_code_length`
