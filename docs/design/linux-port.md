@@ -202,6 +202,11 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   （出厂 `Ctrl+Shift+]`）。后者：服务 `open_settings_with` 推扩展信封 `settings.open` → addon
   （`SettingsLauncher` + `fcitx::startProcess`）启动 `/usr/lib/windinput/wind_setting`
   （`WIND_INPUT_SETTING` 可覆盖）；只启动自己的设置程序，信封内容只当参数。e2e 覆盖整条链。
+- **系统关联**（`windinput://`、`.wpkg`、`.wtheme`）：deb 装 `.desktop` ×2 + `windinput.xml` + hicolor `mimetypes` 类型图标，开箱即用；高级页「系统集成」按 XDG 现查（`xdg-mime query default` + 读 `.desktop` 的
+  `Exec`），系统包提供的注明「在此不能取消」。便携 / tarball 可按用户注册：包里同一份文件以本程序绝对路径写进
+  `$XDG_DATA_HOME`（带标记），取消只撤带标记的文件与 `mimeapps.list` 里指向我们的项，别人的关联不动；
+  自愈只修指向已消失路径的用户级文件。端到端 `scripts/linux/e2e-assoc.sh`；真桌面文件管理器、KDE 查询分支、
+  snap / flatpak 浏览器未验。
 - **门控**：清单 `platform` 字段加 `linux`；在 macOS 精简范围之上，Linux 另藏工具栏显示/切换、
   软键盘热键、`activate_ime`、Dota2 兼容与热键的「全局」勾选。逐项依据见 wind-setting README
   「按平台屏蔽的设置项」。应用兼容性（按应用配置）**保留**：服务按 addon 报的程序名匹配规则，

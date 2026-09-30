@@ -232,6 +232,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | 截图所有窗口到文件（主菜单「高级」） | 摘掉 | 流程按 macOS「浮层像素在宿主」写：要宿主回应 `shot.panel` 才出结果 Toast，addon 不接。「截图候选窗口到剪贴板」可用 |
 | 按应用独立配置（compat） | 机制可用；**打包时不带 Windows 内置规则**（`scripts/lib/gen-compat.sh linux` 生成「字段说明 + 零规则」的 Linux 版系统层，各平台兼容策略不共用） | 服务按 `FOCUS_GAINED` 的 bundleId（= `InputContext::program()`）匹配规则，同 macOS；设置端的应用兼容性窗口保留 |
 | 打开设置（`settings.open` 扩展信封） | 已接 | `WindEngine::onExt` → `fcitx::startProcess`（双 fork，不留僵尸，继承 fcitx5 的会话环境）。设置程序已开着时由它自己的单实例转发参数；但**转来的切页要等设置窗口下一次输入事件才显示**（windui Linux 后端，冷启动深链正常） |
+| 系统关联（`windinput://` 协议、`.wpkg` / `.wtheme`） | 已接（deb 声明 + 设置程序可按用户注册） | deb 装 `scripts/linux/pkg/` 下两个 `.desktop` 与 `windinput.xml`，类型图标在 `data/icons/hicolor/*/mimetypes/`（`scripts/linux/gen-mime-icons.py`）；便携 / tarball 在设置「高级 → 系统集成」按用户注册（写 `$XDG_DATA_HOME`，语义见 wind-setting README「系统关联」）。`scripts/linux/e2e-assoc.sh` 覆盖类型识别、默认处理者、`xdg-open` / `gio open` 拉起设置程序进导入确认、首实例已开时转参、注册/取消一圈。未验：真桌面文件管理器双击（Nautilus / Dolphin / Deepin）、KDE 的 ktraderclient 查询分支、snap / flatpak 浏览器点链接；用户级注册不装图标 |
 | 全局热键 | 不做 | 设置端藏掉热键对话框的「全局」勾选；热键只在输入法激活、有焦点时经按键通路生效 |
 | Shift 单击切中英 | **需清 Fcitx5 的 AltTriggerKeys** | 出厂 `Shift_L` 被 Fcitx5 截走。安装脚本应改 `~/.config/fcitx5/config`，或在 AGENTS 外的用户文档里写明 |
 | 「Shift+鼠标拖选不算单击」 | 缺 | Windows 靠 ToggleTapPolicy 的四个鼠标信号；Fcitx5 引擎收不到鼠标事件 |
