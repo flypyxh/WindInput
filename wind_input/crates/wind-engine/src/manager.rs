@@ -3621,10 +3621,6 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.reverse_scope_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         // 方案文件/override 可能随配置重载而变（设置页改完即热重载），按键功能表一并失效。
         // 两张表同批：会话态那张漏清的表现是「设置页改了翻页键，重启才生效」。
         self.key_actions_cache
@@ -3646,6 +3642,12 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner()) = None;
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.codetable.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.codetable.clone();
+        // 注释反查范围读 `lookup_disabled_dicts`（上一行刚写入）：必须清在写入**之后**，否则
+        // 并发的 `comment_reverse_scope` 会在两者之间按旧开关重算并缓存到下次失效。
+        self.reverse_scope_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();
         *self.english.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.english.clone();
         // 连同**引擎缓存**一起重置：开关从关到开时，缓存里躺着的可能是上次「未尝试」之外的
