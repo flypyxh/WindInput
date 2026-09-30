@@ -5088,7 +5088,9 @@ impl Coordinator {
             Some(ModeKind::Url) => self.exit_url_mode(state),
             Some(ModeKind::Email) => self.exit_email_mode(state),
             Some(ModeKind::Unicode) => self.exit_unicode_mode(state),
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => self.exit_special_mode(state),
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
+                self.exit_special_mode(state)
+            }
             Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
             // ★ 辅助码要**两步**：`exit_aux_code` 是本仓唯一一个「退出后主组合仍存活」的
             // 退出函数——它按设计还原拼音候选与 preedit（辅助码只是筛选，Esc 的语义是
@@ -7174,7 +7176,12 @@ impl Coordinator {
         s.add_word_active
             || matches!(
                 s.active,
-                Some(ModeKind::TempPinyin | ModeKind::Special(_) | ModeKind::RareChar)
+                Some(
+                    ModeKind::TempPinyin
+                        | ModeKind::Special(_)
+                        | ModeKind::RareChar
+                        | ModeKind::Reverse
+                )
             )
     }
 
@@ -9255,12 +9262,12 @@ mod mode_comment_e2e_tests {
         );
         c.state.lock().unwrap().input_buffer.clear();
 
-        // 四个模式逐个开、逐个关。
+        // 五个模式逐个开、逐个关。
         //
-        // 抽成别名是为了躲开 clippy::type_complexity；四个用例共用一个形状，
+        // 抽成别名是为了躲开 clippy::type_complexity；几个用例共用一个形状，
         // 给它一个名字反而把这件事写明白了。
         type StateMutator = Box<dyn Fn(&mut State)>;
-        let cases: [(&str, StateMutator); 4] = [
+        let cases: [(&str, StateMutator); 5] = [
             ("加词", Box::new(|st: &mut State| st.add_word_active = true)),
             (
                 "临拼",
@@ -9273,6 +9280,10 @@ mod mode_comment_e2e_tests {
             (
                 "生僻字",
                 Box::new(|st: &mut State| st.active = Some(ModeKind::RareChar)),
+            ),
+            (
+                "反查",
+                Box::new(|st: &mut State| st.active = Some(ModeKind::Reverse)),
             ),
         ];
         for (name, enter) in cases {

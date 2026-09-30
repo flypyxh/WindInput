@@ -753,7 +753,8 @@ pub(crate) fn template_for<'a>(
             .and_then(|m| pick(&m.comment_template_vertical, &m.comment_template_horizontal)),
         // 生僻字模式并入本支：它的 `overlay` 恒为 None（没有宿主方案、没有 [overlay] 段），
         // 于是 `and_then` 直接给出 None ＝ 跟随全局模板。这正是想要的默认档。
-        Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => {
+        // 反查模式同理（overlay 恒 None ⇒ 跟随全局），注释仍是引擎给的完整编码。
+        Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
             overlay.and_then(|o| pick(&o.comment_template_vertical, &o.comment_template_horizontal))
         }
         Some(ModeKind::TempPinyin) => pick(

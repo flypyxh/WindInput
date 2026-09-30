@@ -171,6 +171,7 @@ impl Coordinator {
             Some(ModeKind::TempEnglish) => Some(&state.temp_english_buffer),
             Some(ModeKind::Mix(_)) => Some(&state.mix_buffer),
             Some(ModeKind::RareChar) => Some(&state.special_buffer),
+            Some(ModeKind::Reverse) => Some(&state.special_buffer),
             _ => None,
         }
     }
@@ -207,6 +208,7 @@ impl Coordinator {
             Some(ModeKind::TempEnglish) => self.exit_temp_english(state),
             Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
             Some(ModeKind::RareChar) => self.exit_special_mode(state),
+            Some(ModeKind::Reverse) => self.exit_special_mode(state),
             _ => self.reset_exclusive_modes(state),
         }
         // 回放目标由**来源**决定，不是恒定的 `input_buffer`（见 `RewindOrigin`）。

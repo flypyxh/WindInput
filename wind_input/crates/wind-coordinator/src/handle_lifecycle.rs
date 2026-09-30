@@ -589,8 +589,15 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::None => None,
-            // 反查模式在 Task 17 接线：暂不进入、不吞键（None 让 z/引导键落普通输入）。
-            BoundAction::Reverse => None,
+            // 反查模式：门卫是总开关 `input.reverse.enabled`（出厂关）+ 活跃方案有反查通配键
+            // （码表 / 混输主码表）。没过返回 None，触发键落普通输入，不吞键。
+            BoundAction::Reverse => {
+                if !self.reverse_mode_available() {
+                    return None;
+                }
+                debug!("key_action: entering reverse mode");
+                Some(self.enter_reverse_mode(state, key_code))
+            }
             // 软键盘不是「模式」，没有编码缓冲也不进 ModeKind——直接开关面板即可。
             // 状态推送由按键路径顶层的 SoftKeyboardPushOnDrop 兜底。
             BoundAction::SoftKeyboard(page) => Some(self.toggle_softkeyboard(page.as_deref())),
@@ -812,7 +819,6 @@ impl Coordinator {
             | BoundAction::TempEnglish
             | BoundAction::AuxCode
             | BoundAction::RareChar
-            // 反查模式在 Task 17 接线（进 overlay，要 `&mut State`，与 RareChar 同族）。
             | BoundAction::Reverse
             | BoundAction::Mix(_)
             | BoundAction::Special(_)
@@ -948,13 +954,12 @@ impl Coordinator {
             BoundAction::TempEnglish => ModeKind::TempEnglish,
             BoundAction::AuxCode => ModeKind::AuxCode,
             BoundAction::RareChar => ModeKind::RareChar,
+            BoundAction::Reverse => ModeKind::Reverse,
             BoundAction::Special(id) => ModeKind::Special(self.special_mode_idx(id)?),
             BoundAction::Mix(id) => ModeKind::Mix(self.mix_mode_idx(id)?),
             // 不建 overlay ⇒ 没有可比对的模式身份。软键盘有自己的开关态，幂等由
             // `toggle_softkeyboard` 自己处理（它的语义就是「再按一次关掉」）。
-            // 反查模式在 Task 17 接线：暂无模式身份（ModeKind::Reverse 尚未引入）。
             BoundAction::None
-            | BoundAction::Reverse
             | BoundAction::SingleChar(_)
             | BoundAction::SoftKeyboard(_)
             | BoundAction::ToggleSchema(_)
@@ -1090,6 +1095,9 @@ impl Coordinator {
         state.rewind = None;
         state.special_buffer.clear();
         state.special_cursor = 0;
+        // 反查模式会写这两位（翻页扩充的依据）；special 族其余成员不写，对它们是空操作。
+        state.has_more = false;
+        state.candidate_limit = 0;
         // `[overlay]` 段快照随模式一并丢弃。消费点都先判 `active == Special`，残留本不会
         // 被读到——但那条「先判 active」是消费点的实现细节，不是这里可以依赖的契约。
         state.overlay_spec = None;
