@@ -58,9 +58,11 @@ public:
         }
     }
 
-    void setPreedit(const std::string& utf8, size_t caretBytes) override
+    void setPreedit(const std::string& composition, size_t caretBytes) override
     {
         fcitx::Text text;
+        // 占位组合（单个空格）不进应用：Fcitx5 直接给 cursorRect，不靠它取坐标（见 HostUi.h）。
+        const std::string utf8 = clientPreeditText(composition);
         if (!utf8.empty()) {
             // DontCommit：客户端没声明 ClientUnfocusCommit 时，Fcitx5 会在失焦那一刻把 client
             // preedit 当正文上屏（实测 DBus 客户端失焦后收到 "ni'hao"）。组合串是编码不是正文，
@@ -266,8 +268,15 @@ void WindEngine::sendFocusGained(fcitx::InputContext* ic)
 {
     uint64_t mask = inputScopeMask(ic);
     lastReportedSecure_ = mask != 0;
-    // 服务端对 FocusGained 回 MODE_PUSH（权威中英状态）；本端没有要用它的地方，读掉即可。
-    sendAndDrain(encodeFocusGainedFrame(clientToken(ic), mask, ic->program(), std::string()));
+    // 服务端对 FocusGained 回 MODE_PUSH（权威中英状态）：托盘图标据此对齐。
+    Frame resp;
+    if (ensureConnected()
+        && bridge_.request(encodeFocusGainedFrame(clientToken(ic), mask, ic->program(), std::string()),
+                           resp)) {
+        noteMode(resp);
+    } else {
+        WIND_DEBUG() << "发送失败: " << bridge_.lastError();
+    }
 }
 
 void WindEngine::sendCaretUpdate(fcitx::InputContext* ic)
@@ -304,8 +313,37 @@ uint16_t WindEngine::prevCharFor(fcitx::InputContext* ic)
 
 bool WindEngine::applyResponse(fcitx::InputContext* ic, const Frame& resp, bool hostShortcut)
 {
+    noteMode(resp);
     ICSink sink(ic);
     return router_.apply(resp, &sink, hostShortcut);
+}
+
+void WindEngine::noteMode(const Frame& frame)
+{
+    if (!mode_.update(frame)) {
+        return;
+    }
+    WIND_DEBUG() << "中英模式 → " << mode_.subModeName();
+    // StatusArea 这一格的 UI 更新就是 Fcitx5 各 UI 模块重取输入法图标的信号（notificationitem
+    // 发 NewIcon、kimpanel 重报属性、classicui 重画托盘）。
+    if (fcitx::InputContext* ic = focusedIC()) {
+        ic->updateUserInterface(fcitx::UserInterfaceComponent::StatusArea);
+    }
+}
+
+std::string WindEngine::subMode(const fcitx::InputMethodEntry&, fcitx::InputContext&)
+{
+    return mode_.subModeName();
+}
+
+std::string WindEngine::subModeIconImpl(const fcitx::InputMethodEntry&, fcitx::InputContext&)
+{
+    return mode_.iconName();
+}
+
+std::string WindEngine::subModeLabelImpl(const fcitx::InputMethodEntry&, fcitx::InputContext&)
+{
+    return mode_.label();
 }
 
 void WindEngine::sendModifierTap(fcitx::InputContext* ic, uint32_t vk)
@@ -522,6 +560,12 @@ void WindEngine::onPushFrame(Frame frame)
             }
         }
         serviceSeenOnce_ = true;
+        break;
+    case CMD_STATE_PUSH:
+    case CMD_ACTIVATION_STATUS_PUSH:
+    case CMD_MODE_PUSH:
+        // 别处改了模式（菜单点「英文」、设置程序改配置）：只刷托盘图标。
+        noteMode(frame);
         break;
     case CMD_COMMIT_TEXT:
     case CMD_UPDATE_COMPOSITION:

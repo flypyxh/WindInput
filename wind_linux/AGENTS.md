@@ -21,10 +21,12 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
 | `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
+| `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：中英模式镜像（托盘图标 `windinput-zh/en`，从服务端四种状态帧学）、应用内预编辑过滤掉单空格占位组合 |
 | `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |
 | `src/fcitx/X11Panel.{h,cpp}` | X11 候选窗 + 三层光栅浮层 + 自绘菜单：自建 xcb 连接、override-redirect 窗口贴帧、候选窗的鼠标点击/悬停/滚轮/右键回传、浮层自动隐藏计时、菜单打开期间抓指针并回报 |
 | `data/*.conf.in` | addon / 输入法描述文件模板（构建时生成到 `build/…/share/fcitx5/`） |
+| `data/icons/hicolor` | 图标成品（`windinput`、`windinput-zh`、`windinput-en`），CMake 装到 `share/icons`；由 `scripts/linux/gen-icons.py` 一次性生成 |
 | `tests/*_test.cpp` | 纯 C++17 单测（不需要 Fcitx5），与 `wind_tsf/tests` 同风格 |
 
 `src/core` 与 `include` 不依赖 Fcitx5，能单独编、单独测——这条边界别破。
@@ -193,6 +195,9 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 | tooltip / 状态气泡 / toast | 已接（X11） | 见上「光栅浮层」。缺：气泡/提示的鼠标交互（Windows 可拖动状态气泡、右键菜单、悬停 tooltip 时保持显示）——浮层对鼠标透明；截图类命令（`TakeScreenshot` 的 `shot.panel`）仍只截候选窗 |
 | 多显示器下的浮层锚点 | 未做 | 工作区取整个根窗口（同候选窗）：Toast / 锚点气泡落在整块虚拟屏的角上，而不是光标所在显示器 |
 | 命令直通车按键合成（`CMD_KEY_TAP/SEQ/HOLD/RELEASE`） | 未接 | 可用 `InputContext::forwardKey` 实现，但只能打进当前 IC，不是系统级合成 |
+| 中英模式指示 | 托盘 / 面板图标（`subModeIcon`） | 见设计文档 §5d。e2e 经 kimpanel 验了图标名随 Shift / 菜单切换；notificationitem（SNI）取的是同一个值但未单独验，真机托盘（GNOME AppIndicator、Deepin dde-dock）的实际显示未验 |
+| 系统输入法配置里的「配置」按钮 | ExternalOption → 设置程序 | e2e 验了 `Controller1.GetConfig` 的描述与命令可启动；fcitx5-configtool 5.1.6+ 直接启动，22.04（5.0.x）显示一页一个按钮；真机点按钮与 Deepin 配置界面未验 |
+| 非嵌入模式的占位组合 | 不写进应用（addon 过滤） | 见设计文档 §5d |
 | 工具栏 / 软键盘 / 输入诊断 HUD | 不做 | 产品决策：与 macOS 精简范围一致。设置端已按平台门控相应设置项（wind-setting README「按平台屏蔽的设置项」）；主菜单里的对应项也按平台摘掉 |
 | 截图所有窗口到文件（主菜单「高级」） | 摘掉 | 流程按 macOS「浮层像素在宿主」写：要宿主回应 `shot.panel` 才出结果 Toast，addon 不接。「截图候选窗口到剪贴板」可用 |
 | 按应用独立配置（compat） | 机制可用；**打包时不带 Windows 内置规则**（`scripts/lib/gen-compat.sh linux` 生成「字段说明 + 零规则」的 Linux 版系统层，各平台兼容策略不共用） | 服务按 `FOCUS_GAINED` 的 bundleId（= `InputContext::program()`）匹配规则，同 macOS；设置端的应用兼容性窗口保留 |

@@ -15,6 +15,7 @@
 #include "ServiceLauncher.h"
 #include "SettingsLauncher.h"
 #include "ExtProtocol.h"
+#include "HostUi.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
@@ -54,6 +55,12 @@ public:
     void deactivate(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
     void reset(const fcitx::InputMethodEntry& entry, fcitx::InputContextEvent& event) override;
 
+    // 托盘 / 面板随中英模式换图标与标签（Fcitx5 的 classicui / notificationitem / kimpanel
+    // 都经这两个取）。服务端的模式是全局的，与 IC 无关。
+    std::string subMode(const fcitx::InputMethodEntry& entry, fcitx::InputContext& ic) override;
+    std::string subModeIconImpl(const fcitx::InputMethodEntry& entry, fcitx::InputContext& ic) override;
+    std::string subModeLabelImpl(const fcitx::InputMethodEntry& entry, fcitx::InputContext& ic) override;
+
     const fcitx::Configuration* getConfig() const override { return &config_; }
 
 private:
@@ -79,6 +86,8 @@ private:
     /// 修饰键单击：发一帧 eventType=UP 的 KeyEvent 并应用其响应。
     void sendModifierTap(fcitx::InputContext* ic, uint32_t vk);
     bool applyResponse(fcitx::InputContext* ic, const Frame& resp, bool hostShortcut);
+    /// 帧里带中英模式就记下；变了则让 Fcitx5 的 UI 模块重取图标。
+    void noteMode(const Frame& frame);
 
     // ── push ──
     void onPushFrame(Frame frame);
@@ -118,6 +127,7 @@ private:
     /// 「清风输入法设置」：挂进 Fcitx5 状态区（托盘菜单 / kimpanel 面板），点了打开设置程序。
     /// 主菜单不从这里进（组字时候选窗右键 / 候选菜单「更多…」）。
     fcitx::SimpleAction settingsAction_;
+    ModeIndicator mode_;
     WindConfig config_;
 };
 

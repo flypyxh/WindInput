@@ -567,6 +567,7 @@ class Impanel:
 async def menu_cases(bus, im):
     """自绘菜单：入口、渲染、悬停 / 键盘 / 点选、子菜单、动作生效，以及每一条关闭路径——
     每条关闭后立刻打字，验证 menu_open 没有卡住输入。"""
+    watch = await kimpanel_watch(bus)
     c = await new_ctx(bus, im, "e2e-menu")
     await c.ic.call_set_cursor_rect(300, 400, 2, 20)
 
@@ -644,11 +645,17 @@ async def menu_cases(bus, im):
             check("菜单：点子菜单「英文」→ 菜单收起、切到英文（字母直通）",
                   gone and eaten == [False] * 3 and c.take() == "",
                   f"菜单消失={gone} eaten={eaten}")
+            # 不经按键的切换：服务端经 push 通道推 CMD_STATE_PUSH，托盘图标要跟上。
+            en = await wait_until(lambda: watch.icon() == "windinput-en", 2)
+            check("托盘图标：菜单点「英文」→ windinput-en（push 通道的状态推送）", en,
+                  f"im={watch.im()!r}")
     await c.key("Escape")
     c.take()
     # 空闲时没有主菜单入口了（状态区入口改成了「清风输入法设置」），主菜单都从组字时的
-    # 「更多…」进——英文态组不了字，先用 Shift 切回中文。
+    # 「更多…」进——英文态组不了字，先用 Shift 切回中文（顺带验按键这条来源的托盘图标）。
     await c.tap_shift()
+    zh = await wait_until(lambda: watch.icon() == "windinput-zh", 2)
+    check("托盘图标：Shift 切回中文 → windinput-zh", zh, f"im={watch.im()!r}")
 
     # g) 主菜单的子菜单点选：输入方案 ▸ 全拼（英文、分隔线之后那一行）→ 仍是中文全拼。
     #    关掉菜单后组字还挂着，先收掉再验打字。
@@ -927,6 +934,87 @@ async def settings_cases(bus, im):
 
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
+
+
+async def mode_icon_cases(bus, im):
+    """托盘 / 面板图标随中英模式切换：引擎的 subModeIcon 经 kimpanel 模块报给面板。按键切换
+    （Shift 单击 → STATUS_UPDATE 响应）与焦点进入（FocusGained → MODE_PUSH）两条来源；
+    菜单切换（push 通道 STATE_PUSH）在 menu_cases 里验。"""
+    watch = await kimpanel_watch(bus)
+    c = await new_ctx(bus, im, "e2e-mode-icon")
+    zh = await wait_until(lambda: watch.icon() == "windinput-zh", 2)
+    check("托盘图标：中文态为 windinput-zh、标签「中」", zh and watch.im().endswith("label=中"),
+          f"im={watch.im()!r}")
+    await c.tap_shift()
+    en = await wait_until(lambda: watch.icon() == "windinput-en", 2)
+    check("托盘图标：Shift 切英文 → windinput-en、标签「英」",
+          en and watch.im().endswith("label=英"), f"im={watch.im()!r}")
+    # 换个文本框再回来：焦点进入时服务端回的 MODE_PUSH 仍是英文，图标不被焦点事件打回中文。
+    d = await new_ctx(bus, im, "e2e-mode-icon-2")
+    await d.ic.call_focus_out()
+    await c.ic.call_focus_in()
+    await asyncio.sleep(0.3)
+    check("托盘图标：换焦点后仍是 windinput-en", watch.icon() == "windinput-en",
+          f"im={watch.im()!r}")
+    await c.tap_shift()
+    back = await wait_until(lambda: watch.icon() == "windinput-zh", 2)
+    check("托盘图标：再按 Shift 切回 → windinput-zh", back, f"im={watch.im()!r}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+async def set_config(key, value):
+    """经 `wind_input config set` 改在线服务的配置（RPC 热重载，不重启服务）。"""
+    svc = os.path.join(os.environ["W"], "svc", "wind_input")
+    r = await asyncio.to_thread(subprocess.run, [svc, "config", "set", key, value],
+                                capture_output=True, text=True)
+    await asyncio.sleep(0.3)
+    return r
+
+
+async def preedit_display_cases(bus, im):
+    """编码显示在候选窗里（非嵌入，`preedit_display = candidate_top`）：服务端照旧给宿主一段单
+    空格的占位组合（Windows 靠它取光标坐标），addon 不把它写进应用——应用里既看不到编码、也
+    不会多出一格空白把光标推走；上屏后文本里没有多余空格。嵌入模式（出厂）预编辑照常。"""
+    r = await set_config("ui.candidate.preedit_display", "candidate_top")
+    check("非嵌入：config set preedit_display=candidate_top", r.returncode == 0,
+          f"rc={r.returncode} {r.stderr.strip()[:200]}")
+    c = await new_ctx(bus, im, "e2e-preedit")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    c.preedits.clear()
+    eaten = await c.type("nihao")
+    await asyncio.sleep(0.3)
+    seen = list(c.preedits)
+    check("非嵌入：组字时应用收到的预编辑恒为空（无占位空格）",
+          all(eaten) and all(p == "" for p in seen), f"eaten={eaten} 预编辑={seen}")
+    if os.environ.get("DISPLAY"):
+        win = candidate_window()
+        ok = win is not None and win[5]
+        check("非嵌入：候选窗出现、左上角落在光标下方附近",
+              ok and 240 <= win[1] <= 330 and 400 <= win[2] <= 470, f"window={win}")
+        if ok:
+            path, _ = screenshot("candidate_preedit_top", win[0])
+            print(f"  非嵌入候选窗截图：{path}", flush=True)
+    await c.key(" ")
+    got = c.take()
+    check("非嵌入：上屏「你好」、没有多余空格", got == "你好", f"上屏={got!r}")
+    # 首键即上屏的路径（数字选词）同样不带占位。
+    await c.type("shi")
+    await c.key("1")
+    got = c.take()
+    check("非嵌入：数字选词上屏不带空格", got != "" and " " not in got, f"上屏={got!r}")
+
+    r = await set_config("ui.candidate.preedit_display", "app_inline")
+    c.preedits.clear()
+    await c.type("nihao")
+    shown = c.preedit
+    await c.key(" ")
+    got = c.take()
+    check("嵌入（复原 app_inline）：预编辑是编码本身、上屏正常",
+          r.returncode == 0 and shown.replace("'", "") == "nihao" and got == "你好",
+          f"rc={r.returncode} 预编辑={shown!r} 上屏={got!r}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
 async def wait_ready(c):
     """服务的 socket 起得比引擎早：词库（首次还要建 .wdat 缓存）加载完成前，按键一律透传。
     用真实通路探活——按 a 直到被吃（= 引擎开始组字），再 Esc 撤掉。"""
@@ -1087,10 +1175,12 @@ async def main():
 
     # 候选窗（X11）：只在 e2e.sh 起了 Xvfb 时跑
     await p.ic.call_focus_out()
+    await preedit_display_cases(bus, im)
     if os.environ.get("DISPLAY"):
         await x11_cases(bus, im)
         await overlay_cases(bus, im)
         await menu_cases(bus, im)
+        await mode_icon_cases(bus, im)
         await settings_cases(bus, im)
         await a.ic.call_focus_in()
         await asyncio.sleep(0.2)

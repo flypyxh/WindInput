@@ -24,7 +24,7 @@ addon 只做按键转发、上屏/预编辑写回、候选窗呈现。宿主选 
 | 不做 | 理由 |
 |---|---|
 | 按应用独立配置（compat） | 主要为解决 Windows 宿主兼容性问题；Linux 上无同类需求，Wayland 下也拿不到前台进程名 |
-| 工具栏 | 后续再考虑类似 macOS 的状态图标 |
+| 工具栏 | 用户明确不要浮动工具栏（「不是这个系统的习惯」）；中英状态改由 Fcitx5 托盘 / 面板图标显示，见 §5d |
 | 软键盘、输入诊断 HUD | Wayland 无法自由定位窗口；HUD 依赖 Windows 专有诊断数据 |
 | 全局热键 | Wayland 无标准方案 |
 
@@ -104,6 +104,33 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   两端认识错开时自愈：菜单不在屏上却收到菜单键 / 指针事件，UI 回送 `MenuClose`；菜单已关却收到
   指针事件，服务端让 UI 收菜单。e2e 逐条覆盖，每条之后立即打字验证。
 
+## 5d. 与 Fcitx5 自身 UI 的衔接
+
+- **输入法图标**：条目 `Icon=windinput`（`wind_linux/data/icons/hicolor`，16…256 各尺寸，出自
+  wind-setting 的 `wind_setting.ico`）。**托盘 / 面板图标随中英模式切换**：引擎实现
+  `subModeIconImpl` / `subModeLabelImpl`，返回 `windinput-zh` / `windinput-en`（带底色圆角方块 +
+  白字「中」「英」，深浅面板都看得清；PNG 16…64 + scalable SVG，字形已转路径）与「中」/「英」。
+  Fcitx5 的 classicui 托盘、notificationitem（StatusNotifierItem，Deepin / KDE / GNOME 的
+  AppIndicator 扩展）、kimpanel 都经 `Instance::inputMethodIcon` 取这个值。模式来源是服务端的
+  四种帧：焦点进入的 `MODE_PUSH`、按键响应的 `STATUS_UPDATE`、push 通道的 `STATE_PUSH`（菜单等
+  别处切换）、带 `MODE_CHANGED` 的上屏；变了就 `updateUserInterface(StatusArea)` 让各 UI 模块重取。
+  不用 `CMD_MODE_STATUS`：那条由工具栏可见性驱动，Linux 不显示工具栏。图标产物入库，生成脚本
+  `scripts/linux/gen-icons.py` 只在改图标时跑，打包不依赖它。
+- **系统输入法配置里的「配置」**：输入法与 addon 都是 `Configurable=True`，addon 的配置只有一项
+  `fcitx::ExternalOption`（指向设置程序，`WIND_INPUT_SETTING` 可覆盖）。依据：fcitx5-mozc /
+  fcitx5-anthy 的包里**没有**静态 `configdesc/*.desc`，Fcitx5 5 的配置描述是 addon 运行时
+  `getConfig()` 给的，外部工具就是 `Type=External` + `External=<命令>`。fcitx5-configtool 5.1.6 起
+  「整页只有一个 External 项」时直接启动它；更早的版本（Ubuntu 22.04 的 5.0.x）显示一页、页上一个
+  启动按钮。Deepin 自带的输入法配置界面是否认这套，未验证。
+- **非嵌入模式的占位组合**：服务端在编码显示于候选窗（`preedit_display` ≠ `app_inline`）以及联想态、
+  加词等模式下，给宿主一段单个空格的占位组合——Windows 的 TSF 要有 composition 才取得到光标坐标。
+  Fcitx5 直接给 `cursorRect`，不需要它，而它在应用里是真实的一格空白、把光标推走。**在 addon 过滤**
+  （`clientPreeditText`：组合串恰为该常量时应用内预编辑写空），不在服务端门控：① addon 仍需把它记成
+  「有组合」——失焦、宿主重置要据此收尾并报 `COMPOSITION_TERMINATED`，服务端若改发空组合，addon 会
+  当成组合结束；② 占位的来源不止 `with_composition_placeholder` 一处（联想态 `ASSOC_COMPOSITION`、
+  加词、临时模式各自直接发），服务端要逐处加 cfg，addon 一处全收；③ Windows / macOS 零改动。
+  常量与服务端同值由 `host_ui_test` 读 `handler.rs` 对账。
+
 ## 6. 阶段
 
 | 阶段 | 内容 | 状态 |
@@ -122,7 +149,8 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   XWayland，`WINDUI_BACKEND=wayland` 才试原生 Wayland），文字经 fontconfig，中文渲染正常。
   控制 socket、用户目录、日志目录与服务同一套规则（`$XDG_RUNTIME_DIR/wind_input[_dev]_ctrl.sock`、
   `~/.config/WindInput[Dev]`），改设置写入用户 `config.toml` 并被服务热加载（实测）。
-- **入口**：应用菜单（`windinput-setting.desktop`，兼 `windinput://` 协议）与「打开设置」热键
+- **入口**：应用菜单（`windinput-setting.desktop`，兼 `windinput://` 协议）、Fcitx5 状态区「清风输入法设置」
+  与系统输入法配置里的「配置」（§5d），以及「打开设置」热键
   （出厂 `Ctrl+Shift+]`）。后者：服务 `open_settings_with` 推扩展信封 `settings.open` → addon
   （`SettingsLauncher` + `fcitx::startProcess`）启动 `/usr/lib/windinput/wind_setting`
   （`WIND_INPUT_SETTING` 可覆盖）；只启动自己的设置程序，信封内容只当参数。e2e 覆盖整条链。
@@ -131,7 +159,7 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   「按平台屏蔽的设置项」。应用兼容性（按应用配置）**保留**：服务按 addon 报的程序名匹配规则，
   与 macOS 同一机制——§2「不做」指的是不为 Linux 维护内置规则，不是机制不可用。
 - **托盘 / 常驻（`run_resident`）缺失不影响设置端**：`wind_setting` 不用常驻模式也不用托盘；
-  缺的是输入法自己的状态指示（见 §2「工具栏」）。
+  输入法自己的状态指示改由 Fcitx5 托盘图标承担（见 §5d）。
 - **已知问题**（windui Linux 后端）：设置程序已开着时，深链转来的切页要等下一次输入事件才显示；
   文件对话框依赖 xdg-desktop-portal 或 zenity，都没有时点了无反应。
 

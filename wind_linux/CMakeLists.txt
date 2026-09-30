@@ -22,6 +22,7 @@ option(WIND_VARIANT_DEV "Build the dev variant" OFF)
 add_library(windcore STATIC
     src/core/Bridge.cpp
     src/core/Codec.cpp
+    src/core/HostUi.cpp
     src/core/KeyMap.cpp
     src/core/Menu.cpp
     src/core/ResponseRouter.cpp
@@ -39,7 +40,7 @@ target_link_libraries(windcore PUBLIC Threads::Threads)
 # ── 单测 ──
 enable_testing()
 foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test
-        settings_launcher_test menu_test)
+        settings_launcher_test menu_test host_ui_test)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE windcore)
     target_compile_definitions(${t} PRIVATE
