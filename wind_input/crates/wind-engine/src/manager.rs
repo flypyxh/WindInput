@@ -1317,7 +1317,8 @@ impl EngineManager {
 
     /// 候选注释 `code_all` / `code_rev_all` 用的 [`Self::word_codes_display`]：系统层按
     /// [`Self::comment_reverse_scope`] 取索引，开关开且方案有未启用扩展库时含它们。
-    /// 三态同 `word_codes_display`；`None` 时调用方后台预热 `comment_reverse_scope` 那份。
+    /// 三态同 `word_codes_display`。变体（含未启用扩展库）没就绪时回退常规索引，故 `None` 只剩
+    /// 「常规索引也没就绪」一种情形；变体是否还欠着看 [`Self::comment_variant_pending`]。
     pub fn word_codes_display_for_comment(&self, schema_id: &str, text: &str) -> Option<String> {
         if schema_id.is_empty() {
             return Some(String::new());
@@ -1339,6 +1340,29 @@ impl EngineManager {
             return None;
         }
         Some(v.codes_of(text).join("/"))
+    }
+
+    /// 注释反查的变体索引此刻是否还欠着：范围是变体、变体没就绪、也没被崩溃保护跳过。
+    ///
+    /// 协调器据此决定要不要派后台补建：变体没就绪时取值会回退常规索引、结果不是 `None`，
+    /// 不能再靠 `None` 判。只查内存——开关关时 [`Self::comment_reverse_scope`] 对已加载的
+    /// 码表引擎短路，其余情形首次读盘后有缓存——故可在按键线程上逐候选调用。
+    pub fn comment_variant_pending(&self, schema_id: &str) -> bool {
+        self.comment_reverse_scope(schema_id) == ReverseScope::WithDisabled
+            && self
+                .reverse_index_if_ready_in(schema_id, ReverseScope::WithDisabled)
+                .is_none()
+            && !self.reverse_index_skipped_in(schema_id, ReverseScope::WithDisabled)
+    }
+
+    /// [`Self::codetable_reverse_hint`] 那份（主码表方案）的 [`Self::comment_variant_pending`]。
+    pub fn codetable_reverse_hint_variant_pending(&self) -> bool {
+        let primary = self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        !primary.is_empty() && self.comment_variant_pending(&primary)
     }
 
     /// 候选注释反查该用哪份索引：`lookup_disabled_dicts` 开、且方案里至少一个扩展库未启用

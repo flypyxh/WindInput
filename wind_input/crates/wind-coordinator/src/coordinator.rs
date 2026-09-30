@@ -67,6 +67,13 @@ const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 /// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
 pub(crate) const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
 
+#[cfg(test)]
+thread_local! {
+    /// 测试观察 [`Coordinator::warm_comment_reverse_index`] 被调了几次（按线程计，互不串）。
+    /// 它每次都要取 `code_source_schema`，混输下那是一次读方案文件，按键线程上不该逐候选调。
+    pub(crate) static WARM_COMMENT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 「正在建立词库索引…」提示延后多久才弹（见 `Coordinator::spawn_index_warm`）。
 ///
 /// 索引自 2026-08-24 起落盘为 `.wridx`，于是同一件事有两种量级完全不同的结果：
@@ -4516,6 +4523,8 @@ impl Coordinator {
     /// 注释范围是「含未启用扩展库」变体才需另建，常规那份由既有预热负责。
     /// 只派活不等，去重同 [`Self::spawn_index_warm_in`]。
     pub(crate) fn warm_comment_reverse_index(&self) {
+        #[cfg(test)]
+        WARM_COMMENT_CALLS.with(|n| n.set(n.get() + 1));
         let sid = self.engine_mgr.code_source_schema();
         let scope = self.engine_mgr.comment_reverse_scope(&sid);
         if scope == wind_engine::ReverseScope::WithDisabled {

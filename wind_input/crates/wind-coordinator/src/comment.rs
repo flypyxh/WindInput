@@ -1072,12 +1072,16 @@ impl crate::coordinator::Coordinator {
 
     /// 注释 / 反查候选的 `code` / `code_rev` 取值（注释反查范围）。系统层没就绪给空串。
     ///
-    /// ★ 补建变体索引**不能**再以「取到 `None`」为信号：变体（含未启用扩展库）没就绪时引擎会
-    /// 回退常规索引、照常给出启用集里的码，`None` 只剩「常规那份也没就绪」一种情形。故每次都
-    /// 调 [`Self::warm_comment_reverse_index`]——已就绪 / 正在建 / 被跳过时它立刻返回。
+    /// ★ 补建信号是「取到 `None`」**或**「变体还欠着」：变体（含未启用扩展库）没就绪时引擎会
+    /// 回退常规索引、照常给出启用集里的码，单看 `None` 会让变体永远不被补建。
+    ///
+    /// ⚠️ 别改成每次都调 [`Self::warm_comment_reverse_index`]：它要先取 `code_source_schema`，
+    /// 混输方案下那是一次读方案文件，而这里在按键线程上逐候选调用。`*_variant_pending` 只查内存。
     fn comment_reverse_hint(&self, text: &str) -> String {
         let v = self.engine_mgr.codetable_reverse_hint(text);
-        self.warm_comment_reverse_index();
+        if v.is_none() || self.engine_mgr.codetable_reverse_hint_variant_pending() {
+            self.warm_comment_reverse_index();
+        }
         v.unwrap_or_default()
     }
 
@@ -1086,7 +1090,9 @@ impl crate::coordinator::Coordinator {
         let v = self
             .engine_mgr
             .word_codes_display_for_comment(schema_id, text);
-        self.warm_comment_reverse_index();
+        if v.is_none() || self.engine_mgr.comment_variant_pending(schema_id) {
+            self.warm_comment_reverse_index();
+        }
         v.unwrap_or_default()
     }
 
@@ -1260,7 +1266,7 @@ impl crate::coordinator::Coordinator {
             // `${code_rev}` 四个字符。
             "code_rev" | "code" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
-                    // 未就绪时本次空着；注释范围那份的后台补建见 `comment_reverse_hint`。
+                    // 常规索引也没就绪时本次空着；变体没就绪时回退常规索引。后台补建见 `comment_reverse_hint`。
                     self.comment_reverse_hint(&c.text)
                 } else {
                     String::new()
@@ -3347,6 +3353,32 @@ mod comment_reverse_scope_tests {
             c.eval_text_var("code_rev", None, "门头沟区", &rev)
                 .as_deref(),
             Some("uuia")
+        );
+    }
+
+    /// 开关关（出厂）且常规索引已就绪：注释取值不再派补建。补建要先取 `code_source_schema`，
+    /// 混输方案下那是一次读方案文件——在按键线程上逐候选、逐键调用就是逐候选读盘。
+    #[test]
+    fn comment_reverse_does_not_warm_when_switch_off_and_ready() {
+        use crate::coordinator::WARM_COMMENT_CALLS;
+        let (c, g) = coord("off_ready", false);
+        assert!(c.engine_mgr.prewarm_reverse_index(&g.id));
+        let rev = wind_reverse::ReverseLookup::default();
+        let before = WARM_COMMENT_CALLS.with(|n| n.get());
+        for _ in 0..3 {
+            assert_eq!(
+                c.eval_text_var("code_rev", None, "工", &rev).as_deref(),
+                Some("a")
+            );
+            assert_eq!(
+                c.eval_text_var("code_rev_all", None, "工", &rev).as_deref(),
+                Some("a")
+            );
+        }
+        assert_eq!(
+            WARM_COMMENT_CALLS.with(|n| n.get()),
+            before,
+            "全关且索引就绪时不该调补建"
         );
     }
 
