@@ -112,6 +112,8 @@ impl StateWriter {
     /// 去代理这件事——那种判据会在写入路径重构时静默失效，而失败信息还会指向错误的
     /// 结论（"测试正在改开发者本机的 state.toml"，实际并没有）。
     #[cfg(test)]
+    // 仅被软键盘用例引用；Linux 外部宿主形态没有软键盘面板，那批用例不编译（见 handle_softkeyboard.rs）。
+    #[cfg_attr(all(test, target_os = "linux", ext_presenter), allow(dead_code))]
     pub(crate) fn is_noop(&self) -> bool {
         self.inner.is_none()
     }
