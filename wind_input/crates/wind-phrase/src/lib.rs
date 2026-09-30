@@ -194,6 +194,31 @@ pub struct PhraseLayer {
     map: HashMap<String, Vec<PhraseEntry>>,
 }
 
+/// 本进程所在平台在短语 `platform` 字段里的名字。
+///
+/// 曾经两处过滤都写死只收 `"windows"`，于是 macOS / Linux 上显示的是 Windows 那一份
+/// （`notepad.exe`、`calc.exe`、`USERPROFILE`），而 `darwin` 条目从未生效过。
+const CURRENT_PLATFORM: &str = if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "darwin"
+} else if cfg!(target_os = "linux") {
+    "linux"
+} else {
+    // Android 等：只收全平台条目。
+    "other"
+};
+
+/// 条目的 `platform` 是否适用于 `current`：缺省 / 空 / `"all"` = 全平台；否则按名字
+/// 比对（大小写不敏感，取值见 system.phrases.toml 文件头）。
+fn platform_matches(platform: Option<&str>, current: &str) -> bool {
+    let Some(p) = platform else {
+        return true;
+    };
+    let p = p.to_lowercase();
+    p.is_empty() || p == "all" || p == current
+}
+
 #[derive(serde::Deserialize)]
 struct PhrasesFile {
     #[serde(default)]
@@ -231,12 +256,8 @@ impl PhraseLayer {
         };
         let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
         for r in parsed.phrases {
-            // 平台过滤：空/"all"/"windows" 接受
-            if let Some(p) = &r.platform {
-                let p = p.to_lowercase();
-                if !p.is_empty() && p != "all" && p != "windows" {
-                    continue;
-                }
+            if !platform_matches(r.platform.as_deref(), CURRENT_PLATFORM) {
+                continue;
             }
             map.entry(r.code).or_default().push(PhraseEntry {
                 text: r.text,
@@ -269,11 +290,8 @@ impl PhraseLayer {
         };
         let mut out = Vec::new();
         for r in parsed.phrases {
-            if let Some(p) = &r.platform {
-                let p = p.to_lowercase();
-                if !p.is_empty() && p != "all" && p != "windows" {
-                    continue;
-                }
+            if !platform_matches(r.platform.as_deref(), CURRENT_PLATFORM) {
+                continue;
             }
             out.push(SystemPhraseEntry {
                 code: r.code,
@@ -929,6 +947,84 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// 各平台只收自己的条目与全平台条目。
+    ///
+    /// 变异判据：把比对改回写死 `"windows"`，linux / darwin 两行转红——那正是 macOS 与
+    /// Linux 上显示 `notepad.exe` 词条的原形。
+    #[test]
+    fn platform_filter_follows_current_platform() {
+        for cur in ["windows", "darwin", "linux"] {
+            assert!(platform_matches(None, cur));
+            assert!(platform_matches(Some(""), cur));
+            assert!(platform_matches(Some("all"), cur));
+            assert!(platform_matches(Some("ALL"), cur));
+            for other in ["windows", "darwin", "linux"] {
+                assert_eq!(
+                    platform_matches(Some(other), cur),
+                    other == cur,
+                    "{other} @ {cur}"
+                );
+            }
+        }
+        assert!(platform_matches(Some("Windows"), "windows"));
+        assert!(!platform_matches(Some("linux"), "other"));
+    }
+
+    /// 本进程编出来的平台名与短语文件用的词表一致（写错一个字母，本平台的条目就全没了）。
+    #[test]
+    fn current_platform_name_is_from_the_file_vocabulary() {
+        let expect = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else {
+            "other"
+        };
+        assert_eq!(CURRENT_PLATFORM, expect);
+    }
+
+    /// 两个加载入口（建层的 `load` 与入库同步的 `parse_system_entries`）用同一个过滤。
+    #[test]
+    fn both_loaders_apply_the_platform_filter() {
+        let dir = std::env::temp_dir().join(format!("wind_phrase_plat_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("system.phrases.toml");
+        std::fs::write(
+            &p,
+            "[[phrases]]\ncode = 'x'\ntext = 'win'\nplatform = 'windows'\n\n\
+             [[phrases]]\ncode = 'x'\ntext = 'mac'\nplatform = 'darwin'\n\n\
+             [[phrases]]\ncode = 'x'\ntext = 'lin'\nplatform = 'linux'\n\n\
+             [[phrases]]\ncode = 'x'\ntext = 'any'\n",
+        )
+        .unwrap();
+        let own = match CURRENT_PLATFORM {
+            "windows" => "win",
+            "darwin" => "mac",
+            "linux" => "lin",
+            _ => "",
+        };
+        let mut want: Vec<&str> = vec!["any"];
+        if !own.is_empty() {
+            want.push(own);
+        }
+        want.sort();
+
+        let mut got: Vec<String> = PhraseLayer::parse_system_entries(&p)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        got.sort();
+        assert_eq!(got, want);
+
+        let layer = PhraseLayer::load(&p);
+        let mut got: Vec<String> = layer.map["x"].iter().map(|e| e.text.clone()).collect();
+        got.sort();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use chrono::TimeZone;
 

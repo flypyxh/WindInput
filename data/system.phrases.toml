@@ -421,6 +421,14 @@ text = '$CC("打开文本编辑", proc.run("open", "-a", "TextEdit"))'
 weight = 2000
 platform = 'darwin'
 
+# Linux 各桌面自带的编辑器不同：按顺序试，第一个装了的即启动（GNOME / 旧 GNOME / KDE /
+# Xfce / Cinnamon / MATE / Deepin / LXQt / LXDE）。
+[[phrases]]
+code = 'cono'
+text = '$CC("打开文本编辑器", proc.any("gnome-text-editor", "gedit", "kate", "kwrite", "mousepad", "xed", "pluma", "deepin-editor", "featherpad", "leafpad"))'
+weight = 2000
+platform = 'linux'
+
 [[phrases]]
 code = 'coca'
 text = '$CC("打开计算器", proc.run("calc.exe"))'
@@ -434,6 +442,12 @@ weight = 2000
 platform = 'darwin'
 
 [[phrases]]
+code = 'coca'
+text = '$CC("打开计算器", proc.any("gnome-calculator", "kcalc", "deepin-calculator", "mate-calc", "galculator", "qalculate-gtk", "xcalc"))'
+weight = 2000
+platform = 'linux'
+
+[[phrases]]
 code = 'cohm'
 text = '$CC("打开用户主目录", open(env("USERPROFILE")))'
 weight = 2000
@@ -444,6 +458,12 @@ code = 'cohm'
 text = '$CC("打开用户主目录", open(env("HOME")))'
 weight = 2000
 platform = 'darwin'
+
+[[phrases]]
+code = 'cohm'
+text = '$CC("打开用户主目录", open(env("HOME")))'
+weight = 2000
+platform = 'linux'
 
 [[phrases]]
 code = 'coll'
