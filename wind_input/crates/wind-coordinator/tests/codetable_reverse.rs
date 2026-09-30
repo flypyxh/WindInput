@@ -205,3 +205,97 @@ fn reverse_exit_after_expand_leaves_no_residue() {
     assert_eq!(c.debug_input_buffer(), "a");
     assert_eq!(c.debug_page_info().0, 0, "主路径从第 1 页开始");
 }
+
+fn zz_phrases() -> Vec<wind_phrase::PhraseSeed> {
+    let seed = |code: &str, text: &str| wind_phrase::PhraseSeed {
+        code: code.into(),
+        text: text.into(),
+        weight: 0,
+        position: 0,
+        is_system: true,
+        category: String::new(),
+    };
+    vec![seed("zzbd", "、"), seed("zzsz", "…")]
+}
+
+#[test]
+fn reverse_symbol_trigger_enters_only_when_enabled() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let c = Coordinator::new_headless(wubi_rev(), Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    assert_eq!(c.debug_active_mode(), Some("reverse"));
+    let mut off = wubi_rev();
+    off.input.reverse.enabled = false;
+    let c = Coordinator::new_headless(off, Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    assert_eq!(c.debug_active_mode(), None, "总开关关：绑了键也不进");
+}
+
+/// ★ Review Focus 3：字母触发键是本方案首码（活码前缀）⇒ 让位作正常码；符号键不让位；
+/// 冲突体检认得反查键。
+#[test]
+fn reverse_letter_trigger_yields_to_live_code_prefix() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.keys.key_actions.insert("a".into(), "reverse".into());
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    letters(&c, "a");
+    assert_eq!(c.debug_active_mode(), None, "a 是五笔活码，让位");
+    assert_eq!(c.debug_input_buffer(), "a");
+    key(&c, VK_ESCAPE, false);
+    key(&c, VK_BACKSLASH, false);
+    assert_eq!(c.debug_active_mode(), Some("reverse"), "符号键不让位");
+
+    let mut conflict = wubi_rev();
+    conflict.schema.codetable.input_chars = "a-y\\".into();
+    let c = Coordinator::new_headless(conflict, Some(&data_dir()));
+    let rep = c.code_char_conflicts();
+    assert!(
+        rep.iter()
+            .any(|(ch, owners)| *ch == '\\' && owners.contains(&"反查模式触发键")),
+        "{rep:?}"
+    );
+}
+
+/// spec §3.1：非码表 / 混输方案让位。
+#[test]
+fn reverse_yields_in_pinyin_schema() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.schema.available = vec!["pinyin".into(), "wubi86".into()];
+    cfg.schema.active = "pinyin".into();
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    key(&c, VK_BACKSLASH, false);
+    assert_eq!(c.debug_active_mode(), None);
+}
+
+/// GH#146 同构：`z_key_action = "reverse"` 在出厂 `zz*` 短语下经 z 夺取进入。
+#[test]
+fn z_key_action_reverse_enters_via_z_fallback() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.schema.codetable.z_key_action = "reverse".into();
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    c.debug_install_phrases(zz_phrases());
+    letters(&c, "z");
+    assert_eq!(c.debug_active_mode(), None, "首键 z 让位给 zz* 活码");
+    letters(&c, "uia");
+    assert_eq!(c.debug_active_mode(), Some("reverse"));
+    assert_eq!(c.debug_preedit(), "zuia");
+    assert!(
+        !c.debug_all_candidate_texts().is_empty(),
+        "uia 的等长 + 前缀结果"
+    );
+}

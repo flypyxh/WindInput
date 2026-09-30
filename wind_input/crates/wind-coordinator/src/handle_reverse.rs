@@ -35,7 +35,6 @@ impl Coordinator {
     }
 
     /// 这个键是否绑了反查动词（方案 `[key_actions]` → 全局 → `z_key_action` 三层链）。
-    #[allow(dead_code)] // Task 19（首键冲突体检 / z 夺取通路）接线
     pub(crate) fn is_reverse_trigger(&self, key_code: u32) -> bool {
         matches!(
             self.bound_action_for(key_code),

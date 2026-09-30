@@ -80,7 +80,8 @@ impl Coordinator {
         // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }
 
-    /// 该键是否被**任一模式**配作进入键（临拼/临英的符号触发键、特殊模式引导键、mix 触发键）。
+    /// 该键是否被**任一模式**配作进入键（临拼/临英的符号触发键、特殊模式引导键、mix 触发键、
+    /// 反查模式触发键）。
     /// 仅用于「智能符号 press2 要不要抢在模式激活之前」的门控：只有被模式占用的符号键存在
     /// 这个冲突，其余标点照常在标点分支判 press2。
     ///
@@ -91,6 +92,7 @@ impl Coordinator {
             || self.is_temp_english_trigger(key_code)
             || self.match_special_trigger(key_code).is_some()
             || self.match_mix_trigger(key_code).is_some()
+            || self.is_reverse_trigger(key_code)
     }
 
     /// 该键在空缓冲时是否已被方案声明为**首码** —— 是则符号类模式引导键让位给码表。
@@ -544,6 +546,13 @@ impl Coordinator {
     ) -> Option<&'static str> {
         if !action.is_enabled() {
             return Some("显式 none");
+        }
+        // 反查模式只在码表 / 五笔拼音混输方案里有意义（活跃引擎给得出反查通配键）。
+        // 放在字母 / 符号分流之前：符号键在拼音方案里也让位，照常产出标点（spec §3.1）；
+        // 字母键在码表里仍走下面的活码前缀判据，在混输里仍走「字母键仅码表引擎」判据。
+        if matches!(action, BoundAction::Reverse) && self.engine_mgr.active_reverse_key().is_none()
+        {
+            return Some("反查模式仅码表 / 五笔拼音混输方案生效");
         }
         let ch = keymap::vk_to_prefix_char_with_letters(key_code)?;
         if !ch.is_ascii_alphabetic() {

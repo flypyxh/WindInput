@@ -5675,6 +5675,9 @@ impl Coordinator {
                 if self.is_temp_english_trigger(vk) {
                     owners.push("临时英文触发键");
                 }
+                if self.is_reverse_trigger(vk) {
+                    owners.push("反查模式触发键");
+                }
             }
             if !owners.is_empty() {
                 out.push((ch, owners));
