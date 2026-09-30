@@ -6698,6 +6698,13 @@ STDAPI CTextService::OnEndEdit(ITfContext* pContext, TfEditCookie ecReadOnly, IT
     // insertion too (cursor moves after typing '1'), which would incorrectly clear the
     // digit tracking that OnTestKeyDown just set. Mouse click detection relies on
     // caret Y comparison in _SendKeyToService instead.
+    // Shift/Ctrl 正等 keyup 切换时选区变了 ⇒ 按住期间有鼠标点选，那次 keyup 不算单击
+    // （论坛 t257）。不受 `_pComposition` 限制：组合中 Shift+点击同样是点选。
+    if (selChanged && _pKeyEventSink != nullptr)
+    {
+        _pKeyEventSink->NoteSelectionChangedDuringToggle();
+    }
+
     if (selChanged && _pComposition == nullptr)
     {
         // Notify Go side to reset its smart punct state

@@ -4,6 +4,7 @@
 #include "IPCClient.h"
 #include "SkipKeyTable.h"
 #include "PassthroughNote.h"
+#include "ToggleTapPolicy.h"
 #include <string>
 #include <cstdint>
 #include <deque>
@@ -172,6 +173,14 @@ public:
     /// 根因是拿边沿去表达一个**持续状态**：漏一个事件就永久错。改成服务端权威 +
     /// level-triggered 之后，DLL 侧再加任何本地清位都是第二个真相源，会把这个毛病请回来。
     void SetCandidateSessionActive(BOOL active) { _hotkeyModeSession = active; }
+
+    /// 宿主报了选区变化（`OnEndEdit`）：若此刻有 Shift/Ctrl 正等着 keyup 触发切换，
+    /// 说明按住期间发生了鼠标点选，这次不算单击（论坛 t257）。无 pending 时空操作。
+    void NoteSelectionChangedDuringToggle()
+    {
+        if (_pendingKeyUpKey != 0)
+            _pendingTapSignals.selectionChanged = true;
+    }
 
     // 供 CTextService 的 SendInput 兜底路径（CommitText/InsertText/ReplacePrecedingChars）
     // 调用：把即将注入的按键标记为"自生成"，OnTestKeyDown/OnTestKeyUp 见到后直接放行，
@@ -489,6 +498,10 @@ private:
     uint32_t _pendingKeyUpKey;   // Key code of pending KeyUp toggle key
     uint32_t _pendingKeyUpModifiers; // Modifiers when KeyDown was pressed
     DWORD    _pendingKeyDownTime;    // GetTickCount() when toggle key was pressed down
+    // 待切换键按住期间鼠标操作的记账（论坛 t257，判据见 ToggleTapPolicy.h）。
+    // 首次记 pending 时置 mouseDownAtPress 并清 GetAsyncKeyState 的「按下过」位；
+    // selectionChanged 由 TextService::OnEndEdit 经 NoteSelectionChangedDuringToggle 置位。
+    wind::toggletap::TapSignals _pendingTapSignals;
     // OnTestKeyDown 是否刚吃下一个 Ctrl+Space。它是「我们独占了这个键」的凭据：
     // TSF 只在 pfEaten=TRUE 后才调 OnKeyDown，吃下就意味着 msctf 不会再拿它当 IME
     // 热键、OPENCLOSE compartment 不会被翻，因此按键侧兜底切换与 compartment 路径

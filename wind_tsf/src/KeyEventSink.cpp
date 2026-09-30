@@ -179,6 +179,23 @@ STDAPI_(ULONG) CKeyEventSink::Release()
     return cr;
 }
 
+// 鼠标键（左/右/中）此刻是否按着。左右键都查：系统可能交换了主副键，VK_LBUTTON 反映的是物理键。
+static bool AnyMouseButtonDown()
+{
+    return ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+}
+
+// 自上一次调用以来鼠标键是否被按下过（GetAsyncKeyState 的最低位）。
+// ⚠️ 微软明说不可依赖这一位：它是否被别的调用方清掉不可控。这里只作**补充信号**，
+// 主判据是选区变化与按着状态（见 ToggleTapPolicy.h）。读取本身会清位，故三键都要读。
+static bool AnyMousePressedSinceLastCall()
+{
+    SHORT l = GetAsyncKeyState(VK_LBUTTON);
+    SHORT r = GetAsyncKeyState(VK_RBUTTON);
+    SHORT m = GetAsyncKeyState(VK_MBUTTON);
+    return ((l | r | m) & 0x0001) != 0;
+}
+
 // 记录「这个切换键正等着 keyup 触发切换」。
 // 由 OnTestKeyDown（放行纯修饰键时）与 OnKeyDown 共同调用；对同一个键重复调用不会
 // 重新计时（见函数内说明），因此两处都调、宿主重复发 keydown，都不会影响长按判定。
@@ -227,6 +244,12 @@ void CKeyEventSink::_MarkPendingToggleKey(WPARAM wParam, uint32_t modifiers)
     _pendingKeyUpKey = specificKey;
     _pendingKeyUpModifiers = modifiers;
     _pendingKeyDownTime = GetTickCount();
+
+    // 鼠标记账（论坛 t257）：首次记 pending 时重置，并把「按下过」位清掉，
+    // 好让 _DispatchPendingToggleKeyUp 读到的只是按住期间发生的点击。
+    _pendingTapSignals = {};
+    _pendingTapSignals.mouseDownAtPress = AnyMouseButtonDown();
+    AnyMousePressedSinceLastCall();
 }
 
 // 取消待切换。热键分支（keydown 白名单 / chinese-only / session / Ctrl+Space）都是
@@ -2000,6 +2023,20 @@ BOOL CKeyEventSink::_DispatchPendingToggleKeyUp(WPARAM wParam)
     {
         WIND_LOG_DEBUG_FMT(L"Toggle key held too long (%lu ms > %lu ms), ignoring\n",
             pressDuration, TOGGLE_TAP_THRESHOLD_MS);
+        return TRUE;
+    }
+
+    // 按住期间有鼠标操作（Shift+点击 / 拖选）⇒ 不是单击，不切换（论坛 t257）。
+    // 放在时长判定之后：长按本来就不切，日志也不必重复报。
+    wind::toggletap::TapSignals signals = _pendingTapSignals;
+    signals.mouseDownAtRelease = AnyMouseButtonDown();
+    signals.mousePressedSincePress = AnyMousePressedSinceLastCall();
+    _pendingTapSignals = {};
+    if (wind::toggletap::IsTapCancelledByMouse(signals))
+    {
+        WIND_LOG_DEBUG_FMT(L"Toggle key tap cancelled by mouse: vk=0x%02X press=%d sel=%d release=%d since=%d\n",
+            pendingKey, signals.mouseDownAtPress, signals.selectionChanged,
+            signals.mouseDownAtRelease, signals.mousePressedSincePress);
         return TRUE;
     }
 
