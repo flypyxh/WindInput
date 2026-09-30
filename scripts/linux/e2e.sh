@@ -21,6 +21,10 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/wi-tgt-linux-wt}"
 ADDON_BUILD="$REPO/wind_linux/build/cmake"
 SERVICE_BIN="$TARGET_DIR/debug/wind_input"
 DATA_DIR="${WIND_E2E_DATA:-$REPO/build_dev/data}"
+# 设置程序（兄弟仓库 wind-setting）：「从输入法打开设置」用例要真的把它拉起来。
+SETTING_REPO="$(cd "$REPO/.." && pwd)/wind-setting"
+SETTING_TARGET_DIR="${WIND_SETTING_TARGET_DIR:-$HOME/.cache/wi-tgt-setting-linux}"
+SETTING_BIN="${WIND_E2E_SETTING:-$SETTING_TARGET_DIR/debug/wind_setting}"
 
 # socket 路径上限 108 字节：临时目录必须短。
 W="${WIND_E2E_DIR:-/tmp/wi-linux/e2e.$$}"
@@ -35,9 +39,14 @@ if [[ -z "${SKIP_BUILD:-}" ]]; then
     log "构建服务（linux-host）…"
     (cd "$REPO/wind_input" && CARGO_TARGET_DIR="$TARGET_DIR" \
         cargo build -q -p wind_service --features linux-host)
+    if [[ -z "${WIND_E2E_SETTING:-}" && -d "$SETTING_REPO" ]]; then
+        log "构建设置程序（$SETTING_REPO）…"
+        (cd "$SETTING_REPO" && CARGO_TARGET_DIR="$SETTING_TARGET_DIR" cargo build -q)
+    fi
 fi
 [[ -f "$ADDON_BUILD/libwindinput.so" ]] || { echo "E2E FAIL: 缺 $ADDON_BUILD/libwindinput.so"; exit 1; }
 [[ -x "$SERVICE_BIN" ]] || { echo "E2E FAIL: 缺 $SERVICE_BIN"; exit 1; }
+[[ -x "$SETTING_BIN" ]] || { echo "E2E FAIL: 缺设置程序 $SETTING_BIN（需要兄弟仓库 ../wind-setting，或用 WIND_E2E_SETTING 指定）"; exit 1; }
 [[ -d "$DATA_DIR/schemas" ]] || { echo "E2E FAIL: 词库目录 $DATA_DIR 不完整（需要 build_dev/data）"; exit 1; }
 
 # ── 准备隔离目录 ─────────────────────────────────────────────────────
@@ -47,6 +56,7 @@ cleanup() {
     [[ -f "$W/svc.pid" ]] && kill "$(cat "$W/svc.pid")" 2>/dev/null || true
     # 自动拉起模式下服务由 addon 起，pid 不归我们；按本次独有的完整路径杀。
     pkill -f -- "^$W/svc/wind_input" 2>/dev/null || true
+    pkill -f -- "^$W/svc/wind_setting" 2>/dev/null || true
     if [[ -z "${KEEP:-}" ]]; then rm -rf "$W"; else log "保留临时目录 $W"; fi
 }
 trap cleanup EXIT
@@ -54,6 +64,18 @@ trap cleanup EXIT
 # 服务按 exe 同目录找 data/：拷一份二进制、data 软链到词库。
 cp "$SERVICE_BIN" "$W/svc/wind_input"
 ln -s "$DATA_DIR" "$W/svc/data"
+# 设置程序经一层包装：先记下 addon 传来的 argv（用例据此断言深链参数），再换成真程序。
+# TMPDIR 指进本次临时目录——windui 的单实例 socket 在 TMPDIR 下，不隔离会与本机开着的
+# 设置程序或并发的另一份 e2e 互相转发。
+ln -s "$SETTING_BIN" "$W/svc/wind_setting.bin"
+mkdir -p "$W/tmp"
+cat >"$W/svc/wind_setting" <<SETTING
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>"$W/setting.argv"
+export TMPDIR="$W/tmp"
+exec "$W/svc/wind_setting.bin" "\$@"
+SETTING
+chmod +x "$W/svc/wind_setting"
 # 用户配置：切到全拼方案（出厂默认是五笔），用例按全拼写。
 mkdir -p "$W/xdg/config/WindInput"
 cat >"$W/xdg/config/WindInput/config.toml" <<'EOF'
@@ -142,6 +164,8 @@ else
 fi
 
 export FCITX_CONFIG_HOME="$W/fcitx"
+# addon 收到 settings.open 时启动它（不设则是安装路径 /usr/lib/windinput/wind_setting）。
+export WIND_INPUT_SETTING="$W/svc/wind_setting"
 export FCITX_ADDON_DIRS="$ADDON_BUILD:$SDK_ROOT/usr/lib/$MULTIARCH/fcitx5"
 export FCITX_DATA_DIRS="$ADDON_BUILD/share/fcitx5:$SDK_ROOT/usr/share/fcitx5"
 unset DISPLAY WAYLAND_DISPLAY

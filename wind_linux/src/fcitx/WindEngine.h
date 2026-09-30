@@ -70,6 +70,7 @@ private:
     void onPushFrame(Frame frame);
     void onRenderFrame(const HostRenderFramePayload& p);
     void onOverlayFrame(const OverlayFramePayload& p);
+    void onExt(const ExtEnvelope& ext);
     fcitx::InputContext* focusedIC();
 
     fcitx::Instance* instance_;

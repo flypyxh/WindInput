@@ -25,6 +25,7 @@ add_library(windcore STATIC
     src/core/KeyMap.cpp
     src/core/ResponseRouter.cpp
     src/core/ServiceLauncher.cpp
+    src/core/SettingsLauncher.cpp
     src/core/ShmFrame.cpp
     src/core/Utf.cpp
 )
@@ -36,7 +37,8 @@ target_link_libraries(windcore PUBLIC Threads::Threads)
 
 # ── 单测 ──
 enable_testing()
-foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test)
+foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test
+        settings_launcher_test)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE windcore)
     target_compile_definitions(${t} PRIVATE

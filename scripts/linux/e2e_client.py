@@ -383,6 +383,89 @@ async def overlay_cases(bus, im):
     await asyncio.sleep(0.2)
 
 
+def settings_windows():
+    """设置程序的顶层窗口（WM_CLASS 实例名 = 可执行文件名 wind_setting.bin，见 windui
+    `x11.rs::wm_class`；e2e 里经包装脚本启动，真程序是那个软链）。"""
+    ids = sh("xdotool", "search", "--classname", "wind_setting").split()
+    return [i for i in ids if "IsViewable" in sh("xwininfo", "-id", i)]
+
+
+def read_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+async def wait_until(pred, timeout):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not pred():
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
+    return True
+
+
+async def settings_cases(bus, im):
+    """「从输入法打开设置」整条链：Ctrl+Shift+]（keys.open_settings 出厂值）→ addon 按键转发
+    → 服务热键分派 open_settings → 下行扩展信封 settings.open → addon 拉起 WIND_INPUT_SETTING
+    （e2e.sh 的包装脚本记下 argv 再换成真设置程序）→ 设置程序经控制 socket 连上服务。"""
+    w = os.environ["W"]
+    argv_log = os.path.join(w, "setting.argv")
+    setting_log = os.path.join(os.environ["XDG_DATA_HOME"], "WindInput", "logs",
+                               "wind_setting.1.log")
+    c = await new_ctx(bus, im, "e2e-settings")
+
+    async def open_settings_hotkey():
+        # Shift 按住时 X 客户端送的是 braceright（0x7d），keycode 35 = ]。
+        down = await c.ic.call_process_key_event(0x7D, 35, STATE_CTRL | STATE_SHIFT, False, 0)
+        await c.ic.call_process_key_event(0x7D, 35, STATE_CTRL | STATE_SHIFT, True, 0)
+        return down
+
+    eaten = await open_settings_hotkey()
+    check("设置：Ctrl+Shift+] 被输入法吃掉（热键命中 open_settings）", eaten is True,
+          f"eaten={eaten}")
+    launched = await wait_until(lambda: len(read_lines(argv_log)) >= 1, 10)
+    check("设置：addon 收到 settings.open 后拉起设置程序", launched,
+          f"{argv_log} 无记录（fcitx5 日志里找「启动设置程序」/「settings.open」）")
+    args = read_lines(argv_log)
+    check("设置：打开设置不带深链参数（默认页）", args[:1] == [""], f"argv={args}")
+    mapped = await wait_until(lambda: len(settings_windows()) == 1, 20)
+    wins = settings_windows()
+    check("设置：设置窗口已映射", mapped, f"windows={wins}")
+    if wins:
+        # 映射早于首帧（首帧要等方案列表等数据回来）：轮询到有内容为止。
+        shot = {}
+
+        def painted():
+            shot["path"], shot["n"] = window_has_content(wins[0], "settings_main")
+            return shot["n"] > 8
+        await wait_until(painted, 10)
+        check("设置：窗口有渲染内容", shot["n"] > 8, f"颜色数={shot['n']} 截图={shot['path']}")
+        print(f"      截图 {shot['path']}", flush=True)
+    connected = await wait_until(
+        lambda: any("apply_loaded 完成, connected=true" in l for l in read_lines(setting_log)), 15)
+    check("设置：设置程序经控制 socket 连上服务", connected,
+          f"{setting_log} 里没有 connected=true")
+
+    # 已开着时再按一次：新进程只把 argv 转给首实例（windui 单实例），窗口不重复。
+    await open_settings_hotkey()
+    again = await wait_until(lambda: len(read_lines(argv_log)) >= 2, 10)
+    forwarded = await wait_until(
+        lambda: any("二次实例 argv" in l for l in read_lines(setting_log)), 10)
+    await asyncio.sleep(0.5)
+    check("设置：再按一次转交给已开的设置程序、不开第二个窗口",
+          again and forwarded and len(settings_windows()) == 1,
+          f"再次启动={again} 转交={forwarded} windows={settings_windows()}")
+
+    subprocess.run(["pkill", "-f", "--", "^" + os.path.join(w, "svc", "wind_setting")])
+    closed = await wait_until(lambda: not settings_windows(), 5)
+    check("设置：设置程序退出后窗口消失", closed, f"windows={settings_windows()}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
 async def wait_ready(c):
     """服务的 socket 起得比引擎早：词库（首次还要建 .wdat 缓存）加载完成前，按键一律透传。
     用真实通路探活——按 a 直到被吃（= 引擎开始组字），再 Esc 撤掉。"""
@@ -546,6 +629,7 @@ async def main():
     if os.environ.get("DISPLAY"):
         await x11_cases(bus, im)
         await overlay_cases(bus, im)
+        await settings_cases(bus, im)
         await a.ic.call_focus_in()
         await asyncio.sleep(0.2)
 

@@ -7,6 +7,7 @@
 
 #include "ExtProtocol.h"
 #include "Protocol.h"
+#include "SettingsLauncher.h"
 #include "TestHarness.h"
 
 #include <algorithm>
@@ -33,6 +34,14 @@ long rustConst(const std::string& name)
     std::string v = m[1];
     v.erase(std::remove(v.begin(), v.end(), '_'), v.end());
     return std::stol(v, nullptr, 0);
+}
+
+/// 在 protocol.rs 里找 `pub const NAME: &str = "...";`，找不到返回空串。
+std::string rustStr(const std::string& name)
+{
+    std::regex re("pub const " + name + R"re(:\s*&str\s*=\s*"([^"]*)"\s*;)re");
+    std::smatch m;
+    return std::regex_search(g_src, m, re) ? std::string(m[1]) : std::string();
 }
 
 #define SYNC(name, value)                                                                \
@@ -125,6 +134,9 @@ int main()
     SYNC("CMD_SERVICE_READY", CMD_SERVICE_READY);
     SYNC("CMD_STATUS_UPDATE", CMD_STATUS_UPDATE);
     SYNC("COMMIT_FLAG_REPLACING_HELD", COMMIT_FLAG_REPLACING_HELD);
+
+    CASE("下行扩展信封的 kind 字符串与 protocol.rs `ext_kind` 一致");
+    CHECK_EQ(rustStr("SETTINGS_OPEN"), std::string(windlinux::EXT_KIND_SETTINGS_OPEN));
 
     TEST_MAIN_END();
 }

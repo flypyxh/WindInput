@@ -2,12 +2,14 @@
 
 #include "ExtProtocol.h"
 #include "ServiceLauncher.h"
+#include "SettingsLauncher.h"
 #include "Protocol.h"
 #include "Utf.h"
 #include "X11Panel.h"
 
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/log.h>
+#include <fcitx-utils/misc.h>
 #include <fcitx-utils/utf8.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/text.h>
@@ -15,6 +17,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <unistd.h>
 
 FCITX_DEFINE_LOG_CATEGORY(windinput_log, "windinput");
 #define WIND_DEBUG() FCITX_LOGC(windinput_log, Debug)
@@ -494,6 +497,11 @@ void WindEngine::onPushFrame(Frame frame)
             onOverlayFrame(*p);
         }
         break;
+    case CMD_EXT:
+        if (auto ext = decodeExt(frame.payload)) {
+            onExt(*ext);
+        }
+        break;
     default:
         // macOS 的文本提示帧（CMD_TOOLTIP_SHOW 等，Linux 服务不发）/ 按键合成：见 AGENTS.md 差距表。
         break;
@@ -521,6 +529,31 @@ void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
         WIND_DEBUG() << "候选帧 scale=" << p.scale << "：X11 下按物理像素原样贴";
     }
     panel_->show(f, f.screenX, f.screenY, (p.flags & FRAME_FLAG_ABSOLUTE_POS) != 0);
+}
+
+void WindEngine::onExt(const ExtEnvelope& ext)
+{
+    if (ext.kind != EXT_KIND_SETTINGS_OPEN) {
+        // 未知 kind 安静忽略：新服务配旧 addon 时不该出错（信封的版本兼容语义）。
+        WIND_DEBUG() << "未处理的扩展信封 kind=" << ext.kind;
+        return;
+    }
+    auto args = parseSettingsOpenArgs(std::string(ext.body.begin(), ext.body.end()));
+    if (!args) {
+        WIND_WARN() << "settings.open 的参数解析失败，不启动设置程序";
+        return;
+    }
+    std::vector<std::string> argv = settingsArgv(*args);
+    if (access(argv[0].c_str(), X_OK) != 0) {
+        WIND_WARN() << "设置程序不存在或不可执行：" << argv[0];
+        return;
+    }
+    // startProcess 双 fork + setsid：设置程序脱离 fcitx5 的进程组、不留僵尸，继承 fcitx5 的
+    // 环境（DISPLAY / WAYLAND_DISPLAY 靠它带过去）。已在运行时由设置程序自己的单实例
+    // 转发把 argv 交给首实例（windui single_instance/unix.rs），这里不必判重。
+    WIND_INFO() << "启动设置程序 " << argv[0] << "（" << args->size() << " 个参数）";
+    const std::string dir = argv[0].substr(0, argv[0].find_last_of('/') + 1);
+    fcitx::startProcess(argv, dir.empty() ? "/" : dir);
 }
 
 void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
