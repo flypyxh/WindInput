@@ -2135,6 +2135,10 @@ pub struct CodetableGlobal {
     /// 与 `wildcard` 主开关正交。见 reverse-mode spec §2。
     #[serde(default)]
     pub wildcard_single_only: bool,
+    /// 通配、反查模式与候选注释反查可查到**未启用**的扩展词库
+    /// （`DictSpec::is_enabled() == false`）；普通打字候选不受影响。见 reverse-mode spec §4。
+    #[serde(default)]
+    pub lookup_disabled_dicts: bool,
     /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
     /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
     ///
@@ -2240,6 +2244,7 @@ impl Default for CodetableGlobal {
             wildcard: false,
             wildcard_key: default_wildcard_key(),
             wildcard_single_only: false,
+            lookup_disabled_dicts: false,
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -2310,6 +2315,9 @@ impl CodetableGlobal {
         }
         if let Some(v) = o.wildcard_single_only {
             out.wildcard_single_only = v;
+        }
+        if let Some(v) = o.lookup_disabled_dicts {
+            out.lookup_disabled_dicts = v;
         }
         // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
         //
@@ -9655,6 +9663,30 @@ mod tests {
         assert!(
             !global_on.resolved(Some(&on)).wildcard,
             "与主开关正交：开仅单字不连带开通配"
+        );
+    }
+
+    /// reverse-mode spec §4.2：一个方案级开关，三态折叠，出厂关。
+    #[test]
+    fn codetable_lookup_disabled_dicts_folds_from_schema() {
+        let g = CodetableGlobal::default();
+        assert!(!g.lookup_disabled_dicts, "出厂关闭");
+        let on = crate::schema::CodeTableSpec {
+            lookup_disabled_dicts: Some(true),
+            ..Default::default()
+        };
+        assert!(g.resolved(Some(&on)).lookup_disabled_dicts);
+        let global_on = CodetableGlobal {
+            lookup_disabled_dicts: true,
+            ..Default::default()
+        };
+        let off = crate::schema::CodeTableSpec {
+            lookup_disabled_dicts: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            !global_on.resolved(Some(&off)).lookup_disabled_dicts,
+            "方案显式关压过全局"
         );
     }
 

@@ -240,6 +240,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.wildcard", Bool),
     f("schema.codetable.wildcard_key", Str),
     f("schema.codetable.wildcard_single_only", Bool),
+    f("schema.codetable.lookup_disabled_dicts", Bool),
     // 码元字符集：范围+字面的自由文本（如 `a-x/`、`a-z0-9`），值域无法枚举故用 Str；
     // 解析与非法回落见 `CodeCharSet`。空 = 内置默认 `a-z`。
     f("schema.codetable.input_chars", Str),
@@ -920,6 +921,10 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         (
             "schema.codetable.wildcard_single_only",
             ct.wildcard_single_only.is_some(),
+        ),
+        (
+            "schema.codetable.lookup_disabled_dicts",
+            ct.lookup_disabled_dicts.is_some(),
         ),
         // 码元字符集用空串表达「未设置」（见 `CodetableGlobal::resolved`）。
         ("schema.codetable.input_chars", !ct.input_chars.is_empty()),

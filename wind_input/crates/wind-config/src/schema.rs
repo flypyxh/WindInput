@@ -492,6 +492,10 @@ pub struct CodeTableSpec {
     /// 见 `docs/design/codetable-reverse-mode.md` §2。
     #[serde(default)]
     pub wildcard_single_only: Option<bool>,
+    /// 通配、反查含未启用扩展词库（`None` = 跟随全局 `schema.codetable.lookup_disabled_dicts`）。
+    /// 见 `docs/design/codetable-reverse-mode.md` §4。
+    #[serde(default)]
+    pub lookup_disabled_dicts: Option<bool>,
     /// 方案级调频覆盖（`[engine.codetable.frequency]`）。
     ///
     /// 缺省 = 整段跟随基线。特殊方案的基线是内置默认（不继承全局 `schema.codetable`，
