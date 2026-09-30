@@ -3,14 +3,15 @@
 use std::path::{Path, PathBuf};
 use wind_config::Config;
 use wind_engine::EngineManager;
+use wind_engine::ReverseScope;
 
 fn uid(tag: &str) -> String {
     format!("zz_ldd_{tag}_{}", std::process::id())
 }
 
 pub struct Cleanup {
-    id: String,
-    dir: PathBuf,
+    pub id: String,
+    pub dir: PathBuf,
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -22,6 +23,8 @@ impl Drop for Cleanup {
 }
 
 /// 主库：工 a / 立法 uuif；已启用扩展 `_ext`：甘蓝菜 aaae；未启用扩展 `_xz`：门头沟区 uuia。
+/// `_xz` 的权重刻意高于主库同前缀的「立法」：「已启用排前」的断言因此只能靠未启用标记成立，
+/// 不会被权重巧合蒙过去。
 /// `xz_file = false` ⇒ `_xz` 的 path 指向不存在的文件（缺失处理）。`with_xz = false` ⇒ 不声明 `_xz`。
 fn write_fixture(dir: &Path, id: &str, with_xz: bool, xz_file: bool) {
     let s = dir.join("schemas");
@@ -58,7 +61,7 @@ fn write_fixture(dir: &Path, id: &str, with_xz: bool, xz_file: bool) {
     if with_xz && xz_file {
         std::fs::write(
             s.join(format!("{id}/xz.dict.yaml")),
-            dict("xz", "uuia\t门头沟区\t0\n"),
+            dict("xz", "uuia\t门头沟区\t1000\n"),
         )
         .unwrap();
     }
@@ -166,4 +169,95 @@ fn only_disabled_extra_hits_carry_the_flag() {
         [("立法".to_string(), false), ("门头沟区".to_string(), true)]
     );
     assert_eq!(flags("aaa?", "aaaz"), [("甘蓝菜".to_string(), false)]);
+}
+
+/// spec §4.2：注释反查变体含未启用库；加词查重（word_codes_in）与悬停（word_codes_display）口径不变（裁决 6）。
+#[test]
+fn comment_reverse_variant_includes_disabled_extra() {
+    let (m, id, _g) = setup("rev", true, true, true);
+    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
+    assert_eq!(
+        m.word_codes_display_for_comment(&id, "门头沟区"),
+        None,
+        "没就绪 ≠ 查不到"
+    );
+    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
+    assert!(m.prewarm_reverse_index(&id));
+    assert_eq!(
+        m.word_codes_display_for_comment(&id, "门头沟区").as_deref(),
+        Some("uuia")
+    );
+    assert_eq!(
+        m.codetable_reverse_hint("门头沟区").as_deref(),
+        Some("uuia")
+    );
+    assert_eq!(
+        m.word_codes_in(&id, "门头沟区").as_deref(),
+        Some(""),
+        "加词查重只认启用集"
+    );
+    assert_eq!(
+        m.word_codes_display(&id, "门头沟区").as_deref(),
+        Some(""),
+        "悬停口径不变"
+    );
+}
+
+/// ★ Review Focus 4：两份索引分文件、内容不同；换一个 manager（重启）后各自复用自己那份，不串。
+#[test]
+fn variant_and_regular_indexes_use_separate_files() {
+    let Some(root) = Config::cache_dir() else {
+        eprintln!("跳过：无缓存根");
+        return;
+    };
+    let (m, id, g) = setup("files", true, true, true);
+    assert!(m.prewarm_reverse_index(&id));
+    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
+    let dir = root.join(&id);
+    let regular = dir.join(format!("{id}.wridx"));
+    let variant = dir.join(format!("{id}.with_disabled.wridx"));
+    assert!(
+        regular.exists() && variant.exists(),
+        "{:?}",
+        std::fs::read_dir(&dir).map(|r| r.count())
+    );
+    assert_ne!(
+        std::fs::read(&regular).unwrap(),
+        std::fs::read(&variant).unwrap()
+    );
+    drop(m);
+    let m2 = manager(&g.dir, &id, true);
+    assert!(m2.prewarm_reverse_index(&id));
+    assert_eq!(
+        m2.word_codes_in(&id, "门头沟区").as_deref(),
+        Some(""),
+        "常规索引复用后仍不含未启用库"
+    );
+    assert!(m2.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
+    assert_eq!(
+        m2.word_codes_display_for_comment(&id, "门头沟区")
+            .as_deref(),
+        Some("uuia")
+    );
+}
+
+/// 裁决 7：开关关 / 方案没有未启用库 ⇒ 退化为常规索引，不另建文件。
+#[test]
+fn scope_collapses_to_enabled() {
+    let (off, id, _g) = setup("scope_off", false, true, true);
+    assert_eq!(off.comment_reverse_scope(&id), ReverseScope::Enabled);
+    let (none, id2, _g2) = setup("scope_none", true, false, true);
+    assert_eq!(none.comment_reverse_scope(&id2), ReverseScope::Enabled);
+}
+
+/// 失效：启用集变了，变体与范围缓存一并作废。
+#[test]
+fn variant_invalidated_on_dict_toggle() {
+    let (m, id, _g) = setup("inval", true, true, true);
+    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
+    m.set_dict_enabled_live(&id, &format!("{id}_ext"), false);
+    assert!(
+        m.reverse_index_if_ready_in(&id, ReverseScope::WithDisabled)
+            .is_none()
+    );
 }
