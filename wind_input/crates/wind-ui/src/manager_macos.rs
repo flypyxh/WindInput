@@ -4,6 +4,9 @@
 //! 候选/工具栏/提示统一光栅化进 POSIX SHM，再经 push 管道通知 .app 端取帧呈现。
 //! 本模块在 `ext_presenter` 下编译：macOS，以及 Linux 的 `linux-host` 形态（宿主是 Fcitx5 addon）。
 //! 软键盘、全局热键这两块是 macOS 专属（AppKit / Carbon），Linux 不做，命令落 `other` 臂。
+//!
+//! 状态气泡 / Toast / 悬停提示两平台分道：macOS `.app` 原生渲染，这里只发文本 + 配色；
+//! Linux addon 不排字，这里光栅化后走 `CMD_OVERLAY_FRAME`（见 `crate::overlay_linux`）。
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -17,11 +20,14 @@ use wind_bridge::HostRenderSink;
 use wind_bridge::shared_memory_posix::PosixSharedMemory;
 use wind_ipc::codec::*;
 use wind_ipc::protocol::*;
-use wind_ui_types::{StatusTipAnchor, StatusTipPlacement, TooltipDoc};
+use wind_ui_types::TooltipDoc;
+#[cfg(target_os = "macos")]
+use wind_ui_types::{StatusTipAnchor, StatusTipPlacement};
 
 const SHM_MAX: usize = MAX_SHARED_RENDER_SIZE;
 
 /// 气泡锚点 → wire 编码（[`wind_ipc::protocol::status_anchor`]）。
+#[cfg(target_os = "macos")]
 fn status_anchor_code(a: StatusTipAnchor) -> i32 {
     use StatusTipAnchor as A;
     match a {
@@ -89,6 +95,7 @@ fn spawn_screenshot_work(tag: &'static str, work: impl FnOnce() + Send + 'static
 /// 编码一帧 Toast。**自由函数而非方法**：截图那条路要在后台线程发 Toast（见
 /// `TakeScreenshot` 分支），那边只拿得到 `sink` 与两个配色串的克隆，碰不到 `&self`。
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
 fn toast_frame(
     bg: &str,
     fg: &str,
@@ -124,6 +131,7 @@ fn toast_frame(
 /// macOS 侧提示类窗口的配色快照。.app 原生渲染 tooltip / 状态气泡 / Toast，
 /// 拿不到 `Resolved`，故在此把主题求值成 hex 串随帧下发；空串 = .app 用内置默认。
 #[derive(Default, Clone)]
+#[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
 struct TipColors {
     tooltip_bg: String,
     tooltip_fg: String,
@@ -142,6 +150,7 @@ pub struct Forwarder {
     tips: TipColors,
     /// 拆字字根字体绝对路径（`SetTooltipChaiziFont` 下发）。缺它则 .app 侧
     /// PUA 字根渲染成方框——对齐 Windows 64a2b50 修的同一问题。
+    #[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
     chaizi_font: String,
     /// 回协调器的事件通道（全局热键触发等）。
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -156,6 +165,9 @@ pub struct Forwarder {
     last_tip: Option<Arc<TooltipDoc>>,
     /// 当前主题（`SetTheme` 留一份），推气泡时现算分段颜色用。
     theme: Option<Box<wind_theme::Resolved>>,
+    /// Linux：状态气泡 / Toast / tooltip 的光栅浮层（macOS 由 `.app` 原生渲染，无此字段）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    overlays: crate::overlay_linux::Overlays,
 }
 
 impl Forwarder {
@@ -163,6 +175,8 @@ impl Forwarder {
         // CandidateWindow 在非 Windows 是纯光栅 mock，不产生鼠标事件；共用同一 tx 即可。
         let win = CandidateWindow::new(CandidateWindowConfig::default(), ev_tx.clone())
             .expect("create candidate window (mock/raster host)");
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let overlays = crate::overlay_linux::Overlays::new(ev_tx.clone(), suffix.clone());
         Self {
             win,
             shm: None,
@@ -174,6 +188,8 @@ impl Forwarder {
             visible: false,
             last_tip: None,
             theme: None,
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            overlays,
         }
     }
 
@@ -316,32 +332,54 @@ impl Forwarder {
                 duration_ms,
                 placement,
             } => {
-                // wire 传屏幕 (x,y) + 锚点编码；跟随光标 / 固定坐标在此算定最终 (x,y)。
-                // 跟随光标时 y 是 caret 顶端，须 +caret_height 落到 caret 底端下方，否则气泡
-                // 贴在 caret 顶端盖住输入位（与候选窗 render_frame 的 y+caret_height 对齐）。
-                // 锚点由 `.app` 在焦点所在屏上落位（前台窗口 / 屏幕几何只有那边拿得到），
-                // 此时 (x,y) 只是选屏参考，照跟随光标的算法给出光标底端。
-                let (fx, fy, anchor) = match placement {
-                    StatusTipPlacement::Fixed { x: px, y: py } => (px, py, status_anchor::NONE),
-                    StatusTipPlacement::Caret { offset_x, offset_y } => (
-                        x + offset_x,
-                        y + offset_y + caret_height,
-                        status_anchor::NONE,
-                    ),
-                    StatusTipPlacement::Anchor(a) => (x, y + caret_height, status_anchor_code(a)),
-                };
-                self.sink.push_frame(&encode_status_show(
+                // Linux：光栅化成浮层帧，落位（含锚点）交 addon 按工作区做。
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.overlays.show_status(
+                    &*self.sink,
                     &text,
-                    &self.tips.status_bg,
-                    &self.tips.status_fg,
-                    fx,
-                    fy,
-                    duration_ms as i32,
-                    anchor,
-                ));
+                    x,
+                    y,
+                    caret_height,
+                    duration_ms,
+                    placement,
+                );
+                #[cfg(target_os = "macos")]
+                {
+                    // wire 传屏幕 (x,y) + 锚点编码；跟随光标 / 固定坐标在此算定最终 (x,y)。
+                    // 跟随光标时 y 是 caret 顶端，须 +caret_height 落到 caret 底端下方，否则气泡
+                    // 贴在 caret 顶端盖住输入位（与候选窗 render_frame 的 y+caret_height 对齐）。
+                    // 锚点由 `.app` 在焦点所在屏上落位（前台窗口 / 屏幕几何只有那边拿得到），
+                    // 此时 (x,y) 只是选屏参考，照跟随光标的算法给出光标底端。
+                    let (fx, fy, anchor) = match placement {
+                        StatusTipPlacement::Fixed { x: px, y: py } => (px, py, status_anchor::NONE),
+                        StatusTipPlacement::Caret { offset_x, offset_y } => (
+                            x + offset_x,
+                            y + offset_y + caret_height,
+                            status_anchor::NONE,
+                        ),
+                        StatusTipPlacement::Anchor(a) => {
+                            (x, y + caret_height, status_anchor_code(a))
+                        }
+                    };
+                    self.sink.push_frame(&encode_status_show(
+                        &text,
+                        &self.tips.status_bg,
+                        &self.tips.status_fg,
+                        fx,
+                        fy,
+                        duration_ms as i32,
+                        anchor,
+                    ));
+                }
             }
             UiCommand::HideStatusTip => {
+                #[cfg(target_os = "macos")]
                 self.sink.push_frame(&encode_status_hide());
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.overlays.hide(
+                    &*self.sink,
+                    wind_ipc::protocol::overlay::OVERLAY_KIND_STATUS,
+                );
             }
             UiCommand::ShowToast {
                 text,
@@ -385,6 +423,8 @@ impl Forwarder {
                 // 面板是惰性建窗的，主题得在本模块之外留一份底，理由见 `SkCmd::Theme`。
                 #[cfg(target_os = "macos")]
                 self.push_softkeyboard(sk::SkCmd::Theme(t.clone()));
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.overlays.set_theme(&t);
                 self.theme = Some(t.clone());
                 self.win.set_theme(*t);
             }
@@ -504,7 +544,10 @@ impl Forwarder {
             UiCommand::ScreenshotCandidateToClipboard => {
                 let shot = self.capture_candidate();
                 let sink = Arc::clone(&self.sink);
+                #[cfg(target_os = "macos")]
                 let (bg, fg) = (self.tips.toast_bg.clone(), self.tips.toast_fg.clone());
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                let toast = self.overlays.toast_handle();
                 spawn_screenshot_work("clip", move || {
                     let (msg, kind) = match shot {
                         Some((buf, w, h)) => {
@@ -521,6 +564,7 @@ impl Forwarder {
                         }
                         None => ("候选窗口未显示，无法截图".to_string(), ToastKind::Info),
                     };
+                    #[cfg(target_os = "macos")]
                     sink.push_frame(&toast_frame(
                         &bg,
                         &fg,
@@ -530,6 +574,8 @@ impl Forwarder {
                         3000,
                         None,
                     ));
+                    #[cfg(all(target_os = "linux", ext_presenter))]
+                    toast.show(&*sink, &msg, ToastPosition::BottomRight, kind, 3000, None);
                 });
             }
             UiCommand::CopyTooltipText(text) => {
@@ -620,15 +666,19 @@ impl Forwarder {
         sk::apply(cmd, &self.ev_tx);
     }
 
-    /// 推一条 toast 给 `.app`（原生渲染）。
+    /// 推一条 toast：macOS 发文本给 `.app` 原生渲染，Linux 光栅化成浮层帧。
     fn push_toast(
-        &self,
+        &mut self,
         text: &str,
         position: ToastPosition,
         kind: ToastKind,
         duration_ms: i32,
         accent: Option<[u8; 4]>,
     ) {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.overlays
+            .show_toast(&*self.sink, text, position, kind, duration_ms, accent);
+        #[cfg(target_os = "macos")]
         self.sink.push_frame(&toast_frame(
             &self.tips.toast_bg,
             &self.tips.toast_fg,
@@ -641,7 +691,7 @@ impl Forwarder {
     }
 
     /// 截图/复制类操作的结果反馈：右下角 toast，3 秒（与 Windows 侧同一形态）。
-    fn push_result_toast(&self, text: &str, kind: ToastKind) {
+    fn push_result_toast(&mut self, text: &str, kind: ToastKind) {
         self.push_toast(text, ToastPosition::BottomRight, kind, 3000, None);
     }
 
@@ -735,6 +785,14 @@ impl Forwarder {
                     scale.round().max(1.0) as u32,
                 ));
                 self.sink.push_frame(&encode_candidate_rects(&rects));
+                // Linux：tooltip 在本进程光栅化，坐标按候选窗建议落点算（addon 平移到实际位置）。
+                // 悬停目标取自候选窗自己的 hover 状态，与 `tip` 同源（都来自本帧 `hover`）。
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                {
+                    let ov = self.win.render_tooltip_overlay(sx, sy);
+                    self.overlays.show_tooltip(&*self.sink, ov);
+                }
+                #[cfg(target_os = "macos")]
                 match &tip {
                     Some(doc) => {
                         let (text, runs) = self.tooltip_payload(doc);
@@ -771,6 +829,7 @@ impl Forwarder {
     ///
     /// 正文色兜底与 `SetTheme` 里下发的 `tooltip_fg` 同源（palette `tooltip_text` → 节点文字色，
     /// 编译期默认同 `node_colors` 的兜底）；等于正文色的区间已丢弃，出厂下恒为空。
+    #[cfg(target_os = "macos")]
     fn tooltip_payload(&self, doc: &TooltipDoc) -> (String, Vec<TooltipColorRun>) {
         let styled = doc.to_styled();
         let runs = match &self.theme {
@@ -800,6 +859,11 @@ impl Forwarder {
         // 候选窗重推帧，把它又推回屏幕上。
         self.visible = false;
         self.last_tip = None;
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.overlays.hide(
+            &*self.sink,
+            wind_ipc::protocol::overlay::OVERLAY_KIND_TOOLTIP,
+        );
         if let Some(shm) = self.shm.as_mut() {
             let seq = shm.write_hidden();
             self.sink
@@ -1168,6 +1232,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // 文本帧是 macOS `.app` 的契约；Linux 走光栅浮层帧，见 `linux_overlays` 同名用例。
+    #[cfg(target_os = "macos")]
     #[test]
     fn copy_tooltip_text_reports_empty_when_no_tip() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1231,6 +1297,8 @@ mod tests {
         );
     }
 
+    // 文本帧是 macOS `.app` 的契约；Linux 走光栅浮层帧，见 `linux_overlays` 同名用例。
+    #[cfg(target_os = "macos")]
     #[test]
     fn status_tip_fixed_overrides_coords() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1265,6 +1333,8 @@ mod tests {
         );
     }
 
+    // 文本帧是 macOS `.app` 的契约；Linux 走光栅浮层帧，见 `linux_overlays` 同名用例。
+    #[cfg(target_os = "macos")]
     #[test]
     fn status_tip_non_fixed_applies_offset() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1295,6 +1365,7 @@ mod tests {
     }
 
     /// 锚点：编码随帧下发，(x,y) 是光标底端（选屏参考），不叠加用户偏移。
+    #[cfg(target_os = "macos")]
     #[test]
     fn status_tip_anchor_is_encoded() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1324,6 +1395,8 @@ mod tests {
         );
     }
 
+    // 文本帧是 macOS `.app` 的契约；Linux 走光栅浮层帧，见 `linux_overlays` 同名用例。
+    #[cfg(target_os = "macos")]
     #[test]
     fn hide_status_tip_and_toast_and_toolbar_emit() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1369,6 +1442,7 @@ mod tests {
     }
 
     /// 气泡的分段颜色随帧下发，且按**推送时**的主题现算：换明暗后重推，颜色跟着换。
+    #[cfg(target_os = "macos")]
     #[test]
     fn tooltip_runs_are_recomputed_on_theme_change() {
         use wind_ui_types::{SpanStyle, StyledText, TooltipDoc, TooltipLine, TooltipSection};
@@ -1468,5 +1542,240 @@ mod tests {
             vec![(2, 2, [0xFF, 0x80, 0x80, 255]), (5, 1, [3, 3, 3, 255])],
             "换明暗重推的气泡必须按新主题现算颜色"
         );
+    }
+
+    /// Linux：状态气泡 / Toast / tooltip 光栅化成 `CMD_OVERLAY_FRAME`，不发 macOS 的文本帧。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    mod linux_overlays {
+        use super::*;
+        use wind_bridge::shared_memory_posix::PosixSharedMemory;
+        use wind_ipc::protocol::overlay::*;
+        use wind_ui_types::{StatusTipAnchor, StatusTipPlacement};
+
+        /// 解出一帧浮层元数据（按 `encode_overlay_frame` 的偏移）。
+        struct Meta {
+            kind: u32,
+            w: u32,
+            h: u32,
+            flags: u32,
+            place: u32,
+            x: i32,
+            y: i32,
+            alt_y: i32,
+            anchor: u32,
+            margin: i32,
+            duration: i32,
+        }
+
+        fn overlays(cap: &Arc<Mutex<Vec<Vec<u8>>>>, kind: u32) -> Vec<Meta> {
+            cap.lock()
+                .unwrap()
+                .iter()
+                .filter(|f| cmd_of(f) == CMD_OVERLAY_FRAME)
+                .map(|f| {
+                    let p = &f[8..];
+                    let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+                    let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+                    Meta {
+                        kind: u(0),
+                        w: u(8),
+                        h: u(12),
+                        flags: u(16),
+                        place: u(20),
+                        x: i(24),
+                        y: i(28),
+                        alt_y: i(36),
+                        anchor: u(40),
+                        margin: i(44),
+                        duration: i(64),
+                    }
+                })
+                .filter(|m| m.kind == kind)
+                .collect()
+        }
+
+        fn visible(m: &Meta) -> bool {
+            m.flags & SharedRenderHeader::FLAG_VISIBLE != 0
+        }
+
+        fn no_text_frames(cap: &Arc<Mutex<Vec<Vec<u8>>>>) {
+            let v = cap.lock().unwrap();
+            for c in [CMD_STATUS_SHOW, CMD_TOAST_SHOW, CMD_TOOLTIP_SHOW] {
+                assert!(
+                    !v.iter().any(|f| cmd_of(f) == c),
+                    "Linux 不该发 macOS 文本帧 0x{c:04X}"
+                );
+            }
+        }
+
+        fn status(f: &mut Forwarder, placement: StatusTipPlacement) {
+            f.handle(UiCommand::ShowStatusTip {
+                text: "中".into(),
+                x: 10,
+                y: 20,
+                caret_height: 18,
+                duration_ms: 1500,
+                placement,
+            });
+        }
+
+        /// 跟随光标：首选点 = 光标底端 + 4 + 偏移，备选点 = 光标顶端上方；像素真在 SHM 里。
+        #[test]
+        fn status_tip_caret_is_rasterized_with_flip_points() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo1");
+            status(
+                &mut f,
+                StatusTipPlacement::Caret {
+                    offset_x: 3,
+                    offset_y: 4,
+                },
+            );
+            no_text_frames(&cap);
+            let m = overlays(&cap, OVERLAY_KIND_STATUS);
+            assert_eq!(m.len(), 1);
+            let m = &m[0];
+            assert!(visible(m));
+            assert_eq!(m.place, OVERLAY_PLACE_FLIP);
+            assert_eq!((m.x, m.y), (13, 20 + 18 + 4 + 4));
+            assert!(m.alt_y < 20, "备选点在光标顶端之上");
+            assert_eq!(m.duration, 1500, "自动隐藏时长随帧下发、归 addon 计时");
+            let name =
+                wind_bridge::endpoint::overlay_shm_name("_lo1", OVERLAY_KIND_STATUS).unwrap();
+            let shm = PosixSharedMemory::open_readonly(&name, MAX_SHARED_RENDER_SIZE).unwrap();
+            let hdr = shm.read_header();
+            assert_eq!((hdr.width, hdr.height), (m.w, m.h));
+            let px = &shm.pixels()[..(m.w * m.h * 4) as usize];
+            assert!(px.chunks(4).any(|p| p[3] > 0), "位图不能是全透明");
+        }
+
+        #[test]
+        fn status_tip_fixed_and_anchor_placements() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo2");
+            status(&mut f, StatusTipPlacement::Fixed { x: 500, y: 600 });
+            status(
+                &mut f,
+                StatusTipPlacement::Anchor(StatusTipAnchor::WindowBottomLeft),
+            );
+            let m = overlays(&cap, OVERLAY_KIND_STATUS);
+            assert_eq!(m.len(), 2);
+            assert_eq!(m[0].place, OVERLAY_PLACE_ABSOLUTE);
+            assert_eq!((m[0].x, m[0].y), (500, 600));
+            assert_eq!(m[1].place, OVERLAY_PLACE_ANCHOR);
+            assert_eq!(
+                m[1].anchor, OVERLAY_ANCHOR_BOTTOM_LEFT,
+                "窗口锚点拿不到窗口边框，降级为屏幕锚点"
+            );
+            assert_eq!(m[1].margin, 16);
+        }
+
+        #[test]
+        fn hide_status_tip_after_show_emits_hidden_overlay() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo3");
+            f.handle(UiCommand::HideStatusTip);
+            assert!(
+                overlays(&cap, OVERLAY_KIND_STATUS).is_empty(),
+                "没显示过不发"
+            );
+            status(&mut f, StatusTipPlacement::Fixed { x: 1, y: 1 });
+            f.handle(UiCommand::HideStatusTip);
+            let m = overlays(&cap, OVERLAY_KIND_STATUS);
+            assert_eq!(m.len(), 2);
+            assert!(visible(&m[0]) && !visible(&m[1]));
+        }
+
+        #[test]
+        fn toast_is_rasterized_with_anchor() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo4");
+            f.handle(UiCommand::ShowToast {
+                text: "ok".into(),
+                position: crate::toast::ToastPosition::BottomCenter,
+                kind: crate::toast::ToastKind::Success,
+                duration_ms: 2000,
+                accent: None,
+            });
+            no_text_frames(&cap);
+            let m = overlays(&cap, OVERLAY_KIND_TOAST);
+            assert_eq!(m.len(), 1);
+            assert!(visible(&m[0]));
+            assert_eq!(m[0].place, OVERLAY_PLACE_ANCHOR);
+            assert_eq!(m[0].anchor, OVERLAY_ANCHOR_BOTTOM_CENTER);
+            assert_eq!((m[0].margin, m[0].duration), (12, 2000));
+        }
+
+        /// 复制类操作的结果反馈也走浮层（此前 Linux 上这条 Toast 被 addon 丢弃）。
+        #[test]
+        fn copy_tooltip_text_reports_empty_when_no_tip() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo5");
+            f.handle(UiCommand::CopyTooltipText(String::new()));
+            let m = overlays(&cap, OVERLAY_KIND_TOAST);
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0].anchor, OVERLAY_ANCHOR_BOTTOM_RIGHT);
+        }
+
+        /// 悬停候选有反查内容 → tooltip 层跟着候选窗走；候选窗隐藏时 tooltip 一起藏。
+        #[test]
+        fn hover_tooltip_follows_candidate_and_hides_with_it() {
+            use wind_ui_types::{StyledText, TooltipDoc, TooltipLine, TooltipSection};
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk(cap.clone(), "_lo6");
+            let mut cand = item("你");
+            cand.tooltip = Arc::new(TooltipDoc {
+                sections: vec![TooltipSection {
+                    title: None,
+                    inline: false,
+                    lines: vec![TooltipLine {
+                        text: StyledText::from("nǐ"),
+                        raw: 0,
+                    }],
+                }],
+            });
+            let update = |f: &mut Forwarder, hover: i32| {
+                f.handle(UiCommand::UpdateCandidates {
+                    preedit: "ni".into(),
+                    preedit_caret: 2,
+                    preedit_host_owned: false,
+                    mode_label: "".into(),
+                    candidates: vec![cand.clone()],
+                    selected: 0,
+                    hover,
+                    page: 1,
+                    total_pages: 1,
+                    caret_x: 100,
+                    caret_y: 200,
+                    caret_height: 20,
+                    caret_valid: true,
+                    fixed: false,
+                    fixed_x: 0,
+                    fixed_y: 0,
+                })
+            };
+            update(&mut f, -1);
+            assert!(
+                overlays(&cap, OVERLAY_KIND_TOOLTIP).is_empty(),
+                "无悬停不发"
+            );
+            update(&mut f, 0);
+            no_text_frames(&cap);
+            let (sx, sy, _) = last_render_frame(&cap).unwrap();
+            let m = overlays(&cap, OVERLAY_KIND_TOOLTIP);
+            assert_eq!(m.len(), 1);
+            assert!(visible(&m[0]));
+            assert_eq!(m[0].place, OVERLAY_PLACE_FOLLOW_CANDIDATE);
+            assert_eq!(m[0].duration, 0, "tooltip 常驻到下一帧");
+            assert!(
+                m[0].x >= sx && m[0].y > sy,
+                "横排在候选行下方：({},{}) vs 候选窗 ({sx},{sy})",
+                m[0].x,
+                m[0].y
+            );
+            f.handle(UiCommand::HideCandidates);
+            let m = overlays(&cap, OVERLAY_KIND_TOOLTIP);
+            assert!(!visible(m.last().unwrap()), "候选窗藏了 tooltip 也得藏");
+        }
     }
 }

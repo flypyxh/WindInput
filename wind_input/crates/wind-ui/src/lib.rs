@@ -46,6 +46,9 @@ pub mod manager;
 /// 外部宿主 forwarder（macOS `.app` / Linux Fcitx5 addon）：把 UiCommand 光栅化进 POSIX SHM + push 推帧给宿主。
 #[cfg(ext_presenter)]
 pub mod manager_macos;
+/// Linux 外部宿主的光栅浮层（状态气泡 / Toast / tooltip → `CMD_OVERLAY_FRAME`）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+mod overlay_linux;
 pub mod popup_menu;
 pub mod screenshot;
 pub mod soft_keyboard;

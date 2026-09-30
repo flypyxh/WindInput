@@ -994,6 +994,39 @@ impl Tooltip {
     }
 }
 
+impl Tooltip {
+    /// Linux 外部宿主：渲染位图 + 落位规则（首选 / 备选点，addon 按工作区选定）。
+    /// `row` 为悬停候选行的屏幕 `(left, top, right, bottom)`；`beside` 对应竖排 / 旋转的
+    /// [`Self::render_frame_beside`]，否则对应横排的 [`Self::render_frame`]。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn render_overlay(
+        &mut self,
+        doc: &Arc<TooltipDoc>,
+        candidate: i32,
+        row: (i32, i32, i32, i32),
+        beside: bool,
+    ) -> Option<crate::overlay_linux::Overlay> {
+        use crate::overlay_linux as ol;
+        let text = self.set_doc(doc, candidate);
+        if text.is_empty() {
+            return None;
+        }
+        self.ensure_scale(row.0, row.3);
+        let (buf, w, h, cw, ch, ml, mt, _mr, _mb, has_shadow) = self.render_to_bgra(&text);
+        Some(ol::Overlay {
+            buf,
+            width: w,
+            height: h,
+            content_x: ml,
+            content_y: mt,
+            content_w: cw,
+            content_h: ch,
+            software_shadow: has_shadow,
+            place: ol::tooltip_place(row, (cw, ch), beside),
+        })
+    }
+}
+
 /// 文本块在窗口里的矩形：与 `View::paint` 画叶节点文本的定位公式同一套——内容盒内
 /// 水平居中（`Align::Center`）、垂直居中，左右 / 上下内边距对称，故内边距不必出现在式中。
 /// `(ml, mt)` 是叶节点的排布原点（软阴影扩边），`(w_f, h_f)` 是叶节点测得尺寸。

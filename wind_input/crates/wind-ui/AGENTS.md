@@ -25,6 +25,7 @@
 | `src/input_diag_hud.rs` | 输入诊断 HUD：四分区文本浮窗（输入态/窗口链/TSF 实例/HostRender），可拖动、双击复制、右键菜单（复制·显示分类·停止刷新·置顶）。定位三档见 `plan_position`——**已定位时走钳制而非原样沿用**，否则内容变长会被屏幕边缘吞掉；拖动不经此路径，故当次说了算、下次更新钳回。`format_diag_lines` 与视图类型已下沉 wind-ui-types（纯测试随迁），此处再导出 |
 | `src/text/dwrite.rs` | DirectWrite 文本测量/渲染（预乘 alpha 回写 BGRA）+ 非 Windows mock（0.6×em 等宽近似） |
 | `src/text/linux/` | Linux 真字形后端（仅 `linux-host` feature）：ttf-parser + ab_glyph_rasterizer，运行期 dlopen fontconfig；无整形/连字/hinting、无彩色 emoji，限制见 `mod.rs` 模块头。默认形态（feature 关）仍是 mock |
+| `src/overlay_linux.rs` | Linux 外部宿主（仅 `linux-host`）：状态气泡 / Toast / tooltip 在服务进程光栅化，各层一段 SHM + `CMD_OVERLAY_FRAME`，落位规则（首选/备选点、锚点）交 addon 按工作区定。macOS 不走这里（`.app` 原生渲染，收文本帧） |
 | `src/linux_host.rs` | Linux 外部宿主形态的系统能力（剪贴板 wl-clipboard/xclip、`xdg-open`），全走外部命令 |
 | `src/text/backend.rs` | `TextBackend` trait（measure/draw 抽象） |
 | `src/theme_assets.rs` | 把 wind-theme 的 `RvImage` ref 解析为绝对路径并转 `ViewImage`/`ViewLayer` |

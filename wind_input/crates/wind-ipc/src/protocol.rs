@@ -228,6 +228,43 @@ pub const CMD_KEY_SEQ: u16 = 0x050F; // comboCount u32 + comboCount×combo
 pub const CMD_KEY_HOLD: u16 = 0x0510; // 单个 combo（按下保持）
 pub const CMD_KEY_RELEASE: u16 = 0x0511; // 单个 combo（抬起）
 pub const CMD_KEY_TYPE: u16 = 0x0512; // 整段 UTF-8 文本（无长度前缀），.app 走 insertText 上屏
+/// 光栅浮层帧（**仅 Linux** Fcitx5 addon）：状态气泡 / Toast / 悬停提示由服务进程光栅化进
+/// 各自的 SHM 段（`endpoint::overlay_shm_name`），本帧通知「某一层有新帧 / 该隐藏」并带上
+/// 落位规则。macOS `.app` 原生渲染这三者、仍收文本帧（`CMD_STATUS_SHOW` 等），从不收本帧。
+/// 布局见 [`crate::codec::encode_overlay_frame`]，常量见 [`overlay`]。
+pub const CMD_OVERLAY_FRAME: u16 = 0x0513;
+
+/// [`CMD_OVERLAY_FRAME`] 的枚举值。全部 `u32` 且名字全局唯一：`wind_linux/tests/protocol_sync_test.cpp`
+/// 按 `pub const NAME: u32 = …` 逐个比对 `wind_linux/include/ExtProtocol.h`。
+pub mod overlay {
+    /// 层（kind）。1/2 与 [`super::HOST_WINDOW_TOOLTIP`] / [`super::HOST_WINDOW_STATUS`] 同值；
+    /// Toast 在 Windows 不走 host-render，故另取 3（不动 `HOST_WINDOW_KIND_COUNT`）。
+    pub const OVERLAY_KIND_TOOLTIP: u32 = 1;
+    pub const OVERLAY_KIND_STATUS: u32 = 2;
+    pub const OVERLAY_KIND_TOAST: u32 = 3;
+
+    /// 落位方式（place）。坐标一律指**内容盒**左上（不含软阴影扩边），宿主减去
+    /// `content_x/y` 得窗口左上。
+    /// - `ABSOLUTE`：`(x, y)` 即落点，宿主只夹进工作区；
+    /// - `FLIP`：首选 `(x, y)`；内容右溢改用 `alt_x`、下溢改用 `alt_y`（`alt_y` 越过上沿则贴下沿），再夹回；
+    /// - `FOLLOW_CANDIDATE`：同 `FLIP`，但坐标是按候选窗**建议**落点算的，宿主先平移
+    ///   「候选窗实际落点 − 建议落点」（候选窗被宿主翻转/钳制过时，提示跟着走）；
+    /// - `ANCHOR`：按 `anchor` 在工作区内落位，离边 `margin` 像素；`(x, y)` 不用。
+    pub const OVERLAY_PLACE_ABSOLUTE: u32 = 0;
+    pub const OVERLAY_PLACE_FLIP: u32 = 1;
+    pub const OVERLAY_PLACE_FOLLOW_CANDIDATE: u32 = 2;
+    pub const OVERLAY_PLACE_ANCHOR: u32 = 3;
+
+    /// 锚点（anchor，仅 `ANCHOR` 用）。状态气泡的窗口锚点在 Linux 拿不到前台窗口边框，
+    /// 服务端先降级成同位置的屏幕锚点再编码，故这里只有屏幕锚点。
+    pub const OVERLAY_ANCHOR_CENTER: u32 = 1;
+    pub const OVERLAY_ANCHOR_TOP_LEFT: u32 = 2;
+    pub const OVERLAY_ANCHOR_TOP_RIGHT: u32 = 3;
+    pub const OVERLAY_ANCHOR_BOTTOM_LEFT: u32 = 4;
+    pub const OVERLAY_ANCHOR_BOTTOM_RIGHT: u32 = 5;
+    pub const OVERLAY_ANCHOR_TOP_CENTER: u32 = 6;
+    pub const OVERLAY_ANCHOR_BOTTOM_CENTER: u32 = 7;
+}
 
 // ──────────────────────────────────────────────
 // 扩展信封 (0x0E01，上下行同码位、按方向区分)

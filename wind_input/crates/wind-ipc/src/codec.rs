@@ -1652,6 +1652,57 @@ pub fn encode_toast_hide() -> Vec<u8> {
     frame(CMD_TOAST_HIDE, Vec::new())
 }
 
+/// [`CMD_OVERLAY_FRAME`] 的元数据（像素在该层的 SHM 段里）。枚举值见 [`crate::protocol::overlay`]。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlayFrameMeta {
+    pub kind: u32,
+    /// 该层 SHM 段写帧后的序号；隐藏帧同样写段（`write_hidden`）后取号。
+    pub seq: u32,
+    /// 位图尺寸（含软阴影扩边）。隐藏帧为 0。
+    pub width: u32,
+    pub height: u32,
+    /// `SharedRenderHeader::FLAG_*`：`FLAG_VISIBLE` 缺席即隐藏该层。
+    pub flags: u32,
+    pub place: u32,
+    /// 内容盒首选左上（屏幕坐标）。
+    pub x: i32,
+    pub y: i32,
+    /// `FLIP` / `FOLLOW_CANDIDATE` 的备选左上（右溢 / 下溢时用）。
+    pub alt_x: i32,
+    pub alt_y: i32,
+    pub anchor: u32,
+    /// `ANCHOR` 离工作区边缘的留白（像素）。
+    pub margin: i32,
+    /// 内容盒在位图内的偏移与尺寸（偏移 = 软阴影左/上扩边）。
+    pub content_x: i32,
+    pub content_y: i32,
+    pub content_w: u32,
+    pub content_h: u32,
+    /// 自动隐藏时长；`0` = 常驻，直到下一帧或隐藏帧。计时归宿主（同 macOS `.app`）。
+    pub duration_ms: i32,
+}
+
+/// CmdOverlayFrame (0x0513, 68B)：kind seq w h flags place（u32）+ x y alt_x alt_y（i32）+ anchor（u32）
+/// + margin content_x content_y（i32）+ content_w content_h（u32）+ duration_ms（i32），均小端。
+pub fn encode_overlay_frame(m: &OverlayFrameMeta) -> Vec<u8> {
+    let mut p = Vec::with_capacity(68);
+    for v in [m.kind, m.seq, m.width, m.height, m.flags, m.place] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [m.x, m.y, m.alt_x, m.alt_y] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    p.extend_from_slice(&m.anchor.to_le_bytes());
+    for v in [m.margin, m.content_x, m.content_y] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [m.content_w, m.content_h] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    p.extend_from_slice(&m.duration_ms.to_le_bytes());
+    frame(CMD_OVERLAY_FRAME, p)
+}
+
 /// 编码配置同步消息 (CMD_SYNC_CONFIG 0x0303)
 ///
 /// 载荷格式（对齐 TSF IPCClient async reader CONFIG_SYNC handler）：
@@ -1767,6 +1818,43 @@ mod darwin_push_tests {
         assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 40);
         assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 0x3);
         assert_eq!(u32::from_le_bytes(p[24..28].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn overlay_frame_layout_is_68_bytes_le() {
+        let f = encode_overlay_frame(&OverlayFrameMeta {
+            kind: 2,
+            seq: 9,
+            width: 120,
+            height: 40,
+            flags: 0x5,
+            place: 1,
+            x: -30,
+            y: 200,
+            alt_x: -31,
+            alt_y: 150,
+            anchor: 7,
+            margin: 16,
+            content_x: 3,
+            content_y: 4,
+            content_w: 110,
+            content_h: 30,
+            duration_ms: 1500,
+        });
+        assert_eq!(f.len(), 8 + 68);
+        assert_eq!(cmd_of(&f), CMD_OVERLAY_FRAME);
+        let p = &f[8..];
+        let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+        let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+        assert_eq!(
+            (u(0), u(4), u(8), u(12), u(16), u(20)),
+            (2, 9, 120, 40, 0x5, 1)
+        );
+        assert_eq!((i(24), i(28), i(32), i(36)), (-30, 200, -31, 150));
+        assert_eq!(u(40), 7);
+        assert_eq!((i(44), i(48), i(52)), (16, 3, 4));
+        assert_eq!((u(56), u(60)), (110, 30));
+        assert_eq!(i(64), 1500);
     }
 
     #[test]

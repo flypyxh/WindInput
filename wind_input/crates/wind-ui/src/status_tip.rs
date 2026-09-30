@@ -674,6 +674,55 @@ impl StatusTip {
             StatusTipPlacement::Anchor(a) => self.render_frame_anchor(text, a, x, y),
         }
     }
+
+    /// Linux 外部宿主：渲染位图 + 落位规则，落位由 addon 按工作区做（服务端拿不到屏幕几何）。
+    /// 三种定位与 [`Self::show_placed`] 一一对应，公式同源（见 `overlay_linux` 的纯函数）。
+    /// `(x, caret_bottom, caret_h)` 为光标；text 为空返回 None。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn render_overlay(
+        &mut self,
+        text: &str,
+        x: i32,
+        caret_bottom: i32,
+        caret_h: i32,
+        placement: StatusTipPlacement,
+    ) -> Option<crate::overlay_linux::Overlay> {
+        use crate::overlay_linux as ol;
+        if text.is_empty() {
+            return None;
+        }
+        self.ensure_scale(x, caret_bottom);
+        let s = self.scale;
+        let (buf, w, h, cw, ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
+        let place = match placement {
+            StatusTipPlacement::Caret { offset_x, offset_y } => ol::status_caret_place(
+                x,
+                caret_bottom,
+                caret_h,
+                (offset_x, offset_y),
+                ch,
+                (4.0 * s).round() as i32,
+            ),
+            StatusTipPlacement::Fixed { x: fx, y: fy } => {
+                ol::status_fixed_place(fx, fy, x, caret_bottom)
+            }
+            StatusTipPlacement::Anchor(a) => ol::Place::Anchor {
+                anchor: ol::status_anchor_code(a),
+                margin: (ANCHOR_MARGIN_DP * s).round() as i32,
+            },
+        };
+        Some(ol::Overlay {
+            buf,
+            width: w,
+            height: h,
+            content_x: ml,
+            content_y: mt,
+            content_w: cw,
+            content_h: ch,
+            software_shadow: has_shadow,
+            place,
+        })
+    }
 }
 
 /// 锚点距参照矩形边缘的留白（逻辑像素，按目标屏 DPI 缩放）。

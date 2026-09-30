@@ -125,6 +125,56 @@ impl Toast {
             self.hide();
             return;
         }
+        let (buf, w, h, cw, ch, ml, mt, _) = self.render_card(text, kind, accent_override);
+        self.window.resize(w, h);
+        self.window.buffer_mut()[..buf.len()].copy_from_slice(&buf);
+        if let Err(e) = self.window.update() {
+            tracing::warn!("Toast update failed: {}", e);
+        }
+
+        let (px, py) = place_on_work_area(pos, cw, ch, (12.0 * self.scale).round() as i32);
+        self.window.show(px - ml as i32, py - mt as i32);
+    }
+
+    /// Linux 外部宿主：渲染位图 + 锚点，落位由 addon 按工作区做（服务端拿不到屏幕几何）。
+    /// 与 [`Self::show`] 同一卡片、同一留白（12dp）；text 为空返回 None。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn render_overlay(
+        &mut self,
+        text: &str,
+        pos: ToastPosition,
+        kind: ToastKind,
+        accent_override: Option<[u8; 4]>,
+    ) -> Option<crate::overlay_linux::Overlay> {
+        use crate::overlay_linux as ol;
+        if text.is_empty() {
+            return None;
+        }
+        let (buf, w, h, cw, ch, ml, mt, has_shadow) = self.render_card(text, kind, accent_override);
+        Some(ol::Overlay {
+            buf,
+            width: w,
+            height: h,
+            content_x: ml,
+            content_y: mt,
+            content_w: cw,
+            content_h: ch,
+            software_shadow: has_shadow,
+            place: ol::Place::Anchor {
+                anchor: ol::toast_anchor_code(pos),
+                margin: (12.0 * self.scale).round() as i32,
+            },
+        })
+    }
+
+    /// 渲染卡片到 BGRA Vec（离屏，不碰窗口）。返回 `(bgra, w, h, cw, ch, ml, mt, has_shadow)`。
+    #[allow(clippy::type_complexity)]
+    fn render_card(
+        &mut self,
+        text: &str,
+        kind: ToastKind,
+        accent_override: Option<[u8; 4]>,
+    ) -> (Vec<u8>, u32, u32, u32, u32, u32, u32, bool) {
         self.ensure_scale();
         let s = self.scale;
         // 深色圆角底 + 居中文本；类型用边框色区分（稳健、跨主题可见）。
@@ -161,32 +211,21 @@ impl Toast {
         let ch = (h_f.ceil() as u32).max(28);
         let w = cw + ml + mr;
         let h = ch + mt + mb;
-
-        self.window.resize(w, h);
-        {
-            let buf = self.window.buffer_mut();
-            let n = (w * h * 4) as usize;
-            buf[..n].fill(0);
-            if let Some(sh) = &self.shadow {
-                sh.paint(
-                    buf,
-                    w,
-                    h,
-                    ml as f32,
-                    mt as f32,
-                    cw as f32,
-                    ch as f32,
-                    card.corner_radius,
-                );
-            }
-            card.paint(buf, w, h, &self.renderer);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        if let Some(sh) = &self.shadow {
+            sh.paint(
+                &mut buf,
+                w,
+                h,
+                ml as f32,
+                mt as f32,
+                cw as f32,
+                ch as f32,
+                card.corner_radius,
+            );
         }
-        if let Err(e) = self.window.update() {
-            tracing::warn!("Toast update failed: {}", e);
-        }
-
-        let (px, py) = place_on_work_area(pos, cw, ch, (12.0 * s).round() as i32);
-        self.window.show(px - ml as i32, py - mt as i32);
+        card.paint(&mut buf, w, h, &self.renderer);
+        (buf, w, h, cw, ch, ml, mt, self.shadow.is_some())
     }
 
     /// 将当前渲染帧保存为 PNG 文件（截图用）。

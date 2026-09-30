@@ -79,6 +79,20 @@ pub fn shm_name(suffix: &str) -> String {
     name
 }
 
+/// Linux 光栅浮层（`CMD_OVERLAY_FRAME`）各层的 SHM 名：候选窗那段 + 层后缀。一层一段，
+/// 候选窗与气泡同时在屏上时互不覆盖。后缀与 Windows host-render（`host_render_windows.rs`
+/// 的 `KIND_SUFFIXES`）同形；Toast 那层 Windows 没有。未知层返回 `None`。
+pub fn overlay_shm_name(suffix: &str, kind: u32) -> Option<String> {
+    use wind_ipc::protocol::overlay::*;
+    let tail = match kind {
+        OVERLAY_KIND_TOOLTIP => "_TIP",
+        OVERLAY_KIND_STATUS => "_STS",
+        OVERLAY_KIND_TOAST => "_TST",
+        _ => return None,
+    };
+    Some(format!("{}{tail}", shm_name(suffix)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +243,24 @@ mod tests {
     }
 
     /// SHM 名与 socket 目录同源：dev 走变体风格，未知后缀原样透传。
+    #[test]
+    fn overlay_shm_name_appends_kind_suffix() {
+        use wind_ipc::protocol::overlay::*;
+        assert_eq!(
+            overlay_shm_name("_dev", OVERLAY_KIND_STATUS).as_deref(),
+            Some("/WindInput_SHMDev_STS")
+        );
+        assert_eq!(
+            overlay_shm_name("", OVERLAY_KIND_TOOLTIP).as_deref(),
+            Some("/WindInput_SHM_TIP")
+        );
+        assert_eq!(
+            overlay_shm_name("", OVERLAY_KIND_TOAST).as_deref(),
+            Some("/WindInput_SHM_TST")
+        );
+        assert_eq!(overlay_shm_name("", 0), None, "候选窗那段不归本函数");
+    }
+
     #[test]
     fn shm_name_maps_dev_suffix_like_socket_dir() {
         assert_eq!(shm_name("_dev"), "/WindInput_SHMDev");
