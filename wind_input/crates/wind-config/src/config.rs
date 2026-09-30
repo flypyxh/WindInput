@@ -2131,6 +2131,10 @@ pub struct CodetableGlobal {
     /// 通配键：单个字面字符（字母或 ASCII 符号）。合法性见 [`parse_wildcard_key`]。
     #[serde(default = "default_wildcard_key")]
     pub wildcard_key: String,
+    /// 通配结果只留单字（一个字素簇），行内通配与反查模式都受它管；
+    /// 与 `wildcard` 主开关正交。见 reverse-mode spec §2。
+    #[serde(default)]
+    pub wildcard_single_only: bool,
     /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
     /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
     ///
@@ -2235,6 +2239,7 @@ impl Default for CodetableGlobal {
             leading_chars: String::new(),
             wildcard: false,
             wildcard_key: default_wildcard_key(),
+            wildcard_single_only: false,
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -2302,6 +2307,9 @@ impl CodetableGlobal {
         }
         if let Some(v) = &o.wildcard_key {
             out.wildcard_key = v.clone();
+        }
+        if let Some(v) = o.wildcard_single_only {
+            out.wildcard_single_only = v;
         }
         // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
         //
@@ -9619,6 +9627,35 @@ mod tests {
             "字母归一小写：缓冲恒存小写"
         );
         assert_eq!(parse_wildcard_key("`"), Some('`'));
+    }
+
+    /// reverse-mode spec §2：仅单字是方案级开关，三态折叠同 `wildcard`，与主开关正交。
+    #[test]
+    fn codetable_wildcard_single_only_folds_from_schema() {
+        let g = CodetableGlobal::default();
+        assert!(!g.wildcard_single_only, "出厂关闭");
+        let on = crate::schema::CodeTableSpec {
+            wildcard_single_only: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            g.resolved(Some(&on)).wildcard_single_only,
+            "方案写了 ⇒ 覆盖"
+        );
+        let global_on = CodetableGlobal {
+            wildcard_single_only: true,
+            ..Default::default()
+        };
+        assert!(
+            global_on
+                .resolved(Some(&crate::schema::CodeTableSpec::default()))
+                .wildcard_single_only,
+            "方案没写 ⇒ 回落全局"
+        );
+        assert!(
+            !global_on.resolved(Some(&on)).wildcard,
+            "与主开关正交：开仅单字不连带开通配"
+        );
     }
 
     /// ★ 便携闸门**只许挡便携这一侧**：非便携下 `user_config_marker_path()` 必须仍给出路径。
