@@ -2744,6 +2744,22 @@ impl EngineManager {
         self.active_engine().and_then(|e| e.wildcard_key())
     }
 
+    /// 活跃方案反查模式内的通配键（非码表方案 `None`；混输取主码表的）。
+    pub fn active_reverse_key(&self) -> Option<char> {
+        self.active_engine().and_then(|e| e.reverse_wildcard_key())
+    }
+
+    /// 反查模式转换（透传活跃引擎；不看 `wildcard` 主开关，不叠英文 / 拼音）。
+    pub fn convert_reverse(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.active_engine()?
+            .convert_reverse(input, pattern, max_candidates)
+    }
+
     /// 活跃方案的通配码长（[`Engine::wildcard_code_length`]；混输取主码表的）。
     /// 协调器判「满码后通配键按字面」只从这里取，**不**用 [`Self::active_max_code_length`]
     /// ——混输那个值刻意为 0。
@@ -5922,6 +5938,8 @@ impl EngineManager {
                 // 默认关）。非法键在此告警一次并视为关闭，协调器经 `active_wildcard_key` 取用。
                 wildcard: eff.wildcard_char(schema_id),
                 wildcard_single_only: eff.wildcard_single_only,
+                // 反查模式通配键：不看主开关，非法回落 z（spec §3.2）。
+                reverse_key: Some(eff.reverse_wildcard_char()),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。

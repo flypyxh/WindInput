@@ -220,6 +220,9 @@ pub struct CommitOptions {
     /// 通配结果只留单字（字素簇）。行内通配与反查模式共用 `wildcard_query`，二者同受约束。
     /// 见 reverse-mode spec §2。
     pub wildcard_single_only: bool,
+    /// 反查模式内的通配键（`reverse_wildcard_char`，恒有值；不看 `wildcard` 主开关）。
+    /// 只有码表方案的 `build_engine` 注入；`None` 表示该引擎不支持反查。见 reverse-mode spec §3.2。
+    pub reverse_key: Option<char>,
 }
 
 /// 码表引擎
@@ -1027,6 +1030,22 @@ impl Engine for CodeTableEngine {
         max_candidates: usize,
     ) -> Option<ConvertResult> {
         self.opts.wildcard?;
+        Some(self.wildcard_query(input, pattern, max_candidates))
+    }
+
+    fn reverse_wildcard_key(&self) -> Option<char> {
+        self.opts.reverse_key
+    }
+
+    /// 反查模式查询（reverse-mode spec §3.2）：与 `convert_wildcard` 共用 `wildcard_query`，
+    /// 但不看 `wildcard` 主开关；仅单字 / 影子层随内核自动生效。
+    fn convert_reverse(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.opts.reverse_key?;
         Some(self.wildcard_query(input, pattern, max_candidates))
     }
 
@@ -2905,5 +2924,40 @@ mod tests {
                 .iter()
                 .any(|c| c.text == "甘蓝菜" && c.from_disabled_dict)
         );
+    }
+    /// spec §3.2：反查不受 wildcard 主开关约束；仅单字照样生效（同一内核）。
+    #[test]
+    fn convert_reverse_ignores_wildcard_switch() {
+        let opts = CommitOptions {
+            reverse_key: Some('z'),
+            wildcard_single_only: true,
+            ..Default::default()
+        };
+        let e = engine_opts(
+            &[("ab", "甲", 10), ("ac", "乙丙", 20), ("bb", "丁", 5)],
+            opts,
+        );
+        assert!(
+            e.convert_wildcard("zb", &slot_pattern("?b"), 50).is_none(),
+            "前置：主开关关"
+        );
+        let r = e.convert_reverse("zb", &slot_pattern("?b"), 50).unwrap();
+        let got: Vec<(&str, &str, &str)> = r
+            .candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c.code.as_str(), c.comment.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [("甲", "ab", "ab"), ("丁", "bb", "bb")],
+            "首位通配、全码注释"
+        );
+        assert!(!r.should_commit && !r.should_clear);
+    }
+
+    #[test]
+    fn convert_reverse_absent_without_reverse_key() {
+        let e = engine_opts(&[("ab", "甲", 10)], CommitOptions::default());
+        assert!(e.convert_reverse("ab", "ab", 50).is_none());
     }
 }

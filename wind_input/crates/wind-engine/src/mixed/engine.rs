@@ -879,6 +879,21 @@ impl Engine for MixedEngine {
         self.primary.wildcard_key()
     }
 
+    /// 反查模式的通配键：代理主码表（spec §3.2）。
+    fn reverse_wildcard_key(&self) -> Option<char> {
+        self.primary.reverse_wildcard_key()
+    }
+
+    /// 反查模式转换：只查主码表（字面 + 通配），拼音 / 英文不参与（spec §3.2）。
+    fn convert_reverse(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.primary.convert_reverse(input, pattern, max_candidates)
+    }
+
     /// 通配转换（spec §10）。无拼音子引擎 ⇒ 代理主码表；有 ⇒ 字面 `convert(input)`
     /// ⊕ 主码表通配，见 [`Self::merge_wildcard`]。
     ///
@@ -2506,6 +2521,7 @@ mod tests {
             4,
             CommitOptions {
                 wildcard: Some('z'),
+                reverse_key: Some('z'),
                 wildcard_single_only: single_only,
                 ..Default::default()
             },
@@ -2721,5 +2737,20 @@ mod tests {
         assert!(texts.contains(&"甲"), "{texts:?}");
         assert!(!texts.contains(&"乙丙"), "通配侧的词组被滤：{texts:?}");
         assert!(texts.contains(&"阿紫"), "拼音侧多字词不受影响：{texts:?}");
+    }
+    /// spec §3.2：反查模式在混输下只查主码表，拼音不参与。
+    #[test]
+    fn mixed_convert_reverse_is_primary_only() {
+        let e = mixed_wc(&[("qa", "甲", 10)], vec![("qz", "阿紫")]);
+        assert_eq!(e.reverse_wildcard_key(), Some('z'));
+        let r = e.convert_reverse("qz", &slot("q?"), 50).unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| c.source == CandidateSource::CodeTable),
+            "{:?}",
+            r.candidates
+        );
+        assert!(r.candidates.iter().any(|c| c.text == "甲"));
     }
 }
