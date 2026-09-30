@@ -18,7 +18,8 @@ pub fn specs() -> Vec<FuncSpec> {
                   "cwd"  = "工作目录; 省略时取被启动程序所在目录",
                   "verb" = "动作: open(默认)/runas(管理员)/edit/print/explore/properties; 仅 Windows",
                   "show" = "初始窗口: normal(默认)/min/max/hidden; 仅 Windows");
-        "proc.shell" : Proc   (1, 2)  effect => fn_shell,       "通过 shell 执行命令行; 第二参可选 flag (term/pwsh)", "proc.shell(\"echo hi\")"
+        "proc.any"   : Proc   (1, -1) effect => fn_any,         "按顺序尝试启动多个程序 (只写程序名, 不带参数), 第一个启动成功的即停", "proc.any(\"gnome-calculator\", \"kcalc\", \"xcalc\")";
+        "proc.shell" : Proc   (1, 2)  effect => fn_shell,      "通过 shell 执行命令行; 第二参可选 flag (term/pwsh)", "proc.shell(\"echo hi\")"
             named(fn_shell_named, "cwd" = "工作目录; 省略时取用户主目录");
         "key.tap"    : Key    (1, 1)  effect => fn_key_tap,     "模拟单次按键组合, 如 Ctrl+C / Shift+End / Enter", "key.tap(\"Ctrl+C\")";
         "key.seq"    : Key    (1, -1) effect => fn_key_seq,     "顺序模拟多个按键组合", "key.seq(\"Home\", \"Shift+End\", \"Delete\")";
@@ -120,6 +121,69 @@ fn fn_run_named(
     check_enum("proc.run", "show", spec.show, RUN_SHOWS)?;
     proc.run(&spec).map_err(|e| runtime_err("proc.run", e))?;
     Ok(String::new())
+}
+
+/// `proc.any(a, b, c…)`：按顺序逐个启动，第一个**启动成功**的即停，后面的不再尝试。
+///
+/// 用途是跨桌面环境的内置词条：同一个「计算器」在 GNOME / KDE / Deepin / Xfce 下是不同的
+/// 程序，词条里列出常见的几个，装了哪个就开哪个。
+///
+/// 「成功」只看 spawn：程序起来之后自己失败（窗口一闪退出）不回落——那要等它退出才知道，
+/// 而等待会卡住动作链。回落的依据是宿主 [`ProcessRunner::run`] 的返回值，它在各平台上
+/// 能说明的事不一样：
+/// - macOS / Linux（`ext_presenter`）进程内直接 spawn，「程序不存在」是
+///   `io::ErrorKind::NotFound`，与「存在但起不来」（权限不足等）可以分开报；
+/// - Windows 转给 TSF 侧 ShellExecute，这里拿不到结果、恒为成功，所以**只会启动第一个**。
+///   内置词条在 Windows 上用 `proc.run`，不用本函数。
+///
+/// 两类失败都继续试下一个：存在但起不来的程序，换一个能用的正是本函数的目的。
+///
+/// [`ProcessRunner::run`]: crate::services::ProcessRunner::run
+fn fn_any(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    let s = services("proc.any", ctx)?;
+    let proc = s
+        .proc
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("proc.any"))?;
+    // 先整体校验再启动：空名交给宿主只会换回一个说不清的平台错误，而且报错之前
+    // 不该已经把排在前面的程序开出去了。
+    if args.iter().any(|a| a.trim().is_empty()) {
+        return Err(runtime_err(
+            "proc.any",
+            anyhow::anyhow!("候选程序名不能为空"),
+        ));
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for cand in args {
+        let cmd = cand.trim();
+        match proc.run(&crate::services::ProcSpawn::new(cmd, &[])) {
+            Ok(()) => return Ok(String::new()),
+            Err(e) if is_not_found(&e) => missing.push(cmd),
+            Err(e) => failed.push(format!("{cmd}（{e}）")),
+        }
+    }
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("未找到 {}", missing.join(" / ")));
+    }
+    if !failed.is_empty() {
+        parts.push(format!("启动失败 {}", failed.join(" / ")));
+    }
+    Err(runtime_err(
+        "proc.any",
+        anyhow::anyhow!("没有可启动的程序：{}", parts.join("；")),
+    ))
+}
+
+/// 宿主的错误链里是否有「文件不存在」。
+///
+/// 看整条链而不是只看最外层：宿主可能给 io 错误加了上下文再返回。
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// `wind.cli` 的 `toast` 取值白名单。
@@ -621,6 +685,150 @@ mod tests {
             rec.0.lock().unwrap().len(),
             RUN_VERBS.len() + RUN_SHOWS.len()
         );
+    }
+
+    /// 按程序名给出预设结果的假 runner，记录尝试顺序。未登记的名字 = 不存在。
+    ///
+    /// 「不存在」给的是**真的** `io::Error(NotFound)`（经 `?` 包成 anyhow），与宿主
+    /// `run_native` 里 `Command::spawn()?` 产生的错误同形——用字符串冒充的话，
+    /// `is_not_found` 的判定根本没被测到。
+    struct ScriptedProc {
+        ok: Vec<&'static str>,
+        denied: Vec<&'static str>,
+        tried: Mutex<Vec<String>>,
+    }
+    impl ScriptedProc {
+        fn new(ok: &[&'static str], denied: &[&'static str]) -> Self {
+            ScriptedProc {
+                ok: ok.to_vec(),
+                denied: denied.to_vec(),
+                tried: Mutex::new(Vec::new()),
+            }
+        }
+        fn tried(&self) -> Vec<String> {
+            self.tried.lock().unwrap().clone()
+        }
+    }
+    impl crate::services::ProcessRunner for ScriptedProc {
+        fn run(&self, spec: &crate::services::ProcSpawn<'_>) -> anyhow::Result<()> {
+            self.tried.lock().unwrap().push(spec.cmd.to_string());
+            assert!(spec.args.is_empty(), "proc.any 不带参数");
+            if self.ok.contains(&spec.cmd) {
+                return Ok(());
+            }
+            let kind = if self.denied.contains(&spec.cmd) {
+                std::io::ErrorKind::PermissionDenied
+            } else {
+                std::io::ErrorKind::NotFound
+            };
+            Err(std::io::Error::from(kind))?
+        }
+        fn shell(&self, _cmdline: &str, _flags: &[String], _cwd: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn any_ctx(p: &Arc<ScriptedProc>) -> MemoryContext {
+        let mut svc = Services::new();
+        svc.proc = Some(p.clone());
+        MemoryContext::new().with_services(svc)
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 按顺序试，第一个成功的即停，后面的不再启动。
+    ///
+    /// 变异判据：去掉 `Ok(()) => return` 的提前返回，`tried` 会多出 c 转红。
+    #[test]
+    fn proc_any_falls_back_in_order_and_stops_at_first_success() {
+        let p = Arc::new(ScriptedProc::new(&["b", "c"], &[]));
+        fn_any(&any_ctx(&p), &names(&["a", "b", "c"])).unwrap();
+        assert_eq!(p.tried(), ["a", "b"]);
+    }
+
+    /// 第一个就能起来时只启动它。
+    #[test]
+    fn proc_any_first_candidate_wins() {
+        let p = Arc::new(ScriptedProc::new(&["a", "b"], &[]));
+        fn_any(&any_ctx(&p), &names(&["a", "b"])).unwrap();
+        assert_eq!(p.tried(), ["a"]);
+    }
+
+    /// 「存在但起不来」同样回落到下一个——换一个能用的正是这个函数的目的。
+    #[test]
+    fn proc_any_falls_back_past_a_candidate_that_fails_to_spawn() {
+        let p = Arc::new(ScriptedProc::new(&["c"], &["b"]));
+        fn_any(&any_ctx(&p), &names(&["a", "b", "c"])).unwrap();
+        assert_eq!(p.tried(), ["a", "b", "c"]);
+    }
+
+    /// 全部失败：报错里列出每个试过的名字，并把「没装」与「起不来」分开说。
+    ///
+    /// 变异判据：`is_not_found` 恒返回 false，a 就跑到「启动失败」那一段去，第二条断言转红。
+    #[test]
+    fn proc_any_all_fail_lists_every_candidate_by_reason() {
+        let p = Arc::new(ScriptedProc::new(&[], &["b"]));
+        let err = fn_any(&any_ctx(&p), &names(&["a", "b", "c"]))
+            .expect_err("全部失败应报错")
+            .to_string();
+        assert_eq!(p.tried(), ["a", "b", "c"]);
+        assert!(err.contains("未找到 a / c"), "{err}");
+        assert!(err.contains("启动失败 b（"), "{err}");
+        assert!(!err.contains("未找到 a / b"), "{err}");
+    }
+
+    /// 只有「没装」时不出现空的「启动失败」段。
+    #[test]
+    fn proc_any_all_missing_mentions_only_missing() {
+        let p = Arc::new(ScriptedProc::new(&[], &[]));
+        let err = fn_any(&any_ctx(&p), &names(&["gnome-calculator", "kcalc"]))
+            .expect_err("全部失败应报错")
+            .to_string();
+        assert!(err.contains("未找到 gnome-calculator / kcalc"), "{err}");
+        assert!(!err.contains("启动失败"), "{err}");
+    }
+
+    /// 空名在启动**任何**程序之前挡下，而不是先开了前面的再报错。
+    #[test]
+    fn proc_any_rejects_blank_names_before_spawning() {
+        let p = Arc::new(ScriptedProc::new(&["a"], &[]));
+        let ctx = any_ctx(&p);
+        for bad in [&["a", ""][..], &["a", "  "], &[""]] {
+            let err = fn_any(&ctx, &names(bad)).expect_err("空名应报错");
+            assert!(err.to_string().contains("不能为空"), "{err}");
+        }
+        assert!(p.tried().is_empty(), "报错前不该启动任何程序");
+    }
+
+    /// 名字两端的空白去掉再交给宿主（`"kcalc "` 这种手误不该变成「未找到」）。
+    #[test]
+    fn proc_any_trims_names() {
+        let p = Arc::new(ScriptedProc::new(&["kcalc"], &[]));
+        fn_any(&any_ctx(&p), &names(&[" kcalc "])).unwrap();
+        assert_eq!(p.tried(), ["kcalc"]);
+    }
+
+    #[test]
+    fn proc_any_without_runner_is_service_unavailable() {
+        let ctx = MemoryContext::new().with_services(Services::new());
+        assert!(matches!(
+            fn_any(&ctx, &names(&["a"])),
+            Err(CmdbarError::ServiceUnavailable { .. })
+        ));
+    }
+
+    /// 宿主给 io 错误加了上下文也认得出「不存在」。
+    #[test]
+    fn not_found_is_detected_through_context() {
+        let e = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("spawn kcalc");
+        assert!(is_not_found(&e));
+        assert!(!is_not_found(&anyhow::anyhow!("NotFound")));
+        assert!(!is_not_found(&anyhow::Error::from(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        ))));
     }
 
     #[test]

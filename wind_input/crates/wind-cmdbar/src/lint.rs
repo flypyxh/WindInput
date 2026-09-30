@@ -30,7 +30,7 @@ pub enum Hint {
 ///
 /// `key.type` / `clip.copy` 的参数是要输入的文本，里面出现换行是正常用法
 /// （`key.type` 会把它发成回车键），一起查会让提示泛滥到没人看。
-const TARGET_SENSITIVE: &[&str] = &["proc.run", "proc.shell", "open", "wind.cli"];
+const TARGET_SENSITIVE: &[&str] = &["proc.run", "proc.any", "proc.shell", "open", "wind.cli"];
 
 /// 检查一条短语文本。
 ///
@@ -204,6 +204,16 @@ mod tests {
             "$CC({q}x{q}, proc.run({q}D:{bs}notes{bs}a.exe{q}))"
         ));
         assert_eq!(r, vec![Hint::ControlCharInPath("proc.run".into())]);
+    }
+
+    /// `proc.any` 的候选同样是程序名 / 路径，单写反斜杠照样该提示。
+    #[test]
+    fn proc_any_path_is_checked_too() {
+        let (q, bs) = (q(), bs());
+        let r = hints(&format!(
+            "$CC({q}x{q}, proc.any({q}D:{bs}tools{q}, {q}kcalc{q}))"
+        ));
+        assert_eq!(r, vec![Hint::ControlCharInPath("proc.any".into())]);
     }
 
     #[test]
