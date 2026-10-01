@@ -823,6 +823,8 @@ impl State {
 /// - `schema` 整段：已含全局 codetable / pinyin / mix（上屏策略、调频等）。
 /// - `input.temp_pinyin`、`input.temp_english`：两者都在 `input` 段却被引擎按需缓存，
 ///   [`wind_engine::EngineManager`] 各持一份镜像，只在构造与 `reload_from_config` 里写。
+/// - `input.reverse.lookup_disabled_dicts`：引擎据它挂不挂影子层（未启用扩展库，只给反查模式），
+///   镜像在 `EngineManager`；同段的 `candidate_layout` 只给协调器读，**不收**（收了每次改布局都丢词典缓存）。
 ///
 /// # ⚠️ 新增「协调器实时读、引擎走镜像」的开关时必须同步这里
 ///
@@ -836,6 +838,7 @@ pub(crate) fn engine_reload_needed(old: &Config, new: &Config) -> bool {
     old.schema != new.schema
         || old.input.temp_pinyin != new.input.temp_pinyin
         || old.input.temp_english != new.input.temp_english
+        || old.input.reverse.lookup_disabled_dicts != new.input.reverse.lookup_disabled_dicts
 }
 
 /// 空码时按标点/符号键怎么处置这串废码（`input.punct_on_empty_behavior` 的解释结果）。
@@ -9905,6 +9908,24 @@ mod engine_reload_needed_tests {
             !engine_reload_needed(&old, &new),
             "工具栏可见性与引擎无关，不该触发重建"
         );
+    }
+
+    /// ★ Review Focus 3：反查专属的「含扩展词库」开关决定引擎挂不挂影子层，必须触发重建。
+    #[test]
+    fn reverse_lookup_switch_requires_engine_reload() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.input.reverse.lookup_disabled_dicts = !old.input.reverse.lookup_disabled_dicts;
+        assert!(engine_reload_needed(&old, &new));
+    }
+
+    /// 反向对照：反查模式的候选布局只给协调器读，不该丢词典缓存。
+    #[test]
+    fn reverse_layout_change_does_not_require_engine_reload() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.input.reverse.candidate_layout = wind_config::LayoutIntent::Vertical;
+        assert!(!engine_reload_needed(&old, &new));
     }
 }
 
