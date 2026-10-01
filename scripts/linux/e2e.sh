@@ -212,6 +212,7 @@ if [[ "${WIND_E2E_X11:-1}" != 0 ]]; then
     if [[ "${WIND_E2E_COMPOSITOR:-0}" != 0 ]]; then
         xcompmgr >"$W/xcompmgr.log" 2>&1 &
         COMP=$!
+        export WIND_E2E_COMP_PID=$COMP # 「合成器起停」用例要能停掉它
         sleep 0.5
         echo "[e2e] xcompmgr 已起（ARGB 路径）"
     fi
@@ -264,8 +265,13 @@ export FCITX_DATA_DIRS="$ADDON_BUILD/share/fcitx5:$SDK_ROOT/usr/share/fcitx5"
 # （随中英模式切换的 windinput-zh / windinput-en）。
 # 菜单空闲超时调短到 5 秒，好让「超时自动收起」这条兜底在 e2e 里跑得到（出厂 60 秒）。
 export WIND_MENU_IDLE_TIMEOUT_MS=5000
+# 抓指针的绝对上限调到 12 秒（出厂 120 秒），验「一直有活动也不无限抓」。
+export WIND_MENU_MAX_GRAB_MS=12000
 # key.hold 的最长保持时间调短到 2 秒（出厂 10 秒），验「超时自动抬起」这条兜底。
 export WIND_KEY_HOLD_TIMEOUT_MS=2000
+# WIND_E2E_FCITX_PRELOAD：只给 fcitx5 预加载的库（拿 ASan 版 addon 跑时填 libasan.so——它必须
+# 先于一切加载；设成全局 LD_PRELOAD 会连服务和客户端一起套上）。
+env ${WIND_E2E_FCITX_PRELOAD:+LD_PRELOAD="$WIND_E2E_FCITX_PRELOAD"} \
 fcitx5 --disable=all --enable=keyboard,dbus,dbusfrontend,kimpanel,windinput \
     --verbose="windinput=5,default=3,key_trace=5" >"$W/fcitx5.log" 2>&1 &
 FCITX=$!

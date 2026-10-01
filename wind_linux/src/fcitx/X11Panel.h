@@ -40,6 +40,8 @@ public:
         /// (x, y) 为根窗口坐标。
         std::function<void(int32_t target, int32_t x, int32_t y)> contextMenu;
         /// 菜单打开期间的指针事件（MENU_POINTER_*、X11 按键号、根窗口坐标）→ CMD_MENU_POINTER。
+        /// 上报失败时引擎就地 `closeMenu(nullptr)`——服务不响应，没人画菜单也没人收它，指针却
+        /// 还被抓着，整个桌面的鼠标都会失灵。
         std::function<void(uint32_t event, uint32_t button, int32_t x, int32_t y)> menuPointer;
         /// 本端自己把菜单收掉了（空闲超时…），reason 报给服务端复位 menu_open。
         std::function<void(const std::string& reason)> menuDismissed;
@@ -82,9 +84,9 @@ public:
     bool menuOpen() const;
     /// 有菜单相关的键盘活动（按键转给服务端的那一刻）：空闲计时重新起算。
     void noteMenuActivity();
-    /// 工作区（根窗口，不分显示器）。连不上 X 时返回空。
+    /// 工作区（根窗口，不分显示器）。还没连上 / 连接已坏时返回空（不在这里重连）。
     std::optional<Rect> screenWorkArea();
-    /// 当前指针位置（根窗口坐标）。连不上 X 时返回空。
+    /// 当前指针位置（根窗口坐标）。还没连上 / 连接已坏时返回空（不在这里重连）。
     std::optional<std::pair<int32_t, int32_t>> pointerPosition();
 
 private:
@@ -113,8 +115,12 @@ private:
     static constexpr size_t kOverlayCount = 3;
     static constexpr size_t kMenuLevels = OVERLAY_MENU_LEVELS;
 
+    /// 连上并就绪（必要时重连）。**只许**在贴帧路径上调：重连会销毁 IO 事件源与窗口，
+    /// 从 X 事件 / 计时器回调里调就是释放正在执行的自己。
     bool ensureConnection();
     void dropConnection();
+    /// 现有连接可用（不重连）。
+    bool connectionUsable() const;
     bool hasCompositor();
     bool ensureWindow(Surface& s, bool argb);
     void destroyWindow(Surface& s);
@@ -162,9 +168,11 @@ private:
     void grabPointer();
     void releasePointer();
     void armMenuIdle();
-    /// 摘掉全部菜单窗口、放开指针、停计时（不报 dismiss）。`fromIdleTimer`：由空闲计时器
-    /// 回调调用时不能销毁那个计时器本身。
-    void dropMenu(bool fromIdleTimer = false);
+    void armMenuDeadline();
+    void onMenuDeadline();
+    /// 摘掉全部菜单窗口、放开指针、停计时（不报 dismiss）。计时器只停不毁（会从它们自己的
+    /// 回调里进来）。
+    void dropMenu();
 
     fcitx::EventLoop& loop_;
     Callbacks cb_;
@@ -206,7 +214,10 @@ private:
     int grabAttempts_ = 0;
     std::unique_ptr<fcitx::EventSourceTime> grabRetry_;
     std::unique_ptr<fcitx::EventSourceTime> menuIdle_;
+    /// 抓指针的绝对上限（从第一级出现算起，不续），见 Menu.h。
+    std::unique_ptr<fcitx::EventSourceTime> menuDeadline_;
     uint32_t menuIdleMs_;
+    uint32_t menuMaxGrabMs_;
     std::optional<std::pair<int32_t, int32_t>> pendingMotion_;
 };
 

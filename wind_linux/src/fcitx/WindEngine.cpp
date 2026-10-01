@@ -153,7 +153,12 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     // menu_open——否则它继续吞方向键 / 回车 / Esc。
     cb.contextMenu = [this](int32_t target, int32_t x, int32_t y) { requestMenu(target, x, y); };
     cb.menuPointer = [this](uint32_t e, uint32_t b, int32_t x, int32_t y) {
-        sendAndDrain(encodeMenuPointerFrame(e, b, x, y));
+        // 报不上去（服务不在 / 不响应）：菜单是它画的、命中也在它那儿，本端留着菜单只剩
+        // 「指针被抓着、整个桌面点不动」。就地收掉放开（不报：没人收）。
+        if (!sendAndDrain(encodeMenuPointerFrame(e, b, x, y))) {
+            WIND_WARN() << "菜单指针事件报不上去，本端收起菜单、放开指针";
+            panel_->closeMenu(nullptr);
+        }
     };
     cb.menuDismissed = [this](const std::string& reason) {
         sendAndDrain(encodeMenuDismissFrame(reason));

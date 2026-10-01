@@ -56,6 +56,13 @@ int main()
     CHECK_EQ(menuIdleTimeoutMs("-5"), kDefaultMenuIdleTimeoutMs);
     CHECK_EQ(menuIdleTimeoutMs("12ab"), kDefaultMenuIdleTimeoutMs);
 
+    CASE("抓指针的绝对上限：默认 120 秒（长于空闲超时），环境变量正整数覆盖");
+    CHECK_EQ(menuMaxGrabMs(nullptr), 120000u);
+    CHECK(kDefaultMenuMaxGrabMs > kDefaultMenuIdleTimeoutMs);
+    CHECK_EQ(menuMaxGrabMs("8000"), 8000u);
+    CHECK_EQ(menuMaxGrabMs("0"), kDefaultMenuMaxGrabMs);
+    CHECK_EQ(menuMaxGrabMs("x"), kDefaultMenuMaxGrabMs);
+
     CASE("CMD_MENU_POINTER：16 字节，event button x y（x/y 有符号）");
     Bytes f = encodeMenuPointerFrame(MENU_POINTER_PRESS, 3, -20, 700);
     CHECK_EQ(f.size(), HEADER_SIZE + 16);

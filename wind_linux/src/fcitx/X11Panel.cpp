@@ -74,7 +74,8 @@ int bitsPerPixel(xcb_connection_t* c, uint8_t depth)
 
 X11CandidatePanel::X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb)
     : loop_(loop), cb_(std::move(cb)),
-      menuIdleMs_(menuIdleTimeoutMs(std::getenv("WIND_MENU_IDLE_TIMEOUT_MS")))
+      menuIdleMs_(menuIdleTimeoutMs(std::getenv("WIND_MENU_IDLE_TIMEOUT_MS"))),
+      menuMaxGrabMs_(menuMaxGrabMs(std::getenv("WIND_MENU_MAX_GRAB_MS")))
 {
     cand_.instance = "wind-candidate";
     cand_.interactive = true;
@@ -136,14 +137,18 @@ bool X11CandidatePanel::ensureConnection()
 
 void X11CandidatePanel::dropConnection()
 {
+    // 只从 ensureConnection 进来，而后者只在贴帧路径（push 帧，经 EventDispatcher）上调——
+    // 不在 X 的 IO 回调、也不在任何计时器回调里（查指针 / 工作区连接坏了只返回空，不重连），
+    // 所以销毁 IO 事件源是安全的。计时器仍一律只停不毁：将来谁从回调里走进来也不至于释放
+    // 正在执行的自己（菜单空闲计时器曾经就是：dropMenu → resyncAfterMenu → 查指针 → 重连）。
     ioEvent_.reset();
-    grabRetry_.reset();
-    menuIdle_.reset();
+    disarm(grabRetry_);
+    disarm(menuIdle_);
+    disarm(menuDeadline_);
     pointerGrabbed_ = false; // 连接一断，服务器端的抓取随之失效
     pendingMotion_.reset();
     menuActive_ = false;
     // 交互态随窗口一起作废（拖动中断线：隐式抓取随连接消失，不会有松开事件来收尾）。
-    // 计时器只停不毁：这里可能正是从它们的回调里（查指针 → 重连）走进来的。
     disarm(hoverDefer_);
     disarm(tipLeave_);
     disarm(statusMenuWait_);
@@ -280,6 +285,9 @@ void X11CandidatePanel::destroyWindow(Surface& s)
     s.hovered = false;
     if (&s == &overlays_[OVERLAY_KIND_STATUS - 1]) {
         drag_ = Drag{}; // 窗口没了，它的隐式抓取与松开事件也就没了
+    }
+    if (&s == &menus_[0]) {
+        pointerGrabbed_ = false; // 抓取窗口销毁，X 服务器随之放掉抓取
     }
 }
 
@@ -566,15 +574,18 @@ std::optional<std::pair<int32_t, int32_t>> X11CandidatePanel::statusContentOrigi
 
 void X11CandidatePanel::onReadable()
 {
-    if (!conn_) {
-        return;
-    }
-    while (xcb_generic_event_t* ev = xcb_poll_for_event(conn_)) {
+    // 每轮都重查 conn_：事件处理会回调到引擎（上报失败时本端收菜单…），这条链现在不会断开
+    // 连接，但别让循环的正确性依赖「回调链永远不碰连接」。
+    while (conn_) {
+        xcb_generic_event_t* ev = xcb_poll_for_event(conn_);
+        if (!ev) {
+            break;
+        }
         handleEvent(ev);
         std::free(ev);
     }
     flushMenuMotion();
-    if (xcb_connection_has_error(conn_)) {
+    if (conn_ && xcb_connection_has_error(conn_) && ioEvent_) {
         WIND_WARN() << "X 连接断开，下一帧重连";
         // 不能在 IO 回调里销毁自己所属的 EventSourceIO，只先停掉它（断开的 fd 恒可读，
         // 不停会空转）。真正的清理由下一次 show 里 ensureConnection 见 has_error 时做。
@@ -957,9 +968,11 @@ bool X11CandidatePanel::showMenuLevel(uint32_t level, const SharedFrame& f,
         return false;
     }
     Surface& s = menus_[level];
+    const xcb_window_t before = s.window;
     if (!ensureWindow(s, hasCompositor()) || bitsPerPixel(conn_, s.depth) != 32) {
         return false;
     }
+    const bool recreated = before != 0 && s.window != before;
     OverlayFramePayload geo = p;
     geo.width = f.width;
     geo.height = f.height;
@@ -968,12 +981,19 @@ bool X11CandidatePanel::showMenuLevel(uint32_t level, const SharedFrame& f,
     // 位置，不重排 z 序。
     present(s, f, placeOverlay(geo, workArea(), 0, 0), !s.mapped);
     if (first) {
-        grabAttempts_ = 0;
-        grabPointer();
+        if (!armed(menuDeadline_)) {
+            armMenuDeadline(); // 第 0 级被重建时 first 也为真：上限不因此顺延
+        }
         // 菜单开着期间指针事件只进菜单：悬停提示的延后 / 宽限到期也不该来动它（去留等菜单收起）。
         menuActive_ = true;
         cancelTipTimers();
         disarm(statusMenuWait_); // 气泡的菜单来了，保持改由菜单收起来放开
+    }
+    // 第 0 级是抓取窗口：首次出现要抓；合成器起停让它换 visual 重建过，旧窗口连同抓取一起
+    // 没了（destroyWindow 已把 pointerGrabbed_ 归位），也要重抓——否则点菜单外再也看不见。
+    if (level == 0 && (first || recreated) && !pointerGrabbed_ && !armed(grabRetry_)) {
+        grabAttempts_ = 0;
+        grabPointer();
     }
     armMenuIdle();
     return true;
@@ -1002,17 +1022,17 @@ void X11CandidatePanel::closeMenu(const char* reason)
     }
 }
 
-void X11CandidatePanel::dropMenu(bool fromIdleTimer)
+void X11CandidatePanel::dropMenu()
 {
     for (Surface& m : menus_) {
         unmap(m);
     }
     releasePointer();
-    grabRetry_.reset();
+    // 只停不毁：本函数会从这几个计时器自己的回调里进来（空闲超时、抓取重试）。
+    disarm(grabRetry_);
+    disarm(menuIdle_);
+    disarm(menuDeadline_);
     pendingMotion_.reset();
-    if (!fromIdleTimer) {
-        menuIdle_.reset();
-    }
     if (menuActive_) {
         menuActive_ = false;
         resyncAfterMenu();
@@ -1039,13 +1059,27 @@ void X11CandidatePanel::armMenuIdle()
                                        if (menuOpen()) {
                                            WIND_INFO() << "菜单空闲 " << menuIdleMs_
                                                        << "ms 无操作，本端收起";
-                                           dropMenu(true);
+                                           dropMenu();
                                            if (cb_.menuDismissed) {
                                                cb_.menuDismissed("idle");
                                            }
                                        }
                                        return true;
                                    });
+}
+
+void X11CandidatePanel::armMenuDeadline()
+{
+    // 从第一级出现算起，不续：见 Menu.h kDefaultMenuMaxGrabMs。
+    armTimer(menuDeadline_, menuMaxGrabMs_, &X11CandidatePanel::onMenuDeadline);
+}
+
+void X11CandidatePanel::onMenuDeadline()
+{
+    if (menuOpen()) {
+        WIND_WARN() << "菜单已开 " << menuMaxGrabMs_ << "ms（抓指针上限），本端收起";
+        closeMenu("max_grab");
+    }
 }
 
 void X11CandidatePanel::grabPointer()
@@ -1110,6 +1144,9 @@ void X11CandidatePanel::handleMenuEvent(xcb_generic_event_t* ev)
             break; // 滚轮（4/5）与侧键：Windows 菜单不处理，这里也不报
         }
         flushMenuMotion();
+        if (!menuOpen()) {
+            break; // 积着的移动没报上去、本端已收菜单（服务无响应）：这一下不再报
+        }
         armMenuIdle();
         if (cb_.menuPointer) {
             cb_.menuPointer(MENU_POINTER_PRESS, e->detail, e->root_x, e->root_y);
@@ -1131,15 +1168,21 @@ void X11CandidatePanel::flushMenuMotion()
     if (!menuOpen()) {
         return;
     }
-    armMenuIdle();
+    // 移动不续空闲计时：服务卡死时指针还在动，续下去菜单就永远收不掉、指针一直被抓着。
+    // 移动带来的高亮重绘是新菜单帧，那条路（showMenuLevel）会续——服务活着才有帧。
     if (cb_.menuPointer) {
         cb_.menuPointer(MENU_POINTER_MOTION, 0, x, y);
     }
 }
 
+bool X11CandidatePanel::connectionUsable() const
+{
+    return conn_ && screen_ && !xcb_connection_has_error(conn_);
+}
+
 std::optional<Rect> X11CandidatePanel::screenWorkArea()
 {
-    if (!ensureConnection()) {
+    if (!connectionUsable()) {
         return std::nullopt;
     }
     return workArea();
@@ -1147,7 +1190,9 @@ std::optional<Rect> X11CandidatePanel::screenWorkArea()
 
 std::optional<std::pair<int32_t, int32_t>> X11CandidatePanel::pointerPosition()
 {
-    if (!ensureConnection()) {
+    // 只读现有连接、不重连：调用方有计时器回调与 X 事件回调（菜单收起后重定悬停…），在那里
+    // 重连会销毁正在执行的事件源。连接坏了就当「不知道指针在哪」，下一帧贴图时再重连。
+    if (!connectionUsable()) {
         return std::nullopt;
     }
     auto* r = xcb_query_pointer_reply(conn_, xcb_query_pointer(conn_, screen_->root), nullptr);

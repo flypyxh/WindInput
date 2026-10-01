@@ -22,4 +22,11 @@ int32_t contextMenuTarget(int32_t hit);
 constexpr uint32_t kDefaultMenuIdleTimeoutMs = 60000;
 uint32_t menuIdleTimeoutMs(const char* env);
 
+/// 菜单抓指针的绝对上限（毫秒）：不论有没有活动，开了这么久就本端收菜单、放开指针。空闲计时
+/// 会被按键 / 按下 / 新菜单帧续上，这条不续——抓指针期间整个桌面的鼠标都归我们，任何计时
+/// 续不上的漏洞（服务端一直推帧、某处一直续）都不该让它变成永久。默认 120000；环境变量
+/// `WIND_MENU_MAX_GRAB_MS`（正整数）可覆盖，给 e2e 用。
+constexpr uint32_t kDefaultMenuMaxGrabMs = 120000;
+uint32_t menuMaxGrabMs(const char* env);
+
 } // namespace windlinux

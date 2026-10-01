@@ -812,6 +812,186 @@ async def menu_cases(bus, im):
     return c
 
 
+def pointer_grab_free():
+    """另起一个 X 客户端试着抓指针：抓得到 = 此刻没有别的客户端抓着（抓到即放）。
+    菜单开着时这里必须是 False——判据先验可观测，再拿它断言「放开了」。"""
+    import ctypes
+    x = ctypes.cdll.LoadLibrary("libX11.so.6")
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XDefaultRootWindow.restype = ctypes.c_ulong
+    x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x.XGrabPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                               ctypes.c_ulong]
+    x.XUngrabPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    d = x.XOpenDisplay(None)
+    if not d:
+        return False
+    # ButtonPressMask = 4，GrabModeAsync = 1；返回 GrabSuccess = 0 / AlreadyGrabbed = 1。
+    r = x.XGrabPointer(d, x.XDefaultRootWindow(d), 0, 4, 1, 1, 0, 0, 0)
+    if r == 0:
+        x.XUngrabPointer(d, 0)
+        x.XSync(d, 0)
+    x.XCloseDisplay(d)
+    return r == 0
+
+
+async def menu_stall_cases(bus, im):
+    """服务卡死（SIGSTOP）时菜单开着：push 仍在线（不会走断线收菜单那条路），指针却被抓着——
+    不设防的话整个桌面的鼠标失灵，且每次移动都续空闲计时、永远收不掉。要求：动一下鼠标，
+    上报失败（一次超时）后本端收菜单、放开指针；恢复后照常打字。"""
+    c = await new_ctx(bus, im, "e2e-menu-stall")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    menu = await open_main_menu(c, tries=3)
+    grabbed = menu is not None and not pointer_grab_free()
+    pid = service_pid()
+    subprocess.run(["kill", "-STOP", pid])
+    try:
+        t0 = time.monotonic()
+        sh("xdotool", "mousemove", "1100", "700")
+        sh("xdotool", "mousemove", "1110", "710")
+        freed = await wait_until(pointer_grab_free, 8.0)
+        dt = time.monotonic() - t0
+        gone = menus_gone()
+    finally:
+        subprocess.run(["kill", "-CONT", pid])
+    check("菜单开着时指针确被抓住（「放开」判据可观测）", grabbed, f"菜单={menu}")
+    print(f"  卡死后动鼠标到放开指针用时 {dt:.2f}s", flush=True)
+    # 上界取 4 秒：一次超时（2 秒）量级，且明显短于空闲超时（e2e 里 5 秒）——靠空闲计时兜底
+    # 收起的不算数。
+    check("服务卡死时动一下鼠标：本端收起菜单、放开指针（一次超时量级）",
+          freed and gone and dt < 4.0, f"放开={freed} 菜单收={gone} 用时 {dt:.1f}s")
+    await asyncio.sleep(3.5)  # 熔断期过去
+    c.preedits.clear()
+    await c.type("nihao")
+    await c.key(" ")
+    got = c.take()
+    check("菜单 + 服务卡死恢复后照常上屏「你好」", got == "你好", f"上屏={got!r}")
+    sh("xdotool", "mousemove", "5", "5")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
+async def menu_idle_ignores_motion_cases(bus, im):
+    """指针移动不续空闲计时：在菜单外来回动（服务端没有新菜单帧），到点照样收起。曾经每批移动
+    都续计时，服务卡死时只要鼠标在动，菜单就永远收不掉、指针一直被抓着。"""
+    idle_ms = int(os.environ.get("WIND_MENU_IDLE_TIMEOUT_MS", "60000"))
+    c = await new_ctx(bus, im, "e2e-menu-motion")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    menu = await open_main_menu(c, tries=3)
+    t0 = time.monotonic()
+    closed_at = None
+    i = 0
+    while time.monotonic() - t0 < idle_ms / 1000 + 3:
+        if menus_gone():
+            closed_at = time.monotonic() - t0
+            break
+        i += 1
+        sh("xdotool", "mousemove", str(1100 + i % 2 * 7), str(700 + i % 2 * 5))
+        await asyncio.sleep(0.3)
+    check(f"菜单外一直动鼠标：空闲 {idle_ms}ms 照样收起（移动不续计时）",
+          menu is not None and closed_at is not None, f"菜单={menu} 收起于 {closed_at}")
+    await end_composition(c)
+    await typing_works(c, "动鼠标不续空闲计时")
+    sh("xdotool", "mousemove", "5", "5")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
+async def menu_max_grab_cases(bus, im):
+    """抓指针的绝对上限：一直有键盘活动（空闲计时一直被续）也不能无限抓着。e2e 把上限调到
+    WIND_MENU_MAX_GRAB_MS（出厂 120 秒）。"""
+    max_ms = int(os.environ.get("WIND_MENU_MAX_GRAB_MS", "0") or 0)
+    idle_ms = int(os.environ.get("WIND_MENU_IDLE_TIMEOUT_MS", "60000"))
+    c = await new_ctx(bus, im, "e2e-menu-maxgrab")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    menu = await open_main_menu(c, tries=3)
+    t0 = time.monotonic()
+    closed_at = None
+    while time.monotonic() - t0 < max_ms / 1000 + 4:
+        if menus_gone():
+            closed_at = time.monotonic() - t0
+            break
+        await c.key("Down")  # 菜单键：续空闲计时
+        await asyncio.sleep(min(1.0, idle_ms / 4000))
+    freed = pointer_grab_free()
+    check(f"菜单一直有活动：开满 {max_ms}ms 本端收起、放开指针",
+          menu is not None and max_ms > idle_ms and closed_at is not None
+          and closed_at > idle_ms / 1000 and freed,
+          f"菜单={menu} 收起于 {closed_at} 放开={freed}")
+    await end_composition(c)
+    await typing_works(c, "抓指针上限收起")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
+async def menu_compositor_toggle_cases(bus, im):
+    """菜单开着时合成器起停：第 0 级菜单按新的合成器状态换 visual 重建，旧窗口连同指针抓取一起
+    没了（X 在抓取窗口不可见时自动放掉抓取）。本端得重新抓上，否则点菜单外再也看不见。"""
+    c = await new_ctx(bus, im, "e2e-menu-comp")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    menu = await open_main_menu(c, tries=3)
+    grabbed = menu is not None and not pointer_grab_free()
+    comp_pid = os.environ.get("WIND_E2E_COMP_PID", "")
+    ours = None
+    if comp_pid:
+        subprocess.run(["kill", comp_pid])
+    else:
+        ours = subprocess.Popen(["xcompmgr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    await asyncio.sleep(0.8)
+    await c.key("Down")  # 菜单重绘 → 新的一帧 → 按新的合成器状态重建窗口
+    await asyncio.sleep(0.6)
+    after = menu_win(0)
+    recreated = menu is not None and after is not None and after[0] != menu[0] and after[5]
+    regrabbed = not pointer_grab_free()
+    # 合成器状态还原（被我们杀掉的那个换一个新的接着跑，随 Xvfb 退出）。
+    if comp_pid:
+        new = subprocess.Popen(["xcompmgr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.environ["WIND_E2E_COMP_PID"] = str(new.pid)
+    else:
+        ours.terminate()
+        ours.wait()
+    await asyncio.sleep(0.8)
+    check("合成器起停：第 0 级菜单重建后重新抓住指针",
+          grabbed and recreated and regrabbed,
+          f"起初抓住={grabbed} 重建={recreated}（{menu} → {after}） 重抓={regrabbed}")
+    await c.key("Escape")
+    await wait_menus_gone()
+    await end_composition(c)
+    await typing_works(c, "合成器起停")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
+async def x_conn_lost_cases(bus, im):
+    """X 连接进入错误态（xkill、Xwayland 重启）时菜单开着：菜单空闲计时器到点收菜单、按指针
+    真实位置重定悬停。重定曾经会顺手重连 X，重连销毁了正在执行的那个计时器（释放后使用，
+    fcitx5 随之段错误）。现在查指针只读现有连接，重连只在下一次贴帧时做。"""
+    c = await new_ctx(bus, im, "e2e-xkill")
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    menu = await open_main_menu(c, tries=3)
+    killed = False
+    if menu:
+        r = subprocess.run(["xkill", "-id", menu[0]], capture_output=True, text=True)
+        killed = r.returncode == 0
+        print(f"  xkill -id {menu[0]} rc={r.returncode} {r.stderr.strip()}", flush=True)
+    idle_ms = int(os.environ.get("WIND_MENU_IDLE_TIMEOUT_MS", "60000"))
+    await asyncio.sleep(idle_ms / 1000 + 1.5)  # 等空闲计时器到点（它在断掉的连接上收菜单）
+    await end_composition(c)
+    await c.type("nihao")
+    cand = await wait_window("wind-candidate", True)
+    await c.key(" ")
+    got = c.take()
+    check("X 连接被断（xkill）且菜单开着：空闲超时收菜单后 fcitx5 存活、照常上屏",
+          menu is not None and killed and got == "你好", f"菜单={menu} xkill={killed} 上屏={got!r}")
+    check("X 连接被断后下一帧重连，候选窗重新出现", cand is not None and cand[5], f"{cand}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
 async def menu_restart_cases(bus, im, restart):
     """服务一侧没了（被杀 / 重启）：菜单是它画的，addon 必须自己收掉、放开指针；新服务起来后
     照常打字。仅在 e2e 自己管服务时跑（自动拉起模式下服务不归脚本管）。"""
@@ -1953,6 +2133,10 @@ async def main():
         await x11_cases(bus, im)
         await overlay_cases(bus, im)
         await menu_cases(bus, im)
+        await menu_idle_ignores_motion_cases(bus, im)
+        await menu_max_grab_cases(bus, im)
+        await menu_compositor_toggle_cases(bus, im)
+        await x_conn_lost_cases(bus, im)
         await overlay_interaction_cases(bus, im)
         await mode_icon_cases(bus, im)
         await settings_cases(bus, im)
@@ -1978,6 +2162,7 @@ async def main():
         await asyncio.sleep(0.2)
         if os.environ.get("DISPLAY"):
             await a.ic.call_focus_out()
+            await menu_stall_cases(bus, im)
             await menu_restart_cases(bus, im, restart)
             await overlay_restart_cases(bus, im, restart)
 
