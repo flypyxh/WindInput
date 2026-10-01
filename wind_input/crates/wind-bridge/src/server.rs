@@ -100,6 +100,9 @@ impl BridgeServer {
     /// 启动 UDS 请求服务器（macOS / Linux）
     #[cfg(unix)]
     pub fn start(&self) -> anyhow::Result<()> {
+        // Linux：先把运行时目录建好并校验（/tmp 兜底必须本用户私有），不合格就不 bind。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        crate::endpoint::ensure_runtime_dir(&self.config.suffix)?;
         let path = crate::endpoint::request_socket_path(&self.config.suffix);
         info!("Bridge UDS server starting on {:?}", path);
         let handler = self.handler.clone();

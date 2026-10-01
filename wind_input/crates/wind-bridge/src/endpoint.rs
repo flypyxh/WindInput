@@ -26,7 +26,7 @@ fn variant_suffix(pipe_suffix: &str) -> &str {
     }
 }
 
-/// runtime 目录：env 覆盖 → macOS: ~/Library/Application Support/WindInput{变体后缀} / Linux: $XDG_RUNTIME_DIR/WindInput{变体后缀} → /tmp/wind_input{管道后缀}
+/// runtime 目录：env 覆盖 → macOS: ~/Library/Application Support/WindInput{变体后缀} / Linux: $XDG_RUNTIME_DIR/WindInput{变体后缀} → /tmp 兜底（见 [`tmp_fallback_dir`]）
 ///
 /// 两段刻意用不同风格的后缀：Application Support 段是**面向用户的应用目录名**
 /// （与 .app、dev.sh、用户配置目录同名），/tmp 段是无 HOME 时的兜底，
@@ -56,7 +56,111 @@ pub fn runtime_dir(suffix: &str) -> PathBuf {
             .join("Application Support")
             .join(format!("WindInput{dir}"));
     }
+    tmp_fallback_dir(suffix)
+}
+
+/// 无会话目录时的 /tmp 兜底。macOS：`/tmp/wind_input{管道后缀}`（不变）。
+///
+/// Linux 外部宿主：`/tmp/wind_input{管道后缀}-<uid>`，并由 [`ensure_runtime_dir`] 建成 0700、
+/// 校验私有。`/tmp` 人人可写：别的用户抢先建这个目录、在里面监听 socket，addon 就会把全部按键
+/// （含密码框）发过去，对方再经推送通道注入文本 / 按键。addon 侧同一规则
+/// （`Bridge.cpp::fallbackRuntimeDir` / `privateDirProblem`），两条通道另校验对端 uid。
+pub fn tmp_fallback_dir(suffix: &str) -> PathBuf {
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    return PathBuf::from(format!("/tmp/wind_input{suffix}-{}", current_uid()));
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     PathBuf::from(format!("/tmp/wind_input{suffix}"))
+}
+
+/// 建好运行时目录并返回其路径（Linux 外部宿主形态；服务启动、bind socket、建单例锁之前调）。
+///
+/// - 显式覆盖（`WIND_INPUT_RUNTIME_DIR`）与 `$XDG_RUNTIME_DIR` 下：缺就建（新建的各级 0700，
+///   失败照旧不管），不校验——前者是用户自己指的，后者的父目录按 XDG 规范是本用户 0700。
+/// - /tmp 兜底：建成 0700，再按 [`check_private_dir`] 校验（是目录、不是符号链接、属主是本用户、
+///   组与其他人无权限），不合格返回错误，服务据此拒绝启动——绝不在别人的目录里 bind。
+///
+/// 其余形态（macOS、不开 linux-host 的 Linux）：同原先的 `create_dir_all`、忽略失败，行为不变。
+/// 建不出来时照旧交给后面的 bind / 加锁去报错。
+#[cfg(unix)]
+pub fn ensure_runtime_dir(suffix: &str) -> std::io::Result<PathBuf> {
+    let dir = runtime_dir(suffix);
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if dir == tmp_fallback_dir(suffix) {
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            check_private_dir(&dir, current_uid())?;
+            return Ok(dir);
+        }
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir);
+    }
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
+    let _ = std::fs::create_dir_all(&dir);
+    Ok(dir)
+}
+
+/// 目录是否「本用户私有」：`lstat` 是目录（不跟符号链接）、属主 = `uid`、组与其他人无任何权限。
+/// 与 addon `Bridge.cpp::privateDirProblem` 同一规则。
+#[cfg(unix)]
+pub fn check_private_dir(dir: &std::path::Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let bad = |why: String| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("运行时目录 {} 不可信：{why}", dir.display()),
+        ))
+    };
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return bad("是符号链接".into());
+    }
+    if !meta.is_dir() {
+        return bad("不是目录".into());
+    }
+    if meta.uid() != uid {
+        return bad(format!("属主是 uid {}", meta.uid()));
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return bad(format!("权限 {mode:04o}，组或其他人可访问"));
+    }
+    Ok(())
+}
+
+/// 连上来的对端是不是本用户的进程（Linux `SO_PEERCRED`）。取不到身份也算不是。
+/// 服务端 accept 后据此拒绝别的用户连进来（按键注入 / 读状态）。
+#[cfg(target_os = "linux")]
+pub fn peer_is_current_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    peer_uid(stream) == Some(unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: fd 在 stream 存活期内有效；cred / len 指向本栈上大小匹配的缓冲。
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of::<libc::ucred>()).then_some(cred.uid)
 }
 
 pub fn request_socket_path(suffix: &str) -> PathBuf {
@@ -199,15 +303,84 @@ mod tests {
             request_socket_path("_dev"),
             std::path::PathBuf::from("/run/user/1000/WindInputDev/bridge.sock")
         );
-        // 没有 XDG_RUNTIME_DIR 时退到 /tmp，而不是 HOME 下的 macOS 式路径。
+        // 没有 XDG_RUNTIME_DIR 时退到 /tmp（带 uid，各用户各一个），而不是 HOME 下的 macOS 式路径。
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        let uid = unsafe { libc::getuid() };
         assert_eq!(
             runtime_dir("_dev"),
-            std::path::PathBuf::from("/tmp/wind_input_dev")
+            std::path::PathBuf::from(format!("/tmp/wind_input_dev-{uid}"))
         );
     }
 
+    /// 私有目录校验：0700 的本用户目录通过；放开权限、符号链接、普通文件、别人的（换个期望 uid
+    /// 模拟）一律拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn check_private_dir_rejects_unsafe_dirs() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("wind_priv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let ok = root.join("ok");
+        std::fs::DirBuilder::new().mode(0o700).create(&ok).unwrap();
+        assert!(check_private_dir(&ok, uid).is_ok());
+        assert!(
+            check_private_dir(&ok, uid + 1).is_err(),
+            "属主不是期望的 uid"
+        );
+        let loose = root.join("loose");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&loose)
+            .unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_private_dir(&loose, uid).is_err());
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o701)).unwrap();
+        assert!(check_private_dir(&loose, uid).is_err());
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&ok, &link).unwrap();
+        assert!(check_private_dir(&link, uid).is_err(), "符号链接不跟");
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_private_dir(&file, uid).is_err());
+        assert!(check_private_dir(&root.join("missing"), uid).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 兜底目录：服务建成 0700；被放开权限后拒绝（不在别人可写的目录里 bind）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[test]
+    fn ensure_runtime_dir_creates_private_tmp_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::capture(&["WIND_INPUT_RUNTIME_DIR", "XDG_RUNTIME_DIR"]);
+        unsafe { std::env::remove_var("WIND_INPUT_RUNTIME_DIR") };
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        // 测试专用后缀：不碰本机真服务可能在用的兜底目录。
+        let suffix = format!("_t{}", std::process::id());
+        let dir = tmp_fallback_dir(&suffix);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(ensure_runtime_dir(&suffix).unwrap(), dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = ensure_runtime_dir(&suffix).unwrap_err();
+        assert!(err.to_string().contains("不可信"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对端 uid：socketpair 两端都是本进程。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_uid_of_socketpair_is_us() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(peer_is_current_user(&a));
+    }
+
     // 以下三条断言 macOS 式的 HOME 路径，Linux 外部宿主形态不适用。
+    // 这一条同时钉住 macOS 的 /tmp 兜底一字未变（不带 uid）。
     #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn runtime_dir_tmp_fallback_with_suffix() {

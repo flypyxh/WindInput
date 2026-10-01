@@ -251,6 +251,14 @@ bool WindEngine::reconnect()
         WIND_WARN() << "服务无响应（连接排队超时），按键暂时透传";
         noteStall();
         return false;
+    case BridgeClient::Failure::Untrusted:
+        // 运行时目录或对端不是本用户的：可能是别的用户在抢我们的 socket。不连、不拉起（拉起的
+        // 服务同样会拒绝这个目录），按键透传。每次都报会刷屏，只报一次。
+        if (!untrustedWarned_) {
+            WIND_WARN() << bridge_.lastError();
+            untrustedWarned_ = true;
+        }
+        return false;
     default:
         break;
     }

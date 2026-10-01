@@ -50,7 +50,14 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
 ## 4. 端点与目录
 
 - socket：`$WIND_INPUT_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/WindInput[Dev]/{bridge,bridge_push}.sock`
-  → `/tmp/wind_input{_dev}`。socket 是运行时状态，不落盘。
+  → `/tmp/wind_input{_dev}-<uid>`。socket 是运行时状态，不落盘。
+- **/tmp 兜底要私有**（无 `XDG_RUNTIME_DIR` 时）：`/tmp` 人人可写，别的用户抢先建好这个目录、在里面
+  监听 socket，addon 就把全部按键（含密码框）发过去，对方再经推送通道发 `COMMIT_TEXT` / `KEY_*`
+  注入文本与按键、或带任意参数拉起设置程序。服务把它建成 0700，并校验「是目录、不是符号链接、属主是
+  本用户、组与其他人无权限」，不合格拒绝启动（`endpoint::ensure_runtime_dir`）；addon 连这个目录下
+  的 socket 前做同一校验（`privateDirProblem`）。`$XDG_RUNTIME_DIR`（规范要求本用户 0700）与显式覆盖
+  不校验目录。**两条通道两端都校验对端 uid**（`SO_PEERCRED`）：addon 只连本用户的服务，服务只服务
+  本用户的进程。
 - 配置：`~/.config/WindInput[Dev]`（`dirs::config_dir`）；缓存/日志：`~/.local/share/WindInput[Dev]`。
 - data：服务可执行文件同目录的 `data/`（`variant::install_root`）；FHS 打包时再议。
 - SHM 名（Linux）：`/WindInput[Dev].<uid>` + 层后缀（`_TIP` / `_STS` / `_TST` / `_MN<k>`），带 uid

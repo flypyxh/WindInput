@@ -13,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
 #include <fstream>
@@ -297,6 +298,103 @@ void TestConnectTimeout()
     ::unlink(path.c_str());
 }
 
+void TestPrivateDir()
+{
+    CASE("兜底运行时目录的私有性：目录、本用户、0700，符号链接 / 文件 / 放开权限 / 别人的都拒绝");
+    char tmpl[] = "/tmp/wl-priv-XXXXXX";
+    const std::string root = mkdtemp(tmpl);
+    const uint32_t me = uint32_t(getuid());
+    const std::string ok = root + "/ok";
+    CHECK(::mkdir(ok.c_str(), 0700) == 0);
+    CHECK(privateDirProblem(ok, me).empty());
+    CHECK(!privateDirProblem(ok, me + 1).empty()); // 属主不是期望的 uid
+    const std::string loose = root + "/loose";
+    CHECK(::mkdir(loose.c_str(), 0700) == 0);
+    CHECK(::chmod(loose.c_str(), 0755) == 0);
+    CHECK(privateDirProblem(loose, me).find("权限") != std::string::npos);
+    CHECK(::chmod(loose.c_str(), 0710) == 0);
+    CHECK(!privateDirProblem(loose, me).empty());
+    const std::string link = root + "/link";
+    CHECK(::symlink(ok.c_str(), link.c_str()) == 0);
+    CHECK(privateDirProblem(link, me).find("符号链接") != std::string::npos);
+    const std::string file = root + "/file";
+    { std::ofstream(file) << "x"; }
+    CHECK(::chmod(file.c_str(), 0600) == 0);
+    CHECK(privateDirProblem(file, me).find("不是目录") != std::string::npos);
+    CHECK(!privateDirProblem(root + "/missing", me).empty());
+    if (std::system(("rm -rf " + root).c_str()) != 0) {
+        std::printf("(清理临时目录失败，忽略)\n");
+    }
+
+    CASE("兜底目录名带 uid（/tmp 下各用户各一个）");
+    unsetenv("WIND_VARIANT");
+    setenv("WIND_VARIANT", "release", 1);
+    CHECK_EQ(fallbackRuntimeDir(), "/tmp/wind_input-" + std::to_string(me));
+    setenv("WIND_VARIANT", "dev", 1);
+    CHECK_EQ(fallbackRuntimeDir(), "/tmp/wind_input_dev-" + std::to_string(me));
+    unsetenv("WIND_VARIANT");
+}
+
+void TestPeerUid()
+{
+    CASE("对端 uid（SO_PEERCRED）：本用户的服务照连；对端不是期望的 uid 就拒绝，连接不留");
+    FakeServer srv("peer.sock", {Reply::Consumed, Reply::Consumed});
+    BridgeClient bc(1000);
+    bc.setExpectedPeerUid(uint32_t(getuid()) + 1);
+    CHECK(!bc.connect(srv.path));
+    CHECK(bc.lastFailure() == BridgeClient::Failure::Untrusted);
+    CHECK(!bc.isConnected());
+    CHECK(!bc.suspended()); // 不是超时，不熔断
+    bc.setExpectedPeerUid(uint32_t(getuid()));
+    CHECK(bc.connect(srv.path));
+    Frame f;
+    CHECK(bc.request(encodeEmptyFrame(CMD_FOCUS_LOST), f));
+    int sv[2];
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    CHECK_EQ(peerUid(sv[0]), int64_t(getuid()));
+    ::close(sv[0]);
+    ::close(sv[1]);
+}
+
+void TestFallbackDirRejected()
+{
+    CASE("兜底目录不私有（如被放开成 0755）：连都不连，报不可信；收紧成 0700 后照连");
+    unsetenv("WIND_INPUT_RUNTIME_DIR");
+    unsetenv("XDG_RUNTIME_DIR");
+    // 本机可能真有本用户某个变体的兜底目录在用：挑一个不存在的变体来造，不碰在用的那个。
+    std::string dir;
+    for (const char* v : {"dev", "release"}) {
+        setenv("WIND_VARIANT", v, 1);
+        struct stat st {};
+        if (::lstat(fallbackRuntimeDir().c_str(), &st) != 0) {
+            dir = fallbackRuntimeDir();
+            break;
+        }
+    }
+    CHECK(!dir.empty()); // 两个变体的兜底目录都在用：这台机器上没法不碰它们来测
+    if (!dir.empty()) {
+        CHECK(::mkdir(dir.c_str(), 0700) == 0);
+        CHECK(::chmod(dir.c_str(), 0755) == 0);
+        const std::string sock = dir + "/bridge.sock";
+        int lfd = listenOn(sock);
+        BridgeClient bc(500);
+        CHECK(!bc.connect(sock));
+        CHECK(bc.lastFailure() == BridgeClient::Failure::Untrusted);
+        CHECK(bc.lastError().find("不可信") != std::string::npos);
+        CHECK(::chmod(dir.c_str(), 0700) == 0);
+        std::thread srv([&] {
+            int c = ::accept(lfd, nullptr, nullptr);
+            ::close(c);
+        });
+        CHECK(bc.connect(sock));
+        srv.join();
+        ::close(lfd);
+        ::unlink(sock.c_str());
+        ::rmdir(dir.c_str());
+    }
+    unsetenv("WIND_VARIANT");
+}
+
 void TestConnectFailures()
 {
     CASE("连接失败：socket 不存在 / 路径超长都如实报错");
@@ -430,7 +528,7 @@ void TestEndpoints()
         }
     }
     unsetenv("XDG_RUNTIME_DIR");
-    CHECK(runtimeDir() == "/tmp/wind_input_dev");
+    CHECK(runtimeDir() == "/tmp/wind_input_dev-" + uid);
     unsetenv("WIND_VARIANT");
 }
 
@@ -445,6 +543,9 @@ int main()
     TestSendToDeadConnectionIsRetried();
     TestBreaker();
     TestConnectTimeout();
+    TestPrivateDir();
+    TestPeerUid();
+    TestFallbackDirRejected();
     TestConnectFailures();
     TestPushReconnect();
     TestStopWhileIdle();

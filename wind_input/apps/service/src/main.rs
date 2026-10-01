@@ -1046,8 +1046,16 @@ fn check_singleton() -> SingletonCheck {
 #[cfg(target_os = "linux")]
 fn check_singleton() -> SingletonCheck {
     use std::os::fd::AsRawFd;
-    let dir = wind_bridge::endpoint::runtime_dir(wind_config::variant::pipe_suffix());
-    let _ = std::fs::create_dir_all(&dir);
+    // 运行时目录先建好并校验：/tmp 兜底（无 XDG_RUNTIME_DIR）必须是本用户私有的，否则别的用户
+    // 抢先建好它、在里面监听 socket，就能收走 addon 发来的全部按键。不合格就拒绝启动。
+    let dir = match wind_bridge::endpoint::ensure_runtime_dir(wind_config::variant::pipe_suffix()) {
+        Ok(dir) => dir,
+        Err(e) => {
+            startup_trace::stage(&format!("runtime-dir-UNSAFE {e}，拒绝启动"));
+            eprintln!("WindInput: {e}，拒绝启动");
+            std::process::exit(1);
+        }
+    };
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

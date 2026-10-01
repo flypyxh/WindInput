@@ -226,6 +226,9 @@ impl PushServer {
     /// 启动 UDS 推送服务器（macOS / Linux）
     #[cfg(unix)]
     pub fn start(&self) -> anyhow::Result<()> {
+        // 同 BridgeServer::start：运行时目录不可信就不 bind。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        crate::endpoint::ensure_runtime_dir(&self.config.suffix)?;
         let path = crate::endpoint::push_socket_path(&self.config.suffix);
         info!("Push UDS server starting on {:?}", path);
         let clients = self.clients.clone();

@@ -44,6 +44,12 @@ pub(crate) fn run_uds_push_server(socket_path: PathBuf, clients: Arc<Mutex<Vec<P
 }
 
 fn handle_push_conn(mut stream: UnixStream, clients: Arc<Mutex<Vec<PushClient>>>) {
+    // 推送里有上屏文本、按键合成、候选内容：只推给本用户的进程。
+    #[cfg(target_os = "linux")]
+    if !crate::endpoint::peer_is_current_user(&stream) {
+        warn!("push client 不是本用户的进程，拒绝");
+        return;
+    }
     crate::server_unix::set_nosigpipe(&stream);
     // 1. 发 SERVICE_READY
     let ready = IpcHeader::new(CMD_SERVICE_READY, 0).to_bytes();

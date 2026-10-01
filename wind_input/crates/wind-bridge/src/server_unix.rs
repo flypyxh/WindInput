@@ -40,6 +40,12 @@ pub fn run_uds_server(socket_path: PathBuf, handler: Arc<dyn MessageHandler>) {
 }
 
 fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
+    // 只服务本用户的进程：别的用户连进来就能发按键、开菜单、拉起设置程序。
+    #[cfg(target_os = "linux")]
+    if !crate::endpoint::peer_is_current_user(&stream) {
+        warn!("bridge client 不是本用户的进程，拒绝");
+        return;
+    }
     set_nosigpipe(&stream);
     let mut header_buf = [0u8; IpcHeader::SIZE];
     loop {

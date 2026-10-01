@@ -23,8 +23,18 @@ namespace windlinux {
 std::string variantSuffix();
 
 /// 运行时目录，与 Rust `endpoint.rs::runtime_dir` 逐条对齐：
-/// `$WIND_INPUT_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/WindInput{Dev}` → `/tmp/wind_input{_dev}`。
+/// `$WIND_INPUT_RUNTIME_DIR` → `$XDG_RUNTIME_DIR/WindInput{Dev}` → `/tmp/wind_input{_dev}-<uid>`。
 std::string runtimeDir();
+/// 无 `$XDG_RUNTIME_DIR` 时的兜底目录 `/tmp/wind_input{_dev}-<uid>`。`/tmp` 人人可写：别的用户
+/// 可以抢先建这个目录、在里面监听 socket，收走全部按键（含密码框）再经推送通道注入文本 / 按键。
+/// 所以连这个目录下的 socket 之前先 `privateDirProblem` 校验（服务端建目录时同一套规则）。
+/// `$XDG_RUNTIME_DIR`（规范要求本用户 0700）与显式覆盖不校验目录；两条通道一律校验对端 uid。
+std::string fallbackRuntimeDir();
+/// 目录是否「本用户私有」：`lstat` 是目录（不是符号链接）、属主 = `uid`、组与其他人无任何权限。
+/// 合格返回空串，否则返回原因。与 Rust `endpoint::check_private_dir` 同一规则。
+std::string privateDirProblem(const std::string& dir, uint32_t uid);
+/// 已连上的 UDS 对端进程的 uid（`SO_PEERCRED`）；取不到返回 -1。
+int64_t peerUid(int fd);
 std::string requestSocketPath();
 std::string pushSocketPath();
 /// POSIX SHM 名：`/WindInput{Dev}.<uid>`（与 Rust `endpoint.rs::shm_name` 的 Linux 外部宿主
@@ -62,6 +72,7 @@ public:
         Suspended,      // 熔断期内，没去连
         Connect,        // 连不上（ENOENT / ECONNREFUSED…）：服务多半没在跑
         ConnectTimeout, // 连接排队超时：服务在，但不 accept
+        Untrusted,      // 兜底目录不是本用户私有，或对端进程不是本用户的（SO_PEERCRED）
         Send,          // 写失败（EPIPE / ECONNRESET）：对端没收到这一帧
         SendTimeout,
         ReadTimeout,    // 发出去了、迟迟没回：服务可能已经处理了这一帧
@@ -69,16 +80,15 @@ public:
         Broken,         // 响应读到一半断了、或帧头不合法
     };
 
-    explicit BridgeClient(int ioTimeoutMs = 2000, int breakerMs = 3000)
-        : timeoutMs_(ioTimeoutMs), breakerMs_(breakerMs)
-    {
-    }
+    explicit BridgeClient(int ioTimeoutMs = 2000, int breakerMs = 3000);
     ~BridgeClient() { close(); }
     BridgeClient(const BridgeClient&) = delete;
     BridgeClient& operator=(const BridgeClient&) = delete;
 
     bool connect(const std::string& path);
     bool isConnected() const { return fd_ >= 0; }
+    /// 对端必须是这个 uid（缺省本用户）。只给单测造「对端是别人」用。
+    void setExpectedPeerUid(uint32_t uid) { expectedPeerUid_ = uid; }
     void close();
 
     bool send(const Bytes& frame);
@@ -110,6 +120,7 @@ private:
     int fd_ = -1;
     int timeoutMs_;
     int breakerMs_;
+    uint32_t expectedPeerUid_;
     std::string lastError_;
     Failure lastFailure_ = Failure::None;
     std::chrono::steady_clock::time_point unhealthyUntil_{};

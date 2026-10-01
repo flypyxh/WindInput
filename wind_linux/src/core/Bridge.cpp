@@ -6,8 +6,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -38,14 +40,30 @@ bool isDev()
     return WIND_VARIANT_DEV != 0;
 }
 
-/// connect 的结果：失败时区分「排队超时」（服务在但不 accept）与其它（服务不在）。
-enum class ConnectResult { Ok, Failed, TimedOut };
+/// connect 的结果：失败时区分「排队超时」（服务在但不 accept）、「不可信」（目录 / 对端不是
+/// 本用户的）与其它（服务不在）。
+enum class ConnectResult { Ok, Failed, TimedOut, Untrusted };
+
+std::string dirnameOf(const std::string& path)
+{
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
 
 /// 超时在 connect **之前**设：AF_UNIX 的 connect 在对端 listen 队列满时会阻塞（服务整体停住
 /// 时就是这样），它认 SO_SNDTIMEO，到点返回 EAGAIN。读超时一并设好（timeoutMs = 0 不设）。
-int connectUnix(const std::string& path, int timeoutMs, std::string& err, ConnectResult& result)
+int connectUnix(const std::string& path, int timeoutMs, uint32_t expectedUid, std::string& err,
+                ConnectResult& result)
 {
     result = ConnectResult::Failed;
+    // 兜底目录在人人可写的 /tmp 下：先确认它是本用户私有的，再去连里面的 socket。
+    if (const std::string dir = dirnameOf(path); dir == fallbackRuntimeDir()) {
+        if (std::string why = privateDirProblem(dir, uint32_t(::getuid())); !why.empty()) {
+            err = "运行时目录 " + dir + " 不可信（" + why + "），拒绝连接";
+            result = ConnectResult::Untrusted;
+            return -1;
+        }
+    }
     sockaddr_un addr{};
     if (path.size() >= sizeof(addr.sun_path)) {
         err = "socket 路径超过 " + std::to_string(sizeof(addr.sun_path) - 1) + " 字节: " + path;
@@ -75,6 +93,14 @@ int connectUnix(const std::string& path, int timeoutMs, std::string& err, Connec
         if (e == EAGAIN || e == EWOULDBLOCK || e == EINPROGRESS) {
             result = ConnectResult::TimedOut;
         }
+        ::close(fd);
+        return -1;
+    }
+    // 对端必须是本用户的进程：别的用户抢先在这个路径上监听，就能收走全部按键、再经推送通道
+    // 往应用里注入文本与按键。
+    if (const int64_t uid = peerUid(fd); uid != int64_t(expectedUid)) {
+        err = "socket " + path + " 的对端 uid=" + std::to_string(uid) + "，不是本用户，拒绝连接";
+        result = ConnectResult::Untrusted;
         ::close(fd);
         return -1;
     }
@@ -177,8 +203,47 @@ std::string runtimeDir()
     if (!xdg.empty()) {
         return xdg + "/WindInput" + variantSuffix();
     }
-    // 无会话运行时目录时的兜底：沿用管道风格的 snake 后缀（`_dev`），同 Rust。
-    return std::string("/tmp/wind_input") + (isDev() ? "_dev" : "");
+    return fallbackRuntimeDir();
+}
+
+std::string fallbackRuntimeDir()
+{
+    // 沿用管道风格的 snake 后缀（`_dev`），同 Rust；带 uid，各用户各一个。
+    return std::string("/tmp/wind_input") + (isDev() ? "_dev" : "") + "-"
+        + std::to_string(::getuid());
+}
+
+std::string privateDirProblem(const std::string& dir, uint32_t uid)
+{
+    struct stat st {};
+    if (::lstat(dir.c_str(), &st) != 0) {
+        return std::string("lstat: ") + std::strerror(errno);
+    }
+    if (S_ISLNK(st.st_mode)) {
+        return "是符号链接";
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return "不是目录";
+    }
+    if (uint32_t(st.st_uid) != uid) {
+        return "属主是 uid " + std::to_string(st.st_uid);
+    }
+    if ((st.st_mode & 077) != 0) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%04o", unsigned(st.st_mode & 07777));
+        return std::string("权限 ") + buf + "，组或其他人可访问";
+    }
+    return {};
+}
+
+int64_t peerUid(int fd)
+{
+    ucred cred{};
+    socklen_t len = sizeof(cred);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || len != sizeof(cred)) {
+        return -1;
+    }
+    return int64_t(cred.uid);
 }
 
 std::string requestSocketPath()
@@ -221,6 +286,11 @@ std::string overlayShmName(uint32_t kind, const std::string& base)
 
 // ── BridgeClient ───────────────────────────────────────────────────
 
+BridgeClient::BridgeClient(int ioTimeoutMs, int breakerMs)
+    : timeoutMs_(ioTimeoutMs), breakerMs_(breakerMs), expectedPeerUid_(uint32_t(::getuid()))
+{
+}
+
 bool BridgeClient::connect(const std::string& path)
 {
     close();
@@ -230,9 +300,11 @@ bool BridgeClient::connect(const std::string& path)
         return false;
     }
     ConnectResult result;
-    fd_ = connectUnix(path, timeoutMs_, lastError_, result);
+    fd_ = connectUnix(path, timeoutMs_, expectedPeerUid_, lastError_, result);
     if (fd_ < 0) {
-        return fail(result == ConnectResult::TimedOut ? Failure::ConnectTimeout : Failure::Connect,
+        return fail(result == ConnectResult::TimedOut    ? Failure::ConnectTimeout
+                        : result == ConnectResult::Untrusted ? Failure::Untrusted
+                                                             : Failure::Connect,
                     lastError_);
     }
     lastFailure_ = Failure::None;
@@ -365,7 +437,7 @@ void PushClient::run()
         std::string err;
         ConnectResult result;
         // 连接也带超时：服务停住时 connect 会阻塞，stop() 要等它返回才 join 得上。
-        int fd = connectUnix(path_, kPushConnectTimeoutMs, err, result);
+        int fd = connectUnix(path_, kPushConnectTimeoutMs, uint32_t(::getuid()), err, result);
         if (fd >= 0) {
             {
                 std::lock_guard<std::mutex> lk(mu_);

@@ -133,6 +133,7 @@ private:
     bool serviceSeenOnce_ = false;
     /// 发生过超时、还没在重连时对齐过（见 noteStall / resyncAfterStall）。
     bool stallPending_ = false;
+    bool untrustedWarned_ = false;
     /// 按下时被本输入法吃掉的键（按硬件键码记）。松开时同样吃掉，免得宿主收到一个没有
     /// 按下的松开——多数宿主无所谓，但有的会据此触发快捷键。
     std::unordered_set<int> eatenKeys_;
