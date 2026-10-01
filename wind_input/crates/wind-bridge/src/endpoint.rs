@@ -204,7 +204,9 @@ pub fn shm_name(suffix: &str) -> String {
 #[cfg(all(target_os = "linux", ext_presenter))]
 pub fn shm_name_for_uid(suffix: &str, uid: u32) -> String {
     let name = format!("/WindInput{}.{uid}", variant_suffix(suffix));
-    debug_assert!(name.len() + "_MN5".len() <= 31, "shm name too long: {name}");
+    // 同 macOS 分支只断言基名：测试专用的长后缀（`_tm<pid>_<n>`）加层后缀会过 31，但 Linux 的真实
+    // 上限是 255；正式变体连层后缀的上界由单测 `linux_shm_name_carries_uid` 钉在 31 以内。
+    debug_assert!(name.len() <= 31, "shm name too long: {name}");
     name
 }
 
