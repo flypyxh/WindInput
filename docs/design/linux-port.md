@@ -326,7 +326,7 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
 - **入口**：应用菜单（`windinput-setting.desktop`，兼 `windinput://` 协议）、Fcitx5 状态区「清风输入法设置」
   与系统输入法配置里的「配置」（§5d），以及「打开设置」热键
   （出厂 `Ctrl+Shift+]`）。后者：服务 `open_settings_with` 推扩展信封 `settings.open` → addon
-  （`SettingsLauncher` + `fcitx::startProcess`）启动 `/usr/lib/windinput/wind_setting`
+  （`SettingsLauncher` + `spawnDetached`）启动 `/usr/lib/windinput/wind_setting`
   （`WIND_INPUT_SETTING` 可覆盖）；只启动自己的设置程序，信封内容只当参数。e2e 覆盖整条链。
 - **系统关联**（`windinput://`、`.wpkg`、`.wtheme`）：deb 装 `.desktop` ×2 + `windinput.xml` + hicolor `mimetypes` 类型图标，开箱即用；高级页「系统集成」按 XDG 现查（`xdg-mime query default` + 读 `.desktop` 的
   `Exec`），系统包提供的注明「在此不能取消」。便携 / tarball 可按用户注册：包里同一份文件以本程序绝对路径写进

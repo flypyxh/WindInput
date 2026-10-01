@@ -20,6 +20,7 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/KeySynth.h` + `src/core/KeySynth.cpp` | 命令直通车按键合成的纯逻辑：键名 → keysym、组合 → 按下 / 抬起事件列、key.hold 的按住记账（卡键保护）与限流。见下「命令直通车按键合成」 |
 | `include/ResponseRouter.h` + `src/core/ResponseRouter.cpp` | 响应帧 → 宿主操作。Swift `BridgeResponseRouter` 的逐条移植（待定标点 / 定格前缀 / hold 计时器 / 数字后智能标点记账） |
 | `include/Utf.h` + `src/core/Utf.cpp` | UTF-16 码元 ↔ UTF-8 字节换算（服务端光标以 UTF-16 计，Fcitx5 要字节偏移） |
+| `include/ServiceLauncher.h` + `src/core/ServiceLauncher.cpp` | 连不上服务时拉起它（节流 20 秒）。`spawnDetached`（设置程序共用）：双 fork（fcitx5 不替我们回收子进程，实测 posix_spawn 出来的服务退出后留 defunct）、新会话、清信号掩码并复位处置、stdio 接 /dev/null、关掉 3 起的 fd |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
 | `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
 | `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：模式镜像（托盘图标：服务端按主字运行时渲染的 `windinput-lbl-<状态>-<主字十六进制>`，没写出时退回种子 `windinput-zh/en/caps`；中英、大写锁定位与标签从服务端四种状态帧学）、addon 加载时预建用户图标目录、大写锁定的本端判定（`CapsLockTracker`）、应用内预编辑过滤掉单空格占位组合 |
@@ -329,7 +330,7 @@ forwardKey 对某类应用确实无效时才值得做，目前没有这样的证
 | 工具栏 / 软键盘 / 输入诊断 HUD | 不做 | 产品决策：与 macOS 精简范围一致。设置端已按平台门控相应设置项（wind-setting README「按平台屏蔽的设置项」）；主菜单里的对应项也按平台摘掉 |
 | 截图所有窗口到文件（主菜单「高级」） | 摘掉 | 流程按 macOS「浮层像素在宿主」写：要宿主回应 `shot.panel` 才出结果 Toast，addon 不接。「截图候选窗口到剪贴板」可用 |
 | 按应用独立配置（compat） | 机制可用；**打包时不带 Windows 内置规则**（`scripts/lib/gen-compat.sh linux` 生成「字段说明 + 零规则」的 Linux 版系统层，各平台兼容策略不共用） | 服务按 `FOCUS_GAINED` 的 bundleId（= `InputContext::program()`）匹配规则，同 macOS；设置端的应用兼容性窗口保留 |
-| 打开设置（`settings.open` 扩展信封） | 已接 | `WindEngine::onExt` → `fcitx::startProcess`（双 fork，不留僵尸，继承 fcitx5 的会话环境）。设置程序已开着时由它自己的单实例转发参数；但**转来的切页要等设置窗口下一次输入事件才显示**（windui Linux 后端，冷启动深链正常） |
+| 打开设置（`settings.open` 扩展信封） | 已接 | `WindEngine::onExt` → `spawnDetached`（与拉起服务同一个：双 fork 不留僵尸、新会话、继承 fcitx5 的会话环境，但不继承它的 fd 与信号处置；`fcitx::startProcess` 只做前两样）。设置程序已开着时由它自己的单实例转发参数；但**转来的切页要等设置窗口下一次输入事件才显示**（windui Linux 后端，冷启动深链正常） |
 | 系统关联（`windinput://` 协议、`.wpkg` / `.wtheme`） | 已接（deb 声明 + 设置程序可按用户注册） | deb 装 `scripts/linux/pkg/` 下两个 `.desktop` 与 `windinput.xml`，类型图标在 `data/icons/hicolor/*/mimetypes/`（`scripts/linux/gen-mime-icons.py`）；便携 / tarball 在设置「高级 → 系统集成」按用户注册（写 `$XDG_DATA_HOME`，语义见 wind-setting README「系统关联」）。`scripts/linux/e2e-assoc.sh` 覆盖类型识别、默认处理者、`xdg-open` / `gio open` 拉起设置程序进导入确认、首实例已开时转参、注册/取消一圈。未验：真桌面文件管理器双击（Nautilus / Dolphin / Deepin）、KDE 的 ktraderclient 查询分支、snap / flatpak 浏览器点链接；用户级注册不装图标 |
 | 全局热键 | 不做 | 设置端藏掉热键对话框的「全局」勾选；热键只在输入法激活、有焦点时经按键通路生效 |
 | Shift 单击切中英 | **需清 Fcitx5 的 AltTriggerKeys** | 出厂 `Shift_L` 被 Fcitx5 截走。安装脚本应改 `~/.config/fcitx5/config`，或在 AGENTS 外的用户文档里写明 |

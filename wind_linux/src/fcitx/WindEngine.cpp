@@ -803,12 +803,15 @@ void WindEngine::launchSettings(const std::vector<std::string>& args)
         WIND_WARN() << "设置程序不存在或不可执行：" << argv[0];
         return;
     }
-    // startProcess 双 fork + setsid：设置程序脱离 fcitx5 的进程组、不留僵尸，继承 fcitx5 的
-    // 环境（DISPLAY / WAYLAND_DISPLAY 靠它带过去）。已在运行时由设置程序自己的单实例
-    // 转发把 argv 交给首实例（windui single_instance/unix.rs），这里不必判重。
+    // 与拉起服务同一个 spawnDetached：双 fork + setsid（不留僵尸、脱离 fcitx5 的会话），继承
+    // fcitx5 的环境（DISPLAY / WAYLAND_DISPLAY 靠它带过去），但不继承它的 fd 与信号处置——
+    // fcitx::startProcess 只做了前两样。已在运行时由设置程序自己的单实例转发把 argv 交给首实例
+    // （windui single_instance/unix.rs），这里不必判重。
     WIND_INFO() << "启动设置程序 " << argv[0] << "（" << args.size() << " 个参数）";
     const std::string dir = argv[0].substr(0, argv[0].find_last_of('/') + 1);
-    fcitx::startProcess(argv, dir.empty() ? "/" : dir);
+    if (!spawnDetached(argv, dir.empty() ? "/" : dir)) {
+        WIND_WARN() << "设置程序启动失败：" << argv[0];
+    }
 }
 
 void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
