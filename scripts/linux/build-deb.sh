@@ -70,6 +70,19 @@ find "$S" -type d -exec chmod 755 {} +
 find "$S" -type f -perm /111 -exec chmod 755 {} +
 find "$S" -type f ! -perm /111 -exec chmod 644 {} +
 
+# 链接期依赖交给 dpkg-shlibdeps 按真实 ELF 符号算（libc6 / libstdc++6 / libgcc-s1 / libfcitx5* / libxcb*），
+# 而不是手写——以后升级编译器或第三方库时手写表很容易漏。算不到的才手写：fcitx5 本体与最低版本
+# （addon 按 5.0.14 的头文件编，是发布基线）、运行时 dlopen 的 libfontconfig1（ELF 里没有 NEEDED）、
+# 字体 / python3 / procps 这类非库依赖。
+SHL="$WORK_DIR/shlibs"
+rm -rf "$SHL"; mkdir -p "$SHL/debian"
+printf 'Source: windinput\n\nPackage: windinput\nArchitecture: any\n' >"$SHL/debian/control"
+SHLIBS_DEPENDS="$(cd "$SHL" && dpkg-shlibdeps -O \
+    -e"$S/usr/lib/windinput/wind_input" -e"$S/usr/lib/windinput/wind_setting" \
+    -e"$(find "$S/usr/lib" -name libwindinput.so -path '*fcitx5*')" | sed -n 's/^shlibs:Depends=//p')"
+[[ -n "$SHLIBS_DEPENDS" ]] || { echo "dpkg-shlibdeps 没有算出依赖" >&2; exit 1; }
+EXTRA_DEPENDS="fcitx5 (>= 5.0.14), libfontconfig1, fonts-noto-cjk | fonts-wqy-microhei | fonts-wqy-zenhei, python3, procps"
+
 mkdir -p "$S/DEBIAN"
 SIZE=$(du -sk --apparent-size "$S" | cut -f1)
 cat >"$S/DEBIAN/control" <<CONTROL
@@ -80,7 +93,7 @@ Maintainer: WindInput <noreply@windinput.com>
 Section: utils
 Priority: optional
 Installed-Size: $SIZE
-Depends: libc6 (>= 2.35), fcitx5 (>= 5.0.14), libxcb1, libxcb-shape0, libfontconfig1, fonts-noto-cjk | fonts-wqy-microhei | fonts-wqy-zenhei, python3, procps
+Depends: $SHLIBS_DEPENDS, $EXTRA_DEPENDS
 Recommends: fcitx5-frontend-gtk3, fcitx5-frontend-qt5 | fcitx5-frontend-qt6, im-config, xclip | wl-clipboard, xdg-utils, xdg-desktop-portal | zenity, libxkbcommon0, fonts-noto-color-emoji
 Homepage: https://windinput.com
 Description: 清风输入法 (WindInput) —— Fcitx5 输入法引擎

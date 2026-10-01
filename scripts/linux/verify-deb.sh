@@ -36,6 +36,12 @@ case "$WANT" in
 esac
 
 R="$T/root"
+# 依赖：链接期依赖由 dpkg-shlibdeps 算出，缺了说明构建脚本漏了这一步（手写表容易漏）
+deps="$(dpkg-deb -f "$DEB" Depends)"
+for d in libc6 libstdc++6 libfcitx5core7 'fcitx5 (>= 5.0.14)'; do
+    [[ "$deps" == *"$d"* ]] || bad "Depends 缺 $d"
+done
+
 # 关键文件
 for f in usr/lib/windinput/wind_input usr/lib/windinput/wind_setting \
          usr/bin/windinput-setup \

@@ -439,3 +439,22 @@ Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `
   真正的验证仍是干净 22.04 / Deepin 上装一次。
 - 补包用 `release-linux.yml` 只对包含本接入的 tag 有效（prep 会检查脚本是否存在）。
 
+### 打包规范审查（对照通行的 Fcitx5 插件打包建议）
+
+目前只发 Debian 系（Ubuntu 22.04+、Deepin 25），rpm / Arch 暂不做。逐项对照：
+
+- **发布基线**三条同时写明：glibc ≥ 2.34（`dpkg-shlibdeps` 实算，构建机 22.04）、libstdc++ ≥ 11、Fcitx5 ≥ 5.0.14
+  （addon 按 5.0.14 头文件编；5.1.x 的 Deepin 25 上实测可加载）。基线只能随构建机变高不能变低。
+- **addon 装到 `${CMAKE_INSTALL_LIBDIR}/fcitx5`**（`GNUInstallDirs`，Debian 得 `lib/<multiarch>`），不写死；
+  服务 / 设置程序 / 词库放私有目录 `/usr/lib/windinput/`（架构相关二进制，由包的 Architecture 区分）。
+- **依赖自动算**：`build-deb.sh` 用 `dpkg-shlibdeps` 取链接期依赖，只手写算不到的（fcitx5 本体与最低版本、
+  运行时 `dlopen` 的 `libfontconfig1`、字体、python3、procps）；`verify-deb.sh` 校验关键项在。
+  （此前手写表漏了 libstdc++6 / libgcc-s1 / libfcitx5*，靠 fcitx5 传递依赖才碰巧能装。）
+- **不写用户 HOME**：包只装 `/usr` 下文件；用户配置 / 词库由 `windinput-setup` 与程序首次运行时在用户目录创建；
+  `remove` / `purge` 都不动用户数据。
+- **不杀 fcitx5**：postinst / postrm 只结束包路径下的 `wind_input` 服务（addon 下次连不上会自动拉起新版），
+  fcitx5 本身留给用户重启（`fcitx5 -rd` 或重新登录）。
+- **包名保持 `windinput`**：不改 `fcitx5-<名>` 形式——这个包不只是 addon，还带服务、设置程序与词库；已部署的测试机以此名升级。
+  日后若拆包，再按 `fcitx5-windinput`（addon）+ `windinput`（服务 / 数据）拆。
+- **不用 AppImage / Flatpak / Snap**，也不用 `alien` 转格式；将来做 rpm 要在 Fedora 容器里独立构建、独立实测。
+

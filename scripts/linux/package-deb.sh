@@ -30,7 +30,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION="$(tr -d '[:space:]' <"$REPO/docs/VERSION")"
 STAMP="$(date +%Y%m%d%H%M)"
-DEB_VERSION="${VERSION}+linux.${STAMP}"
+DEB_VERSION="${VERSION/-/"~"}+linux.${STAMP}"   # 预发布后缀用 ~，排在同号正式版之前
 DATA_DIR="${DATA_DIR:-$REPO/build_dev/data}"
 OUT_DIR="${OUT_DIR:-$REPO/dist/linux}"
 WORK_DIR="${WORK_DIR:-$HOME/.cache/wi-deb}"
