@@ -347,3 +347,11 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    键却被吞」），`handle_menu.rs` 的 `stale_menu_close_echo_closes_new_menu_consistently` 钉住这一点。
    不加代际的理由：要改 `wind-ui-types` 里三平台共用的 `HideMenu` / `MenuClose`（Windows 的
    `popup_menu` 也发它），换来的只是一个人手几乎点不进去的时间窗里少闪一次菜单。
+5. **连接断开不分是哪条（已知限制）**：`server_unix` 每条请求连接结束都调
+   `handle_client_disconnected`，协调器据此把开着的菜单复位，不看断的是哪条连接。addon 目前只有一条
+   请求连接，成立；将来若出现第二个请求客户端（探针、并行的 e2e 客户端），它断开会把 addon 那边开着的
+   菜单在服务端复位（UI 随之收菜单，两端仍一致，只是菜单被无故收掉）。届时给断线回调带上连接标识。
+6. **字体文件被原地截断会 SIGBUS（已知限制）**：Linux 文本后端把字体文件只读 `mmap` 后常驻
+   （`text/linux/store.rs` 的 `map_file`），文件若在服务运行中被**原地截断改写**（而不是包管理器那样
+   写新文件再 rename），访问越过新文件尾的页触发 SIGBUS、服务崩溃。包管理器升级字体走 rename，旧映射
+   仍指向旧 inode，不受影响。读进内存可免，代价是 CJK 字体常驻数十 MB 私有内存，不做。
