@@ -120,6 +120,17 @@ jobs:
             echo "::warning::该 Release 没有 macOS 安装包,跳过 mac 同步。"
             echo "mac=false" >> "$GITHUB_OUTPUT"
           fi
+          # Linux 包同样「有则同步」:两个架构一起要(缺一个说明发布不完整,宁可不同步也不推半套)。
+          if gh release download "$TAG" --repo "${{ github.repository }}" \
+               --pattern "WindInput-${VERSION}-linux-*.deb*" --dir ./dl 2>/dev/null \
+             && [ -f "./dl/WindInput-${VERSION}-linux-amd64.deb" ] \
+             && [ -f "./dl/WindInput-${VERSION}-linux-arm64.deb" ]; then
+            echo "linux=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -f ./dl/WindInput-*-linux-*.deb*
+            echo "::warning::该 Release 没有完整的 Linux 安装包(amd64 + arm64),跳过 Linux 同步。"
+            echo "linux=false" >> "$GITHUB_OUTPUT"
+          fi
           # 升级元数据里的 releaseNotesUrl 指向它(命名口径见 dev.ps1 New-UpdateManifest)
           gh release view "$TAG" --repo "${{ github.repository }}" --json body -q .body \
             > "./dl/WindInput-${VERSION}-Release.md"
@@ -141,9 +152,11 @@ jobs:
           # 或反过来在 mac 落后一版时误删仍在服役的 mac 包(有害)。
           PREV=$(curl -fsSL "${R2_BASE_URL}/latest.json" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || echo "")
           PREV_MAC=$(curl -fsSL "${R2_BASE_URL}/latest-mac.json" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || echo "")
-          echo "previous on R2: win=${PREV:-<none>} mac=${PREV_MAC:-<none>}"
+          PREV_LINUX=$(curl -fsSL "${R2_BASE_URL}/latest-linux.json" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || echo "")
+          echo "previous on R2: win=${PREV:-<none>} mac=${PREV_MAC:-<none>} linux=${PREV_LINUX:-<none>}"
           echo "version=$PREV" >> "$GITHUB_OUTPUT"
           echo "mac_version=$PREV_MAC" >> "$GITHUB_OUTPUT"
+          echo "linux_version=$PREV_LINUX" >> "$GITHUB_OUTPUT"
 
       # 上传顺序是契约:先 exe 后 latest.json。json 是开关,反过来会让客户端
       # 看到新版本却下载到 404(dev.ps1:1181 同款约定)。
@@ -232,6 +245,42 @@ jobs:
           wrangler r2 object put --remote "$R2_BUCKET/latest-mac.json" \
             --file latest-mac.json --content-type "application/json; charset=utf-8"
 
+      # Linux:同样的契约(先传包后传 json),元数据按架构给出。键名 debs 与 exeUrl / pkgUrl 都不同,
+      # 客户端读到别的平台的元数据在解析阶段就会被拒。目前客户端侧还没有 Linux 在线升级的消费方
+      # (升级走 apt / 手动下载),这份 json 先作为官网下载页与后续升级功能的数据源,并用来记「R2 上
+      # 当前指向哪个版本」,让下面的清理步骤能删旧包。
+      - name: Linux - 上传安装包与 latest-linux.json
+        if: steps.gate.outputs.skip != 'true' && steps.dl.outputs.linux == 'true'
+        run: |
+          DEBS='{}'
+          for ARCH in amd64 arm64; do
+            F="WindInput-${VERSION}-linux-${ARCH}.deb"
+            SHA=$(awk '{print $1}' "./dl/$F.sha256")
+            ACTUAL=$(sha256sum "./dl/$F" | awk '{print $1}')
+            if [ "$SHA" != "$ACTUAL" ]; then
+              echo "ERROR: $F 的 sha256 sidecar($SHA) 与实际值($ACTUAL) 不符" >&2
+              exit 1
+            fi
+            SIZE=$(stat -c %s "./dl/$F")
+            wrangler r2 object put --remote "$R2_BUCKET/$F" --file "./dl/$F" \
+              --content-type "application/vnd.debian.binary-package"
+            wrangler r2 object put --remote "$R2_BUCKET/$F.sha256" --file "./dl/$F.sha256" \
+              --content-type "text/plain; charset=utf-8"
+            DEBS=$(jq -c --arg a "$ARCH" --arg url "${R2_BASE_URL}/$F" --arg sha "$SHA" --argjson size "$SIZE" \
+              '. + {($a): {url: $url, sha256: $sha, size: $size}}' <<<"$DEBS")
+          done
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --argjson debs "$DEBS" \
+            --arg releaseNotesUrl "${R2_BASE_URL}/WindInput-${VERSION}-Release.md" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            '{version: $version, tag: $tag, channel: "stable", debs: $debs,
+              releaseNotesUrl: $releaseNotesUrl, publishedAt: $publishedAt}' > latest-linux.json
+          cat latest-linux.json
+          wrangler r2 object put --remote "$R2_BUCKET/latest-linux.json" \
+            --file latest-linux.json --content-type "application/json; charset=utf-8"
+
       - name: 校验 R2 公开地址可达
         if: steps.gate.outputs.skip != 'true'
         run: |
@@ -270,6 +319,14 @@ jobs:
             check "${R2_BASE_URL}/WindInput-${VERSION}-macOS.pkg.sha256" ""
             check "${R2_BASE_URL}/latest-mac.json" ""
           fi
+          if [ "${{ steps.dl.outputs.linux }}" = "true" ]; then
+            for ARCH in amd64 arm64; do
+              F="WindInput-${VERSION}-linux-${ARCH}.deb"
+              check "${R2_BASE_URL}/$F" "$(stat -c %s "./dl/$F")"
+              check "${R2_BASE_URL}/$F.sha256" ""
+            done
+            check "${R2_BASE_URL}/latest-linux.json" ""
+          fi
           echo "R2 对象全部校验通过。"
 
       # 校验通过后才清理旧版本,失败时旧版本原样留着仍可下载。
@@ -281,18 +338,21 @@ jobs:
           PREV_VERSION: ${{ steps.prev.outputs.version }}
           PREV_MAC: ${{ steps.prev.outputs.mac_version }}
           MAC_SYNCED: ${{ steps.dl.outputs.mac }}
+          PREV_LINUX: ${{ steps.prev.outputs.linux_version }}
+          LINUX_SYNCED: ${{ steps.dl.outputs.linux }}
         run: |
-          # macOS 侧此刻指向的版本:本次同步了就是新版本,没同步则仍是原来那个。
+          # macOS / Linux 侧此刻指向的版本:本次同步了就是新版本,没同步则仍是原来那个。
           if [ "$MAC_SYNCED" = "true" ]; then MAC_CUR="$VERSION"; else MAC_CUR="$PREV_MAC"; fi
+          if [ "$LINUX_SYNCED" = "true" ]; then LINUX_CUR="$VERSION"; else LINUX_CUR="$PREV_LINUX"; fi
 
           if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$VERSION" ]; then
             echo "清理 Windows 旧版本: $PREV_VERSION"
             wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe" || true
             wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe.sha256" || true
-            # 发布说明两平台共用同一份。mac 元数据还指着它时不能删 ——
-            # 两平台版本可能不同步(比如某次只发了 Windows),删了 mac 用户的「更新说明」就 404。
-            if [ "$MAC_CUR" = "$PREV_VERSION" ]; then
-              echo "  发布说明 $PREV_VERSION 仍被 macOS 元数据引用,保留"
+            # 发布说明各平台共用同一份。mac / Linux 元数据还指着它时不能删 ——
+            # 各平台版本可能不同步(比如某次只发了 Windows),删了对方用户的「更新说明」就 404。
+            if [ "$MAC_CUR" = "$PREV_VERSION" ] || [ "$LINUX_CUR" = "$PREV_VERSION" ]; then
+              echo "  发布说明 $PREV_VERSION 仍被其它平台元数据引用,保留"
             else
               wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_VERSION}-Release.md" || true
             fi
@@ -307,4 +367,15 @@ jobs:
             wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_MAC}-macOS.pkg.sha256" || true
           else
             echo "macOS: 无需清理(本次同步=${MAC_SYNCED:-false}, 前一版本=${PREV_MAC:-<none>})"
+          fi
+
+          # Linux:同 macOS,本次确实推了新包才清旧包。
+          if [ "$LINUX_SYNCED" = "true" ] && [ -n "$PREV_LINUX" ] && [ "$PREV_LINUX" != "$VERSION" ]; then
+            echo "清理 Linux 旧版本: $PREV_LINUX"
+            for ARCH in amd64 arm64; do
+              wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_LINUX}-linux-${ARCH}.deb" || true
+              wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_LINUX}-linux-${ARCH}.deb.sha256" || true
+            done
+          else
+            echo "Linux: 无需清理(本次同步=${LINUX_SYNCED:-false}, 前一版本=${PREV_LINUX:-<none>})"
           fi

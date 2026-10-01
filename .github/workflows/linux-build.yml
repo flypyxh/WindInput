@@ -1,0 +1,234 @@
+name: Linux Build (reusable)
+
+# Linux 安装包(.deb,amd64 + arm64)的构建流水线,只能被调用,不独立触发:
+#   - release.yml(tag 推送)与 release-linux.yml(手动,可单独发包)都 `uses:` 它。
+# 拆成「可调用的构建」+「独立入口」,是因为被调用的工作流不能申请比调用方更高的权限:
+# 「把 .deb 挂到 Release」要 contents: write,若和构建写在同一个文件里,release.yml 一调用
+# 整个文件就会因权限越界而校验失败。构建本身只读,挂 Release 留在 release-linux.yml 的 attach job。
+#
+# 为什么用 ubuntu-22.04 / ubuntu-22.04-arm 原生 runner、而不是容器或交叉编译:
+#   - 包要在 Ubuntu 22.04(glibc 2.35 / fcitx5 5.0.x)上装得上,在更新的 Debian/Ubuntu 系(含 Deepin 25)
+#     上也要装得上,所以必须在最老的目标基线上构建——更新的构建机会引入 GLIBC_2.38+ 符号;
+#   - arm64 用 GitHub 的原生 arm runner(公开仓免费),不用 qemu:Rust LTO 构建在模拟器上要几小时。
+#   所以 runner 镜像钉死 22.04,不用 -latest。
+#
+# 为什么是 .deb 而不是别的格式:addon 要进 fcitx5 进程、与发行版的 fcitx5 版本绑定,不是自带运行时的
+# 独立应用——Flatpak/AppImage 在这里都不成立。Debian/Ubuntu/Deepin 是当前验证过的目标;
+# rpm(Fedora/openSUSE)与 Arch(PKGBUILD)需要各自发行版上的实测,尚未做。
+#
+# 设置程序 wind-setting 仍是私有仓:没配 WIND_REPOS_TOKEN(fork 等)时整个 Linux 构建跳过并告警
+# (Linux 包的设置入口、.desktop、协议/文件关联都依赖它,不出残缺包)。产物 artifact:
+# dist-linux-amd64 / dist-linux-arm64(内含 WindInput-<版本>-linux-<架构>.deb + .sha256)。
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "产品版本(不带 v)"
+        required: true
+        type: string
+      ref:
+        description: "WindInput 源码的检出 ref(留空 = 触发本次运行的提交)"
+        required: false
+        type: string
+        default: ""
+      setting_ref:
+        description: "wind-setting 检出的分支/标签(留空 = 默认分支)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      WIND_REPOS_TOKEN:
+        description: "wind-setting 私有仓的读取 token;缺省则跳过 Linux 构建"
+        required: false
+    outputs:
+      built:
+        description: "是否实际构建了(没配 WIND_REPOS_TOKEN 时为 false)"
+        value: ${{ jobs.prep.outputs.can_build }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ───────────────────────── 门控 / Debian 版本号 ─────────────────────────
+  prep:
+    name: 门控
+    runs-on: ubuntu-22.04
+    outputs:
+      deb_version: ${{ steps.v.outputs.deb_version }}   # Debian 版本,预发布后缀用 ~ 以便排在正式版之前
+      can_build: ${{ steps.gate.outputs.can_build }}
+    env:
+      HAS_SETTING_TOKEN: ${{ secrets.WIND_REPOS_TOKEN != '' && 'true' || 'false' }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - id: v
+        run: |
+          # Debian 版本里 `-` 是「上游版本 / 打包修订」的分隔符,`0.123.0-dev.x` 会被当成修订号而排在
+          # 正式版 0.123.0 之后;预发布后缀改用 `~`(0.123.0~dev.x < 0.123.0),升级顺序才对。
+          D="${VERSION/-/"~"}"
+          echo "deb_version=$D" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION deb_version=$D"
+      - id: gate
+        run: |
+          if [ "$HAS_SETTING_TOKEN" = true ]; then
+            echo "can_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "can_build=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 secrets.WIND_REPOS_TOKEN,跳过 Linux 构建(设置程序是私有仓,Linux 包不出缺设置程序的残缺版)。"
+          fi
+
+  # ───────────────────────── 词库数据(架构无关,只做一次) ─────────────────────────
+  # 两个架构的包必须带同一份词库:各自下载生成,上游词库在两次下载之间变了就会产出内容不同的两个包。
+  data:
+    name: 词库数据
+    needs: prep
+    if: needs.prep.outputs.can_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wind_input
+      # dev.sh 的 gd 在 Linux 上默认转发到 Windows 编译机(build.local);CI 没有那台机器,
+      # WIND_BUILD_LOCAL=1 就地跑——词库数据与架构/平台无关,不受「本机产物不可发版」的限制
+      # (那条限制针对 cargo-xwin 交叉编的 exe/dll)。产物在 build_dev/data。
+      - name: 下载并组装词库
+        env:
+          WIND_BUILD_LOCAL: "1"
+        run: ./scripts/dev.sh gd
+      - name: 打包数据目录
+        run: tar -C build_dev -czf "$RUNNER_TEMP/linux-data.tar.gz" data
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-data
+          path: ${{ runner.temp }}/linux-data.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  # ───────────────────────── 构建 .deb ─────────────────────────
+  build:
+    name: Linux .deb (${{ matrix.arch }})
+    needs: [prep, data]
+    if: needs.prep.outputs.can_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false      # 一个架构挂了不拖着另一个:先发出能发的
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      VERSION: ${{ inputs.version }}
+      DEB_VERSION: ${{ needs.prep.outputs.deb_version }}
+    steps:
+      # 目录布局同其他平台:wind-setting 以 path 依赖引用 ../wind-ui-rust 与 ../WindInput。
+      - name: 检出 WindInput
+        uses: actions/checkout@v7
+        with:
+          path: WindInput
+          ref: ${{ inputs.ref || github.sha }}
+      - name: 检出 wind-ui-rust (wind-setting 的 path 依赖)
+        uses: actions/checkout@v7
+        with:
+          repository: huanfeng/wind-ui-rust
+          path: wind-ui-rust
+      - name: 检出 wind-setting (私有仓,需 WIND_REPOS_TOKEN)
+        uses: actions/checkout@v7
+        with:
+          repository: huanfeng/wind-setting
+          path: wind-setting
+          ref: ${{ inputs.setting_ref }}
+          token: ${{ secrets.WIND_REPOS_TOKEN }}
+          # token 不留在 .git/config：后面 cargo build 会执行全部依赖的 build.rs，不该让它们读得到
+          persist-credentials: false
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev \
+            libxcb1-dev libxcb-shape0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 与 build-deb.sh 的 SERVICE_TARGET / SETTING_TARGET 对应(默认 target/ 位置),缓存才命中
+          workspaces: |
+            WindInput/wind_input
+            wind-ui-rust
+            wind-setting
+
+      - name: 写入 docs/VERSION
+        working-directory: WindInput
+        run: printf '%s' "$VERSION" > docs/VERSION
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-data
+          path: ${{ runner.temp }}/data-in
+      - name: 解出词库数据
+        run: |
+          mkdir -p "$RUNNER_TEMP/data-out"
+          tar -C "$RUNNER_TEMP/data-out" -xzf "$RUNNER_TEMP/data-in/linux-data.tar.gz"
+
+      - name: 构建 .deb
+        env:
+          APP_VERSION: ${{ inputs.version }}
+          SRC_DIR: ${{ github.workspace }}/WindInput
+          SETTING_DIR: ${{ github.workspace }}/wind-setting
+          DATA_DIR: ${{ runner.temp }}/data-out/data
+          WORK_DIR: ${{ runner.temp }}/deb-work
+          OUT_DIR: ${{ runner.temp }}/deb-out
+          SERVICE_TARGET: ${{ github.workspace }}/WindInput/wind_input/target
+          SETTING_TARGET: ${{ github.workspace }}/wind-setting/target
+        run: bash WindInput/scripts/linux/build-deb.sh
+
+      - name: 核对 .deb(架构 / ELF / glibc / 文件齐全 / 权限)
+        run: |
+          shopt -s failglob
+          bash WindInput/scripts/linux/verify-deb.sh "$RUNNER_TEMP"/deb-out/windinput_*.deb "${{ matrix.arch }}"
+
+      # 在 22.04 上真装一次:apt 解析 Depends(arm64 与 amd64 的包名可用性不同,只有真装才知道),
+      # 并确认三个 ELF 没有缺的动态库——「装得上、一加载就找不到 so」是这类包最常见的静默坏法。
+      - name: 安装冒烟(依赖可解析 / 无缺失动态库 / 能卸载)
+        run: |
+          shopt -s failglob
+          sudo apt-get install -y "$RUNNER_TEMP"/deb-out/windinput_*.deb
+          rc=0
+          for f in /usr/lib/windinput/wind_input /usr/lib/windinput/wind_setting \
+                   /usr/lib/*/fcitx5/libwindinput.so; do
+            if ldd "$f" | grep 'not found'; then echo "::error::$f 有缺失的动态库"; rc=1; fi
+          done
+          [ "$rc" = 0 ] || exit 1
+          bash -n /usr/bin/windinput-setup
+          sudo apt-get remove -y windinput
+          [ ! -e /usr/lib/windinput/wind_input ] || { echo "::error::卸载后文件残留"; exit 1; }
+
+      # 发布资产名与其他平台同口径:WindInput-<版本>-<平台>.<扩展名> + 同名 .sha256 sidecar
+      # (格式对齐 sha256sum,下游校验脚本按第一列取值)。
+      - name: 重命名为发布资产名并生成 sha256
+        run: |
+          shopt -s failglob
+          mkdir -p dist
+          cp "$RUNNER_TEMP"/deb-out/windinput_*.deb "dist/WindInput-${VERSION}-linux-${{ matrix.arch }}.deb"
+          cd dist
+          sha256sum "WindInput-${VERSION}-linux-${{ matrix.arch }}.deb" > "WindInput-${VERSION}-linux-${{ matrix.arch }}.deb.sha256"
+          cat ./*.sha256
+          ls -lh
+
+      # 名字走 dist-* 口径:release.yml 的 publish 按 `pattern: dist-*` 汇总。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          if-no-files-found: error
+          retention-days: 14
+

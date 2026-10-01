@@ -1,0 +1,103 @@
+name: Release Linux
+
+# Linux 安装包的独立入口(手动触发)——「Linux 先独立发包」,不必等 Windows / macOS 两条重流水线:
+#   gh workflow run release-linux.yml                       # 不填 tag:只产出可测 artifact,不发 Release
+#   gh workflow run release-linux.yml -f tag=v0.123.0       # 构建该 tag 的源码,.deb 挂到该 tag 的 Release
+#                                                           # (Release 不存在则建草稿,不直接发布)
+# 构建流水线本体在 linux-build.yml(与 release.yml 共用,为什么拆开见该文件头)。
+#
+# 之后 tag 推送触发 release.yml 时会对同一个 tag 再构建一遍 Linux 并 --clobber 式覆盖同名资产,
+# 与独立发的包不冲突(版本号同源于 tag)。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "把 .deb 挂到该 tag 的 Release(如 v0.123.0,tag 须已存在);留空只产出 artifact"
+        required: false
+        type: string
+        default: ""
+      setting_ref:
+        description: "wind-setting 检出的分支/标签(留空 = 默认分支;合并前实测 Linux 适配用 feat/linux-port)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read            # 默认只读;仅 attach job 提权到 write
+
+jobs:
+  prep:
+    name: 确定版本号
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - id: v
+        env:
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          # 工作流文件取自触发时选的分支，构建脚本却取自 tag 的源码：早于 Linux 接入的 tag 里没有它们，
+          # 与其在构建深处报「找不到文件」，不如这里说清楚。
+          for f in scripts/linux/build-deb.sh scripts/linux/verify-deb.sh; do
+            [ -f "$f" ] || { echo "::error::${IN_TAG:-当前提交} 的源码里没有 $f——该 tag 早于 Linux 接入，不能用本工作流补包。"; exit 1; }
+          done
+          if [ -n "$IN_TAG" ]; then
+            V="${IN_TAG#v}"
+          else
+            V="$(tr -d '[:space:]' < docs/VERSION)-dev.${GITHUB_SHA:0:8}"   # 手动触发:开发占位版本
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "build version = $V"
+
+  build:
+    name: Linux .deb
+    needs: prep
+    uses: ./.github/workflows/linux-build.yml
+    secrets:
+      WIND_REPOS_TOKEN: ${{ secrets.WIND_REPOS_TOKEN }}
+    with:
+      version: ${{ needs.prep.outputs.version }}
+      ref: ${{ inputs.tag }}
+      setting_ref: ${{ inputs.setting_ref }}
+
+  # ───────────────────────── 挂到指定 tag 的 Release(填了 tag 才跑) ─────────────────────────
+  attach:
+    name: 挂到 Release ${{ inputs.tag }}
+    needs: [prep, build]
+    if: inputs.tag != '' && needs.build.outputs.built == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    # 与 release.yml 的 publish / attach-linux 共用一个组：先查后建 Release 是 TOCTOU，并发会建出两个草稿
+    concurrency:
+      group: release-${{ inputs.tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.prep.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-linux-*
+          merge-multiple: true
+          path: dist
+      - name: 核对两个架构都在
+        run: |
+          ls -lh dist
+          for a in amd64 arm64; do
+            [ -f "dist/WindInput-${VERSION}-linux-${a}.deb" ] || { echo "缺 $a 的 .deb" >&2; exit 1; }
+          done
+      # Release 不存在就建草稿(不发布):草稿由人工审过再点 Publish;后续 release.yml 对同一 tag
+      # 建 Release 时会复用这个草稿并追加 Windows / macOS 产物。
+      - name: 创建或更新 Release 并上传
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --verify-tag --title "清风输入法 v${VERSION}" \
+              --notes "Linux 测试版安装包(Ubuntu 22.04+ / Debian 系,含 Deepin)。Windows / macOS 安装包随后补充。"
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
