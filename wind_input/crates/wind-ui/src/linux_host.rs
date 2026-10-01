@@ -6,9 +6,21 @@
 //!
 //! ⚠ 服务进程由 systemd 用户单元拉起时可能没有 `WAYLAND_DISPLAY` / `DISPLAY`，此时选不到
 //! 后端；安装单元须 `import-environment`，或由 addon 拉起服务以继承会话环境。
+//!
+//! 剪贴板命令一律限时（[`TIMEOUT`]）：X11 选区与 Wayland 剪贴板都要持有方应答，持有方挂住时
+//! `xclip -o` / `wl-paste` 会一直等，调用线程跟着挂。超时即杀子进程并回收，按失败处理。
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{Read, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// 剪贴板命令的最长等待。正常情况下几十毫秒内返回。
+const TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 子进程退出后，等旁线程把管道读完 / 写完的宽限。子进程自己 fork 出去的后代还占着管道时
+/// 读写线程会一直阻塞，到点就不等它了（线程随管道关闭自行结束）。
+const PIPE_GRACE: Duration = Duration::from_millis(200);
 
 /// 剪贴板后端。按会话类型择一：有 `WAYLAND_DISPLAY` 优先 wl-clipboard，否则 X11 工具。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,26 +61,89 @@ fn no_backend() -> anyhow::Error {
     )
 }
 
-fn pipe_into(mut cmd: Command, data: &[u8]) -> anyhow::Result<()> {
-    let name = format!("{:?}", cmd.get_program());
+/// 等子进程退出，最多 `timeout`；到点就杀掉并回收（不留僵尸），报错。
+fn wait_timeout(child: &mut Child, name: &str, timeout: Duration) -> anyhow::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{name} 超过 {timeout:?} 未结束，已终止");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn program_name(cmd: &Command) -> String {
+    format!("{:?}", cmd.get_program())
+}
+
+fn pipe_into(cmd: Command, data: &[u8]) -> anyhow::Result<()> {
+    pipe_into_within(cmd, data, TIMEOUT)
+}
+
+fn pipe_into_within(mut cmd: Command, data: &[u8], timeout: Duration) -> anyhow::Result<()> {
+    let name = program_name(&cmd);
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| anyhow::anyhow!("{name} 启动失败: {e}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(data)
-            .map_err(|e| anyhow::anyhow!("{name} 写入失败: {e}"))?;
+    // 写在旁线程：对端不读时 write_all 会卡在写满的管道上，限时就无从谈起。写完 drop 掉
+    // stdin 让对端读到 EOF；xclip / wl-copy 随后自行转入后台持有选区，wait 很快返回。
+    let mut stdin = child.stdin.take();
+    let data = data.to_vec();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = stdin.as_mut().map_or(Ok(()), |s| s.write_all(&data));
+        drop(stdin);
+        let _ = tx.send(r);
+    });
+    let status = wait_timeout(&mut child, &name, timeout)?;
+    match rx.recv_timeout(PIPE_GRACE) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => anyhow::bail!("{name} 写入失败: {e}"),
+        Err(_) => anyhow::bail!("{name} 已退出，但数据没写完"),
     }
-    // 关掉 stdin 让对端读到 EOF；xclip/wl-copy 随后自行转入后台持有选区，wait 很快返回。
-    drop(child.stdin.take());
-    let status = child.wait()?;
     if !status.success() {
         anyhow::bail!("{name} 退出码非零: {status}");
     }
     Ok(())
+}
+
+/// 跑一条命令取 stdout，限时 `timeout`。
+fn capture_within(mut cmd: Command, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    let name = program_name(&cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("{name} 启动失败: {e}"))?;
+    // 读在旁线程：输出大于管道容量时，不边读边等子进程就会互相卡住。
+    let mut stdout = child.stdout.take();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let r = stdout
+            .as_mut()
+            .map_or(Ok(0), |s| s.read_to_end(&mut buf))
+            .map(|_| buf);
+        let _ = tx.send(r);
+    });
+    let status = wait_timeout(&mut child, &name, timeout)?;
+    let out = match rx.recv_timeout(PIPE_GRACE) {
+        Ok(r) => r.map_err(|e| anyhow::anyhow!("{name} 读取失败: {e}"))?,
+        Err(_) => anyhow::bail!("{name} 已退出，但输出管道仍被占着"),
+    };
+    if !status.success() {
+        anyhow::bail!("{name} 退出码非零: {status}");
+    }
+    Ok(out)
 }
 
 /// 写文本剪贴板。
@@ -93,7 +168,7 @@ pub fn get_text() -> String {
     let Some(backend) = pick_backend() else {
         return String::new();
     };
-    let mut cmd = match backend {
+    let cmd = match backend {
         Backend::WlClipboard => {
             let mut c = Command::new("wl-paste");
             c.args(["--no-newline", "--type", "text"]);
@@ -110,9 +185,12 @@ pub fn get_text() -> String {
             c
         }
     };
-    match cmd.stdin(Stdio::null()).stderr(Stdio::null()).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => String::new(),
+    match capture_within(cmd, TIMEOUT) {
+        Ok(out) => String::from_utf8_lossy(&out).into_owned(),
+        Err(e) => {
+            tracing::debug!("读剪贴板失败: {e}");
+            String::new()
+        }
     }
 }
 
@@ -157,5 +235,103 @@ mod tests {
             assert!(set_text("x").is_err());
             assert_eq!(get_text(), "");
         }
+    }
+
+    /// 本测试独占的临时目录（进程号 + 用例名，并发用例不撞）。
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wind_lh_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 假剪贴板工具：不读 stdin、不写 stdout，起一个后代 `sleep` 一直占着继承来的管道——
+    /// 模拟持有方挂住时的 `xclip` / `wl-paste`。故意不 `exec`：杀掉的是 sh，后代还占着管道，
+    /// 正好覆盖「子进程死了、管道没关」那条路。
+    fn hanging_tool(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// 本进程名下处于 Z（僵尸）态、进程名为 `comm` 的子进程数。
+    fn zombies_named(comm: &str) -> usize {
+        let me = std::process::id().to_string();
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+            .filter(|stat| {
+                // 「pid (comm) state ppid …」；comm 可含空格，按最后一个 ')' 切。
+                let Some((head, tail)) = stat.rsplit_once(')') else {
+                    return false;
+                };
+                let name = head.split_once('(').map_or("", |(_, n)| n);
+                let mut f = tail.split_whitespace();
+                let (state, ppid) = (f.next(), f.next());
+                name == comm && state == Some("Z") && ppid == Some(me.as_str())
+            })
+            .count()
+    }
+
+    #[test]
+    fn hanging_reader_times_out_and_is_reaped() {
+        let dir = scratch("read");
+        let tool = hanging_tool(&dir, "wifakepaste");
+        let t = Instant::now();
+        let r = capture_within(Command::new(&tool), Duration::from_millis(300));
+        assert!(r.is_err(), "挂住的读取应当报错");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(zombies_named("wifakepaste"), 0, "超时杀掉的子进程要回收");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 工具自己退出了，但留下的后代还占着 stdout（xclip / wl-copy 会 fork 到后台）：
+    /// 读线程等不到 EOF，过了宽限就放弃，不陪着它挂。
+    #[test]
+    fn descendant_holding_stdout_does_not_hang_reader() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("detach");
+        let p = dir.join("wifakedetach");
+        std::fs::write(&p, "#!/bin/sh\nsleep 5 &\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let t = Instant::now();
+        assert!(capture_within(Command::new(&p), TIMEOUT).is_err());
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hanging_writer_times_out_and_is_reaped() {
+        let dir = scratch("write");
+        let tool = hanging_tool(&dir, "wifakecopy");
+        // 远大于管道容量（64 KiB）：对端不读时 write_all 必然卡住，验证写不阻塞限时。
+        let data = vec![b'x'; 1 << 20];
+        let t = Instant::now();
+        let r = pipe_into_within(Command::new(&tool), &data, Duration::from_millis(300));
+        assert!(r.is_err(), "挂住的写入应当报错");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(zombies_named("wifakecopy"), 0, "超时杀掉的子进程要回收");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正常的工具照常工作：读到 stdout、写进去的字节对端读得到。
+    #[test]
+    fn well_behaved_tools_round_trip() {
+        let dir = scratch("ok");
+        let out = dir.join("got");
+        let mut c = Command::new("sh");
+        c.args(["-c", &format!("cat > '{}'", out.display())]);
+        pipe_into_within(c, "清风".as_bytes(), TIMEOUT).unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "清风");
+        let mut c = Command::new("cat");
+        c.arg(&out);
+        assert_eq!(capture_within(c, TIMEOUT).unwrap(), "清风".as_bytes());
+        let mut c = Command::new("sh");
+        c.args(["-c", "exit 3"]);
+        assert!(capture_within(c, TIMEOUT).is_err(), "退出码非零按失败");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

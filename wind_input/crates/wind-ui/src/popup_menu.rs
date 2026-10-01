@@ -1675,11 +1675,16 @@ pub fn get_clipboard_text() -> String {
     crate::linux_host::get_text()
 }
 
-/// Linux 外部宿主形态：没有剪贴板变更序列号可用于失效判定，且每次读都要起子进程，
-/// 故缓存版目前直接读一次。调用方（联想 / 剪贴板反查）本就是按需触发，不在热路径上。
+/// Linux 外部宿主形态：返回空串（同 Windows / macOS 以外的「拿不到就空」）。
+///
+/// 调用点在**每次按键的候选构建期**（候选含 `{clip()}` 时拼显示标签），这里读一次就要起一个
+/// `wl-paste` / `xclip` 子进程，剪贴板持有方挂住时按键线程跟着挂（最长到命令超时）。
+/// Linux 没有 Windows 的剪贴板序列号 / macOS 的 changeCount 可做廉价失效判定，缓存无从谈起。
+/// 代价：Linux 上这类候选的显示标签里剪贴板那段为空；执行动作走的是 [`get_clipboard_text`]，
+/// 不受影响。
 #[cfg(all(target_os = "linux", ext_presenter))]
 pub fn get_clipboard_text_cached() -> String {
-    crate::linux_host::get_text()
+    String::new()
 }
 
 /// 读剪贴板文本（其它非 Windows mock：返回空串）。
