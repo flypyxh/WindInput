@@ -25,6 +25,9 @@ use crate::popup_menu::{LevelKey, PopupMenu, set_host_work_area};
 
 const LEVELS: usize = OVERLAY_MENU_LEVELS as usize;
 
+/// 建 SHM 段的函数。测试注入一个必失败的，覆盖「段建不起来」这条路。
+type CreateShm = fn(&str, usize) -> std::io::Result<PosixSharedMemory>;
+
 pub(crate) struct MenuHost {
     menu: Option<PopupMenu>,
     events: std::sync::mpsc::Sender<UiEvent>,
@@ -35,6 +38,7 @@ pub(crate) struct MenuHost {
     /// 最近一次指针位置：`MenuAnchor` 的 `i32::MIN` 哨兵（「更多…」弹主菜单）取它，
     /// 对位 Windows 的 `GetCursorPos`。
     last_pointer: Option<(i32, i32)>,
+    create_shm: CreateShm,
 }
 
 impl MenuHost {
@@ -49,6 +53,7 @@ impl MenuHost {
             shms: (0..LEVELS).map(|_| None).collect(),
             pushed: vec![None; LEVELS],
             last_pointer: None,
+            create_shm: PosixSharedMemory::create,
         }
     }
 
@@ -140,7 +145,26 @@ impl MenuHost {
     }
 
     /// 把各级的当前帧与上次推过的比对，变了的写 SHM + 推帧，消失的推隐藏帧。
+    ///
+    /// 第 0 级推不出去（SHM 段建不起来 / 位图无效）时屏上根本没有菜单，协调器却已标记
+    /// `menu_open`：就地收掉菜单并回送 `MenuClose`，否则方向键 / 回车 / Esc 会被一个看不见的
+    /// 菜单吞掉，直到空闲超时。子菜单级推不出去不收：顶层还在，键盘照常可用。
     fn sync(&mut self, sink: &dyn HostRenderSink) {
+        if self.push_levels(sink) {
+            return;
+        }
+        tracing::warn!("菜单顶层推不出帧，收起菜单");
+        if let Some(m) = &mut self.menu {
+            m.hide();
+        }
+        let _ = self.events.send(UiEvent::MenuClose);
+        // 此前推过的级（顶层上一帧、子菜单）补推隐藏帧。
+        self.push_levels(sink);
+    }
+
+    /// [`Self::sync`] 的推帧部分。返回 false = 第 0 级有内容却没推出去。
+    fn push_levels(&mut self, sink: &dyn HostRenderSink) -> bool {
+        let mut top_ok = true;
         let frames = self
             .menu
             .as_ref()
@@ -159,9 +183,13 @@ impl MenuHost {
                         || bytes > MAX_SHARED_RENDER_SIZE - SharedRenderHeader::SIZE
                     {
                         tracing::warn!("菜单第 {k} 级位图 {w}x{h} 无效或过大，丢弃");
+                        top_ok &= k != 0;
                         continue;
                     }
-                    let Some(shm) = ensure_shm(&mut self.shms[k], &self.suffix, kind) else {
+                    let Some(shm) =
+                        ensure_shm(&mut self.shms[k], &self.suffix, kind, self.create_shm)
+                    else {
+                        top_ok &= k != 0;
                         continue;
                     };
                     let seq = shm.write_frame(0, 0, w, h, &f.buf[..bytes]);
@@ -200,6 +228,7 @@ impl MenuHost {
                 }
             }
         }
+        top_ok
     }
 }
 
@@ -207,10 +236,11 @@ fn ensure_shm<'a>(
     slot: &'a mut Option<PosixSharedMemory>,
     suffix: &str,
     kind: u32,
+    create: CreateShm,
 ) -> Option<&'a mut PosixSharedMemory> {
     if slot.is_none() {
         let name = wind_bridge::endpoint::overlay_shm_name(suffix, kind)?;
-        match PosixSharedMemory::create(&name, MAX_SHARED_RENDER_SIZE) {
+        match create(&name, MAX_SHARED_RENDER_SIZE) {
             Ok(s) => *slot = Some(s),
             Err(e) => {
                 tracing::warn!("create menu SHM {name} failed: {e}");
@@ -417,6 +447,40 @@ mod tests {
         h.pointer(&cap, MenuPointerEvent::Move, 1, 1);
         assert_eq!(events(&rx), vec!["MenuClose".to_string()]);
         assert!(cap.take().is_empty());
+    }
+
+    /// SHM 段建不起来：顶层推不出帧，屏上没有菜单。必须当场回送 `MenuClose`、菜单不留在
+    /// 「可见」态——否则协调器的 `menu_open` 一直为真，下一个方向键 / 回车被吞。
+    #[test]
+    fn top_level_shm_failure_closes_menu_and_reports_close() {
+        let (mut h, rx, cap) = host();
+        h.create_shm = |_, _| Err(std::io::Error::other("注入的失败"));
+        h.show(&cap, items(), MenuAnchor::at_point(100, 100));
+        assert_eq!(events(&rx), vec!["MenuClose".to_string()]);
+        assert!(cap.take().is_empty(), "没推出过帧，也就没有隐藏帧可补");
+        assert!(!h.menu.as_ref().unwrap().is_visible(), "菜单已收起");
+        // 之后再来的菜单键走自愈路径（不可见 → 再回一条 MenuClose），不会被当成导航。
+        h.key(&cap, 0x28);
+        assert_eq!(events(&rx), vec!["MenuClose".to_string()]);
+    }
+
+    /// 顶层推过之后才推不出：收菜单时把此前推过的那一帧补推成隐藏帧，宿主那边不留残影。
+    #[test]
+    fn top_level_push_failure_after_success_hides_the_pushed_frame() {
+        let (mut h, rx, cap) = host();
+        h.show(&cap, items(), MenuAnchor::at_point(100, 100));
+        assert_eq!(cap.take().len(), 1);
+        // 丢掉已建好的段，下次推帧要重建——让它失败。
+        h.shms[0] = None;
+        h.create_shm = |_, _| Err(std::io::Error::other("注入的失败"));
+        h.key(&cap, 0x28); // 高亮变化 → 顶层要重推
+        assert_eq!(events(&rx), vec!["MenuClose".to_string()]);
+        let f = cap.take();
+        assert_eq!(
+            f.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(),
+            vec![(OVERLAY_KIND_MENU, false)],
+            "补推一帧隐藏：{f:?}"
+        );
     }
 
     #[test]
