@@ -211,15 +211,19 @@ pub fn set_png(png: &[u8]) -> anyhow::Result<()> {
     }
 }
 
-/// 按默认应用打开路径 / URL（不等待）。
+/// 按默认应用打开路径 / URL（不等待；后台回收，不留僵尸）。
+///
+/// 不限时：调用方本就不等它，而 xdg-open 在部分桌面上会前台跑到被打开的程序退出，
+/// 到点杀它可能连带杀掉被打开的程序。
 pub fn open(target: &str) -> std::io::Result<()> {
-    Command::new("xdg-open")
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+    crate::manager::spawn_reaped(
+        Command::new("xdg-open")
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

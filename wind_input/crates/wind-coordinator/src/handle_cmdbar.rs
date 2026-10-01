@@ -418,7 +418,7 @@ impl ProcessRunner for CoordProc {
         // 不等待的两种情形：显式 `wait="0"`，以及 `toast="off"`（要它闭嘴，就没有
         // 任何理由再接管道、再挂一个等待线程去把输出读回来扔掉）。
         if spec.wait_ms == 0 || spec.toast == "off" {
-            cmd.spawn()?;
+            spawn_reaped(&mut cmd)?;
             return Ok(());
         }
         cmd.env(WIND_CLI_PIPED_ENV, "1")
@@ -704,8 +704,30 @@ fn shell_spawn(cmdline: &str, cwd: &str) -> anyhow::Result<()> {
     if !cwd.is_empty() {
         c.current_dir(cwd);
     }
-    c.spawn()?;
+    spawn_reaped(&mut c)?;
     Ok(())
+}
+
+/// 启动外部程序、不等它结束。unix 上另起一个线程 `wait` 回收：不 wait 的子进程退出后成为
+/// 僵尸，常驻服务每启动一次外部程序就留一个。不用 `SIGCHLD = SIG_IGN` 省掉这条线程——那会让
+/// 别处的 `.output()` / `wait` 拿到 ECHILD。Windows 没有僵尸，直接放手（同改动前）。
+/// 返回子进程号。
+pub(crate) fn spawn_reaped(cmd: &mut Command) -> std::io::Result<u32> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    #[cfg(unix)]
+    if let Err(e) = std::thread::Builder::new()
+        .name("wind-reap".into())
+        // 只做一次阻塞 wait，用不着默认的 2 MiB 栈。
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        warn!("回收线程起不来，子进程 {pid} 退出后会留下僵尸: {e}");
+    }
+    Ok(pid)
 }
 
 /// 被启动进程落到默认工作目录的原因（供调用方拼 WARN；纯函数不直接记日志以便单测）。
@@ -1069,5 +1091,38 @@ mod cli_toast_tests {
         // 字符中间 panic。契约是"非法返回 None"，故这里必须也是 None。
         assert_eq!(parse_hex_rgba("#中中"), None);
         assert_eq!(parse_hex_rgba("#αβγδ"), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod reap_tests {
+    use super::spawn_reaped;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// `pid` 还是不是本进程名下的子进程（活着或僵尸都算）。
+    fn still_my_child(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // 「pid (comm) state ppid …」；comm 可含空格，按最后一个 ')' 切。
+        let mut f = stat.rsplit_once(')')?.1.split_whitespace();
+        let state = f.next()?.chars().next()?;
+        let ppid: u32 = f.next()?.parse().ok()?;
+        (ppid == std::process::id()).then_some(state)
+    }
+
+    /// 立即退出的子进程须被回收：不 wait 的话它会一直挂在 Z 态。
+    #[test]
+    fn exited_child_is_reaped_not_left_as_zombie() {
+        let pid = spawn_reaped(&mut Command::new("true")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = still_my_child(pid);
+        while last.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            last = still_my_child(pid);
+        }
+        assert_eq!(
+            last, None,
+            "子进程 {pid} 退出 5 秒后仍挂在本进程名下（状态 {last:?}）"
+        );
     }
 }

@@ -1349,13 +1349,32 @@ pub(crate) fn open_path(path: &str) {
 /// 与 Windows 的 `ShellExecuteW("open", ...)` 语义对齐。
 #[cfg(target_os = "macos")]
 pub(crate) fn open_path(path: &str) {
-    match std::process::Command::new("/usr/bin/open")
-        .arg(path)
-        .spawn()
-    {
+    match spawn_reaped(std::process::Command::new("/usr/bin/open").arg(path)) {
         Ok(_) => debug!("open_path: {path}"),
         Err(e) => tracing::warn!("open_path 失败 {path}: {e}"),
     }
+}
+
+/// 启动外部程序、不等它结束，另起一个线程 `wait` 回收：不 wait 的子进程退出后成为僵尸，
+/// 常驻服务每打开一次路径 / 程序就留一个。不用 `SIGCHLD = SIG_IGN` 省掉这条线程——那会让
+/// 别处的 `.output()` / `wait` 拿到 ECHILD。返回子进程号。
+/// （wind-coordinator 的 `handle_cmdbar::spawn_reaped` 是同一件事：两个 crate 都要用，
+/// 又没有合适的共同依赖。）
+#[cfg(ext_presenter)]
+pub(crate) fn spawn_reaped(cmd: &mut std::process::Command) -> std::io::Result<u32> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    if let Err(e) = std::thread::Builder::new()
+        .name("wind-reap".into())
+        // 只做一次阻塞 wait，用不着默认的 2 MiB 栈。
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        tracing::warn!("回收线程起不来，子进程 {pid} 退出后会留下僵尸: {e}");
+    }
+    Ok(pid)
 }
 
 /// Linux 外部宿主形态：交给 xdg-open。
@@ -1410,9 +1429,9 @@ pub(crate) fn open_app(path: &str, args: &str) {
         if !argv.is_empty() {
             c.arg("--args").args(&argv);
         }
-        c.spawn()
+        spawn_reaped(&mut c)
     } else {
-        std::process::Command::new(path).args(&argv).spawn()
+        spawn_reaped(std::process::Command::new(path).args(&argv))
     };
     match spawned {
         Ok(_) => debug!("open_app: {path} {args}"),
@@ -1660,5 +1679,38 @@ mod menu_id_tests {
                 "{base}+256 超出 u8 载荷，不得截断成段内命令"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", ext_presenter))]
+mod reap_tests {
+    use super::spawn_reaped;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// `pid` 还是不是本进程名下的子进程（活着或僵尸都算），是则返回状态字母。
+    fn still_my_child(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // 「pid (comm) state ppid …」；comm 可含空格，按最后一个 ')' 切。
+        let mut f = stat.rsplit_once(')')?.1.split_whitespace();
+        let state = f.next()?.chars().next()?;
+        let ppid: u32 = f.next()?.parse().ok()?;
+        (ppid == std::process::id()).then_some(state)
+    }
+
+    /// 立即退出的子进程须被回收：不 wait 的话它会一直挂在 Z 态。
+    #[test]
+    fn exited_child_is_reaped_not_left_as_zombie() {
+        let pid = spawn_reaped(&mut Command::new("true")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = still_my_child(pid);
+        while last.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            last = still_my_child(pid);
+        }
+        assert_eq!(
+            last, None,
+            "子进程 {pid} 退出 5 秒后仍挂在本进程名下（状态 {last:?}）"
+        );
     }
 }

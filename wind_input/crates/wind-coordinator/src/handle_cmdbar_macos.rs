@@ -23,7 +23,7 @@ pub(crate) fn open_native(target: &str) -> anyhow::Result<()> {
     } else {
         "xdg-open"
     };
-    Command::new(opener).arg(target).spawn()?;
+    crate::handle_cmdbar::spawn_reaped(Command::new(opener).arg(target))?;
     Ok(())
 }
 
@@ -37,7 +37,7 @@ pub(crate) fn run_native(cmd: &str, args: &[String], cwd: &str) -> anyhow::Resul
     if !cwd.is_empty() {
         c.current_dir(cwd);
     }
-    c.spawn()?;
+    crate::handle_cmdbar::spawn_reaped(&mut c)?;
     Ok(())
 }
 
