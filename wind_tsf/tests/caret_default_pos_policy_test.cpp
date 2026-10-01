@@ -13,6 +13,7 @@
 //   - IsHostDefaultPosition 把 hasCompStart/hasCompRect 缺席当放行      → TestFingerprint 红
 //   - LatchApplies 改成只看 latched（= 忘了加组合作用域那一版）         → TestLatchScope 红
 //   - SameRect 任一成员比较去掉                                          → TestSameRect 红
+//   - AllowCompositionRectFallback 任一前提去掉（含 !hostDefaultPos，2026-09-30） → TestCompositionRectFallback 红
 // 改测试时请保住这个性质——一条永远绿的测试不会告诉你任何事。
 //
 // ⚠️ 覆盖边界：这里测的只是**判据**。矩形怎么取、闩什么时候置、`_pComposition` 在哪几个
@@ -80,6 +81,13 @@ void TestFingerprint()
     //   「候选窗钉在屏幕左上角」——本条是整个修复的存活判据。
     CHECK(IsHostDefaultPosition(kIllustrator, true, kIllustrator, true, kIllustrator));
 
+    CASE("IsHostDefaultPosition：CUAS 上的 Java 宿主同形，必须命中");
+    // 医疗 HIS/LIS 的 Java 客户端实测（2026-09-30，1920×1040 工作区）。二级降级靠本判据
+    // 让路给 IMM32 那一级；不再命中的话，窗口一最大化这个角点就会被当作组合矩形采信，
+    // 候选窗整场钉在屏幕右缘。
+    constexpr Rect kJavaCuas{1919, 1039, 1920, 1039};
+    CHECK(IsHostDefaultPosition(kJavaCuas, true, kJavaCuas, true, kJavaCuas));
+
     CASE("IsHostDefaultPosition：有高度就不是「没有插入点」");
     // 正常宿主：矩形有高度，无论三者同不同都不该走这条路。
     constexpr Rect tall{473, 189, 478, 217};
@@ -102,6 +110,24 @@ void TestFingerprint()
     CHECK(!IsHostDefaultPosition(kIllustrator, false, kIllustrator, false, kIllustrator));
 }
 
+void TestCompositionRectFallback()
+{
+    CASE("AllowCompositionRectFallback：洛克王国形态（算完布局、不填高度）必须放行");
+    // 这是二级降级存在的理由；它若不再放行，候选窗退回兜底坐标 (640,332)。
+    CHECK(AllowCompositionRectFallback(false, true, true, 46, true));
+
+    CASE("AllowCompositionRectFallback：宿主默认位置指纹命中 ⇒ 不走，哪怕角点在显示区内");
+    // ★ 医疗 HIS/LIS 的 Java 客户端（2026-09-30）：窗口最大化后角点 (1919,1039) 落在显示区
+    //   (0,23,1920,1040) 内、w=1，其它条件全满足。只有指纹这一维挡得住。
+    CHECK(!AllowCompositionRectFallback(true, true, true, 1, true));
+
+    CASE("AllowCompositionRectFallback：其余任一前提不满足 ⇒ 不走");
+    CHECK(!AllowCompositionRectFallback(false, false, true, 46, true)); // 无显示区：失败关闭
+    CHECK(!AllowCompositionRectFallback(false, true, false, 46, true)); // 没取到组合矩形
+    CHECK(!AllowCompositionRectFallback(false, true, true, 0, true));   // 零宽
+    CHECK(!AllowCompositionRectFallback(false, true, true, 1, false));  // 流放之路：落在窗外
+}
+
 void TestLatchScope()
 {
     CASE("LatchApplies：判决只在同一次组合内作数");
@@ -121,6 +147,7 @@ int main()
     std::printf("CaretDefaultPosPolicy tests\n");
     TestSameRect();
     TestFingerprint();
+    TestCompositionRectFallback();
     TestLatchScope();
 
     if (g_failures == 0)

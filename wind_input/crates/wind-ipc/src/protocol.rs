@@ -786,6 +786,24 @@ pub mod caret_source {
     /// 而此处 compStart 与 caret 本就同值，两支结果相同。
     pub const TSF_DEFAULT_POS: i32 = 8;
 
+    /// 宿主经 IMM32 `ImmSetCandidateWindow` 声明的候选窗位置（CANDIDATEFORM，DLL 已换成
+    /// 屏幕坐标）。DLL 只在选区、组合起点、组合整体矩形三次 TSF 查询给出**同一个**退化矩形
+    /// （即 [`TSF_DEFAULT_POS`] 那条指纹）时才取——宿主经 TSF 明说没有插入点，IMM32 是它剩下的
+    /// 唯一表态；取不到时 DLL 照旧按 [`TSF_DEFAULT_POS`] 报。
+    ///
+    /// 典型宿主是走 CUAS 的 Java AWT/Swing（医疗 HIS/LIS 客户端，2026-09-30）：`GetTextExt`
+    /// 三次查询恒为工作区右下角，而它按 `getTextLocation(leading(0))` 把组合起点下沿写进
+    /// CANDIDATEFORM——这是它唯一报位置的渠道，微软拼音在同一宿主上能跟随光标靠的也是它。
+    ///
+    /// ★ **属 TSF 语义域**（[`is_tsf`] 返回 `true`）。[`is_tsf`] 问的是「手上这个点是不是真
+    /// 插入点、能否与组合起点比较」：宿主就这一个 context 表态，点就是组合起点下沿。与
+    /// [`TSF_DEFAULT_POS`] 正相反——那个说「这里没有插入点」。
+    ///
+    /// ⚠ 本来源的帧**不带组合起点**（compStart=(0,0)）：宿主写 CANDIDATEFORM 是异步的，组合首帧
+    /// 多是上一次组合的旧值，带上就会被锁成本次组合的锚点、连打时整场偏一截（偏差小于逃生阀
+    /// 阈值）。不带，锚点就跟着逐帧的 caret 走，宿主写入新值的下一帧即纠正。
+    pub const IMM_CANDIDATE_FORM: i32 = 9;
+
     /// 是否属 TSF 语义域——即「这个坐标和组合起点出自同一个 context」。
     /// 只有这一类才可作权威坐标，也只有这一类才可与组合起点做距离比较。
     ///
@@ -794,7 +812,10 @@ pub mod caret_source {
     /// 退化矩形回答的恰恰是「没有插入点」。放进来它就会被当权威坐标参与跟行与漂移校正，
     /// 而它根本不随插入点移动（整场组合恒为同一个屏幕角落像素）。
     pub fn is_tsf(source: i32) -> bool {
-        matches!(source, TSF_SELECTION | TSF_COMPOSITION | TSF_CACHED)
+        matches!(
+            source,
+            TSF_SELECTION | TSF_COMPOSITION | TSF_CACHED | IMM_CANDIDATE_FORM
+        )
     }
 
     pub fn name(source: i32) -> &'static str {
@@ -807,6 +828,7 @@ pub mod caret_source {
             LAST_KNOWN => "last_known",
             PRE_REFLOW => "pre_reflow",
             TSF_DEFAULT_POS => "tsf_default_pos",
+            IMM_CANDIDATE_FORM => "imm_candidate_form",
             _ => "unknown",
         }
     }
@@ -2148,6 +2170,8 @@ mod tests {
         assert!(caret_source::is_tsf(caret_source::TSF_SELECTION));
         assert!(caret_source::is_tsf(caret_source::TSF_COMPOSITION));
         assert!(caret_source::is_tsf(caret_source::TSF_CACHED));
+        // 宿主经 IMM32 声明的候选位置：真插入点（组合起点下沿），与组合起点同源可比。
+        assert!(caret_source::is_tsf(caret_source::IMM_CANDIDATE_FORM));
         // 以下每一个都曾经或可能冒充插入点，必须全部判否
         assert!(!caret_source::is_tsf(caret_source::GUI_CARET));
         assert!(!caret_source::is_tsf(caret_source::CONSOLE));
@@ -2174,6 +2198,7 @@ mod tests {
             (caret_source::LAST_KNOWN, "last_known"),
             (caret_source::PRE_REFLOW, "pre_reflow"),
             (caret_source::TSF_DEFAULT_POS, "tsf_default_pos"),
+            (caret_source::IMM_CANDIDATE_FORM, "imm_candidate_form"),
         ];
         for (src, want) in named {
             assert_eq!(
@@ -2233,6 +2258,10 @@ mod tests {
             ("CARET_SRC_LAST_KNOWN", caret_source::LAST_KNOWN),
             ("CARET_SRC_PRE_REFLOW", caret_source::PRE_REFLOW),
             ("CARET_SRC_TSF_DEFAULT_POS", caret_source::TSF_DEFAULT_POS),
+            (
+                "CARET_SRC_IMM_CANDIDATE_FORM",
+                caret_source::IMM_CANDIDATE_FORM,
+            ),
         ]
         .into_iter()
         .collect();

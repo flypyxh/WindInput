@@ -54,6 +54,7 @@ pub(crate) fn intent_for(
         Some(ModeKind::Special(_)) => overlay.map(|o| o.candidate_layout),
         // 生僻字模式没有 [overlay] 段可读，布局跟随全局（同辅助码：只筛选、不改呈现形态）。
         Some(ModeKind::RareChar) => None,
+        Some(ModeKind::Reverse) => Some(cfg.input.reverse.candidate_layout),
         Some(ModeKind::TempPinyin) => Some(cfg.input.temp_pinyin.candidate_layout),
         Some(ModeKind::TempEnglish) => Some(cfg.input.temp_english.candidate_layout),
         Some(ModeKind::Url) => Some(cfg.input.url.candidate_layout),
@@ -235,6 +236,7 @@ mod tests {
         c.input.email.candidate_layout = intent;
         c.input.unicode.candidate_layout = intent;
         c.input.add_word.candidate_layout = intent;
+        c.input.reverse.candidate_layout = intent;
         c.schema.mix_modes = vec![MixModeConfig {
             candidate_layout: intent,
             ..Default::default()
@@ -275,6 +277,7 @@ mod tests {
         ModeKind::Url,
         ModeKind::Email,
         ModeKind::Unicode,
+        ModeKind::Reverse,
     ];
 
     /// 全矩阵：每种模式 × 三种意图 × 两种基线。

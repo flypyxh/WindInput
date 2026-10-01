@@ -387,6 +387,12 @@ impl Coordinator {
         state.special_prefix.clear();
         state.candidates.clear();
         state.preedit.clear();
+        // 反查模式会写这三位（翻页扩充 / 末页放宽），不复位的话退出后主路径
+        // 翻页会拿残留的 `has_more` 去扩充、下一次组码直接处于放宽态。Special / RareChar
+        // 从不写它们，对二者是空操作。
+        state.has_more = false;
+        state.candidate_limit = 0;
+        state.scope_relaxed = false;
     }
 
     /// [`Self::update_special_candidates`] 请求的全码自动上屏：命令候选走命令路径，
@@ -416,6 +422,12 @@ impl Coordinator {
     /// 返回 Some(候选) 表示该方案的全码策略请求自动上屏该候选（`$CC` 命令候选由调用方
     /// 走命令执行路径，普通候选上屏其文本）。
     pub(crate) fn update_special_candidates(&self, state: &mut State) -> Option<Candidate> {
+        // 反查模式：缓冲 / 按键处理与 special 族共用，候选另建（convert_reverse + 检索范围
+        // 过滤），且从不请求自动上屏（spec reverse-mode §3.2）。
+        if matches!(state.active, Some(ModeKind::Reverse)) {
+            self.update_reverse_candidates(state);
+            return None;
+        }
         state.candidates.clear();
         self.reset_candidate_view(state);
         // 组合区 = 显示态前缀 + 编码缓冲（前缀只显示不参与查询）。
@@ -552,6 +564,17 @@ impl Coordinator {
     /// 抽出来是因为三个出口此前只有选词这一处记了：标点顶屏与自动上屏只记统计，
     /// 顶屏 / 自动上屏出去的字既不调频、`;` 也重复不出来。
     fn record_special_selection(&self, state: &State, cand: &Candidate) {
+        // 反查模式：缓冲是查询串（含通配）而非码位，记账码取候选**全码**（
+        // 同主路通配的 `main_freq_code`）；归属 active（`effective_data_schema` 给 None）。
+        if matches!(state.active, Some(ModeKind::Reverse)) {
+            let code = if cand.code.is_empty() {
+                state.special_buffer.clone()
+            } else {
+                cand.code.clone()
+            };
+            self.record_selection_in(None, &code, &cand.text, cand.source);
+            return;
+        }
         if !matches!(state.active, Some(ModeKind::RareChar)) {
             let code = state.special_buffer.clone();
             self.record_selection_in(
@@ -749,6 +772,27 @@ impl Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
+                // 反查模式的符号通配键（方案 `wildcard_key` 配成 `?` 之类）：进缓冲作通配，
+                // **先于**选词键与标点顶屏——否则它在模式里要么选了词、要么把候选顶上屏。
+                // 字母通配键走上面的字母臂，不经这里。
+                if matches!(state.active, Some(ModeKind::Reverse))
+                    && let Some(ch) = punct_char(data.key_code, shift)
+                    && self.engine_mgr.active_reverse_key() == Some(ch)
+                {
+                    preedit_cursor::BufEdit::new(
+                        &mut state.special_buffer,
+                        &mut state.special_cursor,
+                    )
+                    .insert(ch);
+                    self.update_special_candidates(state);
+                    let display = state.preedit.clone();
+                    let caret_pos = self.overlay_caret(state);
+                    self.notify_ui_update(state);
+                    return KeyAction::UpdateComposition {
+                        text: display,
+                        caret_pos,
+                    };
+                }
                 // 二三候选键 → 选候选（命令候选执行动作）
                 if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
                     let (start, end) = self.page_range(state);

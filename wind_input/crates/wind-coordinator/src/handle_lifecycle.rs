@@ -80,7 +80,8 @@ impl Coordinator {
         // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }
 
-    /// 该键是否被**任一模式**配作进入键（临拼/临英的符号触发键、特殊模式引导键、mix 触发键）。
+    /// 该键是否被**任一模式**配作进入键（临拼/临英的符号触发键、特殊模式引导键、mix 触发键、
+    /// 反查模式触发键）。
     /// 仅用于「智能符号 press2 要不要抢在模式激活之前」的门控：只有被模式占用的符号键存在
     /// 这个冲突，其余标点照常在标点分支判 press2。
     ///
@@ -91,6 +92,7 @@ impl Coordinator {
             || self.is_temp_english_trigger(key_code)
             || self.match_special_trigger(key_code).is_some()
             || self.match_mix_trigger(key_code).is_some()
+            || self.is_reverse_trigger(key_code)
     }
 
     /// 该键在空缓冲时是否已被方案声明为**首码** —— 是则符号类模式引导键让位给码表。
@@ -546,6 +548,17 @@ impl Coordinator {
             return Some("显式 none");
         }
         let ch = keymap::vk_to_prefix_char_with_letters(key_code)?;
+        // 反查模式只在码表 / 五笔拼音混输方案里有意义（活跃引擎给得出反查通配键）。
+        // 放在字母 / 符号分流之前：符号键在拼音方案里也让位，照常产出标点（spec §3.1）；
+        // 字母键在码表里仍走下面的活码前缀判据，在混输里仍走「字母键仅码表引擎」判据。
+        //
+        // ⚠️ 必须在上一行（无字符的修饰键早退）**之后**：修饰键的 keyup 通路把 Yield 当
+        // 「显式 none」吞键，排在前面会让拼音方案里绑了反查的 RShift 连中英切换都失效；
+        // 修饰键保持原通路——Act 后门卫没过返回 None，落回全局链。
+        if matches!(action, BoundAction::Reverse) && self.engine_mgr.active_reverse_key().is_none()
+        {
+            return Some("反查模式仅码表 / 五笔拼音混输方案生效");
+        }
         if !ch.is_ascii_alphabetic() {
             return None; // 符号键：不让位，也不限引擎
         }
@@ -589,6 +602,15 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::None => None,
+            // 反查模式：门卫是总开关 `input.reverse.enabled`（出厂关）+ 活跃方案有反查通配键
+            // （码表 / 混输主码表）。没过返回 None，触发键落普通输入，不吞键。
+            BoundAction::Reverse => {
+                if !self.reverse_mode_available() {
+                    return None;
+                }
+                debug!("key_action: entering reverse mode");
+                Some(self.enter_reverse_mode(state, key_code))
+            }
             // 软键盘不是「模式」，没有编码缓冲也不进 ModeKind——直接开关面板即可。
             // 状态推送由按键路径顶层的 SoftKeyboardPushOnDrop 兜底。
             BoundAction::SoftKeyboard(page) => Some(self.toggle_softkeyboard(page.as_deref())),
@@ -810,6 +832,7 @@ impl Coordinator {
             | BoundAction::TempEnglish
             | BoundAction::AuxCode
             | BoundAction::RareChar
+            | BoundAction::Reverse
             | BoundAction::Mix(_)
             | BoundAction::Special(_)
             | BoundAction::SingleChar(_)
@@ -944,6 +967,7 @@ impl Coordinator {
             BoundAction::TempEnglish => ModeKind::TempEnglish,
             BoundAction::AuxCode => ModeKind::AuxCode,
             BoundAction::RareChar => ModeKind::RareChar,
+            BoundAction::Reverse => ModeKind::Reverse,
             BoundAction::Special(id) => ModeKind::Special(self.special_mode_idx(id)?),
             BoundAction::Mix(id) => ModeKind::Mix(self.mix_mode_idx(id)?),
             // 不建 overlay ⇒ 没有可比对的模式身份。软键盘有自己的开关态，幂等由
@@ -1084,6 +1108,12 @@ impl Coordinator {
         state.rewind = None;
         state.special_buffer.clear();
         state.special_cursor = 0;
+        // 翻页扩充 / 末页放宽三位：反查模式会写（special 族其余成员不写，对它们是空操作），
+        // 主路与临拼也写。`scope_relaxed` 的失效点 `expire_scope_override` 只挂在按键出口，
+        // 失焦等清缓冲的路径不经过它——不在这里复位，回来后的新组码会继承上一个焦点的放宽态。
+        state.has_more = false;
+        state.candidate_limit = 0;
+        state.scope_relaxed = false;
         // `[overlay]` 段快照随模式一并丢弃。消费点都先判 `active == Special`，残留本不会
         // 被读到——但那条「先判 active」是消费点的实现细节，不是这里可以依赖的契约。
         state.overlay_spec = None;

@@ -33,7 +33,7 @@ use tracing::{debug, warn};
 /// | `toggle_schema:` / `switch_schema:` / `toggle_mode` / `switch_engine` | 无 | 它们正是用来**离开/返回英文态**的；带上 `CHINESE_ONLY` 就成了单程票 |
 /// | `toggle_full_width` / `toggle_toolbar` / `open_settings` / `open_dictionary` / `take_screenshot` | 无 | 两模式下都该生效，与固定字段那段同档 |
 /// | `toggle_punct` / `toggle_s2t` / `toggle_t2s` / `single_char` | `CHINESE_ONLY` | 只在中文态有意义；**不带 `GLOBAL`**，避免不必要地抢占宿主快捷键 |
-/// | 进 overlay 的（`temp_pinyin` / `temp_english` / `aux_code` / `rare_char` / `mix:` / `special:`） | `CHINESE_ONLY \| GLOBAL` | 进 overlay 只在中文输入中途有意义；`GLOBAL` 让 TSF 用 `RegisterHotKey` 抢占，穿透 QQNT/Tabby 等 Chromium 宿主的同名加速键 |
+/// | 进 overlay 的（`temp_pinyin` / `temp_english` / `aux_code` / `rare_char` / `reverse` / `mix:` / `special:`） | `CHINESE_ONLY \| GLOBAL` | 进 overlay 只在中文输入中途有意义；`GLOBAL` 让 TSF 用 `RegisterHotKey` 抢占，穿透 QQNT/Tabby 等 Chromium 宿主的同名加速键 |
 /// | `command:<表达式>` | 无 | 跑的是用户的命令，与中英态无关（英文态下也该按得动）；不改输入状态，不需要抢占 |
 /// | `softkeyboard[:<id>]` | `GLOBAL` | 面板画的是「键位 → 符号」，与中英文态无关（英文态想打个 ℃ 同样合理），C++ 侧为此专设了软键盘总闸 `IsSoftKeyboard()`；带上 `CHINESE_ONLY` 英文态连开都开不出来 |
 ///
@@ -82,6 +82,7 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
         | BA::TempEnglish
         | BA::AuxCode
         | BA::RareChar
+        | BA::Reverse
         | BA::Mix(_)
         | BA::Special(_)
         | BA::SoftKeyboard(_) => true,
@@ -1831,6 +1832,7 @@ mod tests {
             "temp_english",
             "aux_code",
             "rare_char",
+            "reverse",
             "mix:quick_mix",
             "special:fuhao",
             "single_char",
@@ -1887,6 +1889,7 @@ mod tests {
             ("temp_english", true, true),
             ("aux_code", true, true),
             ("rare_char", true, true),
+            ("reverse", true, true),
             ("mix:quick_mix", true, true),
             ("special:fuhao", true, true),
             ("softkeyboard", false, true),
@@ -2033,5 +2036,12 @@ mod tests {
             .filter(|e| e.tsf_hash & HOTKEY_POLICY_SESSION != 0)
             .count();
         assert!(n <= 32, "SESSION 热键 {n} 个，超过 TSF 候选槽位 32");
+    }
+
+    #[test]
+    fn reverse_hotkey_policy_is_global_chinese_only() {
+        let p = hotkey_policy_for(&crate::config::BoundAction::Reverse).unwrap();
+        assert_eq!(p & HOTKEY_POLICY_CHINESE_ONLY, HOTKEY_POLICY_CHINESE_ONLY);
+        assert_eq!(p & HOTKEY_POLICY_GLOBAL, HOTKEY_POLICY_GLOBAL);
     }
 }

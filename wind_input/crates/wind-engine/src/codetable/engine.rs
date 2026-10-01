@@ -217,6 +217,12 @@ pub struct CommitOptions {
     /// 通配键（`[engine.codetable].wildcard` + `.wildcard_key` 折叠后；关闭或键非法为 `None`）。
     /// 引擎只拿它回答 [`Engine::wildcard_key`]；哪几位作通配由协调器定，见 `convert_wildcard`。
     pub wildcard: Option<char>,
+    /// 通配结果只留单字（字素簇）。行内通配与反查模式共用 `wildcard_query`，二者同受约束。
+    /// 见 reverse-mode spec §2。
+    pub wildcard_single_only: bool,
+    /// 反查模式内的通配键（`reverse_wildcard_char`，恒有值；不看 `wildcard` 主开关）。
+    /// 只有码表方案的 `build_engine` 注入；`None` 表示该引擎不支持反查。见 reverse-mode spec §3.2。
+    pub reverse_key: Option<char>,
 }
 
 /// 码表引擎
@@ -252,6 +258,12 @@ pub struct CodeTableEngine {
     ///
     /// `None`（无 store 的测试 / CLI）⇒ 段候选不做调整，退回纯词库序。
     segment_shadow: Option<(Arc<wind_store::Store>, String)>,
+    /// 影子层：本方案未启用的扩展词库（reverse-mode spec §4.2）。
+    ///
+    /// ★ **只在 [`Self::wildcard_query`] 读**——普通 `convert`（打字候选、活码探针、顶码、自动上屏复评）
+    /// 读它就是把未启用库漏进打字候选，spec §4.2「打字候选不受影响」的保证全靠这一条。
+    /// `None` = 开关关 / 无未启用库 / 测试未注入。
+    disabled_dicts: Option<super::DisabledDictLayers>,
 }
 
 impl CodeTableEngine {
@@ -299,6 +311,7 @@ impl CodeTableEngine {
             // 空集只会让热插拔退化成「失效重建」，不会给出错误答案。
             own_extra_dicts: std::collections::HashSet::new(),
             segment_shadow: None,
+            disabled_dicts: None,
         }
     }
 
@@ -319,6 +332,17 @@ impl CodeTableEngine {
     pub fn with_own_extra_dicts<I: IntoIterator<Item = String>>(mut self, ids: I) -> Self {
         self.own_extra_dicts = ids.into_iter().collect();
         self
+    }
+
+    /// 注入影子层（未启用扩展词库，只给通配 / 反查查询用）。见 [`Self::disabled_dicts`] 字段。
+    pub fn with_disabled_dicts(mut self, d: super::DisabledDictLayers) -> Self {
+        self.disabled_dicts = Some(d);
+        self
+    }
+
+    /// 影子层（未注入为 `None`）。
+    pub fn disabled_dicts(&self) -> Option<&super::DisabledDictLayers> {
+        self.disabled_dicts.as_ref()
     }
 
     /// 指明**整句词频**的来源目录（见 `sentence::SentenceFreq`）。词库到首次整句解码时才读。
@@ -648,6 +672,97 @@ fn decide_auto_commit(
     Some(first.text.clone())
 }
 
+impl CodeTableEngine {
+    /// 通配查询内核（行内通配与反查模式共用）。语义见 `convert_wildcard`。
+    fn wildcard_query(&self, input: &str, pattern: &str, max_candidates: usize) -> ConvertResult {
+        let n = pattern.chars().count();
+        let with_prefix = !self.opts.single_code_input;
+        // 按协调器给的上限查（spec §11），硬上限兜底。⚠️ 永不向 `search_pattern` 传 0：
+        // Composite 把 0 当「不限」、各层把 0 当「空」，两边语义不一致。
+        let limit = max_candidates.min(WILDCARD_RESULT_LIMIT);
+        let mut hits: Vec<Candidate> = Vec::new();
+        if limit > 0 {
+            // ★ 词库层自己按 `fetch` 截断（各层两档取额），过滤只能在它之后。仅单字时不够就 ×2 重取，
+            // 直到够数 / 取尽 / 硬上限（同生僻字模式的 refill）。关着时只查一轮 ⇒ 与原实现逐条相同。
+            let mut fetch = limit;
+            loop {
+                let got =
+                    self.dm
+                        .search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix);
+                // 影子层（未启用扩展库，spec §4.2）：只在这里读，普通 convert 不看它。
+                let disabled_hits = self
+                    .disabled_dicts
+                    .as_ref()
+                    .map(|d| {
+                        d.search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix)
+                    })
+                    .unwrap_or_default();
+                // 两边都没取满才算取尽；没有影子层时 `0 < fetch` 恒真 ⇒ 与原判据相同。
+                let exhausted = got.len() < fetch && disabled_hits.len() < fetch;
+                hits = merge_disabled_hits(got, disabled_hits);
+                if !self.opts.wildcard_single_only {
+                    break;
+                }
+                hits.retain(|c| wind_candidate::single_markable_char(&c.text).is_some());
+                if hits.len() >= limit || exhausted || fetch >= WILDCARD_RESULT_LIMIT {
+                    break;
+                }
+                fetch = fetch.saturating_mul(2).min(WILDCARD_RESULT_LIMIT);
+            }
+        }
+        let mut candidates: Vec<Candidate> = hits
+            .into_iter()
+            .map(|mut c| {
+                c.source = CandidateSource::CodeTable;
+                c.is_exact_code = c.code.chars().count() == n;
+                c.comment = c.code.clone();
+                c.is_wildcard = true;
+                c
+            })
+            .collect();
+        let base_cmp = self.opts.base_sort.cmp();
+        // 未启用库的键放在 `cmp_exact_first` 之后（与 `candidate_display_order` 同位）：
+        // 等长 / 更长两档不变，档内先启用后未启用；两条非未启用候选间恒 Equal ⇒ 既有次序不变。
+        candidates.sort_by(|a, b| {
+            cmp_exact_first(a, b)
+                .then(a.from_disabled_dict.cmp(&b.from_disabled_dict))
+                .then_with(|| base_cmp(a, b))
+        });
+        candidates.truncate(limit);
+        let is_empty = candidates.is_empty();
+        ConvertResult {
+            candidates,
+            preedit_display: input.to_string(),
+            is_empty,
+            ..Default::default()
+        }
+    }
+}
+
+/// 通配结果合并影子层命中（spec §4.2）：以 `(text, code)` 为键先收已启用的，再追加键未出现过的
+/// 影子层命中并置 `from_disabled_dict`——同键留已启用那条（沿用 Composite 的去重语义）。
+///
+/// ⚠️ 去重只对两边**本轮取到的**条目有效。开启仅单字且加倍重取一直取到硬上限时，主层可能仍被
+/// 截断，某条同时存在于主层被截段与影子层的候选会被当作影子命中，「未启用」标记在这种极端情形下
+/// 可能打错（不会产生重复候选，可接受）。
+fn merge_disabled_hits(enabled: Vec<Candidate>, disabled: Vec<Candidate>) -> Vec<Candidate> {
+    if disabled.is_empty() {
+        return enabled;
+    }
+    let mut seen: std::collections::HashSet<(String, String)> = enabled
+        .iter()
+        .map(|c| (c.text.clone(), c.code.clone()))
+        .collect();
+    let mut out = enabled;
+    for mut c in disabled {
+        if seen.insert((c.text.clone(), c.code.clone())) {
+            c.from_disabled_dict = true;
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl Engine for CodeTableEngine {
     /// 热插拔扩展词库。**禁用摘层、启用交给重建**，两边不对称，各有理由：
     ///
@@ -681,6 +796,10 @@ impl Engine for CodeTableEngine {
         // 未启用，关闭三者后「甘蓝菜」仍在。
         self.dm
             .unregister_layer(&format!("codetable-extra-{dict_id}"));
+        // 它从此是「未启用库」：进影子层（通配 / 反查仍可查到）。
+        if let Some(d) = &self.disabled_dicts {
+            d.mark_disabled(dict_id);
+        }
         true
     }
 
@@ -911,37 +1030,27 @@ impl Engine for CodeTableEngine {
         max_candidates: usize,
     ) -> Option<ConvertResult> {
         self.opts.wildcard?;
-        let n = pattern.chars().count();
-        let with_prefix = !self.opts.single_code_input;
-        // 按协调器给的上限查（spec §11），硬上限兜底。⚠️ 永不向 `search_pattern` 传 0：
-        // Composite 把 0 当「不限」、各层把 0 当「空」，两边语义不一致。
-        let limit = max_candidates.min(WILDCARD_RESULT_LIMIT);
-        let hits = if limit == 0 {
-            Vec::new()
-        } else {
-            self.dm
-                .search_pattern(pattern, wind_dict::WILDCARD_SLOT, limit, with_prefix)
-        };
-        let mut candidates: Vec<Candidate> = hits
-            .into_iter()
-            .map(|mut c| {
-                c.source = CandidateSource::CodeTable;
-                c.is_exact_code = c.code.chars().count() == n;
-                c.comment = c.code.clone();
-                c.is_wildcard = true;
-                c
-            })
-            .collect();
-        let base_cmp = self.opts.base_sort.cmp();
-        candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
-        candidates.truncate(limit);
-        let is_empty = candidates.is_empty();
-        Some(ConvertResult {
-            candidates,
-            preedit_display: input.to_string(),
-            is_empty,
-            ..Default::default()
-        })
+        Some(self.wildcard_query(input, pattern, max_candidates))
+    }
+
+    fn reverse_wildcard_key(&self) -> Option<char> {
+        self.opts.reverse_key
+    }
+
+    fn disabled_dict_layers(&self) -> Option<&super::DisabledDictLayers> {
+        self.disabled_dicts.as_ref()
+    }
+
+    /// 反查模式查询（reverse-mode spec §3.2）：与 `convert_wildcard` 共用 `wildcard_query`，
+    /// 但不看 `wildcard` 主开关；仅单字 / 影子层随内核自动生效。
+    fn convert_reverse(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        self.opts.reverse_key?;
+        Some(self.wildcard_query(input, pattern, max_candidates))
     }
 
     /// natural 模式（`base_sort = "natural"`）忽略权重：协调器据此对齐 `by_natural` 重排。
@@ -2543,7 +2652,7 @@ mod tests {
         );
     }
 
-    /// ★ Review Focus 4：通配硬上限与翻页扩容上限是**同一个**常量；`max_candidates = 0` 回空，
+    /// 通配硬上限与翻页扩容上限是**同一个**常量；`max_candidates = 0` 回空，
     /// 且不把 0 传给 `search_pattern`（Composite 把 0 当不限、各层把 0 当空）。
     #[test]
     fn wildcard_hard_cap_matches_expansion_cap_and_zero_is_empty() {
@@ -2568,5 +2677,291 @@ mod tests {
         assert_eq!(r.candidates.len(), WILDCARD_RESULT_LIMIT, "硬上限兜底");
         let r0 = e.convert_wildcard("zzz", &slot_pattern("???"), 0).unwrap();
         assert!(r0.candidates.is_empty() && r0.is_empty, "max 0 ⇒ 空结果");
+    }
+
+    fn single_only_opts() -> CommitOptions {
+        CommitOptions {
+            wildcard: Some('z'),
+            wildcard_single_only: true,
+            ..Default::default()
+        }
+    }
+
+    /// 先滤后截：`q??` 下 150 条高权重词组压着 120 条低权重单字：
+    /// 词库层按 limit 截出的前 100 条全是词组，事后过滤只剩 0 条。引擎须加倍重取到凑满。
+    #[test]
+    fn wildcard_single_only_filters_before_truncation() {
+        let mut owned: Vec<(String, String, i32)> = Vec::new();
+        for i in 0..150u32 {
+            let c1 = (b'a' + (i / 26) as u8) as char;
+            let c2 = (b'a' + (i % 26) as u8) as char;
+            owned.push((format!("q{c1}{c2}"), format!("词组{i}"), 10_000 - i as i32));
+        }
+        for i in 0..120u32 {
+            let c1 = (b'a' + (i / 26) as u8) as char;
+            let c2 = (b'a' + (i % 26) as u8) as char;
+            let ch = char::from_u32(0x4E00 + i).unwrap();
+            owned.push((format!("q{c1}{c2}"), ch.to_string(), 1));
+        }
+        let refs: Vec<(&str, &str, i32)> = owned
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let off = engine_opts(&refs, wildcard_opts(CommitOptions::default()));
+        let r = off
+            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
+            .unwrap();
+        assert!(
+            r.candidates.iter().all(|c| c.text.starts_with("词组")),
+            "前置：不过滤时前 100 条全是词组"
+        );
+        let on = engine_opts(&refs, single_only_opts());
+        let r = on
+            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
+            .unwrap();
+        assert_eq!(r.candidates.len(), 100, "过滤后仍凑满 100 条");
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| wind_candidate::single_markable_char(&c.text).is_some())
+        );
+        let r = on
+            .convert_wildcard("qzz", &slot_pattern("q??"), 500)
+            .unwrap();
+        assert_eq!(r.candidates.len(), 120, "词库取尽即停，不死循环");
+    }
+
+    /// 单字判据是字素簇（UAX #29），不是 `chars().count()`：ZWJ 序列、国旗算一个字（issue #83）。
+    #[test]
+    fn wildcard_single_only_counts_grapheme_clusters() {
+        let e = engine_opts(
+            &[
+                ("qa", "👨‍👩‍👧", 40),
+                ("qb", "🇨🇳", 30),
+                ("qc", "工作", 20),
+                ("qd", "工", 10),
+            ],
+            single_only_opts(),
+        );
+        let r = e.convert_wildcard("qz", &slot_pattern("q?"), 50).unwrap();
+        let got: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(got, ["👨‍👩‍👧", "🇨🇳", "工"]);
+    }
+
+    fn disabled_mem(id: &str, entries: &[(&str, &str, i32)]) -> super::super::DisabledDictSource {
+        let owned: Vec<(String, String, i32)> = entries
+            .iter()
+            .map(|(c, t, w)| (c.to_string(), t.to_string(), *w))
+            .collect();
+        super::super::DisabledDictSource {
+            id: id.into(),
+            base_order: 3,
+            default_weight: None,
+            load: Arc::new(move || {
+                let mut d = CodetableDict::empty();
+                for (i, (c, t, w)) in owned.iter().enumerate() {
+                    d.merge_single(c.clone(), t.clone(), *w, i as i32);
+                }
+                Ok(CachedDict::Memory(d))
+            }),
+        }
+    }
+
+    fn with_xz(e: CodeTableEngine) -> CodeTableEngine {
+        e.with_disabled_dicts(super::super::DisabledDictLayers::new(
+            vec![disabled_mem(
+                "xz",
+                &[("uuia", "门头沟区", 9999), ("uuia", "重码", 9999)],
+            )],
+            std::iter::empty(),
+            None,
+        ))
+    }
+
+    /// ★ Review Focus 1：普通 convert（精确 / 前缀 / 活码探针同一入口）永不读影子层，连加载都不触发。
+    #[test]
+    fn plain_convert_never_touches_disabled_layers() {
+        let e = with_xz(engine_opts(
+            &[("uuif", "立法", 10)],
+            wildcard_opts(CommitOptions::default()),
+        ));
+        for input in ["uuia", "uui", "u"] {
+            let r = e.convert(input, 50).unwrap();
+            assert!(r.candidates.iter().all(|c| c.text != "门头沟区"), "{input}");
+        }
+        assert_eq!(
+            e.disabled_dicts().unwrap().load_count(),
+            0,
+            "普通 convert 不触发加载"
+        );
+        e.convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+            .unwrap();
+        assert_eq!(e.disabled_dicts().unwrap().load_count(), 1);
+        assert!(
+            e.convert("uuia", 50)
+                .unwrap()
+                .candidates
+                .iter()
+                .all(|c| c.text != "门头沟区")
+        );
+    }
+
+    /// 仅单字 + 影子层。影子层的词组同样被滤掉；取尽判据是**双边**的——
+    /// 首轮影子层没取满（35 < 100）但主层取满了（100 条全是词组），必须再取一轮才能把主层
+    /// 被截掉的 10 个单字捞回来。若只看任一边就判取尽，结果会只剩影子层那 30 个。
+    #[test]
+    fn wildcard_single_only_filters_disabled_hits_and_exhausts_on_both_sides() {
+        let code = |i: u32| {
+            let c1 = (b'a' + (i / 26) as u8) as char;
+            let c2 = (b'a' + (i % 26) as u8) as char;
+            format!("q{c1}{c2}")
+        };
+        let mut owned: Vec<(String, String, i32)> = Vec::new();
+        for i in 0..150u32 {
+            owned.push((code(i), format!("词组{i}"), 10_000 - i as i32));
+        }
+        for i in 0..10u32 {
+            owned.push((code(i), char::from_u32(0x4E00 + i).unwrap().to_string(), 1));
+        }
+        let refs: Vec<(&str, &str, i32)> = owned
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let mut xz: Vec<(String, String, i32)> = (0..30u32)
+            .map(|i| (code(i), char::from_u32(0x5E00 + i).unwrap().to_string(), 1))
+            .collect();
+        xz.extend((0..5u32).map(|i| (code(i), format!("影子词组{i}"), 9999)));
+        let xz_refs: Vec<(&str, &str, i32)> = xz
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = engine_opts(&refs, single_only_opts()).with_disabled_dicts(
+            super::super::DisabledDictLayers::new(
+                vec![disabled_mem("xz", &xz_refs)],
+                std::iter::empty(),
+                None,
+            ),
+        );
+        let r = e
+            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
+            .unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| wind_candidate::single_markable_char(&c.text).is_some()),
+            "影子层词组同样被滤掉"
+        );
+        let flags: Vec<bool> = r.candidates.iter().map(|c| c.from_disabled_dict).collect();
+        assert_eq!(
+            flags.len(),
+            40,
+            "主层 10 个单字（须重取才见）+ 影子层 30 个"
+        );
+        assert!(flags[..10].iter().all(|f| !f) && flags[10..].iter().all(|f| *f));
+    }
+
+    /// spec §4.2：`(text, code)` 去重（同键留已启用那条），已启用排前，档内再按 base_sort。
+    #[test]
+    fn wildcard_merges_disabled_after_enabled_dedup_by_text_code() {
+        let e = with_xz(engine_opts(
+            &[("uuif", "立法", 10), ("uuia", "重码", 1)],
+            wildcard_opts(CommitOptions::default()),
+        ));
+        let r = e
+            .convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+            .unwrap();
+        let got: Vec<(&str, &str, bool)> = r
+            .candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c.code.as_str(), c.from_disabled_dict))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("立法", "uuif", false),
+                ("重码", "uuia", false),
+                ("门头沟区", "uuia", true)
+            ]
+        );
+    }
+
+    /// 禁用一个已加载的扩展库 ⇒ 主 dm 摘层（普通候选消失），同时它进影子层（通配仍可见）；
+    /// 返回值语义不变（true = 目标态已达成）。
+    #[test]
+    fn set_dict_enabled_disable_moves_dict_into_disabled_layers() {
+        let build = |entries: &[(&str, &str, i32)]| {
+            let mut d = CodetableDict::empty();
+            for (i, (code, text, w)) in entries.iter().enumerate() {
+                d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+            }
+            CachedDict::Memory(d)
+        };
+        let dm = Arc::new(DictManager::new());
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            build(&[("uuif", "立法", 10)]),
+            "codetable-system",
+        )));
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            build(&[("aaae", "甘蓝菜", 50)]),
+            "codetable-extra-ext",
+        )));
+        let e = CodeTableEngine::new(4, wildcard_opts(CommitOptions::default()), dm)
+            .with_own_extra_dicts(["ext".to_string()])
+            .with_disabled_dicts(super::super::DisabledDictLayers::new(
+                vec![disabled_mem("ext", &[("aaae", "甘蓝菜", 50)])],
+                ["ext".to_string()],
+                None,
+            ));
+        assert!(e.set_dict_enabled("ext", false));
+        assert!(
+            e.convert("aaae", 20)
+                .unwrap()
+                .candidates
+                .iter()
+                .all(|c| c.text != "甘蓝菜")
+        );
+        let r = e
+            .convert_wildcard("aaaz", &slot_pattern("aaa?"), 20)
+            .unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .any(|c| c.text == "甘蓝菜" && c.from_disabled_dict)
+        );
+    }
+    /// spec §3.2：反查不受 wildcard 主开关约束；仅单字照样生效（同一内核）。
+    #[test]
+    fn convert_reverse_ignores_wildcard_switch() {
+        let opts = CommitOptions {
+            reverse_key: Some('z'),
+            wildcard_single_only: true,
+            ..Default::default()
+        };
+        let e = engine_opts(
+            &[("ab", "甲", 10), ("ac", "乙丙", 20), ("bb", "丁", 5)],
+            opts,
+        );
+        assert!(
+            e.convert_wildcard("zb", &slot_pattern("?b"), 50).is_none(),
+            "前置：主开关关"
+        );
+        let r = e.convert_reverse("zb", &slot_pattern("?b"), 50).unwrap();
+        let got: Vec<(&str, &str, &str)> = r
+            .candidates
+            .iter()
+            .map(|c| (c.text.as_str(), c.code.as_str(), c.comment.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [("甲", "ab", "ab"), ("丁", "bb", "bb")],
+            "首位通配、全码注释"
+        );
+        assert!(!r.should_commit && !r.should_clear);
+    }
+
+    #[test]
+    fn convert_reverse_absent_without_reverse_key() {
+        let e = engine_opts(&[("ab", "甲", 10)], CommitOptions::default());
+        assert!(e.convert_reverse("ab", "ab", 50).is_none());
     }
 }

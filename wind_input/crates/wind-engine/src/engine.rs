@@ -406,6 +406,29 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// 反查模式内的通配键（reverse-mode spec §3）。只有码表引擎返回 `Some`，混输代理主码表。
+    fn reverse_wildcard_key(&self) -> Option<char> {
+        None
+    }
+
+    /// 影子层（未启用扩展词库，只给通配 / 反查查询用）。只有挂了它的码表引擎返回 `Some`
+    /// （开关开且方案有扩展库），混输代理主码表。管理器据此在后台预热，见
+    /// `EngineManager::warm_disabled_dicts_async`。
+    fn disabled_dict_layers(&self) -> Option<&crate::codetable::DisabledDictLayers> {
+        None
+    }
+
+    /// 反查模式转换（reverse-mode spec §3）：与 [`Self::convert_wildcard`] 同一查询内核，
+    /// 但**不看** `wildcard` 主开关；`pattern` 由协调器把每个通配键位替换成 `WILDCARD_SLOT`。
+    fn convert_reverse(
+        &self,
+        _input: &str,
+        _pattern: &str,
+        _max_candidates: usize,
+    ) -> Option<ConvertResult> {
+        None
+    }
+
     /// 通配用的码长（spec §10）：协调器据此判「满码后通配键按字面」与混输「超码长整串字面」。
     /// 默认即 [`Self::max_code_length`]；混输返回主码表的码长。
     ///

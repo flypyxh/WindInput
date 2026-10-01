@@ -148,35 +148,40 @@ impl Coordinator {
     /// `select_char_index` 都是 `session_action_for` 的派生，再单独问一遍就会把同一个 `;`
     /// 报成「会话键」和「次选键」两条。
     fn wildcard_mid_owners(&self, key: char) -> Vec<&'static str> {
-        use wind_config::{AuxCodeShare, SessionAction};
         let Some((vk, shift)) = wildcard_key_vk(key) else {
             return Vec::new();
         };
         let mut owners: Vec<&'static str> = Vec::new();
-        if let Some(a) = self.session_action_for(vk, shift, true) {
-            let owner = match a {
-                // 选词 / 以词定字的两个消费点自带 `!shift` 守卫：shift 形态本就不归它们。
-                SessionAction::SelectCandidate(_) | SessionAction::SelectChar(_) if shift => None,
-                SessionAction::SelectCandidate(2) => Some("次选键"),
-                SessionAction::SelectCandidate(3) => Some("三选键"),
-                SessionAction::SelectCandidate(_) => Some("选词键"),
-                SessionAction::SelectChar(_) => Some("以词定字键"),
-                SessionAction::AuxCode(AuxCodeShare::Solo) => Some("辅助码键"),
-                SessionAction::AuxCode(AuxCodeShare::PageNext) => Some("辅助码/翻页键"),
-                SessionAction::PagePrev | SessionAction::PageNext => Some("翻页键"),
-                SessionAction::HighlightUp | SessionAction::HighlightDown => Some("高亮键"),
-                SessionAction::Cancel => Some("取消键"),
-                SessionAction::CommitHighlighted => Some("上屏键"),
-                SessionAction::Command(_) => Some("命令键"),
-                SessionAction::SingleChar(_) => Some("单字键"),
-                SessionAction::None => None,
-            };
-            owners.extend(owner);
-        }
+        owners.extend(self.wildcard_session_owner(vk, shift));
         if self.manual_separator_key(vk) {
             owners.push("音节分隔符");
         }
         owners
+    }
+
+    /// 通配键此刻在会话表里的身份名（`None` = 会话表没占它），组码中（[`Self::wildcard_mid_owners`]）用。
+    ///
+    /// ⚠️ 反查模式内**不能**用它：组码中选词 / 以词定字键会让通配让位，是冲突；反查模式里
+    /// 它们不被导航吃掉，见 [`Self::reverse_wildcard_conflicts`]。
+    fn wildcard_session_owner(&self, vk: u32, shift: bool) -> Option<&'static str> {
+        use wind_config::{AuxCodeShare, SessionAction};
+        match self.session_action_for(vk, shift, true)? {
+            // 选词 / 以词定字的两个消费点自带 `!shift` 守卫：shift 形态本就不归它们。
+            SessionAction::SelectCandidate(_) | SessionAction::SelectChar(_) if shift => None,
+            SessionAction::SelectCandidate(2) => Some("次选键"),
+            SessionAction::SelectCandidate(3) => Some("三选键"),
+            SessionAction::SelectCandidate(_) => Some("选词键"),
+            SessionAction::SelectChar(_) => Some("以词定字键"),
+            SessionAction::AuxCode(AuxCodeShare::Solo) => Some("辅助码键"),
+            SessionAction::AuxCode(AuxCodeShare::PageNext) => Some("辅助码/翻页键"),
+            SessionAction::PagePrev | SessionAction::PageNext => Some("翻页键"),
+            SessionAction::HighlightUp | SessionAction::HighlightDown => Some("高亮键"),
+            SessionAction::Cancel => Some("取消键"),
+            SessionAction::CommitHighlighted => Some("上屏键"),
+            SessionAction::Command(_) => Some("命令键"),
+            SessionAction::SingleChar(_) => Some("单字键"),
+            SessionAction::None => None,
+        }
     }
 
     /// 当前缓冲若是通配组码，返回交给引擎的 pattern（作通配的位替换成 `WILDCARD_SLOT`）。
@@ -271,6 +276,49 @@ impl Coordinator {
         owners
     }
 
+    /// 反查模式内的通配键冲突（只告警）。空 = 无冲突或反查模式不可用。
+    ///
+    /// 模式内的按键处理（`handle_special_key`）里导航 `handle_candidate_nav` 排在符号通配键
+    /// 进缓冲之前：通配键若同时是翻页 / 高亮 / 取消等会被导航消费的会话键，按下去先被吃掉，
+    /// 模式里就再也打不出通配。按键顺序不改（改了就是另一侧的键失灵），由体检报出，让用户换键。
+    ///
+    /// 与 [`Self::wildcard_conflicts`] 分开：那边只在通配主开关开时有意义，本模式不看主开关；
+    /// 且组码中的冲突会让位（通配不可用），这边是导航先吃（同样不可用，但成因不同）。
+    pub fn reverse_wildcard_conflicts(&self) -> Vec<&'static str> {
+        if !self.reverse_mode_available() {
+            return Vec::new();
+        }
+        let Some((vk, shift)) = self
+            .engine_mgr
+            .active_reverse_key()
+            .and_then(wildcard_key_vk)
+        else {
+            return Vec::new();
+        };
+        use wind_config::{AuxCodeShare, SessionAction};
+        // 只报 `apply_session_action` **真正消费**的动作。选词 / 以词定字它刻意返回 None
+        // （落到各自消费点，而反查的符号通配键臂排在选词臂之前）；独立辅助码的
+        // `enter_aux_code` 在 overlay 模式里拒绝、同样返回 None——这三类键在模式内照常
+        // 作通配进缓冲，报出来是误报。共键 `aux_code:page_next` 被拒后降级为翻页，照吃。
+        let owner = match self.session_action_for(vk, shift, true) {
+            Some(SessionAction::PagePrev | SessionAction::PageNext) => Some("翻页键"),
+            Some(SessionAction::AuxCode(AuxCodeShare::PageNext)) => Some("辅助码/翻页键"),
+            Some(SessionAction::HighlightUp | SessionAction::HighlightDown) => Some("高亮键"),
+            Some(SessionAction::Cancel) => Some("取消键"),
+            Some(SessionAction::CommitHighlighted) => Some("上屏键"),
+            Some(SessionAction::Command(_)) => Some("命令键"),
+            Some(SessionAction::SingleChar(_)) => Some("单字键"),
+            Some(
+                SessionAction::SelectCandidate(_)
+                | SessionAction::SelectChar(_)
+                | SessionAction::AuxCode(AuxCodeShare::Solo)
+                | SessionAction::None,
+            )
+            | None => None,
+        };
+        owner.into_iter().collect()
+    }
+
     fn wildcard_is_configured_code_char(&self, key: char) -> bool {
         let charset = self.engine_mgr.active_input_chars();
         !charset.is_default_alpha() && charset.contains(key)
@@ -281,6 +329,14 @@ impl Coordinator {
     /// 两类后果相反，故分两条：功能键冲突是「通配让位、组码中用不了」；码元冲突是「通配
     /// 照样生效、该码元被吞掉」。混在一句里用户读不出该改哪边。
     pub(crate) fn warn_wildcard_conflicts(&self) {
+        let reverse_owners = self.reverse_wildcard_conflicts();
+        if !reverse_owners.is_empty() {
+            warn!(
+                "反查模式通配键 {:?} 同时配作 {}；反查模式内它先按原功能处理，模式里打不出通配——请在方案设置里换一个通配键",
+                self.engine_mgr.active_reverse_key(),
+                reverse_owners.join(" / ")
+            );
+        }
         let Some(key) = self.engine_mgr.active_wildcard_key() else {
             return;
         };

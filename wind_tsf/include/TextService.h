@@ -297,9 +297,11 @@ public:
     // pCompRect/pHasCompRect：整个组合 range 的包围矩形，见 BinaryProtocol.h 的 CaretPayloadV3
     // pIsDefaultPos: 非空时输出「本次返回的是宿主的『没有插入点』默认位置」
     //                （CARET_SRC_TSF_DEFAULT_POS，高度为合成值）。为真时 pUsedCompStart 无意义。
+    // pUsedImmCandidateForm: 非空时输出「caret 是否由宿主 IMM32 CANDIDATEFORM 降级顶替」
+    //                （CARET_SRC_IMM_CANDIDATE_FORM）。为真时 pUsedCompStart 恒为假。
     BOOL GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BOOL* pUsedCompStart = nullptr,
                                  RECT* pCompRect = nullptr, BOOL* pHasCompRect = nullptr,
-                                 BOOL* pIsDefaultPos = nullptr);
+                                 BOOL* pIsDefaultPos = nullptr, BOOL* pUsedImmCandidateForm = nullptr);
     BOOL GetCompositionStartPosition(LONG* px, LONG* py);
 
     // Input mode control

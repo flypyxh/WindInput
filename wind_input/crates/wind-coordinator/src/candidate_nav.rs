@@ -202,10 +202,11 @@ impl Coordinator {
         // 而它的 `input_buffer` 恒为空——用 `input_buffer` 一刀切会让临拼刚放宽就在下一次
         // 按键被清掉，且**静默**（用户只看到「按了没用」）。退出临拼后 `active` 已变回
         // 非 TempPinyin，走 `input_buffer` 分支照常失效。
-        let ended = if matches!(s.active, Some(ModeKind::TempPinyin)) {
-            s.temp_pinyin_buffer.is_empty()
-        } else {
-            s.input_buffer.is_empty()
+        // 反查模式同理：码在 `special_buffer`。
+        let ended = match s.active {
+            Some(ModeKind::TempPinyin) => s.temp_pinyin_buffer.is_empty(),
+            Some(ModeKind::Reverse) => s.special_buffer.is_empty(),
+            _ => s.input_buffer.is_empty(),
         };
         if ended {
             s.scope_relaxed = false;
@@ -239,9 +240,13 @@ impl Coordinator {
         }
         // ⚠️ 临拼的码在 `temp_pinyin_buffer`，主路径的在 `input_buffer`——须按当前模式取。
         // 用 `input_buffer` 一刀切会让临拼**永远触发不了**（那边恒为空），且没有任何报错。
+        // 反查模式同理，码在 `special_buffer`。
         let in_temp = matches!(state.active, Some(ModeKind::TempPinyin));
+        let in_reverse = matches!(state.active, Some(ModeKind::Reverse));
         let has_input = if in_temp {
             !state.temp_pinyin_buffer.is_empty()
+        } else if in_reverse {
+            !state.special_buffer.is_empty()
         } else {
             !state.input_buffer.is_empty()
         };
@@ -262,6 +267,13 @@ impl Coordinator {
             // ⚠️ `update_temp_pinyin_candidates` 会把 current_page/selected_index 归零，
             // 重建后须还原，否则用户翻到的位置丢失。
             self.update_temp_pinyin_candidates(state);
+            state.current_page = page_before;
+            state.paged = paged_before;
+        } else if in_reverse {
+            // 反查的候选另有构建函数（主路的读 `input_buffer`，在本模式恒空）。它本身不动
+            // 页码 / 高亮，这里仍同临拼那支还原，免得哪天它内部改成复位视图时静默丢位置。
+            let limit = state.candidate_limit;
+            self.build_reverse_candidates(state, limit);
             state.current_page = page_before;
             state.paged = paged_before;
         } else {

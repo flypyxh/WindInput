@@ -337,6 +337,16 @@ constexpr int32_t CARET_SRC_PRE_REFLOW     = 7;
 // context，但它明说「这里没有插入点」，不得用于跟行、漂移校正那类需要真插入点的逻辑。
 // 详见 Rust 侧 `caret_source::TSF_DEFAULT_POS` 的注释。
 constexpr int32_t CARET_SRC_TSF_DEFAULT_POS = 8;
+// 宿主经 IMM32 `ImmSetCandidateWindow` 声明的候选窗位置（CANDIDATEFORM，已换成屏幕坐标）。
+// 只在 TSF 三次查询（选区、组合起点、组合整体矩形）给出**同一个**退化矩形——即 TSF_DEFAULT_POS
+// 那条指纹——时才取，见 CaretEditSession.cpp 的「三级降级」。典型宿主是走 CUAS 的 Java AWT/Swing：GetTextExt 恒为工作区右下角，而它把
+// 组合起点下沿写进 CANDIDATEFORM——这是它**唯一**报位置的渠道。
+//
+// ★ 属 TSF 语义域（Rust 侧 `caret_source::is_tsf` 返回 true）：宿主就这一个 context 表态，
+// 点就是组合起点下沿。但 DLL **不随它上报组合起点**（compStart=(0,0)）：首帧多是上一次组合的
+// 旧值，报了就会被服务端锁成本次组合的锚点。
+// 与 TSF_DEFAULT_POS 相反——那个说「这里没有插入点」，这个说「插入点在这儿」。
+constexpr int32_t CARET_SRC_IMM_CANDIDATE_FORM = 9;
 
 // Caret position payload v2 (24 bytes) = CaretPayload + source
 //
@@ -762,7 +772,7 @@ struct FocusGainedPayload
     uint8_t      disabled;       // 1 byte: 0/1 - GUID_COMPARTMENT_KEYBOARD_DISABLED 命中
     // reason: 0 None / 1 CompartmentDisabled / 2 InputScopePassword / 3 NumericPassword
     uint8_t      reason;         // 1 byte
-    // 上面那个 caret 的来源（CARET_SRC_* 之一，值域 0~6 故 1 字节足够）。
+    // 上面那个 caret 的来源（CARET_SRC_* 之一，值域 0~9 故 1 字节足够）。
     //
     // ⚠ 焦点 caret 曾被当作「只更新缓存、不参与显示决策」而无需来源信息。**「焦点切换时显示
     // 状态提示气泡」推翻了这个前提**——那个气泡就锚在这个坐标上，于是它第一次直接参与定位。

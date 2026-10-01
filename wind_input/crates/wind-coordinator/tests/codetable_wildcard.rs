@@ -1183,3 +1183,160 @@ fn page_end_relax_appends_filtered_wildcard_results() {
     expected.sort();
     assert_eq!(appended, expected, "被滤的通配生僻字全部追加在末尾");
 }
+
+// ─────────────────── 通配仅单字（reverse-mode spec §2） ───────────────────
+
+fn single_only(mut cfg: Config) -> Config {
+    cfg.schema.codetable.wildcard_single_only = true;
+    cfg
+}
+
+fn is_single(t: &str) -> bool {
+    wind_candidate::single_markable_char(t).is_some()
+}
+
+/// spec §5 列的冒烟串：`azz` 开仅单字后全是单字（`a??` 等长本就全是单字，首批不足以测截断先后）。
+#[test]
+fn single_only_azz_smoke() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(single_only(wubi(true, "z")), Some(&data_dir()));
+    press(&coord, "azz");
+    let texts = coord.debug_all_candidate_texts();
+    assert!(!texts.is_empty());
+    assert!(texts.iter().all(|t| is_single(t)), "{texts:?}");
+}
+
+/// ★ Review Focus 2（真实数据）：`azzz`（`a???`）按权重前 100 条只有 ~38 个单字；
+/// 先滤后截才能让首批凑满 100 个单字、`has_more` 为真、翻页可扩。缺 Task 2 时红在条数。
+#[test]
+fn single_only_azzz_first_batch_is_full_of_singles() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let base = Coordinator::new_headless(no_relax(wubi(true, "z")), Some(&data_dir()));
+    press(&base, "azzz");
+    let base_texts = base.debug_all_candidate_texts();
+    assert!(
+        base_texts.iter().filter(|t| is_single(t)).count() < 100,
+        "前置：不过滤时首批里单字不足 100"
+    );
+    let coord =
+        Coordinator::new_headless(no_relax(single_only(wubi(true, "z"))), Some(&data_dir()));
+    press(&coord, "azzz");
+    let texts = coord.debug_all_candidate_texts();
+    assert!(texts.iter().all(|t| is_single(t)), "{texts:?}");
+    assert!(coord.debug_has_more(), "a??? 单字 1342 个，首批应回满");
+    let first = coord.debug_candidate_count();
+    let grown = page_until_more_than(&coord, first);
+    assert!(grown > first, "翻到边界应扩充：{first} -> {grown}");
+    assert!(
+        coord
+            .debug_all_candidate_texts()
+            .iter()
+            .all(|t| is_single(t))
+    );
+}
+
+/// spec §2 混输：只作用于通配那一侧，拼音「汉字」照出。
+#[test]
+fn mixed_single_only_keeps_pinyin_words() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(single_only(wubi_pinyin(true)), Some(&data_dir()));
+    press(&coord, "hanz");
+    let tri = coord.debug_candidate_triples();
+    assert!(
+        tri.iter()
+            .filter(|(_, c, _)| wubi_hit("hanz", c, true) || wubi_hit("hanz", c, false))
+            .all(|(t, _, _)| is_single(t)),
+        "通配侧全是单字：{tri:?}"
+    );
+    assert!(
+        tri.iter()
+            .any(|(t, c, _)| is_single(t)
+                && (wubi_hit("hanz", c, true) || wubi_hit("hanz", c, false))),
+        "通配侧至少有一条单字命中（防过滤后为空而空过）：{tri:?}"
+    );
+    assert!(
+        tri.iter().any(|(t, _, _)| t == "汉字"),
+        "拼音侧词组照出：{tri:?}"
+    );
+}
+
+// ─────────────── 通配含未启用扩展词库（reverse-mode spec §4） ───────────────
+// 样本：「门头沟区 uuia」只在未启用的 wubi86_xzqy（default_enabled = false），主库 / extra 无 uuia 码。
+
+fn lookup_disabled(mut cfg: Config) -> Config {
+    cfg.schema.codetable.lookup_disabled_dicts = true;
+    cfg
+}
+
+fn tri_of(cfg: Config, keys: &str) -> Vec<(String, String, String)> {
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, keys);
+    coord.debug_candidate_triples()
+}
+
+#[test]
+fn lookup_disabled_dicts_inline_wildcard_sees_xzqy() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let off = tri_of(wubi(true, "z"), "uuiz");
+    assert!(
+        off.iter().all(|(t, _, _)| t != "门头沟区"),
+        "对照：关时不可见"
+    );
+    let on = tri_of(lookup_disabled(wubi(true, "z")), "uuiz");
+    let pos = on
+        .iter()
+        .position(|(t, c, _)| t == "门头沟区" && c == "uuia")
+        .unwrap_or_else(|| panic!("开后应可见：{on:?}"));
+    let last_enabled_equal = on
+        .iter()
+        .rposition(|(t, c, _)| {
+            c.len() == 4 && t != "门头沟区" && off.iter().any(|(ot, oc, _)| ot == t && oc == c)
+        })
+        .unwrap();
+    assert!(
+        last_enabled_equal < pos,
+        "已启用的等长结果全在它之前：{on:?}"
+    );
+}
+
+/// ★ Review Focus 1（真实数据）：开关开着，普通打字的候选逐条不变（含前缀补全与活码字母）。
+#[test]
+fn lookup_disabled_dicts_leaves_plain_typing_identical() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    for keys in ["uuia", "uui", "djma", "a", "zz"] {
+        assert_eq!(
+            tri_of(lookup_disabled(wubi(true, "z")), keys),
+            tri_of(wubi(true, "z"), keys),
+            "{keys}"
+        );
+    }
+}
+
+/// spec §4.2：混输取主方案的开关，通配侧同样可见。
+#[test]
+fn mixed_lookup_disabled_dicts_follows_primary() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let on = tri_of(lookup_disabled(wubi_pinyin(true)), "uuiz");
+    assert!(
+        on.iter().any(|(t, c, _)| t == "门头沟区" && c == "uuia"),
+        "{on:?}"
+    );
+}

@@ -1,10 +1,17 @@
 #include "CaretEditSession.h"
 #include "TextService.h"
 #include "Globals.h"
-// 仅供下方「IMM32 候选位置探测」使用：游戏类宿主多经 IMM32 声明候选位置，而那条路
-// 不反映到 TSF 的 GetTextExt 上（见 DoEditSession 里探测点的注释）。
+#include "CaretDefaultPosPolicy.h"
+#include "ImmCandidateFormPolicy.h"
+// 仅供下方「IMM32 候选位置」降级使用：走 CUAS 的老宿主（Java AWT、多数游戏）经 IMM32 声明
+// 候选位置，而那条路不反映到 TSF 的 GetTextExt 上（见 DoEditSession 里那一级的注释）。
 #include <imm.h>
 #pragma comment(lib, "imm32.lib")
+
+static_assert(wind::caret::kCfsDefault == CFS_DEFAULT, "ImmCandidateFormPolicy.h 与 imm.h 不一致");
+static_assert(wind::caret::kCfsPoint == CFS_POINT, "ImmCandidateFormPolicy.h 与 imm.h 不一致");
+static_assert(wind::caret::kCfsCandidatePos == CFS_CANDIDATEPOS, "ImmCandidateFormPolicy.h 与 imm.h 不一致");
+static_assert(wind::caret::kCfsExclude == CFS_EXCLUDE, "ImmCandidateFormPolicy.h 与 imm.h 不一致");
 
 CCaretEditSession::CCaretEditSession(ITfContext* pContext)
     : _refCount(1)
@@ -15,6 +22,7 @@ CCaretEditSession::CCaretEditSession(ITfContext* pContext)
     , _hasCompositionRect(FALSE)
     , _succeeded(FALSE)
     , _usedCompStartAsCaret(FALSE)
+    , _usedImmCandidateForm(FALSE)
     , _pAsyncOwner(nullptr)
     , _probeKind(CaretProbeKind::Composition)
     , _sessionTag(0)
@@ -252,6 +260,33 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                 && y >= rcScreenExt.top && y <= rcScreenExt.bottom;
         };
 
+        // 宿主没给高度时补的默认行高。二级降级与 IMM32 那一级共用。
+        //
+        // ★ 必须按**宿主视角**的 DPI 换算：GetTextExt / ClientToScreen 给的坐标就在宿主的感知
+        // 级别下，直接补 20 个设备像素，在 4K/高缩放的宿主上只有真实行高的一半，候选窗顶边会
+        // 落在正文行中段、压住正在输入的那一行——正是候选窗定位要消灭的症状。
+        // ⚠ 不要套用 LangBarItemButton 里 SetThreadDpiAwarenessContext 抬高感知级别那套：
+        // 那里要的是「主屏的物理真值」，这里要的是「与宿主坐标同参照系」，抬高反而错——
+        // 宿主 unaware 时它回 96，而那时坐标本就是虚拟化的 96dpi 坐标，正好不该缩放。
+        // 符号动态取（Win10 1607+），与本仓其余 DPI 调用同一惯例；取不到按 96 处理。
+        const auto hostDefaultCaretHeight = [&]() -> LONG {
+            static auto pGetDpiForWindow = reinterpret_cast<UINT(WINAPI*)(HWND)>(
+                GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+            UINT dpi = (pGetDpiForWindow != nullptr && hwndHost != nullptr) ? pGetDpiForWindow(hwndHost) : 0;
+            if (dpi == 0)
+                dpi = 96;
+            return MulDiv(WIND_DEFAULT_CARET_HEIGHT, (int)dpi, 96);
+        };
+
+        // 「宿主对本 context 没有插入点可报」的指纹：三次布局查询给出同一个退化矩形（判据与
+        // TextService 的 CARET_RETRY 判决共用 wind::caret::IsHostDefaultPosition）。必须在任何
+        // 一级降级改动这几个矩形**之前**取，下方二级降级与 IMM32 那一级都要用它。
+        const bool hostDefaultPos =
+            _succeeded
+            && wind::caret::IsHostDefaultPosition(_caretRect, _hasCompositionStart != FALSE,
+                                                  _compositionStartRect, _hasCompositionRect != FALSE,
+                                                  _compositionRect);
+
         // ★ 一级降级：caret 无效而组合起点有效时，用组合起点当 caret。
         //
         // 候选窗本来就该跟随「正在编辑的那段文本」，而不是插入点——两者只差一个组合宽度。
@@ -331,32 +366,32 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
         //   CARET_SRC_TSF_COMPOSITION（TSF 权威域）的名义通过下游每一道闸（h>0、在显示器内、
         //   caret_is_valid），把「我没拿到坐标」伪装成「我拿到了一个权威坐标」，正是本文件末尾
         //   那段撤销记录要根除的谎报，且概率触发比必然触发更难查。
+        // ⚠⚠ **宿主默认位置指纹命中时不走**（`hostDefaultPos`，2026-09-30）：医疗 HIS/LIS 的
+        //   Java 客户端（CUAS 宿主）三次查询恒为工作区右下角 (1919,1039,1920,1039)，w=1 同样 > 0；
+        //   窗口一最大化，GetScreenExt=(0,23,1920,1040) 就把这个角点包了进去，越界校验失守，
+        //   本级把它补上高度以 TSF_COMPOSITION 送出，候选窗整场钉在屏幕右缘。流放之路那次靠的是
+        //   角点恰好在窗外，这次证明越界校验单独挡不住——「三者全同」才是它没在答位置的证据
+        //   （真在排版的宿主，组合矩形宽度随编码串增长，不会与零长度选区的矩形逐像素相同）。
+        //   命中后交给下方 IMM32 那一级；它也拿不到时，由 CARET_RETRY 判决按宿主默认位置采信，
+        //   与 Illustrator 同一条路，来源如实标成 TSF_DEFAULT_POS。
+        if (caretUnusable() && hostDefaultPos && _hasCompositionRect)
+        {
+            WIND_LOG_DEBUG_FMT(L"CaretEditSession: 组合整体矩形 (%ld, %ld, %ld, %ld) 与选区、组合起点全同，"
+                               L"是宿主默认位置而非布局，二级降级不采信\n",
+                               _compositionRect.left, _compositionRect.top,
+                               _compositionRect.right, _compositionRect.bottom);
+        }
         if (caretUnusable()
-            && hasScreenExt
-            && _hasCompositionRect
-            && _compositionRect.right > _compositionRect.left
-            && insideScreenExt(_compositionRect.left, _compositionRect.top))
+            && wind::caret::AllowCompositionRectFallback(
+                hostDefaultPos, hasScreenExt, _hasCompositionRect != FALSE,
+                _compositionRect.right - _compositionRect.left,
+                insideScreenExt(_compositionRect.left, _compositionRect.top)))
         {
             _caretRect = _compositionRect;
             if (_caretRect.bottom <= _caretRect.top)
             {
                 // 宿主没给高度。候选窗只拿它决定「落在文本下方多远」。
-                //
-                // ★ 必须按**宿主视角**的 DPI 换算：GetTextExt 给的坐标就在宿主的感知级别下，
-                // 直接补 20 个设备像素，在 4K/高缩放的宿主上只有真实行高的一半，候选窗顶边会
-                // 落在正文行中段、压住正在输入的那一行——正是候选窗定位要消灭的症状。
-                // ⚠ 不要套用 LangBarItemButton 里 SetThreadDpiAwarenessContext 抬高感知级别那套：
-                // 那里要的是「主屏的物理真值」，这里要的是「与宿主坐标同参照系」，抬高反而错——
-                // 宿主 unaware 时它回 96，而那时坐标本就是虚拟化的 96dpi 坐标，正好不该缩放。
-                // 符号动态取（Win10 1607+），与本仓其余 DPI 调用同一惯例；取不到按 96 处理。
-                static auto pGetDpiForWindow = reinterpret_cast<UINT(WINAPI*)(HWND)>(
-                    GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
-                UINT dpi = (pGetDpiForWindow != nullptr && hwndHost != nullptr)
-                               ? pGetDpiForWindow(hwndHost)
-                               : 0;
-                if (dpi == 0)
-                    dpi = 96;
-                LONG bottom = _caretRect.top + MulDiv(WIND_DEFAULT_CARET_HEIGHT, (int)dpi, 96);
+                LONG bottom = _caretRect.top + hostDefaultCaretHeight();
                 // ★ 宿主自己声明的显示区下沿若比这更近，就用它——那才是这一行文本真正的底，
                 // 补出来的默认高度只是没有更好信息时的替代品。
                 //
@@ -392,18 +427,46 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                                _caretRect.bottom - _caretRect.top);
         }
 
-        // ── IMM32 候选位置探测（只记日志，**不改行为**）─────────────────────────
+        // ── 三级降级：宿主经 IMM32 设的候选窗位置（CANDIDATEFORM）─────────────────
         //
-        // 走到这里说明上面两级降级都没能给出可用的 caret。游戏类宿主往往**根本没打算**用
-        // TSF 传坐标：SDL 的 `SDL_SetTextInputRect` 在 Windows 上实现为 `ImmSetCandidateWindow`
-        // （CANDIDATEFORM），多数自绘 UI 的游戏同理——这条路不会反映到 `GetTextExt` 上。
-        // 流放之路实测连 IMM32 也没设（搜狗、微软拼音在该宿主上同样钉在左上角），但论坛另有
-        // 多款游戏反馈同类症状，其中若有设了 CANDIDATEFORM 的，这就是它们唯一可用的坐标来源
-        // ——先攒实测数据，够了再决定要不要接进降级链。
+        // 走到这里说明上面两级都没能给出可用的 caret。探测只在两种帧上做（其余退化帧多是宿主
+        // 还没排完版，每帧都查 IMC、打一行日志只会淹掉别的行）：
+        //   - `hostDefaultPos`：宿主经 TSF 明说没有插入点——唯一**会采信**的情形；
+        //   - `!_succeeded`：GetTextExt 整个失败（游戏类宿主），只记日志、攒实测数据。
+        // ⚠ 旧探测的条件只有后者，而 Illustrator 与这批 Java 宿主都是「成功但退化」——它们的
+        //   IMM 数据此前一条都没有，是**结构上**就不会执行，不是宿主没设 CANDIDATEFORM。
         //
-        // ⚠ CANDIDATEFORM/COMPOSITIONFORM 的 ptCurrentPos 是**客户区**坐标，故一并打出
-        //   ClientToScreen 之后的值，避免日后比对时把两个参照系混起来。
-        if (!_succeeded)
+        // 走 IMM32→TSF 兼容层（CUAS）的宿主往往
+        // **根本不经 TSF 传坐标**：
+        //   - Java AWT/Swing：收到 IMN_OPENCANDIDATE / IMN_CHANGECANDIDATE 后按
+        //     `getTextLocation(leading(0))` 算出组合起点**下沿**，经 `ImmSetCandidateWindow`
+        //     写进 CANDIDATEFORM（客户区坐标）。GetTextExt 对它三次查询恒为工作区右下角
+        //     (1919,1039,1920,1039)——医疗 HIS/LIS 客户端实测（2026-09-30 用户日志）。微软拼音
+        //     在同一宿主上能跟随光标，靠的只能是这一份。
+        //   - SDL 的 `SDL_SetTextInputRect` 同样实现为 `ImmSetCandidateWindow`，多数自绘 UI 的
+        //     游戏同理。流放之路实测连 IMM32 也没设，那类宿主本级拿不到东西，行为不变。
+        //
+        // IMN_* 通知由 CUAS 在我们 BeginUIElement / UpdateUIElement 时发给宿主（日志里的
+        // host_reads=1 就是 IMM32 桥在读候选串）；AWT 还要投递到 EDT 再回来才写 CANDIDATEFORM。
+        // 所以组合的第一帧**通常**读到的是上一次组合留下的值，或者还没有值（退回原有路径：
+        // CARET_RETRY 判决 / GUI 回退）。
+        //
+        // ★ 只认 CANDIDATEFORM，不认 COMPOSITIONFORM：前者答「候选窗放哪」，后者答「组合窗放哪」，
+        //   不少宿主给后者的是输入框左上角。两者照旧一并打日志，供日后比对。
+        // ★★ 采信后**作废组合起点**（上报 (0,0)），不改写成同一个点：服务端对同一次组合只锁
+        //   首个有效组合起点，而首帧恰恰多半是上一次组合的旧值——连打时新旧起点只差已上屏那几个
+        //   字的宽度，落不到大偏移逃生阀的阈值（3 倍行高）里，锁上就整场修不回来。不报起点，
+        //   服务端锚点跟着逐帧的 caret 走，宿主写入新值的下一帧就跟上（AWT 的这个点在一次组合内
+        //   本就不动，锁不锁无所谓）。留着那个右下角像素则更糟：锚点直接锁在角落上。
+        //   组合整体矩形同样作废，理由同二级降级。
+        // ⚠ CANDIDATEFORM 的 ptCurrentPos 是**客户区**坐标，ClientToScreen 必须用宿主设它时的
+        //   那个窗口。hwndHost 取自 ITfContextView::GetWnd，CUAS context 下即 IMC 所属窗口；
+        //   若不是，换算结果会整体偏出显示区，被 AcceptCandidateFormPoint 的越界校验挡住。
+        //   ⚠ 已知缺口：AWT 按**顶层窗口**客户区原点换算（GetTopLevelParentForWindow），IMC 所属的
+        //   却可能是它的子窗口。Swing 的焦点代理窗口在框架 (0,0) 处，两者等价；纯 AWT 重量级
+        //   控件（java.awt.TextArea）会整体偏一个子窗口偏移，且多半仍在显示区内、挡不住。日志里
+        //   一并打出按 GA_ROOT 换算的值，等真机数据定夺。
+        if (caretUnusable() && (hostDefaultPos || !_succeeded))
         {
             if (hwndHost != nullptr)
             {
@@ -414,21 +477,45 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                     COMPOSITIONFORM comp = {};
                     const BOOL okCand = ImmGetCandidateWindow(himc, 0, &cand);
                     const BOOL okComp = ImmGetCompositionWindow(himc, &comp);
+                    ImmReleaseContext(hwndHost, himc);
                     POINT ptCand = cand.ptCurrentPos;
                     POINT ptComp = comp.ptCurrentPos;
                     ClientToScreen(hwndHost, &ptCand);
                     ClientToScreen(hwndHost, &ptComp);
+                    const HWND hwndRoot = GetAncestor(hwndHost, GA_ROOT);
+                    POINT ptCandRoot = cand.ptCurrentPos;
+                    if (hwndRoot != nullptr)
+                        ClientToScreen(hwndRoot, &ptCandRoot);
                     WIND_LOG_DEBUG_FMT(
-                        L"CaretEditSession: IMM32 probe hwnd=0x%p cand=%d style=0x%08X "
-                        L"client=(%ld,%ld) screen=(%ld,%ld) area=(%ld,%ld,%ld,%ld) | "
-                        L"comp=%d style=0x%08X client=(%ld,%ld) screen=(%ld,%ld)\n",
-                        (void*)hwndHost,
+                        L"CaretEditSession: IMM32 probe hwnd=0x%p root=0x%p cand=%d style=0x%08X "
+                        L"client=(%ld,%ld) screen=(%ld,%ld) viaRoot=(%ld,%ld) area=(%ld,%ld,%ld,%ld) | "
+                        L"comp=%d style=0x%08X client=(%ld,%ld) screen=(%ld,%ld) hostDefaultPos=%d\n",
+                        (void*)hwndHost, (void*)hwndRoot,
                         okCand ? 1 : 0, cand.dwStyle,
                         cand.ptCurrentPos.x, cand.ptCurrentPos.y, ptCand.x, ptCand.y,
+                        ptCandRoot.x, ptCandRoot.y,
                         cand.rcArea.left, cand.rcArea.top, cand.rcArea.right, cand.rcArea.bottom,
                         okComp ? 1 : 0, comp.dwStyle,
-                        comp.ptCurrentPos.x, comp.ptCurrentPos.y, ptComp.x, ptComp.y);
-                    ImmReleaseContext(hwndHost, himc);
+                        comp.ptCurrentPos.x, comp.ptCurrentPos.y, ptComp.x, ptComp.y, hostDefaultPos ? 1 : 0);
+
+                    if (wind::caret::AcceptCandidateFormPoint(hostDefaultPos, okCand != FALSE, cand.dwStyle,
+                                                              ptCand.x, ptCand.y, hasScreenExt, rcScreenExt))
+                    {
+                        // 落点是文本行**下沿**：caret 的 bottom 取它，top 往上补一个默认行高。
+                        _caretRect.left = ptCand.x;
+                        _caretRect.right = ptCand.x + 1;
+                        _caretRect.bottom = ptCand.y;
+                        _caretRect.top = ptCand.y - hostDefaultCaretHeight();
+                        _hasCompositionStart = FALSE;
+                        _hasCompositionRect = FALSE;
+                        _succeeded = TRUE;
+                        _usedCompStartAsCaret = FALSE;
+                        _usedImmCandidateForm = TRUE;
+                        WIND_LOG_DEBUG_FMT(L"CaretEditSession: 三级降级采信 IMM32 CANDIDATEFORM (%ld,%ld)，"
+                                           L"caret=(%ld, %ld, h=%ld)\n",
+                                           ptCand.x, ptCand.y, _caretRect.left, _caretRect.top,
+                                           _caretRect.bottom - _caretRect.top);
+                    }
                 }
                 else
                 {
@@ -490,6 +577,7 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
             result.compRect             = _compositionRect;
             result.hasCompRect          = _hasCompositionRect;
             result.usedCompStartAsCaret = _usedCompStartAsCaret;
+            result.usedImmCandidateForm = _usedImmCandidateForm;
             result.kind                 = _probeKind;
             result.sessionTag           = _sessionTag;
             _pAsyncOwner->OnAsyncCaretRectReady(result);
@@ -549,11 +637,16 @@ BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, Tf
                                                          RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart,
                                                          LONG compStartOffset,
                                                          BOOL* pUsedCompStartAsCaret,
-                                                         RECT* pCompRect, BOOL* pHasCompRect)
+                                                         RECT* pCompRect, BOOL* pHasCompRect,
+                                                         BOOL* pUsedImmCandidateForm)
 {
     if (pUsedCompStartAsCaret)
     {
         *pUsedCompStartAsCaret = FALSE;
+    }
+    if (pUsedImmCandidateForm)
+    {
+        *pUsedImmCandidateForm = FALSE;
     }
     if (pHasCompRect)
     {
@@ -592,6 +685,10 @@ BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, Tf
         if (pUsedCompStartAsCaret)
         {
             *pUsedCompStartAsCaret = pEditSession->UsedCompStartAsCaret();
+        }
+        if (pUsedImmCandidateForm)
+        {
+            *pUsedImmCandidateForm = pEditSession->UsedImmCandidateForm();
         }
         if (pCompRect && pHasCompRect)
         {

@@ -192,7 +192,11 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 - **引擎**：`is_exact_code` 改判等长，`comment = code`，`should_commit` / `should_clear` 恒 false，
   按协调器给的 `max_candidates` 查，硬上限 `WILDCARD_RESULT_LIMIT` = `engine::CANDIDATE_LIMIT_CAP`
   （5000，与翻页扩容上限同一常量；0 不下传 `search_pattern`）；结果带 `is_wildcard`，`source_tier`
-  把「通配 + 等长」放档 0。
+  把「通配 + 等长」放档 0。`wildcard_single_only` 开时在 `wildcard_query` 内按字素簇过滤、
+  不够则 ×2 重取（先滤后截，reverse-mode spec §2）。
+  `lookup_disabled_dicts`：`DisabledDictLayers`（影子层）独立于主 `DictManager`、首次通配懒加载，
+  `wildcard_query` 按 `(text, code)` 去重合并、`from_disabled_dict` 同档沉后；反查索引变体
+  `ReverseScope::WithDisabled` 只供候选注释四变量。
   混输代理主码表的通配键；有拼音子引擎时 `MixedEngine::convert_wildcard` = 字面 `convert(input)`
   ⊕ 主码表通配，`merge_wildcard` 按「通配等长 → 字面 → 通配更长」合并、码表间 `(text, code)`
   去重、拼音 / 英文与码表同字即丢、带拼音保底截断。通配码长走 `Engine::wildcard_code_length`
@@ -211,6 +215,9 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
     `expand_candidates` 的到底判据是**引擎条数未增**（`engine_count <= prev_limit`），对所有引擎生效
     ——按可见条数判，一批全被滤掉时会误判到底；重建后可见列表可能变短，由 `clamp_candidate_view`
     夹回页码与高亮。
+- **反查模式**：协调器 `handle_reverse` 把每个通配键位换成 `WILDCARD_SLOT`，经 `Engine::convert_reverse`
+  （同 `wildcard_query`、不看主开关、混输只查主码表），再过 `apply_filter`；翻页扩充 / 末页放宽按 active
+  分流到 `special_buffer`（反查里 `input_buffer` 恒空）。详见 `docs/design/codetable-reverse-mode.md`。
 - **overlay 门控**：临拼 / 快捷输入等 overlay 激活时 `wildcard_enters` 恒 false，不作通配。
 - **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位一律让位（照常出标点），故不动 C++
   透传标点集；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与

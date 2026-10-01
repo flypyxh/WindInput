@@ -70,6 +70,13 @@ const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 /// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
 pub(crate) const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
 
+#[cfg(test)]
+thread_local! {
+    /// 测试观察 [`Coordinator::warm_comment_reverse_index`] 被调了几次（按线程计，互不串）。
+    /// 它每次都要取 `code_source_schema`，混输下那是一次读方案文件，按键线程上不该逐候选调。
+    pub(crate) static WARM_COMMENT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 「正在建立词库索引…」提示延后多久才弹（见 `Coordinator::spawn_index_warm`）。
 ///
 /// 索引自 2026-08-24 起落盘为 `.wridx`，于是同一件事有两种量级完全不同的结果：
@@ -2797,7 +2804,8 @@ impl Coordinator {
         coordinator.notify_toolbar();
         // 码元集与按键功能的冲突体检（只告警）。默认字符集下直接返回，无开销。
         coordinator.warn_code_char_conflicts();
-        // 通配键与既有按键功能的冲突体检（只告警）。通配关闭时直接返回。
+        // 通配键与既有按键功能的冲突体检（只告警）：先查反查模式内的通配键（不看通配主开关，
+        // 反查模式不可用时跳过），再查组码中的通配键（通配关闭时跳过）。
         coordinator.warn_wildcard_conflicts();
         // 档位循环触发键的撞车体检（只告警）。出厂不配 ⇒ 默认直接返回。
         coordinator.warn_english_case_cycle_conflict();
@@ -4459,6 +4467,18 @@ impl Coordinator {
                 debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
             }
         }
+        // 候选注释反查的「含未启用扩展库」变体（reverse-mode spec §4.2）：开关开且方案有未启用库才建。
+        // 排在上面常规索引之后、同一线程上 ⇒ 两份串行，峰值内存不叠加。
+        let sid = self.engine_mgr.code_source_schema();
+        if self.engine_mgr.comment_reverse_scope(&sid) == wind_engine::ReverseScope::WithDisabled {
+            let t0 = std::time::Instant::now();
+            if self
+                .engine_mgr
+                .prewarm_reverse_index_in(&sid, wind_engine::ReverseScope::WithDisabled)
+            {
+                debug!("预热注释反查变体索引 {} 用时 {:?}", sid, t0.elapsed());
+            }
+        }
         // 辅助码引用的码表方案（`schema:<id>`，含临拼目标方案引用的）：进入辅助码的门卫
         // 要求其反查索引已就绪、按键线程绝不现建——不预热的话每次启动后第一次按辅助码键
         // 都静默不进。辅助码关着时集合为空，不白建。
@@ -4518,19 +4538,60 @@ impl Coordinator {
         self.spawn_index_warm(schema_id, true);
     }
 
+    /// 候选注释反查（`code_rev` / `code` / `code_rev_all` / `code_all`）取不到索引时调：
+    /// 注释范围是「含未启用扩展库」变体才需另建，常规那份由既有预热负责。
+    /// 只派活不等，去重同 [`Self::spawn_index_warm_in`]。
+    pub(crate) fn warm_comment_reverse_index(&self) {
+        #[cfg(test)]
+        WARM_COMMENT_CALLS.with(|n| n.set(n.get() + 1));
+        let sid = self.engine_mgr.code_source_schema();
+        let scope = self.engine_mgr.comment_reverse_scope(&sid);
+        if scope == wind_engine::ReverseScope::WithDisabled {
+            self.spawn_index_warm_in(&sid, scope, false);
+        }
+    }
+
     pub(crate) fn spawn_index_warm(&self, schema_id: &str, with_single_char: bool) {
+        self.spawn_index_warm_in(
+            schema_id,
+            wind_engine::ReverseScope::Enabled,
+            with_single_char,
+        );
+    }
+
+    /// [`Self::spawn_index_warm`] 的按范围版本。
+    ///
+    /// 变体（`WithDisabled`）的构建线程**先确保常规那份建好**再建变体：两份都是全量构建、
+    /// 各有各的构建锁，并行建会让峰值内存翻倍。常规那份本就会被预热（悬停 / 查重都要），
+    /// 先建它不是白干。常规那份正在建时变体这边不起线程——下一次重渲染或按键会再回到这里。
+    /// 常规那份已被连续崩溃保护跳过（`reverse_index_skipped`）时，变体也放弃、不再构建：
+    /// 同一批词库既然让常规索引反复崩溃，变体只会更大。
+    pub(crate) fn spawn_index_warm_in(
+        &self,
+        schema_id: &str,
+        scope: wind_engine::ReverseScope,
+        with_single_char: bool,
+    ) {
         if schema_id.is_empty() {
             return;
         }
-        let index_ready = self.engine_mgr.reverse_index_if_ready(schema_id).is_some();
+        let variant = scope == wind_engine::ReverseScope::WithDisabled;
+        let index_ready = self
+            .engine_mgr
+            .reverse_index_if_ready_in(schema_id, scope)
+            .is_some();
         let single_char_ready =
             !with_single_char || self.engine_mgr.single_char_codes_ready(schema_id);
         // 已被 build_guard 放弃的方案不再起线程：构建线程结束时会通知重绘，重绘又回到这里，
         // 不挡住就是「每次重绘起一个线程」的无限循环。造词缺了反查索引也做不了查重，
         // 故单字全码表一并不建。
         if (index_ready && single_char_ready)
-            || self.engine_mgr.reverse_index_skipped(schema_id)
-            || self.engine_mgr.is_building_reverse_index(schema_id)
+            || self.engine_mgr.reverse_index_skipped_in(schema_id, scope)
+            || self
+                .engine_mgr
+                .is_building_reverse_index_in(schema_id, scope)
+            || (variant && self.engine_mgr.reverse_index_skipped(schema_id))
+            || (variant && self.engine_mgr.is_building_reverse_index(schema_id))
         {
             return;
         }
@@ -4581,7 +4642,16 @@ impl Coordinator {
                     return;
                 };
                 let t0 = std::time::Instant::now();
-                let built_index = c.engine_mgr.prewarm_reverse_index(&sid);
+                if variant {
+                    // 串行：常规那份在别处建着就等它（单飞锁），没建就先建它。
+                    c.engine_mgr.prewarm_reverse_index(&sid);
+                    // 常规那份被崩溃保护跳过 ⇒ 变体也放弃（起线程时它可能还没被跳过）。
+                    if c.engine_mgr.reverse_index_skipped(&sid) {
+                        done.store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                }
+                let built_index = c.engine_mgr.prewarm_reverse_index_in(&sid, scope);
                 if with_single_char {
                     c.engine_mgr.prewarm_single_char_codes(&sid);
                 }
@@ -4591,7 +4661,12 @@ impl Coordinator {
                 if !built_index && !with_single_char {
                     return; // 等锁期间已被别的线程建好，且无别的活要干
                 }
-                debug!("后台建成词库索引 {} 用时 {:?}", sid, t0.elapsed());
+                debug!(
+                    "后台建成词库索引 {} {:?} 用时 {:?}",
+                    sid,
+                    scope,
+                    t0.elapsed()
+                );
                 // 重渲染当前这屏候选，把编码段补上——否则要等用户下一次按键。
                 // 与 reload_user_config / set_filter_mode 的「改完就地重刷」同构。
                 let s = c.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -5042,7 +5117,9 @@ impl Coordinator {
             Some(ModeKind::Url) => self.exit_url_mode(state),
             Some(ModeKind::Email) => self.exit_email_mode(state),
             Some(ModeKind::Unicode) => self.exit_unicode_mode(state),
-            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) => self.exit_special_mode(state),
+            Some(ModeKind::Special(_)) | Some(ModeKind::RareChar) | Some(ModeKind::Reverse) => {
+                self.exit_special_mode(state)
+            }
             Some(ModeKind::Mix(_)) => self.exit_mix_mode(state),
             // ★ 辅助码要**两步**：`exit_aux_code` 是本仓唯一一个「退出后主组合仍存活」的
             // 退出函数——它按设计还原拼音候选与 preedit（辅助码只是筛选，Esc 的语义是
@@ -5626,6 +5703,9 @@ impl Coordinator {
                 }
                 if self.is_temp_english_trigger(vk) {
                     owners.push("临时英文触发键");
+                }
+                if self.is_reverse_trigger(vk) {
+                    owners.push("反查模式触发键");
                 }
             }
             if !owners.is_empty() {
@@ -7140,7 +7220,12 @@ impl Coordinator {
         s.add_word_active
             || matches!(
                 s.active,
-                Some(ModeKind::TempPinyin | ModeKind::Special(_) | ModeKind::RareChar)
+                Some(
+                    ModeKind::TempPinyin
+                        | ModeKind::Special(_)
+                        | ModeKind::RareChar
+                        | ModeKind::Reverse
+                )
             )
     }
 
@@ -9204,7 +9289,7 @@ mod mode_comment_e2e_tests {
     /// `WM_HOTKEY` id 段（`GlobalHotkeys()` 全集）才卡死的。判据搬到服务端之后，这里是
     /// 唯一能挡住同类错误的地方。
     #[test]
-    fn hotkey_session_flag_covers_exactly_the_four_hotkey_modes() {
+    fn hotkey_session_flag_covers_exactly_the_hotkey_modes() {
         let (c, _rx) = coord_with_ui(Config::default());
 
         // 基线：什么都没有 ⇒ 不是会话。
@@ -9224,12 +9309,12 @@ mod mode_comment_e2e_tests {
         );
         c.state.lock().unwrap().input_buffer.clear();
 
-        // 四个模式逐个开、逐个关。
+        // 五个模式逐个开、逐个关。
         //
-        // 抽成别名是为了躲开 clippy::type_complexity；四个用例共用一个形状，
+        // 抽成别名是为了躲开 clippy::type_complexity；几个用例共用一个形状，
         // 给它一个名字反而把这件事写明白了。
         type StateMutator = Box<dyn Fn(&mut State)>;
-        let cases: [(&str, StateMutator); 4] = [
+        let cases: [(&str, StateMutator); 5] = [
             ("加词", Box::new(|st: &mut State| st.add_word_active = true)),
             (
                 "临拼",
@@ -9242,6 +9327,10 @@ mod mode_comment_e2e_tests {
             (
                 "生僻字",
                 Box::new(|st: &mut State| st.active = Some(ModeKind::RareChar)),
+            ),
+            (
+                "反查",
+                Box::new(|st: &mut State| st.active = Some(ModeKind::Reverse)),
             ),
         ];
         for (name, enter) in cases {
