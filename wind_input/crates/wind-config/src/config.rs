@@ -165,6 +165,11 @@ const RETIRED_KEYS: &[&[&str]] = &[
     &["ui", "tooltip", "pinyin_max_readings"],
     &["ui", "tooltip", "chaizi_enabled"],
     &["ui", "tooltip", "debug_enabled"],
+    // 反查模式改造（docs/design/codetable-reverse-mode.md §9）：总开关去掉、「含未启用扩展词库」挪成
+    // `input.reverse.lookup_disabled_dicts`。**不做值迁移**：两键只存在于 0.124.0 之后、0.125 之前的开发期，
+    // 从未随发布版到用户手里（判据同上面 english_code_scope）。
+    &["input", "reverse", "enabled"],
+    &["schema", "codetable", "lookup_disabled_dicts"],
     // ⛔ `ui.candidate.comment_max_chars`（已拆成 `_vertical` / `_horizontal`）**刻意不登记**。
     //
     // 本清单的不变量是上一段那句「删掉不改变任何生效值」，而该键**仍在被读取**——
@@ -2141,10 +2146,6 @@ pub struct CodetableGlobal {
     /// 与 `wildcard` 主开关正交。见 reverse-mode spec §2。
     #[serde(default)]
     pub wildcard_single_only: bool,
-    /// 通配、反查模式与候选注释反查可查到**未启用**的扩展词库
-    /// （`DictSpec::is_enabled() == false`）；普通打字候选不受影响。见 reverse-mode spec §4。
-    #[serde(default)]
-    pub lookup_disabled_dicts: bool,
     /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
     /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
     ///
@@ -2250,7 +2251,6 @@ impl Default for CodetableGlobal {
             wildcard: false,
             wildcard_key: default_wildcard_key(),
             wildcard_single_only: false,
-            lookup_disabled_dicts: false,
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -2321,9 +2321,6 @@ impl CodetableGlobal {
         }
         if let Some(v) = o.wildcard_single_only {
             out.wildcard_single_only = v;
-        }
-        if let Some(v) = o.lookup_disabled_dicts {
-            out.lookup_disabled_dicts = v;
         }
         // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
         //
@@ -4453,14 +4450,11 @@ pub struct RareCharConfig {
 
 /// 反查模式配置（[input.reverse]，reverse-mode spec §3）。
 ///
-/// 进入方式只由 `keys.key_actions` / 方案 `[key_actions]` / `z_key_action` 承载（动词
-/// `reverse`），出厂不绑任何键；`enabled` 是 spec §3.1 要求的总开关，关着时绑了键也不进
-/// （门卫在协调器 `reverse_mode_available`）。
+/// 进入方式只由 `keys.key_actions` / 方案 `[key_actions]` / `z_key_action`（动词 `reverse`）
+/// 承载，出厂不绑任何键 ⇒ 默认不可用；**没有**总开关，与生僻字（[`RareCharConfig`]）同。
+/// 绑了键还要活跃方案有反查能力（码表 / 五笔拼音混输），门卫在协调器 `reverse_mode_available`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReverseConfig {
-    /// 总开关。出厂关。
-    #[serde(default)]
-    pub enabled: bool,
     /// 反查模式期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
@@ -9704,36 +9698,6 @@ mod tests {
         );
     }
 
-    /// reverse-mode spec §4.2：一个方案级开关，三态折叠，出厂关。
-    #[test]
-    fn codetable_lookup_disabled_dicts_folds_from_schema() {
-        let g = CodetableGlobal::default();
-        assert!(!g.lookup_disabled_dicts, "出厂关闭");
-        let on = crate::schema::CodeTableSpec {
-            lookup_disabled_dicts: Some(true),
-            ..Default::default()
-        };
-        assert!(g.resolved(Some(&on)).lookup_disabled_dicts);
-        let global_on = CodetableGlobal {
-            lookup_disabled_dicts: true,
-            ..Default::default()
-        };
-        let off = crate::schema::CodeTableSpec {
-            lookup_disabled_dicts: Some(false),
-            ..Default::default()
-        };
-        assert!(
-            !global_on.resolved(Some(&off)).lookup_disabled_dicts,
-            "方案显式关压过全局"
-        );
-        assert!(
-            global_on
-                .resolved(Some(&crate::schema::CodeTableSpec::default()))
-                .lookup_disabled_dicts,
-            "方案没写 ⇒ 回落全局"
-        );
-    }
-
     /// ★ 便携闸门**只许挡便携这一侧**：非便携下 `user_config_marker_path()` 必须仍给出路径。
     ///
     /// `tests/portable_no_seen_marker.rs` 钉的是低后果那一侧（便携版多出一个没人读的
@@ -11253,6 +11217,31 @@ enable_english = true
         assert_eq!(prune_retired(&mut root), 0, "幂等：再跑一次删 0 个");
     }
 
+    /// 两个旧键进退役清单：清掉它们，同段活键不动；幂等。
+    #[test]
+    fn retired_reverse_keys_are_pruned() {
+        let mut root = tv(r#"
+[input.reverse]
+enabled = true
+candidate_layout = "vertical"
+lookup_disabled_dicts = true
+
+[schema.codetable]
+lookup_disabled_dicts = true
+wildcard = true
+"#);
+        assert_eq!(prune_retired(&mut root), 2);
+        assert!(get_nested(&root, &["input", "reverse", "enabled"]).is_none());
+        assert!(get_nested(&root, &["schema", "codetable", "lookup_disabled_dicts"]).is_none());
+        assert!(
+            get_nested(&root, &["input", "reverse", "lookup_disabled_dicts"]).is_some(),
+            "新键不得误删"
+        );
+        assert!(get_nested(&root, &["input", "reverse", "candidate_layout"]).is_some());
+        assert!(get_nested(&root, &["schema", "codetable", "wildcard"]).is_some());
+        assert_eq!(prune_retired(&mut root), 0);
+    }
+
     /// 父表被清空时应整段回收——用户配置里 `[schema.quick_input]` 常常只有这两个退役键。
     #[test]
     fn prune_retired_reclaims_emptied_parent_table() {
@@ -11846,6 +11835,19 @@ active = "x"
             toml::from_str(user_toml).expect("用例 TOML 应可解析"),
         );
         merged
+    }
+
+    /// ★ Review Focus 1：未发布即退役的两个键残留在用户配置里——不报错、不触发段级降级，同段的活键逐个完好。
+    #[test]
+    fn stale_reverse_keys_load_without_section_fallback() {
+        let merged = merged_user_value(
+            "[input.reverse]\nenabled = true\ncandidate_layout = \"vertical\"\nlookup_disabled_dicts = true\n\
+             [schema.codetable]\nlookup_disabled_dicts = true\nwildcard = true\n",
+        );
+        let cfg = Config::deserialize_with_section_fallback(merged);
+        assert_eq!(cfg.input.reverse.candidate_layout, LayoutIntent::Vertical);
+        assert!(cfg.input.reverse.lookup_disabled_dicts);
+        assert!(cfg.schema.codetable.wildcard, "同段活键不受旧键牵连");
     }
 
     /// `ui` 段的毒：`ui.font.scripts` 是 `BTreeMap<String, Vec<String>>`。
@@ -13532,12 +13534,12 @@ mod status_position_tests {
     #[test]
     fn reverse_config_defaults_off_and_parses() {
         let c = Config::default();
-        assert!(!c.input.reverse.enabled, "出厂关（reverse-mode spec §3.1）");
         assert_eq!(c.input.reverse.candidate_layout, LayoutIntent::Follow);
+        // 旧总开关 `enabled` 已退役：残留在串里被忽略，不影响同段其它字段。
         let t: ReverseConfig =
             toml::from_str("enabled = true\ncandidate_layout = \"vertical\"\n").unwrap();
-        assert!(t.enabled);
         assert_eq!(t.candidate_layout, LayoutIntent::Vertical);
+        assert!(!t.lookup_disabled_dicts);
         let bad: ReverseConfig = toml::from_str("candidate_layout = \"diagonal\"\n").unwrap();
         assert_eq!(
             bad.candidate_layout,

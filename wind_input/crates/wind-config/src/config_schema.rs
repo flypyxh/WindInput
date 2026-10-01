@@ -240,7 +240,6 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.wildcard", Bool),
     f("schema.codetable.wildcard_key", Str),
     f("schema.codetable.wildcard_single_only", Bool),
-    f("schema.codetable.lookup_disabled_dicts", Bool),
     // 码元字符集：范围+字面的自由文本（如 `a-x/`、`a-z0-9`），值域无法枚举故用 Str；
     // 解析与非法回落见 `CodeCharSet`。空 = 内置默认 `a-z`。
     f("schema.codetable.input_chars", Str),
@@ -485,8 +484,7 @@ static REGISTRY: &[ConfigField] = &[
     // 留在此处是**出厂声明处** + 设置端 key_action 控件的标识符。
     f("input.rare_char.trigger_keys", StrList),
     f("input.rare_char.include_blocks", StrList),
-    // 反查模式。进入方式只走 key_actions（动词 reverse），出厂不绑键；enabled 是总开关。
-    f("input.reverse.enabled", Bool),
+    // 反查模式。进入方式只走 key_actions（动词 reverse），出厂不绑键；没有总开关（绑键即可用）。
     f("input.reverse.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
     f("input.reverse.lookup_disabled_dicts", Bool),
     // Emoji 候选扩展（按候选文本查表追加，与编码域无关 ⇒ 全方案通用，故在 input 而非 schema）。
@@ -925,10 +923,6 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         (
             "schema.codetable.wildcard_single_only",
             ct.wildcard_single_only.is_some(),
-        ),
-        (
-            "schema.codetable.lookup_disabled_dicts",
-            ct.lookup_disabled_dicts.is_some(),
         ),
         // 码元字符集用空串表达「未设置」（见 `CodetableGlobal::resolved`）。
         ("schema.codetable.input_chars", !ct.input_chars.is_empty()),
