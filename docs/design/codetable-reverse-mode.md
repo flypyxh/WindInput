@@ -1,6 +1,6 @@
 # 码表反查模式 / 通配仅单字 / 反查含未启用扩展词库（设计）
 
-> **状态：P1–P3 已实施**（提交见 git log --grep 反查 / 通配）。实施计划见 `codetable-reverse-mode-plan.md`；实施中偏离见 §8。承接 `codetable-wildcard.md`（行内通配，已实施）。
+> **状态：P1–P3 已实施；0.125 发布前又做了一轮改造（去总开关、含扩展词库专属化、删注释反查变体），见 §9，与 §3.1 / §4 / §5 / §8 冲突处以 §9 为准**（提交见 git log --grep 反查 / 通配）。实施计划见 `codetable-reverse-mode-plan.md`；实施中偏离见 §8。承接 `codetable-wildcard.md`（行内通配，已实施）。
 > 该文 §8 把「专门的通配/反查模式（首位也想通配）」留待后续，本文即是。
 
 ## 1. 范围
@@ -11,13 +11,13 @@
 |---|---|---|
 | A | 通配仅单字 | 方案级开关，通配结果只留单字 |
 | B | 独立反查模式 | 用户自绑键进入；模式内输入本方案编码（含通配，**首位也可通配**），出候选 |
-| C | 反查含未启用扩展词库 | 方案级开关；通配 + 反查模式 + 注释反查都能查到 `is_enabled()==false` 的扩展库 |
+| C | 反查含未启用扩展词库 | 方案级开关；通配 + 反查模式 + 注释反查都能查到 `is_enabled()==false` 的扩展库（**已改，见 §9：全局键、只管反查模式**） |
 
 用户已拍板的决定：
 - B 的语义是「输入**本方案编码**（含通配）→ 出候选」，不是拼音反查（拼音反查沿用现有临时拼音）。
 - B 的进入方式：新增 `BoundAction` 动词，用户自绑键，出厂**不绑任何键、默认关**。
 - A 的形态：方案级独立开关，与 `wildcard` 主开关正交，不改 `wildcard` 的布尔契约。
-- C 的范围：方案级**一个**开关，覆盖通配 + 反查模式 + 注释反查；普通打字候选不受影响。
+- C 的范围：方案级**一个**开关，覆盖通配 + 反查模式 + 注释反查；普通打字候选不受影响。（已被 §9 取代）
 
 ## 2. A：通配仅单字
 
@@ -35,7 +35,7 @@
 
 - 新增 `BoundAction::Reverse`（键名 `reverse`）与 `ModeKind::Reverse`，按 `prefix-hijack-modes.md` §3 清单接线。
 - 触发键通过 `keys.key_actions` / 方案 `[key_actions]` 绑定（如 `semicolon = "reverse"`）；**出厂无绑定**，
-  模式开关 `input.reverse.enabled`（默认 `false`）。
+  模式开关 `input.reverse.enabled`（默认 `false`）。（**已被 §9 取代**：没有总开关，绑键即可用。）
 - 只在码表方案与混输方案（取主方案）生效；其他方案 `bound_action_yield_reason` 让位。
 - 把新动词补进 `is_any_mode_trigger` 与 `code_char_conflicts` 的 owners 链（既有规约：新增引导键类动词必须同步）。
   这样 §3.3 的首键冲突体检、行内通配的让位判据自动认得它。
@@ -67,14 +67,16 @@
 
 ### 4.2 设计
 
-- 配置：`schema.codetable.lookup_disabled_dicts`（bool，默认 `false`）。
+> **本节已被 §9 部分取代**：开关改为全局键 `input.reverse.lookup_disabled_dicts`、只管反查模式；「注释反查」变体整块删除；下面各条里与此冲突的以 §9 为准。
+
+- 配置：`schema.codetable.lookup_disabled_dicts`（bool，默认 `false`）。（已改，见 §9）
 - 新增引擎内的**影子层**（shadow layers）：与 `enabled` 层分开，仅由「通配 / 反查模式 / 注释反查」使用，
   **普通 `convert` 不看它**（这是「打字候选不受影响」的保证）。
 - 影子层**首次用到才加载**（复用 `CachedDict::load_at_with`、`reader_pool` 的 `Weak` 共享 mmap、`resolve_dict_file`/`cache_path`）；
   没开关或没用到时零开销。（实施后改为：开关开时由后台线程预热，见 §8.4。）
 - 合并规则：影子层结果与已启用层按 `(text, code)` 去重（沿用 Composite 语义），**已启用的排前**，影子层命中排后，
   排序仍走 `cmp_exact_first` + `base_sort`。
-- 注释反查：`ReverseIndex` 增加「含未启用库」的变体，缓存 key 带开关位（避免与常规索引串文件）；
+- 注释反查（**已被 §9 取代：变体已删除**）：`ReverseIndex` 增加「含未启用库」的变体，缓存 key 带开关位（避免与常规索引串文件）；
   仍只用 `reverse_index_if_ready`，未建好则后台建、本次不显示（沿用防卡死约束）。
   （实施后改为：变体未就绪时回退常规索引，先显示启用集里的码，见 §8.4。）
 - 失效：`set_dict_enabled_live`、方案重载、开关切换时清影子层与含未启用的反查索引。
@@ -93,7 +95,7 @@
 
 ## 5. 设置与文档
 
-- wind-config：`wildcard_single_only`、`lookup_disabled_dicts`（均 schema.codetable 下）、`input.reverse.{enabled,candidate_layout}`、`BoundAction::Reverse`。
+- wind-config：`wildcard_single_only`、`lookup_disabled_dicts`（均 schema.codetable 下）、`input.reverse.{enabled,candidate_layout}`、`BoundAction::Reverse`。（已改，见 §9：`enabled` 已删，`lookup_disabled_dicts` 挪到 `input.reverse`。）
 - wind-setting：manifest 三处新项（`dev.sh sg/st` 生成并跑测试）；注意 label 会撞拼音检索表（memory）。
 - WindInputDocs：`codetable.mdx` 通配输入节补 A/C；新增反查模式说明；`pnpm lint`。
 - `codetable-wildcard.md` 顶部范围声明与 §8 加指向本文的一句。
@@ -157,12 +159,12 @@
 - 通配键与导航键冲突的体检是静态判定，只看配置，不看运行时动态改键。
 - `special_id = 0` 与快符方案 0 撞车（继承自生僻字模式）。
 - 反查候选管线没有 `(text, code)` 去重，也没有「单字输入」开关的处理。
-- 「通配与反查含扩展词库」开着时，热禁用扩展库后通配会重新读入该库（重新 mmap）。
-- 变体索引文件在方案不再有未启用库后成为孤儿文件，不会自动清理。
-- 注释反查的方案来源不一致（改前已有，另立项）：后台预热取 `code_source_schema`，而 `code` / `code_rev` 取值读的是
+- 「含扩展词库」开着时，热禁用扩展库后**反查模式**会重新读入该库（重新 mmap）。（原表述是「通配会重新读入」，§9 改口。）
+- ~~变体索引文件在方案不再有未启用库后成为孤儿文件，不会自动清理。~~ 随变体删除而消解（§9.3）。
+- 注释反查的方案来源不一致（改前已有，另立项；变体那部分随 §9.3 消解，常规索引那部分仍在）：后台预热取 `code_source_schema`，而 `code` / `code_rev` 取值读的是
   `primary_codetable`，活跃方案不是主码表时两者可能不同，预热的那份与读取的那份对不上。
 - 反查键在拼音等不支持的方案里「让位」的那条分支只影响 debug 日志，行为上与没绑键相同。
-- 绑了 `reverse` 但 `input.reverse.enabled = false` 时，组合键仍会注册全局热键槽位（按下被吞、不进入），与临时拼音同款。
+- ~~绑了 `reverse` 但 `input.reverse.enabled = false` 时，组合键仍会注册全局热键槽位~~ 总开关已删，绑了即可用，该情形不再存在（§9.1）。
 - 生僻字模式同款问题（需另立项）：右键调整候选后主路径重建、清空候选。反查模式已把右键菜单收成只有「复制」规避。
 
 ### 8.4 最终审查后的修正
@@ -178,3 +180,45 @@
 - **变体未就绪时回退常规索引**：候选注释的 `code` / `code_rev` / `code_all` / `code_rev_all` 在变体还没建好、或被崩溃保护跳过时，
   改用常规索引（若它已就绪），先显示启用集里的码，变体就绪后自然升级；开关关时本就只用常规索引，路径不变。
   因为取到的不再是 `None`，协调器补建变体的信号改为「每次取值后都调 `warm_comment_reverse_index`」（已就绪 / 在建 / 被跳过时立即返回）。
+
+## 9. 改造（0.125 发布前）
+
+反查模式与「含未启用扩展词库」未随任何发布版到用户手里，发布前按下面四点收口。与 §3.1 / §4 / §5 / §8 冲突处以本节为准。
+
+### 9.1 去掉总开关
+
+- 删除 `input.reverse.enabled`。可用性 = **绑了进入键**（全局 `keys.key_actions` / 方案 `[key_actions]` 的 `reverse`，或 `z_key_action = "reverse"`）
+  **且活跃方案有反查能力**（码表 / 五笔拼音混输）。门卫仍是 `reverse_mode_available`，函数体只剩 `active_reverse_key().is_some()`。
+- 启动体检不能再靠 `enabled` 门控，否则每个码表方案只要通配键配在翻页等键上就被报冲突。改为**绑了才报**：
+  `reverse_bound_anywhere()` = 方案按键 ∪ 全局按键（含组合键）∪ `z_key_action`，任一解析为 `Reverse` 即真。
+- 经 z 键引导进入时，**z 是引导键、不是首位通配符**：预编辑 `zuia` 实际查的是 `uia`（等长 + 前缀补全）。想在首位通配，用符号键或组合键进入，再打通配键。
+
+### 9.2 含扩展词库专属化
+
+- 键由 `schema.codetable.lookup_disabled_dicts`（方案级）改为全局 `input.reverse.lookup_disabled_dicts`（默认 `false`），**只管反查模式**。
+- 引擎：`wildcard_query(include_disabled)`。`convert_reverse` 传 `true`，`convert_wildcard`（行内通配）传 `false`；影子层只在全局开关开时才挂到引擎，
+  传 `true` 即「挂了就查」。行内通配、普通 `convert`、候选注释都不看影子层。
+- 全局开关经 `EngineManager` 的镜像字段（`reverse_lookup_disabled`）进 `build_engine`；热重载由协调器 `engine_reload_needed` 收这一个键
+  （不收 `candidate_layout`，它只给协调器读）。后台预热（§8.4 的 `warm_disabled_dicts_async`）保留：首次读盘由后台预热，不落在按键线程上。
+- 混输：`convert_wildcard` / `convert_reverse` 分别代理主码表，随之生效。
+
+### 9.3 注释反查变体整块删除
+
+- 删除 `ReverseScope::WithDisabled`、`comment_reverse_scope`、含未启用库的 `.with_disabled.wridx`、协调器侧补建变体的信号。
+- **理由**：反查模式候选由 `wildcard_query` 统一标 `CodeTable` 来源，注释取 `c.comment = c.code`，不走反查索引；
+  `code` / `code_rev` / `code_all` / `code_rev_all` 四个变量只对 `Pinyin` 来源候选求值。变体唯一的消费方只剩拼音来源候选与 `dict.rev(...)`，
+  专属化之后没有存在的必要，还带来孤儿文件、范围缓存、方案来源不一致等负担。
+- **代价**：临时拼音等拼音来源候选、`dict.rev(...)` 的编码注释**只显示已启用库的码**（原先开关开时也含未启用库）。这是「专属」的必然结果。
+
+### 9.4 旧键处理
+
+- `input.reverse.enabled` 与 `schema.codetable.lookup_disabled_dicts` 进 `RETIRED_KEYS`，启动时由 `prune_user_config` 从用户 `config.toml` 清掉。
+  **不做值迁移**（两键从未随发布版到用户手里，与 `english_code_scope` 同一先例）。
+- 全仓无 `deny_unknown_fields`，两键即使残留也被 serde 静默忽略。方案覆盖文件里残留的 `[engine.codetable] lookup_disabled_dicts` 无清理机制，
+  忽略、无害；设置端方案页「重置」不再清它。
+
+### 9.5 已知遗留
+
+- `reverse_bound_anywhere` 是**保守并集**：方案、全局、z 键三层只要任一绑了 `reverse` 就算，**不按遮蔽裁剪**（例如全局绑的键被方案层覆盖成别的动词，
+  仍算绑过）。后果只是体检**多报**告警，不会漏报，也不影响实际按键行为。
+- `build_engine` 里混输方案递归构建 primary 时**透传**全局开关（secondary 同理），开关是参数而非引擎自存，改签名时需同步这几处。
