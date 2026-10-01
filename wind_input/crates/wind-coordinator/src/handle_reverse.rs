@@ -26,17 +26,30 @@ pub(crate) fn reverse_pattern(buffer: &str, key: char) -> String {
 }
 
 impl Coordinator {
-    /// 反查模式此刻能不能进：总开关 `input.reverse.enabled` 开，且活跃方案有反查通配键
-    /// （码表 / 混输的主码表才有；拼音等引擎给 `None`）。
+    /// 反查模式此刻能不能进：活跃方案有反查通配键（码表 / 混输的主码表才有；拼音等引擎给
+    /// `None`）。没有总开关——能不能触发只看有没有绑进入键，与临时拼音 / 临时英文 / 生僻字同。
     ///
     /// 门卫没过时调用方返回 `None` 让触发键落普通输入——绝不吞键（同 `enter_bound_action`）。
     pub(crate) fn reverse_mode_available(&self) -> bool {
-        self.rt().config.input.reverse.enabled && self.engine_mgr.active_reverse_key().is_some()
+        self.engine_mgr.active_reverse_key().is_some()
+    }
+
+    /// 反查动词在任一层绑了键：方案 `[key_actions]`、全局 `keys.key_actions`（单键与组合键）、`z_key_action`。
+    /// 只给启动体检门控用（没绑就谈不上「模式内冲突」）；按键路径的门卫仍是 [`Self::reverse_mode_available`]。
+    pub(crate) fn reverse_bound_anywhere(&self) -> bool {
+        use wind_config::BoundAction;
+        let any_rev = |m: &std::collections::BTreeMap<String, String>| {
+            m.values()
+                .any(|v| matches!(BoundAction::parse(v), BoundAction::Reverse))
+        };
+        any_rev(&self.engine_mgr.active_key_actions())
+            || any_rev(&self.rt().config.keys.key_actions)
+            || matches!(self.z_key_action(), BoundAction::Reverse)
     }
 
     /// 这个键是否绑了反查动词（方案 `[key_actions]` → 全局 → `z_key_action` 三层链）。
     ///
-    /// 只查绑定，不含可用性（`input.reverse.enabled` / 活跃方案有无反查通配键），与
+    /// 只查绑定，不含可用性（活跃方案有无反查通配键），与
     /// `is_temp_pinyin_trigger` 同口径；可用性门卫在 [`Self::reverse_mode_available`]。
     pub(crate) fn is_reverse_trigger(&self, key_code: u32) -> bool {
         matches!(
@@ -208,7 +221,6 @@ mod tests {
         cfg.schema.available = vec![id.clone()];
         cfg.schema.active = id.clone();
         cfg.input.default.chinese_mode = true;
-        cfg.input.reverse.enabled = true;
         cfg.keys
             .key_actions
             .insert("backslash".into(), "reverse".into());
@@ -330,14 +342,28 @@ mod tests {
         assert_eq!(c.debug_active_mode(), None);
     }
 
-    /// 出厂 `input.reverse.enabled = false`：绑了键也不进入，触发键落普通流程。
+    /// ★ Review Focus 5：没有总开关——绑了键就能进。
     #[test]
-    fn reverse_disabled_does_not_enter() {
-        let (c, _g) = coord("off", |cfg| cfg.input.reverse.enabled = false);
+    fn reverse_enters_with_binding_alone() {
+        let (c, _g) = coord("bound", |_| {});
+        key(&c, VK_BACKSLASH, false);
+        assert_eq!(c.debug_active_mode(), Some("reverse"));
+    }
+
+    /// ★ Review Focus 5：没绑键时反查动词不存在——`\` 照常走中文标点，体检也不报。
+    #[test]
+    fn unbound_trigger_falls_through_as_punct() {
+        let (c, _g) = coord("unbound", |cfg| {
+            cfg.keys.key_actions.remove("backslash");
+            cfg.schema.codetable.wildcard_key = "-".into();
+        });
         let act = press(&c, VK_BACKSLASH);
         assert_eq!(c.debug_active_mode(), None);
-        // 不吞键：`\` 照常走中文标点，产出「、」。
         assert_eq!(inserted(&act), Some("、"));
+        assert!(
+            c.reverse_wildcard_conflicts().is_empty(),
+            "没绑反查，不报反查通配键冲突"
+        );
     }
 
     /// 反查模式里的候选调整没有落点（查询串不是码位、模式内也不读 shadow）：

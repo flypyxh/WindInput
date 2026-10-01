@@ -47,13 +47,12 @@ fn letters(c: &Coordinator, s: &str) {
     }
 }
 
-/// 五笔 86 + `\` 绑反查 + 模式开。通配主开关默认关（反查不看它）。
+/// 五笔 86 + `\` 绑反查（绑键即可用，没有总开关）。通配主开关默认关（反查不看它）。
 fn wubi_rev() -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into()];
     cfg.schema.active = "wubi86".into();
     cfg.input.default.chinese_mode = true;
-    cfg.input.reverse.enabled = true;
     cfg.keys
         .key_actions
         .insert("backslash".into(), "reverse".into());
@@ -228,7 +227,7 @@ fn zz_phrases() -> Vec<wind_phrase::PhraseSeed> {
 }
 
 #[test]
-fn reverse_symbol_trigger_enters_only_when_enabled() {
+fn reverse_symbol_trigger_enters_when_bound() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
@@ -236,11 +235,11 @@ fn reverse_symbol_trigger_enters_only_when_enabled() {
     let c = Coordinator::new_headless(wubi_rev(), Some(&data_dir()));
     key(&c, VK_BACKSLASH, false);
     assert_eq!(c.debug_active_mode(), Some("reverse"));
-    let mut off = wubi_rev();
-    off.input.reverse.enabled = false;
-    let c = Coordinator::new_headless(off, Some(&data_dir()));
+    let mut unbound = wubi_rev();
+    unbound.keys.key_actions.remove("backslash");
+    let c = Coordinator::new_headless(unbound, Some(&data_dir()));
     key(&c, VK_BACKSLASH, false);
-    assert_eq!(c.debug_active_mode(), None, "总开关关：绑了键也不进");
+    assert_eq!(c.debug_active_mode(), None, "没绑反查键：不进");
 }
 
 /// ★ Review Focus 3：字母触发键是本方案首码（活码前缀）⇒ 让位作正常码；符号键不让位；
@@ -331,17 +330,19 @@ fn reverse_focus_lost_after_relax_leaves_no_residue() {
 
 /// 反查模式里 `handle_candidate_nav` 排在通配键进缓冲之前：通配键配成
 /// 翻页 / 选词键时模式内它先被导航吃掉，通配进不了缓冲。不改按键顺序，由体检报出。
-/// 对照：出厂通配键 `z` 不报；反查总开关关时不报（模式进不去，谈不上模式内冲突）。
+/// 对照：出厂通配键 `z` 不报；没绑反查键时不报（模式进不去，谈不上模式内冲突）。
 #[test]
 fn reverse_wildcard_key_on_nav_key_is_reported() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
-    let with_key = |k: &str, enabled: bool| {
+    let with_key = |k: &str, bound: bool| {
         let mut cfg = wubi_rev();
         cfg.schema.codetable.wildcard_key = k.into();
-        cfg.input.reverse.enabled = enabled;
+        if !bound {
+            cfg.keys.key_actions.remove("backslash");
+        }
         Coordinator::new_headless(cfg, Some(&data_dir())).reverse_wildcard_conflicts()
     };
     assert_eq!(with_key("-", true), vec!["翻页键"]);
@@ -349,7 +350,7 @@ fn reverse_wildcard_key_on_nav_key_is_reported() {
     // 随后反查的符号通配键臂排在选词臂之前，`;` 照常进缓冲（下方实跑）。
     assert!(with_key(";", true).is_empty(), "次选键不吃键，不报");
     assert!(with_key("z", true).is_empty(), "对照：出厂 z 无冲突");
-    assert!(with_key("-", false).is_empty(), "对照：总开关关不报");
+    assert!(with_key("-", false).is_empty(), "对照：没绑反查键不报");
 
     // 报的是真冲突：模式内按 `-` 被翻页吃掉，不进缓冲。
     let mut cfg = wubi_rev();

@@ -258,7 +258,7 @@ impl Coordinator {
             }
             // 反查（GH#146 同构）：五笔出厂 `zz*` 短语让首键 z 恒让位，不补这条回路，
             // `z_key_action = "reverse"` 永远进不去。字段与 `enter_reverse_mode` 同一组；
-            // 门卫同首键进入点（总开关 + 活跃方案有反查通配键），没过不夺取、不吞键。
+            // 门卫同首键进入点（活跃方案有反查通配键：码表 / 混输主码表），没过不夺取、不吞键。
             wind_config::BoundAction::Reverse => {
                 if !self.reverse_mode_available() {
                     return None;
