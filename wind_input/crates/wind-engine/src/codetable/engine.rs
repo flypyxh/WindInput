@@ -260,9 +260,11 @@ pub struct CodeTableEngine {
     segment_shadow: Option<(Arc<wind_store::Store>, String)>,
     /// 影子层：本方案未启用的扩展词库（reverse-mode spec §4.2）。
     ///
-    /// ★ **只在 [`Self::wildcard_query`] 读**——普通 `convert`（打字候选、活码探针、顶码、自动上屏复评）
-    /// 读它就是把未启用库漏进打字候选，spec §4.2「打字候选不受影响」的保证全靠这一条。
-    /// `None` = 开关关 / 无未启用库 / 测试未注入。
+    /// ★ **只在 [`Self::wildcard_query`] 且 `include_disabled` 时读**——即只有反查模式
+    /// （`convert_reverse`）读它；行内通配（`convert_wildcard`）与普通 `convert`（打字候选、
+    /// 活码探针、顶码、自动上屏复评）都不读。读了就是把未启用库漏进打字 / 行内通配候选，
+    /// 「未启用扩展库只给反查模式」的保证全靠这一条。
+    /// `None` = 开关（`input.reverse.lookup_disabled_dicts`）关 / 无未启用库 / 测试未注入。
     disabled_dicts: Option<super::DisabledDictLayers>,
 }
 
@@ -334,7 +336,7 @@ impl CodeTableEngine {
         self
     }
 
-    /// 注入影子层（未启用扩展词库，只给通配 / 反查查询用）。见 [`Self::disabled_dicts`] 字段。
+    /// 注入影子层（未启用扩展词库，只给反查模式查询用）。见 [`Self::disabled_dicts`] 字段。
     pub fn with_disabled_dicts(mut self, d: super::DisabledDictLayers) -> Self {
         self.disabled_dicts = Some(d);
         self
@@ -674,7 +676,16 @@ fn decide_auto_commit(
 
 impl CodeTableEngine {
     /// 通配查询内核（行内通配与反查模式共用）。语义见 `convert_wildcard`。
-    fn wildcard_query(&self, input: &str, pattern: &str, max_candidates: usize) -> ConvertResult {
+    ///
+    /// `include_disabled`：是否并查影子层（未启用扩展库）。`false` ⇒ 连 `search_pattern` 都不调
+    /// （不触发影子层加载），结果与没挂影子层时逐条相同。只有反查模式传 `true`。
+    fn wildcard_query(
+        &self,
+        input: &str,
+        pattern: &str,
+        max_candidates: usize,
+        include_disabled: bool,
+    ) -> ConvertResult {
         let n = pattern.chars().count();
         let with_prefix = !self.opts.single_code_input;
         // 按协调器给的上限查（spec §11），硬上限兜底。⚠️ 永不向 `search_pattern` 传 0：
@@ -689,10 +700,12 @@ impl CodeTableEngine {
                 let got =
                     self.dm
                         .search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix);
-                // 影子层（未启用扩展库，spec §4.2）：只在这里读，普通 convert 不看它。
+                // 影子层（未启用扩展库，spec §4.2）：只在这里、且只为反查模式读；
+                // 行内通配与普通 convert 不看它。
                 let disabled_hits = self
                     .disabled_dicts
                     .as_ref()
+                    .filter(|_| include_disabled)
                     .map(|d| {
                         d.search_pattern(pattern, wind_dict::WILDCARD_SLOT, fetch, with_prefix)
                     })
@@ -796,7 +809,7 @@ impl Engine for CodeTableEngine {
         // 未启用，关闭三者后「甘蓝菜」仍在。
         self.dm
             .unregister_layer(&format!("codetable-extra-{dict_id}"));
-        // 它从此是「未启用库」：进影子层（通配 / 反查仍可查到）。
+        // 它从此是「未启用库」：进影子层（反查模式仍可查到）。
         if let Some(d) = &self.disabled_dicts {
             d.mark_disabled(dict_id);
         }
@@ -1023,6 +1036,7 @@ impl Engine for CodeTableEngine {
     /// 逆切分、英文混入；「精确」改判「等长」（落在 `is_exact_code` 上，协调器重排沿用）；
     /// 注释恒为完整编码（学码价值所在，不受 `show_code_hint` 门控）；
     /// `should_commit` / `should_clear` 恒 false（spec §3.2）。
+    /// 不查影子层（未启用扩展库只给反查模式，见 `convert_reverse`）。
     fn convert_wildcard(
         &self,
         input: &str,
@@ -1030,7 +1044,7 @@ impl Engine for CodeTableEngine {
         max_candidates: usize,
     ) -> Option<ConvertResult> {
         self.opts.wildcard?;
-        Some(self.wildcard_query(input, pattern, max_candidates))
+        Some(self.wildcard_query(input, pattern, max_candidates, false))
     }
 
     fn reverse_wildcard_key(&self) -> Option<char> {
@@ -1042,7 +1056,9 @@ impl Engine for CodeTableEngine {
     }
 
     /// 反查模式查询（reverse-mode spec §3.2）：与 `convert_wildcard` 共用 `wildcard_query`，
-    /// 但不看 `wildcard` 主开关；仅单字 / 影子层随内核自动生效。
+    /// 但不看 `wildcard` 主开关；仅单字随内核自动生效。并查影子层（`include_disabled = true`）：
+    /// 影子层只在开关 `input.reverse.lookup_disabled_dicts` 开时才由 `build_engine` 挂上，
+    /// 挂了就查，引擎不另存开关。
     fn convert_reverse(
         &self,
         input: &str,
@@ -1050,7 +1066,7 @@ impl Engine for CodeTableEngine {
         max_candidates: usize,
     ) -> Option<ConvertResult> {
         self.opts.reverse_key?;
-        Some(self.wildcard_query(input, pattern, max_candidates))
+        Some(self.wildcard_query(input, pattern, max_candidates, true))
     }
 
     /// natural 模式（`base_sort = "natural"`）忽略权重：协调器据此对齐 `by_natural` 重排。
@@ -2783,7 +2799,10 @@ mod tests {
     fn plain_convert_never_touches_disabled_layers() {
         let e = with_xz(engine_opts(
             &[("uuif", "立法", 10)],
-            wildcard_opts(CommitOptions::default()),
+            CommitOptions {
+                reverse_key: Some('z'),
+                ..wildcard_opts(CommitOptions::default())
+            },
         ));
         for input in ["uuia", "uui", "u"] {
             let r = e.convert(input, 50).unwrap();
@@ -2794,7 +2813,7 @@ mod tests {
             0,
             "普通 convert 不触发加载"
         );
-        e.convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+        e.convert_reverse("uuiz", &slot_pattern("uui?"), 50)
             .unwrap();
         assert_eq!(e.disabled_dicts().unwrap().load_count(), 1);
         assert!(
@@ -2806,11 +2825,45 @@ mod tests {
         );
     }
 
+    /// ★ Review Focus 2：行内通配不读影子层，连加载都不触发；反查才读。
+    #[test]
+    fn convert_wildcard_never_reads_disabled_layers() {
+        let e = with_xz(engine_opts(
+            &[("uuif", "立法", 10)],
+            CommitOptions {
+                reverse_key: Some('z'),
+                ..wildcard_opts(CommitOptions::default())
+            },
+        ));
+        let r = e
+            .convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+            .unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .all(|c| c.text != "门头沟区" && !c.from_disabled_dict)
+        );
+        assert_eq!(
+            e.disabled_dicts().unwrap().load_count(),
+            0,
+            "行内通配不触发加载"
+        );
+        let r = e
+            .convert_reverse("uuiz", &slot_pattern("uui?"), 50)
+            .unwrap();
+        assert!(
+            r.candidates
+                .iter()
+                .any(|c| c.text == "门头沟区" && c.from_disabled_dict)
+        );
+        assert_eq!(e.disabled_dicts().unwrap().load_count(), 1);
+    }
+
     /// 仅单字 + 影子层。影子层的词组同样被滤掉；取尽判据是**双边**的——
     /// 首轮影子层没取满（35 < 100）但主层取满了（100 条全是词组），必须再取一轮才能把主层
     /// 被截掉的 10 个单字捞回来。若只看任一边就判取尽，结果会只剩影子层那 30 个。
     #[test]
-    fn wildcard_single_only_filters_disabled_hits_and_exhausts_on_both_sides() {
+    fn reverse_single_only_filters_disabled_hits_and_exhausts_on_both_sides() {
         let code = |i: u32| {
             let c1 = (b'a' + (i / 26) as u8) as char;
             let c2 = (b'a' + (i % 26) as u8) as char;
@@ -2835,16 +2888,17 @@ mod tests {
             .iter()
             .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
             .collect();
-        let e = engine_opts(&refs, single_only_opts()).with_disabled_dicts(
-            super::super::DisabledDictLayers::new(
+        let opts = CommitOptions {
+            reverse_key: Some('z'),
+            ..single_only_opts()
+        };
+        let e =
+            engine_opts(&refs, opts).with_disabled_dicts(super::super::DisabledDictLayers::new(
                 vec![disabled_mem("xz", &xz_refs)],
                 std::iter::empty(),
                 None,
-            ),
-        );
-        let r = e
-            .convert_wildcard("qzz", &slot_pattern("q??"), 100)
-            .unwrap();
+            ));
+        let r = e.convert_reverse("qzz", &slot_pattern("q??"), 100).unwrap();
         assert!(
             r.candidates
                 .iter()
@@ -2862,13 +2916,16 @@ mod tests {
 
     /// spec §4.2：`(text, code)` 去重（同键留已启用那条），已启用排前，档内再按 base_sort。
     #[test]
-    fn wildcard_merges_disabled_after_enabled_dedup_by_text_code() {
+    fn reverse_merges_disabled_after_enabled_dedup_by_text_code() {
         let e = with_xz(engine_opts(
             &[("uuif", "立法", 10), ("uuia", "重码", 1)],
-            wildcard_opts(CommitOptions::default()),
+            CommitOptions {
+                reverse_key: Some('z'),
+                ..wildcard_opts(CommitOptions::default())
+            },
         ));
         let r = e
-            .convert_wildcard("uuiz", &slot_pattern("uui?"), 50)
+            .convert_reverse("uuiz", &slot_pattern("uui?"), 50)
             .unwrap();
         let got: Vec<(&str, &str, bool)> = r
             .candidates
@@ -2885,7 +2942,7 @@ mod tests {
         );
     }
 
-    /// 禁用一个已加载的扩展库 ⇒ 主 dm 摘层（普通候选消失），同时它进影子层（通配仍可见）；
+    /// 禁用一个已加载的扩展库 ⇒ 主 dm 摘层（普通候选消失），同时它进影子层（反查仍可见）；
     /// 返回值语义不变（true = 目标态已达成）。
     #[test]
     fn set_dict_enabled_disable_moves_dict_into_disabled_layers() {
@@ -2905,7 +2962,11 @@ mod tests {
             build(&[("aaae", "甘蓝菜", 50)]),
             "codetable-extra-ext",
         )));
-        let e = CodeTableEngine::new(4, wildcard_opts(CommitOptions::default()), dm)
+        let opts = CommitOptions {
+            reverse_key: Some('z'),
+            ..wildcard_opts(CommitOptions::default())
+        };
+        let e = CodeTableEngine::new(4, opts, dm)
             .with_own_extra_dicts(["ext".to_string()])
             .with_disabled_dicts(super::super::DisabledDictLayers::new(
                 vec![disabled_mem("ext", &[("aaae", "甘蓝菜", 50)])],
@@ -2921,7 +2982,7 @@ mod tests {
                 .all(|c| c.text != "甘蓝菜")
         );
         let r = e
-            .convert_wildcard("aaaz", &slot_pattern("aaa?"), 20)
+            .convert_reverse("aaaz", &slot_pattern("aaa?"), 20)
             .unwrap();
         assert!(
             r.candidates

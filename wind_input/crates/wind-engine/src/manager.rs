@@ -451,6 +451,12 @@ pub struct EngineManager {
     /// 不在 `schema` 段里，`english` 镜像够不着它。与 `temp_pinyin` 同构地整份镜像而非
     /// 只存一个 bool：下一个需要它的字段来了不必再改一次结构。
     temp_english: Mutex<wind_config::config::TempEnglishConfig>,
+    /// 全局 `input.reverse.lookup_disabled_dicts` 的镜像；只在 `new` 与 `reload_from_config` 写，
+    /// `ensure_loaded` 读出交给 `build_engine` 决定挂不挂影子层（未启用扩展库，只给反查模式）。
+    ///
+    /// ⚠️ `reload_from_config` 里必须写在 `engines.clear()` **之前**，否则末尾那次
+    /// `ensure_loaded` 会拿旧值建引擎；协调器侧 `engine_reload_needed` 也必须收这个键。
+    reverse_lookup_disabled: std::sync::atomic::AtomicBool,
     /// 不参与词频的字符区块（`schema.frequency.exclude_blocks` 的**解析结果**）。
     ///
     /// 存解析后的 [`wind_candidate::BlockMask`] 而不是原始 `Vec<String>`：解析要按名字线性
@@ -798,6 +804,9 @@ impl EngineManager {
             shared_english_engine: Mutex::new(None),
             temp_pinyin: Mutex::new(config.input.temp_pinyin.clone()),
             temp_english: Mutex::new(config.input.temp_english.clone()),
+            reverse_lookup_disabled: std::sync::atomic::AtomicBool::new(
+                config.input.reverse.lookup_disabled_dicts,
+            ),
             // 用户层在 store 里（`wind_store::charsets`），装配前先 `as_deref` 借用，
             // 下一行才把 `store` 本体 move 进结构体。
             charsets: Mutex::new(Arc::new(Self::build_charsets(
@@ -1681,10 +1690,10 @@ impl EngineManager {
 
     /// 后台预热 `schema_id` 已加载引擎的影子层（未启用扩展词库，reverse-mode spec §4.2）。
     ///
-    /// 影子层是懒加载的：没有这一步，首次通配 / 反查查询会在**按键线程**上（持协调器 state 锁）
+    /// 影子层是懒加载的：没有这一步，首次反查模式查询会在**按键线程**上（持协调器 state 锁）
     /// 逐库 mmap、缺缓存时还要现建 wdat——扩展库大时整机顿住。这里把那次加载挪到后台线程。
     ///
-    /// - **零开销前提**：开关关或方案没有扩展库时引擎根本不挂影子层，这里一查即返回、不起线程；
+    /// - **零开销前提**：开关（`input.reverse.lookup_disabled_dicts`）关或方案没有扩展库时引擎根本不挂影子层，这里一查即返回、不起线程；
     ///   只看**已加载**的引擎，不触发构建（调用点可能在按键线程上）。
     /// - **去重**：已建好或正有线程在建（`needs_warm` 用 `try_lock` 判）就不再起。
     /// - **与按键线程串行**：加载持影子层内部那把锁。按键线程若撞上正在进行的预热就等它建完、
@@ -2500,6 +2509,10 @@ impl EngineManager {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .phrase_seg;
+        // 反查模式专属的「含未启用扩展库」开关（全局镜像），决定 `build_engine` 挂不挂影子层。
+        let lookup_disabled_dicts = self
+            .reverse_lookup_disabled
+            .load(std::sync::atomic::Ordering::Relaxed);
         // 混输分支据此取**共享**英文引擎而不是另建一份。闭包在 `build_engine` 内部求值，
         // 故 `enable_english` 关着时英文引擎一次都不会被建出来。
         //
@@ -2529,6 +2542,7 @@ impl EngineManager {
             self.override_dir.as_deref(),
             &pinyin_cfg,
             phrase_seg_anywhere,
+            lookup_disabled_dicts,
             // 顶层入口：方案自身是拼音时不加约束（简拼开）。混输在其内部为 secondary 注入。
             None,
             english_provider,
@@ -3611,6 +3625,12 @@ impl EngineManager {
         // 同上：`phrase_seg` 变更要能让下方 `engines.clear()` 重建的引擎读到新值。
         *self.temp_english.lock().unwrap_or_else(|e| e.into_inner()) =
             config.input.temp_english.clone();
+        // 反查模式「含未启用扩展库」开关：必须在下方 `engines.clear()` 之前写，末尾那次
+        // `ensure_loaded` 才会按新值挂 / 摘影子层。
+        self.reverse_lookup_disabled.store(
+            config.input.reverse.lookup_disabled_dicts,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // 字符类：**重新装配**而不是照搬字符串——镜像存的是解析结果。漏掉这一行的
         // 症状是设置页改了不生效、重启后才生效（`freq_cache` 在下面被清，会拿着旧的重建）。
         *self.charsets.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Self::build_charsets(
@@ -5456,6 +5476,10 @@ impl EngineManager {
         // `convert` 的 `input.contains(sep)`
         // 就早退，分词路径恒不触发。本参数只决定「引擎要不要具备这个能力、要不要预热索引」。
         phrase_seg_anywhere: bool,
+        // `lookup_disabled_dicts`：全局 `input.reverse.lookup_disabled_dicts`（经
+        // `EngineManager::reverse_lookup_disabled` 镜像传入）。开 ⇒ 码表引擎挂影子层（未启用扩展库，
+        // 只给反查模式读）；混输递归构建子引擎时原样透传。
+        lookup_disabled_dicts: bool,
         mixed_role: Option<MixedRole>,
         // `english_provider`：混输分支取英文子引擎的通道，见 [`EnglishProvider`]。
         // 非混输分支一概不碰它。
@@ -5496,6 +5520,7 @@ impl EngineManager {
                 override_dir,
                 pinyin_cfg,
                 phrase_seg_anywhere,
+                lookup_disabled_dicts,
                 Some(MixedRole::Primary {
                     // 取**混输方案自己**声明的值，不继承 primary_schema 的（见 MixedRole::Primary）。
                     sentence_input: schema.engine.codetable.sentence_input,
@@ -5537,6 +5562,7 @@ impl EngineManager {
                     override_dir,
                     pinyin_cfg,
                     phrase_seg_anywhere,
+                    lookup_disabled_dicts,
                     Some(MixedRole::Secondary(MixPinyinOpts {
                         abbrev: mix_cfg.enable_pinyin_abbrev,
                     })),
@@ -5935,10 +5961,10 @@ impl EngineManager {
             let mut engine = CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
                 .with_charset(charset)
                 .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema));
-            // 影子层（未启用扩展库，只给通配 / 反查用，spec §4.2）：开关关或无扩展库时不挂。
-            // 混输的主码表子引擎也走这里，开关取主码表方案折叠出的 `eff`（混输自身没有独立的
-            // 码表配置，与其余码表行为同一口径）；英文分支不接。
-            if eff.lookup_disabled_dicts
+            // 影子层（未启用扩展库，只给反查模式用，spec §4.2）：开关关或无扩展库时不挂。
+            // 开关取全局 `input.reverse.lookup_disabled_dicts`（反查模式专属，不再是方案级）；
+            // 混输的主码表子引擎同样由它决定；英文分支不接。
+            if lookup_disabled_dicts
                 && let Some(d) = Self::disabled_dict_layers(&schema, &schemas, loaded_extra_ids)
             {
                 engine = engine.with_disabled_dicts(d);
@@ -6091,7 +6117,7 @@ impl EngineManager {
     /// `load` 闭包与 `load_codetable_layers` 同一条读盘路径（`resolve_dict_file` + `cache_path` +
     /// `CachedDict::load_at_with`），**只返回 `Result`、不 panic**：失败由影子层 `warn!` 后跳过该库
     /// （spec §4.3）。它可能 mmap 或首建 wdat，大扩展库上是秒级读盘，故由后台线程预热
-    /// （[`Self::warm_disabled_dicts_async`]），不留给首次通配 / 反查的按键线程；预热没赶上时
+    /// （[`Self::warm_disabled_dicts_async`]），不留给首次反查模式查询的按键线程；预热没赶上时
     /// 按键线程等它建完或自己现建，之后复用，直到失效重建。开关关着时影子层不挂，从不调用。
     fn disabled_extra_sources(
         schema: &Schema,
@@ -6120,7 +6146,8 @@ impl EngineManager {
     /// 组装影子层：来源见 [`Self::disabled_extra_sources`]，启用集 = 本次 `load_codetable_layers`
     /// **实际挂上**的扩展库 id（不是 `is_enabled()`：用户覆盖启用的已挂上、不进影子；启用但加载
     /// 失败的算未挂，影子层会再试一次、再失败也只 warn）。主库恒不在来源里。
-    /// 无扩展库 ⇒ `None`，不挂：没有可查的未启用库，就不该为它付任何构造或预热开销。开关由调用方判。
+    /// 无扩展库 ⇒ `None`，不挂：没有可查的未启用库，就不该为它付任何构造或预热开销。
+    /// 开关（全局 `input.reverse.lookup_disabled_dicts`，影子层只给反查模式读）由调用方判。
     fn disabled_dict_layers(
         schema: &Schema,
         schemas_dir: &Path,

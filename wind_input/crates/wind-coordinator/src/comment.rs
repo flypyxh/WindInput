@@ -3260,7 +3260,7 @@ mod comment_reverse_regular_tests {
         let mut cfg = Config::default();
         cfg.schema.available = vec![id.clone()];
         cfg.schema.active = id.clone();
-        cfg.schema.codetable.lookup_disabled_dicts = on;
+        cfg.input.reverse.lookup_disabled_dicts = on;
         (
             Coordinator::new_headless(cfg, Some(&dir)),
             Cleanup { id, dir },

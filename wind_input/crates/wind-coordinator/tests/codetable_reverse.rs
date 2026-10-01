@@ -443,7 +443,7 @@ fn reverse_mode_sees_disabled_dicts_when_on() {
     let off = rev_triples(wubi_rev(), "zuia");
     assert!(off.iter().all(|(t, _, _)| t != "门头沟区"));
     let mut cfg = wubi_rev();
-    cfg.schema.codetable.lookup_disabled_dicts = true;
+    cfg.input.reverse.lookup_disabled_dicts = true;
     let on = rev_triples(cfg, "zuia");
     let pos = on
         .iter()

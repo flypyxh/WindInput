@@ -1269,11 +1269,13 @@ fn mixed_single_only_keeps_pinyin_words() {
     );
 }
 
-// ─────────────── 通配含未启用扩展词库（reverse-mode spec §4） ───────────────
+// ─────────────── 未启用扩展词库只给反查模式（reverse-rework） ───────────────
 // 样本：「门头沟区 uuia」只在未启用的 wubi86_xzqy（default_enabled = false），主库 / extra 无 uuia 码。
+// 开关 `input.reverse.lookup_disabled_dicts` 开着时，行内通配与普通打字都必须与关时逐条相同；
+// 反查模式那一侧见 tests/codetable_reverse.rs。
 
 fn lookup_disabled(mut cfg: Config) -> Config {
-    cfg.schema.codetable.lookup_disabled_dicts = true;
+    cfg.input.reverse.lookup_disabled_dicts = true;
     cfg
 }
 
@@ -1283,32 +1285,18 @@ fn tri_of(cfg: Config, keys: &str) -> Vec<(String, String, String)> {
     coord.debug_candidate_triples()
 }
 
+/// ★ Review Focus 2（真实数据）：开关开着，行内通配与关时逐条相同，不出未启用库的「门头沟区」。
 #[test]
-fn lookup_disabled_dicts_inline_wildcard_sees_xzqy() {
+fn lookup_disabled_dicts_inline_wildcard_excludes_xzqy() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
     let off = tri_of(wubi(true, "z"), "uuiz");
-    assert!(
-        off.iter().all(|(t, _, _)| t != "门头沟区"),
-        "对照：关时不可见"
-    );
     let on = tri_of(lookup_disabled(wubi(true, "z")), "uuiz");
-    let pos = on
-        .iter()
-        .position(|(t, c, _)| t == "门头沟区" && c == "uuia")
-        .unwrap_or_else(|| panic!("开后应可见：{on:?}"));
-    let last_enabled_equal = on
-        .iter()
-        .rposition(|(t, c, _)| {
-            c.len() == 4 && t != "门头沟区" && off.iter().any(|(ot, oc, _)| ot == t && oc == c)
-        })
-        .unwrap();
-    assert!(
-        last_enabled_equal < pos,
-        "已启用的等长结果全在它之前：{on:?}"
-    );
+    assert!(!off.is_empty(), "前置：行内通配有结果（防空过）");
+    assert_eq!(on, off);
+    assert!(on.iter().all(|(t, _, _)| t != "门头沟区"), "{on:?}");
 }
 
 /// ★ Review Focus 1（真实数据）：开关开着，普通打字的候选逐条不变（含前缀补全与活码字母）。
@@ -1327,16 +1315,14 @@ fn lookup_disabled_dicts_leaves_plain_typing_identical() {
     }
 }
 
-/// spec §4.2：混输取主方案的开关，通配侧同样可见。
+/// 混输：开关开着，主码表子引擎的行内通配同样不出未启用库。
 #[test]
-fn mixed_lookup_disabled_dicts_follows_primary() {
+fn mixed_inline_wildcard_excludes_xzqy() {
     if !mixed_ready() {
         eprintln!("跳过：五笔 / 混输方案数据不存在");
         return;
     }
     let on = tri_of(lookup_disabled(wubi_pinyin(true)), "uuiz");
-    assert!(
-        on.iter().any(|(t, c, _)| t == "门头沟区" && c == "uuia"),
-        "{on:?}"
-    );
+    assert!(!on.is_empty(), "前置：混输行内通配有结果（防空过）");
+    assert!(on.iter().all(|(t, _, _)| t != "门头沟区"), "{on:?}");
 }

@@ -1,4 +1,5 @@
-//! 未启用扩展词库的通配 / 注释反查（reverse-mode spec §4），自造夹具，不依赖 build_dev/data。
+//! 未启用扩展词库只给反查模式（reverse-rework；开关 `input.reverse.lookup_disabled_dicts`）：
+//! 行内通配与普通打字不看它，注释反查只认已启用词库。自造夹具，不依赖 build_dev/data。
 
 use std::path::{Path, PathBuf};
 use wind_config::Config;
@@ -83,7 +84,7 @@ fn manager(dir: &Path, id: &str, on: bool) -> EngineManager {
     cfg.schema.available = vec![id.into()];
     cfg.schema.active = id.into();
     cfg.schema.codetable.wildcard = true;
-    cfg.schema.codetable.lookup_disabled_dicts = on;
+    cfg.input.reverse.lookup_disabled_dicts = on;
     EngineManager::with_store_override(&cfg, Some(dir), None, Some(dir.join("ov")))
 }
 
@@ -100,12 +101,65 @@ fn wc_texts(m: &EngineManager, input: &str, pat: &str) -> Vec<String> {
         .collect()
 }
 
+fn rev_texts(m: &EngineManager, input: &str, pat: &str) -> Vec<String> {
+    m.convert_reverse(input, &slot(pat), 50)
+        .unwrap_or_default()
+        .candidates
+        .into_iter()
+        .map(|c| c.text)
+        .collect()
+}
+
+/// 反查模式：开关开才查未启用扩展库，排在已启用之后。
 #[test]
-fn wildcard_sees_disabled_extra_only_when_switch_on() {
+fn reverse_sees_disabled_extra_only_when_switch_on() {
     let (on, _id, _g) = setup("on", true, true, true);
-    assert_eq!(wc_texts(&on, "uuiz", "uui?"), ["立法", "门头沟区"]);
+    assert_eq!(rev_texts(&on, "uuiz", "uui?"), ["立法", "门头沟区"]);
     let (off, _id2, _g2) = setup("off", false, true, true);
-    assert_eq!(wc_texts(&off, "uuiz", "uui?"), ["立法"]);
+    assert_eq!(rev_texts(&off, "uuiz", "uui?"), ["立法"]);
+}
+
+/// ★ Review Focus 2（接线层）：开关开着，行内通配照旧看不到未启用库。
+#[test]
+fn inline_wildcard_never_sees_disabled_extra() {
+    let (m, _id, _g) = setup("inline", true, true, true);
+    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
+}
+
+/// ★ Review Focus 3：全局开关经 reload_from_config 切换后，影子层随引擎重建挂上 / 摘掉。
+#[test]
+fn global_switch_reload_attaches_and_detaches_layers() {
+    let (m, id, g) = setup("reload", false, true, true);
+    assert!(m.prewarm_schema(&id));
+    assert_eq!(m.disabled_dicts_load_count(&id), None, "关：不挂");
+    let cfg_with = |on: bool| {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec![id.clone()];
+        cfg.schema.active = id.clone();
+        cfg.schema.codetable.wildcard = true;
+        cfg.input.reverse.lookup_disabled_dicts = on;
+        cfg
+    };
+    m.reload_from_config(&cfg_with(true));
+    assert_eq!(wait_disabled_loaded(&m, &id), Some(1), "开：挂上并后台预热");
+    assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法", "门头沟区"]);
+    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
+    m.reload_from_config(&cfg_with(false));
+    assert_eq!(m.disabled_dicts_load_count(&id), None, "关：摘掉");
+    assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法"]);
+    drop(g);
+}
+
+/// ★ Review Focus 1：方案覆盖文件里残留旧的方案级键，不再挂影子层。
+#[test]
+fn stale_schema_level_override_does_not_attach_layers() {
+    let (m, id, _g) = setup("stale_ov", false, true, true);
+    let ov: toml::Value =
+        toml::from_str("[engine.codetable]\nlookup_disabled_dicts = true\n").unwrap();
+    m.write_schema_override(&id, &ov).unwrap();
+    assert!(m.prewarm_schema(&id));
+    assert_eq!(m.disabled_dicts_load_count(&id), None);
+    assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
 /// ★ Review Focus 1（接线层）：开关开着，普通 convert 照旧看不到未启用库。
@@ -123,7 +177,7 @@ fn plain_convert_ignores_disabled_extra_with_switch_on() {
     }
 }
 
-/// 热禁用已启用扩展库 ⇒ 普通候选消失、通配经影子层仍可见。
+/// 热禁用已启用扩展库 ⇒ 普通候选消失、反查经影子层仍可见；行内通配看不到。
 #[test]
 fn live_disable_moves_extra_into_lookup() {
     let (m, id, _g) = setup("live", true, true, true);
@@ -140,14 +194,15 @@ fn live_disable_moves_extra_into_lookup() {
             .iter()
             .all(|c| c.text != "甘蓝菜")
     );
-    assert!(wc_texts(&m, "aaaz", "aaa?").contains(&"甘蓝菜".to_string()));
+    assert!(rev_texts(&m, "aaaz", "aaa?").contains(&"甘蓝菜".to_string()));
+    assert!(!wc_texts(&m, "aaaz", "aaa?").contains(&"甘蓝菜".to_string()));
 }
 
-/// spec §4.3：未启用库文件缺失 ⇒ 跳过（warn），通配照常出主库结果。
+/// spec §4.3：未启用库文件缺失 ⇒ 跳过（warn），反查照常出主库结果。
 #[test]
 fn missing_disabled_file_is_skipped() {
     let (m, _id, _g) = setup("missing", true, true, false);
-    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
+    assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
 /// 影子层只收未启用的扩展库——主库、已启用扩展库的命中恒不带未启用标记，
@@ -156,7 +211,7 @@ fn missing_disabled_file_is_skipped() {
 fn only_disabled_extra_hits_carry_the_flag() {
     let (m, _id, _g) = setup("flag", true, true, true);
     let flags = |pat: &str, input: &str| -> Vec<(String, bool)> {
-        m.convert_wildcard(input, &slot(pat), 50)
+        m.convert_reverse(input, &slot(pat), 50)
             .unwrap_or_default()
             .candidates
             .into_iter()
@@ -182,18 +237,18 @@ fn wait_disabled_loaded(m: &EngineManager, id: &str) -> Option<usize> {
     }
 }
 
-/// 开关开：引擎建好后影子层由后台线程预热，首次通配不再在按键线程上读盘（只建一遍）。
+/// 开关开：引擎建好后影子层由后台线程预热，首次反查不再在按键线程上读盘（只建一遍）。
 #[test]
 fn disabled_layers_warm_in_background_when_switch_on() {
     let (m, id, _g) = setup("warm_on", true, true, true);
     assert!(m.prewarm_schema(&id));
     assert_eq!(wait_disabled_loaded(&m, &id), Some(1), "后台预热应已建好");
     assert!(!m.prewarm_disabled_dicts(&id), "已建好，不再建");
-    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法", "门头沟区"]);
+    assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法", "门头沟区"]);
     assert_eq!(
         m.disabled_dicts_load_count(&id),
         Some(1),
-        "首次通配复用预热结果"
+        "首次反查复用预热结果"
     );
 }
 
@@ -204,7 +259,7 @@ fn switch_off_never_warms_disabled_layers() {
     assert!(m.prewarm_schema(&id));
     assert_eq!(m.disabled_dicts_load_count(&id), None);
     assert!(!m.prewarm_disabled_dicts(&id));
-    assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
+    assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
 /// ★ Review Focus 4：开关开着，注释 / 悬停 / 查重一律只认已启用词库；不存在能带出未启用库编码的路径。
@@ -224,21 +279,24 @@ fn no_variant_index_file_is_written() {
     let (m, id, _g) = setup("nofile", true, true, true);
     assert!(m.prewarm_reverse_index(&id));
     let _ = m.codetable_reverse_hint("立法");
-    if let Some(dir) = Config::cache_dir().map(|c| c.join(&id)) {
-        let names: Vec<String> = std::fs::read_dir(&dir)
-            .map(|it| {
-                it.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let regular = format!("{id}.wridx");
-        assert!(
-            names
-                .iter()
-                .filter(|n| n.ends_with(".wridx"))
-                .all(|n| *n == regular),
-            "{names:?}"
-        );
-    }
+    let Some(dir) = Config::cache_dir().map(|c| c.join(&id)) else {
+        eprintln!("跳过 no_variant_index_file_is_written：没有缓存根，本测试没有真正运行");
+        return;
+    };
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let regular = format!("{id}.wridx");
+    assert!(names.contains(&regular), "{names:?}");
+    assert!(
+        names
+            .iter()
+            .filter(|n| n.ends_with(".wridx"))
+            .all(|n| *n == regular),
+        "{names:?}"
+    );
 }

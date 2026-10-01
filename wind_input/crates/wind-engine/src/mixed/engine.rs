@@ -884,7 +884,7 @@ impl Engine for MixedEngine {
         self.primary.reverse_wildcard_key()
     }
 
-    /// 影子层：代理主码表（通配 / 反查只查主码表）。
+    /// 影子层：代理主码表（只有反查模式读它，而反查只查主码表）。
     fn disabled_dict_layers(&self) -> Option<&crate::codetable::DisabledDictLayers> {
         self.primary.disabled_dict_layers()
     }

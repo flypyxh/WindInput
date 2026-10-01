@@ -1,4 +1,4 @@
-//! 影子层（reverse-mode spec §4.2）：本方案**未启用**的扩展词库，只给码表通配 / 反查查询用。
+//! 影子层（reverse-mode spec §4.2）：本方案**未启用**的扩展词库，只给码表的反查模式查询用（行内通配不读）。
 //!
 //! 代码里不叫 shadow——本仓「shadow」已专指候选调整（`apply_shadow` / `segment_shadow`），避免混淆。
 //!
