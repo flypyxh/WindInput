@@ -17,7 +17,7 @@ windows = { workspace = true }
 libc = "0.2"
 
 [features]
-# Linux 上作为外部宿主（Fcitx5 addon）的服务端：见 build.rs 的 `host_render` 别名。默认关。
+# Linux 上作为外部宿主（Fcitx5 addon）的服务端：见 build.rs 的 `ext_presenter` 别名。默认关。
 linux-host = []
 
 [lints]

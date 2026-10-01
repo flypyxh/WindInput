@@ -53,7 +53,7 @@ default = ["desktop-ui"]
 # 桌面渲染路径：UiManager/剪贴板直通/macOS forwarder。关掉即 headless/Android
 # 形态——生产构造器 `new` 不可用，走 `new_headless_with_ui` + 注入 HostServices。
 desktop-ui = ["dep:wind-ui"]
-# Linux 外部宿主（Fcitx5 addon）形态：见 build.rs 的 `host_render` 别名。默认关。
+# Linux 外部宿主（Fcitx5 addon）形态：见 build.rs 的 `ext_presenter` 别名。默认关。
 linux-host = ["desktop-ui", "wind-ui/linux-host", "wind-bridge/linux-host"]
 
 [dev-dependencies]

@@ -6,7 +6,9 @@ edition.workspace = true
 [features]
 # Linux 上作为外部宿主（Fcitx5 addon）的服务端：启用 host-render forwarder 与真实文本后端。默认关，
 # 关闭时 Linux 仍是 mock 文本（开发机 `cargo test` 行为不变），见 build.rs 的 `ext_presenter` / `mock_text`。
-linux-host = ["dep:ttf-parser", "dep:ab_glyph_rasterizer", "dep:rustybuzz"]
+# 连带打开 wind-bridge 的同名 feature：两个 crate 的 `ext_presenter` 必须一致，否则单独
+# `-p wind-ui --features linux-host` 时 wind-bridge 那边缺 Linux 外部宿主的那部分。
+linux-host = ["dep:ttf-parser", "dep:ab_glyph_rasterizer", "dep:rustybuzz", "wind-bridge/linux-host"]
 
 [dependencies]
 # 表现层协议类型（UiCommand/UiEvent 等）的定义处；本 crate 原路径 pub use 再导出。
