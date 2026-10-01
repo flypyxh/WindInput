@@ -72,17 +72,53 @@ pub fn push_socket_path(suffix: &str) -> PathBuf {
 /// 后缀与 socket 目录同源（`variant_suffix`），对齐 Swift
 /// `CandidatePanelHost` 的 `"/WindInput_SHM\(BridgeEndpoints.variantSuffix)"`；
 /// 不一致的话 dev 变体开出的是两段互不相干的共享内存，候选框永远拿不到帧。
+///
+/// Linux 外部宿主形态带 uid：`/WindInput{变体后缀}.<uid>`（见 [`shm_name_for_uid`]）。
+/// macOS 不变（Swift 写死了名字，且 `/dev/shm` 式的全系统共用问题在那边由沙箱规避）。
 pub fn shm_name(suffix: &str) -> String {
-    let suffix = variant_suffix(suffix);
-    let name = format!("/WindInput_SHM{suffix}");
-    debug_assert!(name.len() <= 31, "shm name too long: {name}");
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    return shm_name_for_uid(suffix, current_uid());
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
+    {
+        let suffix = variant_suffix(suffix);
+        let name = format!("/WindInput_SHM{suffix}");
+        debug_assert!(name.len() <= 31, "shm name too long: {name}");
+        name
+    }
+}
+
+/// Linux 的 SHM 名：`/WindInput{变体后缀}.<uid>`，与 addon `Bridge.cpp::shmNameForUid` 同一规则
+/// （两侧单测钉同一组样例）。
+///
+/// 为什么带 uid：POSIX shm 落在全系统共用的 `/dev/shm`。不带的话同机第二个用户的服务
+/// 建不了段（上一个用户的同名段 `shm_unlink` 得 EPERM、`O_EXCL` 得 EEXIST），候选窗 / 气泡 /
+/// 菜单全失效；别的用户还能抢先建个同名段喂假帧（addon 另按属主拒收）。
+///
+/// 长度：`/WindInput`(10) + `Dev`(3) + `.`(1) + uid（u32 至多 10 位）+ 层后缀（至多 `_MN5` 4）
+/// = 28 ≤ 31。31 是 macOS 的 PSHMNAMLEN（Linux 实际上限是 NAME_MAX 255），两平台守同一个数。
+/// 测试用的未知后缀原样透传（`_debug` 6 字节时最长 31，仍不越界）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub fn shm_name_for_uid(suffix: &str, uid: u32) -> String {
+    let name = format!("/WindInput{}.{uid}", variant_suffix(suffix));
+    debug_assert!(name.len() + "_MN5".len() <= 31, "shm name too long: {name}");
     name
+}
+
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn current_uid() -> u32 {
+    // SAFETY: getuid 无参数、总是成功。
+    unsafe { libc::getuid() }
 }
 
 /// Linux 光栅浮层（`CMD_OVERLAY_FRAME`）各层的 SHM 名：候选窗那段 + 层后缀。一层一段，
 /// 候选窗与气泡同时在屏上时互不覆盖。后缀与 Windows host-render（`host_render_windows.rs`
 /// 的 `KIND_SUFFIXES`）同形；Toast 那层 Windows 没有。未知层返回 `None`。
 pub fn overlay_shm_name(suffix: &str, kind: u32) -> Option<String> {
+    Some(format!("{}{}", shm_name(suffix), overlay_tail(kind)?))
+}
+
+/// 层后缀：`_TIP` / `_STS` / `_TST` / `_MN<k>`。
+fn overlay_tail(kind: u32) -> Option<String> {
     use wind_ipc::protocol::overlay::*;
     let tail = match kind {
         OVERLAY_KIND_TOOLTIP => "_TIP".to_string(),
@@ -94,7 +130,7 @@ pub fn overlay_shm_name(suffix: &str, kind: u32) -> Option<String> {
         }
         _ => return None,
     };
-    Some(format!("{}{tail}", shm_name(suffix)))
+    Some(tail)
 }
 
 #[cfg(test)]
@@ -193,10 +229,42 @@ mod tests {
         );
     }
 
+    /// macOS（及不开 linux-host 的 Linux）：名字一字不变，Swift 那边写死的是同一个串。
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn shm_name_has_leading_slash_and_suffix() {
         assert_eq!(shm_name(""), "/WindInput_SHM");
         assert_eq!(shm_name("_debug"), "/WindInput_SHM_debug");
+    }
+
+    /// Linux 外部宿主：带 uid。样例与 addon `bridge_test`（`shmNameForUid`）逐字相同，
+    /// 那边读本文件核对这几个字面量——改规则两侧一起改。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[test]
+    fn linux_shm_name_carries_uid() {
+        use wind_ipc::protocol::overlay::*;
+        assert_eq!(shm_name_for_uid("", 1000), "/WindInput.1000");
+        assert_eq!(
+            format!(
+                "{}{}",
+                shm_name_for_uid("", 1000),
+                overlay_tail(OVERLAY_KIND_STATUS).unwrap()
+            ),
+            "/WindInput.1000_STS"
+        );
+        let longest = format!(
+            "{}{}",
+            shm_name_for_uid("_dev", u32::MAX),
+            overlay_tail(OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS - 1).unwrap()
+        );
+        assert_eq!(longest, "/WindInputDev.4294967295_MN5");
+        assert!(longest.len() <= 31);
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(shm_name("_dev"), format!("/WindInputDev.{uid}"));
+        assert_eq!(
+            overlay_shm_name("", OVERLAY_KIND_TOAST).as_deref(),
+            Some(format!("/WindInput.{uid}_TST").as_str())
+        );
     }
 
     /// dev 变体的目录名必须是 `WindInputDev`（变体风格），不是把管道后缀 `_dev`
@@ -247,6 +315,7 @@ mod tests {
     }
 
     /// SHM 名与 socket 目录同源：dev 走变体风格，未知后缀原样透传。
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn overlay_shm_name_appends_kind_suffix() {
         use wind_ipc::protocol::overlay::*;
@@ -274,6 +343,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
     #[test]
     fn shm_name_maps_dev_suffix_like_socket_dir() {
         assert_eq!(shm_name("_dev"), "/WindInput_SHMDev");

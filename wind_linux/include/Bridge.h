@@ -27,11 +27,19 @@ std::string variantSuffix();
 std::string runtimeDir();
 std::string requestSocketPath();
 std::string pushSocketPath();
-/// POSIX SHM 名：`/WindInput_SHM{Dev}`（与 Rust `endpoint.rs::shm_name` 对齐）。
+/// POSIX SHM 名：`/WindInput{Dev}.<uid>`（与 Rust `endpoint.rs::shm_name` 的 Linux 外部宿主
+/// 分支对齐；macOS 仍是 `/WindInput_SHM{Dev}`，Swift 写死，不动）。
+///
+/// 带 uid：`/dev/shm` 全系统共用，不带的话同机第二个用户的服务建不了段（`O_EXCL` 撞名、
+/// `shm_unlink` EPERM），别的用户还能抢先建个同名段。长度：`/WindInput`(10) + `Dev`(3) + `.`(1)
+/// + uid（u32 至多 10 位）+ 层后缀（至多 `_MN5` 4）= 28 ≤ 31。守 31 是 macOS 的 PSHMNAMLEN（Linux
+/// 实际上限是 NAME_MAX 255），两平台同一条规则，Rust 侧 debug_assert 同一个数。
 std::string shmName();
-/// 光栅浮层某一层的 SHM 名：`shmName()` + `_TIP` / `_STS` / `_TST`，菜单第 k 级 `_MN<k>`
-/// （与 Rust `endpoint.rs::overlay_shm_name` 对齐）。未知层返回空串。
-std::string overlayShmName(uint32_t kind);
+/// 同上，uid 显式给（单测钉样例用）。
+std::string shmNameForUid(uint32_t uid);
+/// 光栅浮层某一层的 SHM 名：`base`（缺省 `shmName()`）+ `_TIP` / `_STS` / `_TST`，菜单第 k 级
+/// `_MN<k>`（与 Rust `endpoint.rs::overlay_shm_name` 对齐）。未知层返回空串。
+std::string overlayShmName(uint32_t kind, const std::string& base = shmName());
 
 // ── 请求/响应 ────────────────────────────────────────────────────────
 

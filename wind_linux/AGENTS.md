@@ -137,7 +137,7 @@ e2e 的坑，都踩过：
 
 ## 候选窗（X11）
 
-与 macOS 同构：服务进程光栅化（BGRA 预乘 alpha）→ 写 POSIX SHM `/WindInput_SHM[Dev]` →
+与 macOS 同构：服务进程光栅化（BGRA 预乘 alpha）→ 写 POSIX SHM `/WindInput[Dev].<uid>` →
 push `CMD_HOST_RENDER_FRAME`（坐标 + flags）与 `CMD_CANDIDATE_RECTS`（命中矩形，晚于帧）。
 addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧，交 `X11CandidatePanel` 呈现。
 
@@ -155,6 +155,12 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
   （光标高估 18px）、`FLAG_ABSOLUTE_POS` 只钳制不翻转。工作区取根窗口尺寸。
 - **SHM 与重启**：收到 `SERVICE_READY` 关掉旧映射（服务重启会 unlink + 重建段，旧映射成孤儿、
   候选窗卡在旧帧），下一帧按名重开。
+- **SHM 名带 uid、打开先 `fstat`**：`/dev/shm` 全系统共用，名字不带 uid 时同机第二个用户的服务
+  建不了段（`shm_unlink` EPERM、`O_EXCL` EEXIST）。macOS 名字不变（`/WindInput_SHM[Dev]`，Swift
+  写死）。addon 打开后先 `fstat`：属主不是本用户就拒绝（别人抢先建的同名段）；比一个帧头还小也
+  拒绝、下一帧再开——服务端 `shm_open(O_CREAT)` 与 `ftruncate` 之间段大小为 0，按 4MB 映射一读就
+  SIGBUS、带走整个 fcitx5；映射取 `min(实际大小, 4MB)`，帧头里的尺寸再按映射大小校验。剩余风险：
+  别的用户抢先建了我们的名字，服务端建不了段（候选窗不显示），但拿不到也伪造不了内容。
 - 悬停只报候选下标（≥0）：命中表里 -1/-2 是翻页按钮，而悬停协议里 -1 表示「无」。点击翻页
   按钮直接发负下标的 `CMD_CANDIDATE_SELECT`（服务端按 -1 上页 / -2 下页处理）。滚轮 ±120。
 
@@ -162,7 +168,7 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 
 **与 macOS 分道**：`.app` 用原生 NSPanel 排字，服务只发文本 + 配色（`CMD_STATUS_SHOW` 等）；
 本 addon 不排字，这三者与候选窗同构——服务进程按主题光栅化（`wind-ui/src/overlay_linux.rs`，
-真实字形走 `text/linux`），像素写进**各层自己的** SHM 段（`/WindInput_SHM[Dev]` + `_TIP` /
+真实字形走 `text/linux`），像素写进**各层自己的** SHM 段（`/WindInput[Dev].<uid>` + `_TIP` /
 `_STS` / `_TST`，`overlayShmName`），再推 `CMD_OVERLAY_FRAME`（0x0513，68 字节，布局见
 `Codec.h` 的 `OverlayFramePayload`）。macOS 行为不变：Linux 专属代码全在
 `cfg(all(target_os = "linux", ext_presenter))` 下，macOS 仍发文本帧。

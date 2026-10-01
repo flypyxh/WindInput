@@ -53,7 +53,9 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
   → `/tmp/wind_input{_dev}`。socket 是运行时状态，不落盘。
 - 配置：`~/.config/WindInput[Dev]`（`dirs::config_dir`）；缓存/日志：`~/.local/share/WindInput[Dev]`。
 - data：服务可执行文件同目录的 `data/`（`variant::install_root`）；FHS 打包时再议。
-- 已知：SHM 名 `/WindInput_SHM` 是全局的，多用户同机会撞；单用户桌面暂不处理。
+- SHM 名（Linux）：`/WindInput[Dev].<uid>` + 层后缀（`_TIP` / `_STS` / `_TST` / `_MN<k>`），带 uid
+  免得多用户同机撞名（`/dev/shm` 全系统共用）；最长 28 字节，守 macOS 的 31 字节上限。macOS 仍是
+  `/WindInput_SHM[Dev]`。addon 映射前 `fstat` 校验属主与大小（见 `wind_linux/AGENTS.md`「候选窗」）。
 
 ## 5. 系统能力（`wind-ui/src/linux_host.rs`）
 

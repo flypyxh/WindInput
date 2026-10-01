@@ -116,6 +116,49 @@ void TestOpenMissing()
     CHECK(!r.snapshot(f));
 }
 
+void TestOpenGuards()
+{
+    CASE("段还没定长（O_CREAT 与 ftruncate 之间，大小 0）：拒绝映射——按 4MB 映射一读就 SIGBUS");
+    {
+        std::string name = "/wl_zero_" + std::to_string(getpid());
+        shm_unlink(name.c_str());
+        int fd = shm_open(name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
+        CHECK(fd >= 0);
+        ShmFrameReader r;
+        CHECK(!r.open(name));
+        CHECK(!r.isOpen());
+        CHECK(r.lastError().find("字节") != std::string::npos);
+        // 定长之后下一帧就打得开。
+        CHECK(ftruncate(fd, 4096) == 0);
+        CHECK(r.open(name));
+        close(fd);
+        shm_unlink(name.c_str());
+    }
+
+    CASE("段比 4MB 小：只映射实际大小，帧头声称的像素越过段尾时拒收（不 SIGBUS）");
+    {
+        FakeServiceShm svc(4096);
+        ShmFrameReader r;
+        CHECK(r.open(svc.name)); // 缺省按 4MB 上限，实际只映射 4096
+        svc.write(1, 0, 0, 100, 100, 0); // 40000 字节像素，段只有 4096
+        SharedFrame f;
+        CHECK(!r.snapshot(f));
+        svc.write(2, 0, 0, 4, 4, 0x33); // 放得下的帧照常读
+        CHECK(r.snapshot(f));
+        CHECK_EQ(f.bgra.size(), size_t(64));
+    }
+
+    CASE("段的属主不是本用户（别人抢先建的同名段）：拒绝映射");
+    {
+        FakeServiceShm svc(4096);
+        ShmFrameReader r;
+        CHECK(!r.open(svc.name, ShmFrameReader::kDefaultSize, ShmFrameReader::currentUid() + 1));
+        CHECK(!r.isOpen());
+        CHECK(r.lastError().find("属主") != std::string::npos);
+        CHECK(r.open(svc.name, ShmFrameReader::kDefaultSize, ShmFrameReader::currentUid()));
+    }
+}
+
 void TestPlacement()
 {
     const Rect wa{0, 0, 1920, 1080};
@@ -227,6 +270,7 @@ int main()
     TestReadFrame();
     TestRejectBad();
     TestOpenMissing();
+    TestOpenGuards();
     TestPlacement();
     TestOverlayPlacement();
     TestHitTest();

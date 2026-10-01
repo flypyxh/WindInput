@@ -15,6 +15,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
+#include <fstream>
+#include <sstream>
 #include <unistd.h>
 #include <vector>
 
@@ -392,14 +394,41 @@ void TestEndpoints()
     setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
     setenv("WIND_VARIANT", "release", 1);
     CHECK(runtimeDir() == "/run/user/1000/WindInput");
-    CHECK(shmName() == "/WindInput_SHM");
+    const std::string uid = std::to_string(getuid());
+    CHECK(shmName() == "/WindInput." + uid);
     setenv("WIND_VARIANT", "DEV", 1);
     CHECK(runtimeDir() == "/run/user/1000/WindInputDev");
-    CHECK(shmName() == "/WindInput_SHMDev");
-    CHECK(overlayShmName(OVERLAY_KIND_STATUS) == "/WindInput_SHMDev_STS");
-    CHECK(overlayShmName(OVERLAY_KIND_TOOLTIP) == "/WindInput_SHMDev_TIP");
-    CHECK(overlayShmName(OVERLAY_KIND_TOAST) == "/WindInput_SHMDev_TST");
+    CHECK(shmName() == "/WindInputDev." + uid);
+    CHECK(overlayShmName(OVERLAY_KIND_STATUS) == "/WindInputDev." + uid + "_STS");
+    CHECK(overlayShmName(OVERLAY_KIND_TOOLTIP) == "/WindInputDev." + uid + "_TIP");
+    CHECK(overlayShmName(OVERLAY_KIND_TOAST) == "/WindInputDev." + uid + "_TST");
     CHECK(overlayShmName(0).empty());
+
+    CASE("SHM 名带 uid：与 Rust endpoint.rs 钉同一组样例；最长的也不超过 31 字节");
+    // 样例同时写在 endpoint.rs 的 Linux 测试里（下面读源码核对），两侧规则改一边当场红。
+    const std::string longest =
+        overlayShmName(OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS - 1, shmNameForUid(4294967295u));
+    CHECK_EQ(longest, std::string("/WindInputDev.4294967295_MN5"));
+    CHECK(longest.size() <= 31);
+    setenv("WIND_VARIANT", "release", 1);
+    CHECK_EQ(shmNameForUid(1000), std::string("/WindInput.1000"));
+    CHECK_EQ(overlayShmName(OVERLAY_KIND_STATUS, shmNameForUid(1000)),
+             std::string("/WindInput.1000_STS"));
+    setenv("WIND_VARIANT", "DEV", 1);
+    {
+        std::ifstream in(std::string(WIND_REPO_DIR) + "/wind_input/crates/wind-bridge/src/endpoint.rs");
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const std::string rs = ss.str();
+        CHECK(!rs.empty());
+        for (const char* sample : {"\"/WindInputDev.4294967295_MN5\"", "\"/WindInput.1000\"",
+                                   "\"/WindInput.1000_STS\""}) {
+            if (rs.find(sample) == std::string::npos) {
+                std::printf("  endpoint.rs 里没有样例 %s\n", sample);
+                CHECK(false);
+            }
+        }
+    }
     unsetenv("XDG_RUNTIME_DIR");
     CHECK(runtimeDir() == "/tmp/wind_input_dev");
     unsetenv("WIND_VARIANT");

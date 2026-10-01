@@ -739,7 +739,7 @@ void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
         return;
     }
     if (!shm_.isOpen() && !shm_.open(shmName())) {
-        WIND_WARN() << "打不开候选窗共享内存 " << shmName();
+        WIND_WARN() << "打不开候选窗共享内存 " << shmName() << "：" << shm_.lastError();
         return;
     }
     SharedFrame f;
@@ -809,7 +809,7 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
     ShmFrameReader& shm = overlayShm_[p.kind - 1];
     const std::string name = overlayShmName(p.kind);
     if (!shm.isOpen() && !shm.open(name)) {
-        WIND_WARN() << "打不开浮层共享内存 " << name;
+        WIND_WARN() << "打不开浮层共享内存 " << name << "：" << shm.lastError();
         return;
     }
     SharedFrame f;
@@ -829,7 +829,7 @@ void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
     ShmFrameReader& shm = menuShm_[level];
     const std::string name = overlayShmName(p.kind);
     if (!shm.isOpen() && !shm.open(name)) {
-        WIND_WARN() << "打不开菜单共享内存 " << name;
+        WIND_WARN() << "打不开菜单共享内存 " << name << "：" << shm.lastError();
         return;
     }
     SharedFrame f;

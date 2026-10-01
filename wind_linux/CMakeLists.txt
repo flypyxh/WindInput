@@ -7,7 +7,7 @@
 #
 # 选项：
 #   WIND_BUILD_ADDON   构建 Fcitx5 addon（需 Fcitx5Core 开发包）；关掉则只编纯逻辑库与单测
-#   WIND_VARIANT_DEV   编出 dev 变体（运行时目录 WindInputDev、SHM 名 /WindInput_SHMDev）
+#   WIND_VARIANT_DEV   编出 dev 变体（运行时目录 WindInputDev、SHM 名 /WindInputDev.<uid>）
 cmake_minimum_required(VERSION 3.16)
 project(wind_linux VERSION 0.1.0 LANGUAGES CXX)
 

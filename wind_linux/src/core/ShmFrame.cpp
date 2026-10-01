@@ -3,28 +3,56 @@
 #include "ExtProtocol.h"
 #include "Protocol.h"
 
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace windlinux {
 
-bool ShmFrameReader::open(const std::string& name, size_t size)
+uint32_t ShmFrameReader::currentUid()
+{
+    return uint32_t(::getuid());
+}
+
+bool ShmFrameReader::open(const std::string& name, size_t maxSize, uint32_t owner)
 {
     close();
     int fd = ::shm_open(name.c_str(), O_RDONLY, 0);
     if (fd < 0) {
+        lastError_ = std::string("shm_open: ") + std::strerror(errno);
         return false;
     }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        lastError_ = std::string("fstat: ") + std::strerror(errno);
+        ::close(fd);
+        return false;
+    }
+    if (uint32_t(st.st_uid) != owner) {
+        lastError_ = "段的属主是 uid " + std::to_string(st.st_uid) + "，不是本用户，拒绝映射";
+        ::close(fd);
+        return false;
+    }
+    if (st.st_size < off_t(sizeof(SharedRenderHeader))) {
+        lastError_ = "段只有 " + std::to_string(st.st_size) + " 字节（服务端还没定长），下一帧再试";
+        ::close(fd);
+        return false;
+    }
+    const size_t size = std::min(size_t(st.st_size), maxSize);
     void* p = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) {
+        lastError_ = std::string("mmap: ") + std::strerror(errno);
         ::close(fd);
         return false;
     }
     fd_ = fd;
     ptr_ = p;
     size_ = size;
+    lastError_.clear();
     return true;
 }
 

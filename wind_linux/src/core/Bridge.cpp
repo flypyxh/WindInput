@@ -191,24 +191,29 @@ std::string pushSocketPath()
     return runtimeDir() + "/bridge_push.sock";
 }
 
-std::string shmName()
+std::string shmNameForUid(uint32_t uid)
 {
-    return "/WindInput_SHM" + variantSuffix();
+    return "/WindInput" + variantSuffix() + "." + std::to_string(uid);
 }
 
-std::string overlayShmName(uint32_t kind)
+std::string shmName()
+{
+    return shmNameForUid(uint32_t(::getuid()));
+}
+
+std::string overlayShmName(uint32_t kind, const std::string& base)
 {
     switch (kind) {
     case OVERLAY_KIND_TOOLTIP:
-        return shmName() + "_TIP";
+        return base + "_TIP";
     case OVERLAY_KIND_STATUS:
-        return shmName() + "_STS";
+        return base + "_STS";
     case OVERLAY_KIND_TOAST:
-        return shmName() + "_TST";
+        return base + "_TST";
     default:
         // 菜单每级一段：`_MN0`、`_MN1`…
         if (kind >= OVERLAY_KIND_MENU && kind < OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS) {
-            return shmName() + "_MN" + std::to_string(kind - OVERLAY_KIND_MENU);
+            return base + "_MN" + std::to_string(kind - OVERLAY_KIND_MENU);
         }
         return {};
     }

@@ -38,8 +38,16 @@ public:
     ShmFrameReader(const ShmFrameReader&) = delete;
     ShmFrameReader& operator=(const ShmFrameReader&) = delete;
 
-    /// 按名只读打开。服务未建段时失败（ENOENT），调用方下一帧再试。
-    bool open(const std::string& name, size_t size = kDefaultSize);
+    /// 按名只读打开，映射 `min(段的实际大小, maxSize)`。失败（原因见 `lastError`）时调用方
+    /// 下一帧再试：
+    ///   - 服务未建段（ENOENT）；
+    ///   - 段的属主不是 `owner`（缺省本用户）——别的用户抢先建的同名段，内容不可信；
+    ///   - 段比一个帧头还小：服务端 `shm_open(O_CREAT)` 与 `ftruncate` 之间大小为 0，这时按
+    ///     4MB 映射、一读就 SIGBUS，连 fcitx5 一起带走。
+    /// 映射以实际大小为界，`snapshot` 再按映射大小校验帧头里的尺寸，读不出界。
+    bool open(const std::string& name, size_t maxSize = kDefaultSize, uint32_t owner = currentUid());
+    const std::string& lastError() const { return lastError_; }
+    static uint32_t currentUid();
     bool isOpen() const { return ptr_ != nullptr; }
     /// 服务重启会 shm_unlink + 重建段（新 inode），旧映射成了孤儿：收到 SERVICE_READY 必须
     /// close，下一帧按名重开。
@@ -52,6 +60,7 @@ private:
     int fd_ = -1;
     void* ptr_ = nullptr;
     size_t size_ = 0;
+    std::string lastError_;
 };
 
 // ── 落位 ────────────────────────────────────────────────────────────
