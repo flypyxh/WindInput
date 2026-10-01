@@ -6,6 +6,7 @@
 #include "Codec.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -37,14 +38,33 @@ std::string overlayShmName(uint32_t kind);
 /// 阻塞式 UDS 客户端。**不是线程安全的**：同一连接上「发一帧、读一帧」必须配对，从别的
 /// 线程往里插帧会把两边的读写配对错开（macOS 侧 frontCtx 专用连接就是为此而设）。
 ///
-/// 两条保命设置：
-///   - I/O 超时（默认 2000ms）：服务卡死/重启时同步读超时报错，而不是把 Fcitx5 主线程
-///     无限挂住（那会让整个桌面的输入都卡死）。
+/// 保命设置（addon 跑在 fcitx5 主进程里，这里卡住就是整个桌面的输入卡住）：
+///   - I/O 超时（默认 2000ms），**连 connect 一起管**：超时在 connect 之前就设好——服务整体
+///     停住（SIGSTOP、死锁）时 listen 队列塞满，AF_UNIX 的 connect 会一直阻塞，它认 SO_SNDTIMEO。
+///   - 熔断：任何一次超时（连接 / 写 / 读）之后 `breakerMs`（默认 3000ms）内 connect 直接
+///     失败、不碰 socket——服务卡死期间每个键至多付一次超时，其余直接透传；到期后下一键再试。
 ///   - 写用 MSG_NOSIGNAL：对端重启后向死连接写不会 SIGPIPE 杀掉 fcitx5 进程
 ///     （macOS 侧同一问题靠 SO_NOSIGPIPE，Linux 没有这个 socket 选项）。
 class BridgeClient {
 public:
-    explicit BridgeClient(int ioTimeoutMs = 2000) : timeoutMs_(ioTimeoutMs) {}
+    /// 最近一次失败的种类：决定能不能重试（`retryable`）、要不要熔断（`isTimeout`）。
+    enum class Failure {
+        None,
+        NotConnected,
+        Suspended,      // 熔断期内，没去连
+        Connect,        // 连不上（ENOENT / ECONNREFUSED…）：服务多半没在跑
+        ConnectTimeout, // 连接排队超时：服务在，但不 accept
+        Send,          // 写失败（EPIPE / ECONNRESET）：对端没收到这一帧
+        SendTimeout,
+        ReadTimeout,    // 发出去了、迟迟没回：服务可能已经处理了这一帧
+        PeerClosed,     // 一个响应字节都没读到就 EOF / ECONNRESET（服务读帧前后崩了）
+        Broken,         // 响应读到一半断了、或帧头不合法
+    };
+
+    explicit BridgeClient(int ioTimeoutMs = 2000, int breakerMs = 3000)
+        : timeoutMs_(ioTimeoutMs), breakerMs_(breakerMs)
+    {
+    }
     ~BridgeClient() { close(); }
     BridgeClient(const BridgeClient&) = delete;
     BridgeClient& operator=(const BridgeClient&) = delete;
@@ -59,14 +79,40 @@ public:
     bool request(const Bytes& frame, Frame& out);
 
     const std::string& lastError() const { return lastError_; }
+    Failure lastFailure() const { return lastFailure_; }
+    /// 熔断中：上一次超时之后还没过 `breakerMs`。期间 connect 直接失败。
+    bool suspended() const;
+    /// 自上次取走以来发生过超时：服务恢复后可能还会处理掉积在旧连接里的帧（它当时没回，
+    /// 不代表没收），两端的组字状态因此可能错开——上层在重新连上时据此对齐一次。
+    bool takeStallFlag();
+
+    /// 这种失败能否原样重发同一帧：只有「对端确定没处理」的才行——写失败、或一个响应字节
+    /// 都没读到就断（服务在读帧前后崩溃，崩了就不会上屏）。读超时**不能**重发：服务可能已经
+    /// 处理、只是回得慢，协调器不按 event_seq 去重，重发就是重复上屏。
+    static bool retryable(Failure f) { return f == Failure::Send || f == Failure::PeerClosed; }
+    static bool isTimeout(Failure f)
+    {
+        return f == Failure::ConnectTimeout || f == Failure::SendTimeout
+            || f == Failure::ReadTimeout;
+    }
 
 private:
-    bool fail(const std::string& what);
+    bool fail(Failure kind, const std::string& what);
 
     int fd_ = -1;
     int timeoutMs_;
+    int breakerMs_;
     std::string lastError_;
+    Failure lastFailure_ = Failure::None;
+    std::chrono::steady_clock::time_point unhealthyUntil_{};
+    bool stalled_ = false;
 };
+
+/// 发一帧、读响应；失败且 `BridgeClient::retryable` 时调 `reconnect` 换新连接再试**一次**
+/// （服务重启后的第一个键就自愈、不丢字——对位 macOS `handle` 的同名策略）。
+/// `reconnect` 返回 false（连不上 / 熔断中）则放弃。
+bool requestWithRetry(BridgeClient& client, const Bytes& frame, Frame& out,
+                      const std::function<bool()>& reconnect);
 
 /// 从已连接的 fd 读满 n 字节；EOF/错误返回 false。PushClient 与 BridgeClient 共用。
 bool readFully(int fd, uint8_t* buf, size_t n);

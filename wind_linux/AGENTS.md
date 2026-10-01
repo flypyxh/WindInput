@@ -15,7 +15,7 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/Protocol.h` | **直接 include** `wind_tsf/include/BinaryProtocol.h`（不另抄一份）；用宏垫掉它唯一的 Win32 依赖 `GetCurrentModifiers()`。那个函数在 Linux 上**禁止调用** |
 | `include/ExtProtocol.h` | 外部宿主专用 cmd（候选帧 / tooltip / 按键合成…），Windows 不用故不在 BinaryProtocol.h 里。每个值由 `tests/protocol_sync_test.cpp` 逐个对照 `protocol.rs` 源码 |
 | `include/Codec.h` + `src/core/Codec.cpp` | 帧编解码。每个函数注明对位的 Swift `BinaryCodec` 函数 |
-| `include/Bridge.h` + `src/core/Bridge.cpp` | UDS 请求/响应客户端（2s 超时、`MSG_NOSIGNAL`）、push 监听线程（断线每秒重连）、端点路径 |
+| `include/Bridge.h` + `src/core/Bridge.cpp` | UDS 请求/响应客户端（connect / 读 / 写都 2s 超时，超时后熔断 3s；`MSG_NOSIGNAL`；失败分类决定能否重发）、push 监听线程（断线每秒重连）、端点路径 |
 | `include/KeyMap.h` + `src/core/KeyMap.cpp` | X11 keysym / 修饰状态 → Windows VK / 协议修饰位；修饰键单击检测 |
 | `include/KeySynth.h` + `src/core/KeySynth.cpp` | 命令直通车按键合成的纯逻辑：键名 → keysym、组合 → 按下 / 抬起事件列、key.hold 的按住记账（卡键保护）与限流。见下「命令直通车按键合成」 |
 | `include/ResponseRouter.h` + `src/core/ResponseRouter.cpp` | 响应帧 → 宿主操作。Swift `BridgeResponseRouter` 的逐条移植（待定标点 / 定格前缀 / hold 计时器 / 数字后智能标点记账） |
@@ -122,8 +122,17 @@ e2e 的坑，都踩过：
   `CMD_CARET_UPDATE` 12 字节版，y 取行顶、height 取行高。宿主没报过位置（全 0）时不发。
 - prevChar（数字后智能标点）：宿主支持 surrounding text 就读真实光标前字符（对位 Windows 主路径），
   否则退回本端记账（对位 macOS 唯一的备用通路）。
-- 断线自愈：请求连接 2s 超时；I/O 失败即重连并**重试当前帧一次**。push 通道断开后每秒重连，
-  收到第二次起的 `SERVICE_READY` 即视为服务重启：换新请求连接并对当前焦点重报 FocusGained。
+- 断线自愈：请求连接 2s 超时（connect 之前就设好，服务停住时 connect 本身也会阻塞）。只有「对端
+  确定没处理」的失败才换新连接**重发当前帧一次**：写失败、或一个响应字节都没读到就 EOF /
+  ECONNRESET（服务重启 / 读帧前后崩溃）。**读超时不重发**：服务可能已经处理、只是回得慢，协调器
+  不按 `event_seq` 去重，重发就是重复上屏。push 通道断开后每秒重连，收到第二次起的
+  `SERVICE_READY` 即视为服务重启：换新请求连接并对当前焦点重报 FocusGained。
+- 服务卡死（进程在、不响应）：任何一次超时（连接 / 写 / 读）后**熔断 3 秒**，期间 connect 直接
+  失败、按键透传、不再发同步请求——每次卡死至多付一次 2s 超时，而不是每键 4~6 秒（caret +
+  按键 + 重试，`activate` 还有三次请求）。熔断时本端收起组字、候选窗、浮层、菜单（放开指针）并补发
+  key.hold 的抬起；到期后下一键再试，连上即发 `COMPOSITION_TERMINATED` + 重报焦点——服务恢复时会
+  把积在旧连接里的帧处理掉（超时不等于它没收），不复位的话旧码会拼进新输入。e2e 用 SIGSTOP /
+  SIGCONT 验（`stall_cases`）。
 - `reset`（宿主要求重置，如鼠标点击挪了光标）→ 收组合 + `CMD_COMPOSITION_TERMINATED`。
 
 ## 候选窗（X11）

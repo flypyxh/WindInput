@@ -12,6 +12,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 
 from dbus_next.aio import MessageBus
 from dbus_next import Variant  # noqa: F401  (保留：调试时常用)
@@ -1731,6 +1732,61 @@ async def keysynth_restart_cases(bus, im, restart):
     await asyncio.sleep(0.2)
 
 
+def service_pid():
+    return open(os.path.join(os.environ["W"], "svc.pid")).read().strip()
+
+
+async def timed_key(c, name):
+    t0 = time.monotonic()
+    eaten = await c.key(name)
+    return eaten, time.monotonic() - t0
+
+
+async def stall_cases(bus, im):
+    """服务卡死（进程在、不响应，用 SIGSTOP 模拟）：addon 跑在 fcitx5 主进程里，每个键都同步
+    等服务——不设防的话每键卡 4~6 秒、最坏永久挂住。要求：至多付一次超时（2 秒量级），之后
+    熔断期内按键直接透传、焦点切换也不卡；恢复（SIGCONT）后自愈，且服务在恢复时处理掉的
+    积压帧不会把旧码拼进新输入。"""
+    c = await new_ctx(bus, im, "e2e-stall")
+    await wait_ready(c)
+    await c.type("ni")
+    composing = c.preedit != ""
+    pid = service_pid()
+    subprocess.run(["kill", "-STOP", pid])
+    try:
+        first_eaten, first = await timed_key(c, "h")
+        rest = [await timed_key(c, k) for k in "aoxy"]
+        t0 = time.monotonic()
+        await c.ic.call_focus_out()
+        await c.ic.call_focus_in()
+        refocus = time.monotonic() - t0
+        print(f"  卡死期间：首键 {first:.2f}s 其余 {[round(d, 2) for _, d in rest]} "
+              f"焦点切换 {refocus:.2f}s", flush=True)
+        check("服务卡死：首键至多付一次超时（< 3 秒）", composing and first < 3.0,
+              f"组字={composing} 首键 {first:.2f}s")
+        check("服务卡死：熔断期内后续按键不再等（每键 < 0.5 秒）、直接透传",
+              all(d < 0.5 for _, d in rest) and not any(e for e, _ in rest) and not first_eaten,
+              f"{rest} 首键吃={first_eaten}")
+        check("服务卡死：焦点切换不卡（< 0.5 秒）", refocus < 0.5, f"{refocus:.2f}s")
+        check("服务卡死：本端收起组字（应用里不挂着旧预编辑）", c.preedit == "",
+              f"preedit={c.preedit!r}")
+    finally:
+        subprocess.run(["kill", "-CONT", pid])
+    c.take()
+    c.preedits.clear()
+    await asyncio.sleep(3.5)  # 熔断期（3 秒）过去
+    # 不用 wait_ready 探活：它按 a 再按 Esc，Esc 会顺手清掉服务端积压出来的码，掩盖对齐缺失。
+    # 服务一直是就绪的（只是停过），熔断到期后的第一个键就该被吃。
+    eaten = await c.type("nihao")
+    await c.key(" ")
+    got = c.take()
+    check("服务恢复（SIGCONT）后 addon 自愈：熔断到期后的按键重新被吃", all(eaten), f"{eaten}")
+    check("服务恢复后照常上屏「你好」（卡死时积压在旧连接里的码没拼进来）", got == "你好",
+          f"上屏={got!r}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+
 async def wait_ready(c):
     """服务的 socket 起得比引擎早：词库（首次还要建 .wdat 缓存）加载完成前，按键一律透传。
     用真实通路探活——按 a 直到被吃（= 引擎开始组字），再 Esc 撤掉。"""
@@ -1916,6 +1972,7 @@ async def main():
         got = a.take()
         check("服务重启后照常上屏「你好」", got == "你好", f"上屏={got!r}")
         await a.ic.call_focus_out()
+        await stall_cases(bus, im)
         await keysynth_restart_cases(bus, im, restart)
         await a.ic.call_focus_in()
         await asyncio.sleep(0.2)

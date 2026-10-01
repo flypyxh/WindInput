@@ -231,7 +231,23 @@ bool WindEngine::reconnect()
 {
     if (bridge_.connect(requestSocketPath())) {
         WIND_INFO() << "已连上服务";
+        noteStall();
+        if (stallPending_) {
+            stallPending_ = false;
+            resyncAfterStall();
+        }
         return true;
+    }
+    switch (bridge_.lastFailure()) {
+    case BridgeClient::Failure::Suspended:
+        return false; // 熔断期内：这一键直接透传，不再付一次超时
+    case BridgeClient::Failure::ConnectTimeout:
+        // 服务在（socket 有人 listen）但不 accept：卡死，不是没起。拉起也无济于事（单例锁）。
+        WIND_WARN() << "服务无响应（连接排队超时），按键暂时透传";
+        noteStall();
+        return false;
+    default:
+        break;
     }
     WIND_DEBUG() << "连不上服务: " << bridge_.lastError();
     // 服务没在跑（或刚被杀）：拉起它。本次仍返回 false（这一键透传），服务就绪后由下一次
@@ -244,25 +260,66 @@ bool WindEngine::reconnect()
 
 bool WindEngine::requestWithRetry(const Bytes& frame, Frame& resp)
 {
-    if (ensureConnected() && bridge_.request(frame, resp)) {
+    if (windlinux::requestWithRetry(bridge_, frame, resp, [this] { return reconnect(); })) {
         return true;
     }
-    WIND_WARN() << "服务 I/O 失败（" << bridge_.lastError() << "），重连后重试本帧";
-    return reconnect() && bridge_.request(frame, resp);
+    if (bridge_.lastFailure() != BridgeClient::Failure::Suspended) {
+        WIND_WARN() << "服务 I/O 失败（" << bridge_.lastError() << "），本键透传";
+    }
+    noteStall();
+    return false;
 }
 
-void WindEngine::sendAndDrain(const Bytes& frame)
+bool WindEngine::sendAndDrain(const Bytes& frame)
 {
     Frame ignored;
     if (!ensureConnected() || !bridge_.request(frame, ignored)) {
         WIND_DEBUG() << "发送失败: " << bridge_.lastError();
+        noteStall();
+        return false;
     }
+    return true;
 }
 
 void WindEngine::sendAsync(const Bytes& frame)
 {
     if (!ensureConnected() || !bridge_.send(frame)) {
         WIND_DEBUG() << "异步发送失败: " << bridge_.lastError();
+        noteStall();
+    }
+}
+
+void WindEngine::noteStall()
+{
+    if (!bridge_.takeStallFlag() || stallPending_) {
+        return;
+    }
+    // 服务超时没回：之后一段时间按键直接透传（熔断）。本端的组字 / 候选窗 / 菜单都是那个
+    // 服务状态的影子，原地收掉——否则应用里挂着一段预编辑，后面的字母却直通进了正文；
+    // 菜单还抓着指针，整个桌面点不动。恢复后由 resyncAfterStall 把服务端也对齐。
+    WIND_WARN() << "服务无响应：本端收起组字与候选窗，恢复前按键透传";
+    stallPending_ = true;
+    if (fcitx::InputContext* ic = focusedIC(); ic && router_.hasComposition()) {
+        ICSink sink(ic);
+        router_.applyClearComposition(&sink);
+    } else {
+        router_.reset();
+    }
+    // 菜单不报 dismiss（没人收）；服务端的 menu_open 由恢复时的 COMPOSITION_TERMINATED 复位。
+    panel_->closeMenu(nullptr);
+    panel_->hide();
+    panel_->hideAllOverlays();
+    releaseHeldKeys("service_stalled");
+}
+
+void WindEngine::resyncAfterStall()
+{
+    // 服务恢复后可能已把积在旧连接里的帧处理掉（超时不等于它没收到）：组字缓冲里多出
+    // 本端不知道的码。按「组合被宿主终止」复位它（同时复位 menu_open），再重报焦点。
+    WIND_INFO() << "服务恢复响应，对齐组字与焦点状态";
+    sendAsync(encodeEmptyFrame(CMD_COMPOSITION_TERMINATED, true));
+    if (fcitx::InputContext* ic = focusedIC()) {
+        sendFocusGained(ic);
     }
 }
 
@@ -301,6 +358,7 @@ void WindEngine::sendFocusGained(fcitx::InputContext* ic)
         noteMode(resp);
     } else {
         WIND_DEBUG() << "发送失败: " << bridge_.lastError();
+        noteStall();
     }
 }
 

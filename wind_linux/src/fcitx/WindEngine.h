@@ -70,13 +70,18 @@ private:
     ServiceLauncher launcher_;
     bool ensureConnected();
     bool reconnect();
-    /// 在 request 连接上发一帧、读响应；连接失败时重连并**重试一次**（服务重启后的第一个键
-    /// 就自愈、不丢字——对位 macOS `handle` 的同名策略）。
+    /// 在 request 连接上发一帧、读响应；对端确定没处理时重连并**重试一次**（服务重启后的第一
+    /// 个键就自愈、不丢字）。读超时不重试（见 `BridgeClient::retryable`）。
     bool requestWithRetry(const Bytes& frame, Frame& resp);
-    /// 发一帧、读掉 ack，失败只记日志。
-    void sendAndDrain(const Bytes& frame);
+    /// 发一帧、读掉 ack，失败只记日志。返回是否成功（菜单据此决定要不要本端收起）。
+    bool sendAndDrain(const Bytes& frame);
     /// 发一帧不读响应（AsyncFlag 帧）。
     void sendAsync(const Bytes& frame);
+    /// 请求失败后调用：刚发生过超时（服务卡死）就本端收起组字 / 候选窗 / 菜单，并记下待恢复
+    /// 时对齐。每次卡死只做一次。
+    void noteStall();
+    /// 卡死后重新连上：复位服务端组字（它可能处理了积压的帧）并重报焦点。
+    void resyncAfterStall();
 
     // ── 焦点 ──
     uint64_t clientToken(fcitx::InputContext* ic) const;
@@ -126,6 +131,8 @@ private:
     uint16_t keySeq_ = 0;
     bool lastReportedSecure_ = false;
     bool serviceSeenOnce_ = false;
+    /// 发生过超时、还没在重连时对齐过（见 noteStall / resyncAfterStall）。
+    bool stallPending_ = false;
     /// 按下时被本输入法吃掉的键（按硬件键码记）。松开时同样吃掉，免得宿主收到一个没有
     /// 按下的松开——多数宿主无所谓，但有的会据此触发快捷键。
     std::unordered_set<int> eatenKeys_;

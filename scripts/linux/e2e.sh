@@ -18,7 +18,9 @@ eval "$("$REPO/scripts/linux/bootstrap-sdk.sh" env)"
 SDK_ROOT="$WIND_LINUX_SDK/root"
 MULTIARCH="$(gcc -print-multiarch 2>/dev/null || echo x86_64-linux-gnu)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/wi-tgt-linux-wt}"
-ADDON_BUILD="$REPO/wind_linux/build/cmake"
+# 构建目录可覆盖：同一工作树里并发跑多份 e2e（或拿变异版 addon 验用例）时各用各的，
+# 免得一份的构建把另一份正在加载的 .so 换掉。
+ADDON_BUILD="${WIND_E2E_ADDON_BUILD:-$REPO/wind_linux/build/cmake}"
 SERVICE_BIN="$TARGET_DIR/debug/wind_input"
 DATA_DIR="${WIND_E2E_DATA:-$REPO/build_dev/data}"
 # 设置程序（兄弟仓库 wind-setting）：「从输入法打开设置」用例要真的把它拉起来。

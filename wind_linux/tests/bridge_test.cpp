@@ -16,6 +16,7 @@
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace windlinux;
 
@@ -124,6 +125,172 @@ void TestReadTimeout()
     }
     cv.notify_all();
     srv.join();
+    ::close(lfd);
+    ::unlink(path.c_str());
+}
+
+/// 一个只 accept、把收到的帧数记下来的假服务端：`reply` 决定收到帧后怎么办。
+enum class Reply { Never, CloseWithoutReply, Consumed };
+
+struct FakeServer {
+    std::string path;
+    int lfd = -1;
+    std::atomic<int> frames{0};
+    std::atomic<int> conns{0};
+    std::thread th;
+
+    FakeServer(const char* name, std::vector<Reply> plan) : path(tmpPath(name))
+    {
+        lfd = listenOn(path);
+        th = std::thread([this, plan] {
+            for (Reply r : plan) {
+                int c = ::accept(lfd, nullptr, nullptr);
+                if (c < 0) {
+                    return;
+                }
+                ++conns;
+                uint8_t hdr[8];
+                if (readFully(c, hdr, 8)) {
+                    HeaderInfo info;
+                    decodeHeader(hdr, info);
+                    Bytes p(info.length);
+                    readFully(c, p.data(), p.size());
+                    ++frames;
+                    if (r == Reply::Consumed) {
+                        writeAll(c, encodeEmptyFrame(CMD_CONSUMED));
+                    } else if (r == Reply::Never) {
+                        char b;
+                        while (::read(c, &b, 1) > 0) { // 收下不回，直到客户端放弃（关连接）
+                        }
+                    }
+                }
+                ::close(c);
+            }
+        });
+    }
+    ~FakeServer()
+    {
+        ::shutdown(lfd, SHUT_RDWR); // 打断还在等的 accept
+        th.join();
+        ::close(lfd);
+        ::unlink(path.c_str());
+    }
+};
+
+long msSince(std::chrono::steady_clock::time_point t0)
+{
+    return long(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+}
+
+void TestReadTimeoutIsNotRetried()
+{
+    CASE("读超时不重发：服务收下了却迟迟不回（可能已处理），重发就是重复上屏");
+    FakeServer srv("noretry.sock", {Reply::Never, Reply::Consumed});
+    BridgeClient bc(300, 60000);
+    int reconnects = 0;
+    auto reconnect = [&] {
+        ++reconnects;
+        return bc.connect(srv.path);
+    };
+    KeyEvent e;
+    e.keyCode = 0x4E;
+    Frame f;
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(!requestWithRetry(bc, encodeKeyEventFrame(e), f, reconnect));
+    const long ms = msSince(t0);
+    CHECK(bc.lastFailure() == BridgeClient::Failure::ReadTimeout);
+    CHECK(!BridgeClient::retryable(bc.lastFailure()));
+    CHECK_EQ(reconnects, 1); // 只有起手那次连接，没有因失败再连
+    CHECK(ms >= 250 && ms < 1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_EQ(srv.frames.load(), 1);
+}
+
+void TestPeerClosedIsRetried()
+{
+    CASE("一个响应字节都没读到就断（服务读帧后崩溃）：换新连接重发一次，成功");
+    FakeServer srv("retry.sock", {Reply::CloseWithoutReply, Reply::Consumed});
+    BridgeClient bc(1000);
+    auto reconnect = [&] { return bc.connect(srv.path); };
+    Frame f;
+    CHECK(requestWithRetry(bc, encodeEmptyFrame(CMD_FOCUS_LOST), f, reconnect));
+    CHECK_EQ(f.cmd, uint16_t(CMD_CONSUMED));
+    CHECK_EQ(srv.frames.load(), 2);
+    CHECK_EQ(srv.conns.load(), 2);
+}
+
+void TestSendToDeadConnectionIsRetried()
+{
+    CASE("向死连接写（服务重启过）：写失败可重发，换新连接后成功");
+    FakeServer srv("dead.sock", {Reply::CloseWithoutReply, Reply::Consumed});
+    BridgeClient bc(1000);
+    CHECK(bc.connect(srv.path));
+    Frame f;
+    // 先让第一条连接被服务端关掉：发一帧它收下就关。
+    CHECK(!bc.request(encodeEmptyFrame(CMD_FOCUS_LOST), f));
+    CHECK(bc.lastFailure() == BridgeClient::Failure::PeerClosed);
+    CHECK(BridgeClient::retryable(bc.lastFailure()));
+    CHECK(!bc.suspended()); // 不是超时，不熔断
+    CHECK(!bc.takeStallFlag());
+    CHECK(bc.connect(srv.path));
+    CHECK(bc.request(encodeEmptyFrame(CMD_FOCUS_LOST), f));
+}
+
+void TestBreaker()
+{
+    CASE("熔断：超时之后 breakerMs 内 connect 立即失败（不再付一次超时），到期恢复");
+    FakeServer srv("breaker.sock", {Reply::Never, Reply::Consumed});
+    BridgeClient bc(200, 600);
+    CHECK(bc.connect(srv.path));
+    Frame f;
+    CHECK(!bc.request(encodeEmptyFrame(CMD_FOCUS_LOST), f));
+    CHECK(bc.suspended());
+    CHECK(bc.takeStallFlag());
+    CHECK(!bc.takeStallFlag()); // 取走即清
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(!bc.connect(srv.path));
+    CHECK(bc.lastFailure() == BridgeClient::Failure::Suspended);
+    CHECK(msSince(t0) < 50);
+    std::this_thread::sleep_for(std::chrono::milliseconds(650));
+    CHECK(!bc.suspended());
+    CHECK(bc.connect(srv.path));
+    CHECK(bc.request(encodeEmptyFrame(CMD_FOCUS_LOST), f));
+}
+
+void TestConnectTimeout()
+{
+    CASE("服务停住、listen 队列已满：connect 在超时后返回（不无限阻塞），并熔断");
+    std::string path = tmpPath("full.sock");
+    ::unlink(path.c_str());
+    int lfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    std::strncpy(a.sun_path, path.c_str(), sizeof(a.sun_path) - 1);
+    CHECK(::bind(lfd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    CHECK(::listen(lfd, 0) == 0); // 从不 accept
+    // 把队列塞满：非阻塞地连到 EAGAIN 为止。
+    std::vector<int> fillers;
+    for (int i = 0; i < 64; ++i) {
+        int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+            ::close(fd);
+            break;
+        }
+        fillers.push_back(fd);
+    }
+    CHECK(!fillers.empty());
+    BridgeClient bc(300, 60000);
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(!bc.connect(path));
+    const long ms = msSince(t0);
+    CHECK(bc.lastFailure() == BridgeClient::Failure::ConnectTimeout);
+    CHECK(ms >= 250 && ms < 1500);
+    CHECK(bc.suspended());
+    for (int fd : fillers) {
+        ::close(fd);
+    }
     ::close(lfd);
     ::unlink(path.c_str());
 }
@@ -244,6 +411,11 @@ int main()
 {
     TestRequestResponse();
     TestReadTimeout();
+    TestReadTimeoutIsNotRetried();
+    TestPeerClosedIsRetried();
+    TestSendToDeadConnectionIsRetried();
+    TestBreaker();
+    TestConnectTimeout();
     TestConnectFailures();
     TestPushReconnect();
     TestStopWhileIdle();
