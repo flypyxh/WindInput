@@ -483,6 +483,32 @@ mod tests {
         );
     }
 
+    /// 协调器把宿主报来的坐标钳到 ±2^24（`message_handler` 的 `HOST_COORD_LIMIT`）：在这个
+    /// 范围的极端处弹菜单、展开子菜单、移动指针，定位与命中里的加法都不溢出（测试构建开着
+    /// 溢出检查；不钳制时锚点取 `i32::MAX` 会在定位里 panic）。
+    #[test]
+    fn coordinates_at_the_clamp_limit_do_not_overflow() {
+        const L: i32 = 1 << 24;
+        for (x, y) in [(L, L), (-L, -L), (L, -L), (-L, L)] {
+            for (wl, wt, wr, wb) in [(-L, -L, L, L), (0, 0, 1280, 800), (0, 0, 0, 0)] {
+                let (mut h, _rx, cap) = host();
+                h.set_work_area(wl, wt, wr, wb);
+                h.show(&cap, items(), MenuAnchor::at_point(x, y));
+                h.key(&cap, 0x28);
+                h.key(&cap, 0x28);
+                h.key(&cap, 0x27); // 展开子菜单
+                for (px, py) in [(x, y), (L, L), (-L, -L)] {
+                    h.pointer(&cap, MenuPointerEvent::Move, px, py);
+                }
+                h.pointer(&cap, MenuPointerEvent::OtherPress, L, L);
+                assert!(
+                    !cap.take().is_empty(),
+                    "@({x},{y}) 工作区 {wl},{wt},{wr},{wb}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn more_item_anchor_sentinel_uses_last_pointer() {
         let (mut h, _rx, cap) = host();

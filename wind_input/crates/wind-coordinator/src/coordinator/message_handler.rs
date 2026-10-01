@@ -190,31 +190,43 @@ impl Coordinator {
     }
 }
 
-/// 解析扩展信封里的 `{"x":123,"y":456}` 落点 body。
-///
-/// 非法/缺字段/越界一律返回 `None` 交调用方忽略，而不是取 0 兜底：位置类消息拿默认值
-/// 比丢掉一次拖动坏得多——`(0,0)` 会被当成合法坐标落盘，候选窗就此跑到屏幕左上角。
+/// 宿主报来的屏幕坐标的钳制范围。±2^24 远超任何真实屏幕，又给菜单定位里的「坐标 + 宽高」
+/// 留足 i32 余量：任意 i32 原样进去，`popup_menu` 的定位加法在 dev 构建溢出 panic、release 回绕。
+#[cfg(all(target_os = "linux", ext_presenter))]
+const HOST_COORD_LIMIT: i32 = 1 << 24;
+
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn clamp_host_coord(v: i32) -> i32 {
+    v.clamp(-HOST_COORD_LIMIT, HOST_COORD_LIMIT)
+}
+
 /// `menu.open` 的 body：`{"target":i32,"x":i32,"y":i32,"work":[左,上,右,下],"lx":i32,"ly":i32}`。
-/// 缺 `target` / 坐标即整条不认；`work` 缺省或不成形按「没有工作区」（全 0）处理——
-/// 菜单仍能弹，只是不做翻转，越界交给 addon 那边看得见的溢出。`lx`/`ly`（右键点在悬停提示
-/// 位图内的坐标）只有悬停提示菜单带，缺了按 `None`。
+/// 缺 `target` / 坐标即整条不认；`work` 缺省或不成形（含钳制后右 ≤ 左、下 ≤ 上）按「没有
+/// 工作区」（全 0）处理——菜单仍能弹，只是不做翻转，越界交给 addon 那边看得见的溢出。
+/// `lx`/`ly`（右键点在悬停提示位图内的坐标）只有悬停提示菜单带，缺了按 `None`。
+/// 坐标一律钳到 [`HOST_COORD_LIMIT`] 以内。
 #[cfg(all(target_os = "linux", ext_presenter))]
 fn decode_menu_open(body: &[u8]) -> Option<crate::handle_menu::MenuOpenRequest> {
     use crate::handle_menu::MenuOpenRequest;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let int = |v: &serde_json::Value| v.as_i64().and_then(|n| i32::try_from(n).ok());
+    let coord = |v: &serde_json::Value| int(v).map(clamp_host_coord);
     let target = int(v.get("target")?)?;
-    let x = int(v.get("x")?)?;
-    let y = int(v.get("y")?)?;
+    let x = coord(v.get("x")?)?;
+    let y = coord(v.get("y")?)?;
     let mut work = [0i32; 4];
     if let Some(arr) = v.get("work").and_then(|w| w.as_array())
         && arr.len() == 4
     {
         for (slot, n) in work.iter_mut().zip(arr) {
-            *slot = int(n).unwrap_or(0);
+            *slot = coord(n).unwrap_or(0);
+        }
+        let [left, top, right, bottom] = work;
+        if right <= left || bottom <= top {
+            work = [0; 4];
         }
     }
-    let local = v.get("lx").and_then(int).zip(v.get("ly").and_then(int));
+    let local = v.get("lx").and_then(coord).zip(v.get("ly").and_then(coord));
     Some(MenuOpenRequest {
         target,
         x,
@@ -224,6 +236,10 @@ fn decode_menu_open(body: &[u8]) -> Option<crate::handle_menu::MenuOpenRequest> 
     })
 }
 
+/// 解析扩展信封里的 `{"x":123,"y":456}` 落点 body。
+///
+/// 非法/缺字段/越界一律返回 `None` 交调用方忽略，而不是取 0 兜底：位置类消息拿默认值
+/// 比丢掉一次拖动坏得多——`(0,0)` 会被当成合法坐标落盘，候选窗就此跑到屏幕左上角。
 fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let x = v.get("x")?.as_i64()?;
@@ -579,7 +595,12 @@ impl MessageHandler for Coordinator {
                 _ => return,
             };
             self.touch_menu();
-            let _ = self.ui_tx.send(UiCommand::MenuPointer { event: ev, x, y });
+            // 坐标同 `menu.open` 钳制：命中测试里也有「坐标 + 宽高」。
+            let _ = self.ui_tx.send(UiCommand::MenuPointer {
+                event: ev,
+                x: clamp_host_coord(x),
+                y: clamp_host_coord(y),
+            });
         }
         #[cfg(not(all(target_os = "linux", ext_presenter)))]
         let _ = (event, button, x, y);
@@ -4718,6 +4739,79 @@ mod commit_newline_action_tests {
                 assert_eq!(cursor_offset, 1)
             }
             other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", ext_presenter))]
+mod menu_open_decode_tests {
+    use super::*;
+    use crate::handle_menu::MenuOpenRequest;
+
+    fn decode(body: &str) -> MenuOpenRequest {
+        decode_menu_open(body.as_bytes()).unwrap_or_else(|| panic!("应能解析：{body}"))
+    }
+
+    #[test]
+    fn ordinary_request_passes_through_unchanged() {
+        let r = decode(r#"{"target":2,"x":100,"y":-20,"work":[0,0,1920,1080],"lx":5,"ly":6}"#);
+        assert_eq!(
+            r,
+            MenuOpenRequest {
+                target: 2,
+                x: 100,
+                y: -20,
+                work: [0, 0, 1920, 1080],
+                local: Some((5, 6)),
+            }
+        );
+    }
+
+    /// 极值坐标钳到 ±2^24：原样放进去，菜单定位的「坐标 + 宽高」在 dev 构建溢出 panic。
+    #[test]
+    fn extreme_coordinates_are_clamped() {
+        let (max, min) = (i32::MAX, i32::MIN);
+        let r = decode(&format!(
+            r#"{{"target":-1,"x":{max},"y":{min},"work":[{min},{min},{max},{max}],"lx":{max},"ly":{min}}}"#
+        ));
+        let l = HOST_COORD_LIMIT;
+        assert_eq!((r.x, r.y), (l, -l));
+        assert_eq!(r.work, [-l, -l, l, l]);
+        assert_eq!(r.local, Some((l, -l)));
+    }
+
+    /// 菜单指针事件的坐标同样钳制（命中测试里也有「坐标 + 宽高」）。
+    #[test]
+    fn menu_pointer_coordinates_are_clamped() {
+        use wind_bridge::handler::MessageHandler;
+        use wind_ipc::protocol::menu_pointer::MENU_POINTER_MOTION;
+        use wind_ui_types::{MenuAnchor, MenuPointerEvent, UiCommand};
+        let (c, rx) = Coordinator::new_headless_with_ui(wind_config::Config::default(), None);
+        c.show_main_menu(MenuAnchor::at_point(0, 0));
+        let _ = rx.try_iter().count();
+        c.handle_menu_pointer(MENU_POINTER_MOTION, 0, i32::MAX, i32::MIN);
+        let l = HOST_COORD_LIMIT;
+        let cmds: Vec<_> = rx.try_iter().collect();
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                UiCommand::MenuPointer { event: MenuPointerEvent::Move, x, y } if (*x, *y) == (l, -l)
+            )),
+            "{cmds:?}"
+        );
+    }
+
+    /// 工作区不成形（右 ≤ 左 / 下 ≤ 上，包括钳制后才塌掉的）按「没有工作区」。
+    #[test]
+    fn inverted_or_collapsed_work_area_means_none() {
+        for work in [
+            "[100,0,50,800]",
+            "[0,800,1280,0]",
+            "[0,0,0,800]",
+            "[2147483647,0,2147483646,800]",
+        ] {
+            let r = decode(&format!(r#"{{"target":-1,"x":1,"y":2,"work":{work}}}"#));
+            assert_eq!(r.work, [0; 4], "work={work}");
         }
     }
 }
