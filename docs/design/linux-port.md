@@ -373,12 +373,21 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    （`text/linux/store.rs` 的 `map_file`），文件若在服务运行中被**原地截断改写**（而不是包管理器那样
    写新文件再 rename），访问越过新文件尾的页触发 SIGBUS、服务崩溃。包管理器升级字体走 rename，旧映射
    仍指向旧 inode，不受影响。读进内存可免，代价是 CJK 字体常驻数十 MB 私有内存，不做。
+7. **服务卡死恢复时的积压帧（已知窗口）**：addon 超时后关掉连接，但已写进 socket 的帧服务恢复后照样
+   读到、处理（只是回不了）。熔断到期后 addon 第一次重连即发 `COMPOSITION_TERMINATED` + 重报焦点把
+   组字复位；若服务恰好在这次重连**之后**才恢复、才处理积压帧，旧码仍会拼进来——要求服务停住超过
+   3 秒且恰在用户按下一个键的那一刻恢复。根治要协调器按 `event_seq` 去重或给连接带代际，不做。
+8. **托盘图标首次同步渲染**：本状态的三组图标仍在第一次 `build_status` 里同步画（数据依赖，见 §5d），
+   字体缓存冷（装完没跑过 `fc-cache`）时 fontconfig 查字体可能超过 addon 的 2 秒超时——表现为首个键
+   透传、熔断 3 秒后自愈，不卡死。
+9. **SHM 名被别的用户抢先占用**：名字带 uid 后别人仍可在 `/dev/shm` 建我们的名字（`O_EXCL` 失败），
+   服务端建不了段、候选窗不显示；addon 按属主拒收，内容伪造不了。只是拒绝服务，不处理。
 
 ## 8. 安装包与 `windinput-setup` 的取舍
 
 - **升级 / 卸载结束服务**：postinst（仅 `configure`）与 postrm（仅 `remove`）用
   `pkill -x -f '/usr/lib/windinput/wind_input( --restarted)?'`，按整条命令行精确匹配包里那个路径
-  （addon 以 posix_spawn 拉起时 argv 只有这个全路径；菜单「重启服务」自拉起的多一个 `--restarted`），
+  （addon 拉起时（`spawnDetached`，双 fork 后 execve）argv 只有这个全路径；菜单「重启服务」自拉起的多一个 `--restarted`），
   同名开发构建与 `wind_input restart` 这类 CLI 调用不受影响。卸载放 postrm：文件删掉后再结束，
   已加载的 addon 想重新拉起时程序已不在。
 - **已知限制：被结束时丢最后 1 秒的运行时状态**。服务不处理 SIGTERM（默认动作即刻终止），
