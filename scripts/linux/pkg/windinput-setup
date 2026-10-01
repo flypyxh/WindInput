@@ -1,39 +1,97 @@
 #!/usr/bin/env bash
 # 清风输入法 Linux 版：一次性配置当前用户的 Fcitx5。安装 .deb 后运行一次，然后重新登录。
 #
-#   windinput-setup [--schema pinyin|wubi86] [--no-im-config]
+#   windinput-setup [--schema pinyin|wubi86] [--no-im-config] [--no-restart]
 #
 # 做四件事（都只动当前用户的文件，且幂等）：
 #   1. Fcitx5 输入法组里加入「清风输入法」；
 #   2. 清空 Fcitx5 的 AltTriggerKeys——出厂是左 Shift，会在清风之前把 Shift 单击截走，
 #      「Shift 切中英」就永远到不了输入法；
-#   3. 用户配置里没有 config.toml 时写入初始方案（默认全拼；已有则不动）；
+#   3. 用户配置里没有方案设置时写入初始方案（默认全拼；已有则不动）；
 #   4. 用 im-config 把当前用户的输入法框架切到 fcitx5（GTK/Qt/XIM 环境变量）。
+# 本用户的 fcitx5 正在运行时，先让它退出再改、改完重新拉起（--no-restart 则只退出不拉起）。
 set -euo pipefail
 
 SCHEMA=pinyin
 IMCONFIG=1
+RESTART=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --schema) SCHEMA="${2:?--schema 需要参数}"; shift 2 ;;
         --no-im-config) IMCONFIG=0; shift ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        --no-restart) RESTART=0; shift ;;
+        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
 case "$SCHEMA" in pinyin|wubi86) ;; *) echo "--schema 只支持 pinyin / wubi86" >&2; exit 2 ;; esac
 
-CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
+# XDG 规范：相对路径的 XDG_CONFIG_HOME 无效，按未设处理。
+CFG="${XDG_CONFIG_HOME:-}"
+[[ "$CFG" == /* ]] || CFG="$HOME/.config"
 mkdir -p "$CFG/fcitx5"
 
-python3 - "$CFG/fcitx5" <<'PY'
-import os, re, sys
-d = sys.argv[1]
+# fcitx5 运行中改 profile 无效：它退出时（注销就是一次）会把内存里的旧输入法组整份写回，
+# 刚加的清风被冲掉；`fcitx5-remote -r` 只重读全局配置、不重读 profile（两条都在隔离的
+# FCITX_CONFIG_HOME 下用真 fcitx5 实测过）。所以先让它退出——退出时那次写回发生在我们改之前。
+fcitx_running() { pgrep -u "$(id -u)" -x fcitx5 >/dev/null 2>&1; }
+FCITX_WAS_RUNNING=0
+if fcitx_running; then
+    FCITX_WAS_RUNNING=1
+    echo "检测到 fcitx5 正在运行：先让它退出，否则它退出时会用旧配置覆盖本次改动"
+    fcitx5-remote -e >/dev/null 2>&1 || pkill -u "$(id -u)" -x fcitx5 || true
+    for _ in $(seq 1 50); do fcitx_running || break; sleep 0.1; done
+    if fcitx_running; then
+        echo "fcitx5 5 秒内没有退出，未做改动。请先退出 fcitx5（或注销）后再运行本命令。" >&2
+        exit 1
+    fi
+fi
 
-# ── profile：保证 Default 组里有 windinput ──
-p = os.path.join(d, "profile")
-if not os.path.exists(p):
-    open(p, "w").write("""[Groups/0]
+python3 - "$CFG/fcitx5" "$CFG/WindInput" "$SCHEMA" <<'PY'
+import os, re, sys, tempfile
+
+fcitx_dir, wind_dir, schema = sys.argv[1:4]
+
+
+def write_atomic(path, text):
+    """同目录临时文件 + os.replace：中途失败原文件完好；符号链接写到它指向的文件；权限沿用。"""
+    real = os.path.realpath(path)
+    d = os.path.dirname(real)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(real) + ".")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(real):
+            os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+        else:
+            os.chmod(tmp, 0o644 & ~current_umask())
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def current_umask():
+    m = os.umask(0)
+    os.umask(m)
+    return m
+
+
+def read(path):
+    with open(path, newline="") as f:
+        return f.read()
+
+
+def eol_of(s):
+    return "\r\n" if "\r\n" in s else "\n"
+
+
+# ── profile：保证有输入法组且组里有 windinput ──
+FRESH_PROFILE = """[Groups/0]
 Name=Default
 Default Layout=us
 DefaultIM=windinput
@@ -48,63 +106,128 @@ Layout=
 
 [GroupOrder]
 0=Default
-""")
+"""
+p = os.path.join(fcitx_dir, "profile")
+s = read(p) if os.path.exists(p) else ""
+if not re.search(r"^\[Groups/0\][ \t]*\r?$", s, re.M):
+    # 没有文件，或文件里没有任何输入法组（空文件 / 残缺）：fcitx5 读到也会丢弃重建，直接写一份。
+    write_atomic(p, FRESH_PROFILE)
     print("已创建 fcitx5 profile（键盘 us + 清风输入法）")
+elif re.search(r"^Name=windinput[ \t]*\r?$", s, re.M):
+    print("fcitx5 profile 里已有清风输入法")
 else:
-    s = open(p).read()
-    if re.search(r"^Name=windinput$", s, re.M):
-        print("fcitx5 profile 里已有清风输入法")
+    # 追加到 Groups/0 的末尾：找已有最大的 Items 序号。保留原文件的换行风格。
+    nl = eol_of(s)
+    idx = [int(m) for m in re.findall(r"^\[Groups/0/Items/(\d+)\][ \t]*\r?$", s, re.M)]
+    n = (max(idx) + 1) if idx else 0
+    item = f"[Groups/0/Items/{n}]{nl}Name=windinput{nl}Layout={nl}{nl}"
+    m = re.search(r"^\[GroupOrder\][ \t]*\r?$", s, re.M)
+    if m:
+        s = s[: m.start()] + item + s[m.start():]
     else:
-        # 追加到 Groups/0 的末尾：找已有最大的 Items 序号。
-        idx = [int(m) for m in re.findall(r"^\[Groups/0/Items/(\d+)\]", s, re.M)]
-        n = (max(idx) + 1) if idx else 0
-        item = f"[Groups/0/Items/{n}]\nName=windinput\nLayout=\n\n"
-        if re.search(r"^\[GroupOrder\]", s, re.M):
-            s = re.sub(r"^\[GroupOrder\]", item + "[GroupOrder]", s, count=1, flags=re.M)
-        else:
-            s += "\n" + item
-        open(p, "w").write(s)
-        print(f"已把清风输入法加入现有 fcitx5 profile（Items/{n}）")
+        s += ("" if s.endswith("\n") else nl) + nl + item
+    write_atomic(p, s)
+    print(f"已把清风输入法加入现有 fcitx5 profile（Items/{n}）")
 
 # ── config：清空 AltTriggerKeys ──
-c = os.path.join(d, "config")
-sect = "[Hotkey/AltTriggerKeys]"
-s = open(c).read() if os.path.exists(c) else ""
-if sect in s:
-    # 该段到下一个 [ 之间的内容整个清掉
-    s2 = re.sub(r"(\[Hotkey/AltTriggerKeys\]\n)(?:(?!\[).*\n?)*", r"\1\n", s, count=1)
+c = os.path.join(fcitx_dir, "config")
+s = read(c) if os.path.exists(c) else ""
+nl = eol_of(s)
+# 节头必须独占一行（允许尾随空白）：注释或值里出现同样字样不算。
+head = re.search(r"^\[Hotkey/AltTriggerKeys\][ \t]*\r?$", s, re.M)
+if head:
+    body_start = s.find("\n", head.start())
+    body_start = len(s) if body_start < 0 else body_start + 1
+    nxt = re.compile(r"^[ \t]*\[", re.M).search(s, body_start)
+    body_end = nxt.start() if nxt else len(s)
+    # 节内只剩注释与空行就已经是空的；否则整段正文换成一个空行。
+    body = s[body_start:body_end].splitlines()
+    if any(l.strip() and not l.lstrip().startswith("#") for l in body):
+        s2 = s[:body_start] + nl + s[body_end:]
+    else:
+        s2 = s
 else:
-    s2 = s + ("" if s.endswith("\n") or not s else "\n") + sect + "\n\n"
+    s2 = s + ("" if s.endswith("\n") or not s else nl) + "[Hotkey/AltTriggerKeys]" + nl + nl
 if s2 != s:
-    open(c, "w").write(s2)
+    write_atomic(c, s2)
     print("已清空 fcitx5 的 AltTriggerKeys（不再抢 Shift 单击）")
 else:
     print("fcitx5 的 AltTriggerKeys 已是空")
-PY
 
-WCFG="$CFG/WindInput"
-if [[ ! -e "$WCFG/config.toml" ]]; then
-    mkdir -p "$WCFG"
-    cat >"$WCFG/config.toml" <<EOT
-[schema]
-active = "$SCHEMA"
-available = ["pinyin", "wubi86"]
-EOT
-    echo "已写入 $WCFG/config.toml（方案：$SCHEMA）"
-elif ! grep -q '^\[schema\]' "$WCFG/config.toml"; then
-    # 服务先于本脚本启动时会自己生成一份 config.toml（只有键位默认值，没有 [schema]），
-    # 此时方案落在出厂默认（五笔）；补一段，不动已有内容。
-    printf '\n[schema]\nactive = "%s"\navailable = ["pinyin", "wubi86"]\n' "$SCHEMA" >>"$WCFG/config.toml"
-    echo "已在 $WCFG/config.toml 补写 [schema]（方案：$SCHEMA）；重新登录或重启服务后生效"
-else
-    echo "$WCFG/config.toml 已含 [schema]，不改动"
-fi
+# ── WindInput/config.toml：没有方案设置时写入初始方案 ──
+t = os.path.join(wind_dir, "config.toml")
+seed = f'[schema]\nactive = "{schema}"\navailable = ["pinyin", "wubi86"]\n'
+
+
+try:
+    import tomllib  # Python ≥ 3.11；22.04 的 3.10 没有，只能按行判断、不做语法校验
+except ImportError:
+    tomllib = None
+
+
+def toml_ok(text):
+    if tomllib is None:
+        return True
+    try:
+        tomllib.loads(text)
+        return True
+    except tomllib.TOMLDecodeError:
+        return False
+
+
+def defines_schema(text):
+    """config.toml 是否已直接定义了 schema 表。
+
+    三种写法：`[schema]` 表头、顶层点号键 `schema.active = …`、顶层内联表 `schema = {…}`。
+    点号键或内联表已定义 schema 时再追加 `[schema]` 是重复定义，整个文件就读不了了——只 grep
+    `^\[schema\]` 会漏掉后两种。`[schema.xxx]` 子表不算：其后再写 `[schema]` 是合法的。
+    """
+    top_level = True
+    for line in text.splitlines():
+        l = line.strip()
+        if re.match(r"""^\[\s*["']?schema["']?\s*\]""", l):
+            return True
+        if l.startswith("["):
+            top_level = False
+        elif top_level and re.match(r"""^["']?schema["']?\s*[.=]""", l):
+            return True
+    return False
+
+
+if not os.path.exists(t):
+    write_atomic(t, seed)
+    print(f"已写入 {t}（方案：{schema}）")
+else:
+    s = read(t)
+    if not toml_ok(s):
+        print(f"{t} 有 TOML 语法错误，未改动；请先修好它（方案未设置）", file=sys.stderr)
+    elif defines_schema(s):
+        print(f"{t} 已含方案设置，不改动")
+    else:
+        # 服务先于本脚本启动时会自己生成一份 config.toml（只有键位默认值，没有 [schema]），
+        # 此时方案落在出厂默认（五笔）；补一段，不动已有内容。
+        nl = eol_of(s)
+        s2 = s + ("" if s.endswith("\n") or not s else nl) + nl + seed.replace("\n", nl)
+        if toml_ok(s2):
+            write_atomic(t, s2)
+            print(f"已在 {t} 补写 [schema]（方案：{schema}）；重新登录或重启服务后生效")
+        else:
+            print(f"{t} 补写 [schema] 后会变成非法 TOML（可能已用别的写法定义了方案），未改动", file=sys.stderr)
+PY
 
 if [[ $IMCONFIG -eq 1 ]]; then
     if command -v im-config >/dev/null; then
         im-config -n fcitx5 && echo "已用 im-config 切到 fcitx5"
     else
         echo "未找到 im-config，请自行设置 GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx"
+    fi
+fi
+
+if [[ $FCITX_WAS_RUNNING -eq 1 ]]; then
+    if [[ $RESTART -eq 1 && -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        fcitx5 -d >/dev/null 2>&1 && echo "已重新启动 fcitx5（已带上清风输入法）"
+    else
+        echo "fcitx5 已退出、未重新启动：重新登录后会自动启动（或在桌面会话里运行 fcitx5 -d）"
     fi
 fi
 

@@ -59,8 +59,8 @@ Maintainer: WindInput <noreply@windinput.com>
 Section: utils
 Priority: optional
 Installed-Size: $SIZE
-Depends: libc6 (>= 2.35), fcitx5 (>= 5.0.14), libxcb1, libxcb-shape0, libfontconfig1, fonts-noto-cjk | fonts-wqy-microhei | fonts-wqy-zenhei
-Recommends: fcitx5-frontend-gtk3, fcitx5-frontend-qt5 | fcitx5-frontend-qt6, im-config, xclip | wl-clipboard, python3, xdg-utils, xdg-desktop-portal | zenity, libxkbcommon0, fonts-noto-color-emoji
+Depends: libc6 (>= 2.35), fcitx5 (>= 5.0.14), libxcb1, libxcb-shape0, libfontconfig1, fonts-noto-cjk | fonts-wqy-microhei | fonts-wqy-zenhei, python3, procps
+Recommends: fcitx5-frontend-gtk3, fcitx5-frontend-qt5 | fcitx5-frontend-qt6, im-config, xclip | wl-clipboard, xdg-utils, xdg-desktop-portal | zenity, libxkbcommon0, fonts-noto-color-emoji
 Homepage: https://windinput.com
 Description: 清风输入法 (WindInput) —— Fcitx5 输入法引擎
  清风输入法的 Linux 版（测试版）：Rust 服务负责输入逻辑与候选窗渲染，
