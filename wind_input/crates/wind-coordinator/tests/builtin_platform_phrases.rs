@@ -6,8 +6,8 @@
 //! 从未生效过。
 //!
 //! ⚠️ 短语读的是**仓库** `data/system.phrases.toml`，不是 `build_dev/data/` 那份部署产物
-//! （理由同 `builtin_reverse_phrase.rs`）；端到端那条另需 `build_dev/data` 的五笔方案，
-//! 缺失时跳过（判据是耗时 0.00s）。
+//! （理由同 `builtin_reverse_phrase.rs`）；端到端那条（仅 `linux-host` 形态编译）另需
+//! `build_dev/data` 的五笔方案，缺失时带着备齐办法失败，不静默跳过。
 
 use std::path::PathBuf;
 
@@ -479,30 +479,65 @@ mod e2e {
         false
     }
 
+    /// 子进程分支的标记：值是父进程备好的临时根目录。
+    const CHILD_ROOT_ENV: &str = "WIND_TEST_PLAT_PHR_ROOT";
+    const THIS_TEST: &str = "e2e::typing_coca_launches_the_first_installed_calculator";
+
     /// PATH 里只有排第三、第四的两个计算器：打 `coca` 选中后，应当越过前两个（未安装）
     /// 启动第三个，且**只**启动它。
+    ///
+    /// 用例本体在**子进程**里跑（本测试二进制以 `--exact` 重新执行自己）：要换掉的 PATH 只
+    /// 设在子进程上，不碰本进程的全局环境——同一二进制里别的用例并行起协调器，进程内
+    /// `set_var` 与它们的 `getenv` 是数据竞争。
     ///
     /// 变异判据：把 wind-phrase 的平台过滤改回只收 `windows`，候选变成 `calc.exe`、日志
     /// 为空转红；把 `proc.any` 的首个成功即停去掉，日志多出 mate-calc 转红。
     #[test]
     fn typing_coca_launches_the_first_installed_calculator() {
-        if !build_data().join("schemas/wubi86.schema.toml").is_file() {
-            eprintln!("跳过：缺 build_dev/data 的五笔方案");
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            coca_in_child(Path::new(&root));
             return;
         }
+        assert!(
+            build_data().join("schemas/wubi86.schema.toml").is_file(),
+            "本用例需要 {} 下的五笔方案与词库：在仓库根跑 `scripts/dev.sh gd` 生成，或从已有的\
+             工作树整份拷来 build_dev/data（只拷一部分会让别的用例假绿）",
+            build_data().display()
+        );
         let root = std::env::temp_dir().join(format!("wind_plat_phr_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let log = root.join("launched.log");
         // 出厂顺序：gnome-calculator, kcalc, deepin-calculator, mate-calc, …
-        fake_program(&bin, "deepin-calculator", &log);
-        fake_program(&bin, "mate-calc", &log);
-        // SAFETY: 本测试二进制里只有这一条用例读写 PATH（其余用例不起子进程），
-        // 且在构造协调器、起任何线程之前设置。
-        unsafe { std::env::set_var("PATH", &bin) };
+        fake_program(&bin, "deepin-calculator", &root.join("launched.log"));
+        fake_program(&bin, "mate-calc", &root.join("launched.log"));
 
-        let data = data_with_repo_phrases(&root);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([THIS_TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ROOT_ENV, &root)
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            out.status.success(),
+            "子进程失败\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        // 过滤串写错时子进程跑 0 条也是「成功」：确认它真的跑了这一条。
+        assert!(
+            stdout.contains("1 passed"),
+            "子进程没有跑到本用例：\n{stdout}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 子进程里的用例本体：PATH 已由父进程设成只含假程序的 `root/bin`。
+    fn coca_in_child(root: &Path) {
+        let log = root.join("launched.log");
+        let data = data_with_repo_phrases(root);
         let store = Arc::new(wind_store::Store::open(root.join("user.redb")).unwrap());
         let mut cfg = Config::default();
         cfg.schema.available = vec!["wubi86".into()];
@@ -535,6 +570,5 @@ mod e2e {
             "deepin-calculator\n",
             "应越过未安装的前两个、只启动第一个装了的"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

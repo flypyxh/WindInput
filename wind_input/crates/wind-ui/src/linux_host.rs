@@ -41,10 +41,15 @@ fn env_set(name: &str) -> bool {
 }
 
 fn pick_backend() -> Option<Backend> {
-    if env_set("WAYLAND_DISPLAY") && have("wl-copy") {
+    pick_backend_with(env_set, have)
+}
+
+/// 选后端的判据本体：环境变量与命令是否存在都由参数给出，测试不必改进程环境。
+fn pick_backend_with(env: impl Fn(&str) -> bool, have: impl Fn(&str) -> bool) -> Option<Backend> {
+    if env("WAYLAND_DISPLAY") && have("wl-copy") {
         return Some(Backend::WlClipboard);
     }
-    if env_set("DISPLAY") {
+    if env("DISPLAY") {
         if have("xclip") {
             return Some(Backend::Xclip);
         }
@@ -230,15 +235,27 @@ pub fn open(target: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// 无 `WAYLAND_DISPLAY` / `DISPLAY` 时工具再全也不选（避免在无头环境里误起进程）；
+    /// 有会话时按 wl-clipboard → xclip → xsel 的顺序取第一个装了的。
     #[test]
-    fn no_session_env_means_no_backend() {
-        // 无 WAYLAND_DISPLAY / DISPLAY 时任何工具都不该被选中（避免在无头环境里误起进程）。
-        // 只在环境确实干净时断言，否则（开发机在桌面会话里）不做判断。
-        if !env_set("WAYLAND_DISPLAY") && !env_set("DISPLAY") {
-            assert_eq!(pick_backend(), None);
-            assert!(set_text("x").is_err());
-            assert_eq!(get_text(), "");
-        }
+    fn backend_follows_session_env_then_tool_order() {
+        let pick = |env: &[&str], tools: &[&str]| {
+            pick_backend_with(|n| env.contains(&n), |c| tools.contains(&c))
+        };
+        let all = ["wl-copy", "xclip", "xsel"];
+        assert_eq!(pick(&[], &all), None);
+        assert_eq!(
+            pick(&["WAYLAND_DISPLAY", "DISPLAY"], &all),
+            Some(Backend::WlClipboard)
+        );
+        // Wayland 会话缺 wl-clipboard：经 XWayland 的 DISPLAY 退到 X11 工具。
+        assert_eq!(
+            pick(&["WAYLAND_DISPLAY", "DISPLAY"], &["xclip", "xsel"]),
+            Some(Backend::Xclip)
+        );
+        assert_eq!(pick(&["WAYLAND_DISPLAY"], &["xclip", "xsel"]), None);
+        assert_eq!(pick(&["DISPLAY"], &["xsel"]), Some(Backend::Xsel));
+        assert_eq!(pick(&["DISPLAY"], &["wl-copy"]), None);
     }
 
     /// 本测试独占的临时目录（进程号 + 用例名，并发用例不撞）。

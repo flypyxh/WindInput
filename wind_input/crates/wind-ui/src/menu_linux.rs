@@ -359,26 +359,38 @@ mod tests {
     }
 
     /// 悬停：鼠标移到第一项 → 重推一帧（高亮）；移到带子菜单的项 → 第 1 级出现在右侧；
-    /// 再移到菜单外 → 只灭高亮，子菜单保留。
+    /// 移进子菜单的项 → 子菜单重推（高亮）；再移到菜单外 → 只灭最深层（子菜单）的高亮，
+    /// 子菜单保留、顶层不动。
     #[test]
     fn hover_repaints_and_opens_submenu_to_the_right() {
         let (mut h, _rx, cap) = host();
         h.show(&cap, items(), MenuAnchor::at_point(100, 100));
         let (_, _, x, y, w, hh) = cap.take()[0];
-        let row = |i: i32| y + 4 + (hh as i32 - 8) * (2 * i + 1) / 4;
-        h.pointer(&cap, MenuPointerEvent::Move, x + 20, row(0));
+        let row = |y: i32, hh: u32, i: i32| y + 4 + (hh as i32 - 8) * (2 * i + 1) / 4;
+        h.pointer(&cap, MenuPointerEvent::Move, x + 20, row(y, hh, 0));
         let f = cap.take();
         assert_eq!(f.len(), 1, "高亮只重推顶层：{f:?}");
-        h.pointer(&cap, MenuPointerEvent::Move, x + 20, row(0));
+        h.pointer(&cap, MenuPointerEvent::Move, x + 20, row(y, hh, 0));
         assert!(cap.take().is_empty(), "同一项上移动不重推");
-        h.pointer(&cap, MenuPointerEvent::Move, x + 20, row(1));
+        h.pointer(&cap, MenuPointerEvent::Move, x + 20, row(y, hh, 1));
         let f = cap.take();
         let sub = f.iter().find(|t| t.0 == OVERLAY_KIND_MENU + 1).copied();
-        let (_, vis, sx, _, _, _) = sub.unwrap_or_else(|| panic!("子菜单没出来：{f:?}"));
+        let (_, vis, sx, sy, _, sh) = sub.unwrap_or_else(|| panic!("子菜单没出来：{f:?}"));
         assert!(vis && sx >= x + w as i32 - 10, "子菜单在右侧：x={sx}");
+        h.pointer(&cap, MenuPointerEvent::Move, sx + 20, row(sy, sh, 0));
+        let f = cap.take();
+        assert_eq!(
+            f.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(),
+            vec![(OVERLAY_KIND_MENU + 1, true)],
+            "子菜单项高亮只重推子菜单：{f:?}"
+        );
         h.pointer(&cap, MenuPointerEvent::Move, 5, 5);
         let f = cap.take();
-        assert!(f.iter().all(|t| t.1), "移出菜单只灭高亮、不收子菜单：{f:?}");
+        assert_eq!(
+            f.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(),
+            vec![(OVERLAY_KIND_MENU + 1, true)],
+            "移出菜单只灭子菜单的高亮、子菜单不收、顶层不动：{f:?}"
+        );
     }
 
     #[test]
