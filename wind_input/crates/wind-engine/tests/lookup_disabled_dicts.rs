@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use wind_config::Config;
 use wind_engine::EngineManager;
-use wind_engine::ReverseScope;
 
 fn uid(tag: &str) -> String {
     format!("zz_ldd_{tag}_{}", std::process::id())
@@ -171,113 +170,6 @@ fn only_disabled_extra_hits_carry_the_flag() {
     assert_eq!(flags("aaa?", "aaaz"), [("甘蓝菜".to_string(), false)]);
 }
 
-/// spec §4.2：注释反查变体含未启用库；加词查重（word_codes_in）与悬停（word_codes_display）仍只认启用集
-/// ——查重若含未启用库，只在那里有的码+词会被误判为「已存在」。
-#[test]
-fn comment_reverse_variant_includes_disabled_extra() {
-    let (m, id, _g) = setup("rev", true, true, true);
-    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
-    assert_eq!(
-        m.word_codes_display_for_comment(&id, "门头沟区"),
-        None,
-        "没就绪 ≠ 查不到"
-    );
-    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
-    assert!(m.prewarm_reverse_index(&id));
-    assert_eq!(
-        m.word_codes_display_for_comment(&id, "门头沟区").as_deref(),
-        Some("uuia")
-    );
-    assert_eq!(
-        m.codetable_reverse_hint("门头沟区").as_deref(),
-        Some("uuia")
-    );
-    assert_eq!(
-        m.word_codes_in(&id, "门头沟区").as_deref(),
-        Some(""),
-        "加词查重只认启用集"
-    );
-    assert_eq!(
-        m.word_codes_display(&id, "门头沟区").as_deref(),
-        Some(""),
-        "悬停口径不变"
-    );
-}
-
-/// ★ Review Focus 4：两份索引分文件、内容不同；换一个 manager（重启）后各自复用自己那份，不串。
-#[test]
-fn variant_and_regular_indexes_use_separate_files() {
-    let Some(root) = Config::cache_dir() else {
-        eprintln!("跳过：无缓存根");
-        return;
-    };
-    let (m, id, g) = setup("files", true, true, true);
-    assert!(m.prewarm_reverse_index(&id));
-    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
-    let dir = root.join(&id);
-    let regular = dir.join(format!("{id}.wridx"));
-    let variant = dir.join(format!("{id}.with_disabled.wridx"));
-    assert!(
-        regular.exists() && variant.exists(),
-        "{:?}",
-        std::fs::read_dir(&dir).map(|r| r.count())
-    );
-    assert_ne!(
-        std::fs::read(&regular).unwrap(),
-        std::fs::read(&variant).unwrap()
-    );
-    drop(m);
-    let m2 = manager(&g.dir, &id, true);
-    assert!(m2.prewarm_reverse_index(&id));
-    assert_eq!(
-        m2.word_codes_in(&id, "门头沟区").as_deref(),
-        Some(""),
-        "常规索引复用后仍不含未启用库"
-    );
-    assert!(m2.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
-    assert_eq!(
-        m2.word_codes_display_for_comment(&id, "门头沟区")
-            .as_deref(),
-        Some("uuia")
-    );
-}
-
-/// 失效：启用唯一的未启用扩展库后，范围缓存作废、回到 `Enabled`（不再有「未启用」可含）。
-#[test]
-fn scope_cache_invalidated_on_dict_toggle() {
-    let (m, id, _g) = setup("scope_inval", true, true, true);
-    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
-    let xz = format!("{id}_xz");
-    let ov: toml::Value = toml::from_str(&format!(
-        "[[dictionaries]]\nid = \"{xz}\"\nenabled = true\n"
-    ))
-    .unwrap();
-    m.persist_schema_override(&id, &ov).unwrap();
-    m.set_dict_enabled_live(&id, &xz, true);
-    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::Enabled);
-}
-
-/// 开关关 / 方案没有未启用库 ⇒ 退化为常规索引，不另建文件（两份内容相同，另建只是白占内存与磁盘）。
-#[test]
-fn scope_collapses_to_enabled() {
-    let (off, id, _g) = setup("scope_off", false, true, true);
-    assert_eq!(off.comment_reverse_scope(&id), ReverseScope::Enabled);
-    let (none, id2, _g2) = setup("scope_none", true, false, true);
-    assert_eq!(none.comment_reverse_scope(&id2), ReverseScope::Enabled);
-}
-
-/// 失效：启用集变了，变体与范围缓存一并作废。
-#[test]
-fn variant_invalidated_on_dict_toggle() {
-    let (m, id, _g) = setup("inval", true, true, true);
-    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
-    m.set_dict_enabled_live(&id, &format!("{id}_ext"), false);
-    assert!(
-        m.reverse_index_if_ready_in(&id, ReverseScope::WithDisabled)
-            .is_none()
-    );
-}
-
 /// 等后台预热线程把影子层建完（最多 10 秒）；返回最终的建表次数。
 fn wait_disabled_loaded(m: &EngineManager, id: &str) -> Option<usize> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -315,68 +207,38 @@ fn switch_off_never_warms_disabled_layers() {
     assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
-/// 开关全关（全局与方案都没开）：注释反查范围直接判常规，不读方案文件、不写范围缓存。
+/// ★ Review Focus 4：开关开着，注释 / 悬停 / 查重一律只认已启用词库；不存在能带出未启用库编码的路径。
 #[test]
-fn scope_short_circuits_when_switch_off() {
-    let (m, id, _g) = setup("scope_short", false, true, true);
-    assert!(m.prewarm_schema(&id));
-    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::Enabled);
+fn comment_reverse_ignores_disabled_extra_even_when_on() {
+    let (m, id, _g) = setup("cmt", true, true, true);
+    assert!(m.prewarm_reverse_index(&id));
+    assert_eq!(m.codetable_reverse_hint("门头沟区").as_deref(), Some(""));
+    assert_eq!(m.word_codes_display(&id, "门头沟区").as_deref(), Some(""));
+    assert_eq!(m.word_codes_in(&id, "门头沟区").as_deref(), Some(""));
+    assert_eq!(m.codetable_reverse_hint("立法").as_deref(), Some("uuif"));
+}
+
+/// 缓存目录里的反查索引文件只有常规那一份 `<id>.wridx`，不另建含未启用库的变体文件。
+#[test]
+fn no_variant_index_file_is_written() {
+    let (m, id, _g) = setup("nofile", true, true, true);
+    assert!(m.prewarm_reverse_index(&id));
     let _ = m.codetable_reverse_hint("立法");
-    assert_eq!(m.reverse_scope_cached_for_test(&id), None, "不该落范围缓存");
-}
-
-/// 全局关、方案级开：短路不得误判，仍是含未启用库的变体范围。
-#[test]
-fn scope_follows_schema_override_when_global_off() {
-    let (m, id, _g) = setup("scope_schema_on", false, true, true);
-    let ov: toml::Value =
-        toml::from_str("[engine.codetable]\nlookup_disabled_dicts = true\n").unwrap();
-    m.write_schema_override(&id, &ov).unwrap();
-    assert!(m.prewarm_schema(&id));
-    assert!(
-        m.disabled_dicts_load_count(&id).is_some(),
-        "方案级开 ⇒ 挂影子层"
-    );
-    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
-}
-
-/// 变体还没建好、常规已就绪：注释先用常规索引出启用集里的码，不整段空白。
-#[test]
-fn comment_reverse_falls_back_to_regular_while_variant_missing() {
-    let (m, id, _g) = setup("fallback", true, true, true);
-    assert_eq!(m.comment_reverse_scope(&id), ReverseScope::WithDisabled);
-    assert!(m.prewarm_reverse_index(&id));
-    assert!(
-        m.reverse_index_if_ready_in(&id, ReverseScope::WithDisabled)
-            .is_none()
-    );
-    assert_eq!(m.codetable_reverse_hint("立法").as_deref(), Some("uuif"));
-    assert_eq!(
-        m.word_codes_display_for_comment(&id, "立法").as_deref(),
-        Some("uuif")
-    );
-    assert_eq!(
-        m.codetable_reverse_hint("门头沟区").as_deref(),
-        Some(""),
-        "变体没就绪时未启用库的词暂缺"
-    );
-    assert!(m.prewarm_reverse_index_in(&id, ReverseScope::WithDisabled));
-    assert_eq!(
-        m.codetable_reverse_hint("门头沟区").as_deref(),
-        Some("uuia"),
-        "变体就绪后自然升级"
-    );
-}
-
-/// 变体被崩溃保护跳过：同样回退常规索引。
-#[test]
-fn comment_reverse_falls_back_when_variant_skipped() {
-    let (m, id, _g) = setup("fallback_skip", true, true, true);
-    m.mark_reverse_index_skipped_for_test(&id, ReverseScope::WithDisabled);
-    assert!(m.prewarm_reverse_index(&id));
-    assert_eq!(m.codetable_reverse_hint("立法").as_deref(), Some("uuif"));
-    assert_eq!(
-        m.word_codes_display_for_comment(&id, "立法").as_deref(),
-        Some("uuif")
-    );
+    if let Some(dir) = Config::cache_dir().map(|c| c.join(&id)) {
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .map(|it| {
+                it.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let regular = format!("{id}.wridx");
+        assert!(
+            names
+                .iter()
+                .filter(|n| n.ends_with(".wridx"))
+                .all(|n| *n == regular),
+            "{names:?}"
+        );
+    }
 }
