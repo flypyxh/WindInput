@@ -103,7 +103,7 @@ mod tray {
 
         if let Some(dir) = preview {
             for &(variant, label) in PREVIEW_ONLY {
-                let name = tray_icon::icon_name(variant, label);
+                let name = tray_icon::icon_name(false, variant, label);
                 for &n in tray_icon::SIZES {
                     rendered.push((
                         name.clone(),
@@ -127,7 +127,8 @@ mod tray {
             .flatten()
             .filter_map(|f| f.file_name().to_str().map(str::to_string))
             .filter_map(|f| f.strip_suffix(".png").map(str::to_string))
-            .filter(|n| n.starts_with(tray_icon::DYNAMIC_PREFIX))
+            // 正式版前缀是 dev 前缀的前缀：两个变体的运行时图标都列出来。
+            .filter(|n| n.starts_with(tray_icon::icon_prefix(false)))
             .collect();
         names.sort();
         let mut rendered = Vec::new();
