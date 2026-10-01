@@ -38,6 +38,14 @@ use std::path::{Path, PathBuf};
 /// 加条目之前先问：这个文件按行解析的是不是用户能拿到、能编辑、能从别的系统
 /// 搬过来的文本？是的话就该修，不是加白名单。
 const ALLOWED: &[(&str, &str)] = &[
+    // ---- 整个文件只在 cfg(test) 下编译，且读的是构建产物 ----
+    // 整文件测试模块在声明处（pinyin/mod.rs 的 #[cfg(test)] mod）才带 cfg(test)，
+    // 文件内没有 #[cfg(test)] 可供 strip_tests 剥除，守卫于是把它当生产代码。
+    // 它读的是 gen-data 产出的 base.dict.yaml（我们自己生成、LF），不是用户文件。
+    (
+        "crates/wind-engine/src/pinyin/step4_skip_tests.rs",
+        "整文件测试模块，读 gen-data 产物",
+    ),
     // ---- 构建期工具：读的是我们从上游拉下来的数据，不是用户文件 ----
     // 上游（rime / opencc / unicode 数据）用 LF 或 CRLF，不会是孤立 \r；
     // 且构建期解析异常会当场让构建失败或产出明显异常，不存在「运行时静默」。
