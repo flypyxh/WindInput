@@ -340,3 +340,10 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    另：抓指针期间点菜单外，那一下被菜单吃掉、不传给下面的应用（同 X11 原生菜单，与 Windows
    「点外面照常响应」不同）。
 3. `wind-coordinator` 在 macOS 目标上依赖 C 库，本机无法交叉 check，改动靠 CI 的 macOS job 兜底。
+4. **菜单关闭回送没有代际（已知限制，不修）**：UI 收掉一个可见菜单时回送 `MenuClose`，协调器分不出
+   是哪个菜单的。候选右键菜单 A 随候选收起（`notify_ui_hide` 发 `HideMenu`、靠回送收口）后、UI 处理
+   之前，addon 又报 `menu.open` 弹出 B，则 UI 收 A 的回送会让协调器把 B 也收掉——B 一闪即逝，时间窗是
+   一次跨线程往返（毫秒级）。两端认识始终一致（协调器复位时补发 `HideMenu`，不会出现「屏上没菜单、
+   键却被吞」），`handle_menu.rs` 的 `stale_menu_close_echo_closes_new_menu_consistently` 钉住这一点。
+   不加代际的理由：要改 `wind-ui-types` 里三平台共用的 `HideMenu` / `MenuClose`（Windows 的
+   `popup_menu` 也发它），换来的只是一个人手几乎点不进去的时间窗里少闪一次菜单。

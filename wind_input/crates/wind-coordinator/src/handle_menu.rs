@@ -4736,6 +4736,45 @@ mod linux_menu_tests {
         assert!(drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
     }
 
+    /// 已知竞态（`linux-port.md` §7）：`HideMenu` 回送的 `MenuClose` 不带代际，分不出是哪个菜单的。
+    ///
+    /// 候选右键菜单 A 开着 → 候选收起，协调器发 `HideMenu`（持锁路径不复位 `menu_open`，靠 UI
+    /// 回送收口）→ UI 还没处理，addon 又报 `menu.open` 弹主菜单 B → UI 按序先收 A（可见，回送
+    /// `MenuClose`）再弹 B → 协调器处理到这条 `MenuClose`，把 B 当成被关掉。
+    ///
+    /// 后果只是 B 刚弹出就被收掉（时间窗是一次跨线程往返，毫秒级），**两端认识仍然一致**：
+    /// 协调器复位的同时补发 `HideMenu`，UI 随即收掉 B，不会出现「屏上没菜单、键却被吞」。
+    /// 本例钉住的就是这条一致性；若日后给 `MenuClose` 加代际，把末段改成「B 仍开着」。
+    #[test]
+    fn stale_menu_close_echo_closes_new_menu_consistently() {
+        let (c, rx) = coord();
+        with_candidate(&c);
+        c.show_candidate_menu(0, 10, 20); // A
+        drain(&rx);
+        c.notify_ui_hide();
+        assert!(drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)));
+        c.open_menu_from_host(MenuOpenRequest {
+            target: wind_ipc::protocol::menu_target::MENU_TARGET_MAIN,
+            x: 0,
+            y: 0,
+            work: [0, 0, 1280, 800],
+            local: None,
+        }); // B
+        assert!(c.is_menu_open());
+        drain(&rx);
+        // UI 收 A 时的回送，到得比 B 的任何操作都早。
+        c.handle_ui_event(wind_ui_types::UiEvent::MenuClose);
+        assert!(!c.is_menu_open(), "已知限制：B 被这条迟到的回送收掉");
+        assert!(
+            drain(&rx).iter().any(|m| matches!(m, UiCommand::HideMenu)),
+            "协调器复位时必须让 UI 也收掉 B，否则屏上留着一个不收键的菜单"
+        );
+        assert!(
+            !c.forward_menu_key(keymap::VK_RETURN),
+            "复位之后的回车照常交给输入流程，不被吞"
+        );
+    }
+
     #[test]
     fn idle_timeout_predicate() {
         let now = std::time::Instant::now();
@@ -4751,9 +4790,10 @@ mod linux_menu_tests {
     fn stale_open_menu_does_not_swallow_the_next_key() {
         let (c, rx) = coord();
         c.show_main_menu(MenuAnchor::at_point(0, 0));
-        let Some(old) = std::time::Instant::now().checked_sub(MENU_IDLE_TIMEOUT * 2) else {
-            return; // 开机不足两分钟的机器上 Instant 回退不了：此例无从构造
-        };
+        // 开机不足两分钟的机器上 Instant 回退不了：此例无从构造，明说而不是静默通过。
+        let old = std::time::Instant::now()
+            .checked_sub(MENU_IDLE_TIMEOUT * 2)
+            .expect("本例需要开机超过 2 分钟（Instant 要能回退两个空闲超时）");
         c.state.lock().unwrap().menu_touched_at = Some(old);
         drain(&rx);
         assert!(!c.forward_menu_key(keymap::VK_DOWN), "超时后的键照常处理");
@@ -4765,9 +4805,9 @@ mod linux_menu_tests {
     fn menu_keys_keep_the_idle_timer_fresh() {
         let (c, _rx) = coord();
         c.show_main_menu(MenuAnchor::at_point(0, 0));
-        let Some(old) = std::time::Instant::now().checked_sub(MENU_IDLE_TIMEOUT / 2) else {
-            return;
-        };
+        let old = std::time::Instant::now()
+            .checked_sub(MENU_IDLE_TIMEOUT / 2)
+            .expect("本例需要开机超过 30 秒（Instant 要能回退半个空闲超时）");
         c.state.lock().unwrap().menu_touched_at = Some(old);
         assert!(c.forward_menu_key(keymap::VK_DOWN));
         let touched = c.state.lock().unwrap().menu_touched_at.unwrap();
