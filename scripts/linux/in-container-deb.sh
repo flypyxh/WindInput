@@ -43,6 +43,12 @@ install -Dm644 /src/scripts/linux/pkg/windinput-mime.xml "$S/usr/share/mime/pack
 # 图标（windinput / windinput-zh / windinput-en，各尺寸）由上面的 cmake --install 装好。
 install -Dm644 /src/wind_linux/README.md "$S/usr/share/doc/windinput/README.md"
 
+# 权限归一：`cp -a` 把宿主 umask（002 → 0775/0664）原样带进包，装到系统里就是 root 组可写。
+# 目录 755；带执行位的文件 755、其余 644（符号链接不动）。
+find "$S" -type d -exec chmod 755 {} +
+find "$S" -type f -perm /111 -exec chmod 755 {} +
+find "$S" -type f ! -perm /111 -exec chmod 644 {} +
+
 mkdir -p "$S/DEBIAN"
 SIZE=$(du -sk --apparent-size "$S" | cut -f1)
 cat >"$S/DEBIAN/control" <<CONTROL
