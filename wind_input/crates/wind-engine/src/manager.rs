@@ -1721,7 +1721,7 @@ impl EngineManager {
                 }
             });
         if let Err(e) = spawned {
-            warn!("无法启动未启用扩展词库预热线程: {e}（首次通配时再加载）");
+            warn!("无法启动未启用扩展词库预热线程: {e}（首次反查时再加载）");
         }
     }
 
@@ -3311,7 +3311,7 @@ impl EngineManager {
             .single_char_codes
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        // 禁用方向把一个库挪进了影子集合、作废了已建的影子层：趁现在后台重建，别等首次通配
+        // 禁用方向把一个库挪进了影子集合、作废了已建的影子层：趁现在后台重建，别等首次反查
         // 在按键线程上读盘。启用方向走失效重建，新引擎建好时自会预热（见 `ensure_loaded`）。
         if !enabled {
             self.warm_disabled_dicts_async(&self.active_schema_id());
