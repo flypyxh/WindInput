@@ -1279,6 +1279,21 @@ fn lookup_disabled(mut cfg: Config) -> Config {
     cfg
 }
 
+/// 同一份配置下进反查模式（`\` 绑反查）查 `zuia`：给「行内通配不含 xzqy」当「影子层确实挂上过」的对照。
+fn reverse_has_xzqy(mut cfg: Config) -> bool {
+    cfg.keys
+        .key_actions
+        .insert("backslash".into(), "reverse".into());
+    cfg.input.reverse.lookup_disabled_dicts = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0xDC, false);
+    press(&coord, "zuia");
+    coord
+        .debug_candidate_triples()
+        .iter()
+        .any(|(t, c, _)| t == "门头沟区" && c == "uuia")
+}
+
 fn tri_of(cfg: Config, keys: &str) -> Vec<(String, String, String)> {
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     press(&coord, keys);
@@ -1297,6 +1312,10 @@ fn lookup_disabled_dicts_inline_wildcard_excludes_xzqy() {
     assert!(!off.is_empty(), "前置：行内通配有结果（防空过）");
     assert_eq!(on, off);
     assert!(on.iter().all(|(t, _, _)| t != "门头沟区"), "{on:?}");
+    assert!(
+        reverse_has_xzqy(wubi(true, "z")),
+        "对照：同一配置下反查模式查得到门头沟区（影子层确实挂上过）"
+    );
 }
 
 /// ★ Review Focus 1（真实数据）：开关开着，普通打字的候选逐条不变（含前缀补全与活码字母）。
@@ -1325,4 +1344,8 @@ fn mixed_inline_wildcard_excludes_xzqy() {
     let on = tri_of(lookup_disabled(wubi_pinyin(true)), "uuiz");
     assert!(!on.is_empty(), "前置：混输行内通配有结果（防空过）");
     assert!(on.iter().all(|(t, _, _)| t != "门头沟区"), "{on:?}");
+    assert!(
+        reverse_has_xzqy(wubi_pinyin(true)),
+        "对照：同一混输配置下反查模式查得到门头沟区"
+    );
 }
