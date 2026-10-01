@@ -1578,7 +1578,7 @@ mod wildcard_tier_tests {
     /// 不论权重；但不跨档（未启用的等长仍先于已启用的更长补全）。
     #[test]
     fn disabled_dict_sorts_after_enabled_within_exact_tier() {
-        let mut v = vec![
+        let mut v = [
             dd("影等长", true, 9999, true),
             dd("启更长", false, 9999, false),
             dd("启等长", true, 1, false),
@@ -1597,7 +1597,7 @@ mod wildcard_tier_tests {
             a.from_disabled_dict.cmp(&b.from_disabled_dict),
             std::cmp::Ordering::Equal
         );
-        let mut v = vec![a, b];
+        let mut v = [a, b];
         v.sort_by(|x, y| candidate_display_order(x, y, false, false, "uuiz"));
         assert_eq!(v[0].text, "乙", "仍按权重");
     }
