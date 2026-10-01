@@ -25,9 +25,12 @@ public:
     virtual void commitText(const std::string& utf8) = 0;
     /// 摆组合串（预编辑）。`utf8` 为空 = 清除组合。`caretBytes` 为组合内光标的 UTF-8 字节偏移。
     virtual void setPreedit(const std::string& utf8, size_t caretBytes) = 0;
-    /// 删除光标前 `chars` 个字符；宿主不支持（无 surrounding text 能力）时返回 false、什么都不做。
-    virtual bool deleteBeforeCursor(size_t chars) = 0;
-    /// 移动宿主光标 `chars` 个字符（负 = 左）。Fcitx5 侧合成方向键。
+    /// 删除光标前 `utf16Units` 个 **UTF-16 码元**（服务端的量纲，同 Windows / macOS）；实现方
+    /// 按光标前文本换算成码点（`codepointsForUtf16Back`）。宿主不支持（无 surrounding text 能力）
+    /// 时返回 false、什么都不做。调用方保证不超过 `kMaxDeleteUnits`。
+    virtual bool deleteBeforeCursor(size_t utf16Units) = 0;
+    /// 移动宿主光标 `chars` 个字符（负 = 左）。Fcitx5 侧合成方向键，一个方向键一个字符——
+    /// 与 Windows（模拟 VK_LEFT）、macOS（合成方向键）同一量纲。调用方保证 |chars| ≤ `kMaxCursorMove`。
     virtual void moveCursor(int chars) = 0;
 };
 
@@ -48,6 +51,11 @@ public:
 private:
     uint16_t prevChar_ = 0;
 };
+
+/// 服务端给的删除 / 光标移动计数是 u32，转 int 取负前先钳住：大于 INT_MAX 时取负是未定义行为；
+/// 真实值只有个位数（智能标点、撤销上屏的一段词），上限远高于正常用量。
+constexpr uint32_t kMaxDeleteUnits = 1024;
+constexpr uint32_t kMaxCursorMove = 64;
 
 class ResponseRouter {
 public:

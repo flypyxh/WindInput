@@ -1,5 +1,7 @@
 #include "ResponseRouter.h"
 
+#include <algorithm>
+
 #include "ExtProtocol.h"
 #include "Protocol.h"
 #include "Utf.h"
@@ -114,7 +116,7 @@ bool ResponseRouter::apply(const Frame& frame, TextSink* sink, bool hostShortcut
                 digits_.reset(); // 纯删除（ime.undo_commit）：被删掉的数字不能幸存
             }
             if (p->count > 0) {
-                sink->deleteBeforeCursor(p->count);
+                sink->deleteBeforeCursor(std::min(p->count, kMaxDeleteUnits));
             }
             insertCommitted(p->text, sink);
         }
@@ -197,7 +199,7 @@ void ResponseRouter::applyCommitTextWithCursor(const CommitTextWithCursorPayload
     insertCommitted(takePendingPrefix() + p.text, sink);
     // 自动配对插入 `（）` 后把光标退回到配对中间。
     if (p.cursorOffset > 0 && sink) {
-        sink->moveCursor(-static_cast<int>(p.cursorOffset));
+        sink->moveCursor(-static_cast<int>(std::min(p.cursorOffset, kMaxCursorMove)));
     }
 }
 

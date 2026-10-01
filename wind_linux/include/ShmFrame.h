@@ -53,7 +53,12 @@ public:
     /// close，下一帧按名重开。
     void close();
 
-    /// 读当前帧。magic 不对 / 尺寸越界返回 false。dataSize==0（隐藏帧）返回 true、像素为空。
+    /// 帧宽高上限：远大于任何真实候选窗 / 菜单，又在 X11 的 16 位尺寸之内——超了 `uint16_t()`
+    /// 截断，xcb 请求超长（REQ_LEN_EXCEED）直接把连接关掉。
+    static constexpr uint32_t kMaxFrameDim = 16384;
+
+    /// 读当前帧。magic 不对 / 尺寸越界 / 宽高超过 `kMaxFrameDim` 返回 false。dataSize==0（隐藏帧）
+    /// 返回 true、像素为空。
     bool snapshot(SharedFrame& out) const;
 
 private:

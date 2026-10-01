@@ -263,6 +263,22 @@ void TestReplaceBackwardAndCursor()
     r.apply(mk(CMD_MOVE_CURSOR, le32(1)), &s3);
     CHECK(s3.ops.back() == "move:1");
 
+    CASE("服务端给的计数巨大（> INT_MAX）：钳到上限再取负，不是未定义行为");
+    FakeSink s5;
+    Bytes big;
+    put(big, 0xFFFFFFFFu);
+    put(big, 1u);
+    put(big, std::string("."));
+    r.apply(mk(CMD_REPLACE_BACKWARD, big), &s5);
+    CHECK(s5.ops.size() == 2 && s5.ops[0] == "delete:" + std::to_string(kMaxDeleteUnits));
+    FakeSink s6;
+    Bytes far;
+    put(far, uint32_t(std::string("（）").size()));
+    put(far, 0x80000000u);
+    put(far, std::string("（）"));
+    r.apply(mk(CMD_COMMIT_TEXT_WITH_CURSOR, far), &s6);
+    CHECK(s6.ops.back() == "move:-" + std::to_string(kMaxCursorMove));
+
     CASE("KeyType：整段上屏");
     FakeSink s4;
     r.apply(mk(CMD_KEY_TYPE, Bytes{'o', 'k'}), &s4);
@@ -301,6 +317,15 @@ void TestUtf()
     CHECK_EQ(lastCodepoint("x9"), uint32_t('9'));
     CHECK_EQ(lastCodepoint(""), 0u);
     CHECK_EQ(utf16Length(std::string("\xff", 1)), size_t(1)); // 非法字节不崩
+
+    CASE("删光标前 N 个 UTF-16 码元 → 码点数（Fcitx5 的 deleteSurroundingText 按码点）");
+    CHECK_EQ(codepointsForUtf16Back("a你𠀀", 2), size_t(1));      // 𠀀 是代理对：2 码元 = 1 字
+    CHECK_EQ(codepointsForUtf16Back("a你𠀀", 3), size_t(2));
+    CHECK_EQ(codepointsForUtf16Back("a你𠀀", 4), size_t(3));
+    CHECK_EQ(codepointsForUtf16Back("a你𠀀", 1), size_t(0));      // 落在代理对中间：不删半个字
+    CHECK_EQ(codepointsForUtf16Back("你好", 2), size_t(2));       // BMP：码元 = 码点
+    CHECK_EQ(codepointsForUtf16Back("😀", 6), size_t(1 + 4));    // 宿主只给了一段：余下按 1 计
+    CHECK_EQ(codepointsForUtf16Back("", 3), size_t(3));
 }
 
 } // namespace

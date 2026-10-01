@@ -1,5 +1,7 @@
 #include "Utf.h"
 
+#include <vector>
+
 namespace windlinux {
 
 namespace {
@@ -74,6 +76,25 @@ uint32_t lastCodepoint(const std::string& utf8)
         i += decodeOne(utf8, i, last);
     }
     return last;
+}
+
+size_t codepointsForUtf16Back(const std::string& before, size_t units)
+{
+    std::vector<uint8_t> widths; // 每个码点的 UTF-16 码元数
+    for (size_t i = 0; i < before.size();) {
+        uint32_t cp = 0;
+        i += decodeOne(before, i, cp);
+        widths.push_back(cp >= 0x10000 ? 2 : 1);
+    }
+    size_t chars = 0;
+    for (auto it = widths.rbegin(); it != widths.rend(); ++it) {
+        if (units < *it) {
+            return chars; // 0，或落在代理对中间：不再往前
+        }
+        units -= *it;
+        ++chars;
+    }
+    return chars + units;
 }
 
 } // namespace windlinux

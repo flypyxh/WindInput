@@ -84,12 +84,23 @@ public:
         }
     }
 
-    bool deleteBeforeCursor(size_t chars) override
+    bool deleteBeforeCursor(size_t utf16Units) override
     {
         if (!ic_->capabilityFlags().test(fcitx::CapabilityFlag::SurroundingText)) {
             return false;
         }
-        ic_->deleteSurroundingText(-int(chars), unsigned(chars));
+        // 服务端按 UTF-16 码元计、Fcitx5 按码点删：拿光标前的文本换算（emoji、扩展 B 区汉字
+        // 一个字两个码元）。读不到光标前文本时只能按码元数直接删（BMP 内两者相同）。
+        size_t chars = utf16Units;
+        const auto& st = ic_->surroundingText();
+        if (st.isValid() && st.cursor() <= fcitx::utf8::length(st.text())) {
+            const std::string& text = st.text();
+            auto end = fcitx::utf8::nextNChar(text.begin(), st.cursor());
+            chars = codepointsForUtf16Back(std::string(text.begin(), end), utf16Units);
+        }
+        if (chars > 0) {
+            ic_->deleteSurroundingText(-int(chars), unsigned(chars));
+        }
         return true;
     }
 

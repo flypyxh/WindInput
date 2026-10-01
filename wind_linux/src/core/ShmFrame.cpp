@@ -75,7 +75,7 @@ bool ShmFrameReader::snapshot(SharedFrame& out) const
     }
     SharedRenderHeader h;
     std::memcpy(&h, ptr_, sizeof(h)); // packed 结构，拷出来再读，免得未对齐访问
-    if (h.magic != SHARED_RENDER_MAGIC) {
+    if (h.magic != SHARED_RENDER_MAGIC || h.width > kMaxFrameDim || h.height > kMaxFrameDim) {
         return false;
     }
     out.sequence = h.sequence;

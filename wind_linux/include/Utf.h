@@ -25,4 +25,11 @@ size_t utf8CharCount(const std::string& utf8);
 /// 末位码点；空串返回 0。
 uint32_t lastCodepoint(const std::string& utf8);
 
+/// 服务端的「删光标前 N 个」以 **UTF-16 码元**计（Windows TSF 的 ACP、macOS 的 NSRange 都是
+/// 这个量纲），Fcitx5 的 `deleteSurroundingText` 按**码点**计。从光标前文本 `before` 的末尾往前
+/// 数 `units` 个码元，返回覆盖的码点数。落在代理对中间时不含那个字（宁少删不多删，同 macOS
+/// 取不到范围时「只插入不删除」的取向）；`before` 不够长（宿主只给了一段）时，余下的码元按
+/// 每个 1 码点计。
+size_t codepointsForUtf16Back(const std::string& before, size_t units);
+
 } // namespace windlinux

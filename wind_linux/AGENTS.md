@@ -120,6 +120,12 @@ e2e 的坑，都踩过：
   翻转不触发 activate，按键前比对、翻转即补报 FocusGained（同 macOS 的安全输入跟随）。
 - 光标：`InputContext::cursorRect()`（X11 客户端是根窗口坐标，正是 wire 坐标系）→
   `CMD_CARET_UPDATE` 12 字节版，y 取行顶、height 取行高。宿主没报过位置（全 0）时不发。
+- 回删（`CMD_REPLACE_BACKWARD`，智能符号 / 撤销上屏）的计数是 **UTF-16 码元**（Windows TSF 的 ACP、
+  macOS 的 NSRange 同量纲），Fcitx5 的 `deleteSurroundingText` 按码点删：按光标前文本换算
+  （`codepointsForUtf16Back`，落在代理对中间宁少删），读不到光标前文本才按码元数直删。配对插入后的
+  光标回退（`cursorOffset`）是「按几下方向键」，三平台都合成方向键，不换算。两者转 int 取负前钳到
+  1024 / 64（服务端给 u32，> INT_MAX 取负是未定义行为）。帧宽高超过 16384 拒收（X11 尺寸 16 位，
+  截断后的请求会让 xcb 关连接）。
 - prevChar（数字后智能标点）：宿主支持 surrounding text 就读真实光标前字符（对位 Windows 主路径），
   否则退回本端记账（对位 macOS 唯一的备用通路）。
 - 断线自愈：请求连接 2s 超时（connect 之前就设好，服务停住时 connect 本身也会阻塞）。只有「对端

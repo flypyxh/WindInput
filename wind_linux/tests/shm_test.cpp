@@ -96,6 +96,17 @@ void TestRejectBad()
     svc.write(1, 0, 0, 4, 4, 0, /*dataSize=*/16); // dataSize < stride*height
     CHECK(!r.snapshot(f));
 
+    CASE("宽高超过 16384：拒收（X11 尺寸是 16 位，截断后的请求会让 xcb 关连接）");
+    {
+        FakeServiceShm big(64 + 16385 * 4 + 64);
+        ShmFrameReader rb;
+        CHECK(rb.open(big.name, big.size));
+        big.write(1, 0, 0, 16385, 1, 0x10); // 像素放得下，单看尺寸也要拒
+        CHECK(!rb.snapshot(f));
+        big.write(2, 0, 0, 16384, 1, 0x10);
+        CHECK(rb.snapshot(f));
+    }
+
     CASE("隐藏帧（dataSize=0）：成功、像素为空");
     SharedRenderHeader hdr{};
     hdr.magic = SHARED_RENDER_MAGIC;
