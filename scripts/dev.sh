@@ -553,6 +553,10 @@ assemble_data() {
 
     say "\n组装 data/ → $data"
     rm -rf "$data"
+    # 单独跑 gd 时 $outdir(build_dev/)在全新检出里还不存在，下面的 cp -r 会因父目录缺失而整体失败，
+    # 且报错之后脚本照常往下跑——最终得到一份只有下载物、缺 data/ 源文件(配置/方案/主题)的残缺目录。
+    # do_full 总是先 mkdir，所以此前只有「全新检出直接 gd」才踩得到(CI 的 Linux 词库任务正是这条路)。
+    mkdir -p "$outdir"
 
     # 1. 复制 data/ 源文件（configs、五笔词库、主题等）
     cp -rf "$PRODUCT_ROOT/data" "$data"
