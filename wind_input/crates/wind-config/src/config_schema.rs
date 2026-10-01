@@ -488,6 +488,7 @@ static REGISTRY: &[ConfigField] = &[
     // 反查模式。进入方式只走 key_actions（动词 reverse），出厂不绑键；enabled 是总开关。
     f("input.reverse.enabled", Bool),
     f("input.reverse.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
+    f("input.reverse.lookup_disabled_dicts", Bool),
     // Emoji 候选扩展（按候选文本查表追加，与编码域无关 ⇒ 全方案通用，故在 input 而非 schema）。
     f("input.emoji.enabled", Bool),
     f("input.emoji.scope", Enum(EMOJI_SCOPE_VALUES)),

@@ -4464,6 +4464,11 @@ pub struct ReverseConfig {
     /// 反查模式期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
+    /// 反查模式里也查**未启用**的扩展词库（`DictSpec::is_enabled() == false`，如五笔「行政区域」），
+    /// 结果排在已启用词库之后。只管反查模式本身：行内通配、普通打字候选与候选注释里的编码反查都不受影响。
+    /// 出厂关。见 docs/design/codetable-reverse-mode.md §9。
+    #[serde(default)]
+    pub lookup_disabled_dicts: bool,
 }
 
 /// 临时拼音配置（[input.temp_pinyin]）。码表方案下临时切到拼音反查。全局唯一。
@@ -13505,6 +13510,22 @@ mod status_position_tests {
             BoundAction::parse("reversex"),
             BoundAction::None,
             "未知动词仍回落 None"
+        );
+    }
+
+    /// reverse-rework：含未启用扩展词库是反查模式专属的全局开关，出厂关。
+    #[test]
+    fn reverse_lookup_disabled_dicts_defaults_off_and_parses() {
+        assert!(
+            !Config::default().input.reverse.lookup_disabled_dicts,
+            "出厂关"
+        );
+        let t: ReverseConfig = toml::from_str("lookup_disabled_dicts = true\n").unwrap();
+        assert!(t.lookup_disabled_dicts);
+        assert_eq!(
+            t.candidate_layout,
+            LayoutIntent::Follow,
+            "缺省的布局不受影响"
         );
     }
 

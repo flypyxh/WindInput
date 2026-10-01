@@ -1004,6 +1004,9 @@ include_blocks = []
 enabled = false
 # 反查模式期间的候选窗布局（follow / vertical / horizontal，见「模式级候选布局」）。
 candidate_layout = "follow"
+# 反查含扩展词库：反查模式里也查「未启用」的扩展词库（如五笔的行政区域），排在已启用词库之后。
+# 只管反查模式：行内通配、普通打字候选、候选注释里的编码反查都不受影响。
+lookup_disabled_dicts = false
 
 # Emoji 候选：打出词语后，把对应的 emoji 追加到候选列表（如「开心」→ 😄）。
 # 按候选文字查表，与编码无关，所有方案通用。词表见 data/emoji/（来自 rime-emoji，
