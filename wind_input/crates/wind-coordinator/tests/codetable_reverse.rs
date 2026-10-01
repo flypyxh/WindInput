@@ -641,7 +641,7 @@ fn stale_schema_override_leaks_nowhere_real_data() {
     let _ = std::fs::remove_dir_all(&ov);
 }
 
-/// ★ Review Focus 5：没有任何开关——`z_key_action = "reverse"` 经 z 夺取进入，首位通配 `zuia` 照常出结果。
+/// ★ Review Focus 5：没有任何开关——`z_key_action = "reverse"` 经 z 夺取进入（z 是引导键，`zuia` 实际查 `uia`），照常出结果。
 #[test]
 fn z_key_action_reverse_lists_zuia_without_any_switch() {
     if !dict_ready() {
