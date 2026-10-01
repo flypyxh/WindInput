@@ -224,6 +224,47 @@ int main()
         CHECK_EQ(ModeIndicator::dynamicIconName(V::English, "En"), std::string("windinput-lbl-en-456e"));
     }
 
+    CASE("运行时图标名分变体、超长标签走散列；样例与 tray_icon.rs 逐字相同（读源码核对）");
+    {
+        using V = ModeIndicator::Variant;
+        const std::string devPin = ModeIndicator::dynamicIconName(V::Chinese, "拼", true);
+        const std::string relPin = ModeIndicator::dynamicIconName(V::Chinese, "拼", false);
+        std::string longLabel;
+        for (int i = 0; i < 40; ++i) {
+            longLabel += "虎";
+        }
+        const std::string hashed = ModeIndicator::dynamicIconName(V::Chinese, longLabel, false);
+        CHECK_EQ(devPin, std::string("windinput-lbl-dev-zh-e68bbc"));
+        CHECK_EQ(relPin, std::string("windinput-lbl-zh-e68bbc"));
+        CHECK_EQ(hashed, std::string("windinput-lbl-zh-h8b27ed0fc2ac336d"));
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::Caps, std::string(32, 'a'), false),
+                 "windinput-lbl-caps-" + [] {
+                     std::string h;
+                     for (int i = 0; i < 32; ++i) {
+                         h += "61";
+                     }
+                     return h;
+                 }());
+        CHECK(ModeIndicator::dynamicIconName(V::Caps, std::string(33, 'a'), false)
+                  .rfind("windinput-lbl-caps-h", 0) == 0);
+        std::ifstream in(std::string(WIND_REPO_DIR) + "/wind_input/crates/wind-ui/src/tray_icon.rs");
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const std::string rs = ss.str();
+        for (const std::string& sample : {devPin, relPin, hashed}) {
+            if (rs.find("\"" + sample + "\"") == std::string::npos) {
+                std::printf("  tray_icon.rs 里没有样例 %s\n", sample.c_str());
+                CHECK(false);
+            }
+        }
+        // 缺省按本 addon 的变体：WIND_VARIANT=dev 时带 dev 段。
+        setenv("WIND_VARIANT", "dev", 1);
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::Chinese, "拼"), devPin);
+        setenv("WIND_VARIANT", "release", 1);
+        CHECK_EQ(ModeIndicator::dynamicIconName(V::Chinese, "拼"), relPin);
+        unsetenv("WIND_VARIANT");
+    }
+
     CASE("运行时图标在（64px 那张写完）就用它，否则退回种子；文字标签如实");
     {
         namespace fs = std::filesystem;

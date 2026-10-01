@@ -7172,7 +7172,7 @@ impl Coordinator {
         let icon_label = self.mode_icon_label(chinese_mode, caps_lock);
         // Linux：托盘图标按主字运行时渲染，文件必须先于带这个标签的状态帧落盘（见子模块头）。
         #[cfg(all(target_os = "linux", ext_presenter, not(test)))]
-        self.ensure_tray_icons();
+        self.ensure_tray_icons((chinese_mode && !caps_lock).then_some(icon_label.as_str()));
         StatusUpdateData {
             chinese_mode,
             full_width,

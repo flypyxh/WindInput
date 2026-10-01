@@ -58,20 +58,71 @@ impl Variant {
     }
 }
 
-/// 运行时图标的名字：`windinput-lbl-<状态>-<主字 UTF-8 的小写十六进制>`。
+/// 运行时图标的名字：`<前缀><状态>-<主字编码>`。
 ///
-/// **这是与 addon 的契约**（`HostUi.cpp` 的 `dynamicIconName`，`host_ui_test` 钉同一组样例）。
+/// - 前缀按变体分（[`icon_prefix`]）：正式版与 dev 版共用 `~/.local/share/icons/hicolor`，名字不分
+///   的话启动清理（[`TrayIcons::prune`]）会互删对方的图标。
+/// - 主字编码：UTF-8 的小写十六进制；超过 [`MAX_HEX_LABEL_BYTES`] 字节改成 `h` + FNV-1a 64 位散列的
+///   16 位十六进制（文件名上限 255 字节，`[ui.labels]` 可以配很长；十六进制恒为偶数位、只含 0-9a-f，
+///   `h` 开头不会与之混淆）。
+///
+/// **这是与 addon 的契约**（`HostUi.cpp` 的 `dynamicIconName`，`host_ui_test` 读本文件核对同一组样例）。
 /// 用十六进制而不是主字本身：图标名要进 kimpanel 以冒号分段的属性串、进文件名，只用 ASCII 最稳。
-pub fn icon_name(variant: Variant, label: &str) -> String {
-    let mut s = format!("windinput-lbl-{}-", variant.tag());
+pub fn icon_name(dev: bool, variant: Variant, label: &str) -> String {
+    let mut s = format!("{}{}-", icon_prefix(dev), variant.tag());
+    if label.len() > MAX_HEX_LABEL_BYTES {
+        s.push_str(&format!("h{:016x}", fnv1a64(label.as_bytes())));
+        return s;
+    }
     for b in label.as_bytes() {
         s.push_str(&format!("{b:02x}"));
     }
     s
 }
 
-/// 运行时图标的前缀，清理时据此认领自己的文件。
-pub const DYNAMIC_PREFIX: &str = "windinput-lbl-";
+/// 运行时图标的前缀：正式版 `windinput-lbl-`（保持原名，已装机用户磁盘上的运行时图标照认），
+/// dev 版 `windinput-lbl-dev-`。清理时据此认领自己的文件（见 [`TrayIcons::prune`]）。
+pub fn icon_prefix(dev: bool) -> &'static str {
+    if dev {
+        "windinput-lbl-dev-"
+    } else {
+        "windinput-lbl-"
+    }
+}
+
+/// 主字按十六进制编码的字节上限，超了改用散列（见 [`icon_name`]）。32 字节 = 10 个汉字，远超
+/// 标签宽度上限（2）——只有手配的超长 `[ui.labels]` 会走到散列。
+pub const MAX_HEX_LABEL_BYTES: usize = 32;
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// `stem` 是不是这个前缀名下、本模块产出的图标名（`<前缀><zh|en|caps>-<十六进制 | h散列>`）。
+/// 正式版前缀是 dev 前缀的前缀：dev 的名字在正式版看来状态段是 `dev`，不认——两个变体各删各的。
+fn owns(prefix: &str, stem: &str) -> bool {
+    let Some(rest) = stem.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((tag, enc)) = rest.split_once('-') else {
+        return false;
+    };
+    let hex = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    matches!(tag, "zh" | "en" | "caps")
+        && (hex(enc)
+            || enc
+                .strip_prefix('h')
+                .is_some_and(|h| h.len() == 16 && hex(h)))
+}
 
 /// 渲染的尺寸档（hicolor 的 `<N>x<N>`）。托盘常见 16/22/24，HiDPI 取 32/48，64 给面板大图标。
 ///
@@ -538,6 +589,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// 进程内记已确认存在的名字；首次遇到时看磁盘上那组是否齐全（上次运行写过就不重画）。
 pub struct TrayIcons {
     root: PathBuf,
+    /// dev 变体：图标名前缀不同（见 [`icon_prefix`]）。
+    dev: bool,
     /// 已确认齐全的图标名。
     ready: HashSet<String>,
     /// 字体按「覆盖这些字」查过的结果缓存：（覆盖的字符串, 字体数据, 集合序号）。
@@ -545,13 +598,19 @@ pub struct TrayIcons {
 }
 
 impl TrayIcons {
-    /// `root` 是 hicolor 根（通常 [`user_hicolor_dir`]）。
-    pub fn new(root: PathBuf) -> Self {
+    /// `root` 是 hicolor 根（通常 [`user_hicolor_dir`]）；`dev` 是本进程的变体（决定图标名前缀）。
+    pub fn new(root: PathBuf, dev: bool) -> Self {
         Self {
             root,
+            dev,
             ready: HashSet::new(),
             fonts: Vec::new(),
         }
+    }
+
+    /// 本进程（变体）的图标名，见 [`icon_name`]。
+    pub fn name(&self, variant: Variant, label: &str) -> String {
+        icon_name(self.dev, variant, label)
     }
 
     pub fn root(&self) -> &Path {
@@ -611,8 +670,10 @@ impl TrayIcons {
         if label.is_empty() {
             return Ok(None);
         }
-        let name = icon_name(variant, label);
-        if self.ready.contains(&name) {
+        let name = self.name(variant, label);
+        // 进程内缓存命中也补查一下最后那张还在不在（一次 stat）：别的进程（另一个变体的旧版本、
+        // 用户手动清理）可能删过它，缓存却以为还在，addon 就只能一直退回种子图标。
+        if self.ready.contains(&name) && self.png_path(&name, LAST_SIZE).is_file() {
             return Ok(Some(name));
         }
         if !SIZES.iter().all(|&n| self.png_path(&name, n).is_file()) {
@@ -628,9 +689,12 @@ impl TrayIcons {
         Ok(Some(name))
     }
 
-    /// 删掉不在 `keep` 里的运行时图标（只认 [`DYNAMIC_PREFIX`] 开头的文件，别的一概不碰）。
-    /// 返回删掉的文件数。
+    /// 删掉本变体名下、既不在 `keep` 里也不是本进程备好过的运行时图标（只认 [`owns`] 认领的文件：
+    /// 另一个变体的、种子、别的应用的一概不碰）。返回删掉的文件数。
+    ///
+    /// 本进程备好过的（`ready`）一并保留：启动清理在后台跑，期间前台可能刚为新标签写出图标。
     pub fn prune(&mut self, keep: &HashSet<String>) -> usize {
+        let prefix = icon_prefix(self.dev);
         let mut removed = 0;
         let Ok(dirs) = std::fs::read_dir(&self.root) else {
             return 0;
@@ -648,15 +712,15 @@ impl TrayIcons {
                 let Some(stem) = file.strip_suffix(".png") else {
                     continue;
                 };
-                if stem.starts_with(DYNAMIC_PREFIX)
+                if owns(prefix, stem)
                     && !keep.contains(stem)
+                    && !self.ready.contains(stem)
                     && std::fs::remove_file(f.path()).is_ok()
                 {
                     removed += 1;
                 }
             }
         }
-        self.ready.retain(|n| keep.contains(n));
         removed
     }
 }
@@ -667,11 +731,76 @@ mod tests {
 
     #[test]
     fn icon_name_is_ascii_and_matches_addon_samples() {
-        // 与 wind_linux/tests/host_ui_test.cpp 的「运行时图标名」用例同一组样例。
-        assert_eq!(icon_name(Variant::Chinese, "拼"), "windinput-lbl-zh-e68bbc");
-        assert_eq!(icon_name(Variant::English, "英"), "windinput-lbl-en-e88bb1");
-        assert_eq!(icon_name(Variant::Caps, "A"), "windinput-lbl-caps-41");
-        assert_eq!(icon_name(Variant::English, "En"), "windinput-lbl-en-456e");
+        // 与 wind_linux/tests/host_ui_test.cpp 的「运行时图标名」用例同一组样例（那边读本文件核对
+        // 下面这些字面量）。正式版名字与改版前逐字相同：已装机用户磁盘上的运行时图标照认。
+        assert_eq!(
+            icon_name(false, Variant::Chinese, "拼"),
+            "windinput-lbl-zh-e68bbc"
+        );
+        assert_eq!(
+            icon_name(false, Variant::English, "英"),
+            "windinput-lbl-en-e88bb1"
+        );
+        assert_eq!(
+            icon_name(false, Variant::Caps, "A"),
+            "windinput-lbl-caps-41"
+        );
+        assert_eq!(
+            icon_name(false, Variant::English, "En"),
+            "windinput-lbl-en-456e"
+        );
+        assert_eq!(
+            icon_name(true, Variant::Chinese, "拼"),
+            "windinput-lbl-dev-zh-e68bbc"
+        );
+        // 超长标签走散列：40 个「虎」（120 字节）。
+        let long = "虎".repeat(40);
+        assert_eq!(
+            icon_name(false, Variant::Chinese, &long),
+            "windinput-lbl-zh-h8b27ed0fc2ac336d"
+        );
+        // 32 字节恰好还是十六进制，33 字节起散列。
+        assert_eq!(
+            icon_name(false, Variant::Caps, &"a".repeat(32)),
+            format!("windinput-lbl-caps-{}", "61".repeat(32))
+        );
+        assert!(
+            icon_name(false, Variant::Caps, &"a".repeat(33)).starts_with("windinput-lbl-caps-h")
+        );
+    }
+
+    /// 文件名不超过 255 字节，不论标签多长。
+    #[test]
+    fn icon_file_name_fits_name_max() {
+        for n in [1, 10, 11, 32, 33, 100, 1000] {
+            let name = icon_name(true, Variant::Caps, &"虎".repeat(n));
+            assert!(name.len() + ".png".len() <= 255, "{n}: {}", name.len());
+            assert!(name.is_ascii());
+        }
+    }
+
+    /// 两个变体各认各的：正式版前缀是 dev 前缀的前缀，dev 的名字不能被正式版认领（反之亦然）；
+    /// 种子与别的应用的文件谁都不认。
+    #[test]
+    fn owns_distinguishes_variants() {
+        let rel = icon_prefix(false);
+        let dev = icon_prefix(true);
+        assert!(owns(rel, "windinput-lbl-zh-e68bbc"));
+        assert!(owns(rel, "windinput-lbl-caps-h8b27ed0fc2ac336d"));
+        assert!(!owns(rel, "windinput-lbl-dev-zh-e68bbc"));
+        assert!(owns(dev, "windinput-lbl-dev-zh-e68bbc"));
+        assert!(!owns(dev, "windinput-lbl-zh-e68bbc"));
+        for foreign in [
+            "windinput-zh",
+            "windinput",
+            "windinput-lbl-xx-41",
+            "windinput-lbl-zh-",
+            "windinput-lbl-zh-4G",
+            "windinput-lbl-zh-h123",
+        ] {
+            assert!(!owns(rel, foreign), "{foreign}");
+            assert!(!owns(dev, foreign), "{foreign}");
+        }
     }
 
     #[test]
@@ -707,7 +836,7 @@ mod tests {
     fn ensure_writes_every_size_once_and_prune_keeps_only_wanted() {
         let tmp = std::env::temp_dir().join(format!("wi-tray-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let mut t = TrayIcons::new(tmp.clone());
+        let mut t = TrayIcons::new(tmp.clone(), false);
         t.create_dirs().unwrap();
         assert!(tmp.join("48x48/apps").is_dir());
         let before = std::fs::metadata(&tmp).unwrap().modified().unwrap();
@@ -728,14 +857,29 @@ mod tests {
         assert!(img.pixels().any(|p| p[0] > 200 && p[1] > 200 && p[2] > 200));
         // 空标签不画。
         assert_eq!(t.ensure(Variant::English, "").unwrap(), None);
-        // 别人的文件不碰。
+        // 缓存命中但文件被别人删了：补查发现、重画（不会一直以为它在）。
+        std::fs::remove_file(tmp.join(format!("64x64/apps/{name}.png"))).unwrap();
+        assert_eq!(t.ensure(Variant::Chinese, "五").unwrap().unwrap(), name);
+        assert!(tmp.join(format!("64x64/apps/{name}.png")).is_file());
+        // 别人的文件不碰：种子、另一个变体（dev）的运行时图标。
         let foreign = tmp.join("16x16/apps/windinput-zh.png");
         std::fs::write(&foreign, b"x").unwrap();
+        let other_variant = tmp.join("16x16/apps/windinput-lbl-dev-zh-e4ba94.png");
+        std::fs::write(&other_variant, b"x").unwrap();
+        // 本进程备好过的（ready）不在 keep 里也留着：启动清理在后台跑，期间前台可能刚写出新标签。
         let keep: HashSet<String> = [name.clone()].into_iter().collect();
-        assert_eq!(t.prune(&keep), SIZES.len());
+        assert_eq!(t.prune(&keep), 0, "custom 是本进程备好的，不删");
+        let mut fresh = TrayIcons::new(tmp.clone(), false);
+        assert_eq!(fresh.prune(&keep), SIZES.len(), "新进程只保留 keep");
         assert!(tmp.join(format!("16x16/apps/{name}.png")).is_file());
         assert!(!tmp.join(format!("16x16/apps/{custom}.png")).exists());
         assert!(foreign.is_file());
+        assert!(other_variant.is_file(), "正式版不删 dev 的图标");
+        // dev 那边清理时同样不碰正式版的。
+        let mut dev = TrayIcons::new(tmp.clone(), true);
+        assert_eq!(dev.prune(&HashSet::new()), 1);
+        assert!(!other_variant.exists());
+        assert!(tmp.join(format!("16x16/apps/{name}.png")).is_file());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

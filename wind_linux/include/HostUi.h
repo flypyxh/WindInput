@@ -81,9 +81,13 @@ public:
     /// 状态档：图标名里的状态段，也决定底色。
     enum class Variant { Chinese, English, Caps };
     Variant variant() const;
-    /// 运行时图标名：`windinput-lbl-<zh|en|caps>-<主字 UTF-8 小写十六进制>`。
-    /// **与 `wind_ui::tray_icon::icon_name` 同一规则**（两侧单测钉同一组样例）。
+    /// 运行时图标名：`<前缀><zh|en|caps>-<主字编码>`。前缀正式版 `windinput-lbl-`、dev 版
+    /// `windinput-lbl-dev-`（两个变体共用用户图标目录，名字不分会在启动清理时互删）；主字编码是
+    /// UTF-8 小写十六进制，超过 32 字节改为 `h` + FNV-1a 64 位散列的 16 位十六进制（文件名上限
+    /// 255 字节）。**与 `wind_ui::tray_icon::icon_name` 同一规则**（host_ui_test 读那边源码核对样例）。
+    /// `dev` 缺省取本 addon 的变体（`variantSuffix()`）。
     static std::string dynamicIconName(Variant v, const std::string& label);
+    static std::string dynamicIconName(Variant v, const std::string& label, bool dev);
     /// 随包种子：`windinput-zh` / `windinput-en` / `windinput-caps`。
     static std::string seedIconName(Variant v);
 

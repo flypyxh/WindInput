@@ -23,7 +23,7 @@ Fcitx5 的 `InputContext`。引擎/词库/候选逻辑全在服务里，这里**
 | `include/ServiceLauncher.h` + `src/core/ServiceLauncher.cpp` | 连不上服务时拉起它（节流 20 秒）。`spawnDetached`（设置程序共用）：双 fork（fcitx5 不替我们回收子进程，实测 posix_spawn 出来的服务退出后留 defunct）、新会话、清信号掩码并复位处置、stdio 接 /dev/null、关掉 3 起的 fd |
 | `include/SettingsLauncher.h` + `src/core/SettingsLauncher.cpp` | 下行扩展信封 `settings.open` 的 body 解析（JSON argv）与设置程序路径（`WIND_INPUT_SETTING` / `/usr/lib/windinput/wind_setting`）。只启动自己的设置程序，信封内容只进参数位 |
 | `include/Menu.h` + `src/core/Menu.cpp` | 自绘菜单的纯逻辑：kind ↔ 级、候选窗右键的目标、空闲超时（`WIND_MENU_IDLE_TIMEOUT_MS`） |
-| `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：模式镜像（托盘图标：服务端按主字运行时渲染的 `windinput-lbl-<状态>-<主字十六进制>`，没写出时退回种子 `windinput-zh/en/caps`；中英、大写锁定位与标签从服务端四种状态帧学）、addon 加载时预建用户图标目录、大写锁定的本端判定（`CapsLockTracker`）、应用内预编辑过滤掉单空格占位组合 |
+| `include/HostUi.h` + `src/core/HostUi.cpp` | 交给 Fcitx5 呈现的部分：模式镜像（托盘图标：服务端按主字运行时渲染的 `windinput-lbl-[dev-]<状态>-<主字十六进制，超长为 h+散列>`，没写出时退回种子 `windinput-zh/en/caps`；中英、大写锁定位与标签从服务端四种状态帧学）、addon 加载时预建用户图标目录、大写锁定的本端判定（`CapsLockTracker`）、应用内预编辑过滤掉单空格占位组合 |
 | `include/OverlayInput.h` + `src/core/OverlayInput.cpp` | 光栅浮层与候选悬停的鼠标交互纯逻辑：按键 → 动作（拖动 / 菜单 / 关闭）、菜单 target、悬停门控、提示的悬停延后与离开重定、拖动落位 |
 | `include/ShmFrame.h` + `src/core/ShmFrame.cpp` | 候选帧 SHM 读端（对位 `SharedMemoryReader.swift`）、落位几何 `placePanel`（对位 `CandidatePanel.show` 的翻转/钳制）与浮层落位 `placeOverlay`、命中测试 |
 | `src/fcitx/WindEngine.{h,cpp}` | Fcitx5 引擎（`InputMethodEngineV2`）；与 `X11Panel` 是仅有的两个依赖 Fcitx5 头文件的地方 |

@@ -185,7 +185,10 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
   XDG 图标主题规范的用户基目录，用户目录下不必有 `index.theme`（Fcitx5 / GTK / Qt 都合并各基目录的
   hicolor，子目录表取系统那份）。名字用十六进制编码主字：图标名要进 kimpanel 以冒号分段的属性串、
   进文件名，只用 ASCII 最稳。编码规则两侧各一份（`wind_ui::tray_icon::icon_name` /
-  `ModeIndicator::dynamicIconName`），两边单测钉同一组样例。
+  `ModeIndicator::dynamicIconName`），两边单测钉同一组样例（addon 侧读 `tray_icon.rs` 源码核对）。
+  dev 版前缀 `windinput-lbl-dev-`（正式版保持 `windinput-lbl-`，已装机的文件照认）：两个变体共用这个
+  目录，名字不分时启动清理会互删对方的图标。主字超过 32 字节（只有手配的超长 `[ui.labels]`）改为
+  `h` + FNV-1a 64 位散列，文件名不超过 255 字节。
 - **时序由数据依赖保证**：`Coordinator::build_status` 返回之前确保本状态用得到的图标已在盘上
   （`coordinator/tray_icon.rs`，`not(test)`），任何带新标签的状态帧到 addon 时文件必然已写完。
   每次一并备好中文 / 英文 / 大写三组：addon 本端判定大写锁定翻转时不等服务端的帧。
@@ -197,10 +200,14 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 - **文字标签**：`subModeLabelImpl` 返回同一个主字。Fcitx5 的 classicui / notificationitem 有
   `PreferTextIcon`（用户在 Fcitx5 配置里开，我们控制不了），开了的用户看到的是 Fcitx5 按这个字画的
   文字图标，同样正确。
-- **缓存与清理**：同一（状态, 主字）只画一次（进程内集合 + 磁盘上已齐全就跳过）。服务启动时把全部
-  可用方案的标签 + 英文 / 大写标签画好，再删掉不在其中的 `windinput-lbl-*`（别的文件不碰）；运行中
-  新出现的标签只增不删、下次启动收。上限是「可用方案数 + 2」组，不会无限增长。首轮预渲染的耗时记在
-  服务日志「托盘图标已就绪」一行（`elapsed_ms`）。
+- **缓存与清理**：同一（状态, 主字）只画一次（进程内集合 + 磁盘上已齐全就跳过；进程内命中时仍补查
+  64 那张还在不在，被别人删了就重画）。服务第一次构建状态时同步备好本状态的三组，**其余方案在后台
+  线程画**（每组拿一次锁），画完删掉本变体名下不在其中、也不是本进程备好过的旧图标（别的文件、另一
+  个变体的一概不碰）；运行中新出现的标签只增不删、下次启动收。上限是「可用方案数 + 2」组，不会无限
+  增长。首轮预渲染的耗时记在服务日志「托盘图标已就绪」一行（`elapsed_ms`；e2e 两个方案 + 英文 / 大写
+  四组，debug 构建实测 204ms）。挪到后台的理由：方案多、字体缓存冷时整轮同步做可能逼近 addon 每个
+  响应 2 秒的超时（超时即熔断 3 秒）。`build_status` 在有效中文态下直接复用算好的主字，不再为托盘
+  图标多读一遍方案文件。
 - **字体**：fontconfig 按 `sans-serif` + Bold + 简中排序，取第一款覆盖主字全部字符的字体文件，直接读
   轮廓（`text::linux::font_file_covering`）。机器上没有 Bold 字面（本机只有 Noto Sans CJK Regular）时
   用 Regular，22px 起笔画偏细但清楚；Ubuntu / Deepin 的 `fonts-noto-cjk` 带 Bold。

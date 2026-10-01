@@ -1,5 +1,7 @@
 #include "HostUi.h"
 
+#include "Bridge.h"
+
 #include "KeyMap.h"
 #include "Protocol.h"
 
@@ -123,10 +125,27 @@ ModeIndicator::Variant ModeIndicator::variant() const
 
 std::string ModeIndicator::dynamicIconName(Variant v, const std::string& label)
 {
+    return dynamicIconName(v, label, variantSuffix() == "Dev");
+}
+
+std::string ModeIndicator::dynamicIconName(Variant v, const std::string& label, bool dev)
+{
     static const char* kHex = "0123456789abcdef";
-    std::string s = "windinput-lbl-";
+    std::string s = dev ? "windinput-lbl-dev-" : "windinput-lbl-";
     s += v == Variant::Chinese ? "zh" : v == Variant::English ? "en" : "caps";
     s += '-';
+    if (label.size() > 32) { // tray_icon::MAX_HEX_LABEL_BYTES
+        uint64_t h = 0xcbf29ce484222325ull; // FNV-1a 64
+        for (unsigned char c : label) {
+            h ^= c;
+            h *= 0x100000001b3ull;
+        }
+        s += 'h';
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            s += kHex[(h >> shift) & 0xF];
+        }
+        return s;
+    }
     for (unsigned char c : label) {
         s += kHex[c >> 4];
         s += kHex[c & 0xF];
