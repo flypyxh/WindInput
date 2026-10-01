@@ -400,3 +400,42 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
   `FCITX_CONFIG_HOME` 下用 SDK 的真 fcitx5 5.1.7 实测）。所以脚本检测到本用户的 fcitx5 在跑时先
   `fcitx5-remote -e` 让它退出（写回发生在改动之前），改完在有图形会话时 `fcitx5 -d` 拉起；全局
   `config`（AltTriggerKeys）退出时不写回，不受此影响。离线测试：`scripts/linux/test-setup.sh`。
+
+## 9. 发布流程接入（CI）
+
+**产物**：`WindInput-<版本>-linux-amd64.deb`、`WindInput-<版本>-linux-arm64.deb`，各带同名 `.sha256`（资产名与
+Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `~`（`0.123.0-dev.x` → `0.123.0~dev.x`），
+否则 dpkg 把它当「打包修订」而排在正式版之后。
+
+**工作流**（`.github/workflows/`）：
+
+| 文件 | 作用 |
+| --- | --- |
+| `linux-build.yml` | 可调用的构建流水线（仅 `workflow_call`）：门控 → 词库数据（一次）→ 两架构并行构建 → 核对 → 安装冒烟 → 上传 `dist-linux-<arch>` |
+| `release-linux.yml` | **独立入口**（手动触发）：不填 tag 只出 artifact；填 tag 则构建该 tag 并把 `.deb` 挂到该 tag 的 Release（不存在建草稿）。`setting_ref` 可指定 wind-setting 分支（合并前实测用 `feat/linux-port`） |
+| `release.yml` | tag 推送时并行调 `build-linux`，`publish` 汇总进同一个草稿 Release；Linux **不阻塞**（`publish` 不依赖它；单独的 `attach-linux` job 在两架构都成功后挂 .deb，失败不影响草稿、也不会因重跑拖着 publish 覆盖已签名的 exe） |
+| `release-published.yml` | Release 发布后把 `.deb` + `latest-linux.json`（`debs.<arch>.{url,sha256,size}`）同步到 R2，有则同步、两架构齐全才推 |
+
+**为什么拆成 `linux-build.yml` + `release-linux.yml`**：被调用的工作流不能申请比调用方更高的权限；「挂 Release」
+要 `contents: write`，和构建写在一个文件里，`release.yml` 一调用整个文件就因权限越界校验失败。
+
+**为什么原生 runner**：基线必须是最老的目标（`ubuntu-22.04`，glibc 2.35 / fcitx5 5.0.x），更新的构建机会引入
+`GLIBC_2.38+` 符号；arm64 用 `ubuntu-22.04-arm` 原生机而非 qemu（Rust LTO 在模拟器上要数小时）。镜像钉死 22.04，不用 `-latest`。
+
+**门禁**：`scripts/linux/verify-deb.sh` 查 control 架构、包内每个 ELF 的机器类型、`GLIBC` 符号上限 ≤ 2.35、关键文件与词库体积、
+`compat.toml` 零规则、无 group/other 可写、maintainer 脚本语法；随后在 runner 上真装一次（apt 解析 Depends、`ldd` 无缺失库、能卸载）。
+构建脚本 `scripts/linux/build-deb.sh`（本机 docker 的 `package-deb.sh` 与 CI 共用，路径经环境变量传入）。
+
+**设置程序是私有仓**：没配 `WIND_REPOS_TOKEN`（fork）时整个 Linux 构建跳过并告警，不出缺设置入口的残缺包。
+
+**未做**：rpm（Fedora/openSUSE）与 Arch（PKGBUILD）需各自发行版实测；apt 仓库（签名密钥与托管）；客户端在线升级对 Linux 的消费
+（`latest-linux.json` 已就位，设置程序侧尚无读取方，升级暂走 apt/手动下载）；Wayland。
+
+**已知风险（审查结论，未处理）**：
+- 给**已发布**的 Release 补挂 `.deb` 不会触发 `release: published`，R2 要靠手动 dispatch `release-published.yml`；
+  但它会按该 tag 把三个平台都重推一遍并清理「前一版本」——对老 tag 这么做会让 `latest*.json` 回退、删掉新版 exe。
+  只对**最新**版本补同步；要支持老版本需给它加 `platforms` 输入或版本单调性守卫。
+- 安装冒烟的 `ldd` 看不到运行时 `dlopen` 的库（Vulkan/EGL、xkbcommon），且 runner 镜像预装了它们，缺 Depends 测不出来；
+  真正的验证仍是干净 22.04 / Deepin 上装一次。
+- 补包用 `release-linux.yml` 只对包含本接入的 tag 有效（prep 会检查脚本是否存在）。
+
