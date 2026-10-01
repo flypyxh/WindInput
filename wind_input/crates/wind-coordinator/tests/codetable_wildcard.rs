@@ -1269,7 +1269,7 @@ fn mixed_single_only_keeps_pinyin_words() {
     );
 }
 
-// ─────────────── 未启用扩展词库只给反查模式（reverse-rework） ───────────────
+// ─────────────── 未启用扩展词库只给反查模式 ───────────────
 // 样本：「门头沟区 uuia」只在未启用的 wubi86_xzqy（default_enabled = false），主库 / extra 无 uuia 码。
 // 开关 `input.reverse.lookup_disabled_dicts` 开着时，行内通配与普通打字都必须与关时逐条相同；
 // 反查模式那一侧见 tests/codetable_reverse.rs。
@@ -1300,7 +1300,7 @@ fn tri_of(cfg: Config, keys: &str) -> Vec<(String, String, String)> {
     coord.debug_candidate_triples()
 }
 
-/// ★ Review Focus 2（真实数据）：开关开着，行内通配与关时逐条相同，不出未启用库的「门头沟区」。
+/// 真实数据：开关开着，行内通配与关时逐条相同，不出未启用库的「门头沟区」。
 #[test]
 fn lookup_disabled_dicts_inline_wildcard_excludes_xzqy() {
     if !dict_ready() {

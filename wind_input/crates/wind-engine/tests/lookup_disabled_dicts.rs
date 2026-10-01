@@ -1,4 +1,4 @@
-//! 未启用扩展词库只给反查模式（reverse-rework；开关 `input.reverse.lookup_disabled_dicts`）：
+//! 未启用扩展词库只给反查模式（开关 `input.reverse.lookup_disabled_dicts`）：
 //! 行内通配与普通打字不看它，注释反查只认已启用词库。自造夹具，不依赖 build_dev/data。
 
 use std::path::{Path, PathBuf};
@@ -119,14 +119,14 @@ fn reverse_sees_disabled_extra_only_when_switch_on() {
     assert_eq!(rev_texts(&off, "uuiz", "uui?"), ["立法"]);
 }
 
-/// ★ Review Focus 2（接线层）：开关开着，行内通配照旧看不到未启用库。
+/// 接线层：开关开着，行内通配照旧看不到未启用库。
 #[test]
 fn inline_wildcard_never_sees_disabled_extra() {
     let (m, _id, _g) = setup("inline", true, true, true);
     assert_eq!(wc_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
-/// ★ Review Focus 3：全局开关经 reload_from_config 切换后，影子层随引擎重建挂上 / 摘掉。
+/// 全局开关经 reload_from_config 切换后，影子层随引擎重建挂上 / 摘掉。
 #[test]
 fn global_switch_reload_attaches_and_detaches_layers() {
     let (m, id, g) = setup("reload", false, true, true);
@@ -150,7 +150,7 @@ fn global_switch_reload_attaches_and_detaches_layers() {
     drop(g);
 }
 
-/// ★ Review Focus 1：方案覆盖文件里残留旧的方案级键，不再挂影子层。
+/// 方案覆盖文件里残留旧的方案级键，不再挂影子层。
 #[test]
 fn stale_schema_level_override_does_not_attach_layers() {
     let (m, id, _g) = setup("stale_ov", false, true, true);
@@ -262,7 +262,7 @@ fn switch_off_never_warms_disabled_layers() {
     assert_eq!(rev_texts(&m, "uuiz", "uui?"), ["立法"]);
 }
 
-/// ★ Review Focus 4：开关开着，注释 / 悬停 / 查重一律只认已启用词库；不存在能带出未启用库编码的路径。
+/// 开关开着，注释 / 悬停 / 查重一律只认已启用词库；不存在能带出未启用库编码的路径。
 #[test]
 fn comment_reverse_ignores_disabled_extra_even_when_on() {
     let (m, id, _g) = setup("cmt", true, true, true);

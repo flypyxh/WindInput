@@ -11837,7 +11837,7 @@ active = "x"
         merged
     }
 
-    /// ★ Review Focus 1：未发布即退役的两个键残留在用户配置里——不报错、不触发段级降级，同段的活键逐个完好。
+    /// 未发布即退役的两个键残留在用户配置里——不报错、不触发段级降级，同段的活键逐个完好。
     #[test]
     fn stale_reverse_keys_load_without_section_fallback() {
         let merged = merged_user_value(
@@ -13515,7 +13515,7 @@ mod status_position_tests {
         );
     }
 
-    /// reverse-rework：含未启用扩展词库是反查模式专属的全局开关，出厂关。
+    /// 含未启用扩展词库是反查模式专属的全局开关，出厂关。
     #[test]
     fn reverse_lookup_disabled_dicts_defaults_off_and_parses() {
         assert!(

@@ -2825,7 +2825,7 @@ mod tests {
         );
     }
 
-    /// ★ Review Focus 2：行内通配不读影子层，连加载都不触发；反查才读。
+    /// 行内通配不读影子层，连加载都不触发；反查才读。
     #[test]
     fn convert_wildcard_never_reads_disabled_layers() {
         let e = with_xz(engine_opts(

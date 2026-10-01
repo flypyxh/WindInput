@@ -536,9 +536,9 @@ fn reverse_space_commits_highlight() {
     assert_eq!(c.debug_active_mode(), None);
 }
 
-// ─────────────── Task 7：真实数据验收（反查专属的「含扩展词库」） ───────────────
+// ─────────────── 真实数据验收（反查专属的「含扩展词库」） ───────────────
 
-/// ★ Review Focus 2 + 设计 §9：同一开关下，反查模式出门头沟区（排在已启用之后），行内通配不出。
+/// 同一开关下，反查模式出门头沟区（排在已启用之后），行内通配不出。
 #[test]
 fn reverse_only_lookup_zuia_vs_inline_uuiz() {
     if !dict_ready() {
@@ -604,7 +604,7 @@ fn mixed_reverse_sees_xzqy_inline_does_not() {
     );
 }
 
-/// ★ Review Focus 1（真实数据）：方案覆盖文件里残留旧的方案级键，反查与行内通配都不查未启用库。
+/// 真实数据：方案覆盖文件里残留旧的方案级键，反查与行内通配都不查未启用库。
 #[test]
 fn stale_schema_override_leaks_nowhere_real_data() {
     if !dict_ready() {
@@ -641,7 +641,7 @@ fn stale_schema_override_leaks_nowhere_real_data() {
     let _ = std::fs::remove_dir_all(&ov);
 }
 
-/// ★ Review Focus 5：没有任何开关——`z_key_action = "reverse"` 经 z 夺取进入（z 是引导键，`zuia` 实际查 `uia`），照常出结果。
+/// 没有任何开关——`z_key_action = "reverse"` 经 z 夺取进入（z 是引导键，`zuia` 实际查 `uia`），照常出结果。
 #[test]
 fn z_key_action_reverse_lists_zuia_without_any_switch() {
     if !dict_ready() {
@@ -655,7 +655,7 @@ fn z_key_action_reverse_lists_zuia_without_any_switch() {
     c.debug_install_phrases(zz_phrases());
     letters(&c, "zuia");
     assert_eq!(c.debug_active_mode(), Some("reverse"));
-    // 实测（与 brief 样本不符）：z 夺取进入反查后，z 是「引导键」而非首位通配符——
+    // 实测：z 夺取进入反查后，z 是「引导键」而非首位通配符——
     // 预编辑是 zuia，查询的是 `uia`（等长 + 前缀补全），不是 `?uia`。
     assert_eq!(c.debug_preedit(), "zuia");
     let tri = c.debug_candidate_triples();

@@ -3211,7 +3211,7 @@ mod role_contract_tests {
 
 #[cfg(test)]
 mod comment_reverse_regular_tests {
-    //! 候选注释的编码反查只用常规索引（已启用词库）；「含未启用扩展词库」只给反查模式（reverse-rework）。
+    //! 候选注释的编码反查只用常规索引（已启用词库）；「含未启用扩展词库」只给反查模式。
     //! 自造夹具，不依赖 build_dev/data：主库 `a 工`、未启用扩展 `_xz` 里 `uuia 门头沟区`。
     use crate::coordinator::Coordinator;
     use std::path::PathBuf;
@@ -3230,8 +3230,8 @@ mod comment_reverse_regular_tests {
         }
     }
 
-    fn coord(tag: &str, on: bool) -> (std::sync::Arc<Coordinator>, Cleanup) {
-        let id = format!("zz_crs_{tag}_{}", std::process::id());
+    fn coord() -> (std::sync::Arc<Coordinator>, Cleanup) {
+        let id = format!("zz_crs_on_{}", std::process::id());
         let dir = std::env::temp_dir().join(format!("wind_crs_{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         let s = dir.join("schemas");
@@ -3260,17 +3260,17 @@ mod comment_reverse_regular_tests {
         let mut cfg = Config::default();
         cfg.schema.available = vec![id.clone()];
         cfg.schema.active = id.clone();
-        cfg.input.reverse.lookup_disabled_dicts = on;
+        cfg.input.reverse.lookup_disabled_dicts = true;
         (
             Coordinator::new_headless(cfg, Some(&dir)),
             Cleanup { id, dir },
         )
     }
 
-    /// ★ Review Focus 4：开关开着，预热后注释仍查不到未启用库的码；启用库照常。
+    /// 开关开着，预热后注释仍查不到未启用库的码；启用库照常。
     #[test]
     fn prewarm_indexes_never_builds_comment_variant() {
-        let (c, _g) = coord("on", true);
+        let (c, _g) = coord();
         c.prewarm_indexes();
         assert_eq!(
             c.engine_mgr.codetable_reverse_hint("工").as_deref(),

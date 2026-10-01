@@ -9910,7 +9910,7 @@ mod engine_reload_needed_tests {
         );
     }
 
-    /// ★ Review Focus 3：反查专属的「含扩展词库」开关决定引擎挂不挂影子层，必须触发重建。
+    /// 反查专属的「含扩展词库」开关决定引擎挂不挂影子层，必须触发重建。
     #[test]
     fn reverse_lookup_switch_requires_engine_reload() {
         let old = Config::default();

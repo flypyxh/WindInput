@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(c.debug_active_mode(), None);
     }
 
-    /// ★ Review Focus 5：没有总开关——绑了键就能进。
+    /// 没有总开关——绑了键就能进。
     #[test]
     fn reverse_enters_with_binding_alone() {
         let (c, _g) = coord("bound", |_| {});
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(c.debug_active_mode(), Some("reverse"));
     }
 
-    /// ★ Review Focus 5：没绑键时反查动词不存在——`\` 照常走中文标点，体检也不报。
+    /// 没绑键时反查动词不存在——`\` 照常走中文标点，体检也不报。
     #[test]
     fn unbound_trigger_falls_through_as_punct() {
         let (c, _g) = coord("unbound", |cfg| {
