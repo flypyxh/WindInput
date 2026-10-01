@@ -355,3 +355,21 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    （`text/linux/store.rs` 的 `map_file`），文件若在服务运行中被**原地截断改写**（而不是包管理器那样
    写新文件再 rename），访问越过新文件尾的页触发 SIGBUS、服务崩溃。包管理器升级字体走 rename，旧映射
    仍指向旧 inode，不受影响。读进内存可免，代价是 CJK 字体常驻数十 MB 私有内存，不做。
+
+## 8. 安装包与 `windinput-setup` 的取舍
+
+- **升级 / 卸载结束服务**：postinst（仅 `configure`）与 postrm（仅 `remove`）用
+  `pkill -x -f '/usr/lib/windinput/wind_input( --restarted)?'`，按整条命令行精确匹配包里那个路径
+  （addon 以 posix_spawn 拉起时 argv 只有这个全路径；菜单「重启服务」自拉起的多一个 `--restarted`），
+  同名开发构建与 `wind_input restart` 这类 CLI 调用不受影响。卸载放 postrm：文件删掉后再结束，
+  已加载的 addon 想重新拉起时程序已不在。
+- **已知限制：被结束时丢最后 1 秒的运行时状态**。服务不处理 SIGTERM（默认动作即刻终止），
+  `state.toml` 的单点写入器（`state_writer`，1s 防抖）只在 `Drop` 里 flush——被信号结束时不跑；
+  菜单「重启服务」走的 `process::exit` 同样不跑。丢的只是防抖窗口内的界面位置类状态（工具栏位置、
+  软键盘页等），`config.toml` 的写入不经防抖、不受影响。补优雅退出要在 wind-coordinator 暴露 flush
+  接口并在服务里装信号处理线程，收益只是「升级那一刻前 1 秒内拖过的位置」，暂不做。
+- **`windinput-setup` 与正在运行的 fcitx5**：fcitx5 退出时（注销即是）会把内存里的输入法组整份写回
+  `profile`，运行中改盘会被冲掉；`fcitx5-remote -r` 只重读全局配置、不重读 profile（隔离的
+  `FCITX_CONFIG_HOME` 下用 SDK 的真 fcitx5 5.1.7 实测）。所以脚本检测到本用户的 fcitx5 在跑时先
+  `fcitx5-remote -e` 让它退出（写回发生在改动之前），改完在有图形会话时 `fcitx5 -d` 拉起；全局
+  `config`（AltTriggerKeys）退出时不写回，不受此影响。离线测试：`scripts/linux/test-setup.sh`。

@@ -67,15 +67,33 @@ Description: 清风输入法 (WindInput) —— Fcitx5 输入法引擎
  Fcitx5 addon 负责与应用对接，另带图形设置程序（应用菜单「清风输入法设置」，
  或在输入时按 Ctrl+Shift+]）。安装后运行 windinput-setup 配置当前用户。
 CONTROL
+# 结束服务只认包里那个路径：addon 用 posix_spawn 拉起时 argv 恰为这一个全路径、不带参数，
+# 菜单「重启服务」自拉起的再多一个 `--restarted`；`pkill -x -f` 要求整条命令行与模式完全
+# 匹配——同名的开发构建、`wind_input restart` 这类 CLI 调用都不会被误杀。
+# 装的是所有用户共用的二进制，升级 / 卸载时每个用户的旧实例都该结束，故不限 -u。
+# 服务没有 SIGTERM 处理，被结束时防抖窗口（1s）内未落盘的运行时状态会丢（docs/design/linux-port.md §7）。
 cat >"$S/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
-# 升级时旧服务还在跑旧二进制：结束它，addon 在下次连不上时会自动拉起新版。
-# （已加载进 fcitx5 的旧 addon 需重启 fcitx5 或重新登录才换新。）
-pkill -x wind_input 2>/dev/null || true
-echo "清风输入法已安装。请对每个使用者运行一次： windinput-setup   然后注销并重新登录（升级则重启 fcitx5：fcitx5 -rd）。"
+if [ "$1" = configure ]; then
+    # 升级时旧服务还在跑旧二进制：结束它，addon 在下次连不上时会自动拉起新版。
+    # （已加载进 fcitx5 的旧 addon 需重启 fcitx5 或重新登录才换新。）
+    pkill -x -f '/usr/lib/windinput/wind_input( --restarted)?' 2>/dev/null || true
+    echo "清风输入法已安装。请对每个使用者运行一次： windinput-setup   然后注销并重新登录（升级则重启 fcitx5：fcitx5 -rd）。"
+fi
 exit 0
 POSTINST
 chmod 755 "$S/DEBIAN/postinst"
+# 卸载放在 postrm 而不是 prerm：文件删掉之后再结束，addon（仍在已运行的 fcitx5 里）想重新
+# 拉起时程序已不在（它先 access(X_OK)），不会在 prerm 与删文件之间又起一个孤儿。
+cat >"$S/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+if [ "$1" = remove ]; then
+    pkill -x -f '/usr/lib/windinput/wind_input( --restarted)?' 2>/dev/null || true
+fi
+exit 0
+POSTRM
+chmod 755 "$S/DEBIAN/postrm"
 
 dpkg-deb --root-owner-group --build "$S" "/out/windinput_${DEB_VERSION}_amd64.deb"
