@@ -2256,8 +2256,8 @@ pub trait WebDataRpc: WebDataHost {
             b = store
                 .get_user_words(schema, code)
                 .ok()
-                .and_then(&from)
-                .or_else(|| store.get_temp_words(schema, code).ok().and_then(&from))
+                .and_then(from)
+                .or_else(|| store.get_temp_words(schema, code).ok().and_then(from))
                 .unwrap_or(0);
         }
         wind_store::wdict::join_code_by_boundary(code, b)

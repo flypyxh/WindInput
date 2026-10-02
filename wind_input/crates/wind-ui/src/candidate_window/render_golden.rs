@@ -232,7 +232,7 @@ fn factory_render_matches_golden() {
                     .lines()
                     .zip(want.lines())
                     .position(|(a, b)| a != b)
-                    .map_or(got.lines().count().min(want.lines().count()), |i| i);
+                    .unwrap_or(got.lines().count().min(want.lines().count()));
                 failed.push(format!(
                     "{}：第 {} 行起不同\n  实得 {:?}\n  参照 {:?}",
                     file.display(),
@@ -342,7 +342,7 @@ fn comment_above_render_matches_golden() {
             .lines()
             .zip(want.lines())
             .position(|(a, b)| a != b)
-            .map_or(got.lines().count().min(want.lines().count()), |i| i);
+            .unwrap_or(got.lines().count().min(want.lines().count()));
         panic!(
             "上方注释条渲染与 golden 不一致（第 {} 行起）\n  实得 {:?}\n  参照 {:?}",
             line + 1,
