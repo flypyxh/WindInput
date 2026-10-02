@@ -89,8 +89,8 @@ impl Store {
         let b = self
             .get_user_words(schema, code)
             .ok()
-            .and_then(&pick)
-            .or_else(|| self.get_temp_words(schema, code).ok().and_then(&pick))
+            .and_then(pick)
+            .or_else(|| self.get_temp_words(schema, code).ok().and_then(pick))
             .unwrap_or(0);
         crate::wdict::join_code_by_boundary(code, b)
     }
