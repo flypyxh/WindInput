@@ -310,6 +310,8 @@ fn to_store(v: &[wind_phrase::SystemPhraseEntry]) -> Vec<wind_store::phrases::Sy
         .collect()
 }
 
+// 只被 cfg(not(windows)) 的升级重同步用例使用；Windows 目标上不加门会 dead_code（clippy -D warnings）
+#[cfg(not(windows))]
 fn sys_rows(store: &wind_store::Store) -> Vec<(String, String)> {
     let mut v: Vec<_> = store
         .list_system_phrases()
@@ -321,6 +323,7 @@ fn sys_rows(store: &wind_store::Store) -> Vec<(String, String)> {
     v
 }
 
+#[cfg(not(windows))]
 fn keys_of(v: &[wind_phrase::SystemPhraseEntry]) -> Vec<(String, String)> {
     let mut k: Vec<_> = v.iter().map(|e| (e.code.clone(), e.text.clone())).collect();
     k.sort();

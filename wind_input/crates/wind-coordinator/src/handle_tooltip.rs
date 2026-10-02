@@ -528,6 +528,8 @@ mod tests {
         r.per_char.insert(0, false);
     }
 
+    // 只被 changed_candidate_still_copies_but_refuses_commit 用，门与它一致（macOS 目标上会 dead_code）
+    #[cfg(any(not(ext_presenter), target_os = "linux"))]
     fn copied(rx: &Receiver<UiCommand>) -> Vec<String> {
         drain(rx)
             .into_iter()
