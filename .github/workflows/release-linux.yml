@@ -17,7 +17,7 @@ on:
         type: string
         default: ""
       setting_ref:
-        description: "wind-setting 检出的分支/标签(留空 = 默认分支;合并前实测 Linux 适配用 feat/linux-port)"
+        description: "wind-setting 检出的分支/标签(留空 = 默认分支,Linux 适配已在其 main;验证 wind-setting 上尚未合入的改动时填分支名)"
         required: false
         type: string
         default: ""

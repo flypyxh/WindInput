@@ -1,6 +1,6 @@
 # Linux 移植设计
 
-> 状态：进行中（分支 `feat/linux-port`）。目标：在主流 Linux 桌面上「能正常输入」，再逐步补齐体验。
+> 状态：已合入 main（2026-10-02，WindInput 与 wind-setting 均已合入），后续在 main 上迭代。目标：在主流 Linux 桌面上「能正常输入」，再逐步补齐体验。
 
 ## 1. 架构：复用 macOS 的「薄壳 + 服务进程」
 
@@ -412,7 +412,7 @@ Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `
 | 文件 | 作用 |
 | --- | --- |
 | `linux-build.yml` | 可调用的构建流水线（仅 `workflow_call`）：门控 → 词库数据（一次）→ 两架构并行构建 → 核对 → 安装冒烟 → 上传 `dist-linux-<arch>` |
-| `release-linux.yml` | **独立入口**（手动触发）：不填 tag 只出 artifact；填 tag 则构建该 tag 并把 `.deb` 挂到该 tag 的 Release（不存在建草稿）。`setting_ref` 可指定 wind-setting 分支（合并前实测用 `feat/linux-port`） |
+| `release-linux.yml` | **独立入口**（手动触发）：不填 tag 只出 artifact；填 tag 则构建该 tag 并把 `.deb` 挂到该 tag 的 Release（不存在建草稿）。`setting_ref` 可指定 wind-setting 分支（默认 main，已含 Linux 适配） |
 | `release.yml` | tag 推送时并行调 `build-linux`，`publish` 汇总进同一个草稿 Release；Linux **不阻塞**（`publish` 不依赖它；单独的 `attach-linux` job 在两架构都成功后挂 .deb，失败不影响草稿、也不会因重跑拖着 publish 覆盖已签名的 exe） |
 | `release-published.yml` | Release 发布后把 `.deb` + `latest-linux.json`（`debs.<arch>.{url,sha256,size}`）同步到 R2，有则同步、两架构齐全才推 |
 
