@@ -21,9 +21,13 @@
 use wind_store::{Store, wdict::WordIo};
 
 fn store() -> (Store, std::path::PathBuf) {
+    // 同进程内并行的用例各要一个库：只靠时间戳区分不可靠——macOS 的 SystemTime 只有微秒精度，
+    // 两个用例落在同一微秒就拿到同一路径，后开的那个报 "Database already open"。加递增序号。
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let p = std::env::temp_dir().join(format!(
-        "wind_counts_{}_{}.redb",
+        "wind_counts_{}_{}_{}.redb",
         std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
