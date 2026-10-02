@@ -1070,32 +1070,6 @@ impl crate::coordinator::Coordinator {
         if found.get() { out } else { String::new() }
     }
 
-    /// 注释 / 反查候选的 `code` / `code_rev` 取值（注释反查范围）。系统层没就绪给空串。
-    ///
-    /// ★ 补建信号是「取到 `None`」**或**「变体还欠着」：变体（含未启用扩展库）没就绪时引擎会
-    /// 回退常规索引、照常给出启用集里的码，单看 `None` 会让变体永远不被补建。
-    ///
-    /// ⚠️ 别改成每次都调 [`Self::warm_comment_reverse_index`]：它要先取 `code_source_schema`，
-    /// 混输方案下那是一次读方案文件，而这里在按键线程上逐候选调用。`*_variant_pending` 只查内存。
-    fn comment_reverse_hint(&self, text: &str) -> String {
-        let v = self.engine_mgr.codetable_reverse_hint(text);
-        if v.is_none() || self.engine_mgr.codetable_reverse_hint_variant_pending() {
-            self.warm_comment_reverse_index();
-        }
-        v.unwrap_or_default()
-    }
-
-    /// `code_all` / `code_rev_all` 取值，范围与补建同 [`Self::comment_reverse_hint`]。
-    fn comment_reverse_codes_all(&self, schema_id: &str, text: &str) -> String {
-        let v = self
-            .engine_mgr
-            .word_codes_display_for_comment(schema_id, text);
-        if v.is_none() || self.engine_mgr.comment_variant_pending(schema_id) {
-            self.warm_comment_reverse_index();
-        }
-        v.unwrap_or_default()
-    }
-
     /// 纯文本（无候选身份）的模板变量求值。`None` = 未知变量名。
     ///
     /// 变量语义与 [`Self::eval_var`] 逐项对齐，仅两点差异：
@@ -1118,10 +1092,10 @@ impl crate::coordinator::Coordinator {
             // `reverse_render` 的 found 判据，整条反查候选这一次照旧不出现 —— 想要的
             // 效果不变，但不会在「模板里还有别的非空变量」时把字面 `${code_rev}`
             // 混进上屏文本。索引建好后下一次按键即恢复。
-            //
-            // 注释范围那份索引（开关开且方案有未启用扩展库时是变体）由 `comment_reverse_hint`
-            // 顺手在后台补建，见该函数。
-            "code_rev" | "code" => self.comment_reverse_hint(text),
+            "code_rev" | "code" => self
+                .engine_mgr
+                .codetable_reverse_hint(text)
+                .unwrap_or_default(),
             // `code_all` —— 该字在码表里的**全部**码位，默认 `/` 连接（`我` → `q/trn/trnt`）。
             //
             // 与 `code` 的分工照搬同文件 `chaizi` / `chaizi_all` 的既有惯例：不带后缀取单个，
@@ -1133,8 +1107,11 @@ impl crate::coordinator::Coordinator {
             // 恰恰是最没用的答案 —— 简码才是用户要的。
             "code_rev_all" | "code_all" => {
                 let sid = self.engine_mgr.code_source_schema();
-                // 空串的理由同上面的 `code_rev`；范围与预热也同它（含未启用扩展库的变体索引）。
-                let codes = self.comment_reverse_codes_all(&sid, text);
+                // 空串的理由同上面的 `code_rev`。
+                let codes = self
+                    .engine_mgr
+                    .word_codes_display(&sid, text)
+                    .unwrap_or_default();
                 match arg {
                     // `word_codes_display` 固定用 `/` 连接，换分隔符只能在这里替。
                     Some(sep) if !codes.is_empty() => codes.replace('/', sep),
@@ -1266,8 +1243,9 @@ impl crate::coordinator::Coordinator {
             // `${code_rev}` 四个字符。
             "code_rev" | "code" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
-                    // 常规索引也没就绪时本次空着；变体没就绪时回退常规索引。后台补建见 `comment_reverse_hint`。
-                    self.comment_reverse_hint(&c.text)
+                    self.engine_mgr
+                        .codetable_reverse_hint(&c.text)
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 }
@@ -1285,8 +1263,10 @@ impl crate::coordinator::Coordinator {
             "code_rev_all" | "code_all" => {
                 if hint_source.allows_reverse() && c.source == CandidateSource::Pinyin {
                     let sid = self.engine_mgr.code_source_schema();
-                    // 含未启用扩展库与否看注释范围（变体索引只供注释反查）；悬停 `[编码]` 段仍用启用集。
-                    let codes = self.comment_reverse_codes_all(&sid, &c.text);
+                    let codes = self
+                        .engine_mgr
+                        .word_codes_display(&sid, &c.text)
+                        .unwrap_or_default();
                     match arg {
                         Some(sep) if !codes.is_empty() => codes.replace('/', sep),
                         _ => codes,
@@ -3230,8 +3210,9 @@ mod role_contract_tests {
 }
 
 #[cfg(test)]
-mod comment_reverse_scope_tests {
-    //! 候选注释反查走「含未启用库」变体（reverse-mode spec §4.2）。自造夹具，不依赖 build_dev/data。
+mod comment_reverse_regular_tests {
+    //! 候选注释的编码反查只用常规索引（已启用词库）；「含未启用扩展词库」只给反查模式。
+    //! 自造夹具，不依赖 build_dev/data：主库 `a 工`、未启用扩展 `_xz` 里 `uuia 门头沟区`。
     use crate::coordinator::Coordinator;
     use std::path::PathBuf;
     use wind_config::Config;
@@ -3249,8 +3230,8 @@ mod comment_reverse_scope_tests {
         }
     }
 
-    fn coord(tag: &str, on: bool) -> (std::sync::Arc<Coordinator>, Cleanup) {
-        let id = format!("zz_crs_{tag}_{}", std::process::id());
+    fn coord() -> (std::sync::Arc<Coordinator>, Cleanup) {
+        let id = format!("zz_crs_on_{}", std::process::id());
         let dir = std::env::temp_dir().join(format!("wind_crs_{id}"));
         let _ = std::fs::remove_dir_all(&dir);
         let s = dir.join("schemas");
@@ -3279,127 +3260,26 @@ mod comment_reverse_scope_tests {
         let mut cfg = Config::default();
         cfg.schema.available = vec![id.clone()];
         cfg.schema.active = id.clone();
-        cfg.schema.codetable.lookup_disabled_dicts = on;
+        cfg.input.reverse.lookup_disabled_dicts = true;
         (
             Coordinator::new_headless(cfg, Some(&dir)),
             Cleanup { id, dir },
         )
     }
 
+    /// 开关开着，预热后注释仍查不到未启用库的码；启用库照常。
     #[test]
-    fn prewarm_indexes_builds_comment_variant_when_switch_on() {
-        let (c, _g) = coord("on", true);
+    fn prewarm_indexes_never_builds_comment_variant() {
+        let (c, _g) = coord();
         c.prewarm_indexes();
         assert_eq!(
-            c.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
-            Some("uuia")
-        );
-        let (off, _g2) = coord("off", false);
-        off.prewarm_indexes();
-        assert_eq!(
-            off.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
-            Some("")
-        );
-    }
-
-    /// 打字线路取不到就后台建：变体建好之前，常规那份先建好（两份串行，避免首次开开关时两份同时建、内存峰值翻倍）。
-    #[test]
-    fn warm_comment_reverse_index_builds_regular_then_variant_in_background() {
-        use wind_engine::ReverseScope;
-        let (c, g) = coord("lazy", true);
-        assert_eq!(c.engine_mgr.codetable_reverse_hint("门头沟区"), None);
-        c.warm_comment_reverse_index();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while c
-            .engine_mgr
-            .reverse_index_if_ready_in(&g.id, ReverseScope::WithDisabled)
-            .is_none()
-        {
-            assert!(std::time::Instant::now() < deadline, "变体没被后台建出来");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            c.engine_mgr.reverse_index_if_ready(&g.id).is_some(),
-            "变体之前常规那份已建好"
+            c.engine_mgr.codetable_reverse_hint("工").as_deref(),
+            Some("a")
         );
         assert_eq!(
             c.engine_mgr.codetable_reverse_hint("门头沟区").as_deref(),
-            Some("uuia")
-        );
-    }
-
-    /// 变体没就绪时注释先回退常规索引（结果非空），仍须在后台补建变体——补建的信号不能只靠「取到 None」。
-    #[test]
-    fn comment_fallback_to_regular_still_warms_variant() {
-        use wind_engine::ReverseScope;
-        let (c, g) = coord("fallback", true);
-        assert!(c.engine_mgr.prewarm_reverse_index(&g.id));
-        let rev = wind_reverse::ReverseLookup::default();
-        assert_eq!(
-            c.eval_text_var("code_rev", None, "工", &rev).as_deref(),
-            Some("a"),
-            "变体未就绪时回退常规索引"
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while c
-            .engine_mgr
-            .reverse_index_if_ready_in(&g.id, ReverseScope::WithDisabled)
-            .is_none()
-        {
-            assert!(std::time::Instant::now() < deadline, "变体没被后台建出来");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert_eq!(
-            c.eval_text_var("code_rev", None, "门头沟区", &rev)
-                .as_deref(),
-            Some("uuia")
-        );
-    }
-
-    /// 开关关（出厂）且常规索引已就绪：注释取值不再派补建。补建要先取 `code_source_schema`，
-    /// 混输方案下那是一次读方案文件——在按键线程上逐候选、逐键调用就是逐候选读盘。
-    #[test]
-    fn comment_reverse_does_not_warm_when_switch_off_and_ready() {
-        use crate::coordinator::WARM_COMMENT_CALLS;
-        let (c, g) = coord("off_ready", false);
-        assert!(c.engine_mgr.prewarm_reverse_index(&g.id));
-        let rev = wind_reverse::ReverseLookup::default();
-        let before = WARM_COMMENT_CALLS.with(|n| n.get());
-        for _ in 0..3 {
-            assert_eq!(
-                c.eval_text_var("code_rev", None, "工", &rev).as_deref(),
-                Some("a")
-            );
-            assert_eq!(
-                c.eval_text_var("code_rev_all", None, "工", &rev).as_deref(),
-                Some("a")
-            );
-        }
-        assert_eq!(
-            WARM_COMMENT_CALLS.with(|n| n.get()),
-            before,
-            "全关且索引就绪时不该调补建"
-        );
-    }
-
-    /// 常规索引已被连续崩溃保护跳过 ⇒ 变体不再构建（不起线程、不建）。
-    #[test]
-    fn variant_index_not_built_when_regular_index_skipped() {
-        use wind_engine::ReverseScope;
-        let (c, g) = coord("skip", true);
-        c.engine_mgr
-            .mark_reverse_index_skipped_for_test(&g.id, ReverseScope::Enabled);
-        c.warm_comment_reverse_index();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            c.engine_mgr
-                .reverse_index_if_ready_in(&g.id, ReverseScope::WithDisabled)
-                .is_none(),
-            "常规被跳过时变体不该被建出来"
-        );
-        assert!(
-            !c.engine_mgr
-                .is_building_reverse_index_in(&g.id, ReverseScope::WithDisabled)
+            Some(""),
+            "未启用库不进注释反查"
         );
     }
 }

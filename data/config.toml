@@ -90,9 +90,6 @@ wildcard = false
 wildcard_key = "z"
 # 通配仅单字：通配结果只留单字（行内通配与反查模式都生效），词组不出。方案级，这里是全局基线。
 wildcard_single_only = false
-# 通配与反查含扩展词库：通配、反查模式、候选注释里的编码反查也查「未启用」的扩展词库（如行政区域），
-# 已启用的排前。普通打字候选不受影响。方案级，这里是全局基线。
-lookup_disabled_dicts = false
 
 # 码元字符集：哪些字符可以进输入缓冲（决定一次按键是打码还是作标点/选词/透传）。
 # 格式为「范围 + 字面」，如 a-x（五笔标准）、a-x/（词库含 /test 这类词条）、a-z0-9（要打 Win10）。
@@ -997,13 +994,17 @@ trigger_keys = []
 include_blocks = []
 
 # 反查模式：按绑定的键进入，用本方案编码查字（通配键在任何位置都代替一个码元，首位也行），
-# 候选显示完整编码，选中上屏该字；不查拼音。出厂关，且不绑任何键——在 [keys.key_actions] 里绑，
+# 候选显示完整编码，选中上屏该字；不查拼音。只在码表与五笔拼音混输方案里可用。
+# 本段刻意没有 enabled —— 不绑任何键就等于关闭，绑了就是开。进入键在 [keys.key_actions] 里绑，
 # 如 backslash = "reverse"（符号键：编码为空时直接进入；正在打字时先上屏高亮候选再进入）
-# 或 "ctrl+shift+f" = "reverse"（组合键：随时进入，同样先上屏正在打的高亮候选）。
+# 或 "ctrl+shift+f" = "reverse"（组合键：随时进入，同样先上屏正在打的高亮候选）；
+# 字母 z 可在方案的 z_key_action 里选 "reverse"。
 [input.reverse]
-enabled = false
 # 反查模式期间的候选窗布局（follow / vertical / horizontal，见「模式级候选布局」）。
 candidate_layout = "follow"
+# 反查含扩展词库：反查模式里也查「未启用」的扩展词库（如五笔的行政区域），排在已启用词库之后。
+# 只管反查模式：行内通配、普通打字候选、候选注释里的编码反查都不受影响。
+lookup_disabled_dicts = false
 
 # Emoji 候选：打出词语后，把对应的 emoji 追加到候选列表（如「开心」→ 😄）。
 # 按候选文字查表，与编码无关，所有方案通用。词表见 data/emoji/（来自 rime-emoji，

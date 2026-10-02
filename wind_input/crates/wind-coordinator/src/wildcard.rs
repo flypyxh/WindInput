@@ -276,7 +276,7 @@ impl Coordinator {
         owners
     }
 
-    /// 反查模式内的通配键冲突（只告警）。空 = 无冲突或反查模式不可用。
+    /// 反查模式内的通配键冲突（只告警）。空 = 无冲突、反查模式不可用或没绑键。
     ///
     /// 模式内的按键处理（`handle_special_key`）里导航 `handle_candidate_nav` 排在符号通配键
     /// 进缓冲之前：通配键若同时是翻页 / 高亮 / 取消等会被导航消费的会话键，按下去先被吃掉，
@@ -285,7 +285,7 @@ impl Coordinator {
     /// 与 [`Self::wildcard_conflicts`] 分开：那边只在通配主开关开时有意义，本模式不看主开关；
     /// 且组码中的冲突会让位（通配不可用），这边是导航先吃（同样不可用，但成因不同）。
     pub fn reverse_wildcard_conflicts(&self) -> Vec<&'static str> {
-        if !self.reverse_mode_available() {
+        if !(self.reverse_mode_available() && self.reverse_bound_anywhere()) {
             return Vec::new();
         }
         let Some((vk, shift)) = self

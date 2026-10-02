@@ -47,13 +47,12 @@ fn letters(c: &Coordinator, s: &str) {
     }
 }
 
-/// 五笔 86 + `\` 绑反查 + 模式开。通配主开关默认关（反查不看它）。
+/// 五笔 86 + `\` 绑反查（绑键即可用，没有总开关）。通配主开关默认关（反查不看它）。
 fn wubi_rev() -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into()];
     cfg.schema.active = "wubi86".into();
     cfg.input.default.chinese_mode = true;
-    cfg.input.reverse.enabled = true;
     cfg.keys
         .key_actions
         .insert("backslash".into(), "reverse".into());
@@ -228,7 +227,7 @@ fn zz_phrases() -> Vec<wind_phrase::PhraseSeed> {
 }
 
 #[test]
-fn reverse_symbol_trigger_enters_only_when_enabled() {
+fn reverse_symbol_trigger_enters_when_bound() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
@@ -236,11 +235,11 @@ fn reverse_symbol_trigger_enters_only_when_enabled() {
     let c = Coordinator::new_headless(wubi_rev(), Some(&data_dir()));
     key(&c, VK_BACKSLASH, false);
     assert_eq!(c.debug_active_mode(), Some("reverse"));
-    let mut off = wubi_rev();
-    off.input.reverse.enabled = false;
-    let c = Coordinator::new_headless(off, Some(&data_dir()));
+    let mut unbound = wubi_rev();
+    unbound.keys.key_actions.remove("backslash");
+    let c = Coordinator::new_headless(unbound, Some(&data_dir()));
     key(&c, VK_BACKSLASH, false);
-    assert_eq!(c.debug_active_mode(), None, "总开关关：绑了键也不进");
+    assert_eq!(c.debug_active_mode(), None, "没绑反查键：不进");
 }
 
 /// ★ Review Focus 3：字母触发键是本方案首码（活码前缀）⇒ 让位作正常码；符号键不让位；
@@ -331,17 +330,19 @@ fn reverse_focus_lost_after_relax_leaves_no_residue() {
 
 /// 反查模式里 `handle_candidate_nav` 排在通配键进缓冲之前：通配键配成
 /// 翻页 / 选词键时模式内它先被导航吃掉，通配进不了缓冲。不改按键顺序，由体检报出。
-/// 对照：出厂通配键 `z` 不报；反查总开关关时不报（模式进不去，谈不上模式内冲突）。
+/// 对照：出厂通配键 `z` 不报；没绑反查键时不报（模式进不去，谈不上模式内冲突）。
 #[test]
 fn reverse_wildcard_key_on_nav_key_is_reported() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
     }
-    let with_key = |k: &str, enabled: bool| {
+    let with_key = |k: &str, bound: bool| {
         let mut cfg = wubi_rev();
         cfg.schema.codetable.wildcard_key = k.into();
-        cfg.input.reverse.enabled = enabled;
+        if !bound {
+            cfg.keys.key_actions.remove("backslash");
+        }
         Coordinator::new_headless(cfg, Some(&data_dir())).reverse_wildcard_conflicts()
     };
     assert_eq!(with_key("-", true), vec!["翻页键"]);
@@ -349,7 +350,7 @@ fn reverse_wildcard_key_on_nav_key_is_reported() {
     // 随后反查的符号通配键臂排在选词臂之前，`;` 照常进缓冲（下方实跑）。
     assert!(with_key(";", true).is_empty(), "次选键不吃键，不报");
     assert!(with_key("z", true).is_empty(), "对照：出厂 z 无冲突");
-    assert!(with_key("-", false).is_empty(), "对照：总开关关不报");
+    assert!(with_key("-", false).is_empty(), "对照：没绑反查键不报");
 
     // 报的是真冲突：模式内按 `-` 被翻页吃掉，不进缓冲。
     let mut cfg = wubi_rev();
@@ -443,7 +444,7 @@ fn reverse_mode_sees_disabled_dicts_when_on() {
     let off = rev_triples(wubi_rev(), "zuia");
     assert!(off.iter().all(|(t, _, _)| t != "门头沟区"));
     let mut cfg = wubi_rev();
-    cfg.schema.codetable.lookup_disabled_dicts = true;
+    cfg.input.reverse.lookup_disabled_dicts = true;
     let on = rev_triples(cfg, "zuia");
     let pos = on
         .iter()
@@ -533,4 +534,135 @@ fn reverse_space_commits_highlight() {
     let act = key_act(&c, VK_SPACE, false);
     assert!(format!("{act:?}").contains(&first), "上屏的是候选：{act:?}");
     assert_eq!(c.debug_active_mode(), None);
+}
+
+// ─────────────── 真实数据验收（反查专属的「含扩展词库」） ───────────────
+
+/// 同一开关下，反查模式出门头沟区（排在已启用之后），行内通配不出。
+#[test]
+fn reverse_only_lookup_zuia_vs_inline_uuiz() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.input.reverse.lookup_disabled_dicts = true;
+    cfg.schema.codetable.wildcard = true;
+    let rev = rev_triples(cfg.clone(), "zuia");
+    let off = rev_triples(wubi_rev(), "zuia");
+    let pos = rev
+        .iter()
+        .position(|(t, c, _)| t == "门头沟区" && c == "uuia")
+        .unwrap_or_else(|| panic!("{rev:?}"));
+    assert!(pos >= off.len(), "已启用的 {} 条全在前：{rev:?}", off.len());
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    letters(&c, "uuiz");
+    let inline = c.debug_candidate_triples();
+    assert!(
+        inline
+            .iter()
+            .any(|(_, c, _)| c.len() == 4 && c.starts_with("uui")),
+        "前置：行内通配确实生效：{inline:?}"
+    );
+    assert!(
+        inline.iter().all(|(t, _, _)| t != "门头沟区"),
+        "行内通配不查未启用库"
+    );
+}
+
+/// 混输：反查只查主码表且含未启用库；行内通配（码长内）不含。
+/// 同时钉住 `build_engine` 对混输 primary 递归透传全局开关（透传丢了，反查这侧就查不到）。
+#[test]
+fn mixed_reverse_sees_xzqy_inline_does_not() {
+    if !mixed_ready() {
+        eprintln!("跳过：五笔 / 混输方案数据不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
+    cfg.schema.active = "wubi86_pinyin".into();
+    cfg.schema.codetable.wildcard = true;
+    cfg.input.reverse.lookup_disabled_dicts = true;
+    let rev = rev_triples(cfg.clone(), "zuia");
+    assert!(
+        rev.iter().any(|(t, c, _)| t == "门头沟区" && c == "uuia"),
+        "{rev:?}"
+    );
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    letters(&c, "uuiz");
+    assert!(
+        c.debug_candidate_triples()
+            .iter()
+            .any(|(_, c, _)| c.len() == 4 && c.starts_with("uui")),
+        "前置：混输行内通配确实生效"
+    );
+    assert!(
+        c.debug_all_candidate_texts()
+            .iter()
+            .all(|t| t != "门头沟区"),
+        "混输行内通配不查未启用库"
+    );
+}
+
+/// 真实数据：方案覆盖文件里残留旧的方案级键，反查与行内通配都不查未启用库。
+#[test]
+fn stale_schema_override_leaks_nowhere_real_data() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let ov = std::env::temp_dir().join(format!("wind_rev_stale_ov_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ov);
+    std::fs::create_dir_all(&ov).unwrap();
+    // 覆盖文件按 `<override_dir>/<方案 id>.toml` 命名（`EngineManager::persist_schema_override`）。
+    std::fs::write(
+        ov.join("wubi86.toml"),
+        "[engine.codetable]\nlookup_disabled_dicts = true\nwildcard = true\n",
+    )
+    .unwrap();
+    let mk =
+        || Coordinator::new_headless_with_override(wubi_rev(), Some(&data_dir()), Some(ov.clone()));
+    let c = mk();
+    key(&c, VK_BACKSLASH, false);
+    letters(&c, "zuia");
+    let rev = c.debug_candidate_triples();
+    assert!(!rev.is_empty(), "前置：反查有结果");
+    assert!(rev.iter().all(|(t, _, _)| t != "门头沟区"), "{rev:?}");
+    let c = mk();
+    letters(&c, "uuiz");
+    let inline = c.debug_candidate_triples();
+    assert!(
+        inline
+            .iter()
+            .any(|(_, c, _)| c.len() == 4 && c.starts_with("uui")),
+        "前置：覆盖文件里的 wildcard = true 生效，行内通配有结果：{inline:?}"
+    );
+    assert!(inline.iter().all(|(t, _, _)| t != "门头沟区"), "{inline:?}");
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 没有任何开关——`z_key_action = "reverse"` 经 z 夺取进入（z 是引导键，`zuia` 实际查 `uia`），照常出结果。
+#[test]
+fn z_key_action_reverse_lists_zuia_without_any_switch() {
+    if !dict_ready() {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let mut cfg = wubi_rev();
+    cfg.keys.key_actions.remove("backslash");
+    cfg.schema.codetable.z_key_action = "reverse".into();
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    c.debug_install_phrases(zz_phrases());
+    letters(&c, "zuia");
+    assert_eq!(c.debug_active_mode(), Some("reverse"));
+    // 实测：z 夺取进入反查后，z 是「引导键」而非首位通配符——
+    // 预编辑是 zuia，查询的是 `uia`（等长 + 前缀补全），不是 `?uia`。
+    assert_eq!(c.debug_preedit(), "zuia");
+    let tri = c.debug_candidate_triples();
+    assert!(!tri.is_empty(), "无任何开关也有结果");
+    assert!(
+        tri.iter().all(|(_, c, m)| c.starts_with("uia") && c == m),
+        "{tri:?}"
+    );
+    assert!(tri.iter().any(|(_, c, _)| c.len() == 4), "{tri:?}");
 }

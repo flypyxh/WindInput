@@ -194,9 +194,9 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   （5000，与翻页扩容上限同一常量；0 不下传 `search_pattern`）；结果带 `is_wildcard`，`source_tier`
   把「通配 + 等长」放档 0。`wildcard_single_only` 开时在 `wildcard_query` 内按字素簇过滤、
   不够则 ×2 重取（先滤后截，reverse-mode spec §2）。
-  `lookup_disabled_dicts`：`DisabledDictLayers`（影子层）独立于主 `DictManager`、首次通配懒加载，
-  `wildcard_query` 按 `(text, code)` 去重合并、`from_disabled_dict` 同档沉后；反查索引变体
-  `ReverseScope::WithDisabled` 只供候选注释四变量。
+  `input.reverse.lookup_disabled_dicts`（反查模式专属）：`DisabledDictLayers`（影子层）独立于主 `DictManager`、开关开时后台预热，
+  只在 `wildcard_query(include_disabled = true)`（即 `convert_reverse`）读、按 `(text, code)` 去重合并、`from_disabled_dict` 同档沉后；
+  行内通配与注释反查不看它。
   混输代理主码表的通配键；有拼音子引擎时 `MixedEngine::convert_wildcard` = 字面 `convert(input)`
   ⊕ 主码表通配，`merge_wildcard` 按「通配等长 → 字面 → 通配更长」合并、码表间 `(text, code)`
   去重、拼音 / 英文与码表同字即丢、带拼音保底截断。通配码长走 `Engine::wildcard_code_length`

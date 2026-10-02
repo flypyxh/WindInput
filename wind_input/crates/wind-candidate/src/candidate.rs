@@ -455,7 +455,7 @@ pub struct Candidate {
     #[serde(skip)]
     pub is_wildcard: bool,
     /// 该候选来自**未启用的扩展词库**（影子层，`DisabledDictLayers`，reverse-mode spec §4.2）。
-    /// 只由码表通配 / 反查查询置位；显示序在同一精确档内把它排在已启用候选之后。
+    /// 只由反查模式查询置位；显示序在同一精确档内把它排在已启用候选之后。
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub from_disabled_dict: bool,

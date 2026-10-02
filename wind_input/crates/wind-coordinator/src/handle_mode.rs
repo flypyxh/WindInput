@@ -771,7 +771,7 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::None => None,
-            // 反查模式：顶字重开，同生僻字。门卫没过（总开关关 / 方案无反查通配键）不吞键。
+            // 反查模式：顶字重开，同生僻字。门卫：活跃方案有反查通配键（码表 / 混输主码表），没过不吞键。
             BoundAction::Reverse => {
                 if !self.reverse_mode_available() {
                     return None;

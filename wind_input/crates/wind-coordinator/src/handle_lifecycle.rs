@@ -602,8 +602,8 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         match action {
             BoundAction::None => None,
-            // 反查模式：门卫是总开关 `input.reverse.enabled`（出厂关）+ 活跃方案有反查通配键
-            // （码表 / 混输主码表）。没过返回 None，触发键落普通输入，不吞键。
+            // 反查模式的门卫：活跃方案有反查通配键（码表 / 混输主码表）。没有总开关——走到这里
+            // 就是绑了键。没过返回 None，触发键落普通输入，不吞键。
             BoundAction::Reverse => {
                 if !self.reverse_mode_available() {
                     return None;

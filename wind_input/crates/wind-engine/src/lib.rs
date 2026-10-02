@@ -24,7 +24,7 @@ pub use engine::{
 pub use english::EnglishEngine;
 pub use manager::{
     AuxCodeSettings, AuxCodeSourceOptions, AuxSource, EngineManager, FreqSettings, FreqStrategy,
-    ReverseScope, SchemaDictFile,
+    SchemaDictFile,
 };
 pub use pinyin::PinyinEngine;
 pub use text_codes::TextCodeView;
