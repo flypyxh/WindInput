@@ -48,7 +48,8 @@ impl Coordinator {
     /// `origin` 决定快照从哪个缓冲取、回退放回哪条流（见 [`RewindOrigin`]）：正常输入流
     /// 走 `try_prefix_hijack`；临时英文里打 `@` 由 `handle_temp_english_key` 转交
     /// （与大写 `U+` 转交 Unicode 模式同构）——五笔用户名常超过四码，正常流里早已顶字上屏，
-    /// 只有临英才能把完整用户名攒到 `@`。
+    /// 只有临英才能把完整用户名攒到 `@`。快捷输入同理，由 `handle_mix_key` 转交
+    /// （闸门见 `mix_email_handoff`）。
     pub(crate) fn enter_email_mode(
         &self,
         state: &mut State,
@@ -59,11 +60,21 @@ impl Coordinator {
         let snapshot = match origin {
             RewindOrigin::Normal => state.input_buffer.clone(),
             RewindOrigin::TempEnglish => state.temp_english_buffer.clone(),
+            RewindOrigin::Mix { .. } => state.mix_buffer.clone(),
         };
         state.input_buffer.clear();
         state.temp_english_buffer.clear();
         state.temp_english_prefix.clear();
         state.temp_english_cursor = 0;
+        // 快捷输入的组合态（与 `exit_mix_mode` 清的同一组，`committed_*` 除外——转交闸门
+        // 要求它为空）。不走 `exit_mix_mode`：它会把刚要登记的回退一并作废。
+        if matches!(origin, RewindOrigin::Mix { .. }) {
+            state.mix_buffer.clear();
+            state.mix_cursor = 0;
+            state.mix_repeat = false;
+            state.mix_prefix.clear();
+            state.english_case_variant = crate::english_candidates::CaseVariant::default();
+        }
         state.candidates.clear();
         state.active = Some(ModeKind::Email);
         state.email_buffer = buffer.clone();

@@ -193,9 +193,11 @@ impl Coordinator {
 
     /// 执行夺取回退：撤销夺取，把快照回放到正常码表输入流并重算候选。
     pub(crate) fn rewind_hijack(&self, state: &mut State) -> KeyAction {
-        let rw = state.rewind.take();
-        let origin = rw.as_ref().map(|r| r.origin).unwrap_or_default();
-        let snapshot = rw.map(|r| r.snapshot).unwrap_or_default();
+        let (snapshot, origin) = state
+            .rewind
+            .take()
+            .map(|r| (r.snapshot, r.origin))
+            .unwrap_or_default();
         // 退出当前夺取式模式：URL / z-fallback 的临拼、临英、mix、生僻字。
         // ⚠️ 必须与 `active_hijack_buffer` 枚举的模式**一一对应**：那边认得、这边漏了，
         // 就会走 `reset_exclusive_modes` 兜底——状态清得掉，但各模式自己的收尾
@@ -246,6 +248,27 @@ impl Coordinator {
                 KeyAction::UpdateComposition {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
+                }
+            }
+            RewindOrigin::Mix { idx, prefix } => {
+                // 重进同一个快捷输入实例，前缀原样放回（理由见 `RewindOrigin::Mix`）。
+                // 不走 `enter_mix_mode`：它按进入键重算前缀、并把缓冲清空。
+                //
+                // ⚠️ 若该快捷输入当初是 z 夺取进来的，那份回退登记已在转交邮箱时被覆盖，
+                // 回到这里后再退到边界不会继续退回码表缓冲——`Rewind` 只有一层，临英转交
+                // 同此。
+                state.active = Some(ModeKind::Mix(idx));
+                state.mix_id = idx;
+                state.mix_buffer = snapshot;
+                state.mix_cursor = state.mix_buffer.len();
+                state.mix_prefix = prefix;
+                self.update_mix_candidates(state);
+                let caret_pos = self.overlay_caret(state);
+                self.notify_ui_update(state);
+                debug!("rewind_hijack: restored quick input '{}'", state.mix_buffer);
+                KeyAction::UpdateComposition {
+                    text: state.preedit.clone(),
+                    caret_pos,
                 }
             }
         }

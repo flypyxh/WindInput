@@ -95,6 +95,8 @@ impl Coordinator {
             RewindOrigin::Normal => state.input_buffer.clone(),
             // 临英转交：快照是临英缓冲里已有的那部分（`U`），`+` 尚未进任何缓冲。
             RewindOrigin::TempEnglish => state.temp_english_buffer.clone(),
+            // 快捷输入目前不转交 Unicode 模式；为穷尽匹配给出同源的快照。
+            RewindOrigin::Mix { .. } => state.mix_buffer.clone(),
         };
         state.input_buffer.clear();
         state.temp_english_buffer.clear();
@@ -104,6 +106,10 @@ impl Coordinator {
         state.active = Some(ModeKind::Unicode);
         state.unicode_buffer = buffer.clone();
         state.unicode_cursor = state.unicode_buffer.len(); // 进入时缓冲已有前缀，光标落末尾
+        debug!(
+            "Entered Unicode mode (buffer={}, origin={:?})",
+            buffer, origin
+        );
         state.rewind = Some(Rewind {
             snapshot,
             host_text: buffer,
@@ -112,10 +118,6 @@ impl Coordinator {
         self.update_unicode_candidates(state);
         let disp = state.preedit.clone();
         self.notify_ui_update(state);
-        debug!(
-            "Entered Unicode mode (buffer={}, origin={:?})",
-            state.unicode_buffer, origin
-        );
         KeyAction::UpdateComposition {
             text: disp.clone(),
             caret_pos: disp.chars().count() as u32,

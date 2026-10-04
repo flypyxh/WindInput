@@ -120,11 +120,18 @@ pub struct Rewind {
 ///
 /// ⚠️ 新增来源时，除了本枚举还要在 `rewind_hijack` 的 `match` 里接住它。只加变体不接
 /// 分支会落到既有分支上，症状与上面那条一模一样（状态清得掉、回错地方），且不报错。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RewindOrigin {
     /// 正常码表/拼音输入流（`State::input_buffer`）。URL 夺取、z 夺取、小写 `u+` 走这条。
     #[default]
     Normal,
     /// 临时英文缓冲（`State::temp_english_buffer`）。大写 `U+` 的转交走这条。
     TempEnglish,
+    /// 快捷输入缓冲（`State::mix_buffer`）。快捷输入里按 `@` 转交邮箱模式走这条。
+    ///
+    /// 比临英多带两样：`idx` 是哪个融合实例（`State::mix_id`），`prefix` 是显示态前缀
+    /// （`;`，或字母引导时的 `z`）。临英回放可以把前缀清空（Shift+字母进入的临英本就没有），
+    /// 快捷输入不行——前缀是组合区里用户看得见的那个引导符，回放丢了它组合区就少一截；
+    /// 字母引导的实例回车上屏还要靠它把那个字母还回去（`guide_to_return`）。
+    Mix { idx: u8, prefix: String },
 }

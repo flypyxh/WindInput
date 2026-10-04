@@ -7,7 +7,7 @@ use crate::coordinator::{
     CommittedSeg, Coordinator, PunctEmptyCodePolicy, SchemaToggleOrigin, State, SwitchCommit,
     ToggleLanding,
 };
-use crate::pipeline::ModeKind;
+use crate::pipeline::{ModeKind, RewindOrigin};
 use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;
 use tracing::{debug, info, warn};
@@ -930,6 +930,59 @@ impl Coordinator {
         // 大小写档位属于**这一次**组合（同临英 `exit_temp_english`）。
         state.english_case_variant = crate::english_candidates::CaseVariant::default();
         // 布局无需在此恢复：active 已清空，下一次 notify_ui_update 会自动算回全局基线。
+    }
+
+    /// 快捷输入里按 `@`：缓冲像个用户名就带着它转交邮箱模式（GH#162）。
+    ///
+    /// 与临英转交（`handle_temp_english_key`）同一个用意：五笔用户名常超过四码，正常流里
+    /// 早已顶字上屏，只有攒得住一整段的模式才能把完整用户名带到 `@`。
+    ///
+    /// 闸门比临英多几条，因为快捷输入的缓冲不一定是「一段英文」：
+    /// - **缓冲像用户名**：首字符是字母或数字，其余只含字母、数字与 `._-`。`${x}`、`a+b`
+    ///   这类缓冲里的 `@` 维持原有语义（字面或顶屏）。词组透镜的缓冲带分词符 `'`，本就不过
+    ///   这一条，不另设闸门。
+    /// - **数字透镜只认纯数字**：QQ 邮箱的用户名就是号码，得收；但 `1.5`、`2024-10-04`
+    ///   也过得了上一条，它们是算式 / 日期，那里的 `@` 原本恒为字面，不能抢。
+    /// - **不是 `free_input = always` 的实例**：那是专做字面输入的实例，`@` 照字面。
+    /// - **没有分步上屏的段**（`committed_text` 为空）：同 `try_prefix_hijack` 的理由，
+    ///   转交不处置已转换的前缀，它会成孤儿；那个状态下的 `@` 也几乎一定不是邮箱。
+    /// - **光标在缓冲末尾**：光标在中间时 `@` 是插进去的，整个缓冲当用户名就错了。
+    ///
+    /// 开关仍是 `input.email.enabled`，没有第二道。
+    fn mix_email_handoff(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+        shift: bool,
+        lens: MixLens,
+    ) -> Option<KeyAction> {
+        let at = crate::handle_email::EMAIL_AT;
+        if printable_char(data.key_code, shift) != Some(at)
+            || !self.rt().config.input.email.enabled
+            || (lens == MixLens::Numeric && !state.mix_buffer.bytes().all(|b| b.is_ascii_digit()))
+            || self.mix_free_input(state.mix_id) == FreeInputMode::Always
+            || !state.committed_text.is_empty()
+            || state.mix_cursor != state.mix_buffer.len()
+            || !Self::looks_like_email_user(&state.mix_buffer)
+        {
+            return None;
+        }
+        let buffer = format!("{}{}", state.mix_buffer, at);
+        let origin = RewindOrigin::Mix {
+            idx: state.mix_id,
+            prefix: state.mix_prefix.clone(),
+        };
+        Some(self.enter_email_mode(state, buffer, origin))
+    }
+
+    /// 缓冲是否像邮箱用户名：非空，首字符是 ASCII 字母或数字，其余只含字母、数字与 `._-`。
+    ///
+    /// 刻意比 RFC 的 local-part 窄：快捷输入的缓冲同时是算式与字面输入的载体，`+`、`$`
+    /// 这类字符在那里各有含义，收进来就会把 `1+2@`、`${x}@` 也当成邮箱。
+    fn looks_like_email_user(buf: &str) -> bool {
+        let mut chars = buf.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     }
 
     /// 快捷输入此刻的**高亮候选**是不是英文候选（英文成员 / 英文段 / 词组透镜）——
@@ -2966,6 +3019,12 @@ impl Coordinator {
                 let lens = self.mix_lens_for_key(state, data, shift);
                 let free_on = self.mix_free_input(state.mix_id) != FreeInputMode::Off;
                 let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
+
+                // ⓪ 邮箱模式转交（GH#162）：必须早于①——`auto` 下 `@` 会被①⑤收成字面，
+                // `off` 下会被⑥连同高亮候选顶屏。闸门见 `mix_email_handoff`。
+                if let Some(act) = self.mix_email_handoff(state, data, shift, lens) {
+                    return act;
+                }
 
                 // ① 输入字符（按 lens）
                 let input = match lens {
