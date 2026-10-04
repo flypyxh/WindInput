@@ -13729,6 +13729,84 @@ mod caret_compat_tests {
         );
     }
 
+    /// 「坐标仍等于上一轮权威」那一帧被拒时的缓存处理，两个用例共用的现场：缓存里装着
+    /// `cache_source` 来源的 (0,54)，上一轮权威坐标是 (473,217)，正等首显。
+    fn coord_waiting_with_cache(cache_source: i32) -> Arc<Coordinator> {
+        let c = coord();
+        set_mode(&c, wind_config::app_compat::FirstShowMode::Fast);
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 0;
+            st.caret_y = 54;
+            st.caret_height = 20;
+            st.caret_source = cache_source;
+        }
+        *c.last_authoritative_caret.lock().unwrap() = (473, 217, true);
+        c.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *c.pending_first_show.lock().unwrap() = true;
+        c
+    }
+
+    fn composition_probe_at(x: i32, y: i32, height: i32) -> CaretData {
+        CaretData {
+            source: wind_ipc::protocol::caret_source::TSF_COMPOSITION,
+            ..probe_at(x, y, height)
+        }
+    }
+
+    /// ★ Java 被动客户端（JTable 未进入编辑）：宿主不报位置，按键时 DLL 退到 GUI caret，
+    /// 拿到的是窗口客户区原点 (0,54)；组合开始后 TSF 给出 Windows 输入编辑框的位置
+    /// (473,217)——与上一轮权威相同（编辑框不随单元格动），被判「尚未 reflow」继续等。
+    /// 兜底 timer 随即到期，若缓存还是 GUI caret，候选窗就先闪到屏幕左边再跳回
+    /// （2026-10-04 靶机 Zulu 7u45 实测）。TSF 域的旧值再旧也比跨窗口的 GUI caret 可信，
+    /// 所以这一帧要收进缓存给兜底用——但**仍不提前首显**，等待语义不变。
+    #[test]
+    fn probe_equal_to_last_auth_replaces_non_tsf_cache_for_fallback() {
+        let c = coord_waiting_with_cache(wind_ipc::protocol::caret_source::GUI_CARET);
+        c.handle_caret_probe(&composition_probe_at(473, 217, 28));
+        assert!(
+            *c.pending_first_show.lock().unwrap(),
+            "与上一轮权威相同的 probe 仍须继续等，不得提前首显"
+        );
+        let st = c.state.lock().unwrap();
+        assert_eq!(
+            (st.caret_x, st.caret_y, st.caret_height),
+            (473, 217, 28),
+            "兜底该用 TSF 域的 probe，而不是 GUI caret (0,54)"
+        );
+    }
+
+    /// 对照：缓存本就是 TSF 域（宿主组合前上报的空闲插入点）时不得被替换——等待分支存在的
+    /// 理由正是「probe 可能停在上一轮的位置」，此时缓存才是对的那个。
+    #[test]
+    fn probe_equal_to_last_auth_keeps_tsf_cache() {
+        let c = coord_waiting_with_cache(wind_ipc::protocol::caret_source::TSF_SELECTION);
+        c.handle_caret_probe(&composition_probe_at(473, 217, 28));
+        assert!(*c.pending_first_show.lock().unwrap());
+        let st = c.state.lock().unwrap();
+        assert_eq!(
+            (st.caret_x, st.caret_y),
+            (0, 54),
+            "TSF 域的缓存不得被与上一轮权威相同的 probe 覆盖"
+        );
+    }
+
+    /// 对照：probe 本身不是 TSF 域（GUI caret 等）时不收——换来的只是另一份同样靠不住的坐标。
+    #[test]
+    fn probe_equal_to_last_auth_non_tsf_probe_not_absorbed() {
+        let c = coord_waiting_with_cache(wind_ipc::protocol::caret_source::GUI_CARET);
+        let p = CaretData {
+            source: wind_ipc::protocol::caret_source::GUI_CARET,
+            ..probe_at(473, 217, 28)
+        };
+        c.handle_caret_probe(&p);
+        assert!(*c.pending_first_show.lock().unwrap());
+        let st = c.state.lock().unwrap();
+        assert_eq!((st.caret_x, st.caret_y), (0, 54));
+    }
+
     /// 把「组合前的空闲上报」摆好：模拟用户上屏后打空格移动了光标，宿主在按键前上报了
     /// 真实插入点 (745,1007)，而上一轮组合的权威坐标停在 (601,988)。
     fn coord_with_idle_report() -> Arc<Coordinator> {

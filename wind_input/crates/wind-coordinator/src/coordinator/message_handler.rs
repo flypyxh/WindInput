@@ -3986,6 +3986,30 @@ impl MessageHandler for Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if has_base && data.x == lx && data.y == ly {
+            // 等待不变，但缓存若是**非 TSF 域**（GUI caret / last_known）就先换成这份 probe：
+            // 兜底 timer 到期时用的是缓存，TSF 域的旧值再旧也比跨窗口的 GUI caret 可信。
+            //
+            // 实测（2026-10-04 靶机 Zulu 7u45）：Java 被动客户端（JTable 未进入编辑）按键时
+            // DLL 退到 GUI caret，拿到窗口客户区原点 (0,54)；本帧 (473,217) 是 Windows 输入
+            // 编辑框的位置，编辑框不随单元格动，恰与上一轮权威相同 ⇒ 被拒。7ms 后兜底到期
+            // 拿 (0,54) 首显，候选窗先闪到屏幕左边、50ms 后才跳回编辑框旁。
+            //
+            // ⚠ 只换非 TSF 缓存：缓存是 TSF 域时（宿主组合前上报的空闲插入点）它才是对的
+            //   那个，本分支存在的理由正是 probe 可能停在上一轮——那时不能覆盖。
+            let cache_is_tsf = {
+                let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                wind_ipc::protocol::caret_source::is_tsf(s.caret_source)
+            };
+            if wind_ipc::protocol::caret_source::is_tsf(data.source)
+                && !cache_is_tsf
+                && self.absorb_probe_coords(data)
+            {
+                debug!(
+                    "caret_probe → 继续等待: 坐标仍等于上一轮权威 ({lx},{ly})，宿主尚未 reflow；\
+                     缓存原为非 TSF 来源，已换成本帧供兜底用"
+                );
+                return;
+            }
             debug!("caret_probe → 继续等待: 坐标仍等于上一轮权威 ({lx},{ly})，宿主尚未 reflow");
             return;
         }
