@@ -3,6 +3,7 @@
 #include "Globals.h"
 #include "CaretDefaultPosPolicy.h"
 #include "ImmCandidateFormPolicy.h"
+#include "ImmOpenCandidateNudge.h"
 // 仅供下方「IMM32 候选位置」降级使用：走 CUAS 的老宿主（Java AWT、多数游戏）经 IMM32 声明
 // 候选位置，而那条路不反映到 TSF 的 GetTextExt 上（见 DoEditSession 里那一级的注释）。
 #include <imm.h>
@@ -286,6 +287,10 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
             && wind::caret::IsHostDefaultPosition(_caretRect, _hasCompositionStart != FALSE,
                                                   _compositionStartRect, _hasCompositionRect != FALSE,
                                                   _compositionRect);
+        // 这类宿主多半只在收到 IMN_OPENCANDIDATE 后才经 IMM32 报位置，而 CUAS 不替我们发——
+        // 记下本线程，此后每次组合起止补发（见 ImmOpenCandidateNudge.h）。
+        if (hostDefaultPos)
+            wind::caret::NoteHostDefaultPositionForImm();
 
         // ★ 一级降级：caret 无效而组合起点有效时，用组合起点当 caret。
         //
@@ -562,6 +567,16 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
     }
 
     pContextView->Release();
+
+    // 补发 IMN_OPENCANDIDATE 的宿主：位置由宿主异步回写（AWT 经 EDT），组合首帧读到的多半是
+    // 上一次组合的旧值。不报组合起点，服务端锚点逐帧跟随 caret，回写一到就跟上；报了则旧值
+    // 被锁成整场组合的锚点（换输入框时新旧差不到大偏移逃生阀的 3 倍行高）。三级降级采信时
+    // 已自行作废，这里覆盖 CUAS 改答 CANDIDATEFORM 点、走 selection 路径的情形。
+    if (_succeeded && wind::caret::IsImmOpenCandidateHost())
+    {
+        _hasCompositionStart = FALSE;
+        _hasCompositionRect = FALSE;
+    }
 
     // 异步模式：结果只能从这里出去——静态入口在排队执行时早已返回。
     // 失败时**不回调**：服务端会继续等自己的兜底超时，用按键时缓存的坐标显示，

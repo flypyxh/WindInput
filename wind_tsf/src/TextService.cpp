@@ -5,6 +5,7 @@
 #include "IPCClient.h"
 #include "LangBarItemButton.h"
 #include "CaretEditSession.h"
+#include "ImmOpenCandidateNudge.h"
 #include "DisplayAttributeInfo.h"
 #include "HotkeyManager.h"
 #include "HostWindow.h"
@@ -476,6 +477,7 @@ public:
             {
                 _success = TRUE;
                 WIND_LOG_DEBUG(L"CCommitTextEditSession: SetText + EndComposition committed\n");
+                wind::caret::PostImmOpenCandidateIfHost(L"上屏"); // 让宿主按上屏后的光标刷新位置
                 return S_OK;
             }
             // GetRange 失败 (极少): composition 已结束但文字未写入, fallthrough
@@ -747,6 +749,7 @@ public:
                 return E_FAIL;
             }
             WIND_LOG_DEBUG(L"StartComposition succeeded\n");
+            wind::caret::PostImmOpenCandidateIfHost(L"组合开始");
             // Weasel 模式：标记 composition 刚刚创建。下一次 SendCaretPositionUpdate
             // 不会立即发 IPC，而是等 OnLayoutChange 提供 reflow 后的权威坐标，
             // 50ms timer 兜底（应对不发 OnLayoutChange 的应用，如某些 CUAS 路径）。
@@ -7379,6 +7382,7 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint, BOOL nonKeyContex
     }
 
     WIND_LOG_DEBUG(L"EndComposition: Ending active composition\n");
+    wind::caret::PostImmOpenCandidateIfHost(L"组合结束");
 
     // CRITICAL: Transfer ownership of _pComposition immediately
     // This allows new compositions to start while the old one is being ended async
