@@ -402,6 +402,18 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
 
     // Trace: Log ALL key presses (very high frequency)
     WIND_LOG_TRACE_FMT(L"OnTestKeyDown: wParam=0x%02X\n", (uint32_t)wParam);
+    // 外来的 VK_PACKET（能走到这里说明不是 skip 表里我们自己注入的那批）：它没有 VK，中文标点态下的
+    // `,` `.` 以这种形态到达就会被原样放行成 ASCII（B-逗号变英文）。来源未知，故留证据——
+    // 物理逗号/句号键此刻是否按着，能直接区分「硬件键被某层转成 Unicode 包」与「纯软件注入」。
+    if (wParam == VK_PACKET)
+    {
+        WIND_LOG_DEBUG_FMT(
+            L"compat.vk_packet.external lParam=0x%08X scan=0x%02X extraInfo=0x%llX physComma=%d physPeriod=%d shift=%d",
+            (uint32_t)lParam, (uint32_t)((lParam >> 16) & 0xFF), (unsigned long long)GetMessageExtraInfo(),
+            (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) ? 1 : 0, (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) ? 1 : 0,
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 1 : 0);
+        WindLogForegroundProcessInfo(4, L"compat.vk_packet.external.foreground_host");
+    }
     // 每个新按键都重新起算：凭据只对紧随其后的那一次 OnKeyDown 有效。
     _ctrlSpaceEatenInTest = FALSE;
 
