@@ -477,7 +477,7 @@ public:
             {
                 _success = TRUE;
                 WIND_LOG_DEBUG(L"CCommitTextEditSession: SetText + EndComposition committed\n");
-                wind::caret::PostImmOpenCandidateIfHost(L"上屏"); // 让宿主按上屏后的光标刷新位置
+                wind::caret::PostImmCandidateRefreshIfHost(L"上屏"); // 让宿主按上屏后的光标刷新位置
                 return S_OK;
             }
             // GetRange 失败 (极少): composition 已结束但文字未写入, fallthrough
@@ -7382,7 +7382,7 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint, BOOL nonKeyContex
     }
 
     WIND_LOG_DEBUG(L"EndComposition: Ending active composition\n");
-    wind::caret::PostImmOpenCandidateIfHost(L"组合结束");
+    wind::caret::PostImmCandidateRefreshIfHost(L"组合结束");
 
     // CRITICAL: Transfer ownership of _pComposition immediately
     // This allows new compositions to start while the old one is being ended async

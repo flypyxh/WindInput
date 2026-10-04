@@ -44,15 +44,18 @@ inline bool IsImmOpenCandidateHost()
     return t_immOpenCandidateHost;
 }
 
-/// 向本线程的焦点窗口补发 IMN_OPENCANDIDATE。用 Post 而非 Send：调用点多在 edit session
-/// 内，同步把消息送进宿主窗口过程有重入风险；AWT 本来也是投递到 EDT 异步处理。
-inline void PostImmOpenCandidate(const wchar_t* reason)
+/// 向本线程的焦点窗口补发 IMN_OPENCANDIDATE；`thenClose` 时紧跟一条 IMN_CLOSECANDIDATE。
+/// 用 Post 而非 Send：调用点多在 edit session 内，同步把消息送进宿主窗口过程有重入风险；
+/// AWT 本来也是投递到 EDT 异步处理。两条按投递顺序处理。
+inline void PostImmOpenCandidate(const wchar_t* reason, bool thenClose = false)
 {
     const HWND hwnd = GetFocus();
     if (hwnd == nullptr)
         return;
     const BOOL posted = PostMessageW(hwnd, WM_IME_NOTIFY, IMN_OPENCANDIDATE, 1);
-    WIND_LOG_DEBUG_FMT(L"IMN_OPENCANDIDATE 补发(%s) hwnd=0x%p posted=%d\n", reason, (void*)hwnd, (int)posted);
+    const BOOL closed = thenClose ? PostMessageW(hwnd, WM_IME_NOTIFY, IMN_CLOSECANDIDATE, 1) : FALSE;
+    WIND_LOG_DEBUG_FMT(L"IMN_OPENCANDIDATE 补发(%s) hwnd=0x%p posted=%d close=%d\n", reason, (void*)hwnd,
+                       (int)posted, (int)closed);
 }
 
 /// 观测到宿主默认位置指纹时调用：首次置位并立即补发一次（让当前这次组合也能拿到位置）。
@@ -65,11 +68,21 @@ inline void NoteHostDefaultPositionForImm()
     PostImmOpenCandidate(L"首次识别");
 }
 
-/// 组合开始 / 结束时调用：已证实的宿主才补发。
+/// 组合开始时调用：已证实的宿主才补发。
 inline void PostImmOpenCandidateIfHost(const wchar_t* reason)
 {
     if (t_immOpenCandidateHost)
         PostImmOpenCandidate(reason);
+}
+
+/// 组合结束 / 上屏时调用：OPEN 让 AWT 按上屏后的光标刷新 CANDIDATEFORM，紧跟的 CLOSE 让
+/// 消息流与微软拼音一致地成对（OPEN…CLOSE）。AWT 不处理 CLOSE，对 Java 无影响；它防的是
+/// 「命中指纹、又在 OPEN 时弹自己候选框」的 IMM32 宿主——只发 OPEN 不发 CLOSE，那个框会
+/// 在组合结束后留在屏幕上。
+inline void PostImmCandidateRefreshIfHost(const wchar_t* reason)
+{
+    if (t_immOpenCandidateHost)
+        PostImmOpenCandidate(reason, /*thenClose=*/true);
 }
 
 } // namespace caret
