@@ -39,14 +39,28 @@ pub enum CompletionKind {
     EmailSuffix,
     /// 网址输入历史（存上屏的完整文本，如 `www.example.com/path`）。
     UrlHistory,
+    /// 快捷输入历史（存在快捷输入里上屏过的字面文本，如 `${reset_time}`、`RESET_TIME`）。
+    ///
+    /// **区分大小写地存**：`RESET_TIME` 与 `reset_time` 是两条（t46）。按前缀**不区分大小写**
+    /// 地取是消费端的事，见协调器 `quick_history_candidates`。
+    QuickHistory,
 }
 
 impl CompletionKind {
+    /// 全部类别。导出、整表清空等「对每一类都做一遍」的地方一律遍历它，不各自手写列表
+    /// ——新增一类时手写的列表会被漏，症状是那一类不进备份、还原时也清不掉。
+    pub const ALL: [CompletionKind; 3] = [
+        CompletionKind::EmailSuffix,
+        CompletionKind::UrlHistory,
+        CompletionKind::QuickHistory,
+    ];
+
     /// 库中的字面写法。**改动即破坏存量数据**（旧 kind 的记录会读不到）。
     pub fn as_str(self) -> &'static str {
         match self {
             CompletionKind::EmailSuffix => "email_suffix",
             CompletionKind::UrlHistory => "url_history",
+            CompletionKind::QuickHistory => "quick_history",
         }
     }
 
@@ -58,6 +72,7 @@ impl CompletionKind {
         match s {
             "email_suffix" => Some(CompletionKind::EmailSuffix),
             "url_history" => Some(CompletionKind::UrlHistory),
+            "quick_history" => Some(CompletionKind::QuickHistory),
             _ => None,
         }
     }
@@ -316,7 +331,7 @@ impl Store {
     /// 漏登记 `RESTORE_SECTIONS` 的前科说明那是条真会被漏的路。
     pub fn export_completions_jsonl(&self) -> anyhow::Result<String> {
         let mut out = String::new();
-        for kind in [CompletionKind::EmailSuffix, CompletionKind::UrlHistory] {
+        for kind in CompletionKind::ALL {
             let (rows, _) = self.list_completions(kind, "", 0, 0)?;
             for (text, rec) in rows {
                 out.push_str(&serde_json::to_string(&serde_json::json!({
@@ -689,6 +704,26 @@ mod tests {
                 .1,
             1
         );
+    }
+
+    /// 每个 kind 都要能经导出 / 导入往返——遍历 `ALL` 而不是手写，新增 kind 自动纳入。
+    /// 曾经导出循环是手写的两项列表，新加一类不改它，那一类就静默不进备份。
+    #[test]
+    fn jsonl_roundtrip_covers_every_kind() {
+        let a = store("exp_all");
+        for kind in CompletionKind::ALL {
+            a.record_completion(kind, "Same_Text").unwrap();
+        }
+        let dump = a.export_completions_jsonl().unwrap();
+        let b = store("imp_all");
+        b.import_completions_jsonl(&dump).unwrap();
+        for kind in CompletionKind::ALL {
+            assert!(
+                b.get_completion(kind, "Same_Text").unwrap().is_some(),
+                "{kind:?} 没随导出导入保住:\n{dump}"
+            );
+            assert_eq!(CompletionKind::from_key(kind.as_str()), Some(kind));
+        }
     }
 
     #[test]

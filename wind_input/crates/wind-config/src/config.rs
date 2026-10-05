@@ -2905,16 +2905,28 @@ pub struct QuickInputConfig {
     /// 计算器结果小数位数，默认 6
     #[serde(default = "default_decimal_places")]
     pub decimal_places: i32,
+    /// 快捷输入历史（成员 `quick_input.history`）的条数上限，默认 1000；`0` = 不限。
+    ///
+    /// 超出时按「次数少、用得旧」裁掉，与网址历史 `input.url.history_max` 同一套裁剪。
+    /// 不做按时间过期（维护者 2026-10-05 定）：按「用得旧」淘汰本身就会让过气项目的词
+    /// 慢慢被挤出去。内部字段，设置页不开放。
+    #[serde(default = "default_quick_history_max")]
+    pub history_max: u32,
 }
 
 fn default_decimal_places() -> i32 {
     6
 }
 
+fn default_quick_history_max() -> u32 {
+    1000
+}
+
 impl Default for QuickInputConfig {
     fn default() -> Self {
         Self {
             decimal_places: default_decimal_places(),
+            history_max: default_quick_history_max(),
         }
     }
 }

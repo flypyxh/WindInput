@@ -547,6 +547,9 @@ pinyin_partial_candidates_overflow = true
 # mix_modes，写了会把整份定义冻结成快照，见文件头说明）。存量 force_vertical 在加载期
 # 自动迁移：true → "vertical"，false → "follow"（不是 horizontal——false 的语义是「不强制」）。
 decimal_places = 6
+# 快捷输入历史（候选来源 quick_input.history，出厂不启用）的条数上限，0 = 不限。
+# 超出时按「次数少、用得旧」裁掉，不按时间过期。
+history_max = 1000
 
 # 跨引擎的词频公共基线。
 # 与 [schema.codetable.frequency] / [schema.pinyin.frequency] / [schema.english.frequency]

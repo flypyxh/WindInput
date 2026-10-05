@@ -528,6 +528,14 @@ pub trait WebDataRpc: WebDataHost {
             }
             "urlHistory.delete" => self.web_completion_delete(CompletionKind::UrlHistory, params),
             "urlHistory.clear" => self.web_completion_clear(CompletionKind::UrlHistory),
+            // 快捷输入历史（成员 `quick_input.history`），同一张表的第三个分区。
+            "quickHistory.listPaged" => {
+                self.web_completion_list_paged(CompletionKind::QuickHistory, params)
+            }
+            "quickHistory.delete" => {
+                self.web_completion_delete(CompletionKind::QuickHistory, params)
+            }
+            "quickHistory.clear" => self.web_completion_clear(CompletionKind::QuickHistory),
 
             // ── shadow.*（影子规则，redb 持久化）─────────────────
             "shadow.list" => self.web_shadow_list(params),

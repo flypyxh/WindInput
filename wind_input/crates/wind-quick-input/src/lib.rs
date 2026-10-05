@@ -135,6 +135,11 @@ pub const MEMBER_CALC: &str = "quick_input.calc";
 pub const MEMBER_NUMBER: &str = "quick_input.number";
 /// 重复上屏来源（**由协调器实现**：候选取自上屏历史，本 crate 不产出）。
 pub const MEMBER_REPEAT: &str = "quick_input.repeat";
+/// 快捷输入历史来源（**由协调器实现**：候选取自快捷输入里上屏过的字面文本，t46）。
+///
+/// 与 [`MEMBER_REPEAT`] 的分工：那个只在空缓冲时给「上一次上屏」；本来源在有缓冲时按
+/// 前缀给历史。**出厂不在任何融合实例里**，由用户自己加进成员列表。
+pub const MEMBER_HISTORY: &str = "quick_input.history";
 
 /// 旧值 `quick_input` 的展开序，同时是内置「快捷」融合的默认来源序。
 ///

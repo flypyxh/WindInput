@@ -369,6 +369,7 @@ static REGISTRY: &[ConfigField] = &[
     // 快捷输入：各候选来源的开关与优先级在 schema.mix_modes 的 members 里（有无=开关，
     // 顺序=优先级）；总开关＝把 quick_mix 的 trigger_keys 清空。此处只有全局行为项。
     f("schema.quick_input.decimal_places", Int),
+    f("schema.quick_input.history_max", Int),
     // 强制竖排原在此（force_vertical）。它其实是 quick_mix **实例**的显示属性，已迁往
     // mix_modes[].candidate_layout；per-instance 字段由 StructList 条目承载，不另立项
     // （一个配置键只能有一个 manifest 项）。

@@ -1001,6 +1001,13 @@ impl Coordinator {
         let Some(cand) = state.candidates.get(self.highlighted_global_index(state)) else {
             return false;
         };
+        // 快捷输入历史置首时（Free / 大写英文透镜），高亮停在历史上而英文段仍在其后。
+        // 只看高亮会让档位键在有历史命中时整个失效（循环后高亮又归 0、回到历史上），
+        // 而改动前这两个透镜的首位恒是原文——按「英文段在不在」判，保住原行为。
+        if cand.id == crate::quick_history::QUICK_HISTORY_ID {
+            return matches!(self.mix_lens(state), MixLens::Free | MixLens::English)
+                && self.mix_free_is_english_word(state);
+        }
         self.mix_candidate_is_english(state, cand)
     }
 
@@ -2093,6 +2100,31 @@ impl Coordinator {
         }
     }
 
+    /// 快捷输入历史候选的上屏（选词臂、空格臂经 `mix_select_at` 进来）。
+    ///
+    /// 已有分步上屏段时一并带上（`committed_text` + 历史文本）；记账只记历史文本本身。
+    pub(crate) fn commit_quick_history(
+        &self,
+        state: &mut State,
+        text: &str,
+        pos: i32,
+    ) -> KeyAction {
+        self.learn_quick_history(state, text);
+        self.record_commit(text, 0, pos, wind_store::stats::CommitSource::Mix);
+        self.push_commit_history(text);
+        let out = self.maybe_convert(state, &format!("{}{}", state.committed_text, text));
+        // 全半角与原文上屏同口径（回车 / 空格兜底都按 `mix_raw_counts_as_english` 转）：
+        // 否则全角态下选历史得半角、选原文得全角。不补空格——历史不是英文词。
+        let out = if self.mix_raw_counts_as_english(state) {
+            Self::mix_english_width(state, &out)
+        } else {
+            out
+        };
+        self.exit_mix_mode(state);
+        self.notify_ui_hide();
+        Self::commit_action(out, true)
+    }
+
     pub(crate) fn mix_select(&self, state: &mut State, page_offset: usize) -> KeyAction {
         let (start, end) = self.page_range(state);
         let gi = start + page_offset;
@@ -2134,6 +2166,10 @@ impl Coordinator {
             self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_mix_mode(st))
         {
             return act;
+        }
+        // 快捷输入历史候选：整体上屏，次数 +1。它没有编码，不记词频、不造词、不进分段。
+        if cand.id == crate::quick_history::QUICK_HISTORY_ID {
+            return self.commit_quick_history(state, &cand.text, pos);
         }
         // 整体上屏 vs 分步确认的**真正判据**——数字透镜的计算结果与自由输入的原文都没有
         // 可分段消费的编码，只有文本透镜（拼音/英文/码表）才做前缀分步确认。
@@ -2264,6 +2300,10 @@ impl Coordinator {
                 // 单独记历史，使「算完再按 ; 空格」能重复刚上屏的结果。
                 self.push_commit_history(&cand.text);
             }
+            // 选中的是原文（非词库词）：记进快捷输入历史。须在 `exit_mix_mode` 之前。
+            if self.mix_cand_is_literal(state, &cand) {
+                self.learn_mix_literal(state);
+            }
             // 输入统计：混合模式上屏（计算结果 code_len=0；选词用候选码长）。
             self.record_commit(
                 &cand.text,
@@ -2339,13 +2379,22 @@ impl Coordinator {
             // 刻意**不走 `finalize_candidates`**：那是词库候选里 `$AA`/`$CC` 特殊语法的展开点，
             // 而自由输入的文本是用户逐键打进来的字面内容——打了 `$AA` 就该出 `$AA`。
             let raw = state.mix_buffer.clone();
-            state.candidates = match self.mix_free_english_segment(state, &raw) {
+            let seg = match self.mix_free_english_segment(state, &raw) {
                 Some(seg) => seg,
                 None => vec![Candidate {
                     text: raw,
                     ..Default::default()
                 }],
             };
+            // 快捷输入历史在这里**置首**（理由见 `quick_history` 模块文档）：缓冲已不是
+            // 任何成员的合法编码，最可能要的是「之前打过的那串」。回车仍恒上屏原文。
+            let mut cands = self.quick_history_candidates(state, true);
+            let seg: Vec<Candidate> = seg
+                .into_iter()
+                .filter(|c| !cands.iter().any(|h| h.text == c.text))
+                .collect();
+            cands.extend(seg);
+            state.candidates = cands;
             return;
         }
         let numeric = lens == MixLens::Numeric;
@@ -2354,6 +2403,8 @@ impl Coordinator {
         let phrase_only = lens == MixLens::Phrase;
         let members = self.mix_members_resolved(state.mix_id);
         let mut cands: Vec<Candidate> = Vec::new();
+        // 已展开过的前段（遇到历史成员时切段，见该分支）；末尾再接上剩余的 `cands`。
+        let mut finalized: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         // 文本透镜：取首个**真的给出了分段**的成员方案的 preedit_display（拼音的 `ni'hao`）
         // 作组合区显示。
@@ -2451,6 +2502,20 @@ impl Coordinator {
                     if seen.insert(c.text.clone()) {
                         cands.push(c);
                     }
+                }
+            } else if member == wind_quick_input::MEMBER_HISTORY {
+                // 快捷输入历史：跨透镜（文本 / 数字 / 词组都查，缓冲当字面前缀）。
+                // 先把排在它前面的成员候选展开，再接历史——历史文本不能过
+                // `finalize_candidates`（`${x}` 会被当特殊语法改写，见 `quick_history`）。
+                let hist: Vec<Candidate> = self
+                    .quick_history_candidates(state, false)
+                    .into_iter()
+                    .filter(|c| seen.insert(c.text.clone()))
+                    .collect();
+                if !hist.is_empty() {
+                    let before = std::mem::take(&mut cands);
+                    finalized.extend(self.finalize_candidates(before, &state.mix_buffer));
+                    finalized.extend(hist);
                 }
             } else if wind_quick_input::is_quick_member(member) {
                 // quick_input.repeat：仅空缓冲时有候选（上面已 return），此处无动作。
@@ -2649,7 +2714,8 @@ impl Coordinator {
             });
         }
         // 统一展开汇聚点：混输成员词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
-        state.candidates = self.finalize_candidates(cands, &state.mix_buffer);
+        finalized.extend(self.finalize_candidates(cands, &state.mix_buffer));
+        state.candidates = finalized;
         // Emoji 扩展：与主路径同一位置（所有加工之后、简繁展开之前）。快捷输入没有自己的
         // emoji 开关，用的就是全局 `[input.emoji]`——与临拼同一条理由：没有独立开关时，
         // 临时模式应与正式方案表现一致。
@@ -2954,6 +3020,7 @@ impl Coordinator {
                 let raw_text = format!("{}{}{}", guide, state.committed_text, state.mix_buffer);
                 // 原码类上屏也进上屏历史（转换前形态、不含补的空格，同回车）；原码不记词频。
                 self.push_commit_history(&raw_text);
+                self.learn_mix_literal(state);
                 let out = self.maybe_convert(state, &raw_text);
                 // 含英文成员的实例对齐临英空格兜底（A2-3b）：全角态转全角、按临英开关
                 // 补空格。数字透镜（算式无结果）不算英文，原样上屏。
@@ -3001,6 +3068,7 @@ impl Coordinator {
                 // 原码类上屏也进上屏历史（`;` 重复上屏取得到）。记**转换前形态**（与选词出口
                 // 一致）：重复上屏时会再过一次简繁转换。原码不记词频。
                 self.push_commit_history(&raw_text);
+                self.learn_mix_literal(state);
                 let out = self.maybe_convert(state, &raw_text);
                 // 含英文成员的实例对齐临英回车（A2-3b）：全角态转全角；回车是终结性动作，
                 // 不补空格。数字透镜除外，判据与空格兜底共用 `mix_raw_counts_as_english`。
@@ -3252,7 +3320,20 @@ impl Coordinator {
                         // 重复上屏候选已由 `has_head` 排除；数字透镜无编码可记，只记历史。
                         let cand = state.candidates[idx].clone();
                         let lens = self.mix_lens(state);
-                        let code_len = if lens == MixLens::English {
+                        let is_history = cand.id == crate::quick_history::QUICK_HISTORY_ID;
+                        // 原文顶屏同样记历史（与 `mix_select_at` 同口径）。
+                        if !is_history && self.mix_cand_is_literal(state, &cand) {
+                            self.learn_mix_literal(state);
+                        }
+                        let code_len = if is_history {
+                            // 历史候选没有编码：只记历史本身，**跳过下面整条词频链**——
+                            // 它的 source 为空，`mix_freq_candidate` 会原样放行，落到活跃方案
+                            // 记一条 `(主方案, 缓冲, 历史文本)` 的垃圾词频（同 `mix_select_at`
+                            // 那道提前返回）。
+                            self.learn_quick_history(state, &cand.text);
+                            self.push_commit_history(&cand.text);
+                            0
+                        } else if lens == MixLens::English {
                             // 大写英文词：专用记账（小写化码），同 `mix_select_at`。
                             self.record_mix_english_word(state, &cand);
                             0
@@ -3330,6 +3411,7 @@ impl Coordinator {
                                     );
                                     // 原码类上屏进上屏历史（转换前形态、不含标点）；不记词频。
                                     self.push_commit_history(&raw_text);
+                                    self.learn_mix_literal(state);
                                 }
                                 let out = self.maybe_convert(state, &raw_text);
                                 // 含英文成员的实例对齐临英（A2-3b）：全角态转全角；顶屏不补空格。

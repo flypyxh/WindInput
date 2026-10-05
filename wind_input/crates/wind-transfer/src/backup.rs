@@ -444,10 +444,11 @@ pub fn restore_backup(
             }
             "completion" => {
                 if replace && cleared.insert("completion".into()) {
-                    // 两个分区都清：备份包里的这一个文件装的就是两类，只清一类会让
-                    // 另一类变成「本地残留 ∪ 包里内容」，那不是 Replace 的语义。
-                    store.clear_completions(wind_store::completion::CompletionKind::EmailSuffix)?;
-                    store.clear_completions(wind_store::completion::CompletionKind::UrlHistory)?;
+                    // 所有分区都清：备份包里的这一个文件装的就是全部类别，只清一部分会让
+                    // 其余变成「本地残留 ∪ 包里内容」，那不是 Replace 的语义。
+                    for kind in wind_store::completion::CompletionKind::ALL {
+                        store.clear_completions(kind)?;
+                    }
                 }
                 store.import_completions_jsonl(&text())?;
                 restored.push(e.path.clone());
