@@ -6263,14 +6263,16 @@ impl Coordinator {
         let t_nu = std::time::Instant::now();
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
-        // 候选序号标签有**三种**归属，旧实现是个 bool 只装得下前两种：
+        // 候选序号标签：
         //  - 数字透镜：数字键正在录表达式 → 选词改用字母标签 a/b/c
-        //  - 自由输入：字母与数字**都是**字面输入，没有任何键能按序号选 → 干脆不画序号
-        //    （画了就是骗人——用户会去按那个数字，结果把数字打进缓冲）
-        //  - 其余：正常序号
+        //  - 其余（含自由输入）：正常序号
+        //
+        // ★ 自由输入（Free 透镜）下字母与数字**都是**字面输入，没有键能按序号选——曾经因此
+        // 干脆不画序号。维护者 2026-10-07 改定为照常显示：与其它状态的候选窗外观一致，
+        // 尤其快捷输入历史在这里置首、候选一多时，序号是用户辨认「第几条」的唯一参照。
+        // 选词仍靠空格（高亮）与方向键。
         let mix_lens = matches!(state.active, Some(ModeKind::Mix(_))).then(|| self.mix_lens(state));
         let alpha = mix_lens == Some(MixLens::Numeric);
-        let hide_index = mix_lens == Some(MixLens::Free);
         // 悬停提示/候选微调配置（热重载快照）
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
@@ -6472,7 +6474,7 @@ impl Coordinator {
                     tooltip,
                     comment,
                     comment_above,
-                    no_index: hide_index,
+                    no_index: false,
                 }
             })
             .collect();

@@ -81,7 +81,7 @@ pub(crate) enum MixLens {
     ///
     /// # 为什么也不能落进 [`MixLens::Free`]
     ///
-    /// Free 下**一个选词键都没有**、候选窗连序号标签都不画（见 `hide_index`）——那正好废掉
+    /// Free 下**一个选词键都没有**（数字键是字面输入，只能靠空格 / 方向键）——那正好废掉
     /// 分词的目的：从一堆词组里精确挑一条。
     ///
     /// # 于是它自成一档
@@ -471,8 +471,8 @@ impl Coordinator {
     /// 2. [`MixLens::accepts`]：让 `'` 不算「越界字符」。
     ///
     /// 第 2 条不可省。`mix_lens` 在 `free_input = auto`（出厂值）下会因为缓冲里出现越界
-    /// 字符而切到 [`MixLens::Free`]，而 Free 透镜**一个选词键都没有**、候选窗连序号标签
-    /// 都不画（见 `hide_index`）——那正好废掉分词的目的：从一堆词组里精确挑一条。
+    /// 字符而切到 [`MixLens::Free`]，而 Free 透镜**一个选词键都没有**（数字键是字面输入）
+    /// ——那正好废掉分词的目的：从一堆词组里精确挑一条。
     /// 两处若各写一份判据，表现就是「打得进去、选不出来」，且不报任何错。
     pub(crate) fn mix_phrase_separator(&self, idx: u8) -> Option<char> {
         let rt = self.rt();
@@ -604,8 +604,8 @@ impl Coordinator {
     /// 一份表达式的话，改了一处没改另一处就会退回原样，而且同样不报错、只是静默失效。
     ///
     /// **文本透镜不受影响**（①的文本臂只收字母，`;` `'` 本就落到④）；**Free 透镜同样不问
-    /// 本谓词**——那个透镜下「没有任何选词键」是刻意设计（候选窗连序号标签都不画，见
-    /// `coordinator.rs` 的 `hide_index`），字母数字也一并作字面，单把 `;` `'` 挑出来会
+    /// 本谓词**——那个透镜下「没有任何选词键」是刻意设计（序号照画，但只作辨认用，见
+    /// `coordinator.rs` 的序号标签那段），字母数字也一并作字面，单把 `;` `'` 挑出来会
     /// 让「Free = 所见即所得」出现一个无法解释的例外。
     pub(crate) fn mix_select_keys_active(&self, idx: u8) -> bool {
         !(self.mix_free_input(idx) != FreeInputMode::Off && self.mix_takes_select_keys(idx))
@@ -2386,15 +2386,7 @@ impl Coordinator {
                     ..Default::default()
                 }],
             };
-            // 快捷输入历史在这里**置首**（理由见 `quick_history` 模块文档）：缓冲已不是
-            // 任何成员的合法编码，最可能要的是「之前打过的那串」。回车仍恒上屏原文。
-            let mut cands = self.quick_history_candidates(state, true);
-            let seg: Vec<Candidate> = seg
-                .into_iter()
-                .filter(|c| !cands.iter().any(|h| h.text == c.text))
-                .collect();
-            cands.extend(seg);
-            state.candidates = cands;
+            state.candidates = self.mix_free_with_history(state, seg);
             return;
         }
         let numeric = lens == MixLens::Numeric;

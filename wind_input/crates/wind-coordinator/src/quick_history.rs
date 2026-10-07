@@ -27,13 +27,15 @@
 //!
 //! | 透镜 | 历史的位置 |
 //! |---|---|
-//! | Free / 大写英文 | **首位**，后接原文、英文段（大小写档位键照常作用于英文段） |
+//! | Free / 大写英文 | **首位**，后接英文段；原文的去留见 `mix_free_with_history`（大小写档位键照常作用于英文段） |
 //! | 文本 / 数字 | 成员列表里它所在的位置，配额 [`QUICK_HISTORY_QUOTA`] |
 //!
 //! Free 透镜置首的理由：缓冲已不是任何成员的合法编码，最可能要的就是「之前打过的那串」；
 //! 而 Free 透镜没有数字选词键，原文占首位的话历史只能靠方向键挪过去选，置顶就落空了。
-//! 「打什么上屏什么」由回车兜底——空格上屏高亮、**回车恒上屏原文**，与网址 / 邮箱模式
-//! 同一套分工（`mode_completion.rs` 文件头）。没有历史命中时 Free 透镜的行为一字不变。
+//! 原文在组合区里本就看得见，有历史命中时通常不再单列（例外：英文词跟随临英「原文候选」，
+//! 见 `mix_free_with_history`）。「打什么上屏什么」由回车兜底——空格上屏高亮、**回车恒上屏
+//! 原文**，与网址 / 邮箱模式同一套分工（`mode_completion.rs` 文件头）。没有历史命中时 Free
+//! 透镜的候选一字不变。
 //!
 //! ⚠️ 历史候选**不经过 `finalize_candidates`**：那里会把含 `$` / `{` 的文本当词库特殊语法
 //! 展开，`${reset_time}` 会被改写甚至整条丢掉。所以在展开之后才插进去。
@@ -117,16 +119,94 @@ impl Coordinator {
             }
         };
         let want = buffer.to_lowercase();
-        rows.into_iter()
-            .filter(|(text, _)| !(skip_exact && text == buffer))
-            .filter(|(text, _)| text.to_lowercase().starts_with(&want))
-            .take(QUICK_HISTORY_QUOTA)
-            .map(|(text, _)| Candidate {
-                text,
-                id: QUICK_HISTORY_ID.to_string(),
-                ..Default::default()
-            })
-            .collect()
+        let cand = |text: String| Candidate {
+            text,
+            id: QUICK_HISTORY_ID.to_string(),
+            ..Default::default()
+        };
+        // 与缓冲逐字相同的那条（用户把一条记过的历史完整打了出来）：`skip_exact` 时不出，
+        // 否则**排首位且不占配额**——它就是原文本身，占了名额其余历史只剩 4 条。
+        let exact = !skip_exact && rows.iter().any(|(text, _)| text == buffer);
+        let mut out: Vec<Candidate> = Vec::with_capacity(QUICK_HISTORY_QUOTA + 1);
+        if exact {
+            out.push(cand(buffer.clone()));
+        }
+        out.extend(
+            rows.into_iter()
+                .filter(|(text, _)| text != buffer)
+                .filter(|(text, _)| text.to_lowercase().starts_with(&want))
+                .take(QUICK_HISTORY_QUOTA)
+                .map(|(text, _)| cand(text)),
+        );
+        out
+    }
+
+    /// Free / 大写英文透镜的候选（`seg` = 原文 + 英文段）并上历史。没有历史命中时原样返回。
+    ///
+    /// 有命中时原文怎么处理（维护者 2026-10-07 定）：
+    /// - **缓冲是英文词**（纯字母、带大写，`RESET` / `Hel`）：原文跟随临英的「原文候选」
+    ///   开关（`input.temp_english.raw_candidate`，出厂 Always）——要原文时它**排首位**、
+    ///   历史在其后，与临英「首候选是所打原文」一致；不要时去掉原文，历史置首。
+    /// - **其余**（带符号，`${re` / `RESET_TIME`）：去掉原文、历史置首。原文在组合区里本就
+    ///   看得见，回车恒上屏它；排在历史下面反而怪（实机反馈）。
+    pub(crate) fn mix_free_with_history(
+        &self,
+        state: &State,
+        seg: Vec<Candidate>,
+    ) -> Vec<Candidate> {
+        use wind_candidate::CandidateSource;
+        use wind_config::config::RawCandidateMode;
+        let hist = self.quick_history_candidates(state, false);
+        if hist.is_empty() {
+            return seg;
+        }
+        let raw = state.mix_buffer.as_str();
+        // 原文格**按位置认**：`seg` 首格恒是头部（原文）——`mix_free_english_segment` 先放
+        // 头部、去重保留首次出现。按文本认会在两处失手：头部格被同名词库词占据
+        // （`merge_head_with_dict`），以及大小写档位把它改写成 `HEL` / `hel`。
+        let keep_raw = self.mix_free_is_english_word(state) && {
+            let te = &self.rt().config.input.temp_english;
+            match te.raw_candidate {
+                RawCandidateMode::Always => true,
+                RawCandidateMode::Off => false,
+                // `show_candidates = false` 时词库没查，按 Always（同 `update_temp_english_candidates`）。
+                // 判「词库里有」不区分大小写：`seg` 已按输入大小写 / 档位投影过。
+                RawCandidateMode::InDict => {
+                    !te.show_candidates
+                        || seg.iter().any(|c| {
+                            c.source == CandidateSource::English && c.text.eq_ignore_ascii_case(raw)
+                        })
+                }
+            }
+        };
+        // 逐字相同的历史（若有）排在 `hist` 首位，它就是原文本身，不再另列原文格。
+        let exact = hist.first().is_some_and(|h| h.text == raw);
+        let raw_first = keep_raw && !exact;
+        let mut out: Vec<Candidate> = Vec::with_capacity(hist.len() + seg.len());
+        let mut rest = seg.into_iter();
+        if let Some(first) = rest.next() {
+            if raw_first {
+                out.push(first);
+                out.extend(hist);
+            } else {
+                out.extend(hist);
+                // 不单列原文时只去掉**纯原文**（来源为空）；占据头部格的同名词库词照常出
+                // ——临英关掉原文候选时词库词同样会出。
+                if first.source != CandidateSource::None
+                    && !out.iter().any(|o| o.text == first.text)
+                {
+                    out.push(first);
+                }
+            }
+        } else {
+            out.extend(hist);
+        }
+        for c in rest {
+            if !out.iter().any(|o| o.text == c.text) {
+                out.push(c);
+            }
+        }
+        out
     }
 
     /// 记一条快捷输入历史并裁剪到上限。未启用历史成员、或文本不值得记时什么也不做。

@@ -171,8 +171,8 @@ fn free_lens_puts_history_first_and_enter_keeps_raw() {
         "Free 透镜里历史应置首，实际 {texts:?}"
     );
     assert!(
-        texts.iter().any(|t| t == "${re"),
-        "原文仍在候选里: {texts:?}"
+        !texts.iter().any(|t| t == "${re"),
+        "带符号的缓冲有历史命中时不再单列原文（组合区里看得见，回车上屏它）: {texts:?}"
     );
     let act = coord.handle_key_event(&key(VK_SPACE, 0));
     assert_eq!(committed(&act).as_deref(), Some("${reset_time}"));
@@ -347,12 +347,14 @@ fn punct_top_commit_of_history_writes_no_freq() {
     }
 }
 
-/// 历史置首时大小写档位键仍然生效（改动前 Free 透镜首位恒是原文，档位键可用）。
+/// 历史置首（高亮停在历史上）时大小写档位键仍然生效（改动前 Free 透镜首位恒是原文，
+/// 档位键可用）。关掉临英「原文候选」才能让英文词缓冲的历史置首。
 #[test]
 fn case_cycle_key_still_works_when_history_is_first() {
     skip_without_data!();
     let (coord, store) = open_with("cycle", |c| {
         c.input.english_case_cycle_key = "tab".into();
+        c.input.temp_english.raw_candidate = wind_config::config::RawCandidateMode::Off;
     });
     store
         .record_completion(CompletionKind::QuickHistory, "Help_me")
@@ -371,5 +373,151 @@ fn case_cycle_key_still_works_when_history_is_first() {
         after.first().map(String::as_str),
         Some("Help_me"),
         "历史仍在首位"
+    );
+}
+
+/// 英文词缓冲（纯字母带大写）有历史命中时，原文跟随临英「原文候选」：出厂 Always ⇒
+/// 原文首位、历史紧随；关掉 ⇒ 去掉原文、历史置首。
+///
+/// 两组词：`RSTQ` 不在词库里，原文格是纯头部候选；`RESET` 在词库里，原文格被同名词库词
+/// 占据（投影成 `RESET`）——保留原文时它同样要排首位。关掉原文候选时词库词照常出（临英
+/// 同样如此），所以「不单列原文」只拿不在词库里的那组验。
+#[test]
+fn english_word_raw_follows_temp_english_raw_candidate() {
+    skip_without_data!();
+    use wind_config::config::RawCandidateMode;
+    let run = |mode: RawCandidateMode, typed: &str, hist: &str| {
+        let (coord, store) = open_with(&format!("raw_{mode:?}_{typed}"), |c| {
+            c.input.temp_english.raw_candidate = mode;
+        });
+        store
+            .record_completion(CompletionKind::QuickHistory, hist)
+            .unwrap();
+        enter_quick(&coord);
+        type_str(&coord, typed);
+        coord.debug_page_texts()
+    };
+    for (typed, hist) in [("RSTQ", "RSTQ_TIME"), ("RESET", "RESET_TIME")] {
+        let t = run(RawCandidateMode::Always, typed, hist);
+        assert_eq!(
+            t.iter().take(2).map(String::as_str).collect::<Vec<_>>(),
+            [typed, hist],
+            "Always 下原文首位、历史紧随: {t:?}"
+        );
+    }
+    let t = run(RawCandidateMode::Off, "RSTQ", "RSTQ_TIME");
+    assert_eq!(t.first().map(String::as_str), Some("RSTQ_TIME"), "{t:?}");
+    assert!(!t.iter().any(|x| x == "RSTQ"), "Off 下不单列原文: {t:?}");
+}
+
+/// 自由输入（Free 透镜）下候选窗照常显示序号（维护者 2026-10-07 定）。
+#[test]
+fn free_lens_shows_index_labels() {
+    skip_without_data!();
+    use wind_bridge::handler::CaretData;
+    use wind_ipc::protocol::caret_source;
+    use wind_ui_types::UiCommand;
+    let mut c = Config::default();
+    c.schema.available = vec!["wubi86".into(), "pinyin".into(), "english".into()];
+    c.schema.active = "wubi86".into();
+    c.input.default.chinese_mode = true;
+    let (coord, rx) = Coordinator::new_headless_with_ui(c, Some(&data_dir()));
+    enter_quick(&coord);
+    type_str(&coord, "a_b");
+    coord.handle_caret_update(&CaretData {
+        x: 100,
+        y: 200,
+        height: 20,
+        composition_start_x: 100,
+        composition_start_y: 200,
+        source: caret_source::TSF_SELECTION,
+        composition_rect: None,
+    });
+    let items = rx
+        .try_iter()
+        .filter_map(|cmd| match cmd {
+            UiCommand::UpdateCandidates { candidates, .. } => Some(candidates),
+            _ => None,
+        })
+        .last()
+        .expect("应下发候选");
+    assert!(!items.is_empty(), "前提：有候选");
+    assert!(
+        items.iter().all(|i| !i.no_index),
+        "Free 透镜下应照常显示序号: {:?}",
+        items
+            .iter()
+            .map(|i| (&i.text, i.no_index))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 把一条记过的历史完整打出来：它排首位（就是原文本身），候选不为空；其余历史仍有 5 条名额。
+#[test]
+fn typing_a_whole_history_entry_keeps_it_first() {
+    skip_without_data!();
+    let (coord, store) = open("exact", true);
+    for t in [
+        "${reset_time}",
+        "${reset_time}_a",
+        "${reset_time}_b",
+        "${reset_time}_c",
+        "${reset_time}_d",
+        "${reset_time}_e",
+    ] {
+        store
+            .record_completion(CompletionKind::QuickHistory, t)
+            .unwrap();
+    }
+    enter_quick(&coord);
+    type_str(&coord, "${reset_time}");
+    let texts = coord.debug_page_texts();
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("${reset_time}"),
+        "{texts:?}"
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.starts_with("${reset_time}_"))
+            .count(),
+        5,
+        "逐字相同的那条不占配额: {texts:?}"
+    );
+    let act = coord.handle_key_event(&key(VK_SPACE, 0));
+    assert_eq!(committed(&act).as_deref(), Some("${reset_time}"));
+    assert_eq!(count_of(&store, "${reset_time}"), 2, "按历史候选记次数");
+}
+
+/// 按大小写档位键后，原文（已被改写成别的大小写）仍按「原文候选」开关处理：Always 下
+/// 首格仍是原文那一格，不会掉到历史后面。
+#[test]
+fn raw_stays_first_after_case_cycle() {
+    skip_without_data!();
+    let (coord, store) = open_with("cycle_raw", |c| {
+        c.input.english_case_cycle_key = "tab".into();
+    });
+    store
+        .record_completion(CompletionKind::QuickHistory, "RSTQ_TIME")
+        .unwrap();
+    enter_quick(&coord);
+    type_str(&coord, "Rstq");
+    assert_eq!(
+        coord.debug_page_texts().first().map(String::as_str),
+        Some("Rstq"),
+        "前提"
+    );
+    coord.handle_key_event(&key(0x09, 0)); // Tab
+    let texts = coord.debug_page_texts();
+    let first = texts.first().cloned().unwrap_or_default();
+    assert!(
+        first.eq_ignore_ascii_case("rstq"),
+        "档位循环后首格仍应是原文（换了大小写）: {texts:?}"
+    );
+    assert_eq!(
+        texts.get(1).map(String::as_str),
+        Some("RSTQ_TIME"),
+        "{texts:?}"
     );
 }
