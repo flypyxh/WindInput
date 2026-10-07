@@ -367,6 +367,18 @@ pub mod ext_kind {
     /// 下行：问宿主（`.app` / Linux addon）状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。
     /// body 空。气泡不在屏上时不答（协调器保留旧值）。
     pub const POS_STATUS_TIP_QUERY: &str = "pos.status_tip.query";
+    /// 上行（Linux addon）：当前焦点宿主的显示环境。body = `{"caret_free":bool,"scale":1.5}`，
+    /// 两个字段都可缺省（缺省 = 不改现值）。每次焦点获得时由 addon 重报，服务重启也不会丢。
+    ///
+    /// - `caret_free`：宿主不需要也给不出光标坐标。Wayland 原生应用的光标矩形是窗口相对坐标、
+    ///   应用屏幕位置只有合成器知道，候选窗由合成器按 input popup 自己摆位（见 wind_linux 的
+    ///   WaylandPanel）——服务端再等「权威光标坐标」就是白等：首显闸门会一直压到
+    ///   [`FIRST_SHOW_LONG_FALLBACK_MS`] 长兜底才放行（实测首键后 1~2 秒）。置位后按「自绘候选的
+    ///   宿主」处理（同 `set_caret_independent`），首帧直接下发。
+    /// - `scale`：界面缩放因子（1.0 = 96dpi）。服务不链接桌面库，Linux 上的缩放只能由宿主报：
+    ///   Wayland 取输出的缩放，X11 取 `Xft.dpi / 96`。落在 `wind_ui::dpi`，所有浮层的字号与几何
+    ///   都从它派生；帧位图因此按物理像素光栅化，addon 贴图时再按同一个因子折回逻辑尺寸。
+    pub const HOST_DISPLAY: &str = "host.display";
     /// 上行（Linux addon）：请求打开自绘菜单。body =
     /// `{"target":<页内下标>|<menu_target>,"x":..,"y":..,"work":[左,上,右,下]}`——`target` ≥ 0
     /// 为该候选的右键菜单，负值见 [`super::menu_target`]（主菜单 / 状态气泡 / 悬停提示，后者

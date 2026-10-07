@@ -1,5 +1,7 @@
 #include "Codec.h"
 
+#include <cmath>
+
 #include "ExtProtocol.h"
 #include "Protocol.h"
 
@@ -245,6 +247,19 @@ Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, in
 Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y)
 {
     return encodeExtFrame(kind, "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + "}");
+}
+
+Bytes encodeHostDisplayFrame(bool caretFree, double scale)
+{
+    std::string body = std::string("{\"caret_free\":") + (caretFree ? "true" : "false");
+    if (scale > 0.0) {
+        // 两位小数足够表达 125% / 150% / 175% 这类档位；不用 std::to_string（带 locale 的小数点）。
+        const long hundredths = std::lround(scale * 100.0);
+        body += ",\"scale\":" + std::to_string(hundredths / 100) + "."
+                + (hundredths % 100 < 10 ? "0" : "") + std::to_string(hundredths % 100);
+    }
+    body += "}";
+    return encodeExtFrame(EXT_KIND_HOST_DISPLAY, body);
 }
 
 Bytes encodeMenuDismissFrame(const std::string& reason)

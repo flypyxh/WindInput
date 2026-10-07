@@ -247,6 +247,29 @@ fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
     Some((i32::try_from(x).ok()?, i32::try_from(y).ok()?))
 }
 
+/// `host.display` 的 body：两个字段各自可缺省（缺省 = 不改现值）。
+#[derive(Debug, PartialEq)]
+struct HostDisplay {
+    caret_free: Option<bool>,
+    scale: Option<f32>,
+}
+
+/// 解析 `host.display`。字段类型不对（`"caret_free":1`、`"scale":"2"`）按「缺省」处理而不是整条拒：
+/// 两个字段互相独立，一个坏了不该连累另一个；而缺省 = 不改现值，坏值不会把已有状态改回默认
+/// （那会重新引入 Wayland 下的 1~2 秒首显延迟）。整个 body 不是 JSON 对象才返回 `None`。
+fn decode_ext_host_display(body: &[u8]) -> Option<HostDisplay> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = v.as_object()?;
+    Some(HostDisplay {
+        caret_free: obj.get("caret_free").and_then(|x| x.as_bool()),
+        scale: obj
+            .get("scale")
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .filter(|x| x.is_finite() && *x > 0.0),
+    })
+}
+
 /// `shot.result` → Toast 文案。
 ///
 /// 抽成纯函数是为了可测：这里全是措辞分支，而措辞正是**必须与 Windows 侧
@@ -511,6 +534,20 @@ impl MessageHandler for Coordinator {
                     self.save_status_tip_pos(x, y);
                 }
             }
+            // Linux addon：当前焦点宿主的显示环境（光标坐标是否可用、界面缩放）。
+            ext_kind::HOST_DISPLAY => match decode_ext_host_display(body) {
+                Some(d) => {
+                    if let Some(free) = d.caret_free {
+                        self.set_caret_independent(free);
+                    }
+                    #[cfg(all(not(windows), not(target_os = "macos")))]
+                    if let Some(scale) = d.scale {
+                        wind_ui::dpi::set_host_scale(scale);
+                    }
+                    tracing::debug!("host.display: {d:?}");
+                }
+                None => tracing::warn!("host.display 载荷无法解析，忽略"),
+            },
             // 原生浮窗截图的结果（`.app` 动手，服务端只管文案）。
             ext_kind::SHOT_RESULT => match serde_json::from_slice(body) {
                 Ok(v) => {
@@ -4249,6 +4286,66 @@ mod ext_envelope_tests {
 
     fn coord() -> Arc<Coordinator> {
         Coordinator::new_headless(Config::default(), None)
+    }
+
+    #[test]
+    fn decode_ext_host_display_fields_are_independent() {
+        let d = |b: &[u8]| decode_ext_host_display(b);
+        assert_eq!(
+            d(br#"{"caret_free":true,"scale":1.5}"#),
+            Some(HostDisplay {
+                caret_free: Some(true),
+                scale: Some(1.5)
+            })
+        );
+        // 缺省 = 不改现值
+        assert_eq!(
+            d(br#"{"scale":2}"#),
+            Some(HostDisplay {
+                caret_free: None,
+                scale: Some(2.0)
+            })
+        );
+        assert_eq!(
+            d(b"{}"),
+            Some(HostDisplay {
+                caret_free: None,
+                scale: None
+            })
+        );
+        // 一个字段坏了不连累另一个
+        assert_eq!(
+            d(br#"{"caret_free":1,"scale":1.25}"#),
+            Some(HostDisplay {
+                caret_free: None,
+                scale: Some(1.25)
+            })
+        );
+        assert_eq!(
+            d(br#"{"caret_free":false,"scale":"2"}"#),
+            Some(HostDisplay {
+                caret_free: Some(false),
+                scale: None
+            })
+        );
+        // 非正数的缩放当缺省
+        assert_eq!(
+            d(br#"{"scale":0}"#),
+            Some(HostDisplay {
+                caret_free: None,
+                scale: None
+            })
+        );
+        assert_eq!(
+            d(br#"{"scale":-1}"#),
+            Some(HostDisplay {
+                caret_free: None,
+                scale: None
+            })
+        );
+        for bad in [&b""[..], b"not json", b"[1]", b"3"] {
+            assert_eq!(d(bad), None, "body={:?} 应被拒", bad);
+        }
     }
 
     #[test]

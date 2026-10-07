@@ -320,7 +320,7 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
 | M1a | Linux 真实文字后端（`wind-ui/src/text/linux`，ttf-parser + ab_glyph_rasterizer + dlopen fontconfig）；彩色 emoji（CBDT / COLR v0·v1 / OpenType-SVG，emoji 序列经 rustybuzz 整簇整形），限制见该模块头 | 进行中 |
 | M1b | Fcitx5 addon：输入通路（按键/上屏/预编辑/焦点/自愈），DBus 集成测试 | 进行中 |
 | M1c | addon 的 X11 候选窗呈现、鼠标回传；状态气泡 / Toast / tooltip 光栅浮层 | 进行中 |
-| M2 | Wayland：Fcitx5 UI addon + input popup surface；先做 spike 验证 popup 表面能否收鼠标事件 | 待做 |
+| M2 | Wayland：input popup surface（候选 / tooltip / 气泡 / Toast / 自绘菜单合成进同一 popup）+ 鼠标交互 + DPI 缩放 | 已做（treeland 真机验过；遗留见 `wind_linux/AGENTS.md` 差距表） |
 | M3a | 设置端适配：`wind-setting` Linux 原生构建、平台门控、addon 处理 `settings.open`、`.desktop` 入口、随 `.deb` 分发 | 完成（见 §6b） |
 | M3b | 自绘菜单（主菜单 / 候选右键菜单），见 §5c | 完成（X11） |
 

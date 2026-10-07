@@ -82,6 +82,17 @@ int main()
     body = extBody(encodeMenuDismissFrame("idle"), kind);
     CHECK_EQ(kind, std::string("menu.dismiss"));
     CHECK_EQ(body, std::string(R"({"reason":"idle"})"));
+    body = extBody(encodeHostDisplayFrame(true, 1.5), kind);
+    CHECK_EQ(kind, std::string("host.display"));
+    CHECK_EQ(body, std::string(R"({"caret_free":true,"scale":1.50})"));
+    body = extBody(encodeHostDisplayFrame(false, 1.0), kind);
+    CHECK_EQ(body, std::string(R"({"caret_free":false,"scale":1.00})"));
+    body = extBody(encodeHostDisplayFrame(false, 1.25), kind);
+    CHECK_EQ(body, std::string(R"({"caret_free":false,"scale":1.25})"));
+    body = extBody(encodeHostDisplayFrame(false, 1.05), kind);
+    CHECK_EQ(body, std::string(R"({"caret_free":false,"scale":1.05})"));
+    body = extBody(encodeHostDisplayFrame(true, 0.0), kind); // 不知道缩放：不带该字段
+    CHECK_EQ(body, std::string(R"({"caret_free":true})"));
 
     CASE("菜单各级的 SHM 名：_MN<级>，与 Rust overlay_shm_name 对齐");
     CHECK_EQ(overlayShmName(OVERLAY_KIND_MENU), shmName() + "_MN0");

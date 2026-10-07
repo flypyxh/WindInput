@@ -38,6 +38,7 @@
 namespace windlinux {
 
 class X11CandidatePanel;
+class WaylandCandidatePanel;
 
 /// 输入法 / addon 的「配置」：只有一项外部工具（设置程序）。Fcitx5 的配置工具（fcitx5-configtool
 /// 5.1.6 起）遇到「整页只有一个 External 项」就直接启动它，不再弹一张空白配置页；更早的版本
@@ -87,6 +88,8 @@ private:
     uint64_t clientToken(fcitx::InputContext* ic) const;
     uint64_t inputScopeMask(fcitx::InputContext* ic) const;
     void sendFocusGained(fcitx::InputContext* ic);
+    /// `host.display`：光标坐标是否可用 + 界面缩放（见 ExtProtocol.h）。
+    void sendHostDisplay(fcitx::InputContext* ic);
     void sendCaretUpdate(fcitx::InputContext* ic);
     uint16_t prevCharFor(fcitx::InputContext* ic);
     /// 修饰键单击 / CapsLock 状态通知：发一帧 eventType=UP 的 KeyEvent 并应用其响应。
@@ -108,6 +111,10 @@ private:
     /// 启动设置程序（`settings.open` 信封与状态区入口共用）。只启动自己的设置程序，args 只进参数位。
     void launchSettings(const std::vector<std::string>& args);
     fcitx::InputContext* focusedIC();
+    /// 两种候选窗都藏起来（哪一种正显示取决于上一帧的焦点 IC，藏的时候不必区分）。
+    void hideCandidate();
+    /// 收起 Wayland popup 里的全部层（候选 + 浮层）。
+    void hideAllWayland();
 
     // ── 自绘菜单 ──
     /// 请服务端打开菜单（`menu.open`）：target ≥ 0 候选右键菜单，-1 主菜单；(x, y) 锚点。
@@ -148,6 +155,11 @@ private:
     /// 自绘菜单各级的 SHM 读端（下标 = 级）。
     ShmFrameReader menuShm_[OVERLAY_MENU_LEVELS];
     std::unique_ptr<X11CandidatePanel> panel_;
+    /// Wayland 原生应用（frontend wayland_v2）的候选窗：popup surface，由合成器摆位。没有 Wayland
+    /// 支持（编译时缺 libwayland）或不在 Wayland 会话时为空。
+#ifdef WIND_HAVE_WAYLAND
+    std::unique_ptr<WaylandCandidatePanel> wlPanel_;
+#endif
     /// 「清风输入法设置」：挂进 Fcitx5 状态区（托盘菜单 / kimpanel 面板），点了打开设置程序。
     /// 主菜单不从这里进（组字时候选窗右键 / 候选菜单「更多…」）。
     fcitx::SimpleAction settingsAction_;
