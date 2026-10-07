@@ -540,7 +540,8 @@ impl MessageHandler for Coordinator {
                     if let Some(free) = d.caret_free {
                         self.set_caret_independent(free);
                     }
-                    #[cfg(all(not(windows), not(target_os = "macos")))]
+                    // wind-ui 只在 desktop-ui（桌面形态）下才是依赖；headless / Android 没有它
+                    #[cfg(all(feature = "desktop-ui", not(windows), not(target_os = "macos")))]
                     if let Some(scale) = d.scale {
                         wind_ui::dpi::set_host_scale(scale);
                     }
