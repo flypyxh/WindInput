@@ -103,6 +103,8 @@ Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, in
 Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y);
 /// 上行扩展信封 `menu.dismiss`：body = `{"reason":"…"}`（reason 只含 [a-z_]，不转义）。
 Bytes encodeMenuDismissFrame(const std::string& reason);
+/// `host.display`：当前焦点宿主的显示环境（见 ExtProtocol.h）。scale 非正 = 不带该字段。
+Bytes encodeHostDisplayFrame(bool caretFree, double scale);
 /// CMD_FRONT_CONTEXT：appLen+app + titleLen+title + selLen+sel（均 UTF-8）。
 Bytes encodeFrontContextFrame(const std::string& app, const std::string& title,
                               const std::string& sel);

@@ -9,7 +9,7 @@
 #   WIND_BUILD_ADDON   构建 Fcitx5 addon（需 Fcitx5Core 开发包）；关掉则只编纯逻辑库与单测
 #   WIND_VARIANT_DEV   编出 dev 变体（运行时目录 WindInputDev、SHM 名 /WindInputDev.<uid>）
 cmake_minimum_required(VERSION 3.16)
-project(wind_linux VERSION 0.1.0 LANGUAGES CXX)
+project(wind_linux VERSION 0.1.0 LANGUAGES C CXX)   # C：wayland-scanner 生成的协议接口表是 C 代码
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +64,46 @@ if(WIND_BUILD_ADDON)
         src/fcitx/X11Panel.cpp
     )
     target_link_libraries(windinput PRIVATE windcore Fcitx5::Core Fcitx5::Utils PkgConfig::XCB)
+
+    # Wayland 候选窗（input-method-v2 popup surface）：要 libwayland-client 与 wayland-scanner。缺任何一样就不编这一路
+    # （只剩 X11 候选窗，Wayland 原生应用里不显示）；发布构建里缺了应当是配置错误，由 verify-deb.sh 兜（见该脚本）。
+    pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
+    find_program(WAYLAND_SCANNER wayland-scanner)
+    # Fcitx5ModuleWayland 的 cmake 配置把头文件目录写死成 /usr/include，用户前缀 SDK 里对不上，
+    # 故自己找（从 Fcitx5Core 的头文件目录相对定位，系统安装时同样成立）。
+    get_target_property(FCITX_CORE_INC Fcitx5::Core INTERFACE_INCLUDE_DIRECTORIES)
+    find_path(FCITX_WAYLAND_INC wayland_public.h
+        HINTS ${FCITX_CORE_INC}/../Module/fcitx-module/wayland
+        PATH_SUFFIXES Fcitx5/Module/fcitx-module/wayland)
+    if(WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER AND FCITX_WAYLAND_INC)
+        # 协议文件随仓（MIT；input-method-v2 在 wayland-protocols 1.3x 起不再随包提供，viewporter /
+        # xdg-output 一并随仓，免得各发行版的 wayland-protocols 版本与是否安装成为构建变量）。
+        set(WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
+        file(MAKE_DIRECTORY ${WL_GEN})
+        set(WL_GEN_SRC)
+        foreach(proto input-method-unstable-v2 viewporter xdg-output-unstable-v1)
+            set(xml ${CMAKE_CURRENT_SOURCE_DIR}/protocols/${proto}.xml)
+            add_custom_command(
+                OUTPUT ${WL_GEN}/${proto}-client-protocol.h ${WL_GEN}/${proto}-protocol.c
+                COMMAND ${WAYLAND_SCANNER} client-header ${xml} ${WL_GEN}/${proto}-client-protocol.h
+                COMMAND ${WAYLAND_SCANNER} private-code ${xml} ${WL_GEN}/${proto}-protocol.c
+                DEPENDS ${xml})
+            list(APPEND WL_GEN_SRC ${WL_GEN}/${proto}-protocol.c)
+        endforeach()
+        add_library(windwlproto OBJECT ${WL_GEN_SRC})
+        set_target_properties(windwlproto PROPERTIES POSITION_INDEPENDENT_CODE ON
+            C_VISIBILITY_PRESET hidden)   # 与 Fcitx5 自己那份同名接口表互不干扰
+        target_include_directories(windwlproto PUBLIC ${WL_GEN})
+        target_link_libraries(windwlproto PUBLIC PkgConfig::WAYLAND_CLIENT)
+        target_sources(windinput PRIVATE src/fcitx/WaylandPanel.cpp $<TARGET_OBJECTS:windwlproto>)
+        target_include_directories(windinput PRIVATE ${WL_GEN} ${FCITX_WAYLAND_INC})
+        target_link_libraries(windinput PRIVATE PkgConfig::WAYLAND_CLIENT)
+        target_compile_definitions(windinput PRIVATE WIND_HAVE_WAYLAND=1)
+        message(STATUS "Wayland 候选窗：启用")
+    endif()
+    if(NOT TARGET windwlproto)
+        message(WARNING "缺 libwayland-client / wayland-scanner：不编 Wayland 候选窗")
+    endif()
     target_compile_options(windinput PRIVATE -Wall -Wextra)
     # Fcitx5 按 addon conf 的 Library= 找 `lib<name>.so`；MODULE 默认就带 lib 前缀。
     set_target_properties(windinput PROPERTIES PREFIX "lib")

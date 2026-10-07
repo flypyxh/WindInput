@@ -135,6 +135,15 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
   用于 unigram 语言模型的词频权重
 - **来源**: 腾讯 AI Lab 中文词向量数据集
 
+#### Wayland 协议描述（wind_linux/protocols/）
+
+- **用途**: Linux 版 Wayland 候选窗（输入法 popup surface）生成客户端绑定所需的协议 XML，
+  构建时由 wayland-scanner 生成代码；因发行版的 wayland-protocols 包不一定带
+  `input-method-unstable-v2`，随仓库原样收录
+- **文件**: `input-method-unstable-v2.xml`、`viewporter.xml`、`xdg-output-unstable-v1.xml`
+- **仓库**: https://gitlab.freedesktop.org/wayland/wayland-protocols
+- **许可证**: MIT（各文件头部保留原版权声明）
+
 ## 技术参考
 
 以下项目/文档作为实现参考，本项目未复制其代码：

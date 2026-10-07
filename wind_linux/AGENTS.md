@@ -315,7 +315,7 @@ forwardKey 对某类应用确实无效时才值得做，目前没有这样的证
 | 能力 | 现状 | 备注 |
 |---|---|---|
 | 候选窗显示（X11） | 已接 | 见上「候选窗（X11）」 |
-| 候选窗显示（Wayland 原生） | 未做 | 无 DISPLAY 时候选窗不显示（日志 warn 一次）。XWayland 下走 X11 路径，但 `cursorRect()` 是窗口相对坐标，位置会错 |
+| 候选窗显示（Wayland 原生） | 已接（`WaylandPanel`），treeland 真机验过 | 走 `zwp_input_method_v2` 的 popup surface，**由合成器按文本光标摆位**（客户端报的 `cursorRect()` 是窗口相对坐标，没法自己摆）。tooltip / 状态气泡 / Toast / 自绘菜单不另开窗口，与候选竖排合成进同一张位图（tooltip 按服务端落位相对候选窗摆）。鼠标：点选、翻页、滚轮、悬停、右键菜单都可用；候选之外的区域不收鼠标。缺：点菜单外不收菜单（Wayland 不能抓指针，用 Esc / 选项收）；菜单靠近屏幕下 / 右缘可能被合成器裁掉；状态气泡不能拖动、不能右键；treeland 上 Toast 收起时有纯黑（原因未明）、popup 落在任务栏处会被任务栏盖住（合成器层级）；GNOME 不支持 input-method-v2，应用走 X11 / XWayland 那条路；多显示器 / 混合缩放只近似（按候选最近进入的输出）；arm64 上未实机验 |
 | 多显示器 | 未做 | 工作区取整个根窗口，不按 RandR 显示器切分：跨屏边缘的翻转/钳制按整块虚拟屏算 |
 | HiDPI（帧 `scale>1`） | 按物理像素原样贴 | X11 没有逻辑坐标，服务端在 Linux 上目前恒发 scale=1 |
 | 候选窗拖动 / 固定位置回报（`pos.candidate` / `pos.candidate.query`） | 未接 | 服务端问位置时不答 = 保留旧值（macOS 不可见时也不答，语义安全） |
@@ -339,7 +339,8 @@ forwardKey 对某类应用确实无效时才值得做，目前没有这样的证
 | 英文输入统计（`CMD_INPUT_STATS`） | 不发 | 同 macOS |
 | 小键盘 / 符号键映射 | keysym 走 US 布局反查 | 非 US 布局的 Shift 符号键（如德语 `§`）没有 VK，透传给宿主 |
 | 彩色 emoji | 已接（服务端文字后端） | CBDT（Noto Color Emoji）、COLR v0/v1、OpenType-SVG 实测可画；肤色 / ZWJ / 国旗 / 键帽按字体 GSUB 合成一个字形。依赖系统装彩色 emoji 字体（`.deb` Recommends `fonts-noto-color-emoji`），没有时画单色字形或方框。sbix 未实测、COLR v1 扫掠渐变降级为纯色，见 `wind-ui/src/text/linux/mod.rs` 模块头 |
-| 非 X11 坐标（Wayland） | 未处理 | `cursorRect()` 在 Wayland 下是窗口相对坐标，候选窗定位要等 Wayland 阶段 |
+| 非 X11 坐标（Wayland） | 已绕开 | 不用坐标：popup surface 交给合成器摆位。XWayland 应用仍走 X11 窗口 |
+| 界面缩放（DPI） | 已接 | Wayland 取 wl_output / xdg-output（分数缩放经 wp_viewporter），X11 取 `Xft.dpi`（回退 `GDK_SCALE`）；经 `host.display` 扩展信封上报，服务端 `wind_ui::dpi::scale_for_point` 统一按它光栅化 |
 
 ## 协议同步铁律
 

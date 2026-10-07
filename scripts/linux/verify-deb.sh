@@ -52,6 +52,12 @@ for f in usr/lib/windinput/wind_input usr/lib/windinput/wind_setting \
 done
 addon="$(find "$R/usr/lib" -name libwindinput.so -path '*fcitx5*' | head -1)"
 [[ -n "$addon" ]] && ok "addon: ${addon#"$R"/}" || bad "缺 fcitx5 addon libwindinput.so"
+# Wayland 候选窗：CMake 缺 libwayland-dev / wayland-scanner 时只告警、照常出包（没有 Wayland 候选窗），
+# 在发布门禁里把它升级成硬错——否则 Wayland 会话里候选窗静默不显示。
+if [[ -n "$addon" ]]; then
+    if readelf -d "$addon" 2>/dev/null | grep -q 'libwayland-client'; then ok "addon 带 Wayland 候选窗支持"
+    else bad "addon 没链 libwayland-client（构建环境缺 libwayland-dev / libwayland-bin？）"; fi
+fi
 
 # 词库完整性（同 dev.sh verify_dist_data 的口径，只取最能说明「下载/生成失败」的几个）
 D="$R/usr/lib/windinput/data"

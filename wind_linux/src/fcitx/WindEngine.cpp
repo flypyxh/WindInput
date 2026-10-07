@@ -7,6 +7,9 @@
 #include "Protocol.h"
 #include "Utf.h"
 #include "X11Panel.h"
+#ifdef WIND_HAVE_WAYLAND
+#include "WaylandPanel.h"
+#endif
 
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/log.h>
@@ -189,6 +192,32 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
         sendAndDrain(encodePosFrame(EXT_KIND_POS_STATUS_TIP, x, y));
     };
     panel_ = std::make_unique<X11CandidatePanel>(instance_->eventLoop(), std::move(cb));
+#ifdef WIND_HAVE_WAYLAND
+    wlPanel_ = std::make_unique<WaylandCandidatePanel>(instance_);
+    {
+        WaylandCandidatePanel::Callbacks wcb;
+        wcb.select = [this](int32_t i) { sendAndDrain(encodeCandidateSelectFrame(i)); };
+        wcb.hover = [this](int32_t i) { sendAndDrain(encodeCandidateHoverFrame(i)); };
+        wcb.scroll = [this](int32_t d) { sendAndDrain(encodeCandidateScrollFrame(d)); };
+        wcb.contextMenu = [this](int32_t target, int32_t x, int32_t y) {
+            requestMenu(target, x, y);
+        };
+        wcb.menuPointer = [this](uint32_t ev, uint32_t b, int32_t x, int32_t y) {
+            // 报不上去：菜单是服务端画的，本端留着只剩一块点不动的位图，就地收掉
+            if (!sendAndDrain(encodeMenuPointerFrame(ev, b, x, y))) {
+                WIND_WARN() << "菜单指针事件报不上去，本端收起菜单";
+                wlPanel_->closeMenu();
+            }
+        };
+        wlPanel_->setCallbacks(std::move(wcb));
+    }
+    // 输出缩放变了（改系统缩放 / 换屏）：焦点正在 Wayland 应用里就重新上报，服务端下一帧起按新缩放画。
+    wlPanel_->setOnScaleChanged([this]() {
+        if (fcitx::InputContext* ic = focusedIC(); ic && WaylandCandidatePanel::handles(ic)) {
+            sendHostDisplay(ic);
+        }
+    });
+#endif
 
     settingsAction_.setShortText("清风输入法设置");
     settingsAction_.setIcon("preferences-system");
@@ -228,6 +257,9 @@ WindEngine::~WindEngine()
     keyHoldExpiry_.reset();
     // 顺序要紧：先停推送线程（之后不再有 schedule），再拆 dispatcher。
     push_.reset();
+#ifdef WIND_HAVE_WAYLAND
+    wlPanel_.reset();
+#endif
     panel_.reset();
     holdTimer_.reset();
     dispatcher_.detach();
@@ -331,8 +363,9 @@ void WindEngine::noteStall()
     }
     // 菜单不报 dismiss（没人收）；服务端的 menu_open 由恢复时的 COMPOSITION_TERMINATED 复位。
     panel_->closeMenu(nullptr);
-    panel_->hide();
+    hideCandidate();
     panel_->hideAllOverlays();
+    hideAllWayland();
     releaseHeldKeys("service_stalled");
 }
 
@@ -370,10 +403,34 @@ uint64_t WindEngine::inputScopeMask(fcitx::InputContext* ic) const
         : 0;
 }
 
+void WindEngine::sendHostDisplay(fcitx::InputContext* ic)
+{
+    // 告诉服务端当前焦点宿主的显示环境，两样都随焦点变：
+    //  · Wayland 原生应用没有可用的光标坐标（候选窗由合成器摆位）→ 别等坐标；
+    //  · 界面缩放：服务端按它光栅化（字号 / 几何都是缩放后的物理像素）。
+    // 每次获焦都重报（X11 应用报 false），免得上一个焦点的状态留在服务端；服务重启也不丢。
+    if (!ensureConnected()) {
+        return;
+    }
+    bool caretFree = false;
+    double scale = panel_->hostScale();
+#ifdef WIND_HAVE_WAYLAND
+    if (wlPanel_ && WaylandCandidatePanel::handles(ic)) {
+        caretFree = true;
+        scale = wlPanel_->scale();
+    }
+    if (wlPanel_) {
+        wlPanel_->setReportedScale(WaylandCandidatePanel::handles(ic) ? scale : 1.0);
+    }
+#endif
+    sendAndDrain(encodeHostDisplayFrame(caretFree, scale));
+}
+
 void WindEngine::sendFocusGained(fcitx::InputContext* ic)
 {
     uint64_t mask = inputScopeMask(ic);
     lastReportedSecure_ = mask != 0;
+    sendHostDisplay(ic);
     // 服务端对 FocusGained 回 MODE_PUSH（权威中英状态）：托盘图标据此对齐。
     Frame resp;
     if (ensureConnected()
@@ -680,8 +737,9 @@ void WindEngine::onPushFrame(Frame frame)
         for (auto& r : menuShm_) {
             r.close();
         }
-        panel_->hide();
+        hideCandidate();
         panel_->hideAllOverlays();
+        hideAllWayland();
         // 旧服务 hold 的键没人再来 release 了。
         releaseHeldKeys("service_ready");
         {
@@ -732,6 +790,11 @@ void WindEngine::onPushFrame(Frame frame)
         break;
     case CMD_CANDIDATE_RECTS:
         if (auto rects = decodeCandidateRects(frame.payload)) {
+#ifdef WIND_HAVE_WAYLAND
+            if (wlPanel_) {
+                wlPanel_->setRects(*rects);
+            }
+#endif
             panel_->setRects(std::move(*rects));
         }
         break;
@@ -754,7 +817,7 @@ void WindEngine::onPushFrame(Frame frame)
 void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
 {
     if (!p.visible() || p.width == 0 || p.height == 0) {
-        panel_->hide();
+        hideCandidate();
         return;
     }
     if (!shm_.isOpen() && !shm_.open(shmName())) {
@@ -771,7 +834,36 @@ void WindEngine::onRenderFrame(const HostRenderFramePayload& p)
     if (p.scale > 1) {
         WIND_DEBUG() << "候选帧 scale=" << p.scale << "：X11 下按物理像素原样贴";
     }
+#ifdef WIND_HAVE_WAYLAND
+    // Wayland 原生应用：cursorRect 是窗口相对坐标，没法自己摆；交给合成器按 popup surface 摆位。
+    if (wlPanel_ && WaylandCandidatePanel::handles(focusedIC())) {
+        panel_->hide();
+        wlPanel_->show(focusedIC(), f);
+        return;
+    }
+    wlPanel_->hide();
+#endif
     panel_->show(f, f.screenX, f.screenY, (p.flags & FRAME_FLAG_ABSOLUTE_POS) != 0);
+}
+
+void WindEngine::hideAllWayland()
+{
+#ifdef WIND_HAVE_WAYLAND
+    if (wlPanel_) {
+        wlPanel_->closeMenu();
+        wlPanel_->hideAll();
+    }
+#endif
+}
+
+void WindEngine::hideCandidate()
+{
+    panel_->hide();
+#ifdef WIND_HAVE_WAYLAND
+    if (wlPanel_) {
+        wlPanel_->hide();
+    }
+#endif
 }
 
 void WindEngine::onExt(const ExtEnvelope& ext)
@@ -826,6 +918,11 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
     }
     if (!p.visible() || p.width == 0 || p.height == 0) {
         panel_->hideOverlay(p.kind);
+#ifdef WIND_HAVE_WAYLAND
+        if (wlPanel_) {
+            wlPanel_->hideOverlay(p.kind);
+        }
+#endif
         return;
     }
     ShmFrameReader& shm = overlayShm_[p.kind - 1];
@@ -839,6 +936,15 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
         WIND_DEBUG() << "浮层 kind=" << p.kind << " seq=" << p.seq << " 读取失败或为空";
         return;
     }
+#ifdef WIND_HAVE_WAYLAND
+    // Wayland 原生应用：浮层的屏幕坐标没有意义，并进 popup 与候选一起由合成器摆位。
+    if (wlPanel_ && WaylandCandidatePanel::handles(focusedIC())) {
+        panel_->hideOverlay(p.kind);
+        wlPanel_->showOverlay(focusedIC(), p.kind, f, p);
+        return;
+    }
+    wlPanel_->hideOverlay(p.kind);
+#endif
     panel_->showOverlay(p.kind, f, p);
 }
 
@@ -846,6 +952,11 @@ void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
 {
     if (!p.visible() || p.width == 0 || p.height == 0) {
         panel_->hideMenuLevel(level);
+#ifdef WIND_HAVE_WAYLAND
+        if (wlPanel_) {
+            wlPanel_->hideMenuLevel(level);
+        }
+#endif
         return;
     }
     ShmFrameReader& shm = menuShm_[level];
@@ -859,6 +970,13 @@ void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
         WIND_DEBUG() << "菜单第 " << level << " 级 seq=" << p.seq << " 读取失败或为空";
         return;
     }
+#ifdef WIND_HAVE_WAYLAND
+    if (wlPanel_ && WaylandCandidatePanel::handles(focusedIC())) {
+        panel_->hideMenuLevel(level);
+        wlPanel_->showMenuLevel(focusedIC(), level, f, p);
+        return;
+    }
+#endif
     panel_->showMenuLevel(level, f, p);
 }
 
@@ -1050,6 +1168,12 @@ void WindEngine::requestMenu(int32_t target, int32_t x, int32_t y)
 {
     // 工作区随请求报上去：菜单的翻转 / 子菜单左右展开在服务端做，屏幕几何只有这边拿得到。
     Rect wa = panel_->screenWorkArea().value_or(Rect{});
+#ifdef WIND_HAVE_WAYLAND
+    // Wayland 应用：x y 是 popup 位图里的坐标，工作区也在这套坐标系里
+    if (wlPanel_ && WaylandCandidatePanel::handles(focusedIC())) {
+        wa = wlPanel_->virtualWorkArea();
+    }
+#endif
     WIND_DEBUG() << "请求打开菜单 target=" << target << " @(" << x << "," << y << ")";
     sendAndDrain(encodeMenuOpenFrame(target, x, y, wa.x, wa.y, wa.x + wa.w, wa.y + wa.h));
 }

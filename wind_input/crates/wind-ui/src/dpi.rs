@@ -56,9 +56,57 @@ pub fn scale_for_point(x: i32, y: i32) -> f32 {
     1.0
 }
 
+/// Linux 等：服务不链接任何桌面库，缩放由宿主（Fcitx5 addon）按当前焦点所在的显示环境
+/// 上报（`host.display` 扩展信封），这里只存最新值。**不分显示器**：addon 已按焦点 / 候选窗所在
+/// 的输出取好那一个，服务端无从也无需再按点查。未上报过按 1.0（等同旧行为）。
+#[cfg(all(not(windows), not(target_os = "macos")))]
+mod host_scale {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 缩放因子的 f32 位模式。原子量而非锁：渲染线程每帧都读，上报在 IPC 线程写。
+    static BITS: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
+
+    /// 合法范围。下限 1.0：Xft.dpi=72 之类不该把界面缩小到比设计尺寸还小；上限 4.0 防坏值把
+    /// 位图撑爆（候选帧宽高另有 16384 的硬上限，这里只是别让一个坏数字先走到那一步）。
+    pub const MIN: f32 = 1.0;
+    pub const MAX: f32 = 4.0;
+
+    pub fn set(scale: f32) {
+        if scale.is_finite() {
+            BITS.store(scale.clamp(MIN, MAX).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn get() -> f32 {
+        f32::from_bits(BITS.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub use host_scale::set as set_host_scale;
+
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn scale_for_point(_x: i32, _y: i32) -> f32 {
-    1.0
+    host_scale::get()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(test)]
+mod host_scale_tests {
+    use super::*;
+
+    #[test]
+    fn host_scale_is_clamped_and_ignores_garbage() {
+        set_host_scale(1.5);
+        assert_eq!(scale_for_point(0, 0), 1.5);
+        set_host_scale(0.75);
+        assert_eq!(scale_for_point(0, 0), 1.0, "下限 1.0");
+        set_host_scale(99.0);
+        assert_eq!(scale_for_point(0, 0), 4.0, "上限 4.0");
+        set_host_scale(f32::NAN);
+        assert_eq!(scale_for_point(0, 0), 4.0, "NaN 不改现值");
+        set_host_scale(1.0); // 全局量：别把状态留给同进程的其他测试
+    }
 }
 
 #[cfg(target_os = "macos")]

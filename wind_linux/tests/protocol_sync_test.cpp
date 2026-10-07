@@ -148,6 +148,7 @@ int main()
     CHECK_EQ(rustStr("MENU_OPEN"), std::string(windlinux::EXT_KIND_MENU_OPEN));
     CHECK_EQ(rustStr("MENU_DISMISS"), std::string(windlinux::EXT_KIND_MENU_DISMISS));
     CHECK_EQ(rustStr("POS_STATUS_TIP"), std::string(windlinux::EXT_KIND_POS_STATUS_TIP));
+    CHECK_EQ(rustStr("HOST_DISPLAY"), std::string(windlinux::EXT_KIND_HOST_DISPLAY));
     CHECK_EQ(rustStr("POS_STATUS_TIP_QUERY"),
              std::string(windlinux::EXT_KIND_POS_STATUS_TIP_QUERY));
 
