@@ -1518,9 +1518,19 @@ impl Coordinator {
         };
         let Some(freq_cand) = freq_cand else {
             self.push_commit_history(&cand.text);
+            // 纯原文（不是词库词）：英文自动造词的信号（开关与判据都在 `learn_english_raw` 里）。
+            self.learn_temp_english_raw(state, &cand.text);
             return;
         };
         let code = state.temp_english_buffer.to_lowercase();
+        // 选中英文临时词（自动造的词）：推进晋升计数，与英文方案主路同一函数。
+        // 码取**候选自己的全码**（`cand_code`），不是缓冲：打前缀 `immo` 补出 `Immortalwrt`
+        // 再选，临时词记在全码 `immortalwrt` 下；英文引擎不填 `store_code`，拿缓冲去点查
+        // 永远查不到，「打前缀补出来再选」这条最常见的用法就永远晋升不了。
+        if freq_cand.meta.is_temp_dict {
+            let full = Self::cand_code(&code, freq_cand);
+            self.bump_selected_temp_word(ENGLISH_SCHEMA, freq_cand, &full, None);
+        }
         // ★ 词频记 `freq_text()` 而非 `text`：候选可能已被大小写投影改写过，而读端
         // `apply_freq_rerank_in` 排在投影之前、看到的是词库原文。存投影后的形态 ⇒
         // 写 `Hill`、读 `hill`，两端永不相交，英文词频整体静默失效。
@@ -1665,6 +1675,7 @@ impl Coordinator {
                     let text = state.temp_english_buffer.clone();
                     // 原码类上屏也进上屏历史（转换前形态、不含补的空格，同回车）。
                     self.push_commit_history(&text);
+                    self.learn_temp_english_raw(state, &text);
                     let sp = self.english_space_enabled_in(state);
                     commit_text(self, state, text, sp)
                 }
@@ -1703,6 +1714,7 @@ impl Coordinator {
                     // 全角由上屏时再转）。空缓冲上屏的是触发键字符，不记。
                     let raw = state.temp_english_buffer.clone();
                     self.push_commit_history(&raw);
+                    self.learn_temp_english_raw(state, &raw);
                     raw
                 };
                 commit_text(self, state, text, false)
@@ -1865,6 +1877,7 @@ impl Coordinator {
                             PunctEmptyCodePolicy::Commit => {
                                 // 顶掉原文：原码类上屏也进上屏历史（转换前形态、不含标点）。
                                 self.push_commit_history(&state.temp_english_buffer);
+                                self.learn_temp_english_raw(state, &state.temp_english_buffer);
                                 state.temp_english_buffer.clone()
                             }
                         }

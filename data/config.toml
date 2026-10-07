@@ -467,6 +467,18 @@ case_follow_input = true
 #     [input.temp_english] phrase_seg。
 phrase_seg = false
 
+# 英文自动造词：上屏了词库里没有的原文（选中原文候选、回车 / 空格上屏原码、标点顶屏原文）
+# 就记一条。**一个开关管英文方案与临时英文**——两者共用同一套词库，造出的词两边都查得到；
+# 临时英文不另设开关（同临时拼音跟随 [schema.pinyin.auto_learn]）。快捷输入里的英文不在此列，
+# 那里的原文进「快捷输入历史」。
+# 先进临时词库（有上限、会淘汰，拼错一次不会永久留下），累计使用 promote_count 次后晋升
+# 用户词库；0 = 不晋升。
+[schema.english.auto_learn]
+enabled = false
+promote_count = 3
+# 英文临时词库条目上限（0 = 不限），超出按「用得最少、造得最早」淘汰。
+temp_max_entries = 5000
+
 # 英文调频。**没有 protect_top_n***：那组是「简码位首选保护」，判据是本次输入的码长，
 # 而英文没有简码位——一个 a 后面跟的是几万个词而不是钦定首选，照搬只会锁死前几位。
 [schema.english.frequency]

@@ -966,6 +966,9 @@ pub struct EnglishGlobal {
     /// 真正的备选是 `.`（t153 想拿它作模糊万能键），两者将来要一起定，那时再谈可配。
     #[serde(default)]
     pub phrase_seg: bool,
+    /// 英文自动造词（[schema.english.auto_learn]）。见 [`EnglishAutoLearn`]。
+    #[serde(default)]
+    pub auto_learn: EnglishAutoLearn,
 }
 
 impl Default for EnglishGlobal {
@@ -977,6 +980,54 @@ impl Default for EnglishGlobal {
             case_variants: false,
             case_follow_input: true,
             phrase_seg: false,
+            auto_learn: EnglishAutoLearn::default(),
+        }
+    }
+}
+
+/// 英文自动造词（[schema.english.auto_learn]，GH#136 / C1-11 子项 1）。
+///
+/// **一个开关管英文方案与临时英文两处**：两者共用 schema id `english` 与同一套用户 /
+/// 临时词库，造出来的词两边都查得到。与临时拼音跟随 `[schema.pinyin.auto_learn]`、自己
+/// 不另设开关同一口径（维护者 2026-10-07 定）。快捷输入里的英文不在此列：那里的原文进
+/// 快捷输入历史（`quick_input.history`）。
+///
+/// 造词信号是**上屏了词库里没有的原文**——选中原文候选、回车 / 空格上屏原码、标点顶屏
+/// 原文。造词与词频互不相干：造完它就是词库原文，此后按词库词记词频。
+///
+/// 词走**两跳**，与码表 / 拼音的自动造词同构：先进临时词库（有条数上限、会淘汰，拼错一次
+/// 不会永久留下），累计使用 `promote_count` 次后晋升用户词库。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnglishAutoLearn {
+    /// 总开关，出厂关。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 临时词晋升进用户词库所需使用次数（含造词那一次）。**0 = 不晋升**，一直留在临时词库。
+    ///
+    /// L1 与 L2 同值（3），见 [`EnglishGlobal`] 文档里的 §R4——不学码表那份「L1 零值、L2 出厂 3」
+    /// 的分叉。
+    #[serde(default = "default_english_promote_count")]
+    pub promote_count: usize,
+    /// 英文临时词库条目上限（0 = 不限）。超出后按「用得最少、造得最早」淘汰。内部字段，
+    /// 设置页不开放。与码表那份分开：英文与码表的临时词各在自己的 schema 分区里淘汰。
+    #[serde(default = "default_english_temp_max_entries")]
+    pub temp_max_entries: usize,
+}
+
+fn default_english_promote_count() -> usize {
+    3
+}
+
+fn default_english_temp_max_entries() -> usize {
+    5000
+}
+
+impl Default for EnglishAutoLearn {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            promote_count: default_english_promote_count(),
+            temp_max_entries: default_english_temp_max_entries(),
         }
     }
 }

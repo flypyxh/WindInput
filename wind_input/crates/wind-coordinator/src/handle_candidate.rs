@@ -486,6 +486,9 @@ impl Coordinator {
                 return self.record_selection_cand_in(None, &freq_code, &word);
             }
             self.push_commit_history(&cand.text);
+            // 头部候选找不到词库词：英文自动造词的信号。`english_head_dict_word` 在调频关着时
+            // 恒 None，所以「是不是词库词」由 `learn_english_raw` 自己再问一遍引擎。
+            self.learn_english_raw(&active, &cand.text);
             return;
         }
         self.record_selection_cand_in(None, code, cand)

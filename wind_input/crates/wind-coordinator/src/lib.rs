@@ -21,6 +21,7 @@ pub mod edit_ops;
 #[cfg(test)]
 mod email_mode_tests;
 pub(crate) mod english_candidates;
+pub(crate) mod english_learn;
 #[cfg(test)]
 mod freq_learn_tests;
 pub mod handle_addword;

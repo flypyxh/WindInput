@@ -1605,6 +1605,10 @@ impl MessageHandler for Coordinator {
                     let mut text = self.maybe_convert(&state, &raw_text);
                     // 原码类上屏也进上屏历史（转换前形态、不含下面补的空格，同回车）。
                     self.push_commit_history(&raw_text);
+                    // 英文方案上屏原码 = 词库里没有的原文：英文自动造词的信号。
+                    if prefix.is_empty() && self.engine_mgr.active_is_english() {
+                        self.learn_english_raw(&self.engine_mgr.active_schema_id(), &raw_code);
+                    }
                     // 英文补空格（`schema.english.commit_space`）：本分支上屏的是**输入缓冲
                     // 原码**（词库里没有的自造词），无候选可依，故用方案口径
                     // `english_space_enabled_in`（语境口径）而非候选口径。与选中候选补空格一致——两者都是
@@ -1680,6 +1684,10 @@ impl MessageHandler for Coordinator {
                     // 原码类上屏也进上屏历史（`;` 重复上屏取得到）。记**转换前形态**（与选词
                     // 出口一致）：重复上屏时会再过一次简繁转换。原码不是词库词，不记词频。
                     self.push_commit_history(&raw_text);
+                    // 英文方案回车上屏原码：英文自动造词的信号（回车是英文里最常用的「上屏原文」）。
+                    if prefix.is_empty() && self.engine_mgr.active_is_english() {
+                        self.learn_english_raw(&self.engine_mgr.active_schema_id(), &raw_code);
+                    }
                     state.input_buffer.clear();
                     state.input_buffer_cased.clear();
                     state.candidates.clear();
@@ -2155,6 +2163,12 @@ impl MessageHandler for Coordinator {
                                 );
                                 // 原码类上屏进上屏历史（转换前形态、不含标点，同回车）。
                                 self.push_commit_history(&format!("{committed}{raw}"));
+                                if committed.is_empty() && self.engine_mgr.active_is_english() {
+                                    self.learn_english_raw(
+                                        &self.engine_mgr.active_schema_id(),
+                                        raw,
+                                    );
+                                }
                                 // 输入统计同回车上屏原码：只记本次上屏的原码（已转换前缀选词时已记过），
                                 // 标点在下面另记一笔。此前只记了标点，原码在统计里消失。
                                 self.record_commit(
@@ -2262,6 +2276,9 @@ impl MessageHandler for Coordinator {
                         );
                         // 原码类上屏进上屏历史（转换前形态、不含标点，同回车）。
                         self.push_commit_history(&format!("{committed}{raw}"));
+                        if committed.is_empty() && self.engine_mgr.active_is_english() {
+                            self.learn_english_raw(&self.engine_mgr.active_schema_id(), raw);
+                        }
                         // 输入统计同回车上屏原码：只记本次上屏的原码（已转换前缀选词时已记过），
                         // 标点在下面另记一笔。此前只记了标点，原码在统计里消失。
                         self.record_commit(raw, raw.len() as u32, -1, CommitSource::RawInput);

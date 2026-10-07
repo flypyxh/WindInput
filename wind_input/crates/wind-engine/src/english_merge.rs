@@ -221,14 +221,25 @@ pub fn lookup_prefix_fallback(
 /// 「对方确有候选」，只看开关就禁上屏会把「英文被顶掉」修成「谁都上不了屏」）。
 ///
 /// ⚠️ **仍按前缀判**，不复用 [`lookup`] 的精确收窄——理由见该函数文档「与 has_any 的判据
-/// 刻意不同」。只问有无，故只取 1 条。
+/// 刻意不同」。
+///
+/// **英文临时词不算**（2026-10-08 起英文引擎挂了临时词层，见 `[schema.english.auto_learn]`）：
+/// 临时词是自动造词的暂存区，在英文方案里误打一次 `ggll` 就会进去；让它否决五笔四码自动
+/// 上屏，等于一次误操作永久改了主方案的上屏行为。用户词（含已晋升的）照算。临时词排在
+/// 同档系统词之前（层级基序 Temp < System），故多取几条再筛；取满仍全是临时词则按「没有」
+/// 处理——宁可放行上屏，不误否决。
 pub fn has_any(english: &dyn Engine, input: &str, min_length: usize) -> bool {
+    /// 筛掉临时词后仍要有一条：取数上限。
+    const PROBE: usize = 8;
     if input.chars().count() < min_length_or_default(min_length) {
         return false;
     }
     let lower = input.to_lowercase();
-    match english.convert(&lower, 1) {
-        Ok(r) => !r.candidates.is_empty(),
+    match english.convert(&lower, PROBE) {
+        Ok(r) => r
+            .candidates
+            .iter()
+            .any(|c| !c.meta.is_temp_dict || c.meta.is_user_dict),
         Err(_) => false,
     }
 }
@@ -386,6 +397,55 @@ mod tests {
         );
         // 短输入门槛对否决同样生效。
         assert!(!has_any(&eng, "gi", 0), "两字母不该触发否决");
+    }
+
+    /// 英文临时词（自动造词的暂存区）不参与上屏否决：只有临时词命中时按「没有英文候选」
+    /// 处理，五笔四码照常自动上屏；临时词与用户词合并的（已晋升 / 手工加过）仍算。
+    #[test]
+    fn veto_ignores_temp_words() {
+        struct Flags(Vec<(&'static str, bool, bool)>); // (code, is_temp, is_user)
+        impl Engine for Flags {
+            fn convert(&self, input: &str, max: usize) -> anyhow::Result<ConvertResult> {
+                let candidates = self
+                    .0
+                    .iter()
+                    .filter(|(c, _, _)| c.starts_with(input))
+                    .take(max)
+                    .map(|(c, t, u)| {
+                        let mut cand = Candidate {
+                            text: (*c).into(),
+                            code: (*c).into(),
+                            source: CandidateSource::English,
+                            ..Default::default()
+                        };
+                        cand.meta.is_temp_dict = *t;
+                        cand.meta.is_user_dict = *u;
+                        cand
+                    })
+                    .collect();
+                Ok(ConvertResult {
+                    candidates,
+                    ..Default::default()
+                })
+            }
+            fn reset(&self) {}
+            fn engine_type(&self) -> EngineType {
+                EngineType::English
+            }
+        }
+        assert!(!has_any(&Flags(vec![("ggll", true, false)]), "ggll", 0));
+        assert!(
+            has_any(&Flags(vec![("ggll", true, true)]), "ggll", 0),
+            "已入用户词库的照算"
+        );
+        assert!(
+            has_any(
+                &Flags(vec![("ggllx", true, false), ("ggllz", false, false)]),
+                "ggll",
+                0
+            ),
+            "临时词排在前面也要看得到后面的系统词"
+        );
     }
 
     /// 精确命中清掉 `is_exact_code`：那是码表域标志，跨来源带进拼音列表会让英文

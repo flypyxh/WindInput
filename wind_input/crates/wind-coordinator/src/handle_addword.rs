@@ -347,14 +347,19 @@ impl Coordinator {
 
     /// 临时词库上限淘汰。按写入次数节流——每次造词都全表扫描代价过高，而上限本身
     /// 是软约束（略微超出无害）。`max_entries = 0` 视为不限。
-    fn maybe_evict_temp(&self, store: &wind_store::Store, schema: &str) {
-        let max = self
-            .rt()
-            .config
-            .schema
-            .codetable
-            .auto_phrase
-            .temp_max_entries;
+    ///
+    /// 上限按数据域取：英文类方案读 `schema.english.auto_learn.temp_max_entries`，
+    /// 其余沿用码表那份——两者各在自己的 schema 分区里淘汰，互不相干。
+    pub(crate) fn maybe_evict_temp(&self, store: &wind_store::Store, schema: &str) {
+        let english = self.is_english_data_schema(schema);
+        let max = {
+            let rt = self.rt();
+            if english {
+                rt.config.schema.english.auto_learn.temp_max_entries
+            } else {
+                rt.config.schema.codetable.auto_phrase.temp_max_entries
+            }
+        };
         if max == 0 {
             return;
         }
@@ -718,11 +723,20 @@ impl Coordinator {
         let hit = self
             .engine_mgr
             .write_data_schema_id(owner, cand.source)
+            // 英文只认**真从临时词库出来的**候选：原文格（头部候选）选中时，英文自动造词
+            // 刚把它写进临时词库，这里再按文本点查就会命中刚写的那条、同一次上屏记两次。
+            // 拼音 / 码表的「造词后再推」由 `learned_code` 去重，英文造词不经那条路。
+            .filter(|schema| cand.meta.is_temp_dict || !self.is_english_data_schema(schema))
             .and_then(|schema| {
                 [cand.meta.store_code.as_deref(), Some(code)]
                     .into_iter()
                     .flatten()
-                    .find(|c| matches!(store.get_temp_word(&schema, c, &cand.text), Ok(Some(_))))
+                    .find(|c| {
+                        matches!(
+                            store.get_temp_word(&schema, c, cand.freq_text()),
+                            Ok(Some(_))
+                        )
+                    })
                     .map(|c| (schema, c.to_string()))
             });
         let Some((schema, temp_code)) = hit else {
@@ -742,6 +756,9 @@ impl Coordinator {
         };
         let promote_count = if schema == wind_engine::manager::PINYIN_DATA_SCHEMA {
             self.engine_mgr.auto_learn_settings().promote_count
+        } else if self.is_english_data_schema(&schema) {
+            // 英文临时词（自动造词）的晋升阈值在英文那份配置里；落到下面码表那份就是读错桶。
+            self.rt().config.schema.english.auto_learn.promote_count
         } else {
             self.engine_mgr
                 .codetable_settings()
@@ -750,14 +767,13 @@ impl Coordinator {
         };
         // 选中已存在的临时词：learn_temp_word 内部沿用旧 boundary，仅当旧值为 0
         // （v1 遗留/无信息）时用上面算出的边界补上。
-        if let Ok(count) = store.learn_temp_word(
-            &schema,
-            &temp_code,
-            &cand.text,
-            LEARN_ADD_WEIGHT,
-            temp_boundary,
-        ) {
-            self.maybe_promote_temp(store, &schema, &temp_code, &cand.text, count, promote_count);
+        // 文本取投影前的原形（`freq_text`）：英文候选会按输入大小写投影（打 `IMM` 显示成
+        // `IMMORTALWRT`），而临时词库里存的是 `Immortalwrt`。拼音 / 码表候选不投影，两者相同。
+        let text = cand.freq_text();
+        if let Ok(count) =
+            store.learn_temp_word(&schema, &temp_code, text, LEARN_ADD_WEIGHT, temp_boundary)
+        {
+            self.maybe_promote_temp(store, &schema, &temp_code, text, count, promote_count);
         }
     }
 

@@ -5633,13 +5633,19 @@ impl EngineManager {
             // 归属 `schema_id`（即 "english"），与 `data_schema_id` 对英文的返回值一致；
             // 读写不同源的话，加进去的词永远查不出来。
             //
-            // **刻意不挂临时词层**：临时词库是「自动造词的暂存区」，条目由连续上屏推导而来、
-            // 攒够次数才晋升用户词库。英文没有造词流程，挂上去只会是一张永远空的表，
-            // 却让每次查询多走一层。
+            // 临时词层：英文自动造词（`[schema.english.auto_learn]`，2026-10-07 起）的暂存区——
+            // 上屏了词库里没有的原文就记一条，攒够次数晋升用户词库。挂法同码表分支。
+            // ⚠️ 这是**共享**英文引擎：临英与快捷输入 / 混输里的英文成员同样看得到临时词
+            // （拼音 / 码表混英文的上屏否决 `english_merge::has_any` 刻意不算临时词）。
+            // 开关从没开过时这张表是空的；开过再关，已造的临时词仍在、仍可选用。
             //
-            // 注册顺序 User → System 与码表分支一致（用户词在前）。
+            // 注册顺序 User → Temp → System 与码表分支一致（用户词在前）。
             if let Some(store) = &store {
                 dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                    store.clone(),
+                    schema_id,
+                )));
+                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
                     store.clone(),
                     schema_id,
                 )));
