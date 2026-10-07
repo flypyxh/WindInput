@@ -6648,7 +6648,17 @@ impl Coordinator {
         // 无词库落点（无独立归属的 overlay / 空码浏览态）：整页全禁，只留复制——与 Windows 侧
         // `show_candidate_menu` 的「仅复制」分支同一判据（见 `candidate_op_scope`）。
         let Some(scope) = self.candidate_op_scope(state) else {
-            let flags = vec![0x1Fu8; end.min(total).saturating_sub(start)];
+            // 快捷输入历史候选例外：只放开「删除」（0x08），与 Windows 右键「删除此历史」同源。
+            let flags: Vec<u8> = state.candidates[start..end.min(total)]
+                .iter()
+                .map(|c| {
+                    if c.id == crate::quick_history::QUICK_HISTORY_ID {
+                        0x1F & !0x08
+                    } else {
+                        0x1F
+                    }
+                })
+                .collect();
             self.push_server
                 .push_to_active(&wind_ipc::codec::encode_candidate_menu_flags(&flags));
             return;

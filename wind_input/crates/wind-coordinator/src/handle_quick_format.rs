@@ -216,10 +216,21 @@ impl Coordinator {
         op: wind_ui_types::CandidateOp,
         page_local: usize,
     ) {
-        let scope = {
+        let (scope, history) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            self.quick_format_scope(&state, page_local)
+            (
+                self.quick_format_scope(&state, page_local),
+                self.quick_history_at(&state, page_local),
+            )
         };
+        // 快捷输入历史候选：只有「删除」有语义（它没有位置可调，也不在任何词库里）。
+        // 判据与菜单构造侧同源（`quick_history_at`），其余动作原样忽略。
+        if let Some(text) = history {
+            if op == wind_ui_types::CandidateOp::Delete {
+                self.delete_quick_history(&text);
+            }
+            return;
+        }
         let Some(scope) = scope else {
             return self.candidate_op(op, page_local);
         };

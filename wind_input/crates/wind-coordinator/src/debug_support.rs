@@ -18,6 +18,20 @@ impl Coordinator {
         self.engine_mgr.available_schemas()
     }
 
+    /// 点击一个菜单项（测试/诊断用）：经 [`Coordinator::handle_ui_event`] 派发
+    /// `UiEvent::MenuAction`，与 UI 线程回传点击同一入口——菜单项的 kind 与「打开时记下的
+    /// 目标下标」那段接线都在这条路上。
+    pub fn debug_menu_action(&self, kind: wind_ui_types::MenuKind) {
+        self.handle_ui_event(UiEvent::MenuAction(kind));
+    }
+
+    /// 弹出候选右键菜单（测试/诊断用）：直通生产入口 [`Self::show_candidate_menu`]，菜单项经
+    /// UI 通道下发（`UiCommand::ShowCandidateMenu`）。Windows / macOS 的右键由 UI 线程触发、
+    /// Linux 的入口 `menu.open` 只在 `ext_presenter` 构建里编译，集成测试都够不着。
+    pub fn debug_show_candidate_menu(&self, page_local: usize) {
+        self.show_candidate_menu(page_local, 0, 0);
+    }
+
     /// 某个 mix 实例**实际生效的成员方案**（测试/诊断用）：[`Self::mix_members`] 的直通，
     /// 不另算一遍（另算一遍的 debug 方法证明不了生产路径接对了）。
     ///

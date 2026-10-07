@@ -4769,17 +4769,21 @@ impl Coordinator {
         // 门控：中文态 + 有候选 + 有词库落点。落点判定交给 `candidate_op_scope`，与右键菜单
         // 同源——此前这里写的是 `state.active.is_some()` 整类屏蔽，于是特殊模式接上词库管理
         // 之后，右键能删而热键仍然无效（同一能力的两条通路各判各的）。
+        //
+        // 快捷输入历史候选没有词库落点（混输下 scope 恒 None），但右键能删它——热键也得能删，
+        // 判据与右键同源（`quick_history_at`），分发也走同一个 `candidate_or_quick_format_op`。
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if !state.chinese_mode
                 || state.candidates.is_empty()
-                || self.candidate_op_scope(&state).is_none()
+                || (self.candidate_op_scope(&state).is_none()
+                    && self.quick_history_at(&state, num - 1).is_none())
             {
                 return None;
             }
         }
-        // candidate_op 自行重新加锁并做页范围/来源分流校验。
-        self.candidate_op(op, num - 1);
+        // 分发自行重新加锁并做页范围/来源分流校验。
+        self.candidate_or_quick_format_op(op, num - 1);
         Some(KeyAction::Consumed)
     }
 

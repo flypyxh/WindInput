@@ -521,3 +521,87 @@ fn raw_stays_first_after_case_cycle() {
         "{texts:?}"
     );
 }
+
+/// 右键历史候选：菜单只有「删除此历史」与复制；点删除后这条从库里消失、候选立即刷新。
+#[test]
+fn right_click_deletes_a_history_entry() {
+    skip_without_data!();
+    use wind_ui_types::UiCommand;
+    let user_dir = std::env::temp_dir().join(format!("wind_qh_menu_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&user_dir);
+    std::fs::create_dir_all(&user_dir).unwrap();
+    let mut c = Config::default();
+    c.schema.available = vec!["wubi86".into(), "pinyin".into(), "english".into()];
+    c.schema.active = "wubi86".into();
+    c.input.default.chinese_mode = true;
+    c.schema.mix_modes[0]
+        .members
+        .push(wind_quick_input::MEMBER_HISTORY.to_string());
+    let (coord, rx) = Coordinator::new_headless_with_ui_at(c, Some(&data_dir()), Some(&user_dir));
+
+    enter_quick(&coord);
+    type_str(&coord, "RESET_TIME");
+    coord.handle_key_event(&key(VK_RETURN, 0));
+    enter_quick(&coord);
+    type_str(&coord, "RESET_");
+    assert_eq!(
+        coord.debug_page_texts().first().map(String::as_str),
+        Some("RESET_TIME"),
+        "前提：历史已记下并置首"
+    );
+
+    let _ = rx.try_iter().count();
+    coord.debug_show_candidate_menu(0);
+    let items = rx
+        .try_iter()
+        .find_map(|m| match m {
+            UiCommand::ShowCandidateMenu { items, .. } => Some(items),
+            _ => None,
+        })
+        .expect("候选菜单没弹");
+    let labels: Vec<&str> = items
+        .iter()
+        .map(|i| i.label.as_str())
+        .filter(|l| !l.is_empty() && *l != "更多…")
+        .collect();
+    assert_eq!(labels, ["删除此历史", "复制"]);
+
+    // 点菜单里的「删除此历史」：走 UI 回传点击的同一入口（读打开菜单时记下的目标下标）。
+    let delete = items
+        .iter()
+        .find(|i| i.label == "删除此历史")
+        .expect("缺删除项")
+        .kind;
+    coord.debug_menu_action(delete);
+    let texts = coord.debug_page_texts();
+    assert!(
+        !texts.iter().any(|t| t == "RESET_TIME"),
+        "删除后应立即从候选里消失: {texts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&user_dir);
+}
+
+/// 删除候选热键（出厂 Ctrl+Shift+数字）同样能删历史——与右键同一能力、同一判据。
+#[test]
+fn delete_hotkey_removes_a_history_entry() {
+    skip_without_data!();
+    use wind_ipc::protocol::MOD_CTRL;
+    let (coord, store) = open("hotkey", true);
+    store
+        .record_completion(CompletionKind::QuickHistory, "RESET_TIME")
+        .unwrap();
+    enter_quick(&coord);
+    type_str(&coord, "RESET_");
+    assert_eq!(
+        coord.debug_page_texts().first().map(String::as_str),
+        Some("RESET_TIME"),
+        "前提"
+    );
+    let act = coord.handle_key_event(&key(0x31, MOD_CTRL | MOD_SHIFT)); // Ctrl+Shift+1
+    assert!(matches!(act, KeyAction::Consumed), "热键应被消费: {act:?}");
+    assert_eq!(count_of(&store, "RESET_TIME"), 0, "应已从库里删掉");
+    assert!(
+        !coord.debug_page_texts().iter().any(|t| t == "RESET_TIME"),
+        "候选应立即刷新"
+    );
+}

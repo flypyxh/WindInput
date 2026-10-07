@@ -611,7 +611,8 @@ impl MessageHandler for Coordinator {
                 return;
             }
         };
-        self.candidate_op(op, page_local);
+        // 与 Windows / Linux 右键同一条分发：格式候选走格式调整、历史候选走删除历史，其余走词库。
+        self.candidate_or_quick_format_op(op, page_local);
     }
 
     /// Linux addon 报来的菜单指针事件（按键号：1 左 / 2 中 / 3 右）。菜单已关还收到事件 =

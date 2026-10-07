@@ -209,6 +209,35 @@ impl Coordinator {
         out
     }
 
+    /// 当前页第 `page_local` 格若是历史候选，返回它的文本（右键菜单与菜单动作共用这一判据）。
+    pub(crate) fn quick_history_at(&self, state: &State, page_local: usize) -> Option<String> {
+        let (start, end) = self.page_range(state);
+        let idx = start + page_local;
+        if idx >= end {
+            return None;
+        }
+        state
+            .candidates
+            .get(idx)
+            .filter(|c| c.id == QUICK_HISTORY_ID)
+            .map(|c| c.text.clone())
+    }
+
+    /// 右键「删除此历史」：从补全表里删掉这一条，并立即重算候选（不刷新的话用户得退出重进
+    /// 才看得到它消失）。走 mix 路径——历史只出现在快捷输入里。
+    pub(crate) fn delete_quick_history(&self, text: &str) {
+        if let Some(store) = self.store.as_ref()
+            && let Err(e) = store.remove_completion(CompletionKind::QuickHistory, text)
+        {
+            tracing::warn!("快捷输入历史删除失败: {e}");
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(state.active, Some(crate::pipeline::ModeKind::Mix(_))) {
+            self.update_mix_candidates(&mut state);
+            self.notify_ui_update(&state);
+        }
+    }
+
     /// 记一条快捷输入历史并裁剪到上限。未启用历史成员、或文本不值得记时什么也不做。
     pub(crate) fn learn_quick_history(&self, state: &State, text: &str) {
         if !self.mix_has_history(state.mix_id) || !worth_remembering(text) {

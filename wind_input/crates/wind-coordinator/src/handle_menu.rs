@@ -2328,9 +2328,36 @@ impl Coordinator {
         // 快捷输入的格式候选：判据独立于 candidate_op_scope（后者问「有没有词库落点」，
         // 混输没有，返回 None 是对的）。与写端 `candidate_or_quick_format_op` 同源。
         let quick = self.quick_format_scope(&state, page_local);
+        let history = self.quick_history_at(&state, page_local).is_some();
         drop(state);
 
         let op = |o: CandidateOp| MenuKind::Op(o);
+        // 快捷输入历史候选：只给「删除此历史」与复制。它没有位置可调（排序按使用次数），
+        // 也不在任何词库里，词条菜单那几项都没有落点。写端见 `candidate_or_quick_format_op`。
+        if history {
+            #[allow(unused_mut)]
+            let mut items = vec![
+                M::leaf("删除此历史", op(CandidateOp::Delete), true, false),
+                M::separator(),
+                M::leaf("复制", MenuKind::Copy, true, false),
+            ];
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            items.extend([
+                M::separator(),
+                M::leaf(
+                    "更多…",
+                    MenuKind::Command(MenuCmd::OpenMainMenu),
+                    true,
+                    false,
+                ),
+            ]);
+            self.mark_menu_open(page_local, word);
+            let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+                items,
+                anchor: MenuAnchor::at_point(x, y),
+            });
+            return;
+        }
         // 格式候选优先：它调的是「这种写法排第几」，不是词库里的某个词。
         // 标签也相应改写——操作对象是格式，不是这次算出来的那串文本。
         if let Some(q) = quick {
