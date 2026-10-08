@@ -240,7 +240,7 @@ L2；设置端五道闸门；文档站 `settings/advanced.mdx` 新增「性能�
 
 | 阶段 | 内容 | 成功判据 |
 |---|---|---|
-| S1 | `DataNeeds` + 反查 / `UserTextIndex` / 拆字 / 简繁按需加载 | 关掉悬停[编码]并重载配置后，Private 降 ≥ 2 MB；三层模板任一层引用 `${chaizi}` 时拆字仍可用（测试覆盖三层）；简繁切换四个入口都能用 |
+| S1 ✅ `5c075725` | `DataNeeds` + 反查 / `UserTextIndex` / 拆字 / 简繁按需加载。靶机实测出厂配置启动后 Private 31.5–31.6 → 29.9–30.2 MB（−1.5 MB，各两次） | 关掉悬停[编码]并重载配置后，Private 降 ≥ 2 MB；三层模板任一层引用 `${chaizi}` 时拆字仍可用（测试覆盖三层）；简繁切换四个入口都能用 |
 | S2 | `ui.tooltip.enabled`、`ui.candidate.comment_enabled` + 设置端 + 文档 | 关掉后候选刷新不再调用 `word_codes_display`（计数断言）；五道闸门绿 |
 | S3 | redb 平时 N MiB / 批量 256 MiB | 按 D4 定 N：19 万 / 50 万拼音用户词库下，逐键延迟（协调器级基准：真实按键序列经 `Coordinator` 走一遍，取 p50/p99）与 256 MiB 相差 < 10%；词库页翻页、搜索耗时同口径；导入耗时与现状相差 < 10%；持续读后缓存封顶（`redb_cache_high_water` 加阶段） |
 | S4 | `schema.keep_all_loaded` + 启动缓存校验 + 30 分钟淘汰 + 性能分区 + `system.memoryStats` | 切换耗时实测（缓存新鲜 / 过期 × 大词库方案）入本文；`false` 下启动后改过词库再切换不触发同步重建；淘汰后再切回能正常出字；被混输引用的成员不被摘 |
