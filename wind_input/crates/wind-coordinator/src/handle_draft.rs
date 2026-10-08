@@ -14,10 +14,11 @@
 //! 是因为它一句话才触发一次；滑窗模型下那个前提没有了。
 
 use crate::coordinator::Coordinator;
+use crate::draft_window::DraftWord;
 use wind_bridge::handler::KeyAction;
 
 use std::sync::atomic::Ordering;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// 队列的硬上限。后台线程若长时间没跑起来（比如 redb 被暂停），
 /// 队列不能无限涨——超出就丢最早的那些。
@@ -58,7 +59,14 @@ impl Coordinator {
             }
             KeyAction::CommitAndHoldComposition { commit_text, .. }
             | KeyAction::CommitThenDeferComposition { commit_text, .. } => commit_text.as_str(),
-            _ => return,
+            _ => {
+                // 本次按键没有落屏：选词出口登记的上屏码（若有）就此作废，不留给以后的字。
+                self.draft_window
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear_code_hint();
+                return;
+            }
         };
         if text.is_empty() {
             return;
@@ -67,7 +75,7 @@ impl Coordinator {
         let idle = self.auto_phrase_idle_timeout();
         let windows = {
             let mut buf = self.draft_window.lock().unwrap_or_else(|e| e.into_inner());
-            buf.on_commit(
+            buf.on_commit_hinted(
                 text,
                 std::time::Instant::now(),
                 idle,
@@ -75,7 +83,7 @@ impl Coordinator {
                 ap.max_phrase_len,
             )
         }; // 锁在此释放：入队与 flush 判定不该持着流缓冲的锁。
-        let broke = windows.is_empty() && !text.chars().all(crate::handle_addword::is_han);
+        let broke = windows.is_empty() && !text.chars().all(crate::draft_window::is_draft_char);
         self.enqueue_drafts(windows);
         if broke {
             // 非汉字上屏 = 一段话结束，是最常见的落库时机。
@@ -105,7 +113,43 @@ impl Coordinator {
         self.spawn_draft_flush();
     }
 
-    fn enqueue_drafts(&self, words: Vec<String>) {
+    /// 选词出口登记「这个字是用哪条码打出来的」，供下一次落屏随字进流（GH#181）。
+    ///
+    /// 只收**主输入路**上**码表来源的单个汉字**：词组候选带的是整词的码，拆不出各字；
+    /// 拼音/临拼/英文候选带的码不是本方案的码（即便误收，取码时也会因对不上本方案的
+    /// 码而回退全码表，见 `wind_engine::encoder::pick_hinted_code`）。
+    ///
+    /// `fallback_code` 是候选不带词条码时的退路（输入码）。
+    pub(crate) fn note_draft_code_hint(
+        &self,
+        cand: &wind_candidate::Candidate,
+        fallback_code: &str,
+    ) {
+        if !self.draft_enabled() || cand.source != wind_candidate::CandidateSource::CodeTable {
+            return;
+        }
+        let mut cs = cand.text.chars();
+        let (Some(ch), None) = (cs.next(), cs.next()) else {
+            return;
+        };
+        if !crate::draft_window::is_draft_char(ch) {
+            return;
+        }
+        let code = if cand.code.is_empty() {
+            fallback_code
+        } else {
+            cand.code.as_str()
+        };
+        if code.is_empty() {
+            return;
+        }
+        self.draft_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_code_hint(ch, code.to_string());
+    }
+
+    fn enqueue_drafts(&self, words: Vec<DraftWord>) {
         if words.is_empty() {
             return;
         }
@@ -203,7 +247,7 @@ impl Coordinator {
     }
 
     /// 一批草稿词：取码 → 查重 → 单次写事务落库。**跑在后台线程上。**
-    fn flush_draft_batch(&self, words: Vec<String>) {
+    fn flush_draft_batch(&self, words: Vec<DraftWord>) {
         let Some(store) = &self.store else { return };
         let Some(sc) = self.resolve_phrase_schemas() else {
             // 索引没就绪：整批丢掉，不留在队列里等。
@@ -213,15 +257,46 @@ impl Coordinator {
         };
         let mut seen = std::collections::HashSet::new();
         let mut items: Vec<(String, String)> = Vec::new();
-        for word in words {
+        // 取码失败按类别计数，整批只汇总一行 info（见下）。
+        let mut failed: Vec<(&'static str, usize)> = Vec::new();
+        for DraftWord { text, code_hints } in words {
             // 批内去重：滑窗对同一段文字反复切，一批里同一个词出现多次是常态。
             // 不去重的话，同样的取码与查重会做很多遍——这是本函数最贵的两步。
-            if !seen.insert(word.clone()) {
+            if !seen.insert(text.clone()) {
                 continue;
             }
-            if let Some(code) = self.encode_and_dedup(&sc, &word, true) {
-                items.push((code, word));
+            // 窗口里的非汉字（〇，见 `is_draft_char`）必须在本码表真有码。取码那一步对无码的
+            // 非汉字是**跳过**（手工加词「汉字+数字」要的宽口径，GH#171），放到草稿上就是
+            // 「二〇」按「二」的单字全码落库——码表没收录 〇 时造出错码词。
+            if text.chars().any(|c| {
+                !crate::handle_addword::is_han(c)
+                    && self
+                        .engine_mgr
+                        .word_codes_in(&sc.encode, &c.to_string())
+                        .is_none_or(|codes| codes.is_empty())
+            }) {
+                debug!("draft: 含本码表无码的非汉字，跳过: {text}");
+                continue;
             }
+            match self.encode_and_dedup(&sc, &text, &code_hints, true) {
+                Ok(Some(code)) => items.push((code, text)),
+                Ok(None) => {}
+                Err(e) => match failed.iter_mut().find(|(k, _)| *k == e.kind()) {
+                    Some((_, n)) => *n += 1,
+                    None => failed.push((e.kind(), 1)),
+                },
+            }
+        }
+        if !failed.is_empty() {
+            // GH#181③：取码失败曾只有 debug 一行，用户侧只觉得「自动造词失效」。升到 info，
+            // 但**只记数量与类别、不记词**（日志规范：INFO 不得含词条内容）；具体是哪个字
+            // 卡住看 debug 级的逐条日志（`encode_and_dedup`）。
+            let total: usize = failed.iter().map(|(_, n)| n).sum();
+            let kinds: Vec<String> = failed.iter().map(|(k, n)| format!("{k}={n}")).collect();
+            info!(
+                "draft: 本批 {total} 个窗口取码失败、未造词（{}）；开 debug 日志可见具体原因",
+                kinds.join(", ")
+            );
         }
         if items.is_empty() {
             return;

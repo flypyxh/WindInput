@@ -151,8 +151,8 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未随任何版本发布到用户手里（接进设置页的改动与本次迁移在同一个未发布版本内），
     // 且新旧默认值都是 "candidate"，能读到它的只有开发期配置。
     &["schema", "codetable", "frequency", "english_code_scope"],
-    // 并入 `ui.candidate.font_size`（0 = 跟随主题）。它仍被值迁移读取，按下方 ★ 判据
-    // 本不该进来——能进来是因为 [`Config::prune_user_config`] 在清本清单**之前**先把
+    // 并入 `ui.candidate.font_size`（0 = 跟随主题）。它仍被值迁移读取，本不该进来（本清单在
+    // 用户文件上做删除、迁移只改内存，只清不迁 = 下次启动再也迁不到）——能进来是因为 [`Config::prune_user_config`] 在清本清单**之前**先把
     // [`Config::migrate_font_size_follow_theme_value`] 的结果落盘，清的时候它已对生效值
     // 毫无影响。新增同类条目须照此先落盘迁移。
     &["ui", "candidate", "font_size_follow_theme"],
@@ -170,16 +170,11 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未随发布版到用户手里（判据同上面 english_code_scope）。
     &["input", "reverse", "enabled"],
     &["schema", "codetable", "lookup_disabled_dicts"],
-    // ⛔ `ui.candidate.comment_max_chars`（已拆成 `_vertical` / `_horizontal`）**刻意不登记**。
-    //
-    // 本清单的不变量是上一段那句「删掉不改变任何生效值」，而该键**仍在被读取**——
-    // [`Config::migrate_comment_max_chars_value`] 每次 load 都拿它补两个新键。
-    // 而 `prune_user_config` 是在**用户文件**上跑的（服务启动 D2 步），迁移只改**内存**、
-    // 从不落盘 ⇒ 登记进来的时序必然是「先把文件里的旧键删掉，下次启动再也迁不到」，
-    // 用户配的截断值静默归 0。
-    //
-    // ⇒ ★ 判据：**一个键只要还有值迁移在读它，就不能进本清单**；反过来，进本清单的前提是
-    // 它已经对生效值毫无影响。旧键留在用户文件里不算误导——它确实还在生效（经迁移）。
+    // 拆成 `_vertical` / `_horizontal`。与 `font_size_follow_theme` 同一判据：
+    // [`Config::prune_user_config`] 先把 [`Config::migrate_comment_max_chars_value`] 的结果
+    // 落盘、再清本清单。此前它刻意不登记、迁移也不摘旧键，于是旧键在用户文件里常驻，设置页把
+    // 竖排改回 0（等于出厂 ⇒ 新键被删）后，下次 load 又被旧键补回原值。
+    &["ui", "candidate", "comment_max_chars"],
 ];
 
 /// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
@@ -1291,6 +1286,9 @@ pub struct PinyinGlobalConfig {
     /// 词组补全的音节数约束（全局唯一）。
     #[serde(default)]
     pub completion: PinyinCompletion,
+    /// 简拼（只打声母）的开关（`[schema.pinyin.abbrev]`，GH#180）。
+    #[serde(default)]
+    pub abbrev: PinyinAbbrev,
     /// 双拼相关的全局行为（`[schema.pinyin.shuangpin]`）。
     #[serde(default)]
     pub shuangpin: PinyinShuangpin,
@@ -1499,6 +1497,25 @@ impl Default for PinyinCompletion {
     }
 }
 
+/// 简拼（只打声母，`nh` → 你好）的开关（`[schema.pinyin.abbrev]`，GH#180）。
+///
+/// 管的是**纯拼音方案**（全拼 / 双拼）。混输里的拼音另有 `schema.mix.enable_pinyin_abbrev`
+/// 管开关，两者取与。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinyinAbbrev {
+    /// 是否给简拼候选。关掉后纯简拼（`nh`）、混合简拼（`nhao`）、简拼整句
+    /// （`bzdhaobuhao`）一并不出。尾部没打完的音节照常补全（全拼 `nihaom` → 你好吗、
+    /// 搜狗双拼 `hkl` → 好了），那是前缀补全，不归它管。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PinyinAbbrev {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 impl Default for PinyinGlobalConfig {
     fn default() -> Self {
         Self {
@@ -1517,6 +1534,7 @@ impl Default for PinyinGlobalConfig {
             frequency: PinyinFrequency::default(),
             auto_learn: AutoLearnConfig::default(),
             completion: PinyinCompletion::default(),
+            abbrev: PinyinAbbrev::default(),
             shuangpin: PinyinShuangpin::default(),
             aux_code: AuxCodeGlobal::default(),
             grammar: PinyinGrammar::default(),
@@ -4381,10 +4399,39 @@ impl Default for TempEnglishConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapslockConfig {
     #[serde(default)]
     pub cancel_on_mode_switch: bool,
+    /// 切中英时取消了大写锁定之后落到哪个模式（仅 `cancel_on_mode_switch` 开着时有意义）。
+    /// 字符串枚举（同 `temp_english.shift_behavior` 的既有风格），值域：
+    ///
+    /// - `chinese`（出厂）：Shift 等切换键归位中文（对齐搜狗）；Ctrl+空格 这类自带
+    ///   目标方向的切换按它请求的方向——两条都是本字段出现前的旧行为，逐字保留；
+    /// - `english`：两条路都进英文（论坛 t283：「输完大写想接着打小写」）；
+    /// - `toggle`：照常切换——Shift 翻转中英，Ctrl+空格 按请求方向。
+    ///
+    /// 只管**用户按出来的**切换；宿主写 compartment、功能菜单这类非用户发起的模式请求
+    /// 恒按请求落地，不受本项改写。
+    ///
+    /// 消费端见 `Coordinator::mode_after_caps_cancel`，认不出的值告警后回落 `chinese`。
+    /// 另起字段而非把 `cancel_on_mode_switch` 改成枚举：那个布尔已写进用户配置、设置端
+    /// 平台门控与文档，改类型要做旧值兼容反序列化，收益只是少一个键。
+    #[serde(default = "default_capslock_mode_after_cancel")]
+    pub mode_after_cancel: String,
+}
+
+impl Default for CapslockConfig {
+    fn default() -> Self {
+        Self {
+            cancel_on_mode_switch: false,
+            mode_after_cancel: default_capslock_mode_after_cancel(),
+        }
+    }
+}
+
+fn default_capslock_mode_after_cancel() -> String {
+    "chinese".to_string()
 }
 
 /// 生僻字模式配置（[input.rare_char]）。
@@ -4881,6 +4928,18 @@ pub struct KeysConfig {
     pub toggle_mode_keys: Vec<String>,
     #[serde(default = "default_true")]
     pub commit_on_switch: bool,
+    /// Ctrl+空格 切换中英文（GH#172）。**出厂开**。
+    ///
+    /// 关掉之后：DLL 不再吃 Ctrl+空格、也不做按键侧兜底切换（键原样交给宿主，IDEA /
+    /// Android Studio 的代码提示才按得出来）；Windows 系统输入法开关热键翻 OPENCLOSE
+    /// compartment 时服务端拒绝并把 compartment 拉回（见协调器 `ctrl_space_switch_rejected`）。
+    /// ⚠ 系统热键本身在 msctf 层就消费了按键，宿主收不到——那只能让用户去系统设置里关，
+    /// 本开关只保证模式不被翻。
+    ///
+    /// 消费端读 [`Self::ctrl_space_toggle_effective`]，**不要**直接读本字段：「全局自定义
+    /// 按键」里把 `ctrl+space` 绑成 `none` 也算关。
+    #[serde(default = "default_true")]
+    pub ctrl_space_toggle: bool,
     #[serde(default = "default_switch_engine")]
     pub switch_engine: String,
     #[serde(default = "default_toggle_full_width")]
@@ -5008,6 +5067,30 @@ pub struct KeysConfig {
     /// 候选无效按键策略（数字键/次选三选键/以词定字键超出候选范围时的处理）。
     #[serde(default)]
     pub overflow: OverflowConfig,
+}
+
+impl KeysConfig {
+    /// Ctrl+空格 中英切换**实际**是否生效（GH#172）。
+    ///
+    /// 两个入口任一说「关」就关：
+    /// 1. [`Self::ctrl_space_toggle`] 开关；
+    /// 2. [`Self::key_actions`] 里把 Ctrl+空格 绑成 `none`（「全局自定义按键 → 不启用」）。
+    ///
+    /// 第 2 条是为了让用户最先想到的那个地方真的管用：内置切换从来不在 `key_actions` 里，
+    /// 在那里设「不启用」原本只是删一条不存在的绑定（报障原话「设为不启用也禁不掉」）。
+    /// 只认 `none`、不认别的动词：绑成真动作时系统热键仍可能在 msctf 层先翻 compartment，
+    /// 那时若一并拒绝，启用了系统热键的机器上按 Ctrl+空格 就什么都不发生了。
+    pub fn ctrl_space_toggle_effective(&self) -> bool {
+        if !self.ctrl_space_toggle {
+            return false;
+        }
+        let target = crate::hotkey::parse_hotkey("ctrl+space");
+        !self.key_actions.iter().any(|(key, verb)| {
+            let verb = verb.trim();
+            (verb.is_empty() || verb.eq_ignore_ascii_case("none"))
+                && crate::hotkey::parse_hotkey(key) == target
+        })
+    }
 }
 
 /// `KeysConfig::key_actions_materialized` 的 `skip_serializing_if`。
@@ -5226,6 +5309,7 @@ impl Default for KeysConfig {
         Self {
             toggle_mode_keys: default_toggle_mode_keys(),
             commit_on_switch: true,
+            ctrl_space_toggle: true,
             switch_engine: default_switch_engine(),
             toggle_full_width: default_toggle_full_width(),
             toggle_punct: default_toggle_punct(),
@@ -8002,8 +8086,9 @@ impl Config {
     ///
     /// 只在新键**缺失**时抄旧值：用户若已写了新键，那是更明确的意图，不该被旧键盖掉。
     ///
-    /// ⛔ 旧键**不进** [`RETIRED_KEYS`]（理由见那份清单末尾）：本函数每次 load 都要读它，
-    /// 而那份清单是在用户文件上做删除、本函数只改内存 ⇒ 登记进去等于下次启动就迁不到了。
+    /// 抄完**摘掉旧键**，且写盘路径（`prune_user_config` / `set_user_value`）都先跑本函数：
+    /// 旧键留在文件里时，设置页把某一侧改回 0 = 出厂值 ⇒ 新键被删 ⇒ 下次 load 旧键又把它补回
+    /// 原值，用户的修改被静默打回。
     ///
     /// ★ 这条迁移不可省：它是**非零默认**的键（默认 0=不限，但配过非 0 值的人正是在意
     /// 长度的那批），不迁移的表现是「升级后注释突然不再截断」——而这类回归无人会报 bug，
@@ -8016,10 +8101,10 @@ impl Config {
         else {
             return;
         };
-        let Some(old) = cand
-            .get("comment_max_chars")
-            .and_then(toml::Value::as_integer)
-        else {
+        let Some(old) = cand.remove("comment_max_chars") else {
+            return;
+        };
+        let Some(old) = old.as_integer() else {
             return;
         };
         let mut copied = Vec::new();
@@ -8047,7 +8132,7 @@ impl Config {
     ///
     /// 只有在**单独一层**上问 `contains_key`，答案才真正是「这一层的作者写过这个键吗」。
     /// 对用户层来说就是「用户自己写过吗」—— 设置页写回时只写它管的那个键、不会顺手删掉
-    /// 旧键，于是新旧两键会在用户配置里长期并存。少了这个区分，要么迁移不执行（旧键被
+    /// 旧键（`set_user_value` 先跑迁移的那几条除外），于是新旧两键会在用户配置里长期并存。少了这个区分，要么迁移不执行（旧键被
     /// 忽略），要么改成旧键优先（用户在设置页的每次修改都在下次启动被打回），两条路都错。
     ///
     /// custom 层（L2.5）也跑一遍，保住「定制层里的旧值同样被救到」这个既有性质
@@ -8425,6 +8510,7 @@ impl Config {
         Self::migrate_font_size_follow_theme_value(&mut root);
         Self::migrate_langbar_badge_colors_value(&mut root);
         Self::migrate_tooltip_sections_value(&mut root);
+        Self::migrate_comment_max_chars_value(&mut root);
         let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
         // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
@@ -9448,6 +9534,8 @@ impl Config {
         // 残留的旧开关（比如 `chaizi_enabled = true`）会在下次 load 被迁回一份合并段，
         // 用户刚选的出厂段列表被打回。
         Self::migrate_tooltip_sections_value(&mut root);
+        // 注释字数旧键同理：竖排改回 0（出厂值 ⇒ 被剪掉）后，残留的旧键会在下次 load 补回原值。
+        Self::migrate_comment_max_chars_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -12912,16 +13000,30 @@ scripts = { latin = 42 }
         );
     }
 
-    /// ⛔ 旧键**不得**进 `RETIRED_KEYS`：它还在被值迁移读取，而那份清单是在**用户文件**上
-    /// 做删除、迁移只改内存 ⇒ 登记进去 = 下次启动再也迁不到，用户配的值静默归 0。
-    ///
-    /// 这条测试钉的是一个「顺手补上去就出事」的改动，故必须显式存在。
+    /// 迁移摘掉旧键：写盘路径先迁再写，把一侧改回 0（出厂值 ⇒ 新键被删）后旧键不会再把它补回。
     #[test]
-    fn retired_keys_excludes_keys_still_read_by_migration() {
-        assert!(
-            !RETIRED_KEYS.contains(&["ui", "candidate", "comment_max_chars"].as_slice()),
-            "comment_max_chars 仍被 migrate_comment_max_chars_value 读取，不能退役"
+    fn migrate_comment_max_chars_drops_old_key_so_reset_to_zero_sticks() {
+        let mut root: toml::Value =
+            toml::from_str("[ui.candidate]\ncomment_max_chars = 12\n").unwrap();
+        // set_user_value 的顺序：先迁移，再按「等于出厂即删」写入竖排 0。
+        Config::migrate_comment_max_chars_value(&mut root);
+        assert_eq!(prune_retired(&mut root), 0, "迁移已摘掉旧键，清单无事可做");
+        let toml::Value::Table(t) = &mut root else {
+            unreachable!()
+        };
+        remove_nested(t, &["ui", "candidate", "comment_max_chars_vertical"]);
+        let cfg = merged_with(&toml::to_string(&root).unwrap());
+        assert_eq!(
+            cfg.ui.candidate.comment_max_chars_vertical, 0,
+            "改回 0 不被打回"
         );
+        assert_eq!(cfg.ui.candidate.comment_max_chars_horizontal, 12);
+        // 反向：只清不迁会丢设置——这正是 prune 必须先落盘迁移的理由。
+        let mut raw: toml::Value =
+            toml::from_str("[ui.candidate]\ncomment_max_chars = 12\n").unwrap();
+        assert_eq!(prune_retired(&mut raw), 1);
+        let lost = merged_with(&toml::to_string(&raw).unwrap());
+        assert_eq!(lost.ui.candidate.comment_max_chars_horizontal, 0);
     }
 
     #[test]

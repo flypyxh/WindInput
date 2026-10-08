@@ -609,7 +609,7 @@ pub struct DictSpec {
     /// 主词库
     #[serde(default)]
     pub default: bool,
-    /// 非默认但默认启用的附加库（tri-state，nil=true）
+    /// 附加库的方案默认启用状态（tri-state，nil=未启用，见 `should_load`）
     #[serde(default)]
     pub default_enabled: Option<bool>,
     /// 用户覆盖启用（tri-state，nil=继承 default_enabled）

@@ -78,7 +78,7 @@ jobs:
       # CI 里真机验」的前提下，它们是唯一会自动执行的判据闸门，故单列一步。
       - name: wind_tsf 纯逻辑单测
         run: |
-          for t in skip_key_table installer_guard uielement_policy; do
+          for t in skip_key_table installer_guard uielement_policy composition_placeholder ctrl_space_policy window_title_policy; do
             g++ -std=c++17 -Wall -Wextra -Iwind_tsf/include -o "/tmp/$t" "wind_tsf/tests/${t}_test.cpp"
             "/tmp/$t"
           done

@@ -367,8 +367,13 @@ pub mod ext_kind {
     /// 下行：问宿主（`.app` / Linux addon）状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。
     /// body 空。气泡不在屏上时不答（协调器保留旧值）。
     pub const POS_STATUS_TIP_QUERY: &str = "pos.status_tip.query";
-    /// 上行（Linux addon）：当前焦点宿主的显示环境。body = `{"caret_free":bool,"scale":1.5}`，
-    /// 两个字段都可缺省（缺省 = 不改现值）。每次焦点获得时由 addon 重报，服务重启也不会丢。
+    /// 上行（Linux addon）：当前焦点宿主的显示环境。body =
+    /// `{"caret_free":bool,"caret_trusted":bool,"scale":1.5}`，各字段都可缺省（缺省 = 不改现值）。
+    /// 每次焦点获得时由 addon 重报，服务重启也不会丢。
+    ///
+    /// - `caret_trusted`：宿主报的光标坐标可直接当权威。Linux addon 的光标来自应用自己上报的光标
+    ///   矩形，没有 Windows「跨窗口 Win32 光标冒充插入点」的问题，但来源字段恒为 UNKNOWN（没有
+    ///   TSF 语义域）；不声明的话，「焦点变化时显示」这类要等权威坐标的路径会永远挂起。
     ///
     /// - `caret_free`：宿主不需要也给不出光标坐标。Wayland 原生应用的光标矩形是窗口相对坐标、
     ///   应用屏幕位置只有合成器知道，候选窗由合成器按 input popup 自己摆位（见 wind_linux 的
@@ -486,6 +491,11 @@ pub const CONFIG_KEY_JUMP_OUT_KEYS: &str = "jump_out_keys";
 /// TSF 端据此 + 自身持有的 InputScope 掩码在 `OnTestKeyDown` 本地判定是否放行：
 /// 吃键决策发生在 IPC 之前，协调器回 PassThrough 已太晚（形成「吃了再吐」丢键）。
 pub const CONFIG_KEY_PASSWORD_SUPPRESS: &str = "password_suppress";
+/// Ctrl+空格 中英切换开关（GH#172，`keys.ctrl_space_toggle` 的**有效值**）同步键名。
+/// 格式：`enabled(u8)`。关闭时 DLL 在 `OnTestKeyDown` 不吃 Ctrl+空格、`OnKeyDown` 不做兜底
+/// 切换，键原样交给宿主（IDEA 的代码提示）。吃键决策在 IPC 之前，故必须由 DLL 本地判。
+/// DLL 每次重连从默认值（开，历史行为）起步，握手必推。
+pub const CONFIG_KEY_CTRL_SPACE_TOGGLE: &str = "ctrl_space_toggle";
 /// 「英文半角列有自定义标点映射」的源字符集合同步键名。英文模式（非全角）下 TSF 默认直接
 /// 透传标点键、引擎收不到，英半列因此永远不生效；TSF 据此集合**精确**吃下这些键转发引擎
 /// （集合为空 = 行为与历史完全一致）。判据须与 `wind_punct::custom_english_punct_chars`
@@ -523,6 +533,31 @@ pub const CONFIG_KEY_PAIR_STATE_TTL: &str = "pair_state_ttl";
 /// 由服务端在 HUD 打开时推开。**必须在握手时也推一次**：DLL 每次重连都从默认值
 /// （关）起步，只在切换时推会让重连后的宿主永远不采集（`push_connect_fix` 记过同型）。
 pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
+/// 组合区**空文本兜底占位**用哪个字符（GH#175）同步键名。格式：`kind(u8)`，取值见
+/// `COMPOSITION_PLACEHOLDER_*`（0 = 空格、1 = ZWSP、2 = U+2800 盲文空白）。
+///
+/// 按**客户端 pid** 现算（compat 规则 `composition_placeholder`），逐客户端推送：DLL 的组合区
+/// 在文本为空时要补一个占位撑开 range，补哪个字符只有服务端知道。协调器自己发出的占位
+/// 不经这里（直接把字符写进组合文本）。DLL 每次重连从默认（空格）起步，故握手必推。
+///
+/// 向后兼容：DLL 的 `PlaceholderForKind` 对**认不出的值一律回落空格**，所以只认 0/1 的旧 DLL
+/// 收到 2 时兜底占位是空格（历史行为），不会出错；新加档位照此只追加、不复用旧值。
+pub const CONFIG_KEY_COMPOSITION_PLACEHOLDER: &str = "composition_placeholder";
+/// 「本进程可能命中 compat 标题规则」开关（采不采窗口标题）同步键名。格式：`enabled(u8)`。
+///
+/// 开着时 DLL 才在 FocusGained 里附上焦点顶层窗口的标题（变长段 ③，见 [`FocusGainedPayload`]）；
+/// 关着时一次标题都不取——标题是用户数据（网页标题、文件名），没有规则用得上就不该离开宿主进程。
+/// 取值 = `AppCompat::process_may_match_title(该客户端的进程名)`（有不限进程的标题规则、或本进程有
+/// 标题规则），逐客户端推：握手时推，compat 重载 / pid 名纠正后重推。DLL 在开关 0→1 时若本焦点
+/// 发出的 FocusGained 没带标题，会补发一次。
+/// DLL 每次重连从默认值（关）起步，故**握手必推**（`diag_snapshot` 同型）。
+pub const CONFIG_KEY_COMPAT_TITLE_MATCH: &str = "compat_title_match";
+/// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：空格 U+0020（默认）。
+pub const COMPOSITION_PLACEHOLDER_SPACE: u8 = 0;
+/// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：ZWSP U+200B。
+pub const COMPOSITION_PLACEHOLDER_ZWSP: u8 = 1;
+/// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：U+2800 BRAILLE PATTERN BLANK。
+pub const COMPOSITION_PLACEHOLDER_BLANK: u8 = 2;
 
 /// 语言栏按钮的悬停提示文本。格式：`[ch:u16(LE)]...`（UTF-16LE，无长度前缀，
 /// `value` 本身就是整段）。与 `CONFIG_KEY_CUSTOM_EN_PUNCT` 同惯例——C++ 侧照此可以
@@ -924,6 +959,7 @@ pub struct FocusGainedPayload {
     // 并波及全部既有调用点），各由 `crate::codec` 的解码函数单独取：
     //
     //   [0..39 定长][bundleIdLen:u32][bundleId][windowClassLen:u32][windowClass]
+    //              [windowTitleLen:u32][windowTitle]
     //
     //   ① bundleId    darwin 专属：宿主 app 的 bundle id，服务端当「进程名」用于
     //                 compat.toml 匹配与 per-app 记忆。见 `decode_focus_gained_bundle_id`。
@@ -931,6 +967,11 @@ pub struct FocusGainedPayload {
     //                 窗口（任务栏 / Alt+Tab 切换器）与停留型窗口（桌面 / 文件管理器）
     //                 分开——它们同属 explorer.exe，仅凭进程名无法区分。
     //                 见 `decode_focus_gained_window_class`。
+    //   ③ windowTitle 同一个顶层窗口的标题（UTF-8，DLL 截断到 256 个 UTF-16 码元），供
+    //                 compat.toml 的 `title` 条件匹配。**仅当服务端经 `CONFIG_KEY_COMPAT_TITLE_MATCH`
+    //                 推开采集时才非空**（没有标题规则就不取用户的窗口标题）；旧 DLL 不发本段，
+    //                 解出空串。标题按用户数据处理：任何级别的日志只记长度。
+    //                 见 `decode_focus_gained_window_title`。
     //
     // ⚠ **窗口类段必须按顺序走，不能用固定偏移**：bundleId 是变长的，macOS 上非空。
     // Windows DLL 因此要发 `bundleIdLen=0` 占位，让两个平台共用同一条线性走法。

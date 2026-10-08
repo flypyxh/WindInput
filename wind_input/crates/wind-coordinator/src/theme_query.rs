@@ -190,6 +190,70 @@ impl Coordinator {
     }
 }
 
+/// 主题强调色的亮 / 暗两档——设置窗「主题色跟随输入法」的取色源。
+///
+/// 两档都给：设置窗的明暗是它自己的（`wind_setting.toml` 的 `ui.dark`），与输入法的
+/// `ui.theme.style` 无关，按哪档上色只有设置端知道。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeAccent {
+    /// 实际取色的主题 id：请求的主题被 hide 或加载失败时是降级后的 `default`。
+    pub theme_id: String,
+    pub light: ThemeAccentPair,
+    pub dark: ThemeAccentPair,
+}
+
+/// 一档的强调色。`#RRGGBB`，带透明度时 `#RRGGBBAA`；`None` = 主题写了却解析不出。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeAccentPair {
+    /// 填充用强调色（候选序号、强调条、菜单高亮底）。
+    pub accent: Option<String>,
+    /// 当文字用的强调色，作者按该档底色调过可读性——标准色契约名，所有主题都有。
+    pub accent_text: Option<String>,
+}
+
+fn accent_pair_of(colors: Option<&toml::Value>, is_dark: bool) -> ThemeAccentPair {
+    let mut palette = wind_theme::palette::resolve_palette(colors, is_dark);
+    // 不继承 _base 的第三方主题也要有 accent / accent_text：与渲染同一口径补契约名。
+    wind_theme::contract::fill_missing(colors, &mut palette, is_dark);
+    let hex = |n: &str| palette.get(n).map(|&c| rgba_hex(c));
+    ThemeAccentPair {
+        accent: hex("accent"),
+        accent_text: hex("accent_text"),
+    }
+}
+
+fn rgba_hex([r, g, b, a]: Rgba) -> String {
+    if a == 0xFF {
+        format!("#{r:02X}{g:02X}{b:02X}")
+    } else {
+        format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+    }
+}
+
+impl Coordinator {
+    /// 主题的强调色两档；`name` 缺省取当前主题。降级规则同 [`Self::theme_follow_values`]，
+    /// 两级都失败返回 None。
+    ///
+    /// 只合并 colors 不求整棵 `Resolved`：省 13 KB 的按值搬运（栈风险见上），也省两次视图树求值。
+    pub fn theme_accent(&self, name: Option<&str>) -> Option<ThemeAccent> {
+        let dirs = self.theme_search_dirs();
+        let name = match name {
+            Some(n) => n.to_string(),
+            None => <Self as crate::web_host::WebDataHost>::current_theme_name(self),
+        };
+        let (id, merged) =
+            Self::load_theme_with_fallback(|n| wind_theme::load_merged_dirs(&dirs, n, 0), &name)?;
+        let colors = merged.get("colors");
+        Some(ThemeAccent {
+            theme_id: id,
+            light: accent_pair_of(colors, false),
+            dark: accent_pair_of(colors, true),
+        })
+    }
+}
+
 /// `[R, G, B, A]` → `0xAARRGGBB`。
 ///
 /// 用 ARGB 而不是原样透出 `[u8; 4]`：Android 的 `Color` 与 iOS 的 `UIColor(rgb:)`
@@ -256,5 +320,42 @@ mod follow_values_tests {
         let v = follow_values_of("x", &r);
         assert_eq!(v.langbar_text[0].as_deref(), Some("#112233"));
         assert_eq!(v.langbar_text[1], None);
+    }
+}
+
+#[cfg(test)]
+mod accent_tests {
+    use super::*;
+
+    fn colors(src: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(src).unwrap()["colors"].clone()
+    }
+
+    #[test]
+    fn picks_variant_per_band_and_follows_refs() {
+        let c = colors(
+            r##"[colors]
+primary = "#10b981"
+accent = "${primary}"
+accent_text = { light = "#059669", dark = "#34d399" }"##,
+        );
+        let light = accent_pair_of(Some(&c), false);
+        let dark = accent_pair_of(Some(&c), true);
+        assert_eq!(light.accent.as_deref(), Some("#10B981"));
+        assert_eq!(light.accent_text.as_deref(), Some("#059669"));
+        assert_eq!(dark.accent_text.as_deref(), Some("#34D399"));
+    }
+
+    #[test]
+    fn contract_fills_accent_text_when_theme_omits_it() {
+        // 不写 accent_text 的主题：契约兜底，不能是 None（设置端会误判成主题坏了）。
+        let c = colors("[colors]\naccent = \"#123456\"");
+        assert!(accent_pair_of(Some(&c), false).accent_text.is_some());
+    }
+
+    #[test]
+    fn hex_keeps_alpha_only_when_translucent() {
+        assert_eq!(rgba_hex([0x12, 0x34, 0x56, 0xFF]), "#123456");
+        assert_eq!(rgba_hex([0x12, 0x34, 0x56, 0x80]), "#12345680");
     }
 }

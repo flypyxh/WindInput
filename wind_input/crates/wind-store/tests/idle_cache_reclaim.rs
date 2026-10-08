@@ -112,3 +112,28 @@ fn a_never_used_store_is_not_reclaimed_on_a_timer() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+/// 每次回收之后恰好调一次钩子（上层在这里整理堆）：调用次数始终等于回收次数。
+#[test]
+fn the_after_hook_runs_once_per_reclaim() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (s, p) = store("after_hook");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    s.spawn_idle_cache_reclaimer_then(IDLE, TICK, move || {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    // 开库那一笔访问引发第一次回收（同 a_never_used_store_is_not_reclaimed_on_a_timer）。
+    assert!(wait_until(IDLE * 10, || calls.load(Ordering::SeqCst) >= 1));
+    s.count_user_words("py").expect("再访问一次");
+    assert!(
+        wait_until(IDLE * 10, || calls.load(Ordering::SeqCst) >= 2),
+        "第二次回收后该再调一次"
+    );
+    std::thread::sleep(IDLE * 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "没有新访问就不该再调");
+    assert_eq!(s.page_cache_drops(), 2);
+    drop(s);
+    let _ = std::fs::remove_file(&p);
+}

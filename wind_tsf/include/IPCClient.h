@@ -208,10 +208,14 @@ public:
     // explorer.exe 的过渡型窗口（任务栏 / Alt+Tab 切换器）与停留型窗口（桌面 / 文件管理器）
     // 分开——它们进程名相同，per-app 规则仅凭进程名分不开。空值在服务端一律回落到既有
     // 行为（照常重算初始模式），不会让用户配的 initial_mode 静默失效。
+    //
+    // windowTitle: 同一个顶层窗口的标题（可为 nullptr / 空）。调用方只在 core 推开了
+    // CONFIG_KEY_COMPAT_TITLE_MATCH 时才取并传入（见 WindowTitlePolicy.h）；用户数据，日志只记长度。
     BOOL SendFocusGained(int caretX = 0, int caretY = 0, int caretHeight = 0, UINT64 inputScopeMask = 0,
                          bool disabled = false, uint8_t reason = 0,
                          int caretSource = CARET_SRC_UNKNOWN,
-                         const wchar_t* windowClass = nullptr);
+                         const wchar_t* windowClass = nullptr,
+                         const wchar_t* windowTitle = nullptr);
 
     // Send input state report (async, fire-and-forget): standalone disabled/reason change
     // for the currently focused control, e.g. a GUID_COMPARTMENT_KEYBOARD_DISABLED flip that

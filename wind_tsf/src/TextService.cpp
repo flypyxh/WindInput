@@ -9,6 +9,8 @@
 #include "DisplayAttributeInfo.h"
 #include "HotkeyManager.h"
 #include "HostWindow.h"
+#include "CompositionPlaceholder.h" // 组合占位识别 + 兜底取值（空格 / ZWSP / 盲文空白，由 core 按应用决定，GH#175）
+#include "WindowTitlePolicy.h" // 窗口标题采集判据（开关 / 截断；compat 的 title 条件）
 #include <vector>
 #include <shellscalingapi.h>
 #include <inputscope.h> // ITfInputScope / InputScope 枚举
@@ -652,8 +654,11 @@ private:
 class CUpdateCompositionEditSession : public ITfEditSession
 {
 public:
-    CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1, BOOL noUnderline = FALSE)
-        : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos), _noUnderline(noUnderline)
+    // placeholder：_text 为空时兜底写入的占位（core 按应用下发：空格 / ZWSP / 盲文空白，见 CompositionPlaceholder.h）。
+    CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1, BOOL noUnderline = FALSE,
+                                  const wchar_t* placeholder = wind::placeholder::kSpacePlaceholder)
+        : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos), _noUnderline(noUnderline),
+          _placeholder(placeholder)
     {
         _pTextService->AddRef();
         _pContext->AddRef();
@@ -787,9 +792,12 @@ public:
         // 就是空的，`commit_then_new_composition(text, String::new())` 一类同样如此，它们
         // 全靠这一段兜住。删掉后这些路径拿到零长度 range，而 WPS 等宿主对零长度 range 回的
         // 是退化矩形（height=0），候选窗失去坐标来源。
+        //
+        // 占位字符由调用方传进来（_placeholder）：core 按应用 compat 规则下发，默认空格（上面
+        // 说的 WPS 等），浏览器出厂是 ZWSP —— 受控 `<input>` 会 trim 组合中的 value，空格会让
+        // React 回写 value、浏览器随即终止组合（GH#175，见 CompositionPlaceholder.h）。
         BOOL isPlaceholder = _text.empty();
-        static const wchar_t PLACEHOLDER[] = L" ";
-        const wchar_t* textPtr = isPlaceholder ? PLACEHOLDER : _text.c_str();
+        const wchar_t* textPtr = isPlaceholder ? _placeholder : _text.c_str();
         LONG textLen = isPlaceholder ? 1 : (LONG)_text.length();
 
         hr = pRange->SetText(ec, TF_ST_CORRECTION, textPtr, textLen);
@@ -798,7 +806,10 @@ public:
         {
             // 4. Apply display attribute to show underline
             // Skip for placeholder text to avoid any visual artifacts
-            if (!isPlaceholder)
+            // 服务端自己发来的占位（非嵌入模式的编码替身、联想态等，文本恰为占位字符）同样不加
+            // 下划线属性：有宽度的盲文空白（U+2800）被加上组合下划线后，在钉钉表格里会显示成
+            // 一小段「_」（GH#175 实测）。
+            if (!isPlaceholder && !wind::placeholder::IsPlaceholderText(_text))
                 _SetDisplayAttribute(ec, pRange);
 
             // 5. Position cursor within composition
@@ -857,6 +868,7 @@ public:
 private:
     int _caretPos;         // Cursor position within composition (-1 = at end)
     BOOL _noUnderline;     // 整段不设下划线属性（智能符号 HoldComposition 观感对齐已上屏）
+    const wchar_t* _placeholder; // 空文本兜底占位（静态字符串，长度恒为 1）
 
     void _CacheCaretPosition(TfEditCookie ec)
     {
@@ -1044,7 +1056,10 @@ CTextService::CTextService()
     , _focusIsPassword(false)
     , _focusInputScopeMask(0)
     , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
+    , _compositionPlaceholderKind(0)  // 默认空格（历史行为），core 握手时按本进程 compat 规则推
     , _diagSnapshotEnabled(FALSE)     // 默认关，与 core 的 input_diag_hud_visible 初值一致
+    , _titleMatchEnabled(0)           // 默认关：core 握手时按「本进程可能命中标题规则」推
+    , _focusSentTitleBlind(FALSE)
     , _hasThreadFocus(FALSE)
     , _isProcessForeground(FALSE)
     , _activateFlags(0)
@@ -2874,7 +2889,8 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         }
 
         // 这两行都在焦点热路径上：采集一次进程信息要 OpenProcess + 令牌查询 +
-        // 映像路径 + GetWindowTextW。必须走带级别闸门的封装，不能裸调采集函数。
+        // 映像路径 + 窗口标题长度。必须走带级别闸门的封装，不能裸调采集函数。
+        // 标题只记长度（title_len），不记原文——标题是用户数据。
         WindLogCurrentProcessInfo(4, L"compat.focus.current_host");
         WindLogForegroundProcessInfo(4, L"compat.focus.foreground_host");
 
@@ -3070,22 +3086,27 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             // 成本＝GetTop + GetActiveView + GetWnd + GetAncestor + GetClassNameW，
             // 全是进程内调用，与紧随其后的同步 IPC 往返不在一个量级；且同分支上方已经
             // 有一次 _DocMgrHasEditableContext（GetTop + GetStatus），量级相当。
-            const std::wstring focusRootClass = _QueryFocusRootWindowClass(pDocMgrFocus);
+            // 标题只在 core 推开采集（本进程可能命中标题规则）时取，否则恒空；取法不发 WM_GETTEXT。
+            std::wstring focusRootClass;
+            std::wstring focusRootTitle;
+            _QueryFocusRootWindowIdentity(pDocMgrFocus, focusRootClass, focusRootTitle);
             // 独立日志行：与同分支的 compat.focus.foreground_host（打的是**前台**窗口类）
             // 配对，就能在日志里直接比对「焦点顶层窗口」与「前台窗口」是否同一个——
             // 判据该取哪一个，此前从来没有记录过，只能靠这两行对照。
-            WIND_LOG_DEBUG_FMT(L"compat.focus.rootclass focusSession=%llu class=%ls",
-                               _focusSessionId, focusRootClass.c_str());
+            // ⚠ 标题是用户数据（网页标题、文件名）：任何级别都只记长度，不记原文。
+            WIND_LOG_DEBUG_FMT(L"compat.focus.rootclass focusSession=%llu class=%ls title_len=%u",
+                               _focusSessionId, focusRootClass.c_str(), (unsigned)focusRootTitle.size());
             // 单独计时这一段：它是本函数里唯一会阻塞在别的进程上的调用，
             // 需要能和 COM/日志开销分开归因。
             const LONGLONG focusIpcT0 = WindLog::PerfNow();
             const BOOL focusSent = _pIPCClient->SendFocusGained(
                 caretX, caretY, caretHeight, inputScopeMask, _bKeyboardDisabled != FALSE, inputReason,
-                caretSource, focusRootClass.c_str());
+                caretSource, focusRootClass.c_str(), focusRootTitle.c_str());
             focusIpcMs += WindLog::PerfMsSince(focusIpcT0);
             // 排队档的异步回调据此判定"该补发 caret_update"。**必须在这里置位而非发送前**：
             // 内联档的回调早已在上面跑完，那时它读到的是旧值（≠本会话），于是正确地选择"不补发"。
             _focusGainedSentForSession = _focusSessionId;
+            _focusSentTitleBlind = (focusSent && !IsTitleMatchEnabled()) ? TRUE : FALSE;
             if (focusSent)
             {
                 WIND_LOG_DEBUG_FMT(L"FocusGained sent (sync) focusSession=%llu ipc=%.1fms",
@@ -4340,7 +4361,45 @@ void CTextService::TryRecoverFocusState()
 {
     if (!_needsFocusRecovery || _pIPCClient == nullptr || !_pIPCClient->IsConnected())
         return;
+    if (_ResendFocusGained(L"recovery"))
+    {
+        _needsFocusRecovery = FALSE;
+        _pIPCClient->ClearNeedsSyncFlag();
+        _EndFocusGap();
+        SendCaretPositionUpdate();
+        WIND_LOG_INFO(L"Deferred focus recovery sent (async), state will arrive via push\n");
+    }
+    else
+    {
+        WIND_LOG_WARN_FMT(L"Deferred focus recovery send failed focusSession=%llu", _focusSessionId);
+        _needsFocusRecovery = FALSE;
+    }
+}
 
+void CTextService::SetTitleMatchEnabled(BOOL bEnabled)
+{
+    const LONG prev = InterlockedExchange(&_titleMatchEnabled, bEnabled ? 1 : 0);
+    // 关→开：首个 focus_gained 可能早于开关到达（新进程首焦 vs 握手推送是竞态），补发交给
+    // TSF 线程判（本函数跑在 async reader 线程，不能发同步 IPC）。
+    if (prev == 0 && bEnabled && _pLangBarItemButton != nullptr)
+        _pLangBarItemButton->PostTitleMatchResync();
+}
+
+void CTextService::ResyncFocusForTitleMatch()
+{
+    // 判据见 WindowTitlePolicy.h ShouldResyncFocusOnSwitch。
+    if (!wind::window_title::ShouldResyncFocusOnSwitch(_focusSentTitleBlind != FALSE, IsTitleMatchEnabled() != FALSE,
+                                                       HasFocus() != FALSE, HasActiveComposition() != FALSE))
+        return;
+    if (_pIPCClient == nullptr || !_pIPCClient->IsConnected())
+        return;
+    _focusSentTitleBlind = FALSE;
+    if (_ResendFocusGained(L"title_match_on"))
+        WIND_LOG_DEBUG_FMT(L"compat.focus.title_resync sent focusSession=%llu", _focusSessionId);
+}
+
+BOOL CTextService::_ResendFocusGained(const wchar_t* why)
+{
     LONG caretX = _lastFocusCaretX;
     LONG caretY = _lastFocusCaretY;
     LONG caretHeight = _lastFocusCaretHeight > 0 ? _lastFocusCaretHeight : DEFAULT_CARET_HEIGHT;
@@ -4361,41 +4420,35 @@ void CTextService::TryRecoverFocusState()
         caretY = _lastKnownCaretY;
         caretHeight = _lastKnownCaretHeight;
         caretSource = CARET_SRC_LAST_KNOWN;
-        WIND_LOG_INFO_FMT(L"Recovering focus state with last known caret x=%ld y=%ld h=%ld", caretX, caretY, caretHeight);
+        WIND_LOG_INFO_FMT(L"Resending focus (%ls) with last known caret x=%ld y=%ld h=%ld", why, caretX, caretY, caretHeight);
     }
 
-    WIND_LOG_INFO_FMT(L"Attempting deferred focus recovery focusSession=%llu x=%ld y=%ld h=%ld src=%d",
-        _focusSessionId, caretX, caretY, caretHeight, caretSource);
+    WIND_LOG_INFO_FMT(L"Resending focus_gained (%ls) focusSession=%llu x=%ld y=%ld h=%ld src=%d",
+        why, _focusSessionId, caretX, caretY, caretHeight, caretSource);
 
-    // 异步化：SendFocusGained 现在是 fire-and-forget。状态由 push pipe 经
-    // CMD_ACTIVATION_STATUS_PUSH 异步送达，AsyncReader 线程的回调走 PostMessage
-    // 到 TSF 线程的 WM_ACTIVATION_STATUS, 最终触发 ApplyActivationStatusResponse。
     // 输入诊断 HUD（Task 7）：与 OnSetFocus / compartment OnChange 一致，重新查询当前
     // 焦点 DocMgr 的 InputScope mask，避免恢复路径硬编码 mask=0 让 HUD 误显示
     // "原因: 无"。若此刻拿不到焦点 DocMgr（理论上不应发生，仅作防御），mask 退化为 0，
     // reason 仍据线程级 _bKeyboardDisabled + mask 计算，与另两条上报路径同语义。
-    UINT64 recoveryMask = 0;
-    ITfDocumentMgr* pDocMgrRecover = nullptr;
-    if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgrRecover)) && pDocMgrRecover != nullptr)
+    // 窗口类名 / 标题同样现取（与 OnSetFocus 同一函数）：不带的话服务端按「不知道是哪个窗口」
+    // 解析，窗口规则全部不命中，且会被当成换了窗口去重推 DLL 配置。
+    UINT64 mask = 0;
+    std::wstring rootClass;
+    std::wstring rootTitle;
+    ITfDocumentMgr* pDocMgr = nullptr;
+    if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgr)) && pDocMgr != nullptr)
     {
-        recoveryMask = _QueryInputScopeMask(pDocMgrRecover);
-        pDocMgrRecover->Release();
+        mask = _QueryInputScopeMask(pDocMgr);
+        _QueryFocusRootWindowIdentity(pDocMgr, rootClass, rootTitle);
+        pDocMgr->Release();
     }
-    uint8_t recoveryReason = ComputeInputReason(_bKeyboardDisabled != FALSE, recoveryMask, false);
-    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask,
-                                     _bKeyboardDisabled != FALSE, recoveryReason, caretSource))
-    {
-        _needsFocusRecovery = FALSE;
-        _pIPCClient->ClearNeedsSyncFlag();
-        _EndFocusGap();
-        SendCaretPositionUpdate();
-        WIND_LOG_INFO(L"Deferred focus recovery sent (async), state will arrive via push\n");
-    }
-    else
-    {
-        WIND_LOG_WARN_FMT(L"Deferred focus recovery send failed focusSession=%llu", _focusSessionId);
-        _needsFocusRecovery = FALSE;
-    }
+    // 标题只记长度（用户数据）。
+    WIND_LOG_DEBUG_FMT(L"compat.focus.rootclass (%ls) focusSession=%llu class=%ls title_len=%u",
+                       why, _focusSessionId, rootClass.c_str(), (unsigned)rootTitle.size());
+    uint8_t reason = ComputeInputReason(_bKeyboardDisabled != FALSE, mask, false);
+    return _pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, mask,
+                                        _bKeyboardDisabled != FALSE, reason, caretSource,
+                                        rootClass.c_str(), rootTitle.c_str());
 }
 
 BOOL CTextService::_InitIPCClient()
@@ -4653,6 +4706,10 @@ BOOL CTextService::_InitIPCClient()
     // Route through LangBarItemButton's proven message window (same TSF thread,
     // known-working cross-thread channel used by PostUpdateFullStatus et al.).
     _pIPCClient->SetServiceReadyCallback([pThis]() {
+        // 推送通道（重）连上了 = 新的服务会话：会话级开关回到默认。标题采集开关必须清零——
+        // 服务端先发 CMD_SERVICE_READY、再收 token、再推握手配置（同一条管道按序到达，本回调在
+        // reader 线程上同步执行），故清零必然早于握手推来的新值，不会把它冲掉。
+        pThis->SetTitleMatchEnabled(FALSE);
         if (pThis->_pLangBarItemButton != nullptr)
             pThis->_pLangBarItemButton->PostServiceReady();
     });
@@ -5257,17 +5314,42 @@ HWND CTextService::_ResolveFocusWindow(ITfDocumentMgr* pDocMgr, uint8_t* pSrcOut
     return hwndFocus;
 }
 
-// 焦点所在**顶层**窗口的类名，随 focus_gained 上报。空串 = 拿不到（服务端回落既有行为）。
+// 窗口标题，至多 kMaxTitleChars 个 UTF-16 码元（截断不留半个代理对）。取不到为空串。
+//
+// 用 InternalGetWindowText 而非 GetWindowTextW：后者对本进程窗口会**发 WM_GETTEXT**，宿主 UI
+// 线程卡住时就卡在这里，而本函数跑在 OnSetFocus 的同步路径上。前者直接读系统存的标题，不进窗口过程。
+static std::wstring _QueryWindowTitle(HWND hwnd)
+{
+    if (hwnd == nullptr)
+        return std::wstring();
+    // +1 给结尾 NUL，+1 多读一个码元：截断点落在代理对中间时 TruncateTitle 才看得见。
+    wchar_t buf[wind::window_title::kMaxTitleChars + 2] = {};
+    int n = InternalGetWindowText(hwnd, buf, (int)(sizeof(buf) / sizeof(buf[0])));
+    if (n <= 0)
+        return std::wstring();
+    return std::wstring(wind::window_title::TruncateTitle(std::wstring_view(buf, (size_t)n)));
+}
+
+// 焦点所在**顶层**窗口的类名与标题，随 focus_gained 上报。空串 = 拿不到（服务端回落既有行为）。
 //
 // 取顶层（GA_ROOT）而不是焦点窗口本身：要回答的是「这次焦点落在哪一种壳窗口里」，
 // 而任务栏 / 切换器的身份写在顶层窗口的类名上（Shell_TrayWnd 等），子控件类名五花八门。
-std::wstring CTextService::_QueryFocusRootWindowClass(ITfDocumentMgr* pDocMgr)
+// 标题同取顶层窗口（浏览器 / 编辑器的标签页名、文件名写在那里）；**仅当** core 推开了
+// CONFIG_KEY_COMPAT_TITLE_MATCH 才取，否则一次都不碰（标题是用户数据）。
+void CTextService::_QueryFocusRootWindowIdentity(ITfDocumentMgr* pDocMgr, std::wstring& windowClass,
+                                                 std::wstring& windowTitle)
 {
+    windowClass.clear();
+    windowTitle.clear();
     HWND hwndFocus = _ResolveFocusWindow(pDocMgr, nullptr, nullptr);
     if (hwndFocus == nullptr)
-        return std::wstring();
+        return;
     HWND hwndRoot = GetAncestor(hwndFocus, GA_ROOT);
-    return _QueryWindowClass(hwndRoot != nullptr ? hwndRoot : hwndFocus);
+    if (hwndRoot == nullptr)
+        hwndRoot = hwndFocus;
+    windowClass = _QueryWindowClass(hwndRoot);
+    if (wind::window_title::ShouldCollectTitle(IsTitleMatchEnabled() != FALSE))
+        windowTitle = _QueryWindowTitle(hwndRoot);
 }
 
 // 采集并上报一次诊断快照。见 TextService.h 的声明注释。
@@ -6813,6 +6895,17 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOO
         return FALSE;
     }
 
+    // 空文本兜底占位用哪个字符（GH#175）：由 core 按本进程 compat 规则
+    // `composition_placeholder` 决定、经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 下发（默认空格）。
+    // 浏览器受控 `<input>` 会 trim 组合中的 value，空格被削掉后 React 回写、浏览器终止组合，
+    // 故出厂给浏览器下发 ZWSP。core 自己发来的占位（非空文本）原样写入，这里不做任何映射。
+    //
+    // ⚠️ 写组合区只有这一个口子（InsertTextAndStartComposition / 延迟组合 / hold 全都汇到这里）。
+    // 上屏 / 取消 / 宿主终止都是整段替换或清空组合 range，ZWSP 与空格一样不会残留
+    // （见 CCommitTextEditSession / CEndCompositionEditSession / OnCompositionTerminated）。
+    const wchar_t* placeholder = wind::placeholder::PlaceholderForKind(
+        static_cast<uint8_t>(InterlockedCompareExchange(&_compositionPlaceholderKind, 0, 0)));
+
     ITfContext* pContext = nullptr;
     HRESULT hr = pDocMgr->GetTop(&pContext);
     pDocMgr->Release();
@@ -6823,7 +6916,8 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOO
         return FALSE;
     }
 
-    CUpdateCompositionEditSession* pEditSession = new CUpdateCompositionEditSession(this, pContext, full, fullCaret, noUnderline);
+    CUpdateCompositionEditSession* pEditSession =
+        new CUpdateCompositionEditSession(this, pContext, full, fullCaret, noUnderline, placeholder);
 
     // Timing: measure RequestEditSession duration
     LARGE_INTEGER startTime, endTime, freq;
@@ -7473,7 +7567,8 @@ void CTextService::ResetComposingState(BOOL keepPairState)
 //
 // 常规：放在末尾（余码/引导符都是「用户还要接着打」的内容，插入点自然跟在后面）。
 //
-// ★ 例外是**占位组合**（内容恰为一个空格，见 Rust 侧 `COMPOSITION_PLACEHOLDER`）：
+// ★ 例外是**占位组合**（内容恰为一个空格，见 Rust 侧 `COMPOSITION_PLACEHOLDER`；浏览器宿主里
+// 按 compat 规则 `composition_placeholder` 发的是 ZWSP，见 CompositionPlaceholder.h / GH#175，两者都认）：
 // 它不是给用户看的内容，只是因为 TSF 不接受空组合、而输入法又需要一个活着的组合
 // （非嵌入模式下编码由候选窗自绘；联想态压根没有编码）。此时插入点必须落在**它前面**，
 // 否则用户看到光标凭空右移一格——正是「空格很突兀」的由来（2026-08-16 用户反馈）。
@@ -7484,7 +7579,7 @@ void CTextService::ResetComposingState(BOOL keepPairState)
 // ⚠️ 取值必须与 Rust 侧 `COMPOSITION_PLACEHOLDER` 一致，改一处要同步改另一处。
 int CTextService::_CompositionCaretFor(const std::wstring& composition)
 {
-    return composition == L" " ? 0 : static_cast<int>(composition.length());
+    return wind::placeholder::IsPlaceholderText(composition) ? 0 : static_cast<int>(composition.length());
 }
 
 BOOL CTextService::InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition)

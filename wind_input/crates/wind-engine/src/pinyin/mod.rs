@@ -3766,6 +3766,30 @@ impl Engine for PinyinEngine {
                 // 与 push_unique 一致：store 层的前缀子码命中也是子短语，降到完整匹配之后。
                 c.is_partial =
                     !c.is_prefix && c.code.len() < query.len() && query.starts_with(&c.code);
+                // 编码手填成简拼的用户词（`rq` → 「$Y年$M月$D日」，GH#177）：码与击键逐字相同，
+                // 上面的精确查找会把它当**全拼精确命中**放进完整匹配层；而这串击键的系统候选
+                // 全在简拼层（`is_abbrev`，层级里最沉的一层），层级是硬闸门 ⇒ 权重 0 也恒居首选。
+                // 击键被判为纯简拼时（`is_abbreviation`：非完整音节序列），码 == 击键的用户词
+                // 本身就是简拼码，归入同一简拼层按权重 / 词频竞争（与 step5 / 下方简拼召回同层）。
+                // 比 `abbr_query` 而非 `query`：双拼下 `query` 是转换后的全拼，与击键不同域，
+                // 码恰为那段全拼的用户词是真正的全拼命中，不能降层。
+                // `natural_order` 不改：它承载同码用户词的导入序（t80），层内等权时仍按它排。
+                //
+                // ⚠️ **击键本身是音节（序列）的前缀时不降层**（`sh`/`zh`/`zho`/`yans`，判据即
+                // 混输闸门 `is_possible_pinyin_sequence`）。`is_abbreviation` 对这类「未打完的
+                // 音节」同样判真，但它们的主解释是全拼：系统有一大批前缀补全（是 / 上…），
+                // 而简拼层排在前缀层、子短语层之后（`cmp_match_layers`）。此时降层就不是
+                // 「与系统简拼同层竞争」，而是沉到整批补全之下、常常出首页——用户给 `sh`
+                // 配的词凭空打不出来了。故只在击键**无法**读作全拼（`rq`/`bzd`）时降层，
+                // 这时它的同串对手只剩简拼候选，降层恰好落在它们之间。
+                if stroke_is_plain_abbrev
+                    && !c.is_prefix
+                    && c.code == abbr_query
+                    && !self.is_possible_pinyin_sequence(abbr_query)
+                {
+                    c.is_abbrev = true;
+                    abbrev_full_hit = true;
+                }
                 // 用户/临时词的前缀补全（is_prefix=true，码更长）：打到词尾附近就提升进完整
                 // 匹配层，否则被首音节同音子短语整层淹没（长词打到第 3-4 音节才给的根因）。
                 // is_prefix 保持结构真值不动，排序提升由 is_promoted_completion 承接。

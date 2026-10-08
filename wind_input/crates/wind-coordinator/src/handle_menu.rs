@@ -12,6 +12,11 @@ use wind_keys::keymap;
 use wind_ui_types::ToolbarState;
 use wind_ui_types::{CandidateOp, MenuAnchor, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 
+/// 候选窗定位方式与坐标：菜单一起写，写回目标也按这一组判（见 `menu_writeback_target`）。
+const CANDIDATE_POS_FIELDS: [&str; 3] = ["candidate_position_mode", "candidate_x", "candidate_y"];
+/// 状态气泡定位方式与坐标，同上。
+const STATUS_POS_FIELDS: [&str; 3] = ["status_position_mode", "status_x", "status_y"];
+
 /// 菜单打开后的焦点事件豁免期，见 [`Coordinator::menu_close_on_focus_change`]。
 ///
 /// 取 250ms 的依据：下界须盖住跨宿主切换时旧宿主 focus_lost 迟到的约 100ms（实测
@@ -448,7 +453,10 @@ impl Coordinator {
     /// 读取侧规则压过全局，只改全局用户看不到任何变化（C2-33 / GH#148）。
     pub(crate) fn status_reset_position(&self) {
         let name = self.active_process_name();
-        if self.rule_status_position(&name).is_some() {
+        if self
+            .rule_status_position(&name, &self.active_focus_window())
+            .is_some()
+        {
             use wind_config::app_compat::StatusPositionMode as SP;
             self.write_status_position_rule(&name, Some(SP::FollowCaret), 0, 0);
             return;
@@ -478,7 +486,7 @@ impl Coordinator {
     pub(crate) fn save_status_tip_pos(&self, x: i32, y: i32) {
         use wind_config::app_compat::StatusPositionMode as SP;
         let name = self.active_process_name();
-        if let Some((mode, _, _)) = self.rule_status_position(&name) {
+        if let Some((mode, _, _)) = self.rule_status_position(&name, &self.active_focus_window()) {
             if mode == SP::Fixed {
                 let (x, y) = avoid_unset_sentinel(x, y);
                 self.write_status_position_rule(&name, Some(SP::Fixed), x, y);
@@ -518,7 +526,9 @@ impl Coordinator {
     /// 配了定位方式就以规则为准，没配才看全局。
     pub(crate) fn save_candidate_pos(&self, x: i32, y: i32) {
         let name = self.active_process_name();
-        if let Some((rule_fixed, _, _)) = self.rule_candidate_fixed_pos(&name) {
+        if let Some((rule_fixed, _, _)) =
+            self.rule_candidate_fixed_pos(&name, &self.active_focus_window())
+        {
             if rule_fixed {
                 let (x, y) = avoid_unset_sentinel(x, y);
                 self.save_candidate_pos_for_app(&name, x, y);
@@ -554,7 +564,9 @@ impl Coordinator {
             tracing::warn!("save_candidate_pos: 无用户配置目录，无法持久化 process={name}");
             return;
         };
-        if let Err(e) = wind_config::app_compat::set_user_candidate_fixed_pos(&user_dir, name, x, y)
+        let target = self.menu_writeback_target(name, &CANDIDATE_POS_FIELDS);
+        if let Err(e) =
+            wind_config::app_compat::set_user_candidate_fixed_pos(&user_dir, target, x, y)
         {
             tracing::error!("save_candidate_pos: 写用户 compat.toml 失败: {e}");
             return;
@@ -586,9 +598,11 @@ impl Coordinator {
             tracing::warn!("set_candidate_position_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_candidate_position_mode(&user_dir, &name, mode)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_candidate_position_mode(
+            &user_dir,
+            self.menu_writeback_target(&name, &CANDIDATE_POS_FIELDS),
+            mode,
+        ) {
             tracing::error!("set_candidate_position_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -621,9 +635,11 @@ impl Coordinator {
             tracing::warn!("set_ignore_host_ime_close_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_ignore_host_ime_close(&user_dir, &name, enabled)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_ignore_host_ime_close(
+            &user_dir,
+            self.menu_writeback_target(&name, &["ignore_host_ime_close"]),
+            enabled,
+        ) {
             tracing::error!("set_ignore_host_ime_close_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -650,7 +666,7 @@ impl Coordinator {
     pub(crate) fn status_toggle_pinned(&self) {
         use wind_config::app_compat::StatusPositionMode as SP;
         let name = self.active_process_name();
-        if let Some((mode, x, y)) = self.rule_status_position(&name) {
+        if let Some((mode, x, y)) = self.rule_status_position(&name, &self.active_focus_window()) {
             let now_fixed = mode != SP::Fixed;
             if now_fixed {
                 // 先落方式（坐标沿用旧值，多半是 0 哨兵），再请 UI 报当前位置覆盖之。
@@ -904,7 +920,7 @@ impl Coordinator {
     /// ⇒ 收成一张表后，「写反」这件事在结构上不可能发生。
     ///
     /// 编号按菜单显示顺序排，与 `InitialMode` / `AutoPairRule` 的「0=跟随全局」约定一致。
-    const FIRST_SHOW_MENU: [(
+    pub(crate) const FIRST_SHOW_MENU: [(
         u8,
         Option<wind_config::app_compat::FirstShowMode>,
         &'static str,
@@ -932,19 +948,26 @@ impl Coordinator {
     /// 2. 当前焦点的密码框抑制态（只降不升，理由见 [`Self::relax_password_suppress_for_focus`]）；
     /// 3. 逐客户端重推 DLL 的密码框吃键门控（与 2 出自同一判定函数）；
     /// 4. 逐客户端重推英文自动配对配置（DLL 的 `_englishPairEngine` 只认推过去的值）。
+    /// 5. 逐客户端重推空文本兜底占位字符（GH#175，`composition_placeholder`）。
+    /// 6. 逐客户端重推「本进程可能命中标题规则」开关（DLL 据此采不采窗口标题）。
     ///
-    /// 3、4 是幂等的逐客户端推送，值没变时 DLL 收到同值，无副作用。
+    /// 3～6 是幂等推送，值没变时 DLL 收到同值，无副作用。
     pub(crate) fn reload_app_compat(&self) {
         let reloaded = wind_config::app_compat::AppCompat::load(
             self.compat_dirs.0.as_deref(),
             self.compat_dirs.1.as_deref(),
         );
         *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        // 按键路径那三项（占位字符 / 候选窗定位 / 收窗 opt-in）是按旧表预提取的。
+        self.refresh_active_compat_lookups();
+        self.refresh_mode_scope_after_reload();
         #[cfg(windows)]
         self.sync_host_render_whitelist();
         self.relax_password_suppress_for_focus();
         self.push_password_suppress_config(0);
         self.push_english_pair_config(0);
+        self.push_composition_placeholder_config(0);
+        self.push_compat_title_match_config(0);
     }
 
     /// 设置端 `compat.*` 写入之后的收口：重载规则表，再让当前前台进程的 `active_compat`
@@ -997,17 +1020,20 @@ impl Coordinator {
             tracing::warn!("set_first_show_mode: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) = wind_config::app_compat::set_user_first_show_mode(&user_dir, &name, mode) {
+        let target = self.menu_writeback_target(&name, &["first_show_mode"]);
+        if let Err(e) = wind_config::app_compat::set_user_first_show_mode(&user_dir, target, mode) {
             tracing::error!("set_first_show_mode: 写用户 compat.toml 失败: {e}");
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
         self.reload_app_compat();
-        // 3）当前应用立即生效。
+        // 3）当前应用立即生效：按新表对焦点窗口**重新解析**，不直接把 `mode` 塞进缓存——
+        //    「跟随全局」清掉的是这一条，`*` / 更低级规则的值会透上来，直接写会与实际生效值不符。
+        let resolved = self.with_active_compat_rule(|r| r.and_then(|r| r.first_show_mode));
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .first_show_mode = mode;
+            .first_show_mode = resolved;
         tracing::info!(
             "候选窗首显策略 for process={name}: {}",
             mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
@@ -1066,17 +1092,20 @@ impl Coordinator {
             tracing::warn!("set_auto_pair_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) = wind_config::app_compat::set_user_auto_pair(&user_dir, &name, enabled) {
+        let target = self.menu_writeback_target(&name, &["auto_pair"]);
+        if let Err(e) = wind_config::app_compat::set_user_auto_pair(&user_dir, target, enabled) {
             tracing::error!("set_auto_pair_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
         self.reload_app_compat();
-        // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）。
+        // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）：
+        //    按新表重新解析，理由同 `set_first_show_mode`。
+        let resolved = self.with_active_compat_rule(|r| r.and_then(|r| r.auto_pair));
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .auto_pair = enabled;
+            .auto_pair = resolved;
         tracing::info!(
             "符号自动配对 for process={name}: {}",
             match enabled {
@@ -1110,9 +1139,11 @@ impl Coordinator {
             tracing::warn!("set_password_force_english_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_password_force_english(&user_dir, &name, enabled)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_password_force_english(
+            &user_dir,
+            self.menu_writeback_target(&name, &["password_force_english"]),
+            enabled,
+        ) {
             tracing::error!("set_password_force_english_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -1143,9 +1174,13 @@ impl Coordinator {
             tracing::warn!("status_position: 无用户配置目录，无法持久化 process={name}");
             return false;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_status_position(&user_dir, name, mode, x, y)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_status_position(
+            &user_dir,
+            self.menu_writeback_target(name, &STATUS_POS_FIELDS),
+            mode,
+            x,
+            y,
+        ) {
             tracing::error!("status_position: 写用户 compat.toml 失败: {e}");
             return false;
         }
@@ -1186,7 +1221,7 @@ impl Coordinator {
             tracing::warn!("set_status_position_rule: 当前焦点进程未知，忽略本次设置");
             return;
         }
-        let (x, y) = match self.rule_status_position(&name) {
+        let (x, y) = match self.rule_status_position(&name, &self.active_focus_window()) {
             Some((SP::Fixed, x, y)) => (x, y),
             _ => (0, 0),
         };
@@ -1227,9 +1262,11 @@ impl Coordinator {
             tracing::warn!("set_status_fallback_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_status_fallback(&user_dir, &name, fallback)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_status_fallback(
+            &user_dir,
+            self.menu_writeback_target(&name, &["status_fallback_position"]),
+            fallback,
+        ) {
             tracing::error!("set_status_fallback_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -1274,7 +1311,8 @@ impl Coordinator {
             return;
         };
         // 1）写用户层 compat.toml。
-        if let Err(e) = wind_config::app_compat::set_user_schema(&user_dir, &name, value.clone()) {
+        let target = self.menu_writeback_target(&name, &["schema"]);
+        if let Err(e) = wind_config::app_compat::set_user_schema(&user_dir, target, value.clone()) {
             tracing::error!("set_app_schema_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -1284,7 +1322,7 @@ impl Coordinator {
         if code == 1 && !self.has_remembered_schema(&name) {
             self.remember_app_schema(&name, &self.engine_mgr.active_schema_id());
         }
-        self.apply_app_schema_on_focus(&name);
+        self.apply_app_schema_on_focus(&name, &self.active_focus_window());
         tracing::info!(
             "应用独立方案 for process={name}: {}",
             value.as_deref().unwrap_or("(follow-global)")
@@ -1319,10 +1357,16 @@ impl Coordinator {
             return;
         };
         // 1）写用户层 compat.toml。
-        let written = if is_punct {
-            wind_config::app_compat::set_user_initial_punct(&user_dir, &name, mode)
+        let field = if is_punct {
+            "initial_punct"
         } else {
-            wind_config::app_compat::set_user_initial_mode(&user_dir, &name, mode)
+            "initial_mode"
+        };
+        let target = self.menu_writeback_target(&name, &[field]);
+        let written = if is_punct {
+            wind_config::app_compat::set_user_initial_punct(&user_dir, target, mode)
+        } else {
+            wind_config::app_compat::set_user_initial_mode(&user_dir, target, mode)
         };
         if let Err(e) = written {
             tracing::error!("set_initial_state_rule: 写用户 compat.toml 失败: {e}");
@@ -1333,8 +1377,9 @@ impl Coordinator {
         // 3）刷新 active 缓存的判据位：同 pid 时 update_active_compat 提前 return，不会自己刷。
         //    漏掉这步会让「切出本应用时是否重算」用上过期的判据。
         //    注意先取值再持 active_compat 锁，避免与 app_compat 锁形成嵌套顺序。
-        let want_mode = self.rule_initial_mode(&name).map(|m| m.is_chinese());
-        let want_punct = self.rule_initial_punct(&name).map(|m| m.is_chinese());
+        let win = self.active_focus_window();
+        let want_mode = self.rule_initial_mode(&name, &win).map(|m| m.is_chinese());
+        let want_punct = self.rule_initial_punct(&name, &win).map(|m| m.is_chinese());
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1715,21 +1760,23 @@ impl Coordinator {
             // 却不生效，还会显示成没选。所以先置灰，让用户先启用这条规则再逐项设置。
             let has_proc = enabled;
             let enabled = enabled && rule_switch != wind_config::app_compat::RuleSwitch::Disabled;
-            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) = {
-                let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-                let rule = table.get_rule(&proc);
-                (
-                    rule.and_then(|r| r.candidate_position_mode),
-                    rule.and_then(|r| r.ignore_host_ime_close),
-                    rule.and_then(|r| r.password_force_english),
-                    rule.and_then(|r| r.schema.clone()),
-                    rule.and_then(|r| r.status_position_mode),
-                    rule.and_then(|r| r.status_fallback_position),
-                )
-            };
-            let cur_first_show = self.rule_first_show_mode(&proc);
-            let cur_mode = self.rule_initial_mode(&proc);
-            let cur_punct = self.rule_initial_punct(&proc);
+            // 勾选显示的是**焦点窗口**生效中的值（与 auto_pair 读 active_compat 同口径）；菜单写回
+            // 仍只写纯进程键（带窗口条件的规则 P4 之前只能手写），见 app_compat 的写回接口。
+            let proc_win = self.active_focus_window();
+            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) =
+                self.with_compat_rule(&proc, &proc_win, |rule| {
+                    (
+                        rule.and_then(|r| r.candidate_position_mode),
+                        rule.and_then(|r| r.ignore_host_ime_close),
+                        rule.and_then(|r| r.password_force_english),
+                        rule.and_then(|r| r.schema.clone()),
+                        rule.and_then(|r| r.status_position_mode),
+                        rule.and_then(|r| r.status_fallback_position),
+                    )
+                });
+            let cur_first_show = self.rule_first_show_mode(&proc, &proc_win);
+            let cur_mode = self.rule_initial_mode(&proc, &proc_win);
+            let cur_punct = self.rule_initial_punct(&proc, &proc_win);
             let cur_auto_pair = self
                 .active_compat
                 .lock()

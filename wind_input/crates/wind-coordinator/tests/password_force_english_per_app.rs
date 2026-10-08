@@ -46,6 +46,7 @@ fn focus(coord: &Coordinator) {
         caret_source: 0,
         bundle_id: PROC.to_string(),
         window_class: String::new(),
+        window_title: String::new(),
     });
 }
 

@@ -1338,6 +1338,107 @@ fn encode_words_keeps_position_for_unencodable() {
     );
 }
 
+/// GH#171：码表方案加「汉字+数字」（姓名+手机号）时只用中文部分取码。
+/// 单条、批量（设置端出码 / 导入词表）两个入口都要放行，且与纯中文那部分同码。
+#[test]
+fn encode_skips_non_han_like_phone_number() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    let mgr = EngineManager::new(&make_config(&["wubi86"]), Some(&dir));
+    let han = mgr.encode_word("wubi86", "张三").expect("张三 应出得来码");
+    assert_eq!(
+        mgr.encode_word("wubi86", "张三13800138000").as_deref(),
+        Ok(han.as_str()),
+        "数字应被跳过，按「张三」取码"
+    );
+    assert_eq!(
+        mgr.encode_words("wubi86", &["张三13800138000", "张三 abc"]),
+        vec![han.clone(), han],
+        "批量入口（设置端出码 / 导入）口径必须一致"
+    );
+    assert_eq!(
+        mgr.encode_word("wubi86", "张1"),
+        mgr.encode_word("wubi86", "张"),
+        "只剩一个汉字时按单字规则"
+    );
+    assert_eq!(
+        mgr.encode_word("wubi86", "138"),
+        Err(wind_engine::encoder::EncodeError::NoHanChars)
+    );
+    // 码表里有码的非汉字（〇 = llll）照样参与取码：「二〇二六」按四字公式 AaBaCaZa 取
+    // 二〇二 的首码 + 六 的首码，不能被当成「二二六」。
+    let first = |w: &str| {
+        mgr.encode_word("wubi86", w)
+            .unwrap()
+            .chars()
+            .next()
+            .unwrap()
+    };
+    let want: String = [first("二"), first("〇"), first("二"), first("六")]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        mgr.encode_word("wubi86", "二〇二六").as_deref(),
+        Ok(want.as_str())
+    );
+    assert_eq!(
+        mgr.encode_words("wubi86", &["二〇二六年"]),
+        vec![mgr.encode_word("wubi86", "二〇二六年").unwrap()]
+    );
+    assert_ne!(
+        mgr.encode_word("wubi86", "二〇二六"),
+        mgr.encode_word("wubi86", "二二六"),
+        "〇 不该被跳过"
+    );
+    // 生僻字（码表里没码的**汉字**）不能被当成可跳过的字符。
+    assert_eq!(
+        mgr.encode_word("wubi86", "张\u{20000}三1"),
+        Err(wind_engine::encoder::EncodeError::MissingCode { ch: '\u{20000}' })
+    );
+}
+
+/// GH#181①：自动造词按**用户实际打的码**取位。
+///
+/// 真实 wubi86 词库里「彧」有两条同长全码 `akge`(1247) / `gkgy`(978)，单字全码表按权重
+/// 挑 `akge`。用户若是打 `gkgy` 上屏的，造出的「彧幻」就该是 `gk`+`xn`，否则草稿落在
+/// `akxn` 下，他回打 `gkxn` 永远召不回。
+#[test]
+fn hinted_encode_follows_the_code_user_typed() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    let mgr = EngineManager::new(&make_config(&["wubi86"]), Some(&dir));
+    assert!(mgr.prewarm_reverse_index("wubi86") || mgr.reverse_index_if_ready("wubi86").is_some());
+    let no_hint = mgr.encode_word_with_hints("wubi86", "彧幻", &[]);
+    assert_eq!(
+        no_hint.as_deref(),
+        Ok("akxn"),
+        "无提示时沿用全码表（权重挑码）"
+    );
+    assert_eq!(
+        mgr.encode_word_with_hints("wubi86", "彧幻", &[('彧', "gkgy".into())])
+            .as_deref(),
+        Ok("gkxn"),
+        "用户打的是 gkgy，取位必须跟它走"
+    );
+    // 只打了前缀（2 码）也行：取同前缀里够长的那条。「朥」eool/muol 同权，全码表按字典序挑 eool。
+    assert_eq!(
+        mgr.encode_word_with_hints("wubi86", "幻朥", &[('朥', "mu".into())])
+            .as_deref(),
+        Ok("xnmu")
+    );
+    // 提示与本方案的码对不上（如临时拼音上屏带的是拼音码）→ 回退全码表，不硬用。
+    assert_eq!(
+        mgr.encode_word_with_hints("wubi86", "彧幻", &[('彧', "yu".into())]),
+        no_hint
+    );
+}
+
 #[test]
 fn encode_words_handles_empty_input() {
     let dir = data_dir();

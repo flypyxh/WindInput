@@ -102,16 +102,15 @@ impl Coordinator {
     ///
     /// available 校验放在这里而不是解析层：available 可热重载，按当时的值判才能随之生效；
     /// 且启动预热只覆盖 available，放行任意 id 等于允许焦点路径上同步冷构建。
-    pub(crate) fn app_schema_rule(&self, proc: &str) -> Option<AppSchemaRule> {
-        if proc.is_empty() {
-            return None;
-        }
-        let raw = {
-            let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-            match table.get_rule(proc)?.app_schema()? {
-                AppSchema::Remember => return Some(AppSchemaRule::Remember),
-                AppSchema::Fixed(id) => id.to_string(),
-            }
+    ///
+    /// 规则按 (进程, 窗口) 解析；记忆表（`@remember`）仍按进程名记。
+    pub(crate) fn app_schema_rule(&self, proc: &str, win: &FocusWindow) -> Option<AppSchemaRule> {
+        let raw = self.with_compat_rule(proc, win, |r| match r?.app_schema()? {
+            AppSchema::Remember => Some(None),
+            AppSchema::Fixed(id) => Some(Some(id.to_string())),
+        })?;
+        let Some(raw) = raw else {
+            return Some(AppSchemaRule::Remember);
         };
         if self.engine_mgr.available_schemas().contains(&raw) {
             Some(AppSchemaRule::Fixed(raw))
@@ -157,8 +156,8 @@ impl Coordinator {
 
     /// 焦点在该进程时应当使用的方案：固定 → 规则值；`@remember` → 记忆表，无记录用全局；
     /// 无规则 → 全局。
-    pub(crate) fn app_schema_target(&self, proc: &str) -> String {
-        match self.app_schema_rule(proc) {
+    pub(crate) fn app_schema_target(&self, proc: &str, win: &FocusWindow) -> String {
+        match self.app_schema_rule(proc, win) {
             Some(AppSchemaRule::Fixed(id)) => id,
             Some(AppSchemaRule::Remember) => self
                 .remembered_schema(proc)
@@ -176,7 +175,7 @@ impl Coordinator {
     /// 同步切换时缓冲**只丢弃**（[`PendingInput::Discard`]）：焦点切入那一刻 active token 已是
     /// 新宿主，上屏会把旧应用的码打进新应用。菜单改规则、热重载对齐也走这里，那两处缓冲
     /// 本就已被菜单/重载清掉，丢弃与上屏同效。
-    pub(crate) fn apply_app_schema_on_focus(&self, proc: &str) {
+    pub(crate) fn apply_app_schema_on_focus(&self, proc: &str, win: &FocusWindow) {
         // 「比较 + 切换」整段互斥，见 `AppSchemaState::switch_lock`。代际 +1 也放在锁内：
         // 后台线程持锁检查时看到的代际与它随后切换时一致。
         let _switch = self
@@ -185,7 +184,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let generation = self.app_schema.intent_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let target = self.app_schema_target(proc);
+        let target = self.app_schema_target(proc, win);
         if target.is_empty() || target == self.engine_mgr.active_schema_id() {
             return;
         }
@@ -198,6 +197,7 @@ impl Coordinator {
         };
         debug!("按应用方案: {proc} 的目标 {target} 尚未加载，保持当前方案、后台加载");
         let proc = proc.to_string();
+        let win = win.clone();
         let spawned = std::thread::Builder::new()
             .name("app-schema-load".into())
             .spawn(move || {
@@ -208,7 +208,7 @@ impl Coordinator {
                     warn!("按应用方案: {target} 加载失败，{proc} 保持当前方案");
                     return;
                 }
-                c.finish_deferred_app_schema(generation, &proc, &target);
+                c.finish_deferred_app_schema(generation, &proc, &win, &target);
             });
         match spawned {
             Ok(h) => {
@@ -227,7 +227,13 @@ impl Coordinator {
     ///
     /// 「检查 + 切换」整段持 `switch_lock`：否则检查通过后、切换之前焦点线程可以完成下一次
     /// 切入，本函数再把方案切回已作废的旧目标。
-    pub(crate) fn finish_deferred_app_schema(&self, generation: u64, proc: &str, target: &str) {
+    pub(crate) fn finish_deferred_app_schema(
+        &self,
+        generation: u64,
+        proc: &str,
+        win: &FocusWindow,
+        target: &str,
+    ) {
         let _switch = self
             .app_schema
             .switch_lock
@@ -237,7 +243,7 @@ impl Coordinator {
             debug!("按应用方案: {target} 加载完成，但焦点已离开 {proc} 或期间手切过，不切换");
             return;
         }
-        if self.app_schema_target(proc) != target {
+        if self.app_schema_target(proc, win) != target {
             return;
         }
         self.switch_schema_light(target, proc, PendingInput::CommitPerPolicy);
@@ -336,7 +342,7 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         let proc = self.active_process_name();
-        match self.app_schema_rule(&proc) {
+        match self.app_schema_rule(&proc, &self.active_focus_window()) {
             Some(AppSchemaRule::Fixed(_)) => {
                 info!("按应用方案: {proc} 内手切到 {schema_id}（临时，不写 schema.active）");
                 true
@@ -394,7 +400,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = self.engine_mgr.active_schema_id();
         let proc = self.active_process_name();
-        self.apply_app_schema_on_focus(&proc);
+        self.apply_app_schema_on_focus(&proc, &self.active_focus_window());
     }
 
     /// 设置页「设为当前」（`schema.setActive` RPC）直接切了引擎：那是全局意图，全局方案跟随。
@@ -497,7 +503,7 @@ mod tests {
             !c.engine_mgr.is_loaded("zb"),
             "前置条件：headless 不预热，zb 是冷的"
         );
-        c.apply_app_schema_on_focus("code.exe");
+        c.apply_app_schema_on_focus("code.exe", &FocusWindow::default());
         assert!(
             c.app_schema.pending_load.lock().unwrap().is_some(),
             "冷方案必须交给后台线程，而不是在焦点路径上同步构建"
@@ -515,16 +521,16 @@ mod tests {
     #[test]
     fn deferred_switch_is_dropped_when_intent_moved_on() {
         let (c, dir) = fixture("stale");
-        c.apply_app_schema_on_focus("code.exe");
+        c.apply_app_schema_on_focus("code.exe", &FocusWindow::default());
         c.debug_wait_app_schema_load();
         // 回到起点：焦点落到无规则应用（目标 = 全局 za）。
-        c.apply_app_schema_on_focus("plain.exe");
+        c.apply_app_schema_on_focus("plain.exe", &FocusWindow::default());
         assert_eq!(c.engine_mgr.active_schema_id(), "za");
 
         // 模拟「切入 code.exe 时 zb 还冷、加载期间焦点又切走了」。
         let stale = c.app_schema.intent_gen.load(Ordering::SeqCst);
-        c.apply_app_schema_on_focus("plain.exe");
-        c.finish_deferred_app_schema(stale, "code.exe", "zb");
+        c.apply_app_schema_on_focus("plain.exe", &FocusWindow::default());
+        c.finish_deferred_app_schema(stale, "code.exe", &FocusWindow::default(), "zb");
         assert_eq!(
             c.engine_mgr.active_schema_id(),
             "za",
@@ -533,16 +539,16 @@ mod tests {
 
         // 对照：代际未变 ⇒ 照切（否则上一条断言在「永远不切」的实现下也会绿）。
         let current = c.app_schema.intent_gen.load(Ordering::SeqCst);
-        c.finish_deferred_app_schema(current, "code.exe", "zb");
+        c.finish_deferred_app_schema(current, "code.exe", &FocusWindow::default(), "zb");
         assert_eq!(c.engine_mgr.active_schema_id(), "zb");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 把 zb 暖好（冷加载一次）再回到 za：之后切入 code.exe 走同步轻量切换。
     fn warm_zb_then_back_to_za(c: &Arc<Coordinator>) {
-        c.apply_app_schema_on_focus("code.exe");
+        c.apply_app_schema_on_focus("code.exe", &FocusWindow::default());
         c.debug_wait_app_schema_load();
-        c.apply_app_schema_on_focus("plain.exe");
+        c.apply_app_schema_on_focus("plain.exe", &FocusWindow::default());
         assert_eq!(c.engine_mgr.active_schema_id(), "za", "前置：回到全局 za");
         assert!(c.engine_mgr.is_loaded("zb"), "前置：zb 已暖");
     }
@@ -625,7 +631,9 @@ mod tests {
         let stale = c.app_schema.intent_gen.load(Ordering::SeqCst);
         let focus_in_progress = c.app_schema.switch_lock.lock().unwrap();
         let c2 = c.clone();
-        let h = std::thread::spawn(move || c2.finish_deferred_app_schema(stale, "code.exe", "zb"));
+        let h = std::thread::spawn(move || {
+            c2.finish_deferred_app_schema(stale, "code.exe", &FocusWindow::default(), "zb")
+        });
         // 旧实现下后台线程不等锁，这段时间里就跑完了；新实现下它一直卡在锁上。
         let _ = wait_until(|| h.is_finished());
         // 焦点线程完成这次切入：代际 +1（目标 za = 当前，无需切）。
@@ -651,7 +659,7 @@ mod tests {
         let clear = wind_ipc::codec::encode_clear_composition();
 
         c.state.lock().unwrap().input_buffer = "a".into();
-        c.apply_app_schema_on_focus("code.exe");
+        c.apply_app_schema_on_focus("code.exe", &FocusWindow::default());
         assert_eq!(c.engine_mgr.active_schema_id(), "zb");
         let got: Vec<Vec<u8>> = cap.try_iter().collect();
         assert!(
@@ -666,11 +674,11 @@ mod tests {
 
         // 对照：冷方案加载完成（焦点仍在该应用）那条路照 commit_on_switch 上屏——
         // 否则上面几条断言在「一律不上屏」的实现下也会绿。
-        c.apply_app_schema_on_focus("plain.exe");
+        c.apply_app_schema_on_focus("plain.exe", &FocusWindow::default());
         c.state.lock().unwrap().input_buffer = "a".into();
         let _ = cap.try_iter().count();
         let current = c.app_schema.intent_gen.load(Ordering::SeqCst);
-        c.finish_deferred_app_schema(current, "code.exe", "zb");
+        c.finish_deferred_app_schema(current, "code.exe", &FocusWindow::default(), "zb");
         assert_eq!(c.engine_mgr.active_schema_id(), "zb");
         let got: Vec<Vec<u8>> = cap.try_iter().collect();
         assert!(
@@ -695,14 +703,14 @@ mod tests {
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
         for _ in 0..3 {
             assert_eq!(
-                c.app_schema_rule("code.exe"),
+                c.app_schema_rule("code.exe", &FocusWindow::default()),
                 None,
                 "不在 available ⇒ 未配置"
             );
         }
         let reported = || c.app_schema.warned_invalid.lock().unwrap().len();
         assert_eq!(reported(), 1, "同一 (进程, id) 只报一次");
-        assert_eq!(c.app_schema_rule("vim.exe"), None);
+        assert_eq!(c.app_schema_rule("vim.exe", &FocusWindow::default()), None);
         assert_eq!(reported(), 2, "换一个进程要另报");
         let _ = std::fs::remove_dir_all(&dir);
     }

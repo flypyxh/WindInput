@@ -40,13 +40,6 @@ use wind_ipc::protocol::{
     UIELEMENT_ACTION_SET_SELECTION, UiElementPage,
 };
 
-/// compat 里表示「所有应用」的进程名，目前只被 `host_drawn_candidates` 的回落查表认。
-///
-/// ⛔ 刻意**不**做成 `AppCompat::get_rule` 的通用通配：那会让 `process = "*"` 的一条规则
-/// 把全部字段（初始中英、首显档、定位方式……）一次性套到每个应用头上，是个比本次要解决
-/// 的问题大得多的语义变更。这里只给「推断收窗」这一条判据留一个全局关闭口。
-pub(crate) const HOST_DRAWN_WILDCARD: &str = "*";
-
 impl Coordinator {
     /// 消费一次 DLL 的 `CMD_UIELEMENT_STATE`：**两张账一起写完，再统一刷一次 UI**。
     ///
@@ -210,9 +203,9 @@ impl Coordinator {
     /// 反转成 opt-in 之后，查错 pid 的代价从「彻底不能用」降成「多一个框」，但规则该生效
     /// 而不生效仍是 bug，判据不变。）
     ///
-    /// 覆盖查两层：先查本进程名，再回落到通配规则 `process = "*"`。通配那层保留下来是给
-    /// 反方向用的——某类宿主普遍需要收窗时可一行开到全局；opt-in 之后它不再是「故障半径
-    /// 的配套」，因为默认已经不会出现「所有应用候选框都没了」。
+    /// `process = "*"` 通配规则由 `AppCompat::get_rule` 统一合成（本进程规则逐字段叠在通配之上；
+    /// 查不到进程名时 `get_rule` 不吃通配，这里显式取通配那条）。通配是给反方向用的——某类宿主普遍需要收窗时可一行开到
+    /// 全局；opt-in 之后它不再是「故障半径的配套」，因为默认已经不会出现「所有应用候选框都没了」。
     ///
     /// 查不到进程名时按默认（**不**收窗）走：查不到名字就等于查不到规则，而 opt-in 的前提
     /// 是「有人明确说过这个宿主要收」——查不出是谁，就谈不上它被指名过。
@@ -220,19 +213,31 @@ impl Coordinator {
         let Some(pid) = self.uielement_reader_pid() else {
             return false;
         };
-        let name = self.cached_proc_name((pid as u64) << 32);
-        let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-        let by_process = if name.is_empty() {
-            None
-        } else {
-            table.get_rule(&name).and_then(|r| r.host_drawn_candidates)
+        // 命中的就是焦点应用：读焦点变化 / 规则重载时预提取好的值（`ActiveLookups`），不查表。
+        //
+        // 窗口来源与下面现查那支不同：预提取按 active 槽的窗口（焦点实例这一刻的窗口），现查按
+        // `focus_window_of_pid`（该 pid 名下最近一次 focus_gained 的窗口）。焦点实例刚获焦时
+        // 两者相同；只在同一进程的旧实例只发 ime_activated、没再 focus_gained 时可能不同，那时
+        // active 槽才是正在输入的那个窗口。PID 复用时 `revalidate_pid_name` 把两边一起清空。
+        let prefetched = {
+            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            (ac.pid == pid).then_some(ac.lookups.host_drawn_candidates)
         };
-        by_process
-            .or_else(|| {
-                table
-                    .get_rule(HOST_DRAWN_WILDCARD)
-                    .and_then(|r| r.host_drawn_candidates)
-            })
+        let rule = prefetched.unwrap_or_else(|| {
+            let name = self.cached_proc_name((pid as u64) << 32);
+            // `get_rule("")` 不吃通配（空名口径）；本判据历来对无名进程也认通配
+            // （`an_unnamed_process_still_honours_the_wildcard_rule`），故显式取通配那条。
+            let key = if name.is_empty() {
+                wind_config::app_compat::ANY_PROCESS
+            } else {
+                name.as_str()
+            };
+            // 窗口取该 pid 最近一次获焦的那个：游戏常常一次 focus_gained 都没有 ⇒ 空窗口 ⇒
+            // 只按进程名（窗口规则不命中），与引入窗口条件之前一致。
+            let win = self.focus_window_of_pid(pid);
+            self.with_compat_rule(key, &win, |r| r.and_then(|r| r.host_drawn_candidates))
+        });
+        rule
             // ★★★ 没有规则 ⇒ **不**据此收窗（2026-09-15 反转，原为 `unwrap_or(true)`）。
             //
             // 「读走候选串 ⇒ 它在画」这条推断立案时自陈「至今没有反证样本」——那份日志里
@@ -471,6 +476,8 @@ mod tests {
             first_show_mode: Some(wind_config::app_compat::FirstShowMode::Instant),
             ..Default::default()
         };
+        // 像 `update_active_compat` 那样连带预提取按键路径读的规则值。
+        c.refresh_active_compat_lookups();
     }
 
     fn drain(rx: &std::sync::mpsc::Receiver<UiCommand>) -> Vec<&'static str> {
@@ -523,11 +530,12 @@ mod tests {
     /// 把进程名登记进 `pid_names`，让 `active_process_name()` 查得到（compat 覆盖要用）。
     fn name_pid(c: &Coordinator, pid: u32, name: &str) {
         c.pid_names.lock().unwrap().insert(pid, name.to_string());
+        c.refresh_active_compat_lookups();
     }
 
     /// 装一份只含一条规则的 compat 表。
     fn compat_rule(c: &Coordinator, rule: wind_config::app_compat::AppCompatRule) {
-        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![rule]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![rule]));
     }
 
     /// ★★★ 默认不因「读走候选串」收窗：**普通应用一定要看得见候选框**。
@@ -637,6 +645,56 @@ mod tests {
             KeyAction::UpdateComposition { text, .. } => text.as_str(),
             other => panic!("期望组合区更新，实得 {other:?}"),
         }
+    }
+
+    /// GH#175：非嵌入模式的占位字符按**焦点应用**的 compat 规则取——浏览器（规则配 zwsp）
+    /// 出口是 ZWSP，别的应用仍是空格；push 侧按 pid 直查走的是同一张表、同一个入口。
+    ///
+    /// 断言落在按键**出口**（`handle_key_event_policed`），理由同下一条：判据返回什么不算数，
+    /// 被出口读到才算数。变异检验：`Coordinator::composition_placeholder` 改回常量空格 ⇒ 红。
+    #[test]
+    fn placeholder_char_follows_the_focused_apps_compat_rule() {
+        use wind_config::app_compat::{AppCompat, AppCompatRule, PlaceholderChar};
+        let (c, _rx) = coord();
+        *c.preedit_display.lock().unwrap() = PreeditDisplay::CandidateTop;
+        *c.app_compat.lock().unwrap() = AppCompat::from_rules(vec![AppCompatRule {
+            process: "msedge.exe".into(),
+            composition_placeholder: Some(PlaceholderChar::Zwsp),
+            ..Default::default()
+        }]);
+        {
+            let mut names = c.pid_names.lock().unwrap();
+            names.insert(42, "msedge.exe".into());
+            names.insert(43, "wps.exe".into());
+        }
+
+        focus_pid(&c, 42);
+        assert_eq!(
+            composition_of(&type_code(&c, "ni")),
+            "\u{200B}",
+            "浏览器（规则 zwsp）出口应是零宽空格"
+        );
+        assert_eq!(
+            c.composition_placeholder_for_token(42 << 32),
+            PlaceholderChar::Zwsp
+        );
+
+        press(&c, 0x1B); // Esc 收掉组合，换个焦点再打
+        focus_pid(&c, 43);
+        assert_eq!(
+            composition_of(&type_code(&c, "ni")),
+            COMPOSITION_PLACEHOLDER,
+            "未配规则的应用（WPS）保持空格"
+        );
+        assert_eq!(
+            c.composition_placeholder_for_token(43 << 32),
+            PlaceholderChar::Space
+        );
+        assert_eq!(
+            c.composition_placeholder_for_token(0),
+            PlaceholderChar::Space,
+            "pid 未知 ⇒ 空格"
+        );
     }
 
     /// ★★★ 候选窗被压住 ⇒ **强制嵌入编码**：非 app_inline 一律降级回 app_inline。
@@ -804,7 +862,7 @@ mod tests {
             };
             // ↓ 这三行是 `handle_key_event_policed` 出口那一步的复述（见上面的 ⚠️）。
             let out = if c.preedit_uses_placeholder() {
-                action.with_composition_placeholder()
+                action.with_composition_placeholder(c.composition_placeholder())
             } else {
                 action
             };
@@ -1134,7 +1192,7 @@ mod tests {
         compat_rule(
             &c,
             wind_config::app_compat::AppCompatRule {
-                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                process: wind_config::app_compat::ANY_PROCESS.into(),
                 host_drawn_candidates: Some(true),
                 ..Default::default()
             },
@@ -1147,9 +1205,9 @@ mod tests {
         );
 
         // 本进程自己的规则优先于通配：通配开、本进程显式关 ⇒ 照弹我们的窗。
-        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![
             wind_config::app_compat::AppCompatRule {
-                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                process: wind_config::app_compat::ANY_PROCESS.into(),
                 host_drawn_candidates: Some(true),
                 ..Default::default()
             },
@@ -1158,7 +1216,7 @@ mod tests {
                 host_drawn_candidates: Some(false),
                 ..Default::default()
             },
-        ]);
+        ]));
         assert_eq!(c.ui_suppressed_by_host(), None, "本进程规则应压过通配");
     }
 
@@ -1178,7 +1236,7 @@ mod tests {
         compat_rule(
             &c,
             wind_config::app_compat::AppCompatRule {
-                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                process: wind_config::app_compat::ANY_PROCESS.into(),
                 host_drawn_candidates: Some(true),
                 ..Default::default()
             },

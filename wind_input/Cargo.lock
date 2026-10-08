@@ -2479,6 +2479,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "core-foundation-sys",
+ "libc",
  "serde",
  "serde_json",
  "toml 0.8.23",

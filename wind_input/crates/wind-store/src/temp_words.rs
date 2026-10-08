@@ -286,7 +286,11 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen(schema);
+            // 没删到就不动代次：代次一变下游就整表重建索引（见测试
+            // evict_without_deletion_keeps_words_generation）。
+            if deleted > 0 {
+                self.bump_words_gen(schema);
+            }
             Ok(deleted)
         })
     }
@@ -502,7 +506,9 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen(schema);
+            if promoted {
+                self.bump_words_gen(schema);
+            }
             Ok(promoted)
         })
     }
@@ -865,6 +871,33 @@ mod tests {
             "created_at 更早的那条该被淘汰"
         );
         assert!(!s.get_temp_words("wb", "aa_new").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 没删到词就不能动代次：代次一变，`UserTextIndex` / 联想索引就整表重扫用户词。
+    /// 协调器每 64 次造词调一次淘汰，绝大多数时候词数远在上限内——空提交照样 bump 的话，
+    /// 等于每 64 次造词白白触发一轮全表重建（及其分配器高水位）。
+    #[test]
+    fn evict_without_deletion_keeps_words_generation() {
+        let path = tmp("wind_tw_evict_nogen.redb");
+        let s = Store::open(&path).unwrap();
+        s.learn_temp_word("wb", "a", "甲", 800, 0).unwrap();
+        let before = s.words_generation_of("wb");
+        assert_eq!(s.evict_temp_words("wb", 10).unwrap(), 0);
+        assert_eq!(s.words_generation_of("wb"), before, "未删词却 bump 了代次");
+        assert_eq!(s.evict_temp_words("wb", 0).unwrap(), 1);
+        assert_ne!(s.words_generation_of("wb"), before, "删了词必须 bump 代次");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 晋升落空（临时词已不在）同样不能动代次，理由同上。
+    #[test]
+    fn promote_missing_temp_word_keeps_words_generation() {
+        let path = tmp("wind_tw_promote_nogen.redb");
+        let s = Store::open(&path).unwrap();
+        let before = s.words_generation_of("wb");
+        assert!(!s.promote_temp_word("wb", "zz", "无").unwrap());
+        assert_eq!(s.words_generation_of("wb"), before);
         let _ = std::fs::remove_file(&path);
     }
 

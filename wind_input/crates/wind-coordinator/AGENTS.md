@@ -17,6 +17,7 @@
 | `src/coordinator/push_config.rs` | **子模块**：push 通道推送（activation status / 各配置帧 / `push_state_update`） |
 | `src/coordinator/langbar_icon.rs` | **子模块**：语言栏图标 SHM 发布（`ICON_PUBLISHER` 进程级单例 + 状态角标） |
 | `src/coordinator/app_schema.rs` | **子模块**：按应用方案（compat.toml `schema`）——焦点跨进程切入的轻量切换（冷方案后台加载）、手切分流（规则应用不写 `schema.active`）、全局方案 `AppSchemaState::global`（**不读** `rt().config.schema.active`：手切只写盘、内存 config 不刷新）、`@remember` 记忆表（state.toml `app_schemas`） |
+| `src/coordinator/window_ctx.rs` | **子模块**：compat 规则按窗口上下文解析（设计 `docs/design/compat-window-match.md` P2）——`client_token → 最近 focus_gained 的窗口`记账、**规则查表唯一入口** `with_compat_rule`（焦点 / 按 token / 按 pid 三种取窗口口径）、进入类跨越判据 `entry_crossed`（pid 变或带窗口条件的进入类规则集合变；带标题条件的不计）、换窗口重推 DLL 配置、右键菜单写回目标 `menu_writeback_target`（P4：生效值来自「进程 + 窗口条件」规则时写那条的身份，否则纯进程键；整条启用 / 禁用仍按纯进程键）。新增按应用规则的消费点走这里，别再直调 `AppCompat::get_rule` |
 | `src/construct.rs` | 构造器族：生产构造 `new`（desktop-ui）+ headless 家族（`new_headless*`）+ `open_user_store`；装配核心 `build` 留在 coordinator.rs |
 | `src/ui_sender.rs` | `UiSender`：`ui_tx` 的类型。把「投递 `UiCommand` + 唤醒 UI 线程」绑成一次 `send`——UI 线程是事件驱动的（`wind_ui::wake`），只投递不唤醒 = 那条命令躺到下一个计时器到期才被看见。50+ 处发送点靠类型守门，不靠纪律 |
 | `src/config_bundle.rs` | `ConfigBundle`（配置 + 轻量派生缓存快照，热重载整体原子替换）+ `parse_pairs`/`parse_jump_out_*` 配置解析 |

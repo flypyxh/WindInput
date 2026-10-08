@@ -111,18 +111,20 @@ pub fn decode_ext(payload: &[u8]) -> Option<(&str, &[u8])> {
 /// 返回空串。**残缺不是错误**——变长段是纯追加的可选信息，旧 DLL 压根不发。
 /// 第二个返回值为 `None` 表示「本段都没走完，后面不可能有东西」，用于串联下一段。
 fn read_len_prefixed(payload: &[u8], off: usize) -> (&str, Option<usize>) {
-    if payload.len() < off + 4 {
+    // 偏移与长度都来自对端，全程 checked：32 位目标上 `start + n` 可能回绕成一个「合法」的
+    // 小区间，解出错位的垃圾而不是空串。
+    let Some(start) = off.checked_add(4) else {
         return ("", None);
-    }
-    let n = u32::from_le_bytes([
-        payload[off],
-        payload[off + 1],
-        payload[off + 2],
-        payload[off + 3],
-    ]) as usize;
-    let start = off + 4;
-    match payload.get(start..start + n) {
-        Some(b) => (std::str::from_utf8(b).unwrap_or(""), Some(start + n)),
+    };
+    let Some(len_bytes) = payload.get(off..start) else {
+        return ("", None);
+    };
+    let n = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    let Some(end) = start.checked_add(n) else {
+        return ("", None);
+    };
+    match payload.get(start..end) {
+        Some(b) => (std::str::from_utf8(b).unwrap_or(""), Some(end)),
         None => ("", None),
     }
 }
@@ -140,6 +142,21 @@ pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
 /// (`AppCompat::initial_mode_applies_to_window`) 据此保持现状，不按 per-app 规则重算。
 pub fn decode_focus_gained_window_class(payload: &[u8]) -> &str {
     match read_len_prefixed(payload, FocusGainedPayload::VAR_SECTION_OFFSET) {
+        (_, Some(next)) => read_len_prefixed(payload, next).0,
+        (_, None) => "",
+    }
+}
+
+/// 焦点所在**顶层窗口**的标题（变长段 ③）；旧 DLL / 服务端未推开采集 / 段缺失时返回空串。
+///
+/// 同样必须**顺序走过**前两段（bundleId、windowClass）再读。空串与「窗口没有标题」同义：
+/// 带 `title` 条件的规则一律不命中。
+pub fn decode_focus_gained_window_title(payload: &[u8]) -> &str {
+    let Some(class_off) = read_len_prefixed(payload, FocusGainedPayload::VAR_SECTION_OFFSET).1
+    else {
+        return "";
+    };
+    match read_len_prefixed(payload, class_off) {
         (_, Some(next)) => read_len_prefixed(payload, next).0,
         (_, None) => "",
     }
@@ -1282,6 +1299,96 @@ mod tests {
         assert_eq!(decode_focus_gained_window_class(&q), "");
     }
 
+    /// 三个变长段：`[39][bundleIdLen][bundleId][classLen][class][titleLen][title]`。
+    fn focus_payload_with_title(bundle: &str, class: &str, title: &str) -> Vec<u8> {
+        let mut p = focus_payload_with_sections(bundle, class);
+        p.extend_from_slice(&(title.len() as u32).to_le_bytes());
+        p.extend_from_slice(title.as_bytes());
+        p
+    }
+
+    #[test]
+    fn focus_gained_window_title_roundtrip_on_both_platform_shapes() {
+        // Windows 形态（新 DLL、服务端推开了采集）：bundleId 空占位 + 类名 + 标题。
+        let win = focus_payload_with_title("", "Chrome_WidgetWin_1", "新标签页 - Google Chrome");
+        assert_eq!(
+            decode_focus_gained_window_title(&win),
+            "新标签页 - Google Chrome"
+        );
+        assert_eq!(decode_focus_gained_window_class(&win), "Chrome_WidgetWin_1");
+        assert_eq!(decode_focus_gained_bundle_id(&win), "");
+        // ★ 非空 bundleId + 类名：标题段必须顺序走过前两段，固定偏移会读到垃圾。
+        let mac = focus_payload_with_title("com.apple.TextEdit", "NSWindow", "Untitled");
+        assert_eq!(decode_focus_gained_window_title(&mac), "Untitled");
+        assert_eq!(decode_focus_gained_window_class(&mac), "NSWindow");
+        // 新 DLL、未推开采集：标题段在、长度 0。
+        let off = focus_payload_with_title("", "Notepad", "");
+        assert_eq!(decode_focus_gained_window_title(&off), "");
+        assert_eq!(decode_focus_gained_window_class(&off), "Notepad");
+        // 定长段不受影响
+        let fg = decode_focus_gained(&win).unwrap();
+        assert_eq!(fg.client_token, 0);
+    }
+
+    /// 新旧互通：旧 DLL 的帧（没有标题段）解出空串，类名照旧；截断 / 越界 / 非法 UTF-8 不 panic。
+    #[test]
+    fn focus_gained_window_title_absent_or_malformed_is_empty() {
+        // 旧 DLL：39 字节、或只带 bundleId + 类名两段（P3 之前的 Windows DLL）。
+        assert_eq!(decode_focus_gained_window_title(&[0u8; 39]), "");
+        let old = focus_payload_with_sections("", "Shell_TrayWnd");
+        assert_eq!(decode_focus_gained_window_title(&old), "");
+        assert_eq!(decode_focus_gained_window_class(&old), "Shell_TrayWnd");
+        // 只有 bundleId 段（旧 macOS 包）。
+        assert_eq!(
+            decode_focus_gained_window_title(&focus_payload_with_bundle("com.apple.TextEdit")),
+            ""
+        );
+        // 类名段越界 ⇒ 后面不可能有东西。
+        let mut p = focus_payload_with_sections("", "");
+        p.truncate(p.len() - 4);
+        p.extend_from_slice(&999u32.to_le_bytes());
+        assert_eq!(decode_focus_gained_window_title(&p), "");
+        // 标题段长度越界。
+        let mut q = focus_payload_with_title("", "C", "");
+        q.truncate(q.len() - 4);
+        q.extend_from_slice(&999u32.to_le_bytes());
+        q.extend_from_slice(b"abc");
+        assert_eq!(decode_focus_gained_window_title(&q), "");
+        assert_eq!(
+            decode_focus_gained_window_class(&q),
+            "C",
+            "标题段坏了不连累类名"
+        );
+        // 标题非法 UTF-8。
+        let mut r = focus_payload_with_sections("", "C");
+        r.extend_from_slice(&2u32.to_le_bytes());
+        r.extend_from_slice(&[0xFF, 0xFE]);
+        assert_eq!(decode_focus_gained_window_title(&r), "");
+    }
+
+    /// 长度域取极值（`u32::MAX`）：64 位上越界、32 位上 `start + n` 会回绕——一律按「取不到」。
+    #[test]
+    fn focus_gained_sections_with_huge_lengths_are_empty_not_wrapped() {
+        let mut p = focus_payload_with_sections("", "C");
+        p.extend_from_slice(&u32::MAX.to_le_bytes());
+        p.extend_from_slice(b"abc");
+        assert_eq!(decode_focus_gained_window_title(&p), "");
+        let mut q = vec![0u8; 39];
+        q.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_focus_gained_window_class(&q), "");
+        assert_eq!(
+            read_len_prefixed(&q, usize::MAX - 2),
+            ("", None),
+            "偏移本身溢出"
+        );
+    }
+
+    #[test]
+    fn compat_title_match_value_is_one_byte_flag() {
+        assert_eq!(encode_compat_title_match_value(true), vec![1]);
+        assert_eq!(encode_compat_title_match_value(false), vec![0]);
+    }
+
     #[test]
     fn test_encode_host_render_setup_layout_matches_cpp() {
         use crate::protocol::HostRenderSetupEntry;
@@ -1402,6 +1509,25 @@ mod tests {
             u32::from_le_bytes([buf[p + 8], buf[p + 9], buf[p + 10], buf[p + 11]]),
             defer.len() as u32
         );
+    }
+
+    /// GH#175：占位档位按 kind 原样编成 1 字节；值与 C++ `PlaceholderForKind` 一一对应。
+    #[test]
+    fn composition_placeholder_value_is_the_kind_byte() {
+        use crate::protocol::{
+            COMPOSITION_PLACEHOLDER_BLANK, COMPOSITION_PLACEHOLDER_SPACE,
+            COMPOSITION_PLACEHOLDER_ZWSP,
+        };
+        assert_eq!(COMPOSITION_PLACEHOLDER_SPACE, 0);
+        assert_eq!(COMPOSITION_PLACEHOLDER_ZWSP, 1);
+        assert_eq!(COMPOSITION_PLACEHOLDER_BLANK, 2);
+        for k in [
+            COMPOSITION_PLACEHOLDER_SPACE,
+            COMPOSITION_PLACEHOLDER_ZWSP,
+            COMPOSITION_PLACEHOLDER_BLANK,
+        ] {
+            assert_eq!(encode_composition_placeholder_value(k), vec![k]);
+        }
     }
 }
 
@@ -1737,6 +1863,19 @@ pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
     vec![enabled as u8]
 }
 
+/// 编码组合区兜底占位字符的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_COMPOSITION_PLACEHOLDER）。
+/// 格式：kind(u8)，取 `protocol::COMPOSITION_PLACEHOLDER_*`（0 = 空格 U+0020、1 = ZWSP U+200B、
+/// 2 = 盲文空白 U+2800）。旧 DLL 认不出的值回落空格。GH#175。
+pub fn encode_composition_placeholder_value(kind: u8) -> Vec<u8> {
+    vec![kind]
+}
+
+/// 编码「本进程可能命中 compat 标题规则」开关的值部分（对齐 TSF `OnSyncConfig` 的
+/// CONFIG_KEY_COMPAT_TITLE_MATCH）。格式：enabled(u8)。默认关，关闭时 DLL 不采集窗口标题。
+pub fn encode_compat_title_match_value(enabled: bool) -> Vec<u8> {
+    vec![enabled as u8]
+}
+
 /// 编码诊断快照采集开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_DIAG_SNAPSHOT）。
 /// 格式：enabled(u8)。默认关，随输入诊断 HUD 显隐推送；关闭时 DLL 完全不采集。
 pub fn encode_diag_snapshot_value(enabled: bool) -> Vec<u8> {
@@ -1766,6 +1905,12 @@ pub fn encode_jump_out_keys_value(right_symbol: bool, vks: &[u32]) -> Vec<u8> {
 /// 再长的时效与「不过期」在实际使用上没有区别。
 pub fn encode_pair_state_ttl_value(secs: u32) -> Vec<u8> {
     (secs.min(u16::MAX as u32) as u16).to_le_bytes().to_vec()
+}
+
+/// 编码 Ctrl+空格 切换开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_CTRL_SPACE_TOGGLE）。
+/// 格式：enabled(u8)。GH#172。
+pub fn encode_ctrl_space_toggle_value(enabled: bool) -> Vec<u8> {
+    vec![enabled as u8]
 }
 
 /// 编码「英半列有自定义映射的源字符集合」（对齐 TSF `OnSyncConfig` CONFIG_KEY_CUSTOM_EN_PUNCT）。

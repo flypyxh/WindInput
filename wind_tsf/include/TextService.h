@@ -243,7 +243,7 @@ public:
     // keep it INSIDE the composition (Microsoft IME behavior — the real document
     // commit is deferred to the final CommitText). See _pendingCommitPrefix.
     BOOL InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition);
-    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格）放 0**。
+    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格 / ZWSP / 盲文空白，见 CompositionPlaceholder.h）放 0**。
     // 与 Rust 侧 COMPOSITION_PLACEHOLDER 成对，见实现处的说明。
     static int _CompositionCaretFor(const std::wstring& composition);
 
@@ -331,6 +331,19 @@ public:
     void SetPasswordSuppressEnabled(BOOL bEnabled) { _passwordSuppressEnabled = bEnabled; }
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；默认关）。
     void SetDiagSnapshotEnabled(BOOL bEnabled) { _diagSnapshotEnabled = bEnabled; }
+    // 窗口标题采集开关（core 经 CONFIG_KEY_COMPAT_TITLE_MATCH 推「本进程可能命中标题规则」；默认关）。
+    // config 回调跑在 IPC 读线程、读在 TSF 线程，用 Interlocked 读写一个 LONG。
+    // 关→开时（且非断连清零）请 TSF 线程补发一次 focus_gained，见 ResyncFocusForTitleMatch。
+    void SetTitleMatchEnabled(BOOL bEnabled);
+    BOOL IsTitleMatchEnabled() const { return _titleMatchEnabled != 0; }
+    // 标题采集开关刚打开：若当前仍有焦点、且本焦点会话发出的 focus_gained 没带标题（开关当时还没
+    // 推到——新进程首焦与握手推送是竞态），补发一次带类名与标题的 focus_gained，让标题规则
+    // （含 initial_mode）对这次切进生效。TSF 线程调用（经 WM_TITLE_MATCH_RESYNC）。
+    void ResyncFocusForTitleMatch();
+    // 空文本兜底占位字符的档位（core 经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 按本进程 compat
+    // 规则推；0 = 空格（默认）、1 = ZWSP、2 = 盲文空白，GH#175）。config 回调跑在 IPC 读线程，读在 TSF
+    // 线程，故用 Interlocked 读写一个 LONG。
+    void SetCompositionPlaceholderKind(uint8_t kind) { InterlockedExchange(&_compositionPlaceholderKind, (LONG)kind); }
 
     // 语言栏悬停提示（core 经 CONFIG_KEY_LANGBAR_TOOLTIP 推）。文案与选择逻辑全在服务端，
     // 这里只存一份原样交给 CLangBarItemButton::GetTooltipString。
@@ -356,8 +369,10 @@ public:
     // 焦点窗口解析（TSF view → GUI thread，**不含**前台窗口兜底）。诊断快照与
     // focus_gained 的窗口类上报共用它——同一判据写两处必漂移。详见实现处注释。
     HWND _ResolveFocusWindow(ITfDocumentMgr* pDocMgr, uint8_t* pSrcOut, uint64_t* pCtxIdOut);
-    // 焦点所在顶层窗口的类名，随 focus_gained 上报，供服务端区分壳的过渡型 / 停留型窗口。
-    std::wstring _QueryFocusRootWindowClass(ITfDocumentMgr* pDocMgr);
+    // 焦点所在顶层窗口的类名与标题，随 focus_gained 上报。类名供服务端区分壳的过渡型 / 停留型
+    // 窗口、匹配 compat 的 class 条件；标题只在 _titleMatchEnabled 时取（否则恒空），匹配 title 条件。
+    void _QueryFocusRootWindowIdentity(ITfDocumentMgr* pDocMgr, std::wstring& windowClass,
+                                       std::wstring& windowTitle);
     ULONGLONG GetFocusSessionId() const { return _focusSessionId; }
     // 记录 CapsLock 按键活动时刻（物理按键或服务端 cancel_on_mode_switch 的注入）。
     // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；
@@ -583,9 +598,17 @@ private:
     // 上报给 core 之外自己也留一份：IsPasswordSuppressActive 的吃键门控须本地可算。
     UINT64 _focusInputScopeMask;
     BOOL  _passwordSuppressEnabled;   // 抑制策略开关（core 经 CONFIG_KEY_PASSWORD_SUPPRESS 推；默认开）
+    // 空文本兜底占位档位（core 经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 推；默认 0 = 空格）。
+    // 见 SetCompositionPlaceholderKind / CompositionPlaceholder.h。
+    volatile LONG _compositionPlaceholderKind;
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；**默认关**）。
     // 默认关是硬要求：每次焦点切换都查三次类名 + band 的开销，不该由不排查的用户承担。
     BOOL  _diagSnapshotEnabled;
+    // 窗口标题采集开关（core 经 CONFIG_KEY_COMPAT_TITLE_MATCH 推；**默认关**）。
+    // 默认关是硬要求：标题是用户数据，规则表里没有标题规则就一次都不取（WindowTitlePolicy.h）。
+    volatile LONG _titleMatchEnabled;
+    // 本焦点会话发出的 focus_gained 是在标题采集关着时发的（没带标题）。开关随后打开时据此补发。
+    BOOL _focusSentTitleBlind;
     // 语言栏悬停提示文本与它的锁。空 = 尚未收到服务端推送（GetTooltipString 回落到本地
     // 默认文案）；握手时服务端必推一次，故空只出现在连接建立前的极短窗口。
     std::wstring _langBarTooltip;
@@ -887,6 +910,9 @@ public:
     // Called after new/re-connection to ensure TSF and service state are consistent.
     void _DoFullStateSync();
     void TryRecoverFocusState();
+    // 用当前焦点重发一次 focus_gained（caret / InputScope / 类名 / 标题现取）。延迟恢复与
+    // 标题开关补发共用。why 只进日志。
+    BOOL _ResendFocusGained(const wchar_t* why);
 
     // 焦点空窗记账，见 _focusGapStartTick。_Begin 可重复调用（只认第一次），
     // _End 在 focus_gained 真正送达后结算。

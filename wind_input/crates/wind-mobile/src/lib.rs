@@ -325,6 +325,7 @@ impl MobileCore {
             // 移动端没有窗口类概念，恒空；空串的语义是「不知道焦点在哪」，
             // 消费端据此保持现状（见 AppCompat::initial_mode_applies_to_window）。
             window_class: String::new(),
+            window_title: String::new(),
         });
     }
 

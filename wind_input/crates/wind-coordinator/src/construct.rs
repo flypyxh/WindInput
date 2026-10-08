@@ -360,9 +360,13 @@ impl Coordinator {
                 //
                 // 60 秒 / 10 秒一拍：判据是「真的没人在用」，那时重开 Database 的几毫秒
                 // 与随后几次冷查询都没人感知得到。间隔不做成配置键（见该函数的文档）。
-                s.spawn_idle_cache_reclaimer(
+                //
+                // 同一时刻顺带整理堆：丢掉的页缓存、此前构建索引与全表扫的临时分配都只是回到
+                // 分配器手里，不整理的话私有内存停在历史峰值（见 heap_trim.rs）。
+                s.spawn_idle_cache_reclaimer_then(
                     std::time::Duration::from_secs(60),
                     std::time::Duration::from_secs(10),
+                    crate::heap_trim::release_free_heap,
                 );
                 Some(s)
             }

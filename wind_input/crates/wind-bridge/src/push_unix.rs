@@ -8,7 +8,7 @@ use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 use wind_ipc::protocol::*;
 
@@ -65,7 +65,7 @@ fn handle_push_conn(mut stream: UnixStream, clients: Arc<Mutex<Vec<PushClient>>>
     let token = NEXT_PUSH_TOKEN.fetch_add(1, Ordering::Relaxed);
     info!("Push client registered (token=0x{:016X})", token);
     // 3. 注册
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = crate::push::push_channel();
     {
         let mut c = clients.lock().unwrap();
         // hooked: unix 侧不注册 connected_hook（host-render 是 Windows 专属），

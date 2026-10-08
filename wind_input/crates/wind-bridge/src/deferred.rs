@@ -58,6 +58,12 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(false, |h| h.preedit_uses_placeholder())
     }
 
+    fn composition_placeholder(&self) -> &'static str {
+        self.with_handler(crate::handler::COMPOSITION_PLACEHOLDER, |h| {
+            h.composition_placeholder()
+        })
+    }
+
     fn handle_client_connected(&self, pid: u32) {
         // 服务重启是本回调的主场景：`bridge.start()` 早于 `set_ready`（引擎/词典加载
         // 期间），DLL 若恰好在这段窗口重连，per-app 规则预热会被静默吞掉，退化回旧行为
@@ -195,10 +201,15 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_host_render_failed(reason))
     }
 
-    fn get_current_mode(&self, client_token: u64, window_class: &str) -> (bool, bool, bool) {
+    fn get_current_mode(
+        &self,
+        client_token: u64,
+        window_class: &str,
+        window_title: &str,
+    ) -> (bool, bool, bool) {
         // 未就绪时回中文模式 + 中文标点（安全默认）；就绪后委派真实处理器读权威模式。
         self.with_handler((true, false, true), |h| {
-            h.get_current_mode(client_token, window_class)
+            h.get_current_mode(client_token, window_class, window_title)
         })
     }
 

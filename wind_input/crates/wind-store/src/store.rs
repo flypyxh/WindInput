@@ -534,6 +534,19 @@ impl Store {
         idle: std::time::Duration,
         tick: std::time::Duration,
     ) {
+        self.spawn_idle_cache_reclaimer_then(idle, tick, || {});
+    }
+
+    /// 同 [`Self::spawn_idle_cache_reclaimer`]，每次回收后再调 `after`。
+    ///
+    /// 用途是让上层在同一个「真的没人在用」的时刻把空闲堆还给系统：丢掉的页缓存只是
+    /// 回到分配器手里，不整理堆的话私有内存一点不降（本 crate 不碰平台分配器，故留钩子）。
+    pub fn spawn_idle_cache_reclaimer_then(
+        self: &std::sync::Arc<Self>,
+        idle: std::time::Duration,
+        tick: std::time::Duration,
+        after: impl Fn() + Send + 'static,
+    ) {
         let weak = std::sync::Arc::downgrade(self);
         let ticks_to_idle = (idle.as_millis() / tick.as_millis().max(1)).max(1) as u32;
         let spawned = std::thread::Builder::new()
@@ -561,6 +574,8 @@ impl Store {
                             // 停在暂停态——那是故障，不是「内存没回落」。
                             Err(e) => error!("空闲回收页缓存失败：{e}"),
                         }
+                        drop(store);
+                        after();
                         pending = false;
                         quiet = 0;
                     }

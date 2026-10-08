@@ -10,6 +10,18 @@ use wind_config::app_compat::NewlineStyle;
 use wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
 
 impl Coordinator {
+    /// 仍挂在组合里的智能符号（HoldComposition）。超出时限的视为没有：C++ 定时器到点已自行提交，
+    /// 这边的 `held_text` 不会随之清掉，拿它当「还在组合」会二次提交（"。" → 等 >500ms → "=" → "。。="）。
+    pub(crate) fn live_held_text(&self) -> Option<String> {
+        let arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+        let timeout = self.smart_symbol_timeout();
+        if arm.at.is_some_and(|t| t.elapsed() < timeout) {
+            arm.held_text.clone()
+        } else {
+            None
+        }
+    }
+
     /// 当前焦点应用的上屏换行档位：per-app（compat `[[commit_newline]]`）→ 全局
     /// （`input.commit_newline`）→ 出厂 [`NewlineStyle::Keep`]。
     ///
@@ -251,6 +263,7 @@ fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
 #[derive(Debug, PartialEq)]
 struct HostDisplay {
     caret_free: Option<bool>,
+    caret_trusted: Option<bool>,
     scale: Option<f32>,
 }
 
@@ -262,6 +275,7 @@ fn decode_ext_host_display(body: &[u8]) -> Option<HostDisplay> {
     let obj = v.as_object()?;
     Some(HostDisplay {
         caret_free: obj.get("caret_free").and_then(|x| x.as_bool()),
+        caret_trusted: obj.get("caret_trusted").and_then(|x| x.as_bool()),
         scale: obj
             .get("scale")
             .and_then(|x| x.as_f64())
@@ -540,6 +554,9 @@ impl MessageHandler for Coordinator {
                     if let Some(free) = d.caret_free {
                         self.set_caret_independent(free);
                     }
+                    if let Some(trusted) = d.caret_trusted {
+                        self.set_host_caret_trusted(trusted);
+                    }
                     // wind-ui 只在 desktop-ui（桌面形态）下才是依赖；headless / Android 没有它
                     #[cfg(all(feature = "desktop-ui", not(windows), not(target_os = "macos")))]
                     if let Some(scale) = d.scale {
@@ -698,6 +715,11 @@ impl MessageHandler for Coordinator {
             schema_id: self.active_schema_id(),
             source: CommitSource::TsfDirect,
         });
+    }
+
+    fn composition_placeholder(&self) -> &'static str {
+        // GH#175：按焦点应用的 compat 规则取（空格 / ZWSP / U+2800），唯一实现在 push_config.rs。
+        Coordinator::composition_placeholder(self)
     }
 
     fn preedit_uses_placeholder(&self) -> bool {
@@ -872,7 +894,7 @@ impl MessageHandler for Coordinator {
             action
         };
         if self.preedit_uses_placeholder() {
-            action.with_composition_placeholder()
+            action.with_composition_placeholder(self.composition_placeholder())
         } else {
             action
         }
@@ -1467,14 +1489,48 @@ impl MessageHandler for Coordinator {
         // 高亮候选（含逐步转换的已转换前缀），再接着输出该小键盘字符。
         // follow_main 时键已在 handle_key_event 入口归一化为主键盘等价键，永不到达此处。
         if let Some(npc) = numpad_char(data.key_code) {
+            let has_comp = !state.input_buffer.is_empty()
+                || !state.committed_text.is_empty()
+                || !state.candidates.is_empty();
+            // 空闲 + 半角：透传，由宿主自己出字——与主键盘数字空缓冲臂（`VK_1..=VK_9`）同一语义，
+            // 判据也同源（联想态挂在 `candidates` 上，算有组合）。
+            //
+            // ⛔ 不能由我们 InsertText 出字（论坛 t285）：C++ OnTestKeyDown 对无会话的 Number
+            // 类（含小键盘全部 15 键）判「不吃」，但 OnKeyDown 在中文模式仍把它转发过来；
+            // Chrome 类宿主（Twitter / VK 的 PIN 框）无视 test 结论照调 OnKeyDown ⇒ 宿主自己
+            // 出一次、我们再插一次，双重上屏。
+            //
+            // 全角态必须照旧出字：C++ 的 `chinese_fullwidth_number` 分支那时**会吃**这批键，
+            // 透传就成了「吃了再吐」。`numpad_half_width` 开着的全角态也一样（吃键与否 C++
+            // 只看全角，不看这个开关），出的半角字由下方 `commit_highlight_then_char` 负责。
+            if !has_comp && !state.full_width {
+                self.record_commit(&npc.to_string(), 0, -1, CommitSource::Punctuation);
+                return KeyAction::PassThrough;
+            }
             // 命令候选顶屏 → 执行命令（与按空格一致），不上屏 display 标签、不追加该字符。
             if let Some(act) = self.top_commit_command_guard(&mut state) {
                 return act;
             }
-            let has_comp = !state.input_buffer.is_empty()
-                || !state.committed_text.is_empty()
-                || !state.candidates.is_empty();
             return self.commit_highlight_then_char(&mut state, npc, has_comp);
+        }
+        // 同一条闸的 follow_main 版：键已归一成主键盘键，上面那臂认不出来，运算符会落进标点臂
+        // 出「。」等（数字有主键盘空缓冲臂兜着）。C++ 的 Test 只按小键盘 Number 类判、不知道
+        // 本档位，空闲半角照样放行 ⇒ 普通宿主只出 `.`，Chrome 类宿主再加我们插的「。」。
+        // 这里与 Test 对齐，空闲半角一律透传。
+        //
+        // 比上面那臂多判一个挂着的智能符号：HoldComposition 挂着组合时 C++ 视作有会话、已吃下
+        // 本键，透传就是「吃了再吐」；交给标点臂，它会把挂着的符号一并上屏。超时的不算——C++ 定时器
+        // 已自行提交、没有会话了，而 `held_text` 在这边不会随之清掉。
+        if state.numpad_origin
+            && !state.full_width
+            && state.input_buffer.is_empty()
+            && state.committed_text.is_empty()
+            && state.candidates.is_empty()
+            && self.live_held_text().is_none()
+            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+        {
+            self.record_commit(&ch.to_string(), 0, -1, CommitSource::Punctuation);
+            return KeyAction::PassThrough;
         }
 
         // ── z-fallback 夺取：**必须早于下面的按键分派** ──
@@ -1513,7 +1569,7 @@ impl MessageHandler for Coordinator {
             keymap::VK_BACK => {
                 // 联想态：收掉候选并结束占位组合。**必须先于下面的既有分支**——那些分支
                 // 在「缓冲空 + 无已转换段」时给 `PassThrough`，而联想态挂着占位组合
-                // （见 `handle_assoc::ASSOC_COMPOSITION`），裸透传会把组合悬在宿主里。
+                // （见 `Coordinator::assoc_composition`），裸透传会把组合悬在宿主里。
                 //
                 // 这一键是吃掉还是连同收窗一起交还宿主，由 `backspace_cancels_only` 定
                 // （默认吃掉，与回车相反的理由见 `assoc_backspace`）。
@@ -2017,17 +2073,7 @@ impl MessageHandler for Coordinator {
                     // 并清空 held_text，须在此前保存，以便下方普通标点流程将旧符号纳入 CommitText。
                     // 加超时防护：若 arm.at 已超出 timeout，说明 C++ timer 已自然触发提交，
                     // held_text 已过期——不再使用，防止二次提交（"。" → 等待 >500ms → "=" → "。。="）。
-                    let pre_held_text = {
-                        let arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
-                        let timeout = self.smart_symbol_timeout();
-                        let still_in_window =
-                            arm.at.map(|t| t.elapsed() < timeout).unwrap_or(false);
-                        if still_in_window {
-                            arm.held_text.clone()
-                        } else {
-                            None
-                        }
-                    };
+                    let pre_held_text = self.live_held_text();
                     // 智能符号模式：同键连按删中文标点改英文（press2 短路返回）。
                     // 须在候选提交逻辑之前：press2 时无待输入，依赖光标前字符匹配武装态。
                     if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
@@ -2411,16 +2457,45 @@ impl MessageHandler for Coordinator {
         // update_active_compat 落进缓存，否则那边读到空名 → compat 规则匹配不上、per-app
         // 记忆表查不到，整条按应用链路静默退化成全局行为。Windows 恒为空串，不进此分支。
         if !data.bundle_id.is_empty() && new_pid != 0 {
-            self.pid_names
+            let name = data.bundle_id.to_lowercase();
+            let prev = self
+                .pid_names
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(new_pid, data.bundle_id.to_lowercase());
+                .insert(new_pid, name.clone());
+            // 名字变了（含首次落缓存）：按键路径预提取的值按新名字重算。下面的
+            // update_active_compat 在同 pid 同窗口时会早退，不会替它刷。
+            if prev.as_deref() != Some(name.as_str()) {
+                self.refresh_active_compat_lookups();
+            }
         }
         // ⚠ 取自 `mode_scope` 而非 `active_compat`：后者会被过渡窗口（任务栏）更新，
         // 拿它当「上一个模式归属宿主」会让紧随其后的桌面焦点被判成同进程、规则不再生效。
         // 详见 `mode_scope` 字段注释。
-        let (old_pid, old_has_rule) = *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner());
+        let old_scope = self
+            .mode_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // 窗口上下文记账**先于** update_active_compat：后者按该 token 记下的窗口解析规则
+        // （同进程换窗口时持续类字段即时刷新，见 `coordinator/window_ctx.rs`）。
+        // 留不留标题按进程判（`focus_window_of`）。重型段可以反查进程名（通常 bridge 连接时已缓存）。
+        let window = self.focus_window_of(
+            &self.proc_name_or_lookup(new_pid),
+            &data.window_class,
+            &data.window_title,
+        );
+        // DLL 手里那份密码门控是按该 token **旧**窗口算的（没记录 = 握手时的空窗口），换窗口时
+        // 下面的 `apply_input_diag` 只降不升，见 `apply_input_diag_capped`。
+        let dll_pfe = self.password_force_english_for_token(data.client_token);
+        let window_changed = self.note_focus_window(data.client_token, window.clone());
         self.update_active_compat(data.client_token);
+        // 同一 token 换了窗口 ⇒ DLL 手里按 token 持有的那几项配置（占位字符、密码抑制、英文配对）
+        // 可能已不对，重推。放在下面 `apply_input_diag` 之前：服务端按新窗口算密码抑制时，DLL
+        // 那份尽量已在路上（不变量 core.suppress ⊆ C++.suppress，见 `apply_input_diag`）。
+        if window_changed {
+            self.repush_window_scoped_dll_config(data.client_token);
+        }
         let new_has_rule = self
             .active_compat
             .lock()
@@ -2528,12 +2603,21 @@ impl MessageHandler for Coordinator {
         // 取舍：per_app_scope 下同进程重复 focus_gained 不再重算（此前每次都算）。记忆表由
         // record_app_mode 与当前状态保持同步，重算结果恒等于现值，故语义无变化；代价是失去了
         // 一条隐式的 compartment 脏事件自愈路径，该自愈在 IME_ACTIVATED 路径仍然保留。
-        let crossed = new_pid != 0 && old_pid != new_pid;
+        //
+        // 「跨进程」扩展为「切进来」（`focus_crossed`）：同进程内命中的带窗口条件的进入类规则
+        // 集合变了也算（AutoHotkey 两个 GUI 窗口各配各的 initial_mode）。带标题条件的规则不进
+        // 这个集合，仅标题变化永不重算（设计稿定稿决策）；唯一例外是「标题迟到」——上一次焦点
+        // 因 DLL 还没收到采集开关而没带标题，见 `focus_crossed`。
+        //
         // 作用域一票否决：任务栏 / Alt+Tab 切换器与桌面同属 explorer.exe，仅凭进程名
         // 分不开，判据只能来自窗口类。名字取 update_active_compat 刚填好的缓存（此刻必已
         // 就绪）。未配作用域的进程恒放行 ⇒ 绝大多数应用零变化。
         // 详见 `InitialModeScopeRule` 与 should_reapply_initial 注释。
         let proc_name = self.cached_proc_name(data.client_token);
+        let resolved = self.resolve_compat(&proc_name, &window);
+        let new_entry = entry_window_key(&resolved);
+        let crossed = focus_crossed(&old_scope, new_pid, &resolved, &window);
+        let title_blind = self.focus_is_title_blind(&proc_name, &window);
         let out_of_scope = !self
             .app_compat
             .lock()
@@ -2558,7 +2642,13 @@ impl MessageHandler for Coordinator {
             // 只有**真正参与决策**的焦点才推进模式归属。过渡窗口跳过这一步，是为了不把
             // 「跨进程切入」这个一次性事件提前消费掉——否则点任务栏再回桌面时，桌面就成了
             // 「同进程」，它配的 initial_mode 永远不会生效（实测缺陷，见字段注释）。
-            *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = (new_pid, new_has_rule);
+            *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = ModeScope {
+                pid: new_pid,
+                has_rule: new_has_rule,
+                entry_windows: new_entry,
+                title_blind,
+                window: window.clone(),
+            };
         }
         // 按应用方案（compat.toml `schema`）：与 initial_mode 同一个判据——跨进程切入才重算，
         // 同进程内焦点跳转不动，尊重用户在应用内的手切；作用域外的过渡窗口（任务栏）也不动，
@@ -2567,12 +2657,12 @@ impl MessageHandler for Coordinator {
         // 显式 `initial_punct` 规则要在它之后再落一次才压得住。
         // ⛔ 不得挪进 get_current_mode（DLL 同步阻塞路径），见 `coordinator/app_schema.rs`。
         if crossed && !out_of_scope {
-            self.apply_app_schema_on_focus(&proc_name);
+            self.apply_app_schema_on_focus(&proc_name, &window);
         }
         if should_reapply_initial(
             crossed,
             self.rt().config.input.default.per_app_scope(),
-            old_has_rule,
+            old_scope.has_rule,
             new_has_rule,
             out_of_scope,
         ) {
@@ -2586,7 +2676,13 @@ impl MessageHandler for Coordinator {
         // docMgr（Excel 单元格 ↔ 公式栏）不重复弹，见 last_focus_tip_token。
         self.show_focus_status_if_enabled(data.client_token);
         let pid = (data.client_token >> 32) as u32;
-        self.apply_input_diag(pid, data.disabled, data.reason, data.input_scope_mask);
+        self.apply_input_diag_capped(
+            pid,
+            data.disabled,
+            data.reason,
+            data.input_scope_mask,
+            !window_changed || dll_pfe,
+        );
         Some(status)
     }
 
@@ -2716,7 +2812,12 @@ impl MessageHandler for Coordinator {
         // 焦点。真正离开时随后的 DocChanged / Thread 会收口。
     }
 
-    fn get_current_mode(&self, client_token: u64, window_class: &str) -> (bool, bool, bool) {
+    fn get_current_mode(
+        &self,
+        client_token: u64,
+        window_class: &str,
+        window_title: &str,
+    ) -> (bool, bool, bool) {
         // 回传三元组（中英 / 全半角 / **中英标点**）。标点态不可省：DLL 的标点透传判据要按
         // 它在两份集合间二选一，漏了就会在焦点切换后的竞态窗口里误用英文态超集
         // （`,` `.` 被透传成半角）。而 per-app 的 `initial_punct` 规则正是在本方法里落地的。
@@ -2741,10 +2842,20 @@ impl MessageHandler for Coordinator {
         // `initial_chinese_mode_for` 在规则/记忆之外还有 remember_last_state 与配置默认两层。
         // 同源调用之后，这类漂移在结构上不可能再发生。
         let new_pid = (client_token >> 32) as u32;
-        let (old_pid, old_has_rule) = *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner());
-        let crossed = new_pid != 0 && old_pid != new_pid;
+        let old_scope = self
+            .mode_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (old_pid, old_has_rule) = (old_scope.pid, old_scope.has_rule);
+        // 窗口用 DLL 随本请求带来的类名 + 标题：重型段的记账（`note_focus_window`）还没跑，token
+        // 表里是上一个窗口。跨越判据与重型段同源（`focus_crossed`），窗口也同源（`focus_window_of`）。
+        // 进程名只查缓存（同步段禁止 OpenProcess）；查不到时下面本就跳过 per-app 重算。
+        let proc = self.cached_proc_name(client_token);
+        let window = self.focus_window_of(&proc, window_class, window_title);
+        let resolved = self.resolve_compat(&proc, &window);
+        let crossed = focus_crossed(&old_scope, new_pid, &resolved, &window);
         if crossed {
-            let proc = self.cached_proc_name(client_token);
             // 作用域一票否决，判据与重型段完全同源。
             // ⚠ **两处都要有**：本方法先跑且 DLL 正阻塞等它的回传值，只挡住重型段的话，
             // 状态早在这里就被改掉了，日志上却显示「已跳过」——实测就栽在这一步。
@@ -2759,8 +2870,10 @@ impl MessageHandler for Coordinator {
                     "get_current_mode: 窗口在初始模式作用域外 proc={proc} class={window_class:?} → 保持现状"
                 );
             } else if !proc.is_empty() {
-                let new_has_rule = self.rule_initial_mode(&proc).is_some()
-                    || self.rule_initial_punct(&proc).is_some();
+                let new_has_rule = resolved
+                    .rule
+                    .as_ref()
+                    .is_some_and(|r| r.initial_mode.is_some() || r.initial_punct.is_some());
                 let per_app = self.rt().config.input.default.per_app_scope();
                 let reapply = crate::coordinator::should_reapply_initial(
                     crossed,
@@ -2772,7 +2885,7 @@ impl MessageHandler for Coordinator {
                 if reapply {
                     // reset_aux=false：与重型段的调用逐字一致。随后重型段会用同样的入参
                     // 再调一次，`apply_initial_mode` 是幂等的（每次都按当前表重算目标）。
-                    self.apply_initial_mode(client_token, false);
+                    self.apply_initial_mode_in(client_token, &window, false);
                 }
                 // 锁先释放再打日志：本方法在 DLL 的同步阻塞路径上，不在持锁期间做格式化。
                 let (chinese, full, punct) = {
@@ -2815,6 +2928,7 @@ impl MessageHandler for Coordinator {
             self.push_server.set_active_token(client_token);
         }
         // 切回本输入法时同样刷新焦点进程的 caret 兼容态（异步段，不阻塞 DLL）。
+        // 本事件不带窗口信息：规则按该 token 最近一次 focus_gained 记下的窗口解析（没有则只按进程名）。
         self.update_active_compat(client_token);
         // 激活初始状态矩阵：remember=false 重置为配置默认（含全半角/标点）；
         // remember=true 保持全局记忆；state_scope="app" 恢复该应用的会话记忆。
@@ -2911,16 +3025,22 @@ impl MessageHandler for Coordinator {
             "toggle_mode: {} -> 翻转",
             if self.is_chinese_mode() { "中" } else { "英" }
         );
-        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，语义是"回到可输入中文
+        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，出厂语义是"回到可输入中文
         // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
         // chinese_mode 原本为 true（被 CapsLock 压制）时翻转反而落到英文，切换仍然无效。
+        // 落点可配（`input.capslock.mode_after_cancel`，论坛 t283 要「取消大写并进英文」），
+        // 判定见 `mode_after_caps_cancel`。
         let caps_cancelled = self.cancel_caps_on_switch();
         // 中英切换 = 一段输入结束。须在取 state 锁之前调用：terminate_auto_phrase 内部
         // 走词库 IO，不可在持 state 锁时进行。
         self.terminate_auto_phrase("toggle_mode");
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = if caps_cancelled {
-            true
+            Self::mode_after_caps_cancel(
+                &self.rt().config.input.capslock.mode_after_cancel,
+                CapsCancelSwitch::Toggle,
+                state.chinese_mode,
+            )
         } else {
             !state.chinese_mode
         };
@@ -2953,6 +3073,20 @@ impl MessageHandler for Coordinator {
         source: wind_ipc::protocol::ModeSwitchSource,
         ctrl_held: bool,
     ) -> (Option<StatusUpdateData>, String) {
+        // GH#172：用户关掉了 Ctrl+空格 切换（`keys.ctrl_space_toggle` 或自定义按键里绑 none），
+        // 而这次翻转是用户按出来的（系统输入法开关热键 / 按键侧兜底）⇒ 拒绝，回包仍是当前
+        // 模式，DLL 据此把 compartment 拉回。与下面 ignore_host_ime_close 同一条仲裁回路，
+        // 「必须再异步推一次状态」的理由也相同（见那里的 ★★★）。判据见 `ctrl_space` 模块。
+        if self.ctrl_space_switch_rejected(chinese_mode, source, ctrl_held) {
+            tracing::debug!(
+                "system_mode_switch: source={} ctrl_held={} 请求 {}，Ctrl+空格 切换已关闭，拒绝",
+                source.as_str(),
+                ctrl_held,
+                if chinese_mode { "中" } else { "英" }
+            );
+            self.push_state_update();
+            return (Some(self.build_status()), String::new());
+        }
         // per-app「忽略宿主关闭输入法」：拒绝后**不改模式**，回包仍是当前模式。DLL 侧
         // `_ApplyModeSwitch` 见到 `newChineseMode != requestedMode` 会把 compartment 拉回
         // 真实模式——这条仲裁回路早就存在（密码框强制英文用的就是它），不必新开通道。
@@ -2993,8 +3127,23 @@ impl MessageHandler for Coordinator {
             if chinese_mode { "中" } else { "英" }
         );
         // 「切换模式时取消大小写锁定」：目标模式由外部指定（Ctrl+Space/KBLSwitch），
-        // 仅取消 CapsLock 让目标模式真正生效，不改写目标。
-        let _ = self.cancel_caps_on_switch();
+        // 出厂只取消 CapsLock 让目标模式真正生效，不改写目标；`mode_after_cancel = english`
+        // 时改落英文（论坛 t283），判定与 Shift 那条同一函数（`mode_after_caps_cancel`）。
+        // 改写**只对用户按出来的切换**生效：宿主写 compartment / 菜单按请求落地，来源分派见
+        // `CapsCancelSwitch::from_system`。
+        //
+        // ⚠ 改写了目标时回包的模式就与请求不同——DLL 的 `_ApplyModeSwitch` 见到
+        // `newChineseMode != requestedMode` 会把 compartment 拉回真实模式，与 per-app
+        // 「忽略宿主关闭输入法」拒绝请求走的是同一条仲裁回路。
+        let chinese_mode = if self.cancel_caps_on_switch() {
+            Self::mode_after_caps_cancel(
+                &self.rt().config.input.capslock.mode_after_cancel,
+                CapsCancelSwitch::from_system(chinese_mode, source, ctrl_held),
+                self.is_chinese_mode(),
+            )
+        } else {
+            chinese_mode
+        };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。
@@ -4311,9 +4460,18 @@ mod ext_envelope_tests {
     fn decode_ext_host_display_fields_are_independent() {
         let d = |b: &[u8]| decode_ext_host_display(b);
         assert_eq!(
+            d(br#"{"caret_trusted":true}"#),
+            Some(HostDisplay {
+                caret_free: None,
+                caret_trusted: Some(true),
+                scale: None
+            })
+        );
+        assert_eq!(
             d(br#"{"caret_free":true,"scale":1.5}"#),
             Some(HostDisplay {
                 caret_free: Some(true),
+                caret_trusted: None,
                 scale: Some(1.5)
             })
         );
@@ -4322,6 +4480,7 @@ mod ext_envelope_tests {
             d(br#"{"scale":2}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: Some(2.0)
             })
         );
@@ -4329,6 +4488,7 @@ mod ext_envelope_tests {
             d(b"{}"),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: None
             })
         );
@@ -4337,6 +4497,7 @@ mod ext_envelope_tests {
             d(br#"{"caret_free":1,"scale":1.25}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: Some(1.25)
             })
         );
@@ -4344,6 +4505,7 @@ mod ext_envelope_tests {
             d(br#"{"caret_free":false,"scale":"2"}"#),
             Some(HostDisplay {
                 caret_free: Some(false),
+                caret_trusted: None,
                 scale: None
             })
         );
@@ -4352,6 +4514,7 @@ mod ext_envelope_tests {
             d(br#"{"scale":0}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: None
             })
         );
@@ -4359,6 +4522,7 @@ mod ext_envelope_tests {
             d(br#"{"scale":-1}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: None
             })
         );

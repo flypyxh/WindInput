@@ -350,25 +350,14 @@ final class CandidatePanel: NSPanel {
                 self.setFrameOrigin(origin)
             }
         } else {
-            let vf = screen.visibleFrame
-            // wire top-left → Cocoa bottom-left。caretBottomLine = panel 默认贴在 caret 下方时的顶边。
-            let caretBottomLine = WireGeometry.flipY(p.y, screenHeight: screen.frame.height)
-            var originX = p.x
-            var originY = caretBottomLine - size.height
-
-            // 水平: 过长候选框右溢/左溢时回拉, 保证整框可见。
-            if originX + size.width > vf.maxX { originX = vf.maxX - size.width }
-            if originX < vf.minX { originX = vf.minX }
-
-            // 垂直: 下方放不下 → 翻转到 caret 上方 (估算 caret 高 18pt, 避免遮住光标)。
-            if originY < vf.minY {
-                originY = caretBottomLine + 18
-            }
-            // 兜底夹进可见区 (翻转后仍越界, 或屏幕极小)。
-            if originY + size.height > vf.maxY { originY = vf.maxY - size.height }
-            if originY < vf.minY { originY = vf.minY }
-
-            self.setFrameOrigin(NSPoint(x: originX, y: originY))
+            // wire 点 = 光标底端，按它所在的屏钳边界（GH#179：用主屏钳会把副屏上的候选窗拽回主屏）。
+            // 往上挪 4pt 回到光标行内（服务端在光标底端下留了 2pt 间隙）：上下叠放的两块屏，
+            // 光标贴在上屏底边时，wire 点会越过分界线落到下屏。
+            let caretScreen = PanelGeometry.screen(wireX: p.x, wireY: p.y - 4) ?? screen
+            let origin = WireGeometry.followCaretOrigin(
+                wireX: p.x, wireY: p.y, size: size,
+                screenHeight: screen.frame.height, visibleFrame: caretScreen.visibleFrame)
+            self.setFrameOrigin(origin)
         }
         self.orderFrontRegardless()
         // 系统原生窗口阴影按内容 alpha 形状计算且会缓存；内容/尺寸变化后必须 invalidate，

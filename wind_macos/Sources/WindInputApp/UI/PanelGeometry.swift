@@ -34,6 +34,20 @@ enum PanelGeometry {
         return referenceScreen
     }
 
+    /// wire 点所在的屏；不落在任何屏上（尺寸不一的两屏之间的空隙、宿主报了屏外坐标）时取
+    /// **最近**的那块（对齐 Windows `MONITOR_DEFAULTTONEAREST`），无屏时 nil。
+    static func screen(wireX: CGFloat, wireY: CGFloat) -> NSScreen? {
+        guard let ref = referenceScreen else { return nil }
+        let p = NSPoint(x: wireX, y: WireGeometry.flipY(wireY, screenHeight: ref.frame.height))
+        if let s = NSScreen.screens.first(where: { $0.frame.contains(p) }) { return s }
+        func dist2(_ r: NSRect) -> CGFloat {
+            let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+            let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+            return dx * dx + dy * dy
+        }
+        return NSScreen.screens.min(by: { dist2($0.frame) < dist2($1.frame) }) ?? ref
+    }
+
     /// 状态气泡锚点用的「焦点所在屏」（C2-33 / GH#148）。
     ///
     /// 取**鼠标所在屏**，其次才是 `(wireX, wireY)`（服务端给的光标点）所在屏，都不中回退参照屏：

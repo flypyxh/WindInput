@@ -800,6 +800,36 @@ impl CandidateWindow {
         out
     }
 
+    /// 带样式文本**逐行**按宽截断（`\n` 分行，每行各自 [`Self::truncate_text_for_width`]），
+    /// 颜色区间随 `cut_with_mark` 一起裁。全部放得下返回 `None`（调用方沿用原文、不分配）。
+    ///
+    /// 逐行而非整段：竖排注释模板可以写 `\n` 排成多行，整段二分会在首行超长时把后面几行
+    /// 整个裁掉。
+    fn truncate_styled_lines(
+        &self,
+        src: &StyledText,
+        style: &TextStyle,
+        max_w: f32,
+    ) -> Option<StyledText> {
+        let text = src.as_str();
+        let mut parts = Vec::new();
+        let mut changed = false;
+        let mut start = 0;
+        for line in text.split('\n') {
+            let end = start + line.len();
+            let seg = src.slice(start, end);
+            let shown = self.truncate_text_for_width(line, style, max_w);
+            if shown == line {
+                parts.push(seg);
+            } else {
+                changed = true;
+                parts.push(seg.cut_with_mark(shown.len() - '…'.len_utf8(), "…"));
+            }
+            start = end + 1;
+        }
+        changed.then(|| StyledText::join(&parts, "\n"))
+    }
+
     fn truncate_text_for_width(&self, text: &str, style: &TextStyle, max_w: f32) -> String {
         if text.is_empty() {
             return String::new();
@@ -3068,7 +3098,9 @@ impl CandidateWindow {
         // 每候选的「固定开销」（除文字外无条件占用的宽度）与「自然文字宽」。
         // 一律用 [`Self::measure_style`] 按各节点真实字族/字重量，与渲染同源。
         let gap_w = if list_vertical { 0.0 } else { box_gap };
-        let cand_metrics: Vec<(f32, f32)> = order
+        // 同时记下每候选注释的 (总宽, 非文字开销=注释内外边距)，竖排「主词条优先」分配要用。
+        type WidthPairs = Vec<(f32, f32)>;
+        let (cand_metrics, cand_comment_w): (WidthPairs, WidthPairs) = order
             .iter()
             .map(|(i, cand)| {
                 let is_sel = *i == self.selected;
@@ -3101,12 +3133,14 @@ impl CandidateWindow {
                     base + ip.l + ip.r + im.l + im.r
                 };
                 let comment = right_comment(cand, self.rotated);
-                let comment_w = if comment.is_empty() {
-                    0.0
+                let (comment_w, comment_box) = if comment.is_empty() {
+                    (0.0, 0.0)
                 } else {
                     let cp = edges_or(&v.comment.padding, [0.0; 4]);
                     let cm = edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]);
-                    self.text_renderer
+                    let bx = cp.l + cp.r + cm.l + cm.r;
+                    let tw = self
+                        .text_renderer
                         .measure(
                             comment.as_str(),
                             &Self::measure_style(
@@ -3115,11 +3149,8 @@ impl CandidateWindow {
                                 v.comment.font_family.as_deref(),
                             ),
                         )
-                        .width
-                        + cp.l
-                        + cp.r
-                        + cm.l
-                        + cm.r
+                        .width;
+                    (tw + bx, bx)
                 };
                 let tm = if cand.no_index {
                     Edges::default()
@@ -3146,9 +3177,9 @@ impl CandidateWindow {
                         ),
                     )
                     .width;
-                (fixed, natural)
+                ((fixed, natural), (comment_w, comment_box))
             })
-            .collect();
+            .unzip();
         // 整行可用宽度（已扣窗口与候选区内边距）。
         let row_budget =
             (content_budget_px - window_pad.l - window_pad.r - list_pad.l - list_pad.r).max(0.0);
@@ -3219,16 +3250,45 @@ impl CandidateWindow {
             0.0
         };
         // 分配：参与者 = [内联编码(仅横排下与候选同行)] + 候选们。
+        // 竖排的注释文字预算（与 `order` 同序；`None` = 不截，横排与直立态恒为 `None`）。
+        let mut cand_comment_budgets: Vec<Option<f32>> = vec![None; cand_metrics.len()];
         let (inline_preedit_budget_px, cand_text_budgets) = if list_vertical {
             // 竖排：内联编码与每个候选各占一行、互不竞争，都用满整行预算（保持既有行为）。
             // 唯一例外是翻页栏并进编码行时（`pager_in_inline_row`，此时 `pager_row_w` 非 0）：
             // 那一行被它占掉一截，编码预算须同步扣除，否则超长编码会把翻页栏顶出窗口右缘。
+            //
+            // ★ 行内「主词条优先、注释让步」（论坛 t271）。行宽上限 R = `row_budget`，来自
+            //   `content_budget_px` = min(屏幕工作区宽, 主题 `behavior.vertical_max_width`)
+            //   ⊕ 竖排最小宽度兜底，再扣窗口/候选区内边距。记
+            //     F = 除注释外的固定开销（item 内边距 + 序号 + 文字内外边距），
+            //     T = 文字自然宽，C = 注释总宽（含注释内外边距 B），
+            //     Cmin = min(C, B + min_text_w) —— 注释的保底（至少露出一截加 `…`）。
+            //   文字预算 = max(R − F − Cmin, min_text_w)：文字先拿，只给注释留保底；
+            //   注释文字预算 = max(R − F − min(T, 文字预算) − B, min_text_w)：用文字排完剩下的。
+            //   两者都放得下时（T + C ≤ R − F）文字与注释都不截，与改动前逐字节一致。
+            //   此前是「文字预算 = R − F − C」，注释从不让步，超长注释把主词条挤成「你…」。
+            // ⚠️ 直立态（逐格扶正）不走本规则、保持旧行为：那里注释沿堆叠轴量的是高度，而
+            //   `cand_comment_w` 是按横向宽度量的，两套尺子混算会误截。
+            let text_budgets = cand_metrics
+                .iter()
+                .zip(&cand_comment_w)
+                .zip(cand_comment_budgets.iter_mut())
+                .map(|(((fixed, natural), &(c_w, c_box)), c_budget)| {
+                    if self.upright || c_w <= 0.0 {
+                        return (row_budget - fixed).max(min_text_w);
+                    }
+                    let base = fixed - c_w;
+                    let reserve = c_w.min(c_box + min_text_w);
+                    let text_budget = (row_budget - base - reserve).max(min_text_w);
+                    *c_budget = Some(
+                        (row_budget - base - natural.min(text_budget) - c_box).max(min_text_w),
+                    );
+                    text_budget
+                })
+                .collect::<Vec<f32>>();
             (
                 (row_budget - preedit_pad.l - pager_row_w).max(min_text_w),
-                cand_metrics
-                    .iter()
-                    .map(|(fixed, _)| (row_budget - fixed).max(min_text_w))
-                    .collect::<Vec<f32>>(),
+                text_budgets,
             )
         } else {
             let fixed_sum: f32 = cand_metrics.iter().map(|(f, _)| *f).sum();
@@ -3836,7 +3896,18 @@ impl CandidateWindow {
             item = item.child(tleaf);
             // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
             // 内/外边距完整消费：comment.padding 四边 + comment.margin 四边（左默认 6dp 兜底间距）。
-            let comment = right_comment(cand, self.rotated);
+            let mut comment = right_comment(cand, self.rotated);
+            // 竖排注释让步（分配规则见上方预扫）：超出预算时逐行截断加 `…`。
+            if let Some(max_w) = cand_comment_budgets.get(k).copied().flatten() {
+                let style = Self::measure_style(
+                    comment_fs,
+                    eff_weight(&v.comment, &v.item, is_sel, is_hover),
+                    v.comment.font_family.as_deref(),
+                );
+                if let Some(cut) = self.truncate_styled_lines(&comment, &style, max_w) {
+                    comment = Cow::Owned(cut);
+                }
+            }
             if !comment.is_empty() {
                 // 直立态同样逐格扶正：只让候选文字立起来、注释仍躺着的话，同一列里会有
                 // 两种阅读方向。⚠️ 拉丁编码也照切——「英文横着读反而对」那条取舍已被真机
@@ -6302,6 +6373,124 @@ mod width_budget_tests {
             "横排下长短候选宽度应不同，否则本用例的对照失效: {:?}",
             h.iter().map(|x| x.w).collect::<Vec<_>>()
         );
+    }
+}
+
+/// 竖排「主词条优先」宽度分配（论坛 t271）：注释过长时让步的是注释，不是候选文字。
+/// 分配规则见 `build_tree` 里竖排那一支的注释。mock 后端等宽（0.6em），只用几何断言。
+#[cfg(test)]
+mod vertical_comment_budget_tests {
+    use super::*;
+
+    fn cand(text: &str, comment: &str) -> CandidateItem {
+        CandidateItem {
+            text: text.to_string(),
+            code: String::new(),
+            label: String::new(),
+            tooltip: Default::default(),
+            comment: comment.into(),
+            comment_above: Default::default(),
+            no_index: false,
+        }
+    }
+
+    /// 竖排、scale=1、主题竖排最大宽度 `vmax_dp`（0=只受屏幕安全宽约束）。
+    fn build(vertical: bool, vmax_dp: i32, items: Vec<CandidateItem>) -> (CandidateWindow, View) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_orientation(vertical, false, false);
+        w.theme.behavior.vertical_max_width = vmax_dp;
+        w.update("", 0, "", items, 0, -1, 1, 1);
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        (w, root)
+    }
+
+    fn find_list(v: &View) -> Option<&View> {
+        if v.children.iter().any(|c| c.tag >= 0) {
+            return Some(v);
+        }
+        v.children.iter().find_map(find_list)
+    }
+
+    /// 候选 item 的 (文字, 注释) 文本（item = Row[序号, 文字, 注释?]）。
+    fn texts(root: &View) -> Vec<(String, Option<String>)> {
+        let list = find_list(root).expect("未找到候选列表容器");
+        let mut its: Vec<&View> = list.children.iter().filter(|c| c.tag >= 0).collect();
+        its.sort_by_key(|c| c.tag);
+        its.iter()
+            .map(|it| {
+                let t = it.children[1].text.clone().unwrap_or_default();
+                let c = it.children.get(2).and_then(|c| c.text.clone());
+                (t, c)
+            })
+            .collect()
+    }
+
+    /// ★ t271 主症状：注释极长时主词条完整显示，注释截断加 `…`，窗口不超上限。
+    #[test]
+    fn long_comment_yields_to_candidate_text() {
+        let long = "注".repeat(300);
+        for vmax in [0, 300] {
+            let (w, root) = build(true, vmax, vec![cand("你好", &long), cand("世界", "sj")]);
+            let t = texts(&root);
+            assert_eq!(t[0].0, "你好", "vmax={vmax}：主词条不得被注释挤截");
+            let c0 = t[0].1.as_deref().unwrap();
+            assert!(c0.ends_with('…'), "vmax={vmax}：超长注释应截断加省略号");
+            assert!(c0.chars().count() < long.chars().count());
+            assert_eq!(t[1], ("世界".into(), Some("sj".into())), "短注释不受影响");
+            let cap = if vmax > 0 {
+                vmax as f32
+            } else {
+                w.screen_safety_max_width_px() as f32
+            };
+            assert!(
+                root.measured_size().0 <= cap + 0.5,
+                "vmax={vmax}：窗口宽 {} 超出上限 {cap}",
+                root.measured_size().0
+            );
+        }
+    }
+
+    /// 放得下就一个字都不动（零回归）。
+    #[test]
+    fn fitting_text_and_comment_are_untouched() {
+        let (_, root) = build(true, 300, vec![cand("你好", "ni hao"), cand("世界", "")]);
+        let t = texts(&root);
+        assert_eq!(t[0], ("你好".into(), Some("ni hao".into())));
+        assert_eq!(t[1], ("世界".into(), None));
+    }
+
+    /// 主词条自身就超长：主词条截断，但仍给注释留出保底（看得见一截 + `…`），行宽不超上限。
+    #[test]
+    fn overlong_text_still_leaves_room_for_comment() {
+        let long_text = "长".repeat(100);
+        let (_, root) = build(true, 300, vec![cand(&long_text, "chang")]);
+        let t = texts(&root);
+        assert!(t[0].0.ends_with('…'), "主词条超出行宽时照常截断");
+        let c = t[0].1.as_deref().expect("注释节点仍在");
+        assert!(!c.is_empty());
+        assert!(
+            root.measured_size().0 <= 300.5,
+            "行宽 {}",
+            root.measured_size().0
+        );
+    }
+
+    /// 多行注释（竖排模板里写 `\n`）逐行截断：首行超长不会把后面几行整个吃掉。
+    #[test]
+    fn multiline_comment_truncates_per_line() {
+        let long = "注".repeat(300);
+        let comment = format!("{long}\nshort");
+        let (_, root) = build(true, 300, vec![cand("你好", &comment)]);
+        let t = texts(&root);
+        assert_eq!(t[0].0, "你好");
+        let c = t[0].1.as_deref().unwrap();
+        let lines: Vec<&str> = c.split('\n').collect();
+        assert_eq!(lines.len(), 2, "行数不变：{c:?}");
+        assert!(lines[0].ends_with('…'));
+        assert_eq!(lines[1], "short");
     }
 }
 

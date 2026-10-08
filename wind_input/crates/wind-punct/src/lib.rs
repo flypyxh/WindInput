@@ -327,7 +327,7 @@ pub fn custom_covered_punct_chars(conv: &PunctuationConverter, punct: &PunctConf
 /// `VK_DOWN`、`)`(0x29) 撞 `VK_SELECT`，正是最该修的那批（B-9 实测：英文标点态打 `(`
 /// 光标下移、字不上屏）。
 ///
-/// per-app 开关（`auto_pair_allowed_for_pid`）是 AND 语义、只能把已开的关掉，所以全局
+/// per-app 开关（`auto_pair_allowed_for_token`）是 AND 语义、只能把已开的关掉，所以全局
 /// 关着就一定不配对，这里据全局判是安全的；反向（全局开、某 app 关）会多排除几个键，
 /// 落在保守侧。
 fn is_pair_char(cfg: &InputConfig, ch: char) -> bool {

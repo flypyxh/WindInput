@@ -90,6 +90,9 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
                 // 问题）；解一次是为了两平台走同一条路径，将来 `.app` 补发即刻生效。
                 window_class: wind_ipc::codec::decode_focus_gained_window_class(&payload)
                     .to_string(),
+                // 同上：`.app` 目前不发标题段，解出空串。
+                window_title: wind_ipc::codec::decode_focus_gained_window_title(&payload)
+                    .to_string(),
             });
         }
     }

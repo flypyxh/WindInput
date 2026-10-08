@@ -611,6 +611,13 @@ pub trait WebDataRpc: WebDataHost {
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
             "theme.resolved" => Ok(serde_json::to_value(self.theme_follow_values())?),
+            "theme.accent" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                Ok(serde_json::to_value(self.theme_accent(name))?)
+            }
             "theme.preview" => self.web_theme_preview(params),
             "theme.getText" => self.web_theme_get_text(params),
             "theme.delete" => self.web_theme_delete(params),
@@ -1577,11 +1584,21 @@ pub trait WebDataRpc: WebDataHost {
             .ok_or_else(|| anyhow::anyhow!("方案不存在: {}", id))?;
         let base_json = serde_json::to_value(&base)?;
         // 稀疏 diff（仅变化项）写入 override 层，让方案文件后续更新仍能透传未改项。
-        let diff = json_diff(&base_json, cfg).unwrap_or(json!({}));
+        let mut diff = json_diff(&base_json, cfg).unwrap_or(json!({}));
+        // ★ `dictionaries` 不经本入口写：附加词库开关的唯一写入口是 setDictEnabled，
+        // 这里只把既有 override 里的那份原样带过去（论坛 t281）。
+        //
+        // 回传的 cfg 是设置页**打开对话框时**的 getConfig 快照，而设置端一次保存是先
+        // setDictEnabled 再 saveConfig。快照的 dictionaries 只要与方案文件基线不同（之前
+        // 翻过任一扩展库开关就是如此），`json_diff` 对数组整体比较，就会把整份**旧**数组
+        // 写进 override：刚落盘的 `enabled = false` 被冲回去，还顺带冻结了整份词库定义
+        // （path/label/顺序，见 `sparse_dict_overrides`）。在入口剥掉，而不是指望每个调用方
+        // 记得先刷新快照——CLI、旧版设置端都走这里。
+        if let Some(o) = diff.as_object_mut() {
+            o.remove("dictionaries");
+        }
         let mut ov = json_to_toml(&diff);
-        // 保留既有 override 的 dictionaries（附加词库开关由 setDictEnabled 单独管理）。
         if let toml::Value::Table(t) = &mut ov
-            && !t.contains_key("dictionaries")
             && let Some(prev) = self.engine_mgr().get_schema_override(id)
             && let Some(d) = prev.get("dictionaries")
         {
@@ -8614,6 +8631,83 @@ short_code_yield_level = 2
             "除 id/enabled 外不得携带任何结构字段，实际: {:?}",
             t.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// ★★ 论坛 t281：在设置里关掉扩展词库，保存后它仍在出词。
+    ///
+    /// 设置端一次保存先 `setDictEnabled(x, false)`，再 `saveConfig(打开对话框时的快照)`。
+    /// 快照里的 `dictionaries` 只要与方案文件基线不同（之前翻过任一扩展库开关就是如此），
+    /// `json_diff` 就会把整份**旧**数组写进 override，冲掉刚落盘的 `enabled = false`。
+    /// 词库开关的唯一写入口是 `setDictEnabled`，`saveConfig` 不得经由快照改它。
+    #[test]
+    fn save_config_snapshot_does_not_clobber_dict_toggle() {
+        let dir =
+            std::env::temp_dir().join(format!("wind_webdata_dict_toggle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(
+            schemas.join("zz_en.schema.toml"),
+            "[schema]\nid = \"zz_en\"\nname = \"英\"\n[engine]\ntype = \"english\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"en/main.dict.yaml\"\ndefault = true\n\
+             [[dictionaries]]\nid = \"en_it\"\npath = \"en/it.dict.yaml\"\ndefault_enabled = true\n\
+             [[dictionaries]]\nid = \"en_x\"\npath = \"en/x.dict.yaml\"\ndefault_enabled = true\n",
+        )
+        .unwrap();
+        let ov = dir.join("overrides");
+        std::fs::create_dir_all(&ov).unwrap();
+        let store = std::sync::Arc::new(wind_store::Store::open(dir.join("s.redb")).unwrap());
+        let c = Coordinator::new_headless_with_store_override(
+            wind_config::Config::default(),
+            Some(&dir),
+            store,
+            Some(ov.clone()),
+        );
+        let toggle = |dict: &str, on: bool| {
+            c.web_data_rpc(
+                "schema.setDictEnabled",
+                &json!({ "id": "zz_en", "dictId": dict, "enabled": on }),
+            )
+            .unwrap();
+        };
+        // 早先翻过另一个扩展库 ⇒ 合并值的 dictionaries 已与方案文件基线不同。
+        toggle("en_x", false);
+        let snapshot = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_en" }))
+            .unwrap();
+
+        // 同一次保存：先关 en_it，再回传打开对话框时的旧快照（顺带改一个普通字段）。
+        toggle("en_it", false);
+        let mut cfg = snapshot.clone();
+        cfg["schema"]["name"] = json!("英文改名");
+        c.web_data_rpc("schema.saveConfig", &json!({ "id": "zz_en", "cfg": cfg }))
+            .unwrap();
+
+        let merged = c.engine_mgr().schema_merged("zz_en").expect("方案在");
+        let enabled_of = |id: &str| {
+            merged
+                .dictionaries
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| d.enabled)
+        };
+        let saved = std::fs::read_to_string(ov.join("zz_en.toml")).unwrap();
+        assert_eq!(
+            enabled_of("en_it"),
+            Some(false),
+            "刚关掉的 en_it 被快照冲掉了：{saved}"
+        );
+        assert_eq!(
+            enabled_of("en_x"),
+            Some(false),
+            "早先关掉的 en_x 仍关：{saved}"
+        );
+        assert_eq!(merged.schema.name, "英文改名", "普通字段照常保存");
+        assert!(
+            !saved.contains("path"),
+            "override 的 dictionaries 只许 {{id, enabled}} 稀疏项，不得冻结整份定义：{saved}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task 3：schema.list 每个拼音方案应携带 scheme 字段（full/shuangpin），非拼音方案为空串。

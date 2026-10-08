@@ -103,8 +103,15 @@ pub struct CommitResultData {
 /// 正常打字时下一键的 `UpdateComposition` 会立刻把光标拉回 0，所以这个缺陷长期被掩盖；
 /// 联想态没有「下一键」，组合就那么挂着，才把它暴露出来（2026-08-16 用户反馈）。
 ///
-/// C++ 侧据此把「组合内容恰为本值」的情形一律按 `caret_pos = 0` 开组合，见
+/// C++ 侧据此把「组合内容恰为占位」的情形一律按 `caret_pos = 0` 开组合，见
 /// `TextService.cpp` 的 `_CompositionCaretFor`。**两侧取值必须一致**，改这里要同步改那里。
+///
+/// ⚠️ 本常量只是**默认值**（GH#175）：占位字符按应用可配（compat.toml 的
+/// `composition_placeholder = "space" | "zwsp" | "blank"`，出厂给浏览器配 zwsp——受控 `<input>` 会
+/// trim 组合中的 value，空格被削掉后 React 回写、浏览器终止组合，一个字都上不了屏）。
+/// 协调器发占位时一律经 [`MessageHandler::composition_placeholder`]（协调器实现为
+/// `Coordinator::composition_placeholder`）取当前应用的字符，**不要直接用本常量**。
+/// C++ 侧三种字符（空格 / U+200B / U+2800）都认作占位，见 `wind_tsf/include/CompositionPlaceholder.h`。
 pub const COMPOSITION_PLACEHOLDER: &str = " ";
 
 /// 按键事件结果类型
@@ -187,10 +194,12 @@ pub enum KeyAction {
 }
 
 impl KeyAction {
-    /// 非 app_inline（候选窗自行显示 preedit）时，应用侧组合串替换为单个占位空格、光标置前。
+    /// 非 app_inline（候选窗自行显示 preedit）时，应用侧组合串替换为单个占位字符、光标置前。
     /// 目的：保留一段组合串供应用上报 caret 坐标（候选窗定位），但不在应用内显示真实编码
     /// （避免与候选窗 preedit 重复）。对齐 Go 版"模拟空格 + 光标移前"。
-    pub fn with_composition_placeholder(self) -> KeyAction {
+    ///
+    /// `placeholder` 由调用方按当前应用给出（空格 / ZWSP / U+2800，GH#175，见 [`COMPOSITION_PLACEHOLDER`]）。
+    pub fn with_composition_placeholder(self, placeholder: &str) -> KeyAction {
         match self {
             // ⚠️ `!text.is_empty()` 这个守卫**必须留着**：空组合区意味着「这一刻不该有
             // 组合区」，本函数是 preedit 的显示策略（把编码换成占位、避免与候选窗重复显示
@@ -202,7 +211,7 @@ impl KeyAction {
             // `enter_*` 里显式发出（见 `enter_add_word_mode`）。
             KeyAction::UpdateComposition { text, .. } if !text.is_empty() => {
                 KeyAction::UpdateComposition {
-                    text: COMPOSITION_PLACEHOLDER.to_string(),
+                    text: placeholder.to_string(),
                     caret_pos: 0,
                 }
             }
@@ -214,7 +223,7 @@ impl KeyAction {
                 has_new_composition,
             } if !c.is_empty() => KeyAction::InsertText {
                 text,
-                new_composition: Some(COMPOSITION_PLACEHOLDER.to_string()),
+                new_composition: Some(placeholder.to_string()),
                 mode_changed,
                 chinese_mode,
                 has_new_composition,
@@ -229,7 +238,7 @@ impl KeyAction {
                 timeout_ms,
             } if !deferred_composition.is_empty() => KeyAction::CommitThenDeferComposition {
                 commit_text,
-                deferred_composition: COMPOSITION_PLACEHOLDER.to_string(),
+                deferred_composition: placeholder.to_string(),
                 timeout_ms,
             },
             // CommitAndHoldComposition / HoldComposition 刻意不在此列：它们的组合内容是中文符号
@@ -240,7 +249,9 @@ impl KeyAction {
 }
 
 /// 焦点数据
-#[derive(Debug, Clone)]
+///
+/// `Debug` 手写：`window_title` 是用户数据，调试输出只给长度（`{:?}` 打进日志也不泄露原文）。
+#[derive(Clone)]
 pub struct FocusData {
     pub x: i32,
     pub y: i32,
@@ -271,6 +282,31 @@ pub struct FocusData {
     /// ⚠ 空串的语义是「不知道焦点在哪」。消费端据此**保持现状**（不重算初始模式）；
     /// 未配作用域的进程不受影响，故旧 DLL / macOS 上一切照旧。
     pub window_class: String,
+    /// 同一个顶层窗口的标题，供 compat.toml 的 `title` 条件匹配；拿不到时为空串（旧 DLL、服务端
+    /// 未推开采集——没有标题规则时 DLL 不取标题，见 `CONFIG_KEY_COMPAT_TITLE_MATCH`）。
+    ///
+    /// ⚠ 用户数据（网页标题、文件名）：任何级别的日志只记长度，不记原文。
+    pub window_title: String,
+}
+
+impl std::fmt::Debug for FocusData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FocusData")
+            .field("x", &self.x)
+            .field("y", &self.y)
+            .field("height", &self.height)
+            .field("composition_start_x", &self.composition_start_x)
+            .field("composition_start_y", &self.composition_start_y)
+            .field("client_token", &self.client_token)
+            .field("input_scope_mask", &self.input_scope_mask)
+            .field("disabled", &self.disabled)
+            .field("reason", &self.reason)
+            .field("caret_source", &self.caret_source)
+            .field("bundle_id", &self.bundle_id)
+            .field("window_class", &self.window_class)
+            .field("window_title_len", &self.window_title.chars().count())
+            .finish()
+    }
 }
 
 /// 光标位置数据
@@ -308,11 +344,17 @@ pub trait MessageHandler: Send + Sync {
         false
     }
 
+    /// 当前应用的组合占位字符（GH#175）。默认空格 [`COMPOSITION_PLACEHOLDER`]；协调器按焦点应用
+    /// 的 compat 规则 `composition_placeholder` 覆盖。
+    fn composition_placeholder(&self) -> &'static str {
+        COMPOSITION_PLACEHOLDER
+    }
+
     /// 处理按键并按 preedit 显示策略后处理组合串（bridge 入口应调用此方法）。
     fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
         let action = self.handle_key_event(data);
         if self.preedit_uses_placeholder() {
-            action.with_composition_placeholder()
+            action.with_composition_placeholder(self.composition_placeholder())
         } else {
             action
         }
@@ -485,12 +527,19 @@ pub trait MessageHandler: Send + Sync {
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。
     ///
     /// `window_class`：焦点顶层窗口类，语义同 [`FocusData::window_class`]，用于跳过 shell
-    /// 过渡窗口的初始模式套用。
+    /// 过渡窗口的初始模式套用。`window_title`：同 [`FocusData::window_title`]——规则按
+    /// (进程, 类名, 标题) 解析，同步段与重型段必须拿同一个窗口算，否则带标题的规则会让两段的
+    /// 初始模式各算各的（先回一个、再被推送改回来，即「闪」）。
     ///
     /// ⚠ **这是「按应用套用初始模式」的第二个落点**，与重型段 `handle_focus_gained` 各算
     /// 各的（本方法早于它执行，DLL 正阻塞等回传值）。两处的门控条件必须同步改——只改一处
     /// 时症状是「日志显示跳过了、图标照样切」，因为真正把状态改掉的是先跑的这一个。
-    fn get_current_mode(&self, _client_token: u64, _window_class: &str) -> (bool, bool, bool) {
+    fn get_current_mode(
+        &self,
+        _client_token: u64,
+        _window_class: &str,
+        _window_title: &str,
+    ) -> (bool, bool, bool) {
         (true, false, true)
     }
 
@@ -565,26 +614,32 @@ mod placeholder_tests {
                 },
             ),
         ];
-        for (name, action) in cases {
-            let composition = match action.with_composition_placeholder() {
-                KeyAction::UpdateComposition { text, caret_pos } => {
-                    assert_eq!(caret_pos, 0, "{name}: 占位后光标须置前");
-                    text
-                }
-                KeyAction::InsertText {
-                    new_composition, ..
-                } => new_composition.expect("组合串不应消失"),
-                KeyAction::CommitThenDeferComposition {
-                    commit_text,
-                    deferred_composition,
-                    ..
-                } => {
-                    assert_eq!(commit_text, "可能", "{name}: 已承诺上屏的正文不得被改写");
-                    deferred_composition
-                }
-                other => panic!("{name}: 变体不应改变，实际 {other:?}"),
-            };
-            assert_eq!(composition, " ", "{name}: 组合串应换成占位空格");
+        // 各档占位字符都要原样落到组合串上（GH#175：浏览器按 compat 规则用 ZWSP，钉钉表格类用 U+2800）。
+        for placeholder in [COMPOSITION_PLACEHOLDER, "\u{200B}", "\u{2800}"] {
+            for (name, action) in cases.clone() {
+                let composition = match action.with_composition_placeholder(placeholder) {
+                    KeyAction::UpdateComposition { text, caret_pos } => {
+                        assert_eq!(caret_pos, 0, "{name}: 占位后光标须置前");
+                        text
+                    }
+                    KeyAction::InsertText {
+                        new_composition, ..
+                    } => new_composition.expect("组合串不应消失"),
+                    KeyAction::CommitThenDeferComposition {
+                        commit_text,
+                        deferred_composition,
+                        ..
+                    } => {
+                        assert_eq!(commit_text, "可能", "{name}: 已承诺上屏的正文不得被改写");
+                        deferred_composition
+                    }
+                    other => panic!("{name}: 变体不应改变，实际 {other:?}"),
+                };
+                assert_eq!(
+                    composition, placeholder,
+                    "{name}: 组合串应换成给定的占位字符"
+                );
+            }
         }
     }
 
@@ -596,7 +651,7 @@ mod placeholder_tests {
             text: "。".into(),
             timeout_ms: 500,
         };
-        match held.with_composition_placeholder() {
+        match held.with_composition_placeholder(COMPOSITION_PLACEHOLDER) {
             KeyAction::HoldComposition { text, .. } => assert_eq!(text, "。"),
             other => panic!("HoldComposition 不应被改写，实际 {other:?}"),
         }
@@ -606,7 +661,7 @@ mod placeholder_tests {
             hold_text: "。".into(),
             timeout_ms: 500,
         };
-        match commit_hold.with_composition_placeholder() {
+        match commit_hold.with_composition_placeholder(COMPOSITION_PLACEHOLDER) {
             KeyAction::CommitAndHoldComposition {
                 commit_text,
                 hold_text,
@@ -627,12 +682,41 @@ mod placeholder_tests {
             deferred_composition: String::new(),
             timeout_ms: 150,
         };
-        match empty_defer.with_composition_placeholder() {
+        match empty_defer.with_composition_placeholder(COMPOSITION_PLACEHOLDER) {
             KeyAction::CommitThenDeferComposition {
                 deferred_composition,
                 ..
             } => assert!(deferred_composition.is_empty()),
             other => panic!("空组合串不应被改写，实际 {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod focus_data_debug_tests {
+    use super::FocusData;
+
+    /// 窗口标题是用户数据：`{:?}` 只输出长度，不输出原文。
+    #[test]
+    fn debug_output_never_contains_the_window_title() {
+        let d = FocusData {
+            x: 0,
+            y: 0,
+            height: 0,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: 1,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: 0,
+            bundle_id: String::new(),
+            window_class: "Chrome_WidgetWin_1".into(),
+            window_title: "机密文件 - 网页".into(),
+        };
+        let s = format!("{d:?}");
+        assert!(!s.contains("机密"), "{s}");
+        assert!(s.contains("window_title_len: 9"), "{s}");
+        assert!(s.contains("Chrome_WidgetWin_1"), "类名照常输出");
     }
 }

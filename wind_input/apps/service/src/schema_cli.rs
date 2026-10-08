@@ -152,8 +152,9 @@ fn cmd_set(id: &str, key: &str, raw: &str) -> anyhow::Result<i32> {
     }
     // 提交前剥掉 dictionaries：合并配置里它带着 merge_dict_overrides 注入的 enabled，
     // 与 base 不等时 json_diff 会把**整份结构数组**写进 override，冻结方案的词库定义
-    // （path/顺序/新增库全部透不过来）。saveConfig 的保护分支只在 diff 无 dictionaries
-    // 键时回填既有稀疏开关——剥掉后该分支恢复生效。
+    // （path/顺序/新增库全部透不过来）。core 的 saveConfig 现已在入口无条件剥掉
+    // dictionaries、无条件回填既有稀疏开关（论坛 t281），这里的剥除是冗余的双保险，
+    // 保留它无害——也让 CLI 对较旧的 core 同样安全。
     if let Some(o) = cfg.as_object_mut() {
         o.remove("dictionaries");
     }

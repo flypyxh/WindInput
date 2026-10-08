@@ -340,6 +340,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.auto_learn.promote_count", Int),
     f("schema.pinyin.completion.min_syllables", Int),
     f("schema.pinyin.completion.max_extra_syllables", Int),
+    f("schema.pinyin.abbrev.enabled", Bool),
     // 上下文语言模型（n-gram）。weight=0 时不加载模型文件，整句结果与没有该功能时逐位相同。
     f("schema.pinyin.grammar.weight", Float),
     f("schema.pinyin.grammar.model", Str),
@@ -460,6 +461,10 @@ static REGISTRY: &[ConfigField] = &[
         Enum(LAYOUT_INTENT_VALUES),
     ),
     f("input.capslock.cancel_on_mode_switch", Bool),
+    f(
+        "input.capslock.mode_after_cancel",
+        Enum(&["chinese", "english", "toggle"]),
+    ),
     f("input.temp_pinyin.enabled", Bool),
     f("input.temp_pinyin.trigger_keys", StrList),
     f("input.temp_pinyin.hotkey", Str),
@@ -539,6 +544,8 @@ static REGISTRY: &[ConfigField] = &[
     // -- keys（全部按键，扁平；overflow 保留一层）--
     f("keys.toggle_mode_keys", StrList),
     f("keys.commit_on_switch", Bool),
+    // Ctrl+空格 中英切换开关（GH#172）。消费端读 `KeysConfig::ctrl_space_toggle_effective`。
+    f("keys.ctrl_space_toggle", Bool),
     f("keys.switch_engine", Str),
     f("keys.toggle_full_width", Str),
     f("keys.toggle_punct", Str),

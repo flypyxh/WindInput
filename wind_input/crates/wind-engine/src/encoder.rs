@@ -45,6 +45,26 @@ pub enum EncodeError {
     MissingCode { ch: char },
     /// 该字的全码位数不够公式要求（如公式要第 2 码但该字只有 1 位码）。
     CodeTooShort { ch: char, code: String, need: usize },
+    /// 词里没有可取码的字（纯数字/字母/符号且码表里都没码）。取不到码的非汉字只做跳过
+    /// （GH#171），全部跳过之后无码可取。
+    NoHanChars,
+}
+
+impl EncodeError {
+    /// 不含任何字符的失败类别，供 `info` 级日志使用（隐私规则：INFO 不得带词条内容，
+    /// 而 `Display` 会带上卡住的那个字）。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::TooShort => "too_short",
+            Self::NoRules => "no_rules",
+            Self::NoMatchingRule { .. } => "no_matching_rule",
+            Self::BadFormula { .. } => "bad_formula",
+            Self::CharIndexOutOfRange { .. } => "char_index_out_of_range",
+            Self::MissingCode { .. } => "missing_code",
+            Self::CodeTooShort { .. } => "code_too_short",
+            Self::NoHanChars => "no_han_chars",
+        }
+    }
 }
 
 impl std::fmt::Display for EncodeError {
@@ -67,6 +87,7 @@ impl std::fmt::Display for EncodeError {
                 code.chars().count(),
                 need + 1
             ),
+            Self::NoHanChars => write!(f, "不含可取码的字，无从取码"),
         }
     }
 }
@@ -112,6 +133,57 @@ fn match_rule(rules: &[EncoderRule], word_len: usize) -> Option<&EncoderRule> {
         })
 }
 
+/// 取码意义上的「汉字」：只认表意文字区（基本区、扩展 A、兼容表意文字、平面 2/3 整体）。
+///
+/// 全角标点（U+FF00–FFEF）、中文标点（U+3000–303F）、部首、笔画都不算——它们不是
+/// 造词素材。`wind_coordinator::handle_addword::is_han` 直接委托到这里，两边口径同源：
+/// 加词的准入判据与取码时的跳过判据一旦漂移，就会出现「放进来了却取不出码」。
+pub fn is_han(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF      // 基本区
+        | 0x3400..=0x4DBF    // 扩展 A
+        | 0xF900..=0xFAFF    // 兼容表意文字
+        // 平面 2（SIP）/ 平面 3（TIP）整体：两个平面专用于表意文字，扩展 B–J 与兼容汉字
+        // 补充全在其中，将来的扩展 K/L 亦然。
+        | 0x20000..=0x3FFFF)
+}
+
+/// 为一段**加词文本**取码（加词 / 设置端出码 / 导入词表 / 自动造词的统一口径）。
+///
+/// - **整段就一个字符**：直取它的全码（不论是否汉字——码表里可能真收录了符号条目）。
+/// - 否则**跳过取不到码的非汉字**（数字、字母、空白、标点、emoji…），用剩下的字取码
+///   （GH#171：五笔下加「张三13800138000」这类姓名+号码，维护者定为只用中文部分出码，
+///   与「张三」同码可以接受）。剩 0 个 → [`EncodeError::NoHanChars`]；剩 1 个 → 单字规则
+///   （直取全码）；≥2 个 → 按方案公式（[`calc_word_code_by`]）。
+///
+/// ⚠️ 判据是「**有没有码**」优先、「是不是汉字」其次，两头都不能少：
+/// - 码表里**有码**的非汉字照样参与（`〇` 在五笔里是 `llll`，私用区字、部首、`々` 在
+///   某些码表里也当字用）。只看 `is_han` 会把「二〇二六」算成「二二六」的码。
+/// - 取不到码的**汉字**（生僻字）不跳过、让整词作废——那正是 [`calc_word_code`] 防
+///   「你X好」被算成「你好」的那条保护，放宽不能连带打穿它。
+///
+/// `code_of(ch, need)` 见 [`calc_word_code_by`]。
+pub fn encode_text<F>(word: &str, spec: &EncoderSpec, code_of: F) -> Result<String, EncodeError>
+where
+    F: Fn(char, usize) -> Option<String>,
+{
+    let mut cs = word.chars();
+    if let (Some(c), None) = (cs.next(), cs.next()) {
+        return code_of(c, 1).ok_or(EncodeError::MissingCode { ch: c });
+    }
+    // 探码只问「有没有」（need=1）：真正取位时码源还会按公式要的位数再挑一次。
+    let han: String = word
+        .chars()
+        .filter(|&c| is_han(c) || code_of(c, 1).is_some())
+        .collect();
+    let mut hs = han.chars();
+    match (hs.next(), hs.next()) {
+        (None, _) => Err(EncodeError::NoHanChars),
+        (Some(c), None) => code_of(c, 1).ok_or(EncodeError::MissingCode { ch: c }),
+        _ => calc_word_code_by(&han, spec, code_of),
+    }
+}
+
 /// 按方案编码规则计算词组编码。
 ///
 /// `code_of` 提供单字**全码**（见 `EngineManager::single_char_full_codes` 的全码判据：
@@ -120,6 +192,23 @@ fn match_rule(rules: &[EncoderRule], word_len: usize) -> Option<&EncoderRule> {
 pub fn calc_word_code<F>(word: &str, spec: &EncoderSpec, code_of: F) -> Result<String, EncodeError>
 where
     F: Fn(char) -> Option<String>,
+{
+    calc_word_code_by(word, spec, |c, _| code_of(c))
+}
+
+/// 同 [`calc_word_code`]，但 `code_of(ch, need)` 还会被告知**公式要从该字取到第几位**
+/// （`need` = 该字被引用的最大码序 + 1）。
+///
+/// 存在理由（GH#181②）：码源手里一个字常有多条码（简码 `m` 与全码 `mwdy`、多读音的
+/// `le…`/`lw…`），只有知道公式要几位，才能挑出一条既符合用户所打、又够长的码。
+/// 码源给回的码仍短于 `need` 时照旧报 [`EncodeError::CodeTooShort`]。
+pub fn calc_word_code_by<F>(
+    word: &str,
+    spec: &EncoderSpec,
+    code_of: F,
+) -> Result<String, EncodeError>
+where
+    F: Fn(char, usize) -> Option<String>,
 {
     let chars: Vec<char> = word.chars().collect();
     if chars.len() < 2 {
@@ -135,9 +224,9 @@ where
         formula: rule.formula.clone(),
     })?;
 
-    // 先按字缓存全码：同一个字在公式里常被取多次（如 `AaAb` 取两次首字），避免重复查表。
-    let mut cache: Vec<(char, String)> = Vec::with_capacity(chars.len());
-    let mut out = String::with_capacity(steps.len());
+    // 先把每一步落到具体的字上，并统计每个字公式要取到第几位（`need`）——码源要据此挑码。
+    let mut resolved: Vec<char> = Vec::with_capacity(steps.len());
+    let mut need: Vec<(char, usize)> = Vec::with_capacity(chars.len());
     for step in &steps {
         let ch = if step.char_index < 0 {
             chars[chars.len() - 1]
@@ -151,10 +240,22 @@ where
             }
             chars[i]
         };
+        resolved.push(ch);
+        match need.iter_mut().find(|(c, _)| *c == ch) {
+            Some((_, n)) => *n = (*n).max(step.code_index + 1),
+            None => need.push((ch, step.code_index + 1)),
+        }
+    }
+
+    // 按字缓存全码：同一个字在公式里常被取多次（如 `AaAb` 取两次首字），避免重复查表。
+    let mut cache: Vec<(char, String)> = Vec::with_capacity(chars.len());
+    let mut out = String::with_capacity(steps.len());
+    for (step, &ch) in steps.iter().zip(&resolved) {
         let code = match cache.iter().find(|(c, _)| *c == ch) {
             Some((_, code)) => code.clone(),
             None => {
-                let code = code_of(ch).ok_or(EncodeError::MissingCode { ch })?;
+                let n = need.iter().find(|(c, _)| *c == ch).map_or(1, |(_, n)| *n);
+                let code = code_of(ch, n).ok_or(EncodeError::MissingCode { ch })?;
                 cache.push((ch, code.clone()));
                 code
             }
@@ -171,6 +272,46 @@ where
         out.push(piece);
     }
     Ok(out)
+}
+
+/// 按**用户实际打的码**为一个字挑全码（GH#181①）；挑不出返回 `None`，调用方回退全码表。
+///
+/// - `hint`：用户上屏这个字时选中的那条码（候选的词条码，如打 `lw` 选中「嘞」得 `lwkk`
+///   或 `lw`）。它决定了读音/拆法——同一个字的多条同长全码只有它知道用户要哪条。
+/// - `full`：单字全码表给的那条（按权重挑过）。它以 `hint` 开头且够长就用它。
+/// - `all_codes`：该字在方案词库里的全部码（反查索引）。否则从中取以 `hint` 开头、
+///   不超码长上限 `cap`（0 = 不设闸）、长度 ≥ `need` 的**最长**一条，同长取先出现者。
+///
+/// 返回 `None` 的典型情形：`hint` 根本不是本方案的码（临时拼音上屏的字带的是拼音码），
+/// 或同前缀里没有够长的码。这两种都不该硬用 `hint`。
+pub fn pick_hinted_code<'a>(
+    hint: &str,
+    full: Option<&str>,
+    all_codes: impl Iterator<Item = &'a str>,
+    cap: usize,
+    need: usize,
+) -> Option<String> {
+    if hint.is_empty() {
+        return None;
+    }
+    let len = |c: &str| c.chars().count();
+    if let Some(f) = full
+        && f.starts_with(hint)
+        && len(f) >= need
+    {
+        return Some(f.to_string());
+    }
+    let mut best: Option<&str> = None;
+    for c in all_codes {
+        let n = len(c);
+        if !c.starts_with(hint) || n < need || (cap > 0 && n > cap) {
+            continue;
+        }
+        if best.is_none_or(|b| n > len(b)) {
+            best = Some(c);
+        }
+    }
+    best.map(str::to_string)
 }
 
 #[cfg(test)]
@@ -365,6 +506,134 @@ mod tests {
             calc_word_code("你好", &spec, lookup(&m)).unwrap(),
             "wqvb",
             "词长 2 应命中 length_equal 规则而非区间规则"
+        );
+    }
+
+    // ───────────── GH#171：只用中文部分取码 ─────────────
+
+    fn encode(word: &str) -> Result<String, EncodeError> {
+        let m = codes();
+        encode_text(word, &wubi_spec(), |c, _| m.get(&c).cloned())
+    }
+
+    /// 姓名+手机号：数字整段跳过，按「张三」那部分取码（维护者已定：两者同码可接受）。
+    #[test]
+    fn digits_are_skipped_and_han_part_is_encoded() {
+        assert_eq!(encode("你好13800138000").unwrap(), "wqvb");
+        assert_eq!(encode("你1好").unwrap(), "wqvb", "夹在中间的数字同样跳过");
+        assert_eq!(encode("中国人abc").unwrap(), "klww", "ASCII 字母跳过");
+        assert_eq!(encode("中国 人-民").unwrap(), "klwn", "空白与符号跳过");
+        assert_eq!(encode("你好，").unwrap(), "wqvb", "全角标点同样跳过");
+    }
+
+    /// ★ 码表里**有码**的非汉字（`〇` 在五笔里是 `llll`、私用区字、部首…）照样参与取码，
+    /// 只有取不到码的非汉字才跳过。按「是不是汉字」一刀切会把「二〇二六」算成「二二六」的码。
+    #[test]
+    fn non_han_with_a_code_still_takes_part() {
+        let mut m = codes();
+        for (c, code) in [('〇', "llll"), ('二', "fgg"), ('六', "uygy")] {
+            m.insert(c, code.into());
+        }
+        let enc = |w: &str| encode_text(w, &wubi_spec(), |c, _| m.get(&c).cloned());
+        // 四字规则 AaBaCaZa：二(f)〇(l)二(f)六(u)。
+        assert_eq!(enc("二〇二六").unwrap(), "flfu");
+        assert_eq!(enc("二〇二六1").unwrap(), "flfu", "没码的数字仍跳过");
+    }
+
+    /// 剩 1 个汉字按单字规则（直取全码），不进词组公式。
+    #[test]
+    fn single_han_left_uses_single_char_rule() {
+        assert_eq!(encode("你123").unwrap(), "wqiy");
+    }
+
+    /// 一个汉字都不剩 → 仍失败，不能退化成空码或拿符号去凑。
+    #[test]
+    fn no_han_left_still_fails() {
+        assert_eq!(encode("13800138000"), Err(EncodeError::NoHanChars));
+        assert_eq!(encode("ab"), Err(EncodeError::NoHanChars));
+    }
+
+    /// ★「你X好」保护不能被这次放宽连带打穿：X 是**取不到码的汉字**（生僻字）时仍整词作废。
+    /// 只有非汉字才可跳过——把生僻字也跳过，就会静默造出「你好」的码。
+    #[test]
+    fn rare_han_without_code_still_fails_whole_word() {
+        assert_eq!(
+            encode("你囧好123"),
+            Err(EncodeError::MissingCode { ch: '囧' })
+        );
+    }
+
+    /// 词本身就是单个字符：保持直取口径（不论是否汉字），取不到报 MissingCode。
+    #[test]
+    fn single_char_word_keeps_direct_lookup() {
+        assert_eq!(encode("你").unwrap(), "wqiy");
+        assert_eq!(encode("a"), Err(EncodeError::MissingCode { ch: 'a' }));
+    }
+
+    /// 公式对每个字要取到第几位，要如实告诉码源——码源据此挑一条够长的码（GH#181②）。
+    #[test]
+    fn code_source_is_told_how_many_codes_each_char_needs() {
+        let m = codes();
+        let seen = std::cell::RefCell::new(Vec::new());
+        calc_word_code_by("中国人", &wubi_spec(), |c, need| {
+            seen.borrow_mut().push((c, need));
+            m.get(&c).cloned()
+        })
+        .unwrap();
+        // AaBaCaCb：中、国只取第 1 码，人取到第 2 码。
+        assert_eq!(seen.into_inner(), vec![('中', 1), ('国', 1), ('人', 2)]);
+    }
+
+    // ───────────── GH#181①：按用户实际打的码挑全码 ─────────────
+
+    /// 多读音同长（嘞 le…/lw…）：全码表按权重挑了 le，用户打的是 lw → 必须取 lw 那条。
+    #[test]
+    fn hint_picks_the_reading_user_typed() {
+        let all = ["lekk", "lwkk"];
+        assert_eq!(
+            pick_hinted_code("lw", Some("lekk"), all.iter().copied(), 4, 2).as_deref(),
+            Some("lwkk")
+        );
+    }
+
+    /// 全码表的那条本就与用户所打一致 → 用它（它是按权重挑过的）。
+    #[test]
+    fn hint_prefers_full_table_code_when_consistent() {
+        let all = ["lw", "lwka", "lwkk"];
+        assert_eq!(
+            pick_hinted_code("lw", Some("lwkk"), all.iter().copied(), 4, 2).as_deref(),
+            Some("lwkk")
+        );
+    }
+
+    /// 用户打的是 1 位简码（没 → m）、公式要第 2 位：取同前缀里够长的码，不取 m 本身。
+    #[test]
+    fn short_hint_is_extended_to_a_long_enough_code() {
+        let all = ["m", "mody", "mwdy"];
+        assert_eq!(
+            pick_hinted_code("mw", Some("m"), all.iter().copied(), 4, 2).as_deref(),
+            Some("mwdy")
+        );
+        assert_eq!(
+            pick_hinted_code("m", Some("m"), all.iter().copied(), 4, 2).as_deref(),
+            Some("mody"),
+            "全码表那条不够长 → 退到同前缀的更长码（同长取先出现者）"
+        );
+    }
+
+    /// 超过码长上限的怪码（6 码扩展码）不参与；与用户所打对不上的（临拼出的拼音码）→ None，
+    /// 由调用方回退全码表。
+    #[test]
+    fn hint_respects_cap_and_falls_back_when_inconsistent() {
+        let all = ["m", "okuvuu"];
+        assert_eq!(
+            pick_hinted_code("ok", Some("m"), all.iter().copied(), 4, 2),
+            None
+        );
+        let all = ["lekk"];
+        assert_eq!(
+            pick_hinted_code("lei", Some("lekk"), all.iter().copied(), 4, 2),
+            None
         );
     }
 

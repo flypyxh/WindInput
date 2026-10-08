@@ -46,25 +46,18 @@ pub(crate) fn ui_anchor(a: StatusAnchor) -> StatusTipAnchor {
 impl Coordinator {
     /// 当前焦点应用的气泡定位（规则优先回落全局）。
     pub(crate) fn status_position(&self) -> StatusPosition {
-        self.status_position_for(&self.active_process_name())
+        self.status_position_for(&self.active_process_name(), &self.active_focus_window())
     }
 
-    /// 指定进程的气泡定位。方式与坐标同层；兜底独立回落。
-    pub(crate) fn status_position_for(&self, proc_name: &str) -> StatusPosition {
-        let (rule_mode, rule_fallback) = {
-            if proc_name.is_empty() {
-                (None, None)
-            } else {
-                let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-                match table.get_rule(proc_name) {
-                    Some(r) => (
-                        r.status_position_mode.map(|m| (m, r.status_x, r.status_y)),
-                        r.status_fallback_position,
-                    ),
-                    None => (None, None),
-                }
-            }
-        };
+    /// 指定进程（窗口）的气泡定位。方式与坐标同层；兜底独立回落。
+    pub(crate) fn status_position_for(&self, proc_name: &str, win: &FocusWindow) -> StatusPosition {
+        let (rule_mode, rule_fallback) = self.with_compat_rule(proc_name, win, |r| match r {
+            Some(r) => (
+                r.status_position_mode.map(|m| (m, r.status_x, r.status_y)),
+                r.status_fallback_position,
+            ),
+            None => (None, None),
+        });
         let bundle = self.rt();
         let si = &bundle.config.ui.status;
         let (mode, x, y) = rule_mode.unwrap_or((si.position(), si.custom_x, si.custom_y));
@@ -81,13 +74,12 @@ impl Coordinator {
     pub(crate) fn rule_status_position(
         &self,
         proc_name: &str,
+        win: &FocusWindow,
     ) -> Option<(StatusPositionMode, i32, i32)> {
-        if proc_name.is_empty() {
-            return None;
-        }
-        let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-        let r = table.get_rule(proc_name)?;
-        r.status_position_mode.map(|m| (m, r.status_x, r.status_y))
+        self.with_compat_rule(proc_name, win, |r| {
+            let r = r?;
+            r.status_position_mode.map(|m| (m, r.status_x, r.status_y))
+        })
     }
 
     /// 定位方式 + 原始坐标是否可信 → 下发给 UI 的定位；`None` = 不显示（兜底 `hide`）。

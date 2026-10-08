@@ -15,6 +15,7 @@ use crate::pipeline::{ModeKind, Rewind};
 // 子模块（src/coordinator/ 目录）：这批切片重度访问本模块**私有**字段/函数，
 // 子模块对父私有项可见，平级模块则须放开可见性——归属判据即「是否需要碰私有态」。
 mod app_schema;
+mod ctrl_space;
 mod first_show;
 pub(crate) mod fullscreen_watch;
 mod langbar_icon;
@@ -22,6 +23,8 @@ mod message_handler;
 mod push_config;
 mod state_writer;
 mod status_placement;
+mod window_ctx;
+pub(crate) use window_ctx::{FocusWindow, ModeScope, entry_window_key, focus_crossed};
 // 单测不碰真实用户目录（`build_status` 每次都会走到它）。
 #[cfg(all(target_os = "linux", ext_presenter, not(test)))]
 mod tray_icon;
@@ -956,6 +959,33 @@ pub(crate) struct ActiveCompat {
     /// 应用时按目标点所在显示器的 DPI 换算成物理像素，见 [`Coordinator::apply_caret_compat`]。
     pub(crate) caret_offset_x: i32,
     pub(crate) caret_offset_y: i32,
+    /// 规则是按哪个窗口解析的：[`FocusWindow::cache_hash`]（类名小写 + 标题）。与 `pid` 一起构成
+    /// 缓存键——同进程换了窗口（类名 / 标题不同）要重新解析，持续类字段随之即时刷新。
+    /// 窗口本身（解析要用的字符串）存在 `Coordinator::focus_windows` 的 active 槽里。
+    pub(crate) window_hash: u64,
+    /// 按键路径要读的规则值，按 active 槽（`pid` 的缓存名 + active 窗口）预提取，按键时不再查表。
+    /// 刷新点见 [`Coordinator::refresh_active_compat_lookups`]。
+    pub(crate) lookups: ActiveLookups,
+}
+
+/// [`ActiveCompat::lookups`]：按键路径上的三项规则值，焦点应用（active 槽）的。
+///
+/// 这几项原先在按键路径上现查（每次候选窗刷新 / 每键 / 每次收窗判定一次合成查表）；规则表与
+/// 焦点窗口都没变时结果必然不变，故改成在「规则表或焦点窗口变了」的地方预提取：
+/// - 焦点变化、同 pid 换窗口：`update_active_compat`（缓存键 pid + 窗口哈希，变了就整份重算）；
+/// - `reload_app_compat`：规则表重载，右键菜单写回、设置端 per-app 设置变更都经它；
+/// - `revalidate_pid_name`：焦点 pid 的缓存名被改写（PID 复用）。
+///
+/// 全局回落（候选窗定位的全局档）**不**烘进来，仍在读取侧现取，理由同 `first_show_mode`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActiveLookups {
+    /// 协调器自己发占位时用的字符（`composition_placeholder`，没配 = 空格）。
+    pub(crate) composition_placeholder: wind_config::app_compat::PlaceholderChar,
+    /// per-app 候选窗定位 `(fixed, x, y)`；`None` = 规则没配定位方式，跟随全局。
+    pub(crate) candidate_pos: Option<(bool, i32, i32)>,
+    /// `host_drawn_candidates`（UIElement 推断收窗的 opt-in）。进程名未知时取 `"*"` 那条，
+    /// 与 `uielement_host_draws_by_inference` 的口径一致。
+    pub(crate) host_drawn_candidates: Option<bool>,
 }
 
 /// 「当前焦点为什么打不出中文」——全局**唯一**的判定结果。
@@ -1272,6 +1302,43 @@ pub(crate) struct SchemaToggleOrigin {
     pub(crate) trigger_vk: u32,
 }
 
+/// 触发「取消大写」的切换来自哪条路径，见 [`Coordinator::mode_after_caps_cancel`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapsCancelSwitch {
+    /// 本地切换键（Shift 等）：没有方向，只说「切一下」。
+    Toggle,
+    /// 用户按出来的系统切换（Ctrl+空格 / 系统输入法开关热键）：携带目标模式（`true`＝中文）。
+    System(bool),
+    /// 非用户发起的切换（宿主写 compartment、功能菜单、旧版 DLL 无 Ctrl）：携带目标模式，
+    /// **恒按请求落地**、不吃 `mode_after_cancel` 的改写——宿主请求「中文」时 CapsLock
+    /// 恰好开着被取消，不能因为用户选了 `english` 就落成英文。
+    Host(bool),
+}
+
+impl CapsCancelSwitch {
+    /// 按 `CMD_SYSTEM_MODE_SWITCH` 的来源分派。「是不是用户按的」判据与
+    /// [`Coordinator::host_ime_close_ignored`] 同源：系统热键（Ctrl+空格）翻 compartment 时
+    /// Ctrl 尚未释放，宿主自己写则没有伴随按键；按键侧兜底（`CtrlSpaceKey`）恒算用户发起。
+    /// 菜单是用户**明确点了目标**，没有「切一下」的歧义，按请求。
+    pub(crate) fn from_system(
+        requested: bool,
+        source: wind_ipc::protocol::ModeSwitchSource,
+        ctrl_held: bool,
+    ) -> Self {
+        use wind_ipc::protocol::ModeSwitchSource as Src;
+        let by_user = match source {
+            Src::CtrlSpaceKey => true,
+            Src::CompartmentOpenClose | Src::CompartmentConversion | Src::Unknown => ctrl_held,
+            Src::Menu => false,
+        };
+        if by_user {
+            Self::System(requested)
+        } else {
+            Self::Host(requested)
+        }
+    }
+}
+
 /// 中央协调器
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
@@ -1301,7 +1368,7 @@ pub struct Coordinator {
     /// ★ **按键路径上只做「滑窗切分 + push」**，取码、查重、写库全在后台线程
     /// （`spawn_draft_flush`）。草稿的产生速率约每字 4 条，而取码要查单字全码表、
     /// 查重要查反查索引与用户词库——任何一项落在上屏线程上都是在给每次按键加钱。
-    pub(crate) draft_queue: Mutex<Vec<String>>,
+    pub(crate) draft_queue: Mutex<Vec<crate::draft_window::DraftWord>>,
     /// 是否已有草稿 flush 线程在跑。没有这道闸，队列每满一次就会 spawn 一个新线程去
     /// 抢同一把 redb 写锁（同 `is_building_reverse_index` 那道闸的理由）。
     pub(crate) draft_flushing: std::sync::atomic::AtomicBool,
@@ -1467,6 +1534,9 @@ pub struct Coordinator {
     /// 合成坐标去骗过闸门（Android 一度就是这么做的，`height` 写 0 还会被判为「宿主
     /// 尚未 reflow」整帧丢弃，候选一次都不下发）。
     caret_independent: std::sync::atomic::AtomicBool,
+    /// 宿主报的光标坐标可直接当权威用（Linux addon：来自应用自己上报的光标矩形，没有 Windows
+    /// 那种跨窗口 Win32 光标冒充插入点的问题，但来源字段恒为 UNKNOWN）。见 `host.display`。
+    host_caret_trusted: std::sync::atomic::AtomicBool,
     /// 启动时预热全部已装方案（桌面默认开；移动端关，见构造里的说明）
     pub(crate) eager_prewarm: std::sync::atomic::AtomicBool,
     /// 0=Idle 1=Preparing 2=Ready 3=Failed（见 [`Coordinator::readiness`]）
@@ -1774,7 +1844,13 @@ pub struct Coordinator {
     /// 同源教训见 `_hasFocus` / `_hasThreadFocus`（TSF 侧）与
     /// `ime_active` / `has_edit_context` 的拆分：一个变量同时回答两个问题，
     /// 迟早会遇到两个答案相反的场景。
-    pub(crate) mode_scope: Mutex<(u32, bool)>,
+    ///
+    /// 第三项（[`ModeScope::entry_windows`]）是命中的带窗口条件的进入类规则：同进程内它变了也算
+    /// 「切进来」（AutoHotkey 两个 GUI 窗口各配各的 initial_mode），见 [`focus_crossed`]。
+    pub(crate) mode_scope: Mutex<ModeScope>,
+    /// `client_token → 最近一次 focus_gained 的窗口`（+ `active_compat` 当前的窗口），见
+    /// `coordinator/window_ctx.rs`。
+    pub(crate) focus_windows: Mutex<window_ctx::FocusWindows>,
     /// 按应用独立中英状态表（`input.default.state_scope = "app"` 时启用）：
     /// 进程名（小写）→ chinese_mode，会话级记忆（服务重启即清，见计划决策）。
     mode_states: Mutex<HashMap<String, bool>>,
@@ -2238,6 +2314,12 @@ impl Coordinator {
             .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 声明宿主报的光标坐标可直接当权威（见字段 `host_caret_trusted`）。
+    pub fn set_host_caret_trusted(&self, value: bool) {
+        self.host_caret_trusted
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn build(
         config: Config,
         data_dir: Option<&Path>,
@@ -2679,6 +2761,7 @@ impl Coordinator {
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             caret_independent: std::sync::atomic::AtomicBool::new(false),
+            host_caret_trusted: std::sync::atomic::AtomicBool::new(false),
             eager_prewarm: std::sync::atomic::AtomicBool::new(true),
             readiness_state: std::sync::atomic::AtomicU8::new(0),
             pending_first_show: Mutex::new(false),
@@ -2718,7 +2801,8 @@ impl Coordinator {
             ),
             active_compat: Mutex::new(ActiveCompat::default()),
             pid_names: Mutex::new(HashMap::new()),
-            mode_scope: Mutex::new((0, false)),
+            mode_scope: Mutex::new(ModeScope::default()),
+            focus_windows: Mutex::new(Default::default()),
             mode_states: Mutex::new(HashMap::new()),
             runtime_last: Mutex::new((init_chinese, init_full, init_punct)),
             last_caps_inject: Mutex::new(None),
@@ -2885,8 +2969,13 @@ impl Coordinator {
     }
 
     /// 焦点/IME 激活时按 client_token 高 32 位的 PID 解析焦点进程名，缓存其 caret 兼容态
-    /// （对齐 Go `HandleFocusGained` 设置 activeCompatRule）。按 pid 缓存：同进程命中直接返回，
-    /// 避免每次焦点事件重复 OpenProcess。仅在重型/异步段调用，不在 DLL 同步阻塞路径上。
+    /// （对齐 Go `HandleFocusGained` 设置 activeCompatRule）。仅在重型/异步段调用，不在 DLL
+    /// 同步阻塞路径上。
+    ///
+    /// 规则按**窗口上下文**解析：窗口取该 token 最近一次 focus_gained 记下的那个
+    /// （[`Self::note_focus_window`]；ime_activated 不带窗口信息，即沿用它）。缓存键是
+    /// (pid, 类名小写 + 标题的哈希)：同进程同窗口直接返回，避免每次焦点事件重复 OpenProcess；
+    /// 同进程换了窗口则重新解析——持续类字段（定位、首显、配对…）随之即时刷新。
     fn update_active_compat(&self, client_token: u64) {
         let pid = (client_token >> 32) as u32;
         if pid == 0 {
@@ -2901,48 +2990,58 @@ impl Coordinator {
         // ⚠ 在取 `active_compat` 锁**之前**读缓存：本函数末尾是「先 drop(ac) 再锁
         // pid_names」，两把锁在此嵌套会引入一个方向相反的持有序。
         let cached_name = self.cached_proc_name(client_token);
+        // 同理先于 `active_compat` 锁取窗口（`focus_windows` 锁内不取任何别的锁）。
+        // 该 token 从没 focus_gained 过（新实例只发了 ime_activated）⇒ 退回该 pid 最近获焦的窗口，
+        // 而不是按空窗口重解析——那会把 Chromium 的占位、窗口规则的初始模式一起丢掉。
+        let win = self.focus_window_of_token_or_pid(client_token);
+        let window_hash = win.cache_hash();
         let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
-        if ac.pid == pid {
-            return; // 同进程，规则已缓存
+        if ac.pid == pid && ac.window_hash == window_hash {
+            return; // 同进程同窗口，规则已缓存
         }
         let name = if cached_name.is_empty() {
             process_name(pid)
         } else {
             cached_name
         };
-        let (next, rule_matched, rule_initial_mode, rule_initial_punct) = {
-            let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-            let rule = table.get_rule(&name);
-            let initial_mode = rule.and_then(|r| r.initial_mode);
-            let initial_punct = rule.and_then(|r| r.initial_punct);
-            (
-                ActiveCompat {
-                    pid,
-                    caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
-                    stale_probe_guard: rule.map(|r| r.stale_probe_guard).unwrap_or(false),
-                    composition_start_pair_guard: rule
-                        .and_then(|r| r.composition_start_pair_guard)
-                        .unwrap_or(false),
-                    pin_anchor_when_start_drifts: rule
-                        .and_then(|r| r.pin_anchor_when_start_drifts)
-                        .unwrap_or(false),
-                    first_show_mode: rule.and_then(|r| r.first_show_mode),
-                    has_initial_rule: initial_mode.is_some() || initial_punct.is_some(),
-                    auto_pair: rule.and_then(|r| r.auto_pair),
-                    smart_method: rule.and_then(|r| r.smart_method),
-                    caret_offset_x: rule.map(|r| r.caret_offset_x).unwrap_or(0),
-                    caret_offset_y: rule.map(|r| r.caret_offset_y).unwrap_or(0),
-                },
-                rule.is_some(),
-                initial_mode,
-                initial_punct,
-            )
-        };
+        // 名字传小写：与重载 / 改名时按 `pid_names`（小写）重算的口径一致。
+        let lookups = self.compute_active_lookups(&name.to_lowercase(), &win);
+        let (next, rule_matched, rule_initial_mode, rule_initial_punct) =
+            self.with_compat_rule(&name, &win, |rule| {
+                let initial_mode = rule.and_then(|r| r.initial_mode);
+                let initial_punct = rule.and_then(|r| r.initial_punct);
+                (
+                    ActiveCompat {
+                        pid,
+                        caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
+                        stale_probe_guard: rule.map(|r| r.stale_probe_guard).unwrap_or(false),
+                        composition_start_pair_guard: rule
+                            .and_then(|r| r.composition_start_pair_guard)
+                            .unwrap_or(false),
+                        pin_anchor_when_start_drifts: rule
+                            .and_then(|r| r.pin_anchor_when_start_drifts)
+                            .unwrap_or(false),
+                        first_show_mode: rule.and_then(|r| r.first_show_mode),
+                        has_initial_rule: initial_mode.is_some() || initial_punct.is_some(),
+                        auto_pair: rule.and_then(|r| r.auto_pair),
+                        smart_method: rule.and_then(|r| r.smart_method),
+                        caret_offset_x: rule.map(|r| r.caret_offset_x).unwrap_or(0),
+                        caret_offset_y: rule.map(|r| r.caret_offset_y).unwrap_or(0),
+                        window_hash,
+                        lookups,
+                    },
+                    rule.is_some(),
+                    initial_mode,
+                    initial_punct,
+                )
+            });
         // 无条件记录（对齐 Go handle_lifecycle.go:698）。原实现仅在 caret_use_top=true 时打，
         // 规则未命中与「命中但全 false」在日志里无从区分，查「某应用兼容项没生效」时看不到
         // 究竟是没匹配上进程名还是字段没读到。
         debug!(
-            "Compat rule for process={name}: matched={} caret_use_top={} stale_probe_guard={} composition_start_pair_guard={} pin_anchor_when_start_drifts={} first_show_mode={} initial_mode={} initial_punct={} auto_pair={} smart_method={} caret_offset=({},{})",
+            "Compat rule for process={name} class={:?} title_len={}: matched={} caret_use_top={} stale_probe_guard={} composition_start_pair_guard={} pin_anchor_when_start_drifts={} first_show_mode={} initial_mode={} initial_punct={} auto_pair={} smart_method={} caret_offset=({},{})",
+            win.class,
+            win.title.chars().count(),
             rule_matched,
             next.caret_use_top,
             next.stale_probe_guard,
@@ -2971,6 +3070,8 @@ impl Coordinator {
             next.caret_offset_y
         );
         *ac = next;
+        // 持 `active_compat` 锁写：两者是同一份缓存的两半（锁序 active_compat → focus_windows）。
+        self.set_active_focus_window(win);
         drop(ac);
         // 顺带填 pid→进程名缓存，供 FOCUS_GAINED 同步路径免 OpenProcess 查询（per-app 状态）。
         if !name.is_empty() {
@@ -3025,11 +3126,34 @@ impl Coordinator {
                 }
             }
         };
+        // 焦点 pid 的名字刚落缓存或被改写：按键路径那三项按新名字重算（它们只读缓存名）。
+        // 改写 = PID 复用：active 槽记的窗口也属于上一任进程，一并清掉（与下面
+        // `forget_focus_windows_of_pid` 清 token 表同理），window_hash 同步改成空窗口的，
+        // 新进程下一次获焦不会被「同 pid 同窗口」早退拦住。
+        let is_active = {
+            let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            let is_active = ac.pid == pid;
+            if is_active && rewritten {
+                let empty = FocusWindow::default();
+                ac.window_hash = empty.cache_hash();
+                // 锁序 active_compat → focus_windows，与 `update_active_compat` 相同。
+                self.set_active_focus_window(empty);
+            }
+            is_active
+        };
+        if is_active {
+            self.refresh_active_compat_lookups();
+        }
         // 放掉 `pid_names` 锁之后再推：推送内容现算时要再取它。
         if rewritten {
+            // 换了进程：上一任记下的窗口不属于它（不清的话新进程会按旧窗口匹配窗口规则）。
+            self.forget_focus_windows_of_pid(pid);
             for token in self.push_server.tokens_of_pid(pid) {
                 self.push_password_suppress_config(token);
                 self.push_english_pair_config(token);
+                self.push_composition_placeholder_config(token);
+                // 标题采集开关按进程名算（本进程可能命中标题规则），名字纠正后同样要重推。
+                self.push_compat_title_match_config(token);
             }
         }
     }
@@ -3087,6 +3211,20 @@ impl Coordinator {
         if name.is_empty() {
             return;
         }
+        // 窗口：本就是焦点进程时用 active 槽那个（与 `update_active_compat` 解析时同一个窗口），
+        // 否则取该 pid 最近一次获焦的窗口（连接校正时前台进程可能还没 focus_gained 过 ⇒ 空窗口）。
+        let win = {
+            let ac_pid = self
+                .active_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pid;
+            if ac_pid == pid {
+                self.active_focus_window()
+            } else {
+                self.focus_window_of_pid(pid)
+            }
+        };
         let (
             caret_use_top,
             stale_probe_guard,
@@ -3097,9 +3235,7 @@ impl Coordinator {
             smart_method,
             caret_offset_x,
             caret_offset_y,
-        ) = {
-            let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-            let rule = table.get_rule(&name);
+        ) = self.with_compat_rule(&name, &win, |rule| {
             (
                 rule.map(|r| r.caret_use_top).unwrap_or(false),
                 rule.map(|r| r.stale_probe_guard).unwrap_or(false),
@@ -3113,7 +3249,7 @@ impl Coordinator {
                 rule.map(|r| r.caret_offset_x).unwrap_or(0),
                 rule.map(|r| r.caret_offset_y).unwrap_or(0),
             )
-        };
+        });
         debug!(
             "Connected-pid compat refresh for process={name} (pid={pid}): caret_use_top={} stale_probe_guard={stale_probe_guard} composition_start_pair_guard={composition_start_pair_guard} first_show_mode={} auto_pair={} smart_method={} caret_offset=({},{})",
             caret_use_top,
@@ -3149,6 +3285,81 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid, name.to_lowercase());
+        // 按键路径那三项跟的是 active 槽（`.pid` 的名字 + 窗口），不是本函数的 `pid`：
+        // 上面刚可能填了它的缓存名，按 active 槽重算一次。
+        self.refresh_active_compat_lookups();
+    }
+
+    /// 按 (进程名, 窗口) 现算 [`ActiveLookups`]。
+    pub(crate) fn compute_active_lookups(&self, name: &str, win: &FocusWindow) -> ActiveLookups {
+        let (composition_placeholder, candidate_pos, host_drawn_candidates) = self
+            .with_compat_rule(name, win, |rule| {
+                (
+                    rule.and_then(|r| r.composition_placeholder)
+                        .unwrap_or_default(),
+                    rule.and_then(|r| {
+                        let mode = r.candidate_position_mode?;
+                        Some((mode.is_fixed(), r.candidate_x, r.candidate_y))
+                    }),
+                    rule.and_then(|r| r.host_drawn_candidates),
+                )
+            });
+        // 收窗推断对无名进程也认 `"*"`（`get_rule("")` 不吃通配），口径见
+        // `uielement_host_draws_by_inference`。
+        let host_drawn_candidates = if name.is_empty() {
+            self.with_compat_rule(wind_config::app_compat::ANY_PROCESS, win, |r| {
+                r.and_then(|r| r.host_drawn_candidates)
+            })
+        } else {
+            host_drawn_candidates
+        };
+        ActiveLookups {
+            composition_placeholder,
+            candidate_pos,
+            host_drawn_candidates,
+        }
+    }
+
+    /// 按 active 槽（`active_compat.pid` 的缓存名 + active 窗口）重算 [`ActiveCompat::lookups`]。
+    /// 不动其余字段（`.pid` / `.has_initial_rule` 的另一重身份见 `refresh_active_compat_rule_fields`）。
+    ///
+    /// 名字只读 `pid_names` 缓存、不反查进程：与这几项原先在按键路径上现查的口径
+    /// （`active_process_name`）相同。
+    ///
+    /// ⚠ 与 `update_active_compat` 并发时不能「先算后写」：算的期间焦点切到了别的应用，旧结果
+    /// 就会盖掉新应用的值，而之后同一窗口的焦点又被 `window_hash` 早退拦住，永不自愈。故分两步：
+    /// 先在锁外取名字（`pid_names` 不与 `active_compat` 嵌套），再持 `active_compat` 锁核对
+    /// (pid, window_hash) 没变、并在锁内现算现写；变了就放弃（换焦点的那一方已按新表算好）。
+    /// 在锁内算也顺带保证：两次重载并发时，最后写入的那份读的是最后换上的表。
+    pub(crate) fn refresh_active_compat_lookups(&self) {
+        let snap = self.active_lookups_snapshot();
+        self.store_active_lookups_if_current(&snap);
+    }
+
+    /// [`Self::refresh_active_compat_lookups`] 第一步：active 槽的 (pid, window_hash, 缓存名)。
+    pub(crate) fn active_lookups_snapshot(&self) -> (u32, u64, String) {
+        let (pid, hash) = {
+            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            (ac.pid, ac.window_hash)
+        };
+        (pid, hash, self.cached_proc_name((pid as u64) << 32))
+    }
+
+    /// 第二步：active 槽仍是快照那个 (pid, window_hash) 才现算写入，返回是否写了。
+    /// 锁序 active_compat → focus_windows → app_compat，与 `update_active_compat` 相同。
+    pub(crate) fn store_active_lookups_if_current(&self, snap: &(u32, u64, String)) -> bool {
+        let (pid, hash, name) = snap;
+        let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+        if ac.pid != *pid || ac.window_hash != *hash {
+            debug!(
+                "refresh_active_compat_lookups: 焦点已变（pid {pid} → {}），放弃写入",
+                ac.pid
+            );
+            return false;
+        }
+        let win = self.active_focus_window();
+        ac.lookups = self.compute_active_lookups(name, &win);
+        true
     }
 
     /// 按 client_token 高 32 位的 PID 查已缓存的进程名（小写）。未缓存返回空串。
@@ -3170,6 +3381,23 @@ impl Coordinator {
     /// 快照，并按 `password_force_english_for_pid`（per-app 规则优先，否则全局开关）决定是否
     /// 强制英文抑制（密码框场景）。
     pub(crate) fn apply_input_diag(&self, pid: u32, disabled: bool, reason_byte: u8, mask: u64) {
+        self.apply_input_diag_capped(pid, disabled, reason_byte, mask, true);
+    }
+
+    /// 同 [`Self::apply_input_diag`]，`allow_raise = false` 时本次**只降不升**：算出要抑制也先不置位。
+    ///
+    /// 给「同一 token 刚换了窗口」用：DLL 那份门控按旧窗口算、新值的重推还在路上，此刻服务端
+    /// 按新窗口当场置位就是 core 抑制而 DLL 照吃——违反 core.suppress ⊆ C++.suppress
+    /// （同 [`Self::relax_password_suppress_for_focus`] 的口径）。置位留给 DLL 下一次
+    /// input_state_report（那时它手里必然已有新值）。
+    pub(crate) fn apply_input_diag_capped(
+        &self,
+        pid: u32,
+        disabled: bool,
+        reason_byte: u8,
+        mask: u64,
+        allow_raise: bool,
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
         // 展示原因 = mask/disabled 推导，再叠加 DLL 上报的 reason_byte 里「context 级禁用」这一档：
         // DLL 把 context 级 KEYBOARD_DISABLED 折进了 mask 的 IS_PASSWORD 位，折位前的区分只有
@@ -3198,8 +3426,9 @@ impl Coordinator {
         //
         // 开关取值按 pid 走 `password_force_english_for_pid`（per-app 规则优先，否则全局）——
         // 与推给该 DLL 的值**同一个函数**，这是上面那条不变量在按应用覆盖下成立的前提。
-        let suppress =
-            crate::input_diag::is_password_scope(mask) && self.password_force_english_for_pid(pid);
+        let suppress = allow_raise
+            && crate::input_diag::is_password_scope(mask)
+            && self.password_force_english_for_pid(pid);
         self.password_suppress.store(suppress, Relaxed);
         {
             let mut d = self
@@ -3369,36 +3598,25 @@ impl Coordinator {
             .send(wind_ui_types::UiCommand::ShowInputDiag(view));
     }
 
-    /// 查 `compat.toml` 中该进程的初始中英规则；`None` = 未配置（不干预）。
-    ///
-    /// 仅 HashMap 查询，无 OpenProcess，故可用于 DLL 同步阻塞路径（`get_current_mode`）。
-    /// 查 `compat.toml` 中该进程的候选窗首显规则；`None` = 未配置（跟随全局）。
+    /// 查 `compat.toml` 中该进程（该窗口）的候选窗首显规则；`None` = 未配置（跟随全局）。
     pub(crate) fn rule_first_show_mode(
         &self,
         proc_name: &str,
+        win: &FocusWindow,
     ) -> Option<wind_config::app_compat::FirstShowMode> {
-        if proc_name.is_empty() {
-            return None;
-        }
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_rule(proc_name)
-            .and_then(|r| r.first_show_mode)
+        self.with_compat_rule(proc_name, win, |r| r.and_then(|r| r.first_show_mode))
     }
 
+    /// 查 `compat.toml` 中该进程（该窗口）的初始中英规则；`None` = 未配置（不干预）。
+    ///
+    /// 仅锁 + 表查询（含 `resolve` 的纯内存合成），无 OpenProcess，故可用于 DLL 同步阻塞路径
+    /// （`get_current_mode`）。
     pub(crate) fn rule_initial_mode(
         &self,
         proc_name: &str,
+        win: &FocusWindow,
     ) -> Option<wind_config::app_compat::InitialMode> {
-        if proc_name.is_empty() {
-            return None;
-        }
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_rule(proc_name)
-            .and_then(|r| r.initial_mode)
+        self.with_compat_rule(proc_name, win, |r| r.and_then(|r| r.initial_mode))
     }
 
     /// 这次系统模式切换是不是「宿主自作主张关 IME」，且当前应用配了忽略。
@@ -3425,31 +3643,17 @@ impl Coordinator {
         ) {
             return false;
         }
-        let proc = self.active_process_name();
-        if proc.is_empty() {
-            return false;
-        }
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_rule(&proc)
-            .and_then(|r| r.ignore_host_ime_close)
+        self.with_active_compat_rule(|r| r.and_then(|r| r.ignore_host_ime_close))
             .unwrap_or(false)
     }
 
-    /// 查 `compat.toml` 中该进程的初始中英标点规则；`None` = 未配置（不干预）。
+    /// 查 `compat.toml` 中该进程（该窗口）的初始中英标点规则；`None` = 未配置（不干预）。
     pub(crate) fn rule_initial_punct(
         &self,
         proc_name: &str,
+        win: &FocusWindow,
     ) -> Option<wind_config::app_compat::InitialMode> {
-        if proc_name.is_empty() {
-            return None;
-        }
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_rule(proc_name)
-            .and_then(|r| r.initial_punct)
+        self.with_compat_rule(proc_name, win, |r| r.and_then(|r| r.initial_punct))
     }
 
     /// 决策进程 `proc_name` 的中英初始状态（初始状态语义的单一内聚点）。
@@ -3464,10 +3668,12 @@ impl Coordinator {
     ///
     /// 规则是**初始值不是锁定**：它只在焦点跨进程切入的那一刻参与决策，此后用户手切自由，
     /// 且同应用内的焦点跳转不会重新套用（守卫见 `apply_initial_mode` 调用点）。
-    fn initial_chinese_mode_for(&self, proc_name: &str) -> bool {
+    ///
+    /// 规则按 (进程, 窗口) 解析；per-app 记忆表仍按进程名（记忆是「这个应用」的，不分窗口）。
+    fn initial_chinese_mode_for(&self, proc_name: &str, win: &FocusWindow) -> bool {
         let bundle = self.rt();
         let d = &bundle.config.input.default;
-        if let Some(m) = self.rule_initial_mode(proc_name) {
+        if let Some(m) = self.rule_initial_mode(proc_name, win) {
             return m.is_chinese();
         }
         if d.per_app_scope()
@@ -3583,6 +3789,32 @@ impl Coordinator {
         self.force_cancel_caps_lock()
     }
 
+    /// 切中英时**已经取消了大写锁定**，此刻该落到哪个模式（`input.capslock.mode_after_cancel`，
+    /// 论坛 t283）。只在 [`Self::cancel_caps_on_switch`] 返回真时调用；没取消时两条路径照旧
+    /// （Shift 翻转、Ctrl+空格 按请求），不经这里。
+    ///
+    /// `chinese`（出厂）对两条路径给的是**不同的**结果，这是有意的：它逐字保留本配置出现前
+    /// 的行为——Shift 没有方向，旧逻辑归位中文（翻转的话，被大写压着的 `chinese_mode=true`
+    /// 会翻成英文，用户看来「切了没反应」）；Ctrl+空格 带着系统算好的目标，旧逻辑只取消大写、
+    /// 不改目标。
+    pub(crate) fn mode_after_caps_cancel(
+        setting: &str,
+        switch: CapsCancelSwitch,
+        current: bool,
+    ) -> bool {
+        match (setting, switch) {
+            (_, CapsCancelSwitch::Host(requested)) => requested,
+            ("english", _) => false,
+            ("toggle", CapsCancelSwitch::Toggle) => !current,
+            (_, CapsCancelSwitch::System(requested)) => requested,
+            ("chinese", CapsCancelSwitch::Toggle) => true,
+            (other, CapsCancelSwitch::Toggle) => {
+                warn!("input.capslock.mode_after_cancel 取值 {other:?} 不认识，按 chinese 处理");
+                true
+            }
+        }
+    }
+
     /// 取消大小写锁定，**不看配置开关**。仅供语义前提为「我要用中文打字」的动作调用
     /// （目前只有切方案，见 `finish_user_schema_switch`）。
     ///
@@ -3630,12 +3862,21 @@ impl Coordinator {
     /// `reset_aux`＝激活场景：remember=false 时同时重置全半角/标点为配置默认
     /// （焦点切换场景不重置——同一激活期内切窗口不动全半角/标点）。
     /// 需在未持有 state 锁时调用。
+    ///
+    /// 窗口取该 token 最近一次 focus_gained 记下的那个（ime_activated 即沿用它）。
     fn apply_initial_mode(&self, client_token: u64, reset_aux: bool) {
+        let win = self.focus_window_of_token_or_pid(client_token);
+        self.apply_initial_mode_in(client_token, &win, reset_aux);
+    }
+
+    /// 同 [`Self::apply_initial_mode`]，窗口由调用方给：DLL 同步路径（`get_current_mode`）跑在
+    /// 重型段记账之前，token 表里还是上一个窗口，只能用它手里那份类名。
+    fn apply_initial_mode_in(&self, client_token: u64, win: &FocusWindow, reset_aux: bool) {
         let bundle = self.rt();
         let d = &bundle.config.input.default;
         let proc = self.cached_proc_name(client_token);
-        let chinese = self.initial_chinese_mode_for(&proc);
-        let rule_punct = self.rule_initial_punct(&proc);
+        let chinese = self.initial_chinese_mode_for(&proc, win);
+        let rule_punct = self.rule_initial_punct(&proc, win);
         let follow = bundle.config.input.punct.follow_mode;
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if reset_aux && !d.remember_last_state {
@@ -4116,8 +4357,17 @@ impl Coordinator {
     /// 「这个应用固定、但还没拖过」会去用全局那份为别的应用摆的坐标，候选窗一上来就
     /// 落在莫名其妙的位置，而用户根本没为这个应用设过位置。`(0,0)` 交给 UI 落默认锚点
     /// 才是这一档的正确答案。
+    ///
+    /// per-app 那一层读 [`ActiveCompat::lookups`] 预提取的值（本函数在每次候选窗刷新上），
+    /// 与 [`Self::rule_candidate_fixed_pos`] 对焦点窗口现查同值。先取值放锁再读配置（`rt()` 另有锁）。
     pub(crate) fn candidate_fixed_pos(&self) -> (bool, i32, i32) {
-        if let Some((fixed, x, y)) = self.rule_candidate_fixed_pos(&self.active_process_name()) {
+        let rule = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookups
+            .candidate_pos;
+        if let Some((fixed, x, y)) = rule {
             return (fixed, x, y);
         }
         let rt = self.rt();
@@ -4125,15 +4375,17 @@ impl Coordinator {
         (c.is_fixed_position(), c.custom_x, c.custom_y)
     }
 
-    /// 查 `compat.toml` 中该进程的候选窗定位规则；`None` = 未配置（跟随全局）。
-    pub(crate) fn rule_candidate_fixed_pos(&self, proc_name: &str) -> Option<(bool, i32, i32)> {
-        if proc_name.is_empty() {
-            return None;
-        }
-        let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-        let rule = table.get_rule(proc_name)?;
-        let mode = rule.candidate_position_mode?;
-        Some((mode.is_fixed(), rule.candidate_x, rule.candidate_y))
+    /// 查 `compat.toml` 中该进程（该窗口）的候选窗定位规则；`None` = 未配置（跟随全局）。
+    pub(crate) fn rule_candidate_fixed_pos(
+        &self,
+        proc_name: &str,
+        win: &FocusWindow,
+    ) -> Option<(bool, i32, i32)> {
+        self.with_compat_rule(proc_name, win, |rule| {
+            let rule = rule?;
+            let mode = rule.candidate_position_mode?;
+            Some((mode.is_fixed(), rule.candidate_x, rule.candidate_y))
+        })
     }
 
     pub(crate) fn refresh_config_in_memory(&self, mutate: impl FnOnce(&mut Config)) {
@@ -4306,6 +4558,7 @@ impl Coordinator {
                 self.push_cn_passthrough_punct_config(0); // 中文模式该透传的标点：DLL 据此**不**吃
                 self.push_en_passthrough_punct_config(0); // 同上，英文标点态那份（超集）
                 self.push_pair_state_ttl_config(0); // 配对状态时效（DLL 侧闸门据此判陈旧）
+                self.push_ctrl_space_toggle_config(0); // Ctrl+空格 切换开关：DLL 据此吃不吃该键（GH#172）
                 // 诊断采集开关本身与配置文件无关（会话级），这里重推纯属幂等保险——
                 // 与 password_suppress 同样处理，让"重载一次"能修好任何 DLL 侧状态漂移。
                 self.push_diag_snapshot_config(0);
@@ -6493,7 +6746,7 @@ impl Coordinator {
         // preedit 是否嵌入宿主（app_inline）：嵌入时编码插入宿主、光标随输入右移，候选窗须锚在
         // 组合起点（缓冲头部）而非跟随光标末尾；非嵌入时 preedit 在候选窗、宿主光标不动，用当前光标。
         // 该标志同时门控下方 preedit 是否下发候选窗渲染（嵌入时候选窗不重复显示 preedit）。
-        // 联想态**不再强制非嵌入**：宿主侧此刻挂着占位组合（见 `ASSOC_COMPOSITION`），
+        // 联想态**不再强制非嵌入**：宿主侧此刻挂着占位组合（见 `assoc_composition`），
         // 归属如实按配置走即可。嵌入模式下 `maybe_enter_assoc` 干脆不给标识
         // （`state.preedit` 为空），候选窗因此没有编码栏、高度不跳。
         let in_app = self.preedit_in_app_effective();
@@ -7521,7 +7774,18 @@ impl Coordinator {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.caret_source
         };
-        if wind_ipc::protocol::caret_source::is_tsf(source) {
+        // 不需要等 TSF 坐标的两种宿主，直接显示：
+        // - 宿主自己摆窗口（`caret_independent`，Wayland 的 input popup 由合成器按光标摆）：
+        //   坐标根本不用，等它只会永远等不到；
+        // - 宿主声明光标可信（`host_caret_trusted`，Linux addon）：来源恒为 UNKNOWN（没有 TSF
+        //   语义域），按 TSF 判就永远挂起，「焦点变化时显示」在 Linux 上从不出现。
+        let host_caret_trusted = self
+            .caret_independent
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .host_caret_trusted
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if host_caret_trusted || wind_ipc::protocol::caret_source::is_tsf(source) {
             self.pending_focus_tip
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.show_tip(&self.status_indicator_text());
@@ -9318,6 +9582,28 @@ mod mode_comment_e2e_tests {
         c.state.lock().unwrap().active = None;
     }
 
+    /// GH#175：加词（`add_word_via_composition = true`）由协调器自己发的占位跟随焦点应用的
+    /// compat 规则——Edge（规则 zwsp）下是 ZWSP。变异检验：加词处改回常量空格 ⇒ 红。
+    #[test]
+    fn add_word_placeholder_follows_the_focused_apps_rule() {
+        let mut cfg = Config::default();
+        cfg.input.caret.add_word_via_composition = true;
+        let (c, _rx) = coord_with_ui(cfg);
+        c.test_focus_zwsp_app(42, "msedge.exe");
+        let act = {
+            let mut st = c.state.lock().unwrap();
+            st.chinese_mode = true;
+            c.enter_add_word_mode(&mut st)
+        };
+        match act {
+            KeyAction::UpdateComposition { text, caret_pos } => {
+                assert_eq!(text, "\u{200B}", "Edge 下加词占位应是零宽空格");
+                assert_eq!(caret_pos, 0, "光标落在占位前");
+            }
+            other => panic!("开关打开 ⇒ 应发占位 composition，实际: {other:?}"),
+        }
+    }
+
     /// ★★★ 占位 composition 的逐模式开关（`[input.caret]`），**在出厂配置下**逐条验。
     ///
     /// # 这个开关在管什么
@@ -10447,6 +10733,28 @@ mod caret_compat_tests {
         st.caret_source = source;
     }
 
+    /// 宿主自己摆窗口（Wayland input popup，`caret_independent`）时，坐标来源不是 TSF 也直接弹：
+    /// 坐标根本不用，等权威坐标只会永远等不到（Wayland 上「焦点变化时显示」曾因此从不出现）。
+    #[test]
+    fn focus_tip_shows_without_tsf_caret_when_host_places_window() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 0, 0, wind_ipc::protocol::caret_source::UNKNOWN);
+        c.set_caret_independent(true);
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx), "caret_independent 宿主不该挂起等坐标");
+    }
+
+    /// 宿主声明光标可信（Linux addon）时，来源 UNKNOWN 也直接弹（Linux 上「焦点变化时显示」
+    /// 曾因此从不出现）。对照：没声明的普通宿主仍挂起，见 `focus_tip_defers_when_caret_source_is_not_tsf`。
+    #[test]
+    fn focus_tip_shows_for_trusted_host_caret() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 100, 200, wind_ipc::protocol::caret_source::UNKNOWN);
+        c.set_host_caret_trusted(true);
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx), "宿主声明光标可信时不该挂起");
+    }
+
     /// 两个不同宿主的 client_token。用具名常量而非字面量，是因为下面「同宿主不重复弹」
     /// 那组用例的全部含义就在于**这两个值相不相等**，字面量会让它退化成看不出意图的魔数。
     const TOKEN_A: u64 = 0x1111_0000_0001;
@@ -10768,6 +11076,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::GUI_CARET,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -10805,6 +11114,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         assert!(
             !c.composition_start.lock().unwrap().2,
@@ -10834,6 +11144,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -10878,6 +11189,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -13205,6 +13517,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         assert!(
             !c.caret_cache_verified
@@ -14196,21 +14509,23 @@ mod caret_compat_tests {
             candidate_position_mode: Some(wind_config::app_compat::CandidatePositionMode::Fixed),
             ..Default::default()
         };
-        *c.app_compat.lock().unwrap() =
-            wind_config::app_compat::AppCompat::from_rules(vec![rule.clone()]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![
+            rule.clone(),
+        ]));
         assert_eq!(c.candidate_fixed_pos(), (true, 0, 0));
 
         // 拖过之后用它自己那份。
         rule.candidate_x = 320;
         rule.candidate_y = 480;
-        *c.app_compat.lock().unwrap() =
-            wind_config::app_compat::AppCompat::from_rules(vec![rule.clone()]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![
+            rule.clone(),
+        ]));
         assert_eq!(c.candidate_fixed_pos(), (true, 320, 480));
 
         // 规则显式写 follow_caret ⇒ 压过全局的 fixed（这正是「独立一档」的意义）。
         rule.candidate_position_mode =
             Some(wind_config::app_compat::CandidatePositionMode::FollowCaret);
-        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![rule]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![rule]));
         assert!(!c.candidate_fixed_pos().0);
     }
 
@@ -14355,8 +14670,14 @@ mod initial_mode_tests {
     fn set_focus_proc(c: &Arc<Coordinator>, pid: u32, name: &str) {
         c.active_compat.lock().unwrap().pid = pid;
         c.pid_names.lock().unwrap().insert(pid, name.to_string());
-        let has_rule = c.rule_initial_mode(name).is_some() || c.rule_initial_punct(name).is_some();
-        *c.mode_scope.lock().unwrap() = (pid, has_rule);
+        let none = FocusWindow::default();
+        let has_rule = c.rule_initial_mode(name, &none).is_some()
+            || c.rule_initial_punct(name, &none).is_some();
+        *c.mode_scope.lock().unwrap() = ModeScope {
+            pid,
+            has_rule,
+            ..Default::default()
+        };
     }
 
     fn token(pid: u32) -> u64 {
@@ -14416,7 +14737,7 @@ mod initial_mode_tests {
         // 游戏进程：首见 → 默认中文；用户切英文 → 写表。
         set_focus_proc(&c, 100, "game.exe");
         assert!(
-            c.initial_chinese_mode_for("game.exe"),
+            c.initial_chinese_mode_for("game.exe", &FocusWindow::default()),
             "首见进程应为配置默认"
         );
         c.state.lock().unwrap().chinese_mode = false;
@@ -14452,11 +14773,11 @@ mod initial_mode_tests {
             .unwrap()
             .insert("game.exe".to_string(), false);
         // 当前全局是中文，焦点到 game.exe → 同步切英文并回传。
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(!chinese);
         assert!(!c.state.lock().unwrap().chinese_mode);
         // 未缓存的 pid（首次聚焦）：保持现状不误切。
-        let (chinese, _, _) = c.get_current_mode(token(999), "");
+        let (chinese, _, _) = c.get_current_mode(token(999), "", "");
         assert!(!chinese, "未知进程应回传当前状态");
     }
 
@@ -14465,7 +14786,7 @@ mod initial_mode_tests {
     fn get_current_mode_global_scope_passthrough() {
         let c = coord_with(|_| {});
         c.state.lock().unwrap().chinese_mode = false;
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(!chinese);
     }
 
@@ -14502,7 +14823,7 @@ mod initial_mode_tests {
             .unwrap()
             .insert("everything.exe".into(), true); // 记忆表说中文
         assert!(
-            !c.initial_chinese_mode_for("everything.exe"),
+            !c.initial_chinese_mode_for("everything.exe", &FocusWindow::default()),
             "规则必须压过记忆表，否则对常驻进程只生效一次"
         );
         // 没有规则的进程仍旧走记忆表，既有语义不变。
@@ -14510,7 +14831,7 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert("game.exe".into(), true);
-        assert!(c.initial_chinese_mode_for("game.exe"));
+        assert!(c.initial_chinese_mode_for("game.exe", &FocusWindow::default()));
     }
 
     /// 重算门控的完整矩阵。这是本功能唯一容易写错又最难从现象反推的地方，
@@ -14589,6 +14910,7 @@ mod initial_mode_tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: class.into(),
+            window_title: String::new(),
         };
 
         // 任务栏（作用域外）：规则不套用，保持切入前的中文。
@@ -14625,7 +14947,7 @@ mod initial_mode_tests {
         //
         // 「按应用套用初始模式」有**两个落点**，测试必须两个都走，否则等于只测了一半。
         let c = build();
-        let (chinese, _, _) = c.get_current_mode(token(200), "Shell_TrayWnd");
+        let (chinese, _, _) = c.get_current_mode(token(200), "Shell_TrayWnd", "");
         assert!(chinese, "同步段也必须跳过作用域外的窗口");
         c.handle_focus_gained(&focus("Shell_TrayWnd"));
         assert!(
@@ -14635,7 +14957,7 @@ mod initial_mode_tests {
 
         // 对照：桌面走同一条顺序，规则必须照常生效（防过度修复）。
         let c = build();
-        let (chinese, _, _) = c.get_current_mode(token(200), "Progman");
+        let (chinese, _, _) = c.get_current_mode(token(200), "Progman", "");
         assert!(!chinese, "桌面的 initial_mode=english 必须在同步段就生效");
         c.handle_focus_gained(&focus("Progman"));
         assert!(!c.state.lock().unwrap().chinese_mode);
@@ -14687,15 +15009,16 @@ mod initial_mode_tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: class.into(),
+            window_title: String::new(),
         };
 
         // ① 点任务栏（作用域外）：跳过，状态不变。
-        c.get_current_mode(token(200), "Shell_TrayWnd");
+        c.get_current_mode(token(200), "Shell_TrayWnd", "");
         c.handle_focus_gained(&focus("Shell_TrayWnd"));
         assert!(c.state.lock().unwrap().chinese_mode, "任务栏不该改模式");
 
         // ② 真正回到桌面：**同一个 explorer pid**，仍必须算作跨进程切入并套用英文。
-        let (chinese, _, _) = c.get_current_mode(token(200), "Progman");
+        let (chinese, _, _) = c.get_current_mode(token(200), "Progman", "");
         assert!(
             !chinese,
             "桌面必须仍被判为跨进程切入——作用域外的窗口不能提前消费掉这次切换"
@@ -14737,13 +15060,13 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert(100, "everything.exe".to_string());
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(!chinese, "跨进程切入规则应用 → 同步段即回传英文");
 
         // 重型段已把焦点与模式归属都更新为 100；用户随后手切回中文。
         set_focus_proc(&c, 100, "everything.exe");
         c.state.lock().unwrap().chinese_mode = true;
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(
             chinese,
             "同应用内跳转不得把手切的中文拉回规则的英文——规则是初始值不是锁定"
@@ -14779,7 +15102,7 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert(300, "notepad.exe".into());
-        let (sync_chinese, _, _) = c.get_current_mode(token(300), "Notepad");
+        let (sync_chinese, _, _) = c.get_current_mode(token(300), "Notepad", "");
 
         // 重型段随后落地的值。
         c.handle_focus_gained(&FocusData {
@@ -14795,6 +15118,7 @@ mod initial_mode_tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: "Notepad".into(),
+            window_title: String::new(),
         });
         let heavy_chinese = c.state.lock().unwrap().chinese_mode;
 
@@ -15135,6 +15459,106 @@ mod initial_mode_tests {
         assert!(!s.chinese_mode, "配置关保持原翻转语义");
     }
 
+    /// 论坛 t283：取消大写之后落到哪个模式（`input.capslock.mode_after_cancel`）。
+    ///
+    /// 注入 CapsLock 走真实 SendInput，单测里取消恒失败，故判定收成纯函数单独钉。
+    /// 矩阵的两条硬约束：出厂值 `chinese` 必须逐字保留旧行为——Shift 归位中文、
+    /// Ctrl+空格 按它自己请求的方向；`english` 两条路都进英文（楼主要的就是这个）。
+    #[test]
+    fn mode_after_caps_cancel_matrix() {
+        use super::CapsCancelSwitch::{System, Toggle};
+        let f = Coordinator::mode_after_caps_cancel;
+        for cur in [true, false] {
+            // 出厂：Shift 归位中文（不看当前模式），Ctrl+空格 按请求。
+            assert!(f("chinese", Toggle, cur), "chinese/Shift 应归位中文");
+            for req in [true, false] {
+                assert_eq!(
+                    f("chinese", System(req), cur),
+                    req,
+                    "chinese/Ctrl+空格 应按请求"
+                );
+                assert_eq!(
+                    f("toggle", System(req), cur),
+                    req,
+                    "toggle/Ctrl+空格 应按请求"
+                );
+                assert!(
+                    !f("english", System(req), cur),
+                    "english/Ctrl+空格 应进英文"
+                );
+            }
+            assert!(!f("english", Toggle, cur), "english/Shift 应进英文");
+            assert_eq!(f("toggle", Toggle, cur), !cur, "toggle/Shift 应照常翻转");
+            // 认不出的值回落出厂语义（设置端 options 与 core 值域脱节时不至于乱跳）。
+            assert!(f("bogus", Toggle, cur));
+            assert!(f("", Toggle, cur));
+        }
+    }
+
+    /// `CMD_SYSTEM_MODE_SWITCH` 的来源分派：只有**用户按出来的**切换才吃
+    /// `mode_after_cancel` 的改写，宿主写 compartment / 菜单 / 旧版 DLL 无 Ctrl 的一律
+    /// 按请求落地——否则 CapsLock 恰好开着时，宿主请求的「中文」会被 `english` 落成英文。
+    #[test]
+    fn caps_cancel_switch_from_system_source() {
+        use super::CapsCancelSwitch;
+        use wind_ipc::protocol::ModeSwitchSource as Src;
+        let f = CapsCancelSwitch::from_system;
+        for req in [true, false] {
+            // 用户发起：按键侧兜底恒算；系统热键翻 compartment 时 Ctrl 还按着。
+            assert_eq!(
+                f(req, Src::CtrlSpaceKey, false),
+                CapsCancelSwitch::System(req)
+            );
+            assert_eq!(
+                f(req, Src::CtrlSpaceKey, true),
+                CapsCancelSwitch::System(req)
+            );
+            for src in [
+                Src::CompartmentOpenClose,
+                Src::CompartmentConversion,
+                Src::Unknown,
+            ] {
+                assert_eq!(
+                    f(req, src, true),
+                    CapsCancelSwitch::System(req),
+                    "{src:?}+Ctrl"
+                );
+                assert_eq!(
+                    f(req, src, false),
+                    CapsCancelSwitch::Host(req),
+                    "{src:?} 无 Ctrl"
+                );
+            }
+            // 菜单：用户明确点了目标，不改写。
+            assert_eq!(f(req, Src::Menu, false), CapsCancelSwitch::Host(req));
+        }
+        // 宿主来源在任何取值下都按请求，`english` 也不例外。
+        for setting in ["chinese", "english", "toggle"] {
+            for req in [true, false] {
+                for cur in [true, false] {
+                    assert_eq!(
+                        Coordinator::mode_after_caps_cancel(
+                            setting,
+                            CapsCancelSwitch::Host(req),
+                            cur
+                        ),
+                        req,
+                        "{setting} 宿主来源应按请求"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 出厂值：新字段缺省时必须是 `chinese`，老配置（只写了 cancel_on_mode_switch）行为不变。
+    #[test]
+    fn mode_after_cancel_defaults_to_chinese() {
+        assert_eq!(
+            Config::default().input.capslock.mode_after_cancel,
+            "chinese"
+        );
+    }
+
     /// cancel_on_mode_switch=true 但 CapsLock 未开：不注入、正常翻转。
     #[test]
     fn toggle_mode_normal_flip_when_caps_off() {
@@ -15157,9 +15581,18 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert("x.exe".to_string(), false);
-        assert!(!c.initial_chinese_mode_for("x.exe"), "表命中优先");
-        assert!(c.initial_chinese_mode_for("y.exe"), "未命中落默认");
-        assert!(c.initial_chinese_mode_for(""), "空进程名落默认");
+        assert!(
+            !c.initial_chinese_mode_for("x.exe", &FocusWindow::default()),
+            "表命中优先"
+        );
+        assert!(
+            c.initial_chinese_mode_for("y.exe", &FocusWindow::default()),
+            "未命中落默认"
+        );
+        assert!(
+            c.initial_chinese_mode_for("", &FocusWindow::default()),
+            "空进程名落默认"
+        );
     }
 }
 
@@ -15729,6 +16162,7 @@ mod focus_ownership_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         assert!(!c.state.lock().unwrap().menu_open);
     }

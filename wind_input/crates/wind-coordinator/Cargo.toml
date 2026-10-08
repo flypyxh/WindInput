@@ -39,6 +39,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 
+# 空闲时 malloc_trim（heap_trim.rs）
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 # DirectSwitchHotkeys 注册表同步（direct_switch.rs）
