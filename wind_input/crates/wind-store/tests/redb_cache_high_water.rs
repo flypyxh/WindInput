@@ -41,6 +41,7 @@
 //! WIND_HW=import $T -- $M    # 导入 + 验证 pause/resume 能否把缓存要回来
 //! WIND_HW=idle   $T -- $M    # 只开库，不读 → 基线
 //! WIND_HW=scan   $T -- $M    # 开库 + 全表扫 → 差值就是读缓存
+//! WIND_HW=trim   $T -- $M    # 全表扫 → 丢缓存 → malloc_trim，看 RSS 能否落回
 //! ```
 
 use wind_store::{Store, wdict::WordIo};
@@ -208,6 +209,27 @@ fn the_page_cache_is_a_high_water_mark() {
                 println!("[evict] resume 后仍可查（{n} 条）");
             }
         }
-        _ => println!("请设 WIND_HW=build|idle|scan|import|evict|hold，见文件头的跑法"),
+        // ★ 空闲回收 + 整理堆（协调器 `heap_trim.rs` 接在 reclaimer 钩子上）能不能让 RSS
+        // 真正落回。上面 evict 证的是「释放了」，这里证「还给 OS 了」。
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        Ok("trim") => {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> i32;
+            }
+            let s = Store::open(&db).expect("开库");
+            let opened = rss_mb();
+            for _ in 0..3 {
+                let _ = s.search_user_words_prefix("py", "", 0).expect("全表扫");
+            }
+            let filled = rss_mb();
+            s.drop_page_cache().expect("回收");
+            let dropped = rss_mb();
+            unsafe { malloc_trim(0) };
+            let trimmed = rss_mb();
+            println!(
+                "[trim] 开库 {opened:.1} → 全表扫 {filled:.1} → 丢缓存 {dropped:.1} → malloc_trim {trimmed:.1} MB"
+            );
+        }
+        _ => println!("请设 WIND_HW=build|idle|scan|import|evict|hold|trim，见文件头的跑法"),
     }
 }
