@@ -62,6 +62,44 @@ final class WireGeometryTests: XCTestCase {
         XCTAssertEqual(out.y + huge.height, vf.minY + huge.height, "左上角须落在可见区内")
     }
 
+    // MARK: - 跟随光标落位 (GH#179)
+
+    /// 主屏右侧接一块 2560×1440 副屏（Cocoa 下 x 从 1920 起、底边对齐主屏底边）。
+    private let sideVF = CGRect(x: 1920, y: 0, width: 2560, height: 1415)
+
+    /// **GH#179 的回归**：副屏上的光标，按副屏可见区钳位，候选窗留在副屏、就在光标下方。
+    /// 以前拿主屏可见区钳，x 一律被拉到 `1920 - 宽`，候选窗飞回主屏右边缘。
+    func testFollowCaretStaysOnSecondaryScreen() {
+        let size = CGSize(width: 300, height: 60)
+        let out = WireGeometry.followCaretOrigin(wireX: 2500, wireY: 400, size: size,
+                                                 screenHeight: H, visibleFrame: sideVF)
+        XCTAssertEqual(out.x, 2500)
+        XCTAssertEqual(out.y, WireGeometry.flipY(400, screenHeight: H) - size.height)
+    }
+
+    func testFollowCaretPullsBackAtSecondaryRightEdge() {
+        let size = CGSize(width: 300, height: 60)
+        let out = WireGeometry.followCaretOrigin(wireX: 4400, wireY: 400, size: size,
+                                                 screenHeight: H, visibleFrame: sideVF)
+        XCTAssertEqual(out.x, sideVF.maxX - size.width)
+    }
+
+    /// 光标贴屏幕底边、下方放不下 → 翻到光标上方（估算光标高 18pt）。
+    func testFollowCaretFlipsAboveNearBottom() {
+        let size = CGSize(width: 300, height: 60)
+        let out = WireGeometry.followCaretOrigin(wireX: 100, wireY: 1060, size: size,
+                                                 screenHeight: H, visibleFrame: vf)
+        XCTAssertEqual(out.y, WireGeometry.flipY(1060, screenHeight: H) + 18)
+    }
+
+    /// 状态气泡共用同一落位，只是翻上去时离锚点 2pt 而不是让出整行光标。
+    func testFollowCaretAboveGapIsConfigurable() {
+        let size = CGSize(width: 120, height: 34)
+        let out = WireGeometry.followCaretOrigin(wireX: 100, wireY: 1060, size: size,
+                                                 screenHeight: H, visibleFrame: vf, aboveGap: 2)
+        XCTAssertEqual(out.y, WireGeometry.flipY(1060, screenHeight: H) + 2)
+    }
+
     // MARK: - 状态气泡锚点 (C2-33 / GH#148)
 
     /// 可见区 (Cocoa, y 向上): 左下 (0,0), 顶部让出 25pt 菜单栏。

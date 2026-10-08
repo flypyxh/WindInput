@@ -174,22 +174,15 @@ final class StatusBubblePanel: NSPanel {
         guard let screen = PanelGeometry.referenceScreen else {
             orderFrontRegardless(); return
         }
-        let vf = screen.visibleFrame
-        // wire top-left → Cocoa bottom-left: caret 点的 Cocoa y。气泡顶端贴 caret 点下方。
         // wireY 已是 caret 底部下方的锚点 (forwarder 加了 caretHeight+gap), 与候选窗口
         // 同位置; 固定位置模式下则直接是用户摆放的绝对坐标 (那边 fx/fy 就是 custom_x/y)。
-        // 气泡顶边贴该锚点 (originY 为底边, 故 -h)。
-        let caretLine = WireGeometry.flipY(CGFloat(wireY), screenHeight: screen.frame.height)
-        var originX = CGFloat(wireX)
-        var originY = caretLine - h
-
-        if originX + w > vf.maxX { originX = vf.maxX - w }
-        if originX < vf.minX { originX = vf.minX }
-        if originY < vf.minY { originY = caretLine + 2 } // 下方放不下 → 翻到锚点上方
-        if originY + h > vf.maxY { originY = vf.maxY - h }
-        if originY < vf.minY { originY = vf.minY }
-
-        setFrameOrigin(NSPoint(x: originX, y: originY))
+        // 气泡顶边贴该锚点, 下方放不下翻到锚点上方。钳位用**锚点所在屏**（GH#179 同病：
+        // 用主屏钳, 副屏上的气泡被拽回主屏右边缘）; 翻 y 仍用主屏高度（wire 原点在主屏）。
+        let vf = (PanelGeometry.screen(wireX: CGFloat(wireX), wireY: CGFloat(wireY) - 4) ?? screen).visibleFrame
+        let o = WireGeometry.followCaretOrigin(
+            wireX: CGFloat(wireX), wireY: CGFloat(wireY), size: NSSize(width: w, height: h),
+            screenHeight: screen.frame.height, visibleFrame: vf, aboveGap: 2)
+        setFrameOrigin(o)
         orderFrontRegardless()
         armHideTimer(durationMs)
     }

@@ -59,6 +59,26 @@ public enum WireGeometry {
         }
     }
 
+    /// 跟随光标的候选窗落位：wire 左上（光标底端下方）+ 窗口尺寸 → Cocoa 左下角。
+    ///
+    /// `visibleFrame` 必须是**光标所在屏**的可见区（GH#179：曾用主屏，副屏上的候选窗被一把
+    /// 钳回主屏右边缘）。超出左右边回拉；下方放不下翻到光标上方，翻了仍
+    /// 越界再兜底夹进可见区。`aboveGap` 是翻到上方时离锚点的距离：候选窗要让出整行光标（18），
+    /// 状态气泡只留一线（2），与各自原先的写法一致。
+    public static func followCaretOrigin(wireX: CGFloat, wireY: CGFloat, size: CGSize,
+                                         screenHeight: CGFloat, visibleFrame vf: CGRect,
+                                         aboveGap: CGFloat = 18) -> CGPoint {
+        let caretBottomLine = flipY(wireY, screenHeight: screenHeight)
+        var x = wireX
+        var y = caretBottomLine - size.height
+        if x + size.width > vf.maxX { x = vf.maxX - size.width }
+        if x < vf.minX { x = vf.minX }
+        if y < vf.minY { y = caretBottomLine + aboveGap }
+        if y + size.height > vf.maxY { y = vf.maxY - size.height }
+        if y < vf.minY { y = vf.minY }
+        return CGPoint(x: x, y: y)
+    }
+
     /// 把窗口矩形钳进可见区 `visibleFrame`（避开菜单栏/Dock）；返回钳后的左下角。
     /// 内容比屏幕还大时保证**左上角**可见（先按右/下回拉，再按左/上兜底）。
     public static func clamp(origin: CGPoint, size: CGSize, visibleFrame vf: CGRect) -> CGPoint {
