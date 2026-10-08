@@ -36,8 +36,8 @@
 | 方案引擎 | 每个方案一份引擎外壳 + 懒建索引 | 启动 1.5 秒后预热 `available` 全部 + 临拼目标 + english | 当前方案、临拼、临英 | `construct.rs:134-192` |
 | 混输子引擎 | 与独立方案各一份 | 构建混输方案时新建，不复用表内实例 | 混输 | `manager.rs:5529/5571` |
 | 反查索引（主码表） | wubi86 2.3 MB 常驻（≤3 MB 进堆） | `prewarm_indexes` **无条件** | 悬停[编码]、`${code_rev}`、联想、辅助码、自动造词 | `coordinator.rs:4699-4708` |
-| `UserTextIndex` | 推断 19 万词 ≈ 5 MB/份，最多 4 份 | 悬停[编码]段按候选逐条触发 | 同上 | `text_codes.rs:89`、`manager.rs:1273` |
-| 拆字表 | 推断 ≈ 0.8 MB | 启动恒加载 | `${chaizi*}`（出厂注释不含，悬停拆字段出厂关） | `coordinator.rs:2524`、`wind-reverse/lib.rs:842` |
+| `UserTextIndex` | 推断 19 万词 ≈ 5 MB/份，最多 4 份 | 悬停[编码]段按候选逐条触发；`${code_rev}` 经 `codetable_reverse_hint` 也会带上 | 同上 | `text_codes.rs:89`、`manager.rs:1273` |
+| 拆字表 | 推断 ≈ 0.8 MB | 构造期 `build()` 恒加载（`sync_chaizi_assets` 只管切方案 / 重载） | `${chaizi*}`（出厂注释不含，悬停拆字段出厂关） | `coordinator.rs:2524`、`wind-reverse/lib.rs:842` |
 | 简繁表 s2t + t2s | 实测约 1.6 + 0.2 MB | 启动恒加载，不看开关 | 简繁开着时上屏 | `coordinator.rs:2410-2428` |
 | `CharPinyinIndex` | 约 9.2 MB | 首次加词 / `${pinyin}` 用于非拼音候选 | 加词反推拼音 | `pinyin/generate.rs:29` |
 | redb 读缓存 | 实测 19 万词 ≈ 41 MB | 读到就进，空闲 60 秒才丢 | 用户词 / 词频 | `wind-store/store.rs:37` |
@@ -75,7 +75,10 @@
 
 ### 4.1 需求汇总 `DataNeeds`
 
-在 `ConfigBundle::build`（「所有配置生效的必经之路」，`config_bundle.rs:1-4`）里派生一个只读结构：
+由一个纯函数 `DataNeeds::derive(config, SchemaFacts)` 派生（实现见 `wind-coordinator/src/data_needs.rs`）。
+**不放进 `ConfigBundle`**：方案级 / 模式级模板写在方案文件里，辅助码与自动造词随当前方案变，
+而切方案不重建 bundle、`reload_user_config` 又是先建 bundle 后 `reload_from_config`——存进去必在
+这两个时刻过期。改为在构造、配置生效、切方案、预热时现算，判据仍只在一处：
 
 ```rust
 pub(crate) struct DataNeeds {
@@ -86,6 +89,13 @@ pub(crate) struct DataNeeds {
     pub s2t: bool, pub t2s: bool, // 对应方向 enabled
 }
 ```
+
+判定要点（S1 实施时补全）：
+- 方案级模板取**全部已安装方案**的并集，宁可多装一份拆字表也不要切过去才空。
+- 悬停的逐字段 `${code_rev}` 走 `eval_text_var`，**不看** `code_hint_source`；`${code_source}` 单独
+  出现也要查编码——两者都计入 `reverse_index`。
+- 出厂结果：反查要、用户层要（全局模板含 `${code_rev}` 且临拼来源出厂 `auto`），拆字、简繁不要。
+  即出厂只省拆字 + 简繁约 2.6 MB（推断）；主要收益在用户关掉功能之后。
 
 判定材料已经现成：`Template::references`（`comment.rs:625`）、`CompiledTooltip::references`
 （`tooltip.rs:150`），加上各功能的开关。**模板要覆盖三层**（全局 / 方案 / 模式级），漏一层就是
@@ -104,7 +114,8 @@ pub(crate) struct DataNeeds {
 | 简繁表 | 只预载 `enabled` 的方向；切换入口（热键、菜单、工具栏、命令栏）先同步加载再切 | 1.6–1.8 MB |
 | 拼音表 | 维持恒加载：出厂悬停「拼音」段开着，且加词回退要用 | — |
 
-简繁的「同步加载」需要先测：原注释怕的是「按键线程上做文件 I/O」。切换是一次性的用户动作，
+简繁的「同步加载」已实测（S1，release，页缓存热）：s2t 1.3–3.4 ms、t2s 0.1–0.3 ms，远低于
+50 ms，保持同步。下面是当初的顾虑：原注释怕的是「按键线程上做文件 I/O」。切换是一次性的用户动作，
 不是逐键路径。STPhrases 1.5 MB，**实测单次加载 < 50 ms 才这么做**，否则改为后台加载并弹
 「正在加载简繁数据」。顺带修一个现存缺口：菜单 / 工具栏路径（`message_handler.rs:395`）
 **没有**「是否已加载」检查，热键路径有（`coordinator.rs:7974`）。
