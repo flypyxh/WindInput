@@ -538,6 +538,15 @@ pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
 /// 向后兼容：DLL 的 `PlaceholderForKind` 对**认不出的值一律回落空格**，所以只认 0/1 的旧 DLL
 /// 收到 2 时兜底占位是空格（历史行为），不会出错；新加档位照此只追加、不复用旧值。
 pub const CONFIG_KEY_COMPOSITION_PLACEHOLDER: &str = "composition_placeholder";
+/// 「本进程可能命中 compat 标题规则」开关（采不采窗口标题）同步键名。格式：`enabled(u8)`。
+///
+/// 开着时 DLL 才在 FocusGained 里附上焦点顶层窗口的标题（变长段 ③，见 [`FocusGainedPayload`]）；
+/// 关着时一次标题都不取——标题是用户数据（网页标题、文件名），没有规则用得上就不该离开宿主进程。
+/// 取值 = `AppCompat::process_may_match_title(该客户端的进程名)`（有不限进程的标题规则、或本进程有
+/// 标题规则），逐客户端推：握手时推，compat 重载 / pid 名纠正后重推。DLL 在开关 0→1 时若本焦点
+/// 发出的 FocusGained 没带标题，会补发一次。
+/// DLL 每次重连从默认值（关）起步，故**握手必推**（`diag_snapshot` 同型）。
+pub const CONFIG_KEY_COMPAT_TITLE_MATCH: &str = "compat_title_match";
 /// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：空格 U+0020（默认）。
 pub const COMPOSITION_PLACEHOLDER_SPACE: u8 = 0;
 /// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：ZWSP U+200B。
@@ -945,6 +954,7 @@ pub struct FocusGainedPayload {
     // 并波及全部既有调用点），各由 `crate::codec` 的解码函数单独取：
     //
     //   [0..39 定长][bundleIdLen:u32][bundleId][windowClassLen:u32][windowClass]
+    //              [windowTitleLen:u32][windowTitle]
     //
     //   ① bundleId    darwin 专属：宿主 app 的 bundle id，服务端当「进程名」用于
     //                 compat.toml 匹配与 per-app 记忆。见 `decode_focus_gained_bundle_id`。
@@ -952,6 +962,11 @@ pub struct FocusGainedPayload {
     //                 窗口（任务栏 / Alt+Tab 切换器）与停留型窗口（桌面 / 文件管理器）
     //                 分开——它们同属 explorer.exe，仅凭进程名无法区分。
     //                 见 `decode_focus_gained_window_class`。
+    //   ③ windowTitle 同一个顶层窗口的标题（UTF-8，DLL 截断到 256 个 UTF-16 码元），供
+    //                 compat.toml 的 `title` 条件匹配。**仅当服务端经 `CONFIG_KEY_COMPAT_TITLE_MATCH`
+    //                 推开采集时才非空**（没有标题规则就不取用户的窗口标题）；旧 DLL 不发本段，
+    //                 解出空串。标题按用户数据处理：任何级别的日志只记长度。
+    //                 见 `decode_focus_gained_window_title`。
     //
     // ⚠ **窗口类段必须按顺序走，不能用固定偏移**：bundleId 是变长的，macOS 上非空。
     // Windows DLL 因此要发 `bundleIdLen=0` 占位，让两个平台共用同一条线性走法。

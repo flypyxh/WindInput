@@ -126,6 +126,7 @@ fn focus(c: &Coordinator, pid: u32, instance: u32, proc: &str) {
         caret_source: 0,
         bundle_id: proc.to_string(),
         window_class: String::new(),
+        window_title: String::new(),
     });
     c.debug_wait_app_schema_load();
 }

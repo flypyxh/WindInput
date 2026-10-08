@@ -1,6 +1,6 @@
 # 应用兼容规则：窗口类名 / 标题匹配
 
-> 状态：设计定稿（2026-10-08，维护者确认），未实施。来源：论坛 t270（AutoHotkey 同进程多窗口）、
+> 状态：设计定稿（2026-10-08，维护者确认）；P1～P4 已实施（标题变化检测未做）。来源：论坛 t270（AutoHotkey 同进程多窗口）、
 > GH#175（想用 `class = "Chrome_WidgetWin_*"` 覆盖所有 Chromium / Electron 宿主）。
 
 ## 定稿决策
@@ -38,6 +38,9 @@
 
 - 缓存键 pid → (pid, 顶层类名小写, 标题哈希)，在 focus_gained 判定；ime_activated 沿用该 client_token
   最近一次 focus_gained 的窗口上下文。
+- `AppCompat::resolve` 缓存两级（P3）：一级按 (进程, 类名) 存「进程 + 类名都命中」的候选拆成的基底与
+  待比标题的子集（LRU，容量 64）；二级按命中的标题规则集合存合成结果。标题频繁变化只在子集里比标题；
+  没有标题规则时不折叠标题。表里没有标题规则时服务端也不留标题（`focus_window_of`）。
 - 持续类字段（定位、首显、配对、占位…）随判定结果即时刷新；进入类（initial_mode / punct / schema）
   只在「pid 变了，或命中的带窗口条件的初始规则集合变了」时重算，仅标题变化永不重算。
 - `host_render` 只认具体进程、无窗口条件的规则；按事件源 pid 直查（`push_config.rs:157`）在无窗口
@@ -47,8 +50,15 @@
 
 - FocusGained 变长段末尾追加 `titleLen:u32 + title`（旧 DLL 解出空串），DLL 用 `InternalGetWindowText`
   （不发 WM_GETTEXT，宿主卡住也不阻塞），截断 256 字符。
-- 仅当服务端推送「存在标题规则」（新 config key，握手也推）时才采集。
-- 日志：标题按用户数据处理，任何级别只记长度与命中规则键；顺带把 `Globals.cpp:276` debug 级打标题改成只记长度。
+- 仅当服务端推送「本进程可能命中标题规则」（`CONFIG_KEY_COMPAT_TITLE_MATCH`，按客户端进程算：不限进程
+  的标题规则或本进程的标题规则；握手推、compat 重载 / pid 名纠正后逐客户端重推）时才采集；DLL 在推送
+  通道重连（CMD_SERVICE_READY）时清零。纯判据在 `wind_tsf/include/WindowTitlePolicy.h`。
+- 新进程首焦常早于开关到达：DLL 在开关 0→1、仍有焦点、本焦点会话发出的 focus_gained 没带标题时补发一次
+  （带类名与标题）。服务端把「上一次推进模式归属的焦点看不见标题、这次同 pid 同类名带标题且命中写进入类
+  字段的标题规则」也算切进来（`focus_crossed` / `ModeScope::title_blind`），其余仅标题变化照旧不重算。
+- 窗口身份（token 窗口表比较、`ActiveCompat` 缓存键）比「类名 + 命中的标题规则集合」，不比标题原文。
+- 日志：标题按用户数据处理，任何级别只记长度与命中规则键；`WindLogHostProcessInfo`（`compat.*.foreground_host`
+  等）只留 `title_len`，`WindHostProcessInfo` 不再存标题原文。
 
 ## 分期
 

@@ -153,7 +153,9 @@ struct WindHostProcessInfo
     std::wstring processPath;
     std::wstring processName;
     std::wstring windowClass;
-    std::wstring windowTitle;
+    // 窗口标题**只留长度**（InternalGetWindowText 取，上限 255）：标题是用户数据（网页标题、
+    // 文件名），诊断日志只需要知道有没有、多长，原文不进内存结构也就不会进日志。
+    int windowTitleLen = 0;
     std::wstring packageFamilyName;
 };
 

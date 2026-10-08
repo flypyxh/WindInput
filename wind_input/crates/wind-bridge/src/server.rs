@@ -393,6 +393,9 @@ fn handle_client(
                 bundle_id: String::new(),
                 window_class: wind_ipc::codec::decode_focus_gained_window_class(payload)
                     .to_string(),
+                // 仅当服务端推开了采集（本进程可能命中标题规则）时非空；旧 DLL 不发该段，解出空串。
+                window_title: wind_ipc::codec::decode_focus_gained_window_title(payload)
+                    .to_string(),
             };
             handler.handle_focus_gained(&data);
         }
@@ -548,6 +551,7 @@ pub(crate) fn dispatch_command(
                 let (chinese_mode, full_width, chinese_punct) = handler.get_current_mode(
                     token,
                     wind_ipc::codec::decode_focus_gained_window_class(payload),
+                    wind_ipc::codec::decode_focus_gained_window_title(payload),
                 );
                 Some(encode_mode_push(chinese_mode, full_width, chinese_punct))
             }

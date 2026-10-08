@@ -249,7 +249,9 @@ impl KeyAction {
 }
 
 /// 焦点数据
-#[derive(Debug, Clone)]
+///
+/// `Debug` 手写：`window_title` 是用户数据，调试输出只给长度（`{:?}` 打进日志也不泄露原文）。
+#[derive(Clone)]
 pub struct FocusData {
     pub x: i32,
     pub y: i32,
@@ -280,6 +282,31 @@ pub struct FocusData {
     /// ⚠ 空串的语义是「不知道焦点在哪」。消费端据此**保持现状**（不重算初始模式）；
     /// 未配作用域的进程不受影响，故旧 DLL / macOS 上一切照旧。
     pub window_class: String,
+    /// 同一个顶层窗口的标题，供 compat.toml 的 `title` 条件匹配；拿不到时为空串（旧 DLL、服务端
+    /// 未推开采集——没有标题规则时 DLL 不取标题，见 `CONFIG_KEY_COMPAT_TITLE_MATCH`）。
+    ///
+    /// ⚠ 用户数据（网页标题、文件名）：任何级别的日志只记长度，不记原文。
+    pub window_title: String,
+}
+
+impl std::fmt::Debug for FocusData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FocusData")
+            .field("x", &self.x)
+            .field("y", &self.y)
+            .field("height", &self.height)
+            .field("composition_start_x", &self.composition_start_x)
+            .field("composition_start_y", &self.composition_start_y)
+            .field("client_token", &self.client_token)
+            .field("input_scope_mask", &self.input_scope_mask)
+            .field("disabled", &self.disabled)
+            .field("reason", &self.reason)
+            .field("caret_source", &self.caret_source)
+            .field("bundle_id", &self.bundle_id)
+            .field("window_class", &self.window_class)
+            .field("window_title_len", &self.window_title.chars().count())
+            .finish()
+    }
 }
 
 /// 光标位置数据
@@ -500,12 +527,19 @@ pub trait MessageHandler: Send + Sync {
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。
     ///
     /// `window_class`：焦点顶层窗口类，语义同 [`FocusData::window_class`]，用于跳过 shell
-    /// 过渡窗口的初始模式套用。
+    /// 过渡窗口的初始模式套用。`window_title`：同 [`FocusData::window_title`]——规则按
+    /// (进程, 类名, 标题) 解析，同步段与重型段必须拿同一个窗口算，否则带标题的规则会让两段的
+    /// 初始模式各算各的（先回一个、再被推送改回来，即「闪」）。
     ///
     /// ⚠ **这是「按应用套用初始模式」的第二个落点**，与重型段 `handle_focus_gained` 各算
     /// 各的（本方法早于它执行，DLL 正阻塞等回传值）。两处的门控条件必须同步改——只改一处
     /// 时症状是「日志显示跳过了、图标照样切」，因为真正把状态改掉的是先跑的这一个。
-    fn get_current_mode(&self, _client_token: u64, _window_class: &str) -> (bool, bool, bool) {
+    fn get_current_mode(
+        &self,
+        _client_token: u64,
+        _window_class: &str,
+        _window_title: &str,
+    ) -> (bool, bool, bool) {
         (true, false, true)
     }
 
@@ -655,5 +689,34 @@ mod placeholder_tests {
             } => assert!(deferred_composition.is_empty()),
             other => panic!("空组合串不应被改写，实际 {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod focus_data_debug_tests {
+    use super::FocusData;
+
+    /// 窗口标题是用户数据：`{:?}` 只输出长度，不输出原文。
+    #[test]
+    fn debug_output_never_contains_the_window_title() {
+        let d = FocusData {
+            x: 0,
+            y: 0,
+            height: 0,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: 1,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: 0,
+            bundle_id: String::new(),
+            window_class: "Chrome_WidgetWin_1".into(),
+            window_title: "机密文件 - 网页".into(),
+        };
+        let s = format!("{d:?}");
+        assert!(!s.contains("机密"), "{s}");
+        assert!(s.contains("window_title_len: 9"), "{s}");
+        assert!(s.contains("Chrome_WidgetWin_1"), "类名照常输出");
     }
 }

@@ -110,6 +110,10 @@ public:
     // 共享内存里的位图，DLL 这边没有任何东西需要跟着变。
     void PostRefreshIcon();
 
+    // Thread-safe「标题采集开关刚由关变开」通知（async reader 线程调用）。TSF 线程上让
+    // TextService 在仍有焦点、且上一条 focus_gained 没带标题时补发一次（带类名与标题）。
+    void PostTitleMatchResync();
+
     // Schedule a 50ms fallback caret retry on the TSF thread.
     // Used as a safety net when an app does not fire OnLayoutChange promptly.
     void PostDelayedCaretPositionUpdate();
@@ -137,6 +141,7 @@ private:
     static const UINT WM_REPLACE_BACKWARD;
     static const UINT WM_PAIR_COMMIT;
     static const UINT WM_REFRESH_ICON;
+    static const UINT WM_TITLE_MATCH_RESYNC;
 
     // Packed status for message passing
     struct StatusUpdateData {

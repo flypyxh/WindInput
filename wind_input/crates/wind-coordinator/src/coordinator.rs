@@ -24,7 +24,7 @@ mod push_config;
 mod state_writer;
 mod status_placement;
 mod window_ctx;
-pub(crate) use window_ctx::{FocusWindow, ModeScope, entry_crossed, entry_window_key};
+pub(crate) use window_ctx::{FocusWindow, ModeScope, entry_window_key, focus_crossed};
 // 单测不碰真实用户目录（`build_status` 每次都会走到它）。
 #[cfg(all(target_os = "linux", ext_presenter, not(test)))]
 mod tray_icon;
@@ -1843,7 +1843,7 @@ pub struct Coordinator {
     /// 迟早会遇到两个答案相反的场景。
     ///
     /// 第三项（[`ModeScope::entry_windows`]）是命中的带窗口条件的进入类规则：同进程内它变了也算
-    /// 「切进来」（AutoHotkey 两个 GUI 窗口各配各的 initial_mode），见 [`entry_crossed`]。
+    /// 「切进来」（AutoHotkey 两个 GUI 窗口各配各的 initial_mode），见 [`focus_crossed`]。
     pub(crate) mode_scope: Mutex<ModeScope>,
     /// `client_token → 最近一次 focus_gained 的窗口`（+ `active_compat` 当前的窗口），见
     /// `coordinator/window_ctx.rs`。
@@ -3142,6 +3142,8 @@ impl Coordinator {
                 self.push_password_suppress_config(token);
                 self.push_english_pair_config(token);
                 self.push_composition_placeholder_config(token);
+                // 标题采集开关按进程名算（本进程可能命中标题规则），名字纠正后同样要重推。
+                self.push_compat_title_match_config(token);
             }
         }
     }
@@ -11031,6 +11033,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::GUI_CARET,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -11068,6 +11071,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         assert!(
             !c.composition_start.lock().unwrap().2,
@@ -11097,6 +11101,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -11141,6 +11146,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -13468,6 +13474,7 @@ mod caret_compat_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         assert!(
             !c.caret_cache_verified
@@ -14723,11 +14730,11 @@ mod initial_mode_tests {
             .unwrap()
             .insert("game.exe".to_string(), false);
         // 当前全局是中文，焦点到 game.exe → 同步切英文并回传。
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(!chinese);
         assert!(!c.state.lock().unwrap().chinese_mode);
         // 未缓存的 pid（首次聚焦）：保持现状不误切。
-        let (chinese, _, _) = c.get_current_mode(token(999), "");
+        let (chinese, _, _) = c.get_current_mode(token(999), "", "");
         assert!(!chinese, "未知进程应回传当前状态");
     }
 
@@ -14736,7 +14743,7 @@ mod initial_mode_tests {
     fn get_current_mode_global_scope_passthrough() {
         let c = coord_with(|_| {});
         c.state.lock().unwrap().chinese_mode = false;
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(!chinese);
     }
 
@@ -14860,6 +14867,7 @@ mod initial_mode_tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: class.into(),
+            window_title: String::new(),
         };
 
         // 任务栏（作用域外）：规则不套用，保持切入前的中文。
@@ -14896,7 +14904,7 @@ mod initial_mode_tests {
         //
         // 「按应用套用初始模式」有**两个落点**，测试必须两个都走，否则等于只测了一半。
         let c = build();
-        let (chinese, _, _) = c.get_current_mode(token(200), "Shell_TrayWnd");
+        let (chinese, _, _) = c.get_current_mode(token(200), "Shell_TrayWnd", "");
         assert!(chinese, "同步段也必须跳过作用域外的窗口");
         c.handle_focus_gained(&focus("Shell_TrayWnd"));
         assert!(
@@ -14906,7 +14914,7 @@ mod initial_mode_tests {
 
         // 对照：桌面走同一条顺序，规则必须照常生效（防过度修复）。
         let c = build();
-        let (chinese, _, _) = c.get_current_mode(token(200), "Progman");
+        let (chinese, _, _) = c.get_current_mode(token(200), "Progman", "");
         assert!(!chinese, "桌面的 initial_mode=english 必须在同步段就生效");
         c.handle_focus_gained(&focus("Progman"));
         assert!(!c.state.lock().unwrap().chinese_mode);
@@ -14958,15 +14966,16 @@ mod initial_mode_tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: class.into(),
+            window_title: String::new(),
         };
 
         // ① 点任务栏（作用域外）：跳过，状态不变。
-        c.get_current_mode(token(200), "Shell_TrayWnd");
+        c.get_current_mode(token(200), "Shell_TrayWnd", "");
         c.handle_focus_gained(&focus("Shell_TrayWnd"));
         assert!(c.state.lock().unwrap().chinese_mode, "任务栏不该改模式");
 
         // ② 真正回到桌面：**同一个 explorer pid**，仍必须算作跨进程切入并套用英文。
-        let (chinese, _, _) = c.get_current_mode(token(200), "Progman");
+        let (chinese, _, _) = c.get_current_mode(token(200), "Progman", "");
         assert!(
             !chinese,
             "桌面必须仍被判为跨进程切入——作用域外的窗口不能提前消费掉这次切换"
@@ -15008,13 +15017,13 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert(100, "everything.exe".to_string());
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(!chinese, "跨进程切入规则应用 → 同步段即回传英文");
 
         // 重型段已把焦点与模式归属都更新为 100；用户随后手切回中文。
         set_focus_proc(&c, 100, "everything.exe");
         c.state.lock().unwrap().chinese_mode = true;
-        let (chinese, _, _) = c.get_current_mode(token(100), "");
+        let (chinese, _, _) = c.get_current_mode(token(100), "", "");
         assert!(
             chinese,
             "同应用内跳转不得把手切的中文拉回规则的英文——规则是初始值不是锁定"
@@ -15050,7 +15059,7 @@ mod initial_mode_tests {
             .lock()
             .unwrap()
             .insert(300, "notepad.exe".into());
-        let (sync_chinese, _, _) = c.get_current_mode(token(300), "Notepad");
+        let (sync_chinese, _, _) = c.get_current_mode(token(300), "Notepad", "");
 
         // 重型段随后落地的值。
         c.handle_focus_gained(&FocusData {
@@ -15066,6 +15075,7 @@ mod initial_mode_tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: "Notepad".into(),
+            window_title: String::new(),
         });
         let heavy_chinese = c.state.lock().unwrap().chinese_mode;
 
@@ -16109,6 +16119,7 @@ mod focus_ownership_tests {
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
             bundle_id: String::new(),
             window_class: String::new(),
+            window_title: String::new(),
         });
         assert!(!c.state.lock().unwrap().menu_open);
     }

@@ -2453,7 +2453,12 @@ impl MessageHandler for Coordinator {
             .clone();
         // 窗口上下文记账**先于** update_active_compat：后者按该 token 记下的窗口解析规则
         // （同进程换窗口时持续类字段即时刷新，见 `coordinator/window_ctx.rs`）。
-        let window = FocusWindow::of_focus(data);
+        // 留不留标题按进程判（`focus_window_of`）。重型段可以反查进程名（通常 bridge 连接时已缓存）。
+        let window = self.focus_window_of(
+            &self.proc_name_or_lookup(new_pid),
+            &data.window_class,
+            &data.window_title,
+        );
         // DLL 手里那份密码门控是按该 token **旧**窗口算的（没记录 = 握手时的空窗口），换窗口时
         // 下面的 `apply_input_diag` 只降不升，见 `apply_input_diag_capped`。
         let dll_pfe = self.password_force_english_for_token(data.client_token);
@@ -2573,17 +2578,20 @@ impl MessageHandler for Coordinator {
         // record_app_mode 与当前状态保持同步，重算结果恒等于现值，故语义无变化；代价是失去了
         // 一条隐式的 compartment 脏事件自愈路径，该自愈在 IME_ACTIVATED 路径仍然保留。
         //
-        // 「跨进程」扩展为「切进来」（`entry_crossed`）：同进程内命中的带窗口条件的进入类规则
+        // 「跨进程」扩展为「切进来」（`focus_crossed`）：同进程内命中的带窗口条件的进入类规则
         // 集合变了也算（AutoHotkey 两个 GUI 窗口各配各的 initial_mode）。带标题条件的规则不进
-        // 这个集合，仅标题变化永不重算（设计稿定稿决策）。
+        // 这个集合，仅标题变化永不重算（设计稿定稿决策）；唯一例外是「标题迟到」——上一次焦点
+        // 因 DLL 还没收到采集开关而没带标题，见 `focus_crossed`。
         //
         // 作用域一票否决：任务栏 / Alt+Tab 切换器与桌面同属 explorer.exe，仅凭进程名
         // 分不开，判据只能来自窗口类。名字取 update_active_compat 刚填好的缓存（此刻必已
         // 就绪）。未配作用域的进程恒放行 ⇒ 绝大多数应用零变化。
         // 详见 `InitialModeScopeRule` 与 should_reapply_initial 注释。
         let proc_name = self.cached_proc_name(data.client_token);
-        let new_entry = entry_window_key(&self.resolve_compat(&proc_name, &window));
-        let crossed = entry_crossed(&old_scope, new_pid, &new_entry);
+        let resolved = self.resolve_compat(&proc_name, &window);
+        let new_entry = entry_window_key(&resolved);
+        let crossed = focus_crossed(&old_scope, new_pid, &resolved, &window);
+        let title_blind = self.focus_is_title_blind(&proc_name, &window);
         let out_of_scope = !self
             .app_compat
             .lock()
@@ -2612,6 +2620,7 @@ impl MessageHandler for Coordinator {
                 pid: new_pid,
                 has_rule: new_has_rule,
                 entry_windows: new_entry,
+                title_blind,
                 window: window.clone(),
             };
         }
@@ -2777,7 +2786,12 @@ impl MessageHandler for Coordinator {
         // 焦点。真正离开时随后的 DocChanged / Thread 会收口。
     }
 
-    fn get_current_mode(&self, client_token: u64, window_class: &str) -> (bool, bool, bool) {
+    fn get_current_mode(
+        &self,
+        client_token: u64,
+        window_class: &str,
+        window_title: &str,
+    ) -> (bool, bool, bool) {
         // 回传三元组（中英 / 全半角 / **中英标点**）。标点态不可省：DLL 的标点透传判据要按
         // 它在两份集合间二选一，漏了就会在焦点切换后的竞态窗口里误用英文态超集
         // （`,` `.` 被透传成半角）。而 per-app 的 `initial_punct` 规则正是在本方法里落地的。
@@ -2808,12 +2822,13 @@ impl MessageHandler for Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let (old_pid, old_has_rule) = (old_scope.pid, old_scope.has_rule);
-        // 窗口用 DLL 随本请求带来的类名：重型段的记账（`note_focus_window`）还没跑，token 表里
-        // 是上一个窗口。跨越判据与重型段同源（`entry_crossed`）。
-        let window = FocusWindow::of_class(window_class);
+        // 窗口用 DLL 随本请求带来的类名 + 标题：重型段的记账（`note_focus_window`）还没跑，token
+        // 表里是上一个窗口。跨越判据与重型段同源（`focus_crossed`），窗口也同源（`focus_window_of`）。
+        // 进程名只查缓存（同步段禁止 OpenProcess）；查不到时下面本就跳过 per-app 重算。
         let proc = self.cached_proc_name(client_token);
+        let window = self.focus_window_of(&proc, window_class, window_title);
         let resolved = self.resolve_compat(&proc, &window);
-        let crossed = entry_crossed(&old_scope, new_pid, &entry_window_key(&resolved));
+        let crossed = focus_crossed(&old_scope, new_pid, &resolved, &window);
         if crossed {
             // 作用域一票否决，判据与重型段完全同源。
             // ⚠ **两处都要有**：本方法先跑且 DLL 正阻塞等它的回传值，只挡住重型段的话，

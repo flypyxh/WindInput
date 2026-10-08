@@ -31,6 +31,7 @@ fn focus(coord: &Coordinator, mask: u64) {
         caret_source: 0,
         bundle_id: String::new(),
         window_class: String::new(),
+        window_title: String::new(),
     });
 }
 

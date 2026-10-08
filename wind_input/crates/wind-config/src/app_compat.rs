@@ -48,8 +48,8 @@ pub(crate) const USER_COMPAT_HEADER: &str = "\
 # 一个窗口命中多条时按具体程度叠加，越具体越后叠（后叠的赢）：
 #   \"*\" < 仅窗口条件 < 仅进程名 < 进程名 + 窗口条件。
 #   更具体那条里的 unset 也取消 \"*\" 等更低级规则设下的同名字段（回到「跟随全局」）。
-# 设置页「应用兼容性」可新增、修改带 class / title 的规则；当前版本尚未上报窗口标题，
-#   title 条件暂不生效（待后续版本）。
+# 设置页「应用兼容性」可新增、修改带 class / title 的规则。title 在焦点切换时判定，
+#   标题变化不重算初始中英态；只对可能命中 title 规则的进程采集窗口标题，日志不记标题原文。
 # 字段说明见系统层 data/compat.toml 顶部注释。
 
 ";
@@ -1698,15 +1698,22 @@ impl FoldedCtx {
     }
 }
 
+/// 窗口条件：模式为空 = 不限；拿不到值（空串）⇒ 带该条件的规则不命中（哪怕模式是 `*`）。
+fn cond_matches(pattern: &[char], value: &[char]) -> bool {
+    pattern.is_empty() || (!value.is_empty() && wildcard_match_folded(pattern, value))
+}
+
 impl Candidate {
     fn matches(&self, ctx: &FoldedCtx) -> bool {
+        self.matches_process_class(&ctx.process, &ctx.class)
+            && cond_matches(&self.title_pat, &ctx.title)
+    }
+
+    /// 进程 + 类名两项（不看标题）：解析缓存的一级按它把候选拆成「基底」与「待比标题」两组。
+    fn matches_process_class(&self, process: &str, class: &[char]) -> bool {
         let process_ok =
-            self.id.is_any_process() || (!ctx.process.is_empty() && self.id.process == ctx.process);
-        // 拿不到类名 / 标题 ⇒ 带该条件的规则不命中（哪怕模式是 `*`）。
-        let cond = |pattern: &[char], value: &[char]| {
-            pattern.is_empty() || (!value.is_empty() && wildcard_match_folded(pattern, value))
-        };
-        process_ok && cond(&self.class_pat, &ctx.class) && cond(&self.title_pat, &ctx.title)
+            self.id.is_any_process() || (!process.is_empty() && self.id.process == process);
+        process_ok && cond_matches(&self.class_pat, class)
     }
 }
 
@@ -1768,15 +1775,44 @@ fn merge_sorted<'a>(a: &'a [usize], b: &'a [usize]) -> impl Iterator<Item = usiz
     })
 }
 
-/// [`AppCompat::resolve`] 缓存的上限：焦点窗口的组合有限，超过就整表清空重来。
+/// [`AppCompat::resolve`] 一级缓存（按 (进程, 类名)）的容量，满了按 LRU 淘汰最久没用的一条。
 pub(crate) const RESOLVE_CACHE_CAP: usize = 64;
 
-/// 缓存键：规范化后的 (进程名, 类名, 标题)——规范化后相等的上下文合成结果必然相同。
-type CtxKey = (String, String, String);
+/// 每个一级条目下「命中的标题规则集合 → 结果」的容量，满了清空这一条目的二级表。
+/// 同一 (进程, 类名) 下标题规则通常寥寥几条，能组合出的命中集合远少于此。
+const TITLE_HITS_CAP: usize = 16;
 
-/// 解析结果缓存。克隆出来的是空缓存：重载规则表（新建 / 克隆 [`AppCompat`]）即清空。
+/// 一级缓存键：规范化后的 (进程名 ASCII 小写, 类名逐字符折叠)。
+type ClassKey = (String, String);
+
+/// 一级缓存条目：某个 (进程, 类名) 下与标题无关的那部分解析。
+///
+/// 标题随浏览器标签页、编辑器文件频繁变化，而类名不变：把「进程 + 类名都命中」的候选在这里
+/// 一次拆好，标题变化时只在 `title_idx` 那几条里比标题、再与基底合成。
+#[derive(Debug)]
+struct ClassEntry {
+    /// 不带标题条件、进程 + 类名都命中的候选下标（升序 = 合成顺序）。
+    base_idx: Vec<usize>,
+    /// 带标题条件、进程 + 类名都命中的候选下标（升序）。为空 ⇒ 标题与结果无关（零额外开销）。
+    title_idx: Vec<usize>,
+    /// 一条标题规则都不命中时的结果（= 只叠 `base_idx`）。
+    base: std::sync::Arc<ResolvedRule>,
+    /// 二级：命中的标题规则下标（升序）→ 合成结果。标题千变万化，命中集合只有寥寥几种。
+    by_hits: HashMap<Vec<usize>, std::sync::Arc<ResolvedRule>>,
+    /// LRU 时间戳（越大越近）。
+    used: u64,
+}
+
+/// 解析结果缓存（两级，见 [`ClassEntry`]）。克隆出来的是空缓存：重载规则表（新建 / 克隆
+/// [`AppCompat`]）即清空。
 #[derive(Default)]
-struct ResolveCache(std::sync::Mutex<HashMap<CtxKey, std::sync::Arc<ResolvedRule>>>);
+struct ResolveCache(std::sync::Mutex<ResolveCacheInner>);
+
+#[derive(Default)]
+struct ResolveCacheInner {
+    entries: HashMap<ClassKey, ClassEntry>,
+    tick: u64,
+}
 
 impl Clone for ResolveCache {
     fn clone(&self) -> Self {
@@ -1805,6 +1841,10 @@ pub struct AppCompat {
     wildcard: Option<AppCompatRule>,
     /// HostRender 白名单（原始大小写）。
     host_render: Vec<String>,
+    /// 有启用的、不限进程的带标题条件规则。见 [`Self::process_may_match_title`]。
+    title_any_process: bool,
+    /// 有启用的带标题条件规则的进程（小写）。
+    title_processes: std::collections::HashSet<String>,
     cache: ResolveCache,
     /// 小写进程名 → 该进程允许重算初始模式的窗口类名集合（小写）。
     /// **进程不在表内 = 不受限制**（绝大多数应用走这条路，零行为变化）。
@@ -1929,61 +1969,144 @@ impl AppCompat {
     /// 反序列化（结构体上分不开裸 bool 的「没写」与 `false`）。被禁用的规则不参与；行内 `unset`
     /// 跨级生效（取消更低级规则设下的字段 = 本窗口回到全局默认）。
     ///
-    /// 结果按规范化的 (进程名, 类名, 标题) 缓存（上限 [`RESOLVE_CACHE_CAP`]，重载规则表即清空）。
+    /// 缓存分两级（重载规则表即清空）：一级按规范化的 (进程名, 类名)，存「进程 + 类名都命中」的
+    /// 候选拆成的基底与待比标题的子集（LRU，容量 [`RESOLVE_CACHE_CAP`]）；二级按命中的标题规则
+    /// 集合存合成结果。标题频繁变化（切标签页 / 文件）只在子集里比标题，不重扫全表、不重合成；
+    /// 没有标题规则时不折叠标题，与只按类名缓存等价。
     ///
     /// **进程名为空返回空结果**（空名不吃通配，窗口条件规则也不命中），口径同 [`Self::get_rule`]。
     pub fn resolve(&self, ctx: &WindowCtx) -> std::sync::Arc<ResolvedRule> {
-        use crate::compat_overlay::fold_char;
         if ctx.process.is_empty() {
             return std::sync::Arc::default();
         }
-        let fold = |s: &str| s.chars().map(fold_char).collect::<String>();
-        let key: CtxKey = (
+        self.with_class_entry(ctx, |entry, hits| {
+            if hits.is_empty() {
+                return entry.base.clone();
+            }
+            if let Some(r) = entry.by_hits.get(&hits) {
+                return r.clone();
+            }
+            let resolved = std::sync::Arc::new(compose_candidates(
+                merge_sorted(&entry.base_idx, &hits).map(|i| &self.candidates[i]),
+            ));
+            if entry.by_hits.len() >= TITLE_HITS_CAP {
+                entry.by_hits.clear();
+            }
+            entry.by_hits.insert(hits, resolved.clone());
+            resolved
+        })
+    }
+
+    /// 该窗口命中的标题规则（候选下标，升序）——「标题签名」。两个窗口类名相同、签名相同，
+    /// [`Self::resolve`] 的结果必然相同：协调器据此判断「仅标题变化」是否真的换了生效规则，
+    /// 命中集合没变就不算换窗口（不重算、不重推）。下标只在同一张表内有意义，重载即失效。
+    ///
+    /// 进程名为空 / 没有可能命中的标题规则时为空，不折叠标题。
+    pub fn title_signature(&self, ctx: &WindowCtx) -> Vec<usize> {
+        if ctx.process.is_empty() {
+            return Vec::new();
+        }
+        self.with_class_entry(ctx, |_, hits| hits)
+    }
+
+    /// 取（必要时建）`ctx` 的一级缓存条目，连同标题命中的标题规则下标交给 `f`。
+    /// 条目没有标题规则时不折叠标题，命中集合恒空。
+    fn with_class_entry<R>(
+        &self,
+        ctx: &WindowCtx,
+        f: impl FnOnce(&mut ClassEntry, Vec<usize>) -> R,
+    ) -> R {
+        use crate::compat_overlay::fold_char;
+        let key: ClassKey = (
             ctx.process.to_ascii_lowercase(),
-            fold(ctx.class),
-            fold(ctx.title),
+            ctx.class.chars().map(fold_char).collect(),
         );
         let mut cache = self.cache.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = cache.get(&key) {
-            return hit.clone();
+        cache.tick += 1;
+        let tick = cache.tick;
+        if !cache.entries.contains_key(&key) {
+            if cache.entries.len() >= RESOLVE_CACHE_CAP
+                && let Some(oldest) = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.used)
+                    .map(|(k, _)| k.clone())
+            {
+                cache.entries.remove(&oldest);
+            }
+            let entry = self.class_entry(&key);
+            cache.entries.insert(key.clone(), entry);
         }
-        // 缓存键已是规范化后的上下文，直接拆成字符用，不再折叠第二遍。
-        let folded = FoldedCtx {
-            process: key.0.clone(),
-            class: key.1.chars().collect(),
-            title: key.2.chars().collect(),
+        let entry = cache.entries.get_mut(&key).expect("上面刚确保条目存在");
+        entry.used = tick;
+        let hits = if entry.title_idx.is_empty() {
+            Vec::new()
+        } else {
+            let title: Vec<char> = ctx.title.chars().map(fold_char).collect();
+            entry
+                .title_idx
+                .iter()
+                .copied()
+                .filter(|&i| cond_matches(&self.candidates[i].title_pat, &title))
+                .collect()
         };
-        let resolved = std::sync::Arc::new(self.compose_folded(&folded));
-        // 满了整表清空：焦点窗口组合通常远少于上限。键里含标题，若 P2 实测标题频繁变化
-        // （编辑器、浏览器标签页）把缓存冲得很勤，再换成 LRU 或把标题换成哈希 / 只缓存命中集合。
-        if cache.len() >= RESOLVE_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(key, resolved.clone());
-        resolved
+        f(entry, hits)
     }
 
+    /// 建一级缓存条目：把可能命中该 (进程, 类名) 的候选按「进程 + 类名都命中」筛出，再按有无
+    /// 标题条件拆成基底与待比标题两组。
+    fn class_entry(&self, key: &ClassKey) -> ClassEntry {
+        let class: Vec<char> = key.1.chars().collect();
+        let own: &[usize] = self
+            .process_idx
+            .get(&key.0)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let (mut base_idx, mut title_idx) = (Vec::new(), Vec::new());
+        for i in merge_sorted(&self.any_process_idx, own) {
+            let c = &self.candidates[i];
+            if !c.matches_process_class(&key.0, &class) {
+                continue;
+            }
+            if c.title_pat.is_empty() {
+                base_idx.push(i);
+            } else {
+                title_idx.push(i);
+            }
+        }
+        let base = std::sync::Arc::new(compose_candidates(
+            base_idx.iter().map(|&i| &self.candidates[i]),
+        ));
+        ClassEntry {
+            base_idx,
+            title_idx,
+            base,
+            by_hits: HashMap::new(),
+            used: 0,
+        }
+    }
+
+    /// 是否存在启用的带 `title` 条件的 `[[apps]]` 规则。
+    ///
+    /// 按进程的判断见 [`Self::process_may_match_title`]（推给 DLL 的开关用那个）。
+    pub fn has_title_rules(&self) -> bool {
+        self.title_any_process || !self.title_processes.is_empty()
+    }
+
+    /// 该进程的窗口**可能**命中标题规则：有不限进程的标题规则，或本进程有标题规则。
+    ///
+    /// 推给 DLL 的「采不采窗口标题」开关按进程取它（`CONFIG_KEY_COMPAT_TITLE_MATCH`），协调器
+    /// 也据此决定留不留焦点事件带来的标题：用不上的进程一次标题都不取、不留。进程名为空 = false。
+    pub fn process_may_match_title(&self, process: &str) -> bool {
+        !process.is_empty()
+            && (self.title_any_process
+                || self.title_processes.contains(&process.to_ascii_lowercase()))
+    }
+
+    /// 一级缓存（按 (进程, 类名)）当前的条目数。
     #[cfg(test)]
     pub(crate) fn resolve_cache_len(&self) -> usize {
-        self.cache.0.lock().unwrap().len()
-    }
-
-    /// 可能命中 `ctx` 的规则（不限进程那桶 ⊕ 本进程那桶），按合成顺序。
-    fn bucket_of<'s>(&'s self, ctx: &'s FoldedCtx) -> impl Iterator<Item = &'s Candidate> + 's {
-        let own: &[usize] = if ctx.process.is_empty() {
-            &[]
-        } else {
-            self.process_idx
-                .get(&ctx.process)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
-        };
-        merge_sorted(&self.any_process_idx, own).map(|i| &self.candidates[i])
-    }
-
-    /// 不经缓存的合成。
-    fn compose_folded(&self, ctx: &FoldedCtx) -> ResolvedRule {
-        compose_candidates(self.bucket_of(ctx).filter(|c| c.matches(ctx)))
+        self.cache.0.lock().unwrap().entries.len()
     }
 
     /// 右键菜单为焦点窗口写回 `fields` 时该写到哪条规则。
@@ -2108,6 +2231,12 @@ impl AppCompat {
                 let rule = compose_candidates(t0.iter().copied().chain(own)).rule?;
                 Some((name.clone(), rule))
             })
+            .collect();
+        let titled = candidates.iter().filter(|c| !c.title_pat.is_empty());
+        self.title_any_process = titled.clone().any(|c| c.id.is_any_process());
+        self.title_processes = titled
+            .filter(|c| !c.id.is_any_process())
+            .map(|c| c.id.process.clone())
             .collect();
         self.candidates = candidates;
         self.any_process_idx = any_process_idx;
@@ -4749,14 +4878,129 @@ mod resolve_tests {
         let b = c.resolve(&ctx("A.EXE", "cX", "t"));
         assert!(std::sync::Arc::ptr_eq(&a, &b), "规范化后同键命中缓存");
         for i in 0..200 {
-            let title = format!("t{i}");
-            assert!(c.resolve(&ctx("a.exe", "Cx", &title)).rule.is_some());
+            let class = format!("C{i}");
+            assert!(c.resolve(&ctx("a.exe", &class, "t")).rule.is_some());
         }
         assert!(c.resolve_cache_len() <= RESOLVE_CACHE_CAP);
         assert_eq!(
             c.clone().resolve_cache_len(),
             0,
             "克隆（重载）出的表缓存是空的"
+        );
+    }
+
+    /// 缓存两级化：标题变化不新增一级条目（按 (进程, 类名) 缓存），命中同一组标题规则的标题
+    /// 共享同一份结果；一条标题规则都不命中的标题直接拿基底。
+    #[test]
+    fn title_changes_reuse_the_class_entry_and_share_results_by_hit_set() {
+        let c = one("[[apps]]\nprocess = \"a.exe\"\ncaret_offset_x = 1\n\n\
+             [[apps]]\nprocess = \"a.exe\"\ntitle = \"*Doc*\"\ncaret_offset_x = 2\n");
+        let d1 = c.resolve(&ctx("a.exe", "Main", "Doc 1"));
+        let d2 = c.resolve(&ctx("a.exe", "Main", "doc 2"));
+        assert_eq!(d1.rule.as_ref().unwrap().caret_offset_x, 2);
+        assert!(
+            std::sync::Arc::ptr_eq(&d1, &d2),
+            "命中同一组标题规则 ⇒ 同一份结果"
+        );
+        let o1 = c.resolve(&ctx("a.exe", "Main", "Other 1"));
+        let o2 = c.resolve(&ctx("a.exe", "Main", "Other 2"));
+        let none = c.resolve(&ctx("a.exe", "Main", ""));
+        assert_eq!(o1.rule.as_ref().unwrap().caret_offset_x, 1);
+        assert!(std::sync::Arc::ptr_eq(&o1, &o2), "都不命中 ⇒ 基底");
+        assert!(std::sync::Arc::ptr_eq(&o1, &none), "空标题同样是基底");
+        for i in 0..200 {
+            let title = format!("Doc {i}");
+            assert_eq!(caret_x(&c, ctx("a.exe", "Main", &title)), 2);
+        }
+        assert_eq!(c.resolve_cache_len(), 1, "标题轮转不占一级缓存");
+    }
+
+    /// 一级缓存满了淘汰最久没用的那条，而不是整表清空：刚用过的焦点窗口留在缓存里。
+    #[test]
+    fn resolve_cache_evicts_the_least_recently_used_entry() {
+        let c = one("[[apps]]\nclass = \"C*\"\ncaret_use_top = true\n");
+        let first = c.resolve(&ctx("a.exe", "C0", ""));
+        let second = c.resolve(&ctx("a.exe", "C1", ""));
+        for i in 2..RESOLVE_CACHE_CAP {
+            c.resolve(&ctx("a.exe", &format!("C{i}"), ""));
+        }
+        assert_eq!(c.resolve_cache_len(), RESOLVE_CACHE_CAP);
+        // 碰一下 C0，让 C1 成为最久没用的。
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &c.resolve(&ctx("a.exe", "C0", ""))
+        ));
+        c.resolve(&ctx("a.exe", "Cnew", ""));
+        assert_eq!(c.resolve_cache_len(), RESOLVE_CACHE_CAP);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &c.resolve(&ctx("a.exe", "C0", ""))),
+            "刚用过的留着"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&second, &c.resolve(&ctx("a.exe", "C1", ""))),
+            "最久没用的被淘汰"
+        );
+    }
+
+    /// 「存在标题规则」开关（推给 DLL 决定采不采标题）：只看启用的 `[[apps]]` 行。
+    #[test]
+    fn has_title_rules_counts_only_enabled_app_rules_with_a_title() {
+        assert!(
+            !one("[[apps]]\nprocess = \"a.exe\"\nclass = \"C\"\nauto_pair = false\n")
+                .has_title_rules()
+        );
+        assert!(one("[[apps]]\ntitle = \"*x*\"\nauto_pair = false\n").has_title_rules());
+        assert!(
+            !one(
+                "[[apps]]\nprocess = \"a.exe\"\ntitle = \"x\"\ndisabled = true\nauto_pair = false\n"
+            )
+            .has_title_rules(),
+            "禁用的不算"
+        );
+        assert!(
+            !one("[[commit_newline]]\nprocess = \"n.exe\"\ntitle = \"x\"\nstyle = \"crlf\"\n")
+                .has_title_rules(),
+            "附属段的 title 是未知键，不算"
+        );
+        assert!(!AppCompat::default().has_title_rules());
+    }
+
+    /// 「本进程可能命中标题规则」：不限进程的标题规则对所有进程成立，进程标题规则只对本进程。
+    #[test]
+    fn process_may_match_title_follows_the_buckets() {
+        let own = one("[[apps]]\nprocess = \"A.exe\"\ntitle = \"x*\"\nauto_pair = false\n");
+        assert!(own.process_may_match_title("a.EXE"));
+        assert!(!own.process_may_match_title("b.exe"), "别的进程用不上");
+        assert!(!own.process_may_match_title(""), "进程名未知");
+        let any = one("[[apps]]\ntitle = \"x*\"\nauto_pair = false\n");
+        assert!(any.process_may_match_title("b.exe"));
+        let off = one(
+            "[[apps]]\nprocess = \"a.exe\"\ntitle = \"x*\"\ndisabled = true\nauto_pair = false\n\n\
+             [[apps]]\nprocess = \"a.exe\"\nclass = \"C\"\nauto_pair = false\n",
+        );
+        assert!(
+            !off.process_may_match_title("a.exe"),
+            "禁用的、只有类名的都不算"
+        );
+    }
+
+    /// 标题签名 = 命中的标题规则集合：命中同一组的标题签名相同，不命中的与空标题相同。
+    #[test]
+    fn title_signature_is_the_set_of_matching_title_rules() {
+        let c = one(
+            "[[apps]]\nprocess = \"a.exe\"\ntitle = \"*Doc*\"\ncaret_offset_x = 2\n\n\
+             [[apps]]\ntitle = \"*Mail*\"\ncaret_offset_y = 2\n",
+        );
+        let sig = |t: &str| c.title_signature(&ctx("a.exe", "Main", t));
+        assert_eq!(sig("Doc 1"), sig("doc 2"));
+        assert_eq!(sig("Other"), sig(""));
+        assert!(sig("").is_empty());
+        assert_ne!(sig("Doc 1"), sig("Other"));
+        assert_ne!(sig("Doc 1"), sig("Doc Mail"), "多命中一条就不同");
+        let none = one("[[apps]]\nprocess = \"a.exe\"\nclass = \"Main\"\nauto_pair = false\n");
+        assert!(
+            none.title_signature(&ctx("a.exe", "Main", "Doc"))
+                .is_empty()
         );
     }
 
@@ -4820,6 +5064,8 @@ mod resolve_tests {
                         reference_resolve(&c, &x)
                     };
                     assert_eq!(snapshot(&c.resolve(&x)), snapshot(&want), "{x:?}");
+                    // 再解析一次：走缓存（一级命中 / 二级按命中集合命中）的结果同样不变。
+                    assert_eq!(snapshot(&c.resolve(&x)), snapshot(&want), "cached {x:?}");
                 }
             }
             if !process.is_empty() {

@@ -43,6 +43,7 @@ const UINT CLangBarItemButton::WM_ACTIVATION_STATUS = WM_USER + 105;
 const UINT CLangBarItemButton::WM_REPLACE_BACKWARD = WM_USER + 106;
 const UINT CLangBarItemButton::WM_PAIR_COMMIT = WM_USER + 107;
 const UINT CLangBarItemButton::WM_REFRESH_ICON = WM_USER + 108;
+const UINT CLangBarItemButton::WM_TITLE_MATCH_RESYNC = WM_USER + 109;
 
 static const UINT_PTR TIMER_ID_CARET_RETRY    = 0xC401;
 static const UINT_PTR TIMER_ID_SERVICE_READY  = 0xC402;
@@ -782,6 +783,15 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
         delete pResp;
         return 0;
     }
+    else if (msg == WM_TITLE_MATCH_RESYNC)
+    {
+        // 标题采集开关 0→1（core 握手 / compat 重载推来）：首个 focus_gained 可能早于开关到达、
+        // 没带标题，在 TSF 线程上补发一次（SendFocusGained 是同步 IPC，不能在 reader 线程发）。
+        CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (pThis != nullptr && pThis->_pTextService != nullptr)
+            pThis->_pTextService->ResyncFocusForTitleMatch();
+        return 0;
+    }
     else if (msg == WM_SERVICE_READY)
     {
         CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1308,6 +1318,17 @@ void CLangBarItemButton::PostRefreshIcon()
     }
     if (!PostMessageW(_hMsgWnd, WM_REFRESH_ICON, 0, 0))
         WIND_LOG_WARN(L"PostRefreshIcon: PostMessage failed\n");
+}
+
+void CLangBarItemButton::PostTitleMatchResync()
+{
+    if (_hMsgWnd == NULL)
+    {
+        WIND_LOG_WARN(L"PostTitleMatchResync: No message window, skipping\n");
+        return;
+    }
+    if (!PostMessageW(_hMsgWnd, WM_TITLE_MATCH_RESYNC, 0, 0))
+        WIND_LOG_WARN(L"PostTitleMatchResync: PostMessage failed\n");
 }
 
 void CLangBarItemButton::PostServiceReady()

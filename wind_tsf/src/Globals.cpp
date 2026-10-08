@@ -150,10 +150,13 @@ namespace
             if (classLen > 0)
                 info->windowClass.assign(className, classLen);
 
+            // 只取长度、不留原文（标题是用户数据，见 WindHostProcessInfo::windowTitleLen）。
+            // InternalGetWindowText 不发 WM_GETTEXT：GetWindowTextW 对本进程窗口会发，宿主 UI
+            // 线程卡住时日志采集就跟着卡住。
             WCHAR title[256] = {};
-            int titleLen = GetWindowTextW(hwnd, title, ARRAYSIZE(title));
-            if (titleLen > 0)
-                info->windowTitle.assign(title, titleLen);
+            int titleLen = InternalGetWindowText(hwnd, title, ARRAYSIZE(title));
+            info->windowTitleLen = titleLen > 0 ? titleLen : 0;
+            SecureZeroMemory(title, sizeof(title));
         }
 
         if (hProcess == nullptr)
@@ -267,7 +270,7 @@ void WindLogHostProcessInfo(int level, const wchar_t* prefix, const WindHostProc
 {
     WindLog::OutputFmt(
         level,
-        L"%ls pid=%lu tid=%lu hwnd=0x%p appContainer=%d integrityRid=0x%04lX class=%ls title=%ls exe=%ls package=%ls queryError=%lu",
+        L"%ls pid=%lu tid=%lu hwnd=0x%p appContainer=%d integrityRid=0x%04lX class=%ls title_len=%d exe=%ls package=%ls queryError=%lu",
         prefix ? prefix : L"host",
         info.processId,
         info.threadId,
@@ -275,7 +278,7 @@ void WindLogHostProcessInfo(int level, const wchar_t* prefix, const WindHostProc
         info.isAppContainer ? 1 : 0,
         info.integrityRid,
         info.windowClass.empty() ? L"-" : info.windowClass.c_str(),
-        info.windowTitle.empty() ? L"-" : info.windowTitle.c_str(),
+        info.windowTitleLen,
         info.processPath.empty() ? (info.processName.empty() ? L"-" : info.processName.c_str()) : info.processPath.c_str(),
         info.packageFamilyName.empty() ? L"-" : info.packageFamilyName.c_str(),
         info.queryError
@@ -300,8 +303,8 @@ void WindLogCurrentProcessInfo(int level, const wchar_t* prefix)
 
 void WindLogForegroundProcessInfo(int level, const wchar_t* prefix)
 {
-    // 前置闸门：下面的进程信息采集（OpenProcess + 令牌查询 + 映像路径 + GetWindowTextW
-    // 重入宿主窗口过程）代价远高于一条日志，而本函数的调用点在按键路径上。
+    // 前置闸门：下面的进程信息采集（OpenProcess + 令牌查询 + 映像路径 + 窗口标题长度）
+    // 代价远高于一条日志，而本函数的调用点在按键路径上。
     // 缺此闸门时，即便日志级别低于 level、这套查询也照跑不误——日志宏只能延后
     // 「格式化」，挡不住实参位置的函数调用，那是 C++ 求值顺序保证要先做的事。
     if (!WindLog::IsEnabled(level))

@@ -102,6 +102,7 @@ impl Coordinator {
         self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
         self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
         self.push_composition_placeholder_config(client_token); // 空文本兜底占位字符（GH#175）
+        self.push_compat_title_match_config(client_token); // 采不采窗口标题：DLL 重连从「关」起步
         self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
         self.push_cn_passthrough_punct_config(client_token); // 中文模式该透传的标点：DLL 据此**不**吃
         self.push_en_passthrough_punct_config(client_token); // 同上，英文标点态那份（超集）
@@ -300,6 +301,37 @@ impl Coordinator {
             wind_ipc::codec::encode_sync_config(
                 wind_ipc::protocol::CONFIG_KEY_COMPOSITION_PLACEHOLDER,
                 &value,
+            )
+        };
+        if client_token != 0 {
+            self.push_server
+                .push_to_token(client_token, &make(client_token));
+        } else {
+            self.push_server.push_per_client(make);
+        }
+    }
+
+    /// 下发「本进程可能命中 compat 标题规则」开关给 DLL（`CONFIG_KEY_COMPAT_TITLE_MATCH`）：开着
+    /// DLL 才在 FocusGained 里附上顶层窗口标题。用不上标题规则的进程一次标题都不取（用户数据）。
+    ///
+    /// 按**各客户端进程**现算（`AppCompat::process_may_match_title`：不限进程的标题规则对所有进程
+    /// 成立，进程标题规则只对本进程），`client_token = 0` 时逐客户端推。DLL 每次重连从默认值（关）
+    /// 起步，故**握手必推**；compat 重载后逐客户端重推（规则增删标题条件时随之开关）。
+    ///
+    /// 竞态（可接受）：重载与新连接握手并发时，新连接可能先收到按旧表算的值、再收到重载后的重推，
+    /// 或只收到其一——两者都按推送时的表现算，最终一致；最坏是某个焦点按旧开关多取 / 少取一次标题，
+    /// 服务端对用不上的标题直接丢弃（`focus_window_of`），少取的由 DLL 在开关打开时补发焦点自愈。
+    pub fn push_compat_title_match_config(&self, client_token: u64) {
+        let make = |token: u64| {
+            let name = self.proc_name_or_lookup((token >> 32) as u32);
+            let enabled = self
+                .app_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .process_may_match_title(&name);
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_COMPAT_TITLE_MATCH,
+                &wind_ipc::codec::encode_compat_title_match_value(enabled),
             )
         };
         if client_token != 0 {

@@ -786,12 +786,16 @@ struct FocusGainedPayload
     // ⚠ 本结构之后还有**两个前后相接的变长段**（不在结构体里，由 SendFocusGained 手工拼接）：
     //
     //   [本结构 39 字节][bundleIdLen:u32][bundleId][windowClassLen:u32][windowClass]
+    //                   [windowTitleLen:u32][windowTitle]
     //
     //   ① bundleId    macOS `.app` 专属。**Windows 发 len=0 占位**——不是冗余，是让两个
     //                 平台共用同一条线性走法，否则窗口类段的偏移会因平台而异。
     //   ② windowClass 焦点所在顶层窗口的类名（UTF-8）。服务端据此把 explorer.exe 的过渡型
     //                 窗口（任务栏 / Alt+Tab）与停留型窗口（桌面 / 文件管理器）分开——
     //                 二者进程名相同，仅凭进程名无法区分。
+    //   ③ windowTitle 同一个顶层窗口的标题（UTF-8，截断到 256 个 UTF-16 码元），供 compat.toml 的
+    //                 title 条件匹配。**只在 core 经 CONFIG_KEY_COMPAT_TITLE_MATCH 推开时才取**，否则
+    //                 len=0（段照发，保持线性走法）。标题是用户数据：日志只记长度。见 WindowTitlePolicy.h。
     //
     // ⚠ 再加新段一律接在最后，并同步 Rust 侧 `FocusGainedPayload` 的那张布局图。
     // 两处各自往尾部追加而互不知情时，字节偏移会错位，而逐段兼容的解码**不报错、只解出垃圾**。
@@ -920,6 +924,9 @@ constexpr const char* CONFIG_KEY_DIAG_SNAPSHOT = "diag_snapshot";
 // 服务端按本客户端 pid 的 compat 规则 composition_placeholder 现算后逐客户端推送；默认空格。
 // 决策在服务端，DLL 只照做（以及把三种字符都认作占位，见 CompositionPlaceholder.h）。
 constexpr const char* CONFIG_KEY_COMPOSITION_PLACEHOLDER = "composition_placeholder";
+// 「本进程可能命中 compat 标题规则」开关（采不采窗口标题）。格式：enabled(u8)。**默认关**，重连从关起步，
+// core 握手必推、compat 重载后广播。关着时 OnSetFocus 一次标题都不取（标题是用户数据）。
+constexpr const char* CONFIG_KEY_COMPAT_TITLE_MATCH = "compat_title_match";
 // 「英文半角列有自定义标点映射」的源字符集合。英文模式（非全角）下本 DLL 默认直接透传标点键、
 // core 收不到，用户配的「英半」列因此永远不生效；据此集合精确吃下这些键转发给 core。
 // 集合为空（默认）= 行为与历史完全一致。格式：count(u8) + [ch:u16(LE)]...

@@ -4,6 +4,7 @@
 #include "IPCClient.h"
 #include "HotkeyManager.h"
 #include "BinaryProtocol.h"
+#include "WindowTitlePolicy.h" // CONFIG_KEY_COMPAT_TITLE_MATCH 的值解析
 #include <cctype>
 #include <cstdio>  // for swprintf
 
@@ -2992,6 +2993,15 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         if (value.empty()) return;
         _pTextService->SetCompositionPlaceholderKind(value[0]);
         WIND_LOG_INFO_FMT(L"Composition placeholder updated: kind=%d\n", (int)value[0]);
+    }
+    else if (key == CONFIG_KEY_COMPAT_TITLE_MATCH)
+    {
+        // 格式：enabled(u8)（对齐 Rust encode_compat_title_match_value）。core 按「存在 compat
+        // 标题规则」推；开着 OnSetFocus 才取窗口标题随 focus_gained 上报。空值保持现状。
+        const bool enabled = wind::window_title::ParseTitleMatchValue(
+            value.data(), value.size(), _pTextService->IsTitleMatchEnabled() != FALSE);
+        _pTextService->SetTitleMatchEnabled(enabled ? TRUE : FALSE);
+        WIND_LOG_INFO_FMT(L"Compat title match updated: enabled=%d\n", enabled ? 1 : 0);
     }
     else if (key == CONFIG_KEY_DIAG_SNAPSHOT)
     {

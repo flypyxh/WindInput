@@ -949,8 +949,9 @@ impl Coordinator {
     /// 3. 逐客户端重推 DLL 的密码框吃键门控（与 2 出自同一判定函数）；
     /// 4. 逐客户端重推英文自动配对配置（DLL 的 `_englishPairEngine` 只认推过去的值）。
     /// 5. 逐客户端重推空文本兜底占位字符（GH#175，`composition_placeholder`）。
+    /// 6. 逐客户端重推「本进程可能命中标题规则」开关（DLL 据此采不采窗口标题）。
     ///
-    /// 3、4、5 是幂等的逐客户端推送，值没变时 DLL 收到同值，无副作用。
+    /// 3～6 是幂等推送，值没变时 DLL 收到同值，无副作用。
     pub(crate) fn reload_app_compat(&self) {
         let reloaded = wind_config::app_compat::AppCompat::load(
             self.compat_dirs.0.as_deref(),
@@ -966,6 +967,7 @@ impl Coordinator {
         self.push_password_suppress_config(0);
         self.push_english_pair_config(0);
         self.push_composition_placeholder_config(0);
+        self.push_compat_title_match_config(0);
     }
 
     /// 设置端 `compat.*` 写入之后的收口：重载规则表，再让当前前台进程的 `active_compat`

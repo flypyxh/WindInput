@@ -9,8 +9,9 @@
 //! - **跨越判据**：进入类字段（初始中英 / 标点 / 方案）只在「pid 变了，或命中的带窗口条件的进入类
 //!   规则集合变了」时重算；带标题条件的规则不进这个集合，故**仅标题变化永不重算**。
 //!
-//! 标题由 P3 上报（FocusGained 变长段），在那之前 [`FocusWindow::title`] 恒为空串，带 title 的规则
-//! 一律不命中；代码路径已按「有标题」写好，P3 只需改 [`FocusWindow::of_focus`] 一处。
+//! 标题由 FocusGained 变长段上报（P3），只在规则表里有标题规则时才有：DLL 收到
+//! `CONFIG_KEY_COMPAT_TITLE_MATCH` 开着才采集，服务端这边也只在有标题规则时留下标题
+//! （[`Coordinator::focus_window_of`]）。标题按用户数据处理：本模块的日志只记长度。
 
 use super::*;
 use std::hash::{Hash, Hasher};
@@ -18,26 +19,47 @@ use wind_config::app_compat::{AppCompatRule, ResolvedRule, RuleId, RuleKey, Wind
 
 /// 一个焦点窗口的身份：顶层窗口类名 + 标题。拿不到的项为空串，带对应条件的规则一律不命中
 /// （「不知道是哪个窗口」不能套窗口规则）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// **相等 / `cache_hash` 比的是「类名 + 标题签名」，不是标题原文**：标题签名 = 命中的标题规则集合
+/// （`AppCompat::title_signature`）。类名与签名都相同的两个窗口解析结果必然相同，故仅标题变化而
+/// 命中集合不变（浏览器换标签页）不算换窗口——不重算 `active_compat`、不逐 token 重推 DLL 配置。
+/// 签名的下标只在同一张规则表内有意义：重载后与旧记录比较至多多算一次「换了窗口」（多推一次，
+/// 无害），重载自身已逐客户端重推。
+///
+/// `Debug` 手写：标题是用户数据，只输出长度。
+#[derive(Clone, Default)]
 pub(crate) struct FocusWindow {
     pub(crate) class: String,
     pub(crate) title: String,
+    /// 命中的标题规则下标（升序）；没有可能命中的标题规则 / 无标题时为空。
+    pub(crate) title_sig: Vec<usize>,
+}
+
+impl PartialEq for FocusWindow {
+    fn eq(&self, other: &Self) -> bool {
+        self.class == other.class && self.title_sig == other.title_sig
+    }
+}
+
+impl Eq for FocusWindow {}
+
+impl std::fmt::Debug for FocusWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FocusWindow")
+            .field("class", &self.class)
+            .field("title_len", &self.title.chars().count())
+            .field("title_sig", &self.title_sig)
+            .finish()
+    }
 }
 
 impl FocusWindow {
-    /// 从 FocusGained 取。⚠ 标题要等 P3（DLL 上报 + 协议）——届时只改这一处。
-    pub(crate) fn of_focus(data: &FocusData) -> Self {
-        FocusWindow {
-            class: data.window_class.clone(),
-            title: String::new(),
-        }
-    }
-
-    /// 只有类名（DLL 同步路径 `get_current_mode` 只带类名）。
+    /// 只有类名（测试与无标题的场合）。焦点事件一律经 [`Coordinator::focus_window_of`]。
+    #[cfg(test)]
     pub(crate) fn of_class(class: &str) -> Self {
         FocusWindow {
             class: class.to_string(),
-            title: String::new(),
+            ..Default::default()
         }
     }
 
@@ -45,12 +67,12 @@ impl FocusWindow {
         self.class.is_empty() && self.title.is_empty()
     }
 
-    /// `ActiveCompat` 的缓存键分量：(类名小写, 标题) 的哈希。规则按类名不区分大小写匹配，
-    /// 类名大小写不同的两次焦点必然解析出同一结果，不必重算。
+    /// `ActiveCompat` 的缓存键分量：(类名小写, 标题签名) 的哈希。规则按类名不区分大小写匹配，
+    /// 类名大小写不同、或仅标题不同而命中集合相同的两次焦点必然解析出同一结果，不必重算。
     pub(crate) fn cache_hash(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.class.to_lowercase().hash(&mut h);
-        self.title.hash(&mut h);
+        self.title_sig.hash(&mut h);
         h.finish()
     }
 
@@ -84,6 +106,9 @@ pub(crate) struct ModeScope {
     pub(crate) has_rule: bool,
     /// 命中的带窗口条件的进入类规则（不含带标题条件的），见 [`entry_window_key`]。
     pub(crate) entry_windows: Vec<RuleId>,
+    /// 推进本记录的那次焦点「看不见标题」（该进程可能命中标题规则，事件却没带标题）。
+    /// 随后同一窗口带着标题来的那次焦点（DLL 收到采集开关后的补发）仍算切进来，见 [`focus_crossed`]。
+    pub(crate) title_blind: bool,
     /// 推进本记录的那次焦点的窗口：规则表重载后按它重算 `entry_windows`
     /// （[`Coordinator::refresh_mode_scope_after_reload`]）。不能取「该 pid 最近获焦的窗口」：
     /// 作用域外的过渡窗口（explorer 任务栏）不推进本记录，却会成为最近的那个。
@@ -110,7 +135,70 @@ pub(crate) fn entry_crossed(old: &ModeScope, new_pid: u32, new_entry: &[RuleId])
     new_pid != 0 && (old.pid != new_pid || old.entry_windows != new_entry)
 }
 
+/// 完整的「切进来」判据：[`entry_crossed`]，外加「标题迟到」——上一次推进模式归属的焦点看不见
+/// 标题（[`ModeScope::title_blind`]），这次同一进程、同一类名的焦点带着标题来了，且命中了写进入类
+/// 字段的标题规则。
+///
+/// 为什么需要：新进程首焦常常早于 DLL 收到「采集标题」开关，首个 focus_gained 不带标题，这次切进
+/// 就按无标题算掉了；DLL 收到开关后补发一条带标题的，但按 [`entry_crossed`] 它是「仅标题变化」，
+/// 标题规则里的 initial_mode 永远不生效。取舍：服务端无法知道 DLL 何时收到开关（推送异步），只能
+/// 从帧内容判断；条件收得很窄（同 pid、同类名、上一次无标题、这次命中带进入类字段的标题规则），
+/// 误判只剩「真没有标题的窗口后来有了标题」这一种，代价是那一次按规则重套初始状态。
+pub(crate) fn focus_crossed(
+    old: &ModeScope,
+    new_pid: u32,
+    resolved: &ResolvedRule,
+    win: &FocusWindow,
+) -> bool {
+    entry_crossed(old, new_pid, &entry_window_key(resolved))
+        || (old.title_blind
+            && new_pid != 0
+            && old.pid == new_pid
+            && !win.title.is_empty()
+            && old.window.class == win.class
+            && resolved
+                .entry_window_matches
+                .iter()
+                .any(|id| !id.title.is_empty()))
+}
+
 impl Coordinator {
+    /// 焦点事件带来的窗口（FocusGained 的重型段与同步段 `get_current_mode` 共用，两段必须同源）。
+    ///
+    /// 该进程**不可能命中标题规则时丢掉标题**（`AppCompat::process_may_match_title`）：DLL 按开关
+    /// 不采集，但开关推送与焦点事件之间有竞态（重载刚删光标题规则、DLL 还没收到关），此时留下标题
+    /// 既无用又是用户数据。留下的标题算出标题签名，供窗口身份比较（见 [`FocusWindow`]）。
+    pub(crate) fn focus_window_of(&self, process: &str, class: &str, title: &str) -> FocusWindow {
+        let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
+        if title.is_empty() || !table.process_may_match_title(process) {
+            return FocusWindow {
+                class: class.to_string(),
+                ..Default::default()
+            };
+        }
+        let title_sig = table.title_signature(&WindowCtx {
+            process,
+            class,
+            title,
+        });
+        FocusWindow {
+            class: class.to_string(),
+            title: title.to_string(),
+            title_sig,
+        }
+    }
+
+    /// 本次焦点「看不见标题」：该进程可能命中标题规则，焦点事件却没带标题——多半是 DLL 还没收到
+    /// 采集开关（新进程首焦与握手推送的竞态）。记进 [`ModeScope::title_blind`]，见 [`focus_crossed`]。
+    pub(crate) fn focus_is_title_blind(&self, process: &str, win: &FocusWindow) -> bool {
+        win.title.is_empty()
+            && self
+                .app_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .process_may_match_title(process)
+    }
+
     /// 记下 `token` 这次获焦的窗口；与它上一次记录（没有 = 空窗口）不同时返回 true。
     ///
     /// 返回值驱动 DLL 配置重推：DLL 的占位字符 / 密码抑制 / 英文配对是按 token 持有的一份值，
@@ -492,6 +580,14 @@ mod tests {
             caret_source: 0,
             bundle_id: String::new(),
             window_class: class.into(),
+            window_title: String::new(),
+        }
+    }
+
+    fn focus_titled(token: u64, class: &str, title: &str) -> FocusData {
+        FocusData {
+            window_title: title.into(),
+            ..focus(token, class)
         }
     }
 
@@ -580,7 +676,7 @@ initial_mode = "chinese"
         let t = (300u64 << 32) | 1;
         c.handle_focus_gained(&focus(t, "AHK_A"));
         assert!(!chinese(&c));
-        let (cn, _, _) = c.get_current_mode(t, "AHK_B");
+        let (cn, _, _) = c.get_current_mode(t, "AHK_B", "");
         assert!(cn, "同步回传必须已按 B 的规则（中文）");
     }
 
@@ -699,14 +795,8 @@ title = "Doc*"
 initial_punct = "english"
 "#,
         );
-        let a = FocusWindow {
-            class: "Main".into(),
-            title: "Doc 1".into(),
-        };
-        let b = FocusWindow {
-            class: "Main".into(),
-            title: "Other".into(),
-        };
+        let a = c.focus_window_of("app.exe", "Main", "Doc 1");
+        let b = c.focus_window_of("app.exe", "Main", "Other");
         let ra = c.resolve_compat("app.exe", &a);
         let rb = c.resolve_compat("app.exe", &b);
         assert!(
@@ -725,6 +815,237 @@ initial_punct = "english"
             !entry_crossed(&scope, 5, &entry_window_key(&rb)),
             "同进程仅标题不同 ⇒ 不算切进来"
         );
+    }
+
+    /// P3 真有标题之后，端到端走 focus_gained：持续类字段随标题即时刷新，进入类字段在仅标题
+    /// 变化时**永不**重算（用户手切的中英态保留），同步段 `get_current_mode` 与重型段同源。
+    #[test]
+    fn title_rules_follow_the_title_but_title_only_changes_never_reapply_the_initial_mode() {
+        let c = coord_with_rules(
+            "title_e2e",
+            r#"
+[[apps]]
+process = "app.exe"
+title = "* - Doc*"
+caret_offset_x = 7
+initial_mode = "english"
+"#,
+        );
+        c.pid_names.lock().unwrap().insert(5, "app.exe".into());
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(100, "notepad.exe".into());
+        let t = (5u64 << 32) | 1;
+        let caret_x = |c: &Coordinator| c.active_compat.lock().unwrap().caret_offset_x;
+
+        let (cn, _, _) = c.get_current_mode(t, "Main", "A - Doc");
+        assert!(!cn, "同步段：切进命中标题规则的窗口，按规则回英文");
+        c.handle_focus_gained(&focus_titled(t, "Main", "A - Doc"));
+        assert_eq!(caret_x(&c), 7, "持续类：标题规则命中");
+        assert!(!chinese(&c), "切进来：初始模式按标题规则");
+        assert_eq!(c.active_focus_window().title, "A - Doc");
+
+        c.state.lock().unwrap().chinese_mode = true; // 用户手切中文
+        let (cn, _, _) = c.get_current_mode(t, "Main", "Untitled");
+        assert!(cn, "同步段：仅标题变化不重算");
+        c.handle_focus_gained(&focus_titled(t, "Main", "Untitled"));
+        assert_eq!(caret_x(&c), 0, "持续类：标题不命中即刻回落");
+        assert!(chinese(&c), "仅标题变化：手切保留");
+        c.handle_focus_gained(&focus_titled(t, "Main", "B - Doc"));
+        assert_eq!(caret_x(&c), 7, "持续类：再次命中");
+        assert!(chinese(&c), "仅标题变化（又命中）：手切仍保留");
+
+        // 换到别的进程再回来 = 切进来，标题规则的进入类字段随之生效。
+        c.handle_focus_gained(&focus((100u64 << 32) | 1, "Notepad"));
+        c.state.lock().unwrap().chinese_mode = true;
+        let (cn, _, _) = c.get_current_mode(t, "Main", "C - Doc");
+        assert!(!cn, "pid 跨越：按标题规则回英文");
+        c.handle_focus_gained(&focus_titled(t, "Main", "C - Doc"));
+        assert!(!chinese(&c));
+    }
+
+    /// 规则表里没有标题规则时服务端不留标题：仅标题变化不算换窗口（不重算、不重推 DLL 配置），
+    /// 也不把用户的窗口标题存进窗口表。
+    #[test]
+    fn titles_are_dropped_when_no_rule_uses_them() {
+        let c = coord_with_rules(
+            "notitle",
+            "[[apps]]\nclass = \"Chrome_WidgetWin_*\"\ncomposition_placeholder = \"zwsp\"\n",
+        );
+        c.pid_names.lock().unwrap().insert(42, "msedge.exe".into());
+        let t = (42u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(t);
+        c.handle_focus_gained(&focus_titled(t, "Chrome_WidgetWin_1", "Tab 1"));
+        assert_eq!(pushed_placeholder(&cap), Some(1));
+        c.handle_focus_gained(&focus_titled(t, "Chrome_WidgetWin_1", "Tab 2"));
+        assert_eq!(pushed_placeholder(&cap), None, "仅标题变化 ≠ 换窗口");
+        assert!(c.active_focus_window().title.is_empty());
+        assert!(c.focus_window_of_token(t).title.is_empty());
+    }
+
+    /// 新进程首焦早于 DLL 收到采集开关：首个 focus_gained 没带标题，按无标题算了切进；DLL 收到
+    /// 开关后补发一条带标题的——它必须仍算切进来，让标题规则的 initial_mode 生效；之后真正的
+    /// 「仅标题变化」照旧不重算。
+    #[test]
+    fn a_late_title_after_a_title_blind_first_focus_still_counts_as_entering() {
+        let c = coord_with_rules(
+            "title_late",
+            r#"
+[[apps]]
+process = "app.exe"
+title = "* - Doc*"
+initial_mode = "english"
+"#,
+        );
+        c.pid_names.lock().unwrap().insert(5, "app.exe".into());
+        let t = (5u64 << 32) | 1;
+
+        // 首焦：开关还没到，没带标题 ⇒ 标题规则不命中，按默认（中文）。
+        let (cn, _, _) = c.get_current_mode(t, "Main", "");
+        assert!(cn);
+        c.handle_focus_gained(&focus_titled(t, "Main", ""));
+        assert!(chinese(&c));
+        assert!(c.mode_scope.lock().unwrap().title_blind);
+
+        // DLL 收到开关后补发：同 pid、同类名，带着标题 ⇒ 仍算切进来。
+        let (cn, _, _) = c.get_current_mode(t, "Main", "A - Doc");
+        assert!(!cn, "同步段：补发帧让标题规则的 initial_mode 生效");
+        c.handle_focus_gained(&focus_titled(t, "Main", "A - Doc"));
+        assert!(!chinese(&c), "重型段同上");
+        assert!(!c.mode_scope.lock().unwrap().title_blind);
+
+        // 之后才是真正的「仅标题变化」：手切保留。
+        c.state.lock().unwrap().chinese_mode = true;
+        c.handle_focus_gained(&focus_titled(t, "Main", "B - Doc"));
+        assert!(chinese(&c), "仅标题变化不重算");
+    }
+
+    /// 「标题迟到」只在命中了写进入类字段的标题规则时才算切进：标题规则只管持续类字段时，补发帧
+    /// 不得冲掉用户状态。进程本就用不上标题规则时也不记 `title_blind`。
+    #[test]
+    fn a_late_title_without_entry_title_rules_is_not_entering() {
+        let c = coord_with_rules(
+            "title_late_noentry",
+            r#"
+[[apps]]
+process = "app.exe"
+title = "* - Doc*"
+caret_offset_x = 4
+
+[[apps]]
+process = "app.exe"
+initial_mode = "english"
+
+[[apps]]
+process = "app.exe"
+class = "Main"
+initial_punct = "english"
+"#,
+        );
+        c.pid_names.lock().unwrap().insert(5, "app.exe".into());
+        c.pid_names.lock().unwrap().insert(6, "plain.exe".into());
+        let t = (5u64 << 32) | 1;
+        c.handle_focus_gained(&focus_titled(t, "Main", ""));
+        assert!(!chinese(&c), "进程规则：英文");
+        c.state.lock().unwrap().chinese_mode = true;
+        c.handle_focus_gained(&focus_titled(t, "Main", "A - Doc"));
+        assert!(chinese(&c), "补发帧只命中持续类标题规则 ⇒ 不重算");
+        assert_eq!(c.active_compat.lock().unwrap().caret_offset_x, 4);
+
+        c.handle_focus_gained(&focus_titled((6u64 << 32) | 1, "Main", ""));
+        assert!(
+            !c.mode_scope.lock().unwrap().title_blind,
+            "用不上标题规则的进程不算看不见标题"
+        );
+    }
+
+    /// 仅标题变化而命中的标题规则集合不变（换标签页）：不算换窗口，不重推 DLL 配置；命中集合
+    /// 变了才重推。窗口表里比较的是标题签名而不是原文。
+    #[test]
+    fn title_changes_with_the_same_hit_set_are_not_a_window_change() {
+        let c = coord_with_rules(
+            "title_sig",
+            "[[apps]]\nprocess = \"msedge.exe\"\ntitle = \"*Doc*\"\ncomposition_placeholder = \"zwsp\"\n",
+        );
+        c.pid_names.lock().unwrap().insert(42, "msedge.exe".into());
+        let t = (42u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(t);
+        c.handle_focus_gained(&focus_titled(t, "Chrome_WidgetWin_1", "A Doc"));
+        assert_eq!(pushed_placeholder(&cap), Some(1));
+        c.handle_focus_gained(&focus_titled(t, "Chrome_WidgetWin_1", "B Doc"));
+        assert_eq!(pushed_placeholder(&cap), None, "命中集合没变 ⇒ 不重推");
+        c.handle_focus_gained(&focus_titled(t, "Chrome_WidgetWin_1", "Other"));
+        assert_eq!(pushed_placeholder(&cap), Some(0), "命中集合变了 ⇒ 重推");
+        c.handle_focus_gained(&focus_titled(t, "Chrome_WidgetWin_1", "Other 2"));
+        assert_eq!(pushed_placeholder(&cap), None);
+    }
+
+    /// 标题是用户数据：窗口的 `{:?}` 只输出长度。
+    #[test]
+    fn focus_window_debug_never_contains_the_title() {
+        let c = coord_with_rules("title_dbg", "[[apps]]\ntitle = \"*\"\nauto_pair = false\n");
+        let w = c.focus_window_of("a.exe", "C", "机密文件");
+        assert_eq!(w.title, "机密文件", "前置：标题确实留下了");
+        let s = format!("{w:?}");
+        assert!(!s.contains("机密"), "{s}");
+        assert!(s.contains("title_len: 4"), "{s}");
+    }
+
+    fn title_match_msg(enabled: bool) -> Vec<u8> {
+        wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_COMPAT_TITLE_MATCH,
+            &wind_ipc::codec::encode_compat_title_match_value(enabled),
+        )
+    }
+
+    /// 「本进程可能命中标题规则」开关：按各客户端进程现算推送，compat 重载后逐客户端重推新值
+    /// （DLL 据此决定采不采标题）。
+    #[test]
+    fn title_match_switch_is_pushed_and_follows_reload() {
+        let (c, user) = coord_with_user_rules(
+            "titlesw",
+            "[[apps]]\nprocess = \"a.exe\"\ntitle = \"*x*\"\nauto_pair = false\n",
+        );
+        c.pid_names.lock().unwrap().insert(7, "a.exe".into());
+        c.pid_names.lock().unwrap().insert(8, "b.exe".into());
+        let t = (7u64 << 32) | 1;
+        let other = (8u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(t);
+        let cap_other = c.push_server.attach_capture_client(other);
+        c.push_compat_title_match_config(t);
+        c.push_compat_title_match_config(other);
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert_eq!(
+            got,
+            vec![title_match_msg(true)],
+            "握手推：本进程有标题规则 ⇒ 开"
+        );
+        assert_eq!(c.focus_window_of("a.exe", "C", "xy").title, "xy");
+        assert!(
+            c.focus_window_of("b.exe", "C", "xy").title.is_empty(),
+            "用不上标题规则的进程：服务端也不留标题"
+        );
+        let got: Vec<Vec<u8>> = cap_other.try_iter().collect();
+        assert_eq!(
+            got,
+            vec![title_match_msg(false)],
+            "别的进程用不上标题规则 ⇒ 不采集"
+        );
+
+        std::fs::write(
+            user.join("compat.toml"),
+            "[[apps]]\nprocess = \"a.exe\"\nclass = \"C\"\nauto_pair = false\n",
+        )
+        .unwrap();
+        c.reload_app_compat();
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert!(
+            got.contains(&title_match_msg(false)),
+            "重载后广播：标题规则没了 ⇒ 关"
+        );
+        assert!(!got.contains(&title_match_msg(true)));
+        let _ = std::fs::remove_dir_all(&user);
     }
 
     /// ime_activated 不带窗口信息：沿用该 token 最近一次 focus_gained 的窗口上下文。
