@@ -1124,4 +1124,171 @@ auto_pair = false
         assert_eq!(ac.auto_pair, Some(true));
         let _ = std::fs::remove_dir_all(&user);
     }
+
+    /// 按键路径读的三项（占位字符 / 候选窗定位 / 收窗 opt-in）是预提取的（`ActiveLookups`），
+    /// 每个失效点都要刷新：焦点、同 pid 换窗口、菜单写回、per-app 设置变更（整表重载）。
+    ///
+    /// 变异检验：去掉 `update_active_compat` 里的 `lookups`、`reload_app_compat` 里的
+    /// `refresh_active_compat_lookups` 任一处 ⇒ 本条红。
+    #[test]
+    fn keypath_lookups_follow_focus_window_menu_and_settings_changes() {
+        let (c, user) = coord_with_user_rules(
+            "lookups",
+            r#"
+[[apps]]
+class = "Chrome_WidgetWin_*"
+composition_placeholder = "zwsp"
+
+[[apps]]
+process = "p5.exe"
+candidate_position_mode = "fixed"
+candidate_x = 10
+candidate_y = 20
+host_drawn_candidates = true
+"#,
+        );
+        c.pid_names.lock().unwrap().insert(903, "p5.exe".into());
+        let t = (903u64 << 32) | 1;
+        let host_drawn = |c: &Coordinator| {
+            c.active_compat
+                .lock()
+                .unwrap()
+                .lookups
+                .host_drawn_candidates
+        };
+
+        c.handle_focus_gained(&focus(t, "Chrome_WidgetWin_1"));
+        assert_eq!(c.composition_placeholder(), "\u{200B}", "焦点：窗口规则");
+        assert_eq!(c.candidate_fixed_pos(), (true, 10, 20), "焦点：进程规则");
+        assert_eq!(host_drawn(&c), Some(true));
+
+        c.handle_focus_gained(&focus(t, "Other"));
+        assert_eq!(
+            c.composition_placeholder(),
+            COMPOSITION_PLACEHOLDER,
+            "同 pid 换窗口"
+        );
+        assert_eq!(c.candidate_fixed_pos(), (true, 10, 20));
+
+        // 右键菜单写回：候选窗定位改成跟随光标。
+        c.set_candidate_position_rule(1);
+        assert!(!c.candidate_fixed_pos().0, "菜单写回后立即生效");
+
+        // 设置端改了 per-app 设置（落盘后走整表重载）。
+        std::fs::write(
+            user.join("compat.toml"),
+            "[[apps]]\nprocess = \"p5.exe\"\ncomposition_placeholder = \"blank\"\n",
+        )
+        .unwrap();
+        c.reload_compat_and_refresh();
+        assert_eq!(
+            c.composition_placeholder(),
+            "\u{2800}",
+            "设置变更后立即生效"
+        );
+        assert_eq!(
+            c.candidate_fixed_pos(),
+            (
+                c.rt().config.ui.candidate.is_fixed_position(),
+                c.rt().config.ui.candidate.custom_x,
+                c.rt().config.ui.candidate.custom_y
+            ),
+            "规则没了 ⇒ 回落全局"
+        );
+        assert_eq!(host_drawn(&c), None);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// 焦点 pid 的缓存名被改写（PID 复用）：预提取的值按新名字重算，不能停在上一任进程的规则上。
+    #[test]
+    fn keypath_lookups_follow_a_rewritten_pid_name() {
+        let (c, user) = coord_with_user_rules(
+            "lookups_pid",
+            "[[apps]]\nprocess = \"old.exe\"\ncomposition_placeholder = \"zwsp\"\n",
+        );
+        c.pid_names.lock().unwrap().insert(904, "old.exe".into());
+        c.handle_focus_gained(&focus((904u64 << 32) | 1, "Win"));
+        assert_eq!(c.composition_placeholder(), "\u{200B}", "前置");
+        c.revalidate_pid_name(904, "new.exe");
+        assert_eq!(c.composition_placeholder(), COMPOSITION_PLACEHOLDER);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// 刷新与换焦点并发：快照之后焦点切到了别的应用，旧快照不得把新应用的值盖掉
+    /// （之后同一窗口的焦点会被 `window_hash` 早退拦住，盖错了就永不自愈）。
+    ///
+    /// 用分步调用模拟交错：变异检验——去掉 `store_active_lookups_if_current` 的核对 ⇒ 本条红。
+    #[test]
+    fn a_stale_lookup_refresh_never_overwrites_a_newer_focus() {
+        let (c, user) = coord_with_user_rules(
+            "lookups_race",
+            "[[apps]]\nprocess = \"a.exe\"\ncomposition_placeholder = \"zwsp\"\n\n\
+             [[apps]]\nprocess = \"b.exe\"\ncomposition_placeholder = \"blank\"\n",
+        );
+        c.pid_names.lock().unwrap().insert(910, "a.exe".into());
+        c.pid_names.lock().unwrap().insert(911, "b.exe".into());
+        c.handle_focus_gained(&focus((910u64 << 32) | 1, "Win"));
+        let stale = c.active_lookups_snapshot();
+        c.handle_focus_gained(&focus((911u64 << 32) | 1, "Win"));
+        assert_eq!(c.composition_placeholder(), "\u{2800}", "前置：焦点在 b");
+        assert!(
+            !c.store_active_lookups_if_current(&stale),
+            "焦点已变，放弃写入"
+        );
+        assert_eq!(
+            c.composition_placeholder(),
+            "\u{2800}",
+            "b 的值不被 a 的快照盖掉"
+        );
+
+        // 对照：快照仍是当前焦点时照常写入。
+        let fresh = c.active_lookups_snapshot();
+        assert!(c.store_active_lookups_if_current(&fresh));
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// PID 复用：active 槽的窗口属于上一任进程，改名时一并清掉；新进程在同一个类名的窗口获焦
+    /// 不得被「同 pid 同窗口」早退拦住（否则持续类字段停在上一任进程的规则上）。
+    #[test]
+    fn a_rewritten_pid_name_also_forgets_the_active_window() {
+        let (c, user) = coord_with_user_rules(
+            "lookups_pid_win",
+            "[[apps]]\nprocess = \"new.exe\"\nclass = \"Win\"\ncaret_offset_x = 5\n",
+        );
+        c.pid_names.lock().unwrap().insert(906, "old.exe".into());
+        let t = (906u64 << 32) | 1;
+        c.handle_focus_gained(&focus(t, "Win"));
+        assert_eq!(c.active_compat.lock().unwrap().caret_offset_x, 0, "前置");
+        c.revalidate_pid_name(906, "new.exe");
+        assert!(c.active_focus_window().is_empty(), "active 槽的窗口清掉");
+        c.handle_focus_gained(&focus(t, "Win"));
+        assert_eq!(
+            c.active_compat.lock().unwrap().caret_offset_x,
+            5,
+            "新进程同类名窗口获焦按新名字重新解析"
+        );
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// macOS：宿主名随焦点事件（bundle id）才到。同 pid 同窗口时 `update_active_compat` 早退，
+    /// 按键路径预提取的值要由补名字那一步自己刷新。
+    #[test]
+    fn a_late_bundle_id_refreshes_the_keypath_lookups() {
+        let (c, user) = coord_with_user_rules(
+            "lookups_bundle",
+            "[[apps]]\nprocess = \"com.example.p6\"\ncomposition_placeholder = \"zwsp\"\n",
+        );
+        let t = (907u64 << 32) | 1;
+        c.handle_focus_gained(&focus(t, "Win"));
+        assert_eq!(
+            c.composition_placeholder(),
+            COMPOSITION_PLACEHOLDER,
+            "前置：名字未知"
+        );
+        let mut f = focus(t, "Win");
+        f.bundle_id = "com.example.P6".into();
+        c.handle_focus_gained(&f);
+        assert_eq!(c.composition_placeholder(), "\u{200B}");
+        let _ = std::fs::remove_dir_all(&user);
+    }
 }

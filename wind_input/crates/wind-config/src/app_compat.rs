@@ -16,7 +16,7 @@
 pub use crate::compat_overlay::{ANY_PROCESS, RuleId, RuleKey, wildcard_match};
 use crate::compat_overlay::{
     FieldEdit, Obj, Raw, apply_edits, compose, is_disabled, materialize, overlay_raw, parse_raw,
-    render_raw, rule_id, sanitize, unset_of,
+    render_raw, rule_id, sanitize, unset_of, wildcard_match_folded,
 };
 use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
@@ -1672,18 +1672,100 @@ struct Candidate {
     fields: Obj,
     /// 进程名原始写法（trim 后），合成结果的 `process` 取它。
     process: String,
+    /// `id.class` / `id.title` 拆成字符（[`RuleId`] 里已是折叠后的）：建表时拆一次，
+    /// 匹配时不分配、不重折。
+    class_pat: Box<[char]>,
+    title_pat: Box<[char]>,
+}
+
+/// 一次解析用的焦点窗口上下文，已规范化：进程名 ASCII 小写，类名 / 标题逐字符折叠
+/// （与 [`RuleId`] 同一口径）。每次解析只折叠这一次，逐条规则比较时直接用。
+struct FoldedCtx {
+    /// 进程名 ASCII 小写（未 trim，与 [`WindowCtx::process`] 原样比较的口径一致）；空 = 不知道是谁。
+    process: String,
+    class: Vec<char>,
+    title: Vec<char>,
+}
+
+impl FoldedCtx {
+    fn new(ctx: &WindowCtx) -> Self {
+        use crate::compat_overlay::fold_char;
+        FoldedCtx {
+            process: ctx.process.to_ascii_lowercase(),
+            class: ctx.class.chars().map(fold_char).collect(),
+            title: ctx.title.chars().map(fold_char).collect(),
+        }
+    }
 }
 
 impl Candidate {
-    fn matches(&self, ctx: &WindowCtx) -> bool {
-        let process_ok = self.id.is_any_process()
-            || (!ctx.process.is_empty() && self.id.process.eq_ignore_ascii_case(ctx.process));
+    fn matches(&self, ctx: &FoldedCtx) -> bool {
+        let process_ok =
+            self.id.is_any_process() || (!ctx.process.is_empty() && self.id.process == ctx.process);
         // 拿不到类名 / 标题 ⇒ 带该条件的规则不命中（哪怕模式是 `*`）。
-        let cond = |pattern: &str, value: &str| {
-            pattern.is_empty() || (!value.is_empty() && wildcard_match(pattern, value))
+        let cond = |pattern: &[char], value: &[char]| {
+            pattern.is_empty() || (!value.is_empty() && wildcard_match_folded(pattern, value))
         };
-        process_ok && cond(&self.id.class, ctx.class) && cond(&self.id.title, ctx.title)
+        process_ok && cond(&self.class_pat, &ctx.class) && cond(&self.title_pat, &ctx.title)
     }
+}
+
+/// 按合成顺序把命中的规则逐行叠起来（`cands` 必须已按合成顺序排好）。没有命中 = 空结果。
+fn compose_candidates<'a>(cands: impl Iterator<Item = &'a Candidate>) -> ResolvedRule {
+    let mut acc = Obj::new();
+    let mut hit = false;
+    let mut name: Option<&str> = None;
+    let mut window_matches = Vec::new();
+    let mut entry_window_matches = Vec::new();
+    for c in cands {
+        hit = true;
+        acc = compose(&acc, &c.fields);
+        if !c.id.is_any_process() {
+            name = Some(&c.process);
+        }
+        if c.id.has_window_condition() {
+            window_matches.push(c.id.clone());
+            let unset = unset_of(&c.fields);
+            if ENTRY_FIELDS
+                .iter()
+                .any(|k| c.fields.contains_key(*k) || unset.iter().any(|u| u == k))
+            {
+                entry_window_matches.push(c.id.clone());
+            }
+        }
+    }
+    if !hit {
+        return ResolvedRule::default();
+    }
+    acc.remove("unset");
+    acc.insert(
+        "process".into(),
+        serde_json::Value::String(name.unwrap_or(ANY_PROCESS).to_string()),
+    );
+    let rule = match serde_json::from_value::<AppCompatRule>(serde_json::Value::Object(acc)) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            // 每行单独反序列化过（见 `build_apps`），正常走不到这里。
+            tracing::warn!("compat.toml: 合成结果不合法，按无规则处理: {e}");
+            None
+        }
+    };
+    ResolvedRule {
+        rule,
+        window_matches,
+        entry_window_matches,
+    }
+}
+
+/// 两个升序下标表按序归并（不去重：两表不相交）。
+fn merge_sorted<'a>(a: &'a [usize], b: &'a [usize]) -> impl Iterator<Item = usize> + 'a {
+    let (mut a, mut b) = (a.iter().copied().peekable(), b.iter().copied().peekable());
+    std::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(x), Some(y)) if x < y => a.next(),
+        (Some(_), Some(_)) => b.next(),
+        (Some(_), None) => a.next(),
+        (None, _) => b.next(),
+    })
 }
 
 /// [`AppCompat::resolve`] 缓存的上限：焦点窗口的组合有限，超过就整表清空重来。
@@ -1713,6 +1795,10 @@ impl std::fmt::Debug for ResolveCache {
 pub struct AppCompat {
     /// 参与合成的 `[[apps]]` 规则，**已按合成顺序稳定排好**（见 [`RuleId::compose_order`]）。
     candidates: Vec<Candidate>,
+    /// `candidates` 按进程分桶的下标（各桶内升序 = 合成顺序）：不限进程的一桶，外加
+    /// 小写进程名 → 该进程的各条。一个焦点窗口只可能命中这两桶，解析时只扫它们。
+    any_process_idx: Vec<usize>,
+    process_idx: HashMap<String, Vec<usize>>,
     /// 小写进程名 → 无窗口上下文时的合成结果（`"*"` ⊕ 本进程），供 [`Self::get_rule`] 借出引用。
     by_process: HashMap<String, AppCompatRule>,
     /// 无窗口上下文、没有本进程规则时的合成结果（只有 `"*"`）。
@@ -1861,7 +1947,13 @@ impl AppCompat {
         if let Some(hit) = cache.get(&key) {
             return hit.clone();
         }
-        let resolved = std::sync::Arc::new(self.compose_for(ctx));
+        // 缓存键已是规范化后的上下文，直接拆成字符用，不再折叠第二遍。
+        let folded = FoldedCtx {
+            process: key.0.clone(),
+            class: key.1.chars().collect(),
+            title: key.2.chars().collect(),
+        };
+        let resolved = std::sync::Arc::new(self.compose_folded(&folded));
         // 满了整表清空：焦点窗口组合通常远少于上限。键里含标题，若 P2 实测标题频繁变化
         // （编辑器、浏览器标签页）把缓存冲得很勤，再换成 LRU 或把标题换成哈希 / 只缓存命中集合。
         if cache.len() >= RESOLVE_CACHE_CAP {
@@ -1876,51 +1968,22 @@ impl AppCompat {
         self.cache.0.lock().unwrap().len()
     }
 
-    /// 不经缓存的合成。
-    fn compose_for(&self, ctx: &WindowCtx) -> ResolvedRule {
-        let mut acc = Obj::new();
-        let mut hit = false;
-        let mut name: Option<&str> = None;
-        let mut window_matches = Vec::new();
-        let mut entry_window_matches = Vec::new();
-        for c in self.candidates.iter().filter(|c| c.matches(ctx)) {
-            hit = true;
-            acc = compose(&acc, &c.fields);
-            if !c.id.is_any_process() {
-                name = Some(&c.process);
-            }
-            if c.id.has_window_condition() {
-                window_matches.push(c.id.clone());
-                let unset = unset_of(&c.fields);
-                if ENTRY_FIELDS
-                    .iter()
-                    .any(|k| c.fields.contains_key(*k) || unset.iter().any(|u| u == k))
-                {
-                    entry_window_matches.push(c.id.clone());
-                }
-            }
-        }
-        if !hit {
-            return ResolvedRule::default();
-        }
-        acc.remove("unset");
-        acc.insert(
-            "process".into(),
-            serde_json::Value::String(name.unwrap_or(ANY_PROCESS).to_string()),
-        );
-        let rule = match serde_json::from_value::<AppCompatRule>(serde_json::Value::Object(acc)) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                // 每行单独反序列化过（见 `build_apps`），正常走不到这里。
-                tracing::warn!("compat.toml: 合成结果不合法，按无规则处理: {e}");
-                None
-            }
+    /// 可能命中 `ctx` 的规则（不限进程那桶 ⊕ 本进程那桶），按合成顺序。
+    fn bucket_of<'s>(&'s self, ctx: &'s FoldedCtx) -> impl Iterator<Item = &'s Candidate> + 's {
+        let own: &[usize] = if ctx.process.is_empty() {
+            &[]
+        } else {
+            self.process_idx
+                .get(&ctx.process)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
         };
-        ResolvedRule {
-            rule,
-            window_matches,
-            entry_window_matches,
-        }
+        merge_sorted(&self.any_process_idx, own).map(|i| &self.candidates[i])
+    }
+
+    /// 不经缓存的合成。
+    fn compose_folded(&self, ctx: &FoldedCtx) -> ResolvedRule {
+        compose_candidates(self.bucket_of(ctx).filter(|c| c.matches(ctx)))
     }
 
     /// 右键菜单为焦点窗口写回 `fields` 时该写到哪条规则。
@@ -1934,6 +1997,7 @@ impl AppCompat {
         if ctx.process.is_empty() {
             return None;
         }
+        let folded = FoldedCtx::new(ctx);
         self.candidates
             .iter()
             .rev()
@@ -1941,7 +2005,7 @@ impl AppCompat {
                 let unset = unset_of(&c.fields);
                 !c.id.is_any_process()
                     && c.id.has_window_condition()
-                    && c.matches(ctx)
+                    && c.matches(&folded)
                     && fields
                         .iter()
                         .any(|k| c.fields.contains_key(*k) || unset.iter().any(|u| u == k))
@@ -2002,6 +2066,8 @@ impl AppCompat {
                 fields.remove(k);
             }
             candidates.push(Candidate {
+                class_pat: id.class.chars().collect(),
+                title_pat: id.title.chars().collect(),
                 id,
                 fields,
                 process: rule.process,
@@ -2010,28 +2076,42 @@ impl AppCompat {
         // 稳定排序：同一合成级里平手的，保持 `rows` 的顺序，即该身份首次出现的层
         // （出厂 < data_custom < 用户）与行序（见 `compat_overlay::overlay`）。
         candidates.sort_by_key(|c| c.id.compose_order());
-        self.candidates = candidates;
 
-        let none = WindowCtx::default();
-        self.wildcard = self.compose_for(&none).rule;
-        let names: Vec<String> = self
-            .candidates
+        let mut any_process_idx = Vec::new();
+        let mut process_idx: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, c) in candidates.iter().enumerate() {
+            if c.id.is_any_process() {
+                any_process_idx.push(i);
+            } else {
+                process_idx.entry(c.id.process.clone()).or_default().push(i);
+            }
+        }
+
+        // 无窗口上下文时命中的只有「仅 `*`」（T0）与本进程的纯进程规则（T2）；排序后 T0 全在
+        // T2 之前，故「T0 各条 ⊕ 本进程 T2 各条」就是合成顺序。按进程分桶各合成一次，
+        // 而不是对每个进程再全表扫一遍（那是 O(N²)）。
+        let plain = |c: &&Candidate| !c.id.has_window_condition();
+        let t0: Vec<&Candidate> = any_process_idx
             .iter()
-            .filter(|c| !c.id.is_any_process() && !c.id.has_window_condition())
-            .map(|c| c.id.process.clone())
+            .map(|&i| &candidates[i])
+            .filter(plain)
             .collect();
-        self.by_process = names
-            .into_iter()
-            .filter_map(|n| {
-                let rule = self
-                    .compose_for(&WindowCtx {
-                        process: &n,
-                        ..none
-                    })
-                    .rule?;
-                Some((n, rule))
+        self.wildcard = compose_candidates(t0.iter().copied()).rule;
+        self.by_process = process_idx
+            .iter()
+            .filter_map(|(name, idx)| {
+                let own: Vec<&Candidate> =
+                    idx.iter().map(|&i| &candidates[i]).filter(plain).collect();
+                if own.is_empty() {
+                    return None;
+                }
+                let rule = compose_candidates(t0.iter().copied().chain(own)).rule?;
+                Some((name.clone(), rule))
             })
             .collect();
+        self.candidates = candidates;
+        self.any_process_idx = any_process_idx;
+        self.process_idx = process_idx;
     }
 
     fn build_mode_scope(&mut self, rules: Vec<InitialModeScopeRule>) {
@@ -4688,6 +4768,69 @@ mod resolve_tests {
         );
         assert!(c.initial_mode_applies_to_window("explorer.exe", "Progman"));
         assert_eq!(c.commit_newline_for("n.exe"), Some(NewlineStyle::Crlf));
+    }
+
+    /// 分桶之前的参考合成：全表逐条比，匹配用公开的 `wildcard_match`（每次现折叠）。
+    fn reference_resolve(c: &AppCompat, ctx: &WindowCtx) -> ResolvedRule {
+        let matches = |cand: &&Candidate| {
+            let process_ok = cand.id.is_any_process()
+                || (!ctx.process.is_empty() && cand.id.process.eq_ignore_ascii_case(ctx.process));
+            let cond = |pattern: &str, value: &str| {
+                pattern.is_empty() || (!value.is_empty() && wildcard_match(pattern, value))
+            };
+            process_ok && cond(&cand.id.class, ctx.class) && cond(&cand.id.title, ctx.title)
+        };
+        compose_candidates(c.candidates.iter().filter(matches))
+    }
+
+    fn snapshot(r: &ResolvedRule) -> (serde_json::Value, Vec<RuleId>, Vec<RuleId>) {
+        (
+            serde_json::to_value(&r.rule).unwrap(),
+            r.window_matches.clone(),
+            r.entry_window_matches.clone(),
+        )
+    }
+
+    /// 分桶 + 预折叠匹配、按进程分桶的 `get_rule` 查找表，都与全表逐条合成的结果相同。
+    #[test]
+    fn bucketed_resolve_and_lookup_table_match_the_full_scan() {
+        let c = load(
+            [
+                "[[apps]]\nprocess = \"*\"\ncaret_offset_x = 1\nauto_pair = true\n\n\
+                 [[apps]]\nclass = \"Chrome_*\"\ncaret_offset_x = 2\n\n\
+                 [[apps]]\ntitle = \"*Doc*\"\ninitial_mode = \"english\"\n\n\
+                 [[apps]]\nprocess = \"A.exe\"\ncaret_offset_x = 3\nunset = [\"auto_pair\"]\n\n\
+                 [[apps]]\nprocess = \"a.exe\"\nclass = \"chrome_w?\"\ncaret_offset_y = 4\n\n\
+                 [[apps]]\nprocess = \"b.exe\"\nclass = \"*\"\ndisabled = true\ncaret_offset_x = 9\n\n\
+                 [[apps]]\nprocess = \"b.exe\"\nfirst_show_mode = \"wait\"\n",
+                "[[apps]]\nprocess = \"*\"\nfirst_show_mode = \"fast\"\n\n\
+                 [[apps]]\nprocess = \"c.exe\"\nclass = \"Ǆ*\"\nauto_pair = false\n",
+                "[[apps]]\nprocess = \"a.exe\"\ncaret_offset_y = 7\n\n\
+                 [[apps]]\nclass = \"Chrome_*\"\ntitle = \"x?\"\ncaret_use_top = true\n",
+            ],
+            "bucketed",
+        );
+        for process in ["", "a.exe", "A.EXE", "b.exe", "c.exe", "zzz.exe", "*"] {
+            for class in ["", "Chrome_W1", "CHROME_WX", "ǆq", "Other"] {
+                for title in ["", "xy", "My Doc", "x"] {
+                    let x = ctx(process, class, title);
+                    let want = if process.is_empty() {
+                        ResolvedRule::default()
+                    } else {
+                        reference_resolve(&c, &x)
+                    };
+                    assert_eq!(snapshot(&c.resolve(&x)), snapshot(&want), "{x:?}");
+                }
+            }
+            if !process.is_empty() {
+                let want = reference_resolve(&c, &ctx(process, "", "")).rule;
+                assert_eq!(
+                    serde_json::to_value(c.get_rule(process)).unwrap(),
+                    serde_json::to_value(want.as_ref()).unwrap(),
+                    "get_rule({process:?})"
+                );
+            }
+        }
     }
 }
 

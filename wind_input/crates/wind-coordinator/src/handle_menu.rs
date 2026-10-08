@@ -957,6 +957,8 @@ impl Coordinator {
             self.compat_dirs.1.as_deref(),
         );
         *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        // 按键路径那三项（占位字符 / 候选窗定位 / 收窗 opt-in）是按旧表预提取的。
+        self.refresh_active_compat_lookups();
         self.refresh_mode_scope_after_reload();
         #[cfg(windows)]
         self.sync_host_render_whitelist();

@@ -252,10 +252,14 @@ impl Coordinator {
     /// 编码替身、联想态、加词等）都从这里取，别再直接写 `COMPOSITION_PLACEHOLDER`。
     ///
     /// 按焦点应用（`active_compat.pid` + 它的窗口）的 compat 规则解析；只读 pid→名字缓存、不反查
-    /// 进程（本函数在按键路径上），缓存缺失 ⇒ 空格（历史行为）。
+    /// 进程，缓存缺失 ⇒ 空格（历史行为）。本函数在按键路径上，读的是焦点变化 / 规则重载时
+    /// 预提取好的值（[`super::ActiveLookups`]），不查表。
     pub(crate) fn composition_placeholder(&self) -> &'static str {
-        self.with_active_compat_rule(|r| r.and_then(|r| r.composition_placeholder))
-            .unwrap_or_default()
+        self.active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookups
+            .composition_placeholder
             .as_str()
     }
 
@@ -274,6 +278,15 @@ impl Coordinator {
             .unwrap()
             .insert(pid, process.to_lowercase());
         self.active_compat.lock().unwrap().pid = pid;
+        self.refresh_active_compat_lookups();
+    }
+
+    /// 测试用：整表换掉规则表，并像 `reload_app_compat` 那样刷新按键路径预提取的值
+    /// （生产里规则表只经 `reload_app_compat` 替换，直接赋值会让 `ActiveLookups` 停在旧表）。
+    #[cfg(test)]
+    pub(crate) fn test_set_app_compat(&self, table: wind_config::app_compat::AppCompat) {
+        *self.app_compat.lock().unwrap() = table;
+        self.refresh_active_compat_lookups();
     }
 
     /// 下发「空文本兜底占位用哪个字符」给 DLL（GH#175，CONFIG_KEY_COMPOSITION_PLACEHOLDER）。

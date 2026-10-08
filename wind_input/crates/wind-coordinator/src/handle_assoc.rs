@@ -942,6 +942,7 @@ mod tests {
         c.test_focus_zwsp_app(42, "msedge.exe");
         c.active_compat.lock().unwrap().pid = 43;
         c.pid_names.lock().unwrap().insert(43, "wps.exe".into());
+        c.refresh_active_compat_lookups();
         let act = {
             let mut st = c.state.lock().unwrap();
             c.auto_commit_then_assoc(&mut st, "你好".into(), "你好")

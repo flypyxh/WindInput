@@ -963,6 +963,29 @@ pub(crate) struct ActiveCompat {
     /// 缓存键——同进程换了窗口（类名 / 标题不同）要重新解析，持续类字段随之即时刷新。
     /// 窗口本身（解析要用的字符串）存在 `Coordinator::focus_windows` 的 active 槽里。
     pub(crate) window_hash: u64,
+    /// 按键路径要读的规则值，按 active 槽（`pid` 的缓存名 + active 窗口）预提取，按键时不再查表。
+    /// 刷新点见 [`Coordinator::refresh_active_compat_lookups`]。
+    pub(crate) lookups: ActiveLookups,
+}
+
+/// [`ActiveCompat::lookups`]：按键路径上的三项规则值，焦点应用（active 槽）的。
+///
+/// 这几项原先在按键路径上现查（每次候选窗刷新 / 每键 / 每次收窗判定一次合成查表）；规则表与
+/// 焦点窗口都没变时结果必然不变，故改成在「规则表或焦点窗口变了」的地方预提取：
+/// - 焦点变化、同 pid 换窗口：`update_active_compat`（缓存键 pid + 窗口哈希，变了就整份重算）；
+/// - `reload_app_compat`：规则表重载，右键菜单写回、设置端 per-app 设置变更都经它；
+/// - `revalidate_pid_name`：焦点 pid 的缓存名被改写（PID 复用）。
+///
+/// 全局回落（候选窗定位的全局档）**不**烘进来，仍在读取侧现取，理由同 `first_show_mode`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActiveLookups {
+    /// 协调器自己发占位时用的字符（`composition_placeholder`，没配 = 空格）。
+    pub(crate) composition_placeholder: wind_config::app_compat::PlaceholderChar,
+    /// per-app 候选窗定位 `(fixed, x, y)`；`None` = 规则没配定位方式，跟随全局。
+    pub(crate) candidate_pos: Option<(bool, i32, i32)>,
+    /// `host_drawn_candidates`（UIElement 推断收窗的 opt-in）。进程名未知时取 `"*"` 那条，
+    /// 与 `uielement_host_draws_by_inference` 的口径一致。
+    pub(crate) host_drawn_candidates: Option<bool>,
 }
 
 /// 「当前焦点为什么打不出中文」——全局**唯一**的判定结果。
@@ -2971,6 +2994,8 @@ impl Coordinator {
         } else {
             cached_name
         };
+        // 名字传小写：与重载 / 改名时按 `pid_names`（小写）重算的口径一致。
+        let lookups = self.compute_active_lookups(&name.to_lowercase(), &win);
         let (next, rule_matched, rule_initial_mode, rule_initial_punct) =
             self.with_compat_rule(&name, &win, |rule| {
                 let initial_mode = rule.and_then(|r| r.initial_mode);
@@ -2993,6 +3018,7 @@ impl Coordinator {
                         caret_offset_x: rule.map(|r| r.caret_offset_x).unwrap_or(0),
                         caret_offset_y: rule.map(|r| r.caret_offset_y).unwrap_or(0),
                         window_hash,
+                        lookups,
                     },
                     rule.is_some(),
                     initial_mode,
@@ -3090,6 +3116,24 @@ impl Coordinator {
                 }
             }
         };
+        // 焦点 pid 的名字刚落缓存或被改写：按键路径那三项按新名字重算（它们只读缓存名）。
+        // 改写 = PID 复用：active 槽记的窗口也属于上一任进程，一并清掉（与下面
+        // `forget_focus_windows_of_pid` 清 token 表同理），window_hash 同步改成空窗口的，
+        // 新进程下一次获焦不会被「同 pid 同窗口」早退拦住。
+        let is_active = {
+            let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            let is_active = ac.pid == pid;
+            if is_active && rewritten {
+                let empty = FocusWindow::default();
+                ac.window_hash = empty.cache_hash();
+                // 锁序 active_compat → focus_windows，与 `update_active_compat` 相同。
+                self.set_active_focus_window(empty);
+            }
+            is_active
+        };
+        if is_active {
+            self.refresh_active_compat_lookups();
+        }
         // 放掉 `pid_names` 锁之后再推：推送内容现算时要再取它。
         if rewritten {
             // 换了进程：上一任记下的窗口不属于它（不清的话新进程会按旧窗口匹配窗口规则）。
@@ -3229,6 +3273,81 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid, name.to_lowercase());
+        // 按键路径那三项跟的是 active 槽（`.pid` 的名字 + 窗口），不是本函数的 `pid`：
+        // 上面刚可能填了它的缓存名，按 active 槽重算一次。
+        self.refresh_active_compat_lookups();
+    }
+
+    /// 按 (进程名, 窗口) 现算 [`ActiveLookups`]。
+    pub(crate) fn compute_active_lookups(&self, name: &str, win: &FocusWindow) -> ActiveLookups {
+        let (composition_placeholder, candidate_pos, host_drawn_candidates) = self
+            .with_compat_rule(name, win, |rule| {
+                (
+                    rule.and_then(|r| r.composition_placeholder)
+                        .unwrap_or_default(),
+                    rule.and_then(|r| {
+                        let mode = r.candidate_position_mode?;
+                        Some((mode.is_fixed(), r.candidate_x, r.candidate_y))
+                    }),
+                    rule.and_then(|r| r.host_drawn_candidates),
+                )
+            });
+        // 收窗推断对无名进程也认 `"*"`（`get_rule("")` 不吃通配），口径见
+        // `uielement_host_draws_by_inference`。
+        let host_drawn_candidates = if name.is_empty() {
+            self.with_compat_rule(wind_config::app_compat::ANY_PROCESS, win, |r| {
+                r.and_then(|r| r.host_drawn_candidates)
+            })
+        } else {
+            host_drawn_candidates
+        };
+        ActiveLookups {
+            composition_placeholder,
+            candidate_pos,
+            host_drawn_candidates,
+        }
+    }
+
+    /// 按 active 槽（`active_compat.pid` 的缓存名 + active 窗口）重算 [`ActiveCompat::lookups`]。
+    /// 不动其余字段（`.pid` / `.has_initial_rule` 的另一重身份见 `refresh_active_compat_rule_fields`）。
+    ///
+    /// 名字只读 `pid_names` 缓存、不反查进程：与这几项原先在按键路径上现查的口径
+    /// （`active_process_name`）相同。
+    ///
+    /// ⚠ 与 `update_active_compat` 并发时不能「先算后写」：算的期间焦点切到了别的应用，旧结果
+    /// 就会盖掉新应用的值，而之后同一窗口的焦点又被 `window_hash` 早退拦住，永不自愈。故分两步：
+    /// 先在锁外取名字（`pid_names` 不与 `active_compat` 嵌套），再持 `active_compat` 锁核对
+    /// (pid, window_hash) 没变、并在锁内现算现写；变了就放弃（换焦点的那一方已按新表算好）。
+    /// 在锁内算也顺带保证：两次重载并发时，最后写入的那份读的是最后换上的表。
+    pub(crate) fn refresh_active_compat_lookups(&self) {
+        let snap = self.active_lookups_snapshot();
+        self.store_active_lookups_if_current(&snap);
+    }
+
+    /// [`Self::refresh_active_compat_lookups`] 第一步：active 槽的 (pid, window_hash, 缓存名)。
+    pub(crate) fn active_lookups_snapshot(&self) -> (u32, u64, String) {
+        let (pid, hash) = {
+            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            (ac.pid, ac.window_hash)
+        };
+        (pid, hash, self.cached_proc_name((pid as u64) << 32))
+    }
+
+    /// 第二步：active 槽仍是快照那个 (pid, window_hash) 才现算写入，返回是否写了。
+    /// 锁序 active_compat → focus_windows → app_compat，与 `update_active_compat` 相同。
+    pub(crate) fn store_active_lookups_if_current(&self, snap: &(u32, u64, String)) -> bool {
+        let (pid, hash, name) = snap;
+        let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+        if ac.pid != *pid || ac.window_hash != *hash {
+            debug!(
+                "refresh_active_compat_lookups: 焦点已变（pid {pid} → {}），放弃写入",
+                ac.pid
+            );
+            return false;
+        }
+        let win = self.active_focus_window();
+        ac.lookups = self.compute_active_lookups(name, &win);
+        true
     }
 
     /// 按 client_token 高 32 位的 PID 查已缓存的进程名（小写）。未缓存返回空串。
@@ -4226,10 +4345,17 @@ impl Coordinator {
     /// 「这个应用固定、但还没拖过」会去用全局那份为别的应用摆的坐标，候选窗一上来就
     /// 落在莫名其妙的位置，而用户根本没为这个应用设过位置。`(0,0)` 交给 UI 落默认锚点
     /// 才是这一档的正确答案。
+    ///
+    /// per-app 那一层读 [`ActiveCompat::lookups`] 预提取的值（本函数在每次候选窗刷新上），
+    /// 与 [`Self::rule_candidate_fixed_pos`] 对焦点窗口现查同值。先取值放锁再读配置（`rt()` 另有锁）。
     pub(crate) fn candidate_fixed_pos(&self) -> (bool, i32, i32) {
-        if let Some((fixed, x, y)) =
-            self.rule_candidate_fixed_pos(&self.active_process_name(), &self.active_focus_window())
-        {
+        let rule = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookups
+            .candidate_pos;
+        if let Some((fixed, x, y)) = rule {
             return (fixed, x, y);
         }
         let rt = self.rt();
@@ -14333,21 +14459,23 @@ mod caret_compat_tests {
             candidate_position_mode: Some(wind_config::app_compat::CandidatePositionMode::Fixed),
             ..Default::default()
         };
-        *c.app_compat.lock().unwrap() =
-            wind_config::app_compat::AppCompat::from_rules(vec![rule.clone()]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![
+            rule.clone(),
+        ]));
         assert_eq!(c.candidate_fixed_pos(), (true, 0, 0));
 
         // 拖过之后用它自己那份。
         rule.candidate_x = 320;
         rule.candidate_y = 480;
-        *c.app_compat.lock().unwrap() =
-            wind_config::app_compat::AppCompat::from_rules(vec![rule.clone()]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![
+            rule.clone(),
+        ]));
         assert_eq!(c.candidate_fixed_pos(), (true, 320, 480));
 
         // 规则显式写 follow_caret ⇒ 压过全局的 fixed（这正是「独立一档」的意义）。
         rule.candidate_position_mode =
             Some(wind_config::app_compat::CandidatePositionMode::FollowCaret);
-        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![rule]);
+        c.test_set_app_compat(wind_config::app_compat::AppCompat::from_rules(vec![rule]));
         assert!(!c.candidate_fixed_pos().0);
     }
 

@@ -2431,10 +2431,17 @@ impl MessageHandler for Coordinator {
         // update_active_compat 落进缓存，否则那边读到空名 → compat 规则匹配不上、per-app
         // 记忆表查不到，整条按应用链路静默退化成全局行为。Windows 恒为空串，不进此分支。
         if !data.bundle_id.is_empty() && new_pid != 0 {
-            self.pid_names
+            let name = data.bundle_id.to_lowercase();
+            let prev = self
+                .pid_names
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(new_pid, data.bundle_id.to_lowercase());
+                .insert(new_pid, name.clone());
+            // 名字变了（含首次落缓存）：按键路径预提取的值按新名字重算。下面的
+            // update_active_compat 在同 pid 同窗口时会早退，不会替它刷。
+            if prev.as_deref() != Some(name.as_str()) {
+                self.refresh_active_compat_lookups();
+            }
         }
         // ⚠ 取自 `mode_scope` 而非 `active_compat`：后者会被过渡窗口（任务栏）更新，
         // 拿它当「上一个模式归属宿主」会让紧随其后的桌面焦点被判成同进程、规则不再生效。

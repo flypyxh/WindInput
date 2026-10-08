@@ -9,6 +9,9 @@ pub mod change_hook;
 pub mod charset_def;
 pub mod code_charset;
 pub mod compat_admin;
+/// 兼容规则表的性能基准（`#[ignore]`，见模块头部）。
+#[cfg(test)]
+mod compat_bench;
 pub(crate) mod compat_overlay;
 pub mod compat_schema;
 pub mod config;

@@ -35,7 +35,7 @@ use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// 一条规则的原始键值。
 pub(crate) type Obj = Map<String, Value>;
@@ -211,6 +211,14 @@ fn fold_str(s: &str) -> String {
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().map(fold_char).collect();
     let t: Vec<char> = text.chars().map(fold_char).collect();
+    wildcard_match_folded(&p, &t)
+}
+
+/// [`wildcard_match`] 的内核：模式与文本都已逐字符 [`fold_char`] 过，不分配。
+///
+/// 运行时合成走这里：模式在建表时折叠一次（[`RuleId`] 的类名 / 标题本就是折叠后的），
+/// 焦点窗口的类名 / 标题每次解析只折叠一次，逐条规则比较时不再分配、不再重折。
+pub(crate) fn wildcard_match_folded(p: &[char], t: &[char]) -> bool {
     let (mut pi, mut ti) = (0, 0);
     // 最近一个 `*` 的位置，以及它目前吞到文本的哪里（失配时让它多吞一个字符再试）。
     let mut star: Option<(usize, usize)> = None;
@@ -293,15 +301,21 @@ fn to_json(v: &toml::Value) -> Value {
 
 /// 同一段里同身份（[`RuleId`]）的多行，按先后顺序叠成一行（后写的赢）。与运行时逐行叠加的
 /// 结果一致，但让后续的编辑与视图只面对「每个身份一行」。作废的行原样保留（写回时不丢）。
+///
+/// 身份 → 行下标用一张表记着（每行的 [`RuleId`] 只算一次）：逐行线性查找再逐个重算身份是 O(N²)，
+/// 5000 条规则时整表重载要好几秒。
 fn coalesce(section: &str, rows: Vec<Obj>) -> Vec<Obj> {
-    let mut out: Vec<Obj> = Vec::new();
+    let mut out: Vec<Obj> = Vec::with_capacity(rows.len());
+    let mut index: HashMap<RuleId, usize> = HashMap::with_capacity(rows.len());
     for r in rows {
-        let same = rule_id(section, &r).and_then(|id| {
-            out.iter()
-                .position(|o| rule_id(section, o).as_ref() == Some(&id))
-        });
-        match same {
-            Some(i) => out[i] = compose(&out[i], &r),
+        match rule_id(section, &r) {
+            Some(id) => match index.get(&id) {
+                Some(&i) => out[i] = compose(&out[i], &r),
+                None => {
+                    index.insert(id, out.len());
+                    out.push(r);
+                }
+            },
             None => out.push(r),
         }
     }
@@ -426,17 +440,26 @@ pub(crate) fn compose(base: &Obj, layer: &Obj) -> Obj {
 ///
 /// 结果的行序 = 各身份**首次出现**的层与行序（更高层叠上来的同身份行留在原位）。窗口合成
 /// （`AppCompat::resolve`）里「同级平手按层」的「层」因此就是该身份首次出现的那一层。
+///
+/// 身份 → 行下标建一次表（同身份取**第一行**，与逐行线性查找的 `position` 同一口径），
+/// 理由同 [`coalesce`]。
 pub(crate) fn overlay(section: &str, mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
+    let mut index: HashMap<RuleId, usize> = HashMap::with_capacity(base.len() + layer.len());
+    for (i, b) in base.iter().enumerate() {
+        if let Some(id) = rule_id(section, b) {
+            index.entry(id).or_insert(i);
+        }
+    }
     for row in layer {
         let Some(id) = rule_id(section, row) else {
             continue;
         };
-        match base
-            .iter()
-            .position(|b| rule_id(section, b).as_ref() == Some(&id))
-        {
-            Some(i) => base[i] = compose(&base[i], row),
-            None => base.push(compose(&Obj::new(), row)),
+        match index.get(&id) {
+            Some(&i) => base[i] = compose(&base[i], row),
+            None => {
+                index.insert(id, base.len());
+                base.push(compose(&Obj::new(), row));
+            }
         }
     }
     base
@@ -1613,5 +1636,158 @@ mod window_match_tests {
             "{text}"
         );
         assert_eq!(parse_raw(&text).unwrap().apps, raw.apps);
+    }
+
+    /// 去平方之前的参考实现：逐行线性查找、每次比较都重算身份。建表版必须与它逐行相同。
+    fn reference_coalesce(section: &str, rows: Vec<Obj>) -> Vec<Obj> {
+        let mut out: Vec<Obj> = Vec::new();
+        for r in rows {
+            let same = rule_id(section, &r).and_then(|id| {
+                out.iter()
+                    .position(|o| rule_id(section, o).as_ref() == Some(&id))
+            });
+            match same {
+                Some(i) => out[i] = compose(&out[i], &r),
+                None => out.push(r),
+            }
+        }
+        out
+    }
+
+    fn reference_overlay(section: &str, mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
+        for row in layer {
+            let Some(id) = rule_id(section, row) else {
+                continue;
+            };
+            match base
+                .iter()
+                .position(|b| rule_id(section, b).as_ref() == Some(&id))
+            {
+                Some(i) => base[i] = compose(&base[i], row),
+                None => base.push(compose(&Obj::new(), row)),
+            }
+        }
+        base
+    }
+
+    /// 伪随机的一段行：身份从一个小池子里抽（大小写 / 空白不同的同一身份、窗口条件、作废行），
+    /// 夹着禁用 / 重新启用的行与对身份键的 unset；每行带一个按行号递增的值，叠加顺序一错结果就不同。
+    fn noisy_rows(seed: u64, n: usize) -> Vec<Obj> {
+        let mut x = seed;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as usize
+        };
+        let processes = [
+            None,
+            Some("a.exe"),
+            Some("A.EXE"),
+            Some(" a.exe "),
+            Some("b.exe"),
+            Some("*"),
+        ];
+        let classes = [None, Some("X"), Some(" x "), Some("Chrome_*")];
+        let titles = [None, None, Some("T*")];
+        (0..n)
+            .map(|i| {
+                let mut o = Obj::new();
+                if next() % 13 == 0 {
+                    o.insert("process".into(), json!(1));
+                } else if let Some(p) = processes[next() % processes.len()] {
+                    o.insert("process".into(), json!(p));
+                }
+                if let Some(c) = classes[next() % classes.len()] {
+                    o.insert("class".into(), json!(c));
+                }
+                if let Some(t) = titles[next() % titles.len()] {
+                    o.insert("title".into(), json!(t));
+                }
+                o.insert("caret_offset_x".into(), json!(i));
+                match next() % 6 {
+                    0 => {
+                        o.insert("unset".into(), json!(["auto_pair"]));
+                    }
+                    // 对身份键与 `disabled` 的 unset：身份键不可 unset（叠加时被过滤），`disabled` 可以。
+                    1 => {
+                        o.insert(
+                            "unset".into(),
+                            json!(["process", "class", "title", "disabled", "auto_pair"]),
+                        );
+                    }
+                    _ => {
+                        o.insert("auto_pair".into(), json!(next() % 2 == 0));
+                    }
+                }
+                // 禁用行照样参与跨层叠加（`disabled` 是普通字段），可被后来的 `false` 重新启用。
+                match next() % 5 {
+                    0 => {
+                        o.insert("disabled".into(), json!(true));
+                    }
+                    1 => {
+                        o.insert("disabled".into(), json!(false));
+                    }
+                    _ => {}
+                }
+                o
+            })
+            .collect()
+    }
+
+    /// 去平方（身份 → 下标建表）不改变任何叠加结果：行序仍是各身份**首次出现**的顺序，同身份
+    /// 后来的行逐字段叠上去；底层本身有重复身份时套给第一行（与线性 `position` 同一口径）。
+    #[test]
+    fn indexed_coalesce_and_overlay_match_the_linear_reference() {
+        for seed in 0..40u64 {
+            for section in ["apps", "commit_newline"] {
+                let base = noisy_rows(seed, 60);
+                let layer = noisy_rows(seed + 1000, 40);
+                assert_eq!(
+                    coalesce(section, base.clone()),
+                    reference_coalesce(section, base.clone()),
+                    "coalesce seed={seed} section={section}"
+                );
+                // 未合并过的底层（含重复身份）与合并过的底层各比一次。
+                assert_eq!(
+                    overlay(section, base.clone(), &layer),
+                    reference_overlay(section, base.clone(), &layer),
+                    "overlay(raw base) seed={seed} section={section}"
+                );
+                let merged = coalesce(section, base);
+                assert_eq!(
+                    overlay(section, merged.clone(), &layer),
+                    reference_overlay(section, merged, &layer),
+                    "overlay(coalesced base) seed={seed} section={section}"
+                );
+            }
+        }
+    }
+
+    /// 预折叠的匹配内核与公开的 `wildcard_match` 同一口径。
+    #[test]
+    fn folded_matcher_agrees_with_the_public_one() {
+        let patterns = [
+            "",
+            "*",
+            "?",
+            "a*b",
+            "*X?",
+            "Ǆ*",
+            "chrome_widgetwin_*",
+            "**?",
+        ];
+        let texts = ["", "a", "ab", "aXb", "ǆz", "Chrome_WidgetWin_1", "xyz"];
+        for p in patterns {
+            for t in texts {
+                let pf: Vec<char> = p.chars().map(fold_char).collect();
+                let tf: Vec<char> = t.chars().map(fold_char).collect();
+                assert_eq!(
+                    wildcard_match_folded(&pf, &tf),
+                    wildcard_match(p, t),
+                    "{p:?} vs {t:?}"
+                );
+            }
+        }
     }
 }
