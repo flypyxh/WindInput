@@ -195,6 +195,9 @@ struct Slot {
 pub(crate) struct UserTextSlots {
     map: HashMap<String, Slot>,
     tick: u64,
+    /// [`clear`] 一次加一。后台重建发起时记下，写回 / 复位 `building` 前比对：清空之后
+    /// 旧线程既不该把表写进新槽，也不该把新槽的 `building` 复位（那会让新一轮重建重复起）。
+    epoch: u64,
 }
 
 pub(crate) type SharedSlots = Arc<Mutex<UserTextSlots>>;
@@ -241,21 +244,15 @@ pub(crate) fn get_or_refresh(
     let stale = current.as_ref().is_none_or(|i| i.is_stale(store));
     if stale && !slot.building {
         slot.building = true;
+        let epoch = g.epoch;
         let (slots2, store2, key) = (slots.clone(), store.clone(), data_schema.to_string());
         let spawned = std::thread::Builder::new()
             .name("user-text-index".into())
             .spawn(move || {
                 // 建表中途 panic 也要复位 `building`，否则单飞标记卡死、此后永不重建。
-                let _reset = BuildingGuard(slots2.clone(), key.clone());
+                let _reset = BuildingGuard(slots2.clone(), key.clone(), epoch);
                 let idx = Arc::new(UserTextIndex::build(&store2, &key));
-                if let Some(s) = slots2
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .map
-                    .get_mut(&key)
-                {
-                    s.index = Some(idx);
-                }
+                install(&slots2, &key, epoch, idx);
             });
         if let Err(e) = spawned {
             tracing::warn!("按词查编码用户层：起重建线程失败: {e}");
@@ -267,20 +264,48 @@ pub(crate) fn get_or_refresh(
     current
 }
 
-struct BuildingGuard(SharedSlots, String);
+/// 后台重建的结果写回槽。发起后被 [`clear`] 过（代次不符）就丢弃。
+fn install(slots: &SharedSlots, key: &str, epoch: u64, idx: Arc<UserTextIndex>) {
+    let mut g = slots.lock().unwrap_or_else(|e| e.into_inner());
+    if g.epoch != epoch {
+        return;
+    }
+    if let Some(s) = g.map.get_mut(key) {
+        s.index = Some(idx);
+    }
+}
+
+/// 复位 `building`（第三项是发起时的代次，被清空过就不碰新槽）。
+struct BuildingGuard(SharedSlots, String, u64);
 
 impl Drop for BuildingGuard {
     fn drop(&mut self) {
-        if let Some(s) = self
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map
-            .get_mut(&self.1)
-        {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if g.epoch != self.2 {
+            return;
+        }
+        if let Some(s) = g.map.get_mut(&self.1) {
             s.building = false;
         }
     }
+}
+
+/// 丢掉全部槽（含在建的：其重建线程写回时找不到槽即作罢）。
+pub(crate) fn clear(slots: &SharedSlots) {
+    let mut g = slots.lock().unwrap_or_else(|e| e.into_inner());
+    g.map.clear();
+    g.epoch += 1;
+}
+
+/// 已建好索引的槽数。
+pub(crate) fn loaded(slots: &SharedSlots) -> usize {
+    slots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .values()
+        .filter(|s| s.index.is_some())
+        .count()
 }
 
 /// 阻塞地建好并放进槽（预热 / 测试用）。已是最新则不重建，返回是否真的建了。
@@ -312,6 +337,24 @@ mod tests {
         v.iter()
             .map(|(t, c)| (t.to_string(), c.to_string()))
             .collect()
+    }
+
+    /// 清空后，旧一轮重建的写回与 `building` 复位都不该落到新槽上。
+    #[test]
+    fn clear_fences_off_in_flight_rebuild() {
+        let slots: SharedSlots = Default::default();
+        let old_epoch = slots.lock().unwrap().epoch;
+        slots.lock().unwrap().touch("wb").building = true;
+        clear(&slots);
+        // 清空后新一轮重建已起。
+        slots.lock().unwrap().touch("wb").building = true;
+        let idx = Arc::new(UserTextIndex::from_rows("wb", (0, 0), rows(&[("工", "a")])));
+        install(&slots, "wb", old_epoch, idx);
+        drop(BuildingGuard(slots.clone(), "wb".into(), old_epoch));
+        let g = slots.lock().unwrap();
+        let s = g.map.get("wb").unwrap();
+        assert!(s.index.is_none(), "旧线程的结果不该写进清空后的新槽");
+        assert!(s.building, "旧线程不该复位新一轮重建的单飞标记");
     }
 
     #[test]

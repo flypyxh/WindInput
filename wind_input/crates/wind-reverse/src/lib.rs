@@ -846,6 +846,17 @@ impl ReverseLookup {
         }
     }
 
+    /// 拆字表是否在内存里（有条目）。
+    pub fn has_chaizi(&self) -> bool {
+        !self.chaizi.is_empty()
+    }
+
+    /// 与 `other` 交换拆字表。供「锁外读盘建好、锁内一次换入」：`other` 用
+    /// `ReverseLookup::load(None, Some(path))` 建，换完它持有的是旧表、随之释放。
+    pub fn swap_chaizi(&mut self, other: &mut ReverseLookup) {
+        std::mem::swap(&mut self.chaizi, &mut other.chaizi);
+    }
+
     /// 载入拆字库（字\t字根\t编码）；存编码列 + 字根列。
     fn load_chaizi(&mut self, path: &Path) {
         let content = match std::fs::read_to_string(path) {

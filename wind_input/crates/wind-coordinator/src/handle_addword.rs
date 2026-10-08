@@ -267,7 +267,7 @@ impl Coordinator {
     /// 造词是否启用（码表/混输方案 + 开关开启）。拼音方案走 `[pinyin.auto_learn]` 的
     /// 选词即学路线，不进本缓冲。
     pub(crate) fn auto_phrase_enabled(&self) -> bool {
-        !self.engine_mgr.is_pinyin() && self.engine_mgr.codetable_settings().auto_phrase.enabled
+        self.engine_mgr.auto_phrase_enabled()
     }
 
     /// 终止信号统一入口（回车/焦点丢失/IME 停用/模式切换/切换方案/光标移动）。

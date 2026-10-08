@@ -13,6 +13,7 @@ pub use comment::preview as template_preview;
 pub(crate) mod config_bundle;
 pub(crate) mod construct;
 pub mod coordinator;
+pub(crate) mod data_needs;
 pub(crate) mod debug_support;
 #[cfg(windows)]
 pub mod direct_switch;

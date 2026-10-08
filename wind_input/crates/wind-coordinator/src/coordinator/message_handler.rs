@@ -405,8 +405,9 @@ impl MessageHandler for Coordinator {
             // 两个方向共用一条路：互斥保证住在 `toggle_conversion_direction` 里，
             // 各写一份必然漂移（其中一份忘了关掉对面就是两个方向同时开）。
             "toggle_s2t" | "toggle_t2s" => {
-                self.toggle_conversion_direction(command == "toggle_s2t");
-                self.show_status();
+                if self.try_toggle_conversion(command == "toggle_s2t") {
+                    self.show_status();
+                }
                 Some(self.build_status())
             }
             _ => None,
