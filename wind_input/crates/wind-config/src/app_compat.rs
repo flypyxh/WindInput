@@ -13,7 +13,7 @@
 //! 跨层叠完之后，一个焦点窗口可能命中多条规则：按具体程度**分级合成**（[`AppCompat::resolve`]），
 //! 设计见 `docs/design/compat-window-match.md`。
 
-pub use crate::compat_overlay::{ANY_PROCESS, RuleId, wildcard_match};
+pub use crate::compat_overlay::{ANY_PROCESS, RuleId, RuleKey, wildcard_match};
 use crate::compat_overlay::{
     FieldEdit, Obj, Raw, apply_edits, compose, is_disabled, materialize, overlay_raw, parse_raw,
     render_raw, rule_id, sanitize, unset_of,
@@ -48,7 +48,8 @@ pub(crate) const USER_COMPAT_HEADER: &str = "\
 # 一个窗口命中多条时按具体程度叠加，越具体越后叠（后叠的赢）：
 #   \"*\" < 仅窗口条件 < 仅进程名 < 进程名 + 窗口条件。
 #   更具体那条里的 unset 也取消 \"*\" 等更低级规则设下的同名字段（回到「跟随全局」）。
-# 带 class / title 的规则设置页暂不显示，只能在本文件手写；设置页的改动不会碰它们。
+# 设置页「应用兼容性」可新增、修改带 class / title 的规则；当前版本尚未上报窗口标题，
+#   title 条件暂不生效（待后续版本）。
 # 字段说明见系统层 data/compat.toml 顶部注释。
 
 ";
@@ -1236,14 +1237,21 @@ pub(crate) fn with_menu_system<R>(system: Raw, known: bool, f: impl FnOnce() -> 
     r
 }
 
-/// 对某进程的 `[[apps]]` 差异行做一批字段编辑。只动**纯进程键**那一条（右键菜单没有窗口
-/// 条件的概念），同进程带 class / title 的规则不受影响。
+/// 对 `[[apps]]` 里某一条（按身份定位）的差异行做一批字段编辑。传进程名即**纯进程键**那一条，
+/// 同进程带 class / title 的规则不受影响；右键菜单在当前值来自更具体的窗口规则时传那条的身份
+/// （协调器 `menu_writeback_target`），出厂规则则在用户层写同身份的覆盖。
 fn edit_user_apps(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     edits: &[FieldEdit],
 ) -> Result<(), std::io::Error> {
-    let id = Some(RuleId::process_only(process));
+    let target = target.into();
+    let Some(id) = target.id("apps") else {
+        return Err(std::io::Error::other(
+            "规则身份为空（进程名 / 类名 / 标题都没有）",
+        ));
+    };
+    let id = Some(id);
     update_user_raw(user_dir, |user, system, known| {
         // 下层（系统 / data_custom）把这个进程的规则禁用了，而用户在菜单里给它选了一个选项：
         // 这是明确的「我要配置它」，不带重新启用的话规则仍是禁用，选项存了却永远不生效。
@@ -1263,7 +1271,19 @@ fn edit_user_apps(
                 serde_json::Value::Bool(false),
             ));
         }
-        apply_edits::<AppCompatRule>("apps", &system.apps, &mut user.apps, process, &all, known)
+        let had = user.apps.iter().any(|r| rule_id("apps", r) == id);
+        apply_edits::<AppCompatRule>("apps", &system.apps, &mut user.apps, &target, &all, known);
+        // 菜单「跟随全局」作用在用户新增的「进程 + 窗口」规则上：清掉的只是这一条的字段，更低级的
+        // 规则（纯进程 / `*`）会透上来；清空了整条就消失。留个痕迹便于排查「点了跟随全局却不是全局值」。
+        let in_system = system.apps.iter().any(|r| rule_id("apps", r) == id);
+        if had && !in_system && !user.apps.iter().any(|r| rule_id("apps", r) == id) {
+            tracing::debug!(
+                "菜单写回后用户规则已无任何字段，整条移除（process={} class={:?} title_len={}）",
+                target.process,
+                target.class,
+                target.title.chars().count()
+            );
+        }
     })
 }
 
@@ -1314,15 +1334,16 @@ pub fn menu_rule_switch(user_dir: &Path, process: &str) -> RuleSwitch {
 /// 与设置端 `CompatAdmin::set_disabled` 同一套写法。
 pub fn set_user_rule_disabled(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     disabled: bool,
 ) -> Result<(), std::io::Error> {
+    let target = target.into();
     update_user_raw(user_dir, |user, system, known| {
         apply_edits::<AppCompatRule>(
             "apps",
             &system.apps,
             &mut user.apps,
-            process,
+            &target,
             &[set_value("disabled", disabled)],
             known,
         )
@@ -1332,58 +1353,58 @@ pub fn set_user_rule_disabled(
 /// 设置用户层 compat.toml 中指定进程的首显策略（`None` = 清除，回到跟随全局）。
 pub fn set_user_first_show_mode(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     mode: Option<FirstShowMode>,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_or_clear("first_show_mode", mode)])
+    edit_user_apps(user_dir, target, &[set_or_clear("first_show_mode", mode)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的初始中英状态（`None` = 清除）。
 pub fn set_user_initial_mode(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     mode: Option<InitialMode>,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_or_clear("initial_mode", mode)])
+    edit_user_apps(user_dir, target, &[set_or_clear("initial_mode", mode)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的初始中英标点（`None` = 清除）。
 pub fn set_user_initial_punct(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     mode: Option<InitialMode>,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_or_clear("initial_punct", mode)])
+    edit_user_apps(user_dir, target, &[set_or_clear("initial_punct", mode)])
 }
 
 /// 设置用户层 compat.toml 中指定进程是否加入 HostRender 白名单。
 /// `false` 写成显式覆盖（系统层打开时它才是「从白名单里去掉」；系统层没有时会被当作冗余丢掉）。
 pub fn set_user_host_render(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     enabled: bool,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_value("host_render", enabled)])
+    edit_user_apps(user_dir, target, &[set_value("host_render", enabled)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的符号自动配对开关（`None` = 清除）。
 pub fn set_user_auto_pair(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_or_clear("auto_pair", enabled)])
+    edit_user_apps(user_dir, target, &[set_or_clear("auto_pair", enabled)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的密码框强制英文（`None` = 清除）。
 pub fn set_user_password_force_english(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
     edit_user_apps(
         user_dir,
-        process,
+        target,
         &[set_or_clear("password_force_english", enabled)],
     )
 }
@@ -1391,10 +1412,10 @@ pub fn set_user_password_force_english(
 /// 设置用户层 compat.toml 中指定进程的输入方案（`None` = 清除）。
 pub fn set_user_schema(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     schema: Option<String>,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_or_clear("schema", schema)])
+    edit_user_apps(user_dir, target, &[set_or_clear("schema", schema)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的候选窗定位方式（`None` = 清除，含坐标）。
@@ -1403,7 +1424,7 @@ pub fn set_user_schema(
 /// 上一次的老位置，而他刚刚才关掉它——「关了又开，位置从哪来的」无从解释。
 pub fn set_user_candidate_position_mode(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     mode: Option<CandidatePositionMode>,
 ) -> Result<(), std::io::Error> {
     let mut edits = vec![set_or_clear("candidate_position_mode", mode)];
@@ -1411,7 +1432,7 @@ pub fn set_user_candidate_position_mode(
         edits.push(clear("candidate_x"));
         edits.push(clear("candidate_y"));
     }
-    edit_user_apps(user_dir, process, &edits)
+    edit_user_apps(user_dir, target, &edits)
 }
 
 /// 记住指定进程的候选窗固定落点：**定位方式与坐标一起写**（内容左上，物理像素）。
@@ -1423,13 +1444,13 @@ pub fn set_user_candidate_position_mode(
 /// 因为规避函数在协调器侧（与状态气泡共用），下沉到配置层会变成第二份实现。
 pub fn set_user_candidate_fixed_pos(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     x: i32,
     y: i32,
 ) -> Result<(), std::io::Error> {
     edit_user_apps(
         user_dir,
-        process,
+        target,
         &[
             set_or_clear(
                 "candidate_position_mode",
@@ -1448,35 +1469,35 @@ pub fn set_user_candidate_fixed_pos(
 /// 把内置规则整个去掉——与菜单文案相反。显式 `Some(false)` / `Some(true)` 才是用户的覆盖。
 pub fn set_user_ignore_host_ime_close(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     enabled: Option<bool>,
 ) -> Result<(), std::io::Error> {
     let edit = match enabled {
         Some(v) => set_value("ignore_host_ime_close", v),
         None => FieldEdit::Inherit("ignore_host_ime_close".to_string()),
     };
-    edit_user_apps(user_dir, process, &[edit])
+    edit_user_apps(user_dir, target, &[edit])
 }
 
 /// 设置用户层 compat.toml 中指定进程的智能符号替换方案（`None` = 清除）。
 pub fn set_user_smart_method(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     method: Option<SmartMethod>,
 ) -> Result<(), std::io::Error> {
-    edit_user_apps(user_dir, process, &[set_or_clear("smart_method", method)])
+    edit_user_apps(user_dir, target, &[set_or_clear("smart_method", method)])
 }
 
 /// 设置用户层 compat.toml 中指定进程的光标坐标校正偏移（像素，正=右/下）。
 pub fn set_user_caret_offset(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     dx: i32,
     dy: i32,
 ) -> Result<(), std::io::Error> {
     edit_user_apps(
         user_dir,
-        process,
+        target,
         &[
             set_value("caret_offset_x", dx),
             set_value("caret_offset_y", dy),
@@ -1490,7 +1511,7 @@ pub fn set_user_caret_offset(
 /// ⚠ `fixed` 的坐标由调用方先做 `(0,0)` 哨兵规避（协调器的 `avoid_unset_sentinel`）。
 pub fn set_user_status_position(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     mode: Option<StatusPositionMode>,
     x: i32,
     y: i32,
@@ -1503,18 +1524,18 @@ pub fn set_user_status_position(
         edits.push(clear("status_x"));
         edits.push(clear("status_y"));
     }
-    edit_user_apps(user_dir, process, &edits)
+    edit_user_apps(user_dir, target, &edits)
 }
 
 /// 设置用户层 compat.toml 中指定进程的状态气泡兜底位置（`None` = 清除）。
 pub fn set_user_status_fallback(
     user_dir: &Path,
-    process: &str,
+    target: impl Into<RuleKey>,
     fallback: Option<StatusFallback>,
 ) -> Result<(), std::io::Error> {
     edit_user_apps(
         user_dir,
-        process,
+        target,
         &[set_or_clear("status_fallback_position", fallback)],
     )
 }
@@ -1900,6 +1921,32 @@ impl AppCompat {
             window_matches,
             entry_window_matches,
         }
+    }
+
+    /// 右键菜单为焦点窗口写回 `fields` 时该写到哪条规则。
+    ///
+    /// 菜单显示的是焦点窗口的生效值；它若来自「进程名 + 窗口条件」的规则，写纯进程键会被那条压住
+    /// （点了没反应）。所以取命中的规则里**比纯进程键更具体**（T3：具体进程 + 窗口条件）、且自己
+    /// 写了或 `unset` 了其中任一字段的最后叠的那条——它就是这些字段生效值的出处，写它必然生效。
+    /// 返回 `None` = 写纯进程键（照旧）：生效值来自纯进程 / `"*"` / 仅窗口条件的规则时，纯进程键
+    /// 叠在它们之后，写它就够了；而改仅窗口条件那条（如 `Chrome_WidgetWin_*`）会波及别的应用。
+    pub fn menu_writeback_target(&self, ctx: &WindowCtx, fields: &[&str]) -> Option<RuleId> {
+        if ctx.process.is_empty() {
+            return None;
+        }
+        self.candidates
+            .iter()
+            .rev()
+            .find(|c| {
+                let unset = unset_of(&c.fields);
+                !c.id.is_any_process()
+                    && c.id.has_window_condition()
+                    && c.matches(ctx)
+                    && fields
+                        .iter()
+                        .any(|k| c.fields.contains_key(*k) || unset.iter().any(|u| u == k))
+            })
+            .map(|c| c.id.clone())
     }
 
     /// 该进程组合区用哪个占位字符（GH#175）。**唯一的查表入口**，协调器发占位与给 DLL
@@ -3660,6 +3707,51 @@ mod layering_tests {
         with_menu_system(raw(text), true, f)
     }
 
+    /// 菜单按窗口规则的身份写回：出厂窗口规则在用户层写同身份的覆盖，纯进程那条不动。
+    #[test]
+    fn menu_set_by_window_identity_overrides_that_rule_only() {
+        let dir = tmp("m_win");
+        let sys = "[[apps]]\nprocess = \"AHK.exe\"\nfirst_show_mode = \"fast\"\n\n[[apps]]\nprocess = \"AHK.exe\"\nclass = \"AutoHotkeyGUI\"\nfirst_show_mode = \"wait\"\n";
+        with_system(sys, || {
+            let target = RuleId {
+                process: "ahk.exe".into(),
+                class: "autohotkeygui".into(),
+                title: String::new(),
+            };
+            set_user_first_show_mode(&dir, &target, Some(FirstShowMode::Instant)).unwrap();
+        });
+        let user = raw(&read(&dir));
+        assert_eq!(user.apps.len(), 1, "{:?}", user.apps);
+        assert_eq!(
+            user.apps[0]["class"],
+            serde_json::json!("AutoHotkeyGUI"),
+            "沿用出厂写法"
+        );
+        assert_eq!(user.apps[0]["process"], serde_json::json!("AHK.exe"));
+        assert_eq!(
+            user.apps[0]["first_show_mode"],
+            serde_json::json!("instant")
+        );
+        let c = load(sys, &read(&dir), "m_win_l");
+        let mode = |class: &str| {
+            c.resolve(&WindowCtx {
+                process: "ahk.exe",
+                class,
+                title: "",
+            })
+            .rule
+            .as_ref()
+            .and_then(|r| r.first_show_mode)
+        };
+        assert_eq!(mode("AutoHotkeyGUI"), Some(FirstShowMode::Instant));
+        assert_eq!(mode("Other"), Some(FirstShowMode::Fast), "纯进程那条不动");
+        assert!(
+            set_user_auto_pair(&dir, "", Some(true)).is_err(),
+            "身份为空不写"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn menu_set_stores_only_the_changed_field() {
         let dir = tmp("m_set");
@@ -4109,6 +4201,84 @@ mod resolve_tests {
             .as_ref()
             .map(|r| r.caret_offset_x)
             .unwrap_or(-1)
+    }
+
+    /// 菜单写回的目标：生效值来自「进程 + 窗口条件」的规则时写那条，否则写纯进程键。
+    #[test]
+    fn menu_writeback_targets_the_most_specific_process_window_rule_touching_the_field() {
+        let c = one(r#"
+            [[apps]]
+            class = "Chrome_WidgetWin_*"
+            first_show_mode = "wait"
+            [[apps]]
+            process = "ahk.exe"
+            first_show_mode = "fast"
+            [[apps]]
+            process = "ahk.exe"
+            class = "AutoHotkey*"
+            first_show_mode = "instant"
+            [[apps]]
+            process = "ahk.exe"
+            class = "AutoHotkeyGUI"
+            auto_pair = true
+            [[apps]]
+            process = "ahk.exe"
+            class = "AutoHotkeyGUI"
+            title = "T*"
+            unset = ["auto_pair"]
+            [[apps]]
+            process = "ahk.exe"
+            class = "Off"
+            first_show_mode = "wait"
+            disabled = true
+        "#);
+        let id = |class: &str, title: &str| RuleId {
+            process: "ahk.exe".into(),
+            class: class.into(),
+            title: title.into(),
+        };
+        let gui = ctx("AHK.exe", "AutoHotkeyGUI", "");
+        assert_eq!(
+            c.menu_writeback_target(&gui, &["first_show_mode"]),
+            Some(id("autohotkey*", "")),
+            "更具体的 AutoHotkeyGUI 那条没写这个字段，出处是通配那条"
+        );
+        assert_eq!(
+            c.menu_writeback_target(&gui, &["auto_pair"]),
+            Some(id("autohotkeygui", ""))
+        );
+        assert_eq!(
+            c.menu_writeback_target(&ctx("ahk.exe", "AutoHotkeyGUI", "Title"), &["auto_pair"]),
+            Some(id("autohotkeygui", "t*")),
+            "unset 也是出处"
+        );
+        assert_eq!(
+            c.menu_writeback_target(&gui, &["caret_use_top", "auto_pair"]),
+            Some(id("autohotkeygui", "")),
+            "多字段取任一"
+        );
+        assert_eq!(
+            c.menu_writeback_target(&ctx("ahk.exe", "Other", ""), &["first_show_mode"]),
+            None,
+            "只命中纯进程规则 ⇒ 写纯进程键"
+        );
+        assert_eq!(
+            c.menu_writeback_target(&ctx("ahk.exe", "Off", ""), &["first_show_mode"]),
+            None,
+            "禁用的不算"
+        );
+        assert_eq!(
+            c.menu_writeback_target(
+                &ctx("code.exe", "Chrome_WidgetWin_1", ""),
+                &["first_show_mode"]
+            ),
+            None,
+            "仅窗口条件（不限进程）的出处不改它，写纯进程键即可压过"
+        );
+        assert_eq!(
+            c.menu_writeback_target(&ctx("", "AutoHotkeyGUI", ""), &["auto_pair"]),
+            None
+        );
     }
 
     /// 每级各写一条 caret_offset_x，越具体越后叠（后叠的赢）。规则在文件里**倒序**写，

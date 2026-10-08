@@ -120,6 +120,76 @@ impl RuleId {
     }
 }
 
+/// 规则身份的**原始写法**（各项 trim 后、保留大小写）：定位用 [`Self::id`] 规范化成 [`RuleId`]，
+/// 新建行时按它写 `process` / `class` / `title`（系统层有同身份那条时沿用系统层的写法）。
+///
+/// `From<&str>` 是纯进程键（右键菜单、按进程名的旧接口），与 [`RuleId::process_only`] 同一口径。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleKey {
+    pub process: String,
+    pub class: String,
+    pub title: String,
+}
+
+impl RuleKey {
+    pub fn new(process: &str, class: &str, title: &str) -> Self {
+        RuleKey {
+            process: process.trim().to_string(),
+            class: class.trim().to_string(),
+            title: title.trim().to_string(),
+        }
+    }
+
+    /// 写成一行的身份键。`[[apps]]` 不限进程又带窗口条件时不写 `process`（与出厂写法一致）；
+    /// 附属两段没有窗口条件，只写 `process`。
+    pub(crate) fn to_obj(&self, section: &str) -> Obj {
+        let mut o = Obj::new();
+        let window = has_window_conditions(section);
+        let has_window = window && (!self.class.is_empty() || !self.title.is_empty());
+        if !(self.process.is_empty() || (has_window && self.process == ANY_PROCESS)) {
+            o.insert("process".into(), Value::String(self.process.clone()));
+        }
+        if window {
+            for (k, v) in [("class", &self.class), ("title", &self.title)] {
+                if !v.is_empty() {
+                    o.insert(k.into(), Value::String(v.clone()));
+                }
+            }
+        }
+        o
+    }
+
+    /// 规范化身份；认不出（三者全空、附属段没有进程名）返回 `None`。
+    pub fn id(&self, section: &str) -> Option<RuleId> {
+        rule_id(section, &self.to_obj(section))
+    }
+}
+
+impl From<&str> for RuleKey {
+    fn from(process: &str) -> Self {
+        RuleKey::new(process, "", "")
+    }
+}
+
+impl From<&String> for RuleKey {
+    fn from(process: &String) -> Self {
+        RuleKey::from(process.as_str())
+    }
+}
+
+impl From<&RuleKey> for RuleKey {
+    fn from(k: &RuleKey) -> Self {
+        k.clone()
+    }
+}
+
+/// 由已规范化的身份得到写法（小写）。只适合定位**已存在**的规则（新建行会写成小写）。
+impl From<&RuleId> for RuleKey {
+    fn from(id: &RuleId) -> Self {
+        RuleKey::new(&id.process, &id.class, &id.title)
+    }
+}
+
 /// 不区分大小写比较用的单字符折叠：转小写后仍是**一个**字符才采用，否则保留原字符
 /// （个别字符小写后是多个码点，按 char 匹配时 `?` 必须仍然只对应它一个）。
 pub(crate) fn fold_char(c: char) -> char {
@@ -463,8 +533,19 @@ pub(crate) fn field_value_problem<T: DeserializeOwned>(
 pub struct Problem {
     pub section: String,
     pub process: String,
+    /// 规则的窗口条件（原样、trim 后；没有为空串），与 `process` 一起定位是哪一条。
+    pub class: String,
+    pub title: String,
     pub key: String,
     pub message: String,
+}
+
+/// 一行里某个窗口条件键的写法（trim 后；不是字符串或没写为空串）。
+pub(crate) fn window_key_of(o: &Obj, k: &str) -> String {
+    o.get(k)
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 参与叠加之前先把无效的值当成「没写」剔掉。返回（清理后的行，每处剔除的说明）。
@@ -479,11 +560,18 @@ pub(crate) fn sanitize<T: DeserializeOwned>(
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let name = process_of(r).to_string();
+        let (class, title) = if has_window_conditions(section) {
+            (window_key_of(r, "class"), window_key_of(r, "title"))
+        } else {
+            (String::new(), String::new())
+        };
         // 认不出身份的行整条作废（不套给任何人）：报告后不进叠加。
         if rule_id(section, r).is_none() {
             report.push(Problem {
                 section: section.to_string(),
                 process: name,
+                class,
+                title,
                 key: "process".to_string(),
                 message: if has_window_conditions(section) {
                     "process / class / title 都没写或类型不对，整条规则作废".to_string()
@@ -527,6 +615,8 @@ pub(crate) fn sanitize<T: DeserializeOwned>(
                 report.push(Problem {
                     section: section.to_string(),
                     process: name.clone(),
+                    class: class.clone(),
+                    title: title.clone(),
                     key: k.clone(),
                     message: format!("{p}，已忽略"),
                 });
@@ -652,6 +742,25 @@ pub(crate) fn normalize<T: DeserializeOwned + Serialize>(
         .collect();
     user.remove("unset");
 
+    // 没有同身份的系统行（用户新增的规则）：显式 `false` / `0` 与 `unset` 都**不是**冗余——
+    // 合成时它们跨级生效（压过 / 取消 `*`、仅进程等更低级规则设下的值），与本行有没有系统对照
+    // 无关。只修剪 `disabled = false`（禁用只作用于本条，没有跨级效果）。
+    if sys.is_none() {
+        if user.get("disabled") == Some(&Value::Bool(false)) {
+            user.remove("disabled");
+        }
+        let has_content = user
+            .keys()
+            .any(|k| !matches!(k.as_str(), "process" | "class" | "title" | "comment"))
+            || !unset.is_empty();
+        if !unset.is_empty() {
+            user.insert("unset".into(), unset_array(&unset));
+        }
+        if !has_content {
+            user.remove("comment");
+        }
+        return has_content;
+    }
     let full = effective_view::<T>(sys, user, &unset);
     // 1) 字段与 disabled：去掉后运行时效果不变的就是冗余。
     for k in effective_keys::<T>(section, user) {
@@ -686,34 +795,40 @@ pub(crate) fn normalize<T: DeserializeOwned + Serialize>(
     has_content
 }
 
-/// 把一批字段编辑应用到用户层某一段：找到（或新建）该进程的差异行，逐项编辑，规范化，
+/// 把一批字段编辑应用到用户层某一段：找到（或新建）该身份的差异行，逐项编辑，规范化，
 /// 落回（没内容就删掉这一行）。`sys_rows` 是**已叠加好的系统层**该段。
 ///
-/// 按**纯进程键**（[`RuleId::process_only`]）认「同一条」：同进程带窗口条件的规则是另一条，不受影响。
+/// 按**完整身份**（[`RuleKey::id`]）认「同一条」：传进程名（`&str`）即纯进程键，同进程带窗口条件
+/// 的规则是另一条，不受影响。身份认不出（三者全空）时什么也不做。
 pub(crate) fn apply_edits<T: DeserializeOwned + Serialize>(
     section: &str,
     sys_rows: &[Obj],
     user_rows: &mut Vec<Obj>,
-    process: &str,
+    key: impl Into<RuleKey>,
     edits: &[FieldEdit],
     system_known: bool,
 ) {
-    let process = process.trim();
-    let id = Some(RuleId::process_only(process));
+    let key = key.into();
+    let Some(id) = key.id(section) else {
+        return;
+    };
+    let id = Some(id);
     let sys = sys_rows.iter().find(|r| rule_id(section, r) == id);
     let idx = user_rows.iter().position(|r| rule_id(section, r) == id);
     let mut row = match idx {
         Some(i) => user_rows[i].clone(),
-        None => {
-            let mut o = Obj::new();
-            // 新建行沿用系统层的写法（大小写），没有才用调用方给的。
-            let name = sys
-                .map(process_of)
-                .filter(|n| !n.is_empty())
-                .unwrap_or(process);
-            o.insert("process".into(), Value::String(name.trim().to_string()));
-            o
-        }
+        // 新建行沿用系统层的写法（大小写），没有才用调用方给的。
+        None => match sys {
+            Some(s) => s
+                .iter()
+                .filter(|(k, _)| {
+                    k.as_str() == "process"
+                        || (has_window_conditions(section) && WINDOW_KEYS.contains(&k.as_str()))
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => key.to_obj(section),
+        },
     };
     let mut unset: BTreeSet<String> = unset_of(&row).into_iter().collect();
     for e in edits {
@@ -1013,8 +1128,9 @@ mod tests {
         assert!(user.is_empty(), "与系统一致就不该有用户条目: {user:?}");
     }
 
+    /// 后半句 P4 改口径：没有同身份系统行的显式 false 也保留（跨级压过 `*` 等更低级规则）。
     #[test]
-    fn explicit_false_over_a_system_true_is_kept_but_false_over_nothing_is_dropped() {
+    fn explicit_false_is_kept_over_a_system_true_and_on_a_user_rule() {
         let sys = vec![sys_wechat()];
         let mut user = Vec::new();
         apply_edits::<AppCompatRule>(
@@ -1040,7 +1156,11 @@ mod tests {
             &[FieldEdit::Set("caret_use_top".into(), json!(false))],
             true,
         );
-        assert!(user2.is_empty(), "系统没有它时 false 与没写等价，属冗余");
+        assert_eq!(
+            user2[0]["caret_use_top"],
+            json!(false),
+            "用户新增规则的显式 false 不是冗余：它压过 * 等更低级规则"
+        );
     }
 
     #[test]

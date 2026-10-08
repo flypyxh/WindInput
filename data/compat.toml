@@ -23,7 +23,8 @@
 #   设下的：某进程写 unset = ["first_show_mode"]，它就不再继承 "*" 的 first_show_mode；
 #   disabled 的规则不参与。拿不到进程名时任何规则（含 "*"）都不命中。
 #   [[initial_mode_scope]] / [[commit_newline]] 不支持窗口条件（写了不生效）。
-#   设置页「应用兼容性」暂不显示带 class / title 的规则，只能在 compat.toml 里手写维护。
+#   设置页「应用兼容性」可新增、修改带 class / title 的规则（出厂规则的匹配条件只读，可复制为新规则）。
+#   ⚠ 当前版本尚未上报窗口标题，title 条件暂不生效（待后续版本）；class 已生效。
 #
 # 可用字段:
 #   process:              进程名（不区分大小写）；不写 = "*"

@@ -12,6 +12,11 @@ use wind_keys::keymap;
 use wind_ui_types::ToolbarState;
 use wind_ui_types::{CandidateOp, MenuAnchor, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 
+/// 候选窗定位方式与坐标：菜单一起写，写回目标也按这一组判（见 `menu_writeback_target`）。
+const CANDIDATE_POS_FIELDS: [&str; 3] = ["candidate_position_mode", "candidate_x", "candidate_y"];
+/// 状态气泡定位方式与坐标，同上。
+const STATUS_POS_FIELDS: [&str; 3] = ["status_position_mode", "status_x", "status_y"];
+
 /// 菜单打开后的焦点事件豁免期，见 [`Coordinator::menu_close_on_focus_change`]。
 ///
 /// 取 250ms 的依据：下界须盖住跨宿主切换时旧宿主 focus_lost 迟到的约 100ms（实测
@@ -447,12 +452,6 @@ impl Coordinator {
     /// 当前焦点应用配了气泡定位规则时改**规则**（写成跟随光标、坐标清零），不碰全局——
     /// 读取侧规则压过全局，只改全局用户看不到任何变化（C2-33 / GH#148）。
     pub(crate) fn status_reset_position(&self) {
-        self.warn_if_menu_writeback_shadowed(
-            "status_reset_position",
-            |r: Option<&wind_config::app_compat::AppCompatRule>| {
-                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
-            },
-        );
         let name = self.active_process_name();
         if self
             .rule_status_position(&name, &self.active_focus_window())
@@ -486,12 +485,6 @@ impl Coordinator {
     /// 不碰全局——判据与读取侧 `status_position` 同源，照 `save_candidate_pos`。
     pub(crate) fn save_status_tip_pos(&self, x: i32, y: i32) {
         use wind_config::app_compat::StatusPositionMode as SP;
-        self.warn_if_menu_writeback_shadowed(
-            "save_status_tip_pos",
-            |r: Option<&wind_config::app_compat::AppCompatRule>| {
-                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
-            },
-        );
         let name = self.active_process_name();
         if let Some((mode, _, _)) = self.rule_status_position(&name, &self.active_focus_window()) {
             if mode == SP::Fixed {
@@ -532,15 +525,6 @@ impl Coordinator {
     /// 所有跟随全局的应用位置全被改掉。判据与读取侧 `candidate_fixed_pos` 同源：规则里
     /// 配了定位方式就以规则为准，没配才看全局。
     pub(crate) fn save_candidate_pos(&self, x: i32, y: i32) {
-        self.warn_if_menu_writeback_shadowed(
-            "save_candidate_pos",
-            |r: Option<&wind_config::app_compat::AppCompatRule>| {
-                r.and_then(|r| {
-                    r.candidate_position_mode
-                        .map(|m| (m, r.candidate_x, r.candidate_y))
-                })
-            },
-        );
         let name = self.active_process_name();
         if let Some((rule_fixed, _, _)) =
             self.rule_candidate_fixed_pos(&name, &self.active_focus_window())
@@ -580,7 +564,9 @@ impl Coordinator {
             tracing::warn!("save_candidate_pos: 无用户配置目录，无法持久化 process={name}");
             return;
         };
-        if let Err(e) = wind_config::app_compat::set_user_candidate_fixed_pos(&user_dir, name, x, y)
+        let target = self.menu_writeback_target(name, &CANDIDATE_POS_FIELDS);
+        if let Err(e) =
+            wind_config::app_compat::set_user_candidate_fixed_pos(&user_dir, target, x, y)
         {
             tracing::error!("save_candidate_pos: 写用户 compat.toml 失败: {e}");
             return;
@@ -612,9 +598,11 @@ impl Coordinator {
             tracing::warn!("set_candidate_position_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_candidate_position_mode(&user_dir, &name, mode)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_candidate_position_mode(
+            &user_dir,
+            self.menu_writeback_target(&name, &CANDIDATE_POS_FIELDS),
+            mode,
+        ) {
             tracing::error!("set_candidate_position_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -647,9 +635,11 @@ impl Coordinator {
             tracing::warn!("set_ignore_host_ime_close_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_ignore_host_ime_close(&user_dir, &name, enabled)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_ignore_host_ime_close(
+            &user_dir,
+            self.menu_writeback_target(&name, &["ignore_host_ime_close"]),
+            enabled,
+        ) {
             tracing::error!("set_ignore_host_ime_close_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -675,12 +665,6 @@ impl Coordinator {
     /// 当前焦点应用配了气泡定位规则时翻转**规则**（固定 ↔ 跟随光标），随后的落盘也走规则。
     pub(crate) fn status_toggle_pinned(&self) {
         use wind_config::app_compat::StatusPositionMode as SP;
-        self.warn_if_menu_writeback_shadowed(
-            "status_toggle_pinned",
-            |r: Option<&wind_config::app_compat::AppCompatRule>| {
-                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
-            },
-        );
         let name = self.active_process_name();
         if let Some((mode, x, y)) = self.rule_status_position(&name, &self.active_focus_window()) {
             let now_fixed = mode != SP::Fixed;
@@ -936,7 +920,7 @@ impl Coordinator {
     /// ⇒ 收成一张表后，「写反」这件事在结构上不可能发生。
     ///
     /// 编号按菜单显示顺序排，与 `InitialMode` / `AutoPairRule` 的「0=跟随全局」约定一致。
-    const FIRST_SHOW_MENU: [(
+    pub(crate) const FIRST_SHOW_MENU: [(
         u8,
         Option<wind_config::app_compat::FirstShowMode>,
         &'static str,
@@ -1032,17 +1016,20 @@ impl Coordinator {
             tracing::warn!("set_first_show_mode: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) = wind_config::app_compat::set_user_first_show_mode(&user_dir, &name, mode) {
+        let target = self.menu_writeback_target(&name, &["first_show_mode"]);
+        if let Err(e) = wind_config::app_compat::set_user_first_show_mode(&user_dir, target, mode) {
             tracing::error!("set_first_show_mode: 写用户 compat.toml 失败: {e}");
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
         self.reload_app_compat();
-        // 3）当前应用立即生效。
+        // 3）当前应用立即生效：按新表对焦点窗口**重新解析**，不直接把 `mode` 塞进缓存——
+        //    「跟随全局」清掉的是这一条，`*` / 更低级规则的值会透上来，直接写会与实际生效值不符。
+        let resolved = self.with_active_compat_rule(|r| r.and_then(|r| r.first_show_mode));
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .first_show_mode = mode;
+            .first_show_mode = resolved;
         tracing::info!(
             "候选窗首显策略 for process={name}: {}",
             mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
@@ -1101,17 +1088,20 @@ impl Coordinator {
             tracing::warn!("set_auto_pair_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) = wind_config::app_compat::set_user_auto_pair(&user_dir, &name, enabled) {
+        let target = self.menu_writeback_target(&name, &["auto_pair"]);
+        if let Err(e) = wind_config::app_compat::set_user_auto_pair(&user_dir, target, enabled) {
             tracing::error!("set_auto_pair_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
         // 2）重载整表（系统层 + 用户层），与启动时同一口径。
         self.reload_app_compat();
-        // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）。
+        // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）：
+        //    按新表重新解析，理由同 `set_first_show_mode`。
+        let resolved = self.with_active_compat_rule(|r| r.and_then(|r| r.auto_pair));
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .auto_pair = enabled;
+            .auto_pair = resolved;
         tracing::info!(
             "符号自动配对 for process={name}: {}",
             match enabled {
@@ -1145,9 +1135,11 @@ impl Coordinator {
             tracing::warn!("set_password_force_english_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_password_force_english(&user_dir, &name, enabled)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_password_force_english(
+            &user_dir,
+            self.menu_writeback_target(&name, &["password_force_english"]),
+            enabled,
+        ) {
             tracing::error!("set_password_force_english_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -1178,9 +1170,13 @@ impl Coordinator {
             tracing::warn!("status_position: 无用户配置目录，无法持久化 process={name}");
             return false;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_status_position(&user_dir, name, mode, x, y)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_status_position(
+            &user_dir,
+            self.menu_writeback_target(name, &STATUS_POS_FIELDS),
+            mode,
+            x,
+            y,
+        ) {
             tracing::error!("status_position: 写用户 compat.toml 失败: {e}");
             return false;
         }
@@ -1221,12 +1217,6 @@ impl Coordinator {
             tracing::warn!("set_status_position_rule: 当前焦点进程未知，忽略本次设置");
             return;
         }
-        self.warn_if_menu_writeback_shadowed(
-            "set_status_position_rule",
-            |r: Option<&wind_config::app_compat::AppCompatRule>| {
-                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
-            },
-        );
         let (x, y) = match self.rule_status_position(&name, &self.active_focus_window()) {
             Some((SP::Fixed, x, y)) => (x, y),
             _ => (0, 0),
@@ -1268,9 +1258,11 @@ impl Coordinator {
             tracing::warn!("set_status_fallback_rule: 无用户配置目录，无法持久化");
             return;
         };
-        if let Err(e) =
-            wind_config::app_compat::set_user_status_fallback(&user_dir, &name, fallback)
-        {
+        if let Err(e) = wind_config::app_compat::set_user_status_fallback(
+            &user_dir,
+            self.menu_writeback_target(&name, &["status_fallback_position"]),
+            fallback,
+        ) {
             tracing::error!("set_status_fallback_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -1315,7 +1307,8 @@ impl Coordinator {
             return;
         };
         // 1）写用户层 compat.toml。
-        if let Err(e) = wind_config::app_compat::set_user_schema(&user_dir, &name, value.clone()) {
+        let target = self.menu_writeback_target(&name, &["schema"]);
+        if let Err(e) = wind_config::app_compat::set_user_schema(&user_dir, target, value.clone()) {
             tracing::error!("set_app_schema_rule: 写用户 compat.toml 失败: {e}");
             return;
         }
@@ -1360,10 +1353,16 @@ impl Coordinator {
             return;
         };
         // 1）写用户层 compat.toml。
-        let written = if is_punct {
-            wind_config::app_compat::set_user_initial_punct(&user_dir, &name, mode)
+        let field = if is_punct {
+            "initial_punct"
         } else {
-            wind_config::app_compat::set_user_initial_mode(&user_dir, &name, mode)
+            "initial_mode"
+        };
+        let target = self.menu_writeback_target(&name, &[field]);
+        let written = if is_punct {
+            wind_config::app_compat::set_user_initial_punct(&user_dir, target, mode)
+        } else {
+            wind_config::app_compat::set_user_initial_mode(&user_dir, target, mode)
         };
         if let Err(e) = written {
             tracing::error!("set_initial_state_rule: 写用户 compat.toml 失败: {e}");

@@ -14,7 +14,7 @@
 
 use super::*;
 use std::hash::{Hash, Hasher};
-use wind_config::app_compat::{AppCompatRule, ResolvedRule, RuleId, WindowCtx};
+use wind_config::app_compat::{AppCompatRule, ResolvedRule, RuleId, RuleKey, WindowCtx};
 
 /// 一个焦点窗口的身份：顶层窗口类名 + 标题。拿不到的项为空串，带对应条件的规则一律不命中
 /// （「不知道是哪个窗口」不能套窗口规则）。
@@ -322,30 +322,32 @@ impl Coordinator {
         }
     }
 
-    /// 菜单写回（P4 之前只写纯进程键）前的提示：焦点窗口的生效值与「只按进程名」解析的值不同，
-    /// 说明当前值来自带窗口条件的规则，写回纯进程键可能被它压住、看起来「点了没反应」。
-    /// 只打 warn（不含标题文本，标题按用户数据处理），返回是否命中，行为不变。
-    pub(crate) fn warn_if_menu_writeback_shadowed<T: PartialEq>(
-        &self,
-        what: &str,
-        pick: impl Fn(Option<&AppCompatRule>) -> T,
-    ) -> bool {
-        let name = self.active_process_name();
+    /// 右键菜单为焦点应用写回 `fields` 时的目标规则身份（设计稿 P4）。
+    ///
+    /// 菜单显示的是焦点窗口的生效值；它来自「进程名 + 窗口条件」的规则时，写那条的身份
+    /// （出厂规则则在用户层写同身份的覆盖），否则写纯进程键（进程名原样）。判据在
+    /// `AppCompat::menu_writeback_target`。日志不含标题文本（标题按用户数据处理）。
+    pub(crate) fn menu_writeback_target(&self, name: &str, fields: &[&str]) -> RuleKey {
         let win = self.active_focus_window();
         if name.is_empty() || win.is_empty() {
-            return false;
+            return RuleKey::from(name);
         }
-        let shadowed = self.with_compat_rule(&name, &win, &pick)
-            != self.with_compat_rule(&name, &FocusWindow::default(), &pick);
-        if shadowed {
-            tracing::warn!(
-                "{what}: 当前窗口（class={:?} title_len={}）的生效值来自带窗口条件的规则，\
-                 菜单只写回 {name} 的进程规则，可能被窗口规则压住而不生效",
-                win.class,
-                win.title.chars().count()
-            );
+        let target = self
+            .app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .menu_writeback_target(&win.ctx(name), fields);
+        match target {
+            Some(id) => {
+                tracing::debug!(
+                    "菜单写回 {fields:?}: 生效值来自窗口规则（class={:?} title_len={}），写到该规则",
+                    id.class,
+                    id.title.chars().count()
+                );
+                RuleKey::from(&id)
+            }
+            None => RuleKey::from(name),
         }
-        shadowed
     }
 
     /// 焦点换了窗口（同一 token 的窗口上下文变了）时，给该 token 重推按规则现算的 DLL 配置。
@@ -1004,29 +1006,122 @@ password_force_english = true
         assert!(chinese(&c), "同一个窗口：不算切进来，手切保留");
     }
 
-    /// 菜单写回只写纯进程键：当前生效值来自窗口规则时提示（P4 前只打 warn，行为不变）。
+    /// 带用户层 compat.toml 的协调器（菜单写回要落盘）。返回 (协调器, 用户目录)。
+    fn coord_with_user_rules(tag: &str, text: &str) -> (Arc<Coordinator>, std::path::PathBuf) {
+        let user = std::env::temp_dir().join(format!(
+            "wind_menu_wb_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&user);
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("compat.toml"), text).unwrap();
+        let (c, _rx) = Coordinator::new_headless_with_ui_at(Config::default(), None, Some(&user));
+        c.reload_app_compat();
+        (c, user)
+    }
+
+    fn first_show_in(
+        c: &Coordinator,
+        class: &str,
+    ) -> Option<wind_config::app_compat::FirstShowMode> {
+        c.with_compat_rule("p4menu.exe", &FocusWindow::of_class(class), |r| {
+            r.and_then(|r| r.first_show_mode)
+        })
+    }
+
+    fn menu_id(mode: wind_config::app_compat::FirstShowMode) -> u8 {
+        Coordinator::FIRST_SHOW_MENU
+            .iter()
+            .find(|(_, m, _)| *m == Some(mode))
+            .map(|(id, _, _)| *id)
+            .unwrap()
+    }
+
+    /// 菜单写回落到生效值的出处：焦点窗口命中「进程 + 类名」规则且它写了该字段 ⇒ 写那条；
+    /// 该字段只来自纯进程规则 ⇒ 写纯进程键。
     #[test]
-    fn menu_writeback_is_flagged_when_a_window_rule_supplies_the_value() {
-        let c = coord_with_rules(
-            "menuwarn",
+    fn menu_writeback_goes_to_the_window_rule_that_supplies_the_value() {
+        use wind_config::app_compat::FirstShowMode as F;
+        let (c, user) = coord_with_user_rules(
+            "win",
             r#"
 [[apps]]
-process = "app.exe"
-candidate_position_mode = "follow_caret"
+process = "p4menu.exe"
+first_show_mode = "fast"
+auto_pair = true
 
 [[apps]]
-process = "app.exe"
+process = "p4menu.exe"
 class = "Pinned"
-candidate_position_mode = "fixed"
+first_show_mode = "wait"
 "#,
         );
-        c.pid_names.lock().unwrap().insert(900, "app.exe".into());
-        let pick = |r: Option<&wind_config::app_compat::AppCompatRule>| {
-            r.and_then(|r| r.candidate_position_mode)
-        };
-        c.handle_focus_gained(&focus((900u64 << 32) | 1, "Pinned"));
-        assert!(c.warn_if_menu_writeback_shadowed("t", pick));
-        c.handle_focus_gained(&focus((900u64 << 32) | 1, "Plain"));
-        assert!(!c.warn_if_menu_writeback_shadowed("t", pick));
+        c.pid_names.lock().unwrap().insert(901, "p4menu.exe".into());
+        c.handle_focus_gained(&focus((901u64 << 32) | 1, "Pinned"));
+        assert_eq!(
+            c.active_compat.lock().unwrap().first_show_mode,
+            Some(F::Wait)
+        );
+
+        c.set_first_show_mode(menu_id(F::Instant));
+        assert_eq!(first_show_in(&c, "Pinned"), Some(F::Instant), "点了就生效");
+        assert_eq!(first_show_in(&c, "Plain"), Some(F::Fast), "纯进程那条不动");
+        assert_eq!(
+            c.active_compat.lock().unwrap().first_show_mode,
+            Some(F::Instant)
+        );
+
+        c.set_auto_pair_rule(2);
+        let text = std::fs::read_to_string(user.join("compat.toml")).unwrap();
+        let raw: toml::Table = toml::from_str(&text).unwrap();
+        let apps = raw["apps"].as_array().unwrap();
+        let pinned = apps
+            .iter()
+            .find(|r| r.get("class").is_some())
+            .expect("窗口规则还在");
+        assert!(
+            pinned.get("auto_pair").is_none(),
+            "auto_pair 的出处是纯进程那条: {text}"
+        );
+        let plain = apps.iter().find(|r| r.get("class").is_none()).unwrap();
+        assert_eq!(plain["auto_pair"].as_bool(), Some(false), "{text}");
+        assert_eq!(c.active_compat.lock().unwrap().auto_pair, Some(false));
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// 写完按新表重新解析，而不是把菜单值直接塞进缓存：「跟随全局」清掉本进程这一条后，
+    /// `*` 的值会透上来，缓存必须与之一致。
+    #[test]
+    fn menu_follow_global_refreshes_the_cache_from_the_resolved_rule() {
+        use wind_config::app_compat::FirstShowMode as F;
+        let (c, user) = coord_with_user_rules(
+            "reres",
+            r#"
+[[apps]]
+process = "*"
+first_show_mode = "wait"
+auto_pair = true
+
+[[apps]]
+process = "p4menu.exe"
+first_show_mode = "fast"
+auto_pair = false
+"#,
+        );
+        c.pid_names.lock().unwrap().insert(902, "p4menu.exe".into());
+        c.handle_focus_gained(&focus((902u64 << 32) | 1, "Any"));
+        assert_eq!(
+            c.active_compat.lock().unwrap().first_show_mode,
+            Some(F::Fast)
+        );
+        assert_eq!(c.active_compat.lock().unwrap().auto_pair, Some(false));
+
+        c.set_first_show_mode(0);
+        c.set_auto_pair_rule(0);
+        let ac = *c.active_compat.lock().unwrap();
+        assert_eq!(ac.first_show_mode, Some(F::Wait), "* 的值透上来");
+        assert_eq!(ac.auto_pair, Some(true));
+        let _ = std::fs::remove_dir_all(&user);
     }
 }
