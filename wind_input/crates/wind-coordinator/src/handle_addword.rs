@@ -64,15 +64,13 @@ fn trim_segs_start(segs: &[CommittedSeg], max_chars: usize) -> usize {
 /// 当成汉字混进词里。
 /// ⚠️ 与 `wind_candidate::is_han`（常用性判定域）**刻意不同源**：那边把部首、笔画一并纳入
 /// （它们在码表里占着汉字编码出现），这边不能——部首不是造词素材。补充平面的处理则一致。
+///
+/// 区段定义在 [`wind_engine::encoder::is_han`]（码表取码跳过非汉字用的同一把尺子）：加词的
+/// 准入判据与取码时的跳过判据必须同源，否则会出现「放进来了却取不出码」。
+/// 平面 2/3 整体纳入——原先逐块列举到 `0x323AF`（扩展 H 末尾），漏掉扩展 I 与 Unicode 17
+/// 新增的扩展 J，那批字**加不了词**。
 pub(crate) fn is_han(c: char) -> bool {
-    matches!(c as u32,
-        0x4E00..=0x9FFF      // 基本区
-        | 0x3400..=0x4DBF    // 扩展 A
-        | 0xF900..=0xFAFF    // 兼容表意文字
-        // 平面 2（SIP）/ 平面 3（TIP）整体：两个平面专用于表意文字，扩展 B–J 与兼容汉字
-        // 补充全在其中，将来的扩展 K/L 亦然。原先逐块列举到 `0x323AF`（扩展 H 末尾），
-        // 漏掉扩展 I（2EBF0–2EE5F）与 Unicode 17 新增的扩展 J（323B0 起）——那批字**加不了词**。
-        | 0x20000..=0x3FFFF)
+    wind_engine::encoder::is_han(c)
 }
 
 /// `dict.add` 入库文本规整：只去首尾空白，**不做一行化 / 截断**。
@@ -91,18 +89,54 @@ fn sanitize_dict_add_text(raw: &str) -> anyhow::Result<&str> {
     Ok(s)
 }
 
+/// 加词推导取码按方案分的三条路。[`Coordinator::add_word_code_family`] 是**唯一**判据：
+/// 准入校验（`try_dict_add`）与取码（`calc_add_word_code`）各判一次就会漂移——曾经一边把
+/// 「方案类型未知」归拼音、一边归码表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddWordFamily {
+    /// 码即单词本身。
+    English,
+    /// 码来自读音：非汉字一律不收。
+    Pinyin,
+    /// 按方案 `[[encoder.rules]]` 从单字全码组装（含混输主码表与类型未知的兜底）。
+    CodeTable,
+}
+
+/// 码表方案推导取码时，整段文本（含被跳过的非汉字）的总长上限。
+///
+/// 码表取码只用其中的汉字（GH#171），汉字数仍受 [`ADD_WORD_MAX_LEN`] 约束；这一道防的是
+/// 剪贴板里一整句外文夹着一两个汉字——那不是「一个词」，悄悄整句入库比拒绝更糟（同
+/// `sanitize_dict_add_text` 的取向）。32 足以放下「姓名 + 手机号 / 座机 + 分机」这类组合。
+const ADD_WORD_MAX_TEXT_LEN: usize = 32;
+
 /// 推导编码路径**专属**的额外校验。
 ///
-/// 编码由方案规则从单字全码组装（见 `calc_add_word_code`），只有汉字词推得出来；长度上限
-/// 对齐加词界面的 [`ADD_WORD_MAX_LEN`]。**显式给了 code 的调用方不走这里**——那是用户
-/// 明确意图（可能加颜文字、外文等无法自动取码的词条），套上这些守卫是回归。
-fn check_derivable_word(word: &str) -> anyhow::Result<()> {
-    let n = word.chars().count();
-    if n > ADD_WORD_MAX_LEN {
-        anyhow::bail!("内容过长（{} 字，上限 {}）", n, ADD_WORD_MAX_LEN);
+/// `han_only`：拼音/英文类方案传 `true`——拼音码来自读音，非汉字没有读音，混进来只会产出
+/// 覆盖不全的码（见 `calc_add_word_code` 拼音分支），故一律拒绝。码表方案传 `false`：取码
+/// **跳过码表里没码的非汉字**（GH#171，姓名+手机号），「到底有没有可取码的字」交给取码
+/// 本身判（`wind_engine::encoder::encode_text`）——`〇` 这类有码的非汉字这里判不出来。
+///
+/// 长度上限对齐加词界面的 [`ADD_WORD_MAX_LEN`]，码表方案按**汉字数**算（它才是编码规则的
+/// 上界），另有总长上限 [`ADD_WORD_MAX_TEXT_LEN`]。**显式给了 code 的调用方不走这里**——
+/// 那是用户明确意图（可能加颜文字、外文等无法自动取码的词条），套上这些守卫是回归。
+fn check_derivable_word(word: &str, han_only: bool) -> anyhow::Result<()> {
+    if han_only {
+        let n = word.chars().count();
+        if n > ADD_WORD_MAX_LEN {
+            anyhow::bail!("内容过长（{} 字，上限 {}）", n, ADD_WORD_MAX_LEN);
+        }
+        if !word.chars().all(is_han) {
+            anyhow::bail!("含非汉字，无法自动取码");
+        }
+        return Ok(());
     }
-    if !word.chars().all(is_han) {
-        anyhow::bail!("含非汉字，无法自动取码");
+    let total = word.chars().count();
+    if total > ADD_WORD_MAX_TEXT_LEN {
+        anyhow::bail!("内容过长（{} 字，上限 {}）", total, ADD_WORD_MAX_TEXT_LEN);
+    }
+    let han = word.chars().filter(|c| is_han(*c)).count();
+    if han > ADD_WORD_MAX_LEN {
+        anyhow::bail!("汉字过多（{} 字，上限 {}）", han, ADD_WORD_MAX_LEN);
     }
     Ok(())
 }
@@ -296,6 +330,10 @@ impl Coordinator {
 
     /// 给一个词取码并过两道查重闸；通过则返回它的码表词组码。
     ///
+    /// 返回：`Err` = 取码失败（调用方据此汇总 info 日志）；`Ok(None)` = 查重命中、不必造；
+    /// `Ok(Some(code))` = 可造。`code_hints` 是各字上屏时用户实际选中的码（GH#181），
+    /// 取码优先按它取位，见 `EngineManager::encode_word_with_hints`。
+    ///
     /// 查重的两道（系统词库 / 用户词库）**不是旧模型的包袱**，草稿层同样要过：
     /// 造一个用户本来就打得出的词，只会在候选面上多出一条重复项。
     ///
@@ -305,15 +343,20 @@ impl Coordinator {
         &self,
         sc: &PhraseSchemas,
         word: &str,
+        code_hints: &[(char, String)],
         also_skip_temp: bool,
-    ) -> Option<String> {
-        let code = match self.engine_mgr.encode_word(&sc.encode, word) {
+    ) -> Result<Option<String>, wind_engine::encoder::EncodeError> {
+        let code = match self
+            .engine_mgr
+            .encode_word_with_hints(&sc.encode, word, code_hints)
+        {
             Ok(c) => c,
             Err(e) => {
-                // DEBUG 级可带具体字符（CLAUDE.md 隐私规则：INFO 及以下不得带）。
+                // DEBUG 级可带具体字符（隐私规则：INFO 及以上不得带）。
                 // 这条是排查「自动造词不生效」最关键的线索——通常是某个字在码表里没有全码。
+                // INFO 级的汇总由调用方按批打（只记数量与类别）。
                 debug!("auto-phrase: 取码失败，整词作废（{}）: {}", word, e);
-                return None;
+                return Err(e);
             }
         };
         // 查重①系统词库：反查索引给的是该词在词库里的**实际**编码列表（`a/ab/abc`），
@@ -325,24 +368,26 @@ impl Coordinator {
             .unwrap_or_default();
         if existing.split('/').any(|c| c == code) {
             debug!("auto-phrase: 系统词库已有 {} -> {}，跳过", code, word);
-            return None;
+            return Ok(None);
         }
-        let store = self.store.as_ref()?;
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
         // 查重②用户词库：同「码+词」已存在则不再写（否则候选会出现重复项）。
         if let Ok(recs) = store.get_user_words(&sc.write, &code)
             && recs.iter().any(|r| r.text == word)
         {
             debug!("auto-phrase: 用户词库已有 {} -> {}，跳过", code, word);
-            return None;
+            return Ok(None);
         }
         if also_skip_temp
             && let Ok(recs) = store.get_temp_words(&sc.write, &code)
             && recs.iter().any(|r| r.text == word)
         {
             debug!("draft: 临时词库已有 {} -> {}，不再记草稿", code, word);
-            return None;
+            return Ok(None);
         }
-        Some(code)
+        Ok(Some(code))
     }
 
     /// 临时词库上限淘汰。按写入次数节流——每次造词都全表扫描代价过高，而上限本身
@@ -411,7 +456,9 @@ impl Coordinator {
         };
         let word = sanitize_dict_add_text(text)?;
         let (code, boundary) = if code.is_empty() {
-            check_derivable_word(word)?;
+            // 码表方案跳过没码的非汉字取码（GH#171）；拼音/英文仍要求整段是汉字。
+            let han_only = self.add_word_code_family().1 != AddWordFamily::CodeTable;
+            check_derivable_word(word, han_only)?;
             // 与快捷加词（Ctrl+=）同一套推导：拼音方案走引擎词级消歧、无果回退逐字反查；
             // 码表方案按方案 `[[encoder.rules]]` 从单字全码组装。boundary 一并取回——
             // 只有拼音那条路给得出音节边界，透传后消费方才不必降级回 DAG。
@@ -1270,17 +1317,27 @@ impl Coordinator {
     /// 第三方码表方案取码恒空、手动加词直接失败；② 硬编码规则对非五笔码表方案静默出错。
     /// 且拆字表与词库解耦，用户换词库/加扩展库后可能造出**打不出来**的码。
     /// 现统一走码表词库自身的单字全码 + 方案声明的公式，与「造出的词必须能打出来」对齐。
-    fn calc_add_word_code(&self, word: &str) -> (String, u64) {
+    /// 加词目标方案及其取码路线（见 [`AddWordFamily`]）。类型未知（方案读不到）归码表——
+    /// 那条路取不出码时自会失败，与改前 `calc_add_word_code` 的兜底一致。
+    fn add_word_code_family(&self) -> (String, AddWordFamily) {
         let schema = self.add_word_target_schema();
-        let engine_type = self.engine_mgr.schema_engine_type(&schema);
+        let family = match self.engine_mgr.schema_engine_type(&schema).as_deref() {
+            Some("english") => AddWordFamily::English,
+            Some("pinyin") => AddWordFamily::Pinyin,
+            _ => AddWordFamily::CodeTable,
+        };
+        (schema, family)
+    }
+
+    fn calc_add_word_code(&self, word: &str) -> (String, u64) {
+        let (schema, family) = self.add_word_code_family();
         // 英文方案：码即单词本身。走不到下面任何一条——`encode_word` 按方案的
         // `[[encoder.rules]]` 从单字全码组装，英文方案没有那一段，取码必失败，
         // 结果是英文方案下加词恒提示「当前方案取不出编码」。
-        if engine_type.as_deref() == Some("english") {
+        if family == AddWordFamily::English {
             return Self::english_add_word_code(word);
         }
-        let is_pinyin = engine_type.map(|t| t == "pinyin").unwrap_or(false);
-        if is_pinyin {
+        if family == AddWordFamily::Pinyin {
             // 含非汉字 → 不取码，让加词中止（界面显示「无法计算编码」）。
             //
             // 拼音码来自读音，而非汉字没有读音：`gen_pinyin` 的 `filter_map` 会**静默跳过**
@@ -1290,8 +1347,9 @@ impl Coordinator {
             // 取码本就为空、早已中止，只有**混合**的情况从这里漏了过去。
             //
             // 守卫**只作用于拼音**：码表方案的码不来自读音，词库里可能真收录了符号条目
-            // （标点/特殊符号有合法的码），一刀切会把它们的加词能力砍掉。非汉字在码表下
-            // 取不出码时，`encode_word` 自己会失败返回空码，行为不变。
+            // （`〇`、标点/特殊符号有合法的码），一刀切会把它们的加词能力砍掉。码表下
+            // 有码的非汉字参与取码、没码的非汉字被跳过（GH#171，见
+            // `wind_engine::encoder::encode_text`），一个可取码的字都没有才失败返回空码。
             if !word.chars().all(is_han) {
                 debug!("addword: 含非汉字，拼音方案不取码（word={}）", word);
                 return (String::new(), 0);
@@ -2456,15 +2514,90 @@ mod tests {
     #[test]
     fn derivable_word_rejects_non_han_and_overlong() {
         use super::{ADD_WORD_MAX_LEN, check_derivable_word};
-        assert!(check_derivable_word("你好").is_ok());
-        assert!(check_derivable_word("hello").is_err(), "纯英文取不出码");
-        assert!(check_derivable_word("你好abc").is_err(), "混入非汉字应拒绝");
+        // 拼音（码来自读音）：非汉字一律拒绝，行为不变。
+        assert!(check_derivable_word("你好", true).is_ok());
+        assert!(
+            check_derivable_word("hello", true).is_err(),
+            "纯英文取不出码"
+        );
+        assert!(
+            check_derivable_word("你好abc", true).is_err(),
+            "混入非汉字应拒绝"
+        );
         // 全角/中文标点是造词终止符、不是素材（见 is_han 的刻意排除）。
-        assert!(check_derivable_word("你好，").is_err(), "中文标点应拒绝");
+        assert!(
+            check_derivable_word("你好，", true).is_err(),
+            "中文标点应拒绝"
+        );
         let long: String = std::iter::repeat_n('好', ADD_WORD_MAX_LEN + 1).collect();
-        assert!(check_derivable_word(&long).is_err(), "超上限应拒绝");
+        assert!(check_derivable_word(&long, true).is_err(), "超上限应拒绝");
         let ok: String = std::iter::repeat_n('好', ADD_WORD_MAX_LEN).collect();
-        assert!(check_derivable_word(&ok).is_ok(), "恰好等于上限应放行");
+        assert!(
+            check_derivable_word(&ok, true).is_ok(),
+            "恰好等于上限应放行"
+        );
+    }
+
+    /// GH#171：码表方案只用中文部分取码，非汉字可以混在词里（姓名+手机号）。
+    #[test]
+    fn codetable_derivable_word_allows_non_han_around_han() {
+        use super::{ADD_WORD_MAX_LEN, ADD_WORD_MAX_TEXT_LEN, check_derivable_word};
+        assert!(check_derivable_word("张三13800138000", false).is_ok());
+        assert!(check_derivable_word("你好，", false).is_ok());
+        // 「有没有可取码的字」不在这里判（〇 这类有码的非汉字这里看不出来），交给取码；
+        // 纯数字在取码那一步失败，见 `codetable_dict_add_derives_code_from_han_part`。
+        assert!(check_derivable_word("二〇二六", false).is_ok());
+        // 字数上限按**汉字**数算（它才是编码规则的上界）。
+        let han: String = std::iter::repeat_n('好', ADD_WORD_MAX_LEN).collect();
+        assert!(check_derivable_word(&format!("{han}123"), false).is_ok());
+        let han: String = std::iter::repeat_n('好', ADD_WORD_MAX_LEN + 1).collect();
+        assert!(check_derivable_word(&han, false).is_err());
+        // 整段文本仍有总长上限：整句英文夹两个汉字不是「一个词」。
+        let text = format!("你好{}", "a".repeat(ADD_WORD_MAX_TEXT_LEN - 1));
+        assert!(check_derivable_word(&text, false).is_err());
+    }
+
+    /// GH#171 端到端：五笔下 `dict.add("张三13800138000")`（不给码）按「张三」的码入库。
+    #[test]
+    fn codetable_dict_add_derives_code_from_han_part() {
+        let data =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
+        if !data.join("schemas/wubi86.schema.toml").exists() {
+            eprintln!("跳过：缺少 wubi86 schema");
+            return;
+        }
+        let mut cfg = wind_config::config::Config::default();
+        cfg.schema.available = vec!["wubi86".into()];
+        cfg.schema.active = "wubi86".into();
+        let db = std::env::temp_dir().join("wind_dictadd_gh171.redb");
+        let _ = std::fs::remove_file(&db);
+        let store = std::sync::Arc::new(wind_store::Store::open(&db).unwrap());
+        let c = Coordinator::new_headless_with_store(cfg, Some(&data), store.clone());
+        let han = c.engine_mgr.encode_word("wubi86", "张三").unwrap();
+        c.cmd_dict_add("张三13800138000", "").unwrap();
+        let schema = c.engine_mgr.data_schema_id("wubi86");
+        let recs = store.get_user_words(&schema, &han).unwrap();
+        // 〇 在五笔里有码，必须参与取码：入库码 = 「二〇二六年」整段的码，不是「二二六年」的。
+        let year = c.engine_mgr.encode_word("wubi86", "二〇二六年").unwrap();
+        assert_ne!(
+            Ok(year.clone()),
+            c.engine_mgr.encode_word("wubi86", "二二六年"),
+            "〇 不该被跳过"
+        );
+        c.cmd_dict_add("二〇二六年", "").unwrap();
+        let year_recs = store.get_user_words(&schema, &year).unwrap();
+        // 一个可取码的字都没有 → 仍拒绝，且不写库。
+        let err = c.cmd_dict_add("13800138000", "").unwrap_err().to_string();
+        let _ = std::fs::remove_file(&db);
+        assert!(
+            recs.iter().any(|r| r.text == "张三13800138000"),
+            "应按「张三」的码 {han} 入库：{recs:?}"
+        );
+        assert!(
+            year_recs.iter().any(|r| r.text == "二〇二六年"),
+            "应按含 〇 的码 {year} 入库：{year_recs:?}"
+        );
+        assert!(err.contains("取不出编码"), "{err}");
     }
 
     #[test]

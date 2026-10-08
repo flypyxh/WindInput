@@ -1338,7 +1338,7 @@ pub struct Coordinator {
     /// ★ **按键路径上只做「滑窗切分 + push」**，取码、查重、写库全在后台线程
     /// （`spawn_draft_flush`）。草稿的产生速率约每字 4 条，而取码要查单字全码表、
     /// 查重要查反查索引与用户词库——任何一项落在上屏线程上都是在给每次按键加钱。
-    pub(crate) draft_queue: Mutex<Vec<String>>,
+    pub(crate) draft_queue: Mutex<Vec<crate::draft_window::DraftWord>>,
     /// 是否已有草稿 flush 线程在跑。没有这道闸，队列每满一次就会 spawn 一个新线程去
     /// 抢同一把 redb 写锁（同 `is_building_reverse_index` 那道闸的理由）。
     pub(crate) draft_flushing: std::sync::atomic::AtomicBool,

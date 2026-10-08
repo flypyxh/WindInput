@@ -491,6 +491,9 @@ impl Coordinator {
             self.learn_english_raw(&active, &cand.text);
             return;
         }
+        // 码表自动造词：登记这个字是用哪条码打出来的（GH#181）。主输入路的选词 / 顶屏出口
+        // 全都经过这里（见上），故挂在这个薄包装里而不是逐个出口。
+        self.note_draft_code_hint(cand, code);
         self.record_selection_cand_in(None, code, cand)
     }
 

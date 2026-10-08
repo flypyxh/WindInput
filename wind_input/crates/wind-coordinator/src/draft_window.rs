@@ -34,14 +34,33 @@ pub const DEFAULT_MAX_WINDOW: usize = 5;
 /// 两次落屏之间的最大间隔；超过则视作断流（防跨句拼出杂词）。
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 滑窗切出的一个草稿词，连同其中各字**上屏时用户实际选中的码**（GH#181）。
+///
+/// 取码时有提示的字按提示取位，没有的回退单字全码表（见
+/// `EngineManager::encode_word_with_hints`）。提示只来自单字上屏：词组上屏时候选带的是
+/// 整词的码，拆不出每个字各是哪条。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftWord {
+    pub text: String,
+    /// `(字, 码)`，按字在词中的顺序；同一个字只记第一次。
+    pub code_hints: Vec<(char, String)>,
+}
+
 /// 落屏文本流的滑窗缓冲。
 ///
 /// 只保留最近 `max_window` 个字：再往前的字不可能参与任何新窗口，留着只是占地方。
 #[derive(Debug, Default)]
 pub struct DraftWindowBuf {
-    chars: Vec<char>,
+    /// 流里的字，各带上屏时登记的码（没有则 `None`）。
+    chars: Vec<(char, Option<String>)>,
     /// 上一次落屏的时刻；`None` = 流为空。
     last_at: Option<Instant>,
+    /// 选词出口登记、**下一次落屏**消费的「这个字是用哪条码打出来的」。
+    ///
+    /// 走登记而不是让落屏动作自己带码：落屏收口在 `note_commit_action`，那里只看得到
+    /// `KeyAction`（只有文本）；选中的候选只在选词出口手里。两者在同一次按键内先后发生，
+    /// 下一次落屏无论是什么都会把它取走，故不会跨键串到别的字上。
+    pending_hint: Option<(char, String)>,
 }
 
 impl DraftWindowBuf {
@@ -55,7 +74,17 @@ impl DraftWindowBuf {
 
     #[cfg(test)]
     fn buffered(&self) -> String {
-        self.chars.iter().collect()
+        self.chars.iter().map(|(c, _)| *c).collect()
+    }
+
+    /// 登记：下一次落屏若恰是单字 `ch`，它是用 `code` 打出来的。
+    pub fn set_code_hint(&mut self, ch: char, code: String) {
+        self.pending_hint = Some((ch, code));
+    }
+
+    /// 作废未消费的登记（本次按键没有落屏）。
+    pub fn clear_code_hint(&mut self) {
+        self.pending_hint = None;
     }
 
     /// 文本落屏。返回**本次新产生的窗口**（可能为空）。
@@ -74,9 +103,32 @@ impl DraftWindowBuf {
         min_window: usize,
         max_window: usize,
     ) -> Vec<String> {
+        self.on_commit_hinted(text, now, idle_timeout, min_window, max_window)
+            .into_iter()
+            .map(|w| w.text)
+            .collect()
+    }
+
+    /// 同 [`Self::on_commit`]，但窗口带上各字登记过的上屏码（见 [`DraftWord`]）。
+    ///
+    /// 消费 [`Self::set_code_hint`] 的登记：本次落屏恰是那个单字时随字进流，否则作废。
+    pub fn on_commit_hinted(
+        &mut self,
+        text: &str,
+        now: Instant,
+        idle_timeout: Duration,
+        min_window: usize,
+        max_window: usize,
+    ) -> Vec<DraftWord> {
         if text.is_empty() {
             return Vec::new();
         }
+        let hint = self.pending_hint.take();
+        let mut cs = text.chars();
+        let hint = match (cs.next(), cs.next(), hint) {
+            (Some(c), None, Some((h, code))) if c == h => Some(code),
+            _ => None,
+        };
         if !text.chars().all(is_han) {
             self.terminate();
             return Vec::new();
@@ -93,7 +145,7 @@ impl DraftWindowBuf {
         let (min, max) = normalize_bounds(min_window, max_window);
         let mut out = Vec::new();
         for ch in text.chars() {
-            self.chars.push(ch);
+            self.chars.push((ch, hint.clone()));
             // 只保留可能参与后续窗口的那一段。
             if self.chars.len() > max {
                 let drop = self.chars.len() - max;
@@ -102,8 +154,19 @@ impl DraftWindowBuf {
             // 以本字结尾、长度 min..=max 的全部窗口。
             let n = self.chars.len();
             for len in min..=max.min(n) {
-                let w: String = self.chars[n - len..].iter().collect();
-                out.push(w);
+                let span = &self.chars[n - len..];
+                let mut code_hints: Vec<(char, String)> = Vec::new();
+                for (c, code) in span {
+                    if let Some(code) = code
+                        && !code_hints.iter().any(|(h, _)| h == c)
+                    {
+                        code_hints.push((*c, code.clone()));
+                    }
+                }
+                out.push(DraftWord {
+                    text: span.iter().map(|(c, _)| *c).collect(),
+                    code_hints,
+                });
             }
         }
         out
@@ -122,7 +185,7 @@ impl DraftWindowBuf {
         let mut remaining = utf16_count;
         while remaining > 0 {
             match self.chars.pop() {
-                Some(c) => remaining = remaining.saturating_sub(c.len_utf16()),
+                Some((c, _)) => remaining = remaining.saturating_sub(c.len_utf16()),
                 None => break,
             }
         }
@@ -139,6 +202,7 @@ impl DraftWindowBuf {
     pub fn terminate(&mut self) {
         self.chars.clear();
         self.last_at = None;
+        self.pending_hint = None;
     }
 }
 
@@ -309,6 +373,73 @@ mod tests {
             vec!["你好"],
             "流没被切断，窗口照常切出"
         );
+    }
+
+    // ───────────── GH#181：窗口带上各字的上屏码 ─────────────
+
+    fn hinted(b: &mut DraftWindowBuf, text: &str, t: Instant) -> Vec<DraftWord> {
+        b.on_commit_hinted(text, t, DEFAULT_IDLE_TIMEOUT, 2, 5)
+    }
+
+    /// 单字上屏前登记的码，随这个字进流，并出现在**所有**含它的窗口里。
+    #[test]
+    fn code_hint_rides_along_with_its_char() {
+        let mut b = DraftWindowBuf::new();
+        let t = now();
+        b.set_code_hint('好', "hc".into());
+        hinted(&mut b, "好", t);
+        b.set_code_hint('嘞', "lw".into());
+        let w = hinted(&mut b, "嘞", t);
+        assert_eq!(
+            w,
+            vec![DraftWord {
+                text: "好嘞".into(),
+                code_hints: vec![('好', "hc".into()), ('嘞', "lw".into())],
+            }]
+        );
+        // 下一个字没登记码：窗口里只有前两个字带码。
+        let w = hinted(&mut b, "啊", t);
+        assert_eq!(
+            w[1].code_hints,
+            vec![('好', "hc".into()), ('嘞', "lw".into())],
+            "{w:?}"
+        );
+        assert_eq!(w[0].text, "嘞啊");
+        assert_eq!(w[0].code_hints, vec![('嘞', "lw".into())]);
+    }
+
+    /// 登记的码**只管下一次落屏**、且必须字对得上：词组上屏、换了个字上屏都不能张冠李戴。
+    #[test]
+    fn code_hint_applies_only_to_the_matching_single_char_commit() {
+        let mut b = DraftWindowBuf::new();
+        let t = now();
+        b.set_code_hint('今', "wyn".into());
+        let w = hinted(&mut b, "今天", t);
+        assert!(w[0].code_hints.is_empty(), "词组上屏不吃单字的码：{w:?}");
+        b.set_code_hint('去', "fcu".into());
+        let w = hinted(&mut b, "上", t);
+        assert!(
+            w.iter().all(|d| d.code_hints.is_empty()),
+            "字对不上不能套用：{w:?}"
+        );
+        let w = hinted(&mut b, "去", t);
+        assert!(
+            w.iter().all(|d| d.code_hints.is_empty()),
+            "登记只管下一次落屏，过期不再生效：{w:?}"
+        );
+    }
+
+    /// 断流顺带作废未消费的登记。
+    #[test]
+    fn terminate_drops_pending_code_hint() {
+        let mut b = DraftWindowBuf::new();
+        let t = now();
+        hinted(&mut b, "你", t);
+        b.set_code_hint('好', "vb".into());
+        b.terminate();
+        hinted(&mut b, "你", t);
+        let w = hinted(&mut b, "好", t);
+        assert!(w[0].code_hints.is_empty(), "{w:?}");
     }
 
     /// 断流不产出任何待结算的东西——与 `AutoPhraseBuf::terminate` 的语义分界。

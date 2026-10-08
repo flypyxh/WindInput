@@ -2191,31 +2191,60 @@ impl EngineManager {
     /// 「造出来的词以后能打出来」，用与词库解耦的静态资源（如拆字表）出码，用户换了词库
     /// 或加了扩展库就可能造出打不出的码。
     ///
-    /// 任一字取不到码即整词失败，错误里带上是哪个字（见 [`encoder::EncodeError`]）。
+    /// 文本口径见 [`encoder::encode_text`]：**单字**直取全码、不进词组公式；**非汉字跳过**
+    /// （GH#171，姓名+手机号只按姓名取码）；取不到码的**汉字**仍整词失败，错误里带上是哪个字
+    /// （见 [`encoder::EncodeError`]）。
     ///
-    /// **单字**与 [`Self::encode_words`] 同口径——直取全码，不进词组公式。两个入口对同一个
-    /// 字必须给同一个答案：设置页出码走复数版、输入法内加词走本函数，口径一旦漂移，用户就会
-    /// 在一个界面拿到码、在另一个界面被告知「当前方案取不出编码」。
+    /// 与 [`Self::encode_words`] 同口径：设置页出码 / 导入词表走复数版、输入法内加词走本函数，
+    /// 口径一旦漂移，用户就会在一个界面拿到码、在另一个界面被告知「当前方案取不出编码」。
     pub fn encode_word(&self, schema_id: &str, word: &str) -> Result<String, encoder::EncodeError> {
-        let spec = Self::read_schema(
+        self.encode_word_with_hints(schema_id, word, &[])
+    }
+
+    /// 同 [`Self::encode_word`]，但优先按**用户实际打的码**取位（GH#181，自动造词用）。
+    ///
+    /// `hints` 是「字 → 用户上屏它时选中的那条码」。单字全码表对多读音/多拆法的字只能按权重
+    /// 挑一条（小鹤音形「嘞」挑到 `le…`，用户打的是 `lw`），按它造出的草稿码与用户回打的码
+    /// 对不上，永远召不回。有提示的字经 [`encoder::pick_hinted_code`] 在该字的全部码（反查
+    /// 索引）里挑以提示开头、不超码长上限、且够公式取位的一条；挑不出（提示不是本方案的码，
+    /// 或反查索引没就绪）回退全码表。无提示的字行为与 [`Self::encode_word`] 完全一致。
+    pub fn encode_word_with_hints(
+        &self,
+        schema_id: &str,
+        word: &str,
+        hints: &[(char, String)],
+    ) -> Result<String, encoder::EncodeError> {
+        let schema = Self::read_schema(
             schema_id,
             self.data_dir.as_deref(),
             self.override_dir.as_deref(),
-        )
-        .and_then(|s| s.encoder)
-        .unwrap_or_default();
+        );
+        let cap = schema
+            .as_ref()
+            .map_or(0, |s| s.engine.codetable.max_code_length);
+        let spec = schema.and_then(|s| s.encoder).unwrap_or_default();
         let codes = self.single_char_full_codes(schema_id);
-        // 单字不进词组公式，理由同 `encode_words` 里的长注释：`calc_word_code` 是「按 rules
-        // 从各字全码组装」，开头即 `chars.len() < 2 → TooShort`。取不到时仍报 `MissingCode`，
-        // 保住「是哪个字没码」这条线索——加词侧的 debug 日志正靠它排查。
-        let mut cs = word.chars();
-        if let (Some(c), None) = (cs.next(), cs.next()) {
-            return codes
-                .get(&c)
-                .cloned()
-                .ok_or(encoder::EncodeError::MissingCode { ch: c });
-        }
-        encoder::calc_word_code(word, &spec, |c| codes.get(&c).cloned())
+        // 反查索引只在真有提示时才取（**不阻塞**：没就绪就当没有提示）。
+        let index = if hints.is_empty() {
+            None
+        } else {
+            self.reverse_index_if_ready(schema_id)
+        };
+        encoder::encode_text(word, &spec, |c, need| {
+            let full = codes.get(&c);
+            if let Some(idx) = index.as_deref()
+                && let Some((_, hint)) = hints.iter().find(|(h, _)| *h == c)
+            {
+                let key = c.to_string();
+                let all = idx.codes_of(&key).into_iter().flat_map(|l| l.iter());
+                if let Some(code) =
+                    encoder::pick_hinted_code(hint, full.map(String::as_str), all, cap, need)
+                {
+                    return Some(code);
+                }
+            }
+            full.cloned()
+        })
     }
 
     /// 批量版 [`Self::encode_word`]：规则完全一致，但**方案只读一次**。
@@ -2226,7 +2255,7 @@ impl EngineManager {
     ///
     /// 返回与 `words` **同序等长**；取不到码的位置为空串——调用方靠下标把码配回词，
     /// 跳过失败项会让其后所有词错位配到别人的码上。
-    /// **单字**直取其全码（不走词组公式，见函数体注释）；多字按方案公式组装。
+    /// 文本口径（单字直取、非汉字跳过）与单条版同一个 [`encoder::encode_text`]。
     pub fn encode_words(&self, schema_id: &str, words: &[&str]) -> Vec<String> {
         let spec = Self::read_schema(
             schema_id,
@@ -2239,29 +2268,15 @@ impl EngineManager {
         let mut failed = 0usize;
         let out: Vec<String> = words
             .iter()
-            .map(|w| {
-                // 单字**不进词组公式**：`calc_word_code` 做的是「按方案 `[[encoder.rules]]`
-                // 从各字全码组装」，开头就 `if chars.len() < 2 { TooShort }`，而 rules 本身
-                // 也不会为 len=1 定公式——单字要的码就是它自己的全码，恰恰躺在上面这张
-                // `codes` 表里。
-                //
-                // 少了这一支，「给某个字补一条编码」这个加词界面上最常见的输入，在所有
-                // 码表方案（以及走码表分支的混输方案）下**恒定出不了码**，用户只能手填。
-                let mut cs = w.chars();
-                if let (Some(c), None) = (cs.next(), cs.next()) {
-                    return codes.get(&c).cloned().unwrap_or_else(|| {
-                        failed += 1;
-                        String::new()
-                    });
-                }
-                match encoder::calc_word_code(w, &spec, |c| codes.get(&c).cloned()) {
+            .map(
+                |w| match encoder::encode_text(w, &spec, |c, _| codes.get(&c).cloned()) {
                     Ok(code) => code,
                     Err(_) => {
                         failed += 1;
                         String::new()
                     }
-                }
-            })
+                },
+            )
             .collect();
         // 逐条打日志在万级批量下反而淹没有用信息，只汇总一行。
         if failed > 0 {
