@@ -279,7 +279,9 @@ impl Store {
                 }
             }
             txn.commit()?;
-            self.bump_words_gen(schema);
+            if promoted {
+                self.bump_words_gen(schema);
+            }
             Ok(promoted)
         })
     }
