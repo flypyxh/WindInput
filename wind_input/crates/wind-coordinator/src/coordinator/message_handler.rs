@@ -1773,6 +1773,19 @@ impl MessageHandler for Coordinator {
                 }
                 self.handle_number_key_select(&mut state, num)
             }
+            // 空闲半角的 0：与上面 1-9 同一透传。此前它落兜底标点流水线由我们 InsertText「0」，
+            // 而 C++ Test 对无会话半角数字不吃 ⇒ Chrome 类宿主（照调 OnKeyDown）在 PIN 框里出两个 0。
+            // 全角不进此臂，仍落兜底流水线出 ０（C++ 那时会吃键）。
+            keymap::VK_0
+                if data.modifiers & MOD_SHIFT == 0
+                    && !state.full_width
+                    && state.candidates.is_empty()
+                    && state.input_buffer.is_empty()
+                    && state.committed_text.is_empty() =>
+            {
+                self.record_commit("0", 0, -1, CommitSource::Punctuation);
+                KeyAction::PassThrough
+            }
             keymap::VK_0
                 if data.modifiers & MOD_SHIFT == 0
                     && !(state.candidates.is_empty()
@@ -1781,8 +1794,8 @@ impl MessageHandler for Coordinator {
             {
                 // 数字键 0 选当前页第 10 个候选（对齐通行约定 0=第10；越界按
                 // overflow.number_key 处理）。follow_main 归一化后小键盘 0 走此臂，与主键盘一致。
-                // 空缓冲下的 0 不进此臂（guard 排除）→ 落兜底标点流水线，保持全角态输出全角 ０
-                // 及自定义标点映射——0 曾靠「不在数字选词臂、落兜底」才正确，见 fullwidth 修复。
+                // 空闲的 0 不进此臂（guard 排除）：半角由上一臂透传，全角落兜底标点流水线出全角 ０
+                // ——0 曾靠「不在数字选词臂、落兜底」才正确，见 fullwidth 修复。
                 self.handle_number_key_select(&mut state, 10)
             }
             keymap::VK_A..=keymap::VK_Z => {
