@@ -220,14 +220,6 @@ impl Coordinator {
         }
     }
 
-    /// 下发密码框抑制策略开关给 DLL。DLL 据此 + 自身持有的 InputScope 掩码在
-    /// `OnTestKeyDown` 本地判定是否放行；判据两侧必须一致（见 `apply_input_diag` 与
-    /// C++ `IsPasswordSuppressActive`），漂移即「吃了再吐」丢键。
-    /// 开关持久化在 `input.password_force_english`（右键菜单「高级」可切），握手时、每次切换与
-    /// 配置重载后都要推。
-    ///
-    /// 取值按**目标进程**现算（compat.toml 的 per-app `password_force_english` 优先），故
-    /// `client_token=0` 时逐客户端推而不是广播同一个值——同 [`Self::push_english_pair_config`]。
     /// 指定 PID 的进程组合区用哪个占位字符（GH#175，compat 规则 `composition_placeholder`）。
     ///
     /// 与 [`Self::auto_pair_allowed_for_pid`] 同一纪律：**按 PID 直查，不走 `active_compat`
@@ -308,6 +300,14 @@ impl Coordinator {
         }
     }
 
+    /// 下发密码框抑制策略开关给 DLL。DLL 据此 + 自身持有的 InputScope 掩码在
+    /// `OnTestKeyDown` 本地判定是否放行；判据两侧必须一致（见 `apply_input_diag` 与
+    /// C++ `IsPasswordSuppressActive`），漂移即「吃了再吐」丢键。
+    /// 开关持久化在 `input.password_force_english`（右键菜单「高级」可切），握手时、每次切换与
+    /// 配置重载后都要推。
+    ///
+    /// 取值按**目标进程**现算（compat.toml 的 per-app `password_force_english` 优先），故
+    /// `client_token=0` 时逐客户端推而不是广播同一个值——同 [`Self::push_english_pair_config`]。
     pub fn push_password_suppress_config(&self, client_token: u64) {
         let make = |token: u64| {
             let enabled = self.password_force_english_for_pid((token >> 32) as u32);
