@@ -72,7 +72,13 @@ rbuild_apply_slot() {
         "") gd="$(git -C "$PRODUCT_ROOT" rev-parse --git-dir 2>/dev/null)"
             cd="$(git -C "$PRODUCT_ROOT" rev-parse --git-common-dir 2>/dev/null)"
             # 没装 git / 不是仓库 ⇒ 两者都空 ⇒ 当作主树, 不派生。
-            [ -n "$gd" ] && [ -n "$cd" ] && [ "$gd" != "$cd" ] && slot="$(basename "$PRODUCT_ROOT")"
+            # 本仓 worktree 惯例是 wt-<名>/WindInput：叶子名恒为 WindInput，拿它当槽位会让所有
+            # worktree 撞进同一个 C:/build-WindInput、同步时互相覆盖源码（2026-10-08 实测：编出
+            # 一份半新半旧的树，报找不到刚加的方法）。叶子名与主仓同名时改取父目录名。
+            if [ -n "$gd" ] && [ -n "$cd" ] && [ "$gd" != "$cd" ]; then
+                slot="$(basename "$PRODUCT_ROOT")"
+                [ "$slot" = WindInput ] && slot="$(basename "$(dirname "$PRODUCT_ROOT")")"
+            fi
             ;;
     esac
     [ -n "$slot" ] || return 0
