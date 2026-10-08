@@ -340,6 +340,8 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.auto_learn.promote_count", Int),
     f("schema.pinyin.completion.min_syllables", Int),
     f("schema.pinyin.completion.max_extra_syllables", Int),
+    f("schema.pinyin.abbrev.enabled", Bool),
+    f("schema.pinyin.abbrev.max_syllables", Int),
     // 上下文语言模型（n-gram）。weight=0 时不加载模型文件，整句结果与没有该功能时逐位相同。
     f("schema.pinyin.grammar.weight", Float),
     f("schema.pinyin.grammar.model", Str),

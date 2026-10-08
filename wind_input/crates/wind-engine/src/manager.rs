@@ -5736,8 +5736,12 @@ impl EngineManager {
             };
             let pcfg = PinyinConfig {
                 use_smart_compose: pg.use_smart_compose,
-                // 无覆盖（纯拼音方案）时保持历史行为：简拼开。
-                enable_abbrev: mix_secondary.map(|o| o.abbrev).unwrap_or(true),
+                // 纯拼音方案看 `[schema.pinyin.abbrev] enabled`；混输看 `mix.enable_pinyin_abbrev`，
+                // 两者取与——混输用户关掉全局简拼，混输里的拼音也不该还出简拼。
+                enable_abbrev: pg.abbrev.enabled && mix_secondary.map(|o| o.abbrev).unwrap_or(true),
+                // 缩写上限不按混输分流：它是「我愿意缩写多长」的个人取舍，理由同下方
+                // completion 两项。
+                abbrev_max_syllables: pg.abbrev.max_syllables as usize,
                 // 残码整句只在**非混输**下启用，理由见 `PinyinConfig::enable_partial_final`。
                 // ⚠️ 判据是「是不是混输辅助」本身，不是 `abbrev` 的取值——两个开关恰好都
                 // 「混输时关掉」，但语义正交，串用会在其中一个被单独调整时静默错配。

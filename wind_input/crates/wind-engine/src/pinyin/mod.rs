@@ -810,6 +810,18 @@ pub struct Config {
     /// （`is_abbreviation` 只要求每字母是某音节首字母），而混输里有人只拿拼音做临时输入补位。
     /// 关闭时连简拼族的召回一并省掉（step5/5b/6/6.2 整条支路）。
     pub enable_abbrev: bool,
+    /// 一条简拼族候选最多缩写几个音节（只打声母的段数）；0 = 不限（GH#180）。
+    ///
+    /// 来自 `schema.pinyin.abbrev.max_syllables`。闸门见 [`PinyinEngine::abbrev_count_allowed`]，
+    /// 各支路数法：纯简拼 = 击键字母数；混合简拼 = 模式里的声母段数
+    /// （[`mixed_abbrev::MixedPattern::abbrev_seg_count`]）；简拼整句 = 解码路径上简拼节点
+    /// （`LatticeNode::abbrev`）的字母数。三处口径一致：按「这个字母在本读法里是不是只当
+    /// 声母用」计，而不是按字面像不像音节——`agzy` 里的 `a` 是「爱」的声母，计 1；
+    /// 模糊拼写 `tin`（听）是全拼，不计。
+    ///
+    /// ⚠️ 尾部残码补全（`haol` → 好了、双拼 `hcl` → 好了）不是简拼，不受本项与
+    /// `enable_abbrev` 约束——那是前缀补全 / step 2c 的事。
+    pub abbrev_max_syllables: usize,
     /// 是否让**尾部残码**参与整句解码（step 2c，`buzhidaok`→「不知道看」）。
     /// 默认 true = 纯拼音方案的行为。
     ///
@@ -997,6 +1009,7 @@ impl Default for Config {
         Self {
             use_smart_compose: true,
             enable_abbrev: true,
+            abbrev_max_syllables: 0,
             enable_partial_final: true,
             // ⚠️ 与 `wind_config::PinyinCompletion::default()` 的 4 / 5 **保持同值**。
             // 真实路径总是从 wind-config 传入（`manager.rs` 的 `completion_min_syllables:
@@ -1346,6 +1359,24 @@ impl PinyinEngine {
         }
     }
 
+    /// 缩写了 `n` 个音节的解读是否在 `abbrev_max_syllables` 之内（0 = 不限，GH#180）。
+    fn abbrev_count_allowed(&self, n: usize) -> bool {
+        let max = self.config.abbrev_max_syllables;
+        max == 0 || n <= max
+    }
+
+    /// `mixed_abbrev::mixed_patterns` 再滤掉声母段超过上限的模式。
+    ///
+    /// 两处混合召回（step5b、前缀回退②）与用户层召回共用这份模式表，在源头滤一次，
+    /// 下游的系统层、用户层、校验三处就都不必各自再判（各判一遍就有漏判一处的自由度）。
+    fn capped_mixed_patterns(&self, stroke: &str) -> Vec<mixed_abbrev::MixedPattern> {
+        let mut pats = mixed_abbrev::mixed_patterns(stroke, &self.trie);
+        if self.config.abbrev_max_syllables != 0 {
+            pats.retain(|p| self.abbrev_count_allowed(p.abbrev_seg_count()));
+        }
+        pats
+    }
+
     fn recall_abbrev_prefix(&self, stroke: &str, consumed: usize, cands: &mut Vec<Candidate>) {
         let trie = &self.trie;
         let dict = &self.dict;
@@ -1396,7 +1427,9 @@ impl PinyinEngine {
         //
         // 本函数整体已由调用方按 `config.enable_abbrev` 把关（见 step 6.2 的入口条件），
         // 故此处只需判形态。该值下面 ③④ 复用，不重算——重算就多一次漂移的机会。
-        let plain = AbbrevMatcher::is_abbreviation(stroke, trie);
+        // 纯简拼每个字母缩一个音节，故缩写数 = 击键长度。
+        let plain_allowed = self.abbrev_count_allowed(stroke.len());
+        let plain = plain_allowed && AbbrevMatcher::is_abbreviation(stroke, trie);
         if plain {
             for (key, edits) in self.abbrev_recall_keys(stroke) {
                 // 模糊处数与折扣，口径同 step5（见那里的论证）。
@@ -1431,7 +1464,7 @@ impl PinyinEngine {
         let pats = if covered >= stroke.len() {
             Vec::new()
         } else {
-            mixed_abbrev::mixed_patterns(stroke, trie)
+            self.capped_mixed_patterns(stroke)
         };
         if !pats.is_empty() {
             let mut keys: Vec<String> = pats
@@ -1482,7 +1515,14 @@ impl PinyinEngine {
             // 用户/临时层自己的配额基准（见 `start` 处的说明）：不与系统层 ①② 抢同一份。
             let store_base = cands.len();
             for c in self.recall_store_by_abbrev(store_dm, stroke, plain, &pats) {
-                let plain_edits = self.abbrev_matches_stroke(&c.code, c.boundary, stroke);
+                // 纯简拼读法超了上限就不认：这条候选可能是经混合模式的键召回来的，
+                // 但「整串都是声母」这种读法本身已被拒。判据用 `plain_allowed` 而非 `plain`，
+                // 不限时与改动前逐字节相同。
+                let plain_edits = if plain_allowed {
+                    self.abbrev_matches_stroke(&c.code, c.boundary, stroke)
+                } else {
+                    None
+                };
                 // 旧代码 `if plain { None }` 的短路前提是「纯简拼命中恒精确 ⇒ 已是最小」。
                 // 召回侧放宽后这个前提**只在 `Some(0)` 时还成立** —— 纯简拼也可能是变体键
                 // 命中、带着处数，那时混合解释可能更优（处数更少），不能跳过不算。
@@ -3195,6 +3235,18 @@ impl Engine for PinyinEngine {
             // `CODA_STEAL_PENALTY`。
             lattice::penalize_coda_steals(abbr_query, trie, &mut lattice_nodes);
             let input_len = abbr_query.len();
+            // 简拼节点的 (起, 止, 规范码)：解码后按路径认领，数整句缩写了几个音节（GH#180）。
+            // 简拼节点必带规范码，故路径上只要有它，`ViterbiResult::pieces` 就是 Some。
+            let abbrev_nodes: Vec<&lattice::LatticeNode> = if self.config.abbrev_max_syllables == 0
+            {
+                Vec::new()
+            } else {
+                lattice_nodes
+                    .iter()
+                    .flatten()
+                    .filter(|n| n.abbrev)
+                    .collect()
+            };
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
             for (end_pos, at_end) in lattice_nodes.iter().enumerate() {
                 if end_pos > input_len {
@@ -3222,7 +3274,24 @@ impl Engine for PinyinEngine {
                 // （`dblg`），而简拼候选的 code 是全拼码（`duobuliaoguan`）——同一个词的
                 // 词频会记到两个互不相认的键上，正是 wdat v5 改「索引存码」时修掉的那个坑。
                 // 交给 step5/6.2 的简拼路径处理即可，那边的 code 是对的。
+                // 缩写上限（GH#180）按解码路径实际缩掉的音节数判，超了宁可不出整句。
+                // 简拼节点每个字母缩一个音节，与 step5 纯简拼「缩写数 = 字母数」同口径。
+                let within_abbrev_cap = self.config.abbrev_max_syllables == 0 || {
+                    let abbreviated: usize = result
+                        .pieces
+                        .iter()
+                        .flatten()
+                        .filter(|pc| {
+                            abbrev_nodes.iter().any(|n| {
+                                n.start == pc.start && n.end == pc.end && n.canon == pc.canon
+                            })
+                        })
+                        .map(|pc| pc.end - pc.start)
+                        .sum();
+                    self.abbrev_count_allowed(abbreviated)
+                };
                 if result.words.len() >= 2
+                    && within_abbrev_cap
                     && !sentence.is_empty()
                     && logp_per_char >= MIXED_SENTENCE_MIN_LOGP_PER_CHAR
                     && !candidates.iter().any(|c| c.text == sentence)
@@ -3487,6 +3556,10 @@ impl Engine for PinyinEngine {
         // 连 is_abbreviation 的 Dag 构建都省掉）。
         let stroke_is_plain_abbrev =
             self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(abbr_query, trie);
+        // 整串读作纯简拼是否超了缩写上限（GH#180）：纯简拼每个字母缩一个音节。
+        // 与 `stroke_is_plain_abbrev` 分开：后者还管 GH#177 那条「码 == 击键的用户词降层」，
+        // 那是用户手填的码，不是缩写，不受上限约束。
+        let plain_abbrev_allowed = self.abbrev_count_allowed(abbr_query.len());
 
         // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。
         //    仅当输入像简拼时才查（is_abbreviation：每字母均为某音节首字母、且非完整音节序列），
@@ -3496,7 +3569,7 @@ impl Engine for PinyinEngine {
         //    AbbrevSection 存的是**全拼码**（v5），故这里是「查索引拿码 → 走主表装配」两步。
         //    候选因此带上真实的 code 与 boundary：词频记账走 `cand_code` 取候选的 code，
         //    此前设成简拼串 `nh`，同一个词在简拼与全拼下遂走两个互不相认的计数。
-        if stroke_is_plain_abbrev {
+        if stroke_is_plain_abbrev && plain_abbrev_allowed {
             for (key, edits) in self.abbrev_recall_keys(abbr_query) {
                 // `edits` 由 `fuzzy_abbrev_keys` 在构造期给出（逐位计），与校验侧
                 // `Initial` 段计 1 处**同口径**（简拼键的每一位就是一个 `Initial` 段）。
@@ -3575,7 +3648,7 @@ impl Engine for PinyinEngine {
         //     不是机制——那正是「双拼下 `xan` 本身歧义、故意未处理」记的那件事。
         //     分隔符把段结构定死之后，`full_pinyin` 成了无歧义的解释，比击键域更可信。
         let mixed_pats = if self.config.enable_abbrev && !mixed_covered {
-            mixed_abbrev::mixed_patterns(mixed_pattern_source, trie)
+            self.capped_mixed_patterns(mixed_pattern_source)
         } else {
             Vec::new()
         };
@@ -3832,7 +3905,7 @@ impl Engine for PinyinEngine {
                 for mut c in self.recall_store_by_abbrev(
                     store_dm,
                     abbr_query,
-                    stroke_is_plain_abbrev,
+                    stroke_is_plain_abbrev && plain_abbrev_allowed,
                     &mixed_pats,
                 ) {
                     if c.text.is_empty() {
@@ -3840,7 +3913,12 @@ impl Engine for PinyinEngine {
                     }
                     // 比对基准是原始击键（见 `abbr_query`）：双拼下 query 已是转换结果，
                     // 拿它比对永远匹配不上用户敲的简拼。
-                    let plain_edits = self.abbrev_matches_stroke(&c.code, c.boundary, abbr_query);
+                    // 超了缩写上限的纯简拼读法不认（同前缀回退③④那处）。
+                    let plain_edits = if plain_abbrev_allowed {
+                        self.abbrev_matches_stroke(&c.code, c.boundary, abbr_query)
+                    } else {
+                        None
+                    };
                     // 混合简拼：按 boundary 切回音节序列逐段比对（无边界 → 无判据 → 不参与）。
                     // 与系统词侧走同一批 `mixed_pats`，判据完全一致，只是这边不经索引——
                     // 用户词规模小，现算即可（与 `abbrev_of_code` 那条注释同理）。
@@ -6077,6 +6155,57 @@ mod tests {
         );
     }
 
+    /// 缩写上限（GH#180）对用户 / 临时层同样生效：整串召回（step 6）与前缀回退（6.2 ③④）
+    /// 两处都数纯简拼的字母数。
+    #[test]
+    fn abbrev_cap_applies_to_store_layers() {
+        let engine_with_cap = |tag: &str, max: usize| {
+            let store = tmp_store(tag);
+            store
+                .add_user_word("pinyin", "heleyibei", "喝了一杯", 500, 0)
+                .unwrap();
+            let dm = DictManager::new();
+            dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                store.clone(),
+                "pinyin",
+            )));
+            PinyinEngine::new(
+                Config {
+                    abbrev_max_syllables: max,
+                    ..Default::default()
+                },
+                CachedDict::Memory(CodetableDict::empty()),
+            )
+            .with_store_layers(Arc::new(dm))
+        };
+        let has = |e: &PinyinEngine, input: &str| {
+            e.convert(input, 50)
+                .unwrap()
+                .candidates
+                .iter()
+                .any(|c| c.text == "喝了一杯")
+        };
+
+        let open = engine_with_cap("abbrev_cap_store_0", 0);
+        assert!(has(&open, "hlyb"), "不限时 hlyb 应命中用户词「喝了一杯」");
+        assert!(
+            has(&open, "hlybx"),
+            "不限时 hlybx 应经前缀回退命中「喝了一杯」"
+        );
+
+        let capped = engine_with_cap("abbrev_cap_store_3", 3);
+        assert!(
+            !has(&capped, "hlyb"),
+            "上限 3 时 hlyb（缩 4 个）不该命中用户词"
+        );
+        assert!(
+            !has(&capped, "hlybx"),
+            "上限 3 时前缀回退的 hlyb 段同样不该命中"
+        );
+        // 全拼不受上限影响。
+        assert!(has(&capped, "heleyibei"), "缩写上限不得影响全拼命中");
+    }
+
     /// C1：query→原始输入空间的 consumed 回映射。无 `'` 恒等；边界紧跟 `'` 归入已消费侧；
     /// 连续 `''` 一并吸收；越过分隔符时正确计数；nih'ao 段内残码边界不 panic。
     /// Task 1.4 TDD：with_fuzzy builder 注入的配置应被引擎持有（探针验证）。
@@ -6212,6 +6341,7 @@ mod tests {
             log_prob: -1000.0,
             // 预置一个不同的规范码，换没换一眼可辨。
             canon: Some(("stale".to_string(), 0b1)),
+            abbrev: false,
         });
         LatticeBuilder::new().add_store_abbrev_nodes("bcx", &dm, &mut nodes);
         assert_eq!(nodes[3].len(), 1, "同词同起点不新增");

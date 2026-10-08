@@ -121,6 +121,15 @@ impl MixedPattern {
         self.segs.is_empty()
     }
 
+    /// 只打了声母的段数（`Initial` 与 `Retroflex`）——这条读法缩写掉了几个音节。
+    /// `nhao` = [n][hao] 得 1，`bzd` = [b][z][d] 得 3。
+    pub fn abbrev_seg_count(&self) -> usize {
+        self.segs
+            .iter()
+            .filter(|s| !matches!(s, AbbrevSeg::Syllable(_)))
+            .count()
+    }
+
     /// 候选词的音节序列是否符合本模式。
     ///
     /// **音节数相等是硬条件**，这继承自纯简拼那条「字母数 == `boundary.count_ones()`」的

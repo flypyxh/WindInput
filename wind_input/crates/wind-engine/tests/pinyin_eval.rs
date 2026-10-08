@@ -22,6 +22,7 @@
 //! - `WIND_PINYIN_EVAL_N`     每类抽样数（默认 600）
 //! - `WIND_PINYIN_EVAL_SEED`  随机种子（默认 20260721）
 //! - `WIND_PINYIN_EVAL_DUMP`  每类导出的未命中明细条数（默认 40）
+//! - `WIND_PINYIN_EVAL_ABBREV_MAX` 简拼缩写上限 `schema.pinyin.abbrev.max_syllables`（默认 0 = 不限）
 //!
 //! ## 样本分类判据
 //!
@@ -103,6 +104,13 @@ fn manager(dir: &Path) -> EngineManager {
     // 质量与开销差别都很大，标定时要能一键切换。
     if let Ok(m) = std::env::var("WIND_GRAM_MODEL") {
         cfg.schema.pinyin.grammar.model = m;
+    }
+    // 简拼缩写上限（GH#180）。默认 0 = 不限，与出厂一致。
+    if let Some(n) = std::env::var("WIND_PINYIN_EVAL_ABBREV_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        cfg.schema.pinyin.abbrev.max_syllables = n;
     }
     EngineManager::new(&cfg, Some(dir))
 }

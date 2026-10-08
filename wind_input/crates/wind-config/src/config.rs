@@ -1291,6 +1291,9 @@ pub struct PinyinGlobalConfig {
     /// 词组补全的音节数约束（全局唯一）。
     #[serde(default)]
     pub completion: PinyinCompletion,
+    /// 简拼（只打声母）的开关与长度上限（`[schema.pinyin.abbrev]`，GH#180）。
+    #[serde(default)]
+    pub abbrev: PinyinAbbrev,
     /// 双拼相关的全局行为（`[schema.pinyin.shuangpin]`）。
     #[serde(default)]
     pub shuangpin: PinyinShuangpin,
@@ -1499,6 +1502,36 @@ impl Default for PinyinCompletion {
     }
 }
 
+/// 简拼（只打声母，`nh` → 你好）的开关与长度上限（`[schema.pinyin.abbrev]`，GH#180）。
+///
+/// 管的是**纯拼音方案**（全拼 / 双拼）。混输里的拼音另有 `schema.mix.enable_pinyin_abbrev`
+/// 管开关，两者取与；`max_syllables` 则两边都认（它是「我愿意缩写多长」的个人取舍，
+/// 与当前是不是混输无关，口径同 `completion`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinyinAbbrev {
+    /// 是否给简拼候选。关掉后纯简拼（`nh`）、混合简拼（`nhao`）、简拼整句
+    /// （`bzdhaobuhao`）一并不出。尾部没打完的音节照常补全（全拼 `nihaom` → 你好吗、
+    /// 搜狗双拼 `hkl` → 好了），那是前缀补全，不归它管。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 一条候选里最多允许几个音节**只打了声母**；0 = 不限（出厂）。
+    ///
+    /// 数的是缩写掉的音节，不是候选字数：`nhao` 只缩了 1 个，`hlyb`（喝了一杯）缩了 4 个，
+    /// `bzdhaobuhao`（不知道好不好）缩了 3 个。取 3 即「短简拼照常、四个及以上的不出」；
+    /// 取 1 等于禁掉纯简拼（纯声母串至少两个字母，`nh` 会无候选）。
+    #[serde(default)]
+    pub max_syllables: u32,
+}
+
+impl Default for PinyinAbbrev {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_syllables: 0,
+        }
+    }
+}
+
 impl Default for PinyinGlobalConfig {
     fn default() -> Self {
         Self {
@@ -1517,6 +1550,7 @@ impl Default for PinyinGlobalConfig {
             frequency: PinyinFrequency::default(),
             auto_learn: AutoLearnConfig::default(),
             completion: PinyinCompletion::default(),
+            abbrev: PinyinAbbrev::default(),
             shuangpin: PinyinShuangpin::default(),
             aux_code: AuxCodeGlobal::default(),
             grammar: PinyinGrammar::default(),
