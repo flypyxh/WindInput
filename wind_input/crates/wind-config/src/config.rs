@@ -151,8 +151,8 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未随任何版本发布到用户手里（接进设置页的改动与本次迁移在同一个未发布版本内），
     // 且新旧默认值都是 "candidate"，能读到它的只有开发期配置。
     &["schema", "codetable", "frequency", "english_code_scope"],
-    // 并入 `ui.candidate.font_size`（0 = 跟随主题）。它仍被值迁移读取，按下方 ★ 判据
-    // 本不该进来——能进来是因为 [`Config::prune_user_config`] 在清本清单**之前**先把
+    // 并入 `ui.candidate.font_size`（0 = 跟随主题）。它仍被值迁移读取，本不该进来（本清单在
+    // 用户文件上做删除、迁移只改内存，只清不迁 = 下次启动再也迁不到）——能进来是因为 [`Config::prune_user_config`] 在清本清单**之前**先把
     // [`Config::migrate_font_size_follow_theme_value`] 的结果落盘，清的时候它已对生效值
     // 毫无影响。新增同类条目须照此先落盘迁移。
     &["ui", "candidate", "font_size_follow_theme"],
@@ -170,16 +170,11 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未随发布版到用户手里（判据同上面 english_code_scope）。
     &["input", "reverse", "enabled"],
     &["schema", "codetable", "lookup_disabled_dicts"],
-    // ⛔ `ui.candidate.comment_max_chars`（已拆成 `_vertical` / `_horizontal`）**刻意不登记**。
-    //
-    // 本清单的不变量是上一段那句「删掉不改变任何生效值」，而该键**仍在被读取**——
-    // [`Config::migrate_comment_max_chars_value`] 每次 load 都拿它补两个新键。
-    // 而 `prune_user_config` 是在**用户文件**上跑的（服务启动 D2 步），迁移只改**内存**、
-    // 从不落盘 ⇒ 登记进来的时序必然是「先把文件里的旧键删掉，下次启动再也迁不到」，
-    // 用户配的截断值静默归 0。
-    //
-    // ⇒ ★ 判据：**一个键只要还有值迁移在读它，就不能进本清单**；反过来，进本清单的前提是
-    // 它已经对生效值毫无影响。旧键留在用户文件里不算误导——它确实还在生效（经迁移）。
+    // 拆成 `_vertical` / `_horizontal`。与 `font_size_follow_theme` 同一判据：
+    // [`Config::prune_user_config`] 先把 [`Config::migrate_comment_max_chars_value`] 的结果
+    // 落盘、再清本清单。此前它刻意不登记、迁移也不摘旧键，于是旧键在用户文件里常驻，设置页把
+    // 竖排改回 0（等于出厂 ⇒ 新键被删）后，下次 load 又被旧键补回原值。
+    &["ui", "candidate", "comment_max_chars"],
 ];
 
 /// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
@@ -8091,8 +8086,9 @@ impl Config {
     ///
     /// 只在新键**缺失**时抄旧值：用户若已写了新键，那是更明确的意图，不该被旧键盖掉。
     ///
-    /// ⛔ 旧键**不进** [`RETIRED_KEYS`]（理由见那份清单末尾）：本函数每次 load 都要读它，
-    /// 而那份清单是在用户文件上做删除、本函数只改内存 ⇒ 登记进去等于下次启动就迁不到了。
+    /// 抄完**摘掉旧键**，且写盘路径（`prune_user_config` / `set_user_value`）都先跑本函数：
+    /// 旧键留在文件里时，设置页把某一侧改回 0 = 出厂值 ⇒ 新键被删 ⇒ 下次 load 旧键又把它补回
+    /// 原值，用户的修改被静默打回。
     ///
     /// ★ 这条迁移不可省：它是**非零默认**的键（默认 0=不限，但配过非 0 值的人正是在意
     /// 长度的那批），不迁移的表现是「升级后注释突然不再截断」——而这类回归无人会报 bug，
@@ -8105,10 +8101,10 @@ impl Config {
         else {
             return;
         };
-        let Some(old) = cand
-            .get("comment_max_chars")
-            .and_then(toml::Value::as_integer)
-        else {
+        let Some(old) = cand.remove("comment_max_chars") else {
+            return;
+        };
+        let Some(old) = old.as_integer() else {
             return;
         };
         let mut copied = Vec::new();
@@ -8136,7 +8132,7 @@ impl Config {
     ///
     /// 只有在**单独一层**上问 `contains_key`，答案才真正是「这一层的作者写过这个键吗」。
     /// 对用户层来说就是「用户自己写过吗」—— 设置页写回时只写它管的那个键、不会顺手删掉
-    /// 旧键，于是新旧两键会在用户配置里长期并存。少了这个区分，要么迁移不执行（旧键被
+    /// 旧键（`set_user_value` 先跑迁移的那几条除外），于是新旧两键会在用户配置里长期并存。少了这个区分，要么迁移不执行（旧键被
     /// 忽略），要么改成旧键优先（用户在设置页的每次修改都在下次启动被打回），两条路都错。
     ///
     /// custom 层（L2.5）也跑一遍，保住「定制层里的旧值同样被救到」这个既有性质
@@ -8514,6 +8510,7 @@ impl Config {
         Self::migrate_font_size_follow_theme_value(&mut root);
         Self::migrate_langbar_badge_colors_value(&mut root);
         Self::migrate_tooltip_sections_value(&mut root);
+        Self::migrate_comment_max_chars_value(&mut root);
         let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
         // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
@@ -9537,6 +9534,8 @@ impl Config {
         // 残留的旧开关（比如 `chaizi_enabled = true`）会在下次 load 被迁回一份合并段，
         // 用户刚选的出厂段列表被打回。
         Self::migrate_tooltip_sections_value(&mut root);
+        // 注释字数旧键同理：竖排改回 0（出厂值 ⇒ 被剪掉）后，残留的旧键会在下次 load 补回原值。
+        Self::migrate_comment_max_chars_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -13001,16 +13000,30 @@ scripts = { latin = 42 }
         );
     }
 
-    /// ⛔ 旧键**不得**进 `RETIRED_KEYS`：它还在被值迁移读取，而那份清单是在**用户文件**上
-    /// 做删除、迁移只改内存 ⇒ 登记进去 = 下次启动再也迁不到，用户配的值静默归 0。
-    ///
-    /// 这条测试钉的是一个「顺手补上去就出事」的改动，故必须显式存在。
+    /// 迁移摘掉旧键：写盘路径先迁再写，把一侧改回 0（出厂值 ⇒ 新键被删）后旧键不会再把它补回。
     #[test]
-    fn retired_keys_excludes_keys_still_read_by_migration() {
-        assert!(
-            !RETIRED_KEYS.contains(&["ui", "candidate", "comment_max_chars"].as_slice()),
-            "comment_max_chars 仍被 migrate_comment_max_chars_value 读取，不能退役"
+    fn migrate_comment_max_chars_drops_old_key_so_reset_to_zero_sticks() {
+        let mut root: toml::Value =
+            toml::from_str("[ui.candidate]\ncomment_max_chars = 12\n").unwrap();
+        // set_user_value 的顺序：先迁移，再按「等于出厂即删」写入竖排 0。
+        Config::migrate_comment_max_chars_value(&mut root);
+        assert_eq!(prune_retired(&mut root), 0, "迁移已摘掉旧键，清单无事可做");
+        let toml::Value::Table(t) = &mut root else {
+            unreachable!()
+        };
+        remove_nested(t, &["ui", "candidate", "comment_max_chars_vertical"]);
+        let cfg = merged_with(&toml::to_string(&root).unwrap());
+        assert_eq!(
+            cfg.ui.candidate.comment_max_chars_vertical, 0,
+            "改回 0 不被打回"
         );
+        assert_eq!(cfg.ui.candidate.comment_max_chars_horizontal, 12);
+        // 反向：只清不迁会丢设置——这正是 prune 必须先落盘迁移的理由。
+        let mut raw: toml::Value =
+            toml::from_str("[ui.candidate]\ncomment_max_chars = 12\n").unwrap();
+        assert_eq!(prune_retired(&mut raw), 1);
+        let lost = merged_with(&toml::to_string(&raw).unwrap());
+        assert_eq!(lost.ui.candidate.comment_max_chars_horizontal, 0);
     }
 
     #[test]
