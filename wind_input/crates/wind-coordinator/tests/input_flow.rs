@@ -577,6 +577,43 @@ fn test_numpad_follow_main_empty_passthrough() {
     );
 }
 
+/// t285 的 follow_main 版：运算符归一成主键盘标点后曾落进标点臂出「。」，而 C++ Test 对小键盘
+/// Number 类空闲半角放行 ⇒ Chrome 类宿主出「.」+「。」。空闲半角须与 direct 一样透传。
+#[test]
+fn test_numpad_follow_main_idle_operators_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.numpad_behavior = "follow_main".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    // * / + / - / . / /
+    for vk in [0x6A_u32, 0x6B, 0x6D, 0x6E, 0x6F] {
+        let act = coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN));
+        assert!(
+            matches!(act, KeyAction::PassThrough),
+            "follow_main 空闲半角小键盘 vk=0x{vk:02X} 应透传，实际: {act:?}"
+        );
+    }
+    // 主键盘 `.` 不受影响：照旧出中文句号。
+    let act = coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN));
+    assert_eq!(action_text(&act).as_deref(), Some("。"), "实际: {act:?}");
+    // 有组合时仍按主键盘标点处理：与同场景按主键盘 `.` 的结果一致。
+    let outcome = |vk: u32| {
+        let mut cfg = config_with("wubi86");
+        cfg.input.numpad_behavior = "follow_main".into();
+        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+        press_letter(&coord, 'a');
+        format!(
+            "{:?}",
+            coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN))
+        )
+    };
+    let np = outcome(0x6E);
+    assert!(!np.contains("PassThrough"), "有组合不得透传，实际: {np}");
+    assert_eq!(np, outcome(0xBE), "有组合时小键盘 . 应与主键盘 . 一致");
+}
+
 /// 全角态、指定 numpad 档位与中英模式的协调器。
 fn coord_full_width(
     numpad_behavior: &str,

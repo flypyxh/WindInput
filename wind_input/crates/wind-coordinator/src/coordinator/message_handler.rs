@@ -10,6 +10,18 @@ use wind_config::app_compat::NewlineStyle;
 use wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
 
 impl Coordinator {
+    /// 仍挂在组合里的智能符号（HoldComposition）。超出时限的视为没有：C++ 定时器到点已自行提交，
+    /// 这边的 `held_text` 不会随之清掉，拿它当「还在组合」会二次提交（"。" → 等 >500ms → "=" → "。。="）。
+    pub(crate) fn live_held_text(&self) -> Option<String> {
+        let arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+        let timeout = self.smart_symbol_timeout();
+        if arm.at.is_some_and(|t| t.elapsed() < timeout) {
+            arm.held_text.clone()
+        } else {
+            None
+        }
+    }
+
     /// 当前焦点应用的上屏换行档位：per-app（compat `[[commit_newline]]`）→ 全局
     /// （`input.commit_newline`）→ 出厂 [`NewlineStyle::Keep`]。
     ///
@@ -1496,6 +1508,25 @@ impl MessageHandler for Coordinator {
             }
             return self.commit_highlight_then_char(&mut state, npc, has_comp);
         }
+        // 同一条闸的 follow_main 版：键已归一成主键盘键，上面那臂认不出来，运算符会落进标点臂
+        // 出「。」等（数字有主键盘空缓冲臂兜着）。C++ 的 Test 只按小键盘 Number 类判、不知道
+        // 本档位，空闲半角照样放行 ⇒ 普通宿主只出 `.`，Chrome 类宿主再加我们插的「。」。
+        // 这里与 Test 对齐，空闲半角一律透传。
+        //
+        // 比上面那臂多判一个挂着的智能符号：HoldComposition 挂着组合时 C++ 视作有会话、已吃下
+        // 本键，透传就是「吃了再吐」；交给标点臂，它会把挂着的符号一并上屏。超时的不算——C++ 定时器
+        // 已自行提交、没有会话了，而 `held_text` 在这边不会随之清掉。
+        if state.numpad_origin
+            && !state.full_width
+            && state.input_buffer.is_empty()
+            && state.committed_text.is_empty()
+            && state.candidates.is_empty()
+            && self.live_held_text().is_none()
+            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+        {
+            self.record_commit(&ch.to_string(), 0, -1, CommitSource::Punctuation);
+            return KeyAction::PassThrough;
+        }
 
         // ── z-fallback 夺取：**必须早于下面的按键分派** ──
         //
@@ -2037,17 +2068,7 @@ impl MessageHandler for Coordinator {
                     // 并清空 held_text，须在此前保存，以便下方普通标点流程将旧符号纳入 CommitText。
                     // 加超时防护：若 arm.at 已超出 timeout，说明 C++ timer 已自然触发提交，
                     // held_text 已过期——不再使用，防止二次提交（"。" → 等待 >500ms → "=" → "。。="）。
-                    let pre_held_text = {
-                        let arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
-                        let timeout = self.smart_symbol_timeout();
-                        let still_in_window =
-                            arm.at.map(|t| t.elapsed() < timeout).unwrap_or(false);
-                        if still_in_window {
-                            arm.held_text.clone()
-                        } else {
-                            None
-                        }
-                    };
+                    let pre_held_text = self.live_held_text();
                     // 智能符号模式：同键连按删中文标点改英文（press2 短路返回）。
                     // 须在候选提交逻辑之前：press2 时无待输入，依赖光标前字符匹配武装态。
                     if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
