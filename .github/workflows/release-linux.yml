@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-    # 与 release.yml 的 publish / attach-linux 共用一个组：先查后建 Release 是 TOCTOU，并发会建出两个草稿
+    # 与 release.yml 的 publish 共用一个组：先查后建 Release 是 TOCTOU，并发会建出两个草稿
     concurrency:
       group: release-${{ inputs.tag }}
       cancel-in-progress: false

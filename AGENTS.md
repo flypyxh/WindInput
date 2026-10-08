@@ -396,7 +396,7 @@ cargo test -p wind-rpc --test wind_setting_assets
   （`wind_input.exe` / `wind_tsf.dll` / `wind_setting.exe` / `wind_portable.exe` / 安装包），
   跨仓经环境变量 `WIND_APP_VERSION` 注入（不经脚本独立构建时各仓自行回退）。
   发版只改 `docs/VERSION` 一处，**不要**手改各仓 `Cargo.toml` 的 `version`。
-- Linux 包（`.deb`，amd64 + arm64）由 `release.yml` 并行调 `linux-build.yml` 构建，**不阻塞** Windows/macOS 发布；
+- Linux 包（`.deb`，amd64 + arm64）由 `release.yml` 并行调 `linux-build.yml` 构建，与 Windows/macOS **同为硬依赖**（任一平台失败都不建草稿）；
   想先单独发 Linux：手动触发 `release-linux.yml`（可填 tag 挂到该 tag 的 Release）。设计与取舍见
   [docs/design/linux-port.md](docs/design/linux-port.md) §9；本机出包 `scripts/linux/package-deb.sh`，核对 `scripts/linux/verify-deb.sh`。
 - CI（release.yml）为 tag-first：以 tag 覆盖 `docs/VERSION` 再构建；仓库里的 `docs/VERSION`
