@@ -909,6 +909,9 @@ constexpr const char* CONFIG_KEY_STATS = "stats";
 // OnTestKeyDown 本地判定是否放行——吃键决策发生在 IPC 之前，仅靠 core 回 PassThrough
 // 已经太晚（会形成「吃了再吐」丢键）。
 constexpr const char* CONFIG_KEY_PASSWORD_SUPPRESS = "password_suppress";
+// Ctrl+空格 中英切换开关（GH#172，keys.ctrl_space_toggle 的有效值）。格式：enabled(u8)。默认开。
+// 关闭时 OnTestKeyDown 不吃 Ctrl+空格、OnKeyDown 不兜底切换，键交给宿主。判据见 CtrlSpacePolicy.h。
+constexpr const char* CONFIG_KEY_CTRL_SPACE_TOGGLE = "ctrl_space_toggle";
 // 诊断快照采集开关（会话级，随输入诊断 HUD 显隐）。格式：enabled(u8)。默认关。
 // 采集要查三次窗口类名 + band，属于「只有排查时才值得付」的开销。
 constexpr const char* CONFIG_KEY_DIAG_SNAPSHOT = "diag_snapshot";

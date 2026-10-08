@@ -543,6 +543,8 @@ static REGISTRY: &[ConfigField] = &[
     // -- keys（全部按键，扁平；overflow 保留一层）--
     f("keys.toggle_mode_keys", StrList),
     f("keys.commit_on_switch", Bool),
+    // Ctrl+空格 中英切换开关（GH#172）。消费端读 `KeysConfig::ctrl_space_toggle_effective`。
+    f("keys.ctrl_space_toggle", Bool),
     f("keys.switch_engine", Str),
     f("keys.toggle_full_width", Str),
     f("keys.toggle_punct", Str),

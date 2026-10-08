@@ -4910,6 +4910,18 @@ pub struct KeysConfig {
     pub toggle_mode_keys: Vec<String>,
     #[serde(default = "default_true")]
     pub commit_on_switch: bool,
+    /// Ctrl+空格 切换中英文（GH#172）。**出厂开**。
+    ///
+    /// 关掉之后：DLL 不再吃 Ctrl+空格、也不做按键侧兜底切换（键原样交给宿主，IDEA /
+    /// Android Studio 的代码提示才按得出来）；Windows 系统输入法开关热键翻 OPENCLOSE
+    /// compartment 时服务端拒绝并把 compartment 拉回（见协调器 `ctrl_space_switch_rejected`）。
+    /// ⚠ 系统热键本身在 msctf 层就消费了按键，宿主收不到——那只能让用户去系统设置里关，
+    /// 本开关只保证模式不被翻。
+    ///
+    /// 消费端读 [`Self::ctrl_space_toggle_effective`]，**不要**直接读本字段：「全局自定义
+    /// 按键」里把 `ctrl+space` 绑成 `none` 也算关。
+    #[serde(default = "default_true")]
+    pub ctrl_space_toggle: bool,
     #[serde(default = "default_switch_engine")]
     pub switch_engine: String,
     #[serde(default = "default_toggle_full_width")]
@@ -5037,6 +5049,30 @@ pub struct KeysConfig {
     /// 候选无效按键策略（数字键/次选三选键/以词定字键超出候选范围时的处理）。
     #[serde(default)]
     pub overflow: OverflowConfig,
+}
+
+impl KeysConfig {
+    /// Ctrl+空格 中英切换**实际**是否生效（GH#172）。
+    ///
+    /// 两个入口任一说「关」就关：
+    /// 1. [`Self::ctrl_space_toggle`] 开关；
+    /// 2. [`Self::key_actions`] 里把 Ctrl+空格 绑成 `none`（「全局自定义按键 → 不启用」）。
+    ///
+    /// 第 2 条是为了让用户最先想到的那个地方真的管用：内置切换从来不在 `key_actions` 里，
+    /// 在那里设「不启用」原本只是删一条不存在的绑定（报障原话「设为不启用也禁不掉」）。
+    /// 只认 `none`、不认别的动词：绑成真动作时系统热键仍可能在 msctf 层先翻 compartment，
+    /// 那时若一并拒绝，启用了系统热键的机器上按 Ctrl+空格 就什么都不发生了。
+    pub fn ctrl_space_toggle_effective(&self) -> bool {
+        if !self.ctrl_space_toggle {
+            return false;
+        }
+        let target = crate::hotkey::parse_hotkey("ctrl+space");
+        !self.key_actions.iter().any(|(key, verb)| {
+            let verb = verb.trim();
+            (verb.is_empty() || verb.eq_ignore_ascii_case("none"))
+                && crate::hotkey::parse_hotkey(key) == target
+        })
+    }
 }
 
 /// `KeysConfig::key_actions_materialized` 的 `skip_serializing_if`。
@@ -5255,6 +5291,7 @@ impl Default for KeysConfig {
         Self {
             toggle_mode_keys: default_toggle_mode_keys(),
             commit_on_switch: true,
+            ctrl_space_toggle: true,
             switch_engine: default_switch_engine(),
             toggle_full_width: default_toggle_full_width(),
             toggle_punct: default_toggle_punct(),

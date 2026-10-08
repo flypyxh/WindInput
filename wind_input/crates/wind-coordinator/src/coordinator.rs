@@ -15,6 +15,7 @@ use crate::pipeline::{ModeKind, Rewind};
 // 子模块（src/coordinator/ 目录）：这批切片重度访问本模块**私有**字段/函数，
 // 子模块对父私有项可见，平级模块则须放开可见性——归属判据即「是否需要碰私有态」。
 mod app_schema;
+mod ctrl_space;
 mod first_show;
 pub(crate) mod fullscreen_watch;
 mod langbar_icon;
@@ -4369,6 +4370,7 @@ impl Coordinator {
                 self.push_cn_passthrough_punct_config(0); // 中文模式该透传的标点：DLL 据此**不**吃
                 self.push_en_passthrough_punct_config(0); // 同上，英文标点态那份（超集）
                 self.push_pair_state_ttl_config(0); // 配对状态时效（DLL 侧闸门据此判陈旧）
+                self.push_ctrl_space_toggle_config(0); // Ctrl+空格 切换开关：DLL 据此吃不吃该键（GH#172）
                 // 诊断采集开关本身与配置文件无关（会话级），这里重推纯属幂等保险——
                 // 与 password_suppress 同样处理，让"重载一次"能修好任何 DLL 侧状态漂移。
                 self.push_diag_snapshot_config(0);

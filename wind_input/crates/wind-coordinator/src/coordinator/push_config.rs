@@ -105,6 +105,7 @@ impl Coordinator {
         self.push_cn_passthrough_punct_config(client_token); // 中文模式该透传的标点：DLL 据此**不**吃
         self.push_en_passthrough_punct_config(client_token); // 同上，英文标点态那份（超集）
         self.push_pair_state_ttl_config(client_token); // 配对状态时效（DLL 侧闸门据此判陈旧）
+        self.push_ctrl_space_toggle_config(client_token); // Ctrl+空格 切换开关（GH#172）：DLL 重连从「开」起步
         // 诊断采集开关：DLL 每次重连都从默认值（关）起步，握手不推则 HUD 开着也收不到
         // 新连接宿主的快照——而最需要它的 SearchHost 恰恰是最常重连的那类。
         self.push_diag_snapshot_config(client_token);

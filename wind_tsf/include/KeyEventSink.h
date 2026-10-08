@@ -5,8 +5,10 @@
 #include "SkipKeyTable.h"
 #include "PassthroughNote.h"
 #include "ToggleTapPolicy.h"
+#include "CtrlSpacePolicy.h"
 #include <string>
 #include <cstdint>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <set>
@@ -506,6 +508,12 @@ private:
     // 天然互斥。QQ 那类「不调 OnTestKeyDown 却调 OnKeyDown」的宿主此标志恒为 FALSE，
     // 兜底不触发——宁可不修，也不拿双切换去赌。
     BOOL     _ctrlSpaceEatenInTest;
+    // Ctrl+空格 是否当中英切换键（GH#172，服务端经 CONFIG_KEY_CTRL_SPACE_TOGGLE 下发
+    // `keys.ctrl_space_toggle` 的有效值）。关闭时 OnTestKeyDown 不吃 Ctrl+空格，键交给宿主
+    // （IDEA 代码提示）；_ctrlSpaceEatenInTest 因此恒 FALSE，OnKeyDown 的兜底切换也随之不走。
+    // 每次重连从默认（开）起步，握手时服务端必推。判据见 CtrlSpacePolicy.h。
+    // 写在 IPC 读线程（OnSyncConfig）、读在 TSF 线程（OnTestKeyDown）⇒ atomic。
+    std::atomic<bool> _ctrlSpaceToggleEnabled{wind::ctrlspace::kDefaultEnabled};
 
     // Maximum duration (ms) for a toggle key press to count as a "tap"
     // Long presses beyond this threshold will NOT trigger mode toggle

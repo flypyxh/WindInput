@@ -1120,6 +1120,11 @@ min_prefix = 2
 [keys]
 toggle_mode_keys = ["lshift", "rshift"]
 commit_on_switch = true
+# Ctrl+空格 切换中英文。关掉后 Ctrl+空格 原样交给应用（如 IDEA 的代码提示）。
+# 在下面 key_actions 里写 "ctrl+space" = "none" 效果相同。
+# ⚠ 若 Windows 系统设置里也开着「Ctrl+空格 切换输入法」的热键，系统会先吃掉这个键，
+#   应用仍收不到——请到 设置 → 时间和语言 → 输入 → 高级键盘设置 → 输入语言热键 里关掉。
+ctrl_space_toggle = true
 switch_engine = "ctrl+shift+e"
 toggle_full_width = "shift+space"
 toggle_punct = "ctrl+."

@@ -486,6 +486,11 @@ pub const CONFIG_KEY_JUMP_OUT_KEYS: &str = "jump_out_keys";
 /// TSF 端据此 + 自身持有的 InputScope 掩码在 `OnTestKeyDown` 本地判定是否放行：
 /// 吃键决策发生在 IPC 之前，协调器回 PassThrough 已太晚（形成「吃了再吐」丢键）。
 pub const CONFIG_KEY_PASSWORD_SUPPRESS: &str = "password_suppress";
+/// Ctrl+空格 中英切换开关（GH#172，`keys.ctrl_space_toggle` 的**有效值**）同步键名。
+/// 格式：`enabled(u8)`。关闭时 DLL 在 `OnTestKeyDown` 不吃 Ctrl+空格、`OnKeyDown` 不做兜底
+/// 切换，键原样交给宿主（IDEA 的代码提示）。吃键决策在 IPC 之前，故必须由 DLL 本地判。
+/// DLL 每次重连从默认值（开，历史行为）起步，握手必推。
+pub const CONFIG_KEY_CTRL_SPACE_TOGGLE: &str = "ctrl_space_toggle";
 /// 「英文半角列有自定义标点映射」的源字符集合同步键名。英文模式（非全角）下 TSF 默认直接
 /// 透传标点键、引擎收不到，英半列因此永远不生效；TSF 据此集合**精确**吃下这些键转发引擎
 /// （集合为空 = 行为与历史完全一致）。判据须与 `wind_punct::custom_english_punct_chars`

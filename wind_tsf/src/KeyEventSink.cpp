@@ -7,6 +7,12 @@
 #include <cctype>
 #include <cstdio>  // for swprintf
 
+// CtrlSpacePolicy.h 不含 Win32 头、自带一份修饰位与 VK 常量（好让 g++ 单测），这里钉住两边一致。
+static_assert(wind::ctrlspace::kModShift == KEYMOD_SHIFT, "CtrlSpacePolicy kModShift != KEYMOD_SHIFT");
+static_assert(wind::ctrlspace::kModCtrl == KEYMOD_CTRL, "CtrlSpacePolicy kModCtrl != KEYMOD_CTRL");
+static_assert(wind::ctrlspace::kModAlt == KEYMOD_ALT, "CtrlSpacePolicy kModAlt != KEYMOD_ALT");
+static_assert(wind::ctrlspace::kVkSpace == VK_SPACE, "CtrlSpacePolicy kVkSpace != VK_SPACE");
+
 namespace
 {
     // 纯修饰键：唯一职责就是修饰别的按键，自身按下/抬起对宿主没有独立语义。
@@ -653,7 +659,11 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     //      判据的隐含前提是「Space 会经过 keystroke sink」，而 WebView 类宿主
     //      （实测 DBX/msedgewebview2）根本不递 Space，标记永远打不上。
     // 值语义之后这两个问题都不存在了：值本身就是答案，无需知道是谁写的。
-    if (wParam == VK_SPACE && (modifiers & KEYMOD_CTRL) && !(modifiers & (KEYMOD_ALT | KEYMOD_SHIFT)))
+    //
+    // GH#172：用户可关（`keys.ctrl_space_toggle`）。关闭时这里不吃，键落到下方常规流程
+    // （无会话时原样交给宿主，IDEA / Android Studio 的代码提示才按得出来）；凭据不置位，
+    // OnKeyDown 的兜底切换也就不会发生。系统热键那条路由服务端拒绝翻转，见 CtrlSpacePolicy.h。
+    if (wind::ctrlspace::ShouldInterceptCtrlSpace(_ctrlSpaceToggleEnabled.load(), (uint32_t)wParam, modifiers))
     {
         _CancelPendingToggle(wParam, L"ctrl_space_intercept");
         // 留下凭据：若 TSF 紧接着仍调用 OnKeyDown，说明 msctf 没把这个键当系统热键，
@@ -1237,8 +1247,12 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // OnTestKeyDown 返回 pfEaten=TRUE 之后才被调用，吃下该键就意味着 msctf 不会再拿它当
     // 热键。_ctrlSpaceEatenInTest 就是这份独占凭据，同时也兑现了吃键集不变量（test 吃了，
     // down 就必须干活）——此前 test 吃下、down 却 passthrough，键既没切换也没落进宿主。
-    if (_ctrlSpaceEatenInTest && wParam == VK_SPACE
-        && (modifiers & KEYMOD_CTRL) && !(modifiers & (KEYMOD_ALT | KEYMOD_SHIFT)))
+    //
+    // ⚠ 这里**不再**看 _ctrlSpaceToggleEnabled（GH#172 审查）：开关在 test 阶段已判过，凭据
+    // 本身就是「test 时开关开着且吃下了」的证明。若开关恰在 test 与 down 之间推到，再判一次
+    // 只会造成「吃了不办」，并留下过期的 TRUE 凭据。
+    if (_ctrlSpaceEatenInTest
+        && wind::ctrlspace::IsCtrlSpaceChord((uint32_t)wParam, modifiers))
     {
         *pfEaten = TRUE;
         // 长按 auto-repeat：吃掉但不切换。判据与上方 toggle_mode_key 分支同源
@@ -2945,6 +2959,13 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         uint16_t secs = *reinterpret_cast<const uint16_t*>(value.data());
         _pairStateTtlMs = (ULONGLONG)secs * 1000ULL;
         WIND_LOG_INFO_FMT(L"Pair state TTL updated: %d s\n", (int)secs);
+    }
+    else if (key == CONFIG_KEY_CTRL_SPACE_TOGGLE)
+    {
+        // 格式：enabled(u8)（对齐 Rust encode_ctrl_space_toggle_value）。GH#172。
+        const bool enabled = wind::ctrlspace::DecodeToggleValue(value.data(), value.size(), _ctrlSpaceToggleEnabled.load());
+        _ctrlSpaceToggleEnabled.store(enabled);
+        WIND_LOG_INFO_FMT(L"Ctrl+Space toggle updated: enabled=%d\n", enabled ? 1 : 0);
     }
     else if (key == CONFIG_KEY_PASSWORD_SUPPRESS)
     {

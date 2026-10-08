@@ -2974,6 +2974,20 @@ impl MessageHandler for Coordinator {
         source: wind_ipc::protocol::ModeSwitchSource,
         ctrl_held: bool,
     ) -> (Option<StatusUpdateData>, String) {
+        // GH#172：用户关掉了 Ctrl+空格 切换（`keys.ctrl_space_toggle` 或自定义按键里绑 none），
+        // 而这次翻转是用户按出来的（系统输入法开关热键 / 按键侧兜底）⇒ 拒绝，回包仍是当前
+        // 模式，DLL 据此把 compartment 拉回。与下面 ignore_host_ime_close 同一条仲裁回路，
+        // 「必须再异步推一次状态」的理由也相同（见那里的 ★★★）。判据见 `ctrl_space` 模块。
+        if self.ctrl_space_switch_rejected(chinese_mode, source, ctrl_held) {
+            tracing::debug!(
+                "system_mode_switch: source={} ctrl_held={} 请求 {}，Ctrl+空格 切换已关闭，拒绝",
+                source.as_str(),
+                ctrl_held,
+                if chinese_mode { "中" } else { "英" }
+            );
+            self.push_state_update();
+            return (Some(self.build_status()), String::new());
+        }
         // per-app「忽略宿主关闭输入法」：拒绝后**不改模式**，回包仍是当前模式。DLL 侧
         // `_ApplyModeSwitch` 见到 `newChineseMode != requestedMode` 会把 compartment 拉回
         // 真实模式——这条仲裁回路早就存在（密码框强制英文用的就是它），不必新开通道。

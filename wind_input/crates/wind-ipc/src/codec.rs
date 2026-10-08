@@ -1768,6 +1768,12 @@ pub fn encode_pair_state_ttl_value(secs: u32) -> Vec<u8> {
     (secs.min(u16::MAX as u32) as u16).to_le_bytes().to_vec()
 }
 
+/// 编码 Ctrl+空格 切换开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_CTRL_SPACE_TOGGLE）。
+/// 格式：enabled(u8)。GH#172。
+pub fn encode_ctrl_space_toggle_value(enabled: bool) -> Vec<u8> {
+    vec![enabled as u8]
+}
+
 /// 编码「英半列有自定义映射的源字符集合」（对齐 TSF `OnSyncConfig` CONFIG_KEY_CUSTOM_EN_PUNCT）。
 ///
 /// 格式：count(u8) + [ch:u16(LE)]...  源字符均为 ASCII 标点，一个 UTF-16 单元足够。
