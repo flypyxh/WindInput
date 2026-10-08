@@ -805,7 +805,10 @@ public:
         {
             // 4. Apply display attribute to show underline
             // Skip for placeholder text to avoid any visual artifacts
-            if (!isPlaceholder)
+            // 服务端自己发来的占位（非嵌入模式的编码替身、联想态等，文本恰为占位字符）同样不加
+            // 下划线属性：有宽度的盲文空白（U+2800）被加上组合下划线后，在钉钉表格里会显示成
+            // 一小段「_」（GH#175 实测）。
+            if (!isPlaceholder && !wind::placeholder::IsPlaceholderText(_text))
                 _SetDisplayAttribute(ec, pRange);
 
             // 5. Position cursor within composition

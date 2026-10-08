@@ -3366,8 +3366,8 @@ mod layering_tests {
         ] {
             assert_eq!(
                 placeholder(process, class),
-                PlaceholderChar::Zwsp,
-                "{process} + {class} 出厂应为 zwsp"
+                PlaceholderChar::Blank,
+                "{process} + {class} 出厂应为 blank"
             );
         }
         // 进程规则（Code.exe 的 composition_start_pair_guard）与类名规则逐字段叠加，两者都在。

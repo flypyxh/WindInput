@@ -244,21 +244,24 @@ first_show_mode = "wait"
 # GH#175：按顶层窗口类名认浏览器内核，而不是逐个列进程名（Edge / Chrome / 各家套壳浏览器的
 # 进程名数不完）。⚠ Chrome_WidgetWin_* 是整个 Chromium 家族的窗口类，**所有 Electron / CEF 应用
 # 一并命中**：VS Code（Code.exe）、飞书、QQ NT、新版微信等。它们的网页输入框同样可能 trim；
-# 上面给 Code.exe / Feishu.exe / QQ.exe 写的进程规则不含本字段，逐字段叠加后照样继承 zwsp。
-# 某个应用改用零宽空格后出了问题（光标位置不对等），在用户层给它写
+# 上面给 Code.exe / Feishu.exe / QQ.exe 写的进程规则不含本字段，逐字段叠加后照样继承 blank。
+# 用 blank（U+2800 盲文空白）而不是 zwsp：钉钉在线表格选中单元格直接打字时靠「出现了内容」进入
+# 编辑态，零宽字符被当成没有内容、候选窗停在左上角代理输入框；blank 有宽度又不会被 trim（实测
+# 番茄小说搜索框与钉钉表格都正常）。
+# 某个应用改用盲文空白后出了问题（光标位置不对等），在用户层给它写
 #   [[apps]]
 #   process = "Xxx.exe"
 #   composition_placeholder = "space"
 # 进程规则比仅类名规则更具体，写了的字段压过它。
 [[apps]]
 class = "Chrome_WidgetWin_*"
-comment = "Chromium 内核（Edge / Chrome / Electron 应用）- 网页受控输入框会 trim 组合中的 value 再回写，占位空格被削掉即终止组合、一个字都上不了屏（GH#175，番茄小说搜索框）；改用零宽空格占位"
-composition_placeholder = "zwsp"
+comment = "Chromium 内核（Edge / Chrome / Electron 应用）- 网页受控输入框会 trim 组合中的 value 再回写，占位空格被削掉即终止组合、一个字都上不了屏（GH#175，番茄小说搜索框）；改用盲文空白占位（零宽空格会让钉钉表格进不了编辑态）"
+composition_placeholder = "blank"
 
 [[apps]]
 class = "MozillaWindowClass"
 comment = "Firefox 内核 - 同上（GH#175）"
-composition_placeholder = "zwsp"
+composition_placeholder = "blank"
 
 # 示例：给「fast 判据失灵」的宿主退回 wait（本字段不写即跟随全局默认，无需逐个开启）
 # [[apps]]
