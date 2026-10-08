@@ -22,7 +22,14 @@
 //!    都不能被悄悄删掉（新版本写下的内容被旧版本读写时尤其如此）。读不进来的内容
 //!    （[`Raw::skipped`]）则由写入路径当作「文件已损坏」处理，先留 `.bad`。
 //!
-//! 设计见 `docs/design/compat-settings-ui.md` 第 11 节。
+//! # 规则身份
+//!
+//! 跨层认「同一条」的键是 [`RuleId`]：`(process 或 "*", class 模式, title 模式)`。`[[apps]]` 可以
+//! 只写窗口条件（不写 process = `"*"`）；三者全空的行作废。附属两段（`[[initial_mode_scope]]` /
+//! `[[commit_newline]]`）没有窗口条件，身份仍只是进程名，写了 `class` / `title` 当未知键保留。
+//! 旧文件没有 class / title 时，身份就退化成进程名，行为与引入窗口条件之前逐字节相同。
+//!
+//! 设计见 `docs/design/compat-settings-ui.md` 第 11 节、`docs/design/compat-window-match.md`。
 
 use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
 use serde::Serialize;
@@ -33,9 +40,159 @@ use std::collections::BTreeSet;
 /// 一条规则的原始键值。
 pub(crate) type Obj = Map<String, Value>;
 
-/// 不属于「兼容取值」的键：`process` 是主键，`comment` 只是文档，`disabled` 与 `unset`
-/// 是叠加语法本身。它们不进 `overridden`，也不允许被补丁 / 还原当成普通字段触碰。
-pub(crate) const META_KEYS: [&str; 4] = ["process", "comment", "disabled", "unset"];
+/// 不属于「兼容取值」的键：`process` / `class` / `title` 是规则身份，`comment` 只是文档，
+/// `disabled` 与 `unset` 是叠加语法本身。它们不进 `overridden`，也不允许被补丁 / 还原当成普通字段触碰。
+/// 顺序即写回文件时的键序。
+pub(crate) const META_KEYS: [&str; 6] =
+    ["process", "class", "title", "comment", "disabled", "unset"];
+
+/// 规则身份里的窗口条件键。只有 `[[apps]]` 认它们（见 [`has_window_conditions`]）。
+const WINDOW_KEYS: [&str; 2] = ["class", "title"];
+
+/// 该段的规则能否带窗口条件：只有 `[[apps]]`。
+fn has_window_conditions(section: &str) -> bool {
+    section == "apps"
+}
+
+/// `k` 在该段是不是元键。`class` / `title` 只在 `[[apps]]` 是元键，在附属两段是普通的未知键
+/// （原样保留、列进 `unknown_keys`）。
+pub(crate) fn is_meta_key(section: &str, k: &str) -> bool {
+    if WINDOW_KEYS.contains(&k) {
+        has_window_conditions(section)
+    } else {
+        META_KEYS.contains(&k)
+    }
+}
+
+/// 「所有进程」。`[[apps]]` 不写 process 等同于写它。
+pub const ANY_PROCESS: &str = "*";
+
+/// 规则身份：跨层认「同一条」的键 `(process 或 "*", class 模式, title 模式)`。
+///
+/// 三项都已规范化：trim；进程名按 ASCII 转小写（与运行时进程名查表一致），模式按
+/// [`fold_char`] 逐字符转小写（与 [`wildcard_match`] 一致）。没有窗口条件时 `class` / `title` 为空串。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub struct RuleId {
+    pub process: String,
+    pub class: String,
+    pub title: String,
+}
+
+impl RuleId {
+    /// 纯进程键（右键菜单、按进程名的管理接口用）。不把空名映射成 `"*"`：调用方拿不到进程名
+    /// 时不能误改到通配规则头上。
+    pub fn process_only(process: &str) -> Self {
+        RuleId {
+            process: process.trim().to_ascii_lowercase(),
+            ..Default::default()
+        }
+    }
+
+    /// 是否不限进程（`process = "*"` 或没写）。
+    pub fn is_any_process(&self) -> bool {
+        self.process == ANY_PROCESS
+    }
+
+    /// 是否带窗口条件（类名或标题）。
+    pub fn has_window_condition(&self) -> bool {
+        !self.class.is_empty() || !self.title.is_empty()
+    }
+
+    /// 合成顺序键，升序叠加（后叠的赢）。设计稿「叠加顺序」：
+    /// T0 仅 `*` < T1 仅窗口条件 < T2 仅进程名 < T3 进程名 + 窗口条件；T1 / T3 内部
+    /// 仅类名 < 仅标题 < 类名 + 标题；同级再按模式里的非通配字符数升序。
+    /// 一样的再按层与行序——那由调用方的稳定排序保证。
+    pub(crate) fn compose_order(&self) -> (u8, u8, usize) {
+        let window = match (self.class.is_empty(), self.title.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(0),
+            (true, false) => Some(1),
+            (false, false) => Some(2),
+        };
+        let tier = match (self.is_any_process(), window) {
+            (true, None) => (0, 0),
+            (true, Some(w)) => (1, w),
+            (false, None) => (2, 0),
+            (false, Some(w)) => (3, w),
+        };
+        let literal = |p: &str| p.chars().filter(|c| !matches!(c, '*' | '?')).count();
+        (tier.0, tier.1, literal(&self.class) + literal(&self.title))
+    }
+}
+
+/// 不区分大小写比较用的单字符折叠：转小写后仍是**一个**字符才采用，否则保留原字符
+/// （个别字符小写后是多个码点，按 char 匹配时 `?` 必须仍然只对应它一个）。
+pub(crate) fn fold_char(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) => l,
+        _ => c,
+    }
+}
+
+fn fold_str(s: &str) -> String {
+    s.chars().map(fold_char).collect()
+}
+
+/// 窗口条件的通配匹配：`*` 任意串（含空串）、`?` 恰好一个字符，其余字面比较；整串匹配
+/// （不是前缀或子串），不区分大小写，按 char 而不是按字节。
+///
+/// 空文本的处理不在这里：类名 / 标题拿不到时带该条件的规则一律不命中，由调用方先判。
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().map(fold_char).collect();
+    let t: Vec<char> = text.chars().map(fold_char).collect();
+    let (mut pi, mut ti) = (0, 0);
+    // 最近一个 `*` 的位置，以及它目前吞到文本的哪里（失配时让它多吞一个字符再试）。
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// 一行的规则身份；作废的行返回 `None`。
+///
+/// 作废：身份键类型不对（`process = 1`、`class = ["X"]`……），或三者全空。类型不对时**整条**作废，
+/// 而不是去掉那个条件——去掉窗口条件等于把规则放宽到整个进程，比不生效危险得多。
+/// 附属两段只认 process（必须非空），`class` / `title` 在那里是未知键，不参与身份。
+pub(crate) fn rule_id(section: &str, o: &Obj) -> Option<RuleId> {
+    let text = |k: &str| -> Option<String> {
+        match o.get(k) {
+            None => Some(String::new()),
+            Some(Value::String(s)) => Some(s.trim().to_string()),
+            Some(_) => None,
+        }
+    };
+    let process = text("process")?;
+    if !has_window_conditions(section) {
+        return (!process.is_empty()).then(|| RuleId::process_only(&process));
+    }
+    let (class, title) = (text("class")?, text("title")?);
+    if process.is_empty() && class.is_empty() && title.is_empty() {
+        return None;
+    }
+    Some(RuleId {
+        process: if process.is_empty() {
+            ANY_PROCESS.to_string()
+        } else {
+            process.to_ascii_lowercase()
+        },
+        class: fold_str(&class),
+        title: fold_str(&title),
+    })
+}
 
 /// 三段规则的原始键值，外加原样保留的其它顶层内容。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -64,15 +221,15 @@ fn to_json(v: &toml::Value) -> Value {
     }
 }
 
-/// 同一段里同名进程的多行，按先后顺序叠成一行（后写的赢）。与运行时逐行叠加的结果一致，
-/// 但让后续的编辑与视图只面对「每个进程一行」。
-fn coalesce(rows: Vec<Obj>) -> Vec<Obj> {
+/// 同一段里同身份（[`RuleId`]）的多行，按先后顺序叠成一行（后写的赢）。与运行时逐行叠加的
+/// 结果一致，但让后续的编辑与视图只面对「每个身份一行」。作废的行原样保留（写回时不丢）。
+fn coalesce(section: &str, rows: Vec<Obj>) -> Vec<Obj> {
     let mut out: Vec<Obj> = Vec::new();
     for r in rows {
-        let name = process_of(&r).to_string();
-        let same = (!name.trim().is_empty())
-            .then(|| out.iter().position(|o| same_process(process_of(o), &name)))
-            .flatten();
+        let same = rule_id(section, &r).and_then(|id| {
+            out.iter()
+                .position(|o| rule_id(section, o).as_ref() == Some(&id))
+        });
         match same {
             Some(i) => out[i] = compose(&out[i], &r),
             None => out.push(r),
@@ -119,9 +276,12 @@ pub(crate) fn parse_raw(text: &str) -> Result<Raw, String> {
             }
         }
     }
-    raw.apps = coalesce(std::mem::take(&mut raw.apps));
-    raw.initial_mode_scope = coalesce(std::mem::take(&mut raw.initial_mode_scope));
-    raw.commit_newline = coalesce(std::mem::take(&mut raw.commit_newline));
+    raw.apps = coalesce("apps", std::mem::take(&mut raw.apps));
+    raw.initial_mode_scope = coalesce(
+        "initial_mode_scope",
+        std::mem::take(&mut raw.initial_mode_scope),
+    );
+    raw.commit_newline = coalesce("commit_newline", std::mem::take(&mut raw.commit_newline));
     Ok(raw)
 }
 
@@ -129,13 +289,9 @@ pub(crate) fn process_of(o: &Obj) -> &str {
     o.get("process").and_then(Value::as_str).unwrap_or("")
 }
 
-/// 进程名相等：两边 trim、不区分大小写（与运行时查表一致，运行时在读入时就 trim）。
-pub(crate) fn same_process(a: &str, b: &str) -> bool {
-    a.trim().eq_ignore_ascii_case(b.trim())
-}
-
 /// `unset` 清单：接受字符串数组，也宽容地接受单个字符串（`unset = "first_show_mode"`）。
-/// 不是这两种形态返回 `None`。清单里的非字符串元素丢弃，`process` / `unset` 自身不能被 unset。
+/// 不是这两种形态返回 `None`。清单里的非字符串元素丢弃，身份键（`process` / `class` / `title`）
+/// 与 `unset` 自身不能被 unset。
 fn parse_unset(v: &Value) -> Option<Vec<String>> {
     let list: Vec<String> = match v {
         Value::String(s) => vec![s.clone()],
@@ -148,7 +304,7 @@ fn parse_unset(v: &Value) -> Option<Vec<String>> {
     };
     Some(
         list.into_iter()
-            .filter(|k| !matches!(k.as_str(), "process" | "unset"))
+            .filter(|k| !matches!(k.as_str(), "process" | "class" | "title" | "unset"))
             .collect(),
     )
 }
@@ -163,7 +319,7 @@ fn unset_of(o: &Obj) -> Vec<String> {
 /// 2. `layer` 自己写了的字段覆盖 `base`（同一条里既 `unset` 又写了同名字段 = 写了的赢）；
 /// 3. `unset` 清单向上**累积**（`base` 的并 `layer` 的，再减去 `layer` 自己写了的字段）：
 ///    叠加结果同样是一份「相对更下一层的差异」，更高层还要能读到它。
-/// 4. `process` 保留 `base` 的写法（系统层的大小写），没有才取 `layer` 的。
+/// 4. 身份键（`process` / `class` / `title`）保留 `base` 的写法（系统层的大小写），没有才取 `layer` 的。
 pub(crate) fn compose(base: &Obj, layer: &Obj) -> Obj {
     let mut out = base.clone();
     let layer_unset = unset_of(layer);
@@ -175,8 +331,8 @@ pub(crate) fn compose(base: &Obj, layer: &Obj) -> Obj {
     for (k, v) in layer {
         match k.as_str() {
             "unset" => {}
-            "process" => {
-                out.entry("process").or_insert_with(|| v.clone());
+            "process" | "class" | "title" => {
+                out.entry(k.as_str()).or_insert_with(|| v.clone());
             }
             _ => {
                 out.insert(k.clone(), v.clone());
@@ -195,13 +351,19 @@ pub(crate) fn compose(base: &Obj, layer: &Obj) -> Obj {
     out
 }
 
-/// 把 `layer` 一段整体叠加到 `base` 一段上：同名进程逐字段叠加，其余保持，新进程追加。
-/// 进程名为空（缺失 / 类型写错）的行作废，不套给任何人。
-pub(crate) fn overlay(mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
-    for row in layer.iter().filter(|r| !process_of(r).trim().is_empty()) {
+/// 把 `layer` 一段整体叠加到 `base` 一段上：同身份（[`RuleId`]）逐字段叠加，其余保持，新身份追加。
+/// 作废的行（见 [`rule_id`]）不套给任何人。
+///
+/// 结果的行序 = 各身份**首次出现**的层与行序（更高层叠上来的同身份行留在原位）。窗口合成
+/// （`AppCompat::resolve`）里「同级平手按层」的「层」因此就是该身份首次出现的那一层。
+pub(crate) fn overlay(section: &str, mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
+    for row in layer {
+        let Some(id) = rule_id(section, row) else {
+            continue;
+        };
         match base
             .iter()
-            .position(|b| same_process(process_of(b), process_of(row)))
+            .position(|b| rule_id(section, b).as_ref() == Some(&id))
         {
             Some(i) => base[i] = compose(&base[i], row),
             None => base.push(compose(&Obj::new(), row)),
@@ -213,9 +375,13 @@ pub(crate) fn overlay(mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
 /// 三段一起叠加（只带三段，`extra` / `skipped` 对叠加结果没有意义）。
 pub(crate) fn overlay_raw(base: Raw, layer: &Raw) -> Raw {
     Raw {
-        apps: overlay(base.apps, &layer.apps),
-        initial_mode_scope: overlay(base.initial_mode_scope, &layer.initial_mode_scope),
-        commit_newline: overlay(base.commit_newline, &layer.commit_newline),
+        apps: overlay("apps", base.apps, &layer.apps),
+        initial_mode_scope: overlay(
+            "initial_mode_scope",
+            base.initial_mode_scope,
+            &layer.initial_mode_scope,
+        ),
+        commit_newline: overlay("commit_newline", base.commit_newline, &layer.commit_newline),
         ..Default::default()
     }
 }
@@ -313,11 +479,31 @@ pub(crate) fn sanitize<T: DeserializeOwned>(
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let name = process_of(r).to_string();
+        // 认不出身份的行整条作废（不套给任何人）：报告后不进叠加。
+        if rule_id(section, r).is_none() {
+            report.push(Problem {
+                section: section.to_string(),
+                process: name,
+                key: "process".to_string(),
+                message: if has_window_conditions(section) {
+                    "process / class / title 都没写或类型不对，整条规则作废".to_string()
+                } else {
+                    "process 没写或类型不对，整条规则作废".to_string()
+                },
+            });
+            continue;
+        }
         let mut row = r.clone();
         let keys: Vec<String> = row.keys().cloned().collect();
         for k in keys {
+            if WINDOW_KEYS.contains(&k.as_str()) && !has_window_conditions(section) {
+                tracing::warn!(
+                    "compat.toml: [[{section}]] {name} 不支持窗口条件 {k}，当作未知键保留（不生效）"
+                );
+            }
             let problem = match k.as_str() {
                 "process" | "comment" => None,
+                "class" | "title" if has_window_conditions(section) => None,
                 "disabled" => {
                     (!row[&k].is_boolean()).then(|| format!("disabled = {} 不是布尔值", row[&k]))
                 }
@@ -489,7 +675,7 @@ pub(crate) fn normalize<T: DeserializeOwned + Serialize>(
 
     let has_content = user
         .keys()
-        .any(|k| !matches!(k.as_str(), "process" | "comment"))
+        .any(|k| !matches!(k.as_str(), "process" | "class" | "title" | "comment"))
         || !unset.is_empty();
     if !unset.is_empty() {
         user.insert("unset".into(), unset_array(&unset));
@@ -502,6 +688,8 @@ pub(crate) fn normalize<T: DeserializeOwned + Serialize>(
 
 /// 把一批字段编辑应用到用户层某一段：找到（或新建）该进程的差异行，逐项编辑，规范化，
 /// 落回（没内容就删掉这一行）。`sys_rows` 是**已叠加好的系统层**该段。
+///
+/// 按**纯进程键**（[`RuleId::process_only`]）认「同一条」：同进程带窗口条件的规则是另一条，不受影响。
 pub(crate) fn apply_edits<T: DeserializeOwned + Serialize>(
     section: &str,
     sys_rows: &[Obj],
@@ -511,12 +699,9 @@ pub(crate) fn apply_edits<T: DeserializeOwned + Serialize>(
     system_known: bool,
 ) {
     let process = process.trim();
-    let sys = sys_rows
-        .iter()
-        .find(|r| same_process(process_of(r), process));
-    let idx = user_rows
-        .iter()
-        .position(|r| same_process(process_of(r), process));
+    let id = Some(RuleId::process_only(process));
+    let sys = sys_rows.iter().find(|r| rule_id(section, r) == id);
+    let idx = user_rows.iter().position(|r| rule_id(section, r) == id);
     let mut row = match idx {
         Some(i) => user_rows[i].clone(),
         None => {
@@ -571,8 +756,8 @@ pub(crate) fn apply_edits<T: DeserializeOwned + Serialize>(
 /// 原样保留——新版本写下的字段被旧版本读写时不能被悄悄丢掉）。
 fn ordered_keys(section: &str, o: &Obj) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for k in META_KEYS {
-        if o.contains_key(k) {
+    for k in META_KEYS.iter().filter(|k| is_meta_key(section, k)) {
+        if o.contains_key(*k) {
             out.push(k.to_string());
         }
     }
@@ -628,9 +813,9 @@ pub(crate) fn render_raw(header: &str, raw: &Raw) -> Result<String, String> {
         );
     }
     let back = parse_raw(&out).map_err(|e| format!("渲染结果无法重新解析: {e}"))?;
-    if back.apps != coalesce(raw.apps.clone())
-        || back.initial_mode_scope != coalesce(raw.initial_mode_scope.clone())
-        || back.commit_newline != coalesce(raw.commit_newline.clone())
+    if back.apps != coalesce("apps", raw.apps.clone())
+        || back.initial_mode_scope != coalesce("initial_mode_scope", raw.initial_mode_scope.clone())
+        || back.commit_newline != coalesce("commit_newline", raw.commit_newline.clone())
         || back.extra != raw.extra
     {
         return Err("写回后的内容与内存中不一致，已拒绝落盘（防止改坏用户文件）".into());
@@ -713,7 +898,7 @@ mod tests {
             obj(json!({"process": " a.EXE ", "caret_use_top": true})),
             obj(json!({"process": "C.exe", "auto_pair": false})),
         ];
-        let out = overlay(base, &layer);
+        let out = overlay("apps", base, &layer);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0]["auto_pair"], json!(true));
         assert_eq!(out[0]["caret_use_top"], json!(true));
@@ -727,7 +912,7 @@ mod tests {
             obj(json!({"process": 1})),
             obj(json!({"process": "  "})),
         ];
-        assert!(overlay(Vec::new(), &layer).is_empty());
+        assert!(overlay("apps", Vec::new(), &layer).is_empty());
     }
 
     #[test]
@@ -1069,5 +1254,244 @@ mod tests {
         );
         assert_eq!(report.len(), 3, "{report:?}");
         assert_eq!(rows[0]["first_show_mode"], json!("wiat"), "原始行不被改动");
+    }
+}
+
+/// 窗口条件（`class` / `title`）：通配匹配器、规则身份、按身份叠加（设计见
+/// `docs/design/compat-window-match.md`）。
+#[cfg(test)]
+mod window_match_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn obj(v: Value) -> Obj {
+        v.as_object().cloned().expect("测试夹具必须是对象")
+    }
+
+    #[test]
+    fn wildcard_star_and_question_mark_boundaries() {
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "a"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("**", "x"));
+        assert!(!wildcard_match("?", ""));
+        assert!(wildcard_match("?", "a"));
+        assert!(!wildcard_match("?", "ab"));
+        assert!(wildcard_match("a?c", "abc"));
+        assert!(!wildcard_match("a?c", "ac"));
+        assert!(wildcard_match("Chrome_WidgetWin_*", "Chrome_WidgetWin_1"));
+        assert!(wildcard_match("Chrome_WidgetWin_*", "Chrome_WidgetWin_"));
+        assert!(!wildcard_match("Chrome_WidgetWin_*", "Chrome_WidgetWin"));
+        assert!(
+            !wildcard_match("abc", "abcd"),
+            "无通配时是整串匹配，不是前缀"
+        );
+        assert!(!wildcard_match("bcd", "abcd"), "也不是子串");
+        assert!(wildcard_match("*b*", "abc"));
+        assert!(wildcard_match("*a*b", "xaybzab"), "需要回溯");
+        assert!(!wildcard_match("*a*b", "xaybzac"));
+        assert!(wildcard_match("a*b*c", "a-b-b-c"));
+        assert!(wildcard_match("*?", "x"));
+        assert!(!wildcard_match("*??", "x"));
+        assert!(wildcard_match("a*", "a"));
+        assert!(!wildcard_match("a*", "ba"));
+    }
+
+    #[test]
+    fn wildcard_is_case_insensitive_and_unicode_aware_per_char() {
+        assert!(wildcard_match("CHROME_widgetwin_*", "chrome_WidgetWin_0"));
+        assert!(
+            wildcard_match("ÉDITEUR", "éditeur"),
+            "非 ASCII 也不区分大小写"
+        );
+        assert!(
+            wildcard_match("?", "中"),
+            "? 匹配一个字符（按 char，不是按字节）"
+        );
+        assert!(wildcard_match("新建?本文档*", "新建文本文档 - 记事本"));
+        assert!(!wildcard_match("??", "中"));
+        assert!(wildcard_match("*记事本", "无标题 - 记事本"));
+    }
+
+    #[test]
+    fn rule_id_defaults_process_to_any_trims_and_folds_case() {
+        let id = rule_id("apps", &obj(json!({"class": " Chrome_WidgetWin_* "}))).unwrap();
+        assert_eq!(id.process, "*", "不写 process = 所有进程");
+        assert_eq!(id.class, "chrome_widgetwin_*");
+        assert_eq!(id.title, "");
+        assert!(id.has_window_condition());
+
+        let a = rule_id(
+            "apps",
+            &obj(json!({"process": " AutoHotkey.EXE ", "title": "Foo"})),
+        );
+        let b = rule_id(
+            "apps",
+            &obj(json!({"process": "autohotkey.exe", "title": " foo "})),
+        );
+        assert_eq!(a, b, "身份 trim + 不区分大小写");
+        assert_ne!(
+            a,
+            rule_id("apps", &obj(json!({"process": "autohotkey.exe"}))),
+            "带窗口条件的与纯进程规则不是同一条"
+        );
+        let star = rule_id("apps", &obj(json!({"process": "*"}))).unwrap();
+        assert_eq!(
+            star,
+            rule_id("apps", &obj(json!({"process": "*", "class": " "}))).unwrap()
+        );
+        assert!(!star.has_window_condition());
+    }
+
+    #[test]
+    fn rule_id_voids_rows_without_any_condition_or_with_wrong_types() {
+        for bad in [
+            json!({"auto_pair": true}),
+            json!({"process": "  ", "class": "", "title": " "}),
+            json!({"process": 1}),
+            json!({"process": "a.exe", "class": 1}),
+            json!({"class": ["X"]}),
+            json!({"process": "a.exe", "title": true}),
+        ] {
+            assert_eq!(rule_id("apps", &obj(bad.clone())), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn side_sections_have_no_window_conditions() {
+        let id = rule_id(
+            "initial_mode_scope",
+            &obj(json!({"process": "Explorer.exe", "class": "X", "title": 1})),
+        )
+        .unwrap();
+        assert_eq!(
+            id,
+            RuleId::process_only("explorer.exe"),
+            "class / title 在附属段是未知键"
+        );
+        assert_eq!(rule_id("commit_newline", &obj(json!({"class": "X"}))), None);
+    }
+
+    #[test]
+    fn overlay_and_coalesce_use_the_rule_identity() {
+        let base = vec![
+            obj(json!({"process": "AutoHotkey.exe", "auto_pair": true})),
+            obj(json!({"process": "AutoHotkey.exe", "title": "Foo*", "initial_mode": "english"})),
+        ];
+        let layer = vec![
+            obj(json!({"process": "autohotkey.exe", "title": "FOO*", "caret_use_top": true})),
+            obj(json!({"class": "Chrome_WidgetWin_*", "composition_placeholder": "zwsp"})),
+        ];
+        let out = overlay("apps", base, &layer);
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(
+            out[0].get("caret_use_top"),
+            None,
+            "纯进程那条不受窗口规则影响"
+        );
+        assert_eq!(out[1]["initial_mode"], json!("english"));
+        assert_eq!(out[1]["caret_use_top"], json!(true), "同身份逐字段叠加");
+        assert_eq!(out[1]["title"], json!("Foo*"), "保留底层的写法");
+        assert_eq!(out[2]["class"], json!("Chrome_WidgetWin_*"));
+
+        let raw = parse_raw(
+            "[[apps]]\nprocess = \"a.exe\"\nclass = \"X\"\nauto_pair = true\n\n[[apps]]\nprocess = \"a.exe\"\nauto_pair = false\n\n[[apps]]\nprocess = \"A.EXE\"\nclass = \" x \"\ncaret_use_top = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            raw.apps.len(),
+            2,
+            "同一段里同身份的多行合成一行: {:?}",
+            raw.apps
+        );
+        assert_eq!(raw.apps[0]["auto_pair"], json!(true));
+        assert_eq!(raw.apps[0]["caret_use_top"], json!(true));
+    }
+
+    #[test]
+    fn class_and_title_cannot_be_unset() {
+        let base = obj(json!({"process": "a.exe", "class": "X", "auto_pair": true}));
+        let layer = obj(
+            json!({"process": "a.exe", "class": "X", "unset": ["class", "title", "auto_pair"]}),
+        );
+        let out = compose(&base, &layer);
+        assert_eq!(out["class"], json!("X"));
+        assert_eq!(out["unset"], json!(["auto_pair"]));
+    }
+
+    #[test]
+    fn sanitize_reports_and_drops_rows_without_a_usable_identity() {
+        use crate::app_compat::AppCompatRule;
+        let rows = vec![
+            obj(json!({"auto_pair": true})),
+            obj(json!({"process": "a.exe", "class": 1, "auto_pair": true})),
+            obj(json!({"class": "X", "auto_pair": true})),
+        ];
+        let (clean, report) = sanitize::<AppCompatRule>("apps", &rows);
+        assert_eq!(
+            clean.len(),
+            1,
+            "类型错的窗口条件整条作废，而不是去掉条件后放宽成整个进程: {clean:?}"
+        );
+        assert_eq!(clean[0]["class"], json!("X"));
+        assert_eq!(report.len(), 2, "{report:?}");
+    }
+
+    #[test]
+    fn side_sections_keep_class_as_an_unknown_key() {
+        use crate::app_compat::InitialModeScopeRule;
+        let rows = vec![obj(
+            json!({"process": "explorer.exe", "classes": ["A"], "class": "X"}),
+        )];
+        let (clean, report) = sanitize::<InitialModeScopeRule>("initial_mode_scope", &rows);
+        assert!(report.is_empty(), "{report:?}");
+        assert_eq!(clean[0]["class"], json!("X"), "当未知键原样保留");
+        assert!(!is_meta_key("initial_mode_scope", "class"));
+        assert!(is_meta_key("apps", "class") && is_meta_key("apps", "title"));
+    }
+
+    #[test]
+    fn apply_edits_by_process_never_touches_a_window_rule() {
+        use crate::app_compat::AppCompatRule;
+        let sys = vec![obj(
+            json!({"process": "a.exe", "class": "X", "caret_use_top": true}),
+        )];
+        let mut user = vec![obj(
+            json!({"process": "a.exe", "class": "X", "auto_pair": true}),
+        )];
+        apply_edits::<AppCompatRule>(
+            "apps",
+            &sys,
+            &mut user,
+            "A.exe",
+            &[FieldEdit::Set("caret_use_top".into(), json!(true))],
+            true,
+        );
+        assert_eq!(user.len(), 2, "纯进程键新建一行: {user:?}");
+        assert_eq!(user[0]["auto_pair"], json!(true));
+        assert_eq!(
+            user[1]["caret_use_top"],
+            json!(true),
+            "系统那条带窗口条件，不能把它当成同一条判冗余"
+        );
+        assert!(user[1].get("class").is_none());
+    }
+
+    #[test]
+    fn render_puts_window_conditions_right_after_process_and_roundtrips() {
+        let raw = Raw {
+            apps: vec![obj(json!({
+                "auto_pair": true, "title": "Foo*", "comment": "c", "class": "X", "process": "a.exe"
+            }))],
+            ..Default::default()
+        };
+        let text = render_raw("", &raw).unwrap();
+        let at = |k: &str| text.find(&format!("{k} =")).unwrap();
+        assert!(
+            at("process") < at("class") && at("class") < at("title") && at("title") < at("comment"),
+            "{text}"
+        );
+        assert_eq!(parse_raw(&text).unwrap().apps, raw.apps);
     }
 }

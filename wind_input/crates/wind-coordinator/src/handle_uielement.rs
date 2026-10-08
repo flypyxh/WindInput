@@ -40,13 +40,6 @@ use wind_ipc::protocol::{
     UIELEMENT_ACTION_SET_SELECTION, UiElementPage,
 };
 
-/// compat 里表示「所有应用」的进程名，目前只被 `host_drawn_candidates` 的回落查表认。
-///
-/// ⛔ 刻意**不**做成 `AppCompat::get_rule` 的通用通配：那会让 `process = "*"` 的一条规则
-/// 把全部字段（初始中英、首显档、定位方式……）一次性套到每个应用头上，是个比本次要解决
-/// 的问题大得多的语义变更。这里只给「推断收窗」这一条判据留一个全局关闭口。
-pub(crate) const HOST_DRAWN_WILDCARD: &str = "*";
-
 impl Coordinator {
     /// 消费一次 DLL 的 `CMD_UIELEMENT_STATE`：**两张账一起写完，再统一刷一次 UI**。
     ///
@@ -210,9 +203,9 @@ impl Coordinator {
     /// 反转成 opt-in 之后，查错 pid 的代价从「彻底不能用」降成「多一个框」，但规则该生效
     /// 而不生效仍是 bug，判据不变。）
     ///
-    /// 覆盖查两层：先查本进程名，再回落到通配规则 `process = "*"`。通配那层保留下来是给
-    /// 反方向用的——某类宿主普遍需要收窗时可一行开到全局；opt-in 之后它不再是「故障半径
-    /// 的配套」，因为默认已经不会出现「所有应用候选框都没了」。
+    /// `process = "*"` 通配规则由 `AppCompat::get_rule` 统一合成（本进程规则逐字段叠在通配之上；
+    /// 查不到进程名时 `get_rule` 不吃通配，这里显式取通配那条）。通配是给反方向用的——某类宿主普遍需要收窗时可一行开到
+    /// 全局；opt-in 之后它不再是「故障半径的配套」，因为默认已经不会出现「所有应用候选框都没了」。
     ///
     /// 查不到进程名时按默认（**不**收窗）走：查不到名字就等于查不到规则，而 opt-in 的前提
     /// 是「有人明确说过这个宿主要收」——查不出是谁，就谈不上它被指名过。
@@ -222,17 +215,16 @@ impl Coordinator {
         };
         let name = self.cached_proc_name((pid as u64) << 32);
         let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-        let by_process = if name.is_empty() {
-            None
+        // `get_rule("")` 不吃通配（空名口径）；本判据历来对无名进程也认通配
+        // （`an_unnamed_process_still_honours_the_wildcard_rule`），故显式取通配那条。
+        let key = if name.is_empty() {
+            wind_config::app_compat::ANY_PROCESS
         } else {
-            table.get_rule(&name).and_then(|r| r.host_drawn_candidates)
+            name.as_str()
         };
-        by_process
-            .or_else(|| {
-                table
-                    .get_rule(HOST_DRAWN_WILDCARD)
-                    .and_then(|r| r.host_drawn_candidates)
-            })
+        table
+            .get_rule(key)
+            .and_then(|r| r.host_drawn_candidates)
             // ★★★ 没有规则 ⇒ **不**据此收窗（2026-09-15 反转，原为 `unwrap_or(true)`）。
             //
             // 「读走候选串 ⇒ 它在画」这条推断立案时自陈「至今没有反证样本」——那份日志里
@@ -1181,7 +1173,7 @@ mod tests {
         compat_rule(
             &c,
             wind_config::app_compat::AppCompatRule {
-                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                process: wind_config::app_compat::ANY_PROCESS.into(),
                 host_drawn_candidates: Some(true),
                 ..Default::default()
             },
@@ -1196,7 +1188,7 @@ mod tests {
         // 本进程自己的规则优先于通配：通配开、本进程显式关 ⇒ 照弹我们的窗。
         *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(vec![
             wind_config::app_compat::AppCompatRule {
-                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                process: wind_config::app_compat::ANY_PROCESS.into(),
                 host_drawn_candidates: Some(true),
                 ..Default::default()
             },
@@ -1225,7 +1217,7 @@ mod tests {
         compat_rule(
             &c,
             wind_config::app_compat::AppCompatRule {
-                process: crate::handle_uielement::HOST_DRAWN_WILDCARD.into(),
+                process: wind_config::app_compat::ANY_PROCESS.into(),
                 host_drawn_candidates: Some(true),
                 ..Default::default()
             },

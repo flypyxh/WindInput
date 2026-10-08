@@ -5,13 +5,18 @@
 //! 系统预置（`{data_dir}/compat.toml`）→ 定制版（`data_custom/compat.toml`）→
 //! 用户覆盖（`{user_config_dir}/compat.toml`）。
 //!
-//! **整体原则：每一层都是相对下一层的差异，逐字段叠加**（同名进程内：写了的字段覆盖、没写的继承、
+//! **整体原则：每一层都是相对下一层的差异，逐字段叠加**（同一条规则内：写了的字段覆盖、没写的继承、
 //! `unset` 取消、`disabled` 禁用）。没有「同名整条替换」，也没有哪个字段享有特殊的继承待遇——
 //! 叠加引擎与全部语义见 [`crate::compat_overlay`]，本模块负责把叠加结果变成运行时结构体。
+//!
+//! `[[apps]]` 可带窗口条件（`class` 顶层窗口类名 / `title` 顶层窗口标题，`*` `?` 通配）。
+//! 跨层叠完之后，一个焦点窗口可能命中多条规则：按具体程度**分级合成**（[`AppCompat::resolve`]），
+//! 设计见 `docs/design/compat-window-match.md`。
 
+pub use crate::compat_overlay::{ANY_PROCESS, RuleId, wildcard_match};
 use crate::compat_overlay::{
-    FieldEdit, Raw, apply_edits, is_disabled, materialize, overlay_raw, parse_raw, process_of,
-    render_raw, same_process, sanitize,
+    FieldEdit, Obj, Raw, apply_edits, compose, is_disabled, materialize, overlay_raw, parse_raw,
+    render_raw, rule_id, sanitize,
 };
 use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
@@ -33,11 +38,17 @@ pub(crate) const USER_COMPAT_HEADER: &str = "\
 # ⚠ 本文件由输入法（右键菜单 / 设置页）自动管理，每次改动都会整份重写，
 #   手写的注释与排版不会保留。需要长期留存的说明请写在系统层 compat.toml。
 #
-# 叠加语义：每条规则只记与系统层不同的字段，逐字段叠加在同名进程的系统规则之上：
+# 叠加语义：每条规则只记与系统层不同的字段，逐字段叠加在同一条系统规则之上：
 #   - 写了的字段覆盖系统值，没写的字段继承系统值；
 #   - unset = [\"字段名\", …] 取消系统设定的字段（回到「跟随全局」）；
 #   - 显式写 false 可以关掉系统打开的开关；
 #   - disabled = true 禁用整条系统规则。
+# 「同一条」= process（不写即 \"*\"，所有进程）+ class（顶层窗口类名）+ title（顶层窗口标题）
+#   三者都相同；class / title 支持 * ? 通配、不区分大小写。
+# 一个窗口命中多条时按具体程度叠加，越具体越后叠（后叠的赢）：
+#   \"*\" < 仅窗口条件 < 仅进程名 < 进程名 + 窗口条件。
+#   更具体那条里的 unset 也取消 \"*\" 等更低级规则设下的同名字段（回到「跟随全局」）。
+# 带 class / title 的规则设置页暂不显示，只能在本文件手写；设置页的改动不会碰它们。
 # 字段说明见系统层 data/compat.toml 顶部注释。
 
 ";
@@ -1049,7 +1060,7 @@ pub struct AppCompatRule {
     /// ⚠ `Some(false)` 与 `None` **不同义**，别按「反正默认也是否」来理解：
     /// ① 用户层不写 = 继承出厂同名规则（出厂已有 `MapleStory.exe = true`），显式写 `false`
     ///    才挡得住；
-    /// ② 查表时 `Some(false)` 会短路掉 `process = "*"` 通配的 `or_else` 回落，`None` 不会
+    /// ② 本进程规则逐字段叠在 `process = "*"` 通配之上：写了 `false` 压过通配，不写则继承通配
     ///    （`a_wildcard_rule_applies_everywhere_and_a_process_rule_wins` 正是靠这点成立）。
     ///
     /// 「宿主接管候选绘制」有两条来源，语气不同，本字段只管后面那条：
@@ -1079,8 +1090,8 @@ pub struct AppCompatRule {
     /// 仍用 `Option<bool>` 而不是裸 `bool`：要区分「没写」与「显式写了 false」，
     /// 且 `#[serde(default)]` 下的裸 bool 会让用户层规则覆盖掉出厂值（理由同 `initial_mode`）。
     ///
-    /// 规则查两层：本进程名一条，以及 `process = "*"` 的通配一条（通配现在的用途是反方向
-    /// ——某类宿主普遍需要收窗时一行开到全局）。查表见
+    /// `process = "*"` 的通配与其它字段一样参与统一合成（[`AppCompat::get_rule`]），用途是反方向
+    /// ——某类宿主普遍需要收窗时一行开到全局。查表见
     /// `Coordinator::uielement_host_draws_by_inference`。
     #[serde(
         default,
@@ -1090,8 +1101,8 @@ pub struct AppCompatRule {
     pub host_drawn_candidates: Option<bool>,
     /// 组合区占位字符；`None` = 空格（历史行为）。见 [`PlaceholderChar`]（GH#175）。
     ///
-    /// 查表请走 [`AppCompat::composition_placeholder_for`]：它负责 `process = "*"` 通配的
-    /// 回落，散落各处自己查会漏掉通配。
+    /// 查表请走 [`AppCompat::composition_placeholder_for`]：它负责「进程名未知 ⇒ 空格」这条
+    /// 例外（`process = "*"` 通配已由统一合成处理）。
     #[serde(
         default,
         deserialize_with = "de_composition_placeholder",
@@ -1216,12 +1227,14 @@ pub(crate) fn with_menu_system<R>(system: Raw, known: bool, f: impl FnOnce() -> 
     r
 }
 
-/// 对某进程的 `[[apps]]` 差异行做一批字段编辑。
+/// 对某进程的 `[[apps]]` 差异行做一批字段编辑。只动**纯进程键**那一条（右键菜单没有窗口
+/// 条件的概念），同进程带 class / title 的规则不受影响。
 fn edit_user_apps(
     user_dir: &Path,
     process: &str,
     edits: &[FieldEdit],
 ) -> Result<(), std::io::Error> {
+    let id = Some(RuleId::process_only(process));
     update_user_raw(user_dir, |user, system, known| {
         // 下层（系统 / data_custom）把这个进程的规则禁用了，而用户在菜单里给它选了一个选项：
         // 这是明确的「我要配置它」，不带重新启用的话规则仍是禁用，选项存了却永远不生效。
@@ -1229,11 +1242,11 @@ fn edit_user_apps(
         let lower_disabled = system
             .apps
             .iter()
-            .any(|r| same_process(process_of(r), process) && is_disabled(r));
+            .any(|r| rule_id("apps", r) == id && is_disabled(r));
         let user_decided = user
             .apps
             .iter()
-            .any(|r| same_process(process_of(r), process) && r.contains_key("disabled"));
+            .any(|r| rule_id("apps", r) == id && r.contains_key("disabled"));
         let mut all = edits.to_vec();
         if lower_disabled && !user_decided {
             all.push(FieldEdit::Set(
@@ -1270,16 +1283,13 @@ pub enum RuleSwitch {
     Disabled,
 }
 
-/// 读某进程整条规则的开关状态（系统层 ⊕ 用户层叠加后判定）。
+/// 读某进程整条规则（纯进程键那一条）的开关状态（系统层 ⊕ 用户层叠加后判定）。
 pub fn menu_rule_switch(user_dir: &Path, process: &str) -> RuleSwitch {
     let (system, _) = system_layer_for_menu();
     let user = load_raw(&user_dir.join(COMPAT_FILE_NAME)).unwrap_or_default();
     let merged = overlay_raw(system, &user);
-    match merged
-        .apps
-        .iter()
-        .find(|r| same_process(process_of(r), process))
-    {
+    let id = Some(RuleId::process_only(process));
+    match merged.apps.iter().find(|r| rule_id("apps", r) == id) {
         None => RuleSwitch::NoRule,
         Some(r) if is_disabled(r) => RuleSwitch::Disabled,
         Some(_) => RuleSwitch::Enabled,
@@ -1586,12 +1596,90 @@ pub struct CommitNewlineRule {
     pub style: Option<NewlineStyle>,
 }
 
+/// 焦点窗口上下文：按它解析 `[[apps]]` 规则（[`AppCompat::resolve`]）。
+///
+/// 类名 / 标题拿不到时传空串：带对应条件的规则一律不命中（「不知道是哪个窗口」不能套窗口规则）。
+/// 进程名为空同理：只命中不限进程（`"*"` / 只写窗口条件）的规则。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowCtx<'a> {
+    /// 进程映像名，如 `AutoHotkey.exe`（不区分大小写）。
+    pub process: &'a str,
+    /// 顶层窗口类名。
+    pub class: &'a str,
+    /// 顶层窗口标题。
+    pub title: &'a str,
+}
+
+/// 一次解析的结果。
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedRule {
+    /// 命中的各条规则按级合成后的结果；一条都没命中为 `None`。
+    ///
+    /// `process` 取命中的最具体那条具体进程规则的写法；只命中了不限进程的规则时为 `"*"`。
+    pub rule: Option<AppCompatRule>,
+    /// 命中的**带窗口条件**的规则身份，按合成顺序。只命中纯进程 / `"*"` 规则时为空。
+    ///
+    /// 留给协调器判断「命中的窗口规则变了没有」：进入类字段（initial_mode 等）只在 pid 变了、
+    /// 或这个集合变了时才重算，仅标题变化不重算（设计稿「服务端判定」）。
+    pub window_matches: Vec<RuleId>,
+}
+
+/// 参与合成的一条 `[[apps]]` 规则（已跨层叠好、启用、单独反序列化过）。
+#[derive(Debug, Clone)]
+struct Candidate {
+    id: RuleId,
+    /// 原始键值，已去掉身份键（`process` / `class` / `title`），保留 `unset`。
+    fields: Obj,
+    /// 进程名原始写法（trim 后），合成结果的 `process` 取它。
+    process: String,
+}
+
+impl Candidate {
+    fn matches(&self, ctx: &WindowCtx) -> bool {
+        let process_ok = self.id.is_any_process()
+            || (!ctx.process.is_empty() && self.id.process.eq_ignore_ascii_case(ctx.process));
+        // 拿不到类名 / 标题 ⇒ 带该条件的规则不命中（哪怕模式是 `*`）。
+        let cond = |pattern: &str, value: &str| {
+            pattern.is_empty() || (!value.is_empty() && wildcard_match(pattern, value))
+        };
+        process_ok && cond(&self.id.class, ctx.class) && cond(&self.id.title, ctx.title)
+    }
+}
+
+/// [`AppCompat::resolve`] 缓存的上限：焦点窗口的组合有限，超过就整表清空重来。
+pub(crate) const RESOLVE_CACHE_CAP: usize = 64;
+
+/// 缓存键：规范化后的 (进程名, 类名, 标题)——规范化后相等的上下文合成结果必然相同。
+type CtxKey = (String, String, String);
+
+/// 解析结果缓存。克隆出来的是空缓存：重载规则表（新建 / 克隆 [`AppCompat`]）即清空。
+#[derive(Default)]
+struct ResolveCache(std::sync::Mutex<HashMap<CtxKey, std::sync::Arc<ResolvedRule>>>);
+
+impl Clone for ResolveCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ResolveCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResolveCache")
+    }
+}
+
 /// 所有应用兼容性规则 + 运行时查找表。
 #[derive(Debug, Clone, Default)]
 pub struct AppCompat {
-    apps: Vec<AppCompatRule>,
-    /// 小写进程名 → `apps` 下标。
-    lookup: HashMap<String, usize>,
+    /// 参与合成的 `[[apps]]` 规则，**已按合成顺序稳定排好**（见 [`RuleId::compose_order`]）。
+    candidates: Vec<Candidate>,
+    /// 小写进程名 → 无窗口上下文时的合成结果（`"*"` ⊕ 本进程），供 [`Self::get_rule`] 借出引用。
+    by_process: HashMap<String, AppCompatRule>,
+    /// 无窗口上下文、没有本进程规则时的合成结果（只有 `"*"`）。
+    wildcard: Option<AppCompatRule>,
+    /// HostRender 白名单（原始大小写）。
+    host_render: Vec<String>,
+    cache: ResolveCache,
     /// 小写进程名 → 该进程允许重算初始模式的窗口类名集合（小写）。
     /// **进程不在表内 = 不受限制**（绝大多数应用走这条路，零行为变化）。
     mode_scope: HashMap<String, std::collections::HashSet<String>>,
@@ -1628,14 +1716,23 @@ impl AppCompat {
     }
 
     /// 从两段规则构建（含查找表）。换行清单为空 ⇒ 所有进程都跟随全局。
+    ///
+    /// 结构体经序列化回到键值再参与合成：省略的 `None` / `false` 都按「没写」处理。
     pub fn from_parts(apps: Vec<AppCompatRule>, scope: Vec<InitialModeScopeRule>) -> Self {
-        let mut c = AppCompat {
-            apps,
-            lookup: HashMap::new(),
-            mode_scope: HashMap::new(),
-            commit_newline: HashMap::new(),
-        };
-        c.build_lookup();
+        let rows: Vec<Obj> = apps
+            .iter()
+            .filter_map(|r| match serde_json::to_value(r) {
+                Ok(serde_json::Value::Object(o)) => Some(o),
+                _ => None,
+            })
+            .collect();
+        Self::from_app_rows(&rows, scope)
+    }
+
+    /// 由已跨层叠好的 `[[apps]]` 原始行构建。
+    fn from_app_rows(rows: &[Obj], scope: Vec<InitialModeScopeRule>) -> Self {
+        let mut c = AppCompat::default();
+        c.build_apps(rows);
         c.build_mode_scope(scope);
         c
     }
@@ -1687,48 +1784,178 @@ impl AppCompat {
         }
     }
 
-    /// 按进程名（不区分大小写）查规则，未匹配返回 None。
+    /// 按进程名（不区分大小写）查规则，没有窗口上下文：等于 `resolve` 以空类名、空标题调用，
+    /// 即 `"*"` 规则 ⊕ 本进程的纯进程规则（带窗口条件的规则一律不命中）。都没有返回 `None`。
+    ///
+    /// **进程名为空返回 `None`**（空名不吃通配）：不知道是谁时保持历史行为，与
+    /// [`Self::composition_placeholder_for`] 同一口径。要显式取通配那条传 [`ANY_PROCESS`]。
     pub fn get_rule(&self, process_name: &str) -> Option<&AppCompatRule> {
-        self.lookup
+        if process_name.is_empty() {
+            return None;
+        }
+        self.by_process
             .get(&process_name.to_ascii_lowercase())
-            .map(|&i| &self.apps[i])
+            .or(self.wildcard.as_ref())
+    }
+
+    /// 按焦点窗口上下文解析 `[[apps]]` 规则：命中的各条按具体程度分级合成，越具体越后叠
+    /// （后叠的赢）。顺序见 [`RuleId::compose_order`]；合成在原始键值上逐行 `compose`，最后才
+    /// 反序列化（结构体上分不开裸 bool 的「没写」与 `false`）。被禁用的规则不参与；行内 `unset`
+    /// 跨级生效（取消更低级规则设下的字段 = 本窗口回到全局默认）。
+    ///
+    /// 结果按规范化的 (进程名, 类名, 标题) 缓存（上限 [`RESOLVE_CACHE_CAP`]，重载规则表即清空）。
+    ///
+    /// **进程名为空返回空结果**（空名不吃通配，窗口条件规则也不命中），口径同 [`Self::get_rule`]。
+    pub fn resolve(&self, ctx: &WindowCtx) -> std::sync::Arc<ResolvedRule> {
+        use crate::compat_overlay::fold_char;
+        if ctx.process.is_empty() {
+            return std::sync::Arc::default();
+        }
+        let fold = |s: &str| s.chars().map(fold_char).collect::<String>();
+        let key: CtxKey = (
+            ctx.process.to_ascii_lowercase(),
+            fold(ctx.class),
+            fold(ctx.title),
+        );
+        let mut cache = self.cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+        let resolved = std::sync::Arc::new(self.compose_for(ctx));
+        // 满了整表清空：焦点窗口组合通常远少于上限。键里含标题，若 P2 实测标题频繁变化
+        // （编辑器、浏览器标签页）把缓存冲得很勤，再换成 LRU 或把标题换成哈希 / 只缓存命中集合。
+        if cache.len() >= RESOLVE_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_cache_len(&self) -> usize {
+        self.cache.0.lock().unwrap().len()
+    }
+
+    /// 不经缓存的合成。
+    fn compose_for(&self, ctx: &WindowCtx) -> ResolvedRule {
+        let mut acc = Obj::new();
+        let mut hit = false;
+        let mut name: Option<&str> = None;
+        let mut window_matches = Vec::new();
+        for c in self.candidates.iter().filter(|c| c.matches(ctx)) {
+            hit = true;
+            acc = compose(&acc, &c.fields);
+            if !c.id.is_any_process() {
+                name = Some(&c.process);
+            }
+            if c.id.has_window_condition() {
+                window_matches.push(c.id.clone());
+            }
+        }
+        if !hit {
+            return ResolvedRule::default();
+        }
+        acc.remove("unset");
+        acc.insert(
+            "process".into(),
+            serde_json::Value::String(name.unwrap_or(ANY_PROCESS).to_string()),
+        );
+        let rule = match serde_json::from_value::<AppCompatRule>(serde_json::Value::Object(acc)) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                // 每行单独反序列化过（见 `build_apps`），正常走不到这里。
+                tracing::warn!("compat.toml: 合成结果不合法，按无规则处理: {e}");
+                None
+            }
+        };
+        ResolvedRule {
+            rule,
+            window_matches,
+        }
     }
 
     /// 该进程组合区用哪个占位字符（GH#175）。**唯一的查表入口**，协调器发占位与给 DLL
     /// 下发兜底占位都走这里。
     ///
-    /// 先查本进程，没配再查 `process = "*"` 通配，都没配 = 空格。本进程显式写 `space`
-    /// 压过通配。进程名未知（空串）⇒ 空格，不吃通配：不知道是谁时保持历史行为。
+    /// 走统一合成（[`Self::get_rule`]）：`process = "*"` 通配对它生效，本进程显式写 `space`
+    /// 压过通配，都没配 = 空格。进程名未知（空串）⇒ 空格，不吃通配：不知道是谁时保持历史行为。
     pub fn composition_placeholder_for(&self, process_name: &str) -> PlaceholderChar {
         if process_name.is_empty() {
             return PlaceholderChar::default();
         }
         self.get_rule(process_name)
             .and_then(|r| r.composition_placeholder)
-            .or_else(|| self.get_rule("*").and_then(|r| r.composition_placeholder))
             .unwrap_or_default()
     }
 
-    /// 现算 HostRender 白名单：所有 `host_render = true` 的进程名（原始大小写）。
+    /// 现算 HostRender 白名单：`host_render = true` 的进程名（原始大小写）。
+    ///
+    /// 只收**具体进程、无窗口条件**的规则，看的是那条规则自己的值（不与 `"*"` 合成）：白名单是
+    /// 按进程下发给 bridge 的，`"*"` 与窗口条件在这里都表达不出来。
     ///
     /// 供 `HostRenderManager::set_whitelist` 消费；调用方须按事件源 PID 直查，
     /// 不得经 `ActiveCompat` 全局焦点槽缓存，理由见 [`AppCompatRule::host_render`]。
     pub fn host_render_processes(&self) -> Vec<String> {
-        self.apps
-            .iter()
-            .filter(|r| r.host_render)
-            .map(|r| r.process.clone())
-            .collect()
+        self.host_render.clone()
     }
 
-    fn build_lookup(&mut self) {
-        self.lookup = self
-            .apps
+    /// 由已跨层叠好的 `[[apps]]` 原始行建合成用的候选表与各查找表。
+    fn build_apps(&mut self, rows: &[Obj]) {
+        let mut candidates = Vec::new();
+        self.host_render.clear();
+        for r in rows.iter().filter(|r| !is_disabled(r)) {
+            // 作废的行（身份认不出，见 `rule_id`）不套给任何人。
+            let Some(id) = rule_id("apps", r) else {
+                continue;
+            };
+            // 单行结构性失败只丢这一行并留 WARN，不牵连其它规则（与 `materialize` 一致）。
+            let mut solo = r.clone();
+            solo.remove("unset");
+            let rule =
+                match serde_json::from_value::<AppCompatRule>(serde_json::Value::Object(solo)) {
+                    Ok(rule) => rule,
+                    Err(e) => {
+                        tracing::warn!("compat.toml: 规则 {id:?} 结构不合法，已跳过: {e}");
+                        continue;
+                    }
+                };
+            if !id.is_any_process() && !id.has_window_condition() && rule.host_render {
+                self.host_render.push(rule.process.clone());
+            }
+            let mut fields = r.clone();
+            for k in ["process", "class", "title"] {
+                fields.remove(k);
+            }
+            candidates.push(Candidate {
+                id,
+                fields,
+                process: rule.process,
+            });
+        }
+        // 稳定排序：同一合成级里平手的，保持 `rows` 的顺序，即该身份首次出现的层
+        // （出厂 < data_custom < 用户）与行序（见 `compat_overlay::overlay`）。
+        candidates.sort_by_key(|c| c.id.compose_order());
+        self.candidates = candidates;
+
+        let none = WindowCtx::default();
+        self.wildcard = self.compose_for(&none).rule;
+        let names: Vec<String> = self
+            .candidates
             .iter()
-            .enumerate()
-            // 空进程名 = 作废的规则（`process` 类型写错，见 `de_process`），不套给任何人。
-            .filter(|(_, r)| !r.process.is_empty())
-            .map(|(i, r)| (r.process.to_ascii_lowercase(), i))
+            .filter(|c| !c.id.is_any_process() && !c.id.has_window_condition())
+            .map(|c| c.id.process.clone())
+            .collect();
+        self.by_process = names
+            .into_iter()
+            .filter_map(|n| {
+                let rule = self
+                    .compose_for(&WindowCtx {
+                        process: &n,
+                        ..none
+                    })
+                    .rule?;
+                Some((n, rule))
+            })
             .collect();
     }
 
@@ -1791,7 +2018,7 @@ impl AppCompat {
         Self::from_raw(&overlay_raw(Raw::default(), &sanitize_raw(&raw).0))
     }
 
-    /// 叠加好的原始键值 → 运行时表（跳过禁用行、逐行容错反序列化）。
+    /// 叠加好的原始键值 → 运行时表（跳过禁用行、逐行容错反序列化；`[[apps]]` 保留原始键值供合成）。
     pub(crate) fn from_raw(raw: &Raw) -> Self {
         // 没有 `classes` 的作用域规则没有意义，直接作废：反序列化会把它变成空清单，而空清单的含义
         // 是「该进程的初始模式在任何窗口上都不重算」——写错 / 漏写一个字段不能静默变成「全挡」。
@@ -1802,11 +2029,8 @@ impl AppCompat {
             .filter(|r| r.contains_key("classes"))
             .cloned()
             .collect();
-        Self::from_parts(
-            materialize::<AppCompatRule>(&raw.apps),
-            materialize::<InitialModeScopeRule>(&scopes),
-        )
-        .with_commit_newline(materialize::<CommitNewlineRule>(&raw.commit_newline))
+        Self::from_app_rows(&raw.apps, materialize::<InitialModeScopeRule>(&scopes))
+            .with_commit_newline(materialize::<CommitNewlineRule>(&raw.commit_newline))
     }
 }
 
@@ -3023,7 +3247,7 @@ mod layering_tests {
                 serde_json::from_value(json!({"process": "P.EXE", "comment": "稀疏条目"})).unwrap(),
             ];
             let rules: Vec<AppCompatRule> =
-                materialize(&crate::compat_overlay::overlay(sys, &user));
+                materialize(&crate::compat_overlay::overlay("apps", sys, &user));
             let out = serde_json::to_value(&rules[0]).unwrap();
             assert!(
                 out.get(f.key).is_some(),
@@ -3736,5 +3960,601 @@ mod layering_tests {
         );
         assert!(read(&dir).contains("a.exe"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 按窗口上下文分级合成（`docs/design/compat-window-match.md`「叠加顺序」）。
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wind_compat_res_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    /// 每段文本一层（出厂 < data_custom < 用户），走生产加载路径。
+    fn load(layers: [&str; 3], tag: &str) -> AppCompat {
+        let dirs: Vec<_> = (0..3).map(|i| tmp(&format!("{tag}{i}"))).collect();
+        for (d, t) in dirs.iter().zip(layers) {
+            std::fs::write(d.join(COMPAT_FILE_NAME), t).unwrap();
+        }
+        let c = AppCompat::load_layered(Some(&dirs[0]), Some(&dirs[1]), Some(&dirs[2]));
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        c
+    }
+    fn one(text: &str) -> AppCompat {
+        AppCompat::from_single_layer_text(text)
+    }
+    fn ctx<'a>(process: &'a str, class: &'a str, title: &'a str) -> WindowCtx<'a> {
+        WindowCtx {
+            process,
+            class,
+            title,
+        }
+    }
+    fn caret_x(c: &AppCompat, w: WindowCtx) -> i32 {
+        c.resolve(&w)
+            .rule
+            .as_ref()
+            .map(|r| r.caret_offset_x)
+            .unwrap_or(-1)
+    }
+
+    /// 每级各写一条 caret_offset_x，越具体越后叠（后叠的赢）。规则在文件里**倒序**写，
+    /// 证明顺序来自级别而不是行序。
+    #[test]
+    fn tiers_compose_from_wildcard_to_process_plus_window() {
+        let text = r#"
+            [[apps]]
+            process = "ahk.exe"
+            class = "C"
+            title = "T"
+            caret_offset_x = 7
+            [[apps]]
+            process = "ahk.exe"
+            class = "C"
+            caret_offset_x = 6
+            [[apps]]
+            process = "ahk.exe"
+            caret_offset_x = 5
+            [[apps]]
+            class = "C"
+            title = "T"
+            caret_offset_x = 4
+            [[apps]]
+            title = "T*"
+            caret_offset_x = 3
+            [[apps]]
+            class = "C"
+            caret_offset_x = 2
+            [[apps]]
+            process = "*"
+            caret_offset_x = 1
+        "#;
+        let c = one(text);
+        assert_eq!(caret_x(&c, ctx("other.exe", "", "")), 1, "T0");
+        assert_eq!(caret_x(&c, ctx("other.exe", "C", "")), 2, "T1 仅类名");
+        assert_eq!(caret_x(&c, ctx("other.exe", "X", "T")), 3, "T1 仅标题");
+        assert_eq!(
+            caret_x(&c, ctx("other.exe", "C", "Tx")),
+            3,
+            "仅类名、仅标题同时命中：仅标题后叠"
+        );
+        assert_eq!(
+            caret_x(&c, ctx("other.exe", "C", "T")),
+            4,
+            "T1 类名+标题 压过仅标题、仅类名"
+        );
+        assert_eq!(caret_x(&c, ctx("AHK.exe", "C", "T")), 7, "T3 类名+标题");
+        assert_eq!(caret_x(&c, ctx("ahk.exe", "C", "x")), 6, "T3 仅类名");
+        assert_eq!(caret_x(&c, ctx("ahk.exe", "X", "T")), 5, "T2 压过 T1");
+        assert_eq!(
+            caret_x(&c, ctx("", "C", "T")),
+            -1,
+            "进程名未知：空名不吃通配，窗口规则也不命中"
+        );
+    }
+
+    /// 同级内：非通配字符多的（更具体）后叠；一样具体的按层、再按行序。
+    #[test]
+    fn within_a_tier_more_literal_patterns_win_then_layer_then_row_order() {
+        let c = one(r#"
+            [[apps]]
+            class = "Chrome_WidgetWin_1"
+            caret_offset_x = 2
+            [[apps]]
+            class = "Chrome_*"
+            caret_offset_x = 1
+            [[apps]]
+            class = "*_WidgetWin_1"
+            caret_offset_y = 1
+            [[apps]]
+            class = "Chrome_W?dgetWin_1"
+            caret_offset_y = 2
+        "#);
+        let r = c.resolve(&ctx("x.exe", "chrome_widgetwin_1", ""));
+        let r = r.rule.as_ref().unwrap();
+        assert_eq!(r.caret_offset_x, 2, "字面最长的那条最后叠");
+        assert_eq!(r.caret_offset_y, 2, "同为 16 个字面字符时，按行序后写的赢");
+
+        let c = load(
+            [
+                "[[apps]]\nclass = \"Chrome_*\"\ncaret_offset_x = 1\n",
+                "[[apps]]\nclass = \"*_WidgetWin\"\ncaret_offset_x = 2\n",
+                "[[apps]]\nclass = \"chrome_*\"\ncaret_offset_y = 9\n",
+            ],
+            "layer",
+        );
+        let r = c.resolve(&ctx("x.exe", "Chrome_WidgetWin", ""));
+        let r = r.rule.as_ref().unwrap();
+        assert_eq!(r.caret_offset_x, 2, "同样具体：data_custom 的那条后叠");
+        assert_eq!(r.caret_offset_y, 9, "用户层的同身份行叠在出厂那条上");
+    }
+
+    /// 同级、字面字符数也相同的平手：同一层按行序（后写的赢）。
+    #[test]
+    fn a_tie_within_one_layer_goes_to_the_later_row() {
+        let c = one(
+            "[[apps]]\nclass = \"A*\"\ncaret_offset_x = 1\n\n[[apps]]\nclass = \"*A\"\ncaret_offset_x = 2\n\n[[apps]]\nclass = \"?A\"\ncaret_offset_y = 1\n\n[[apps]]\nclass = \"A?\"\ncaret_offset_y = 2\n",
+        );
+        let r = c.resolve(&ctx("x.exe", "AA", ""));
+        let r = r.rule.as_ref().unwrap();
+        assert_eq!((r.caret_offset_x, r.caret_offset_y), (2, 2));
+    }
+
+    /// 平手跨层：出厂 < data_custom < 用户，高层（该身份首次出现的层）赢。
+    #[test]
+    fn a_tie_across_layers_goes_to_the_higher_layer() {
+        let c = load(
+            [
+                "[[apps]]\nclass = \"*A\"\ncaret_offset_x = 1\n",
+                "[[apps]]\nclass = \"A*\"\ncaret_offset_x = 2\ncaret_offset_y = 2\n",
+                "[[apps]]\nclass = \"A?\"\ncaret_offset_y = 3\n",
+            ],
+            "tie",
+        );
+        let r = c.resolve(&ctx("x.exe", "AA", ""));
+        let r = r.rule.as_ref().unwrap();
+        assert_eq!(r.caret_offset_x, 2, "data_custom 压过出厂");
+        assert_eq!(r.caret_offset_y, 3, "用户层压过 data_custom");
+    }
+
+    /// 空名不吃通配：进程名拿不到时 `get_rule` / `resolve` 都是空结果，`"*"` 与窗口规则都不命中。
+    #[test]
+    fn an_empty_process_name_gets_no_rule_at_all() {
+        let c = one(
+            "[[apps]]\nprocess = \"*\"\ninitial_mode = \"english\"\n\n[[apps]]\nclass = \"C\"\nauto_pair = true\n",
+        );
+        assert!(c.get_rule("").is_none());
+        let r = c.resolve(&ctx("", "C", "t"));
+        assert!(r.rule.is_none() && r.window_matches.is_empty());
+        assert_eq!(
+            c.get_rule(ANY_PROCESS).and_then(|r| r.initial_mode),
+            Some(InitialMode::English),
+            "显式取通配那条仍然可以"
+        );
+        assert!(c.get_rule("x.exe").is_some());
+    }
+
+    /// 旧文件里手写的 `*` + 某进程 `unset` 同名字段：unset 跨级生效，把 `*` 设下的值也取消
+    /// （= 该进程回到跟随全局）。这是设计稿定的语义（P1 起），钉住它。
+    #[test]
+    fn a_process_unset_also_cancels_the_wildcard_value() {
+        let c = load(
+            [
+                "[[apps]]\nprocess = \"Foo.exe\"\nfirst_show_mode = \"wait\"\n",
+                "",
+                "[[apps]]\nprocess = \"*\"\nfirst_show_mode = \"instant\"\nauto_pair = false\n\n[[apps]]\nprocess = \"foo.exe\"\nunset = [\"first_show_mode\"]\n",
+            ],
+            "unsetstar",
+        );
+        let foo = c.get_rule("foo.exe").unwrap();
+        assert_eq!(foo.first_show_mode, None, "出厂值与通配值一并取消");
+        assert_eq!(foo.auto_pair, Some(false), "没 unset 的字段照常继承通配");
+        assert_eq!(
+            c.get_rule("bar.exe").and_then(|r| r.first_show_mode),
+            Some(FirstShowMode::Instant)
+        );
+    }
+
+    #[test]
+    fn empty_class_or_title_never_hits_a_rule_with_that_condition() {
+        let c = one(
+            "[[apps]]\nclass = \"*\"\ncaret_use_top = true\n\n[[apps]]\ntitle = \"*\"\nauto_pair = false\n",
+        );
+        assert!(c.resolve(&ctx("a.exe", "", "")).rule.is_none());
+        let r = c.resolve(&ctx("a.exe", "X", ""));
+        let r = r.rule.as_ref().unwrap();
+        assert!(r.caret_use_top);
+        assert_eq!(r.auto_pair, None, "标题为空，带标题条件的规则不命中");
+    }
+
+    /// 行内 unset 跨级生效：更具体那条把通配设下的字段取消 = 本窗口回到全局默认。
+    /// disabled 的行不参与合成。
+    #[test]
+    fn unset_reaches_across_tiers_and_disabled_rows_do_not_take_part() {
+        let c = one(r#"
+            [[apps]]
+            process = "*"
+            first_show_mode = "wait"
+            initial_mode = "english"
+            [[apps]]
+            process = "ahk.exe"
+            title = "Editor*"
+            unset = ["first_show_mode"]
+            [[apps]]
+            process = "ahk.exe"
+            class = "X"
+            disabled = true
+            initial_mode = "chinese"
+        "#);
+        let r = c.resolve(&ctx("ahk.exe", "X", "Editor - 1"));
+        let r = r.rule.as_ref().unwrap();
+        assert_eq!(r.first_show_mode, None, "unset 取消了通配那条的值");
+        assert_eq!(
+            r.initial_mode,
+            Some(InitialMode::English),
+            "被禁用的那条不参与"
+        );
+        assert_eq!(
+            c.get_rule("ahk.exe").and_then(|r| r.first_show_mode),
+            Some(FirstShowMode::Wait),
+            "没有窗口上下文时窗口规则不命中，unset 也就不生效"
+        );
+    }
+
+    /// `process = "*"` 纳入统一合成后对**所有**字段生效；本进程规则在其上逐字段叠加。
+    #[test]
+    fn the_wildcard_rule_now_applies_to_every_field() {
+        let c = one(r#"
+            [[apps]]
+            process = "*"
+            initial_mode = "english"
+            host_drawn_candidates = true
+            [[apps]]
+            process = "Foo.exe"
+            host_drawn_candidates = false
+        "#);
+        let unknown = c.get_rule("nobody.exe").expect("通配对任何进程都生效");
+        assert_eq!(unknown.initial_mode, Some(InitialMode::English));
+        let foo = c.get_rule("foo.exe").unwrap();
+        assert_eq!(
+            foo.initial_mode,
+            Some(InitialMode::English),
+            "没写的字段从通配继承"
+        );
+        assert_eq!(
+            foo.host_drawn_candidates,
+            Some(false),
+            "本进程写了的压过通配"
+        );
+        assert_eq!(foo.process, "Foo.exe", "合成结果的进程名取最具体那条的写法");
+        assert_eq!(unknown.process, "*");
+    }
+
+    #[test]
+    fn get_rule_is_resolve_without_a_window() {
+        let c = one(
+            "[[apps]]\nprocess = \"a.exe\"\nauto_pair = true\n\n[[apps]]\nprocess = \"a.exe\"\nclass = \"X\"\nauto_pair = false\n",
+        );
+        assert_eq!(c.get_rule("A.EXE").and_then(|r| r.auto_pair), Some(true));
+        assert_eq!(
+            c.resolve(&ctx("a.exe", "", ""))
+                .rule
+                .as_ref()
+                .and_then(|r| r.auto_pair),
+            Some(true)
+        );
+        assert_eq!(
+            c.resolve(&ctx("a.exe", "x", ""))
+                .rule
+                .as_ref()
+                .and_then(|r| r.auto_pair),
+            Some(false)
+        );
+        assert!(c.get_rule("b.exe").is_none());
+    }
+
+    /// P2 据此判断「命中的带窗口条件的规则集合变了没有」。
+    #[test]
+    fn resolve_reports_which_window_rules_matched_in_compose_order() {
+        let c = one(
+            "[[apps]]\nprocess = \"a.exe\"\ntitle = \"T*\"\nauto_pair = true\n\n[[apps]]\nclass = \"C\"\nauto_pair = false\n\n[[apps]]\nprocess = \"a.exe\"\ncaret_use_top = true\n",
+        );
+        let r = c.resolve(&ctx("a.exe", "c", "Title"));
+        assert_eq!(
+            r.window_matches,
+            vec![
+                RuleId {
+                    process: "*".into(),
+                    class: "c".into(),
+                    title: String::new()
+                },
+                RuleId {
+                    process: "a.exe".into(),
+                    class: String::new(),
+                    title: "t*".into()
+                },
+            ]
+        );
+        assert!(c.resolve(&ctx("a.exe", "", "")).window_matches.is_empty());
+    }
+
+    #[test]
+    fn host_render_only_takes_concrete_processes_without_window_conditions() {
+        let c = one(r#"
+            [[apps]]
+            process = "*"
+            host_render = true
+            [[apps]]
+            process = "SearchHost.exe"
+            host_render = true
+            [[apps]]
+            process = "Foo.exe"
+            class = "X"
+            host_render = true
+            [[apps]]
+            class = "Y"
+            host_render = true
+        "#);
+        assert_eq!(
+            c.host_render_processes(),
+            vec!["SearchHost.exe".to_string()]
+        );
+    }
+
+    #[test]
+    fn composition_placeholder_goes_through_the_unified_composition() {
+        let c = one(
+            "[[apps]]\nprocess = \"*\"\ncomposition_placeholder = \"zwsp\"\n\n[[apps]]\nprocess = \"wps.exe\"\ncomposition_placeholder = \"space\"\n\n[[apps]]\nprocess = \"code.exe\"\nauto_pair = true\n",
+        );
+        assert_eq!(
+            c.composition_placeholder_for("x.exe"),
+            PlaceholderChar::Zwsp
+        );
+        assert_eq!(
+            c.composition_placeholder_for("code.exe"),
+            PlaceholderChar::Zwsp
+        );
+        assert_eq!(
+            c.composition_placeholder_for("WPS.exe"),
+            PlaceholderChar::Space
+        );
+        assert_eq!(
+            c.composition_placeholder_for(""),
+            PlaceholderChar::Space,
+            "进程名未知：保持历史行为"
+        );
+    }
+
+    #[test]
+    fn resolve_results_are_cached_and_the_cache_is_bounded() {
+        let c = one("[[apps]]\nclass = \"C*\"\ncaret_use_top = true\n");
+        let a = c.resolve(&ctx("a.exe", "Cx", "t"));
+        let b = c.resolve(&ctx("A.EXE", "cX", "t"));
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "规范化后同键命中缓存");
+        for i in 0..200 {
+            let title = format!("t{i}");
+            assert!(c.resolve(&ctx("a.exe", "Cx", &title)).rule.is_some());
+        }
+        assert!(c.resolve_cache_len() <= RESOLVE_CACHE_CAP);
+        assert_eq!(
+            c.clone().resolve_cache_len(),
+            0,
+            "克隆（重载）出的表缓存是空的"
+        );
+    }
+
+    /// 附属段不支持窗口条件：写了当未知键保留，规则仍按进程名生效。
+    #[test]
+    fn side_sections_ignore_window_conditions() {
+        let c = one(
+            "[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclass = \"Nope\"\nclasses = [\"Progman\"]\n\n[[commit_newline]]\nprocess = \"n.exe\"\ntitle = \"x\"\nstyle = \"crlf\"\n",
+        );
+        assert!(c.initial_mode_applies_to_window("explorer.exe", "Progman"));
+        assert_eq!(c.commit_newline_for("n.exe"), Some(NewlineStyle::Crlf));
+    }
+}
+
+/// 旧文件（没有 class / title）在新实现下的合成结果必须与按进程名认「同一条」的旧实现**逐字节相同**。
+///
+/// 这里留一份旧实现的精简副本（只保留按进程名 coalesce / overlay 的那几行）作对照：
+/// 新实现改的正是「认同一条」的键，拿新实现自己的函数当基准就成了自证。
+#[cfg(test)]
+mod legacy_equivalence_tests {
+    use super::*;
+    use crate::compat_overlay::{Obj, compose, parse_raw, process_of};
+
+    /// 不经 `parse_raw`（它内部的 coalesce 正是被测对象）直接读出 `[[apps]]` 各行。
+    fn toml_rows(text: &str) -> Vec<Obj> {
+        let toml: toml::Value = toml::from_str(text).unwrap();
+        toml.get("apps")
+            .and_then(|a| a.as_array())
+            .unwrap()
+            .iter()
+            .map(|t| {
+                serde_json::to_value(t)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            })
+            .collect()
+    }
+    fn legacy_coalesce(rows: Vec<Obj>) -> Vec<Obj> {
+        let mut out: Vec<Obj> = Vec::new();
+        for r in rows {
+            let name = process_of(&r).to_string();
+            let same = (!name.trim().is_empty())
+                .then(|| {
+                    out.iter()
+                        .position(|o| process_of(o).trim().eq_ignore_ascii_case(name.trim()))
+                })
+                .flatten();
+            match same {
+                Some(i) => out[i] = compose(&out[i], &r),
+                None => out.push(r),
+            }
+        }
+        out
+    }
+    fn legacy_overlay(mut base: Vec<Obj>, layer: &[Obj]) -> Vec<Obj> {
+        for row in layer.iter().filter(|r| !process_of(r).trim().is_empty()) {
+            match base.iter().position(|b| {
+                process_of(b)
+                    .trim()
+                    .eq_ignore_ascii_case(process_of(row).trim())
+            }) {
+                Some(i) => base[i] = compose(&base[i], row),
+                None => base.push(compose(&Obj::new(), row)),
+            }
+        }
+        base
+    }
+    /// 旧运行时表：小写进程名 → 规则（`materialize` + `build_lookup`）。
+    fn legacy_table(layers: &[&str]) -> Vec<(String, String)> {
+        let mut apps: Vec<Obj> = Vec::new();
+        for text in layers {
+            let raw = Raw {
+                apps: legacy_coalesce(toml_rows(text)),
+                ..Default::default()
+            };
+            apps = legacy_overlay(apps, &sanitize_raw(&raw).0.apps);
+        }
+        let rules: Vec<AppCompatRule> = materialize(&apps);
+        rules
+            .into_iter()
+            .filter(|r| !r.process.is_empty())
+            .map(|r| {
+                (
+                    r.process.to_ascii_lowercase(),
+                    serde_json::to_string(&r).unwrap(),
+                )
+            })
+            .collect()
+    }
+    fn new_table(layers: &[&str], names: &[String]) -> Vec<(String, String)> {
+        let mut raw = Raw::default();
+        for text in layers {
+            raw = overlay_raw(raw, &sanitize_raw(&parse_raw(text).unwrap()).0);
+        }
+        let c = AppCompat::from_raw(&raw);
+        names
+            .iter()
+            .filter_map(|n| {
+                c.get_rule(n)
+                    .map(|r| (n.clone(), serde_json::to_string(r).unwrap()))
+            })
+            .collect()
+    }
+
+    const USER_FIXTURES: [&str; 3] = [
+        r#"
+[[apps]]
+process = "weixin.EXE"
+caret_use_top = false
+first_show_mode = "instant"
+
+[[apps]]
+process = "EXCEL.EXE"
+unset = ["first_show_mode"]
+auto_pair = false
+
+[[apps]]
+process = "MapleStory.exe"
+disabled = true
+
+[[apps]]
+process = " NewApp.exe "
+initial_mode = "english"
+schema = "@remember"
+caret_offset_x = 3
+unknown_future = [1, 2]
+
+[[apps]]
+process = "newapp.exe"
+initial_mode = "chinese"
+auto_pair = true
+
+[[apps]]
+process = 1
+auto_pair = true
+
+[[apps]]
+auto_pair = true
+
+[[apps]]
+process = "typo.exe"
+first_show_mode = "wiat"
+smart_method = "hold_composition"
+"#,
+        r#"
+[[apps]]
+process = "QQ.exe"
+disabled = true
+
+[[apps]]
+process = "SearchHost.exe"
+host_render = false
+
+[[apps]]
+process = "custom.exe"
+host_render = true
+"#,
+        r#"
+[[apps]]
+process = "QQ.exe"
+disabled = false
+first_show_mode = "wait"
+
+[[apps]]
+process = "Feishu.exe"
+unset = "stale_probe_guard"
+"#,
+    ];
+
+    fn shipped() -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/compat.toml");
+        std::fs::read_to_string(p).expect("仓库 data/compat.toml 必须在")
+    }
+
+    #[test]
+    fn files_without_window_conditions_compose_exactly_as_before() {
+        let sys = shipped();
+        let stacks: Vec<Vec<&str>> = vec![
+            vec![&sys],
+            vec![&sys, USER_FIXTURES[0]],
+            vec![&sys, USER_FIXTURES[1], USER_FIXTURES[2]],
+            vec![&sys, USER_FIXTURES[1], USER_FIXTURES[0]],
+            vec![USER_FIXTURES[0]],
+        ];
+        for (i, layers) in stacks.iter().enumerate() {
+            let old = legacy_table(layers);
+            assert!(!old.is_empty());
+            let mut names: Vec<String> = old.iter().map(|(n, _)| n.clone()).collect();
+            names.extend(["unknown.exe", "", "*"].map(String::from));
+            let new = new_table(layers, &names);
+            assert_eq!(new, old, "第 {i} 组：新旧合成结果不同");
+        }
+    }
+
+    #[test]
+    fn coalesce_and_render_are_unchanged_for_old_files() {
+        let sys = shipped();
+        for text in [
+            sys.as_str(),
+            USER_FIXTURES[0],
+            USER_FIXTURES[1],
+            USER_FIXTURES[2],
+        ] {
+            let raw = parse_raw(text).unwrap();
+            assert_eq!(raw.apps, legacy_coalesce(toml_rows(text)));
+            let rendered = render_raw(USER_COMPAT_HEADER, &raw).unwrap();
+            assert_eq!(parse_raw(&rendered).unwrap().apps, raw.apps);
+        }
     }
 }

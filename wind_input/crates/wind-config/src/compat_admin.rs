@@ -15,9 +15,9 @@ use crate::app_compat::{
 };
 pub use crate::compat_overlay::Problem;
 use crate::compat_overlay::{
-    FieldEdit, META_KEYS, Obj, Raw, apply_edits, compose, effective_keys, field_value_problem,
-    has_registered_diff, is_disabled, normalize, overlay, overlay_raw, parse_raw, process_of,
-    render_raw, same_process, sanitize,
+    ANY_PROCESS, FieldEdit, META_KEYS, Obj, Raw, RuleId, apply_edits, compose, effective_keys,
+    field_value_problem, has_registered_diff, is_disabled, is_meta_key, normalize, overlay,
+    overlay_raw, parse_raw, process_of, render_raw, rule_id, sanitize,
 };
 use crate::compat_schema::{COMPAT_FIELDS, Kind, known_keys};
 use serde::Serialize;
@@ -145,6 +145,10 @@ pub struct RuleView {
     pub unknown_keys: Vec<String>,
     /// 本段每个已登记字段的逐字段视图（键 = 字段名，齐全，不遗漏）。
     pub fields: BTreeMap<String, FieldView>,
+    /// 规则身份（跨层认「同一条」的键）。按进程名的接口只认纯进程键那一条；不对外序列化
+    /// （窗口条件的管理接口在后续一期）。
+    #[serde(skip)]
+    pub(crate) id: RuleId,
 }
 
 /// 进程名校验：trim 后非空、不含路径分隔符与控制字符。返回 trim 后的名字。
@@ -180,7 +184,7 @@ fn typed_obj<T: DeserializeOwned + Serialize>(row: &Obj) -> Obj {
 /// 只靠反序列化是不够的：容错反序列化会把错类型 / 错取值悄悄吞成「跟随全局」，
 /// 键名拼错则被 serde 直接忽略——两者都会让调用方以为写成功了。
 fn check_patch_key<T: DeserializeOwned>(section: &str, key: &str, v: &Value) -> Result<(), String> {
-    if META_KEYS.contains(&key) {
+    if is_meta_key(section, key) {
         return Err(format!("字段 {key} 不能通过补丁修改"));
     }
     if !known_keys(section).contains(&key) {
@@ -217,12 +221,17 @@ fn view_in<T: DeserializeOwned + Serialize>(
     // 叠加用清理后的副本（无效值当成没写），差异与冗余判断仍看用户层原始内容。
     let (clean_user, _) = sanitize::<T>(sec_name, user);
     let known = known_keys(sec_name);
-    overlay(sys.to_vec(), &clean_user)
+    overlay(sec_name, sys.to_vec(), &clean_user)
         .into_iter()
-        .map(|eff| {
-            let name = process_of(&eff).to_string();
-            let s = sys.iter().find(|r| same_process(process_of(r), &name));
-            let u = user.iter().find(|r| same_process(process_of(r), &name));
+        .filter_map(|eff| {
+            let id = rule_id(sec_name, &eff)?;
+            let name = match process_of(&eff) {
+                "" => ANY_PROCESS.to_string(),
+                p => p.to_string(),
+            };
+            let same = |r: &&Obj| rule_id(sec_name, r).as_ref() == Some(&id);
+            let s = sys.iter().find(same);
+            let u = user.iter().find(same);
             // 规范化后还有**已登记字段层面**的差异，才算「用户层有真正的差异」；
             // 认不出的键对运行时没有效果，不能让规则显示成已修改。
             let mut normalized = u.cloned();
@@ -258,9 +267,7 @@ fn view_in<T: DeserializeOwned + Serialize>(
             let unknown_keys: Vec<String> = u
                 .map(|r| {
                     r.keys()
-                        .filter(|k| {
-                            !META_KEYS.contains(&k.as_str()) && !known.contains(&k.as_str())
-                        })
+                        .filter(|k| !is_meta_key(sec_name, k) && !known.contains(&k.as_str()))
                         .cloned()
                         .collect()
                 })
@@ -322,7 +329,8 @@ fn view_in<T: DeserializeOwned + Serialize>(
                     )
                 })
                 .collect();
-            RuleView {
+            Some(RuleView {
+                id,
                 process: name,
                 state,
                 effective: Value::Object(effective),
@@ -332,7 +340,7 @@ fn view_in<T: DeserializeOwned + Serialize>(
                 user: u.map(|r| Value::Object(r.clone())),
                 unknown_keys,
                 fields,
-            }
+            })
         })
         .collect()
 }
@@ -411,22 +419,37 @@ impl Layers {
         &self.warnings
     }
 
+    /// 设置页的规则列表。**不含带窗口条件（class / title）的规则**：按进程名的管理接口表达不了
+    /// 它们，列出来会显示成同名行（只写窗口条件的显示成 `*`），在那一行上改字段会经 upsert
+    /// 新建一条纯进程 / 纯 `*` 规则——后者套到所有应用。窗口规则目前只在 compat.toml 里手写维护，
+    /// 管理接口在后续一期（设计稿 P4）。
     pub fn view(&self, sec: Section) -> Vec<RuleView> {
+        self.view_all(sec)
+            .into_iter()
+            .filter(|v| !v.id.has_window_condition())
+            .collect()
+    }
+
+    /// 含窗口规则的全部视图（导入预览按身份比对前后用）。
+    fn view_all(&self, sec: Section) -> Vec<RuleView> {
         with_section!(sec, T => view_in::<T>(sec.as_str(), rows(&self.system, sec), rows(&self.user, sec)))
     }
 
-    /// 单条规则的视图（进程名不区分大小写）。
+    /// 单条规则的视图（进程名不区分大小写；纯进程键那一条，同进程带窗口条件的不算）。
     pub fn view_of(&self, sec: Section, process: &str) -> Option<RuleView> {
-        self.view(sec)
-            .into_iter()
-            .find(|v| same_process(&v.process, process))
+        self.view_of_id(sec, &RuleId::process_only(process))
+    }
+
+    fn view_of_id(&self, sec: Section, id: &RuleId) -> Option<RuleView> {
+        self.view_all(sec).into_iter().find(|v| &v.id == id)
     }
 
     fn exists(&self, sec: Section, process: &str) -> bool {
+        let id = Some(RuleId::process_only(process));
         rows(&self.system, sec)
             .iter()
             .chain(rows(&self.user, sec))
-            .any(|r| same_process(process_of(r), process))
+            .any(|r| rule_id(sec.as_str(), r) == id)
     }
 
     fn apply(&mut self, sec: Section, process: &str, edits: &[FieldEdit]) {
@@ -481,15 +504,16 @@ impl Layers {
         Ok(())
     }
 
-    /// 还原单条：删掉用户层同名条目。用户新增的规则等于删除。返回是否删除过。
+    /// 还原单条：删掉用户层同名条目（纯进程键那一条）。用户新增的规则等于删除。返回是否删除过。
     pub fn reset(&mut self, sec: Section, process: &str) -> bool {
+        let id = Some(RuleId::process_only(process));
         let list = match sec {
             Section::Apps => &mut self.user.apps,
             Section::InitialModeScope => &mut self.user.initial_mode_scope,
             Section::CommitNewline => &mut self.user.commit_newline,
         };
         let before = list.len();
-        list.retain(|r| !same_process(process_of(r), process));
+        list.retain(|r| rule_id(sec.as_str(), r) != id);
         list.len() != before
     }
 
@@ -579,7 +603,9 @@ pub struct ImportPreview {
 /// 导入文本里的一条规则（已剔除不认识的键与无效取值）。
 struct IncomingRule {
     section: Section,
+    /// 显示用的进程名（没写 process 的窗口规则为 `"*"`）。
     process: String,
+    id: RuleId,
     fields: Obj,
 }
 
@@ -613,23 +639,47 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
     for sec in ALL_SECTIONS {
         let known = known_keys(sec.as_str());
         for row in rows(&raw, sec) {
-            let process = match row.get("process").and_then(Value::as_str) {
-                Some(p) => match validate_process(p) {
-                    Ok(p) => p,
+            // 身份认不出（`[[apps]]` 的 process / class / title 全空或类型不对；附属段缺 process）⇒ 整条拒绝。
+            let Some(id) = rule_id(sec.as_str(), row) else {
+                let why = match row.get("process").and_then(Value::as_str) {
+                    Some(p) => match validate_process(p) {
+                        Err(e) => format!("{p:?} {e}"),
+                        Ok(_) => format!("{p:?} 的 class / title 不是字符串"),
+                    },
+                    None => "缺少 process".to_string(),
+                };
+                inc.rejected.push(format!("{}: {why}", sec.as_str()));
+                continue;
+            };
+            let mut fields = Obj::new();
+            let process = match row.get("process").and_then(Value::as_str).map(str::trim) {
+                Some(p) if !p.is_empty() => match validate_process(p) {
+                    Ok(p) => {
+                        fields.insert("process".into(), Value::String(p.clone()));
+                        p
+                    }
                     Err(e) => {
                         inc.rejected.push(format!("{}: {p:?} {e}", sec.as_str()));
                         continue;
                     }
                 },
-                None => {
-                    inc.rejected.push(format!("{}: 缺少 process", sec.as_str()));
-                    continue;
-                }
+                // 只写窗口条件的 `[[apps]]` 规则：不限进程。
+                _ => ANY_PROCESS.to_string(),
             };
-            let mut fields = Obj::new();
-            fields.insert("process".into(), Value::String(process.clone()));
+            let window_keys: &[&str] = if is_meta_key(sec.as_str(), "class") {
+                &["class", "title"]
+            } else {
+                &[]
+            };
+            for k in window_keys {
+                if let Some(p) = row.get(*k).and_then(Value::as_str).map(str::trim)
+                    && !p.is_empty()
+                {
+                    fields.insert(k.to_string(), Value::String(p.to_string()));
+                }
+            }
             for (k, v) in row {
-                if k == "process" {
+                if k == "process" || window_keys.contains(&k.as_str()) {
                     continue;
                 }
                 match k.as_str() {
@@ -679,6 +729,7 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
             inc.rules.push(IncomingRule {
                 section: sec,
                 process,
+                id,
                 fields,
             });
         }
@@ -708,15 +759,18 @@ impl Layers {
                 for sec in ALL_SECTIONS {
                     // 保留 `unset`：它是「系统层设了、叠加后没有」的记号，缺了它，把这份导出
                     // 在同一套系统层上重新导入，被取消的字段会又继承回来。
-                    let eff: Vec<Obj> =
-                        overlay(rows(&self.system, sec).clone(), &sanitize_rows(self, sec))
-                            .into_iter()
-                            .filter(|r| !is_disabled(r))
-                            .map(|mut r| {
-                                r.remove("disabled");
-                                r
-                            })
-                            .collect();
+                    let eff: Vec<Obj> = overlay(
+                        sec.as_str(),
+                        rows(&self.system, sec).clone(),
+                        &sanitize_rows(self, sec),
+                    )
+                    .into_iter()
+                    .filter(|r| !is_disabled(r))
+                    .map(|mut r| {
+                        r.remove("disabled");
+                        r
+                    })
+                    .collect();
                     match sec {
                         Section::Apps => raw.apps = eff,
                         Section::InitialModeScope => raw.initial_mode_scope = eff,
@@ -741,24 +795,24 @@ impl Layers {
             ),
             Section::CommitNewline => (&self.system.commit_newline, &mut self.user.commit_newline),
         };
-        let idx = user
-            .iter()
-            .position(|u| same_process(process_of(u), &r.process));
+        let sec = r.section.as_str();
+        let same = |o: &&Obj| rule_id(sec, o).as_ref() == Some(&r.id);
+        let idx = user.iter().position(|u| same(&u));
+        let sys_row = sys.iter().find(same);
         let base = match idx {
             Some(i) => user[i].clone(),
             None => {
+                // 新建行沿用系统层的写法（大小写），没有才用导入文本的。
                 let mut o = Obj::new();
-                let name = sys
-                    .iter()
-                    .find(|s| same_process(process_of(s), &r.process))
-                    .map(process_of)
-                    .unwrap_or(&r.process);
-                o.insert("process".into(), Value::String(name.to_string()));
+                for k in ["process", "class", "title"] {
+                    if let Some(v) = sys_row.and_then(|s| s.get(k)).or_else(|| r.fields.get(k)) {
+                        o.insert(k.into(), v.clone());
+                    }
+                }
                 o
             }
         };
         let mut row = compose(&base, &r.fields);
-        let sys_row = sys.iter().find(|s| same_process(process_of(s), &r.process));
         let keep = with_section!(r.section, T => normalize::<T>(r.section.as_str(), sys_row, &mut row, true));
         match (idx, keep) {
             (Some(i), true) => user[i] = row,
@@ -784,8 +838,8 @@ impl Layers {
                 .get("disabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let before = self.view_of(r.section, &r.process);
-            let now = after.view_of(r.section, &r.process);
+            let before = self.view_of_id(r.section, &r.id);
+            let now = after.view_of_id(r.section, &r.id);
             let action = if disabled {
                 "disable"
             } else {
@@ -805,11 +859,11 @@ impl Layers {
         }
         if mode == ImportMode::Replace {
             for sec in ALL_SECTIONS {
-                for v in self.view(sec).into_iter().filter(|v| v.has_user_entry) {
+                for v in self.view_all(sec).into_iter().filter(|v| v.has_user_entry) {
                     let mentioned = incoming
                         .rules
                         .iter()
-                        .any(|r| r.section == sec && same_process(&r.process, &v.process));
+                        .any(|r| r.section == sec && r.id == v.id);
                     if !mentioned {
                         items.push(ImportItem {
                             section: sec.as_str(),
@@ -1105,7 +1159,7 @@ mod tests {
     fn user_row(l: &Layers, sec: Section, p: &str) -> Option<Obj> {
         rows(&l.user, sec)
             .iter()
-            .find(|r| same_process(process_of(r), p))
+            .find(|r| rule_id(sec.as_str(), r) == Some(RuleId::process_only(p)))
             .cloned()
     }
 
@@ -2738,5 +2792,177 @@ composition_start_pair_guard = true
             dep.get("dependsOn").is_some() && dep.get("depends_on").is_none(),
             "{dep}"
         );
+    }
+}
+
+/// 规则身份带窗口条件后，按进程名的管理接口只认纯进程键那一条。
+#[cfg(test)]
+mod window_identity_tests {
+    use super::*;
+    use crate::compat_overlay::parse_raw;
+    use serde_json::json;
+
+    const SYS: &str = "[[apps]]\nprocess = \"ahk.exe\"\nauto_pair = true\n\n[[apps]]\nprocess = \"ahk.exe\"\ntitle = \"Editor*\"\ninitial_mode = \"english\"\n";
+
+    fn layers(usr: &str) -> Layers {
+        Layers {
+            system: parse_raw(SYS).unwrap(),
+            user: parse_raw(usr).unwrap(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn process_apis_address_only_the_pure_process_rule() {
+        let mut l =
+            layers("[[apps]]\nprocess = \"AHK.exe\"\ntitle = \"editor*\"\ncaret_use_top = true\n");
+        let views = l.view(Section::Apps);
+        assert_eq!(
+            views.iter().map(|v| v.process.as_str()).collect::<Vec<_>>(),
+            vec!["ahk.exe"],
+            "带窗口条件的规则不进设置页列表"
+        );
+        let v = l.view_of(Section::Apps, "ahk.exe").unwrap();
+        assert_eq!(v.state, RuleState::System, "纯进程那条没被用户动过");
+        assert_eq!(v.effective["auto_pair"], json!(true));
+
+        l.upsert(
+            Section::Apps,
+            "ahk.exe",
+            &json!({"auto_pair": false}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            l.user.apps.len(),
+            2,
+            "新建了纯进程差异行: {:?}",
+            l.user.apps
+        );
+        assert_eq!(
+            l.user.apps[0]["caret_use_top"],
+            json!(true),
+            "窗口规则那行原样"
+        );
+        assert!(l.reset(Section::Apps, "ahk.exe"));
+        assert_eq!(l.user.apps.len(), 1, "只删纯进程那条");
+        assert_eq!(l.user.apps[0]["title"], json!("editor*"));
+        assert!(!l.reset(Section::Apps, "ahk.exe"));
+    }
+
+    /// 只写窗口条件的规则（身份里 process = "*"）不能在列表里显示成 `*`：在那一行上改字段会
+    /// 新建一条纯 `*` 规则，套到所有应用。
+    #[test]
+    fn window_only_rules_are_not_listed_and_process_writes_never_touch_them() {
+        let mut l = layers(
+            "[[apps]]\nclass = \"Chrome_WidgetWin_*\"\ncomposition_placeholder = \"zwsp\"\n\n[[apps]]\nprocess = \"ahk.exe\"\nclass = \"X\"\ndisabled = true\n",
+        );
+        let listed: Vec<String> = l
+            .view(Section::Apps)
+            .into_iter()
+            .map(|v| v.process)
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["ahk.exe".to_string()],
+            "只剩出厂那条纯进程规则"
+        );
+        assert!(l.view_of(Section::Apps, "*").is_none());
+        let before = l.user.apps.clone();
+
+        l.set_disabled(Section::Apps, "ahk.exe", true).unwrap();
+        l.set_disabled(Section::Apps, "ahk.exe", false).unwrap();
+        assert!(!l.reset(Section::Apps, "*"), "没有纯 * 规则可还原");
+        assert!(
+            l.set_disabled(Section::Apps, "*", true).is_err(),
+            "纯 * 规则不存在"
+        );
+        assert_eq!(l.user.apps, before, "按进程名的写入不碰窗口规则");
+        l.upsert(
+            Section::Apps,
+            "ahk.exe",
+            &json!({"caret_use_top": true}).as_object().unwrap().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            &l.user.apps[..2],
+            &before[..],
+            "窗口规则原样，纯进程差异另起一行"
+        );
+        assert!(l.user.apps[2].get("class").is_none());
+        assert!(l.reset(Section::Apps, "ahk.exe"));
+        assert_eq!(l.user.apps, before);
+    }
+
+    /// replace 导入会清掉用户层的窗口规则：预览必须把它列成 remove（列表里虽不显示）。
+    #[test]
+    fn replace_import_previews_removal_of_window_rules() {
+        let l = layers("[[apps]]\nprocess = \"ahk.exe\"\ntitle = \"T\"\nauto_pair = true\n");
+        let p = l.import_preview("", ImportMode::Replace).unwrap();
+        assert_eq!(
+            p.items
+                .iter()
+                .map(|i| (i.process.as_str(), i.action))
+                .collect::<Vec<_>>(),
+            vec![("ahk.exe", "remove")]
+        );
+    }
+
+    #[test]
+    fn patching_class_or_title_is_refused_like_process() {
+        let mut l = layers("");
+        let err = l
+            .upsert(
+                Section::Apps,
+                "ahk.exe",
+                &json!({"class": "X"}).as_object().unwrap().clone(),
+            )
+            .unwrap_err();
+        assert!(err.contains("不能通过补丁修改"), "{err}");
+        assert!(l.reset_field(Section::Apps, "ahk.exe", "title").is_err());
+    }
+
+    /// 导入带窗口条件的规则：保留条件、按身份叠到同一条上，不能被压扁成整个进程的规则。
+    #[test]
+    fn import_keeps_window_conditions_in_the_identity() {
+        let mut l = layers("");
+        let p = l
+            .import_apply(
+                "[[apps]]\nprocess = \"AHK.EXE\"\ntitle = \" EDITOR* \"\ncaret_use_top = true\n\n[[apps]]\nclass = \"Chrome_WidgetWin_*\"\ncomposition_placeholder = \"zwsp\"\n\n[[apps]]\nprocess = \"x.exe\"\nclass = 1\nauto_pair = true\n",
+                ImportMode::Merge,
+            )
+            .unwrap();
+        assert_eq!(p.rejected.len(), 1, "{:?}", p.rejected);
+        assert_eq!(l.user.apps.len(), 2, "{:?}", l.user.apps);
+        let ahk = &l.user.apps[0];
+        assert_eq!(ahk["title"], json!("Editor*"), "沿用系统层同身份那条的写法");
+        assert_eq!(ahk["caret_use_top"], json!(true));
+        assert!(ahk.get("initial_mode").is_none(), "只记差异");
+        let chrome = &l.user.apps[1];
+        assert!(chrome.get("process").is_none(), "没写 process 的保持不写");
+        assert_eq!(chrome["class"], json!("Chrome_WidgetWin_*"));
+        assert_eq!(
+            p.items
+                .iter()
+                .map(|i| (i.process.as_str(), i.action))
+                .collect::<Vec<_>>(),
+            vec![("AHK.EXE", "override"), ("*", "add")]
+        );
+        assert!(
+            l.view_of(Section::Apps, "ahk.exe").unwrap().user.is_none(),
+            "纯进程那条没被碰"
+        );
+    }
+
+    #[test]
+    fn side_sections_list_class_as_an_unknown_key() {
+        let l = Layers {
+            system: Raw::default(),
+            user: parse_raw("[[initial_mode_scope]]\nprocess = \"explorer.exe\"\nclasses = [\"A\"]\nclass = \"X\"\n").unwrap(),
+            warnings: Vec::new(),
+        };
+        let v = l
+            .view_of(Section::InitialModeScope, "explorer.exe")
+            .unwrap();
+        assert_eq!(v.unknown_keys, vec!["class".to_string()]);
     }
 }
