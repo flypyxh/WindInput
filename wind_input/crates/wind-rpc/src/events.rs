@@ -16,8 +16,12 @@ use wind_ipc::rpc::{EventMessage, encode_message};
 
 /// 单个订阅者（writer 线程）的发送端。
 struct Subscriber {
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
+
+/// 每个订阅者的积压上限。事件只在配置/词库变更时发，正常情况下队列几乎是空的；
+/// 满了说明设置端卡住不读，按断开处理：设置端断线后自动重连，积压期间的事件丢失。
+const SUBSCRIBER_QUEUE_CAP: usize = 64;
 
 /// 事件广播中心：持有所有订阅者发送端，`broadcast` 向全部投递（幂等、无副作用）。
 #[derive(Clone)]
@@ -46,13 +50,13 @@ impl EventSink {
 
     /// 注册一个订阅者，返回其接收端（由传输层 writer 线程消费并写线路）。
     pub(crate) fn subscribe(&self) -> std::sync::mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(SUBSCRIBER_QUEUE_CAP);
         self.subscribers.lock().unwrap().push(Subscriber { tx });
         rx
     }
 
-    /// 广播一条事件给所有订阅者。失败的订阅者（writer 线程已退出）下次广播时
-    /// send 仍会失败但无副作用；如需主动回收可在此 retain（当前订阅者数量极少，从简）。
+    /// 广播一条事件给所有订阅者，顺带移除投递失败的：writer 线程已退出（设置窗口关了）
+    /// 或积压满了（卡住不读）。不移除的话设置窗口每开一次表里就多一个死订阅者。
     pub fn broadcast(&self, event: &str, data: Value) {
         let msg = EventMessage {
             event: event.to_string(),
@@ -65,10 +69,10 @@ impl EventSink {
                 return;
             }
         };
-        let subs = self.subscribers.lock().unwrap();
-        for s in subs.iter() {
-            let _ = s.tx.send(bytes.clone());
-        }
+        self.subscribers
+            .lock()
+            .unwrap()
+            .retain(|s| s.tx.try_send(bytes.clone()).is_ok());
     }
 
     /// 配置变更事件（setItems/reload 后）。事件名与前端约定一致："config.changed"。
@@ -92,5 +96,38 @@ impl EventSink {
     /// 需要重启才能完全生效的提示事件。
     pub fn emit_needs_restart(&self, data: Value) {
         self.broadcast("needsRestart", data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count(sink: &EventSink) -> usize {
+        sink.subscribers.lock().unwrap().len()
+    }
+
+    /// 设置窗口关掉后（接收端析构），下一次广播就把它移出表：此前只增不删。
+    #[test]
+    fn closed_subscriber_is_removed_on_broadcast() {
+        let sink = EventSink::new();
+        let live = sink.subscribe();
+        drop(sink.subscribe());
+        assert_eq!(count(&sink), 2);
+        sink.emit_config_changed(Value::Null);
+        assert_eq!(count(&sink), 1);
+        assert!(live.try_recv().is_ok(), "活着的订阅者照常收到");
+    }
+
+    /// 卡住不读的订阅者积压到上限即移除，内存不随事件数增长。
+    #[test]
+    fn stalled_subscriber_is_removed_when_queue_fills() {
+        let sink = EventSink::new();
+        let stuck = sink.subscribe();
+        for _ in 0..SUBSCRIBER_QUEUE_CAP + 1 {
+            sink.emit_config_changed(Value::Null);
+        }
+        assert_eq!(count(&sink), 0);
+        assert_eq!(stuck.try_iter().count(), SUBSCRIBER_QUEUE_CAP);
     }
 }

@@ -17,6 +17,8 @@ use crate::server::PipeHandle;
 /// 推送管道配置
 pub struct PushConfig {
     pub suffix: String,
+    /// 单次写超时。⚠ **当前两端都没接上**：写线程是无限期阻塞写，卡住的对端靠发送队列
+    /// 上限 [`PUSH_QUEUE_CAP`] 兜住内存。
     pub write_timeout_ms: u64,
 }
 
@@ -29,12 +31,57 @@ impl Default for PushConfig {
     }
 }
 
+/// 每个客户端发送队列的帧数上限。
+///
+/// 写线程用的是阻塞 `WriteFile`：对端进程挂起（UWP 被挂起、调试器停住）但不断开时，
+/// 64 KB 管道缓冲一满它就停在那里，此前的无界队列会把之后每一帧广播都攒在内存里。
+/// 正常情况下队列几乎是空的（写线程即收即写），连接握手时的一批配置推送约 14 帧，
+/// 64 帧足够吸收突发；真满了说明对端不读了，见 [`offer`] 的处置。
+///
+/// 不取更大：`sync_channel` 创建时就按容量分配槽位（实测 256 槽 ≈ 8.8 KB/客户端，而
+/// 每个加载了 TSF 的进程都有客户端），上限本身不该变成新的常驻开销。
+pub(crate) const PUSH_QUEUE_CAP: usize = 64;
+
+pub(crate) fn push_channel() -> (
+    std::sync::mpsc::SyncSender<Vec<u8>>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    std::sync::mpsc::sync_channel(PUSH_QUEUE_CAP)
+}
+
+/// 投一帧进客户端队列，返回该客户端是否已卡死（队列满）。
+///
+/// 卡死的客户端由调用方移出客户端表：发送端随之析构，写线程一旦解除阻塞就把余下的帧写完、
+/// `recv` 出错、断开管道；DLL 的读线程感知断开后重连，重连握手会做全量状态同步。比起
+/// 「满了就丢帧」，这样对端恢复后拿到的是当前状态，而不是半截过期帧。
+/// 对端已断开（`Disconnected`）不算卡死——写线程自己会清理表项。
+fn offer(c: &PushClient, data: Vec<u8>) -> bool {
+    matches!(
+        c.tx.try_send(data),
+        Err(std::sync::mpsc::TrySendError::Full(_))
+    )
+}
+
+/// 把 [`offer`] 判为卡死的客户端移出表。
+fn drop_stalled(clients: &mut Vec<PushClient>, stalled: &[u64]) {
+    if stalled.is_empty() {
+        return;
+    }
+    clients.retain(|c| !stalled.contains(&c.token));
+    for t in stalled {
+        warn!(
+            "Push client 0x{:016X} 发送队列已满（{} 帧，对端不读），断开待其重连",
+            t, PUSH_QUEUE_CAP
+        );
+    }
+}
+
 /// 客户端连接信息
 pub(crate) struct PushClient {
     /// 客户端 token（PID << 32 | instance_counter；unix 端由服务端发号）
     pub(crate) token: u64,
     /// 发送通道（writer 线程独占管道句柄）
-    pub(crate) tx: std::sync::mpsc::Sender<Vec<u8>>,
+    pub(crate) tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     /// 是否已触发过 connected_hook。
     ///
     /// 存在的意义是**跨越 hook 注册时刻**：`start()` 在 main.rs 早期就开始 accept，而
@@ -144,13 +191,14 @@ impl PushServer {
     /// 广播会把按别的进程计算的位污染给无关客户端（真机踩坑：SearchHost 收到兄弟进程的
     /// avail=0 推送后陷入 Band 窗口销毁重建循环）。
     pub fn push_to_token(&self, token: u64, data: &[u8]) -> bool {
-        let clients = self.clients.lock().unwrap();
-        if let Some(c) = clients.iter().find(|c| c.token == token) {
-            let _ = c.tx.send(data.to_vec());
-            true
-        } else {
-            false
+        let mut clients = self.clients.lock().unwrap();
+        let Some(c) = clients.iter().find(|c| c.token == token) else {
+            return false;
+        };
+        if offer(c, data.to_vec()) {
+            drop_stalled(&mut clients, &[token]);
         }
+        true
     }
 
     /// 记录活动客户端 token（焦点获取 / IME 激活时调用）
@@ -257,7 +305,8 @@ impl PushServer {
     /// 生产代码不调用；它不开管道、不起线程，只往客户端表里加一项。
     #[doc(hidden)]
     pub fn attach_capture_client(&self, token: u64) -> std::sync::mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        // 测试可能攒很多帧才读，给足余量，别让 [`PUSH_QUEUE_CAP`] 把它当卡死踢掉。
+        let (tx, rx) = std::sync::mpsc::sync_channel(4096);
         self.clients.lock().unwrap().push(PushClient {
             token,
             tx,
@@ -269,10 +318,7 @@ impl PushServer {
 
     /// 向所有连接客户端广播消息（用于状态/激活同步，幂等无副作用）
     pub fn push_to_active(&self, data: &[u8]) {
-        let clients = self.clients.lock().unwrap();
-        for client in clients.iter() {
-            let _ = client.tx.send(data.to_vec());
-        }
+        self.push_per_client(|_| data.to_vec());
     }
 
     /// 逐客户端生成并投递消息：`make(token)` 按各自的 token 现算内容。
@@ -280,10 +326,13 @@ impl PushServer {
     /// 用于 **per-app 配置**——不同宿主进程的取值不同（如 `compat.toml` 按进程关掉自动配对），
     /// 拿 [`Self::push_to_active`] 广播同一条会把某个进程的规则套到所有进程头上。
     pub fn push_per_client(&self, make: impl Fn(u64) -> Vec<u8>) {
-        let clients = self.clients.lock().unwrap();
-        for client in clients.iter() {
-            let _ = client.tx.send(make(client.token));
-        }
+        let mut clients = self.clients.lock().unwrap();
+        let stalled: Vec<u64> = clients
+            .iter()
+            .filter(|c| offer(c, make(c.token)))
+            .map(|c| c.token)
+            .collect();
+        drop_stalled(&mut clients, &stalled);
     }
 
     /// 某个宿主进程的全部推送客户端 token（token 高 32 位是 pid）。一个进程可能有多个
@@ -306,25 +355,38 @@ impl PushServer {
     /// 读取即复位计数、不再依赖投递结果）。
     pub fn push_commit_to_active(&self, data: &[u8]) -> bool {
         let active = self.active_token.load(Ordering::Relaxed);
-        let clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap();
         if clients.is_empty() {
             return false;
         }
-        if active != 0
-            && let Some(c) = clients.iter().find(|c| c.token == active)
+        let target = if active != 0
+            && let Some(i) = clients.iter().position(|c| c.token == active)
         {
-            return c.tx.send(data.to_vec()).is_ok();
-        }
-        if clients.len() == 1 {
-            clients[0].tx.send(data.to_vec()).is_ok()
+            Some(i)
+        } else if clients.len() == 1 {
+            Some(0)
         } else {
-            warn!(
-                "push_commit: 无匹配活动客户端 (active=0x{:016X}, clients={})，跳过以防多发",
-                active,
-                clients.len()
-            );
-            false
+            None
+        };
+        if let Some(i) = target {
+            let token = clients[i].token;
+            return match clients[i].tx.try_send(data.to_vec()) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // 这一帧没入队，对端重连后的全量同步也补不回上屏这类副作用帧。
+                    warn!("push_commit: 活动客户端 0x{token:016X} 卡死，本条上屏帧丢弃");
+                    drop_stalled(&mut clients, &[token]);
+                    false
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            };
         }
+        warn!(
+            "push_commit: 无匹配活动客户端 (active=0x{:016X}, clients={})，跳过以防多发",
+            active,
+            clients.len()
+        );
+        false
     }
 
     /// 推送 ActivationStatus 给活跃客户端
@@ -530,7 +592,7 @@ fn serve_push_client(
     debug!("Push client token: 0x{:016X}", token);
 
     // 创建发送通道
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = push_channel();
 
     // 注册客户端（不持有 pipe handle，本线程稍后独占）
     let client = PushClient {
@@ -651,7 +713,7 @@ mod tests {
     #[test]
     fn push_to_token_exact_match_no_fallback() {
         let srv = PushServer::new(PushConfig::default());
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = push_channel();
         srv.clients_for_test().lock().unwrap().push(PushClient {
             token: 0xAA_0000_0001,
             tx,
@@ -667,8 +729,42 @@ mod tests {
         assert!(rx.try_recv().is_err(), "不匹配的 token 不得收到任何帧");
     }
 
+    /// 对端不读（写线程卡在 WriteFile）时，队列满即把它移出客户端表：内存封顶在
+    /// [`PUSH_QUEUE_CAP`] 帧，且别的客户端照常收帧。此前是无界队列，卡多久涨多久。
+    #[test]
+    fn stalled_client_is_dropped_when_queue_fills() {
+        let srv = PushServer::new(PushConfig::default());
+        let (stuck_tx, stuck_rx) = push_channel(); // 持有但从不读 = 卡住的对端
+        let (live_tx, live_rx) = push_channel();
+        let clients = srv.clients_for_test();
+        {
+            let mut c = clients.lock().unwrap();
+            c.push(PushClient {
+                token: 1,
+                tx: stuck_tx,
+                hooked: true,
+            });
+            c.push(PushClient {
+                token: 2,
+                tx: live_tx,
+                hooked: true,
+            });
+        }
+        for i in 0..PUSH_QUEUE_CAP + 10 {
+            srv.push_to_active(&[i as u8]);
+            while live_rx.try_recv().is_ok() {}
+        }
+        let tokens: Vec<u64> = clients.lock().unwrap().iter().map(|c| c.token).collect();
+        assert_eq!(tokens, vec![2], "卡住的客户端该被移除，正常的留下");
+        assert_eq!(
+            stuck_rx.try_iter().count(),
+            PUSH_QUEUE_CAP,
+            "积压不得超过上限"
+        );
+    }
+
     fn add_test_client(srv: &PushServer, token: u64) {
-        let (tx, _rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (tx, _rx) = push_channel();
         srv.clients_for_test().lock().unwrap().push(PushClient {
             token,
             tx,
