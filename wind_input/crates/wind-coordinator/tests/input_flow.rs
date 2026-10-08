@@ -5819,6 +5819,81 @@ fn test_web_theme_resolved_falls_back_to_default_theme() {
     assert!(v["fontSize"].as_i64().unwrap() > 0, "{v}");
 }
 
+/// 设置窗跟随输入法主题色的取色源：出厂主题两档都要有可解析的 accent / accentText。
+#[test]
+fn test_web_theme_accent_all_builtin_themes_have_both_bands() {
+    if !has_schemas() {
+        eprintln!("skip: no build_dev/data");
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let list = coord
+        .web_data_rpc("theme.list", &serde_json::json!({}))
+        .unwrap();
+    let ids: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(!ids.is_empty());
+    for id in ids {
+        let v = coord
+            .web_data_rpc("theme.accent", &serde_json::json!({ "name": id }))
+            .unwrap();
+        assert_eq!(v["themeId"].as_str(), Some(id.as_str()), "{v}");
+        for band in ["light", "dark"] {
+            for key in ["accent", "accentText"] {
+                let c = v[band][key].as_str().unwrap_or_default();
+                assert!(
+                    c.starts_with('#') && (c.len() == 7 || c.len() == 9),
+                    "{id}.{band}.{key} 应为 #RRGGBB[AA]：{v}"
+                );
+            }
+        }
+    }
+}
+
+/// 清风·绿的 accent_text 亮暗两档不同（#059669 / #34d399）：确认两档是分别解析的，
+/// 不是同一档复制两份。
+#[test]
+fn test_web_theme_accent_bands_resolve_separately() {
+    if !has_schemas() {
+        eprintln!("skip: no build_dev/data");
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let v = coord
+        .web_data_rpc("theme.accent", &serde_json::json!({ "name": "jade" }))
+        .unwrap();
+    assert_eq!(v["light"]["accentText"].as_str(), Some("#059669"), "{v}");
+    assert_eq!(v["dark"]["accentText"].as_str(), Some("#34D399"), "{v}");
+}
+
+#[test]
+fn test_web_theme_accent_defaults_to_current_and_falls_back() {
+    if !has_schemas() {
+        eprintln!("skip: no build_dev/data");
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.ui.theme.name = "jade".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    // 不带 name（或空串）取当前主题。
+    for params in [serde_json::json!({}), serde_json::json!({ "name": "" })] {
+        let v = coord.web_data_rpc("theme.accent", &params).unwrap();
+        assert_eq!(v["themeId"].as_str(), Some("jade"), "{v}");
+    }
+    // 不存在的主题降级为 FALLBACK_THEME，themeId 如实报出。
+    let v = coord
+        .web_data_rpc(
+            "theme.accent",
+            &serde_json::json!({ "name": "不存在的主题" }),
+        )
+        .unwrap();
+    assert_eq!(v["themeId"].as_str(), Some("default"), "{v}");
+}
+
 /// 造一个只含若干最小码表方案的临时数据目录：`(id, 方案文件里追加的段)`。
 ///
 /// 覆盖反查要测「方案文件与 override 层写同一个键」，而测试不能往真实 `build_dev/data`

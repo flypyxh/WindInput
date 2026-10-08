@@ -56,6 +56,8 @@ pub trait WebDataHost {
 
     /// 主题对外观可覆盖键给出的值（设置端「跟随主题（值）」），见 `theme_query.rs`。
     fn theme_follow_values(&self) -> Option<crate::theme_query::ThemeFollowValues>;
+    /// 主题强调色两档（设置窗「主题色跟随输入法」），`name` 缺省取当前主题。
+    fn theme_accent(&self, name: Option<&str>) -> Option<crate::theme_query::ThemeAccent>;
 
     /// 加词界面的默认上下文（目标方案 + 最近上屏文本），见
     /// [`crate::handle_addword::AddWordContext`]。
@@ -304,6 +306,9 @@ impl WebDataHost for Coordinator {
     }
     fn theme_follow_values(&self) -> Option<crate::theme_query::ThemeFollowValues> {
         Coordinator::theme_follow_values(self)
+    }
+    fn theme_accent(&self, name: Option<&str>) -> Option<crate::theme_query::ThemeAccent> {
+        Coordinator::theme_accent(self, name)
     }
     fn quick_format_rows(&self) -> Vec<crate::handle_quick_format::QuickFormatRow> {
         Coordinator::quick_format_rows(self)
