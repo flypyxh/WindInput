@@ -118,7 +118,7 @@ fn common_han_reproduces_the_existing_verdict_shape() {
         "名单该在列表体里，实得 {} 条",
         han.added.len()
     );
-    // ★ 一行连写多字：8104 个字挤在两百来行里，而不是 8104 行。
+    // ★ 一行连写多字：8105 个字挤在两百来行里，而不是 8105 行。
     // 顺序按《通用规范汉字表》的级别排（一级 → 二级 → 三级），设置页照它分页。
     for ch in ["一", "乙", "二"] {
         assert!(han.added.contains(&ch.to_string()), "名单里该有「{ch}」");
