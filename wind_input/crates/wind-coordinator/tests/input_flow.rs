@@ -482,13 +482,53 @@ fn test_numpad_direct_outputs_digit() {
         other => panic!("direct 小键盘应 InsertText，实际: {:?}", other),
     }
 
-    // 空组合时无候选可顶：仅输出数字本身。
+    // 空组合（半角）时无候选可顶：透传，由宿主自己出字——与主键盘数字同一语义。
+    // 曾经是「我们 InsertText 出这个数字」，在 Chrome 类宿主里双重上屏（论坛 t285），
+    // 完整理由见 `test_numpad_direct_idle_passthrough`。
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
     let act = coord.handle_key_event(&key_event(0x65, EVENT_KEY_DOWN));
-    assert_eq!(
-        action_text(&act).unwrap_or_default(),
-        "5",
-        "空组合 direct 小键盘应只输出数字"
+    assert!(
+        matches!(act, KeyAction::PassThrough),
+        "空组合 direct 小键盘应透传，实际: {:?}",
+        act
+    );
+}
+
+/// 论坛 t285：中文模式空闲（无组合、无候选）+ 半角时，小键盘数字与运算符必须透传。
+///
+/// C++ 的 OnTestKeyDown 对这批键（ClassifyInputKey 归 Number）在无会话时**不吃**，而
+/// OnKeyDown 在中文模式下仍会把 Number 转发给服务端。Chrome 类宿主（Twitter / VK 的 PIN
+/// 框）无视 test 的「不吃」照调 OnKeyDown：宿主自己出一次、我们 InsertText 再出一次 ⇒
+/// 双重上屏。主键盘数字同场景回 PassThrough，所以从来没这个问题。
+///
+/// 全角态不在此列：C++ 的 `chinese_fullwidth_number` 分支此时会吃键，服务端必须出字
+/// （由 `test_numpad_half_width_direct` 等守着）。
+#[test]
+fn test_numpad_direct_idle_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    for half_width in [false, true] {
+        let mut cfg = config_with("wubi86");
+        cfg.input.numpad_half_width = half_width;
+        let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+        // Numpad0 / Numpad9 / * / + / - / . / /
+        for vk in [0x60_u32, 0x69, 0x6A, 0x6B, 0x6D, 0x6E, 0x6F] {
+            let act = coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN));
+            assert!(
+                matches!(act, KeyAction::PassThrough),
+                "中文空闲半角下小键盘 vk=0x{vk:02X} 应透传（numpad_half_width={half_width}），实际: {act:?}"
+            );
+        }
+    }
+    // 有组合时语义不变：顶屏高亮候选再接运算符。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let act = coord.handle_key_event(&key_event(0x6B, EVENT_KEY_DOWN)); // VK_ADD
+    let text = action_text(&act).unwrap_or_default();
+    assert!(
+        text.ends_with('+') && text.chars().count() > 1,
+        "有组合时小键盘 + 应顶屏候选再接 +，实际: {act:?}"
     );
 }
 

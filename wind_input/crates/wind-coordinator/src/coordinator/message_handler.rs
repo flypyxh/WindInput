@@ -1467,13 +1467,28 @@ impl MessageHandler for Coordinator {
         // 高亮候选（含逐步转换的已转换前缀），再接着输出该小键盘字符。
         // follow_main 时键已在 handle_key_event 入口归一化为主键盘等价键，永不到达此处。
         if let Some(npc) = numpad_char(data.key_code) {
+            let has_comp = !state.input_buffer.is_empty()
+                || !state.committed_text.is_empty()
+                || !state.candidates.is_empty();
+            // 空闲 + 半角：透传，由宿主自己出字——与主键盘数字空缓冲臂（`VK_1..=VK_9`）同一语义，
+            // 判据也同源（联想态挂在 `candidates` 上，算有组合）。
+            //
+            // ⛔ 不能由我们 InsertText 出字（论坛 t285）：C++ OnTestKeyDown 对无会话的 Number
+            // 类（含小键盘全部 15 键）判「不吃」，但 OnKeyDown 在中文模式仍把它转发过来；
+            // Chrome 类宿主（Twitter / VK 的 PIN 框）无视 test 结论照调 OnKeyDown ⇒ 宿主自己
+            // 出一次、我们再插一次，双重上屏。
+            //
+            // 全角态必须照旧出字：C++ 的 `chinese_fullwidth_number` 分支那时**会吃**这批键，
+            // 透传就成了「吃了再吐」。`numpad_half_width` 开着的全角态也一样（吃键与否 C++
+            // 只看全角，不看这个开关），出的半角字由下方 `commit_highlight_then_char` 负责。
+            if !has_comp && !state.full_width {
+                self.record_commit(&npc.to_string(), 0, -1, CommitSource::Punctuation);
+                return KeyAction::PassThrough;
+            }
             // 命令候选顶屏 → 执行命令（与按空格一致），不上屏 display 标签、不追加该字符。
             if let Some(act) = self.top_commit_command_guard(&mut state) {
                 return act;
             }
-            let has_comp = !state.input_buffer.is_empty()
-                || !state.committed_text.is_empty()
-                || !state.candidates.is_empty();
             return self.commit_highlight_then_char(&mut state, npc, has_comp);
         }
 
@@ -2911,16 +2926,22 @@ impl MessageHandler for Coordinator {
             "toggle_mode: {} -> 翻转",
             if self.is_chinese_mode() { "中" } else { "英" }
         );
-        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，语义是"回到可输入中文
+        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，出厂语义是"回到可输入中文
         // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
         // chinese_mode 原本为 true（被 CapsLock 压制）时翻转反而落到英文，切换仍然无效。
+        // 落点可配（`input.capslock.mode_after_cancel`，论坛 t283 要「取消大写并进英文」），
+        // 判定见 `mode_after_caps_cancel`。
         let caps_cancelled = self.cancel_caps_on_switch();
         // 中英切换 = 一段输入结束。须在取 state 锁之前调用：terminate_auto_phrase 内部
         // 走词库 IO，不可在持 state 锁时进行。
         self.terminate_auto_phrase("toggle_mode");
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = if caps_cancelled {
-            true
+            Self::mode_after_caps_cancel(
+                &self.rt().config.input.capslock.mode_after_cancel,
+                CapsCancelSwitch::Toggle,
+                state.chinese_mode,
+            )
         } else {
             !state.chinese_mode
         };
@@ -2993,8 +3014,23 @@ impl MessageHandler for Coordinator {
             if chinese_mode { "中" } else { "英" }
         );
         // 「切换模式时取消大小写锁定」：目标模式由外部指定（Ctrl+Space/KBLSwitch），
-        // 仅取消 CapsLock 让目标模式真正生效，不改写目标。
-        let _ = self.cancel_caps_on_switch();
+        // 出厂只取消 CapsLock 让目标模式真正生效，不改写目标；`mode_after_cancel = english`
+        // 时改落英文（论坛 t283），判定与 Shift 那条同一函数（`mode_after_caps_cancel`）。
+        // 改写**只对用户按出来的切换**生效：宿主写 compartment / 菜单按请求落地，来源分派见
+        // `CapsCancelSwitch::from_system`。
+        //
+        // ⚠ 改写了目标时回包的模式就与请求不同——DLL 的 `_ApplyModeSwitch` 见到
+        // `newChineseMode != requestedMode` 会把 compartment 拉回真实模式，与 per-app
+        // 「忽略宿主关闭输入法」拒绝请求走的是同一条仲裁回路。
+        let chinese_mode = if self.cancel_caps_on_switch() {
+            Self::mode_after_caps_cancel(
+                &self.rt().config.input.capslock.mode_after_cancel,
+                CapsCancelSwitch::from_system(chinese_mode, source, ctrl_held),
+                self.is_chinese_mode(),
+            )
+        } else {
+            chinese_mode
+        };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。

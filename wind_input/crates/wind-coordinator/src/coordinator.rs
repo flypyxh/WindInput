@@ -1272,6 +1272,43 @@ pub(crate) struct SchemaToggleOrigin {
     pub(crate) trigger_vk: u32,
 }
 
+/// 触发「取消大写」的切换来自哪条路径，见 [`Coordinator::mode_after_caps_cancel`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapsCancelSwitch {
+    /// 本地切换键（Shift 等）：没有方向，只说「切一下」。
+    Toggle,
+    /// 用户按出来的系统切换（Ctrl+空格 / 系统输入法开关热键）：携带目标模式（`true`＝中文）。
+    System(bool),
+    /// 非用户发起的切换（宿主写 compartment、功能菜单、旧版 DLL 无 Ctrl）：携带目标模式，
+    /// **恒按请求落地**、不吃 `mode_after_cancel` 的改写——宿主请求「中文」时 CapsLock
+    /// 恰好开着被取消，不能因为用户选了 `english` 就落成英文。
+    Host(bool),
+}
+
+impl CapsCancelSwitch {
+    /// 按 `CMD_SYSTEM_MODE_SWITCH` 的来源分派。「是不是用户按的」判据与
+    /// [`Coordinator::host_ime_close_ignored`] 同源：系统热键（Ctrl+空格）翻 compartment 时
+    /// Ctrl 尚未释放，宿主自己写则没有伴随按键；按键侧兜底（`CtrlSpaceKey`）恒算用户发起。
+    /// 菜单是用户**明确点了目标**，没有「切一下」的歧义，按请求。
+    pub(crate) fn from_system(
+        requested: bool,
+        source: wind_ipc::protocol::ModeSwitchSource,
+        ctrl_held: bool,
+    ) -> Self {
+        use wind_ipc::protocol::ModeSwitchSource as Src;
+        let by_user = match source {
+            Src::CtrlSpaceKey => true,
+            Src::CompartmentOpenClose | Src::CompartmentConversion | Src::Unknown => ctrl_held,
+            Src::Menu => false,
+        };
+        if by_user {
+            Self::System(requested)
+        } else {
+            Self::Host(requested)
+        }
+    }
+}
+
 /// 中央协调器
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
@@ -3581,6 +3618,32 @@ impl Coordinator {
             return false;
         }
         self.force_cancel_caps_lock()
+    }
+
+    /// 切中英时**已经取消了大写锁定**，此刻该落到哪个模式（`input.capslock.mode_after_cancel`，
+    /// 论坛 t283）。只在 [`Self::cancel_caps_on_switch`] 返回真时调用；没取消时两条路径照旧
+    /// （Shift 翻转、Ctrl+空格 按请求），不经这里。
+    ///
+    /// `chinese`（出厂）对两条路径给的是**不同的**结果，这是有意的：它逐字保留本配置出现前
+    /// 的行为——Shift 没有方向，旧逻辑归位中文（翻转的话，被大写压着的 `chinese_mode=true`
+    /// 会翻成英文，用户看来「切了没反应」）；Ctrl+空格 带着系统算好的目标，旧逻辑只取消大写、
+    /// 不改目标。
+    pub(crate) fn mode_after_caps_cancel(
+        setting: &str,
+        switch: CapsCancelSwitch,
+        current: bool,
+    ) -> bool {
+        match (setting, switch) {
+            (_, CapsCancelSwitch::Host(requested)) => requested,
+            ("english", _) => false,
+            ("toggle", CapsCancelSwitch::Toggle) => !current,
+            (_, CapsCancelSwitch::System(requested)) => requested,
+            ("chinese", CapsCancelSwitch::Toggle) => true,
+            (other, CapsCancelSwitch::Toggle) => {
+                warn!("input.capslock.mode_after_cancel 取值 {other:?} 不认识，按 chinese 处理");
+                true
+            }
+        }
     }
 
     /// 取消大小写锁定，**不看配置开关**。仅供语义前提为「我要用中文打字」的动作调用
@@ -15133,6 +15196,106 @@ mod initial_mode_tests {
         let s = c.state.lock().unwrap();
         assert!(s.caps_lock, "配置关不得动 CapsLock");
         assert!(!s.chinese_mode, "配置关保持原翻转语义");
+    }
+
+    /// 论坛 t283：取消大写之后落到哪个模式（`input.capslock.mode_after_cancel`）。
+    ///
+    /// 注入 CapsLock 走真实 SendInput，单测里取消恒失败，故判定收成纯函数单独钉。
+    /// 矩阵的两条硬约束：出厂值 `chinese` 必须逐字保留旧行为——Shift 归位中文、
+    /// Ctrl+空格 按它自己请求的方向；`english` 两条路都进英文（楼主要的就是这个）。
+    #[test]
+    fn mode_after_caps_cancel_matrix() {
+        use super::CapsCancelSwitch::{System, Toggle};
+        let f = Coordinator::mode_after_caps_cancel;
+        for cur in [true, false] {
+            // 出厂：Shift 归位中文（不看当前模式），Ctrl+空格 按请求。
+            assert!(f("chinese", Toggle, cur), "chinese/Shift 应归位中文");
+            for req in [true, false] {
+                assert_eq!(
+                    f("chinese", System(req), cur),
+                    req,
+                    "chinese/Ctrl+空格 应按请求"
+                );
+                assert_eq!(
+                    f("toggle", System(req), cur),
+                    req,
+                    "toggle/Ctrl+空格 应按请求"
+                );
+                assert!(
+                    !f("english", System(req), cur),
+                    "english/Ctrl+空格 应进英文"
+                );
+            }
+            assert!(!f("english", Toggle, cur), "english/Shift 应进英文");
+            assert_eq!(f("toggle", Toggle, cur), !cur, "toggle/Shift 应照常翻转");
+            // 认不出的值回落出厂语义（设置端 options 与 core 值域脱节时不至于乱跳）。
+            assert!(f("bogus", Toggle, cur));
+            assert!(f("", Toggle, cur));
+        }
+    }
+
+    /// `CMD_SYSTEM_MODE_SWITCH` 的来源分派：只有**用户按出来的**切换才吃
+    /// `mode_after_cancel` 的改写，宿主写 compartment / 菜单 / 旧版 DLL 无 Ctrl 的一律
+    /// 按请求落地——否则 CapsLock 恰好开着时，宿主请求的「中文」会被 `english` 落成英文。
+    #[test]
+    fn caps_cancel_switch_from_system_source() {
+        use super::CapsCancelSwitch;
+        use wind_ipc::protocol::ModeSwitchSource as Src;
+        let f = CapsCancelSwitch::from_system;
+        for req in [true, false] {
+            // 用户发起：按键侧兜底恒算；系统热键翻 compartment 时 Ctrl 还按着。
+            assert_eq!(
+                f(req, Src::CtrlSpaceKey, false),
+                CapsCancelSwitch::System(req)
+            );
+            assert_eq!(
+                f(req, Src::CtrlSpaceKey, true),
+                CapsCancelSwitch::System(req)
+            );
+            for src in [
+                Src::CompartmentOpenClose,
+                Src::CompartmentConversion,
+                Src::Unknown,
+            ] {
+                assert_eq!(
+                    f(req, src, true),
+                    CapsCancelSwitch::System(req),
+                    "{src:?}+Ctrl"
+                );
+                assert_eq!(
+                    f(req, src, false),
+                    CapsCancelSwitch::Host(req),
+                    "{src:?} 无 Ctrl"
+                );
+            }
+            // 菜单：用户明确点了目标，不改写。
+            assert_eq!(f(req, Src::Menu, false), CapsCancelSwitch::Host(req));
+        }
+        // 宿主来源在任何取值下都按请求，`english` 也不例外。
+        for setting in ["chinese", "english", "toggle"] {
+            for req in [true, false] {
+                for cur in [true, false] {
+                    assert_eq!(
+                        Coordinator::mode_after_caps_cancel(
+                            setting,
+                            CapsCancelSwitch::Host(req),
+                            cur
+                        ),
+                        req,
+                        "{setting} 宿主来源应按请求"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 出厂值：新字段缺省时必须是 `chinese`，老配置（只写了 cancel_on_mode_switch）行为不变。
+    #[test]
+    fn mode_after_cancel_defaults_to_chinese() {
+        assert_eq!(
+            Config::default().input.capslock.mode_after_cancel,
+            "chinese"
+        );
     }
 
     /// cancel_on_mode_switch=true 但 CapsLock 未开：不注入、正常翻转。

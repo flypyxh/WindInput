@@ -943,6 +943,11 @@ candidate_layout = "follow"
 # 切方案（直达热键 / 循环键 / 托盘）一律无条件取消大写并归位中文，不看本项：
 # 那两件事是「用新方案打字」的前提，不是可选副作用。
 cancel_on_mode_switch = false
+# 取消了大写之后落到哪个模式（仅上一项开着时有意义）：
+#   "chinese" — Shift 归位中文；Ctrl+空格 按它自己的切换方向（出厂，即本项出现前的行为）
+#   "english" — 一律进英文（取消大写接着打小写）
+#   "toggle"  — 照常切换：Shift 翻转中英，Ctrl+空格 按它自己的切换方向
+mode_after_cancel = "chinese"
 [input.temp_pinyin]
 enabled = true
 trigger_keys = ["backtick"]

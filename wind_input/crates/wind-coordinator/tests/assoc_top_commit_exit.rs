@@ -204,6 +204,27 @@ fn numpad_clears_assoc_hint() {
     next_input_follows_caret(&c, &rx);
 }
 
+/// 论坛 t285 的边界：小键盘在「空闲 + 半角」时改为透传，但联想态**不算空闲**——
+/// 联想挂着占位组合与候选，透传会把组合悬在宿主里、联想也收不掉。必须仍由我们出字
+/// （联想态不顶屏，故上屏的只有数字本身）。判据见 message_handler 小键盘臂的 `has_comp`。
+#[test]
+fn numpad_in_assoc_is_not_passthrough() {
+    if !dict_ready() {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let (c, _rx) = open(|_| {});
+    enter_assoc(&c);
+    let act = c.handle_key_event(&key(VK_NUMPAD1));
+    match &act {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "1", "联想态小键盘应只上屏数字（不顶联想候选）")
+        }
+        other => panic!("联想态小键盘不得透传，应 InsertText，实得 {other:?}"),
+    }
+    assert!(c.debug_assoc_texts().is_empty(), "联想应已收掉");
+}
+
 /// 绑到软键盘的引导键：软键盘不是模式，进不了「各 `enter_*` 清候选」那条隐式退出；
 /// 联想候选原样挂着、占位组合也没人收。
 #[test]

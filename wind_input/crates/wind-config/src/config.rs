@@ -4381,10 +4381,39 @@ impl Default for TempEnglishConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapslockConfig {
     #[serde(default)]
     pub cancel_on_mode_switch: bool,
+    /// 切中英时取消了大写锁定之后落到哪个模式（仅 `cancel_on_mode_switch` 开着时有意义）。
+    /// 字符串枚举（同 `temp_english.shift_behavior` 的既有风格），值域：
+    ///
+    /// - `chinese`（出厂）：Shift 等切换键归位中文（对齐搜狗）；Ctrl+空格 这类自带
+    ///   目标方向的切换按它请求的方向——两条都是本字段出现前的旧行为，逐字保留；
+    /// - `english`：两条路都进英文（论坛 t283：「输完大写想接着打小写」）；
+    /// - `toggle`：照常切换——Shift 翻转中英，Ctrl+空格 按请求方向。
+    ///
+    /// 只管**用户按出来的**切换；宿主写 compartment、功能菜单这类非用户发起的模式请求
+    /// 恒按请求落地，不受本项改写。
+    ///
+    /// 消费端见 `Coordinator::mode_after_caps_cancel`，认不出的值告警后回落 `chinese`。
+    /// 另起字段而非把 `cancel_on_mode_switch` 改成枚举：那个布尔已写进用户配置、设置端
+    /// 平台门控与文档，改类型要做旧值兼容反序列化，收益只是少一个键。
+    #[serde(default = "default_capslock_mode_after_cancel")]
+    pub mode_after_cancel: String,
+}
+
+impl Default for CapslockConfig {
+    fn default() -> Self {
+        Self {
+            cancel_on_mode_switch: false,
+            mode_after_cancel: default_capslock_mode_after_cancel(),
+        }
+    }
+}
+
+fn default_capslock_mode_after_cancel() -> String {
+    "chinese".to_string()
 }
 
 /// 生僻字模式配置（[input.rare_char]）。
