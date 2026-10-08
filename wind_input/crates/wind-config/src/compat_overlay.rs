@@ -309,7 +309,7 @@ fn parse_unset(v: &Value) -> Option<Vec<String>> {
     )
 }
 
-fn unset_of(o: &Obj) -> Vec<String> {
+pub(crate) fn unset_of(o: &Obj) -> Vec<String> {
     o.get("unset").and_then(parse_unset).unwrap_or_default()
 }
 

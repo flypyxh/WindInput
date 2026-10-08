@@ -2439,8 +2439,25 @@ impl MessageHandler for Coordinator {
         // ⚠ 取自 `mode_scope` 而非 `active_compat`：后者会被过渡窗口（任务栏）更新，
         // 拿它当「上一个模式归属宿主」会让紧随其后的桌面焦点被判成同进程、规则不再生效。
         // 详见 `mode_scope` 字段注释。
-        let (old_pid, old_has_rule) = *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner());
+        let old_scope = self
+            .mode_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // 窗口上下文记账**先于** update_active_compat：后者按该 token 记下的窗口解析规则
+        // （同进程换窗口时持续类字段即时刷新，见 `coordinator/window_ctx.rs`）。
+        let window = FocusWindow::of_focus(data);
+        // DLL 手里那份密码门控是按该 token **旧**窗口算的（没记录 = 握手时的空窗口），换窗口时
+        // 下面的 `apply_input_diag` 只降不升，见 `apply_input_diag_capped`。
+        let dll_pfe = self.password_force_english_for_token(data.client_token);
+        let window_changed = self.note_focus_window(data.client_token, window.clone());
         self.update_active_compat(data.client_token);
+        // 同一 token 换了窗口 ⇒ DLL 手里按 token 持有的那几项配置（占位字符、密码抑制、英文配对）
+        // 可能已不对，重推。放在下面 `apply_input_diag` 之前：服务端按新窗口算密码抑制时，DLL
+        // 那份尽量已在路上（不变量 core.suppress ⊆ C++.suppress，见 `apply_input_diag`）。
+        if window_changed {
+            self.repush_window_scoped_dll_config(data.client_token);
+        }
         let new_has_rule = self
             .active_compat
             .lock()
@@ -2548,12 +2565,18 @@ impl MessageHandler for Coordinator {
         // 取舍：per_app_scope 下同进程重复 focus_gained 不再重算（此前每次都算）。记忆表由
         // record_app_mode 与当前状态保持同步，重算结果恒等于现值，故语义无变化；代价是失去了
         // 一条隐式的 compartment 脏事件自愈路径，该自愈在 IME_ACTIVATED 路径仍然保留。
-        let crossed = new_pid != 0 && old_pid != new_pid;
+        //
+        // 「跨进程」扩展为「切进来」（`entry_crossed`）：同进程内命中的带窗口条件的进入类规则
+        // 集合变了也算（AutoHotkey 两个 GUI 窗口各配各的 initial_mode）。带标题条件的规则不进
+        // 这个集合，仅标题变化永不重算（设计稿定稿决策）。
+        //
         // 作用域一票否决：任务栏 / Alt+Tab 切换器与桌面同属 explorer.exe，仅凭进程名
         // 分不开，判据只能来自窗口类。名字取 update_active_compat 刚填好的缓存（此刻必已
         // 就绪）。未配作用域的进程恒放行 ⇒ 绝大多数应用零变化。
         // 详见 `InitialModeScopeRule` 与 should_reapply_initial 注释。
         let proc_name = self.cached_proc_name(data.client_token);
+        let new_entry = entry_window_key(&self.resolve_compat(&proc_name, &window));
+        let crossed = entry_crossed(&old_scope, new_pid, &new_entry);
         let out_of_scope = !self
             .app_compat
             .lock()
@@ -2578,7 +2601,12 @@ impl MessageHandler for Coordinator {
             // 只有**真正参与决策**的焦点才推进模式归属。过渡窗口跳过这一步，是为了不把
             // 「跨进程切入」这个一次性事件提前消费掉——否则点任务栏再回桌面时，桌面就成了
             // 「同进程」，它配的 initial_mode 永远不会生效（实测缺陷，见字段注释）。
-            *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = (new_pid, new_has_rule);
+            *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner()) = ModeScope {
+                pid: new_pid,
+                has_rule: new_has_rule,
+                entry_windows: new_entry,
+                window: window.clone(),
+            };
         }
         // 按应用方案（compat.toml `schema`）：与 initial_mode 同一个判据——跨进程切入才重算，
         // 同进程内焦点跳转不动，尊重用户在应用内的手切；作用域外的过渡窗口（任务栏）也不动，
@@ -2587,12 +2615,12 @@ impl MessageHandler for Coordinator {
         // 显式 `initial_punct` 规则要在它之后再落一次才压得住。
         // ⛔ 不得挪进 get_current_mode（DLL 同步阻塞路径），见 `coordinator/app_schema.rs`。
         if crossed && !out_of_scope {
-            self.apply_app_schema_on_focus(&proc_name);
+            self.apply_app_schema_on_focus(&proc_name, &window);
         }
         if should_reapply_initial(
             crossed,
             self.rt().config.input.default.per_app_scope(),
-            old_has_rule,
+            old_scope.has_rule,
             new_has_rule,
             out_of_scope,
         ) {
@@ -2606,7 +2634,13 @@ impl MessageHandler for Coordinator {
         // docMgr（Excel 单元格 ↔ 公式栏）不重复弹，见 last_focus_tip_token。
         self.show_focus_status_if_enabled(data.client_token);
         let pid = (data.client_token >> 32) as u32;
-        self.apply_input_diag(pid, data.disabled, data.reason, data.input_scope_mask);
+        self.apply_input_diag_capped(
+            pid,
+            data.disabled,
+            data.reason,
+            data.input_scope_mask,
+            !window_changed || dll_pfe,
+        );
         Some(status)
     }
 
@@ -2761,10 +2795,19 @@ impl MessageHandler for Coordinator {
         // `initial_chinese_mode_for` 在规则/记忆之外还有 remember_last_state 与配置默认两层。
         // 同源调用之后，这类漂移在结构上不可能再发生。
         let new_pid = (client_token >> 32) as u32;
-        let (old_pid, old_has_rule) = *self.mode_scope.lock().unwrap_or_else(|e| e.into_inner());
-        let crossed = new_pid != 0 && old_pid != new_pid;
+        let old_scope = self
+            .mode_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (old_pid, old_has_rule) = (old_scope.pid, old_scope.has_rule);
+        // 窗口用 DLL 随本请求带来的类名：重型段的记账（`note_focus_window`）还没跑，token 表里
+        // 是上一个窗口。跨越判据与重型段同源（`entry_crossed`）。
+        let window = FocusWindow::of_class(window_class);
+        let proc = self.cached_proc_name(client_token);
+        let resolved = self.resolve_compat(&proc, &window);
+        let crossed = entry_crossed(&old_scope, new_pid, &entry_window_key(&resolved));
         if crossed {
-            let proc = self.cached_proc_name(client_token);
             // 作用域一票否决，判据与重型段完全同源。
             // ⚠ **两处都要有**：本方法先跑且 DLL 正阻塞等它的回传值，只挡住重型段的话，
             // 状态早在这里就被改掉了，日志上却显示「已跳过」——实测就栽在这一步。
@@ -2779,8 +2822,10 @@ impl MessageHandler for Coordinator {
                     "get_current_mode: 窗口在初始模式作用域外 proc={proc} class={window_class:?} → 保持现状"
                 );
             } else if !proc.is_empty() {
-                let new_has_rule = self.rule_initial_mode(&proc).is_some()
-                    || self.rule_initial_punct(&proc).is_some();
+                let new_has_rule = resolved
+                    .rule
+                    .as_ref()
+                    .is_some_and(|r| r.initial_mode.is_some() || r.initial_punct.is_some());
                 let per_app = self.rt().config.input.default.per_app_scope();
                 let reapply = crate::coordinator::should_reapply_initial(
                     crossed,
@@ -2792,7 +2837,7 @@ impl MessageHandler for Coordinator {
                 if reapply {
                     // reset_aux=false：与重型段的调用逐字一致。随后重型段会用同样的入参
                     // 再调一次，`apply_initial_mode` 是幂等的（每次都按当前表重算目标）。
-                    self.apply_initial_mode(client_token, false);
+                    self.apply_initial_mode_in(client_token, &window, false);
                 }
                 // 锁先释放再打日志：本方法在 DLL 的同步阻塞路径上，不在持锁期间做格式化。
                 let (chinese, full, punct) = {
@@ -2835,6 +2880,7 @@ impl MessageHandler for Coordinator {
             self.push_server.set_active_token(client_token);
         }
         // 切回本输入法时同样刷新焦点进程的 caret 兼容态（异步段，不阻塞 DLL）。
+        // 本事件不带窗口信息：规则按该 token 最近一次 focus_gained 记下的窗口解析（没有则只按进程名）。
         self.update_active_compat(client_token);
         // 激活初始状态矩阵：remember=false 重置为配置默认（含全半角/标点）；
         // remember=true 保持全局记忆；state_scope="app" 恢复该应用的会话记忆。

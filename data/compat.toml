@@ -24,8 +24,6 @@
 #   disabled 的规则不参与。拿不到进程名时任何规则（含 "*"）都不命中。
 #   [[initial_mode_scope]] / [[commit_newline]] 不支持窗口条件（写了不生效）。
 #   设置页「应用兼容性」暂不显示带 class / title 的规则，只能在 compat.toml 里手写维护。
-#   ⚠ 目前协调器还只按进程名查规则（窗口上下文的接入在后续版本），带 class / title 的规则暂不生效；
-#     process = "*" 已对所有字段生效。
 #
 # 可用字段:
 #   process:              进程名（不区分大小写）；不写 = "*"
@@ -147,9 +145,9 @@
 #                         ⚠ GH#175：网页里的受控输入框会把组合中的内容 trim() 后回写
 #                         （番茄小说搜索框即是），空格一被去掉，浏览器就终止组合，一个字都
 #                         上不了屏。"zwsp" 改用零宽空格 U+200B，trim() 不去掉它。
-#                         出厂只给浏览器开；Electron 应用（如 Code.exe / Feishu.exe）若遇到
-#                         同样的问题，可按需加一行。不要给 WPS 等软件改：它们靠那个空格才能
-#                         给出有效的光标位置。支持 process = "*" 通配（见上一项）。
+#                         出厂按窗口类名给 Chromium（含所有 Electron 应用）与 Firefox 开（见下方
+#                         两条 class 规则）。不要给 WPS 等软件改：它们靠那个空格才能给出有效的
+#                         光标位置。支持 process = "*" 通配与 class / title 窗口条件。
 #   caret_offset_x:       光标坐标水平校正（dp，96dpi 基准逻辑像素，正=右，默认 0）。
 #   caret_offset_y:       光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下，默认 0）。
 #                         用于宿主报告的光标坐标**系统性偏移**的场景（如 Windows Terminal，
@@ -239,19 +237,23 @@ process = "et.exe"
 comment = "WPS 表格，与 Excel 同类：每个字都换一次 docMgr，且切换前先报上一个单元格的坐标与组合起点。fast 档的试探坐标抢在切换前首显于旧单元格，组合起点也随之锁死在那里——此后即便校正判据判出 277px 偏移触发 reshow，下发位置仍取那个锁死的组合起点，表现为候选窗恒慢一步"
 first_show_mode = "wait"
 
+# GH#175：按顶层窗口类名认浏览器内核，而不是逐个列进程名（Edge / Chrome / 各家套壳浏览器的
+# 进程名数不完）。⚠ Chrome_WidgetWin_* 是整个 Chromium 家族的窗口类，**所有 Electron / CEF 应用
+# 一并命中**：VS Code（Code.exe）、飞书、QQ NT、新版微信等。它们的网页输入框同样可能 trim；
+# 上面给 Code.exe / Feishu.exe / QQ.exe 写的进程规则不含本字段，逐字段叠加后照样继承 zwsp。
+# 某个应用改用零宽空格后出了问题（光标位置不对等），在用户层给它写
+#   [[apps]]
+#   process = "Xxx.exe"
+#   composition_placeholder = "space"
+# 进程规则比仅类名规则更具体，写了的字段压过它。
 [[apps]]
-process = "msedge.exe"
-comment = "Edge - 网页受控输入框会 trim 组合中的 value 再回写，占位空格被削掉即终止组合、一个字都上不了屏（GH#175，番茄小说搜索框）；改用零宽空格占位"
+class = "Chrome_WidgetWin_*"
+comment = "Chromium 内核（Edge / Chrome / Electron 应用）- 网页受控输入框会 trim 组合中的 value 再回写，占位空格被削掉即终止组合、一个字都上不了屏（GH#175，番茄小说搜索框）；改用零宽空格占位"
 composition_placeholder = "zwsp"
 
 [[apps]]
-process = "chrome.exe"
-comment = "Chrome - 同 Edge（GH#175）"
-composition_placeholder = "zwsp"
-
-[[apps]]
-process = "firefox.exe"
-comment = "Firefox - 同 Edge（GH#175）"
+class = "MozillaWindowClass"
+comment = "Firefox 内核 - 同上（GH#175）"
 composition_placeholder = "zwsp"
 
 # 示例：给「fast 判据失灵」的宿主退回 wait（本字段不写即跟随全局默认，无需逐个开启）

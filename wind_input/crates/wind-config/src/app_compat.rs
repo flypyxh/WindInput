@@ -16,7 +16,7 @@
 pub use crate::compat_overlay::{ANY_PROCESS, RuleId, wildcard_match};
 use crate::compat_overlay::{
     FieldEdit, Obj, Raw, apply_edits, compose, is_disabled, materialize, overlay_raw, parse_raw,
-    render_raw, rule_id, sanitize,
+    render_raw, rule_id, sanitize, unset_of,
 };
 use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
@@ -1622,7 +1622,17 @@ pub struct ResolvedRule {
     /// 留给协调器判断「命中的窗口规则变了没有」：进入类字段（initial_mode 等）只在 pid 变了、
     /// 或这个集合变了时才重算，仅标题变化不重算（设计稿「服务端判定」）。
     pub window_matches: Vec<RuleId>,
+    /// `window_matches` 里**自己写了（或 `unset` 了）进入类字段**（[`ENTRY_FIELDS`]）的那些，同序。
+    ///
+    /// 进入类字段的跨越判据看的是它而不是 `window_matches`：出厂的 `Chrome_WidgetWin_*` 只管
+    /// 占位字符，VS Code 里弹出个原生对话框（类名不同）就让它不再命中——若按 `window_matches`
+    /// 判，这一下就会被当成「切进了另一个规则窗口」，把用户在 VS Code 里手切的中英态冲掉。
+    pub entry_window_matches: Vec<RuleId>,
 }
+
+/// 进入类字段：只在焦点「切进来」那一刻生效（初始中英、初始标点、按应用方案），停留期间尊重
+/// 用户手切。其余字段都是持续类，随窗口上下文即时刷新。
+pub const ENTRY_FIELDS: [&str; 3] = ["initial_mode", "initial_punct", "schema"];
 
 /// 参与合成的一条 `[[apps]]` 规则（已跨层叠好、启用、单独反序列化过）。
 #[derive(Debug, Clone)]
@@ -1842,6 +1852,7 @@ impl AppCompat {
         let mut hit = false;
         let mut name: Option<&str> = None;
         let mut window_matches = Vec::new();
+        let mut entry_window_matches = Vec::new();
         for c in self.candidates.iter().filter(|c| c.matches(ctx)) {
             hit = true;
             acc = compose(&acc, &c.fields);
@@ -1850,6 +1861,13 @@ impl AppCompat {
             }
             if c.id.has_window_condition() {
                 window_matches.push(c.id.clone());
+                let unset = unset_of(&c.fields);
+                if ENTRY_FIELDS
+                    .iter()
+                    .any(|k| c.fields.contains_key(*k) || unset.iter().any(|u| u == k))
+                {
+                    entry_window_matches.push(c.id.clone());
+                }
             }
         }
         if !hit {
@@ -1871,6 +1889,7 @@ impl AppCompat {
         ResolvedRule {
             rule,
             window_matches,
+            entry_window_matches,
         }
     }
 
@@ -3280,19 +3299,62 @@ mod layering_tests {
             c.get_rule("qq.exe")
                 .is_some_and(|r| r.composition_start_pair_guard == Some(true))
         );
-        // GH#175：出厂只给浏览器换零宽空格占位，其余（WPS 等靠空格撑光标矩形）保持空格。
-        for browser in ["msedge.exe", "chrome.exe", "firefox.exe"] {
+        // GH#175：出厂按窗口类名给 Chromium / Firefox 内核换零宽空格占位（含所有 Electron 应用），
+        // 其余（WPS 等靠空格撑光标矩形）保持空格。
+        let placeholder = |process: &str, class: &str| {
+            c.resolve(&WindowCtx {
+                process,
+                class,
+                title: "",
+            })
+            .rule
+            .as_ref()
+            .and_then(|r| r.composition_placeholder)
+            .unwrap_or_default()
+        };
+        for (process, class) in [
+            ("msedge.exe", "Chrome_WidgetWin_1"),
+            ("chrome.exe", "Chrome_WidgetWin_1"),
+            ("firefox.exe", "MozillaWindowClass"),
+            ("Code.exe", "Chrome_WidgetWin_1"),
+            ("Feishu.exe", "Chrome_WidgetWin_0"),
+        ] {
             assert_eq!(
-                c.composition_placeholder_for(browser),
+                placeholder(process, class),
                 PlaceholderChar::Zwsp,
-                "{browser} 出厂应为 zwsp"
+                "{process} + {class} 出厂应为 zwsp"
             );
         }
-        for other in ["wps.exe", "WINWORD.EXE", "notepad.exe", "Code.exe"] {
+        // 进程规则（Code.exe 的 composition_start_pair_guard）与类名规则逐字段叠加，两者都在。
+        assert!(
+            c.resolve(&WindowCtx {
+                process: "Code.exe",
+                class: "Chrome_WidgetWin_1",
+                title: "",
+            })
+            .rule
+            .as_ref()
+            .is_some_and(|r| r.composition_start_pair_guard == Some(true))
+        );
+        for (process, class) in [
+            ("wps.exe", "OpusApp"),
+            ("WINWORD.EXE", "OpusApp"),
+            ("notepad.exe", "Notepad"),
+            // 拿不到类名 ⇒ 类名规则不命中：浏览器也退回空格（握手时还不知道窗口）。
+            ("msedge.exe", ""),
+            ("Code.exe", ""),
+        ] {
             assert_eq!(
-                c.composition_placeholder_for(other),
+                placeholder(process, class),
                 PlaceholderChar::Space,
-                "{other} 出厂应保持空格"
+                "{process} + {class:?} 出厂应保持空格"
+            );
+        }
+        for name in ["msedge.exe", "chrome.exe", "firefox.exe"] {
+            assert_eq!(
+                c.composition_placeholder_for(name),
+                PlaceholderChar::Space,
+                "按进程名（无窗口上下文）不再命中：出厂规则已换成类名"
             );
         }
         for class in ["Progman", "WorkerW"] {
@@ -4257,6 +4319,60 @@ mod resolve_tests {
             Some(false)
         );
         assert!(c.get_rule("b.exe").is_none());
+    }
+
+    /// 进入类字段的跨越判据只认「自己写了（或 unset 了）进入类字段」的窗口规则：只管占位、定位的
+    /// 窗口规则（出厂的 `Chrome_WidgetWin_*`）命中与否，不该让同进程内换窗口重算初始模式。
+    #[test]
+    fn resolve_reports_entry_window_matches_only_for_rules_touching_entry_fields() {
+        let c = one(r#"
+            [[apps]]
+            class = "Chrome_WidgetWin_*"
+            composition_placeholder = "zwsp"
+            [[apps]]
+            process = "a.exe"
+            class = "Dlg"
+            initial_mode = "english"
+            [[apps]]
+            process = "a.exe"
+            class = "U*"
+            unset = ["schema"]
+            [[apps]]
+            process = "a.exe"
+            title = "T*"
+            initial_punct = "chinese"
+            [[apps]]
+            process = "a.exe"
+            initial_mode = "chinese"
+        "#);
+        let id = |p: &str, class: &str, title: &str| RuleId {
+            process: p.into(),
+            class: class.into(),
+            title: title.into(),
+        };
+        let r = c.resolve(&ctx("a.exe", "Chrome_WidgetWin_1", ""));
+        assert_eq!(r.window_matches, vec![id("*", "chrome_widgetwin_*", "")]);
+        assert!(
+            r.entry_window_matches.is_empty(),
+            "只管占位的类名规则不算进入类"
+        );
+        let r = c.resolve(&ctx("a.exe", "Dlg", "Tab"));
+        assert_eq!(
+            r.entry_window_matches,
+            vec![id("a.exe", "dlg", ""), id("a.exe", "", "t*")]
+        );
+        let r = c.resolve(&ctx("a.exe", "Up", ""));
+        assert_eq!(
+            r.entry_window_matches,
+            vec![id("a.exe", "u*", "")],
+            "unset 进入类字段同样改变进入时的结果"
+        );
+        assert!(
+            c.resolve(&ctx("a.exe", "", ""))
+                .entry_window_matches
+                .is_empty(),
+            "纯进程规则不进集合"
+        );
     }
 
     /// P2 据此判断「命中的带窗口条件的规则集合变了没有」。

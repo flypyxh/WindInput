@@ -447,8 +447,17 @@ impl Coordinator {
     /// 当前焦点应用配了气泡定位规则时改**规则**（写成跟随光标、坐标清零），不碰全局——
     /// 读取侧规则压过全局，只改全局用户看不到任何变化（C2-33 / GH#148）。
     pub(crate) fn status_reset_position(&self) {
+        self.warn_if_menu_writeback_shadowed(
+            "status_reset_position",
+            |r: Option<&wind_config::app_compat::AppCompatRule>| {
+                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
+            },
+        );
         let name = self.active_process_name();
-        if self.rule_status_position(&name).is_some() {
+        if self
+            .rule_status_position(&name, &self.active_focus_window())
+            .is_some()
+        {
             use wind_config::app_compat::StatusPositionMode as SP;
             self.write_status_position_rule(&name, Some(SP::FollowCaret), 0, 0);
             return;
@@ -477,8 +486,14 @@ impl Coordinator {
     /// 不碰全局——判据与读取侧 `status_position` 同源，照 `save_candidate_pos`。
     pub(crate) fn save_status_tip_pos(&self, x: i32, y: i32) {
         use wind_config::app_compat::StatusPositionMode as SP;
+        self.warn_if_menu_writeback_shadowed(
+            "save_status_tip_pos",
+            |r: Option<&wind_config::app_compat::AppCompatRule>| {
+                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
+            },
+        );
         let name = self.active_process_name();
-        if let Some((mode, _, _)) = self.rule_status_position(&name) {
+        if let Some((mode, _, _)) = self.rule_status_position(&name, &self.active_focus_window()) {
             if mode == SP::Fixed {
                 let (x, y) = avoid_unset_sentinel(x, y);
                 self.write_status_position_rule(&name, Some(SP::Fixed), x, y);
@@ -517,8 +532,19 @@ impl Coordinator {
     /// 所有跟随全局的应用位置全被改掉。判据与读取侧 `candidate_fixed_pos` 同源：规则里
     /// 配了定位方式就以规则为准，没配才看全局。
     pub(crate) fn save_candidate_pos(&self, x: i32, y: i32) {
+        self.warn_if_menu_writeback_shadowed(
+            "save_candidate_pos",
+            |r: Option<&wind_config::app_compat::AppCompatRule>| {
+                r.and_then(|r| {
+                    r.candidate_position_mode
+                        .map(|m| (m, r.candidate_x, r.candidate_y))
+                })
+            },
+        );
         let name = self.active_process_name();
-        if let Some((rule_fixed, _, _)) = self.rule_candidate_fixed_pos(&name) {
+        if let Some((rule_fixed, _, _)) =
+            self.rule_candidate_fixed_pos(&name, &self.active_focus_window())
+        {
             if rule_fixed {
                 let (x, y) = avoid_unset_sentinel(x, y);
                 self.save_candidate_pos_for_app(&name, x, y);
@@ -649,8 +675,14 @@ impl Coordinator {
     /// 当前焦点应用配了气泡定位规则时翻转**规则**（固定 ↔ 跟随光标），随后的落盘也走规则。
     pub(crate) fn status_toggle_pinned(&self) {
         use wind_config::app_compat::StatusPositionMode as SP;
+        self.warn_if_menu_writeback_shadowed(
+            "status_toggle_pinned",
+            |r: Option<&wind_config::app_compat::AppCompatRule>| {
+                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
+            },
+        );
         let name = self.active_process_name();
-        if let Some((mode, x, y)) = self.rule_status_position(&name) {
+        if let Some((mode, x, y)) = self.rule_status_position(&name, &self.active_focus_window()) {
             let now_fixed = mode != SP::Fixed;
             if now_fixed {
                 // 先落方式（坐标沿用旧值，多半是 0 哨兵），再请 UI 报当前位置覆盖之。
@@ -941,6 +973,7 @@ impl Coordinator {
             self.compat_dirs.1.as_deref(),
         );
         *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        self.refresh_mode_scope_after_reload();
         #[cfg(windows)]
         self.sync_host_render_whitelist();
         self.relax_password_suppress_for_focus();
@@ -1188,7 +1221,13 @@ impl Coordinator {
             tracing::warn!("set_status_position_rule: 当前焦点进程未知，忽略本次设置");
             return;
         }
-        let (x, y) = match self.rule_status_position(&name) {
+        self.warn_if_menu_writeback_shadowed(
+            "set_status_position_rule",
+            |r: Option<&wind_config::app_compat::AppCompatRule>| {
+                r.and_then(|r| r.status_position_mode.map(|m| (m, r.status_x, r.status_y)))
+            },
+        );
+        let (x, y) = match self.rule_status_position(&name, &self.active_focus_window()) {
             Some((SP::Fixed, x, y)) => (x, y),
             _ => (0, 0),
         };
@@ -1286,7 +1325,7 @@ impl Coordinator {
         if code == 1 && !self.has_remembered_schema(&name) {
             self.remember_app_schema(&name, &self.engine_mgr.active_schema_id());
         }
-        self.apply_app_schema_on_focus(&name);
+        self.apply_app_schema_on_focus(&name, &self.active_focus_window());
         tracing::info!(
             "应用独立方案 for process={name}: {}",
             value.as_deref().unwrap_or("(follow-global)")
@@ -1335,8 +1374,9 @@ impl Coordinator {
         // 3）刷新 active 缓存的判据位：同 pid 时 update_active_compat 提前 return，不会自己刷。
         //    漏掉这步会让「切出本应用时是否重算」用上过期的判据。
         //    注意先取值再持 active_compat 锁，避免与 app_compat 锁形成嵌套顺序。
-        let want_mode = self.rule_initial_mode(&name).map(|m| m.is_chinese());
-        let want_punct = self.rule_initial_punct(&name).map(|m| m.is_chinese());
+        let win = self.active_focus_window();
+        let want_mode = self.rule_initial_mode(&name, &win).map(|m| m.is_chinese());
+        let want_punct = self.rule_initial_punct(&name, &win).map(|m| m.is_chinese());
         self.active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1717,21 +1757,23 @@ impl Coordinator {
             // 却不生效，还会显示成没选。所以先置灰，让用户先启用这条规则再逐项设置。
             let has_proc = enabled;
             let enabled = enabled && rule_switch != wind_config::app_compat::RuleSwitch::Disabled;
-            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) = {
-                let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
-                let rule = table.get_rule(&proc);
-                (
-                    rule.and_then(|r| r.candidate_position_mode),
-                    rule.and_then(|r| r.ignore_host_ime_close),
-                    rule.and_then(|r| r.password_force_english),
-                    rule.and_then(|r| r.schema.clone()),
-                    rule.and_then(|r| r.status_position_mode),
-                    rule.and_then(|r| r.status_fallback_position),
-                )
-            };
-            let cur_first_show = self.rule_first_show_mode(&proc);
-            let cur_mode = self.rule_initial_mode(&proc);
-            let cur_punct = self.rule_initial_punct(&proc);
+            // 勾选显示的是**焦点窗口**生效中的值（与 auto_pair 读 active_compat 同口径）；菜单写回
+            // 仍只写纯进程键（带窗口条件的规则 P4 之前只能手写），见 app_compat 的写回接口。
+            let proc_win = self.active_focus_window();
+            let (cur_cand_pos, cur_ignore_close, cur_pfe, cur_schema, cur_status, cur_status_fb) =
+                self.with_compat_rule(&proc, &proc_win, |rule| {
+                    (
+                        rule.and_then(|r| r.candidate_position_mode),
+                        rule.and_then(|r| r.ignore_host_ime_close),
+                        rule.and_then(|r| r.password_force_english),
+                        rule.and_then(|r| r.schema.clone()),
+                        rule.and_then(|r| r.status_position_mode),
+                        rule.and_then(|r| r.status_fallback_position),
+                    )
+                });
+            let cur_first_show = self.rule_first_show_mode(&proc, &proc_win);
+            let cur_mode = self.rule_initial_mode(&proc, &proc_win);
+            let cur_punct = self.rule_initial_punct(&proc, &proc_win);
             let cur_auto_pair = self
                 .active_compat
                 .lock()

@@ -214,7 +214,6 @@ impl Coordinator {
             return false;
         };
         let name = self.cached_proc_name((pid as u64) << 32);
-        let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
         // `get_rule("")` 不吃通配（空名口径）；本判据历来对无名进程也认通配
         // （`an_unnamed_process_still_honours_the_wildcard_rule`），故显式取通配那条。
         let key = if name.is_empty() {
@@ -222,9 +221,10 @@ impl Coordinator {
         } else {
             name.as_str()
         };
-        table
-            .get_rule(key)
-            .and_then(|r| r.host_drawn_candidates)
+        // 窗口取该 pid 最近一次获焦的那个：游戏常常一次 focus_gained 都没有 ⇒ 空窗口 ⇒
+        // 只按进程名（窗口规则不命中），与引入窗口条件之前一致。
+        let win = self.focus_window_of_pid(pid);
+        self.with_compat_rule(key, &win, |r| r.and_then(|r| r.host_drawn_candidates))
             // ★★★ 没有规则 ⇒ **不**据此收窗（2026-09-15 反转，原为 `unwrap_or(true)`）。
             //
             // 「读走候选串 ⇒ 它在画」这条推断立案时自陈「至今没有反证样本」——那份日志里
@@ -658,7 +658,10 @@ mod tests {
             "\u{200B}",
             "浏览器（规则 zwsp）出口应是零宽空格"
         );
-        assert_eq!(c.composition_placeholder_for_pid(42), PlaceholderChar::Zwsp);
+        assert_eq!(
+            c.composition_placeholder_for_token(42 << 32),
+            PlaceholderChar::Zwsp
+        );
 
         press(&c, 0x1B); // Esc 收掉组合，换个焦点再打
         focus_pid(&c, 43);
@@ -668,11 +671,11 @@ mod tests {
             "未配规则的应用（WPS）保持空格"
         );
         assert_eq!(
-            c.composition_placeholder_for_pid(43),
+            c.composition_placeholder_for_token(43 << 32),
             PlaceholderChar::Space
         );
         assert_eq!(
-            c.composition_placeholder_for_pid(0),
+            c.composition_placeholder_for_token(0),
             PlaceholderChar::Space,
             "pid 未知 ⇒ 空格"
         );

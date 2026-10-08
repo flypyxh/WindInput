@@ -122,20 +122,22 @@ impl Coordinator {
         self.push_activation_status(client_token);
     }
 
-    /// 指定 PID 的进程是否启用符号自动配对（per-app 规则，未配则跟随全局）。
+    /// 推给 `token` 那个 DLL 的符号自动配对开关（per-app 规则，未配则跟随全局）。
     ///
-    /// ⚠ **按 PID 直查规则表，绝不走 `active_compat` 焦点槽**：本函数的调用方是推送路径，
+    /// ⚠ **按目标客户端直查规则表，绝不走 `active_compat` 焦点槽**：本函数的调用方是推送路径，
     /// 目标客户端未必是当前焦点进程（新客户端握手、配置变更广播都会推给后台进程）。
     /// 拿焦点槽的值会把焦点应用的规则套到别人头上——同 `host_render` 的既有纪律。
-    pub(super) fn auto_pair_allowed_for_pid(&self, pid: u32) -> bool {
-        self.compat_bool_for_pid(pid, |r| r.auto_pair)
+    /// 窗口取该 token 自己最近一次获焦的那个（同进程的不同 TSF 实例可能各在不同窗口）。
+    pub(super) fn auto_pair_allowed_for_token(&self, token: u64) -> bool {
+        self.compat_bool_for_token(token, |r| r.auto_pair)
             .unwrap_or(true)
     }
 
     /// 按 PID 直查 per-app 规则里的某个 `Option<bool>` 字段；pid / 进程名未知或未配 = `None`。
     ///
-    /// 与 [`Self::auto_pair_allowed_for_pid`] 同一纪律：**不走 `active_compat` 焦点槽**，
-    /// 调用方多是推送路径，目标客户端未必是焦点进程。
+    /// 与 [`Self::auto_pair_allowed_for_token`] 同一纪律：**不走 `active_compat` 焦点槽**，
+    /// 调用方多是推送路径，目标客户端未必是焦点进程。窗口取该 pid 最近一次获焦的那个
+    /// （[`Self::focus_window_of_pid`]）；没获焦过 ⇒ 不匹配窗口规则（设计稿「服务端判定」）。
     fn compat_bool_for_pid(
         &self,
         pid: u32,
@@ -144,35 +146,44 @@ impl Coordinator {
         if pid == 0 {
             return None;
         }
-        let name = {
-            let cached = self
-                .pid_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&pid)
-                .cloned();
-            cached.unwrap_or_else(|| process_name(pid))
-        };
-        if name.is_empty() {
+        self.with_pid_compat_rule(pid, |r| r.and_then(pick))
+    }
+
+    /// 同 [`Self::compat_bool_for_pid`]，窗口取 `token` 自己最近一次获焦的那个（推给该 token 的
+    /// DLL 配置用：同进程的不同 TSF 实例可能各在不同窗口）。
+    fn compat_bool_for_token(
+        &self,
+        token: u64,
+        pick: impl Fn(&wind_config::app_compat::AppCompatRule) -> Option<bool>,
+    ) -> Option<bool> {
+        if (token >> 32) as u32 == 0 {
             return None;
         }
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_rule(&name)
-            .and_then(pick)
+        self.with_token_compat_rule(token, |r| r.and_then(pick))
     }
 
     /// 指定 PID 的进程密码框是否强制英文：per-app 规则优先，未配则跟随全局
     /// `input.password_force_english`（运行时镜像 `password_suppress_enabled`）。
     ///
-    /// ★★ **本函数是这项判定的唯一出处**：服务端 `apply_input_diag` 算 suppress、
-    /// [`Self::push_password_suppress_config`] 推给 DLL 的吃键门控，两边都只能调它。
+    /// ★★ **本函数（与它的按 token 版本）是这项判定的唯一出处**：服务端 `apply_input_diag` 算
+    /// suppress 调本函数、[`Self::push_password_suppress_config`] 推给 DLL 的吃键门控调
+    /// [`Self::password_force_english_for_token`]，两者只差「窗口取谁的」，解析与回落同一份。
     /// 两边各算各的，迟早出现「规则只进了一边」⇒ core 抑制而 DLL 照吃 ⇒ 密码框丢键
     /// （不变量 core.suppress ⊆ C++.suppress，见 `apply_input_diag` 与 C++
     /// `IsPasswordSuppressActive`）。
+    /// 对刚获焦的那个实例，pid 最近获焦的窗口就是该 token 的窗口（见 `focus_window_of_pid`），
+    /// 两边算出同一个值。
     pub(crate) fn password_force_english_for_pid(&self, pid: u32) -> bool {
         self.compat_bool_for_pid(pid, |r| r.password_force_english)
+            .unwrap_or_else(|| {
+                self.password_suppress_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+    }
+
+    /// 推给 `token` 那个 DLL 的密码框强制英文开关，口径同 [`Self::password_force_english_for_pid`]。
+    pub(crate) fn password_force_english_for_token(&self, token: u64) -> bool {
+        self.compat_bool_for_token(token, |r| r.password_force_english)
             .unwrap_or_else(|| {
                 self.password_suppress_enabled
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -187,8 +198,8 @@ impl Coordinator {
     pub fn push_english_pair_config(&self, client_token: u64) {
         let rt = self.rt();
         let make = |token: u64| {
-            let pid = (token >> 32) as u32;
-            let enabled = rt.config.input.auto_pair.english && self.auto_pair_allowed_for_pid(pid);
+            let enabled =
+                rt.config.input.auto_pair.english && self.auto_pair_allowed_for_token(token);
             let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
             wind_ipc::codec::encode_sync_config(
                 wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
@@ -220,44 +231,31 @@ impl Coordinator {
         }
     }
 
-    /// 指定 PID 的进程组合区用哪个占位字符（GH#175，compat 规则 `composition_placeholder`）。
+    /// 推给 `token` 那个 DLL 的兜底占位字符（GH#175，compat 规则 `composition_placeholder`）。
     ///
-    /// 与 [`Self::auto_pair_allowed_for_pid`] 同一纪律：**按 PID 直查，不走 `active_compat`
-    /// 焦点槽**——调用方是推送路径，目标客户端未必是焦点进程。查表（含 `"*"` 通配）统一走
-    /// `AppCompat::composition_placeholder_for`。
-    pub(crate) fn composition_placeholder_for_pid(
+    /// 与 [`Self::auto_pair_allowed_for_token`] 同一纪律：**按目标客户端直查，不走
+    /// `active_compat` 焦点槽**——调用方是推送路径，目标客户端未必是焦点进程。窗口取该 token
+    /// 最近一次获焦的那个（出厂的 `Chrome_WidgetWin_*` / `MozillaWindowClass` 靠它命中）；
+    /// 进程名未知 ⇒ 空格。
+    pub(crate) fn composition_placeholder_for_token(
         &self,
-        pid: u32,
+        token: u64,
     ) -> wind_config::app_compat::PlaceholderChar {
-        if pid == 0 {
+        if (token >> 32) as u32 == 0 {
             return Default::default();
         }
-        let name = {
-            let cached = self
-                .pid_names
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&pid)
-                .cloned();
-            cached.unwrap_or_else(|| process_name(pid))
-        };
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .composition_placeholder_for(&name)
+        self.with_token_compat_rule(token, |r| r.and_then(|r| r.composition_placeholder))
+            .unwrap_or_default()
     }
 
     /// 协调器**自己发出**的占位组合用什么字符（GH#175）——所有发占位的地方（非嵌入模式的
     /// 编码替身、联想态、加词等）都从这里取，别再直接写 `COMPOSITION_PLACEHOLDER`。
     ///
-    /// 按焦点应用（`active_compat.pid`）的 compat 规则解析；只读 pid→名字缓存、不反查进程
-    /// （本函数在按键路径上），缓存缺失 ⇒ 空格（历史行为）。
+    /// 按焦点应用（`active_compat.pid` + 它的窗口）的 compat 规则解析；只读 pid→名字缓存、不反查
+    /// 进程（本函数在按键路径上），缓存缺失 ⇒ 空格（历史行为）。
     pub(crate) fn composition_placeholder(&self) -> &'static str {
-        let name = self.active_process_name();
-        self.app_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .composition_placeholder_for(&name)
+        self.with_active_compat_rule(|r| r.and_then(|r| r.composition_placeholder))
+            .unwrap_or_default()
             .as_str()
     }
 
@@ -284,7 +282,7 @@ impl Coordinator {
     /// （模板同 [`Self::push_password_suppress_config`]）。握手、pid 校正、compat 重载时推。
     pub fn push_composition_placeholder_config(&self, client_token: u64) {
         let make = |token: u64| {
-            let zwsp = self.composition_placeholder_for_pid((token >> 32) as u32)
+            let zwsp = self.composition_placeholder_for_token(token)
                 == wind_config::app_compat::PlaceholderChar::Zwsp;
             let value = wind_ipc::codec::encode_composition_placeholder_value(zwsp);
             wind_ipc::codec::encode_sync_config(
@@ -310,7 +308,7 @@ impl Coordinator {
     /// `client_token=0` 时逐客户端推而不是广播同一个值——同 [`Self::push_english_pair_config`]。
     pub fn push_password_suppress_config(&self, client_token: u64) {
         let make = |token: u64| {
-            let enabled = self.password_force_english_for_pid((token >> 32) as u32);
+            let enabled = self.password_force_english_for_token(token);
             let value = wind_ipc::codec::encode_password_suppress_value(enabled);
             wind_ipc::codec::encode_sync_config(
                 wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
