@@ -83,7 +83,7 @@ impl Coordinator {
                 ap.max_phrase_len,
             )
         }; // 锁在此释放：入队与 flush 判定不该持着流缓冲的锁。
-        let broke = windows.is_empty() && !text.chars().all(crate::handle_addword::is_han);
+        let broke = windows.is_empty() && !text.chars().all(crate::draft_window::is_draft_char);
         self.enqueue_drafts(windows);
         if broke {
             // 非汉字上屏 = 一段话结束，是最常见的落库时机。
@@ -132,7 +132,7 @@ impl Coordinator {
         let (Some(ch), None) = (cs.next(), cs.next()) else {
             return;
         };
-        if !crate::handle_addword::is_han(ch) {
+        if !crate::draft_window::is_draft_char(ch) {
             return;
         }
         let code = if cand.code.is_empty() {
@@ -263,6 +263,19 @@ impl Coordinator {
             // 批内去重：滑窗对同一段文字反复切，一批里同一个词出现多次是常态。
             // 不去重的话，同样的取码与查重会做很多遍——这是本函数最贵的两步。
             if !seen.insert(text.clone()) {
+                continue;
+            }
+            // 窗口里的非汉字（〇，见 `is_draft_char`）必须在本码表真有码。取码那一步对无码的
+            // 非汉字是**跳过**（手工加词「汉字+数字」要的宽口径，GH#171），放到草稿上就是
+            // 「二〇」按「二」的单字全码落库——码表没收录 〇 时造出错码词。
+            if text.chars().any(|c| {
+                !crate::handle_addword::is_han(c)
+                    && self
+                        .engine_mgr
+                        .word_codes_in(&sc.encode, &c.to_string())
+                        .is_none_or(|codes| codes.is_empty())
+            }) {
+                debug!("draft: 含本码表无码的非汉字，跳过: {text}");
                 continue;
             }
             match self.encode_and_dedup(&sc, &text, &code_hints, true) {

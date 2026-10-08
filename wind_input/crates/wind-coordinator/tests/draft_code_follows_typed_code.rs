@@ -120,3 +120,34 @@ fn draft_code_uses_the_code_the_user_actually_typed() {
         "不该再按全码表的 akge 落到 akxn 下：{stale:?}"
     );
 }
+
+/// 〇（U+3007）不是 `is_han`，曾一上屏就让滑窗断流，「二〇」这类年份 / 编号词永远造不出来。
+/// wubi86 给了 〇 码 `llll`，草稿应按「二 fg + 〇 ll」落在 `fgll` 下。
+#[test]
+fn draft_window_keeps_ling_and_encodes_it() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["wubi86".into(), "pinyin".into()];
+    cfg.schema.active = "wubi86".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.codetable.auto_phrase.enabled = true;
+
+    let db = std::env::temp_dir().join("wind_draft_ling_fgll.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    type_and_pick(&coord, "fg", "二");
+    type_and_pick(&coord, "llll", "〇");
+
+    let found = wait_draft(&store, "fgll");
+    let _ = std::fs::remove_file(&db);
+    assert!(
+        found.iter().any(|t| t == "二〇"),
+        "「二」「〇」连续上屏，草稿应有 fgll -> 二〇；实际 {found:?}"
+    );
+}

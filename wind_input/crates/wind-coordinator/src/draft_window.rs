@@ -24,6 +24,18 @@
 use crate::handle_addword::is_han;
 use std::time::{Duration, Instant};
 
+/// 能进滑窗的字：汉字，外加 〇（U+3007）。
+///
+/// 〇 落在 CJK 符号区，[`is_han`] 不认它；但它在年份、编号里与汉字连用（「二〇二六」），五笔
+/// 码表也给了码（`llll`），取码那一步（`encoder::encode_text`）已让有码的非汉字参与。若窗口仍按
+/// [`is_han`] 断，〇 一上屏就把前面的字清掉，这类词永远造不出来。
+///
+/// 只放这一个字而不是「码表里有码就算」：窗口拿不到码表，且个别码表给标点也配了码，按有码放行
+/// 会让标点两侧的字拼进同一个窗口。
+pub fn is_draft_char(c: char) -> bool {
+    is_han(c) || c == '〇'
+}
+
 /// 滑窗长度下界的兜底值（配置为 0 时用）。
 pub const DEFAULT_MIN_WINDOW: usize = 2;
 /// 滑窗长度上界的兜底值（配置为 0 时用）。
@@ -129,7 +141,7 @@ impl DraftWindowBuf {
             (Some(c), None, Some((h, code))) if c == h => Some(code),
             _ => None,
         };
-        if !text.chars().all(is_han) {
+        if !text.chars().all(is_draft_char) {
             self.terminate();
             return Vec::new();
         }
@@ -292,6 +304,17 @@ mod tests {
         assert!(w.is_empty(), "断流后重新起头，第一个字够不到 min");
         let w = feed(&mut b, "天", t);
         assert_eq!(w, vec!["今天"], "「班今天」这种跨句杂词不该出现：{w:?}");
+    }
+
+    /// 〇 不断流：「二〇二六」逐字上屏能拼出含 〇 的窗口，前面的字不被清掉。
+    #[test]
+    fn ling_does_not_break_the_stream() {
+        let mut b = DraftWindowBuf::new();
+        let t = now();
+        feed(&mut b, "二", t);
+        assert_eq!(feed(&mut b, "〇", t), vec!["二〇"]);
+        assert_eq!(feed(&mut b, "二", t), vec!["〇二", "二〇二"]);
+        assert!(feed(&mut b, "六", t).contains(&"二〇二六".to_string()));
     }
 
     /// idle 超时断流。
