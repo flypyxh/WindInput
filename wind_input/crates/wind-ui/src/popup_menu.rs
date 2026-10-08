@@ -2501,7 +2501,7 @@ mod clipboard_tests_macos {
     /// 内容（末尾尽力恢复，进程被中断则恢复不了），不该混进 `cargo test` 日常批次。
     ///
     /// 改动 `get_clipboard_text_cached` 的 macOS 实现后手动跑：
-    /// `cargo test -p wind-ui --lib clipboard_cache -- --ignored --nocapture`
+    /// `env -u LANG -u LC_ALL -u LC_CTYPE cargo test -p wind-ui --lib clipboard_cache -- --ignored --nocapture`
     #[test]
     #[ignore = "真写系统剪贴板，会覆盖使用者当前内容；须在 macOS 本机手动跑"]
     fn clipboard_cache_invalidates_on_change_macos() {
@@ -2520,6 +2520,16 @@ mod clipboard_tests_macos {
             get_clipboard_text_cached(),
             B,
             "缓存未随剪贴板变更失效（候选标签会显示旧内容）"
+        );
+
+        // 中文往返（t274）：在**没有 LANG** 的环境里跑才有意义，那正是 LaunchAgent 下的服务：
+        // `env -u LANG -u LC_ALL -u LC_CTYPE cargo test ... -- --ignored`
+        const ZH: &str = "清风输入法剪贴板中文";
+        set_clipboard_text(ZH);
+        assert_eq!(
+            get_clipboard_text(),
+            ZH,
+            "中文往返走样（pbcopy/pbpaste 编码）"
         );
 
         if !original.is_empty() {
