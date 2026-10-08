@@ -1737,6 +1737,12 @@ pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
     vec![enabled as u8]
 }
 
+/// 编码组合区兜底占位字符的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_COMPOSITION_PLACEHOLDER）。
+/// 格式：kind(u8)，0 = 空格（U+0020）、1 = ZWSP（U+200B）。GH#175。
+pub fn encode_composition_placeholder_value(zwsp: bool) -> Vec<u8> {
+    vec![zwsp as u8]
+}
+
 /// 编码诊断快照采集开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_DIAG_SNAPSHOT）。
 /// 格式：enabled(u8)。默认关，随输入诊断 HUD 显隐推送；关闭时 DLL 完全不采集。
 pub fn encode_diag_snapshot_value(enabled: bool) -> Vec<u8> {

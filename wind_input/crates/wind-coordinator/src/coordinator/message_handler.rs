@@ -700,6 +700,11 @@ impl MessageHandler for Coordinator {
         });
     }
 
+    fn composition_placeholder(&self) -> &'static str {
+        // GH#175：按焦点应用的 compat 规则取（空格 / ZWSP），唯一实现在 push_config.rs。
+        Coordinator::composition_placeholder(self)
+    }
+
     fn preedit_uses_placeholder(&self) -> bool {
         // 非 app_inline（候选窗自显 preedit）→ 应用侧用占位空格，不重复显示编码。
         //
@@ -872,7 +877,7 @@ impl MessageHandler for Coordinator {
             action
         };
         if self.preedit_uses_placeholder() {
-            action.with_composition_placeholder()
+            action.with_composition_placeholder(self.composition_placeholder())
         } else {
             action
         }
@@ -1528,7 +1533,7 @@ impl MessageHandler for Coordinator {
             keymap::VK_BACK => {
                 // 联想态：收掉候选并结束占位组合。**必须先于下面的既有分支**——那些分支
                 // 在「缓冲空 + 无已转换段」时给 `PassThrough`，而联想态挂着占位组合
-                // （见 `handle_assoc::ASSOC_COMPOSITION`），裸透传会把组合悬在宿主里。
+                // （见 `Coordinator::assoc_composition`），裸透传会把组合悬在宿主里。
                 //
                 // 这一键是吃掉还是连同收窗一起交还宿主，由 `backspace_cancels_only` 定
                 // （默认吃掉，与回车相反的理由见 `assoc_backspace`）。

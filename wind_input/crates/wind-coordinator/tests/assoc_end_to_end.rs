@@ -98,7 +98,7 @@ fn press(c: &Coordinator, code: &str) {
 ///   - `InsertText`                 —— 没进联想态（或 `top_commit_mode = pre_confirm`）
 ///   - `CommitThenDeferComposition` —— **进了联想态**：真提交 + 延到 keyup 才开占位组合
 ///
-/// 后者正是联想能收到后续按键的关键（见 `handle_assoc::ASSOC_COMPOSITION`）。
+/// 后者正是联想能收到后续按键的关键（见 `Coordinator::assoc_composition`）。
 /// 本函数刻意两种都接：它要回答的是「上屏了什么」，而不是「走了哪条时序」。
 fn commit_with_space(c: &Coordinator) -> String {
     match c.handle_key_event(&key_event(0x20)) {

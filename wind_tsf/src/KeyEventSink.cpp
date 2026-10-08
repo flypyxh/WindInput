@@ -2984,6 +2984,14 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         _pTextService->SetLangBarTooltip(text);
         WIND_LOG_DEBUG_FMT(L"LangBar tooltip updated: %ls\n", text.c_str());
     }
+    else if (key == CONFIG_KEY_COMPOSITION_PLACEHOLDER)
+    {
+        // 格式：kind(u8)（对齐 Rust encode_composition_placeholder_value）。0 = 空格、1 = ZWSP。
+        // GH#175：空文本兜底占位按本进程 compat 规则取字符，决策在 core。
+        if (value.empty()) return;
+        _pTextService->SetCompositionPlaceholderKind(value[0]);
+        WIND_LOG_INFO_FMT(L"Composition placeholder updated: kind=%d\n", (int)value[0]);
+    }
     else if (key == CONFIG_KEY_DIAG_SNAPSHOT)
     {
         // 格式：enabled(u8)（对齐 Rust encode_diag_snapshot_value）

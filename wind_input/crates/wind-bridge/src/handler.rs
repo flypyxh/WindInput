@@ -103,8 +103,15 @@ pub struct CommitResultData {
 /// 正常打字时下一键的 `UpdateComposition` 会立刻把光标拉回 0，所以这个缺陷长期被掩盖；
 /// 联想态没有「下一键」，组合就那么挂着，才把它暴露出来（2026-08-16 用户反馈）。
 ///
-/// C++ 侧据此把「组合内容恰为本值」的情形一律按 `caret_pos = 0` 开组合，见
+/// C++ 侧据此把「组合内容恰为占位」的情形一律按 `caret_pos = 0` 开组合，见
 /// `TextService.cpp` 的 `_CompositionCaretFor`。**两侧取值必须一致**，改这里要同步改那里。
+///
+/// ⚠️ 本常量只是**默认值**（GH#175）：占位字符按应用可配（compat.toml 的
+/// `composition_placeholder = "space" | "zwsp"`，出厂给浏览器配 zwsp——受控 `<input>` 会
+/// trim 组合中的 value，空格被削掉后 React 回写、浏览器终止组合，一个字都上不了屏）。
+/// 协调器发占位时一律经 [`MessageHandler::composition_placeholder`]（协调器实现为
+/// `Coordinator::composition_placeholder`）取当前应用的字符，**不要直接用本常量**。
+/// C++ 侧两种字符（空格 / U+200B）都认作占位，见 `wind_tsf/include/CompositionPlaceholder.h`。
 pub const COMPOSITION_PLACEHOLDER: &str = " ";
 
 /// 按键事件结果类型
@@ -187,10 +194,12 @@ pub enum KeyAction {
 }
 
 impl KeyAction {
-    /// 非 app_inline（候选窗自行显示 preedit）时，应用侧组合串替换为单个占位空格、光标置前。
+    /// 非 app_inline（候选窗自行显示 preedit）时，应用侧组合串替换为单个占位字符、光标置前。
     /// 目的：保留一段组合串供应用上报 caret 坐标（候选窗定位），但不在应用内显示真实编码
     /// （避免与候选窗 preedit 重复）。对齐 Go 版"模拟空格 + 光标移前"。
-    pub fn with_composition_placeholder(self) -> KeyAction {
+    ///
+    /// `placeholder` 由调用方按当前应用给出（空格或 ZWSP，GH#175，见 [`COMPOSITION_PLACEHOLDER`]）。
+    pub fn with_composition_placeholder(self, placeholder: &str) -> KeyAction {
         match self {
             // ⚠️ `!text.is_empty()` 这个守卫**必须留着**：空组合区意味着「这一刻不该有
             // 组合区」，本函数是 preedit 的显示策略（把编码换成占位、避免与候选窗重复显示
@@ -202,7 +211,7 @@ impl KeyAction {
             // `enter_*` 里显式发出（见 `enter_add_word_mode`）。
             KeyAction::UpdateComposition { text, .. } if !text.is_empty() => {
                 KeyAction::UpdateComposition {
-                    text: COMPOSITION_PLACEHOLDER.to_string(),
+                    text: placeholder.to_string(),
                     caret_pos: 0,
                 }
             }
@@ -214,7 +223,7 @@ impl KeyAction {
                 has_new_composition,
             } if !c.is_empty() => KeyAction::InsertText {
                 text,
-                new_composition: Some(COMPOSITION_PLACEHOLDER.to_string()),
+                new_composition: Some(placeholder.to_string()),
                 mode_changed,
                 chinese_mode,
                 has_new_composition,
@@ -229,7 +238,7 @@ impl KeyAction {
                 timeout_ms,
             } if !deferred_composition.is_empty() => KeyAction::CommitThenDeferComposition {
                 commit_text,
-                deferred_composition: COMPOSITION_PLACEHOLDER.to_string(),
+                deferred_composition: placeholder.to_string(),
                 timeout_ms,
             },
             // CommitAndHoldComposition / HoldComposition 刻意不在此列：它们的组合内容是中文符号
@@ -308,11 +317,17 @@ pub trait MessageHandler: Send + Sync {
         false
     }
 
+    /// 当前应用的组合占位字符（GH#175）。默认空格 [`COMPOSITION_PLACEHOLDER`]；协调器按焦点应用
+    /// 的 compat 规则 `composition_placeholder` 覆盖。
+    fn composition_placeholder(&self) -> &'static str {
+        COMPOSITION_PLACEHOLDER
+    }
+
     /// 处理按键并按 preedit 显示策略后处理组合串（bridge 入口应调用此方法）。
     fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
         let action = self.handle_key_event(data);
         if self.preedit_uses_placeholder() {
-            action.with_composition_placeholder()
+            action.with_composition_placeholder(self.composition_placeholder())
         } else {
             action
         }
@@ -565,26 +580,32 @@ mod placeholder_tests {
                 },
             ),
         ];
-        for (name, action) in cases {
-            let composition = match action.with_composition_placeholder() {
-                KeyAction::UpdateComposition { text, caret_pos } => {
-                    assert_eq!(caret_pos, 0, "{name}: 占位后光标须置前");
-                    text
-                }
-                KeyAction::InsertText {
-                    new_composition, ..
-                } => new_composition.expect("组合串不应消失"),
-                KeyAction::CommitThenDeferComposition {
-                    commit_text,
-                    deferred_composition,
-                    ..
-                } => {
-                    assert_eq!(commit_text, "可能", "{name}: 已承诺上屏的正文不得被改写");
-                    deferred_composition
-                }
-                other => panic!("{name}: 变体不应改变，实际 {other:?}"),
-            };
-            assert_eq!(composition, " ", "{name}: 组合串应换成占位空格");
+        // 两种占位字符都要原样落到组合串上（GH#175：浏览器按 compat 规则用 ZWSP）。
+        for placeholder in [COMPOSITION_PLACEHOLDER, "\u{200B}"] {
+            for (name, action) in cases.clone() {
+                let composition = match action.with_composition_placeholder(placeholder) {
+                    KeyAction::UpdateComposition { text, caret_pos } => {
+                        assert_eq!(caret_pos, 0, "{name}: 占位后光标须置前");
+                        text
+                    }
+                    KeyAction::InsertText {
+                        new_composition, ..
+                    } => new_composition.expect("组合串不应消失"),
+                    KeyAction::CommitThenDeferComposition {
+                        commit_text,
+                        deferred_composition,
+                        ..
+                    } => {
+                        assert_eq!(commit_text, "可能", "{name}: 已承诺上屏的正文不得被改写");
+                        deferred_composition
+                    }
+                    other => panic!("{name}: 变体不应改变，实际 {other:?}"),
+                };
+                assert_eq!(
+                    composition, placeholder,
+                    "{name}: 组合串应换成给定的占位字符"
+                );
+            }
         }
     }
 
@@ -596,7 +617,7 @@ mod placeholder_tests {
             text: "。".into(),
             timeout_ms: 500,
         };
-        match held.with_composition_placeholder() {
+        match held.with_composition_placeholder(COMPOSITION_PLACEHOLDER) {
             KeyAction::HoldComposition { text, .. } => assert_eq!(text, "。"),
             other => panic!("HoldComposition 不应被改写，实际 {other:?}"),
         }
@@ -606,7 +627,7 @@ mod placeholder_tests {
             hold_text: "。".into(),
             timeout_ms: 500,
         };
-        match commit_hold.with_composition_placeholder() {
+        match commit_hold.with_composition_placeholder(COMPOSITION_PLACEHOLDER) {
             KeyAction::CommitAndHoldComposition {
                 commit_text,
                 hold_text,
@@ -627,7 +648,7 @@ mod placeholder_tests {
             deferred_composition: String::new(),
             timeout_ms: 150,
         };
-        match empty_defer.with_composition_placeholder() {
+        match empty_defer.with_composition_placeholder(COMPOSITION_PLACEHOLDER) {
             KeyAction::CommitThenDeferComposition {
                 deferred_composition,
                 ..

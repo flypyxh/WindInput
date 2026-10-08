@@ -639,6 +639,53 @@ mod tests {
         }
     }
 
+    /// GH#175：非嵌入模式的占位字符按**焦点应用**的 compat 规则取——浏览器（规则配 zwsp）
+    /// 出口是 ZWSP，别的应用仍是空格；push 侧按 pid 直查走的是同一张表、同一个入口。
+    ///
+    /// 断言落在按键**出口**（`handle_key_event_policed`），理由同下一条：判据返回什么不算数，
+    /// 被出口读到才算数。变异检验：`Coordinator::composition_placeholder` 改回常量空格 ⇒ 红。
+    #[test]
+    fn placeholder_char_follows_the_focused_apps_compat_rule() {
+        use wind_config::app_compat::{AppCompat, AppCompatRule, PlaceholderChar};
+        let (c, _rx) = coord();
+        *c.preedit_display.lock().unwrap() = PreeditDisplay::CandidateTop;
+        *c.app_compat.lock().unwrap() = AppCompat::from_rules(vec![AppCompatRule {
+            process: "msedge.exe".into(),
+            composition_placeholder: Some(PlaceholderChar::Zwsp),
+            ..Default::default()
+        }]);
+        {
+            let mut names = c.pid_names.lock().unwrap();
+            names.insert(42, "msedge.exe".into());
+            names.insert(43, "wps.exe".into());
+        }
+
+        focus_pid(&c, 42);
+        assert_eq!(
+            composition_of(&type_code(&c, "ni")),
+            "\u{200B}",
+            "浏览器（规则 zwsp）出口应是零宽空格"
+        );
+        assert_eq!(c.composition_placeholder_for_pid(42), PlaceholderChar::Zwsp);
+
+        press(&c, 0x1B); // Esc 收掉组合，换个焦点再打
+        focus_pid(&c, 43);
+        assert_eq!(
+            composition_of(&type_code(&c, "ni")),
+            COMPOSITION_PLACEHOLDER,
+            "未配规则的应用（WPS）保持空格"
+        );
+        assert_eq!(
+            c.composition_placeholder_for_pid(43),
+            PlaceholderChar::Space
+        );
+        assert_eq!(
+            c.composition_placeholder_for_pid(0),
+            PlaceholderChar::Space,
+            "pid 未知 ⇒ 空格"
+        );
+    }
+
     /// ★★★ 候选窗被压住 ⇒ **强制嵌入编码**：非 app_inline 一律降级回 app_inline。
     ///
     /// # 修的是什么
@@ -804,7 +851,7 @@ mod tests {
             };
             // ↓ 这三行是 `handle_key_event_policed` 出口那一步的复述（见上面的 ⚠️）。
             let out = if c.preedit_uses_placeholder() {
-                action.with_composition_placeholder()
+                action.with_composition_placeholder(c.composition_placeholder())
             } else {
                 action
             };

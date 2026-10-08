@@ -42,7 +42,7 @@
 //!    因为它由服务端应答**异步**回填，赢不了下一次 `OnTestKeyDown` 的竞速。
 //!    真机日志同一行里 `composing=0 candidates=1 inputSession=0`：判定取的是 0，
 //!    日志打出来已经是 1。该位已随之废弃（`BinaryProtocol.h` 里标了勿复用）。
-//! 3. **挂占位组合**（见 [`ASSOC_COMPOSITION`]）—— `HasActiveComposition()` 是 TSF
+//! 3. **挂占位组合**（见 [`Self::assoc_composition`]）—— `HasActiveComposition()` 是 TSF
 //!    组合对象的**同步**状态，没有那个竞速窗口。特殊模式 / 临拼 / 临英一直可靠，
 //!    正是因为它们都挂着组合。
 //!
@@ -65,7 +65,7 @@ use crate::coordinator::{Coordinator, State};
 use wind_assoc::{
     AssocConfig, AssocContext, AssocHit, AssocKind, AssocMode, AssocProvider, AssocSource,
 };
-use wind_bridge::handler::{COMPOSITION_PLACEHOLDER, KeyAction, KeyEventData};
+use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateSource};
 use wind_keys::keymap;
 
@@ -182,36 +182,41 @@ impl State {
     }
 }
 
-/// 联想态挂在宿主里的**占位组合**内容。
-///
-/// # 为什么必须有一个真的组合
-///
-/// TSF 侧「这个键要不要转发给输入法」的判据是
-/// `HasActiveComposition() || _hasCandidates || …`。联想态下文本已提交、组合已结束，
-/// 于是**只剩 `_hasCandidates` 一条路**——而它是由服务端应答**异步**回填的，赢不了
-/// 下一次 `OnTestKeyDown` 的竞速。真机日志里抓到过铁证，同一行里：
-///
-/// ```text
-/// vk=0x57 composing=0 candidates=1 inputSession=0 eaten=1
-/// ```
-///
-/// `candidates` 是打日志时**现读**的、`inputSession` 是这次判定**开头**取的：
-/// 判定用的是 0，日志打出来已经是 1。退格/Esc 就这样被宿主自己吃掉，服务端永远
-/// 收不到——现象正是「联想窗关不掉」。
-///
-/// `HasActiveComposition()` 则是 TSF 组合对象的**同步**状态，没有这个窗口。
-/// 这也正是特殊模式 / 临拼 / 临英一直可靠的原因：它们都挂着组合。
-///
-/// # 为什么是那个占位空格
-///
-/// 直接复用非嵌入模式的既有约定 [`COMPOSITION_PLACEHOLDER`]——空格 **且光标落在它
-/// 前面**。两半缺一不可：只放空格不移光标，用户看到插入点凭空右移一格，很突兀
-/// （2026-08-16 用户反馈）。光标那一半由 C++ 侧按「组合内容恰为占位符」判定。
-///
-/// 要给用户看的「联想输入」标识在 `state.preedit` 里，走候选窗自己的编码栏，
-/// **不流进宿主**——而且只在非嵌入模式给：嵌入模式下候选窗本就没有编码栏，
-/// 凭空多一栏会让窗口高度一跳。
-pub(crate) const ASSOC_COMPOSITION: &str = COMPOSITION_PLACEHOLDER;
+impl Coordinator {
+    /// 联想态挂在宿主里的**占位组合**内容。
+    ///
+    /// # 为什么必须有一个真的组合
+    ///
+    /// TSF 侧「这个键要不要转发给输入法」的判据是
+    /// `HasActiveComposition() || _hasCandidates || …`。联想态下文本已提交、组合已结束，
+    /// 于是**只剩 `_hasCandidates` 一条路**——而它是由服务端应答**异步**回填的，赢不了
+    /// 下一次 `OnTestKeyDown` 的竞速。真机日志里抓到过铁证，同一行里：
+    ///
+    /// ```text
+    /// vk=0x57 composing=0 candidates=1 inputSession=0 eaten=1
+    /// ```
+    ///
+    /// `candidates` 是打日志时**现读**的、`inputSession` 是这次判定**开头**取的：
+    /// 判定用的是 0，日志打出来已经是 1。退格/Esc 就这样被宿主自己吃掉，服务端永远
+    /// 收不到——现象正是「联想窗关不掉」。
+    ///
+    /// `HasActiveComposition()` 则是 TSF 组合对象的**同步**状态，没有这个窗口。
+    /// 这也正是特殊模式 / 临拼 / 临英一直可靠的原因：它们都挂着组合。
+    ///
+    /// # 为什么是那个占位字符
+    ///
+    /// 直接复用非嵌入模式的既有约定（[`Coordinator::composition_placeholder`]，默认空格、
+    /// 浏览器按 compat 规则为 ZWSP，GH#175）——占位 **且光标落在它前面**。两半缺一不可：
+    /// 只放空格不移光标，用户看到插入点凭空右移一格，很突兀（2026-08-16 用户反馈）。
+    /// 光标那一半由 C++ 侧按「组合内容恰为占位符」判定（空格与 ZWSP 都认）。
+    ///
+    /// 要给用户看的「联想输入」标识在 `state.preedit` 里，走候选窗自己的编码栏，
+    /// **不流进宿主**——而且只在非嵌入模式给：嵌入模式下候选窗本就没有编码栏，
+    /// 凭空多一栏会让窗口高度一跳。
+    pub(crate) fn assoc_composition(&self) -> &'static str {
+        self.composition_placeholder()
+    }
+}
 
 /// 这个 VK 是不是**修饰键本身**（按下它不构成「用户做了别的事」）。
 ///
@@ -477,7 +482,7 @@ impl Coordinator {
         // 没有不打扰的地方可放。
         //
         // ⚠️ 无论哪种模式，这个字符串都**绝不流进宿主 composition**——宿主拿到的恒是
-        // [`ASSOC_COMPOSITION`]（占位空格）。真写进去就是把「联想输入」四个字塞进用户的文档。
+        // [`Self::assoc_composition`]（占位空格）。真写进去就是把「联想输入」四个字塞进用户的文档。
         // 用**有效**归属：候选窗被宿主压住时（UI-less 游戏）这个标识同样没有落点，与嵌入模式同理。
         //
         // ★ 更要紧的是**方向**。上面那条「绝不流进宿主 composition」今天成立，靠的是
@@ -657,7 +662,7 @@ impl Coordinator {
     ///
     /// # 病灶
     ///
-    /// 联想态在宿主里挂着占位组合（见 [`ASSOC_COMPOSITION`]），TSF 的 `_HasInputSession()`
+    /// 联想态在宿主里挂着占位组合（见 [`Self::assoc_composition`]），TSF 的 `_HasInputSession()`
     /// 因此为真 ⇒ `OnTestKeyDown` 把 Del / Home / End / 左右（C++ 归 `HotkeyType::CursorKey`）
     /// 一律吃下转发。而协调器这边，这些键的既有分支门槛都是「缓冲或已转换段非空」，
     /// 联想两者皆空 ⇒ 一路落到 `PassThrough`。
@@ -845,7 +850,7 @@ impl Coordinator {
         {
             self.notify_ui_update(state);
             // 与 `commit_selected` 同：上屏后重开占位组合，联想态才收得到后续按键。
-            return self.commit_then_new_composition(out, ASSOC_COMPOSITION.to_string());
+            return self.commit_then_new_composition(out, self.assoc_composition().to_string());
         }
         self.notify_ui_hide();
         Self::commit_action(out, true)
@@ -900,6 +905,48 @@ mod tests {
 
     fn texts(c: &Coordinator) -> Vec<String> {
         c.debug_assoc_texts()
+    }
+
+    /// GH#175：联想态挂的占位组合跟随焦点应用的 compat 规则——Edge（规则 zwsp）下是 ZWSP，
+    /// 未配规则的应用仍是空格。变异检验：`assoc_composition` 改回常量空格 ⇒ 红。
+    #[test]
+    fn assoc_placeholder_follows_the_focused_apps_rule() {
+        fn placeholder_of(act: KeyAction) -> String {
+            match act {
+                KeyAction::CommitThenDeferComposition {
+                    deferred_composition,
+                    ..
+                } => deferred_composition,
+                KeyAction::InsertText {
+                    new_composition: Some(c),
+                    ..
+                } => c,
+                other => panic!("进联想态应上屏并重开占位组合，实得 {other:?}"),
+            }
+        }
+        let c = coord_smart();
+        c.test_focus_zwsp_app(42, "msedge.exe");
+        let act = {
+            let mut st = c.state.lock().unwrap();
+            c.auto_commit_then_assoc(&mut st, "你好".into(), "你好")
+        };
+        assert!(c.state.lock().unwrap().assoc_active(), "前提：进了联想态");
+        assert_eq!(
+            placeholder_of(act),
+            "\u{200B}",
+            "Edge 下联想占位应是零宽空格"
+        );
+
+        // 对照：焦点换成未配规则的进程 ⇒ 空格。
+        let c = coord_smart();
+        c.test_focus_zwsp_app(42, "msedge.exe");
+        c.active_compat.lock().unwrap().pid = 43;
+        c.pid_names.lock().unwrap().insert(43, "wps.exe".into());
+        let act = {
+            let mut st = c.state.lock().unwrap();
+            c.auto_commit_then_assoc(&mut st, "你好".into(), "你好")
+        };
+        assert_eq!(placeholder_of(act), " ", "未配规则的应用保持空格");
     }
 
     /// ★ 桌面默认关，而且**是靠基线段本身就是 `"off"`**——不再有哨兵值参与。

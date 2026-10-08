@@ -120,8 +120,18 @@
 #                             [[apps]]
 #                             process = "*"
 #                             host_drawn_candidates = true
-#                         通配只对本字段生效，不会把别的字段也套到所有应用上；
-#                         本进程自己的规则优先于通配。
+#                         通配只对本字段与 composition_placeholder 生效，不会把别的字段也
+#                         套到所有应用上；本进程自己的规则优先于通配。
+#   composition_placeholder:
+#                         组合区占位字符："space" | "zwsp"｜不写=space（空格）。
+#                         编码不显示在软件里时（非嵌入模式、联想态、热键进入的加词/临拼等），
+#                         输入法要在软件的输入区里挂一个占位字符撑住组合。历来是空格。
+#                         ⚠ GH#175：网页里的受控输入框会把组合中的内容 trim() 后回写
+#                         （番茄小说搜索框即是），空格一被去掉，浏览器就终止组合，一个字都
+#                         上不了屏。"zwsp" 改用零宽空格 U+200B，trim() 不去掉它。
+#                         出厂只给浏览器开；Electron 应用（如 Code.exe / Feishu.exe）若遇到
+#                         同样的问题，可按需加一行。不要给 WPS 等软件改：它们靠那个空格才能
+#                         给出有效的光标位置。支持 process = "*" 通配（见上一项）。
 #   caret_offset_x:       光标坐标水平校正（dp，96dpi 基准逻辑像素，正=右，默认 0）。
 #   caret_offset_y:       光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下，默认 0）。
 #                         用于宿主报告的光标坐标**系统性偏移**的场景（如 Windows Terminal，
@@ -210,6 +220,21 @@ first_show_mode = "wait"
 process = "et.exe"
 comment = "WPS 表格，与 Excel 同类：每个字都换一次 docMgr，且切换前先报上一个单元格的坐标与组合起点。fast 档的试探坐标抢在切换前首显于旧单元格，组合起点也随之锁死在那里——此后即便校正判据判出 277px 偏移触发 reshow，下发位置仍取那个锁死的组合起点，表现为候选窗恒慢一步"
 first_show_mode = "wait"
+
+[[apps]]
+process = "msedge.exe"
+comment = "Edge - 网页受控输入框会 trim 组合中的 value 再回写，占位空格被削掉即终止组合、一个字都上不了屏（GH#175，番茄小说搜索框）；改用零宽空格占位"
+composition_placeholder = "zwsp"
+
+[[apps]]
+process = "chrome.exe"
+comment = "Chrome - 同 Edge（GH#175）"
+composition_placeholder = "zwsp"
+
+[[apps]]
+process = "firefox.exe"
+comment = "Firefox - 同 Edge（GH#175）"
+composition_placeholder = "zwsp"
 
 # 示例：给「fast 判据失灵」的宿主退回 wait（本字段不写即跟随全局默认，无需逐个开启）
 # [[apps]]

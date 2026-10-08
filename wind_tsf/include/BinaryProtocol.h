@@ -915,6 +915,10 @@ constexpr const char* CONFIG_KEY_CTRL_SPACE_TOGGLE = "ctrl_space_toggle";
 // 诊断快照采集开关（会话级，随输入诊断 HUD 显隐）。格式：enabled(u8)。默认关。
 // 采集要查三次窗口类名 + band，属于「只有排查时才值得付」的开销。
 constexpr const char* CONFIG_KEY_DIAG_SNAPSHOT = "diag_snapshot";
+// 组合区空文本兜底占位用哪个字符（GH#175）。格式：kind(u8)，0 = 空格、1 = ZWSP（U+200B）。
+// 服务端按本客户端 pid 的 compat 规则 composition_placeholder 现算后逐客户端推送；默认空格。
+// 决策在服务端，DLL 只照做（以及把两种字符都认作占位，见 CompositionPlaceholder.h）。
+constexpr const char* CONFIG_KEY_COMPOSITION_PLACEHOLDER = "composition_placeholder";
 // 「英文半角列有自定义标点映射」的源字符集合。英文模式（非全角）下本 DLL 默认直接透传标点键、
 // core 收不到，用户配的「英半」列因此永远不生效；据此集合精确吃下这些键转发给 core。
 // 集合为空（默认）= 行为与历史完全一致。格式：count(u8) + [ch:u16(LE)]...

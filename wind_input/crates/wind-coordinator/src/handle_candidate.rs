@@ -3691,16 +3691,13 @@ impl Coordinator {
                 // ★ 上屏后**重开一个占位组合**——这是联想态能收到后续按键的唯一可靠手段。
                 // 宿主的会话判据里，只有 `HasActiveComposition()` 是同步的；靠应答异步
                 // 回填的 `_hasCandidates` 赢不了下一次 OnTestKeyDown 的竞速（见
-                // `handle_assoc::ASSOC_COMPOSITION` 里的真机日志铁证）。
+                // `Coordinator::assoc_composition` 里的真机日志铁证）。
                 //
                 // 走 `commit_then_new_composition` 而不是自己拼 `InsertText`：它按
                 // `top_commit_mode` 分流，direct_commit 下把新组合延到 keyup 才开，
                 // 躲开「真提交 + 同位置重开」被 diff 式宿主误读成替换。进特殊模式走的
                 // 也是这一条。
-                return self.commit_then_new_composition(
-                    out,
-                    crate::handle_assoc::ASSOC_COMPOSITION.to_string(),
-                );
+                return self.commit_then_new_composition(out, self.assoc_composition().to_string());
             }
             self.notify_ui_hide();
             Self::commit_action(out, true)

@@ -220,6 +220,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME loading_icon COMMAND loading_icon_test)
 
+    add_executable(composition_placeholder_test tests/composition_placeholder_test.cpp)
+    target_include_directories(composition_placeholder_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(composition_placeholder_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME composition_placeholder COMMAND composition_placeholder_test)
+
     add_executable(ctrl_space_policy_test tests/ctrl_space_policy_test.cpp)
     target_include_directories(ctrl_space_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

@@ -33,7 +33,7 @@ impl Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // ⚠️ `candidates` 这一项不能少 —— **联想态**的四项全是空的：文本已上屏（`input_buffer`
         // / `committed_text` 空）、`active` 恒为 `None`（联想不是 overlay 模式，`assoc_active()`
-        // 纯看首候选的 source），而它挂在宿主里的那个组合是 `ASSOC_COMPOSITION` 占位空格。
+        // 纯看首候选的 source），而它挂在宿主里的那个组合是 `assoc_composition` 占位。
         // 少了这一项，联想态下重启服务不推 `ClearComposition`，那个占位空格就留在用户文档里
         // 成了孤儿——而且这次连兜底都没有：服务进程重启了，`assoc_placeholder_orphaned` 标记
         // 跟着没了，`adopt_orphaned_placeholder` 接不到。症状同 `fire_assoc_hide` 注释里记的
@@ -1155,14 +1155,14 @@ mod restart_tests {
     //! 重启服务前的「有没有活跃组合」判据。
     //!
     //! 只钉**联想态**这一格：那是四个原有析取项同时为空、而宿主里确实挂着组合
-    //! （`ASSOC_COMPOSITION` 占位空格）的唯一形态，也是这条判据唯一会判错的地方。
+    //! （`assoc_composition` 占位）的唯一形态，也是这条判据唯一会判错的地方。
 
     use crate::Coordinator;
     use wind_candidate::{Candidate, CandidateSource};
     use wind_config::Config;
 
     /// 摆一个联想态：文本已上屏 ⇒ 缓冲/前缀全空、`active` 为 `None`，只有联想候选在。
-    /// 宿主那边此刻挂着 `ASSOC_COMPOSITION` 占位空格（本测试构造不出宿主，只摆核心侧）。
+    /// 宿主那边此刻挂着 `assoc_composition` 占位（本测试构造不出宿主，只摆核心侧）。
     fn fill_assoc(c: &Coordinator) {
         let mut st = c.state.lock().unwrap();
         st.input_buffer.clear();

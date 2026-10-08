@@ -3068,6 +3068,7 @@ impl Coordinator {
             for token in self.push_server.tokens_of_pid(pid) {
                 self.push_password_suppress_config(token);
                 self.push_english_pair_config(token);
+                self.push_composition_placeholder_config(token);
             }
         }
     }
@@ -6558,7 +6559,7 @@ impl Coordinator {
         // preedit 是否嵌入宿主（app_inline）：嵌入时编码插入宿主、光标随输入右移，候选窗须锚在
         // 组合起点（缓冲头部）而非跟随光标末尾；非嵌入时 preedit 在候选窗、宿主光标不动，用当前光标。
         // 该标志同时门控下方 preedit 是否下发候选窗渲染（嵌入时候选窗不重复显示 preedit）。
-        // 联想态**不再强制非嵌入**：宿主侧此刻挂着占位组合（见 `ASSOC_COMPOSITION`），
+        // 联想态**不再强制非嵌入**：宿主侧此刻挂着占位组合（见 `assoc_composition`），
         // 归属如实按配置走即可。嵌入模式下 `maybe_enter_assoc` 干脆不给标识
         // （`state.preedit` 为空），候选窗因此没有编码栏、高度不跳。
         let in_app = self.preedit_in_app_effective();
@@ -9381,6 +9382,28 @@ mod mode_comment_e2e_tests {
             "临英由 composition 撑会话，不该算进本位"
         );
         c.state.lock().unwrap().active = None;
+    }
+
+    /// GH#175：加词（`add_word_via_composition = true`）由协调器自己发的占位跟随焦点应用的
+    /// compat 规则——Edge（规则 zwsp）下是 ZWSP。变异检验：加词处改回常量空格 ⇒ 红。
+    #[test]
+    fn add_word_placeholder_follows_the_focused_apps_rule() {
+        let mut cfg = Config::default();
+        cfg.input.caret.add_word_via_composition = true;
+        let (c, _rx) = coord_with_ui(cfg);
+        c.test_focus_zwsp_app(42, "msedge.exe");
+        let act = {
+            let mut st = c.state.lock().unwrap();
+            st.chinese_mode = true;
+            c.enter_add_word_mode(&mut st)
+        };
+        match act {
+            KeyAction::UpdateComposition { text, caret_pos } => {
+                assert_eq!(text, "\u{200B}", "Edge 下加词占位应是零宽空格");
+                assert_eq!(caret_pos, 0, "光标落在占位前");
+            }
+            other => panic!("开关打开 ⇒ 应发占位 composition，实际: {other:?}"),
+        }
     }
 
     /// ★★★ 占位 composition 的逐模式开关（`[input.caret]`），**在出厂配置下**逐条验。

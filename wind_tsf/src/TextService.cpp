@@ -9,6 +9,7 @@
 #include "DisplayAttributeInfo.h"
 #include "HotkeyManager.h"
 #include "HostWindow.h"
+#include "CompositionPlaceholder.h" // 组合占位识别 + 兜底取值（空格 / ZWSP，由 core 按应用决定，GH#175）
 #include <vector>
 #include <shellscalingapi.h>
 #include <inputscope.h> // ITfInputScope / InputScope 枚举
@@ -652,8 +653,11 @@ private:
 class CUpdateCompositionEditSession : public ITfEditSession
 {
 public:
-    CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1, BOOL noUnderline = FALSE)
-        : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos), _noUnderline(noUnderline)
+    // placeholder：_text 为空时兜底写入的占位（core 按应用下发：空格 / ZWSP，见 CompositionPlaceholder.h）。
+    CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1, BOOL noUnderline = FALSE,
+                                  const wchar_t* placeholder = wind::placeholder::kSpacePlaceholder)
+        : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos), _noUnderline(noUnderline),
+          _placeholder(placeholder)
     {
         _pTextService->AddRef();
         _pContext->AddRef();
@@ -787,9 +791,12 @@ public:
         // 就是空的，`commit_then_new_composition(text, String::new())` 一类同样如此，它们
         // 全靠这一段兜住。删掉后这些路径拿到零长度 range，而 WPS 等宿主对零长度 range 回的
         // 是退化矩形（height=0），候选窗失去坐标来源。
+        //
+        // 占位字符由调用方传进来（_placeholder）：core 按应用 compat 规则下发，默认空格（上面
+        // 说的 WPS 等），浏览器出厂是 ZWSP —— 受控 `<input>` 会 trim 组合中的 value，空格会让
+        // React 回写 value、浏览器随即终止组合（GH#175，见 CompositionPlaceholder.h）。
         BOOL isPlaceholder = _text.empty();
-        static const wchar_t PLACEHOLDER[] = L" ";
-        const wchar_t* textPtr = isPlaceholder ? PLACEHOLDER : _text.c_str();
+        const wchar_t* textPtr = isPlaceholder ? _placeholder : _text.c_str();
         LONG textLen = isPlaceholder ? 1 : (LONG)_text.length();
 
         hr = pRange->SetText(ec, TF_ST_CORRECTION, textPtr, textLen);
@@ -857,6 +864,7 @@ public:
 private:
     int _caretPos;         // Cursor position within composition (-1 = at end)
     BOOL _noUnderline;     // 整段不设下划线属性（智能符号 HoldComposition 观感对齐已上屏）
+    const wchar_t* _placeholder; // 空文本兜底占位（静态字符串，长度恒为 1）
 
     void _CacheCaretPosition(TfEditCookie ec)
     {
@@ -1044,6 +1052,7 @@ CTextService::CTextService()
     , _focusIsPassword(false)
     , _focusInputScopeMask(0)
     , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
+    , _compositionPlaceholderKind(0)  // 默认空格（历史行为），core 握手时按本进程 compat 规则推
     , _diagSnapshotEnabled(FALSE)     // 默认关，与 core 的 input_diag_hud_visible 初值一致
     , _hasThreadFocus(FALSE)
     , _isProcessForeground(FALSE)
@@ -6813,6 +6822,17 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOO
         return FALSE;
     }
 
+    // 空文本兜底占位用哪个字符（GH#175）：由 core 按本进程 compat 规则
+    // `composition_placeholder` 决定、经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 下发（默认空格）。
+    // 浏览器受控 `<input>` 会 trim 组合中的 value，空格被削掉后 React 回写、浏览器终止组合，
+    // 故出厂给浏览器下发 ZWSP。core 自己发来的占位（非空文本）原样写入，这里不做任何映射。
+    //
+    // ⚠️ 写组合区只有这一个口子（InsertTextAndStartComposition / 延迟组合 / hold 全都汇到这里）。
+    // 上屏 / 取消 / 宿主终止都是整段替换或清空组合 range，ZWSP 与空格一样不会残留
+    // （见 CCommitTextEditSession / CEndCompositionEditSession / OnCompositionTerminated）。
+    const wchar_t* placeholder = wind::placeholder::PlaceholderForKind(
+        static_cast<uint8_t>(InterlockedCompareExchange(&_compositionPlaceholderKind, 0, 0)));
+
     ITfContext* pContext = nullptr;
     HRESULT hr = pDocMgr->GetTop(&pContext);
     pDocMgr->Release();
@@ -6823,7 +6843,8 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOO
         return FALSE;
     }
 
-    CUpdateCompositionEditSession* pEditSession = new CUpdateCompositionEditSession(this, pContext, full, fullCaret, noUnderline);
+    CUpdateCompositionEditSession* pEditSession =
+        new CUpdateCompositionEditSession(this, pContext, full, fullCaret, noUnderline, placeholder);
 
     // Timing: measure RequestEditSession duration
     LARGE_INTEGER startTime, endTime, freq;
@@ -7473,7 +7494,8 @@ void CTextService::ResetComposingState(BOOL keepPairState)
 //
 // 常规：放在末尾（余码/引导符都是「用户还要接着打」的内容，插入点自然跟在后面）。
 //
-// ★ 例外是**占位组合**（内容恰为一个空格，见 Rust 侧 `COMPOSITION_PLACEHOLDER`）：
+// ★ 例外是**占位组合**（内容恰为一个空格，见 Rust 侧 `COMPOSITION_PLACEHOLDER`；浏览器宿主里
+// 按 compat 规则 `composition_placeholder` 发的是 ZWSP，见 CompositionPlaceholder.h / GH#175，两者都认）：
 // 它不是给用户看的内容，只是因为 TSF 不接受空组合、而输入法又需要一个活着的组合
 // （非嵌入模式下编码由候选窗自绘；联想态压根没有编码）。此时插入点必须落在**它前面**，
 // 否则用户看到光标凭空右移一格——正是「空格很突兀」的由来（2026-08-16 用户反馈）。
@@ -7484,7 +7506,7 @@ void CTextService::ResetComposingState(BOOL keepPairState)
 // ⚠️ 取值必须与 Rust 侧 `COMPOSITION_PLACEHOLDER` 一致，改一处要同步改另一处。
 int CTextService::_CompositionCaretFor(const std::wstring& composition)
 {
-    return composition == L" " ? 0 : static_cast<int>(composition.length());
+    return wind::placeholder::IsPlaceholderText(composition) ? 0 : static_cast<int>(composition.length());
 }
 
 BOOL CTextService::InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition)

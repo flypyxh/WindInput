@@ -282,6 +282,62 @@ impl InitialMode {
     }
 }
 
+/// 宿主组合区里的**占位字符**（GH#175）。
+///
+/// 输入法有会话、却没有可见编码要放进宿主时（非嵌入模式、联想态、直达热键进入的模式等），
+/// 组合区里要挂一个占位字符：TSF 不接受空组合，且 WPS 一类宿主对零长度 range 回的是
+/// 退化矩形（height=0），候选窗失去坐标来源。历来用一个空格。
+///
+/// 浏览器里的**受控输入框**会把组合中的 value 拿去 `trim()` 再回写（番茄小说搜索框：React 17
+/// `onChange: e => setV(e.target.value.trim())`）：空格一被削掉 state ≠ DOM，React 回写
+/// value，浏览器随即终止组合，一个字都上不了屏。ZWSP（U+200B）不被 `trim()` / `\s` 当空白，
+/// 能躲开这一回写；但它在非浏览器宿主里的光标度量没有实测过，故**按应用配置**，出厂只给
+/// 浏览器开。
+///
+/// 消费：协调器按焦点应用解析后直接发出该字符（[`Self::as_str`]）；DLL 的空文本兜底占位
+/// 经 `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 按客户端 pid 下发。DLL 两种字符都认作占位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceholderChar {
+    /// U+0020。**不写 = 这一档**（历史行为）。
+    #[default]
+    Space,
+    /// U+200B ZERO WIDTH SPACE。
+    Zwsp,
+}
+
+impl PlaceholderChar {
+    /// 配置串 → 枚举。无法识别返回 `None`（＝未配置，回落空格）。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "space" => Some(Self::Space),
+            "zwsp" => Some(Self::Zwsp),
+            _ => None,
+        }
+    }
+    /// 枚举 → 配置串（写回 compat.toml 用）。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Space => "space",
+            Self::Zwsp => "zwsp",
+        }
+    }
+    /// 实际写进宿主组合区的字符串（恒为一个字符）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Space => " ",
+            Self::Zwsp => "\u{200B}",
+        }
+    }
+}
+
+fn de_composition_placeholder<'de, D>(d: D) -> Result<Option<PlaceholderChar>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_opt_str_enum(d, "composition_placeholder", PlaceholderChar::from_config)
+}
+
 /// 应用独立的候选窗定位方式。
 ///
 /// 与全局 `ui.candidate.position_mode` 同语义，但**按应用覆盖**：少数宿主报的 caret
@@ -1032,6 +1088,16 @@ pub struct AppCompatRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub host_drawn_candidates: Option<bool>,
+    /// 组合区占位字符；`None` = 空格（历史行为）。见 [`PlaceholderChar`]（GH#175）。
+    ///
+    /// 查表请走 [`AppCompat::composition_placeholder_for`]：它负责 `process = "*"` 通配的
+    /// 回落，散落各处自己查会漏掉通配。
+    #[serde(
+        default,
+        deserialize_with = "de_composition_placeholder",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub composition_placeholder: Option<PlaceholderChar>,
 }
 
 impl AppCompatRule {
@@ -1628,6 +1694,21 @@ impl AppCompat {
             .map(|&i| &self.apps[i])
     }
 
+    /// 该进程组合区用哪个占位字符（GH#175）。**唯一的查表入口**，协调器发占位与给 DLL
+    /// 下发兜底占位都走这里。
+    ///
+    /// 先查本进程，没配再查 `process = "*"` 通配，都没配 = 空格。本进程显式写 `space`
+    /// 压过通配。进程名未知（空串）⇒ 空格，不吃通配：不知道是谁时保持历史行为。
+    pub fn composition_placeholder_for(&self, process_name: &str) -> PlaceholderChar {
+        if process_name.is_empty() {
+            return PlaceholderChar::default();
+        }
+        self.get_rule(process_name)
+            .and_then(|r| r.composition_placeholder)
+            .or_else(|| self.get_rule("*").and_then(|r| r.composition_placeholder))
+            .unwrap_or_default()
+    }
+
     /// 现算 HostRender 白名单：所有 `host_render = true` 的进程名（原始大小写）。
     ///
     /// 供 `HostRenderManager::set_whitelist` 消费；调用方须按事件源 PID 直查，
@@ -1967,6 +2048,108 @@ mod newline_style_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GH#175：`composition_placeholder` 解析 + 查表（含 `process = "*"` 通配与具体进程压过通配）。
+    #[test]
+    fn composition_placeholder_parses_and_falls_back_to_wildcard() {
+        let toml = r#"
+            [[apps]]
+            process = "msedge.exe"
+            composition_placeholder = "zwsp"
+
+            [[apps]]
+            process = "WPS.exe"
+            composition_placeholder = "space"
+
+            [[apps]]
+            process = "plain.exe"
+            caret_use_top = true
+
+            [[apps]]
+            process = "typo.exe"
+            composition_placeholder = "zwj"
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps);
+        assert_eq!(
+            compat
+                .get_rule("MSEDGE.EXE")
+                .unwrap()
+                .composition_placeholder,
+            Some(PlaceholderChar::Zwsp)
+        );
+        assert_eq!(
+            compat
+                .get_rule("plain.exe")
+                .unwrap()
+                .composition_placeholder,
+            None
+        );
+        assert_eq!(
+            compat.get_rule("typo.exe").unwrap().composition_placeholder,
+            None,
+            "值域外 ⇒ 回落未配置，不拖垮整份"
+        );
+        assert_eq!(
+            compat.composition_placeholder_for("msedge.exe"),
+            PlaceholderChar::Zwsp
+        );
+        assert_eq!(
+            compat.composition_placeholder_for("plain.exe"),
+            PlaceholderChar::Space
+        );
+        assert_eq!(
+            compat.composition_placeholder_for("unknown.exe"),
+            PlaceholderChar::Space
+        );
+        assert_eq!(
+            compat.composition_placeholder_for(""),
+            PlaceholderChar::Space
+        );
+
+        // 通配：没配的进程跟通配走；具体进程显式写 space 压过通配。
+        let wild = r#"
+            [[apps]]
+            process = "*"
+            composition_placeholder = "zwsp"
+
+            [[apps]]
+            process = "WPS.exe"
+            composition_placeholder = "space"
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(wild).unwrap().apps);
+        assert_eq!(
+            compat.composition_placeholder_for("chrome.exe"),
+            PlaceholderChar::Zwsp
+        );
+        assert_eq!(
+            compat.composition_placeholder_for("wps.exe"),
+            PlaceholderChar::Space
+        );
+        assert_eq!(
+            compat.composition_placeholder_for(""),
+            PlaceholderChar::Space,
+            "进程未知 ⇒ 不吃通配"
+        );
+    }
+
+    #[test]
+    fn placeholder_char_config_roundtrip() {
+        for v in [PlaceholderChar::Space, PlaceholderChar::Zwsp] {
+            assert_eq!(PlaceholderChar::from_config(v.as_config()), Some(v));
+        }
+        assert_eq!(PlaceholderChar::Space.as_str(), " ");
+        assert_eq!(PlaceholderChar::Zwsp.as_str(), "\u{200B}");
+        assert_eq!(
+            PlaceholderChar::default(),
+            PlaceholderChar::Space,
+            "不写 = 现状（空格）"
+        );
+        assert_eq!(
+            PlaceholderChar::from_config("ZWSP"),
+            Some(PlaceholderChar::Zwsp)
+        );
+        assert_eq!(PlaceholderChar::from_config("nbsp"), None);
+    }
 
     /// 三个新增 per-app 字段的解析。`auto_pair` / `smart_method` 是 `Option`，
     /// **未配置必须是 `None` 而不是 `Some(false)`/`Some(默认值)`**——那是「跟随全局」
@@ -2873,6 +3056,21 @@ mod layering_tests {
             c.get_rule("qq.exe")
                 .is_some_and(|r| r.composition_start_pair_guard == Some(true))
         );
+        // GH#175：出厂只给浏览器换零宽空格占位，其余（WPS 等靠空格撑光标矩形）保持空格。
+        for browser in ["msedge.exe", "chrome.exe", "firefox.exe"] {
+            assert_eq!(
+                c.composition_placeholder_for(browser),
+                PlaceholderChar::Zwsp,
+                "{browser} 出厂应为 zwsp"
+            );
+        }
+        for other in ["wps.exe", "WINWORD.EXE", "notepad.exe", "Code.exe"] {
+            assert_eq!(
+                c.composition_placeholder_for(other),
+                PlaceholderChar::Space,
+                "{other} 出厂应保持空格"
+            );
+        }
         for class in ["Progman", "WorkerW"] {
             assert!(
                 c.initial_mode_applies_to_window("explorer.exe", class),

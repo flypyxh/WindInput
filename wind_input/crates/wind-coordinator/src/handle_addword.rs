@@ -4,7 +4,7 @@
 
 use crate::coordinator::{CommittedSeg, Coordinator, LEARN_ADD_WEIGHT, State};
 use tracing::{debug, warn};
-use wind_bridge::handler::{COMPOSITION_PLACEHOLDER, KeyAction, KeyEventData};
+use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::CandidateSource;
 use wind_ipc::protocol::MOD_CTRL;
 use wind_keys::keymap;
@@ -1056,7 +1056,7 @@ impl Coordinator {
         // 所以这条路不是「小心地建」，而是**根本不建**。
         if self.rt().config.input.caret.add_word_via_composition {
             KeyAction::UpdateComposition {
-                text: COMPOSITION_PLACEHOLDER.to_string(),
+                text: self.composition_placeholder().to_string(),
                 caret_pos: 0,
             }
         } else {

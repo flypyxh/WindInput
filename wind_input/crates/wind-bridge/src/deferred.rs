@@ -58,6 +58,12 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(false, |h| h.preedit_uses_placeholder())
     }
 
+    fn composition_placeholder(&self) -> &'static str {
+        self.with_handler(crate::handler::COMPOSITION_PLACEHOLDER, |h| {
+            h.composition_placeholder()
+        })
+    }
+
     fn handle_client_connected(&self, pid: u32) {
         // 服务重启是本回调的主场景：`bridge.start()` 早于 `set_ready`（引擎/词典加载
         // 期间），DLL 若恰好在这段窗口重连，per-app 规则预热会被静默吞掉，退化回旧行为

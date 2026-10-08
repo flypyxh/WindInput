@@ -101,6 +101,7 @@ impl Coordinator {
         self.push_english_pair_config(client_token);
         self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
         self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
+        self.push_composition_placeholder_config(client_token); // 空文本兜底占位字符（GH#175）
         self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
         self.push_cn_passthrough_punct_config(client_token); // 中文模式该透传的标点：DLL 据此**不**吃
         self.push_en_passthrough_punct_config(client_token); // 同上，英文标点态那份（超集）
@@ -227,6 +228,86 @@ impl Coordinator {
     ///
     /// 取值按**目标进程**现算（compat.toml 的 per-app `password_force_english` 优先），故
     /// `client_token=0` 时逐客户端推而不是广播同一个值——同 [`Self::push_english_pair_config`]。
+    /// 指定 PID 的进程组合区用哪个占位字符（GH#175，compat 规则 `composition_placeholder`）。
+    ///
+    /// 与 [`Self::auto_pair_allowed_for_pid`] 同一纪律：**按 PID 直查，不走 `active_compat`
+    /// 焦点槽**——调用方是推送路径，目标客户端未必是焦点进程。查表（含 `"*"` 通配）统一走
+    /// `AppCompat::composition_placeholder_for`。
+    pub(crate) fn composition_placeholder_for_pid(
+        &self,
+        pid: u32,
+    ) -> wind_config::app_compat::PlaceholderChar {
+        if pid == 0 {
+            return Default::default();
+        }
+        let name = {
+            let cached = self
+                .pid_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&pid)
+                .cloned();
+            cached.unwrap_or_else(|| process_name(pid))
+        };
+        self.app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .composition_placeholder_for(&name)
+    }
+
+    /// 协调器**自己发出**的占位组合用什么字符（GH#175）——所有发占位的地方（非嵌入模式的
+    /// 编码替身、联想态、加词等）都从这里取，别再直接写 `COMPOSITION_PLACEHOLDER`。
+    ///
+    /// 按焦点应用（`active_compat.pid`）的 compat 规则解析；只读 pid→名字缓存、不反查进程
+    /// （本函数在按键路径上），缓存缺失 ⇒ 空格（历史行为）。
+    pub(crate) fn composition_placeholder(&self) -> &'static str {
+        let name = self.active_process_name();
+        self.app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .composition_placeholder_for(&name)
+            .as_str()
+    }
+
+    /// 测试用：把焦点设成 `pid`/`process`，并让该进程的 compat 规则配 `composition_placeholder = "zwsp"`
+    /// （模拟出厂的 Edge 规则）。各路径「在浏览器焦点下出 ZWSP」的测试共用。
+    #[cfg(test)]
+    pub(crate) fn test_focus_zwsp_app(&self, pid: u32, process: &str) {
+        use wind_config::app_compat::{AppCompat, AppCompatRule, PlaceholderChar};
+        *self.app_compat.lock().unwrap() = AppCompat::from_rules(vec![AppCompatRule {
+            process: process.into(),
+            composition_placeholder: Some(PlaceholderChar::Zwsp),
+            ..Default::default()
+        }]);
+        self.pid_names
+            .lock()
+            .unwrap()
+            .insert(pid, process.to_lowercase());
+        self.active_compat.lock().unwrap().pid = pid;
+    }
+
+    /// 下发「空文本兜底占位用哪个字符」给 DLL（GH#175，CONFIG_KEY_COMPOSITION_PLACEHOLDER）。
+    ///
+    /// DLL 在组合文本为空时自己补一个占位撑开 range，补哪个字符由这里按**各客户端 pid** 现算
+    /// （模板同 [`Self::push_password_suppress_config`]）。握手、pid 校正、compat 重载时推。
+    pub fn push_composition_placeholder_config(&self, client_token: u64) {
+        let make = |token: u64| {
+            let zwsp = self.composition_placeholder_for_pid((token >> 32) as u32)
+                == wind_config::app_compat::PlaceholderChar::Zwsp;
+            let value = wind_ipc::codec::encode_composition_placeholder_value(zwsp);
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_COMPOSITION_PLACEHOLDER,
+                &value,
+            )
+        };
+        if client_token != 0 {
+            self.push_server
+                .push_to_token(client_token, &make(client_token));
+        } else {
+            self.push_server.push_per_client(make);
+        }
+    }
+
     pub fn push_password_suppress_config(&self, client_token: u64) {
         let make = |token: u64| {
             let enabled = self.password_force_english_for_pid((token >> 32) as u32);

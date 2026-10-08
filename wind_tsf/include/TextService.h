@@ -243,7 +243,7 @@ public:
     // keep it INSIDE the composition (Microsoft IME behavior — the real document
     // commit is deferred to the final CommitText). See _pendingCommitPrefix.
     BOOL InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition);
-    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格）放 0**。
+    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格或 ZWSP，见 CompositionPlaceholder.h）放 0**。
     // 与 Rust 侧 COMPOSITION_PLACEHOLDER 成对，见实现处的说明。
     static int _CompositionCaretFor(const std::wstring& composition);
 
@@ -331,6 +331,10 @@ public:
     void SetPasswordSuppressEnabled(BOOL bEnabled) { _passwordSuppressEnabled = bEnabled; }
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；默认关）。
     void SetDiagSnapshotEnabled(BOOL bEnabled) { _diagSnapshotEnabled = bEnabled; }
+    // 空文本兜底占位字符的档位（core 经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 按本进程 compat
+    // 规则推；0 = 空格（默认）、1 = ZWSP，GH#175）。config 回调跑在 IPC 读线程，读在 TSF
+    // 线程，故用 Interlocked 读写一个 LONG。
+    void SetCompositionPlaceholderKind(uint8_t kind) { InterlockedExchange(&_compositionPlaceholderKind, (LONG)kind); }
 
     // 语言栏悬停提示（core 经 CONFIG_KEY_LANGBAR_TOOLTIP 推）。文案与选择逻辑全在服务端，
     // 这里只存一份原样交给 CLangBarItemButton::GetTooltipString。
@@ -583,6 +587,9 @@ private:
     // 上报给 core 之外自己也留一份：IsPasswordSuppressActive 的吃键门控须本地可算。
     UINT64 _focusInputScopeMask;
     BOOL  _passwordSuppressEnabled;   // 抑制策略开关（core 经 CONFIG_KEY_PASSWORD_SUPPRESS 推；默认开）
+    // 空文本兜底占位档位（core 经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 推；默认 0 = 空格）。
+    // 见 SetCompositionPlaceholderKind / CompositionPlaceholder.h。
+    volatile LONG _compositionPlaceholderKind;
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；**默认关**）。
     // 默认关是硬要求：每次焦点切换都查三次类名 + band 的开销，不该由不排查的用户承担。
     BOOL  _diagSnapshotEnabled;

@@ -81,6 +81,7 @@ const INITIAL_MODES: &[&str] = &["english", "chinese"];
 const SMART_METHODS: &[&str] = &["delete_replace", "hold_composition"];
 const CANDIDATE_POSITION_MODES: &[&str] = &["follow_caret", "fixed"];
 const NEWLINE_STYLES: &[&str] = &["keep", "cr", "lf", "crlf"];
+const PLACEHOLDER_CHARS: &[&str] = &["space", "zwsp"];
 
 /// 全部字段。顺序即界面内的展示顺序（同组内）。
 pub static COMPAT_FIELDS: &[FieldMeta] = &[
@@ -449,6 +450,21 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
         protocol: true,
         advanced: true,
     },
+    FieldMeta {
+        section: "apps",
+        key: "composition_placeholder",
+        kind: Kind::Enum,
+        group: "host",
+        label: "占位字符",
+        summary: "编码不显示在软件里时，输入区中临时放的那个字符：空格或零宽空格。",
+        problem: "网页里有些输入框会自动去掉首尾空格（如番茄小说的搜索框），占位的空格一被去掉，输入就被打断，一个字都打不上去。\
+                  给浏览器改用零宽空格即可避开。不设置则用空格：WPS 等软件靠它确定光标位置，不要随意更改。",
+        hosts: &["msedge.exe", "chrome.exe", "firefox.exe"],
+        options: PLACEHOLDER_CHARS,
+        depends_on: None,
+        protocol: true,
+        advanced: true,
+    },
     // ── 初始模式作用域 ────────────────────────────────────────────
     FieldMeta {
         section: "initial_mode_scope",
@@ -521,6 +537,8 @@ pub const OPTION_LABELS: &[(&str, &str)] = &[
     ("cr", "回车（CR）"),
     ("lf", "换行（LF）"),
     ("crlf", "回车换行（CRLF）"),
+    ("space", "空格"),
+    ("zwsp", "零宽空格"),
 ];
 
 /// 个别字段里同一个取值 id 的说法与全局登记不同时的覆盖：`(字段键, 取值, 显示名)`。
