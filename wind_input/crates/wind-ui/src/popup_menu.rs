@@ -1333,12 +1333,25 @@ pub fn set_clipboard_text(text: &str) {
     }
 }
 
+/// `pbcopy` / `pbpaste` 的命令，**强制 UTF-8 locale**。
+///
+/// 两者按 locale 决定文本编码；服务进程由 LaunchAgent 拉起，环境里没有 `LANG`，于是按
+/// 非 UTF-8 编码转换——中文写进去、读出来都是乱码（t274：加词 Tab 取剪贴板出乱码）。
+/// 终端里起的 dev 服务继承了 shell 的 `LANG`，所以开发机上永远复现不出来。
+/// `LC_ALL` 一并设：它优先级最高，环境里若残留 `LC_ALL=C` 会盖掉 `LANG`。
+#[cfg(target_os = "macos")]
+fn pasteboard_command(path: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(path);
+    cmd.env("LANG", "en_US.UTF-8").env("LC_ALL", "en_US.UTF-8");
+    cmd
+}
+
 /// 写剪贴板（macOS pbcopy），失败返回错误。
 #[cfg(target_os = "macos")]
 pub fn try_set_clipboard_text(text: &str) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("/usr/bin/pbcopy")
+    use std::process::Stdio;
+    let mut child = pasteboard_command("/usr/bin/pbcopy")
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("pbcopy 启动失败: {}", e))?;
@@ -1498,8 +1511,7 @@ fn read_clipboard(allow_retry: bool) -> String {
 /// 读剪贴板文本（macOS：经 `pbpaste` 子进程）。失败/无文本返回空串。
 #[cfg(target_os = "macos")]
 pub fn get_clipboard_text() -> String {
-    use std::process::Command;
-    match Command::new("/usr/bin/pbpaste").output() {
+    match pasteboard_command("/usr/bin/pbpaste").output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => String::new(),
     }
@@ -2466,6 +2478,22 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod clipboard_tests_macos {
     use super::*;
+
+    /// pbcopy/pbpaste 必须带 UTF-8 locale 跑：LaunchAgent 拉起的服务进程没有 `LANG`，
+    /// 少了这两个变量中文就成乱码（t274）。终端里跑测试有 `LANG`，往返测试抓不到这条，故直接看命令。
+    #[test]
+    fn pasteboard_command_forces_utf8_locale() {
+        let cmd = pasteboard_command("/usr/bin/pbpaste");
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for key in ["LANG", "LC_ALL"] {
+            assert!(
+                envs.iter().any(|(k, v)| *k == key
+                    && v.and_then(|v| v.to_str())
+                        .is_some_and(|v| v.ends_with("UTF-8"))),
+                "{key} 未设成 UTF-8：{envs:?}"
+            );
+        }
+    }
 
     /// macOS 版的同一条不变量：缓存必须随剪贴板变更失效。
     ///
