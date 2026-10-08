@@ -367,8 +367,13 @@ pub mod ext_kind {
     /// 下行：问宿主（`.app` / Linux addon）状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。
     /// body 空。气泡不在屏上时不答（协调器保留旧值）。
     pub const POS_STATUS_TIP_QUERY: &str = "pos.status_tip.query";
-    /// 上行（Linux addon）：当前焦点宿主的显示环境。body = `{"caret_free":bool,"scale":1.5}`，
-    /// 两个字段都可缺省（缺省 = 不改现值）。每次焦点获得时由 addon 重报，服务重启也不会丢。
+    /// 上行（Linux addon）：当前焦点宿主的显示环境。body =
+    /// `{"caret_free":bool,"caret_trusted":bool,"scale":1.5}`，各字段都可缺省（缺省 = 不改现值）。
+    /// 每次焦点获得时由 addon 重报，服务重启也不会丢。
+    ///
+    /// - `caret_trusted`：宿主报的光标坐标可直接当权威。Linux addon 的光标来自应用自己上报的光标
+    ///   矩形，没有 Windows「跨窗口 Win32 光标冒充插入点」的问题，但来源字段恒为 UNKNOWN（没有
+    ///   TSF 语义域）；不声明的话，「焦点变化时显示」这类要等权威坐标的路径会永远挂起。
     ///
     /// - `caret_free`：宿主不需要也给不出光标坐标。Wayland 原生应用的光标矩形是窗口相对坐标、
     ///   应用屏幕位置只有合成器知道，候选窗由合成器按 input popup 自己摆位（见 wind_linux 的

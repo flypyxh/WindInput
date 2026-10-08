@@ -249,9 +249,10 @@ Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y)
     return encodeExtFrame(kind, "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + "}");
 }
 
-Bytes encodeHostDisplayFrame(bool caretFree, double scale)
+Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, double scale)
 {
-    std::string body = std::string("{\"caret_free\":") + (caretFree ? "true" : "false");
+    std::string body = std::string("{\"caret_free\":") + (caretFree ? "true" : "false")
+                       + ",\"caret_trusted\":" + (caretTrusted ? "true" : "false");
     if (scale > 0.0) {
         // 两位小数足够表达 125% / 150% / 175% 这类档位；不用 std::to_string（带 locale 的小数点）。
         const long hundredths = std::lround(scale * 100.0);
