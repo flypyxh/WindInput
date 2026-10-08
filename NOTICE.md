@@ -140,9 +140,12 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 - **用途**: Linux 版 Wayland 候选窗（输入法 popup surface）生成客户端绑定所需的协议 XML，
   构建时由 wayland-scanner 生成代码；因发行版的 wayland-protocols 包不一定带
   `input-method-unstable-v2`，随仓库原样收录
-- **文件**: `input-method-unstable-v2.xml`、`viewporter.xml`、`xdg-output-unstable-v1.xml`
+- **文件**: `input-method-unstable-v2.xml`、`viewporter.xml`、`xdg-output-unstable-v1.xml`、
+  `xdg-shell.xml`、`relative-pointer-unstable-v1.xml`
 - **仓库**: https://gitlab.freedesktop.org/wayland/wayland-protocols
 - **许可证**: MIT（各文件头部保留原版权声明）
+- **另收**: `wlr-layer-shell-unstable-v1.xml`（屏幕锚定的浮层用），出自
+  https://gitlab.freedesktop.org/wlroots/wlr-protocols ，HPND 式宽松许可（文件头部保留原版权与许可声明）
 
 ## 技术参考
 

@@ -78,10 +78,14 @@ if(WIND_BUILD_ADDON)
     if(WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER AND FCITX_WAYLAND_INC)
         # 协议文件随仓（MIT；input-method-v2 在 wayland-protocols 1.3x 起不再随包提供，viewporter /
         # xdg-output 一并随仓，免得各发行版的 wayland-protocols 版本与是否安装成为构建变量）。
+        # wlr-layer-shell 来自 wlr-protocols（屏幕锚定的浮层用）；它的 get_popup 引用 xdg_popup，
+        # 所以 xdg-shell 也要生成一份接口表。
         set(WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
         file(MAKE_DIRECTORY ${WL_GEN})
         set(WL_GEN_SRC)
-        foreach(proto input-method-unstable-v2 viewporter xdg-output-unstable-v1)
+        foreach(proto input-method-unstable-v2 viewporter xdg-output-unstable-v1
+                      wlr-layer-shell-unstable-v1 xdg-shell
+                      relative-pointer-unstable-v1)
             set(xml ${CMAKE_CURRENT_SOURCE_DIR}/protocols/${proto}.xml)
             add_custom_command(
                 OUTPUT ${WL_GEN}/${proto}-client-protocol.h ${WL_GEN}/${proto}-protocol.c
