@@ -202,6 +202,18 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
         wcb.contextMenu = [this](int32_t target, int32_t x, int32_t y) {
             requestMenu(target, x, y);
         };
+        wcb.screenMenu = [this](int32_t target, int32_t x, int32_t y, Rect wa) {
+            WIND_DEBUG() << "请求打开屏幕菜单 target=" << target << " @(" << x << "," << y << ")";
+            if (!sendAndDrain(encodeMenuOpenFrame(target, x, y, wa.x, wa.y, wa.x + wa.w, wa.y + wa.h))) {
+                wlPanel_->closeMenu();
+            }
+        };
+        wcb.menuDismissed = [this](const std::string& reason) {
+            sendAndDrain(encodeMenuDismissFrame(reason));
+        };
+        wcb.statusMoved = [this](int32_t x, int32_t y) {
+            sendAndDrain(encodePosFrame(EXT_KIND_POS_STATUS_TIP, x, y));
+        };
         wcb.menuPointer = [this](uint32_t ev, uint32_t b, int32_t x, int32_t y) {
             // 报不上去：菜单是服务端画的，本端留着只剩一块点不动的位图，就地收掉
             if (!sendAndDrain(encodeMenuPointerFrame(ev, b, x, y))) {
@@ -423,7 +435,9 @@ void WindEngine::sendHostDisplay(fcitx::InputContext* ic)
         wlPanel_->setReportedScale(WaylandCandidatePanel::handles(ic) ? scale : 1.0);
     }
 #endif
-    sendAndDrain(encodeHostDisplayFrame(caretFree, scale));
+    // 光标可信恒为真：Linux 的光标矩形来自应用自己上报（没有 Windows 那种跨窗口光标冒充插入点
+    // 的问题），只是来源字段没有 TSF 那套语义可填。不声明的话服务端「焦点变化时显示」永远挂起。
+    sendAndDrain(encodeHostDisplayFrame(caretFree, true, scale));
 }
 
 void WindEngine::sendFocusGained(fcitx::InputContext* ic)
@@ -870,7 +884,16 @@ void WindEngine::onExt(const ExtEnvelope& ext)
 {
     if (ext.kind == EXT_KIND_POS_STATUS_TIP_QUERY) {
         // 切「固定位置」时服务端问气泡此刻在哪，好以当前位置落盘。不在屏上不答（服务端保留旧值）。
-        if (auto at = panel_->statusContentOrigin()) {
+        std::optional<std::pair<int32_t, int32_t>> at;
+#ifdef WIND_HAVE_WAYLAND
+        if (wlPanel_) {
+            at = wlPanel_->statusContentOrigin(); // Wayland 下气泡在 layer-shell 上（若在）
+        }
+#endif
+        if (!at) {
+            at = panel_->statusContentOrigin();
+        }
+        if (at) {
             sendAndDrain(encodePosFrame(EXT_KIND_POS_STATUS_TIP, at->first, at->second));
         }
         return;
@@ -938,7 +961,9 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
     }
 #ifdef WIND_HAVE_WAYLAND
     // Wayland 原生应用：浮层的屏幕坐标没有意义，并进 popup 与候选一起由合成器摆位。
-    if (wlPanel_ && WaylandCandidatePanel::handles(focusedIC())) {
+    // 按屏幕摆的（Toast、屏幕锚点 / 固定位置的气泡）在 Wayland 会话里一律走 layer-shell，与焦点
+    // 在哪种应用无关：焦点在 XWayland 应用（或没有焦点）时若走 X11 窗口，treeland 会把它压在任务栏下面。
+    if (wlPanel_ && (WaylandCandidatePanel::handles(focusedIC()) || wlPanel_->wantsLayer(p.kind, p))) {
         panel_->hideOverlay(p.kind);
         wlPanel_->showOverlay(focusedIC(), p.kind, f, p);
         return;
@@ -971,7 +996,7 @@ void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
         return;
     }
 #ifdef WIND_HAVE_WAYLAND
-    if (wlPanel_ && WaylandCandidatePanel::handles(focusedIC())) {
+    if (wlPanel_ && (wlPanel_->screenMenuActive() || WaylandCandidatePanel::handles(focusedIC()))) {
         panel_->hideMenuLevel(level);
         wlPanel_->showMenuLevel(focusedIC(), level, f, p);
         return;
