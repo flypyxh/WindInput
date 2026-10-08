@@ -459,10 +459,6 @@ pub struct LatticeNode {
     /// 打出来的规范码——`chaijiuduolian` 的整句若按所打码落库，下次同样打法零罚精确命中这条
     /// 非规范记录。Viterbi 回溯把它透传出来（`ViterbiResult::learn_code`）。
     pub canon: Option<(String, u64)>,
-    /// 简拼节点（`add_abbrev_nodes` / `add_store_abbrev_nodes`）：本节点跨度里的每个字母
-    /// 都只打了声母。整句的缩写上限（GH#180）按路径上这类节点的字母数计——只看字符串
-    /// 分不清全拼节点 `a`（啊）与简拼节点里的 `a`（爱），也分不清模糊拼写 `tin` 与缩写。
-    pub abbrev: bool,
 }
 
 /// 词图里把 `zh` / `ch` / `sh` **拆成两个声母**（z|h）的次数：某个 `h` 紧跟在 z/c/s 之后、
@@ -648,7 +644,6 @@ impl LatticeBuilder {
                         syl_mask: offsets_mask(&offsets),
                         log_prob,
                         canon: None,
-                        abbrev: false,
                     });
                 }
 
@@ -704,7 +699,6 @@ impl LatticeBuilder {
                                 syl_mask: offsets_mask(&offsets),
                                 log_prob,
                                 canon: Some((variant.clone(), canon_mask)),
-                                abbrev: false,
                             });
                         }
                     }
@@ -788,7 +782,6 @@ impl LatticeBuilder {
                             // 字母。见 `LatticeNode::canon`。边界必非 0——上面已经过
                             // `syllables_from_boundary` 校验且音节数 = 字母数（≥ 2）。
                             canon: Some((abbr_code.clone(), hit.boundary)),
-                            abbrev: true,
                         });
                     }
                 }
@@ -903,7 +896,6 @@ impl LatticeBuilder {
                             existing.syllables = slice_syllables(code, &offsets);
                             existing.syl_mask = offsets_mask(&offsets);
                             existing.canon = None;
-                            existing.abbrev = false;
                         }
                         continue;
                     }
@@ -915,7 +907,6 @@ impl LatticeBuilder {
                         syl_mask: offsets_mask(&offsets),
                         log_prob,
                         canon: None,
-                        abbrev: false,
                     });
                 }
             }
@@ -1072,7 +1063,6 @@ impl LatticeBuilder {
                         existing.syllables = slice_syllables(code, offsets);
                         existing.syl_mask = offsets_mask(offsets);
                         existing.canon = Some((variant.clone(), cand.boundary));
-                        existing.abbrev = false;
                     }
                     continue;
                 }
@@ -1085,7 +1075,6 @@ impl LatticeBuilder {
                     log_prob,
                     // 记录自己的码与边界：边界已逐音节验过等于变体边界。
                     canon: Some((variant.clone(), cand.boundary)),
-                    abbrev: false,
                 });
             }
         }
@@ -1176,7 +1165,6 @@ impl LatticeBuilder {
                             existing.syllables = stroke.chars().map(|c| c.to_string()).collect();
                             existing.syl_mask = (0..span).fold(0u64, |m, i| m | (1u64 << i));
                             existing.canon = Some((cand.code.clone(), cand.boundary));
-                            existing.abbrev = true;
                         }
                         continue;
                     }
@@ -1190,7 +1178,6 @@ impl LatticeBuilder {
                         log_prob,
                         // 记录自己的码与边界（`syllables_from_boundary` 已保证边界非 0）。
                         canon: Some((cand.code.clone(), cand.boundary)),
-                        abbrev: true,
                     });
                 }
             }
@@ -1274,7 +1261,6 @@ impl LatticeBuilder {
                 log_prob,
                 // 残码位不填：见 `LatticeNode::canon`，残码整句的造词口径不在本字段范围。
                 canon: None,
-                abbrev: false,
             });
         }
     }
@@ -1334,7 +1320,6 @@ mod coda_steal_tests {
             syl_mask: mask,
             log_prob: 0.0,
             canon: None,
-            abbrev: false,
         }
     }
 
