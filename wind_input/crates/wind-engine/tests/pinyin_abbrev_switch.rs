@@ -92,3 +92,40 @@ fn trailing_initial_completion_is_not_governed() {
         &t[..t.len().min(20)]
     );
 }
+
+/// 混输取与：`schema.mix.enable_pinyin_abbrev` 开着，全局「启用简拼」关掉时，
+/// 混输里的拼音同样不出简拼。只改纯拼音那一半的接线会被上一个用例抓到，这里管另一半。
+#[test]
+fn mixed_requires_global_switch_too() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：build_dev/data 下没有拼音词库");
+        return;
+    };
+    const MIX: &str = "wubi86_pinyin";
+    if !dir.join(format!("schemas/{MIX}.schema.toml")).exists() {
+        eprintln!("跳过：没有混输方案 {MIX}");
+        return;
+    }
+    let abbrev_hits = |global: bool| {
+        let mgr = manager(&dir, MIX, |c| {
+            c.schema.mix.enable_pinyin_abbrev = true;
+            c.schema.pinyin.abbrev.enabled = global;
+        });
+        mgr.convert_with(MIX, "bjdx", 100)
+            .candidates
+            .into_iter()
+            .filter(|c| c.is_abbrev)
+            .map(|c| c.text)
+            .collect::<Vec<_>>()
+    };
+    let on = abbrev_hits(true);
+    assert!(
+        has(&on, "北京大学"),
+        "两个开关都开时混输 bjdx 应出简拼「北京大学」: {on:?}"
+    );
+    let off = abbrev_hits(false);
+    assert!(
+        off.is_empty(),
+        "全局简拼关掉后混输不该再出简拼候选: {off:?}"
+    );
+}
