@@ -9,7 +9,7 @@
 #include "DisplayAttributeInfo.h"
 #include "HotkeyManager.h"
 #include "HostWindow.h"
-#include "CompositionPlaceholder.h" // 组合占位识别 + 兜底取值（空格 / ZWSP，由 core 按应用决定，GH#175）
+#include "CompositionPlaceholder.h" // 组合占位识别 + 兜底取值（空格 / ZWSP / 盲文空白，由 core 按应用决定，GH#175）
 #include <vector>
 #include <shellscalingapi.h>
 #include <inputscope.h> // ITfInputScope / InputScope 枚举
@@ -653,7 +653,7 @@ private:
 class CUpdateCompositionEditSession : public ITfEditSession
 {
 public:
-    // placeholder：_text 为空时兜底写入的占位（core 按应用下发：空格 / ZWSP，见 CompositionPlaceholder.h）。
+    // placeholder：_text 为空时兜底写入的占位（core 按应用下发：空格 / ZWSP / 盲文空白，见 CompositionPlaceholder.h）。
     CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1, BOOL noUnderline = FALSE,
                                   const wchar_t* placeholder = wind::placeholder::kSpacePlaceholder)
         : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos), _noUnderline(noUnderline),

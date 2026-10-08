@@ -243,7 +243,7 @@ public:
     // keep it INSIDE the composition (Microsoft IME behavior — the real document
     // commit is deferred to the final CommitText). See _pendingCommitPrefix.
     BOOL InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition);
-    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格或 ZWSP，见 CompositionPlaceholder.h）放 0**。
+    // 新开组合时插入点的位置：常规放末尾，**占位组合（单个空格 / ZWSP / 盲文空白，见 CompositionPlaceholder.h）放 0**。
     // 与 Rust 侧 COMPOSITION_PLACEHOLDER 成对，见实现处的说明。
     static int _CompositionCaretFor(const std::wstring& composition);
 
@@ -332,7 +332,7 @@ public:
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；默认关）。
     void SetDiagSnapshotEnabled(BOOL bEnabled) { _diagSnapshotEnabled = bEnabled; }
     // 空文本兜底占位字符的档位（core 经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 按本进程 compat
-    // 规则推；0 = 空格（默认）、1 = ZWSP，GH#175）。config 回调跑在 IPC 读线程，读在 TSF
+    // 规则推；0 = 空格（默认）、1 = ZWSP、2 = 盲文空白，GH#175）。config 回调跑在 IPC 读线程，读在 TSF
     // 线程，故用 Interlocked 读写一个 LONG。
     void SetCompositionPlaceholderKind(uint8_t kind) { InterlockedExchange(&_compositionPlaceholderKind, (LONG)kind); }
 

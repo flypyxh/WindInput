@@ -528,12 +528,22 @@ pub const CONFIG_KEY_PAIR_STATE_TTL: &str = "pair_state_ttl";
 /// 由服务端在 HUD 打开时推开。**必须在握手时也推一次**：DLL 每次重连都从默认值
 /// （关）起步，只在切换时推会让重连后的宿主永远不采集（`push_connect_fix` 记过同型）。
 pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
-/// 组合区**空文本兜底占位**用哪个字符（GH#175）同步键名。格式：`kind(u8)`，0 = 空格、1 = ZWSP。
+/// 组合区**空文本兜底占位**用哪个字符（GH#175）同步键名。格式：`kind(u8)`，取值见
+/// `COMPOSITION_PLACEHOLDER_*`（0 = 空格、1 = ZWSP、2 = U+2800 盲文空白）。
 ///
 /// 按**客户端 pid** 现算（compat 规则 `composition_placeholder`），逐客户端推送：DLL 的组合区
 /// 在文本为空时要补一个占位撑开 range，补哪个字符只有服务端知道。协调器自己发出的占位
 /// 不经这里（直接把字符写进组合文本）。DLL 每次重连从默认（空格）起步，故握手必推。
+///
+/// 向后兼容：DLL 的 `PlaceholderForKind` 对**认不出的值一律回落空格**，所以只认 0/1 的旧 DLL
+/// 收到 2 时兜底占位是空格（历史行为），不会出错；新加档位照此只追加、不复用旧值。
 pub const CONFIG_KEY_COMPOSITION_PLACEHOLDER: &str = "composition_placeholder";
+/// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：空格 U+0020（默认）。
+pub const COMPOSITION_PLACEHOLDER_SPACE: u8 = 0;
+/// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：ZWSP U+200B。
+pub const COMPOSITION_PLACEHOLDER_ZWSP: u8 = 1;
+/// `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的取值：U+2800 BRAILLE PATTERN BLANK。
+pub const COMPOSITION_PLACEHOLDER_BLANK: u8 = 2;
 
 /// 语言栏按钮的悬停提示文本。格式：`[ch:u16(LE)]...`（UTF-16LE，无长度前缀，
 /// `value` 本身就是整段）。与 `CONFIG_KEY_CUSTOM_EN_PUNCT` 同惯例——C++ 侧照此可以

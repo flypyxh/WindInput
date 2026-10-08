@@ -305,8 +305,12 @@ impl InitialMode {
 /// 能躲开这一回写；但它在非浏览器宿主里的光标度量没有实测过，故**按应用配置**，出厂只给
 /// 浏览器开。
 ///
+/// ZWSP 也有宿主不吃：钉钉在线表格选中单元格直接打字时，靠「出现了内容」才进入编辑态，
+/// 零宽字符被当成没有内容，组合停在左上角的代理输入框里、候选窗定位错——那里要空格。
+/// 两头都要（非空白 + 有宽度）时用第三档 `blank`（U+2800 盲文空白）。
+///
 /// 消费：协调器按焦点应用解析后直接发出该字符（[`Self::as_str`]）；DLL 的空文本兜底占位
-/// 经 `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 按客户端 pid 下发。DLL 两种字符都认作占位。
+/// 经 `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 按客户端 pid 下发。DLL 三种字符都认作占位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaceholderChar {
@@ -315,6 +319,8 @@ pub enum PlaceholderChar {
     Space,
     /// U+200B ZERO WIDTH SPACE。
     Zwsp,
+    /// U+2800 BRAILLE PATTERN BLANK：非空白（`trim()` / `\s` 不删）、有宽度。
+    Blank,
 }
 
 impl PlaceholderChar {
@@ -323,6 +329,7 @@ impl PlaceholderChar {
         match s.trim().to_ascii_lowercase().as_str() {
             "space" => Some(Self::Space),
             "zwsp" => Some(Self::Zwsp),
+            "blank" => Some(Self::Blank),
             _ => None,
         }
     }
@@ -331,6 +338,7 @@ impl PlaceholderChar {
         match self {
             Self::Space => "space",
             Self::Zwsp => "zwsp",
+            Self::Blank => "blank",
         }
     }
     /// 实际写进宿主组合区的字符串（恒为一个字符）。
@@ -338,6 +346,7 @@ impl PlaceholderChar {
         match self {
             Self::Space => " ",
             Self::Zwsp => "\u{200B}",
+            Self::Blank => "\u{2800}",
         }
     }
 }
@@ -2377,7 +2386,11 @@ mod tests {
 
     #[test]
     fn placeholder_char_config_roundtrip() {
-        for v in [PlaceholderChar::Space, PlaceholderChar::Zwsp] {
+        for v in [
+            PlaceholderChar::Space,
+            PlaceholderChar::Zwsp,
+            PlaceholderChar::Blank,
+        ] {
             assert_eq!(PlaceholderChar::from_config(v.as_config()), Some(v));
         }
         assert_eq!(PlaceholderChar::Space.as_str(), " ");
@@ -2392,6 +2405,38 @@ mod tests {
             Some(PlaceholderChar::Zwsp)
         );
         assert_eq!(PlaceholderChar::from_config("nbsp"), None);
+    }
+
+    /// 钉钉在线表格一类宿主：选中单元格直接打字时，靠「出现了内容」才进入编辑态——ZWSP 被当成
+    /// 没有内容，空格又会被受控输入 trim 掉。`blank`（U+2800）两头都躲开：有宽度、非空白。
+    #[test]
+    fn blank_placeholder_is_non_whitespace_with_width() {
+        let toml = r#"
+            [[apps]]
+            process = "DingTalk.exe"
+            composition_placeholder = "Blank"
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps);
+        assert_eq!(
+            compat.composition_placeholder_for("dingtalk.exe"),
+            PlaceholderChar::Blank
+        );
+        assert_eq!(
+            PlaceholderChar::from_config(PlaceholderChar::Blank.as_config()),
+            Some(PlaceholderChar::Blank)
+        );
+        assert_eq!(PlaceholderChar::Blank.as_config(), "blank");
+        assert_eq!(PlaceholderChar::Blank.as_str(), "\u{2800}");
+        let ch = PlaceholderChar::Blank.as_str().chars().next().unwrap();
+        assert_eq!(PlaceholderChar::Blank.as_str().chars().count(), 1);
+        // JS `trim()` / `\s` 的空白集 ⊂ Unicode White_Space（外加 U+FEFF）；它不在其中。
+        assert!(!ch.is_whitespace(), "U+2800 不得是空白，否则会被 trim 掉");
+        assert_ne!(ch, '\u{FEFF}');
+        assert_eq!(
+            toml::Value::try_from(PlaceholderChar::Blank).unwrap(),
+            toml::Value::String("blank".into()),
+            "序列化写回 compat.toml 的取值"
+        );
     }
 
     /// 三个新增 per-app 字段的解析。`auto_pair` / `smart_method` 是 `Option`，

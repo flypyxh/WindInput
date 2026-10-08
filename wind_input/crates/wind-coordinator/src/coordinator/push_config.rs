@@ -282,9 +282,8 @@ impl Coordinator {
     /// （模板同 [`Self::push_password_suppress_config`]）。握手、pid 校正、compat 重载时推。
     pub fn push_composition_placeholder_config(&self, client_token: u64) {
         let make = |token: u64| {
-            let zwsp = self.composition_placeholder_for_token(token)
-                == wind_config::app_compat::PlaceholderChar::Zwsp;
-            let value = wind_ipc::codec::encode_composition_placeholder_value(zwsp);
+            let kind = placeholder_wire_kind(self.composition_placeholder_for_token(token));
+            let value = wind_ipc::codec::encode_composition_placeholder_value(kind);
             wind_ipc::codec::encode_sync_config(
                 wind_ipc::protocol::CONFIG_KEY_COMPOSITION_PLACEHOLDER,
                 &value,
@@ -663,5 +662,21 @@ impl Coordinator {
         // 状态变化同样可能改变 tooltip（切中英、CapsLock）。内部去重，绝大多数
         // 状态推送（全半角、标点、方案切换）不会真的发出去。
         self.push_langbar_tooltip(0);
+    }
+}
+
+/// compat 规则的占位字符 → `CONFIG_KEY_COMPOSITION_PLACEHOLDER` 的下发值（GH#175）。
+///
+/// 穷举 match：给 `PlaceholderChar` 加档位时这里编译不过，逼着同步协议与 DLL
+/// （`wind_tsf/include/CompositionPlaceholder.h` 的 `PlaceholderForKind`）。
+fn placeholder_wire_kind(p: wind_config::app_compat::PlaceholderChar) -> u8 {
+    use wind_config::app_compat::PlaceholderChar;
+    use wind_ipc::protocol::{
+        COMPOSITION_PLACEHOLDER_BLANK, COMPOSITION_PLACEHOLDER_SPACE, COMPOSITION_PLACEHOLDER_ZWSP,
+    };
+    match p {
+        PlaceholderChar::Space => COMPOSITION_PLACEHOLDER_SPACE,
+        PlaceholderChar::Zwsp => COMPOSITION_PLACEHOLDER_ZWSP,
+        PlaceholderChar::Blank => COMPOSITION_PLACEHOLDER_BLANK,
     }
 }

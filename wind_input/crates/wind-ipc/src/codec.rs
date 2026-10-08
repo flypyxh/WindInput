@@ -1403,6 +1403,25 @@ mod tests {
             defer.len() as u32
         );
     }
+
+    /// GH#175：占位档位按 kind 原样编成 1 字节；值与 C++ `PlaceholderForKind` 一一对应。
+    #[test]
+    fn composition_placeholder_value_is_the_kind_byte() {
+        use crate::protocol::{
+            COMPOSITION_PLACEHOLDER_BLANK, COMPOSITION_PLACEHOLDER_SPACE,
+            COMPOSITION_PLACEHOLDER_ZWSP,
+        };
+        assert_eq!(COMPOSITION_PLACEHOLDER_SPACE, 0);
+        assert_eq!(COMPOSITION_PLACEHOLDER_ZWSP, 1);
+        assert_eq!(COMPOSITION_PLACEHOLDER_BLANK, 2);
+        for k in [
+            COMPOSITION_PLACEHOLDER_SPACE,
+            COMPOSITION_PLACEHOLDER_ZWSP,
+            COMPOSITION_PLACEHOLDER_BLANK,
+        ] {
+            assert_eq!(encode_composition_placeholder_value(k), vec![k]);
+        }
+    }
 }
 
 // ── darwin host-render push 帧编码器 (W4) ──
@@ -1738,9 +1757,10 @@ pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
 }
 
 /// 编码组合区兜底占位字符的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_COMPOSITION_PLACEHOLDER）。
-/// 格式：kind(u8)，0 = 空格（U+0020）、1 = ZWSP（U+200B）。GH#175。
-pub fn encode_composition_placeholder_value(zwsp: bool) -> Vec<u8> {
-    vec![zwsp as u8]
+/// 格式：kind(u8)，取 `protocol::COMPOSITION_PLACEHOLDER_*`（0 = 空格 U+0020、1 = ZWSP U+200B、
+/// 2 = 盲文空白 U+2800）。旧 DLL 认不出的值回落空格。GH#175。
+pub fn encode_composition_placeholder_value(kind: u8) -> Vec<u8> {
+    vec![kind]
 }
 
 /// 编码诊断快照采集开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_DIAG_SNAPSHOT）。

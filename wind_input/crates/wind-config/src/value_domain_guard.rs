@@ -228,7 +228,7 @@ fn app_compat_seed() -> toml::Value {
         status_fallback_position: Some(StatusFallback::Hide),
         ignore_host_ime_close: Some(true),
         host_drawn_candidates: Some(true),
-        composition_placeholder: Some(crate::app_compat::PlaceholderChar::Zwsp),
+        composition_placeholder: Some(crate::app_compat::PlaceholderChar::Blank),
     };
     let file = AppCompatFile {
         apps: vec![rule],

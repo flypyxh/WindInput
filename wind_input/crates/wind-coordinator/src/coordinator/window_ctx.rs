@@ -497,24 +497,23 @@ mod tests {
         c.state.lock().unwrap().chinese_mode
     }
 
-    fn placeholder_msg(zwsp: bool) -> Vec<u8> {
+    fn placeholder_msg(kind: u8) -> Vec<u8> {
         wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_COMPOSITION_PLACEHOLDER,
-            &wind_ipc::codec::encode_composition_placeholder_value(zwsp),
+            &wind_ipc::codec::encode_composition_placeholder_value(kind),
         )
     }
 
-    /// 收到的占位字符推送：`None` = 没推，`Some(zwsp)` = 推了一次。
-    fn pushed_placeholder(cap: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<bool> {
+    /// 收到的占位字符推送：`None` = 没推，`Some(kind)` = 推了一次（0 空格 / 1 ZWSP / 2 盲文空白）。
+    fn pushed_placeholder(cap: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<u8> {
         let got: Vec<Vec<u8>> = cap.try_iter().collect();
-        match (
-            got.contains(&placeholder_msg(true)),
-            got.contains(&placeholder_msg(false)),
-        ) {
-            (true, false) => Some(true),
-            (false, true) => Some(false),
-            (false, false) => None,
-            (true, true) => panic!("同一轮收到两种值"),
+        let kinds: Vec<u8> = (0u8..=2)
+            .filter(|&k| got.contains(&placeholder_msg(k)))
+            .collect();
+        match kinds.as_slice() {
+            [] => None,
+            [k] => Some(*k),
+            _ => panic!("同一轮收到多种值：{kinds:?}"),
         }
     }
 
@@ -597,7 +596,7 @@ initial_mode = "chinese"
 
         // 握手：还没有焦点窗口 ⇒ 类名规则不命中 ⇒ 空格。
         c.push_composition_placeholder_config(t);
-        assert_eq!(pushed_placeholder(&cap), Some(false));
+        assert_eq!(pushed_placeholder(&cap), Some(0));
 
         c.handle_focus_gained(&focus(t, "Chrome_WidgetWin_1"));
         assert_eq!(
@@ -607,7 +606,7 @@ initial_mode = "chinese"
         );
         assert_eq!(
             pushed_placeholder(&cap),
-            Some(true),
+            Some(1),
             "首次带类名获焦必须重推：握手那份是按空窗口算的"
         );
 
@@ -618,8 +617,34 @@ initial_mode = "chinese"
         assert_eq!(c.composition_placeholder(), COMPOSITION_PLACEHOLDER);
         assert_eq!(
             pushed_placeholder(&cap),
-            Some(false),
+            Some(0),
             "换到非 Chromium 窗口重推空格"
+        );
+    }
+
+    /// GH#175 第三档：`blank`（U+2800）——协调器自己发的占位与推给 DLL 的档位（2）都要跟上。
+    /// 钉钉在线表格一类「靠出现内容进入编辑态」的宿主用它（ZWSP 被当成没内容）。
+    #[test]
+    fn blank_rule_gives_braille_blank_and_pushes_kind_2() {
+        let c = coord_with_rules(
+            "blank",
+            "[[apps]]\nprocess = \"DingTalk.exe\"\ncomposition_placeholder = \"blank\"\n",
+        );
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(42, "dingtalk.exe".into());
+        let t = (42u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(t);
+
+        c.push_composition_placeholder_config(t);
+        assert_eq!(pushed_placeholder(&cap), Some(2), "blank 下发值 = 2");
+
+        c.handle_focus_gained(&focus(t, "StandardFrame_DingTalk"));
+        assert_eq!(
+            c.composition_placeholder(),
+            "\u{2800}",
+            "协调器自己发的占位"
         );
     }
 

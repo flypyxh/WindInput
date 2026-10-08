@@ -2986,7 +2986,8 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
     }
     else if (key == CONFIG_KEY_COMPOSITION_PLACEHOLDER)
     {
-        // 格式：kind(u8)（对齐 Rust encode_composition_placeholder_value）。0 = 空格、1 = ZWSP。
+        // 格式：kind(u8)（对齐 Rust encode_composition_placeholder_value）。0 = 空格、1 = ZWSP、
+        // 2 = 盲文空白（U+2800）。原样存下，由 PlaceholderForKind 取字符：认不出的值回落空格。
         // GH#175：空文本兜底占位按本进程 compat 规则取字符，决策在 core。
         if (value.empty()) return;
         _pTextService->SetCompositionPlaceholderKind(value[0]);

@@ -107,11 +107,11 @@ pub struct CommitResultData {
 /// `TextService.cpp` 的 `_CompositionCaretFor`。**两侧取值必须一致**，改这里要同步改那里。
 ///
 /// ⚠️ 本常量只是**默认值**（GH#175）：占位字符按应用可配（compat.toml 的
-/// `composition_placeholder = "space" | "zwsp"`，出厂给浏览器配 zwsp——受控 `<input>` 会
+/// `composition_placeholder = "space" | "zwsp" | "blank"`，出厂给浏览器配 zwsp——受控 `<input>` 会
 /// trim 组合中的 value，空格被削掉后 React 回写、浏览器终止组合，一个字都上不了屏）。
 /// 协调器发占位时一律经 [`MessageHandler::composition_placeholder`]（协调器实现为
 /// `Coordinator::composition_placeholder`）取当前应用的字符，**不要直接用本常量**。
-/// C++ 侧两种字符（空格 / U+200B）都认作占位，见 `wind_tsf/include/CompositionPlaceholder.h`。
+/// C++ 侧三种字符（空格 / U+200B / U+2800）都认作占位，见 `wind_tsf/include/CompositionPlaceholder.h`。
 pub const COMPOSITION_PLACEHOLDER: &str = " ";
 
 /// 按键事件结果类型
@@ -198,7 +198,7 @@ impl KeyAction {
     /// 目的：保留一段组合串供应用上报 caret 坐标（候选窗定位），但不在应用内显示真实编码
     /// （避免与候选窗 preedit 重复）。对齐 Go 版"模拟空格 + 光标移前"。
     ///
-    /// `placeholder` 由调用方按当前应用给出（空格或 ZWSP，GH#175，见 [`COMPOSITION_PLACEHOLDER`]）。
+    /// `placeholder` 由调用方按当前应用给出（空格 / ZWSP / U+2800，GH#175，见 [`COMPOSITION_PLACEHOLDER`]）。
     pub fn with_composition_placeholder(self, placeholder: &str) -> KeyAction {
         match self {
             // ⚠️ `!text.is_empty()` 这个守卫**必须留着**：空组合区意味着「这一刻不该有
@@ -580,8 +580,8 @@ mod placeholder_tests {
                 },
             ),
         ];
-        // 两种占位字符都要原样落到组合串上（GH#175：浏览器按 compat 规则用 ZWSP）。
-        for placeholder in [COMPOSITION_PLACEHOLDER, "\u{200B}"] {
+        // 各档占位字符都要原样落到组合串上（GH#175：浏览器按 compat 规则用 ZWSP，钉钉表格类用 U+2800）。
+        for placeholder in [COMPOSITION_PLACEHOLDER, "\u{200B}", "\u{2800}"] {
             for (name, action) in cases.clone() {
                 let composition = match action.with_composition_placeholder(placeholder) {
                     KeyAction::UpdateComposition { text, caret_pos } => {

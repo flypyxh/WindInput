@@ -701,7 +701,7 @@ impl MessageHandler for Coordinator {
     }
 
     fn composition_placeholder(&self) -> &'static str {
-        // GH#175：按焦点应用的 compat 规则取（空格 / ZWSP），唯一实现在 push_config.rs。
+        // GH#175：按焦点应用的 compat 规则取（空格 / ZWSP / U+2800），唯一实现在 push_config.rs。
         Coordinator::composition_placeholder(self)
     }
 
