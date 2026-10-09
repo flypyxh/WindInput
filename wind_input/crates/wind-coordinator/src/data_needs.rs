@@ -950,7 +950,9 @@ mod tests {
         let id = "zz_dn_keep";
         let dir = schema_fixture("keep", id, true);
         let c = fixture_coord(&dir, id);
-        assert_eq!(c.reverse_render("好", "${chaizi}"), "");
+        // 首次用到只负责触发后台装载；返回空还是已装上取决于调度（macOS CI 上后台抢先装完、
+        // 直接返回了「女子」），不在这里断言。
+        let _ = c.reverse_render("好", "${chaizi}");
         assert!(wait_for(|| has_chaizi(&c)), "前置条件：后台装上");
         c.apply_data_needs();
         assert!(
