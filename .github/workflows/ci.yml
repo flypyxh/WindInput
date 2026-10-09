@@ -76,10 +76,13 @@ jobs:
       # 约 10 秒。⚠ 上面那步交叉编译只保证 DLL 能编出来，**一条断言都不会执行**；
       # 这些测试此前只有手敲 g++ 才跑得到，等于不存在。在「游戏兼容这类改动无法在
       # CI 里真机验」的前提下，它们是唯一会自动执行的判据闸门，故单列一步。
+      # 按通配取全部 *_test.cpp：手写清单曾漏掉一半（新测试只登记了 CMake），等于没跑。
       - name: wind_tsf 纯逻辑单测
         run: |
-          for t in skip_key_table installer_guard uielement_policy composition_placeholder ctrl_space_policy window_title_policy; do
-            g++ -std=c++17 -Wall -Wextra -Iwind_tsf/include -o "/tmp/$t" "wind_tsf/tests/${t}_test.cpp"
+          set -e
+          for f in wind_tsf/tests/*_test.cpp; do
+            t="$(basename "$f" .cpp)"
+            g++ -std=c++17 -Wall -Wextra -Iwind_tsf/include -o "/tmp/$t" "$f"
             "/tmp/$t"
           done
 
