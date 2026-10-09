@@ -192,6 +192,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME passthrough_note COMMAND passthrough_note_test)
 
+    add_executable(number_key_policy_test tests/number_key_policy_test.cpp)
+    target_include_directories(number_key_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(number_key_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME number_key_policy COMMAND number_key_policy_test)
+
     add_executable(deferred_composition_policy_test tests/deferred_composition_policy_test.cpp)
     target_include_directories(deferred_composition_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

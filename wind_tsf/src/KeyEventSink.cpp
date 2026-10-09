@@ -1,5 +1,6 @@
 #include "KeyEventSink.h"
 #include "DeferredCompositionPolicy.h"
+#include "NumberKeyPolicy.h"
 #include "TextService.h"
 #include "IPCClient.h"
 #include "HotkeyManager.h"
@@ -835,7 +836,10 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
             // 中文+全角：无 input session 时也需拦截 Number, 让 Go 走全角转换。
             // 否则数字直通到应用得到半角, 仅在记事本(IMM32 兼容层)恰好正确,
             // VS Code/Chrome/WPS/Word 等纯 TSF 应用都会出错。
-            if (isChineseMode && keyType == HotkeyType::Number && _pTextService->IsFullWidth())
+            // 判据与 OnKeyDown 的 numberPassthrough 同一个函数（NumberKeyPolicy.h）。
+            if (keyType == HotkeyType::Number &&
+                wind::numberkey::ShouldEatNumberKey(hasInputSession != FALSE, isChineseMode != FALSE,
+                                                    _pTextService->IsFullWidth() != FALSE))
             {
                 *pfEaten = TRUE;
                 _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, keyType,
@@ -1345,6 +1349,15 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         isChineseMode && !hasInputSession && !_pTextService->IsFullWidth() &&
         _IsPassthroughPunctKey(wParam, modifiers);
 
+    // 与 OnTestKeyDown 的 Number 分支对称（同一个 ShouldEatNumberKey）：Test 放行的数字类键
+    // （中文半角空闲的主键盘 / 小键盘数字与运算符）这里也不转发服务端。此前一律转发、靠服务端回
+    // PassThrough 兜着，服务端某条路径一出字（t285 小键盘、主键盘 0、follow_main 运算符），
+    // Test 不吃却照调 OnKeyDown 的 Chrome 类宿主就宿主出一次、我们插一次。
+    BOOL numberPassthrough =
+        isChineseMode && CHotkeyManager::ClassifyInputKey(wParam, modifiers) == HotkeyType::Number &&
+        !wind::numberkey::ShouldEatNumberKey(hasInputSession != FALSE, true,
+                                             _pTextService->IsFullWidth() != FALSE);
+
     // Track whether this is a Ctrl/Alt combo that needs cleanup-then-passthrough
     BOOL isCtrlAltCleanup = FALSE;
 
@@ -1415,7 +1428,8 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
             {
                 // 透传场景一律不视为输入键（保持 pfEaten=FALSE 同步透传，不发 core）：
                 // CapsLock 下的字母/标点，以及中文模式下产物即原样 ASCII 的标点。
-                isInputKey = (capsLockLetterPassthrough || capsLockPunctPassthrough || punctPassthrough)
+                isInputKey = (capsLockLetterPassthrough || capsLockPunctPassthrough || punctPassthrough ||
+                              numberPassthrough)
                                  ? FALSE
                                  : (keyType != HotkeyType::None);
             }
@@ -1470,6 +1484,13 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
             *pfEaten = TRUE;
             _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::Letter,
                             isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"state_change_letter_consume");
+        }
+        else if (numberPassthrough)
+        {
+            // 与 OnTestKeyDown 末尾同一记账：宿主自己出的数字，供下一个标点的数字后智能标点用。
+            _lastPassthroughDigit = _DigitCharFromVk(wParam, modifiers);
+            _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::Number,
+                            isChineseMode, hasComposition, _hasCandidates, hasInputSession, FALSE, L"number_passthrough");
         }
         else
         {
