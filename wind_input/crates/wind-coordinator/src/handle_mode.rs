@@ -189,7 +189,7 @@ impl Coordinator {
 
     /// 设置简入繁出开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
     pub fn debug_set_s2t(&self, on: bool) -> bool {
-        if self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        if on && !self.ensure_converter(true) {
             return false;
         }
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,7 +202,7 @@ impl Coordinator {
 
     /// 设置繁入简出开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
     pub fn debug_set_t2s(&self, on: bool) -> bool {
-        if self.t2s.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        if on && !self.ensure_converter(false) {
             return false;
         }
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());

@@ -911,6 +911,10 @@ impl crate::coordinator::Coordinator {
         behavior: &'a wind_config::SchemaBehavior,
         vertical: bool,
     ) -> &'a str {
+        // 注释总开关在三层之上：关就是关（空模板 ⇒ 注释、上方注释条、上屏注释都为空）。
+        if !cfg.ui.candidate.comment_enabled {
+            return "";
+        }
         resolve_template(
             template_for(cfg, state.overlay_spec.as_ref(), state.active, vertical),
             schema_template_of(behavior, vertical),
@@ -1054,6 +1058,20 @@ impl crate::coordinator::Coordinator {
         if text.is_empty() {
             return String::new();
         }
+        // 运行期格式串不在配置里，`DataNeeds` 看不见：拆字表没装就后台装，本次拆字为空、
+        // 下次就有。必须在取读锁**之前**判——装表要取写锁。
+        let t = Template::parse(tpl);
+        if REVERSE_TEXT_VAR_NAMES
+            .iter()
+            .any(|n| n.starts_with("chaizi") && t.references(n))
+            && !self
+                .reverse
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_chaizi()
+        {
+            self.ensure_chaizi_async();
+        }
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         // ★ `${char}` 恒有值（它只是把待查文本原样回显），故不能让它算进「查到了」。
         // 否则 `render` 的「变量全空则整体消失」就永远不会触发：剪贴板里是个查不到的
@@ -1092,10 +1110,16 @@ impl crate::coordinator::Coordinator {
             // `reverse_render` 的 found 判据，整条反查候选这一次照旧不出现 —— 想要的
             // 效果不变，但不会在「模板里还有别的非空变量」时把字面 `${code_rev}`
             // 混进上屏文本。索引建好后下一次按键即恢复。
-            "code_rev" | "code" => self
-                .engine_mgr
-                .codetable_reverse_hint(text)
-                .unwrap_or_default(),
+            //
+            // ★ 没就绪时顺手派后台构建（单飞、已就绪即返回，不阻塞）：运行期格式串不在配置里，
+            // `DataNeeds` 看不见它，没有别人会替它建——不派的话这条反查永远是空的。
+            "code_rev" | "code" => match self.engine_mgr.codetable_reverse_hint(text) {
+                Some(code) => code,
+                None => {
+                    self.spawn_index_warm(&self.engine_mgr.primary_codetable_id(), false);
+                    String::new()
+                }
+            },
             // `code_all` —— 该字在码表里的**全部**码位，默认 `/` 连接（`我` → `q/trn/trnt`）。
             //
             // 与 `code` 的分工照搬同文件 `chaizi` / `chaizi_all` 的既有惯例：不带后缀取单个，
@@ -1108,10 +1132,13 @@ impl crate::coordinator::Coordinator {
             "code_rev_all" | "code_all" => {
                 let sid = self.engine_mgr.code_source_schema();
                 // 空串的理由同上面的 `code_rev`。
-                let codes = self
-                    .engine_mgr
-                    .word_codes_display(&sid, text)
-                    .unwrap_or_default();
+                let codes = match self.engine_mgr.word_codes_display(&sid, text) {
+                    Some(codes) => codes,
+                    None => {
+                        self.spawn_index_warm(&sid, false); // 理由同上
+                        String::new()
+                    }
+                };
                 match arg {
                     // `word_codes_display` 固定用 `/` 连接，换分隔符只能在这里替。
                     Some(sep) if !codes.is_empty() => codes.replace('/', sep),

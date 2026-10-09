@@ -616,6 +616,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.min_window_height_horizontal", Int),
     f("ui.candidate.min_window_height_vertical", Int),
     f("ui.candidate.min_rows", Int),
+    f("ui.candidate.comment_enabled", Bool),
     f("ui.candidate.comment_template_vertical", Str),
     f("ui.candidate.comment_template_horizontal", Str),
     f("ui.candidate.comment_max_chars_vertical", Int),
@@ -648,6 +649,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.theme.name", Str),
     f("ui.theme.style", Str),
     f("ui.mode_indicator.style", Enum(&["short", "full", "none"])),
+    f("ui.tooltip.enabled", Bool),
     f("ui.tooltip.delay", Int),
     f("ui.tooltip.max_chars", Int),
     f("ui.tooltip.wrap_width", Int),
@@ -1399,6 +1401,32 @@ mod tests {
         };
         assert_eq!(int("max_chars"), l1.max_chars as i64);
         assert_eq!(int("wrap_width"), l1.wrap_width as i64);
+    }
+
+    /// `[ui.<table>]` 下某个布尔键在 L2 里的值；缺键直接红。
+    fn l2_bool(table: &str, key: &str) -> bool {
+        data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get(table))
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or_else(|| panic!("data/config.toml 缺少布尔键 ui.{table}.{key}"))
+    }
+
+    /// L1↔L2 同源：悬停提示总开关（出厂开，设计 memory-footprint.md §9 D2「零回归」）。
+    #[test]
+    fn tooltip_enabled_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.tooltip.enabled;
+        assert!(l1, "ui.tooltip.enabled 出厂应为 true");
+        assert_eq!(l2_bool("tooltip", "enabled"), l1);
+    }
+
+    /// L1↔L2 同源：候选注释总开关（出厂开，同上）。
+    #[test]
+    fn comment_enabled_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.candidate.comment_enabled;
+        assert!(l1, "ui.candidate.comment_enabled 出厂应为 true");
+        assert_eq!(l2_bool("candidate", "comment_enabled"), l1);
     }
 
     /// 解析仓库内系统预置 `data/config.toml`。

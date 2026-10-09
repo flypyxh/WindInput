@@ -10,6 +10,15 @@ use wind_config::app_compat::NewlineStyle;
 use wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
 
 impl Coordinator {
+    /// 光标前最后一段已不是我们上屏的那段（宿主自己出了字、重放了键，或用户挪了光标）：撤销上屏
+    /// 计数退化为 1（否则「你好」后打个 0 再撤销删的是「好0」），草稿滑窗断流（否则「你」「0」
+    /// 「好」连打会登记「你好」）。
+    pub(crate) fn note_host_wrote_text(&self, reason: &str) {
+        self.last_commit_len
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        self.terminate_auto_phrase(reason);
+    }
+
     /// 仍挂在组合里的智能符号（HoldComposition）。超出时限的视为没有：C++ 定时器到点已自行提交，
     /// 这边的 `held_text` 不会随之清掉，拿它当「还在组合」会二次提交（"。" → 等 >500ms → "=" → "。。="）。
     pub(crate) fn live_held_text(&self) -> Option<String> {
@@ -407,8 +416,9 @@ impl MessageHandler for Coordinator {
             // 两个方向共用一条路：互斥保证住在 `toggle_conversion_direction` 里，
             // 各写一份必然漂移（其中一份忘了关掉对面就是两个方向同时开）。
             "toggle_s2t" | "toggle_t2s" => {
-                self.toggle_conversion_direction(command == "toggle_s2t");
-                self.show_status();
+                if self.try_toggle_conversion(command == "toggle_s2t") {
+                    self.show_status();
+                }
                 Some(self.build_status())
             }
             _ => None,
@@ -768,15 +778,22 @@ impl MessageHandler for Coordinator {
         // **必须在 `handle_key_event` 之前**：出口那道是「这一按之后」的清理，而这一位说的是
         // 「这一按之前已经发生过」，放到出口就晚了一整拍——press2 早已误触发。
         //
-        // 影响面刻意收到最窄：只解除智能符号武装，不碰任何别的状态；位为假时（绝大多数按键）
-        // 连锁都不取。旧 DLL 不置位 ⇒ 行为与改造前逐字一致。
+        // 同一个事实还说明光标前最后一段已不是我们上屏的那段，另两处据此复位：撤销上屏计数
+        // （否则「你好」后透传一个 0 再撤销，删的是「好0」）与草稿滑窗（否则「你」「0」「好」连打
+        // 会登记「你好」——光标回声在自提交后 200ms 内被忽略，靠 SelectionChanged 断不了）。
+        // 中文半角空闲的数字键 DLL 不再转发（NumberKeyPolicy.h），这是服务端唯一知道它们的途径。
+        //
+        // 位为假时（绝大多数按键）连锁都不取。旧 DLL 不置位 ⇒ 行为与改造前逐字一致。
         if data.event_type == EVENT_KEY_DOWN && data.toggles & TOGGLE_PASSTHROUGH_KEY != 0 {
-            let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
-            if arm.armed {
-                debug!("SmartSymbol: 上一按之后有键被透传给宿主，解除武装");
-                arm.armed = false;
-                arm.hold_pending_commit = false;
+            {
+                let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+                if arm.armed {
+                    debug!("SmartSymbol: 上一按之后有键被透传给宿主，解除武装");
+                    arm.armed = false;
+                    arm.hold_pending_commit = false;
+                }
             }
+            self.note_host_wrote_text("宿主自行出字");
         }
         let action = self.handle_key_event(data);
         // 上屏换行改写。与 record_input_stats / note_commit_action 同一收口理由（上屏路径
@@ -893,6 +910,13 @@ impl MessageHandler for Coordinator {
         } else {
             action
         };
+        // 本键交还宿主重放（联想态的退格 / 回车 / 方向键等）：同开头透传位那段，光标前已不是我们
+        // 上屏的那段。普通宿主的重放键在 Test 里被 Suppress、不置透传位，不能等下一按的位。
+        // 必须排在上面两道改判**之后**：Del / Home / 左右这些是在 `assoc_release_on_passthrough`
+        // 里才改成重放的。
+        if matches!(action, KeyAction::ClearCompositionThenPassThrough) {
+            self.note_host_wrote_text("交还宿主重放");
+        }
         if self.preedit_uses_placeholder() {
             action.with_composition_placeholder(self.composition_placeholder())
         } else {
@@ -1496,9 +1520,10 @@ impl MessageHandler for Coordinator {
             // 判据也同源（联想态挂在 `candidates` 上，算有组合）。
             //
             // ⛔ 不能由我们 InsertText 出字（论坛 t285）：C++ OnTestKeyDown 对无会话的 Number
-            // 类（含小键盘全部 15 键）判「不吃」，但 OnKeyDown 在中文模式仍把它转发过来；
+            // 类（含小键盘全部 15 键）判「不吃」，旧 DLL 的 OnKeyDown 在中文模式仍把它转发过来；
             // Chrome 类宿主（Twitter / VK 的 PIN 框）无视 test 结论照调 OnKeyDown ⇒ 宿主自己
-            // 出一次、我们再插一次，双重上屏。
+            // 出一次、我们再插一次，双重上屏。新 DLL 两边共用 `NumberKeyPolicy.h`、不再转发，
+            // 本臂与下面 follow_main 那条留给旧 DLL 与不走 Test 直接调 KeyDown 的宿主。
             //
             // 全角态必须照旧出字：C++ 的 `chinese_fullwidth_number` 分支那时**会吃**这批键，
             // 透传就成了「吃了再吐」。`numpad_half_width` 开着的全角态也一样（吃键与否 C++
@@ -1778,6 +1803,19 @@ impl MessageHandler for Coordinator {
                 }
                 self.handle_number_key_select(&mut state, num)
             }
+            // 空闲半角的 0：与上面 1-9 同一透传。此前它落兜底标点流水线由我们 InsertText「0」，
+            // 而 C++ Test 对无会话半角数字不吃 ⇒ Chrome 类宿主（照调 OnKeyDown）在 PIN 框里出两个 0。
+            // 全角不进此臂，仍落兜底流水线出 ０（C++ 那时会吃键）。
+            keymap::VK_0
+                if data.modifiers & MOD_SHIFT == 0
+                    && !state.full_width
+                    && state.candidates.is_empty()
+                    && state.input_buffer.is_empty()
+                    && state.committed_text.is_empty() =>
+            {
+                self.record_commit("0", 0, -1, CommitSource::Punctuation);
+                KeyAction::PassThrough
+            }
             keymap::VK_0
                 if data.modifiers & MOD_SHIFT == 0
                     && !(state.candidates.is_empty()
@@ -1786,8 +1824,8 @@ impl MessageHandler for Coordinator {
             {
                 // 数字键 0 选当前页第 10 个候选（对齐通行约定 0=第10；越界按
                 // overflow.number_key 处理）。follow_main 归一化后小键盘 0 走此臂，与主键盘一致。
-                // 空缓冲下的 0 不进此臂（guard 排除）→ 落兜底标点流水线，保持全角态输出全角 ０
-                // 及自定义标点映射——0 曾靠「不在数字选词臂、落兜底」才正确，见 fullwidth 修复。
+                // 空闲的 0 不进此臂（guard 排除）：半角由上一臂透传，全角落兜底标点流水线出全角 ０
+                // ——0 曾靠「不在数字选词臂、落兜底」才正确，见 fullwidth 修复。
                 self.handle_number_key_select(&mut state, 10)
             }
             keymap::VK_A..=keymap::VK_Z => {
@@ -1960,14 +1998,19 @@ impl MessageHandler for Coordinator {
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
                         // 记账码取首候选（按来源分流，见 `freq_code`），与上一处 AutoCommit 同口径。
-                        let (source, code) = state
+                        let (source, code, freq_text) = state
                             .candidates
                             .first()
-                            .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
+                            .map(|c| {
+                                let code = self.freq_code(&state.input_buffer, c);
+                                (c.source, code, c.freq_text().to_string())
+                            })
                             .unwrap_or_else(|| {
-                                (CandidateSource::default(), state.input_buffer.clone())
+                                let buf = state.input_buffer.clone();
+                                (CandidateSource::default(), buf, text.clone())
                             });
-                        let out = self.commit_candidate(&mut state, &text, None, source, &code);
+                        let out = self
+                            .commit_candidate(&mut state, &text, &freq_text, None, source, &code);
                         // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
                         return self.auto_commit_then_assoc(&mut state, out, &text);
                     }
@@ -2724,8 +2767,15 @@ impl MessageHandler for Coordinator {
         // （尚无任何客户端获焦）无条件放行，那种失焦压根没有归属可清，警告它纯属噪音。
         // 能走到这里且 `active != 0`，则由 stale 校验反推必有 `client_token == active`
         // ——正是「它就是当前活动客户端，却从未 gained 过」这一种。
+        //
+        // `NoEditCtx` 除外：DLL 对不可编辑的 DocMgr 本就不发 focus_gained、改发这一条（输入法切入
+        // 时焦点在网页正文这类地方也走这里），「没 gained 过」正是预期。
         let gained = self.push_server.gained_token();
-        if client_token != 0 && client_token != gained && self.push_server.active_token() != 0 {
+        if client_token != 0
+            && client_token != gained
+            && self.push_server.active_token() != 0
+            && !matches!(reason, FocusLostReason::NoEditCtx)
+        {
             tracing::warn!(
                 "handle_focus_lost: token={client_token:#x} 从未上报过 focus_gained（最近 gained={gained:#x}）——上游可能吞掉了它的 focus_gained，激活态被清后将无人恢复"
             );
@@ -4296,7 +4346,7 @@ impl MessageHandler for Coordinator {
         //   现状（不比现在差），误判成移动只是让下一次首显多等一程（慢而不错）。
         self.caret_cache_verified
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.terminate_auto_phrase("selection_changed");
+        self.note_host_wrote_text("selection_changed");
     }
 
     fn handle_commit_request(&self, data: &CommitRequestData) -> Option<CommitResultData> {

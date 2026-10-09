@@ -1394,6 +1394,25 @@ STDAPI CTextService::ActivateEx(ITfThreadMgr* pThreadMgr, TfClientId tfClientId,
     // 服务端先清旧态、再收到这份新读数。
     _ReportFocusInputStateOnActivate();
 
+    // 焦点已在某个文本框里时，按「刚拿到焦点」走一遍完整的焦点处理（同 Weasel：激活时对当前
+    // 焦点 DocMgr 补做焦点初始化）。只补上面那份密码读数不够：focus_gained 才带顶层窗口类名 /
+    // 标题，服务端按 client_token 记窗口上下文——新实例的 token 没有记录，按类名的应用兼容规则
+    // 全部不命中（GH#175：Edge 里从别的输入法切进来，占位按空格推下来，番茄小说搜索框打不了字，
+    // 切一下焦点才好）。顺带补上新实例从未做过的 layout / edit sink 挂接与 _hasFocus。
+    // 服务端还没连上时 OnSetFocus 挂 _needsFocusRecovery，连上后 _DoFullStateSync 末尾补发。
+    // 只在本线程是前台线程时做（_hasThreadFocus 由上面 _InitHotkeyWindow 按前台窗口算好）：
+    // 后台线程被激活时补发会冒充前台焦点，把服务端的活动客户端 / 初始模式归属推到后台进程。
+    if (_pThreadMgr != nullptr && _hasThreadFocus)
+    {
+        ITfDocumentMgr* pDocMgrFocus = nullptr;
+        if (SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgrFocus)) && pDocMgrFocus != nullptr)
+        {
+            WIND_LOG_DEBUG(L"ActivateEx: focus already present, replaying OnSetFocus\n");
+            OnSetFocus(pDocMgrFocus, nullptr);
+            pDocMgrFocus->Release();
+        }
+    }
+
     // NOTE: Using synchronous IPC mode (no reader thread)
     // Reference: Weasel uses sync IPC with librime and it works well
     // The reader thread is not started - responses are received synchronously in OnKeyDown
@@ -2832,6 +2851,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
     double focusIpcMs = 0.0;
 
     _hasFocus = (pDocMgrFocus != nullptr);
+    // 「上一份 focus_gained 没带标题」只属于那一份：焦点一动就作废，只有下面真发出 focus_gained 时
+    // 才重新置位。否则焦点转到 transient / 不可编辑的 DocMgr 后，标题开关一到仍会补发 focus_gained，
+    // 服务端把不可编辑的焦点当成可编辑（工具栏误显示）。
+    _focusSentTitleBlind = FALSE;
 
     // If gaining focus (pDocMgrFocus is not null)
     if (pDocMgrFocus != nullptr)
@@ -4299,16 +4322,23 @@ void CTextService::_DoFullStateSync()
         }
     }
 
-    // 注：清除 _needsStateSync / _needsFocusRecovery 提前到此处，让后续 KeyEventSink 路径
-    // 不再触发重复 state sync。即便 push 暂时未到，下一次焦点切换会重新拉起 activation 流程。
+    // 注：清除 _needsStateSync 提前到此处，让后续 KeyEventSink 路径不再触发重复 state sync。
+    // 即便 push 暂时未到，下一次焦点切换会重新拉起 activation 流程。
+    //
+    // ⛔ _needsFocusRecovery **不在这里清**，交给本函数末尾的 TryRecoverFocusState 消费：
+    // IME_ACTIVATED 不带窗口类名 / 标题，服务端据此认不出窗口，按类名的应用兼容规则全部
+    // 不命中（GH#175 冷启动：服务没起来时 focus_gained 发不出去，此前在这里一清，补发就再也
+    // 不会发生，要用户切一下焦点才好）。
     _pIPCClient->ClearNeedsSyncFlag();
-    _needsFocusRecovery = FALSE;
 
     // UIElement「谁画候选」的记账住在服务端，服务重启就没了；本函数正是每次（重）连后
     // 的全量同步点，故无条件重报一次：UI-less 线程从激活起就不弹窗，普通线程报 0 把
     // 本 pid 上次留下的记账（pid 复用 / 上次会话宿主接管过）清掉。
     _uiElementStateSent = -1;
     _ReportUiElementState();
+
+    // 先前发不出去的 focus_gained（服务没连上）在此补发，带上窗口类名 / 标题。
+    TryRecoverFocusState();
 }
 
 // ApplyActivationStatusResponse 在 TSF 线程上把 push pipe 接收到的 activation status 落地。
@@ -4388,8 +4418,12 @@ void CTextService::SetTitleMatchEnabled(BOOL bEnabled)
 void CTextService::ResyncFocusForTitleMatch()
 {
     // 判据见 WindowTitlePolicy.h ShouldResyncFocusOnSwitch。
+    // 「有焦点」须连带本线程在前台（_hasThreadFocus）：_hasFocus 只记 DocMgr 焦点，失去线程焦点时
+    // 不清零。开关是逐客户端推的（加第一条标题规则时所有进程同时 0→1），不带这一条，每个挂着
+    // DocMgr 焦点的后台进程都会补发 focus_gained、冒充前台，活动客户端落到最后发到的那个。
     if (!wind::window_title::ShouldResyncFocusOnSwitch(_focusSentTitleBlind != FALSE, IsTitleMatchEnabled() != FALSE,
-                                                       HasFocus() != FALSE, HasActiveComposition() != FALSE))
+                                                       HasFocus() != FALSE && _hasThreadFocus != FALSE,
+                                                       HasActiveComposition() != FALSE))
         return;
     if (_pIPCClient == nullptr || !_pIPCClient->IsConnected())
         return;
@@ -4433,19 +4467,26 @@ BOOL CTextService::_ResendFocusGained(const wchar_t* why)
     // 窗口类名 / 标题同样现取（与 OnSetFocus 同一函数）：不带的话服务端按「不知道是哪个窗口」
     // 解析，窗口规则全部不命中，且会被当成换了窗口去重推 DLL 配置。
     UINT64 mask = 0;
+    bool ctxDisabled = false;
     std::wstring rootClass;
     std::wstring rootTitle;
     ITfDocumentMgr* pDocMgr = nullptr;
     if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgr)) && pDocMgr != nullptr)
     {
         mask = _QueryInputScopeMask(pDocMgr);
+        ctxDisabled = _IsFocusKeyboardDisabled(pDocMgr) != FALSE;
         _QueryFocusRootWindowIdentity(pDocMgr, rootClass, rootTitle);
         pDocMgr->Release();
     }
+    // context 级 KEYBOARD_DISABLED（Chromium 网页密码框）折成 IS_PASSWORD 位，与 OnSetFocus 同：
+    // 不折的话补发的 focus_gained 会把服务端的密码抑制当场解除。
+    const UINT64 rawMask = mask;
+    if (ctxDisabled)
+        mask |= kScopeBitPassword;
     // 标题只记长度（用户数据）。
     WIND_LOG_DEBUG_FMT(L"compat.focus.rootclass (%ls) focusSession=%llu class=%ls title_len=%u",
                        why, _focusSessionId, rootClass.c_str(), (unsigned)rootTitle.size());
-    uint8_t reason = ComputeInputReason(_bKeyboardDisabled != FALSE, mask, false);
+    uint8_t reason = ComputeInputReason(_bKeyboardDisabled != FALSE, rawMask, ctxDisabled);
     return _pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, mask,
                                         _bKeyboardDisabled != FALSE, reason, caretSource,
                                         rootClass.c_str(), rootTitle.c_str());

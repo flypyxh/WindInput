@@ -607,9 +607,7 @@ impl Compiler {
         // ★ 必须排在 key_actions 与数字模板**之后**，且撞键就**不登记**：用户在 key_actions
         // 里绑过的 Alt 组合让位给用户。只靠 `.find()` 先到先得不够——TSF 那侧的白名单是按
         // 策略位分桶的集合，同一个 hash 同时进 SESSION 桶会改变用户绑定的吃键条件。
-        if crate::config::AltCommit::from_config(&self.config.input.alt_commit)
-            != crate::config::AltCommit::Off
-        {
+        if crate::config::AltCommit::effective(&self.config) != crate::config::AltCommit::Off {
             for vk in std::iter::once(VK_SPACE).chain(0x30..=0x39) {
                 let raw = key_hash(MOD_ALT, vk);
                 if result.key_down.iter().any(|e| e.match_hash == raw) {
@@ -1969,6 +1967,25 @@ mod tests {
         assert!(
             alt_entries(&compiled).is_empty(),
             "出厂 alt_commit=off，不该登记任何 Alt 组合"
+        );
+    }
+
+    /// `alt_commit = comment` 而候选注释总开关关着：注释恒空，按 `off` 处理——一个 Alt 组合都不进表，
+    /// 否则 TSF 照 SESSION 位吃掉 Alt+数字，宿主的菜单加速键就丢了。`pinyin` 档不受影响。
+    #[test]
+    fn alt_commit_comment_with_comments_off_registers_nothing() {
+        let mut cfg = Config::default();
+        cfg.input.alt_commit = "comment".into();
+        cfg.ui.candidate.comment_enabled = false;
+        assert!(
+            alt_entries(&Compiler::new(cfg.clone()).compile()).is_empty(),
+            "注释关着时 comment 档等同 off，不该登记 Alt 组合"
+        );
+        cfg.input.alt_commit = "pinyin".into();
+        assert_eq!(
+            alt_entries(&Compiler::new(cfg).compile()).len(),
+            11,
+            "pinyin 档不看注释开关"
         );
     }
 

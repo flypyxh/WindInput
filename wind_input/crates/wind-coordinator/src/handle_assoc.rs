@@ -258,7 +258,7 @@ fn is_modifier_like_vk(vk: u32) -> bool {
 /// 一组 `platform_default_*` 函数——一处判断变成每个字段一处。
 ///
 /// ⚠️ 判据是**协调器被编译进哪个宿主**，不是运行时探测。
-const fn use_mobile_overrides() -> bool {
+pub(crate) const fn use_mobile_overrides() -> bool {
     cfg!(target_os = "android")
 }
 

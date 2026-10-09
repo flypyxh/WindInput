@@ -1130,6 +1130,16 @@ impl AltCommit {
             _ => Self::Off,
         }
     }
+
+    /// **生效**档：`comment` 档而候选注释总开关（`ui.candidate.comment_enabled`）关着时按
+    /// `Off` 处理——注释恒空，认领 Alt 组合只会把宿主的加速键吞掉。热键登记与协调器分派
+    /// 都取这一份，两边口径一致（TSF 吃键集 ⊆ Rust 出字集）。
+    pub fn effective(cfg: &Config) -> Self {
+        match Self::from_config(&cfg.input.alt_commit) {
+            Self::Comment if !cfg.ui.candidate.comment_enabled => Self::Off,
+            kind => kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -6256,6 +6266,14 @@ pub struct UiCandidateConfig {
     /// 要连这些一并罩住用 [`Self::min_window_height_vertical`]（两项可同时配，取较大者）。
     #[serde(default)]
     pub min_rows: usize,
+    /// 候选注释总开关（默认开）。关掉后不渲染注释段（含上方注释条与 `${code_hint}`），
+    /// 注释模板也不再计入按需加载的需求（反查索引、用户层编码索引、拆字表随之可卸）。
+    ///
+    /// 在注释模板三层裁决（模式级 → 方案级 → 全局）**之上**：关就是关。不用「把模板设空」
+    /// 表达，是因为全局设空会被方案级 / 模式级模板覆盖回来，且模板是专家级字符串
+    /// （设计 `docs/design/memory-footprint.md` §4.3）。
+    #[serde(default = "default_true")]
+    pub comment_enabled: bool,
     /// **竖排**候选的注释段（候选右侧灰字）模板。语法见 `wind_coordinator::comment`。
     ///
     /// 横竖各持一份模板、互不影响：两种排布的可用横向空间差一个数量级（竖排每行独占，
@@ -6469,6 +6487,7 @@ impl Default for UiCandidateConfig {
             min_window_height_horizontal: 0,
             min_window_height_vertical: 0,
             min_rows: 0,
+            comment_enabled: true,
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),
             comment_above: false,
@@ -6648,6 +6667,11 @@ impl Default for UiThemeConfig {
 /// `docs/design/candidate-tooltip-sections.md`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TooltipConfig {
+    /// 悬停提示总开关（默认开）。关掉后不再逐候选渲染气泡，段列表也不再计入按需加载的
+    /// 需求（悬停[编码]用的反查索引、用户层编码索引，拆字段用的拆字表随之可卸）。
+    /// 段各自的 `enabled` 在它之下（设计 `docs/design/memory-footprint.md` §4.3）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// 提示延迟显示时间（毫秒）。
     #[serde(default = "default_tooltip_delay")]
     pub delay: i32,
@@ -6828,6 +6852,7 @@ fn default_tooltip_delay() -> i32 {
 impl Default for TooltipConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             delay: default_tooltip_delay(),
             max_chars: default_tooltip_max_chars(),
             wrap_width: default_tooltip_wrap_width(),

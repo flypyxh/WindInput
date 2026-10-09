@@ -823,6 +823,16 @@ impl State {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 测试钩子：本线程上 `notify_ui_update` 为悬停「编码」段调 `word_codes_display` 的次数
+    /// （`ui.tooltip.enabled = false` 时应为 0）。线程局部：并行测试互不干扰。
+    ///
+    /// ⚠️ 只覆盖**同步**调用路径：别的线程（后台预热、异步刷新等）上的调用计在那个线程的
+    /// 副本里，这里看不见。计数为 0 只证明调用线程上的候选刷新没查。
+    pub(crate) static WORD_CODE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 配置变更后**引擎是否需要重建**（`reload_user_config` 的 `schema_dirty`）。
 ///
 /// 抽成自由函数而非内联表达式，就是为了**能被单测直接喂两份配置**——它守的那类缺陷
@@ -1434,8 +1444,9 @@ pub struct Coordinator {
     /// `state.toml` 的单点延迟写入器：合并连续微调、进程内串行化 load-modify-save。
     /// 无 `store`（headless 测试夹具）时是不写盘的空实现，见 [`state_writer::StateWriter`]。
     pub(crate) state_writer: state_writer::StateWriter,
-    /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段随主码表方案
-    /// 热重载（见 `sync_chaizi_assets`），拼音段启动加载后不变。
+    /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段只在有消费者时装、随主码表
+    /// 方案与配置热重载（见 `sync_chaizi_assets` / `ensure_chaizi_async`），拼音段启动加载后
+    /// 不变。
     pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
     /// 辅助码运行时来源（进入辅助码时按 `[engine.aux_code].files` 建，来源清单即缓存键）。
     /// `None` = 尚未建 / 已失效。见 [`crate::aux_code_source`]。
@@ -2085,6 +2096,67 @@ pub struct Coordinator {
 pub(crate) struct ChaiziAssets {
     pub(crate) db: Option<std::path::PathBuf>,
     pub(crate) font: Option<(String, String)>,
+    /// 运行期格式串触发的后台加载正在进行（单飞闸，见 `Coordinator::ensure_chaizi_async`）。
+    pub(crate) loading: bool,
+    /// 每次 sync 加一。后台加载换入前比对，过期（期间切了方案）就丢弃。
+    pub(crate) generation: u64,
+    /// 运行期路径本代次已经试过（含「方案没配拆字库 / 库文件不存在」）：不再每键重读方案
+    /// 文件、每键告警。sync 时清掉，给换了方案之后一次重试。
+    pub(crate) tried: bool,
+    /// 当前这份表是运行期格式串按需装的（配置里没有拆字消费者）。sync 据此**不卸**它——
+    /// 否则每次配置生效都卸、下一次 `dict.rev` 又装，来回读盘。方案的拆字库路径变了才卸。
+    pub(crate) runtime: bool,
+    /// 测试计数：运行期路径解析拆字库（读方案文件）的次数。
+    #[cfg(test)]
+    pub(crate) resolve_attempts: usize,
+}
+
+/// 拆字加载线程的 `loading` 复位守卫：线程中途 panic 也复位，否则单飞闸卡死、此后永不再试
+/// （与 `wind_engine::text_codes` 的 `BuildingGuard` 同一做法）。
+pub(crate) struct ChaiziLoadingGuard(pub(crate) std::sync::Weak<Coordinator>);
+
+impl Drop for ChaiziLoadingGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.upgrade() {
+            c.chaizi_assets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .loading = false;
+        }
+    }
+}
+
+/// 读盘加载一个方向的简繁转换器（`to_traditional` = 简入繁出）。数据缺失返回 `None`。
+///
+/// 转换链里的**每本 octrie 各自按层序解析**（走 resolve_data_file 这个单文件收口点，
+/// `opencc/<名>.octrie`），定制层只放一本 `STPhrases.octrie` 也能正常工作，缺的那本自动
+/// 落回出厂。**不能整份目录胜出**——理由见 `Converter::load_variant_resolved` 的文档
+/// （残链会一个字都不转，且无从察觉）。
+pub(crate) fn load_converter(
+    data_dir: Option<&Path>,
+    config: &Config,
+    to_traditional: bool,
+) -> Option<wind_transform::s2t::Converter> {
+    let variant = if !to_traditional {
+        "t2s".to_string()
+    } else if config.input.s2t.variant.is_empty() {
+        "s2t".to_string()
+    } else {
+        config.input.s2t.variant.clone()
+    };
+    let t0 = std::time::Instant::now();
+    let conv = wind_transform::s2t::Converter::load_variant_resolved(&variant, |file| {
+        Config::resolve_data_file(data_dir, &format!("opencc/{file}"))
+    });
+    if conv.is_some() {
+        info!(
+            "Loaded converter (variant={variant}) in {} ms",
+            t0.elapsed().as_millis()
+        );
+    } else {
+        warn!("简繁数据缺失（variant={variant}），该方向不可用");
+    }
+    conv
 }
 
 /// 字根字体从 `sent` 变到 `want` 时要下发的 `(路径, 家族名)`；不用发时 `None`。
@@ -2348,6 +2420,11 @@ impl Coordinator {
             bundle.compiled_hotkeys.key_down.len(),
             bundle.compiled_hotkeys.key_up.len()
         );
+        // 按需数据（拆字表、简繁表）只装有消费者的，见 `crate::data_needs`。
+        let needs = crate::data_needs::DataNeeds::derive(
+            &bundle.config,
+            &crate::data_needs::SchemaFacts::collect(&engine_mgr),
+        );
 
         // 短语层（方案 B）：TOML 变更时同步进 store，再从 store（仅 enabled）建层。
         // 启动解析的条目缓存进结构体，作为"恢复默认"重读文件失败时的回退。
@@ -2412,29 +2489,17 @@ impl Coordinator {
             }
         };
 
-        // 简繁转换器：转换链里的**每本 octrie 各自按层序解析**（走 resolve_data_file
-        // 这个单文件收口点，`opencc/<名>.octrie`），定制层只放一本 `STPhrases.octrie`
-        // 也能正常工作，缺的那本自动落回出厂。**不能整份目录胜出**——理由见
-        // `Converter::load_variant_resolved` 的文档（残链会一个字都不转，且无从察觉）。
-        let s2t_variant = if config.input.s2t.variant.is_empty() {
-            "s2t".to_string()
-        } else {
-            config.input.s2t.variant.clone()
-        };
-        let s2t = wind_transform::s2t::Converter::load_variant_resolved(&s2t_variant, |file| {
-            Config::resolve_data_file(data_dir, &format!("opencc/{file}"))
-        });
-        if s2t.is_some() {
-            info!("Loaded S2T converter (variant={})", s2t_variant);
-        }
-        // 繁 → 简（「繁入简出」）。**恒加载**，不看 `input.t2s.enabled`——与 s2t 同策略：
-        // 运行时热键随时可开，届时再读盘就得在按键线程上做文件 I/O。
-        let t2s = wind_transform::s2t::Converter::load_variant_resolved("t2s", |file| {
-            Config::resolve_data_file(data_dir, &format!("opencc/{file}"))
-        });
-        if t2s.is_some() {
-            info!("Loaded T2S converter");
-        }
+        // 简繁转换器（解析规则见 `load_converter`）：只预载**开着的**方向（两份合计约
+        // 1.8 MB）。关着的方向在切换入口（热键 / 菜单 / 工具栏 / 命令栏）先同步加载再切，
+        // 见 `ensure_converter`——切换是一次性的用户动作，不是逐键路径。
+        let s2t = needs
+            .s2t
+            .then(|| load_converter(data_dir, &config, true))
+            .flatten();
+        let t2s = needs
+            .t2s
+            .then(|| load_converter(data_dir, &config, false))
+            .flatten();
 
         // 词频已迁 redb（self.store 的 FREQ 表，选词时 record_freq）。
 
@@ -2454,8 +2519,11 @@ impl Coordinator {
 
         // 候选反查表（拆字/拼音）：拆字库路径取自主码表方案 [engine.chaizi].db_path（相对 schemas/，
         // 用户方案目录优先——第三方方案的拆字库只在用户目录下）。
-        let chaizi_db = engine_mgr
-            .chaizi_spec()
+        // 只在有消费者时加载（`DataNeeds::chaizi`）；运行期格式串另走首次使用时后台加载。
+        let chaizi_db = needs
+            .chaizi
+            .then(|| engine_mgr.chaizi_spec())
+            .flatten()
             .filter(|c| !c.db_path.is_empty())
             .and_then(|c| {
                 let p = Config::resolve_schema_resource(data_dir, &c.db_path);
@@ -2754,6 +2822,7 @@ impl Coordinator {
             chaizi_assets: Mutex::new(ChaiziAssets {
                 db: chaizi_db,
                 font: None, // 字体在 new() 经 sync_chaizi_assets 下发（headless 无 UI 不发）
+                ..Default::default()
             }),
             // 空初值 + new() 里的 sync_comment_dicts 首次加载：与拆字字体同一套「声明式变更
             // 检测」，构造期不做 IO，加载与热重载走同一条路径（不会出现只在启动生效的分叉）。
@@ -4016,6 +4085,106 @@ impl Coordinator {
         g.shown
     }
 
+    /// 构造时传入的数据根（生产即 `Config::data_dir()`；headless / 移动端是宿主给的那个）。
+    /// 运行期按需加载的数据文件经它解析，与构造期加载同源。
+    pub(crate) fn data_dir(&self) -> Option<std::path::PathBuf> {
+        self.compat_dirs.0.clone().or_else(Config::data_dir)
+    }
+
+    /// 拆字库路径（`[engine.chaizi].db_path`，用户方案目录优先）。配了却找不到要告警。
+    fn resolve_chaizi_db(
+        data_dir: Option<&Path>,
+        spec: Option<&wind_config::schema::ChaiziSpec>,
+    ) -> Option<std::path::PathBuf> {
+        let c = spec.filter(|c| !c.db_path.is_empty())?;
+        let p = Config::resolve_schema_resource(data_dir, &c.db_path);
+        if p.is_none() {
+            warn!(
+                "拆字库不存在（用户/系统 schemas 目录均未找到）: {}",
+                c.db_path
+            );
+        }
+        p
+    }
+
+    /// 运行期格式串（cmdbar `dict.rev`、短语里的反查）要拆字而表没在内存里：后台加载，
+    /// 本次照旧返回空、下次就有（与 `ensure_reverse_index_async` 同一模式）。配置里的消费者
+    /// 不走这里——它们由 [`Self::sync_chaizi_assets`] 按 `DataNeeds` 装好。
+    ///
+    /// 可能每键都被调（短语求值），故先过闸再解析：解析要读方案文件，找不到库还要告警。
+    /// 本代次（两次 sync 之间）只解析一次，找不到也记「试过」。读盘在锁外做，只在换入那一刻
+    /// 取反查表写锁：候选渲染持着它的读锁。
+    pub(crate) fn ensure_chaizi_async(&self) {
+        let generation = {
+            let mut a = self.chaizi_assets.lock().unwrap_or_else(|e| e.into_inner());
+            if a.db.is_some() || a.loading || a.tried {
+                return;
+            }
+            a.tried = true;
+            #[cfg(test)]
+            {
+                a.resolve_attempts += 1;
+            }
+            a.generation
+        };
+        let Some(path) = Self::resolve_chaizi_db(
+            self.data_dir().as_deref(),
+            self.engine_mgr.chaizi_spec().as_ref(),
+        ) else {
+            return;
+        };
+        {
+            let mut a = self.chaizi_assets.lock().unwrap_or_else(|e| e.into_inner());
+            if a.generation != generation || a.db.is_some() || a.loading {
+                return;
+            }
+            a.loading = true;
+        }
+        let Some(weak) = self.self_weak.get().cloned() else {
+            self.chaizi_assets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .loading = false;
+            return;
+        };
+        let guard = ChaiziLoadingGuard(weak.clone());
+        let spawned = std::thread::Builder::new()
+            .name("chaizi-load".into())
+            .spawn(move || {
+                let _guard = guard;
+                let fresh = wind_reverse::ReverseLookup::load(None, Some(&path));
+                if let Some(c) = weak.upgrade() {
+                    c.install_runtime_chaizi(generation, path, fresh);
+                }
+            });
+        if let Err(e) = spawned {
+            // 闭包（连同守卫）随 Err 一起被丢弃，守卫已复位 `loading`。
+            warn!("起拆字表加载线程失败: {e}");
+        }
+    }
+
+    /// 后台加载好的拆字表换入。`generation` 是发起加载时记下的代次：期间 sync 过（切了方案、
+    /// 配置生效）就丢弃——那份可能是旧方案的表；期间已被 sync 装上（配置改成了要拆字）也不覆盖。
+    pub(crate) fn install_runtime_chaizi(
+        &self,
+        generation: u64,
+        path: std::path::PathBuf,
+        mut fresh: wind_reverse::ReverseLookup,
+    ) {
+        let mut a = self.chaizi_assets.lock().unwrap_or_else(|e| e.into_inner());
+        a.loading = false;
+        if a.generation != generation || a.db.is_some() {
+            return;
+        }
+        self.reverse
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .swap_chaizi(&mut fresh);
+        a.db = Some(path);
+        a.runtime = true;
+        info!("拆字表按运行期用到后台加载完成");
+    }
+
     /// 热重载用户配置：从磁盘重读 Config 并原子替换 bundle（轻量设置即时生效），
     /// 再 best-effort 刷新主题/工具栏。返回是否仍需重启才能完全生效。
     /// 轻量项（标点/智能符号/候选数/热键/配对/导航键等）即时生效；重型项（引擎/方案/
@@ -4024,24 +4193,19 @@ impl Coordinator {
     /// 同步拆字资产到当前来源方案（`chaizi_spec`：码表=自身、混输=其主码表成员、拼音=全局
     /// 主码表，与编码段同源）：库路径变了才重载反查表拆字段（含变为无配置时清空释放内存），
     /// 字根字体变了才重发（渲染端每次 set 都重建字体集，勿重复下发）。调用点=启动、方案切换
-    /// （菜单/循环/设置页）、reload_user_config(schema_dirty)。资源相对路径按「用户方案目录
+    /// （菜单/循环/设置页）、配置生效（`apply_data_needs`）。资源相对路径按「用户方案目录
     /// 优先、回落系统数据目录」解析（与方案文件同规则）。
+    ///
+    /// 库只在 [`DataNeeds::chaizi`](crate::data_needs::DataNeeds) 为真时加载，变为假时卸载
+    /// （反查表拆字段清空）；字体照旧随方案下发（它不占本进程内存，撤换另有判据）。
     pub(crate) fn sync_chaizi_assets(&self) {
-        let data_dir = Config::data_dir();
+        self.sync_chaizi_assets_with(&self.data_needs());
+    }
+
+    fn sync_chaizi_assets_with(&self, needs: &crate::data_needs::DataNeeds) {
+        let data_dir = self.data_dir();
         let spec = self.engine_mgr.chaizi_spec();
-        let new_db = spec
-            .as_ref()
-            .filter(|c| !c.db_path.is_empty())
-            .and_then(|c| {
-                let p = Config::resolve_schema_resource(data_dir.as_deref(), &c.db_path);
-                if p.is_none() {
-                    warn!(
-                        "拆字库不存在（用户/系统 schemas 目录均未找到）: {}",
-                        c.db_path
-                    );
-                }
-                p
-            });
+        let spec_db = Self::resolve_chaizi_db(data_dir.as_deref(), spec.as_ref());
         let new_font = spec
             .as_ref()
             .filter(|c| !c.font_path.is_empty())
@@ -4062,12 +4226,28 @@ impl Coordinator {
                 p.map(|p| (p.to_string_lossy().into_owned(), c.font_family.clone()))
             });
         let mut assets = self.chaizi_assets.lock().unwrap_or_else(|e| e.into_inner());
+        // 进行中的运行期加载作废、运行期路径给一次重试（可能换了方案）。
+        assets.generation += 1;
+        assets.tried = false;
+        // 配置要拆字 ⇒ 装方案的库。不要 ⇒ 卸，**除非**当前那份是运行期按需装的、且方案的
+        // 拆字库没换（见 `ChaiziAssets::runtime`）。
+        let keep = needs.chaizi || (assets.runtime && assets.db == spec_db);
+        let new_db = if keep { spec_db } else { None };
         if assets.db != new_db {
+            if new_db.is_none() && assets.db.is_some() {
+                info!("卸载拆字表（当前配置无拆字消费者，或方案无拆字库）");
+            }
+            // 读盘在反查表写锁之外：候选渲染持着它的读锁，写锁里读文件等于让按键等磁盘。
+            let mut fresh = wind_reverse::ReverseLookup::load(None, new_db.as_deref());
             self.reverse
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
-                .reload_chaizi(new_db.as_deref());
+                .swap_chaizi(&mut fresh);
             assets.db = new_db;
+            assets.runtime = false;
+        }
+        if needs.chaizi {
+            assets.runtime = false; // 归配置所有了
         }
         if let Some((path, family)) = chaizi_font_to_send(&assets.font, &new_font) {
             if path.is_empty() {
@@ -4450,8 +4630,8 @@ impl Coordinator {
                 if schema_dirty {
                     // 热重建方案集：清输入缓冲、刷新工具栏/状态，免重启切换方案。
                     self.engine_mgr.reload_from_config(&new_cfg);
-                    // 主码表可能变更：拆字库/字根字体随之切换（变更检测，未变不动）。
-                    self.sync_chaizi_assets();
+                    // 主码表可能变更：拆字库/字根字体随之切换——由下面 `apply_data_needs`
+                    // 统一做（变更检测，未变不动），它必须排在 `reload_from_config` 之后。
                     // 注释库**不需要**在这里复核：它只跟 `[[ui.comment_dicts]]` 走，
                     // 而那份配置在上面的非 schema_dirty 路径里已经同步过；方案集重建
                     // 换掉活跃方案也不改变该挂载什么（`schemas` 是查询期判据）。
@@ -4491,6 +4671,9 @@ impl Coordinator {
                             });
                     }
                 }
+                // 按需数据随配置收放（拆字表、用户层编码索引、简繁表），两个分支都要：
+                // 注释模板 / 悬停段 / 编码来源档都不会把 schema 标脏。
+                self.apply_data_needs();
                 // 同步主题选择:设置页改 config.ui.theme.* 后内存态须跟随,reload_config 才会下发新主题
                 // (此前 reload_config 只重推旧内存主题 → 设置页切主题不生效)。
                 {
@@ -4706,14 +4889,21 @@ impl Coordinator {
         // 悬停 [编码] / 编码提示取 code_source_schema，词语联想取 assoc_word_schema。
         // 混输下两者通常都解析到同一个主码表成员，故去重后一般只建一份。
         // 两者相同时不必去重：prewarm_reverse_index 幂等，第二次直接返回。
-        let ids = [
-            self.engine_mgr.code_source_schema(),
-            self.engine_mgr.assoc_word_schema(),
-        ];
-        for id in ids.iter().filter(|s| !s.is_empty()) {
-            let t0 = std::time::Instant::now();
-            if self.engine_mgr.prewarm_reverse_index(id) {
-                debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
+        //
+        // 只在有消费者时建（`DataNeeds::reverse_index`）：主码表反查索引常驻 2~3 MB，
+        // 悬停[编码]、`${code_rev}`、联想、辅助码、自动造词都没开的用户不该付。
+        // 之后才打开的功能由 `apply_data_needs` 后台补建；运行期格式串（cmdbar `dict.rev`）
+        // 里的 `${code_rev*}` 由 `eval_text_var` 首次用到时后台建。
+        if self.data_needs().reverse_index {
+            let ids = [
+                self.engine_mgr.code_source_schema(),
+                self.engine_mgr.assoc_word_schema(),
+            ];
+            for id in ids.iter().filter(|s| !s.is_empty()) {
+                let t0 = std::time::Instant::now();
+                if self.engine_mgr.prewarm_reverse_index(id) {
+                    debug!("预热反查索引 {} 用时 {:?}", id, t0.elapsed());
+                }
             }
         }
         // 辅助码引用的码表方案（`schema:<id>`，含临拼目标方案引用的）：进入辅助码的门卫
@@ -5491,6 +5681,7 @@ impl Coordinator {
                                 &prefix,
                                 text,
                                 None,
+                                None,
                                 &remainder,
                                 cand.source,
                             ),
@@ -5503,10 +5694,12 @@ impl Coordinator {
                     Some(cand) => {
                         let source = cand.source;
                         let s2t_override = cand.s2t_override.clone();
+                        let freq_text = cand.freq_text().to_string();
                         return self.commit_top_text(
                             state,
                             &prefix,
                             cand.text,
+                            Some(&freq_text),
                             s2t_override.as_deref(),
                             &remainder,
                             source,
@@ -5522,6 +5715,7 @@ impl Coordinator {
                     state,
                     &prefix,
                     engine_top,
+                    None,
                     None, // 引擎码表纯文本，无候选对象可承载变体覆盖
                     &remainder,
                     CandidateSource::CodeTable,
@@ -5534,12 +5728,19 @@ impl Coordinator {
             InputOutcome::AutoCommit(text) => {
                 // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
                 // 记账码同取首候选（按来源分流，见 `freq_code`），无候选时退回输入缓冲。
-                let (source, code) = state
+                // 记账文本同理取首候选的 `freq_text`（模板词是源文本，GH#177）。
+                let (source, code, freq_text) = state
                     .candidates
                     .first()
-                    .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
-                    .unwrap_or_else(|| (CandidateSource::default(), state.input_buffer.clone()));
-                let out = self.commit_candidate(state, &text, None, source, &code);
+                    .map(|c| {
+                        let code = self.freq_code(&state.input_buffer, c);
+                        (c.source, code, c.freq_text().to_string())
+                    })
+                    .unwrap_or_else(|| {
+                        let buf = state.input_buffer.clone();
+                        (CandidateSource::default(), buf, text.clone())
+                    });
+                let out = self.commit_candidate(state, &text, &freq_text, None, source, &code);
                 // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
                 return self.auto_commit_then_assoc(state, out, &text);
             }
@@ -6129,6 +6330,9 @@ impl Coordinator {
     /// （数量不再可信，宁可少删多按几次，也不按陈旧计数误删多个）。
     ///
     /// v1 不校验光标前内容（用户主动触发；焦点变化/其它输入均已把计数刷回 1，故误删至多 1 个）；
+    /// 「其它输入」= 宿主自行出字 / 重放 / 用户挪光标（`note_host_wrote_text`），其中宿主自行出字
+    /// 要等**下一个**送达的 keydown 带透传位才知道——工具栏按钮触发撤销没有 keydown，那一下仍按
+    /// 旧计数删（冷门入口，已知限制）；
     /// v2 预留 prevChar 比对。已知限制：SendInput 退格兜底宿主按「一次退格删一整字」处理时，
     /// emoji 会多删（兜底宿主 × emoji 双重边缘），留待后续按宿主特判。
     pub(crate) fn cmd_undo_commit(&self) {
@@ -6552,7 +6756,8 @@ impl Coordinator {
         } else {
             None
         };
-        // 反查表读锁在候选循环外取一次（写方仅 sync_chaizi_assets 的热重载路径）。
+        // 反查表读锁在候选循环外取一次（写方只有拆字段的装卸：sync_chaizi_assets /
+        // ensure_chaizi_async）。
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         // 注释段（候选右侧灰字）模板，见 `crate::comment`。横竖各持一份、互不影响：
         // 两种排布的可用横向空间差一个数量级，能放什么本就不是同一个答案。
@@ -6640,7 +6845,11 @@ impl Coordinator {
                 // Some("")）。此时本段不显示，并已在循环外触发后台构建，建好后自动补上。
                 let word_code = code_schema
                     .as_deref()
-                    .and_then(|sid| self.engine_mgr.word_codes_display(sid, &c.text))
+                    .and_then(|sid| {
+                        #[cfg(test)]
+                        WORD_CODE_LOOKUPS.with(|n| n.set(n.get() + 1));
+                        self.engine_mgr.word_codes_display(sid, &c.text)
+                    })
                     .unwrap_or_default();
                 let dict_schema =
                     self.comment_dict_scope(state, c, mix_comment_scope, &comment_dict_schema);
@@ -7206,6 +7415,81 @@ impl Coordinator {
         }
         warn!("input.s2t 与 input.t2s 同时开启，已关闭 input.t2s（两个方向互斥）");
         self.persist_t2s_enabled(false);
+    }
+
+    /// 确保 `to_traditional` 方向（true = 简入繁出）的转换器在内存里：缺则**同步**读盘。
+    /// 返回该方向是否可用（数据缺失为 false）。
+    ///
+    /// 只在切换入口与配置生效时调——那是一次性的用户动作，不是逐键路径。release 实测
+    /// s2t 1.3–3.4 ms、t2s 0.1–0.3 ms（2026-10-08，Linux 页缓存热，`data_needs` 的
+    /// `converter_load_timing`），远低于设计稿的 50 ms 门槛，故同步加载、不弹「正在加载」。
+    pub(crate) fn ensure_converter(&self, to_traditional: bool) -> bool {
+        let slot = if to_traditional { &self.s2t } else { &self.t2s };
+        let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = load_converter(
+                self.data_dir().as_deref(),
+                &self.rt().config,
+                to_traditional,
+            );
+        }
+        g.is_some()
+    }
+
+    /// 切换入口（热键、菜单、工具栏、命令栏）共用：要**打开**的方向先确保数据在内存，
+    /// 缺数据就提示「简繁数据缺失」且不切。返回是否切了。
+    ///
+    /// 两条入口曾各写一份：热键路径查「已加载」、菜单路径不查——数据缺失时菜单照样把开关
+    /// 拨上，状态显示「繁」而上屏原样不转。
+    pub(crate) fn try_toggle_conversion(&self, to_traditional: bool) -> bool {
+        let turning_on = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if to_traditional {
+                !s.s2t_enabled
+            } else {
+                !s.t2s_enabled
+            }
+        };
+        if turning_on && !self.ensure_converter(to_traditional) {
+            self.show_toast(
+                "简繁数据缺失",
+                ToastPosition::BottomCenter,
+                ToastKind::Error,
+            );
+            return false;
+        }
+        self.toggle_conversion_direction(to_traditional);
+        true
+    }
+
+    /// 配置生效后按 [`DataNeeds`](crate::data_needs::DataNeeds) 对齐按需数据。
+    /// `reload_user_config` 与方案设置变更（`refresh_schema_derived_config`）调。各项方向不同：
+    ///
+    /// - 拆字表：装 / 卸都做（见 `sync_chaizi_assets`；运行期按需装的那份不卸）。
+    /// - 主码表反查索引：只**补建**（后台，`spawn_index_warm` 单飞、已就绪即返回）。消费者
+    ///   （联想、`${code_rev}`）只问 `reverse_index_if_ready`，从不自己建——不在这里补，
+    ///   设置页刚打开的功能就一直拿不到索引。不需要时**不卸**：它有内存护栏（只留在用的几份），
+    ///   失效由 `invalidate_schema` / `reload_from_config` 负责。
+    /// - 用户层编码索引：只**清空**（不需要时）；需要时由消费者首次用到时后台建。
+    /// - 简繁转换器：只**加载**（开着的方向），从不卸载——切换常来回按；`input.s2t.variant`
+    ///   改了要重启才生效（沿用原有行为，已加载的那份不重读）。
+    pub(crate) fn apply_data_needs(&self) {
+        let needs = self.data_needs();
+        self.sync_chaizi_assets_with(&needs);
+        if needs.reverse_index {
+            self.spawn_index_warm(&self.engine_mgr.code_source_schema(), false);
+            self.spawn_index_warm(&self.engine_mgr.assoc_word_schema(), false);
+        }
+        if !needs.user_text && self.engine_mgr.user_text_loaded() > 0 {
+            info!("释放按词查编码用户层（当前配置无消费者）");
+            self.engine_mgr.clear_user_text();
+        }
+        if needs.s2t {
+            self.ensure_converter(true);
+        }
+        if needs.t2s {
+            self.ensure_converter(false);
+        }
     }
 
     /// 切换简繁转换的**一个方向**，返回切换后该方向是否开着。
@@ -7986,21 +8270,9 @@ impl Coordinator {
                 true
             }
             "toggle_s2t" | "toggle_t2s" => {
-                let to_traditional = action == "toggle_s2t";
-                let loaded = if to_traditional {
-                    self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-                } else {
-                    self.t2s.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-                };
-                if !loaded {
-                    self.show_toast(
-                        "简繁数据缺失",
-                        ToastPosition::BottomCenter,
-                        ToastKind::Error,
-                    );
+                if !self.try_toggle_conversion(action == "toggle_s2t") {
                     return true;
                 }
-                self.toggle_conversion_direction(to_traditional);
                 self.show_status();
                 // 工具栏「繁」格随切即刷（对齐 toggle_full_width 与菜单路径）。缺这步时
                 // 只有一闪而过的状态气泡，工具栏状态滞后到下次刷新事件，被误感知为“切换卡”。
@@ -9184,7 +9456,7 @@ impl Coordinator {
             return 0;
         }
         store
-            .get_freq(&sid, &code, &c.text)
+            .get_freq(&sid, &code, c.freq_text())
             .ok()
             .flatten()
             .map(|r| r.count)
@@ -10180,6 +10452,121 @@ mod mode_comment_e2e_tests {
 
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── 两个总开关（memory-footprint.md §4.3，S2） ─────────────────────
+
+    /// 取最近一条 `UpdateCandidates` 里首候选的 `(上方注释条, 注释)`。
+    fn last_comment_parts(rx: &std::sync::mpsc::Receiver<UiCommand>) -> Option<(String, String)> {
+        let mut found = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                found = candidates.first().map(|c| {
+                    (
+                        c.comment_above.as_str().to_string(),
+                        c.comment.as_str().to_string(),
+                    )
+                });
+            }
+        }
+        found
+    }
+
+    /// 注释总开关在三层裁决之上：全局 / 方案级 / 模式级各一例，开着时各自出注释，
+    /// 关掉后全都不出——含 `${code_hint}`（码表引擎产的编码提示）与上方注释条。
+    #[test]
+    fn comment_switch_off_overrides_all_three_layers() {
+        let dir = data_dir_with_schema(
+            "switch",
+            "zz_cmt_sw",
+            "comment_template_vertical = \"方案${code_hint}\"\n\
+             comment_template_horizontal = \"方案${code_hint}\"",
+        );
+        let run = |enabled: bool| {
+            let mut cfg = cfg_with_templates();
+            cfg.ui.candidate.comment_enabled = enabled;
+            // 上方注释条一并开着，全局模板带字面 `\n`：开着时上段进上方条，关掉总开关后
+            // 上方条也必须为空——不然它可能是因为模板没拆出上段才空的，断言就是恒绿。
+            cfg.ui.candidate.comment_above = true;
+            cfg.ui.candidate.comment_template_vertical = "上${code_hint}\n全局${code_hint}".into();
+            cfg.ui.candidate.comment_template_horizontal =
+                "上${code_hint}\n全局${code_hint}".into();
+            cfg.input.temp_english.comment_template_vertical = Some("临英${code_hint}".into());
+            cfg.input.temp_english.comment_template_horizontal = Some("临英${code_hint}".into());
+            // 全局层：无方案目录（方案层没意见）、无模式。
+            let (g, grx) = coord_with_ui(cfg.clone());
+            emit(&g, None);
+            let global = last_comment_parts(&grx).expect("应下发候选");
+            // 方案层：方案文件声明了模板、无模式。
+            cfg.schema.active = "zz_cmt_sw".into();
+            let (s, srx) = coord_with_ui_at(cfg, Some(&dir));
+            emit(&s, None);
+            let schema = last_comment_parts(&srx).expect("应下发候选");
+            // 模式层：临英。
+            emit(&s, Some(ModeKind::TempEnglish));
+            let mode = last_comment_parts(&srx).expect("应下发候选");
+            [global, schema, mode]
+        };
+        let none = (String::new(), String::new());
+        assert_eq!(
+            run(true),
+            [
+                ("上码".to_string(), "全局码".to_string()),
+                (String::new(), "方案码".to_string()),
+                (String::new(), "临英码".to_string()),
+            ],
+            "前置条件：开关开着时三层各出各的注释（含 ${{code_hint}}）"
+        );
+        assert_eq!(
+            run(false),
+            [none.clone(), none.clone(), none],
+            "注释总开关关掉 ⇒ 三层模板都不出注释，${{code_hint}} 与上方注释条也不出"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 悬停总开关关掉：候选不带气泡，且候选刷新不再调用 `word_codes_display`（计数断言）。
+    ///
+    /// 要真实码表方案（`build_dev` 的 wubi86）：编码段的来源方案取活跃码表，没有码表就
+    /// 一次也不会查，开着那一侧的计数也是 0，断言就成了恒绿。
+    #[test]
+    fn tooltip_switch_off_skips_rendering_and_word_code_lookup() {
+        let data =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
+        if !data.join("schemas/wubi86.schema.toml").exists() {
+            eprintln!("跳过：缺 build_dev 词库");
+            return;
+        }
+        let run = |enabled: bool| {
+            let mut cfg = Config::default();
+            cfg.schema.active = "wubi86".into();
+            cfg.schema.available = vec!["wubi86".into()];
+            cfg.ui.tooltip.enabled = enabled;
+            let (c, rx) = coord_with_ui_at(cfg, Some(&data));
+            let before = WORD_CODE_LOOKUPS.with(|n| n.get());
+            emit(&c, None);
+            let lookups = WORD_CODE_LOOKUPS.with(|n| n.get()) - before;
+            let mut tip = None;
+            while let Ok(cmd) = rx.try_recv() {
+                if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                    tip = candidates.first().map(|c| c.tooltip.clone());
+                }
+            }
+            (tip.expect("应下发候选"), lookups)
+        };
+        let (tip, lookups) = run(true);
+        assert!(
+            !tip.is_empty(),
+            "前置条件：开着时候选「测」有气泡（拼音段）"
+        );
+        assert!(
+            lookups > 0,
+            "前置条件：开着时编码段逐候选查 word_codes_display"
+        );
+
+        let (tip, lookups) = run(false);
+        assert!(tip.is_empty(), "悬停关掉 ⇒ 候选不带气泡：{tip:?}");
+        assert_eq!(lookups, 0, "悬停关掉 ⇒ 不再调用 word_codes_display");
     }
 }
 

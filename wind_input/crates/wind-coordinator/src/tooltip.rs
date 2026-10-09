@@ -113,11 +113,13 @@ impl RenderedTooltip {
 }
 
 impl CompiledTooltip {
+    /// `ui.tooltip.enabled = false` 编译出**空段列表**：这是悬停总开关的唯一落点——候选循环
+    /// 因此不渲染任何段、不查编码（`references` 全否），`DataNeeds` 里悬停的贡献也随之归零。
     pub(crate) fn compile(cfg: &TooltipConfig) -> Self {
         let sections = cfg
             .sections
             .iter()
-            .filter(|s| s.enabled)
+            .filter(|s| cfg.enabled && s.enabled)
             .map(|s: &SectionConfig| CompiledSection {
                 label: Template::parse(&s.label),
                 template: Template::parse(&s.template),

@@ -550,6 +550,17 @@ pub struct Candidate {
     /// 故记账一律走 [`Candidate::freq_text`]，取本字段而非 `text`。
     #[serde(skip)]
     pub case_source: Option<String>,
+    /// 词库原文里的 `$` 模板 / `{..}` 插值**展开之前**的源文本（`None` = 未经展开）。
+    ///
+    /// 用户词库可以存 `rq` → `$Y年$M月$D日`（GH#177），协调器的 `finalize_candidates` 把它
+    /// 展开进 `text`（「2026年10月9日」）。词频键若取展开文本，次日文本一变就对不上，
+    /// 调频清零、每天还留一行垃圾。源文本逐日不变，又正是存储里的那条记录，故记账走
+    /// [`Candidate::freq_text`] 取本字段。
+    ///
+    /// 与 `case_source` 分开存：英文重套大小写档位时会把 `text` 还原成 `case_source`，
+    /// 若模板源也放那里，候选就会显示成 `$Y年$M月$D日` 源码。
+    #[serde(skip)]
+    pub template_source: Option<String>,
     pub id: String,
     /// 候选窗里**显示**的文本；空串 = 显示 `text`（绝大多数候选）。上屏、词频、候选调整
     /// 一律仍按 `text`，本字段只换显示。
@@ -617,6 +628,7 @@ impl Default for Candidate {
             index_label: String::new(),
             meta: CandidateMeta::default(),
             case_source: None,
+            template_source: None,
             id: String::new(),
             display_text: String::new(),
             actions: Vec::new(),
@@ -625,11 +637,15 @@ impl Default for Candidate {
 }
 
 impl Candidate {
-    /// 词频 / 候选调整记账用的文本：大小写投影前的词库原文（未投影时即 `text`）。
+    /// 词频 / 候选调整记账用的文本：模板展开前、大小写投影前的词库原文（都没发生时即 `text`）。
     ///
-    /// 存在理由见 [`Candidate::case_source`]——两端不同源就是英文词频静默失效。
+    /// 存在理由见 [`Candidate::case_source`] 与 [`Candidate::template_source`]——两端不同源，
+    /// 就是英文词频静默失效、模板词调频隔天清零。
     pub fn freq_text(&self) -> &str {
-        self.case_source.as_deref().unwrap_or(&self.text)
+        self.template_source
+            .as_deref()
+            .or(self.case_source.as_deref())
+            .unwrap_or(&self.text)
     }
 
     /// 按 text 去重时调用：把**被丢弃那条**所占的码位并入本候选（保留者吸收被弃者）。
@@ -1600,5 +1616,36 @@ mod wildcard_tier_tests {
         let mut v = [a, b];
         v.sort_by(|x, y| candidate_display_order(x, y, false, false, "uuiz"));
         assert_eq!(v[0].text, "乙", "仍按权重");
+    }
+}
+
+#[cfg(test)]
+mod freq_text_tests {
+    use super::*;
+
+    fn cand(text: &str, case_source: Option<&str>, template_source: Option<&str>) -> Candidate {
+        Candidate {
+            text: text.into(),
+            case_source: case_source.map(Into::into),
+            template_source: template_source.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_candidate_uses_text() {
+        assert_eq!(cand("你好", None, None).freq_text(), "你好");
+    }
+
+    #[test]
+    fn case_projected_candidate_uses_case_source() {
+        assert_eq!(cand("Hill", Some("hill"), None).freq_text(), "hill");
+    }
+
+    /// 模板源文本最优先：它才是存储里那条记录，且逐日不变（GH#177）。
+    #[test]
+    fn template_source_wins_over_case_source() {
+        let c = cand("2026年10月9日", Some("2026年10月9日"), Some("$Y年$M月$D日"));
+        assert_eq!(c.freq_text(), "$Y年$M月$D日");
     }
 }

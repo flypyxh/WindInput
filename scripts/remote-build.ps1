@@ -148,6 +148,9 @@ if ($slot -and $slot -in @('0', 'none', 'off')) {
         $common = & git -C $ProductRoot rev-parse --git-common-dir 2>$null
         if ($LASTEXITCODE -eq 0 -and $gitDir -and $common -and $gitDir -ne $common) {
             $slot = Split-Path $ProductRoot -Leaf
+            # worktree 惯例是 wt-<名>/WindInput：叶子名恒为 WindInput，会让所有 worktree 撞进
+            # 同一槽位、互相覆盖源码。与主仓同名时改取父目录名（与 remote-build.sh 一致）。
+            if ($slot -eq 'WindInput') { $slot = Split-Path (Split-Path $ProductRoot -Parent) -Leaf }
         }
     } catch { }   # 没装 git / 不是仓库: 当作主树处理
 }

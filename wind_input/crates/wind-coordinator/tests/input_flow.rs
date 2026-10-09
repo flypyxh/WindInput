@@ -5293,12 +5293,13 @@ fn test_number_zero_selects_tenth_candidate() {
     );
     assert_eq!(np0, main0, "小键盘 0 (follow_main) 应与主键盘 0 选同一候选");
 
-    // 空缓冲下的 0 不进选词臂：输出数字本身，不回归 fullwidth（此处半角态 → '0'）。
+    // 空缓冲下的 0 不进选词臂：半角态透传、由宿主出 0（我们 InsertText 会在 Chrome 类宿主
+    // 的 PIN 框里出两个 0，见 `test_chinese_halfwidth_digits_still_passthrough`）。
     let c = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
     let empty0 = c.handle_key_event(&key_event(0x30, EVENT_KEY_DOWN));
     assert!(
-        matches!(&empty0, KeyAction::PassThrough) || action_text(&empty0).as_deref() == Some("0"),
-        "空缓冲主键盘 0 应输出数字 0（透传或上屏），实际: {:?}",
+        matches!(&empty0, KeyAction::PassThrough),
+        "空缓冲半角主键盘 0 应透传，实际: {:?}",
         empty0
     );
 }
@@ -8788,7 +8789,7 @@ fn test_chinese_halfwidth_digits_still_passthrough() {
     }
     // 零回归：半角态空缓冲数字仍透传（C++ 此时不吃），保留宿主原生按键语义。
     let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
-    for vk in [0x31_u32, 0x39] {
+    for vk in [0x30_u32, 0x31, 0x39] {
         assert!(
             matches!(
                 coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)),

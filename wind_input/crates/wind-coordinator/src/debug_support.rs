@@ -280,6 +280,19 @@ impl Coordinator {
         self.run_menu_cmd(cmd);
     }
 
+    /// 简繁两方向：`((s2t 开, t2s 开), (s2t 转换器已加载, t2s 转换器已加载))`（测试/诊断用）。
+    pub fn debug_conversion(&self) -> ((bool, bool), (bool, bool)) {
+        let on = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.s2t_enabled, s.t2s_enabled)
+        };
+        let loaded = (
+            self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            self.t2s.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+        );
+        (on, loaded)
+    }
+
     /// 密码框强制英文的运行时两态：`(策略开关, 当前是否正在抑制)`（测试/诊断用）。
     pub fn debug_password_suppress(&self) -> (bool, bool) {
         use std::sync::atomic::Ordering::Relaxed;

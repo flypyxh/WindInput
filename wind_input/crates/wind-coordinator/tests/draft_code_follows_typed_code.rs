@@ -151,3 +151,45 @@ fn draft_window_keeps_ling_and_encodes_it() {
         "「二」「〇」连续上屏，草稿应有 fgll -> 二〇；实际 {found:?}"
     );
 }
+
+/// 两次上屏之间有键被透传给宿主（中文半角空闲的数字由宿主自己出字，服务端只经下一按的
+/// `TOGGLE_PASSTHROUGH_KEY` 得知），前后两段不得拼成一个词：「二」「0」「六」不登记「二六」。
+#[test]
+fn host_typed_key_between_commits_breaks_the_draft_stream() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["wubi86".into(), "pinyin".into()];
+    cfg.schema.active = "wubi86".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.codetable.auto_phrase.enabled = true;
+
+    let db = std::env::temp_dir().join("wind_draft_host_key_break.redb");
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), Arc::clone(&store));
+    coord.prewarm_indexes();
+
+    type_and_pick(&coord, "fg", "二");
+    // 「0」进了宿主：下一按（「六」的首码）带上透传位。
+    let mut first = key(0x55); // U
+    first.toggles = wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
+    coord.handle_key_event_policed(&first);
+    type_and_pick(&coord, "y", "六");
+    // 对照：「六」之后正常接「二」，滑窗应照常工作（证明不是造词整体失效）。
+    type_and_pick(&coord, "fg", "二");
+
+    let control = wait_draft(&store, "uyfg");
+    let broken = store.search_drafts("wubi86", "fguy", 0).unwrap_or_default();
+    let _ = std::fs::remove_file(&db);
+    assert!(
+        control.iter().any(|t| t == "六二"),
+        "对照组「六二」应照常登记：{control:?}"
+    );
+    assert!(
+        !broken.iter().any(|t| t == "二六"),
+        "中间夹了宿主出的字，「二六」不该登记：{broken:?}"
+    );
+}

@@ -437,6 +437,8 @@ impl Coordinator {
     /// 定向推给活跃客户端（理由见那边 ★★ 注释：广播会污染 hostRenderAvail 位）。
     pub(crate) fn refresh_schema_derived_config(&self) {
         self.refresh_config_in_memory(|_| {});
+        // 方案级注释模板可能变了（`${chaizi}` 加上 / 去掉）：按需数据跟着收放。
+        self.apply_data_needs();
         // 方案设置可能改了 `[engine.aux_code].files`（换了引用的码表方案），新来源的反查索引
         // 要提前在后台建好，否则下一次按辅助码键静默不进。
         self.warm_aux_code_sources();

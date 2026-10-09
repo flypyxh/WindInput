@@ -15,4 +15,4 @@
 >
 > ⚠️ **macOS**：本版本未经 Apple 公证，双击安装包会提示「无法验证开发者」。请改用 **右键 →「打开」→「打开」**，或在终端执行 `sudo installer -pkg <安装包路径> -target /`。装完后到「系统设置 → 键盘 → 文本输入 → 输入法 → 编辑 → +」里添加「清风输入法」。
 >
-> ⚠️ **Linux**：先 `sudo apt install ./<下载的 .deb 文件>`，再对每个使用者运行一次 `windinput-setup`，注销并重新登录（升级只需 `fcitx5 -rd`）。目前仅支持 **X11** 会话，Wayland 暂不支持；其它发行版（Fedora / Arch 等）的包尚未提供。
+> ⚠️ **Linux**：先 `sudo apt install ./<下载的 .deb 文件>`，再对每个使用者运行一次 `windinput-setup`，注销并重新登录（升级只需 `fcitx5 -rd`）。支持 **X11** 与 **Wayland** 会话（Wayland 需合成器支持 input-method-v2，目前仅在 treeland 上实测；GNOME / KDE 尚未验证）；其它发行版（Fedora / Arch 等）的包尚未提供。
