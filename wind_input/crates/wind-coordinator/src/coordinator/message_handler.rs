@@ -796,11 +796,6 @@ impl MessageHandler for Coordinator {
             self.note_host_wrote_text("宿主自行出字");
         }
         let action = self.handle_key_event(data);
-        // 本键交还宿主重放（联想态的退格 / 回车 / 方向键等）：同上，光标前已不是我们上屏的那段。
-        // 普通宿主的重放键在 Test 里被 Suppress、不置透传位，这里不能等下一按的位。
-        if matches!(action, KeyAction::ClearCompositionThenPassThrough) {
-            self.note_host_wrote_text("交还宿主重放");
-        }
         // 上屏换行改写。与 record_input_stats / note_commit_action 同一收口理由（上屏路径
         // 40+ 个返回点，散点接线必漏），而且这里还多一条：换行形式是**平台/宿主**的表达
         // 约定，属于服务端的职责——DLL 拿到什么就写什么，不再自己判断（A3-3）。
@@ -915,6 +910,13 @@ impl MessageHandler for Coordinator {
         } else {
             action
         };
+        // 本键交还宿主重放（联想态的退格 / 回车 / 方向键等）：同开头透传位那段，光标前已不是我们
+        // 上屏的那段。普通宿主的重放键在 Test 里被 Suppress、不置透传位，不能等下一按的位。
+        // 必须排在上面两道改判**之后**：Del / Home / 左右这些是在 `assoc_release_on_passthrough`
+        // 里才改成重放的。
+        if matches!(action, KeyAction::ClearCompositionThenPassThrough) {
+            self.note_host_wrote_text("交还宿主重放");
+        }
         if self.preedit_uses_placeholder() {
             action.with_composition_placeholder(self.composition_placeholder())
         } else {

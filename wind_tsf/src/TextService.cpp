@@ -2851,6 +2851,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
     double focusIpcMs = 0.0;
 
     _hasFocus = (pDocMgrFocus != nullptr);
+    // 「上一份 focus_gained 没带标题」只属于那一份：焦点一动就作废，只有下面真发出 focus_gained 时
+    // 才重新置位。否则焦点转到 transient / 不可编辑的 DocMgr 后，标题开关一到仍会补发 focus_gained，
+    // 服务端把不可编辑的焦点当成可编辑（工具栏误显示）。
+    _focusSentTitleBlind = FALSE;
 
     // If gaining focus (pDocMgrFocus is not null)
     if (pDocMgrFocus != nullptr)
@@ -4414,8 +4418,12 @@ void CTextService::SetTitleMatchEnabled(BOOL bEnabled)
 void CTextService::ResyncFocusForTitleMatch()
 {
     // 判据见 WindowTitlePolicy.h ShouldResyncFocusOnSwitch。
+    // 「有焦点」须连带本线程在前台（_hasThreadFocus）：_hasFocus 只记 DocMgr 焦点，失去线程焦点时
+    // 不清零。开关是逐客户端推的（加第一条标题规则时所有进程同时 0→1），不带这一条，每个挂着
+    // DocMgr 焦点的后台进程都会补发 focus_gained、冒充前台，活动客户端落到最后发到的那个。
     if (!wind::window_title::ShouldResyncFocusOnSwitch(_focusSentTitleBlind != FALSE, IsTitleMatchEnabled() != FALSE,
-                                                       HasFocus() != FALSE, HasActiveComposition() != FALSE))
+                                                       HasFocus() != FALSE && _hasThreadFocus != FALSE,
+                                                       HasActiveComposition() != FALSE))
         return;
     if (_pIPCClient == nullptr || !_pIPCClient->IsConnected())
         return;
