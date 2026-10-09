@@ -10,6 +10,15 @@ use wind_config::app_compat::NewlineStyle;
 use wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
 
 impl Coordinator {
+    /// 光标前最后一段已不是我们上屏的那段（宿主自己出了字、重放了键，或用户挪了光标）：撤销上屏
+    /// 计数退化为 1（否则「你好」后打个 0 再撤销删的是「好0」），草稿滑窗断流（否则「你」「0」
+    /// 「好」连打会登记「你好」）。
+    pub(crate) fn note_host_wrote_text(&self, reason: &str) {
+        self.last_commit_len
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        self.terminate_auto_phrase(reason);
+    }
+
     /// 仍挂在组合里的智能符号（HoldComposition）。超出时限的视为没有：C++ 定时器到点已自行提交，
     /// 这边的 `held_text` 不会随之清掉，拿它当「还在组合」会二次提交（"。" → 等 >500ms → "=" → "。。="）。
     pub(crate) fn live_held_text(&self) -> Option<String> {
@@ -764,17 +773,29 @@ impl MessageHandler for Coordinator {
         // **必须在 `handle_key_event` 之前**：出口那道是「这一按之后」的清理，而这一位说的是
         // 「这一按之前已经发生过」，放到出口就晚了一整拍——press2 早已误触发。
         //
-        // 影响面刻意收到最窄：只解除智能符号武装，不碰任何别的状态；位为假时（绝大多数按键）
-        // 连锁都不取。旧 DLL 不置位 ⇒ 行为与改造前逐字一致。
+        // 同一个事实还说明光标前最后一段已不是我们上屏的那段，另两处据此复位：撤销上屏计数
+        // （否则「你好」后透传一个 0 再撤销，删的是「好0」）与草稿滑窗（否则「你」「0」「好」连打
+        // 会登记「你好」——光标回声在自提交后 200ms 内被忽略，靠 SelectionChanged 断不了）。
+        // 中文半角空闲的数字键 DLL 不再转发（NumberKeyPolicy.h），这是服务端唯一知道它们的途径。
+        //
+        // 位为假时（绝大多数按键）连锁都不取。旧 DLL 不置位 ⇒ 行为与改造前逐字一致。
         if data.event_type == EVENT_KEY_DOWN && data.toggles & TOGGLE_PASSTHROUGH_KEY != 0 {
-            let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
-            if arm.armed {
-                debug!("SmartSymbol: 上一按之后有键被透传给宿主，解除武装");
-                arm.armed = false;
-                arm.hold_pending_commit = false;
+            {
+                let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+                if arm.armed {
+                    debug!("SmartSymbol: 上一按之后有键被透传给宿主，解除武装");
+                    arm.armed = false;
+                    arm.hold_pending_commit = false;
+                }
             }
+            self.note_host_wrote_text("宿主自行出字");
         }
         let action = self.handle_key_event(data);
+        // 本键交还宿主重放（联想态的退格 / 回车 / 方向键等）：同上，光标前已不是我们上屏的那段。
+        // 普通宿主的重放键在 Test 里被 Suppress、不置透传位，这里不能等下一按的位。
+        if matches!(action, KeyAction::ClearCompositionThenPassThrough) {
+            self.note_host_wrote_text("交还宿主重放");
+        }
         // 上屏换行改写。与 record_input_stats / note_commit_action 同一收口理由（上屏路径
         // 40+ 个返回点，散点接线必漏），而且这里还多一条：换行形式是**平台/宿主**的表达
         // 约定，属于服务端的职责——DLL 拿到什么就写什么，不再自己判断（A3-3）。
@@ -1492,9 +1513,10 @@ impl MessageHandler for Coordinator {
             // 判据也同源（联想态挂在 `candidates` 上，算有组合）。
             //
             // ⛔ 不能由我们 InsertText 出字（论坛 t285）：C++ OnTestKeyDown 对无会话的 Number
-            // 类（含小键盘全部 15 键）判「不吃」，但 OnKeyDown 在中文模式仍把它转发过来；
+            // 类（含小键盘全部 15 键）判「不吃」，旧 DLL 的 OnKeyDown 在中文模式仍把它转发过来；
             // Chrome 类宿主（Twitter / VK 的 PIN 框）无视 test 结论照调 OnKeyDown ⇒ 宿主自己
-            // 出一次、我们再插一次，双重上屏。
+            // 出一次、我们再插一次，双重上屏。新 DLL 两边共用 `NumberKeyPolicy.h`、不再转发，
+            // 本臂与下面 follow_main 那条留给旧 DLL 与不走 Test 直接调 KeyDown 的宿主。
             //
             // 全角态必须照旧出字：C++ 的 `chinese_fullwidth_number` 分支那时**会吃**这批键，
             // 透传就成了「吃了再吐」。`numpad_half_width` 开着的全角态也一样（吃键与否 C++
@@ -4305,7 +4327,7 @@ impl MessageHandler for Coordinator {
         //   现状（不比现在差），误判成移动只是让下一次首显多等一程（慢而不错）。
         self.caret_cache_verified
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.terminate_auto_phrase("selection_changed");
+        self.note_host_wrote_text("selection_changed");
     }
 
     fn handle_commit_request(&self, data: &CommitRequestData) -> Option<CommitResultData> {

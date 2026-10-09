@@ -1741,6 +1741,37 @@ mod tests {
         );
     }
 
+    /// 上屏之后有键透传给宿主（DLL 经下一按的 `TOGGLE_PASSTHROUGH_KEY` 报告）：光标前最后一段
+    /// 已是宿主自己出的字，撤销计数退化为 1——否则「你好」后打个 0 再撤销，删的是「好0」。
+    #[test]
+    fn host_typed_key_resets_undo_commit_len() {
+        let c = coord("undo_len_host_key");
+        c.note_commit_action(&Coordinator::commit_action("你好".into(), true));
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2);
+        let shift = |toggles| wind_bridge::handler::KeyEventData {
+            key_code: 0x10, // Shift：本身什么都不做，只为把透传位带进来
+            scan_code: 0,
+            modifiers: 0,
+            event_type: wind_ipc::protocol::EVENT_KEY_DOWN,
+            toggles,
+            event_seq: 0,
+            prev_char: 0,
+        };
+        // 反向：不带位的按键不动计数（防「每个 keydown 都复位」）。
+        c.handle_key_event_policed(&shift(0));
+        assert_eq!(
+            c.last_commit_len.load(Ordering::Relaxed),
+            2,
+            "无透传位不复位"
+        );
+        c.handle_key_event_policed(&shift(wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY));
+        assert_eq!(
+            c.last_commit_len.load(Ordering::Relaxed),
+            1,
+            "透传位到达后撤销只删 1"
+        );
+    }
+
     /// 焦点变化复位撤销计数：换窗/换文本框后光标前已非「刚上屏那段」，退化删 1。
     #[test]
     fn focus_lost_resets_undo_commit_len() {
