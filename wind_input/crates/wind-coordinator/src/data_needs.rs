@@ -92,6 +92,8 @@ impl DataNeeds {
     /// - 悬停段**不看**编码来源档：逐字段走 `eval_text_var`，那里的 `${code_rev}` 不带门控；
     ///   `${word_code}` / `${code_source}` 任一被引用，候选循环就按词查码（含用户层）。
     /// - 拆字不受任何档门控，模板里写了就要。
+    /// - 两个总开关在上面这些之上：`ui.candidate.comment_enabled` 关 ⇒ 三层注释模板都不算；
+    ///   `ui.tooltip.enabled` 关 ⇒ 悬停段都不算（设计 §4.3）。
     pub(crate) fn derive(cfg: &Config, facts: &SchemaFacts) -> Self {
         let tip = crate::tooltip::CompiledTooltip::compile(&cfg.ui.tooltip);
         let tip_any = |names: &[&str]| names.iter().any(|n| tip.references(n));
@@ -144,10 +146,14 @@ impl DataNeeds {
                 .map(|t| (t.clone(), false, true)),
         );
 
-        let comment_rev = layers.iter().any(|(t, in_temp, in_main)| {
-            ((*in_temp && temp_rev) || (*in_main && main_rev)) && refs_any(t, CODE_REV_VARS)
-        });
-        let comment_chaizi = layers.iter().any(|(t, _, _)| refs_any(t, CHAIZI_VARS));
+        // 注释总开关关着：三层模板一律不渲染（`comment_template_for` 给空模板），都不算需求。
+        // 悬停总开关不必在这里判：关着时 `CompiledTooltip::compile` 已编出空段列表。
+        let comment_on = cfg.ui.candidate.comment_enabled;
+        let comment_rev = comment_on
+            && layers.iter().any(|(t, in_temp, in_main)| {
+                ((*in_temp && temp_rev) || (*in_main && main_rev)) && refs_any(t, CODE_REV_VARS)
+            });
+        let comment_chaizi = comment_on && layers.iter().any(|(t, _, _)| refs_any(t, CHAIZI_VARS));
 
         let tip_code = tip_any(&["word_code", "code_source"]) || tip_any(CODE_REV_VARS);
         let mobile = crate::handle_assoc::use_mobile_overrides().then_some(&cfg.mobile.association);
@@ -362,6 +368,125 @@ mod tests {
             }
         }
         assert!(derive(&c).chaizi, "出厂拆字段打开 ⇒ 要");
+    }
+
+    // ───────────────────── 两个总开关（设计 §4.3，S2） ─────────────────────
+
+    /// 打开出厂「拆字」悬停段（出厂关着）。
+    fn with_chaizi_tip_section(mut c: Config) -> Config {
+        let mut hit = false;
+        for s in &mut c.ui.tooltip.sections {
+            if Template::parse(&s.template).references("chaizi") {
+                s.enabled = true;
+                hit = true;
+            }
+        }
+        assert!(hit, "前置条件：出厂悬停段里有引用 ${{chaizi}} 的「拆字」段");
+        c
+    }
+
+    /// 三层注释模板都引用拆字与编码反查：全局、模式级（临英）、方案级与 overlay（经 facts）。
+    fn all_layers_reference_chaizi(mut c: Config) -> (Config, SchemaFacts) {
+        c.ui.candidate.comment_template_vertical = "${code_rev}${chaizi}".into();
+        c.ui.candidate.comment_template_horizontal = "${code_rev}${chaizi}".into();
+        c.input.temp_english.comment_template_vertical = Some("${chaizi}".into());
+        let facts = SchemaFacts {
+            schema_templates: vec!["${chaizi}".into()],
+            overlay_templates: vec!["${chaizi_code}".into()],
+            ..Default::default()
+        };
+        (c, facts)
+    }
+
+    /// 两个开关都关：出厂里会让反查 / 用户层 / 拆字为真的贡献全部归零。
+    ///
+    /// 前提里联想关着（出厂 `off`）、辅助码与自动造词不在用（`SchemaFacts` 缺省）——它们
+    /// 不属注释也不属悬停，仍能让 `reverse_index` 为真，另见下一条。
+    #[test]
+    fn both_toggles_off_zero_reverse_user_text_and_chaizi() {
+        let (c, facts) = all_layers_reference_chaizi(with_chaizi_tip_section(factory()));
+        let on = DataNeeds::derive(&c, &facts);
+        assert!(
+            on.reverse_index && on.user_text && on.chaizi,
+            "前置条件：开关都开时三项都要：{on:?}"
+        );
+
+        let mut off = c.clone();
+        off.ui.tooltip.enabled = false;
+        off.ui.candidate.comment_enabled = false;
+        let n = DataNeeds::derive(&off, &facts);
+        assert_eq!(
+            (n.reverse_index, n.user_text, n.chaizi),
+            (false, false, false),
+            "两开关都关 ⇒ 注释三层与悬停段的贡献都归零：{n:?}"
+        );
+    }
+
+    /// 两开关都关后，注释 / 悬停以外的反查消费者照旧：联想、辅助码、自动造词。
+    #[test]
+    fn both_toggles_off_leave_other_reverse_consumers() {
+        let mut c = factory();
+        c.ui.tooltip.enabled = false;
+        c.ui.candidate.comment_enabled = false;
+        assert!(!derive(&c).reverse_index, "前置条件：基线什么都不要");
+
+        let mut assoc = c.clone();
+        assoc.input.association.kind = "word".into();
+        let n = derive(&assoc);
+        assert!(n.reverse_index && !n.user_text, "联想仍要系统层反查");
+
+        let aux = DataNeeds::derive(
+            &c,
+            &SchemaFacts {
+                aux_code_in_use: true,
+                ..Default::default()
+            },
+        );
+        assert!(aux.reverse_index && aux.user_text, "辅助码仍两层都查");
+
+        let auto = DataNeeds::derive(
+            &c,
+            &SchemaFacts {
+                auto_phrase: true,
+                ..Default::default()
+            },
+        );
+        assert!(auto.reverse_index && !auto.user_text, "自动造词仍查重");
+    }
+
+    /// 只关注释：注释的贡献没了（拆字只有注释在要 ⇒ 不要），悬停「编码」段的贡献还在。
+    #[test]
+    fn comment_off_keeps_tooltip_contribution() {
+        let (mut c, facts) = all_layers_reference_chaizi(factory());
+        assert!(
+            DataNeeds::derive(&c, &facts).chaizi,
+            "前置条件：拆字只由注释三层要"
+        );
+        c.ui.candidate.comment_enabled = false;
+        let n = DataNeeds::derive(&c, &facts);
+        assert!(!n.chaizi, "注释关掉 ⇒ 三层模板里的拆字都不算：{n:?}");
+        assert!(
+            n.reverse_index && n.user_text,
+            "悬停「编码」段仍开着 ⇒ 反查与用户层照要：{n:?}"
+        );
+    }
+
+    /// 只关悬停：悬停段的贡献没了（拆字只有悬停段在要 ⇒ 不要），注释的反查贡献还在。
+    #[test]
+    fn tooltip_off_keeps_comment_contribution() {
+        let mut c = with_chaizi_tip_section(factory());
+        assert!(derive(&c).chaizi, "前置条件：拆字只由悬停段要");
+        c.ui.tooltip.enabled = false;
+        let n = derive(&c);
+        assert!(!n.chaizi, "悬停关掉 ⇒ 拆字段不算：{n:?}");
+        assert!(
+            n.reverse_index && n.user_text,
+            "出厂全局注释 ${{code_rev}} + 临拼档 auto 仍是消费者：{n:?}"
+        );
+        // 反证上一句确实来自注释：再关注释就都不要了。
+        c.ui.candidate.comment_enabled = false;
+        let n = derive(&c);
+        assert!(!n.reverse_index && !n.user_text, "{n:?}");
     }
 
     #[test]
@@ -579,6 +704,45 @@ mod tests {
         });
         c.apply_data_needs();
         assert_eq!(c.engine_mgr.user_text_loaded(), 0, "没有消费者 ⇒ 清空");
+        drop(c);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 端到端（S2）：注释与悬停都在要拆字 / 用户层时，关掉两个总开关并生效配置 ⇒
+    /// 用户层编码索引清空、拆字表卸载。
+    #[test]
+    fn toggles_off_release_user_text_and_chaizi() {
+        if !has_data() {
+            eprintln!("跳过：缺 build_dev 词库");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("wind_dn_s2_{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(wind_store::Store::open(&path).unwrap());
+        let cfg = wubi(|c| {
+            *c = with_chaizi_tip_section(c.clone());
+            c.ui.candidate.comment_template_vertical = "${chaizi}".into();
+            c.ui.candidate.comment_template_horizontal = "${chaizi}".into();
+        });
+        let c = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+        c.engine_mgr.prewarm_text_codes("wubi86");
+        assert!(
+            has_chaizi(&c),
+            "前置条件：注释与悬停都引用拆字 ⇒ 构造期装上"
+        );
+        assert_eq!(c.engine_mgr.user_text_loaded(), 1, "前置条件：用户层已建");
+
+        c.refresh_config_in_memory(|cfg| {
+            cfg.ui.tooltip.enabled = false;
+            cfg.ui.candidate.comment_enabled = false;
+        });
+        c.apply_data_needs();
+        assert_eq!(
+            c.engine_mgr.user_text_loaded(),
+            0,
+            "两开关关掉 ⇒ 用户层没有消费者，应清空"
+        );
+        assert!(!has_chaizi(&c), "两开关关掉 ⇒ 拆字表应卸载");
         drop(c);
         let _ = std::fs::remove_file(&path);
     }

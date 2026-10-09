@@ -4816,7 +4816,8 @@ impl Coordinator {
         if numpad_origin || data.modifiers & wind_config::hotkey::MOD_GENERIC_MASK != MOD_ALT {
             return None;
         }
-        let kind = AltCommit::from_config(&self.rt().config.input.alt_commit);
+        // 生效档：注释总开关关着时 `comment` 档按 `off` 处理（见 `AltCommit::effective`）。
+        let kind = AltCommit::effective(&self.rt().config);
         if kind == AltCommit::Off {
             return None;
         }

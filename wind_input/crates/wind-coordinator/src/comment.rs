@@ -911,6 +911,10 @@ impl crate::coordinator::Coordinator {
         behavior: &'a wind_config::SchemaBehavior,
         vertical: bool,
     ) -> &'a str {
+        // 注释总开关在三层之上：关就是关（空模板 ⇒ 注释、上方注释条、上屏注释都为空）。
+        if !cfg.ui.candidate.comment_enabled {
+            return "";
+        }
         resolve_template(
             template_for(cfg, state.overlay_spec.as_ref(), state.active, vertical),
             schema_template_of(behavior, vertical),

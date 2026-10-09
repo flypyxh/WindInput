@@ -823,6 +823,16 @@ impl State {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 测试钩子：本线程上 `notify_ui_update` 为悬停「编码」段调 `word_codes_display` 的次数
+    /// （`ui.tooltip.enabled = false` 时应为 0）。线程局部：并行测试互不干扰。
+    ///
+    /// ⚠️ 只覆盖**同步**调用路径：别的线程（后台预热、异步刷新等）上的调用计在那个线程的
+    /// 副本里，这里看不见。计数为 0 只证明调用线程上的候选刷新没查。
+    pub(crate) static WORD_CODE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 配置变更后**引擎是否需要重建**（`reload_user_config` 的 `schema_dirty`）。
 ///
 /// 抽成自由函数而非内联表达式，就是为了**能被单测直接喂两份配置**——它守的那类缺陷
@@ -6814,7 +6824,11 @@ impl Coordinator {
                 // Some("")）。此时本段不显示，并已在循环外触发后台构建，建好后自动补上。
                 let word_code = code_schema
                     .as_deref()
-                    .and_then(|sid| self.engine_mgr.word_codes_display(sid, &c.text))
+                    .and_then(|sid| {
+                        #[cfg(test)]
+                        WORD_CODE_LOOKUPS.with(|n| n.set(n.get() + 1));
+                        self.engine_mgr.word_codes_display(sid, &c.text)
+                    })
                     .unwrap_or_default();
                 let dict_schema =
                     self.comment_dict_scope(state, c, mix_comment_scope, &comment_dict_schema);
@@ -10406,6 +10420,121 @@ mod mode_comment_e2e_tests {
 
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── 两个总开关（memory-footprint.md §4.3，S2） ─────────────────────
+
+    /// 取最近一条 `UpdateCandidates` 里首候选的 `(上方注释条, 注释)`。
+    fn last_comment_parts(rx: &std::sync::mpsc::Receiver<UiCommand>) -> Option<(String, String)> {
+        let mut found = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                found = candidates.first().map(|c| {
+                    (
+                        c.comment_above.as_str().to_string(),
+                        c.comment.as_str().to_string(),
+                    )
+                });
+            }
+        }
+        found
+    }
+
+    /// 注释总开关在三层裁决之上：全局 / 方案级 / 模式级各一例，开着时各自出注释，
+    /// 关掉后全都不出——含 `${code_hint}`（码表引擎产的编码提示）与上方注释条。
+    #[test]
+    fn comment_switch_off_overrides_all_three_layers() {
+        let dir = data_dir_with_schema(
+            "switch",
+            "zz_cmt_sw",
+            "comment_template_vertical = \"方案${code_hint}\"\n\
+             comment_template_horizontal = \"方案${code_hint}\"",
+        );
+        let run = |enabled: bool| {
+            let mut cfg = cfg_with_templates();
+            cfg.ui.candidate.comment_enabled = enabled;
+            // 上方注释条一并开着，全局模板带字面 `\n`：开着时上段进上方条，关掉总开关后
+            // 上方条也必须为空——不然它可能是因为模板没拆出上段才空的，断言就是恒绿。
+            cfg.ui.candidate.comment_above = true;
+            cfg.ui.candidate.comment_template_vertical = "上${code_hint}\n全局${code_hint}".into();
+            cfg.ui.candidate.comment_template_horizontal =
+                "上${code_hint}\n全局${code_hint}".into();
+            cfg.input.temp_english.comment_template_vertical = Some("临英${code_hint}".into());
+            cfg.input.temp_english.comment_template_horizontal = Some("临英${code_hint}".into());
+            // 全局层：无方案目录（方案层没意见）、无模式。
+            let (g, grx) = coord_with_ui(cfg.clone());
+            emit(&g, None);
+            let global = last_comment_parts(&grx).expect("应下发候选");
+            // 方案层：方案文件声明了模板、无模式。
+            cfg.schema.active = "zz_cmt_sw".into();
+            let (s, srx) = coord_with_ui_at(cfg, Some(&dir));
+            emit(&s, None);
+            let schema = last_comment_parts(&srx).expect("应下发候选");
+            // 模式层：临英。
+            emit(&s, Some(ModeKind::TempEnglish));
+            let mode = last_comment_parts(&srx).expect("应下发候选");
+            [global, schema, mode]
+        };
+        let none = (String::new(), String::new());
+        assert_eq!(
+            run(true),
+            [
+                ("上码".to_string(), "全局码".to_string()),
+                (String::new(), "方案码".to_string()),
+                (String::new(), "临英码".to_string()),
+            ],
+            "前置条件：开关开着时三层各出各的注释（含 ${{code_hint}}）"
+        );
+        assert_eq!(
+            run(false),
+            [none.clone(), none.clone(), none],
+            "注释总开关关掉 ⇒ 三层模板都不出注释，${{code_hint}} 与上方注释条也不出"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 悬停总开关关掉：候选不带气泡，且候选刷新不再调用 `word_codes_display`（计数断言）。
+    ///
+    /// 要真实码表方案（`build_dev` 的 wubi86）：编码段的来源方案取活跃码表，没有码表就
+    /// 一次也不会查，开着那一侧的计数也是 0，断言就成了恒绿。
+    #[test]
+    fn tooltip_switch_off_skips_rendering_and_word_code_lookup() {
+        let data =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
+        if !data.join("schemas/wubi86.schema.toml").exists() {
+            eprintln!("跳过：缺 build_dev 词库");
+            return;
+        }
+        let run = |enabled: bool| {
+            let mut cfg = Config::default();
+            cfg.schema.active = "wubi86".into();
+            cfg.schema.available = vec!["wubi86".into()];
+            cfg.ui.tooltip.enabled = enabled;
+            let (c, rx) = coord_with_ui_at(cfg, Some(&data));
+            let before = WORD_CODE_LOOKUPS.with(|n| n.get());
+            emit(&c, None);
+            let lookups = WORD_CODE_LOOKUPS.with(|n| n.get()) - before;
+            let mut tip = None;
+            while let Ok(cmd) = rx.try_recv() {
+                if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                    tip = candidates.first().map(|c| c.tooltip.clone());
+                }
+            }
+            (tip.expect("应下发候选"), lookups)
+        };
+        let (tip, lookups) = run(true);
+        assert!(
+            !tip.is_empty(),
+            "前置条件：开着时候选「测」有气泡（拼音段）"
+        );
+        assert!(
+            lookups > 0,
+            "前置条件：开着时编码段逐候选查 word_codes_display"
+        );
+
+        let (tip, lookups) = run(false);
+        assert!(tip.is_empty(), "悬停关掉 ⇒ 候选不带气泡：{tip:?}");
+        assert_eq!(lookups, 0, "悬停关掉 ⇒ 不再调用 word_codes_display");
     }
 }
 
