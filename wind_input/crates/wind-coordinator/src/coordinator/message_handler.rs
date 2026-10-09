@@ -2755,8 +2755,15 @@ impl MessageHandler for Coordinator {
         // （尚无任何客户端获焦）无条件放行，那种失焦压根没有归属可清，警告它纯属噪音。
         // 能走到这里且 `active != 0`，则由 stale 校验反推必有 `client_token == active`
         // ——正是「它就是当前活动客户端，却从未 gained 过」这一种。
+        //
+        // `NoEditCtx` 除外：DLL 对不可编辑的 DocMgr 本就不发 focus_gained、改发这一条（输入法切入
+        // 时焦点在网页正文这类地方也走这里），「没 gained 过」正是预期。
         let gained = self.push_server.gained_token();
-        if client_token != 0 && client_token != gained && self.push_server.active_token() != 0 {
+        if client_token != 0
+            && client_token != gained
+            && self.push_server.active_token() != 0
+            && !matches!(reason, FocusLostReason::NoEditCtx)
+        {
             tracing::warn!(
                 "handle_focus_lost: token={client_token:#x} 从未上报过 focus_gained（最近 gained={gained:#x}）——上游可能吞掉了它的 focus_gained，激活态被清后将无人恢复"
             );
