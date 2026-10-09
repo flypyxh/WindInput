@@ -5681,6 +5681,7 @@ impl Coordinator {
                                 &prefix,
                                 text,
                                 None,
+                                None,
                                 &remainder,
                                 cand.source,
                             ),
@@ -5693,10 +5694,12 @@ impl Coordinator {
                     Some(cand) => {
                         let source = cand.source;
                         let s2t_override = cand.s2t_override.clone();
+                        let freq_text = cand.freq_text().to_string();
                         return self.commit_top_text(
                             state,
                             &prefix,
                             cand.text,
+                            Some(&freq_text),
                             s2t_override.as_deref(),
                             &remainder,
                             source,
@@ -5712,6 +5715,7 @@ impl Coordinator {
                     state,
                     &prefix,
                     engine_top,
+                    None,
                     None, // 引擎码表纯文本，无候选对象可承载变体覆盖
                     &remainder,
                     CandidateSource::CodeTable,
@@ -5724,12 +5728,19 @@ impl Coordinator {
             InputOutcome::AutoCommit(text) => {
                 // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
                 // 记账码同取首候选（按来源分流，见 `freq_code`），无候选时退回输入缓冲。
-                let (source, code) = state
+                // 记账文本同理取首候选的 `freq_text`（模板词是源文本，GH#177）。
+                let (source, code, freq_text) = state
                     .candidates
                     .first()
-                    .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
-                    .unwrap_or_else(|| (CandidateSource::default(), state.input_buffer.clone()));
-                let out = self.commit_candidate(state, &text, None, source, &code);
+                    .map(|c| {
+                        let code = self.freq_code(&state.input_buffer, c);
+                        (c.source, code, c.freq_text().to_string())
+                    })
+                    .unwrap_or_else(|| {
+                        let buf = state.input_buffer.clone();
+                        (CandidateSource::default(), buf, text.clone())
+                    });
+                let out = self.commit_candidate(state, &text, &freq_text, None, source, &code);
                 // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
                 return self.auto_commit_then_assoc(state, out, &text);
             }
@@ -9445,7 +9456,7 @@ impl Coordinator {
             return 0;
         }
         store
-            .get_freq(&sid, &code, &c.text)
+            .get_freq(&sid, &code, c.freq_text())
             .ok()
             .flatten()
             .map(|r| r.count)

@@ -759,6 +759,10 @@ impl Coordinator {
         // 先收键再**一次事务**批量查：逐候选 `get_freq` 会为每个候选开一次 redb 读事务，
         // 五笔单字母下 78+ 候选即 78 次，是每键的固定开销（见 `get_freq_batch`）。
         let mut probe: Vec<(String, String, String)> = Vec::new();
+        // 词频按 `freq_text()` 查（模板源文本，与写端同键），而重排纯函数按候选 `text`
+        // 认记录 ⇒ 结果表的键另收一份 `text`，与 probe 一一对应。两者只在模板展开 /
+        // 大小写投影过的候选上不同（GH#177）。
+        let mut rec_keys: Vec<&str> = Vec::new();
         for c in candidates.iter() {
             // 短语不参与词频维度（写入端 `record_selection` 对称跳过）：其次序由短语定义的
             // weight/position 决定，且求值型短语的文本逐日变化，点查恒 miss——白花一次
@@ -769,7 +773,7 @@ impl Coordinator {
             // 排除区块（写端 `record_selection_in` 调同一个判据）：跳过即不进 probe，
             // 于是也不占 `get_freq_batch` 的一个条目——**这道判断在热路径上是净省**，
             // 它省掉的是三次 String 分配加一次批量查条目，而自身只是一次移位加与运算。
-            if settings.excluded_from_freq(&c.text) {
+            if settings.excluded_from_freq(c.freq_text()) {
                 continue;
             }
             let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
@@ -795,18 +799,18 @@ impl Coordinator {
             probe.push((
                 sid.to_string(),
                 Self::freq_code_with(code, c, settings.english_code_by_input),
-                c.text.clone(),
+                c.freq_text().to_string(),
             ));
+            rec_keys.push(&c.text);
         }
         let found = store.get_freq_batch(&probe).unwrap_or_default();
         // 只为**命中**的候选 clone 文本：五笔单字母下 78 个候选往往只有个位数有词频记录，
         // 先收一份全量文本副本再筛是白 clone 七十多次。
-        let recs: std::collections::HashMap<String, FreqRecord> = probe
-            .iter()
-            .map(|(_, _, text)| text)
+        let recs: std::collections::HashMap<String, FreqRecord> = rec_keys
+            .into_iter()
             .zip(found)
             .filter_map(|(t, r)| match r {
-                Some(r) if r.count > 0 => Some((t.clone(), r)),
+                Some(r) if r.count > 0 => Some((t.to_string(), r)),
                 _ => None,
             })
             .collect();
@@ -1007,6 +1011,15 @@ impl Coordinator {
     /// shadow 规则的存储键 code 同源；`raw` 为 store 里的 `PhraseEntry.text`（模板未展开）。
     /// `raw` 为空（测试直构的 `PhraseHit::plain` / `$AA` 字面元素）→ 返回空 id，表示该候选
     /// 无稳定身份，shadow 落回文本匹配。
+    /// 满码自动上屏复核：引擎意向 `t`（词条原文）是否就是这条 `$` 模板候选展开前的源文本。
+    ///
+    /// **`{..}` 插值不放行**：剪贴板 / 反查这类内容取自外部状态，自动上屏等于不经候选窗
+    /// 就把用户没看过的内容送出去（剪贴板值还是「宁陈旧勿等待」的缓存）。它们维持原状——
+    /// 恒不满码自动上屏，须手动选。纯 `$` 模板（日期等）可预期，与 `$CC` 纯文本命令同口径。
+    pub(crate) fn template_auto_commit_matches(c: &Candidate, t: &str) -> bool {
+        c.template_source.as_deref() == Some(t) && !t.contains('{')
+    }
+
     pub(crate) fn phrase_cand_id(code: &str, raw: &str) -> String {
         if raw.is_empty() {
             return String::new();
@@ -1131,10 +1144,19 @@ impl Coordinator {
                     command_src,
                 } => {
                     let mut c = cand;
-                    c.text = display;
+                    let source_text = std::mem::replace(&mut c.text, display);
                     if let Some(src) = command_src {
                         c.phrase_template = src;
                         c.is_command = true;
+                    } else {
+                        // 模板 / 插值：展开文本逐日变化，凡以文本为键的记账都改认源文本
+                        // （GH#177）——词频走 `template_source`（见其文档）；候选调整走稳定
+                        // id，与短语的 `phrase:{code}:{原文}` 同理，否则置顶次日即失配。
+                        // 命令候选另有 phrase_template。
+                        if c.id.is_empty() {
+                            c.id = format!("tmpl:{source_text}");
+                        }
+                        c.template_source = Some(source_text);
                     }
                     expanded.push(c);
                 }
@@ -1767,12 +1789,14 @@ impl Coordinator {
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
         // 词库 `$CC` 命令词条经 finalize_candidates 展开后 text 已改写为 display 标签，而引擎
         // 意向 commit_text 是原始 `$CC` 源 → 按 phrase_template 补匹配（否则意向恒被误否决）。
+        // `$` 模板词条同理，按展开前的 `template_source` 补匹配（GH#177）。
         let outcome = match auto_commit
             .filter(|t| {
-                state
-                    .candidates
-                    .iter()
-                    .any(|c| &c.text == t || (c.is_command && &c.phrase_template == t))
+                state.candidates.iter().any(|c| {
+                    &c.text == t
+                        || (c.is_command && &c.phrase_template == t)
+                        || Self::template_auto_commit_matches(c, t)
+                })
             })
             // 短语侧否决：引擎的「唯一」判在**码表候选子集**上跑（`decide_auto_commit` 按
             // `c.code == input` 筛，而短语候选的 code 恒为空串、且在引擎 convert 之后才由协调器
@@ -3118,15 +3142,19 @@ impl Coordinator {
     /// **刻意做成显式入参而非在此取 `state.input_buffer`**：本函数只拿得到 `text`，
     /// 同文多候选无从反查，交由每个调用点交代码来源（同 `add_user_word` 的 `boundary`
     /// 入参先例）。
+    ///
+    /// `freq_text`：词频记账文本，取候选的 [`Candidate::freq_text`]（模板词是展开前的源文本，
+    /// GH#177）；无候选实体时同 `text`。同样因为本函数无从由 `text` 反查候选而做成入参。
     pub(crate) fn commit_candidate(
         &self,
         state: &mut State,
         text: &str,
+        freq_text: &str,
         s2t_override: Option<&str>,
         source: CandidateSource,
         freq_code: &str,
     ) -> String {
-        self.record_selection(freq_code, text, source);
+        self.record_selection_cased_in(None, freq_code, freq_text, text, source);
         let mut out = match s2t_override {
             Some(t) => t.to_string(),
             None => self.maybe_convert(state, text),
@@ -4035,7 +4063,10 @@ impl Coordinator {
             let chinese_mode = state.chinese_mode;
             // 记账码传 `input`、来源如实传 `cand.source`（短语）——与 `commit_top_text` 的
             // 命令顶码分支同构：`record_selection` 据来源拦掉短语，求值文本不进 FREQ 表。
-            let out = self.commit_candidate(state, &text, None, cand.source, &input);
+            // 记账文本取 `freq_text`（命令的显示标签）：读端重排按它查，满码自动上屏的
+            // 命令也按它记（首候选的 `freq_text`），三处同键。求值文本可能逐次不同。
+            let out =
+                self.commit_candidate(state, &text, cand.freq_text(), None, cand.source, &input);
             self.notify_ui_hide();
             return Self::commit_action(out, chinese_mode);
         }
@@ -4142,17 +4173,28 @@ impl Coordinator {
     /// 现实中三条来路都取不到 1对多变体候选——顶码取 `candidates.first()`，而变体恒插在原字
     /// **之后**（见 [`Self::expand_s2t_variants`]）——但判据写在候选身上而非「反正取不到」的
     /// 推断上：顶码哪天改取高亮候选，这里不必跟着想起来改。
+    ///
+    /// `freq_text`：词频记账文本（被顶出候选的 [`Candidate::freq_text`]；`None` = 同
+    /// `top_text`）。模板词的 `top_text` 是当天展开结果，按它记账次日即成孤儿行（GH#177）。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_top_text(
         &self,
         state: &mut State,
         prefix: &str,
         top_text: String,
+        freq_text: Option<&str>,
         s2t_override: Option<&str>,
         remainder: &str,
         source: CandidateSource,
     ) -> KeyAction {
         if !top_text.is_empty() {
-            self.record_selection(prefix, &top_text, source);
+            self.record_selection_cased_in(
+                None,
+                prefix,
+                freq_text.unwrap_or(&top_text),
+                &top_text,
+                source,
+            );
             // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
             self.record_commit(
                 &top_text,
@@ -4629,6 +4671,9 @@ impl Coordinator {
                     codes.push(c);
                 }
             }
+            // 库里存的是模板源文本（`rq` → `$Y年$M月$D日`），`text` 是当天展开结果，
+            // 按后者删恒 miss（GH#177）。
+            let stored_text = cand.template_source.as_deref().unwrap_or(&cand.text);
             // 删之前先查。**没有这一步，三种结局在日志里长得一模一样**：`redb` 的 `remove`
             // 对不存在的 key 静默成功，而 key 由 schema+code+text 三段拼成，任一段错配的
             // 表现都是「点了删除、界面毫无变化、词还在词库里」。
@@ -4638,7 +4683,9 @@ impl Coordinator {
                 } else {
                     store.get_temp_words(s, c)
                 };
-                recs.unwrap_or_default().iter().any(|r| r.text == cand.text)
+                recs.unwrap_or_default()
+                    .iter()
+                    .any(|r| r.text == stored_text)
             };
             // 两个标记**各删各的表**：同文双记录时只删一张，剩下那张照样供出同一条候选。
             let mut removed: Vec<String> = Vec::new();
@@ -4654,9 +4701,9 @@ impl Coordinator {
                     continue;
                 };
                 let r = if user {
-                    store.remove_user_word(&sid, c, &cand.text)
+                    store.remove_user_word(&sid, c, stored_text)
                 } else {
-                    store.remove_temp_word(&sid, c, &cand.text)
+                    store.remove_temp_word(&sid, c, stored_text)
                 };
                 match r {
                     Ok(()) => {

@@ -541,10 +541,16 @@ impl Coordinator {
             )
         };
         if let Some(t) = auto_commit {
+            // 引擎意向是词条原文：`$CC` 命令比 phrase_template、`$` 模板比 template_source
+            // （展开后 text 已变，同主路复核；`{..}` 插值不放行，GH#177）。
             return state
                 .candidates
                 .iter()
-                .find(|c| c.text == t || (c.is_command && c.phrase_template == t))
+                .find(|c| {
+                    c.text == t
+                        || (c.is_command && c.phrase_template == t)
+                        || Self::template_auto_commit_matches(c, &t)
+                })
                 .cloned();
         }
         None
@@ -572,14 +578,17 @@ impl Coordinator {
             } else {
                 cand.code.clone()
             };
-            self.record_selection_in(None, &code, &cand.text, cand.source);
+            self.record_selection_cased_in(None, &code, cand.freq_text(), &cand.text, cand.source);
             return;
         }
         if !matches!(state.active, Some(ModeKind::RareChar)) {
             let code = state.special_buffer.clone();
-            self.record_selection_in(
+            // 词频记 `freq_text`（模板词为源文本，与 `update_special_candidates` 的重排读端
+            // 同键，GH#177），历史记实际上屏的 `text`。
+            self.record_selection_cased_in(
                 self.effective_data_schema(state).as_deref(),
                 &code,
+                cand.freq_text(),
                 &cand.text,
                 cand.source,
             );

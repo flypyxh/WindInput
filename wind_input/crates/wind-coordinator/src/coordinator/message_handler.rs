@@ -1998,14 +1998,19 @@ impl MessageHandler for Coordinator {
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
                         // 记账码取首候选（按来源分流，见 `freq_code`），与上一处 AutoCommit 同口径。
-                        let (source, code) = state
+                        let (source, code, freq_text) = state
                             .candidates
                             .first()
-                            .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
+                            .map(|c| {
+                                let code = self.freq_code(&state.input_buffer, c);
+                                (c.source, code, c.freq_text().to_string())
+                            })
                             .unwrap_or_else(|| {
-                                (CandidateSource::default(), state.input_buffer.clone())
+                                let buf = state.input_buffer.clone();
+                                (CandidateSource::default(), buf, text.clone())
                             });
-                        let out = self.commit_candidate(&mut state, &text, None, source, &code);
+                        let out = self
+                            .commit_candidate(&mut state, &text, &freq_text, None, source, &code);
                         // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
                         return self.auto_commit_then_assoc(&mut state, out, &text);
                     }

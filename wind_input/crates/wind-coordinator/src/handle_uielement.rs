@@ -856,6 +856,7 @@ mod tests {
                     "aaaa",
                     "工".into(),
                     None,
+                    None,
                     "h",
                     wind_candidate::CandidateSource::CodeTable,
                 )
