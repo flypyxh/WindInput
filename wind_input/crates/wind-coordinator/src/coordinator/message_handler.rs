@@ -272,6 +272,7 @@ fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
 #[derive(Debug, PartialEq)]
 struct HostDisplay {
     caret_free: Option<bool>,
+    caret_trusted: Option<bool>,
     scale: Option<f32>,
 }
 
@@ -283,6 +284,7 @@ fn decode_ext_host_display(body: &[u8]) -> Option<HostDisplay> {
     let obj = v.as_object()?;
     Some(HostDisplay {
         caret_free: obj.get("caret_free").and_then(|x| x.as_bool()),
+        caret_trusted: obj.get("caret_trusted").and_then(|x| x.as_bool()),
         scale: obj
             .get("scale")
             .and_then(|x| x.as_f64())
@@ -561,6 +563,9 @@ impl MessageHandler for Coordinator {
                 Some(d) => {
                     if let Some(free) = d.caret_free {
                         self.set_caret_independent(free);
+                    }
+                    if let Some(trusted) = d.caret_trusted {
+                        self.set_host_caret_trusted(trusted);
                     }
                     // wind-ui 只在 desktop-ui（桌面形态）下才是依赖；headless / Android 没有它
                     #[cfg(all(feature = "desktop-ui", not(windows), not(target_os = "macos")))]
@@ -4498,9 +4503,18 @@ mod ext_envelope_tests {
     fn decode_ext_host_display_fields_are_independent() {
         let d = |b: &[u8]| decode_ext_host_display(b);
         assert_eq!(
+            d(br#"{"caret_trusted":true}"#),
+            Some(HostDisplay {
+                caret_free: None,
+                caret_trusted: Some(true),
+                scale: None
+            })
+        );
+        assert_eq!(
             d(br#"{"caret_free":true,"scale":1.5}"#),
             Some(HostDisplay {
                 caret_free: Some(true),
+                caret_trusted: None,
                 scale: Some(1.5)
             })
         );
@@ -4509,6 +4523,7 @@ mod ext_envelope_tests {
             d(br#"{"scale":2}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: Some(2.0)
             })
         );
@@ -4516,6 +4531,7 @@ mod ext_envelope_tests {
             d(b"{}"),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: None
             })
         );
@@ -4524,6 +4540,7 @@ mod ext_envelope_tests {
             d(br#"{"caret_free":1,"scale":1.25}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: Some(1.25)
             })
         );
@@ -4531,6 +4548,7 @@ mod ext_envelope_tests {
             d(br#"{"caret_free":false,"scale":"2"}"#),
             Some(HostDisplay {
                 caret_free: Some(false),
+                caret_trusted: None,
                 scale: None
             })
         );
@@ -4539,6 +4557,7 @@ mod ext_envelope_tests {
             d(br#"{"scale":0}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: None
             })
         );
@@ -4546,6 +4565,7 @@ mod ext_envelope_tests {
             d(br#"{"scale":-1}"#),
             Some(HostDisplay {
                 caret_free: None,
+                caret_trusted: None,
                 scale: None
             })
         );

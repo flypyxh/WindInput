@@ -1545,6 +1545,9 @@ pub struct Coordinator {
     /// 合成坐标去骗过闸门（Android 一度就是这么做的，`height` 写 0 还会被判为「宿主
     /// 尚未 reflow」整帧丢弃，候选一次都不下发）。
     caret_independent: std::sync::atomic::AtomicBool,
+    /// 宿主报的光标坐标可直接当权威用（Linux addon：来自应用自己上报的光标矩形，没有 Windows
+    /// 那种跨窗口 Win32 光标冒充插入点的问题，但来源字段恒为 UNKNOWN）。见 `host.display`。
+    host_caret_trusted: std::sync::atomic::AtomicBool,
     /// 启动时预热全部已装方案（桌面默认开；移动端关，见构造里的说明）
     pub(crate) eager_prewarm: std::sync::atomic::AtomicBool,
     /// 0=Idle 1=Preparing 2=Ready 3=Failed（见 [`Coordinator::readiness`]）
@@ -2383,6 +2386,12 @@ impl Coordinator {
             .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 声明宿主报的光标坐标可直接当权威（见字段 `host_caret_trusted`）。
+    pub fn set_host_caret_trusted(&self, value: bool) {
+        self.host_caret_trusted
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn build(
         config: Config,
         data_dir: Option<&Path>,
@@ -2821,6 +2830,7 @@ impl Coordinator {
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             caret_independent: std::sync::atomic::AtomicBool::new(false),
+            host_caret_trusted: std::sync::atomic::AtomicBool::new(false),
             eager_prewarm: std::sync::atomic::AtomicBool::new(true),
             readiness_state: std::sync::atomic::AtomicU8::new(0),
             pending_first_show: Mutex::new(false),
@@ -8037,7 +8047,18 @@ impl Coordinator {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.caret_source
         };
-        if wind_ipc::protocol::caret_source::is_tsf(source) {
+        // 不需要等 TSF 坐标的两种宿主，直接显示：
+        // - 宿主自己摆窗口（`caret_independent`，Wayland 的 input popup 由合成器按光标摆）：
+        //   坐标根本不用，等它只会永远等不到；
+        // - 宿主声明光标可信（`host_caret_trusted`，Linux addon）：来源恒为 UNKNOWN（没有 TSF
+        //   语义域），按 TSF 判就永远挂起，「焦点变化时显示」在 Linux 上从不出现。
+        let host_caret_trusted = self
+            .caret_independent
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .host_caret_trusted
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if host_caret_trusted || wind_ipc::protocol::caret_source::is_tsf(source) {
             self.pending_focus_tip
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.show_tip(&self.status_indicator_text());
@@ -11086,6 +11107,28 @@ mod caret_compat_tests {
         st.caret_y = y;
         st.caret_height = 25;
         st.caret_source = source;
+    }
+
+    /// 宿主自己摆窗口（Wayland input popup，`caret_independent`）时，坐标来源不是 TSF 也直接弹：
+    /// 坐标根本不用，等权威坐标只会永远等不到（Wayland 上「焦点变化时显示」曾因此从不出现）。
+    #[test]
+    fn focus_tip_shows_without_tsf_caret_when_host_places_window() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 0, 0, wind_ipc::protocol::caret_source::UNKNOWN);
+        c.set_caret_independent(true);
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx), "caret_independent 宿主不该挂起等坐标");
+    }
+
+    /// 宿主声明光标可信（Linux addon）时，来源 UNKNOWN 也直接弹（Linux 上「焦点变化时显示」
+    /// 曾因此从不出现）。对照：没声明的普通宿主仍挂起，见 `focus_tip_defers_when_caret_source_is_not_tsf`。
+    #[test]
+    fn focus_tip_shows_for_trusted_host_caret() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 100, 200, wind_ipc::protocol::caret_source::UNKNOWN);
+        c.set_host_caret_trusted(true);
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx), "宿主声明光标可信时不该挂起");
     }
 
     /// 两个不同宿主的 client_token。用具名常量而非字面量，是因为下面「同宿主不重复弹」

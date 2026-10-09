@@ -11,11 +11,9 @@ name: Release
 #   build-windows  → windows-2022 原生 MSVC,产 Setup.exe + Portable.zip
 #   build-macos    → macos-14,产通用二进制(arm64+x86_64) .pkg
 #   build-linux    → 调 linux-build.yml:ubuntu-22.04 / 22.04-arm 原生 runner 各产一个 .deb。
-#                    Linux 仍是测试版,**不阻塞**发布:publish 不依赖它(见 attach-linux 的注释)。
-#                    想先单独发 Linux 包 / Linux 失败后补包:release-linux.yml(手动触发,填本 tag)。
-#   publish        → 汇总 Windows / macOS artifact,建**一个**草稿 Release
-#   attach-linux   → publish 之后,两个架构的 .deb 都构建成功才挂到该草稿上;失败不影响草稿,
-#                    发布前核对 Release 页是否带 .deb 即可
+#                    与 Windows / macOS 同等对待:**任一平台失败都不建草稿**,三平台同版同发。
+#                    想先单独发 Linux 包 / 补包:release-linux.yml(手动触发,填本 tag)。
+#   publish        → 汇总三个平台的 artifact,建**一个**草稿 Release
 #
 # ⚠️ 创建 Release 必须收口到单个 job。softprops/action-gh-release 是「先查是否存在、
 #   不存在则创建」,两个 build job 各自调它就是标准的 TOCTOU —— 并发下会建出两个草稿,
@@ -335,7 +333,11 @@ jobs:
   # ───────────────────────── 汇总发布 ─────────────────────────
   publish:
     name: 创建草稿 Release
-    needs: [prep, build-windows, build-macos]
+    # Linux 与另两个平台一样是硬依赖:曾经让它不阻塞、发布后再单独挂包,结果是 Linux 一挂
+    # 草稿照样只带 Windows / macOS,全靠人记得核对。依赖它之后,Linux 失败 → 不建草稿 →
+    # 「Re-run failed jobs」会连同 publish 一起跑**第一次**,不存在覆盖已签名产物 / 人工改过
+    # 的正文的问题(那只在 publish 已经成功过之后重跑才会发生)。
+    needs: [prep, build-windows, build-macos, build-linux]
     if: github.ref_type == 'tag'
     # 与 release-linux.yml 的 attach 共用一个组(先查后建 Release 是 TOCTOU)
     concurrency:
@@ -351,7 +353,6 @@ jobs:
         with:
           fetch-depth: 0       # gen-release-notes.sh 要按历史拓扑找上一个 tag
 
-      # 按名字取而不是 `dist-*`:dist-linux-* 由下面的 attach-linux 单独挂,不能被这里一并传上去。
       - name: 下载 Windows 产物
         uses: actions/download-artifact@v8
         with:
@@ -362,8 +363,18 @@ jobs:
         with:
           name: dist-macos
           path: dist
+      # 没配 WIND_REPOS_TOKEN 的 fork 不构建 Linux(built=false),那时没有这些 artifact
+      - name: 下载 Linux 产物
+        if: needs.build-linux.outputs.built == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-linux-*
+          merge-multiple: true
+          path: dist
 
       - name: 核对产物齐全
+        env:
+          LINUX_BUILT: ${{ needs.build-linux.outputs.built }}
         run: |
           ls -lh dist
           # 少了任何一个都说明某个 build job 悄悄产出了空目录 —— 与其发一个缺平台的
@@ -372,6 +383,14 @@ jobs:
             # shellcheck disable=SC2086
             ls dist/$pat >/dev/null 2>&1 || { echo "缺产物: $pat" >&2; exit 1; }
           done
+          # Linux 两个架构都要(release-published 也是两个都在才同步 R2,只来一个等于没发)
+          if [ "$LINUX_BUILT" = "true" ]; then
+            for a in amd64 arm64; do
+              [ -f "dist/WindInput-${BUILD_VERSION}-linux-${a}.deb" ] || { echo "缺产物: linux-${a}.deb" >&2; exit 1; }
+            done
+          else
+            echo "::warning::本次没有构建 Linux 安装包(未配置 WIND_REPOS_TOKEN),草稿里不会有 .deb。"
+          fi
 
       # Windows 产物在 CI 上【必然未签名】—— 云签名的会话要做二次验证、只活 2 小时、
       # 还需要一个本地客户端进程,托管 runner 上做不到。详见 docs/design/code-signing.md。
@@ -428,35 +447,3 @@ jobs:
           # 与 wind-setting src/update/notes.rs(→ 应用内升级提示),保持"暂未填写"占位则两边都跳过。
           body_path: release_notes.md
           files: dist/*
-
-  # ───────────────────────── 挂 Linux 包 ─────────────────────────
-  # 单独成 job、排在 publish 之后,而不让 publish 依赖 build-linux,原因:
-  #   - Linux 失败时整个 run 是红的,维护者会点「Re-run failed jobs」;若 publish 依赖 build-linux,
-  #     重跑会把 publish 一起重跑,用 CI 里未签名的 exe 覆盖 sign-draft 传上去的签名版、并覆盖人工改过的正文。
-  #     现在重跑只会重跑 build-linux 与本 job,publish 在它们上游、不受牵连。
-  #   - 两个架构齐全才挂(只坏一个时不留孤儿包,release-published 也要求两个都在才同步 R2)。
-  attach-linux:
-    name: 挂 Linux 安装包
-    needs: [prep, publish, build-linux]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.publish.result == 'success' && needs.build-linux.result == 'success' && needs.build-linux.outputs.built == 'true' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    concurrency:
-      group: release-${{ github.ref_name }}
-      cancel-in-progress: false
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      BUILD_VERSION: ${{ needs.prep.outputs.version }}
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: dist-linux-*
-          merge-multiple: true
-          path: dist
-      - name: 核对两个架构都在并上传
-        run: |
-          for a in amd64 arm64; do
-            [ -f "dist/WindInput-${BUILD_VERSION}-linux-${a}.deb" ] || { echo "缺产物: linux-${a}.deb" >&2; exit 1; }
-          done
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*
