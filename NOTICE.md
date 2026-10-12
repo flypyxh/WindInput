@@ -48,7 +48,10 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 - **仓库**: https://github.com/gaboolic/rime-frost
 - **许可证**: GPL-3.0
 - **使用的文件**: `rime_frost.dict.yaml`、`cn_dicts/`（8105 / 41448 / base /
-  ext / others / corrections / tencent）、`en_dicts/`（en / en_ext）
+  ext / others / corrections / tencent）、`en_dicts/`（en / en_ext）、`cn_dicts_cell/` 中的 16 张
+  小型细胞词库（作扩展词库随包，出厂关，清单见 `scripts/dev.sh` 的 `FROST_CELLS`）、
+  `opencc/emoji.txt` 与 `opencc/others.txt`（emoji 附加模块；`others.txt` 构建期按分组剔除
+  `FROST_OTHERS_EXCLUDE` 所列的组后分发）
 - **另用于**: 笔画输入方案词库的权重（取 `cn_dicts/8105`、`41448` 的单字字频，见 rime-stroke 条目）
 
 #### pinyin-data

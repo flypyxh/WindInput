@@ -34,7 +34,7 @@
 - 相关日志文件
   - Windows 安装版：`%LOCALAPPDATA%\WindInput\logs\`
   - Windows 便携版：`<程序目录>\localdata\logs\`
-  - macOS：`~/Library/Logs/WindInput/`
+  - macOS：`~/Library/Application Support/WindInput/logs/`
 
 ## 功能建议
 

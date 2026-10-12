@@ -452,6 +452,15 @@ download_dicts() {
     download_file "$FROST_BASE/cn_dicts/others.dict.yaml"         "$rime_frost_cn/others.dict.yaml"         "容错词"
     download_file "$FROST_BASE/cn_dicts/corrections.dict.yaml"    "$rime_frost_cn/corrections.dict.yaml"    "错音词"
     download_file "$FROST_BASE/cn_dicts/tencent.dict.yaml"        "$rime_frost_cn/tencent.dict.yaml"        "腾讯词频 ~17MB"
+    # emoji / 符号表：emoji 附加模块的数据源（wind-config 的 EMOJI_MODULES，出厂只开 emoji）
+    mkdir -p "$rime_frost/opencc"
+    download_file "$FROST_BASE/opencc/emoji.txt"  "$rime_frost/opencc/emoji.txt"  "emoji 表"
+    download_file "$FROST_BASE/opencc/others.txt" "$rime_frost/opencc/others.txt" "符号 / 杂项表"
+    local cell
+    mkdir -p "$rime_frost/cn_dicts_cell"
+    for cell in $FROST_CELLS; do
+        download_file "$FROST_BASE/cn_dicts_cell/$cell.dict.yaml" "$rime_frost/cn_dicts_cell/$cell.dict.yaml" "扩展词库"
+    done
 
     gray "rime-frost (英文):"
     download_file "$FROST_BASE/en_dicts/en.dict.yaml"     "$rime_frost_en/en.dict.yaml"     "主词库"
@@ -541,6 +550,61 @@ download_dicts() {
     download_file "$EMOJI_BASE/LICENSE"                   "$rime_emoji/LICENSE"                   "LGPL-3.0"
 }
 
+# 随包附带的 rime-frost 细胞词库（上游 cn_dicts_cell/ 下的文件名，组装到 schemas/pinyin/ext/）。
+# 只挑体积小、开了对主库排序几乎无影响的（共约 3.6MB，见 docs/design/schema-dict-discovery.md §8）。
+# ⚠ 与 dev.ps1 的 $FrostCells、mac/dev.sh 的 FROST_CELLS、data/schemas/{pinyin,shuangpin}.schema.toml
+#   里的 cell_* 词库声明同步。
+FROST_CELLS="exthot idiom place history name name2 sport geography animal computer music media industry_product inputmethod chess chess2"
+
+# rime-frost others.txt 里不随包的分组（按分组标题整组剔除）。「著名表演艺术家」是成人影星的
+# 中日文名对照，即便模块默认关也不该进安装包。
+# ⚠ 与 dev.ps1 的 $FrostOthersExclude、mac/dev.sh 的同名变量同步。
+FROST_OTHERS_EXCLUDE="著名表演艺术家"
+
+# 按分组标题过滤 rime-frost 的 OpenCC 杂项表：$1 源，$2 目标。标题行形如
+# `----------偏旁部首<Tab>----------`（OpenCC 无注释语法，rime-frost 借假词条写标题），
+# 被剔除的组从其标题到下一个标题整段去掉；其余行原样保留（运行时按分组取，见 emojidict::select_sections）。
+strip_frost_sections() {
+    awk -v excl="$FROST_OTHERS_EXCLUDE" '
+        BEGIN { n = split(excl, ex, " ") }
+        /^----------[^\t]*\t-+[ \t]*$/ {
+            name = $0; sub(/^-+/, "", name); sub(/\t.*$/, "", name)
+            skip = 0
+            for (i = 1; i <= n; i++) if (name == ex[i]) skip = 1
+        }
+        !skip { print }
+    ' "$1" > "$2"
+}
+
+# 把 rime 主表 import_tables 里**没随包**的子表、以及全部 cn_dicts_cell/ 细胞词库注释掉（就地改写）。
+#
+# 上游 rime_frost.dict.yaml 默认导入 GB18030-2022 与 23 张细胞词库：
+# - 没随包的：原样带着的话每次加载都对缺的那些 warn 一遍。
+# - 细胞词库：一律裁掉，哪怕随包附带了。它们作为扩展词库由方案单独开关；留在主表里就成了
+#   主库的一部分、关不掉。随包的组装在 ext/ 而非 cn_dicts_cell/，按下面的存在判据本也会裁，
+#   这里单列是为了标对来源（[扩展词库] 而非 [未随包]）。
+# 其余子表的判据是「输出目录里有没有这个文件」而不是写死名单：以后多发几张不用回来改这里。
+# ⚠ dev.ps1 的 Remove-UnshippedImports、mac/dev.sh 的 strip_unshipped_imports 是同一件事，改一边要同步另外两边。
+strip_unshipped_imports() {
+    local main="$1" dir
+    dir="$(dirname "$main")"
+    awk -v dir="$dir" '
+        /^\.\.\.[[:space:]]*$/ { done = 1 }
+        !done && /^import_tables:/ { inblk = 1; print; next }
+        !done && inblk && /^[^[:space:]#-]/ { inblk = 0 }
+        !done && inblk && match($0, /^[[:space:]]*-[[:space:]]*[^[:space:]#]+/) {
+            entry = substr($0, RSTART, RLENGTH); sub(/^[[:space:]]*-[[:space:]]*/, "", entry)
+            if (entry ~ /^cn_dicts_cell\//) {
+                print "  # [扩展词库] " substr($0, RSTART + RLENGTH - length(entry)); next
+            }
+            if (system("test -f \"" dir "/" entry ".dict.yaml\"") != 0) {
+                print "  # [未随包] " substr($0, RSTART + RLENGTH - length(entry)); next
+            }
+        }
+        { print }
+    ' "$main" > "$main.tmp" && mv -f "$main.tmp" "$main"
+}
+
 # 从 data/（源）+ .cache/（下载/生成）组装完整运行时数据到 $outdir/data/
 assemble_data() {
     local outdir="${1:-$BUILD_DEV_DIR}"
@@ -580,6 +644,12 @@ assemble_data() {
                  others.dict.yaml corrections.dict.yaml; do
             [ -f "$rime_frost/cn_dicts/$f" ] && cp -f "$rime_frost/cn_dicts/$f" "$pinyin_cn/"
         done
+        # 细胞词库放主词库目录的 ext/（扩展词库的默认发现目录），不沿用上游的 cn_dicts_cell/
+        mkdir -p "$pinyin/ext"
+        for f in $FROST_CELLS; do
+            [ -f "$rime_frost/cn_dicts_cell/$f.dict.yaml" ] && cp -f "$rime_frost/cn_dicts_cell/$f.dict.yaml" "$pinyin/ext/"
+        done
+        strip_unshipped_imports "$pinyin/rime_frost.dict.yaml"
     else
         warn "缺 .cache/rime-frost/，拼音词库不可用（运行 gen-data 下载）"
     fi
@@ -667,6 +737,17 @@ assemble_data() {
         fi
     else
         warn "缺 .cache/rime-emoji/，emoji 扩展不可用（运行 gen-data 下载）"
+    fi
+
+    # 8b. rime-frost 的 emoji / 符号表（emoji 附加模块）。GPL-3.0，与上面的拼音词库同源同许可。
+    # others.txt 剔除不随包的分组（FROST_OTHERS_EXCLUDE），其余分组运行时按模块取。
+    if [ -f "$rime_frost/opencc/emoji.txt" ]; then
+        mkdir -p "$data/emoji"
+        cp -f "$rime_frost/opencc/emoji.txt" "$data/emoji/frost_emoji.txt"
+        [ -f "$rime_frost/opencc/others.txt" ] \
+            && strip_frost_sections "$rime_frost/opencc/others.txt" "$data/emoji/frost_others.txt"
+    else
+        warn "缺 .cache/rime-frost/opencc/，白霜 emoji 模块不可用（运行 gen-data 下载）"
     fi
 
     gray "data/ 组装完成 ($(find "$data" -type f | wc -l) 文件)"

@@ -155,6 +155,12 @@ pub trait ImeController: Send + Sync {
     ///
     /// `s2t` = 简入繁出，`t2s` = 繁入简出；两者互斥，开一个自动关另一个。
     fn toggle(&self, target: &str) -> anyhow::Result<()>;
+    /// 把开关设为指定状态（`ime.set`）；**已是该状态时不动作**。与 `toggle` 的分别：短语 /
+    /// 绑键要表达「确保打开」时，toggle 只能赌当前是关的。默认不支持（宿主按需覆盖）。
+    fn set(&self, target: &str, on: bool) -> anyhow::Result<()> {
+        let _ = on;
+        anyhow::bail!("ime.set 不支持 target {target:?}")
+    }
     /// 打开设置窗口的指定页面。`page` 为规范页 id（schema/input/keys/ui/dict/
     /// advanced/about），空串打开默认页。未知 id 由设置端忽略并落到默认页。
     ///

@@ -214,6 +214,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.available", StrList),
     f("schema.primary_codetable", Str),
     f("schema.primary_pinyin", Str),
+    f("schema.keep_all_loaded", Bool),
     // 全局码表（公共基线；方案经 schema_overrides 覆盖）
     f("schema.codetable.top_code_commit", Bool),
     f("schema.codetable.clear_on_empty_max", Bool),
@@ -368,6 +369,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.block_commit_on_pinyin_word", Bool),
     f("schema.mix.pinyin_word_min_weight", Int),
     f("schema.mix.enable_pinyin_abbrev", Bool),
+    f("schema.mix.pinyin_code_hint", Bool),
     f("schema.mix.pinyin_partial_candidates", Bool),
     f("schema.mix.pinyin_partial_candidates_overflow", Bool),
     // 快捷输入：各候选来源的开关与优先级在 schema.mix_modes 的 members 里（有无=开关，
@@ -439,6 +441,10 @@ static REGISTRY: &[ConfigField] = &[
         "input.temp_english.shift_behavior",
         Enum(&["temp_english", "direct_commit"]),
     ),
+    f(
+        "input.temp_english.shift_when_composing",
+        Enum(&["buffer", "commit_enter"]),
+    ),
     f("input.temp_english.trigger_keys", StrList),
     f("input.temp_english.allow_symbols", Bool),
     f("input.temp_english.symbol_chars", Str),
@@ -504,6 +510,9 @@ static REGISTRY: &[ConfigField] = &[
     f("input.emoji.max_hosts", Int),
     f("input.emoji.min_word_chars", Int),
     f("input.emoji.categories", Bool),
+    // 附加模块开关（id → bool）。键由内置注册表与用户放进 `emoji/` 的文件共同决定，不是
+    // 固定集合，故整体登记为 Map；设置端由对话框整体读写。
+    f("input.emoji.modules", Map(&[])),
     f("input.url.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
     f("input.email.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
     f("input.unicode.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
@@ -533,6 +542,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.association.mode", Enum(&["one_shot", "continuous"])),
     f("input.association.max_count", Int),
     f("input.association.space_commits", Bool),
+    f("input.association.select_keys_commit", Bool),
     f("input.association.enter_cancels_only", Bool),
     f("input.association.backspace_cancels_only", Bool),
     f("input.association.hide_after_ms", Int),
@@ -1427,6 +1437,19 @@ mod tests {
         let l1 = crate::Config::default().ui.candidate.comment_enabled;
         assert!(l1, "ui.candidate.comment_enabled 出厂应为 true");
         assert_eq!(l2_bool("candidate", "comment_enabled"), l1);
+    }
+
+    /// L1↔L2 同源：方案常驻策略（出厂关，设计 memory-footprint.md §9 D1）。
+    #[test]
+    fn keep_all_loaded_l1_matches_l2() {
+        let l1 = crate::Config::default().schema.keep_all_loaded;
+        assert!(!l1, "schema.keep_all_loaded 出厂应为 false");
+        let l2 = data_config_toml()
+            .get("schema")
+            .and_then(|t| t.get("keep_all_loaded"))
+            .and_then(toml::Value::as_bool)
+            .expect("data/config.toml 缺少布尔键 schema.keep_all_loaded");
+        assert_eq!(l2, l1);
     }
 
     /// 解析仓库内系统预置 `data/config.toml`。

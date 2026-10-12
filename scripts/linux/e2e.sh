@@ -151,9 +151,10 @@ cat >"$W/clipboard.last"
 XCLIP
 chmod +x "$W/fakebin/xclip"
 
-# fcitx5 配置：输入法组里只放本引擎（Fcitx5 把组里第一个当「非激活态」输入法，只有一个
-# 就恒为它，省掉触发键激活这一步）；清空 AltTriggerKeys——出厂是 Shift_L，会在我们之前把
-# Shift 单击截走，「Shift 切中英」永远到不了服务。
+# fcitx5 配置：与真实用户一致——输入法组是「键盘 + 清风」两个，Fcitx5 出厂的 AltTriggerKeys
+# （Shift_L）原样保留。出厂它会在引擎之前把 Shift 单击截走，由 addon 在 PreInputMethod 阶段先接管
+# （见 WindEngine 的 Shift 接管）；这里不清空它，「Shift 切中英」用例就是对这条的回归。
+# ActiveByDefault：新输入上下文直接处于激活态（否则每个上下文都要先发触发键）。
 cat >"$W/fcitx/profile" <<'EOF'
 [Groups/0]
 Name=Default
@@ -161,6 +162,10 @@ Default Layout=us
 DefaultIM=windinput
 
 [Groups/0/Items/0]
+Name=keyboard-us
+Layout=
+
+[Groups/0/Items/1]
 Name=windinput
 Layout=
 
@@ -173,13 +178,12 @@ EnumerateWithTriggerKeys=True
 
 [Hotkey/TriggerKeys]
 
-[Hotkey/AltTriggerKeys]
-
 [Hotkey/ActivateKeys]
 
 [Hotkey/DeactivateKeys]
 
 [Behavior]
+ActiveByDefault=True
 ShareInputState=No
 EOF
 

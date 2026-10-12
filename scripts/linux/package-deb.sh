@@ -24,7 +24,6 @@
 #   /usr/share/icons/hicolor/{64x64,256x256}/apps/windinput.png
 #   /usr/lib/<multiarch>/fcitx5/libwindinput.so           Fcitx5 addon
 #   /usr/share/fcitx5/{addon,inputmethod}/windinput.conf  addon / 输入法描述
-#   /usr/bin/windinput-setup                              一次性配置当前用户的 Fcitx5
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

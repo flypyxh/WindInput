@@ -453,6 +453,14 @@ function Download-Dicts {
     Get-Dict "$frostBase/cn_dicts/others.dict.yaml"      "$rimeFrostCn\others.dict.yaml"        "容错词"       | Out-Null
     Get-Dict "$frostBase/cn_dicts/corrections.dict.yaml" "$rimeFrostCn\corrections.dict.yaml"   "错音词"       | Out-Null
     Get-Dict "$frostBase/cn_dicts/tencent.dict.yaml"     "$rimeFrostCn\tencent.dict.yaml"       "腾讯词频"     | Out-Null
+    # emoji / 符号表: emoji 附加模块的数据源 (wind-config 的 EMOJI_MODULES, 出厂只开 emoji)
+    New-Item -ItemType Directory -Path "$rimeFrost\opencc" -Force | Out-Null
+    Get-Dict "$frostBase/opencc/emoji.txt"  "$rimeFrost\opencc\emoji.txt"  "emoji 表"        | Out-Null
+    Get-Dict "$frostBase/opencc/others.txt" "$rimeFrost\opencc\others.txt" "符号 / 杂项表"   | Out-Null
+    New-Item -ItemType Directory -Path "$rimeFrost\cn_dicts_cell" -Force | Out-Null
+    foreach ($c in $FrostCells) {
+        Get-Dict "$frostBase/cn_dicts_cell/$c.dict.yaml" "$rimeFrost\cn_dicts_cell\$c.dict.yaml" "扩展词库" | Out-Null
+    }
 
     Gray "rime-frost (英文):"
     Get-Dict "$frostBase/en_dicts/en.dict.yaml"     "$rimeFrostEn\en.dict.yaml"     "主词库" | Out-Null
@@ -540,6 +548,51 @@ function Download-Dicts {
     return $true
 }
 
+# 随包附带的 rime-frost 细胞词库。清单与理由见 dev.sh 的 FROST_CELLS（几处要同步）。
+$FrostCells = @('exthot', 'idiom', 'place', 'history', 'name', 'name2', 'sport', 'geography', 'animal',
+                'computer', 'music', 'media', 'industry_product', 'inputmethod', 'chess', 'chess2')
+
+# rime-frost others.txt 里不随包的分组。理由与清单见 dev.sh 的 FROST_OTHERS_EXCLUDE（几处要同步）。
+$FrostOthersExclude = @('著名表演艺术家')
+
+# 按分组标题过滤 rime-frost 的 OpenCC 杂项表 (同 dev.sh 的 strip_frost_sections):
+# 被剔除的组从其标题到下一个标题整段去掉, 其余行原样保留。按 LF 切行、按 LF 拼回。
+function Copy-FrostOthers ([string]$src, [string]$dst) {
+    $lines = [IO.File]::ReadAllText($src, [Text.UTF8Encoding]::new($false)) -split "`n"
+    $skip = $false
+    $out = foreach ($l in $lines) {
+        if ($l -match '^-{10}([^\t]*)\t-+\s*$') { $skip = $FrostOthersExclude -contains $Matches[1].TrimStart('-') }
+        if (-not $skip) { $l }
+    }
+    [IO.File]::WriteAllText($dst, ($out -join "`n"), [Text.UTF8Encoding]::new($false))
+}
+
+# 把 rime 主表 import_tables 里**没随包**的子表、以及全部 cn_dicts_cell/ 细胞词库注释掉（就地改写）。
+# 理由见 dev.sh 的 strip_unshipped_imports（同一件事，改一边要同步另外两边）：
+# 免去缺失子表的 warn；细胞词库作为扩展词库单独开关，留在主表里就关不掉。其余子表的判据是
+# 输出目录里有没有这个文件，不写死名单。
+# 按 LF 切行、按 LF 拼回，原文件的换行与编码（UTF-8 无 BOM）保持不变。
+function Remove-UnshippedImports ([string]$main) {
+    $dir = Split-Path $main -Parent
+    $lines = [IO.File]::ReadAllText($main, [Text.UTF8Encoding]::new($false)) -split "`n"
+    $inBlock = $false; $done = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $l = $lines[$i]
+        if ($l -match '^\.\.\.\s*$') { $done = $true }
+        if ($done) { continue }
+        if ($l -match '^import_tables:') { $inBlock = $true; continue }
+        if ($inBlock -and $l -match '^[^\s#-]') { $inBlock = $false }
+        if ($inBlock -and $l -match '^\s*-\s*([^\s#]+)(.*)$') {
+            if ($Matches[1].StartsWith('cn_dicts_cell/')) {
+                $lines[$i] = "  # [扩展词库] $($Matches[1])$($Matches[2])"
+            } elseif (-not (Test-Path (Join-Path $dir "$($Matches[1]).dict.yaml"))) {
+                $lines[$i] = "  # [未随包] $($Matches[1])$($Matches[2])"
+            }
+        }
+    }
+    [IO.File]::WriteAllText($main, ($lines -join "`n"), [Text.UTF8Encoding]::new($false))
+}
+
 # 从 data/(源) + .cache/(下载/生成) 组装完整运行时数据到 $outdir\data\
 function Assemble-Data ([string]$outdir = $BuildDevDir) {
     $data      = "$outdir\data"
@@ -575,6 +628,12 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
         foreach ($f in @("8105.dict.yaml", "41448.dict.yaml", "base.dict.yaml", "ext.dict.yaml", "others.dict.yaml", "corrections.dict.yaml")) {
             if (Test-Path "$rimeFrost\cn_dicts\$f") { Copy-Item "$rimeFrost\cn_dicts\$f" $pinyinCn -Force }
         }
+        # 细胞词库放主词库目录的 ext\（扩展词库的默认发现目录），不沿用上游的 cn_dicts_cell\
+        New-Item -ItemType Directory -Path "$pinyin\ext" -Force | Out-Null
+        foreach ($c in $FrostCells) {
+            if (Test-Path "$rimeFrost\cn_dicts_cell\$c.dict.yaml") { Copy-Item "$rimeFrost\cn_dicts_cell\$c.dict.yaml" "$pinyin\ext" -Force }
+        }
+        Remove-UnshippedImports "$pinyin\rime_frost.dict.yaml"
     } else { Warn "缺 .cache\rime-frost\, 拼音词库不可用 (运行 gen-data 下载)" }
 
     # 3. 英文词库
@@ -656,6 +715,16 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
             Copy-Item "$emojiCache\LICENSE" "$emojiOut\LICENSE" -Force
         } else { Warn "缺 rime-emoji LICENSE, 该数据不得分发 (重跑 gen-data)" }
     } else { Warn "缺 .cache\rime-emoji\, emoji 扩展不可用 (运行 gen-data 下载)" }
+
+    # 8b. rime-frost 的 emoji / 符号表 (emoji 附加模块)。GPL-3.0, 与拼音词库同源同许可。
+    #     others.txt 剔除不随包的分组 ($FrostOthersExclude), 其余分组运行时按模块取。
+    if (Test-Path "$rimeFrost\opencc\emoji.txt") {
+        New-Item -ItemType Directory -Path "$data\emoji" -Force | Out-Null
+        Copy-Item "$rimeFrost\opencc\emoji.txt" "$data\emoji\frost_emoji.txt" -Force
+        if (Test-Path "$rimeFrost\opencc\others.txt") {
+            Copy-FrostOthers "$rimeFrost\opencc\others.txt" "$data\emoji\frost_others.txt"
+        }
+    } else { Warn "缺 .cache\rime-frost\opencc\, 白霜 emoji 模块不可用 (运行 gen-data 下载)" }
 
     $cnt = (Get-ChildItem $data -Recurse -File).Count
     Gray "data/ 组装完成 ($cnt 文件)"

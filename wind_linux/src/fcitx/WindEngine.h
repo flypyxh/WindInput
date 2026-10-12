@@ -110,6 +110,8 @@ private:
     void onMenuFrame(uint32_t level, const OverlayFramePayload& p);
     /// 启动设置程序（`settings.open` 信封与状态区入口共用）。只启动自己的设置程序，args 只进参数位。
     void launchSettings(const std::vector<std::string>& args);
+    /// 把 Fcitx5 出厂当作「替代触发键」的 Shift 单击留给本引擎（实现处有原因）。
+    void claimShiftTap(fcitx::KeyEvent& event);
     fcitx::InputContext* focusedIC();
     /// 两种候选窗都藏起来（哪一种正显示取决于上一帧的焦点 IC，藏的时候不必区分）。
     void hideCandidate();
@@ -163,6 +165,7 @@ private:
     /// 「清风输入法设置」：挂进 Fcitx5 状态区（托盘菜单 / kimpanel 面板），点了打开设置程序。
     /// 主菜单不从这里进（组字时候选窗右键 / 候选菜单「更多…」）。
     fcitx::SimpleAction settingsAction_;
+    std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>> shiftClaim_;
     ModeIndicator mode_;
     WindConfig config_;
     KeyHoldTracker keyHolds_;

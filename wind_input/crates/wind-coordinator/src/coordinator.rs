@@ -855,8 +855,17 @@ thread_local! {
 /// 恒空，原路径拿 `ip'pro` 去查 code 前缀也必然落空 ⇒ **候选塌成只剩原文，直到重启**。
 ///
 /// 判据是「这个键有没有第二个消费者在引擎侧」，不是「它在不在 schema 段」。
+/// # 不收什么
+///
+/// - `schema.keep_all_loaded`：方案常驻策略由 `apply_residency_change` 就地对齐（摘除 /
+///   后台预热），引擎侧没有它的镜像；收进来会让「切换常驻开关」把全部引擎丢掉重建。
 pub(crate) fn engine_reload_needed(old: &Config, new: &Config) -> bool {
-    old.schema != new.schema
+    let schema_changed = {
+        let mut old_schema = old.schema.clone();
+        old_schema.keep_all_loaded = new.schema.keep_all_loaded;
+        old_schema != new.schema
+    };
+    schema_changed
         || old.input.temp_pinyin != new.input.temp_pinyin
         || old.input.temp_english != new.input.temp_english
         || old.input.reverse.lookup_disabled_dicts != new.input.reverse.lookup_disabled_dicts
@@ -1457,13 +1466,13 @@ pub struct Coordinator {
     /// ★ 功能关闭时恒为 `None` 且**数据文件根本不打开**——未启用的用户为本功能付出的
     /// 常驻内存与启动开销都是零。这是 `.wemj` 走 mmap 的同一条理由的延伸：本表按需读页，
     /// 常驻内存与库大小基本无关，但「不加载」比「加载得很省」还要省。
-    pub(crate) emoji_dict:
-        std::sync::RwLock<Option<std::sync::Arc<wind_dict::emojidict::EmojiReader>>>,
-    /// 上次生效的 emoji 加载参数 `(enabled, categories)`，`sync_emoji_dict` 的去重依据。
+    pub(crate) emoji_dict: std::sync::RwLock<Option<EmojiTables>>,
+    /// 上次生效的 emoji 加载参数 `(enabled, categories, 开着的附加模块 id)`，
+    /// `sync_emoji_dict` 的去重依据。
     ///
-    /// 只记**影响加载结果**的两项：`show_as` / `max_per_word` 这些是查询期参数，改了不必
-    /// 重建 mmap。判据写宽了会让每次 reload 都重解析一遍 4600 行词表。
-    pub(crate) emoji_spec: Mutex<Option<(bool, bool)>>,
+    /// 只记**影响加载结果**的几项：`show_as` / `max_per_word` 这些是查询期参数，改了不必
+    /// 重建 mmap。判据写宽了会让每次 reload 都重解析一遍词表。
+    pub(crate) emoji_spec: Mutex<Option<EmojiSpec>>,
     /// 「辅助码触发键被音节分隔符占用」的告警是否已发过（每方案一次，随
     /// `invalidate_aux_code_table` 复位）。见 `handle_aux_code::warn_aux_code_key_taken`。
     pub(crate) aux_code_key_warned: std::sync::atomic::AtomicBool,
@@ -1599,6 +1608,12 @@ pub struct Coordinator {
     /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
     /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
     pub(crate) first_show_was_provisional: std::sync::atomic::AtomicBool,
+    /// 本轮组合紧接在一次**上屏**之后开（Shift+字母上屏进临英）：宿主插入点必然已前移，
+    /// 兜底首显用的旧坐标是确定的陈旧值，不是「可能差一点」。置位时兜底首显**不记**
+    /// `first_show_was_provisional`，让随后到达的权威坐标按常规 3px 容差校正，
+    /// 而不是被放宽容差（≈2 个行高）当微移吞掉、候选窗留在上屏前的位置。
+    /// 由 [`Coordinator::reset_first_show`] 复位，兜底首显消费。
+    pub(crate) first_show_after_commit: std::sync::atomic::AtomicBool,
     /// 坐标缓存是否已被**当前插入点**验证过（= `state.caret_*` 还算不算数）。
     ///
     /// `fast` 档短兜底的隐含前提是「手里的旧坐标 ≈ 当前插入点」——同一行连打时它只差一个
@@ -2853,6 +2868,7 @@ impl Coordinator {
             last_key_at: Mutex::new(None),
             last_key_interval_ms: Mutex::new(None),
             first_show_was_provisional: std::sync::atomic::AtomicBool::new(false),
+            first_show_after_commit: std::sync::atomic::AtomicBool::new(false),
             caret_cache_verified: std::sync::atomic::AtomicBool::new(false),
             caret_cache_is_idle_report: std::sync::atomic::AtomicBool::new(false),
             awaiting_first_authority_after_focus: std::sync::atomic::AtomicBool::new(false),
@@ -2949,6 +2965,22 @@ impl Coordinator {
         coordinator.reload_common_chars();
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
+        // 按词查编码用户层后台建好 → 重刷当前这屏候选，把用户码补上（否则要等下一次按键）。
+        // 与 `spawn_index_warm` 建成反查索引后的重渲染同一个做法；只持 Weak。
+        {
+            let weak = Arc::downgrade(&coordinator);
+            coordinator
+                .engine_mgr
+                .set_user_text_built_hook(Arc::new(move || {
+                    let Some(c) = weak.upgrade() else {
+                        return;
+                    };
+                    let s = c.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if !s.input_buffer.is_empty() {
+                        c.notify_ui_update(&s);
+                    }
+                }));
+        }
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
         // 码元集与按键功能的冲突体检（只告警）。默认字符集下直接返回，无开销。
@@ -4324,6 +4356,8 @@ impl Coordinator {
             merge_comment_dicts(&rt.config.ui.comment_dicts, &auto)
         };
         let mut paths: Vec<(std::path::PathBuf, Vec<String>)> = Vec::new();
+        // `${dict:id}` 用：每个库被哪些 id 指到（去重合并的那条的 id 也算它的）。
+        let mut ids: Vec<(std::path::PathBuf, Vec<String>)> = Vec::new();
         for eff in specs.iter().filter(|e| e.enabled) {
             // 自动项的路径已经是解析好的绝对路径（检测时就得打开文件），手工项才需要按
             // `schemas/` 逐层解析。两者到这里汇成同一条流水线。
@@ -4341,9 +4375,15 @@ impl Coordinator {
                 // 解析到同一处），只加载一次。重复加载除了浪费解析时间，还会让优先级
                 // 判定变得依赖「第几次出现」——去重后靠前那条恒胜出。
                 Some(p) if paths.iter().any(|(q, _)| *q == p) => {
-                    info!("注释词库重复挂载，已跳过: {} (id={})", p.display(), s.id)
+                    info!("注释词库重复挂载，已跳过: {} (id={})", p.display(), s.id);
+                    if let Some((_, v)) = ids.iter_mut().find(|(q, _)| *q == p) {
+                        v.push(s.id.clone());
+                    }
                 }
-                Some(p) => paths.push((p, s.schemas.clone())),
+                Some(p) => {
+                    ids.push((p.clone(), vec![s.id.clone()]));
+                    paths.push((p, s.schemas.clone()));
+                }
                 // 只 warn 不中断：一个库路径写错不该让其余库一起不加载。
                 None => warn!(
                     "注释词库不存在（用户/安装目录均未找到）: {} (id={})",
@@ -4357,6 +4397,11 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if *cur == paths {
+            // 挂载集合没变，id 仍可能改了（只改 id 不改路径）：只刷新 id，不重挂
+            self.reverse
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_comment_ids(&ids);
             return;
         }
         // 注释库缓存与词库 .wdat **同根**：`comment_cache_path` 自己按 schemas 下的目录链分
@@ -4364,10 +4409,11 @@ impl Coordinator {
         // `EngineManager::cache_path` 同构，不再另立一层专用目录。
         // 无缓存目录（便携/测试）时传 None，注释库退化为内存加载，功能不受影响。
         let cache_dir = Config::cache_dir();
-        self.reverse
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .reload_comments(&paths, cache_dir.as_deref());
+        {
+            let mut rl = self.reverse.write().unwrap_or_else(|e| e.into_inner());
+            rl.reload_comments(&paths, cache_dir.as_deref());
+            rl.set_comment_ids(&ids);
+        }
         *cur = paths;
     }
 
@@ -4384,10 +4430,17 @@ impl Coordinator {
     /// 失败不记录 ⇒ 下次 sync 会重试，于是用户补跑 `gen-data` 后不必改配置就能生效；
     /// 重试成本只是解析一次路径后发现文件不在，可以忽略。
     pub(crate) fn sync_emoji_dict(&self) {
-        let (enabled, categories) = {
+        let (enabled, categories, modules) = {
             let rt = self.rt();
             let e = &rt.config.input.emoji;
-            (e.enabled, e.categories)
+            // 列表含用户放进 `emoji/` 的文件：扫目录发生在这里（启动 / 配置重载），
+            // 不在按键路径上。新放的文件要重载配置（或重开设置保存一次）才挂上。
+            let modules: Vec<wind_config::EmojiModuleEntry> =
+                Config::emoji_modules(Config::data_dir().as_deref())
+                    .into_iter()
+                    .filter(|m| e.module_enabled(&m.id))
+                    .collect();
+            (e.enabled, e.categories, modules)
         };
         // 值域校验放在去重之前：`scope`/`show_as` 不影响加载、不进变更判据，但配置变更
         // 时正是唯一该告警的时机。放进热路径的话每次按键都会刷一条。
@@ -4409,10 +4462,14 @@ impl Coordinator {
                 );
             }
         }
-        let spec = (enabled, categories);
+        let spec: EmojiSpec = (
+            enabled,
+            categories,
+            modules.iter().map(|m| m.id.clone()).collect(),
+        );
         {
             let cur = self.emoji_spec.lock().unwrap_or_else(|e| e.into_inner());
-            if *cur == Some(spec) {
+            if cur.as_ref() == Some(&spec) {
                 return;
             }
         }
@@ -4422,6 +4479,12 @@ impl Coordinator {
             *self.emoji_spec.lock().unwrap_or_else(|e| e.into_inner()) = Some(spec);
             info!("emoji 扩展已关闭");
             return;
+        }
+        // 一表一缓存之前是主表 + 分类表合建的一份 `emoji.wemj`，现已无人读它
+        if let Some(dir) = Config::cache_dir() {
+            for f in ["emoji.wemj", "emoji.wemj.fp"] {
+                let _ = std::fs::remove_file(dir.join("emoji").join(f));
+            }
         }
         // ★ 先放掉旧表，再重建。`categories` 翻转会改变指纹源 ⇒ `load_or_build` 要写新的
         // `.wemj` 并 rename 覆盖旧文件，而旧表此刻还被本字段的 Arc 持着 mmap——Windows 上
@@ -4433,7 +4496,7 @@ impl Coordinator {
         // 池里只存 Weak（`reader_pool` 模块文档），本字段是唯一的强引用；写锁会等正在
         // `apply_emoji_suggestions` 里的读者退出，之后旧映射即释放。
         *self.emoji_dict.write().unwrap_or_else(|e| e.into_inner()) = None;
-        let loaded = Self::load_emoji_dict(categories);
+        let loaded = Self::load_emoji_dict(categories, &modules);
         let ok = loaded.is_some();
         *self.emoji_dict.write().unwrap_or_else(|e| e.into_inner()) = loaded;
         if ok {
@@ -4441,38 +4504,105 @@ impl Coordinator {
         }
     }
 
-    /// 实际加载 emoji 表：解析路径 → 繁简归一 → 建/复用 `.wemj` 缓存 → mmap。
+    /// 实际加载 emoji 表：解析路径 → （繁简归一）→ 建/复用 `.wemj` 缓存 → mmap。
     ///
-    /// 失败一律返回 `None`（＝功能不可用），**不降级成内存表**——理由见
+    /// **一表一缓存**（`<cache>/emoji/<id>.wemj`），查询期按顺序合并（[`EmojiTables`]）：
+    /// 开关一个模块只是挂 / 不挂那张表，其余的缓存原样复用、永不因别人重建。合建一份的话，
+    /// 翻任何一个开关都要重写整份 `.wemj`，而 Windows 上覆盖被映射的文件会被拒（见
+    /// `sync_emoji_dict` 里「先放掉旧表」那段）。
+    ///
+    /// 顺序：rime-emoji 主表 → 分类表 → 附加模块（[`wind_config::EMOJI_MODULES`] 的顺序）。
+    /// 主表在前，开了附加模块的用户原有的首个 emoji 不变。
+    ///
+    /// 一张都没加载成返回 `None`（＝功能不可用），**不降级成内存表**——理由见
     /// [`wind_dict::emojidict::load_or_build`]：本功能是纯锦上添花的可选项，而「常驻内存
     /// 随功能数量累积」正是它要避开的东西。
     fn load_emoji_dict(
         categories: bool,
-    ) -> Option<std::sync::Arc<wind_dict::emojidict::EmojiReader>> {
+        modules: &[wind_config::EmojiModuleEntry],
+    ) -> Option<EmojiTables> {
         let data_dir = Config::data_dir();
         let dd = data_dir.as_deref();
-
-        let Some(word) = Config::resolve_data_file(dd, "emoji/emoji_word.txt") else {
-            warn!("emoji 词表缺失（data/emoji/emoji_word.txt），扩展不可用；运行 gen-data 下载");
+        let Some(cache_dir) = Config::cache_dir() else {
+            warn!("无缓存目录，emoji 扩展不可用");
             return None;
         };
-        let mut tables = vec![word];
-        if categories {
-            match Config::resolve_data_file(dd, "emoji/emoji_category.txt") {
-                Some(p) => tables.push(p),
-                // 分类表可缺：主表照常工作，只是打「动物」不再出一串。
-                None => warn!("emoji 分类表缺失，已按仅主表加载"),
+        let cache_of = |id: &str| cache_dir.join("emoji").join(format!("{id}.wemj"));
+        let mut readers = Vec::new();
+
+        // ── rime-emoji 主表 / 分类表：键是繁体，必须归一 ──
+        match Self::load_emoji_norm(dd) {
+            Some((norm, norm_path)) => {
+                let mut rime = vec![("word", "emoji/emoji_word.txt", true)];
+                rime.push(("category", "emoji/emoji_category.txt", categories));
+                for (id, rel, on) in rime {
+                    if !on {
+                        continue;
+                    }
+                    let Some(src) = Config::resolve_data_file(dd, rel) else {
+                        warn!(
+                            "emoji 表缺失（data/{rel}），已跳过（安装包应已附带；源码构建请跑 gen-data）"
+                        );
+                        continue;
+                    };
+                    // 归一表进 `fp_extra`：它不参与解析但决定解析结果，漏传会让 OpenCC 数据
+                    // 升级后旧缓存被永久复用（见 `cache_fp::EMOJI_TAG`）。
+                    if let Some(r) = wind_dict::emojidict::load_or_build(
+                        &[src],
+                        std::slice::from_ref(&norm_path),
+                        &cache_of(id),
+                        &[],
+                        Some(&|s: &str| norm.convert_once(s)),
+                    ) {
+                        readers.push(r);
+                    }
+                }
+            }
+            None => warn!("emoji 繁简归一表不可用，rime-emoji 主表与分类表已跳过"),
+        }
+
+        // ── 附加模块（rime-frost 与用户放置的 OpenCC 表，键是简体，不归一）──
+        for m in modules {
+            let Some(src) = Config::resolve_data_file(dd, &m.file) else {
+                warn!("emoji 模块 {} 的源文件缺失（{}），已跳过", m.id, m.file);
+                continue;
+            };
+            // 用户模块的缓存名加前缀：用户文件名任意，别和内置模块、主表的缓存撞名。
+            let cache_id = if m.user {
+                format!("user.{}", m.id)
+            } else {
+                m.id.clone()
+            };
+            if let Some(r) = wind_dict::emojidict::load_or_build(
+                &[src],
+                &[],
+                &cache_of(&cache_id),
+                &m.sections,
+                None,
+            ) {
+                readers.push(r);
             }
         }
 
-        // ★ 繁→简归一表是**必需**的，缺了不能降级成「不归一照样加载」。
-        // 上游 rime-emoji 的键全是繁体（实测 国0/國28、爱0/愛16），而本仓候选恒简体
-        // ⇒ 不归一的结果不是「差一点」，是**一条都命中不了**。那种状态下功能看着已启用、
-        // 实际完全不工作，比直接报不可用难查得多。
+        if readers.is_empty() {
+            warn!("emoji 表一张都没加载成，功能不可用");
+            return None;
+        }
+        let n: u32 = readers.iter().map(|r| r.entry_count()).sum();
+        info!("Loaded emoji dict: {} 张表 {} entries", readers.len(), n);
+        Some(EmojiTables(readers))
+    }
+
+    /// rime-emoji 的繁→简归一表。上游键全是繁体（实测 国0/國28、爱0/愛16），而本仓候选
+    /// 恒简体 ⇒ 缺了它主表与分类表**一条都命中不了**，此时宁可不挂这两张，也不挂上一张
+    /// 看着启用、实际全空的表。
+    fn load_emoji_norm(
+        dd: Option<&std::path::Path>,
+    ) -> Option<(wind_transform::s2t::Dict, std::path::PathBuf)> {
         let Some(norm_path) = Config::resolve_data_file(dd, "opencc/TSCharactersDerived.octrie")
         else {
             warn!(
-                "emoji 繁简归一表缺失（opencc/TSCharactersDerived.octrie），扩展不可用；运行 gen-data 重建"
+                "emoji 繁简归一表缺失（opencc/TSCharactersDerived.octrie）（安装包应已附带；源码构建请跑 gen-data）"
             );
             return None;
         };
@@ -4483,23 +4613,7 @@ impl Coordinator {
             warn!("emoji 归一表格式无效: {}", norm_path.display());
             None
         })?;
-
-        let Some(cache_dir) = Config::cache_dir() else {
-            warn!("无缓存目录，emoji 扩展不可用");
-            return None;
-        };
-        let cache_file = cache_dir.join("emoji").join("emoji.wemj");
-
-        // 归一表进 `fp_extra`：它不参与解析但决定解析结果，漏传会让 OpenCC 数据升级后
-        // 旧缓存被永久复用（见 `cache_fp::EMOJI_TAG`）。
-        let r = wind_dict::emojidict::load_or_build(&tables, &[norm_path], &cache_file, |s| {
-            norm.convert_once(s)
-        });
-        match &r {
-            Some(d) => info!("Loaded emoji dict: {} entries", d.entry_count()),
-            None => warn!("emoji 扩展表加载失败，功能不可用"),
-        }
-        r
+        Some((norm, norm_path))
     }
 
     /// 辅助码来源缓存失效：方案切换后置 `None`，下次进入辅助码时按新方案的
@@ -4595,6 +4709,7 @@ impl Coordinator {
                 let schema_dirty = engine_reload_needed(&old.config, &cfg);
                 // 候选窗定位方式切换的边沿检测（见下方 ReportCandidatePos）。
                 let cand_was_fixed = old.config.ui.candidate.is_fixed_position();
+                let was_keep_all = old.config.schema.keep_all_loaded;
                 drop(old);
 
                 let keys = schema_key_union(&self.engine_mgr);
@@ -4666,6 +4781,12 @@ impl Coordinator {
                             .name("reload-prewarm".into())
                             .spawn(move || {
                                 if let Some(c) = weak.upgrade() {
+                                    // 重建只建回了当前方案：按常驻策略把常驻集合（全部方案，
+                                    // 或临拼目标 / 英文）补回来，否则「切换零等待」要到重启才恢复。
+                                    // 宿主声明按需加载（移动端）时与启动同样不建。
+                                    if c.eager_prewarm.load(std::sync::atomic::Ordering::Relaxed) {
+                                        c.prewarm_schemas_on_start();
+                                    }
                                     c.prewarm_indexes();
                                 }
                             });
@@ -4674,6 +4795,8 @@ impl Coordinator {
                 // 按需数据随配置收放（拆字表、用户层编码索引、简繁表），两个分支都要：
                 // 注释模板 / 悬停段 / 编码来源档都不会把 schema 标脏。
                 self.apply_data_needs();
+                // 方案常驻策略变了：就地摘除 / 后台预热（这个键不标脏，见 engine_reload_needed）。
+                self.apply_residency_change(was_keep_all);
                 // 同步主题选择:设置页改 config.ui.theme.* 后内存态须跟随,reload_config 才会下发新主题
                 // (此前 reload_config 只重推旧内存主题 → 设置页切主题不生效)。
                 {
@@ -6357,6 +6480,114 @@ impl Coordinator {
         let _ = self.push_server.push_commit_to_active(&encoded);
     }
 
+    /// 命令栏的数据类开关（`ime.toggle` / `ime.set` 直通，不进菜单与工具栏）：
+    /// - `emoji`：emoji 候选总开关（`input.emoji.enabled`）；
+    /// - `emoji:<模块id>`：附加模块（`input.emoji.modules.<id>`，含用户放进 `emoji/` 的文件）；
+    /// - `dict:<注释库id>`：注释词库（`[[ui.comment_dicts]]` 的 `enabled`，中英释义、拆分等）。
+    ///
+    /// `want` = 目标状态，`None` = 取反（toggle）。已是目标状态时不写盘、不重载——`ime.set`
+    /// 的语义就是「确保是这个状态」——但**照样提示**「…已是开启状态」：一点反应都没有的话，
+    /// 用户分不清是状态本就如此还是命令没被调用（维护者实测反馈）。改了则写用户配置后热重载
+    /// （emoji 表 / 注释库按新开关重挂），提示「…已开启 / 已关闭」：命令栏与短语没有别的
+    /// 反馈渠道，开了没反应和关掉了在界面上无从分辨。
+    pub(crate) fn cmd_set_feature(&self, target: &str, want: Option<bool>) -> anyhow::Result<()> {
+        let (name, on) = if target == "emoji" {
+            let cur = self.rt().config.input.emoji.enabled;
+            let on = want.unwrap_or(!cur);
+            let name = "emoji 候选".to_string();
+            if on == cur {
+                return self.notify_feature_unchanged(target, &name, on);
+            }
+            Config::set_user_value(&["input", "emoji", "enabled"], toml::Value::Boolean(on))?;
+            (name, on)
+        } else if let Some(id) = target.strip_prefix("emoji:") {
+            let module = Config::emoji_modules(Config::data_dir().as_deref())
+                .into_iter()
+                .find(|m| m.id == id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "没有 id 为 {id:?} 的 emoji 模块（见设置 → Emoji/OpenCC → 附加模块）"
+                    )
+                })?;
+            let cur = self.rt().config.input.emoji.module_enabled(id);
+            let on = want.unwrap_or(!cur);
+            let name = format!("emoji 模块「{}」", module.label);
+            if on == cur {
+                return self.notify_feature_unchanged(target, &name, on);
+            }
+            Config::set_user_value(&["input", "emoji", "modules", id], toml::Value::Boolean(on))?;
+            (name, on)
+        } else if let Some(id) = target.strip_prefix("dict:") {
+            let configured = self.rt().config.ui.comment_dicts.clone();
+            let auto: Vec<String> = self
+                .auto_comment_sources()
+                .into_iter()
+                .map(|a| a.id)
+                .collect();
+            let name = format!("注释词库「{id}」");
+            let Some((list, on)) =
+                crate::handle_cmdbar::set_comment_dict(&configured, &auto, id, want)?
+            else {
+                // 只有指定了状态才可能「已一致」（取反恒有变化），故 want 必为 Some
+                return self.notify_feature_unchanged(target, &name, want.unwrap_or(true));
+            };
+            Config::set_user_value(&["ui", "comment_dicts"], toml::Value::try_from(&list)?)?;
+            (name, on)
+        } else {
+            anyhow::bail!("不认识的数据开关 {target:?}");
+        };
+        self.reload_user_config();
+        let text = format!("{name}已{}", if on { "开启" } else { "关闭" });
+        if let Err(e) = self.ui_toast(&text, "info", "", "center", 1500) {
+            warn!("数据开关的提示弹不出来: {e}");
+        }
+        info!("数据开关 {target}: {text}");
+        Ok(())
+    }
+
+    /// `ime.set` 遇到状态本就一致：不写盘不重载，只提示「…已是开启 / 关闭状态」。
+    fn notify_feature_unchanged(&self, target: &str, name: &str, on: bool) -> anyhow::Result<()> {
+        let text = format!("{name}已是{}状态", if on { "开启" } else { "关闭" });
+        self.notify_set_unchanged(target, &text);
+        Ok(())
+    }
+
+    fn notify_set_unchanged(&self, target: &str, text: &str) {
+        if let Err(e) = self.ui_toast(text, "info", "", "center", 1500) {
+            warn!("ime.set 的提示弹不出来: {e}");
+        }
+        info!("ime.set {target}: {text}（未改动）");
+    }
+
+    /// `ime.set` 的输入状态开关（`cn-en` / `fullshape` / `s2t` / `t2s` / `toolbar`）：已是目标
+    /// 状态只提示（同数据开关），否则走 `ime.toggle` 同一条切换路径——那条路径自带状态气泡
+    /// 与工具栏刷新，这里不另弹提示，免得一次切换两个浮窗。
+    ///
+    /// `cn-en` 读的是 `chinese_mode`（用户选的中英），不含 CapsLock 临时英文：`set` 回答的是
+    /// 「切到中文」，CapsLock 松开后自然回到中文。
+    pub(crate) fn cmd_set_state(&self, target: &str, on: bool) -> anyhow::Result<()> {
+        let cur = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match target {
+                "cn-en" => s.chinese_mode,
+                "fullshape" => s.full_width,
+                "s2t" => s.s2t_enabled,
+                "t2s" => s.t2s_enabled,
+                "toolbar" => s.toolbar_visible,
+                _ => anyhow::bail!(
+                    "ime.set 不支持 {target:?}：输入状态只认 cn-en / fullshape / s2t / t2s / toolbar（layout / candwin / preedit 只能 ime.toggle）"
+                ),
+            }
+        };
+        if cur == on {
+            let text = crate::handle_cmdbar::state_unchanged_text(target, on);
+            self.notify_set_unchanged(target, &text);
+            return Ok(());
+        }
+        self.cmd_ime_toggle(target);
+        Ok(())
+    }
+
     pub(crate) fn cmd_ime_toggle(&self, target: &str) {
         match target {
             "cn-en" => {
@@ -6679,7 +6910,16 @@ impl Coordinator {
         let caret_free = self
             .caret_independent
             .load(std::sync::atomic::Ordering::Relaxed);
-        if is_first_frame && !caret_free && !skip_caret_pending && !coords_ready && !idle_anchor {
+        // 上屏后开的新组合（`first_show_after_commit`）：插入点必然已前移，instant 的遗留坐标、
+        // idle_anchor 的「按键前」坐标都是上屏前的陈旧值，逃生口一律不放行，老老实实等
+        // 权威坐标（兜底超时到期时消费该标记，见 `fire_pending_first_show`）。
+        let after_commit = self
+            .first_show_after_commit
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if is_first_frame
+            && !caret_free
+            && (after_commit || (!skip_caret_pending && !coords_ready && !idle_anchor))
+        {
             // 唯一的「等」出口。与下面的放行日志成对，两条合起来即可从服务端日志判定
             // 每一帧走了哪条路、以及是哪个逃生口生效——不必再对着 TSF 日志比时间戳。
             debug!(
@@ -6740,7 +6980,8 @@ impl Coordinator {
         let scope_prefix = rt.config.input.scope_relax.prefix.as_str();
         // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
         // 受 source==Pinyin 守卫)。门控两类:
-        //  - 普通拼音/混输方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource,出厂 off);
+        //  - 普通拼音方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource,出厂 off);
+        //  - 混输方案:跟随 schema.mix.pinyin_code_hint(开关,出厂开);
         //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):跟随独立的
         //    input.temp_pinyin.code_hint_source(出厂 auto,可关),见 comment_hint_source。
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
@@ -10638,6 +10879,16 @@ mod engine_reload_needed_tests {
         assert!(engine_reload_needed(&old, &new));
     }
 
+    /// 反向对照：方案常驻策略由 `apply_residency_change` 就地对齐（摘除 / 后台预热），
+    /// 改它不该把全部引擎丢掉重建。
+    #[test]
+    fn keep_all_loaded_change_does_not_require_engine_reload() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.schema.keep_all_loaded = !old.schema.keep_all_loaded;
+        assert!(!engine_reload_needed(&old, &new));
+    }
+
     /// 反向对照：反查模式的候选布局只给协调器读，不该丢词典缓存。
     #[test]
     fn reverse_layout_change_does_not_require_engine_reload() {
@@ -13959,6 +14210,35 @@ mod caret_compat_tests {
             c.first_show_was_provisional
                 .load(std::sync::atomic::Ordering::Relaxed),
             "兜底显示后应置位 provisional 以享放宽容差"
+        );
+    }
+
+    /// 上屏后紧接着开的新组合（Shift+字母上屏进临英）：兜底首显用的旧坐标确定陈旧，
+    /// 不得记 provisional，否则随后一个字宽的前移会被放宽容差吞掉、候选窗留在原位。
+    #[test]
+    fn first_show_after_commit_is_not_provisional() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 100;
+            st.caret_y = 200;
+            st.caret_height = 25;
+        }
+        *c.pending_first_show.lock().unwrap() = true;
+        c.first_show_after_commit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let token = *c.pending_first_show_token.lock().unwrap();
+        c.fire_pending_first_show(token);
+        assert!(
+            !c.first_show_was_provisional
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "上屏后的兜底首显不应享放宽容差"
+        );
+        assert!(
+            !c.first_show_after_commit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "标记应被兜底首显消费"
         );
     }
 
@@ -17320,6 +17600,22 @@ mod input_diag_tests {
 // 注释词库：配置里的挂载表 × 词库自带 comment 列的自动派生项
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `sync_emoji_dict` 的变更判据：`(enabled, categories, 开着的附加模块 id)`。
+pub(crate) type EmojiSpec = (bool, bool, Vec<String>);
+
+/// 已挂载的 emoji 表，按查询合并顺序（见 `Coordinator::load_emoji_dict`）。
+pub(crate) struct EmojiTables(pub(crate) Vec<std::sync::Arc<wind_dict::emojidict::EmojiReader>>);
+
+impl EmojiTables {
+    /// 各表命中的值按表序拼成一串（空格分隔）。表间的重复（同一符号、或带 / 不带 U+FE0F）
+    /// 不在这里去：消费端本就要按 `emoji_dedup_key` 去重并截断到 `max_per_word`，在这里
+    /// 再去一遍只是多分配。
+    pub(crate) fn lookup(&self, text: &str) -> Option<String> {
+        let parts: Vec<&str> = self.0.iter().filter_map(|r| r.lookup(text)).collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
+    }
+}
+
 /// 一个自动派生出的注释源：某个方案声明的词库自己带了 `comment` 列。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutoCommentSource {
@@ -18165,5 +18461,47 @@ mod toolbar_items_tests {
     fn defining_a_button_does_not_show_it() {
         let buttons = [btn("sym", "符")];
         assert_eq!(parse_with(&[], &buttons), DEFAULT_TOOLBAR_ITEMS.to_vec());
+    }
+}
+
+#[cfg(test)]
+mod emoji_tables_tests {
+    use super::EmojiTables;
+    use wind_dict::emojidict::{EmojiReader, write_emoji_wemj};
+
+    fn table(
+        dir: &std::path::Path,
+        name: &str,
+        rows: &[(&str, &[&str])],
+    ) -> std::sync::Arc<EmojiReader> {
+        let p = dir.join(format!("{name}.wemj"));
+        let rows: Vec<(String, Vec<String>)> = rows
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        write_emoji_wemj(&p, &rows).unwrap();
+        std::sync::Arc::new(EmojiReader::open(&p).unwrap())
+    }
+
+    /// 多表按挂载顺序拼接：主表在前，附加模块的同词结果接在后面；只有一张表命中时就是它；
+    /// 都没命中为 None。去重留给消费端（`plan_emoji_insertions`）。
+    #[test]
+    fn lookup_concatenates_in_table_order() {
+        let dir = std::env::temp_dir().join(format!("wind-emoji-tables-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = EmojiTables(vec![
+            table(&dir, "word", &[("开心", &["😄"])]),
+            table(
+                &dir,
+                "frost",
+                &[("开心", &["😄", "😊"]), ("右箭头", &["➡️"])],
+            ),
+        ]);
+        assert_eq!(t.lookup("开心").as_deref(), Some("😄 😄 😊"));
+        assert_eq!(t.lookup("右箭头").as_deref(), Some("➡️"));
+        assert_eq!(t.lookup("无此词"), None);
+        drop(t);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -18,7 +18,7 @@
 | `src/codetable/engine.rs` | `CodeTableEngine`：经 `DictManager`(CompositeDict) 精确 + 前缀查询；全码自动上屏、顶码、`clear_on_empty_max` 等上屏策略（`CommitOptions`） |
 | `src/mixed/engine.rs` | `MixedEngine`：持码表主 + 拼音次 + 可选英文子引擎，分档加权合并（码表精确 +boost、短语 +1M、英文精确 +500K、前缀 +500K，拼音 ÷100 降档）；**拼音否决统一入口 `pinyin_vetoes_commit`**（否决①粗粒度默认关 / ②词强度默认开，满码/顶码/显示态复评三通路共用）；超码长走 `convert_overflow`（`pinyin_only_overflow` 分流），归属由 `codetable_owns_overflow` 四条判据裁决 |
 | `src/english.rs` | `EnglishEngine`：码表引擎薄包装（词库 code 列小写化，大小写不敏感前缀匹配），独立方案或被混输懒加载（`schema.mix.enable_english`）；`convert` 在含分词符时三路合并（合并而非劫持）：原路径 → **词组分段** → **剥离分词符再查**，按 text 跨三路去重。剥离那路只收「text 含分词符或多词」的命中——不设闸的话 `p'o` 剥成 `po` 会把 pocket/pod/poem 一屏普通单词补全灌进来，分段候选挤不进 `max_candidates` |
-| `src/english_phrase.rs` | 英文词组分词（t42）：`'` 切段、每段打前缀、允许跳词。**按候选 `text` 的空格切词，不读 `code`**（出厂词组两种编码并存，共同前缀式的 code 里没有后段词）。`LazyPhraseIndex` 懒建 + 后台预热 + 可作废（词库热摘不重建引擎）。排序 `weight → 跨度 → 文本`，主键必须是 weight（协调器会统一重排） |
+| `src/english_phrase.rs` | 英文词组分词（t42）：`'` 切段、每段打前缀、允许跳词。**按候选 `text` 的空格切词，不读 `code`**（出厂词组两种编码并存，共同前缀式的 code 里没有后段词）。`LazyPhraseIndex` 懒建 + 后台预热 + 可作废（词库热摘不重建引擎）+ **落盘 mmap**（`<cache>/<方案键>/phrase-<指纹>.wphr`，指纹＝各启用层 `DictLayer::entries_digest` + `ENGLISH_PHRASE_INDEX_TAG`，进文件名而非 `.fp`，故热摘后取另一份、启用回来复用；>3 MB mmap、扫描前后指纹不等不落盘；收词/小写化语义一改要把 tag +1）。堆版与 mmap 版是同一份字节镜像、同一套查找代码。排序 `weight → 跨度 → 文本`，主键必须是 weight（协调器会统一重排） |
 | `src/english_merge.rs` | 英文候选混入（**只收精确命中**）：配置按引擎分两份——`schema.codetable.english_merge`（三项，可经方案级 `[engine.codetable.english_merge]` 覆盖）与 `schema.pinyin.english_merge`（两项，无 `block_commit`），由 `manager::english_merge_cfg` 分流折叠成 `Effective`。接线在 `manager.rs` 的三条通路，**不是**混输那套（后者与 `truncation_tier` 三方仲裁耦合，见该模块文档） |
 
 ## For AI Agents
@@ -53,7 +53,7 @@
   出两张表：引擎序（历史基线，limit 10）与界面序（limit 300 → 同一比较器 → 同文去重，与协调器实测
   逐条对拍一致）。E 类（短简拼 `zhge`/`zhy`/`baichx`）只有界面序有意义。
 - **整句候选与词库同量纲**：拼音侧 `SENTENCE_WEIGHT_BASE`(3e7) **已退役**（`docs/design/sentence-weight-same-axis.md`，四步全部实施），现为 `sentence_weight()` = `exp(log_prob/n + ln DICT_TOTAL)`，即各词频次的几何平均。整句要降位走 `is_sentence_demoted`（step 6.5「整句让位于精确整词」，把整句压到 `用户词weight - 1`——这是「用户把词加进词库、配再高权重也换不回首选」的修复点）。3e7 只在**码表侧**还活着，且那边的值是 1e6（`codetable/sentence.rs`）。
-- **懒加载 + single-flight 构建锁**：`ensure_loaded` 抢方案专属 build_lock 后复查，避免后台预热与首次切换重复熔大词库；不同方案可并行构建。引擎缓存仅在 `invalidate_schema`/`reload_from_config` 清除（无 LRU 驱逐，与 Go 版不同）。
+- **懒加载 + single-flight 构建锁**：`ensure_loaded` 抢方案专属 build_lock 后复查，避免后台预热与首次切换重复熔大词库；不同方案可并行构建。引擎缓存在 `invalidate_schema`/`reload_from_config` 清除；方案常驻策略关着时（`schema.keep_all_loaded = false`，出厂）另由协调器的清扫拍子调 `evict_idle` 摘掉闲置 30 分钟的引擎——「最后使用」只在 `ensure_loaded` 快路径打（一次原子读写），保护名单见 `residency_protected`；摘除只清**只属于该方案**的反查索引 / 单字全码表 / 按词查编码用户层槽，不走 `invalidate_schema` 的全清。懒建缓存（单字全码表、按词查编码用户层）另由同一拍子调 `evict_idle_caches` 做 30 分钟闲置释放，**不看**常驻开关；「最后使用」同样记淘汰时钟读数（取表处一次原子写 / 已持锁时顺手写）。
 - **`convert` 永不 panic**：引擎错误降级为 `ConvertResult::default()`（空候选），勿在热路径用会 panic 的 `unwrap`。锁中毒统一 `unwrap_or_else(|e| e.into_inner())`。
 - **扩展词库热插拔**：`set_dict_enabled` 直接翻 `codetable-extra-<id>` 系统层的 enabled 标志，无需重建引擎；启用集变化会失效反查索引（编码提示依赖启用词库合并）。
 - **混输拼音否决默认值三处同源**：`auto_commit_block_on_pinyin` / `block_commit_on_pinyin_word` / `pinyin_only_overflow` **均默认开**——`MixConfig::default()`（mixed/engine.rs）、`MixGlobal::default()` + serde default（wind-config/config.rs）、`data/config.toml [schema.mix]` 三处必须一致，改默认须同步全部三处。**出厂默认以 L1⊕L2 为准**（L2 覆盖 L1，即 data/config.toml 的值）。前两者曾漂移过（`MixConfig` false vs 另两处 true / `pinyin_only_overflow` L1 false vs L2 true），后果分两层：引擎单测跑在现实中不存在的配置下；且 `Config::preset_for_pruning` 拿 L1⊕L2 判「用户值是否等于默认」，L1/L2 不一致时该判据会开始吃用户配置。

@@ -729,6 +729,18 @@ pub struct SchemaConfig {
     pub primary_codetable: String,
     #[serde(default)]
     pub primary_pinyin: String,
+    /// 方案常驻策略（出厂 `false`）。
+    ///
+    /// - `true`：启动后预热全部可用方案（+ 临拼目标 + 英文）并一直常驻——切换零等待。
+    /// - `false`：启动只建用得着的（当前方案、临拼目标、临英开着时的英文），其余方案只在
+    ///   后台校验 / 重建派生缓存、建完即释放；切过去时现建（缓存新鲜时只是 mmap + 建外壳），
+    ///   30 分钟没用的方案引擎自动卸载。
+    ///
+    /// 一个布尔同时管「预热」与「淘汰」：两者是同一个取舍的两面，拆成两个键会出现「不预热
+    /// 但永不卸载」这类无意义组合（设计 `docs/design/memory-footprint.md` §5）。30 分钟与
+    /// 每分钟一拍不进配置（R1：程序能定）。
+    #[serde(default)]
+    pub keep_all_loaded: bool,
     /// 全局码表配置（所有码表方案公共基线；方案经 schema_overrides 覆盖）。
     #[serde(default)]
     pub codetable: CodetableGlobal,
@@ -776,6 +788,7 @@ impl Default for SchemaConfig {
             available: Vec::new(),
             primary_codetable: String::new(),
             primary_pinyin: String::new(),
+            keep_all_loaded: false,
             codetable: CodetableGlobal::default(),
             pinyin: PinyinGlobalConfig::default(),
             mix: MixGlobal::default(),
@@ -1203,7 +1216,8 @@ fn default_code_hint_source() -> String {
 pub struct PinyinGlobalConfig {
     /// 拼音方案（含双拼）下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
     /// 出厂 `off`（理由见 `default_code_hint_source`）；认不出的值同样回落 `off`。
-    /// 临拼/快捷输入不读本字段，读 `input.temp_pinyin.code_hint_source`。
+    /// 临拼/快捷输入不读本字段，读 `input.temp_pinyin.code_hint_source`；混输方案也不读，
+    /// 读 `schema.mix.pinyin_code_hint`。
     #[serde(default = "default_code_hint_source")]
     pub code_hint_source: String,
     #[serde(default = "default_true")]
@@ -2824,12 +2838,22 @@ pub struct MixGlobal {
     /// 那里正是长拼音的地盘，`nihaom` 选「你好」再续打的分步上屏要留着。
     #[serde(default = "default_true")]
     pub pinyin_partial_candidates_overflow: bool,
-    /// 混输时拼音是否产出简拼候选（声母缩写，nh→你好）。默认开=历史行为（此前恒开无开关）。
-    /// 关闭后混输里的拼音只认全拼，适合「只把拼音当临时输入补位、不用简拼」的用户；
-    /// 简拼会让几乎任何字母串都可能是拼音，关掉可让候选更干净。仅影响混输的拼音子引擎，
-    /// 纯拼音方案不受影响。
-    #[serde(default = "default_true")]
+    /// 混输时拼音是否产出简拼候选（声母缩写，nh→你好）。**出厂关**（a3971b4f 起；此前恒开）：
+    /// 开着时超码长的顶码上屏基本不会发生，理由见 `data/config.toml` 同名项注释。
+    /// 关闭时混输里的拼音只认全拼，候选更干净。仅影响混输的拼音子引擎，纯拼音方案不受影响。
+    /// ⚠️ 三处同源：本处 serde 默认 / `Default` / `data/config.toml`，由
+    /// `mix_pinyin_abbrev_*` 三条测试守门。
+    #[serde(default)]
     pub enable_pinyin_abbrev: bool,
+    /// 混输方案下，拼音候选旁是否显示主码表的编码（反查）。默认开。
+    ///
+    /// 独立于拼音方案那份 `schema.pinyin.code_hint_source`：那份出厂 `off`，照顾的是纯拼音
+    /// 用户；混输用户以码表为主，打拼音时看编码正是学码、补码的场景，共用一份就只能顾一头
+    /// （此前混输读的就是拼音那份，拼音出厂改 off 后混输跟着没了编码提示）。
+    /// 只有开关、不设四档：混输里的拼音是全拼，双拼编码没有意义。
+    /// 临拼 / 快捷输入期间不读本项，读 `input.temp_pinyin.code_hint_source`。
+    #[serde(default = "default_true")]
+    pub pinyin_code_hint: bool,
 }
 
 impl Default for MixGlobal {
@@ -2855,6 +2879,7 @@ impl Default for MixGlobal {
             // 用户把两个否决开关都关掉也无济于事）。混输用户以码表为主，默认让顶码可用；
             // 需要简拼的用户显式打开即可。详见 `data/config.toml` 同名项注释。
             enable_pinyin_abbrev: false,
+            pinyin_code_hint: true,
         }
     }
 }
@@ -3468,6 +3493,17 @@ pub struct AssociationConfig {
     /// 这一项没有「更对」的答案——它取决于用户把联想当「顺手就选」还是「别挡我打字」。
     #[serde(default = "default_true")]
     pub space_commits: bool,
+    /// 二三候选键（`keys.select_key_groups` / `session_actions` 里 `select_candidate:N`
+    /// 的**可打印**键，出厂 `;` `'`）在联想态是否选联想候选。
+    ///
+    /// `true`（默认）= 照常选第 2/3 条，与非联想态一致。`false` = 联想态下让出这些键：
+    /// 收起联想窗，该键按「联想窗不在」处理（普通标点照常出；若另绑了模式引导，则照常进
+    /// 该模式）。对标 QQ 五笔（论坛 t251）：联想是输入法猜的，按 `;` 想打的是分号。
+    ///
+    /// 只管 keydown 消费的可打印键。修饰键组（`lrshift` / `lrctrl`）走 keyup、没有字符可
+    /// 「原样上屏」，不受本项影响；数字键选联想也不受影响。
+    #[serde(default = "default_true")]
+    pub select_keys_commit: bool,
     /// 联想态按**回车**：只收窗（吃键），还是收窗 + 把回车**透传**给宿主。
     ///
     /// `false`（默认）= 透传：联想窗收起，同时回车照常换行 / 发送消息。
@@ -3525,6 +3561,7 @@ impl Default for AssociationConfig {
             mode: default_assoc_mode(),
             max_count: default_assoc_max_count(),
             space_commits: true,
+            select_keys_commit: true,
             enter_cancels_only: false,
             backspace_cancels_only: true,
             hide_after_ms: default_assoc_hide_after_ms(),
@@ -4279,6 +4316,14 @@ pub struct TempEnglishConfig {
     pub show_candidates: bool,
     #[serde(default = "default_shift_behavior")]
     pub shift_behavior: String,
+    /// **已有编码缓冲时**按 Shift+字母的行为（`shift_behavior` 只管空缓冲那一支）。
+    /// 字符串枚举，值域：
+    /// - `buffer`（出厂）：大写字母以小写进编码缓冲、大小写记在影子串里（现状，
+    ///   英文候选套形、混输自由输入都依赖它）。
+    /// - `commit_enter`：上屏高亮候选（含已转换前缀），再以该大写字母进临时英文——
+    ///   对齐临时拼音「顶字进模式」。英文方案下不生效。
+    #[serde(default = "default_shift_when_composing")]
+    pub shift_when_composing: String,
     /// 触发键（符号键进入临时英文模式，类似临时拼音触发键）。默认空（仅 Shift+字母触发）。
     #[serde(default)]
     pub trigger_keys: Vec<String>,
@@ -4394,6 +4439,7 @@ impl Default for TempEnglishConfig {
             enabled: true,
             show_candidates: true,
             shift_behavior: "temp_english".to_string(),
+            shift_when_composing: default_shift_when_composing(),
             trigger_keys: Vec::new(),
             allow_symbols: false,
             symbol_chars: default_temp_english_symbol_chars(),
@@ -4503,6 +4549,199 @@ pub struct EmojiConfig {
     /// 入口，故做成独立开关而不是不引入。
     #[serde(default)]
     pub categories: bool,
+    /// 附加模块开关（`[input.emoji.modules]`，键 = [`EMOJI_MODULES`] 的 id）。缺的键按该模块
+    /// 的出厂值（[`EmojiConfig::module_enabled`]）；不认识的键忽略。
+    ///
+    /// 用表而不是 `[[tables]]` 数组：配置分层对**表按键合并**、对**数组整体覆盖**。写成数组的话
+    /// 用户在设置里翻一个开关，整份列表就落进用户配置固化下来，之后新增的出厂模块对他不可见。
+    #[serde(default = "default_emoji_modules")]
+    pub modules: BTreeMap<String, bool>,
+}
+
+/// emoji 追加的附加模块（rime-frost 的 OpenCC 表，`docs/design/opencc-conversions.md` T3）。
+///
+/// rime-emoji 主表（`emoji/emoji_word.txt`，随 [`EmojiConfig::enabled`]）与分类表
+/// （[`EmojiConfig::categories`]）不在此列：它们早于本机制，开关保持原样。
+pub struct EmojiModule {
+    /// 配置键 `input.emoji.modules.<id>`，也是缓存文件名。
+    pub id: &'static str,
+    /// 设置页显示名。
+    pub label: &'static str,
+    /// 设置页说明（举一个例子，让人知道打什么词会出什么）。
+    pub description: &'static str,
+    /// 相对数据根（`data/`）的源文件，OpenCC 文本词典。
+    pub file: &'static str,
+    /// 只取这些分组（`others.txt` 按分组拼成一份）；空 = 整表。
+    pub sections: &'static [&'static str],
+    /// 出厂是否开启。
+    pub default_on: bool,
+}
+
+/// 附加模块注册表。**顺序即查询合并顺序**（同一个词多个模块都有时，靠前的排前面）。
+///
+/// ⚠ 与 `data/config.toml` 的 `[input.emoji.modules]`、`config_schema` 的登记、设置端清单
+/// 的开关同步。`others.txt` 里「著名表演艺术家」一组（成人影星名）构建期就剔除、不在此列；
+/// 「emoji集合」一组的键带 `V` 前缀（`V动物`），正常打字打不出宿主词，也不收。
+pub const EMOJI_MODULES: &[EmojiModule] = &[
+    EmojiModule {
+        id: "frost_emoji",
+        label: "白霜 Emoji",
+        description: "补充更多词语的 emoji 与符号，如「右箭头」→ ➡️、「勾选」→ ☑️",
+        file: "emoji/frost_emoji.txt",
+        sections: &[],
+        default_on: true,
+    },
+    EmojiModule {
+        id: "frost_radicals",
+        label: "偏旁部首",
+        description: "如「提手旁」→ 扌",
+        file: "emoji/frost_others.txt",
+        sections: &["偏旁部首"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_greek",
+        label: "希腊字母",
+        description: "如「阿尔法」→ alpha α Α",
+        file: "emoji/frost_others.txt",
+        sections: &["希腊字母"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_misc",
+        label: "单位与杂项",
+        description: "如「平方米」→ m²",
+        file: "emoji/frost_others.txt",
+        sections: &["其他"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_keys",
+        label: "键盘符号",
+        description: "如「command」→ ⌘",
+        file: "emoji/frost_others.txt",
+        sections: &["键盘符号"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_diezi",
+        label: "叠字",
+        description: "如「两个火」→ 炎 炏",
+        file: "emoji/frost_others.txt",
+        sections: &["二叠字", "三叠字", "四叠字"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_chem",
+        label: "化学式",
+        description: "如「高锰酸钾」→ KMnO₄",
+        file: "emoji/frost_others.txt",
+        sections: &["化学式"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_month",
+        label: "月份星期英文",
+        description: "如「一月」→ Jan. January",
+        file: "emoji/frost_others.txt",
+        sections: &["月份星期"],
+        default_on: false,
+    },
+    EmojiModule {
+        id: "frost_sitcom",
+        label: "美剧人名",
+        description: "如「谢耳朵」→ Sheldon",
+        file: "emoji/frost_others.txt",
+        sections: &["生活大爆炸&老友记"],
+        default_on: false,
+    },
+];
+
+/// 用户放置 emoji / OpenCC 表的目录（相对数据根，各资源层合并扫描）。
+pub const EMOJI_USER_DIR: &str = "emoji";
+
+/// 数据根 `emoji/` 下属于内置表源文件的文件名，不当作用户模块（它们由主表 / 分类表 /
+/// [`EMOJI_MODULES`] 读取；用户层放同名文件是**覆盖**那张内置表，不是新增模块）。
+const EMOJI_BUILTIN_FILES: &[&str] = &[
+    "emoji_word.txt",
+    "emoji_category.txt",
+    "frost_emoji.txt",
+    "frost_others.txt",
+];
+
+/// 一个可开关的 emoji 附加模块：内置（[`EMOJI_MODULES`]）或用户放进 `emoji/` 的文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmojiModuleEntry {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    /// 相对数据根的源文件。
+    pub file: String,
+    pub sections: Vec<String>,
+    /// 用户放置的文件（`false` = 内置模块）。
+    pub user: bool,
+    pub default_on: bool,
+}
+
+impl Config {
+    /// 全部 emoji 附加模块：内置在前（注册表序），其后是 `emoji/` 目录里用户放置的
+    /// OpenCC 表（`*.txt`，按文件名序；id = 文件名去掉 `.txt`，出厂关）。
+    ///
+    /// 用户文件与内置模块 id 撞名时跳过并告警：同一个开关管两张表，用户分不清。
+    pub fn emoji_modules(data_dir: Option<&Path>) -> Vec<EmojiModuleEntry> {
+        let mut out: Vec<EmojiModuleEntry> = EMOJI_MODULES
+            .iter()
+            .map(|m| EmojiModuleEntry {
+                id: m.id.to_string(),
+                label: m.label.to_string(),
+                description: m.description.to_string(),
+                file: m.file.to_string(),
+                sections: m.sections.iter().map(|s| s.to_string()).collect(),
+                user: false,
+                default_on: m.default_on,
+            })
+            .collect();
+        for (rel, _abs) in Self::list_data_dir(data_dir, EMOJI_USER_DIR, ".txt") {
+            let name = rel.rsplit('/').next().unwrap_or(&rel);
+            if EMOJI_BUILTIN_FILES.contains(&name) {
+                continue;
+            }
+            let id = name.trim_end_matches(".txt").to_string();
+            if out.iter().any(|m| m.id == id) {
+                warn!("emoji 模块文件 {rel} 与内置模块同名，已跳过（请改个文件名）");
+                continue;
+            }
+            out.push(EmojiModuleEntry {
+                label: id.clone(),
+                description: String::new(),
+                id,
+                file: rel,
+                sections: Vec::new(),
+                user: true,
+                default_on: false,
+            });
+        }
+        out
+    }
+}
+
+fn default_emoji_modules() -> BTreeMap<String, bool> {
+    EMOJI_MODULES
+        .iter()
+        .map(|m| (m.id.to_string(), m.default_on))
+        .collect()
+}
+
+impl EmojiConfig {
+    /// 模块是否开启：配置里写了按配置，没写按出厂值；不认识的 id（含用户放置的文件）为 false。
+    pub fn module_enabled(&self, id: &str) -> bool {
+        self.modules.get(id).copied().unwrap_or_else(|| {
+            EMOJI_MODULES
+                .iter()
+                .find(|m| m.id == id)
+                .is_some_and(|m| m.default_on)
+        })
+    }
 }
 
 fn default_emoji_scope() -> String {
@@ -4531,6 +4770,7 @@ impl Default for EmojiConfig {
             max_hosts: default_emoji_max_hosts(),
             min_word_chars: default_emoji_min_word_chars(),
             categories: false,
+            modules: default_emoji_modules(),
         }
     }
 }
@@ -6567,16 +6807,14 @@ impl UiCandidateConfig {
 
     /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 [`TRUNCATION_MARK`]
     /// 提示"过长"（仅影响显示；上屏用完整原文，见 coordinator 候选下发）。
+    ///
+    /// 「字」按**字素簇**计（口径同悬停提示的截断与折行）：按码位切会把 emoji ZWJ 序列、
+    /// 组合符、变体选择符拦腰切开，屏上冒出半个字形。
     pub fn truncate_display(&self, text: &str) -> String {
-        if self.max_chars == 0 {
-            return text.to_string();
-        }
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() <= self.max_chars {
-            text.to_string()
-        } else {
-            let head: String = chars[..self.max_chars].iter().collect();
-            format!("{head}{TRUNCATION_MARK}")
+        use unicode_segmentation::UnicodeSegmentation;
+        match text.grapheme_indices(true).nth(self.max_chars) {
+            Some((cut, _)) if self.max_chars > 0 => format!("{}{TRUNCATION_MARK}", &text[..cut]),
+            _ => text.to_string(),
         }
     }
 }
@@ -7470,6 +7708,10 @@ fn default_pinyin_separator() -> String {
 
 fn default_shift_behavior() -> String {
     "temp_english".to_string()
+}
+
+fn default_shift_when_composing() -> String {
+    "buffer".to_string()
 }
 
 /// 用户配置目录的就绪探测结果。
@@ -9451,6 +9693,35 @@ impl Config {
     /// `compat.toml`（字段级）两处，它们各有专用加载器，不走本函数。
     pub fn resolve_data_file(data_dir: Option<&Path>, rel: &str) -> Option<PathBuf> {
         Self::resolve_overridable(data_dir, None, rel, "data")
+    }
+
+    /// 列出数据根 `<sub>/` 下所有以 `suffix` 结尾的文件，各层合并、靠前的层遮蔽同名者。
+    /// 与 [`Self::resolve_data_file`] 同一层序，差别同 [`Self::list_schema_resource_dir`] 之于
+    /// [`Self::resolve_schema_resource`]：那个回答「这个名字在哪一层」，这个回答「一共有哪些」。
+    pub fn list_data_dir(
+        data_dir: Option<&Path>,
+        sub: &str,
+        suffix: &str,
+    ) -> Vec<(String, PathBuf)> {
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        for layer in Self::resource_layers_named_with(data_dir) {
+            let Ok(rd) = std::fs::read_dir(layer.path.join(sub)) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(suffix) || !entry.path().is_file() {
+                    continue;
+                }
+                let rel = format!("{sub}/{name}");
+                if out.iter().any(|(r, _)| *r == rel) {
+                    continue;
+                }
+                out.push((rel, entry.path()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// 把**语法不合法**的配置原件另存一份，返回备份路径。
@@ -11832,6 +12103,43 @@ active = "x"
         assert_eq!(c.truncate_display("一二"), "一二", "不足不截");
     }
 
+    /// 截断按**字素簇**计（口径同悬停提示），不把 ZWJ 序列 / 组合符 / 变体选择符拦腰切开。
+    #[test]
+    fn test_truncate_display_counts_graphemes() {
+        let cfg = merged_with("[ui.candidate]\nmax_chars = 3\n");
+        let c = cfg.ui.candidate;
+        let family = "👨\u{200D}👩\u{200D}👧";
+        // ZWJ 序列算一个字：恰好 3 簇不截；4 簇截到前 3 簇，序列完整保留。
+        let abf = format!("ab{family}");
+        assert_eq!(c.truncate_display(&abf), abf, "ZWJ 序列整簇计 1");
+        assert_eq!(
+            c.truncate_display(&format!("{family}{family}{family}{family}")),
+            format!("{family}{family}{family}…")
+        );
+        // 组合符：e + U+0301 是一簇。
+        let e = "e\u{301}";
+        assert_eq!(
+            c.truncate_display(&e.repeat(3)),
+            e.repeat(3),
+            "组合符不另计"
+        );
+        assert_eq!(
+            c.truncate_display(&e.repeat(4)),
+            format!("{}…", e.repeat(3))
+        );
+        // 变体选择符：⚽ + U+FE0F 是一簇。
+        let ball = "⚽\u{FE0F}";
+        assert_eq!(c.truncate_display(&ball.repeat(3)), ball.repeat(3));
+        assert_eq!(
+            c.truncate_display(&format!("ab{ball}{ball}")),
+            format!("ab{ball}…"),
+            "截断点落在簇边界，不留孤立的 U+FE0F"
+        );
+        // 普通中英文与恰好等长。
+        assert_eq!(c.truncate_display("中a文b"), "中a文…");
+        assert_eq!(c.truncate_display("中a文"), "中a文", "恰好等长不截");
+    }
+
     #[test]
     fn test_user_index_label_optional() {
         // 用户显式设置：已配槽位返回 Some，越界返回 None（主题层可接手）。
@@ -13217,6 +13525,21 @@ smart_method = "delete_replace"
         assert!(
             !MixGlobal::default().enable_pinyin_abbrev,
             "简拼出厂应为关；改它前先读 data/config.toml 同名项的注释"
+        );
+    }
+
+    /// 第三处同源：serde 字段默认值（写了 `[schema.mix]` 段、没写这一项时取它）。
+    ///
+    /// 它曾是 `default_true`，与 `Default` / `data/config.toml` 的 `false` 相反。`Config::load`
+    /// 以 `Config::default()` 序列化值打底，所以那条路上触发不到；但直接反序列化部分配置的
+    /// 调用方（测试、日后的新入口）会拿到与出厂相反的值。
+    #[test]
+    fn mix_pinyin_abbrev_serde_default_matches_default() {
+        let v: Config = toml::from_str("[schema.mix]\nshow_source_hint = true\n").unwrap();
+        assert_eq!(
+            v.schema.mix.enable_pinyin_abbrev,
+            MixGlobal::default().enable_pinyin_abbrev,
+            "serde 默认值与 Default 漂移了"
         );
     }
 

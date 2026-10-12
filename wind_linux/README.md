@@ -28,9 +28,17 @@ cd wind_input && cargo build --release -p wind_service --features linux-host
 ```bash
 scripts/linux/package-deb.sh          # 在 22.04 容器里构建，产物 dist/linux/windinput_<版本>_amd64.deb
 sudo apt install ./windinput_*.deb     # 会带上 fcitx5 及 GTK/Qt 前端
-windinput-setup                        # 每个使用者运行一次：配置 fcitx5、切输入法框架
-# 然后注销并重新登录
 ```
+
+装完不需要任何额外脚本，按 Fcitx5 的标准用法：
+
+1. 系统的输入法框架用 Fcitx5（Deepin 默认就是；Ubuntu 桌面用系统的「语言支持」把键盘输入法系统设为
+   Fcitx5，或 `im-config -n fcitx5`——这是所有 Fcitx5 输入法共同的前提，不是本包的额外步骤），
+   注销并重新登录；
+2. 打开「Fcitx5 配置」（fcitx5-configtool），把「清风输入法」加进输入法列表；
+3. Shift 单击切中英开箱可用（addon 自己接管，不必改 Fcitx5 的全局配置）。
+
+升级只需 `fcitx5 -rd`（或重新登录）。
 
 包里带图形设置程序（`/usr/lib/windinput/wind_setting`）：应用菜单「清风输入法设置」，或输入时按
 `Ctrl+Shift+]`。构建时需要兄弟仓库 `../wind-setting` 与 `../wind-ui-rust`（`SETTING_REPO` 可指定）。
@@ -42,14 +50,15 @@ windinput-setup                        # 每个使用者运行一次：配置 fc
 
 ## 使用
 
-1. 启动服务 `wind_input`（exe 同目录要有 `data/` 词库目录）。socket 在
-   `$XDG_RUNTIME_DIR/WindInput/`。
+1. 服务由 addon 在连不上时自动拉起；手动启动 `wind_input`（exe 同目录要有 `data/` 词库目录）仅用于开发。
+   socket 在 `$XDG_RUNTIME_DIR/WindInput/`。
 2. 在 Fcitx5 配置里把「清风输入法」加入输入法组。
 3. 设置：应用菜单或 Fcitx5 托盘菜单里的「清风输入法设置」、Fcitx5 输入法配置里清风的「配置」，
    或在输入时按 `Ctrl+Shift+]`（开发时设置程序路径可用
    `WIND_INPUT_SETTING` 覆盖，默认 `/usr/lib/windinput/wind_setting`）。
-4. 想用 Shift 单击切换中英：到 Fcitx5 全局配置里清空「临时在当前和第一个输入法之间切换」
-   （`AltTriggerKeys`，出厂是左 Shift），否则 Shift 会先被 Fcitx5 截走。
+4. Shift 单击切中英：Fcitx5 出厂把左 Shift 配成「临时在当前和第一个输入法之间切换」
+   （`AltTriggerKeys`），会在引擎之前截走。addon 在更早的阶段把 Shift 单击接过来
+   （`WindEngine::claimShiftTap`），用户不必改配置；清空了该项或当前不是清风时不插手。
 
 ## 测试
 

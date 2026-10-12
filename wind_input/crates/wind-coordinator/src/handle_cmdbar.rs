@@ -309,9 +309,24 @@ struct CoordIme(Weak<Coordinator>);
 impl ImeController for CoordIme {
     fn toggle(&self, target: &str) -> anyhow::Result<()> {
         if let Some(c) = self.0.upgrade() {
+            // 数据类开关（emoji / 附加模块 / 注释词库）要报错给调用方：id 写错时静默无反应，
+            // 写短语的人无从排查。其余 target 维持原样。
+            if is_feature_target(target) {
+                return c.cmd_set_feature(target, None);
+            }
             c.cmd_ime_toggle(target);
         }
         Ok(())
+    }
+    fn set(&self, target: &str, on: bool) -> anyhow::Result<()> {
+        let Some(c) = self.0.upgrade() else {
+            return Ok(());
+        };
+        if is_feature_target(target) {
+            c.cmd_set_feature(target, Some(on))
+        } else {
+            c.cmd_set_state(target, on)
+        }
     }
     fn open_setting(&self, page: &str, args: &str) -> anyhow::Result<()> {
         if let Some(c) = self.0.upgrade() {
@@ -594,6 +609,67 @@ pub(crate) fn parse_hex_rgba(s: &str) -> Option<[u8; 4]> {
         b(4)?,
         if hex.len() == 8 { b(6)? } else { 255 },
     ])
+}
+
+/// `ime.toggle` 的数据类开关 target：`emoji`、`emoji:<模块id>`、`dict:<注释库id>`。
+pub(crate) fn is_feature_target(target: &str) -> bool {
+    target == "emoji" || target.starts_with("emoji:") || target.starts_with("dict:")
+}
+
+/// `ime.set` 输入状态已是目标时的提示。措辞按各开关在菜单 / 工具栏上的叫法：中英、全半角
+/// 是二选一的两个状态，直接说「已是英文模式」；简繁与工具栏是开关，说「已是开启状态」。
+pub(crate) fn state_unchanged_text(target: &str, on: bool) -> String {
+    let onoff =
+        |name: &str, yes: &str, no: &str| format!("{name}已是{}状态", if on { yes } else { no });
+    match target {
+        "cn-en" => format!("已是{}模式", if on { "中文" } else { "英文" }),
+        "fullshape" => format!("已是{}", if on { "全角" } else { "半角" }),
+        "s2t" => onoff("简入繁出", "开启", "关闭"),
+        "t2s" => onoff("繁入简出", "开启", "关闭"),
+        "toolbar" => onoff("工具栏", "显示", "隐藏"),
+        other => format!("{other}已是{}状态", if on { "开启" } else { "关闭" }),
+    }
+}
+
+/// 把注释词库 `id` 设为 `want`（`None` = 取反）。返回新的 `[[ui.comment_dicts]]` 数组与新状态；
+/// 已是目标状态时返回 `None`（不写盘）。
+///
+/// - 列表里已有该 id 的条目（手工挂的库，或自动来源的引用空壳）：就地改 `enabled`。
+/// - 没有、但它是自动来源（词库自带 comment 列，未登记时是开着的）：要关就追加一条只含
+///   `id/auto/enabled` 的引用空壳（同设置端写法）；要开则本来就开着，不动。
+/// - 都不是：报错（id 写错）。
+///
+/// 纯函数，单测钉住；写盘与重载在调用方。
+pub(crate) fn set_comment_dict(
+    configured: &[wind_config::CommentDictSpec],
+    auto_ids: &[String],
+    id: &str,
+    want: Option<bool>,
+) -> anyhow::Result<Option<(Vec<wind_config::CommentDictSpec>, bool)>> {
+    let mut out = configured.to_vec();
+    if let Some(spec) = out.iter_mut().find(|s| s.id == id) {
+        let on = want.unwrap_or(!spec.enabled);
+        if on == spec.enabled {
+            return Ok(None);
+        }
+        spec.enabled = on;
+        return Ok(Some((out, on)));
+    }
+    if auto_ids.iter().any(|a| a == id) {
+        // 未登记的自动来源恒为开（见 `merge_comment_dicts`）
+        let on = want.unwrap_or(false);
+        if on {
+            return Ok(None);
+        }
+        out.push(wind_config::CommentDictSpec {
+            id: id.to_string(),
+            auto: true,
+            enabled: false,
+            ..Default::default()
+        });
+        return Ok(Some((out, false)));
+    }
+    anyhow::bail!("没有 id 为 {id:?} 的注释词库（见设置 → 候选标注 → 注释词库）")
 }
 
 /// 配置服务：cmdbar `config.get` / `config.set` / `config.toggle`。
@@ -1124,5 +1200,132 @@ mod reap_tests {
             last, None,
             "子进程 {pid} 退出 5 秒后仍挂在本进程名下（状态 {last:?}）"
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_toggle_tests {
+    use super::{is_feature_target, set_comment_dict, state_unchanged_text};
+    use wind_config::CommentDictSpec;
+
+    fn manual(id: &str, enabled: bool) -> CommentDictSpec {
+        CommentDictSpec {
+            id: id.into(),
+            path: format!("comments/{id}.txt"),
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn state_unchanged_text_uses_menu_wording() {
+        assert_eq!(state_unchanged_text("cn-en", true), "已是中文模式");
+        assert_eq!(state_unchanged_text("cn-en", false), "已是英文模式");
+        assert_eq!(state_unchanged_text("fullshape", false), "已是半角");
+        assert_eq!(state_unchanged_text("s2t", true), "简入繁出已是开启状态");
+        assert_eq!(state_unchanged_text("toolbar", false), "工具栏已是隐藏状态");
+    }
+
+    #[test]
+    fn feature_targets_are_recognized() {
+        for t in ["emoji", "emoji:frost_greek", "emoji:猫猫", "dict:en"] {
+            assert!(is_feature_target(t), "{t}");
+        }
+        for t in ["s2t", "cn-en", "emojis", "dictx"] {
+            assert!(!is_feature_target(t), "{t}");
+        }
+    }
+
+    /// 已在列表里的条目就地翻转，顺序与其它条目不动。
+    #[test]
+    fn flips_existing_entry_in_place() {
+        let cfg = [manual("en", true), manual("chaifen", false)];
+        let (list, on) = set_comment_dict(&cfg, &[], "chaifen", None)
+            .unwrap()
+            .unwrap();
+        assert!(on);
+        assert_eq!(list.len(), 2);
+        assert!(list[0].enabled && list[1].enabled);
+        let (list, on) = set_comment_dict(&list, &[], "en", None).unwrap().unwrap();
+        assert!(!on && !list[0].enabled);
+    }
+
+    /// 指定状态：与当前一致时不动作（None）；不一致才改。
+    #[test]
+    fn set_is_noop_when_already_in_state() {
+        let cfg = [manual("en", true)];
+        assert!(
+            set_comment_dict(&cfg, &[], "en", Some(true))
+                .unwrap()
+                .is_none()
+        );
+        let (list, on) = set_comment_dict(&cfg, &[], "en", Some(false))
+            .unwrap()
+            .unwrap();
+        assert!(!on && !list[0].enabled);
+    }
+
+    /// 自动来源（未登记时是开的）不在列表里：要开不动作；要关 / 取反就追加一条关着的引用空壳。
+    #[test]
+    fn auto_source_gets_a_disabled_shell() {
+        let cfg = [manual("en", true)];
+        let auto = vec!["auto:pinyin/cn_dicts/corrections.dict.yaml".to_string()];
+        assert!(
+            set_comment_dict(&cfg, &auto, &auto[0], Some(true))
+                .unwrap()
+                .is_none()
+        );
+        for want in [None, Some(false)] {
+            let (list, on) = set_comment_dict(&cfg, &auto, &auto[0], want)
+                .unwrap()
+                .unwrap();
+            assert!(!on);
+            let shell = &list[1];
+            assert!(shell.auto && !shell.enabled && shell.path.is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_id_is_an_error() {
+        assert!(set_comment_dict(&[manual("en", true)], &[], "nope", Some(true)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod set_state_tests {
+    use crate::Coordinator;
+    use wind_config::Config;
+
+    fn coord() -> std::sync::Arc<Coordinator> {
+        let mut cfg = Config::default();
+        // 全半角切换会记「上次状态」；关掉，测试不落盘
+        cfg.input.default.remember_last_state = false;
+        Coordinator::new_headless(cfg, None)
+    }
+
+    fn full_width(c: &Coordinator) -> bool {
+        c.state.lock().unwrap().full_width
+    }
+
+    /// 与当前不同才切；已是目标状态再 set 不翻回去（toggle 的语义会翻回去）。
+    #[test]
+    fn set_is_idempotent_for_input_state() {
+        let c = coord();
+        assert!(!full_width(&c));
+        c.cmd_set_state("fullshape", true).unwrap();
+        assert!(full_width(&c));
+        c.cmd_set_state("fullshape", true).unwrap();
+        assert!(full_width(&c), "已是全角时再 set on 不应翻回半角");
+        c.cmd_set_state("fullshape", false).unwrap();
+        assert!(!full_width(&c));
+    }
+
+    /// 多值 / 循环类 target 没有「开」「关」可言，报错而不是静默翻一格。
+    #[test]
+    fn set_rejects_cyclic_targets() {
+        let c = coord();
+        for t in ["layout", "preedit", "candwin", "nope"] {
+            assert!(c.cmd_set_state(t, true).is_err(), "{t}");
+        }
     }
 }

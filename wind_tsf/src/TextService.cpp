@@ -3375,31 +3375,65 @@ void CTextService::_EnsureHostRenderSetup(const ServiceResponse& response, BOOL 
         WIND_LOG_WARN(L"Host render flag missing after reconnect, retrying setup because host window was previously active\n");
     }
 
-    if (candidate != nullptr && !forceRefresh)
-    {
-        // Check if the host's band has changed (e.g., user switched from Start Menu
-        // search band=6 to taskbar search band=13). Recreate ALL host windows rather
-        // than UpdateBand on each: the tooltip/status windows are owned by the candidate
-        // hwnd for z-order, so recreating the candidate alone would leave them pointing
-        // at a destroyed owner. Full re-setup keeps ownership consistent.
-        DWORD currentHostBand = candidate->GetHostBand();
-        if (currentHostBand > 1 && currentHostBand != candidate->GetCurrentBand())
-        {
-            WIND_LOG_INFO_FMT(L"Host band changed to %u, recreating all host windows\n", currentHostBand);
-            _DestroyHostWindow();
-            // fall through to recreate at the new band
-        }
-        else
-        {
-            return; // no change needed
-        }
-    }
-    else if (candidate != nullptr)
+    // 唯一调用点（ApplyActivationStatusResponse）传 forceRefresh=TRUE：activation 即重建。
+    // 此前这里有「!forceRefresh 时按 band 变化惰性重建」的分支，因此从未走到，band 复核
+    // 改由 RecheckHostBand 在输入首键时做。
+    if (candidate != nullptr)
     {
         WIND_LOG_INFO(L"Refreshing host render windows after service reconnection\n");
         _DestroyHostWindow();
     }
 
+    _CreateHostWindows(nullptr);
+}
+
+BOOL CTextService::_HostBandNeedsRebuild()
+{
+    CHostWindow* candidate = _pHostWindow[HOST_WINDOW_CANDIDATE];
+    if (candidate == nullptr)
+        return FALSE;
+    // 没拿到 owner 也要重建：候选窗不被搜索面板 own，同 band 内仍可能压在面板下面。
+    // 句柄失效也要：owner 被宿主销毁时被 own 的候选窗会被连带销毁。
+    return wind::hostband::NeedsRebuild(candidate->GetForegroundHostBand(),
+                                        candidate->GetRequestedBand(),
+                                        candidate->HasOwner() != FALSE,
+                                        IsWindow(candidate->GetHwnd()) != FALSE)
+               ? TRUE
+               : FALSE;
+}
+
+// 建窗时的 band 是「当时」探的：SearchHost 开机预启动、界面还没显示时就收到 activation，
+// 枚举到的窗口不在开始菜单那一层，建出来的候选窗被开始菜单盖住；activation 推送不会因为
+// 用户打开开始菜单而重来，于是一直错到下一次重建（2026-10-09 靶机「开机第一次被遮挡」）。
+// 故在一段输入的第一个键（宿主界面必定已显示）按前台 band 复核一次。不放在焦点进入：
+// SearchHost 二次聚焦会跳过 focus_gained，键才是必经之路。
+//
+// 跑在键路径上：不需要重建时只是 GetForegroundWindow + GetWindowBand 两个调用，且只在
+// 本线程有 host 候选窗（白名单宿主）时发生。整组重建而不是 UpdateBand：tooltip/状态窗
+// 被候选窗 own，只重建候选会让它们挂在已销毁的 owner 上。
+void CTextService::RecheckHostBand(const wchar_t* why)
+{
+    if (!_HostBandNeedsRebuild())
+        return;
+    if (_pIPCClient == nullptr || !_pIPCClient->IsConnected())
+        return;
+
+    CHostWindow* candidate = _pHostWindow[HOST_WINDOW_CANDIDATE];
+    // 旧窗的依据随上报带走：新窗在 recheck 后必然 requested=前台、owner=true，不带旧值
+    // 中央日志里就分不清当初是 band 判错还是只缺 owner（本地这行日志在 SearchHost 里落不了盘）。
+    wind::hostband::Placement prev = {};
+    prev.probedBand = candidate->GetProbedHostBand();
+    prev.requestedBand = candidate->GetRequestedBand();
+    prev.actualBand = candidate->GetCurrentBand();
+    prev.hasOwner = candidate->HasOwner() != FALSE;
+    WIND_LOG_INFO_FMT(L"Host band recheck (%ls): foreground band=%u, window requested=%u actual=%u owner=%d, recreating\n",
+        why, candidate->GetForegroundHostBand(), prev.requestedBand, prev.actualBand, prev.hasOwner ? 1 : 0);
+    _DestroyHostWindow();
+    _CreateHostWindows(&prev);
+}
+
+void CTextService::_CreateHostWindows(const wind::hostband::Placement* prev)
+{
     WIND_LOG_INFO(L"Host render available, requesting setup\n");
 
     ServiceResponse hrResponse;
@@ -3450,6 +3484,7 @@ void CTextService::_EnsureHostRenderSetup(const ServiceResponse& response, BOOL 
         if (_pHostWindow[HOST_WINDOW_CANDIDATE] != nullptr)
         {
             WIND_LOG_INFO(L"Host windows initialized successfully\n");
+            _ReportHostRenderPlaced(prev);
         }
         else
         {
@@ -3466,6 +3501,23 @@ void CTextService::_EnsureHostRenderSetup(const ServiceResponse& response, BOOL 
         uint32_t reason = HOST_RENDER_FAIL_WINDOW_CREATE;
         _pIPCClient->SendAsync(CMD_HOST_RENDER_FAILED, &reason, sizeof(reason));
     }
+}
+
+// 中央日志里留一笔「据什么、往哪建、落在哪」。AppContainer 宿主（SearchHost）写不了
+// tsf_log，不靠这条就看不到它的 band 判定。低频诊断，按协议约定走 CMD_EXT 信封。
+void CTextService::_ReportHostRenderPlaced(const wind::hostband::Placement* prev)
+{
+    CHostWindow* candidate = _pHostWindow[HOST_WINDOW_CANDIDATE];
+    if (candidate == nullptr || _pIPCClient == nullptr)
+        return;
+    wind::hostband::Placement now = {};
+    now.probedBand = candidate->GetProbedHostBand();
+    now.requestedBand = candidate->GetRequestedBand();
+    now.actualBand = candidate->GetCurrentBand();
+    now.hasOwner = candidate->HasOwner() != FALSE;
+    std::vector<uint8_t> payload = wind::hostband::EncodeExt(
+        wind::hostband::kPlacedKind, wind::hostband::PlacedBody(GetCurrentProcessId(), now, prev));
+    _pIPCClient->SendAsync(CMD_EXT, payload.data(), (uint32_t)payload.size());
 }
 
 // ============================================================================
@@ -4748,8 +4800,9 @@ BOOL CTextService::_InitIPCClient()
     // known-working cross-thread channel used by PostUpdateFullStatus et al.).
     _pIPCClient->SetServiceReadyCallback([pThis]() {
         // 推送通道（重）连上了 = 新的服务会话：会话级开关回到默认。标题采集开关必须清零——
-        // 服务端先发 CMD_SERVICE_READY、再收 token、再推握手配置（同一条管道按序到达，本回调在
-        // reader 线程上同步执行），故清零必然早于握手推来的新值，不会把它冲掉。
+        // 服务端收到 token 后、待自身就绪才发 CMD_SERVICE_READY，且必排在握手配置之前（同一条
+        // 管道按序到达，本回调在 reader 线程上同步执行；服务端的保证见 PushServer::mark_ready），
+        // 故清零必然早于握手推来的新值，不会把它冲掉。
         pThis->SetTitleMatchEnabled(FALSE);
         if (pThis->_pLangBarItemButton != nullptr)
             pThis->_pLangBarItemButton->PostServiceReady();
@@ -7859,7 +7912,16 @@ void CTextService::StartDeferredCompositionIfPending()
     WIND_LOG_DEBUG_FMT(L"StartDeferredComposition: opening new composition text=%s\n", text.c_str());
     // 此刻 CommitText 已结束旧组合、_pComposition 为空 → UpdateComposition 新建组合并显示余码
     //（有下划线的正常编码态）。对齐真实输入法 compositionstart@keyup。
-    UpdateComposition(text, _CompositionCaretFor(text));
+    const BOOL opened = UpdateComposition(text, _CompositionCaretFor(text));
+    // 延迟组合是在 keyup / 定时器里开的，不经 keydown 的应答处理，没人替它上报坐标：
+    // 上屏使宿主光标前移，服务端若没收到这条，首显只能拿上屏前的陈旧坐标兜底，
+    // 候选窗留在原处，直到下一个按键才跳（Shift+字母上屏进临英实测，2026-10-09）。
+    // 组合没建成（失败 / 宿主排成异步还没落地）就不报：非按键上下文里同步取坐标会被宿主拒，
+    // 退到 GUI 光标的值会被服务端当权威坐标。异步落地的由 OnLayoutChange 去报。
+    if (opened && HasActiveComposition())
+    {
+        SendCaretPositionUpdate();
+    }
 }
 
 void CTextService::CancelDeferredComposition()

@@ -44,7 +44,6 @@ done
 
 # 关键文件
 for f in usr/lib/windinput/wind_input usr/lib/windinput/wind_setting \
-         usr/bin/windinput-setup \
          usr/share/fcitx5/addon/windinput.conf usr/share/fcitx5/inputmethod/windinput.conf \
          usr/share/applications/windinput-setting.desktop usr/share/mime/packages/windinput.xml \
          usr/lib/windinput/data/compat.toml; do
@@ -82,6 +81,9 @@ check_min schemas/stroke/stroke.dict.yaml 500000
 # （字段说明注释里会提到 Weixin.exe 之类的例子，只看非注释行：出现任何表头 / 键值就是带了规则）
 noncomment="$(grep -vE '^[[:space:]]*(#|$)' "$D/compat.toml" || true)"
 if [[ -n "$noncomment" ]]; then bad "compat.toml 含非注释内容（应为零规则）"; else ok "compat.toml 零规则"; fi
+
+# 包里不得再带一次性配置脚本：装完 deb、在 Fcitx5 里添加输入法就必须能用
+if [[ -e "$R/usr/bin/windinput-setup" ]]; then bad "包里不应再有 usr/bin/windinput-setup"; else ok "无 windinput-setup"; fi
 
 # ELF：机器类型 + glibc 符号版本上限
 n=0

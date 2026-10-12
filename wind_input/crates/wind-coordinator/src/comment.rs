@@ -79,6 +79,7 @@ use wind_config::{Config, OverlaySpec};
 use wind_ui_types::{InlineColor, SpanStyle, StyledText};
 
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// 一次变量引用：名字 + 可选参数（`${chaizi_all:／}` 的 `／`）。
 ///
@@ -503,13 +504,23 @@ fn render_nodes(
 /// 整个模板按一个隐式可选段处理：所有变量都为空 ⇒ 返回空。否则返回渲染结果（已 trim
 /// 首尾空白——模板里为分隔而写的空格，在相邻内容缺席时不该留在两端）。
 ///
-/// `max_chars` = 0 表示不限；超出则按字符截断并加 `…`（`…` 继承被截处前一个字的样式）。
+/// `max_chars` = 0 表示不限；超出则按字素簇截断并加 `…`（见 [`truncate_graphemes`]）。
 pub(crate) fn render_styled(
     tpl: &str,
     max_chars: usize,
     eval: impl Fn(&str, Option<&str>) -> Option<String>,
 ) -> StyledText {
     Template::parse(tpl).render_whole(max_chars, &eval)
+}
+
+/// 注释段的长度截断：超过 `max_chars` 个**字素簇**就只留前 `max_chars` 簇，再接 `…`
+/// （继承被截处前一个字的样式）；0 = 不限。口径同候选的 `truncate_display` 与悬停提示——
+/// 按码位切会把 emoji ZWJ 序列、组合符、变体选择符拦腰切开。
+fn truncate_graphemes(t: StyledText, max_chars: usize) -> StyledText {
+    match t.as_str().grapheme_indices(true).nth(max_chars) {
+        Some((cut, _)) if max_chars > 0 => t.cut_with_mark(cut, "…"),
+        _ => t,
+    }
 }
 
 /// [`render_styled`] 的纯文本形态：要上屏的文字（`alt_commit_text` 上屏注释、`reverse_render`
@@ -560,7 +571,7 @@ impl Template {
         if !render_nodes(&self.0, eval, &|_| true, &mut b) {
             return StyledText::new();
         }
-        b.out.into_trimmed().into_truncated(max_chars, "…")
+        truncate_graphemes(b.out.into_trimmed(), max_chars)
     }
 
     /// 上方注释条开关开时的渲染：按模板**字面文字**里第一个 `\n` 拆成 `(上段, 下段)`。
@@ -577,7 +588,7 @@ impl Template {
         if !render_nodes(&self.0, eval, &|_| true, &mut b) {
             return (StyledText::new(), StyledText::new());
         }
-        let part = |t: StyledText| t.into_trimmed().into_truncated(max_chars, "…");
+        let part = |t: StyledText| truncate_graphemes(t.into_trimmed(), max_chars);
         let Some(s) = b.split_at else {
             return (StyledText::new(), part(b.out));
         };
@@ -937,16 +948,29 @@ impl crate::coordinator::Coordinator {
     /// 注释段求值用的编码来源档。候选窗渲染与「上屏注释」（`input.alt_commit`）共用，
     /// 两处各算一份的话，同一条候选显示的注释与上屏的注释会不一样。
     ///
-    /// 两份开关按模式分：临拼 / 快捷输入读 `input.temp_pinyin.code_hint_source`（出厂
-    /// `auto`，码表用户反查编码的场景），其余（拼音 / 双拼主方案）读
-    /// `schema.pinyin.code_hint_source`（出厂 `off`）。两类用户习惯相反，所以拆开。
+    /// 三份开关，模式层优先于方案层：
+    /// - 临拼 / 快捷输入读 `input.temp_pinyin.code_hint_source`（出厂 `auto`，码表用户借
+    ///   拼音反查编码的场景）——哪怕主方案是混输；
+    /// - 混输方案读 `schema.mix.pinyin_code_hint`（出厂开，开 ⇒ 只放行码表反查：混输里的
+    ///   拼音是全拼，双拼编码没意义）；
+    /// - 其余（拼音 / 双拼主方案）读 `schema.pinyin.code_hint_source`（出厂 `off`）。
+    ///
+    /// 码表用户与纯拼音用户习惯相反，所以拆开。混输曾落在最后一档，拼音出厂改 `off` 后
+    /// 混输跟着没了编码提示。
     /// ★ 临拼那份原样生效、**可以关掉**——旧实现在这里无视配置并集式强制放行反查。
     pub(crate) fn comment_hint_source(&self, state: &State) -> CodeHintSource {
         if Self::forces_code_hint(state) {
-            self.engine_mgr.temp_pinyin_code_hint_source()
-        } else {
-            self.engine_mgr.code_hint_source()
+            return self.engine_mgr.temp_pinyin_code_hint_source();
         }
+        let active = self.engine_mgr.active_schema_id();
+        if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
+            return if self.rt().config.schema.mix.pinyin_code_hint {
+                CodeHintSource::CodeTable
+            } else {
+                CodeHintSource::Off
+            };
+        }
+        self.engine_mgr.code_hint_source()
     }
 
     /// 「上屏注释 / 拼音」（`input.alt_commit`，t138）要上屏的文本；空串＝这条候选没有可上屏的。
@@ -1172,7 +1196,13 @@ impl crate::coordinator::Coordinator {
             // 作用域取活跃方案：本入口（cmdbar `dict.rev`）是**低频**路径，就地取一次
             // 比给整条求值链加一个参数划算；且它没有候选身份，也就没有临英那种
             // 「数据归 english 桶」的语境可言。
-            "dict" => reverse.comment_of(text, None, &self.engine_mgr.active_schema_id()),
+            "dict" => {
+                let schema = self.engine_mgr.active_schema_id();
+                match arg {
+                    Some(id) => reverse.comment_of_id(id, text, None, &schema),
+                    None => reverse.comment_of(text, None, &schema),
+                }
+            }
             _ => return reverse_text_var(name, arg, text, reverse),
         })
     }
@@ -1229,7 +1259,13 @@ impl crate::coordinator::Coordinator {
         }
         let guard = self.emoji_dict.read().unwrap_or_else(|e| e.into_inner());
         let list = guard.as_ref()?.lookup(text)?;
-        let picked: Vec<&str> = list.split_whitespace().take(max_per_word).collect();
+        // 与追加档同一套去重（剥 U+FE0F，保留先到者），否则注释里同一符号出两次。
+        let mut seen = std::collections::HashSet::new();
+        let picked: Vec<&str> = list
+            .split_whitespace()
+            .filter(|e| seen.insert(crate::handle_candidate::emoji_dedup_key(e)))
+            .take(max_per_word)
+            .collect();
         if picked.is_empty() {
             None
         } else {
@@ -1342,7 +1378,11 @@ impl crate::coordinator::Coordinator {
             // （由调用方按 `effective_data_schema` 解析）：注释库是**数据类**资源，
             // 归属与词频/短语同源——临英下要按 `english` 查，而不是主方案。
             // 这与注释**模板**取 active（呈现类）刻意不同，见 `comment_template_for`。
-            "dict" => reverse.comment_of(&c.text, Some(&c.code), dict_schema),
+            // `${dict:id}` 只查那一个库（`${dict}` 只回第一个命中的库，多库并排要靠它）。
+            "dict" => match arg {
+                Some(id) => reverse.comment_of_id(id, &c.text, Some(&c.code), dict_schema),
+                None => reverse.comment_of(&c.text, Some(&c.code), dict_schema),
+            },
             _ => return None,
         })
     }
@@ -2114,6 +2154,33 @@ mod split_tests {
         assert_eq!((a.into_string(), b.into_string()), pair("abc…", "uvw…"));
     }
 
+    /// 注释段截断按字素簇计（口径同候选 `truncate_display` 与悬停提示）：
+    /// ZWJ 序列 / 组合符 / 变体选择符不被拦腰切开，恰好等长不截。整段与拆段两条路径都走。
+    #[test]
+    fn truncation_counts_graphemes() {
+        let family = "👨\u{200D}👩\u{200D}👧";
+        let e = "e\u{301}";
+        let ball = "⚽\u{FE0F}";
+        let cases = [
+            (format!("ab{family}"), format!("ab{family}")),
+            (format!("ab{family}c"), format!("ab{family}…")),
+            (e.repeat(3), e.repeat(3)),
+            (e.repeat(4), format!("{}…", e.repeat(3))),
+            (format!("ab{ball}{ball}"), format!("ab{ball}…")),
+            ("中a文".to_string(), "中a文".to_string()),
+            ("中a文b".to_string(), "中a文…".to_string()),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                render("${a}", 3, ev(&[("a", &input)])),
+                want,
+                "整段：{input:?}"
+            );
+            let (_, b) = Template::parse("${a}").render_split(3, &ev(&[("a", &input)]));
+            assert_eq!(b.into_string(), want, "拆段：{input:?}");
+        }
+    }
+
     /// 上段里变量值自带的换行折成空格：上方条恒单行，否则按页等高就被撑破。下段不动。
     #[test]
     fn newline_in_upper_var_value_becomes_space() {
@@ -2528,6 +2595,60 @@ mod eval_var_tests {
         );
         assert_eq!(hint_in(&co, Some(ModeKind::Mix(0))), CodeHintSource::Auto);
     }
+
+    /// 混输方案为活跃方案、拼音那份与混输那份各配一值的协调器。
+    fn mixed_coord(schema_src: &str, mix_hint: bool) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["wubi86_pinyin".to_string(), "pinyin".to_string()];
+        cfg.schema.active = "wubi86_pinyin".to_string();
+        cfg.schema.pinyin.code_hint_source = schema_src.to_string();
+        cfg.schema.mix.pinyin_code_hint = mix_hint;
+        Coordinator::new_headless(cfg, Some(&data_dir()))
+    }
+
+    /// 混输方案读 `schema.mix.pinyin_code_hint`，不受拼音方案那份影响。
+    ///
+    /// 拼音那份刻意配成与之相反的值：混输若还读拼音那份（本开关引入前的行为），这里会拿到
+    /// 对方的档位。
+    #[test]
+    fn mixed_schema_follows_mix_switch() {
+        for schema in ["off", "auto"] {
+            assert_eq!(
+                hint_in(&mixed_coord(schema, true), None),
+                CodeHintSource::CodeTable,
+                "混输开：schema.pinyin={schema}"
+            );
+            assert_eq!(
+                hint_in(&mixed_coord(schema, false), None),
+                CodeHintSource::Off,
+                "混输关：schema.pinyin={schema}"
+            );
+        }
+    }
+
+    /// 混输方案下进临拼 / 快捷输入，仍按临拼那份——模式层优先于方案层。
+    #[test]
+    fn overlay_modes_in_mixed_schema_follow_temp_pinyin_source() {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["wubi86_pinyin".to_string(), "pinyin".to_string()];
+        cfg.schema.active = "wubi86_pinyin".to_string();
+        cfg.schema.mix.pinyin_code_hint = true;
+        cfg.input.temp_pinyin.code_hint_source = "off".to_string();
+        let co = Coordinator::new_headless(cfg, Some(&data_dir()));
+        for active in [Some(ModeKind::TempPinyin), Some(ModeKind::Mix(0))] {
+            assert_eq!(hint_in(&co, active), CodeHintSource::Off, "{active:?}");
+        }
+    }
+
+    /// 出厂：拼音方案不显示编码，混输方案显示主码表反查编码。
+    #[test]
+    fn factory_mixed_schema_shows_reverse_code() {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["wubi86_pinyin".to_string(), "pinyin".to_string()];
+        cfg.schema.active = "wubi86_pinyin".to_string();
+        let co = Coordinator::new_headless(cfg, Some(&data_dir()));
+        assert_eq!(hint_in(&co, None), CodeHintSource::CodeTable);
+    }
 }
 
 /// 设置页预览行的模板样例求值与诊断（设计 text-span-colors.md §11）。
@@ -2635,6 +2756,22 @@ mod legacy_parity {
         }
     }
 
+    /// 参照的截断按码位计，现行按字素簇计（见 `truncate_graphemes`）——这是**有意**的行为
+    /// 变化，参照本身不改（它的价值在于不变）。故对拍取参照的**不截断**产物，截断这一步按
+    /// 现行口径在此显式套上：截断之前的渲染仍须与参照逐字节相同。
+    fn legacy_render_truncated(
+        tpl: &str,
+        max: usize,
+        e: &impl Fn(&str, Option<&str>) -> Option<String>,
+    ) -> String {
+        use unicode_segmentation::UnicodeSegmentation;
+        let s = legacy_ref::render(tpl, 0, e);
+        match s.grapheme_indices(true).nth(max) {
+            Some((cut, _)) if max > 0 => format!("{}…", &s[..cut]),
+            _ => s,
+        }
+    }
+
     #[test]
     fn render_matches_pre_change_engine() {
         for tpl in TEMPLATES {
@@ -2643,7 +2780,7 @@ mod legacy_parity {
                 for max in [0usize, 1, 3, 8] {
                     assert_eq!(
                         super::render(tpl, max, &e),
-                        legacy_ref::render(tpl, max, &e),
+                        legacy_render_truncated(tpl, max, &e),
                         "render({tpl:?}, {max}) 与改动前不同，取值 {fx:?}"
                     );
                 }

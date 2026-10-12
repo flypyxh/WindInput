@@ -15,6 +15,7 @@
 #include <fcitx-utils/log.h>
 #include <fcitx-utils/misc.h>
 #include <fcitx-utils/utf8.h>
+#include <fcitx/globalconfig.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/statusarea.h>
 #include <fcitx/text.h>
@@ -237,6 +238,13 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
         [this](fcitx::InputContext*) { launchSettings({}); });
     instance_->userInterfaceManager().registerAction("windinput-settings", &settingsAction_);
 
+    // Fcitx5 出厂 AltTriggerKeys=Shift_L：它在 InputMethod 阶段先于引擎处理按键，按下即把 Shift
+    // 过滤掉、松开时切到组里第一个输入法——「Shift 切中英」永远到不了本引擎。用户不该为此去改
+    // Fcitx5 的全局配置，所以在更早的 PreInputMethod 阶段把 Shift 单击接过来（见 claimShiftTap）。
+    shiftClaim_ = instance_->watchEvent(
+        fcitx::EventType::InputContextKeyEvent, fcitx::EventWatcherPhase::PreInputMethod,
+        [this](fcitx::Event& e) { claimShiftTap(static_cast<fcitx::KeyEvent&>(e)); });
+
     push_ = std::make_unique<PushClient>(
         pushSocketPath(),
         [this](Frame f) {
@@ -260,6 +268,28 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     // 引擎一加载就把服务带起来，让它趁用户还没开始打字时完成词库加载。
     ensureConnected();
     WIND_INFO() << "WindInput 引擎已加载，服务端点 " << requestSocketPath();
+}
+
+void WindEngine::claimShiftTap(fcitx::KeyEvent& event)
+{
+    const fcitx::KeySym sym = event.origKey().sym();
+    if (sym != FcitxKey_Shift_L && sym != FcitxKey_Shift_R) {
+        return;
+    }
+    // 只在本引擎是当前输入法、且 Fcitx5 确实把这个 Shift 配成了替代触发键时接管；
+    // 用户清空了 AltTriggerKeys，或当前不是清风，就完全不插手。
+    fcitx::InputContext* ic = event.inputContext();
+    const fcitx::InputMethodEntry* entry = instance_->inputMethodEntry(ic);
+    if (!entry || instance_->inputMethodEngine(ic) != static_cast<fcitx::InputMethodEngine*>(this)) {
+        return;
+    }
+    if (!fcitx::Key(sym).checkKeyList(instance_->globalConfig().altTriggerKeys())) {
+        return;
+    }
+    // 自己走一遍按键通路，再把事件标成已过滤：Fcitx5 的触发键处理就不会再看到这个 Shift。
+    // 没被吃的键（Shift 本身一向不吃）仍由前端原样交给应用。
+    keyEvent(*entry, event);
+    event.filter();
 }
 
 WindEngine::~WindEngine()

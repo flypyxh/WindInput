@@ -111,8 +111,8 @@ body:
       description: |
         如有截图请在此粘贴。日志文件位置：
         - Windows 安装版：`%LOCALAPPDATA%\WindInput\logs\`
-        - Windows 便携版：`<程序目录>\userdata\logs\`
-        - macOS：`~/Library/Logs/WindInput/`
+        - Windows 便携版：`<程序目录>\localdata\logs\`
+        - macOS：`~/Library/Application Support/WindInput/logs/`
 
   - type: textarea
     id: additional

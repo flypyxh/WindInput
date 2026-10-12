@@ -13,7 +13,8 @@ pub fn specs() -> Vec<FuncSpec> {
         "dict.add"        : Dict    (1, 2) effect => fn_dict_add,    "把文本加入用户词库; code 可选, 不传时按当前方案规则推导", "dict.add(clip())";
         "dict.rev"        : Dict    (1, 2) pure   => fn_dict_rev,    "反查文本中某个字的编码与读音; n 为第几个字 (1 起, 默认 1), 超出字数返回空串", "dict.rev(clip())"
             named(fn_dict_rev_named, "format" = "版式模板, 同候选注释段语法; 变量 ${char}/${code_rev_all}(全部码位)/${code_rev}(仅全码)/${code_schema}(本方案击键)/${pinyin}/${chaizi}/${chaizi_code}/${dict}; 省略='${char}: ${code_rev_all} ${pinyin}'");
-        "ime.toggle"      : Ime     (1, 1) effect => fn_ime_toggle,  "切换 IME 状态 (cn-en / fullshape / layout / candwin / s2t / preedit / toolbar)", "ime.toggle(\"cn-en\")";
+        "ime.toggle"      : Ime     (1, 1) effect => fn_ime_toggle,  "切换 IME 状态 (cn-en / fullshape / layout / candwin / s2t / t2s / preedit / toolbar)；数据开关 emoji / emoji:<模块id> / dict:<注释库id>", "ime.toggle(\"cn-en\")";
+        "ime.set"         : Ime     (2, 2) effect => fn_ime_set,     "把开关设为指定状态, 已是该状态则只提示不动作; target 为输入状态 (cn-en / fullshape / s2t / t2s / toolbar; cn-en 的 on=中文) 或数据开关 (emoji / emoji:<模块id> / dict:<注释库id>), 状态 on/off (也认 true/false、1/0、开/关)", "ime.set(\"emoji:frost_greek\", \"on\")";
         "ime.schema"      : Ime     (1, 1) effect => fn_ime_schema,  "切换输入方案并持久化", "ime.schema(\"pinyin\")";
         "ime.theme"       : Ime     (1, 1) effect => fn_ime_theme,   "切换主题并持久化 (= config.set ui.theme.name)", "ime.theme(\"msime\")";
         "ime.theme_cycle" : Ime     (0, 1) effect => fn_theme_cycle, "循环切换主题并持久化; dir 可选 next(默认)/prev", "ime.theme_cycle()";
@@ -90,6 +91,31 @@ fn fn_dict_rev_named(
         .unwrap_or(DEFAULT_REV_FORMAT);
     let mut buf = [0u8; 4];
     Ok(ctx.reverse_lookup(ch.encode_utf8(&mut buf), format))
+}
+
+fn fn_ime_set(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    let on = parse_switch(&args[1]).ok_or_else(|| {
+        runtime_err(
+            "ime.set",
+            anyhow::anyhow!(
+                "状态需要 on / off（或 true/false、1/0、开/关），收到 {:?}",
+                args[1]
+            ),
+        )
+    })?;
+    let ime = ime(ctx, "ime.set")?;
+    ime.set(&args[0], on)
+        .map_err(|e| runtime_err("ime.set", e))?;
+    Ok(String::new())
+}
+
+/// `ime.set` 的状态参数。大小写不敏感、去首尾空白；认不出返回 None（由调用方报错，不猜）。
+fn parse_switch(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "开" => Some(true),
+        "off" | "false" | "0" | "关" => Some(false),
+        _ => None,
+    }
 }
 
 fn fn_ime_toggle(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
@@ -229,6 +255,10 @@ mod tests {
                 .push(format!("{left}|{right}|{jump_steps}"));
             Ok(())
         }
+        fn set(&self, target: &str, on: bool) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("set {target}={on}"));
+            Ok(())
+        }
     }
 
     fn ctx_with(rec: Arc<RecIme>) -> MemoryContext {
@@ -245,6 +275,31 @@ mod tests {
             format!("{text}|{format}")
         }));
         c
+    }
+
+    /// `ime.set` 的状态参数：几种常见写法都认、大小写与首尾空白不敏感，原样带 target 转给宿主；
+    /// 认不出的状态报错且**不**调用宿主（不猜：猜错就是把用户想开的关掉）。
+    #[test]
+    fn ime_set_parses_state_and_forwards() {
+        let rec = Arc::new(RecIme(Mutex::new(Vec::new())));
+        let ctx = ctx_with(rec.clone());
+        for (v, want) in [
+            ("on", true),
+            (" OFF ", false),
+            ("true", true),
+            ("0", false),
+            ("开", true),
+            ("关", false),
+        ] {
+            fn_ime_set(&ctx, &["emoji:frost_greek".into(), v.into()]).unwrap();
+            assert_eq!(
+                rec.0.lock().unwrap().pop().unwrap(),
+                format!("set emoji:frost_greek={want}"),
+                "{v:?}"
+            );
+        }
+        assert!(fn_ime_set(&ctx, &["emoji".into(), "maybe".into()]).is_err());
+        assert!(rec.0.lock().unwrap().is_empty(), "认不出的状态不该调用宿主");
     }
 
     /// 省略 n 取第 1 个字；省略 format 填默认版式。

@@ -52,6 +52,10 @@ struct CommentSource {
     /// ⇒ ★ 与既有判据同构：**过滤要尽量靠近消费点**。模板里不写 `${dict}` 就根本不调用
     /// `comment_of`（零开销），任何挂载层的过滤都做不到这一点。
     schemas: Vec<String>,
+    /// 指向本库的 `[[ui.comment_dicts]].id`（供 `${dict:id}` 按库取）。一般一个；两条规格
+    /// 解析到同一文件时挂载去重成一个库，两个 id 都认它。由 [`ReverseLookup::set_comment_ids`]
+    /// 在挂载后写入。
+    ids: Vec<String>,
     body: CommentBody,
 }
 
@@ -434,14 +438,20 @@ fn parse_comment_dict(path: &std::path::Path) -> std::io::Result<Vec<(String, St
     let normalized = wind_utils::text::normalize_input(&content);
     let content: &str = &normalized;
     // 正文起点：首个独占一行的 `...` 之后。无该行 → 整个文件都是正文（容许无 YAML 头的裸表）。
-    let (header, body) = match content.find("\n...") {
+    // `bare`：连 `...` 都没有的裸表。OpenCC 文本词典（rime-frost 的 `chinese_english.txt` 等）
+    // 就是这种形态，按 [`opencc_comment`] 的约定读；有 `...` 的是 rime 词库形态，不动。
+    let (header, body, bare) = match content.find("\n...") {
         Some(i) if content[i + 1..].starts_with("...") => {
             let rest = &content[i + 4..];
             let body = rest.strip_prefix("\r").unwrap_or(rest);
-            (&content[..i], body.strip_prefix('\n').unwrap_or(body))
+            (
+                &content[..i],
+                body.strip_prefix('\n').unwrap_or(body),
+                false,
+            )
         }
-        _ if content.starts_with("...") => (&content[..0], &content[3..]),
-        _ => (&content[..0], content),
+        _ if content.starts_with("...") => (&content[..0], &content[3..], false),
+        _ => (&content[..0], content, true),
     };
     let Some((text_col, comment_col, code_col)) = comment_columns(header) else {
         tracing::warn!(
@@ -466,7 +476,13 @@ fn parse_comment_dict(path: &std::path::Path) -> std::io::Result<Vec<(String, St
             continue;
         }
         let text = parts[text_col];
-        let comment = parts[comment_col];
+        let mut comment = parts[comment_col];
+        if bare {
+            let Some(c) = opencc_comment(text, comment) else {
+                continue;
+            };
+            comment = c;
+        }
         if text.is_empty() || comment.is_empty() {
             continue;
         }
@@ -474,6 +490,28 @@ fn parse_comment_dict(path: &std::path::Path) -> std::io::Result<Vec<(String, St
         out.push((text.to_string(), comment.to_string(), code.to_string()));
     }
     Ok(out)
+}
+
+/// 裸表（无 YAML 头）按 OpenCC 文本词典的约定取注释；返回 `None` 表示这行不是词条。
+///
+/// OpenCC 文本词典（`键<Tab>值1 值2 …`）只是 OpenCC 项目的约定，没有规范；rime 生态在它上面
+/// 又叠了两条约定，这里都要认，用户从那边拿来的表才能直接放：
+/// - **值的首项重复键本身**（`好\t好 good well`）：rime simplifier 用转换结果替换原候选，要保住
+///   原词就得把它写成首项。作注释时它是噪音（显示成「好 good well」），丢掉。不带这一项的表
+///   原样保留。同 `wind_dict::emojidict::parse_upstream`。
+/// - **`---` 开头的行是注释**：OpenCC 文本词典没有注释语法，rime-frost 借「键不可重复」写成
+///   `----------格式为：…\t----------…`。
+fn opencc_comment<'a>(text: &str, value: &'a str) -> Option<&'a str> {
+    if text.starts_with("---") {
+        return None;
+    }
+    let v = value.trim_start();
+    match v.strip_prefix(text) {
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            Some(rest.trim_start())
+        }
+        _ => Some(value),
+    }
 }
 
 /// 精确查不到时依次重试的大小写变形（全小写 → 首字母大写 → 全大写，去掉与原文相同者）。
@@ -545,6 +583,7 @@ fn load_comment_source(
         Some(CommentSource {
             src: src.to_path_buf(),
             schemas: schemas.to_vec(),
+            ids: Vec::new(),
             body,
         })
     };
@@ -729,6 +768,26 @@ pub fn declares_comment_column(path: &Path) -> bool {
 }
 
 impl ReverseLookup {
+    /// 诊断：(拆字表, 拼音表, 常驻内存的注释库) 各自的堆字节（按容量）；mmap 的注释库不计。
+    pub fn heap_bytes(&self) -> (usize, usize, usize) {
+        let chaizi = self.chaizi.entries.capacity() * size_of::<ChaiziEntry>()
+            + self.chaizi.arena.capacity();
+        let pinyin = self.pinyin.entries.capacity() * size_of::<PinyinEntry>()
+            + self.pinyin.reading_ends.capacity() * size_of::<u32>()
+            + self.pinyin.arena.capacity();
+        let comments = self
+            .comments
+            .iter()
+            .map(|c| match &c.body {
+                CommentBody::Mmap(_) => 0,
+                CommentBody::Memory(t) => {
+                    t.entries.capacity() * size_of::<CommentEntry>() + t.arena.capacity()
+                }
+            })
+            .sum();
+        (chaizi, pinyin, comments)
+    }
+
     /// 加载反查表：两份资源的路径**都**由调用方解析后传入（无则跳过）——拆字库来自方案
     /// `[engine.chaizi].db_path`，拼音读音表 `pinyin_map.txt` 来自数据根。
     ///
@@ -818,10 +877,40 @@ impl ReverseLookup {
     ///
     /// 全都没命中且词含 ASCII 字母时，再按大小写变形重试一遍（见 [`case_fallbacks`]）。
     pub fn comment_of(&self, text: &str, code: Option<&str>, schema: &str) -> String {
+        self.comment_in(None, text, code, schema)
+    }
+
+    /// 只在 id 为 `id` 的那个注释库里查（`${dict:id}`）；其余同 [`Self::comment_of`]，
+    /// 方案白名单照样生效。
+    ///
+    /// `${dict}` 只回**一条**：按挂载顺序第一个命中的库胜出。中英释义与汉字拆分都挂成注释库
+    /// 时，单字「好」只能显示其一；按库取才能在同一模板里并排写 `${dict:en} ${dict:chaifen}`。
+    /// 不存在的 id 得空串（与查不到同档）。
+    pub fn comment_of_id(&self, id: &str, text: &str, code: Option<&str>, schema: &str) -> String {
+        self.comment_in(Some(id), text, code, schema)
+    }
+
+    /// 写入各库对应的 `[[ui.comment_dicts]].id`（`(源文件路径, ids)`，路径同 `reload_comments`）。
+    /// 与挂载分开：改 id 不改路径时不必重挂 mmap。
+    pub fn set_comment_ids(&mut self, ids: &[(std::path::PathBuf, Vec<String>)]) {
+        for s in &mut self.comments {
+            s.ids = ids
+                .iter()
+                .find(|(p, _)| *p == s.src)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+        }
+    }
+
+    fn comment_in(&self, id: Option<&str>, text: &str, code: Option<&str>, schema: &str) -> String {
         // ★ 白名单过滤对三遍扫描**统一施加**：漏掉任何一遍，那条路径就会从被排除的库里
         // 取出注释，表现为「限定了方案，可有些词还是显示别的方案的注释」——只在大小写
         // 回退这类少数路径上出现，最难查。
-        let applicable = || self.comments.iter().filter(|s| s.applies_to(schema));
+        let applicable = || {
+            self.comments.iter().filter(|s| {
+                s.applies_to(schema) && id.is_none_or(|id| s.ids.iter().any(|i| i == id))
+            })
+        };
         if let Some(c) = code.filter(|c| !c.is_empty())
             && let Some(hit) = applicable().find_map(|s| s.lookup_by_code(text, c))
         {
@@ -1545,6 +1634,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `${dict:id}`：只在该 id 的库里查，不受挂载顺序影响；`${dict}` 仍取第一个命中的库。
+    /// 方案白名单对按库取同样生效；未知 id 得空串；同一文件被两个 id 指到时两个都认。
+    #[test]
+    fn comment_of_id_reads_one_library() {
+        let (dir, mut paths) = write_libs(
+            "byid",
+            &[
+                &[("好", "good well", "")],
+                &[("好", "女子", ""), ("妈", "女马", "")],
+            ],
+        );
+        paths[1].1 = vec!["pinyin".into()];
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, None);
+        rl.set_comment_ids(&[
+            (paths[0].0.clone(), vec!["en".into()]),
+            (paths[1].0.clone(), vec!["chaifen".into(), "chai".into()]),
+        ]);
+
+        assert_eq!(
+            rl.comment_of("好", None, "pinyin"),
+            "good well",
+            "不带 id：首个命中"
+        );
+        assert_eq!(rl.comment_of_id("chaifen", "好", None, "pinyin"), "女子");
+        assert_eq!(
+            rl.comment_of_id("chai", "好", None, "pinyin"),
+            "女子",
+            "同库第二个 id"
+        );
+        assert_eq!(
+            rl.comment_of_id("en", "妈", None, "pinyin"),
+            "",
+            "不跨库回落"
+        );
+        assert_eq!(rl.comment_of_id("nope", "好", None, "pinyin"), "");
+        assert_eq!(
+            rl.comment_of_id("chaifen", "好", None, "wubi86"),
+            "",
+            "白名单照样生效"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★ 重载时仍在列表里的库**原样复用**：不重新校验指纹，也就不再读源文件。
     ///
     /// 这是切方案（`schemas` 字段）的高频路径——方案专属库开关的同时，全局库通常一字未改，
@@ -2030,6 +2163,35 @@ mod tests {
     fn parse_accepts_headerless_tsv() {
         let rows = parse_str("苹果\tapple\n");
         assert_eq!(rows, vec![("苹果".into(), "apple".into(), String::new())]);
+    }
+
+    /// 裸表按 OpenCC 约定读：丢掉重复键本身的值首项、跳过 `---` 注释行；首项不是键本身的
+    /// 原样保留（「好人」不是「好」的重复）；只剩键本身的行没有注释，跳过。
+    #[test]
+    fn parse_reads_bare_opencc_tables() {
+        let rows = parse_str(
+            "----------格式为：输入内容\t----------格式为：输入内容 \n\
+             好\t好 good well\n\
+             好人\tgood person\n\
+             好\t好人 的首项不是键\n\
+             空\t空\n",
+        );
+        let got: Vec<(&str, &str)> = rows.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("好", "good well"),
+                ("好人", "good person"),
+                ("好", "好人 的首项不是键"),
+            ]
+        );
+    }
+
+    /// 有 `...` 的 rime 形态不套 OpenCC 约定：注释本来就可能以词本身开头。
+    #[test]
+    fn parse_keeps_rime_form_comment_verbatim() {
+        let rows = parse_str("...\n好\t好 good\n");
+        assert_eq!(rows[0].1, "好 good");
     }
 
     /// 注释内容含空格/标点原样保留（只按 `\t` 切列，不 trim 内容）。

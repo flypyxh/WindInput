@@ -206,7 +206,6 @@ jobs:
             if ldd "$f" | grep 'not found'; then echo "::error::$f 有缺失的动态库"; rc=1; fi
           done
           [ "$rc" = 0 ] || exit 1
-          bash -n /usr/bin/windinput-setup
           sudo apt-get remove -y windinput
           [ ! -e /usr/lib/windinput/wind_input ] || { echo "::error::卸载后文件残留"; exit 1; }
 

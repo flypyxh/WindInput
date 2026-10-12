@@ -147,50 +147,13 @@ impl Coordinator {
                     debug!("启动预热已关闭（宿主声明按需加载）");
                     return;
                 }
-                let active = c.engine_mgr.active_schema_id();
-                // available_schemas 只含「可切换的方案」。临时拼音 / 临时英文的目标引擎
-                // **不在其中**（它们是模式的实现，不是可切换方案），此前因此漏出预热范围：
-                // 实测首次按引导键进临拼时才同步加载 52 万词条的拼音库 + 英文库，用户感到
-                // 顿一下。两者都只在启用时才预热，不给没开这些功能的用户白付内存。
-                let mut targets: Vec<String> = c.engine_mgr.available_schemas().to_vec();
-                // ⚠ `temp_pinyin_target()` **自身就会 `ensure_loaded`**（它的语义是「可用才
-                // 返回」），故这一行本身即完成了临拼引擎的加载，下面循环里那次只是复查跳过。
-                // 看着绕，但比在此复制一份「开关 + 方案适用性 + 目标解析」的判据强——那套判据
-                // 是所有临拼入口的公共门卫，抄一份必然漂移。
-                if let Some(t) = c.engine_mgr.temp_pinyin_target() {
-                    targets.push(t);
-                }
-                if c.rt().config.input.temp_english.show_candidates {
-                    targets.push("english".to_string());
-                }
-                for id in targets {
-                    if id == active || c.engine_mgr.is_loaded(&id) {
-                        continue;
-                    }
-                    let t0 = std::time::Instant::now();
-                    if c.engine_mgr.prewarm_schema(&id) {
-                        debug!("Prewarmed schema {} in {:?}", id, t0.elapsed());
-                    } else {
-                        debug!("Prewarm skipped/failed for schema {}", id);
-                    }
-                }
-                debug!("Schema prewarm done");
-
-                // 反查索引（悬停[编码]/编码提示/词语联想的数据源）同样要提前建好。
-                //
-                // 它此前是**首次按键时**才懒构建的，而对大词库那是秒级操作，恰好落在
-                // TSF→服务的同步 IPC 链路上：真机 feihuzj2（253 万条）实测让整机卡了
-                // 29.5 秒。放到这里之后，绝大多数用户永远碰不到那次构建。
-                //
-                // 只预热**当前用得着的方案**（悬停编码段与词语联想各自的来源方案，
-                // 混输下通常同为主码表成员）：其余方案的索引切过去时才有意义，而每份
-                // 索引对超大词库是百 MB 量级（护栏本就只保留两份），全量预热等于把内存
-                // 花在用户未必会用的方案上。
-                //
-                // 与测试、移动端 prepare() 共用 `prewarm_indexes`，避免三处各写一份。
-                c.prewarm_indexes();
+                c.prewarm_on_start();
             });
         }
+
+        // 闲置清扫（每分钟一拍）：方案常驻策略关着时摘掉 30 分钟没用的方案引擎。
+        // 与预热一样只在桌面构造器里起——移动端走 headless 构造，不受影响（设计 §9 D3）。
+        coordinator.spawn_idle_sweeper();
 
         // 恢复持久化的工具栏位置（按前台窗口所在显示器的 key 查找）。
         // 与运行期换屏走同一个函数——判据分成两套迟早漂移。
@@ -242,20 +205,55 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
-        // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]。
-        // 库已在 build 内加载，此处仅补发字体（sync 按变更检测，重复调用幂等）。
-        // 快捷输入格式表的用户调整（右键调序/停用）：真相在 store，这里装载运行时镜像。
-        // 必须在 store 就位之后——构造体内只能给空初值。
-        coordinator.reload_quick_adjust();
-        coordinator.sync_chaizi_assets();
-        // 注释词库首次加载（`[[ui.comment_dicts]]`，出厂为空数组=不加载任何库）。
-        coordinator.sync_comment_dicts();
-        // emoji 扩展表首次加载（`[input.emoji]`，出厂 enabled=false ⇒ 不打开任何文件）。
-        coordinator.sync_emoji_dict();
+        // 快捷输入调整 / 拆字字根字体（PUA 字根渲染，路径 + DWrite 家族名取自主码表方案
+        // [engine.chaizi]）/ 注释库 / emoji 的首次装载，见 `load_data_on_start`。
+        coordinator.load_data_on_start();
         // 统一应用外观项（幂等）：补齐上面手动块未含的翻页栏 / 页码等外观项，
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
         coordinator
+    }
+
+    /// 生产构造器在 `build` 之后的**非 UI** 数据装载（快捷输入调整、拆字、注释库、emoji）。
+    ///
+    /// 抽出来是为了让 `debug_desktop_startup_and_prewarm`（本机复现内存的探针入口）与
+    /// `new` 走同一份序列，不各抄一份而漂移。
+    pub(crate) fn load_data_on_start(&self) {
+        // 快捷输入格式表的用户调整（右键调序/停用）：真相在 store，这里装载运行时镜像。
+        // 必须在 store 就位之后——构造体内只能给空初值。
+        self.reload_quick_adjust();
+        // 拆字库已在 build 内加载，此处仅补发字体（sync 按变更检测，重复调用幂等）。
+        self.sync_chaizi_assets();
+        // 注释词库首次加载（`[[ui.comment_dicts]]`，出厂为空数组=不加载任何库）。
+        self.sync_comment_dicts();
+        // emoji 扩展表首次加载（`[input.emoji]`，出厂 enabled=false ⇒ 不打开任何文件）。
+        self.sync_emoji_dict();
+    }
+
+    /// 启动预热线程的主体（`new` 里延迟 1.5 秒后调；**阻塞**，只可在后台线程 / 测试里调）：
+    /// 按方案常驻策略建方案引擎（[`Self::prewarm_schemas_on_start`]：全部常驻，或只建
+    /// 用得着的），再 [`Self::prewarm_indexes`]，常驻关着时最后校验其余方案的缓存
+    /// （[`Self::refresh_schema_caches_on_start`]）。
+    ///
+    /// 与 `debug_desktop_startup_and_prewarm` 共用，理由同 [`Self::load_data_on_start`]。
+    pub(crate) fn prewarm_on_start(&self) {
+        self.prewarm_schemas_on_start();
+
+        // 反查索引（悬停[编码]/编码提示/词语联想的数据源）同样要提前建好。
+        //
+        // 它此前是**首次按键时**才懒构建的，而对大词库那是秒级操作，恰好落在
+        // TSF→服务的同步 IPC 链路上：真机 feihuzj2（253 万条）实测让整机卡了
+        // 29.5 秒。放到这里之后，绝大多数用户永远碰不到那次构建。
+        //
+        // 只预热**当前用得着的方案**（悬停编码段与词语联想各自的来源方案，
+        // 混输下通常同为主码表成员）：其余方案的索引切过去时才有意义，而每份
+        // 索引对超大词库是百 MB 量级（护栏本就只保留两份），全量预热等于把内存
+        // 花在用户未必会用的方案上。
+        //
+        // 与测试、移动端 prepare() 共用 `prewarm_indexes`，避免三处各写一份。
+        self.prewarm_indexes();
+        // 常驻关着时，其余方案只校验派生缓存（排在索引之后，见该函数文档）。
+        self.refresh_schema_caches_on_start();
     }
 
     /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
@@ -358,14 +356,19 @@ impl Coordinator {
                 // `backup.restore` / `dict.clear` 之后直接丢；读那一路躲不掉——设置页的
                 // 分页要给精确 `total` 就不能早退，照样扫完整表——只能靠这条兜。
                 //
-                // 60 秒 / 10 秒一拍：判据是「真的没人在用」，那时重开 Database 的几毫秒
-                // 与随后几次冷查询都没人感知得到。间隔不做成配置键（见该函数的文档）。
+                // 长档 60 秒：判据是「真的没人在用」，那时重开 Database 的几毫秒与随后几次
+                // 冷查询都没人感知得到。短档 3 秒：设置页列表 / 导出、后台建索引这类全表扫描
+                // 做完只标记（`Store::mark_scan_pending[_rows]`），停手 3 秒就还——持续打字时
+                // 长档等不到，而自动造词让打字中反复重建索引，当场回收会让按键线程陪等关库重开。
+                // 1 秒一拍。
+                // 时长不做成配置键（见 wind-store `RECLAIM_IDLE` 的文档）。
                 //
                 // 同一时刻顺带整理堆：丢掉的页缓存、此前构建索引与全表扫的临时分配都只是回到
                 // 分配器手里，不整理的话私有内存停在历史峰值（见 heap_trim.rs）。
                 s.spawn_idle_cache_reclaimer_then(
-                    std::time::Duration::from_secs(60),
-                    std::time::Duration::from_secs(10),
+                    wind_store::store::RECLAIM_IDLE,
+                    wind_store::store::SCAN_RECLAIM_IDLE,
+                    wind_store::store::RECLAIM_TICK,
                     crate::heap_trim::release_free_heap,
                 );
                 Some(s)

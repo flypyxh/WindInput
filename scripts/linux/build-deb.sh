@@ -30,14 +30,18 @@ SETTING_TARGET="${SETTING_TARGET:-$WORK_DIR/target-setting}"
 ARCH="$(dpkg --print-architecture)"
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 
+# 不加 --locked，与 Windows / macOS 的发布构建一致：设置程序经 path 依赖引用 wind-ui-rust 等兄弟仓，
+# 它们升版本后锁文件常常没跟上，--locked 会让 Linux 一端单独在发版时失败。
+# 等这些依赖改走 crates.io、锁文件稳定下来，再三端统一加回 --locked。
+
 # ── 服务 ──
 (cd "$SRC_DIR/wind_input" && CARGO_TARGET_DIR="$SERVICE_TARGET" \
-    cargo build --release --locked -p wind_service --features linux-host)
+    cargo build --release -p wind_service --features linux-host)
 
 # ── 设置程序 ──
 # 版本号与服务同源（docs/VERSION），不走 git——worktree 的 .git 指向宿主路径，容器里读不到。
 (cd "$SETTING_DIR" && WIND_APP_VERSION="$APP_VERSION" CARGO_TARGET_DIR="$SETTING_TARGET" \
-    cargo build --release --locked)
+    cargo build --release)
 
 # ── addon ──
 cmake -S "$SRC_DIR/wind_linux" -B "$WORK_DIR/cmake" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
@@ -56,7 +60,6 @@ bash "$SRC_DIR/scripts/lib/gen-compat.sh" linux "$DATA_DIR/compat.toml" "$S/usr/
 # addon / 输入法描述：cmake 只装了库，描述文件（构建目录里 configure_file 出来的）补进去。
 install -Dm644 $WORK_DIR/cmake/share/fcitx5/addon/windinput.conf "$S/usr/share/fcitx5/addon/windinput.conf"
 install -Dm644 $WORK_DIR/cmake/share/fcitx5/inputmethod/windinput.conf "$S/usr/share/fcitx5/inputmethod/windinput.conf"
-install -Dm755 $SRC_DIR/scripts/linux/pkg/windinput-setup "$S/usr/bin/windinput-setup"
 install -Dm755 $SETTING_TARGET/release/wind_setting "$S/usr/lib/windinput/wind_setting"
 install -Dm644 $SRC_DIR/scripts/linux/pkg/windinput-setting.desktop "$S/usr/share/applications/windinput-setting.desktop"
 install -Dm644 $SRC_DIR/scripts/linux/pkg/windinput-import.desktop "$S/usr/share/applications/windinput-import.desktop"
@@ -73,7 +76,7 @@ find "$S" -type f ! -perm /111 -exec chmod 644 {} +
 # 链接期依赖交给 dpkg-shlibdeps 按真实 ELF 符号算（libc6 / libstdc++6 / libgcc-s1 / libfcitx5* / libxcb*），
 # 而不是手写——以后升级编译器或第三方库时手写表很容易漏。算不到的才手写：fcitx5 本体与最低版本
 # （addon 按 5.0.14 的头文件编，是发布基线）、运行时 dlopen 的 libfontconfig1（ELF 里没有 NEEDED）、
-# 字体 / python3 / procps 这类非库依赖。
+# 字体 / procps 这类非库依赖。
 SHL="$WORK_DIR/shlibs"
 rm -rf "$SHL"; mkdir -p "$SHL/debian"
 printf 'Source: windinput\n\nPackage: windinput\nArchitecture: any\n' >"$SHL/debian/control"
@@ -81,7 +84,7 @@ SHLIBS_DEPENDS="$(cd "$SHL" && dpkg-shlibdeps -O \
     -e"$S/usr/lib/windinput/wind_input" -e"$S/usr/lib/windinput/wind_setting" \
     -e"$(find "$S/usr/lib" -name libwindinput.so -path '*fcitx5*')" | sed -n 's/^shlibs:Depends=//p')"
 [[ -n "$SHLIBS_DEPENDS" ]] || { echo "dpkg-shlibdeps 没有算出依赖" >&2; exit 1; }
-EXTRA_DEPENDS="fcitx5 (>= 5.0.14), libfontconfig1, fonts-noto-cjk | fonts-wqy-microhei | fonts-wqy-zenhei, python3, procps"
+EXTRA_DEPENDS="fcitx5 (>= 5.0.14), libfontconfig1, fonts-noto-cjk | fonts-wqy-microhei | fonts-wqy-zenhei, procps"
 
 mkdir -p "$S/DEBIAN"
 SIZE=$(du -sk --apparent-size "$S" | cut -f1)
@@ -99,7 +102,7 @@ Homepage: https://windinput.com
 Description: 清风输入法 (WindInput) —— Fcitx5 输入法引擎
  清风输入法的 Linux 版（测试版）：Rust 服务负责输入逻辑与候选窗渲染，
  Fcitx5 addon 负责与应用对接，另带图形设置程序（应用菜单「清风输入法设置」，
- 或在输入时按 Ctrl+Shift+]）。安装后运行 windinput-setup 配置当前用户。
+ 或在输入时按 Ctrl+Shift+]）。安装后在 Fcitx5 配置的输入法列表里添加「清风输入法」即可使用。
 CONTROL
 # 结束服务只认包里那个路径：addon 用 posix_spawn 拉起时 argv 恰为这一个全路径、不带参数，
 # 菜单「重启服务」自拉起的再多一个 `--restarted`；`pkill -x -f` 要求整条命令行与模式完全
@@ -113,7 +116,7 @@ if [ "$1" = configure ]; then
     # 升级时旧服务还在跑旧二进制：结束它，addon 在下次连不上时会自动拉起新版。
     # （已加载进 fcitx5 的旧 addon 需重启 fcitx5 或重新登录才换新。）
     pkill -x -f '/usr/lib/windinput/wind_input( --restarted)?' 2>/dev/null || true
-    echo "清风输入法已安装。请对每个使用者运行一次： windinput-setup   然后注销并重新登录（升级则重启 fcitx5：fcitx5 -rd）。"
+    echo "清风输入法已安装。在 Fcitx5 配置的输入法列表里添加「清风输入法」即可使用（首次安装需注销并重新登录；升级只需重启 fcitx5：fcitx5 -rd）。"
 fi
 exit 0
 POSTINST

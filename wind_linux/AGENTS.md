@@ -87,9 +87,9 @@ e2e 的坑，都踩过：
 - **xcompmgr + Xvfb 下 `xwd -root` 截到的合成结果不可信**（候选窗整体错位、文字出彩边），
   而 `xwd -id <候选窗>` 取到的窗口自身像素是对的。ARGB 路径因此只验到「窗口像素正确」，
   屏幕上的合成效果要在真桌面上看。
-- **Fcitx5 出厂 `AltTriggerKeys=Shift_L`** 会在引擎之前截走 Shift 单击，「Shift 切中英」永远
-  到不了服务。e2e 的 fcitx 配置把它清空；**真实用户也得清**（或在安装脚本里改），否则
-  出厂的 Shift 切中英在 Linux 上不生效——见下方差距表。
+- **Fcitx5 出厂 `AltTriggerKeys=Shift_L`** 会在引擎之前截走 Shift 单击。addon 在 `PreInputMethod`
+  阶段先接管（`WindEngine::claimShiftTap`，条件与取舍见设计文档 §8），**用户不必改任何 Fcitx5 配置**；
+  e2e 的 fcitx 配置保留出厂值并带「键盘 + 清风」两个输入法，Shift 用例就是回归。
 
 ## 协议用法（与 macOS 的异同）
 
@@ -333,7 +333,7 @@ forwardKey 对某类应用确实无效时才值得做，目前没有这样的证
 | 打开设置（`settings.open` 扩展信封） | 已接 | `WindEngine::onExt` → `spawnDetached`（与拉起服务同一个：双 fork 不留僵尸、新会话、继承 fcitx5 的会话环境，但不继承它的 fd 与信号处置；`fcitx::startProcess` 只做前两样）。设置程序已开着时由它自己的单实例转发参数；但**转来的切页要等设置窗口下一次输入事件才显示**（windui Linux 后端，冷启动深链正常） |
 | 系统关联（`windinput://` 协议、`.wpkg` / `.wtheme`） | 已接（deb 声明 + 设置程序可按用户注册） | deb 装 `scripts/linux/pkg/` 下两个 `.desktop` 与 `windinput.xml`，类型图标在 `data/icons/hicolor/*/mimetypes/`（`scripts/linux/gen-mime-icons.py`）；便携 / tarball 在设置「高级 → 系统集成」按用户注册（写 `$XDG_DATA_HOME`，语义见 wind-setting README「系统关联」）。`scripts/linux/e2e-assoc.sh` 覆盖类型识别、默认处理者、`xdg-open` / `gio open` 拉起设置程序进导入确认、首实例已开时转参、注册/取消一圈。未验：真桌面文件管理器双击（Nautilus / Dolphin / Deepin）、KDE 的 ktraderclient 查询分支、snap / flatpak 浏览器点链接；用户级注册不装图标 |
 | 全局热键 | 不做（确定） | 设置端藏掉热键对话框的「全局」勾选；热键只在输入法激活、有焦点时经按键通路生效 |
-| Shift 单击切中英 | **需清 Fcitx5 的 AltTriggerKeys** | 出厂 `Shift_L` 被 Fcitx5 截走。安装脚本应改 `~/.config/fcitx5/config`，或在 AGENTS 外的用户文档里写明 |
+| Shift 单击切中英 | 已接（addon 接管 Fcitx5 的 `AltTriggerKeys`） | `claimShiftTap`，设计文档 §8；用户清空 `AltTriggerKeys` 或当前不是清风时不插手 |
 | 「Shift+鼠标拖选不算单击」 | 缺 | Windows 靠 ToggleTapPolicy 的四个鼠标信号；Fcitx5 引擎收不到鼠标事件 |
 | CapsLock 状态通知（`VK_CAPITAL` keyup） | 已发 | 松开时发，服务端同步镜像、弹状态气泡、托盘换「A」；另由每键 `toggles` 校准 |
 | 英文输入统计（`CMD_INPUT_STATS`） | 不发 | 同 macOS |

@@ -45,8 +45,14 @@ fn emoji_real_upstream_end_to_end() {
     let cache = tmp.join("emoji.wemj");
 
     let tables = vec![word, category];
-    let dict = emojidict::load_or_build(&tables, &[octrie], &cache, |s| norm.convert_once(s))
-        .expect("真实数据建表失败");
+    let dict = emojidict::load_or_build(
+        &tables,
+        &[octrie],
+        &cache,
+        &[],
+        Some(&|s: &str| norm.convert_once(s)),
+    )
+    .expect("真实数据建表失败");
 
     // ── 1. 繁简归一确实生效 ────────────────────────────────────────────────
     // 上游键全是繁体（实测 国0/國28、爱0/愛16）。查得到简体键 ⇒ 归一这一步真跑了。

@@ -385,8 +385,16 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    透传、熔断 3 秒后自愈，不卡死。
 9. **SHM 名被别的用户抢先占用**：名字带 uid 后别人仍可在 `/dev/shm` 建我们的名字（`O_EXCL` 失败），
    服务端建不了段、候选窗不显示；addon 按属主拒收，内容伪造不了。只是拒绝服务，不处理。
+10. **GNOME Wayland 会话下候选窗位置不准（已知限制，不修）**：GNOME 没有 input-method-v2，Wayland 原生应用
+   （如 gedit，`frontend=dbus`）经 DBus 前端报的 `cursorRect` 是**窗口相对坐标**，而 X11 路径把它当屏幕
+   坐标摆，候选窗于是不跟窗口走。2026-10-10 在 Ubuntu 22.04（GNOME Shell 42.9）实测：gedit 报
+   `rect=(344,76 0x18)`，服务端摆到 `(344,96)`。addon 自己换算不了——Wayland 客户端不知道窗口的屏幕位置，
+   GNOME 42 又封了 `Introspect.GetWindows`（AccessDenied）与 `Shell.Eval`。唯一做准的办法是写 GNOME Shell
+   扩展取焦点窗口 frame 再回传（kimpanel 即此思路），成本高且随 GNOME 版本变，暂不做。
+   X11 会话（含 XWayland 应用）正常；Deepin 25 的 treeland 有 input-method-v2，走 popup surface，正常。
+   较新的 GNOME 是否有变化未验证。
 
-## 8. 安装包与 `windinput-setup` 的取舍
+## 8. 安装包：只装 deb 就能用（不再有 `windinput-setup`）
 
 - **升级 / 卸载结束服务**：postinst（仅 `configure`）与 postrm（仅 `remove`）用
   `pkill -x -f '/usr/lib/windinput/wind_input( --restarted)?'`，按整条命令行精确匹配包里那个路径
@@ -398,11 +406,17 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
   菜单「重启服务」走的 `process::exit` 同样不跑。丢的只是防抖窗口内的界面位置类状态（工具栏位置、
   软键盘页等），`config.toml` 的写入不经防抖、不受影响。补优雅退出要在 wind-coordinator 暴露 flush
   接口并在服务里装信号处理线程，收益只是「升级那一刻前 1 秒内拖过的位置」，暂不做。
-- **`windinput-setup` 与正在运行的 fcitx5**：fcitx5 退出时（注销即是）会把内存里的输入法组整份写回
-  `profile`，运行中改盘会被冲掉；`fcitx5-remote -r` 只重读全局配置、不重读 profile（隔离的
-  `FCITX_CONFIG_HOME` 下用 SDK 的真 fcitx5 5.1.7 实测）。所以脚本检测到本用户的 fcitx5 在跑时先
-  `fcitx5-remote -e` 让它退出（写回发生在改动之前），改完在有图形会话时 `fcitx5 -d` 拉起；全局
-  `config`（AltTriggerKeys）退出时不写回，不受此影响。离线测试：`scripts/linux/test-setup.sh`。
+- **不再有一次性配置脚本**（2026-10-10 删除 `windinput-setup`）。发布的软件不能要求用户先跑一个
+  外部脚本才能用；原脚本做的四件事逐项处理如下：
+
+  | 原脚本做的事 | 现在 |
+  | --- | --- |
+  | 把清风加进 Fcitx5 输入法组 | 用户在 Fcitx5 配置（fcitx5-configtool）的输入法列表里添加——所有 Fcitx5 输入法的标准用法。脚本要先让运行中的 fcitx5 退出再改 `profile`（它退出时整份写回会冲掉改动），这类对用户配置的强改本身就是问题 |
+  | 清空 `AltTriggerKeys`（出厂 `Shift_L`） | addon 自己解决：`WindEngine::claimShiftTap` 在 `PreInputMethod` 阶段（早于 Fcitx5 在 `InputMethod` 阶段处理触发键）接过 Shift_L / Shift_R 的按下与松开，自己走 `keyEvent` 后 `filter()`，Fcitx5 的触发键逻辑看不到它（按下没记 `keyReleased_`，松开不会触发 `altTrigger`）。条件：本引擎是当前输入法、且该键确在 `AltTriggerKeys` 里——用户清空了它或当前是别的输入法就不插手。代价：想用 Shift 在清风与键盘布局间切换的人改用 Ctrl+Space（清风自己的 Shift 本来就是切中英）。e2e 的 fcitx5 配置保留出厂值并带「键盘 + 清风」两个输入法，Shift 用例即回归 |
+  | 用户配置里写初始方案 | 不做。出厂方案与 Windows 一致（五笔），随包的 `data/config.toml` 预置层原样分发；用户在设置里改方案后写进自己的 `config.toml` |
+  | `im-config -n fcitx5` | 不做。系统输入法框架是 Fcitx5 是所有 Fcitx5 输入法的共同前提（Deepin 默认；Ubuntu GNOME 在 `im-config` 里 `DESKTOP_SETUP_IBUS` 命中时恒选 ibus，装 fcitx5 不会自动切），写进安装说明；`im-config` 留在 Recommends |
+
+  依赖随之去掉 `python3`（只有该脚本用）。`procps` 保留（postinst / postrm 的 `pkill`）。
 
 ## 9. 发布流程接入（CI）
 
@@ -453,7 +467,7 @@ Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `
 - **依赖自动算**：`build-deb.sh` 用 `dpkg-shlibdeps` 取链接期依赖，只手写算不到的（fcitx5 本体与最低版本、
   运行时 `dlopen` 的 `libfontconfig1`、字体、python3、procps）；`verify-deb.sh` 校验关键项在。
   （此前手写表漏了 libstdc++6 / libgcc-s1 / libfcitx5*，靠 fcitx5 传递依赖才碰巧能装。）
-- **不写用户 HOME**：包只装 `/usr` 下文件；用户配置 / 词库由 `windinput-setup` 与程序首次运行时在用户目录创建；
+- **不写用户 HOME**：包只装 `/usr` 下文件；用户配置 / 词库由程序首次运行时在用户目录创建；
   `remove` / `purge` 都不动用户数据。
 - **不杀 fcitx5**：postinst / postrm 只结束包路径下的 `wind_input` 服务（addon 下次连不上会自动拉起新版），
   fcitx5 本身留给用户重启（`fcitx5 -rd` 或重新登录）。

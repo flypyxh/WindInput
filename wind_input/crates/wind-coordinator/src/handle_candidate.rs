@@ -317,6 +317,15 @@ fn sole_non_emoji(candidates: &[Candidate]) -> Option<&Candidate> {
 
 /// 规划 emoji 插入：返回 `(宿主下标, 该宿主要插入的 emoji)`，**不修改**候选列表。
 ///
+/// emoji 去重键：剥掉 U+FE0F（变体选择符 16，要求 emoji 呈现）。
+///
+/// 上游表里过半符号带尾随 FE0F（`✅️` 而非 `✅`），同一个符号两种写法按字符串比是两条，
+/// 会挤占 `max_per_word` 配额（`奖项` → `🏅️ 🏅 🎖️`）。只用来比，**不改写**输出：FE0F 决定
+/// 彩色 emoji 还是黑白文本字形，谁先到用谁（见 `docs/design/text-mapping-tables.md` §2.3）。
+pub(crate) fn emoji_dedup_key(s: &str) -> String {
+    s.replace('\u{FE0F}', "")
+}
+
 /// # 为什么抽成纯函数
 ///
 /// [`Coordinator::apply_emoji_suggestions`] 的其余部分要真实的 `Coordinator`（配置 + mmap
@@ -330,7 +339,8 @@ fn sole_non_emoji(candidates: &[Candidate]) -> Option<&Candidate> {
 /// - `exact_only` 时跳过前缀补全与子短语：那些候选本身就是「猜」出来的，再挂 emoji 只会
 ///   放大噪音；
 /// - 去重集合**起手装入全部既有候选文本**：词库里本来就收了那个 emoji 时不再重复给一条，
-///   多个宿主命中同一个 emoji 时也只给一条。
+///   多个宿主命中同一个 emoji 时也只给一条。去重按 [`emoji_dedup_key`]（剥掉 U+FE0F）比，
+///   保留先到者的原形。
 fn plan_emoji_insertions(
     candidates: &[Candidate],
     exact_only: bool,
@@ -339,8 +349,10 @@ fn plan_emoji_insertions(
     min_chars: usize,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Vec<(usize, Vec<String>)> {
-    let mut seen: std::collections::HashSet<String> =
-        candidates.iter().map(|c| c.text.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|c| emoji_dedup_key(&c.text))
+        .collect();
     let mut picks: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, c) in candidates.iter().enumerate().take(max_hosts) {
         if c.is_emoji_suggestion || c.text.chars().count() < min_chars {
@@ -357,7 +369,7 @@ fn plan_emoji_insertions(
             if picked.len() >= max_per_word {
                 break;
             }
-            if seen.insert(e.to_string()) {
+            if seen.insert(emoji_dedup_key(e)) {
                 picked.push(e.to_string());
             }
         }
@@ -567,11 +579,13 @@ impl Coordinator {
         history_text: &str,
         source: CandidateSource,
     ) {
+        // 历史先记、与词频文本空不空无关：两条通路独立（理由见 emoji 守卫）。空显示标签的
+        // `$CC` 纯文本命令就是 `freq_text` 空而上屏文本非空的例子。
+        self.push_commit_history(history_text);
         let text = freq_text;
         if text.is_empty() {
             return;
         }
-        self.push_commit_history(history_text);
         if source == CandidateSource::Phrase {
             return;
         }
@@ -654,7 +668,7 @@ impl Coordinator {
             max_hosts,
             max_per_word,
             min_chars,
-            |t| dict.lookup(t).map(str::to_string),
+            |t| dict.lookup(t),
         );
         if picks.is_empty() {
             return;
@@ -1003,6 +1017,25 @@ impl Coordinator {
         out
     }
 
+    /// 满码自动上屏复核：引擎意向 `t` 是否指向这条候选，可以放行。
+    ///
+    /// 意向有两种来路，都要认：引擎首轮按**词条原文**给（`$` 模板词条是 `$Y年$M月$D日`，
+    /// 要比 `template_source`）；显示态复评（`recheck_auto_commit`）按**展开后的候选**给
+    /// （比 `text`）。`$CC` 命令另由调用方按 `phrase_template` 认。
+    ///
+    /// **`{..}` 插值一律不放行**，两种来路都拦：剪贴板 / 反查这类内容取自外部状态，自动
+    /// 上屏等于不经候选窗就把用户没看过的内容送出去（剪贴板值还是「宁陈旧勿等待」的缓存）。
+    /// 它们须手动选。纯 `$` 模板（日期等）可预期，与 `$CC` 纯文本命令同口径（GH#177）。
+    pub(crate) fn auto_commit_target_matches(c: &Candidate, t: &str) -> bool {
+        if c.template_source
+            .as_deref()
+            .is_some_and(|s| s.contains('{'))
+        {
+            return false;
+        }
+        c.text == t || c.template_source.as_deref() == Some(t)
+    }
+
     /// 短语候选的**稳定 id**（`Candidate::id`）：`phrase:{code}:{原始记录文本}`，对齐 Go
     /// `dict.phraseCandID`。供 shadow 规则跨日精准匹配——短语的显示文本可能是模板求值结果
     /// （`date` 的 `$Y-$MM-$DD` → `2026-07-29`），以文本为键的规则次日必失配。
@@ -1011,15 +1044,6 @@ impl Coordinator {
     /// shadow 规则的存储键 code 同源；`raw` 为 store 里的 `PhraseEntry.text`（模板未展开）。
     /// `raw` 为空（测试直构的 `PhraseHit::plain` / `$AA` 字面元素）→ 返回空 id，表示该候选
     /// 无稳定身份，shadow 落回文本匹配。
-    /// 满码自动上屏复核：引擎意向 `t`（词条原文）是否就是这条 `$` 模板候选展开前的源文本。
-    ///
-    /// **`{..}` 插值不放行**：剪贴板 / 反查这类内容取自外部状态，自动上屏等于不经候选窗
-    /// 就把用户没看过的内容送出去（剪贴板值还是「宁陈旧勿等待」的缓存）。它们维持原状——
-    /// 恒不满码自动上屏，须手动选。纯 `$` 模板（日期等）可预期，与 `$CC` 纯文本命令同口径。
-    pub(crate) fn template_auto_commit_matches(c: &Candidate, t: &str) -> bool {
-        c.template_source.as_deref() == Some(t) && !t.contains('{')
-    }
-
     pub(crate) fn phrase_cand_id(code: &str, raw: &str) -> String {
         if raw.is_empty() {
             return String::new();
@@ -1793,9 +1817,8 @@ impl Coordinator {
         let outcome = match auto_commit
             .filter(|t| {
                 state.candidates.iter().any(|c| {
-                    &c.text == t
-                        || (c.is_command && &c.phrase_template == t)
-                        || Self::template_auto_commit_matches(c, t)
+                    (c.is_command && &c.phrase_template == t)
+                        || Self::auto_commit_target_matches(c, t)
                 })
             })
             // 短语侧否决：引擎的「唯一」判在**码表候选子集**上跑（`decide_auto_commit` 按
@@ -4671,9 +4694,9 @@ impl Coordinator {
                     codes.push(c);
                 }
             }
-            // 库里存的是模板源文本（`rq` → `$Y年$M月$D日`），`text` 是当天展开结果，
-            // 按后者删恒 miss（GH#177）。
-            let stored_text = cand.template_source.as_deref().unwrap_or(&cand.text);
+            // 库里存的是词条原文：模板词是源文本（`rq` → `$Y年$M月$D日`，GH#177）、英文是
+            // 大小写投影前的形态；`text` 是展开 / 投影后的样子，按它删恒 miss。
+            let stored_text = cand.freq_text();
             // 删之前先查。**没有这一步，三种结局在日志里长得一模一样**：`redb` 的 `remove`
             // 对不存在的 key 静默成功，而 key 由 schema+code+text 三段拼成，任一段错配的
             // 表现都是「点了删除、界面毫无变化、词还在词库里」。
@@ -5450,6 +5473,25 @@ mod plan_emoji_tests {
             vec!["😊".to_string(), "🙂".to_string(), "😁".to_string()],
             "已在候选里的 😄 应被跳过"
         );
+    }
+
+    /// 同一符号带 / 不带 U+FE0F 只算一个：表内重复只留先到者的原形，已有候选也挡得住。
+    /// 回归：上游表开分类后「奖项」出 `🏅️ 🏅 🎖️`，三个配额两个是同一枚奖牌。
+    #[test]
+    fn dedups_variation_selector_forms() {
+        let fe0f = |t: &str| match t {
+            "奖项" => Some("🏅\u{FE0F} 🏅 🎖\u{FE0F} 🥇".to_string()),
+            "打勾" => Some("✅\u{FE0F} ✔\u{FE0F}".to_string()),
+            _ => None,
+        };
+        let got = plan_emoji_insertions(&[c("奖项")], true, 1, 3, 2, fe0f);
+        assert_eq!(
+            got[0].1,
+            ["🏅\u{FE0F}", "🎖\u{FE0F}", "🥇"],
+            "裸 🏅 是前一条的另一种写法，跳过；保留先到的带 FE0F 形态"
+        );
+        let got = plan_emoji_insertions(&[c("打勾"), c("✅")], true, 1, 3, 2, fe0f);
+        assert_eq!(got[0].1, ["✔\u{FE0F}"], "候选里已有 ✅，表里的 ✅️ 不再给");
     }
 
     /// 两个宿主命中同一个 emoji 时只给一条。

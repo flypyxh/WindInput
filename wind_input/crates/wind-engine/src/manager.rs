@@ -403,9 +403,30 @@ pub const ASSOC_TEMP_MIN_COUNT: u32 = 2;
 /// 词语联想：每档先取 `limit ×` 本值作重排池。
 pub const ASSOC_POOL_FACTOR: usize = 4;
 
+/// [`LoadedEngine::last_used`] 的记号：校验缓存刚建好、还没人用过（见
+/// [`EngineManager::refresh_schema_cache`]）。时钟读数从 0 往上走，碰不到它。
+const UNTOUCHED: u64 = u64::MAX;
+
+/// `engines` 表里的一项：引擎 + 最后使用时刻（方案常驻策略的闲置淘汰用）。
+///
+/// 时刻存的是 [`EngineManager::use_clock`] 的读数（毫秒，粗粒度——淘汰拍子推进一次），
+/// 不在取引擎时读系统时钟：按键热路径上的全部开销就是一次原子读 + 一次原子写。
+struct LoadedEngine {
+    engine: Arc<dyn Engine>,
+    last_used: std::sync::atomic::AtomicU64,
+}
+
 pub struct EngineManager {
-    /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
-    engines: Mutex<HashMap<String, Arc<dyn Engine>>>,
+    /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）+ 最后使用时刻
+    engines: Mutex<HashMap<String, LoadedEngine>>,
+    /// 淘汰时钟的零点（构造时刻）。
+    clock_origin: std::time::Instant,
+    /// 淘汰时钟：距 `clock_origin` 的毫秒数，**只在淘汰拍子里推进**（[`Self::evict_idle`]）。
+    ///
+    /// 取引擎时把它的当前读数记进 [`LoadedEngine::last_used`]——不直接读系统时钟，是为了让
+    /// 按键热路径上只多一次原子读写。代价是「最后使用」的精度只到一个拍子（生产 1 分钟），
+    /// 对 30 分钟的闲置判据无关紧要。
+    use_clock: std::sync::atomic::AtomicU64,
     /// 当前活跃方案 ID
     active: Mutex<String>,
     /// 活跃方案的**变更代际**：每次 `active` 真正改变时 +1。
@@ -535,11 +556,16 @@ pub struct EngineManager {
     user_assoc: crate::user_assoc::SharedSlot,
     /// 按词查编码的用户层，按方案分槽。见 [`crate::text_codes`]。
     user_text: crate::text_codes::SharedSlots,
+    /// 用户层后台重建写回之后的回调（协调器借它重刷当前这屏候选，见
+    /// [`Self::set_user_text_built_hook`]）。
+    user_text_built: std::sync::OnceLock<crate::text_codes::BuiltHook>,
     /// 码表**单字全码**表缓存:方案 id → (汉字 → 全码)。供造词按 `[[encoder.rules]]` 组装
     /// 词组编码(见 `encode_word`)。与 `reverse_index` 分开是刻意的——那份按「码长升序」排,
     /// 服务悬停 `[编码]` 的打法列表展示;这份要的是「按权重挑全码」,两种排序需求互斥。
     /// **只缓存一份**:造词恒对活跃方案(混输则其主码表)进行,切方案即弃,无需两份护栏。
     single_char_codes: Mutex<Option<SingleCharCodeCache>>,
+    /// 单字全码表的最后使用（[`Self::use_clock`] 读数），供闲置清扫（[`Self::evict_idle_caches`]）。
+    single_char_used: std::sync::atomic::AtomicU64,
     /// 全局拼音配置（fuzzy/code_hint_source/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
     /// 双拼韵母键集缓存：(已缓存的活跃方案 id, Option<HashSet<u8>>)。
@@ -596,6 +622,25 @@ pub struct EngineManager {
     /// 测试钩子：上面两份事实被真正重算的次数。
     #[cfg(test)]
     data_facts_builds: std::sync::atomic::AtomicUsize,
+}
+
+/// 诊断：[`EngineManager::memory_report`] 的结果。字节数都按容量估、不含分配器开销。
+#[derive(Debug, Default, Clone)]
+pub struct MemoryReport {
+    /// 已加载引擎：(方案 id, 引擎类型, 引擎内已建懒建结构)。
+    pub engines: Vec<(String, String, Vec<crate::engine::MemPart>)>,
+    /// 反查索引：(方案 id, 常驻堆字节, 镜像总字节)；mmap 的常驻堆为 0。
+    pub reverse_index: Vec<(String, usize, usize)>,
+    /// 按词查编码用户层：(数据方案 id, 堆字节, 是否在重建中)。
+    pub user_text: Vec<(String, usize, bool)>,
+    /// 联想用户词索引：(数据方案 id, 堆字节)。
+    pub user_assoc: Option<(String, usize)>,
+    /// 单字全码表：(方案 id, 堆字节, 分配块数)。
+    pub single_char: Option<(String, usize, usize)>,
+    pub user_text_builds: crate::text_codes::BuildStatsSnapshot,
+    pub user_assoc_builds: crate::text_codes::BuildStatsSnapshot,
+    /// `CharPinyinIndex` 构建（每个拼音引擎一份、首次用到时在调用线程上同步建）。
+    pub char_pinyin_builds: crate::text_codes::BuildStatsSnapshot,
 }
 
 /// 方案文件里「按需加载」要看的事实（协调器 `DataNeeds` 的材料），见
@@ -692,9 +737,11 @@ fn cache_path(source: &Path, ext: &str) -> std::path::PathBuf {
     source.with_extension(ext)
 }
 
-/// 递归删除目录下的缓存产物（wdat 词库 / fp 指纹 / wdb unigram），best-effort：
-/// 单个文件删除失败（如仍被 mmap 占用）计入 failed 继续。只认扩展名白名单，
-/// 不触碰目录本身与其它文件（缓存根与用户数据同在 %LOCALAPPDATA% 命名空间下）。
+/// 递归删除目录下的缓存产物（wdat 词库 / fp 指纹 / wdb unigram / wridx 反查索引 /
+/// building 构建死亡记录 / 英文词组索引 `phrase-*.wphr` 及其写盘临时文件），best-effort：
+/// 单个文件删除失败（如仍被 mmap 占用）计入 failed 继续。只认白名单（扩展名，外加词组
+/// 索引的文件名形态——`.tmp` 只按扩展名认太宽），不触碰目录本身与其它文件（缓存根与
+/// 用户数据同在 %LOCALAPPDATA% 命名空间下）。
 fn purge_cache_files(dir: &Path, removed: &mut usize, failed: &mut usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -714,7 +761,10 @@ fn purge_cache_files(dir: &Path, removed: &mut usize, failed: &mut usize) {
         let is_cache = p
             .extension()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb" | "wridx" | "building"));
+            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb" | "wridx" | "building"))
+            || p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::english_phrase::is_phrase_cache_file);
         if !is_cache {
             continue;
         }
@@ -745,6 +795,12 @@ fn dir_has_yaml(dir: &Path) -> bool {
 
 /// [`EngineManager::read_dict_head`] 只读这么多字节的头 —— 超出即认定正文早已开始。
 const DICT_HEAD_SCAN_LIMIT: usize = 64 * 1024;
+
+/// rime 词库文件后缀（发现目录只认这一种）。
+const DICT_YAML_SUFFIX: &str = ".dict.yaml";
+
+/// 码表 / 拼音方案没声明 `[[dictionary_dirs]]` 时兜底的发现目录名（主词库所在目录下）。
+const DEFAULT_DICT_DIR: &str = "ext";
 
 /// 把 `sibling` 接到 `rel` 所在目录下：`pinyin/rime_frost.dict.yaml` +
 /// `cn_dicts/corrections.dict.yaml` → `pinyin/cn_dicts/corrections.dict.yaml`。
@@ -825,6 +881,8 @@ impl EngineManager {
 
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
+            clock_origin: std::time::Instant::now(),
+            use_clock: std::sync::atomic::AtomicU64::new(0),
             active: Mutex::new(active_id.clone()),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             available: Mutex::new(available),
@@ -861,7 +919,9 @@ impl EngineManager {
             reverse_index: Mutex::new(HashMap::new()),
             user_assoc: Default::default(),
             user_text: Default::default(),
+            user_text_built: std::sync::OnceLock::new(),
             single_char_codes: Mutex::new(None),
+            single_char_used: std::sync::atomic::AtomicU64::new(0),
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
             shuangpin_reverse_cache: Mutex::new((String::new(), None)),
@@ -1320,7 +1380,13 @@ impl EngineManager {
         }
         let system = self.reverse_index_if_ready(schema_id);
         let user = self.store.as_ref().and_then(|s| {
-            crate::text_codes::get_or_refresh(&self.user_text, s, &self.data_schema_id(schema_id))
+            crate::text_codes::get_or_refresh(
+                &self.user_text,
+                s,
+                &self.data_schema_id(schema_id),
+                self.use_clock_now(),
+                self.user_text_built.get().cloned(),
+            )
         });
         crate::text_codes::TextCodeView { system, user }
     }
@@ -1332,9 +1398,24 @@ impl EngineManager {
         }
         let built_sys = self.prewarm_reverse_index(schema_id);
         let built_user = self.store.as_ref().is_some_and(|s| {
-            crate::text_codes::prewarm(&self.user_text, s, &self.data_schema_id(schema_id))
+            crate::text_codes::prewarm(
+                &self.user_text,
+                s,
+                &self.data_schema_id(schema_id),
+                self.use_clock_now(),
+            )
         });
         built_sys || built_user
+    }
+
+    /// 注册「用户层后台重建写回之后」的回调（一次性，重复注册忽略）。
+    ///
+    /// 用户层缺失 / 过期时查询本次没有用户码、另起后台重建（[`Self::text_codes`]）；没有这个
+    /// 回调，建好之后要等用户下一次按键才看得到——闲置清扫释放之后回来的第一键尤其如此。
+    /// 回调在重建线程上、出锁之后调；与反查索引后台建成后的重绘（协调器 `spawn_index_warm`）
+    /// 同一个意思。
+    pub fn set_user_text_built_hook(&self, hook: crate::text_codes::BuiltHook) {
+        let _ = self.user_text_built.set(hook);
     }
 
     /// 清空「按词查编码」的用户层（全部方案槽）。配置不再有消费者时由协调器调，释放内存
@@ -1343,6 +1424,55 @@ impl EngineManager {
     /// 再用到，照常走首次使用时后台重建。
     pub fn clear_user_text(&self) {
         crate::text_codes::clear(&self.user_text);
+    }
+
+    /// 诊断：各懒建结构的自报大小与已加载引擎清单（`docs/design/memory-footprint.md` S5）。
+    /// 只读：逐个取锁拷出数字，不触发任何构建。
+    pub fn memory_report(&self) -> MemoryReport {
+        let engines: Vec<(String, Arc<dyn Engine>)> = {
+            let g = self.engines.lock().unwrap_or_else(|e| e.into_inner());
+            let mut v: Vec<_> = g
+                .iter()
+                .map(|(k, l)| (k.clone(), l.engine.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let engines = engines
+            .into_iter()
+            .map(|(id, e)| (id, format!("{:?}", e.engine_type()), e.memory_parts()))
+            .collect();
+        let reverse_index = {
+            let g = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
+            let mut v: Vec<_> = g
+                .iter()
+                .map(|(k, i)| (k.clone(), i.heap_bytes(), i.image_bytes()))
+                .collect();
+            v.sort();
+            v
+        };
+        let single_char = self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(id, m)| {
+                let mut bytes = m.capacity() * (size_of::<(char, String)>() + 1);
+                for s in m.values() {
+                    bytes += s.capacity();
+                }
+                (id.clone(), bytes, 1 + m.len())
+            });
+        MemoryReport {
+            engines,
+            reverse_index,
+            user_text: crate::text_codes::report(&self.user_text),
+            user_assoc: crate::user_assoc::report(&self.user_assoc),
+            single_char,
+            user_text_builds: crate::text_codes::BUILD_STATS.snapshot(),
+            user_assoc_builds: crate::user_assoc::BUILD_STATS.snapshot(),
+            char_pinyin_builds: crate::pinyin::generate::BUILD_STATS.snapshot(),
+        }
     }
 
     /// 用户层当前在内存里的方案份数（诊断 / 测试用）。
@@ -1733,8 +1863,8 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(schema_id)
-            .filter(|e| e.disabled_dict_layers().is_some())
-            .cloned()
+            .filter(|l| l.engine.disabled_dict_layers().is_some())
+            .map(|l| Arc::clone(&l.engine))
     }
 
     /// 阻塞地把 `schema_id` 已加载引擎的影子层建好（预热线程 / 测试用，**不可进按键链路**）。
@@ -1877,6 +2007,17 @@ impl EngineManager {
     ) -> Option<std::path::PathBuf> {
         let key = Self::schema_cache_key(schema_id)?;
         Some(cache_root.join(&key).join(format!("{key}.wscc")))
+    }
+
+    /// 英文词组分词索引（`.wphr`）的落盘目录：`<cache>/<方案键>/`，文件名由索引自己按
+    /// 启用词库集合的指纹取（`phrase-<指纹>.wphr`，见 [`crate::english_phrase::LazyPhraseIndex`]）。
+    ///
+    /// 与 [`reverse_index_cache_path`](Self::reverse_index_cache_path) 同目录、同键：同源于该方案
+    /// 的整组词库，一起生、一起废。**无缓存根时 `None` = 不落盘**，理由也同那里——词库源常在
+    /// 只读的安装目录，不该把十几 MB 的派生产物落到源旁。
+    fn english_phrase_cache_dir(schema_id: &str) -> Option<std::path::PathBuf> {
+        let dir = CACHE_DIR.get()?.as_ref()?;
+        Some(dir.join(Self::schema_cache_key(schema_id)?))
     }
 
     /// 方案 id → 可安全当**目录名和文件名**用的键；id 为空时 `None`。
@@ -2132,6 +2273,8 @@ impl EngineManager {
 
     /// 取 `schema_id` 的单字全码表，缺则构建并缓存（只留一份，见字段注释）。
     fn single_char_full_codes(&self, schema_id: &str) -> Arc<HashMap<char, String>> {
+        self.single_char_used
+            .store(self.use_clock_now(), std::sync::atomic::Ordering::Relaxed);
         {
             let guard = self
                 .single_char_codes
@@ -2543,8 +2686,353 @@ impl EngineManager {
         self.ensure_loaded(schema_id)
     }
 
-    fn ensure_loaded(&self, schema_id: &str) -> bool {
+    /// 已加载就把「最后使用」记成当前淘汰时钟并返回 true；未加载返回 false。
+    ///
+    /// 记录与查表在**同一把 `engines` 锁**下：淘汰拍子也是持这把锁读「最后使用」再摘，
+    /// 故「取引擎的人刚确认它在表里、淘汰随即把它摘掉」不会发生——要么淘汰在前（这里
+    /// 看到未加载、去重建），要么记录在前（淘汰看到它刚用过）。
+    fn touch_loaded(&self, schema_id: &str) -> bool {
+        let g = self.engines.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(schema_id) {
+            Some(l) => {
+                l.last_used.store(
+                    self.use_clock.load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 淘汰时钟的当前读数（不推进）。
+    fn use_clock_now(&self) -> u64 {
+        self.use_clock.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 已加载引擎（**不触发构建、不记使用**）。
+    fn loaded_engine(&self, schema_id: &str) -> Option<Arc<dyn Engine>> {
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .map(|l| Arc::clone(&l.engine))
+    }
+
+    /// 已加载引擎的方案 id（升序）。诊断与测试用。
+    pub fn loaded_schemas(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// 方案常驻策略（`schema.keep_all_loaded = false`）下**不摘**的方案：
+    ///
+    /// - 当前方案；
+    /// - 临拼目标（开关开着、当前方案适用时；按 id 判，不触发加载）；
+    /// - `english`——临英候选开着，或共享英文引擎已被取走（英文混入 / 混输的英文子引擎握着
+    ///   同一个 `Arc`：这时从表里摘掉一分内存也省不下，下次 `ensure_loaded("english")`
+    ///   反倒会再建一份）。
+    ///
+    /// 混输的成员**不保护**：混输在 `build_engine` 里自建成员子引擎，用不到表里那份独立
+    /// 引擎，保护它只是多留一份没人用的副本。
+    ///
+    /// 启动常驻集合与闲置淘汰的保护名单是同一份，两处判据不会漂移。
+    /// 正在构建的方案还不在 `engines` 表里，天然不会被摘。
+    pub fn residency_protected(&self) -> std::collections::HashSet<String> {
+        let active = self.active_schema_id();
+        let mut keep = std::collections::HashSet::new();
+        let temp_pinyin_on = self
+            .temp_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enabled;
+        let primary_pinyin = self
+            .primary_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(t) = Self::resolve_temp_pinyin_target(
+            temp_pinyin_on,
+            self.loaded_engine_type(&active),
+            &primary_pinyin,
+        ) {
+            keep.insert(t);
+        }
+        let temp_english_on = self
+            .temp_english
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .show_candidates;
+        let english_shared = matches!(
+            *self
+                .shared_english_engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            Some(Some(_))
+        );
+        if temp_english_on || english_shared {
+            keep.insert(ENGLISH_SCHEMA.to_string());
+        }
+        keep.insert(active);
+        keep
+    }
+
+    /// 闲置淘汰（方案常驻策略关时由协调器的清扫拍子调）：先推进淘汰时钟，再把
+    /// 「`idle` 以上没用过、且不在 [`Self::residency_protected`] 里」的引擎从表里摘掉，
+    /// 返回被摘的方案 id。`idle = 0` 即「保护名单外的一律摘」（运行期把常驻关掉时用）。
+    ///
+    /// 只摘引擎与**只属于它**的派生索引（[`Self::forget_unloaded`]），不动方案配置缓存：
+    /// 配置没变，再切回来时按原样重建即可（派生缓存文件仍新鲜 ⇒ 只是 mmap + 建外壳）。
+    pub fn evict_idle(&self, idle: std::time::Duration) -> Vec<String> {
+        let now = self.advance_use_clock();
+        let idle_ms = idle.as_millis() as u64;
+        let keep = self.residency_protected();
+        let mut dropped: Vec<(String, LoadedEngine)> = Vec::new();
+        {
+            let mut g = self.engines.lock().unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<String> = g
+                .iter()
+                .filter(|(id, l)| {
+                    !keep.contains(id.as_str())
+                        && now
+                            .saturating_sub(l.last_used.load(std::sync::atomic::Ordering::Relaxed))
+                            >= idle_ms
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                if let Some(l) = g.remove(&id) {
+                    dropped.push((id, l));
+                }
+            }
+        }
+        // 出锁再放引擎（解映射、释放外壳不该挡住取引擎的按键线程）。
+        let ids: Vec<String> = dropped.into_iter().map(|(id, _)| id).collect();
+        for id in &ids {
+            self.forget_unloaded(id);
+        }
+        if !ids.is_empty() {
+            info!("闲置淘汰方案引擎：{:?}", ids);
+        }
+        ids
+    }
+
+    /// 推进淘汰时钟到当前时刻并返回读数（只在清扫拍子里调，见 [`Self::use_clock`]）。
+    fn advance_use_clock(&self) -> u64 {
+        let now = self.clock_origin.elapsed().as_millis() as u64;
+        self.use_clock
+            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+        now
+    }
+
+    /// 懒建缓存的闲置清扫（`docs/design/memory-footprint.md` §7；协调器清扫拍子调，与方案
+    /// 常驻策略无关、恒生效）：先推进淘汰时钟，再释放 `idle` 以上没用过的
+    ///
+    /// - 单字全码表。释放后各消费方下次用到时就地重建（`.wscc` 新鲜时只是读一次盘，毫秒级；
+    ///   过期才全量重建），不丢活：
+    ///   - 自动造词的草稿落库（协调器 `resolve_phrase_schemas`，后台线程）：反查索引就绪时
+    ///     同步建回来再落库；反查索引也没就绪才照旧整批放弃并派后台预热；
+    ///   - 快捷加词取码（按键线程）与设置页 `dict.encodeWords` / `dict.encode`（RPC 线程）：
+    ///     经 [`Self::encode_word`] / [`Self::encode_words`] 在调用线程上同步建回来。
+    /// - 按词查编码用户层的槽（悬停 [编码]、`${code_rev}`）。释放后下一次查询**本次没有用户层**
+    ///   （只出系统层的码），同时起后台重建，建好后下一次查询就有。
+    ///
+    /// 「最后使用」与引擎同一套打法：取用处一次原子写 / 已持锁时顺手写时钟读数。
+    /// 返回释放了的项（`single_char:<方案>` / `user_text:<数据方案>`），供日志与测试。
+    pub fn evict_idle_caches(&self, idle: std::time::Duration) -> Vec<String> {
+        let now = self.advance_use_clock();
+        let idle_ms = idle.as_millis() as u64;
+        let mut released = Vec::new();
+        // 摘下的表出锁再析构（2 万多个小块），别让取表的造词 / 加词路径陪等。
+        let taken = {
+            let mut sc = self
+                .single_char_codes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let used = self
+                .single_char_used
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(used) >= idle_ms {
+                sc.take()
+            } else {
+                None
+            }
+        };
+        if let Some((id, table)) = taken {
+            drop(table);
+            released.push(format!("single_char:{id}"));
+        }
+        released.extend(
+            crate::text_codes::evict_idle(&self.user_text, now, idle_ms)
+                .into_iter()
+                .map(|k| format!("user_text:{k}")),
+        );
+        if !released.is_empty() {
+            info!("闲置释放懒建缓存：{:?}", released);
+        }
+        released
+    }
+
+    /// 引擎被摘后，清掉**只属于它**的派生索引。
+    ///
+    /// 与 [`Self::invalidate_schema`] 不同，这里不清全部反查索引 / 单字全码表：摘引擎不改变
+    /// 任何方案的定义，别的方案的索引照样有效。被摘方案自己的反查索引 / 单字全码表也要先过一遍
+    /// 「在用」判据——主码表、编码来源、联想 / 辅助码在用的方案（同 `reverse_index_for` 的
+    /// 护栏）的索引不随引擎走：拼音方案的编码提示查的就是主码表的反查索引，与主码表的引擎
+    /// 在不在内存无关。
+    fn forget_unloaded(&self, schema_id: &str) {
+        let primary = self.primary_codetable_id();
+        let mut in_use = self.reverse_index_pins();
+        in_use.push(self.code_source_schema());
+        let in_use_kept = reverse_index_keeps(schema_id, "", &primary, &in_use);
+        if !in_use_kept {
+            let removed = self
+                .reverse_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(schema_id)
+                .is_some();
+            if removed {
+                self.reverse_index_skipped
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(schema_id);
+            }
+        }
+        // 单字全码表跟反查索引同一个「在用」判据：自动造词取码对的是编码来源方案
+        // （混输则其主码表成员），与那个方案的独立引擎在不在内存无关。
+        if in_use_kept {
+            return;
+        }
+        // 按词查编码用户层（S4 审查 L7）：槽按**数据方案**分（拼音类方案共用 `pinyin` 一份），
+        // 还有已加载引擎或在用方案落在同一数据方案上就留着。
+        let data = self.data_schema_id(schema_id);
+        let shared = {
+            let loaded: Vec<String> = self
+                .engines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            loaded
+                .iter()
+                .chain(in_use.iter())
+                .chain(std::iter::once(&primary))
+                .any(|id| !id.is_empty() && self.data_schema_id(id) == data)
+        };
+        if !shared {
+            crate::text_codes::remove(&self.user_text, &data);
+        }
+        let mut sc = self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if sc.as_ref().is_some_and(|(id, _)| id == schema_id) {
+            *sc = None;
+        }
+    }
+
+    /// 共享英文引擎缓存放手（[`Self::shared_english_engine`] 字段），条件是眼下没有消费者：
+    /// 临英候选关着、且表里没有混输（混输握着同一个 `Arc`，放手会让下次再建一份）。
+    /// 英文候选混入不算消费者——它每次现取，缓存空了会重新取回表里那一份。
+    ///
+    /// 放手后英文不再落进 [`Self::residency_protected`]，闲置清扫才能摘它。启动缓存校验
+    /// 之后调（校验建混输时把英文取走了）。返回是否真的放了手。
+    pub fn release_shared_english_if_unused(&self) -> bool {
+        let temp_english_on = self
+            .temp_english
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .show_candidates;
+        let mixed_loaded = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|l| l.engine.engine_type() == EngineType::Mixed);
+        if temp_english_on || mixed_loaded {
+            return false;
+        }
+        self.shared_english_engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some()
+    }
+
+    /// 校验某方案的派生缓存（`.wdat` 等，指纹不符或缺失即重建），**建完不留引擎**
+    /// （除非它在 [`Self::residency_protected`] 里）。阻塞，只可在后台线程里调。
+    ///
+    /// 走与切换完全相同的 `ensure_loaded` 构建路径，而不是另抽一个「只确保缓存」的入口：
+    /// 缓存的种类、路径、指纹判据都长在 `build_engine` 那几条分支里（码表逐库、拼音
+    /// merged / unigram、英文词组索引……），另写一份必然漂移，漂了的表现是「启动校验过了、
+    /// 切换时照样同步重建」。代价是多建一次引擎外壳——缓存新鲜时就是 mmap + 外壳，立即释放。
+    ///
+    /// 已加载的方案直接返回 true（它的缓存在加载时已校验过）。返回是否构建成功。
+    pub fn refresh_schema_cache(&self, schema_id: &str) -> bool {
+        self.refresh_schema_cache_hooked(schema_id, || {})
+    }
+
+    /// [`Self::refresh_schema_cache`] 的测试缝：`after_build` 在「建好」与「摘除」之间跑，
+    /// 用来确定性地复现「校验刚建完、用户恰好切过去」的竞态。生产只走上面那个入口。
+    #[doc(hidden)]
+    pub fn refresh_schema_cache_hooked(&self, schema_id: &str, after_build: impl FnOnce()) -> bool {
         if self.is_loaded(schema_id) {
+            return true;
+        }
+        if !self.ensure_loaded(schema_id) {
+            return false;
+        }
+        // 建完打一个「没人碰过」的记号：此后任何取引擎（`touch_loaded`）都会把它覆盖成
+        // 时钟读数。不能拿时钟读数本身比对——它只在清扫拍子里推进，建完与随后的使用
+        // 很可能读到同一个值。
+        if let Some(l) = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+        {
+            l.last_used
+                .store(UNTOUCHED, std::sync::atomic::Ordering::Relaxed);
+        }
+        after_build();
+        let protected = self.residency_protected().contains(schema_id);
+        let dropped = {
+            let mut g = self.engines.lock().unwrap_or_else(|e| e.into_inner());
+            let untouched = g.get(schema_id).is_some_and(|l| {
+                l.last_used.load(std::sync::atomic::Ordering::Relaxed) == UNTOUCHED
+            });
+            if untouched && !protected {
+                g.remove(schema_id)
+            } else {
+                // 被用过（含切成了当前方案：切换先经 `ensure_loaded`）或受保护 ⇒ 留下；
+                // 记号换回时钟读数，否则它永远不算闲置。
+                if untouched && let Some(l) = g.get(schema_id) {
+                    l.last_used
+                        .store(self.use_clock_now(), std::sync::atomic::Ordering::Relaxed);
+                }
+                None
+            }
+        };
+        drop(dropped);
+        true
+    }
+
+    /// 取引擎的公共入口：已加载就记一笔「用过」（闲置淘汰的判据），否则构建。
+    ///
+    /// 取引擎的路径（`engine_for` / `convert_with*` / `enumerate_with` / …）都先过这里，
+    /// 故「最后使用」只在这一处打。快路径上相对原来的 `is_loaded` 只多一次原子读 +
+    /// 一次原子写（[`Self::touch_loaded`]），不读系统时钟、不多拿锁。
+    fn ensure_loaded(&self, schema_id: &str) -> bool {
+        if self.touch_loaded(schema_id) {
             return true;
         }
         // single-flight：取该方案的专用构建锁（不同方案各自一把，可并行构建）。
@@ -2554,7 +3042,7 @@ impl EngineManager {
         };
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
         // 抢到锁后复查：等待期间可能已被另一线程（预热/切换）构建完成。
-        if self.is_loaded(schema_id) {
+        if self.touch_loaded(schema_id) {
             return true;
         }
         let codetable_cfg = self
@@ -2628,7 +3116,14 @@ impl EngineManager {
                 self.engines
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(schema_id.to_string(), Arc::from(engine));
+                    .insert(
+                        schema_id.to_string(),
+                        LoadedEngine {
+                            engine: Arc::from(engine),
+                            // 刚建好也算「用过」，否则一个拍子之内就可能被判闲置。
+                            last_used: std::sync::atomic::AtomicU64::new(self.use_clock_now()),
+                        },
+                    );
                 // 活跃方案的引擎（重）建好了：影子层后台预热。非活跃方案等切过去时再热
                 // （`on_active_changed`），不为用户未必会用的方案读盘。
                 if schema_id == self.active_schema_id() {
@@ -2659,11 +3154,7 @@ impl EngineManager {
             return None;
         }
         self.ensure_loaded(schema_id);
-        self.engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned()
+        self.loaded_engine(schema_id)
     }
 
     /// 当前活跃方案 ID
@@ -2852,7 +3343,7 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(schema_id)
-            .map(|e| e.base_sort_ignores_weight())
+            .map(|e| e.engine.base_sort_ignores_weight())
             .unwrap_or(false)
     }
 
@@ -3262,7 +3753,7 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(id, _)| id.as_str() != schema_id)
-            .map(|(id, e)| (id.clone(), Arc::clone(e)))
+            .map(|(id, l)| (id.clone(), Arc::clone(&l.engine)))
             .collect();
         loaded
             .into_iter()
@@ -3304,12 +3795,7 @@ impl EngineManager {
     /// `reload_from_config` 的动作才生效——真机表现为「关了没反应，顺手改别的设置又好了」。
     /// 转发不到的依赖方案（成员子引擎不认这个 dict）直接失效，下次使用按已落盘的 override 重建。
     pub fn set_dict_enabled_live(&self, schema_id: &str, dict_id: &str, enabled: bool) -> bool {
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         // 独立方案与把它当成员的混输方案同一条规则：翻得动就翻，翻不动就失效待重建。
         // 只失效混输不失效独立方案的话，同一个拼音扩展库在混输里下次输入就生效、
         // 在独立拼音方案里却要重启，两个方案表现不一致。
@@ -3949,11 +4435,7 @@ impl EngineManager {
         // 混输构建期回调进来时，外层正持着**那个混输方案**的 build_lock；这里取的是
         // `"english"` 自己那一把（`build_locks` 按 schema_id 分表），不是同一把锁。
         let built = if self.ensure_loaded(ENGLISH_SCHEMA) {
-            self.engines
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(ENGLISH_SCHEMA)
-                .cloned()
+            self.loaded_engine(ENGLISH_SCHEMA)
         } else {
             None
         };
@@ -4008,7 +4490,7 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(schema_id)
-            .map(|e| e.engine_type())
+            .map(|e| e.engine.engine_type())
     }
 
     /// 确保指定方案可加载（懒加载）。用于 overlay 模式（特殊模式等）激活前的可用性校验。
@@ -5177,12 +5659,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return ConvertResult::default();
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         match engine {
             Some(e) => e
                 .convert_with_opts(input, max_candidates, opts)
@@ -5203,12 +5680,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return ConvertResult::default();
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         match engine {
             Some(e) => e.convert(input, max_candidates).unwrap_or_else(|err| {
                 warn!("convert_with error: {}", err);
@@ -5224,12 +5696,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return Vec::new();
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         engine.map(|e| e.enumerate(limit)).unwrap_or_default()
     }
 
@@ -5241,7 +5708,7 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(schema_id)
-            .and_then(|e| e.browse_display_limit())
+            .and_then(|e| e.engine.browse_display_limit())
     }
 
     /// 反查 `(code, text)` 在该方案词典里的音节边界；方案未加载/非拼音/查不到均返回 0。
@@ -5252,12 +5719,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return 0;
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         engine.map_or(0, |e| e.syllable_boundary_of(code, text))
     }
 
@@ -5270,12 +5732,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return None;
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned()?;
+        let engine = self.loaded_engine(schema_id)?;
         engine.generate_word_pinyin(text)
     }
 
@@ -5294,12 +5751,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return vec![BoundaryResolution::NoInfo; pairs.len()];
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         let Some(engine) = engine else {
             return vec![BoundaryResolution::NoInfo; pairs.len()];
         };
@@ -5317,12 +5769,7 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return vec![None; texts.len()];
         }
-        let engine = self
-            .engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .cloned();
+        let engine = self.loaded_engine(schema_id);
         let Some(engine) = engine else {
             return vec![None; texts.len()];
         };
@@ -5472,6 +5919,15 @@ impl EngineManager {
                 return None;
             }
         };
+        // 发现目录里的词库登记为扩展库。必须在合并 override **之前**：override 的词库项只按 id
+        // 匹配方案里已有的库（`merge_dict_overrides`），晚注入的库用户翻的开关永远对不上号。
+        Self::inject_dir_dicts(
+            &mut base,
+            &|sub| Config::list_schema_resource_dir(Some(data_dir), sub, DICT_YAML_SUFFIX),
+            &|rel| {
+                Self::dict_head_resolved(&Self::resolve_dict_file(rel, &data_dir.join("schemas")))
+            },
+        );
         // 合并 override 层（存在才读；不存在则零影响）。
         if let Some(ov) = override_dir.and_then(|d| Self::read_override_value(schema_id, d)) {
             merge_toml(&mut base, ov);
@@ -5862,6 +6318,8 @@ impl EngineManager {
                     CodeTableEngine::new(mcl, commit_opts, Arc::new(dm))
                         .with_own_extra_dicts(Self::declared_extra_dict_ids(&schema)),
                 )
+                // 落盘目录须先于 `with_phrase_seg` 装上：后者会立刻起预热线程。
+                .with_phrase_cache_dir(Self::english_phrase_cache_dir(schema_id))
                 .with_phrase_seg(seg),
             ));
         }
@@ -6568,6 +7026,177 @@ impl EngineManager {
         out
     }
 
+    /// 把 `[[dictionary_dirs]]` 目录里的词库登记成扩展库，追加到 `base` 的 `dictionaries` 末尾。
+    ///
+    /// 生成项：`id = "dir:<相对路径去掉 .dict.yaml>"`（带前缀，不与方案手写的 id 撞；按完整
+    /// 路径而非文件名，两个目录里的同名文件不会合成一项），`label` 取词库头的 `name:`、空则
+    /// 文件名，出厂关（不写 `default_enabled`），码表的 `base_order` 排在已声明的库之后。
+    ///
+    /// 跳过两类文件：
+    /// - 方案已手写声明的（同 path）——手写的有 label / base_order 等设计，优先；
+    /// - 已被某个已声明词库的 `import_tables` 引用、**且确实会被它加载**的——它本就是那张
+    ///   主表的一部分，再登记一次就是同一批词加载两遍。用户拿上游完整的 `rime_frost.dict.yaml`
+    ///   连同 `cn_dicts_cell/` 一起放进用户目录时正是这样。「确实会加载」由 `head` 负责判定
+    ///   （生产用 [`Self::dict_head_resolved`]）。
+    ///
+    /// `list_dir(sub)` 返回 `(相对 schemas/ 的路径, 绝对路径)`（生产用分层扫描），
+    /// `head(rel)` 读该词库头部 → `(name, import_tables)`。两者都作为参数传入，单测不碰真实用户目录。
+    fn inject_dir_dicts(
+        base: &mut toml::Value,
+        list_dir: &dyn Fn(&str) -> Vec<(String, std::path::PathBuf)>,
+        head: &dyn Fn(&str) -> (String, Vec<String>),
+    ) {
+        let Some(table) = base.as_table_mut() else {
+            return;
+        };
+        Self::default_dict_dir(table);
+        let dirs: Vec<(String, String)> = table
+            .get("dictionary_dirs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|d| {
+                        let path = d.get("path")?.as_str()?.trim_matches('/').to_string();
+                        let ty = d.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        (!path.is_empty()).then(|| (path, ty.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if dirs.is_empty() {
+            return;
+        }
+        let dicts = table
+            .entry("dictionaries")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let Some(arr) = dicts.as_array_mut() else {
+            return;
+        };
+
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut next_order: i64 = 0;
+        for d in arr.iter() {
+            next_order = next_order.max(
+                d.get("base_order")
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(0)
+                    + 1,
+            );
+            let Some(rel) = d.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            taken.insert(rel.to_string());
+            // import_tables 子表相对主表所在目录（同 `rime_source_paths`）
+            let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            for imp in head(rel).1 {
+                let sub = format!("{imp}{DICT_YAML_SUFFIX}");
+                taken.insert(if parent.is_empty() {
+                    sub
+                } else {
+                    format!("{parent}/{sub}")
+                });
+            }
+        }
+
+        for (dir, ty) in dirs {
+            for (rel, _abs) in list_dir(&dir) {
+                if !taken.insert(rel.clone()) {
+                    continue;
+                }
+                let stem = rel.strip_suffix(DICT_YAML_SUFFIX).unwrap_or(&rel);
+                let file = stem.rsplit_once('/').map(|(_, f)| f).unwrap_or(stem);
+                let name = head(&rel).0;
+                let mut t = toml::map::Map::new();
+                t.insert("id".into(), format!("dir:{stem}").into());
+                t.insert(
+                    "label".into(),
+                    if name.is_empty() {
+                        file.to_string()
+                    } else {
+                        name
+                    }
+                    .into(),
+                );
+                t.insert("description".into(), format!("自动识别：{rel}").into());
+                t.insert("path".into(), rel.clone().into());
+                t.insert("type".into(), ty.clone().into());
+                t.insert("base_order".into(), next_order.into());
+                next_order += 1;
+                arr.push(toml::Value::Table(t));
+            }
+        }
+    }
+
+    /// 码表 / 拼音方案（`[engine] type = "codetable" | "pinyin"`）没写 `dictionary_dirs` 键时，补一个
+    /// 兜底发现目录 `<主词库所在目录>/ext`，类型同主词库。出厂与第三方方案不改文件就能放扩展词库。
+    /// 英文、混输等不兜底：混输没有自己的词库，英文没有这个需求。
+    ///
+    /// 补进方案本身而不是只在扫描时用：`schema.getConfig` 也就带上它，设置端的「打开扩展词库
+    /// 目录」按钮不用另外推算。写了 `dictionary_dirs = []` 即显式关掉兜底。主词库在 `schemas/`
+    /// 根下（路径无目录部分）时不兜底——那会去扫所有方案共用的 `schemas/ext`。
+    fn default_dict_dir(table: &mut toml::map::Map<String, toml::Value>) {
+        if table.contains_key("dictionary_dirs") {
+            return;
+        }
+        let has_dict_dir = table
+            .get("engine")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| {
+                t.eq_ignore_ascii_case("codetable") || t.eq_ignore_ascii_case("pinyin")
+            });
+        if !has_dict_dir {
+            return;
+        }
+        let Some(dicts) = table.get("dictionaries").and_then(|d| d.as_array()) else {
+            return;
+        };
+        let Some(main) = dicts
+            .iter()
+            .find(|d| d.get("default").and_then(|v| v.as_bool()) == Some(true))
+            .or_else(|| dicts.first())
+        else {
+            return;
+        };
+        let Some((parent, _)) = main
+            .get("path")
+            .and_then(|p| p.as_str())
+            .and_then(|p| p.rsplit_once('/'))
+        else {
+            return;
+        };
+        let ty = main
+            .get("type")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("rime_codetable");
+        let mut dir = toml::map::Map::new();
+        dir.insert("path".into(), format!("{parent}/{DEFAULT_DICT_DIR}").into());
+        dir.insert("type".into(), ty.into());
+        table.insert(
+            "dictionary_dirs".into(),
+            toml::Value::Array(vec![toml::Value::Table(dir)]),
+        );
+    }
+
+    /// [`Self::read_dict_head`]，但 `import_tables` 只留**真能在主表目录找到文件**的那些。
+    ///
+    /// 给发现目录的「已被主表引用就跳过」用：子表只按主表**所在目录**拼路径、不走分层
+    /// （`rime_source_paths`），所以安装目录里的主表写着 `cn_dicts_cell/idiom`、而文件只在
+    /// 用户目录时，它其实**不会**被主表加载。只看清单就跳过，这张库就两头落空——主表没加载、
+    /// 扩展词库列表里也不出现（未经 S1 裁剪的旧主表正是这样，评测时撞见）。
+    fn dict_head_resolved(path: &Path) -> (String, Vec<String>) {
+        let (name, imports) = Self::read_dict_head(path);
+        let Some(dir) = path.parent() else {
+            return (name, Vec::new());
+        };
+        let imports = imports
+            .into_iter()
+            .filter(|imp| dir.join(format!("{imp}{DICT_YAML_SUFFIX}")).is_file())
+            .collect();
+        (name, imports)
+    }
+
     /// 读一个 `.dict.yaml` 的 YAML 头 → `(name, import_tables)`。
     ///
     /// 只读到独占一行的 `...`（正文起点）或 [`DICT_HEAD_SCAN_LIMIT`] 为止 —— 主词库正文
@@ -6665,10 +7294,11 @@ impl EngineManager {
     /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
     /// - 多库 → `.combined.wdat`。
     ///
-    /// ⚠️ **现存唯一的多库消费方是拼音引擎**（`PinyinEngine` 只持有一个 `CachedDict`、
-    /// 没有 composite 分层，故多库拼音方案必须拿到合并视图）。出厂 pinyin/shuangpin
-    /// 各只声明 1 个词库、走单库快路径，因此**出厂配置下 `combined.wdat` 根本不会产生**；
-    /// 只有用户经 `schema_overrides` 给拼音方案加第二个词库才会触发。
+    /// ⚠️ **现存唯一的多库消费方是拼音引擎**（`PinyinEngine` 只持有一个 `CachedDict`）。
+    /// 启用的库**全是** rime_pinyin 时（主库 + 发现目录里开启的细胞词库正是如此），每个库
+    /// 各自走单库合并、各有各的缓存，组成 [`CachedDict::Layered`] 交给引擎：开关一张扩展库
+    /// 只是多挂或少挂一层，主库几十 MB 的合并缓存不重建。只有拼音方案混挂了别的类型才落到
+    /// `combined.wdat`——那条路径按 `search_prefix` 枚举后重写，**丢音节边界与简拼**。
     ///
     /// 码表/英文的 live 查询走 `load_codetable_layers` 的每库独立层；两个索引构建方
     /// 已改走 [`Self::load_dicts_individually`]，不再经过这里。
@@ -6692,6 +7322,29 @@ impl EngineManager {
                 e.dict_type.clone()
             }
         };
+
+        // 拼音族多库：分层（见本函数文档）。某张扩展库建不出来只少一层，主库照常可用。
+        if enabled.len() > 1 && enabled.iter().all(|e| dtype(e) == "rime_pinyin") {
+            let main = resolve(&enabled[0].path);
+            info!(
+                "Loading dictionary: {} (type=rime_pinyin, 扩展库 {} 层)",
+                main.display(),
+                enabled.len() - 1
+            );
+            let mut layers = vec![Self::load_rime_pinyin_dict(&main)?];
+            for e in &enabled[1..] {
+                let full = resolve(&e.path);
+                match Self::load_rime_pinyin_dict(&full) {
+                    Some(d) => layers.push(d),
+                    None => warn!("扩展词库 {} 加载失败，本次不挂这一层", full.display()),
+                }
+            }
+            return Some(if layers.len() == 1 {
+                layers.pop()?
+            } else {
+                CachedDict::Layered(layers)
+            });
+        }
 
         // 单库快路径
         if enabled.len() == 1 {
@@ -8539,6 +9192,285 @@ mod tests {
         );
     }
 
+    /// 发现目录注入的夹具：`files` 是目录里的文件（相对 schemas/），`heads` 是各词库头部。
+    fn inject_with(base_src: &str, files: &[&str], heads: &[(&str, &str, &[&str])]) -> toml::Value {
+        let mut base: toml::Value = toml::from_str(base_src).unwrap();
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        let heads: Vec<(String, String, Vec<String>)> = heads
+            .iter()
+            .map(|(r, n, i)| {
+                (
+                    r.to_string(),
+                    n.to_string(),
+                    i.iter().map(|x| x.to_string()).collect(),
+                )
+            })
+            .collect();
+        EngineManager::inject_dir_dicts(
+            &mut base,
+            &|sub| {
+                files
+                    .iter()
+                    .filter(|f| f.starts_with(&format!("{sub}/")))
+                    .map(|f| (f.clone(), std::path::PathBuf::from(f)))
+                    .collect()
+            },
+            &|rel| {
+                heads
+                    .iter()
+                    .find(|(r, _, _)| r == rel)
+                    .map(|(_, n, i)| (n.clone(), i.clone()))
+                    .unwrap_or_default()
+            },
+        );
+        base
+    }
+
+    fn dict_ids(base: &toml::Value) -> Vec<String> {
+        base.get("dictionaries")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d.get("id")?.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    const PINYIN_WITH_DIR: &str = "[[dictionaries]]\nid = \"main\"\npath = \"pinyin/rime_frost.dict.yaml\"\n\
+        type = \"rime_pinyin\"\ndefault = true\n\
+        [[dictionary_dirs]]\npath = \"pinyin/cn_dicts_cell\"\ntype = \"rime_pinyin\"\n";
+
+    /// 目录里的词库登记成**出厂关**的扩展库，id 带前缀、label 取词库头 name（空则文件名）。
+    #[test]
+    fn dir_dicts_are_injected_disabled_with_name_or_file_label() {
+        let base = inject_with(
+            PINYIN_WITH_DIR,
+            &[
+                "pinyin/cn_dicts_cell/idiom.dict.yaml",
+                "pinyin/cn_dicts_cell/food.dict.yaml",
+            ],
+            &[("pinyin/cn_dicts_cell/idiom.dict.yaml", "成语", &[])],
+        );
+        assert_eq!(
+            dict_ids(&base),
+            [
+                "main",
+                "dir:pinyin/cn_dicts_cell/idiom",
+                "dir:pinyin/cn_dicts_cell/food"
+            ]
+        );
+        let schema: Schema = base.try_into().unwrap();
+        let idiom = &schema.dictionaries[1];
+        assert_eq!(idiom.label, "成语");
+        assert_eq!(idiom.path, "pinyin/cn_dicts_cell/idiom.dict.yaml");
+        assert_eq!(idiom.dict_type, "rime_pinyin");
+        assert!(!idiom.default);
+        assert!(!idiom.is_enabled(), "出厂关：开不开由用户在扩展词库里决定");
+        assert_eq!(
+            schema.dictionaries[2].label, "food",
+            "词库头没写 name 时退回文件名"
+        );
+    }
+
+    /// 两类不登记：方案已手写声明的同一文件；已被已声明词库的 import_tables 引用的文件
+    /// （用户拿上游完整 rime_frost 主表覆盖时，它们就是主表的一部分，再登记就加载两遍）。
+    #[test]
+    fn dir_dicts_skip_declared_and_imported_files() {
+        let src = format!(
+            "{PINYIN_WITH_DIR}[[dictionaries]]\nid = \"hand\"\npath = \"pinyin/cn_dicts_cell/hand.dict.yaml\"\n\
+             type = \"rime_pinyin\"\nlabel = \"手写的\"\nbase_order = 5\n"
+        );
+        let base = inject_with(
+            &src,
+            &[
+                "pinyin/cn_dicts_cell/hand.dict.yaml",
+                "pinyin/cn_dicts_cell/idiom.dict.yaml",
+                "pinyin/cn_dicts_cell/place.dict.yaml",
+            ],
+            &[(
+                "pinyin/rime_frost.dict.yaml",
+                "rime_frost",
+                &["cn_dicts/base", "cn_dicts_cell/idiom"],
+            )],
+        );
+        assert_eq!(
+            dict_ids(&base),
+            ["main", "hand", "dir:pinyin/cn_dicts_cell/place"],
+            "hand 已手写、idiom 已被主表 import，只有 place 是新的"
+        );
+        let place = &base.get("dictionaries").unwrap().as_array().unwrap()[2];
+        assert_eq!(
+            place.get("base_order").unwrap().as_integer(),
+            Some(6),
+            "排在已声明的库之后（码表按 base_order 分层）"
+        );
+    }
+
+    /// 用户在扩展词库里翻的开关（override 的 `{id, enabled}`）必须对得上注入的库——
+    /// 这正是注入要排在 merge_toml 之前的原因。
+    #[test]
+    fn dir_dict_toggle_from_override_applies_after_injection() {
+        let mut base = inject_with(
+            PINYIN_WITH_DIR,
+            &["pinyin/cn_dicts_cell/idiom.dict.yaml"],
+            &[],
+        );
+        let over: toml::Value = toml::from_str(
+            "[[dictionaries]]\nid = \"dir:pinyin/cn_dicts_cell/idiom\"\nenabled = true\n",
+        )
+        .unwrap();
+        merge_toml(&mut base, over);
+        let schema: Schema = base.try_into().unwrap();
+        assert!(schema.dictionaries[1].is_enabled());
+    }
+
+    /// 没声明发现目录 ⇒ 原样不动；声明了但方案没有 `[[dictionaries]]` ⇒ 照样能登记。
+    #[test]
+    fn dir_dicts_noop_without_dirs_and_work_without_declared_dicts() {
+        let plain = "[[dictionaries]]\nid = \"main\"\npath = \"a.dict.yaml\"\ndefault = true\n";
+        let before: toml::Value = toml::from_str(plain).unwrap();
+        assert_eq!(inject_with(plain, &["x/a.dict.yaml"], &[]), before);
+
+        let only_dir = "[[dictionary_dirs]]\npath = \"wubi86/ext/\"\ntype = \"rime_codetable\"\n";
+        let base = inject_with(only_dir, &["wubi86/ext/a.dict.yaml"], &[]);
+        assert_eq!(
+            dict_ids(&base),
+            ["dir:wubi86/ext/a"],
+            "path 的首尾斜杠不影响扫描"
+        );
+    }
+
+    const CODETABLE_NO_DIR: &str = "[engine]\ntype = \"codetable\"\n\
+        [[dictionaries]]\nid = \"extra\"\npath = \"shared/extra.dict.yaml\"\nbase_order = 1\n\
+        [[dictionaries]]\nid = \"main\"\npath = \"wubi86/main.dict.yaml\"\ntype = \"rime_codetable\"\n\
+        default = true\nbase_order = 0\n";
+
+    /// 码表方案没写 dictionary_dirs ⇒ 兜底扫主词库目录下的 ext/（取 default=true 的那张，
+    /// 不是第一张），兜底目录写回方案、扫到的库排在已声明的之后。
+    #[test]
+    fn codetable_without_dirs_falls_back_to_main_dict_ext() {
+        let base = inject_with(
+            CODETABLE_NO_DIR,
+            &["wubi86/ext/chengyu.dict.yaml", "wubi86/stray.dict.yaml"],
+            &[],
+        );
+        assert_eq!(
+            dict_ids(&base),
+            ["extra", "main", "dir:wubi86/ext/chengyu"],
+            "只扫 ext/，方案目录本层的未声明文件不登记"
+        );
+        let schema: Schema = base.try_into().unwrap();
+        assert_eq!(schema.dictionary_dirs.len(), 1);
+        assert_eq!(schema.dictionary_dirs[0].path, "wubi86/ext");
+        assert_eq!(schema.dictionary_dirs[0].dict_type, "rime_codetable");
+        assert_eq!(schema.dictionaries[2].base_order, 2);
+        assert!(!schema.dictionaries[2].is_enabled());
+    }
+
+    /// 拼音方案同样兜底：出厂全拼 / 双拼的随包细胞库就在 `pinyin/ext`，类型取 rime_pinyin。
+    #[test]
+    fn pinyin_without_dirs_falls_back_to_main_dict_ext() {
+        let src = "[engine]\ntype = \"pinyin\"\n\
+            [[dictionaries]]\nid = \"main\"\npath = \"pinyin/rime_frost.dict.yaml\"\n\
+            type = \"rime_pinyin\"\ndefault = true\n";
+        let base = inject_with(src, &["pinyin/ext/idiom.dict.yaml"], &[]);
+        assert_eq!(dict_ids(&base), ["main", "dir:pinyin/ext/idiom"]);
+        let schema: Schema = base.try_into().unwrap();
+        assert_eq!(schema.dictionary_dirs[0].path, "pinyin/ext");
+        assert_eq!(schema.dictionary_dirs[0].dict_type, "rime_pinyin");
+    }
+
+    /// 不兜底的三种：显式写了 `dictionary_dirs = []`；英文等其它方案；主词库在 schemas/ 根下。
+    #[test]
+    fn default_dict_dir_only_when_undeclared_and_main_has_a_dir() {
+        let files = ["wubi86/ext/a.dict.yaml", "ext/a.dict.yaml"];
+        let opted_out = format!("dictionary_dirs = []\n{CODETABLE_NO_DIR}");
+        assert_eq!(
+            dict_ids(&inject_with(&opted_out, &files, &[])),
+            ["extra", "main"]
+        );
+
+        let english = CODETABLE_NO_DIR.replace("\"codetable\"", "\"english\"");
+        let base = inject_with(&english, &files, &[]);
+        assert_eq!(dict_ids(&base), ["extra", "main"]);
+        assert!(base.get("dictionary_dirs").is_none());
+
+        let at_root = "[engine]\ntype = \"codetable\"\n\
+            [[dictionaries]]\nid = \"main\"\npath = \"main.dict.yaml\"\ndefault = true\n";
+        let base = inject_with(at_root, &files, &[]);
+        assert_eq!(dict_ids(&base), ["main"]);
+        assert!(base.get("dictionary_dirs").is_none());
+    }
+
+    /// 主表清单里写了、但主表目录里没有的子表，不算「已被主表引用」：子表不走分层，它其实
+    /// 不会被加载。只看清单就跳过，用户目录里那张同名细胞库就两头落空。
+    #[test]
+    fn dict_head_resolved_keeps_only_imports_present_beside_main() {
+        let dir = std::env::temp_dir().join(format!("wind-headres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cells")).unwrap();
+        let main = dir.join("main.dict.yaml");
+        std::fs::write(
+            &main,
+            "---\nname: main\nimport_tables:\n  - cells/here\n  - cells/elsewhere\n...\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("cells/here.dict.yaml"), "---\nname: here\n...\n").unwrap();
+
+        let (name, imports) = EngineManager::dict_head_resolved(&main);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(name, "main");
+        assert_eq!(
+            imports,
+            ["cells/here"],
+            "cells/elsewhere 不在主表目录，不会被主表加载"
+        );
+    }
+
+    /// 端到端：真实 `read_schema` 走分层扫描 + 读词库头 + 合并 override。
+    /// 目录名取一个用户目录里不可能有的，免得本机真实的用户层混进来。
+    #[test]
+    fn read_schema_registers_dir_dicts_and_applies_override() {
+        let root = std::env::temp_dir().join(format!("wind-dirdicts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        let schemas = data.join("schemas");
+        let cells = schemas.join("zz_dirdicts_probe/cells");
+        std::fs::create_dir_all(&cells).unwrap();
+        std::fs::write(
+            schemas.join("zzprobe.schema.toml"),
+            "[schema]\nid = \"zzprobe\"\nname = \"探针\"\n\
+             [[dictionaries]]\nid = \"main\"\npath = \"zz_dirdicts_probe/main.dict.yaml\"\ndefault = true\n\
+             [[dictionary_dirs]]\npath = \"zz_dirdicts_probe/cells\"\ntype = \"rime_codetable\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("zz_dirdicts_probe/main.dict.yaml"),
+            "---\nname: main\nimport_tables:\n  - cells/inmain  # 已被主表引用\n...\n",
+        )
+        .unwrap();
+        std::fs::write(cells.join("inmain.dict.yaml"), "---\nname: inmain\n...\n").unwrap();
+        std::fs::write(cells.join("extra.dict.yaml"), "---\nname: \"额外\"\n...\n").unwrap();
+        std::fs::write(cells.join("notes.txt"), "不是词库").unwrap();
+        let ov = root.join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        std::fs::write(
+            ov.join("zzprobe.toml"),
+            "[[dictionaries]]\nid = \"dir:zz_dirdicts_probe/cells/extra\"\nenabled = true\n",
+        )
+        .unwrap();
+
+        let schema = EngineManager::read_schema("zzprobe", Some(&data), Some(&ov)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let ids: Vec<&str> = schema.dictionaries.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["main", "dir:zz_dirdicts_probe/cells/extra"]);
+        let extra = &schema.dictionaries[1];
+        assert_eq!(extra.label, "额外");
+        assert!(extra.is_enabled(), "override 的开关落到注入的库上");
+    }
+
     /// base 侧没有 dictionaries 时，override 的稀疏项无 path、造不出可用词库，应整键忽略。
     #[test]
     fn merge_toml_dictionaries_not_created_from_override_alone() {
@@ -9686,6 +10618,130 @@ input_chars = \"a-z;\"
         assert!(!marker.exists());
     }
 
+    /// 分层视图（主库 + 细胞库各一层）与「主表 import 细胞库合成一份 merged」查询结果逐项
+    /// 一致：精确查、前缀查、按音节截断的前缀查、简拼、更长码存在性。
+    ///
+    /// 夹具里刻意放的三类陷阱：
+    /// - **跨层同权**（主库「拟好」与细胞库「尼豪」都是 64）：`order` 是层内名次，跨层直接比
+    ///   会排反；
+    /// - **被音节过滤掉的同码高权词**（主库「西安」xi'an 1000 与单音节「先」同码 `xian`）：
+    ///   读端先取名次再过滤，合并缓存里「先」的名次照样排在「西安」之后，拿候选池重算会算小；
+    /// - **跨层同一个词**（两层都有「你好」）：合并缓存保留两条，分层也不去重。
+    ///
+    /// 简拼 `xg` 的跨层同权码（主库 xiguan、细胞库 xigua 都是 300）验证按码字典序而非层序。
+    #[test]
+    fn layered_pinyin_dict_matches_merged_cache() {
+        let dir = std::env::temp_dir().join(format!("wind_eng_layered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cells")).unwrap();
+        let body_main = "你好\tni hao\t100\n你\tni\t500\n拟好\tni hao\t64\n你好吗\tni hao ma\t20\n\
+                         中国\tzhong guo\t1000\n逆\tni\t64\n\
+                         西安\txi an\t1000\n先\txian\t500\n想\txiang\t500\n小\txiao\t10\n\
+                         习惯\txi guan\t300\n";
+        let body_cell = "你好呀\tni hao ya\t30\n尼豪\tni hao\t64\n中国风\tzhong guo feng\t50\n\
+                         厚积薄发\thou ji bo fa\t5\n泥\tni\t64\n你好\tni hao\t300\n\
+                         虾啊\txia a\t10\n鲜\txian\t500\n西瓜\txi gua\t300\n";
+        let main = dir.join("main.dict.yaml");
+        std::fs::write(&main, format!("---\nname: main\n...\n{body_main}")).unwrap();
+        let cell = dir.join("cells/cell.dict.yaml");
+        std::fs::write(&cell, format!("---\nname: cell\n...\n{body_cell}")).unwrap();
+        // 对照组：同一批词经 import_tables 合成一份（旧的整合方式）
+        std::fs::write(
+            dir.join("mainbody.dict.yaml"),
+            format!("---\nname: mb\n...\n{body_main}"),
+        )
+        .unwrap();
+        let both = dir.join("both.dict.yaml");
+        std::fs::write(
+            &both,
+            "---\nname: both\nimport_tables:\n  - mainbody\n  - cells/cell\n...\n",
+        )
+        .unwrap();
+
+        let merged = EngineManager::load_rime_pinyin_dict(&both).unwrap();
+        let layered = CachedDict::Layered(vec![
+            EngineManager::load_rime_pinyin_dict(&main).unwrap(),
+            EngineManager::load_rime_pinyin_dict(&cell).unwrap(),
+        ]);
+
+        let hits = |v: Vec<wind_dict::cached::DictHit>| {
+            v.into_iter()
+                .map(|h| (h.code, h.text, h.weight, h.order, h.boundary))
+                .collect::<Vec<_>>()
+        };
+        for code in [
+            "nihao",
+            "ni",
+            "zhongguo",
+            "houjibofa",
+            "nihaoya",
+            "xian",
+            "none",
+        ] {
+            assert_eq!(
+                hits(layered.search_with_boundary(code)),
+                hits(merged.search_with_boundary(code)),
+                "精确查 {code}"
+            );
+            assert_eq!(
+                layered.search(code),
+                merged.search(code),
+                "精确查(元组) {code}"
+            );
+        }
+        for (prefix, limit) in [
+            ("ni", 100),
+            ("ni", 3),
+            ("nihao", 2),
+            ("zhong", 10),
+            ("h", 5),
+            ("xi", 10),
+            ("x", 3),
+        ] {
+            assert_eq!(
+                hits(layered.search_prefix_with_boundary(prefix, limit)),
+                hits(merged.search_prefix_with_boundary(prefix, limit)),
+                "前缀查 {prefix} limit={limit}"
+            );
+        }
+        for (prefix, limit, syl, done) in [
+            ("ni", 10, 2, 2),
+            ("nihao", 10, 3, 5),
+            ("zhongguo", 5, 2, 8),
+            ("xia", 10, 1, 0),
+            ("xi", 10, 1, 0),
+            ("x", 4, 1, 0),
+        ] {
+            assert_eq!(
+                hits(layered.search_prefix_with_boundary_syllable_capped(prefix, limit, syl, done)),
+                hits(merged.search_prefix_with_boundary_syllable_capped(prefix, limit, syl, done)),
+                "音节截断前缀查 {prefix}"
+            );
+        }
+        for ab in ["nh", "nhy", "zg", "zgf", "hjbf", "xa", "xg", "xx"] {
+            assert_eq!(
+                layered.search_abbrev(ab, 10),
+                merged.search_abbrev(ab, 10),
+                "简拼 {ab}"
+            );
+        }
+        for p in ["nihao", "zhongguo", "houjibofa", "ni"] {
+            assert_eq!(
+                layered.has_longer_code(p),
+                merged.has_longer_code(p),
+                "更长码 {p}"
+            );
+        }
+
+        drop((merged, layered));
+        for f in [&main, &cell, &both] {
+            for ext in ["merged.wdat", "merged.wdat.fp"] {
+                let _ = std::fs::remove_file(cache_path(f, ext));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn purge_cache_files_only_removes_cache_extensions() {
         let dir = std::env::temp_dir().join(format!("wind_eng_purge-{}", std::process::id()));
@@ -9698,15 +10754,22 @@ input_chars = \"a-z;\"
         std::fs::write(dir.join("unigram.wdb"), b"x").unwrap();
         // 构建死亡记录（应删：「重建缓存」即手动重试，见 build_guard）
         std::fs::write(sub.join("main.wdat.building"), b"x").unwrap();
-        // 非缓存文件（应留）
+        // 英文词组索引及其写盘临时文件（应删，`english_phrase::is_phrase_cache_file`）
+        std::fs::write(sub.join("phrase-x.wphr"), b"x").unwrap();
+        std::fs::write(sub.join("phrase-x.wphr.123-0.tmp"), b"x").unwrap();
+        // 非缓存文件（应留）——别人的 `.tmp` 也不归我们删
         std::fs::write(dir.join("note.txt"), b"x").unwrap();
         std::fs::write(sub.join("raw.dict.yaml"), b"x").unwrap();
+        std::fs::write(sub.join("other.tmp"), b"x").unwrap();
 
         let (mut removed, mut failed) = (0usize, 0usize);
         purge_cache_files(&dir, &mut removed, &mut failed);
-        assert_eq!((removed, failed), (5, 0));
+        assert_eq!((removed, failed), (7, 0));
         assert!(dir.join("note.txt").exists());
         assert!(sub.join("raw.dict.yaml").exists());
+        assert!(sub.join("other.tmp").exists());
+        assert!(!sub.join("phrase-x.wphr").exists());
+        assert!(!sub.join("phrase-x.wphr.123-0.tmp").exists());
         assert!(!sub.join("main.wdat").exists());
         assert!(!dir.join("unigram.wdb").exists());
 
