@@ -219,8 +219,9 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   （同 `wildcard_query`、不看主开关、混输只查主码表），再过 `apply_filter`；翻页扩充 / 末页放宽按 active
   分流到 `special_buffer`（反查里 `input_buffer` 恒空）。详见 `docs/design/codetable-reverse-mode.md`。
 - **overlay 门控**：临拼 / 快捷输入等 overlay 激活时 `wildcard_enters` 恒 false，不作通配。
-- **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位一律让位（照常出标点），故不动 C++
-  透传标点集；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与
+- **按键裁决要点**（全文见设计稿 §3.3）：符号通配键在首位也作通配（论坛 t302；空缓冲调用点
+  `wildcard_takes_lead_key` 让全局绑定让位，方案级显式绑定优先），并从 C++ 透传标点集扣掉
+  （`schema_leading_code_chars`，只算纯码表方案）；缓冲已达 `max_code_length` 时通配键按字面（`wildcard_past_full`，裁决与
   `wildcard_pattern` 共用）。
 
 ## 4. 拼音引擎（PinyinEngine，全拼）

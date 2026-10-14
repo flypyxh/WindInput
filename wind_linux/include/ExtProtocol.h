@@ -71,8 +71,8 @@ inline constexpr const char* EXT_KIND_POS_STATUS_TIP = "pos.status_tip";
 /// 上行：当前焦点宿主的显示环境。body `{"caret_free":bool,"caret_trusted":bool,"scale":1.5}`，
 /// 字段可缺省（= 不改现值）。caret_free：Wayland 原生应用，候选窗由合成器摆位，服务端据此跳过
 /// 首显闸门里「等权威坐标」的那段（否则首键后要等 600ms 长兜底）；caret_trusted：本端报的光标
-/// 可直接当权威（Linux 恒为真，来源字段却只能填 UNKNOWN）；scale：界面缩放因子（见 protocol.rs
-/// `HOST_DISPLAY`）。
+/// 可直接当权威（Linux 恒为真，来源字段却只能填 UNKNOWN）；inline_preedit：客户端声明了 Preedit
+/// 能力位（否则服务端把编码画进候选窗）；scale：界面缩放因子（见 protocol.rs `HOST_DISPLAY`）。
 inline constexpr const char* EXT_KIND_HOST_DISPLAY = "host.display";
 /// 下行：服务端问状态气泡此刻在哪（切「固定位置」时以当前位置落盘）。气泡不在屏上不答。
 inline constexpr const char* EXT_KIND_POS_STATUS_TIP_QUERY = "pos.status_tip.query";

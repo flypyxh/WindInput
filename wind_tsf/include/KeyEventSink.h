@@ -87,8 +87,8 @@ public:
     // Reset composing state (called when focus is lost or input field changes)
     // 注意: _lastPassthroughDigit 不在此清零。它是跨 IME 会话的上下文信号，
     // 用于 Excel/WPS cell-select(按数字直通) → cell-edit(按标点) 这种焦点切换
-    // 场景的数字后智能标点判断。残留由按键事件路径（_SendKeyToService 非智能
-    // 标点目标键清零）和光标 Y 跨行检测兜底，不应在 IME 会话状态重置时一起清。
+    // 场景的数字后智能标点判断。残留由按键路径（任何进宿主或送服务端的 keydown 都会
+    // 消费/清零）兜底；鼠标挪光标看不见，是只认序列的已知代价（见 SmartPunctPrevChar.h）。
     // keepPairState=TRUE：保留自动配对状态（`_englishPairEngine` 与 `_pairPendingDepth`）。
     // 配对状态的前提是「光标紧贴一个已插入的右符号」。中英模式切换与上屏都不移动光标、
     // 也不消除那个右符号，前提仍成立，清掉只会让 Tab/Enter 跳不出去（切走再切回、或
@@ -319,6 +319,9 @@ private:
     // （吃下的键要交给 core 出字，本地配对若抢先 CommitText 就把转发吞了）。
     // 判据必须与 core 的 `wind_punct::custom_english_punct_chars` 同源，漂移即「吃了再吐」丢键。
     BOOL _IsCustomEnglishPunctKey(WPARAM vk, uint32_t modifiers) const;
+    // 英文半角会吃下转发 core 的标点键（英半自定义 ∪ 英文配对键）。「中文 + CapsLock」的
+    // 标点透传按它开例外，与「英文 + CapsLock」对齐（GH#197）。
+    BOOL _IsEnglishHalfEatenPunctKey(WPARAM vk, uint32_t modifiers) const;
     // 「中文模式下该透传不吃」的标点集合（core 经 CONFIG_KEY_CN_PASSTHROUGH_PUNCT 推送）。
     // 空集合（默认）= 与历史行为完全一致。
     std::set<wchar_t> _cnPassthroughPunctChars;
@@ -414,7 +417,10 @@ private:
         ~PassthroughNoter()
         {
             if (sink != nullptr && eaten != nullptr)
+            {
                 sink->_passthrough.NoteKeyDown((uint32_t)vk, *eaten != FALSE, suppressed);
+                sink->_NoteInputSequenceAtExit(vk, *eaten != FALSE, suppressed);
+            }
         }
     };
 
@@ -430,10 +436,10 @@ private:
     // 宿主上**整条功能失效**。而走这条兜底的恰恰是 `prev_char` 读不回的那批宿主（微信/终端），
     // 也就是本功能最需要生效的地方——真机上还极难归因：换个宿主就好了。
 
-    // ── 数字后智能标点的备用 prevChar 通路 ──────────────────────────────────────
+    // ── 数字后智能标点的输入序列记账 ────────────────────────────────────────────
     //
-    // prevChar 主路径是 TSF 现读文档（CTextService::ConsumeCachedPrevChar）；EverEdit
-    // 这类宿主读不回文档、恒为 0，只能靠 _lastPassthroughDigit 记住「刚打出去的数字」。
+    // 「数字后」**只认** _lastPassthroughDigit 记下的「刚打出去的数字」，TSF 现读文档里的
+    // 数字不算（理由与取值规则见 SmartPunctPrevChar.h）。
     // 服务端只认 prevChar 的**值**（wind-punct 判 0x30..=0x39），它不知道数字是怎么打的，
     // 所以「哪些键**产出数字**」这个判据完全落在本文件——那些键透传出去了，服务端看不到。
     //
@@ -444,8 +450,7 @@ private:
     //
     // ★ 主键盘与小键盘必须都认。判据只写 '0'..'9'（VK 0x30-0x39）时小键盘数字
     // （VK_NUMPAD0-9 = 0x60-0x69）不但记不上，还会落进记录点的 else 分支把已记的值清零
-    // ——症状是「小键盘打的数字后面标点仍出中文」，且只在读不回文档的宿主暴露（能读的
-    // 宿主主路径兜住了，看起来像是随机时灵时不灵）。同族的 _IsHoldReplayKey 一直是两种
+    // ——症状是「小键盘打的数字后面标点仍出中文」。同族的 _IsHoldReplayKey 一直是两种
     // 都列的，这里是遗漏。NumLock 关闭时小键盘发的是 VK_END/VK_INSERT 等，语义本就不是
     // 数字，天然不命中；NumLock 开着按 Shift+小键盘时 Windows 临时取消 NumLock，届时
     // vk 已是方向键，同样到不了这里。
@@ -454,6 +459,10 @@ private:
     // 统一成一个出口，避免两处判据各写一份而漂移。
     static WCHAR _DigitCharFromVk(WPARAM vk, uint32_t modifiers)
     {
+        // Ctrl/Alt+数字是宿主快捷键（Word 的 Ctrl+1 设标题、切标签页），不产出数字——
+        // 与 Linux `DigitTracker::digitChar` 同口径。出口守卫让放行路径全覆盖后这条更要紧。
+        if (modifiers & (KEYMOD_CTRL | KEYMOD_ALT))
+            return 0;
         // Shift+主键盘数字产出的是符号（!@#…）而非数字，不能当数字记。
         if (vk >= '0' && vk <= '9')
             return (modifiers & KEYMOD_SHIFT) ? 0 : (WCHAR)vk;
@@ -462,22 +471,24 @@ private:
         return 0;
     }
 
-    // 经引擎上屏的文本也要更新备用 prevChar。全角数字、小键盘 direct「顶屏候选再追加
-    // 数字」、候选文本本身带数字这些路径，pfEaten 为真且响应不是 PassThrough，两个按键侧
-    // 记录点（OnTestKeyDown 透传臂 / OnKeyDown 补设）都不覆盖——能读文档的宿主靠主路径
-    // 兜住，读不回的宿主里这些场景现在是全丢的。
+    // 按键侧记录点：挂在 PassthroughNoter 的出口（OnTestKeyDown / OnKeyDown 两处），按最终
+    // `*pfEaten` 判。键进了宿主（判据同透传上报，`WindPassthrough::IsUserKeyIntoHost`：纯修饰键、
+    // 自注入键不算）就记「是不是数字」，非数字即清零——CapsLock 字母、翻页热键、Backspace、
+    // 方向键、Ctrl+V 都在此清。此前是在几个透传分支里手工接线，散点漏了好几处提前 return。
     //
-    // 记的是「已落进文档、光标紧邻的那个字符」，与 prevChar 语义严格一致：末位是 ASCII
+    // 同时作废 CTextService 缓存的 prevChar——那是按键前的快照：不作废会让智能符号 press2
+    // 守卫在不触发 OnEndEdit 的宿主里（Tabby）拿旧字去比对。
+    void _NoteInputSequenceAtExit(WPARAM vk, bool eaten, bool suppressed);
+
+    // 经引擎上屏的文本也要更新输入序列记账。全角数字、小键盘 direct「顶屏候选再追加
+    // 数字」、候选文本本身带数字这些路径，pfEaten 为真且响应不是 PassThrough，两个按键侧
+    // 记录点（OnTestKeyDown 透传臂 / OnKeyDown 补设）都不覆盖，漏了就是这些场景全丢。
+    //
+    // 记的是「已落进文档、光标紧邻的那个字符」，与按键侧记录点同一语义：末位是 ASCII
     // 数字则记，否则清零（上屏汉字/标点后不该再继承数字状态）。全角数字（U+FF10-FF19）
     // 刻意不记——服务端只认 ASCII 0x30-0x39，记了也不会命中，徒增误判面。
     // 空文本不动状态：没有东西写进文档，光标前是什么并没有改变。
-    void _TrackCommittedTextForSmartPunct(const std::wstring& text)
-    {
-        if (text.empty())
-            return;
-        WCHAR last = text.back();
-        _lastPassthroughDigit = (last >= L'0' && last <= L'9') ? last : 0;
-    }
+    void _TrackCommittedTextForSmartPunct(const std::wstring& text);
 
     // ⛔ 这里曾有 CapsLock 的「回敲复原」机制（_RestoreCapsLockToggle / _capsSessionEaten /
     // 自注入放行窗口），2026-08-11 全部移除——TSF 压不住 CapsLock 的锁定态翻转，而事后
@@ -485,7 +496,7 @@ private:
     // WH_KEYBOARD_LL 钩子在状态更新前拦截，见 wind-keys 的 capslock_hook 模块。
     // **不要在 TSF 侧重新实现它。**
 
-    WCHAR _lastPassthroughDigit; // Last digit key that passed through (for smart punct fallback in apps where TSF can't read text)
+    WCHAR _lastPassthroughDigit; // 最近一笔输入若是 ASCII 数字则记之，否则 0——数字后智能标点的唯一依据
     // 「自上一个 keydown 送达服务端以来有键进了宿主」的记账。规则与理由见 PassthroughNote.h；
     // 消费点在 _SendKeyToService（仅 keydown 那一发），清理点在 ResetComposingState。
     WindPassthrough::PassthroughState _passthrough;

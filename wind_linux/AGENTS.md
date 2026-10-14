@@ -127,8 +127,8 @@ e2e 的坑，都踩过：
   光标回退（`cursorOffset`）是「按几下方向键」，三平台都合成方向键，不换算。两者转 int 取负前钳到
   1024 / 64（服务端给 u32，> INT_MAX 取负是未定义行为）。帧宽高超过 16384 拒收（X11 尺寸 16 位，
   截断后的请求会让 xcb 关连接）。
-- prevChar（数字后智能标点）：宿主支持 surrounding text 就读真实光标前字符（对位 Windows 主路径），
-  否则退回本端记账（对位 macOS 唯一的备用通路）。
+- prevChar（数字后智能标点）：「数字后」只认本端记账（`DigitTracker`，三平台一致）；surrounding text
+  读到的光标前字符只在**非数字**时照报，供智能符号 press2 守卫比对（`DigitTracker::resolve`）。
 - 断线自愈：请求连接 2s 超时（connect 之前就设好，服务停住时 connect 本身也会阻塞）。只有「对端
   确定没处理」的失败才换新连接**重发当前帧一次**：写失败、或一个响应字节都没读到就 EOF /
   ECONNRESET（服务重启 / 读帧前后崩溃）。**读超时不重发**：服务可能已经处理、只是回得慢，协调器
@@ -251,10 +251,11 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
   e2e `x_conn_lost_cases`（xkill 菜单窗口的连接、等空闲超时）验 fcitx5 存活并重连。本机 SDK 的
   Fcitx5 5.1.7 上，计时器回调里销毁自身经 ASan 实测不报错（最小复现与 ASan 版 addon 跑 e2e 均无报告），
   别的 Fcitx5 版本未验——修法不依赖哪个版本恰好容忍。
-- **入口**：候选窗右键 → `menu.open`（带工作区）；主菜单经候选菜单末行「更多…」。空闲时没有
-  主菜单入口：状态区动作 `windinput-settings`（「清风输入法设置」，`activate` 时挂进
-  `StatusGroup::InputMethod`）直接启动设置程序，取舍见设计文档 §5c。
-- e2e 的菜单用例都从组字中的「更多…」开主菜单，关掉后先 Esc 收组字再验打字；菜单用例把空闲超时
+- **入口**：候选窗右键 → `menu.open`（带工作区）；主菜单另走两个
+  状态区动作（不论组字与否）（`activate` 时挂进 `StatusGroup::InputMethod`）：`windinput-settings`（「清风输入法设置」，
+  直接启动设置程序）与 `windinput-menu`（「清风输入法菜单」，`openMainMenuAtPointer`：主菜单弹在
+  指针处——X11 按 `pointerPosition()`，Wayland 走屏幕菜单、落点等指针进入底板时取），取舍见设计文档 §5c。
+- e2e 的菜单用例都经状态区「清风输入法菜单」开主菜单（`open_main_menu`，指针先挪到固定点）；菜单用例把空闲超时
   调到 5 秒以覆盖超时那条路。客户端扮演 kimpanel（持有 `org.kde.impanel`、发 `TriggerProperty`
   点状态区动作，听 `org.kde.kimpanel.inputmethod` 的 `UpdateProperty` 取当前输入法图标），故
   fcitx5 要 `--enable` 上 `kimpanel`。
@@ -315,7 +316,7 @@ forwardKey 对某类应用确实无效时才值得做，目前没有这样的证
 | 能力 | 现状 | 备注 |
 |---|---|---|
 | 候选窗显示（X11） | 已接 | 见上「候选窗（X11）」 |
-| 候选窗显示（Wayland 原生） | 已接（`WaylandPanel`），treeland 真机验过 | 跟着光标走的（候选、tooltip、跟随光标的状态气泡、候选右键菜单）走 `zwp_input_method_v2` 的 popup surface，**由合成器按文本光标摆位**（客户端报的 `cursorRect()` 是窗口相对坐标，没法自己摆），合成进同一张位图（tooltip 按服务端落位相对候选窗摆）；按屏幕摆的（Toast、屏幕锚点 / 固定位置的状态气泡）在合成器有 wlr-layer-shell 时各开一个 OVERLAY 层 surface，按锚点 + 边距摆，在任务栏之上，且不论焦点在哪种应用都走这条（XWayland 窗口会被 treeland 压在任务栏下）。气泡右键菜单开在一张铺满输出的透明 layer 底板上（各级菜单是子 surface），坐标即输出坐标，菜单外的点击也由底板接住（代替抓指针；请求 2s 无菜单 / 60s 无点击 / 120s 上限三道兜底收起）。layer surface 收起时连角色对象一起销毁、下次重建（只摘 buffer 时 treeland 不再发 configure）；所有我们的 wl_surface 只建不毁并挂全零 user_data 占位（classicui 的指针回调会读它）。鼠标：点选、翻页、滚轮、悬停、右键菜单；layer 上的气泡可拖（relative-pointer 取位移，surface 自己在动，按 surface 坐标算会乱跳）、Toast 可点击关闭；popup 里只有候选与气泡收鼠标。缺：候选菜单点外部不收（popup 的屏幕位置不可知，开不了底板；用 Esc / 选项收）；跟随光标的气泡不能拖；菜单靠近屏幕下 / 右缘可能被合成器裁掉；锚在底 / 右边的 layer 气泡开始拖时可能跳一个任务栏厚度（合成器不告诉独占区）；候选窗落在任务栏处会被盖住（popup 层级归合成器）；GNOME 不支持 input-method-v2，应用走 X11 / XWayland 那条路；KDE Plasma（input-method v1）未支持；多显示器 / 混合缩放只近似；arm64 上未实机验 |
+| 候选窗显示（Wayland 原生） | 已接（`WaylandPanel`），treeland 真机验过 | 跟着光标走的（候选、tooltip、跟随光标的状态气泡）走 `zwp_input_method_v2` 的 popup surface（KWin 只有 input-method-v1，走 `zwp_input_panel_v1` 的 overlay 面板：KWin 全局只认一个面板、角色拆不掉，故每个显示周期换新 surface，旧的经 `RetiredSurfaces` 延迟销毁，见 `docs/design/linux-kde-input-method-v1.md`），**由合成器按文本光标摆位**（客户端报的 `cursorRect()` 是窗口相对坐标，没法自己摆），合成进同一张位图（tooltip 按服务端落位相对候选窗摆）；按屏幕摆的（Toast、屏幕锚点 / 固定位置的状态气泡）在合成器有 wlr-layer-shell 时各开一个 OVERLAY 层 surface，按锚点 + 边距摆，在任务栏之上，且不论焦点在哪种应用都走这条（XWayland 窗口会被 treeland 压在任务栏下）。气泡右键菜单开在一张铺满输出的透明 layer 底板上（各级菜单是子 surface），坐标即输出坐标，菜单外的点击也由底板接住（代替抓指针；请求 2s 无菜单 / 60s 无点击 / 120s 上限三道兜底收起）。layer surface 收起时连角色对象一起销毁、下次重建（只摘 buffer 时 treeland 不再发 configure）；所有我们的 wl_surface 只建不毁并挂全零 user_data 占位（classicui 的指针回调会读它）。鼠标：点选、翻页、滚轮、悬停、右键菜单；layer 上的气泡可拖（relative-pointer 取位移，surface 自己在动，按 surface 坐标算会乱跳）、Toast 可点击关闭；popup 里只有候选与气泡收鼠标。跟随光标的气泡不能拖；菜单靠近屏幕下 / 右缘可能被合成器裁掉；锚在底 / 右边的 layer 气泡开始拖时可能跳一个任务栏厚度（合成器不告诉独占区）；候选窗落在任务栏处会被盖住（popup 层级归合成器）；GNOME 不支持 input-method-v2，应用走 X11 / XWayland 那条路；KDE Plasma（input-method v1）Kubuntu 26.04 / KWin 6.6.6 真机验过；多显示器 / 混合缩放只近似；arm64 上未实机验 |
 | 多显示器 | 未做 | 工作区取整个根窗口，不按 RandR 显示器切分：跨屏边缘的翻转/钳制按整块虚拟屏算 |
 | HiDPI（帧 `scale>1`） | 按物理像素原样贴 | X11 没有逻辑坐标，服务端在 Linux 上目前恒发 scale=1 |
 | 候选窗拖动 / 固定位置回报（`pos.candidate` / `pos.candidate.query`） | 未接 | 服务端问位置时不答 = 保留旧值（macOS 不可见时也不答，语义安全） |

@@ -3,6 +3,8 @@ name: Release Published
 # Release 正式发布(release.yml 产出草稿 → 人工审核 Release Notes → 点 Publish)的下游动作:
 #   1. notify-docs  通知文档仓同步更新记录 → data/releases.json → 驱动 /changelog 与 /download
 #   2. sync-to-r2   把安装包与在线升级元数据推到 Cloudflare R2(dl.windinput.com)
+#   3. winget       向 microsoft/winget-pkgs 提交新版本清单(`winget install windinput`)
+#   4. scoop        通知 huanfeng/scoop-bucket 把 windinput-np 升到新版(`scoop install huanfeng/windinput-np`)
 #
 # 两平台各一套元数据:latest.json(exeUrl,Windows)与 latest-mac.json(pkgUrl,macOS)。
 # 键名故意不同,好让「客户端读到另一平台的元数据」在解析阶段就被拒 —— 客户端侧对应实现见
@@ -18,6 +20,8 @@ name: Release Published
 #     DOCS_REPO_PAT          对文档仓有 contents:write 的 PAT(GITHUB_TOKEN 跨仓无效)
 #     CLOUDFLARE_API_TOKEN   具备 R2 Edit 权限的 Token
 #     CLOUDFLARE_ACCOUNT_ID  Cloudflare 账户 ID
+#     WINGET_TOKEN           classic PAT(public_repo),其所有者名下要有 microsoft/winget-pkgs 的 fork
+#     SCOOP_TOKEN            对 huanfeng/scoop-bucket 有 contents:write 的 PAT(与 wind-dict 等姊妹项目同名)
 #
 # ⚠️ 依赖 release.yml 的 draft: true。GitHub 不会为 GITHUB_TOKEN 发起的动作触发新 workflow
 # (防递归),若把 release.yml 改成直接发布正式版,release:published 事件不会产生,本工作流
@@ -379,3 +383,91 @@ jobs:
           else
             echo "Linux: 无需清理(本次同步=${LINUX_SYNCED:-false}, 前一版本=${PREV_LINUX:-<none>})"
           fi
+
+  winget:
+    name: 提交 winget 清单
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      HAS_TOKEN: ${{ secrets.WINGET_TOKEN != '' && 'true' || 'false' }}
+      PRERELEASE: ${{ github.event.release.prerelease || false }}
+    steps:
+      # komac update 以 winget-pkgs 里的上一版为模板,只换 URL / 哈希 / 版本 —— 所以包必须
+      # 已经在库里;首次入库走 scripts/pkg-managers/winget-manifest.sh 手工提交。
+      - name: 检查前置条件
+        id: gate
+        run: |
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "::warning::未配置 secrets.WINGET_TOKEN,跳过 winget 提交。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          # 预发布不进 winget:winget 没有渠道概念,提交了就会被所有 `winget upgrade` 拉到。
+          # 带 '-' 的版本号(0.124.1-beta.2 之类)同理,即便 Release 忘了勾 pre-release。
+          elif [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *-* ]]; then
+            echo "::notice::$TAG 是预发布版本,不提交 winget。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 下载地址用官网下载网关 dl.windinput.com(国内快):网关 302 到国内镜像或 R2;R2 只留最新
+      # 一版(见上面的清理步骤),R2 上已清掉的旧版由网关回落 GitHub Releases 的同名资产
+      # (WindInputSite/worker),所以 winget-pkgs 定期回测历史版本 URL 时不会 404。三处出口是
+      # 同一个文件,哈希一致。也因此本 job 不必等 R2 同步完成:还没传上去时网关同样回落 GitHub。
+      #
+      # 直接跑 komac 而不用 winget-releaser:后者只认 GitHub Release 资产的 URL。
+      # komac 下载这个地址算哈希,以库里上一版为模板生成清单,向 microsoft/winget-pkgs 提 PR
+      # (从 token 所属账号的 fork 发出,没有 fork 会自动建)。
+      - name: 提交到 winget-pkgs
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          KOMAC_VERSION: 2.16.0
+          KOMAC_SHA256: 7d2707fa6210f2789a3702de49fbd150b736dbf426ee0b9bc8e098736f9fd82d
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ steps.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          F="komac-${KOMAC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$F" "https://github.com/russellbanks/Komac/releases/download/v${KOMAC_VERSION}/$F"
+          echo "${KOMAC_SHA256}  $F" | sha256sum -c -
+          tar -xzf "$F" komac
+          ./komac update WindInput.WindInput \
+            --version "$VERSION" \
+            --urls "https://dl.windinput.com/WindInput-Setup-${VERSION}.exe" \
+            --release-notes-url "https://github.com/${{ github.repository }}/releases/tag/${TAG}" \
+            --submit
+
+  # 自有桶 huanfeng/scoop-bucket 的 Excavator 定时任务已被 GitHub 以长期无活动停用,不能指望它按
+  # checkver 自动跟进,故由这里主动通知。对端 update-installer-manifest.yml 只改 version/url/hash:
+  # URL 按桶内清单自己的 autoupdate 模板生成,哈希由对端下载后自算,这里只报版本号。
+  # 官方 Nonportable 桶(若收录)由其机器人按 checkver/autoupdate 跟进,与此无关。
+  scoop:
+    name: 通知 Scoop 桶
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PRERELEASE: ${{ github.event.release.prerelease || false }}
+      TOKEN: ${{ secrets.SCOOP_TOKEN }}
+    steps:
+      - name: 发送 repository_dispatch
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::未配置 secrets.SCOOP_TOKEN,跳过 Scoop 桶更新。"
+            exit 0
+          fi
+          # 与 winget 同一条判据:Scoop 同样没有渠道概念,预发布不进桶。
+          if [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *-* ]]; then
+            echo "::notice::$TAG 是预发布版本,不更新 Scoop 桶。"
+            exit 0
+          fi
+          jq -n --arg version "$VERSION" \
+            '{event_type: "update-installer-manifest", client_payload: {app: "windinput-np", version: $version}}' \
+            | curl -fsS -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://api.github.com/repos/huanfeng/scoop-bucket/dispatches" \
+                --data-binary @-
+          echo "已通知 huanfeng/scoop-bucket 更新 windinput-np 到 $VERSION"

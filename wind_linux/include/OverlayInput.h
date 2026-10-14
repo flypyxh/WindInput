@@ -77,6 +77,26 @@ int32_t tipRecheckHover(bool onTip, bool onCandidate, int32_t candidateHit, int3
 Rect dragOverlay(int32_t px, int32_t py, int32_t grabDx, int32_t grabDy,
                  const OverlayFramePayload& geo, const Rect& workArea);
 
+/// 候选窗左键点选：按下只记命中，**松开时仍落在同一项上**才选（候选与翻页按钮同理；移出后松开
+/// 视为放弃，按钮的通行语义）。对位 macOS `CandidateContentView.mouseUp`（ab671477，同 Squirrel）。
+/// 按下就选的话，上屏、收起候选窗在松开前就做完了，松开落到候选窗后面的应用上。
+class ClickGate {
+public:
+    void press(int32_t hit) { pressed_ = hit; }
+    /// 返回要选的命中（候选下标 / 翻页 -1 -2），不选返回 kNoHit。每次按下只交出一次。
+    int32_t release(int32_t hit)
+    {
+        const int32_t p = pressed_;
+        pressed_ = kNoHit;
+        return p != kNoHit && p == hit ? p : kNoHit;
+    }
+    /// 候选窗收起 / 指针离开：按下作废。
+    void cancel() { pressed_ = kNoHit; }
+
+private:
+    int32_t pressed_ = kNoHit;
+};
+
 /// 窗口矩形里是否包含屏幕点（半开区间）。
 bool rectContains(const Rect& r, int32_t x, int32_t y);
 

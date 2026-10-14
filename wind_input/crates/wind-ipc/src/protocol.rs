@@ -380,6 +380,10 @@ pub mod ext_kind {
     ///   WaylandPanel）——服务端再等「权威光标坐标」就是白等：首显闸门会一直压到
     ///   [`FIRST_SHOW_LONG_FALLBACK_MS`] 长兜底才放行（实测首键后 1~2 秒）。置位后按「自绘候选的
     ///   宿主」处理（同 `set_caret_independent`），首帧直接下发。
+    /// - `inline_preedit`：宿主能否在应用内显示预编辑（Linux：客户端是否声明了 Fcitx5 的
+    ///   Preedit 能力位）。`false` 时编码改由候选窗画（见协调器 `preedit_in_app_effective`）——
+    ///   addon 不把编码转交 Fcitx5 自己的输入面板，否则 classicui 会另起一个小窗、被候选窗盖住
+    ///   （WPS / QQ 实测）。缺省 = 不改现值；只有 Linux addon 发，其他平台恒按「能」处理。
     /// - `scale`：界面缩放因子（1.0 = 96dpi）。服务不链接桌面库，Linux 上的缩放只能由宿主报：
     ///   Wayland 取输出的缩放，X11 取 `Xft.dpi / 96`。落在 `wind_ui::dpi`，所有浮层的字号与几何
     ///   都从它派生；帧位图因此按物理像素光栅化，addon 贴图时再按同一个因子折回逻辑尺寸。

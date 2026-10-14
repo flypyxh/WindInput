@@ -391,7 +391,7 @@ app_build() {
     done
 
     # 菜单栏图标 (单色 PDF 模板). plist 引用 menu_icon.pdf, 另带 _15 / _26 应对 Retina.
-    # 源 SVG 在 Resources/wind-{15,26}.svg, 重新生成: rsvg-convert -f pdf -o menu_icon_15.pdf wind-15.svg
+    # SVG/PDF 由 scripts/mac/gen_menu_icon.py 生成 (圆角方块镂空「风」, 对齐系统输入法图标), 勿手改.
     local icon src
     for icon in menu_icon.pdf menu_icon_15.pdf menu_icon_26.pdf; do
         src="$MACOS_DIR/Sources/WindInputApp/Resources/$icon"
@@ -1306,6 +1306,18 @@ PY
     # 4c. 触发一次 input sources 重读
     defaults read com.apple.HIToolbox AppleEnabledInputSources >/dev/null 2>&1 || true
 
+    # 4c'. 踢掉第 1 步之后又被 IMK 拉起的控制器: pkill 后到 cp 完成前, 清风正被选中的宿主
+    #     会让 IMK 立刻重拉一个 (可能还是旧二进制)。第 1 步杀过了不等于干净, 别删这一步。
+    #     **必须在起注册守护之前做, 之后绝不能再踢**:
+    #     注册一发生, 当前选中清风的宿主会让 imklaunchagent 立即拉起一个**新**控制器
+    #     (launchd: "spawned … because launch job demand"), 它是唯一持有 IMK 端点的进程。
+    #     旧版在注册后 sleep 1 再 kick, 恰好把这个新控制器杀掉 (实测 macOS 27: 19:00:54 与
+    #     20:35:20 两次都是"拉起 <1s 即被杀")。此后同 bundle 只剩不建 IMKServer 的注册守护,
+    #     imklaunchagent 每次要端点都是 NO Endpoint —— 切走切回、重开宿主都无效, 只有
+    #     重启 (守护消失) 才恢复, 即 GH#186。是否中招取决于安装那一刻清风是否正被选中且
+    #     有聚焦的文本框 (如授权对话框), 所以时有时无。
+    kick_ime_app
+
     # 4d. 调本 .app 自身 binary 的 --register-input-source 立即注册 (免重启即可在 picker 出现).
     #     macOS Tahoe (26) 起 TIS 仅接受来自 IME 自身进程的 TISRegisterInputSource 调用
     #     (校验 codesign identity 匹配 bundleID), 外部 swift CLI 调 silently no-op.
@@ -1321,13 +1333,6 @@ PY
         info "    PID=$REGISTER_PID (要停止后台 register: kill $REGISTER_PID)"
         head -2 /tmp/wind_register.log 2>/dev/null | sed 's/^/    /'
     fi
-
-    # .app 刚被整包替换, 但此刻可能还有一个**旧** bundle 的控制器进程在跑 (p1 的顺序是
-    # 先装 service——那一步的 kick 会让 IMK 用旧 .app 重拉一个控制器——再装 app)。
-    # 不踢掉它就留下「跑着旧二进制 / 连接已失效」的控制器, 表现正是
-    # 「输入法能切过去, 但一个字都打不出来」, 且极易被误判成 TIS 缓存问题去反复注销重登。
-    # 这里补一次 kick: 只杀控制器实例, 保留上面刚 fork 的 --register-input-source 守护。
-    kick_ime_app
 
     bold "==> Done"
     cat <<EOF

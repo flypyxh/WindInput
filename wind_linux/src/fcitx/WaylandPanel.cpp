@@ -9,6 +9,7 @@
 #include <fcitx/addonmanager.h>
 
 #include <wayland-client.h>
+#include "input-method-unstable-v1-client-protocol.h"
 #include "input-method-unstable-v2-client-protocol.h"
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
@@ -92,12 +93,22 @@ struct WaylandListeners {
                          wl_fixed_t y)
     {
         auto* self = static_cast<WaylandCandidatePanel*>(data);
+        self->retired_.pointerEnter(reinterpret_cast<uintptr_t>(surface));
         if (int32_t ox, oy; self->screenMenu_ && self->screenMenuOffset(surface, ox, oy)) {
             self->menuPtrSurface_ = surface;
             self->menuPtrOffX_ = ox;
             self->menuPtrOffY_ = oy;
             self->layerPtrX_ = wl_fixed_to_double(x);
             self->layerPtrY_ = wl_fixed_to_double(y);
+            if (self->pendingMenu_ && self->pendingMenu_->locate) {
+                self->pendingMenu_->x = ox + int32_t(std::lround(self->layerPtrX_));
+                self->pendingMenu_->y = oy + int32_t(std::lround(self->layerPtrY_));
+                self->pendingMenu_->locate = false;
+                if (self->catcher_.mapped) {
+                    self->sendPendingMenu();
+                }
+                return;
+            }
             self->reportScreenMenuPointer(MENU_POINTER_MOTION, 0);
             return;
         }
@@ -123,6 +134,8 @@ struct WaylandListeners {
     static void ptrLeave(void* data, wl_pointer*, uint32_t, wl_surface* surface)
     {
         auto* self = static_cast<WaylandCandidatePanel*>(data);
+        self->retired_.pointerLeave(reinterpret_cast<uintptr_t>(surface));
+        self->reapRetired(false); // 指针停在退役 surface 上时拖着没销毁的，此刻可以了
         if (surface && surface == self->menuPtrSurface_) {
             self->menuPtrSurface_ = nullptr;
             return;
@@ -140,6 +153,7 @@ struct WaylandListeners {
             return;
         }
         self->pointerInside_ = false;
+        self->click_.cancel();
         self->setHover(-1);
         self->updatePopupStatusHover();
     }
@@ -216,7 +230,17 @@ struct WaylandListeners {
             }
             return;
         }
-        if (!self->pointerInside_ || !pressed || self->screenMenu_) {
+        if (!self->pointerInside_ || self->screenMenu_) {
+            return;
+        }
+        if (!pressed) {
+            // 左键点选在松开时生效（ClickGate）：按下时的隐式抓取让松开仍落在本 surface 上
+            if (button == kBtnLeft) {
+                const int32_t idx = self->click_.release(self->hitAtPointer());
+                if (idx != kNoHit && self->cb_.select) {
+                    self->cb_.select(idx);
+                }
+            }
             return;
         }
         if (self->menuOpen()) {
@@ -228,26 +252,19 @@ struct WaylandListeners {
             return;
         }
         if (button == kBtnRight && self->pointerOnPopupStatus() && self->cb_.contextMenu) {
-            // 右键 popup 里的状态气泡：状态菜单，同样画在 popup 里
+            // 右键 popup 里的状态气泡：状态菜单
             self->setHover(-1);
-            self->cb_.contextMenu(MENU_TARGET_STATUS,
-                                  int32_t(std::lround(self->pointerX_ * self->reportedScale_)),
-                                  int32_t(std::lround(self->pointerY_ * self->reportedScale_)));
+            self->openContextMenu(MENU_TARGET_STATUS);
             return;
         }
         if (button == kBtnLeft) {
-            const int32_t idx = self->hitAtPointer();
-            if (idx != kNoHit && self->cb_.select) {
-                self->cb_.select(idx);
-            }
+            self->click_.press(self->hitAtPointer());
         } else if (button == kBtnRight && self->cb_.contextMenu) {
             // 命中候选 → 候选菜单，空白 / 翻页按钮 → 主菜单（同 X11 与 Windows）。
             // 悬停先清掉：菜单开着时候选窗收不到悬停，残留的高亮会一直挂着。
             const int32_t hit = self->hitAtPointer();
             self->setHover(-1);
-            self->cb_.contextMenu(contextMenuTarget(hit),
-                                  int32_t(std::lround(self->pointerX_ * self->reportedScale_)),
-                                  int32_t(std::lround(self->pointerY_ * self->reportedScale_)));
+            self->openContextMenu(contextMenuTarget(hit));
         }
     }
     static void ptrAxis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value)
@@ -350,6 +367,16 @@ struct WaylandListeners {
     }
     static void surfaceLeave(void*, wl_surface*, wl_output*) {}
 
+    /// 退役 surface 取消映射后发的 sync 回来了：合成器已处理完取消映射，此前的指针事件也已送达。
+    static void retiredSynced(void* data, wl_callback* cb, uint32_t)
+    {
+        auto* r = static_cast<WaylandCandidatePanel::Retired*>(data);
+        wl_callback_destroy(cb);
+        r->sync = nullptr;
+        r->owner->retired_.synced(reinterpret_cast<uintptr_t>(r->surface));
+        r->owner->reapRetired(false);
+    }
+
     static void popupRect(void*, zwp_input_popup_surface_v2*, int32_t x, int32_t y, int32_t w,
                           int32_t h)
     {
@@ -368,6 +395,7 @@ const wl_registry_listener kRegistryListener = {WaylandListeners::registryGlobal
                                                 WaylandListeners::registryRemove};
 const wl_buffer_listener kBufferListener = {WaylandListeners::bufferRelease};
 const zwp_input_popup_surface_v2_listener kPopupListener = {WaylandListeners::popupRect};
+const wl_callback_listener kRetiredSyncListener = {WaylandListeners::retiredSynced};
 const wl_output_listener kOutputListener = [] {
     wl_output_listener l{}; // 绑 v≤3：name / description（v4）不会来；逐成员赋值免得各版本头文件成员数不同
     l.geometry = WaylandListeners::outGeometry;
@@ -447,9 +475,16 @@ WaylandCandidatePanel::~WaylandCandidatePanel()
     teardown(display_ != nullptr);
 }
 
-bool WaylandCandidatePanel::handles(const fcitx::InputContext* ic)
+bool WaylandCandidatePanel::handles(const fcitx::InputContext* ic) const
 {
-    return ic && std::strcmp(ic->frontend(), "wayland_v2") == 0;
+    if (!ic) {
+        return false;
+    }
+    if (std::strcmp(ic->frontend(), "wayland_v2") == 0) {
+        return true;
+    }
+    // input-method-v1（KWin）：没绑到面板全局时接不住，留给 X11 那条路（与改动前一致）
+    return inputPanel_ && std::strcmp(ic->frontend(), "wayland") == 0;
 }
 
 void WaylandCandidatePanel::onConnection(const std::string& name, wl_display* display)
@@ -510,6 +545,14 @@ void WaylandCandidatePanel::onGlobal(uint32_t name, const char* iface, uint32_t 
         relPtrMgr_ = static_cast<zwp_relative_pointer_manager_v1*>(
             wl_registry_bind(registry_, name, &zwp_relative_pointer_manager_v1_interface, 1));
         ensureRelativePointer();
+    } else if (std::strcmp(iface, "zwp_input_panel_v1") == 0 && !inputPanel_) {
+        inputPanel_ = static_cast<zwp_input_panel_v1*>(
+            wl_registry_bind(registry_, name, &zwp_input_panel_v1_interface, 1));
+        WIND_INFO() << "input-method-v1 面板可用（KWin）：Wayland 原生应用的候选窗走 overlay 面板";
+        // handles() 随之变了：焦点若已在 v1 应用里，让引擎重报宿主显示（不等坐标、缩放）
+        if (onScaleChanged_) {
+            onScaleChanged_();
+        }
     } else if (std::strcmp(iface, "wl_seat") == 0 && !seat_) {
         seat_ = static_cast<wl_seat*>(wl_registry_bind(registry_, name, &wl_seat_interface, 1));
         wl_seat_add_listener(seat_, &kSeatListener, this);
@@ -607,11 +650,18 @@ void WaylandCandidatePanel::teardown(bool alive)
             }
         }
         dropPopup();
+        reapRetired(true);
         if (buffer_) {
             wl_buffer_destroy(buffer_);
         }
+        if (panelSurf_) {
+            zwp_input_panel_surface_v1_destroy(panelSurf_);
+        }
         if (surface_) {
             wl_surface_destroy(surface_);
+        }
+        if (inputPanel_) {
+            zwp_input_panel_v1_destroy(inputPanel_);
         }
         if (viewport_) {
             wp_viewport_destroy(viewport_);
@@ -672,8 +722,12 @@ void WaylandCandidatePanel::teardown(bool alive)
     relPtr_ = nullptr;
     relPtrMgr_ = nullptr;
     layerShell_ = nullptr;
+    reapRetired(true, false); // 连接已死时到这里才丢（只释放本端结构）
     buffer_ = nullptr;
     surface_ = nullptr;
+    surfaceRole_ = Role::None;
+    panelSurf_ = nullptr;
+    inputPanel_ = nullptr;
     popup_ = nullptr;
     im_ = nullptr;
     viewport_ = nullptr;
@@ -746,6 +800,55 @@ zwp_input_method_v2* WaylandCandidatePanel::rawProxyOf(void* wrapper)
 
 bool WaylandCandidatePanel::ensurePopup(fcitx::InputContext* ic)
 {
+    if (ic && std::strcmp(ic->frontend(), "wayland") == 0 && inputPanel_) {
+        return ensurePanelV1();
+    }
+    return ensurePopupV2(ic);
+}
+
+bool WaylandCandidatePanel::ensureSurface()
+{
+    if (!surface_) {
+        surface_ = wl_compositor_create_surface(compositor_);
+        // Fcitx5 classicui 对本连接上每个 wl_surface 的指针进入事件都会取 user_data 当它自己的
+        // 包装对象解引用（`surface->userData()`）：我们的 surface 它不认识，user_data 为空就崩
+        // （实测鼠标一移上候选窗就带崩 fcitx5）。给一块全零的内存，它读到的 userData 是空指针，
+        // 按「不是我的窗口」直接返回。包装类内部布局没有头文件可对，故留足余量而不依赖偏移。
+        // 注意 wl_proxy_add_listener 会把 user_data 覆盖成它的 data 参数：listener 的 data 也必须
+        // 传占位（实测传 this 时，classicui 把 this 当它的窗口对象解引用，照样崩）；
+        // this 另存进占位内存的 kFakeSelfOffset 处供回调取回。
+        static char fakeWrapper[1024] = {};
+        *reinterpret_cast<WaylandCandidatePanel**>(fakeWrapper + WaylandListeners::kFakeSelfOffset) =
+            this;
+        wl_surface_add_listener(surface_, &kSurfaceListener, fakeWrapper);
+        wl_surface_set_user_data(surface_, fakeWrapper);
+        WIND_INFO() << "Wayland 候选窗：surface 已建";
+    }
+    return surface_ != nullptr;
+}
+
+bool WaylandCandidatePanel::ensurePanelV1()
+{
+    if (surface_ && surfaceRole_ != Role::PanelV1 && surfaceRole_ != Role::None) {
+        retireSurface(); // 拿过 v2 popup 角色的 surface 不能再当面板
+    }
+    if (!ensureSurface()) {
+        return false;
+    }
+    if (panelSurf_) {
+        return true;
+    }
+    // overlay 面板：KWin 把它摆在文本光标下方（放不下翻到上方、夹进可用区域），重新映射、光标矩形
+    // 或尺寸变了都会重摆。角色没有 destroy 请求，收起时整个 surface 退役（见 hidePopup）。
+    panelSurf_ = zwp_input_panel_v1_get_input_panel_surface(inputPanel_, surface_);
+    zwp_input_panel_surface_v1_set_overlay_panel(panelSurf_);
+    surfaceRole_ = Role::PanelV1;
+    WIND_DEBUG() << "Wayland 候选窗：已把 surface 登记为 input-method-v1 overlay 面板";
+    return true;
+}
+
+bool WaylandCandidatePanel::ensurePopupV2(fcitx::InputContext* ic)
+{
     auto* waylandim = instance_->addonManager().addon("waylandim");
     if (!waylandim) {
         return false;
@@ -767,21 +870,11 @@ bool WaylandCandidatePanel::ensurePopup(fcitx::InputContext* ic)
         }
         return false;
     }
-    if (!surface_) {
-        surface_ = wl_compositor_create_surface(compositor_);
-        // Fcitx5 classicui 对本连接上每个 wl_surface 的指针进入事件都会取 user_data 当它自己的
-        // 包装对象解引用（`surface->userData()`）：我们的 surface 它不认识，user_data 为空就崩
-        // （实测鼠标一移上候选窗就带崩 fcitx5）。给一块全零的内存，它读到的 userData 是空指针，
-        // 按「不是我的窗口」直接返回。包装类内部布局没有头文件可对，故留足余量而不依赖偏移。
-        // 注意 wl_proxy_add_listener 会把 user_data 覆盖成它的 data 参数：listener 的 data 也必须
-        // 传占位（实测传 this 时，classicui 把 this 当它的窗口对象解引用，照样崩）；
-        // this 另存进占位内存的 kFakeSelfOffset 处供回调取回。
-        static char fakeWrapper[1024] = {};
-        *reinterpret_cast<WaylandCandidatePanel**>(fakeWrapper + WaylandListeners::kFakeSelfOffset) =
-            this;
-        wl_surface_add_listener(surface_, &kSurfaceListener, fakeWrapper);
-        wl_surface_set_user_data(surface_, fakeWrapper);
-        WIND_INFO() << "Wayland 候选窗：surface 已建，输入法对象 " << static_cast<void*>(im);
+    if (surface_ && surfaceRole_ == Role::PanelV1) {
+        retireSurface();
+    }
+    if (!ensureSurface()) {
+        return false;
     }
     if (popup_ && im_ == im) {
         return true;
@@ -790,6 +883,7 @@ bool WaylandCandidatePanel::ensurePopup(fcitx::InputContext* ic)
     popup_ = zwp_input_method_v2_get_input_popup_surface(im, surface_);
     zwp_input_popup_surface_v2_add_listener(popup_, &kPopupListener, this);
     im_ = im;
+    surfaceRole_ = Role::PopupV2;
     WIND_DEBUG() << "Wayland 候选窗：已把 surface 登记为 input popup";
     return true;
 }
@@ -1272,6 +1366,7 @@ void WaylandCandidatePanel::hidePopup()
     if (!surface_ || !display_) {
         return;
     }
+    click_.cancel(); // 收起后的松开不再选
     // 销毁 popup 角色（合成器据此摘窗，下一次显示重建时按当时的文本光标矩形重新摆位——只摘 buffer
     // 不销毁角色，treeland 会让候选窗一直钉在第一次出现的地方），但 **wl_surface 本身留着**：
     // 它一旦销毁，鼠标恰好正进入它时迟到的 `wl_pointer.enter` 带的是已销毁对象（libwayland 交给
@@ -1281,9 +1376,79 @@ void WaylandCandidatePanel::hidePopup()
     // surface 当普通内容画（实测 Toast 收起时闪出整块纯黑）。
     wl_surface_attach(surface_, nullptr, 0, 0);
     wl_surface_commit(surface_);
-    dropPopup();
+    if (surfaceRole_ == Role::PanelV1) {
+        // v1 面板角色拆不掉，而 KWin 只认一个面板：Fcitx5 classicui 显示自己的窗口时会无声顶掉
+        // 我们的，留着这个 surface 下次贴图也不会再出现。整个 surface 退役，下次显示换新的。
+        retireSurface();
+    } else {
+        dropPopup();
+    }
     wl_display_flush(display_);
     buffer_ = nullptr;
+}
+
+void WaylandCandidatePanel::retireSurface()
+{
+    if (!surface_) {
+        return;
+    }
+    // 先取消映射（hidePopup 已做过的话重复一次无害）；sync 回来时合成器已处理完它（见 RetiredSurfaces.h）
+    wl_surface_attach(surface_, nullptr, 0, 0);
+    wl_surface_commit(surface_);
+    auto r = std::make_unique<Retired>();
+    r->owner = this;
+    r->surface = surface_;
+    r->viewport = viewport_;
+    r->role = panelSurf_;
+    r->sync = wl_display_sync(display_);
+    wl_callback_add_listener(r->sync, &kRetiredSyncListener, r.get());
+    retired_.retire(reinterpret_cast<uintptr_t>(surface_));
+    retiredRes_.push_back(std::move(r));
+    WIND_DEBUG() << "Wayland 候选窗：surface 退役，待销毁 " << retired_.size();
+    surface_ = nullptr;
+    viewport_ = nullptr;
+    panelSurf_ = nullptr;
+    surfaceRole_ = Role::None;
+    dropPopup();
+    // 新 surface 上还没有指针：悬停状态归零（退役 surface 的离开事件不再走候选窗那条路）。
+    // 只清本端、不报服务端（同 hide()：服务端随候选窗收起自行复位）——这里可能处在 present()
+    // 中途，同步 IPC 一旦超时会经 noteStall 重入收起。
+    pointerInside_ = false;
+    hover_ = -1;
+    popupStatusHovered_ = false;
+}
+
+void WaylandCandidatePanel::reapRetired(bool all, bool alive)
+{
+    const auto ids = all ? retired_.takeAll() : retired_.takeDestroyable();
+    for (uintptr_t id : ids) {
+        auto it = std::find_if(retiredRes_.begin(), retiredRes_.end(), [id](const auto& r) {
+            return reinterpret_cast<uintptr_t>(r->surface) == id;
+        });
+        if (it == retiredRes_.end()) {
+            continue;
+        }
+        Retired& r = **it;
+        // wl_callback 与面板角色都没有 destroy 请求，*_destroy 只释放本端代理：连接死了也照样释放，
+        // 免得代理的 listener 还指着下面要释放的 Retired
+        if (r.sync) {
+            wl_callback_destroy(r.sync);
+        }
+        if (r.role) {
+            zwp_input_panel_surface_v1_destroy(r.role);
+        }
+        if (alive) {
+            if (r.viewport) {
+                wp_viewport_destroy(r.viewport);
+            }
+            wl_surface_destroy(r.surface);
+        }
+        retiredRes_.erase(it);
+    }
+    if (!ids.empty()) {
+        WIND_DEBUG() << "Wayland 候选窗：销毁退役 surface " << ids.size() << " 个，余 "
+                     << retired_.size();
+    }
 }
 
 // ── 屏幕锚定的浮层（wlr-layer-shell）────────────────────────────────
@@ -1612,7 +1777,30 @@ void WaylandCandidatePanel::disarm(std::unique_ptr<fcitx::EventSourceTime>& t)
     }
 }
 
-void WaylandCandidatePanel::openScreenMenu(int32_t target, int32_t x, int32_t y)
+bool WaylandCandidatePanel::openMenuAtPointer(int32_t target)
+{
+    if (!layerShell_ || !subcomp_ || !ready()) {
+        return false;
+    }
+    openScreenMenu(target, 0, 0, true);
+    return true;
+}
+
+void WaylandCandidatePanel::openContextMenu(int32_t target)
+{
+    if (layerShell_ && subcomp_) {
+        // 合成进 popup 位图的话，菜单一大位图跟着变大，合成器重摆整块（翻到光标上方、夹回屏内），
+        // 候选窗被挤走；而且 popup 的屏幕位置不可知，开不了接住菜单外点击的底板。
+        openScreenMenu(target, 0, 0, true);
+        return;
+    }
+    if (cb_.contextMenu) {
+        cb_.contextMenu(target, int32_t(std::lround(pointerX_ * reportedScale_)),
+                        int32_t(std::lround(pointerY_ * reportedScale_)));
+    }
+}
+
+void WaylandCandidatePanel::openScreenMenu(int32_t target, int32_t x, int32_t y, bool locate)
 {
     if (!layerShell_ || !subcomp_ || !ready()) {
         WIND_WARN() << "开不了屏幕菜单：layer-shell/subcompositor 缺";
@@ -1622,11 +1810,15 @@ void WaylandCandidatePanel::openScreenMenu(int32_t target, int32_t x, int32_t y)
     closeMenu(); // popup 里若还开着菜单，先收（不报：服务端开新菜单时自己会关旧的）
     screenMenu_ = true;
     screenMenuShown_ = false;
-    pendingMenu_ = PendingMenu{target, x, y};
+    pendingMenu_ = PendingMenu{target, x, y, locate};
     layers_[OVERLAY_KIND_STATUS].hideTimer.reset(); // 菜单开着期间气泡不消失
     armTimer(menuMax_, menuMaxMs_, &WaylandCandidatePanel::onMenuMaxExpired);
     armTimer(menuIdle_, menuIdleMs_, &WaylandCandidatePanel::onMenuIdleExpired);
     showCatcher();
+    if (locate) {
+        // 指针一直不进底板（理论上松开右键、底板映射后合成器就会发进入）：别让底板挡着桌面
+        armTimer(menuWait_, 2000, &WaylandCandidatePanel::onMenuWaitExpired);
+    }
     if (catcher_.mapped) {
         sendPendingMenu();
     }
@@ -1698,8 +1890,8 @@ void WaylandCandidatePanel::catcherConfigured(uint32_t serial, uint32_t w, uint3
 
 void WaylandCandidatePanel::sendPendingMenu()
 {
-    if (!pendingMenu_) {
-        return;
+    if (!pendingMenu_ || pendingMenu_->locate) {
+        return; // 落点待定：等指针进入底板（见 ptrEnter）
     }
     const PendingMenu m = *pendingMenu_;
     pendingMenu_.reset();

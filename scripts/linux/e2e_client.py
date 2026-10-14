@@ -251,6 +251,7 @@ async def x11_cases(bus, im):
     await asyncio.sleep(0.3)
     win = candidate_window()
     got = ""
+    hit = None
     if win and win[5]:
         _, x, y, w, h, _ = win
         for dx in range(4, w, 8):
@@ -258,6 +259,7 @@ async def x11_cases(bus, im):
             await asyncio.sleep(0.12)
             got = c.take()
             if got:
+                hit = (x + dx, y + h // 2)
                 break
     check("X11：鼠标点候选 → 上屏（CMD_CANDIDATE_SELECT → push 回来的 CommitText）",
           got != "", "点遍中线都没有上屏")
@@ -265,6 +267,23 @@ async def x11_cases(bus, im):
     win = candidate_window()
     check("X11：鼠标选词后候选窗隐藏", win is not None and not win[5], f"window={win}")
     sh("xdotool", "mousemove", "5", "5")
+
+    # 点选在松开时生效（同 macOS）：按下不上屏；按住拖出候选窗再松开 = 放弃，候选窗仍在。
+    if hit:
+        await c.type("nihao")
+        await asyncio.sleep(0.3)
+        sh("xdotool", "mousemove", str(hit[0]), str(hit[1]), "mousedown", "1")
+        await asyncio.sleep(0.2)
+        on_press = c.take()
+        sh("xdotool", "mousemove", "5", "5", "mouseup", "1")
+        await asyncio.sleep(0.2)
+        on_release = c.take()
+        win = candidate_window()
+        check("X11：按下候选不上屏，拖出候选窗松开 = 放弃（候选窗仍在）",
+              on_press == "" and on_release == "" and win is not None and win[5],
+              f"按下={on_press!r} 松开={on_release!r} window={win}")
+        await c.key("Escape")
+        c.take()
 
     # 屏幕底边：光标在 (300, 780)，下方放不下 → 翻到光标上方，且不出屏。
     await c.ic.call_set_cursor_rect(300, 780, 2, 16)
@@ -481,25 +500,21 @@ async def impanel(bus):
     return _IMPANEL
 
 
-async def open_main_menu(c, tries=1):
-    """功能主菜单的鼠标入口只剩组字时的候选窗：右键候选 → 候选菜单末行「更多…」→ 主菜单
-    （空闲时的状态区入口是「清风输入法设置」，不再开菜单）。返回主菜单窗口或 None。
-    组字（nihao）在菜单关掉后仍挂着，调用方用 end_composition 收掉再验打字。
+async def open_main_menu(c, tries=1, at=(300, 200)):
+    """功能主菜单的鼠标入口：Fcitx5 状态区动作「清风输入法菜单」（托盘菜单 / kimpanel 面板里
+    那一项），主菜单弹在指针处（先把指针挪到 at）。候选菜单里不再有「更多…」（见 linux-port.md
+    §5c）。返回主菜单窗口或 None。
 
     tries > 1：服务刚重启时 socket 先于整个服务就绪，menu.open 可能被当「未就绪」丢掉，重试。"""
+    panel = await impanel(c.bus)
     for _ in range(tries):
-        menu, _pt = await open_candidate_menu(c)
-        if menu and menu[5]:
-            last = await probe_row(menu, from_bottom=True)
-            if last is not None:
-                sh("xdotool", "mousemove", str(menu[1] + menu[3] // 3), str(last), "click", "1")
-                await asyncio.sleep(0.5)
-                main = await wait_window("wind-menu-0", True)
-                if main and main[5] and main[4] > menu[4]:
-                    return main
-        await c.key("Escape")  # 候选菜单若还开着，这一下收菜单；下面那下收组字
+        sh("xdotool", "mousemove", str(at[0]), str(at[1]))
+        panel.trigger("/Fcitx/windinput-menu")
+        main = await wait_window("wind-menu-0", True)
+        if main and main[5]:
+            return main
+        await c.key("Escape")
         await wait_menus_gone()
-        await end_composition(c)
     return None
 
 
@@ -555,6 +570,10 @@ class KimpanelWatch:
         iface = bus.get_proxy_object(name, path, intro).get_interface(name)
         iface.on_update_property(lambda p: self.props.append(p))
         iface.on_register_properties(lambda ps: self.registered.append(list(ps)))
+        # Fcitx5 输入面板里的预编辑 / 辅助文本：classicui 会把它们画成另一个小窗。
+        self.panel_texts = []
+        iface.on_update_preedit_text(lambda t, _a: self.panel_texts.append(t))
+        iface.on_update_aux(lambda t, _a: self.panel_texts.append(t))
 
     def im(self):
         for p in reversed(self.props):
@@ -654,17 +673,17 @@ async def menu_cases(bus, im):
     c.take()
     await typing_works(c, "字母关闭")
 
-    # d) 「更多…」→ 功能主菜单；主菜单比候选菜单高，截图看字形 / 勾选 / 分隔线 / 子菜单箭头。
+    # d) 候选菜单里没有通往主菜单的项（末行是「复制」，协调器单测钉内容）；主菜单走状态区入口。
+    #    主菜单比候选菜单高，截图看字形 / 勾选 / 分隔线 / 子菜单箭头。
     menu, pt = await open_candidate_menu(c)
-    main = None
-    if menu and menu[5]:
-        last = await probe_row(menu, from_bottom=True)
-        if last is not None:
-            sh("xdotool", "mousemove", str(menu[1] + menu[3] // 3), str(last), "click", "1")
-            await asyncio.sleep(0.5)
-            main = await wait_window("wind-menu-0", True)
-    ok = main is not None and main[5] and main[4] > (menu[4] if menu else 0)
-    check("菜单：候选菜单「更多…」→ 功能主菜单", ok, f"候选菜单={menu} 主菜单={main}")
+    cand_h = menu[4] if menu else 0
+    await c.key("Escape")
+    await wait_menus_gone()
+    await end_composition(c)
+    main = await open_main_menu(c)
+    ok = main is not None and main[5] and main[4] > cand_h
+    check("菜单：状态区「清风输入法菜单」→ 功能主菜单（比候选菜单高）", ok,
+          f"候选菜单={menu} 主菜单={main}")
     if ok:
         _, mx, my, mw, mh, _ = main
         path, n = window_has_content(main[0], "menu_main")
@@ -694,8 +713,7 @@ async def menu_cases(bus, im):
                   f"im={watch.im()!r}")
     await c.key("Escape")
     c.take()
-    # 空闲时没有主菜单入口了（状态区入口改成了「清风输入法设置」），主菜单都从组字时的
-    # 「更多…」进——英文态组不了字，先用 Shift 切回中文（顺带验按键这条来源的托盘图标）。
+    # 切回中文（顺带验按键这条来源的托盘图标）：下面点子菜单「全拼」要从中文态验起。
     await c.tap_shift()
     zh = await wait_until(lambda: watch.icon() == ICON_PIN, 2)
     check("托盘图标：Shift 切回中文 → 「拼」（全拼）", zh, f"im={watch.im()!r}")
@@ -704,7 +722,7 @@ async def menu_cases(bus, im):
     #    关掉菜单后组字还挂着，先收掉再验打字。
     main = await open_main_menu(c)
     ok = main is not None
-    check("菜单：组字中经「更多…」再开主菜单", ok, f"menu={main}")
+    check("菜单：状态区入口再开主菜单", ok, f"menu={main}")
     if ok:
         await probe_row(main)
         sub = await wait_window("wind-menu-1", True)
@@ -1581,11 +1599,37 @@ async def settings_cases(bus, im):
     await asyncio.sleep(0.3)
     regs = [p for ps in watch.registered for p in ps]
     listed = any(p.startswith("/Fcitx/windinput-settings:清风输入法设置:") for p in regs)
-    check("设置：状态区列出「清风输入法设置」、不再有「清风输入法菜单」",
-          listed and not any("windinput-menu" in p for p in regs), f"属性={regs[-6:]}")
+    listed_menu = any(p.startswith("/Fcitx/windinput-menu:清风输入法菜单:") for p in regs)
+    check("设置：状态区同时列出「清风输入法设置」与「清风输入法菜单」",
+          listed and listed_menu, f"属性={regs[-6:]}")
     before = len(read_lines(argv_log))
     panel.trigger("/Fcitx/windinput-settings")
     await launched_again("状态区点「清风输入法设置」", before)
+
+    # 状态区「清风输入法菜单」：主菜单弹在指针处（刚点托盘的地方），不在文本光标处。
+    # 内容左上 = 指针，位图带阴影扩边，故按窗口左上留 30px 余量。
+    await c.ic.call_set_cursor_rect(900, 600, 2, 20)  # 光标放远处：菜单若跟光标走就会被看出来
+    sh("xdotool", "mousemove", "300", "120")
+    panel.trigger("/Fcitx/windinput-menu")
+    main = await wait_window("wind-menu-0", True)
+    ok = main is not None and main[5]
+    check("菜单：状态区「清风输入法菜单」弹出主菜单", ok, f"menu={main}")
+    if ok:
+        _, mx, my, _, _, _ = main
+        check("菜单：状态区入口的主菜单在指针处（不跟文本光标）",
+              0 <= 300 - mx <= 30 and 0 <= 120 - my <= 30, f"@({mx},{my})")
+    await c.key("Escape")
+    await wait_menus_gone()
+    # 指针在屏幕右下角（托盘的典型位置）：菜单翻到指针左上方、整个留在屏内（1280x800）
+    sh("xdotool", "mousemove", "1270", "790")
+    panel.trigger("/Fcitx/windinput-menu")
+    main = await wait_window("wind-menu-0", True)
+    ok = (main is not None and main[5] and main[1] >= 0 and main[2] >= 0
+          and main[1] + main[3] <= 1280 + 30 and main[2] + main[4] <= 800 + 30)
+    check("菜单：指针在屏幕右下角时主菜单不出屏", ok, f"menu={main}")
+    await c.key("Escape")
+    await wait_menus_gone()
+    sh("xdotool", "mousemove", "5", "5")
 
     # 系统输入法配置里点清风的「配置」：配置工具经 Controller1.GetConfig 取描述。整页只有一个
     # External 项时 fcitx5-configtool（5.1.6+）直接启动它，而不是弹一张空白配置页。
@@ -1761,6 +1805,31 @@ async def preedit_display_cases(bus, im):
     check("嵌入（复原 app_inline）：预编辑是编码本身、上屏正常",
           r.returncode == 0 and shown.replace("'", "") == "nihao" and got == "你好",
           f"rc={r.returncode} 预编辑={shown!r} 上屏={got!r}")
+    await c.ic.call_focus_out()
+    await asyncio.sleep(0.2)
+
+    # 客户端不声明 Preedit 能力位（WPS / QQ 一类走 XIM 的应用）：编码不能交给 Fcitx5 输入面板
+    # ——classicui 会另起小窗画它，被我们的候选窗盖住——而是由服务端画进候选窗顶部栏。
+    # kimpanel 收到的就是 classicui 会画的那份面板文本，拿它作观测点。
+    kw = await kimpanel_watch(bus)
+    c = await new_ctx(bus, im, "e2e-no-preedit", caps=0)
+    await c.ic.call_set_cursor_rect(300, 400, 2, 20)
+    kw.panel_texts.clear()
+    eaten = await c.type("nihao")
+    await asyncio.sleep(0.3)
+    leaked = [t for t in kw.panel_texts if t.strip()]
+    check("无 Preedit 能力位：编码不交给 Fcitx5 输入面板", all(eaten) and not leaked,
+          f"eaten={eaten} 面板文本={leaked}")
+    if os.environ.get("DISPLAY"):
+        win = candidate_window()
+        ok = win is not None and win[5]
+        check("无 Preedit 能力位：候选窗照常出现", ok, f"window={win}")
+        if ok:
+            path, _ = screenshot("candidate_no_preedit_cap", win[0])
+            print(f"  无 Preedit 能力位候选窗截图（编码应在顶部栏）：{path}", flush=True)
+    await c.key(" ")
+    got = c.take()
+    check("无 Preedit 能力位：上屏「你好」、没有多余空格", got == "你好", f"上屏={got!r}")
     await c.ic.call_focus_out()
     await asyncio.sleep(0.2)
 

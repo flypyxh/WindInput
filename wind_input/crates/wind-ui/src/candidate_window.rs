@@ -490,6 +490,7 @@ impl CandidateWindow {
             engage_delay_ms: 60,
             hwnd: window.hwnd(),
             dragging: false,
+            pressed: None,
             drag_anchor: (0, 0),
             drag_origin: (0, 0),
             drag_pin: None,
@@ -2407,6 +2408,7 @@ impl CandidateWindow {
             opacity: 1.0,
             tint,
             place: None,
+            scale: self.scale,
         })
     }
 
@@ -2450,17 +2452,9 @@ impl CandidateWindow {
         )
     }
 
-    /// RvGradient → 渲染用 ViewGradient（stop 颜色直通 [R,G,B,A]）。
+    /// RvGradient → 渲染用 ViewGradient（委托共享 theme_assets，弹窗类同一份）。
     fn rv_gradient(&self, g: Option<&wind_theme::RvGradient>) -> Option<crate::view::ViewGradient> {
-        let g = g?;
-        if g.stops.is_empty() {
-            return None;
-        }
-        Some(crate::view::ViewGradient {
-            radial: g.kind == "radial",
-            angle: g.angle,
-            stops: g.stops.clone(),
-        })
+        crate::theme_assets::rv_gradient(g)
     }
 
     /// 按当前状态构建候选视图树（横向布局）。
@@ -4309,6 +4303,8 @@ pub struct CandidateMouse {
     hwnd: HWND,
     /// 是否正在拖动（左键按在空白区并保持）
     dragging: bool,
+    /// 左键按下时命中的候选 / 翻页键（松开时仍在同一项才动作，见 [`click_on_release`]）。
+    pressed: Option<i32>,
     /// 拖动起点：光标屏幕坐标
     drag_anchor: (i32, i32),
     /// 拖动起点：窗口左上屏幕坐标
@@ -4583,6 +4579,7 @@ impl CandidateMouse {
     fn reset_drag(&mut self) {
         self.dragging = false;
         self.drag_pin = None;
+        self.pressed = None;
     }
 
     fn hit(&self, x: f32, y: f32) -> i32 {
@@ -4593,6 +4590,11 @@ impl CandidateMouse {
         }
         -1
     }
+}
+
+/// 候选窗左键点选：按下记的命中 `pressed` 与松开处的命中 `hit` 是同一项才动作。
+fn click_on_release(pressed: Option<i32>, hit: i32) -> Option<i32> {
+    pressed.filter(|&p| p == hit)
 }
 
 /// 从 lParam 解出 client 坐标（低/高 16 位有符号）
@@ -4616,17 +4618,14 @@ impl WindowMouse for CandidateMouse {
                 let (x, y) = mouse_pos(lparam);
                 let i = self.hit(x, y);
                 match i {
-                    TAG_PAGE_PREV => {
+                    // 候选 / 翻页键：按下只记命中，松开仍在同一项上才动作（见 WM_LBUTTONUP）。
+                    // SetCapture：移出窗口后松开也要收到，才能判「放弃」并放掉按下态。
+                    i if i >= 0 || i == TAG_PAGE_PREV || i == TAG_PAGE_NEXT => {
                         self.double_click.reset();
-                        let _ = self.events.send(UiEvent::Page(-1));
-                    }
-                    TAG_PAGE_NEXT => {
-                        self.double_click.reset();
-                        let _ = self.events.send(UiEvent::Page(1));
-                    }
-                    i if i >= 0 => {
-                        self.double_click.reset();
-                        let _ = self.events.send(UiEvent::CandidateSelect(i as usize));
+                        self.pressed = Some(i);
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
                     }
                     _ => {
                         // 空白区（编码栏/内边距，非候选非翻页键）→ 起拖，整窗跟随光标。
@@ -4652,7 +4651,7 @@ impl WindowMouse for CandidateMouse {
                         let _ = ReleaseCapture();
                     }
                     // 双击判定：只收「按下到松开窗口没挪」的空白处单击——拖过一下的不算，
-                    // 否则拖完紧跟一次点击也会截图。候选项 / 翻页键按下即动作，不经这里。
+                    // 否则拖完紧跟一次点击也会截图。候选项 / 翻页键走下面的 else，不经这里。
                     let (interval, slop) = crate::double_click::system_thresholds();
                     if self.window_origin() == Some(self.drag_origin) {
                         let mut p = POINT::default();
@@ -4677,6 +4676,24 @@ impl WindowMouse for CandidateMouse {
                         let _ = self
                             .events
                             .send(UiEvent::CandidateWindowMoved { x: cx, y: cy });
+                    }
+                } else {
+                    // 候选 / 翻页键的点击在松开时生效（同 macOS `CandidateContentView.mouseUp`、
+                    // Linux `ClickGate`）：按下就选的话，上屏、收起候选窗在松开前就做完了。
+                    // 按下后移出该项再松开 = 放弃。抓取无条件放：按住期间候选窗收起时
+                    // `pressed` 已被 `reset_drag` 清掉，抓取却还在，不放的话下一次点击会落到
+                    // 隐藏的候选窗上。
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    let (x, y) = mouse_pos(lparam);
+                    if let Some(p) = click_on_release(self.pressed.take(), self.hit(x, y)) {
+                        let ev = match p {
+                            TAG_PAGE_PREV => UiEvent::Page(-1),
+                            TAG_PAGE_NEXT => UiEvent::Page(1),
+                            i => UiEvent::CandidateSelect(i as usize),
+                        };
+                        let _ = self.events.send(ev);
                     }
                 }
                 Some(LRESULT(0))
@@ -7530,6 +7547,7 @@ mod tip_hold_tests {
             engage_delay_ms: delay_ms,
             hwnd: HWND::default(),
             dragging: false,
+            pressed: None,
             drag_anchor: (0, 0),
             drag_origin: (0, 0),
             drag_pin: None,
@@ -7579,6 +7597,49 @@ mod tip_hold_tests {
                 )
             })
             .count()
+    }
+
+    fn selects(rx: &Receiver<UiEvent>) -> Vec<usize> {
+        rx.try_iter()
+            .filter_map(|e| match e {
+                UiEvent::CandidateSelect(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 点选在松开时生效（同 macOS / Linux）：按下不选，松开仍在同一项才选，且只选一次。
+    #[test]
+    fn candidate_select_fires_on_release_over_same_item() {
+        let (mut m, rx) = mouse(DELAY);
+        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
+        assert!(selects(&rx).is_empty(), "按下就选了");
+        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(6, 5));
+        assert_eq!(selects(&rx), vec![0]);
+        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(6, 5));
+        assert!(selects(&rx).is_empty(), "一次按下只选一次");
+    }
+
+    /// 按下后移到别的候选 / 空白处松开 = 放弃。
+    #[test]
+    fn candidate_select_abandoned_when_released_elsewhere() {
+        let (mut m, rx) = mouse(DELAY);
+        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
+        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(25, 5));
+        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
+        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(500, 5));
+        assert!(selects(&rx).is_empty());
+        assert!(!m.dragging, "按在候选上不起拖");
+    }
+
+    /// 按住期间候选窗收起（上屏 / Esc / 失焦）：之后的松开不选。
+    #[test]
+    fn candidate_select_dropped_when_hidden_while_pressed() {
+        let (mut m, rx) = mouse(DELAY);
+        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
+        m.reset_drag();
+        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(5, 5));
+        assert!(selects(&rx).is_empty());
     }
 
     /// 已激活、悬停在候选 0 上（UI 画着的悬停也是 0）。

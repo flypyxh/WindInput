@@ -145,10 +145,10 @@ fn symbol_wildcard_enters_buffer_instead_of_punct() {
     assert_ne!(coord.debug_input_buffer(), "a?", "对照：关闭时 ? 不进缓冲");
 }
 
-/// 空缓冲下符号通配键一律让位（其标点产物即绑定的功能）：与关闭通配时逐键相同，
-/// 中文标点下出全角「？」、缓冲保持为空。组码中同一键照常作通配。
+/// 空缓冲下符号通配键**作通配**（论坛 t302；此前一律让位出标点）：首位 `?` 进缓冲、不出「？」。
+/// 对照：关闭通配时同一键照常出全角「？」。
 #[test]
-fn lead_symbol_wildcard_yields_to_punct() {
+fn lead_symbol_wildcard_enters_buffer() {
     if !dict_ready() {
         eprintln!("跳过：五笔词库不存在");
         return;
@@ -161,18 +161,16 @@ fn lead_symbol_wildcard_yields_to_punct() {
             coord.debug_input_buffer(),
         )
     };
-    let off = lead(false);
     assert_eq!(
-        off,
+        lead(false),
         (Some("？".to_string()), String::new()),
         "前置：关闭时出全角问号"
     );
-    assert_eq!(lead(true), off, "开启时首位 ? 与关闭时逐键相同");
-
-    let coord = Coordinator::new_headless(wubi(true, "?"), Some(&data_dir()));
-    press(&coord, "a");
-    press_vk(&coord, VK_SLASH, true);
-    assert_eq!(coord.debug_input_buffer(), "a?", "对照：组码中照常作通配");
+    assert_eq!(
+        lead(true),
+        (None, "?".to_string()),
+        "开启时首位 ? 作通配进缓冲"
+    );
 }
 
 /// 非首位通配键与次选键冲突 ⇒ 让位（`;` 照常选第 2 个候选）且体检报冲突。

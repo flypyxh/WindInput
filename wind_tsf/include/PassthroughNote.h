@@ -96,6 +96,13 @@ inline bool IsSelfInjectedVk(uint32_t vk)
     return vk == kVkPacket || vk == kVkAsyncCommitTrigger;
 }
 
+/// 这一 keydown 是否算「用户的键进了宿主」（排除项见文件头）。数字后智能标点的输入序列
+/// 记账（KeyEventSink::_NoteInputSequenceAtExit）用的也是这一判据，两者必须同口径。
+inline bool IsUserKeyIntoHost(uint32_t vk, bool eaten, bool suppressed)
+{
+    return !eaten && !suppressed && !IsSelfInjectedVk(vk) && !IsBareModifier(vk);
+}
+
 /// 记账状态：一个布尔 + 三条规则。放进类里是为了让规则可被单测钉住（见文件头的局限说明）。
 class PassthroughState
 {
@@ -107,9 +114,8 @@ public:
     /// ★ 抑制**优先于**记账：两个排除项（`suppressed` 与 `IsSelfInjectedVk`）任一成立即不记。
     void NoteKeyDown(uint32_t vk, bool eaten, bool suppressed)
     {
-        if (eaten || suppressed || IsSelfInjectedVk(vk) || IsBareModifier(vk))
-            return;
-        _pending = true;
+        if (IsUserKeyIntoHost(vk, eaten, suppressed))
+            _pending = true;
     }
 
     /// keydown 事件发往服务端时消费：返回该不该置 `TOGGLE_PASSTHROUGH_KEY`，并清零。

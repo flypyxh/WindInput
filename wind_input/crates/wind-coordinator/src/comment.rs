@@ -338,6 +338,8 @@ pub(crate) fn role_of(name: &str) -> &str {
     match name {
         "code" => "code_rev",
         "code_all" => "code_rev_all",
+        // 同一份注释库数据，只是聚合了全部库：主题按 `dict` 配的色对它同样生效。
+        "dict_all" => "dict",
         other => other,
     }
 }
@@ -846,6 +848,7 @@ pub(crate) const EVAL_VAR_NAMES: &[&str] = &[
     "chaizi_all",
     "chaizi_code_all",
     "dict",
+    "dict_all",
 ];
 
 /// [`Coordinator::eval_text_var`] 自己的分支（其余交给 [`reverse_text_var`]）。
@@ -857,7 +860,11 @@ pub(crate) const EVAL_TEXT_VAR_NAMES: &[&str] = &[
     "pinyin",
     "shuangpin",
     "dict",
+    "dict_all",
 ];
+
+/// `${dict_all}` 不写分隔符时的连接符。
+pub(crate) const DICT_ALL_SEP: &str = "；";
 
 /// [`reverse_text_var`]。
 pub(crate) const REVERSE_TEXT_VAR_NAMES: &[&str] = &[
@@ -1203,6 +1210,12 @@ impl crate::coordinator::Coordinator {
                     None => reverse.comment_of(text, None, &schema),
                 }
             }
+            "dict_all" => {
+                let schema = self.engine_mgr.active_schema_id();
+                reverse
+                    .comments_of(text, None, &schema)
+                    .join(arg.unwrap_or(DICT_ALL_SEP))
+            }
             _ => return reverse_text_var(name, arg, text, reverse),
         })
     }
@@ -1237,6 +1250,8 @@ impl crate::coordinator::Coordinator {
     ///   不限字数、默认空格连接、参数改分隔符规则相同（t207）。无编码的字同样跳过。
     /// - `dict` —— 用户挂载的注释词库（`[[ui.comment_dicts]]`）里该词的注释。键是**词**，
     ///   一份「英汉释义」「emoji 名称」可跨全部方案复用；候选 `code` 作可选消歧。
+    /// - `dict_all[:分隔符]` —— 全部适用注释库**各出一条**，按挂载顺序、去重，默认 `；` 连接
+    ///   （`dict` 只回第一个命中的库）。见 `ReverseLookup::comments_of`。
     ///
     /// `arg` = `${name:arg}` 的冒号后部分（未 trim）。只有声明支持参数的变量会读它，
     /// 其余变量收到参数时**静默忽略**而非报未知——参数写错不该让整个变量退化成错误回显。
@@ -1379,12 +1394,46 @@ impl crate::coordinator::Coordinator {
             // 归属与词频/短语同源——临英下要按 `english` 查，而不是主方案。
             // 这与注释**模板**取 active（呈现类）刻意不同，见 `comment_template_for`。
             // `${dict:id}` 只查那一个库（`${dict}` 只回第一个命中的库，多库并排要靠它）。
-            "dict" => match arg {
-                Some(id) => reverse.comment_of_id(id, &c.text, Some(&c.code), dict_schema),
-                None => reverse.comment_of(&c.text, Some(&c.code), dict_schema),
-            },
+            //
+            // ★ 按输入大小写投影过的英文候选（`case_source` 有值，见 `apply_english_case`）用
+            // **词库原文**查，且回退只往小写走（论坛 t281）：输入 `ASP` 时词库的 `asp`（毒蛇）
+            // 显示成 `ASP`，拿显示形态查会精确命中 IT 库的缩写 `ASP`；拿原文 `asp` 双向回退
+            // 同样会升格命中它。词库已确证这个词是小写的，升格就是换了个词。
+            "dict" => {
+                let (key, fb) = dict_query_key(c);
+                reverse.comment_of_with(arg, key, Some(&c.code), dict_schema, fb)
+            }
+            // `${dict_all[:分隔符]}` —— 全部适用库各出一条（论坛 t282），默认 `；` 连接、按内容
+            // 去重。`${dict}` 只回第一个命中的库，中英释义与 IT 术语库都收了同一个词时另一条
+            // 就看不见；`${dict:id}` 能并排但要逐库写死 id。不带来源库标签：标签该写在库内容里。
+            "dict_all" => {
+                let (key, fb) = dict_query_key(c);
+                reverse
+                    .comments_of_with(key, Some(&c.code), dict_schema, fb)
+                    .join(arg.unwrap_or(DICT_ALL_SEP))
+            }
             _ => return None,
         })
+    }
+}
+
+/// 候选查注释库用的词与大小写回退方向（论坛 t281，理由见 `eval_var` 的 `dict` 分支）。
+///
+/// | 候选 | 查的词 | 回退 |
+/// |---|---|---|
+/// | 未改写 | 显示文本 | 双向（输入 `abc` 要能查到缩写 `ABC`） |
+/// | 英文**词库**词被改写（投影 / 大小写档） | 词库原文 `case_source` | 只往小写 |
+/// | 头部候选（用户所打原文及其变形）被大小写档改写 | **显示文本** | 只往小写 |
+///
+/// 头部候选不是词库词，`case_source` 只是用户打出来的形态，不说明它是哪个词；用户按出了
+/// 哪种形态，就该按那种形态查——全大写档打 `asp` 得到的 `ASP` 要能查到缩写 `ASP`。但全小写档
+/// 打 `ASP` 得到的 `asp` 是用户显式要的小写，双向回退会把它升格回 `ASP`，故同样只往小写走。
+fn dict_query_key(c: &Candidate) -> (&str, wind_reverse::CaseFallback) {
+    use wind_reverse::CaseFallback::{Both, LowerOnly};
+    match &c.case_source {
+        None => (c.text.as_str(), Both),
+        Some(orig) if c.source == CandidateSource::English => (orig.as_str(), LowerOnly),
+        Some(_) => (c.text.as_str(), LowerOnly),
     }
 }
 
@@ -2282,6 +2331,208 @@ mod eval_var_tests {
     fn eval(co: &Coordinator, name: &str, c: &Candidate, hint: CodeHintSource) -> Option<String> {
         let rev = wind_reverse::ReverseLookup::default();
         co.eval_var(name, None, c, &rev, hint, "shuangpin")
+    }
+
+    // ───────────── `${dict_all}`（论坛 t282） ─────────────
+
+    /// 挂两个注释库：英汉释义 + IT 术语，都收了 `configure`。
+    fn two_comment_libs(tag: &str) -> (PathBuf, wind_reverse::ReverseLookup) {
+        let dir = std::env::temp_dir().join(format!("wind_dict_all_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = "name: t\ncolumns:\n  - text\n  - comment\n...\n";
+        let mut specs = Vec::new();
+        for (i, body) in ["configure\tv.配置\n", "configure\t[IT]配置…\n"]
+            .iter()
+            .enumerate()
+        {
+            let p = dir.join(format!("lib{i}.dict.yaml"));
+            std::fs::write(&p, format!("{head}{body}")).unwrap();
+            specs.push((p, Vec::new()));
+        }
+        let mut rl = wind_reverse::ReverseLookup::default();
+        rl.reload_comments(&specs, None);
+        (dir, rl)
+    }
+
+    fn word(text: &str) -> Candidate {
+        Candidate {
+            text: text.into(),
+            code: text.into(),
+            comment: "kh".into(),
+            source: CandidateSource::English,
+            ..Default::default()
+        }
+    }
+
+    fn comment(
+        co: &Coordinator,
+        rl: &wind_reverse::ReverseLookup,
+        tpl: &str,
+        c: &Candidate,
+    ) -> String {
+        comment_max(co, rl, tpl, c, 0)
+    }
+
+    fn comment_max(
+        co: &Coordinator,
+        rl: &wind_reverse::ReverseLookup,
+        tpl: &str,
+        c: &Candidate,
+        max: usize,
+    ) -> String {
+        co.comment_for(c, &Template::parse(tpl), max, rl, CodeHintSource::Off, "")
+            .as_str()
+            .to_string()
+    }
+
+    /// 默认分隔符 `；`，`${dict_all:/}` 自定义；`${dict}` 仍只回第一条。
+    #[test]
+    fn dict_all_joins_every_library_with_separator() {
+        let co = coord("pinyin");
+        let (dir, rl) = two_comment_libs("sep");
+        let c = word("configure");
+        assert_eq!(comment(&co, &rl, "${dict_all}", &c), "v.配置；[IT]配置…");
+        assert_eq!(comment(&co, &rl, "${dict_all:/}", &c), "v.配置/[IT]配置…");
+        assert_eq!(comment(&co, &rl, "${dict}", &c), "v.配置");
+        // 分隔符参数不 trim：两侧空格原样保留。分隔符里不能有 `|`（变量回退链）与 `}`（变量
+        // 结束），这里用模板写得出来的 ` · `。
+        assert_eq!(
+            comment(&co, &rl, "${dict_all: · }", &c),
+            "v.配置 · [IT]配置…"
+        );
+        // 裸文本入口（cmdbar `dict.rev`）同义，同样经模板解析。
+        assert_eq!(
+            render("${dict_all: · }", 0, |n, a| co.eval_text_var(
+                n,
+                a,
+                "configure",
+                &rl
+            )),
+            "v.配置 · [IT]配置…"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 查不到时是「已知变量、值为空」：所在可选段整段消失，而不是原样回显 `${dict_all}`。
+    #[test]
+    fn empty_dict_all_drops_its_optional_group() {
+        let co = coord("pinyin");
+        let (dir, rl) = two_comment_libs("empty");
+        let tpl = "${code_hint}{ [${dict_all}]}";
+        assert_eq!(comment(&co, &rl, tpl, &word("nosuch")), "kh");
+        assert_eq!(
+            comment(&co, &rl, tpl, &word("configure")),
+            "kh [v.配置；[IT]配置…]"
+        );
+        assert_eq!(
+            co.eval_text_var("dict_all", None, "nosuch", &rl).as_deref(),
+            Some("")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 论坛 t281：输入 `ASP` 时词库的 `asp`（毒蛇）被投影成 `ASP`，不得贴上 IT 库里缩写
+    /// `ASP` 的释义——`${dict}`、`${dict_all}` 都按词库原文 `asp` 查、回退不升格。
+    #[test]
+    fn case_projected_candidate_queries_dictionary_original() {
+        use crate::english_candidates::{CaseVariant, apply_english_case};
+        let co = coord("pinyin");
+        let dir = std::env::temp_dir().join(format!("wind_t281_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(
+                &p,
+                format!("name: t\ncolumns:\n  - text\n  - comment\n...\n{body}"),
+            )
+            .unwrap();
+            (p, Vec::new())
+        };
+        let it = lib("it.dict.yaml", "ASP\t[IT]动态服务器页面\n");
+        let en = lib("en.dict.yaml", "asp\tn.毒蛇\n");
+
+        let mut projected = [word("asp")];
+        assert!(apply_english_case(
+            &mut projected,
+            "ASP",
+            CaseVariant::Default
+        ));
+        let projected = &projected[0];
+        assert_eq!(projected.text, "ASP", "前提：asp 被投影成 ASP");
+
+        // 只有 IT 库：不显示缩写的释义。
+        let mut rl = wind_reverse::ReverseLookup::default();
+        rl.reload_comments(std::slice::from_ref(&it), None);
+        assert_eq!(comment(&co, &rl, "${dict}", projected), "");
+        assert_eq!(comment(&co, &rl, "{${dict_all}}", projected), "");
+        // 词库里本来就是大写的 `ASP`（未投影）照常显示 IT 释义。
+        assert_eq!(
+            comment(&co, &rl, "${dict}", &word("ASP")),
+            "[IT]动态服务器页面"
+        );
+
+        // 英汉库也收了小写 asp：显示毒蛇，聚合里同样没有 IT 那条。
+        rl.reload_comments(&[en, it], None);
+        assert_eq!(comment(&co, &rl, "${dict}", projected), "n.毒蛇");
+        assert_eq!(comment(&co, &rl, "${dict_all}", projected), "n.毒蛇");
+        assert_eq!(
+            comment(&co, &rl, "${dict_all}", &word("ASP")),
+            "[IT]动态服务器页面"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 头部候选（用户所打原文，非词库词）被大小写档改写时按**显示文本**查、只往小写回退
+    /// （论坛 t281 审查）：全大写档打 `asp` → `ASP` 查得到缩写；全小写档打 `ASP` → `asp`
+    /// 不得升格贴上缩写的释义。
+    #[test]
+    fn case_variant_head_candidate_queries_display_text() {
+        use crate::english_candidates::{CaseVariant, apply_english_case, english_head_candidates};
+        let co = coord("pinyin");
+        let dir = std::env::temp_dir().join(format!("wind_t281h_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("it.dict.yaml");
+        std::fs::write(
+            &p,
+            "name: t\ncolumns:\n  - text\n  - comment\n...\nASP\t[IT]动态服务器页面\n",
+        )
+        .unwrap();
+        let mut rl = wind_reverse::ReverseLookup::default();
+        rl.reload_comments(&[(p, Vec::new())], None);
+
+        let mut up = english_head_candidates("asp", true, false);
+        assert!(apply_english_case(&mut up, "asp", CaseVariant::Upper));
+        assert_eq!(
+            (up[0].text.as_str(), up[0].source),
+            ("ASP", CandidateSource::None)
+        );
+        assert_eq!(comment(&co, &rl, "${dict}", &up[0]), "[IT]动态服务器页面");
+        assert_eq!(
+            comment(&co, &rl, "${dict_all}", &up[0]),
+            "[IT]动态服务器页面"
+        );
+
+        let mut low = english_head_candidates("ASP", true, false);
+        assert!(apply_english_case(&mut low, "ASP", CaseVariant::Lower));
+        assert_eq!(low[0].text, "asp");
+        assert_eq!(comment(&co, &rl, "${dict}", &low[0]), "");
+        assert_eq!(comment(&co, &rl, "${dict_all}", &low[0]), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 注释段的字数上限照样截断聚合结果。
+    #[test]
+    fn dict_all_obeys_comment_max_chars() {
+        let co = coord("pinyin");
+        let (dir, rl) = two_comment_libs("max");
+        assert_eq!(
+            comment_max(&co, &rl, "${dict_all}", &word("configure"), 6),
+            "v.配置；[…"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★ 核心：双拼方案下 `${shuangpin}` 给出用户实际要敲的键。

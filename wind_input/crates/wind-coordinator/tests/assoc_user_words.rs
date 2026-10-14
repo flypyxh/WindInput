@@ -75,6 +75,16 @@ fn coord(
     at_full: bool,
     seed: impl FnOnce(&wind_store::Store),
 ) -> (Arc<Coordinator>, Arc<wind_store::Store>) {
+    coord_with(tag, kind, at_full, seed, |_| {})
+}
+
+fn coord_with(
+    tag: &str,
+    kind: &str,
+    at_full: bool,
+    seed: impl FnOnce(&wind_store::Store),
+    tweak: impl FnOnce(&mut Config),
+) -> (Arc<Coordinator>, Arc<wind_store::Store>) {
     let store_path = std::env::temp_dir().join(format!("wind_assoc_user_{tag}.redb"));
     let _ = std::fs::remove_file(&store_path);
     let store = Arc::new(wind_store::Store::open(&store_path).unwrap());
@@ -87,6 +97,10 @@ fn coord(
     cfg.input.association.kind = kind.to_string();
     cfg.input.association.mode = "continuous".to_string();
     cfg.schema.codetable.auto_commit_at_full = at_full;
+    // 联想档内按选词次数重排只在调频开着时生效（`assoc_prefix_words` 查 `enabled`）。
+    // `Config::default()` 不读 data/config.toml，码表调频默认关，故显式打开。
+    cfg.schema.codetable.frequency.enabled = true;
+    tweak(&mut cfg);
     let c = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store.clone());
     // 生产由启动后的预热线程建索引（系统反查索引 + 用户词文本索引），headless 不跑那个线程。
     c.prewarm_indexes();
@@ -245,6 +259,37 @@ fn freq_reranks_system_words_within_tier() {
         "实得 {got:?}"
     );
     assert!(got.iter().any(|t| t == "荷兰"), "荷兰仍在：{got:?}");
+}
+
+/// 反向对照：调频关、只记次数（`record_always`，论坛 t278）⇒ 次数**不得**改联想顺序。
+///
+/// 写端放开后库里就有了数据；联想打分若不查 `enabled`，用户「只想记、不想调」的
+/// 联想顺序会被悄悄改掉。
+#[test]
+fn record_always_freq_does_not_rerank_assoc() {
+    if !dict_ready() {
+        return;
+    }
+    let (c, _) = coord_with(
+        "f_record_only",
+        "word",
+        false,
+        |s| {
+            for _ in 0..10 {
+                s.record_freq("wubi86", "awaw", "荷花").unwrap();
+            }
+        },
+        |cfg| {
+            cfg.schema.codetable.frequency.enabled = false;
+            cfg.schema.codetable.frequency.record_always = true;
+        },
+    );
+    let got = assoc_after_he(&c);
+    assert_eq!(
+        got.first().map(String::as_str),
+        Some("荷兰"),
+        "只记次数时联想应保持系统序：{got:?}"
+    );
 }
 
 /// ★ 临时词门槛：count=1 只在系统词之后补位；count≥2 进个人档（用户词之后、系统词之前）。

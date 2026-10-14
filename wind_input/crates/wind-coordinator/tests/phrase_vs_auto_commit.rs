@@ -170,3 +170,45 @@ fn candidates_identical_whether_auto_commit_enabled() {
         "开与不开自动上屏，候选面必须一致（这正是本次修复的诉求）"
     );
 }
+
+/// 论坛 t308：双拼关简拼后，`ofa` 没有任何拼音候选，短语（这里是直通命令）成了唯一一条，
+/// 打完第三码就被「全码唯一自动上屏」当场执行——拼音系没有满码，这条开关本不该管它。
+///
+/// 开关读的是 `schema.codetable`，拼音方案继承全局那一份，故用户为码表开了它，双拼就中招。
+/// 用普通短语断言（命令短语走同一道闸，结局只是 AutoCommand 而非 InsertText）。
+#[test]
+fn shuangpin_phrase_is_not_auto_committed() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        eprintln!("跳过：缺少 build_dev/data 双拼方案");
+        return;
+    }
+    let store_path =
+        std::env::temp_dir().join(format!("wind_phrase_ac_t308_{}.redb", std::process::id()));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("ofa", "音形短语", 0, 1200).unwrap();
+
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["shuangpin".into()];
+    cfg.schema.active = "shuangpin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.pinyin.abbrev.enabled = false;
+    cfg.schema.codetable.auto_commit_at_full = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&d), store);
+
+    press_letter(&coord, 'o');
+    press_letter(&coord, 'f');
+    let action = press_letter(&coord, 'a');
+    let cands = coord.debug_all_candidate_texts();
+    let _ = std::fs::remove_file(&store_path);
+    assert!(
+        !matches!(action, KeyAction::InsertText { .. }),
+        "双拼下短语不得被自动上屏，实际 {action:?}"
+    );
+    assert_eq!(
+        cands,
+        vec!["音形短语"],
+        "前提：短语须是唯一候选（否则唯一闸就拦了，测不到本缺口）"
+    );
+}

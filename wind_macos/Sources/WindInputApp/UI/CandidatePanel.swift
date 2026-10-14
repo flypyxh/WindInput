@@ -75,6 +75,8 @@ final class CandidateContentView: NSView {
     private var dragMoved = false
     /// 阈值取 3pt：小于手指/鼠标在点击瞬间的自然抖动即可，不必更大。
     private static let dragThreshold: CGFloat = 3
+    /// 按下时命中的候选/翻页键。选词等到**松开**且仍落在同一项上才发, 见 `mouseUp`。
+    private var pressedIndex: Int?
     var unifiedMenuProvider: (() -> [MenuItemData]?)? // 空白处右键: 取统一菜单树
     var onUnifiedAction: ((Int) -> Void)?             // 统一菜单项点击 (menu item id)
     private let unifiedMenuBuilder = UnifiedMenuBuilder() // 与菜单栏共用的统一菜单构建器 (须持有: 作为叶子项 target)
@@ -130,7 +132,12 @@ final class CandidateContentView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        if let idx = hitIndex(event) { onSelect?(idx); return }
+        // 上一次点击的残留先清掉: 按下期间窗口被收起时, 那次的 mouseUp 不一定送得到。
+        pressedIndex = nil
+        dragAnchor = nil
+        dragOrigin = nil
+        dragMoved = false
+        if let idx = hitIndex(event) { pressedIndex = idx; return }
         // 空白区（编码栏/内边距，非候选非翻页键）→ 起拖，整窗跟随光标。与 Windows 侧
         // WM_LBUTTONDOWN 的同一分支同构（那边用 SetCapture 保证移出窗口后仍收到消息；
         // AppKit 在 mouseDown 之后会把整条拖动序列都发给本视图，无需额外捕获）。
@@ -154,8 +161,21 @@ final class CandidateContentView: NSView {
         onDragMoved?()
     }
 
+    /// 选词在松开时发, 不在按下时 (与 Squirrel 一致)。
+    ///
+    /// 按下就选的后果 (macOS 27 实测): 上屏 + 收起候选窗在松开前就做完了, 约 50~130ms 后
+    /// 窗口又被摆回屏幕 —— 本进程没有任何 order 调用, 只见 WindowServer 把它从 none 改回
+    /// visible, 成了停在原地、点了没反应的残影, 直到下一次收起才消失。键盘上屏没有这一下。
+    /// 是系统处理这次点击的哪一步把它摆回来的没有查明 (拦掉推迟到松开的窗口排序无效);
+    /// 改成整个点击结束再选之后, 收起后的窗口不再回来。
     override func mouseUp(with event: NSEvent) {
         defer { dragAnchor = nil; dragOrigin = nil; dragMoved = false }
+        if let idx = pressedIndex {
+            pressedIndex = nil
+            // 按下后移出该项再松开 = 放弃 (按钮的通行语义)。
+            if hitIndex(event) == idx { onSelect?(idx) }
+            return
+        }
         guard dragAnchor != nil, dragMoved else { return }
         onDragEnded?()
     }

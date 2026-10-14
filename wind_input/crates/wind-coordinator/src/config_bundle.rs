@@ -275,7 +275,7 @@ pub(crate) fn schema_custom_covered_punct_chars(
     out
 }
 
-/// 所有已安装方案的码元集里可作首码的非字母字符（并集）。见
+/// 所有已安装方案的码元集里可作首码的非字母字符（并集），含开着的符号通配键。见
 /// [`SchemaKeyUnion::leading_code_chars`]。
 ///
 /// 只收非字母：字母本就是默认码元，与标点集合不可能相交，白扫一遍。
@@ -286,7 +286,7 @@ pub(crate) fn schema_custom_covered_punct_chars(
 /// [`schema_custom_en_punct_chars`]：overlay 方案（快符等）不进 `available`，
 /// 而它们恰恰是最可能把符号配成码元的一类。
 ///
-/// ⛔ **必须走 `schema_code_char_set`（纯 TOML 读），不能用 `input_chars_of`**：后者会
+/// ⛔ **必须走 `schema_lead_inputs`（纯 TOML 读），不能用 `input_chars_of`**：后者会
 /// `ensure_loaded` → `build_engine`，把方案的码表 / 词库整个熔出来。而 `EngineManager`
 /// 的懒加载是明写的设计（只同步构建活跃方案，其余交给 `prewarm_schema` 后台预热），
 /// 本函数的三个调用点——`Coordinator::new`、`refresh_config_in_memory`、
@@ -297,9 +297,12 @@ pub(crate) fn schema_leading_code_chars(mgr: &EngineManager) -> std::collections
     let mut out = std::collections::BTreeSet::new();
     for id in mgr.installed_schemas() {
         // 读不到方案文件 ⇒ 该方案本就用不了，跳过不影响可达性。
-        let Some(cs) = mgr.schema_code_char_set(&id) else {
+        let Some((cs, wildcard)) = mgr.schema_lead_inputs(&id) else {
             continue;
         };
+        // 符号通配键同样可作首码（论坛 t302），不在 `input_chars` 里也得算上：映射成原样
+        // ASCII 的反引号会进透传集，首位按下 DLL 直接放给宿主，通配根本收不到。
+        out.extend(wildcard);
         if cs.is_default_alpha() {
             continue; // 默认集只有字母，不可能与标点相撞
         }

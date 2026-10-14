@@ -68,7 +68,10 @@ int main()
         signal(SIGUSR2, SIG_IGN);
         std::string out = dir + "/env";
         std::string sh = writeScript(dir, "{ ls /proc/$$/fd | tr '\\n' ' '; echo; "
-                                          "grep -E '^(SigBlk|SigIgn)' /proc/$$/status; "
+                                          // 用内建 read 读：bash（Arch 等的 /bin/sh）fork 外部命令期间
+                                          // 会临时屏蔽 SIGCHLD，grep 读到的 SigBlk 恒带 0x10000（GH#192）。
+                                          "while read -r l; do case $l in SigBlk*|SigIgn*) echo \"$l\";; esac; "
+                                          "done < /proc/$$/status; "
                                           "cut -d' ' -f6 /proc/$$/stat; pwd; } > " + out + ".tmp; mv "
                                           + out + ".tmp " + out);
         CHECK(spawnDetached(std::vector<std::string>{sh}, "/tmp"));

@@ -246,6 +246,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.input_chars", Str),
     f("schema.codetable.leading_chars", Str),
     f("schema.codetable.frequency.enabled", Bool),
+    f("schema.codetable.frequency.record_always", Bool),
     f("schema.codetable.frequency.protect_top_n", Int),
     f("schema.codetable.frequency.protect_top_n_len1", Int),
     f("schema.codetable.frequency.protect_top_n_len2", Int),
@@ -261,6 +262,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.frequency.half_life", Float),
     // ── 英文（[schema.english]）：不再共用码表段 ──
     f("schema.english.frequency.enabled", Bool),
+    f("schema.english.frequency.record_always", Bool),
     f(
         "schema.english.frequency.strategy",
         Enum(FREQ_STRATEGY_VALUES),
@@ -328,6 +330,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.fuzzy.un_ong", Bool),
     f("schema.pinyin.fuzzy.eng_ong", Bool),
     f("schema.pinyin.frequency.enabled", Bool),
+    f("schema.pinyin.frequency.record_always", Bool),
     f("schema.pinyin.frequency.half_life", Float),
     f("schema.pinyin.frequency.base_scale", Float),
     f("schema.pinyin.frequency.recency_peak", Float),
@@ -955,6 +958,10 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         ),
         // ── [engine.codetable.frequency] ──
         ("schema.codetable.frequency.enabled", freq.enabled.is_some()),
+        (
+            "schema.codetable.frequency.record_always",
+            freq.record_always.is_some(),
+        ),
         (
             "schema.codetable.frequency.strategy",
             freq.strategy.is_some(),

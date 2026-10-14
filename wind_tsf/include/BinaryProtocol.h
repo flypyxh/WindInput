@@ -284,7 +284,8 @@ struct KeyPayload
     uint8_t  eventType;   // 0=KeyDown, 1=KeyUp
     uint8_t  toggles;     // Toggle key states (CapsLock/NumLock/ScrollLock)
     uint16_t eventSeq;    // Monotonic event sequence number
-    uint16_t prevChar;    // Character before caret (from ITfTextEditSink cache, 0 if unavailable)
+    uint16_t prevChar;    // Character before caret, 0 if unavailable. ASCII digits come only from
+                          // the IME's own input sequence, never from the document (SmartPunctPrevChar.h)
 };
 static_assert(sizeof(KeyPayload) == 18, "KeyPayload must be 18 bytes");
 

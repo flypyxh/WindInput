@@ -210,6 +210,20 @@ comment_template_horizontal = ""            # 本方案横排不显示注释
   `webdata` 的 `schema.setActive`、`reload_user_config` 的 `schema_dirty` 分支内那次）
   随之删除并改注释：挂载只跟**配置**走。保留构造期与配置热重载两处。
 
+### 注释库变量（论坛 t282 起）
+
+| 变量 | 查询 | 结果 |
+|---|---|---|
+| `${dict}` | `comment_of`：先跨全部适用库找 code 精确命中，再按挂载顺序取首条，最后大小写回退 | **一条** |
+| `${dict:id}` | `comment_of_id`：同上，只在该 id 的库里查 | 一条 |
+| `${dict_all[:分隔符]}` | `comments_of`：每个适用库最多一条（先同码、无则该库首条），按挂载顺序、按字符串去重、空串跳过；**全部库都没有精确命中**时才按大小写变形各库再取一条 | 默认 `；` 连接，不带来源库标签 |
+
+- 三者共用 `ReverseLookup::applicable_comments` 这一个白名单判据（含大小写回退那遍），不写第二份。
+- 不变量：`comment_of` 的结果 ∈ `comments_of` 的结果（测试 `comment_of_is_always_among_comments_of`）。
+- 角色归一 `dict_all` → `dict`（`role_of`），主题按 `dict` 配的色对它同样生效，`TEXT_ROLES` 不增项。
+- 出厂悬停气泡新增「释义」段 `${dict_all:\n}`（分隔符是真换行，每库一行），L1
+  `default_tooltip_sections()` 与 L2 `data/config.toml` 同源；没挂注释库时整段为空、不显示。
+
 ## 6 测试判据
 
 | 判据 | 为什么必须是这一条 |

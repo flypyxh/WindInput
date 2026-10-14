@@ -110,6 +110,9 @@ impl PromotePrefix {
 pub struct FreqSettings {
     /// 词频维度主开关（全局 schema.{codetable,pinyin}.frequency.enabled）；关则完全不重排。
     pub enabled: bool,
+    /// 调频关闭时仍记录（`schema.*.frequency.record_always`）。**只放开写端**，读端一律
+    /// 只认 [`Self::enabled`]；写端判据走 [`Self::records`]，不要直接读本字段。
+    pub record_always: bool,
     /// used-first 内的排序策略（全局 schema.codetable.frequency.strategy；仅码表用）。
     pub strategy: FreqStrategy,
     /// 呈现层前 N 位保护（全局 `schema.codetable.frequency.protect_top_n*`；仅码表/混输用）。
@@ -135,6 +138,7 @@ impl Default for FreqSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            record_always: false,
             strategy: FreqStrategy::Step,
             protect: ProtectPolicy::NONE,
             promote_prefix: PromotePrefix::Single,
@@ -146,6 +150,14 @@ impl Default for FreqSettings {
 }
 
 impl FreqSettings {
+    /// 选中时要不要记账：调频开着，或用户要求「只记次数、不调序」（论坛 t278）。
+    ///
+    /// 写端（`record_selection_in`）用它，读端（重排 / 英文热词召回 / 联想打分）用
+    /// [`Self::enabled`]——两端的开关**刻意不同**，这正是 `record_always` 的全部语义。
+    pub fn records(&self) -> bool {
+        self.enabled || self.record_always
+    }
+
     /// 这条候选文本要不要**整个绕开词频**（既不记录、也不重排）。
     ///
     /// # ★ 这个方法存在的唯一理由是「两端同源」
@@ -1614,7 +1626,16 @@ impl EngineManager {
             }
         }
 
-        let scores = self.assoc_freq_scores(&data_schema, &items);
+        // 选词次数只在调频开着时参与排序：`record_always`（只记不调）攒下的次数不得在这里
+        // 悄悄改联想顺序。此前不查开关也没出事，只因关调频时写端不记、库里没数据。
+        //
+        // ⚠️ 开关按**活跃方案**取，不按 `schema_id`：混输下后者是主码表（`assoc_word_schema`），
+        // 而写端与主候选重排读的是混输自己的折叠值（方案级覆盖可以与主码表不同）。
+        let scores = if self.freq_settings_for(&self.active_schema_id()).enabled {
+            self.assoc_freq_scores(&data_schema, &items)
+        } else {
+            vec![0.0; items.len()]
+        };
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_by(|&a, &b| {
             items[a]
@@ -4770,6 +4791,46 @@ impl EngineManager {
         ))
     }
 
+    /// [`Self::schema_code_char_set`] 加上该方案开着的**符号**通配键，**一次**读方案文件。
+    ///
+    /// 供协调器算「空闲时可作首码的符号」：符号通配键也能作首码（论坛 t302），须同码元首码
+    /// 一样从 DLL 透传标点集里扣掉。同为纯配置读、不建引擎，理由见 `schema_code_char_set`。
+    ///
+    /// 通配键只算**纯码表**方案：混输首位恒字面（扣了也收不到），拼音 / 英文方案虽会经折叠
+    /// 继承全局 `wildcard` 开关，但根本不消费它——算进来只会让别的方案下这个符号被白吃。
+    /// 非法键不在此告警（建引擎时 `wildcard_char` 已告警过一次）。
+    pub fn schema_lead_inputs(
+        &self,
+        schema_id: &str,
+    ) -> Option<(wind_config::CodeCharSet, Option<char>)> {
+        let schema = Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )?;
+        let ct = &schema.engine.codetable;
+        let charset = wind_config::CodeCharSet::new(
+            &ct.input_chars,
+            &ct.leading_chars,
+            &format!("schema {schema_id}"),
+        );
+        let wildcard = if schema.engine.engine_type.eq_ignore_ascii_case("codetable") {
+            let global = self
+                .codetable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let eff = Self::codetable_baseline(Some(&schema), &global).resolved(Some(ct));
+            eff.wildcard
+                .then(|| wind_config::config::parse_wildcard_key(&eff.wildcard_key))
+                .flatten()
+                .filter(|c| !c.is_ascii_alphabetic())
+        } else {
+            None
+        };
+        Some((charset, wildcard))
+    }
+
     /// **所有已安装**方案（含 overlay）的 `[key_actions]` 里出现过的键名（并集）。
     ///
     /// 与 [`Self::all_key_action_keys`] 只差枚举源，但那一差是**语义性**的：
@@ -5455,6 +5516,7 @@ impl EngineManager {
                 let en = self.english.lock().unwrap_or_else(|e| e.into_inner());
                 FreqSettings {
                     enabled: en.frequency.enabled,
+                    record_always: en.frequency.record_always,
                     strategy: Self::parse_freq_strategy(&en.frequency.strategy),
                     // 英文没有「简码位」：一个 a 后面跟的是几万个词而不是钦定首选，
                     // 套用码表那套按码长分级的首选保护只会锁死前几位不让调频。
@@ -5469,6 +5531,7 @@ impl EngineManager {
                 // 拼音 strategy/protect 字段不参与（仅码表 used-first 排序用），取默认。
                 FreqSettings {
                     enabled: pf.frequency.enabled,
+                    record_always: pf.frequency.record_always,
                     strategy: FreqStrategy::Step,
                     protect: ProtectPolicy::NONE,
                     promote_prefix: PromotePrefix::parse(&pf.frequency.promote_prefix),
@@ -5499,6 +5562,7 @@ impl EngineManager {
                     english_code_by_input,
                     charsets: Arc::clone(&charsets),
                     enabled: ct.frequency.enabled,
+                    record_always: ct.frequency.record_always,
                     strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
                     protect: ProtectPolicy {
                         by_len: [
@@ -7127,9 +7191,9 @@ impl EngineManager {
         }
     }
 
-    /// 码表 / 拼音方案（`[engine] type = "codetable" | "pinyin"`）没写 `dictionary_dirs` 键时，补一个
-    /// 兜底发现目录 `<主词库所在目录>/ext`，类型同主词库。出厂与第三方方案不改文件就能放扩展词库。
-    /// 英文、混输等不兜底：混输没有自己的词库，英文没有这个需求。
+    /// 码表 / 拼音 / 英文方案（`[engine] type = "codetable" | "pinyin" | "english"`）没写
+    /// `dictionary_dirs` 键时，补一个兜底发现目录 `<主词库所在目录>/ext`，类型同主词库。出厂与
+    /// 第三方方案不改文件就能放扩展词库（英文专业术语库，论坛 t306）。混输不兜底：它没有自己的词库。
     ///
     /// 补进方案本身而不是只在扫描时用：`schema.getConfig` 也就带上它，设置端的「打开扩展词库
     /// 目录」按钮不用另外推算。写了 `dictionary_dirs = []` 即显式关掉兜底。主词库在 `schemas/`
@@ -7143,7 +7207,9 @@ impl EngineManager {
             .and_then(|e| e.get("type"))
             .and_then(|t| t.as_str())
             .is_some_and(|t| {
-                t.eq_ignore_ascii_case("codetable") || t.eq_ignore_ascii_case("pinyin")
+                ["codetable", "pinyin", "english"]
+                    .iter()
+                    .any(|k| t.eq_ignore_ascii_case(k))
             });
         if !has_dict_dir {
             return;
@@ -9381,7 +9447,29 @@ mod tests {
         assert_eq!(schema.dictionary_dirs[0].dict_type, "rime_pinyin");
     }
 
-    /// 不兜底的三种：显式写了 `dictionary_dirs = []`；英文等其它方案；主词库在 schemas/ 根下。
+    /// 英文方案同样兜底（t306）：出厂主库在 `english/en.dict.yaml`，类型取 english，扫到的库排在
+    /// 内置 en_ext 之后、出厂关。
+    #[test]
+    fn english_without_dirs_falls_back_to_main_dict_ext() {
+        let src = "[engine]\ntype = \"english\"\n\
+            [[dictionaries]]\nid = \"en_main\"\npath = \"english/en.dict.yaml\"\n\
+            type = \"english\"\ndefault = true\nbase_order = 0\n\
+            [[dictionaries]]\nid = \"en_ext\"\npath = \"english/en_ext.dict.yaml\"\n\
+            type = \"english\"\ndefault_enabled = true\nbase_order = 1\n";
+        let base = inject_with(src, &["english/ext/en_it.dict.yaml"], &[]);
+        assert_eq!(
+            dict_ids(&base),
+            ["en_main", "en_ext", "dir:english/ext/en_it"]
+        );
+        let schema: Schema = base.try_into().unwrap();
+        assert_eq!(schema.dictionary_dirs[0].path, "english/ext");
+        assert_eq!(schema.dictionary_dirs[0].dict_type, "english");
+        assert_eq!(schema.dictionaries[2].dict_type, "english");
+        assert_eq!(schema.dictionaries[2].base_order, 2);
+        assert!(!schema.dictionaries[2].is_enabled());
+    }
+
+    /// 不兜底的三种：显式写了 `dictionary_dirs = []`；混输等没有词库类型的方案；主词库在 schemas/ 根下。
     #[test]
     fn default_dict_dir_only_when_undeclared_and_main_has_a_dir() {
         let files = ["wubi86/ext/a.dict.yaml", "ext/a.dict.yaml"];
@@ -9391,8 +9479,8 @@ mod tests {
             ["extra", "main"]
         );
 
-        let english = CODETABLE_NO_DIR.replace("\"codetable\"", "\"english\"");
-        let base = inject_with(&english, &files, &[]);
+        let mixed = CODETABLE_NO_DIR.replace("\"codetable\"", "\"mixed\"");
+        let base = inject_with(&mixed, &files, &[]);
         assert_eq!(dict_ids(&base), ["extra", "main"]);
         assert!(base.get("dictionary_dirs").is_none());
 
@@ -9851,6 +9939,40 @@ input_chars = \"a-z;\"
         // 读不到的方案返回 None，而不是默认 a-z——拿默认值去提示等于凭空报冲突。
         assert!(mgr.schema_code_char_set("no_such_schema").is_none());
 
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 符号通配键只算纯码表方案（论坛 t302）：拼音方案经折叠也继承全局 `wildcard`，但不消费它，
+    /// 算进去会让「空闲透传标点」在拼音下也白吃这个符号。字母键不算（字母本不在透传集）。
+    #[test]
+    fn schema_lead_inputs_counts_symbol_wildcard_only_for_codetable() {
+        let base_dir =
+            std::env::temp_dir().join(format!("wind_eng_lead_in_{}", std::process::id()));
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        for (id, ty) in [("lct", "codetable"), ("lpy", "pinyin")] {
+            std::fs::write(
+                schemas.join(format!("{id}.schema.toml")),
+                format!("[schema]\nid = \"{id}\"\n[engine]\ntype = \"{ty}\"\n"),
+            )
+            .unwrap();
+        }
+        let mk = |key: &str| {
+            let mut cfg = Config::default();
+            cfg.schema.active = "lct".to_string();
+            cfg.schema.available = vec!["lct".to_string()];
+            cfg.schema.codetable.wildcard = true;
+            cfg.schema.codetable.wildcard_key = key.to_string();
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, None)
+        };
+        let m = mk("/");
+        assert_eq!(m.schema_lead_inputs("lct").unwrap().1, Some('/'));
+        assert_eq!(m.schema_lead_inputs("lpy").unwrap().1, None, "拼音方案不算");
+        assert_eq!(
+            mk("z").schema_lead_inputs("lct").unwrap().1,
+            None,
+            "字母键不算"
+        );
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 

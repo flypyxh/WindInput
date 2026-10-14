@@ -235,6 +235,7 @@ pub struct StatusTip {
     fg: [u8; 4],
     /// 主题位图背景（如 jidian status 的九宫格 panel）+ z 层水印。
     bg_image: Option<ViewImage>,
+    bg_gradient: Option<crate::view::ViewGradient>,
     layers: Vec<ViewLayer>,
     /// 主题配置的软投影 / 边框 / 圆角（与候选窗一致化）。
     shadow: Option<crate::view::SoftShadow>,
@@ -281,6 +282,7 @@ impl StatusTip {
             bg: [40, 40, 40, 235],
             fg: [245, 245, 245, 255],
             bg_image: None,
+            bg_gradient: None,
             layers: Vec::new(),
             shadow: None,
             border: None,
@@ -348,6 +350,7 @@ impl StatusTip {
         if let Some(node) = &theme.views.status {
             let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
+            self.bg_gradient = crate::theme_assets::rv_gradient(node.bg_gradient.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             self.shadow = crate::view::SoftShadow::build(
                 node.shadow_offset_x,
@@ -371,6 +374,7 @@ impl StatusTip {
             self.radius = node.border_radius.map(|d| d.resolve(s, 0.0));
         } else {
             self.bg_image = None;
+            self.bg_gradient = None;
             self.layers = Vec::new();
             self.shadow = None;
             self.border = None;
@@ -395,6 +399,9 @@ impl StatusTip {
         tip.corner_radius = self
             .radius
             .unwrap_or((self.renderer.measure_text("国").height + 10.0 * s) * 0.3);
+        if let Some(g) = &self.bg_gradient {
+            tip = tip.bg_gradient(g.clone());
+        }
         if let Some(img) = &self.bg_image {
             tip = tip.bg_image(img.clone());
         }
@@ -1196,6 +1203,44 @@ mod anchor_tests {
         assert_eq!(
             place_anchor(A::ScreenBottomRight, LEFT_WORK, None, TIP, M),
             (-16 - 120, 1040 - 16 - 34)
+        );
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::StatusTip;
+    use crate::theme_assets::gradient_fixture as fx;
+
+    /// status 节点的 `background.gradient` 叠在底色上（口径同候选窗节点）。
+    /// 取样点在左内边距、垂直居中：文字居中画不到这里。上内边距只有几像素，macOS 的字形
+    /// 墨迹会伸进去（CI 上取到过 `[253, 32, 32]`），不能用。
+    #[test]
+    fn status_bubble_paints_bg_gradient() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tip = StatusTip::new(tx).expect("非 Windows 下是内存桩");
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.status = Some(fx::node());
+        tip.set_theme(&theme);
+        let (buf, w, _, _, ch, ml, mt, _) = tip.render_bubble_to_bgra("中");
+        assert_eq!(
+            fx::rgb(&buf, w, ml + 3, mt + ch / 2),
+            fx::RED,
+            "status 渐变没画"
+        );
+
+        // 换到同节点、但没配渐变的主题：渐变必须清掉，露出底色。
+        let mut plain = wind_theme::Resolved::default();
+        plain.views.status = Some(wind_theme::RvNode {
+            bg_gradient: None,
+            ..fx::node()
+        });
+        tip.set_theme(&plain);
+        let (buf, w, _, _, ch, ml, mt, _) = tip.render_bubble_to_bgra("中");
+        assert_eq!(
+            fx::rgb(&buf, w, ml + 3, mt + ch / 2),
+            fx::BLUE,
+            "旧主题的渐变残留"
         );
     }
 }

@@ -63,7 +63,7 @@ type = "rime_codetable"
 **兜底目录（2026-10-10，S7 码表、S8 拼音）**：`[engine] type` 为 `codetable` / `pinyin` 的方案没写
 `dictionary_dirs` 键时，自动补一个 `<主词库所在目录>/ext`，类型同主词库（主词库取 `default = true`
 那张，没有就取第一张）。出厂全拼、双拼、五笔、笔画和第三方方案不改文件就能用，目录名全部统一。
-英文、混输不兜底（混输没有自己的词库）。
+英文方案（2026-10-12，论坛 t306）同样兜底，目录为 `english/ext`，类型 english；混输不兜底（它没有自己的词库）。
 
 - 补进方案本身（不只在扫描时用），`schema.getConfig` 随之带上，设置端「打开扩展词库目录」不用另算。
 - 写 `dictionary_dirs = []` 显式关掉兜底；主词库在 `schemas/` 根下时不兜底（否则会扫各方案共用的 `schemas/ext`）。

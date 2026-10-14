@@ -61,6 +61,12 @@ public class InputController: IMKInputController {
     // 候选框右键菜单闪断期里被延后的 Deactivate (见 CandidateMenuTracking / deactivateServer)。
     // 进程内至多一份: 闪断只发生在菜单所属的那个 client 上。仅主线程访问。
     private static weak var blipDeferred: InputController?
+    /// 最近一次被 activateServer 的控制器。跨宿主切换时系统**先激活新 client、后失活旧
+    /// client**, 而 FocusLost 帧不带宿主标识, 服务端只能当"当前焦点失去"处理。旧控制器
+    /// 晚到的失活若照发, 就会把新宿主刚上报的状态清掉 —— 实测 macOS 27 安装器弹授权框:
+    /// SecurityAgent 激活 (报了密码位) 200ms 后才来安装器窗口的失活, 密码位被清, 授权框
+    /// 里的按键照常组字 (首字符进缓冲、候选窗出现在对话框后面)。失活时据此判断是否已被取代。
+    private static weak var lastActivated: InputController?
     private var blipSender: Any?     // 延后清 marked text 时要用的 client, 须强持
     private var blipBundleID = ""    // 停用时的宿主, 用来认闪回 (见 activateServer)
     private var blipGeneration = 0   // 兜底定时器据此判断自己是否已过期
@@ -117,6 +123,7 @@ public class InputController: IMKInputController {
                 // 右键菜单造成的闪回: 服务端从没收到 FocusLost, 这次 Activate 也就不必再报,
                 // 组合与候选原样保留。
                 pending.blipSender = nil
+                Self.lastActivated = self
                 if pending !== self { router.adoptState(from: pending.router) }
                 currentClient = sender as? (IMKTextInput & NSObjectProtocol)
                 CandidatePanelHost.shared.activeResponder = self
@@ -133,6 +140,11 @@ public class InputController: IMKInputController {
         router.digitTracker.reset()
         // 激活即确保连上 (装完首次激活 / 重启后并发竞态时 init 那次可能没连上)。
         ensureConnected()
+        // 旧控制器还没失活 (跨宿主切换系统先激活新 client): 它欠的 FocusLost 在这里先补上,
+        // 保住「Lost 先于 Gained」—— 服务端只在失焦时清输入缓冲/候选/菜单态, 不补的话组字中
+        // 切应用, 旧宿主里的编码会带进新宿主。它晚到的那次失活随后按过期丢弃, 见 performDeactivation。
+        if let prev = Self.lastActivated, prev !== self { sendEmpty(UpstreamCmd.focusLost) }
+        Self.lastActivated = self
         sendFocusGained()
         sendFrontContext()
     }
@@ -164,6 +176,10 @@ public class InputController: IMKInputController {
             let adapter = imkClient.map { IMKClientAdapter(imkClient: $0, controller: self) }
             router.applyClearComposition(client: adapter)
         }
+        // 已有别的控制器在本控制器之后激活: 它激活时已替本控制器补过 FocusLost, 服务端此刻的
+        // 焦点属于它, 这条失活已过期, 不报。
+        if let newer = Self.lastActivated, newer !== self { return }
+        Self.lastActivated = nil
         sendEmpty(UpstreamCmd.focusLost)
     }
 

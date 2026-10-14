@@ -139,6 +139,8 @@ fn coord(tag: &str, seed: impl FnOnce(&wind_store::Store)) -> Arc<Coordinator> {
     cfg.input.default.chinese_mode = true;
     cfg.input.symbol.smart_mode = false;
     cfg.input.association.kind = "word".into();
+    // 联想按选词次数重排只在调频开着时生效；`Config::default()` 码表调频默认关。
+    cfg.schema.codetable.frequency.enabled = true;
     let c = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
     c.prewarm_indexes();
     c

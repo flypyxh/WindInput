@@ -304,6 +304,16 @@ void TestDigitTracker()
     CHECK_EQ(r.digitTracker().prevChar(), uint16_t(0));
     r.apply(commit("7"), nullptr); // 没写进文档就不记账
     CHECK_EQ(r.digitTracker().prevChar(), uint16_t(0));
+
+    CASE("数字后只认记账：宿主光标前的旧数字不算，非数字照报");
+    DigitTracker t;
+    CHECK_EQ(t.resolve(uint16_t('3')), uint16_t(0));          // 光标停在旧数字后
+    CHECK_EQ(t.resolve(uint16_t(0x3002)), uint16_t(0x3002)); // 「。」照报给 press2 守卫
+    CHECK_EQ(t.resolve(0), uint16_t(0));
+    t.noteKeyPassthrough(0x35, 0);
+    CHECK_EQ(t.resolve(0), uint16_t('5'));                   // 读不到宿主
+    CHECK_EQ(t.resolve(uint16_t('5')), uint16_t('5'));       // 宿主读到的正是它
+    CHECK_EQ(t.resolve(uint16_t(0x5BF9)), uint16_t('5'));    // surrounding 异步滞后的旧字「对」
 }
 
 void TestUtf()

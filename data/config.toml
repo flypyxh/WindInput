@@ -86,14 +86,14 @@ z_key_action = ""
 
 # 通配输入（万能键）：组码时通配键代替恰好一个码元，候选显示完整编码；通配结果不自动上屏、不顶字、不清空。
 # 这是**方案级**配置，按码表在自己的 [engine.codetable] 里开；此处是全局基线，出厂关闭。
-# 首位：符号通配键一律让位（照常出标点）；字母通配键若已绑定任何功能/模式（z_key_action、z_key_repeat、
+# 首位：符号通配键也作通配（全局引导键让位，方案级 key_actions 显式绑定优先）；字母通配键若已绑定任何功能/模式（z_key_action、z_key_repeat、
 # 临拼/快捷输入等引导键、活码前缀）则让位给它。
 # 非首位：通配键若是选词/翻页/分隔/辅助码键则让位给原功能（启动时告警）；已满码时按字面（照常顶字）。
 # 五笔拼音混输方案不参与通配。
 wildcard = false
 # 通配键：单个字面字符（与 input_chars 同一词表），字母或 ASCII 符号，如 "z"、"?"、"`"；数字与空格不可用，非法则视为关闭。
 # 注意：选真实码元字符时，该字符会被通配吞掉，仅建议用于该键闲置的方案（如五笔的 z）；
-# 符号键组码中作通配，即不再顶字出该标点——要打该标点请先上屏。
+# 符号键在首位与组码中都作通配（满码后、混输首位、与选词/翻页等冲突时除外），即不再出该标点——该标点本身请用快捷输入或短语打出。
 wildcard_key = "z"
 # 通配仅单字：通配结果只留单字（行内通配与反查模式都生效），词组不出。方案级，这里是全局基线。
 wildcard_single_only = false
@@ -134,6 +134,9 @@ block_commit = true
 
 [schema.codetable.frequency]
 enabled = false
+# 调频关闭时仍记录选词次数（只记不调序，供设置页「词频」查看 / 导出）。
+# 日后再开 enabled，攒下的次数会立刻参与排序。enabled = true 时本项无意义。
+record_always = false
 # 兜底档：码长 ≥ 4 的深码位。0 = 不保护——那里正是调频该起作用的地方。
 protect_top_n = 0
 # 一简位（码长 1）：保护词库钦定首选。
@@ -355,6 +358,8 @@ eng_ong = false
 # 拼音调频（衰减参数；三个数值 0 = 用词频 store 的内置默认）。
 [schema.pinyin.frequency]
 enabled = true
+# 调频关闭时仍记录选词次数；语义同 [schema.codetable.frequency]。
+record_always = false
 # 半衰期（小时）：词频热度衰减到一半所需时间。
 half_life = 0.0
 # base 系数与最近使用峰值：**当前模型不使用**，改动无效果。
@@ -499,6 +504,8 @@ temp_max_entries = 5000
 # 而英文没有简码位——一个 a 后面跟的是几万个词而不是钦定首选，照搬只会锁死前几位。
 [schema.english.frequency]
 enabled = false
+# 调频关闭时仍记录选词次数；语义同 [schema.codetable.frequency]。
+record_always = false
 # top（一次到顶 MRU）/ step（逐次提升）/ position（位次渐进）。
 # **默认与码表不同**：英文候选几乎全是前缀匹配，top/step 那种「用过一次即整体跳到没用过
 # 的那批之前」过于激进，误选一次就把词顶到很显眼的位置且不衰减。position 每次只前移
@@ -1372,6 +1379,8 @@ comment_enabled = true
 #   dict               挂载的注释词库里该词的注释（见下方 [[ui.comment_dicts]]）
 #   dict:<id>          只查 id 为 <id> 的那个注释库（${dict} 只取第一个命中的库；多库并排如
 #                      "${dict:en}{ ${dict:chaifen}}"）
+#   dict_all[:分隔符]  全部适用注释库各取一条，按库顺序、相同内容只留一条，默认「；」连接；
+#                      如 ${dict_all:/}（可能很长，慎用于横排）。分隔符里不能有 | 和 }
 #
 # 出厂值 ${code_hint|code_rev|shuangpin} 的回退链含义：优先显示引擎产的编码提示，
 # 没有就显示主码表反查编码，再没有（例如没配主码表的用户）就显示双拼编码。
@@ -1515,7 +1524,7 @@ wrap_width = 40
 # ${word_code} 该词在编码来源方案里的全部编码（a/ab/abc）；${code_source} 编码来源
 # 方案名（直接用该方案输入时为空）；${readings} / ${readings:N} 当前字的全部读音 / 前 N 个；
 # ${unicode} 当前字码位；${unicode_all} / ${unicode_all:分隔符} 逐字码位；${debug} 调试信息。
-# 注释模板的变量（${pinyin}、${chaizi}、${chaizi_code}、${dict}……）同样可用。
+# 注释模板的变量（${pinyin}、${chaizi}、${chaizi_code}、${dict}、${dict_all}……）同样可用。
 [[ui.tooltip.sections]]
 enabled = true
 label = "完整原文"
@@ -1545,6 +1554,14 @@ enabled = false
 label = "拆字"
 template = "${char}：${chaizi}{ [${chaizi_code}]}"
 each = "han"
+promote = ""
+inline = false
+
+[[ui.tooltip.sections]]
+enabled = true
+label = "释义"
+template = "${dict_all:\n}"   # 全部注释库各一条、每条一行；没挂注释库或查不到时整段不出现
+each = ""
 promote = ""
 inline = false
 

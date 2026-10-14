@@ -1557,6 +1557,10 @@ pub struct Coordinator {
     /// 宿主报的光标坐标可直接当权威用（Linux addon：来自应用自己上报的光标矩形，没有 Windows
     /// 那种跨窗口 Win32 光标冒充插入点的问题，但来源字段恒为 UNKNOWN）。见 `host.display`。
     host_caret_trusted: std::sync::atomic::AtomicBool,
+    /// 焦点宿主**显示不了**应用内预编辑（Linux addon：客户端没声明 Fcitx5 的 Preedit 能力位，
+    /// 如 WPS、QQ 一类走 XIM 的应用）。置位时编码改由我们自己的候选窗画，见
+    /// [`Coordinator::preedit_in_app_effective`]。见 `host.display` 的 `inline_preedit`。
+    host_no_inline_preedit: std::sync::atomic::AtomicBool,
     /// 启动时预热全部已装方案（桌面默认开；移动端关，见构造里的说明）
     pub(crate) eager_prewarm: std::sync::atomic::AtomicBool,
     /// 0=Idle 1=Preparing 2=Ready 3=Failed（见 [`Coordinator::readiness`]）
@@ -2407,6 +2411,12 @@ impl Coordinator {
             .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 声明焦点宿主能否显示应用内预编辑（见字段 `host_no_inline_preedit`）。
+    pub fn set_host_inline_preedit(&self, supported: bool) {
+        self.host_no_inline_preedit
+            .store(!supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn build(
         config: Config,
         data_dir: Option<&Path>,
@@ -2846,6 +2856,7 @@ impl Coordinator {
             last_valid_caret: Mutex::new((0, 0, 0)),
             caret_independent: std::sync::atomic::AtomicBool::new(false),
             host_caret_trusted: std::sync::atomic::AtomicBool::new(false),
+            host_no_inline_preedit: std::sync::atomic::AtomicBool::new(false),
             eager_prewarm: std::sync::atomic::AtomicBool::new(true),
             readiness_state: std::sync::atomic::AtomicU8::new(0),
             pending_first_show: Mutex::new(false),
@@ -6648,6 +6659,16 @@ impl Coordinator {
     pub(crate) fn preedit_in_app_effective(&self) -> bool {
         if self.ui_suppressed_by_host().is_some() {
             return true;
+        }
+        // 反方向的同一个道理：宿主**没有**应用内预编辑（Linux 下不声明 Preedit 能力位的客户端，
+        // WPS / QQ 等），配置说 app_inline 也嵌不进去。addon 不能把编码转交 Fcitx5 的输入面板
+        // ——那会由 classicui 另起一个小窗，正好被我们的候选窗盖住——所以编码归候选窗顶部栏
+        // （`SetPreeditEmbedded` 按配置原值下发，app_inline 时为 false，即顶部栏）。
+        if self
+            .host_no_inline_preedit
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
         }
         self.preedit_display
             .lock()
@@ -10808,6 +10829,55 @@ mod mode_comment_e2e_tests {
         let (tip, lookups) = run(false);
         assert!(tip.is_empty(), "悬停关掉 ⇒ 候选不带气泡：{tip:?}");
         assert_eq!(lookups, 0, "悬停关掉 ⇒ 不再调用 word_codes_display");
+    }
+
+    /// 出厂「释义」段走真实链路（论坛 t282）：挂两个注释库，经 `notify_ui_update` 下发的气泡
+    /// 里每个库的释义各占一行；查不到的候选没有这一段。
+    #[test]
+    fn default_tooltip_dict_all_section_lists_every_library() {
+        let dir = std::env::temp_dir().join(format!("wind_tip_dict_all_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = "name: t\ncolumns:\n  - text\n  - comment\n...\n";
+        let specs: Vec<_> = [("en", "v.配置"), ("it", "[IT]配置…")]
+            .iter()
+            .map(|(n, cmt)| {
+                let p = dir.join(format!("{n}.dict.yaml"));
+                std::fs::write(&p, format!("{head}configure\t{cmt}\n")).unwrap();
+                (p, Vec::new())
+            })
+            .collect();
+        let (c, rx) = coord_with_ui(Config::default());
+        c.reverse.write().unwrap().reload_comments(&specs, None);
+        let tip_of = |text: &str| {
+            {
+                let mut st = c.state.lock().unwrap();
+                st.candidates = vec![wind_candidate::Candidate {
+                    text: text.into(),
+                    code: text.into(),
+                    source: wind_candidate::CandidateSource::English,
+                    ..Default::default()
+                }];
+                st.input_buffer = text.into();
+            }
+            let st = c.state.lock().unwrap();
+            c.notify_ui_update(&st);
+            drop(st);
+            let mut tip = None;
+            while let Ok(cmd) = rx.try_recv() {
+                if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                    tip = candidates.first().map(|c| c.tooltip.to_plain_text());
+                }
+            }
+            tip.expect("应下发候选")
+        };
+        assert!(
+            tip_of("configure").contains("[释义]\nv.配置\n[IT]配置…"),
+            "{:?}",
+            tip_of("configure")
+        );
+        assert!(!tip_of("nosuch").contains("[释义]"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -16360,6 +16430,50 @@ mod capslock_tests {
             "中文+CapsLock+无session+标点应透传，实际: {:?}",
             action
         );
+    }
+
+    /// GH#197：中文 + CapsLock + 英文配对开 → 配对键与「英文 + 大写」同样出一对、可跳出。
+    /// DLL 对配对键开了透传例外（`_IsEnglishHalfEatenPunctKey`）吃下转发，此处若仍
+    /// PassThrough 就是「吃了再吐」，配对静默失效。
+    #[test]
+    fn capslock_on_english_pair_key_inserts_pair() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.symbol.smart_mode = false;
+        cfg.input.auto_pair.english = true;
+        let c = Coordinator::new_headless(cfg, None);
+        set_caps_lock(&c, true);
+        let mut ev = kev_caps(0x39 /* '9' */, EVENT_KEY_DOWN);
+        ev.modifiers = MOD_SHIFT;
+        match c.handle_key_event(&ev) {
+            KeyAction::InsertTextWithCursor {
+                text,
+                cursor_offset,
+            } => {
+                assert_eq!(text, "()");
+                assert_eq!(cursor_offset, 1);
+            }
+            other => panic!("中文+CapsLock+Shift+9 应插入英文配对，实际: {:?}", other),
+        }
+        // 非配对标点仍按原样透传（保留原始 WM_KEYDOWN）。
+        assert!(matches!(
+            c.handle_key_event(&kev_caps(0xBC, EVENT_KEY_DOWN)),
+            KeyAction::PassThrough
+        ));
+    }
+
+    /// 对照：英文配对关时配对键仍透传（DLL 判据 `ShouldEat` 同样为假，不吃）。
+    #[test]
+    fn capslock_on_pair_key_passthrough_when_english_pair_off() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.symbol.smart_mode = false;
+        cfg.input.auto_pair.english = false;
+        let c = Coordinator::new_headless(cfg, None);
+        set_caps_lock(&c, true);
+        let mut ev = kev_caps(0x39, EVENT_KEY_DOWN);
+        ev.modifiers = MOD_SHIFT;
+        assert!(matches!(c.handle_key_event(&ev), KeyAction::PassThrough));
     }
 
     #[test]

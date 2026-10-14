@@ -86,7 +86,10 @@ private:
     // Hit-test client coords against the latest rect table. Returns the candidate
     // index (>=0), a page button (-1 up / -2 down), or INT_MIN for no hit.
     int  _HitTest(int clientX, int clientY);
-    void _OnMouseClick(int clientX, int clientY);
+    // Left click acts on RELEASE (HostClickPolicy.h): down records the hit, up selects
+    // only if it is still over the same item.
+    void _OnMouseDown(int clientX, int clientY);
+    void _OnMouseUp(int clientX, int clientY);
     void _OnMouseMove(int clientX, int clientY);
     void _OnMouseLeave();
     void _OnMouseWheel(int delta);
@@ -168,6 +171,7 @@ private:
     // updates the baseline). All accesses are guarded by _rectLock.
     int  _lastHoverIndex;
     BOOL _trackingMouse;  // WM_MOUSELEAVE tracking armed (UI thread only)
+    int  _pressedHit;     // hit under the left-button press; INT_MIN = none (UI thread only)
 
     // Synthetic-move filter (UI thread only). When the candidate window repaints or
     // follows the caret under a physically-stationary cursor, Windows still posts

@@ -460,6 +460,7 @@ pub struct PopupMenu {
     font_px: f32,
     /// 菜单容器位图背景 + z 层（jidian menu.root 吃九宫格 panel + 角标水印）。
     bg_image: Option<crate::view::ViewImage>,
+    bg_gradient: Option<crate::view::ViewGradient>,
     layers: Vec<crate::view::ViewLayer>,
     /// 边框宽 / 圆角（设备像素，从 menu.root 节点 border 读取，px/dp 经 Dim 区分）。
     border_w: f32,
@@ -503,6 +504,7 @@ impl PopupMenu {
             hl_fg: HL_FG,
             font_px: FONT_PX,
             bg_image: None,
+            bg_gradient: None,
             layers: Vec::new(),
             border_w: scale, // 默认 1dp（≈1 设备像素，细边清晰）
             radius: 6.0 * scale,
@@ -598,6 +600,7 @@ impl PopupMenu {
         let s = self.scale;
         if let Some(node) = &theme.views.menu_root {
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
+            self.bg_gradient = crate::theme_assets::rv_gradient(node.bg_gradient.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             // 背景色/边框色/宽/圆角从 menu.root 节点读取（权威，px/dp 经 Dim 区分）；
             // bg_color / border_color 默认已带 menu_bg / menu_border token 兜底（resolve build 传入）。
@@ -628,6 +631,7 @@ impl PopupMenu {
             );
         } else {
             self.bg_image = None;
+            self.bg_gradient = None;
             self.layers = Vec::new();
             self.border = theme.color("menu_border", BORDER);
             self.border_w = s;
@@ -1014,7 +1018,10 @@ impl PopupMenu {
             .border(self.border, self.border_w)
             .radius(self.radius)
             .pad(root_pad);
-        // 主题位图背景 + 层（jidian menu.root 吃九宫格 panel + 角标水印）。
+        // 主题渐变 + 位图背景 + 层（jidian menu.root 吃九宫格 panel + 角标水印）。
+        if let Some(g) = &self.bg_gradient {
+            root = root.bg_gradient(g.clone());
+        }
         if let Some(img) = &self.bg_image {
             root = root.bg_image(img.clone());
         }
@@ -2535,5 +2542,39 @@ mod clipboard_tests_macos {
         if !original.is_empty() {
             set_clipboard_text(&original);
         }
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use crate::theme_assets::gradient_fixture as fx;
+
+    /// menu.root 的 `background.gradient` 叠在底色上（口径同候选窗节点）。
+    /// 取样点在 root 上内边距里（避开 1px 边框）。
+    #[test]
+    fn menu_root_paints_bg_gradient() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut m = PopupMenu::new(tx).expect("mock 菜单");
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.menu_root = Some(fx::node());
+        m.set_theme(&theme);
+        let items = vec![MenuItemSpec::leaf("x", MenuKind::Copy, true, false)];
+        let (root, w, h, _) = m.build_view(&items, NONE_SEL);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        root.paint(&mut buf, w, h, &m.renderer);
+        assert_eq!(fx::rgb(&buf, w, w / 2, 2), fx::RED, "menu.root 渐变没画");
+
+        // 换到同节点、但没配渐变的主题：渐变必须清掉，露出底色。
+        let mut plain = wind_theme::Resolved::default();
+        plain.views.menu_root = Some(wind_theme::RvNode {
+            bg_gradient: None,
+            ..fx::node()
+        });
+        m.set_theme(&plain);
+        let (root, w, h, _) = m.build_view(&items, NONE_SEL);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        root.paint(&mut buf, w, h, &m.renderer);
+        assert_eq!(fx::rgb(&buf, w, w / 2, 2), fx::BLUE, "旧主题的渐变残留");
     }
 }

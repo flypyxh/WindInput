@@ -35,11 +35,23 @@ public:
 };
 
 /// 数字后智能标点的 prevChar 记账——对位 Swift `SmartPunctDigitTracker`（语义与取舍见那边
-/// 的长注释）。Linux 上若宿主支持 surrounding text，addon 优先读真实的光标前字符，本记账
-/// 只在读不到时兜底。
+/// 的长注释）。「数字后」**只认本记账**（2026-10-13 定，三平台一致）：宿主 surrounding text
+/// 里的数字不算——那会把「光标恰好停在旧数字后面」也当成数字后，用户在那里打不出全角标点。
 class DigitTracker {
 public:
     uint16_t prevChar() const { return prevChar_; }
+    /// 发给服务端的 prevChar（对位 Windows `WindSmartPunct::ResolvePrevChar`）。`hostChar` 是
+    /// surrounding text 读到的光标前字符（0 = 读不到）：记账有数字就报记账；否则报宿主字符，
+    /// 但 ASCII 数字抹成 0。非数字照报——服务端智能符号 press2 守卫拿它比对武装串末位。
+    /// ⛔ 别让宿主字符「否决」记账：Qt / Electron 的 surrounding 是异步推送的，快打「3.」时
+    /// 读到的可能还是插入 3 之前的内容，会误判成非数字后。
+    uint16_t resolve(uint16_t hostChar) const
+    {
+        if (prevChar_ != 0) {
+            return prevChar_;
+        }
+        return hostChar >= 0x30 && hostChar <= 0x39 ? 0 : hostChar;
+    }
     void reset() { prevChar_ = 0; }
     /// 这一键产出的数字字符（0 = 不产出数字）。Ctrl/Alt/Win + 数字是宿主快捷键，不记。
     static uint16_t digitChar(uint32_t vk, uint32_t modifiers);

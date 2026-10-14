@@ -491,6 +491,7 @@ pub struct Tooltip {
     fg: [u8; 4],
     /// 主题位图背景 + z 层（jidian tooltip 吃九宫格 panel + 角标水印）。
     bg_image: Option<ViewImage>,
+    bg_gradient: Option<crate::view::ViewGradient>,
     layers: Vec<ViewLayer>,
     /// 主题配置的软投影 / 边框 / 圆角（与候选窗一致化）。
     shadow: Option<crate::view::SoftShadow>,
@@ -544,6 +545,7 @@ impl Tooltip {
             bg: BG,
             fg: FG,
             bg_image: None,
+            bg_gradient: None,
             layers: Vec::new(),
             shadow: None,
             border: None,
@@ -591,6 +593,7 @@ impl Tooltip {
             }
             let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
+            self.bg_gradient = crate::theme_assets::rv_gradient(node.bg_gradient.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             self.shadow = crate::view::SoftShadow::build(
                 node.shadow_offset_x,
@@ -614,6 +617,7 @@ impl Tooltip {
             self.radius = node.border_radius.map(|d| d.resolve(s, 0.0));
         } else {
             self.bg_image = None;
+            self.bg_gradient = None;
             self.layers = Vec::new();
             self.shadow = None;
             self.border = None;
@@ -637,6 +641,9 @@ impl Tooltip {
             tip = tip.border(bc, bw);
         }
         tip.corner_radius = self.radius.unwrap_or(5.0 * s);
+        if let Some(g) = &self.bg_gradient {
+            tip = tip.bg_gradient(g.clone());
+        }
         if let Some(img) = &self.bg_image {
             tip = tip.bg_image(img.clone());
         }
@@ -1892,5 +1899,42 @@ mod tests {
              ColorRun {{ start: 19, end: 23, rgba: [154, 208, 255, 255] }}]"
         );
         assert!(log[0].contains(&want), "{}\n期望含 {want}", log[0]);
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::Tooltip;
+    use crate::theme_assets::gradient_fixture as fx;
+
+    /// tooltip 节点的 `background.gradient` 叠在底色上（口径同候选窗节点）。
+    /// 取样点同 status 气泡：左内边距、垂直居中（上内边距会被 macOS 的字形墨迹压到）。
+    #[test]
+    fn tooltip_paints_bg_gradient() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut t = Tooltip::new(tx).expect("非 Windows 下是内存桩");
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.tooltip = Some(fx::node());
+        t.set_theme(&theme);
+        let (buf, w, _, _, ch, ml, mt, ..) = t.render_to_bgra("中");
+        assert_eq!(
+            fx::rgb(&buf, w, ml + 3, mt + ch / 2),
+            fx::RED,
+            "tooltip 渐变没画"
+        );
+
+        // 换到同节点、但没配渐变的主题：渐变必须清掉，露出底色。
+        let mut plain = wind_theme::Resolved::default();
+        plain.views.tooltip = Some(wind_theme::RvNode {
+            bg_gradient: None,
+            ..fx::node()
+        });
+        t.set_theme(&plain);
+        let (buf, w, _, _, ch, ml, mt, ..) = t.render_to_bgra("中");
+        assert_eq!(
+            fx::rgb(&buf, w, ml + 3, mt + ch / 2),
+            fx::BLUE,
+            "旧主题的渐变残留"
+        );
     }
 }

@@ -37,7 +37,8 @@ body:
       options:
         - Windows
         - macOS
-        - 两者都涉及
+        - Linux
+        - 多个平台
         - 不确定
     validations:
       required: true

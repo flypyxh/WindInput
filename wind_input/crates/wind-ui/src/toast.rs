@@ -29,6 +29,7 @@ pub struct Toast {
     bg: [u8; 4],
     fg: [u8; 4],
     bg_image: Option<ViewImage>,
+    bg_gradient: Option<crate::view::ViewGradient>,
     layers: Vec<ViewLayer>,
     shadow: Option<crate::view::SoftShadow>,
     radius: Option<f32>,
@@ -54,6 +55,7 @@ impl Toast {
             bg: [44, 44, 48, 240],
             fg: [240, 240, 245, 255],
             bg_image: None,
+            bg_gradient: None,
             layers: Vec::new(),
             shadow: None,
             radius: None,
@@ -79,6 +81,7 @@ impl Toast {
         if let Some(node) = &theme.views.toast {
             let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref(), s);
+            self.bg_gradient = crate::theme_assets::rv_gradient(node.bg_gradient.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
             self.shadow = crate::view::SoftShadow::build(
                 node.shadow_offset_x,
@@ -105,6 +108,7 @@ impl Toast {
                 .map(|c| (c, node.border_width.map(|d| d.resolve(s, 0.0))));
         } else {
             self.bg_image = None;
+            self.bg_gradient = None;
             self.layers = Vec::new();
             self.shadow = None;
             self.border = None;
@@ -193,6 +197,9 @@ impl Toast {
             .child(label)
             .border(border_color, border_width);
         card.corner_radius = self.radius.unwrap_or(6.0 * s);
+        if let Some(g) = &self.bg_gradient {
+            card = card.bg_gradient(g.clone());
+        }
         if let Some(img) = &self.bg_image {
             card = card.bg_image(img.clone());
         }
@@ -308,4 +315,40 @@ fn place_on_work_area(pos: ToastPosition, w: u32, h: u32, margin: i32) -> (i32, 
         }
     }
     (0, 0)
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::{Toast, ToastKind};
+    use crate::theme_assets::gradient_fixture as fx;
+
+    /// toast 节点的 `background.gradient` 叠在底色上（口径同候选窗节点）。
+    /// 取样点避开 2dp 边框环。
+    #[test]
+    fn toast_card_paints_bg_gradient() {
+        let mut t = Toast::new().expect("非 Windows 下是内存桩");
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.toast = Some(fx::node());
+        t.set_theme(&theme);
+        let (buf, w, _, cw, _, ml, mt, _) = t.render_card("中", ToastKind::Info, None);
+        assert_eq!(
+            fx::rgb(&buf, w, ml + cw / 2, mt + 4),
+            fx::RED,
+            "toast 渐变没画"
+        );
+
+        // 换到同节点、但没配渐变的主题：渐变必须清掉，露出底色。
+        let mut plain = wind_theme::Resolved::default();
+        plain.views.toast = Some(wind_theme::RvNode {
+            bg_gradient: None,
+            ..fx::node()
+        });
+        t.set_theme(&plain);
+        let (buf, w, _, cw, _, ml, mt, _) = t.render_card("中", ToastKind::Info, None);
+        assert_eq!(
+            fx::rgb(&buf, w, ml + cw / 2, mt + 4),
+            fx::BLUE,
+            "旧主题的渐变残留"
+        );
+    }
 }

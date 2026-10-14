@@ -194,6 +194,7 @@ pub(super) fn check_layer(custom_dir: &Path, data_dir: Option<&Path>, app_versio
     // ③ 清单的减法清单与「配置里还在引用它」的交叉核对。
     if let Some(m) = &manifest {
         check_hide_lists(custom_dir, data_dir, m, custom_value, &mut rep);
+        check_settings_hide(m, &mut rep);
     }
 
     // ④ 简繁数据：按名逐文件覆盖，只放一两本是**正常**的；名字对不上才是问题。
@@ -215,6 +216,7 @@ const MANIFEST_KNOWN: &[(&str, &[&str])] = &[
     ("custom", &["id", "name", "version", "base_version"]),
     ("schemas", &["hide"]),
     ("themes", &["hide"]),
+    ("settings", &["hide"]),
 ];
 
 fn check_manifest(
@@ -318,7 +320,7 @@ fn check_manifest_unknown_fields(raw: &toml::Value, rep: &mut Report) {
             CUSTOM_MANIFEST_NAME,
             None,
             "顶层不是配置表。",
-            "清单必须由 [custom] / [schemas] / [themes] 三个段构成。",
+            "清单由 [custom] / [schemas] / [themes] / [settings] 这几个段构成。",
         );
         return;
     };
@@ -771,6 +773,27 @@ fn is_opaque_leaf(prefix: &str) -> bool {
 fn has_registered_descendant(prefix: &str) -> bool {
     let with_dot = format!("{prefix}.");
     registry().iter().any(|f| f.key.starts_with(&with_dot))
+}
+
+// ---------------------------------------------------------------------------
+// ③' 设置界面减法（`[settings] hide`）
+// ---------------------------------------------------------------------------
+
+/// 只校验**选择器语法**与 `feature:` 的取值。`key:` 是否真的命中某个设置项，这里判不了：
+/// 设置项清单住在设置程序里（含 `local.*` 这类不进 config 的条目），拿 config 注册表去比会
+/// 把合法的条目报成错。命中与否由设置程序启动时检查，一条都没命中的打 WARN 进设置日志。
+fn check_settings_hide(manifest: &wind_config::CustomManifest, rep: &mut Report) {
+    let (_, errors) = wind_config::SettingsHide::parse(&manifest.settings.hide);
+    for e in errors {
+        rep.warn(
+            CUSTOM_MANIFEST_NAME,
+            Some("settings.hide".into()),
+            format!("{e}\n这一条会被忽略，对应的设置照常显示；其余条目不受影响。"),
+            "例：hide = [\"key:input.temp_english.*\", \"feature:wizard\"]。\
+             注意隐藏只影响设置界面，功能照常生效——要关掉功能，请在 data_custom/config.toml \
+             里把值设好。",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,6 +1798,30 @@ mod tests {
         );
         let rep = f.run();
         one(&rep, Level::Warn, "schemas.hidden");
+    }
+
+    /// `[settings]` 是认识的段：写对了零报告（不能被当成未知段告警）。
+    #[test]
+    fn settings_hide_valid_selectors_report_nothing() {
+        let f = Fixture::new();
+        f.manifest(
+            "[custom]\nid = \"demo\"\nversion = \"1\"\nbase_version = \"1.2.0\"\n\n[settings]\nhide = [\"key:input.temp_english.*\", \"feature:wizard\"]\n",
+        );
+        let rep = f.run();
+        assert!(rep.findings.is_empty(), "{}", dump(&rep));
+    }
+
+    /// 坏选择器逐条告警，点名 `settings.hide`，并说清「隐藏 ≠ 关闭功能」。
+    #[test]
+    fn settings_hide_bad_selector_is_warned() {
+        let f = Fixture::new();
+        f.manifest(
+            "[custom]\nid = \"demo\"\nversion = \"1\"\nbase_version = \"1.2.0\"\n\n[settings]\nhide = [\"input.temp_english.*\", \"key:ui.toolbar.*\"]\n",
+        );
+        let rep = f.run();
+        let text = one(&rep, Level::Warn, "settings.hide");
+        assert!(text.contains("类型前缀"), "{text}");
+        assert!(text.contains("config.toml"), "应提示关功能要改配置：{text}");
     }
 
     #[test]

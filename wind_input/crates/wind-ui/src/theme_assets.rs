@@ -1,8 +1,8 @@
 //! 主题图片资产解析（各窗口共享）：把 RvImage 的 ref 解析为绝对路径，转成 View 渲染用的
-//! ViewImage / ViewLayer。背景图/层的实际绘制由 view.rs 的 paint（线程局部 image_cache）完成。
+//! ViewImage / ViewLayer；RvGradient 同在此转成 ViewGradient。背景图/层的实际绘制由 view.rs 的 paint（线程局部 image_cache）完成。
 
-use crate::view::{ImagePlace, ViewImage, ViewLayer};
-use wind_theme::{Resolved, RvImage};
+use crate::view::{ImagePlace, ViewGradient, ViewImage, ViewLayer};
+use wind_theme::{Resolved, RvGradient, RvImage};
 
 /// 把 image ref 解析为可读绝对路径：resources 注册表 → data:/绝对 → 在 asset_dirs（base 链目录）
 /// 搜字面文件（如 _base 的 chevron.svg）。
@@ -39,6 +39,7 @@ pub fn rv_image(theme: &Resolved, im: Option<&RvImage>, scale: f32) -> Option<Vi
         opacity: im.opacity,
         tint: im.tint,
         place: positioned(im).then(|| image_place(im, scale)),
+        scale,
     })
 }
 
@@ -53,9 +54,26 @@ pub fn rv_layers(theme: &Resolved, layers: &[RvImage], scale: f32) -> Vec<ViewLa
                 z: im.z,
                 place: image_place(im, scale),
                 opacity: im.opacity,
+                // 口径同 rv_image：未配 / transparent 都落成 alpha=0 = 不染色。
+                tint: im.tint.unwrap_or([0, 0, 0, 0]),
             })
         })
         .collect()
+}
+
+/// RvGradient → 渲染用 ViewGradient（stop 颜色直通 [R,G,B,A]）；无 stop 返回 None。
+/// 候选窗各节点与弹窗类（status / tooltip / toast / menu.root）共用，绘制统一走
+/// `View::bg_gradient`（叠在底色之上、背景图之下、裁到圆角）。
+pub fn rv_gradient(g: Option<&RvGradient>) -> Option<ViewGradient> {
+    let g = g?;
+    if g.stops.is_empty() {
+        return None;
+    }
+    Some(ViewGradient {
+        radial: g.kind == "radial",
+        angle: g.angle,
+        stops: g.stops.clone(),
+    })
 }
 
 /// 定位字段 → 渲染形态：偏移分流（dp×scale / 百分比）+ 尺寸×scale。背景图与覆盖图共用。
@@ -77,6 +95,7 @@ fn image_place(im: &RvImage, scale: f32) -> ImagePlace {
         off_y_pct,
         w: if im.w > 0 { im.w as f32 * scale } else { 0.0 },
         h: if im.h > 0 { im.h as f32 * scale } else { 0.0 },
+        scale,
     }
 }
 
@@ -91,6 +110,33 @@ fn positioned(im: &RvImage) -> bool {
         None => false,
     };
     !im.anchor.is_empty() || nonzero(im.offset_x) || nonzero(im.offset_y) || im.w != 0 || im.h != 0
+}
+
+/// 弹窗类（status / tooltip / toast / menu.root）渐变接线测试的共用夹具：蓝底 + 纯红线性渐变。
+/// 渐变叠在底色之上，接上了取样点就是红，没接上就是蓝。
+#[cfg(test)]
+pub(crate) mod gradient_fixture {
+    pub const BG: [u8; 4] = [0, 0, 255, 255];
+    pub const RED: [u8; 3] = [255, 0, 0];
+    pub const BLUE: [u8; 3] = [0, 0, 255];
+
+    pub fn node() -> wind_theme::RvNode {
+        wind_theme::RvNode {
+            bg_color: Some(BG),
+            bg_gradient: Some(wind_theme::RvGradient {
+                kind: "linear".into(),
+                angle: 0.0,
+                stops: vec![([255, 0, 0, 255], 0.0), ([255, 0, 0, 255], 1.0)],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// BGRA 缓冲 → 某点 RGB。
+    pub fn rgb(buf: &[u8], buf_w: u32, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * buf_w + x) * 4) as usize;
+        [buf[i + 2], buf[i + 1], buf[i]]
+    }
 }
 
 #[cfg(test)]
@@ -178,9 +224,32 @@ mod tests {
                 off_y_pct: 10.0,
                 w: 48.0,
                 h: 0.0,
+                scale: 2.0,
             }
         );
         assert_eq!(rv_layers(&theme, &[full], 2.0)[0].place, p);
+    }
+
+    /// 图层 tint 透传：口径同背景图 `rv_image`（未配 = 不染色 `[0,0,0,0]`）。
+    /// 曾经 schema 有、resolve 有、到这一环被丢——主题配了图层 tint 毫无变化。
+    #[test]
+    fn rv_layers_carries_tint() {
+        let theme = Resolved::default();
+        let tinted = RvImage {
+            reference: "mark.svg".to_string(),
+            tint: Some([10, 20, 30, 200]),
+            ..Default::default()
+        };
+        let plain = RvImage {
+            reference: "mark.svg".to_string(),
+            ..Default::default()
+        };
+        let out = rv_layers(&theme, &[tinted.clone(), plain], 1.0);
+        assert_eq!(out[0].tint, [10, 20, 30, 200], "图层 tint 没传到渲染层");
+        assert_eq!(out[1].tint, [0, 0, 0, 0], "未配 tint 应原样出图");
+        // 与背景图同口径。
+        let bg = rv_image(&theme, Some(&tinted), 1.0).unwrap();
+        assert_eq!(bg.tint, Some(out[0].tint));
     }
 
     /// 空 ref = 没有图，不能凭空造一个（调用方据此跳过整层绘制）。

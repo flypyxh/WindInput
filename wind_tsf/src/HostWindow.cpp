@@ -1,5 +1,6 @@
 #include "HostWindow.h"
 #include "FileLogger.h"
+#include "HostClickPolicy.h"
 #include "IPCClient.h"
 #include <climits>
 #ifndef WHEEL_DELTA
@@ -50,6 +51,7 @@ CHostWindow::CHostWindow()
     , _rectLockInit(FALSE)
     , _lastHoverIndex(INT_MIN)
     , _trackingMouse(FALSE)
+    , _pressedHit(INT_MIN)
     , _lastScreenX(0)
     , _lastScreenY(0)
     , _hasScreenPos(FALSE)
@@ -171,7 +173,14 @@ LRESULT CALLBACK CHostWindow::_WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         {
         case WM_LBUTTONDOWN:
             // Client coords (window is sized to the bitmap → coords match panel-local rects).
-            self->_OnMouseClick((int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
+            self->_OnMouseDown((int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
+            return 0;
+        case WM_LBUTTONUP:
+            self->_OnMouseUp((int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
+            return 0;
+        case WM_CAPTURECHANGED:
+            // Capture taken away mid-press (another window grabbed it): the press is void.
+            self->_pressedHit = INT_MIN;
             return 0;
         case WM_MOUSEMOVE:
             self->_OnMouseMove((int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
@@ -256,11 +265,27 @@ int CHostWindow::_HitTest(int clientX, int clientY)
     return (candidateHit != INT_MIN) ? candidateHit : pageHit;
 }
 
-void CHostWindow::_OnMouseClick(int clientX, int clientY)
+void CHostWindow::_OnMouseDown(int clientX, int clientY)
 {
+    _pressedHit = _HitTest(clientX, clientY);
+    if (_pressedHit != INT_MIN)
+        SetCapture(_hwnd); // still get the release after the cursor leaves → judge "abandon"
+}
+
+void CHostWindow::_OnMouseUp(int clientX, int clientY)
+{
+    const int pressed = _pressedHit;
+    _pressedHit = INT_MIN;
+    if (GetCapture() == _hwnd)
+        ReleaseCapture(); // posts WM_CAPTURECHANGED; _pressedHit is already cleared
+    // Hidden while held (commit / Esc / focus loss came from the keyboard or Go): the hit
+    // rects are stale, the release must not select whatever sat under the cursor.
+    if (!IsWindowVisible(_hwnd))
+        return;
     int hit = _HitTest(clientX, clientY);
-    WIND_LOG_INFO_FMT(L"HostWindow: mouse click at (%d,%d) hit=%d\n", clientX, clientY, hit);
-    if (hit == INT_MIN || _pIPCClient == nullptr)
+    WIND_LOG_INFO_FMT(L"HostWindow: mouse click at (%d,%d) pressed=%d hit=%d\n", clientX, clientY,
+                      pressed, hit);
+    if (!wind::hostclick::SelectsOnRelease(pressed, hit) || _pIPCClient == nullptr)
         return;
 
     int32_t idx = (int32_t)hit; // >=0 candidate, -1 page up, -2 page down

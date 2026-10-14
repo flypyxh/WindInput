@@ -53,6 +53,21 @@ gh release view v<上一版> --repo huanfeng/WindInput
 「新功能」的提交，逐个 `git log -1 --format='%s%n%b' <sha>` 读 body，
 确认：出厂默认值、入口位置、是否实验性、是否有行为变更。
 
+### 6. 收集反馈来源（供致谢行用）
+
+提交标题里的 `论坛 t123` 是论坛**帖子号**，`GH#123` 是 GitHub **Issue/PR 号**，
+都不是用户名。三个仓一起扫，**只收进入了正文的条目**对应的编号
+（被「先删再写」扔掉的提交，其来源不致谢）：
+
+```bash
+{ git log --format='%s' v<上一版>..HEAD
+  git -C ../wind-setting log --format='%s' --since='<上一版时间戳>'
+  git -C ../wind-ui-rust  log --format='%s' --since='<上一版时间戳>'
+} | grep -oE '论坛 t[0-9]+|GH#[0-9]+' | sort -u
+```
+
+待合入的 worktree 分支（`git worktree list`）若要随本版发布，也要一起扫。
+
 ---
 
 ## 二、分类：只有四类，不许新增
@@ -135,6 +150,20 @@ gh release view v<上一版> --repo huanfeng/WindInput
 
 **例外**：用户真正要输入或看到的标识符保留反引号原样 —— `calc.percent`、
 `key.type`、`.wpkg`、`Tab`、`inf%`。
+
+### 致谢行：编号是帖子，不是人
+
+「其他说明」最后一条。`t281` 是帖子号，写成「感谢论坛用户 t281」读起来像一个叫
+t281 的用户。句式固定为：
+
+```
+感谢在论坛帖 t128、t278 及 GitHub Issue #170、#182 中反馈的各位用户
+```
+
+- 论坛号带 `t` 前缀，GitHub 号带 `#` 且前面写明 `GitHub Issue`：两边编号会撞
+  （t192 与 #192 是两件事），前缀不能省。
+- 各自按数字升序；某一边没有就整段省掉，不留「及」。
+- 不写用户名：提交里没有，猜错比不写更糟。
 
 ---
 

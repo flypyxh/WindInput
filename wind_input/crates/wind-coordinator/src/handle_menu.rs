@@ -2382,22 +2382,11 @@ impl Coordinator {
         // 快捷输入历史候选：只给「删除此历史」与复制。它没有位置可调（排序按使用次数），
         // 也不在任何词库里，词条菜单那几项都没有落点。写端见 `candidate_or_quick_format_op`。
         if history {
-            #[allow(unused_mut)]
-            let mut items = vec![
+            let items = vec![
                 M::leaf("删除此历史", op(CandidateOp::Delete), true, false),
                 M::separator(),
                 M::leaf("复制", MenuKind::Copy, true, false),
             ];
-            #[cfg(all(target_os = "linux", ext_presenter))]
-            items.extend([
-                M::separator(),
-                M::leaf(
-                    "更多…",
-                    MenuKind::Command(MenuCmd::OpenMainMenu),
-                    true,
-                    false,
-                ),
-            ]);
             self.mark_menu_open(page_local, word);
             let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
                 items,
@@ -2412,8 +2401,7 @@ impl Coordinator {
                 let a = self.quick_adjust_of(q.kind);
                 !a.is_empty()
             };
-            #[allow(unused_mut)]
-            let mut items = vec![
+            let items = vec![
                 // 「同类型内」这个限定不能省：置顶只在本类（日期/数字/计算）内生效，
                 // 类与类之间的先后由 `mix_modes.members` 决定，不归本菜单管。
                 M::leaf(
@@ -2434,17 +2422,6 @@ impl Coordinator {
                 M::separator(),
                 M::leaf("复制", MenuKind::Copy, true, false),
             ];
-            // 「更多…」理由见下方词条菜单同一处。
-            #[cfg(all(target_os = "linux", ext_presenter))]
-            items.extend([
-                M::separator(),
-                M::leaf(
-                    "更多…",
-                    MenuKind::Command(MenuCmd::OpenMainMenu),
-                    true,
-                    false,
-                ),
-            ]);
             self.mark_menu_open(page_local, word);
             let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
                 items,
@@ -2518,19 +2495,6 @@ impl Coordinator {
         // 「同一个字在临拼下右键没有这一项」——用户绝不会想到那是分支写重了。
         items.extend(common_item);
         items.push(M::leaf("复制", MenuKind::Copy, true, false));
-        // Linux 没有工具栏也没有托盘：组字时通往主菜单的只剩候选窗空白处右键，而候选窗
-        // 几乎没有空白。借候选菜单末尾给一个「更多…」（同工具栏分格菜单那一项，同一个
-        // `OpenMainMenu`，锚点取刚才点它的指针位置）。
-        #[cfg(all(target_os = "linux", ext_presenter))]
-        items.extend([
-            M::separator(),
-            M::leaf(
-                "更多…",
-                MenuKind::Command(MenuCmd::OpenMainMenu),
-                true,
-                false,
-            ),
-        ]);
         self.mark_menu_open(page_local, word);
         // 候选右键菜单在光标处向下弹出（above=false，y_bottom 不使用）。
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
@@ -4555,8 +4519,11 @@ mod linux_menu_tests {
         }
     }
 
+    /// 候选菜单不再挂「更多…」：主菜单的入口是 Fcitx5 状态区的「清风输入法菜单」（弹在指针处）。
+    /// 原先的「更多…」点下去时屏幕菜单已关，随后下发的主菜单在 Wayland 下落进候选窗的 popup，
+    /// 把候选窗挤走（2026-10-12 KDE 真机）。
     #[test]
-    fn candidate_menu_ends_with_more_leading_to_main_menu() {
+    fn candidate_menu_has_no_main_menu_entry() {
         let (c, rx) = coord();
         with_candidate(&c);
         c.show_candidate_menu(0, 10, 20);
@@ -4567,9 +4534,14 @@ mod linux_menu_tests {
                 _ => None,
             })
             .expect("候选菜单没弹");
-        let last = items.last().unwrap();
-        assert_eq!(last.label, "更多…");
-        assert_eq!(last.kind, MenuKind::Command(MenuCmd::OpenMainMenu));
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.kind == MenuKind::Command(MenuCmd::OpenMainMenu)),
+            "候选菜单不该再有通往主菜单的项：{:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert_eq!(items.last().unwrap().label, "复制");
         assert!(c.is_menu_open());
     }
 

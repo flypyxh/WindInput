@@ -399,6 +399,9 @@ cargo test -p wind-rpc --test wind_setting_assets
 - Linux 包（`.deb`，amd64 + arm64）由 `release.yml` 并行调 `linux-build.yml` 构建，与 Windows/macOS **同为硬依赖**（任一平台失败都不建草稿）；
   想先单独发 Linux：手动触发 `release-linux.yml`（可填 tag 挂到该 tag 的 Release）。设计与取舍见
   [docs/design/linux-port.md](docs/design/linux-port.md) §9；本机出包 `scripts/linux/package-deb.sh`，核对 `scripts/linux/verify-deb.sh`。
+- 包管理器（winget `WindInput.WindInput` / Scoop `windinput-np`，在自有桶 huanfeng/scoop-bucket，Nonportable 待收录）只是调用标准安装包，
+  清单开关绑定 wind-installer 的提权、退出码与 ARP 键名；契约与上架步骤见
+  [docs/design/package-managers.md](docs/design/package-managers.md)。
 - CI（release.yml）为 tag-first：以 tag 覆盖 `docs/VERSION` 再构建；仓库里的 `docs/VERSION`
   是开发占位。**切勿添加 `tag == docs/VERSION` 一致性校验**——会破坏手动触发的 `-dev` 占位流程。
 - 草稿 Release 的正文由 `scripts/gen-release-notes.sh` 生成（模板在 `docs/release-notes/`）：

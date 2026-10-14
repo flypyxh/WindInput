@@ -177,6 +177,8 @@ fn sample_value(name: &str, arg: Option<&str>, ch: Option<char>) -> Option<Strin
         },
         "chaizi_all" => joined(&["亻尔", "女子"]),
         "chaizi_code_all" => joined(&["wqiy", "vbg"]),
+        // `dict_all` 归一到 `dict` 角色（同一份数据），但取值不同：按原名分开。
+        "dict" if name == "dict_all" => ["hello", "问候"].join(arg.unwrap_or(super::DICT_ALL_SEP)),
         "dict" => "hello".into(),
         "word_code" => "wqvb".into(),
         "code_source" => "五笔".into(),
@@ -408,6 +410,19 @@ mod tests {
         );
     }
 
+    /// `${dict_all}` 有样例值，分隔符参数生效（默认 `；`）。
+    #[test]
+    fn dict_all_sample_uses_separator() {
+        let s = sample("${dict_all}", &TemplateScene::Comment);
+        assert!(s.problems.is_empty());
+        assert_eq!(s.text.as_str(), "hello；问候");
+        let s = sample(
+            "${dict_all:/}",
+            &TemplateScene::TooltipContent { each: "".into() },
+        );
+        assert_eq!(s.text.as_str(), "hello/问候");
+    }
+
     /// 内联色的位置（SPEC 区间，含嵌套在可选段 / 内联色里的）与未知 key。
     #[test]
     fn color_specs_with_positions_and_notes() {
@@ -478,7 +493,7 @@ mod tests {
         ));
         // 注释里 eval_var 的变量照常可用。
         assert!(!unavailable(
-            "${code_hint}${emoji}${dict}${code}",
+            "${code_hint}${emoji}${dict}${dict_all}${code}",
             &TemplateScene::Comment
         ));
         // 未知变量仍按「未知」报，不混进「不可用」。

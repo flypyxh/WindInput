@@ -53,19 +53,55 @@ fn svg_tree(src: &str) -> Option<resvg::usvg::Tree> {
     resvg::usvg::Tree::from_data(&data, &opts).ok()
 }
 
-/// 栅格化 SVG 到 w×h，返回预乘 RGBA 字节（resvg 输出）。
-fn rasterize_svg(src: &str, w: u32, h: u32) -> Option<Vec<u8>> {
+/// 把 SVG 树按 `ts` 渲染进一张 w×h 画布（resvg 输出，预乘 RGBA）。
+fn render_svg(
+    tree: &resvg::usvg::Tree,
+    w: u32,
+    h: u32,
+    ts: resvg::tiny_skia::Transform,
+) -> Option<resvg::tiny_skia::Pixmap> {
+    let mut pm = resvg::tiny_skia::Pixmap::new(w, h)?;
+    resvg::render(tree, ts, &mut pm.as_mut());
+    Some(pm)
+}
+
+/// 栅格化 SVG 并拉伸到 w×h（两轴各自缩放，stretch / nine_slice 用）。
+fn rasterize_svg(src: &str, w: u32, h: u32) -> Option<resvg::tiny_skia::Pixmap> {
     let tree = svg_tree(src)?;
     let size = tree.size();
-    let mut pm = resvg::tiny_skia::Pixmap::new(w, h)?;
     let sx = w as f32 / size.width().max(1.0);
     let sy = h as f32 / size.height().max(1.0);
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(sx, sy),
-        &mut pm.as_mut(),
-    );
-    Some(pm.data().to_vec())
+    render_svg(&tree, w, h, resvg::tiny_skia::Transform::from_scale(sx, sy))
+}
+
+/// SVG center / tile：单元 = 文档尺寸 × k（统一比例，不为凑整而纵横各拉一份；单元按
+/// ceil 取整，多出的边角透明）。**只栅格化目标盒里看得见的部分**——单元尺寸来自主题
+/// （不可信），整单元栅格化可以大到分配不出来（4000² 文档 × 200% 就是 512 MB）：
+/// - center：直接把居中后的单元渲进 w×h 画布，越界的部分 resvg 自己裁掉；
+/// - tile：只渲 `min(单元, 盒)` 那么大一块，再按单元周期平铺——单元比盒大时，
+///   盒内看到的恰是单元左上那一块，周期取渲出的尺寸结果相同。
+///
+/// 返回 `(画布, 采样用的源宽高)`：center 已是 w×h 成品，tile 交给 `sample_into` 平铺。
+fn rasterize_svg_unit(
+    src: &str,
+    tile: bool,
+    k: f32,
+    w: u32,
+    h: u32,
+) -> Option<(resvg::tiny_skia::Pixmap, u32, u32)> {
+    let tree = svg_tree(src)?;
+    let size = tree.size();
+    let unit = |d: f32| (d * k).ceil().clamp(1.0, u32::MAX as f32) as u32;
+    let (uw, uh) = (unit(size.width()), unit(size.height()));
+    let scale = resvg::tiny_skia::Transform::from_scale(k, k);
+    if tile {
+        let (rw, rh) = (uw.min(w), uh.min(h));
+        return render_svg(&tree, rw, rh, scale).map(|pm| (pm, rw, rh));
+    }
+    // 居中偏移与位图 center（`map_src`）同一取整：整数像素对齐，不糊边。
+    let ox = (w as i64 - uw as i64) / 2;
+    let oy = (h as i64 - uh as i64) / 2;
+    render_svg(&tree, w, h, scale.post_translate(ox as f32, oy as f32)).map(|pm| (pm, w, h))
 }
 
 /// 栅格化**内联 SVG 字符串** → tint 后的 BGRA 预乘 Pixmap（工具栏图标用，不走文件缓存）。
@@ -174,6 +210,9 @@ pub struct FillSpec {
     pub slice: [u32; 4],
     /// 仅 nine_slice：中段沿 [x, y] 轴平铺而非拉伸。
     pub repeat: [bool; 2],
+    /// DPI 缩放 ×1000（整数才能进缓存键）。仅 SVG 的 center / tile 用：单元尺寸 =
+    /// 文档尺寸 × scale，scale 不同单元就不同，必须分开缓存。位图按纹理像素，不看它。
+    pub scale_milli: u32,
 }
 
 impl FillSpec {
@@ -183,6 +222,7 @@ impl FillSpec {
             mode: MODE_STRETCH,
             slice: [0; 4],
             repeat: [false; 2],
+            scale_milli: 1000,
         }
     }
 }
@@ -190,6 +230,11 @@ impl FillSpec {
 /// stretch 的模式码。单独具名是为了让 [`FillSpec::stretch`] 不必把编码表抄第二份——
 /// 抄了的话，改 [`mode_code`] 时编译器不会提醒那一处。
 const MODE_STRETCH: u8 = 0;
+
+/// SVG 是否按「文档尺寸 × DPI」单元铺（center / tile），即 `scale_milli` 是否有意义。
+fn is_unit_mode(mode: u8) -> bool {
+    mode == mode_code("center") || mode == mode_code("tile")
+}
 
 /// 填充模式码：0=stretch（默认）1=nine_slice 2=tile 3=center。
 pub fn mode_code(mode: &str) -> u8 {
@@ -431,6 +476,16 @@ impl ImageCache {
         tint: [u8; 4],
     ) -> Option<&Pixmap> {
         self.touch();
+        // scale 只决定 SVG center / tile 的单元尺寸；其余情形归一，免得每个 DPI 各驻留一份
+        // 一模一样的填充。
+        let spec = if is_svg(path) && is_unit_mode(spec.mode) {
+            spec
+        } else {
+            FillSpec {
+                scale_milli: 1000,
+                ..spec
+            }
+        };
         let key = (self.id_of(path), spec, w, h, tint);
         if !self.fills.contains_key(&key) {
             let built = self.build_fill(key, path);
@@ -452,12 +507,39 @@ impl ImageCache {
         }
         let mut pm = Pixmap::new(w, h)?;
         if is_svg(path) {
-            // SVG：按目标尺寸栅格化（resvg 输出预乘 RGBA），逐像素 tint/直通 + R/B 交换。
+            // SVG：resvg 输出预乘 RGBA，逐像素 tint/直通 + R/B 交换。
             // 告警与位图侧对齐：静默画不出来正是这次要消灭的病症，别在这一侧留一份。
-            let Some(rgba) = rasterize_svg(path, w, h) else {
-                tracing::warn!("主题背景图（SVG）栅格化失败: {}", brief(path));
+            let fail = || tracing::warn!("主题背景图（SVG）栅格化失败: {}", brief(path));
+            if is_unit_mode(spec.mode) {
+                // center / tile：以「文档尺寸 × DPI」为单元（见 rasterize_svg_unit），
+                // 平铺沿用位图同一套采样。stretch / nine_slice 走下面的整盒拉伸（矢量切九宫意义不大）。
+                let k = spec.scale_milli as f32 / 1000.0;
+                let tile = spec.mode == mode_code("tile");
+                let Some((unit, sw, sh)) = rasterize_svg_unit(path, tile, k, w, h) else {
+                    fail();
+                    return None;
+                };
+                let tile_spec = FillSpec {
+                    mode: mode_code("tile"),
+                    ..spec
+                };
+                // center 已渲成 w×h 成品：按 tile 采样即 1:1 直拷（sw=w、sh=h）。
+                sample_into(
+                    pm.pixels_mut(),
+                    tile_spec,
+                    (sw, sh, unit.data()),
+                    w,
+                    h,
+                    tint,
+                    true,
+                );
+                return Some(pm);
+            }
+            let Some(rendered) = rasterize_svg(path, w, h) else {
+                fail();
                 return None;
             };
+            let rgba = rendered.data();
             let px = pm.pixels_mut();
             for (i, p) in px.iter_mut().enumerate() {
                 let b = i * 4;
@@ -467,28 +549,48 @@ impl ImageCache {
         }
         // 位图：image 解码（未预乘）→ 按模式采样 → tint/预乘 + R/B 交换。
         let src = self.decode(id, path)?;
-        let (sw, sh, data) = (src.w, src.h, &src.rgba);
-        if sw == 0 || sh == 0 {
+        if src.w == 0 || src.h == 0 {
             return None;
         }
-        let px = pm.pixels_mut();
-        for dy in 0..h {
-            for dx in 0..w {
-                let Some((sx, sy)) = map_src(spec, sw, sh, w, h, dx, dy) else {
-                    continue; // 透明（Pixmap::new 已清零）
-                };
-                let si = ((sy * sw + sx) * 4) as usize;
-                px[(dy * w + dx) as usize] = compose(
-                    data[si],
-                    data[si + 1],
-                    data[si + 2],
-                    data[si + 3],
-                    tint,
-                    false,
-                );
-            }
-        }
+        sample_into(
+            pm.pixels_mut(),
+            spec,
+            (src.w, src.h, &src.rgba),
+            w,
+            h,
+            tint,
+            false,
+        );
         Some(pm)
+    }
+}
+
+/// 按 `spec` 把源图（`(sw, sh, RGBA8)`，`premult` 标明是否已预乘）采样进 `w×h` 的目标像素。
+/// 位图各模式与 SVG 的 center / tile（单元已栅格化好）共用；None 处保持透明（Pixmap::new 已清零）。
+fn sample_into(
+    px: &mut [PremultipliedColorU8],
+    spec: FillSpec,
+    (sw, sh, data): (u32, u32, &[u8]),
+    w: u32,
+    h: u32,
+    tint: [u8; 4],
+    premult: bool,
+) {
+    for dy in 0..h {
+        for dx in 0..w {
+            let Some((sx, sy)) = map_src(spec, sw, sh, w, h, dx, dy) else {
+                continue;
+            };
+            let si = ((sy * sw + sx) * 4) as usize;
+            px[(dy * w + dx) as usize] = compose(
+                data[si],
+                data[si + 1],
+                data[si + 2],
+                data[si + 3],
+                tint,
+                premult,
+            );
+        }
     }
 }
 
@@ -507,6 +609,7 @@ fn map_src(
         mode,
         slice,
         repeat,
+        ..
     } = spec;
     match mode {
         1 => {
@@ -917,6 +1020,7 @@ mod tests {
             mode: mode_code("nine_slice"),
             slice: [0; 4],
             repeat: [true, false],
+            scale_milli: 1000,
         };
         let stretch = FillSpec {
             repeat: [false, false],
@@ -963,6 +1067,7 @@ mod tests {
             mode: mode_code("nine_slice"),
             slice: [0; 4],
             repeat: [false, true],
+            scale_milli: 1000,
         };
         let pm = cache.fill(&uri, spec, 1, 6, [0; 4]).expect("纵向平铺");
         let col: Vec<u8> = (0..6)
@@ -982,6 +1087,7 @@ mod tests {
             mode: mode_code("nine_slice"),
             slice: [0, 2, 0, 2],
             repeat: [true, false],
+            scale_milli: 1000,
         };
         // 目标 3 < 左右切片和 4 ⇒ 整轴按比例拉伸：src = d*10/3 → 0, 3, 6
         let pm = cache.fill(&uri, spec, 3, 1, [0; 4]).expect("退化仍要出图");
@@ -998,9 +1104,197 @@ mod tests {
             // 左右切片加起来已经吃掉整张源图，中段宽度为 0。
             slice: [0, 2, 0, 2],
             repeat: [true, true],
+            scale_milli: 1000,
         };
         let pm = cache.fill(&uri, spec, 8, 1, [0; 4]).expect("退化仍要出图");
         assert_eq!(row_reds(pm, 8), vec![10, 10, 20, 20, 30, 30, 40, 40]);
+    }
+
+    fn svg_spec(mode: &str, scale_milli: u32) -> FillSpec {
+        FillSpec {
+            mode: mode_code(mode),
+            scale_milli,
+            ..FillSpec::stretch()
+        }
+    }
+
+    /// SVG `center`：单元 = 文档尺寸 × DPI，居中放进目标盒，四周透明（超出裁掉）。
+    /// 此前 SVG 分支无视 mode 一律拉伸——整张盒被涂满。
+    #[test]
+    fn svg_center_places_document_sized_unit_in_the_middle() {
+        let uri = svg_data_uri(4, 4, "#FF0000");
+        let mut cache = ImageCache::new();
+        let alpha_row = |pm: &Pixmap, y: u32| -> Vec<u8> {
+            (0..16)
+                .map(|x| pm.pixel(x, y).expect("像素").alpha())
+                .collect()
+        };
+
+        // scale 2 → 单元 8×8，居中落在 [4,12)。
+        let pm = cache
+            .fill(&uri, svg_spec("center", 2000), 16, 16, [0; 4])
+            .expect("SVG center 出图");
+        let mut want = vec![0u8; 16];
+        want[4..12].fill(255);
+        assert_eq!(alpha_row(pm, 8), want, "单元没按文档×DPI 居中");
+        assert_eq!(pm.pixel(8, 3).unwrap().alpha(), 0, "单元上方被涂");
+        assert_eq!(pm.pixel(8, 12).unwrap().alpha(), 0, "单元下方被涂");
+
+        // scale 不同单元不同：同图同盒、只差 scale，必须是另一份缓存。
+        let pm1 = cache
+            .fill(&uri, svg_spec("center", 1000), 16, 16, [0; 4])
+            .expect("SVG center 出图");
+        let mut want1 = vec![0u8; 16];
+        want1[6..10].fill(255);
+        assert_eq!(alpha_row(pm1, 8), want1, "scale 没进缓存键或没参与单元尺寸");
+
+        // 单元比盒大：居中后四周裁掉，整盒涂满。
+        let big = cache
+            .fill(&uri, svg_spec("center", 2000), 4, 4, [0; 4])
+            .expect("SVG center 出图");
+        assert_eq!(big.pixel(0, 0).unwrap().alpha(), 255);
+        assert_eq!(big.pixel(3, 3).unwrap().alpha(), 255);
+    }
+
+    /// SVG `tile`：以「文档尺寸 × DPI」为单元平铺，不随目标盒缩放。
+    #[test]
+    fn svg_tile_repeats_document_sized_unit() {
+        // 2×1：左列红、右列蓝。
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1"><rect width="1" height="1" fill="#FF0000"/><rect x="1" width="1" height="1" fill="#0000FF"/></svg>"##;
+        let uri = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(svg)
+        );
+        let mut cache = ImageCache::new();
+        // BGRA：源 R 落在 blue 通道（见 row_reds）；红 → 'r'，蓝 → 'b'。
+        let row = |pm: &Pixmap, w: u32| -> String {
+            (0..w)
+                .map(|x| {
+                    let p = pm.pixel(x, 0).expect("像素");
+                    match (p.blue(), p.red()) {
+                        (255, 0) => 'r',
+                        (0, 255) => 'b',
+                        _ => '?',
+                    }
+                })
+                .collect()
+        };
+        let pm = cache
+            .fill(&uri, svg_spec("tile", 2000), 12, 2, [0; 4])
+            .expect("SVG tile 出图");
+        assert_eq!(row(pm, 12), "rrbbrrbbrrbb", "没按 4×2 单元平铺");
+        let pm1 = cache
+            .fill(&uri, svg_spec("tile", 1000), 6, 1, [0; 4])
+            .expect("SVG tile 出图");
+        assert_eq!(row(pm1, 6), "rbrbrb");
+    }
+
+    /// 市场主题不可信：文档尺寸 × DPI 的单元可以大到分配不出来（这里 6 亿 px 宽）。
+    /// center / tile 只该栅格化目标盒里看得见的那部分——整单元栅格化在这里直接出不了图。
+    #[test]
+    fn svg_center_and_tile_never_rasterize_beyond_the_box() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300000000" height="1"><rect width="300000000" height="1" fill="#FF0000"/></svg>"##;
+        let uri = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(svg)
+        );
+        let mut cache = ImageCache::new();
+        // scale 2 → 单元 6e8×2：居中后盒内只剩中间两行。
+        let c = cache
+            .fill(&uri, svg_spec("center", 2000), 8, 8, [0; 4])
+            .expect("超大单元的 center 也要出图");
+        assert_eq!(c.pixel(0, 3).unwrap().alpha(), 255);
+        assert_eq!(c.pixel(7, 4).unwrap().alpha(), 255);
+        assert_eq!(c.pixel(4, 2).unwrap().alpha(), 0);
+        assert_eq!(c.pixel(4, 5).unwrap().alpha(), 0);
+        // tile：单元比盒宽，横向等于单元左段；纵向周期 2 行。
+        let t = cache
+            .fill(&uri, svg_spec("tile", 2000), 8, 4, [0; 4])
+            .expect("超大单元的 tile 也要出图");
+        for (x, y) in [(0, 0), (7, 1), (3, 2), (7, 3)] {
+            assert_eq!(t.pixel(x, y).unwrap().alpha(), 255, "({x},{y})");
+        }
+    }
+
+    /// 非整数文档尺寸：单元按统一比例 k 栅格化，不为凑满 ceil 后的格子而纵横各拉一份。
+    /// 4×1.5 的满铺矩形在 scale 1 下占 1.5 行：第二行只有一半覆盖（半透明），不是被拉满。
+    #[test]
+    fn svg_unit_scales_uniformly_for_fractional_document() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="1.5"><rect width="4" height="1.5" fill="#FF0000"/></svg>"##;
+        let uri = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(svg)
+        );
+        let mut cache = ImageCache::new();
+        let pm = cache
+            .fill(&uri, svg_spec("center", 1000), 4, 4, [0; 4])
+            .expect("出图");
+        let col: Vec<u8> = (0..4).map(|y| pm.pixel(1, y).unwrap().alpha()).collect();
+        assert_eq!(col[0], 0);
+        assert_eq!(col[1], 255);
+        assert!(
+            (100..=160).contains(&col[2]),
+            "半行覆盖应是半透明，实得 {col:?}（255 = 被非等比拉满）"
+        );
+        assert_eq!(col[3], 0);
+    }
+
+    /// scale 只影响 SVG 的 center / tile：位图与 SVG stretch 在不同 DPI 下是同一份缓存，
+    /// 否则每换一次 DPI 就多驻留一份一模一样的填充。
+    #[test]
+    fn scale_only_splits_cache_for_svg_center_and_tile() {
+        let png = png_data_uri(4, 4, [255, 0, 0, 255]);
+        let svg = svg_data_uri(4, 4, "#FF0000");
+        let mut cache = ImageCache::new();
+        for k in [1000, 2000] {
+            cache
+                .fill(&png, svg_spec("center", k), 8, 8, [0; 4])
+                .unwrap();
+            cache
+                .fill(&svg, svg_spec("stretch", k), 8, 8, [0; 4])
+                .unwrap();
+        }
+        assert_eq!(
+            cache.fill_stats().0,
+            2,
+            "位图 / SVG stretch 按 DPI 分裂了缓存"
+        );
+        for k in [1000, 2000] {
+            cache.fill(&svg, svg_spec("tile", k), 8, 8, [0; 4]).unwrap();
+        }
+        assert_eq!(
+            cache.fill_stats().0,
+            4,
+            "SVG tile 不同 DPI 单元不同，必须分开缓存"
+        );
+    }
+
+    /// stretch / nine_slice 维持原状：SVG 按目标尺寸整体拉伸，scale 不参与。
+    #[test]
+    fn svg_stretch_and_nine_slice_still_stretch() {
+        let uri = svg_data_uri(4, 4, "#FF0000");
+        let mut cache = ImageCache::new();
+        for mode in ["stretch", "nine_slice"] {
+            let pm = cache
+                .fill(&uri, svg_spec(mode, 2000), 16, 16, [0; 4])
+                .expect("SVG 出图");
+            assert_eq!(pm.pixel(0, 0).unwrap().alpha(), 255, "{mode}：没铺满");
+            assert_eq!(pm.pixel(15, 15).unwrap().alpha(), 255, "{mode}：没铺满");
+        }
+    }
+
+    /// tint 照常作用于 center：单元内换色，单元外仍透明。
+    #[test]
+    fn svg_center_honors_tint() {
+        let uri = svg_data_uri(4, 4, "#FF0000");
+        let mut cache = ImageCache::new();
+        let pm = cache
+            .fill(&uri, svg_spec("center", 1000), 8, 8, [0, 255, 0, 255])
+            .expect("SVG center 出图");
+        let inside = pm.pixel(4, 4).unwrap();
+        assert_eq!((inside.green(), inside.alpha()), (255, 255), "tint 没生效");
+        assert_eq!(inside.blue(), 0, "原色残留");
+        assert_eq!(pm.pixel(1, 1).unwrap().alpha(), 0, "单元外被 tint 涂上");
     }
 
     #[test]

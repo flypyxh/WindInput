@@ -248,3 +248,122 @@ fn other_front_on_top_shows_every_row_whole() {
         "首条是另一个前段时，每一行都要显示整串"
     );
 }
+
+fn seed(code: &str, text: &str) -> wind_phrase::PhraseSeed {
+    wind_phrase::PhraseSeed {
+        code: code.into(),
+        text: text.into(),
+        weight: 2000,
+        position: 0,
+        is_system: true,
+        category: String::new(),
+    }
+}
+
+/// 自造 4 码方案（开逆切分）：`oj`→井、`s`→三/所有，`ojs` 在码表里空码且无后继 ⇒ 未满码
+/// 也照切（2+1）。不依赖 `build_dev/data`。
+fn coord_xy(tag: &str) -> (Arc<Coordinator>, TempRoot) {
+    coord_xy_with(tag, "", |_| {})
+}
+
+/// `coord_xy` 的可配版：`extra_dict` 追加词条行，`tweak` 改全局配置。
+fn coord_xy_with(
+    tag: &str,
+    extra_dict: &str,
+    tweak: impl FnOnce(&mut Config),
+) -> (Arc<Coordinator>, TempRoot) {
+    let root = std::env::temp_dir().join(format!("wind_split_xy_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let schemas = root.join("data/schemas");
+    std::fs::create_dir_all(schemas.join("xy")).unwrap();
+    std::fs::write(
+        schemas.join("xy.schema.toml"),
+        "[schema]\nid = \"xy\"\nname = \"xy\"\n[engine]\ntype = \"codetable\"\n\
+         [engine.codetable]\nmax_code_length = 4\nsplit_input = true\n\
+         [[dictionaries]]\nid = \"main\"\npath = \"xy/xy.dict.yaml\"\ndefault = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        schemas.join("xy/xy.dict.yaml"),
+        format!("---\nname: xy\nversion: \"1\"\n...\n井\toj\n三\ts\n所有\ts\n{extra_dict}"),
+    )
+    .unwrap();
+    let store = Arc::new(Store::open(root.join("user_data.db")).unwrap());
+    let mut c = Config::default();
+    c.schema.available = vec!["xy".into()];
+    c.schema.active = "xy".into();
+    c.input.default.chinese_mode = true;
+    tweak(&mut c);
+    let coord =
+        Coordinator::new_headless_with_store_override(c, Some(&root.join("data")), store, None);
+    (coord, TempRoot(root))
+}
+
+/// 论坛 t307：短语码在码表里空码时，引擎照样切分——直通命令 `ojs` 旁边多出「井三/井所有」，
+/// 组合区显示切分串 `oj's`。精确码短语就是这串码的精确解，切分候选须让位。
+#[test]
+fn exact_code_phrase_suppresses_split() {
+    // ★ 前提对照：没有短语时这串码确实切分——否则下面是在一个不切的世界里断言「没切」。
+    let (bare, _d0) = coord_xy("t307_bare");
+    press(&bare, "ojs");
+    assert_eq!(bare.debug_page_texts(), vec!["井三", "井所有"]);
+    assert_eq!(bare.debug_preedit(), "oj's");
+
+    for (tag, text, shown) in [
+        ("lit", "短语甲", "短语甲"),
+        (
+            "cmd",
+            r#"$CC("[计算器]", proc.run("calc.exe"))"#,
+            "[计算器]",
+        ),
+    ] {
+        let (coord, _d) = coord_xy(&format!("t307_{tag}"));
+        coord.debug_install_phrases(vec![seed("ojs", text)]);
+        press(&coord, "ojs");
+        assert_eq!(coord.debug_page_texts(), vec![shown], "{tag}：只剩短语");
+        assert_eq!(coord.debug_preedit(), "ojs", "{tag}：组合区不得留切分串");
+    }
+
+    // 码在短语表里、但求值为空的条目不出候选（这里是非 Windows 恒空的 `{clip()}`）⇒ 它不是
+    // 这串码的解，切分照常——按「码在不在表里」判的话候选窗会全空。
+    let (empty, _d2) = coord_xy("t307_empty");
+    empty.debug_install_phrases(vec![seed("ojs", "{clip()}")]);
+    press(&empty, "ojs");
+    assert_eq!(empty.debug_page_texts(), vec!["井三", "井所有"]);
+}
+
+/// 同上，满码长（主场）那一格：五笔 `aaab` 空码会切成「式节/式蒸…」。
+#[test]
+fn exact_code_phrase_suppresses_split_at_full_length() {
+    if !has_data() {
+        eprintln!("跳过：缺 build_dev 词库");
+        return;
+    }
+    let (coord, _store, _dir) = coord_with("t307_full", "");
+    coord.debug_install_phrases(vec![seed(INPUT, "短语甲")]);
+    press(&coord, INPUT);
+    assert_eq!(coord.debug_page_texts(), vec!["短语甲"]);
+}
+
+/// 论坛 t302：精确匹配 + 空码补全 + 逆切分，满码长 `ojss` 空码、但码表收了超码长的 `ojssa`。
+/// 期望：不切分，空码补全给出后续编码那一条。修复前两处都错——切成「井三三…」，且补全的
+/// `< max_code_length` 闸门在满码长处不放行。
+#[test]
+fn full_length_empty_code_with_longer_entry_shows_completion_not_split() {
+    let exact = |c: &mut Config| {
+        c.schema.codetable.single_code_input = true;
+        c.schema.codetable.single_code_complete = true;
+    };
+    let (coord, _d) = coord_xy_with("t302", "后续\tojssa\n", exact);
+    press(&coord, "ojss");
+    assert_eq!(coord.debug_page_texts(), vec!["后续"]);
+
+    // ★ 反向对照：没有超码长词条时同一串照切——证明拦下切分的是后继。
+    let (bare, _d0) = coord_xy_with("t302_bare", "", exact);
+    press(&bare, "ojss");
+    assert!(
+        bare.debug_page_texts().iter().all(|t| t.starts_with('井')),
+        "无后继时应切分，实际 {:?}",
+        bare.debug_page_texts()
+    );
+}

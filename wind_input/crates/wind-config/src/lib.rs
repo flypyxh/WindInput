@@ -16,6 +16,7 @@ pub(crate) mod compat_overlay;
 pub mod compat_schema;
 pub mod config;
 pub mod config_schema;
+pub mod custom_settings;
 pub mod dir_var;
 pub mod font_name;
 pub mod hotkey;
@@ -43,6 +44,7 @@ pub use config::{
     TOOLBAR_ITEM_KEYS, TOOLBAR_LABEL_MAX_WIDTH, TextOrientation, ToolbarButtonSpec, TopCommitMode,
     sanitize_dota2_alias, toolbar_label_trunc,
 };
+pub use custom_settings::{SETTINGS_FEATURES, SettingsHide, SettingsSelector};
 pub use dir_var::{dir_var, dir_var_help, dir_var_names, dir_var_str, is_dir_var};
 pub use runtime_state::RuntimeState;
 pub use schema::{

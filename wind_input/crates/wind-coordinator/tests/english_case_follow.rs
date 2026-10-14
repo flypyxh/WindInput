@@ -271,29 +271,68 @@ fn freq_records_dict_original_not_projected_text() {
     let coord =
         Coordinator::new_headless_with_store(cfg, Some(&data_dir()), std::sync::Arc::clone(&store));
 
+    // 取 hibernation 而不是 hibernate：后者在 en_ext 里另有专名 `Hibernate`，投影后同名时
+    // 留下的是那条没被改写的专名（`dedup_by_text`，论坛 t281 审查），选中的就不是投影候选了。
     type_word_cased(&coord, "Hi");
     let page = coord.debug_page_texts();
     let shown = page
         .iter()
-        .find(|t| t.as_str() == "Hibernate")
-        .expect("应有投影后的 Hibernate");
+        .find(|t| t.as_str() == "Hibernation")
+        .unwrap_or_else(|| panic!("应有投影后的 Hibernation：{page:?}"));
     let idx = page.iter().position(|t| t == shown).expect("上面刚找到");
     // 数字键选中它（页内第 idx+1 条）。
     coord.handle_key_event(&key(b'1' as u32 + idx as u32, 0));
 
     assert!(
         store
-            .get_freq("english", "hibernate", "hibernate")
+            .get_freq("english", "hibernation", "hibernation")
             .unwrap()
             .is_some(),
-        "词频应按词库原文 hibernate 记账"
+        "词频应按词库原文 hibernation 记账"
     );
+    assert!(
+        store
+            .get_freq("english", "hibernation", "Hibernation")
+            .unwrap()
+            .is_none(),
+        "不得按屏幕上的投影形态记账——那样读端永远查不中"
+    );
+}
+
+/// 词库同时有 `hibernate` 与专名 `Hibernate`（en_ext）：输入 `Hi` 时前者投影成 `Hibernate`，
+/// 与后者同名。留下的必须是没被改写的专名（论坛 t281 审查）——选中它，词频记在专名上。
+#[test]
+fn projected_twin_yields_to_real_capitalized_word() {
+    if !has_english_schema() {
+        eprintln!("跳过：缺少英文方案或词库");
+        return;
+    }
+    let mut cfg = english_config();
+    cfg.schema.english.frequency.enabled = true;
+    let store = store_at("freq_twin");
+    let coord =
+        Coordinator::new_headless_with_store(cfg, Some(&data_dir()), std::sync::Arc::clone(&store));
+    type_word_cased(&coord, "Hi");
+    let page = coord.debug_page_texts();
+    let idx = page
+        .iter()
+        .position(|t| t == "Hibernate")
+        .unwrap_or_else(|| panic!("应有 Hibernate：{page:?}"));
+    assert_eq!(page.iter().filter(|t| *t == "Hibernate").count(), 1);
+    coord.handle_key_event(&key(b'1' as u32 + idx as u32, 0));
     assert!(
         store
             .get_freq("english", "hibernate", "Hibernate")
             .unwrap()
+            .is_some(),
+        "选中的是专名 Hibernate"
+    );
+    assert!(
+        store
+            .get_freq("english", "hibernate", "hibernate")
+            .unwrap()
             .is_none(),
-        "不得按屏幕上的投影形态记账——那样读端永远查不中"
+        "不是投影出来的小写词"
     );
 }
 

@@ -195,6 +195,7 @@ private:
 
     std::vector<CandidateHitRect> rects_;
     int32_t hover_ = -1; // 最近报给服务端的悬停
+    ClickGate click_;    // 左键点选：按下记命中，松开同一项才选
     int32_t pendingHover_ = -1;
     std::unique_ptr<fcitx::EventSourceTime> hoverDefer_; // 延后报的悬停变化
     std::unique_ptr<fcitx::EventSourceTime> tipLeave_;   // 离开悬停提示后的宽限

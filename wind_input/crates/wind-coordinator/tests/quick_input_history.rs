@@ -562,7 +562,7 @@ fn right_click_deletes_a_history_entry() {
     let labels: Vec<&str> = items
         .iter()
         .map(|i| i.label.as_str())
-        .filter(|l| !l.is_empty() && *l != "更多…")
+        .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(labels, ["删除此历史", "复制"]);
 

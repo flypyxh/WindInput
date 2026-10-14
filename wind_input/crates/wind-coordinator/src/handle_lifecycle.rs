@@ -109,6 +109,8 @@ impl Coordinator {
     /// Shift+字母进临时英文、以及 `z_key_action` 的三重身份裁决（后者本就自带
     /// `has_code_prefix("z")` 判据处理码元冲突，不需要也不能被本函数接管）。
     ///
+    /// 符号通配键的首位仲裁**不在这里**，见 [`Self::wildcard_takes_lead_key`]。
+    ///
     /// ★★ 五c 之后**只对全局层绑定生效**（`bound_key_decision` 按来源分流）：这是
     /// **跨层**仲裁——全局配置无从知道某个方案把这个符号当码元用了。方案级 `[key_actions]`
     /// 与同方案的 `leading_chars` 是同层冲突，显式绑定优先，见 §4.3。
@@ -121,6 +123,17 @@ impl Coordinator {
         }
         self.engine_mgr
             .active_is_leading_char(ch.to_ascii_lowercase())
+    }
+
+    /// 空缓冲下这个键是否归**符号通配键**（论坛 t302）：是则全局层绑定（出厂反引号 = 临拼
+    /// 触发）让位，键落普通输入、由 `try_code_char_gate` 收作通配。方案级显式绑定仍优先
+    /// （判据内含，见 `wildcard_symbol_takes_lead`）。
+    ///
+    /// ⚠️ **只能在空缓冲的调用点问**，不能并进 [`Self::code_char_takes_lead`]：后者也被组码中
+    /// 「顶字 + 进模式」那条路调用，而满码后通配键按字面（`wildcard_past_full`）不进缓冲——
+    /// 那里再让位，引导键与通配两头落空，键被白吞（审查实测 `aaaa` + 反引号）。
+    pub(crate) fn wildcard_takes_lead_key(&self, key_code: u32) -> bool {
+        punct_char(key_code, false).is_some_and(|ch| self.wildcard_symbol_takes_lead(ch))
     }
 
     /// 空缓冲模式激活的单一入口。命中返回激活 KeyAction，都不命中返回 None（落普通输入）。
@@ -306,6 +319,13 @@ impl Coordinator {
         // 命中即执行并跳过下方全局引导键链；显式 `none` 则两边都不走（return None 落普通
         // 输入）；未声明的键才落全局链——这是「未配置者行为逐字节不变」的保证。
         if state.input_buffer.is_empty() && data.modifiers & (MOD_SHORTCUT | MOD_SHIFT) == 0 {
+            if self.wildcard_takes_lead_key(data.key_code) {
+                debug!(
+                    "key_action: vk=0x{:02X} 让位 —— 符号通配键作首码",
+                    data.key_code
+                );
+                return None;
+            }
             match self.bound_key_decision(data.key_code) {
                 BoundKeyDecision::Act(action) => {
                     if let Some(act) = self.enter_bound_action(state, &action, data.key_code) {
@@ -1047,6 +1067,10 @@ impl Coordinator {
         data: &KeyEventData,
     ) -> Option<BoundAction> {
         if !state.input_buffer.is_empty() || data.modifiers & (MOD_SHORTCUT | MOD_SHIFT) != 0 {
+            return None;
+        }
+        // 与 `try_activate_mode` 同一道首位仲裁：符号通配键让全局绑定让位。
+        if self.wildcard_takes_lead_key(data.key_code) {
             return None;
         }
         let BoundKeyDecision::Act(action) = self.bound_key_decision(data.key_code) else {

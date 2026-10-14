@@ -240,12 +240,14 @@ pub struct ViewImage {
     /// None=铺满节点（mode 作用于整个节点盒）；Some=按定位摆成一块，mode 作用于这块，
     /// 超出节点圆角盒的部分裁掉。
     pub place: Option<ImagePlace>,
+    /// DPI 缩放：SVG 的 center / tile 以「文档尺寸 × scale」为单元（位图按纹理像素，不用它）。
+    pub scale: f32,
 }
 
 /// 图片在 host 内的定位：九宫锚点 + 偏移 + 目标尺寸。背景图与覆盖图共用。
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ImagePlace {
-    /// top-left | top | … | center | … | bottom-right；空=top-left。
+    /// top-left | top | … | center | … | bottom-right；空=居中（见 [`anchor_pos`]）。
     pub anchor: String,
     /// dp 偏移（已 ×scale，px）。
     pub off_x: f32,
@@ -253,14 +255,46 @@ pub struct ImagePlace {
     /// 百分比偏移（相对 host 宽/高；paint 期换算）。与 dp 偏移叠加。
     pub off_x_pct: f32,
     pub off_y_pct: f32,
-    /// 目标尺寸 px；≤0 的那一维取原图尺寸（两维各自独立，与主题编辑器预览同口径）。
+    /// 目标尺寸 px（已 ×scale）；≤0 = 未给，规则见 [`ImagePlace::rect`]。
     pub w: f32,
     pub h: f32,
+    /// DPI 缩放：两维都没给 size 时，原图尺寸要乘它（SVG 为文档尺寸）。
+    pub scale: f32,
 }
+
+impl Default for ImagePlace {
+    fn default() -> Self {
+        Self {
+            anchor: String::new(),
+            off_x: 0.0,
+            off_y: 0.0,
+            off_x_pct: 0.0,
+            off_y_pct: 0.0,
+            w: 0.0,
+            h: 0.0,
+            scale: 1.0,
+        }
+    }
+}
+
+/// 定位图（背景图定位块 / 覆盖图）单边像素上限。
+///
+/// 尺寸来自主题（市场主题不可信）：只给一维按原图比例推算、或不给尺寸取原图 × DPI，都能
+/// 推出天文数字（1×100000 的图写 w=20 → h=2,000,000），而填充位图按这个尺寸整块分配。
+/// 定位图最终都裁到宿主内，宿主是候选窗 / 弹窗这一级（远小于此），截掉的部分本就看不见。
+/// 4096：200% 屏上 2048dp 的合法大图仍原样保留；单张最坏 4096² × 4B = 64 MiB，有界。
+/// 两维各自截（不保比例）——只有病态主题会碰到它，此时保住内存比保住比例要紧。
+const MAX_PLACED_EDGE: f32 = 4096.0;
 
 impl ImagePlace {
     /// host 内的目标矩形 `(x, y, w, h)`（已取整）：anchor 九宫基位 + offset（dp px + 百分比
-    /// 相对 host 宽/高）。`src` 取原图尺寸，只在有一维没给 size 时才调用（免得白解码）。
+    /// 相对 host 宽/高）。`src` 取原图尺寸（SVG 为文档尺寸），只在有一维没给 size 时才调用
+    /// （免得白解码）。尺寸规则（位图与 SVG 同口径）：
+    /// - 两维都给：按给的来；
+    /// - 只给一维：另一维 = 给定维 × 原图对应宽高比；
+    /// - 都不给：原图尺寸 × `scale`（DPI）。
+    ///
+    /// 结果两维各截到 [`MAX_PLACED_EDGE`]（防病态主题撑爆填充位图）。
     fn rect(
         &self,
         host: Rect,
@@ -270,12 +304,17 @@ impl ImagePlace {
             (self.w, self.h)
         } else {
             let (sw, sh) = src()?;
-            (
-                if self.w > 0.0 { self.w } else { sw as f32 },
-                if self.h > 0.0 { self.h } else { sh as f32 },
-            )
+            let (sw, sh) = (sw.max(1) as f32, sh.max(1) as f32);
+            if self.w > 0.0 {
+                (self.w, self.w * sh / sw)
+            } else if self.h > 0.0 {
+                (self.h * sw / sh, self.h)
+            } else {
+                (sw * self.scale, sh * self.scale)
+            }
         };
-        let (w, h) = (w.round().max(1.0), h.round().max(1.0));
+        let cap = |v: f32| v.round().clamp(1.0, MAX_PLACED_EDGE);
+        let (w, h) = (cap(w), cap(h));
         let (ax, ay) = anchor_pos(&self.anchor, host, w, h);
         let x = (ax + self.off_x + self.off_x_pct / 100.0 * host.w).round();
         let y = (ay + self.off_y + self.off_y_pct / 100.0 * host.h).round();
@@ -290,6 +329,9 @@ pub struct ViewLayer {
     pub z: i32,
     pub place: ImagePlace,
     pub opacity: f32,
+    /// 单色染色，语义同背景图 [`ViewImage::tint`]（alpha 蒙版）；`[0,0,0,0]`=原样。
+    /// 图层不支持 disabled_tint。
+    pub tint: [u8; 4],
 }
 
 /// 背景渐变（叠在底色之上、背景图之下，裁到圆角内）。
@@ -1631,10 +1673,11 @@ fn fill_spec_of(img: &ViewImage) -> crate::image_cache::FillSpec {
             px(img.slice[3]),
         ],
         repeat: img.slice_repeat,
+        scale_milli: (img.scale * 1000.0).round().max(1.0) as u32,
     }
 }
 
-/// 绘制 z 层覆盖图：按 place 定位（见 [`ImagePlace::rect`]）置于 host 内，stretch 到目标尺寸 + opacity；
+/// 绘制 z 层覆盖图：按 place 定位（见 [`ImagePlace::rect`]）置于 host 内，stretch 到目标尺寸 + tint + opacity；
 /// 超出 host 矩形（不带圆角）的部分裁掉，内容上下两层同一口径——对齐编辑器预览 `paintLayers`。
 fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewLayer) {
     let (x, y, rw, rh) = snap_to_pixels(host.x, host.y, host.w, host.h);
@@ -1649,7 +1692,7 @@ fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewL
             crate::image_cache::FillSpec::stretch(),
             lw as u32,
             lh as u32,
-            [0, 0, 0, 0],
+            layer.tint,
         ) else {
             return;
         };
@@ -2322,9 +2365,14 @@ mod fill_spec_tests {
             opacity: 1.0,
             tint: None,
             place: None,
+            scale: 1.5,
         };
 
         let spec = fill_spec_of(&img);
+        assert_eq!(
+            spec.scale_milli, 1500,
+            "DPI 没传到光栅化（SVG center/tile 单元）"
+        );
 
         assert_eq!(spec.mode, crate::image_cache::mode_code("nine_slice"));
         // 切片取整到源图纹理像素；负值夹到 0（主题写反了不该变成天文数字）。
@@ -2343,6 +2391,7 @@ mod fill_spec_tests {
             opacity: 1.0,
             tint: None,
             place: None,
+            scale: 1.0,
         };
         assert_eq!(fill_spec_of(&img), crate::image_cache::FillSpec::stretch());
     }
@@ -3417,6 +3466,7 @@ mod paint_order_tests {
                 opacity: 1.0,
                 tint: None,
                 place: None,
+                scale: 1.0,
             });
         v.layout(0.0, 0.0, &tr);
         let (w, h) = (20usize, 20usize);
@@ -3481,6 +3531,7 @@ mod bg_place_tests {
             opacity: 1.0,
             tint: None,
             place,
+            scale: 1.0,
         }
     }
 
@@ -3588,9 +3639,156 @@ mod bg_place_tests {
         assert_eq!(rgb(&buf, 40, 36, 15), WHITE);
     }
 
-    /// 只给一维 size：另一维取原图尺寸（编辑器预览对背景图与覆盖图同此口径）。
+    /// 尺寸规则的纯几何：只给一维 → 另一维按原图宽高比推算；两维都不给 → 原图 × DPI。
+    /// 两维都给时按给的来，不看原图（`src` 不该被调用——位图白解码一次不便宜）。
     #[test]
-    fn single_axis_size_takes_other_axis_from_source() {
+    fn rect_size_rules() {
+        let host = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let size = |p: ImagePlace, src: (u32, u32)| {
+            let (_, _, w, h) = p.rect(host, || Some(src)).expect("有原图尺寸就该出矩形");
+            (w, h)
+        };
+        let tl = place("top-left");
+
+        // 只给 w：h = w × src_h / src_w。
+        let only_w = ImagePlace {
+            w: 20.0,
+            ..tl.clone()
+        };
+        assert_eq!(
+            size(only_w, (10, 6)),
+            (20.0, 12.0),
+            "只给 w 时 h 没按原图比例"
+        );
+        // 只给 h：w = h × src_w / src_h。
+        let only_h = ImagePlace {
+            h: 12.0,
+            ..tl.clone()
+        };
+        assert_eq!(
+            size(only_h, (10, 6)),
+            (20.0, 12.0),
+            "只给 h 时 w 没按原图比例"
+        );
+        // 都不给：原图 × scale。
+        let none = ImagePlace {
+            scale: 2.0,
+            ..tl.clone()
+        };
+        assert_eq!(size(none, (6, 4)), (12.0, 8.0), "缺省尺寸没乘 DPI");
+        // 都给：不问原图。
+        let both = ImagePlace {
+            w: 7.0,
+            h: 9.0,
+            scale: 2.0,
+            ..tl.clone()
+        };
+        let (_, _, w, h) = both
+            .rect(host, || panic!("两维都给了还去取原图尺寸"))
+            .unwrap();
+        assert_eq!((w, h), (7.0, 9.0));
+        // 只给一维时 scale 不再叠乘（给定维已 ×scale，比例无量纲）。
+        let only_w_hidpi = ImagePlace {
+            w: 40.0,
+            scale: 2.0,
+            ..tl
+        };
+        assert_eq!(size(only_w_hidpi, (10, 6)), (40.0, 24.0));
+    }
+
+    /// 推算 / 缺省尺寸有上限（[`MAX_PLACED_EDGE`]）：市场主题给个 1×100000 的图再写 w=20，
+    /// 按比例推出 h=2,000,000，填充位图就是几 GB。双向钉：超了必须截，没超一点不能动。
+    #[test]
+    fn rect_size_is_capped() {
+        let host = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let size = |p: ImagePlace, src: (u32, u32)| {
+            let (_, _, w, h) = p.rect(host, || Some(src)).unwrap();
+            (w, h)
+        };
+        let tl = place("top-left");
+        let only_w = ImagePlace {
+            w: 20.0,
+            ..tl.clone()
+        };
+        assert_eq!(size(only_w.clone(), (1, 100_000)), (20.0, MAX_PLACED_EDGE));
+        let hidpi = ImagePlace {
+            scale: 2.0,
+            ..tl.clone()
+        };
+        assert_eq!(size(hidpi, (100_000, 1)), (MAX_PLACED_EDGE, 2.0));
+        let both = ImagePlace {
+            w: 99_999.0,
+            h: 3.0,
+            ..tl
+        };
+        assert_eq!(size(both, (1, 1)), (MAX_PLACED_EDGE, 3.0));
+        // 反向：贴着上限以下的合法大图原样保留。
+        assert_eq!(size(only_w, (1, 204)), (20.0, 4080.0));
+    }
+
+    /// 定位背景图（place=Some）+ SVG center：单元（文档尺寸）居中于定位块内，块内其余透明。
+    #[test]
+    fn positioned_svg_bg_image_centers_unit_in_its_block() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#FF0000"/></svg>"##;
+        let uri = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(svg)
+        );
+        let p = ImagePlace {
+            off_x: 2.0,
+            off_y: 2.0,
+            w: 12.0,
+            h: 12.0,
+            ..place("top-left")
+        };
+        let img = ViewImage {
+            mode: "center".to_string(),
+            ..image(uri, Some(p))
+        };
+        let buf = paint(node().bg_image(img), 20.0, 20.0, 20, 20);
+        // 定位块 [2,14)，单元 4×4 居中 → [6,10)。
+        assert_eq!(rgb(&buf, 20, 6, 6), [255, 0, 0]);
+        assert_eq!(rgb(&buf, 20, 9, 9), [255, 0, 0]);
+        assert_eq!(rgb(&buf, 20, 5, 7), WHITE, "单元被拉伸到整块");
+        assert_eq!(rgb(&buf, 20, 10, 7), WHITE, "单元被拉伸到整块");
+        assert_eq!(rgb(&buf, 20, 7, 2), WHITE);
+    }
+
+    /// SVG 与位图同口径：原图尺寸取 SVG 文档尺寸，只给一维按文档宽高比推算。
+    #[test]
+    fn svg_layer_single_axis_keeps_document_aspect() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><rect width="10" height="6" fill="#FF0000"/></svg>"##;
+        let uri = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(svg)
+        );
+        let p = ImagePlace {
+            w: 20.0,
+            ..place("top-left")
+        };
+        let buf = paint(node().layers(vec![layer(uri, 1, p)]), 40.0, 20.0, 40, 20);
+        assert_eq!(
+            rgb(&buf, 40, 19, 11),
+            [255, 0, 0],
+            "SVG 高没按文档比例推到 12"
+        );
+        assert_eq!(rgb(&buf, 40, 5, 12), WHITE, "SVG 高超出 12");
+        assert_eq!(rgb(&buf, 40, 20, 3), WHITE, "SVG 宽超出 size.w");
+    }
+
+    /// 只给一维 size：另一维按原图宽高比推算（背景图与覆盖图同此口径）。
+    #[test]
+    fn single_axis_size_keeps_source_aspect() {
         let p = ImagePlace {
             w: 20.0,
             ..place("top-left")
@@ -3608,6 +3806,7 @@ mod bg_place_tests {
                 z: 1,
                 place: p,
                 opacity: 1.0,
+                tint: [0, 0, 0, 0],
             }]),
             40.0,
             20.0,
@@ -3617,7 +3816,13 @@ mod bg_place_tests {
         for (name, buf) in [("背景图", &bg), ("覆盖图", &layer)] {
             assert_eq!(rgb(buf, 40, 19, 5), [255, 0, 0], "{name}：宽没取 size.w");
             assert_eq!(rgb(buf, 40, 20, 3), WHITE, "{name}：宽超出 size.w");
-            assert_eq!(rgb(buf, 40, 5, 6), WHITE, "{name}：高没取原图 6px");
+            // 原图 10×6、w=20 → h=12。
+            assert_eq!(
+                rgb(buf, 40, 5, 11),
+                [255, 0, 0],
+                "{name}：高没按比例推到 12"
+            );
+            assert_eq!(rgb(buf, 40, 5, 12), WHITE, "{name}：高超出 12");
         }
     }
 
@@ -3649,7 +3854,35 @@ mod bg_place_tests {
             z,
             place,
             opacity: 1.0,
+            tint: [0, 0, 0, 0],
         }
+    }
+
+    /// 图层 tint：语义同背景图（把图当 alpha 蒙版、RGB 换成 tint 色），此前 `paint_layer`
+    /// 写死 `[0,0,0,0]`，主题里给图层配的 tint 一声不响地被丢掉。
+    #[test]
+    fn layer_tint_recolors_like_bg_image() {
+        let p = ImagePlace {
+            w: 10.0,
+            h: 10.0,
+            ..place("top-left")
+        };
+        let tinted = ViewLayer {
+            tint: [0, 0, 255, 255],
+            ..layer(png_uri(RED, 10, 10), 1, p.clone())
+        };
+        let buf = paint(node().layers(vec![tinted]), 20.0, 20.0, 20, 20);
+        assert_eq!(rgb(&buf, 20, 5, 5), [0, 0, 255], "图层 tint 没生效");
+        assert_eq!(rgb(&buf, 20, 15, 15), WHITE, "图层外被涂");
+        // 反向对照：未配 tint 原样出图。
+        let plain = paint(
+            node().layers(vec![layer(png_uri(RED, 10, 10), 1, p)]),
+            20.0,
+            20.0,
+            20,
+            20,
+        );
+        assert_eq!(rgb(&plain, 20, 5, 5), [255, 0, 0]);
     }
 
     /// 覆盖图超出节点的部分裁掉，裁到节点**矩形**（不带圆角）——对齐编辑器预览

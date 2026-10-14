@@ -190,7 +190,7 @@ pub struct CommitOptions {
     pub show_code_hint: bool,
     /// 精确匹配模式（关闭前缀匹配，对齐 Go SingleCodeInput）。
     pub single_code_input: bool,
-    /// 精确匹配空码补全：精确无候选且未满码时，从更长编码取首选（对齐 Go SingleCodeComplete）。
+    /// 精确匹配空码补全：精确无候选且不超码长时，从更长编码取首选（对齐 Go SingleCodeComplete）。
     pub single_code_complete: bool,
     /// 基础排序维度（weight 降序 / natural 出现序）。见 [`BaseSort`]。
     pub base_sort: BaseSort,
@@ -494,9 +494,16 @@ impl CodeTableEngine {
         if !self.opts.split_trigger.allows(candidates) {
             return none;
         }
-        // 未满码时才问后继：满码长那一格是主场，不必问。放在空度判据**之后**，
-        // 让绝大多数按键根本走不到这次索引查询。
-        if len < self.max_code_length && self.has_longer_code(input) {
+        // 问后继放在空度判据**之后**，让绝大多数按键根本走不到这次索引查询。
+        //
+        // 未满码时恒问。满码长那一格**默认档也要问**（论坛 t302）：前缀匹配下有更长后继
+        // 必然带出前缀候选，上面的空度判据早已拦下，这一问只对**精确匹配模式**
+        // （`single_code_input`，前缀枚举被关）有效——那里「列表空」不等于「空码」，码表收了
+        // 超码长的词条时满码长照样有后续可打（小鹤音形实测），切了就抢掉了「空码提示后续
+        // 编码」那一格。`no_exact` 档不问：它的定义就是「有前缀/后续也切」。
+        let ask_longer =
+            len < self.max_code_length || self.opts.split_trigger == SplitTrigger::Empty;
+        if ask_longer && self.has_longer_code(input) {
             return none;
         }
         let split_at = SPLIT_FRONT_LEN;
@@ -901,7 +908,9 @@ impl Engine for CodeTableEngine {
             }
         } else if self.opts.single_code_complete
             && candidates.is_empty()
-            && input.chars().count() < self.max_code_length
+            // `<=` 而非 `<`（论坛 t302）：码表可以收超码长的词条（小鹤音形实测），满码长空码时
+            // 照样有后续编码可提示。超码长那一段归顶码 / 整句，仍不碰。
+            && input.chars().count() <= self.max_code_length
         {
             // 空码补全：从更长编码备一小池候选作提示。
             // limit=8：够协调器过滤后仍有得选，又避免全量前缀扫描开销。
@@ -1526,6 +1535,30 @@ mod tests {
         assert!(!r.should_commit, "补全候选不应触发自动上屏");
     }
 
+    /// 论坛 t302：满码长空码、码表另有超码长词条 ⇒ 照样备补全（曾被 `< max_code_length` 截断）。
+    /// 同开逆切分时，切分须让位给这条后续（见 `decode_split` 的后继判据）。
+    #[test]
+    fn single_code_complete_fills_at_full_length() {
+        for split_input in [false, true] {
+            let e = engine_opts(
+                &[("abcde", "你", 100), ("ab", "甲", 90), ("cd", "乙", 90)],
+                CommitOptions {
+                    single_code_input: true,
+                    single_code_complete: true,
+                    split_input,
+                    ..Default::default()
+                },
+            );
+            let r = e.convert("abcd", 50).unwrap();
+            assert!(r.candidates.is_empty(), "split={split_input}：不得切分");
+            assert_eq!(
+                r.completion_hints.first().map(|c| c.text.as_str()),
+                Some("你"),
+                "split={split_input}：满码长空码应备超码长后续"
+            );
+        }
+    }
+
     #[test]
     fn single_code_complete_hint_absent_without_longer_code() {
         // 无 "ab" 精确项、也无更长后继 → 无货可备。
@@ -2079,6 +2112,34 @@ mod tests {
             !r.candidates.iter().any(|c| c.is_split_composed),
             "三码有更长后继时不得切分，实际: {:?}",
             texts(&r)
+        );
+    }
+
+    /// ★ 论坛 t302：**精确匹配模式**下满码长空码、但码表收了更长编码 ⇒ 默认档不切。
+    ///
+    /// 前缀匹配下这串会带出前缀候选、空度判据就拦了；精确模式关掉前缀枚举后列表是空的，
+    /// 只剩后继查询能认出「还没到头」。反向对照：同一串去掉更长条目就照切——证明拦下它的
+    /// 是后继而不是精确模式本身。
+    #[test]
+    fn split_full_length_yields_to_longer_code_in_exact_mode() {
+        let exact = || CommitOptions {
+            single_code_input: true,
+            ..split_opts()
+        };
+        let e = split_engine(&[PREFIX_ONLY_ENTRY], exact());
+        let r = e.convert("hfkn", 50).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.is_split_composed),
+            "满码长有更长后继（hfknq）时不得切分，实际: {:?}",
+            texts(&r)
+        );
+        assert!(r.preedit_codetable.is_empty(), "没切就不得留切分串");
+
+        let control = split_engine(&[], exact());
+        assert_eq!(
+            texts(&control.convert("hfkn", 50).unwrap()),
+            vec!["很可能", "很可难"],
+            "★ 反向对照：无更长后继时精确模式照切"
         );
     }
 

@@ -1027,3 +1027,105 @@ fn empty_freq_text_still_records_commit_history() {
         Some("命令文本")
     );
 }
+
+// ── `record_always`：只记次数、不调序（论坛 t278）──────────────────────────────
+
+/// 单码表方案 `ct_test` 的 Coordinator；`schema_freq` 写进方案文件的 `[engine.codetable.frequency]`。
+fn record_always_coord(
+    tag: &str,
+    tweak: impl FnOnce(&mut Config),
+    schema_freq: &str,
+) -> (Arc<Coordinator>, Arc<Store>) {
+    let base_dir = std::env::temp_dir().join(format!("wind_record_always_{tag}"));
+    let schemas = base_dir.join("schemas");
+    let _ = std::fs::remove_dir_all(&base_dir);
+    std::fs::create_dir_all(&schemas).unwrap();
+    std::fs::write(
+        schemas.join("ct_test.schema.toml"),
+        format!(
+            "[schema]\nid = \"ct_test\"\n[engine]\ntype = \"codetable\"\n\
+             [engine.codetable.frequency]\n{schema_freq}\n"
+        ),
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.schema.active = "ct_test".into();
+    cfg.schema.available = vec!["ct_test".into()];
+    // 两个开关一律显式设：`Config::default()` 不读 data/config.toml。
+    cfg.schema.codetable.frequency.enabled = false;
+    cfg.schema.codetable.frequency.record_always = false;
+    tweak(&mut cfg);
+    let db_path = std::env::temp_dir().join(format!("wind_record_always_{tag}.redb"));
+    let _ = std::fs::remove_file(&db_path);
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    let c = Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+    (c, store)
+}
+
+/// ★ 调频关 + `record_always` 开 ⇒ 写端照常记账。
+///
+/// 读端「不重排」要拿真实词库比候选页才测得出，见 `tests/freq_record_always.rs`。
+#[test]
+fn record_always_records_while_freq_disabled() {
+    let (c, store) = record_always_coord(
+        "on",
+        |cfg| cfg.schema.codetable.frequency.record_always = true,
+        "",
+    );
+    c.record_selection("aaaa", "工", CandidateSource::CodeTable);
+    c.record_selection("aaaa", "工", CandidateSource::CodeTable);
+    assert_eq!(
+        store
+            .get_freq("ct_test", "aaaa", "工")
+            .unwrap()
+            .map(|r| r.count),
+        Some(2),
+        "只记次数开着时应照常累计"
+    );
+}
+
+/// 反向对照：两个开关都关 ⇒ 不记。缺了它，「无条件记账」的实现会让上一条假绿。
+#[test]
+fn record_always_off_keeps_disabled_freq_silent() {
+    let (c, store) = record_always_coord("off", |_| {}, "");
+    c.record_selection("aaaa", "工", CandidateSource::CodeTable);
+    assert!(store.get_freq("ct_test", "aaaa", "工").unwrap().is_none());
+}
+
+/// 方案级覆盖：全局关，方案文件 `[engine.codetable.frequency] record_always = true` ⇒ 记。
+///
+/// 锁的是 `resolved()` 的折叠——只加了全局字段、漏了方案级那一行时这里红。
+#[test]
+fn record_always_honors_schema_override() {
+    let (c, store) = record_always_coord("schema", |_| {}, "record_always = true");
+    c.record_selection("aaaa", "工", CandidateSource::CodeTable);
+    assert!(
+        store.get_freq("ct_test", "aaaa", "工").unwrap().is_some(),
+        "方案文件里开的 record_always 应生效"
+    );
+}
+
+/// 拼音档同样认 `record_always`（三个引擎各有一份开关）。
+#[test]
+fn pinyin_record_always_records() {
+    let base_dir = std::env::temp_dir().join("wind_record_always_py");
+    let schemas = base_dir.join("schemas");
+    let _ = std::fs::remove_dir_all(&base_dir);
+    std::fs::create_dir_all(&schemas).unwrap();
+    std::fs::write(
+        schemas.join("py_test.schema.toml"),
+        "[schema]\nid = \"py_test\"\n[engine]\ntype = \"pinyin\"\n",
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.schema.active = "py_test".into();
+    cfg.schema.available = vec!["py_test".into()];
+    cfg.schema.pinyin.frequency.enabled = false;
+    cfg.schema.pinyin.frequency.record_always = true;
+    let db_path = std::env::temp_dir().join("wind_record_always_py.redb");
+    let _ = std::fs::remove_file(&db_path);
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    let c = Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+    c.record_selection("nihao", "你好", CandidateSource::Pinyin);
+    assert!(store.get_freq("pinyin", "nihao", "你好").unwrap().is_some());
+}

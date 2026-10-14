@@ -1,4 +1,5 @@
-// Wayland 候选窗：把服务光栅化好的 BGRA 帧贴到 input-method-v2 的 popup surface 上。
+// Wayland 候选窗：把服务光栅化好的 BGRA 帧贴到由合成器按文本光标摆位的 surface 上——
+// input-method-v2 的 popup surface（treeland 等），或 input-method-v1 的 overlay 面板（KWin）。
 //
 // X11 路径（X11Panel）靠 `cursorRect()` 是屏幕坐标这一条自己摆窗口；Wayland 客户端报的却是
 // 窗口相对坐标，应用的屏幕位置只有合成器知道。popup surface 正是为此设计的：把 wl_surface 交给
@@ -9,11 +10,17 @@
 // 默认队列上，事件由 Fcitx5 的事件读取线程 / 主线程分发，本类不另起 IO。
 // 输入法对象：由 waylandim 前端持有（一个座位只能有一个输入法绑定），经 addon 函数
 // `getInputMethodV2(ic)` 取得——它返回 Fcitx5 私有包装类，C 层指针见 `rawProxyOf`。
+// v1 不需要输入法对象：`zwp_input_panel_v1` 全局直接从本类的 registry 绑（KWin 只把它发给自己
+// 拉起的输入法连接，即 Fcitx5 的默认连接）。v1 的面板角色没有 destroy 请求、KWin 又全局只认
+// 一个面板，故每个显示周期换新 surface，旧的经 RetiredSurfaces 延迟销毁
+// （docs/design/linux-kde-input-method-v1.md）。
 #pragma once
 
 #include "Codec.h"
 #include "ExtProtocol.h"
 #include "Menu.h"
+#include "OverlayInput.h"
+#include "RetiredSurfaces.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
@@ -35,6 +42,7 @@ struct wl_compositor;
 struct wl_shm;
 struct wl_surface;
 struct wl_buffer;
+struct wl_callback;
 struct wl_seat;
 struct wl_pointer;
 struct wl_output;
@@ -44,6 +52,8 @@ struct wp_viewporter;
 struct wp_viewport;
 struct zwp_input_method_v2;
 struct zwp_input_popup_surface_v2;
+struct zwp_input_panel_v1;
+struct zwp_input_panel_surface_v1;
 struct zwlr_layer_shell_v1;
 struct zwlr_layer_surface_v1;
 struct zwp_relative_pointer_manager_v1;
@@ -58,9 +68,9 @@ public:
     explicit WaylandCandidatePanel(fcitx::Instance* instance);
     ~WaylandCandidatePanel();
 
-    /// 该 IC 是否由本类负责（Wayland 原生前端 `wayland_v2`）。其余（XIM / DBus 下的 X11 应用…）
-    /// 走 X11 窗口。
-    static bool handles(const fcitx::InputContext* ic);
+    /// 该 IC 是否由本类负责：Wayland 原生前端 `wayland_v2`，或 `wayland`（input-method-v1）且
+    /// 绑到了 `zwp_input_panel_v1`。其余（XIM / DBus 下的 X11 应用…）走 X11 窗口。
+    bool handles(const fcitx::InputContext* ic) const;
     /// 已拿到连接且 wl_compositor / wl_shm 就绪。
     bool ready() const { return compositor_ && shm_; }
 
@@ -120,6 +130,9 @@ public:
     bool menuOpen() const;
     /// 菜单此刻开在屏幕坐标系（layer-shell）上：菜单帧不论焦点在哪种应用都归这里。
     bool screenMenuActive() const { return screenMenu_; }
+    /// 在指针处开屏幕菜单（状态区「清风输入法菜单」用）：落点等指针进入底板时取。没有
+    /// layer-shell / 连接没就绪时返回 false，调用方退回 X11。
+    bool openMenuAtPointer(int32_t target);
     /// 本端收起菜单（不报服务端）。
     void closeMenu();
     Rect virtualWorkArea() const;
@@ -146,6 +159,13 @@ private:
     /// 丢掉全部 Wayland 对象（连接已死时不能再调 destroy 请求，故分两种）。
     void teardown(bool connectionAlive);
     bool ensurePopup(fcitx::InputContext* ic);
+    bool ensureSurface();
+    bool ensurePopupV2(fcitx::InputContext* ic);
+    bool ensurePanelV1();
+    /// 当前 surface 退役（v1：已摘 buffer），进延迟销毁队列。
+    void retireSurface();
+    /// 销毁可以销毁的退役 surface；`all` = 连接拆除时全部处理（`alive` 为假时只丢不发请求）。
+    void reapRetired(bool all, bool alive = true);
     /// 把各层合成一张位图贴上去；没有任何层在显示就收起 popup。
     bool present(fcitx::InputContext* ic);
     /// `inputW/H`：位图里接收鼠标的那一块（候选窗）的像素尺寸，0 = 整张都不接收。
@@ -182,6 +202,20 @@ private:
     wl_surface* surface_ = nullptr;
     zwp_input_method_v2* im_ = nullptr;      // 当前 popup 挂在哪个输入法对象上
     zwp_input_popup_surface_v2* popup_ = nullptr;
+    // surface 拿过哪种角色（角色一经指定终身不变，换另一种只能换 surface）。
+    enum class Role { None, PopupV2, PanelV1 };
+    Role surfaceRole_ = Role::None;
+    zwp_input_panel_v1* inputPanel_ = nullptr;
+    zwp_input_panel_surface_v1* panelSurf_ = nullptr; // 当前 surface 的 v1 角色
+    struct Retired {
+        WaylandCandidatePanel* owner = nullptr;
+        wl_surface* surface = nullptr;
+        wp_viewport* viewport = nullptr;
+        zwp_input_panel_surface_v1* role = nullptr;
+        wl_callback* sync = nullptr;
+    };
+    std::vector<std::unique_ptr<Retired>> retiredRes_;
+    RetiredSurfaces retired_;
     wl_buffer* buffer_ = nullptr;            // 最近一次 attach 的（release 时销毁）
     // 层 0 = 候选，1..3 = OVERLAY_KIND_TOOLTIP/STATUS/TOAST。
     static constexpr int kLayers = 4;
@@ -287,6 +321,9 @@ private:
     bool screenMenuShown_ = false; // 本次菜单已有一级显示过（之前来的「隐藏」帧不算收菜单）
     struct PendingMenu {
         int32_t target, x, y; // x y：输出逻辑坐标
+        // 落点待定：右键在候选窗（popup / 面板）里，它的屏幕位置不可知，等指针进入底板时取指针的
+        // 输出坐标当落点（底板铺满输出，坐标即输出坐标）
+        bool locate = false;
     };
     std::optional<PendingMenu> pendingMenu_;
     std::unique_ptr<fcitx::EventSourceTime> menuWait_; // 请求后迟迟没有菜单帧
@@ -294,7 +331,10 @@ private:
     std::unique_ptr<fcitx::EventSourceTime> menuMax_;  // 绝对上限（底板挡着整个桌面的鼠标）
     wl_surface* menuPtrSurface_ = nullptr;
     int32_t menuPtrOffX_ = 0, menuPtrOffY_ = 0;
-    void openScreenMenu(int32_t target, int32_t x, int32_t y);
+    void openScreenMenu(int32_t target, int32_t x, int32_t y, bool locate = false);
+    /// 候选窗里的右键：有 layer-shell 时开在屏幕坐标系（候选窗不动、点菜单外能收），落点取
+    /// 指针进入底板时的位置；没有 layer-shell 时退回合成进 popup 位图（旧路径）。
+    void openContextMenu(int32_t target);
     void showCatcher();
     void catcherConfigured(uint32_t serial, uint32_t w, uint32_t h);
     void sendPendingMenu();
@@ -318,6 +358,7 @@ private:
     bool pointerInside_ = false;
     double pointerX_ = 0, pointerY_ = 0; // surface 内逻辑坐标
     int32_t hover_ = -1;
+    ClickGate click_; // 左键点选：按下记命中，松开同一项才选
     /// 指针在位图里的命中（kNoHit / 候选下标 / 翻页 -1 -2）。
     int32_t hitAtPointer() const;
     void setHover(int32_t index);

@@ -217,6 +217,10 @@ bool X11CandidatePanel::ensureWindow(Surface& s, bool argb)
         events = XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION
             | XCB_EVENT_MASK_LEAVE_WINDOW;
     }
+    if (&s == &cand_) {
+        // 左键点选在松开时生效（ClickGate）；按下时的隐式抓取保证松开落回本窗口
+        events |= XCB_EVENT_MASK_BUTTON_RELEASE;
+    }
     if (s.overlay) {
         // 拖动靠按下时的隐式抓取收移动与松开（指针拖出窗口也照收，松手即结束——不会卡住）；
         // 进入用于悬停提示「指针已挪进来」。
@@ -443,6 +447,7 @@ void X11CandidatePanel::hide()
     unmap(cand_);
     rects_.clear();
     hover_ = -1;
+    click_.cancel();
     cancelTipTimers();
     // tooltip 挂在候选窗上：候选窗藏了它必须一起藏（服务端也会推隐藏帧，这里兜底）。
     hideOverlay(OVERLAY_KIND_TOOLTIP);
@@ -624,10 +629,7 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
         }
         disarm(hoverDefer_); // 点下去就以点的这一处为准，别让延后的悬停随后改掉它
         if (e->detail == 1) {
-            int32_t idx = hitTest(rects_, e->event_x, e->event_y);
-            if (idx != kNoHit && cb_.select) {
-                cb_.select(idx);
-            }
+            click_.press(hitTest(rects_, e->event_x, e->event_y)); // 松开时才选，见 ClickGate
         } else if (e->detail == 3 && cb_.contextMenu) {
             // 右键：命中候选 → 候选菜单，空白 / 翻页按钮 → 主菜单（同 Windows right_click）。
             // 悬停先清掉：菜单开着时候选窗收不到移动事件，残留的高亮会一直挂着。
@@ -636,6 +638,17 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
                             e->root_x, e->root_y);
         } else if ((e->detail == 4 || e->detail == 5) && cb_.scroll) {
             cb_.scroll(e->detail == 4 ? 120 : -120);
+        }
+        break;
+    }
+    case XCB_BUTTON_RELEASE: {
+        auto* e = reinterpret_cast<xcb_button_release_event_t*>(ev);
+        if (e->event != cand_.window || e->detail != 1) {
+            break;
+        }
+        const int32_t idx = click_.release(hitTest(rects_, e->event_x, e->event_y));
+        if (idx != kNoHit && cb_.select) {
+            cb_.select(idx);
         }
         break;
     }

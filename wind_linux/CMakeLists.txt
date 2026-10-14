@@ -1,4 +1,4 @@
-# wind_linux：清风输入法的 Fcitx5 addon（C++17）。
+# wind_linux：清风输入法的 Fcitx5 addon（C++17；新版 Fcitx5 头文件下自动升 C++20）。
 #
 #   eval "$(scripts/linux/bootstrap-sdk.sh env)"      # 无 root 机器上先引入用户前缀 SDK
 #   cmake -S wind_linux -B wind_linux/build -G Ninja
@@ -11,7 +11,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(wind_linux VERSION 0.1.0 LANGUAGES C CXX)   # C：wayland-scanner 生成的协议接口表是 C 代码
 
-set(CMAKE_CXX_STANDARD 17)
+# 默认 C++17（Ubuntu 22.04 的 Fcitx5 5.0.x 头文件即可）；命令行 -DCMAKE_CXX_STANDARD=20 可覆盖。
+# 较新的 Fcitx5 头文件要 C++20，addon 目标会在下面探测后自动升级。
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -28,6 +32,7 @@ add_library(windcore STATIC
     src/core/Menu.cpp
     src/core/OverlayInput.cpp
     src/core/ResponseRouter.cpp
+    src/core/RetiredSurfaces.cpp
     src/core/ServiceLauncher.cpp
     src/core/SettingsLauncher.cpp
     src/core/ShmFrame.cpp
@@ -42,7 +47,8 @@ target_link_libraries(windcore PUBLIC Threads::Threads)
 # ── 单测 ──
 enable_testing()
 foreach(t codec_test keymap_test router_test bridge_test protocol_sync_test shm_test launcher_test
-        settings_launcher_test menu_test host_ui_test overlay_input_test keysynth_test)
+        settings_launcher_test menu_test host_ui_test overlay_input_test keysynth_test
+        retired_surfaces_test)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE windcore)
     target_compile_definitions(${t} PRIVATE
@@ -65,6 +71,22 @@ if(WIND_BUILD_ADDON)
     )
     target_link_libraries(windinput PRIVATE windcore Fcitx5::Core Fcitx5::Utils PkgConfig::XCB)
 
+    # 新版 Fcitx5（Arch 等）的头文件用了 std::ranges / std::span / std::source_location，按当前标准编不过
+    # 就把 addon 升到 C++20（GH#192）。只探 addon 用到的头文件与日志宏，纯逻辑库与单测不受影响。
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_LIBRARIES Fcitx5::Utils)
+    check_cxx_source_compiles("
+        #include <fcitx-utils/key.h>
+        #include <fcitx-utils/log.h>
+        FCITX_DEFINE_LOG_CATEGORY(probe_log, \"probe\");
+        int main() { FCITX_LOGC(probe_log, Debug) << fcitx::Key(\"a\").toString(); return 0; }
+    " WIND_FCITX_HEADERS_OK_AT_DEFAULT_STD)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(NOT WIND_FCITX_HEADERS_OK_AT_DEFAULT_STD)
+        message(STATUS "Fcitx5 头文件需要 C++20，addon 按 C++20 编译")
+        target_compile_features(windinput PRIVATE cxx_std_20)
+    endif()
+
     # Wayland 候选窗（input-method-v2 popup surface）：要 libwayland-client 与 wayland-scanner。缺任何一样就不编这一路
     # （只剩 X11 候选窗，Wayland 原生应用里不显示）；发布构建里缺了应当是配置错误，由 verify-deb.sh 兜（见该脚本）。
     pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
@@ -76,6 +98,7 @@ if(WIND_BUILD_ADDON)
         HINTS ${FCITX_CORE_INC}/../Module/fcitx-module/wayland
         PATH_SUFFIXES Fcitx5/Module/fcitx-module/wayland)
     if(WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER AND FCITX_WAYLAND_INC)
+        # input-method-v1 只用其中的 zwp_input_panel_v1（KWin 的 overlay 面板）。
         # 协议文件随仓（MIT；input-method-v2 在 wayland-protocols 1.3x 起不再随包提供，viewporter /
         # xdg-output 一并随仓，免得各发行版的 wayland-protocols 版本与是否安装成为构建变量）。
         # wlr-layer-shell 来自 wlr-protocols（屏幕锚定的浮层用）；它的 get_popup 引用 xdg_popup，
@@ -83,7 +106,7 @@ if(WIND_BUILD_ADDON)
         set(WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-gen)
         file(MAKE_DIRECTORY ${WL_GEN})
         set(WL_GEN_SRC)
-        foreach(proto input-method-unstable-v2 viewporter xdg-output-unstable-v1
+        foreach(proto input-method-unstable-v1 input-method-unstable-v2 viewporter xdg-output-unstable-v1
                       wlr-layer-shell-unstable-v1 xdg-shell
                       relative-pointer-unstable-v1)
             set(xml ${CMAKE_CURRENT_SOURCE_DIR}/protocols/${proto}.xml)

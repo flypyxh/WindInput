@@ -169,9 +169,13 @@ pub(crate) fn merge_head_with_dict(
     }
     let mut out = Vec::with_capacity(head.len() + dict.len());
     for h in head {
+        // 同名的有多条时（投影把词库的 `asp` 改写成 `ASP`，词库里又有真 `ASP`），先取
+        // **没被改写**的那条：它才是字面上就是这个词的词库词，投影出来的那条只是形态撞了名。
+        let same = |c: &Candidate| c.source == CandidateSource::English && c.text == h.text;
         match dict
             .iter()
-            .position(|c| c.source == CandidateSource::English && c.text == h.text)
+            .position(|c| same(c) && c.case_source.is_none())
+            .or_else(|| dict.iter().position(same))
         {
             Some(i) => out.push(dict.remove(i)),
             None => out.push(h),
@@ -307,9 +311,30 @@ pub(crate) fn apply_english_case(cands: &mut [Candidate], raw: &str, variant: Ca
 /// 大小写处理之后必须再跑一次：投影会把词库的 `hi` 改写成 `Hi`，与头部原文候选撞车；
 /// 全大写/全小写档更会把三条大小写变形塌成同一条。去重若仍停在改写之前，候选窗里就会
 /// 出现两条一模一样的行。
+///
+/// 同名的几条里有**没被改写**的（`case_source` 为空）时由它占那一格：词库同时有 `asp` 与
+/// `ASP`、输入 `ASP` 时，投影出来的 `asp` 可能因词频更高排在前面，保留首条就把真 `ASP`
+/// 吃掉了（论坛 t281 审查）。占格保留那一格的 `natural_order`，位次语义不变。
 pub(crate) fn dedup_by_text(cands: &mut Vec<Candidate>) {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    cands.retain(|c| seen.insert(c.text.clone()));
+    let mut first: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut keep = vec![true; cands.len()];
+    for i in 0..cands.len() {
+        match first.get(&cands[i].text) {
+            None => {
+                first.insert(cands[i].text.clone(), i);
+            }
+            Some(&f) => {
+                keep[i] = false;
+                if cands[f].case_source.is_some() && cands[i].case_source.is_none() {
+                    let order = cands[f].natural_order;
+                    cands.swap(f, i);
+                    cands[f].natural_order = order;
+                }
+            }
+        }
+    }
+    let mut it = keep.into_iter();
+    cands.retain(|_| it.next().unwrap_or(true));
 }
 
 /// 这条候选是不是**英文头部候选**（所打原文 / 它的大小写变形）：无来源、无码、非短语 /
@@ -355,7 +380,7 @@ impl crate::coordinator::Coordinator {
     /// （`temp_english_literal_text_is_not_recorded` 钉着）。想让自造词参与排序，该走加词。
     ///
     /// `cand` 不是头部候选（有来源 / 有码 / 短语 / emoji，或文本不是缓冲的大小写形态）、
-    /// 或 `engine_schema` 的调频关着时直接 `None`，不查词库。
+    /// 或 `engine_schema` 不记词频（调频关且未开 `record_always`）时直接 `None`，不查词库。
     pub(crate) fn english_head_dict_word(
         &self,
         engine_schema: &str,
@@ -366,9 +391,11 @@ impl crate::coordinator::Coordinator {
             return None;
         }
         let head_text = cand.freq_text();
-        // 调频关着就不查：结果只用来记词频，而写端本来也会因开关关着而不写。先判开关，
+        // 不记词频就不查：结果只用来记词频，而写端本来也会因开关关着而不写。先判开关，
         // 关着时连这次查询与它的副作用（临英的上屏历史）都不发生，行为与改前逐字相同。
-        if !self.engine_mgr.freq_settings_for(engine_schema).enabled {
+        // ⚠️ 判据是写端的 `records()` 而非 `enabled`：这里是**写端**的一环，用 `enabled` 会让
+        // 「仅记录次数」（`record_always`）在最常见的「打全词按空格」下一条都不记（论坛 t278）。
+        if !self.engine_mgr.freq_settings_for(engine_schema).records() {
             return None;
         }
         let code = buf.to_lowercase();
@@ -647,6 +674,47 @@ mod tests {
             CandidateSource::None,
             "同名短语不占格：头部变形照旧，短语被吃掉"
         );
+    }
+
+    /// 词库同时有 `asp`（词频更高）与 `ASP`，输入 `ASP`：投影后的 `asp` 与真 `ASP` 同名
+    /// （论坛 t281 审查）。占据头部格的必须是**没被改写**的真 `ASP`，投影出来的那条被吃掉。
+    #[test]
+    fn merge_head_prefers_unrewritten_dict_word() {
+        let mut dict = vec![dict_cand("asp"), dict_cand("ASP")];
+        assert!(apply_english_case(&mut dict, "ASP", CaseVariant::Default));
+        assert_eq!(
+            texts(&dict),
+            vec!["ASP", "ASP"],
+            "前提：asp 投影后与真 ASP 同名"
+        );
+        let merged = merge_head_with_dict(english_head_candidates("ASP", true, false), dict);
+        assert_eq!(texts(&merged), vec!["ASP"]);
+        assert_eq!(merged[0].source, CandidateSource::English);
+        assert_eq!(
+            merged[0].case_source, None,
+            "头部格是真 ASP，不是投影出来的 asp"
+        );
+    }
+
+    /// 改写后同名时保留未被改写的那条，且占**首次出现的那一格**（位次不变）。
+    #[test]
+    fn dedup_prefers_unrewritten_and_keeps_slot() {
+        let mut v = vec![dict_cand("asp"), dict_cand("help"), dict_cand("ASP")];
+        for (i, c) in v.iter_mut().enumerate() {
+            c.natural_order = i as i32;
+        }
+        assert!(apply_english_case(&mut v, "ASP", CaseVariant::Default));
+        dedup_by_text(&mut v);
+        assert_eq!(texts(&v), vec!["ASP", "help"]);
+        assert_eq!(v[0].case_source, None, "留下的是真 ASP");
+        assert_eq!(v[0].natural_order, 0, "占首次出现那一格的位次");
+        // 都改写过 / 都没改写：仍保留首条。
+        let mut w = vec![dict_cand("hill"), dict_cand("HILL")];
+        w[1].case_source = Some("Hill".into());
+        w[0].case_source = Some("hill".into());
+        w[0].text = "HILL".into();
+        dedup_by_text(&mut w);
+        assert_eq!(w[0].freq_text(), "hill");
     }
 
     /// 无字母的输入三形态相同，变形为空——只剩原文。

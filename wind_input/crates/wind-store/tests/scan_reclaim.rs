@@ -241,9 +241,13 @@ fn a_paused_store_is_not_reclaimed_and_the_hook_is_not_run() {
 
 /// 闲置时回收线程按慢拍（`tick` 的 10 倍）睡；这时来的标记要把它叫醒，短档照常生效，
 /// 不被慢拍拖到十拍之后。
+///
+/// 拍长取 100 ms（慢拍 1 s）是为了把「叫醒了」与「没叫醒」拉开：macOS CI 上叫醒路径
+/// 实测 370~400 ms（比几拍的理论值多出 ~250 ms 与拍长无关的开销）；拍长 50 ms 时没叫醒
+/// 也只要 ~450 ms，门限 350 ms 卡在两者之间，叫醒了也判红。现在没叫醒至少 ~800 ms。
 #[test]
 fn a_mark_wakes_an_idle_reclaimer() {
-    const SLOW_TICK: Duration = Duration::from_millis(50); // 闲置慢拍 = 500 ms
+    const SLOW_TICK: Duration = Duration::from_millis(100); // 闲置慢拍 = 1 s
     let (s, p) = store("wake");
     s.spawn_idle_cache_reclaimer(NEVER, SCAN_IDLE, SLOW_TICK);
     s.count_user_words("py").expect("扫");
@@ -258,7 +262,7 @@ fn a_mark_wakes_an_idle_reclaimer() {
     assert!(wait_until(Duration::from_secs(5), || s.page_cache_drops() >= 2));
     let took = t0.elapsed();
     assert!(
-        took < SCAN_IDLE + SLOW_TICK * 5,
+        took < SCAN_IDLE + SLOW_TICK * 5, // 600 ms
         "标记应叫醒慢拍中的回收线程：用了 {took:?}"
     );
     let _ = std::fs::remove_file(&p);

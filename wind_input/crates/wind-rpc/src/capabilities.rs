@@ -25,6 +25,11 @@ fn type_name(ty: FieldType) -> &'static str {
     }
 }
 
+/// 按点分键取 TOML 子值。
+fn lookup_path<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    key.split('.').try_fold(root, |v, seg| v.get(seg))
+}
+
 /// 生成 capability descriptor JSON。
 ///
 /// `data_dir` 用于读取系统预置 `data/config.toml`（L2）。**定制层 L2.5
@@ -73,7 +78,13 @@ pub fn generate(data_dir: Option<&Path>) -> anyhow::Result<serde_json::Value> {
                 ),
             );
         }
-        let default = match leaves.get(f.key) {
+        // `map` 键整表就是一个值：出厂表非空时 `leaf_entries` 会下钻到 `<key>.<id>`，按键名
+        // 查叶子就落空（`input.emoji.modules` 即此例），故直接按路径取子表。
+        let value = match f.ty {
+            FieldType::Map(_) => lookup_path(&preset, f.key),
+            _ => leaves.get(f.key),
+        };
+        let default = match value {
             Some(v) => serde_json::to_value(v)?,
             None => serde_json::Value::Null,
         };

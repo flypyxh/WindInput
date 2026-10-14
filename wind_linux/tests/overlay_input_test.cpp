@@ -127,6 +127,38 @@ int main()
     CHECK_EQ(back.x, d.x);
     CHECK_EQ(back.y, d.y);
 
+    CASE("ClickGate：松开仍在同一项才选，且只选一次");
+    {
+        ClickGate g;
+        g.press(2);
+        CHECK_EQ(g.release(2), 2);
+        CHECK_EQ(g.release(2), kNoHit);
+    }
+    CASE("ClickGate：按下后移到别项 / 空白再松开 = 放弃");
+    {
+        ClickGate g;
+        g.press(2);
+        CHECK_EQ(g.release(3), kNoHit);
+        g.press(2);
+        CHECK_EQ(g.release(kNoHit), kNoHit);
+    }
+    CASE("ClickGate：翻页按钮（负下标）同理；没按下就松开不选");
+    {
+        ClickGate g;
+        g.press(-2);
+        CHECK_EQ(g.release(-2), -2);
+        CHECK_EQ(g.release(0), kNoHit);
+        g.press(kNoHit);
+        CHECK_EQ(g.release(kNoHit), kNoHit);
+    }
+    CASE("ClickGate：候选窗收起后的松开不选");
+    {
+        ClickGate g;
+        g.press(1);
+        g.cancel();
+        CHECK_EQ(g.release(1), kNoHit);
+    }
+
     CASE("rectContains：半开区间");
     CHECK(rectContains(Rect{10, 20, 5, 5}, 10, 20));
     CHECK(rectContains(Rect{10, 20, 5, 5}, 14, 24));

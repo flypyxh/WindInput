@@ -581,7 +581,7 @@ mod tests {
     }
 
     fn cand_eval<'a>(c: &'a Cand<'a>) -> impl Fn(&str, Option<&str>) -> Option<String> + 'a {
-        move |name, _arg| {
+        move |name, arg| {
             Some(match name {
                 "word_code" => c.word_code.unwrap_or_default().to_string(),
                 "code_source" => c.code_source.unwrap_or_default().to_string(),
@@ -589,6 +589,11 @@ mod tests {
                 // 注释库只给英文词配一条，够测「非汉字候选靠注释库出气泡」。
                 "dict" if c.full == "hello" => "问候".to_string(),
                 "dict" => String::new(),
+                // 两个库都收了 hello（与 `comments_of` 同形：每库一条、按挂载顺序）。
+                "dict_all" if c.full == "hello" => {
+                    ["问候", "[IT]你好世界"].join(arg.unwrap_or(crate::comment::DICT_ALL_SEP))
+                }
+                "dict_all" => String::new(),
                 _ => return None,
             })
         }
@@ -1053,6 +1058,31 @@ mod tests {
             ..cand("world")
         };
         assert_eq!(render_new(&rl, &s, &other), "", "查不到就没有气泡");
+    }
+
+    /// 出厂「释义」段 `${dict_all:\n}`：分隔符是真换行，各库释义各占一行；查不到整段不显示。
+    #[test]
+    fn dict_all_section_splits_into_rows() {
+        let rl = ReverseLookup::default();
+        let d = TooltipConfig::default();
+        let s: Vec<SectionConfig> = d
+            .sections
+            .iter()
+            .filter(|s| s.label == "释义")
+            .cloned()
+            .collect();
+        assert_eq!(s.len(), 1, "出厂段列表应含「释义」段");
+        assert_eq!(s[0].template, "${dict_all:\n}");
+        let c = Cand {
+            word_code: None,
+            ..cand("hello")
+        };
+        assert_eq!(render_new(&rl, &s, &c), "[释义]\n问候\n[IT]你好世界");
+        let other = Cand {
+            word_code: None,
+            ..cand("world")
+        };
+        assert_eq!(render_new(&rl, &s, &other), "");
     }
 
     // ───────────────────────── P2：完整原文、截断、折行 ─────────────────────────

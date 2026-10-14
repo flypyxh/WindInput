@@ -103,9 +103,8 @@ impl Coordinator {
 
     /// 首位：通配键已绑定任何功能 / 模式即让位（spec §3.3 首位一行）。
     ///
-    /// **符号键在首位一律让位**：空缓冲下符号键本就产出标点，这份产物即是它绑定的功能——
-    /// 对应用户原始要求「键已启动别的功能 / 模式时不做首键模糊匹配」。首位通配属 spec §8
-    /// 延后的专门模式。顺带不必把符号键从 C++ 透传集里剔除（剔除曾让 `/` 跨方案被白吃）。
+    /// **符号键与字母分开判**（论坛 t302）：符号通配键首位**作通配**，只有方案级
+    /// `[key_actions]` 显式绑了它才让位，见 [`Self::wildcard_symbol_takes_lead`]。
     fn wildcard_lead_yields(&self, key: char) -> bool {
         // 五笔拼音混输：首位一律字面（spec §10）。z 是拼音声母（`zhang` / `zai`），而混输下
         // `has_code_prefix("z")` 只在装了 `zz*` 短语时成立（单字母够不着 `min_pinyin_length`，
@@ -114,7 +113,7 @@ impl Coordinator {
             return true;
         }
         if !key.is_ascii_lowercase() {
-            return true;
+            return !self.wildcard_symbol_takes_lead(key);
         }
         let Some((vk, _)) = wildcard_key_vk(key) else {
             return true;
@@ -132,6 +131,38 @@ impl Coordinator {
             return true;
         }
         self.has_code_prefix(&key.to_string())
+    }
+
+    /// 符号通配键在空缓冲时是否**作首码**（论坛 t302）。
+    ///
+    /// 通配出厂关闭，开了并选了符号键就是方案作者 / 用户明说「这个键是码元」——码元理应
+    /// 能出现在任何一位，包括第一位。此前符号键首位一律让位给标点 / 模式，于是反引号要先被
+    /// 出厂的临拼触发抢走、再按一次退出临拼，才轮到通配（用户实测「要按两次」）。
+    ///
+    /// 让位只剩两种：
+    /// - 混输（spec §10，首位恒字面，理由见 [`Self::wildcard_lead_yields`]）；
+    /// - **方案级** `[key_actions]` 显式绑了这个键：同层冲突，显式绑定优先（与
+    ///   [`Self::code_char_takes_lead`] 的跨层仲裁同一口径）。全局层的绑定则由
+    ///   `code_char_takes_lead` 判让位——全局配置无从知道本方案把它当码元用了。
+    ///
+    /// 这个键原本的标点产物（反引号 → `·`）就此在首位拿不到，与把符号写进 `input_chars`
+    /// 的代价相同；需要时用快捷输入 / 短语出。
+    pub(crate) fn wildcard_symbol_takes_lead(&self, key: char) -> bool {
+        if key.is_ascii_alphabetic()
+            || self.engine_mgr.active_wildcard_key() != Some(key)
+            || self.engine_mgr.active_wildcard_mixes_pinyin()
+        {
+            return false;
+        }
+        let Some((vk, shift)) = wildcard_key_vk(key) else {
+            return false;
+        };
+        // 按键绑定只认无 Shift 的那一下（空缓冲分派的守卫），`?` 这类 Shift 形态碰不到
+        // `slash` 上的绑定 ⇒ 不拿它来挡。
+        shift
+            || !self
+                .bound_action_with_source(vk)
+                .is_some_and(|(a, from_schema)| from_schema && a.is_enabled())
     }
 
     /// 缓冲首字符是通配键，且首位按规则会让位 ⇒ 它是字面码元，整轮组码不作通配。
@@ -354,6 +385,25 @@ impl Coordinator {
                 key
             );
         }
+        if let Some(name) = self.wildcard_lead_overrides_global(key) {
+            warn!(
+                "通配键 {:?} 同时是全局「{}」的按键；本方案首位它作通配，该功能在本方案下按这个键进不去——如需保留，请换通配键或给该功能另配键",
+                key, name
+            );
+        }
+    }
+
+    /// 符号通配键在首位接管了哪一项**全局**绑定（`None` = 没有）。码元撞引导键时
+    /// `code_char_conflicts` 会报，通配接管同样要报，否则用户只看到「反引号进不了临拼了」。
+    fn wildcard_lead_overrides_global(&self, key: char) -> Option<String> {
+        if !self.wildcard_symbol_takes_lead(key) {
+            return None;
+        }
+        let (vk, _) = wildcard_key_vk(key)?;
+        match self.bound_action_with_source(vk)? {
+            (action, false) if action.is_enabled() => Some(format!("{action:?}")),
+            _ => None,
+        }
     }
 }
 
@@ -489,33 +539,41 @@ mod tests {
     }
 
     /// 非首位有冲突（通配键 `=` 是出厂翻页键）⇒ 非首位的通配键只可能是经让位进来的字面。
-    /// 首位是符号键 ⇒ 让位（它是字面），整轮字面。
+    /// 首位不受翻页键影响（空缓冲无页可翻）⇒ 照常作通配（论坛 t302）。
     #[test]
     fn pattern_keeps_mid_positions_literal_on_conflict() {
         let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard_key = "=".into()) else {
             return;
         };
-        assert_eq!(c.wildcard_decision("", '='), Yield, "前置：首位符号键让位");
+        assert_eq!(c.wildcard_decision("", '='), Enter, "首位符号通配键作通配");
         assert_eq!(
             c.wildcard_decision("a", '='),
             Yield,
             "前置：非首位让位给翻页"
         );
         assert_eq!(c.wildcard_pattern("a="), None);
-        assert_eq!(c.wildcard_pattern("=a="), None, "首位字面 ⇒ 整轮字面");
+        assert_eq!(
+            c.wildcard_pattern("=a="),
+            Some(format!("{S}a=")),
+            "首位通配、非首位字面"
+        );
     }
 
-    /// 符号通配键在首位一律让位（它的标点产物即是绑定的功能）；组码中照常作通配。
-    /// 对照：字母通配键首位全无绑定时仍作通配。
+    /// 符号通配键首位**作通配**（论坛 t302），与组码中一致；pattern 与按键裁决同一结论。
+    /// 对照：字母通配键首位全无绑定时同样作通配。
     #[test]
-    fn symbol_wildcard_always_yields_at_lead() {
+    fn symbol_wildcard_enters_at_lead() {
         let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard_key = "?".into()) else {
             return;
         };
-        assert_eq!(c.wildcard_decision("", '?'), Yield);
+        assert_eq!(c.wildcard_decision("", '?'), Enter);
         assert_eq!(c.wildcard_decision("a", '?'), Enter, "组码中照常作通配");
         assert_eq!(c.wildcard_pattern("a?"), Some(format!("a{S}")));
-        assert_eq!(c.wildcard_pattern("?a"), None, "首位字面 ⇒ 整轮字面");
+        assert_eq!(
+            c.wildcard_pattern("?a"),
+            Some(format!("{S}a")),
+            "首位也是通配"
+        );
 
         let Some(c) = wubi_z(|_| {}) else { return };
         assert_eq!(
@@ -523,6 +581,17 @@ mod tests {
             Enter,
             "对照：字母键首位无绑定"
         );
+    }
+
+    /// 通配接管全局引导键时要能报出来（出厂反引号 = 临拼触发）；字母键与关闭通配时不报。
+    #[test]
+    fn wildcard_lead_override_of_global_binding_is_reported() {
+        let Some(c) = wubi_z(|cfg| cfg.schema.codetable.wildcard_key = "`".into()) else {
+            return;
+        };
+        assert!(c.wildcard_lead_overrides_global('`').is_some());
+        let Some(c) = wubi_z(|_| {}) else { return };
+        assert!(c.wildcard_lead_overrides_global('z').is_none());
     }
 
     /// 满码后通配键按字面：`aaaa` + `z` 让位，`aaaaz` 不是通配组码；按键裁决与 pattern

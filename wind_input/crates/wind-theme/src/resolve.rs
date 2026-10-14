@@ -151,11 +151,20 @@ fn resolve_gradient(
     palette: &HashMap<String, Rgba>,
     is_dark: bool,
 ) -> Option<RvGradient> {
+    // 缺 pos 的均分按原序号算（颜色解析失败的 stop 也占位），与编辑器 resolveGradientV3 同口径。
+    let n = g.stops.len();
     let mut stops: Vec<(Rgba, f32)> = g
         .stops
         .iter()
-        .filter_map(|s| {
-            resolve_color(Some(&s.color), palette, is_dark).map(|c| (c, s.pos.clamp(0.0, 1.0)))
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let even = if n > 1 {
+                i as f32 / (n - 1) as f32
+            } else {
+                0.0
+            };
+            let pos = s.pos.unwrap_or(even).clamp(0.0, 1.0);
+            resolve_color(Some(&s.color), palette, is_dark).map(|c| (c, pos))
         })
         .collect();
     if stops.is_empty() {
@@ -703,6 +712,69 @@ mod tests {
             Some([255, 0, 0, 255]),
             "禁用态文字色应解析出来"
         );
+    }
+
+    /// 弹窗类节点（status / tooltip / toast / menu.root）的 `background.gradient` 必须求值进
+    /// RvNode——渲染层要消费它，这一层先不能丢。
+    #[test]
+    fn test_popup_nodes_carry_bg_gradient() {
+        let text = r##"
+[status]
+background = { gradient = { stops = [{ color = "#FF0000", pos = 0.0 }, { color = "#0000FF", pos = 1.0 }] } }
+[tooltip]
+background = { gradient = { type = "radial", stops = [{ color = "#FF0000", pos = 0.0 }] } }
+[toast]
+background = { gradient = { angle = 90, stops = [{ color = "#00FF00", pos = 1.0 }] } }
+[menu.root]
+background = { gradient = { stops = [{ color = "#0000FF", pos = 0.5 }] } }
+"##;
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let theme: Theme = crate::normalize::normalize_theme(value).try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+        let g = |n: Option<&RvNode>, name: &str| {
+            n.and_then(|n| n.bg_gradient.clone())
+                .unwrap_or_else(|| panic!("{name} 的渐变没求值进 RvNode"))
+        };
+        let st = g(r.views.status.as_ref(), "status");
+        assert_eq!(st.kind, "linear");
+        assert_eq!(
+            st.stops,
+            vec![([255, 0, 0, 255], 0.0), ([0, 0, 255, 255], 1.0)]
+        );
+        assert_eq!(g(r.views.tooltip.as_ref(), "tooltip").kind, "radial");
+        assert_eq!(g(r.views.toast.as_ref(), "toast").angle, 90.0);
+        assert_eq!(
+            g(r.views.menu_root.as_ref(), "menu.root").stops,
+            vec![([0, 0, 255, 255], 0.5)]
+        );
+    }
+
+    /// 缺 `pos` 的 stop 按序号均分（与主题编辑器同口径；全缺时同 CSS）；此前缺省 0，
+    /// 全部 stop 挤在起点，整块退化成最后一色的纯色。显式给了 pos 的照旧。
+    #[test]
+    fn test_gradient_missing_pos_spreads_evenly() {
+        let text = r##"
+[window]
+background = { gradient = { stops = [{ color = "#FF0000" }, { color = "#00FF00" }, { color = "#0000FF" }] } }
+[status]
+background = { gradient = { stops = [{ color = "#FF0000" }, { color = "#0000FF", pos = 0.25 }] } }
+[toast]
+background = { gradient = { stops = [{ color = "#FF0000" }] } }
+"##;
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let theme: Theme = crate::normalize::normalize_theme(value).try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+        let pos = |n: Option<&RvNode>| -> Vec<f32> {
+            n.and_then(|n| n.bg_gradient.clone())
+                .expect("渐变应求值")
+                .stops
+                .iter()
+                .map(|s| s.1)
+                .collect()
+        };
+        assert_eq!(pos(Some(&r.views.window)), vec![0.0, 0.5, 1.0]);
+        assert_eq!(pos(r.views.status.as_ref()), vec![0.0, 0.25]);
+        assert_eq!(pos(r.views.toast.as_ref()), vec![0.0]);
     }
 
     #[test]

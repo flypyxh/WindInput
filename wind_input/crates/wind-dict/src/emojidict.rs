@@ -353,12 +353,14 @@ pub fn parse_opencc(content: &str) -> Vec<(String, Vec<String>)> {
 ///
 /// `sections` 为空时原样返回整份内容（不分组的表）。
 pub fn select_sections<'a>(content: &'a str, sections: &[String]) -> std::borrow::Cow<'a, str> {
+    // 分组标题行靠整行匹配认出：孤立 \r 不归一的话整份文件是一行，一个分组都认不出。
+    let normalized = wind_utils::text::normalize_input(content);
     if sections.is_empty() {
-        return std::borrow::Cow::Borrowed(content);
+        return normalized;
     }
     let mut out = String::new();
     let mut keep = false;
-    for line in content.lines() {
+    for line in normalized.lines() {
         if let Some(rest) = line.strip_prefix("----------") {
             if let Some((name, val)) = rest.split_once('\t')
                 && val.trim().chars().all(|c| c == '-')

@@ -814,6 +814,67 @@ mod tests {
         );
     }
 
+    /// 反方向：宿主**显示不了**应用内预编辑（Linux 下不声明 Preedit 能力位的 XIM 客户端，
+    /// WPS / QQ 实测）时，出厂 `app_inline` 也得把编码交给候选窗画——组合区给占位、候选窗
+    /// 的 `preedit_host_owned` 为 false。否则 addon 只能把编码转交 Fcitx5 输入面板，由
+    /// classicui 另起小窗、被我们的候选窗盖住。
+    ///
+    /// 断言同时落在两条出口上（按键应答的组合区文本 + 下发候选窗的编码归属），理由同上：
+    /// 判据被出口读到才算数。开头的对照（能力位在场时照旧嵌入）不可省——判据恒 false 时
+    /// 只测正向也全绿。
+    ///
+    /// 变异检验：删掉 `preedit_in_app_effective` 里 `host_no_inline_preedit` 那段 ⇒ 正向红；
+    /// 把它改成无条件回 false ⇒ 开头对照红。
+    #[test]
+    fn a_host_without_inline_preedit_gets_the_code_in_the_candidate_window() {
+        let host_owned = |rx: &std::sync::mpsc::Receiver<UiCommand>| {
+            rx.try_iter()
+                .filter_map(|cmd| match cmd {
+                    UiCommand::UpdateCandidates {
+                        preedit,
+                        preedit_host_owned,
+                        ..
+                    } => Some((preedit, preedit_host_owned)),
+                    _ => None,
+                })
+                .last()
+                .expect("期望下发过候选窗")
+        };
+
+        let (c, rx) = coord();
+        focus_pid(&c, 42);
+        assert!(
+            c.preedit_display.lock().unwrap().in_app(),
+            "前置：出厂即 app_inline"
+        );
+        assert_eq!(
+            composition_of(&type_code(&c, "ni")),
+            "ni",
+            "对照：能嵌入的宿主照旧把编码写进组合区"
+        );
+        assert!(host_owned(&rx).1, "对照：编码归宿主画");
+
+        let (c, rx) = coord();
+        focus_pid(&c, 42);
+        c.set_host_inline_preedit(false);
+        assert_eq!(
+            composition_of(&type_code(&c, "ni")),
+            COMPOSITION_PLACEHOLDER,
+            "宿主嵌不进去：组合区只挂占位"
+        );
+        let (preedit, owned) = host_owned(&rx);
+        assert!(!owned, "编码改归候选窗画");
+        assert_eq!(preedit, "ni");
+
+        // 换到能嵌入的宿主（addon 每次获焦都重报）即恢复，不能粘住。
+        c.set_host_inline_preedit(true);
+        assert_eq!(
+            composition_of(&press(&c, 'H' as u32)),
+            "nih",
+            "恢复能力后下一键回到嵌入"
+        );
+    }
+
     /// ★ 顶码余码这条**出厂主路径**在压制态下也得把真编码交出去。
     ///
     /// `top_commit_mode` 出厂是 `direct_commit`（`data/config.toml`），于是压制态下用户在游戏

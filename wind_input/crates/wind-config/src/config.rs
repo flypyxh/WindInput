@@ -1051,6 +1051,9 @@ impl Default for EnglishAutoLearn {
 pub struct EnglishFrequency {
     #[serde(default)]
     pub enabled: bool,
+    /// 调频关闭时仍记录选词次数；语义同 [`CodetableFrequency::record_always`]。
+    #[serde(default)]
+    pub record_always: bool,
     /// `"top"` / `"step"` / `"position"`，默认 `"position"`。
     ///
     /// **与码表默认不同**：英文候选几乎全是前缀匹配，`top`/`step` 那种「用过一次即整体
@@ -1091,6 +1094,7 @@ impl Default for EnglishFrequency {
     fn default() -> Self {
         Self {
             enabled: false,
+            record_always: false,
             strategy: default_english_freq_strategy(),
             promote_prefix: default_codetable_promote_prefix(),
             half_life: 0.0,
@@ -2424,6 +2428,9 @@ impl CodetableGlobal {
             if let Some(v) = f.enabled {
                 out.frequency.enabled = v;
             }
+            if let Some(v) = f.record_always {
+                out.frequency.record_always = v;
+            }
             if let Some(v) = &f.strategy {
                 out.frequency.strategy = v.clone();
             }
@@ -2498,6 +2505,13 @@ impl CodetableGlobal {
 pub struct CodetableFrequency {
     #[serde(default)]
     pub enabled: bool,
+    /// **调频关闭时仍记录选词次数**（GH 论坛 t278）。`enabled = true` 时本项无意义（本来就记）。
+    ///
+    /// 记录与使用是两件事：本项只放开**写端**（`record_selection_in`），读端（主候选重排、
+    /// 英文热词召回、词语联想打分）仍只认 `enabled`。用途是攒一份「真实常用字词」的次数表
+    /// 供设置页查看 / 导出，而候选顺序保持固定。日后再开 `enabled`，攒下的次数即刻参与排序。
+    #[serde(default)]
+    pub record_always: bool,
     /// 锁定码表原始前 N 位——**兜底档**：码长 ≥ 4 的深码位。
     /// 简码位（码长 1/2/3）另有分级值，见下面三个字段。
     ///
@@ -2566,6 +2580,7 @@ impl Default for CodetableFrequency {
     fn default() -> Self {
         Self {
             enabled: false,
+            record_always: false,
             protect_top_n: 0,
             protect_top_n_len1: default_protect_len1(),
             protect_top_n_len2: default_protect_len2(),
@@ -2582,6 +2597,9 @@ impl Default for CodetableFrequency {
 pub struct PinyinFrequency {
     #[serde(default)]
     pub enabled: bool,
+    /// 调频关闭时仍记录选词次数；语义同 [`CodetableFrequency::record_always`]。
+    #[serde(default)]
+    pub record_always: bool,
     /// 半衰期（小时）。
     #[serde(default)]
     pub half_life: f64,
@@ -7001,14 +7019,31 @@ const TIP_DEBUG: &str = "调试";
 /// 「完整原文」置首：只在候选显示被截断时有值，平时整段不出现；出现时正是用户最想看的。
 /// 其后复现旧出厂外观：`[编码]`（非直接输入时带来源方案名）、`[拼音]` 逐字全读音，
 /// 拆字、调试关着。Unicode 段是新增能力，出厂关。
+///
+/// 「释义」段（论坛 t282）出厂开：全部适用注释库各出一条、每条一行（分隔符是真换行）。
+/// 没挂注释库或查不到时整段为空、不显示，故对没用注释库的用户零外观变化。
 pub fn default_tooltip_sections() -> Vec<TooltipSection> {
     vec![
         TooltipSection::new("完整原文", "", "${full_text}"),
         TooltipSection::new(TIP_CODE, "", "${word_code}"),
         TooltipSection::new(TIP_PINYIN, "han", "${char}：${readings}"),
         TooltipSection::new(TIP_CHAIZI, "han", "${char}：${chaizi}{ [${chaizi_code}]}").disabled(),
+        TooltipSection::new("释义", "", "${dict_all:\n}"),
         TooltipSection::new("Unicode", "char", "${char}：${unicode}").disabled(),
         TooltipSection::new(TIP_DEBUG, "", "${debug}").disabled(),
+    ]
+}
+
+/// 「释义」段加入之前（论坛 t282）的出厂段列表，**冻结**，只供
+/// [`Config::migrate_stale_factory_tooltip_sections_value`] 认出存量副本。出厂再变时不要改它。
+fn tooltip_sections_before_dict_all() -> Vec<TooltipSection> {
+    vec![
+        TooltipSection::new("完整原文", "", "${full_text}"),
+        TooltipSection::new("编码{(${code_source})}", "", "${word_code}"),
+        TooltipSection::new("拼音", "han", "${char}：${readings}"),
+        TooltipSection::new("拆字", "han", "${char}：${chaizi}{ [${chaizi_code}]}").disabled(),
+        TooltipSection::new("Unicode", "char", "${char}：${unicode}").disabled(),
+        TooltipSection::new("调试", "", "${debug}").disabled(),
     ]
 }
 
@@ -7785,6 +7820,14 @@ pub struct CustomManifest {
     /// 主题减法清单。
     #[serde(default)]
     pub themes: CustomHideList,
+    /// 设置界面减法清单：条目是选择器（`key:<配置键>`，可带尾部 `*`；`feature:<id>`），
+    /// 由设置程序消费，core 只解析与校验。
+    ///
+    /// ⚠️ 与上面两段**语义不同**：那两段是「不存在」，这一段只是「界面上不显示」——
+    /// 被隐藏的设置照常生效，值仍来自定制层 / 用户层。要关掉一个功能，定制者应在
+    /// `data_custom/config.toml` 里把值设好，再在这里把它藏起来；两件事不得合成一个开关。
+    #[serde(default)]
+    pub settings: CustomHideList,
 }
 
 /// 定制版身份。没有它，定制版用户报障时连他装的是不是定制版都判断不出来。
@@ -8410,6 +8453,33 @@ impl Config {
         Self::migrate_font_size_follow_theme_value(layer);
         Self::migrate_langbar_badge_colors_value(layer);
         Self::migrate_tooltip_sections_value(layer);
+        Self::migrate_stale_factory_tooltip_sections_value(layer);
+    }
+
+    /// 存量迁移（**层内**）：本层的 `ui.tooltip.sections` 与「释义」段加入之前的旧出厂 6 段
+    /// （论坛 t282）逐项相等时，视为冗余剪掉，让这层跟随新出厂。
+    ///
+    /// 以前这份副本会被 [`prune_redundant`] 当冗余删；出厂多了一段之后两边不再相等，它就成了
+    /// 删不掉的「自定义」，用户永远拿不到新段。比较按反序列化后的段（serde 缺省补齐），
+    /// 手写时省掉了 `promote = ""` 之类字段的同样认得；改过任何一处的不动。
+    fn migrate_stale_factory_tooltip_sections_value(layer: &mut toml::Value) {
+        let Some(tip) = layer
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("tooltip"))
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return;
+        };
+        let stale = tip
+            .get("sections")
+            .and_then(|v| v.clone().try_into::<Vec<TooltipSection>>().ok())
+            .is_some_and(|secs| secs == tooltip_sections_before_dict_all());
+        if stale {
+            tip.remove("sections");
+            info!(
+                "ui.tooltip.sections equals the pre-t282 factory list → dropped, following factory"
+            );
+        }
     }
 
     /// 存量迁移（**层内**、须在反序列化前跑）：`[ui.tooltip]` 的六个旧开关 → `sections`。
@@ -8777,6 +8847,7 @@ impl Config {
         Self::migrate_font_size_follow_theme_value(&mut root);
         Self::migrate_langbar_badge_colors_value(&mut root);
         Self::migrate_tooltip_sections_value(&mut root);
+        Self::migrate_stale_factory_tooltip_sections_value(&mut root);
         Self::migrate_comment_max_chars_value(&mut root);
         let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
@@ -11886,8 +11957,8 @@ active = "x"
             .collect();
         assert_eq!(
             on,
-            ["完整原文", "编码{(${code_source})}", "拼音"],
-            "出厂开完整原文、编码、拼音"
+            ["完整原文", "编码{(${code_source})}", "拼音", "释义"],
+            "出厂开完整原文、编码、拼音、释义"
         );
         assert_eq!(t.max_chars, 200, "单行显示上限默认 200 字");
         assert_eq!(t.wrap_width, 40, "折行宽度默认 40 列");
@@ -11966,7 +12037,7 @@ active = "x"
         let (secs, user) = tooltip_after_migration("[ui.tooltip]\nchaizi_enabled = true\n");
         assert_eq!(
             enabled_labels(&secs),
-            ["完整原文", "编码{(${code_source})}", "拆字 / 拼音"]
+            ["完整原文", "编码{(${code_source})}", "拆字 / 拼音", "释义"]
         );
         let merged = secs.iter().find(|s| s.label == "拆字 / 拼音").unwrap();
         assert_eq!(merged.each, "han");
@@ -11992,7 +12063,7 @@ active = "x"
         );
         assert_eq!(
             enabled_labels(&secs),
-            ["完整原文", "编码{(${code_source})}", "拆字"]
+            ["完整原文", "编码{(${code_source})}", "拆字", "释义"]
         );
     }
 
@@ -12024,7 +12095,57 @@ active = "x"
     fn migrate_tooltip_code_and_debug_switches() {
         let (secs, _) =
             tooltip_after_migration("[ui.tooltip]\ncode_enabled = false\ndebug_enabled = true\n");
-        assert_eq!(enabled_labels(&secs), ["完整原文", "拼音", "调试"]);
+        assert_eq!(enabled_labels(&secs), ["完整原文", "拼音", "释义", "调试"]);
+    }
+
+    /// 旧出厂 6 段（加「释义」之前，论坛 t282）原样躺在用户层的：视为冗余剪掉，跟随新出厂。
+    /// 以前 `prune_redundant` 会把它当冗余删，出厂一变它就成了删不掉的「自定义」。
+    /// 字段写得不全（serde 缺省补齐后相等）同样认；改过任何一处的不动。
+    #[test]
+    fn stale_factory_tooltip_sections_follow_new_factory() {
+        let old6 = r#"
+[[ui.tooltip.sections]]
+label = "完整原文"
+template = "${full_text}"
+[[ui.tooltip.sections]]
+label = "编码{(${code_source})}"
+template = "${word_code}"
+[[ui.tooltip.sections]]
+label = "拼音"
+each = "han"
+template = "${char}：${readings}"
+[[ui.tooltip.sections]]
+enabled = false
+label = "拆字"
+each = "han"
+template = "${char}：${chaizi}{ [${chaizi_code}]}"
+[[ui.tooltip.sections]]
+enabled = false
+label = "Unicode"
+each = "char"
+template = "${char}：${unicode}"
+[[ui.tooltip.sections]]
+enabled = false
+label = "调试"
+template = "${debug}"
+"#;
+        let (secs, user) = tooltip_after_migration(old6);
+        assert_eq!(secs, default_tooltip_sections(), "跟随新出厂（含「释义」）");
+        assert!(
+            get_nested(&user, &["ui", "tooltip", "sections"]).is_none(),
+            "本层的旧出厂副本被剪掉：{user:?}"
+        );
+        // 落盘那条路（prune_user_config 用的同一个迁移函数）同样剪。
+        let mut root: toml::Value = toml::from_str(old6).unwrap();
+        Config::migrate_stale_factory_tooltip_sections_value(&mut root);
+        assert!(get_nested(&root, &["ui", "tooltip", "sections"]).is_none());
+
+        // 改过一处（打开了调试段）= 用户自定义，原样保留。
+        let custom = old6.replacen("enabled = false\nlabel = \"调试\"", "label = \"调试\"", 1);
+        assert_ne!(custom, old6, "前提：确实改到了");
+        let (secs, user) = tooltip_after_migration(&custom);
+        assert!(get_nested(&user, &["ui", "tooltip", "sections"]).is_some());
+        assert_eq!(secs.len(), 6, "自定义列表不被加段");
     }
 
     /// 用户已写 `sections` 时以它为准，旧键只清不迁。

@@ -535,6 +535,9 @@ pub struct CodeTableEnglishMergeSpec {
 pub struct CodeTableFrequencySpec {
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// 调频关闭时仍记录选词次数（见 `CodetableFrequency::record_always`）。
+    #[serde(default)]
+    pub record_always: Option<bool>,
     /// `"top"` / `"step"` / `"position"`。
     #[serde(default)]
     pub strategy: Option<String>,

@@ -514,6 +514,39 @@ fn opencc_comment<'a>(text: &str, value: &'a str) -> Option<&'a str> {
     }
 }
 
+/// 注释查询精确查不到时，大小写回退往哪个方向走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseFallback {
+    /// 双向（[`case_fallbacks`] 全部变形）：查询的文本是用户**打出来的形态**，大小写不说明
+    /// 它是哪个词——输入 `abc` 要能查到缩写 `ABC`。
+    Both,
+    /// 只往小写走（`Configure` → `configure`、`ASP` → `asp`），不升格（论坛 t281）。
+    ///
+    /// 用于词的大小写**已由词库确证**的场合：英文候选按输入大小写投影过时（`asp` 显示成
+    /// `ASP`），调用方拿词库原文 `asp` 来查。小写 `asp`（毒蛇）与缩写 `ASP` 是两个词，
+    /// 升格会给前者贴上后者的释义；往小写走只是句首 / 大写锁定的形态差，照常放行。
+    LowerOnly,
+}
+
+impl CaseFallback {
+    fn variants(self, text: &str) -> Vec<String> {
+        let mut out = case_fallbacks(text);
+        if self == Self::LowerOnly {
+            out.retain(|v| only_lowers(text, v));
+        }
+        out
+    }
+}
+
+/// `to` 是否只是把 `from` 的若干大写字母改成了小写（逐字符对应，其余原样）。
+fn only_lowers(from: &str, to: &str) -> bool {
+    from.chars().count() == to.chars().count()
+        && from
+            .chars()
+            .zip(to.chars())
+            .all(|(f, t)| f == t || (f.is_uppercase() && f.to_lowercase().eq(std::iter::once(t))))
+}
+
 /// 精确查不到时依次重试的大小写变形（全小写 → 首字母大写 → 全大写，去掉与原文相同者）。
 ///
 /// **必须双向**：英文注释库里既有小写词条（`apple`）也有大写缩写（`ABC`、`AAP`），
@@ -877,7 +910,20 @@ impl ReverseLookup {
     ///
     /// 全都没命中且词含 ASCII 字母时，再按大小写变形重试一遍（见 [`case_fallbacks`]）。
     pub fn comment_of(&self, text: &str, code: Option<&str>, schema: &str) -> String {
-        self.comment_in(None, text, code, schema)
+        self.comment_in(None, text, code, schema, CaseFallback::Both)
+    }
+
+    /// [`Self::comment_of`] / [`Self::comment_of_id`]（`id` 为 `Some`）的通用形：可指定大小写
+    /// 回退的方向（见 [`CaseFallback`]）。
+    pub fn comment_of_with(
+        &self,
+        id: Option<&str>,
+        text: &str,
+        code: Option<&str>,
+        schema: &str,
+        fallback: CaseFallback,
+    ) -> String {
+        self.comment_in(id, text, code, schema, fallback)
     }
 
     /// 只在 id 为 `id` 的那个注释库里查（`${dict:id}`）；其余同 [`Self::comment_of`]，
@@ -887,7 +933,7 @@ impl ReverseLookup {
     /// 时，单字「好」只能显示其一；按库取才能在同一模板里并排写 `${dict:en} ${dict:chaifen}`。
     /// 不存在的 id 得空串（与查不到同档）。
     pub fn comment_of_id(&self, id: &str, text: &str, code: Option<&str>, schema: &str) -> String {
-        self.comment_in(Some(id), text, code, schema)
+        self.comment_in(Some(id), text, code, schema, CaseFallback::Both)
     }
 
     /// 写入各库对应的 `[[ui.comment_dicts]].id`（`(源文件路径, ids)`，路径同 `reload_comments`）。
@@ -902,15 +948,78 @@ impl ReverseLookup {
         }
     }
 
-    fn comment_in(&self, id: Option<&str>, text: &str, code: Option<&str>, schema: &str) -> String {
-        // ★ 白名单过滤对三遍扫描**统一施加**：漏掉任何一遍，那条路径就会从被排除的库里
-        // 取出注释，表现为「限定了方案，可有些词还是显示别的方案的注释」——只在大小写
-        // 回退这类少数路径上出现，最难查。
-        let applicable = || {
-            self.comments.iter().filter(|s| {
-                s.applies_to(schema) && id.is_none_or(|id| s.ids.iter().any(|i| i == id))
-            })
+    /// 查词在**全部适用库**里的注释（`${dict_all}`）：每库最多一条（先同码、无则该库首条），
+    /// 按挂载顺序，按字符串去重，空串跳过。所有库都没有精确命中时，再按大小写变形各库
+    /// 取一条（同 [`Self::comment_of`] 的回退那遍，且同受白名单约束）。
+    ///
+    /// 不变量：[`Self::comment_of`] 的结果总在本函数的结果里——它取的是某个库的那一条，
+    /// 而那个库在这里出的正是同一条（逐库「先同码后首条」与跨库两遍扫描对单个库等价）。
+    pub fn comments_of(&self, text: &str, code: Option<&str>, schema: &str) -> Vec<String> {
+        self.comments_of_with(text, code, schema, CaseFallback::Both)
+    }
+
+    /// [`Self::comments_of`] 的通用形：可指定大小写回退的方向（见 [`CaseFallback`]）。
+    pub fn comments_of_with(
+        &self,
+        text: &str,
+        code: Option<&str>,
+        schema: &str,
+        fallback: CaseFallback,
+    ) -> Vec<String> {
+        let code = code.filter(|c| !c.is_empty());
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |s: &str| {
+            if !s.is_empty() && !out.iter().any(|o| o == s) {
+                out.push(s.to_string());
+            }
         };
+        let mut exact = false;
+        for src in self.applicable_comments(None, schema) {
+            let one = code
+                .and_then(|c| src.lookup_by_code(text, c))
+                .or_else(|| src.lookup_first(text));
+            if let Some(s) = one {
+                exact = true;
+                push(s);
+            }
+        }
+        if !exact {
+            let variants = fallback.variants(text);
+            if !variants.is_empty() {
+                for src in self.applicable_comments(None, schema) {
+                    if let Some(s) = variants.iter().find_map(|v| src.lookup_first(v)) {
+                        push(s);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 适用于 `schema` 语境的注释库（`id` 给定时只限该库），按挂载顺序。
+    ///
+    /// ★ 白名单判据只此一份：`comment_in` 的三遍扫描与 `comments_of` 的两遍都经它。
+    /// 漏掉任何一遍，那条路径就会从被排除的库里取出注释，表现为「限定了方案，可有些词
+    /// 还是显示别的方案的注释」——只在大小写回退这类少数路径上出现，最难查。
+    fn applicable_comments<'a>(
+        &'a self,
+        id: Option<&'a str>,
+        schema: &'a str,
+    ) -> impl Iterator<Item = &'a CommentSource> + 'a {
+        self.comments.iter().filter(move |s| {
+            s.applies_to(schema) && id.is_none_or(|id| s.ids.iter().any(|i| i == id))
+        })
+    }
+
+    fn comment_in(
+        &self,
+        id: Option<&str>,
+        text: &str,
+        code: Option<&str>,
+        schema: &str,
+        fallback: CaseFallback,
+    ) -> String {
+        let applicable = || self.applicable_comments(id, schema);
         if let Some(c) = code.filter(|c| !c.is_empty())
             && let Some(hit) = applicable().find_map(|s| s.lookup_by_code(text, c))
         {
@@ -919,7 +1028,7 @@ impl ReverseLookup {
         if let Some(hit) = applicable().find_map(|s| s.lookup_first(text)) {
             return hit.to_string();
         }
-        for v in case_fallbacks(text) {
+        for v in fallback.variants(text) {
             if let Some(hit) = applicable().find_map(|s| s.lookup_first(&v)) {
                 return hit.to_string();
             }
@@ -1678,6 +1787,177 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ───────────── `${dict_all}`：全部适用库各出一条（论坛 t282） ─────────────
+
+    /// 两库都有该词 → 按挂载顺序各出一条；`${dict}` 只回第一条。
+    #[test]
+    fn comments_of_collects_one_per_library_in_mount_order() {
+        let (dir, both) = rl_both(
+            "all-order",
+            &[
+                &[("configure", "v.配置", "")],
+                &[("configure", "[IT]配置…", "")],
+            ],
+        );
+        for (name, rl) in &both {
+            assert_eq!(
+                rl.comments_of("configure", None, ""),
+                ["v.配置", "[IT]配置…"],
+                "{name}"
+            );
+            assert_eq!(rl.comment_of("configure", None, ""), "v.配置", "{name}");
+            assert!(rl.comments_of("nosuch", None, "").is_empty(), "{name}");
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一份内容挂两次（不同路径）只出一条：按字符串去重。
+    #[test]
+    fn comments_of_dedups_identical_text_across_libraries() {
+        let (dir, both) = rl_both(
+            "all-dedup",
+            &[
+                &[("好", "good", "")],
+                &[("好", "good", "")],
+                &[("好", "女子", "")],
+            ],
+        );
+        for (name, rl) in &both {
+            assert_eq!(rl.comments_of("好", None, ""), ["good", "女子"], "{name}");
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同库同词多码：注释相同只出一条；注释不同按 code 只出对应那条，无 code 出首条。
+    #[test]
+    fn comments_of_gives_at_most_one_per_library() {
+        let (dir, both) = rl_both(
+            "all-percode",
+            &[
+                &[("了", "助词", "le"), ("了", "助词", "liao")],
+                &[("行", "走", "xing"), ("行", "银行", "hang")],
+            ],
+        );
+        for (name, rl) in &both {
+            assert_eq!(rl.comments_of("了", Some("liao"), ""), ["助词"], "{name}");
+            assert_eq!(rl.comments_of("行", Some("hang"), ""), ["银行"], "{name}");
+            assert_eq!(rl.comments_of("行", Some("xing"), ""), ["走"], "{name}");
+            assert_eq!(rl.comments_of("行", None, ""), ["走"], "{name}");
+            assert_eq!(
+                rl.comments_of("行", Some("zzz"), ""),
+                ["走"],
+                "{name}：code 对不上回落该库首条"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 白名单排除的库不出现——精确那遍与大小写回退那遍都一样。
+    #[test]
+    fn comments_of_respects_schema_whitelist_in_both_passes() {
+        let (dir, mut paths) = write_libs(
+            "all-wl",
+            &[&[("apple", "n.苹果", "")], &[("apple", "[水果]苹果", "")]],
+        );
+        paths[0].1 = vec!["english".into()];
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&dir.join("cache")));
+
+        assert_eq!(
+            rl.comments_of("apple", None, "english"),
+            ["n.苹果", "[水果]苹果"]
+        );
+        assert_eq!(rl.comments_of("apple", None, "wubi86"), ["[水果]苹果"]);
+        assert_eq!(
+            rl.comments_of("APPLE", None, "wubi86"),
+            ["[水果]苹果"],
+            "大小写回退那一遍同样受白名单约束"
+        );
+        assert_eq!(
+            rl.comments_of("APPLE", None, "english"),
+            ["n.苹果", "[水果]苹果"]
+        );
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大小写回退：全无精确命中时 `Configure` 能聚合两库；任一库有精确命中则不走回退。
+    #[test]
+    fn comments_of_case_fallback_only_without_exact_hits() {
+        let (dir, both) = rl_both(
+            "all-case",
+            &[
+                &[("configure", "v.配置", "")],
+                &[("configure", "[IT]配置…", "")],
+            ],
+        );
+        for (name, rl) in &both {
+            assert_eq!(
+                rl.comments_of("Configure", None, ""),
+                ["v.配置", "[IT]配置…"],
+                "{name}"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, both) = rl_both(
+            "all-case-exact",
+            &[
+                &[("configure", "v.配置", "")],
+                &[("Configure", "人名?", "")],
+            ],
+        );
+        for (name, rl) in &both {
+            assert_eq!(
+                rl.comments_of("Configure", None, ""),
+                ["人名?"],
+                "{name}：有精确命中就不再按大小写变形去别的库捞"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不变量：`comment_of` 的结果 ∈ `comments_of` 的结果（都空时同为空）。
+    #[test]
+    fn comment_of_is_always_among_comments_of() {
+        let (dir, both) = rl_both(
+            "all-inv",
+            &[
+                &[("行", "通用释义", ""), ("Us", "缩写", "")],
+                &[("行", "五笔专用", "tfhh"), ("us", "我们", "")],
+                &[("US", "美国", ""), ("行", "通用释义", "")],
+            ],
+        );
+        let queries: &[(&str, Option<&str>)] = &[
+            ("行", None),
+            ("行", Some("tfhh")),
+            ("行", Some("hang")),
+            ("us", None),
+            ("US", None),
+            ("uS", None),
+            ("Us", None),
+            ("无", None),
+        ];
+        for (name, rl) in &both {
+            for &(t, code) in queries {
+                let one = rl.comment_of(t, code, "");
+                let all = rl.comments_of(t, code, "");
+                if one.is_empty() {
+                    assert!(all.is_empty(), "{name} {t} {code:?}: {all:?}");
+                } else {
+                    assert!(all.contains(&one), "{name} {t} {code:?}: {one} ∉ {all:?}");
+                }
+            }
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★ 重载时仍在列表里的库**原样复用**：不重新校验指纹，也就不再读源文件。
     ///
     /// 这是切方案（`schemas` 字段）的高频路径——方案专属库开关的同时，全局库通常一字未改，
@@ -1961,6 +2241,60 @@ mod tests {
                 rl.comment_of("Us", None, ""),
                 "我们",
                 "{name} 回退顺序：小写在先"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ `LowerOnly`（论坛 t281）：词的大小写已由词库确证时，回退只许把大写改小写，不许升格。
+    ///
+    /// 小写 `asp`（毒蛇）与大写缩写 `ASP`（Active Server Pages）是两个词；双向回退会让前者
+    /// 贴上后者的释义。往小写走（`Configure` → `configure`）只是句首 / 大写锁定的形态差，
+    /// 照常放行。
+    #[test]
+    fn lower_only_fallback_never_raises_case() {
+        let (dir, both) = rl_both(
+            "case-lower-only",
+            &[&[
+                ("ASP", "[IT]动态服务器页面", ""),
+                ("configure", "v.配置", ""),
+            ]],
+        );
+        for (name, rl) in &both {
+            let one = |t: &str| rl.comment_of_with(None, t, None, "", CaseFallback::LowerOnly);
+            let all = |t: &str| rl.comments_of_with(t, None, "", CaseFallback::LowerOnly);
+            assert_eq!(one("asp"), "", "{name}：小写词不得升格去命中大写缩写");
+            assert!(all("asp").is_empty(), "{name}");
+            assert_eq!(one("Asp"), "", "{name}：首字母大写同样不得升到全大写");
+            assert_eq!(one("ASP"), "[IT]动态服务器页面", "{name}：精确照常");
+            assert_eq!(one("Configure"), "v.配置", "{name}：往小写走照常");
+            assert_eq!(all("CONFIGURE"), ["v.配置"], "{name}");
+            // 双向档（默认）行为不变。
+            assert_eq!(
+                rl.comment_of("asp", None, ""),
+                "[IT]动态服务器页面",
+                "{name}"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 注释库同时收了小写原词：精确命中它，与大写那条无关。
+        let (dir, both) = rl_both(
+            "case-lower-only-both",
+            &[&[("ASP", "[IT]动态服务器页面", ""), ("asp", "n.毒蛇", "")]],
+        );
+        for (name, rl) in &both {
+            assert_eq!(
+                rl.comment_of_with(None, "asp", None, "", CaseFallback::LowerOnly),
+                "n.毒蛇",
+                "{name}"
+            );
+            assert_eq!(
+                rl.comments_of_with("asp", None, "", CaseFallback::LowerOnly),
+                ["n.毒蛇"],
+                "{name}"
             );
         }
         drop(both);

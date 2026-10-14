@@ -288,7 +288,8 @@ fn clear_blocked_by_candidates(candidates: &[Candidate], input_len: usize) -> bo
 /// `opts`，协调器取不到，故短语侧须在此重算。两处语义必须一致。
 ///
 /// `max_code_length` 为 0（拼音等无「全码」概念的引擎，见 `Engine::max_code_length` 默认实现）
-/// 时结果为 0 → 调用方的 `len < 0` 恒假 → 不设闸，与引擎侧同构降级。
+/// 时结果为 0 → `len < 0` 恒假、不设闸。短语自动上屏因此在调用前就先把这类引擎整体拦下
+/// （论坛 t308），不靠这里。
 fn resolve_auto_commit_min_len(configured: usize, max_code_length: usize) -> usize {
     if configured > 0 {
         configured
@@ -420,7 +421,8 @@ fn make_emoji_candidate(text: String) -> Candidate {
 impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
-    /// 未开启「自动调频」（`schema.codetable/pinyin.frequency.enabled`）时不记录，避免关闭功能后仍写库。
+    /// 未开启「自动调频」（`schema.*.frequency.enabled`）时不记录，避免关闭功能后仍写库；
+    /// 例外是用户显式要求「只记次数」（`record_always`，论坛 t278）——那时只写不读。
     /// 记一条上屏历史（最近置前，限 16 条）。供命令栏 `last(n)`、加词推荐、
     /// z 键重复上屏与快捷输入的 `quick_input.repeat` 共用同一事实源。
     ///
@@ -487,7 +489,7 @@ impl Coordinator {
     /// ★ 找不到对应词库词的头部候选（纯原文，如 `wxyzq`）**不记词频、只记上屏历史**——与
     /// 临英 / 快捷输入同一口径（理由见 `english_head_dict_word`：`(wxyzq, wxyzq)` 是读端永远
     /// 查不中的孤儿键）。输入统计由各出口自己的 `record_commit` 记，不经本函数，照旧。
-    /// 调频关时同样只记历史——那时改前也只记了历史（写端被开关挡下）。
+    /// 不记词频时（调频关且未开 `record_always`）同样只记历史——写端本就被开关挡下。
     pub(crate) fn record_selection_cand(&self, code: &str, cand: &Candidate) {
         if self.engine_mgr.active_is_english()
             && crate::english_candidates::is_english_head_candidate(cand, code)
@@ -498,7 +500,7 @@ impl Coordinator {
                 return self.record_selection_cand_in(None, &freq_code, &word);
             }
             self.push_commit_history(&cand.text);
-            // 头部候选找不到词库词：英文自动造词的信号。`english_head_dict_word` 在调频关着时
+            // 头部候选找不到词库词：英文自动造词的信号。`english_head_dict_word` 在不记词频时
             // 恒 None，所以「是不是词库词」由 `learn_english_raw` 自己再问一遍引擎。
             self.learn_english_raw(&active, &cand.text);
             return;
@@ -593,9 +595,10 @@ impl Coordinator {
             let owner = schema_override
                 .map(str::to_string)
                 .unwrap_or_else(|| self.engine_mgr.active_schema_id());
-            // 未开启「自动调频」则不记录（配置说关、代码却记的潜在 bug，对齐 apply_freq_rerank 的开关检查）。
+            // 未开启「自动调频」则不记录（配置说关、代码却记的潜在 bug，对齐 apply_freq_rerank 的开关检查），
+            // 除非开了「只记次数」`record_always`。读端仍只认 `enabled`，见 `FreqSettings::records`。
             let settings = self.engine_mgr.freq_settings_for(&owner);
-            if !settings.enabled {
+            if !settings.records() {
                 return;
             }
             // 排除区块（`schema.frequency.exclude_blocks`，出厂为空）：emoji 这类候选不学词频。
@@ -1322,6 +1325,11 @@ impl Coordinator {
         let phrase_spec = self.phrase_spec_of(state);
         let phrase_scope = crate::schema_scope::phrase_scope(&phrase_spec);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
+        // 本轮是否**真出了**精确码短语候选（下方合成候选让位的判据）。不能用
+        // `phrase_has_exact_code`：码在表里不等于候选出得来——求值为空（非节日的 `$LF`、
+        // 剪贴板空时的 `{dict.rev(clip())}`）或求值出错的条目被 `lookup` 整条丢弃，照那个
+        // 判据会把切分候选也删掉，候选窗全空。
+        let mut exact_phrase_shown = false;
         if wildcard_pattern.is_none() && !phrases.is_empty() && !phrase_scope.is_closed() {
             let recent = self.recent_commits_snapshot();
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
@@ -1351,6 +1359,7 @@ impl Coordinator {
                 reverse: &reverse,
             };
             for hit in phrases.lookup(&state.input_buffer, &recent, &host, &phrase_scope) {
+                exact_phrase_shown = true;
                 let is_command = hit.command_src.is_some();
                 let is_system = hit.is_system;
                 // 稳定 id 取**模板原文**：text 可能是求值结果（date/time/clip），逐日变化。
@@ -1430,7 +1439,7 @@ impl Coordinator {
             // 精确匹配模式（`single_code_input`，仅纯码表方案）：默认抑制短语前缀枚举，只保留上面的
             // 精确码短语（`lookup`）——与码表引擎跳过 `search_prefix` 的行为对齐。混输不适用：其拼音半边
             // 恒前缀匹配，切精确会与拼音割裂（见 `EngineManager::is_codetable`）。
-            // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
+            // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且不超码长时，
             // 放行一次前缀枚举作**补全候选源**，避免精确模式下彻底无候选。
             let ct = self.engine_mgr.codetable_settings();
             // 引擎模式：纯码表 vs 拼音/混输。全局短语的前缀命中按**来源**（来源=短语库、全局、
@@ -1446,7 +1455,8 @@ impl Coordinator {
             let complete_fallback = exact_only
                 && ct.single_code_complete
                 && candidates.is_empty()
-                && state.input_buffer.chars().count() < self.engine_mgr.active_max_code_length();
+                // `<=`：满码长空码也补（论坛 t302），与引擎侧 `completion_hints` 的闸门同口径。
+                && state.input_buffer.chars().count() <= self.engine_mgr.active_max_code_length();
             let prefix_hits = if !exact_only || complete_fallback {
                 phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix, &phrase_scope)
             } else {
@@ -1541,6 +1551,20 @@ impl Coordinator {
             }
         }
         drop(phrases);
+        // 码表合成候选（逆切分 / 整句）让位给**精确码短语**（论坛 t307）。
+        //
+        // 引擎判「空码」只看得见码表：两者的闸门都是「整串无精确解」，而短语在 convert 之后
+        // 才由上面追加 ⇒ 短语码在码表里空码时照切不误，`ojs`（直通命令）旁边多出「井三/井所有」，
+        // 组合区还会显示切分串。补上引擎够不到的那一半：精确码短语就是这串码的精确解。
+        //
+        // ⚠️ 限定码表来源：拼音整句同样带 `is_sentence`，它与短语本就并列，不归这里管。
+        let codetable_composed = |c: &Candidate| {
+            (c.is_split_composed || c.is_sentence) && c.source == CandidateSource::CodeTable
+        };
+        if exact_phrase_shown && candidates.iter().any(codetable_composed) {
+            candidates.retain(|c| !codetable_composed(c));
+            state.preedit_codetable_body.clear();
+        }
         let mixed =
             self.engine_mgr.current_engine_type() == Some(wind_engine::engine::EngineType::Mixed);
         // 供跨来源档位判「消费整串」与「码 == 输入」。缓冲恒 ASCII，字节长度与 `consumed_length` 同域。
@@ -1895,6 +1919,15 @@ impl Coordinator {
     pub(crate) fn phrase_auto_commit(&self, state: &State) -> Option<InputOutcome> {
         let ct = self.engine_mgr.codetable_settings();
         if !ct.auto_commit_at_full {
+            return None;
+        }
+        // 无「满码」概念的引擎（拼音 / 双拼，`max_code_length` 为 0）**整体不参与**（论坛 t308）。
+        //
+        // 开关读的是 `schema.codetable`，拼音方案照样继承全局那一份；而下面的最短码长闸在码长
+        // 为 0 时恒放行 ⇒ 只剩「唯一候选」一道闸。双拼关掉简拼后，`ofa` 这类码没有任何拼音
+        // 候选，直通命令 `$CC(…ime.schema…)` 成了唯一一条，打完第三码当场执行。简拼开着时
+        // 不触发只是碰巧多了一条简拼候选，换个无拼音解的码照样中招。
+        if self.engine_mgr.active_max_code_length() == 0 {
             return None;
         }
         // 最短码长闸：与引擎 decide_auto_commit 的 `input.chars().count() < min_len` 同构。
