@@ -102,6 +102,7 @@ impl Coordinator {
         self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
         self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
         self.push_composition_placeholder_config(client_token); // 空文本兜底占位字符（GH#175）
+        self.push_multiline_commit_config(client_token); // 多行上屏是否走粘贴：DLL 重连从 commit 起步
         self.push_compat_title_match_config(client_token); // 采不采窗口标题：DLL 重连从「关」起步
         self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
         self.push_cn_passthrough_punct_config(client_token); // 中文模式该透传的标点：DLL 据此**不**吃
@@ -301,6 +302,26 @@ impl Coordinator {
             wind_ipc::codec::encode_sync_config(
                 wind_ipc::protocol::CONFIG_KEY_COMPOSITION_PLACEHOLDER,
                 &value,
+            )
+        };
+        if client_token != 0 {
+            self.push_server
+                .push_to_token(client_token, &make(client_token));
+        } else {
+            self.push_server.push_per_client(make);
+        }
+    }
+
+    /// 下发「含换行的上屏是否走剪贴板粘贴」给 DLL（CONFIG_KEY_MULTILINE_COMMIT，compat 规则
+    /// `multiline_commit`）。按各客户端现算，口径与时机同 [`Self::push_composition_placeholder_config`]。
+    pub fn push_multiline_commit_config(&self, client_token: u64) {
+        let make = |token: u64| {
+            let paste = (token >> 32) as u32 != 0
+                && self.with_token_compat_rule(token, |r| r.and_then(|r| r.multiline_commit))
+                    == Some(wind_config::app_compat::MultilineCommit::Paste);
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_MULTILINE_COMMIT,
+                &wind_ipc::codec::encode_multiline_commit_value(paste),
             )
         };
         if client_token != 0 {

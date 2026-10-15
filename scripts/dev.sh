@@ -514,7 +514,7 @@ download_dicts() {
     # 辅助码表：拼音候选的字形二次筛选（默认关闭的功能，见 schema.pinyin.aux_code）。
     # 小鹤/自然码两张已是 `字=码` 行格式，零转换；笔画表来自 rime-stroke 的 .dict.yaml，
     # 由 gen_aux_code 剥 YAML 头 + 按字集裁剪（字表来自 zispace/hanzi-chars）。
-    # ⚠️ rime-stroke 是 LGPL-3.0，与本仓 MIT 不同 —— 同 rime-frost 处理：只下载不入库，
+    # ⚠️ rime-stroke 是 LGPL-3.0，与本仓 GPL-3.0 不同 —— 同 rime-frost 处理：只下载不入库，
     # 产物随发行版分发并适用原许可，见 NOTICE.md。
     local aux_code="$CACHE_DIR/aux-code"
     mkdir -p "$aux_code/charset"
@@ -534,7 +534,7 @@ download_dicts() {
         "$aux_code/charset/Unicode-CJK 〇.txt" "字集: 〇"
 
     # Emoji 候选扩展（设计见 docs/design/emoji-suggestion.md，出厂关闭）。
-    # ⚠️ rime-emoji 是 LGPL-3.0，与本仓 MIT 不同。政策与 rime-stroke 一致 —— 只下载不入库；
+    # ⚠️ rime-emoji 是 LGPL-3.0，与本仓 GPL-3.0 不同。政策与 rime-stroke 一致 —— 只下载不入库；
     #    但**分发方式刻意不同**：本表随发行版**原样**分发（不做构建期转换），我们分发的因此是
     #    逐字副本而非衍生作品，LGPL 的修改版义务不触发。繁→简归一与二进制化都在**用户本机**
     #    首次启用时进行，产物是本机缓存，从不离开用户机器 ⇒ 不构成 conveying。
@@ -1398,7 +1398,7 @@ do_installer() {
 # 【不含 userdata/】—— 那是便携版的用户数据目录(配置/词频/用户词库), 打进包等于把打包机
 # 的个人数据分发给所有人。
 # 缺 wind_setting.exe / wind_portable.exe 时照常出包: build_setting/build_portable 在伴生仓
-# 缺失时自行跳过(见其函数首行), 此处不二次判定 —— 这也让没有私有伴生仓的环境能出便携包。
+# 缺失时自行跳过(见其函数首行), 此处不二次判定 —— 这也让没有伴生仓的环境能出便携包。
 do_portable_zip() {
     local skip="${1:-}"
     if [ "$skip" = "skip" ]; then

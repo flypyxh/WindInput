@@ -137,7 +137,7 @@ cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 #    声明, 不等于副本)。补齐需在 gen-data 里逐个下载上游 LICENSE, 属独立的合规工作,
 #    不在本次改动范围内 —— 见 NOTICE.md 的「许可证兼容性说明」。
 mkdir -p "$STAGE/licenses"
-cp -f "$PRODUCT_ROOT/LICENSE"   "$STAGE/licenses/LICENSE"    # 本项目自身 (MIT)
+cp -f "$PRODUCT_ROOT/LICENSE"   "$STAGE/licenses/LICENSE"    # 本项目自身 (GPL-3.0-or-later)
 cp -f "$PRODUCT_ROOT/NOTICE.md" "$STAGE/licenses/NOTICE.md"
 # rime-emoji 的 LGPL-3.0 全文随数据一同分发, 紧贴 data/emoji/ (assemble_data 复制)。
 

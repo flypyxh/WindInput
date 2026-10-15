@@ -440,7 +440,7 @@ impl Coordinator {
 
     /// 焦点换了窗口（同一 token 的窗口上下文变了）时，给该 token 重推按规则现算的 DLL 配置。
     ///
-    /// 清单与 `revalidate_pid_name` 的补推一致：这三项都是「按目标客户端现算」的。握手推的值按
+    /// 清单与 `revalidate_pid_name` 的补推一致：这几项都是「按目标客户端现算」的。握手推的值按
     /// 空窗口算（那时还没有焦点），故首次获焦带来类名时同样要推（`Chrome_WidgetWin_*` 的占位
     /// 字符就靠这一下才到 DLL）。
     pub(crate) fn repush_window_scoped_dll_config(&self, token: u64) {
@@ -450,6 +450,7 @@ impl Coordinator {
         self.push_password_suppress_config(token);
         self.push_english_pair_config(token);
         self.push_composition_placeholder_config(token);
+        self.push_multiline_commit_config(token);
     }
 }
 
@@ -744,6 +745,71 @@ initial_mode = "chinese"
             "\u{2800}",
             "协调器自己发的占位"
         );
+    }
+
+    /// 收到的多行上屏方式推送：`None` = 没推，`Some(paste)` = 推了一次。
+    fn pushed_multiline(cap: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<bool> {
+        let msg = |paste: bool| {
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_MULTILINE_COMMIT,
+                &wind_ipc::codec::encode_multiline_commit_value(paste),
+            )
+        };
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        match (got.contains(&msg(false)), got.contains(&msg(true))) {
+            (false, false) => None,
+            (true, false) => Some(false),
+            (false, true) => Some(true),
+            _ => panic!("同一轮收到两种值"),
+        }
+    }
+
+    /// `multiline_commit` 按客户端现算下发：进程规则在握手时就生效，窗口规则随获焦重推，
+    /// 没配的进程推 commit。
+    #[test]
+    fn multiline_commit_pushes_per_client_and_repushes_on_window_change() {
+        let c = coord_with_rules(
+            "multiline",
+            "[[apps]]\nprocess = \"Weixin.exe\"\nmultiline_commit = \"paste\"\n\n\
+             [[apps]]\nprocess = \"Weixin.exe\"\nclass = \"Term*\"\nmultiline_commit = \"commit\"\n",
+        );
+        c.pid_names.lock().unwrap().insert(42, "weixin.exe".into());
+        c.pid_names.lock().unwrap().insert(43, "notepad.exe".into());
+        let t = (42u64 << 32) | 1;
+        let other = (43u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(t);
+        let cap_other = c.push_server.attach_capture_client(other);
+
+        c.push_multiline_commit_config(t);
+        assert_eq!(pushed_multiline(&cap), Some(true), "握手：进程规则即生效");
+        c.push_multiline_commit_config(other);
+        assert_eq!(pushed_multiline(&cap_other), Some(false), "没配 = commit");
+
+        c.handle_focus_gained(&focus(t, "TermWnd"));
+        assert_eq!(
+            pushed_multiline(&cap),
+            Some(false),
+            "换到带窗口条件的规则必须重推"
+        );
+        c.handle_focus_gained(&focus(t, "MainWnd"));
+        assert_eq!(pushed_multiline(&cap), Some(true));
+
+        c.push_multiline_commit_config(0);
+        assert_eq!(pushed_multiline(&cap), Some(true), "广播按各客户端现算");
+        assert_eq!(pushed_multiline(&cap_other), Some(false));
+    }
+
+    /// 出厂规则：微信推 paste。
+    #[test]
+    fn shipped_rules_push_paste_to_weixin() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data/compat.toml");
+        let text = std::fs::read_to_string(path).expect("仓库 data/compat.toml 必须在");
+        let c = coord_with_rules("multiline_shipped", &text);
+        c.pid_names.lock().unwrap().insert(42, "weixin.exe".into());
+        let t = (42u64 << 32) | 1;
+        let cap = c.push_server.attach_capture_client(t);
+        c.push_multiline_commit_config(t);
+        assert_eq!(pushed_multiline(&cap), Some(true));
     }
 
     /// 进入类字段只在「命中的带窗口条件的**进入类**规则集合」变了时重算：只管占位的类名规则

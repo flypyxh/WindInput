@@ -69,7 +69,6 @@
 #                                   更进一步：直接采信首条（连打不重排，跟手比精确更重要）。
 #                                   焦点切换或鼠标移动光标之后，手里的坐标属于别处，此时
 #                                   自动退回去等真坐标（首帧信任门），不会先错位再跳。
-#                                   实测常规连打首帧中位 7ms，焦点后首帧中位 105ms。
 #                         "wait"    等宿主 reflow 后的权威坐标才显示，代价是 85~95ms 首显
 #                                   延迟，快速连打时候选框只来得及显示几毫秒。留给
 #                                   "fast" 判据失灵的宿主兜底。
@@ -128,7 +127,7 @@
 #                           ② 宿主没声明、却把候选串**读走了**（传统 IMM32 宿主经系统桥接
 #                              取候选自己画，老网游多是这一类）——这是**推断**，本字段管的
 #                              就是它。
-#                         ⚠ 为什么默认是「否」（2026-09-15 反转）：读候选串的**不一定**在画。
+#                         ⚠ 为什么默认是「否」：读候选串的**不一定**在画。
 #                         实测 Notepad / Illustrator / EverEdit 都把候选串整串读走却都不画，
 #                         默认当它们自绘的话现象是**两个候选框都没有**、完全不能用，而用户
 #                         无从知道要来这里配什么。反过来判错（该收没收）最多多出一个框，
@@ -144,9 +143,8 @@
 #                         组合区占位字符："space" | "zwsp" | "blank"｜不写=space（空格）。
 #                         编码不显示在软件里时（非嵌入模式、联想态、热键进入的加词/临拼等），
 #                         输入法要在软件的输入区里挂一个占位字符撑住组合。历来是空格。
-#                         ⚠ GH#175：网页里的受控输入框会把组合中的内容 trim() 后回写
-#                         （番茄小说搜索框即是），空格一被去掉，浏览器就终止组合，一个字都
-#                         上不了屏。"zwsp" 改用零宽空格 U+200B，trim() 不去掉它。
+#                         ⚠ 网页里的受控输入框会把组合中的内容 trim() 后回写，空格一被去掉，
+#                         浏览器就终止组合，一个字都上不了屏。"zwsp" 改用零宽空格 U+200B，trim() 不去掉它。
 #                         "blank" 用盲文空白 U+2800：同样不被 trim() / \s 当空白，而且**有宽度**。
 #                         给「靠出现内容才进入编辑态」的宿主用——钉钉在线表格选中单元格直接打字
 #                         时，零宽空格被当成没有内容、不进编辑态，组合停在左上角的代理输入框里，
@@ -154,6 +152,9 @@
 #                         出厂按窗口类名给 Chromium（含所有 Electron 应用）与 Firefox 开（见下方
 #                         两条 class 规则）。不要给 WPS 等软件改：它们靠那个空格才能给出有效的
 #                         光标位置。支持 process = "*" 通配与 class / title 窗口条件。
+#   multiline_commit:     含换行的上屏文本怎么交给软件："commit" | "paste"｜不写=commit（直接上屏）。
+#                         "paste" 先结束组合，再把文本写入剪贴板并模拟 Ctrl+V 粘贴；只影响含换行的上屏。
+#                         ⚠ 会覆盖剪贴板原有内容且不恢复（不进剪贴板历史）；终端等 Ctrl+V 不是粘贴的软件不要开。
 #   caret_offset_x:       光标坐标水平校正（dp，96dpi 基准逻辑像素，正=右，默认 0）。
 #   caret_offset_y:       光标坐标垂直校正（dp，96dpi 基准逻辑像素，正=下，默认 0）。
 #                         用于宿主报告的光标坐标**系统性偏移**的场景（如 Windows Terminal，
@@ -193,63 +194,63 @@
 
 [[apps]]
 process = "MapleStory.exe"
-comment = "新枫之谷（台服）- CUAS 的 IMM32 桥替它读走候选、画出旧版系统候选窗，屏幕上两个框且宿主那个停在第一个码的候选上（论坛 65 楼 253 帖，0.121.0 起）。宿主画的那个贴着它自己的输入框，比我们在全屏游戏里靠 caret 猜的准——这类宿主的 caret 恒为退化矩形。故让出绘制权，只留它那一个框"
+comment = "新枫之谷（台服）：宿主经 IMM32 自绘候选框，收起我们的框，避免两个框"
 host_drawn_candidates = true
 
 [[apps]]
 process = "Weixin.exe"
-comment = "微信 - Qt WebView 输入框 caret height 不稳定（h=1 或 h=20），使用 rect.top 定位；组合期间上报的 rect 还会停在上一次组合的位置（差 136~419px），需拦截陈旧试探坐标"
+comment = "微信：光标高度不稳定改用顶边定位；拦截陈旧坐标；多行文本用粘贴上屏"
 caret_use_top = true
 stale_probe_guard = true
+multiline_commit = "paste"
 
 [[apps]]
 process = "QQ.exe"
-comment = "QQNT 聊天框长组合时交替上报组合起点降级帧与当前 selection；compStart 稳定，caret 跨度不是锚点错误"
+comment = "QQNT：长组合时交替上报组合起点与插入点，不当作锚点错误"
 composition_start_pair_guard = true
 
 [[apps]]
 process = "Code.exe"
-comment = "VS Code - CEF 嵌入组合，帧形态同 QQNT（降级帧 + 换行后的陈旧 cached 帧）；实测越阈 175 次，最大跨度 2402px"
+comment = "VS Code：同 QQNT 的组合起点交替上报"
 composition_start_pair_guard = true
 
 [[apps]]
 process = "Feishu.exe"
-comment = "飞书 - 同上；实测越阈 170 次，最大跨度 1112px。另有连发两个 TSF_COMPOSITION 帧的变体。在线表格换单元格首键：probe/pre_reflow 帧带上一格的陈旧坐标，首显画在旧位置、约 80ms 后跳到新格（实测 dx≤852 dy≤540）"
+comment = "飞书：同 QQNT 的组合起点交替上报；在线表格换单元格首键坐标停在上一格"
 composition_start_pair_guard = true
 stale_probe_guard = true
 
 [[apps]]
 process = "SearchHost.exe"
-comment = "Win11 开始菜单 / 任务栏搜索，候选窗无法盖过其 Band 层级，走 HostRender 代理渲染"
+comment = "Win11 开始菜单 / 任务栏搜索：候选框盖不过其层级，改由宿主代理渲染"
 host_render = true
 
 [[apps]]
 process = "searchapp.exe"
-comment = "Win10 任务栏搜索"
+comment = "Win10 任务栏搜索：同上"
 host_render = true
 
 [[apps]]
 process = "startmenuexperiencehost.exe"
-comment = "Win10 开始菜单输入框"
+comment = "Win10 开始菜单：同上"
 host_render = true
 
 [[apps]]
 process = "EXCEL.EXE"
-comment = "进单元格时先在编辑栏建临时编辑上下文、约 0.5s 后才切到单元格，fast 档的试探坐标会抢在切换前把候选窗显示在编辑栏，随后再大幅跳到单元格；wait 档整条忽略试探坐标、并由 caret_pending 握手把兜底延到 600ms，足以等过这次切换，实测一次到位"
+comment = "Excel：进单元格前先在编辑栏报坐标，fast 首显会落在编辑栏，改用 wait"
 first_show_mode = "wait"
 
 [[apps]]
 process = "et.exe"
-comment = "WPS 表格，与 Excel 同类：每个字都换一次 docMgr，且切换前先报上一个单元格的坐标与组合起点。fast 档的试探坐标抢在切换前首显于旧单元格，组合起点也随之锁死在那里——此后即便校正判据判出 277px 偏移触发 reshow，下发位置仍取那个锁死的组合起点，表现为候选窗恒慢一步"
+comment = "WPS 表格：同 Excel，fast 首显落在上一个单元格，改用 wait"
 first_show_mode = "wait"
 
-# GH#175：按顶层窗口类名认浏览器内核，而不是逐个列进程名（Edge / Chrome / 各家套壳浏览器的
+# 按顶层窗口类名认浏览器内核，而不是逐个列进程名（Edge / Chrome / 各家套壳浏览器的
 # 进程名数不完）。⚠ Chrome_WidgetWin_* 是整个 Chromium 家族的窗口类，**所有 Electron / CEF 应用
 # 一并命中**：VS Code（Code.exe）、飞书、QQ NT、新版微信等。它们的网页输入框同样可能 trim；
 # 上面给 Code.exe / Feishu.exe / QQ.exe 写的进程规则不含本字段，逐字段叠加后照样继承 blank。
 # 用 blank（U+2800 盲文空白）而不是 zwsp：钉钉在线表格选中单元格直接打字时靠「出现了内容」进入
-# 编辑态，零宽字符被当成没有内容、候选窗停在左上角代理输入框；blank 有宽度又不会被 trim（实测
-# 番茄小说搜索框与钉钉表格都正常）。
+# 编辑态，零宽字符被当成没有内容、候选窗停在左上角代理输入框；blank 有宽度又不会被 trim。
 # 某个应用改用盲文空白后出了问题（光标位置不对等），在用户层给它写
 #   [[apps]]
 #   process = "Xxx.exe"
@@ -257,12 +258,12 @@ first_show_mode = "wait"
 # 进程规则比仅类名规则更具体，写了的字段压过它。
 [[apps]]
 class = "Chrome_WidgetWin_*"
-comment = "Chromium 内核（Edge / Chrome / Electron 应用）- 网页受控输入框会 trim 组合中的 value 再回写，占位空格被削掉即终止组合、一个字都上不了屏（GH#175，番茄小说搜索框）；改用盲文空白占位（零宽空格会让钉钉表格进不了编辑态）"
+comment = "Chromium 内核（含 Electron 应用）：网页输入框会 trim 占位空格导致上不了屏，改用盲文空白"
 composition_placeholder = "blank"
 
 [[apps]]
 class = "MozillaWindowClass"
-comment = "Firefox 内核 - 同上（GH#175）"
+comment = "Firefox 内核：同上"
 composition_placeholder = "blank"
 
 # 示例：给「fast 判据失灵」的宿主退回 wait（本字段不写即跟随全局默认，无需逐个开启）
@@ -311,14 +312,13 @@ composition_placeholder = "blank"
 #   · 任务栏、Alt+Tab、任务视图、任务栏溢出区、资源管理器窗口 —— 点它是为了去别处，
 #     或者另有用途（资源管理器的搜索/重命名框反而常要中文）。
 # 后一类是每次切换应用的必经之路，被规则一并命中后，每切一次应用就会重算一次初始
-# 中英状态，表现为语言栏图标频繁闪「英」。实测样本：非桌面 169 次、桌面 12 次。
+# 中英状态，表现为语言栏图标频繁闪「英」。
 #
 # 语义：**只有本段列出的窗口类才允许重算该进程的初始模式**，其余一律保持现状。
 # 只影响 per-app 初始中英/标点的重算，不影响该窗口的输入功能——任务栏搜索框照常
 # 可以打字，只是不再把当前模式改掉。
 #
 # ★ 为什么是白名单而不是黑名单（列出哪些窗口是「过渡型」）：黑名单有两个失效面，
-#   本机制初版就是黑名单，当天即被实测推翻——
 #   ① 拿不到窗口类时（explorer 新起 TSF 连接后的头一个 focus_gained，此刻连 caret
 #      都还没有）空类名不在黑名单里，被判成「不是过渡窗口」而放行，当场闪英；
 #   ② Windows 每个版本都在新增 XAML 岛窗口类，漏一个就套错一次。
@@ -339,19 +339,20 @@ composition_placeholder = "blank"
 #
 # ⚠ 未在本段出现的进程**完全不受限制**（绝大多数应用），行为与本机制引入前一致。
 
+# 不可改成全局：Excel / WPS 表格的矩形形态相同，但每字换一次 docMgr，候选框本就该跟着单元格走。
 [[apps]]
 process = "wps.exe"
-comment = "WPS 文字：组合起点每帧与插入点同步右移（矩形恒 w=2，起点即插入点），大偏移逃生阀被这份漂移数据一路骗着重锁，实测把锚点从真实起点 1830 推到 2591；而删除是逐字的、每步 15~30px 够不到 3 倍行高阈值，锚点就永久卡住，候选窗离组合区 868px。钉在首帧起点即可——首帧 compStart 是对的。⚠ 不可改成全局：Excel / et.exe 矩形形态完全相同，但它们每字换一次 docMgr、候选窗本就该跟着单元格走，靠的正是逃生阀"
+comment = "WPS 文字：组合起点随插入点漂移，候选框锚点钉在首帧起点"
 pin_anchor_when_start_drifts = true
 
 [[apps]]
 process = "WINWORD.EXE"
-comment = "Microsoft Word：与 WPS 文字同类，长组合内组合起点跟着插入点走。其 cached 帧另有 w=0 的退化矩形（坐标是另一处的陈旧值），那条由全局的「退化帧整帧不可信」判据挡掉，与本开关无关"
+comment = "Word：同 WPS 文字，组合起点随插入点漂移"
 pin_anchor_when_start_drifts = true
 
 [[initial_mode_scope]]
 process = "explorer.exe"
-comment = "Windows 资源管理器：initial_mode 只作用于桌面本身，任务栏/切换器/文件管理器窗口保持现状"
+comment = "资源管理器：初始中英态只作用于桌面，任务栏与文件窗口保持现状"
 classes = [
   "Progman", # 桌面（常规）
   "WorkerW", # 桌面（壁纸切换 / 幻灯片放映期间的桌面顶层窗口）
@@ -365,10 +366,10 @@ classes = [
 #
 # 解决的问题：「换行」在不同宿主的文本模型里根本不是同一个东西。
 #   · 富文本模型（RichEdit / TOM 这条线）的文档存储里，段落边界**就是** CR。LF 在那里
-#     不是「另一种换行写法」，而是个不构成换行的控制字符——2026-08-23 真机现场：同一段
-#     带换行的文本，Word 里每个换行处渲染成一段类似 Tab 的空白。
+#     不是「另一种换行写法」，而是个不构成换行的控制字符：Word 里每个 LF 处渲染成
+#     一段类似 Tab 的空白。
 #   · 而 VS Code / 终端 / 浏览器输入框是「写进去什么就存什么」，在那里做任何转换都是在
-#     改写用户的数据（论坛 t112：正则直通后行尾从 \n 变成 \r，用户很久之后才发现）。
+#     改写用户的数据。
 #
 # ★ 为什么出厂默认是 keep、名单只列需要转换的那几个：两个方向的漏配代价不对称。
 #   漏配一个富文本宿主 ⇒ 用户立刻看见换行显示不对，能反馈、加一行即可；
@@ -385,7 +386,13 @@ classes = [
 #
 # 遇到别的宿主换行显示不对（渲染成方块/空白、整段挤成一行），照下面的格式加一条即可。
 
+# wps.exe 刻意不在此列：记事本与 WPS 文字用 LF 即能正常分段。
 [[commit_newline]]
 process = "WINWORD.EXE"
-comment = "Microsoft Word：文档存储的段落边界是 CR，LF 落进去不构成段落（2026-08-23 真机实测）。⚠ 同现场实测『记事本与 WPS 文字正常分段』，故 wps.exe 刻意不在此列——按『富文本模型』推理会想当然地把它加进来，实测说的是反话"
+comment = "Word：段落边界是 CR，LF 不构成换行"
 style = "cr"
+
+[[commit_newline]]
+process = "QQ.exe"
+comment = "QQNT 聊天框：LF 换行的多行文本会乱序，CR 会丢换行，CRLF 正常"
+style = "crlf"

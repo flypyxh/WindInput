@@ -16,8 +16,7 @@ name: Linux Build (reusable)
 # 独立应用——Flatpak/AppImage 在这里都不成立。Debian/Ubuntu/Deepin 是当前验证过的目标;
 # rpm(Fedora/openSUSE)与 Arch(PKGBUILD)需要各自发行版上的实测,尚未做。
 #
-# 设置程序 wind-setting 仍是私有仓:没配 WIND_REPOS_TOKEN(fork 等)时整个 Linux 构建跳过并告警
-# (Linux 包的设置入口、.desktop、协议/文件关联都依赖它,不出残缺包)。产物 artifact:
+# 产物 artifact:
 # dist-linux-amd64 / dist-linux-arm64(内含 WindInput-<版本>-linux-<架构>.deb + .sha256)。
 on:
   workflow_call:
@@ -36,28 +35,18 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
-      WIND_REPOS_TOKEN:
-        description: "wind-setting 私有仓的读取 token;缺省则跳过 Linux 构建"
-        required: false
-    outputs:
-      built:
-        description: "是否实际构建了(没配 WIND_REPOS_TOKEN 时为 false)"
-        value: ${{ jobs.prep.outputs.can_build }}
 
 permissions:
   contents: read
 
 jobs:
-  # ───────────────────────── 门控 / Debian 版本号 ─────────────────────────
+  # ───────────────────────── Debian 版本号 ─────────────────────────
   prep:
-    name: 门控
+    name: 版本号
     runs-on: ubuntu-22.04
     outputs:
       deb_version: ${{ steps.v.outputs.deb_version }}   # Debian 版本,预发布后缀用 ~ 以便排在正式版之前
-      can_build: ${{ steps.gate.outputs.can_build }}
     env:
-      HAS_SETTING_TOKEN: ${{ secrets.WIND_REPOS_TOKEN != '' && 'true' || 'false' }}
       VERSION: ${{ inputs.version }}
     steps:
       - id: v
@@ -67,21 +56,12 @@ jobs:
           D="${VERSION/-/"~"}"
           echo "deb_version=$D" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION deb_version=$D"
-      - id: gate
-        run: |
-          if [ "$HAS_SETTING_TOKEN" = true ]; then
-            echo "can_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "can_build=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::未配置 secrets.WIND_REPOS_TOKEN,跳过 Linux 构建(设置程序是私有仓,Linux 包不出缺设置程序的残缺版)。"
-          fi
 
   # ───────────────────────── 词库数据(架构无关,只做一次) ─────────────────────────
   # 两个架构的包必须带同一份词库:各自下载生成,上游词库在两次下载之间变了就会产出内容不同的两个包。
   data:
     name: 词库数据
     needs: prep
-    if: needs.prep.outputs.can_build == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
@@ -111,7 +91,6 @@ jobs:
   build:
     name: Linux .deb (${{ matrix.arch }})
     needs: [prep, data]
-    if: needs.prep.outputs.can_build == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -137,15 +116,12 @@ jobs:
         with:
           repository: huanfeng/wind-ui-rust
           path: wind-ui-rust
-      - name: 检出 wind-setting (私有仓,需 WIND_REPOS_TOKEN)
+      - name: 检出 wind-setting
         uses: actions/checkout@v7
         with:
           repository: huanfeng/wind-setting
           path: wind-setting
           ref: ${{ inputs.setting_ref }}
-          token: ${{ secrets.WIND_REPOS_TOKEN }}
-          # token 不留在 .git/config：后面 cargo build 会执行全部依赖的 build.rs，不该让它们读得到
-          persist-credentials: false
 
       - name: 安装构建依赖
         run: |

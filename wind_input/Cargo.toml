@@ -37,7 +37,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 # 全工作区 lint 策略。各成员 crate 以 `[lints] workspace = true` 接入（新建 crate 别忘了加，
 # 否则它不受这里约束）。

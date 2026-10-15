@@ -82,6 +82,7 @@ const SMART_METHODS: &[&str] = &["delete_replace", "hold_composition"];
 const CANDIDATE_POSITION_MODES: &[&str] = &["follow_caret", "fixed"];
 const NEWLINE_STYLES: &[&str] = &["keep", "cr", "lf", "crlf"];
 const PLACEHOLDER_CHARS: &[&str] = &["space", "zwsp", "blank"];
+const MULTILINE_COMMITS: &[&str] = &["commit", "paste"];
 
 /// 全部字段。顺序即界面内的展示顺序（同组内）。
 pub static COMPAT_FIELDS: &[FieldMeta] = &[
@@ -467,6 +468,22 @@ pub static COMPAT_FIELDS: &[FieldMeta] = &[
         protocol: true,
         advanced: true,
     },
+    FieldMeta {
+        section: "apps",
+        key: "multiline_commit",
+        kind: Kind::Enum,
+        group: "host",
+        label: "多行文本上屏方式",
+        summary: "含换行的文本怎么交给软件：直接上屏，或经剪贴板粘贴。",
+        problem: "新版微信收到含换行的上屏文本时，会把输入的编码残留在输入框里。改用粘贴上屏即可避开。\
+                  粘贴会覆盖剪贴板原有内容且不恢复（不进剪贴板历史），只影响含换行的上屏。终端等 Ctrl+V 不是粘贴的软件不要开启。\
+                  不设置则直接上屏。",
+        hosts: &["Weixin.exe"],
+        options: MULTILINE_COMMITS,
+        depends_on: None,
+        protocol: true,
+        advanced: true,
+    },
     // ── 初始模式作用域 ────────────────────────────────────────────
     FieldMeta {
         section: "initial_mode_scope",
@@ -542,6 +559,8 @@ pub const OPTION_LABELS: &[(&str, &str)] = &[
     ("space", "空格"),
     ("zwsp", "零宽空格"),
     ("blank", "盲文空白（有宽度、不算空格）"),
+    ("commit", "直接上屏"),
+    ("paste", "粘贴上屏"),
 ];
 
 /// 个别字段里同一个取值 id 的说法与全局登记不同时的覆盖：`(字段键, 取值, 显示名)`。

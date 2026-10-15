@@ -74,7 +74,7 @@
    优先），本 crate 禁止 `data_dir.join(...)`。
 - **⛔ 码表文件不入版本库**：`data/schemas/aux_code/` 已在 `.gitignore`，内容是
    `wind-tools/gen_aux_code` 的构建产物（`.cache/aux-code/` ← 上游下载）。
-   笔画表上游 rime-stroke 是 **LGPL-3.0**，与本仓 MIT 不同——按 `NOTICE.md` 的既定政策
+   笔画表上游 rime-stroke 是 **LGPL-3.0**，与本仓 GPL-3.0 不同——按 `NOTICE.md` 的既定政策
    （同 GPL-3.0 的 rime-frost）只下载不入库。要改码表内容就改 `gen_aux_code`，
    **别把生成物手工编辑后提交**：PR #68 最初那版 `stroke.txt` 正是手工产物，
    其裁剪字集比对 hanzi-chars 全部 81 张表也复原不出来，上游一更新就再没人能重做。

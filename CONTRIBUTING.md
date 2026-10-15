@@ -2,15 +2,6 @@
 
 感谢您对清风输入法 (WindInput) 项目的关注！我们欢迎所有形式的贡献，包括 Bug 报告、功能建议和代码提交。
 
-> **⚠️ alpha 阶段 PR 政策**
->
-> 本项目目前处于 alpha 阶段，代码与文档变动频繁。为降低维护与冲突成本，**此阶段暂不接受仅包含文档改动或轻微改动的 Pull Request**，例如：
->
-> - 纯文档变更（错别字、措辞润色、README/注释更新等）
-> - 轻微改动（个别字符串、代码格式调整、无功能影响的小修小补等）
->
-> 如发现文档错误或有改进建议，欢迎通过 [Issue](../../issues) 反馈，由维护者统一处理。功能性的 Bug 修复与新特性 PR 不受此限制，仍然欢迎提交。
-
 ## 签署 CLA（必须）
 
 **所有贡献者在首次提交 Pull Request 前必须签署贡献者许可协议 (CLA)。**
@@ -68,9 +59,10 @@ macOS 额外需要：
 
 构建脚本会自动下载第三方词库数据（缓存于 `.cache/`）并生成完整数据目录。
 
-> 配套的设置程序（wind-setting）、便携启动器（wind-portable）与安装器
-> （wind-installer）为独立的未开源仓库，构建脚本在其不存在时会自动跳过，
-> 不影响核心部分的构建。
+> 配套的设置程序（[wind-setting](https://github.com/huanfeng/wind-setting)）、
+> 便携启动器（[wind-portable](https://github.com/huanfeng/wind-portable)）与安装器
+> （[wind-installer](https://github.com/huanfeng/wind-installer)）为独立仓库，
+> 构建脚本在其不存在时会自动跳过，不影响核心部分的构建。
 
 ### Git Hooks（首次克隆后建议激活）
 
@@ -139,7 +131,7 @@ scripts/dev.sh hooks       # Linux/macOS
 
 ## 许可证
 
-提交贡献即表示您同意您的贡献将按照项目的 [MIT 许可证](LICENSE) 进行授权。词库相关的第三方资源许可证请参阅 [NOTICE.md](NOTICE.md)。
+本项目采用 [GPL-3.0-or-later](LICENSE) 许可证。提交贡献即表示您同意按照 [CLA](CLA.md) 的条款授权您的贡献。词库相关的第三方资源许可证请参阅 [NOTICE.md](NOTICE.md)。
 
 此外，若您将本项目分支后公开发布，请更换项目名称与 logo 并注明为非官方分支。
 该项不影响您对代码的任何权利，详见 [项目名称与标识使用约定](BRANDING.md)。

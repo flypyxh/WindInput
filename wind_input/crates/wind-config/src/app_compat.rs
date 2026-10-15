@@ -359,6 +359,48 @@ where
     de_opt_str_enum(d, "composition_placeholder", PlaceholderChar::from_config)
 }
 
+/// 含换行的上屏文本怎么交给宿主。
+///
+/// 有的宿主（新版微信）收到 TSF 上屏的多行文本时，会把组合区的编码显示残留在界面上，
+/// 换哪种 TSF 写法都一样；改为结束组合后写剪贴板、注入 Ctrl+V 粘贴即无残留。粘贴会覆盖
+/// 剪贴板且不恢复，Ctrl+V 不是粘贴的宿主（终端等）不能开，故**按应用配置**。
+///
+/// 消费：DLL 的上屏出口，经 `CONFIG_KEY_MULTILINE_COMMIT` 按客户端 pid 下发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultilineCommit {
+    /// TSF 上屏（历史行为）。**不写 = 这一档**。
+    #[default]
+    Commit,
+    /// 结束组合后经剪贴板 + Ctrl+V 粘贴。只影响含换行的上屏。
+    Paste,
+}
+
+impl MultilineCommit {
+    /// 配置串 → 枚举。无法识别返回 `None`（＝未配置，回落 commit）。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "commit" => Some(Self::Commit),
+            "paste" => Some(Self::Paste),
+            _ => None,
+        }
+    }
+    /// 枚举 → 配置串（写回 compat.toml 用）。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Paste => "paste",
+        }
+    }
+}
+
+fn de_multiline_commit<'de, D>(d: D) -> Result<Option<MultilineCommit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_opt_str_enum(d, "multiline_commit", MultilineCommit::from_config)
+}
+
 /// 应用独立的候选窗定位方式。
 ///
 /// 与全局 `ui.candidate.position_mode` 同语义，但**按应用覆盖**：少数宿主报的 caret
@@ -1119,6 +1161,13 @@ pub struct AppCompatRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub composition_placeholder: Option<PlaceholderChar>,
+    /// 含换行的上屏走 TSF 还是剪贴板粘贴；`None` = commit（历史行为）。见 [`MultilineCommit`]。
+    #[serde(
+        default,
+        deserialize_with = "de_multiline_commit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multiline_commit: Option<MultilineCommit>,
 }
 
 impl AppCompatRule {
@@ -2640,6 +2689,68 @@ mod tests {
         );
     }
 
+    /// `multiline_commit` 解析：认不出的值退化为未配置；`process = "*"` 通配与窗口条件照常生效。
+    #[test]
+    fn multiline_commit_parses_and_composes() {
+        let toml = r#"
+            [[apps]]
+            process = "Weixin.exe"
+            multiline_commit = "Paste"
+
+            [[apps]]
+            process = "typo.exe"
+            multiline_commit = "clipboard"
+
+            [[apps]]
+            process = "num.exe"
+            multiline_commit = 1
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps);
+        let get = |p: &str| compat.get_rule(p).and_then(|r| r.multiline_commit);
+        assert_eq!(get("weixin.exe"), Some(MultilineCommit::Paste));
+        assert_eq!(get("typo.exe"), None, "值域外 ⇒ 未配置，不拖垮整份");
+        assert_eq!(get("num.exe"), None, "类型错 ⇒ 未配置");
+        assert_eq!(MultilineCommit::default(), MultilineCommit::Commit);
+        for v in [MultilineCommit::Commit, MultilineCommit::Paste] {
+            assert_eq!(MultilineCommit::from_config(v.as_config()), Some(v));
+        }
+
+        let wild = r#"
+            [[apps]]
+            process = "*"
+            multiline_commit = "paste"
+
+            [[apps]]
+            process = "WindowsTerminal.exe"
+            multiline_commit = "commit"
+
+            [[apps]]
+            process = "app.exe"
+            class = "Chat*"
+            multiline_commit = "commit"
+        "#;
+        let compat = AppCompat::from_single_layer_text(wild);
+        let at = |process: &str, class: &str| {
+            compat
+                .resolve(&WindowCtx {
+                    process,
+                    class,
+                    title: "",
+                })
+                .rule
+                .as_ref()
+                .and_then(|r| r.multiline_commit)
+        };
+        assert_eq!(at("x.exe", ""), Some(MultilineCommit::Paste), "通配");
+        assert_eq!(
+            at("windowsterminal.exe", ""),
+            Some(MultilineCommit::Commit),
+            "具体进程压过通配"
+        );
+        assert_eq!(at("app.exe", "ChatWnd"), Some(MultilineCommit::Commit));
+        assert_eq!(at("app.exe", "Other"), Some(MultilineCommit::Paste));
+    }
+
     #[test]
     fn placeholder_char_config_roundtrip() {
         for v in [
@@ -3417,6 +3528,42 @@ mod layering_tests {
         assert!(r.stale_probe_guard, "没提到的字段照旧继承");
     }
 
+    /// `multiline_commit` 与其它字段同样逐字段叠加：用户层写 commit 压过出厂 paste，
+    /// unset 回到默认，都不动微信的其它出厂字段。
+    #[test]
+    fn multiline_commit_overlays_and_unsets_per_field() {
+        let sys = format!("{WECHAT}multiline_commit = \"paste\"\n");
+        let inherit = load(
+            &sys,
+            "[[apps]]\nprocess = \"weixin.exe\"\nfirst_show_mode = \"wait\"\n",
+            "ml_inherit",
+        );
+        let r = inherit.get_rule("Weixin.exe").unwrap();
+        assert_eq!(
+            r.multiline_commit,
+            Some(MultilineCommit::Paste),
+            "不写即继承"
+        );
+
+        let off = load(
+            &sys,
+            "[[apps]]\nprocess = \"Weixin.exe\"\nmultiline_commit = \"commit\"\n",
+            "ml_off",
+        );
+        let r = off.get_rule("Weixin.exe").unwrap();
+        assert_eq!(r.multiline_commit, Some(MultilineCommit::Commit));
+        assert!(r.caret_use_top, "没提到的字段照旧继承");
+
+        let unset = load(
+            &sys,
+            "[[apps]]\nprocess = \"Weixin.exe\"\nunset = [\"multiline_commit\"]\n",
+            "ml_unset",
+        );
+        let r = unset.get_rule("Weixin.exe").unwrap();
+        assert_eq!(r.multiline_commit, None, "unset 回到默认（commit）");
+        assert!(r.stale_probe_guard);
+    }
+
     #[test]
     fn unset_returns_a_system_field_to_follow_global() {
         let c = load(
@@ -3599,6 +3746,14 @@ mod layering_tests {
         assert!(
             c.get_rule("qq.exe")
                 .is_some_and(|r| r.composition_start_pair_guard == Some(true))
+        );
+        let wx = c.get_rule("Weixin.exe").expect("出厂有微信规则");
+        assert_eq!(wx.multiline_commit, Some(MultilineCommit::Paste));
+        assert!(wx.caret_use_top && wx.stale_probe_guard, "原有字段不受影响");
+        assert_eq!(
+            c.get_rule("WXWork.exe").and_then(|r| r.multiline_commit),
+            None,
+            "只给微信开"
         );
         // GH#175：出厂按窗口类名给 Chromium / Firefox 内核换零宽空格占位（含所有 Electron 应用），
         // 其余（WPS 等靠空格撑光标矩形）保持空格。

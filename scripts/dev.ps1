@@ -497,7 +497,7 @@ function Download-Dicts {
     # 辅助码表: 拼音候选的字形二次筛选 (默认关闭的功能, 见 schema.pinyin.aux_code)。
     # 小鹤/自然码两张已是 `字=码` 行格式, 零转换; 笔画表来自 rime-stroke 的 .dict.yaml,
     # 由 gen_aux_code 剥 YAML 头 + 按字集裁剪 (字表来自 zispace/hanzi-chars)。
-    # ⚠️ rime-stroke 是 LGPL-3.0, 与本仓 MIT 不同 —— 同 rime-frost 处理: 只下载不入库,
+    # ⚠️ rime-stroke 是 LGPL-3.0, 与本仓 GPL-3.0 不同 —— 同 rime-frost 处理: 只下载不入库,
     # 产物随发行版分发并适用原许可, 见 NOTICE.md。
     $auxBase = "https://raw.githubusercontent.com/HowcanoeWang/rime-lua-aux-code/main/aux_code"
     Gray "辅助码表:"
@@ -533,7 +533,7 @@ function Download-Dicts {
     Get-Dict "$openccBase/HKVariants.txt"   "$opencc\HKVariants.txt"   "香港字形"   | Out-Null
 
     # Emoji 候选扩展 (设计见 docs\design\emoji-suggestion.md, 出厂关闭)。
-    # ⚠️ rime-emoji 是 LGPL-3.0, 与本仓 MIT 不同。政策与 rime-stroke 一致 —— 只下载不入库;
+    # ⚠️ rime-emoji 是 LGPL-3.0, 与本仓 GPL-3.0 不同。政策与 rime-stroke 一致 —— 只下载不入库;
     #    但**分发方式刻意不同**: 本表随发行版**原样**分发 (不做构建期转换), 我们分发的因此是
     #    逐字副本而非衍生作品, LGPL 的修改版义务不触发。繁->简归一与二进制化都在**用户本机**
     #    首次启用时进行, 产物是本机缓存, 从不离开用户机器 => 不构成 conveying。

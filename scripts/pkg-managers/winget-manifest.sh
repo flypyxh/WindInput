@@ -117,7 +117,7 @@ PublisherSupportUrl: https://github.com/$REPO/issues
 Author: huanfeng
 PackageName: 清风输入法
 PackageUrl: https://windinput.com
-License: MIT
+License: GPL-3.0-or-later
 LicenseUrl: https://github.com/$REPO/blob/HEAD/LICENSE
 Copyright: Copyright (c) 2026 WindInput Contributors
 ShortDescription: 轻量、快速、可定制的开源中文输入法
@@ -151,7 +151,7 @@ PublisherSupportUrl: https://github.com/$REPO/issues
 Author: huanfeng
 PackageName: WindInput
 PackageUrl: https://windinput.com
-License: MIT
+License: GPL-3.0-or-later
 LicenseUrl: https://github.com/$REPO/blob/HEAD/LICENSE
 ShortDescription: A lightweight, fast and customizable open-source Chinese input method
 Description: WindInput is designed for Wubi and code-table input schemes, offering Wubi 86 and Wubi-Pinyin mixed input, with Quanpin and Shuangpin support.

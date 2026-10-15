@@ -56,8 +56,6 @@ jobs:
     name: Linux .deb
     needs: prep
     uses: ./.github/workflows/linux-build.yml
-    secrets:
-      WIND_REPOS_TOKEN: ${{ secrets.WIND_REPOS_TOKEN }}
     with:
       version: ${{ needs.prep.outputs.version }}
       ref: ${{ inputs.tag }}
@@ -67,7 +65,7 @@ jobs:
   attach:
     name: 挂到 Release ${{ inputs.tag }}
     needs: [prep, build]
-    if: inputs.tag != '' && needs.build.outputs.built == 'true'
+    if: inputs.tag != ''
     runs-on: ubuntu-22.04
     permissions:
       contents: write

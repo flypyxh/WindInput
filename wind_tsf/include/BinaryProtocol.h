@@ -926,6 +926,9 @@ constexpr const char* CONFIG_KEY_DIAG_SNAPSHOT = "diag_snapshot";
 // 服务端按本客户端 pid 的 compat 规则 composition_placeholder 现算后逐客户端推送；默认空格。
 // 决策在服务端，DLL 只照做（以及把三种字符都认作占位，见 CompositionPlaceholder.h）。
 constexpr const char* CONFIG_KEY_COMPOSITION_PLACEHOLDER = "composition_placeholder";
+// 含换行的上屏是否改走剪贴板粘贴。格式：mode(u8)，0 = commit（默认）、1 = paste；认不出的值按 commit。
+// 服务端按本客户端 pid 的 compat 规则 multiline_commit 现算后逐客户端推送，见 MultilineCommit.h。
+constexpr const char* CONFIG_KEY_MULTILINE_COMMIT = "multiline_commit";
 // 「本进程可能命中 compat 标题规则」开关（采不采窗口标题）。格式：enabled(u8)。**默认关**，重连从关起步，
 // core 握手必推、compat 重载后广播。关着时 OnSetFocus 一次标题都不取（标题是用户数据）。
 constexpr const char* CONFIG_KEY_COMPAT_TITLE_MATCH = "compat_title_match";

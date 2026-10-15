@@ -553,6 +553,12 @@ pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
 /// 向后兼容：DLL 的 `PlaceholderForKind` 对**认不出的值一律回落空格**，所以只认 0/1 的旧 DLL
 /// 收到 2 时兜底占位是空格（历史行为），不会出错；新加档位照此只追加、不复用旧值。
 pub const CONFIG_KEY_COMPOSITION_PLACEHOLDER: &str = "composition_placeholder";
+/// 含换行的上屏是否改走剪贴板粘贴同步键名。格式：`mode(u8)`，0 = commit（TSF 上屏，默认）、
+/// 1 = paste（结束组合后写剪贴板 + 注入 Ctrl+V）。
+///
+/// 按**客户端 pid** 现算（compat 规则 `multiline_commit`），逐客户端推送；DLL 每次重连从
+/// commit 起步，故握手必推。认不出的值 DLL 按 commit 处理。
+pub const CONFIG_KEY_MULTILINE_COMMIT: &str = "multiline_commit";
 /// 「本进程可能命中 compat 标题规则」开关（采不采窗口标题）同步键名。格式：`enabled(u8)`。
 ///
 /// 开着时 DLL 才在 FocusGained 里附上焦点顶层窗口的标题（变长段 ③，见 [`FocusGainedPayload`]）；

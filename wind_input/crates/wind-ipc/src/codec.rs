@@ -1529,6 +1529,13 @@ mod tests {
             assert_eq!(encode_composition_placeholder_value(k), vec![k]);
         }
     }
+
+    /// 多行上屏方式：commit = 0、paste = 1，与 C++ 侧的判读一致。
+    #[test]
+    fn multiline_commit_value_is_one_byte() {
+        assert_eq!(encode_multiline_commit_value(false), vec![0]);
+        assert_eq!(encode_multiline_commit_value(true), vec![1]);
+    }
 }
 
 // ── darwin host-render push 帧编码器 (W4) ──
@@ -1868,6 +1875,12 @@ pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
 /// 2 = 盲文空白 U+2800）。旧 DLL 认不出的值回落空格。GH#175。
 pub fn encode_composition_placeholder_value(kind: u8) -> Vec<u8> {
     vec![kind]
+}
+
+/// 编码多行上屏方式的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_MULTILINE_COMMIT）。
+/// 格式：mode(u8)，0 = commit、1 = paste。
+pub fn encode_multiline_commit_value(paste: bool) -> Vec<u8> {
+    vec![paste as u8]
 }
 
 /// 编码「本进程可能命中 compat 标题规则」开关的值部分（对齐 TSF `OnSyncConfig` 的

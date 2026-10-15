@@ -203,7 +203,8 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 
 ## 许可证兼容性说明
 
-本项目源代码采用 [MIT 许可证](LICENSE)。
+本项目源代码采用 [GPL-3.0-or-later](LICENSE)。依赖的第三方 Rust crate 均为与 GPL-3.0
+兼容的许可证（MIT、Apache-2.0、BSD、ISC、Zlib、MPL-2.0 等）。
 
 词库数据文件来源于上述第三方项目，其各自适用原项目的许可证条款。
 GPL-3.0 许可的词库数据（rime-frost）与 LGPL-3.0 许可的笔画码表（rime-stroke）
@@ -228,6 +229,6 @@ Apache-2.0（极点五笔码表）与 Unicode-3.0（Unicode CLDR，当前仅研�
 
 ## 本项目自身的名称与标识
 
-本项目的 logo（`pic/logo.png`）与应用图标为原创图形作品，不在 MIT 许可证的
-授权范围内。关于项目名称「清风输入法」「WindInput」的使用，
-详见 [BRANDING.md](BRANDING.md)。
+本项目的 logo（`pic/logo.png`）与应用图标为原创图形作品，不在 GPL 许可证的
+授权范围内。依据 GPL-3.0 第 7 条 (e) 款，本项目的许可证不授予使用项目名称
+「清风输入法」「WindInput」及其标识的权利，详见 [BRANDING.md](BRANDING.md)。

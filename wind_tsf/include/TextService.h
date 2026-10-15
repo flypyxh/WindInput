@@ -351,6 +351,9 @@ public:
     // 规则推；0 = 空格（默认）、1 = ZWSP、2 = 盲文空白，GH#175）。config 回调跑在 IPC 读线程，读在 TSF
     // 线程，故用 Interlocked 读写一个 LONG。
     void SetCompositionPlaceholderKind(uint8_t kind) { InterlockedExchange(&_compositionPlaceholderKind, (LONG)kind); }
+    // 含换行的上屏方式（core 经 CONFIG_KEY_MULTILINE_COMMIT 按本进程 compat 规则推；0 = commit（默认）、
+    // 1 = paste，见 MultilineCommit.h）。跨线程读写同上。
+    void SetMultilineCommitMode(uint8_t mode) { InterlockedExchange(&_multilineCommitMode, (LONG)mode); }
 
     // 语言栏悬停提示（core 经 CONFIG_KEY_LANGBAR_TOOLTIP 推）。文案与选择逻辑全在服务端，
     // 这里只存一份原样交给 CLangBarItemButton::GetTooltipString。
@@ -465,6 +468,10 @@ public:
     BOOL HasDeferredComposition() const { return !_deferredCompText.empty(); }
 
 private:
+    // 多行文本的粘贴上屏：写剪贴板（CRLF）+ 注入 Ctrl+V。只由 CCommitTextEditSession 在组合结束后调用。
+    // 返回 FALSE = 没能注入（剪贴板写不进 / SendInput 一个都没发出），调用方须自己插入原文兜底。
+    BOOL _PasteTextViaClipboard(const std::wstring& text);
+
     // 坐标出口：DPI 归一 + 更新 last known + 发 IPC。同步/异步两条取坐标路径共用。
     // pCompRect：整个组合 range 的包围矩形，nullptr / 四值全 0 表示本帧没取到。
     // 探针阶段只上报不决策，见 BinaryProtocol.h 的 CaretPayloadV3。
@@ -608,6 +615,8 @@ private:
     // 空文本兜底占位档位（core 经 CONFIG_KEY_COMPOSITION_PLACEHOLDER 推；默认 0 = 空格）。
     // 见 SetCompositionPlaceholderKind / CompositionPlaceholder.h。
     volatile LONG _compositionPlaceholderKind;
+    // 多行上屏方式（core 经 CONFIG_KEY_MULTILINE_COMMIT 推；默认 0 = commit）。见 SetMultilineCommitMode。
+    volatile LONG _multilineCommitMode;
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；**默认关**）。
     // 默认关是硬要求：每次焦点切换都查三次类名 + band 的开销，不该由不排查的用户承担。
     BOOL  _diagSnapshotEnabled;

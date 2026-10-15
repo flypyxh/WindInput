@@ -158,6 +158,10 @@ CI 承接）、CI 另有 `cargo tree` 断言 coordinator 无 wind-ui 依赖边�
 `Co-Authored-By`、`Generated with` 以及 `Constraint:` / `Confidence:` / `Tested:` 等
 AI 附加 trailer。
 
+提交信息以及进库的注释与文档**不要**带个人信息：真实姓名、邮箱、内网地址与主机名，
+以及含用户名或个人目录布局的本机路径（如 `/home/<用户名>/…`、`C:\Users\<用户名>\…`、
+`D:\Develop\…`）。引用文件一律写仓库相对路径。
+
 ## 格式化（强制）
 
 仓库自带 `.githooks/pre-commit`（提交前自动跑 `cargo fmt --check`），默认未激活，

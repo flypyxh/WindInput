@@ -26,7 +26,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_TOKEN }}
         with:
-          path-to-signatures: "signatures/cla.json"
+          path-to-signatures: "signatures/cla-v2.json"
           path-to-document: "https://github.com/${{ github.repository }}/blob/main/CLA.md"
           branch: "main"
           # 仓库所有者：自己的提交进了 fork PR 时（评审重做后强推回贡献者分支）会被自家门禁

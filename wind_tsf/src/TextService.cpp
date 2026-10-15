@@ -9,9 +9,11 @@
 #include "DisplayAttributeInfo.h"
 #include "HotkeyManager.h"
 #include "HostWindow.h"
+#include "MultilineCommit.h"        // 多行文本粘贴上屏：CRLF 规范化 + 下发值判读
 #include "CompositionPlaceholder.h" // 组合占位识别 + 兜底取值（空格 / ZWSP / 盲文空白，由 core 按应用决定，GH#175）
 #include "WindowTitlePolicy.h" // 窗口标题采集判据（开关 / 截断；compat 的 title 条件）
 #include <vector>
+#include <algorithm>
 #include <shellscalingapi.h>
 #include <inputscope.h> // ITfInputScope / InputScope 枚举
 
@@ -289,10 +291,11 @@ class CCommitTextEditSession : public ITfEditSession
 {
 public:
     // pComposition ownership is transferred to this object (may be nullptr if no active composition)
+    // paste=TRUE：组合清空并结束后，文本改经剪贴板 + Ctrl+V 交给宿主（见 MultilineCommit.h）。
     CCommitTextEditSession(CTextService* pTextService, ITfContext* pContext,
-                           ITfComposition* pComposition, const std::wstring& text)
+                           ITfComposition* pComposition, const std::wstring& text, BOOL paste = FALSE)
         : _refCount(1), _pTextService(pTextService), _pContext(pContext),
-          _pComposition(pComposition), _text(text), _success(FALSE), _executed(FALSE)
+          _pComposition(pComposition), _text(text), _paste(paste), _success(FALSE), _executed(FALSE)
     {
         _pTextService->AddRef();
         _pContext->AddRef();
@@ -440,7 +443,8 @@ public:
                 // 上屏是"定稿", 语义上本就不是更正; Weasel 的 CInsertTextEditSession 同样
                 // 用 flags=0。代价是宿主会把它当作新输入、可能触发自动更正类处理, 这对
                 // 中文上屏无实际影响, 且正是"让宿主按输入法上屏来对待"所期望的。
-                pRange->SetText(ec, 0, _text.c_str(), (LONG)_text.length());
+                // 粘贴模式只清空组合，正文随后经 Ctrl+V 送达。
+                pRange->SetText(ec, 0, _paste ? L"" : _text.c_str(), _paste ? 0 : (LONG)_text.length());
 
                 // SetText 之后重新取一次 composition range 再 Clear: 上面那个 pRange 是
                 // 替换**之前**取的, 它在替换后是否仍覆盖新文本属于宿主实现细节, 重新取
@@ -475,7 +479,7 @@ public:
             _pComposition->EndComposition(ec);
             _pComposition->Release();
             _pComposition = nullptr;
-            if (committedViaComposition)
+            if (committedViaComposition && !_paste)
             {
                 _success = TRUE;
                 WIND_LOG_DEBUG(L"CCommitTextEditSession: SetText + EndComposition committed\n");
@@ -484,7 +488,21 @@ public:
             }
             // GetRange 失败 (极少): composition 已结束但文字未写入, fallthrough
             // 到 InsertTextAtSelection 兜底, 避免静默丢字。
-            WIND_LOG_DEBUG(L"CCommitTextEditSession: GetRange failed, falling back to InsertTextAtSelection\n");
+            if (!committedViaComposition)
+                WIND_LOG_DEBUG(L"CCommitTextEditSession: GetRange failed, falling back to InsertTextAtSelection\n");
+        }
+
+        // 粘贴模式：组合已在上面清空并结束，这里才注入 Ctrl+V。注入的按键排在宿主输入队列里，
+        // 要等本会话（同步：当前按键处理；异步：TSF 授锁时）返回后才被处理，届时组合早已结束。
+        if (_paste)
+        {
+            if (_pTextService->_PasteTextViaClipboard(_text))
+            {
+                _success = TRUE;
+                return S_OK;
+            }
+            WIND_LOG_WARN_FMT(L"CCommitTextEditSession: paste failed, inserting at selection instead, textLen=%zu\n",
+                              _text.length());
         }
 
         // 无 active composition 的回退路径 (鼠标上屏 / 上述 GetRange 失败兜底): 走
@@ -528,6 +546,7 @@ private:
     ITfContext* _pContext;
     ITfComposition* _pComposition;  // Owned composition pointer
     std::wstring _text;
+    BOOL _paste;
     BOOL _success;
     BOOL _executed;  // DoEditSession 跑过没有（与成败无关）；见 WasExecuted()
 };
@@ -1057,6 +1076,7 @@ CTextService::CTextService()
     , _focusInputScopeMask(0)
     , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
     , _compositionPlaceholderKind(0)  // 默认空格（历史行为），core 握手时按本进程 compat 规则推
+    , _multilineCommitMode(0)         // 默认 commit，core 握手时按本进程 compat 规则推
     , _diagSnapshotEnabled(FALSE)     // 默认关，与 core 的 input_diag_hud_visible 初值一致
     , _titleMatchEnabled(0)           // 默认关：core 握手时按「本进程可能命中标题规则」推
     , _focusSentTitleBlind(FALSE)
@@ -7207,6 +7227,139 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 //   字符注入，多数控件既不换行也不报错（key.type 8/22 的实测，见 wind-keys 的
 //   `split_type_text`）。那是那条出口的物理限制，修法是拆成 VK_RETURN，单独立案。
 
+// 多行文本的粘贴上屏（compat `multiline_commit = "paste"`），由 CCommitTextEditSession 在组合结束后调用。
+// 剪贴板不备份也不恢复：恢复会让剪贴板历史工具多记一条，且宿主何时处理 Ctrl+V 不可知，恢复早了会贴出旧内容。
+// 给剪贴板追加一个注册格式，值为 DWORD。须在 OpenClipboard 之后、CloseClipboard 之前调用。
+static void SetClipboardDwordFormat(const wchar_t* name, DWORD value)
+{
+    const UINT fmt = RegisterClipboardFormatW(name);
+    if (fmt == 0)
+        return;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+    if (h == nullptr)
+        return;
+    DWORD* p = static_cast<DWORD*>(GlobalLock(h));
+    if (p == nullptr)
+    {
+        GlobalFree(h);
+        return;
+    }
+    *p = value;
+    GlobalUnlock(h);
+    if (SetClipboardData(fmt, h) == nullptr)
+        GlobalFree(h);
+}
+
+BOOL CTextService::_PasteTextViaClipboard(const std::wstring& text)
+{
+    const std::wstring crlf = wind::multiline::NormalizeToCrlf(text);
+    const size_t newlines = (size_t)std::count(crlf.begin(), crlf.end(), L'\n');
+
+    // 以下两种情况注入的 Ctrl+V 会变质或落到别处，在写剪贴板、压 skip 条目之前就放弃，由调用方插入原文。
+    // ① 物理按住 Shift / Alt / Win：叠成 Ctrl+Shift+V 之类的别的快捷键（Ctrl 本身按着无妨）。
+    const int heldMods[] = {VK_LSHIFT, VK_RSHIFT, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN};
+    for (int vk : heldMods)
+    {
+        if (GetAsyncKeyState(vk) & 0x8000)
+        {
+            WIND_LOG_DEBUG_FMT(L"MultilinePaste: modifier vk=0x%02X held, inserting instead, len=%zu\n", vk,
+                               text.length());
+            return FALSE;
+        }
+    }
+    // ② 前台不是本线程：SendInput 进的是前台窗口的输入队列。
+    if (GetWindowThreadProcessId(GetForegroundWindow(), nullptr) != GetCurrentThreadId())
+    {
+        WIND_LOG_DEBUG_FMT(L"MultilinePaste: foreground is another thread, inserting instead, len=%zu\n",
+                           text.length());
+        return FALSE;
+    }
+
+    // 剪贴板可能正被别的进程占着（剪贴板历史 / 同步工具），短暂重试，总等待不超过约 40ms。
+    // 用本 DLL 自己的消息窗作所有者：传 nullptr 时 EmptyClipboard 会把所有者置空。
+    BOOL opened = FALSE;
+    for (int attempt = 0; attempt < 5 && !opened; attempt++)
+    {
+        if (attempt > 0)
+            Sleep(8);
+        opened = OpenClipboard(_hHotkeyWnd);
+    }
+    if (!opened)
+    {
+        WIND_LOG_WARN_FMT(L"MultilinePaste: OpenClipboard failed err=%lu, len=%zu\n", GetLastError(), text.length());
+        return FALSE;
+    }
+    BOOL written = FALSE;
+    const size_t cb = (crlf.length() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, cb);
+    if (hMem != nullptr)
+    {
+        wchar_t* pDst = static_cast<wchar_t*>(GlobalLock(hMem));
+        if (pDst != nullptr)
+        {
+            memcpy(pDst, crlf.c_str(), cb);
+            GlobalUnlock(hMem);
+            written = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, hMem) != nullptr;
+        }
+        if (!written)
+            GlobalFree(hMem); // SetClipboardData 成功后内存归系统，失败才由我们释放
+    }
+    if (written)
+    {
+        // 这份内容只是上屏的载体：不进 Win+V 历史、不同步云剪贴板，并请第三方剪贴板工具忽略。
+        SetClipboardDwordFormat(L"CanIncludeInClipboardHistory", 0);
+        SetClipboardDwordFormat(L"CanUploadToCloudClipboard", 0);
+        SetClipboardDwordFormat(L"ExcludeClipboardContentFromMonitorProcessing", 0);
+    }
+    const DWORD clipErr = written ? 0 : GetLastError();
+    CloseClipboard();
+    if (!written)
+    {
+        WIND_LOG_WARN_FMT(L"MultilinePaste: SetClipboardData failed err=%lu, len=%zu\n", clipErr, text.length());
+        return FALSE;
+    }
+
+    // Ctrl↓ V↓ V↑ Ctrl↑ 一次注入，中间不被真实键鼠穿插；纯 VK、无 UNICODE 标志，宿主按快捷键处理。
+    // 两个键都是凭空造的，down / up 都不该进本输入法的按键逻辑 ⇒ MarkSyntheticKey（各压 down、up
+    // 两条，见 SkipKeyTable.h），而不是 _ReplayKeyToHost 那种只压 down 的：注入的 Ctrl keyup 若走
+    // 正常路径，会落进修饰键释放的处理（defer 中的配对动作会吃掉它 ⇒ 宿主里 Ctrl 卡住；Ctrl 配成
+    // 切换键时有误切的风险）。宿主不调 OnTestKeyUp 时残留的 keyup 条目由 skip 表的 TTL 收掉。
+    if (_pKeyEventSink != nullptr)
+    {
+        _pKeyEventSink->MarkSyntheticKey(VK_CONTROL);
+        _pKeyEventSink->MarkSyntheticKey('V');
+    }
+    INPUT inputs[4] = {};
+    for (INPUT& in : inputs)
+        in.type = INPUT_KEYBOARD;
+    const WORD vks[4] = {VK_CONTROL, 'V', 'V', VK_CONTROL};
+    for (int i = 0; i < 4; i++)
+    {
+        inputs[i].ki.wVk = vks[i];
+        // 补上扫描码：有的宿主按扫描码认键。不加 KEYEVENTF_SCANCODE，仍以 VK 为准。
+        inputs[i].ki.wScan = (WORD)MapVirtualKeyW(vks[i], MAPVK_VK_TO_VSC);
+    }
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    const UINT sent = SendInput(4, inputs, sizeof(INPUT));
+    if (sent == 0)
+    {
+        WIND_LOG_WARN_FMT(L"MultilinePaste: SendInput failed err=%lu, len=%zu\n", GetLastError(), text.length());
+        return FALSE;
+    }
+    if (sent != 4)
+    {
+        // 已注入了一部分，再插入原文会重复出字，不补；但 Ctrl↓ 已发出，补一个 Ctrl↑ 免得宿主里 Ctrl 卡住。
+        // 不另压 skip 条目：上面 MarkSyntheticKey 给 Ctrl↑ 压的那条因第 4 个事件没发出而仍在表里，正好对应它。
+        const UINT upSent = SendInput(1, &inputs[3], sizeof(INPUT));
+        WIND_LOG_WARN_FMT(L"MultilinePaste: SendInput sent %u of 4, ctrl-up resent=%u, len=%zu\n", sent, upSent,
+                          text.length());
+    }
+    WIND_LOG_DEBUG_FMT(L"MultilinePaste: clipboard set + Ctrl+V injected, len=%zu, newlines=%zu, sent=%u\n",
+                       crlf.length(), newlines, sent);
+    return TRUE;
+}
+
 BOOL CTextService::CommitText(const std::wstring& text, BOOL nonKeyContext, BOOL replacingHeld,
                               BOOL* pAsyncDeferred)
 {
@@ -7245,12 +7398,17 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL nonKeyContext, BOOL
         newlineCount++;
     }
 
+    // 含换行且本进程 compat 配了 paste：组合照常结束，正文改经剪贴板 + Ctrl+V 交给宿主
+    // （见 MultilineCommit.h）。会话请求流程不变，粘贴在 DoEditSession 里组合结束之后发生。
+    const BOOL paste = wind::multiline::ContainsNewline(full) && wind::multiline::IsPasteMode(
+        static_cast<uint8_t>(InterlockedCompareExchange(&_multilineCommitMode, 0, 0)));
+
     // 诊断用：只统计换行符个数、不打印正文（日志隐私红线）。用来确认到本函数为止
     // 换行是否还完整——如果这里已经是 0，说明丢字发生在 Rust/IPC 一侧；如果这里
     // 不为 0 但宿主里没体现出分段，说明问题出在 TSF/宿主对本次提交的处理上。
     {
-        WIND_LOG_DEBUG_FMT(L"CommitText: textLen=%zu, newlines=%d, nonKeyContext=%d, replacingHeld=%d\n",
-                           full.length(), newlineCount, (int)nonKeyContext, (int)replacingHeld);
+        WIND_LOG_DEBUG_FMT(L"CommitText: textLen=%zu, newlines=%d, nonKeyContext=%d, replacingHeld=%d, paste=%d\n",
+                           full.length(), newlineCount, (int)nonKeyContext, (int)replacingHeld, (int)paste);
     }
 
     LARGE_INTEGER startTime, endTime, freq;
@@ -7292,7 +7450,7 @@ BOOL CTextService::CommitText(const std::wstring& text, BOOL nonKeyContext, BOOL
             goto fallback;
         }
 
-        CCommitTextEditSession* pEditSession = new CCommitTextEditSession(this, pContext, pCompToEnd, full);
+        CCommitTextEditSession* pEditSession = new CCommitTextEditSession(this, pContext, pCompToEnd, full, paste);
         // pCompToEnd ownership transferred to pEditSession
 
         if (nonKeyContext)

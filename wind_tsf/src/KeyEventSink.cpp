@@ -3058,6 +3058,13 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         _pTextService->SetCompositionPlaceholderKind(value[0]);
         WIND_LOG_INFO_FMT(L"Composition placeholder updated: kind=%d\n", (int)value[0]);
     }
+    else if (key == CONFIG_KEY_MULTILINE_COMMIT)
+    {
+        // 格式：mode(u8)（对齐 Rust encode_multiline_commit_value）。0 = commit、1 = paste。
+        if (value.empty()) return;
+        _pTextService->SetMultilineCommitMode(value[0]);
+        WIND_LOG_INFO_FMT(L"Multiline commit mode updated: mode=%d\n", (int)value[0]);
+    }
     else if (key == CONFIG_KEY_COMPAT_TITLE_MATCH)
     {
         // 格式：enabled(u8)（对齐 Rust encode_compat_title_match_value）。core 按「存在 compat
