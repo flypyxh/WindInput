@@ -2330,23 +2330,25 @@ mod tests {
         use wind_dict::SystemDictLayer;
         use wind_dict::cached::CachedDict;
         let dir = tmp_dir("stalefp");
-        let (yaml, wdat, cache) = (dir.join("en.dict.yaml"), dir.join("en.wdat"), dir.join("c"));
-        let mut fp = wdat.clone().into_os_string();
-        fp.push(".fp");
+        // `en.wdat` 是槽位；实际文件名带内容指纹（`cache_fp` S2），建好之后才知道，
+        // 用 `source_file()` 取——本用例模拟的是「实际文件被外部原地改写」的现场。
+        let (yaml, slot, cache) = (dir.join("en.dict.yaml"), dir.join("en.wdat"), dir.join("c"));
         std::fs::write(
             &yaml,
             "---\nname: en\n...\nBuenos Aires\tbuenosaires\t60\niPhone 15 Pro Max\tiphone\t100\n",
         )
         .unwrap();
+        let wdat;
         {
+            let d = CachedDict::load_at_with(&yaml, &slot, true).unwrap();
+            wdat = d.source_file().expect("应走 mmap 缓存").to_path_buf();
             let dm = DictManager::new();
-            dm.register_layer(Box::new(SystemDictLayer::new(
-                CachedDict::load_at_with(&yaml, &wdat, true).unwrap(),
-                "en",
-            )));
+            dm.register_layer(Box::new(SystemDictLayer::new(d, "en")));
             let lazy = LazyPhraseIndex::with_cache_dir(Some(cache.clone()));
             assert_eq!(lazy_texts(&lazy, &dm, "ip'max"), vec!["iPhone 15 Pro Max"]);
         }
+        let mut fp = wdat.clone().into_os_string();
+        fp.push(".fp");
         // wdat 被换成不含 iPhone 的版本，`.fp` 仍是旧的。
         let stale = std::fs::read(&fp).unwrap();
         let mut d = wind_dict::codetable::CodetableDict::empty();

@@ -103,6 +103,9 @@ outside: rare                # 作用域内、名单外  ← 缺了它「换一�
 
 ## 3. 配置落点：出厂/定制层是 `charsets/` 目录，用户层在 redb
 
+> **2026-10 更新（用户数据存储重设计 P4a / P5）**：用户层已离开 redb，真源是用户目录
+> `data/charsets/<key>.yaml`（与出厂层同格式，可手改，`dict.reload` 可指名重载）。下文讲 redb 的部分是历史。
+
 ### 3.1 ⛔ 不能进 `config.toml`——`is_known_key` 是静态登记表
 
 `config_schema.rs` 的 `is_known_key(key) = field(key).is_some()`，每个键要在代码里逐条

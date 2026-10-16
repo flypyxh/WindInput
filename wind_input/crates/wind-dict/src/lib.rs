@@ -35,12 +35,11 @@ pub mod layer;
 pub mod manager;
 pub mod reader_pool;
 pub mod reverseidx;
-pub mod store_layer;
 pub mod trie;
 pub mod weight_norm;
 
+pub use codetable::{RimeLayout, rime_body_layout, rime_layout};
 pub use composite::CompositeDict;
 pub use layer::{DictLayer, LayerType, MutableLayer, WILDCARD_SLOT};
 pub use manager::{DictManager, SystemDictLayer};
-pub use store_layer::{StoreDraftLayer, StoreTempLayer, StoreUserLayer};
 pub use weight_norm::WeightNorm;

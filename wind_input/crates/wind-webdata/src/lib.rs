@@ -365,7 +365,8 @@ fn today_str() -> String {
 ///
 /// - `process`：`{bytes, kind}`，口径见 `wind_coordinator::process_memory`（Windows Private、
 ///   Linux / Android RssAnon；macOS 两者皆 `null`）。
-/// - `redb`：redb 不暴露页缓存的在用量，只给上限与「空闲回收」已发生的次数；无 store 时 `null`。
+/// - `redb`：redb 不暴露页缓存的在用量，只给上限与「空闲回收」已发生的次数；旧库没打开（迁移
+///   全部完成后运行期不再打开它）或无 store 时 `null`。
 /// - 字节数都是各结构按容量自报、不含分配器开销，只用来回答「是哪一档涨了」。
 fn memory_stats_json<H: WebDataHost + ?Sized>(h: &H) -> Value {
     let process = wind_coordinator::process_memory::private_memory();
@@ -402,7 +403,7 @@ fn memory_stats_json<H: WebDataHost + ?Sized>(h: &H) -> Value {
         "reverseLookup": {
             "chaiziBytes": chaizi, "pinyinBytes": pinyin, "commentBytes": comments,
         },
-        "redb": h.user_store().map(|s| json!({
+        "redb": h.user_store().filter(|s| !s.is_paused()).map(|s| json!({
             "cacheLimitBytes": wind_store::store::DEFAULT_CACHE_SIZE_BYTES,
             "pageCacheDrops": s.page_cache_drops(),
         })),
@@ -470,6 +471,33 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         }
         // 内存诊断（只读，设置端「高级 → 性能 → 内存占用」与「复制诊断信息」）。
         "system.memoryStats" => Ok(memory_stats_json(h)),
+        // 存储状态（设置页提示「只读模式」）：用户数据设计 §7.1 降级保护。
+        // `issues`：用户数据目录下的文件问题（设计 §2.5），路径相对数据目录。
+        // `format_version` 是 meta.toml 里的实际值，`known_format_version` 是本版本认识的上限；
+        // `write_error`：最近一次写用户数据失败的原因（磁盘满、目录只读…），成功写入后清空。
+        // 用户数据锁不可用 / 被别的进程占用时引擎只读，同样报 readonly。
+        "system.storageStatus" => {
+            let store = h.user_store();
+            let engine_readonly = store.is_some_and(|s| s.runtime().data().readonly());
+            let reason = h.storage_readonly_reason().or_else(|| {
+                engine_readonly.then(|| {
+                    "用户数据被另一个进程占用，或文件锁不可用：本次运行不保存学习与修改。"
+                        .to_string()
+                })
+            });
+            let actual = store
+                .and_then(|s| s.path().parent().map(wind_config::user_meta::read))
+                .flatten()
+                .map(|m| m.format_version);
+            Ok(json!({
+                "readonly": reason.is_some(),
+                "reason": reason,
+                "format_version": actual.unwrap_or(wind_config::user_meta::KNOWN_FORMAT_VERSION),
+                "known_format_version": wind_config::user_meta::KNOWN_FORMAT_VERSION,
+                "write_error": store.and_then(|s| s.runtime().data().write_error()),
+                "issues": store.map(|s| storage_issues_json(s)).unwrap_or_default(),
+            }))
+        }
         // 桌面提示（CLI `wind_input ui toast`、外部脚本）：toast 只能由 core 进程
         // 自己的 UI 线程渲染，别的进程除了转交没有第二条路。
         //
@@ -506,7 +534,7 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         // 批量写：成功后立即回收页缓存，见 `BULK_WRITE_METHODS`。
         "backup.restore" => h.web_backup_restore(params),
 
-        // ── dict.*（用户词库，redb 持久化）────────────────────
+        // ── dict.*（用户词库）────────────────────
         "comment.sources" => h.web_comment_sources(),
         "emoji.modules" => h.web_emoji_modules(),
         "dict.listPaged" => h.web_dict_list_paged(params),
@@ -541,6 +569,10 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         // 批量写：成功后立即回收页缓存，见 `BULK_WRITE_METHODS`。
         "dict.import" => h.web_dict_import(params),
         "dict.previewImport" => h.web_dict_preview_import(params),
+        // 用户词文本手改后重新载入（设计 §5）；带 paths 只同步这几个文件，越界拒绝。
+        "dict.reload" => h.web_dict_reload(params),
+        // 显式折回全部待写回的数据（备份 / 导出 / 调试前）。
+        "dict.flush" => h.web_dict_flush(),
 
         // ── temp.*（临时词，redb）─────────────────────────────
         "temp.list" => h.web_temp_list(params),
@@ -551,12 +583,12 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         "temp.promoteAll" => h.web_temp_promote_all(params),
         "temp.clear" => h.web_temp_clear(params),
 
-        // ── freq.*（用户词频，redb 持久化）───────────────────
+        // ── freq.*（用户词频）───────────────────
         "freq.listPaged" => h.web_freq_list_paged(params),
         "freq.delete" => h.web_freq_delete(params),
         "freq.clear" => h.web_freq_clear(params),
 
-        // ── mailSuffix.* / urlHistory.*（补全学习数据，redb 持久化）──
+        // ── mailSuffix.* / urlHistory.*（补全学习数据）──
         // 两组共用一份实现，只差 `CompletionKind`：存储层本就是一张表两个分区，
         // RPC 再各写一遍等于把「同形态」这件事在第三处重新论证一遍。
         // 命名空间分开是给设置端用的——「清空网址历史」不该顺带抹掉邮箱学习。
@@ -573,7 +605,7 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         "quickHistory.delete" => h.web_completion_delete(CompletionKind::QuickHistory, params),
         "quickHistory.clear" => h.web_completion_clear(CompletionKind::QuickHistory),
 
-        // ── shadow.*（影子规则，redb 持久化）─────────────────
+        // ── shadow.*（影子规则）─────────────────
         "shadow.list" => h.web_shadow_list(params),
         // 分页版（设置页列表走这条；`shadow.list` 保留给全量取用方）。
         "shadow.listPaged" => h.web_shadow_list_paged(params),
@@ -585,7 +617,7 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         "shadow.removeRule" => h.web_shadow_remove_rule(params),
         "shadow.addRule" => h.web_shadow_add_rule(params),
 
-        // ── phrase.*（用户短语，全局，redb 持久化）──────────
+        // ── phrase.*（用户短语，全局）──────────
         "phrase.list" => h.web_phrase_list(),
         "phrase.add" => h.web_phrase_add(params),
         "phrase.update" => h.web_phrase_update(params),
@@ -600,7 +632,7 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         "phrase.importText" => h.web_phrase_import_text(params),
         "phrase.resetSystem" => h.web_phrase_reset_system(),
 
-        // ── quick.*（快捷输入格式表的用户调整，全局，redb 持久化）──
+        // ── quick.*（快捷输入格式表的用户调整，全局）──
         // 基表（模板与出厂顺序）在 system.quick.toml，**RPC 一律不写它**：
         // 那会抢走高级用户手写文件的所有权，见 handle_quick_format 模块文档。
         "charset.list" => h.web_charset_list(),
@@ -667,6 +699,36 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
 
         other => anyhow::bail!("unknown method: {}", other),
     }
+}
+
+/// 数据文件问题 → 设置页用的 JSON（路径相对数据目录、`/` 分隔）。
+fn storage_issues_json(store: &wind_store::Store) -> Vec<Value> {
+    use wind_store::issues::IssueKind;
+    let root = store.user_text_dir();
+    store
+        .data_issues()
+        .into_iter()
+        .map(|i| {
+            let rel = i.path.strip_prefix(root).unwrap_or(&i.path);
+            let path: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let mut v = json!({ "path": path.join("/") });
+            match i.kind {
+                IssueKind::BadLines(n) => {
+                    v["kind"] = json!("bad_lines");
+                    v["lines"] = json!(n);
+                }
+                IssueKind::Isolated => v["kind"] = json!("isolated"),
+                IssueKind::Rebuilt { kept_as } => {
+                    v["kind"] = json!("rebuilt");
+                    v["kept_as"] = json!(kept_as);
+                }
+            }
+            v
+        })
+        .collect()
 }
 
 pub trait WebDataRpc: WebDataHost {
@@ -1135,6 +1197,35 @@ pub trait WebDataRpc: WebDataHost {
         // text 同理：列表给的是转义形态、key 是真实文本，不还原一样删不掉。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
         store.remove_user_word(&schema, &code, &store_text(text))?;
+        Ok(json!({ "ok": true }))
+    }
+
+    /// `dict.reload {paths?: [string]}` → `{reloaded: [schema]}`：不带 paths 全量扫描。
+    fn web_dict_reload(&self, params: &Value) -> anyhow::Result<Value> {
+        let store = self
+            .user_store()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let reloaded = match params.get("paths").and_then(|v| v.as_array()) {
+            Some(arr) => {
+                let paths: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                store.reload_user_text_paths(&paths)?
+            }
+            None => store.sync_user_texts(),
+        };
+        // 变了的项重建对应的内存镜像（短语层、快捷格式、常用字、字符集）
+        self.apply_user_text_changes(&reloaded);
+        Ok(json!({ "reloaded": reloaded }))
+    }
+
+    /// `dict.flush` → `{ok: true}`。
+    fn web_dict_flush(&self) -> anyhow::Result<Value> {
+        let store = self
+            .user_store()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.flush_user_data()?;
         Ok(json!({ "ok": true }))
     }
 
@@ -2095,7 +2186,7 @@ pub trait WebDataRpc: WebDataHost {
         let schemas_dir = user_dir.as_ref().map(|d| d.join("schemas"));
         let schema_overrides_dir = user_dir.as_ref().map(|d| d.join("schema_overrides"));
         let themes_dir = user_dir.as_ref().map(|d| d.join("themes"));
-        let state_file = wind_config::Config::local_dir().map(|d| d.join("state.toml"));
+        let state_file = wind_config::Config::state_dir().map(|d| d.join("state.toml"));
         let src = BackupSources {
             user_config_file: cfg_file.as_deref(),
             compat_file: compat_file.as_deref(),
@@ -2155,7 +2246,7 @@ pub trait WebDataRpc: WebDataHost {
         let schemas_dir = user_dir.as_ref().map(|d| d.join("schemas"));
         let schema_overrides_dir = user_dir.as_ref().map(|d| d.join("schema_overrides"));
         let themes_dir = user_dir.as_ref().map(|d| d.join("themes"));
-        let state_file = wind_config::Config::local_dir().map(|d| d.join("state.toml"));
+        let state_file = wind_config::Config::state_dir().map(|d| d.join("state.toml"));
         let targets = RestoreTargets {
             user_config_file: cfg_file.as_deref(),
             compat_file: compat_file.as_deref(),
@@ -2164,13 +2255,27 @@ pub trait WebDataRpc: WebDataHost {
             user_themes_dir: themes_dir.as_deref(),
             state_file: state_file.as_deref(),
         };
-        let r = restore_backup(
+        // 还原期间挂起统计收集器：它后台 30 秒那次 flush 若落在「还原写完、resume 之前」，会把
+        // 还原前的今天与总计写回去（P4a 审查 I-5）。还原失败也要解除挂起。
+        let collector = self.stat_collector();
+        if let Some(c) = collector {
+            c.suspend();
+        }
+        let r = match restore_backup(
             std::path::Path::new(path),
             store,
             &targets,
             strategy,
             sections.as_deref(),
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(c) = collector {
+                    c.unsuspend();
+                }
+                return Err(e);
+            }
+        };
         // 刷新:config 域生效、短语重建、涉及方案失效缓存(未加载时安全 no-op)。
         let touched_config = r.restored.iter().any(|p| p.starts_with("config/"));
         let touched_phrase = r.restored.iter().any(|p| p == "userdata/phrases.wdict");
@@ -2216,6 +2321,24 @@ pub trait WebDataRpc: WebDataHost {
         }
         if touched_charsets {
             self.reload_charsets();
+        }
+        // 常用字 / 快捷格式的内存镜像、统计收集器都要跟着还原后的数据重载：收集器不 resume 的话，
+        // 它下一次写盘会把还原前的「今天」和总计写回去（P4a Review Focus 4）。
+        let touched = |p: &str| r.restored.iter().any(|x| x == p);
+        let mut changed = Vec::new();
+        if touched("userdata/common_chars.jsonl") {
+            changed.push("common_chars".to_string());
+        }
+        if touched("userdata/quick_format.yaml") {
+            changed.push("quick_format".to_string());
+        }
+        self.apply_user_text_changes(&changed);
+        if let Some(c) = collector {
+            if touched("userdata/stats.jsonl") || touched("userdata/stats_meta.json") {
+                c.resume();
+            } else {
+                c.unsuspend();
+            }
         }
         Ok(json!({
             "restored": r.restored,
@@ -5308,6 +5431,20 @@ outside: rare
         }
     }
 
+    /// dict.reload / dict.flush：分派在表里；reload 越界路径报错。
+    #[test]
+    fn dict_reload_and_flush_are_dispatched() {
+        let c = coord("dict_reload_flush");
+        let r = c.web_data_rpc("dict.reload", &json!({})).unwrap();
+        assert!(r.get("reloaded").is_some_and(|v| v.is_array()), "{r}");
+        let r = c.web_data_rpc("dict.flush", &json!({})).unwrap();
+        assert_eq!(r, json!({"ok": true}));
+        assert!(
+            c.web_data_rpc("dict.reload", &json!({"paths": ["/etc/passwd"]}))
+                .is_err()
+        );
+    }
+
     /// ★ S3 复审 M3：这些方法也扫整表 / 是批量写，名单里不能缺。
     #[test]
     fn rpc_name_tables_cover_reviewed_methods() {
@@ -5320,10 +5457,10 @@ outside: rare
         );
     }
 
-    /// ★ S3：设置页翻页（`dict.listPaged`，每次都扫整表）只标记待回收、不逐页回收；
-    /// 停手满短档后回收**一次**。另验窄查询（`dict.search` 带 limit）不标记。
+    /// 协调器起来就迁完了全部旧数据、放下了 redb：设置页翻页（`dict.listPaged`）与窄查询照常，
+    /// 不再触发 redb 页缓存回收（无缓存可回收）。
     #[test]
-    fn dict_list_paged_marks_scan_and_reclaims_once_after_short_idle() {
+    fn dict_list_paged_after_migration_has_no_redb_to_reclaim() {
         use std::time::Duration;
         const TICK: Duration = Duration::from_millis(20);
         const SCAN_IDLE: Duration = Duration::from_millis(300);
@@ -5349,11 +5486,7 @@ outside: rare
         )
         .unwrap();
         std::thread::sleep(SCAN_IDLE * 3);
-        assert_eq!(
-            store.page_cache_drops(),
-            0,
-            "带 limit 的前缀查询不该触发短档"
-        );
+        assert_eq!(store.page_cache_drops(), 0, "窄查询不触发回收");
 
         let c = coord("scan_reclaim");
         let store = c.user_store().expect("有 store").clone();
@@ -5364,15 +5497,11 @@ outside: rare
         let page = json!({ "schemaId": "pinyin", "offset": 0, "limit": 50 });
         let first = c.web_data_rpc("dict.listPaged", &page).unwrap();
         let second = c.web_data_rpc("dict.listPaged", &page).unwrap();
-        assert_eq!(store.page_cache_drops(), 0, "连续翻页只标记，不逐页回收");
-
+        assert!(store.is_paused(), "迁完即放下旧库");
         assert!(
-            wait_drops(&store, 1, SCAN_IDLE * 20),
-            "停手满短档后该回收一次"
+            !wait_drops(&store, 1, SCAN_IDLE * 3),
+            "没有 redb 页缓存可回收"
         );
-        std::thread::sleep(SCAN_IDLE * 3);
-        assert_eq!(store.page_cache_drops(), 1, "只回收一次，不重复");
-        // 回收后查询结果不变。
         let after = c.web_data_rpc("dict.listPaged", &page).unwrap();
         assert_eq!(first, second);
         assert_eq!(first, after);
@@ -9791,6 +9920,58 @@ short_code_yield_level = 2
         );
     }
 
+    /// P4a Review Focus 4：Replace 还原统计后，收集器下一次写盘不覆盖还原值。
+    #[test]
+    fn restore_stats_resets_collector() {
+        use wind_store::stat_collector::StatEvent;
+        let c = coord("restore_stats");
+        let store = c.user_store().cloned().unwrap();
+        let col = c.stat_collector().expect("采集器");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        store
+            .put_daily_stat(
+                &today,
+                &wind_store::stats::DailyStats {
+                    chinese: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        col.resume();
+        let out =
+            std::env::temp_dir().join(format!("wind_restore_stats_{}.zip", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        c.web_data_rpc(
+            "backup.create",
+            &json!({ "path": out.to_string_lossy(), "includeStats": true }),
+        )
+        .unwrap();
+        col.record(StatEvent {
+            timestamp: chrono::Local::now(),
+            chinese: 100,
+            english: 0,
+            punct: 0,
+            other: 0,
+            code_len: 2,
+            candidate_pos: 0,
+            keystrokes: 2,
+            schema_id: "wb".into(),
+            source: Default::default(),
+        });
+        c.web_data_rpc(
+            "backup.restore",
+            &json!({ "path": out.to_string_lossy(), "sections": ["stats"], "strategy": "replace" }),
+        )
+        .unwrap();
+        col.flush();
+        assert_eq!(
+            store.get_daily_stat(&today).unwrap().chinese,
+            5,
+            "收集器不得覆盖还原值"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
     #[test]
     fn backup_rpc_contract() {
         let c = coord("backuprpc");
@@ -10125,13 +10306,18 @@ mod phrase_shadowing_tests {
     /// 带真实 `system.phrases.toml` 的无头协调器（`data_dir=None` 时补齐逻辑会整体早退，
     /// 那样测出来的「通过」是假的——它根本没跑到被测代码）。
     fn coord_with_sys_phrase(tag: &str) -> (Arc<Coordinator>, std::path::PathBuf) {
+        coord_with_sys_toml(tag, "")
+    }
+
+    /// `extra`：追加在 TOML 末尾的更多 `[[phrases]]` 条目。
+    fn coord_with_sys_toml(tag: &str, extra: &str) -> (Arc<Coordinator>, std::path::PathBuf) {
         let base = std::env::temp_dir().join(format!("wind_phrase_shadow_{tag}"));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(
             base.join("system.phrases.toml"),
             format!(
-                "[[phrases]]\ncode = '{SYS_CODE}'\ntext = '{SYS_TEXT}'\nweight = 1000\nposition = 1\n"
+                "[[phrases]]\ncode = '{SYS_CODE}'\ntext = '{SYS_TEXT}'\nweight = 1000\nposition = 1\n{extra}"
             ),
         )
         .unwrap();
@@ -10161,6 +10347,50 @@ mod phrase_shadowing_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// P3 审查 I2：`dict.reload` 载入手改的短语文件后，输入期短语层随之重建。
+    #[test]
+    fn dict_reload_rebuilds_phrase_layer() {
+        let (c, base) = coord_with_sys_phrase("reload_phrases");
+        let store = c.user_store().cloned().unwrap();
+        store.add_phrase("yx", "me@x.com", 0, 1800).unwrap();
+        c.web_data_rpc("phrase.list", &json!({})).ok();
+        let f = store.phrases_path();
+        std::fs::write(
+            &f,
+            std::fs::read_to_string(&f).unwrap() + "dzdz\t地址\t1800\n",
+        )
+        .unwrap();
+        let r = c.web_data_rpc("dict.reload", &json!({})).unwrap();
+        assert!(
+            r["reloaded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "phrases"),
+            "{r}"
+        );
+        assert!(c.debug_phrase_texts("dzdz").contains(&"地址".to_string()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P3 审查 I1：数据目录里没有 system.phrases.toml 时短语迁移照样做（没有 TOML 就没有系统行），
+    /// 用户短语不能因此看不见。
+    #[test]
+    fn phrase_migration_runs_without_system_toml() {
+        let base = std::env::temp_dir().join("wind_phrase_no_toml");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = Arc::new(Store::open(base.join("s.redb")).unwrap());
+        store
+            .legacy_put_phrase("yx", "me@x.com", 1800, 0, true, false, false, "")
+            .unwrap();
+        let c = Coordinator::new_headless_with_store(Config::default(), Some(&base), store.clone());
+        assert!(store.migrated_p3());
+        assert!(store.list_phrases().unwrap().iter().any(|p| p.code == "yx"));
+        assert!(c.debug_phrase_texts("yx").contains(&"me@x.com".to_string()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 删除遮蔽行 → 系统条目露出来（用户预期：删掉我加的那条，就该回到系统默认）。
     #[test]
     fn removing_shadowing_phrase_restores_system_entry() {
@@ -10187,21 +10417,12 @@ mod phrase_shadowing_tests {
     /// 「清空用户短语」同理，且**不得**顺带重置用户对系统短语的编辑。
     #[test]
     fn clearing_user_phrases_restores_system_entry_without_resetting_edits() {
-        let (c, base) = coord_with_sys_phrase("clear");
+        let (c, base) = coord_with_sys_toml(
+            "clear",
+            "[[phrases]]\ncode = 'other'\ntext = '别的'\nweight = 1\nposition = 0\n",
+        );
         let store = c.user_store().cloned().unwrap();
-        // 另加一条纯系统短语并由用户改过权重（模拟在系统短语列表里调过）
-        store
-            .add_phrase("other", "别的", 0, 1)
-            .and_then(|_| {
-                store.reclaim_system_phrases(&[wind_store::phrases::SystemPhrase {
-                    code: "other".into(),
-                    text: "别的".into(),
-                    weight: 1,
-                    position: 0,
-                    category: String::new(),
-                }])
-            })
-            .unwrap();
+        // 另一条系统短语由用户改过权重（在系统短语列表里调过）
         store
             .update_phrase("other", "别的", None, None, Some(7), Some(4321))
             .unwrap();
@@ -10414,8 +10635,10 @@ mod memory_stats_tests {
     use wind_store::Store;
 
     /// 一个自造码表方案 `zm1` 的数据目录 + store（不依赖 build_dev，不会静默跳过）。
-    fn coord() -> Arc<Coordinator> {
-        let base = std::env::temp_dir().join(format!("wind_memstats-{}", std::process::id()));
+    /// `tag` 让并行的用例各用各的夹具目录——redb 是独占锁，两条用例同时开同一个 `s.redb`
+    /// 必有一条失败。
+    fn coord(tag: &str) -> Arc<Coordinator> {
+        let base = std::env::temp_dir().join(format!("wind_memstats-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let schemas = base.join("schemas");
         std::fs::create_dir_all(schemas.join("zm1")).unwrap();
@@ -10438,9 +10661,85 @@ mod memory_stats_tests {
         Coordinator::new_headless_with_store(cfg, Some(&base), store)
     }
 
+    /// storageStatus 报 meta.toml 里的实际格式版本，并带上写失败原因（没有时为 null）。
+    #[test]
+    fn storage_status_reports_actual_format_version_and_write_error() {
+        let c = coord("storage_status_actual");
+        let v = c.web_data_rpc("system.storageStatus", &json!({})).unwrap();
+        assert_eq!(
+            v["format_version"],
+            wind_config::user_meta::KNOWN_FORMAT_VERSION
+        );
+        assert!(v["write_error"].is_null());
+        let dir = c
+            .user_store()
+            .unwrap()
+            .path()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(
+            dir.join("meta.toml"),
+            "format_version = 3\ndir_id = \"x\"\n",
+        )
+        .unwrap();
+        let v = c.web_data_rpc("system.storageStatus", &json!({})).unwrap();
+        assert_eq!(v["format_version"], 3, "报文件里的实际值");
+        assert_eq!(
+            v["known_format_version"],
+            wind_config::user_meta::KNOWN_FORMAT_VERSION
+        );
+    }
+
+    /// §2.5：数据文件的问题（坏行 / 隔离 / 已重建 / 未迁移）经 storageStatus 交给设置页。
+    #[test]
+    fn storage_status_lists_data_file_issues() {
+        let c = coord("storage_status_issues");
+        let root = c.user_store().unwrap().user_text_dir().to_path_buf();
+        let f = root.join("pinyin").join("freq.table.yaml");
+        let g = root.join("stats").join("2026-10.toml");
+        wind_store::issues::report(&f, wind_store::issues::IssueKind::BadLines(3));
+        wind_store::issues::report(
+            &g,
+            wind_store::issues::IssueKind::Rebuilt {
+                kept_as: "2026-10.toml.corrupt-x".into(),
+            },
+        );
+        let v = c.web_data_rpc("system.storageStatus", &json!({})).unwrap();
+        let issues = v["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 2, "{v}");
+        assert_eq!(issues[0]["path"], "pinyin/freq.table.yaml");
+        assert_eq!(issues[0]["kind"], "bad_lines");
+        assert_eq!(issues[0]["lines"], 3);
+        assert_eq!(issues[1]["path"], "stats/2026-10.toml");
+        assert_eq!(issues[1]["kind"], "rebuilt");
+        assert_eq!(issues[1]["kept_as"], "2026-10.toml.corrupt-x");
+        wind_store::issues::clear(&f);
+        wind_store::issues::clear(&g);
+    }
+
+    /// 用户数据设计 §7.1：`system.storageStatus` 报只读标志、原因与格式版本。正常构造的
+    /// 协调器不是只读；只读路径（meta.toml 版本更高）由 wind-coordinator 的
+    /// `tests/storage_readonly.rs` 验（trait 在那边不可调，这里验的是 RPC 的形状）。
+    #[test]
+    fn storage_status_reports_readonly_flag_and_versions() {
+        let c = coord("storage_status_reports_r");
+        let v = c.web_data_rpc("system.storageStatus", &json!({})).unwrap();
+        assert_eq!(v["readonly"], false);
+        assert!(v["reason"].is_null());
+        assert_eq!(
+            v["format_version"],
+            wind_config::user_meta::KNOWN_FORMAT_VERSION
+        );
+        assert_eq!(
+            v["known_format_version"],
+            wind_config::user_meta::KNOWN_FORMAT_VERSION
+        );
+    }
+
     #[test]
     fn memory_stats_reports_process_schemas_and_structures() {
-        let c = coord();
+        let c = coord("memory_stats_reports_pro");
         let v = c.web_data_rpc("system.memoryStats", &json!({})).unwrap();
 
         let p = &v["process"];
@@ -10469,7 +10768,9 @@ mod memory_stats_tests {
         for k in ["chaiziBytes", "pinyinBytes", "commentBytes"] {
             assert!(v["reverseLookup"][k].is_u64(), "reverseLookup.{k}：{v}");
         }
-        assert!(v["redb"]["cacheLimitBytes"].as_u64().unwrap() > 0);
-        assert!(v["redb"]["pageCacheDrops"].is_u64());
+        assert!(
+            v["redb"].is_null(),
+            "全新用户目录不打开旧库，不该报它的缓存上限：{v}"
+        );
     }
 }

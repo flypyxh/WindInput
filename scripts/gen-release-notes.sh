@@ -48,11 +48,16 @@ if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then END="$TAG"; else 
 
 # 上一版本:优先按历史拓扑取「$END 的祖先里最近的 tag」——比版本号排序更准,
 # 不会被旁支上手工打的 tag 干扰。describe 取不到(浅克隆/首个版本)时退回版本号排序。
+# 正式版跳过预发布 tag:0.127.0 的变更记录要从 0.126.0 算起,而不是只剩最后一个 beta 之后的。
+# 预发布版则取最近的任意 tag(beta.2 接 beta.1)。
+EXCLUDE=()
+[[ "$VERSION" == *-* ]] || EXCLUDE=(--exclude 'v*-*')
 if [ -z "$PREV" ]; then
-  PREV="$(git describe --tags --abbrev=0 --match 'v*' "${END}^" 2>/dev/null || true)"
+  PREV="$(git describe --tags --abbrev=0 --match 'v*' ${EXCLUDE[@]+"${EXCLUDE[@]}"} "${END}^" 2>/dev/null || true)"
 fi
 if [ -z "$PREV" ]; then
-  PREV="$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+' | grep -vx "$TAG" | head -n1 || true)"
+  PREV="$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+' | grep -vx "$TAG" \
+    | { if [[ "$VERSION" == *-* ]]; then cat; else grep -v -- '-'; fi; } | head -n1 || true)"
 fi
 if [ -n "$PREV" ]; then RANGE="$PREV..$END"; else RANGE="$END"; fi
 echo "release notes: tag=$TAG range=$RANGE" >&2

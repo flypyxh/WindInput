@@ -9,7 +9,7 @@ use std::sync::Arc;
 // debug! 只在 desktop-ui 门内的 `new` 用到；headless 形态下无引用。
 #[cfg(feature = "desktop-ui")]
 use tracing::debug;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use wind_bridge::push::{PushConfig, PushServer};
 use wind_config::Config;
@@ -23,6 +23,60 @@ use wind_ui_types::UiEvent;
 use wind_ui::manager::UiManager;
 
 use crate::coordinator::Coordinator;
+
+/// 把 `format_version` 升到迁移进度够到的值；够到 5（旧库各表迁完）⇒ 删掉旧库链标记、旧库改名
+/// `userdata.redb.legacy`（§7.4）。打开用户库后、短语迁移之后各调一次。没迁完不升：认识旧格式的
+/// 旧版本回退后旧表仍是完整的真源、仍可写。
+pub(crate) fn finish_format_upgrade(store: &Store, user_dir: &Path) {
+    let Some(v) = store.format_version_reached() else {
+        warn!("P1 迁移未完成，format_version 暂不升级，下次启动重试");
+        return;
+    };
+    if let Err(e) = wind_config::user_meta::raise_format_version(user_dir, v) {
+        warn!("format_version 升级失败（旧版本仍可能写 redb）：{e}");
+        return;
+    }
+    if v >= wind_store::migrate_p3::FULLY_MIGRATED_VERSION {
+        store.forget_legacy_markers();
+        wind_store::legacy_retire::retire_legacy_db(user_dir);
+    }
+}
+
+/// 生产的运行时状态位置：`<state>/runtime/<dir_id>/`。按用户目录分开——换用户目录（`datadir.conf`、
+/// 拷回旧目录副本）时新目录有自己的引擎、迁移标记与锁，旧目录学到的数据不会混进来，新目录的旧表
+/// 照常迁移。dir_id 只取字母数字与 `-` `_`（它来自 meta.toml，防路径穿越）。
+/// 用户数据文件在用户目录 `<user_dir>/data/` 下（随目录漫游 / 备份）。
+pub(crate) fn runtime_state_loc(
+    state_base: &Path,
+    dir_id: &str,
+    user_dir: &Path,
+    legacy_done: bool,
+) -> wind_store::store::StateLoc {
+    let safe: String = dir_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let safe = if safe.is_empty() {
+        "default".to_string()
+    } else {
+        safe
+    };
+    wind_store::store::StateLoc {
+        state_dir: state_base.join("runtime").join(safe),
+        dir_id: dir_id.to_string(),
+        text_dir: user_dir.join(wind_store::DATA_DIR_NAME),
+        legacy_done,
+    }
+}
+
+/// 运行时引擎的状态目录取哪里。
+#[derive(Clone, Copy)]
+pub(crate) enum StateChoice {
+    /// 生产：`Config::state_dir()`（`local_dir()/state`）+ meta 的 dir_id。
+    Production,
+    /// 测试 / 无头：redb 旁的派生目录（不碰本机状态目录与它的锁）。
+    Derived,
+}
 
 impl Coordinator {
     /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程。
@@ -81,8 +135,9 @@ impl Coordinator {
         let user_dir =
             Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
         // redb 用户数据库（用户偏好数据：词频、自定义词、shadow 规则，应随用户漫游）。
-        let store = user_dir.as_deref().and_then(Self::open_user_store);
-        let coordinator = Self::build(
+        let (store, storage_readonly) =
+            Self::open_user_store_checked(user_dir.as_deref(), StateChoice::Production);
+        let coordinator = Self::build_with_readonly(
             config,
             data_dir.as_deref(),
             push_server,
@@ -90,6 +145,7 @@ impl Coordinator {
             user_dir,
             store,
             None, // 生产路径：override 目录由 EngineManager 取用户配置目录下的默认值
+            storage_readonly,
         );
 
         // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
@@ -334,21 +390,112 @@ impl Coordinator {
             write_timeout_ms: 30_000,
         }));
         let user_dir = user_dir.map(|d| d.to_path_buf());
-        let store = user_dir.as_deref().and_then(Self::open_user_store);
+        // 测试路径：运行时数据放 redb 旁的派生目录，不碰本机状态目录与它的锁
+        let (store, storage_readonly) =
+            Self::open_user_store_checked(user_dir.as_deref(), StateChoice::Derived);
         (
-            Self::build(config, data_dir, push_server, ui_tx, user_dir, store, None),
+            Self::build_with_readonly(
+                config,
+                data_dir,
+                push_server,
+                ui_tx,
+                user_dir,
+                store,
+                None,
+                storage_readonly,
+            ),
             rx,
         )
     }
 
+    /// 先查 `meta.toml` 的格式版本（用户数据设计 §7.1）：高于本版本或读不出 ⇒ 只读模式，
+    /// 不打开 redb、不写任何用户数据；否则照常打开。
+    pub(crate) fn open_user_store_checked(
+        dir: Option<&Path>,
+        choice: StateChoice,
+    ) -> (Option<Arc<Store>>, Option<String>) {
+        let Some(d) = dir else { return (None, None) };
+        match wind_config::user_meta::load_or_init(d) {
+            wind_config::user_meta::MetaCheck::Ok(meta) => {
+                // 用户目录记为迁完 ⇒ 不再从旧库重迁（state 被清也一样）
+                let legacy_done =
+                    meta.format_version >= wind_store::migrate_p3::FULLY_MIGRATED_VERSION;
+                (
+                    Self::open_user_store(d, choice, &meta.dir_id, legacy_done),
+                    None,
+                )
+            }
+            wind_config::user_meta::MetaCheck::Incompatible { found, known } => {
+                let reason = format!(
+                    "用户数据由更新版本写入（格式 {found}，本版本只认识 {known}）：已进入只读模式，\
+                     不会修改任何用户数据。请升级到新版本，或从备份还原。"
+                );
+                error!("{reason}");
+                (None, Some(reason))
+            }
+            wind_config::user_meta::MetaCheck::Unreadable(e) => {
+                let reason = format!("用户目录的 meta.toml 读不出（{e}）：按只读模式运行。");
+                error!("{reason}");
+                (None, Some(reason))
+            }
+        }
+    }
+
     /// 打开用户目录下的 redb（缺目录时创建）。失败只 warn：store 不可用时协调器
     /// 退化为「不落盘」而非拒绝启动。
-    pub(crate) fn open_user_store(dir: &Path) -> Option<Arc<Store>> {
+    pub(crate) fn open_user_store(
+        dir: &Path,
+        choice: StateChoice,
+        dir_id: &str,
+        legacy_done: bool,
+    ) -> Option<Arc<Store>> {
         let _ = std::fs::create_dir_all(dir);
         let p = dir.join("userdata.redb");
-        match Store::open(&p) {
+        let opened = match choice {
+            StateChoice::Production => match Config::state_dir() {
+                Some(state_base) => Store::open_with_state(
+                    &p,
+                    runtime_state_loc(&state_base, dir_id, dir, legacy_done),
+                ),
+                None => {
+                    // 文本仍在真实用户目录里：它是真源，不能跟着派生目录走
+                    warn!("取不到本机状态目录，运行时数据放在 redb 旁的派生目录");
+                    Store::open_with_state(
+                        &p,
+                        wind_store::store::StateLoc {
+                            state_dir: wind_store::store::derived_state_dir(&p),
+                            dir_id: dir_id.into(),
+                            text_dir: dir.join(wind_store::DATA_DIR_NAME),
+                            legacy_done,
+                        },
+                    )
+                }
+            },
+            StateChoice::Derived => {
+                // 运行时状态放 redb 旁的派生目录（新库时清空，测试反复用同一路径不串数据）；用户词
+                // 文本是真源，同生产一样在 `<用户目录>/user/`，从不跟着清（移动端也走这条）。
+                // 用户目录已记为迁完时本就没有 redb（全新目录不建），不在不代表是新库。
+                let state_dir = wind_store::store::derived_state_dir(&p);
+                if !p.exists() && !legacy_done {
+                    let _ = std::fs::remove_dir_all(&state_dir);
+                }
+                Store::open_with_state(
+                    &p,
+                    wind_store::store::StateLoc {
+                        state_dir,
+                        dir_id: "derived".into(),
+                        text_dir: dir.join(wind_store::DATA_DIR_NAME),
+                        legacy_done,
+                    },
+                )
+            }
+        };
+        match opened {
             Ok(s) => {
-                info!("Opened redb store: {}", p.display());
+                info!("Opened user store: {}", dir.display());
+                // 迁移完成才升 format_version：此后认识旧格式的版本只读（§7.1）。P3 的短语迁移要等
+                // 协调器交来系统短语（之后协调器会再升一次）。
+                finish_format_upgrade(&s, dir);
                 let s = Arc::new(s);
                 // 空闲一分钟就把 redb 的页缓存还给系统。那笔缓存只涨不落
                 // （上界 ≈ min(配额, 库文件大小)，19 万词实测 41 MB、50 万词约 90 MB），
@@ -371,6 +518,10 @@ impl Coordinator {
                     wind_store::store::RECLAIM_TICK,
                     crate::heap_trim::release_free_heap,
                 );
+                // 用户词改动停手 30 秒后写回 user.dict.yaml：没有后续写入也要有人来折回。
+                s.spawn_userdata_ticker(wind_store::store::USERDATA_TICK);
+                // 补全历史等小文件只改内存，这里每 2 秒把改动落盘一次（设计 §2.4 去抖）。
+                s.spawn_small_file_flusher(wind_store::store::SMALL_FILE_FLUSH);
                 Some(s)
             }
             Err(e) => {
@@ -417,5 +568,308 @@ impl Coordinator {
             Some(store),
             override_dir,
         )
+    }
+}
+
+#[cfg(test)]
+mod p1_meta_tests {
+    use super::*;
+
+    /// Review Focus 3：meta 为 1 的目录被新版打开 ⇒ 迁移后升到最新（认识 1 的旧版本随后只读）。
+    #[test]
+    fn opening_migrates_and_raises_format_version() {
+        let d = std::env::temp_dir().join(format!("wind_raise_fv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("meta.toml"), "format_version = 1\ndir_id = \"d1\"\n").unwrap();
+        let (store, reason) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        assert!(store.is_some() && reason.is_none());
+        let text = std::fs::read_to_string(d.join("meta.toml")).unwrap();
+        assert!(text.contains("format_version = 3"), "{text}");
+        assert!(text.contains("d1"), "dir_id 保留: {text}");
+        let state = wind_store::store::derived_state_dir(&d.join("userdata.redb"));
+        assert!(state.join(wind_store::migrate_p1::MIGRATED_P1).is_file());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 造一个「老版本写的」用户目录：meta 为 1，redb 旧表里有一条拼音临时词。
+    fn legacy_user_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wind_p1fix_{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("meta.toml"), "format_version = 1\ndir_id = \"d1\"\n").unwrap();
+        let p = d.join("userdata.redb");
+        let s = Store::open(&p).unwrap();
+        s.legacy_put_temp("py", "nihao", "你好", 800, 3, 1_700_000_000, 0b101)
+            .unwrap();
+        drop(s);
+        std::fs::remove_dir_all(wind_store::store::derived_state_dir(&p)).unwrap();
+        d
+    }
+
+    fn meta_version(d: &std::path::Path) -> u32 {
+        let t = std::fs::read_to_string(d.join("meta.toml")).unwrap();
+        toml::from_str::<wind_config::user_meta::UserMeta>(&t)
+            .unwrap()
+            .format_version
+    }
+
+    /// §7.4：旧库各表迁完 ⇒ format_version 5、旧库改名 `.legacy`、`migrated-*` 标记删除；
+    /// 再开不打开旧库、不重迁，数据都在。
+    #[test]
+    fn legacy_dir_reaches_final_format_and_retires_redb() {
+        let d = legacy_user_dir("retire");
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        s.migrate_phrases_now().unwrap();
+        crate::construct::finish_format_upgrade(&s, &d);
+        drop(s);
+        assert_eq!(
+            meta_version(&d),
+            wind_config::user_meta::KNOWN_FORMAT_VERSION
+        );
+        assert!(d.join("userdata.redb.legacy").is_file());
+        assert!(!d.join("userdata.redb").exists());
+        let state = wind_store::store::derived_state_dir(&d.join("userdata.redb"));
+        assert!(
+            wind_store::migrate_p3::all_migration_markers()
+                .iter()
+                .all(|m| !state.join(m).exists()),
+            "迁完不再留 migrated-* 标记"
+        );
+        assert!(
+            d.join("data/py/temp.dict.yaml").is_file(),
+            "学到的数据落成文本"
+        );
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert!(s.runtime().temp_word("py", "nihao", "你好").is_some());
+        assert!(!d.join("userdata.redb").exists(), "不再新建 redb");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// P5 退出判据：删掉整个本机状态目录后重启，学到的数据、补全、统计全在。
+    #[test]
+    fn wiping_state_dir_keeps_all_user_data() {
+        let d = std::env::temp_dir().join(format!("wind_p5_wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        {
+            let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+            let s = store.unwrap();
+            s.learn_temp_word("pinyin", "nihao", "你好", 10, 0b101)
+                .unwrap();
+            s.record_freq("pinyin", "nihao", "你好").unwrap();
+            s.record_assoc_pick("pinyin", "我们", "我们的").unwrap();
+            s.record_completion(
+                wind_store::completion::CompletionKind::EmailSuffix,
+                "qq.com",
+            )
+            .unwrap();
+            s.put_daily_stat(
+                "2026-10-15",
+                &wind_store::stats::DailyStats {
+                    chinese: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            s.flush_user_data().unwrap();
+        }
+        assert_eq!(
+            meta_version(&d),
+            wind_config::user_meta::KNOWN_FORMAT_VERSION,
+            "全新目录直接是最新格式"
+        );
+        std::fs::remove_dir_all(wind_store::store::derived_state_dir(
+            &d.join("userdata.redb"),
+        ))
+        .unwrap();
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert!(s.runtime().temp_word("pinyin", "nihao", "你好").is_some());
+        assert_eq!(
+            s.get_freq("pinyin", "nihao", "你好")
+                .unwrap()
+                .unwrap()
+                .count,
+            1
+        );
+        assert!(!s.runtime().assoc_history("pinyin", "我们", 10).is_empty());
+        assert!(
+            s.get_completion(
+                wind_store::completion::CompletionKind::EmailSuffix,
+                "qq.com"
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(s.get_daily_stat("2026-10-15").unwrap().chinese, 5);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 审查 I3：迁移失败时不得升 format_version（旧版本回退后仍可写、旧表仍是完整的真源）。
+    #[test]
+    fn failed_migration_does_not_raise_format_version() {
+        let d = legacy_user_dir("noraise");
+        let state = wind_store::store::derived_state_dir(&d.join("userdata.redb"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("py"), b"x").unwrap(); // 拼音的状态子目录被占 ⇒ 迁移失败
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        assert!(store.is_some(), "迁移失败不阻断启动");
+        drop(store);
+        let text = std::fs::read_to_string(d.join("meta.toml")).unwrap();
+        assert!(
+            text.contains("format_version = 1"),
+            "迁移没成功就不升版本: {text}"
+        );
+        std::fs::remove_file(state.join("py")).unwrap();
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        drop(store);
+        let text = std::fs::read_to_string(d.join("meta.toml")).unwrap();
+        assert!(text.contains("format_version = 3"), "迁移成功后升: {text}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// P1、P2 都迁完才升到 3；只迁完 P1 停在 2，P2 迁完后再升。
+    #[test]
+    fn format_version_follows_migration_progress() {
+        let d = legacy_user_dir("p2progress");
+        let p = d.join("userdata.redb");
+        {
+            let s = Store::open(&p).unwrap();
+            s.legacy_put_user("pinyin", "nihao", "你好", 9, 0b101, 1)
+                .unwrap();
+        }
+        std::fs::remove_dir_all(wind_store::store::derived_state_dir(&p)).unwrap();
+        // 用户词文本的路径被一个目录占住 ⇒ P2 写不出文本、迁移失败；P1（学到的数据写同目录下
+        // 别的文件）照常
+        let blocker = d
+            .join(wind_store::DATA_DIR_NAME)
+            .join("pinyin")
+            .join("user.dict.yaml");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        drop(store);
+        let text = std::fs::read_to_string(d.join("meta.toml")).unwrap();
+        assert!(text.contains("format_version = 2"), "只迁完 P1: {text}");
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert!(s.migrated_p2());
+        assert_eq!(s.get_user_words("pinyin", "nihao").unwrap()[0].text, "你好");
+        drop(s);
+        let text = std::fs::read_to_string(d.join("meta.toml")).unwrap();
+        assert!(text.contains("format_version = 3"), "P2 迁完: {text}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// P2b 审查 M8：派生模式（移动端、测试）的用户词文本同样在 `<用户目录>/user/`；redb 不在时
+    /// 只清派生状态目录，真源文本不动、重开即读回。
+    #[test]
+    fn derived_mode_keeps_user_text_in_user_dir() {
+        let d = std::env::temp_dir().join(format!("wind_p2b_m8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        s.add_user_word("wb", "a", "工", 7, 0).unwrap();
+        s.flush_user_data().unwrap();
+        assert!(
+            d.join(wind_store::DATA_DIR_NAME)
+                .join("wb")
+                .join("user.dict.yaml")
+                .is_file()
+        );
+        drop(s);
+        // 全新目录本就不建 redb；有的话也删掉——两种情形文本都要原样读回
+        let _ = std::fs::remove_file(d.join("userdata.redb"));
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert_eq!(s.get_user_words("wb", "a").unwrap()[0].weight, 7);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 全新目录（meta 直接是最新格式）根本不建 redb：派生模式不能因「redb 不在」就把它当新库、
+    /// 每次打开都清掉运行时状态（移动端走派生模式，那等于每次启动丢掉学到的词）。
+    #[test]
+    fn derived_mode_fresh_dir_keeps_learned_data_across_reopen() {
+        let d = std::env::temp_dir().join(format!("wind_fresh_keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert!(!d.join("userdata.redb").exists(), "全新目录不建旧库");
+        s.learn_temp_word("py", "ni", "你", 1, 0).unwrap();
+        drop(s);
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert!(
+            !s.get_temp_words("py", "ni").unwrap().is_empty(),
+            "重开后学到的词还在"
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// P3 迁完（短语迁移要等 set_system_phrases）后升到最新（P4a 在打开时已迁完 ⇒ 5）。
+    #[test]
+    fn format_version_reaches_latest_after_phrase_migration() {
+        let d = legacy_user_dir("p3fv");
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        let s = store.unwrap();
+        assert!(!s.migrated_p3(), "短语迁移要等系统短语");
+        s.set_system_phrases(&[]).unwrap();
+        assert!(s.migrated_p3());
+        assert_eq!(
+            s.format_version_reached(),
+            Some(wind_config::user_meta::KNOWN_FORMAT_VERSION)
+        );
+        drop(s);
+        let (store, _) = Coordinator::open_user_store_checked(Some(&d), StateChoice::Derived);
+        drop(store);
+        assert_eq!(
+            meta_version(&d),
+            wind_config::user_meta::KNOWN_FORMAT_VERSION
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 审查 I2：运行时状态按用户目录（dir_id）分开——换目录后新目录的旧表照常迁移，
+    /// 旧目录学到的词不混进来。
+    #[test]
+    fn runtime_state_is_per_user_dir() {
+        let base = std::env::temp_dir().join(format!("wind_p1fix_base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let a = std::env::temp_dir().join(format!("wind_p1fix_a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&a);
+        let sa = Store::open_with_state(
+            a.join("userdata.redb"),
+            runtime_state_loc(&base, "dir-A", &a, false),
+        )
+        .unwrap();
+        sa.learn_temp_word("py", "jiade", "甲的", 800, 0).unwrap();
+        drop(sa);
+        let b = legacy_user_dir("perdir");
+        let sb = Store::open_with_state(
+            b.join("userdata.redb"),
+            runtime_state_loc(&base, "dir-B", &b, false),
+        )
+        .unwrap();
+        assert!(sb.migrated_p1());
+        assert_eq!(
+            sb.get_temp_word("py", "nihao", "你好").unwrap(),
+            Some(3),
+            "B 的旧表迁入"
+        );
+        assert!(
+            sb.get_temp_word("py", "jiade", "甲的").unwrap().is_none(),
+            "A 的词不混进 B"
+        );
+        drop(sb);
+        for d in [&base, &a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

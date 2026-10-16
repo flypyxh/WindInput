@@ -91,7 +91,8 @@ prestart = true
 conf_file = "datadir.conf"
 # 卸载删除用户数据前的安全判据：datadir.conf 是用户可编辑的明文路径，而下游动作是
 # remove_dir_all + 拷到桌面。目录非空时必须命中其一，否则跳过删除（空目录一律放行）。
-markers = ["config.toml", "compat.toml", "userdata.redb", "wind_setting.toml", "schemas", "themes"]
+# meta.toml / data 是 P5 起每个用户目录都有的；userdata.redb(.legacy) 是旧库与迁完改名后的它。
+markers = ["config.toml", "compat.toml", "meta.toml", "data", "userdata.redb", "userdata.redb.legacy", "wind_setting.toml", "schemas", "themes"]
 
 # ── 本机数据目录清理：%LOCALAPPDATA%\WindInput 下由主程序运行期创建的东西 ────
 #    不声明这一段，卸载后这些会原样留下（连同目录本身）——安装器只撤销自己写过的
@@ -106,7 +107,10 @@ markers = ["config.toml", "compat.toml", "userdata.redb", "wind_setting.toml", "
 #      logs   主程序 / wind_setting / TSF DLL 三方的日志，含 tsf_log/ 与 tsf_log_config
 #             （wind_tsf 的 FileLogger 直接往这里写，它不经过主程序的日志栈）
 #    state_files →「删除用户词库和配置数据」勾选。删了就没了，故跟随那个危险勾选：
-#      state.toml        工具栏位置等本机状态
+#      state/            本机状态目录：state.toml（工具栏位置等）+ runtime/<dir_id>/（未折回的日志与
+#                        可由用户目录重建的快照段；学到的数据、补全、统计的真源在用户目录 data/ 下）
+#      state.toml        **旧布局遗留**：state/ 之前它直接放在本机根下，首次加载会挪进 state/；
+#                        没跑过新版本就卸载的机器上仍在这里
 #      user_config.seen  「用户配置曾存在」标记；留着会让重装后的漫游配置探测
 #                        以为用户定制过，从而白等一轮漫游挂载
 #      userdata.redb     **旧布局遗留**。现役位置在用户数据目录（见 [datadir].markers），
@@ -114,7 +118,7 @@ markers = ["config.toml", "compat.toml", "userdata.redb", "wind_setting.toml", "
 #                        列在这里只为清掉那份历史残留，不影响现役路径。
 [localdata]
 cache_dirs  = ["cache", "logs"]
-state_files = ["state.toml", "user_config.seen", "userdata.redb"]
+state_files = ["state", "state.toml", "user_config.seen", "userdata.redb"]
 remove_dir_when_empty = true
 
 # ── 界面文案：留空即用中性默认（不含「输入法」「词库」字样）──────────────────

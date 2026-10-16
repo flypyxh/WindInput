@@ -329,21 +329,34 @@ impl CachedDict {
             };
         }
 
-        // 按缓存文件 single-flight：同一个 wdat 常被多个方案引用（如 wubi86 独立引擎与
-        // 混输的 primary 子引擎），缓存失效时会同时走到下面的 write_cache → rename。
-        // 混输子引擎的构建不经 ensure_loaded，也就不受 build_locks 保护，故须在此自锁。
+        // `wdat_path` 是**槽位**（逻辑缓存路径），实际文件是 `<stem>-<指纹>.wdat`
+        // （内容寻址，见 `cache_fp` 的 S2 段）。按槽位 single-flight：同一个槽位常被多个
+        // 方案引用（如 wubi86 独立引擎与混输的 primary 子引擎），缓存失效时会同时走到下面的
+        // write_cache。混输子引擎的构建不经 ensure_loaded，也就不受 build_locks 保护，故须
+        // 在此自锁。
         let build_lock = crate::reader_pool::file_lock(wdat_path);
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        // 检查缓存是否有效（同时充当拿锁后的复查：等待期间别的线程可能已重建完成）
-        if Self::cache_is_valid(yaml_path, wdat_path, lowercase_code) {
-            match crate::reader_pool::open_wdat(wdat_path) {
+        // tag 带上 lowercase_code：同一份 yaml 在 english / 非 english 两种 dict_type 下
+        // 解析结果不同，不区分就会在切换后复用大小写错误的缓存。
+        let tag = crate::cache_fp::dict_tag(lowercase_code);
+        // 源读不出（权限 / IO 故障）⇒ 没有稳定的缓存可言：直接解析进内存，不落盘。
+        let stamps_before = crate::cache_fp::stamps_of(&[yaml_path]);
+        let content = crate::cache_fp::resolve_slot_fp(wdat_path, &[yaml_path], tag)
+            .map(|fp| (crate::cache_fp::slot_content_path(wdat_path, &fp), fp));
+
+        // 指纹对应的文件在 ⇒ 就是它（同时充当拿锁后的复查：等待期间别的线程可能已建好）
+        if let Some((path, _)) = &content
+            && path.is_file()
+        {
+            match crate::reader_pool::open_wdat(path) {
                 Ok(reader) => {
                     info!(
                         "Using mmap cache: {} ({} keys)",
-                        wdat_path.display(),
+                        path.display(),
                         reader.key_count()
                     );
+                    crate::cache_fp::touch_cache(path);
                     return Ok(Self::Mmap(reader));
                 }
                 Err(e) => {
@@ -364,40 +377,49 @@ impl CachedDict {
             dict.len()
         );
 
-        // 确保缓存目录存在后写入 .wdat 缓存
-        if let Some(parent) = wdat_path.parent() {
+        let Some((path, fp)) = content else {
+            warn!(
+                "源 {} 无法计算指纹（读取失败），本次退化为内存模式——词库常驻堆而非 mmap。",
+                yaml_path.display()
+            );
+            return Ok(Self::Memory(dict));
+        };
+        // 指纹是解析**之前**算的；解析期间源被保存，按旧指纹命名的文件就会装着新内容。
+        if !crate::cache_fp::stamps_of(&[yaml_path]).unchanged_since(&stamps_before) {
+            warn!(
+                "源 {} 在解析期间被改写，本次不落盘（内存模式），下次启动重来。",
+                yaml_path.display()
+            );
+            return Ok(Self::Memory(dict));
+        }
+
+        // 确保缓存目录存在后写入 .wdat 缓存。目标是**新文件名**，不覆盖任何正被 mmap 的旧文件。
+        if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // 先删旧 `.fp` 再写新 wdat：新 `.fp` 写失败时，盘上留下的是「没有指纹」（下次
-        // `cache_is_valid` 判不新鲜而重建、下游摘要退到大小:mtime），而不是一份与新 wdat
-        // 对不上的旧指纹（见 `cache_fp::remove_cache_fp`）。
-        crate::cache_fp::remove_cache_fp(wdat_path);
-        if let Err(e) = Self::write_cache(&dict, wdat_path) {
+        if let Err(e) = Self::write_cache(&dict, &path) {
             // 退化成内存模式：词库整份常驻堆而非 mmap，大词库代价可观。此前只记一行
             // 「Failed to write」，看不出后果，用户也就无从解释内存为何偏高。
             warn!(
                 "写入 wdat 缓存失败 {}: {}。本次退化为内存模式——词库常驻堆而非 mmap，\
                  内存占用显著高于正常路径。常见原因是缓存目录不可写或磁盘空间不足。",
-                wdat_path.display(),
+                path.display(),
                 e
             );
             return Ok(Self::Memory(dict));
         }
-        // 写内容指纹 sidecar，供下次按内容(而非 mtime)校验复用。
-        // tag 带上 lowercase_code：同一份 yaml 在 english / 非 english 两种 dict_type 下
-        // 解析结果不同，不区分就会在切换后复用大小写错误的缓存。
-        crate::cache_fp::write_cache_fp(
-            wdat_path,
-            &[yaml_path],
-            crate::cache_fp::dict_tag(lowercase_code),
-        );
+        // `.fp` 写在实际文件旁，供二级缓存（`.wridx` / 英文词组索引）经 cache_digest 取摘要。
+        // 指纹已经算过（它就在文件名里），不再重读源。
+        crate::cache_fp::write_cache_fp_value(&path, &fp);
+        // 同槽位只留最近两份：覆盖库与自带库交替时两份都在，不再来回重建。
+        crate::cache_fp::prune_slot(wdat_path, &path, 2);
 
         // 用 mmap 重新打开缓存
-        match crate::reader_pool::open_wdat(wdat_path) {
+        match crate::reader_pool::open_wdat(&path) {
             Ok(reader) => {
                 info!(
                     "Using mmap cache: {} ({} keys)",
-                    wdat_path.display(),
+                    path.display(),
                     reader.key_count()
                 );
                 Ok(Self::Mmap(reader))
@@ -407,15 +429,6 @@ impl CachedDict {
                 Ok(Self::Memory(dict))
             }
         }
-    }
-
-    /// 检查缓存是否有效（按源文件**内容指纹** + 解析方式 tag，不受 scp/部署刷新 mtime 影响）。
-    fn cache_is_valid(yaml_path: &Path, wdat_path: &Path, lowercase_code: bool) -> bool {
-        crate::cache_fp::cache_is_fresh(
-            wdat_path,
-            &[yaml_path],
-            crate::cache_fp::dict_tag(lowercase_code),
-        )
     }
 
     /// 将内存词典写入 .wdat 缓存
@@ -1217,41 +1230,79 @@ mod tests {
         assert!(idx.codes_of("任意").is_none());
     }
 
-    /// ★ 重建 wdat 时**先删旧 `.fp`**：新 `.fp` 写失败的话，盘上留下的应是「没有指纹」
-    /// （下游摘要退到 `大小:mtime`、`cache_is_fresh` 判不新鲜而重建），而不是一份
-    /// 「旧指纹」——后者会让 `.wridx` / 英文词组索引把新 wdat 当成没变过，静默复用旧产物。
-    ///
-    /// 写失败用「旧 `.fp` 只读」模拟（非 root 下 `fs::write` 打不开只读文件；目录可写，
-    /// 删得掉）。root 下只读挡不住写，本用例退化为恒绿——不是假红，只是测不到。
-    #[cfg(unix)]
+    /// ★ S2 的退出判据：同一槽位、两份不同内容的源（用户目录覆盖了自带的同名词库）交替
+    /// 加载，第二轮起**零重建**——两份各有各的文件，不再互相顶掉。
     #[test]
-    fn a_stale_fp_is_removed_before_the_wdat_is_rebuilt() {
-        use std::os::unix::fs::PermissionsExt;
+    fn alternating_sources_on_one_slot_do_not_rebuild_each_other() {
+        let dir = std::env::temp_dir().join(format!("wind-slot-pingpong-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("x.dict.yaml");
+        let slot = dir.join("x.wdat");
+        let a = "---\nname: x\n...\n啊\ta\t1\n";
+        let b = "---\nname: x\n...\n啊\ta\t1\n吧\tb\t1\n";
+        let set_old_mtime = |secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(&yaml)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        let load = |body: &str, secs: u64| {
+            std::fs::write(&yaml, body).unwrap();
+            set_old_mtime(secs);
+            let d = CachedDict::load_at_with(&yaml, &slot, false).unwrap();
+            d.source_file().expect("应走 mmap").to_path_buf()
+        };
+        let pa = load(a, 1_700_000_000);
+        let pb = load(b, 1_700_000_100);
+        assert_ne!(pa, pb);
+        let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let (ma, mb) = (mtime(&pa), mtime(&pb));
+
+        // 第二轮：回到 A 再回到 B，两份文件都还在且都没被重写
+        assert_eq!(load(a, 1_700_000_000), pa);
+        assert_eq!(load(b, 1_700_000_100), pb);
+        assert_eq!(mtime(&pa), ma, "A 不该被重建");
+        assert_eq!(mtime(&pb), mb, "B 不该被重建");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 内容寻址之后「旧 `.fp` 挂在新 wdat 旁」在结构上不可能发生：重建永远写**新文件名**，
+    /// 旧文件与它的 `.fp` 原封不动留到被 prune。本用例守的是这条新不变量：源内容一变，
+    /// `source_file()` 换成另一个路径，二级缓存拿到的摘要随之不同；旧路径的 `.fp` 还在、
+    /// 但没人再按它取摘要。
+    #[test]
+    fn a_rebuild_lands_on_a_new_content_addressed_file() {
         let dir = std::env::temp_dir().join(format!("wind-stale-fp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let yaml = dir.join("x.dict.yaml");
-        let wdat = dir.join("x.wdat");
-        let mut fp = wdat.clone().into_os_string();
-        fp.push(".fp");
+        let slot = dir.join("x.wdat");
         std::fs::write(&yaml, "---\nname: x\n...\n啊\ta\t1\n").unwrap();
-        drop(CachedDict::load_at_with(&yaml, &wdat, false).unwrap());
-        let before = crate::cache_fp::cache_digest(&wdat);
+        let d1 = CachedDict::load_at_with(&yaml, &slot, false).unwrap();
+        let p1 = d1.source_file().expect("首建应走 mmap").to_path_buf();
+        let before = crate::cache_fp::cache_digest(&p1);
         assert!(
             before.starts_with("fp:"),
             "前提：首建应写出 .fp，实际 {before}"
         );
-        std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_ne!(p1, slot, "实际文件名应带指纹，而不是槽位本身");
+        drop(d1);
 
         std::fs::write(&yaml, "---\nname: x\n...\n啊\ta\t1\n吧\tb\t1\n").unwrap();
-        let d = CachedDict::load_at_with(&yaml, &wdat, false).unwrap();
-        assert_eq!(d.search("b").len(), 1, "前提：wdat 确已按新 yaml 重建");
-        drop(d);
+        let d2 = CachedDict::load_at_with(&yaml, &slot, false).unwrap();
+        assert_eq!(d2.search("b").len(), 1, "前提：wdat 确已按新 yaml 重建");
+        let p2 = d2.source_file().unwrap().to_path_buf();
+        assert_ne!(p1, p2, "内容变了必须落到新文件");
+        assert!(p1.is_file(), "旧文件留给 prune（keep=2），不被覆盖");
         assert_ne!(
-            crate::cache_fp::cache_digest(&wdat),
+            crate::cache_fp::cache_digest(&p2),
             before,
-            "wdat 已换内容，摘要却还是旧指纹——下游派生缓存会静默复用旧产物"
+            "新文件的摘要必须与旧的不同——否则派生缓存会静默复用旧产物"
         );
+        drop(d2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

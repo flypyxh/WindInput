@@ -180,6 +180,18 @@ pub fn create_backup(
         serde_json::Value::Null,
     )?;
 
+    // 快捷格式调整（调序 / 停用 / 自定义条目）：全局段。包内是 yaml 序列化，与 data/ 下的 toml 真源不同。
+    let quick = store.export_quick_format_yaml()?;
+    if !quick.is_empty() {
+        add(
+            &mut w,
+            "userdata/quick_format.yaml".into(),
+            quick.as_bytes(),
+            "quick_format",
+            serde_json::Value::Null,
+        )?;
+    }
+
     // 补全学习数据（邮箱后缀词频 + 网址历史）：同样是键不带方案的全局段。
     // 一个文件装两类（jsonl 每行自带 kind），而不是两个文件——备份包里多一个文件就多
     // 一处要在 create / restore / RESTORE_SECTIONS 三处同步登记的地方，而 common_chars
@@ -440,6 +452,10 @@ pub fn restore_backup(
                     store.clear_common_char_overrides()?;
                 }
                 store.import_common_chars_jsonl(&text())?;
+                restored.push(e.path.clone());
+            }
+            "quick_format" => {
+                store.import_quick_format_yaml(&text(), replace)?;
                 restored.push(e.path.clone());
             }
             "completion" => {
@@ -1201,6 +1217,45 @@ mod tests {
     ///
     /// 与 `compat.toml` / `schema_overrides/` 同类；不同的是它在库里而不是目录里，
     /// 故不走 `user_*_dir`，走 store 的 list / set。文本原样进出，一个字节都不能动。
+    #[test]
+    fn quick_format_is_backed_up_and_restored() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("q.zip");
+        let store = open_store(t.path(), "q1");
+        store.add_quick_format("date", "my", "yyyy").unwrap();
+        let r = create_backup(
+            &store,
+            &empty_sources(),
+            &out,
+            "0",
+            "test",
+            "2026-10-15T00:00:00Z",
+            &BackupOptions {
+                include_stats: false,
+                include_state: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            r.entries.iter().any(|e| e == "userdata/quick_format.yaml"),
+            "{:?}",
+            r.entries
+        );
+        let store2 = open_store(t.path(), "q2");
+        restore_backup(
+            &out,
+            &store2,
+            &empty_targets(),
+            crate::merge::Strategy::Replace,
+            Some(&["quick_format".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            store2.get_quick_format("date").unwrap().unwrap().added[0].id,
+            "my"
+        );
+    }
+
     #[test]
     fn charsets_are_backed_up_and_restored() {
         let t = tempfile::tempdir().unwrap();

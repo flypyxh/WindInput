@@ -686,9 +686,10 @@ fn prune_comment_cache(cache_root: &Path, specs: &[(std::path::PathBuf, Vec<Stri
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            // `x.wcmt` / `x.wcmt.fp` / `x.wcmt.tmp` 都归到主名 `x.wcmt` 上判定
+            // `x.wcmt` / `x.wcmt.fp` / `x.wcmt.st` / `x.wcmt.tmp` 都归到主名 `x.wcmt` 上判定
             let base = name
                 .strip_suffix(".fp")
+                .or_else(|| name.strip_suffix(".st"))
                 .or_else(|| name.strip_suffix(".tmp"))
                 .unwrap_or(&name);
             if !base.ends_with(".wcmt") {

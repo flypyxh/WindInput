@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 wind-utils = { path = "../wind-utils" }
 wind-candidate = { path = "../wind-candidate" }
-wind-store = { path = "../wind-store" }
+wind-wdict = { path = "../wind-wdict" }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

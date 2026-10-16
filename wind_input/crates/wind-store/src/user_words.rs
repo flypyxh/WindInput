@@ -8,12 +8,10 @@
 //!
 //! key 编码：`"{schema}\0{code}\0{text}"`（store.md §2）。
 
-use crate::abbrev_index;
-use crate::store::{META, Store, USER_ABBREV, USER_WORDS};
+use crate::store::Store;
 use crate::wdict;
-use redb::{ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use wind_userdata::runtime::UserWord;
 
 /// 遍历期的**借用视图**：`code` / `text` 直接指向 redb 页里的字节，不分配。
 ///
@@ -81,49 +79,6 @@ pub struct WordsImportCounts {
     pub added: usize,
     pub updated: usize,
     pub unchanged: usize,
-}
-
-/// 当前 unix 秒
-pub(crate) fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// 用户词入库序号的发号器游标（存 META 表）。
-const NEXT_ORDER_KEY: &str = "user_words_next_order";
-
-/// 在**调用方的写事务内**领取 `n` 个连续的入库序号，返回起始号（含）。
-///
-/// # 为什么必须同事务
-///
-/// 号段与词条写入同属调用方那一个事务：回滚时号段一并作废，不会在序号轴上留下空洞；
-/// 提交后游标已推进，下一批必然更大 —— 于是「入库先后」与「序号大小」恒同序。
-/// 若改成自开事务先领号再写词，两者之间崩溃就会漏号，更糟的是并发两个导入可能拿到同一段。
-///
-/// # 为什么不扫表取 max+1
-///
-/// 那要求每次写入都全表扫一遍；用户词库上万条时代价不可接受，且并发下仍会撞号。
-///
-/// 序号从 **1** 起：0 被 `enc_val_ordered` 保留表示「无序号」（v1/v2 遗留记录）。
-///
-/// 游标用 `saturating_add` 封顶，全程无回绕、无负数、无 panic；到顶后新词一律拿同一个号，
-/// 退化成「新词之间无序」。⚠️ 但**推进速度不是「词条数」**：`import_user_words` 一次领满
-/// `rows.len()`，不管其中多少行只是更新 —— 所以游标吃掉的是**累计导入行数**。
-/// 一个一万条的词库反复导入约 43 万次即可耗尽 u32，虽仍属够不着，但别按「42 亿个词」去理解。
-pub(crate) fn take_word_orders(txn: &WriteTransaction, n: u32) -> anyhow::Result<u32> {
-    let mut t = txn.open_table(META)?;
-    let cur = t
-        .get(NEXT_ORDER_KEY)?
-        .and_then(|g| <[u8; 4]>::try_from(g.value()).ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(1);
-    t.insert(
-        NEXT_ORDER_KEY,
-        cur.saturating_add(n).to_le_bytes().as_slice(),
-    )?;
-    Ok(cur)
 }
 
 /// key: "{schema}\0{code}\0{text}"
@@ -230,39 +185,55 @@ pub(crate) fn dec_val_ordered(b: &[u8]) -> Option<(i32, u32, i64, u64, u32)> {
     ))
 }
 
-/// 手动加词文本长度上限（字符数）。
-///
-/// `add_user_word` 是所有**手动加词**路径的共同写入闸口（Ctrl+= 快捷加词、命令栏
-/// `dict.add` 显式给码、设置页词库管理），本上限加在那一处即等价于加在全部手动入口，
-/// 不必在每个调用点重复。⚠️ 批量导入（`import_user_words`）走独立写入逻辑、不经过
-/// 此处，库里仍可能存在历史导入的超长词条——这不是本上限的覆盖范围。
-///
-/// 数值不追求精确：`ADD_WORD_MAX_LEN=10`（wind-coordinator `handle_addword.rs`）已经拦住了
-/// 推导编码的正常场景，但**显式给码**（`dict.add(text, code)`）与设置页手动加词两条路径不
-/// 经过那道校验，此前无任何长度限制（用户实测提交过 7500 字词条，未必是本上限拦住的现象——
-/// 这里只是兜底防线，防止病态输入，不代表 7500 字场景本身已被诊断清楚）。10000 字对真实
-/// 使用场景足够宽松。
-pub(crate) const USER_WORD_TEXT_MAX_CHARS: usize = 10000;
+/// 未折回进文本的新词 order 为 0：门面上排到最后（与用户词层同向；旧库里 0 表示「无序号的旧记录」，
+/// P2 起不再有这种记录——迁移时按旧序写成了文本行号）。
+fn order_out(o: u32) -> u32 {
+    if o == 0 {
+        wind_userdata::layer::UNFOLDED_ORDER
+    } else {
+        o
+    }
+}
 
-/// 手动加词 code（编码）长度上限（字符数）。
-///
-/// 与 [`USER_WORD_TEXT_MAX_CHARS`] 同一闸口、同一动机，但数值按 code 的实际容量定：
-/// 二进制格式 `code_len: u16`（`wind_dict::binformat`）本身给不出实质约束，真正收紧的是
-/// 拼音音节边界 `boundary: u64`——**code 超过 64 字节，边界位掩码就装不下、消费方降级回
-/// DAG 猜测**。真实方案数值都远小于它：五笔类码表码固定 4 位，英文方案
-/// `max_code_length=32`，10 字词组全拼全码约 60 字节。128 留出 2 倍以上余量，够真实场景
-/// 用、又能挡住病态输入（比如把 text 错填进了 code 参数）。
-pub(crate) const USER_WORD_CODE_MAX_CHARS: usize = 128;
+fn record_of(w: UserWord) -> UserWordRecord {
+    UserWordRecord {
+        order: order_out(w.order),
+        code: w.code,
+        text: w.text,
+        weight: w.weight,
+        count: 0,
+        created_at: 0,
+        boundary: w.boundary,
+    }
+}
 
+/// `WordIo` → `UserWord`：码拆成扁平码 + 边界，显式边界优先——空格载体表达不了「单音节」
+/// （`xian` 的 0b1 经 join→split 会退化成 0），导入闸口求解出的边界走 `WordIo::boundary`。
+fn user_rows(rows: &[wdict::WordIo]) -> Vec<UserWord> {
+    rows.iter()
+        .map(|r| {
+            let (code, spaced_b) = wdict::split_spaced_code(&r.code);
+            UserWord {
+                code,
+                text: r.text.clone(),
+                weight: r.weight,
+                boundary: r.boundary.unwrap_or(spaced_b),
+                order: 0,
+            }
+        })
+        .collect()
+}
+
+/// P2 起用户词的真源是 `user/<schema>/user.dict.yaml`（设计 §6）：方法签名不变，方法体委托
+/// `wind_userdata::runtime` 的用户词 API。写入先进日志 + delta，空闲 30 秒或显式折回时按行补丁
+/// 写回文本；清空 / 导入是用户的显式动作，立即写回。用户词不再有 count / created_at（恒 0）。
 impl Store {
-    /// 新增/合并用户词：已存在则权重取 max、保留原 created_at；新词记 created_at=now。
-    /// 用户词**无权重上限**（store.md §3），但文本/编码长度分别有 `USER_WORD_TEXT_MAX_CHARS`
-    /// / `USER_WORD_CODE_MAX_CHARS` 兜底上限。
+    /// 新增/合并用户词：已存在则权重取 max、旧边界为 0 时补上。文本 / 编码长度分别有
+    /// `wind_userdata::runtime::USER_TEXT_MAX_CHARS` / `USER_CODE_MAX_CHARS` 兜底上限（超出报「过长」）。
     ///
     /// `boundary`：该 code 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）。
-    /// 造词路径（`generate_word_pinyin`）算得；用户手输码/wdict 导入无从得知，传 0
-    /// （消费方降级回 DAG）。已存在且旧值非 0 时沿用旧值——同 (schema,code,text) 的切分是
-    /// 确定的，不因再次加词而变。
+    /// 造词路径（`generate_word_pinyin`）算得；用户手输码 / wdict 导入无从得知，传 0
+    /// （消费方降级回 DAG）。
     pub fn add_user_word(
         &self,
         schema: &str,
@@ -271,203 +242,76 @@ impl Store {
         weight: i32,
         boundary: u64,
     ) -> anyhow::Result<()> {
-        let n = text.chars().count();
-        if n > USER_WORD_TEXT_MAX_CHARS {
-            anyhow::bail!("词条过长（{n} 字，上限 {USER_WORD_TEXT_MAX_CHARS}）");
-        }
-        let code_len = code.chars().count();
-        if code_len > USER_WORD_CODE_MAX_CHARS {
-            anyhow::bail!("编码过长（{code_len} 字，上限 {USER_WORD_CODE_MAX_CHARS}）");
-        }
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(USER_WORDS)?;
-                let existing = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_val_ordered(g.value()));
-                let (w, c, ca, b) = match existing {
-                    Some((ow, oc, oca, ob, _)) => {
-                        (ow.max(weight), oc, oca, if ob != 0 { ob } else { boundary })
-                    }
-                    None => (weight, 0, now_secs(), boundary),
-                };
-                // 入库序号：已存在的原样保留（含 0 —— 旧库记录不补号，理由见 `enc_val_ordered`
-                // 的惰性升级一节：补了它们会拿到比所有新词更大的号，反而打乱既有词序）。
-                let order = match existing {
-                    Some((_, _, _, _, oo)) => oo,
-                    None => take_word_orders(&txn, 1)?,
-                };
-                // 边界可能从 0 被补齐（见上），索引键随之改变 → shift 负责删旧建新。
-                let old_b = existing.map(|(_, _, _, ob, _)| ob);
-                let mut idx = txn.open_table(USER_ABBREV)?;
-                abbrev_index::shift(&mut idx, schema, code, text, old_b, b)?;
-                t.insert(key.as_str(), enc_val_ordered(w, c, ca, b, order).as_slice())?;
-            }
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(())
-        })
+        self.ensure_user_text(schema);
+        self.runtime()
+            .add_user_word(schema, code, text, weight, boundary)?;
+        self.bump_words_gen(schema);
+        self.after_write();
+        Ok(())
     }
 
-    /// 流式遍历某方案下以 `prefix` 开头的用户词。回调返回 `false` 即停。
-    ///
-    /// 与 [`Self::search_user_words_prefix`] 的唯一差别是**不物化**：`code` / `text` 直接
-    /// 借 redb 的页，一条也不往堆上抄。调用方自己决定留哪几条。
-    ///
-    /// # 为什么要有它
-    ///
-    /// 设置页的分页列表从前一律「先全收进 `Vec` 再 `skip(offset).take(limit)`」——用户
-    /// 19 万条的词库，翻第一页也要先造 38 万个 `String`。本机实测那一趟几十 MB 峰值，
-    /// 而真正要显示的只有 50 条。
-    ///
-    /// ⚠️ **它省的是 Rust 侧的峰值，不是 redb 的读缓存**：range 迭代照样把走过的 B 树
-    /// 叶子页读进缓存（key 与 value 同页），那笔高水位只有丢弃 `Database` 才还得掉
-    /// （见 `tests/redb_cache_high_water.rs` 与 [`Store::drop_page_cache`]）。两件事要分开记。
+    /// 流式遍历某方案下以 `prefix` 开头的用户词（按 (code, text) 升序）。回调返回 `false` 即停。
+    /// 设置页分页列表只物化要显示的那一页。
     pub fn for_each_user_word(
         &self,
         schema: &str,
         prefix: &str,
         f: &mut dyn FnMut(UserWordView<'_>) -> bool,
     ) -> anyhow::Result<()> {
-        let scan = format!("{schema}\u{0}{prefix}");
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(USER_WORDS)?;
-            for item in t.range(scan.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&scan) {
-                    break;
-                }
-                let (Some((_, code, text)), Some((w, c, ca, b, o))) =
-                    (split_key(key), dec_val_ordered(v.value()))
-                else {
-                    // 解不出的记录**跳过但不计数**，与 `search_user_words_prefix` 一致：
-                    // 那边也是 `if let` 不匹配就不 push。总数口径必须和它逐条对齐，否则
-                    // 会出现「说有 N 条、翻到最后一页只有 N-1 条」。
-                    continue;
-                };
-                if !f(UserWordView {
-                    code,
-                    text,
-                    weight: w,
-                    count: c,
-                    created_at: ca,
-                    boundary: b,
-                    order: o,
-                }) {
-                    break;
-                }
-            }
-            Ok(())
-        })
+        self.ensure_user_text(schema);
+        self.runtime().for_each_user_word(schema, prefix, &mut |w| {
+            f(UserWordView {
+                code: &w.code,
+                text: &w.text,
+                weight: w.weight,
+                count: 0,
+                created_at: 0,
+                boundary: w.boundary,
+                order: order_out(w.order),
+            })
+        });
+        Ok(())
     }
 
-    /// 某方案下的用户词条数。只数不抄。
-    ///
-    /// 口径与 [`Self::search_user_words_prefix`]`(schema, "", 0).len()` 逐条一致
-    /// （解不出的记录两边都不算）——设置页拿它显示「共 N 条」，与列表必须对得上。
+    /// 某方案下的用户词条数。口径与 [`Self::for_each_user_word`] 逐条一致。
     pub fn count_user_words(&self, schema: &str) -> anyhow::Result<usize> {
-        let mut n = 0usize;
-        self.for_each_user_word(schema, "", &mut |_| {
-            n += 1;
-            true
-        })?;
-        Ok(n)
+        self.ensure_user_text(schema);
+        Ok(self.runtime().count_user_words(schema))
     }
 
     /// 精确取某 code 下的所有用户词
     pub fn get_user_words(&self, schema: &str, code: &str) -> anyhow::Result<Vec<UserWordRecord>> {
-        let prefix = format!("{schema}\u{0}{code}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(USER_WORDS)?;
-            let mut out = Vec::new();
-            for item in t.range(prefix.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let text = &key[prefix.len()..];
-                if let Some((w, c, ca, b, o)) = dec_val_ordered(v.value()) {
-                    out.push(UserWordRecord {
-                        code: code.to_string(),
-                        text: text.to_string(),
-                        weight: w,
-                        count: c,
-                        created_at: ca,
-                        boundary: b,
-                        order: o,
-                    });
-                }
-            }
-            Ok(out)
-        })
+        self.ensure_user_text(schema);
+        Ok(self
+            .runtime()
+            .user_words(schema, code)
+            .into_iter()
+            .map(record_of)
+            .collect())
     }
 
-    /// 前缀检索（跨 code）。limit<=0 表示不限。
+    /// 前缀检索（跨 code，按 (code, text) 升序）。limit<=0 表示不限。
     pub fn search_user_words_prefix(
         &self,
         schema: &str,
         prefix: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<UserWordRecord>> {
-        let scan = format!("{schema}\u{0}{prefix}");
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(USER_WORDS)?;
-            let mut out = Vec::new();
-            for item in t.range(scan.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&scan) {
-                    break;
-                }
-                if let (Some((_, code, text)), Some((w, c, ca, b, o))) =
-                    (split_key(key), dec_val_ordered(v.value()))
-                {
-                    out.push(UserWordRecord {
-                        code: code.to_string(),
-                        text: text.to_string(),
-                        weight: w,
-                        count: c,
-                        created_at: ca,
-                        boundary: b,
-                        order: o,
-                    });
-                }
-                if limit > 0 && out.len() >= limit {
-                    break;
-                }
-            }
-            Ok(out)
-        })
+        let mut out = Vec::new();
+        self.for_each_user_word(schema, prefix, &mut |w| {
+            out.push(w.to_record());
+            limit == 0 || out.len() < limit
+        })?;
+        Ok(out)
     }
 
     /// 删除用户词（不存在静默成功）
     pub fn remove_user_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(USER_WORDS)?;
-                // 先读边界才能算出索引键——删主表之后就查不到了，顺序不可调换。
-                let b = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_val(g.value()))
-                    .map(|(_, _, _, b)| b);
-                t.remove(key.as_str())?;
-                if let Some(b) = b {
-                    abbrev_index::remove(&mut txn.open_table(USER_ABBREV)?, schema, code, text, b)?;
-                }
-            }
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(())
-        })
+        self.ensure_user_text(schema);
+        self.runtime().remove_user_word(schema, code, text)?;
+        self.bump_words_gen(schema);
+        self.after_write();
+        Ok(())
     }
 
     /// 更新用户词权重（不存在返回 false，不创建）
@@ -478,245 +322,172 @@ impl Store {
         text: &str,
         new_weight: i32,
     ) -> anyhow::Result<bool> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let updated;
-            {
-                let mut t = txn.open_table(USER_WORDS)?;
-                let existing = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_val_ordered(g.value()));
-                match existing {
-                    // 仅改权重：boundary 与 order 均沿用（切分、入库先后都与权重无关）。
-                    Some((_, c, ca, b, o)) => {
-                        t.insert(
-                            key.as_str(),
-                            enc_val_ordered(new_weight, c, ca, b, o).as_slice(),
-                        )?;
-                        updated = true;
-                    }
-                    None => updated = false,
-                }
-            }
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(updated)
-        })
+        self.ensure_user_text(schema);
+        let updated = self
+            .runtime()
+            .update_user_word_weight(schema, code, text, new_weight)?;
+        self.bump_words_gen(schema);
+        self.after_write();
+        Ok(updated)
     }
 
-    /// 选词回调：count++，每 count_threshold 次给权重 +boost_delta；不存在则创建（weight=0）。
-    /// 注：用户词的"调频"为权重微调；候选"用过上浮"由独立的用户词频系统负责（frequency.md）。
-    pub fn on_word_selected(
-        &self,
-        schema: &str,
-        code: &str,
-        text: &str,
-        boost_delta: i32,
-        count_threshold: u32,
-    ) -> anyhow::Result<()> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let structural;
-            {
-                let mut t = txn.open_table(USER_WORDS)?;
-                // 不存在则创建 weight=0 记录（隐性造词路径）：此处只有扁平 code，无边界可算 → 0。
-                let existing = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_val_ordered(g.value()));
-                let is_new = existing.is_none();
-                // 本路径会凭空造词（见下），新词同样要领入库序号；已有的原样保留。
-                let order = match existing {
-                    Some((_, _, _, _, oo)) => oo,
-                    None => take_word_orders(&txn, 1)?,
-                };
-                let (w, c, ca, b, _) = existing.unwrap_or((0, 0, now_secs(), 0, 0));
-                let nc = c.saturating_add(1);
-                let nw = if count_threshold > 0 && nc % count_threshold == 0 {
-                    w.saturating_add(boost_delta)
-                } else {
-                    w
-                };
-                t.insert(
-                    key.as_str(),
-                    enc_val_ordered(nw, nc, ca, b, order).as_slice(),
-                )?;
-                structural = is_new || nw != w;
-                // ⚠️ **本路径会凭空造出用户词**（上面那句注释说的「隐性造词」），故必须建索引。
-                // 改权重不用动索引（value 空），但新增必须——漏了这一处，靠选词自动产生的
-                // 词就永远进不了简拼索引，且只在「用过一段时间后」才显形。
-                if is_new {
-                    abbrev_index::insert(&mut txn.open_table(USER_ABBREV)?, schema, code, text, b)?;
-                }
-            }
-            txn.commit()?;
-            // 只有新造词、权重变化才动联想索引；纯 count +1（绝大多数选词）不算——用户词在
-            // 联想里按权重排，count 不参与。
-            if structural {
-                self.bump_words_gen(schema);
-            }
-            Ok(())
-        })
-    }
-
-    /// 清空某 schema 的全部用户词(单写事务),返回删除条数。
+    /// 清空某 schema 的全部用户词（文本整文件重写为空表），返回删除条数。
     pub fn clear_user_words(&self, schema: &str) -> anyhow::Result<usize> {
-        let prefix = format!("{schema}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(USER_WORDS)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range(prefix.as_str()..)? {
-                        let (k, _) = item?;
-                        let key = k.value();
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        ks.push(key.to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in &keys {
-                    t.remove(k.as_str())?;
-                }
-            }
-            abbrev_index::clear_schema(&mut txn.open_table(USER_ABBREV)?, schema)?;
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(n)
-        })
+        self.ensure_user_text(schema);
+        let n = self.runtime().clear_user_words(schema)?;
+        self.bump_words_gen(schema);
+        Ok(n)
     }
 
-    /// 批量导入用户词(单写事务,Merge 语义与 add_user_word 一致):
-    /// 新键 → added(count=0, created_at=now);导入权重 > 现有 → updated(保留 count/created_at);
-    /// 否则 → unchanged(不写)。dry-run 见 preview_import_user_words,两者分类必须一致。
+    /// 批量导入用户词（Merge 语义与 add_user_word 一致）：新键 → added；导入权重更大或补上 0 边界
+    /// → updated；否则 → unchanged。导入后立即写回文本；已有词不挪行，新词按导入行序追加。
+    /// dry-run 见 preview_import_user_words，两者分类一致。
     pub fn import_user_words(
         &self,
         schema: &str,
         rows: &[wdict::WordIo],
     ) -> anyhow::Result<WordsImportCounts> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let mut c = WordsImportCounts::default();
-            {
-                let mut t = txn.open_table(USER_WORDS)?;
-                let mut idx = txn.open_table(USER_ABBREV)?;
-                // ★ t80 的正题：**一次领满号段**，按 `rows` 的行序依次发给新词条，于是
-                // 「词条在导入文件里的先后」= 「order 的大小」，同码等权时便按原文件顺序出。
-                // 逐条领号也对，但那要每条都开一次 META 表读写；万条词库时代价白费。
-                // 更新已有词条不消耗号，于是号段里会留下空洞 —— 无害，order 只比大小、
-                // 不要求连续。
-                let mut next_order = take_word_orders(&txn, rows.len() as u32)?;
-                for r in rows {
-                    // code 列可能是带空格的音节码（`ni hao`）→ 拆成扁平 key + 边界。
-                    // 无空格（五笔码/旧版导出）→ boundary=0，与改动前等价。
-                    let (code, spaced_b) = wdict::split_spaced_code(&r.code);
-                    // ★ 显式边界优先：空格载体表达不了「单音节」（`xian` 的 0b1 经
-                    // join→split 会退化成 0），故导入闸口求解出的边界走 `WordIo::boundary`。
-                    let in_b = r.boundary.unwrap_or(spaced_b);
-                    let key = enc_key(schema, &code, &r.text);
-                    let existing = t
-                        .get(key.as_str())?
-                        .and_then(|g| dec_val_ordered(g.value()));
-                    match existing {
-                        None => {
-                            t.insert(
-                                key.as_str(),
-                                enc_val_ordered(r.weight, r.count, now_secs(), in_b, next_order)
-                                    .as_slice(),
-                            )?;
-                            next_order = next_order.saturating_add(1);
-                            abbrev_index::insert(&mut idx, schema, &code, &r.text, in_b)?;
-                            c.added += 1;
-                        }
-                        Some((w, cnt, ca, b, o)) => {
-                            // weight/count 各取 max；boundary 旧值非 0 则沿用（同
-                            // `add_user_word`：同 (schema,code,text) 的切分是确定的，
-                            // 不因再次导入而变），旧值为 0 时用导入行补齐。
-                            // 三者任一变化即写盘为 updated，否则 unchanged。
-                            let nw = w.max(r.weight);
-                            let nc = cnt.max(r.count);
-                            let nb = if b != 0 { b } else { in_b };
-                            if nw != w || nc != cnt || nb != b {
-                                // order 原样保留：再次导入同一个词不该把它挪到队尾。
-                                t.insert(
-                                    key.as_str(),
-                                    enc_val_ordered(nw, nc, ca, nb, o).as_slice(),
-                                )?;
-                                // 边界被补齐时索引键随之改变 → shift 删旧建新。
-                                if nb != b {
-                                    abbrev_index::shift(
-                                        &mut idx,
-                                        schema,
-                                        &code,
-                                        &r.text,
-                                        Some(b),
-                                        nb,
-                                    )?;
-                                }
-                                c.updated += 1;
-                            } else {
-                                c.unchanged += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(c)
+        self.ensure_user_text(schema);
+        let c = self.runtime().import_user_rows(schema, &user_rows(rows))?;
+        self.bump_words_gen(schema);
+        Ok(WordsImportCounts {
+            added: c.added,
+            updated: c.updated,
+            unchanged: c.unchanged,
         })
     }
 
-    /// 导入 dry-run(只读):分类规则与 import_user_words 完全一致;
-    /// samples 取前 5 个会落盘行(added/updated)的 "code text"。
+    /// 导入 dry-run（只读）：分类规则与 import_user_words 完全一致（同批重复键按「本批已合并」
+    /// 判定）；samples 取前 5 个会落盘行（added/updated）的 "code text"。
     pub fn preview_import_user_words(
         &self,
         schema: &str,
         rows: &[wdict::WordIo],
     ) -> anyhow::Result<(WordsImportCounts, Vec<String>)> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(USER_WORDS)?;
-            let mut c = WordsImportCounts::default();
-            let mut samples = Vec::new();
-            for r in rows {
-                // 与 import_user_words 同款拆分：key 必须用扁平码，否则带空格的行
-                // 一律查不到既有记录、全部误报为 added。显式边界同样优先（判据必须与
-                // 落库端逐项一致，否则预览的 willUpdate 会与实际不符）。
-                let (code, spaced_b) = wdict::split_spaced_code(&r.code);
-                let in_b = r.boundary.unwrap_or(spaced_b);
-                let key = enc_key(schema, &code, &r.text);
-                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                let will_write = match existing {
-                    None => {
-                        c.added += 1;
-                        true
-                    }
-                    // 判据须与 import_user_words 逐项对齐，含 boundary 补齐那一项
-                    // （旧值为 0 且导入行给得出边界 → 会落盘 → 算 updated）。
-                    Some((w, cnt, _, b))
-                        if r.weight > w || r.count > cnt || (b == 0 && in_b != 0) =>
-                    {
-                        c.updated += 1;
-                        true
-                    }
-                    Some(_) => {
-                        c.unchanged += 1;
-                        false
-                    }
-                };
-                if will_write && samples.len() < 5 {
-                    samples.push(format!("{} {}", r.code, r.text));
-                }
+        use wind_userdata::runtime::RowEffect;
+        self.ensure_user_text(schema);
+        let mut c = WordsImportCounts::default();
+        let mut samples = Vec::new();
+        let effects = self.runtime().classify_user_rows(schema, &user_rows(rows));
+        for (r, effect) in rows.iter().zip(effects) {
+            match effect {
+                RowEffect::Added => c.added += 1,
+                RowEffect::Updated => c.updated += 1,
+                RowEffect::Unchanged => c.unchanged += 1,
             }
-            Ok((c, samples))
-        })
+            if effect != RowEffect::Unchanged && samples.len() < 5 {
+                samples.push(format!("{} {}", r.code, r.text));
+            }
+        }
+        Ok((c, samples))
+    }
+
+    /// 由文本重建该方案的用户词段（手改生效）。变了 ⇒ 推进代次（联想 / 按词查码索引据此重建）。
+    /// 失败（文本隔离 / 读不了）只 WARN 返回 false：查询照旧按已有段与未折回操作提供。
+    pub fn sync_user_text(&self, schema: &str) -> bool {
+        use wind_userdata::record::Target;
+        self.ensure_user_text(schema);
+        match self.runtime().data().sync_text(Target::User, schema) {
+            Ok(true) => {
+                self.bump_words_gen(schema);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!("用户词文本 {schema} 同步失败：{e:#}");
+                false
+            }
+        }
+    }
+
+    /// 学到的数据的文本被手改 / 换掉 ⇒ 由文本重建段（P5）。变了返回 true 并 bump 代次。
+    pub fn sync_learned_text(&self, target: wind_userdata::record::Target, schema: &str) -> bool {
+        let ud = self.runtime().data();
+        if let Err(e) = ud.bind_by_rule(target, schema) {
+            tracing::warn!("数据文件 {schema} 绑定失败：{e:#}");
+            return false;
+        }
+        match ud.sync_text(target, schema) {
+            Ok(true) => {
+                self.bump_words_gen(schema);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!("数据文件 {schema} 同步失败：{e:#}");
+                false
+            }
+        }
+    }
+
+    /// 发现（用户目录下新出现的方案目录）+ 同步全部用户文本：各方案的用户词与 Shadow、全局短语。
+    /// 返回变了的：方案名，短语变了另含 `"phrases"`（调用方据此重建输入期短语层）。
+    /// 触发：配置热重载、`dict.reload` 不带路径（设计 §5）。
+    pub fn sync_user_texts(&self) -> Vec<String> {
+        let mut changed: Vec<String> = self
+            .user_text_schemas()
+            .into_iter()
+            .filter(|s| self.sync_user_text(s))
+            .collect();
+        for s in self.sync_shadows() {
+            if !changed.contains(&s) {
+                changed.push(s);
+            }
+        }
+        for (t, s) in self.learned_text_keys() {
+            if self.sync_learned_text(t, &s) && !changed.contains(&s) {
+                changed.push(s);
+            }
+        }
+        if self.sync_phrases() {
+            changed.push("phrases".into());
+        }
+        if self.quick_doc().sync() {
+            changed.push("quick_format".into());
+        }
+        if self.common_doc().sync() {
+            changed.push("common_chars".into());
+        }
+        if self.sync_charsets() {
+            changed.push("charsets".into());
+        }
+        changed
+    }
+
+    /// `dict.reload` 带路径：只认 `<text_dir>/phrases.dict.yaml`、`<text_dir>/<schema>/user.dict.yaml`
+    /// 与 `<text_dir>/<schema>/shadow.dict.yaml`（按路径分量比对，不碰文件系统；`..` 是 `ParentDir`
+    /// 分量，必然比对失败）。任一路径不合规 ⇒ 整体 Err、一个都不同步。返回值同 [`Self::sync_user_texts`]。
+    pub fn reload_user_text_paths(&self, paths: &[String]) -> anyhow::Result<Vec<String>> {
+        let targets = paths
+            .iter()
+            .map(|p| classify_text_path(self.user_text_dir(), p, cfg!(windows)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut changed = Vec::new();
+        for t in targets {
+            let name = match t {
+                TextPath::Phrases => self.sync_phrases().then(|| "phrases".to_string()),
+                TextPath::Quick => self.quick_doc().sync().then(|| "quick_format".to_string()),
+                TextPath::Common => self.common_doc().sync().then(|| "common_chars".to_string()),
+                TextPath::Charsets => self.sync_charsets().then(|| "charsets".to_string()),
+                TextPath::Words(s) => self.sync_user_text(&s).then_some(s),
+                TextPath::Shadow(s) => self.shadow_table_synced(&s).then_some(s),
+                TextPath::Learned(t, s) => self.sync_learned_text(t, &s).then_some(s),
+                TextPath::Completion => self.reload_completions().then(|| "completion".to_string()),
+                TextPath::Stats => None,
+            };
+            if let Some(n) = name
+                && !changed.contains(&n)
+            {
+                changed.push(n);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// `dict.flush`：折回全部待处理操作（文本目标写回文件），再压实日志。
+    pub fn flush_user_data(&self) -> anyhow::Result<()> {
+        self.runtime().data().compact()?;
+        self.flush_small_files()
     }
 
     /// 导出某方案的全部用户词为 wdict 文本(仅 code/text/weight,不含个人 count/created_at)。
@@ -776,9 +547,101 @@ impl Store {
     }
 }
 
+/// `dict.reload` 收到的路径指向哪类用户文本。
+enum TextPath {
+    Phrases,
+    Quick,
+    Common,
+    Charsets,
+    Words(String),
+    Shadow(String),
+    /// 学到的数据（P5）：`<schema>/{temp,draft}.dict.yaml`、`{freq,assoc}.table.yaml`。
+    Learned(wind_userdata::record::Target, String),
+    Completion,
+    /// `stats/*.toml`：统计每次按需读文件，重载无需动作。
+    Stats,
+}
+
+/// 只认 `<base>/` 下的那几种文件。`fold_case`：按不分大小写的文件系统比较（Windows）；
+/// 此时方案名取磁盘上实际的目录名，调用方传来的大小写不一定与之相同。
+fn classify_text_path(
+    base: &std::path::Path,
+    p: &str,
+    fold_case: bool,
+) -> anyhow::Result<TextPath> {
+    use std::path::Component;
+    let fold = |s: &str| {
+        if fold_case {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let names = |path: &std::path::Path| -> Option<Vec<String>> {
+        path.components()
+            .map(|c| match c {
+                Component::ParentDir | Component::CurDir => None,
+                c => Some(fold(&c.as_os_str().to_string_lossy())),
+            })
+            .collect()
+    };
+    let outside = || anyhow::anyhow!("路径不在用户文本目录内：{p}");
+    let base_names = names(base).ok_or_else(outside)?;
+    let all = names(std::path::Path::new(p)).ok_or_else(outside)?;
+    let rest = match all.strip_prefix(base_names.as_slice()) {
+        Some(rest) => rest,
+        None => return Err(outside()),
+    };
+    let is = |got: &String, want: &str| *got == fold(want);
+    match rest {
+        [f] if is(f, "phrases.dict.yaml") => Ok(TextPath::Phrases),
+        [f] if is(f, "quick_format.toml") => Ok(TextPath::Quick),
+        [f] if is(f, "common_chars.yaml") => Ok(TextPath::Common),
+        [f] if is(f, "completion.table.yaml") => Ok(TextPath::Completion),
+        [d, f] if is(d, "charsets") && f.ends_with(&fold(".yaml")) => Ok(TextPath::Charsets),
+        [d, f] if is(d, "stats") && f.ends_with(&fold(".toml")) => Ok(TextPath::Stats),
+        [d, f] => {
+            let schema = schema_dir_name(base, d, fold_case);
+            if is(f, "user.dict.yaml") {
+                Ok(TextPath::Words(schema))
+            } else if is(f, "shadow.dict.yaml") {
+                Ok(TextPath::Shadow(schema))
+            } else if let Some(t) = crate::learned_text::LEARNED_TARGETS.into_iter().find(|t| {
+                crate::learned_text::learned_binding(base, *t, "s")
+                    .and_then(|b| b.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .is_some_and(|n| is(f, &n))
+            }) {
+                Ok(TextPath::Learned(t, schema))
+            } else {
+                anyhow::bail!("不是可重载的用户数据文件：{p}")
+            }
+        }
+        _ => Err(outside()),
+    }
+}
+
+/// 方案目录名。不分大小写时 `given` 已折成小写，取 `base` 下实际的那个目录名；
+/// 目录不在（文件还没建过）就用折过的名字。
+fn schema_dir_name(base: &std::path::Path, given: &str, fold_case: bool) -> String {
+    if !fold_case {
+        return given.to_string();
+    }
+    std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .find(|n| n.to_lowercase() == given)
+        .unwrap_or_else(|| given.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wind_userdata::runtime::{
+        USER_CODE_MAX_CHARS as USER_WORD_CODE_MAX_CHARS,
+        USER_TEXT_MAX_CHARS as USER_WORD_TEXT_MAX_CHARS,
+    };
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(name);
@@ -794,6 +657,81 @@ mod tests {
             count: 0,
             boundary: None,
         }
+    }
+
+    fn io(code: &str, text: &str, weight: i32) -> wdict::WordIo {
+        wdict::WordIo {
+            weight,
+            ..row(code, text)
+        }
+    }
+
+    /// 用户词落进文本：门面写 → 折回 → 文件里有；重开后从文本读回。
+    #[test]
+    fn user_words_live_in_text() {
+        let p = tmp("wind_uw_in_text.redb");
+        {
+            let s = Store::open(&p).unwrap();
+            s.add_user_word("pinyin", "nihao", "你好", 9, 0b101)
+                .unwrap();
+            s.runtime()
+                .data()
+                .fold(wind_userdata::record::Target::User, "pinyin")
+                .unwrap();
+            let f = s.user_text_path("pinyin");
+            assert!(
+                std::fs::read_to_string(&f)
+                    .unwrap()
+                    .contains("你好\tni hao\t9")
+            );
+        }
+        let s = Store::open(&p).unwrap();
+        let got = s.get_user_words("pinyin", "nihao").unwrap();
+        assert_eq!(
+            (got[0].text.as_str(), got[0].weight, got[0].boundary),
+            ("你好", 9, 0b101)
+        );
+    }
+
+    /// 未折回的新词列得出、数得对、导出排最后。
+    #[test]
+    fn unfolded_words_are_listed_counted_and_exported_last() {
+        let s = Store::open(tmp("wind_uw_unfolded.redb")).unwrap();
+        s.add_user_word("wb", "aa", "式", 5, 0).unwrap();
+        s.runtime()
+            .data()
+            .fold(wind_userdata::record::Target::User, "wb")
+            .unwrap();
+        s.add_user_word("wb", "aa", "工", 5, 0).unwrap();
+        let mut n = 0;
+        s.for_each_user_word("wb", "", &mut |_| {
+            n += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(s.count_user_words("wb").unwrap(), 2);
+        let rows = s.collect_user_word_rows("wb").unwrap();
+        assert_eq!(rows.last().unwrap().text, "工", "未折回的新词导出在末尾");
+    }
+
+    /// 预览分类与实际导入一致（含同批重复键、补边界）。
+    #[test]
+    fn preview_matches_import_counts() {
+        let s = Store::open(tmp("wind_uw_preview2.redb")).unwrap();
+        s.add_user_word("pinyin", "nihao", "你好", 100, 0).unwrap();
+        let rows = vec![
+            io("ni hao", "你好", 1),
+            io("ta", "他", 3),
+            io("ta", "他", 9),
+        ];
+        let (pc, _) = s.preview_import_user_words("pinyin", &rows).unwrap();
+        let ic = s.import_user_words("pinyin", &rows).unwrap();
+        assert_eq!(
+            (pc.added, pc.updated, pc.unchanged),
+            (ic.added, ic.updated, ic.unchanged)
+        );
+        assert_eq!((ic.added, ic.updated, ic.unchanged), (1, 2, 0));
     }
 
     /// 超长文本（> `USER_WORD_TEXT_MAX_CHARS`）一律拒绝——覆盖显式给码/设置页手动加词这
@@ -1185,49 +1123,6 @@ mod tests {
         assert_eq!(dec_val(&[]), None);
     }
 
-    /// 惰性升级：旧 16B 记录经一次写入后自然补齐为 24B，boundary 从此可用。
-    #[test]
-    fn v1_record_upgrades_on_write() {
-        let path = tmp("wind_uw_v1_upgrade.redb");
-        let s = Store::open(&path).unwrap();
-
-        // 直接以 v1（16B）格式塞一条记录，绕过 add_user_word，模拟旧库。
-        let key = enc_key("py", "nihao", "你好");
-        {
-            let mut v1 = [0u8; 16];
-            v1[0..4].copy_from_slice(&500i32.to_le_bytes());
-            v1[4..8].copy_from_slice(&3u32.to_le_bytes());
-            v1[8..16].copy_from_slice(&1_700_000_000i64.to_le_bytes());
-            s.with_db(|db| {
-                let txn = db.begin_write()?;
-                {
-                    let mut t = txn.open_table(USER_WORDS)?;
-                    t.insert(key.as_str(), v1.as_slice())?;
-                }
-                txn.commit()?;
-                Ok(())
-            })
-            .unwrap();
-        }
-
-        // 旧记录可读，boundary=0。
-        let r = s.get_user_words("py", "nihao").unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].weight, 500, "旧记录的既有字段不得丢失");
-        assert_eq!(r[0].boundary, 0, "v1 无 boundary");
-
-        // 再次加词（权重取 max）：旧值 boundary=0 → 用新算出的补齐。
-        s.add_user_word("py", "nihao", "你好", 100, 0b101).unwrap();
-        let r2 = s.get_user_words("py", "nihao").unwrap();
-        assert_eq!(r2[0].weight, 500, "权重取 max，不被低值覆盖");
-        assert_eq!(r2[0].boundary, 0b101, "旧记录 boundary=0 时应被新值补齐");
-
-        // 已有非 0 boundary 时沿用，不被后续调用抹掉（切分与 code/text 绑定，不因再加词而变）。
-        s.add_user_word("py", "nihao", "你好", 100, 0).unwrap();
-        let r3 = s.get_user_words("py", "nihao").unwrap();
-        assert_eq!(r3[0].boundary, 0b101, "已有边界不该被 0 覆盖");
-    }
-
     /// 无边界词（手输码/旧版扁平导入）仍须被简拼查询捞出来交给引擎现判，
     /// 且**只在首字符对得上时**才捞——这正是分组的意义。
     #[test]
@@ -1249,167 +1144,6 @@ mod tests {
         assert_eq!(texts("nh"), vec!["你好"]);
         // 首字符对不上 → 一条不返回（改动前是整库返回）
         assert!(texts("zg").is_empty());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **索引必须覆盖每一条写路径。**
-    ///
-    /// 这是本方案唯一的系统性风险：主表写了、索引没写，简拼就静默召不回那个词——
-    /// 不报错、不告警。五条写路径逐一验证。
-    #[test]
-    fn every_write_path_maintains_the_index() {
-        let p = tmp("wind_abbrev_paths.redb");
-        let s = Store::open(&p).unwrap();
-        let hit = |ab: &str| -> Vec<String> {
-            s.search_user_words_by_abbrev("py", ab, 0)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.text)
-                .collect()
-        };
-
-        // ① add_user_word
-        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
-        assert_eq!(hit("nh"), vec!["你好"], "add_user_word 应建索引");
-
-        // ② import_user_words
-        s.import_user_words(
-            "py",
-            &[wdict::WordIo {
-                code: "xi an ning".into(),
-                text: "西安宁".into(),
-                weight: 700,
-                count: 0,
-                boundary: None,
-            }],
-        )
-        .unwrap();
-        assert_eq!(hit("xan"), vec!["西安宁"], "import 应建索引");
-
-        // ③ on_word_selected 的隐性造词（最容易漏的一条）
-        s.on_word_selected("py", "zg", "中国", 0, 0).unwrap();
-        assert_eq!(
-            hit("zg"),
-            vec!["中国"],
-            "隐性造词的记录 boundary=0，应落在 z 的兜底组（否则它永远召不回）"
-        );
-
-        // ④ remove_user_word
-        s.remove_user_word("py", "nihao", "你好").unwrap();
-        assert!(hit("nh").is_empty(), "remove 应删索引");
-
-        // ⑤ clear_user_words
-        s.clear_user_words("py").unwrap();
-        assert!(
-            hit("xan").is_empty() && hit("zg").is_empty(),
-            "clear 应清索引"
-        );
-        assert_eq!(s.abbrev_index_len(), 0, "索引应随主表一起清空");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **改权重不该动索引**——这正是 value 留空的收益。
-    /// 若哪天把 weight 塞进 value，这两条高频路径就都得同步更新，漏一处即静默错乱。
-    #[test]
-    fn weight_changes_do_not_touch_the_index() {
-        let p = tmp("wind_abbrev_weight.redb");
-        let s = Store::open(&p).unwrap();
-        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
-        let before = s.abbrev_index_len();
-
-        s.update_user_word_weight("py", "nihao", "你好", 900)
-            .unwrap();
-        s.on_word_selected("py", "nihao", "你好", 100, 1).unwrap();
-        assert_eq!(s.abbrev_index_len(), before, "索引条数不该变");
-
-        let got = s.search_user_words_by_abbrev("py", "nh", 0).unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(
-            got[0].weight >= 900,
-            "回主表点查拿到的必须是**最新**权重，实际 {}",
-            got[0].weight
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 边界从 0 被补齐时，索引键要跟着搬家——旧键残留会变成永远匹配不上的幽灵。
-    #[test]
-    fn filling_boundary_moves_the_index_key() {
-        let p = tmp("wind_abbrev_move.redb");
-        let s = Store::open(&p).unwrap();
-        s.add_user_word("py", "nihao", "你好", 500, 0).unwrap(); // 无边界 → \u{1}n 兜底组
-        // 探针：`nx` 的声母组必然为空，故命中只可能来自 n 的兜底组。
-        assert_eq!(
-            s.search_user_words_by_abbrev("py", "nx", 0).unwrap().len(),
-            1,
-            "补齐前它躺在 n 的兜底组里"
-        );
-
-        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap(); // 补齐边界
-        assert_eq!(
-            s.abbrev_index_len(),
-            1,
-            "补齐后仍应只有一条索引（旧键必须被删）"
-        );
-        assert!(
-            s.search_user_words_by_abbrev("py", "nx", 0)
-                .unwrap()
-                .is_empty(),
-            "补齐边界后不该再留在兜底组（残留即幽灵：查什么都跟着出来）"
-        );
-        assert_eq!(
-            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
-            1
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 存量数据补建索引：老库升级上来时索引是空的，不补建则简拼静默失效。
-    #[test]
-    fn rebuild_covers_preexisting_words() {
-        let p = tmp("wind_abbrev_rebuild.redb");
-        let s = Store::open(&p).unwrap();
-        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
-        s.add_user_word("wb", "aaaa", "工工", 100, 0).unwrap();
-
-        // 模拟老库：主表有数据、索引为空
-        s.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut idx = txn.open_table(USER_ABBREV)?;
-                let keys: Vec<String> = idx
-                    .iter()?
-                    .filter_map(|i| i.ok().map(|(k, _)| k.value().to_string()))
-                    .collect();
-                for k in &keys {
-                    idx.remove(k.as_str())?;
-                }
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(s.abbrev_index_len(), 0, "前提：索引确实被清空了");
-        assert!(
-            s.search_user_words_by_abbrev("py", "nh", 0)
-                .unwrap()
-                .is_empty(),
-            "前提校验：没有索引时确实召不回——这正是必须补建的理由"
-        );
-
-        assert_eq!(s.rebuild_abbrev_indexes().unwrap(), 2);
-        assert_eq!(
-            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
-            1,
-            "补建后应能召回"
-        );
-        assert_eq!(
-            s.search_user_words_by_abbrev("wb", "aaaa", 0)
-                .unwrap()
-                .len(),
-            1,
-            "跨 schema 的词也要补建，且各归各的 schema"
-        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1452,26 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn test_on_word_selected_threshold_boost() {
-        let path = tmp("wind_uw_sel.redb");
-        let s = Store::open(&path).unwrap();
-        // 阈值 3：第 3 次选词才 +boost
-        for _ in 0..2 {
-            s.on_word_selected("wb", "a", "工", 500, 3).unwrap();
-        }
-        assert_eq!(
-            s.get_user_words("wb", "a").unwrap()[0].weight,
-            0,
-            "未到阈值不加权"
-        );
-        s.on_word_selected("wb", "a", "工", 500, 3).unwrap();
-        let r = s.get_user_words("wb", "a").unwrap();
-        assert_eq!(r[0].count, 3);
-        assert_eq!(r[0].weight, 500, "第 3 次达阈值 +500");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
     fn export_import_user_words_roundtrip() {
         let path = tmp("wind_uw_io.redb");
         let s = Store::open(&path).unwrap();
@@ -1501,8 +1215,9 @@ mod tests {
     /// `xian`，`split_spaced_code` 读回来是 0。导入闸口求解出的单字词边界若走 code
     /// 传递会**静默退化为 0，而调用方以为补上了**。本条锁住那条旁路。
     ///
-    /// ⚠️ 对照组是本测试的要害：不给显式边界时确实退化为 0——那正是旁路存在的理由。
-    /// 少了对照组，这条测试无法证明「显式边界」比「code 空格」多做了任何事。
+    /// P2 起用户词落文本：单个汉字的单音节由文本解析推断（一个汉字只对应一个音节），所以不给
+    /// 显式边界的单字词同样是 0b1；非汉字单字符（emoji）的单音节文本表达不了，退化为 0——
+    /// 这是对照组，证明推断只认汉字。
     #[test]
     fn explicit_boundary_survives_where_spaces_cannot() {
         let path = tmp("wind_uw_explicit_b.redb");
@@ -1519,8 +1234,10 @@ mod tests {
             &[
                 // 单音节：显式 0b1
                 row("xian", "先", Some(0b1)),
-                // 对照：同样单音节码，不给显式边界
+                // 不给显式边界的单个汉字：由文本推断
                 row("gong", "工", None),
+                // 对照：非汉字单字符，显式单音节在文本里表达不了
+                row("xiao", "😊", Some(0b1)),
                 // 多音节：显式边界与 code 空格都能表达，显式优先
                 row("nihao", "你好", Some(0b101)),
             ],
@@ -1535,11 +1252,8 @@ mod tests {
                 .boundary
         };
         assert_eq!(b("xian", "先"), 0b1, "单音节边界必须存活");
-        assert_eq!(
-            b("gong", "工"),
-            0,
-            "不给显式边界 ⇒ 空格载体推不出单音节，退化为 0"
-        );
+        assert_eq!(b("gong", "工"), 0b1, "单个汉字由文本推断为单音节");
+        assert_eq!(b("xiao", "😊"), 0, "非汉字单字符的单音节退化为 0");
         assert_eq!(b("nihao", "你好"), 0b101);
         let _ = std::fs::remove_file(&path);
     }
@@ -1693,13 +1407,10 @@ mod tests {
     }
 
     #[test]
-    fn export_dict_wdict_roundtrips_words_count_and_shadow() {
+    fn export_dict_wdict_roundtrips_words_and_shadow() {
         let path = tmp("wind_uw_dict_io.redb");
         let s = Store::open(&path).unwrap();
-        // 用户词 + 调频次数
         s.add_user_word("wb", "a", "工", 100, 0).unwrap();
-        s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // count -> 1
-        s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // count -> 2
         // shadow：pin + del
         s.pin_shadow("wb", "aaaa", "恭", None, 0).unwrap();
         s.delete_shadow("wb", "bbbb", "见").unwrap();
@@ -1718,7 +1429,6 @@ mod tests {
         assert_eq!(imported, 1);
         let got = s2.get_user_words("wb", "a").unwrap();
         assert_eq!(got[0].weight, 100);
-        assert_eq!(got[0].count, 2, "count(调频)随导出/导入流转");
 
         let (actions, sk) = crate::wdict::parse_shadow_wdict(&text).unwrap();
         assert_eq!(sk, 0);
@@ -1735,5 +1445,211 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
+    }
+
+    /// 手改文本 → sync → 新词可见、删掉的行消失、代次推进；未被手改的未折回操作仍在。
+    #[test]
+    fn reload_picks_up_hand_edit_and_bumps_generation() {
+        let s = Store::open(tmp("wind_uw_handedit.redb")).unwrap();
+        s.add_user_word("pinyin", "nihao", "你好", 9, 0b101)
+            .unwrap();
+        s.add_user_word("pinyin", "ta", "他", 1, 0b1).unwrap();
+        s.runtime()
+            .data()
+            .fold(wind_userdata::record::Target::User, "pinyin")
+            .unwrap();
+        s.add_user_word("pinyin", "wo", "我", 2, 0b1).unwrap(); // 未折回
+        let f = s.user_text_path("pinyin");
+        let edited = std::fs::read_to_string(&f)
+            .unwrap()
+            .replace("他\tta\t1\n", "")
+            + "手改\tshou gai\t3\n";
+        std::fs::write(&f, edited).unwrap();
+        let g0 = s.words_generation_of("pinyin");
+        assert_eq!(s.sync_user_texts(), vec!["pinyin".to_string()]);
+        assert_ne!(s.words_generation_of("pinyin"), g0);
+        assert_eq!(
+            s.get_user_words("pinyin", "shougai").unwrap()[0].text,
+            "手改"
+        );
+        assert!(s.get_user_words("pinyin", "ta").unwrap().is_empty());
+        assert_eq!(s.get_user_words("pinyin", "wo").unwrap()[0].text, "我");
+        assert!(s.sync_user_texts().is_empty(), "没变就不重建");
+    }
+
+    /// dict.reload 的路径只认 `<text_dir>/<schema>/user.dict.yaml`。
+    #[test]
+    fn reload_rejects_paths_outside_user_dir() {
+        let s = Store::open(tmp("wind_uw_reloadpath.redb")).unwrap();
+        s.add_user_word("wb", "a", "工", 1, 0).unwrap();
+        s.runtime()
+            .data()
+            .fold(wind_userdata::record::Target::User, "wb")
+            .unwrap();
+        let ok = s.user_text_path("wb").to_string_lossy().into_owned();
+        assert!(s.reload_user_text_paths(&[ok]).is_ok());
+        let base = s.user_text_dir().to_string_lossy().into_owned();
+        for bad in [
+            format!("{base}/../x/user.dict.yaml"),
+            format!("{base}/wb/other.dict.yaml"),
+            "/etc/passwd".to_string(),
+            format!("{base}/wb/../../user.dict.yaml"),
+            format!("{base}/user.dict.yaml"),
+            "user.dict.yaml".to_string(),
+        ] {
+            assert!(
+                s.reload_user_text_paths(std::slice::from_ref(&bad))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Windows 路径不分大小写：盘符、目录、文件名换了大小写 / 斜杠方向，仍认得是哪个文件；
+    /// 方案名取磁盘上的实际目录名。区分大小写的平台上照旧拒绝。
+    #[test]
+    fn text_path_matching_folds_case_when_asked() {
+        let d = std::env::temp_dir().join(format!("wind_uw_ci-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let base = d.join("User");
+        std::fs::create_dir_all(base.join("WubiEx")).unwrap();
+        let upper = base.to_string_lossy().to_uppercase();
+        let p = format!("{upper}/WUBIEX/User.Dict.YAML");
+        match classify_text_path(&base, &p, true).unwrap() {
+            TextPath::Words(s) => assert_eq!(s, "WubiEx"),
+            _ => panic!("应认作用户词文件"),
+        }
+        assert!(matches!(
+            classify_text_path(&base, &format!("{upper}/Phrases.Dict.Yaml"), true).unwrap(),
+            TextPath::Phrases
+        ));
+        assert!(classify_text_path(&base, &p, false).is_err());
+        assert!(classify_text_path(&base, &format!("{upper}/../X/user.dict.yaml"), true).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// P5：学到的数据与补全历史也能经 dict.reload 指名重载。
+    #[test]
+    fn reload_accepts_learned_and_completion_paths() {
+        use wind_userdata::record::Target;
+        let base = std::path::Path::new("/u/data");
+        let p = |rel: &str| base.join(rel).to_string_lossy().into_owned();
+        assert!(matches!(
+            classify_text_path(base, &p("pinyin/freq.table.yaml"), false).unwrap(),
+            TextPath::Learned(Target::Freq, s) if s == "pinyin"
+        ));
+        assert!(matches!(
+            classify_text_path(base, &p("pinyin/temp.dict.yaml"), false).unwrap(),
+            TextPath::Learned(Target::Temp, _)
+        ));
+        assert!(matches!(
+            classify_text_path(base, &p("pinyin/draft.dict.yaml"), false).unwrap(),
+            TextPath::Learned(Target::Draft, _)
+        ));
+        assert!(matches!(
+            classify_text_path(base, &p("pinyin/assoc.table.yaml"), false).unwrap(),
+            TextPath::Learned(Target::Assoc, _)
+        ));
+        assert!(matches!(
+            classify_text_path(base, &p("completion.table.yaml"), false).unwrap(),
+            TextPath::Completion
+        ));
+        assert!(classify_text_path(base, &p("pinyin/other.yaml"), false).is_err());
+        assert!(
+            matches!(
+                classify_text_path(base, &p("stats/2026-10.toml"), false).unwrap(),
+                TextPath::Stats
+            ),
+            "统计按需读文件，重载即生效"
+        );
+    }
+
+    #[test]
+    fn reload_of_hand_edited_freq_text_takes_effect() {
+        let s = Store::open(tmp("wind_uw_reload_freq.redb")).unwrap();
+        s.record_freq("pinyin", "a", "啊").unwrap();
+        s.flush_user_data().unwrap();
+        let f = s.user_text_dir().join("pinyin/freq.table.yaml");
+        let t = std::fs::read_to_string(&f)
+            .unwrap()
+            .replace("a\t啊\t1\t", "a\t啊\t9\t");
+        std::fs::write(&f, t).unwrap();
+        let changed = s
+            .reload_user_text_paths(&[f.to_string_lossy().into_owned()])
+            .unwrap();
+        assert_eq!(changed, vec!["pinyin".to_string()]);
+        assert_eq!(
+            s.get_freq("pinyin", "a", "啊").unwrap().map(|r| r.count),
+            Some(9)
+        );
+    }
+
+    /// 真实 Windows：dict.reload 收到小写 + 正斜杠写法的路径也能重载。
+    #[cfg(windows)]
+    #[test]
+    fn reload_accepts_case_and_slash_variants_on_windows() {
+        let s = Store::open(tmp("wind_uw_reload_ci.redb")).unwrap();
+        s.add_user_word("wb", "a", "工", 1, 0).unwrap();
+        s.flush_user_data().unwrap();
+        let f = s.user_text_path("wb");
+        std::fs::write(&f, std::fs::read_to_string(&f).unwrap() + "式\tb\t1\n").unwrap();
+        let p = f.to_string_lossy().to_lowercase().replace('\\', "/");
+        assert_eq!(
+            s.reload_user_text_paths(&[p]).unwrap(),
+            vec!["wb".to_string()]
+        );
+        assert_eq!(s.get_user_words("wb", "b").unwrap()[0].text, "式");
+    }
+
+    /// dict.flush：全部待处理操作折回，文本里有。
+    #[test]
+    fn flush_folds_everything() {
+        let s = Store::open(tmp("wind_uw_flush.redb")).unwrap();
+        s.add_user_word("wb", "a", "工", 1, 0).unwrap();
+        s.flush_user_data().unwrap();
+        assert!(
+            std::fs::read_to_string(s.user_text_path("wb"))
+                .unwrap()
+                .contains("工\ta\t1")
+        );
+    }
+
+    /// 手改短语与 Shadow 文件：sync_user_texts 一并载入，返回值含 "phrases" 与方案名；dict.reload
+    /// 也认这两种文件。
+    #[test]
+    fn sync_picks_up_phrase_and_shadow_hand_edits() {
+        let s = Store::open(tmp("wind_uw_sync_ph_sh.redb")).unwrap();
+        s.add_phrase("yx", "me@x.com", 0, 1800).unwrap();
+        s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
+        let pf = s.phrases_path();
+        std::fs::write(
+            &pf,
+            std::fs::read_to_string(&pf).unwrap() + "dz\t地址\t1800\n",
+        )
+        .unwrap();
+        let sf = s.shadow_path("wb");
+        std::fs::write(
+            &sf,
+            std::fs::read_to_string(&sf).unwrap() + "bb\t八\tdelete\n",
+        )
+        .unwrap();
+        let mut changed = s.sync_user_texts();
+        changed.sort();
+        assert_eq!(changed, vec!["phrases".to_string(), "wb".to_string()]);
+        assert!(
+            s.enabled_phrases_for_input()
+                .unwrap()
+                .iter()
+                .any(|p| p.code == "dz")
+        );
+        assert!(s.get_shadow_rules("wb", "bb").unwrap().is_some());
+        std::fs::write(&pf, std::fs::read_to_string(&pf).unwrap() + "xx\t叉\t1\n").unwrap();
+        let p = pf.to_string_lossy().into_owned();
+        assert_eq!(
+            s.reload_user_text_paths(&[p]).unwrap(),
+            vec!["phrases".to_string()]
+        );
+        let p = sf.to_string_lossy().into_owned();
+        assert!(s.reload_user_text_paths(&[p]).is_ok());
     }
 }

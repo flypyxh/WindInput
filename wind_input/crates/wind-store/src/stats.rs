@@ -26,11 +26,10 @@
 
 use crate::store::{META, STATS_DAILY, Store};
 use chrono::{Duration, NaiveDate};
-use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// META 表中存放统计全局元数据的键。
+/// 旧 META 表中存放统计全局元数据的键（P4a 起只供迁移读）。
 const STATS_META_KEY: &str = "stats_meta";
 
 /// 上屏来源分类（对齐 Go `CommitSource`，末尾追加 Rust 特有的 Url/Mix）。
@@ -246,94 +245,165 @@ pub fn qualifies_for_max_speed(chars: u32, active_millis: u64) -> bool {
     active_millis >= MIN_SPEED_SAMPLE_MS && chars >= MIN_SPEED_SAMPLE_CHARS
 }
 
+/// 一个月的文件：`{version: 1, days: {YYYY-MM-DD: DailyStats}}`。
+#[derive(Serialize, Deserialize, Default)]
+struct MonthFile {
+    version: u32,
+    #[serde(default)]
+    days: std::collections::BTreeMap<String, DailyStats>,
+}
+
+/// 旧表里的每日统计与元数据（迁移用）。
+pub(crate) type LegacyStats = (Vec<(String, DailyStats)>, Option<StatsMeta>);
+
+/// `YYYY-MM-DD` 的月份部分；格式不对（含非 ASCII 数字）⇒ `None`。按字节切之前先验形态——
+/// 直接 `&date[..7]` 遇到全角数字会切在字符中间 panic，而 release 下 panic 会带走整个服务。
+fn month_of(date: &str) -> Option<&str> {
+    let b = date.as_bytes();
+    let ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    ok.then(|| &date[..7])
+}
+
 impl Store {
+    /// 每日统计目录：`<data>/stats/`（P5 起随用户目录走；按月一个 `YYYY-MM.toml`）。
+    pub fn stats_dir(&self) -> std::path::PathBuf {
+        self.user_text_dir().join("stats")
+    }
+
+    fn stats_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stats_io.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn month_path(&self, ym: &str) -> std::path::PathBuf {
+        self.stats_dir().join(format!("{ym}.toml"))
+    }
+
+    /// 读一个月：机写文件，坏了从 `.bak` 自愈或另存后从空开始（§2.5）；读不了（IO）⇒ Err。
+    fn read_month(
+        &self,
+        ym: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, DailyStats>> {
+        let parse = |b: &[u8]| -> anyhow::Result<MonthFile> {
+            Ok(toml::from_str(std::str::from_utf8(b)?)?)
+        };
+        Ok(
+            crate::machine_file::load_machine_file(&self.month_path(ym), &parse)?
+                .map(|f| f.days)
+                .unwrap_or_default(),
+        )
+    }
+
+    fn write_month(
+        &self,
+        ym: &str,
+        days: std::collections::BTreeMap<String, DailyStats>,
+    ) -> anyhow::Result<()> {
+        let p = self.month_path(ym);
+        if days.is_empty() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(());
+        }
+        let text = toml::to_string(&MonthFile { version: 1, days })?;
+        wind_userdata::text::fold::commit_text(&p, text.as_bytes(), None)
+    }
+
+    /// 现存的月份（`YYYY-MM`，升序）。
+    fn stat_months(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(self.stats_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let ym = n.strip_suffix(".toml")?;
+                (ym.len() == 7 && ym.as_bytes()[4] == b'-').then(|| ym.to_string())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     /// 累加某日的中文/英文上屏字符数（读改写）。Stage 1 保留，供现有采集单点使用。
     pub fn record_stat(&self, date: &str, chinese: u32, english: u32) -> anyhow::Result<()> {
         if chinese == 0 && english == 0 {
             return Ok(());
         }
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(STATS_DAILY)?;
-                let mut rec: DailyStats = t
-                    .get(date)?
-                    .and_then(|g| serde_json::from_slice(g.value()).ok())
-                    .unwrap_or_default();
-                rec.chinese = rec.chinese.saturating_add(chinese);
-                rec.english = rec.english.saturating_add(english);
-                let bytes = serde_json::to_vec(&rec)?;
-                t.insert(date, bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
+        let Some(ym) = month_of(date) else {
+            anyhow::bail!("日期格式不对：{date}");
+        };
+        let _g = self.stats_lock();
+        let mut days = self.read_month(ym)?;
+        let rec = days.entry(date.to_string()).or_default();
+        rec.chinese = rec.chinese.saturating_add(chinese);
+        rec.english = rec.english.saturating_add(english);
+        self.write_month(ym, days)
     }
 
-    /// 覆盖写入某日完整统计（采集器 flush 用）。
+    /// 覆盖写入某日完整统计（采集器 flush 用，30 秒一次，不在按键路径）。
     pub fn put_daily_stat(&self, date: &str, stat: &DailyStats) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(STATS_DAILY)?;
-                let bytes = serde_json::to_vec(stat)?;
-                t.insert(date, bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
+        let Some(ym) = month_of(date) else {
+            anyhow::bail!("日期格式不对：{date}");
+        };
+        let _g = self.stats_lock();
+        let mut days = self.read_month(ym)?;
+        days.insert(date.to_string(), stat.clone());
+        self.write_month(ym, days)
     }
 
     /// 取某日统计（无则零值）。
     pub fn get_daily_stat(&self, date: &str) -> anyhow::Result<DailyStats> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(STATS_DAILY)?;
-            Ok(t.get(date)?
-                .and_then(|g| serde_json::from_slice(g.value()).ok())
-                .unwrap_or_default())
-        })
+        let Some(ym) = month_of(date) else {
+            return Ok(DailyStats::default());
+        };
+        let _g = self.stats_lock();
+        Ok(self.read_month(ym)?.remove(date).unwrap_or_default())
     }
 
-    /// 取日期区间 [from, to]（含端点；YYYY-MM-DD 字典序即时间序）。
+    /// 取日期区间 [from, to]（含端点；YYYY-MM-DD 字典序即时间序），只读涉及的月份文件。
     pub fn daily_stats(&self, from: &str, to: &str) -> anyhow::Result<Vec<(String, DailyStats)>> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(STATS_DAILY)?;
-            let mut out = Vec::new();
-            for item in t.range(from..)? {
-                let (k, v) = item?;
-                let date = k.value();
-                if date > to {
-                    break;
+        let (Some(fm), Some(tm)) = (month_of(from), month_of(to)) else {
+            return Ok(Vec::new());
+        };
+        let _g = self.stats_lock();
+        let mut out = Vec::new();
+        for ym in self.stat_months() {
+            if ym.as_str() < fm || ym.as_str() > tm {
+                continue;
+            }
+            // 一个月读不了（IO）不拖垮整个区间：跳过它，其余照常
+            let days = match self.read_month(&ym) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("统计 {ym} 读不了，跳过：{e:#}");
+                    continue;
                 }
-                if let Ok(rec) = serde_json::from_slice::<DailyStats>(v.value()) {
-                    out.push((date.to_string(), rec));
+            };
+            for (d, st) in days {
+                if d.as_str() >= from && d.as_str() <= to {
+                    out.push((d, st));
                 }
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// 全部每日统计（升序）。
     fn all_daily_stats(&self) -> anyhow::Result<Vec<(String, DailyStats)>> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(STATS_DAILY)?;
-            let mut out = Vec::new();
-            for item in t.range::<&str>(..)? {
-                let (k, v) = item?;
-                if let Ok(rec) = serde_json::from_slice::<DailyStats>(v.value()) {
-                    out.push((k.value().to_string(), rec));
-                }
-            }
-            Ok(out)
-        })
+        self.daily_stats("0000-01-01", "9999-12-31")
     }
 
     /// 导出全部每日统计为 jsonl（每行 {"date","stat"}）。
     pub fn export_stats_jsonl(&self) -> anyhow::Result<String> {
-        let all = self.daily_stats("0000-01-01", "9999-12-31")?;
+        let all = self.all_daily_stats()?;
         let mut out = String::new();
         for (date, stat) in all {
             out.push_str(&serde_json::to_string(
@@ -344,7 +414,7 @@ impl Store {
         Ok(out)
     }
 
-    /// 从 jsonl 导入每日统计。overwrite=false 时已存在日跳过（以本地为准）。
+    /// 从 jsonl 导入每日统计。overwrite=false 时已存在日跳过（以本地为准）。每个月份只写一次。
     /// 返回 (imported, skipped_bad_lines)。
     pub fn import_stats_jsonl(
         &self,
@@ -353,16 +423,8 @@ impl Store {
     ) -> anyhow::Result<(usize, usize)> {
         let normalized = wind_utils::text::normalize_input(text);
         let text = normalized.as_ref();
-        // 非覆盖模式先一次性收集已存在日期，避免逐行开读事务（备份可跨数年 daily）。
-        let mut existing: std::collections::HashSet<String> = if overwrite {
-            Default::default()
-        } else {
-            self.daily_stats("0000-01-01", "9999-12-31")?
-                .into_iter()
-                .map(|(d, _)| d)
-                .collect()
-        };
-        let mut imported = 0usize;
+        let mut by_month: std::collections::BTreeMap<String, Vec<(String, DailyStats)>> =
+            Default::default();
         let mut skipped = 0usize;
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -380,42 +442,66 @@ impl Store {
                 skipped += 1;
                 continue;
             };
-            if !overwrite {
-                if existing.contains(date) {
+            let Some(ym) = month_of(date) else {
+                skipped += 1;
+                continue;
+            };
+            by_month
+                .entry(ym.to_string())
+                .or_default()
+                .push((date.to_string(), stat));
+        }
+        let _g = self.stats_lock();
+        let mut imported = 0usize;
+        for (ym, rows) in by_month {
+            let mut days = self.read_month(&ym)?;
+            for (date, stat) in rows {
+                // 非覆盖：已存在的日以本地为准；批内重复日期「先到者胜」
+                if !overwrite && days.contains_key(&date) {
                     continue;
                 }
-                // 批内重复日期同样"先到者胜"，与逐行判存的原语义一致。
-                existing.insert(date.to_string());
+                days.insert(date, stat);
+                imported += 1;
             }
-            self.put_daily_stat(date, &stat)?;
-            imported += 1;
+            self.write_month(&ym, days)?;
         }
         Ok((imported, skipped))
     }
 
+    pub(crate) fn stats_meta_path(&self) -> std::path::PathBuf {
+        self.stats_dir().join("meta.toml")
+    }
+
+    /// 元数据：没有 ⇒ None；坏了从 `.bak` 自愈，`.bak` 也不行 ⇒ 另存后 None（§2.5）。
+    fn load_stats_meta(&self) -> anyhow::Result<Option<StatsMeta>> {
+        let parse = |b: &[u8]| -> anyhow::Result<StatsMeta> {
+            Ok(toml::from_str(std::str::from_utf8(b)?)?)
+        };
+        crate::machine_file::load_machine_file(&self.stats_meta_path(), &parse)
+    }
+
     /// 读取统计全局元数据（无则零值）。
     pub fn get_stats_meta(&self) -> anyhow::Result<StatsMeta> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(META)?;
-            Ok(t.get(STATS_META_KEY)?
-                .and_then(|g| serde_json::from_slice(g.value()).ok())
-                .unwrap_or_default())
-        })
+        Ok(self.load_stats_meta()?.unwrap_or_default())
+    }
+
+    /// 读取统计全局元数据；文件没有（被删、坏了且备份不可用）而月数据还在 ⇒ 由月数据重算并写回。
+    /// 收集器用它起步：把零值当真再累加写回会永久抹掉累计值（M-3）。
+    pub fn stats_meta_or_recalc(&self, speed_factor: f32) -> anyhow::Result<StatsMeta> {
+        match self.load_stats_meta()? {
+            Some(m) => Ok(m),
+            None if !self.stat_months().is_empty() => {
+                tracing::warn!("统计元数据缺失，由每日数据重算");
+                self.recalculate_stats_meta(speed_factor)
+            }
+            None => Ok(StatsMeta::default()),
+        }
     }
 
     /// 写入统计全局元数据。
     pub fn put_stats_meta(&self, meta: &StatsMeta) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(META)?;
-                let bytes = serde_json::to_vec(meta)?;
-                t.insert(STATS_META_KEY, bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
+        let text = toml::to_string(meta)?;
+        wind_userdata::text::fold::commit_text(&self.stats_meta_path(), text.as_bytes(), None)
     }
 
     /// 从现存每日数据重建全局元数据（prune 后/meta 缺失时调用，对齐 Go `RecalculateStatsMeta`）。
@@ -495,54 +581,59 @@ impl Store {
 
     /// 清空所有统计（每日 + 元数据），返回删除的天数。
     pub fn clear_stats(&self) -> anyhow::Result<usize> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(STATS_DAILY)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range::<&str>(..)? {
-                        ks.push(item?.0.value().to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in keys {
-                    t.remove(k.as_str())?;
-                }
-            }
-            {
-                // 同事务清除元数据，保证 daily 与 meta 一致。
-                let mut m = txn.open_table(META)?;
-                m.remove(STATS_META_KEY)?;
-            }
-            txn.commit()?;
-            Ok(n)
-        })
+        let _g = self.stats_lock();
+        let mut n = 0usize;
+        for ym in self.stat_months() {
+            n += self.read_month(&ym).map(|d| d.len()).unwrap_or(0);
+            self.write_month(&ym, Default::default())?;
+        }
+        match std::fs::remove_file(self.stats_meta_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(n)
     }
 
-    /// 删除 `before`（不含）之前的统计，返回删除条数。
+    /// 删除 `before`（不含）之前的统计，返回删除条数。整月在前的直接删文件。
     pub fn prune_stats_before(&self, before: &str) -> anyhow::Result<usize> {
+        let Some(bm) = month_of(before) else {
+            return Ok(0);
+        };
+        let _g = self.stats_lock();
+        let mut n = 0usize;
+        for ym in self.stat_months() {
+            if ym.as_str() > bm {
+                break;
+            }
+            let mut days = self.read_month(&ym)?;
+            let before_len = days.len();
+            days.retain(|d, _| d.as_str() >= before);
+            n += before_len - days.len();
+            if days.len() != before_len {
+                self.write_month(&ym, days)?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// 旧 `STATS_DAILY` 表全部行与旧 META 里的 `stats_meta`（P4a 迁移用）。
+    pub(crate) fn legacy_stats(&self) -> anyhow::Result<LegacyStats> {
         self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(STATS_DAILY)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range::<&str>(..before)? {
-                        ks.push(item?.0.value().to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in keys {
-                    t.remove(k.as_str())?;
+            let txn = db.begin_read()?;
+            let t = txn.open_table(STATS_DAILY)?;
+            let mut days = Vec::new();
+            for item in t.range::<&str>(..)? {
+                let (k, v) = item?;
+                if let Ok(rec) = serde_json::from_slice::<DailyStats>(v.value()) {
+                    days.push((k.value().to_string(), rec));
                 }
             }
-            txn.commit()?;
-            Ok(n)
+            let m = txn.open_table(META)?;
+            let meta = m
+                .get(STATS_META_KEY)?
+                .and_then(|g| serde_json::from_slice(g.value()).ok());
+            Ok((days, meta))
         })
     }
 }
@@ -995,5 +1086,156 @@ mod tests {
             "小样本那天应被忽略，且旧的污染值 1500 被重算覆盖"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 每日统计按月落用户数据目录的 TOML；prune 整月删文件；meta 单独一个文件。
+    #[test]
+    fn daily_stats_live_in_monthly_data_files() {
+        let s = Store::open(tmp("wind_stats_files.redb")).unwrap();
+        let d = DailyStats {
+            chinese: 12,
+            ..Default::default()
+        };
+        s.put_daily_stat("2026-10-14", &d).unwrap();
+        s.put_daily_stat("2026-09-30", &d).unwrap();
+        assert!(s.stats_dir().join("2026-10.toml").is_file());
+        assert!(s.stats_dir().join("2026-09.toml").is_file());
+        assert_eq!(s.daily_stats("2026-09-01", "2026-10-31").unwrap().len(), 2);
+        assert_eq!(s.get_daily_stat("2026-10-14").unwrap().chinese, 12);
+        assert_eq!(s.prune_stats_before("2026-10-01").unwrap(), 1);
+        assert!(!s.stats_dir().join("2026-09.toml").exists());
+        s.put_stats_meta(&StatsMeta {
+            total_chars: 99,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.get_stats_meta().unwrap().total_chars, 99);
+        s.pause().unwrap();
+        assert_eq!(
+            s.get_daily_stat("2026-10-14").unwrap().chinese,
+            12,
+            "不碰 redb"
+        );
+        s.resume().unwrap();
+        assert_eq!(s.clear_stats().unwrap(), 1);
+        assert_eq!(s.get_stats_meta().unwrap().total_chars, 0);
+    }
+
+    fn sample_day() -> DailyStats {
+        let mut d = DailyStats {
+            chinese: 100,
+            commit_count: 30,
+            active_millis: 60_000,
+            speed_v2: true,
+            by_source: vec![1, 2],
+            ..Default::default()
+        };
+        d.hours[9] = 100;
+        d.code_len_dist[1] = 4;
+        d.by_schema.insert(
+            "pinyin".into(),
+            SchemaStats {
+                total_chars: 100,
+                ..Default::default()
+            },
+        );
+        d
+    }
+
+    fn corrupt_names(dir: &std::path::Path, prefix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
+    #[test]
+    fn month_file_is_toml_in_data_dir_and_round_trips() {
+        let s = Store::open(tmp("wind_stats_toml.redb")).unwrap();
+        s.put_daily_stat("2026-10-15", &sample_day()).unwrap();
+        assert!(s.stats_dir().starts_with(s.user_text_dir()));
+        let p = s.stats_dir().join("2026-10.toml");
+        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(v.get("days").is_some());
+        let got = s.get_daily_stat("2026-10-15").unwrap();
+        assert_eq!(got.hours[9], 100);
+        assert_eq!(got.by_schema["pinyin"].total_chars, 100);
+        assert_eq!(got.by_source, vec![1, 2]);
+        s.put_stats_meta(&StatsMeta {
+            total_chars: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(s.stats_dir().join("meta.toml").is_file());
+    }
+
+    #[test]
+    fn corrupt_month_is_rebuilt_and_writes_keep_working() {
+        let s = Store::open(tmp("wind_stats_corrupt_month.redb")).unwrap();
+        let p = s.stats_dir().join("2026-10.toml");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "days = [[[").unwrap();
+        s.put_daily_stat("2026-10-15", &sample_day()).unwrap();
+        assert_eq!(s.get_daily_stat("2026-10-15").unwrap().chinese, 100);
+        assert_eq!(
+            corrupt_names(p.parent().unwrap(), "2026-10.toml.corrupt-"),
+            1
+        );
+        wind_userdata::issues::clear(&p);
+    }
+
+    /// M-3：元数据坏了且没有可用备份 ⇒ 由各月数据重算，不当成全 0 写回。
+    #[test]
+    fn corrupt_stats_meta_is_recalculated_not_zeroed() {
+        let s = Store::open(tmp("wind_stats_meta_recalc.redb")).unwrap();
+        s.put_daily_stat("2026-10-14", &sample_day()).unwrap();
+        let before = s.recalculate_stats_meta(1.0).unwrap();
+        assert!(before.total_chars > 0);
+        let mp = s.stats_dir().join("meta.toml");
+        std::fs::write(&mp, "total_chars = \"x").unwrap();
+        let _ = std::fs::remove_file(s.stats_dir().join("meta.toml.bak"));
+        let after = s.stats_meta_or_recalc(1.0).unwrap();
+        assert_eq!(after.total_chars, before.total_chars);
+        assert_eq!(corrupt_names(&s.stats_dir(), "meta.toml.corrupt-"), 1);
+        wind_userdata::issues::clear(&mp);
+    }
+
+    #[test]
+    fn missing_meta_with_month_data_is_recalculated() {
+        let s = Store::open(tmp("wind_stats_meta_missing.redb")).unwrap();
+        s.put_daily_stat("2026-10-14", &sample_day()).unwrap();
+        let _ = std::fs::remove_file(s.stats_dir().join("meta.toml"));
+        assert_eq!(s.stats_meta_or_recalc(1.0).unwrap().total_chars, 100);
+    }
+
+    #[test]
+    fn range_query_skips_unreadable_month() {
+        let s = Store::open(tmp("wind_stats_range_skip.redb")).unwrap();
+        s.put_daily_stat("2026-09-01", &sample_day()).unwrap();
+        s.put_daily_stat("2026-10-01", &sample_day()).unwrap();
+        let p = s.stats_dir().join("2026-09.toml");
+        std::fs::write(&p, "days = [[[").unwrap();
+        let _ = std::fs::remove_file(s.stats_dir().join("2026-09.toml.bak"));
+        let v = s.daily_stats("2026-09-01", "2026-10-31").unwrap();
+        assert!(v.iter().any(|(d, _)| d == "2026-10-01"));
+        wind_userdata::issues::clear(&p);
+    }
+
+    /// 审查 I-1：非 ASCII / 畸形日期不得 panic（release 下 panic = abort 会带走整个服务）。
+    #[test]
+    fn malformed_dates_never_panic() {
+        let s = Store::open(tmp("wind_stats_bad_dates.redb")).unwrap();
+        let line = "{\"date\":\"２０２６-10-14\",\"stat\":{}}\n{\"date\":\"2026-1\",\"stat\":{}}\n";
+        let (n, skipped) = s.import_stats_jsonl(line, true).unwrap();
+        assert_eq!((n, skipped), (0, 2));
+        assert!(s.daily_stats("２０２６-01-01", "2026-12-31").is_ok());
+        assert_eq!(s.get_daily_stat("２０２６-10-14").unwrap().total(), 0);
+        assert!(
+            s.put_daily_stat("２０２６-10-14", &DailyStats::default())
+                .is_err()
+        );
+        assert!(s.record_stat("x", 1, 0).is_err());
+        assert_eq!(s.prune_stats_before("２０２６-01-01").unwrap(), 0);
     }
 }

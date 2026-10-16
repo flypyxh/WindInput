@@ -1,0 +1,13 @@
+[package]
+name = "wind-wdict"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-utils = { path = "../wind-utils" }
+# 词条文本域的转义分流判据（`is_cmdbar_grammar`）：命令栏语法条目的反斜杠归 lexer 管，
+# 本层不得再转一次。判据只此一份，抄第二份就是下次漂移的起点。
+wind-cmdbar = { path = "../wind-cmdbar" }
+
+[lints]
+workspace = true

@@ -1,0 +1,96 @@
+//! 数据文件问题登记（设计 §2.5）：坏行数、隔离、已重建 / 未迁移。进程级，以绝对路径为键；设置页经
+//! `system.storageStatus` 读。只记路径与计数，不记文件内容。
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueKind {
+    /// 这么多行解析不了，已跳过（原样留在文件里）。
+    BadLines(usize),
+    /// 整份解析不了：不往里写，按最后一次成功的数据服务。
+    Isolated,
+    /// 坏文件已另存为 `kept_as` 并重建（机写文件从 `.bak` 恢复或从空开始；显式整体替换）。
+    Rebuilt { kept_as: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileIssue {
+    pub path: PathBuf,
+    pub kind: IssueKind,
+}
+
+static ISSUES: Mutex<BTreeMap<PathBuf, IssueKind>> = Mutex::new(BTreeMap::new());
+
+fn lock() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, IssueKind>> {
+    ISSUES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 登记（同一路径覆盖旧值）。
+pub fn report(path: &Path, kind: IssueKind) {
+    lock().insert(path.to_path_buf(), kind);
+}
+
+pub fn clear(path: &Path) {
+    lock().remove(path);
+}
+
+/// `root` 之下（按路径分量判断）的全部问题，按路径排序。
+pub fn list_under(root: &Path) -> Vec<FileIssue> {
+    lock()
+        .iter()
+        .filter(|(p, _)| p.starts_with(root))
+        .map(|(p, k)| FileIssue {
+            path: p.clone(),
+            kind: k.clone(),
+        })
+        .collect()
+}
+
+/// 一次成功解析的统一上报：有坏行记 WARN（只记行数）并登记；没有就清掉该文件的旧问题。
+pub fn report_parse(path: &Path, bad_lines: usize) {
+    if bad_lines > 0 {
+        tracing::warn!(
+            "{} 有 {bad_lines} 行无法解析，已跳过（原样保留在文件里）",
+            path.display()
+        );
+        report(path, IssueKind::BadLines(bad_lines));
+    } else {
+        clear(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_overwrites_and_list_filters_by_root() {
+        let a = Path::new("/tmp/issues-t1/data/a.dict.yaml");
+        let b = Path::new("/tmp/issues-t1-other/b");
+        report(a, IssueKind::BadLines(2));
+        report(a, IssueKind::Isolated);
+        report(b, IssueKind::Isolated);
+        let v = list_under(Path::new("/tmp/issues-t1"));
+        assert_eq!(
+            v,
+            vec![FileIssue {
+                path: a.into(),
+                kind: IssueKind::Isolated
+            }]
+        );
+        clear(a);
+        assert!(list_under(Path::new("/tmp/issues-t1")).is_empty());
+        clear(b);
+    }
+
+    #[test]
+    fn report_parse_clears_when_clean() {
+        let a = Path::new("/tmp/issues-t2/x");
+        report_parse(a, 3);
+        assert_eq!(list_under(a)[0].kind, IssueKind::BadLines(3));
+        report_parse(a, 0);
+        assert!(list_under(a).is_empty());
+    }
+}

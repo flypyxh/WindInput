@@ -1373,6 +1373,9 @@ pub struct Coordinator {
     pub(crate) engine_mgr: EngineManager,
     /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
     pub(crate) store: Option<Arc<Store>>,
+    /// 只读模式的原因（用户数据设计 §7.1 降级保护：meta.toml 版本高于本版本 / 读不出）；
+    /// `None` = 正常读写。只读时 `store` 恒 None。
+    pub(crate) storage_readonly: Option<String>,
     /// 标点转换器（引号左右状态）
     pub(crate) punct: Mutex<PunctuationConverter>,
     /// 智能符号模式待命态（同键连按删中文标点改英文）
@@ -1524,8 +1527,8 @@ pub struct Coordinator {
     pub(crate) softkeyboard_opened_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// 快捷输入格式表的**用户调整**（右键调序 / 停用）运行时镜像，键为格式类别。
     ///
-    /// 真相在 `userdata.redb` 的 `quick_format` 表，这里是读缓存：候选生成在热路径上
-    /// （每次按键都跑），每次去查库不划算。
+    /// 真相在用户数据目录的 `quick_format.toml`，这里是读缓存：候选生成在热路径上
+    /// （每次按键都跑），每次去读文件不划算。
     ///
     /// ⚠️ 右键操作必须**写库 + 更新本镜像**两件都做。只写库不回灌，症状就是
     /// 「调了没反应、重启才生效」——本仓这个坑踩过不止一次。
@@ -2417,6 +2420,48 @@ impl Coordinator {
             .store(!supported, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 退出（重启服务、注销 / 关机、SIGTERM）前把统计与待处理的用户数据落盘：`process::exit`
+    /// 与系统结束进程都不跑析构。
+    /// 失败只 WARN——日志还在，下次启动照样回放。
+    pub fn flush_user_data_before_exit(&self) {
+        // 统计收集器的内存增量先落到统计文件
+        if let Some(sc) = self.stat_collector.as_ref() {
+            sc.flush();
+        }
+        if let Some(s) = self.store.as_ref()
+            && let Err(e) = s.flush_user_data()
+        {
+            warn!("退出前用户数据落盘失败（日志仍在，下次启动回放）：{e:#}");
+        }
+    }
+
+    /// 注销 / 关机（Windows `WM_ENDSESSION`）与 SIGTERM（Linux / macOS）时先落盘：服务 main
+    /// 在协调器就绪后调一次。
+    pub fn install_exit_flush(self: &Arc<Self>) {
+        #[cfg(all(windows, feature = "desktop-ui"))]
+        {
+            let c = self.clone();
+            wind_ui::window::set_session_end_hook(Box::new(move || {
+                tracing::info!("会话结束：用户数据落盘");
+                c.flush_user_data_before_exit();
+            }));
+        }
+        // Android 的输入法跑在应用进程里，进程生命周期归系统管，不接 SIGTERM。
+        #[cfg(all(unix, not(target_os = "android")))]
+        {
+            let c = self.clone();
+            crate::exit_signal::install_sigterm(Box::new(move || {
+                c.flush_user_data_before_exit();
+                std::process::exit(0);
+            }));
+        }
+    }
+
+    /// 只读模式的原因（用户数据设计 §7.1 降级保护）；`None` = 正常读写。
+    pub fn storage_readonly_reason(&self) -> Option<&str> {
+        self.storage_readonly.as_deref()
+    }
+
     pub(crate) fn build(
         config: Config,
         data_dir: Option<&Path>,
@@ -2425,6 +2470,29 @@ impl Coordinator {
         user_dir: Option<std::path::PathBuf>,
         store: Option<Arc<Store>>,
         override_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        Self::build_with_readonly(
+            config,
+            data_dir,
+            push_server,
+            ui_tx,
+            user_dir,
+            store,
+            override_dir,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_readonly(
+        config: Config,
+        data_dir: Option<&Path>,
+        push_server: Arc<PushServer>,
+        ui_tx: crate::UiSender,
+        user_dir: Option<std::path::PathBuf>,
+        store: Option<Arc<Store>>,
+        override_dir: Option<std::path::PathBuf>,
+        storage_readonly: Option<String>,
     ) -> Arc<Self> {
         // 注入 redb Store：码表引擎注册用户词/临时词层，用户词进候选合并。
         // override_dir 为 None 时由 EngineManager 取默认（用户配置目录下的 schema_overrides）。
@@ -2463,36 +2531,51 @@ impl Coordinator {
         }
         let phrases = {
             if let Some(store) = store.as_ref() {
-                if let Some(p) = system_phrase_path.as_ref() {
-                    let entries = wind_phrase::PhraseLayer::parse_system_entries(p);
+                {
+                    // 没有 system.phrases.toml（定制版可能删掉）⇒ 系统短语为空，但照样交给 store：
+                    // 短语迁移要在这里触发，否则旧表里的用户短语永远迁不过来、看不见。
+                    let entries = system_phrase_path
+                        .as_ref()
+                        .map(|p| wind_phrase::PhraseLayer::parse_system_entries(p))
+                        .unwrap_or_default();
                     // 内容哈希：条目稳定序列化后哈希
                     let hash = phrase_entries_hash(&entries);
-                    // 自愈：哈希不一致（TOML 改动）或表内系统短语为空（被删/未初始化）时才同步。
-                    // 仅凭哈希会漏掉"系统短语从表中丢失但 TOML 未变"的场景。
-                    let sys_empty = store
-                        .list_system_phrases()
-                        .map(|v| v.is_empty())
-                        .unwrap_or(false);
-                    if store.phrase_sys_hash().ok().flatten().as_deref() != Some(hash.as_str())
-                        || sys_empty
+                    let sys: Vec<wind_store::phrases::SystemPhrase> = entries
+                        .iter()
+                        .map(|e| wind_store::phrases::SystemPhrase {
+                            code: e.code.clone(),
+                            text: e.text.clone(),
+                            weight: e.weight,
+                            position: e.position,
+                            category: e.category.clone(),
+                        })
+                        .collect();
+                    // 系统短语只在内存（P3 叠加模型），每次启动都交给 store；首次还会触发旧表迁移。
+                    // 没有 TOML 时不动 store 里的系统条目，只确保旧表迁移照样做。
+                    let r = if system_phrase_path.is_some() {
+                        store.set_system_phrases(&sys)
+                    } else {
+                        store.migrate_phrases_now()
+                    };
+                    if let Err(e) = r {
+                        warn!("系统短语设定 / 短语迁移失败: {e}");
+                    }
+                    // 短语迁移刚完成就升版本：等到下次启动才升，中间回退的旧版本会继续往旧表写
+                    if let Some(dir) = store.path().parent()
+                        && dir.join("meta.toml").is_file()
                     {
-                        let sys: Vec<wind_store::phrases::SystemPhrase> = entries
-                            .iter()
-                            .map(|e| wind_store::phrases::SystemPhrase {
-                                code: e.code.clone(),
-                                text: e.text.clone(),
-                                weight: e.weight,
-                                position: e.position,
-                                category: e.category.clone(),
-                            })
-                            .collect();
-                        if let Ok(st) = store.sync_system_phrases(&sys) {
-                            info!(
-                                "Synced system phrases: +{} ~{} -{}",
-                                st.added, st.updated, st.removed
-                            );
-                            let _ = store.set_phrase_sys_hash(&hash);
-                        }
+                        crate::construct::finish_format_upgrade(store, dir);
+                    }
+                    // TOML 改了（哈希不一致）才同步：修改行回到新 TOML 值、已删条目的修改行清掉。
+                    if system_phrase_path.is_some()
+                        && store.phrase_sys_hash().ok().flatten().as_deref() != Some(hash.as_str())
+                        && let Ok(st) = store.sync_system_phrases(&sys)
+                    {
+                        info!(
+                            "Synced system phrases: +{} ~{} -{}",
+                            st.added, st.updated, st.removed
+                        );
+                        let _ = store.set_phrase_sys_hash(&hash);
                     }
                     system_phrase_entries = entries;
                 }
@@ -2800,6 +2883,7 @@ impl Coordinator {
             ui_tx,
             engine_mgr,
             store,
+            storage_readonly,
             punct: Mutex::new(punct_conv),
             capslock_hook: Mutex::new(None),
             capslock_press_tx,
@@ -4494,7 +4578,7 @@ impl Coordinator {
         }
         // 一表一缓存之前是主表 + 分类表合建的一份 `emoji.wemj`，现已无人读它
         if let Some(dir) = Config::cache_dir() {
-            for f in ["emoji.wemj", "emoji.wemj.fp"] {
+            for f in ["emoji.wemj", "emoji.wemj.fp", "emoji.wemj.st"] {
                 let _ = std::fs::remove_file(dir.join("emoji").join(f));
             }
         }
@@ -4748,6 +4832,14 @@ impl Coordinator {
                 // 文本查表、与编码域无关，本就不是某个方案的属性。自带变更检测（只看
                 // enabled/categories），未变即空操作。
                 self.sync_emoji_dict();
+                // 用户词文本手改后，保存配置 / 设置页触发热重载时一并生效（设计 §5）。
+                if let Some(store) = &self.store {
+                    let changed = store.sync_user_texts();
+                    if !changed.is_empty() {
+                        info!("用户文本已重新载入：{} 项", changed.len());
+                    }
+                    self.apply_user_text_changes(&changed);
+                }
                 // 语言栏图标的呈现参数同理跟随全局配置（`[ui.langbar]`），也不属 schema。
                 // 少了这一步，改角标形状/配色要重启才生效——「改了没反应、重启就好」正是
                 // 本仓反复出现的那类缺陷（运行时镜像态没回灌）。自带变更检测，未变即空操作。
@@ -9425,6 +9517,24 @@ impl Coordinator {
     }
 
     /// 从 store 重建短语层（短语类 RPC 改动后调用，使输入期即时生效）。
+    /// 用户文本重新载入后，按变了的项重建内存镜像：短语层、快捷格式调整、常用字覆盖、字符集
+    /// 注册表。用户词与 Shadow 由引擎 / 按键路径直接读表，不用重建。
+    pub(crate) fn apply_user_text_changes(&self, changed: &[String]) {
+        let has = |k: &str| changed.iter().any(|c| c == k);
+        if has("phrases") {
+            self.rebuild_phrases();
+        }
+        if has("quick_format") {
+            self.reload_quick_adjust();
+        }
+        if has("common_chars") {
+            self.reload_common_chars();
+        }
+        if has("charsets") {
+            self.reload_charsets();
+        }
+    }
+
     pub(crate) fn rebuild_phrases(&self) {
         let recs: Vec<wind_phrase::PhraseSeed> = match self.store.as_ref() {
             Some(store) => store
@@ -18618,5 +18728,29 @@ mod emoji_tables_tests {
         assert_eq!(t.lookup("无此词"), None);
         drop(t);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod exit_flush_tests {
+    use super::*;
+
+    /// 退出前落盘连统计一起：`process::exit` 不跑析构，收集器的内存增量否则就丢了。
+    #[test]
+    fn flush_before_exit_writes_todays_stats() {
+        let user = std::env::temp_dir().join(format!("wind_exit_flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user);
+        let (c, _rx) = Coordinator::new_headless_with_ui_at(Config::default(), None, Some(&user));
+        let sc = c.stat_collector.as_ref().expect("有用户目录就有统计收集器");
+        sc.record(StatEvent {
+            chinese: 7,
+            ..Default::default()
+        });
+        c.flush_user_data_before_exit();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let store = c.store.as_ref().unwrap();
+        assert_eq!(store.get_daily_stat(&today).unwrap().chinese, 7);
+        drop(c);
+        let _ = std::fs::remove_dir_all(&user);
     }
 }

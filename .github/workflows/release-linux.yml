@@ -94,7 +94,9 @@ jobs:
       - name: 创建或更新 Release 并上传
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+            # 版本号带后缀即预发布,与 release.yml 的草稿同一判据
+            PRE=(); [[ "$VERSION" == *-* ]] && PRE=(--prerelease)
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft "${PRE[@]}" \
               --verify-tag --title "清风输入法 v${VERSION}" \
               --notes "Linux 测试版安装包(Ubuntu 22.04+ / Debian 系,含 Deepin)。Windows / macOS 安装包随后补充。"
           fi

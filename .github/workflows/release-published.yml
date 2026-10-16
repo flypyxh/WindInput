@@ -47,12 +47,18 @@ jobs:
       DOCS_REPO: ${{ vars.DOCS_REPO }}
       PAT: ${{ secrets.DOCS_REPO_PAT }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PRERELEASE: ${{ github.event.release.prerelease || false }}
     steps:
       # 文档仓侧由 .github/workflows/sync-changelog.yml 接收 changelog-updated,
       # 取 Release body 的 user-facing 标记块写入 data/releases.json 并开 PR 自动合并。
       # 该仓另有每天 04:00 CST 的 schedule 兜底,故此处失败只会退化为最长约一天的延迟。
       - name: 发送 repository_dispatch
         run: |
+          # 预发布不进文档站(文档仓脚本也会跳过,这里先不发,省一次空跑)。判据同 sync-to-r2。
+          if [ "$PRERELEASE" = "true" ] || [[ "${TAG#v}" == *-* ]]; then
+            echo "::notice::$TAG 是预发布版本,不通知文档仓。"
+            exit 0
+          fi
           if [ -z "$DOCS_REPO" ] || [ -z "$PAT" ]; then
             echo "::warning::未配置 vars.DOCS_REPO 或 secrets.DOCS_REPO_PAT,跳过通知;文档仓的每日 schedule 会兜底同步。"
             exit 0
@@ -75,11 +81,19 @@ jobs:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PRERELEASE: ${{ github.event.release.prerelease || false }}
     steps:
       - name: 检查 R2 配置是否完整
         id: gate
         run: |
-          if [ -z "$R2_BUCKET" ] || [ -z "$R2_BASE_URL" ] \
+          VERSION="${TAG#v}"
+          # 预发布不进 R2:latest*.json 是正式版的升级开关,写进去全体用户就会被应用内升级
+          # 推到预发布;清理步骤还会删掉上一个正式版的安装包。beta 只走 GitHub 预发布。
+          # 判据与 winget / Scoop 相同:Release 勾了 pre-release,或版本号带 '-'。
+          if [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *-* ]]; then
+            echo "::notice::$TAG 是预发布版本,不同步 R2(不改应用内升级元数据)。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$R2_BUCKET" ] || [ -z "$R2_BASE_URL" ] \
              || [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
             echo "::warning::R2 配置不完整(vars.R2_BUCKET / vars.R2_BASE_URL / secrets.CLOUDFLARE_API_TOKEN / secrets.CLOUDFLARE_ACCOUNT_ID),跳过 R2 同步。"
             echo "skip=true" >> "$GITHUB_OUTPUT"

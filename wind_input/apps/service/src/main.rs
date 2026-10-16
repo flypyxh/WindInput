@@ -405,6 +405,8 @@ fn main() {
     let coord_for_push_hook = coordinator.clone();
     let coord_for_web = coordinator.clone();
     let coord_for_restart_toast = coordinator.clone();
+    let coord_for_exit = coordinator.clone();
+    coordinator.install_exit_flush();
     deferred.set_ready(coordinator);
 
     // 三步顺序不能动（见 `PushServer::mark_ready`）：
@@ -531,6 +533,7 @@ fn main() {
 
         if RESTART.load(Ordering::SeqCst) {
             info!("Restart requested, relaunching service...");
+            coord_for_exit.flush_user_data_before_exit();
             drop(_singleton_guard);
             relaunch_self();
             std::process::exit(0);
@@ -544,6 +547,7 @@ fn main() {
     match restart_rx.recv() {
         Ok(()) => {
             info!("Restart requested, relaunching service...");
+            coord_for_exit.flush_user_data_before_exit();
             // 先释放单例 Named Mutex（关闭句柄），让新实例可获取所有权，避免竞争
             drop(_singleton_guard);
             relaunch_self();

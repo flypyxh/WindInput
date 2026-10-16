@@ -106,6 +106,14 @@ cmdbar 撤销上屏），直接追加会让被替换掉的字留在流里，制�
 
 ## 4. 存储：专用表，不是内存
 
+> **P5 更新**：草稿的真源已是用户目录 `data/<schema>/draft.dict.yaml`（表格文本，引擎快照只是加速结构）。
+>
+> **P1b 更新（用户数据存储重设计）**：草稿已从 redb 的 `DRAFT_WORDS` 表迁到运行时引擎
+> `wind-userdata`（`Runtime` 的草稿 API，经 `wind-store::Store` 门面委托）。下文「单写者抢锁」「批量
+> 写事务」的约束随之消失：引擎写入一条一次 `write`、不抢 redb 锁；有效期基准改为 `last_used`（写入即
+> 续期，语义同原「重写刷新 created_at」）；过期与容量淘汰少量时逐条删、大量时整段折回。其余（只精确召回、
+> 不建简拼、恒沉底、转正进临时词）不变。见 `docs/design/user-data-storage-plan-p1b.md`。
+
 草稿进 redb 的**专用表**，不是进程内存。
 
 初稿曾选内存（`DictLayer` 是干净的 trait，省一次 redb 往返）。**否决**，理由不是内存占用而是

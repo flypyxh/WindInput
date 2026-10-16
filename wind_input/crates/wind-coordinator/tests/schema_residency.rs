@@ -114,11 +114,15 @@ fn cache_root() -> PathBuf {
 }
 
 /// `<cache>/<id>/` 下的 `.wdat`（码表词库缓存）。
+/// 该方案目录下**最新**的 wdat。缓存按内容命名、重建写新文件且旧份保留到被 prune
+/// （`cache_fp` S2），同一时刻目录里可能有新旧两份，取 mtime 最新的才是当前这份。
 fn wdat_of(id: &str) -> Option<PathBuf> {
     std::fs::read_dir(cache_root().join(id))
         .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|x| x == "wdat"))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "wdat"))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
 }
 
 /// 每条用例的起点。`keep_all` 为 `schema.keep_all_loaded`。

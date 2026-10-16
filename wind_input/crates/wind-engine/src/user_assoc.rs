@@ -359,7 +359,7 @@ mod tests {
         wind_store::Store::open(&p).unwrap()
     }
 
-    /// ★ 连续选词（用户词 count +1、已有临时词 count +1）不让索引过期 ⇒ 不触发后台全表重建。
+    /// ★ 连续选词（已有临时词 count +1）不让索引过期 ⇒ 不触发后台全表重建。
     #[test]
     fn repeated_picks_do_not_invalidate_index() {
         let s = tmp_store("picks");
@@ -367,7 +367,6 @@ mod tests {
         s.learn_temp_word("wb", "awgg", "荷叶田田", 800, 0).unwrap();
         let idx = UserAssocIndex::build(&s, "wb");
         for _ in 0..10 {
-            s.on_word_selected("wb", "awfa", "荷载", 0, 0).unwrap();
             s.learn_temp_word("wb", "awgg", "荷叶田田", 800, 0).unwrap();
             s.increment_temp_if_exists("wb", "awgg", "荷叶田田")
                 .unwrap();
@@ -384,22 +383,15 @@ mod tests {
         assert!(idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL));
     }
 
-    /// 用户词权重变化（每 count_threshold 次 boost）是结构变化：排序键变了。
+    /// 用户词权重变化是结构变化：排序键变了。
     #[test]
-    fn user_weight_boost_invalidates_index() {
+    fn user_weight_change_invalidates_index() {
         let s = tmp_store("boost");
         s.add_user_word("wb", "awfa", "荷载", 0, 0).unwrap();
         let idx = UserAssocIndex::build(&s, "wb");
-        s.on_word_selected("wb", "awfa", "荷载", 5, 2).unwrap();
-        assert!(
-            !idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL),
-            "count=1 未到阈值"
-        );
-        s.on_word_selected("wb", "awfa", "荷载", 5, 2).unwrap();
-        assert!(
-            idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL),
-            "count=2 权重 +5"
-        );
+        assert!(!idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL));
+        s.update_user_word_weight("wb", "awfa", "荷载", 5).unwrap();
+        assert!(idx.is_stale(&s, COUNT_REBUILD_MIN_INTERVAL), "权重变了");
     }
 
     #[test]

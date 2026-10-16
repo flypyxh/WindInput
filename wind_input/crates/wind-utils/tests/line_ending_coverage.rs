@@ -121,6 +121,15 @@ const ALLOWED: &[(&str, &str)] = &[
         "parse_rss_anon_kb 解析的是内核给的 /proc/self/status，格式固定、只用 \\n 分行，\
          不是用户文件；取不到只是内存统计缺一项，不涉及数据丢失。",
     ),
+    (
+        "crates/wind-dict/src/cache_fp.rs",
+        "st_current_fp 读的是本程序自己写的缓存状态 sidecar（.st），不是用户文件；\
+         读不懂只会当缓存不新鲜、重建一次。",
+    ),
+    (
+        "crates/wind-dict/src/datformat.rs",
+        "rss_mb 解析内核给的 /proc/self/status（同 process_memory.rs），只用于构建日志。",
+    ),
     // ---- 另案：修法与其余几处不同 ----
     (
         "crates/wind-dict/src/codetable.rs",
@@ -141,15 +150,16 @@ const DELEGATED: &[(&str, &str)] = &[
         "第一步就是 split_head_body，它归一化",
     ),
     ("charset_def.rs::parse_doc", "同上"),
+    // wind-wdict 的 lib.rs
     (
-        "wdict.rs::parse_word_rows",
+        "lib.rs::parse_word_rows",
         "由 parse_words_wdict / parse_temp_words_wdict 保证",
     ),
     (
-        "wdict.rs::check_wdict_header",
+        "lib.rs::check_wdict_header",
         "拿到的 header 来自已归一化的全文",
     ),
-    ("wdict.rs::section_columns_from_header", "同上"),
+    ("lib.rs::section_columns_from_header", "同上"),
     (
         "phrase_text.rs::first_content_line",
         "由 is_phrase_text / parse_phrase_text 保证",

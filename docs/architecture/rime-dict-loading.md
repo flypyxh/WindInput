@@ -228,8 +228,9 @@ Config / active_schema
                  ├─[mixed]   → 递归 build_engine(primary/secondary/english)
                  ├─[english] → load_codetable_layers (lowercase_code=true)  :1579
                  ├─[pinyin]  → load_dictionary                              :1608
-                 │     ├─ 单库 & rime_pinyin → load_rime_pinyin_dict        :2038
-                 │     │     └─ 读头 YAML → import_tables → 各子表并行解析 → merged.wdat
+                 │     ├─ 单库 & rime_pinyin → load_rime_pinyin_dict
+                 │     │     └─ 读头 YAML → import_tables → 每张子表自己的段（load_at_with，
+                 │     │        内容寻址缓存）→ k 路归并 → WdatStreamWriter → merged-<fp>.wdat
                  │     └─ 多库 → load_merged_dicts → combined.wdat          :1948
                  └─[codetable] → load_codetable_layers                      :1710
                        └─ 每库 CachedDict::load_at_with                 cached.rs:51
@@ -311,9 +312,26 @@ DictManager（每方案一个）→ CompositeDict
 缓存根：`%LOCALAPPDATA%\WindInput[Dev]\cache\{方案名}\`。
 `CACHE_DIR` 为 None 时**回退写到源文件旁**（安装目录可能只读）。
 
+**merged 由子表段归并生成（2026-10-14，S3/S4）**：旧做法是并行解析全部子表、HashMap 聚合、
+再把 65 万条 owned 元组交给 `WdatWriter`；现在每张子表先各自成段（`CachedDict::load_at_with`，
+改了哪张只重建哪张，串行建段以免两张大表的解析峰值叠加），再用各段的 `WdatReader::codes()`
+有序游标做 k 路归并，直接喂 `WdatStreamWriter`（text 字节进池、码进连续缓冲，不建 `String`）。
+同 code 的候选按子表序拼接后按权重稳定降序，简拼由条目的音节边界推回首字母、同 (简拼, 码)
+取最大权重——与旧算法**逐字节相同**（`merge_from_segments_matches_aggregate_build` 用旧算法
+作 oracle 锁定；真实雾凇数据 md5 一致）。`WdatWriter::build` 也改为排序后喂流式写入器，两条
+路径共用一套 DAT 构建。段只做归并输入，不挂查询层。
+
+**缓存文件按内容命名（2026-10-14，S2）**：`cache_path()` 算出的 `<ns>/<stem>.wdat` 是
+**槽位**，实际文件是 `<ns>/<stem>-<指纹前 12 位>.wdat`（`cache_fp::slot_content_path`）。
+同名不同内容的源（用户目录覆盖了自带词库）各得各的文件，来回切换不再互踩；重建永远写
+新文件名，不覆盖正被 mmap 的旧文件。`.st` 挂在槽位上（`<stem>.wdat.st`）给出当前指纹，
+`.fp` 仍写在实际文件旁供二级缓存取摘要。同槽位只留最近 2 份（`cache_fp::prune_slot`），
+旧式非寻址文件升级后由它顺手清掉。merged / combined 两条合并路径同样走槽位。
+
 ### 5.2 新鲜度判定
 
-`cache_fp.rs`：sidecar `<cache>.fp` 存 SipHash 指纹。
+`cache_fp.rs`：sidecar `<cache>.fp` 存 SipHash 指纹（内容寻址之后它退居二级缓存的摘要源，
+新鲜判定本身是「指纹对应的文件在不在」）。
 
 ```rust
 fingerprint(sources) =
@@ -332,6 +350,19 @@ fingerprint(sources) =
 稳定可复用，后来补上则指纹改变、缓存正确失效。
 ⚠️ 只有 `NotFound` 这么处理；**权限/IO 故障仍返回 `None` 强制重建**——那是「读不出来」
 而非「不存在」，把瞬时故障固化进指纹会让故障恢复后继续复用错误缓存。
+
+**状态 sidecar `<cache>.st`（2026-10-14，S1）**：内容指纹要读满源，大方案一次启动的新鲜
+判定就是几百 MB 的 I/O。`.st` 记下算指纹时每个源的 `(存在性, 长度, mtime, inode, ctime)`
+以及指纹值、解析语义版本、tag；下次判新鲜先 stat，逐项相同就直接信 `.fp`、不读内容；有任何
+不同再算完整指纹，相等时把 `.st` 刷成当前状态。它**不违背**上面「不用 mtime」的原则：那里
+拒绝的是用 mtime 判「要不要重建」，这里 mtime 只决定「要不要重新算指纹」，误判的代价是多算
+一次哈希。inode 与 ctime（Unix；其余平台恒 0）是给 Flatpak / Nix 这类把 mtime 钉死的发行
+形态补的洞：换文件必换 inode，ctime 用户态改不了。两条守卫：源的 mtime 距**取 stamp 之前
+的时刻**不足 2 秒（racy 窗口，同一刻度内两次同长度写入 mtime 逐纳秒相同；基准不能取哈希
+完成后的时刻，大源哈希可能超过 2 秒）不记 stamp，写完再拿 `.st` 自身的 mtime 按同一文件
+系统时钟复核一次；`.st` 首行指纹或版本/tag 行对不上就整份忽略。Windows 上只有 len + mtime，
+刻意回拨时间戳仍可骗过快路径，逃生口是 `schema.rebuildCache`。
+设计见 `docs/design/system-dict-cache-improvements.md`。
 
 **`PARSE_SEMANTICS_VERSION` 的意义**：指纹若只覆盖源数据，它回答的是「**源文件**变了吗」，
 而真正该回答的是「这份缓存和**当前程序**会产出的结果一致吗」。两者平时重合，**恰在解析器

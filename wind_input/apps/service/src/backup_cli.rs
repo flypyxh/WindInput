@@ -26,6 +26,7 @@ const RESTORE_SECTIONS: &[&str] = &[
     "shadow",
     "phrase",
     "common_chars",
+    "quick_format",
     "charset",
     "completion",
     "schemas",

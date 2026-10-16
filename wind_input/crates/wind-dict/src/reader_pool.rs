@@ -14,6 +14,9 @@
 //! 覆盖（`CachedDict::write_cache`、combined/merged 重写、`write_comment_wcmt`）。若池持强
 //! 引用，reader 将永久驻留，重建会从「偶发失败」恶化成「永久失败」。
 //!
+//! （2026-10-14 起缓存按内容命名、重建写新文件不覆盖旧文件，rename 冲突已不再发生；
+//! `Weak` 仍是对的——旧文件要等最后一个持有者放手才能被 `prune_slot` 删掉。）
+//!
 //! 存 `Weak` 则天然保住既有的释放语义：`EngineManager::reload_from_config` 的
 //! `engines.clear()` 与 `invalidate_schema` 的 `engines.remove()` 依旧是有效释放点，
 //! 无需在池上再叠一层手工引用计数或强制关闭通道。

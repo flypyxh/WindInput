@@ -1,5 +1,6 @@
 //! wdict（.wdict.yaml）格式读写 — 复刻旧 Go pkg/dictio。
 //! 支持 phrases / words / shadow 三种 section；文件可含多段。
+//! 独立 crate（原 `wind-store::wdict`，抽出以免 `wind-dict` 为几个文本函数依赖用户库）。
 //!
 //! 文件 = `# 注释` + `wind_dict:` YAML 头 + `\n--- !<tag>\n` 分隔的 TSV 数据段。
 //! TSV 字段转义：`\`→`\\`、换行→`\n`、制表→`\t`；bool→"1"/"0"。

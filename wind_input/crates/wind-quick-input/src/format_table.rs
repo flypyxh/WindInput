@@ -236,7 +236,7 @@ const BUILTIN: &[(&str, FormatKind, &str)] = &[
     ("calc.percent", FormatKind::Calc, "{pct()}"),
 ];
 
-/// 用户对某一类格式的调整（右键菜单产生，存在 userdata.redb，**不写回格式表文件**）。
+/// 用户对某一类格式的调整（右键菜单产生，存在用户数据目录的 `quick_format.toml`，**不写回格式表文件**）。
 ///
 /// 本类型是「中立数据」：`wind-store` 有自己的可序列化记录，协调器负责转换。
 /// 两处不合并是刻意的——store 不依赖业务类型，与 shadow 同一条纪律。

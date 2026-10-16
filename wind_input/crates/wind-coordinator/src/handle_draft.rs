@@ -1,7 +1,7 @@
 //! 滑窗草稿的接线：落屏文本流 → 滑窗切分 → 异步批量落库。
 //!
 //! 状态机在 [`crate::draft_window`]（纯逻辑），存储在 `wind_store::draft_words`，
-//! 召回在 `wind_dict::store_layer::StoreDraftLayer`。本模块只做接线与 IO 调度。
+//! 召回在 `wind_store::store_layer::StoreDraftLayer`。本模块只做接线与 IO 调度。
 //! 设计见 `docs/design/auto-phrase-draft-layer.md`。
 //!
 //! # 按键路径上只做两件事

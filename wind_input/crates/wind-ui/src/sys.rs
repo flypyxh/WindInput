@@ -22,6 +22,8 @@ mod imp {
     };
     // WM_MOUSELEAVE 不在 WindowsAndMessaging 模块内，直接以字面量定义（与 Win32 一致）。
     pub const WM_MOUSELEAVE: u32 = 0x02A3;
+    /// 会话结束（注销 / 关机）。
+    pub const WM_ENDSESSION: u32 = 0x0016;
 }
 
 // 下面四条 allow 同源：本模块的 mock 是**照抄 `windows` crate 的形状**的——PascalCase 函数名、
@@ -91,6 +93,7 @@ mod imp {
     pub const WM_SETCURSOR: u32 = 0x0020;
     pub const WM_MOUSELEAVE: u32 = 0x02A3;
     pub const WM_TIMER: u32 = 0x0113;
+    pub const WM_ENDSESSION: u32 = 0x0016;
 
     // ---- 光标/窗口 API（mock：无副作用）----
     /// # Safety

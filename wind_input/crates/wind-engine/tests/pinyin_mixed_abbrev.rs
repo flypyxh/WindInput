@@ -308,7 +308,7 @@ fn user_word_mixed_abbrev_hits() {
         .add_user_word("pinyin", "daboluoge", "大菠萝哥", 500, 0b10010101)
         .unwrap();
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         store.clone(),
         "pinyin",
     )));

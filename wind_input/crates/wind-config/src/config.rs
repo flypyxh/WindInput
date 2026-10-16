@@ -9417,7 +9417,7 @@ impl Config {
         crate::variant::app_dir_name()
     }
 
-    /// 用户配置目录（config.toml / userdata.redb / 词频 / shadow 置顶删词 / 用户词库）。
+    /// 用户配置目录（config.toml / meta.toml / `data/` 下的全部用户数据 / 旧库 userdata.redb(.legacy)）。
     /// - 便携模式：`<exe目录>/userdata/`
     /// - 自定义数据目录（安装向导选定，落 `datadir.conf`）：该目录本身
     /// - 正常模式：漫游 `%APPDATA%\WindInput[Dev]`（随用户在多设备间同步）
@@ -9944,10 +9944,11 @@ impl Config {
         Self::set_user_value(path, toml::Value::Boolean(value))
     }
 
-    /// 运行时状态目录（state.toml：工具栏位置等本机状态）。
-    /// 与 `local_dir()` 相同路径，独立命名便于语义区分。
+    /// 本机**状态**目录（设计 `user-data-storage-redesign.md` §2.1）：机器写、不可再生、
+    /// 不漫游。`state.toml`、设备 id、锁、运行时快照、小文件都在这里。与 `cache/`（可删）
+    /// 和 `logs/` 并列，本机根下只有这三个目录。
     pub fn state_dir() -> Option<PathBuf> {
-        Self::local_dir()
+        Self::local_dir().map(|d| d.join("state"))
     }
 
     /// 本机状态目录（工具栏位置、日志、缓存等机器相关数据）。

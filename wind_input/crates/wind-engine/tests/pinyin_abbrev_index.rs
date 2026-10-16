@@ -163,7 +163,7 @@ fn system_and_user_abbrev_share_one_layer() {
         .add_user_word("pinyin", "daboluoge", "大菠萝哥", 500, 0b10010101)
         .unwrap();
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         store.clone(),
         "pinyin",
     )));

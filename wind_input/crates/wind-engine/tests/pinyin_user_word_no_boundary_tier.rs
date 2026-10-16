@@ -90,11 +90,11 @@ fn engine(tag: &str, max_extra: u32, shuangpin: bool) -> PinyinEngine {
         .expect("写入无边界用户词");
 
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         s.clone(),
         "pinyin",
     )));
-    dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
         s.clone(),
         "pinyin",
     )));
@@ -269,11 +269,11 @@ fn merge_branch_user_weight_applies_without_boundary() {
         .add_user_word("pinyin", CODE, MERGED, USER_WEIGHT, 0)
         .expect("写入无边界用户词");
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         store.clone(),
         "pinyin",
     )));
-    dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(store, "pinyin")));
+    dm.register_layer(Box::new(wind_store::StoreTempLayer::new(store, "pinyin")));
     let cfg = PyConfig {
         completion_min_syllables: 1,
         completion_max_extra_syllables: 5,

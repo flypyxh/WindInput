@@ -96,10 +96,19 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
 
     // 2) base/check 初始化（check=-1 表空闲），root 占位 0；空闲位置(1..)串成链表，
     //    见 FreeList 顶部说明——这是解决大规模 key 集合构建退化为平方级耗时的关键。
-    let mut base = vec![0i32; 256];
-    let mut check = vec![-1i32; 256];
+    //    按键数预留：实测 dat_size ≈ 2.3–5.2 × 键数（雾凇主表 52.5 万键 → 271 万，简拼 18.4 万
+    //    → 43 万），按 6× 预留就不再翻倍扩容——扩容要把 base/check/next/prev 四个数组各拷一遍，
+    //    那是构建期约 80 MB 瞬时峰值的来源；尾部多余的空闲最后一步裁掉，不进文件。
+    //    预留本身的常驻是 16 B × 槽数（check/next/prev 都实际写满）。它不比旧做法差：旧做法
+    //    翻倍扩容最终停在 ≥ dat_size 的 2 的幂上，即 (1–2) × dat_size ≈ (2.3–10.4) × 键数，
+    //    6× 落在这个区间里；低比例词库（简拼类 2.3×）多留一些，裁掉后 shrink_to_fit 归还。
+    let cap = (codes.len().saturating_mul(6)).max(256);
+    let mut base = vec![0i32; cap];
+    let mut check = vec![-1i32; cap];
     check[0] = 0;
-    let mut free = FreeList::new(256);
+    let mut free = FreeList::new(cap);
+    // 高分支节点的稀疏游标：见 [`find_base_sparse`]。
+    let mut sparse_cursor: usize = 1;
 
     // 3) BFS：队列保层序。
     if !codes.is_empty() {
@@ -133,7 +142,17 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
                 continue;
             }
             child_codes.sort_unstable();
-            let bv = find_base(&child_codes, &mut base, &mut check, &mut free);
+            let bv = if child_codes.len() >= HIGH_FANOUT {
+                find_base_sparse(
+                    &child_codes,
+                    &mut base,
+                    &mut check,
+                    &mut free,
+                    &mut sparse_cursor,
+                )
+            } else {
+                find_base(&child_codes, &mut base, &mut check, &mut free)
+            };
             base[s as usize] = bv;
 
             // find_base 返回前已确保下面每个目标位置都在 base/check 范围内且空闲，
@@ -161,6 +180,10 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
     }
     base.truncate(size);
     check.truncate(size);
+    // 预留的尾巴裁掉后把容量也还回去：这两个数组要活到落盘，不还的话 6× 预留里没用上的
+    // 部分（简拼类词库可能过半）会一直占着。
+    base.shrink_to_fit();
+    check.shrink_to_fit();
 
     Dat {
         base,
@@ -247,6 +270,67 @@ impl FreeList {
         } else {
             self.tail = p;
         }
+    }
+}
+
+/// 子节点数达到这个值的节点按「稀疏游标」安放（[`find_base_sparse`]）。
+///
+/// 从空闲链表头起首次适配，对小节点很好（填满头部的空洞），对高分支节点是灾难：每个候选
+/// 位置都要查全部子节点，而头部区域早被小节点填得七零八落，几十个子节点同时落空的概率
+/// 极低，于是一路试到很远——雾凇简拼 DAT 只有主表 1/3 的键，构建却比主表慢一半，正是
+/// 这个退化。darts-clone / cedar 的做法是分两个游标：高分支节点去数组尾部的稀疏区，
+/// 小节点继续填头部的洞。阈值取 4：拼音与简拼树里 ≥4 个子节点的节点占比不高但耗时占大头。
+const HIGH_FANOUT: usize = 4;
+
+/// 高分支节点的 base：从 `cursor`（上一个高分支节点落下的位置）起向后找，不回头。
+/// 游标之后的区域几乎全空，候选位置极少冲突，代价与子节点数成正比。
+/// 游标位置本身可能已被小节点占掉（它们从头部首次适配，偶尔会走到这里），先线性跳过。
+fn find_base_sparse(
+    codes: &[i32],
+    base: &mut Vec<i32>,
+    check: &mut Vec<i32>,
+    free: &mut FreeList,
+    cursor: &mut usize,
+) -> i32 {
+    let min_code = codes[0];
+    let mut pos = *cursor;
+    loop {
+        if pos >= check.len() {
+            let new_cap = base.len() * 2;
+            base.resize(new_cap, 0);
+            check.resize(new_cap, -1);
+            free.grow_to(new_cap);
+        }
+        if check[pos] != -1 {
+            pos += 1;
+            continue;
+        }
+        let b = pos as i32 - min_code;
+        if b < 1 {
+            pos += 1;
+            continue;
+        }
+        let mut conflict = false;
+        for &c in codes {
+            let tu = (b + c) as usize;
+            if tu >= check.len() {
+                let new_cap = (tu + 1).next_power_of_two().max(base.len() * 2);
+                base.resize(new_cap, 0);
+                check.resize(new_cap, -1);
+                free.grow_to(new_cap);
+            }
+            if check[tu] != -1 {
+                conflict = true;
+                break;
+            }
+        }
+        if !conflict {
+            *cursor = pos;
+            return b;
+        }
+        // 沿空闲链表前进（pos 当前空闲，next 一定指向更后面的空闲位置）
+        let nxt = free.next[pos] as usize;
+        pos = if nxt == 0 { check.len() } else { nxt };
     }
 }
 
@@ -424,6 +508,24 @@ type DatLeafRow = (u32, u16);
 /// EntryTable 一行：`(文本在共享池的偏移, 文本字节长, weight, natural_order, 音节边界位图)`。
 type DatEntryRow = (u32, u16, i32, u32, u64);
 
+/// 当前进程匿名常驻内存（MB，RssAnon），只给构建打点用；非 Linux 返回 0。
+fn rss_mb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // 取 RssAnon 而非 VmRSS：构建期间 mmap 着的段文件页也算 VmRSS，但那是文件页、
+        // 可随时回收，不是本进程的私有内存（与 Windows 看 Private 不看 WS 同理）。
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+            && let Some(kb) = s
+                .lines()
+                .find_map(|l| l.strip_prefix("RssAnon:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        {
+            return kb / 1024;
+        }
+    }
+    0
+}
+
 /// 构建完成、待落盘的 .wdat 各段（含全部区段偏移）。由 [`WdatWriter::build`] 产出。
 ///
 /// 与 [`WdatWriter`] 分开，是为了**让条目数据早点死**：`build` 消费 writer，文本进池即
@@ -460,6 +562,7 @@ impl WdatBlob {
     /// 原子写一个目标：tmp+pid+seq → rename。`&self`，故可在多个目标上重试。
     pub fn emit(&self, path: &Path) -> anyhow::Result<()> {
         use std::io::Write;
+        let t_emit = std::time::Instant::now();
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -569,37 +672,12 @@ impl WdatBlob {
             self.entries.len(),
             self.dat_size
         );
+        tracing::debug!(
+            emit_ms = t_emit.elapsed().as_millis() as u64,
+            "wdat emit done"
+        );
         Ok(())
     }
-}
-
-/// 从排序后的 (code,entries) 构建一段独立 DAT：返回 (DAT, leaves, entries)，文本入共享池。
-/// 主表与简拼表各调一次（共用同一 StringPool 去重）。
-fn build_section(
-    mut sorted: Vec<(String, Vec<WriteEntry>)>,
-    pool: &mut StringPool,
-) -> (Dat, Vec<DatLeafRow>, Vec<DatEntryRow>) {
-    let mut leaves: Vec<DatLeafRow> = Vec::with_capacity(sorted.len());
-    let mut entries: Vec<DatEntryRow> = Vec::new();
-    let mut entry_byte_off = 0u32;
-    // 先走一趟**只消费候选**：每条 text 的字节进池之后那个 `String` 就没人要了，就地
-    // 释放。`code` 留着——下面建 DAT 要借它们，那是本函数最后一步。
-    for (_, ents) in sorted.iter_mut() {
-        let ents = std::mem::take(ents);
-        leaves.push((entry_byte_off, ents.len() as u16));
-        entry_byte_off += (ents.len() * ENTRY_SIZE) as u32;
-        for (text, weight, order, boundary) in ents {
-            let text_off = pool.add(&text);
-            entries.push((text_off, text.len() as u16, weight, order, boundary));
-            // `text` 在此出作用域 —— 池里已有它的字节，这份 `String` 不必活到写盘。
-        }
-        // 这个 code 的 `Vec<WriteEntry>` 也在此归还（52 万个 code 就是 52 万次）。
-    }
-    let codes: Vec<&str> = sorted.iter().map(|(c, _)| c.as_str()).collect();
-    let dat = build_dat_from_sorted(&codes);
-    drop(codes);
-    drop(sorted); // code 串到这里才真正没人用
-    (dat, leaves, entries)
 }
 
 /// 计算 MaxW 段（v6）：`maxw[s]` = 以状态 s 为根的子树中所有条目 weight 的最大值。
@@ -783,106 +861,348 @@ impl WdatWriter {
     /// 想落盘多次（正式路径写不进去要退到临时目录、或写成了但打不开要换个地方重来）就用
     /// 这个：条目数据在这一步结束时已经释放，而 `WdatBlob::emit` 只碰那些字节。
     pub fn build(mut self) -> WdatBlob {
-        let has_abbrev = !self.abbrevs.is_empty();
-
-        // 共享字符串池：主表先入（简拼候选多与主表 text 重复 → 去重复用偏移）。
-        let mut pool = StringPool::new();
-
-        // 按 code 排序（确定性 + DAT key 唯一）。
-        //
-        // 排的是 **owned 元组**而不是从前的 `Vec<&(..)>`：消费式的 `build_section` 要把
-        // entries move 出来，持引用做不到。代价是排序搬动 32 字节的元素而非 8 字节的引用
-        // （52 万条上是毫秒级），换来的是文本能边进池边释放，而不是与池全程叠加。
+        // 按 code 排序（确定性 + DAT key 唯一）。排的是 owned 元组：下面要逐 code 把
+        // entries 喂进流式写入器后立刻释放，持引用做不到。
+        // 两条路径共用一套构建：排好序喂给流式写入器。同一输入两条路径逐字节相同，
+        // 这是 S3 对拍的基础（`stream_writer_matches_batch_writer_byte_for_byte`）。
+        let t_all = std::time::Instant::now();
         let mut keys = std::mem::take(&mut self.keys);
         keys.sort_by(|a, b| a.0.cmp(&b.0));
-        let (dat, leaves, entries) = build_section(keys, &mut pool);
+        let sort_ms = t_all.elapsed().as_millis() as u64;
+        let mut sw = WdatStreamWriter::new();
+        sw.sort_ms = sort_ms;
+        for (code, ents) in keys {
+            sw.push_code(
+                &code,
+                ents.iter().map(|(t, w, o, b)| (t.as_str(), *w, *o, *b)),
+            );
+            // `ents` 在此归还：文本已进池，这份 `String` 不必活到写盘。
+        }
+        let mut abbrevs = std::mem::take(&mut self.abbrevs);
+        abbrevs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (ab, ents) in abbrevs {
+            sw.push_abbrev_sorted(&ab, ents.iter().map(|(t, w, _, _)| (t.as_str(), *w)));
+        }
+        sw.meta = self.meta.take();
+        sw.build()
+    }
+}
 
-        let (a_dat, a_leaves, a_entries) = if has_abbrev {
-            let mut abbrevs = std::mem::take(&mut self.abbrevs);
-            abbrevs.sort_by(|a, b| a.0.cmp(&b.0));
-            let (d, l, e) = build_section(abbrevs, &mut pool);
-            (Some(d), l, e)
-        } else {
-            (None, Vec::new(), Vec::new())
-        };
+/// 流式写入器（S3）：code **按字节序严格递增**喂入，text 字节直接进池、不建 `String`；
+/// 码存进一个连续字节缓冲加偏移表，而不是几十万个 `String`。常驻 ≈ 池 + 条目行 + 码缓冲，
+/// 取代 [`WdatWriter`] 那份把全部条目以 owned 元组收满内存的做法。
+///
+/// 喂入顺序就是 DAT 的键序（由段的 [`WdatReader::codes`] 游标或排好序的内存表保证）；
+/// 简拼键同样按序喂入，各简拼下的条目顺序照原样写（调用方负责「权重降序、码升序」）。
+pub struct WdatStreamWriter {
+    pool: StringPool,
+    codes_buf: Vec<u8>,
+    code_spans: Vec<(u32, u16)>,
+    leaves: Vec<DatLeafRow>,
+    entries: Vec<DatEntryRow>,
+    entry_byte_off: u32,
+    abbrevs_buf: Vec<u8>,
+    abbrev_spans: Vec<(u32, u16)>,
+    a_leaves: Vec<DatLeafRow>,
+    a_entries: Vec<DatEntryRow>,
+    a_entry_byte_off: u32,
+    meta: Option<Vec<u8>>,
+    /// 由 [`WdatWriter::build`] 填入，只进 debug 打点。
+    sort_ms: u64,
+}
 
-        // 池的索引到这里就没用了（去重只发生在构建期），显式解构让那 8B×槽数 立刻归还
-        // ——65 万条约 10 MB，而下面还要把整个文件写一遍。
-        let StringPool {
-            buf: pool_buf,
-            slots,
-            filled: _,
-        } = pool;
-        drop(slots);
+impl Default for WdatStreamWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-        // MaxW 段（v6 剪枝上界），与各自的 DAT 同长。
-        let maxw = compute_maxw(&dat, &leaves, &entries);
-        let a_maxw = a_dat
-            .as_ref()
-            .map(|ad| compute_maxw(ad, &a_leaves, &a_entries))
-            .unwrap_or_default();
-        // 主区段偏移。base/check/maxw 三段等长，故 leaf 段起点为 dat_off + dat_size*4*3。
-        let dat_size = dat.base.len() as u32;
-        let dat_off = HEADER_SIZE as u32;
-        let leaf_off = dat_off + dat_size * 4 * 3;
-        let entry_off = leaf_off + (leaves.len() * LEAF_SIZE) as u32;
-        let str_off = entry_off + (entries.len() * ENTRY_SIZE) as u32;
-        let after_pool = str_off + pool_buf.len() as u32;
+impl WdatStreamWriter {
+    pub fn new() -> Self {
+        Self {
+            pool: StringPool::new(),
+            codes_buf: Vec::new(),
+            code_spans: Vec::new(),
+            leaves: Vec::new(),
+            entries: Vec::new(),
+            entry_byte_off: 0,
+            abbrevs_buf: Vec::new(),
+            abbrev_spans: Vec::new(),
+            a_leaves: Vec::new(),
+            a_entries: Vec::new(),
+            a_entry_byte_off: 0,
+            meta: None,
+            sort_ms: 0,
+        }
+    }
 
-        // 简拼区段（AbbrevSection）：紧跟共享池之后。自描述头 24B（6×u32）：
-        // {dat_size, leaf_count, dat_off, leaf_off, entry_off, char_map_off}。
-        const ABBREV_HDR: u32 = 24;
-        let (abbrev_off, a_dat_off, a_leaf_off, a_entry_off, a_charmap_off, after_abbrev) =
-            if let Some(ad) = &a_dat {
-                let abbrev_off = after_pool;
-                let a_dat_off = abbrev_off + ABBREV_HDR;
-                let a_dat_size = ad.base.len() as u32;
-                let a_leaf_off = a_dat_off + a_dat_size * 4 * 3;
-                let a_entry_off = a_leaf_off + (a_leaves.len() * LEAF_SIZE) as u32;
-                let a_charmap_off = a_entry_off + (a_entries.len() * ENTRY_SIZE) as u32;
-                let after = a_charmap_off + CHARMAP_SIZE as u32;
-                (
-                    abbrev_off,
-                    a_dat_off,
-                    a_leaf_off,
-                    a_entry_off,
-                    a_charmap_off,
-                    after,
-                )
-            } else {
-                (0, 0, 0, 0, 0, after_pool)
-            };
+    fn last_span<'b>(buf: &'b [u8], spans: &[(u32, u16)]) -> Option<&'b [u8]> {
+        spans
+            .last()
+            .map(|&(o, l)| &buf[o as usize..o as usize + l as usize])
+    }
 
-        let char_map_off = after_abbrev;
-        let meta_off = match &self.meta {
-            Some(m) if !m.is_empty() => char_map_off + CHARMAP_SIZE as u32,
-            _ => 0,
-        };
+    /// 喂一个 code 及其候选 `(text, weight, order, boundary)`。code 必须大于上一个（字节序），
+    /// 否则 DAT 会建错——这是调用方的不变量，违背即 panic。空候选列表的 code 跳过
+    /// （与 [`WdatWriter::add`] 一致）。
+    pub fn push_code<'a>(
+        &mut self,
+        code: &str,
+        entries: impl IntoIterator<Item = (&'a str, i32, u32, u64)>,
+    ) {
+        let mut n = 0usize;
+        let start_off = self.entry_byte_off;
+        for (text, weight, order, boundary) in entries {
+            let text_off = self.pool.add(text);
+            self.entries
+                .push((text_off, text.len() as u16, weight, order, boundary));
+            n += 1;
+        }
+        if n == 0 {
+            return;
+        }
+        if let Some(prev) = Self::last_span(&self.codes_buf, &self.code_spans) {
+            assert!(
+                code.as_bytes() > prev,
+                "WdatStreamWriter: code 必须按字节序严格递增喂入"
+            );
+        }
+        self.code_spans
+            .push((self.codes_buf.len() as u32, code.len() as u16));
+        self.codes_buf.extend_from_slice(code.as_bytes());
+        // 叶的计数是 u16：超过 65535 条只截断**计数**，条目区偏移仍按实际条数前进——
+        // 与从前 `build_section` 一致，后续叶的偏移才不会错位（release 不查溢出，
+        // 用 u16 累加会回绕）。
+        self.leaves
+            .push((start_off, n.min(u16::MAX as usize) as u16));
+        self.entry_byte_off += (n * ENTRY_SIZE) as u32;
+    }
 
-        WdatBlob {
-            dat,
+    /// 喂一个简拼键及其全拼码列表 `(code, weight)`，键须按字节序严格递增；列表顺序照写
+    /// （order 取列表序号，boundary 恒 0——简拼码不构成音节序列）。
+    pub fn push_abbrev_sorted<'a>(
+        &mut self,
+        abbrev: &str,
+        codes: impl IntoIterator<Item = (&'a str, i32)>,
+    ) {
+        let mut n = 0usize;
+        let start_off = self.a_entry_byte_off;
+        for (i, (code, weight)) in codes.into_iter().enumerate() {
+            let off = self.pool.add(code);
+            self.a_entries
+                .push((off, code.len() as u16, weight, i as u32, 0u64));
+            n += 1;
+        }
+        if n == 0 {
+            return;
+        }
+        if let Some(prev) = Self::last_span(&self.abbrevs_buf, &self.abbrev_spans) {
+            assert!(
+                abbrev.as_bytes() > prev,
+                "WdatStreamWriter: 简拼键必须按字节序严格递增喂入"
+            );
+        }
+        self.abbrev_spans
+            .push((self.abbrevs_buf.len() as u32, abbrev.len() as u16));
+        self.abbrevs_buf.extend_from_slice(abbrev.as_bytes());
+        self.a_leaves
+            .push((start_off, n.min(u16::MAX as usize) as u16));
+        self.a_entry_byte_off += (n * ENTRY_SIZE) as u32;
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.code_spans.len()
+    }
+
+    pub fn abbrev_count(&self) -> usize {
+        self.abbrev_spans.len()
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 第 `idx` 个已喂入的 code（按喂入序）。供归并侧回查简拼对应的全拼码。
+    pub fn code_at(&self, idx: usize) -> &str {
+        let (o, l) = self.code_spans[idx];
+        std::str::from_utf8(&self.codes_buf[o as usize..o as usize + l as usize]).unwrap_or("")
+    }
+
+    pub fn set_meta(&mut self, meta: Vec<u8>) {
+        self.meta = Some(meta);
+    }
+
+    fn spans_as_strs<'b>(buf: &'b [u8], spans: &[(u32, u16)]) -> Vec<&'b str> {
+        spans
+            .iter()
+            .map(|&(o, l)| {
+                std::str::from_utf8(&buf[o as usize..o as usize + l as usize]).unwrap_or("")
+            })
+            .collect()
+    }
+
+    /// 建 DAT、算 MaxW、定各段偏移。条目行与池在喂入时已成型，这里只剩两棵 DAT。
+    pub fn build(self) -> WdatBlob {
+        let t_all = std::time::Instant::now();
+        let rss_start = rss_mb();
+        tracing::debug!(
+            entries = self.entries.len(),
+            pool_bytes = self.pool.buf.len(),
+            rss_mb = rss_start,
+            "wdat section: entries pooled"
+        );
+        let codes = Self::spans_as_strs(&self.codes_buf, &self.code_spans);
+        let t_dat = std::time::Instant::now();
+        let dat = build_dat_from_sorted(&codes);
+        tracing::debug!(
+            codes = codes.len(),
+            dat_size = dat.base.len(),
+            dat_ms = t_dat.elapsed().as_millis() as u64,
+            rss_mb = rss_mb(),
+            "wdat section: DAT built"
+        );
+        drop(codes);
+        let Self {
+            pool,
+            codes_buf,
+            code_spans,
             leaves,
             entries,
-            maxw,
-            a_dat,
+            abbrevs_buf,
+            abbrev_spans,
             a_leaves,
             a_entries,
-            a_maxw,
-            pool_buf,
-            meta: self.meta,
-            dat_size,
-            dat_off,
-            leaf_off,
-            entry_off,
-            str_off,
-            abbrev_off,
-            a_dat_off,
-            a_leaf_off,
-            a_entry_off,
-            a_charmap_off,
-            char_map_off,
-            meta_off,
-        }
+            meta,
+            sort_ms,
+            ..
+        } = self;
+        drop((codes_buf, code_spans));
+        let t_main = t_all.elapsed();
+
+        let a_dat = if abbrev_spans.is_empty() {
+            None
+        } else {
+            let abbrevs = Self::spans_as_strs(&abbrevs_buf, &abbrev_spans);
+            let t_dat = std::time::Instant::now();
+            let d = build_dat_from_sorted(&abbrevs);
+            tracing::debug!(
+                codes = abbrevs.len(),
+                dat_size = d.base.len(),
+                dat_ms = t_dat.elapsed().as_millis() as u64,
+                rss_mb = rss_mb(),
+                "wdat section: abbrev DAT built"
+            );
+            Some(d)
+        };
+        drop((abbrevs_buf, abbrev_spans));
+        let t_abbrev = t_all.elapsed();
+
+        let blob = assemble_blob(dat, leaves, entries, a_dat, a_leaves, a_entries, pool, meta);
+        tracing::debug!(
+            keys = blob.leaves.len(),
+            entries = blob.entries.len(),
+            dat_size = blob.dat_size,
+            sort_ms,
+            main_section_ms = t_main.as_millis() as u64,
+            abbrev_section_ms = (t_abbrev - t_main).as_millis() as u64,
+            maxw_ms = (t_all.elapsed() - t_abbrev).as_millis() as u64,
+            total_ms = t_all.elapsed().as_millis() as u64 + sort_ms,
+            rss_start_mb = rss_start,
+            rss_end_mb = rss_mb(),
+            "wdat build stages"
+        );
+        blob
+    }
+}
+
+/// MaxW、各段偏移与 [`WdatBlob`] 组装：两条写入路径的共同尾巴。
+#[allow(clippy::too_many_arguments)]
+fn assemble_blob(
+    dat: Dat,
+    leaves: Vec<DatLeafRow>,
+    entries: Vec<DatEntryRow>,
+    a_dat: Option<Dat>,
+    a_leaves: Vec<DatLeafRow>,
+    a_entries: Vec<DatEntryRow>,
+    pool: StringPool,
+    meta: Option<Vec<u8>>,
+) -> WdatBlob {
+    // 池的索引到这里就没用了（去重只发生在构建期），显式解构让那 8B×槽数 立刻归还
+    // ——65 万条约 10 MB，而下面还要把整个文件写一遍。
+    let StringPool {
+        buf: pool_buf,
+        slots,
+        filled: _,
+    } = pool;
+    drop(slots);
+
+    // MaxW 段（v6 剪枝上界），与各自的 DAT 同长。
+    let maxw = compute_maxw(&dat, &leaves, &entries);
+    let a_maxw = a_dat
+        .as_ref()
+        .map(|ad| compute_maxw(ad, &a_leaves, &a_entries))
+        .unwrap_or_default();
+    // 主区段偏移。base/check/maxw 三段等长，故 leaf 段起点为 dat_off + dat_size*4*3。
+    let dat_size = dat.base.len() as u32;
+    let dat_off = HEADER_SIZE as u32;
+    let leaf_off = dat_off + dat_size * 4 * 3;
+    let entry_off = leaf_off + (leaves.len() * LEAF_SIZE) as u32;
+    let str_off = entry_off + (entries.len() * ENTRY_SIZE) as u32;
+    let after_pool = str_off + pool_buf.len() as u32;
+
+    // 简拼区段（AbbrevSection）：紧跟共享池之后。自描述头 24B（6×u32）：
+    // {dat_size, leaf_count, dat_off, leaf_off, entry_off, char_map_off}。
+    const ABBREV_HDR: u32 = 24;
+    let (abbrev_off, a_dat_off, a_leaf_off, a_entry_off, a_charmap_off, after_abbrev) =
+        if let Some(ad) = &a_dat {
+            let abbrev_off = after_pool;
+            let a_dat_off = abbrev_off + ABBREV_HDR;
+            let a_dat_size = ad.base.len() as u32;
+            let a_leaf_off = a_dat_off + a_dat_size * 4 * 3;
+            let a_entry_off = a_leaf_off + (a_leaves.len() * LEAF_SIZE) as u32;
+            let a_charmap_off = a_entry_off + (a_entries.len() * ENTRY_SIZE) as u32;
+            let after = a_charmap_off + CHARMAP_SIZE as u32;
+            (
+                abbrev_off,
+                a_dat_off,
+                a_leaf_off,
+                a_entry_off,
+                a_charmap_off,
+                after,
+            )
+        } else {
+            (0, 0, 0, 0, 0, after_pool)
+        };
+
+    let char_map_off = after_abbrev;
+    let meta_off = match &meta {
+        Some(m) if !m.is_empty() => char_map_off + CHARMAP_SIZE as u32,
+        _ => 0,
+    };
+
+    WdatBlob {
+        dat,
+        leaves,
+        entries,
+        maxw,
+        a_dat,
+        a_leaves,
+        a_entries,
+        a_maxw,
+        pool_buf,
+        meta,
+        dat_size,
+        dat_off,
+        leaf_off,
+        entry_off,
+        str_off,
+        abbrev_off,
+        a_dat_off,
+        a_leaf_off,
+        a_entry_off,
+        a_charmap_off,
+        char_map_off,
+        meta_off,
     }
 }
 
@@ -1003,6 +1323,54 @@ struct DatView {
     char_map: [i32; 256],
     rev_map: Vec<u8>, // 紧凑码 → 原始字节（1..=max_code）
     max_code: i32,
+}
+
+/// [`WdatReader::codes`] 的游标：显式栈 DFS，与 `for_each_leaf` 同一遍历序，但可拉式逐项取。
+pub struct CodeCursor<'a> {
+    r: &'a WdatReader,
+    /// `(状态, 进入该状态时 path 的长度, 下一个要试的紧凑码)`
+    stack: Vec<(i32, usize, i32)>,
+    path: Vec<u8>,
+    root_pending: bool,
+}
+
+impl Iterator for CodeCursor<'_> {
+    type Item = (String, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let v = &self.r.main;
+        if self.root_pending {
+            self.root_pending = false;
+            if let Some(leaf) = self.r.terminal_leaf(v, 0) {
+                return Some((String::new(), leaf));
+            }
+        }
+        while let Some(top) = self.stack.len().checked_sub(1) {
+            let (s, plen, _) = self.stack[top];
+            self.path.truncate(plen);
+            let mut descended = false;
+            while self.stack[top].2 <= v.max_code {
+                let c = self.stack[top].2;
+                self.stack[top].2 += 1;
+                let t = self.r.base(v, s) + c;
+                if !WdatReader::in_range(v, t) || self.r.check(v, t) != s {
+                    continue;
+                }
+                self.path.push(v.rev_map[c as usize]);
+                self.stack.push((t, self.path.len(), 1));
+                descended = true;
+                if let Some(leaf) = self.r.terminal_leaf(v, t) {
+                    let code = std::str::from_utf8(&self.path).unwrap_or("").to_string();
+                    return Some((code, leaf));
+                }
+                break;
+            }
+            if !descended {
+                self.stack.pop();
+            }
+        }
+        None
+    }
 }
 
 pub struct WdatReader {
@@ -1733,6 +2101,63 @@ impl WdatReader {
 
     /// 遍历全部条目（供反查索引构建）：DFS 全树**流式**回调 (code,text,weight)，
     /// 不累积全量 Vec——避免在大词库反查时堆起数十万 DictEntry（私有堆峰值/碎片）。
+    /// 主表全部 code 的**有序游标**（字节序递增，短码在长码前），每项 `(code, leaf)`；
+    /// 配合 [`Self::leaf_entries`] 读候选。供多段 k 路归并（S4）用：拉式迭代，不像
+    /// [`Self::for_each_entry`] 那样要把整段推完。
+    pub fn codes(&self) -> CodeCursor<'_> {
+        CodeCursor {
+            r: self,
+            stack: if self.main.dat_size == 0 {
+                Vec::new()
+            } else {
+                vec![(0, 0, 1)]
+            },
+            path: Vec::new(),
+            root_pending: self.main.dat_size != 0,
+        }
+    }
+
+    /// 主表里 `code` 的叶号（[`Self::codes`] 给出的同一种）；码不在表里给 `None`。
+    pub fn leaf_of(&self, code: &str) -> Option<u32> {
+        let v = &self.main;
+        if v.dat_size == 0 {
+            return None;
+        }
+        self.terminal_leaf(v, self.walk(v, code)?)
+    }
+
+    /// 某叶首条在主表条目区里的序号。条目区按喂入顺序连续排列（[`WdatStreamWriter::push_code`]），
+    /// 所以这就是该叶首条的全局序号，调用方不必自己另建「码 → 序号」表。
+    pub fn leaf_first_entry(&self, leaf: u32) -> u32 {
+        self.read_leaf(&self.main, leaf).0 / ENTRY_SIZE as u32
+    }
+
+    /// 某叶的全部候选 `(text, weight, order, boundary)`，text 直接借 mmap。
+    pub fn leaf_entries(&self, leaf: u32) -> Vec<(&str, i32, u32, u64)> {
+        let v = &self.main;
+        let (eoff, elen) = self.read_leaf(v, leaf);
+        let base = v.entry_off + eoff as usize;
+        let mut out = Vec::with_capacity(elen as usize);
+        for i in 0..elen as usize {
+            let o = base + i * ENTRY_SIZE;
+            if o + ENTRY_SIZE > self.mmap.len() {
+                break;
+            }
+            let text_off = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap());
+            let text_len = u16::from_le_bytes(self.mmap[o + 4..o + 6].try_into().unwrap());
+            let weight = i32::from_le_bytes(self.mmap[o + 6..o + 10].try_into().unwrap());
+            let order = u32::from_le_bytes(self.mmap[o + 10..o + 14].try_into().unwrap());
+            let boundary = u64::from_le_bytes(self.mmap[o + 14..o + 22].try_into().unwrap());
+            out.push((
+                self.read_string(text_off, text_len),
+                weight,
+                order,
+                boundary,
+            ));
+        }
+        out
+    }
+
     pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
         if self.main.dat_size == 0 {
             return;
@@ -2693,6 +3118,153 @@ mod tests {
             assert_eq!(res.len(), 1, "{code} 应命中");
             assert_eq!(res[0].text, format!("词{i}"));
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ───────────── S3：流式写入器与有序游标 ─────────────
+
+    /// 一份带简拼区、边界、order 与 meta 的输入，分别走批量写入器与流式写入器，
+    /// 产物逐字节相同。这是「两条路径共用一套构建」的对拍基础。
+    #[test]
+    fn stream_writer_matches_batch_writer_byte_for_byte() {
+        type Entries<'a> = Vec<(&'a str, i32, u32, u64)>;
+        let data: Vec<(&str, Entries)> = vec![
+            (
+                "nihao",
+                vec![("你好", 100, 0, 0b101), ("拟好", 20, 1, 0b101)],
+            ),
+            ("ni", vec![("你", 500, 0, 0b1), ("泥", 30, 1, 0b1)]),
+            ("xian", vec![("先", 80, 0, 0b1), ("西安", 70, 1, 0b101)]),
+            ("a", vec![("啊", 1, 0, 0b1)]),
+            ("nihaoma", vec![("你好吗", 10, 0, 0b10101)]),
+        ];
+        let abbrevs: Vec<(&str, Vec<(&str, i32)>)> = vec![
+            ("nh", vec![("nihao", 100)]),
+            ("xa", vec![("xian", 70)]),
+            ("nhm", vec![("nihaoma", 10)]),
+        ];
+        let mut batch = WdatWriter::new();
+        for (code, ents) in &data {
+            batch.add_with_boundary(
+                code.to_string(),
+                ents.iter()
+                    .map(|(t, w, o, b)| (t.to_string(), *w, *o, *b))
+                    .collect(),
+            );
+        }
+        for (ab, ents) in &abbrevs {
+            batch.add_abbrev(
+                ab.to_string(),
+                ents.iter().map(|(c, w)| (c.to_string(), *w)).collect(),
+            );
+        }
+        batch.set_meta(b"meta-bytes".to_vec());
+        let pb = std::env::temp_dir().join("wind_stream_eq_batch.wdat");
+        batch.write(&pb).unwrap();
+
+        let mut sorted = data.clone();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let mut sw = WdatStreamWriter::new();
+        for (code, ents) in &sorted {
+            sw.push_code(code, ents.iter().map(|(t, w, o, b)| (*t, *w, *o, *b)));
+        }
+        let mut ab_sorted = abbrevs.clone();
+        ab_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (ab, ents) in &ab_sorted {
+            sw.push_abbrev_sorted(ab, ents.iter().map(|(c, w)| (*c, *w)));
+        }
+        sw.set_meta(b"meta-bytes".to_vec());
+        let ps = std::env::temp_dir().join("wind_stream_eq_stream.wdat");
+        sw.build().emit(&ps).unwrap();
+
+        assert_eq!(
+            std::fs::read(&pb).unwrap(),
+            std::fs::read(&ps).unwrap(),
+            "批量与流式两条路径产物必须逐字节相同"
+        );
+        let _ = std::fs::remove_file(&pb);
+        let _ = std::fs::remove_file(&ps);
+    }
+
+    /// 同一 code 超过 65535 条候选：计数截断、偏移按实际条数前进，后续叶不错位，
+    /// 且与批量写入器逐字节相同。
+    #[test]
+    fn stream_writer_caps_leaf_count_without_misaligning_later_leaves() {
+        let big: Vec<(String, i32)> = (0..70_000).map(|i| (format!("w{i}"), 1)).collect();
+        let mut batch = WdatWriter::new();
+        batch.add("a".into(), big.clone());
+        batch.add("b".into(), vec![("乙".into(), 9)]);
+        let pb = std::env::temp_dir().join("wind_stream_cap_batch.wdat");
+        batch.write(&pb).unwrap();
+        let mut sw = WdatStreamWriter::new();
+        sw.push_code(
+            "a",
+            big.iter()
+                .enumerate()
+                .map(|(i, (t, w))| (t.as_str(), *w, i as u32, 0)),
+        );
+        sw.push_code("b", [("乙", 9, 0, 0)]);
+        let ps = std::env::temp_dir().join("wind_stream_cap_stream.wdat");
+        sw.build().emit(&ps).unwrap();
+        assert_eq!(std::fs::read(&pb).unwrap(), std::fs::read(&ps).unwrap());
+        let r = WdatReader::open(&ps).unwrap();
+        assert_eq!(r.search("a").len(), u16::MAX as usize);
+        assert_eq!(r.search("b").first().map(|e| e.text.as_str()), Some("乙"));
+        let _ = std::fs::remove_file(&pb);
+        let _ = std::fs::remove_file(&ps);
+    }
+
+    /// 乱序喂码必须 panic：这是 DAT 正确性的不变量，不能静默建错。
+    #[test]
+    #[should_panic(expected = "严格递增")]
+    fn stream_writer_rejects_unsorted_codes() {
+        let mut sw = WdatStreamWriter::new();
+        sw.push_code("b", [("乙", 1, 0, 0)]);
+        sw.push_code("a", [("甲", 1, 0, 0)]);
+    }
+
+    /// 游标按字节序严格递增、短码先于长码，且与 `for_each_entry` 的 (code,text,weight)
+    /// 序列**完全一致**（含同码多条与跨段重复）；`leaf_entries` 与精确查询一致。
+    #[test]
+    fn code_cursor_is_sorted_and_matches_for_each_entry() {
+        let p = build(
+            "wind_cursor.wdat",
+            &[
+                ("nihao", &[("你好", 100), ("拟好", 20)]),
+                ("ni", &[("你", 500)]),
+                ("", &[("空码", 1)]),
+                ("nihaoma", &[("你好吗", 10), ("你好吗", 10)]),
+                ("a", &[("啊", 1)]),
+                ("ab", &[("阿布", 2)]),
+            ],
+        );
+        let r = WdatReader::open(&p).unwrap();
+        let mut via_cursor: Vec<(String, String, i32)> = Vec::new();
+        let mut prev: Option<String> = None;
+        for (code, leaf) in r.codes() {
+            if let Some(pv) = &prev {
+                assert!(code.as_bytes() > pv.as_bytes(), "{pv:?} -> {code:?} 不递增");
+            }
+            prev = Some(code.clone());
+            let ents = r.leaf_entries(leaf);
+            let direct = r.search(&code);
+            assert_eq!(
+                ents.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(),
+                direct
+                    .iter()
+                    .map(|e| (e.text.as_str(), e.weight))
+                    .collect::<Vec<_>>(),
+                "leaf_entries 与精确查询应一致: {code}"
+            );
+            for (t, w, _, _) in ents {
+                via_cursor.push((code.clone(), t.to_string(), w));
+            }
+        }
+        let mut via_each: Vec<(String, String, i32)> = Vec::new();
+        r.for_each_entry(&mut |c, t, w| via_each.push((c.to_string(), t.to_string(), w)));
+        assert_eq!(via_cursor, via_each);
+        assert_eq!(via_cursor.len(), 8);
+        assert_eq!(via_cursor[0].0, "", "空码（根为终止态）先出");
         let _ = std::fs::remove_file(&p);
     }
 }

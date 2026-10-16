@@ -12,7 +12,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use wind_store::{Store, wdict::WordIo};
+use wind_store::Store;
+use wind_store::completion::CompletionKind;
+
+/// 负载用旧补全历史表（`legacy_*` 写读器直接走 redb）：P2–P4a 起运行期数据都不在 redb，页缓存
+/// 机制要拿仍能读写的 redb 表来测；P4b 随 redb 一起删。
+const K: CompletionKind = CompletionKind::UrlHistory;
 
 fn store(tag: &str) -> (Arc<Store>, std::path::PathBuf) {
     let p = std::env::temp_dir().join(format!("wind_dpc_{}_{tag}.redb", std::process::id()));
@@ -20,35 +25,33 @@ fn store(tag: &str) -> (Arc<Store>, std::path::PathBuf) {
     (Arc::new(Store::open(&p).expect("开库")), p)
 }
 
-fn rows(n: usize) -> Vec<WordIo> {
-    (0..n)
-        .map(|i| WordIo {
-            code: format!("a{i:04}"),
-            text: format!("词{i:04}"),
-            weight: 100,
-            count: 0,
-            boundary: None,
-        })
-        .collect()
+fn fill(s: &Store, n: usize) {
+    let rows: Vec<_> = (0..n).map(|i| (K, format!("a{i:04}"), 1, 0)).collect();
+    s.legacy_put_completions(&rows).expect("导入");
+}
+
+fn listed(s: &Store) -> Vec<String> {
+    s.legacy_scan_completions(K, "", 0).expect("扫")
 }
 
 /// 丢缓存不得丢数据——它换掉的只是 `Database` 实例，库文件原封不动。
 #[test]
 fn dropping_the_cache_keeps_every_row() {
     let (s, p) = store("rows");
-    s.import_user_words("py", &rows(500)).expect("导入");
-    let before = s.search_user_words_prefix("py", "", 0).expect("扫");
+    fill(&s, 500);
+    let before = listed(&s);
 
     s.drop_page_cache().expect("丢缓存");
 
-    let after = s.search_user_words_prefix("py", "", 0).expect("扫");
+    let after = listed(&s);
     assert_eq!(after, before, "丢缓存前后必须逐条相同");
     assert_eq!(after.len(), 500);
     assert!(!s.is_paused(), "结束时不得停在暂停态");
 
     // 还能继续写。
-    s.add_user_word("py", "zz", "新词", 100, 0).expect("写");
-    assert_eq!(s.count_user_words("py").expect("计数"), 501);
+    s.legacy_put_completions(&[(K, "zz".into(), 1, 0)])
+        .expect("写");
+    assert_eq!(listed(&s).len(), 501);
 
     let _ = std::fs::remove_file(&p);
 }
@@ -68,7 +71,7 @@ fn dropping_the_cache_keeps_every_row() {
 #[test]
 fn concurrent_reads_survive_a_cache_drop() {
     let (s, p) = store("concurrent");
-    s.import_user_words("py", &rows(2000)).expect("导入");
+    fill(&s, 2000);
 
     let stop = Arc::new(AtomicBool::new(false));
     let failures = Arc::new(AtomicUsize::new(0));
@@ -84,7 +87,7 @@ fn concurrent_reads_survive_a_cache_drop() {
             );
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    match s.search_user_words_prefix("py", "a01", 10) {
+                    match s.legacy_scan_completions(K, "a01", 10) {
                         Ok(_) => reads.fetch_add(1, Ordering::Relaxed),
                         Err(_) => failures.fetch_add(1, Ordering::Relaxed),
                     };

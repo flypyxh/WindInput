@@ -973,8 +973,8 @@ fn parse_rime_line(
     // 的「编码在前」写法手写进「文本在前」的词库，文件级判定按多数票不会为这一行让步，
     // 结果 text=`u`、code=`$SS(...)`，这条短语永远打不出来，也没有任何提示。
     // 只认 marker、不单凭 `{`：`{` 可以是编码字符集里的正经键位。
-    let (code_col, text_col) = if wind_store::wdict::is_misplaced_cmdbar_code(parts[spec.code_col])
-        && !wind_store::wdict::is_cmdbar_text(parts[spec.text_col])
+    let (code_col, text_col) = if wind_wdict::is_misplaced_cmdbar_code(parts[spec.code_col])
+        && !wind_wdict::is_cmdbar_text(parts[spec.text_col])
     {
         (spec.text_col, spec.code_col)
     } else {
@@ -1060,9 +1060,43 @@ fn parse_rime_line(
         //
         // 注：`PARSE_SEMANTICS_VERSION` 已 +1（见 `cache_fp.rs`）——本次改动会让含
         // `$CC` 且带反斜杠的词库解析出不同结果，不 bump 则存量 .wdat 静默复用旧结果。
-        text: wind_store::wdict::unescape_text_field(text),
+        text: wind_wdict::unescape_text_field(text),
         weight,
         boundary,
+    })
+}
+
+/// 文本层（`wind-userdata::text`）复用的 Rime 正文布局。规则只在本文件一份：正文起点
+/// （[`rime_body_offset`]）、`# no comment`（[`find_no_comment_directive`]）、列规格
+/// （[`resolve_columns`]：`columns:` 声明优先，否则探测）。
+pub struct RimeLayout {
+    pub body_offset: usize,
+    pub comment_cutoff: Option<usize>,
+    pub text_col: usize,
+    pub code_col: usize,
+    pub weight_col: Option<usize>,
+}
+
+/// 只要正文起点与 `# no comment` 位置、不判列的布局：自带 `columns:` 表头、列名不限于
+/// text / code 的表格文本（`wind-userdata::text::table`）用。返回 `(body_offset, comment_cutoff)`，
+/// 两者都是相对整个 `content` 的字节偏移。
+pub fn rime_body_layout(content: &str) -> Option<(usize, Option<usize>)> {
+    let body_offset = rime_body_offset(content)?;
+    let cutoff = find_no_comment_directive(&content[body_offset..]);
+    Some((body_offset, cutoff.map(|c| c + body_offset)))
+}
+
+pub fn rime_layout(content: &str, path: &Path) -> Option<RimeLayout> {
+    let body_offset = rime_body_offset(content)?;
+    let body = &content[body_offset..];
+    let cutoff = find_no_comment_directive(body);
+    let spec = resolve_columns(content, body, path, cutoff)?;
+    Some(RimeLayout {
+        body_offset,
+        comment_cutoff: cutoff.map(|c| c + body_offset),
+        text_col: spec.text_col,
+        code_col: spec.code_col,
+        weight_col: spec.weight_col,
     })
 }
 
@@ -2453,5 +2487,21 @@ columns:
                 }
             }
         }
+    }
+    #[test]
+    fn rime_layout_exposes_body_columns_and_comment_cutoff() {
+        let content = "---\nname: x\ncolumns:\n  - code\n  - text\n  - weight\n...\n# 注释\nni\t你\t1\n# no comment\n#hash\t井\t2\n";
+        let l = rime_layout(content, std::path::Path::new("x.dict.yaml")).unwrap();
+        assert!(content[l.body_offset..].starts_with("# 注"));
+        assert_eq!((l.text_col, l.code_col, l.weight_col), (1, 0, Some(2)));
+        let cut = l.comment_cutoff.unwrap();
+        assert!(content[cut..].starts_with("# no comment"));
+        assert!(rime_layout("no body marker", std::path::Path::new("y")).is_none());
+        let d = rime_layout("---\n...\n你好\tnihao\n", std::path::Path::new("z")).unwrap();
+        assert_eq!(
+            (d.text_col, d.code_col, d.weight_col),
+            (0, 1, Some(2)),
+            "未声明 = librime 默认列序"
+        );
     }
 }

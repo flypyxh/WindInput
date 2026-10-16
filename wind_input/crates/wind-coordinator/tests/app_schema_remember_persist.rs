@@ -91,7 +91,7 @@ fn remembered_schema_survives_restart() {
         std::env::set_var("WIND_INSTALL_ROOT", &root);
     }
     let user = root.join("userdata");
-    let state = root.join("localdata/state.toml");
+    let state = root.join("localdata/state/state.toml");
     assert_eq!(
         Config::user_config_dir(),
         Some(user.clone()),
@@ -99,7 +99,7 @@ fn remembered_schema_survives_restart() {
     );
     assert_eq!(
         Config::state_dir(),
-        Some(root.join("localdata")),
+        Some(root.join("localdata/state")),
         "前置条件：本机状态目录须已重定向，否则会改掉开发者本机的 state.toml"
     );
 

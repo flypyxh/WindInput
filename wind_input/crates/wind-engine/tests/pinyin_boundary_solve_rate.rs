@@ -47,13 +47,25 @@ use wind_engine::pinyin::syllable::SyllableTrie;
 /// 而这正是本仓「词库测试假绿」的经典形态。找不到就直接失败。
 fn merged_wdat() -> PathBuf {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    // 缓存按内容命名：`rime_frost.merged-<fp>.wdat`，多份时取最新的
     let candidates = [
-        PathBuf::from(&local).join("WindInputDev/cache/pinyin/rime_frost.merged.wdat"),
-        PathBuf::from(&local).join("WindInput/cache/pinyin/rime_frost.merged.wdat"),
+        PathBuf::from(&local).join("WindInputDev/cache/pinyin"),
+        PathBuf::from(&local).join("WindInput/cache/pinyin"),
     ];
-    for c in &candidates {
-        if c.is_file() {
-            return c.clone();
+    for dir in &candidates {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let newest = rd
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("rime_frost.merged-") && n.ends_with(".wdat"))
+            })
+            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+        if let Some(e) = newest {
+            return e.path();
         }
     }
     panic!(

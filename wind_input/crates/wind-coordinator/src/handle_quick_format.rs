@@ -5,8 +5,8 @@
 //! | 落点 | 内容 | 谁写 |
 //! |---|---|---|
 //! | `data/system.quick.toml` | 格式模板与出厂顺序 | 出厂 / 高级用户手写 |
-//! | `userdata.redb` 的 `quick_format` 表 | 用户的调序与停用 | 本模块（右键） |
-//! | [`Coordinator::quick_adjust`] | 上一行的运行时镜像 | 本模块（写库时同步） |
+//! | `<userdata>/data/quick_format.toml` | 用户的调序与停用 | 本模块（右键） |
+//! | [`Coordinator::quick_adjust`] | 上一行的运行时镜像 | 本模块（写入时同步） |
 //!
 //! **GUI 调整绝不回写 `system.quick.toml`**：那会抢走高级用户手写文件的所有权
 //! （重写丢注释与排版），更糟的是让普通用户点两下右键就永久脱离出厂更新——

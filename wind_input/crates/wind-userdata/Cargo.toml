@@ -1,0 +1,21 @@
+[package]
+name = "wind-userdata"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-dict = { path = "../wind-dict" }
+wind-candidate = { path = "../wind-candidate" }
+wind-wdict = { path = "../wind-wdict" }
+wind-utils = { path = "../wind-utils" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+crc32fast = "1"
+memmap2 = "0.9"
+uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -1764,6 +1764,10 @@ impl Coordinator {
         // `take_input_on_schema_switch`）。
         let commit = self.take_input_on_schema_switch();
         if self.engine_mgr.switch_schema(schema_id) {
+            // 切到的方案若手改过用户词文本，切过去就生效（设计 §5）。
+            if let Some(store) = &self.store {
+                store.sync_user_text(&self.engine_mgr.data_schema_id(schema_id));
+            }
             self.finish_user_schema_switch(schema_id, "Switched to schema");
             // 切过来的方案有段被降级 ⇒ 现在说，别等用户自己发现「这个方案某项设置没反应」。
             // 落在切换成功之后：加载失败已由上面的 `show_tip` 交代，两条提示不会撞。

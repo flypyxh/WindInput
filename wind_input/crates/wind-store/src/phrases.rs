@@ -3,12 +3,12 @@
 //! 与 Go 版本 `wind_input/internal/store/phrases.go` 对齐。短语是**全局**的（不分方案）：
 //! code（触发码）→ text（上屏内容，可为字面量或 cmdbar 模板如 `$date`）。
 //!
-//! PHRASES 表，key=`"{code}\0{text}"`（store.md §2），value = PhraseValue 的 JSON
-//! （短语数量少、写入低频，JSON 足够）。系统短语来自 data/system.phrases.toml（wind-phrase
-//! 层），此处只存**用户**短语；resetDefault = 清空用户短语。
+//! P3 起真源是 `<userdata>/user/phrases.dict.yaml`（设计 §2.2）：系统短语来自
+//! `system.phrases.toml`（协调器经 [`Store::set_system_phrases`] 交进来，只在内存），文件里只记
+//! 用户行与「对系统条目的修改」行（`overrides_system = 1`），读时叠加。旧 redb `PHRASES` 表
+//! （key=`"{code}\0{text}"`，value = PhraseValue 的 JSON）只供迁移读。
 
 use crate::store::{PHRASES, Store};
-use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
 /// 待同步的系统短语（来自 TOML，已做 platform 过滤）。
@@ -124,51 +124,182 @@ fn split_phrase_key(key: &str) -> Option<(&str, &str)> {
     Some((it.next()?, it.next()?))
 }
 
-impl Store {
-    /// 列举全部用户短语（按 code\0text 升序）。
-    pub fn list_phrases(&self) -> anyhow::Result<Vec<PhraseRecord>> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(PHRASES)?;
-            let mut out = Vec::new();
-            for item in t.range::<&str>(..)? {
-                let (k, v) = item?;
-                if let (Some((code, text)), Ok(val)) = (
-                    split_phrase_key(k.value()),
-                    serde_json::from_slice::<PhraseValue>(v.value()),
-                ) {
-                    out.push(PhraseRecord {
-                        code: code.to_string(),
-                        text: text.to_string(),
-                        weight: val.weight,
-                        position: val.position,
-                        enabled: val.enabled,
-                        is_system: val.is_system,
-                        overrides_system: val.overrides_system,
-                        category: val.category,
-                    });
-                }
-            }
-            Ok(out)
-        })
+/// 短语文件的列（设计 §2.2）。
+pub const PHRASE_COLS: &[&str] = &[
+    "code",
+    "text",
+    "weight",
+    "position",
+    "enabled",
+    "category",
+    "overrides_system",
+];
+
+/// 文件里的一行。`overrides_system = true`：对同键系统条目的修改（归属仍是系统）；否则是用户行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileRow {
+    code: String,
+    text: String,
+    weight: i32,
+    position: i32,
+    enabled: bool,
+    category: String,
+    overrides_system: bool,
+}
+
+impl FileRow {
+    fn fields(&self) -> Vec<String> {
+        vec![
+            self.code.clone(),
+            self.text.clone(),
+            self.weight.to_string(),
+            self.position.to_string(),
+            if self.enabled { "1" } else { "0" }.into(),
+            self.category.clone(),
+            if self.overrides_system { "1" } else { "0" }.into(),
+        ]
     }
 
-    /// 新增/覆盖一条用户短语。
-    ///
-    /// **归属用户优先**：撞上同 `(code, text)` 的系统行时把它转为用户行
-    /// （`is_system=false`）并置 [`PhraseRecord::overrides_system`]——用户建的那条生效，
-    /// 系统条目从「系统短语」列表隐去。这与 `sync_system_phrases` 对用户行的既有处理
-    /// （「跳过，让用户行遮蔽同键的系统条目」）是同一条规则。
-    ///
-    /// ⚠️ **此处的行为被反转过两次，改前先读完这段**：
-    /// - 最早也是转用户行，但当时**不可自愈**——`sync_system_phrases` 的
-    ///   `!cur.is_system → continue` 永远跳过它，系统条目再也回不来，现象是
-    ///   「系统短语莫名少了一条」；
-    /// - 于是改成保留 `is_system=true`，结果变成反方向的
-    ///   「用户新建的短语在用户列表里看不到」（`list_user_phrases_paged` 按 `!is_system` 过滤）；
-    /// - 现在回到转用户行，**可逆性由两条路补齐**：「系统恢复默认」经
-    ///   [`Self::reclaim_system_phrases`] 按 TOML 对照认领回系统归属；「清空用户短语」
-    ///   删掉该行后由调用方补一次 sync 重新插入系统条目。缺了这两条就会退回第一种毛病。
+    fn key(&self) -> (String, String) {
+        (self.code.clone(), self.text.clone())
+    }
+}
+
+fn file_rows(doc: &wind_userdata::text::table::TableDoc) -> Vec<FileRow> {
+    let flag = |s: &str, default: bool| match s.trim() {
+        "" => default,
+        v => v != "0",
+    };
+    doc.rows
+        .iter()
+        .filter(|r| !doc.get(r, "code").is_empty() && !doc.get(r, "text").is_empty())
+        .map(|r| FileRow {
+            code: doc.get(r, "code").to_string(),
+            text: doc.get(r, "text").to_string(),
+            weight: doc
+                .get(r, "weight")
+                .trim()
+                .parse()
+                .unwrap_or(DEFAULT_USER_PHRASE_WEIGHT),
+            position: doc.get(r, "position").trim().parse().unwrap_or(0),
+            enabled: flag(doc.get(r, "enabled"), true),
+            category: doc.get(r, "category").to_string(),
+            overrides_system: flag(doc.get(r, "overrides_system"), false),
+        })
+        .collect()
+}
+
+/// 叠加视图（设计 §2.2）：系统条目（来自 TOML，内存）∪ 文件行。修改行改写同键系统条目的字段、
+/// 归属仍是系统；用户行与系统条目同键 ⇒ 遮蔽它（`overrides_system = true`）；系统里已没有的
+/// 修改行不呈现（TOML 同步时删掉）。按 `code\0text` 升序。
+fn overlay(sys: &[SystemPhrase], rows: &[FileRow]) -> Vec<PhraseRecord> {
+    use std::collections::BTreeMap;
+    let mut m: BTreeMap<(String, String), PhraseRecord> = sys
+        .iter()
+        .map(|e| {
+            (
+                (e.code.clone(), e.text.clone()),
+                PhraseRecord {
+                    code: e.code.clone(),
+                    text: e.text.clone(),
+                    weight: e.weight,
+                    position: e.position,
+                    enabled: true,
+                    is_system: true,
+                    overrides_system: false,
+                    category: e.category.clone(),
+                },
+            )
+        })
+        .collect();
+    for r in rows {
+        let in_sys = m.get(&r.key()).is_some_and(|p| p.is_system);
+        if r.overrides_system && !in_sys {
+            continue;
+        }
+        m.insert(
+            r.key(),
+            PhraseRecord {
+                code: r.code.clone(),
+                text: r.text.clone(),
+                weight: r.weight,
+                position: r.position,
+                enabled: r.enabled,
+                is_system: r.overrides_system,
+                overrides_system: !r.overrides_system && in_sys,
+                category: r.category.clone(),
+            },
+        );
+    }
+    m.into_values().collect()
+}
+
+impl Store {
+    /// 用户短语文件：`<text_dir>/phrases.dict.yaml`（全局，不分方案）。
+    pub fn phrases_path(&self) -> std::path::PathBuf {
+        self.user_text_dir().join("phrases.dict.yaml")
+    }
+
+    fn phrase_table(&self) -> std::sync::Arc<wind_userdata::text::table::TextTable> {
+        self.phrase_table
+            .get_or_init(|| {
+                std::sync::Arc::new(wind_userdata::text::table::TextTable::open(
+                    self.phrases_path(),
+                    PHRASE_COLS,
+                    "phrases",
+                ))
+            })
+            .clone()
+    }
+
+    fn system_phrases(&self) -> std::sync::Arc<Vec<SystemPhrase>> {
+        self.phrase_sys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn file_phrase_rows(&self) -> Vec<FileRow> {
+        file_rows(&self.phrase_table().doc())
+    }
+
+    /// 改写若干键的文件行（`None` = 删掉该键的行），一次提交。写前按文件现状重新解析（手改优先）。
+    fn put_phrase_rows(
+        &self,
+        rows: Vec<((String, String), Option<FileRow>)>,
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let edits: Vec<_> = rows
+            .into_iter()
+            .map(|((c, t), r)| (vec![c, t], r.map(|r| vec![r.fields()]).unwrap_or_default()))
+            .collect();
+        self.phrase_table().edit(&edits, &["code", "text"])
+    }
+
+    fn find_phrase(&self, code: &str, text: &str) -> Option<PhraseRecord> {
+        self.phrase_table().sync();
+        overlay(&self.system_phrases(), &self.file_phrase_rows())
+            .into_iter()
+            .find(|p| p.code == code && p.text == text)
+    }
+
+    /// 设定系统短语（来自 `system.phrases.toml`，已做 platform 过滤）。协调器每次启动都调；短语迁移
+    /// 标记缺失时先把旧表迁成文本（要 TOML 才分得清系统行被改过没有）。
+    pub fn set_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<()> {
+        *self.phrase_sys.write().unwrap_or_else(|e| e.into_inner()) =
+            std::sync::Arc::new(entries.to_vec());
+        self.migrate_p3_phrases_if_needed(entries)
+    }
+
+    /// 列举全部短语（叠加视图，按 code\0text 升序）。
+    pub fn list_phrases(&self) -> anyhow::Result<Vec<PhraseRecord>> {
+        Ok(overlay(&self.system_phrases(), &self.file_phrase_rows()))
+    }
+
+    /// 新增/覆盖一条用户短语。**归属用户优先**：撞上同键系统条目即遮蔽它（列表里标
+    /// [`PhraseRecord::overrides_system`]）；同键的修改行被这条用户行取代。
     pub fn add_phrase(
         &self,
         code: &str,
@@ -176,63 +307,28 @@ impl Store {
         position: i32,
         weight: i32,
     ) -> anyhow::Result<()> {
-        let shadows_system = self.get_phrase(code, text)?.is_some_and(|c| c.is_system);
-        self.put_phrase(
-            code,
-            text,
-            PhraseValue {
+        self.put_phrase_rows(vec![(
+            (code.into(), text.into()),
+            Some(FileRow {
+                code: code.into(),
+                text: text.into(),
                 weight,
                 position,
                 enabled: true,
-                // 用户优先：撞键即转为用户行，输入期与列表都以用户这条为准。
-                is_system: false,
-                overrides_system: shadows_system,
                 // 新建的用户短语未分类。分类目前只能由系统短语 TOML 声明或将来的 GUI 设置。
                 category: String::new(),
-            },
-        )
+                overrides_system: false,
+            }),
+        )])
     }
 
-    fn put_phrase(&self, code: &str, text: &str, val: PhraseValue) -> anyhow::Result<()> {
-        let key = phrase_key(code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(PHRASES)?;
-                let bytes = serde_json::to_vec(&val)?;
-                t.insert(key.as_str(), bytes.as_slice())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-    }
-
-    /// 取一条短语（无则 None）。
-    fn get_phrase(&self, code: &str, text: &str) -> anyhow::Result<Option<PhraseValue>> {
-        let key = phrase_key(code, text);
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(PHRASES)?;
-            Ok(t.get(key.as_str())?
-                .and_then(|g| serde_json::from_slice::<PhraseValue>(g.value()).ok()))
-        })
-    }
-
-    /// 删除一条短语（不存在静默成功）。
+    /// 删除一条短语的文件行（不存在静默成功）。删的是用户行或修改行；系统条目随之恢复默认。
     pub fn remove_phrase(&self, code: &str, text: &str) -> anyhow::Result<()> {
-        let key = phrase_key(code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(PHRASES)?;
-                t.remove(key.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
+        self.put_phrase_rows(vec![((code.into(), text.into()), None)])
     }
 
-    /// 编辑短语：可改 code/text（键变化时 remove+add）/position/weight。保留 enabled/is_system。
+    /// 编辑短语：可改 code/text/position/weight，保留 enabled 与分类。系统条目不改键 ⇒ 写修改行
+    /// （归属仍是系统）；系统条目改键 ⇒ 原键写一行停用的修改行、新键作为用户行。
     pub fn update_phrase(
         &self,
         code: &str,
@@ -242,121 +338,154 @@ impl Store {
         position: Option<i32>,
         weight: Option<i32>,
     ) -> anyhow::Result<()> {
-        let cur = self.get_phrase(code, text)?.unwrap_or(PhraseValue {
-            weight: 0,
-            position: 0,
-            enabled: true,
-            is_system: false,
-            overrides_system: false,
-            category: String::new(),
-        });
+        let cur = self.find_phrase(code, text);
         let nc = new_code.unwrap_or(code);
         let nt = new_text.unwrap_or(text);
-        let val = PhraseValue {
-            weight: weight.unwrap_or(cur.weight),
-            position: position.unwrap_or(cur.position),
-            enabled: cur.enabled,
-            is_system: cur.is_system,
-            // 编辑既有条目不改归属：在系统短语列表里调权重仍是系统条目，不因此转成用户行。
-            // 本位只记录 `add_phrase` 撞键形成的遮蔽关系。
-            overrides_system: cur.overrides_system,
-            // 编辑既有条目不改分类——本函数改的是 code/text/weight/position。
-            category: cur.category.clone(),
+        let is_system = cur.as_ref().is_some_and(|c| c.is_system);
+        let (w0, p0, en, cat) = cur
+            .map(|c| (c.weight, c.position, c.enabled, c.category))
+            .unwrap_or((0, 0, true, String::new()));
+        let moved = nc != code || nt != text;
+        let new_row = FileRow {
+            code: nc.into(),
+            text: nt.into(),
+            weight: weight.unwrap_or(w0),
+            position: position.unwrap_or(p0),
+            enabled: en,
+            category: cat.clone(),
+            overrides_system: is_system && !moved,
         };
-        // 键改变 → 先删旧键
-        if nc != code || nt != text {
-            self.remove_phrase(code, text)?;
+        let mut rows = Vec::new();
+        if moved {
+            let old = if is_system {
+                Some(FileRow {
+                    code: code.into(),
+                    text: text.into(),
+                    weight: w0,
+                    position: p0,
+                    enabled: false,
+                    category: cat,
+                    overrides_system: true,
+                })
+            } else {
+                None
+            };
+            rows.push(((code.to_string(), text.to_string()), old));
         }
-        self.put_phrase(nc, nt, val)
+        rows.push(((nc.to_string(), nt.to_string()), Some(new_row)));
+        self.put_phrase_rows(rows)
     }
 
-    /// 设置启停。
+    /// 设置启停。系统条目写修改行；都不存在 ⇒ 写一条用户行（同旧语义）。
     pub fn set_phrase_enabled(&self, code: &str, text: &str, enabled: bool) -> anyhow::Result<()> {
-        let mut cur = self.get_phrase(code, text)?.unwrap_or(PhraseValue {
-            weight: 0,
-            position: 0,
-            enabled: true,
-            is_system: false,
-            overrides_system: false,
-            category: String::new(),
-        });
-        cur.enabled = enabled;
-        self.put_phrase(code, text, cur)
+        let row = match self.find_phrase(code, text) {
+            Some(c) => FileRow {
+                code: code.into(),
+                text: text.into(),
+                weight: c.weight,
+                position: c.position,
+                enabled,
+                category: c.category,
+                overrides_system: c.is_system,
+            },
+            None => FileRow {
+                code: code.into(),
+                text: text.into(),
+                weight: 0,
+                position: 0,
+                enabled,
+                category: String::new(),
+                overrides_system: false,
+            },
+        };
+        self.put_phrase_rows(vec![((code.into(), text.into()), Some(row))])
     }
 
-    /// TOML 内容哈希标记（判断是否需要重新同步系统短语）。
+    /// 系统短语同步哈希的文件：`<text_dir>/phrases.sys_hash`。它描述的是「短语文件里的修改行
+    /// 已按哪一版系统 TOML 归一过」，所以跟着短语文件（用户目录）走——放本机状态目录的话，换机 /
+    /// 清 state 后哈希缺失会触发一次同步，把用户对系统短语的修改重置回出厂。
+    pub fn phrase_sys_hash_path(&self) -> std::path::PathBuf {
+        self.user_text_dir().join("phrases.sys_hash")
+    }
+
+    /// TOML 内容哈希标记（判断是否需要重新同步系统短语），见 [`Self::phrase_sys_hash_path`]。
     pub fn phrase_sys_hash(&self) -> anyhow::Result<Option<String>> {
-        self.meta_get("phrase_sys_hash")
+        let p = self.phrase_sys_hash_path();
+        Ok(wind_userdata::text::fold::read_text(&p)?
+            .map(|(b, _)| String::from_utf8_lossy(&b).trim().to_string())
+            .filter(|s| !s.is_empty()))
     }
 
     pub fn set_phrase_sys_hash(&self, h: &str) -> anyhow::Result<()> {
-        self.meta_set("phrase_sys_hash", h)
+        let p = self.phrase_sys_hash_path();
+        wind_userdata::text::fold::commit_text(&p, format!("{h}\n").as_bytes(), None)
     }
 
-    /// 把系统短语同步进 PHRASES 表（is_system=true）：
-    /// 已存在 (code,text) → 更新 weight/position，保留 enabled；不存在 → 插入 enabled=true；
-    /// 表内 is_system=true 但不在本次列表的 → 删除。用户短语(is_system=false)不动。
+    /// 旧 META 里的 `phrase_sys_hash`（P4a 迁移用）。
+    pub(crate) fn legacy_phrase_sys_hash(&self) -> anyhow::Result<Option<String>> {
+        self.meta_get("phrase_sys_hash")
+    }
+
+    /// 系统短语 TOML 变了：设定新的系统条目；修改行的 weight / position / category 回到 TOML 值、
+    /// 保留 enabled；TOML 里已没有的键，其修改行删掉。用户行不动（遮蔽照旧）。
     pub fn sync_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<SyncStats> {
-        use std::collections::HashSet;
-        let mut stats = SyncStats::default();
-        let wanted: HashSet<(String, String)> = entries
+        use std::collections::{HashMap, HashSet};
+        let prev: HashSet<(String, String)> = self
+            .system_phrases()
             .iter()
             .map(|e| (e.code.clone(), e.text.clone()))
             .collect();
-
-        // 1. 删除过时系统短语
-        let existing = self.list_phrases()?;
-        for p in &existing {
-            if p.is_system && !wanted.contains(&(p.code.clone(), p.text.clone())) {
-                self.remove_phrase(&p.code, &p.text)?;
+        *self.phrase_sys.write().unwrap_or_else(|e| e.into_inner()) =
+            std::sync::Arc::new(entries.to_vec());
+        self.phrase_table().sync();
+        let rows = self.file_phrase_rows();
+        let users: HashSet<(String, String)> = rows
+            .iter()
+            .filter(|r| !r.overrides_system)
+            .map(FileRow::key)
+            .collect();
+        let wanted: HashMap<(String, String), &SystemPhrase> = entries
+            .iter()
+            .map(|e| ((e.code.clone(), e.text.clone()), e))
+            .collect();
+        let mut stats = SyncStats::default();
+        for k in &prev {
+            if !wanted.contains_key(k) && !users.contains(k) {
                 stats.removed += 1;
             }
         }
-        // 2. upsert
-        for e in entries {
-            match self.get_phrase(&e.code, &e.text)? {
-                Some(cur) => {
-                    // 用户行（is_system=false）优先：跳过，让用户行遮蔽同键的系统条目。
-                    // 若强制改写为 is_system=true，一旦该系统条目从 TOML 移除，
-                    // 删除过时系统项的路径会把这条用户短语一并静默删除。
-                    if !cur.is_system {
-                        continue;
-                    }
-                    let val = PhraseValue {
-                        weight: e.weight,
-                        position: e.position,
-                        enabled: cur.enabled, // 保留开关
-                        is_system: true,
-                        // 本分支只处理已是系统行的条目（用户行在上面 continue 掉了），
-                        // 系统行不存在遮蔽关系。
-                        overrides_system: false,
-                        // 分类随 TOML 刷新：它是系统短语定义的一部分，与 weight/position 同源。
-                        category: e.category.clone(),
-                    };
-                    self.put_phrase(&e.code, &e.text, val)?;
-                    stats.updated += 1;
-                }
-                None => {
-                    self.put_phrase(
-                        &e.code,
-                        &e.text,
-                        PhraseValue {
-                            weight: e.weight,
-                            position: e.position,
-                            enabled: true,
-                            is_system: true,
-                            overrides_system: false,
-                            category: e.category.clone(),
-                        },
-                    )?;
-                    stats.added += 1;
-                }
+        for k in wanted.keys() {
+            if users.contains(k) {
+                continue;
+            }
+            if prev.contains(k) {
+                stats.updated += 1;
+            } else {
+                stats.added += 1;
             }
         }
+        let mut edits = Vec::new();
+        for r in rows.iter().filter(|r| r.overrides_system) {
+            match wanted.get(&r.key()) {
+                Some(e) => {
+                    let nr = FileRow {
+                        weight: e.weight,
+                        position: e.position,
+                        category: e.category.clone(),
+                        ..r.clone()
+                    };
+                    if &nr != r {
+                        edits.push((r.key(), Some(nr)));
+                    }
+                }
+                None => edits.push((r.key(), None)),
+            }
+        }
+        self.put_phrase_rows(edits)?;
         Ok(stats)
     }
 
-    /// 系统短语（is_system=true），按 key 升序，不分页。
+    /// 系统短语（叠加视图里归属系统的），按 key 升序，不分页。
     pub fn list_system_phrases(&self) -> anyhow::Result<Vec<PhraseRecord>> {
         Ok(self
             .list_phrases()?
@@ -398,34 +527,32 @@ impl Store {
             .collect())
     }
 
-    /// 系统"恢复默认"：is_system=true 行全部 enabled=true。返回改动条数。
+    /// 系统"恢复默认"：修改行全部 enabled=1。返回改动条数。
     pub fn reset_system_enabled(&self) -> anyhow::Result<usize> {
-        let mut n = 0;
-        for p in self.list_phrases()? {
-            if p.is_system && !p.enabled {
-                self.set_phrase_enabled(&p.code, &p.text, true)?;
-                n += 1;
-            }
-        }
+        self.phrase_table().sync();
+        let edits: Vec<_> = self
+            .file_phrase_rows()
+            .into_iter()
+            .filter(|r| r.overrides_system && !r.enabled)
+            .map(|r| (r.key(), Some(FileRow { enabled: true, ..r })))
+            .collect();
+        let n = edits.len();
+        self.put_phrase_rows(edits)?;
         Ok(n)
     }
 
-    /// 用户"清空"：删 is_system=false 行。返回删除条数。
-    ///
-    /// ⚠️ 这会连**遮蔽了系统条目的行**（`overrides_system`）一起删掉——它们归属用户。
-    /// 删后该 `(code,text)` 在库里彻底消失，被遮蔽的系统条目也随之不见，调用方**必须补一次**
-    /// `sync_system_phrases` 把它插回来（见 `Coordinator::resync_system_phrases_after_user_reset`）。
-    /// sync 平时只在 TOML 哈希变动或「系统恢复默认」时才跑，不补就要等到下次哈希变化。
+    /// 用户"清空"：删全部用户行（含遮蔽系统条目的），保留对系统条目的修改。返回删除条数。
+    /// 被遮蔽的系统条目随之重新呈现，无需再补 sync。
     pub fn reset_user_phrases(&self) -> anyhow::Result<usize> {
-        let users: Vec<PhraseRecord> = self
-            .list_phrases()?
+        self.phrase_table().sync();
+        let edits: Vec<_> = self
+            .file_phrase_rows()
             .into_iter()
-            .filter(|p| !p.is_system)
+            .filter(|r| !r.overrides_system)
+            .map(|r| (r.key(), None))
             .collect();
-        let n = users.len();
-        for p in users {
-            self.remove_phrase(&p.code, &p.text)?;
-        }
+        let n = edits.len();
+        self.put_phrase_rows(edits)?;
         Ok(n)
     }
 
@@ -447,85 +574,72 @@ impl Store {
         Ok(crate::wdict::export_phrases_wdict(&rows, exported_at))
     }
 
-    /// 导入用户短语（合并 upsert）。返回 (导入条数, 跳过条数)。
-    ///
-    /// 与 [`Self::add_phrase`] 同口径：导入的是**用户**短语，撞上同键系统行即遮蔽它
-    /// （转用户行 + 置 `overrides_system`）。导入是撞键的高发路径（用户常在导出文件里
-    /// 手工增删行），可逆性同样依赖「系统恢复默认」的 reclaim 与清空后的 sync 补齐。
+    /// 导入用户短语（合并 upsert，一次提交）。返回 (导入条数, 跳过条数)。撞上同键系统条目即遮蔽它。
     pub fn import_user_phrases_wdict(&self, text: &str) -> anyhow::Result<(usize, usize)> {
         let (rows, skipped) =
             crate::wdict::parse_phrases_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         let imported = rows.len();
-        for r in rows {
-            let cur = self.get_phrase(&r.code, &r.text)?;
-            // 撞系统行 → 记下遮蔽关系；撞已有用户行 → 沿用它原本的遮蔽标记。
-            let overrides_system = cur
-                .as_ref()
-                .map(|c| c.is_system || c.overrides_system)
-                .unwrap_or(false);
-            self.put_phrase(
-                &r.code,
-                &r.text,
-                PhraseValue {
+        let edits = rows
+            .into_iter()
+            .map(|r| {
+                let row = FileRow {
+                    code: r.code,
+                    text: r.text,
                     weight: r.weight,
                     position: r.position,
                     enabled: r.enabled,
-                    is_system: false,
-                    overrides_system,
-                    // 分发导入的短语不带分类：`PhraseIo` 是跨设备传输格式，给它加字段
-                    // 是导入导出契约的变更，与本需求无关。导入后落为未分类。
+                    // 分发导入的短语不带分类（`PhraseIo` 是跨设备传输格式），导入后落为未分类。
                     category: String::new(),
-                },
-            )?;
-        }
+                    overrides_system: false,
+                };
+                (row.key(), Some(row))
+            })
+            .collect();
+        self.put_phrase_rows(edits)?;
         Ok((imported, skipped))
     }
 
-    /// 分发导入时一条短语的落点。
-    ///
-    /// 与 wdict 导入（备份语义、整表 upsert）不同，分发导入**只新增、不改动既有条目**：
-    /// 别人的包无权改写接收者已有短语的权重与位置。
+    /// 分发导入时一条短语的落点（只新增、不改动既有条目）。
     pub fn plan_phrase_import(
         &self,
         items: &[(String, String)],
     ) -> anyhow::Result<Vec<PhraseImportStatus>> {
-        items
+        let all = self.list_phrases()?;
+        Ok(items
             .iter()
-            .map(|(code, text)| {
-                Ok(match self.get_phrase(code, text)? {
+            .map(
+                |(code, text)| match all.iter().find(|p| &p.code == code && &p.text == text) {
                     None => PhraseImportStatus::New,
                     Some(cur) if cur.is_system => PhraseImportStatus::ShadowsSystem,
                     Some(_) => PhraseImportStatus::ExistsUser,
-                })
-            })
-            .collect()
+                },
+            )
+            .collect())
     }
 
-    /// 分发导入：新条目**追加到末尾**，已存在的用户短语原样跳过。
-    ///
-    /// ★ position 由本地重新分配，不取分发文本里的值——分发格式压根不带 position，
-    /// 正是因为照抄分发者的位置会打乱接收者既有短语的顺序。这与 wdict 导入
-    /// （[`Self::import_user_phrases_wdict`] 原样写入 position，备份还原要求逐字还原）
-    /// 是**刻意相反**的两种语义，别把其中一处「顺手统一」掉。
-    ///
-    /// `text` 必须已是**存储域**文本（调用方过 `unescape_text_field`），与手动新增
-    /// 走同一个转换——出入口必须成对。
+    /// 分发导入：新条目**追加到末尾**（position 由本地重新分配），已存在的用户短语原样跳过
+    /// （连 enabled 也不动）。一次提交。`text` 必须已是存储域文本。
     pub fn import_phrases_appending(
         &self,
         items: &[(String, String)],
         weight: i32,
     ) -> anyhow::Result<PhraseImportReport> {
-        let mut next_pos = self
-            .list_phrases()?
+        let all = self.list_phrases()?;
+        let mut next_pos = all
             .iter()
             .map(|p| p.position)
             .max()
             .unwrap_or(-1)
             .saturating_add(1);
         let mut rep = PhraseImportReport::default();
+        let mut edits = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for (code, text) in items {
-            match self.get_phrase(code, text)? {
-                // 已有用户行：连 enabled 也不动——用户停用过的条目不该被一次导入悄悄启用。
+            if !seen.insert((code.clone(), text.clone())) {
+                rep.skipped_existing += 1;
+                continue;
+            }
+            match all.iter().find(|p| &p.code == code && &p.text == text) {
                 Some(cur) if !cur.is_system => {
                     rep.skipped_existing += 1;
                     continue;
@@ -533,98 +647,190 @@ impl Store {
                 Some(_) => rep.shadowed_system += 1,
                 None => {}
             }
-            self.add_phrase(code, text, next_pos, weight)?;
+            let row = FileRow {
+                code: code.clone(),
+                text: text.clone(),
+                weight,
+                position: next_pos,
+                enabled: true,
+                category: String::new(),
+                overrides_system: false,
+            };
+            edits.push((row.key(), Some(row)));
             next_pos = next_pos.saturating_add(1);
             rep.added += 1;
         }
+        self.put_phrase_rows(edits)?;
         Ok(rep)
     }
 
-    /// 只把**缺失**的系统条目补回库里，已存在的行一律不动。返回补回条数。
-    ///
-    /// **与 [`Self::sync_system_phrases`] 的区别是要点**：sync 会用 TOML 值覆盖已存在系统行的
-    /// weight/position（「以文件为准」，供「恢复默认」与 TOML 变更时用），本函数一个字节都不改。
-    ///
-    /// 用于「用户短语被清空后，把被遮蔽的系统条目补回来」：遮蔽行归属用户
-    /// （见 [`Self::add_phrase`]），`reset_user_phrases` 会连它一起删掉，该 `(code,text)` 遂
-    /// 彻底消失。这条路**不能用 sync**——用户的动作只是清空用户短语，顺带把他在系统短语
-    /// 列表里改过的权重重置掉是越界的副作用。
+    /// 设定系统条目（同 [`Self::set_system_phrases`]，不改任何文件行）；返回此前不在系统列表、
+    /// 也没有文件行的条目数——即「补回来」的条数。系统条目总在叠加视图里，清空用户短语后被遮蔽
+    /// 的条目自动重新呈现，本函数只为保持旧接口的语义。
     pub fn ensure_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<usize> {
-        let mut n = 0;
-        for e in entries {
-            if self.get_phrase(&e.code, &e.text)?.is_none() {
-                self.put_phrase(
-                    &e.code,
-                    &e.text,
-                    PhraseValue {
-                        weight: e.weight,
-                        position: e.position,
-                        enabled: true,
-                        is_system: true,
-                        overrides_system: false,
-                        category: e.category.clone(),
-                    },
-                )?;
-                n += 1;
-            }
-        }
-        Ok(n)
+        let before: std::collections::HashSet<(String, String)> = self
+            .list_phrases()?
+            .into_iter()
+            .map(|p| (p.code, p.text))
+            .collect();
+        self.set_system_phrases(entries)?;
+        Ok(entries
+            .iter()
+            .filter(|e| !before.contains(&(e.code.clone(), e.text.clone())))
+            .count())
     }
 
-    /// 把「(code,text) 命中系统短语表、但库里是用户行」的记录**认领回系统行**，
-    /// 返回认领条数。供「恢复默认」显式调用。
-    ///
-    /// 这是「用户短语遮蔽系统条目」（[`Self::add_phrase`]）的**撤销路径**，也修复历史上被
-    /// 降级的存量数据。认领后归属回到系统、遮蔽标记清零，紧随其后的 `sync_system_phrases`
-    /// 会把 weight/position 刷回 TOML 定义。
-    ///
-    /// 不放进 [`Self::sync_system_phrases`]：那条路径每次启动都可能跑，无法区分「遮蔽了系统
-    /// 条目的用户行」与「用户自建的同款短语」，静默认领会让后者在该条目从 TOML 移除时被
-    /// 连带删除。「恢复默认」是显式用户动作，认领语义与其名称相符，且只改归属、不删文本。
+    /// 「恢复默认」：键在 TOML 里的用户行**认领回系统**（转成修改行，字段保留；紧随其后的
+    /// `sync_system_phrases` 把 weight/position 刷回 TOML）。返回认领条数。
     pub fn reclaim_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<usize> {
-        let mut n = 0;
-        for e in entries {
-            match self.get_phrase(&e.code, &e.text)? {
-                Some(cur) if !cur.is_system => {
-                    self.put_phrase(
-                        &e.code,
-                        &e.text,
-                        PhraseValue {
-                            is_system: true,
-                            overrides_system: false,
-                            ..cur
-                        },
-                    )?;
-                    n += 1;
-                }
-                _ => {}
-            }
-        }
+        let keys: std::collections::HashSet<(String, String)> = entries
+            .iter()
+            .map(|e| (e.code.clone(), e.text.clone()))
+            .collect();
+        self.phrase_table().sync();
+        let edits: Vec<_> = self
+            .file_phrase_rows()
+            .into_iter()
+            .filter(|r| !r.overrides_system && keys.contains(&r.key()))
+            .map(|r| {
+                (
+                    r.key(),
+                    Some(FileRow {
+                        overrides_system: true,
+                        ..r
+                    }),
+                )
+            })
+            .collect();
+        let n = edits.len();
+        self.put_phrase_rows(edits)?;
         Ok(n)
     }
 
-    /// 重置为默认：清空全部用户短语，返回删除条数。
+    /// 重置为默认：清空短语文件（用户行与修改行），返回删除条数。
     pub fn reset_phrases(&self) -> anyhow::Result<usize> {
+        let n = self.file_phrase_rows().len();
+        self.phrase_table().replace_all(&[])?;
+        Ok(n)
+    }
+
+    /// 手改的短语文件重新载入。变了返回 true（调用方据此重建输入期短语层）。
+    pub fn sync_phrases(&self) -> bool {
+        self.phrase_table().sync()
+    }
+
+    /// 测试 / 探针：往旧 `PHRASES` 表写一条（模拟升级前的库）。
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn legacy_put_phrase(
+        &self,
+        code: &str,
+        text: &str,
+        weight: i32,
+        position: i32,
+        enabled: bool,
+        is_system: bool,
+        overrides_system: bool,
+        category: &str,
+    ) -> anyhow::Result<()> {
+        let key = phrase_key(code, text);
+        let bytes = serde_json::to_vec(&PhraseValue {
+            weight,
+            position,
+            enabled,
+            is_system,
+            overrides_system,
+            category: category.into(),
+        })?;
         self.with_db(|db| {
             let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(PHRASES)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range::<&str>(..)? {
-                        ks.push(item?.0.value().to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in keys {
-                    t.remove(k.as_str())?;
+            txn.open_table(PHRASES)?
+                .insert(key.as_str(), bytes.as_slice())?;
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 旧 `PHRASES` 表全部行（迁移用）。
+    pub(crate) fn legacy_phrase_rows(&self) -> anyhow::Result<Vec<PhraseRecord>> {
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(PHRASES)?;
+            let mut out = Vec::new();
+            for item in t.range::<&str>(..)? {
+                let (k, v) = item?;
+                if let (Some((code, text)), Ok(val)) = (
+                    split_phrase_key(k.value()),
+                    serde_json::from_slice::<PhraseValue>(v.value()),
+                ) {
+                    out.push(PhraseRecord {
+                        code: code.to_string(),
+                        text: text.to_string(),
+                        weight: val.weight,
+                        position: val.position,
+                        enabled: val.enabled,
+                        is_system: val.is_system,
+                        overrides_system: val.overrides_system,
+                        category: val.category,
+                    });
                 }
             }
-            txn.commit()?;
-            Ok(n)
+            Ok(out)
         })
+    }
+
+    /// 迁移用：把旧表行转成文件行，写入文件里还没有的键（文件里已有的以文件为准），一次提交。
+    pub(crate) fn merge_legacy_phrases(&self, sys: &[SystemPhrase]) -> anyhow::Result<usize> {
+        use std::collections::{HashMap, HashSet};
+        let sysm: HashMap<(&str, &str), &SystemPhrase> = sys
+            .iter()
+            .map(|e| ((e.code.as_str(), e.text.as_str()), e))
+            .collect();
+        self.phrase_table().sync();
+        let have: HashSet<(String, String)> =
+            self.file_phrase_rows().iter().map(FileRow::key).collect();
+        let mut edits = Vec::new();
+        for p in self.legacy_phrase_rows()? {
+            let row = if !p.is_system {
+                FileRow {
+                    code: p.code,
+                    text: p.text,
+                    weight: p.weight,
+                    position: p.position,
+                    enabled: p.enabled,
+                    category: p.category,
+                    overrides_system: false,
+                }
+            } else {
+                match sysm.get(&(p.code.as_str(), p.text.as_str())) {
+                    // TOML 里已没有的旧系统行：同旧 sync，丢弃
+                    None => continue,
+                    Some(e)
+                        if e.weight == p.weight
+                            && e.position == p.position
+                            && e.category == p.category
+                            && p.enabled =>
+                    {
+                        continue;
+                    }
+                    Some(_) => FileRow {
+                        code: p.code,
+                        text: p.text,
+                        weight: p.weight,
+                        position: p.position,
+                        enabled: p.enabled,
+                        category: p.category,
+                        overrides_system: true,
+                    },
+                }
+            };
+            if !have.contains(&row.key()) {
+                edits.push((row.key(), Some(row)));
+            }
+        }
+        let n = edits.len();
+        self.put_phrase_rows(edits)?;
+        Ok(n)
     }
 }
 
@@ -949,12 +1155,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 撤销路径二：「清空用户短语」删掉遮蔽行后，补一次 sync 能把系统条目插回来。
-    ///
-    /// **`reset_user_phrases` 自身不做这件事**（store 层拿不到 TOML），由调用方补——
-    /// 不补就是当年那个「系统短语莫名少一条」的 bug，故在此锁死这个前后顺序。
+    /// 撤销路径二：「清空用户短语」删掉遮蔽行后，系统条目**立即**重新呈现（P3 叠加模型：系统条目
+    /// 来自 TOML、只在内存，从不随用户行一起消失——当年「系统短语莫名少一条」的病根不复存在）。
     #[test]
-    fn clearing_user_phrases_then_sync_restores_shadowed_system_entry() {
+    fn clearing_user_phrases_restores_shadowed_system_entry() {
         let path = tmp("wind_phrases_clear_restore.redb");
         let s = Store::open(&path).unwrap();
         let sys = [SystemPhrase {
@@ -967,25 +1171,17 @@ mod tests {
         s.sync_system_phrases(&sys).unwrap();
         s.add_phrase("date", "$Y年$M月$D日", 9, 5000).unwrap();
 
-        // 清空用户短语：遮蔽行归属用户，会被删掉 → 该 (code,text) 在库里彻底消失。
+        // 清空用户短语：遮蔽行归属用户，会被删掉 → 系统条目以 TOML 定义值重新呈现。
         assert_eq!(s.reset_user_phrases().unwrap(), 1);
-        assert!(
-            s.list_phrases().unwrap().is_empty(),
-            "清空后系统条目也一并不见——这正是必须补 sync 的原因"
-        );
-
-        // 调用方补的那次 sync 把系统条目插回来，且是 TOML 定义值。
-        s.sync_system_phrases(&sys).unwrap();
         let after = s.list_system_phrases().unwrap();
         assert_eq!(after.len(), 1, "系统条目应被补回");
         assert_eq!((after[0].weight, after[0].position), (1000, 1));
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `ensure_system_phrases` 只补缺失、**绝不改动已存在的行**。
-    ///
-    /// 这条性质是它存在的全部理由：用 sync 代替它，一次「清空用户短语」就会把用户在系统
-    /// 短语列表里改过的权重/次序重置回 TOML 默认值——用户没要求这件事。
+    /// `ensure_system_phrases` **绝不改动已存在的行**（用 sync 代替它，一次「清空用户短语」就会
+    /// 把用户在系统短语列表里改过的权重/次序重置回 TOML 默认值）。P3 叠加模型下系统条目总在，
+    /// 删掉修改行即恢复默认，没有「缺口」可补，返回 0。
     #[test]
     fn ensure_system_phrases_only_fills_gaps() {
         let path = tmp("wind_phrases_ensure.redb");
@@ -1012,10 +1208,10 @@ mod tests {
         s.update_phrase("a", "甲", None, None, Some(9), Some(5555))
             .unwrap();
         s.set_phrase_enabled("b", "乙", false).unwrap();
-        // 「乙」被删掉（模拟遮蔽行被 reset_user_phrases 连带清掉后的缺口）
+        // 删掉「乙」的修改行 ⇒ 乙恢复默认（启用），不会出现缺口
         s.remove_phrase("b", "乙").unwrap();
 
-        assert_eq!(s.ensure_system_phrases(&sys).unwrap(), 1, "只补回缺失的乙");
+        assert_eq!(s.ensure_system_phrases(&sys).unwrap(), 0, "没有缺口");
 
         let list = s.list_system_phrases().unwrap();
         let a = list.iter().find(|p| p.code == "a").unwrap();
@@ -1024,7 +1220,10 @@ mod tests {
             (5555, 9),
             "已存在的行一字不改——这正是不能用 sync 的原因"
         );
-        assert!(list.iter().any(|p| p.code == "b"), "缺失的补回");
+        assert!(
+            list.iter().any(|p| p.code == "b" && p.enabled),
+            "删掉修改行 = 恢复默认"
+        );
 
         // 幂等：再补一次不重复插入。
         assert_eq!(s.ensure_system_phrases(&sys).unwrap(), 0);
@@ -1200,5 +1399,128 @@ mod tests {
             "同键更新权重"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn sys(code: &str, text: &str, w: i32) -> SystemPhrase {
+        SystemPhrase {
+            code: code.into(),
+            text: text.into(),
+            weight: w,
+            position: 0,
+            category: String::new(),
+        }
+    }
+
+    /// 短语落文本：用户行进 phrases.dict.yaml；系统条目不进文件；修改系统条目写一行 overrides_system=1。
+    #[test]
+    fn phrases_live_in_text_as_overlay() {
+        let s = Store::open(tmp("wind_ph_text.redb")).unwrap();
+        s.set_system_phrases(&[sys("rq", "{date}", 100), sys("sj", "{time}", 100)])
+            .unwrap();
+        s.add_phrase("yx", "me@x.com", 0, 1800).unwrap();
+        s.set_phrase_enabled("sj", "{time}", false).unwrap();
+        let f = std::fs::read_to_string(s.phrases_path()).unwrap();
+        assert!(f.contains("yx\tme@x.com\t1800\t0\t1\t\t0"), "{f}");
+        assert!(f.contains("sj\t{time}\t100\t0\t0\t\t1"), "{f}");
+        assert!(!f.contains("rq\t"), "未改的系统条目不进文件");
+        let input: Vec<String> = s
+            .enabled_phrases_for_input()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.code)
+            .collect();
+        assert!(input.contains(&"rq".to_string()) && input.contains(&"yx".to_string()));
+        assert!(!input.contains(&"sj".to_string()));
+        let sj = s
+            .list_system_phrases()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.code == "sj")
+            .unwrap();
+        assert!(sj.is_system && !sj.enabled);
+    }
+
+    /// TOML 升级 ⇒ 修改行回到新 TOML 的权重、保留禁用；TOML 删掉的条目连同修改行消失。
+    #[test]
+    fn toml_upgrade_resets_edits_but_keeps_disabled() {
+        let s = Store::open(tmp("wind_ph_upgrade.redb")).unwrap();
+        s.set_system_phrases(&[sys("a", "甲", 10), sys("b", "乙", 10), sys("c", "丙", 10)])
+            .unwrap();
+        s.set_phrase_enabled("a", "甲", false).unwrap();
+        s.update_phrase("b", "乙", None, None, None, Some(99))
+            .unwrap();
+        s.set_phrase_enabled("c", "丙", false).unwrap();
+        let new = [sys("a", "甲", 20), sys("b", "乙", 30)];
+        s.set_system_phrases(&new).unwrap();
+        s.sync_system_phrases(&new).unwrap();
+        let all = s.list_phrases().unwrap();
+        let get = |c: &str| all.iter().find(|p| p.code == c).cloned();
+        assert_eq!(get("a").map(|p| (p.weight, p.enabled)), Some((20, false)));
+        assert_eq!(get("b").map(|p| (p.weight, p.enabled)), Some((30, true)));
+        assert!(get("c").is_none());
+        assert!(
+            !std::fs::read_to_string(s.phrases_path())
+                .unwrap()
+                .contains("丙")
+        );
+    }
+
+    /// 用户行遮蔽系统条目；清空用户短语后系统条目恢复，对系统条目的修改保留。
+    #[test]
+    fn user_rows_shadow_and_reset_keeps_system_edits() {
+        let s = Store::open(tmp("wind_ph_shadowing.redb")).unwrap();
+        s.set_system_phrases(&[sys("a", "甲", 10), sys("b", "乙", 10)])
+            .unwrap();
+        s.add_phrase("a", "甲", 3, 500).unwrap();
+        let a = s
+            .list_phrases()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.code == "a")
+            .unwrap();
+        assert!(!a.is_system && a.overrides_system && a.weight == 500);
+        s.set_phrase_enabled("b", "乙", false).unwrap();
+        s.reset_user_phrases().unwrap();
+        let all = s.list_phrases().unwrap();
+        let a = all.iter().find(|p| p.code == "a").unwrap();
+        assert!(a.is_system && a.weight == 10);
+        assert!(
+            !all.iter().find(|p| p.code == "b").unwrap().enabled,
+            "对系统条目的修改保留"
+        );
+    }
+
+    /// phrase_sys_hash 离开 redb：落用户目录（跟着短语文件走），重开读回。
+    #[test]
+    fn phrase_sys_hash_lives_beside_phrases_file() {
+        let p = tmp("wind_ph_hash_state.redb");
+        {
+            let s = Store::open(&p).unwrap();
+            s.set_phrase_sys_hash("h1").unwrap();
+            assert!(s.phrase_sys_hash_path().is_file());
+            assert_eq!(s.phrase_sys_hash_path().parent(), Some(s.user_text_dir()));
+        }
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.phrase_sys_hash().unwrap().as_deref(), Some("h1"));
+    }
+
+    /// 审查 I-4：系统短语同步哈希随用户目录走——本机状态目录是新的（换机 / 清 state）时不得丢失，
+    /// 否则会触发一次同步、把用户对系统短语的修改重置回出厂。
+    #[test]
+    fn phrase_sys_hash_roams_with_user_dir() {
+        let base = std::env::temp_dir().join(format!("wind_ph_hash_roam_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let loc = |st: &str| crate::store::StateLoc {
+            state_dir: base.join(st),
+            dir_id: "d".into(),
+            text_dir: base.join(crate::DATA_DIR_NAME),
+            legacy_done: false,
+        };
+        {
+            let s = Store::open_with_state(base.join("a.redb"), loc("state1")).unwrap();
+            s.set_phrase_sys_hash("h1").unwrap();
+        }
+        let s = Store::open_with_state(base.join("b.redb"), loc("state2")).unwrap();
+        assert_eq!(s.phrase_sys_hash().unwrap().as_deref(), Some("h1"));
     }
 }

@@ -480,6 +480,37 @@ fn runtime_wdat(src: &std::path::Path) -> Option<PathBuf> {
     ))
 }
 
+/// 槽位的**内容寻址变体**（`<stem>-<指纹12位>.wdat`，缓存是按内容命名的，见
+/// `cache_fp` S2）。多份时取最新的；一份都没有 ⇒ None。
+fn runtime_wdat_actual(src: &std::path::Path) -> Option<PathBuf> {
+    let slot = runtime_wdat(src)?;
+    let dir = slot.parent()?;
+    let prefix = format!("{}-", slot.file_stem()?.to_str()?);
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with(&prefix) && name.ends_with(".wdat")) {
+            continue;
+        }
+        let mt = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _)| mt > *t) {
+            best = Some((mt, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 清掉槽位下全部变体（含旧式文件与 `.fp`），让「是否重新生成」成为干净的判据。
+fn purge_runtime_wdat(slot: &std::path::Path) {
+    wind_dict::cache_fp::prune_slot(slot, std::path::Path::new("/nonexistent"), 0);
+}
+
 /// 未启用的扩展词库**不该被加载**，于是也不该在缓存里留下 wdat（t107）。
 ///
 /// 缺陷期 `load_codetable_layers` 无条件加载全部扩展库（注释写着「含禁用的，全部加载常驻，
@@ -510,13 +541,7 @@ fn disabled_extra_dict_leaves_no_wdat_cache() {
     };
 
     // 清掉缺陷期遗留的产物, 让「是否重新生成」成为干净的判据。
-    let _ = std::fs::remove_file(&wdat);
-    let fp = {
-        let mut t = wdat.clone().into_os_string();
-        t.push(".fp");
-        PathBuf::from(t)
-    };
-    let _ = std::fs::remove_file(&fp);
+    purge_runtime_wdat(&wdat);
 
     let cfg = make_config(&["wubi86"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
@@ -527,13 +552,13 @@ fn disabled_extra_dict_leaves_no_wdat_cache() {
         "前提：主库应能出候选，否则下面测的是「整条链没跑」而非本改动"
     );
     assert!(
-        main_wdat.exists(),
+        runtime_wdat_actual(&main_src).is_some(),
         "前提：主库缓存应生成 —— 它不在说明加载链整个坏了: {}",
         main_wdat.display()
     );
 
     assert!(
-        !wdat.exists(),
+        runtime_wdat_actual(&src).is_none(),
         "未启用的扩展库不该被加载, 更不该留下 wdat 缓存: {}",
         wdat.display()
     );
@@ -585,20 +610,20 @@ fn disabling_dict_releases_wdat_file_lock() {
         return;
     }
     let main_src = dir.join("schemas/wubi86/wubi86_jidian.dict.yaml");
-    let (Some(wdat), Some(main_wdat)) = (runtime_wdat(&src), runtime_wdat(&main_src)) else {
+    if wind_config::Config::cache_dir().is_none() {
         eprintln!("跳过：本机取不到缓存根");
         return;
-    };
+    }
 
     let cfg = make_config(&["wubi86"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
     let cands = mgr.convert("aaaa", 20).candidates;
     assert!(!cands.is_empty(), "前提：引擎应已构建并出候选");
-    assert!(
-        wdat.exists(),
-        "前提：启用的扩展库应已建出缓存: {}",
-        wdat.display()
-    );
+    // 缓存按内容命名，建好之后才知道实际文件名
+    let (Some(wdat), Some(main_wdat)) = (runtime_wdat_actual(&src), runtime_wdat_actual(&main_src))
+    else {
+        panic!("前提：启用的扩展库与主库应已建出缓存: {}", src.display());
+    };
 
     // ⚠️ 判据必须走 **`DeleteFileW`**，不能用 Rust std（实测踩过两次）：
     // `remove_file` 在新版 Windows 上走 POSIX 删除语义（`FileDispositionInfoEx`），

@@ -12,6 +12,11 @@
 
 use std::time::Instant;
 use wind_store::Store;
+use wind_store::completion::CompletionKind;
+
+/// 负载用旧补全历史表（`legacy_*` 写读器直接走 redb）：P2–P4a 起运行期数据都不在 redb，页缓存
+/// 机制要拿仍能读写的 redb 表来测；P4b 随 redb 一起删。
+const K: CompletionKind = CompletionKind::UrlHistory;
 
 #[test]
 #[ignore = "观测，须设 WIND_DB 指向用户库副本"]
@@ -25,18 +30,14 @@ fn time_drop_page_cache_on_a_real_store() {
     println!("开库 {:?}", t.elapsed());
     for round in 1..=5 {
         let t = Instant::now();
-        let n = s
-            .search_user_words_prefix("pinyin", "", 0)
-            .expect("全表扫")
-            .len();
+        // P2 / P3 起用户词与短语不在 redb；全表扫换成仍在 redb 的补全历史表
+        let n = s.legacy_scan_completions(K, "", 0).expect("全表扫").len();
         let scan = t.elapsed();
         let t = Instant::now();
         s.drop_page_cache().expect("回收");
         let drop = t.elapsed();
         let t = Instant::now();
-        let _ = s
-            .search_user_words_prefix("pinyin", "ni", 20)
-            .expect("冷查询");
+        let _ = s.legacy_scan_completions(K, "ni", 20).expect("冷查询");
         let cold = t.elapsed();
         println!(
             "第 {round} 轮：全表扫 {n} 条 {scan:?}；关库重开 {drop:?}；随后一次窄查询（冷） {cold:?}"

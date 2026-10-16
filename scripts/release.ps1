@@ -246,12 +246,13 @@ function Confirm-Step ([string]$prompt, [bool]$defaultYes = $false, [bool]$ignor
 # ---------- 语义化版本 ----------
 function ConvertTo-SemVer ([string]$v) {
     $v = ($v -replace '^v', '').Trim()
-    if ($v -notmatch '^(\d+)\.(\d+)\.(\d+)(?:[-+.](.+))?$') { return $null }
+    # 与 release.sh 的 valid_version 同一口径: x.y.z 或 x.y.z-段.段 (段为字母数字)。
+    if ($v -notmatch '^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$') { return $null }
     [pscustomobject]@{
         Major = [int]$Matches[1]
         Minor = [int]$Matches[2]
         Patch = [int]$Matches[3]
-        Pre   = $Matches[4]           # 预发布后缀, 如 alpha / beta1
+        Pre   = $Matches[4]           # 预发布后缀, 如 beta.1
         Raw   = $v
     }
 }
@@ -263,10 +264,26 @@ function Compare-SemVer ($a, $b) {
     # 同 X.Y.Z 时: 正式版 > 预发布版 (v1.0.0 比 v1.0.0-beta 新)
     $ap = [bool]$a.Pre; $bp = [bool]$b.Pre
     if ($ap -ne $bp) { if ($ap) { return -1 } else { return 1 } }
-    if ($a.Pre -ne $b.Pre) { return [string]::Compare($a.Pre, $b.Pre) }
+    if ($a.Pre -ne $b.Pre) { return Compare-PreRelease $a.Pre $b.Pre }
     return 0
 }
+# 预发布后缀按点分段比: 数字段按数值 (beta.2 < beta.10), 其余按字符串; 段数少的在前。
+function Compare-PreRelease ([string]$a, [string]$b) {
+    $as = $a -split '\.'; $bs = $b -split '\.'
+    for ($i = 0; $i -lt [Math]::Min($as.Count, $bs.Count); $i++) {
+        $x = $as[$i]; $y = $bs[$i]
+        if ($x -match '^\d+$' -and $y -match '^\d+$') {
+            if ([long]$x -ne [long]$y) { return [Math]::Sign([long]$x - [long]$y) }
+        } elseif ($x -ne $y) {
+            return [string]::CompareOrdinal($x, $y)
+        }
+    }
+    return $as.Count - $bs.Count
+}
+# 预发布 (x.y.z-…) 的下一个版本是它的正式版 x.y.z, 不论哪一级——beta 之后要发的就是那个号。
+# ⚠️ 与 release.sh 的 bump_version 同算法。
 function Step-Version ($sv, [string]$level) {
+    if ($sv.Pre) { return "{0}.{1}.{2}" -f $sv.Major, $sv.Minor, $sv.Patch }
     switch ($level) {
         "patch" { "{0}.{1}.{2}" -f $sv.Major, $sv.Minor, ($sv.Patch + 1) }
         "minor" { "{0}.{1}.0"   -f $sv.Major, ($sv.Minor + 1) }

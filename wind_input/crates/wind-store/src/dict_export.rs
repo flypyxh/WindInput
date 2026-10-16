@@ -384,7 +384,6 @@ mod tests {
         let path = tmp("wind_dict_sections_io.redb");
         let s = Store::open(&path).unwrap();
         s.add_user_word("wb", "a", "工", 100, 0).unwrap();
-        s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // user count -> 1
         s.learn_temp_word("wb", "ab", "临时", 50, 0).unwrap();
         s.learn_temp_word("wb", "ab", "临时", 50, 0).unwrap(); // temp count -> 2
         s.record_freq("wb", "a", "工").unwrap();
@@ -415,7 +414,7 @@ mod tests {
 
         let uw = s2.get_user_words("wb", "a").unwrap();
         assert_eq!(uw[0].weight, 100);
-        assert_eq!(uw[0].count, 1, "用户词 count 流转");
+        assert_eq!(uw[0].count, 0, "用户词 P2 起不保留 count");
         let tw = s2.get_temp_words("wb", "ab").unwrap();
         assert_eq!(tw[0].count, 2, "临时词 count 保真");
         assert_eq!(

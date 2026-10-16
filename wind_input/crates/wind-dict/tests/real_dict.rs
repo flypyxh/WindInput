@@ -61,7 +61,8 @@ fn test_real_wubi_candidates() {
     // 缓存必须是**这次**建出来的：拷贝过来的只有 yaml，wdat 出现即证明走完了
     // yaml → wdat → mmap 全路径（本文件守的 entry_off 回归只在这条路上成立）。
     assert!(
-        path.with_extension("wdat").is_file(),
+        dict.source_file()
+            .is_some_and(|w| w.is_file() && w.parent() == path.parent()),
         "应在临时目录里新建 wdat 缓存：{}",
         path.display()
     );
@@ -96,7 +97,8 @@ fn test_real_pinyin_candidates() {
     let dict = CachedDict::load(&path).expect("加载拼音词典");
     assert!(!dict.is_empty(), "拼音词典应非空");
     assert!(
-        path.with_extension("wdat").is_file(),
+        dict.source_file()
+            .is_some_and(|w| w.is_file() && w.parent() == path.parent()),
         "应在临时目录里新建 wdat 缓存：{}",
         path.display()
     );
@@ -140,7 +142,8 @@ fn test_mongolian_trailing_space_survives_cache_pipeline() {
 
     let dict = CachedDict::load(&path).expect("加载蒙古文词典");
     assert!(
-        path.with_extension("wdat").is_file(),
+        dict.source_file()
+            .is_some_and(|w| w.is_file() && w.parent() == path.parent()),
         "应新建 wdat 缓存，本用例要的就是过缓存这一遭"
     );
 

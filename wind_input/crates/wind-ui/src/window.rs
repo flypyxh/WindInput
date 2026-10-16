@@ -27,6 +27,44 @@ pub fn take_system_color_changed() -> bool {
     SYSTEM_COLOR_CHANGED.swap(false, Ordering::Relaxed)
 }
 
+type SessionEndHook = Box<dyn Fn() + Send + Sync>;
+static SESSION_END_HOOK: std::sync::OnceLock<SessionEndHook> = std::sync::OnceLock::new();
+static SESSION_END_RAN: AtomicBool = AtomicBool::new(false);
+
+/// 注册「会话结束」（注销 / 关机）钩子：服务借它在进程被系统结束前把用户数据落盘。只认第一次注册。
+pub fn set_session_end_hook(h: SessionEndHook) {
+    let _ = SESSION_END_HOOK.set(h);
+}
+
+/// 跑一次会话结束钩子（重复调用无事）。`WM_ENDSESSION` 会发给本进程的每个顶层窗口，且处理
+/// 返回后系统随时可能结束进程，所以就地同步执行。
+pub fn run_session_end_hook() {
+    if SESSION_END_RAN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(h) = SESSION_END_HOOK.get() {
+        h();
+    }
+}
+
+#[cfg(test)]
+mod session_end_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 注销 / 关机时每个顶层窗口都收到 `WM_ENDSESSION`：钩子只跑一次。
+    #[test]
+    fn session_end_hook_runs_once() {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        set_session_end_hook(Box::new(|| {
+            N.fetch_add(1, Ordering::SeqCst);
+        }));
+        run_session_end_hook();
+        run_session_end_hook();
+        assert_eq!(N.load(Ordering::SeqCst), 1);
+    }
+}
+
 /// 屏幕点 `(x, y)` 处最上层的窗口是不是 `hwnd`。
 ///
 /// 用 `WindowFromPoint` 而非比窗口矩形：它与鼠标消息同一套命中（隐藏窗口不算、分层窗口
@@ -464,6 +502,10 @@ mod platform {
             // 系统浅色/深色模式切换：置标记后仍需交回默认处理（本消息不属于我们，别吞）。
             if msg == WM_SETTINGCHANGE && is_immersive_color_set(lparam) {
                 super::SYSTEM_COLOR_CHANGED.store(true, super::Ordering::Relaxed);
+            }
+            // 注销 / 关机确定要结束会话（wparam 非 0）：返回后进程随时被结束，落盘就地做完
+            if msg == crate::sys::WM_ENDSESSION && wparam.0 != 0 {
+                super::run_session_end_hook();
             }
             // 不抢焦点：点击浮层不激活窗口，目标应用保持前台
             if msg == WM_MOUSEACTIVATE {

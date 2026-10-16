@@ -46,11 +46,11 @@ fn store(tag: &str) -> Arc<Store> {
 /// 装好用户层 + 临时层的引擎（与 `EngineManager` 的注册方式一致）。
 fn engine_with(tag: &str, s: Arc<Store>, cfg: PyConfig) -> PinyinEngine {
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         s.clone(),
         "pinyin",
     )));
-    dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
         s.clone(),
         "pinyin",
     )));
@@ -170,16 +170,15 @@ fn disabling_abbrev_also_disables_the_store_layer_recall() {
     );
 }
 
-/// **无边界词仍能召回**。`on_word_selected` 的隐性造词只有扁平码、没有音节边界，
+/// **无边界词仍能召回**。手输码 / 旧库导入的词只有扁平码、没有音节边界，
 /// 算不出声母串；这类词挂在「码首字符」兜底组里，查询时并入交给引擎用 DAG 现判。
 ///
 /// 建了索引反而召不回，比慢更糟——这条防的就是那个。
 #[test]
 fn words_without_boundary_are_still_recalled_via_the_fallback_group() {
     let s = store("noboundary");
-    // 隐性造词：boundary=0
-    s.on_word_selected("pinyin", "zaijian", "再见", 0, 0)
-        .unwrap();
+    // 无边界的用户词：boundary=0
+    s.add_user_word("pinyin", "zaijian", "再见", 0, 0).unwrap();
     assert_eq!(
         s.get_user_words("pinyin", "zaijian").unwrap()[0].boundary,
         0,

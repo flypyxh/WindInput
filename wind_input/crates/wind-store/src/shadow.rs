@@ -6,10 +6,8 @@
 //! 本模块只负责规则的增删查与持久化，避免对候选类型产生依赖。
 
 use crate::store::{SHADOW, Store};
-use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 /// 单条置顶/移动规则：把 word 固定到 position（页内/列表内目标下标）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,143 +94,141 @@ impl ShadowRecord {
     }
 }
 
-/// Shadow 规则存储：key = "方案id\t输入码"
-pub struct ShadowStore {
-    map: RwLock<HashMap<String, ShadowRecord>>,
-}
-
-impl Default for ShadowStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ShadowStore {
-    pub fn new() -> Self {
-        Self {
-            map: RwLock::new(HashMap::new()),
-        }
-    }
-
-    fn key(schema: &str, code: &str) -> String {
-        format!("{}\t{}", schema, code)
-    }
-
-    /// 置顶/移动：把 word 固定到 position（0 = 首位）。LIFO：最新规则覆盖同词旧规则。
-    pub fn pin(&self, schema: &str, code: &str, word: &str, position: usize) {
-        let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(Self::key(schema, code))
-            .or_default()
-            .apply_pin(word, None, position);
-    }
-
-    /// 删除（屏蔽）：word 不再出现在该输入码的候选中。
-    pub fn delete(&self, schema: &str, code: &str, word: &str) {
-        let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-        map.entry(Self::key(schema, code))
-            .or_default()
-            .apply_delete(word);
-    }
-
-    /// 恢复默认：清除该 word 的置顶与删除规则。
-    pub fn reset(&self, schema: &str, code: &str, word: &str) {
-        let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-        let key = Self::key(schema, code);
-        if let Some(rec) = map.get_mut(&key) {
-            rec.apply_remove(word, None);
-            if rec.is_empty() {
-                map.remove(&key);
-            }
-        }
-    }
-
-    /// 该 word 是否有 Shadow 规则（置顶或删除）
-    pub fn has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
-        let map = self.map.read().unwrap_or_else(|e| e.into_inner());
-        match map.get(&Self::key(schema, code)) {
-            Some(rec) => rec.has_target(word, None),
-            None => false,
-        }
-    }
-
-    /// 取某输入码的规则副本（无则 None）
-    pub fn get_rules(&self, schema: &str, code: &str) -> Option<ShadowRecord> {
-        let map = self.map.read().unwrap_or_else(|e| e.into_inner());
-        map.get(&Self::key(schema, code)).cloned()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    }
-
-    /// 从 JSON 文件加载（不存在则静默忽略）
-    pub fn load_from_file(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        if let Ok(parsed) = serde_json::from_str::<HashMap<String, ShadowRecord>>(&content) {
-            *self.map.write().unwrap_or_else(|e| e.into_inner()) = parsed;
-        }
-        Ok(())
-    }
-
-    /// 保存到 JSON 文件（原子写）
-    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = {
-            let map = self.map.read().unwrap_or_else(|e| e.into_inner());
-            serde_json::to_string_pretty(&*map).unwrap_or_else(|_| "{}".to_string())
-        };
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json.as_bytes())?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    }
-}
-
-// ───────────────────────── redb Shadow ops（新后端，满足 dict §9 契约）─────────────────────────
+// ───────────────────────── Shadow 规则文本（P3）─────────────────────────
 //
-// key=`"{schema}\0{code}"`，value=ShadowRecord 的 JSON（每码规则稀疏、写入低频，JSON 足够）。
-// 规则的「应用」（pin/delete 落到候选）仍由引擎排序阶段负责（dict.md：Shadow 是 Provider 非层）。
+// 真源 `<user>/<schema>/shadow.dict.yaml`（设计 §2.2）：`columns: [code, text, action, position,
+// cand_id]`。同一编码的规则是一组行：pin 行在前（newest first，同 `ShadowRecord.pinned`），
+// delete 行在后；`position` 是目标槽位。内存持有解析结果，按键路径读零 IO；写入按组补丁、整文件
+// 提交。规则的「应用」（pin/delete 落到候选）仍由引擎排序阶段负责（dict.md：Shadow 是 Provider）。
 
-fn shadow_key(schema: &str, code: &str) -> String {
-    format!("{schema}\u{0}{code}")
+/// Shadow 文件的列。
+pub const SHADOW_COLS: &[&str] = &["code", "text", "action", "position", "cand_id"];
+
+fn record_of_rows<'a>(
+    doc: &wind_userdata::text::table::TableDoc,
+    rows: impl Iterator<Item = &'a wind_userdata::text::table::TableRow>,
+) -> ShadowRecord {
+    let mut rec = ShadowRecord::default();
+    for r in rows {
+        let word = doc.get(r, "text").to_string();
+        match doc.get(r, "action") {
+            "pin" => {
+                let id = doc.get(r, "cand_id");
+                rec.pinned.push(ShadowPin {
+                    word,
+                    cand_id: (!id.is_empty()).then(|| id.to_string()),
+                    position: doc.get(r, "position").trim().parse().unwrap_or(0),
+                });
+            }
+            "delete" if !rec.deleted.contains(&word) => rec.deleted.push(word),
+            _ => {}
+        }
+    }
+    rec
+}
+
+/// 某方案全部规则，按编码在文件里首次出现的先后。
+fn records_of(doc: &wind_userdata::text::table::TableDoc) -> Vec<(String, ShadowRecord)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&wind_userdata::text::table::TableRow>> = HashMap::new();
+    for r in &doc.rows {
+        let code = doc.get(r, "code").to_string();
+        let g = groups.entry(code.clone()).or_default();
+        if g.is_empty() {
+            order.push(code);
+        }
+        g.push(r);
+    }
+    order
+        .into_iter()
+        .map(|c| {
+            let rec = record_of_rows(doc, groups[&c].iter().copied());
+            (c, rec)
+        })
+        .filter(|(_, r)| !r.is_empty())
+        .collect()
+}
+
+/// 一组规则 → 文件行（按 `SHADOW_COLS` 列序）。
+fn rows_of(code: &str, rec: &ShadowRecord) -> Vec<Vec<String>> {
+    let pins = rec.pinned.iter().map(|p| {
+        vec![
+            code.to_string(),
+            p.word.clone(),
+            "pin".into(),
+            p.position.to_string(),
+            p.cand_id.clone().unwrap_or_default(),
+        ]
+    });
+    let dels = rec.deleted.iter().map(|w| {
+        vec![
+            code.to_string(),
+            w.clone(),
+            "delete".into(),
+            String::new(),
+            String::new(),
+        ]
+    });
+    pins.chain(dels).collect()
 }
 
 impl Store {
-    /// 读改写一条 code 的 Shadow 规则；改完为空则删除该键（单写事务）。
+    /// 某数据方案的 Shadow 文件：`<text_dir>/<schema>/shadow.dict.yaml`。
+    pub fn shadow_path(&self, schema: &str) -> std::path::PathBuf {
+        self.user_text_dir().join(schema).join("shadow.dict.yaml")
+    }
+
+    /// 该方案的 Shadow 表（首次访问时读文件，之后常驻）。
+    fn shadow_table(
+        &self,
+        schema: &str,
+    ) -> anyhow::Result<std::sync::Arc<wind_userdata::text::table::TextTable>> {
+        wind_userdata::engine::check_schema_id(schema)?;
+        let mut m = self.shadows.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = m.get(schema) {
+            return Ok(t.clone());
+        }
+        let t = std::sync::Arc::new(wind_userdata::text::table::TextTable::open(
+            self.shadow_path(schema),
+            SHADOW_COLS,
+            "shadow",
+        ));
+        m.insert(schema.to_string(), t.clone());
+        Ok(t)
+    }
+
+    /// 读改写若干编码的规则，一次提交（改完为空的组整组删掉）。
+    fn modify_shadows(
+        &self,
+        schema: &str,
+        codes: &[&str],
+        f: &mut dyn FnMut(&str, &mut ShadowRecord),
+    ) -> anyhow::Result<()> {
+        let t = self.shadow_table(schema)?;
+        // 先按文件现状重新解析（手改优先），再在最新内容上改
+        t.sync();
+        let doc = t.doc();
+        let all: HashMap<String, ShadowRecord> = records_of(&doc).into_iter().collect();
+        let mut edits = Vec::with_capacity(codes.len());
+        for &code in codes {
+            let mut rec = all.get(code).cloned().unwrap_or_default();
+            f(code, &mut rec);
+            edits.push((vec![code.to_string()], rows_of(code, &rec)));
+        }
+        t.edit(&edits, &["code"])
+    }
+
     fn modify_shadow(
         &self,
         schema: &str,
         code: &str,
         f: impl FnOnce(&mut ShadowRecord),
     ) -> anyhow::Result<()> {
-        let key = shadow_key(schema, code);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(SHADOW)?;
-                let mut rec: ShadowRecord = t
-                    .get(key.as_str())?
-                    .and_then(|g| serde_json::from_slice(g.value()).ok())
-                    .unwrap_or_default();
-                f(&mut rec);
-                if rec.is_empty() {
-                    t.remove(key.as_str())?;
-                } else {
-                    let bytes = serde_json::to_vec(&rec)?;
-                    t.insert(key.as_str(), bytes.as_slice())?;
-                }
+        let mut f = Some(f);
+        self.modify_shadows(schema, &[code], &mut |_, rec| {
+            if let Some(f) = f.take() {
+                f(rec)
             }
-            txn.commit()?;
-            Ok(())
         })
     }
 
@@ -267,19 +263,60 @@ impl Store {
         self.modify_shadow(schema, code, |rec| rec.apply_remove(word, cand_id))
     }
 
-    /// 取某 code 的 Shadow 规则（无则 None）。
+    /// 取某 code 的 Shadow 规则（无则 None）。按键路径：只读内存，不碰文件、不碰 redb。
     pub fn get_shadow_rules(
         &self,
         schema: &str,
         code: &str,
     ) -> anyhow::Result<Option<ShadowRecord>> {
-        let key = shadow_key(schema, code);
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(SHADOW)?;
-            Ok(t.get(key.as_str())?
-                .and_then(|g| serde_json::from_slice(g.value()).ok()))
-        })
+        let doc = self.shadow_table(schema)?.doc();
+        let rec = record_of_rows(&doc, doc.rows.iter().filter(|r| doc.get(r, "code") == code));
+        Ok((!rec.is_empty()).then_some(rec))
+    }
+
+    /// 单个方案的 Shadow 文件重新载入；变了返回 true。
+    pub(crate) fn shadow_table_synced(&self, schema: &str) -> bool {
+        let fresh = !self
+            .shadows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(schema);
+        match self.shadow_table(schema) {
+            Ok(t) => t.sync() || (fresh && !t.doc().rows.is_empty()),
+            Err(_) => false,
+        }
+    }
+
+    /// 手改的 Shadow 文件重新载入（启动后新出现的方案目录也算），返回变了的方案。
+    pub fn sync_shadows(&self) -> Vec<String> {
+        let mut schemas: std::collections::BTreeSet<String> = self
+            .shadows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        schemas.extend(self.shadow_schemas_on_disk());
+        // 首次载入的表本身就是「新内容」
+        schemas
+            .into_iter()
+            .filter(|s| self.shadow_table_synced(s))
+            .collect()
+    }
+
+    /// 用户目录下有 Shadow 文件的方案。
+    pub(crate) fn shadow_schemas_on_disk(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(self.user_text_dir()) {
+            for e in rd.flatten() {
+                if e.path().join("shadow.dict.yaml").is_file()
+                    && let Some(n) = e.file_name().to_str()
+                {
+                    out.push(n.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// 导出某方案全部 shadow 规则为 jsonl（每行 {"code","rec"}）。
@@ -295,13 +332,38 @@ impl Store {
         Ok(out)
     }
 
-    /// 从 jsonl 导入 shadow 规则（逐条 replay pin/delete，天然 upsert）。
+    /// 一批 (code, 动作) 在内存里重放后一次提交（备份还原、wdict 导入）。
+    fn replay_shadow(
+        &self,
+        schema: &str,
+        actions: &[(String, ShadowAction)],
+    ) -> anyhow::Result<usize> {
+        let mut codes: Vec<&str> = actions.iter().map(|(c, _)| c.as_str()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        let mut n = 0usize;
+        self.modify_shadows(schema, &codes, &mut |code, rec| {
+            for (c, a) in actions {
+                if c != code {
+                    continue;
+                }
+                match a {
+                    ShadowAction::Pin(p) => rec.apply_pin(&p.word, p.cand_id.clone(), p.position),
+                    ShadowAction::Delete(w) => rec.apply_delete(w),
+                }
+                n += 1;
+            }
+        })?;
+        Ok(n)
+    }
+
+    /// 从 jsonl 导入 shadow 规则（重放 pin/delete，天然 upsert；一次提交）。
     /// 返回 (imported=重放的规则条数, skipped=非法行数)。
     pub fn import_shadow_jsonl(&self, schema: &str, text: &str) -> anyhow::Result<(usize, usize)> {
         let normalized = wind_utils::text::normalize_input(text);
         let text = normalized.as_ref();
-        let mut imported = 0usize;
         let mut skipped = 0usize;
+        let mut actions = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -320,14 +382,13 @@ impl Store {
             };
             // 存储序 index 0 = 最新（apply_pin LIFO 插队首），反向重放才能还原原顺序。
             for p in rec.pinned.iter().rev() {
-                self.pin_shadow(schema, code, &p.word, p.cand_id.as_deref(), p.position)?;
-                imported += 1;
+                actions.push((code.to_string(), ShadowAction::Pin(p.clone())));
             }
             for w in &rec.deleted {
-                self.delete_shadow(schema, code, w)?;
-                imported += 1;
+                actions.push((code.to_string(), ShadowAction::Delete(w.clone())));
             }
         }
+        let imported = self.replay_shadow(schema, &actions)?;
         Ok((imported, skipped))
     }
 
@@ -364,81 +425,90 @@ impl Store {
         Ok(out)
     }
 
-    /// 从动作行导入 shadow 规则（逐行 replay pin/delete，天然 upsert）。返回重放条数。
+    /// 从动作行导入 shadow 规则（重放 pin/delete，天然 upsert；一次提交）。返回重放条数。
     pub fn import_shadow_actions(
         &self,
         schema: &str,
         actions: &[crate::wdict::ShadowActionIo],
     ) -> anyhow::Result<usize> {
-        let mut n = 0usize;
-        for a in actions {
-            match a.action.as_str() {
-                "pin" => {
-                    let pos = a.position.max(0) as usize;
-                    self.pin_shadow(schema, &a.code, &a.word, a.cand_id.as_deref(), pos)?;
-                    n += 1;
-                }
-                "del" => {
-                    self.delete_shadow(schema, &a.code, &a.word)?;
-                    n += 1;
-                }
-                _ => {}
-            }
+        let acts: Vec<(String, ShadowAction)> = actions
+            .iter()
+            .filter_map(|a| match a.action.as_str() {
+                "pin" => Some((
+                    a.code.clone(),
+                    ShadowAction::Pin(ShadowPin {
+                        word: a.word.clone(),
+                        cand_id: a.cand_id.clone(),
+                        position: a.position.max(0) as usize,
+                    }),
+                )),
+                "del" => Some((a.code.clone(), ShadowAction::Delete(a.word.clone()))),
+                _ => None,
+            })
+            .collect();
+        self.replay_shadow(schema, &acts)
+    }
+
+    /// 清空某方案全部 shadow 规则（整文件替换），返回清掉的编码组数。
+    pub fn clear_shadow(&self, schema: &str) -> anyhow::Result<usize> {
+        let t = self.shadow_table(schema)?;
+        let n = records_of(&t.doc()).len();
+        if n > 0 || t.path().is_file() {
+            t.replace_all(&[])?;
         }
         Ok(n)
     }
 
-    /// 清空某方案全部 shadow 规则（单写事务），返回删除键数。
-    pub fn clear_shadow(&self, schema: &str) -> anyhow::Result<usize> {
-        let prefix = format!("{schema}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(SHADOW)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range(prefix.as_str()..)? {
-                        let (k, _) = item?;
-                        let key = k.value();
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        ks.push(key.to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in &keys {
-                    t.remove(k.as_str())?;
-                }
-            }
-            txn.commit()?;
-            Ok(n)
-        })
+    /// 列举某方案下所有 code 的 Shadow 规则（设置页用）。返回 (code, 规则) 列表，按 code 排序。
+    pub fn list_shadow_rules(&self, schema: &str) -> anyhow::Result<Vec<(String, ShadowRecord)>> {
+        let mut v = records_of(&self.shadow_table(schema)?.doc());
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(v)
     }
 
-    /// 列举某方案下所有 code 的 Shadow 规则（设置页用）。返回 (code, 规则) 列表。
-    pub fn list_shadow_rules(&self, schema: &str) -> anyhow::Result<Vec<(String, ShadowRecord)>> {
-        let prefix = format!("{schema}\u{0}");
+    /// 迁移用：整组写入文件里还没有的编码（文件里已有的组以文件为准），一次提交。
+    pub(crate) fn merge_shadow_rules(
+        &self,
+        schema: &str,
+        rules: Vec<(String, ShadowRecord)>,
+    ) -> anyhow::Result<()> {
+        let t = self.shadow_table(schema)?;
+        let have: std::collections::HashSet<String> =
+            records_of(&t.doc()).into_iter().map(|(c, _)| c).collect();
+        let edits: Vec<_> = rules
+            .iter()
+            .filter(|(c, _)| !have.contains(c))
+            .map(|(c, r)| (vec![c.clone()], rows_of(c, r)))
+            .collect();
+        if edits.is_empty() {
+            return Ok(());
+        }
+        t.edit(&edits, &["code"])
+    }
+
+    /// 测试 / 探针：往旧 `SHADOW` 表写一条（模拟升级前的库）。
+    #[doc(hidden)]
+    pub fn legacy_put_shadow(
+        &self,
+        schema: &str,
+        code: &str,
+        rec: &ShadowRecord,
+    ) -> anyhow::Result<()> {
+        let key = format!("{schema}\u{0}{code}");
+        let bytes = serde_json::to_vec(rec)?;
         self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(SHADOW)?;
-            let mut out = Vec::new();
-            for item in t.range(prefix.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let code = &key[prefix.len()..];
-                if let Ok(rec) = serde_json::from_slice::<ShadowRecord>(v.value()) {
-                    out.push((code.to_string(), rec));
-                }
-            }
-            Ok(out)
+            let txn = db.begin_write()?;
+            txn.open_table(SHADOW)?
+                .insert(key.as_str(), bytes.as_slice())?;
+            txn.commit()?;
+            Ok(())
         })
     }
+}
+
+enum ShadowAction {
+    Pin(ShadowPin),
+    Delete(String),
 }
 
 #[cfg(test)]
@@ -480,45 +550,6 @@ mod tests {
         assert!(s.list_shadow_rules("wb").unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
-    }
-
-    #[test]
-    fn test_pin_delete_reset() {
-        let s = ShadowStore::new();
-        s.pin("wubi", "aaaa", "恭恭敬敬", 0);
-        s.delete("wubi", "bbbb", "某词");
-        assert!(s.has_rule("wubi", "aaaa", "恭恭敬敬"));
-        assert!(s.has_rule("wubi", "bbbb", "某词"));
-
-        let r = s.get_rules("wubi", "aaaa").unwrap();
-        assert_eq!(r.pinned.len(), 1);
-        assert_eq!(r.pinned[0].position, 0);
-
-        // 删除优先级：pin 后再 delete 同词，pin 被移除
-        s.delete("wubi", "aaaa", "恭恭敬敬");
-        let r = s.get_rules("wubi", "aaaa").unwrap();
-        assert!(r.pinned.is_empty());
-        assert_eq!(r.deleted, vec!["恭恭敬敬".to_string()]);
-
-        // 恢复默认清除规则
-        s.reset("wubi", "aaaa", "恭恭敬敬");
-        assert!(!s.has_rule("wubi", "aaaa", "恭恭敬敬"));
-    }
-
-    #[test]
-    fn test_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("wind_shadow_roundtrip.json");
-        let _ = std::fs::remove_file(&tmp);
-        let a = ShadowStore::new();
-        a.pin("py", "nihao", "你好", 0);
-        a.delete("py", "ceshi", "测试");
-        a.save_to_file(&tmp).unwrap();
-
-        let b = ShadowStore::new();
-        b.load_from_file(&tmp).unwrap();
-        assert!(b.has_rule("py", "nihao", "你好"));
-        assert!(b.has_rule("py", "ceshi", "测试"));
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -638,5 +669,95 @@ mod tests {
         // 跨方案隔离
         assert_eq!(s.list_shadow_rules("py").unwrap().len(), 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 规则落文本：pin / delete 按行写进 shadow.dict.yaml，重开读回；newest-first 保持。
+    #[test]
+    fn shadow_rules_live_in_text() {
+        let p = tmp("wind_shadow_text.redb");
+        {
+            let s = Store::open(&p).unwrap();
+            s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
+            s.pin_shadow("wb", "aa", "工", None, 1).unwrap();
+            s.delete_shadow("wb", "aa", "式").unwrap();
+            let f = std::fs::read_to_string(s.shadow_path("wb")).unwrap();
+            assert!(
+                f.contains("aa\t工\tpin\t1\t\naa\t恭\tpin\t0\t\naa\t式\tdelete\t\t\n"),
+                "{f}"
+            );
+        }
+        let s = Store::open(&p).unwrap();
+        let r = s.get_shadow_rules("wb", "aa").unwrap().unwrap();
+        assert_eq!(
+            r.pinned.iter().map(|x| x.word.as_str()).collect::<Vec<_>>(),
+            vec!["工", "恭"]
+        );
+        assert_eq!(r.deleted, vec!["式".to_string()]);
+    }
+
+    /// 空编码桶（特殊模式）往返不丢。
+    #[test]
+    fn empty_code_rules_roundtrip() {
+        let p = tmp("wind_shadow_empty_code.redb");
+        {
+            let s = Store::open(&p).unwrap();
+            s.pin_shadow("wb", "", "日期", Some("phrase:rq:{date}"), 2)
+                .unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let r = s.get_shadow_rules("wb", "").unwrap().unwrap();
+        assert_eq!(r.pinned[0].cand_id.as_deref(), Some("phrase:rq:{date}"));
+        assert_eq!(r.pinned[0].position, 2);
+    }
+
+    /// 按键路径查 Shadow 不碰 redb、不读文件（加载后删掉文件、暂停 redb 照样查得到）；手改文件
+    /// sync 后生效。
+    #[test]
+    fn shadow_lookup_does_not_touch_redb_or_file() {
+        let s = Store::open(tmp("wind_shadow_hot.redb")).unwrap();
+        s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
+        let f = s.shadow_path("wb");
+        let saved = std::fs::read(&f).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        s.pause().unwrap();
+        assert!(s.get_shadow_rules("wb", "aa").unwrap().is_some());
+        s.resume().unwrap();
+        std::fs::write(
+            &f,
+            [saved.as_slice(), "bb\t八\tdelete\t\t\n".as_bytes()].concat(),
+        )
+        .unwrap();
+        assert!(
+            s.get_shadow_rules("wb", "bb").unwrap().is_none(),
+            "未 sync 不生效"
+        );
+        assert_eq!(s.sync_shadows(), vec!["wb".to_string()]);
+        assert_eq!(
+            s.get_shadow_rules("wb", "bb").unwrap().unwrap().deleted,
+            vec!["八".to_string()]
+        );
+    }
+
+    /// 导入一批规则只写一次文件（逐条提交会把备份还原拖成每条一次 fsync）。
+    #[test]
+    fn import_writes_once() {
+        let s = Store::open(tmp("wind_shadow_import_once.redb")).unwrap();
+        let actions: Vec<crate::wdict::ShadowActionIo> = (0..200)
+            .map(|i| crate::wdict::ShadowActionIo {
+                action: "del".into(),
+                code: format!("c{i}"),
+                word: format!("词{i}"),
+                position: 0,
+                cand_id: None,
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        assert_eq!(s.import_shadow_actions("wb", &actions).unwrap(), 200);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(s.list_shadow_rules("wb").unwrap().len(), 200);
     }
 }

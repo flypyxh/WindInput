@@ -271,8 +271,9 @@ impl DictLayer for SystemDictLayer {
     /// 代价是「内容没变、wdat 被重写」时多重建一次词组索引（百毫秒级）。
     ///
     /// ⚠️ 只混进**本方法**，不改共用的 `cache_digest`：后者是 `.wridx` 的指纹源，改它会让
-    /// 全体用户的反查索引白重建一次（大词库峰值数百 MB）。`.fp` 那一侧的根治在
-    /// `CachedDict::load_at_with`：重建 wdat 前先删旧 `.fp`。
+    /// 全体用户的反查索引白重建一次（大词库峰值数百 MB）。`.fp` 那一侧自 S2 起由内容寻址
+    /// 根治：重建永远写新文件名，旧 `.fp` 不可能挂到新 wdat 旁；本方法混入的 `大小:mtime`
+    /// 仍挡住「实际文件被外部原地改写」这一种现场。
     fn entries_digest(&self) -> Option<String> {
         let p = self.dict.source_file()?;
         let own = match std::fs::metadata(p) {
@@ -649,17 +650,23 @@ mod tests {
         assert_ne!(digest_of(None), v1, "词库内容变了，摘要必须变");
 
         // 无 `.fp` sidecar（wdat-only 分发）时退到「大小:mtime」：只动 mtime 也得变。
+        // `wdat` 是槽位，实际文件名带指纹——拿 reader 自报的路径。
         let v2 = digest_of(None);
-        let mut fp = wdat.clone().into_os_string();
+        let real = CachedDict::load_at_with(&yaml, &wdat, true)
+            .unwrap()
+            .source_file()
+            .expect("mmap 词库应有磁盘产物")
+            .to_path_buf();
+        let mut fp = real.clone().into_os_string();
         fp.push(".fp");
         std::fs::remove_file(&fp).unwrap();
-        let d = CachedDict::Mmap(crate::reader_pool::open_wdat(&wdat).unwrap());
+        let d = CachedDict::Mmap(crate::reader_pool::open_wdat(&real).unwrap());
         let no_fp = SystemDictLayer::new(d, "en").entries_digest().unwrap();
         assert_ne!(no_fp, v2);
-        let f = std::fs::File::options().write(true).open(&wdat).unwrap();
+        let f = std::fs::File::options().write(true).open(&real).unwrap();
         f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
             .unwrap();
-        let d = CachedDict::Mmap(crate::reader_pool::open_wdat(&wdat).unwrap());
+        let d = CachedDict::Mmap(crate::reader_pool::open_wdat(&real).unwrap());
         assert_ne!(
             SystemDictLayer::new(d, "en").entries_digest().unwrap(),
             no_fp,

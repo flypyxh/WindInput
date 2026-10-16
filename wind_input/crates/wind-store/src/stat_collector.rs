@@ -90,6 +90,22 @@ struct Inner {
     meta: StatsMeta,
     dirty: bool,
     last_commit: Option<DateTime<Local>>,
+    /// 挂起（备份还原期间）：任何 flush（含后台定时那次）都不落盘，`resume` 清掉。
+    suspended: bool,
+    /// 元数据没读到（IO 错误）：`meta` 不可信，不写回（否则零值会盖掉累计值，M-3），下次 flush
+    /// 重读。
+    meta_unknown: bool,
+}
+
+/// 起步用的元数据：读不了 ⇒ 零值 + 标记不可信。
+fn load_meta(store: &Store, speed_factor: f32) -> (StatsMeta, bool) {
+    match store.stats_meta_or_recalc(speed_factor) {
+        Ok(m) => (m, false),
+        Err(e) => {
+            warn!("统计元数据读不了，暂不写回：{e:#}");
+            (StatsMeta::default(), true)
+        }
+    }
 }
 
 /// 采集器与后台线程共享的状态。
@@ -127,12 +143,15 @@ impl StatCollector {
         let today = today_string();
         let mut today_stat = store.get_daily_stat(&today).unwrap_or_default();
         migrate_to_speed_v2(&mut today_stat);
+        let (meta, meta_unknown) = load_meta(&store, speed_factor);
         let mut inner = Inner {
             today: today_stat,
             today_date: today.clone(),
-            meta: store.get_stats_meta().unwrap_or_default(),
+            meta,
             dirty: false,
             last_commit: None,
+            suspended: false,
+            meta_unknown,
         };
         if inner.meta.first_day.is_empty() {
             inner.meta.first_day = today;
@@ -213,6 +232,23 @@ impl StatCollector {
         inner.last_commit = None;
     }
 
+    /// 挂起：先把内存里的落盘，之后任何 flush 都不写，直到 [`Self::resume`]。备份还原统计期间用——
+    /// 不挂起的话，后台 30 秒那次 flush 可能恰在「还原写完、resume 之前」把旧的今天与总计写回去。
+    pub fn suspend(&self) {
+        let mut inner = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.flush_locked(&mut inner);
+        inner.suspended = true;
+    }
+
+    /// 解除挂起但不重载（还原没碰统计时用：内存里攒的照常落盘）。
+    pub fn unsuspend(&self) {
+        self.shared
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .suspended = false;
+    }
+
     /// 暂停：flush 后由调用方释放 store（Windows 热替换）。
     pub fn pause(&self) {
         self.flush();
@@ -225,12 +261,15 @@ impl StatCollector {
         inner.today = self.shared.store.get_daily_stat(&today).unwrap_or_default();
         migrate_to_speed_v2(&mut inner.today);
         inner.today_date = today.clone();
-        inner.meta = self.shared.store.get_stats_meta().unwrap_or_default();
+        let (meta, unknown) = load_meta(&self.shared.store, self.shared.speed_factor());
+        inner.meta = meta;
+        inner.meta_unknown = unknown;
         if inner.meta.first_day.is_empty() {
             inner.meta.first_day = today;
         }
         inner.dirty = false;
         inner.last_commit = None;
+        inner.suspended = false;
     }
 }
 
@@ -344,7 +383,8 @@ impl Shared {
     }
 
     fn flush_locked(&self, inner: &mut Inner) {
-        if !inner.dirty || self.store.is_paused() {
+        // P4a 起统计落本机状态文件，不再受 redb 暂停影响；备份还原期间挂起不写
+        if !inner.dirty || inner.suspended {
             return;
         }
         if let Err(e) = self.store.put_daily_stat(&inner.today_date, &inner.today) {
@@ -360,6 +400,17 @@ impl Shared {
             if sp > inner.meta.max_speed {
                 inner.meta.max_speed = sp;
             }
+        }
+        if inner.meta_unknown {
+            let (meta, unknown) = load_meta(&self.store, self.speed_factor());
+            if unknown {
+                // 当日数据已落盘；元数据等能读到再写
+                inner.dirty = false;
+                return;
+            }
+            inner.meta = meta;
+            inner.meta_unknown = false;
+            update_streak(&mut inner.meta, &inner.today_date);
         }
         if let Err(e) = self.store.put_stats_meta(&inner.meta) {
             warn!("flush StatsMeta failed: {}", e);
@@ -430,6 +481,24 @@ mod tests {
             std::env::temp_dir().join(format!("wind_collector_{}_{}.redb", std::process::id(), n));
         let _ = std::fs::remove_file(&p);
         Arc::new(Store::open(&p).unwrap())
+    }
+
+    /// M-3：元数据文件坏了（无可用备份）时，收集器起步不得拿零值累加写回。
+    #[test]
+    fn collector_starts_from_recalculated_meta_when_meta_file_is_corrupt() {
+        let store = mem_store();
+        let d = crate::stats::DailyStats {
+            chinese: 300,
+            ..Default::default()
+        };
+        store.put_daily_stat("2020-01-01", &d).unwrap();
+        store.recalculate_stats_meta(1.0).unwrap();
+        let mp = store.stats_dir().join("meta.toml");
+        std::fs::write(&mp, "total_chars = [").unwrap();
+        let _ = std::fs::remove_file(store.stats_dir().join("meta.toml.bak"));
+        let sc = StatCollector::new(store.clone(), 1.0);
+        assert_eq!(sc.get_meta().total_chars, 300);
+        wind_userdata::issues::clear(&mp);
     }
 
     #[test]
@@ -686,5 +755,32 @@ mod tests {
         } // Drop 应 flush
         let today = store.get_daily_stat(&today_string()).unwrap();
         assert_eq!(today.total(), 7, "Drop 时应持久化未落库数据");
+    }
+
+    /// 审查 I-5：还原期间收集器挂起，任何 flush（含后台 30 秒那次）都不落盘；resume 后按库里的值重载。
+    #[test]
+    fn suspended_collector_never_flushes() {
+        let store = mem_store();
+        let sc = StatCollector::new(store.clone(), 1.0);
+        sc.suspend();
+        sc.record(StatEvent {
+            chinese: 100,
+            ..Default::default()
+        });
+        sc.flush();
+        assert_eq!(store.get_daily_stat(&today_string()).unwrap().chinese, 0);
+        sc.resume();
+        sc.flush();
+        assert_eq!(store.get_daily_stat(&today_string()).unwrap().chinese, 0);
+        sc.record(StatEvent {
+            chinese: 1,
+            ..Default::default()
+        });
+        sc.flush();
+        assert_eq!(
+            store.get_daily_stat(&today_string()).unwrap().chinese,
+            1,
+            "resume 后照常"
+        );
     }
 }

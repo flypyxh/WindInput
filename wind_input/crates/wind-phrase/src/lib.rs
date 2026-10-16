@@ -434,7 +434,7 @@ impl PhraseLayer {
             } else if let Some(text) = expand_template(&e.text, &now) {
                 // 短语文本按原样出候选：库里存的就是真实文本（含真换行）。
                 // 转义只在系统边界发生（文本文件读写、设置页 UI 进出），见
-                // `wind_dict::store_layer::record_to_candidate` 的同源说明。
+                // `wind_store::store_layer::record_to_candidate` 的同源说明。
                 //
                 // 全空展开（如整条只有一个非节日的 `$LF`）不出空候选——
                 // 与前缀路径 `lookup_prefix_at` 同处置。

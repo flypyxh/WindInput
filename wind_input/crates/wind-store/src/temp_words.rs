@@ -8,19 +8,28 @@
 //! 临时词权重固定为写入时的初值；晋升进用户词库时统一取 `PROMOTED_WEIGHT`（与已有
 //! 用户词取 max，不覆盖手动加词的更高权重）。
 
-use crate::abbrev_index;
-use crate::store::{Store, TEMP_ABBREV, TEMP_WORDS, USER_ABBREV, USER_WORDS};
-use crate::user_words::{
-    UserWordRecord, dec_val, dec_val_ordered, enc_key, enc_val, enc_val_ordered, now_secs,
-};
+use crate::store::Store;
+use crate::user_words::UserWordRecord;
 use crate::wdict;
-use redb::ReadableTable;
 
 /// 临时词权重硬上限（仅约束写入时的初值，权重不再随复选累加）
 pub const TEMP_WORD_MAX_WEIGHT: i32 = 10000;
 
 /// 自动学习词晋升入用户词库时的统一权重（与已存在的用户词权重取 max，不覆盖手动加词）
 pub const PROMOTED_WEIGHT: i32 = 1000;
+
+/// 引擎临时词 → 门面记录（临时词库本就没有入库序号，order 恒 0）。
+fn rec_of(w: wind_userdata::runtime::TempWord) -> UserWordRecord {
+    UserWordRecord {
+        code: w.code,
+        text: w.text,
+        weight: w.weight,
+        count: w.count,
+        created_at: w.created_at,
+        boundary: w.boundary,
+        order: 0,
+    }
+}
 
 impl Store {
     /// 学习临时词：新词 weight=min(add_weight,MAX)/count=1；已存在只 count++，权重不变
@@ -38,49 +47,17 @@ impl Store {
         add_weight: i32,
         boundary: u64,
     ) -> anyhow::Result<u32> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let new_count;
-            let is_new;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                let (w, c, ca, b) = match existing {
-                    // 旧记录 boundary 为 0（v1 遗留）时用新算出的补上，否则沿用。
-                    Some((ow, oc, oca, ob)) => {
-                        (ow, oc + 1, oca, if ob != 0 { ob } else { boundary })
-                    }
-                    None => (
-                        add_weight.min(TEMP_WORD_MAX_WEIGHT),
-                        1,
-                        now_secs(),
-                        boundary,
-                    ),
-                };
-                new_count = c;
-                is_new = existing.is_none();
-                t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
-                // count++ 不影响索引（value 空），但**新增**与**边界补齐**都要落索引。
-                let old_b = existing.map(|(_, _, _, ob)| ob);
-                abbrev_index::shift(
-                    &mut txn.open_table(TEMP_ABBREV)?,
-                    schema,
-                    code,
-                    text,
-                    old_b,
-                    b,
-                )?;
-            }
-            txn.commit()?;
-            // 新词是结构变化；已有词只是 count +1（边界补齐不进联想索引）。
-            if is_new {
-                self.bump_words_gen(schema);
-            } else {
-                self.bump_words_count_gen();
-            }
-            Ok(new_count)
-        })
+        let (count, is_new) = self
+            .runtime()
+            .learn_temp_detailed(schema, code, text, add_weight, boundary)?;
+        // 新词是结构变化；已有词只是 count +1（边界补齐不进联想索引）。
+        if is_new {
+            self.bump_words_gen(schema);
+        } else {
+            self.bump_words_count_gen();
+        }
+        self.after_write();
+        Ok(count)
     }
 
     /// 点查临时词当前累积 count（无记录返回 None）。供协调器选词路径判断晋升。
@@ -90,14 +67,10 @@ impl Store {
         code: &str,
         text: &str,
     ) -> anyhow::Result<Option<u32>> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(TEMP_WORDS)?;
-            Ok(t.get(key.as_str())?
-                .and_then(|g| dec_val(g.value()))
-                .map(|(_, c, _, _)| c))
-        })
+        Ok(self
+            .runtime()
+            .temp_word(schema, code, text)
+            .map(|w| w.count))
     }
 
     /// 仅当已存在时计数 +1（不创建新条目、权重不变）。返回 (是否存在, 新count)。
@@ -107,59 +80,24 @@ impl Store {
         code: &str,
         text: &str,
     ) -> anyhow::Result<(bool, u32)> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let result;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                match existing {
-                    Some((w, c, ca, b)) => {
-                        let nc = c + 1;
-                        t.insert(key.as_str(), enc_val(w, nc, ca, b).as_slice())?;
-                        result = (true, nc);
-                    }
-                    None => result = (false, 0),
-                }
-            }
-            txn.commit()?;
-            if result.0 {
-                self.bump_words_count_gen();
-            }
-            Ok(result)
-        })
+        let r = self
+            .runtime()
+            .increment_temp_if_exists(schema, code, text)?;
+        if r.0 {
+            self.bump_words_count_gen();
+            self.after_write();
+        }
+        Ok(r)
     }
 
     /// 精确取某 code 下的所有临时词
     pub fn get_temp_words(&self, schema: &str, code: &str) -> anyhow::Result<Vec<UserWordRecord>> {
-        let prefix = format!("{schema}\u{0}{code}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(TEMP_WORDS)?;
-            let mut out = Vec::new();
-            for item in t.range(prefix.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                let text = &key[prefix.len()..];
-                if let Some((w, c, ca, b)) = dec_val(v.value()) {
-                    out.push(UserWordRecord {
-                        code: code.to_string(),
-                        text: text.to_string(),
-                        weight: w,
-                        count: c,
-                        created_at: ca,
-                        boundary: b,
-                        // 临时词库不参与「导入文件词序」那套排序（它的顺序由造词先后与 count 决定）。
-                        order: 0,
-                    });
-                }
-            }
-            Ok(out)
-        })
+        Ok(self
+            .runtime()
+            .temp_words(schema, code)
+            .into_iter()
+            .map(rec_of)
+            .collect())
     }
 
     /// 流式遍历某方案下以 `prefix` 开头的临时词。回调返回 `false` 即停。
@@ -177,36 +115,18 @@ impl Store {
         prefix: &str,
         f: &mut dyn FnMut(crate::user_words::UserWordView<'_>) -> bool,
     ) -> anyhow::Result<()> {
-        let scan = format!("{schema}\u{0}{prefix}");
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(TEMP_WORDS)?;
-            for item in t.range(scan.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&scan) {
-                    break;
-                }
-                let (Some((_, code, text)), Some((w, c, ca, b))) =
-                    (crate::user_words::split_key(key), dec_val(v.value()))
-                else {
-                    continue; // 解不出的记录跳过且不计数
-                };
-                if !f(crate::user_words::UserWordView {
-                    code,
-                    text,
-                    weight: w,
-                    count: c,
-                    created_at: ca,
-                    boundary: b,
-                    // 临时词库不参与「导入文件词序」那套排序（顺序由造词先后与 count 决定）。
-                    order: 0,
-                }) {
-                    break;
-                }
-            }
-            Ok(())
-        })
+        self.runtime().for_each_temp(schema, prefix, &mut |w| {
+            f(crate::user_words::UserWordView {
+                code: &w.code,
+                text: &w.text,
+                weight: w.weight,
+                count: w.count,
+                created_at: w.created_at,
+                boundary: w.boundary,
+                order: 0,
+            })
+        });
+        Ok(())
     }
 
     /// 某方案下的临时词条数。只数不抄。
@@ -217,12 +137,7 @@ impl Store {
     /// ⚠️ 它省的是 Rust 侧的物化峰值（19 万条 × 两个 `String`），**不省 redb 读缓存**：
     /// range 迭代照样把走过的叶子页读进缓存。见 [`Store::drop_page_cache`]。
     pub fn count_temp_words(&self, schema: &str) -> anyhow::Result<usize> {
-        let mut n = 0usize;
-        self.for_each_temp_word(schema, "", &mut |_| {
-            n += 1;
-            true
-        })?;
-        Ok(n)
+        Ok(self.runtime().count_temp(schema))
     }
 
     /// 前缀检索临时词（跨 code）。limit<=0 不限。
@@ -233,10 +148,10 @@ impl Store {
         limit: usize,
     ) -> anyhow::Result<Vec<UserWordRecord>> {
         let mut out = Vec::new();
-        self.for_each_temp_word(schema, prefix, &mut |w| {
-            out.push(w.to_record());
+        self.runtime().for_each_temp(schema, prefix, &mut |w| {
+            out.push(rec_of(w.clone()));
             limit == 0 || out.len() < limit
-        })?;
+        });
         Ok(out)
     }
 
@@ -253,46 +168,14 @@ impl Store {
     /// `count == 1`（造出来从未被选中）那批，它们在 FREQ 里根本没有记录，跨表读只会回落到
     /// 同一个默认值、重新并列。`created_at` 对每条都是确定值，先淘汰最老的没用过的词。
     pub fn evict_temp_words(&self, schema: &str, max_keep: usize) -> anyhow::Result<usize> {
-        let scan = format!("{schema}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let mut deleted = 0usize;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                // 1) 事务内收集本方案全部 (key, count, created_at, weight, boundary)
-                //    boundary 一并带出：删索引要按**删除前**的边界算分组键（见 abbrev_index::remove）。
-                let mut all: Vec<(String, u32, i64, i32, u64)> = Vec::new();
-                for item in t.range(scan.as_str()..)? {
-                    let (k, v) = item?;
-                    let key = k.value();
-                    if !key.starts_with(&scan) {
-                        break;
-                    }
-                    let (w, c, ca, b) = dec_val(v.value()).unwrap_or((0, 0, 0, 0));
-                    all.push((key.to_string(), c, ca, w, b));
-                }
-                // 2) 超出 max_keep 则删除排序最靠前的若干条
-                if all.len() > max_keep {
-                    all.sort_by_key(|(_, c, ca, w, _)| (*c, *ca, *w)); // 升序：最该淘汰的在前
-                    let to_delete = all.len() - max_keep;
-                    let mut idx = txn.open_table(TEMP_ABBREV)?;
-                    for (key, _, _, _, b) in all.iter().take(to_delete) {
-                        t.remove(key.as_str())?;
-                        if let Some((_, code, text)) = crate::user_words::split_key(key) {
-                            abbrev_index::remove(&mut idx, schema, code, text, *b)?;
-                        }
-                        deleted += 1;
-                    }
-                }
-            }
-            txn.commit()?;
-            // 没删到就不动代次：代次一变下游就整表重建索引（见测试
-            // evict_without_deletion_keeps_words_generation）。
-            if deleted > 0 {
-                self.bump_words_gen(schema);
-            }
-            Ok(deleted)
-        })
+        let n = self.runtime().evict_temp(schema, max_keep)?;
+        // 没删到就不动代次：代次一变下游就整表重建索引（见测试
+        // evict_without_deletion_keeps_words_generation）。
+        if n > 0 {
+            self.bump_words_gen(schema);
+            self.after_write();
+        }
+        Ok(n)
     }
 
     /// 导出某方案全部临时词为 wdict 文本（code/text/weight；count 属晋升进度不流转）。
@@ -346,171 +229,58 @@ impl Store {
         schema: &str,
         rows: &[wdict::WordIo],
     ) -> anyhow::Result<usize> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                let mut idx = txn.open_table(TEMP_ABBREV)?;
-                for r in rows {
-                    // code 列可能是带空格的音节码 → 拆成扁平 key + 边界。
-                    // ★ `WordIo::boundary` 优先于空格载体：导入闸口的求解结果走这个字段送进来，
-                    // 而空格表达不了单音节（`xian` 的 0b1 join 后无空格，split 回来是 0）。
-                    // 只认空格的话，补齐的边界会被静默丢掉——统计上还照样记成「已补齐」。
-                    let (code, spaced_b) = wdict::split_spaced_code(&r.code);
-                    let in_b = r.boundary.unwrap_or(spaced_b);
-                    let key = enc_key(schema, &code, &r.text);
-                    let cap = r.weight.min(TEMP_WORD_MAX_WEIGHT);
-                    // 已存在且旧 boundary 非 0 则沿用（切分不因导入而变），为 0 时用导入行补齐。
-                    let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                    let (w, c, ca, b) = match existing {
-                        Some((ow, oc, oca, ob)) => (
-                            ow.max(cap),
-                            oc.max(r.count),
-                            oca,
-                            if ob != 0 { ob } else { in_b },
-                        ),
-                        None => (cap, r.count, now_secs(), in_b),
-                    };
-                    t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
-                    let old_b = existing.map(|(_, _, _, ob)| ob);
-                    abbrev_index::shift(&mut idx, schema, &code, &r.text, old_b, b)?;
+        let rows: Vec<wind_userdata::runtime::TempWord> = rows
+            .iter()
+            .map(|r| {
+                // code 列可能是带空格的音节码 → 拆成扁平码 + 边界。
+                // ★ `WordIo::boundary` 优先于空格载体：导入闸口的求解结果走这个字段送进来，
+                // 而空格表达不了单音节（`xian` 的 0b1 join 后无空格，split 回来是 0）。
+                let (code, spaced_b) = wdict::split_spaced_code(&r.code);
+                wind_userdata::runtime::TempWord {
+                    code,
+                    text: r.text.clone(),
+                    weight: r.weight,
+                    count: r.count,
+                    created_at: 0,
+                    boundary: r.boundary.unwrap_or(spaced_b),
                 }
-            }
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(rows.len())
-        })
+            })
+            .collect();
+        let n = self.runtime().import_temp_rows(schema, &rows)?;
+        self.bump_words_gen(schema);
+        Ok(n)
     }
 
     /// 清空某方案全部临时词（单写事务），返回删除条数。
     pub fn clear_temp_words(&self, schema: &str) -> anyhow::Result<usize> {
-        let prefix = format!("{schema}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range(prefix.as_str()..)? {
-                        let (k, _) = item?;
-                        let key = k.value();
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        ks.push(key.to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in &keys {
-                    t.remove(k.as_str())?;
-                }
-            }
-            abbrev_index::clear_schema(&mut txn.open_table(TEMP_ABBREV)?, schema)?;
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(n)
-        })
+        let n = self.runtime().clear_temp(schema)?;
+        self.bump_words_gen(schema);
+        Ok(n)
     }
 
     /// 删除临时词（不存在静默成功）。
     pub fn remove_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                // 先读边界才能算出索引键——删主表之后就查不到了，顺序不可调换。
-                let b = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_val(g.value()))
-                    .map(|(_, _, _, b)| b);
-                t.remove(key.as_str())?;
-                if let Some(b) = b {
-                    abbrev_index::remove(&mut txn.open_table(TEMP_ABBREV)?, schema, code, text, b)?;
-                }
-            }
-            txn.commit()?;
-            self.bump_words_gen(schema);
-            Ok(())
-        })
+        self.runtime().remove_temp(schema, code, text)?;
+        self.bump_words_gen(schema);
+        self.after_write();
+        Ok(())
     }
 
     /// 晋升：把临时词移入用户词库，并从临时库删除。返回是否发生晋升。
     /// 权重统一取 `PROMOTED_WEIGHT`（与已存在的用户词权重取 max，不覆盖手动加词的更高权重，
     /// 不再沿用临时词自身权重）；count=temp+user，created_at 优先保留 user 旧值。
     pub fn promote_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<bool> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let promoted;
-            {
-                let mut temp_t = txn.open_table(TEMP_WORDS)?;
-                let temp = temp_t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                match temp {
-                    None => promoted = false,
-                    Some((_tw, tc, tca, tb)) => {
-                        {
-                            let mut user_t = txn.open_table(USER_WORDS)?;
-                            // boundary 随词一起晋升：临时词由造词算得（有边界），用户词侧若已有
-                            // 非 0 值则沿用（同 code/text 的切分确定，且旧值来源未必更差）。
-                            let existing = user_t
-                                .get(key.as_str())?
-                                .and_then(|g| dec_val_ordered(g.value()));
-                            // order：已在用户词表里的沿用原号，新晋升的领一个新号。
-                            // 不可用 24B 的 `enc_val` 写这里 —— 那会把导入词条既有的入库序号
-                            // 抹成 0，把它顶到该 code 下所有词之前，且「用过一阵子」才显形。
-                            let (nw, nc, nca, nb, no) = match existing {
-                                Some((uw, uc, uca, ub, uo)) => (
-                                    uw.max(PROMOTED_WEIGHT),
-                                    tc + uc,
-                                    uca,
-                                    if ub != 0 { ub } else { tb },
-                                    uo,
-                                ),
-                                None => (
-                                    PROMOTED_WEIGHT,
-                                    tc,
-                                    tca,
-                                    tb,
-                                    crate::user_words::take_word_orders(&txn, 1)?,
-                                ),
-                            };
-                            user_t.insert(
-                                key.as_str(),
-                                enc_val_ordered(nw, nc, nca, nb, no).as_slice(),
-                            )?;
-                            // ⚠️ **本文件里唯一写用户词表的路径**。按文件名去数用户词的写路径
-                            // 必漏这一处——晋升住在临时词模块里。漏了它，自动学习晋升上来的词
-                            // 就永远进不了简拼索引，且要「用一段时间后」才显形。
-                            abbrev_index::shift(
-                                &mut txn.open_table(USER_ABBREV)?,
-                                schema,
-                                code,
-                                text,
-                                existing.map(|(_, _, _, ub, _)| ub),
-                                nb,
-                            )?;
-                        }
-                        temp_t.remove(key.as_str())?;
-                        abbrev_index::remove(
-                            &mut txn.open_table(TEMP_ABBREV)?,
-                            schema,
-                            code,
-                            text,
-                            tb,
-                        )?;
-                        promoted = true;
-                    }
-                }
-            }
-            txn.commit()?;
-            if promoted {
-                self.bump_words_gen(schema);
-            }
-            Ok(promoted)
-        })
+        // 先写用户词、再删临时词：崩溃在两步之间两边各有一份，用户层去重兜得住；反过来会丢词。
+        // `add_user_word` 本身就是「已存在则权重取 max、0 边界补齐」，与旧事务里的合并一致；
+        // count 相加不再保留（用户词 P2 起没有 count）。
+        let Some(tw) = self.runtime().temp_word(schema, code, text) else {
+            return Ok(false);
+        };
+        self.add_user_word(schema, code, text, PROMOTED_WEIGHT, tw.boundary)?;
+        self.runtime().remove_temp(schema, code, text)?;
+        self.bump_words_gen(schema);
+        self.after_write();
+        Ok(true)
     }
 }
 
@@ -561,8 +331,8 @@ mod tests {
         assert_eq!(b("xian", "先"), 0b1, "单音节边界必须存活");
         assert_eq!(
             b("gong", "工"),
-            0,
-            "不给显式边界 ⇒ 空格载体推不出单音节，退化为 0（旧路径不变）"
+            0b1,
+            "不给显式边界：拼音文本里单个汉字按单音节读（与用户词文本同一规则，P5）"
         );
         assert_eq!(b("nihao", "你好"), 0b101);
         let _ = std::fs::remove_file(&path);
@@ -635,95 +405,6 @@ mod tests {
             .unwrap();
         s.clear_temp_words("py").unwrap();
         assert!(hit("zj").is_empty(), "clear 应清索引");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 复选只加 count，不该动索引——这正是索引 value 留空的收益。
-    #[test]
-    fn temp_count_bump_does_not_touch_the_index() {
-        let p = tmp("wind_temp_abbrev_count.redb");
-        let s = Store::open(&p).unwrap();
-        s.learn_temp_word("py", "nihao", "你好", 500, 0b101)
-            .unwrap();
-        let before = s.abbrev_index_len();
-        s.learn_temp_word("py", "nihao", "你好", 500, 0b101)
-            .unwrap();
-        s.increment_temp_if_exists("py", "nihao", "你好").unwrap();
-        assert_eq!(s.abbrev_index_len(), before, "索引条数不该变");
-        assert_eq!(
-            s.search_temp_words_by_abbrev("py", "nh", 0).unwrap().len(),
-            1
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **重开库时自动补建**：老库升级上来索引是空的，若等调用方来判断就会漏
-    /// （`Store::open` 有协调器/设置页/备份还原等多个入口），而漏掉的表现是静默失效。
-    #[test]
-    fn reopening_an_unindexed_db_backfills_automatically() {
-        let p = tmp("wind_abbrev_backfill.redb");
-        {
-            let s = Store::open(&p).unwrap();
-            s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
-            s.learn_temp_word("py", "haoya", "好呀", 500, 0b1001)
-                .unwrap();
-            // 模拟老库：主表有数据、索引为空
-            s.with_db(|db| {
-                let txn = db.begin_write()?;
-                for t in [USER_ABBREV, TEMP_ABBREV] {
-                    abbrev_index::clear_schema(&mut txn.open_table(t)?, "py")?;
-                }
-                txn.commit()?;
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(s.abbrev_index_len(), 0, "前提：索引确实被清空了");
-        }
-        let s = Store::open(&p).unwrap();
-        assert_eq!(s.abbrev_index_len(), 2, "重开时应自动补建");
-        assert_eq!(
-            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
-            1
-        );
-        assert_eq!(
-            s.search_temp_words_by_abbrev("py", "hy", 0).unwrap().len(),
-            1
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 存量数据补建覆盖**两张**索引：只补用户词等于临时词简拼仍然失效。
-    #[test]
-    fn rebuild_covers_both_tables() {
-        let p = tmp("wind_temp_abbrev_rebuild.redb");
-        let s = Store::open(&p).unwrap();
-        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
-        s.learn_temp_word("py", "haoya", "好呀", 500, 0b1001)
-            .unwrap();
-
-        // 模拟老库：主表有数据、两张索引都空
-        s.with_db(|db| {
-            let txn = db.begin_write()?;
-            for t in [USER_ABBREV, TEMP_ABBREV] {
-                let mut idx = txn.open_table(t)?;
-                abbrev_index::clear_schema(&mut idx, "py")?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(s.abbrev_index_len(), 0, "前提：索引确实被清空了");
-
-        assert_eq!(s.rebuild_abbrev_indexes().unwrap(), 2);
-        assert_eq!(
-            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
-            1
-        );
-        assert_eq!(
-            s.search_temp_words_by_abbrev("py", "hy", 0).unwrap().len(),
-            1,
-            "临时词表也要补建"
-        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -852,19 +533,21 @@ mod tests {
         let s = Store::open(&path).unwrap();
         // 该被淘汰的是 created_at 更早的 zz_old，而它的 key 字典序排在后面：排序键一旦
         // 漏掉 created_at，稳定排序会保持 range 的字典序，删掉的就变成 aa_new。
-        s.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(TEMP_WORDS)?;
-                for (code, text, ca) in [("aa_new", "新造", 100i64), ("zz_old", "老词", 50)] {
-                    let key = enc_key("wb", code, text);
-                    t.insert(key.as_str(), enc_val(800, 1, ca, 0).as_slice())?;
-                }
+        // P1 起临时词在运行时引擎：用带时刻的操作直接造（created_at 取操作时刻）。
+        use wind_userdata::engine::Op;
+        use wind_userdata::record::{OpKind, Payload, Target};
+        let mut ops = Vec::new();
+        for (code, text, ca) in [("aa_new", "新造", 100i64), ("zz_old", "老词", 50)] {
+            for (kind, payload) in [
+                (OpKind::Upsert, Payload::Weight(800)),
+                (OpKind::Incr, Payload::Count(1)),
+            ] {
+                let mut op = Op::new(Target::Temp, "wb", kind, code, text, payload, 0);
+                op.ts_ms = ca * 1000;
+                ops.push(op);
             }
-            txn.commit()?;
-            Ok(())
-        })
-        .unwrap();
+        }
+        s.runtime().data().apply_batch(&ops).unwrap();
         assert_eq!(s.evict_temp_words("wb", 1).unwrap(), 1);
         assert!(
             s.get_temp_words("wb", "zz_old").unwrap().is_empty(),
@@ -924,10 +607,9 @@ mod tests {
         assert!(s.promote_temp_word("wb", "a", "工").unwrap());
         // 临时库已删
         assert!(s.get_temp_words("wb", "a").unwrap().is_empty());
-        // 晋升权重统一取 PROMOTED_WEIGHT（不沿用临时权重），count 累计保留
+        // 晋升权重统一取 PROMOTED_WEIGHT（不沿用临时权重）；用户词 P2 起没有 count
         let u = s.get_user_words("wb", "a").unwrap();
         assert_eq!(u[0].weight, PROMOTED_WEIGHT);
-        assert_eq!(u[0].count, 2);
         // 已存在更高权重的手动加词：晋升不应下调，取 max
         s.add_user_word("wb", "b", "戈", 1200, 0).unwrap();
         s.learn_temp_word("wb", "b", "戈", 800, 0).unwrap();
@@ -936,5 +618,35 @@ mod tests {
         // 不存在的临时词晋升返回 false
         assert!(!s.promote_temp_word("wb", "z", "无").unwrap());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review Focus 5：门面委托后代次推进时机与旧实现一致。
+    #[test]
+    fn temp_writes_bump_generations_like_before() {
+        let s = Store::open(tmp("wind_tw_gens.redb")).unwrap();
+        let (w0, c0) = (s.words_generation(), s.words_count_generation());
+        s.learn_temp_word("py", "a", "甲", 800, 0).unwrap();
+        assert!(s.words_generation() > w0, "新词推进结构代次");
+        let (w1, c1) = (s.words_generation(), s.words_count_generation());
+        assert_eq!(c1, c0);
+        s.learn_temp_word("py", "a", "甲", 800, 0).unwrap();
+        assert_eq!(s.words_generation(), w1, "count+1 不推进结构代次");
+        assert!(s.words_count_generation() > c1);
+        s.remove_temp_word("py", "a", "甲").unwrap();
+        assert!(s.words_generation() > w1);
+    }
+
+    /// §10 退出判据：按键路径（学习 / 点查 / 临时词层查询）不经过 redb Mutex。
+    #[test]
+    fn temp_hot_path_does_not_touch_redb() {
+        let s = std::sync::Arc::new(Store::open(tmp("wind_tw_hot.redb")).unwrap());
+        s.pause().unwrap(); // redb 暂停：with_db 一律报错
+        s.learn_temp_word("py", "nihao", "你好", 800, 0b101)
+            .unwrap();
+        assert_eq!(s.get_temp_word("py", "nihao", "你好").unwrap(), Some(1));
+        let layer = crate::StoreTempLayer::new(s.clone(), "py");
+        use wind_dict::DictLayer;
+        assert_eq!(layer.search("nihao", 0).len(), 1);
+        assert_eq!(layer.search_abbrev("nh", 0).len(), 1);
     }
 }

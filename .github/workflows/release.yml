@@ -399,6 +399,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true                          # 人工审核 Release Notes 后再发布
+          # 版本号带 '-'(0.127.0-beta.1 之类)即预发布:下游 release-published.yml 据此
+          # 不推应用内升级元数据、不进 winget / Scoop。发布时别手动取消这个勾。
+          prerelease: ${{ contains(env.BUILD_VERSION, '-') }}
           name: 清风输入法 v${{ env.BUILD_VERSION }}
           # 正文里的 user-facing 标记块是给人填的:发布前把面向用户的更新说明写进标记内。
           # 两个下游按此标记取内容 —— 文档仓 scripts/sync_release_notes.py(→ 官网更新记录)

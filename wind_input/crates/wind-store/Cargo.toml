@@ -8,6 +8,8 @@ redb = { workspace = true }
 wind-utils = { path = "../wind-utils" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +18,10 @@ chrono = "0.4"
 # 词条文本域的转义分流判据（`is_cmdbar_grammar`）：命令栏语法条目的反斜杠归 lexer 管，
 # 本层不得再转一次。判据只此一份，抄第二份就是下次漂移的起点。
 wind-cmdbar = { path = "../wind-cmdbar" }
+wind-wdict = { path = "../wind-wdict" }
+wind-dict = { path = "../wind-dict" }
+wind-candidate = { path = "../wind-candidate" }
+wind-userdata = { path = "../wind-userdata" }
 
 [lints]
 workspace = true

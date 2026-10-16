@@ -1,10 +1,7 @@
-//! Store 核心：基于 redb 的持久化存储（骨架）
+//! Store 核心：打开用户数据引擎、把 `data/` 下的文本绑定上、跑旧库迁移。
 //!
-//! 与 Go 版本 `wind_input/internal/store/store.go`（bbolt）对齐，但用 redb。
-//! 见 docs/redesign/store.md：redb 无嵌套 bucket，用扁平 table + schema 前缀复合 key。
-//!
-//! 本提交为**骨架**：open / 表定义 / 事务封装 / pause-resume（Windows 热替换释放文件锁）/
-//! version + 迁移框架。用户词/临时词/词频/shadow 的具体 ops 在后续提交按 store.md §10.2 实现。
+//! 全部用户数据的真源在用户目录 `data/`（设计 `docs/design/user-data-storage-redesign.md`
+//! §2.1）。redb（`userdata.redb`）只在旧库链（P1–P4a）未迁完时打开、只读旧表；迁完后不再打开。
 
 use redb::{Database, TableDefinition};
 use std::path::{Path, PathBuf};
@@ -25,7 +22,7 @@ pub const CURRENT_VERSION: u32 = 1;
 /// 常规输入根本填不满缓存，只有设置页的词库列举（全表顺序扫）会填一次。故本值真正的
 /// 作用是**给超大词库一个显式上界**（50 万词的库约 90 MB），而不是解决 19 万词的内存。
 ///
-/// ## 取值：由 `perf_cache_size.rs` 双向标定
+/// ## 取值：由 `perf_cache_size.rs` 双向标定（用户词 P2 迁出 redb 后该探针已删，结论留作记录）
 ///
 /// 读路径（简拼召回 / 前缀补全 / 全量列举）对本值**几乎不敏感**：redb 2.x 不是 mmap，
 /// 未命中走 `read` 系统调用、由 OS 页缓存供数据，是 µs 级 syscall 而非磁盘寻道——
@@ -49,6 +46,12 @@ pub const SCAN_RECLAIM_IDLE: std::time::Duration = std::time::Duration::from_sec
 /// 回收线程的采样拍长。短档只有 3 秒，拍长须远小于它。只在有东西待回收时按它醒；
 /// 闲置时按它的 [`IDLE_TICK_FACTOR`] 倍睡（生产 10 秒），来了标记就被叫醒。
 pub const RECLAIM_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 用户数据后台节拍：文本目标（用户词）空闲折回不依赖下一次写入，停手后这么久之内一定写回。
+pub const USERDATA_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 小文件（补全历史）去抖落盘的节拍（设计 §2.4：2 秒）。
+pub const SMALL_FILE_FLUSH: std::time::Duration = std::time::Duration::from_secs(2);
 /// 闲置慢拍 = `tick` × 本值。
 const IDLE_TICK_FACTOR: u32 = 10;
 /// [`Store::mark_scan_pending_rows`] 的门槛：后台扫描走过的行数不到它就不标记。
@@ -69,15 +72,15 @@ fn open_db(path: &Path, cache_bytes: usize) -> Result<Database, redb::DatabaseEr
 }
 
 // ── 表定义（key 编码见 store.md §2：复合 key 带 schema 前缀，redb 扁平）──
-/// 用户词：key = "{schema}\0{code}\0{text}"，value = 序列化记录
+/// 用户词（旧表）：key = "{schema}\0{code}\0{text}"，value = 序列化记录。P2 起真源是
+/// `user/<schema>/user.dict.yaml`，本表只供迁移读、只读保留到 P4。
 pub(crate) const USER_WORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("user_words");
 /// 临时词：同上
 pub(crate) const TEMP_WORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("temp_words");
 /// 用户词**简拼索引**：key = `"{schema}\0{group}\0{code}\0{text}"`，value 空。
 /// 键的构成、分组规则与维护契约全在 [`crate::abbrev_index`]。
 ///
-/// 新表无需迁移：`init_tables` 在写事务里 `open_table` 即创建；存量数据的索引由
-/// [`Store::rebuild_abbrev_indexes`] 在首次发现索引为空时补建。
+/// P2 起退役：用户词简拼走引擎的分组索引，本表只读保留到 P4。
 pub(crate) const USER_ABBREV: TableDefinition<&str, &[u8]> = TableDefinition::new("user_abbrev");
 /// 临时词**简拼索引**：与 [`USER_ABBREV`] 同构，索引 `TEMP_WORDS`。
 ///
@@ -153,9 +156,70 @@ enum Dropped {
     Busy,
 }
 
+/// 引擎状态目录、目录 id 与用户词文本目录（设计 §2.1 / §3.7）。生产 = `local_dir()/state/runtime/<dir_id>`
+/// + `meta.toml` 的 dir_id + `<userdata>/user`。
+#[derive(Clone, Debug)]
+pub struct StateLoc {
+    pub state_dir: PathBuf,
+    pub dir_id: String,
+    /// 用户词文本的根：`<text_dir>/<schema>/user.dict.yaml`。
+    pub text_dir: PathBuf,
+    /// 用户目录已记为迁完（协调器据 `meta.toml` 的 `format_version` 判定）。为真时不再从旧 redb
+    /// 迁移：本机状态目录里的迁移标记丢了（清 state、换机）也只补写标记——重迁会把升级后删掉的
+    /// 数据从旧表合并回来。
+    pub legacy_done: bool,
+}
+
+/// `Store::open(path)` 的引擎状态目录：redb 文件名后追加 `.state`。测试与工具用；生产走
+/// [`Store::open_with_state`]。
+pub fn derived_state_dir(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".state");
+    PathBuf::from(s)
+}
+
+/// `Store::open(path)` 的用户词文本目录：redb 文件名后追加 `.user`（与派生状态目录一起随新库清空）。
+pub fn derived_text_dir(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".user");
+    PathBuf::from(s)
+}
+
 /// 存储引擎（redb）。`db` 为 None 表示已暂停（pause，释放文件锁供热替换）。
 pub struct Store {
     path: PathBuf,
+    /// 运行时数据引擎（临时词 / 草稿 / 词频 / 联想历史，设计 §6 P1）。四组 API 委托给它。
+    runtime: std::sync::Arc<wind_userdata::runtime::Runtime>,
+    /// 引擎状态目录（迁移标记也在这里）。
+    state_dir: PathBuf,
+    /// 用户词文本根目录（P2 起用户词的真源）。
+    text_dir: PathBuf,
+    /// 旧库链（P1–P4a）已迁完：来自 `meta.toml`（`StateLoc::legacy_done`），或本进程里
+    /// `format_version` 刚写到 5、标记已删（`forget_legacy_markers`）。
+    pub(crate) legacy_done: std::sync::atomic::AtomicBool,
+    /// 各方案的 Shadow 规则表（P3 起真源是 `user/<schema>/shadow.dict.yaml`），首次访问时载入。
+    /// 每日统计文件读改写的串行化（收集器 flush 与设置页查询 / 清理并发）。
+    pub(crate) stats_io: Mutex<()>,
+    /// 补全历史（P4a 起内存持有，去抖落盘到状态目录）。
+    pub(crate) completions: Mutex<crate::completion::CompletionState>,
+    /// 补全历史落盘的串行化（落盘在数据锁外做）。
+    pub(crate) completion_io: Mutex<()>,
+    /// 快捷格式调整 / 常用字覆盖的真源文件（P4a 起，首次访问时载入）。
+    pub(crate) quick_doc: std::sync::OnceLock<wind_userdata::text::doc::TextDoc>,
+    pub(crate) common_doc: std::sync::OnceLock<wind_userdata::text::doc::TextDoc>,
+    /// 快捷格式 / 常用字覆盖的最后一次好数据（文件手改坏了时继续服务，§2.5）。
+    pub(crate) quick_good: crate::last_good::LastGood<crate::quick_format::QuickFile>,
+    pub(crate) common_good: crate::last_good::LastGood<std::collections::BTreeMap<String, bool>>,
+    /// 字符集用户层目录的上次指纹（`None` = 还没取过）。
+    pub(crate) charsets_fp: Mutex<Option<String>>,
+    /// 系统短语（来自 TOML，协调器交进来；P3 起不落库）。
+    pub(crate) phrase_sys: std::sync::RwLock<std::sync::Arc<Vec<crate::phrases::SystemPhrase>>>,
+    /// 用户短语文件表（首次访问时载入）。
+    pub(crate) phrase_table:
+        std::sync::OnceLock<std::sync::Arc<wind_userdata::text::table::TextTable>>,
+    pub(crate) shadows: Mutex<
+        std::collections::HashMap<String, std::sync::Arc<wind_userdata::text::table::TextTable>>,
+    >,
     db: Mutex<Option<Database>>,
     /// 本库的页缓存上限；`resume` 重开时要用同一个值，故随实例存着。
     cache_bytes: usize,
@@ -201,26 +265,95 @@ pub struct Store {
     words_epoch: std::sync::atomic::AtomicU64,
 }
 
+impl Drop for Store {
+    /// 释放前把还没落盘的小文件写掉（进程正常退出、测试、工具不起落盘线程时靠它）。
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_small_files() {
+            warn!("释放时小文件落盘失败：{e:#}");
+        }
+    }
+}
+
 impl Store {
-    /// 打开数据库：创建/打开 redb，建表，运行版本迁移。
+    /// 打开数据库，引擎状态放在派生目录（见 [`derived_state_dir`]）。redb 文件此前不存在 ⇒
+    /// 视为新库，先清空派生目录（新库配新状态，测试反复用同一路径时不串数据）。
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::open_with_cache_size(path, DEFAULT_CACHE_SIZE_BYTES)
     }
 
-    /// 指定页缓存上限打开。供 `perf_cache_size.rs` 标定用；生产走 [`Self::open`]。
+    /// 生产入口：引擎状态放在给定目录，从不清空。
+    pub fn open_with_state(path: impl AsRef<Path>, loc: StateLoc) -> anyhow::Result<Self> {
+        Self::open_inner(path.as_ref(), DEFAULT_CACHE_SIZE_BYTES, loc)
+    }
+
+    /// 指定页缓存上限打开（状态目录同 [`Self::open`]）。
     pub fn open_with_cache_size(
         path: impl AsRef<Path>,
         cache_bytes: usize,
     ) -> anyhow::Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
+        let derived = derived_state_dir(path);
+        let text_dir = derived_text_dir(path);
+        if !path.exists() {
+            let _ = std::fs::remove_dir_all(&derived);
+            let _ = std::fs::remove_dir_all(&text_dir);
+        }
+        Self::open_inner(
+            path,
+            cache_bytes,
+            StateLoc {
+                state_dir: derived,
+                dir_id: "derived".into(),
+                text_dir,
+                legacy_done: false,
+            },
+        )
+    }
+
+    fn open_inner(path: &Path, cache_bytes: usize, loc: StateLoc) -> anyhow::Result<Self> {
+        let path = path.to_path_buf();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let db = open_db(&path, cache_bytes)?;
-        Self::init_tables(&db)?;
+        // 迁移全部完成过的库不再打开旧 redb：不锁、不写，文件原样留给回退的旧版本。判据是
+        // meta.toml 的 format_version（`legacy_done`）；标记只在旧库链进行中作断点续做用。
+        let fully_migrated = loc.legacy_done
+            || crate::migrate_p3::ALL_MIGRATION_MARKERS
+                .iter()
+                .all(|m| loc.state_dir.join(m).is_file());
+        let db = if fully_migrated {
+            None
+        } else {
+            let db = open_db(&path, cache_bytes)?;
+            Self::init_tables(&db)?;
+            Some(db)
+        };
+        let state_dir = loc.state_dir.clone();
+        let ud = wind_userdata::engine::UserData::open(wind_userdata::engine::Dirs {
+            state_dir: loc.state_dir.clone(),
+            dir_id: loc.dir_id.clone(),
+        })?;
+        let runtime = std::sync::Arc::new(wind_userdata::runtime::Runtime::new(
+            std::sync::Arc::new(ud),
+        ));
         let store = Self {
             path,
-            db: Mutex::new(Some(db)),
+            runtime,
+            state_dir: state_dir.clone(),
+            text_dir: loc.text_dir.clone(),
+            legacy_done: std::sync::atomic::AtomicBool::new(loc.legacy_done),
+            shadows: Mutex::new(std::collections::HashMap::new()),
+            phrase_sys: Default::default(),
+            completions: Mutex::new(Default::default()),
+            completion_io: Mutex::new(()),
+            stats_io: Mutex::new(()),
+            quick_doc: std::sync::OnceLock::new(),
+            common_doc: std::sync::OnceLock::new(),
+            quick_good: Default::default(),
+            common_good: Default::default(),
+            charsets_fp: Mutex::new(None),
+            phrase_table: std::sync::OnceLock::new(),
+            db: Mutex::new(db),
             cache_bytes,
             touched: std::sync::atomic::AtomicBool::new(false),
             drops: std::sync::atomic::AtomicU64::new(0),
@@ -231,44 +364,211 @@ impl Store {
             words_gen_by_schema: Default::default(),
             words_epoch: std::sync::atomic::AtomicU64::new(0),
         };
+        if fully_migrated {
+            store.bind_user_texts_at_open();
+            store.bind_learned_texts_at_open();
+            store.remember_charsets_fp();
+            info!(
+                "Store opened: {}（旧库已迁完，不再打开）",
+                store.path.display()
+            );
+            return Ok(store);
+        }
         store.run_migrations()?;
-        store.backfill_abbrev_indexes();
+        store.bind_user_texts_at_open();
+        store.bind_learned_texts_at_open();
+        if let Err(e) = store.migrate_p1_if_needed(&state_dir) {
+            // 迁移失败不阻断启动：标记没写，下次启动重做（与引擎已有数据合并，这一轮的写入
+            // 不会被旧表盖掉）；本次运行只能看到已迁成的那些目标。协调器据 `migrated_p1()`
+            // 决定是否升 format_version——没迁完就不升，旧版本回退后仍可用旧表。
+            warn!("P1 迁移失败，下次启动重试：{e}");
+        }
+        if let Err(e) = store.migrate_p2_if_needed(&state_dir) {
+            // 同 P1：不阻断启动，标记没写下次重做（合并，幂等）；没迁完不升 format_version
+            warn!("P2 迁移失败，下次启动重试：{e}");
+        }
+        if let Err(e) = store.migrate_p3_shadow_if_needed(&state_dir) {
+            warn!("P3 Shadow 迁移失败，下次启动重试：{e}");
+        }
+        if let Err(e) = store.migrate_p4_if_needed(&state_dir) {
+            warn!("P4a 迁移失败，下次启动重试：{e}");
+        }
+        // 字符集用户层的基线指纹：没有它，启动后第一次手改 sync 时比不出变化
+        store.remember_charsets_fp();
         info!(
             "Store opened: {} (v{})",
             store.path.display(),
             store.version().unwrap_or(0)
         );
+        store.release_legacy_db_if_migrated();
         Ok(store)
     }
 
-    /// 存量库补建简拼索引：升级到带索引的版本时，老库里的词一条索引都没有，
-    /// 不补建则简拼**静默召不回**（比慢更糟）。
-    ///
-    /// 放在 `open` 里而不是交给调用方判断，是因为 `Store::open` 有多个入口（协调器、
-    /// 设置页、备份还原、各类测试）——留给调用方就等于留一个「忘了调」的口子，
-    /// 而这类遗漏的表现是静默失效。
-    ///
-    /// 常态开销 O(1)：索引条目数与主表条目数恒等（每条词正好一条索引），
-    /// 故只有「索引空而主表非空」时才会真正扫一遍。失败只记日志不阻断启动——
-    /// 简拼召不回是退化，打不开词库是故障，不该用后者换前者。
-    fn backfill_abbrev_indexes(&self) {
-        let need = self
-            .with_db(|db| {
-                use redb::ReadableTableMetadata;
-                let txn = db.begin_read()?;
-                let idx =
-                    txn.open_table(USER_ABBREV)?.len()? + txn.open_table(TEMP_ABBREV)?.len()?;
-                let main =
-                    txn.open_table(USER_WORDS)?.len()? + txn.open_table(TEMP_WORDS)?.len()?;
-                Ok(idx == 0 && main > 0)
-            })
-            .unwrap_or(false);
-        if !need {
+    /// 迁移全部完成就放下旧 redb（释放文件锁）。短语迁移要等系统短语，常是最后一步，
+    /// 故打开时与短语迁移之后各查一次。
+    pub(crate) fn release_legacy_db_if_migrated(&self) {
+        if !self.legacy_chain_done() {
             return;
         }
-        match self.rebuild_abbrev_indexes() {
-            Ok(n) => info!("简拼索引补建完成：{} 条", n),
-            Err(e) => warn!("简拼索引补建失败（简拼召回将失效）：{}", e),
+        let mut guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.take().is_some() {
+            info!("旧库已全部迁完，释放：{}", self.path.display());
+        }
+    }
+
+    /// P1 迁移是否已完成（标记 `migrated-p1` 在）。协调器据此决定能否升 `format_version`。
+    pub fn migrated_p1(&self) -> bool {
+        self.state_dir
+            .join(crate::migrate_p1::MIGRATED_P1)
+            .is_file()
+    }
+
+    pub fn user_text_dir(&self) -> &Path {
+        &self.text_dir
+    }
+
+    /// 某数据方案的用户词文本：`<text_dir>/<schema>/user.dict.yaml`。
+    pub fn user_text_path(&self, schema: &str) -> PathBuf {
+        self.text_dir.join(schema).join("user.dict.yaml")
+    }
+
+    /// 该方案的用户词绑定到文本（已绑定即返回）。同步失败（文本隔离 / 读不了）只 WARN：绑定照样
+    /// 登记，之后的折回 / 同步会重试；查询按已有段与 delta 提供。
+    pub(crate) fn ensure_user_text(&self, schema: &str) {
+        use wind_userdata::record::Target;
+        let ud = self.runtime.data();
+        if ud.text_binding(Target::User, schema).is_some() {
+            return;
+        }
+        let b = wind_userdata::engine::TextBinding {
+            path: self.user_text_path(schema),
+            name: format!("{schema}.user"),
+            lowercase: false,
+            syllable_codes: schema == "pinyin",
+            format: wind_userdata::engine::TextFormat::Words,
+        };
+        if let Err(e) = ud.bind_text(Target::User, schema, b) {
+            warn!("用户词文本 {schema} 同步失败（按已有数据提供查询）：{e:#}");
+        }
+    }
+
+    /// 有用户词的方案：用户目录下已有文本的 ∪ 引擎里有用户词数据的。
+    pub(crate) fn user_text_schemas(&self) -> std::collections::BTreeSet<String> {
+        let mut schemas: std::collections::BTreeSet<String> = self
+            .runtime
+            .data()
+            .keys()
+            .into_iter()
+            .filter(|(t, _)| *t == wind_userdata::record::Target::User)
+            .map(|(_, s)| s)
+            .collect();
+        if let Ok(rd) = std::fs::read_dir(&self.text_dir) {
+            for e in rd.flatten() {
+                if e.path().join("user.dict.yaml").is_file()
+                    && let Some(n) = e.file_name().to_str()
+                {
+                    schemas.insert(n.to_string());
+                }
+            }
+        }
+        schemas
+    }
+
+    /// 打开时把已有用户词的方案都绑定上（重开后归文本管的目标要绑定了才能折回）。
+    fn bind_user_texts_at_open(&self) {
+        for s in self.user_text_schemas() {
+            self.ensure_user_text(&s);
+        }
+    }
+
+    /// 学到的数据（P5）：设定按规则绑定到 `<text_dir>/<schema>/` 的文本，再把已有数据的方案
+    /// （引擎里有段 / 待处理操作的 ∪ 目录下已有对应文件的）都绑上。单个失败只 WARN。
+    fn bind_learned_texts_at_open(&self) {
+        use crate::learned_text::learned_binding;
+        let ud = self.runtime.data();
+        let dir = self.text_dir.clone();
+        ud.set_text_rule(Box::new(move |t, s| learned_binding(&dir, t, s)));
+        for (t, s) in self.learned_text_keys() {
+            if let Err(e) = ud.bind_by_rule(t, &s) {
+                warn!("数据文件绑定失败（按已有数据提供查询）：{e:#}");
+            }
+        }
+    }
+
+    /// 有学到的数据的 (目标, 方案)：引擎里有段 / 待处理操作的 ∪ 文本目录下已有对应文件的。
+    pub(crate) fn learned_text_keys(
+        &self,
+    ) -> std::collections::BTreeSet<(wind_userdata::record::Target, String)> {
+        use crate::learned_text::{LEARNED_TARGETS, learned_binding};
+        let ud = self.runtime.data();
+        let mut keys: std::collections::BTreeSet<(wind_userdata::record::Target, String)> = ud
+            .keys()
+            .into_iter()
+            .filter(|(t, _)| LEARNED_TARGETS.contains(t))
+            .collect();
+        for e in std::fs::read_dir(&self.text_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Some(schema) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            for t in LEARNED_TARGETS {
+                if learned_binding(&self.text_dir, t, &schema).is_some_and(|b| b.path.is_file()) {
+                    keys.insert((t, schema.clone()));
+                }
+            }
+        }
+        keys
+    }
+
+    /// 用户数据目录下各文件的问题（§2.5：坏行 / 隔离 / 已重建 / 未迁移），按路径排序。
+    pub fn data_issues(&self) -> Vec<crate::issues::FileIssue> {
+        crate::issues::list_under(&self.text_dir)
+    }
+
+    /// 起用户数据后台节拍（生产由协调器起；测试 / 工具不起，靠显式折回）。只读实例不起。
+    pub fn spawn_userdata_ticker(&self, every: std::time::Duration) {
+        let _ = self.runtime.data().spawn_ticker(every);
+    }
+
+    /// 小文件（补全历史，P4a）有改动就落盘。去抖落盘线程、`Store` 释放、`dict.flush` 调。
+    pub fn flush_small_files(&self) -> anyhow::Result<()> {
+        self.flush_completions()
+    }
+
+    /// 小文件去抖落盘线程（生产由协调器起；测试 / 工具靠 `Drop` 落盘）。只持 `Weak`。
+    pub fn spawn_small_file_flusher(self: &std::sync::Arc<Self>, every: std::time::Duration) {
+        let weak = std::sync::Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("store-small-files".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    let Some(me) = weak.upgrade() else { return };
+                    if let Err(e) = me.flush_small_files() {
+                        warn!("小文件落盘失败：{e:#}");
+                    }
+                }
+            });
+    }
+
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// 运行时数据引擎。
+    pub fn runtime(&self) -> &std::sync::Arc<wind_userdata::runtime::Runtime> {
+        &self.runtime
+    }
+
+    /// 门面写入之后：攒够了就起后台折回（判定 O(目标数)，单飞）。
+    #[allow(dead_code)]
+    pub(crate) fn after_write(&self) {
+        let d = self.runtime.data();
+        if d.needs_maintain() {
+            d.spawn_maintain();
         }
     }
 
@@ -397,7 +697,7 @@ impl Store {
         })
     }
 
-    /// 写 META 表的字符串值。
+    /// 写 META 表的字符串值（P4a 起只剩迁移测试造旧库用）。
     pub(crate) fn meta_set(&self, key: &str, val: &str) -> anyhow::Result<()> {
         self.with_db(|db| {
             let txn = db.begin_write()?;
@@ -758,23 +1058,18 @@ impl Store {
         &self.path
     }
 
-    /// 枚举按 schema 前缀编码的表（user/temp/freq/shadow/assoc_history）里出现过的全部 schema id。
+    /// 枚举出现过的全部数据方案 id：redb 的用户词 / shadow 表 + 运行时引擎（临时词 / 草稿 / 词频 /
+    /// 联想历史）。
     /// 备份用：确保有数据但未在当前配置启用的方案也被覆盖。
     pub fn list_data_schemas(&self) -> anyhow::Result<Vec<String>> {
-        let mut set = std::collections::BTreeSet::new();
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            for table in [USER_WORDS, TEMP_WORDS, FREQ, SHADOW, ASSOC_HIST] {
-                let t = txn.open_table(table)?;
-                for item in t.range::<&str>(..)? {
-                    let (k, _) = item?;
-                    if let Some((schema, _rest)) = k.value().split_once('\u{0}') {
-                        set.insert(schema.to_string());
-                    }
-                }
+        // 临时词 / 词频 / 联想历史（P1）与用户词（P2）在运行时引擎，`runtime.schemas()` 已含；
+        // Shadow（P3）在 `user/<schema>/shadow.dict.yaml`，有规则的才算
+        let mut set: std::collections::BTreeSet<String> = self.runtime.schemas();
+        for sc in self.shadow_schemas_on_disk() {
+            if !set.contains(&sc) && !self.list_shadow_rules(&sc)?.is_empty() {
+                set.insert(sc);
             }
-            Ok(())
-        })?;
+        }
         Ok(set.into_iter().collect())
     }
 }
@@ -782,6 +1077,113 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// redb 在同一进程里对已打开的文件拒绝再开：能另开一份 ⇒ Store 没握着它（不锁文件）。
+    fn redb_is_released(path: &Path) -> bool {
+        Database::open(path).is_ok()
+    }
+
+    /// 迁移全部完成（短语迁移是最后一步）后立即放下旧库：不再锁文件。
+    #[test]
+    fn legacy_db_is_released_once_fully_migrated() {
+        let path =
+            std::env::temp_dir().join(format!("wind_store_release-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(derived_state_dir(&path));
+        let _ = std::fs::remove_dir_all(derived_text_dir(&path));
+        let s = Store::open(&path).unwrap();
+        assert!(!redb_is_released(&path), "短语还没迁，旧库要留着");
+        s.migrate_phrases_now().unwrap();
+        assert!(s.migrated_p3() && s.migrated_p4());
+        assert!(redb_is_released(&path), "全部迁完就放下旧库");
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(derived_state_dir(&path));
+        let _ = std::fs::remove_dir_all(derived_text_dir(&path));
+    }
+
+    /// 用户目录已记为迁完（`legacy_done`，来自 meta.toml 的 format_version）时，state 里的迁移
+    /// 标记被删了也不再从 redb 重迁：升级后删掉的词不会被旧表带回来，redb 不开、不写；
+    /// 标记不补写（P5 起判据只认 format_version），其余依赖旧库链完成的判断照旧。
+    #[test]
+    fn legacy_done_skips_remigration_even_if_markers_are_deleted() {
+        let path =
+            std::env::temp_dir().join(format!("wind_store_ldone-{}.redb", std::process::id()));
+        let st =
+            std::env::temp_dir().join(format!("wind_store_ldone_state-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&st);
+        let loc = |done: bool| StateLoc {
+            state_dir: st.clone(),
+            dir_id: "d".into(),
+            text_dir: st.join(crate::DATA_DIR_NAME),
+            legacy_done: done,
+        };
+        let del_markers = || {
+            for m in crate::migrate_p3::ALL_MIGRATION_MARKERS {
+                let _ = std::fs::remove_file(st.join(m));
+            }
+        };
+        {
+            let s = Store::open_with_state(&path, loc(false)).unwrap();
+            s.legacy_put_user("wb", "a", "工", 1, 0, 0).unwrap();
+        }
+        // 旧表里的词迁成文本，然后用户在新版本里删掉它
+        del_markers();
+        {
+            let s = Store::open_with_state(&path, loc(false)).unwrap();
+            s.migrate_phrases_now().unwrap();
+            assert_eq!(s.get_user_words("wb", "a").unwrap().len(), 1, "迁进来了");
+            s.remove_user_word("wb", "a", "工").unwrap();
+            s.flush_user_data().unwrap();
+        }
+        del_markers();
+        let before = std::fs::read(&path).unwrap();
+        let s = Store::open_with_state(&path, loc(true)).unwrap();
+        assert!(
+            s.get_user_words("wb", "a").unwrap().is_empty(),
+            "删掉的词不被旧表带回"
+        );
+        assert!(redb_is_released(&path), "不打开旧库");
+        assert!(
+            crate::migrate_p3::ALL_MIGRATION_MARKERS
+                .iter()
+                .all(|m| !st.join(m).exists()),
+            "判据只认 format_version：标记不再补写（P5）"
+        );
+        drop(s);
+        assert!(std::fs::read(&path).unwrap() == before, "旧库文件不被写");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&st);
+    }
+
+    /// 已经迁完的库再打开：根本不碰 redb（不锁、不写——文件逐字节不变，留给回退的旧版本）。
+    #[test]
+    fn fully_migrated_store_never_opens_legacy_db() {
+        let path =
+            std::env::temp_dir().join(format!("wind_store_noopen-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(derived_state_dir(&path));
+        let _ = std::fs::remove_dir_all(derived_text_dir(&path));
+        {
+            let s = Store::open(&path).unwrap();
+            s.migrate_phrases_now().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let s = Store::open(&path).unwrap();
+        assert!(redb_is_released(&path), "迁完的库重开不再打开旧库");
+        s.add_user_word("wb", "a", "工", 1, 0).unwrap();
+        assert_eq!(
+            s.get_user_words("wb", "a").unwrap()[0].text,
+            "工",
+            "照常读写"
+        );
+        drop(s);
+        assert!(std::fs::read(&path).unwrap() == before, "旧库文件不被写");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(derived_state_dir(&path));
+        let _ = std::fs::remove_dir_all(derived_text_dir(&path));
+    }
 
     #[test]
     fn list_data_schemas_across_tables() {
@@ -821,5 +1223,132 @@ mod tests {
             assert_eq!(s.version().unwrap(), CURRENT_VERSION);
         }
         let _ = std::fs::remove_file(&path);
+    }
+    fn tmp_db(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wind_store_rt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d.join(format!("{name}.redb"))
+    }
+
+    #[test]
+    fn open_attaches_runtime_in_derived_state_dir() {
+        let p = tmp_db("derived");
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).unwrap();
+        s.runtime().learn_temp("py", "a", "甲", 1, 0).unwrap();
+        assert!(derived_state_dir(&p).join("journal").is_dir());
+        drop(s);
+        let s = Store::open(&p).unwrap();
+        assert!(
+            s.runtime().temp_word("py", "a", "甲").is_some(),
+            "同一库重开，引擎数据仍在"
+        );
+    }
+
+    /// P5：学到的数据写进用户数据目录的文本（复制用户目录即带走）。
+    #[test]
+    fn learned_data_is_written_to_data_dir() {
+        let p = tmp_db("learned_text");
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).unwrap();
+        s.learn_temp_word("pinyin", "nihao", "你好", 10, 0b101)
+            .unwrap();
+        s.record_freq("pinyin", "nihao", "你好").unwrap();
+        s.record_assoc_pick("pinyin", "我们", "我们的").unwrap();
+        s.flush_user_data().unwrap();
+        let dir = s.user_text_dir().join("pinyin");
+        let temp = std::fs::read_to_string(dir.join("temp.dict.yaml")).unwrap();
+        assert!(temp.contains("你好\tni hao\t10\t1\t"), "{temp}");
+        assert!(dir.join("freq.table.yaml").is_file());
+        assert!(dir.join("assoc.table.yaml").is_file());
+    }
+
+    /// 打开时，`data/` 下已有学到的数据文本（换机复制过来）⇒ 直接绑定、可查。
+    #[test]
+    fn learned_text_copied_from_another_machine_is_bound_at_open() {
+        let p = tmp_db("learned_copy");
+        let _ = std::fs::remove_file(&p);
+        {
+            let s = Store::open(&p).unwrap();
+            s.learn_temp_word("pinyin", "nihao", "你好", 10, 0b101)
+                .unwrap();
+            s.flush_user_data().unwrap();
+        }
+        let text = derived_text_dir(&p).join("pinyin/temp.dict.yaml");
+        let saved = std::fs::read(&text).unwrap();
+        std::fs::remove_dir_all(derived_state_dir(&p)).unwrap();
+        // 派生模式下 redb 在就不清；只删 state，文本留着
+        std::fs::write(&text, &saved).unwrap();
+        let s = Store::open(&p).unwrap();
+        assert!(s.runtime().temp_word("pinyin", "nihao", "你好").is_some());
+    }
+
+    /// Review Focus 4：删掉 redb 再开同一路径 = 新库，派生目录里的旧引擎数据不得残留。
+    #[test]
+    fn fresh_redb_starts_with_empty_runtime() {
+        let p = tmp_db("fresh");
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).unwrap();
+        s.runtime().learn_temp("py", "a", "甲", 1, 0).unwrap();
+        drop(s);
+        std::fs::remove_file(&p).unwrap();
+        let s = Store::open(&p).unwrap();
+        assert!(s.runtime().temp_word("py", "a", "甲").is_none());
+    }
+
+    #[test]
+    fn open_with_state_uses_the_given_dir_and_never_wipes() {
+        let p = tmp_db("explicit");
+        let _ = std::fs::remove_file(&p);
+        let st = std::env::temp_dir().join(format!("wind_store_rt_state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&st);
+        let loc = || StateLoc {
+            state_dir: st.clone(),
+            dir_id: "dir-x".into(),
+            text_dir: st.join(crate::DATA_DIR_NAME),
+            legacy_done: false,
+        };
+        let s = Store::open_with_state(&p, loc()).unwrap();
+        s.runtime().learn_temp("py", "a", "甲", 1, 0).unwrap();
+        drop(s);
+        std::fs::remove_file(&p).unwrap();
+        let s = Store::open_with_state(&p, loc()).unwrap();
+        assert!(
+            s.runtime().temp_word("py", "a", "甲").is_some(),
+            "显式状态目录不随 redb 清空"
+        );
+        assert!(!derived_state_dir(&p).exists());
+    }
+
+    /// 一次很长的 `with_db`（单事务导入、冷扫描）期间不许回收；空闲要从它**结束**时算起——
+    /// 否则它一结束回收线程就立刻关库重开（还会与批量写之后的立即回收撞在一起）。
+    /// （原在 `tests/scan_reclaim.rs`，借用户词遍历的回调制造长操作；P2 起用户词不经 redb，挪到
+    /// 这里直接用 `with_db`。）
+    #[test]
+    fn a_long_operation_is_not_idle_time() {
+        use std::time::Duration;
+        let tick = Duration::from_millis(20);
+        let scan_idle = Duration::from_millis(100);
+        let p = tmp_db("long_op");
+        let _ = std::fs::remove_file(&p);
+        let s = std::sync::Arc::new(Store::open(&p).unwrap());
+        s.spawn_idle_cache_reclaimer(Duration::from_secs(3600), scan_idle, tick);
+        s.mark_scan_pending();
+        s.with_db(|_| {
+            std::thread::sleep(scan_idle * 4);
+            Ok(())
+        })
+        .unwrap();
+        std::thread::sleep(scan_idle / 2);
+        assert_eq!(
+            s.page_cache_drops(),
+            0,
+            "长操作刚结束、还没空闲满短档，不该回收"
+        );
+        let t0 = std::time::Instant::now();
+        while s.page_cache_drops() < 1 && t0.elapsed() < scan_idle * 20 {
+            std::thread::sleep(tick / 2);
+        }
+        assert!(s.page_cache_drops() >= 1, "结束后空闲满短档才回收");
     }
 }

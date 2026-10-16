@@ -739,10 +739,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// S3：大库上用户层编码索引（`UserTextIndex`）建完只标记待回收，库空闲满短档后回收——
-    /// 预热与打字链路触发的后台重建两条路都是；建完当场不回收（不让按键线程等关库重开）。
+    /// 协调器起来就迁完了全部旧数据、放下了 redb：大库上用户层编码索引的预热与后台重建照常，
+    /// 但不再有 redb 页缓存可回收（回收线程空转、不报错）。
     #[test]
-    fn user_text_rebuild_reclaims_after_short_idle() {
+    fn user_text_rebuild_after_migration_has_no_redb_to_reclaim() {
         use std::time::Duration;
         const TICK: Duration = Duration::from_millis(20);
         const SCAN_IDLE: Duration = Duration::from_millis(150);
@@ -777,14 +777,11 @@ mod tests {
             }
             false
         };
-        let d0 = store.page_cache_drops();
+        assert!(store.is_paused(), "迁完即放下旧库");
         assert!(c.engine_mgr.prewarm_text_codes("wubi86"));
-        assert_eq!(store.page_cache_drops(), d0, "预热建完不当场回收");
-        assert!(wait_drops(d0 + 1), "空闲满短档后回收");
-
         store.add_user_word("wubi86", "zzzz", "嗨", 0, 0).unwrap();
         let _ = c.engine_mgr.text_codes("wubi86"); // 过期 ⇒ 后台重建
-        assert!(wait_drops(d0 + 2), "后台重建之后同样在空闲满短档后回收");
+        assert!(!wait_drops(1), "没有 redb 页缓存可回收");
         drop(c);
         let _ = std::fs::remove_file(&path);
     }

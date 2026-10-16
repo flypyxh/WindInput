@@ -732,13 +732,18 @@ mod tests {
         std::fs::write(&sp, swapped).unwrap();
         let (c, _) = coord("cold", &dir);
         type_str(&c, "uidup");
-        {
+        // 「未就绪 ⇒ 原样」只在后台索引**此刻确实还没建好**时才能断言：词库只有四行，
+        // 并行跑测试时后台线程偶尔抢在第一键之前建完（缓存构建路径少读一次源之后更常见），
+        // 那时候选已经是辅助后的，按「未就绪」断言就是假红。就绪与否要看事实，不能当前提。
+        if c.engine_mgr.reverse_index_if_ready(&id).is_none() {
             let st = c.state.lock().unwrap();
             assert!(
                 st.candidates.iter().all(|c| !c.is_direct_aux),
                 "未就绪：原样"
             );
             assert_ne!(st.candidates.first().map(|c| c.text.as_str()), Some("释读"));
+        } else {
+            eprintln!("后台索引已先于首键建好，跳过「未就绪」断言，只验就绪后生效");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while c.engine_mgr.reverse_index_if_ready(&id).is_none() {

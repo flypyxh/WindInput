@@ -507,6 +507,15 @@ pub struct EngineManager {
     /// `aux_settings_cache` 的失效代次：每次清表（持锁）+1。未命中时先记代次再算，回填前
     /// （同一把锁下）代次变了就不回填——否则「算到一半被清」的旧值会被插回去，一直留到下次失效。
     aux_settings_gen: std::sync::atomic::AtomicU64,
+    /// 码表设置缓存（(schema_id, 是否按混输解析) → 生效设置），供 [`EngineManager::codetable_settings`]。
+    ///
+    /// **必须缓存**：单字过滤、建候选、短语自动上屏每键各取一次，每次 `read_schema` 混输方案
+    /// 再读主码表方案——不缓存就是每键 6 次读盘 + TOML 解析 + 扫词库目录。键里带「是否混输」：
+    /// 它取决于引擎加载了没有，加载前后解析结果不同，不能共用一条。失效同 `aux_settings_cache`：
+    /// 任一方案失效或配置重载都整表清（混输引用主码表方案，按 id 局部清会漏）。
+    codetable_settings_cache: Mutex<HashMap<(String, bool), wind_config::CodetableGlobal>>,
+    /// `codetable_settings_cache` 的失效代次（同 `aux_settings_gen`）。
+    codetable_settings_gen: std::sync::atomic::AtomicU64,
     /// 方案引擎类型缓存（`schema_engine_type`）。**按 id 缓存，reload/invalidate 时清**，
     /// 与 `freq_cache`/`name_cache` 同生命周期。
     ///
@@ -741,6 +750,24 @@ type SingleCharCodeCache = (String, Arc<HashMap<char, String>>);
 /// 结论是不值得为它写代码：受影响的只有用了子目录的少数用户，量也小，卸载时缓存目录整个
 /// 清掉；真要立刻回收还有既有的全量入口 [`EngineManager::rebuild_all_caches`]
 /// （CLI `schema rebuild`）。
+/// 当前进程匿名常驻内存（MB，RssAnon），只给构建打点用；非 Linux 返回 0。
+fn linux_rss_mb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // 取 RssAnon 而非 VmRSS：构建期间 mmap 着的段文件页也算 VmRSS，但那是文件页、
+        // 可随时回收，不是本进程的私有内存（与 Windows 看 Private 不看 WS 同理）。
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+            && let Some(kb) = s
+                .lines()
+                .find_map(|l| l.strip_prefix("RssAnon:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        {
+            return kb / 1024;
+        }
+    }
+    0
+}
+
 fn cache_path(source: &Path, ext: &str) -> std::path::PathBuf {
     if let Some(Some(dir)) = CACHE_DIR.get() {
         let stem = wind_dict::cache_ns::cache_stem(source);
@@ -773,7 +800,7 @@ fn purge_cache_files(dir: &Path, removed: &mut usize, failed: &mut usize) {
         let is_cache = p
             .extension()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb" | "wridx" | "building"))
+            .is_some_and(|s| matches!(s, "wdat" | "fp" | "st" | "wdb" | "wridx" | "building"))
             || p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(crate::english_phrase::is_phrase_cache_file);
@@ -919,6 +946,8 @@ impl EngineManager {
             freq_cache: Mutex::new(HashMap::new()),
             aux_settings_cache: Mutex::new(HashMap::new()),
             aux_settings_gen: std::sync::atomic::AtomicU64::new(0),
+            codetable_settings_cache: Mutex::new(HashMap::new()),
+            codetable_settings_gen: std::sync::atomic::AtomicU64::new(0),
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             session_actions_cache: Mutex::new(HashMap::new()),
@@ -4024,6 +4053,7 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
         self.invalidate_aux_settings_cache();
+        self.invalidate_codetable_settings_cache();
         self.invalidate_data_facts();
         self.schema_type_cache
             .lock()
@@ -4234,6 +4264,7 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.invalidate_aux_settings_cache();
+        self.invalidate_codetable_settings_cache();
         self.invalidate_data_facts();
         self.schema_type_cache
             .lock()
@@ -4919,13 +4950,70 @@ impl EngineManager {
     /// 的注释。用 `loaded_engine_type(schema_id)` 而非 `current_engine_type()` 判混输，
     /// 理由同上：后者也是问活跃方案。
     fn codetable_settings_of(&self, schema_id: &str) -> wind_config::CodetableGlobal {
+        let mixed = matches!(self.loaded_engine_type(schema_id), Some(EngineType::Mixed));
+        let key = (schema_id.to_string(), mixed);
+        if let Some(s) = self
+            .codetable_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return s.clone();
+        }
+        let generation = self
+            .codetable_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        let s = self.resolve_codetable_settings(schema_id, mixed);
+        self.cache_codetable_settings(key, s.clone(), generation);
+        s
+    }
+
+    /// 清 `codetable_settings_cache` 并推进失效代次（持锁完成）。
+    fn invalidate_codetable_settings_cache(&self) {
+        let mut cache = self
+            .codetable_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.clear();
+        self.codetable_settings_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// 回填 `codetable_settings_cache`：算之前记下的代次已过期（期间被清过）就丢弃。
+    fn cache_codetable_settings(
+        &self,
+        key: (String, bool),
+        s: wind_config::CodetableGlobal,
+        generation: u64,
+    ) -> bool {
+        let mut cache = self
+            .codetable_settings_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self
+            .codetable_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            return false;
+        }
+        cache.insert(key, s);
+        true
+    }
+
+    /// 不带缓存的解析（读方案文件）。
+    fn resolve_codetable_settings(
+        &self,
+        schema_id: &str,
+        mixed: bool,
+    ) -> wind_config::CodetableGlobal {
         let global = self
             .codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         // 混输方案自身无独立 codetable 配置，override 从其 primary_schema（主码表方案）读取
-        let resolve_id = if matches!(self.loaded_engine_type(schema_id), Some(EngineType::Mixed)) {
+        let resolve_id = if mixed {
             Self::read_schema(
                 schema_id,
                 self.data_dir.as_deref(),
@@ -5664,7 +5752,7 @@ impl EngineManager {
     /// | 旧落点 | 何时失效 | 现在在哪 |
     /// |---|---|---|
     /// | `schemas/common_chars.txt` | 2026-09-04 | `charsets/common_han.yaml` 的列表体 |
-    /// | `charsets/*.yaml` | 2026-09-05 | redb（设置页「外部编辑」对话框里加载） |
+    /// | `charsets/*.yaml` | 2026-09-05 | `data/charsets/*.yaml`（设置页「外部编辑」对话框里加载） |
     ///
     /// ⚠️ 两者都是**静默失效**：文件还在、程序不读、也不报错。用户看到的是「我明明改了
     /// 字表，判定却还是自带那套」。提醒不能省。第二条没写迁移：那个落点从未发布。
@@ -6344,11 +6432,11 @@ impl EngineManager {
             //
             // 注册顺序 User → Temp → System 与码表分支一致（用户词在前）。
             if let Some(store) = &store {
-                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
                     store.clone(),
                     schema_id,
                 )));
-                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+                dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
                     store.clone(),
                     schema_id,
                 )));
@@ -6538,11 +6626,11 @@ impl EngineManager {
             // 存储归属统一为 "pinyin"，使全拼/双拼方案共享同一份用户词与临时词。
             if let Some(store) = &store {
                 let dm = wind_dict::DictManager::new();
-                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
                     store.clone(),
                     PINYIN_DATA_SCHEMA,
                 )));
-                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+                dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
                     store.clone(),
                     PINYIN_DATA_SCHEMA,
                 )));
@@ -6614,11 +6702,11 @@ impl EngineManager {
             // 注入 redb Store 时，注册用户词/临时词层（按 schema 隔离），让用户词进候选合并。
             let dm = wind_dict::DictManager::new();
             if let Some(store) = &store {
-                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
                     store.clone(),
                     schema_id,
                 )));
-                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+                dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
                     store.clone(),
                     schema_id,
                 )));
@@ -6632,7 +6720,7 @@ impl EngineManager {
                 // 重建，故不另设通路；真要做成热更新，得给层一个共享的原子值，
                 // 为一个内部字段不值得。
                 if codetable_cfg.auto_phrase.enabled {
-                    dm.register_layer(Box::new(wind_dict::StoreDraftLayer::new(
+                    dm.register_layer(Box::new(wind_store::StoreDraftLayer::new(
                         store.clone(),
                         schema_id,
                         i64::from(codetable_cfg.auto_phrase.draft_ttl_hours) * 3600,
@@ -7339,9 +7427,8 @@ impl EngineManager {
         };
         match std::fs::remove_file(&combined) {
             Ok(()) => {
-                let mut fp = combined.clone().into_os_string();
-                fp.push(".fp");
-                let _ = std::fs::remove_file(std::path::PathBuf::from(fp));
+                // `.fp` 与 `.st` 两个 sidecar 一起清
+                wind_dict::cache_fp::remove_cache_fp(&combined);
                 info!(
                     "已清理遗留的合并缓存 {}（释放 {:.1} MB，该文件已无消费方）",
                     combined.display(),
@@ -7462,22 +7549,31 @@ impl EngineManager {
         // schema_id，挡不住"两个方案指向同一个 combined.wdat"）。
         let build_lock = wind_dict::reader_pool::file_lock(combined);
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // 拿锁后复查
-        if Self::combined_cache_fresh(&paths, combined, COMBINED_CACHE_TAG)
-            && let Ok(reader) = wind_dict::reader_pool::open_wdat(combined)
+        // 拿锁后复查。`combined` 是槽位，实际文件名带全部源的指纹（内容寻址）。
+        // 复核快照先于算指纹取（理由见 load_rime_pinyin_dict）。
+        let stamps_before = wind_dict::cache_fp::stamps_of(&paths);
+        let content = wind_dict::cache_fp::resolve_slot_fp(combined, &paths, COMBINED_CACHE_TAG)
+            .map(|fp| (wind_dict::cache_fp::slot_content_path(combined, &fp), fp));
+        if let Some((path, _)) = &content
+            && path.is_file()
+            && let Ok(reader) = wind_dict::reader_pool::open_wdat(path)
         {
             info!(
                 "Using combined cache: {} ({} keys)",
-                combined.display(),
+                path.display(),
                 reader.key_count()
             );
+            wind_dict::cache_fp::touch_cache(path);
             return Some(CachedDict::Mmap(reader));
         }
 
         // 构建期峰值远高于成品，理由与退避语义同 load_rime_pinyin_dict 里那段。
         let attempt = match wind_dict::build_guard::begin(
             combined,
-            &wind_dict::cache_fp::build_key(&paths, COMBINED_CACHE_TAG),
+            content
+                .as_ref()
+                .map(|(_, fp)| fp.as_str())
+                .unwrap_or("unreadable"),
         ) {
             wind_dict::build_guard::Gate::Proceed(a) => a,
             wind_dict::build_guard::Gate::Skip { reason } => {
@@ -7531,17 +7627,34 @@ impl EngineManager {
             entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             writer.add(code, entries);
         }
-        let written = writer.write(combined);
+        // 源指纹算不出（读取失败）、或构建期间源被改写时，退回写到槽位本身：没有 `.fp`，
+        // 派生缓存按大小:mtime 判，下次启动按新指纹重来（旧式文件由 prune 顺手清）。
+        let content = if wind_dict::cache_fp::stamps_of(&paths).unchanged_since(&stamps_before) {
+            content
+        } else {
+            warn!("合并词库的源在构建期间被改写，本次不落正式缓存");
+            None
+        };
+        let target: std::path::PathBuf = content
+            .as_ref()
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| combined.to_path_buf());
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let written = writer.write(&target);
         attempt.finish();
         match written {
             Ok(_) => {
-                // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
-                wind_dict::cache_fp::write_cache_fp(combined, &paths, COMBINED_CACHE_TAG);
-                match wind_dict::reader_pool::open_wdat(combined) {
+                if let Some((p, fp)) = &content {
+                    wind_dict::cache_fp::write_cache_fp_value(p, fp);
+                    wind_dict::cache_fp::prune_slot(combined, p, 2);
+                }
+                match wind_dict::reader_pool::open_wdat(&target) {
                     Ok(reader) => {
                         info!(
                             "Wrote combined cache: {} ({} keys from {} dicts)",
-                            combined.display(),
+                            target.display(),
                             reader.key_count(),
                             sources.len()
                         );
@@ -7558,16 +7671,6 @@ impl EngineManager {
                 None
             }
         }
-    }
-
-    /// 缓存是否可复用：按源文件**内容指纹**判定（非 mtime）。
-    /// scp/部署/版本控制会刷新源 mtime，旧的 mtime 校验会因此恒失效 → 每次重建(300MB)；
-    /// 改为内容指纹后，源内容未变即复用，构建后由 write_cache_fp 写指纹 sidecar。
-    ///
-    /// `paths` 必须覆盖**全部**参与构建的源文件——含 rime_pinyin 的 import_tables 子表，
-    /// 否则改子表不会让缓存失效（静默复用陈旧件）。见 [`Self::rime_source_paths`]。
-    fn combined_cache_fresh(paths: &[&Path], combined: &Path, tag: &str) -> bool {
-        wind_dict::cache_fp::cache_is_fresh(combined, paths, tag)
     }
 
     /// 某个词库源实际参与构建的**全部**文件：主表本身，外加 `rime_pinyin` 的
@@ -7678,6 +7781,67 @@ impl EngineManager {
         Some(d)
     }
 
+    /// 一张 import_tables 子表的**归并输入段**：内容寻址缓存（改了哪张只重建哪张）。
+    /// 返回 `(段, 若写在临时目录则其路径)`：落不了盘时写到临时目录当一次性段，调用方归并完
+    /// 即删；连临时目录都写不了就放弃这张表（记 warn）。
+    ///
+    /// 与旧路径（逐表 `parse_rime_entries_parallel`）保持同一取舍：源 yaml 不存在就跳过——
+    /// 不走 wdat-only 旁文件，否则那份 `.wdat` 不在 merged 的指纹里，更新后 merged 不会失效；
+    /// 空表也跳过（旧路径解析出 0 条等于没有这张表）。
+    fn load_merge_segment(
+        p: &Path,
+    ) -> Option<(
+        std::sync::Arc<wind_dict::datformat::WdatReader>,
+        Option<std::path::PathBuf>,
+    )> {
+        if !p.is_file() {
+            return None;
+        }
+        match CachedDict::load_at_with(p, &cache_path(p, "wdat"), false) {
+            Ok(CachedDict::Mmap(r)) => {
+                info!("  segment {} ({} keys)", p.display(), r.key_count());
+                Some((r, None))
+            }
+            Ok(CachedDict::Memory(d)) => {
+                if d.is_empty() {
+                    return None;
+                }
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tmp = std::env::temp_dir().join(format!(
+                    "wind-seg-{}-{}-{}.wdat",
+                    std::process::id(),
+                    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    wind_dict::cache_ns::cache_stem(p)
+                ));
+                let mut w = wind_dict::datformat::WdatWriter::new();
+                d.export_to_wdat(&mut w);
+                match w
+                    .write(&tmp)
+                    .and_then(|_| wind_dict::datformat::WdatReader::open(&tmp))
+                {
+                    Ok(r) => {
+                        warn!(
+                            "子表 {} 的段写不进缓存目录，本次用临时副本 {}",
+                            p.display(),
+                            tmp.display()
+                        );
+                        Some((std::sync::Arc::new(r), Some(tmp)))
+                    }
+                    Err(e) => {
+                        warn!("  Failed to stage {}: {}", p.display(), e);
+                        let _ = std::fs::remove_file(&tmp);
+                        None
+                    }
+                }
+            }
+            Ok(CachedDict::Layered(_)) => None,
+            Err(e) => {
+                warn!("  Failed to load {}: {}", p.display(), e);
+                None
+            }
+        }
+    }
+
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
         // wdat-only：拼音是独立于 CachedDict::load_at_with 的第二条链路（要读 yaml 头展开
         // import_tables 再并行解析正文），源缺失时那两步全废，故须在此单独拦截。
@@ -7707,51 +7871,65 @@ impl EngineManager {
         }
         // merged.wdat 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
         // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
-        let merged_wdat = cache_path(dict_path, "merged.wdat");
+        let merged_slot = cache_path(dict_path, "merged.wdat");
         // 收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖全部源，
         // 故须先于 fresh 判定算出（仅解析头部 yaml，开销极低）。
         // 与 combined 层共用 rime_source_paths——两处各写一份正是 R6 那条陈旧路径的成因。
         // 按缓存文件 single-flight。这里是该缺陷最典型的现场：pinyin / shuangpin /
         // 混输的 secondary 子引擎三者的 schema 都指向 pinyin/rime_frost.dict.yaml，
         // cache_path 又按源文件在 schemas 下的目录链做命名空间，最终是同一个 merged.wdat。
-        let build_lock = wind_dict::reader_pool::file_lock(&merged_wdat);
+        let build_lock = wind_dict::reader_pool::file_lock(&merged_slot);
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let sub_paths = Self::rime_source_paths(dict_path, "rime_pinyin");
         let src_refs: Vec<&Path> = sub_paths.iter().map(|p| p.as_path()).collect();
+        // 复核快照要在算指纹**之前**取：否则「算完指纹、取快照之前」被改写的源，前后快照
+        // 一致而指纹却对应旧内容。
+        let stamps_before = wind_dict::cache_fp::stamps_of(&src_refs);
 
-        // merged 缓存对**全部源**做内容指纹校验：主表或任一子表内容变化、或源清单增删都
-        // 判定失效并重建（避免「子表改了却仍用旧 merged」的静默陈旧）。
-        if merged_wdat.exists()
-            && Self::combined_cache_fresh(&src_refs, &merged_wdat, MERGED_CACHE_TAG)
+        // 内容寻址：槽位 + **全部源**的指纹 → 实际文件名。主表或任一子表内容变化、源清单
+        // 增删都会换出另一个文件名，旧 merged 自然不会被复用（避免「子表改了却仍用旧
+        // merged」的静默陈旧）。文件在，就是它。
+        let content =
+            wind_dict::cache_fp::resolve_slot_fp(&merged_slot, &src_refs, MERGED_CACHE_TAG).map(
+                |fp| {
+                    (
+                        wind_dict::cache_fp::slot_content_path(&merged_slot, &fp),
+                        fp,
+                    )
+                },
+            );
+        if let Some((path, _)) = &content
+            && path.is_file()
         {
-            match wind_dict::reader_pool::open_wdat(&merged_wdat) {
+            match wind_dict::reader_pool::open_wdat(path) {
                 Ok(reader) => {
                     info!(
                         "Using merged mmap cache: {} ({} keys)",
-                        merged_wdat.display(),
+                        path.display(),
                         reader.key_count()
                     );
+                    wind_dict::cache_fp::touch_cache(path);
                     return Some(CachedDict::Mmap(reader));
                 }
-                Err(e) => {
-                    warn!("Stale merged cache ({}), regenerating", e);
-                    Self::remove_stale_cache(&merged_wdat);
-                }
+                Err(e) => warn!("Stale merged cache ({}), regenerating", e),
             }
-        } else if merged_wdat.exists() {
-            info!(
-                "merged cache stale (sources changed), regenerating: {}",
-                merged_wdat.display()
-            );
-            Self::remove_stale_cache(&merged_wdat);
         }
 
         // 下面这段是构建峰值所在（65 万条实测 ~420 MB），内存不足时分配失败直接 abort、
         // 不可捕获（见 build_guard）。登记一次尝试：若连续死在这里，下次启动跳过而非再死。
+        if content.is_none() {
+            warn!(
+                "拼音词库 {} 的源无法计算指纹（有源文件读取失败），本次 merged 只写临时目录",
+                dict_path.display()
+            );
+        }
         let attempt = match wind_dict::build_guard::begin(
-            &merged_wdat,
-            &wind_dict::cache_fp::build_key(&src_refs, MERGED_CACHE_TAG),
+            &merged_slot,
+            content
+                .as_ref()
+                .map(|(_, fp)| fp.as_str())
+                .unwrap_or("unreadable"),
         ) {
             wind_dict::build_guard::Gate::Proceed(a) => a,
             wind_dict::build_guard::Gate::Skip { reason } => {
@@ -7760,99 +7938,180 @@ impl EngineManager {
             }
         };
 
-        // 并行解析每个源正文（纯 CPU 多线程），直接产出 (code,text,weight)：不再为每个子表
-        // 生成中间 .wdat，也绕过 CodetableDict 的 BTreeMap 构建与逐 code 排序（merged 稍后会
-        // 统一按权重重排）。WdatWriter 的 add 系列不合并同 code 的多次调用（内部直接 push），
-        // 故先用 HashMap 聚合，否则同一 code 会落成多条记录、读取端只命中其一 → 同 code
-        // 候选系统性丢失。
-        // 全拼按 code 聚合；简拼（声母缩写，如 nh→你好）按简拼码聚合，存进 wdat 独立 AbbrevSection。
-        // 全拼条目携带 boundary（wdat v4 音节边界，取自 rime 源数据 `ni hao` 的空格）；
-        // 简拼码是各音节首字母的拼接、本身不构成音节序列，无边界语义，故 agg_ab 不带。
-        let mut agg: HashMap<String, Vec<(String, i32, u64)>> = HashMap::new();
-        // 简拼 → (全拼码 → 该码下的最高权重)。**内层用 map 去重**：同一简拼下多个词
-        // 常共用一个全拼码（`nh` 的「你好」「拟好」同为 `nihao`），存词时它们是不同条目，
-        // 改存码后就成了重复项，不去重会把 AbbrevSection 撑大且截断时挤掉别的码。
-        let mut agg_ab: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        let mut total_entries = 0usize;
-        for sub_path in &sub_paths {
-            // lowercase_code=false：import_tables 子表均为拼音表(非 english)，与改前
-            // CachedDict::load_at(默认不小写 code)行为一致。
-            match wind_dict::codetable::parse_rime_entries_parallel(sub_path, false) {
-                Ok((fulls, abbrevs)) => {
-                    let count = fulls.len();
-                    info!(
-                        "  Loading {} entries ({} abbrev) from {}",
-                        count,
-                        abbrevs.len(),
-                        sub_path.display()
-                    );
-                    for (code, text, weight, boundary) in fulls {
-                        agg.entry(code).or_default().push((text, weight, boundary));
-                    }
-                    for (ab, code, weight) in abbrevs {
-                        let slot = agg_ab
-                            .entry(ab)
-                            .or_default()
-                            .entry(code)
-                            .or_insert(i32::MIN);
-                        *slot = (*slot).max(weight);
-                    }
-                    total_entries += count;
-                }
-                Err(e) => warn!("  Failed to load {}: {}", sub_path.display(), e),
-            }
-        }
-
-        if total_entries == 0 {
+        // ① 各子表各自的段（S4）：走 `load_at_with` 的内容寻址缓存，改一张子表只重建那一张。
+        //    **串行**建段：表间并行只把两张大表的解析峰值叠在一起（实测 7 表并行首建峰值
+        //    498 MB，高于旧路径的 430 MB）。段只做归并输入，不挂查询层。落不了盘（缓存目录
+        //    不可写 ⇒ 内存模式）的子表写到临时目录当一次性段，归并完即删。
+        let t_segs = std::time::Instant::now();
+        let mut temp_segments: Vec<std::path::PathBuf> = Vec::new();
+        let readers: Vec<std::sync::Arc<wind_dict::datformat::WdatReader>> = sub_paths
+            .iter()
+            .filter_map(|p| {
+                let (r, tmp) = Self::load_merge_segment(p)?;
+                temp_segments.extend(tmp);
+                Some(r)
+            })
+            .collect();
+        if readers.is_empty() {
             attempt.finish();
             warn!("No entries loaded from pinyin dictionary");
             return None;
         }
-
-        let mut writer = wind_dict::datformat::WdatWriter::new();
-
-        for (code, mut entries) in agg {
-            // 同 code 下按权重降序，保证候选顺序稳定
-            entries.sort_by_key(|e| std::cmp::Reverse(e.1));
-            // order 取排序后的叶内序号，与改前 `writer.add`（内部 with_local_order）语义一致；
-            // 额外携带 boundary（v4）。
-            let with_order: Vec<(String, i32, u32, u64)> = entries
-                .into_iter()
-                .enumerate()
-                .map(|(i, (text, weight, boundary))| (text, weight, i as u32, boundary))
-                .collect();
-            writer.add_with_boundary(code, with_order);
-        }
-        // 简拼表 → 独立 AbbrevSection（与全拼查询互不污染）。存的是**全拼码**，
-        // 查询时据此走主表装配候选（wdat v5，见 codetable::RimeEntries）。
-        // 同简拼下按权重降序——该权重只决定截断时保留哪些码。
-        let abbrev_count = agg_ab.len();
-        for (ab, codes) in agg_ab {
-            let mut entries: Vec<(String, i32)> = codes.into_iter().collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            writer.add_abbrev(ab, entries);
-        }
-        info!(
-            "  merged pinyin: {} codes + {} abbrevs",
-            writer.key_count(),
-            abbrev_count
+        debug!(
+            segments = readers.len(),
+            segments_ms = t_segs.elapsed().as_millis() as u64,
+            rss_mb = linux_rss_mb(),
+            "merged: sub-table segments ready"
         );
 
+        // ② k 路归并 → 流式写入器（S3）。各段的 `codes()` 游标按字节序递增；同 code 的候选按
+        //    子表顺序拼接后按权重稳定降序、order 取序号——与从前「HashMap 聚合 + 排序」逐字节
+        //    等价（`merge_from_segments_matches_aggregate_build` 锁定）。跨表同 (text, code)
+        //    不去重，沿用旧语义。
+        let mut cursors: Vec<_> = readers.iter().map(|r| r.codes().peekable()).collect();
+        let mut sw = wind_dict::datformat::WdatStreamWriter::new();
+        // 简拼候选 `(简拼字节区间, code 序号, 权重)`：按 (简拼, 权重降序, code) 排后去重，
+        // 等价于旧的 `agg_ab[ab][code] = max(weight)` 再按 (权重降序, code 升序) 排。
+        let mut ab_buf: Vec<u8> = Vec::new();
+        let mut ab_items: Vec<(u32, u16, u32, i32)> = Vec::new();
+        let mut merged: Vec<(&str, i32, u64)> = Vec::new();
+        let mut long_codes_without_abbrev = 0usize;
+        while let Some(min_code) = cursors
+            .iter_mut()
+            .filter_map(|c| c.peek().map(|(k, _)| k.clone()))
+            .min()
+        {
+            merged.clear();
+            for (ti, c) in cursors.iter_mut().enumerate() {
+                if c.peek().is_some_and(|(k, _)| *k == min_code) {
+                    let (_, leaf) = c.next().expect("peeked");
+                    for (t, w, _o, b) in readers[ti].leaf_entries(leaf) {
+                        merged.push((t, w, b));
+                    }
+                }
+            }
+            merged.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let code_idx = sw.key_count() as u32;
+            for (_, w, b) in &merged {
+                if b.count_ones() >= 2 {
+                    // 边界位是**字节**位置，但首字母要取整个 char（旧解析器 `chars().next()`）：
+                    // 音节以 ê / ü 之类非 ASCII 开头时只取一个字节会拼出非法 UTF-8。
+                    let off = ab_buf.len() as u32;
+                    for pos in 0..min_code.len().min(64) {
+                        if b & (1u64 << pos) != 0
+                            && let Some(ch) = min_code.get(pos..).and_then(|s| s.chars().next())
+                        {
+                            let mut tmp = [0u8; 4];
+                            ab_buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+                        }
+                    }
+                    let n = (ab_buf.len() as u32 - off) as u16;
+                    ab_items.push((off, n, code_idx, *w));
+                } else if *b == 0 && min_code.len() >= 64 {
+                    // 音节起点 ≥64 的码整体没有边界位图（`syllable_boundary_mask`），这里推不出
+                    // 简拼；旧解析器按音节数 ≥2 仍会生成。≥13 个音节的词组实际极少，记数即可。
+                    long_codes_without_abbrev += 1;
+                }
+            }
+            sw.push_code(
+                &min_code,
+                merged
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (t, w, b))| (*t, *w, i as u32, *b)),
+            );
+        }
+        drop(cursors);
+        let total_entries = sw.entry_count();
+        if long_codes_without_abbrev > 0 {
+            info!(
+                "  merged: {} 条 ≥64 字节的码没有边界位图，未生成简拼",
+                long_codes_without_abbrev
+            );
+        }
+        // 与旧路径一致：一条都没有（全部子表缺失或为空）就不落盘，返回 None
+        if total_entries == 0 {
+            attempt.finish();
+            drop(readers);
+            for t in &temp_segments {
+                let _ = std::fs::remove_file(t);
+            }
+            warn!("No entries loaded from pinyin dictionary");
+            return None;
+        }
+
+        let ab_of = |it: &(u32, u16, u32, i32)| -> &[u8] {
+            &ab_buf[it.0 as usize..it.0 as usize + it.1 as usize]
+        };
+        ab_items.sort_by(|x, y| ab_of(x).cmp(ab_of(y)));
+        let mut abbrev_count = 0usize;
+        let mut i = 0usize;
+        while i < ab_items.len() {
+            let ab = ab_of(&ab_items[i]).to_vec();
+            let mut group: Vec<(u32, i32)> = Vec::new();
+            while i < ab_items.len() && ab_of(&ab_items[i]) == ab.as_slice() {
+                group.push((ab_items[i].2, ab_items[i].3));
+                i += 1;
+            }
+            // 同 (简拼, code) 只留权重最高的那条：先按 (code, 权重降序) 排让同 code 相邻、
+            // dedup 留首条，再按 (权重降序, code 字典序) 排成写入序。
+            group.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            group.dedup_by_key(|e| e.0);
+            let mut group: Vec<(&str, i32)> = group
+                .into_iter()
+                .map(|(ci, w)| (sw.code_at(ci as usize), w))
+                .collect();
+            group.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            let ab_str = std::str::from_utf8(&ab).unwrap_or("");
+            let owned: Vec<(String, i32)> =
+                group.iter().map(|(c, w)| (c.to_string(), *w)).collect();
+            drop(group);
+            sw.push_abbrev_sorted(ab_str, owned.iter().map(|(c, w)| (c.as_str(), *w)));
+            abbrev_count += 1;
+        }
+        drop((ab_items, ab_buf));
+        info!(
+            "  merged pinyin: {} codes + {} abbrevs",
+            sw.key_count(),
+            abbrev_count
+        );
+        debug!(rss_mb = linux_rss_mb(), "merged: writer filled");
+
         info!("Writing merged .wdat cache ({} entries)...", total_entries);
-        // 写缓存目录；若仍失败（缓存目录不可写等）退到系统临时目录。绝不退化成仅主词典
-        // （rime header 仅数十条），那会让拼音/混输/临时拼音全部无候选。
         let temp_fallback = std::env::temp_dir().join(
-            merged_wdat
+            merged_slot
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("rime.merged.wdat")),
         );
-        // 先构建再逐个目标落盘：`build` 消费 writer，条目数据（65 万条那次占 130 MB）在这
-        // 一步结束时就还给分配器了，而回退重写只需要已经构建好的字节。从前是拿 writer 在
-        // 循环里重试，等于把那 130 MB 一直押到最后一个目标写完。
-        let blob = writer.build();
+        let blob = sw.build();
+        drop(readers);
+        for t in &temp_segments {
+            let _ = std::fs::remove_file(t); // Windows 上若仍被映射删不掉，留给系统临时目录
+        }
+        // 指纹是建段之前算的；期间任一源被改写，按旧指纹命名的 merged 就会装着新内容。
+        // 这时只写临时副本（不进正式路径、不写 .fp），下次启动按新指纹重来。
+        let content = if wind_dict::cache_fp::stamps_of(&src_refs).unchanged_since(&stamps_before) {
+            content
+        } else {
+            warn!(
+                "拼音词库 {} 的源在构建期间被改写，本次不落正式缓存，下次启动重建",
+                dict_path.display()
+            );
+            None
+        };
         attempt.finish();
-        for target in [&merged_wdat, &temp_fallback] {
-            let is_fallback = target.as_path() == temp_fallback.as_path();
+        // 正式目标是内容寻址的新文件（源指纹算不出时没有正式目标，只剩临时回退）
+        let official: Option<std::path::PathBuf> = content.as_ref().map(|(p, _)| p.clone());
+        let targets: Vec<&Path> = official
+            .iter()
+            .map(|p| p.as_path())
+            .chain(std::iter::once(temp_fallback.as_path()))
+            .collect();
+        for target in targets {
+            let is_fallback = target == temp_fallback.as_path();
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             if let Err(e) = blob.emit(target) {
                 if is_fallback {
                     warn!("Failed to write merged cache {}: {}", target.display(), e);
@@ -7870,9 +8129,11 @@ impl EngineManager {
                 }
                 continue;
             }
-            // 写内容指纹(覆盖全部源；仅对正式缓存路径，fresh 校验也只看 merged_wdat)
-            if target.as_path() == merged_wdat.as_path() {
-                wind_dict::cache_fp::write_cache_fp(&merged_wdat, &src_refs, MERGED_CACHE_TAG);
+            // 正式路径：`.fp` 写在实际文件旁供派生缓存取摘要（指纹已在文件名里，不重算），
+            // 并把同槽位的旧份数收到 2 份。
+            if !is_fallback && let Some((p, fp)) = &content {
+                wind_dict::cache_fp::write_cache_fp_value(p, fp);
+                wind_dict::cache_fp::prune_slot(&merged_slot, p, 2);
             }
             match wind_dict::reader_pool::open_wdat(target) {
                 Ok(reader) => {
@@ -7901,26 +8162,6 @@ impl EngineManager {
         }
         error!("merged 缓存的正式路径与临时回退路径均写入失败，拼音词库不可用（该方案将无候选）");
         None
-    }
-
-    /// 删除待重建的陈旧缓存。失败不阻断重建流程（后续 write 走 tmp + rename，本就能覆盖），
-    /// 但**必须留痕**：此前这里是 `let _ =`，删不掉时日志上完全没有痕迹，而它往往是缓存
-    /// 目录权限/占用问题的第一个征兆。
-    ///
-    /// 注意：文件正被 mmap 持有**不会**让删除以外的重建步骤失败——rename 覆盖照样成功
-    /// （见 `reader_pool` 的回归测试），陈旧数据由 reader 池的 stamp 校验负责挡住。
-    fn remove_stale_cache(path: &Path) {
-        if let Err(e) = std::fs::remove_file(path) {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return; // 本就不存在，不是问题
-            }
-            warn!(
-                "无法删除待重建的缓存 {}: {}。重建仍会继续（rename 可覆盖），\
-                 但若反复出现，请检查该目录的权限。",
-                path.display(),
-                e
-            );
-        }
     }
 }
 
@@ -8349,6 +8590,81 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire);
         assert_ne!(now, before, "清表推进代次");
         assert!(mgr.cache_aux_settings("x".into(), AuxCodeSettings::default(), now));
+        assert!(cached(&mgr), "代次未变照常回填");
+    }
+
+    /// 码表设置每次按键要取好几次（单字过滤、建候选、短语自动上屏），不能每次都重读方案文件。
+    fn codetable_cache_fixture(name: &str, auto_commit: bool) -> std::path::PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("wind_eng_ct_cache-{name}-{}", std::process::id()));
+        let schemas = base.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        std::fs::write(
+            schemas.join("wb_c.schema.toml"),
+            format!(
+                "[schema]\nid = \"wb_c\"\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\nauto_commit_at_full = {auto_commit}\n"
+            ),
+        )
+        .unwrap();
+        base
+    }
+
+    #[test]
+    fn codetable_settings_are_cached_until_schema_invalidated() {
+        let base = codetable_cache_fixture("inv", true);
+        let mgr = EngineManager::new(&Config::default(), Some(&base));
+        assert!(mgr.codetable_settings_of("wb_c").auto_commit_at_full);
+        codetable_cache_fixture("inv", false);
+        assert!(
+            mgr.codetable_settings_of("wb_c").auto_commit_at_full,
+            "命中缓存：不重读方案文件"
+        );
+        mgr.invalidate_schema("wb_c");
+        assert!(
+            !mgr.codetable_settings_of("wb_c").auto_commit_at_full,
+            "方案失效后重读"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 全局 `schema.codetable` 是缓存值的基线：配置重载后必须重算（设置页改了要立即生效）。
+    #[test]
+    fn codetable_settings_follow_config_reload() {
+        let base = codetable_cache_fixture("reload", true);
+        let mut cfg = Config::default();
+        cfg.schema.codetable.z_key_repeat = false;
+        let mgr = EngineManager::new(&cfg, Some(&base));
+        assert!(!mgr.codetable_settings_of("wb_c").z_key_repeat);
+        cfg.schema.codetable.z_key_repeat = true;
+        mgr.reload_from_config(&cfg);
+        assert!(
+            mgr.codetable_settings_of("wb_c").z_key_repeat,
+            "重载后用新的全局基线"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回填竞态同辅助码缓存：算的途中被清过，旧值不得回填。
+    #[test]
+    fn codetable_settings_cache_drops_stale_fill() {
+        let mgr = EngineManager::new(&Config::default(), None);
+        let key = ("x".to_string(), false);
+        let cached = |m: &EngineManager| {
+            m.codetable_settings_cache
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        };
+        let before = mgr
+            .codetable_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        mgr.invalidate_codetable_settings_cache();
+        assert!(!mgr.cache_codetable_settings(key.clone(), Default::default(), before));
+        assert!(!cached(&mgr), "过期代次不得回填");
+        let now = mgr
+            .codetable_settings_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(mgr.cache_codetable_settings(key.clone(), Default::default(), now));
         assert!(cached(&mgr), "代次未变照常回填");
     }
 
@@ -10711,12 +11027,26 @@ input_chars = \"a-z;\"
             std::path::PathBuf::from(s)
         };
         let marker = sibling(".building");
-        let _cleanup = Cleanup(vec![
-            dir.clone(),
-            merged.clone(),
-            marker.clone(),
-            sibling(".fp"),
-        ]);
+        let _cleanup = Cleanup(vec![dir.clone(), marker.clone(), sibling(".st")]);
+        // 内容寻址：产物是 `<stem>-<fp>.wdat` 变体，不是槽位名本身
+        let variants = |slot: &std::path::Path| -> Vec<std::path::PathBuf> {
+            let prefix = format!("{}-", slot.file_stem().unwrap().to_str().unwrap());
+            std::fs::read_dir(slot.parent().unwrap())
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".wdat"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for v in variants(&merged) {
+            let _ = std::fs::remove_file(&v);
+        }
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -10732,7 +11062,7 @@ input_chars = \"a-z;\"
             EngineManager::load_rime_pinyin_dict(&dict).is_none(),
             "同一输入已连续死在构建中，本次应降级而不是再建"
         );
-        assert!(!merged.exists(), "跳过时不应产出缓存");
+        assert!(variants(&merged).is_empty(), "跳过时不应产出缓存");
 
         // 源变了 → 重新尝试并成功，且成功后不再留记录。
         std::fs::write(&dict, "---\nname: py\n...\n你好\tni hao\t200\n").unwrap();
@@ -10751,6 +11081,92 @@ input_chars = \"a-z;\"
     /// - **跨层同一个词**（两层都有「你好」）：合并缓存保留两条，分层也不去重。
     ///
     /// 简拼 `xg` 的跨层同权码（主库 xiguan、细胞库 xigua 都是 300）验证按码字典序而非层序。
+    /// ★ S3/S4 对拍：merged 改为「子表各自成段 → k 路归并 → 流式写入器」之后，产物必须与
+    /// 旧算法（并行解析全部子表 → HashMap 聚合 → `WdatWriter`）**逐字节相同**。旧算法在
+    /// 本用例里原样复刻作 oracle。夹具覆盖：跨表同 code、跨表同 (text, code)（不去重）、
+    /// 同码多条等权（稳定序＝子表序）、单音节（无简拼）、多音节简拼跨表取最大权重。
+    #[test]
+    fn merge_from_segments_matches_aggregate_build() {
+        let dir = std::env::temp_dir().join(format!("wind_eng_mergeeq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cells")).unwrap();
+        let body_a = "你好\tni hao\t100\n你\tni\t500\n拟好\tni hao\t64\n你好吗\tni hao ma\t20\n\
+                      中国\tzhong guo\t1000\n逆\tni\t64\n西安\txi an\t1000\n先\txian\t500\n\
+                      习惯\txi guan\t300\n啊\ta\t1\n";
+        let body_b = "你好呀\tni hao ya\t30\n尼豪\tni hao\t64\n中国风\tzhong guo feng\t50\n\
+                      泥\tni\t64\n你好\tni hao\t300\n鲜\txian\t500\n西瓜\txi gua\t300\n\
+                      你好\tni hao\t100\n\
+                      安安\tan an\t261\n凹凹\tao ao\t261\n爱爱\tai ai\t93\n按按\tan an\t75\n\
+                      挨挨\tai ai\t66\n欸\tê\t5\n欸哟\tê yo\t7\n女吕\tnü lü\t3\n";
+        std::fs::write(
+            dir.join("a.dict.yaml"),
+            format!("---\nname: a\n...\n{body_a}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("cells/b.dict.yaml"),
+            format!("---\nname: b\n...\n{body_b}"),
+        )
+        .unwrap();
+        let main = dir.join("main.dict.yaml");
+        std::fs::write(
+            &main,
+            "---\nname: main\nimport_tables:\n  - a\n  - cells/b\n...\n",
+        )
+        .unwrap();
+
+        // 新路径
+        let got = EngineManager::load_rime_pinyin_dict(&main).unwrap();
+        let got_path = got.source_file().expect("merged 应落盘").to_path_buf();
+        let got_bytes = std::fs::read(&got_path).unwrap();
+
+        // oracle：旧算法原样复刻
+        let mut agg: HashMap<String, Vec<(String, i32, u64)>> = HashMap::new();
+        let mut agg_ab: HashMap<String, HashMap<String, i32>> = HashMap::new();
+        for sub in EngineManager::rime_source_paths(&main, "rime_pinyin") {
+            let (fulls, abbrevs) =
+                wind_dict::codetable::parse_rime_entries_parallel(&sub, false).unwrap();
+            for (code, text, weight, boundary) in fulls {
+                agg.entry(code).or_default().push((text, weight, boundary));
+            }
+            for (ab, code, weight) in abbrevs {
+                let slot = agg_ab
+                    .entry(ab)
+                    .or_default()
+                    .entry(code)
+                    .or_insert(i32::MIN);
+                *slot = (*slot).max(weight);
+            }
+        }
+        let mut writer = wind_dict::datformat::WdatWriter::new();
+        for (code, mut entries) in agg {
+            entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let with_order: Vec<(String, i32, u32, u64)> = entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (text, weight, boundary))| (text, weight, i as u32, boundary))
+                .collect();
+            writer.add_with_boundary(code, with_order);
+        }
+        for (ab, codes) in agg_ab {
+            let mut entries: Vec<(String, i32)> = codes.into_iter().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            writer.add_abbrev(ab, entries);
+        }
+        let oracle = dir.join("oracle.wdat");
+        writer.write(&oracle).unwrap();
+        let want = std::fs::read(&oracle).unwrap();
+
+        assert_eq!(got_bytes.len(), want.len(), "长度不同");
+        assert!(got_bytes == want, "段归并产物与旧算法逐字节不同");
+        // 顺手验内容：跨表同 (text, code) 保留两条；简拼取跨表最大权重
+        assert_eq!(got.search("nihao").len(), 5);
+        let ab = got.search_abbrev("nh", 10);
+        assert_eq!(ab.first().map(String::as_str), Some("nihao"));
+        drop(got);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn layered_pinyin_dict_matches_merged_cache() {
         let dir = std::env::temp_dir().join(format!("wind_eng_layered-{}", std::process::id()));

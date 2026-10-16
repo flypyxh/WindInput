@@ -26,6 +26,7 @@ pub mod schema;
 pub mod section_fallback;
 pub mod startup_trace;
 pub mod tolerant_de;
+pub mod user_meta;
 /// 值域守门元测试（见模块头部）。放在 `src/` 而非 `tests/`：它要遍历
 /// `AppCompatFile` 等 crate 私有类型，集成测试只看得见 pub API。
 #[cfg(test)]

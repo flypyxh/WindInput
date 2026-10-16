@@ -118,6 +118,16 @@ impl RuntimeState {
     /// 从 `state_dir/state.toml` 加载，文件不存在或解析失败时返回默认值。
     pub fn load(state_dir: &Path) -> Self {
         let path = state_dir.join("state.toml");
+        // 一次性迁移：此前 state.toml 直接躺在本机根下（`local_dir()`），归位到 state/
+        if !path.exists()
+            && let Some(parent) = state_dir.parent()
+            && parent.join("state.toml").is_file()
+        {
+            let _ = std::fs::create_dir_all(state_dir);
+            if let Err(e) = std::fs::rename(parent.join("state.toml"), &path) {
+                tracing::warn!("迁移 state.toml 到 state/ 失败: {e}");
+            }
+        }
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
@@ -330,5 +340,22 @@ last_softkeyboard_page = "symbols"
         assert!(!back.last_chinese_mode);
         assert!(back.last_full_width);
         assert!(!back.last_chinese_punct);
+    }
+
+    /// 前置（设计 §2.1）：state.toml 从本机根挪进 state/，老位置的文件首次加载时搬过来。
+    #[test]
+    fn legacy_state_toml_is_moved_into_state_dir_on_load() {
+        let root = std::env::temp_dir().join(format!("wind_state_move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state.toml"), "last_chinese_mode = false\n").unwrap();
+        let state_dir = root.join("state");
+        let st = RuntimeState::load(&state_dir);
+        assert!(!st.last_chinese_mode, "应读到老位置的内容");
+        assert!(state_dir.join("state.toml").is_file(), "应已搬进 state/");
+        assert!(!root.join("state.toml").exists(), "老位置应已清空");
+        // 再读一次走新位置
+        assert!(!RuntimeState::load(&state_dir).last_chinese_mode);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

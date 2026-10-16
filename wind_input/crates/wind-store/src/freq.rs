@@ -9,9 +9,7 @@
 //! 说明：本文件另保留 legacy `FreqTracker`（文件式，供 coordinator 过渡期使用），将在
 //! coordinator 接通 redb 词频时移除。
 
-use crate::store::{FREQ, Store};
-use crate::user_words::{enc_key, now_secs};
-use redb::ReadableTable;
+use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -96,29 +94,21 @@ pub(crate) fn dec_freq(b: &[u8]) -> Option<FreqRecord> {
     })
 }
 
+/// 引擎词频 → 门面记录。
+pub(crate) fn freq_of(r: wind_userdata::runtime::FreqRec) -> FreqRecord {
+    FreqRecord {
+        count: r.count,
+        last_used: r.last_used,
+    }
+}
+
 impl Store {
     /// 记录一次选词：count++、last_used=now（单写事务）。
     /// 注：当前同步写；如成为热点可改为内存累积 + 批量 flush（store.md §2 异步批量）。
     pub fn record_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
-        let key = enc_key(schema, code, text);
-        let now = now_secs();
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(FREQ)?;
-                let count = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_freq(g.value()))
-                    .map(|r| r.count)
-                    .unwrap_or(0);
-                t.insert(
-                    key.as_str(),
-                    enc_freq(count.saturating_add(1), now).as_slice(),
-                )?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
+        self.runtime().record_freq(schema, code, text)?;
+        self.after_write();
+        Ok(())
     }
 
     /// **批量**取词频：一次读事务查多个 `(schema, code, text)`，按入参顺序返回。
@@ -133,19 +123,12 @@ impl Store {
         &self,
         keys: &[(String, String, String)],
     ) -> anyhow::Result<Vec<Option<FreqRecord>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(FREQ)?;
-            let mut out = Vec::with_capacity(keys.len());
-            for (schema, code, text) in keys {
-                let key = enc_key(schema, code, text);
-                out.push(t.get(key.as_str())?.and_then(|g| dec_freq(g.value())));
-            }
-            Ok(out)
-        })
+        Ok(self
+            .runtime()
+            .freq_batch(keys)
+            .into_iter()
+            .map(|r| r.map(freq_of))
+            .collect())
     }
 
     /// 取词频记录（不存在返回 None）。
@@ -155,12 +138,7 @@ impl Store {
         code: &str,
         text: &str,
     ) -> anyhow::Result<Option<FreqRecord>> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(FREQ)?;
-            Ok(t.get(key.as_str())?.and_then(|g| dec_freq(g.value())))
-        })
+        Ok(self.runtime().freq(schema, code, text).map(freq_of))
     }
 
     /// 流式遍历某方案下以 `prefix` 开头的词频记录。回调返回 `false` 即停。
@@ -174,27 +152,9 @@ impl Store {
         prefix: &str,
         f: &mut dyn FnMut(&str, &str, FreqRecord) -> bool,
     ) -> anyhow::Result<()> {
-        let scan = format!("{schema}\u{0}{prefix}");
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(FREQ)?;
-            for item in t.range(scan.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&scan) {
-                    break;
-                }
-                let (Some((_, code, text)), Some(rec)) =
-                    (crate::user_words::split_key(key), dec_freq(v.value()))
-                else {
-                    continue; // 解不出的记录跳过且不计数
-                };
-                if !f(code, text, rec) {
-                    break;
-                }
-            }
-            Ok(())
-        })
+        self.runtime()
+            .for_each_freq(schema, prefix, &mut |c, t, r| f(c, t, freq_of(r)));
+        Ok(())
     }
 
     /// 列举某方案的词频记录（设置页用）：按 code 前缀过滤，分页。
@@ -212,16 +172,15 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> anyhow::Result<FreqPage> {
-        let mut page = Vec::new();
-        let mut total = 0usize;
-        self.for_each_freq(schema, prefix, &mut |code, text, rec| {
-            if total >= offset && (limit == 0 || page.len() < limit) {
-                page.push((code.to_string(), text.to_string(), rec));
-            }
-            total += 1;
-            true
-        })?;
-        Ok((page, total))
+        let (rows, total) = self
+            .runtime()
+            .list_freq_paged(schema, prefix, offset, limit);
+        Ok((
+            rows.into_iter()
+                .map(|(c, t, r)| (c, t, freq_of(r)))
+                .collect(),
+            total,
+        ))
     }
 
     /// 导出某方案全部词频为 jsonl（每行 {"code","text","count","last_used"}）。
@@ -264,22 +223,13 @@ impl Store {
             rows.push((code.to_string(), word.to_string(), count, last_used));
         }
         let imported = rows.len();
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(FREQ)?;
-                for (code, word, count, last_used) in &rows {
-                    let key = enc_key(schema, code, word);
-                    let merged = match t.get(key.as_str())?.and_then(|g| dec_freq(g.value())) {
-                        Some(old) => (old.count.max(*count), old.last_used.max(*last_used)),
-                        None => (*count, *last_used),
-                    };
-                    t.insert(key.as_str(), enc_freq(merged.0, merged.1).as_slice())?;
-                }
-            }
-            txn.commit()?;
-            Ok(())
-        })?;
+        let rows: Vec<(String, String, wind_userdata::runtime::FreqRec)> = rows
+            .into_iter()
+            .map(|(c, t, count, last_used)| {
+                (c, t, wind_userdata::runtime::FreqRec { count, last_used })
+            })
+            .collect();
+        self.runtime().import_freq_rows(schema, &rows)?;
         Ok((imported, skipped))
     }
 
@@ -289,70 +239,31 @@ impl Store {
         schema: &str,
         rows: &[crate::wdict::FreqIo],
     ) -> anyhow::Result<usize> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(FREQ)?;
-                for r in rows {
-                    // code 列可能带音节空格（导出端与 words/temp_words 同形），而词频表 key
-                    // 是扁平的。**不拆就会写进一条永不匹配任何候选的死键**——查询侧拿的是
-                    // 候选的扁平 code，那条记录再也读不到，用户只会看到「调频不生效」。
-                    let (code, _) = crate::wdict::split_spaced_code(&r.code);
-                    let key = enc_key(schema, &code, &r.text);
-                    let merged = match t.get(key.as_str())?.and_then(|g| dec_freq(g.value())) {
-                        Some(old) => (old.count.max(r.count), old.last_used.max(r.last_used)),
-                        None => (r.count, r.last_used),
-                    };
-                    t.insert(key.as_str(), enc_freq(merged.0, merged.1).as_slice())?;
-                }
-            }
-            txn.commit()?;
-            Ok(rows.len())
-        })
+        let rows: Vec<(String, String, wind_userdata::runtime::FreqRec)> = rows
+            .iter()
+            .map(|r| {
+                let (code, _) = crate::wdict::split_spaced_code(&r.code);
+                (
+                    code,
+                    r.text.clone(),
+                    wind_userdata::runtime::FreqRec {
+                        count: r.count,
+                        last_used: r.last_used,
+                    },
+                )
+            })
+            .collect();
+        self.runtime().import_freq_rows(schema, &rows)
     }
 
     /// 删除一条词频（不存在静默成功）。
     pub fn delete_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
-        let key = enc_key(schema, code, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(FREQ)?;
-                t.remove(key.as_str())?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
+        self.runtime().delete_freq(schema, code, text)
     }
 
     /// 清空某方案全部词频，返回删除条数。
     pub fn clear_freq(&self, schema: &str) -> anyhow::Result<usize> {
-        let scan = format!("{schema}\u{0}");
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let n;
-            {
-                let mut t = txn.open_table(FREQ)?;
-                let keys: Vec<String> = {
-                    let mut ks = Vec::new();
-                    for item in t.range(scan.as_str()..)? {
-                        let (k, _) = item?;
-                        let key = k.value();
-                        if !key.starts_with(&scan) {
-                            break;
-                        }
-                        ks.push(key.to_string());
-                    }
-                    ks
-                };
-                n = keys.len();
-                for k in keys {
-                    t.remove(k.as_str())?;
-                }
-            }
-            txn.commit()?;
-            Ok(n)
-        })
+        self.runtime().clear_freq(schema)
     }
 }
 
@@ -698,5 +609,26 @@ mod tests {
         assert_eq!(b.get_count("你好"), 2);
         assert!(b.get_boost("你好") > 0.0);
         let _ = std::fs::remove_file(&tmp);
+    }
+    /// §10 退出判据：词频记录 / 批量查、联想、草稿读写都不经过 redb Mutex。
+    #[test]
+    fn draft_freq_assoc_hot_paths_do_not_touch_redb() {
+        let p = std::env::temp_dir().join(format!("wind_freq_hot-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let s = std::sync::Arc::new(Store::open(&p).unwrap());
+        s.pause().unwrap();
+        s.record_freq("py", "nihao", "你好").unwrap();
+        let got = s
+            .get_freq_batch(&[("py".into(), "nihao".into(), "你好".into())])
+            .unwrap();
+        assert_eq!(got[0].map(|r| r.count), Some(1));
+        s.record_assoc_pick("py", "天", "气").unwrap();
+        assert_eq!(s.assoc_history("py", "天", 0).unwrap().len(), 1);
+        s.add_drafts("wb", &[("ggtt".into(), "盖伦".into())])
+            .unwrap();
+        assert_eq!(s.search_drafts("wb", "ggtt", 86_400).unwrap(), vec!["盖伦"]);
+        use wind_dict::DictLayer;
+        let l = crate::StoreDraftLayer::new(s.clone(), "wb", 86_400);
+        assert_eq!(l.search("ggtt", 0).len(), 1);
     }
 }

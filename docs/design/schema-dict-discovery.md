@@ -80,7 +80,7 @@ type = "rime_codetable"
 
 | 字段 | 取值 |
 |---|---|
-| `id` | `dir:<相对 path 的文件主名>`，如 `dir:idiom`。带前缀，避免与方案手写的 id 撞 |
+| `id` | `dir:<相对路径去掉 .dict.yaml>`，如 `dir:pinyin/ext/idiom`。带前缀，避免与方案手写的 id 撞；用完整路径，不同目录的同名文件不撞 |
 | `label` | 词库头部 `name:`（复用 `read_dict_head` / `dict_yaml_name`），空则文件主名 |
 | `description` | 「自动识别：<相对路径>（用户目录/安装目录）」 |
 | `path` | 相对 `schemas/` 的路径 |

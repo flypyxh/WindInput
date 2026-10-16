@@ -5018,11 +5018,11 @@ mod tests {
             .learn_temp_word("pinyin", "lanshou", "蓝瘦", 800, 0)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
-        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -5059,11 +5059,11 @@ mod tests {
             .learn_temp_word("pinyin", "zaiyebuhao", "再也不好", 800, 0)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
-        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -5096,7 +5096,7 @@ mod tests {
             .add_user_word("pinyin", "nihaoa", "你好", 500, 0)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -5141,7 +5141,7 @@ mod tests {
             .add_user_word("pinyin", "nihao", "你好", 500, 0)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -5177,11 +5177,11 @@ mod tests {
                 .unwrap();
         }
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
-        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -5528,7 +5528,7 @@ mod tests {
                 .unwrap();
         }
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         let eng = PinyinEngine::new(
             Config {
                 sentence_uses_user_words: true,
@@ -5571,7 +5571,7 @@ mod tests {
                 .unwrap();
         }
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         let eng = PinyinEngine::new(
             Config {
                 sentence_uses_user_words: true,
@@ -5606,7 +5606,7 @@ mod tests {
                 .unwrap();
         }
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         let eng = PinyinEngine::new(
             Config {
                 sentence_uses_user_words: true,
@@ -5728,7 +5728,7 @@ mod tests {
             .add_user_word("pinyin", "qingfengshurufa", "清风输入法", 5000, boundary)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         // min_syllables 设回 2：本组用例用 `qingfengshu`(3 音节) 验用户长词上浮，
         // 出厂的 4 会挡掉样本。
         let cfg = Config {
@@ -6033,11 +6033,11 @@ mod tests {
             .learn_temp_word("pinyin", "lanshoubing", "蓝瘦蘑菇", 800, 0)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
-        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreTempLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -6069,7 +6069,7 @@ mod tests {
             .add_user_word("pinyin", "cainiaoyizhan", "菜鸟驿站", 500, 0)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));
@@ -6220,7 +6220,7 @@ mod tests {
             .add_user_word("pinyin", "baichengxian", "拜城县", 800, 0b1_0000_1001)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         let mut nodes: Vec<Vec<lattice::LatticeNode>> = vec![Vec::new(); 4];
         nodes[3].push(lattice::LatticeNode {
             start: 0,
@@ -6257,7 +6257,7 @@ mod tests {
             .add_user_word("pinyin", "caijiu", "菜就", 500, 0b1001)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         let eng = sp_fp_engine("fuzzy_words", &[("中国", "zhong guo", 5000)], true)
             .with_fuzzy(FuzzyConfig {
                 zh_z: true,
@@ -6301,7 +6301,7 @@ mod tests {
             .add_user_word("pinyin", "caijiu", "菜就", 500, 0b1001)
             .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(store, "pinyin")));
         let eng = sp_fp_engine("merge_origin", &[("菜就", "cai jiu", 5000)], true)
             .with_store_layers(Arc::new(dm));
         let r = eng.convert("caijiu", 50).unwrap();
@@ -7569,7 +7569,7 @@ mod tests {
             .unwrap();
 
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
             store.clone(),
             "pinyin",
         )));

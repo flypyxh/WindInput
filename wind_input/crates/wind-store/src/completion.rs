@@ -25,7 +25,6 @@
 //! 让 `list_data_schemas()` 之类按前缀扫描的逻辑读到一个不存在的方案。
 
 use crate::store::{COMPLETION, Store};
-use redb::ReadableTable;
 
 /// 学习数据的类别（表 key 的第一段）。
 ///
@@ -131,7 +130,7 @@ fn now_secs() -> i64 {
 /// 排序判据：次数降序 → 最近使用降序 → 文本升序。
 ///
 /// 末尾那道文本比较不是装饰：只按前两项排时，两条次数与时刻都相同的记录顺序取决于
-/// redb 的返回次序，候选窗会在两次相同输入间无故换序。补全候选的位置必须是**可盲打**的。
+/// 存储的返回次序，候选窗会在两次相同输入间无故换序。补全候选的位置必须是**可盲打**的。
 fn better(a: &(String, CompletionRecord), b: &(String, CompletionRecord)) -> std::cmp::Ordering {
     b.1.count
         .cmp(&a.1.count)
@@ -139,52 +138,180 @@ fn better(a: &(String, CompletionRecord), b: &(String, CompletionRecord)) -> std
         .then(a.0.cmp(&b.0))
 }
 
+/// 内存里的补全历史（P5 起真源是用户数据目录的 `completion.table.yaml`）。
+#[derive(Default)]
+pub(crate) struct CompletionState {
+    loaded: bool,
+    map: std::collections::BTreeMap<(&'static str, String), CompletionRecord>,
+    dirty: bool,
+    /// 每次改动 +1：落盘在锁外做，写完时代次没变才算「干净」。
+    generation: u64,
+    /// 文件读不了（IO 错误，如被占用）：本次运行不写回，免得盖掉读不到的原文件。解析失败不走
+    /// 这里——机写文件坏了从 `.bak` 自愈或另存后重建（§2.5）。
+    unreadable: bool,
+    /// 最近一次读到 / 写出的文件指纹：重载时据此分辨文件是不是被手改过。
+    fp: Option<String>,
+}
+
+fn file_fp(p: &std::path::Path) -> Option<String> {
+    wind_userdata::text::fold::read_text(p)
+        .ok()
+        .map(|c| wind_userdata::text::fold::fingerprint(c.as_ref().map(|(b, _)| b.as_slice())))
+}
+
+pub(crate) const COMPLETION_COLUMNS: [&str; 4] = ["kind", "text", "count", "last_used"];
+
+type CompletionMap = std::collections::BTreeMap<(&'static str, String), CompletionRecord>;
+
+/// 解析补全表：坏行（未知类别、空文本、数字坏）跳过并计数。
+fn parse_completion_table(
+    bytes: &[u8],
+    path: &std::path::Path,
+) -> anyhow::Result<(CompletionMap, usize)> {
+    let doc = wind_userdata::text::table::parse_table(bytes, path)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let mut map = CompletionMap::new();
+    let mut bad = 0;
+    for r in &doc.rows {
+        let kind = CompletionKind::from_key(doc.get(r, "kind"));
+        let text = doc.get(r, "text");
+        let count = doc.get(r, "count").trim().parse::<u32>();
+        let last = doc.get(r, "last_used").trim().parse::<i64>();
+        match (kind, count, last) {
+            (Some(k), Ok(count), Ok(last_used)) if !text.is_empty() => {
+                map.entry((k.as_str(), text.to_string()))
+                    .or_insert(CompletionRecord { count, last_used });
+            }
+            _ => bad += 1,
+        }
+    }
+    Ok((map, bad))
+}
+
+/// 补全表的整文件渲染。
+pub(crate) fn render_completion_table(map: &CompletionMap) -> String {
+    let rows: Vec<Vec<String>> = map
+        .iter()
+        .map(|((k, t), r)| {
+            vec![
+                k.to_string(),
+                t.clone(),
+                r.count.to_string(),
+                r.last_used.to_string(),
+            ]
+        })
+        .collect();
+    wind_userdata::text::table::render_table(&COMPLETION_COLUMNS, "completion", &rows)
+}
+
 impl Store {
-    /// 记录一次使用：count++、last_used=now（单写事务）。
+    /// 补全历史：`<data>/completion.table.yaml`（P5 起随用户目录走）。
+    pub fn completion_path(&self) -> std::path::PathBuf {
+        self.user_text_dir().join("completion.table.yaml")
+    }
+
+    /// 取内存表（首次访问时从文件载入）。
+    fn completions(&self) -> std::sync::MutexGuard<'_, CompletionState> {
+        let mut g = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.loaded {
+            g.loaded = true;
+            let path = self.completion_path();
+            let parse = |b: &[u8]| parse_completion_table(b, &path);
+            match crate::machine_file::load_machine_file(&path, &parse) {
+                Ok(None) => {}
+                Ok(Some((map, bad))) => {
+                    wind_userdata::issues::report_parse(&path, bad);
+                    g.map = map;
+                }
+                Err(e) => {
+                    tracing::warn!("读不了补全历史文件：{e:#}（本次运行不写回）");
+                    g.unreadable = true;
+                }
+            }
+            g.fp = file_fp(&path);
+        }
+        g
+    }
+
+    /// 文件被手改 / 换掉（`dict.reload` 指名）：丢掉内存表，下次访问重读。
+    ///
+    /// 文件被手改过（指纹与最近一次读写的不同）⇒ 以文件为准，内存里未落盘的改动丢弃，不先落盘
+    /// 盖掉手改。
+    pub fn reload_completions(&self) -> bool {
+        let edited = {
+            let g = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+            g.loaded && g.fp != file_fp(&self.completion_path())
+        };
+        if edited {
+            tracing::info!("补全历史文件被改过，以文件为准重新载入");
+        } else if let Err(e) = self.flush_completions() {
+            tracing::warn!("补全历史落盘失败：{e:#}");
+        }
+        let mut g = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+        *g = CompletionState::default();
+        true
+    }
+
+    /// 内存表有改动就整文件原子写一次（去抖落盘线程、`Store` 释放、`dict.flush` 调）。
+    ///
+    /// 数据锁只在取快照时短暂持有：写盘（两次 fsync，机械盘上可达上百毫秒）在锁外做，按键路径的
+    /// 读写不陪等。并发的两次落盘由 `completion_io` 串行。
+    pub(crate) fn flush_completions(&self) -> anyhow::Result<()> {
+        let _io = self.completion_io.lock().unwrap_or_else(|e| e.into_inner());
+        let (bytes, generation) = {
+            let g = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+            if !g.dirty || g.unreadable {
+                return Ok(());
+            }
+            (Self::completion_bytes(&g)?, g.generation)
+        };
+        wind_userdata::text::fold::commit_text(&self.completion_path(), &bytes, None)?;
+        let mut g = self.completions.lock().unwrap_or_else(|e| e.into_inner());
+        g.fp = Some(wind_userdata::text::fold::fingerprint(Some(&bytes)));
+        if g.generation == generation {
+            g.dirty = false;
+        }
+        Ok(())
+    }
+
+    fn completion_bytes(g: &CompletionState) -> anyhow::Result<Vec<u8>> {
+        Ok(render_completion_table(&g.map).into_bytes())
+    }
+
+    /// 记录一次使用：count++、last_used=now（只改内存，去抖落盘）。
     ///
     /// 空文本与超长文本**静默忽略**（返回 `Ok(false)`）：调用点在上屏路径上，那里为一条
     /// 学习数据报错没有任何可做的补救，而把畸形数据写进去会一直留在补全列表里。
-    ///
-    /// 写入时机同 [`Store::record_freq`]：每次上屏即时落盘。这两类数据的写入频率远低于
-    /// 选词（只在网址/邮箱模式上屏时发生），不需要内存缓冲。
     pub fn record_completion(&self, kind: CompletionKind, text: &str) -> anyhow::Result<bool> {
         if text.is_empty() || text.chars().count() > COMPLETION_TEXT_MAX_CHARS {
             return Ok(false);
         }
-        let key = enc_key(kind, text);
         let now = now_secs();
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(COMPLETION)?;
-                let count = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_rec(g.value()))
-                    .map(|r| r.count)
-                    .unwrap_or(0);
-                t.insert(
-                    key.as_str(),
-                    enc_rec(count.saturating_add(1), now).as_slice(),
-                )?;
-            }
-            txn.commit()?;
-            Ok(())
-        })?;
+        let mut g = self.completions();
+        let r = g
+            .map
+            .entry((kind.as_str(), text.to_string()))
+            .or_insert(CompletionRecord {
+                count: 0,
+                last_used: 0,
+            });
+        r.count = r.count.saturating_add(1);
+        r.last_used = now;
+        g.dirty = true;
+        g.generation += 1;
         Ok(true)
     }
 
-    /// 取一条记录。`None` = 没学过。
     pub fn get_completion(
         &self,
         kind: CompletionKind,
         text: &str,
     ) -> anyhow::Result<Option<CompletionRecord>> {
-        let key = enc_key(kind, text);
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(COMPLETION)?;
-            Ok(t.get(key.as_str())?.and_then(|g| dec_rec(g.value())))
-        })
+        Ok(self
+            .completions()
+            .map
+            .get(&(kind.as_str(), text.to_string()))
+            .copied())
     }
 
     /// 列举某 kind 下以 `prefix` 开头的记录，已按 [`better`] 排好序。
@@ -192,8 +319,7 @@ impl Store {
     /// `limit = 0` 表示不限。返回 `(本页, 该 kind 下命中前缀的总数)`。
     ///
     /// ⚠️ 前缀匹配是**字面**的，不做大小写归一——归一属于消费端的策略（网址补全要
-    /// 不区分大小写，而用户自定义的邮箱后缀大小写可能有意义），放在这里会让两个消费端
-    /// 再也表达不出差异。
+    /// 不区分大小写，而用户自定义的邮箱后缀大小写可能有意义）。
     pub fn list_completions(
         &self,
         kind: CompletionKind,
@@ -201,91 +327,57 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> anyhow::Result<(Vec<(String, CompletionRecord)>, usize)> {
-        let scan = format!("{}{}", scan_prefix(kind), prefix);
-        let strip = scan_prefix(kind).len();
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(COMPLETION)?;
-            let mut all: Vec<(String, CompletionRecord)> = Vec::new();
-            for item in t.range(scan.as_str()..)? {
-                let (k, v) = item?;
-                let key = k.value();
-                if !key.starts_with(&scan) {
-                    break;
-                }
-                if let Some(rec) = dec_rec(v.value()) {
-                    all.push((key[strip..].to_string(), rec));
-                }
-            }
-            all.sort_by(better);
-            let total = all.len();
-            let page: Vec<_> = all
-                .into_iter()
-                .skip(offset)
-                .take(if limit == 0 { usize::MAX } else { limit })
-                .collect();
-            Ok((page, total))
-        })
+        let k = kind.as_str();
+        let mut all: Vec<(String, CompletionRecord)> = self
+            .completions()
+            .map
+            .range((k, prefix.to_string())..)
+            .take_while(|((kk, t), _)| *kk == k && t.starts_with(prefix))
+            .map(|((_, t), r)| (t.clone(), *r))
+            .collect();
+        all.sort_by(better);
+        let total = all.len();
+        let page: Vec<_> = all
+            .into_iter()
+            .skip(offset)
+            .take(if limit == 0 { usize::MAX } else { limit })
+            .collect();
+        Ok((page, total))
     }
 
     /// 删一条。返回它本来在不在。
     pub fn remove_completion(&self, kind: CompletionKind, text: &str) -> anyhow::Result<bool> {
-        let key = enc_key(kind, text);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let existed;
-            {
-                let mut t = txn.open_table(COMPLETION)?;
-                existed = t.remove(key.as_str())?.is_some();
-            }
-            txn.commit()?;
-            Ok(existed)
-        })
+        let mut g = self.completions();
+        let existed = g.map.remove(&(kind.as_str(), text.to_string())).is_some();
+        g.dirty |= existed;
+        g.generation += 1;
+        Ok(existed)
     }
 
     /// 清空某 kind 的全部记录，返回删除条数。
     ///
     /// **只清这一类**：用户在设置里点「清空网址历史」不该顺带把邮箱后缀学习也抹掉。
     pub fn clear_completions(&self, kind: CompletionKind) -> anyhow::Result<usize> {
-        let scan = scan_prefix(kind);
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            let mut removed = 0usize;
-            {
-                let mut t = txn.open_table(COMPLETION)?;
-                let keys: Vec<String> = t
-                    .range(scan.as_str()..)?
-                    .filter_map(|item| item.ok())
-                    .map(|(k, _)| k.value().to_string())
-                    .take_while(|k| k.starts_with(&scan))
-                    .collect();
-                for k in keys {
-                    if t.remove(k.as_str())?.is_some() {
-                        removed += 1;
-                    }
-                }
-            }
-            txn.commit()?;
-            Ok(removed)
-        })
+        let mut g = self.completions();
+        let before = g.map.len();
+        g.map.retain(|(k, _), _| *k != kind.as_str());
+        let removed = before - g.map.len();
+        g.dirty |= removed > 0;
+        g.generation += 1;
+        Ok(removed)
     }
 
     /// 裁剪到只保留排序最靠前的 `max` 条，返回删除条数。`max = 0` 表示不限（不裁剪）。
     ///
-    /// 网址历史是**无界**的（用户打过的每个网址都是一条），没有这道闸它会一直长。裁剪
-    /// 按与补全展示**同一个排序**（[`better`]）取舍，所以被裁掉的一定是补全里最靠后、
-    /// 用户最不可能选到的那些。
+    /// 网址历史是**无界**的，没有这道闸它会一直长。裁剪按与补全展示**同一个排序**
+    /// （[`better`]）取舍，被裁掉的一定是补全里最靠后、用户最不可能选到的那些。
     ///
     /// # ★ `keep` 存在的理由：不加它，表一满就再也学不进新东西
     ///
     /// 调用方的顺序是「先记一条，再裁到上限」，而新记的那条 `count` 恒为 1，在 [`better`]
-    /// 的首要判据（次数降序）里排在所有 `count ≥ 2` 的老条目**之后**。于是表里一旦攒够
-    /// `max` 条老条目，每次上屏都是**写进去、当场被自己这次裁剪删掉**——历史从此冻结，
-    /// 且每次上屏白付一次写事务加一次全表排序。这是纯 LFU 的结构性缺陷，不是调 `max`
-    /// 能绕开的。
-    ///
-    /// `keep` 把本次刚写入的那条提到排序最前，使它必定在保留集内；被挤掉的于是变成
-    /// 「除它以外最冷的那条」，这才是这道闸本来该有的语义。
+    /// 的首要判据（次数降序）里排在所有 `count ≥ 2` 的老条目**之后**。表里一旦攒够 `max`
+    /// 条老条目，每次上屏都是「写进去、当场被自己这次裁剪删掉」——历史从此冻结。`keep`
+    /// 把本次刚写入的那条提到排序最前，使它必定在保留集内。
     pub fn prune_completions(
         &self,
         kind: CompletionKind,
@@ -306,29 +398,22 @@ impl Store {
             let item = all.remove(pos);
             all.insert(0, item);
         }
-        let doomed: Vec<String> = all.into_iter().skip(max).map(|(text, _)| text).collect();
+        let mut g = self.completions();
         let mut removed = 0usize;
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(COMPLETION)?;
-                for text in &doomed {
-                    if t.remove(enc_key(kind, text).as_str())?.is_some() {
-                        removed += 1;
-                    }
-                }
+        for (text, _) in all.into_iter().skip(max) {
+            if g.map.remove(&(kind.as_str(), text)).is_some() {
+                removed += 1;
             }
-            txn.commit()?;
-            Ok(())
-        })?;
+        }
+        g.dirty |= removed > 0;
+        g.generation += 1;
         Ok(removed)
     }
 
     /// 导出**全部** kind 为 jsonl（每行 `{"kind","text","count","last_used"}`）。
     ///
     /// 不按 kind 分文件：备份包里多一个文件就多一处要在 `create_backup` /
-    /// `restore_backup` / `RESTORE_SECTIONS` 三处同步登记的地方，而 `common_chars`
-    /// 漏登记 `RESTORE_SECTIONS` 的前科说明那是条真会被漏的路。
+    /// `restore_backup` / `RESTORE_SECTIONS` 三处同步登记的地方。
     pub fn export_completions_jsonl(&self) -> anyhow::Result<String> {
         let mut out = String::new();
         for kind in CompletionKind::ALL {
@@ -346,60 +431,133 @@ impl Store {
         Ok(out)
     }
 
-    /// 从 jsonl 导入（单写事务）。已存在的条目取 `max(count)` / `max(last_used)`。
+    /// 从 jsonl 导入。已存在的条目取 `max(count)` / `max(last_used)`。导入完立即落盘。
     ///
     /// 返回 `(imported, skipped)`。非法行、未知 kind、超长文本都计入 skipped 而不报错
     /// ——备份还原时为一条坏记录中断整个还原，代价远大于丢掉那一条。
     pub fn import_completions_jsonl(&self, text: &str) -> anyhow::Result<(usize, usize)> {
         let normalized = wind_utils::text::normalize_input(text);
         let text = normalized.as_ref();
-        let mut rows: Vec<(CompletionKind, String, u32, i64)> = Vec::new();
         let mut skipped = 0usize;
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                skipped += 1;
-                continue;
-            };
-            let kind = v
-                .get("kind")
-                .and_then(|x| x.as_str())
-                .and_then(CompletionKind::from_key);
-            let word = v.get("text").and_then(|x| x.as_str());
-            let (Some(kind), Some(word)) = (kind, word) else {
-                skipped += 1;
-                continue;
-            };
-            if word.is_empty() || word.chars().count() > COMPLETION_TEXT_MAX_CHARS {
-                skipped += 1;
-                continue;
-            }
-            let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
-            let last_used = v.get("last_used").and_then(|x| x.as_i64()).unwrap_or(0);
-            rows.push((kind, word.to_string(), count, last_used));
-        }
         let mut imported = 0usize;
+        {
+            let mut g = self.completions();
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    skipped += 1;
+                    continue;
+                };
+                let kind = v
+                    .get("kind")
+                    .and_then(|x| x.as_str())
+                    .and_then(CompletionKind::from_key);
+                let word = v.get("text").and_then(|x| x.as_str());
+                let (Some(kind), Some(word)) = (kind, word) else {
+                    skipped += 1;
+                    continue;
+                };
+                if word.is_empty() || word.chars().count() > COMPLETION_TEXT_MAX_CHARS {
+                    skipped += 1;
+                    continue;
+                }
+                let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                let last_used = v.get("last_used").and_then(|x| x.as_i64()).unwrap_or(0);
+                let r =
+                    g.map
+                        .entry((kind.as_str(), word.to_string()))
+                        .or_insert(CompletionRecord {
+                            count: 0,
+                            last_used: 0,
+                        });
+                r.count = r.count.max(count);
+                r.last_used = r.last_used.max(last_used);
+                g.dirty = true;
+                g.generation += 1;
+                imported += 1;
+            }
+        }
+        self.flush_completions()?;
+        Ok((imported, skipped))
+    }
+
+    /// 旧 `COMPLETION` 表全部行（P4a 迁移用）。
+    pub(crate) fn legacy_completion_rows(
+        &self,
+    ) -> anyhow::Result<Vec<(CompletionKind, String, CompletionRecord)>> {
+        self.with_db(|db| {
+            use redb::ReadableTable;
+            let txn = db.begin_read()?;
+            let t = txn.open_table(COMPLETION)?;
+            let mut out = Vec::new();
+            for item in t.iter()? {
+                let (k, v) = item?;
+                let Some((kind, text)) = k.value().split_once('\u{0}') else {
+                    continue;
+                };
+                if let (Some(kind), Some(rec)) =
+                    (CompletionKind::from_key(kind), dec_rec(v.value()))
+                {
+                    out.push((kind, text.to_string(), rec));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// 测试 / 探针：往旧 `COMPLETION` 表写一批（模拟升级前的库；redb 页缓存机制测试也拿它做负载，
+    /// P4b 随 redb 一起删）。单写事务。
+    #[doc(hidden)]
+    pub fn legacy_put_completions(
+        &self,
+        rows: &[(CompletionKind, String, u32, i64)],
+    ) -> anyhow::Result<()> {
         self.with_db(|db| {
             let txn = db.begin_write()?;
             {
                 let mut t = txn.open_table(COMPLETION)?;
-                for (kind, word, count, last_used) in &rows {
-                    let key = enc_key(*kind, word);
-                    let old = t.get(key.as_str())?.and_then(|g| dec_rec(g.value()));
-                    let (c, lu) = match old {
-                        Some(o) => (o.count.max(*count), o.last_used.max(*last_used)),
-                        None => (*count, *last_used),
-                    };
-                    t.insert(key.as_str(), enc_rec(c, lu).as_slice())?;
-                    imported += 1;
+                for (kind, text, count, last_used) in rows {
+                    t.insert(
+                        enc_key(*kind, text).as_str(),
+                        enc_rec(*count, *last_used).as_slice(),
+                    )?;
                 }
             }
             txn.commit()?;
             Ok(())
-        })?;
-        Ok((imported, skipped))
+        })
+    }
+
+    /// redb 页缓存机制测试的读负载：扫旧 `COMPLETION` 表里 kind 下以 `prefix` 开头的文本（`limit`
+    /// 0 = 不限）。P4b 随 redb 一起删。
+    #[doc(hidden)]
+    pub fn legacy_scan_completions(
+        &self,
+        kind: CompletionKind,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let scan = format!("{}{}", scan_prefix(kind), prefix);
+        let strip = scan_prefix(kind).len();
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(COMPLETION)?;
+            let mut out = Vec::new();
+            for item in t.range(scan.as_str()..)? {
+                let (k, _) = item?;
+                let key = k.value();
+                if !key.starts_with(&scan) {
+                    break;
+                }
+                out.push(key[strip..].to_string());
+                if limit > 0 && out.len() >= limit {
+                    break;
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -417,6 +575,125 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&p);
         Store::open(&p).unwrap()
+    }
+
+    fn reopen(tag: &str, s: Store) -> Store {
+        drop(s);
+        let p = std::env::temp_dir().join(format!(
+            "wind_completion_test_{}_{}_{:?}.redb",
+            std::process::id(),
+            tag,
+            std::thread::current().id()
+        ));
+        Store::open(&p).unwrap()
+    }
+
+    fn has(s: &Store, kind: CompletionKind, text: &str) -> bool {
+        s.get_completion(kind, text).unwrap().is_some()
+    }
+
+    /// dict.reload 指名补全文件：手改的内容生效，不被内存里未落盘的旧版本盖掉。
+    #[test]
+    fn reload_keeps_hand_edit_even_with_unflushed_changes() {
+        let s = store("reload_edit");
+        s.record_completion(CompletionKind::EmailSuffix, "qq.com")
+            .unwrap();
+        s.flush_completions().unwrap();
+        s.record_completion(CompletionKind::EmailSuffix, "163.com")
+            .unwrap(); // 未落盘
+        let p = s.completion_path();
+        let edited = std::fs::read_to_string(&p)
+            .unwrap()
+            .replace("qq.com", "hand.example");
+        std::fs::write(&p, &edited).unwrap();
+        assert!(s.reload_completions());
+        assert!(has(&s, CompletionKind::EmailSuffix, "hand.example"));
+        assert!(!has(&s, CompletionKind::EmailSuffix, "qq.com"));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            edited,
+            "手改的文件没被盖掉"
+        );
+    }
+
+    /// M-2 / §2.5 机写文件：坏了从 `.bak` 自愈，之后照常学习、照常落盘。
+    #[test]
+    fn corrupt_completion_self_heals_from_bak() {
+        let s = store("heal");
+        s.record_completion(CompletionKind::EmailSuffix, "qq.com")
+            .unwrap();
+        s.flush_completions().unwrap();
+        s.record_completion(CompletionKind::EmailSuffix, "163.com")
+            .unwrap();
+        s.flush_completions().unwrap(); // .bak = 只有 qq.com 的那一版
+        let p = s.completion_path();
+        let s = reopen("heal", s);
+        std::fs::write(&p, b"\xff garbage").unwrap();
+        let s = reopen("heal", s);
+        assert!(has(&s, CompletionKind::EmailSuffix, "qq.com"));
+        s.record_completion(CompletionKind::EmailSuffix, "gmail.com")
+            .unwrap();
+        s.flush_completions().unwrap();
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("gmail.com") && txt.contains("qq.com"), "{txt}");
+    }
+
+    #[test]
+    fn completion_without_good_bak_is_kept_aside_and_rebuilt() {
+        let s = store("rebuild");
+        let p = s.completion_path();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"\xff garbage").unwrap();
+        s.record_completion(CompletionKind::UrlHistory, "example.com")
+            .unwrap();
+        s.flush_completions().unwrap();
+        let kept = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("completion.table.yaml.corrupt-")
+            });
+        assert!(kept);
+        assert!(std::fs::read_to_string(&p).unwrap().contains("example.com"));
+    }
+
+    #[test]
+    fn completion_file_is_table_text_in_data_dir() {
+        let s = store("table");
+        s.record_completion(CompletionKind::QuickHistory, "a\tb")
+            .unwrap();
+        s.flush_completions().unwrap();
+        let p = s.completion_path();
+        assert!(p.ends_with("completion.table.yaml"));
+        assert!(p.starts_with(s.user_text_dir()));
+        let txt = std::fs::read_to_string(&p).unwrap();
+        assert!(txt.contains("kind: completion"), "{txt}");
+        assert!(txt.contains("quick_history\ta\\tb\t1\t"), "{txt}");
+        let s = reopen("table", s);
+        assert!(has(&s, CompletionKind::QuickHistory, "a\tb"));
+    }
+
+    #[test]
+    fn completion_bad_rows_are_skipped_and_counted() {
+        let s = store("badrow");
+        let p = s.completion_path();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "---\ncolumns: [kind, text, count, last_used]\nwind: {kind: completion, escape: true}\n...\n# no comment\nemail_suffix\tqq.com\t2\t1\nnope\tx\t1\t1\nemail_suffix\ty.com\tz\t1\n",
+        )
+        .unwrap();
+        assert!(has(&s, CompletionKind::EmailSuffix, "qq.com"));
+        assert_eq!(
+            wind_userdata::issues::list_under(&p),
+            vec![wind_userdata::issues::FileIssue {
+                path: p.clone(),
+                kind: wind_userdata::issues::IssueKind::BadLines(2)
+            }]
+        );
+        wind_userdata::issues::clear(&p);
     }
 
     #[test]
@@ -761,5 +1038,93 @@ mod tests {
             assert_eq!(CompletionKind::from_key(k.as_str()), Some(k));
         }
         assert_eq!(CompletionKind::from_key("emial_suffix"), None);
+    }
+
+    /// 按键路径读写都只碰内存（redb 暂停照样补全、记录、裁剪）。
+    #[test]
+    fn completion_hot_path_does_not_touch_redb() {
+        let s = store("hot");
+        s.record_completion(CompletionKind::EmailSuffix, "qq.com")
+            .unwrap();
+        s.pause().unwrap();
+        assert!(
+            s.record_completion(CompletionKind::EmailSuffix, "163.com")
+                .unwrap()
+        );
+        assert_eq!(
+            s.list_completions(CompletionKind::EmailSuffix, "", 0, 0)
+                .unwrap()
+                .1,
+            2
+        );
+        assert_eq!(
+            s.prune_completions(CompletionKind::EmailSuffix, 1, None)
+                .unwrap(),
+            1
+        );
+        s.resume().unwrap();
+    }
+
+    /// 不起落盘线程，释放 Store 时同步落盘，重开后记录在。
+    #[test]
+    fn completion_survives_drop_without_flusher() {
+        let p = std::env::temp_dir().join(format!("wind_cmp_drop_{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let s = Store::open(&p).unwrap();
+            s.record_completion(CompletionKind::UrlHistory, "example.com")
+                .unwrap();
+            s.record_completion(CompletionKind::UrlHistory, "example.com")
+                .unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let rec = s
+            .get_completion(CompletionKind::UrlHistory, "example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.count, 2);
+        assert!(s.completion_path().is_file());
+    }
+
+    /// 审查 I-2：落盘（含 fsync）期间不持数据锁——按键路径的 list / record 不被一次写盘卡住。
+    #[test]
+    fn flush_does_not_block_readers() {
+        let s = std::sync::Arc::new(store("flush_nonblock"));
+        s.record_completion(CompletionKind::EmailSuffix, "qq.com")
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Mutex::new(rx);
+        let flusher = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let f2 = flusher.clone();
+        let hook = wind_userdata::text::fold::add_before_rename_hook(Box::new(move || {
+            if Some(std::thread::current().id()) == *f2.lock().unwrap() {
+                // 模拟一次很慢的 fsync：等主线程读完再放行（最多 2 秒）
+                let _ = rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2));
+            }
+        }));
+        let s2 = s.clone();
+        let fl = flusher.clone();
+        let h = std::thread::spawn(move || {
+            *fl.lock().unwrap() = Some(std::thread::current().id());
+            s2.flush_small_files().unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
+        let n = s
+            .list_completions(CompletionKind::EmailSuffix, "", 0, 0)
+            .unwrap()
+            .1;
+        let waited = t.elapsed();
+        let _ = tx.send(());
+        h.join().unwrap();
+        drop(hook);
+        assert_eq!(n, 1);
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "读等了 {waited:?}"
+        );
     }
 }

@@ -5,23 +5,22 @@
 
 ## Purpose
 
-多层复合词典系统。定义 `DictLayer` 查询接口与 `CompositeDict` 跨层聚合引擎，负责 wdb/wdat 二进制格式的生成与 mmap 零拷贝查询，并将 `wind-store` 用户词/临时词桥接为可挂载的查询层。向上为各引擎 crate 暴露 `DictManager` 作为每方案唯一词典入口，向下依赖 `wind-candidate`（候选类型）与 `wind-store`（持久化后端）。
+多层复合词典系统。定义 `DictLayer` 查询接口与 `CompositeDict` 跨层聚合引擎，负责 wdb/wdat 二进制格式的生成与 mmap 零拷贝查询，（用户词 / 临时词 / 草稿的查询层 `Store*Layer` 已于 P1b 挪到 `wind-store`，本 crate 不再依赖用户库）。向上为各引擎 crate 暴露 `DictManager` 作为每方案唯一词典入口，向下依赖 `wind-candidate`（候选类型）与 `wind-wdict`（文本转义判据）。
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| `src/lib.rs` | 对外导出 `CompositeDict`、`DictLayer/LayerType/MutableLayer`、`DictManager/SystemDictLayer`、`StoreUserLayer/StoreTempLayer` |
+| `src/lib.rs` | 对外导出 `CompositeDict`、`DictLayer/LayerType/MutableLayer`、`DictManager/SystemDictLayer` |
 | `src/layer.rs` | `DictLayer`/`MutableLayer` trait；`LayerType` 枚举（Logic=0 \< User=1 \< Temp=2 \< Cell=3 \< System=4，数值越小优先级越高） |
 | `src/composite.rs` | `CompositeDict` 跨层聚合；去重继承更高权重；前缀查保最短码；`set_layer_enabled` 热插拔；含完整单元测试 |
 | `src/manager.rs` | `DictManager` 持有每方案一个 `CompositeDict`；`SystemDictLayer` 把 `CachedDict` 包为 `DictLayer`，用原子标志支持运行时启停 |
-| `src/store_layer.rs` | `StoreUserLayer` / `StoreTempLayer` 把 `wind-store` 查询包装为 `DictLayer`（User/Temp 层） |
 | `src/binformat.rs` | wdb 格式 `DictReader`（mmap 二分查询，V2/V3）/ `DictWriter`（原子 .tmp→rename 写入）；`for_each_entry` 供反查索引构建 |
-| `src/datformat.rs` | wdat（DAT）格式，含独立 `AbbrevSection`（简拼区）；`CachedDict::Mmap` 实际使用的格式 |
-| `src/cached.rs` | `CachedDict`（Mmap/Memory 两种模式）；yaml→wdat 缓存流程 + **wdat-only 模式**（用户只投放二进制词库、无 yaml 源时原位直接加载，加载失败不可重建）；`build_reverse_index` 构建汉字→编码反查表 |
+| `src/datformat.rs` | wdat（DAT）格式，含独立 `AbbrevSection`（简拼区）；`CachedDict::Mmap` 实际使用的格式。`WdatStreamWriter` 流式写入（码按序喂入、text 直接进池）是唯一的构建路径，`WdatWriter` 排序后委托给它；`WdatReader::codes()` 有序游标 + `leaf_entries()` 供多段 k 路归并；构建各阶段有 debug 级计时与 RssAnon 打点（`RUST_LOG=wind_dict=debug`） |
+| `src/cached.rs` | `CachedDict`（Mmap/Memory/Layered 三种模式）；yaml→wdat 缓存流程（传入的 wdat 路径是**槽位**，实际文件按内容指纹命名）+ **wdat-only 模式**（用户只投放二进制词库、无 yaml 源时原位直接加载，加载失败不可重建）；`build_reverse_index` 构建汉字→编码反查表 |
 | `src/reader_pool.rs` | wdat/wcmt mmap reader 进程级共享池（按缓存文件路径复用，存 `Weak` 不持强引用——mmap 期间 rename 会 Access Denied，池持强引用会让词库重建永久失败；新鲜度归 `cache_fp`，本池只管「同一路径只 mmap 一份」） |
-| `src/cache_fp.rs` | 基于源文件内容指纹（SipHash sidecar `.fp`）的缓存有效性校验，解决部署刷新 mtime 导致恒重建的问题 |
-| `src/codetable.rs` | `CodetableDict` 内存 BTreeMap；自动检测五笔/拼音 Rime 格式；`parse_rime_entries_parallel` 多线程解析（>1MB 走 `thread::scope`），输出全拼+简拼两组 |
+| `src/cache_fp.rs` | 基于源文件内容指纹（SipHash sidecar `.fp`）的缓存有效性校验，解决部署刷新 mtime 导致恒重建的问题；状态 sidecar `.st` 记源的 (存在性, 长度, mtime, inode, ctime) 让源没动时判新鲜只 stat 不读内容（距取 stamp 前 2 s 内的 racy 窗口不记）；内容寻址槽位 API（`resolve_slot_fp` / `slot_content_path` / `prune_slot`）：文件名带指纹、同槽位留 2 份 |
+| `src/codetable.rs` | `CodetableDict` 内存 BTreeMap；自动检测五笔/拼音 Rime 格式；`parse_rime_entries_parallel` 多线程解析（>1MB 走 `thread::scope`），输出全拼+简拼两组；`rime_layout` 公开正文起点 / `# no comment` 截断点 / 列下标给 `wind-userdata` 文本层复用（规则只此一份） |
 | `src/trie.rs` | 前缀 Trie，供英文词库回退路径等组件使用 |
 | `src/hotcache.rs` | 热点码查找缓存层 |
 
@@ -37,9 +36,13 @@
 
 - **binformat entry_off 是字节偏移**：`DictKeyIndex.entry_off` 表示 EntryRecords 区内的**字节偏移**（累计条目数 × entry_size），而非条目数本身——历史上曾被误写为条目数导致非首 key 全部读乱码。修改 `DictWriter` 写入逻辑时务必保持此语义，见 `binformat.rs` 写入注释与往返回归测试。
 
+- **缓存文件名带内容指纹，传给 `load_at_with` 的 wdat 路径是槽位不是文件**：实际文件是 `<stem>-<fp12>.wdat`，要拿真实路径用 `CachedDict::source_file()`，测试里不要 `assert!(slot.exists())`。重建永远写新文件、不覆盖旧文件，同槽位由 `prune_slot` 留最近 2 份——覆盖库与自带库交替时两份都在。
+
+- **wdat 构建只有一条路径**：`WdatStreamWriter`。改 DAT 布局、池、MaxW 只改它；`WdatWriter::build` 是「排序后喂入」的薄壳，`stream_writer_matches_batch_writer_byte_for_byte` 锁定两者逐字节相同。排错 / 对拍用 `cargo run -p wind-dict --example wdat_dump -- <file.wdat> [abbrev]` 导出 TSV。
+
 - **缓存格式为 wdat（DAT），非 wdb**：`CachedDict` 走 `datformat.rs` 的 wdat 格式（含 AbbrevSection 简拼），而非旧的 wdb；`cache_fp.rs` 用内容指纹而非 mtime，缓存路径可与源分离（`CachedDict::load_at`），部署时不会因 mtime 刷新恒重建。
 
-- **Shadow 不是查询层**：`ShadowRecord`（pin/delete 规则）不挂进 `CompositeDict`，其应用由引擎在候选排序后由调用方执行；本 crate 只在 `store_layer.rs` 桥接 `wind-store` 的查询，不持有 Shadow 状态。
+- **Shadow 不是查询层**：`ShadowRecord`（pin/delete 规则）不挂进 `CompositeDict`，其应用由引擎在候选排序后由调用方执行；本 crate 不持有 Shadow 状态。
 
 ### Testing Requirements
 
@@ -51,7 +54,7 @@
 ### Internal
 
 - `wind-candidate` — `Candidate` 类型、排序函数 `better`、`CandidateSource`
-- `wind-store` — `Store`、`user_words::UserWordRecord`（经 `store_layer.rs` 桥接）
+- `wind-wdict` — 码表文本列的转义与命令栏条目判据（`codetable.rs`）
 
 ### External
 

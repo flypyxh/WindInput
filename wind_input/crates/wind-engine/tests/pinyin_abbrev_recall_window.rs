@@ -98,11 +98,11 @@ fn engine_with_store(tag: &str, count: usize, s: Arc<Store>) -> PinyinEngine {
 
 fn engine_with_store_dict(dict: CachedDict, s: Arc<Store>) -> PinyinEngine {
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         s.clone(),
         "pinyin",
     )));
-    dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(s, "pinyin")));
+    dm.register_layer(Box::new(wind_store::StoreTempLayer::new(s, "pinyin")));
     PinyinEngine::new(PyConfig::default(), dict).with_store_layers(Arc::new(dm))
 }
 

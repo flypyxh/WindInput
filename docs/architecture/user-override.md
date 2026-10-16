@@ -64,9 +64,10 @@
 
 ### 模型 C：不用文件覆盖（数据进数据库）
 
-用户短语、用户词、词频、shadow 置顶/删词全部存 `userdata.redb` / `user_data.db`，
-**没有**用户目录文件覆盖入口。`data/system.phrases.toml` 是系统短语的**种子**：启动时按
-内容哈希同步进库，之后一切读写都以库为准。
+用户短语、用户词、词频、shadow 置顶/删词全部存用户数据目录 `<userdata>/data/` 下的文本
+（2026-10 起取代 `userdata.redb`，见 `docs/design/user-data-storage-redesign.md`），**没有**另一层
+文件覆盖入口。`data/system.phrases.toml` 是系统短语的**种子**：每次启动交给存储层，文件只记
+用户行与对系统短语的修改行。
 
 注意区分：`system.phrases.toml` 这个文件本身**支持模型 A 覆盖**（用户可以整份替换掉自带的
 系统短语种子），但用户对单条短语的增删改仍然只走数据库，不回写任何 TOML。

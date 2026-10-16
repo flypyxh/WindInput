@@ -67,11 +67,11 @@ fn store(tag: &str) -> Arc<Store> {
 
 fn engine(tag: &str, s: Arc<Store>, on: bool) -> PinyinEngine {
     let dm = wind_dict::manager::DictManager::new();
-    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+    dm.register_layer(Box::new(wind_store::StoreUserLayer::new(
         s.clone(),
         "pinyin",
     )));
-    dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(s, "pinyin")));
+    dm.register_layer(Box::new(wind_store::StoreTempLayer::new(s, "pinyin")));
     let cfg = PyConfig {
         sentence_uses_user_words: on,
         ..Default::default()

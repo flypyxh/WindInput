@@ -2468,6 +2468,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "unicode-segmentation",
+ "uuid",
  "wind-quick-input",
  "wind-utils",
 ]
@@ -2525,8 +2526,8 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "wind-candidate",
- "wind-store",
  "wind-utils",
+ "wind-wdict",
  "windows",
 ]
 
@@ -2674,11 +2675,17 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror",
+ "toml 0.8.23",
  "tracing",
  "uuid",
+ "wind-candidate",
  "wind-cmdbar",
+ "wind-dict",
+ "wind-userdata",
  "wind-utils",
+ "wind-wdict",
 ]
 
 [[package]]
@@ -2772,8 +2779,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "wind-userdata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "memmap2",
+ "serde",
+ "serde_yaml",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+ "wind-candidate",
+ "wind-dict",
+ "wind-utils",
+ "wind-wdict",
+]
+
+[[package]]
 name = "wind-utils"
 version = "0.1.0"
+
+[[package]]
+name = "wind-wdict"
+version = "0.1.0"
+dependencies = [
+ "wind-cmdbar",
+ "wind-utils",
+]
 
 [[package]]
 name = "wind-webdata"

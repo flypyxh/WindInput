@@ -39,8 +39,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 
-# 空闲时 malloc_trim（heap_trim.rs）
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# 空闲时 malloc_trim（heap_trim.rs）；SIGTERM 先落盘（exit_signal.rs，桌面 unix）
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
