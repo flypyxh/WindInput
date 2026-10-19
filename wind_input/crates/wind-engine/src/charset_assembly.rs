@@ -58,6 +58,65 @@ pub fn user_docs_from_store(
     }
 }
 
+/// 同 [`user_docs_from_store`]，另按出厂校验并把问题登记到该文件（`storageStatus.issues` /
+/// `data.endEdit` 带回）：解析不了 / key 与文件名不一致 ⇒ 整份忽略；出厂类改 `ranges`、写
+/// `replace: true` ⇒ 去掉这两项、其余照用。没问题的文件清掉旧的不合规问题（别的问题不动）。
+pub fn validated_user_docs(
+    store: &wind_store::Store,
+    factory: &BTreeMap<String, MergedClass>,
+) -> Vec<wind_config::charset_def::CharsetDoc> {
+    use wind_store::issues::{self, IssueKind};
+    let rows = match store.list_charset_docs() {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("读字符类用户层失败，本次按无调整装配：{e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (key, text) in rows {
+        let Ok(path) = store.charset_path(&key) else {
+            continue;
+        };
+        let invalid = |message: String| issues::report(&path, IssueKind::Invalid { message });
+        let mut doc = match wind_config::charset_def::parse_doc(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("字符类用户层「{key}」解析失败，已跳过：{e}");
+                invalid(format!("字符分类文件格式有误，整份未生效：{e}"));
+                continue;
+            }
+        };
+        if doc.def.key != key {
+            warn!("字符类用户层：文件名「{key}」与文本里的 key 不一致，已跳过");
+            invalid(format!(
+                "文件里的 key「{}」与文件名不一致，整份未生效",
+                doc.def.key
+            ));
+            continue;
+        }
+        let mut ignored = Vec::new();
+        if let Some(f) = factory.get(&key) {
+            if doc.def.ranges.is_some() && f.def.ranges.is_some() && doc.def.ranges != f.def.ranges
+            {
+                doc.def.ranges = None;
+                ignored.push("出厂字符分类的范围不能改，已忽略");
+            }
+            if doc.def.replace == Some(true) {
+                doc.def.replace = None;
+                ignored.push("出厂字符分类不能整份替换（replace），已忽略");
+            }
+        }
+        if ignored.is_empty() {
+            issues::clear_invalid(&path);
+        } else {
+            invalid(ignored.join("；"));
+        }
+        out.push(doc);
+    }
+    out
+}
+
 /// 装配出判定用的 registry。
 ///
 /// `data_dir` 供 `file:` 字段走 `resolve_schema_resource` 做三层解析；`None` 时
@@ -286,6 +345,15 @@ fn load_member_file(key: &str, rel: &str, data_dir: Option<&Path>) -> Vec<String
 mod tests {
     use super::*;
     use wind_config::charset_def::{CharsetDef, parse_doc};
+
+    /// 字符类文件的说明行在 wind-config 渲染、在 wind-store 启动补写，两份文案必须一致。
+    #[test]
+    fn charset_banner_matches_store_backfill() {
+        assert_eq!(
+            wind_config::charset_def::STORED_DOC_BANNER,
+            wind_store::banner::CHARSETS
+        );
+    }
 
     /// 造合并结果：先垫两个**模拟出厂的区块类**，再叠加测试自己那份。
     ///

@@ -103,8 +103,7 @@ impl FocusLostReason {
 
 // 上行（darwin .app / Windows host-render DLL）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
 pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex i32 LE；<0 为翻页按钮（-1 上页 / -2 下页，与 SHM 命中矩形约定一致）
-pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无；Windows 另带 anchorX/belowY/aboveY 三个 i32，当前仅取 index)
-pub const CMD_CANDIDATE_CONTEXT_MENU: u16 = 0x020F; // 上行：候选右键动作 (payload: index i32 + actionLen u32 + action UTF-8)
+pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE（≥0 候选；Windows：-1=无、-2/-3=翻页；非 Windows：-1/-2=翻页、其余负值 INT32_MIN=无；Windows 另带 anchorX/belowY/aboveY 三个 i32，当前仅取 index）
 pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (payload: 菜单 id i32 LE)
 pub const CMD_CANDIDATE_SCROLL: u16 = 0x0211; // 上行：host 候选框滚轮 (payload: delta i32，WHEEL_DELTA 倍数，正=上滚)；服务端解释成「上下键调整高亮项」（到页边界翻到相邻页），见 Coordinator::handle_candidate_scroll
 /// 上报前台上下文（命令直通车 `app()`/`title()`/`sel()` 取值，目前仅 darwin `.app` 发）：
@@ -228,29 +227,9 @@ pub const CMD_HOST_RENDER_REQUEST: u16 = 0x0501;
 pub const CMD_HOST_RENDER_FRAME: u16 = 0x0502; // SHM 新帧就绪通知 (seq+几何+flags+scale, 28B)
 pub const CMD_CANDIDATE_RECTS: u16 = 0x0503; // 候选命中矩形 (panel-local)
 pub const CMD_MODE_STATUS: u16 = 0x0504; // 输入模式状态 (菜单栏指示器)
-pub const CMD_CANDIDATE_MENU_FLAGS: u16 = 0x0505; // 每候选右键菜单禁用位
 pub const CMD_MENU_SHOW: u16 = 0x0506; // 统一菜单树 (响应 CmdShowContextMenu)
 // 0x0507 曾是 CMD_OPEN_SETTINGS（payload 为「页名+参数」空格串）。已改走扩展信封的
 // `settings.open`（body 为 JSON argv 数组），码位空出——新增下行专用码位可从这里取。
-pub const CMD_TOOLTIP_SHOW: u16 = 0x0508; // 候选悬停 tooltip
-pub const CMD_TOOLTIP_HIDE: u16 = 0x0509;
-pub const CMD_STATUS_SHOW: u16 = 0x050A; // 模式状态气泡
-pub const CMD_STATUS_HIDE: u16 = 0x050B;
-/// `CMD_STATUS_SHOW` 尾部的锚点编码（C2-33 / GH#148）。`NONE` = 按 x/y 定位（跟随光标 / 固定
-/// 坐标，服务端已算定）；其余 = `.app` 按锚点在焦点所在屏自行落位，此时 x/y 只作选屏参考。
-/// 窗口两档在 `.app` 拿不到宿主窗口边框时降级为同位置的屏幕锚点。
-pub mod status_anchor {
-    pub const NONE: i32 = 0;
-    pub const SCREEN_CENTER: i32 = 1;
-    pub const SCREEN_TOP_LEFT: i32 = 2;
-    pub const SCREEN_TOP_RIGHT: i32 = 3;
-    pub const SCREEN_BOTTOM_LEFT: i32 = 4;
-    pub const SCREEN_BOTTOM_RIGHT: i32 = 5;
-    pub const WINDOW_CENTER: i32 = 6;
-    pub const WINDOW_BOTTOM_LEFT: i32 = 7;
-}
-pub const CMD_TOAST_SHOW: u16 = 0x050C; // Toast 通知
-pub const CMD_TOAST_HIDE: u16 = 0x050D;
 // 命令直通车按键合成（darwin 下行）：服务进程无辅助功能授权无法 post CGEvent，
 // 故把 key.tap/seq/hold/release/type 推给 .app 侧 KeySynthesizer 合成（.app 有授权）。
 // combo 载荷：keyLen u32 + key + modCount u32 + modCount×(modLen u32 + mod)，key/mod 均 UTF-8。
@@ -259,9 +238,9 @@ pub const CMD_KEY_SEQ: u16 = 0x050F; // comboCount u32 + comboCount×combo
 pub const CMD_KEY_HOLD: u16 = 0x0510; // 单个 combo（按下保持）
 pub const CMD_KEY_RELEASE: u16 = 0x0511; // 单个 combo（抬起）
 pub const CMD_KEY_TYPE: u16 = 0x0512; // 整段 UTF-8 文本（无长度前缀），.app 走 insertText 上屏
-/// 光栅浮层帧（**仅 Linux** Fcitx5 addon）：状态气泡 / Toast / 悬停提示由服务进程光栅化进
-/// 各自的 SHM 段（`endpoint::overlay_shm_name`），本帧通知「某一层有新帧 / 该隐藏」并带上
-/// 落位规则。macOS `.app` 原生渲染这三者、仍收文本帧（`CMD_STATUS_SHOW` 等），从不收本帧。
+/// 光栅浮层帧（外部宿主：macOS `.app` / Linux Fcitx5 addon）：状态气泡 / Toast / 悬停提示 /
+/// 自绘菜单由服务进程光栅化进各自的 SHM 段（`endpoint::overlay_shm_name`），本帧通知「某一层
+/// 有新帧 / 该隐藏」并带上落位规则。
 /// 布局见 [`crate::codec::encode_overlay_frame`]，常量见 [`overlay`]。
 pub const CMD_OVERLAY_FRAME: u16 = 0x0513;
 
@@ -352,16 +331,6 @@ pub mod ext_kind {
     pub const POS_CANDIDATE: &str = "pos.candidate";
     /// 上行：状态提示气泡被拖动到新位置。body 同 [`POS_CANDIDATE`]。
     pub const POS_STATUS_TIP: &str = "pos.status_tip";
-    /// 下行：请 `.app` 把某个原生浮窗截图存盘并复制到剪贴板。
-    /// body = `{"target":"status_tip"|"tooltip","path":"/绝对路径.png"}`。
-    ///
-    /// 为什么由 `.app` 动手：状态气泡与悬停提示是 `.app` 侧的原生 NSPanel，**像素不在
-    /// 服务进程**（候选窗相反，那是本进程光栅化后经 SHM 推下去的，故直接在本进程截）。
-    /// 文件名与随后的 Toast 文案仍由服务端决定，保持与 Windows 逐字一致。
-    pub const SHOT_PANEL: &str = "shot.panel";
-    /// 上行：[`SHOT_PANEL`] 的结果。
-    /// body = `{"ok":bool,"path":"…","clipboard":bool,"reason":"…"}`（`reason` 仅失败时）。
-    pub const SHOT_RESULT: &str = "shot.result";
     /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 [`POS_CANDIDATE`]。body 空。
     pub const POS_CANDIDATE_QUERY: &str = "pos.candidate.query";
     /// 下行：问宿主（`.app` / Linux addon）状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。
@@ -530,6 +499,11 @@ pub const CONFIG_KEY_CN_PASSTHROUGH_PUNCT: &str = "cn_passthrough_punct";
 ///
 /// TSF 侧按**当下**标点态（`STATUS_CHINESE_PUNCT`）二选一，标点态是运行时状态、进不了配置。
 pub const CONFIG_KEY_EN_PASSTHROUGH_PUNCT: &str = "en_passthrough_punct";
+/// 空格行配了自定义标点映射的列（位掩码，第 i 位 = 列 i：0=中半 1=英全 2=中全 3=英半）。
+/// 格式：`mask(u8)`。中文模式空缓冲时 TSF 默认透传空格、只在全角态吃；按 `OnTestKeyDown`
+/// 结论走的宿主（Notepad++、WPS）因此收不到半角列配的映射（t337）。TSF 据此按当下标点态 /
+/// 全半角多吃，引擎对吃下的空格必须出字。DLL 每次重连从 0（历史行为）起步，握手必推。
+pub const CONFIG_KEY_SPACE_CUSTOM_COLS: &str = "space_custom_cols";
 /// 配对状态时效（秒，0=不过期）同步键名。TSF 端持有吃键闸门（`_pairPendingDepth`），
 /// 必须能本地判定状态是否陈旧：若只有协调器过期而 DLL 仍吃跳出键，协调器回 PassThrough
 /// 已太晚（形成「吃了再吐」丢键）。故 TTL 判据以 DLL 侧为准，此键把阈值推给它。

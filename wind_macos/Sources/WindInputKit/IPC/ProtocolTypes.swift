@@ -31,7 +31,9 @@ public enum UpstreamCmd {
     /// NSPanel 候选框滚轮 (payload: delta i32, WHEEL_DELTA=120 的倍数, 正=上滚)。
     /// 服务端把它解释成「上下键调整高亮项」(到页边界翻到相邻页)，两平台同一实现。
     public static let candidateScroll: UInt16  = 0x0211
-    public static let candidateContextMenu: UInt16 = 0x020F // NSPanel 右键菜单动作 (payload: index i32 + actionLen u32 + action UTF-8)
+    /// 自绘菜单打开期间的原始指针事件 (payload 16 字节: event u32 + button u32 + x i32 + y i32,
+    /// wire 点坐标)。event: 1 移动 / 2 按下；button: 1 左 / 2 中 / 3 右，移动时 0。
+    public static let menuPointer: UInt16      = 0x021B
     public static let menuAction: UInt16       = 0x0210   // 统一菜单项被选中 (payload: id i32)
     public static let frontContext: UInt16     = 0x0215   // 前台上下文快照 (payload: appLen+app + titleLen+title + selLen+sel)
     /// 扩展信封 (上行)。低频消息的统一入口，见 Rust protocol.rs 的 CMD_EXT。
@@ -78,18 +80,14 @@ public enum DownstreamCmd {
     public static let hostRenderSetup: UInt16  = 0x0501
     public static let hostRenderFrame: UInt16  = 0x0502   // SHM 新帧就绪通知 (darwin)
     public static let candidateRects: UInt16   = 0x0503   // 当前帧候选命中矩形 (panel-local)
+    /// 光栅浮层帧 (状态气泡 / Toast / 悬停提示 / 自绘菜单)：像素在各层自己的 SHM 段，本帧带落位规则。
+    /// 布局见 `OverlayFrame`。
+    public static let overlayFrame: UInt16     = 0x0513
     public static let modeStatus: UInt16       = 0x0504   // 输入模式状态 (中英/全半角/标点/方案), 供菜单栏指示器
-    public static let candidateMenuFlags: UInt16 = 0x0505 // 当前页候选右键菜单禁用位 (每候选 1 字节)
     public static let menuShow: UInt16         = 0x0506   // 统一菜单树 (CmdShowContextMenu 请求的响应)
     /// 扩展信封 (下行)。与上行同码位、按方向区分，见 Rust protocol.rs 的 CMD_EXT。
     /// 「打开设置」等低频消息走这里 (kind = "settings.open")，不再各占一个码位。
     public static let ext: UInt16              = 0x0E01
-    public static let tooltipShow: UInt16      = 0x0508   // 候选悬停 tooltip 文本 + 主题色; .app 据悬停候选矩形定位
-    public static let tooltipHide: UInt16      = 0x0509   // 隐藏 tooltip (空 payload)
-    public static let statusShow: UInt16       = 0x050A   // 状态提示气泡 (模式/标点/全半角文本 + 主题色 + 位置 + 时长)
-    public static let statusHide: UInt16       = 0x050B   // 隐藏状态提示气泡 (空 payload)
-    public static let toastShow: UInt16        = 0x050C   // Toast 通知 (标题+正文 + 主题色 + accent + 位置 + 时长)
-    public static let toastHide: UInt16        = 0x050D   // 隐藏 Toast (空 payload)
     public static let keyTap: UInt16           = 0x050E   // 命令直通车单次按键合成 (key + modifiers); CGEvent post
     public static let keySeq: UInt16           = 0x050F   // 顺序多个按键组合
     public static let keyHold: UInt16          = 0x0510   // 按下并保持 (与 release 成对)
@@ -108,24 +106,21 @@ public enum ExtKind {
     public static let posCandidate = "pos.candidate"
     /// 上行：状态提示气泡被拖动到新位置。body 同 `posCandidate`。
     public static let posStatusTip = "pos.status_tip"
-    /// 下行：请 `.app` 把某个原生浮窗截图存盘并复制到剪贴板。
-    /// body = `{"target":"status_tip"|"tooltip","path":"/绝对路径.png"}`。
-    ///
-    /// 状态气泡与悬停提示是 `.app` 侧的 NSPanel，**像素不在服务进程**（候选窗相反，
-    /// 那是服务端光栅化后经 SHM 推下来的）。文件名与随后的 Toast 文案仍由服务端决定，
-    /// 保持两平台措辞一致。
-    public static let shotPanel = "shot.panel"
-    /// 上行：`shotPanel` 的结果。
-    /// body = `{"ok":bool,"path":"…","clipboard":bool,"reason":"…"}`（`reason` 仅失败时）。
-    public static let shotResult = "shot.result"
     /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 `posCandidate`。body 空。
     public static let posCandidateQuery = "pos.candidate.query"
     /// 下行：问 `.app` 状态气泡此刻在哪，答案走上行 `posStatusTip`。body 空。
     public static let posStatusTipQuery = "pos.status_tip.query"
     //
-    // 这两个「位置」要一问一答而不是由服务进程记账：浮窗是 `.app` 侧的原生 NSPanel，
-    // 服务端发下来的只是**建议落点**，这边还会按所在屏可见区钳制、在下方放不下时翻到光标
-    // 上方、以及沿用用户本次组合内拖出来的落位。用户点「固定位置」要以当前看到的位置落盘。
+    // 这两个「位置」要一问一答而不是由服务进程记账：浮窗落位在 `.app` 侧，服务端发下来的只是
+    // **建议落点**，这边还会按所在屏可见区钳制、在下方放不下时翻到光标上方、以及沿用用户本次
+    // 组合内拖出来的落位。用户点「固定位置」要以当前看到的位置落盘。
+    /// 上行：请求打开自绘菜单。body = `{"target":<页内下标>|-1 主菜单|-2 状态气泡|-3 悬停提示,
+    /// "x":..,"y":..,"work":[左,上,右,下]}`，坐标为 wire 点；悬停提示另带 `"lx","ly"`（右键点在提示
+    /// 位图内的像素坐标，含软阴影扩边）。
+    public static let menuOpen = "menu.open"
+    /// 上行：`.app` 自己把菜单收掉了（空闲超时 / 服务重启 / 断线…），服务端据此复位。
+    /// body = `{"reason":"…"}`，只进日志。
+    public static let menuDismiss = "menu.dismiss"
 }
 
 /// 按键组合 (CmdKeyTap/Hold/Release 解码结果, 及 KeySeq 内单项)。
@@ -168,121 +163,6 @@ public struct MenuItemData {
         self.checked = checked
         self.disabled = disabled
         self.children = children
-    }
-}
-
-/// 候选悬停 tooltip (CmdTooltipShow 0x0508 解码结果)。text 可含 \n 多行、\t 分列。
-/// bgColor/fgColor 为 #RRGGBBAA, 空串表示用 .app 内置深色默认。位置由 .app 定。
-public struct TooltipPayload {
-    public let text: String
-    public let bgColor: String
-    public let fgColor: String
-    public let fontPath: String   // 拆字字根字体文件绝对路径, 空=无需特殊字体
-    /// 分段颜色 (后加尾段); 空 = 整段 fgColor。旧服务不发此段, 解码为空。
-    public let runs: [TooltipColorRun]
-
-    public init(text: String, bgColor: String, fgColor: String, fontPath: String = "",
-                runs: [TooltipColorRun] = []) {
-        self.text = text
-        self.bgColor = bgColor
-        self.fgColor = fgColor
-        self.fontPath = fontPath
-        self.runs = runs
-    }
-}
-
-/// tooltip 的一段分段颜色: text 里 UTF-16 区间 [start, start+length) (直接当 NSRange 用)
-/// 改用 (r,g,b,a) 画。颜色已由服务端按主题解析好, 按 sRGB 解释 (与候选窗 CoreText 渲染同色)。
-public struct TooltipColorRun: Equatable {
-    public let start: Int
-    public let length: Int
-    public let r: UInt8
-    public let g: UInt8
-    public let b: UInt8
-    public let a: UInt8
-
-    public init(start: Int, length: Int, r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
-        self.start = start
-        self.length = length
-        self.r = r
-        self.g = g
-        self.b = b
-        self.a = a
-    }
-}
-
-/// 状态提示气泡 (CmdStatusShow 0x050A 解码结果)。模式切换时近 caret 弹出的瞬态气泡。
-/// text 为合并短文 (如 "中 ，"); bgColor/fgColor 为 #RRGGBBAA; x/y 为 caret 屏幕坐标
-/// (wire top-left); durationMs>0 时到点自动隐藏 (temp), ==0 常驻 (always)。
-/// anchor 为尾段 (C2-33 / GH#148), 取值见 `StatusAnchor`; 旧服务不发 → 0 (按 x/y 摆)。
-public struct StatusBubblePayload {
-    public let text: String
-    public let bgColor: String
-    public let fgColor: String
-    public let x: Int32
-    public let y: Int32
-    public let durationMs: Int32
-    public let anchor: Int32
-
-    public init(text: String, bgColor: String, fgColor: String, x: Int32, y: Int32, durationMs: Int32,
-                anchor: Int32 = 0) {
-        self.text = text
-        self.bgColor = bgColor
-        self.fgColor = fgColor
-        self.x = x
-        self.y = y
-        self.durationMs = durationMs
-        self.anchor = anchor
-    }
-}
-
-/// 状态气泡锚点 (CmdStatusShow 尾段)。与 Rust `wind_ipc::protocol::status_anchor` **同值**,
-/// 改一边必须改另一边。`none` = 按 x/y 摆 (跟随光标 / 固定坐标, 服务端已算定)。
-public enum StatusAnchor: Int32 {
-    case none = 0
-    case screenCenter = 1
-    case screenTopLeft = 2
-    case screenTopRight = 3
-    case screenBottomLeft = 4
-    case screenBottomRight = 5
-    case windowCenter = 6
-    case windowBottomLeft = 7
-
-    /// 拿不到宿主窗口边框时的降级: 窗口锚点换成同位置的屏幕锚点, 其余原样。
-    public var screenEquivalent: StatusAnchor {
-        switch self {
-        case .windowCenter: return .screenCenter
-        case .windowBottomLeft: return .screenBottomLeft
-        default: return self
-        }
-    }
-}
-
-/// Toast 通知 (CmdToastShow 0x050C 解码结果)。屏幕级通知 (如词库加载完成), 区别于
-/// 锚 caret 的瞬态状态气泡。message 可含 \n 多行; bgColor/fgColor/accentColor 为
-/// #RRGGBB[AA]; position 为 "bottom_right"/"center" (.app 据此在工作区落位);
-/// durationMs: 0=默认 5000, >0 自动隐藏毫秒数, <0 不自动隐藏; maxWidth 内容最大像素宽
-/// (DIP, 逻辑点), 0=由 .app 决定。
-public struct ToastPayload {
-    public let title: String
-    public let message: String
-    public let bgColor: String
-    public let fgColor: String
-    public let accentColor: String
-    public let position: String
-    public let durationMs: Int32
-    public let maxWidth: Int32
-
-    public init(title: String, message: String, bgColor: String, fgColor: String,
-                accentColor: String, position: String, durationMs: Int32, maxWidth: Int32) {
-        self.title = title
-        self.message = message
-        self.bgColor = bgColor
-        self.fgColor = fgColor
-        self.accentColor = accentColor
-        self.position = position
-        self.durationMs = durationMs
-        self.maxWidth = maxWidth
     }
 }
 

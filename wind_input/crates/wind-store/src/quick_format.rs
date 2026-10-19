@@ -169,8 +169,8 @@ pub(crate) struct QuickFile {
     kinds: std::collections::BTreeMap<String, QuickFormatRecord>,
 }
 
-const QUICK_HEADER: &str = "# 快捷格式调整（WindInput 维护，可手改）\n\
-# [kinds.<类别>] 下：disabled = 停用的格式 id；[[kinds.<类别>.moved]] id / position = 固定到组内第几位；\n\
+/// 说明行之后的语法提示。
+const QUICK_HELP: &str = "# [kinds.<类别>] 下：disabled = 停用的格式 id；[[kinds.<类别>.moved]] id / position = 固定到组内第几位；\n\
 # [[kinds.<类别>.added]] id / text = 自己加的格式。出厂格式表见 system.quick.toml。\n";
 
 /// 用户目录里的 `quick_format.toml`（P5 起）。
@@ -190,7 +190,11 @@ pub(crate) fn parse_quick_yaml(s: &str) -> anyhow::Result<QuickFile> {
 }
 
 pub(crate) fn render_quick(qf: &QuickFile) -> anyhow::Result<String> {
-    Ok(format!("{QUICK_HEADER}{}", toml::to_string(qf)?))
+    Ok(format!(
+        "{}\n{QUICK_HELP}{}",
+        wind_userdata::text::banner::QUICK_FORMAT,
+        toml::to_string(qf)?
+    ))
 }
 
 impl Store {
@@ -212,6 +216,7 @@ impl Store {
     /// 读改写整份快捷格式调整；全表为空则删文件。文件解析不了 ⇒ Err、什么都不写（M-1）。
     fn modify_quick_file(&self, f: &mut dyn FnMut(&mut QuickFile)) -> anyhow::Result<()> {
         let doc = self.quick_doc();
+        self.check_not_editing(doc.path())?;
         doc.modify(&mut |cur| {
             let mut qf = cur
                 .map(parse_quick)
@@ -334,6 +339,7 @@ impl Store {
         rows: Vec<(String, QuickFormatRecord)>,
         replace: bool,
     ) -> anyhow::Result<()> {
+        self.check_not_editing(self.quick_doc().path())?;
         if replace {
             // 整份还原是用户显式的整体动作：坏文件先留存，再写
             crate::last_good::preserve_if_unparsable(self.quick_doc(), &parse_quick)?;
@@ -420,7 +426,7 @@ mod tests {
             s.get_quick_format("date").unwrap().unwrap().moved[0].id,
             "date.lunar"
         );
-        let kept = std::fs::read_dir(f.parent().unwrap())
+        let kept = std::fs::read_dir(s.user_text_dir().join(".backup"))
             .unwrap()
             .flatten()
             .any(|e| {

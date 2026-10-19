@@ -279,4 +279,34 @@ mod tests {
             );
         }
     }
+
+    /// 没有前置闸门的宿主（Linux / macOS）把每个键都送进 `handle_key_event`：空闲 Esc 必须
+    /// 透传，否则浏览器 Vimium 一类收不到（GH#209）；有编码时仍是取消组合。
+    #[test]
+    fn escape_passes_through_without_a_session() {
+        use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
+        let esc = KeyEventData {
+            key_code: keymap::VK_ESCAPE,
+            scan_code: 0,
+            modifiers: 0,
+            event_type: wind_ipc::protocol::EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        };
+        let c = coord();
+        let act = c.handle_key_event(&esc);
+        assert!(
+            matches!(act, KeyAction::PassThrough),
+            "空闲 Esc 应透传，实际: {act:?}"
+        );
+
+        c.state.lock().unwrap().input_buffer = "ni".into();
+        let act = c.handle_key_event(&esc);
+        assert!(
+            matches!(act, KeyAction::ClearComposition),
+            "有编码时 Esc 应取消组合，实际: {act:?}"
+        );
+        assert!(c.state.lock().unwrap().input_buffer.is_empty());
+    }
 }

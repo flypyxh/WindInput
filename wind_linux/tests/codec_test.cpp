@@ -131,7 +131,9 @@ void TestSmallUpstream()
     CHECK_EQ(u32At(c, 16), 18u);
 
     CHECK_EQ(u16At(encodeCandidateSelectFrame(2), 2), uint16_t(CMD_CANDIDATE_SELECT));
-    CHECK_EQ(int32_t(u32At(encodeCandidateHoverFrame(-1), 8)), -1);
+    // 「无悬停」上线时折成 INT32_MIN：-1/-2 在服务端非 Windows 分支是翻页按钮。
+    CHECK_EQ(int32_t(u32At(encodeCandidateHoverFrame(-1), 8)), INT32_MIN);
+    CHECK_EQ(int32_t(u32At(encodeCandidateHoverFrame(3), 8)), 3);
     CHECK_EQ(int32_t(u32At(encodeCandidateScrollFrame(-120), 8)), -120);
     CHECK_EQ(u16At(encodeMenuActionFrame(9), 2), uint16_t(CMD_MENU_ACTION));
 
@@ -254,6 +256,13 @@ void TestDecodeRender()
     CHECK_EQ(od->contentW, 110u);
     CHECK_EQ(od->contentH, 30u);
     CHECK_EQ(od->durationMs, 1500);
+    // 服务端现在恒发 72 字节（末尾多一个 f32 scale）：多出的尾段不影响前 68 字节的读取。
+    Bytes ov72 = ov;
+    append(ov72, le32(0x40000000u)); // 2.0f
+    auto od72 = decodeOverlayFrame(ov72);
+    CHECK(od72.has_value());
+    CHECK_EQ(od72->kind, 2u);
+    CHECK_EQ(od72->durationMs, 1500);
     ov.pop_back();
     CHECK(!decodeOverlayFrame(ov).has_value());
 

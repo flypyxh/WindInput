@@ -412,118 +412,6 @@ public enum BinaryCodec {
         return out
     }
 
-    /// 解 CmdMenuShow (0x0506): count(u32) + count×item; item = id(i32)+flags(u8)
-    /// +labelLen(u32)+label+childCount(u32)+children(递归)。flags: 0x01 分隔/0x02 勾选/0x04 禁用。
-    /// 解码 CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
-    /// (均 UTF-8) + runCount(u32) + runCount×(start u32 + len u32 + rgba u32)。
-    /// fontPath 与 runs 都是后加尾段, 缺省时分别为空串 / 空数组 (旧服务 → 单色)。
-    /// rgba 为小端 u32, 字节依次 R、G、B、A; start/len 以 UTF-16 码元计。
-    public static func decodeTooltipPayload(_ buf: Data) throws -> TooltipPayload {
-        var off = 0
-        func readStr() throws -> String {
-            guard buf.count >= off + 4 else {
-                throw IPCError.payloadTooShort(expected: off + 4, got: buf.count)
-            }
-            let n = Int(buf.readUInt32LE(at: off)); off += 4
-            guard buf.count >= off + n else {
-                throw IPCError.payloadTooShort(expected: off + n, got: buf.count)
-            }
-            let s = n > 0
-                ? (String(data: buf.subdata(in: (buf.startIndex + off)..<(buf.startIndex + off + n)), encoding: .utf8) ?? "")
-                : ""
-            off += n
-            return s
-        }
-        let text = try readStr()
-        let bg = try readStr()
-        let fg = try readStr()
-        // fontPath 为后加字段; off 已到末尾 (旧服务无此段) 时容忍缺省为空。
-        let fontPath = off < buf.count ? try readStr() : ""
-        // runs 同理 (分段着色): 没有尾段 = 单色。
-        var runs: [TooltipColorRun] = []
-        if off < buf.count {
-            guard buf.count >= off + 4 else {
-                throw IPCError.payloadTooShort(expected: off + 4, got: buf.count)
-            }
-            let n = Int(buf.readUInt32LE(at: off)); off += 4
-            guard buf.count >= off + n * 12 else {
-                throw IPCError.payloadTooShort(expected: off + n * 12, got: buf.count)
-            }
-            runs.reserveCapacity(n)
-            for _ in 0..<n {
-                let start = Int(buf.readUInt32LE(at: off))
-                let len = Int(buf.readUInt32LE(at: off + 4))
-                let i = buf.startIndex + off + 8
-                runs.append(TooltipColorRun(start: start, length: len,
-                                            r: buf[i], g: buf[i + 1], b: buf[i + 2], a: buf[i + 3]))
-                off += 12
-            }
-        }
-        return TooltipPayload(text: text, bgColor: bg, fgColor: fg, fontPath: fontPath, runs: runs)
-    }
-
-    public static func decodeStatusBubblePayload(_ buf: Data) throws -> StatusBubblePayload {
-        var off = 0
-        func readStr() throws -> String {
-            guard buf.count >= off + 4 else {
-                throw IPCError.payloadTooShort(expected: off + 4, got: buf.count)
-            }
-            let n = Int(buf.readUInt32LE(at: off)); off += 4
-            guard buf.count >= off + n else {
-                throw IPCError.payloadTooShort(expected: off + n, got: buf.count)
-            }
-            let s = n > 0
-                ? (String(data: buf.subdata(in: (buf.startIndex + off)..<(buf.startIndex + off + n)), encoding: .utf8) ?? "")
-                : ""
-            off += n
-            return s
-        }
-        let text = try readStr()
-        let bg = try readStr()
-        let fg = try readStr()
-        guard buf.count >= off + 12 else {
-            throw IPCError.payloadTooShort(expected: off + 12, got: buf.count)
-        }
-        let x = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
-        let y = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
-        let dur = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
-        // 锚点尾段 (C2-33 / GH#148): 旧服务不发, 缺省 0 = 按 x/y 摆。
-        let anchor = buf.count >= off + 4 ? Int32(bitPattern: buf.readUInt32LE(at: off)) : 0
-        return StatusBubblePayload(text: text, bgColor: bg, fgColor: fg, x: x, y: y, durationMs: dur,
-                                   anchor: anchor)
-    }
-
-    public static func decodeToastPayload(_ buf: Data) throws -> ToastPayload {
-        var off = 0
-        func readStr() throws -> String {
-            guard buf.count >= off + 4 else {
-                throw IPCError.payloadTooShort(expected: off + 4, got: buf.count)
-            }
-            let n = Int(buf.readUInt32LE(at: off)); off += 4
-            guard buf.count >= off + n else {
-                throw IPCError.payloadTooShort(expected: off + n, got: buf.count)
-            }
-            let s = n > 0
-                ? (String(data: buf.subdata(in: (buf.startIndex + off)..<(buf.startIndex + off + n)), encoding: .utf8) ?? "")
-                : ""
-            off += n
-            return s
-        }
-        let title = try readStr()
-        let message = try readStr()
-        let bg = try readStr()
-        let fg = try readStr()
-        let accent = try readStr()
-        let position = try readStr()
-        guard buf.count >= off + 8 else {
-            throw IPCError.payloadTooShort(expected: off + 8, got: buf.count)
-        }
-        let dur = Int32(bitPattern: buf.readUInt32LE(at: off)); off += 4
-        let maxWidth = Int32(bitPattern: buf.readUInt32LE(at: off))
-        return ToastPayload(title: title, message: message, bgColor: bg, fgColor: fg,
-                            accentColor: accent, position: position, durationMs: dur, maxWidth: maxWidth)
-    }
-
     // readLenString 读 u32 长度前缀的 UTF-8 字符串, 推进 off。按键解码共用。
     private static func readLenString(_ buf: Data, _ off: inout Int) throws -> String {
         guard buf.count >= off + 4 else {
@@ -581,6 +469,8 @@ public enum BinaryCodec {
         return buf.isEmpty ? "" : (String(data: buf, encoding: .utf8) ?? "")
     }
 
+    /// 解 CmdMenuShow (0x0506): count(u32) + count×item; item = id(i32)+flags(u8)
+    /// +labelLen(u32)+label+childCount(u32)+children(递归)。flags: 0x01 分隔/0x02 勾选/0x04 禁用。
     public static func decodeUnifiedMenuPayload(_ buf: Data) throws -> [MenuItemData] {
         var off = 0
         let items = try decodeMenuItems(buf, &off)
@@ -621,18 +511,6 @@ public enum BinaryCodec {
             children: children)
     }
 
-    /// 编码 CmdCandidateContextMenu (0x020F upstream): index i32 + actionLen u32 + action UTF-8。
-    public static func encodeCandidateContextMenuFrame(index: Int, action: String) -> Data {
-        let actionBytes = Array(action.utf8)
-        var payload = Data(count: 8)
-        payload.writeUInt32LE(UInt32(bitPattern: Int32(index)), at: 0)
-        payload.writeUInt32LE(UInt32(actionBytes.count), at: 4)
-        payload.append(contentsOf: actionBytes)
-        var out = encodeHeader(cmd: UpstreamCmd.candidateContextMenu, payloadLen: UInt32(payload.count))
-        out.append(payload)
-        return out
-    }
-
     /// 编码 CmdFrontContext (0x0211 upstream): appLen u32 + app + titleLen u32 + title + selLen u32 + sel。
     /// 均 UTF-8、LE 长度前缀。与 Rust `wind-bridge` server.rs 的 CMD_FRONT_CONTEXT 解码对齐。
     public static func encodeFrontContextFrame(app: String, title: String, sel: String) -> Data {
@@ -669,6 +547,19 @@ public enum BinaryCodec {
         return (kind, buf.subdata(in: (base + off + 4)..<(base + off + 4 + bodyLen)))
     }
 
+    /// 编码 CmdMenuPointer (0x021B 上行)：event u32 + button u32 + x i32 + y i32，共 16 字节。
+    /// 移动事件每秒可达上百次，带异步标志、服务端不回 ack，调用方因此无需读响应。
+    public static func encodeMenuPointerFrame(event: UInt32, button: UInt32, x: Int32, y: Int32) -> Data {
+        var payload = Data(count: 16)
+        payload.writeUInt32LE(event, at: 0)
+        payload.writeUInt32LE(button, at: 4)
+        payload.writeUInt32LE(UInt32(bitPattern: x), at: 8)
+        payload.writeUInt32LE(UInt32(bitPattern: y), at: 12)
+        var out = encodeHeader(cmd: UpstreamCmd.menuPointer, payloadLen: 16, async: true)
+        out.append(payload)
+        return out
+    }
+
     /// 编码扩展信封 (0x0E01 上行)。
     public static func encodeExtFrame(kind: String, body: Data) -> Data {
         let kindBytes = Array(kind.utf8)
@@ -682,19 +573,6 @@ public enum BinaryCodec {
         var out = encodeHeader(cmd: UpstreamCmd.ext, payloadLen: UInt32(payload.count))
         out.append(payload)
         return out
-    }
-
-    /// 解 CmdCandidateMenuFlags (0x0505): count(u32) + count×(1 字节禁用位)。
-    /// 禁用位: 0x01 上移, 0x02 下移, 0x04 置顶, 0x08 删除, 0x10 恢复默认。
-    public static func decodeCandidateMenuFlagsPayload(_ buf: Data) throws -> [UInt8] {
-        guard buf.count >= 4 else {
-            throw IPCError.payloadTooShort(expected: 4, got: buf.count)
-        }
-        let n = Int(buf.readUInt32LE(at: 0))
-        guard buf.count >= 4 + n else {
-            throw IPCError.payloadTooShort(expected: 4 + n, got: buf.count)
-        }
-        return [UInt8](buf.subdata(in: 4..<(4 + n)))
     }
 
     /// 解 CmdModeStatus (0x0504): flags(u32)+effectiveMode(u32)+labelLen(u32)+label(UTF-8)。

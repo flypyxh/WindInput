@@ -79,7 +79,7 @@ Bytes encodeCaretUpdateFrame(int32_t x, int32_t y, int32_t height);
 
 /// CMD_CANDIDATE_SELECT：页内下标 i32（<0 为翻页按钮：-1 上页 / -2 下页）。
 Bytes encodeCandidateSelectFrame(int32_t index);
-/// CMD_CANDIDATE_HOVER：页内下标 i32（-1 = 无）。
+/// CMD_CANDIDATE_HOVER：页内下标 i32；传入负值（无悬停）发 INT32_MIN，见实现处说明。
 Bytes encodeCandidateHoverFrame(int32_t index);
 /// CMD_CANDIDATE_SCROLL：delta i32，WHEEL_DELTA(120) 倍数，正 = 上滚。
 Bytes encodeCandidateScrollFrame(int32_t delta);
@@ -183,8 +183,8 @@ struct HostRenderFramePayload {
 /// CMD_HOST_RENDER_FRAME（push）：seq,x,y,w,h,flags 各 u32/i32（24 字节）[+ scale u32]。
 std::optional<HostRenderFramePayload> decodeHostRenderFrame(const Bytes& p);
 
-/// CMD_OVERLAY_FRAME（push，仅 Linux）：一层浮层（状态气泡 / Toast / tooltip）有新帧或该隐藏。
-/// 像素在该层自己的 SHM 段（`overlayShmName(kind)`）。68 字节，逐字段对位 Rust
+/// CMD_OVERLAY_FRAME（push）：一层浮层（状态气泡 / Toast / tooltip）有新帧或该隐藏。
+/// 像素在该层自己的 SHM 段（`overlayShmName(kind)`）。68 字节基础布局（服务端现在恒在末尾多发一个 f32 scale 成 72 字节，addon 不读，按 ≥68 字节接收），逐字段对位 Rust
 /// `codec.rs::encode_overlay_frame`：kind seq w h flags place（u32）、x y altX altY（i32）、
 /// anchor（u32）、margin contentX contentY（i32）、contentW contentH（u32）、durationMs（i32）。
 /// 坐标一律是**内容盒**左上（不含软阴影扩边）。

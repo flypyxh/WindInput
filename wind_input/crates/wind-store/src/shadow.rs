@@ -179,7 +179,7 @@ impl Store {
     }
 
     /// 该方案的 Shadow 表（首次访问时读文件，之后常驻）。
-    fn shadow_table(
+    pub(crate) fn shadow_table(
         &self,
         schema: &str,
     ) -> anyhow::Result<std::sync::Arc<wind_userdata::text::table::TextTable>> {
@@ -205,6 +205,7 @@ impl Store {
         f: &mut dyn FnMut(&str, &mut ShadowRecord),
     ) -> anyhow::Result<()> {
         let t = self.shadow_table(schema)?;
+        self.check_not_editing(t.path())?;
         // 先按文件现状重新解析（手改优先），再在最新内容上改
         t.sync();
         let doc = t.doc();
@@ -452,6 +453,7 @@ impl Store {
     /// 清空某方案全部 shadow 规则（整文件替换），返回清掉的编码组数。
     pub fn clear_shadow(&self, schema: &str) -> anyhow::Result<usize> {
         let t = self.shadow_table(schema)?;
+        self.check_not_editing(t.path())?;
         let n = records_of(&t.doc()).len();
         if n > 0 || t.path().is_file() {
             t.replace_all(&[])?;
@@ -473,6 +475,7 @@ impl Store {
         rules: Vec<(String, ShadowRecord)>,
     ) -> anyhow::Result<()> {
         let t = self.shadow_table(schema)?;
+        self.check_not_editing(t.path())?;
         let have: std::collections::HashSet<String> =
             records_of(&t.doc()).into_iter().map(|(c, _)| c).collect();
         let edits: Vec<_> = rules

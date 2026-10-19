@@ -3,7 +3,7 @@
 //! 与 Go 版本 `wind_input/internal/engine/pinyin/fuzzy.go` 对齐。
 //! 允许用户输入时忽略常见发音混淆（如 z/zh, c/ch, s/sh, n/l）。
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// 笛卡尔积展开的组合数上限（超出即降级，见 [`FuzzyMatcher::expand_syllables`]）。
@@ -27,10 +27,32 @@ pub struct FuzzyConfig {
     pub un_ong: bool,
     /// `eng ↔ ong`（`deng`↔`dong`、`zheng`↔`zhong`）。
     pub eng_ong: bool,
+    /// 双拼**同键韵母**推出的等价音节：音节 → 同一键对下其余的合法读音
+    /// （自定义布局 `q = ["iu", "ui"]` 时 `diu` → `[dui]`、`dui` → `[diu]`）。
+    ///
+    /// **不是用户配置**：由 `PinyinEngine::with_shuangpin` 从布局推出
+    /// （`ShuangpinConverter::shared_key_syllables`），全拼方案恒空。双拼转换器对一个键对
+    /// 只交出一条全拼，其余读音靠这里在拼音引擎里展开回来。
+    ///
+    /// 展开时**零罚分**（处数计 0）：用户自己把两个韵母配在同一个键上，两种读音按词频平等
+    /// 竞争，不是「打错了」。与用户开的模糊组叠加时，后者照旧计处数。
+    pub shared_key: HashMap<String, Vec<String>>,
 }
 
 impl FuzzyConfig {
-    /// 是否有任一模糊组开启。供调用方在全关时跳过整段展开逻辑（含其前置的切分求解）。
+    /// 只留用户开的模糊组、去掉双拼同键音节的副本（双拼方案下的全拼降级支路用）。
+    pub fn without_shared_key(&self) -> FuzzyConfig {
+        FuzzyConfig {
+            shared_key: HashMap::new(),
+            ..self.clone()
+        }
+    }
+
+    /// 是否有任一展开来源：用户开的模糊组，或双拼同键音节（[`Self::shared_key`]）。
+    /// 供调用方在全关时跳过整段展开逻辑（含其前置的切分求解）。
+    ///
+    /// 同键音节必须算在内：否则用户没开任何模糊音时，各调用点的早退会把它整条跳过。
+    /// 只改声母首字母的路径（简拼键）对它是恒等变换，多算进来只多一次空展开。
     ///
     /// 注意**不能**用「对整串求 `fuzzy_variants` 得空」来代替这个判断：那既漏掉非首音节的
     /// 变体，又要求先拿到 code；本判断只看配置，可在任何前置计算之前短路。
@@ -48,6 +70,7 @@ impl FuzzyConfig {
             || self.uan_uang
             || self.un_ong
             || self.eng_ong
+            || !self.shared_key.is_empty()
     }
 }
 
@@ -479,7 +502,34 @@ impl FuzzyMatcher {
     ///
     /// 返回值里的处数是**惩罚计量**：`sen`→`sheng` 两处都不同，置信度本就该低于只错一处的
     /// `sen`→`shen`，对齐 librime `kFuzzySpellingPenalty` / libime `fuzzyCost` 的逐处累加。
+    ///
+    /// 双拼同键音节（[`FuzzyConfig::shared_key`]）并在这里：对端计 **0 处**，对端再经用户
+    /// 模糊组得到的变体照常计处数；同一变体多条来源取处数最小者。
     pub fn fuzzy_variants_scored(input: &str, config: &FuzzyConfig) -> Vec<(String, usize)> {
+        let mut variants = Self::group_variants_scored(input, config);
+        let Some(partners) = config.shared_key.get(input) else {
+            return variants;
+        };
+        let mut add = |variant: String, edits: usize| {
+            if variant == input {
+                return;
+            }
+            match variants.iter_mut().find(|(v, _)| *v == variant) {
+                Some(slot) => slot.1 = slot.1.min(edits),
+                None => variants.push((variant, edits)),
+            }
+        };
+        for partner in partners {
+            add(partner.clone(), 0);
+            for (v, e) in Self::group_variants_scored(partner, config) {
+                add(v, e);
+            }
+        }
+        variants
+    }
+
+    /// 只看用户模糊组的单音节变体（[`Self::fuzzy_variants_scored`] 的本体）。
+    fn group_variants_scored(input: &str, config: &FuzzyConfig) -> Vec<(String, usize)> {
         let (initial, final_) = split_initial_final(input);
         let initials = part_options(initial, INITIAL_GROUPS, config);
         let finals = part_options(final_, FINAL_GROUPS, config);
@@ -620,6 +670,56 @@ mod tests {
 
     fn syls(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---------------------------------------------------------------- shared_key
+
+    fn shared(pairs: &[(&str, &str)]) -> FuzzyConfig {
+        let mut c = FuzzyConfig::default();
+        for (a, b) in pairs {
+            c.shared_key
+                .entry(a.to_string())
+                .or_default()
+                .push(b.to_string());
+            c.shared_key
+                .entry(b.to_string())
+                .or_default()
+                .push(a.to_string());
+        }
+        c
+    }
+
+    /// 同键音节计 0 处，且用户一个模糊组都没开也展开（`any_enabled` 不早退）。
+    #[test]
+    fn shared_key_variant_is_zero_penalty_without_any_group() {
+        let c = shared(&[("diu", "dui")]);
+        assert!(c.any_enabled(), "只有同键音节时也须算作开启");
+        assert_eq!(
+            FuzzyMatcher::fuzzy_variants_scored("diu", &c),
+            vec![("dui".to_string(), 0)]
+        );
+        assert_eq!(
+            FuzzyMatcher::expand_syllables(&syls(&["diu"]), &c),
+            vec![("diu".to_string(), 0), ("dui".to_string(), 0)]
+        );
+        assert!(fuzzy_spellings(&c).is_empty(), "同键音节都合法，不进错音串");
+    }
+
+    /// 与用户模糊组叠加：同键对端零罚，用户组照旧计处数；对端的用户组变体也算进来。
+    #[test]
+    fn shared_key_stacks_with_user_groups() {
+        let mut c = shared(&[("lin", "liu")]);
+        c.in_ing = true;
+        c.n_l = true;
+        let v = FuzzyMatcher::fuzzy_variants_scored("lin", &c);
+        let edits = |s: &str| v.iter().find(|(x, _)| x == s).map(|(_, e)| *e);
+        assert_eq!(edits("liu"), Some(0), "{v:?}");
+        assert_eq!(edits("ling"), Some(1), "{v:?}");
+        assert_eq!(edits("nin"), Some(1), "{v:?}");
+        assert_eq!(edits("ning"), Some(2), "{v:?}");
+        assert_eq!(edits("niu"), Some(1), "对端经 n_l 计 1 处: {v:?}");
+        assert_eq!(edits("lin"), None, "不含自身");
+        assert_eq!(v.len(), 5, "不重复: {v:?}");
     }
 
     // ---------------------------------------------------------------- any_enabled

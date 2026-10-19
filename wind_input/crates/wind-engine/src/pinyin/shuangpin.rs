@@ -200,7 +200,9 @@ fn charset_spec(extra: &[u8]) -> String {
 // 合法音节判定复用 SyllableTrie（与 Go validPinyinSyllables 对齐）。
 // ============================================================================
 
+use crate::pinyin::fuzzy::{FuzzyConfig, fuzzy_spellings};
 use crate::pinyin::syllable::SyllableTrie;
+use std::collections::HashSet;
 
 /// 一个转换后的音节。
 ///
@@ -268,6 +270,22 @@ impl SpConvertResult {
     }
 }
 
+/// 出厂布局**固有**的同键音节对（无序）：这些对不进 [`ShuangpinConverter::shared_key_syllables`]。
+///
+/// 同键对只为用户自定义出来的同键服务；出厂布局里本就成立的那几对（各布局 `o = ["uo", "o"]`
+/// 的 luo/lo、首道 `k = ["en", "ia"]` 的 den/dia）维持改动前「只出首个读音」的行为——
+/// 出厂双拼用户不开模糊音时因此根本不走模糊展开路径。
+///
+/// 按**音节对**排除而不是按单个音节：自定义布局在 `w` 上加 `o` 得到的 lia/lo 不在表里，照常生效。
+/// 新增出厂布局引入新的固有对时，守护测试 `builtin_layouts_shared_key_pairs_are_all_excluded` 变红。
+const BUILTIN_SHARED_KEY_PAIRS: &[(&str, &str)] = &[("luo", "lo"), ("den", "dia")];
+
+fn is_builtin_shared_pair(a: &str, b: &str) -> bool {
+    BUILTIN_SHARED_KEY_PAIRS
+        .iter()
+        .any(|&(x, y)| (x == a && y == b) || (x == b && y == a))
+}
+
 /// 双拼→全拼转换器（对齐 Go Converter）。
 pub struct ShuangpinConverter {
     layout: Layout,
@@ -276,6 +294,11 @@ pub struct ShuangpinConverter {
     fuzzy_zh_z: bool,
     fuzzy_ch_c: bool,
     fuzzy_sh_s: bool,
+    /// 开着的模糊组推出的错音串（`din`、`tin`…，见 [`fuzzy_spellings`]）。
+    ///
+    /// 键对拼出它们时照收、原样交给拼音引擎，由那边按模糊组展开（全拼打 `din` 同路）。
+    /// 单独存一份而不并进 `trie`：严格音节表还管反向表建表等，那里不能认错音串。
+    fuzzy_spellings: HashSet<String>,
 }
 
 impl ShuangpinConverter {
@@ -286,14 +309,16 @@ impl ShuangpinConverter {
             fuzzy_zh_z: false,
             fuzzy_ch_c: false,
             fuzzy_sh_s: false,
+            fuzzy_spellings: HashSet::new(),
         }
     }
 
-    /// 配置声母模糊音开关（对齐 Go SetFuzzyInitials）。
-    pub fn set_fuzzy(&mut self, zh_z: bool, ch_c: bool, sh_s: bool) {
-        self.fuzzy_zh_z = zh_z;
-        self.fuzzy_ch_c = ch_c;
-        self.fuzzy_sh_s = sh_s;
+    /// 配置模糊音：声母三组走对偶声母（对齐 Go SetFuzzyInitials），其余组经错音串生效。
+    pub fn set_fuzzy(&mut self, fuzzy: &FuzzyConfig) {
+        self.fuzzy_zh_z = fuzzy.zh_z;
+        self.fuzzy_ch_c = fuzzy.ch_c;
+        self.fuzzy_sh_s = fuzzy.sh_s;
+        self.fuzzy_spellings = fuzzy_spellings(fuzzy).into_iter().collect();
     }
 
     pub fn layout(&self) -> &Layout {
@@ -401,6 +426,15 @@ impl ShuangpinConverter {
                     }
                 }
             }
+            // 错音串垫底：只在本对键没有真音节时才用得上（自然码 `dn` = din，开 in↔ing）。
+            if use_fuzzy && results.is_empty() {
+                for f in self.layout.finals_of(key2) {
+                    let syllable = normalize_pinyin(&format!("{initial}{f}"));
+                    if self.fuzzy_spellings.contains(&syllable) {
+                        results.push(syllable);
+                    }
+                }
+            }
         }
 
         if !self.layout.has_zero_pairs() {
@@ -423,6 +457,49 @@ impl ShuangpinConverter {
         }
 
         results
+    }
+
+    /// 同键韵母推出的等价音节（喂给 [`FuzzyConfig::shared_key`]，零罚分展开）。
+    ///
+    /// `convert` 对一个键对只交出 `syllables[0]` 一条全拼：自定义布局把两个韵母放在同一个
+    /// 韵母键上（`q = ["iu", "ui"]`）时，`dq` 算得出 `diu`、`dui` 两个合法音节，后者却被
+    /// 丢掉。这里把「同一声母键 + 同一韵母键得到的全部合法音节」两两配对，交给拼音引擎
+    /// 按模糊音那套机制展开回来。
+    ///
+    /// 只看常规「声母 + 韵母」那一路（[`Self::convert_pair_inner`] 第 2 步、不带模糊对偶
+    /// 声母）：零声母路径与 `zero_pairs` 不造对。按**音节**而非韵母字面配对，ü 归一化
+    /// （`jv` → `ju`）后的拼写因此与引擎侧一致。
+    ///
+    /// 出厂布局固有的对（[`BUILTIN_SHARED_KEY_PAIRS`]）不产生，故出厂布局返回空表。
+    pub fn shared_key_syllables(&self) -> HashMap<String, Vec<String>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for initial in self.layout.initials.values() {
+            for finals in self.layout.finals.values() {
+                let mut syls: Vec<String> = Vec::new();
+                for f in finals {
+                    let syl = normalize_pinyin(&format!("{initial}{f}"));
+                    if self.is_valid(&syl) && !syls.contains(&syl) {
+                        syls.push(syl);
+                    }
+                }
+                for a in &syls {
+                    for b in syls
+                        .iter()
+                        .filter(|b| *b != a && !is_builtin_shared_pair(a, b))
+                    {
+                        let partners = out.entry(a.clone()).or_default();
+                        if !partners.contains(b) {
+                            partners.push(b.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // 键表是 HashMap，排一次序让展开顺序（进而组合上限的截断）不随哈希漂移。
+        for partners in out.values_mut() {
+            partners.sort();
+        }
+        out
     }
 
     /// 检查一个完整音节是否匹配给定的韵母键（对齐 Go matchesFinal）。
@@ -1298,7 +1375,10 @@ mod converter_tests {
         // fuzzy 关：s+l 无合法 → fallback "sl"
         assert_eq!(c.convert("sl").full_pinyin(), "sl");
         // fuzzy s↔sh 开启：s+l 应被 sh+l 模糊补救 → "shuang"
-        c.set_fuzzy(false, false, true);
+        c.set_fuzzy(&FuzzyConfig {
+            sh_s: true,
+            ..Default::default()
+        });
         assert_eq!(c.convert("sl").full_pinyin(), "shuang");
         // 整段 slpb → shuangpin
         assert_eq!(c.convert("slpb").full_pinyin(), "shuangpin");
@@ -1308,7 +1388,7 @@ mod converter_tests {
     #[test]
     fn xiaohe_fuzzy_original_legal_not_shadowed() {
         let mut c = conv("xiaohe");
-        c.set_fuzzy(true, true, true);
+        c.set_fuzzy(&initials_fuzzy());
         assert_eq!(c.convert("zi").full_pinyin(), "zi");
         assert_eq!(c.convert("zisi").full_pinyin(), "zisi");
     }
@@ -1317,7 +1397,10 @@ mod converter_tests {
     #[test]
     fn xiaohe_fuzzy_bidirectional() {
         let mut c = conv("xiaohe");
-        c.set_fuzzy(true, false, false);
+        c.set_fuzzy(&FuzzyConfig {
+            zh_z: true,
+            ..Default::default()
+        });
         let results = c.convert_pair(b'v', b'd');
         assert!(results.iter().any(|s| s == "zhai"), "缺 zhai: {results:?}");
         assert!(
@@ -1333,6 +1416,147 @@ mod converter_tests {
         let c = conv("xiaohe");
         let results = c.convert_pair(b's', b'l');
         assert!(results.is_empty(), "fuzzy 关时 s+l 应为空: {results:?}");
+    }
+
+    /// 同键韵母：`q = ["iu", "ui"]` 时 `dq` 两个读音互为对端；`w` 上 `ia`/`o` 同键时
+    /// `lw` 得 `lia`/`lo`。零声母引导键不造对（`o` 不会和 `ia` 配上）。
+    /// `x` 同时放 uo/o/ia：出厂固有的 luo/lo 按**对**排除，lia 与两者的对照常生效。
+    const SHARED_KEY: &str = r#"
+[meta]
+id = "shared"
+name = "同键测试"
+[finals]
+q = ["iu", "ui"]
+w = ["ia", "ua", "o"]
+x = ["uo", "o", "ia"]
+f = ["en"]
+[zero_initials]
+o = ["o", "ou"]
+"#;
+
+    #[test]
+    fn shared_key_syllables_pairs_same_key_finals() {
+        let c = ShuangpinConverter::new(Layout::from_toml_str(SHARED_KEY).unwrap());
+        let m = c.shared_key_syllables();
+        assert_eq!(m.get("diu"), Some(&vec!["dui".to_string()]));
+        assert_eq!(m.get("dui"), Some(&vec!["diu".to_string()]));
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(m.get("lia"), Some(&v(&["lo", "luo"])));
+        assert_eq!(
+            m.get("lo"),
+            Some(&v(&["lia"])),
+            "luo/lo 是出厂固有对，不得互配"
+        );
+        assert_eq!(m.get("luo"), Some(&v(&["lia"])));
+        assert!(!m.contains_key("o"), "零声母路径不造对: {:?}", m.get("o"));
+        // 只有一个合法音节的键对不进表（`gua` 的 g+w：gia/go 都不成音节）。
+        assert!(!m.contains_key("gua"), "{:?}", m.get("gua"));
+        assert!(!m.contains_key("den"));
+        // 转换器本身行为不变：仍只交出首个读音，其余靠引擎展开。
+        assert_eq!(c.convert("dq").full_pinyin, "diu");
+    }
+
+    /// 每个韵母键只放一个韵母的布局不产生任何对（出厂布局的情形见下一个用例）。
+    #[test]
+    fn shared_key_syllables_empty_for_single_final_keys() {
+        let single = r#"
+[meta]
+id = "single"
+name = "单韵母键"
+[finals]
+q = ["iu"]
+v = ["ui"]
+"#;
+        let c = ShuangpinConverter::new(Layout::from_toml_str(single).unwrap());
+        assert!(c.shared_key_syllables().is_empty());
+    }
+
+    /// 出厂布局的同键情形全部落在排除表里：出厂布局推不出任何同键对，行为与改动前一致。
+    ///
+    /// 守护的是排除表的完整性——这里按**不排除**的口径重算一遍各布局的同键音节对，逐对
+    /// 断言在表里。新增/修改出厂布局引入新的固有对时这里变红：要么把它补进表，要么评估
+    /// 让它生效的排序影响。
+    #[test]
+    fn builtin_layouts_shared_key_pairs_are_all_excluded() {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for id in all_builtin_ids() {
+            let c = conv(&id);
+            assert!(c.shared_key_syllables().is_empty(), "{id} 不得产生同键对");
+            for initial in c.layout.initials.values() {
+                for finals in c.layout.finals.values() {
+                    let mut syls: Vec<String> = Vec::new();
+                    for f in finals {
+                        let s = normalize_pinyin(&format!("{initial}{f}"));
+                        // ue/ve 归一化后同形，同一音节不成对。
+                        if c.is_valid(&s) && !syls.contains(&s) {
+                            syls.push(s);
+                        }
+                    }
+                    for (i, a) in syls.iter().enumerate() {
+                        for b in &syls[i + 1..] {
+                            assert!(
+                                is_builtin_shared_pair(a, b),
+                                "{id}: 固有同键对 {a}/{b} 不在 BUILTIN_SHARED_KEY_PAIRS 里"
+                            );
+                            seen.push((a.clone(), b.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        // 表里每一对都确有出厂布局用到，免得表只增不减、悄悄吞掉自定义布局的对。
+        for &(x, y) in BUILTIN_SHARED_KEY_PAIRS {
+            assert!(
+                seen.iter()
+                    .any(|(a, b)| (a == x && b == y) || (a == y && b == x)),
+                "排除表里的 {x}/{y} 已无出厂布局使用"
+            );
+        }
+    }
+
+    fn initials_fuzzy() -> FuzzyConfig {
+        FuzzyConfig {
+            zh_z: true,
+            ch_c: true,
+            sh_s: true,
+            ..Default::default()
+        }
+    }
+
+    fn all_fuzzy() -> FuzzyConfig {
+        FuzzyConfig {
+            zh_z: true,
+            ch_c: true,
+            sh_s: true,
+            n_l: true,
+            f_h: true,
+            r_l: true,
+            an_ang: true,
+            en_eng: true,
+            in_ing: true,
+            ian_iang: true,
+            uan_uang: true,
+            un_ong: true,
+            eng_ong: true,
+            ..Default::default()
+        }
+    }
+
+    /// 韵母模糊音：自然码 `n` = in，`dn` 解出 `din`——它不是音节，但开着 in↔ing 时
+    /// 是登记过的错音串，交给拼音引擎按 `ding` 展开（与全拼打 `din` 同路）。
+    #[test]
+    fn ziranma_fuzzy_final_keeps_misspelling() {
+        let mut c = conv("ziranma");
+        assert_eq!(c.convert("dn").full_pinyin(), "dn", "模糊音关：dn 无解");
+        c.set_fuzzy(&FuzzyConfig {
+            in_ing: true,
+            ..Default::default()
+        });
+        assert_eq!(c.convert("dn").full_pinyin(), "din");
+        assert_eq!(c.convert("tn").full_pinyin(), "tin");
+        assert_eq!(c.convert("dnyi").full_pinyin(), "dinyi");
+        // 本身合法的不受影响。
+        assert_eq!(c.convert("bn").full_pinyin(), "bin");
     }
 
     // --- 边界测试 6.1-4：符号键 `;` e2e 转换（mspy 布局，;=ing）---
@@ -1617,7 +1841,7 @@ mod converter_tests {
         let plain = conv("xiaohe").build_reverse();
 
         let mut fuzzy_conv = conv("xiaohe");
-        fuzzy_conv.set_fuzzy(true, true, true);
+        fuzzy_conv.set_fuzzy(&all_fuzzy());
         let fuzzy = fuzzy_conv.build_reverse();
 
         for syl in [

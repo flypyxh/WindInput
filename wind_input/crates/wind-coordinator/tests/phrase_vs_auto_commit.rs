@@ -212,3 +212,81 @@ fn shuangpin_phrase_is_not_auto_committed() {
         "前提：短语须是唯一候选（否则唯一闸就拦了，测不到本缺口）"
     );
 }
+
+/// 建一个五笔拼音混输协调器（开满码自动上屏），注入一条短语。
+fn mixed_coord_with_phrase(
+    tag: &str,
+    code: &str,
+    text: &str,
+) -> (std::sync::Arc<Coordinator>, PathBuf) {
+    let store_path = std::env::temp_dir().join(format!(
+        "wind_phrase_ac_mixed_{tag}_{}.redb",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase(code, text, 0, 1200).unwrap();
+
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["wubi86_pinyin".into()];
+    cfg.schema.active = "wubi86_pinyin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.codetable.auto_commit_at_full = true;
+    (
+        Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store),
+        store_path,
+    )
+}
+
+fn has_mixed_schema() -> bool {
+    data_dir()
+        .join("schemas/wubi86_pinyin.schema.toml")
+        .exists()
+}
+
+/// 混输是码表系，有满码：满码唯一的短语照常自动上屏。
+///
+/// 拼音 / 双拼的拦截（`shuangpin_phrase_is_not_auto_committed`）曾按 `max_code_length == 0`
+/// 认引擎，而混输引擎这个值刻意为 0，于是混输也被一并拦下。
+#[test]
+fn mixed_full_code_phrase_is_auto_committed() {
+    if !has_mixed_schema() {
+        eprintln!("跳过：缺少 build_dev/data 混输方案");
+        return;
+    }
+    let (coord, store_path) = mixed_coord_with_phrase("full", "zqzq", "混输满码短语");
+    let mut action = KeyAction::Consumed;
+    for ch in "zqzq".chars() {
+        action = press_letter(&coord, ch);
+    }
+    let _ = std::fs::remove_file(&store_path);
+    assert!(
+        matches!(&action, KeyAction::InsertText { text, .. } if text == "混输满码短语"),
+        "混输下满码唯一短语应自动上屏，实际 {action:?}"
+    );
+}
+
+/// 混输下未到满码的短语不自动上屏（最短码长闸须按主码表码长算，而不是 0）。
+#[test]
+fn mixed_short_phrase_is_not_auto_committed() {
+    if !has_mixed_schema() {
+        eprintln!("跳过：缺少 build_dev/data 混输方案");
+        return;
+    }
+    let (coord, store_path) = mixed_coord_with_phrase("short", "zqz", "混输三码短语");
+    let mut action = KeyAction::Consumed;
+    for ch in "zqz".chars() {
+        action = press_letter(&coord, ch);
+    }
+    let cands = coord.debug_all_candidate_texts();
+    let _ = std::fs::remove_file(&store_path);
+    assert!(
+        !matches!(action, KeyAction::InsertText { .. }),
+        "混输下 3 码短语不得自动上屏，实际 {action:?}"
+    );
+    assert_eq!(
+        cands,
+        vec!["混输三码短语"],
+        "前提：短语须是唯一候选（否则唯一闸就拦了，测不到码长闸）"
+    );
+}

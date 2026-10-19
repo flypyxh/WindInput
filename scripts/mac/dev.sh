@@ -207,7 +207,8 @@ cargo_target_dir() {
 repo_version() {
     local f="$REPO_DIR/docs/VERSION"
     [[ -f "$f" ]] || return 0
-    tr -d '\xef\xbb\xbf \t\r\n' < "$f"
+    # BOM 用八进制写：tr 不认 \x 转义，会把 x、e、f、b 当成要删的字母（beta → ta）。
+    LC_ALL=C tr -d '\357\273\277 \t\r\n' < "$f"
 }
 
 # 两个 target 各编一遍再 lipo 成通用二进制。
@@ -362,7 +363,7 @@ app_build() {
     local VERSION_FILE="$REPO_DIR/docs/VERSION"
     local APP_VERSION
     if [[ -f "$VERSION_FILE" ]]; then
-        APP_VERSION=$(tr -d '\xef\xbb\xbf \t\r\n' < "$VERSION_FILE")
+        APP_VERSION=$(LC_ALL=C tr -d '\357\273\277 \t\r\n' < "$VERSION_FILE")
         if [[ -n "$APP_VERSION" ]]; then
             # 显示版本保留预发布后缀 (-beta.1), 与 Windows 一致; CFBundleVersion 供系统比较, 只用数字核心。
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP_BUNDLE/Contents/Info.plist"

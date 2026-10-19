@@ -259,6 +259,24 @@ impl Coordinator {
         }
     }
 
+    /// 菜单入口（无按键上下文）：开关面板；**开出来了**才处置正在打的编码并收候选窗。
+    ///
+    /// 与 [`Self::softkeyboard_hotkey`] 同一道理（面板一开就接管主键区，旧候选挂着像卡住了），
+    /// 只是出口不同：菜单没有按键应答可搭，编码经 push 出口交还宿主。
+    ///
+    /// 先开后处置、且以「开出来了」为准：Linux 外部宿主形态开不出面板，那里不能把用户
+    /// 正在打的码白白清掉。关闭方向不必处置（软键盘态下本就没有输入会话）。
+    pub(crate) fn softkeyboard_menu_toggle(&self, page: Option<&str>) {
+        let was_open = self.softkeyboard_is_open();
+        self.toggle_softkeyboard(page);
+        if !was_open && self.softkeyboard_is_open() {
+            let commit = self.take_input_on_schema_switch();
+            // `take_input_on_mode_switch` 只清状态不动 UI，收候选窗由调用方负责。
+            self.notify_ui_hide();
+            self.push_switch_commit(&commit);
+        }
+    }
+
     /// 开启软键盘。表为空时不开——弹一个一个符号都打不出的面板只会让用户以为坏了。
     pub(crate) fn open_softkeyboard(&self, page: Option<&str>) -> KeyAction {
         // Linux 外部宿主形态没有软键盘面板（addon 不画，Wayland 上也无法自由定位窗口）。

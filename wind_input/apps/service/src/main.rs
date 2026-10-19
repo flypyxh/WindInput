@@ -5,8 +5,6 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use file_rotate::compression::Compression;
-use file_rotate::{ContentLimit, FileRotate};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -664,7 +662,7 @@ fn init_logger() {
 
     // ★ 关闭档（level = off）：一个文件都不建，直接返回。
     //
-    // 光靠 `EnvFilter("off")` 不够——下面的 `FileRotate::new` + `rotate_on_startup`
+    // 光靠 `EnvFilter("off")` 不够——下面的 `SelfHealingLog::new`（内含启动轮转）
     // 会创建并轮转 `wind_input.1.log`，于是用户选了"关闭"却仍在磁盘上看到日志文件
     // （空的，但带着时间戳与文件名）。用户要的是"这台机器上别留输入法的痕迹",
     // 空文件同样是痕迹。`startup_stage.log` 由 `startup_trace` 自己的门控挡住。
@@ -698,19 +696,16 @@ fn init_logger() {
     let log_path = log_dir.join(format!("wind_input.{}.log", log_rotate::CURRENT_INDEX));
 
     // 升级路径：把前两代命名迁成现在这套，否则新的扫描认不出它们，会永久滞留在目录里
-    // （更要紧的是二代那份"最新"会被当成历史）。须在 FileRotate::new 之前——构造时
+    // （更要紧的是二代那份"最新"会被当成历史）。须在 SelfHealingLog::new 之前——构造时
     // 就会扫描既存序号。
     log_rotate::migrate_legacy_suffix(&log_path);
 
-    let mut rotate = FileRotate::new(
+    // 自愈写端：日志被设置页「清理」或用户手动删掉后自己接回来，见 SelfHealingLog。
+    let rotate = log_rotate::SelfHealingLog::new(
         &log_path,
-        log_rotate::AppendCountBeforeExt::new(cfg_debug.log_max_files),
-        ContentLimit::Bytes((cfg_debug.log_max_size_mb * 1024 * 1024) as usize),
-        Compression::None,
-        None,
+        cfg_debug.log_max_files,
+        cfg_debug.log_max_size_mb * 1024 * 1024,
     );
-
-    log_rotate::rotate_on_startup(&mut rotate, &log_path);
 
     // 顺带回收 TSF DLL 留下的过期日志。它按进程拆文件（每宿主 × pid 一个，落在
     // `logs/tsf_log/`），文件数会累积，而 DLL 自己在 loader lock 下没法做目录遍历。

@@ -194,7 +194,10 @@ Bytes encodeCandidateSelectFrame(int32_t index)
 
 Bytes encodeCandidateHoverFrame(int32_t index)
 {
-    return i32Frame(CMD_CANDIDATE_HOVER, index);
+    // 本端内部用 -1 表示「无悬停」，但线上 -1/-2 在服务端非 Windows 分支是翻页按钮
+    // （`message_handler` 的 `handle_candidate_hover`）：发 -1 会让上页按钮残留悬停高亮。
+    // addon 从不上报翻页按钮的悬停，故负值一律折成 INT32_MIN（与 macOS `.app` 同一哨兵）。
+    return i32Frame(CMD_CANDIDATE_HOVER, index < 0 ? INT32_MIN : index);
 }
 
 Bytes encodeCandidateScrollFrame(int32_t delta)

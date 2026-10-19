@@ -420,3 +420,78 @@ fn continuous_writes_still_fold_after_max_pending_age() {
     assert!(f.is_file(), "未空闲但待处理超龄 ⇒ 折回");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// 外部编辑中（暂停写回）的表格文本目标：整体替换（清空 / 导入 / 还原）与带策略的整写都拒绝，
+/// 文件不动；学习照常进 delta，恢复写回后落进文件。
+#[test]
+fn held_table_target_refuses_whole_file_writes() {
+    let d = root("held");
+    let ud = open(&d);
+    let f = d.join("data/s/freq.table.yaml");
+    ud.bind_text(Target::Freq, "s", binding(&f, &codec::FREQ))
+        .unwrap();
+    incr(&ud, Target::Freq, "a", "啊", 1);
+    ud.fold_text(Target::Freq, "s").unwrap();
+    let before = std::fs::read(&f).unwrap();
+    ud.hold_text(Target::Freq, "s");
+    let e = ud
+        .replace_text_entries(Target::Freq, "s", Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("正在外部编辑"), "{e}");
+    assert!(ud.clear(Target::Freq, "s").is_err());
+    assert!(ud.fold_with(Target::Freq, "s", &mut |v| v).is_err());
+    incr(&ud, Target::Freq, "b", "吧", 1);
+    ud.compact().unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), before);
+    ud.release_text(Target::Freq, "s");
+    assert!(std::fs::read_to_string(&f).unwrap().contains("b\t吧\t1\t"));
+    assert_eq!(ud.clear(Target::Freq, "s").unwrap(), 2);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// 暂停写回与整写互斥：整写进行中（已过「是否暂停」那道检查）开始暂停，要等这次写完才生效；
+/// 生效之后的整写一律拒绝——不会出现「检查时没暂停、写的时候已经在外部编辑」。
+#[test]
+fn hold_waits_for_in_flight_whole_file_write() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = root("hold_race");
+    let ud = Arc::new(open(&d));
+    let f = d.join("data/s/freq.table.yaml");
+    ud.bind_text(Target::Freq, "s", binding(&f, &codec::FREQ))
+        .unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let held_during_write = Arc::new(AtomicBool::new(false));
+    let me = std::thread::current().id();
+    let hook = wind_userdata::text::fold::add_before_rename_hook(Box::new({
+        let (ud, fired, held_during_write) = (ud.clone(), fired.clone(), held_during_write.clone());
+        move || {
+            if std::thread::current().id() != me || fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let u = ud.clone();
+            std::thread::spawn(move || u.hold_text(Target::Freq, "s"));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            held_during_write.store(ud.is_held(Target::Freq, "s"), Ordering::SeqCst);
+        }
+    }));
+    ud.replace_text_entries(Target::Freq, "s", Vec::new())
+        .unwrap();
+    drop(hook);
+    assert!(
+        !held_during_write.load(Ordering::SeqCst),
+        "整写进行中暂停不能插进来"
+    );
+    for _ in 0..200 {
+        if ud.is_held(Target::Freq, "s") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let e = ud
+        .replace_text_entries(Target::Freq, "s", Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("正在外部编辑"), "{e}");
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -17,6 +17,9 @@
 //! # 选择器
 //!
 //! - `key:<配置键>`：精确匹配设置项的 key；以 `*` 结尾时按前缀匹配（`key:input.temp_english.*`）。
+//!   两种写法都连带视图项 `a.b#视图`（`schema.mix_modes` 这类一个配置键多行的设置）：视图与
+//!   本体读写的是同一个配置键，只藏一半就留下一行还能改它的控件。`a.b.*` 另命中 `a.b` 本身。
+//!   精确写法不命中子键 `a.b.c` 与同前缀的 `a.b_x`。
 //!   用配置键而不是界面上的分区名：分区名是文案，随界面调整改名；配置键有迁移保障。
 //!   一个分区里的项全被隐藏后，设置程序会把那张卡片连同二级导航一并去掉，故不需要单独的
 //!   「隐藏分区」语法。
@@ -26,7 +29,33 @@
 ///
 /// - `wizard`：设置向导（不自动弹出，侧栏也不显示入口）。定制版通常已替用户选好方案，
 ///   向导的「选方案 + 套推荐预设」会写进用户层、盖掉定制层调好的值。
-pub const SETTINGS_FEATURES: &[&str] = &["wizard"];
+///
+/// 其余都是设置清单之外的手写卡 / 控件（没有配置键，`key:` 够不着），一张一个：
+///
+/// - `theme_transfer`：外观 → 主题卡里的「导入主题 / 导出当前主题 / 主题市场」三行。
+/// - `theme_editor`：外观 → 「主题编辑器」卡。
+/// - `integration`：高级 → 「系统集成」卡（协议关联 / 文件关联）。
+/// - `config_import`：配置导入的全部入口——高级 → 「导入」卡、侧栏 / 底栏 / 词库窗的右键
+///   导入菜单、`--page import` 深链（含命令直通车 `setting.open("import")`）。
+/// - `backup`：高级 → 「备份与还原」卡。
+/// - `compat`：高级 → 「应用兼容性」入口卡。
+/// - `memory`：高级 → 性能与诊断卡里的「内存占用 / 诊断信息」行。
+/// - `update_check`：关于页的「检查更新」按钮，连同打开设置时的自动检查。
+/// - `dark_mode`：底栏的浅色 / 深色切换。
+/// - `accent`：底栏的主题色下拉。
+pub const SETTINGS_FEATURES: &[&str] = &[
+    "wizard",
+    "theme_transfer",
+    "theme_editor",
+    "integration",
+    "config_import",
+    "backup",
+    "compat",
+    "memory",
+    "update_check",
+    "dark_mode",
+    "accent",
+];
 
 /// 一条解析过的 `[settings] hide` 选择器。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,9 +118,17 @@ impl SettingsSelector {
         match self {
             Self::Key { pattern, prefix } => {
                 if *prefix {
+                    // `a.b.*` 也命中 `a.b` 本身与它的视图项 `a.b#视图`：定制者写 `.*` 想的是
+                    // 「这一整块」，而 `schema.mix_modes` 这类键自己就是一行、其余行是它的视图。
                     key.starts_with(pattern.as_str())
+                        || pattern.strip_suffix('.').is_some_and(|stem| {
+                            key.strip_prefix(stem)
+                                .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
+                        })
                 } else {
-                    key == pattern
+                    // 精确 key 也命中它的视图项 `a.b#视图`，不命中 `a.b.c` / `a.b_x`。
+                    key.strip_prefix(pattern.as_str())
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
                 }
             }
             Self::Feature(_) => false,
@@ -167,6 +204,36 @@ mod tests {
     }
 
     #[test]
+    fn dot_star_also_matches_the_stem_and_its_views() {
+        let sel = SettingsSelector::parse("key:schema.mix_modes.*").unwrap();
+        assert!(sel.matches_key("schema.mix_modes"));
+        assert!(sel.matches_key("schema.mix_modes#members"));
+        assert!(!sel.matches_key("schema.mix_modes_x"));
+        assert!(!sel.matches_key("schema.mix"));
+    }
+
+    /// 精确 key 连带视图项，但不外溢到子键或同前缀的兄弟键。
+    #[test]
+    fn exact_key_also_matches_its_views() {
+        let sel = SettingsSelector::parse("key:schema.mix_modes").unwrap();
+        assert!(sel.matches_key("schema.mix_modes"));
+        assert!(sel.matches_key("schema.mix_modes#members"));
+        assert!(sel.matches_key("schema.mix_modes#candidate_layout"));
+        assert!(!sel.matches_key("schema.mix_modes.members"));
+        assert!(!sel.matches_key("schema.mix_modes_x"));
+        assert!(!sel.matches_key("schema.mix"));
+    }
+
+    /// 精确写视图 key 只藏那一个视图，本体与别的视图不受牵连。
+    #[test]
+    fn exact_view_key_matches_only_that_view() {
+        let sel = SettingsSelector::parse("key:schema.mix_modes#members").unwrap();
+        assert!(sel.matches_key("schema.mix_modes#members"));
+        assert!(!sel.matches_key("schema.mix_modes"));
+        assert!(!sel.matches_key("schema.mix_modes#free_input"));
+    }
+
+    #[test]
     fn whitespace_around_parts_is_tolerated() {
         let sel = SettingsSelector::parse("  key : ui.toolbar.* ").unwrap();
         assert!(sel.matches_key("ui.toolbar.visible"));
@@ -174,10 +241,21 @@ mod tests {
 
     #[test]
     fn known_feature_parses() {
-        assert_eq!(
-            SettingsSelector::parse("feature:wizard").unwrap(),
-            SettingsSelector::Feature("wizard".into())
-        );
+        for id in SETTINGS_FEATURES {
+            assert_eq!(
+                SettingsSelector::parse(&format!("feature:{id}")).unwrap(),
+                SettingsSelector::Feature((*id).into())
+            );
+        }
+    }
+
+    /// 报错要把合法值列全：定制者照着改，漏列一个就等于没告诉他有这一项。
+    #[test]
+    fn unknown_feature_error_lists_every_id() {
+        let err = SettingsSelector::parse("feature:nope").unwrap_err();
+        for id in SETTINGS_FEATURES {
+            assert!(err.contains(id), "报错里缺 `{id}`：{err}");
+        }
     }
 
     #[test]

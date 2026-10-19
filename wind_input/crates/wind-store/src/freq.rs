@@ -199,6 +199,7 @@ impl Store {
     /// 从 jsonl 导入词频（单写事务；Merge=已存在取 max(count)/max(last_used)）。
     /// 返回 (imported, skipped)；非法行跳过计数。
     pub fn import_freq_jsonl(&self, schema: &str, text: &str) -> anyhow::Result<(usize, usize)> {
+        self.check_learned_not_held(wind_userdata::record::Target::Freq, schema)?;
         let normalized = wind_utils::text::normalize_input(text);
         let text = normalized.as_ref();
         let mut rows: Vec<(String, String, u32, i64)> = Vec::new();
@@ -239,6 +240,7 @@ impl Store {
         schema: &str,
         rows: &[crate::wdict::FreqIo],
     ) -> anyhow::Result<usize> {
+        self.check_learned_not_held(wind_userdata::record::Target::Freq, schema)?;
         let rows: Vec<(String, String, wind_userdata::runtime::FreqRec)> = rows
             .iter()
             .map(|r| {
@@ -258,11 +260,13 @@ impl Store {
 
     /// 删除一条词频（不存在静默成功）。
     pub fn delete_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
+        self.check_learned_not_held(wind_userdata::record::Target::Freq, schema)?;
         self.runtime().delete_freq(schema, code, text)
     }
 
     /// 清空某方案全部词频，返回删除条数。
     pub fn clear_freq(&self, schema: &str) -> anyhow::Result<usize> {
+        self.check_learned_not_held(wind_userdata::record::Target::Freq, schema)?;
         self.runtime().clear_freq(schema)
     }
 }

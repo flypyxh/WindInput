@@ -3,11 +3,13 @@
 
 pub mod abbrev_index;
 pub mod assoc_history;
+mod banner_backfill;
 pub mod charsets;
 pub mod common_chars;
 pub mod completion;
 pub mod dict_export;
 pub mod draft_words;
+pub mod external_edit;
 pub mod freq;
 pub mod import_formats;
 mod last_good;
@@ -28,8 +30,11 @@ pub mod stats;
 pub mod store;
 pub mod store_layer;
 pub mod temp_words;
+pub mod user_dicts;
 pub mod user_words;
+pub use wind_userdata::engine::check_schema_id;
 pub use wind_userdata::issues;
+pub use wind_userdata::text::banner;
 pub use wind_wdict as wdict;
 
 pub use store::Store;

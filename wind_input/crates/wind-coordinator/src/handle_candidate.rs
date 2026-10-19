@@ -257,10 +257,11 @@ pub(crate) fn cycle_sentence_window(
 /// 满码空码清空的**最终复核**：候选列表里是否存在「拦得住清空」的候选。
 ///
 /// 清空要穿过三道门，缺一不可：
-/// 1. 码表 `clear_on_empty_max`（`CodeTableEngine`：满码 + 无候选 + 无更长后继）；
+/// 1. 码表 `clear_on_empty_max`（`CodeTableEngine`：满码 + 无更长后继，**不看**有无候选）；
 /// 2. 混输 `should_clear`（`MixedEngine`：两道拼音守护，受 `auto_commit_block_on_pinyin` 支配）；
-/// 3. **本复核** —— 引擎在追加短语**之前**就算好了 `should_clear`，看不见协调器随后并入的短语
-///    候选（`zzbd` 这类码表无字但短语命中），故须以最终列表复查。
+/// 3. **本复核** —— 「空不空」只在这里判。引擎看不见协调器随后并入的短语候选（`zzbd` 这类
+///    码表无字但短语命中），也看不见随后的过滤（常用字档滤掉 `lynn` 的「甿」「軶」、单字输入
+///    滤掉词组），故须以用户所见的最终列表裁决。
 ///
 /// 判据**不是**「列表非空」：**拼音的部分匹配不算匹配**。`nunl` 的「嫩」只解释了前 3 码 `nun`
 /// （`consumed_length=3 < 4`），拿它当「有候选」等于让一个没解释完输入的候选替整串挡下清空，
@@ -1240,10 +1241,7 @@ impl Coordinator {
         let last_seg_is_pinyin = crate::wildcard::last_seg_is_pinyin(state);
         let pinyin_schema = if last_seg_is_pinyin {
             let active = self.engine_mgr.active_schema_id();
-            self.engine_mgr
-                .schema_merged(&active)
-                .map(|s| s.engine.mixed.secondary_schema.clone())
-                .filter(|s| !s.is_empty())
+            self.engine_mgr.mixed_secondary_schema(&active)
         } else {
             None
         };
@@ -1878,8 +1876,8 @@ impl Coordinator {
                     _ => InputOutcome::Normal,
                 }
             }
-            // 满码空码清空：`should_clear` 由引擎在追加短语**之前**计算，故此处须以叠加短语后的
-            // 最终候选复查（判据见 `clear_blocked_by_candidates`——不是简单的「列表非空」）。
+            // 满码空码清空：引擎只给资格，空不空按叠加短语、过滤之后的最终候选裁决
+            // （判据见 `clear_blocked_by_candidates`——不是简单的「列表非空」）。
             // 通配组码不清空（spec §3.2）：`convert_wildcard` 本就不给清空意向，这里是双保险。
             None if should_clear
                 && wildcard_pattern.is_none()
@@ -1921,13 +1919,16 @@ impl Coordinator {
         if !ct.auto_commit_at_full {
             return None;
         }
-        // 无「满码」概念的引擎（拼音 / 双拼，`max_code_length` 为 0）**整体不参与**（论坛 t308）。
+        // 无「满码」概念的引擎（拼音 / 双拼）**整体不参与**（论坛 t308）。
         //
         // 开关读的是 `schema.codetable`，拼音方案照样继承全局那一份；而下面的最短码长闸在码长
         // 为 0 时恒放行 ⇒ 只剩「唯一候选」一道闸。双拼关掉简拼后，`ofa` 这类码没有任何拼音
         // 候选，直通命令 `$CC(…ime.schema…)` 成了唯一一条，打完第三码当场执行。简拼开着时
         // 不触发只是碰巧多了一条简拼候选，换个无拼音解的码照样中招。
-        if self.engine_mgr.active_max_code_length() == 0 {
+        //
+        // ⚠️ 必须问满码长而不是 `active_max_code_length`：后者对混输刻意为 0，用它会把混输
+        // 一并拦下（v0.126.0 的回归）。
+        if self.engine_mgr.active_full_code_length() == 0 {
             return None;
         }
         // 最短码长闸：与引擎 decide_auto_commit 的 `input.chars().count() < min_len` 同构。
@@ -2054,7 +2055,7 @@ impl Coordinator {
     fn phrase_auto_commit_min_len(&self, ct: &wind_config::CodetableGlobal) -> usize {
         resolve_auto_commit_min_len(
             ct.auto_commit_min_len,
-            self.engine_mgr.active_max_code_length(),
+            self.engine_mgr.active_full_code_length(),
         )
     }
 
@@ -4232,6 +4233,10 @@ impl Coordinator {
     ///
     /// `freq_text`：词频记账文本（被顶出候选的 [`Candidate::freq_text`]；`None` = 同
     /// `top_text`）。模板词的 `top_text` 是当天展开结果，按它记账次日即成孤儿行（GH#177）。
+    ///
+    /// `draft_boundary`：顶出的首选**是一条草稿候选**时它的 `boundary`，否则 `None`。
+    /// 非 `None` 表示这次上屏要按「草稿被用过」记账（跃迁进临时词库）——判据是**词落了屏**，
+    /// 不是用户按了哪颗键：顶码本来就没有选择键可按。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_top_text(
         &self,
@@ -4242,6 +4247,7 @@ impl Coordinator {
         s2t_override: Option<&str>,
         remainder: &str,
         source: CandidateSource,
+        draft_boundary: Option<u64>,
     ) -> KeyAction {
         if !top_text.is_empty() {
             self.record_selection_cased_in(
@@ -4258,6 +4264,12 @@ impl Coordinator {
                 0,
                 wind_store::stats::CommitSource::Candidate,
             );
+            // `6a-draft`：顶码上屏同样算「用过」→ 草稿跃迁进临时词库。
+            // 判据是词落没落屏，不是「用户按了哪颗键」——顶码没有选择键可按，但词确实上了屏；
+            // 缺了这一跳，打超满码长顶出草稿的人永远打不出自己造的词。
+            if let Some(boundary) = draft_boundary {
+                let _ = self.promote_draft_on_commit(prefix, &top_text, boundary);
+            }
         }
         // 出屏文本（记账之后取，见上）：变体候选用其覆盖文本，其余按需简繁转换。
         let out_text = match s2t_override {

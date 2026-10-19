@@ -142,15 +142,15 @@ impl Toast {
 
     /// Linux 外部宿主：渲染位图 + 锚点，落位由 addon 按工作区做（服务端拿不到屏幕几何）。
     /// 与 [`Self::show`] 同一卡片、同一留白（12dp）；text 为空返回 None。
-    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[cfg(ext_presenter)]
     pub(crate) fn render_overlay(
         &mut self,
         text: &str,
         pos: ToastPosition,
         kind: ToastKind,
         accent_override: Option<[u8; 4]>,
-    ) -> Option<crate::overlay_linux::Overlay> {
-        use crate::overlay_linux as ol;
+    ) -> Option<crate::overlay_host::Overlay> {
+        use crate::overlay_host as ol;
         if text.is_empty() {
             return None;
         }
@@ -166,8 +166,9 @@ impl Toast {
             software_shadow: has_shadow,
             place: ol::Place::Anchor {
                 anchor: ol::toast_anchor_code(pos),
-                margin: (12.0 * self.scale).round() as i32,
+                margin: ol::to_host(12.0 * self.scale, self.scale),
             },
+            scale: self.scale,
         })
     }
 

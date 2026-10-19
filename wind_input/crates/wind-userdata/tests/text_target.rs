@@ -433,3 +433,25 @@ fn text_bad_lines_are_reported_to_issues() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// 外部编辑会话：暂停写回的目标不被空闲折回与压实写回；查询照常叠加 delta；释放即折回。
+#[test]
+fn held_text_target_is_not_folded_until_released() {
+    let (_d, ud, file) = setup("held");
+    bind(&ud, &file);
+    ud.hold_text(Target::User, "py");
+    assert!(ud.is_held(Target::User, "py"));
+    up(&ud, "nihao", "你好", 9, 0b101);
+    assert_eq!(ud.maintain_text_idle(std::time::Duration::ZERO).unwrap(), 0);
+    assert!(!ud.needs_maintain(), "暂停中的目标不该触发维护");
+    ud.compact().unwrap();
+    assert!(!file.exists(), "暂停中不写文件");
+    assert_eq!(ud.pending(Target::User, "py"), 1);
+    assert_eq!(texts(&ud, "nihao"), vec![("你好".into(), 9)]);
+    assert_eq!(ud.held_texts(), vec![(Target::User, "py".to_string())]);
+    ud.release_text(Target::User, "py");
+    assert!(!ud.is_held(Target::User, "py"));
+    assert_eq!(ud.pending(Target::User, "py"), 0, "释放即折回");
+    let s = std::fs::read_to_string(&file).unwrap();
+    assert!(s.contains("你好\tni hao\t9"), "{s}");
+}

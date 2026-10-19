@@ -12,10 +12,9 @@
 namespace windlinux {
 
 // ── 上行（addon → 服务）──
-constexpr uint16_t CMD_CANDIDATE_CONTEXT_MENU = 0x020F;
 constexpr uint16_t CMD_MENU_ACTION = 0x0210;
 constexpr uint16_t CMD_FRONT_CONTEXT = 0x0215;
-/// 自绘菜单打开期间的指针事件（仅 Linux）：event u32 + button u32 + x i32 + y i32（根窗口坐标）。
+/// 自绘菜单打开期间的指针事件：event u32 + button u32 + x i32 + y i32（Linux 为根窗口坐标，macOS 为 wire 点）。
 constexpr uint16_t CMD_MENU_POINTER = 0x021B;
 constexpr uint32_t MENU_POINTER_MOTION = 1;
 constexpr uint32_t MENU_POINTER_PRESS = 2;
@@ -24,20 +23,13 @@ constexpr uint32_t MENU_POINTER_PRESS = 2;
 constexpr uint16_t CMD_HOST_RENDER_FRAME = 0x0502;
 constexpr uint16_t CMD_CANDIDATE_RECTS = 0x0503;
 constexpr uint16_t CMD_MODE_STATUS = 0x0504;
-constexpr uint16_t CMD_CANDIDATE_MENU_FLAGS = 0x0505;
 constexpr uint16_t CMD_MENU_SHOW = 0x0506;
-constexpr uint16_t CMD_TOOLTIP_SHOW = 0x0508;
-constexpr uint16_t CMD_TOOLTIP_HIDE = 0x0509;
-constexpr uint16_t CMD_STATUS_SHOW = 0x050A;
-constexpr uint16_t CMD_STATUS_HIDE = 0x050B;
-constexpr uint16_t CMD_TOAST_SHOW = 0x050C;
-constexpr uint16_t CMD_TOAST_HIDE = 0x050D;
 constexpr uint16_t CMD_KEY_TAP = 0x050E;
 constexpr uint16_t CMD_KEY_SEQ = 0x050F;
 constexpr uint16_t CMD_KEY_HOLD = 0x0510;
 constexpr uint16_t CMD_KEY_RELEASE = 0x0511;
 constexpr uint16_t CMD_KEY_TYPE = 0x0512;
-/// 光栅浮层帧（状态气泡 / Toast / tooltip），仅 Linux。布局见 Codec.h `OverlayFramePayload`。
+/// 光栅浮层帧（状态气泡 / Toast / tooltip / 菜单），macOS `.app` 与 Linux addon 共用。布局见 Codec.h `OverlayFramePayload`。
 constexpr uint16_t CMD_OVERLAY_FRAME = 0x0513;
 
 // ── CMD_OVERLAY_FRAME 的枚举（protocol.rs `pub mod overlay`）──

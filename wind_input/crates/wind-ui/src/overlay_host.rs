@@ -1,14 +1,14 @@
-//! Linux 外部宿主（Fcitx5 addon）的光栅浮层：状态气泡 / Toast / 悬停提示。
+//! 外部宿主（Linux Fcitx5 addon / macOS `.app`）的光栅浮层：状态气泡 / Toast / 悬停提示。
 //!
-//! 与 macOS 分道：`.app` 用原生 NSPanel 排字，服务端只发文本 + 配色（`CMD_STATUS_SHOW` 等）；
-//! Linux addon 不排字，这三者与候选窗同构——在服务进程按主题光栅化（真实字形走
-//! `text/linux`），像素写进各层自己的 SHM 段，再推一帧 `CMD_OVERLAY_FRAME` 通知。
+//! 宿主不排字，这三者与候选窗同构——在服务进程按主题光栅化（Linux 走 `text/linux`，macOS 走
+//! CoreText），像素写进各层自己的 SHM 段，再推一帧 `CMD_OVERLAY_FRAME` 通知。宿主坐标单位
+//! 在 Linux 是像素、macOS 是点，见 [`px_per_unit`]。
 //!
 //! **落位分工**：服务端拿不到屏幕几何（X11 根窗口 / 工作区只有 addon 知道），故只给出
 //! 「首选点 + 备选点」或「锚点 + 留白」，addon 按工作区选定并夹回（`wind_linux` 的
 //! `placeOverlay`）。几何公式与 Windows 各窗口的本地定位逐项对应，见各 `render_overlay`。
 //!
-//! **计时分工**：自动隐藏时长随帧下发、由 addon 计时（同 macOS `.app`）。服务端的
+//! **计时分工**：自动隐藏时长随帧下发、由宿主（addon / `.app`）计时。服务端的
 //! forwarder 线程阻塞在命令通道上，没有到期唤醒机制，不在这边计时。
 
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,27 @@ pub(crate) enum Place {
     },
 }
 
+/// 宿主坐标单位对应多少位图像素。Linux 宿主（X11 / Wayland）的坐标就是像素：1.0；
+/// macOS 的坐标是点，位图是 `scale` 倍的像素。落位里凡是把位图尺寸 / 像素偏移与宿主坐标混算
+/// 的地方（留白、翻转的备选点、候选行矩形…）都要先过 [`to_host`]。
+pub(crate) fn px_per_unit(scale: f32) -> f32 {
+    px_per_unit_for(scale, cfg!(target_os = "macos"))
+}
+
+/// [`px_per_unit`] 的纯函数形态（`host_uses_points` 由平台决定），便于在 Linux 上测 macOS 的分支。
+fn px_per_unit_for(scale: f32, host_uses_points: bool) -> f32 {
+    if host_uses_points {
+        scale.max(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// 位图像素长度 → 宿主坐标单位（四舍五入）。
+pub(crate) fn to_host(px: f32, scale: f32) -> i32 {
+    (px / px_per_unit(scale)).round() as i32
+}
+
 /// 一层浮层的一帧：位图 + 内容盒 + 落位规则。
 pub(crate) struct Overlay {
     pub buf: Vec<u8>,
@@ -60,6 +81,8 @@ pub(crate) struct Overlay {
     pub content_h: u32,
     pub software_shadow: bool,
     pub place: Place,
+    /// 本帧的渲染缩放（位图像素 / 逻辑像素），随帧带给 macOS `.app` 折回点。
+    pub scale: f32,
 }
 
 impl Overlay {
@@ -79,6 +102,7 @@ impl Overlay {
             content_w: self.content_w,
             content_h: self.content_h,
             duration_ms,
+            scale: self.scale,
             ..Default::default()
         };
         match self.place {
@@ -471,6 +495,17 @@ impl Overlays {
 mod tests {
     use super::*;
 
+    /// macOS 宿主坐标是点、位图是 scale 倍像素：像素长度折成点，反向取整互逆；Linux 恒不换算。
+    #[test]
+    fn host_units_follow_platform() {
+        assert_eq!(px_per_unit_for(2.0, true), 2.0);
+        assert_eq!(px_per_unit_for(0.5, true), 1.0, "缩放不会小于 1");
+        assert_eq!(px_per_unit_for(2.0, false), 1.0);
+        let k = px_per_unit_for(2.0, true);
+        assert_eq!((61.0_f32 / k).round() as i32, 31);
+        assert_eq!((30.0_f32 * k).round() as i32, 60);
+    }
+
     #[test]
     fn caret_place_below_with_offset_and_flip_above_without() {
         // 光标底 120、高 20；偏移 (5, 7)；内容高 30；gap 4。
@@ -587,6 +622,7 @@ mod tests {
                 anchor: OVERLAY_ANCHOR_CENTER,
                 margin: 16,
             },
+            scale: 1.0,
         };
         shms.show(&cap, OVERLAY_KIND_STATUS, &ov, 1200);
         shms.hide(&cap, OVERLAY_KIND_STATUS);
@@ -617,6 +653,7 @@ mod tests {
             content_h: 2,
             software_shadow: false,
             place: Place::Absolute { x: 0, y: 0 },
+            scale: 1.0,
         };
         shms.show(&cap, OVERLAY_KIND_TOOLTIP, &ov, 0);
         assert_eq!(shms.snapshot(OVERLAY_KIND_TOOLTIP), Some((buf, 3, 2)));

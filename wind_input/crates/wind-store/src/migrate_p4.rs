@@ -281,9 +281,13 @@ mod tests {
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         std::fs::write(&f, "common: [甲]\nuncommon: []\n").unwrap();
         let s = Store::open(&p).unwrap();
+        // 打开时只补了说明行（banner_backfill），内容没被迁移盖掉
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
-            "common: [甲]\nuncommon: []\n"
+            format!(
+                "{}\ncommon: [甲]\nuncommon: []\n",
+                wind_userdata::text::banner::COMMON_CHARS
+            )
         );
         assert_eq!(s.get_common_char_override("的").unwrap(), None);
         assert_eq!(

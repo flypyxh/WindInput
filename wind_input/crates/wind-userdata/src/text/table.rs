@@ -133,12 +133,15 @@ pub fn parse_table(bytes: &[u8], _path: &Path) -> Result<TableDoc, ParseError> {
     })
 }
 
-/// 整文件渲染：LF、无 BOM、`escape: true`，正文以 `# no comment` 开头（首列可以 `#` 开头）。
+/// 整文件渲染：按种类的说明行、LF、无 BOM、`escape: true`，正文以 `# no comment` 开头（首列可以 `#` 开头）。
 pub fn render_table(columns: &[&str], kind: &str, rows: &[Vec<String>]) -> String {
-    let mut s = format!(
+    let mut s = super::banner::for_kind(kind)
+        .map(|b| format!("{b}\n"))
+        .unwrap_or_default();
+    s.push_str(&format!(
         "---\ncolumns: [{}]\nwind: {{kind: {kind}, escape: true}}\n...\n# no comment\n",
         columns.join(", ")
-    );
+    ));
     for r in rows {
         let line: Vec<String> = r.iter().map(|f| escape_field(true, f)).collect();
         s.push_str(&line.join("\t"));
@@ -152,7 +155,7 @@ pub type GroupEdit = (Vec<String>, Vec<Vec<String>>);
 
 /// 按组补丁：原文件里该组的行全部删掉，新行插在原第一行的位置（没有该组 ⇒ 追加到末尾）；其余
 /// 字节不变。新行按**文件的**列序、文件的 escape 设置输出（文件里没有的列丢弃）；`original` 为空
-/// ⇒ 先渲染表头。
+/// ⇒ 先渲染表头；直接以 `---` 开头 ⇒ 补上说明行。
 pub fn patch_groups(
     original: &[u8],
     path: &Path,
@@ -161,12 +164,13 @@ pub fn patch_groups(
     columns: &[&str],
     kind: &str,
 ) -> Result<Vec<u8>, ParseError> {
-    let fresh;
+    let fresh: std::borrow::Cow<[u8]>;
     let original: &[u8] = if original.is_empty() {
-        fresh = render_table(columns, kind, &[]);
-        fresh.as_bytes()
+        fresh = render_table(columns, kind, &[]).into_bytes().into();
+        &fresh
     } else {
-        original
+        fresh = super::banner::prepend_if_bare(original, super::banner::for_kind(kind));
+        &fresh
     };
     let doc = parse_table(original, path)?;
     let s = std::str::from_utf8(original).map_err(|_| ParseError::NotUtf8)?;
@@ -424,6 +428,46 @@ mod tests {
                 vec!["bb", "见\n了", "delete", "", ""],
             ]
         );
+    }
+
+    /// 整写带按种类取的说明行（不认识的种类不写）；解析跳过它；补丁给直接以 `---` 开头的文件补上，第一行是注释的不动；空文件按新建写。
+    #[test]
+    fn banner_is_rendered_by_kind_and_kept_by_patch() {
+        use crate::text::banner;
+        let s = render_table(COLS, "shadow", &[row(&["aa", "恭", "pin", "0", ""])]);
+        assert!(s.starts_with(&format!("{}\n---\n", banner::SHADOW)), "{s}");
+        let d = parse_table(s.as_bytes(), Path::new("s")).unwrap();
+        assert_eq!(d.kind.as_deref(), Some("shadow"));
+        assert_eq!(d.rows.len(), 1);
+        assert!(render_table(COLS, "other", &[]).starts_with("---\n"));
+        let edit = [(row(&["bb"]), vec![row(&["bb", "八", "delete", "", ""])])];
+        let out = |orig: &str| {
+            String::from_utf8(
+                patch_groups(
+                    orig.as_bytes(),
+                    Path::new("s"),
+                    &["code"],
+                    &edit,
+                    COLS,
+                    "shadow",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let bare = "---\ncolumns: [code, text, action]\n...\naa\t恭\tpin\n";
+        assert_eq!(
+            out(bare),
+            format!("{}\n{bare}bb\t八\tdelete\n", banner::SHADOW)
+        );
+        let crlf = bare.replace('\n', "\r\n");
+        assert_eq!(
+            out(&crlf),
+            format!("{}\r\n{crlf}bb\t八\tdelete\r\n", banner::SHADOW)
+        );
+        let mine = format!("# 我的\n{bare}");
+        assert_eq!(out(&mine), format!("{mine}bb\t八\tdelete\n"));
+        assert!(out("").starts_with(&format!("{}\n---\n", banner::SHADOW)));
     }
 
     /// 按组替换：组内行整体换掉、位置不变；别的行、注释、CRLF、BOM 逐字节不变；新组追加。

@@ -305,7 +305,7 @@ state (postcard, 版本化)
 
 `CompositeDict::merge_search` 的去重、继承权重、前缀取最短码语义不变；每层各自 limit，临时词不会被用户词挤占名额。
 
-- 用户自放的只读词库走扩展词库目录（系统层，见 §10 P2c），不进用户层；删除其中的词照旧是 Shadow delete。
+- 用户自放的只读词库是用户分库 `data/<数据方案>/dicts/*.dict.yaml`，开关在同层 `dicts.toml`，作为扩展词库的另一个来源登记（码表与用户词同档），见 `user-dict-libraries-and-external-edit.md` §3；界面删分库的词改该文件，Shadow 照旧可对任何词置顶 / 删除。
 - 临时词晋升：`temp Delete + user Upsert` 两条记录，同一 seq 对；晋升阈值判断读 sidecar 的 count 与 delta 的 Incr 之和。
 - `on_word_selected` 阈值调权：count 走 Incr，满阈值时追加 SetWeight；语义与现状一致。
 - 英文学词：`meta.is_temp_dict` 对应 target = temp；先查后写在同步写路径下成立。
@@ -389,15 +389,17 @@ P2–P4a 的中间布局（`user/` 目录名、补全 / 统计在 `state/`、`qu
 
 ## 10 分阶段
 
+发版状态：P0–P5 已随 v0.127.0-beta.1 发出（预发布）。
+
 | 阶段 | 内容 | 退出判据 |
 |---|---|---|
-| 前置 | §7.1 降级保护：`meta.toml` 的 `format_version` 与只读模式；`state/` 目录与 `state.toml` 挪位 | **已实现**（2026-10-14，aa83e4a8 / af84a68a）：随下一个发版进入现场 |
-| P0 | `wind-userdata` 引擎：快照、日志、delta、state、锁、device_id、折回；快照段带简拼区与无边界组 | **已实现**（2026-10-14，cbe75b3d…a19027ef；计划 `user-data-storage-plan-p0.md`）：引擎级测试 18 + 5 全绿。与设计的差异：日志记录多一个 `boundary` 字段（回放时 delta 要建简拼分组）；快照发布用 `RwLock<Arc<View>>` 不引 `arc-swap`；折回在调用线程上做，P1 再放独立线程。真实 `userdata.redb` 的等价测试归 P1（迁移时才有对照） |
+| 前置 | §7.1 降级保护：`meta.toml` 的 `format_version` 与只读模式；`state/` 目录与 `state.toml` 挪位 | **已实现**（`f88b50a1` meta.toml、`c7acfaf5` state.toml）：v0.127.0-beta.1 起进入现场 |
+| P0 | `wind-userdata` 引擎：快照、日志、delta、state、锁、device_id、折回；快照段带简拼区与无边界组 | **已实现**（计划 `user-data-storage-plan-p0.md`）：引擎级测试 18 + 5 全绿。与设计的差异：日志记录多一个 `boundary` 字段（回放时 delta 要建简拼分组）；快照发布用 `RwLock<Arc<View>>` 不引 `arc-swap`；折回在调用线程上做，P1 再放独立线程。真实 `userdata.redb` 的等价测试归 P1（迁移时才有对照） |
 | P1a | 引擎补强（时间、叠加唯一、delta 二分、fold_with、零条目快照、state 版本、压实与后台折回）；`Runtime` 四组领域 API；临时词层 / 草稿层 | **已实现**（计划 `user-data-storage-plan-p1a.md`）：领域 API 与 `wind-store` 对拍测试全绿 |
 | P1b | 接线：协调器写路径、`EngineManager` 换层、设置页 IPC、备份 / 导出、联想索引改走 `Runtime`；redb → 引擎一次性迁移；`format_version` → 2；退役 5 张表 | **已实现**（计划 `user-data-storage-plan-p1b.md`）：与设计的差异——**`Store` 做门面**，四组方法签名不变、方法体委托 `Runtime`，调用方零改动、现有测试即对拍；为此 `wdict` 拆成 `wind-wdict`、Store 三层挪进 `wind-store`。全量回归 4930 条 0 失败；按键路径不经 redb Mutex（`pause()` 测试守）。运行时状态按用户目录分开（`state/runtime/<dir_id>/`）；迁移为合并语义、完成才升 `format_version`。独立审查探针：5000 临时词 + 19 万词频的库迁移 451–476 ms、再开 86–89 ms；真实用户库等价待靶机（`examples/p1_migrate_check.rs`） |
 | P2a | 文本层引擎：`user.dict.yaml` 解析与 `normalize_key`、按行补丁、文本目标折回 / 同步 / 整文件替换、sidecar 记行序、用户词层与领域 API | **已实现**（计划 `user-data-storage-plan-p2a.md`）。与设计的差异：文本只存 text / code / weight（用户词 count / created_at 不进文本）；段放在引擎状态目录（沿用 sidecar 提交点，可由文本重建）；`sync_text` 总算内容指纹，不走长度 + mtime 快路径；写出的正文以 `# no comment` 开头；补齐的音节边界改写该行码列；归文本管的目标绑定前不折回；单个文本目标折回失败只退避该目标 |
 | P2b | 接线：`wind-store` 用户词门面委托、redb `USER_WORDS` → `user.dict.yaml` 迁移、`format_version` → 3、`dict.reload` / `dict.flush`、启动 / 切方案 / 配置重载时 `sync_text`；退役 2 张表 | **已实现**（计划 `user-data-storage-plan-p2b.md`）。与设计的差异：用户分库移到 P2c；用户词 count / created_at 不再保留，`on_word_selected` 删除（无生产调用方）；`lowercase` 未按方案下发；拼音文本里单个汉字的无空格码按单音节解析（空格载体表达不了 0b1）；空闲写回由 5 秒一拍的后台节拍驱动。合成 19 万词旧库迁移 674 ms、逐码比对 0 不一致 |
-| P2c | 用户分库 | **并入现有扩展词库目录，不另建机制**（2026-10-14 裁定）：用户自放的只读 `*.dict.yaml` 已由 `[[dictionary_dirs]]` / 默认 `<主词库目录>/ext`（`inject_dir_dicts`，用户目录优先）识别，按方案 override 逐个开关即「登记」，设置页有入口（`schema-dict-discovery.md`）。再在 `user/<schema>/` 下开第二个入口只会让同一件事两处配置。`user/<schema>/` 只认 `user.dict.yaml`，其余文件不读 |
+| P2c | 用户分库 | **改由 `user-dict-libraries-and-external-edit.md` §3 承接**（2026-10-16）：放在 `data/<数据方案>/dicts/`、开关在 `dicts.toml`，复用扩展词库的发现与加载，不另建机制；原「并入扩展词库目录」的裁定作废。**已实现**（用户分库），随 beta.1 |
 | P3 | 短语与 Shadow 文本化；设置页列表 / 编辑改走新层；系统短语覆盖语义 | **已实现**（计划 `user-data-storage-plan-p3.md`）。与设计的差异：两张表按 §2.4 小表处理（内存持有、按组补丁、整文件提交，不走日志 + delta），按键路径查 Shadow 零 IO；短语为叠加模型——系统短语只在内存（每次启动由协调器交给 store），文件只记用户行与 `overrides_system: 1` 的修改行；系统短语改键时原键写停用的修改行、新键归用户；`phrase_sys_hash` 留在 redb `META` 等 P4；短语迁移要 TOML 才分得清系统行被改过没有，所以在首次 `set_system_phrases` 时做，做完立即升 `format_version` 到 4 |
 | P4a | 覆盖表与小文件：快捷格式 / 常用字 / 字符集用户层进用户目录（文件是真源，写入带指纹复核），补全历史（内存持有、2 秒去抖落盘）/ 每日统计（按月）/ 统计元数据 / `phrase_sys_hash` 进本机状态目录；`format_version` → 5；备份补快捷格式，还原后重载镜像与统计收集器 | **已实现**（计划 `user-data-storage-plan-p4a.md`）。与设计的差异：备份包格式不变（老备份照样能还原），「按类别直接打包 `user/` + `state/`」随 P4b 做；补全历史原在按键路径上读 redb（邮箱 / 网址 / 快捷输入每键一次），现读内存；`schema_version`（META）随 redb 留到 P4b。此后运行期不再写 redb，它只供迁移读 |
 | P4b | 删除 redb 依赖；独立迁移器 `wind_migrate`（§7.3）；备份按类别打包目录；删掉暂停 / 恢复与页缓存回收机制 | **须等 P1–P4a 的迁移版本发出后再做**（§7：兼容护栏先于破坏性变更），发版时机由维护者定。退出判据：`cargo tree` 无 redb；备份还原全量回归 |

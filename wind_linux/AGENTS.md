@@ -176,12 +176,12 @@ addon 在主线程（经 EventDispatcher）按名只读打开 SHM、拷出一帧
 
 ## 光栅浮层：状态气泡 / Toast / 悬停提示（X11）
 
-**与 macOS 分道**：`.app` 用原生 NSPanel 排字，服务只发文本 + 配色（`CMD_STATUS_SHOW` 等）；
-本 addon 不排字，这三者与候选窗同构——服务进程按主题光栅化（`wind-ui/src/overlay_linux.rs`，
+**与 macOS 同构**（2026-10 起 macOS 也改成这样，见 `docs/design/mac-overlay-raster.md`）：
+本 addon 不排字，这三者与候选窗同构——服务进程按主题光栅化（`wind-ui/src/overlay_host.rs`，
 真实字形走 `text/linux`），像素写进**各层自己的** SHM 段（`/WindInput[Dev].<uid>` + `_TIP` /
-`_STS` / `_TST`，`overlayShmName`），再推 `CMD_OVERLAY_FRAME`（0x0513，68 字节，布局见
-`Codec.h` 的 `OverlayFramePayload`）。macOS 行为不变：Linux 专属代码全在
-`cfg(all(target_os = "linux", ext_presenter))` 下，macOS 仍发文本帧。
+`_STS` / `_TST`，`overlayShmName`），再推 `CMD_OVERLAY_FRAME`（0x0513，68 字节基础布局，macOS 版
+末尾多一个 f32 scale，本 addon 不读；布局见 `Codec.h` 的 `OverlayFramePayload`）。服务端代码在
+`cfg(ext_presenter)` 下，macOS `.app` 与本 addon 共用。
 
 - **一层一窗**：`X11CandidatePanel` 里候选窗与三层浮层各一个 `Surface`，共用一条 xcb 连接；
   实例名 `wind-tooltip` / `wind-status` / `wind-toast`（e2e 按它找窗）。窗口类型
@@ -329,7 +329,7 @@ forwardKey 对某类应用确实无效时才值得做，目前没有这样的证
 | 系统输入法配置里的「配置」按钮 | ExternalOption → 设置程序 | e2e 验了 `Controller1.GetConfig` 的描述与命令可启动；fcitx5-configtool 5.1.6+ 直接启动，22.04（5.0.x）显示一页一个按钮；真机点按钮与 Deepin 配置界面未验 |
 | 非嵌入模式的占位组合 | 不写进应用（addon 过滤） | 见设计文档 §5d |
 | 工具栏 / 软键盘 / 输入诊断 HUD | 不做（工具栏确定不做；软键盘暂缓，视发布后的反馈再定） | 产品决策：与 macOS 精简范围一致。设置端已按平台门控相应设置项（wind-setting README「按平台屏蔽的设置项」）；主菜单里的对应项也按平台摘掉 |
-| 截图所有窗口到文件（主菜单「高级」） | 摘掉 | 流程按 macOS「浮层像素在宿主」写：要宿主回应 `shot.panel` 才出结果 Toast，addon 不接。「截图候选窗口到剪贴板」可用 |
+| 截图所有窗口到文件（主菜单「高级」） | 已接 | 候选窗与各浮层的像素都在服务进程，就地编码存盘（`manager_macos.rs` 的 `TakeScreenshot`，macOS 同一份）；不含菜单。此前因流程按「像素在宿主」写（`shot.panel`）而摘掉，现已不需要宿主回应 |
 | 按应用独立配置（compat） | 机制可用，真机验过（2026-10-09：两个应用分别默认中文 / 英文，切换焦点时正确切换）；**打包时不带 Windows 内置规则**（`scripts/lib/gen-compat.sh linux` 生成「字段说明 + 零规则」的 Linux 版系统层，各平台兼容策略不共用） | 服务按 `FOCUS_GAINED` 的 bundleId（= `InputContext::program()`）匹配规则，同 macOS；设置端的应用兼容性窗口保留 |
 | 打开设置（`settings.open` 扩展信封） | 已接 | `WindEngine::onExt` → `spawnDetached`（与拉起服务同一个：双 fork 不留僵尸、新会话、继承 fcitx5 的会话环境，但不继承它的 fd 与信号处置；`fcitx::startProcess` 只做前两样）。设置程序已开着时由它自己的单实例转发参数；但**转来的切页要等设置窗口下一次输入事件才显示**（windui Linux 后端，冷启动深链正常） |
 | 系统关联（`windinput://` 协议、`.wpkg` / `.wtheme`） | 已接（deb 声明 + 设置程序可按用户注册） | deb 装 `scripts/linux/pkg/` 下两个 `.desktop` 与 `windinput.xml`，类型图标在 `data/icons/hicolor/*/mimetypes/`（`scripts/linux/gen-mime-icons.py`）；便携 / tarball 在设置「高级 → 系统集成」按用户注册（写 `$XDG_DATA_HOME`，语义见 wind-setting README「系统关联」）。`scripts/linux/e2e-assoc.sh` 覆盖类型识别、默认处理者、`xdg-open` / `gio open` 拉起设置程序进导入确认、首实例已开时转参、注册/取消一圈。未验：真桌面文件管理器双击（Nautilus / Dolphin / Deepin）、KDE 的 ktraderclient 查询分支、snap / flatpak 浏览器点链接；用户级注册不装图标 |

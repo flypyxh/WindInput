@@ -96,6 +96,7 @@ impl TextDoc {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(e.into()),
                     }
+                    super::fold::remove_backup(&self.path);
                 }
                 st.fp = super::fold::fingerprint(None);
                 st.content = None;
@@ -119,6 +120,7 @@ impl TextDoc {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
+                super::fold::remove_backup(&self.path);
                 st.fp = super::fold::fingerprint(None);
                 st.content = None;
             }

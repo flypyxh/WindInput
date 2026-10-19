@@ -173,14 +173,12 @@ void ResponseRouter::applyCommitText(const CommitTextPayload& p, TextSink* sink)
     }
     std::string prefix = pendingCommitPrefix_;
     pendingCommitPrefix_.clear();
-    // 先收掉旧组合再上屏：Fcitx5 的 commitString 不会顺带清 client preedit（IMKit 的
-    // insertText 自带「替换 marked text」语义，Swift 侧因此不需要这一步——两边宿主模型的
-    // 差异，不是漏写）。不清的话宿主里会同时留着上屏文本和旧编码。
-    if (!compositionText_.empty() && sink) {
-        sink->setPreedit("", 0);
-    }
-    compositionText_.clear();
+    // 先上屏、再收掉旧组合，与 Fcitx5 自带引擎同序。Fcitx5 的 commitString 不会顺带清
+    // client preedit（IMKit 的 insertText 自带「替换 marked text」语义，Swift 侧因此不需要
+    // 这一步），不清的话宿主里会同时留着上屏文本和旧编码。反过来先清空预编辑，Electron
+    // 输入框冷启动后的第一次会把随后的 CommitString 丢掉。
     insertCommitted(prefix + p.text, sink);
+    clearPreeditIfAny(sink);
 
     if (!p.newComposition.empty()) {
         // 内联 preedit：commit 后立即开始新一轮组合
@@ -192,11 +190,8 @@ void ResponseRouter::applyCommitText(const CommitTextPayload& p, TextSink* sink)
 void ResponseRouter::applyCommitTextWithCursor(const CommitTextWithCursorPayload& p,
                                                TextSink* sink)
 {
-    if (!compositionText_.empty() && sink) {
-        sink->setPreedit("", 0);
-    }
-    compositionText_.clear();
     insertCommitted(takePendingPrefix() + p.text, sink);
+    clearPreeditIfAny(sink);
     // 自动配对插入 `（）` 后把光标退回到配对中间。
     if (p.cursorOffset > 0 && sink) {
         sink->moveCursor(-static_cast<int>(std::min(p.cursorOffset, kMaxCursorMove)));
@@ -216,13 +211,13 @@ void ResponseRouter::applyUpdateComposition(const UpdateCompositionPayload& p, T
 void ResponseRouter::applyClearComposition(TextSink* sink)
 {
     std::string prefix = takePendingPrefix();
+    if (!prefix.empty()) {
+        insertCommitted(prefix, sink);
+    }
     if (sink) {
         sink->setPreedit("", 0);
     }
     compositionText_.clear();
-    if (!prefix.empty()) {
-        insertCommitted(prefix, sink);
-    }
 }
 
 void ResponseRouter::insertCommitted(const std::string& text, TextSink* sink)
@@ -265,13 +260,17 @@ void ResponseRouter::flushPendingPrefix(TextSink* sink)
     if (prefix.empty()) {
         return;
     }
-    if (!compositionText_.empty()) {
-        if (sink) {
-            sink->setPreedit("", 0);
-        }
-        compositionText_.clear();
-    }
     insertCommitted(prefix, sink);
+    clearPreeditIfAny(sink);
+}
+
+void ResponseRouter::clearPreeditIfAny(TextSink* sink)
+{
+    // 上屏之后再调；为什么不能反过来见 applyCommitText。
+    if (!compositionText_.empty() && sink) {
+        sink->setPreedit("", 0);
+    }
+    compositionText_.clear();
 }
 
 void ResponseRouter::absorbHeldIntoPrefix()

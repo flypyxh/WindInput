@@ -213,6 +213,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME number_key_policy COMMAND number_key_policy_test)
 
+    add_executable(space_key_policy_test tests/space_key_policy_test.cpp)
+    target_include_directories(space_key_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(space_key_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME space_key_policy COMMAND space_key_policy_test)
+
     add_executable(hold_replay_policy_test tests/hold_replay_policy_test.cpp)
     target_include_directories(hold_replay_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

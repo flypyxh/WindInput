@@ -2,6 +2,7 @@
 #include "DeferredCompositionPolicy.h"
 #include "HoldReplayPolicy.h"
 #include "NumberKeyPolicy.h"
+#include "SpaceKeyPolicy.h"
 #include "SmartPunctPrevChar.h"
 #include "TextService.h"
 #include "IPCClient.h"
@@ -815,11 +816,15 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
             // 与下方 Number 的 chinese_fullwidth_number 例外同源——core 侧空缓冲空格早已
             // 正确走标点流水线，但此处不吃就永远送不到，故全角空格只在恰好有 session /
             // resync 窗口内时才灵，表现为「有时全角有时半角」。
-            if (isChineseMode && keyType == HotkeyType::Space && _pTextService->IsFullWidth())
+            // 半角态则看自定义标点「空格」行当前列配没配映射（t337），判据见 SpaceKeyPolicy.h。
+            if (isChineseMode && keyType == HotkeyType::Space &&
+                wind::spacekey::ShouldEatIdleSpace(_pTextService->IsChinesePunct() != FALSE,
+                                                   _pTextService->IsFullWidth() != FALSE, _spaceCustomCols))
             {
                 *pfEaten = TRUE;
                 _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, keyType,
-                                isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"chinese_fullwidth_space");
+                                isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE,
+                                _pTextService->IsFullWidth() ? L"chinese_fullwidth_space" : L"chinese_custom_space");
                 return S_OK;
             }
         }
@@ -3016,6 +3021,12 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
             _enPassthroughPunctChars.insert((wchar_t)ch);
         }
         WIND_LOG_INFO_FMT(L"EN passthrough punct chars updated: count=%d\n", (int)_enPassthroughPunctChars.size());
+    }
+    else if (key == CONFIG_KEY_SPACE_CUSTOM_COLS)
+    {
+        // 格式：mask(u8)（对齐 Rust encode_space_custom_cols_value）。
+        _spaceCustomCols = value.empty() ? 0 : value[0];
+        WIND_LOG_INFO_FMT(L"Space custom cols updated: mask=0x%X\n", (unsigned)_spaceCustomCols);
     }
     else if (key == CONFIG_KEY_PAIR_STATE_TTL)
     {

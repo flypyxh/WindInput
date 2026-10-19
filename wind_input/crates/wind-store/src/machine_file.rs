@@ -1,24 +1,13 @@
-//! 机器写的小文件（补全历史、统计；设计 §2.5 第 3 条）：解析失败先从 `.bak` 自愈，`.bak` 也不行
-//! 就把坏文件另存为 `.corrupt-<时间>` 后从空重建。坏文件本身从不被覆盖。
+//! 机器写的小文件（补全历史、统计；设计 §2.5 第 3 条）：解析失败先从上一版（`.backup/` 里的，没有
+//! 再看旧版留在旁边的 `.bak`）自愈，也不行就把坏文件另存为 `.corrupt-<时间>` 后从空重建。坏文件本身
+//! 从不被覆盖。
 
 use std::path::Path;
 use wind_userdata::issues::{self, IssueKind};
 use wind_userdata::text::fold;
 
-fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(suffix);
-    s.into()
-}
-
-fn kept_name(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// 读机写文件：不存在 ⇒ `Ok(None)`；解析成功 ⇒ `Ok(Some(v))`；解析失败 ⇒ 坏文件另存留存，
-/// `.bak` 能解析就把它恢复成正文并返回其内容，否则返回 `Ok(None)`（调用方从空开始）。两种情况都
+/// 上一版能解析就把它恢复成正文并返回其内容，否则返回 `Ok(None)`（调用方从空开始）。两种情况都
 /// 登记 `Rebuilt`。读不了（IO）⇒ `Err`。
 pub(crate) fn load_machine_file<T>(
     path: &Path,
@@ -32,13 +21,17 @@ pub(crate) fn load_machine_file<T>(
         Err(e) => e,
     };
     tracing::warn!("{} 无法解析（{err:#}），尝试从备份恢复", path.display());
-    let bak = with_suffix(path, ".bak");
-    let restored = match fold::read_text(&bak)? {
-        Some((b, _)) => parse(&b).ok().map(|v| (b, v)),
-        None => None,
-    };
+    let mut restored = None;
+    for bak in [fold::backup_path(path), fold::legacy_backup_path(path)] {
+        if let Some((b, _)) = fold::read_text(&bak)?
+            && let Ok(v) = parse(&b)
+        {
+            restored = Some((b, v));
+            break;
+        }
+    }
     let kept = fold::preserve_corrupt(path)?;
-    let kept_as = kept.as_deref().map(kept_name).unwrap_or_default();
+    let kept_as = kept.as_deref().map(fold::kept_as).unwrap_or_default();
     issues::report(path, IssueKind::Rebuilt { kept_as });
     match restored {
         Some((b, v)) => {
@@ -96,6 +89,32 @@ mod tests {
             issues::list_under(&f)[0].kind,
             IssueKind::Rebuilt { .. }
         ));
+        issues::clear(&f);
+    }
+
+    /// 数据目录下：先用 `.backup/` 里的上一版，没有再用旧版旁边的 `.bak`；坏文件留存进 `.backup/`。
+    #[test]
+    fn heals_from_backup_dir_before_legacy_bak() {
+        let d = dir("backup_dir");
+        fold::register_data_root(&d);
+        let f = d.join("stats").join("a");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "x").unwrap();
+        std::fs::write(d.join("stats/a.bak"), "9").unwrap();
+        std::fs::create_dir_all(d.join(".backup/stats")).unwrap();
+        std::fs::write(d.join(".backup/stats/a"), "5").unwrap();
+        assert_eq!(load_machine_file(&f, &num).unwrap(), Some(5));
+        let IssueKind::Rebuilt { kept_as } = issues::list_under(&f)[0].kind.clone() else {
+            panic!("要登记 Rebuilt");
+        };
+        assert!(kept_as.starts_with(".backup/stats/a.corrupt-"), "{kept_as}");
+        std::fs::remove_file(d.join(".backup/stats/a")).unwrap();
+        std::fs::write(&f, "y").unwrap();
+        assert_eq!(
+            load_machine_file(&f, &num).unwrap(),
+            Some(9),
+            "回退到旧 .bak"
+        );
         issues::clear(&f);
     }
 

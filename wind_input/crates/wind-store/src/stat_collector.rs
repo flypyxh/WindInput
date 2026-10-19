@@ -495,7 +495,7 @@ mod tests {
         store.recalculate_stats_meta(1.0).unwrap();
         let mp = store.stats_dir().join("meta.toml");
         std::fs::write(&mp, "total_chars = [").unwrap();
-        let _ = std::fs::remove_file(store.stats_dir().join("meta.toml.bak"));
+        let _ = std::fs::remove_file(wind_userdata::text::fold::backup_path(&mp));
         let sc = StatCollector::new(store.clone(), 1.0);
         assert_eq!(sc.get_meta().total_chars, 300);
         wind_userdata::issues::clear(&mp);

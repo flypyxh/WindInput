@@ -917,19 +917,6 @@ pub(crate) fn dispatch_command(
             Some(encode_ack())
         }
 
-        // ── darwin .app 候选右键上下文菜单动作（index i32 + actionLen u32 + action UTF-8，上行）──
-        CMD_CANDIDATE_CONTEXT_MENU => {
-            if payload.len() >= 8 {
-                let index = i32::from_le_bytes(payload[0..4].try_into().unwrap());
-                let action_len = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
-                if payload.len() >= 8 + action_len {
-                    let action = std::str::from_utf8(&payload[8..8 + action_len]).unwrap_or("");
-                    handler.handle_candidate_context_menu(index, action);
-                }
-            }
-            Some(encode_ack())
-        }
-
         // ── 鼠标点选候选（页内下标 i32 LE，上行；darwin .app 同步 / Windows host DLL SendAsync）──
         // 0x020D 双用途：下行 CMD_MODE_PUSH（仅编码），上行 CMD_CANDIDATE_SELECT（仅 dispatch）。
         // 负值为翻页按钮（-1 上页 / -2 下页），对齐 Go handleHostCandidateSelect 的 int32 解码——

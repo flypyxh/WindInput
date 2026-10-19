@@ -109,7 +109,7 @@ Frame commitAndHold(uint16_t cmd, const std::string& c, const std::string& h)
 
 void TestBasicFlow()
 {
-    CASE("组字 → 上屏：预编辑随 UpdateComposition 走，CommitText 先清预编辑再上屏");
+    CASE("组字 → 上屏：预编辑随 UpdateComposition 走，CommitText 先上屏再清预编辑");
     ResponseRouter r;
     FakeSink s;
     CHECK(r.apply(update("ni", 2), &s));
@@ -120,8 +120,47 @@ void TestBasicFlow()
     CHECK(s.committed == "你好");
     CHECK(s.preedit.empty());
     CHECK(!r.hasComposition());
-    // 顺序：先清再上屏（Fcitx5 的 commitString 不会顺带清 client preedit）
-    CHECK(s.ops.size() == 3 && s.ops[1] == "preedit:" && s.ops[2] == "commit:你好");
+    // 顺序：先上屏再清（Fcitx5 的 commitString 不会顺带清 client preedit；反过来 Electron 冷启动会丢字）
+    CHECK(s.ops.size() == 3 && s.ops[1] == "commit:你好" && s.ops[2] == "preedit:");
+}
+
+void TestCommitBeforeClearingPreedit()
+{
+    CASE("凡是上屏顺带收组合的路径，都先 commit 后清预编辑");
+    {
+        ResponseRouter r;
+        FakeSink s;
+        r.apply(update("kh", 2), &s);
+        Bytes w;
+        put(w, uint32_t(std::string("（）").size()));
+        put(w, 1u);
+        put(w, std::string("（）"));
+        r.apply(mk(CMD_COMMIT_TEXT_WITH_CURSOR, w), &s);
+        CHECK(s.ops.size() == 4 && s.ops[1] == "commit:（）" && s.ops[2] == "preedit:"
+              && s.ops[3] == "move:-1");
+    }
+    {
+        ResponseRouter r;
+        FakeSink s;
+        r.apply(hold("、", 0), &s);
+        r.applyClearComposition(&s);
+        CHECK(s.ops.size() == 3 && s.ops[1] == "commit:、" && s.ops[2] == "preedit:");
+    }
+    {
+        ResponseRouter r;
+        FakeSink s;
+        r.apply(hold("。", 0), &s);
+        r.apply(mk(CMD_PASS_THROUGH), &s);
+        CHECK(s.ops.size() == 3 && s.ops[1] == "commit:。" && s.ops[2] == "preedit:");
+    }
+    {
+        ResponseRouter r;
+        FakeSink s;
+        r.apply(update("gg", 2), &s);
+        r.apply(commitAndHold(CMD_COMMIT_THEN_DEFER, "工", "a"), &s);
+        CHECK(s.ops.size() == 4 && s.ops[1] == "commit:工" && s.ops[2] == "preedit:"
+              && s.ops[3] == "preedit:a");
+    }
 }
 
 void TestCaretIsUtf16ToBytes()
@@ -343,6 +382,7 @@ void TestUtf()
 int main()
 {
     TestBasicFlow();
+    TestCommitBeforeClearingPreedit();
     TestCaretIsUtf16ToBytes();
     TestPassThroughAndClear();
     TestHeldSymbol();

@@ -92,6 +92,13 @@ impl Coordinator {
         self.convert_punct(state, ch, 0)
     }
 
+    /// 空缓冲的空格 DLL 吃没吃：全角态恒吃；中文模式下还看空格行当前列配没配映射
+    /// （`CONFIG_KEY_SPACE_CUSTOM_COLS`，与 DLL 同一份掩码）。
+    pub(crate) fn idle_space_eaten(&self, state: &State) -> bool {
+        let col = wind_punct::punct_col_idx(state.chinese_punct, state.full_width);
+        state.full_width || (state.chinese_mode && self.rt().space_custom_cols & (1 << col) != 0)
+    }
+
     /// 标点转换单点流水线（对齐 Go `convertPunct`，固定优先级）：
     ///   1. 自定义映射（四状态：中半 0 / 英全 1 / 中全 2 / 英半 3，按当前中英标点+全半角选列）
     ///   2. 数字后智能转换（命中则该标点按英文输出，不转中文）

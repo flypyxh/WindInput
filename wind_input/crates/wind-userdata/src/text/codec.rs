@@ -76,11 +76,14 @@ pub struct Decoded {
 
 fn header(spec: &TableSpec, syllable: bool) -> String {
     let cols: Vec<&str> = spec.columns.iter().map(|(n, _)| *n).collect();
-    let mut h = format!(
+    let mut h = super::banner::for_kind(spec.kind)
+        .map(|b| format!("{b}\n"))
+        .unwrap_or_default();
+    h.push_str(&format!(
         "---\ncolumns: [{}]\nwind:\n  kind: {}\n",
         cols.join(", "),
         spec.kind
-    );
+    ));
     if syllable {
         h.push_str("  code_spacing: syllable\n");
     }
@@ -223,7 +226,7 @@ fn escape(escape: bool, s: &str) -> String {
     }
 }
 
-/// 整文件渲染：LF、无 BOM、`escape: true`。
+/// 整文件渲染：说明行、LF、无 BOM、`escape: true`。
 pub fn render(spec: &TableSpec, syllable: bool, entries: &[SnapshotEntry]) -> String {
     let mut s = header(spec, syllable);
     for e in entries {
@@ -239,7 +242,7 @@ pub fn render(spec: &TableSpec, syllable: bool, entries: &[SnapshotEntry]) -> St
 
 /// 按键补丁：`Some(e)` ⇒ 该键第一行换成新值、其余同键行删除，文件里没有则追加末尾；`None` ⇒
 /// 同键行全删。坏行、注释、空行与未涉及的行逐字节不变；新行按**文件**的列序与 escape 设置输出。
-/// 空文件 ⇒ 先渲染表头。单趟线性。
+/// 空文件 ⇒ 先渲染表头；直接以 `---` 开头 ⇒ 补上说明行。单趟线性。
 pub fn patch(
     bytes: &[u8],
     path: &Path,
@@ -261,12 +264,13 @@ pub fn patch_decoded(
     syllable: bool,
     edits: &BTreeMap<(String, String), Option<SnapshotEntry>>,
 ) -> Result<(Vec<u8>, Decoded), ParseError> {
-    let fresh;
+    let fresh: std::borrow::Cow<[u8]>;
     let bytes: &[u8] = if bytes.is_empty() {
-        fresh = header(spec, syllable);
-        fresh.as_bytes()
+        fresh = header(spec, syllable).into_bytes().into();
+        &fresh
     } else {
-        bytes
+        fresh = super::banner::prepend_if_bare(bytes, super::banner::for_kind(spec.kind));
+        &fresh
     };
     let doc = parse_table(bytes, path)?;
     let s = std::str::from_utf8(bytes).map_err(|_| ParseError::NotUtf8)?;
@@ -456,6 +460,43 @@ mod tests {
         assert_eq!((got.code.as_str(), got.text.as_str()), ("nihao", "你好"));
         assert_eq!((got.weight, got.count, got.created_at), (3, 2, 1700000000));
         assert_eq!(got.boundary, 0b101);
+    }
+
+    /// 整写带各自的说明行，解码照常；补丁给直接以 `---` 开头的文件补上说明行，第一行是注释的不动，空文件按新建写。
+    #[test]
+    fn banner_is_rendered_and_patch_keeps_the_first_line() {
+        use crate::text::banner;
+        for (spec, line) in [
+            (&TEMP, banner::TEMP),
+            (&DRAFT, banner::DRAFT),
+            (&FREQ, banner::FREQ),
+            (&ASSOC, banner::ASSOC),
+        ] {
+            let s = render(spec, false, &[]);
+            assert!(s.starts_with(&format!("{line}\n---\n")), "{s}");
+        }
+        let v = vec![e("a", "啊", 0, 3, 0, 10, 0)];
+        let s = render(&FREQ, false, &v);
+        let d = decode(s.as_bytes(), Path::new("f"), &FREQ, false, false).unwrap();
+        assert_eq!((d.entries.len(), d.bad_lines), (1, 0));
+        let mut edits = BTreeMap::new();
+        edits.insert(
+            ("b".into(), "不".into()),
+            Some(e("b", "不", 0, 1, 0, 11, 0)),
+        );
+        let old = render(&FREQ, false, &v).replacen(&format!("{}\n", banner::FREQ), "", 1);
+        assert!(
+            p(&old, &FREQ, &edits).starts_with(&format!("{}\n---\n", banner::FREQ)),
+            "直接以 --- 开头的旧文件补上说明行"
+        );
+        let crlf = old.replace('\n', "\r\n");
+        assert!(p(&crlf, &FREQ, &edits).starts_with(&format!("{}\r\n---\r\n", banner::FREQ)));
+        let (_, d) =
+            patch_decoded(old.as_bytes(), Path::new("f"), &FREQ, false, false, &edits).unwrap();
+        assert_eq!(d.entries.len(), 2);
+        let mine = format!("# 我的\n{old}");
+        assert!(p(&mine, &FREQ, &edits).starts_with("# 我的\n---\n"));
+        assert!(p("", &FREQ, &edits).starts_with(&format!("{}\n---\n", banner::FREQ)));
     }
 
     #[test]

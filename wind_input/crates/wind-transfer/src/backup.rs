@@ -270,6 +270,44 @@ pub fn create_backup(
         )?;
     }
 
+    // 用户分库与开关文件：原样进包（`data/<数据方案>/…`），还原时写回同一位置。
+    let text_dir = store.user_text_dir();
+    let mut data_schemas: Vec<String> = std::fs::read_dir(text_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| !n.starts_with('.')) // `.backup/` 不进包
+        .collect();
+    data_schemas.sort();
+    for ds in &data_schemas {
+        let meta = serde_json::json!({ "schema": ds });
+        let switches = wind_store::user_dicts::meta_path(text_dir, ds);
+        if switches.is_file() {
+            add(
+                &mut w,
+                format!("data/{ds}/{}", wind_store::user_dicts::META_FILE),
+                &std::fs::read(&switches)?,
+                "user_dicts_meta",
+                meta.clone(),
+            )?;
+        }
+        for l in wind_store::user_dicts::scan(text_dir, ds) {
+            add(
+                &mut w,
+                format!(
+                    "data/{ds}/{}/{}.dict.yaml",
+                    wind_store::user_dicts::LIBS_DIR,
+                    l.name
+                ),
+                &std::fs::read(&l.path)?,
+                "user_dict_file",
+                meta.clone(),
+            )?;
+        }
+    }
+
     w.finish()?;
     Ok(BackupResult {
         path: out_path.to_path_buf(),
@@ -300,7 +338,24 @@ fn section_of(ty: &str) -> &str {
         "stats_meta" => "stats",
         "compat" => "config",
         "assoc_history" => "freq",
+        "user_dict_file" | "user_dicts_meta" => "dict",
         other => other,
+    }
+}
+
+/// 分库条目只能落在 `<数据方案>/dicts/<名>.dict.yaml` 或 `<数据方案>/dicts.toml`（数据方案段须是合法方案 id）。
+fn is_user_dict_rel(rel: &str, ty: &str) -> bool {
+    use wind_store::user_dicts::{LIBS_DIR, META_FILE, validate_name};
+    let ds_ok = |ds: &str| wind_store::check_schema_id(ds).is_ok();
+    match (ty, rel.split('/').collect::<Vec<_>>().as_slice()) {
+        ("user_dicts_meta", [ds, f]) => ds_ok(ds) && *f == META_FILE,
+        ("user_dict_file", [ds, d, f]) => {
+            ds_ok(ds)
+                && *d == LIBS_DIR
+                && f.strip_suffix(".dict.yaml")
+                    .is_some_and(|n| validate_name(n).is_ok())
+        }
+        _ => false,
     }
 }
 
@@ -366,6 +421,33 @@ pub fn restore_backup(
         let bytes = crate::bundle::extract_entry(package, &e.path)?;
         let text = || String::from_utf8_lossy(&bytes).into_owned();
         let schema = e.meta.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+        // 正在外部编辑的文件不整写（编辑器还开着，写了会被它的保存盖掉）：记为冲突跳过
+        let editing = match e.r#type.as_str() {
+            "dict" if !schema.is_empty() => store.user_words_held(schema),
+            "shadow" if !schema.is_empty() => store.is_editing(&store.shadow_path(schema)),
+            "phrase" => store.is_editing(&store.phrases_path()),
+            "common_chars" => store.is_editing(&store.common_chars_path()),
+            "quick_format" => store.is_editing(&store.quick_format_path()),
+            // 替换要先清空全部字符类：有一个在编辑就整段跳过，不清到一半
+            "charset" => store
+                .list_charset_docs()?
+                .iter()
+                .filter(|(k, _)| {
+                    replace
+                        || wind_config::charset_def::parse_doc(&text())
+                            .is_ok_and(|d| d.def.key == *k)
+                })
+                .any(|(k, _)| store.charset_path(k).is_ok_and(|p| store.is_editing(&p))),
+            "user_dict_file" | "user_dicts_meta" => {
+                crate::bundle::validate_entry_rel(&e.path, "data/")
+                    .is_ok_and(|rel| store.is_editing(&store.user_text_dir().join(rel)))
+            }
+            _ => false,
+        };
+        if editing {
+            conflicts.push(e.path.clone());
+            continue;
+        }
         match e.r#type.as_str() {
             "config" => {
                 if let Some(target) = targets.user_config_file {
@@ -519,6 +601,16 @@ pub fn restore_backup(
                         restored.push(e.path.clone());
                     }
                     Err(_) => conflicts.push(e.path.clone()),
+                }
+            }
+            "user_dict_file" | "user_dicts_meta" => {
+                let rel = crate::bundle::validate_entry_rel(&e.path, "data/")?;
+                if !is_user_dict_rel(&rel, &e.r#type) {
+                    conflicts.push(e.path.clone());
+                } else if write_file(&store.user_text_dir().join(&rel), &bytes, strategy)? {
+                    restored.push(e.path.clone());
+                } else {
+                    conflicts.push(e.path.clone());
                 }
             }
             "theme_file" => {
@@ -1325,6 +1417,221 @@ mod tests {
             store2.get_charset_doc("local_only").unwrap(),
             None,
             "Replace 模式先清空再还原"
+        );
+    }
+
+    /// 用户分库与开关文件原样进包（归 dict 段），还原写回 `data/` 下同一位置。
+    #[test]
+    fn user_dict_libs_roundtrip_as_files() {
+        let t = tempfile::tempdir().unwrap();
+        let s = open_store(t.path(), "src");
+        s.create_user_dict("pinyin", "成语").unwrap();
+        s.set_user_dict_enabled("pinyin", "shuangpin", "成语", false)
+            .unwrap();
+        let root = s.user_text_dir().to_path_buf();
+        let lib = root.join("pinyin/dicts/成语.dict.yaml");
+        let lib_bytes = fs::read(&lib).unwrap();
+        let meta_bytes = fs::read(root.join("pinyin/dicts.toml")).unwrap();
+        // `.backup/` 里的上一版 / 坏文件留存不进包
+        fs::create_dir_all(root.join(".backup/dicts")).unwrap();
+        fs::write(root.join(".backup/dicts.toml"), "x").unwrap();
+        fs::write(root.join(".backup/dicts/坏.dict.yaml"), "---\n...\n").unwrap();
+        let pkg = t.path().join("b.zip");
+        create_backup(
+            &s,
+            &empty_sources(),
+            &pkg,
+            "0",
+            "test",
+            "t",
+            &BackupOptions {
+                include_stats: false,
+                include_state: false,
+            },
+        )
+        .unwrap();
+        let m = crate::bundle::read_manifest(&pkg).unwrap();
+        let entry = |p: &str| m.contents.iter().find(|e| e.path == p).cloned();
+        let e = entry("data/pinyin/dicts/成语.dict.yaml").expect("分库进包");
+        assert_eq!(e.r#type, "user_dict_file");
+        assert_eq!(
+            e.meta.get("schema").and_then(|v| v.as_str()),
+            Some("pinyin")
+        );
+        assert_eq!(
+            entry("data/pinyin/dicts.toml").unwrap().r#type,
+            "user_dicts_meta"
+        );
+        assert!(
+            m.contents.iter().all(|e| !e.path.contains(".backup")),
+            "{:?}",
+            m.contents.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+        assert_eq!(section_of("user_dict_file"), "dict");
+        assert_eq!(section_of("user_dicts_meta"), "dict");
+
+        // 只还原 temp 段：分库不动
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = open_store(t2.path(), "dst");
+        let root2 = s2.user_text_dir().to_path_buf();
+        let only_temp = vec!["temp".to_string()];
+        restore_backup(
+            &pkg,
+            &s2,
+            &empty_targets(),
+            crate::merge::Strategy::Merge,
+            Some(&only_temp),
+        )
+        .unwrap();
+        assert!(!root2.join("pinyin/dicts/成语.dict.yaml").exists());
+
+        let r = restore_backup(
+            &pkg,
+            &s2,
+            &empty_targets(),
+            crate::merge::Strategy::Merge,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root2.join("pinyin/dicts/成语.dict.yaml")).unwrap(),
+            lib_bytes
+        );
+        assert_eq!(
+            fs::read(root2.join("pinyin/dicts.toml")).unwrap(),
+            meta_bytes
+        );
+        assert!(
+            r.restored
+                .contains(&"data/pinyin/dicts/成语.dict.yaml".to_string())
+        );
+
+        // 合并：已有同名文件算冲突、不覆盖；替换：覆盖
+        fs::write(root2.join("pinyin/dicts/成语.dict.yaml"), "mine").unwrap();
+        let r = restore_backup(
+            &pkg,
+            &s2,
+            &empty_targets(),
+            crate::merge::Strategy::Merge,
+            None,
+        )
+        .unwrap();
+        assert!(
+            r.conflicts
+                .contains(&"data/pinyin/dicts/成语.dict.yaml".to_string())
+        );
+        assert_eq!(
+            fs::read(root2.join("pinyin/dicts/成语.dict.yaml")).unwrap(),
+            b"mine"
+        );
+        restore_backup(
+            &pkg,
+            &s2,
+            &empty_targets(),
+            crate::merge::Strategy::Replace,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root2.join("pinyin/dicts/成语.dict.yaml")).unwrap(),
+            lib_bytes
+        );
+    }
+
+    /// 分库条目的数据方案段也要是合法方案 id。
+    #[test]
+    fn user_dict_rel_checks_schema_segment() {
+        assert!(is_user_dict_rel("pinyin/dicts.toml", "user_dicts_meta"));
+        assert!(is_user_dict_rel(
+            "wb/dicts/我的.dict.yaml",
+            "user_dict_file"
+        ));
+        for bad in [".x/dicts.toml", "x /dicts.toml", "x./dicts.toml"] {
+            assert!(!is_user_dict_rel(bad, "user_dicts_meta"), "{bad}");
+        }
+        assert!(!is_user_dict_rel(".x/dicts/a.dict.yaml", "user_dict_file"));
+    }
+
+    /// 还原遇到正在外部编辑的文件：记为冲突跳过、不整写（编辑器还开着），其余照常还原。
+    #[test]
+    fn restore_skips_files_under_external_edit() {
+        let t = tempfile::tempdir().unwrap();
+        let s = seed_store(t.path());
+        s.create_user_dict("pinyin", "成语").unwrap();
+        s.set_user_dict_enabled("pinyin", "pinyin", "成语", false)
+            .unwrap();
+        let pkg = t.path().join("b.zip");
+        create_backup(
+            &s,
+            &empty_sources(),
+            &pkg,
+            "0",
+            "test",
+            "t",
+            &BackupOptions {
+                include_stats: false,
+                include_state: false,
+            },
+        )
+        .unwrap();
+        let m = crate::bundle::read_manifest(&pkg).unwrap();
+        let charset_entry = m
+            .contents
+            .iter()
+            .find(|e| e.r#type == "charset")
+            .unwrap()
+            .path
+            .clone();
+
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = open_store(t2.path(), "dst");
+        s2.add_user_word("wb", "zz", "杂", 1, 0).unwrap();
+        s2.create_user_dict("pinyin", "成语").unwrap();
+        s2.set_charset_doc("emoji", "key: emoji\ndefault: common\n")
+            .unwrap();
+        for f in [
+            "wb/user.dict.yaml",
+            "wb/shadow.dict.yaml",
+            "phrases.dict.yaml",
+            "common_chars.yaml",
+            "charsets/emoji.yaml",
+            "pinyin/dicts/成语.dict.yaml",
+            "pinyin/dicts.toml",
+        ] {
+            s2.begin_edit(f).unwrap();
+        }
+        let words_file = s2.user_text_path("wb");
+        let words_before = fs::read(&words_file).unwrap();
+        let r = restore_backup(
+            &pkg,
+            &s2,
+            &empty_targets(),
+            crate::merge::Strategy::Replace,
+            None,
+        )
+        .unwrap();
+        for p in [
+            "userdata/user_words/wb.wdict",
+            "userdata/shadow/wb.jsonl",
+            "userdata/phrases.wdict",
+            "userdata/common_chars.jsonl",
+            charset_entry.as_str(),
+            "data/pinyin/dicts/成语.dict.yaml",
+            "data/pinyin/dicts.toml",
+        ] {
+            assert!(r.conflicts.iter().any(|c| c == p), "{p}: {:?}", r.conflicts);
+        }
+        assert_eq!(
+            fs::read(&words_file).unwrap(),
+            words_before,
+            "编辑中的文件不整写"
+        );
+        assert!(
+            r.restored
+                .iter()
+                .any(|p| p == "userdata/temp_words/wb.wdict"),
+            "其余照常还原：{:?}",
+            r.restored
         );
     }
 }

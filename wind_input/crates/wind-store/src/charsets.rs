@@ -1,17 +1,19 @@
-//! 字符类的**用户层**（设置页「字符集分类」+ 外部编辑回读 + 备份还原）。
+//! 字符类的**用户层**（设置页「字符集」→「字符分类」：「+ 添加」走 `charset.create`，整份手改走
+//! `data.beginEdit {kind: charsets}`；备份还原）。
 //!
 //! ## 文件是真相源（P4a 起，设计 §2.4）
 //!
 //! ```text
 //! 出厂 data/charsets/*.yaml（只读，随安装包）
 //!   ↓ 定制 data_custom/charsets/*.yaml（只读）
-//!   ↓ 用户层 <userdata>/user/charsets/<key>.yaml（自建类、对出厂类的字段覆盖与成员增删）
+//!   ↓ 用户层 <userdata>/data/charsets/<key>.yaml（自建类、对出厂类的字段覆盖与成员增删）
 //! registry
 //! ```
 //!
 //! 曾经放进 redb，唯一的理由是「程序和人同写一个文件，后保存者赢、另一方静默丢失」。现在程序
-//! 的写入是显式的整份替换（设置页保存、编辑副本回读，「这份就是新内容」），手改文件经
-//! `sync_charsets` 在配置重载 / `dict.reload` 时生效；编辑副本 → 回读的流程照旧。仍存在的一种
+//! 的写入是显式的整份替换（设置页保存、新建，「这份就是新内容」），手改文件经
+//! `sync_charsets` 在配置重载 / `dict.reload` / 结束编辑时生效。重建时按出厂校验
+//! （`wind_engine::charset_assembly::validated_user_docs`），不合规的登记问题。仍存在的一种
 //! 冲突：设置页保存与编辑器同时保存同一个类，后写者胜（设置页的写入是显式整份替换，不复核）。
 //!
 //! ## 内容就是 yaml 文本本身
@@ -35,7 +37,7 @@ impl Store {
     /// 某类的用户层文件。`key` 是一个路径分量（越界 / 非法 ⇒ Err）。
     pub fn charset_path(&self, key: &str) -> anyhow::Result<std::path::PathBuf> {
         wind_userdata::engine::check_schema_id(key)
-            .map_err(|_| anyhow::anyhow!("非法字符类 key：{key:?}"))?;
+            .map_err(|_| anyhow::anyhow!("非法字符分类 key：{key:?}"))?;
         Ok(self.charsets_dir().join(format!("{key}.yaml")))
     }
 
@@ -50,6 +52,7 @@ impl Store {
     /// 文本合法性由调用方负责——本层不解析。
     pub fn set_charset_doc(&self, key: &str, text: &str) -> anyhow::Result<()> {
         let p = self.charset_path(key)?;
+        self.check_not_editing(&p)?;
         wind_userdata::text::fold::commit_text(&p, text.as_bytes(), None)?;
         self.remember_charsets_fp();
         Ok(())
@@ -58,6 +61,7 @@ impl Store {
     /// 删掉一个类的用户层（自建类 = 整个类消失；出厂类 = 回到出厂）。`false` = 本就没有。
     pub fn remove_charset_doc(&self, key: &str) -> anyhow::Result<bool> {
         let p = self.charset_path(key)?;
+        self.check_not_editing(&p)?;
         let existed = match std::fs::remove_file(&p) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -96,6 +100,10 @@ impl Store {
     /// 清空用户层（备份「替换」模式用）。返回删掉的条数。
     pub fn clear_charset_docs(&self) -> anyhow::Result<usize> {
         let docs = self.list_charset_docs()?;
+        // 先全查一遍：有一个在编辑就整体不动，不清到一半
+        for (k, _) in &docs {
+            self.check_not_editing(&self.charset_path(k)?)?;
+        }
         for (k, _) in &docs {
             self.remove_charset_doc(k)?;
         }

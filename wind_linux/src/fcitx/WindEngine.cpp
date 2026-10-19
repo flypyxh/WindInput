@@ -891,7 +891,7 @@ void WindEngine::onPushFrame(Frame frame)
         }
         break;
     default:
-        // macOS 的文本提示帧（CMD_TOOLTIP_SHOW 等，Linux 服务不发）：见 AGENTS.md 差距表。
+        // 其余下行帧（按键合成等）addon 不处理。
         break;
     }
 }

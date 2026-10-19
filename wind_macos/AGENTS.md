@@ -9,13 +9,13 @@ Win 的 `m2`=核心 exe ↔ mac 的 `m2`=Rust 服务）。
 
 ## 当前阶段
 
-协议通路、IMKit 骨架、候选/菜单/提示的原生呈现均已就位：
+协议通路、IMKit 骨架、候选/菜单/提示的呈现均已就位：
 
 - 协议层 `WindInputKit`（BinaryCodec + BridgeClient + PushClient + ProtocolTypes）
 - IMKit `.app`：InputController（composition / commit / 焦点 / 密码框 / 自愈重连）
   + KeyHandler（NSEvent → Win VK）
-- 呈现层：候选框 NSPanel（SHM 取帧）、统一菜单、菜单栏模式指示器、tooltip、
-  状态气泡、Toast、命令直通车按键合成
+- 呈现层：候选框 NSPanel（SHM 取帧）、**光栅浮层**（悬停提示 / 状态气泡 / Toast / 候选右键菜单与
+  主菜单，见下「光栅浮层」）、菜单栏模式指示器与系统输入源菜单（原生 NSMenu）、命令直通车按键合成
 - IMK server 注册 + 自身 `--register-input-source` 子命令（镜像 Squirrel/RIME 路径）
 - 单元测试 `Tests/WindInputKitTests/`（`swift test`）
 
@@ -30,7 +30,6 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 | UiCommand | 影响 | 备注 |
 |---|---|---|
 | `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md`。**菜单入口已按平台摘掉**（`build_main_menu_items` 的 `advanced_children`）——留一个点了没反应的项比没有更糟 |
-| `ShowCandidateMenu` / `HideMenu` / `MenuKey` | N/A（**不是缺失**） | macOS 弹的是原生 NSMenu，方向键/回车/Esc 由 AppKit 自己消费。协调器**刻意不转发**菜单键（见 `handle_key_event` 里那段 `cfg(not(target_os = "macos"))`）：一旦吞键而 `menu_open` 没复位就会永久卡死输入 |
 | `SetToolbarPos` / `SetToolbarAutoHide` / `SetToolbarVertical` / `SetToolbarLayout` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地"。`SetToolbarLayout`（`ui.toolbar.items`，格的显隐与顺序）同理——菜单栏指示器只有一个主字，没有"哪几格" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
 
@@ -122,67 +121,48 @@ macOS 侧的通例是「服务进程只光栅化，窗口一律归 `.app`」—�
 已接：`RegisterGlobalHotkeys`（见下）、`OpenPath` / `OpenApp`（`/usr/bin/open`，
 `.app` 包走 `open -a … --args`）、`TakeScreenshot` / `ScreenshotCandidateToClipboard` /
 `CopyTooltipText`（见下）、`ReportCandidatePos` / `ReportStatusTipPos`（见下「浮窗拖动
-与位置固定」）、`ScreenshotStatusTip` / `ScreenshotTooltip`（见下「原生浮窗截图」）。
+与位置固定」）、`ScreenshotStatusTip` / `ScreenshotTooltip`、`ShowCandidateMenu` / `HideMenu` /
+`MenuKey` / `MenuPointer` / `SetWorkArea` / `TooltipMenuAt`（见「光栅浮层」）。
 
-### 原生浮窗截图（状态气泡 / 悬停提示）
+### 光栅浮层（悬停提示 / 状态气泡 / Toast / 自绘菜单）
 
-候选窗的像素在服务进程（本进程光栅化后经 SHM 推下去），直接截自己的 buffer 即可；
-**这两者相反**——是 `.app` 侧的原生 NSPanel，服务端只下发文本与配色，只能请那边动手：
+与 Linux Fcitx5 addon 同构（设计与分期见 `docs/design/mac-overlay-raster.md`，Linux 一侧见
+`docs/design/linux-port.md` §5b/§5c）：服务进程按主题光栅化进各层自己的 SHM 段
+（`/WindInput_SHM[Dev]` + `_TIP` / `_STS` / `_TST` / `_MN<k>`），`CMD_OVERLAY_FRAME` 只带落位规则
+与自动隐藏时长；`.app` 只贴图、落位、计时、转发鼠标。主题的背景图 / 渐变 / 图层 / 软阴影 / 边框 /
+字号偏移因此与 Windows、Linux 完全一致，不再有「每加一个主题字段就要在 Swift 里再抄一遍」。
 
-下行扩展信封 `shot.panel`（body 带 `target` 与服务端定好的 `path`）→ `.app` 截图存盘 +
-复制剪贴板 → 上行 `shot.result` 回报 → 协调器据此弹 Toast。**文件名与文案留在服务端**，
-与 Windows 侧 `manager.rs` 的对应分支逐字一致，两平台同一操作不该有不同措辞。
+| 文件 | 职责 |
+|---|---|
+| `WindInputKit/IPC/OverlayProtocol.swift` | 帧解码、落位（`OverlayPlacer`，逐项对位 `wind_linux` 的 `placeOverlay`）、交互纯逻辑（`OverlayInput`、`HoverGate`）。纯几何，`swift test` 可测 |
+| `UI/OverlayPanel.swift` | 一层一个 borderless + nonactivating NSPanel，只贴图 |
+| `UI/OverlayHost.swift` | 读 SHM、按屏幕可见区落位、自动隐藏计时、鼠标交互、菜单生命周期 |
+| `UI/MenuCatcherPanel.swift` | 菜单打开期间盖住所有屏幕的几乎全透明窗，接管指针 |
 
-「截图所有窗口」（高级菜单）同理：候选窗在服务进程就地截，其余三个（状态气泡 /
-悬停提示 / Toast）经同一请求交给 `.app`。**右键菜单不截**——Windows 上它是我们自绘的
-窗口（`popup_menu.rs`），macOS 上却是原生 NSMenu，截它同样只能走屏幕录制授权那条路。
-两侧的成功数由 `already` 字段（服务端放进请求、`.app` 原样带回）相加，合成**一条**
-Toast；分开弹会在四个浮窗都可见时连弹四条。
+要点：
 
-两个实现细节：
+- **坐标单位**：帧里的 x/y/alt/margin 是 wire 点（与候选窗一致）；位图尺寸与内容盒偏移 / 尺寸是**像素**，
+  帧末尾的 `scale`（f32，72 字节版）告诉 `.app` 怎么折回点。服务端落位里凡混算像素与坐标的地方都先过
+  `overlay_host::to_host`。Linux 宿主坐标就是像素，换算恒为恒等。
+- **交互对齐 Windows / Linux**：悬停提示保持与 280ms 宽限（候选悬停变化延后上报，`CandidatePanelHost.handleRawHover`）、
+  悬停提示与状态气泡的右键菜单（`menu.open` target −3 / −2）、状态气泡拖动并回报 `pos.status_tip`、
+  Toast 点击关闭、悬停 / 拖动 / 菜单开着时不自动消失。
+- **自绘菜单不抓指针**：macOS 没有 X11 那样的指针抓取，改用 `MenuCatcherPanel`（alpha 0.01，完全透明的窗
+  收不到事件）；菜单各级窗口比它高一级且 `ignoresMouseEvents`，指针事件一律落到捕获窗，原样以
+  `CMD_MENU_POINTER`（异步、不等 ack）报给服务端，命中测试在服务端做。键盘仍走 IMK `handle(_:)` →
+  服务端 `forward_menu_key`。**协调器因此不再区分 macOS 不转发菜单键**——一旦吞键而 `menu_open` 没复位
+  就会卡死输入，所以 Linux 那套关闭路径与自愈都平移过来了：空闲 60s（按下与服务端每推一帧都续，
+  所以晃鼠标也会续，兜底靠不续的抓取上限 120s）、请求后 2s 等不到第 0 级帧、屏幕布局变化、服务重启 /
+  push 断线本端就地收并发 `menu.dismiss`、服务端 `FocusLost` 收菜单。
+- **仍是原生 NSMenu 的**：菜单栏状态项（`ModeStatusController`）与系统输入源菜单（`InputController.menu`，
+  由 IMK 在别的进程里绘制，无法自绘），继续用 `UnifiedMenuBuilder` 与精简菜单树。
+- **候选右键菜单不再抢键盘焦点**：此前 `NSMenu.popUp` 会让 Spotlight 这类宿主连发 Deactivate/Activate，
+  需要 `CandidateMenuTracking` 那套「焦点闪断期」补偿；自绘非激活面板后根因消失，相关代码已删除。
+- **截图**：像素都在本进程（候选窗在 `render_frame`，浮层在各层 SHM），「截图所有窗口」「截图此窗口」
+  就地编码存盘并进剪贴板，不再需要 `.app` 参与，也没有屏幕录制授权问题。
 
-- **不用 `CGWindowListCreateImage`**：那条路自 macOS 14 起要「屏幕录制」授权，而本输入法
-  申请的是「辅助功能」。为一个截图菜单项再要一项更敏感的授权不成比例，且用户拒授权后
-  只会得到一张黑图——比功能不存在更糟。自己的视图自己渲染不需要任何授权。
-- **走 `layer.render(in:)` 而非 `cacheDisplay(in:to:)`**：这两个浮窗的背景是**图层属性**
-  （`layer.backgroundColor` + `cornerRadius`）而不是 `draw(_:)` 画出来的，而 `cacheDisplay`
-  只走视图绘制路径——对这种视图会截出一张只有文字、没有底色和圆角的透明图。
-
-未接的变体落在 `Forwarder::handle` 的 `other =>` 兜底臂，只打一条 debug 日志。
-**新接一个变体时同步更新本表**。
-
-### 按应用配置 / 焦点重型段
-
-`.app` 的 `FocusGained` 载荷此前只有 12 字节（pid 占位 + inputScopeMask），而 Rust
-`FocusGainedPayload::from_bytes` 的下限是 36 —— **解码恒失败，整个焦点重型段从未在
-macOS 上跑过**。载荷现已补齐为与 Windows 同构的 39 字节 + 尾部 `bundleIdLen + bundleId`。
-
-宿主名的来源两平台不同：Windows 由服务进程 `OpenProcess` 反查进程名，macOS 反查不到
-（服务里的 `process_name` 恒返回空串），只能由 `.app` 取 IMKit `client.bundleIdentifier()`
-随焦点事件送上来。落点是既有的 `pid_names` 缓存，`update_active_compat` 已改为
-**缓存优先于反查** —— 缓存之后的两平台路径完全一致。
-
-`compat.toml` 的 `process` 字段是小写全等匹配（macOS 上比的是 bundle identifier，如
-`com.tencent.xinwechat`）。**各平台的兼容策略不共用**：仓库 `data/compat.toml` 里的内置规则全是
-Windows 宿主的修正（`xxx.exe`、TSF 组合帧、Band 层级），macOS 用不上。所以 `scripts/mac/dev.sh` 的
-`assemble_data` 会用 `scripts/lib/gen-compat.sh macos` 把它换成「字段说明 + 零条内置规则」的 macOS 版
-（字段说明从 Windows 版截取以免漂移；用户层 `compat.toml` 不受影响，设置里的「应用兼容性」仍可加规则）。
-此前两平台曾共用同一份，`wechat.exe` 与 `com.tencent.xinwechat` 并存——现已改为分开。
-⚠ 该改动只改了打包组装，**未在 macOS 真机 / CI 上验证**（本机只能跑脚本语法与产物检查）。
-
-caret 段发全 0 是安全的：`apply_focus_caret` 见 `height == 0` 即返回，坐标另经
-`CmdCaretUpdate` 上报。
-
-### 输入源切换（activate_ime）
-
-`keys.activate_ime` 在 Windows 上由 ctfmon 从 `DirectSwitchHotkeys` 注册表接管；macOS
-无对应机制，改由**服务进程**注册 Carbon 全局热键 + `TISSelectInputSource`
-（`wind-ui/src/input_source_macos.rs`）。放在服务进程是必须的：该热键的语义是「本输入法
-没激活时也生效」，那时 `.app` 通常没在跑。
-
-**语义差异不可消除**：Windows 是 per-app 切换（只改当前前台应用），macOS 的
-`TISSelectInputSource` 是全局切换 —— 系统没有「只改这个 app」的公开 API。设置界面的
-hint 已如实写明两平台差异。
+已知限制：Toast 的渲染缩放取主屏（`dpi::scale_for_point(0, 0)`），多屏且缩放不同时落在非主屏上会按主屏
+密度渲染（尺寸仍正确，只是清晰度随主屏）；CoreText 后端暂未实现主题字重（`font_styled` 忽略 weight）。
 
 ### 候选窗截图 / 提示复制
 
@@ -190,7 +170,7 @@ macOS 的候选窗**像素本来就在服务进程里**（我们光栅化后经 
 `.app` 参与：`Forwarder::capture_candidate` 直接拿 `render_frame()` 的 buffer 编码存盘。
 悬停提示的文本同理（随帧下发，服务侧有 `last_tip`），复制也不需要 `.app`。
 
-反过来，**状态气泡与悬停提示的截图做不了**：那两者是 `.app` 侧原生 NSPanel，像素不在本进程。
+状态气泡与悬停提示的像素在各自的浮层 SHM 段里，截图同样就地做（见「光栅浮层」）。
 
 两处踩过的坑：
 
@@ -359,15 +339,13 @@ SHM / socket / config 全部变体隔离（漏一处即冲突，如曾漏 SHM �
 | `Sources/WindInputApp/main.swift` | `.app` 入口：默认启 IMKServer + NSApp.run; 也支持 `--register-input-source` / `--enable-input-source` / `--select-input-source` 子命令。`--register-input-source` **总是重注册 + RunLoop 常驻**，不因「已注册」早退（重新部署 .app 的 cdhash 变，必须重注册刷新否则无法切换；install 已先杀旧守护，早退会让注册失去维持进程而失效）。变体隔离：mode-id 检查用 `Bundle.main.bundleIdentifier + "."` 前缀精确匹配（避免 `WindInput`/`WindInputDev` 子串互串） |
 | `Sources/WindInputApp/Controller/InputController.swift` | `IMKInputController` 子类，同步 KeyEvent roundtrip，路由 PassThrough/Consumed/CommitText/UpdateComposition; `activateServer`/`deactivateServer` 发 FocusGained/FocusLost（驱动协调器 imeActivated → 指示器）; **密码框适配**（对齐 Win 36614ae）: `activateServer` 用 `IsSecureEventInputEnabled()` 探测，命中则在帧 payload 携带 InputScope bitmask 的 IS_PASSWORD 位（bit31），协调器据此对密码框强制英文半角直通（模式图标不变）; `deactivateServer` 失焦时若仍有 marked text 先 `setMarkedText("")` 清残留 + 清本端 composition。`menu()` 重写：点系统输入源图标弹出统一菜单（复用 UnifiedMenuBuilder）; 选中项经 IMK `doCommandBySelector` → `imkMenuCommand:` 读 NSMenuItem.tag 回发 CmdMenuAction。**自愈重连**: bridge 连接持有在实例字段，`activateServer`/`handle` 入口 `ensureConnected()` 懒重连; `handle` 的 `send`/`readFrame` 经 `sendAndApply` 执行，失败 catch → `reconnect()` 后**用新连接重试当前键一次**（服务重启后第一个键就自愈，不丢字）; 连接用 `ioTimeoutMs=2000` + `SO_NOSIGPIPE`。**智能配对光标**: `router.moveHostCursor` 闭包把 kit 层的 `CursorMove` 意图用 `KeySynthesizer` 合成 ←/→ 方向键（主线程 async，排在 insertText 后）; 需辅助功能授权，未授权静默降级 |
 | `Sources/WindInputApp/Controller/KeyHandler.swift` | `NSEvent.keyCode` → Win VK 映射 + Modifier 编码 + KeyEvent 帧构造 |
-| `Sources/WindInputApp/UI/CandidatePanelHost.swift` | 候选框承载层：订阅 push，收 CmdHostRenderFrame→SHM→NSPanel、CmdCandidateRects→hit-test、CmdModeStatus→ModeStatusController、CmdTooltip*/CmdStatus*→气泡、CmdToast*→ToastPanel; 命令直通车按键：CmdKeyTap/Hold/Release/Seq→`KeySynthesizer` CGEvent 合成，CmdKeyType→`activeResponder.applyPushResponse`→router `insertText` 上屏; 鼠标选词回发。导出 `unifiedMenuItems()`/`sendMenuAction(_:)` 供三处菜单（候选框右键/菜单栏指示器/系统输入菜单）复用同一 IPC 请求与回发路径 |
+| `Sources/WindInputApp/UI/CandidatePanelHost.swift` | 候选框承载层：订阅 push，收 CmdHostRenderFrame→SHM→NSPanel、CmdCandidateRects→hit-test、CmdModeStatus→ModeStatusController、CmdOverlayFrame→`OverlayHost`（悬停提示 / 状态气泡 / Toast / 自绘菜单）; 协调候选悬停与悬停提示的保持 / 宽限; 命令直通车按键：CmdKeyTap/Hold/Release/Seq→`KeySynthesizer` CGEvent 合成，CmdKeyType→`activeResponder.applyPushResponse`→router `insertText` 上屏; 鼠标选词回发。导出 `unifiedMenuItems()`/`sendMenuAction(_:)` 供菜单栏指示器 / 系统输入菜单复用同一 IPC 请求与回发路径 |
 | `Sources/WindInputApp/UI/KeySynthesizer.swift` | 命令直通车按键合成（key.tap/seq/hold/release）: canonical 键名→CGKeyCode + 修饰键→CGEventFlags 映射，经 `CGEvent.post(tap: .cgSessionEventTap)` 向聚焦应用注入; **需「辅助功能」授权**，`ensureTrusted()` 未授权时弹一次系统请求并放弃本次（ad-hoc 签名重部署 cdhash 变会使旧授权失效，须重授）。key.type / clip.paste 文本上屏不走此处，走 `client.insertText` 免授权 |
-| `Sources/WindInputApp/UI/CandidatePanel.swift` | 候选框 NSPanel（borderless 浮窗）+ 自绘 bitmap + 鼠标命中/悬停; 空白处右键经 UnifiedMenuBuilder 弹统一菜单; 空白处左键**拖动**整窗，松手回报 `pos.candidate`（见「浮窗拖动与位置固定」）|
-| `Sources/WindInputApp/UI/UnifiedMenuBuilder.swift` | 把服务下发的统一菜单树（MenuItemData）构建为原生 NSMenu; 三处共用。两种派发：`.inProcess`（普通 NSMenu，builder 作 target 回调）与 `.imkCommand`（系统输入菜单，target=nil + selector，IMK 经 doCommandBySelector 路由）; 菜单 id 统一经 NSMenuItem.tag 回传 |
+| `Sources/WindInputApp/UI/CandidatePanel.swift` | 候选框 NSPanel（borderless 浮窗）+ 自绘 bitmap + 鼠标命中/悬停; 右键只报目标（候选下标 / −1 主菜单），菜单由服务端自绘; 空白处左键**拖动**整窗，松手回报 `pos.candidate`（见「浮窗拖动与位置固定」）|
+| `Sources/WindInputApp/UI/OverlayHost.swift` · `OverlayPanel.swift` · `MenuCatcherPanel.swift` | 光栅浮层承载层，见上「光栅浮层」 |
+| `Sources/WindInputApp/UI/UnifiedMenuBuilder.swift` | 把服务下发的统一菜单树（MenuItemData）构建为原生 NSMenu; 菜单栏指示器与系统输入菜单共用（候选右键菜单已改服务端自绘）。两种派发：`.inProcess`（普通 NSMenu，builder 作 target 回调）与 `.imkCommand`（系统输入菜单，target=nil + selector，IMK 经 doCommandBySelector 路由）; 菜单 id 统一经 NSMenuItem.tag 回传 |
 | `Sources/WindInputApp/UI/ModeStatusController.swift` | 菜单栏模式指示器（NSStatusItem）: 收 CmdModeStatus 显示中英/全半角/标点/方案; 下拉菜单（NSMenuDelegate 动态填充）复用统一菜单树，点击回发 CmdMenuAction，服务未就绪时回退只读状态 |
-| `Sources/WindInputApp/UI/TooltipPanel.swift` | 候选悬停 tooltip NSPanel。配色与拆字字根字体路径随 `CmdTooltipShow` 下发（服务侧 `manager_macos.rs` 从主题求值成 `#RRGGBBAA`）; 空串则用内置深色默认。分段颜色走同一帧的 `runs` 尾段（UTF-16 区间 + 已解析的 RGBA，缺省即单色，新旧两端互容） |
-| `Sources/WindInputApp/UI/StatusBubblePanel.swift` | 锚 caret 的模式状态气泡（收 CmdStatusShow）; 可拖动，松手回报 `pos.status_tip`，并应答服务端的 `pos.status_tip.query`。帧尾 `anchor` 非 0 时按锚点落在「焦点所在屏」（`PanelGeometry.anchorScreen`：鼠标所在屏优先）的可见区；窗口锚点因 IMK 拿不到宿主窗口 frame 降级为同位置屏幕锚点（C2-33 / GH#148） |
 | `Sources/WindInputApp/UI/PanelGeometry.swift` | 把 `WireGeometry` 的纯几何接到真实 NSScreen（只决定「哪块屏」这一件事，其余在 kit 里可测）|
-| `Sources/WindInputApp/UI/ToastPanel.swift` | 屏幕级 Toast 通知 NSPanel（词库就绪/错误等）: 收 CmdToastShow（标题+正文+bg/fg/accent+position+时长）渲染暗色圆角卡片 + 左侧 accent 条，按 durationMs 自动隐藏（0=5000，<0 常驻）; 点击穿透 |
 | `Sources/WindInputApp/Resources/Info.plist` | IMK 元数据：ComponentInputModeDict / TISInputSourceID / LSUIElement（**不可**设 LSBackgroundOnly，否则候选 NSPanel 无法显示）/ InputMethodConnectionName = bundleID_Connection。**不可设 `tsInputModeDefaultStateKey`**: 会让 mode 注册即「已启用」却不落盘 AppleEnabledInputSources，导致「+ 添加输入法」列表过滤掉它、主列表又没有 → 中英文分组两头都看不见（Tahoe 实测） |
 | `Sources/WindInputApp/Resources/AppIcon.icns` | 应用图标（Finder/安装器/关于面板），plist `CFBundleIconFile=AppIcon` 引用。与菜单栏单色 `menu_icon.pdf`（`tsInputMethodIconFileKey`）互不相干 |
 | `Sources/WindInputApp/Resources/WindInput.entitlements` | App Sandbox 关闭（IMKit `.app` 与服务 UDS 共享文件路径需要） |

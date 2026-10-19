@@ -524,6 +524,9 @@ pub struct EngineManager {
     /// redb 查询叠加，造成可感知卡顿。缓存 `None` 同样有意义：方案文件不存在时反复尝试
     /// 读盘，还会刷出成片的 `Schema file not found` 警告。
     schema_type_cache: Mutex<HashMap<String, Option<String>>>,
+    /// 已建引擎所用用户分库的指纹（方案 id → [(数据方案, 指纹)]），建引擎前记下。不带路径的
+    /// `dict.reload` 据此判断分库变没变（[`Self::user_dicts_changed`]）。
+    user_dicts_seen: Mutex<HashMap<String, Vec<(String, String)>>>,
     /// 方案级 `[key_actions]` 表缓存（schema_id → 表）。
     ///
     /// **必须缓存**：消费点 `Coordinator::bound_action_for` 在按键热路径上，且进模式的两条
@@ -949,6 +952,7 @@ impl EngineManager {
             codetable_settings_cache: Mutex::new(HashMap::new()),
             codetable_settings_gen: std::sync::atomic::AtomicU64::new(0),
             schema_type_cache: Mutex::new(HashMap::new()),
+            user_dicts_seen: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             session_actions_cache: Mutex::new(HashMap::new()),
             behavior_cache: Mutex::new(HashMap::new()),
@@ -2211,9 +2215,12 @@ impl EngineManager {
             return Some(ReverseIndex::default());
         };
         let schemas = data_dir.join("schemas");
-        let Some(schema) =
-            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
-        else {
+        let Some(schema) = Self::read_schema_in(
+            schema_id,
+            Some(data_dir),
+            self.override_dir.as_deref(),
+            self.user_text_dir(),
+        ) else {
             return Some(ReverseIndex::default());
         };
         let dicts = Self::load_dicts_individually(&schema, &schemas);
@@ -2350,9 +2357,12 @@ impl EngineManager {
         let Some(data_dir) = self.data_dir.as_deref() else {
             return HashMap::new();
         };
-        let Some(schema) =
-            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
-        else {
+        let Some(schema) = Self::read_schema_in(
+            schema_id,
+            Some(data_dir),
+            self.override_dir.as_deref(),
+            self.user_text_dir(),
+        ) else {
             return HashMap::new();
         };
         let cap = schema.engine.codetable.max_code_length;
@@ -3137,6 +3147,8 @@ impl EngineManager {
         //
         // 闭包**先绑定再取引用**：写成 `Some(&|| …)` 的话它是个临时值，在 `if` 表达式结束
         // 时就被丢掉，借用活不到 `build_engine` 的调用点。
+        // 先记指纹再建：建的过程中文件被改，下次 `dict.reload` 照样能发现
+        let user_dicts_fp = self.user_dicts_fingerprints(schema_id);
         let borrow_shared_english = || self.shared_english_engine();
         let english_provider: Option<EnglishProvider<'_>> = if schema_id == ENGLISH_SCHEMA {
             None
@@ -3163,6 +3175,10 @@ impl EngineManager {
                     schema_id,
                     engine.engine_type()
                 );
+                self.user_dicts_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(schema_id.to_string(), user_dicts_fp);
                 self.engines
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3316,6 +3332,14 @@ impl EngineManager {
     ) -> Option<ConvertResult> {
         self.active_engine()?
             .convert_reverse(input, pattern, max_candidates)
+    }
+
+    /// 活跃方案的满码长：码表取其码长，混输取主码表的，拼音 / 双拼为 0（无「满码」）。
+    ///
+    /// 与 [`Self::active_max_code_length`] 只差在混输：那个值对混输刻意为 0。短语自动上屏
+    /// 的「是否参与」与最短码长都按本值判，混输才和它的主码表同口径。
+    pub fn active_full_code_length(&self) -> usize {
+        self.active_wildcard_code_length()
     }
 
     /// 活跃方案的通配码长（[`Engine::wildcard_code_length`]；混输取主码表的）。
@@ -3718,6 +3742,21 @@ impl EngineManager {
         .filter(|p| !p.is_empty())
     }
 
+    /// 混输方案的拼音子方案 id（`[engine.mixed].secondary_schema`）；非混输/未知/未配置返回 None。
+    /// 按键路径上用：引擎类型走缓存，不登记用户分库（不列目录、不读分库头与开关文件）。
+    pub fn mixed_secondary_schema(&self, schema_id: &str) -> Option<String> {
+        if self.schema_engine_type(schema_id).as_deref() != Some("mixed") {
+            return None;
+        }
+        Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .map(|s| s.engine.mixed.secondary_schema)
+        .filter(|p| !p.is_empty())
+    }
+
     /// 写入/词频归属 id：非混输 = `data_schema_id(自身)`（source 无关，零回归）；
     /// 混输按候选来源分流（码表→主方案自身 id、拼音→"pinyin"）；
     /// 无法归因（None/English/Phrase 或 primary 缺失）返回 None，调用方跳过本次读写。
@@ -3741,11 +3780,17 @@ impl EngineManager {
 
     /// 方案合并定义（基础 + override 层）——设置页 getConfig 返回。
     pub fn schema_merged(&self, schema_id: &str) -> Option<Schema> {
-        Self::read_schema(
+        Self::read_schema_in(
             schema_id,
             self.data_dir.as_deref(),
             self.override_dir.as_deref(),
+            self.user_text_dir(),
         )
+    }
+
+    /// 用户数据目录（`<用户目录>/data`）；无 store 时 None（不登记用户分库）。
+    fn user_text_dir(&self) -> Option<&Path> {
+        self.store.as_ref().map(|s| s.user_text_dir())
     }
 
     /// 读取某方案 override 层（TOML 值，无则 None）。
@@ -3927,6 +3972,142 @@ impl EngineManager {
         // 恒 true：上面每条路都以「无需重启即可生效」收尾。保留返回值是为了兼容既有调用方
         // （web 的 `live` 字段），也给将来真出现「必须重启」的分支留个位置。
         true
+    }
+
+    /// 方案引擎用到的用户分库所在的数据方案：混输取两个成员的，其余取自己的。
+    fn user_dict_data_schemas(&self, schema_id: &str) -> Vec<String> {
+        if self.schema_engine_type(schema_id).as_deref() != Some("mixed") {
+            return vec![self.data_schema_id(schema_id)];
+        }
+        let mut out = Vec::new();
+        for m in self.user_dict_mixed_members(schema_id) {
+            let ds = self.data_schema_id(&m);
+            if !out.contains(&ds) {
+                out.push(ds);
+            }
+        }
+        out
+    }
+
+    fn user_dicts_fingerprints(&self, schema_id: &str) -> Vec<(String, String)> {
+        let Some(dir) = self.user_text_dir() else {
+            return Vec::new();
+        };
+        self.user_dict_data_schemas(schema_id)
+            .into_iter()
+            .map(|ds| {
+                let fp = wind_store::user_dicts::fingerprint(dir, &ds);
+                (ds, fp)
+            })
+            .collect()
+    }
+
+    /// 已建引擎所用的用户分库里，文件或开关变了的数据方案（不带路径的 `dict.reload`）。
+    /// 只比对，不失效：调用方对返回的每个数据方案调 [`Self::invalidate_user_dicts`]。
+    pub fn user_dicts_changed(&self) -> Vec<String> {
+        let Some(dir) = self.user_text_dir() else {
+            return Vec::new();
+        };
+        let loaded: Vec<String> = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let seen = self
+            .user_dicts_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut now: HashMap<String, String> = HashMap::new();
+        let mut changed: Vec<String> = Vec::new();
+        for id in loaded {
+            for (ds, fp) in seen.get(&id).into_iter().flatten() {
+                let cur = now
+                    .entry(ds.clone())
+                    .or_insert_with(|| wind_store::user_dicts::fingerprint(dir, ds));
+                if cur != fp && !changed.contains(ds) {
+                    changed.push(ds.clone());
+                }
+            }
+        }
+        changed.sort();
+        changed
+    }
+
+    /// 某数据方案的用户分库变了（文件或开关）：失效用到它的全部方案（拼音族、作成员的混输）。
+    /// 编译缓存按内容指纹，没变的分库不重编，代价是一次方案重建。
+    pub fn invalidate_user_dicts(&self, ds: &str) {
+        let mut ids: Vec<String> = self.available_schemas();
+        let loaded: Vec<String> = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for id in loaded {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let mut hits: Vec<String> = Vec::new();
+        for id in &ids {
+            for m in self.user_dict_mixed_members(id) {
+                if !ids.contains(&m) && !hits.contains(&m) && self.data_schema_id(&m) == ds {
+                    hits.push(m);
+                }
+            }
+            if self.schema_engine_type(id).as_deref() != Some("mixed")
+                && self.data_schema_id(id) == ds
+                && !hits.contains(id)
+            {
+                hits.push(id.clone());
+            }
+        }
+        info!(
+            "用户分库有变化：失效 {} 个方案（数据方案 {ds}）",
+            hits.len()
+        );
+        // `invalidate_schema` 自带扇出到把它当成员的混输
+        for id in hits {
+            self.invalidate_schema(&id);
+        }
+        self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.reverse_index_skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 混输方案的成员（primary / secondary）；非混输为空。
+    fn user_dict_mixed_members(&self, schema_id: &str) -> Vec<String> {
+        if self.schema_engine_type(schema_id).as_deref() != Some("mixed") {
+            return Vec::new();
+        }
+        Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .map(|s| {
+            [
+                s.engine.mixed.primary_schema,
+                s.engine.mixed.secondary_schema,
+            ]
+            .into_iter()
+            .filter(|m| !m.is_empty() && m != schema_id)
+            .collect()
+        })
+        .unwrap_or_default()
     }
 
     /// 删除某方案 override 层并使其引擎缓存失效。返回是否删除了文件。
@@ -5689,13 +5870,17 @@ impl EngineManager {
         Self::warn_stale_charset_files();
         // 层序与 `resolve_schema_resource` 一致（后者是 user > custom > data，
         // 这里是靠后的覆盖靠前的）。
-        let defs = wind_config::charset_def::load_layered(
+        let mut defs = wind_config::charset_def::load_factory(
             data_dir,
             wind_config::Config::custom_data_dir().as_deref(),
-            store
-                .map(crate::charset_assembly::user_docs_from_store)
-                .unwrap_or_default(),
         );
+        // 用户层按出厂校验（改出厂范围 / 整份替换被忽略并登记问题），再叠上去
+        if let Some(store) = store {
+            let docs = crate::charset_assembly::validated_user_docs(store, &defs);
+            for doc in docs {
+                wind_config::charset_def::apply_doc(&mut defs, doc);
+            }
+        }
         crate::charset_assembly::assemble(
             &defs,
             data_dir,
@@ -5752,7 +5937,7 @@ impl EngineManager {
     /// | 旧落点 | 何时失效 | 现在在哪 |
     /// |---|---|---|
     /// | `schemas/common_chars.txt` | 2026-09-04 | `charsets/common_han.yaml` 的列表体 |
-    /// | `charsets/*.yaml` | 2026-09-05 | `data/charsets/*.yaml`（设置页「外部编辑」对话框里加载） |
+    /// | `charsets/*.yaml` | 2026-09-05 | `data/charsets/*.yaml`（设置页「新建分类…」对话框里加载） |
     ///
     /// ⚠️ 两者都是**静默失效**：文件还在、程序不读、也不报错。用户看到的是「我明明改了
     /// 字表，判定却还是自带那套」。提醒不能省。第二条没写迁移：那个落点从未发布。
@@ -5764,7 +5949,7 @@ impl EngineManager {
         if stale.is_file() {
             warn!(
                 "{} 已不再生效——常用字表现在在 charsets/common_han.yaml 里。要沿用你的名单，\
-                 请在设置页「字符集分类」→「外部编辑」里对常用汉字「选择其它文件…」加载它",
+                 请在设置页「字符集」→「新建分类…」里用「选择其它文件…」加载它",
                 stale.display()
             );
         }
@@ -5772,8 +5957,8 @@ impl EngineManager {
         let stale_dir = dir.join(wind_config::charset_def::CHARSETS_DIR_NAME);
         if dir_has_yaml(&stale_dir) {
             warn!(
-                "{} 已不再被读取——字符类的用户层现在在数据库里。里面的文件可在设置页\
-                 「字符集分类」→「外部编辑」里用「选择其它文件…」逐个加载",
+                "{} 已不再被读取——字符分类的个人调整现在在用户数据目录 data/charsets/ 里。\
+                 里面的文件可在设置页「字符集」→「新建分类…」里用「选择其它文件…」逐个加载",
                 stale_dir.display()
             );
         }
@@ -6053,6 +6238,17 @@ impl EngineManager {
         data_dir: Option<&Path>,
         override_dir: Option<&Path>,
     ) -> Option<Schema> {
+        Self::read_schema_in(schema_id, data_dir, override_dir, None)
+    }
+
+    /// 同 [`Self::read_schema`]，另把用户分库（`<user_text_dir>/<数据方案>/dicts/`）登记进词库表。
+    /// 只有用到词库的路径（建引擎、getConfig / setDictEnabled、反查索引、单字码表）需要它。
+    fn read_schema_in(
+        schema_id: &str,
+        data_dir: Option<&Path>,
+        override_dir: Option<&Path>,
+        user_text_dir: Option<&Path>,
+    ) -> Option<Schema> {
         if Config::custom_hides_schema(schema_id) {
             Self::warn_hidden_schema_once(schema_id);
             return None;
@@ -6083,6 +6279,10 @@ impl EngineManager {
         // 合并 override 层（存在才读；不存在则零影响）。
         if let Some(ov) = override_dir.and_then(|d| Self::read_override_value(schema_id, d)) {
             merge_toml(&mut base, ov);
+        }
+        // 用户分库在 override 之后登记：开关只认 dicts.toml，override 里同 id 的项不起作用。
+        if let Some(dir) = user_text_dir {
+            Self::inject_user_dicts(&mut base, schema_id, dir);
         }
         // 字段级容错（`tolerant_de`）的回落是**静默**的：它只让那一个字段回落，不再触发
         // 下面的段级降级。清空→反序列化→取走，把这些回落也收进 `degraded_items`，
@@ -6278,7 +6478,12 @@ impl EngineManager {
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
-        let schema = Self::read_schema(schema_id, Some(data_dir), override_dir)?;
+        let schema = Self::read_schema_in(
+            schema_id,
+            Some(data_dir),
+            override_dir,
+            store.as_ref().map(|s| s.user_text_dir()),
+        )?;
 
         // 混输方案：递归构建主（码表）+ 次（拼音）子引擎，包装为 MixedEngine
         if schema.engine.engine_type.to_lowercase() == "mixed" {
@@ -6511,6 +6716,8 @@ impl EngineManager {
                 uan_uang: pg.fuzzy.enabled && pg.fuzzy.uan_uang,
                 un_ong: pg.fuzzy.enabled && pg.fuzzy.un_ong,
                 eng_ong: pg.fuzzy.enabled && pg.fuzzy.eng_ong,
+                // 双拼同键音节不来自用户配置，由 `with_shuangpin` 从布局推出。
+                ..Default::default()
             };
             let pcfg = PinyinConfig {
                 use_smart_compose: pg.use_smart_compose,
@@ -6613,7 +6820,7 @@ impl EngineManager {
                 match crate::pinyin::shuangpin::Layout::from_toml(&lp) {
                     Ok(layout) => {
                         let mut conv = crate::pinyin::shuangpin::ShuangpinConverter::new(layout);
-                        conv.set_fuzzy(fuzzy.zh_z, fuzzy.ch_c, fuzzy.sh_s);
+                        conv.set_fuzzy(&fuzzy);
                         engine = engine.with_shuangpin(conv);
                     }
                     Err(e) => {
@@ -6841,6 +7048,10 @@ impl EngineManager {
         // fn item 而非闭包：闭包会借住外部变量，与几处 return 的 move 冲突。
         fn has_wdat(p: &Path) -> bool {
             wind_dict::cached::wdat_sibling(p).is_some_and(|w| w.is_file())
+        }
+        // 绝对路径（用户分库）不走分层
+        if Path::new(rel).is_absolute() {
+            return std::path::PathBuf::from(rel);
         }
         // 兜底同原行为：返回 data 层（末位）路径，由调用方报加载失败。层序恒非空
         // （`dict_layers` 必压入 data 层），空表只可能来自测试，退化为相对路径。
@@ -7276,6 +7487,80 @@ impl EngineManager {
                 next_order += 1;
                 arr.push(toml::Value::Table(t));
             }
+        }
+    }
+
+    /// 把用户分库登记成扩展库，追加到 `base` 的 `dictionaries` 末尾（设计
+    /// `user-dict-libraries-and-external-edit.md` §3.2）。只给有自己词库的方案（码表 / 拼音 /
+    /// 英文，同扩展词库的兜底范围）；混输的分库随成员方案走。
+    ///
+    /// 生成项：`id = "user:<名>"`、label 取词库头 `name:`（空则名字）、`path` 为绝对路径、类型同
+    /// 主词库、`base_order = -3`（码表与用户词同档，排在系统库前；拼音不读它）、`enabled` 取
+    /// `dicts.toml`（出厂开）。拼音族的数据方案折叠到 `pinyin`（与 [`Self::data_schema_id`] 同口径）。
+    fn inject_user_dicts(base: &mut toml::Value, schema_id: &str, user_text_dir: &Path) {
+        let Some(table) = base.as_table_mut() else {
+            return;
+        };
+        let ty = table
+            .get("engine")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !["codetable", "pinyin", "english"].contains(&ty.as_str()) {
+            return;
+        }
+        let ds = if ty == "pinyin" {
+            PINYIN_DATA_SCHEMA
+        } else {
+            schema_id
+        };
+        let libs = wind_store::user_dicts::scan(user_text_dir, ds);
+        if libs.is_empty() {
+            return;
+        }
+        let Some(arr) = table.get_mut("dictionaries").and_then(|d| d.as_array_mut()) else {
+            return;
+        };
+        let Some(main) = arr
+            .iter()
+            .find(|d| d.get("default").and_then(|v| v.as_bool()) == Some(true))
+            .or_else(|| arr.first())
+        else {
+            return;
+        };
+        let dict_type = main
+            .get("type")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("rime_codetable")
+            .to_string();
+        let off = wind_store::user_dicts::off_names(user_text_dir, ds, schema_id);
+        for l in libs {
+            let label = wind_store::user_dicts::read_label(&l.path);
+            let mut t = toml::map::Map::new();
+            t.insert(
+                "id".into(),
+                format!("{}{}", wind_store::user_dicts::ID_PREFIX, l.name).into(),
+            );
+            t.insert(
+                "label".into(),
+                if label.is_empty() {
+                    l.name.clone()
+                } else {
+                    label
+                }
+                .into(),
+            );
+            t.insert(
+                "description".into(),
+                format!("用户分库：{ds}/dicts/{}.dict.yaml", l.name).into(),
+            );
+            t.insert("path".into(), l.path.to_string_lossy().into_owned().into());
+            t.insert("type".into(), dict_type.clone().into());
+            t.insert("base_order".into(), (-3).into());
+            t.insert("enabled".into(), (!off.contains(&l.name)).into());
+            arr.push(toml::Value::Table(t));
         }
     }
 

@@ -81,13 +81,14 @@ fn open(tag: &str, history: bool) -> (Arc<Coordinator>, Arc<Store>) {
     (coord, store)
 }
 
-/// 逐键敲入：小写字母 / 数字原样，大写字母带 Shift，`_` `$` `{` `}` `.` `+` 按美式键位。
+/// 逐键敲入：小写字母 / 数字原样，大写字母带 Shift，`_` `-` `$` `{` `}` `.` `+` 按美式键位。
 fn type_str(coord: &Coordinator, s: &str) {
     for ch in s.chars() {
         let (vk, m) = match ch {
             'a'..='z' | '0'..='9' => ((ch.to_ascii_uppercase() as u32) & 0xFF, 0),
             'A'..='Z' => (ch as u32, MOD_SHIFT),
             '_' => (VK_OEM_MINUS, MOD_SHIFT),
+            '-' => (VK_OEM_MINUS, 0),
             '+' => (VK_OEM_PLUS, MOD_SHIFT),
             '.' => (VK_OEM_PERIOD, 0),
             '$' => (u32::from(b'4'), MOD_SHIFT),
@@ -151,6 +152,39 @@ fn literal_commit_is_remembered_and_recalled() {
         texts.iter().any(|t| t == "reset_time"),
         "打 res 应补出历史 reset_time，实际 {texts:?}"
     );
+}
+
+/// 纯小写前缀（文本透镜）下历史排在成员顺序里自己的位置：成员列表里排在拼音、英文前面，
+/// `reset_time` / `font-size` 打前缀即首位；排在末尾则被拼音、英文压到首页之外（论坛 t298）。
+#[test]
+fn text_lens_history_rank_follows_member_order() {
+    skip_without_data!();
+    for (tag, history_last) in [("rank_head", false), ("rank_tail", true)] {
+        let (coord, _store) = open_with(tag, |c| {
+            if history_last {
+                let m = &mut c.schema.mix_modes[0].members;
+                m.retain(|x| x != wind_quick_input::MEMBER_HISTORY);
+                m.push(wind_quick_input::MEMBER_HISTORY.to_string());
+            }
+        });
+        for word in ["reset_time", "font-size"] {
+            enter_quick(&coord);
+            type_str(&coord, word);
+            let act = coord.handle_key_event(&key(VK_RETURN, 0));
+            assert_eq!(committed(&act).as_deref(), Some(word), "前提");
+        }
+        for (prefix, word) in [("res", "reset_time"), ("font", "font-size")] {
+            enter_quick(&coord);
+            type_str(&coord, prefix);
+            let texts = coord.debug_page_texts();
+            coord.handle_key_event(&key(0x1B, 0));
+            assert_eq!(
+                texts.first().map(String::as_str) == Some(word),
+                !history_last,
+                "{tag}：{prefix} 首位，实际 {texts:?}"
+            );
+        }
+    }
 }
 
 /// 带符号的缓冲（Free 透镜）：历史排首位，空格上屏它并次数 +1；回车恒上屏原文。

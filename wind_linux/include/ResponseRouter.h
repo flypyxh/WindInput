@@ -106,6 +106,7 @@ private:
     void applyMarkedText(const std::string& text, size_t caretUtf16, TextSink* sink);
     void setCompositionRaw(const std::string& text, TextSink* sink);
     void flushPendingPrefix(TextSink* sink);
+    void clearPreeditIfAny(TextSink* sink);
     void absorbHeldIntoPrefix();
     std::string takePendingPrefix();
     void cancelHoldTimer() { ++holdGeneration_; }

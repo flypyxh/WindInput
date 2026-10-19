@@ -75,10 +75,7 @@ pub(crate) fn preserve_if_unparsable<T>(
         issues::report(
             doc.path(),
             IssueKind::Rebuilt {
-                kept_as: kept
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                kept_as: wind_userdata::text::fold::kept_as(&kept),
             },
         );
     }

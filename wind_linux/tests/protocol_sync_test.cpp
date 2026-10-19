@@ -70,20 +70,12 @@ int main()
     g_src = ss.str();
 
     CASE("ExtProtocol.h 的外部宿主专用 cmd 与 protocol.rs 一致");
-    SYNC("CMD_CANDIDATE_CONTEXT_MENU", windlinux::CMD_CANDIDATE_CONTEXT_MENU);
     SYNC("CMD_MENU_ACTION", windlinux::CMD_MENU_ACTION);
     SYNC("CMD_FRONT_CONTEXT", windlinux::CMD_FRONT_CONTEXT);
     SYNC("CMD_HOST_RENDER_FRAME", windlinux::CMD_HOST_RENDER_FRAME);
     SYNC("CMD_CANDIDATE_RECTS", windlinux::CMD_CANDIDATE_RECTS);
     SYNC("CMD_MODE_STATUS", windlinux::CMD_MODE_STATUS);
-    SYNC("CMD_CANDIDATE_MENU_FLAGS", windlinux::CMD_CANDIDATE_MENU_FLAGS);
     SYNC("CMD_MENU_SHOW", windlinux::CMD_MENU_SHOW);
-    SYNC("CMD_TOOLTIP_SHOW", windlinux::CMD_TOOLTIP_SHOW);
-    SYNC("CMD_TOOLTIP_HIDE", windlinux::CMD_TOOLTIP_HIDE);
-    SYNC("CMD_STATUS_SHOW", windlinux::CMD_STATUS_SHOW);
-    SYNC("CMD_STATUS_HIDE", windlinux::CMD_STATUS_HIDE);
-    SYNC("CMD_TOAST_SHOW", windlinux::CMD_TOAST_SHOW);
-    SYNC("CMD_TOAST_HIDE", windlinux::CMD_TOAST_HIDE);
     SYNC("CMD_KEY_TAP", windlinux::CMD_KEY_TAP);
     SYNC("CMD_KEY_SEQ", windlinux::CMD_KEY_SEQ);
     SYNC("CMD_KEY_HOLD", windlinux::CMD_KEY_HOLD);

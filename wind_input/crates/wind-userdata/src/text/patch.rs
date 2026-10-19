@@ -1,9 +1,11 @@
 //! 渲染与按行补丁写回（设计 §3.5 文本目标第 1 步）。
 //!
-//! 补丁只改被操作的行，其余字节（BOM、换行风格、注释、空行、行尾空白、自定义顺序）原样保留。
+//! 补丁只改被操作的行，其余字节（BOM、换行风格、注释、空行、行尾空白、自定义顺序）原样保留；
+//! 文件直接以 `---` 开头时最前面补一行说明（[`super::banner::prepend_if_bare`]）。
 //! 操作按给出顺序依次作用到「文件行 + 本轮新增行」的内存模型上，最后统一输出：
 //! - `Upsert`：已有同键行 ⇒ 第一行的权重取 `max(旧, 新)`（无权重列则不动），拼音文件里该行码
 //!   无空格（边界未知）而操作带边界时把码改写成带空格的；没有 ⇒ 追加到末尾；
+//! - `Insert`：没有同键行才追加，权重列留空（用户分库：没给权重就按方案默认）；有 ⇒ 空操作；
 //! - `Delete`：删所有同键行（含本轮新增的）；
 //! - `SetWeight`：只改第一行；早于文件修改时间的视为被手改覆盖，跳过；没有该行 ⇒ 空操作。
 //!
@@ -21,6 +23,11 @@ pub enum PatchOp {
         boundary: u64,
         weight: i32,
     },
+    Insert {
+        code: String,
+        text: String,
+        boundary: u64,
+    },
     Delete {
         code: String,
         text: String,
@@ -33,8 +40,10 @@ pub enum PatchOp {
     },
 }
 
-fn header(name: &str, syllable_codes: bool) -> String {
-    let mut h = format!("---\nname: {name}\ncolumns: [text, code, weight]\nwind:\n  kind: words\n");
+fn header(banner: &str, name: &str, syllable_codes: bool) -> String {
+    let mut h = format!(
+        "{banner}\n---\nname: {name}\ncolumns: [text, code, weight]\nwind:\n  kind: words\n"
+    );
     if syllable_codes {
         h.push_str("  code_spacing: syllable\n");
     }
@@ -43,9 +52,19 @@ fn header(name: &str, syllable_codes: bool) -> String {
     h
 }
 
-/// 整文件渲染（迁移 / 清空 / 导入 / 新建）：LF、无 BOM、`columns: [text, code, weight]`。
+/// 整文件渲染（迁移 / 清空 / 导入 / 新建）：说明行、LF、无 BOM、`columns: [text, code, weight]`。
 pub fn render(name: &str, syllable_codes: bool, rows: &[(String, String, u64, i32)]) -> String {
-    let mut s = header(name, syllable_codes);
+    render_with(super::banner::USER_DICT, name, syllable_codes, rows)
+}
+
+/// 同 [`render`]，说明行由调用方给（用户分库）。
+pub fn render_with(
+    banner: &str,
+    name: &str,
+    syllable_codes: bool,
+    rows: &[(String, String, u64, i32)],
+) -> String {
+    let mut s = header(banner, name, syllable_codes);
     for (code, text, boundary, weight) in rows {
         s.push_str(&wind_wdict::escape_text_field(text));
         s.push('\t');
@@ -62,7 +81,8 @@ struct Added {
     key: (String, String),
     code: String,
     boundary: u64,
-    weight: i32,
+    /// None：权重列留空（`Insert`）。
+    weight: Option<i32>,
     alive: bool,
 }
 
@@ -101,12 +121,39 @@ pub fn patch(
     new_file_name: &str,
     syllable_codes: bool,
 ) -> Result<Vec<u8>, ParseError> {
-    let fresh;
+    patch_with_banner(
+        original,
+        path,
+        lowercase,
+        ops,
+        file_mtime_secs,
+        new_file_name,
+        syllable_codes,
+        Some(super::banner::USER_DICT),
+    )
+}
+
+/// 同 [`patch`]；`banner` 为 None 时不给直接以 `---` 开头的文件补说明行（用户分库：用户自己
+/// 放进来的文件不动）。
+#[allow(clippy::too_many_arguments)]
+pub fn patch_with_banner(
+    original: &[u8],
+    path: &Path,
+    lowercase: bool,
+    ops: &[PatchOp],
+    file_mtime_secs: i64,
+    new_file_name: &str,
+    syllable_codes: bool,
+    banner: Option<&str>,
+) -> Result<Vec<u8>, ParseError> {
+    let fresh: std::borrow::Cow<[u8]>;
     let original: &[u8] = if original.is_empty() {
-        fresh = header(new_file_name, syllable_codes);
-        fresh.as_bytes()
+        let b = banner.unwrap_or(super::banner::USER_DICT);
+        fresh = header(b, new_file_name, syllable_codes).into_bytes().into();
+        &fresh
     } else {
-        original
+        fresh = super::banner::prepend_if_bare(original, banner);
+        &fresh
     };
     let dict = parse(original, path, lowercase)?;
     let s = std::str::from_utf8(original).map_err(|_| ParseError::NotUtf8)?;
@@ -134,6 +181,7 @@ pub fn patch(
     for op in ops {
         let (code, text) = match op {
             PatchOp::Upsert { code, text, .. }
+            | PatchOp::Insert { code, text, .. }
             | PatchOp::Delete { code, text }
             | PatchOp::SetWeight { code, text, .. } => (code, text),
         };
@@ -165,7 +213,7 @@ pub fn patch(
                     }
                     lines[i] = Some(line);
                 } else if let Some(a) = first_added {
-                    added[a].weight = added[a].weight.max(*weight);
+                    added[a].weight = Some(added[a].weight.map_or(*weight, |w| w.max(*weight)));
                     if added[a].boundary == 0 {
                         added[a].boundary = *boundary;
                     }
@@ -175,7 +223,19 @@ pub fn patch(
                         key,
                         code: flat,
                         boundary: *boundary,
-                        weight: *weight,
+                        weight: Some(*weight),
+                        alive: true,
+                    });
+                }
+            }
+            PatchOp::Insert { boundary, .. } => {
+                if first_line.is_none() && first_added.is_none() {
+                    added_at.insert(key.clone(), added.len());
+                    added.push(Added {
+                        key,
+                        code: flat,
+                        boundary: *boundary,
+                        weight: None,
                         alive: true,
                     });
                 }
@@ -202,7 +262,7 @@ pub fn patch(
                         lines[i] = Some(with_weight(line, wc, *weight));
                     }
                 } else if let Some(a) = first_added {
-                    added[a].weight = *weight;
+                    added[a].weight = Some(*weight);
                 }
             }
         }
@@ -235,8 +295,13 @@ pub fn patch(
             a.key.1.clone()
         };
         cols[layout.code_col] = wind_wdict::join_code_by_boundary(&a.code, a.boundary);
-        if let Some(wc) = layout.weight_col {
-            cols[wc] = a.weight.to_string();
+        if let (Some(wc), Some(w)) = (layout.weight_col, a.weight) {
+            cols[wc] = w.to_string();
+        }
+        // 权重留空且在末列：不留行尾的空列
+        let keep = layout.text_col.max(layout.code_col) + 1;
+        while cols.len() > keep && cols.last().is_some_and(String::is_empty) {
+            cols.pop();
         }
         rows.push(cols.join("\t"));
     }
@@ -266,6 +331,45 @@ mod tests {
             boundary: b,
             weight: w,
         }
+    }
+
+    /// 直接以 `---` 开头的文件补丁后多出的说明行。
+    fn banned(s: &str) -> String {
+        format!("{}\n{s}", crate::text::banner::USER_DICT)
+    }
+
+    /// `Insert`：没有同键行才追加且权重列留空；已有就不动（权重不改）。
+    #[test]
+    fn insert_appends_blank_weight_and_keeps_existing() {
+        let head = "---\nname: x\ncolumns: [text, code, weight]\n...\n工\ta\t5\n";
+        let ins = |code: &str, text: &str| PatchOp::Insert {
+            code: code.into(),
+            text: text.into(),
+            boundary: 0,
+        };
+        let out = |ops: &[PatchOp]| {
+            String::from_utf8(
+                patch_with_banner(
+                    head.as_bytes(),
+                    Path::new("x.dict.yaml"),
+                    false,
+                    ops,
+                    0,
+                    "x",
+                    false,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(out(&[ins("a", "工")]), head);
+        assert_eq!(out(&[ins("b", "式")]), format!("{head}式\tb\n"));
+        assert_eq!(
+            out(&[ins("b", "式"), up("b", "式", 0, 3)]),
+            format!("{head}式\tb\t3\n"),
+            "同轮再 Upsert 给了权重"
+        );
     }
 
     fn run(orig: &str, ops: &[PatchOp]) -> String {
@@ -320,7 +424,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "---\nwind:\n  code_spacing: syllable\n...\n好\thao\t1\n"
+            banned("---\nwind:\n  code_spacing: syllable\n...\n好\thao\t1\n")
         );
         let out = run(
             "---\n...\n好\thao\t1\n好\thao\t1\n",
@@ -331,7 +435,7 @@ mod tests {
                 ts_secs: 2_000,
             }],
         );
-        assert_eq!(out, "---\n...\n好\thao\t8\n好\thao\t1\n");
+        assert_eq!(out, banned("---\n...\n好\thao\t8\n好\thao\t1\n"));
     }
 
     #[test]
@@ -339,7 +443,7 @@ mod tests {
         let orig = "---\n...\n好\thao\t10\n";
         assert_eq!(
             run(orig, &[up("hao", "好", 0, 3)]),
-            orig,
+            banned(orig),
             "Upsert 取 max：旧 10 > 新 3 不变"
         );
         let stale = PatchOp::SetWeight {
@@ -350,7 +454,7 @@ mod tests {
         };
         assert_eq!(
             run(orig, &[stale]),
-            orig,
+            banned(orig),
             "早于文件 mtime 的 SetWeight 视为被手改覆盖"
         );
     }
@@ -375,8 +479,11 @@ mod tests {
             "多音节未知仍为 0；单个汉字由解析推断为单音节"
         );
         assert!(
-            out.starts_with("---\nname: pinyin.user\n"),
-            "空文件先渲染头"
+            out.starts_with(&format!(
+                "{}\n---\nname: pinyin.user\n",
+                crate::text::banner::USER_DICT
+            )),
+            "空文件先渲染说明行与头"
         );
     }
 
@@ -388,7 +495,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "---\nwind:\n  escape: true\n...\n好\thao\t1\nC:\\\\note\tcn\t1\n"
+            banned("---\nwind:\n  escape: true\n...\n好\thao\t1\nC:\\\\note\tcn\t1\n")
         );
     }
 
@@ -403,6 +510,40 @@ mod tests {
             s.contains("columns: [text, code, weight]") && s.contains("code_spacing: syllable")
         );
         assert!(s.ends_with("...\n# no comment\n你好\tni hao\t3\n"));
+        assert!(s.starts_with(&format!("{}\n---\n", crate::text::banner::USER_DICT)));
+    }
+
+    /// 说明行：直接以 `---` 开头的文件补上（行尾随文件）；第一行是注释（含用户自己的）或带 BOM ⇒ 原样不动。
+    #[test]
+    fn patch_keeps_the_first_line_as_is() {
+        let custom = "# 我自己的说明\n---\n...\n好\thao\t1\n";
+        assert_eq!(
+            run(custom, &[up("ni", "你", 0b1, 2)]),
+            "# 我自己的说明\n---\n...\n好\thao\t1\n你\tni\t2\n"
+        );
+        let bare = "---\n...\n好\thao\t1\n";
+        assert_eq!(
+            run(bare, &[up("ni", "你", 0b1, 2)]),
+            format!(
+                "{}\n---\n...\n好\thao\t1\n你\tni\t2\n",
+                crate::text::banner::USER_DICT
+            ),
+            "直接以 --- 开头的文件补上说明行"
+        );
+        let crlf = "---\r\n...\r\n好\thao\t1\r\n";
+        assert_eq!(
+            run(crlf, &[up("ni", "你", 0b1, 2)]),
+            format!(
+                "{}\r\n---\r\n...\r\n好\thao\t1\r\n你\tni\t2\r\n",
+                crate::text::banner::USER_DICT
+            ),
+            "CRLF 文件的说明行也用 CRLF"
+        );
+        let bom = "\u{feff}---\n...\n好\thao\t1\n";
+        assert!(
+            run(bom, &[up("ni", "你", 0b1, 2)]).starts_with("\u{feff}---\n"),
+            "带 BOM 不补"
+        );
     }
 
     /// 大批追加线性：6 万条新词一轮补丁（导入 / 迁移走这条）不能是平方级。
@@ -419,5 +560,38 @@ mod tests {
             t.elapsed()
         );
         assert_eq!(out.lines().filter(|l| l.contains('\t')).count(), 60_000);
+    }
+
+    /// 用户分库：整写用分库的说明行；删行补丁不给用户自己放进来的文件补说明行。
+    #[test]
+    fn lib_banner_on_render_and_untouched_on_patch() {
+        let banner = crate::text::banner::USER_DICT_LIB;
+        let out = render_with(
+            banner,
+            "\"成语\"",
+            false,
+            &[("a".into(), "工".into(), 0, 3)],
+        );
+        assert!(
+            out.starts_with(&format!("{banner}\n---\nname: \"成语\"\n")),
+            "{out}"
+        );
+        let orig = "---\n...\n工\ta\t3\n式\taa\t1\n";
+        let del = PatchOp::Delete {
+            code: "a".into(),
+            text: "工".into(),
+        };
+        let got = patch_with_banner(
+            orig.as_bytes(),
+            Path::new("x.dict.yaml"),
+            false,
+            &[del],
+            0,
+            "x",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "---\n...\n式\taa\t1\n");
     }
 }

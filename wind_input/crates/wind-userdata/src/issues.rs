@@ -13,6 +13,8 @@ pub enum IssueKind {
     Isolated,
     /// 坏文件已另存为 `kept_as` 并重建（机写文件从 `.bak` 恢复或从空开始；显式整体替换）。
     Rebuilt { kept_as: String },
+    /// 内容不合规、整份或部分被忽略（字符分类文件）；`message` 是给用户看的一句原因。
+    Invalid { message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,14 @@ pub fn report(path: &Path, kind: IssueKind) {
 
 pub fn clear(path: &Path) {
     lock().remove(path);
+}
+
+/// 只清掉该文件的「内容不合规」问题（校验通过时用；别的问题由各自的读写路径管）。
+pub fn clear_invalid(path: &Path) {
+    let mut g = lock();
+    if matches!(g.get(path), Some(IssueKind::Invalid { .. })) {
+        g.remove(path);
+    }
 }
 
 /// `root` 之下（按路径分量判断）的全部问题，按路径排序。
@@ -83,6 +93,33 @@ mod tests {
         clear(a);
         assert!(list_under(Path::new("/tmp/issues-t1")).is_empty());
         clear(b);
+    }
+
+    /// 只清「内容不合规」：同一文件的别的问题（已重建 / 隔离）留着。
+    #[test]
+    fn clear_invalid_keeps_other_kinds() {
+        let a = Path::new("/tmp/issues-t3/a");
+        report(
+            a,
+            IssueKind::Rebuilt {
+                kept_as: "x".into(),
+            },
+        );
+        clear_invalid(a);
+        assert_eq!(
+            list_under(a)[0].kind,
+            IssueKind::Rebuilt {
+                kept_as: "x".into()
+            }
+        );
+        report(
+            a,
+            IssueKind::Invalid {
+                message: "m".into(),
+            },
+        );
+        clear_invalid(a);
+        assert!(list_under(a).is_empty());
     }
 
     #[test]

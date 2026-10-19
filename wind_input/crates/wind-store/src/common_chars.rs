@@ -69,8 +69,8 @@ struct CommonFile {
     uncommon: Vec<String>,
 }
 
-const COMMON_HEADER: &str =
-    "# 常用字覆盖（WindInput 维护，可手改）：common = 强制常用，uncommon = 强制生僻\n";
+/// 说明行之后的字段提示。
+const COMMON_HELP: &str = "# common = 强制常用，uncommon = 强制生僻\n";
 
 fn parse_common(s: &str) -> anyhow::Result<BTreeMap<String, bool>> {
     if s.trim().is_empty() {
@@ -92,7 +92,7 @@ fn parse_common(s: &str) -> anyhow::Result<BTreeMap<String, bool>> {
     Ok(m)
 }
 
-fn render_common(m: &BTreeMap<String, bool>) -> String {
+pub(crate) fn render_common(m: &BTreeMap<String, bool>) -> String {
     let f = CommonFile {
         common: m
             .iter()
@@ -106,7 +106,8 @@ fn render_common(m: &BTreeMap<String, bool>) -> String {
             .collect(),
     };
     format!(
-        "{COMMON_HEADER}{}",
+        "{}\n{COMMON_HELP}{}",
+        wind_userdata::text::banner::COMMON_CHARS,
         serde_yaml::to_string(&f).unwrap_or_default()
     )
 }
@@ -129,6 +130,7 @@ impl Store {
     /// 读改写全部覆盖，一次提交；全空则删文件。文件解析不了 ⇒ Err、什么都不写（M-1）。
     fn modify_common(&self, f: &mut dyn FnMut(&mut BTreeMap<String, bool>)) -> anyhow::Result<()> {
         let doc = self.common_doc();
+        self.check_not_editing(doc.path())?;
         doc.modify(&mut |cur| {
             let mut m = cur
                 .map(parse_common)
@@ -201,6 +203,7 @@ impl Store {
 
     /// 清空全部覆盖（词库管理界面的「全部恢复出厂」）。返回清掉的条数。
     pub fn clear_common_char_overrides(&self) -> anyhow::Result<usize> {
+        self.check_not_editing(self.common_doc().path())?;
         let n = self.common_map().len();
         crate::last_good::preserve_if_unparsable(self.common_doc(), &parse_common)?;
         self.common_doc().replace(None)?;
@@ -253,7 +256,7 @@ mod tests {
         std::fs::write(&f, "common: [\n").unwrap();
         s.common_doc().sync();
         s.clear_common_char_overrides().unwrap();
-        let kept: Vec<_> = std::fs::read_dir(f.parent().unwrap())
+        let kept: Vec<_> = std::fs::read_dir(s.user_text_dir().join(".backup"))
             .unwrap()
             .flatten()
             .filter(|e| {

@@ -300,6 +300,36 @@ impl TextRenderer {
         font.ascent() + font.descent() + font.leading()
     }
 
+    /// 单行行高（像素）；字体度量取不到时回落 `size * 1.2`。多行排版逐行按它下移。
+    fn lines_height(&self, size: f32, font: &CTFont) -> f32 {
+        let h = Self::line_height(font) as f32;
+        if h > 0.0 { h } else { size * 1.2 }
+    }
+
+    /// 按 `\n` 硬换行的多行测量（与 DirectWrite 的 NO_WRAP、Linux 后端同口径：不自动折行，
+    /// 宽取最宽一行，高为行数 × 行高）。`line_width` 量单行宽。
+    fn measure_lines(
+        &self,
+        text: &str,
+        size: f32,
+        line_width: impl Fn(&str) -> f32,
+        font: &CTFont,
+    ) -> TextMetrics {
+        let lh = self.lines_height(size, font);
+        let mut width = 0f32;
+        let mut n = 0u32;
+        for (_, l) in line_offsets(text) {
+            n += 1;
+            if !l.is_empty() {
+                width = width.max(line_width(l));
+            }
+        }
+        TextMetrics {
+            width,
+            height: lh * n as f32,
+        }
+    }
+
     /// 测量文本。镜像 dwrite 的 `TextRenderer::measure`。
     pub fn measure(&self, text: &str, ts: &TextStyle) -> TextMetrics {
         if text.is_empty() {
@@ -309,6 +339,9 @@ impl TextRenderer {
             };
         }
         let font = self.font_styled(ts.size, ts.weight, ts.family);
+        if text.contains('\n') {
+            return self.measure_lines(text, ts.size, |l| self.measure(l, ts).width, &font);
+        }
         let line = make_line(text, &font, None);
         let b = line.get_typographic_bounds();
         // 行高取**基准字体**自身的度量，不取这一行的 typographic bounds：后者是行内所有
@@ -341,6 +374,22 @@ impl TextRenderer {
         let h = buf_height as usize;
         if buf.len() < w * h * 4 {
             return Err("buffer too small".into());
+        }
+        if text.contains('\n') {
+            let lh = self.lines_height(ts.size, &self.font_styled(ts.size, ts.weight, ts.family));
+            for (i, (_, l)) in line_offsets(text).enumerate() {
+                self.draw(
+                    buf,
+                    buf_width,
+                    buf_height,
+                    x,
+                    y + i as f32 * lh,
+                    l,
+                    ts,
+                    color,
+                )?;
+            }
+            return Ok(());
         }
         let font = self.font_styled(ts.size, ts.weight, ts.family);
         // color 为 [R,G,B,A]（与 palette/View 叶子色约定一致）；给 CGColor 真 R/G/B。
@@ -403,6 +452,24 @@ impl TextRenderer {
         color: [u8; 4],
         runs: &[ColorRun],
     ) -> Result<(), String> {
+        if text.contains('\n') {
+            let lh = self.lines_height(ts.size, &self.font_styled(ts.size, ts.weight, ts.family));
+            for (i, (off, l)) in line_offsets(text).enumerate() {
+                let sub = ColorRun::slice(runs, off, off + l.len());
+                self.draw_runs(
+                    buf,
+                    buf_width,
+                    buf_height,
+                    x,
+                    y + i as f32 * lh,
+                    l,
+                    ts,
+                    color,
+                    &sub,
+                )?;
+            }
+            return Ok(());
+        }
         let spans = utf16_runs(text, runs);
         if spans.is_empty() {
             return self.draw(buf, buf_width, buf_height, x, y, text, ts, color);
@@ -480,6 +547,14 @@ impl TextRenderer {
             };
         }
         let font = self.font_for(size);
+        if text.contains('\n') {
+            return self.measure_lines(
+                text,
+                size,
+                |l| self.measure_text_sized(l, size).width,
+                &font,
+            );
+        }
         let line = make_line(text, &font, None);
         let b = line.get_typographic_bounds();
         let height = Self::line_height(&font) as f32;
@@ -539,6 +614,22 @@ impl TextRenderer {
             return Err("buffer too small".into());
         }
 
+        if text.contains('\n') {
+            let lh = self.lines_height(size, &self.font_for(size));
+            for (i, (_, l)) in line_offsets(text).enumerate() {
+                self.draw_text_sized(
+                    buf,
+                    buf_width,
+                    buf_height,
+                    x,
+                    y + i as f32 * lh,
+                    l,
+                    size,
+                    color,
+                )?;
+            }
+            return Ok(());
+        }
         let font = self.font_for(size);
         // 文本前景色：入参 color 为 [R,G,B,A]（与 palette/View 叶子色约定一致，非 BGRA）。
         // CGBitmapContext 声明为 BGRA 内存序，CoreGraphics 据 bitmapInfo 自行落位，故这里给真 R/G/B。
@@ -578,6 +669,16 @@ impl TextRenderer {
         }
         Ok(())
     }
+}
+
+/// 按 `\n` 拆行，附带每行在原文里的字节起点（着色区间按它切分）。
+fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut off = 0usize;
+    text.split('\n').map(move |l| {
+        let at = off;
+        off += l.len() + 1;
+        (at, l)
+    })
 }
 
 /// 用给定字体（可选前景色）构造单行 CTLine。
@@ -818,5 +919,81 @@ mod tests {
             right.1 > 20 && right.1 > right.0 * 4,
             "右半应以蓝为主：{right:?}"
         );
+    }
+    /// `\n` 硬换行：高 = 行数 × 单行高，宽取最宽一行（悬停提示等多行文本依赖）。
+    #[test]
+    fn newline_stacks_lines_and_takes_widest() {
+        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
+        let ts = TextStyle::new(16.0);
+        let one = r.measure("你好世界啊", &ts);
+        let two = r.measure("你好世界啊\n你", &ts);
+        let three = r.measure("你好世界啊\n你\n", &ts);
+        assert!(
+            (two.height - one.height * 2.0).abs() < 0.5,
+            "两行高：{two:?} vs {one:?}"
+        );
+        assert!(
+            (three.height - one.height * 3.0).abs() < 0.5,
+            "末尾空行也占一行：{three:?}"
+        );
+        assert!(
+            (two.width - one.width).abs() < 0.5,
+            "宽取最宽一行：{two:?} vs {one:?}"
+        );
+    }
+
+    /// 第二行真画在第一行下面，而且分段颜色按行切分后各归各的行。
+    #[test]
+    fn newline_draws_second_line_below_with_its_own_colors() {
+        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
+        let ts = TextStyle::new(16.0);
+        let lh = r.measure("A", &ts).height;
+        let (w, h) = (96u32, (lh * 2.0).ceil() as u32 + 8);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        // "红\n蓝"：第一行红、第二行蓝（字节区间：红 0..3，\n 3..4，蓝 4..7）。
+        let runs = [
+            ColorRun {
+                start: 0,
+                end: 3,
+                rgba: [255, 0, 0, 255],
+            },
+            ColorRun {
+                start: 4,
+                end: 7,
+                rgba: [0, 0, 255, 255],
+            },
+        ];
+        r.draw_runs(
+            &mut buf,
+            w,
+            h,
+            4.0,
+            2.0,
+            "红\n蓝",
+            &ts,
+            [0, 0, 0, 255],
+            &runs,
+        )
+        .unwrap();
+        let (mut top, mut bottom) = ((0, 0), (0, 0));
+        for i in 0..(w * h) as usize {
+            let (b, red, a) = (buf[i * 4] as i32, buf[i * 4 + 2] as i32, buf[i * 4 + 3]);
+            if a == 0 {
+                continue;
+            }
+            let row = (i as u32 / w) as f32;
+            let side = if row < 2.0 + lh {
+                &mut top
+            } else {
+                &mut bottom
+            };
+            if red > b + 30 {
+                side.0 += 1;
+            } else if b > red + 30 {
+                side.1 += 1;
+            }
+        }
+        assert!(top.0 > 10 && top.1 == 0, "上半行应只有红：{top:?}");
+        assert!(bottom.1 > 10 && bottom.0 == 0, "下半行应只有蓝：{bottom:?}");
     }
 }

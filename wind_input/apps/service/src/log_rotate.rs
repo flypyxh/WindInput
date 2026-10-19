@@ -29,12 +29,14 @@
 //! 的文件名，[`SuffixScheme::scan_suffixes`] 决定启动时能认回哪些既存文件。只改前者
 //! 会让扫描认不出自己上次写的文件，旧日志既不参与序号推进也永不被淘汰，最终堆满目录。
 
+use file_rotate::compression::Compression;
 use file_rotate::suffix::{Representation, SuffixScheme};
-use file_rotate::{FileRotate, SuffixInfo};
+use file_rotate::{ContentLimit, FileRotate, SuffixInfo};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// 磁盘上「当前这次运行」那份日志的序号。历史从 `CURRENT_INDEX + 1` 起。
 ///
@@ -329,11 +331,117 @@ fn scan_disk_indices(parent: &Path, stem: &str, ext: &str) -> Vec<usize> {
         .collect()
 }
 
+/// 主日志的写端：在 `FileRotate` 外面包一层，让日志文件**被外部删掉或清空后能自己接回来**。
+///
+/// 日志目录是用户与设置页都会去清的地方（设置 › 高级 › 日志 › 清理，或在资源管理器里
+/// 整个删掉）。裸用 `FileRotate` 时两种删法都有后果：
+///
+/// - **删历史**（`.2.log` 起）：file-rotate 只在构造时扫一次磁盘记下有哪些序号，轮转时
+///   按记忆逐个后挪并 `assert!(old_path.exists())`。记忆里的文件没了 ⇒ 下一次轮转 panic，
+///   而 release 是 `panic = "abort"`——整个输入法服务崩掉。
+/// - **删当前**（`.1.log`）：句柄还吊着已摘名的文件，此后每一行都写进看不见的幽灵文件，
+///   直到重启。
+///
+/// 对策与 TSF 的 `CFileLogger::_ResyncFile` 同一思路：
+///
+/// - 轮转**由这里按大小触发**（内层用 `ContentLimit::None`），且每次轮转前重建内层——
+///   `FileRotate::new` 会重新扫描磁盘，记忆与磁盘一致，后挪就不会撞上不存在的文件。
+///   轮转十 MB 才一次，重扫的开销可以忽略。
+/// - 每 [`RESYNC_INTERVAL`] 对一次表：当前文件没了就重建内层（按原路径重开），还在就以
+///   真实大小校正计数（被清空时不至于提前轮转）。节流按时间而不是按行，安静时零开销。
+pub struct SelfHealingLog {
+    path: PathBuf,
+    max_files: usize,
+    max_bytes: u64,
+    inner: FileRotate<AppendCountBeforeExt>,
+    /// 当前文件已写字节数（轮转判据）。会被 [`Self::resync`] 校正为磁盘真实大小。
+    count: u64,
+    last_check: Instant,
+    check_interval: Duration,
+}
+
+/// 对表间隔。与 TSF 的 `FILE_CHECK_INTERVAL_MS` 同为一秒：被删后最多丢一秒的日志。
+pub const RESYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+impl SelfHealingLog {
+    /// 打开主日志并做一次启动轮转（见 [`rotate_on_startup`]）。
+    pub fn new(path: &Path, max_files: usize, max_bytes: u64) -> Self {
+        let mut inner = Self::open(path, max_files);
+        rotate_on_startup(&mut inner, path);
+        let mut log = Self {
+            path: path.to_path_buf(),
+            max_files,
+            max_bytes,
+            inner,
+            count: 0,
+            last_check: Instant::now(),
+            check_interval: RESYNC_INTERVAL,
+        };
+        log.resync();
+        log
+    }
+
+    fn open(path: &Path, max_files: usize) -> FileRotate<AppendCountBeforeExt> {
+        FileRotate::new(
+            path,
+            AppendCountBeforeExt::new(max_files),
+            ContentLimit::None,
+            Compression::None,
+            None,
+        )
+    }
+
+    /// 重建内层：重新扫描历史序号、按原路径重开当前文件（目录没了也会建回来）。
+    fn reopen(&mut self) {
+        self.inner = Self::open(&self.path, self.max_files);
+    }
+
+    fn resync(&mut self) {
+        self.last_check = Instant::now();
+        match std::fs::metadata(&self.path) {
+            Ok(m) => self.count = m.len(),
+            // 被删了（或 Windows 上处于删除挂起、拿不到属性）：按原路径重开。
+            Err(_) => {
+                self.reopen();
+                self.count = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+
+    fn rotate(&mut self) {
+        // 先重扫再轮转：磁盘上的历史可能刚被人删过，见类型文档。
+        self.reopen();
+        if self.inner.rotate().is_err() {
+            // 轮转失败时内层的文件句柄可能已被 take 掉，后续写入会静默落空；
+            // 重开一次，宁可这份文件超长也别丢日志。
+            self.reopen();
+        }
+        self.count = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+    }
+}
+
+impl io::Write for SelfHealingLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.last_check.elapsed() >= self.check_interval {
+            self.resync();
+        }
+        // 按整条日志判定，不像 file-rotate 那样把一行劈成两半写进两个文件。
+        if self.count > 0 && self.count + buf.len() as u64 > self.max_bytes {
+            self.rotate();
+        }
+        self.inner.write_all(buf)?;
+        self.count += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use file_rotate::ContentLimit;
-    use file_rotate::compression::Compression;
     use std::io::Write;
 
     /// 造一个已含内容的日志文件，模拟「上一次运行留下的日志」。
@@ -350,6 +458,99 @@ mod tests {
             Compression::None,
             None,
         )
+    }
+
+    /// 对表间隔为零的自愈写端，测试里每次写入都会对一次表。
+    fn healing(path: &Path, max_files: usize, max_bytes: u64) -> SelfHealingLog {
+        let mut log = SelfHealingLog::new(path, max_files, max_bytes);
+        log.check_interval = Duration::ZERO;
+        log
+    }
+
+    /// 清理删掉历史后照常轮转。裸 `FileRotate` 在这里会 `assert!(old_path.exists())`
+    /// 失败——core release 是 `panic = "abort"`，等于整个服务崩掉。
+    #[test]
+    fn rotation_survives_history_deleted_underneath() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.1.log");
+        let mut log = healing(&path, 10, 100);
+        for _ in 0..4 {
+            log.write_all(&[b'a'; 60]).unwrap();
+        }
+        assert!(dir.path().join("wind_input.3.log").exists());
+
+        for e in std::fs::read_dir(dir.path()).unwrap() {
+            std::fs::remove_file(e.unwrap().path()).unwrap();
+        }
+        for _ in 0..30 {
+            log.write_all(&[b'b'; 60]).unwrap();
+        }
+        assert!(path.exists());
+        assert!(dir.path().join("wind_input.2.log").exists());
+    }
+
+    /// 当前那份被删：按原路径重开，之后的日志写进看得见的新文件，而不是幽灵 inode。
+    #[test]
+    fn deleted_current_file_is_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.1.log");
+        let mut log = healing(&path, 10, 1024);
+        log.write_all(b"before\n").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        log.write_all(b"after\n").unwrap();
+        log.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+    }
+
+    /// 整个日志目录被删也能接回来（目录一并建回）。
+    #[test]
+    fn deleted_log_dir_is_recreated() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wind_input.1.log");
+        let mut log = healing(&path, 10, 1024);
+        log.write_all(b"before\n").unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        log.write_all(b"after\n").unwrap();
+        log.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+    }
+
+    /// 被清空后以真实大小重新计数：不会因为旧的累计值提前轮转出一个几乎空的历史份。
+    #[test]
+    fn truncation_resets_rotation_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.1.log");
+        let mut log = healing(&path, 10, 100);
+        log.write_all(&[b'a'; 90]).unwrap();
+
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        log.write_all(&[b'b'; 50]).unwrap();
+        assert!(!dir.path().join("wind_input.2.log").exists());
+    }
+
+    /// 一条日志不劈成两半：超限时整条进下一份。
+    #[test]
+    fn a_line_is_never_split_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.1.log");
+        let mut log = healing(&path, 10, 100);
+        log.write_all(&[b'a'; 80]).unwrap();
+        log.write_all(&[b'b'; 40]).unwrap();
+        log.flush().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("wind_input.2.log")).unwrap(),
+            vec![b'a'; 80]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'b'; 40]);
     }
 
     /// 主文件路径 = `wind_input.1.log`。内部序号 n 落到磁盘 n+1，且末尾那个 `.1`

@@ -530,10 +530,6 @@ pub trait MessageHandler: Send + Sync {
     /// darwin: .app 回传统一菜单项选择（菜单 id）。默认空。
     fn handle_menu_action_id(&self, _id: i32) {}
 
-    /// darwin: .app 候选右键上下文菜单动作（页内下标 + 动作串）。
-    /// action ∈ {move_top, move_up, move_down, delete, reset_default, copy}。默认空。
-    fn handle_candidate_context_menu(&self, _page_local_index: i32, _action: &str) {}
-
     /// darwin: .app 上报前台上下文（app bundle id / 窗口标题 / 选中文本），供命令直通车
     /// app()/title()/sel() 取值。聚焦时快照，缺 AX/IMKit 支持的字段为空串。默认空实现。
     fn handle_front_context(&self, _app: &str, _title: &str, _sel: &str) {}

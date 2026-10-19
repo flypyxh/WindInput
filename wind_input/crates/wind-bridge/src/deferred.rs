@@ -109,12 +109,6 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_candidate_hover(page_local_index))
     }
 
-    fn handle_candidate_context_menu(&self, page_local_index: i32, action: &str) {
-        self.with_handler((), |h| {
-            h.handle_candidate_context_menu(page_local_index, action)
-        })
-    }
-
     fn handle_front_context(&self, app: &str, title: &str, sel: &str) {
         self.with_handler((), |h| h.handle_front_context(app, title, sel))
     }

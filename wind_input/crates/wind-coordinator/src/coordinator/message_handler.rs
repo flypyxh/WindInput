@@ -213,10 +213,10 @@ impl Coordinator {
 
 /// 宿主报来的屏幕坐标的钳制范围。±2^24 远超任何真实屏幕，又给菜单定位里的「坐标 + 宽高」
 /// 留足 i32 余量：任意 i32 原样进去，`popup_menu` 的定位加法在 dev 构建溢出 panic、release 回绕。
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 const HOST_COORD_LIMIT: i32 = 1 << 24;
 
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 fn clamp_host_coord(v: i32) -> i32 {
     v.clamp(-HOST_COORD_LIMIT, HOST_COORD_LIMIT)
 }
@@ -226,7 +226,7 @@ fn clamp_host_coord(v: i32) -> i32 {
 /// 工作区」（全 0）处理——菜单仍能弹，只是不做翻转，越界交给 addon 那边看得见的溢出。
 /// `lx`/`ly`（右键点在悬停提示位图内的坐标）只有悬停提示菜单带，缺了按 `None`。
 /// 坐标一律钳到 [`HOST_COORD_LIMIT`] 以内。
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 fn decode_menu_open(body: &[u8]) -> Option<crate::handle_menu::MenuOpenRequest> {
     use crate::handle_menu::MenuOpenRequest;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -334,57 +334,6 @@ fn host_render_placed_log(body: &[u8]) -> Option<(bool, String)> {
         "（候选窗句柄已失效，已重建）"
     });
     Some((band_was_wrong, line))
-}
-
-/// `shot.result` → Toast 文案。
-///
-/// 抽成纯函数是为了可测：这里全是措辞分支，而措辞正是**必须与 Windows 侧
-/// `manager.rs` 逐字一致**的东西——两平台同一操作得到不同说法是最没必要的分叉，
-/// 而这种分叉不会有任何编译或运行期信号。
-fn shot_result_message(v: &serde_json::Value) -> (String, ToastKind) {
-    let results = v.get("results").and_then(|r| r.as_array());
-    let ok = |r: &serde_json::Value| r.get("ok").and_then(|b| b.as_bool()) == Some(true);
-    if v.get("mode").and_then(|m| m.as_str()) == Some("all") {
-        // 「截图所有窗口」：本进程截的候选窗数量由请求原样带回，与 `.app` 这边的成功数
-        // 相加，合成**一条** Toast（各弹各的会连弹三四条）。
-        let n = v.get("already").and_then(|n| n.as_u64()).unwrap_or(0) as usize
-            + results.map_or(0, |a| a.iter().filter(|r| ok(r)).count());
-        let dir = v.get("dir").and_then(|d| d.as_str()).unwrap_or("");
-        if n == 0 {
-            return ("没有可见窗口可截图".to_string(), ToastKind::Info);
-        }
-        return if v.get("already_clipboard").and_then(|b| b.as_bool()) == Some(true) {
-            (
-                format!("已保存 {n} 张截图（候选已复制到剪贴板）\n{dir}"),
-                ToastKind::Success,
-            )
-        } else {
-            (format!("已保存 {n} 张截图\n{dir}"), ToastKind::Success)
-        };
-    }
-    // 单窗截图（气泡/提示自身右键菜单里的「截图此窗口」）。
-    let Some(r) = results.and_then(|a| a.first()) else {
-        return ("截图失败：无结果".to_string(), ToastKind::Error);
-    };
-    let label = match r.get("target").and_then(|t| t.as_str()) {
-        Some("tooltip") => "悬停提示",
-        _ => "状态提示气泡",
-    };
-    if ok(r) {
-        let path = r.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        let suffix = if r.get("clipboard").and_then(|b| b.as_bool()) == Some(true) {
-            "（已复制到剪贴板）"
-        } else {
-            ""
-        };
-        (format!("{label}已截图{suffix}\n{path}"), ToastKind::Success)
-    } else {
-        match r.get("reason").and_then(|x| x.as_str()) {
-            // 不可见不是错误：用户在气泡消失之后才点的菜单，如实告知即可。
-            Some("not_visible") | None => (format!("{label}未显示，无法截图"), ToastKind::Info),
-            Some(e) => (format!("截图失败：{e}"), ToastKind::Error),
-        }
-    }
 }
 
 impl MessageHandler for Coordinator {
@@ -622,28 +571,20 @@ impl MessageHandler for Coordinator {
                 }
                 None => tracing::warn!("host.display 载荷无法解析，忽略"),
             },
-            // 原生浮窗截图的结果（`.app` 动手，服务端只管文案）。
             // Windows TSF：host render 候选窗落位诊断（SearchHost 写不了 tsf_log，只能看这条）。
             ext_kind::DIAG_HOST_RENDER_PLACED => match host_render_placed_log(body) {
                 Some((true, line)) => tracing::warn!("{line}"),
                 Some((false, line)) => tracing::info!("{line}"),
                 None => tracing::warn!("diag.host_render_placed 载荷无法解析，忽略"),
             },
-            ext_kind::SHOT_RESULT => match serde_json::from_slice(body) {
-                Ok(v) => {
-                    let (msg, kind) = shot_result_message(&v);
-                    self.show_toast(&msg, ToastPosition::BottomRight, kind);
-                }
-                Err(e) => tracing::warn!("shot.result 载荷无法解析：{e}"),
-            },
             // Linux addon：右键候选 / 候选窗空白处 / Fcitx5 状态区入口请求打开自绘菜单。
-            #[cfg(all(target_os = "linux", ext_presenter))]
+            #[cfg(ext_presenter)]
             ext_kind::MENU_OPEN => match decode_menu_open(body) {
                 Some(req) => self.open_menu_from_host(req),
                 None => tracing::warn!("menu.open 载荷无法解析，忽略"),
             },
             // Linux addon：菜单被 addon 自己收掉了（超时 / 失焦 / 服务重启 / 抓不住指针…）。
-            #[cfg(all(target_os = "linux", ext_presenter))]
+            #[cfg(ext_presenter)]
             ext_kind::MENU_DISMISS => {
                 let why = serde_json::from_slice::<serde_json::Value>(body)
                     .ok()
@@ -655,49 +596,10 @@ impl MessageHandler for Coordinator {
         }
     }
 
-    /// macOS `.app` 候选右键动作：动作串 → 词条操作/复制，作用于页内下标候选。
-    fn handle_candidate_context_menu(&self, page_local_index: i32, action: &str) {
-        use wind_ui_types::{CandidateOp, UiCommand};
-        if page_local_index < 0 {
-            return;
-        }
-        let page_local = page_local_index as usize;
-        let op = match action {
-            "move_top" => CandidateOp::MoveTop,
-            "move_up" => CandidateOp::MoveUp,
-            "move_down" => CandidateOp::MoveDown,
-            "delete" => CandidateOp::Delete,
-            "reset_default" => CandidateOp::Reset,
-            "copy" => {
-                // 解析页内下标对应候选文本，交 UI 侧写剪贴板（macOS 走 popup_menu::set_clipboard_text）。
-                let text = {
-                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    let (start, end) = self.page_range(&state);
-                    let idx = start + page_local;
-                    if idx < end && idx < state.candidates.len() {
-                        state.candidates[idx].text.clone()
-                    } else {
-                        String::new()
-                    }
-                };
-                if !text.is_empty() {
-                    let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
-                }
-                return;
-            }
-            other => {
-                tracing::debug!("handle_candidate_context_menu: 未知动作 {}", other);
-                return;
-            }
-        };
-        // 与 Windows / Linux 右键同一条分发：格式候选走格式调整、历史候选走删除历史，其余走词库。
-        self.candidate_or_quick_format_op(op, page_local);
-    }
-
     /// Linux addon 报来的菜单指针事件（按键号：1 左 / 2 中 / 3 右）。菜单已关还收到事件 =
     /// 两端认识错开（addon 还挂着上一帧），让 UI 收菜单、补推隐藏帧。
     fn handle_menu_pointer(&self, event: u32, button: u32, x: i32, y: i32) {
-        #[cfg(all(target_os = "linux", ext_presenter))]
+        #[cfg(ext_presenter)]
         {
             use wind_ipc::protocol::menu_pointer::*;
             use wind_ui_types::{MenuPointerEvent as E, UiCommand};
@@ -720,25 +622,25 @@ impl MessageHandler for Coordinator {
                 y: clamp_host_coord(y),
             });
         }
-        #[cfg(not(all(target_os = "linux", ext_presenter)))]
+        #[cfg(not(ext_presenter))]
         let _ = (event, button, x, y);
     }
 
     /// Linux：addon 的请求连接断了。菜单若开着，没人会再报关闭——就地复位，免得下一个
     /// addon 实例（fcitx5 重启）送来的方向键 / 回车 / Esc 被一个不存在的菜单吞掉。
     fn handle_client_disconnected(&self) {
-        #[cfg(all(target_os = "linux", ext_presenter))]
+        #[cfg(ext_presenter)]
         if self.is_menu_open() {
             self.menu_dismissed_by_host("addon 连接断开");
         }
     }
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {
-        // 弹出菜单窗口 (popup_menu.rs / ShowCandidateMenu·MenuKey·HideMenu UiCommand) 是
-        // Windows 专有；macOS 由 IMK 原生 NSMenu 渲染菜单 (InputController.menu())。
-        // macOS 上 IMK 频繁调 menu() → Swift 发 CMD_SHOW_CONTEXT_MENU 仅为「查询菜单项」，
-        // 若在此调 show_main_menu 会把协调器置 menu_open=true 并经 forward_menu_key 吞掉后续
-        // 所有按键，而 macOS 无弹窗、永不回 MenuClose → 输入被永久卡死 (打字无响应)。
+        // 自绘菜单（popup_menu.rs / ShowCandidateMenu·MenuKey·HideMenu UiCommand）在 Windows 由本
+        // 命令弹出；外部宿主（Linux addon / macOS `.app`）走 `menu.open` 扩展信封。macOS 上 IMK
+        // 频繁调 `menu()` → Swift 发 CMD_SHOW_CONTEXT_MENU 仅为「查询菜单项」（系统输入源菜单是原生
+        // NSMenu），若在此调 show_main_menu 会把协调器置 menu_open=true 并经 forward_menu_key 吞掉
+        // 后续按键，而此时没有任何自绘菜单窗口、永不回 MenuClose → 输入被卡死 (打字无响应)。
         #[cfg(not(ext_presenter))]
         self.show_main_menu(wind_ui_types::MenuAnchor::at_point(x, y));
         #[cfg(ext_presenter)]
@@ -1219,11 +1121,9 @@ impl MessageHandler for Coordinator {
         }
 
         // ── 右键菜单打开时：方向键/回车/ESC 由菜单消费（优先于一切）──
-        // 菜单由服务自绘的两种形态：Windows 进程内窗口、Linux 光栅帧交 addon 贴图（二者同一份
-        // `popup_menu`）。macOS 用 IMK 原生菜单自行消费键，协调器不应吞键 (否则 menu_open 一旦
-        // 被置真会永久卡死输入，见 handle_show_context_menu)。Linux 的各条关闭路径见
-        // docs/design/linux-port.md §7。
-        #[cfg(any(not(ext_presenter), target_os = "linux"))]
+        // 菜单由服务自绘的两种形态：Windows 进程内窗口、光栅帧交宿主（macOS `.app` / Linux
+        // addon）贴图（同一份 `popup_menu`）。宿主形态下 menu_open 一旦被置真而窗口没了，输入会被
+        // 永久吞键卡死，各条关闭路径与自愈见 docs/design/linux-port.md §7。
         if self.is_menu_open() && self.forward_menu_key(data.key_code) {
             return KeyAction::Consumed;
         }
@@ -1650,6 +1550,15 @@ impl MessageHandler for Coordinator {
             // Escape：取消整个组合（含已转换前缀），不上屏。实现收口在 `cancel_session`
             // ——`keys.session_actions` 里绑 `cancel` 的键走的是同一个函数，两条通路
             // 行为必然一致。
+            //
+            // 没有会话（也没挂着待定标点）时交还宿主：Linux / macOS 没有 TSF 那道前置闸门，
+            // 每个键都会到这里，空闲 Esc 若照样回 ClearComposition 就被吞掉（GH#209：
+            // 浏览器 Vimium 收不到 Esc）。
+            keymap::VK_ESCAPE
+                if !Self::has_input_session(&state) && self.live_held_text().is_none() =>
+            {
+                KeyAction::PassThrough
+            }
             keymap::VK_ESCAPE => self.cancel_session(&mut state),
             keymap::VK_BACK => {
                 // 联想态：收掉候选并结束占位组合。**必须先于下面的既有分支**——那些分支
@@ -1772,8 +1681,11 @@ impl MessageHandler for Coordinator {
                     // 内建默认仅全角态转全角空格 U+3000，对齐设置端展示基线与微软拼音）。
                     // 流水线原样返回 " " 时（半角态无自定义）维持透传，保留宿主对
                     // 空格键的原生语义（如网页滚动）。
+                    //
+                    // DLL 据 `space_custom_cols` 吃下的空格则必须出字：并集掩码可能比当前方案
+                    // 宽，产物仍是 " " 时透传就成了吃了再吐（t337）。
                     let text = self.convert_punct(&state, ' ', data.prev_char);
-                    if text == " " {
+                    if text == " " && !self.idle_space_eaten(&state) {
                         return KeyAction::PassThrough;
                     }
                     self.record_commit(&text, 0, -1, CommitSource::Punctuation);
@@ -2071,6 +1983,9 @@ impl MessageHandler for Coordinator {
                                 let buf = state.input_buffer.clone();
                                 (CandidateSource::default(), buf, text.clone())
                             });
+                        // `6a-draft`：满码自动上屏 / 空码顶出同样算「用过」→ 草稿转正。
+                        // 与 `coordinator.rs` 那处 AutoCommit 同口径，判据见 `commit_top_text`。
+                        self.promote_draft_on_auto_commit(&state, &text, &code);
                         let out = self
                             .commit_candidate(&mut state, &text, &freq_text, None, source, &code);
                         // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
@@ -2891,7 +2806,7 @@ impl MessageHandler for Coordinator {
                 // HideCandidates 无条件隐藏菜单窗口，此时若把 menu_open 留成 true，就成了
                 // 「窗口没了、键还被吞」的状态不一致——比守卫失效更糟。
                 s.menu_open = false;
-                #[cfg(all(target_os = "linux", ext_presenter))]
+                #[cfg(ext_presenter)]
                 self.hide_menu_ui_unlocked();
                 s.menu_opened_at = None;
                 self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
@@ -3123,7 +3038,7 @@ impl MessageHandler for Coordinator {
             s.preedit.clear();
             s.candidates.clear();
             s.menu_open = false;
-            #[cfg(all(target_os = "linux", ext_presenter))]
+            #[cfg(ext_presenter)]
             self.hide_menu_ui_unlocked();
             s.menu_opened_at = None;
             self.reset_exclusive_modes(&mut s); // 切走本输入法时丢弃独占模式残留
@@ -3338,7 +3253,7 @@ impl MessageHandler for Coordinator {
         // 复位菜单状态：点击别处会终止 composition 并经 notify_ui_hide 隐藏菜单窗口，
         // 但若不清 menu_open，下一个键会被 forward_menu_key 当作菜单键吞掉（首字符失效）。
         state.menu_open = false;
-        #[cfg(all(target_os = "linux", ext_presenter))]
+        #[cfg(ext_presenter)]
         self.hide_menu_ui_unlocked();
         drop(state);
         self.clear_pair_tracker(); // 组合意外终止：配对上下文失效，清栈防跳出键误判
@@ -4840,66 +4755,6 @@ mod ext_envelope_tests {
         assert_eq!(c.state.lock().unwrap().selected_index, 0);
     }
 
-    /// 「截图所有窗口」：两侧数量相加，合成一条 Toast。
-    ///
-    /// 分开弹是最容易写出来的实现，也是最烦人的——候选窗 + 气泡 + 提示 + Toast 全可见时
-    /// 会连弹四条通知。`already` 由服务端放进请求、`.app` 原样带回，就是为了不为这一次
-    /// 往返在任何一边留状态。
-    #[test]
-    fn shot_all_sums_both_sides_into_one_message() {
-        let v = serde_json::json!({
-            "mode": "all",
-            "dir": "/tmp/shots",
-            "already": 1,                    // 候选窗（服务进程截的）
-            "already_clipboard": true,
-            "results": [
-                {"target": "status_tip", "ok": true},
-                {"target": "tooltip", "ok": false, "reason": "not_visible"},
-                {"target": "toast", "ok": true},
-            ],
-        });
-        let (msg, kind) = super::shot_result_message(&v);
-        assert_eq!(msg, "已保存 3 张截图（候选已复制到剪贴板）\n/tmp/shots");
-        assert!(matches!(kind, ToastKind::Success));
-    }
-
-    /// 一个都没截到不是错误：用户可能就是在没有任何浮窗时点的菜单。
-    #[test]
-    fn shot_all_with_nothing_visible_is_info() {
-        let v = serde_json::json!({
-            "mode": "all", "already": 0, "dir": "/tmp",
-            "results": [{"target": "status_tip", "ok": false, "reason": "not_visible"}],
-        });
-        let (msg, kind) = super::shot_result_message(&v);
-        assert_eq!(msg, "没有可见窗口可截图");
-        assert!(matches!(kind, ToastKind::Info));
-    }
-
-    /// 单窗截图的三种结局：成功带路径、不可见（Info 不是 Error）、真失败。
-    #[test]
-    fn shot_single_wording_by_outcome() {
-        let mk = |r: serde_json::Value| {
-            super::shot_result_message(&serde_json::json!({ "results": [r] }))
-        };
-        let (msg, kind) = mk(serde_json::json!({
-            "target": "tooltip", "ok": true, "clipboard": true, "path": "/tmp/t.png"
-        }));
-        assert_eq!(msg, "悬停提示已截图（已复制到剪贴板）\n/tmp/t.png");
-        assert!(matches!(kind, ToastKind::Success));
-
-        let (msg, kind) = mk(serde_json::json!({
-            "target": "status_tip", "ok": false, "reason": "not_visible"
-        }));
-        assert_eq!(msg, "状态提示气泡未显示，无法截图");
-        assert!(matches!(kind, ToastKind::Info), "不可见不该报成错误");
-
-        let (msg, kind) = mk(serde_json::json!({
-            "target": "status_tip", "ok": false, "reason": "render_failed"
-        }));
-        assert_eq!(msg, "截图失败：render_failed");
-        assert!(matches!(kind, ToastKind::Error));
-    }
-
     /// 缺字段 / 非整数 / 越界 / 不是 JSON —— 一律 None。
     ///
     /// 关键在于**不能取 0 兜底**：`(0, 0)` 会被当成合法坐标落盘成 custom_x/y，
@@ -5258,7 +5113,7 @@ mod commit_newline_action_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux", ext_presenter))]
+#[cfg(all(test, ext_presenter))]
 mod menu_open_decode_tests {
     use super::*;
     use crate::handle_menu::MenuOpenRequest;

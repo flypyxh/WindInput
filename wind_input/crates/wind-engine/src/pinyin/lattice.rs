@@ -1021,7 +1021,8 @@ impl LatticeBuilder {
             }
             for (q, variant, mask, offsets, edits) in &next {
                 // 全原音节组合 = 所打码本身，已由精确分支处理（且带真值边界校验）。
-                if *edits > 0 {
+                // 按码比而不按处数：双拼同键音节计 0 处，却不是所打码。
+                if variant != &input[p..*q] {
                     spans.entry((*q, variant.clone())).or_default().push((
                         *mask,
                         offsets.clone(),

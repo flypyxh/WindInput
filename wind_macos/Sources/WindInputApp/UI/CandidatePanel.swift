@@ -14,42 +14,6 @@ import WindInputKit
 //   mouseDown 命中 → onSelect(pageLocalIndex)。nonactivating panel 仍收 mouseDown,
 //   acceptsFirstMouse=true 让首次点击 (panel 非 key 时) 也生效。
 
-/// 候选框右键菜单的「焦点闪断期」。
-///
-/// `NSMenu.popUp` 会向 WindowServer 申请 stealKeyFocus：菜单跟踪期间键盘焦点被菜单拿走，
-/// 收起时再还回去。普通前台 app（Edge 等）不受影响，但 Spotlight / 「应用程序」列表搜索
-/// 这类靠 keyThief 拿焦点的宿主会因此被 IMK 连发「Deactivate → Activate」——弹出时一对，
-/// 收起后约 10ms 又一对（2026-09-28 系统日志实测）。若照常处理 Deactivate（清 marked text
-/// + FocusLost），服务端就把候选收掉，菜单挂在候选窗上也跟着消失。
-/// InputController 据此把这段时间里的 Deactivate 延后，见 `deactivateServer`。
-enum CandidateMenuTracking {
-    /// 菜单收起后仍算闪断期的时长：收起后那对 Deactivate/Activate 实测晚 5~10ms 到。
-    /// 别放太宽——这段时间里真实的失焦（收起菜单后立刻切走）也会被延后到它结束才处理。
-    static let trailingGrace: TimeInterval = 0.15
-    /// 仅主线程访问（popUp 在主线程同步跑完整个跟踪循环，IMK 回调也在主线程）。
-    private(set) static var isTracking = false
-    private static var endedAt: TimeInterval?   // 单调时钟（systemUptime），不受改系统时间影响
-
-    static var inFocusBlip: Bool {
-        if isTracking { return true }
-        guard let t = endedAt else { return false }
-        return ProcessInfo.processInfo.systemUptime - t < trailingGrace
-    }
-
-    /// 菜单收起且尾随闪断也过去后回调（主线程）。由 CandidatePanelHost 接到当前 controller。
-    static var didSettle: (() -> Void)?
-
-    static func popUp(_ menu: NSMenu, at point: NSPoint, in view: NSView) {
-        isTracking = true
-        defer {
-            isTracking = false
-            endedAt = ProcessInfo.processInfo.systemUptime
-            DispatchQueue.main.asyncAfter(deadline: .now() + trailingGrace) { didSettle?() }
-        }
-        menu.popUp(positioning: nil, at: point, in: view)
-    }
-}
-
 /// 自绘候选框 bitmap + 处理鼠标命中的内容视图。
 final class CandidateContentView: NSView {
     private var image: NSImage?
@@ -57,11 +21,11 @@ final class CandidateContentView: NSView {
     /// 无悬停哨兵：须区别于翻页器 hover(-1 上页 / -2 下页)，故不能复用 -1。
     static let noHover = Int(Int32.min)
     private var lastHover: Int = CandidateContentView.noHover
-    private var ctxIndex: Int = -1     // 当前右键菜单针对的候选页内索引
-    private var menuFlags: [UInt8] = [] // 每候选右键菜单禁用位 (0x01上移 0x02下移 0x04置顶 0x08删除 0x10恢复默认)
     var onSelect: ((Int) -> Void)?
     var onHover: ((Int) -> Void)?
-    var onContextAction: ((Int, String) -> Void)? // (pageLocalIndex, action)
+    /// 右键：候选上 → 该候选页内下标（≥0）；空白 / 翻页区 → -1（主菜单）。菜单由服务端自绘，
+    /// 这里只报「在哪个目标上右键」，见 `OverlayHost.requestMenu`。
+    var onContextMenu: ((Int) -> Void)?
     var onScroll: ((Int32) -> Void)?              // 滚轮 (delta, WHEEL_DELTA 倍数, 正=上滚)
     var onDragMoved: (() -> Void)?                // 拖动进行中 (每次位移后)
     var onDragEnded: (() -> Void)?                // 空白区拖动松手 (整窗已移到新位置)
@@ -77,10 +41,6 @@ final class CandidateContentView: NSView {
     private static let dragThreshold: CGFloat = 3
     /// 按下时命中的候选/翻页键。选词等到**松开**且仍落在同一项上才发, 见 `mouseUp`。
     private var pressedIndex: Int?
-    var unifiedMenuProvider: (() -> [MenuItemData]?)? // 空白处右键: 取统一菜单树
-    var onUnifiedAction: ((Int) -> Void)?             // 统一菜单项点击 (menu item id)
-    private let unifiedMenuBuilder = UnifiedMenuBuilder() // 与菜单栏共用的统一菜单构建器 (须持有: 作为叶子项 target)
-
     override var isFlipped: Bool { true } // top-left 原点, 与 wire/rects 坐标系一致
 
     func update(image: NSImage, rects: [CandidateHitRect]) {
@@ -94,9 +54,16 @@ final class CandidateContentView: NSView {
         self.hitRects = rects
     }
 
-    /// 更新右键菜单禁用位 (每候选 1 字节)。
-    func setMenuFlags(_ flags: [UInt8]) {
-        self.menuFlags = flags
+    /// 屏幕点是否落在本视图内、以及命中的候选页内下标（翻页键 / 空白 → -1）。
+    /// 离开悬停提示后重定悬停用：指针此刻在不在候选窗上、在哪一项上。
+    func hover(atScreen p: NSPoint, in window: NSWindow) -> (inside: Bool, index: Int) {
+        let winPt = window.convertFromScreen(NSRect(origin: p, size: .zero)).origin
+        let v = convert(winPt, from: nil)
+        guard bounds.contains(v) else { return (false, -1) }
+        for r in hitRects where r.contains(px: v.x, py: v.y) {
+            return (true, Int(r.index) >= 0 ? Int(r.index) : -1)
+        }
+        return (true, -1)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -181,40 +148,12 @@ final class CandidateContentView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        // 候选 (index>=0): 候选上下文菜单; 空白/翻页区: 统一主菜单 (方案/主题/简繁/设置…)。
-        guard let idx = hitIndex(event), idx >= 0 else {
-            if let items = unifiedMenuProvider?(), !items.isEmpty {
-                let menu = unifiedMenuBuilder.build(items, dispatch: .inProcess { [weak self] id in self?.onUnifiedAction?(id) })
-                CandidateMenuTracking.popUp(menu, at: convert(event.locationInWindow, from: nil), in: self)
-            }
-            return
-        }
-        ctxIndex = idx
-        let f: UInt8 = idx < menuFlags.count ? menuFlags[idx] : 0
-        let menu = NSMenu()
-        menu.autoenablesItems = false // 用我们显式的 isEnabled (按候选禁用位), 不让 AppKit 自动判定
-        addContextItem(menu, "置顶", "move_top", disabled: f & 0x04 != 0)
-        addContextItem(menu, "上移", "move_up", disabled: f & 0x01 != 0)
-        addContextItem(menu, "下移", "move_down", disabled: f & 0x02 != 0)
-        menu.addItem(.separator())
-        addContextItem(menu, "删除", "delete", disabled: f & 0x08 != 0)
-        addContextItem(menu, "恢复默认", "reset_default", disabled: f & 0x10 != 0)
-        menu.addItem(.separator())
-        addContextItem(menu, "复制", "copy", disabled: false)
-        CandidateMenuTracking.popUp(menu, at: convert(event.locationInWindow, from: nil), in: self)
-    }
-
-    private func addContextItem(_ menu: NSMenu, _ title: String, _ action: String, disabled: Bool) {
-        let item = NSMenuItem(title: title, action: #selector(contextMenuAction(_:)), keyEquivalent: "")
-        item.target = self
-        item.representedObject = action
-        item.isEnabled = !disabled
-        menu.addItem(item)
-    }
-
-    @objc private func contextMenuAction(_ sender: NSMenuItem) {
-        if let action = sender.representedObject as? String {
-            onContextAction?(ctxIndex, action)
+        // 候选 (index>=0): 候选右键菜单; 空白/翻页区: 主菜单 (方案/主题/简繁/设置…)。
+        // 两者都由服务端自绘（与 Windows / Linux 同一份），这里只报目标。
+        if let idx = hitIndex(event), idx >= 0 {
+            onContextMenu?(idx)
+        } else {
+            onContextMenu?(-1)
         }
     }
 
@@ -271,20 +210,10 @@ final class CandidatePanel: NSPanel {
         get { content.onHover }
         set { content.onHover = newValue }
     }
-    /// 右键菜单动作回调 (pageLocalIndex, action)。
-    var onContextAction: ((Int, String) -> Void)? {
-        get { content.onContextAction }
-        set { content.onContextAction = newValue }
-    }
-    /// 空白处右键的统一菜单树提供者。
-    var unifiedMenuProvider: (() -> [MenuItemData]?)? {
-        get { content.unifiedMenuProvider }
-        set { content.unifiedMenuProvider = newValue }
-    }
-    /// 统一菜单项点击回调 (menu item id)。
-    var onUnifiedAction: ((Int) -> Void)? {
-        get { content.onUnifiedAction }
-        set { content.onUnifiedAction = newValue }
+    /// 右键回调：候选下标（≥0）或 -1（空白 / 翻页区 → 主菜单）。
+    var onContextMenu: ((Int) -> Void)? {
+        get { content.onContextMenu }
+        set { content.onContextMenu = newValue }
     }
     /// 滚轮回调 (delta, WHEEL_DELTA 倍数, 正=上滚)。服务端解释成高亮上下移。
     var onScroll: ((Int32) -> Void)? {
@@ -403,9 +332,10 @@ final class CandidatePanel: NSPanel {
         return content.screenRect(forIndex: index, in: self)
     }
 
-    /// 更新右键菜单禁用位 (CmdCandidateMenuFlags)。
-    func updateMenuFlags(_ flags: [UInt8]) {
-        content.setMenuFlags(flags)
+    /// 屏幕点在候选窗上的悬停命中，见 `CandidateContentView.hover(atScreen:in:)`。
+    func hover(atScreen p: NSPoint) -> (inside: Bool, index: Int) {
+        guard isVisible else { return (false, -1) }
+        return content.hover(atScreen: p, in: self)
     }
 
     func hidePanel() {

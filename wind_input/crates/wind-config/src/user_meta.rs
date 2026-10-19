@@ -12,6 +12,10 @@ use std::path::Path;
 /// 旧库改名 `userdata.redb.legacy`。2–4 只在开发分支上出现过。每个 P 阶段迁移完成 +1。
 pub const KNOWN_FORMAT_VERSION: u32 = 5;
 
+/// 说明行（设计 `user-dict-libraries-and-external-edit.md` §5；`data/` 下文件的文案在
+/// `wind_userdata::text::banner`）。
+const META_BANNER: &str = "# 清风输入法 · 用户数据的格式版本。由程序自动维护，请勿手动修改。";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserMeta {
     pub format_version: u32,
@@ -93,7 +97,7 @@ fn write_meta(user_dir: &Path, s: &str) -> std::io::Result<()> {
     let tmp = user_dir.join("meta.toml.tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(s.as_bytes())?;
+        f.write_all(format!("{META_BANNER}\n{s}").as_bytes())?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, user_dir.join("meta.toml"))?;
@@ -148,6 +152,33 @@ mod tests {
             panic!()
         };
         assert_eq!(again.dir_id, m.dir_id, "第二次读到同一个 dir_id");
+    }
+
+    /// 第一行是说明行，读照常；升版本整写时说明行还在。
+    #[test]
+    fn meta_file_starts_with_banner() {
+        let d = dir("banner");
+        assert!(matches!(load_or_init(&d), MetaCheck::Ok(_)));
+        let first = |d: &Path| {
+            std::fs::read_to_string(d.join("meta.toml"))
+                .unwrap()
+                .lines()
+                .next()
+                .map(str::to_string)
+        };
+        assert_eq!(first(&d).as_deref(), Some(META_BANNER));
+        assert!(read(&d).is_some());
+        std::fs::write(
+            d.join("meta.toml"),
+            "format_version = 1\ndir_id = \"abc\"\n",
+        )
+        .unwrap();
+        raise_format_version(&d, 2).unwrap();
+        assert_eq!(first(&d).as_deref(), Some(META_BANNER));
+        assert!(
+            META_BANNER.starts_with("# 清风输入法 · ")
+                && META_BANNER.ends_with("。由程序自动维护，请勿手动修改。")
+        );
     }
 
     #[test]

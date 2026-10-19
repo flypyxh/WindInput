@@ -102,6 +102,9 @@ pub(crate) struct ConfigBundle {
     /// 那个态不走中文标点表，`,` `.` `;` 这些的产物也是原样 ASCII。
     /// 两份都推给 DLL，由它按当下标点态选用——标点态是运行时状态，不进配置快照。
     pub(crate) en_passthrough_punct_chars: std::collections::BTreeSet<char>,
+    /// 空格行配了自定义映射的列（位掩码，全局表 ∪ 各方案表）。中文模式空缓冲时 DLL 据此
+    /// 吃下空格（`CONFIG_KEY_SPACE_CUSTOM_COLS`），本侧对吃下的空格必须出字、不能透传。
+    pub(crate) space_custom_cols: u8,
     /// 分层按键配置的解析器（当前只收全局 `keys.key_actions` 的预编译引导键表）。
     ///
     /// 与 `session_keys` 同源的理由：动作值域在 `wind-config`、键名解析在 `wind-keys`，
@@ -231,6 +234,9 @@ pub(crate) struct SchemaKeyUnion {
     /// （连 `custom_enabled` 一起换），全局表完全不参与 ⇒ 只看全局表的话，方案配的键会被
     /// 透传掉、方案里那一格静默失效且零日志。同 `punct_en_chars` 已经接上的那条链。
     pub(crate) custom_covered_chars: std::collections::BTreeSet<char>,
+    /// 任一**已安装**方案的自定义标点表里，空格行配了值的列（位并集，见
+    /// `wind_punct::custom_space_cols`）。理由同上一项：方案表整表替换，只看全局表会漏。
+    pub(crate) space_custom_cols: u8,
 }
 
 /// 算一次跨方案并集。
@@ -246,7 +252,27 @@ pub(crate) fn schema_key_union(mgr: &EngineManager) -> SchemaKeyUnion {
             .filter_map(|name| crate::key_resolver::key_action_name_to_vk(name))
             .collect(),
         custom_covered_chars: schema_custom_covered_punct_chars(mgr),
+        space_custom_cols: schema_custom_space_cols(mgr),
     }
+}
+
+/// 任一已安装方案的自定义标点表里空格行配了值的列（位并集）。见
+/// [`SchemaKeyUnion::space_custom_cols`]，写法同 [`schema_custom_covered_punct_chars`]。
+pub(crate) fn schema_custom_space_cols(mgr: &EngineManager) -> u8 {
+    let conv = wind_transform::punctuation::PunctuationConverter::new();
+    let mut mask = 0;
+    for id in mgr.installed_schemas() {
+        let Some(table) = mgr.behavior_for(&id).punct_custom_mappings.clone() else {
+            continue;
+        };
+        let punct = wind_config::config::PunctConfig {
+            custom_enabled: !table.is_empty(),
+            custom_mappings: table,
+            ..Default::default()
+        };
+        mask |= wind_punct::custom_space_cols(&conv, &punct);
+    }
+    mask
 }
 
 /// 任一已安装方案的自定义标点表覆盖过的源字符（并集）。见
@@ -516,6 +542,12 @@ impl ConfigBundle {
                 .into_iter()
                 .filter(|&ch| not_occupied(ch))
                 .collect();
+        // 取并集同 `custom_en_punct_chars`：推送只在握手与重载发生、切方案不推。多吃的那几列
+        // 由出字侧兜住（吃下的空格即使产物是半角也照样上屏），不会吃了再吐。
+        let space_custom_cols = wind_punct::custom_space_cols(
+            &wind_transform::punctuation::PunctuationConverter::new(),
+            &config.input.punct,
+        ) | schema_keys.space_custom_cols;
         // ⚠️ `input.rare_char.include_blocks` **不在这里解析**：它与 `exclude_blocks`
         // 一样是「按名字点名字符类」，两者在 `EngineManager` 装配 `CharsetRegistry` 时
         // 一并吃进去（`charset_assembly::ExternalRefs`），拼错的名字也在那里统一 warn。
@@ -536,6 +568,7 @@ impl ConfigBundle {
             custom_en_punct_chars,
             cn_passthrough_punct_chars,
             en_passthrough_punct_chars,
+            space_custom_cols,
             key_resolver,
             schema_session_vks,
             tooltip,
@@ -610,6 +643,27 @@ mod reload_tests {
             global_only.compiled_hotkeys.key_down.len(),
             "全局已登记的键，方案级不该再追加一条"
         );
+    }
+
+    /// 空格列掩码 = 全局表 ∪ 方案表：方案表整表替换，只看全局那份，方案里配的空格在
+    /// Notepad++ 这类宿主上就静默失效（t337）。
+    #[test]
+    fn space_custom_cols_unions_global_and_schema_tables() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            ConfigBundle::build(cfg.clone(), &Default::default()).space_custom_cols,
+            0
+        );
+        cfg.input.punct.custom_enabled = true;
+        cfg.input.punct.custom_mappings.insert(
+            " ".into(),
+            vec!["\u{3000}".into(), "".into(), "".into(), "".into()],
+        );
+        let union = SchemaKeyUnion {
+            space_custom_cols: 0b1000,
+            ..Default::default()
+        };
+        assert_eq!(ConfigBundle::build(cfg, &union).space_custom_cols, 0b1001);
     }
 
     #[test]

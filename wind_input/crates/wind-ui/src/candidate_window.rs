@@ -2032,7 +2032,7 @@ impl CandidateWindow {
 
     /// 当前悬停 tooltip 的目标：`(气泡内容, 候选行命中矩形, 悬停下标)`；无悬停 / 无内容为 None。
     /// 顺带记下 `tip_for`（气泡归属哪个候选）。host-render 两条渲染路径共用。
-    #[cfg(any(windows, all(target_os = "linux", ext_presenter)))]
+    #[cfg(any(windows, ext_presenter))]
     fn tooltip_target(&mut self) -> Option<(std::sync::Arc<wind_ui_types::TooltipDoc>, Rect, i32)> {
         let hover = self.tooltip_hover();
         let info = if (0..TAG_PAGE_PREV).contains(&hover) {
@@ -2095,19 +2095,21 @@ impl CandidateWindow {
     /// Linux 外部宿主：渲染当前悬停 tooltip（位图 + 落位规则）。`(wx, wy)` 为候选窗**建议**
     /// 落点（`render_frame` 的 screen_x/y），addon 再平移到候选窗实际位置。侧边 / 上下的判据
     /// 同 [`Self::render_tooltip_frame`]。
-    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[cfg(ext_presenter)]
     pub(crate) fn render_tooltip_overlay(
         &mut self,
         wx: i32,
         wy: i32,
-    ) -> Option<crate::overlay_linux::Overlay> {
+    ) -> Option<crate::overlay_host::Overlay> {
         let (code, r, hover) = self.tooltip_target()?;
         let beside = self.vertical || self.rotated;
+        // 命中矩形是位图像素，`(wx, wy)` 是宿主坐标单位（macOS 为点），先折成同一单位。
+        let u = |px: f32| crate::overlay_host::to_host(px, self.scale);
         let row = (
-            wx + r.x as i32,
-            wy + r.y as i32,
-            wx + (r.x + r.w) as i32,
-            wy + (r.y + r.h) as i32,
+            wx + u(r.x),
+            wy + u(r.y),
+            wx + u(r.x + r.w),
+            wy + u(r.y + r.h),
         );
         self.tooltip
             .as_mut()?
@@ -2116,7 +2118,7 @@ impl CandidateWindow {
 
     /// Linux 外部宿主：右键点在提示位图内 `(cx, cy)` → `(候选页内下标, 命中, 指纹)`，
     /// 见 [`Tooltip::menu_request_at`]。气泡渲染器没建起来时为 `None`。
-    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[cfg(ext_presenter)]
     pub(crate) fn tooltip_menu_request_at(
         &self,
         cx: i32,

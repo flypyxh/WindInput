@@ -31,6 +31,9 @@ use std::path::{Component, Path, PathBuf};
 
 /// 各层词库根的固定目录名。
 const SCHEMAS_DIR_NAME: &str = "schemas";
+/// 用户分库所在：`<用户目录>/data/<数据方案>/dicts/`。
+const USER_DATA_DIR_NAME: &str = "data";
+const USER_DICTS_DIR_NAME: &str = "dicts";
 
 /// 源文件 → 缓存命名空间（相对目录链，可为空＝直接落缓存根）。
 ///
@@ -59,6 +62,13 @@ pub fn schema_namespace(source: &Path) -> PathBuf {
         .rposition(|s| s.eq_ignore_ascii_case(SCHEMAS_DIR_NAME))
     {
         Some(i) => segs[i + 1..].iter().collect(),
+        // 用户分库 `data/<数据方案>/dicts/`：带上数据方案，不同方案的同名分库不撞
+        None if segs.len() >= 3
+            && segs[segs.len() - 1] == USER_DICTS_DIR_NAME
+            && segs[segs.len() - 3] == USER_DATA_DIR_NAME =>
+        {
+            segs[segs.len() - 3..].iter().collect()
+        }
         // 没有 schemas 段：退回旧行为（父目录名），免得测试夹具与便携版的缓存路径失去分组。
         None => segs.last().map(PathBuf::from).unwrap_or_default(),
     }
@@ -160,6 +170,15 @@ mod tests {
             schema_namespace(Path::new("tmp/fixture/wubi86/x.dict.yaml")),
             PathBuf::from("wubi86")
         );
+    }
+
+    #[test]
+    fn user_dict_libs_are_grouped_by_data_schema() {
+        // 用户分库 `<用户目录>/data/<数据方案>/dicts/`：不同数据方案的同名分库不撞
+        let a = schema_namespace(Path::new("u/W/data/pinyin/dicts/成语.dict.yaml"));
+        let b = schema_namespace(Path::new("u/W/data/wubi86/dicts/成语.dict.yaml"));
+        assert_eq!(a, PathBuf::from("data").join("pinyin").join("dicts"));
+        assert_ne!(a, b);
     }
 
     #[test]

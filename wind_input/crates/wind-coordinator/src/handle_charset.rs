@@ -1,18 +1,8 @@
-//! 字符类的设置页读写：列类、改类属性、恢复默认、外部编辑（探测 / 导出 / 试算 / 加载）、
-//! 删自建类、清理被它压住的逐条覆盖。
+//! 字符类的设置页读写：列类、改类属性、新建 / 删自建类、恢复默认、清理被它压住的逐条覆盖。
 //!
-//! 设计见 `docs/design/charset-classification.md`。用户层落在 **redb**
-//! （`wind_store::charsets`，value 就是 yaml 文本），不是目录——程序和人不能写同一个
-//! 文件，理由见那边的模块文档。人要改就走「外部编辑」：
-//!
-//! ```text
-//! charset_export_edit(key)  →  临时文件（完整视图，首行写明「不会被自动读取」）
-//!        ↓ 用户在编辑器里改
-//! charset_import_file(path) →  parse → diff 出厂 → 稀疏 diff 存库 → 热载
-//! ```
-//!
-//! 「加载外部文件」是**唯一**的回读入口，也是手写 yaml 的入口：文件里的 key 出厂有就当
-//! 覆盖，没有就当自建类。一条路，不分「回读」与「导入」。
+//! 设计见 `docs/design/charset-classification.md`。用户层是 `data/charsets/<key>.yaml`
+//! （`wind_store::charsets`）；要整份手改走词库页的「编辑文件」（`data.beginEdit`
+//! `kind: charsets`），载入时按出厂校验。
 //!
 //! # ★ 两种操作的差别必须让用户看见（§7.3）
 //!
@@ -28,7 +18,6 @@
 //! 必须显示出来，并给一个「清理冗余」的出口。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 use wind_config::charset_def::{self, CharsetDoc, Commonality};
@@ -83,36 +72,6 @@ pub struct CharsetCleanupOutcome {
     pub scanned: usize,
     /// 删掉的条数（与当前默认判定同向 ⇒ 留着没有意义）。
     pub removed: usize,
-}
-
-/// 「外部编辑」对话框打开时对编辑文件的**探测**：不写任何东西，只报告落点与现状。
-///
-/// 对话框据此决定给用户哪几个动作：文件不存在 ⇒「导出并打开」；已存在 ⇒「打开已有
-/// 文件」/「重新导出」——上次导出改到一半关了窗，回来应该能接着改，而不是被静默覆盖。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CharsetEditFile {
-    /// 探测的类；`None` 传入时是模板（新建类）分配到的 key。
-    pub key: String,
-    pub name: String,
-    /// 出厂有这个 key。模板恒为 false。
-    pub builtin: bool,
-    pub path: PathBuf,
-    pub exists: bool,
-    /// 文件最后修改时间（本地时区，`YYYY-MM-DD HH:MM`）；不存在或读不到为 `None`。
-    pub modified: Option<String>,
-}
-
-/// 「从文件加载」导入的一个类。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CharsetImported {
-    pub key: String,
-    pub name: String,
-    /// 出厂有这个 key（导入的是覆盖），还是新建了一个类。
-    pub builtin: bool,
-    /// 存进用户层的：新增成员数 / 移除成员数 / 覆盖的字段数。
-    pub added: usize,
-    pub removed: usize,
-    pub fields: usize,
 }
 
 impl crate::Coordinator {
@@ -194,13 +153,60 @@ impl crate::Coordinator {
         anyhow::ensure!(
             self.engine_mgr.charsets().class_by_key(key).is_some()
                 || !charset_def::is_empty_override(&doc),
-            "没有名为「{key}」的字符类"
+            "没有名为「{key}」的字符分类"
         );
 
         apply_edit(&mut doc, edit)?;
         self.save_user_doc(&doc)?;
         self.reload_charsets();
         debug!("字符类「{key}」已更新：{edit:?}");
+        Ok(())
+    }
+
+    /// 新建一个**空的**自建分类：只有文件名（key）、显示名与可选的默认判定 / 优先级。
+    /// 成员与码位范围之后在设置页用「编辑文件」补。
+    pub(crate) fn charset_create(
+        &self,
+        key: &str,
+        name: &str,
+        edit: &CharsetEdit,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            charset_def::is_valid_key(key),
+            "文件名不合法：不能为空、首尾不能有空格，不能含 / \\ . : * ? \" < > |，最多 64 字节"
+        );
+        // 只差大小写也算重名：一类一个文件，Windows 的文件名不分大小写。用户层按**文件**
+        // 判（不按解析结果）：手改写坏的那份解析不出来、列表里看不见，新建同名会把它整份覆盖。
+        let lower = key.to_lowercase();
+        let files: Vec<String> = self
+            .charset_store()?
+            .list_charset_docs()?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let taken = self
+            .engine_mgr
+            .charset_factory()
+            .keys()
+            .chain(files.iter())
+            .any(|k| k.to_lowercase() == lower);
+        anyhow::ensure!(!taken, "已有名为「{key}」的字符分类");
+        let name = name.trim();
+        let mut doc = CharsetDoc {
+            def: charset_def::CharsetDef {
+                key: key.to_string(),
+                name: Some(if name.is_empty() { key } else { name }.to_string()),
+                ..Default::default()
+            },
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
+        apply_edit(&mut doc, edit)?;
+        // 不给优先级就排在出厂的常用汉字表（10）之前——留空走默认 100 的话，
+        // 对汉字的表态会被它整个盖住，见 NEW_CLASS_ORDER。
+        doc.def.order.get_or_insert(NEW_CLASS_ORDER);
+        self.save_user_doc(&doc)?;
+        self.reload_charsets();
         Ok(())
     }
 
@@ -225,198 +231,10 @@ impl crate::Coordinator {
         );
         anyhow::ensure!(
             self.charset_store()?.remove_charset_doc(key)?,
-            "没有名为「{key}」的字符类"
+            "没有名为「{key}」的字符分类"
         );
         self.reload_charsets();
         Ok(())
-    }
-
-    /// 「外部编辑」：把一个类的**完整视图**写到临时文件，返回路径给设置页去打开。
-    ///
-    /// 文件首行写明「不会被自动读取」——改完要回设置页「加载外部文件」。冲突只剩一处：
-    /// 导出后、加载前，设置页又改了同一个类的属性，加载会整条替换掉。单人本地工具，
-    /// 不做版本号合并；头注释说了这是导出的副本。
-    pub(crate) fn charset_export_edit(&self, key: &str) -> anyhow::Result<PathBuf> {
-        self.charset_export_edit_to(key, &default_edit_dir())
-    }
-
-    /// [`Self::charset_export_edit`] 的落点可指定版。产品路径永远用 [`default_edit_dir`]；
-    /// 分出来是给测试用的——测试若也写系统临时目录，就会**覆盖用户正在编辑的同名文件**
-    /// （2026-09-06 真的发生过：三份「导出文件」其实是 `cargo test` 写的）。
-    pub(crate) fn charset_export_edit_to(&self, key: &str, dir: &Path) -> anyhow::Result<PathBuf> {
-        let factory = self.engine_mgr.charset_factory();
-        let user = self.user_doc(key)?;
-        anyhow::ensure!(
-            factory.contains_key(key) || !charset_def::is_empty_override(&user),
-            "没有名为「{key}」的字符类"
-        );
-        let text = charset_def::render_edit_view(factory.get(key), &user)?;
-        let path = write_edit_file(dir, key, &text)?;
-        debug!("字符类「{key}」已导出到 {}", path.display());
-        Ok(path)
-    }
-
-    /// 「外部编辑」对话框打开/换类时的探测：编辑文件在哪、有没有、什么时候改的。
-    /// **不写文件**。`key` 为 `None` 即「新建类」，报告模板将落到的 key 与路径。
-    pub(crate) fn charset_edit_file(&self, key: Option<&str>) -> anyhow::Result<CharsetEditFile> {
-        self.charset_edit_file_in(key, &default_edit_dir())
-    }
-
-    /// [`Self::charset_edit_file`] 的落点可指定版，理由同 [`Self::charset_export_edit_to`]。
-    pub(crate) fn charset_edit_file_in(
-        &self,
-        key: Option<&str>,
-        dir: &Path,
-    ) -> anyhow::Result<CharsetEditFile> {
-        let factory = self.engine_mgr.charset_factory();
-        let (key, name, builtin) = match key {
-            Some(k) => {
-                let user = self.user_doc(k)?;
-                anyhow::ensure!(
-                    factory.contains_key(k) || !charset_def::is_empty_override(&user),
-                    "没有名为「{k}」的字符类"
-                );
-                let name = factory
-                    .get(k)
-                    .map(|f| f.def.display_name().to_string())
-                    .unwrap_or_else(|| user.def.display_name().to_string());
-                (k.to_string(), name, factory.contains_key(k))
-            }
-            None => (self.template_key(), TEMPLATE_NAME.to_string(), false),
-        };
-        anyhow::ensure!(
-            charset_def::is_valid_key(&key),
-            "字符类的 key「{key}」不合法"
-        );
-        let path = dir.join(format!("{key}.yaml"));
-        let meta = std::fs::metadata(&path).ok();
-        let modified = meta.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-            chrono::DateTime::<chrono::Local>::from(t)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        });
-        Ok(CharsetEditFile {
-            key,
-            name,
-            builtin,
-            path,
-            exists: meta.is_some_and(|m| m.is_file()),
-            modified,
-        })
-    }
-
-    /// 模板分配到的 key：既不在出厂也不在用户层的第一个 `my_class_N`。
-    fn template_key(&self) -> String {
-        let factory = self.engine_mgr.charset_factory();
-        let user = self.user_docs();
-        (1..)
-            .map(|n| format!("my_class_{n}"))
-            .find(|k| !factory.contains_key(k) && !user.contains_key(k))
-            .expect("总能找到一个没用过的名字")
-    }
-
-    /// 「新建类」：导出一份**模板**到临时文件，用户填完再「加载外部文件」。
-    ///
-    /// 不做对话框：新建的全部内容（key、名称、范围、成员）本来就都在文件里，多一个只填
-    /// 两项的对话框反而让用户以为建完了。key 由用户在文件里改——模板给的名字不会与出厂
-    /// 撞车，加载时若撞了出厂的 key 会当作对那个类的覆盖，头注释里有说。
-    pub(crate) fn charset_export_template(&self) -> anyhow::Result<PathBuf> {
-        self.charset_export_template_to(&default_edit_dir())
-    }
-
-    /// [`Self::charset_export_template`] 的落点可指定版，理由同 [`Self::charset_export_edit_to`]。
-    pub(crate) fn charset_export_template_to(&self, dir: &Path) -> anyhow::Result<PathBuf> {
-        let key = self.template_key();
-        let doc = CharsetDoc {
-            def: charset_def::CharsetDef {
-                key: key.clone(),
-                name: Some(TEMPLATE_NAME.into()),
-                ranges: Some(Vec::new()),
-                // ★★ 模板**显式**给 order，不留空走 `DEFAULT_ORDER`——见 TEMPLATE_ORDER。
-                order: Some(TEMPLATE_ORDER),
-                ..Default::default()
-            },
-            added: Vec::new(),
-            removed: Vec::new(),
-        };
-        let text = charset_def::render_edit_view(None, &doc)?;
-        write_edit_file(dir, &key, &text)
-    }
-
-    /// 「从文件加载」：解析文件里的每个类，出厂有的当覆盖（diff 后存）、没有的当自建。
-    ///
-    /// 一个文件可以带多个类（meta 头是数组，与出厂 `blocks.yaml` 同款），逐个导入；
-    /// 任一个失败整次失败、库不动——半导入的状态用户理不清。
-    pub(crate) fn charset_import_file(&self, path: &Path) -> anyhow::Result<Vec<CharsetImported>> {
-        let pending = self.plan_import(path)?;
-        // 全部 diff 通过之后才落库。
-        for (diff, _) in &pending {
-            self.save_user_doc(diff)?;
-        }
-        self.reload_charsets();
-        let out: Vec<CharsetImported> = pending.into_iter().map(|(_, s)| s).collect();
-        debug!("从 {} 导入字符类：{out:?}", path.display());
-        Ok(out)
-    }
-
-    /// 「加载」前的**试算**：与 [`Self::charset_import_file`] 走同一条解析与 diff，只是不落库。
-    ///
-    /// 对话框先把「将更新「常用汉字」：+3 字 −2 字」摆出来再要确认——加载是整份替换
-    /// 该类的用户层，而用户看不见库里现在是什么；试算就是那个「覆盖提示」。
-    pub(crate) fn charset_import_preview(
-        &self,
-        path: &Path,
-    ) -> anyhow::Result<Vec<CharsetImported>> {
-        Ok(self
-            .plan_import(path)?
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect())
-    }
-
-    /// 读文件、逐类 diff 出厂，产出待落库的 doc 与给界面的摘要。任一类失败即整体失败。
-    fn plan_import(&self, path: &Path) -> anyhow::Result<Vec<(CharsetDoc, CharsetImported)>> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("读 {} 失败：{e}", path.display()))?;
-        let docs = charset_def::parse_docs(&text)?;
-        anyhow::ensure!(!docs.is_empty(), "文件里没有任何字符类");
-
-        let factory = self.engine_mgr.charset_factory();
-        let mut pending: Vec<(CharsetDoc, CharsetImported)> = Vec::new();
-        for doc in docs {
-            let key = doc.def.key.clone();
-            let f = factory.get(&key);
-            let diff = charset_def::diff_against_factory(doc, f)?;
-            let name = f
-                .map(|m| m.def.display_name().to_string())
-                .unwrap_or_else(|| diff.def.display_name().to_string());
-            let d = &diff.def;
-            let fields = [
-                d.name.is_some(),
-                d.ranges.is_some(),
-                d.file.is_some(),
-                d.scope.is_some(),
-                d.default.is_some(),
-                d.outside.is_some(),
-                d.order.is_some(),
-                d.no_freq.is_some(),
-                d.in_rare.is_some(),
-                d.enabled.is_some(),
-            ]
-            .into_iter()
-            .filter(|b| *b)
-            .count();
-            let summary = CharsetImported {
-                key,
-                name,
-                builtin: f.is_some(),
-                added: diff.added.len(),
-                removed: diff.removed.len(),
-                fields,
-            };
-            pending.push((diff, summary));
-        }
-        Ok(pending)
     }
 
     /// 清理压在某个类上的**冗余**逐条覆盖：方向与当前默认判定相同的那些。
@@ -429,7 +247,10 @@ impl crate::Coordinator {
     ) -> anyhow::Result<CharsetCleanupOutcome> {
         let store = self.charset_store()?;
         let reg = self.engine_mgr.charsets();
-        anyhow::ensure!(reg.class_by_key(key).is_some(), "没有名为「{key}」的字符类");
+        anyhow::ensure!(
+            reg.class_by_key(key).is_some(),
+            "没有名为「{key}」的字符分类"
+        );
 
         let rows = store.list_common_char_overrides()?;
         let cc = self.common_chars.read().unwrap_or_else(|e| e.into_inner());
@@ -496,7 +317,7 @@ impl crate::Coordinator {
     fn charset_store(&self) -> anyhow::Result<&wind_store::Store> {
         self.store
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("无持久化存储，字符类的调整无处落盘"))
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储，字符分类的调整无处落盘"))
     }
 
     /// 用户层现有的全部调整，按 key 索引。没有 store 时为空。
@@ -558,10 +379,7 @@ impl crate::Coordinator {
     }
 }
 
-/// 「新建类」模板的显示名。用户在文件里改成自己的。
-const TEMPLATE_NAME: &str = "我的字符类";
-
-/// 「新建类」模板给的 `order`，**比所有出厂类都小**。
+/// 新建的自建类缺省的 `order`，**比所有出厂类都小**。
 ///
 /// ★★ 不留空走 [`charset_def::DEFAULT_ORDER`]（100）的理由是一个实测出来的坑：出厂值
 /// 是 `common_han` = 10、`emoji` = 20、50 个区块类 = 900，而 `common_han` 带
@@ -572,37 +390,18 @@ const TEMPLATE_NAME: &str = "我的字符类";
 /// `scope` 型的全域表态不在它的判据里（设计文档 §6.5 那道防线盖不住这种形态）。
 ///
 /// ⛔ 对策**不是**改 `DEFAULT_ORDER`：那会让所有没写 `order` 的已有自建类的仲裁结果
-/// 静默翻转。只给新导出的模板一个显式值——**已存的类一个字节都不改**。
+/// 静默翻转。只给新建的类一个显式值——**已存的类一个字节都不改**。
 ///
 /// ⚠️ 这个决定有三条代价，不是零成本，写在这里免得下次误以为它只有好处：
 ///
 /// 1. **「老类不动」只在字面上成立，相对次序变了**：新建的类（5）会压过用户先前建的、
 ///    走 `DEFAULT_ORDER` 的老类（100）——改动前两者同为 100、靠 key 字典序打平。
 ///    用户若要老类优先，得自己去把它的 `order` 调小。
-/// 2. **新建的类彼此打平**：每个模板都拿 5，两个自建类之间只能靠 key 字典序破
+/// 2. **新建的类彼此打平**：每个都拿 5，两个自建类之间只能靠 key 字典序破
 ///    （`CharsetRegistry` 编译时那条 `then_with(key)`）。确定，但语义是任意的。
 /// 3. **护栏只盖 `data/`**：钉住它的测试喂的是仓里的自带层；`charset_factory()` 实际
 ///    还合并 `data_custom/`（定制版层）。定制包若发一个 `order < 5` 的类，测试不会响。
-const TEMPLATE_ORDER: i32 = 5;
-
-/// 外部编辑文件的默认落点：系统临时目录下 `WindInput/charsets/`。
-///
-/// 放临时目录而不是用户配置目录：它**不是配置**，是导出的副本，留在配置目录里用户
-/// 会以为改它就生效（那正是改成库存储要消灭的误解）。
-fn default_edit_dir() -> PathBuf {
-    std::env::temp_dir()
-        .join("WindInput")
-        .join(charset_def::CHARSETS_DIR_NAME)
-}
-
-/// 把编辑视图写到 `dir/<key>.yaml`。`key` 已由渲染函数校验过可作文件名。
-fn write_edit_file(dir: &Path, key: &str, text: &str) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow::anyhow!("建目录 {} 失败：{e}", dir.display()))?;
-    let path = dir.join(format!("{key}.yaml"));
-    std::fs::write(&path, text).map_err(|e| anyhow::anyhow!("写 {} 失败：{e}", path.display()))?;
-    Ok(path)
-}
+const NEW_CLASS_ORDER: i32 = 5;
 
 /// 把一次编辑叠加到用户层的那份 doc 上。
 ///
@@ -648,6 +447,7 @@ mod tests {
 
     use super::*;
     use crate::Coordinator;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use wind_config::Config;
 
@@ -976,88 +776,69 @@ mod tests {
 
     // ── 外部编辑 ───────────────────────────────────────────────────────────
 
-    /// ★★ 导出 → 改文件 → 从文件加载 → 判定生效，一条链走通。
-    ///
-    /// 这是「文本作中介」那条路的主用例：用户在编辑器里删一个 emoji、加一个字段，
-    /// 加载后库里只多了那两条（稀疏），判定立即改变。
+    /// 新建：一个空的自建分类直接进列表（成员之后用「编辑文件」加）；重名、出厂名、
+    /// 只差大小写的名字、不合法的文件名都拒绝。
     #[test]
-    fn export_edit_import_changes_the_verdict() {
-        let (c, user) = coord("edit_chain");
-        let path = c.charset_export_edit_to("emoji", &user).unwrap();
-        assert!(path.starts_with(&user), "测试导出不得离开夹具目录");
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            text.lines().next().unwrap().contains("不会被自动读取"),
-            "首行必须说明这不是配置文件"
-        );
-        assert!(text.contains("\n😀\n"), "完整视图里该有出厂成员");
-
-        // 用户：把 😀 从类里拿掉、让整个类判生僻。
-        let edited = text
-            .replace("\n😀\n", "\n")
-            .replace("\n---\n", "\n---\ndefault: rare\n");
-        std::fs::write(&path, edited).unwrap();
-
-        let out = c.charset_import_file(&path).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].key, "emoji");
-        assert!(out[0].builtin);
-        assert_eq!((out[0].added, out[0].removed, out[0].fields), (0, 1, 1));
-
-        assert!(!is_common(&c, "😃"), "整类判生僻生效");
-        assert!(
-            is_common(&c, "😀"),
-            "被拿掉的那个不再属于 emoji 类 ⇒ 兜底判常用"
-        );
-
-        let stored = stored(&c, "emoji").unwrap();
-        assert!(stored.contains("-😀"), "库里是稀疏 diff：{stored}");
-        assert!(!stored.contains("😃"), "没改的成员不该进库");
-
-        drop(c);
-        let _ = std::fs::remove_dir_all(&user);
-    }
-
-    /// 导出后原样加载 ⇒ 库里**没有**记录。导出过不等于调整过。
-    #[test]
-    fn importing_an_untouched_export_leaves_no_trace() {
-        let (c, user) = coord("untouched");
-        let path = c.charset_export_edit_to("common_han", &user).unwrap();
-        let out = c.charset_import_file(&path).unwrap();
-        assert_eq!((out[0].added, out[0].removed, out[0].fields), (0, 0, 0));
-        assert_eq!(stored(&c, "common_han"), None);
-        assert!(is_common(&c, "我"));
-        drop(c);
-        let _ = std::fs::remove_dir_all(&user);
-    }
-
-    /// 加载一个出厂没有的 key ⇒ 自建类：列表里出现、`builtin` 为假、判定生效、可删。
-    #[test]
-    fn importing_a_new_key_creates_a_custom_class_that_can_be_deleted() {
-        let (c, user) = coord("custom");
-        let f = user.join("mine.yaml");
-        std::fs::write(
-            &f,
-            "---\nkey: 我的生僻符号\nname: 我的生僻符号\ndefault: rare\norder: 1\n...\n★\n☆\n",
-        )
-        .unwrap();
-        assert!(is_common(&c, "★"), "出厂不认识 ★ ⇒ 兜底判常用");
-
-        let out = c.charset_import_file(&f).unwrap();
-        assert!(!out[0].builtin);
-        assert_eq!(out[0].added, 2);
-        assert!(!is_common(&c, "★"), "自建类的 default 生效");
-
+    fn creating_an_empty_class() {
+        let (c, user) = coord("create");
+        let edit = CharsetEdit {
+            default_common: Some("rare".into()),
+            order: Some(7),
+            ..Default::default()
+        };
+        c.charset_create("my_symbols", "我的符号", &edit).unwrap();
         let rows = c.charset_rows();
-        let row = rows.iter().find(|r| r.key == "我的生僻符号").unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.key == "my_symbols")
+            .expect("新分类进列表");
+        assert_eq!(row.name, "我的符号");
         assert!(!row.builtin);
-        assert!(row.overridden);
-        assert_eq!(row.member_count, 2);
+        assert_eq!(row.member_count, 0);
+        assert_eq!(row.order, 7);
 
-        c.charset_delete("我的生僻符号").unwrap();
-        assert!(is_common(&c, "★"), "删了之后判定回到出厂");
-        assert!(!c.charset_rows().iter().any(|r| r.key == "我的生僻符号"));
+        let dup = c
+            .charset_create("my_symbols", "x", &CharsetEdit::default())
+            .unwrap_err();
+        assert!(dup.to_string().contains("已有"), "{dup}");
+        let case = c
+            .charset_create("MY_SYMBOLS", "x", &CharsetEdit::default())
+            .unwrap_err();
+        assert!(
+            case.to_string().contains("已有"),
+            "Windows 文件名不分大小写：{case}"
+        );
+        let factory = c
+            .charset_create("emoji", "x", &CharsetEdit::default())
+            .unwrap_err();
+        assert!(factory.to_string().contains("已有"), "{factory}");
+        let bad = c
+            .charset_create("a/b", "x", &CharsetEdit::default())
+            .unwrap_err();
+        assert!(bad.to_string().contains("文件名"), "{bad}");
 
+        // 不给优先级：排在常用汉字表之前，否则对汉字不起作用。
+        c.charset_create("plain", "", &CharsetEdit::default())
+            .unwrap();
+        let rows = c.charset_rows();
+        let plain = rows.iter().find(|r| r.key == "plain").unwrap();
+        assert_eq!(plain.order, NEW_CLASS_ORDER);
+        assert_eq!(plain.name, "plain", "显示名留空同文件名");
+
+        // 写坏的同名文件：列表里看不见，但新建同名不许覆盖它。
+        let path = c.charset_store().unwrap().charset_path("broken").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "key: [不合法\n").unwrap();
+        let e = c
+            .charset_create("broken", "x", &CharsetEdit::default())
+            .unwrap_err();
+        assert!(e.to_string().contains("已有"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "key: [不合法\n");
+
+        let dev = c
+            .charset_create("con", "x", &CharsetEdit::default())
+            .unwrap_err();
+        assert!(dev.to_string().contains("文件名"), "Windows 设备名：{dev}");
         drop(c);
         let _ = std::fs::remove_dir_all(&user);
     }
@@ -1073,154 +854,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&user);
     }
 
-    /// 改出厂类的范围 ⇒ 加载**报错**，库不动。
-    #[test]
-    fn importing_changed_factory_ranges_is_refused_and_leaves_the_store_untouched() {
-        let (c, user) = coord("ranges");
-        let f = user.join("bad.yaml");
-        std::fs::write(&f, "key: 符号\nranges: [U+0000-U+FFFF]\n").unwrap();
-        let e = c.charset_import_file(&f).unwrap_err();
-        assert!(e.to_string().contains("范围只读"), "{e}");
-        assert_eq!(stored(&c, "符号"), None);
-        drop(c);
-        let _ = std::fs::remove_dir_all(&user);
-    }
-
-    /// 探测不写文件；导出后再探测能看到「已存在 + 修改时间」；模板探测报的 key 与随后
-    /// 真正导出的模板一致（对话框靠这一点在导出前就把路径显示给用户）。
-    #[test]
-    fn edit_file_probe_reports_existence_without_writing() {
-        let (c, user) = coord("probe");
-        let p = c.charset_edit_file_in(Some("emoji"), &user).unwrap();
-        assert_eq!(
-            (p.key.as_str(), p.builtin, p.exists),
-            ("emoji", true, false)
-        );
-        assert_eq!(p.name, "Emoji 表情");
-        assert!(!p.path.exists(), "探测不许写文件");
-        assert_eq!(p.modified, None);
-
-        let exported = c.charset_export_edit_to("emoji", &user).unwrap();
-        let p = c.charset_edit_file_in(Some("emoji"), &user).unwrap();
-        assert_eq!(p.path, exported);
-        assert!(p.exists);
-        assert!(p.modified.is_some(), "存在的文件要报修改时间");
-
-        let t = c.charset_edit_file_in(None, &user).unwrap();
-        assert_eq!(
-            (t.key.as_str(), t.builtin, t.exists),
-            ("my_class_1", false, false)
-        );
-        assert_eq!(c.charset_export_template_to(&user).unwrap(), t.path);
-
-        assert!(
-            c.charset_edit_file_in(Some("no_such_class"), &user)
-                .is_err(),
-            "不存在的类要报错，而不是给一个永远导不出的路径"
-        );
-        drop(c);
-        let _ = std::fs::remove_dir_all(&user);
-    }
-
-    /// 试算给出与真正导入**相同**的摘要，但库与判定都不动。
-    #[test]
-    fn import_preview_reports_the_same_summary_but_changes_nothing() {
-        let (c, user) = coord("preview");
-        let path = c.charset_export_edit_to("emoji", &user).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let edited = text
-            .replace("\n😀\n", "\n")
-            .replace("\n---\n", "\n---\ndefault: rare\n");
-        std::fs::write(&path, edited).unwrap();
-
-        let preview = c.charset_import_preview(&path).unwrap();
-        assert_eq!(stored(&c, "emoji"), None, "试算不落库");
-        assert!(is_common(&c, "😃"), "试算不改判定");
-
-        let applied = c.charset_import_file(&path).unwrap();
-        assert_eq!(preview, applied, "试算与实际导入的摘要必须一致");
-        assert!(!is_common(&c, "😃"));
-
-        // 坏文件：试算与导入报同一个错。
-        std::fs::write(&path, "key: [broken").unwrap();
-        assert!(c.charset_import_preview(&path).is_err());
-        assert!(c.charset_import_file(&path).is_err());
-        drop(c);
-        let _ = std::fs::remove_dir_all(&user);
-    }
-
-    /// 「新建类」模板：key 不与现有的撞、首行同样声明不会被自动读取。
-    #[test]
-    fn the_new_class_template_has_a_fresh_key() {
-        let (c, user) = coord("template");
-        let path = c.charset_export_template_to(&user).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.lines().next().unwrap().contains("不会被自动读取"));
-        assert!(text.contains("key: my_class_1"));
-        // 模板是自建类：说明要教 ranges 的写法，而不是讲「出厂 + 你的调整」。
-        assert!(
-            text.contains("ranges: [U+"),
-            "自建类头部要给 ranges 写法示例"
-        );
-        assert!(!text.contains("出厂 + 你的调整"));
-        // 直接加载模板也合法——得到一个空的自建类。
-        let out = c.charset_import_file(&path).unwrap();
-        assert!(!out[0].builtin);
-        drop(c);
-        let _ = std::fs::remove_dir_all(&user);
-    }
-
-    /// ★★ 新建模板的 `order` 必须压过**所有出厂类**，且判据读的是仓里真实的
+    /// ★★ 新建的类缺省 `order` 必须压过**所有出厂类**，且判据读的是仓里真实的
     /// `data/charsets/`，不是记在这里的一个数字。
     ///
-    /// 背景见 [`TEMPLATE_ORDER`]：缺省的 100 压不过 `common_han`（10），用户新建一个类
+    /// 背景见 [`NEW_CLASS_ORDER`]：缺省的 100 压不过 `common_han`（10），用户新建一个类
     /// 想把几个生僻汉字设成常用会**一点反应都没有**，而这条路连 warn 都收不到
     /// （`shadowed_keys` 只比对区间型的 ranges）。出厂哪天把某个类的 order 调小，
     /// 这条测试当场红，而不是等用户来报「配了没反应」。
     #[test]
-    fn the_new_class_template_outranks_every_factory_class() {
-        let (c, user) = coord("template_order");
-        let path = c.charset_export_template_to(&user).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            text.contains(&format!("order: {TEMPLATE_ORDER}")),
-            "模板必须**显式**写 order（留空会走 DEFAULT_ORDER）：{text}"
-        );
-
-        let orders: std::collections::BTreeSet<i32> = c
+    fn a_new_class_outranks_every_factory_class() {
+        let (c, user) = coord("new_order");
+        let lowest = c
             .engine_mgr
             .charset_factory()
             .values()
             .map(|f| f.def.order_or_default())
-            .collect();
-        let lowest = *orders.first().expect("出厂层至少有 blocks.yaml 里那批类");
+            .min()
+            .expect("出厂层至少有 blocks.yaml 里那批类");
         assert!(
-            TEMPLATE_ORDER < lowest,
-            "模板 order {TEMPLATE_ORDER} 必须小于最小的出厂 order {lowest}"
+            NEW_CLASS_ORDER < lowest,
+            "新建类的 order {NEW_CLASS_ORDER} 必须小于最小的出厂 order {lowest}"
         );
 
-        // ⚠️ 连**取值集合**一起钉住，不只钉最小值：`charset_def.rs` 的两份编辑视图头注释
-        // 里写着「出厂类用的是 10（常用汉字）、20（emoji）、900（Unicode 区块）」，那句话
-        // 是 `data/charsets/` 的镜像，除了这条断言没有任何东西看着它。出厂哪天加一个
-        // `order: 50` 的类，上面那条 `<` 照绿，而**用户手上那份导出文件开始说假话**——
-        // 同样是注释漂移，只是这次漂的是用户可见的文案。
-        assert_eq!(
-            orders,
-            std::collections::BTreeSet::from([10, 20, 900, 1000]),
-            "出厂 order 取值集合变了 ⇒ 必须同步改 charset_def.rs 里 CUSTOM_VIEW_HEADER 与 \
-             EDIT_VIEW_HEADER 那句「出厂类用的是 10 / 20 / 900 / 1000」"
-        );
-
-        // 模板 → 库 → 装配一整条链：导入后真的以这个优先级排在最前。
-        c.charset_import_file(&path).unwrap();
+        // 新建 → 落盘 → 装配一整条链：真的以这个优先级排在最前。
+        c.charset_create("mine", "", &CharsetEdit::default())
+            .unwrap();
         let rows = c.charset_rows();
-        let row = rows
-            .iter()
-            .find(|r| r.key == "my_class_1")
-            .expect("导入的自建类要在列表里");
-        assert_eq!(row.order, TEMPLATE_ORDER);
         assert_eq!(
-            rows[0].key, "my_class_1",
+            (rows[0].key.as_str(), rows[0].order),
+            ("mine", NEW_CLASS_ORDER),
             "order 最小 ⇒ 列表第一行（列表序就是仲裁序）"
         );
         drop(c);

@@ -1598,14 +1598,6 @@ pub fn encode_mode_status(flags: u32, effective_mode: u32, label: &str) -> Vec<u
     frame(CMD_MODE_STATUS, p)
 }
 
-/// CmdCandidateMenuFlags (0x0505): count:u32 + count×(1 字节禁用位)
-pub fn encode_candidate_menu_flags(per_cand: &[u8]) -> Vec<u8> {
-    let mut p = Vec::with_capacity(4 + per_cand.len());
-    p.extend_from_slice(&(per_cand.len() as u32).to_le_bytes());
-    p.extend_from_slice(per_cand);
-    frame(CMD_CANDIDATE_MENU_FLAGS, p)
-}
-
 /// 统一菜单树的线格式节点（wind-ipc 本地类型，避免反向依赖 wind-ui）。
 /// 上游（coordinator）把 `MenuItemSpec` 映射为此结构后编码。
 #[derive(Debug, Clone, Default)]
@@ -1687,106 +1679,8 @@ pub fn encode_key_type(text: &str) -> Vec<u8> {
     frame(CMD_KEY_TYPE, text.as_bytes().to_vec())
 }
 
-/// macOS 原生气泡的一段分段颜色：`text` 里 UTF-16 码元区间 `[start, start + len)`
-/// （直接对应 `NSRange`）改用 `rgba`（`[R, G, B, A]`，已在服务端按主题解析好）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TooltipColorRun {
-    pub start: u32,
-    pub len: u32,
-    pub rgba: [u8; 4],
-}
-
-/// CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
-/// + runCount:u32 + runCount×(start:u32 + len:u32 + rgba:u32)。
-///
-/// `runs` 是分段着色的后加尾段（区间以 UTF-16 计）。`rgba` 按小端 u32 写出，字节依次为
-/// R、G、B、A（即 `R | G<<8 | B<<16 | A<<24`）。新旧两端都兼容：旧 `.app` 读完四段字符串
-/// 就不再往下读，多出的尾段被忽略、退化为单色；新 `.app` 遇到旧服务（没有尾段）同样单色。
-/// 故空 `runs` 也照写一个 `count = 0`，不省略。
-pub fn encode_tooltip_show(
-    text: &str,
-    bg: &str,
-    fg: &str,
-    font_path: &str,
-    runs: &[TooltipColorRun],
-) -> Vec<u8> {
-    let mut p = Vec::new();
-    for s in [text, bg, fg, font_path] {
-        push_string(&mut p, s);
-    }
-    p.extend_from_slice(&(runs.len() as u32).to_le_bytes());
-    for r in runs {
-        p.extend_from_slice(&r.start.to_le_bytes());
-        p.extend_from_slice(&r.len.to_le_bytes());
-        p.extend_from_slice(&r.rgba);
-    }
-    frame(CMD_TOOLTIP_SHOW, p)
-}
-
-/// CmdTooltipHide (0x0509): 空 payload
-pub fn encode_tooltip_hide() -> Vec<u8> {
-    frame(CMD_TOOLTIP_HIDE, Vec::new())
-}
-
-/// CmdStatusShow (0x050A): textLen+text + bgLen+bg + fgLen+fg + x:i32 + y:i32 + duration_ms:i32
-/// + anchor:i32（[`crate::protocol::status_anchor`]）。
-///
-/// `anchor` 是尾部追加段：旧 `.app` 读到 duration 就停，忽略它（锚点退化成按 x/y 摆）；
-/// 新 `.app` 读不到它时按 `NONE` 处理。两端互容，同 tooltip 的 `runs` 尾段。
-#[allow(clippy::too_many_arguments)]
-pub fn encode_status_show(
-    text: &str,
-    bg: &str,
-    fg: &str,
-    x: i32,
-    y: i32,
-    duration_ms: i32,
-    anchor: i32,
-) -> Vec<u8> {
-    let mut p = Vec::new();
-    for s in [text, bg, fg] {
-        push_string(&mut p, s);
-    }
-    p.extend_from_slice(&x.to_le_bytes());
-    p.extend_from_slice(&y.to_le_bytes());
-    p.extend_from_slice(&duration_ms.to_le_bytes());
-    p.extend_from_slice(&anchor.to_le_bytes());
-    frame(CMD_STATUS_SHOW, p)
-}
-
-/// CmdStatusHide (0x050B): 空 payload
-pub fn encode_status_hide() -> Vec<u8> {
-    frame(CMD_STATUS_HIDE, Vec::new())
-}
-
-/// CmdToastShow (0x050C): 六段长度前缀串 (title+message+bg+fg+accent+position) + duration_ms:i32 + max_width:i32
-#[allow(clippy::too_many_arguments)]
-pub fn encode_toast_show(
-    title: &str,
-    message: &str,
-    bg: &str,
-    fg: &str,
-    accent: &str,
-    position: &str,
-    duration_ms: i32,
-    max_width: i32,
-) -> Vec<u8> {
-    let mut p = Vec::new();
-    for s in [title, message, bg, fg, accent, position] {
-        push_string(&mut p, s);
-    }
-    p.extend_from_slice(&duration_ms.to_le_bytes());
-    p.extend_from_slice(&max_width.to_le_bytes());
-    frame(CMD_TOAST_SHOW, p)
-}
-
-/// CmdToastHide (0x050D): 空 payload
-pub fn encode_toast_hide() -> Vec<u8> {
-    frame(CMD_TOAST_HIDE, Vec::new())
-}
-
 /// [`CMD_OVERLAY_FRAME`] 的元数据（像素在该层的 SHM 段里）。枚举值见 [`crate::protocol::overlay`]。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct OverlayFrameMeta {
     pub kind: u32,
     /// 该层 SHM 段写帧后的序号；隐藏帧同样写段（`write_hidden`）后取号。
@@ -1813,12 +1707,19 @@ pub struct OverlayFrameMeta {
     pub content_h: u32,
     /// 自动隐藏时长；`0` = 常驻，直到下一帧或隐藏帧。计时归宿主（同 macOS `.app`）。
     pub duration_ms: i32,
+    /// 位图像素 / 宿主坐标单位。Linux 宿主坐标就是像素（恒 1.0，addon 不读这个字段）；macOS 坐标是点、
+    /// 位图是 `scale` 倍的像素，`.app` 据此把位图尺寸与内容盒折回点。`0.0` = 未设，按 1 处理。
+    pub scale: f32,
 }
 
-/// CmdOverlayFrame (0x0513, 68B)：kind seq w h flags place（u32）+ x y alt_x alt_y（i32）+ anchor（u32）
-/// + margin content_x content_y（i32）+ content_w content_h（u32）+ duration_ms（i32），均小端。
+/// CmdOverlayFrame (0x0513, 72B)，均小端：
+///
+/// kind seq w h flags place（u32）+ x y alt_x alt_y（i32）+ anchor（u32）+ margin content_x content_y
+/// （i32）+ content_w content_h（u32）+ duration_ms（i32）+ scale（f32）。
+///
+/// 前 68 字节是 Linux addon 认的基础布局（它只要求 ≥ 68），末尾 `scale` 供 macOS `.app` 读。
 pub fn encode_overlay_frame(m: &OverlayFrameMeta) -> Vec<u8> {
-    let mut p = Vec::with_capacity(68);
+    let mut p = Vec::with_capacity(72);
     for v in [m.kind, m.seq, m.width, m.height, m.flags, m.place] {
         p.extend_from_slice(&v.to_le_bytes());
     }
@@ -1833,6 +1734,7 @@ pub fn encode_overlay_frame(m: &OverlayFrameMeta) -> Vec<u8> {
         p.extend_from_slice(&v.to_le_bytes());
     }
     p.extend_from_slice(&m.duration_ms.to_le_bytes());
+    p.extend_from_slice(&m.scale.to_le_bytes());
     frame(CMD_OVERLAY_FRAME, p)
 }
 
@@ -1926,6 +1828,12 @@ pub fn encode_ctrl_space_toggle_value(enabled: bool) -> Vec<u8> {
     vec![enabled as u8]
 }
 
+/// 编码空格行自定义映射的列掩码（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_SPACE_CUSTOM_COLS）。
+/// 格式：mask(u8)。
+pub fn encode_space_custom_cols_value(mask: u8) -> Vec<u8> {
+    vec![mask]
+}
+
 /// 编码「英半列有自定义映射的源字符集合」（对齐 TSF `OnSyncConfig` CONFIG_KEY_CUSTOM_EN_PUNCT）。
 ///
 /// 格式：count(u8) + [ch:u16(LE)]...  源字符均为 ASCII 标点，一个 UTF-16 单元足够。
@@ -1979,7 +1887,7 @@ mod darwin_push_tests {
     }
 
     #[test]
-    fn overlay_frame_layout_is_68_bytes_le() {
+    fn overlay_frame_layout_is_72_bytes_le() {
         let f = encode_overlay_frame(&OverlayFrameMeta {
             kind: 2,
             seq: 9,
@@ -1998,8 +1906,9 @@ mod darwin_push_tests {
             content_w: 110,
             content_h: 30,
             duration_ms: 1500,
+            scale: 2.0,
         });
-        assert_eq!(f.len(), 8 + 68);
+        assert_eq!(f.len(), 8 + 72);
         assert_eq!(cmd_of(&f), CMD_OVERLAY_FRAME);
         let p = &f[8..];
         let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
@@ -2013,6 +1922,7 @@ mod darwin_push_tests {
         assert_eq!((i(44), i(48), i(52)), (16, 3, 4));
         assert_eq!((u(56), u(60)), (110, 30));
         assert_eq!(i(64), 1500);
+        assert_eq!(f32::from_le_bytes(p[68..72].try_into().unwrap()), 2.0);
     }
 
     #[test]
@@ -2123,121 +2033,5 @@ mod darwin_push_tests {
         assert_eq!(sub[1].flags & 0x01, 0x01); // separator
         assert_eq!(sub[2].id, 4001);
         assert_eq!(sub[2].flags & 0x04, 0x04); // disabled
-    }
-
-    /// 读完四段字符串后的偏移（旧 `.app` 只读到这里）。
-    fn after_strings(p: &[u8], expect: [&str; 4]) -> usize {
-        let mut off = 0usize;
-        for s in expect {
-            let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
-            assert_eq!(n, s.len());
-            assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
-            off += 4 + n;
-        }
-        off
-    }
-
-    #[test]
-    fn tooltip_show_four_strings_then_empty_runs() {
-        let f = encode_tooltip_show("abc", "#fff", "#000", "/p.ttf", &[]);
-        assert_eq!(cmd_of(&f), CMD_TOOLTIP_SHOW);
-        let p = &f[8..];
-        let off = after_strings(p, ["abc", "#fff", "#000", "/p.ttf"]);
-        assert_eq!(&p[off..], &0u32.to_le_bytes(), "空 runs 也写一个 count = 0");
-    }
-
-    /// runs 尾段：UTF-16 区间 + rgba 小端 u32（字节依次 R、G、B、A）。
-    #[test]
-    fn tooltip_show_runs_tail_layout() {
-        let runs = [
-            TooltipColorRun {
-                start: 0,
-                len: 4,
-                rgba: [0x11, 0x22, 0x33, 0x44],
-            },
-            TooltipColorRun {
-                start: 5,
-                len: 2,
-                rgba: [0xFF, 0x00, 0x80, 0xFF],
-            },
-        ];
-        let f = encode_tooltip_show("[拼音]\n你", "", "", "", &runs);
-        let p = &f[8..];
-        let off = after_strings(p, ["[拼音]\n你", "", "", ""]);
-        let u32_at = |i: usize| u32::from_le_bytes(p[off + i..off + i + 4].try_into().unwrap());
-        assert_eq!(u32_at(0), 2);
-        assert_eq!((u32_at(4), u32_at(8)), (0, 4));
-        assert_eq!(u32_at(12), 0x4433_2211, "R | G<<8 | B<<16 | A<<24");
-        assert_eq!((u32_at(16), u32_at(20)), (5, 2));
-        assert_eq!(&p[off + 24..off + 28], &[0xFF, 0x00, 0x80, 0xFF]);
-        assert_eq!(off + 28, p.len());
-    }
-
-    #[test]
-    fn status_show_three_strings_then_four_i32() {
-        let f = encode_status_show("中 ，", "#111", "#eee", 50, 80, 1000, 6);
-        assert_eq!(cmd_of(&f), CMD_STATUS_SHOW);
-        let p = &f[8..];
-        let mut off = 0usize;
-        for s in ["中 ，", "#111", "#eee"] {
-            let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
-            assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
-            off += 4 + n;
-        }
-        assert_eq!(i32::from_le_bytes(p[off..off + 4].try_into().unwrap()), 50);
-        assert_eq!(
-            i32::from_le_bytes(p[off + 4..off + 8].try_into().unwrap()),
-            80
-        );
-        assert_eq!(
-            i32::from_le_bytes(p[off + 8..off + 12].try_into().unwrap()),
-            1000
-        );
-        assert_eq!(
-            i32::from_le_bytes(p[off + 12..off + 16].try_into().unwrap()),
-            6,
-            "锚点编码是尾部追加段"
-        );
-        assert_eq!(off + 16, p.len());
-    }
-
-    #[test]
-    fn empty_payload_frames_are_header_only() {
-        assert_eq!(encode_tooltip_hide().len(), 8);
-        assert_eq!(encode_status_hide().len(), 8);
-        assert_eq!(encode_toast_hide().len(), 8);
-        assert_eq!(cmd_of(&encode_tooltip_hide()), CMD_TOOLTIP_HIDE);
-        assert_eq!(cmd_of(&encode_status_hide()), CMD_STATUS_HIDE);
-        assert_eq!(cmd_of(&encode_toast_hide()), CMD_TOAST_HIDE);
-    }
-
-    #[test]
-    fn candidate_menu_flags_count_then_bytes() {
-        let f = encode_candidate_menu_flags(&[0x01, 0x10, 0x00]);
-        assert_eq!(cmd_of(&f), CMD_CANDIDATE_MENU_FLAGS);
-        let p = &f[8..];
-        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 3);
-        assert_eq!(&p[4..7], &[0x01, 0x10, 0x00]);
-    }
-
-    #[test]
-    fn toast_show_six_strings_then_two_i32() {
-        let f = encode_toast_show("标题", "正文", "#1", "#2", "#3", "bottom_right", 5000, 320);
-        assert_eq!(cmd_of(&f), CMD_TOAST_SHOW);
-        let p = &f[8..];
-        let mut off = 0usize;
-        for s in ["标题", "正文", "#1", "#2", "#3", "bottom_right"] {
-            let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
-            assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
-            off += 4 + n;
-        }
-        assert_eq!(
-            i32::from_le_bytes(p[off..off + 4].try_into().unwrap()),
-            5000
-        );
-        assert_eq!(
-            i32::from_le_bytes(p[off + 4..off + 8].try_into().unwrap()),
-            320
-        );
     }
 }

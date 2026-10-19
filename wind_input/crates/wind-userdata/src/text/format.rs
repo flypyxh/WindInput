@@ -212,6 +212,23 @@ mod tests {
         assert_eq!(d.entries[0].line, 8, "行号含头部行");
     }
 
+    /// 文件头前的说明行不参与解析，行号照常含它。
+    #[test]
+    fn banner_line_before_header_is_ignored() {
+        let d = p(
+            &format!(
+                "{}\n{HEAD}你好\tni hao\t100\n",
+                crate::text::banner::USER_DICT
+            ),
+            false,
+        );
+        assert_eq!(d.header.kind.as_deref(), Some("words"));
+        assert!(d.header.syllable_codes && d.header.escape);
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!((d.entries[0].text.as_str(), d.entries[0].line), ("你好", 9));
+        assert_eq!(d.bad_lines, 0);
+    }
+
     #[test]
     fn bad_lines_are_skipped_and_counted() {
         let d = p(

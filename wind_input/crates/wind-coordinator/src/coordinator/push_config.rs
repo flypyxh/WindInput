@@ -107,6 +107,7 @@ impl Coordinator {
         self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
         self.push_cn_passthrough_punct_config(client_token); // 中文模式该透传的标点：DLL 据此**不**吃
         self.push_en_passthrough_punct_config(client_token); // 同上，英文标点态那份（超集）
+        self.push_space_custom_cols_config(client_token); // 空格行自定义列：DLL 重连从 0 起步
         self.push_pair_state_ttl_config(client_token); // 配对状态时效（DLL 侧闸门据此判陈旧）
         self.push_ctrl_space_toggle_config(client_token); // Ctrl+空格 切换开关（GH#172）：DLL 重连从「开」起步
         // 诊断采集开关：DLL 每次重连都从默认值（关）起步，握手不推则 HUD 开着也收不到
@@ -443,6 +444,21 @@ impl Coordinator {
         }
     }
 
+    /// 下发空格行自定义映射的列掩码（`CONFIG_KEY_SPACE_CUSTOM_COLS`）。中文模式空缓冲时
+    /// DLL 据此吃下空格转发；出字侧见 VK_SPACE 分支的 `idle_space_eaten`。
+    pub fn push_space_custom_cols_config(&self, client_token: u64) {
+        let value = wind_ipc::codec::encode_space_custom_cols_value(self.rt().space_custom_cols);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_SPACE_CUSTOM_COLS,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
+    }
+
     /// 方案 override（`schema.saveConfig` / `schema.resetConfig`）落盘后，重建 `ConfigBundle`
     /// 里的**跨方案派生集合**并下发 DLL（GH#144）。
     ///
@@ -466,6 +482,7 @@ impl Coordinator {
         self.push_custom_en_punct_config(0);
         self.push_cn_passthrough_punct_config(0);
         self.push_en_passthrough_punct_config(0);
+        self.push_space_custom_cols_config(0);
         let active_token = self.push_server.active_token();
         if active_token != 0 {
             self.push_activation_status(active_token);

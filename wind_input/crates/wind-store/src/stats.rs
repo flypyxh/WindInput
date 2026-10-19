@@ -312,7 +312,11 @@ impl Store {
             }
             return Ok(());
         }
-        let text = toml::to_string(&MonthFile { version: 1, days })?;
+        let text = format!(
+            "{}\n{}",
+            wind_userdata::text::banner::STATS,
+            toml::to_string(&MonthFile { version: 1, days })?
+        );
         wind_userdata::text::fold::commit_text(&p, text.as_bytes(), None)
     }
 
@@ -500,7 +504,11 @@ impl Store {
 
     /// 写入统计全局元数据。
     pub fn put_stats_meta(&self, meta: &StatsMeta) -> anyhow::Result<()> {
-        let text = toml::to_string(meta)?;
+        let text = format!(
+            "{}\n{}",
+            wind_userdata::text::banner::STATS,
+            toml::to_string(meta)?
+        );
         wind_userdata::text::fold::commit_text(&self.stats_meta_path(), text.as_bytes(), None)
     }
 
@@ -1179,7 +1187,10 @@ mod tests {
         s.put_daily_stat("2026-10-15", &sample_day()).unwrap();
         assert_eq!(s.get_daily_stat("2026-10-15").unwrap().chinese, 100);
         assert_eq!(
-            corrupt_names(p.parent().unwrap(), "2026-10.toml.corrupt-"),
+            corrupt_names(
+                &s.user_text_dir().join(".backup/stats"),
+                "2026-10.toml.corrupt-"
+            ),
             1
         );
         wind_userdata::issues::clear(&p);
@@ -1194,10 +1205,16 @@ mod tests {
         assert!(before.total_chars > 0);
         let mp = s.stats_dir().join("meta.toml");
         std::fs::write(&mp, "total_chars = \"x").unwrap();
-        let _ = std::fs::remove_file(s.stats_dir().join("meta.toml.bak"));
+        let _ = std::fs::remove_file(wind_userdata::text::fold::backup_path(&mp));
         let after = s.stats_meta_or_recalc(1.0).unwrap();
         assert_eq!(after.total_chars, before.total_chars);
-        assert_eq!(corrupt_names(&s.stats_dir(), "meta.toml.corrupt-"), 1);
+        assert_eq!(
+            corrupt_names(
+                &s.user_text_dir().join(".backup/stats"),
+                "meta.toml.corrupt-"
+            ),
+            1
+        );
         wind_userdata::issues::clear(&mp);
     }
 
@@ -1216,7 +1233,7 @@ mod tests {
         s.put_daily_stat("2026-10-01", &sample_day()).unwrap();
         let p = s.stats_dir().join("2026-09.toml");
         std::fs::write(&p, "days = [[[").unwrap();
-        let _ = std::fs::remove_file(s.stats_dir().join("2026-09.toml.bak"));
+        let _ = std::fs::remove_file(wind_userdata::text::fold::backup_path(&p));
         let v = s.daily_stats("2026-09-01", "2026-10-31").unwrap();
         assert!(v.iter().any(|(d, _)| d == "2026-10-01"));
         wind_userdata::issues::clear(&p);

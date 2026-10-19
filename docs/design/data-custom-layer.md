@@ -780,9 +780,11 @@ hide = ["key:input.temp_english.*", "key:input.english_case_cycle_key", "feature
 1. **隐藏 ≠ 不存在 ≠ 关闭。** 这是本清单里第三种减法，与 `[schemas]`/`[themes] hide`（「不存在」）
    不同轴：被隐藏的设置照常生效，值仍来自定制层 / 用户层，设置程序不改写它。要关掉功能，
    定制者在 `data_custom/config.toml` 里设值、再在这里藏——两件事不得合成一个开关（同契约 5）。
-2. **选择器只有两种。** `key:<配置键>`（尾部 `*` = 前缀匹配）与 `feature:<id>`（取值见
-   `wind_config::SETTINGS_FEATURES`，目前只有 `wizard`）。不用界面上的分区名：那是文案，随
-   界面调整改名。解析住在 `wind-config/src/custom_settings.rs`，`config check` 与设置程序共用。
+2. **选择器只有两种。** `key:<配置键>`（尾部 `*` = 前缀匹配；两种写法都连带 `<配置键>#视图`
+   项，`.*` 另命中键本身）与 `feature:<id>`（取值见 `wind_config::SETTINGS_FEATURES`：向导，
+   以及设置清单之外的手写卡——主题导入导出、主题编辑器、系统集成、备份还原、检查更新、底栏明暗
+   等，一张一个 id）。不用界面上的分区名：那是文案，随界面调整改名。解析住在
+   `wind-config/src/custom_settings.rs`，`config check` 与设置程序共用。
 3. **折进 `MItem.hidden`，不开新判据。** 与 platform / variant 门控同一条路：行渲染、空分区
    剔除（`sections_of`）、二级导航、搜索索引都只认 `hidden`。手工拼的卡（方案页四张引擎配置卡）
    在项全被隐藏时返回 `None`，模糊音网格以 `schema.pinyin.fuzzy.enabled` 整块判定。

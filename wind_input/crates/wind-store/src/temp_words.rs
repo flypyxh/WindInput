@@ -205,6 +205,7 @@ impl Store {
         schema: &str,
         text: &str,
     ) -> anyhow::Result<(usize, usize)> {
+        self.check_learned_not_held(wind_userdata::record::Target::Temp, schema)?;
         let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         for r in &rows {
             // code 列可能是带空格的音节码 → 拆成扁平码 + 边界；无空格则 boundary=0。
@@ -229,6 +230,7 @@ impl Store {
         schema: &str,
         rows: &[wdict::WordIo],
     ) -> anyhow::Result<usize> {
+        self.check_learned_not_held(wind_userdata::record::Target::Temp, schema)?;
         let rows: Vec<wind_userdata::runtime::TempWord> = rows
             .iter()
             .map(|r| {
@@ -253,6 +255,7 @@ impl Store {
 
     /// 清空某方案全部临时词（单写事务），返回删除条数。
     pub fn clear_temp_words(&self, schema: &str) -> anyhow::Result<usize> {
+        self.check_learned_not_held(wind_userdata::record::Target::Temp, schema)?;
         let n = self.runtime().clear_temp(schema)?;
         self.bump_words_gen(schema);
         Ok(n)
@@ -260,6 +263,7 @@ impl Store {
 
     /// 删除临时词（不存在静默成功）。
     pub fn remove_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
+        self.check_learned_not_held(wind_userdata::record::Target::Temp, schema)?;
         self.runtime().remove_temp(schema, code, text)?;
         self.bump_words_gen(schema);
         self.after_write();
@@ -270,6 +274,7 @@ impl Store {
     /// 权重统一取 `PROMOTED_WEIGHT`（与已存在的用户词权重取 max，不覆盖手动加词的更高权重，
     /// 不再沿用临时词自身权重）；count=temp+user，created_at 优先保留 user 旧值。
     pub fn promote_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<bool> {
+        self.check_learned_not_held(wind_userdata::record::Target::Temp, schema)?;
         // 先写用户词、再删临时词：崩溃在两步之间两边各有一份，用户层去重兜得住；反过来会丢词。
         // `add_user_word` 本身就是「已存在则权重取 max、0 边界补齐」，与旧事务里的合并一致；
         // count 相加不再保留（用户词 P2 起没有 count）。

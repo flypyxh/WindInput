@@ -165,6 +165,7 @@ fn fuzzy_all() -> FuzzyConfig {
         uan_uang: true,
         un_ong: true,
         eng_ong: true,
+        ..Default::default()
     }
 }
 

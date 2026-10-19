@@ -82,9 +82,10 @@ Linux 会被误归进去（拼 `.exe` 设置路径、弹进程内菜单并吞键
 
 ## 5b. 提示类浮层（状态气泡 / Toast / tooltip）
 
-与 macOS 不同：`.app` 原生排字，Linux addon 不排字——服务端光栅化（与候选窗同构），像素走各层
-独立的 SHM 段，`CMD_OVERLAY_FRAME` 只带落位规则与自动隐藏时长；落位（需要屏幕几何）与计时都在
-addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
+addon 不排字——服务端光栅化（与候选窗同构），像素走各层独立的 SHM 段，`CMD_OVERLAY_FRAME` 只带落位
+规则与自动隐藏时长；落位（需要屏幕几何）与计时都在宿主。macOS `.app` 自 2026-10 起也是这条路（早先
+是原生 NSPanel 排字），两平台共用 `wind-ui/src/overlay_host.rs` / `menu_host.rs`，见
+`docs/design/mac-overlay-raster.md`。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 
 **鼠标交互对齐 Windows**（`wind_linux/include/OverlayInput.h`）。按「谁知道判据」分两半：
 
@@ -96,7 +97,7 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 | 状态气泡右键菜单（常驻 / 焦点切换时显示 / 固定位置 / 恢复默认 / 截图） | `RequestStatusMenu` → `show_status_menu` | `menu.open`（target −2）→ 同一个 `show_status_menu`；「固定位置」经 `pos.status_tip.query` 取当前位置 |
 | 悬停 / 拖动 / 菜单开着时不自动消失，结束后重新计时 | UI 循环按 `interacting()` 顺延 | addon（计时本来就在 addon） |
 | Toast 点击关闭、悬停暂停 | 无（Windows Toast 不收鼠标） | addon 本地（Linux 新增） |
-| 「截图此窗口」 | 窗口自己截 | 服务端从该层 SHM 读回、就地存盘进剪贴板（macOS 的像素在 `.app`，走 `shot.panel`；Linux 不走） |
+| 「截图此窗口」 | 窗口自己截 | 服务端从该层 SHM 读回、就地存盘进剪贴板（macOS 同） |
 
 不做：「悬停行高亮」——Windows 的提示气泡也没有这一项，没有可对齐的行为。
 
@@ -105,7 +106,7 @@ addon。细节见 `wind_linux/AGENTS.md`「光栅浮层」。
 不用 Fcitx5 / 桌面的菜单：与候选窗、浮层同构，服务进程光栅化、addon 贴图，外观与 Windows 同一份。
 
 - **复用 Windows 的 `popup_menu` 整套**（级联状态机、视图树、主题、定位、命中测试、增量重绘）。
-  `wind-ui/src/menu_linux.rs` 只换两头：出——各级像素写各自的 SHM 段（`_MN0`…），推
+  `wind-ui/src/menu_host.rs` 只换两头：出——各级像素写各自的 SHM 段（`_MN0`…），推
   `CMD_OVERLAY_FRAME`（kind = `OVERLAY_KIND_MENU + 级`，落位 `EXACT`）；进——addon 在菜单打开期间
   **抓住指针**（X11 pointer grab，`owner_events=1`），把移动 / 按下原样报上来（`CMD_MENU_POINTER`
   0x021B，16 字节），命中测试在服务端做。键盘仍走 `forward_menu_key`（不抓键盘）。

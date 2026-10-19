@@ -540,6 +540,11 @@ impl PopupMenu {
 
     /// DPI 动态化：按显示点所在显示器实时取缩放，变化则更新字号并按新缩放重解析主题几何。
     fn ensure_scale(&mut self, x: i32, y: i32) {
+        #[cfg(ext_presenter)]
+        let sc = HOST_MENU_SCALE
+            .with(|c| c.get())
+            .unwrap_or_else(|| crate::dpi::scale_for_point(x, y));
+        #[cfg(not(ext_presenter))]
         let sc = crate::dpi::scale_for_point(x, y);
         if (sc - self.scale).abs() > 0.01 {
             self.scale = sc;
@@ -1132,7 +1137,7 @@ impl PopupMenu {
 }
 
 /// 一级菜单当前画好的一帧（外部宿主形态：像素交宿主贴图）。
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 pub(crate) struct LevelFrame<'a> {
     /// 窗口几何 `(左, 上, 宽, 高)`，屏幕坐标，含软投影扩边。
     pub geom: (i32, i32, u32, u32),
@@ -1143,15 +1148,15 @@ pub(crate) struct LevelFrame<'a> {
 }
 
 /// [`LevelFrame::key`]：同 [`plan_render`] 的增量判据——条目、高亮、几何三者都没变即像素没变。
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 #[derive(Clone, PartialEq)]
 pub(crate) struct LevelKey(LevelRender);
 
 /// Linux 外部宿主（Fcitx5 addon）形态：菜单窗口不在本进程，[`LayeredWindow`] 是只持缓冲区的
-/// mock，像素由 `menu_linux` 取走经 SHM 推给 addon。菜单的状态机、渲染、定位、命中测试
+/// mock，像素由 `menu_host` 取走经 SHM 推给 addon。菜单的状态机、渲染、定位、命中测试
 /// 与 Windows 是同一份，只是鼠标事件改由宿主报来（[`Self::on_pointer`]）、工作区改由宿主
 /// 报来（[`set_host_work_area`]）。
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 impl PopupMenu {
     /// 宿主报来的指针事件（屏幕坐标）。语义对齐 Windows：移动与左键走 wnd_proc 的同一套
     /// 处理；右键在哪都只关菜单（`WM_RBUTTONDOWN`）；中键只有落在菜单外才关（菜单外按下
@@ -1207,15 +1212,24 @@ impl PopupMenu {
     }
 }
 
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 thread_local! {
     /// 宿主报来的工作区（左, 上, 右, 下）。菜单与它的渲染线程同在 forwarder 线程。
     static HOST_WORK_AREA: std::cell::Cell<Option<(i32, i32, i32, i32)>> =
         const { std::cell::Cell::new(None) };
+    /// 本次菜单的渲染缩放。macOS 的宿主坐标是点、菜单几何是像素，`scale_for_point` 拿像素坐标
+    /// 去查显示器会查错屏，故由 `menu_host` 按宿主点坐标定好后塞进来；`None` = 照常按点查。
+    static HOST_MENU_SCALE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// 记下本次菜单的渲染缩放（外部宿主形态），见 `HOST_MENU_SCALE`。
+#[cfg(ext_presenter)]
+pub(crate) fn set_host_menu_scale(scale: Option<f32>) {
+    HOST_MENU_SCALE.with(|c| c.set(scale));
 }
 
 /// 记下宿主报来的工作区，供 [`work_area_of`] 用（Linux 外部宿主形态）。
-#[cfg(all(target_os = "linux", ext_presenter))]
+#[cfg(ext_presenter)]
 pub(crate) fn set_host_work_area(area: Option<(i32, i32, i32, i32)>) {
     HOST_WORK_AREA.with(|c| c.set(area));
 }
@@ -1824,7 +1838,7 @@ fn work_area_of(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
         }
     }
     // Linux：屏幕几何只有 addon 拿得到，随「打开菜单」请求报上来（整块根窗口，不分显示器）。
-    #[cfg(all(target_os = "linux", ext_presenter))]
+    #[cfg(ext_presenter)]
     if let Some(wa) = HOST_WORK_AREA.with(|c| c.get()) {
         return Some(wa);
     }

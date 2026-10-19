@@ -57,6 +57,38 @@ fn toggle_opens_and_closes() {
     assert!(!c.softkeyboard_is_open());
 }
 
+/// 菜单里开面板：面板一开就接管主键区，正在打的码若还挂着，候选窗就成了「卡住」的残影。
+/// 与热键入口同一道理（`softkeyboard_hotkey`），只是菜单没有按键应答，走 push 出口。
+#[test]
+fn menu_open_takes_pending_input() {
+    let c = coord();
+    c.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .input_buffer
+        .push_str("gg");
+    assert!(c.has_pending_composition());
+    c.run_menu_cmd(wind_ui_types::MenuCmd::ToggleSoftKeyboard);
+    assert!(c.softkeyboard_is_open());
+    assert!(!c.has_pending_composition(), "开面板后不该残留编码");
+}
+
+/// 关面板方向不动输入态：软键盘态下本就没有输入会话。
+#[test]
+fn menu_close_does_not_touch_input() {
+    let c = coord();
+    c.toggle_softkeyboard(None);
+    assert!(c.softkeyboard_is_open());
+    c.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .input_buffer
+        .push_str("gg");
+    c.run_menu_cmd(wind_ui_types::MenuCmd::ToggleSoftKeyboard);
+    assert!(!c.softkeyboard_is_open());
+    assert!(c.has_pending_composition(), "关面板不该处置编码");
+}
+
 /// 漏掉这次推送的症状极隐蔽：Rust 接管按键，而 C++ 仍按「没开」判定不吃数字键，
 /// 于是数字行整行失效、别的键都正常。
 #[test]

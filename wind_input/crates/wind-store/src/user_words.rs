@@ -13,7 +13,7 @@ use crate::wdict;
 use serde::{Deserialize, Serialize};
 use wind_userdata::runtime::UserWord;
 
-/// 遍历期的**借用视图**：`code` / `text` 直接指向 redb 页里的字节，不分配。
+/// 遍历期的**借用视图**：`code` / `text` 直接借引擎条目里的字符串，不分配。
 ///
 /// 只在 [`Store::for_each_user_word`] 的回调里活着；要留下来就 [`Self::to_record`]。
 #[derive(Debug, Clone, Copy)]
@@ -322,6 +322,7 @@ impl Store {
         text: &str,
         new_weight: i32,
     ) -> anyhow::Result<bool> {
+        self.check_words_not_held(schema)?;
         self.ensure_user_text(schema);
         let updated = self
             .runtime()
@@ -454,9 +455,9 @@ impl Store {
         changed
     }
 
-    /// `dict.reload` 带路径：只认 `<text_dir>/phrases.dict.yaml`、`<text_dir>/<schema>/user.dict.yaml`
-    /// 与 `<text_dir>/<schema>/shadow.dict.yaml`（按路径分量比对，不碰文件系统；`..` 是 `ParentDir`
-    /// 分量，必然比对失败）。任一路径不合规 ⇒ 整体 Err、一个都不同步。返回值同 [`Self::sync_user_texts`]。
+    /// `dict.reload` 带路径：只认 `classify_text_path` 列出的那几种——短语、快捷格式、常用字、补全、
+    /// `charsets/*.yaml`、`stats/*.toml`，以及 `<schema>/` 下的用户词、Shadow、学到的数据、用户分库与
+    /// `dicts.toml`（按路径分量比对，不碰文件系统；`..` 是 `ParentDir` 分量，必然比对失败）。任一路径不合规 ⇒ 整体 Err、一个都不同步。返回值同 [`Self::sync_user_texts`]。
     pub fn reload_user_text_paths(&self, paths: &[String]) -> anyhow::Result<Vec<String>> {
         let targets = paths
             .iter()
@@ -468,12 +469,14 @@ impl Store {
                 TextPath::Phrases => self.sync_phrases().then(|| "phrases".to_string()),
                 TextPath::Quick => self.quick_doc().sync().then(|| "quick_format".to_string()),
                 TextPath::Common => self.common_doc().sync().then(|| "common_chars".to_string()),
-                TextPath::Charsets => self.sync_charsets().then(|| "charsets".to_string()),
+                TextPath::Charsets(_) => self.sync_charsets().then(|| "charsets".to_string()),
                 TextPath::Words(s) => self.sync_user_text(&s).then_some(s),
                 TextPath::Shadow(s) => self.shadow_table_synced(&s).then_some(s),
                 TextPath::Learned(t, s) => self.sync_learned_text(t, &s).then_some(s),
                 TextPath::Completion => self.reload_completions().then(|| "completion".to_string()),
                 TextPath::Stats => None,
+                // 分库不归 store 管内容：交给调用方失效用到该数据方案的方案
+                TextPath::UserDicts(s) => Some(format!("{USER_DICTS_CHANGED}{s}")),
             };
             if let Some(n) = name
                 && !changed.contains(&n)
@@ -548,11 +551,13 @@ impl Store {
 }
 
 /// `dict.reload` 收到的路径指向哪类用户文本。
-enum TextPath {
+#[derive(Clone)]
+pub(crate) enum TextPath {
     Phrases,
     Quick,
     Common,
-    Charsets,
+    /// `charsets/<key>.yaml`：带磁盘上实际的 key。
+    Charsets(String),
     Words(String),
     Shadow(String),
     /// 学到的数据（P5）：`<schema>/{temp,draft}.dict.yaml`、`{freq,assoc}.table.yaml`。
@@ -560,11 +565,16 @@ enum TextPath {
     Completion,
     /// `stats/*.toml`：统计每次按需读文件，重载无需动作。
     Stats,
+    /// 用户分库 `<schema>/dicts/<名>.dict.yaml` 与开关 `<schema>/dicts.toml`。
+    UserDicts(String),
 }
+
+/// 重载 / 结束编辑的返回里，用户分库变了记作 `dicts:<数据方案>`。
+pub const USER_DICTS_CHANGED: &str = "dicts:";
 
 /// 只认 `<base>/` 下的那几种文件。`fold_case`：按不分大小写的文件系统比较（Windows）；
 /// 此时方案名取磁盘上实际的目录名，调用方传来的大小写不一定与之相同。
-fn classify_text_path(
+pub(crate) fn classify_text_path(
     base: &std::path::Path,
     p: &str,
     fold_case: bool,
@@ -598,14 +608,28 @@ fn classify_text_path(
         [f] if is(f, "quick_format.toml") => Ok(TextPath::Quick),
         [f] if is(f, "common_chars.yaml") => Ok(TextPath::Common),
         [f] if is(f, "completion.table.yaml") => Ok(TextPath::Completion),
-        [d, f] if is(d, "charsets") && f.ends_with(&fold(".yaml")) => Ok(TextPath::Charsets),
+        [d, f] if is(d, "charsets") && f.ends_with(&fold(".yaml")) => {
+            let name = schema_dir_name(&base.join("charsets"), f, fold_case);
+            Ok(TextPath::Charsets(
+                name[..name.len() - ".yaml".len()].to_string(),
+            ))
+        }
         [d, f] if is(d, "stats") && f.ends_with(&fold(".toml")) => Ok(TextPath::Stats),
+        [d, l, f]
+            if is(l, crate::user_dicts::LIBS_DIR)
+                && f.strip_suffix(&fold(".dict.yaml"))
+                    .is_some_and(|n| crate::user_dicts::validate_name(n).is_ok()) =>
+        {
+            Ok(TextPath::UserDicts(schema_dir_name(base, d, fold_case)))
+        }
         [d, f] => {
             let schema = schema_dir_name(base, d, fold_case);
             if is(f, "user.dict.yaml") {
                 Ok(TextPath::Words(schema))
             } else if is(f, "shadow.dict.yaml") {
                 Ok(TextPath::Shadow(schema))
+            } else if is(f, crate::user_dicts::META_FILE) {
+                Ok(TextPath::UserDicts(schema))
             } else if let Some(t) = crate::learned_text::LEARNED_TARGETS.into_iter().find(|t| {
                 crate::learned_text::learned_binding(base, *t, "s")
                     .and_then(|b| b.path.file_name().map(|n| n.to_string_lossy().into_owned()))

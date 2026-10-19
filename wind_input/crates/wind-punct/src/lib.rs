@@ -319,6 +319,17 @@ pub fn custom_covered_punct_chars(conv: &PunctuationConverter, punct: &PunctConf
         .collect()
 }
 
+/// 空格行哪几列配了自定义映射：第 i 位 = 列 i（[`punct_col_idx`] 的列号）非空。
+///
+/// 中文模式空缓冲时 DLL 默认透传空格（保留网页滚动等宿主语义），只在全角态吃；半角列配了
+/// 映射就得据此多吃，否则按 `OnTestKeyDown` 结论走的宿主（Notepad++、WPS）直接收到半角
+/// 空格，而照调 `OnKeyDown` 的 Chrome 类宿主却正常（t337）。查表同走 [`custom_lookup`]。
+pub fn custom_space_cols(conv: &PunctuationConverter, punct: &PunctConfig) -> u8 {
+    (0..4)
+        .filter(|&col| custom_lookup(conv, punct, ' ', col).is_some())
+        .fold(0, |mask, col| mask | (1 << col))
+}
+
 /// 该字符是否**正在**参与自动配对。配对栈由引擎维护，透传掉栈就断了，故命中即不能透传。
 ///
 /// ⚠️ **必须连开关一起判**。两张配对表出厂就有值（`()[]{}｛｝` 等），而
@@ -556,6 +567,22 @@ mod tests {
         // 空白不是按键产物，不进吃键集。
         c.symbol.english_chars = ". ,".to_string();
         assert_eq!(english_smart_source_chars(&c), vec![',', '.']);
+    }
+
+    #[test]
+    fn custom_space_cols_marks_mapped_columns() {
+        let conv = PunctuationConverter::new();
+        let mut c = cfg();
+        assert_eq!(custom_space_cols(&conv, &c.punct), 0, "出厂无映射");
+        c.punct.custom_enabled = true;
+        // 列序：0=中半 1=英全 2=中全 3=英半；空串 = 回落默认，不算配了。
+        c.punct.custom_mappings.insert(
+            " ".into(),
+            vec!["\u{3000}".into(), "".into(), "\u{3000}".into(), "".into()],
+        );
+        assert_eq!(custom_space_cols(&conv, &c.punct), 0b0101);
+        c.punct.custom_enabled = false;
+        assert_eq!(custom_space_cols(&conv, &c.punct), 0, "总开关关着不算");
     }
 
     #[test]

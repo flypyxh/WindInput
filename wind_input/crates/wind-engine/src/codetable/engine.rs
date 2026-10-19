@@ -1002,9 +1002,12 @@ impl Engine for CodeTableEngine {
             Some(text) => (true, text),
             None => (false, String::new()),
         };
-        // 满码空码清空：无候选 + 码长达满码 + 无更长后继（避免吞掉长码精确匹配）。
-        let should_clear = is_empty
-            && self.opts.clear_on_empty_max
+        // 满码空码清空的**资格**：码长达满码 + 无更长后继（避免吞掉长码精确匹配）。
+        //
+        // 不看本处候选是否为空：检索范围、单字输入等过滤在协调器里才做，`lynn` 这里有
+        // 「甿」「軶」，常用字档下用户看到的却是空列表。空不空由协调器按最终列表裁决
+        // （`clear_blocked_by_candidates`）。
+        let should_clear = self.opts.clear_on_empty_max
             && input.chars().count() >= self.max_code_length
             && !has_longer;
         Ok(ConvertResult {

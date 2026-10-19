@@ -77,7 +77,8 @@ pub struct ConvertResult {
     pub commit_text: String,
     /// 是否为空码（有输入但无候选）
     pub is_empty: bool,
-    /// 满码空码时是否应清空缓冲（码表 clear_on_empty_max）
+    /// 满码空码清空的资格（码表 clear_on_empty_max：满码 + 无更长后继）。**不含**「无候选」——
+    /// 候选要经协调器过滤后才是用户所见，由协调器按最终列表裁决是否真清空。
     pub should_clear: bool,
     /// 精确匹配空码补全的**备选池**（码表 `single_code_input` + `single_code_complete`）：
     /// 从更长编码取的候选，按引擎序排好，**尚未**计入 `candidates`。
@@ -448,8 +449,9 @@ pub trait Engine: Send + Sync {
     /// 通配用的码长（spec §10）：协调器据此判「满码后通配键按字面」与混输「超码长整串字面」。
     /// 默认即 [`Self::max_code_length`]；混输返回主码表的码长。
     ///
-    /// ⚠️ 与 `max_code_length` 分开是有意的：混输的 `max_code_length` 刻意为 0，它还决定
-    /// 协调器的短语自动上屏门槛（`phrase_auto_commit_min_len`），代理过去会连带改变那条行为。
+    /// ⚠️ 与 `max_code_length` 分开是有意的：混输的 `max_code_length` 刻意为 0，代理过去会
+    /// 连带改变依赖它的那些判据。协调器要「混输按主码表算」时走
+    /// `EngineManager::active_full_code_length`（即本值）。
     fn wildcard_code_length(&self) -> usize {
         self.max_code_length()
     }

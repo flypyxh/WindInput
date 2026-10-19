@@ -9,6 +9,8 @@ import WindInputKit
 //   2. 收 CmdHostRenderFrame → snapshot SHM → CGImage → 贴 NSPanel
 //   3. 收 CmdCandidateRects → 存命中矩形, 喂 panel 供鼠标 hit-test
 //   4. NSPanel 鼠标点选 → 发 CmdCandidateSelect 回 Go (经独立 request 连接)
+//   4b. 收 CmdOverlayFrame → 交 OverlayHost (悬停提示 / 状态气泡 / Toast / 自绘菜单, 同样是
+//       服务端光栅化后经 SHM 贴图); 候选悬停与悬停提示的保持 / 宽限在这里协调
 //   5. 收 push 通道的 commit/composition (鼠标选词结果走 push) → 路由到当前
 //      active InputController, 由其 insertText/setMarkedText 上屏
 //
@@ -24,20 +26,23 @@ public protocol PushResponder: AnyObject {
     /// 供**绕过 router 直接改文档**的路径调用：合成按键往宿主打字符/退格，文档变了而
     /// 我们的记账一无所知。这类路径拿不到「改成了什么」，只能作废，回落默认行为。
     func invalidateDigitTracking()
-
-    /// 候选框右键菜单收起、焦点闪断平息后调用: 核对宿主里的 marked text 是否还在
-    /// (见 CandidateMenuTracking)。
-    func menuTrackingDidSettle()
 }
 
 public final class CandidatePanelHost {
     public static let shared = CandidatePanelHost()
 
     private let panel: CandidatePanel
-    private let tooltip: TooltipPanel
-    private let statusBubble: StatusBubblePanel
-    private let toast: ToastPanel
-    private var lastHoverIndex = -1   // 仅主线程访问 (onHover/tooltipShow 都切主线程)
+    /// 悬停提示 / 状态气泡 / Toast / 自绘菜单的承载层。仅主线程使用。
+    private let overlays = OverlayHost()
+    /// 最近一次**实际报给服务端**的候选悬停 (仅主线程)。可能晚于鼠标真实位置: 悬停提示显示着时,
+    /// 候选悬停的变化会被延后上报, 给「从候选行穿过空隙挪进提示」留时间 (见 `handleRawHover`)。
+    private var reportedHover = -1
+    private var pendingHover: DispatchWorkItem?
+    /// 待报悬停的目标 (计时中途目标可换, 计时不重排)。
+    private var pendingHoverTarget = -1
+    private var pendingRecheck: DispatchWorkItem?
+    /// 服务端最近一次建议的候选窗落点 (wire 左上, 仅主线程)。悬停提示按「候选窗实际落点 − 它」平移。
+    private var lastSuggestedWire: (x: CGFloat, y: CGFloat)?
     private var reader: SharedMemoryReader?
     private var push: PushClient?
     private var sendClient: BridgeClient?       // 发 CmdCandidateSelect 用 (request 连接)
@@ -56,38 +61,19 @@ public final class CandidatePanelHost {
     private init() {
         if Thread.isMainThread {
             panel = CandidatePanel()
-            tooltip = TooltipPanel()
-            statusBubble = StatusBubblePanel()
-            toast = ToastPanel()
         } else {
             var p: CandidatePanel?
-            var t: TooltipPanel?
-            var s: StatusBubblePanel?
-            var to: ToastPanel?
-            DispatchQueue.main.sync { p = CandidatePanel(); t = TooltipPanel(); s = StatusBubblePanel(); to = ToastPanel() }
+            DispatchQueue.main.sync { p = CandidatePanel() }
             panel = p!
-            tooltip = t!
-            statusBubble = s!
-            toast = to!
         }
         panel.onSelect = { [weak self] index in self?.handlePanelClick(index) }
-        panel.onHover = { [weak self] index in
-            guard let self = self else { return }
-            self.lastHoverIndex = index               // 主线程 (mouseMoved)
-            if index < 0 { self.tooltip.hidePanel() }  // 离开候选立即收起, 文本到达前先隐
-            self.sendFrame(BinaryCodec.encodeCandidateHoverFrame(index: index))
-        }
-        panel.onContextAction = { [weak self] index, action in
-            self?.sendFrame(BinaryCodec.encodeCandidateContextMenuFrame(index: index, action: action))
-        }
+        panel.onHover = { [weak self] index in self?.handleRawHover(index) }
+        panel.onContextMenu = { [weak self] target in self?.openMenu(target: target) }
+        wireOverlays()
         panel.onScroll = { [weak self] delta in
             self?.sendFrame(BinaryCodec.encodeCandidateScrollFrame(delta: delta))
         }
         panel.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posCandidate, x, y) }
-        statusBubble.onMoved = { [weak self] x, y in self?.reportPos(ExtKind.posStatusTip, x, y) }
-        panel.unifiedMenuProvider = { [weak self] in self?.requestUnifiedMenu() }
-        panel.onUnifiedAction = { [weak self] id in self?.sendMenuAction(id) }
-        CandidateMenuTracking.didSettle = { [weak self] in self?.activeResponder?.menuTrackingDidSettle() }
         // 菜单栏状态菜单复用候选框空白处右键的同一统一菜单树与回发路径, 保证两处一致。
         ModeStatusController.shared.unifiedMenuProvider = { [weak self] in self?.requestUnifiedMenu() }
         ModeStatusController.shared.onUnifiedAction = { [weak self] id in self?.sendMenuAction(id) }
@@ -113,47 +99,133 @@ public final class CandidatePanelHost {
         sendFrame(BinaryCodec.encodeExtFrame(kind: kind, body: body))
     }
 
-    /// 截自家浮窗存盘 + 复制剪贴板, 结果回上行。主线程调用 (要渲染视图层级)。
-    ///
-    /// `echo` 里除 `items` 外的字段**原样回传**: 文案所需的上下文 (模式、数量、目录、
-    /// 候选是否已进剪贴板) 由服务端放进来又拿回去, 两边都不必为一次往返留状态。
-    ///
-    /// 未知 target **不静默丢弃**: 回一条失败, 免得服务端那边少一条结果却不知为何。
-    ///
-    /// **右键菜单不在可截之列**: macOS 上那是原生 NSMenu, 截它要走
-    /// `CGWindowListCreateImage` + 屏幕录制授权 (见 `PanelCapture`)。只截我们自己画的。
-    private func capturePanels(_ items: [[String: Any]], echo: [String: Any]) {
-        var results: [[String: Any]] = []
-        for item in items {
-            guard let target = item["target"] as? String,
-                  let path = item["path"] as? String else { continue }
-            var r: [String: Any] = ["target": target, "path": path]
-            let panel: NSPanel? = switch target {
-            case "status_tip": statusBubble
-            case "tooltip": tooltip
-            case "toast": toast
-            default: nil
-            }
-            if let panel = panel {
-                do {
-                    r["clipboard"] = try PanelCapture.snapshot(panel, toPath: path)
-                    r["ok"] = true
-                } catch {
-                    r["ok"] = false
-                    r["reason"] = (error as? LocalizedError)?.errorDescription
-                        ?? error.localizedDescription
-                }
-            } else {
-                r["ok"] = false
-                r["reason"] = "unknown_target"
-            }
-            results.append(r)
+    // MARK: - 浮层 (悬停提示 / 状态气泡 / Toast / 自绘菜单)
+
+    /// 把 `OverlayHost` 的注入点接到本类的发送通路上。
+    private func wireOverlays() {
+        overlays.sendExt = { [weak self] kind, obj in
+            guard let body = try? JSONSerialization.data(withJSONObject: obj) else { return }
+            self?.sendFrame(BinaryCodec.encodeExtFrame(kind: kind, body: body))
         }
-        var body = echo
-        body.removeValue(forKey: "items")
-        body["results"] = results
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        sendFrame(BinaryCodec.encodeExtFrame(kind: ExtKind.shotResult, body: data))
+        overlays.sendMenuPointer = { [weak self] event, button, x, y in
+            self?.sendAsync(BinaryCodec.encodeMenuPointerFrame(event: event, button: button, x: x, y: y))
+        }
+        overlays.candidateShift = { [weak self] in self?.candidateShift() ?? (0, 0) }
+        overlays.onTooltipPointerEntered = { [weak self] in
+            // 指针挪进了提示: 撤掉待报的悬停变化与重定, 提示留着让用户够得着它。
+            self?.pendingHover?.cancel(); self?.pendingHover = nil
+            self?.pendingRecheck?.cancel(); self?.pendingRecheck = nil
+        }
+        overlays.onTooltipPointerExited = { [weak self] in
+            self?.scheduleHoverRecheck(afterMs: OverlayInput.tipGraceMs)
+        }
+        overlays.onMenuClosed = { [weak self] in self?.scheduleHoverRecheck(afterMs: 0) }
+        overlays.onMenuRequested = { [weak self] in self?.cancelPendingHover() }
+    }
+
+    /// 候选窗实际落点 − 服务端建议落点 (点)。候选窗被钳边 / 翻转 / 拖动过时, 悬停提示跟着挪。
+    private func candidateShift() -> (dx: CGFloat, dy: CGFloat) {
+        guard let sug = lastSuggestedWire, let actual = panel.wireTopLeft() else { return (0, 0) }
+        return (CGFloat(actual.0) - sug.x, CGFloat(actual.1) - sug.y)
+    }
+
+    /// 撤掉待报的悬停变化与重定 (指针进了提示 / 点击 / 菜单请求时)。
+    private func cancelPendingHover() {
+        pendingHover?.cancel(); pendingHover = nil
+        pendingRecheck?.cancel(); pendingRecheck = nil
+    }
+
+    /// 候选悬停变化 (主线程)。悬停提示显示着时, 变化被延后上报: 一离开候选就报的话, 提示当场被
+    /// 收掉, 用户永远够不着它 (Windows `candidate_window::hover_move` 同一规则)。
+    private func handleRawHover(_ raw: Int) {
+        // 菜单开着时指针归捕获窗：候选视图补发的 mouseExited 不是用户真的移开了，别据此收提示。
+        // 菜单收起时 `onMenuClosed` 会按指针真实位置重定一次。
+        guard !overlays.isMenuOpen else { return }
+        let norm = raw < 0 ? -1 : raw
+        // 已有待报项: 回到已报的目标 = 撤销待报; 否则只换目标, 计时不顺延 (一路擦过多个候选
+        // 不该把宽限无限拖长)。对位 Linux addon 的 candidateHover。
+        if pendingHover != nil {
+            if norm == reportedHover {
+                pendingHover?.cancel(); pendingHover = nil
+            } else {
+                pendingHoverTarget = raw
+            }
+            return
+        }
+        let ms = OverlayInput.hoverDeferMs(last: reportedHover, raw: raw,
+                                           tipShown: overlays.isShown(OverlayKind.tooltip))
+        if ms == 0 {
+            reportHover(raw)
+            return
+        }
+        pendingHoverTarget = raw
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingHover = nil
+            self.reportHover(self.pendingHoverTarget)
+        }
+        pendingHover = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(ms)), execute: item)
+    }
+
+    private func reportHover(_ index: Int) {
+        reportedHover = index < 0 ? -1 : index   // 翻页器 (-1/-2) 与无悬停哨兵一律记作「无」
+        sendFrame(BinaryCodec.encodeCandidateHoverFrame(index: index))
+    }
+
+    /// 离开悬停提示 (或菜单收起) 后, 宽限到期重新定悬停: 指针回到提示 / 提示所属候选行就不动,
+    /// 在候选窗别处报那里, 在外面报「无」(提示随之收起)。
+    private func scheduleHoverRecheck(afterMs ms: UInt32) {
+        pendingRecheck?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.pendingRecheck = nil
+            self?.recheckHover()
+        }
+        pendingRecheck = item
+        if ms == 0 {
+            DispatchQueue.main.async(execute: item)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(ms)), execute: item)
+        }
+    }
+
+    private func recheckHover() {
+        // 菜单开着不重定: 提示右键菜单挂在提示上, 此刻把悬停报成「无」会把提示收掉。
+        // 菜单关闭时 `onMenuClosed` 会补做一次。
+        guard !overlays.isMenuOpen else { return }
+        guard reportedHover >= 0 || overlays.isShown(OverlayKind.tooltip) else { return }
+        let m = NSEvent.mouseLocation
+        let wy = WireGeometry.flipY(m.y, screenHeight: PanelGeometry.referenceHeight)
+        let onTip = overlays.tooltipContainsWire(m.x, wy)
+        let (onCandidate, hit) = panel.hover(atScreen: m)
+        let r = OverlayInput.tipRecheckHover(onTip: onTip, onCandidate: onCandidate,
+                                             candidateHit: hit, held: reportedHover)
+        // 上行线约定: 「无悬停」是 Int32.min 哨兵; -1 / -2 是翻页器 (服务端 mac 分支)。
+        if r != OverlayInput.keepHover { reportHover(r >= 0 ? r : CandidateContentView.noHover) }
+    }
+
+    /// 候选窗右键: 请求服务端在鼠标处打开自绘菜单 (候选下标 ≥ 0 → 候选菜单, -1 → 主菜单)。
+    private func openMenu(target: Int) {
+        cancelPendingHover()
+        let m = NSEvent.mouseLocation
+        let wy = WireGeometry.flipY(m.y, screenHeight: PanelGeometry.referenceHeight)
+        overlays.requestMenu(target: target, at: (m.x, wy))
+    }
+
+    /// 发一帧、不等 ack (带异步标志)。菜单指针移动每秒上百次, 同步往返会拖慢主线程。
+    private func sendAsync(_ frame: Data) {
+        lock.lock()
+        if sendClient == nil {
+            sendClient = try? BridgeClient(socketPath: BridgeEndpoints.requestSocket)
+        }
+        let c = sendClient
+        lock.unlock()
+        guard let c = c else { return }
+        do {
+            try c.send(frame)
+        } catch {
+            lock.lock(); sendClient?.close(); sendClient = nil; lock.unlock()
+        }
     }
 
     /// 回发统一菜单项点击 (CmdMenuAction)。三处菜单共用同一发送路径。
@@ -180,6 +252,11 @@ public final class CandidatePanelHost {
             if self.push === pc { self.push = nil }
             self.lock.unlock()
             NSLog("CandidatePanelHost: push error: \(err) — 安排重连")
+            // 服务断了, 没人会再推菜单的隐藏帧: 本端就地收菜单 (服务端重启后自会复位)。
+            DispatchQueue.main.async {
+                self.overlays.dismissMenu(reason: "push_disconnected")
+                self.overlays.hideAll()
+            }
             self.scheduleReconnect()
         }
         var connected = false
@@ -227,22 +304,9 @@ public final class CandidatePanelHost {
         reader?.closeReader(); reader = nil
         DispatchQueue.main.async { [weak self] in
             self?.panel.hidePanel()
-            self?.tooltip.hidePanel()
-            self?.statusBubble.hidePanel()
-            self?.toast.hidePanel()
+            self?.overlays.dismissMenu(reason: "stop")
+            self?.overlays.hideAll()
         }
-    }
-
-    /// 显示候选悬停 tooltip: 定位到当前悬停候选的屏幕矩形 (主线程调用)。
-    /// 文本异步到达, 期间用户可能已移开 → lastHoverIndex<0 或取不到矩形则不显示。
-    private func showTooltip(_ p: TooltipPayload) {
-        let idx = lastHoverIndex
-        guard idx >= 0, let rect = panel.candidateScreenRect(index: idx) else {
-            tooltip.hidePanel()
-            return
-        }
-        tooltip.show(text: p.text, bgHex: p.bgColor, fgHex: p.fgColor,
-                     fontPath: p.fontPath, runs: p.runs, anchorScreenRect: rect)
     }
 
     private func openSHMIfNeeded() {
@@ -264,6 +328,7 @@ public final class CandidatePanelHost {
 
     /// 面板点击: index>=0 选词; index==-1 翻上页; index==-2 翻下页 (合成 pgup/pgdn 键)。
     private func handlePanelClick(_ index: Int) {
+        pendingHover?.cancel(); pendingHover = nil
         if index >= 0 {
             sendFrame(BinaryCodec.encodeCandidateSelectFrame(index: index))
         } else if index == -1 {
@@ -345,6 +410,15 @@ public final class CandidatePanelHost {
             // 变成孤立旧段 → 候选窗卡在旧帧不刷新。收到 SERVICE_READY 即强制重开 SHM reader，
             // 下一帧按名重开拿到新段，无需重装/重启 .app。
             lock.lock(); reader?.closeReader(); reader = nil; lock.unlock()
+            // 各浮层的 SHM 段同样被重建; 开着的菜单也随旧服务一并作废。
+            DispatchQueue.main.async { [weak self] in
+                self?.lastSuggestedWire = nil
+                self?.overlays.serviceRestarted()
+            }
+        case DownstreamCmd.overlayFrame:
+            if let f = OverlayFrame.decode(frame.payload) {
+                DispatchQueue.main.async { [weak self] in self?.overlays.apply(f) }
+            }
         case DownstreamCmd.hostRenderFrame:
             guard let p = try? BinaryCodec.decodeHostRenderFramePayload(frame.payload) else { return }
             applyHostRenderFrame(p)
@@ -358,10 +432,6 @@ public final class CandidatePanelHost {
             if let st = try? BinaryCodec.decodeModeStatusPayload(frame.payload) {
                 ModeStatusController.shared.apply(st)
             }
-        case DownstreamCmd.candidateMenuFlags:
-            if let flags = try? BinaryCodec.decodeCandidateMenuFlagsPayload(frame.payload) {
-                DispatchQueue.main.async { [weak self] in self?.panel.updateMenuFlags(flags) }
-            }
         case DownstreamCmd.ext:
             // 扩展信封：低频消息统一入口。未知 kind 安静忽略（版本兼容的根本）。
             guard let (kind, body) = BinaryCodec.decodeExt(frame.payload) else { break }
@@ -371,15 +441,6 @@ public final class CandidatePanelHost {
                 let args = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
                 let argv = (args?["args"] as? [String]) ?? []
                 ModeStatusController.shared.openSettings(arguments: argv)
-            case ExtKind.shotPanel:
-                // 服务端请我们截自家的浮窗（像素不在它那边）。存盘 + 复制剪贴板都在这里做，
-                // 文件名是它给的；结果回上行, 由它统一弹 Toast——两平台文案因此保持一致。
-                guard let o = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
-                      let items = o["items"] as? [[String: Any]] else {
-                    NSLog("WindInput[ext] shot.panel 载荷无法解析")
-                    break
-                }
-                DispatchQueue.main.async { [weak self] in self?.capturePanels(items, echo: o) }
             case ExtKind.posCandidateQuery, ExtKind.posStatusTipQuery:
                 // 服务端问「你现在在哪」(用户点了菜单里的「固定位置」)。浮窗不可见时**不答**:
                 // 那种情况下没有"当前位置"可言, 沉默让服务端保留旧值, 好过报一个上次残留的
@@ -387,35 +448,13 @@ public final class CandidatePanelHost {
                 let isCandidate = (kind == ExtKind.posCandidateQuery)
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
-                    let pos = isCandidate ? self.panel.wireTopLeft() : self.statusBubble.wireTopLeft()
+                    let pos = isCandidate ? self.panel.wireTopLeft() : self.overlays.statusTipTopLeft()
                     guard let (x, y) = pos else { return }
                     self.reportPos(isCandidate ? ExtKind.posCandidate : ExtKind.posStatusTip, x, y)
                 }
             default:
                 NSLog("WindInput[ext] 未处理的 kind=\(kind)")
             }
-        case DownstreamCmd.tooltipShow:
-            if let p = try? BinaryCodec.decodeTooltipPayload(frame.payload) {
-                DispatchQueue.main.async { [weak self] in self?.showTooltip(p) }
-            }
-        case DownstreamCmd.tooltipHide:
-            DispatchQueue.main.async { [weak self] in self?.tooltip.hidePanel() }
-        case DownstreamCmd.statusShow:
-            if let p = try? BinaryCodec.decodeStatusBubblePayload(frame.payload) {
-                DispatchQueue.main.async { [weak self] in
-                    self?.statusBubble.show(text: p.text, bgHex: p.bgColor, fgHex: p.fgColor,
-                                            wireX: p.x, wireY: p.y, durationMs: p.durationMs,
-                                            anchor: p.anchor)
-                }
-            }
-        case DownstreamCmd.statusHide:
-            DispatchQueue.main.async { [weak self] in self?.statusBubble.hidePanel() }
-        case DownstreamCmd.toastShow:
-            if let p = try? BinaryCodec.decodeToastPayload(frame.payload) {
-                DispatchQueue.main.async { [weak self] in self?.toast.show(p) }
-            }
-        case DownstreamCmd.toastHide:
-            DispatchQueue.main.async { [weak self] in self?.toast.hidePanel() }
         // 合成按键四路: 往宿主打任意键 (含数字、退格), 文档被改而 router 完全不经手 ——
         // 「光标前一字符」的记账够不到这里, 只能作废。用户自定义宏才触发, 量级小于按键/
         // 上屏两条主路, 但漏了就是「打完宏再打标点出错形」这种查无可查的偶发。
@@ -456,9 +495,12 @@ public final class CandidatePanelHost {
         if !visible || p.width == 0 || p.height == 0 {
             Self.renderLog.debug("renderFrame hiding (invisible or zero-size)")
             DispatchQueue.main.async { [weak self] in
-                self?.lastHoverIndex = -1
+                self?.lastSuggestedWire = nil
+                self?.reportedHover = -1
+                self?.pendingHover?.cancel(); self?.pendingHover = nil
                 self?.panel.hidePanel()
-                self?.tooltip.hidePanel()
+                // 悬停提示随候选一起收: 服务端 `hide_frame` 会补推它的隐藏帧, 这里先收省一拍。
+                self?.overlays.hide(OverlayKind.tooltip)
             }
             return
         }
@@ -484,6 +526,7 @@ public final class CandidatePanelHost {
         DispatchQueue.main.async { [weak self] in
             // 软件阴影已渲染在 image 中时禁用系统窗口阴影，避免在画布边缘产生黑边。
             self?.panel.hasShadow = !useSoftwareShadow
+            self?.lastSuggestedWire = (pt.x, pt.y)
             self?.panel.show(image: img, atScreenPoint: pt, rects: rects, absolute: absolute)
         }
     }
@@ -498,6 +541,8 @@ public final class CandidatePanelHost {
     /// BGRA device 像素 → NSImage, size 设为 logical (像素/scale)。Retina 上高分辨率
     /// 位图贴 logical 框 = 1 device px : 1 image px, 清晰。
     static func makeNSImage(from f: SharedFrame, scale: CGFloat) -> NSImage? {
+        // 头与像素不是原子写入：读到半新半旧的头时 stride×height 会超出像素缓冲，CGImage 会越界读。
+        guard f.stride >= f.width * 4, f.bgra.count >= f.stride * f.height else { return nil }
         guard let provider = CGDataProvider(data: f.bgra as CFData) else { return nil }
         let bitmapInfo: CGBitmapInfo = [
             CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue),

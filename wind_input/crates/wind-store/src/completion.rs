@@ -647,7 +647,7 @@ mod tests {
         s.record_completion(CompletionKind::UrlHistory, "example.com")
             .unwrap();
         s.flush_completions().unwrap();
-        let kept = std::fs::read_dir(p.parent().unwrap())
+        let kept = std::fs::read_dir(s.user_text_dir().join(".backup"))
             .unwrap()
             .flatten()
             .any(|e| {

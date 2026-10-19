@@ -328,6 +328,9 @@ private:
     // 同上，**英文标点态**那份（core 经 CONFIG_KEY_EN_PASSTHROUGH_PUNCT 推送）。
     // 是上一份的超集：那个态不走中文标点表。按当下标点态二选一。
     std::set<wchar_t> _enPassthroughPunctChars;
+    // 自定义标点「空格」行配了值的列（位掩码，core 经 CONFIG_KEY_SPACE_CUSTOM_COLS 推送）。
+    // 0（默认）= 与历史行为一致：中文模式空缓冲只在全角态吃空格。判据见 SpaceKeyPolicy.h。
+    uint8_t _spaceCustomCols = 0;
     // 该键在中文输入模式下是否该**透传**（不吃）。内部按**当下标点态**在两份集合间
     // 二选一（中文态那份 / 英文态那份，后者是超集）。
     //
