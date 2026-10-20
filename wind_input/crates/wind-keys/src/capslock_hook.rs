@@ -28,12 +28,16 @@
 //!
 //! # 安装门控
 //!
-//! ★ **只有用户在 `keys.session_actions` 里真的配了 `capslock` 才安装**（协调器侧判定）。
-//! 没配的用户进程里根本不存在全局键盘钩子——这是本功能唯一的风险控制手段，不可省。
+//! ★ **只有用户在 `keys.session_actions` 里真的配了 `capslock`、或把它勾成中英切换键时才安装**
+//! （协调器侧判定）。
+//! 没配的用户进程里根本不存在全局键盘钩子——这是本功能首要的风险控制手段，不可省。
+//!
+//! 勾成切换键时空闲也要吃（[`IDLE_PID`]），那道闸门另有两重保护：只在前台窗口属于
+//! 本输入法所在的那个进程时接管；按着 Shift / Ctrl / Alt / Win 时不接管。
 
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// 钩子此刻是否应当吃掉 CapsLock。
 ///
@@ -42,14 +46,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 糟糕得多，属于必须优先避免的故障方向。
 static SHOULD_EAT: AtomicBool = AtomicBool::new(false);
 
-/// 按下 CapsLock 时的通知回调。在钩子线程里执行，实现方必须只做非阻塞投递。
-type PressCallback = Box<dyn Fn() + Send + Sync + 'static>;
+/// 空闲时也吃 CapsLock：「切换按键」勾了 CapsLock 时，存本输入法激活所在的宿主进程 pid，
+/// 0 = 不吃。由协调器随激活态更新。
+///
+/// 与 [`SHOULD_EAT`] 分开存：那个闸门在候选窗隐藏、失焦时被无条件归零（宁可少吃），
+/// 这个跟着激活态走。★ 激活态在宿主崩溃、切到不走 TSF 的程序时可能清不掉，故钩子吃键前
+/// 还要比对前台窗口的进程：对不上就放行，滞留的闸门也伤不到别的应用。
+static IDLE_PID: AtomicU32 = AtomicU32::new(0);
+
+/// 被吃掉的 CapsLock 事件。`Down` 含按住不放时的自动重复，`first` 标出这次按下的第一个；
+/// `Up` 只在这次按下归我们时才有，带按住时长（毫秒，取钩子事件的系统时间戳之差），
+/// `interrupted` = 按住期间按过别的键（同 Shift 的轻敲判定：那样不算单按 CapsLock）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapsEvent {
+    Down { first: bool },
+    Up { held_ms: u32, interrupted: bool },
+}
+
+/// CapsLock 事件的通知回调。在钩子线程里执行，实现方必须只做非阻塞投递。
+type PressCallback = Box<dyn Fn(CapsEvent) + Send + Sync + 'static>;
 #[cfg(windows)]
 static CALLBACK: OnceLock<PressCallback> = OnceLock::new();
 
 /// 设置「当前是否拦截 CapsLock」。协调器在会话状态变化时调用，钩子未安装时也可安全调用。
 pub fn set_should_eat(eat: bool) {
     SHOULD_EAT.store(eat, Ordering::Relaxed);
+}
+
+/// 设置「空闲时在哪个进程里也拦截 CapsLock」（0 = 不拦），见 [`IDLE_PID`]。钩子未安装时也可安全调用。
+pub fn set_idle_pid(pid: u32) {
+    IDLE_PID.store(pid, Ordering::Relaxed);
 }
 
 /// 当前拦截状态（供日志/诊断）。
@@ -103,14 +129,18 @@ pub(crate) fn decide_eat(is_down: bool, should_eat: bool, eaten_down: bool) -> (
 
 #[cfg(windows)]
 mod imp {
-    use super::{CALLBACK, SHOULD_EAT};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{CALLBACK, CapsEvent, IDLE_PID, SHOULD_EAT};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc;
     use tracing::{debug, error, info};
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PostThreadMessageW,
-        SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+        CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+        KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PostThreadMessageW, SetWindowsHookExW,
+        UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
     };
 
     const VK_CAPITAL: u32 = 0x14;
@@ -138,6 +168,38 @@ mod imp {
     /// 它们要收回的是「接管新按下」的权限，不是撤销一次已经吃了一半的按键。
     static EATEN_DOWN: AtomicBool = AtomicBool::new(false);
 
+    /// 这次被接管的按下里第一个 down 的系统时间戳（`KBDLLHOOKSTRUCT::time`，毫秒）。
+    static DOWN_TIME: AtomicU32 = AtomicU32::new(0);
+
+    /// 这次被接管的按下期间是否按过别的键。首个 down 清零，其它键的 down 置位。
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    /// 空闲闸门此刻对这次按下成不成立：前台窗口属于 `pid`，且没按着组合修饰键。
+    ///
+    /// 只在 CapsLock 的首个 down 上调（一次物理按下一次），两个都是不阻塞的系统调用。
+    fn idle_gate_open(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        // 按着修饰键（Shift+CapsLock 等）交还系统：那是用户要的组合，而且吃掉 CapsLock 会让
+        // TSF 把那一下 Shift 判成干净单击，再切一次中英。
+        let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
+            GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0
+        };
+        if held(VK_SHIFT) || held(VK_CONTROL) || held(VK_MENU) || held(VK_LWIN) || held(VK_RWIN) {
+            return false;
+        }
+        let mut fg_pid = 0u32;
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return false;
+            }
+            GetWindowThreadProcessId(hwnd, Some(&mut fg_pid));
+        }
+        fg_pid == pid
+    }
+
     /// 已安装的钩子。Drop 即卸载（停消息泵 → 线程内 `UnhookWindowsHookEx` → join）。
     pub struct CapsLockHook {
         thread_id: u32,
@@ -146,31 +208,53 @@ mod imp {
 
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         // 文档：nCode < 0 必须直接下传；这里连 HC_ACTION 之外的一律下传。
-        // 两个标志都为假时立刻下传——绝大多数按键走的是这条路径，必须最短（两次
-        // relaxed 原子读，不解引用 lParam、不进任何分支）。
+        // 三个标志都为假时立刻下传——绝大多数按键走的是这条路径，必须最短（三次
+        // relaxed 原子读，不解引用 lParam、不进任何分支）。空闲闸门开着时每个键都要进来
+        // 看一眼键码，那也只是一次解引用加比较。
         if code == HC_ACTION
-            && (SHOULD_EAT.load(Ordering::Relaxed) || EATEN_DOWN.load(Ordering::Relaxed))
+            && (SHOULD_EAT.load(Ordering::Relaxed)
+                || IDLE_PID.load(Ordering::Relaxed) != 0
+                || EATEN_DOWN.load(Ordering::Relaxed))
         {
             // SAFETY: 文档保证 nCode == HC_ACTION 时 lParam 指向有效的 KBDLLHOOKSTRUCT。
             let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-            if info.vkCode == VK_CAPITAL {
-                // 注入事件一律放行。本模块自己不注入 CapsLock，但别的工具（AHK / 厂商热键
-                // 程序）可能会——拦下它们既无意义，又会让那些工具行为异常。
+            if info.vkCode != VK_CAPITAL {
+                // 按住 CapsLock 期间按了别的键：松开时不算单按。
+                let msg = wparam.0 as u32;
+                if EATEN_DOWN.load(Ordering::Relaxed) && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                {
+                    INTERRUPTED.store(true, Ordering::Relaxed);
+                }
+            } else {
+                // 注入事件一律放行。★ 协调器开关大写就靠注入一次 CapsLock（长按切换键），
+                // 放行注入是那条路的前提；AHK / 厂商热键程序的注入同理不该拦。
                 if (info.flags & LLKHF_INJECTED).0 == 0 {
                     let msg = wparam.0 as u32;
                     let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
                     // 裁决抽成纯函数（见其文档）。load + store 不是原子对，但钩子回调由
                     // 系统在**本模块自己的那一个线程**上串行调用，不存在并发进入；
                     // `SHOULD_EAT` 是别的线程写的，这里只取一次快照。
-                    let (eat, next_eaten) = super::decide_eat(
-                        is_down,
-                        SHOULD_EAT.load(Ordering::Relaxed),
-                        EATEN_DOWN.load(Ordering::Relaxed),
-                    );
+                    let owed = EATEN_DOWN.load(Ordering::Relaxed);
+                    // 空闲闸门只在一次按下的首个 down 上判（之后的事件靠配对状态归属）。
+                    let gate = SHOULD_EAT.load(Ordering::Relaxed)
+                        || (is_down && !owed && idle_gate_open(IDLE_PID.load(Ordering::Relaxed)));
+                    let (eat, next_eaten) = super::decide_eat(is_down, gate, owed);
                     EATEN_DOWN.store(next_eaten, Ordering::Relaxed);
                     if eat {
-                        if is_down && let Some(cb) = CALLBACK.get() {
-                            cb();
+                        let ev = if is_down {
+                            if !owed {
+                                DOWN_TIME.store(info.time, Ordering::Relaxed);
+                                INTERRUPTED.store(false, Ordering::Relaxed);
+                            }
+                            CapsEvent::Down { first: !owed }
+                        } else {
+                            CapsEvent::Up {
+                                held_ms: info.time.wrapping_sub(DOWN_TIME.load(Ordering::Relaxed)),
+                                interrupted: INTERRUPTED.load(Ordering::Relaxed),
+                            }
+                        };
+                        if let Some(cb) = CALLBACK.get() {
+                            cb(ev);
                         }
                         return LRESULT(1);
                     }
@@ -235,6 +319,7 @@ mod imp {
         fn drop(&mut self) {
             // 卸载期间先停止拦截：PostThreadMessage 到线程真正退出之间仍会有回调进来。
             SHOULD_EAT.store(false, Ordering::Relaxed);
+            IDLE_PID.store(0, Ordering::Relaxed);
             // 配对状态一并清零：钩子都要没了，「还欠一个 up」的账不能留给下一次安装。
             EATEN_DOWN.store(false, Ordering::Relaxed);
             unsafe {

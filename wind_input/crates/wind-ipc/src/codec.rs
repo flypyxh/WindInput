@@ -2,6 +2,7 @@
 //!
 //! 与 Go 版本 `wind_input/internal/ipc/binary_codec.go` 对齐。
 
+use crate::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
 use crate::protocol::*;
 use thiserror::Error;
 
@@ -1680,7 +1681,7 @@ pub fn encode_key_type(text: &str) -> Vec<u8> {
 }
 
 /// [`CMD_OVERLAY_FRAME`] 的元数据（像素在该层的 SHM 段里）。枚举值见 [`crate::protocol::overlay`]。
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverlayFrameMeta {
     pub kind: u32,
     /// 该层 SHM 段写帧后的序号；隐藏帧同样写段（`write_hidden`）后取号。
@@ -1710,6 +1711,9 @@ pub struct OverlayFrameMeta {
     /// 位图像素 / 宿主坐标单位。Linux 宿主坐标就是像素（恒 1.0，addon 不读这个字段）；macOS 坐标是点、
     /// 位图是 `scale` 倍的像素，`.app` 据此把位图尺寸与内容盒折回点。`0.0` = 未设，按 1 处理。
     pub scale: f32,
+    /// 可拖动区域（位图内 `x, y, w, h`），仅 [`OVERLAY_KIND_TOOLBAR`] / [`OVERLAY_KIND_SOFTKEYBOARD`]
+    /// 的帧会编码，其它层忽略此字段。
+    pub drag: Vec<[i32; 4]>,
 }
 
 /// CmdOverlayFrame (0x0513, 72B)，均小端：
@@ -1718,6 +1722,9 @@ pub struct OverlayFrameMeta {
 /// （i32）+ content_w content_h（u32）+ duration_ms（i32）+ scale（f32）。
 ///
 /// 前 68 字节是 Linux addon 认的基础布局（它只要求 ≥ 68），末尾 `scale` 供 macOS `.app` 读。
+///
+/// 工具栏 / 软键盘（kind 10 / 11）在其后多一段拖动区：`count u32` + `count × (x y w h) i32`。
+/// 其它 kind 不编码这一段——macOS Swift 解码器不认尾段，绝不能让它收到。
 pub fn encode_overlay_frame(m: &OverlayFrameMeta) -> Vec<u8> {
     let mut p = Vec::with_capacity(72);
     for v in [m.kind, m.seq, m.width, m.height, m.flags, m.place] {
@@ -1735,7 +1742,36 @@ pub fn encode_overlay_frame(m: &OverlayFrameMeta) -> Vec<u8> {
     }
     p.extend_from_slice(&m.duration_ms.to_le_bytes());
     p.extend_from_slice(&m.scale.to_le_bytes());
+    if matches!(m.kind, OVERLAY_KIND_TOOLBAR | OVERLAY_KIND_SOFTKEYBOARD) {
+        p.extend_from_slice(&(m.drag.len() as u32).to_le_bytes());
+        for r in &m.drag {
+            for v in r {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
     frame(CMD_OVERLAY_FRAME, p)
+}
+
+/// [`CMD_PANEL_POINTER`] 的载荷（20 字节，小端）：kind event button（u32）+ x y（i32）。
+pub fn encode_panel_pointer(kind: u32, event: u32, button: u32, x: i32, y: i32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(20);
+    for v in [kind, event, button] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [x, y] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    p
+}
+
+/// 解 [`encode_panel_pointer`]；不足 20 字节返回 `None`，多出的尾部忽略。
+pub fn decode_panel_pointer(p: &[u8]) -> Option<(u32, u32, u32, i32, i32)> {
+    if p.len() < 20 {
+        return None;
+    }
+    let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+    Some((u(0), u(4), u(8), u(12) as i32, u(16) as i32))
 }
 
 /// 编码配置同步消息 (CMD_SYNC_CONFIG 0x0303)
@@ -1907,6 +1943,7 @@ mod darwin_push_tests {
             content_h: 30,
             duration_ms: 1500,
             scale: 2.0,
+            drag: vec![],
         });
         assert_eq!(f.len(), 8 + 72);
         assert_eq!(cmd_of(&f), CMD_OVERLAY_FRAME);
@@ -1923,6 +1960,53 @@ mod darwin_push_tests {
         assert_eq!((u(56), u(60)), (110, 30));
         assert_eq!(i(64), 1500);
         assert_eq!(f32::from_le_bytes(p[68..72].try_into().unwrap()), 2.0);
+    }
+
+    #[test]
+    fn overlay_frame_drag_tail_only_for_panel_kinds() {
+        let base = OverlayFrameMeta {
+            kind: 3,
+            drag: vec![[1, 2, 3, 4], [5, 6, 7, 8]],
+            ..Default::default()
+        };
+        // 非交互层：带不带拖动区都是 72 字节，逐字节相同。
+        let plain = encode_overlay_frame(&base);
+        assert_eq!(plain.len(), 8 + 72);
+        let no_drag = encode_overlay_frame(&OverlayFrameMeta {
+            drag: vec![],
+            ..base.clone()
+        });
+        assert_eq!(plain, no_drag);
+
+        // 工具栏：多 4 + 2*16 字节，并能原样解回。
+        let f = encode_overlay_frame(&OverlayFrameMeta {
+            kind: OVERLAY_KIND_TOOLBAR,
+            ..base.clone()
+        });
+        assert_eq!(f.len(), 8 + 72 + 4 + 2 * 16);
+        let p = &f[8 + 72..];
+        let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+        assert_eq!(i(0), 2);
+        let rects: Vec<[i32; 4]> = (0..2)
+            .map(|k| std::array::from_fn(|j| i(4 + k * 16 + j * 4)))
+            .collect();
+        assert_eq!(rects, base.drag);
+
+        // 软键盘同样带尾段；零个拖动区只多 count。
+        let f = encode_overlay_frame(&OverlayFrameMeta {
+            kind: OVERLAY_KIND_SOFTKEYBOARD,
+            drag: vec![],
+            ..base
+        });
+        assert_eq!(f.len(), 8 + 72 + 4);
+    }
+
+    #[test]
+    fn panel_pointer_roundtrip() {
+        let p = encode_panel_pointer(11, 3, 1, -5, 40);
+        assert_eq!(p.len(), 20);
+        assert_eq!(decode_panel_pointer(&p), Some((11, 3, 1, -5, 40)));
+        assert_eq!(decode_panel_pointer(&p[..19]), None);
     }
 
     #[test]

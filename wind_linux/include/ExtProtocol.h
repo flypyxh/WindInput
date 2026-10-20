@@ -18,6 +18,13 @@ constexpr uint16_t CMD_FRONT_CONTEXT = 0x0215;
 constexpr uint16_t CMD_MENU_POINTER = 0x021B;
 constexpr uint32_t MENU_POINTER_MOTION = 1;
 constexpr uint32_t MENU_POINTER_PRESS = 2;
+/// 工具栏 / 软键盘上的指针事件：kind u32 + event u32 + button u32 + x i32 + y i32（20 字节，位图内坐标）。
+constexpr uint16_t CMD_PANEL_POINTER = 0x021C;
+constexpr uint32_t PANEL_POINTER_MOTION = 1;
+constexpr uint32_t PANEL_POINTER_PRESS = 2;
+constexpr uint32_t PANEL_POINTER_RELEASE = 3;
+constexpr uint32_t PANEL_POINTER_LEAVE = 4;
+constexpr uint32_t PANEL_POINTER_WHEEL = 5;
 
 // ── 下行 push（服务 → addon）──
 constexpr uint16_t CMD_HOST_RENDER_FRAME = 0x0502;
@@ -39,6 +46,9 @@ constexpr uint32_t OVERLAY_KIND_TOAST = 3;
 /// 自绘菜单第 0 级；第 k 级子菜单 = OVERLAY_KIND_MENU + k（k < OVERLAY_MENU_LEVELS）。
 constexpr uint32_t OVERLAY_KIND_MENU = 4;
 constexpr uint32_t OVERLAY_MENU_LEVELS = 6;
+/// 悬浮工具栏 / 软键盘：帧尾多一段拖动区（count u32 + count × x y w h i32）。
+constexpr uint32_t OVERLAY_KIND_TOOLBAR = 10;
+constexpr uint32_t OVERLAY_KIND_SOFTKEYBOARD = 11;
 constexpr uint32_t OVERLAY_PLACE_ABSOLUTE = 0;
 constexpr uint32_t OVERLAY_PLACE_FLIP = 1;
 constexpr uint32_t OVERLAY_PLACE_FOLLOW_CANDIDATE = 2;
@@ -60,11 +70,17 @@ inline constexpr const char* EXT_KIND_MENU_OPEN = "menu.open";
 inline constexpr const char* EXT_KIND_MENU_DISMISS = "menu.dismiss";
 /// 上行：状态气泡拖动落点 / 应询回报的当前位置（内容左上）。落不落盘由服务端按定位方式定。
 inline constexpr const char* EXT_KIND_POS_STATUS_TIP = "pos.status_tip";
+/// 上行：工具栏 / 软键盘拖动落点。body `{"x":..,"y":..,"output":"DP-1"}`，内容盒左上，output 可缺省。
+inline constexpr const char* EXT_KIND_POS_TOOLBAR = "pos.toolbar";
+inline constexpr const char* EXT_KIND_POS_SOFTKEYBOARD = "pos.softkeyboard";
+/// 上行：焦点宿主进入 / 退出全屏。body `{"fullscreen":bool}`。
+inline constexpr const char* EXT_KIND_HOST_FULLSCREEN = "host.fullscreen";
 /// 上行：当前焦点宿主的显示环境。body `{"caret_free":bool,"caret_trusted":bool,"scale":1.5}`，
 /// 字段可缺省（= 不改现值）。caret_free：Wayland 原生应用，候选窗由合成器摆位，服务端据此跳过
 /// 首显闸门里「等权威坐标」的那段（否则首键后要等 600ms 长兜底）；caret_trusted：本端报的光标
 /// 可直接当权威（Linux 恒为真，来源字段却只能填 UNKNOWN）；inline_preedit：客户端声明了 Preedit
-/// 能力位（否则服务端把编码画进候选窗）；scale：界面缩放因子（见 protocol.rs `HOST_DISPLAY`）。
+/// 能力位（否则服务端把编码画进候选窗）；scale：界面缩放因子（见 protocol.rs `HOST_DISPLAY`）；output：焦点所在输出名（可缺省）；work：该输出的工作区 [左,上,右,下]（可缺省，与 output 成对报）。
+/// panels：能力声明，本 addon 能贴工具栏 / 软键盘浮层（恒报 true；旧 addon 不报 → 服务端不开软键盘）。
 inline constexpr const char* EXT_KIND_HOST_DISPLAY = "host.display";
 /// 下行：服务端问状态气泡此刻在哪（切「固定位置」时以当前位置落盘）。气泡不在屏上不答。
 inline constexpr const char* EXT_KIND_POS_STATUS_TIP_QUERY = "pos.status_tip.query";

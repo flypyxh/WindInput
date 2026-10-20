@@ -248,6 +248,32 @@ public enum OverlayInput {
         return raw >= 0 ? tipSwitchMs : tipGraceMs
     }
 
+    /// 指针从 (px, py) 移到 (nx, ny) 这一步是不是朝着悬停提示 `tip` 去。是的话延后的悬停变化按
+    /// switch 顺延（展开态的提示停靠在窗口外侧，过去要横穿好几格）。对位 Windows
+    /// `candidate_window::heading_to_tip`：沿提示所在那一侧在靠近，且偏离提示跨度不比靠近快。
+    public static func headingToTip(_ px: CGFloat, _ py: CGFloat, _ nx: CGFloat, _ ny: CGFloat,
+                                    tip: WireRect) -> Bool {
+        let (l, t, r, b) = (tip.x, tip.y, tip.right, tip.bottom)
+        let (dx, dy) = (nx - px, ny - py)
+        let beside = l >= px || r <= px
+        if !beside && t < py && b > py { return false }   // 已在提示上
+        let toward = l >= px ? dx : r <= px ? -dx : t >= py ? dy : -dy
+        let lateral = beside ? dy : dx
+        let (lo, hi, pos) = beside ? (t, b, ny) : (l, r, nx)
+        let away = pos > hi ? lateral : pos < lo ? -lateral : 0
+        return toward > 0 && away <= toward
+    }
+
+    /// 点到提示的距离（沿提示所在那一侧的轴；在提示上为 0）。只有刷新到本次宽限的新低才顺延：
+    /// 指针停着抖动时一来一回刷不出新低，不会把切换无限拖住。对位 Windows `tip_gap`。
+    public static func tipGap(_ x: CGFloat, _ y: CGFloat, tip: WireRect) -> CGFloat {
+        if tip.x >= x { return tip.x - x }
+        if tip.right <= x { return x - tip.right }
+        if tip.y >= y { return tip.y - y }
+        if tip.bottom <= y { return y - tip.bottom }
+        return 0
+    }
+
     /// 「不改悬停」的哨兵。
     public static let keepHover = Int.min
 

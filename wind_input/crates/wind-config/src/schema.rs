@@ -691,6 +691,28 @@ pub struct EncoderRule {
     pub formula: String,
 }
 
+// 跨 crate 的序列化 / 反序列化一律走这几个入口，理由同 `Config::from_toml_value` 上方。
+impl Schema {
+    #[inline(never)]
+    pub fn from_toml_value(v: toml::Value) -> Result<Self, toml::de::Error> {
+        v.try_into()
+    }
+
+    #[inline(never)]
+    pub fn to_toml_value(&self) -> Result<toml::Value, toml::ser::Error> {
+        toml::Value::try_from(self)
+    }
+
+    /// [`crate::section_fallback::probe_and_patch`] 的 Schema 实例。
+    #[inline(never)]
+    pub fn probe_and_patch(
+        merged: &toml::Value,
+        default_v: &toml::Value,
+    ) -> crate::section_fallback::Patched {
+        crate::section_fallback::probe_and_patch::<Self>(merged, default_v)
+    }
+}
+
 impl Schema {
     /// 是否为拼音类型引擎（engine.type 缺省时依据默认词典类型判定）
     pub fn is_pinyin(&self) -> bool {

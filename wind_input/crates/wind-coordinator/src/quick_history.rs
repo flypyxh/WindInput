@@ -233,7 +233,10 @@ impl Coordinator {
 
     /// 记一条快捷输入历史并裁剪到上限。未启用历史成员、或文本不值得记时什么也不做。
     pub(crate) fn learn_quick_history(&self, state: &State, text: &str) {
-        if !self.mix_has_history(state.mix_id) || !worth_remembering(text) {
+        if !self.mix_has_history(state.mix_id)
+            || !worth_remembering(text)
+            || self.learning_suspended()
+        {
             return;
         }
         let Some(store) = self.store.as_ref() else {

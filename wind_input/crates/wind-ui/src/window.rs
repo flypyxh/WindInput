@@ -562,12 +562,17 @@ mod platform {
     use super::{HWND, Rc, RefCell, WindowMouse};
 
     /// Layered Window 的非 Windows mock：持有 BGRA 缓冲区，窗口操作为空实现。
+    ///
+    /// Linux 外部宿主形态下，工具栏 / 软键盘这两个类名的窗口改由 [`crate::ext_panel`] 呈现：
+    /// 位图走 overlay 帧交 addon 贴图，指针由 addon 报来。其它类名仍是 mock。
     pub struct LayeredWindow {
         width: u32,
         height: u32,
         buffer: Vec<u8>,
         /// 保留注册的鼠标处理器以维持 API 一致（非 Windows 下永不触发）。
         _mouse: RefCell<Option<Rc<RefCell<dyn WindowMouse>>>>,
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        ext: Option<crate::ext_panel::Binding>,
     }
 
     impl LayeredWindow {
@@ -575,22 +580,42 @@ mod platform {
             _parent: Option<HWND>,
             width: u32,
             height: u32,
-            _class_name: &str,
+            class_name: &str,
         ) -> Result<Self, String> {
+            #[cfg(not(all(target_os = "linux", ext_presenter)))]
+            let _ = class_name;
             Ok(Self {
                 width,
                 height,
                 buffer: vec![0u8; (width * height * 4) as usize],
                 _mouse: RefCell::new(None),
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                ext: crate::ext_panel::Binding::for_class(class_name),
             })
         }
 
         pub fn hwnd(&self) -> HWND {
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            if let Some(b) = &self.ext {
+                return b.hwnd();
+            }
             HWND::default()
         }
 
         pub fn register_mouse(&self, handler: Rc<RefCell<dyn WindowMouse>>) {
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            if let Some(b) = &self.ext {
+                b.register_mouse(handler.clone());
+            }
             *self._mouse.borrow_mut() = Some(handler);
+        }
+
+        /// 可拖动区域（位图内 `x, y, w, h`），随下一帧带给 addon，由它本地跟随拖动。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        pub fn set_drag_regions(&self, rects: Vec<[i32; 4]>) {
+            if let Some(b) = &self.ext {
+                b.set_drag_regions(rects);
+            }
         }
 
         pub fn buffer(&self) -> &[u8] {
@@ -608,18 +633,37 @@ mod platform {
         }
 
         pub fn update(&self) -> Result<(), String> {
+            self.update_with_alpha(255)
+        }
+
+        pub fn update_with_alpha(&self, alpha: u8) -> Result<(), String> {
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            if let Some(b) = &self.ext {
+                return b.update(&self.buffer, self.width, self.height, alpha);
+            }
+            let _ = alpha;
             Ok(())
         }
 
-        pub fn update_with_alpha(&self, _alpha: u8) -> Result<(), String> {
-            Ok(())
+        pub fn show(&self, x: i32, y: i32) {
+            self.show_z(x, y, super::ShowZOrder::Topmost)
         }
 
-        pub fn show(&self, _x: i32, _y: i32) {}
+        /// z 序由宿主定（工具栏 / 软键盘恒在上层），意图在此忽略。
+        pub fn show_z(&self, x: i32, y: i32, _z: super::ShowZOrder) {
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            if let Some(b) = &self.ext {
+                b.show(x, y);
+            }
+            let _ = (x, y);
+        }
 
-        pub fn show_z(&self, _x: i32, _y: i32, _z: super::ShowZOrder) {}
-
-        pub fn hide(&self) {}
+        pub fn hide(&self) {
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            if let Some(b) = &self.ext {
+                b.hide();
+            }
+        }
 
         pub fn clear(&mut self) {
             self.buffer.fill(0);

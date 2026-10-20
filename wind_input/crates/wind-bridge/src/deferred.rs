@@ -123,6 +123,10 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_menu_pointer(event, button, x, y))
     }
 
+    fn on_panel_pointer(&self, kind: u32, event: u32, button: u32, x: i32, y: i32) {
+        self.with_handler((), |h| h.on_panel_pointer(kind, event, button, x, y))
+    }
+
     fn handle_client_disconnected(&self) {
         self.with_handler((), |h| h.handle_client_disconnected())
     }

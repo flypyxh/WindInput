@@ -180,6 +180,11 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     // 右键状态气泡 / 悬停提示：与候选右键同一条 `menu.open`，工作区随请求报上去；提示另带
     // 右键点在位图内的坐标（按段 / 按行的命中在服务端做）。
     cb.overlayMenu = [this](int32_t target, int32_t x, int32_t y, int32_t lx, int32_t ly) {
+#ifdef WIND_HAVE_WAYLAND
+        if (wlPanel_) {
+            wlPanel_->clearPanelMenuPending(); // X11 浮层的菜单，不是面板的
+        }
+#endif
         Rect wa = panel_->screenWorkArea().value_or(Rect{});
         WIND_DEBUG() << "请求打开浮层菜单 target=" << target << " @(" << x << "," << y << ")";
         sendAndDrain(target == MENU_TARGET_TOOLTIP
@@ -190,6 +195,21 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
     };
     cb.statusMoved = [this](int32_t x, int32_t y) {
         sendAndDrain(encodePosFrame(EXT_KIND_POS_STATUS_TIP, x, y));
+    };
+    // 工具栏 / 软键盘：拖动区外的指针原样回传（命中、高亮、按键都在服务端的 toolbar.rs /
+    // soft_keyboard.rs）；本地拖完只报一次落点；活动窗口全屏与否喂服务端的全屏隐藏。
+    cb.panelPointer = [this](uint32_t kind, uint32_t ev, uint32_t b, int32_t x, int32_t y) {
+        sendAndDrain(encodePanelPointer(kind, ev, b, x, y));
+    };
+    cb.panelMoved = [this](uint32_t kind, int32_t x, int32_t y, const std::string& output) {
+        reportPanelPos(kind, x, y, output);
+    };
+    cb.fullscreenChanged = [this](bool on) {
+        bool waylandPanels = false;
+#ifdef WIND_HAVE_WAYLAND
+        waylandPanels = wlPanel_ && wlPanel_->layerPanels();
+#endif
+        reportFullscreen(effectiveFullscreen(on, waylandPanels));
     };
     panel_ = std::make_unique<X11CandidatePanel>(instance_->eventLoop(), std::move(cb));
 #ifdef WIND_HAVE_WAYLAND
@@ -221,8 +241,30 @@ WindEngine::WindEngine(fcitx::Instance* instance) : instance_(instance)
                 wlPanel_->closeMenu();
             }
         };
+        // 工具栏 / 软键盘（layer-shell）：同 X11 那一对
+        wcb.panelPointer = [this](uint32_t kind, uint32_t ev, uint32_t b, int32_t x, int32_t y) {
+            sendAndDrain(encodePanelPointer(kind, ev, b, x, y));
+        };
+        wcb.panelMoved = [this](uint32_t kind, int32_t x, int32_t y, const std::string& output) {
+            reportPanelPos(kind, x, y, output);
+        };
         wlPanel_->setCallbacks(std::move(wcb));
     }
+    // layer-shell 绑上了：工具栏 / 软键盘改摆在 Wayland 坐标系里。输出 / 工作区按这套重报；
+    // 全屏改靠 TOP 层近似，之前按 XWayland 报过的全屏态复位（effectiveFullscreen）。
+    wlPanel_->setOnLayerShell([this]() {
+        reportFullscreen(false);
+        if (fcitx::InputContext* ic = focusedIC()) {
+            sendHostDisplay(ic);
+        }
+    });
+    // 输出的可用区变了（探测 surface 首次量到 / 任务栏变了）：工作区跟着重报，与焦点在哪种应用无关
+    // （工具栏 / 软键盘一律摆在 layer-shell 上）。
+    wlPanel_->setOnWorkChanged([this]() {
+        if (fcitx::InputContext* ic = focusedIC()) {
+            sendHostDisplay(ic);
+        }
+    });
     // 输出缩放变了（改系统缩放 / 换屏）：焦点正在 Wayland 应用里就重新上报，服务端下一帧起按新缩放画。
     wlPanel_->setOnScaleChanged([this]() {
         if (fcitx::InputContext* ic = focusedIC(); ic && wlPanel_->handles(ic)) {
@@ -487,14 +529,50 @@ void WindEngine::sendHostDisplay(fcitx::InputContext* ic)
         scale = wlPanel_->scale();
     }
     if (wlPanel_) {
-        wlPanel_->setReportedScale(wlPanel_->handles(ic) ? scale : 1.0);
+        // layer-shell 上的气泡、Toast、工具栏、软键盘不论焦点在哪种应用都按这个缩放光栅化，
+        // 贴图时要按同一个数折回逻辑尺寸
+        wlPanel_->setReportedScale(scale);
     }
 #endif
     // 光标可信恒为真：Linux 的光标矩形来自应用自己上报（没有 Windows 那种跨窗口光标冒充插入点
     // 的问题），只是来源字段没有 TSF 那套语义可填。不声明的话服务端「焦点变化时显示」永远挂起。
     // 内嵌预编辑看客户端的 Preedit 能力位：没有的话编码由服务端画进候选窗（见 ICSink::setPreedit）。
     const bool inlinePreedit = ic->capabilityFlags().test(fcitx::CapabilityFlag::Preedit);
-    sendAndDrain(encodeHostDisplayFrame(caretFree, true, inlinePreedit, scale));
+    sendAndDrain(encodeHostDisplayFrame(caretFree, true, inlinePreedit, scale, hostOutput(ic)));
+}
+
+HostOutput WindEngine::hostOutput(fcitx::InputContext* ic)
+{
+    HostOutput out;
+#ifdef WIND_HAVE_WAYLAND
+    // 合成器有 layer-shell：工具栏 / 软键盘摆在 Wayland 的坐标系里（与焦点在哪种应用无关），
+    // 输出名与工作区也要按这一套报，才与 pos.* 和下发的落点对得上。
+    if (wlPanel_) {
+        if (std::optional<HostOutput> o = wlPanel_->hostOutput()) {
+            return *o;
+        }
+    }
+    // Wayland 原生应用：候选窗由合成器摆在 popup 里，这边没有它在屏幕上的坐标，工作区无从谈起。
+    if (wlPanel_ && wlPanel_->handles(ic)) {
+        return out;
+    }
+#endif
+    // X11：焦点所在输出（RandR）的名字与工作区。位置取应用报的光标矩形，应用没报（全 0）时取
+    // 指针处。没有 RandR / 点不在任何输出上时名字不报，工作区回落到根窗口（不分显示器）。
+    std::optional<std::pair<int32_t, int32_t>> at;
+    const fcitx::Rect& caret = ic->cursorRect();
+    if (caret.left() != 0 || caret.top() != 0 || caret.width() != 0 || caret.height() != 0) {
+        at = std::make_pair(caret.left(), caret.top());
+    } else {
+        at = panel_->pointerPosition();
+    }
+    if (at) {
+        if (std::optional<HostOutput> o = panel_->outputAt(at->first, at->second)) {
+            return *o;
+        }
+    }
+    out.work = panel_->screenWorkArea();
+    return out;
 }
 
 void WindEngine::sendFocusGained(fcitx::InputContext* ic)
@@ -819,9 +897,15 @@ void WindEngine::onPushFrame(Frame frame)
         for (auto& r : menuShm_) {
             r.close();
         }
+        for (auto& r : panelShm_) {
+            r.close();
+        }
         hideCandidate();
         panel_->hideAllOverlays();
         hideAllWayland();
+        // 工具栏 / 软键盘是旧连接上推来的：丢掉。服务端在 push 连接（重）建立时按自己的状态
+        // 重推可见的那几层（新服务没有可见面板，同一服务换了连接则原样补回）。
+        hidePanels();
         // 旧服务 hold 的键没人再来 release 了。
         releaseHeldKeys("service_ready");
         {
@@ -835,6 +919,11 @@ void WindEngine::onPushFrame(Frame frame)
                 if (fcitx::InputContext* ic = focusedIC(); ic && reconnect()) {
                     sendFocusGained(ic);
                 }
+            }
+            // 服务端在 push 连接建立时把全屏复位成 false（新服务本就是默认值）：仍全屏就补报，
+            // 免得工具栏盖在全屏应用上。首次连上也补——早于复位报的那次会被冲掉。
+            if (fullscreen_.resyncAfterRestart()) {
+                sendAndDrain(encodeHostFullscreenFrame(true));
             }
             if (hadMenu) {
                 sendAndDrain(encodeMenuDismissFrame("service_ready"));
@@ -1003,7 +1092,8 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
         onMenuFrame(uint32_t(level), p);
         return;
     }
-    if (p.kind < 1 || p.kind > 3) {
+    const bool panel = isPanelOverlayKind(p.kind);
+    if (!panel && (p.kind < 1 || p.kind > 3)) {
         WIND_DEBUG() << "未知浮层 kind=" << p.kind << "，忽略";
         return;
     }
@@ -1016,7 +1106,8 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
 #endif
         return;
     }
-    ShmFrameReader& shm = overlayShm_[p.kind - 1];
+    static_assert(OVERLAY_KIND_SOFTKEYBOARD == OVERLAY_KIND_TOOLBAR + 1, "panelShm_ 按 kind 连续编址");
+    ShmFrameReader& shm = panel ? panelShm_[p.kind - OVERLAY_KIND_TOOLBAR] : overlayShm_[p.kind - 1];
     const std::string name = overlayShmName(p.kind);
     if (!shm.isOpen() && !shm.open(name)) {
         WIND_WARN() << "打不开浮层共享内存 " << name << "：" << shm.lastError();
@@ -1039,6 +1130,38 @@ void WindEngine::onOverlayFrame(const OverlayFramePayload& p)
     wlPanel_->hideOverlay(p.kind);
 #endif
     panel_->showOverlay(p.kind, f, p);
+}
+
+void WindEngine::hidePanels()
+{
+    for (uint32_t kind : {OVERLAY_KIND_TOOLBAR, OVERLAY_KIND_SOFTKEYBOARD}) {
+        panel_->hideOverlay(kind);
+#ifdef WIND_HAVE_WAYLAND
+        if (wlPanel_) {
+            wlPanel_->hideOverlay(kind);
+        }
+#endif
+    }
+}
+
+void WindEngine::reportPanelPos(uint32_t kind, int32_t x, int32_t y, const std::string& output)
+{
+    const char* ext = panelPosKind(kind);
+    if (!ext) {
+        WIND_WARN() << "reportPanelPos：kind=" << kind << " 不是工具栏 / 软键盘";
+        return;
+    }
+    WIND_DEBUG() << ext << " (" << x << "," << y << ") output=" << output;
+    sendAndDrain(encodePosFrame(ext, x, y, output));
+}
+
+void WindEngine::reportFullscreen(bool fullscreen)
+{
+    if (!fullscreen_.change(fullscreen)) {
+        return;
+    }
+    WIND_DEBUG() << "焦点窗口" << (fullscreen ? "进入" : "退出") << "全屏";
+    sendAndDrain(encodeHostFullscreenFrame(fullscreen));
 }
 
 void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
@@ -1064,7 +1187,11 @@ void WindEngine::onMenuFrame(uint32_t level, const OverlayFramePayload& p)
         return;
     }
 #ifdef WIND_HAVE_WAYLAND
-    if (wlPanel_ && (wlPanel_->screenMenuActive() || wlPanel_->handles(focusedIC()))) {
+    // 屏幕菜单开着、刚在 layer-shell 面板上按过（服务端从工具栏 / 软键盘发起的菜单，坐标是面板
+    // 坐标）、或焦点在 Wayland 原生应用：都归 Wayland 这边。
+    if (wlPanel_
+        && (wlPanel_->screenMenuActive() || wlPanel_->panelMenuPending()
+            || wlPanel_->handles(focusedIC()))) {
         panel_->hideMenuLevel(level);
         wlPanel_->showMenuLevel(focusedIC(), level, f, p);
         return;
@@ -1265,6 +1392,13 @@ void WindEngine::requestMenu(int32_t target, int32_t x, int32_t y)
     // Wayland 应用：x y 是 popup 位图里的坐标，工作区也在这套坐标系里
     if (wlPanel_ && wlPanel_->handles(focusedIC())) {
         wa = wlPanel_->virtualWorkArea();
+    }
+#endif
+#ifdef WIND_HAVE_WAYLAND
+    if (wlPanel_) {
+        // 本端发起的菜单（X11 / popup 候选右键、X11 托盘入口）：随后的菜单帧不是面板的，否则刚点过
+        // 工具栏时它会被开到 Wayland 底板上、还减去输出原点
+        wlPanel_->clearPanelMenuPending();
     }
 #endif
     WIND_DEBUG() << "请求打开菜单 target=" << target << " @(" << x << "," << y << ")";

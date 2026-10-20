@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 /// 淡出时长（固定 1 秒，不做配置）。
-const FADE_DURATION: Duration = Duration::from_millis(1000);
+pub(crate) const FADE_DURATION: Duration = Duration::from_millis(1000);
 
 /// 淡出期间的重绘间隔（约 60fps）。
 ///
@@ -137,6 +137,11 @@ impl AutoHide {
             return Some(now + FADE_FRAME);
         }
         self.deadline
+    }
+
+    /// 处于假隐藏：窗口还在、肉眼看不见。
+    pub fn is_ghosted(&self) -> bool {
+        self.ghosted
     }
 
     /// 是否有活动计时/淡出。false 时调用方跳过 tick 推进（不取 Instant::now()）。

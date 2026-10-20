@@ -55,7 +55,9 @@ const BASE_THEME: &str = include_str!("../../../../data/themes/_base/theme.toml"
 fn base_colors() -> &'static toml::Table {
     static COLORS: OnceLock<toml::Table> = OnceLock::new();
     COLORS.get_or_init(|| {
-        let v: Value = toml::from_str(BASE_THEME).expect("嵌入的 _base/theme.toml 解析失败");
+        let v: Value = BASE_THEME
+            .parse()
+            .expect("嵌入的 _base/theme.toml 解析失败");
         v.get("colors")
             .and_then(Value::as_table)
             .cloned()

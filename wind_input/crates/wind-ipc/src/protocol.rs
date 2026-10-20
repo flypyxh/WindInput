@@ -153,6 +153,26 @@ pub mod menu_pointer {
     pub const MENU_POINTER_PRESS: u32 = 2;
 }
 
+/// 上行（**仅 Linux** Fcitx5 addon）：交互浮层（悬浮工具栏 / 软键盘）上的指针事件。
+///
+/// 这两层与自绘菜单一样由服务进程光栅化、addon 只贴图（见 [`overlay::OVERLAY_KIND_TOOLBAR`]），
+/// 命中测试、悬停高亮、按键按下都在服务端。addon 把窗口内的指针事件原样报上来。
+///
+/// payload（20 字节，小端）：`kind u32`（浮层 kind）+ `event u32`（[`panel_pointer`]）+
+/// `button u32`（X11 按键号：1 左 / 2 中 / 3 右；滚轮取 4 上 / 5 下；移动与离开时 0）+
+/// `x i32` + `y i32`（**位图内**坐标，含软阴影扩边，与 Windows 客户区坐标同义）。
+/// 同步请求回 ack。
+pub const CMD_PANEL_POINTER: u16 = 0x021C;
+
+/// [`CMD_PANEL_POINTER`] 的 `event` 取值。名字全局唯一，`protocol_sync_test` 逐个比对。
+pub mod panel_pointer {
+    pub const PANEL_POINTER_MOTION: u32 = 1;
+    pub const PANEL_POINTER_PRESS: u32 = 2;
+    pub const PANEL_POINTER_RELEASE: u32 = 3;
+    pub const PANEL_POINTER_LEAVE: u32 = 4;
+    pub const PANEL_POINTER_WHEEL: u32 = 5;
+}
+
 /// 扩展信封 [`ext_kind::MENU_OPEN`] 的 `target` 里「不是候选」的几档（≥ 0 是候选页内下标）。
 /// 名字全局唯一，`protocol_sync_test` 逐个比对。
 pub mod menu_target {
@@ -256,6 +276,11 @@ pub mod overlay {
     /// 每级一个窗口、一段 SHM。级数上限 [`OVERLAY_MENU_LEVELS`]，更深的子菜单不显示。
     pub const OVERLAY_KIND_MENU: u32 = 4;
     pub const OVERLAY_MENU_LEVELS: u32 = 6;
+    /// 悬浮工具栏 / 软键盘（Linux）。菜单占 4..=9（`OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS`），故从 10 起。
+    /// 这两层可交互、可拖动：帧尾多一段拖动区（见 [`crate::codec::encode_overlay_frame`]），
+    /// 指针事件走 [`super::CMD_PANEL_POINTER`]。
+    pub const OVERLAY_KIND_TOOLBAR: u32 = 10;
+    pub const OVERLAY_KIND_SOFTKEYBOARD: u32 = 11;
 
     /// 落位方式（place）。坐标一律指**内容盒**左上（不含软阴影扩边），宿主减去
     /// `content_x/y` 得窗口左上。
@@ -331,6 +356,13 @@ pub mod ext_kind {
     pub const POS_CANDIDATE: &str = "pos.candidate";
     /// 上行：状态提示气泡被拖动到新位置。body 同 [`POS_CANDIDATE`]。
     pub const POS_STATUS_TIP: &str = "pos.status_tip";
+    /// 上行（Linux addon）：悬浮工具栏被拖动到新位置。body =
+    /// `{"x":123,"y":456,"output":"DP-1"}`，内容盒左上的屏幕坐标；`output` 可缺省。
+    pub const POS_TOOLBAR: &str = "pos.toolbar";
+    /// 上行（Linux addon）：软键盘被拖动到新位置。body 同 [`POS_TOOLBAR`]。
+    pub const POS_SOFTKEYBOARD: &str = "pos.softkeyboard";
+    /// 上行（Linux addon）：焦点宿主进入 / 退出全屏。body = `{"fullscreen":bool}`。
+    pub const HOST_FULLSCREEN: &str = "host.fullscreen";
     /// 下行：问 `.app` 候选窗此刻在哪，答案走上行 [`POS_CANDIDATE`]。body 空。
     pub const POS_CANDIDATE_QUERY: &str = "pos.candidate.query";
     /// 下行：问宿主（`.app` / Linux addon）状态气泡此刻在哪，答案走上行 [`POS_STATUS_TIP`]。
@@ -356,6 +388,13 @@ pub mod ext_kind {
     /// - `scale`：界面缩放因子（1.0 = 96dpi）。服务不链接桌面库，Linux 上的缩放只能由宿主报：
     ///   Wayland 取输出的缩放，X11 取 `Xft.dpi / 96`。落在 `wind_ui::dpi`，所有浮层的字号与几何
     ///   都从它派生；帧位图因此按物理像素光栅化，addon 贴图时再按同一个因子折回逻辑尺寸。
+    /// - `output`：焦点所在输出（显示器）名，如 `"DP-1"`；缺省 = 不改现值。
+    /// - `work`：该输出的工作区 `[左,上,右,下]`（屏幕坐标，同 [`MENU_OPEN`] 的 `work`），工具栏 /
+    ///   软键盘的默认落点按它算。与 `output` 成对：报了其一，工作区就按本次替换（只报 `output` = 工作区未知），
+    ///   `output` 只在报了时更新。
+    /// - `panels`：能力声明，宿主能贴工具栏 / 软键盘浮层（Linux addon 恒报 `true`）。不认这两种浮层
+    ///   的旧 addon 不报，服务端据此不开软键盘、主菜单不出这两项。缺省 = 不改现值；请求连接断开时
+    ///   复位为未声明（见协调器 `host_has_panels`）。
     pub const HOST_DISPLAY: &str = "host.display";
     /// 上行（Linux addon）：请求打开自绘菜单。body =
     /// `{"target":<页内下标>|<menu_target>,"x":..,"y":..,"work":[左,上,右,下]}`——`target` ≥ 0

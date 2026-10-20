@@ -27,6 +27,7 @@ pub mod quick_format;
 pub mod shadow;
 pub mod stat_collector;
 pub mod stats;
+pub mod stats_report;
 pub mod store;
 pub mod store_layer;
 pub mod temp_words;

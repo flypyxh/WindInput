@@ -489,6 +489,8 @@ pub struct Tooltip {
     base_logical: f32,
     /// 窗口是否显示中（与 `TooltipMouse` 共享：离开隐藏在那边执行）。
     visible: Rc<Cell<bool>>,
+    /// 最近一次显示的内容盒屏幕矩形 `(left, top, right, bottom)`，见 [`Self::content_rect`]。
+    placed: Cell<(i32, i32, i32, i32)>,
     bg: [u8; 4],
     fg: [u8; 4],
     /// 主题位图背景 + z 层（jidian tooltip 吃九宫格 panel + 角标水印）。
@@ -545,6 +547,7 @@ impl Tooltip {
             scale,
             base_logical: FONT_PX,
             visible,
+            placed: Cell::new((0, 0, 0, 0)),
             bg: BG,
             fg: FG,
             bg_image: None,
@@ -735,6 +738,7 @@ impl Tooltip {
         // 内容盒按工作区钳位（下方优先，不足上翻到候选行上方）；窗口原点 = 内容锚点 − 左/上 margin。
         let (px, py) = clamp_to_work_area(x, anchor_top, anchor_bottom, cw, ch);
         self.window.show(px - ml as i32, py - mt as i32);
+        self.placed.set((px, py, px + cw as i32, py + ch as i32));
         self.visible.set(true);
     }
 
@@ -760,6 +764,7 @@ impl Tooltip {
         let (cw, ch, ml, mt, ..) = self.render_to_window(&text);
         let (px, py) = clamp_beside(win_left, win_right, row_top, row_bottom, cw, ch);
         self.window.show(px - ml as i32, py - mt as i32);
+        self.placed.set((px, py, px + cw as i32, py + ch as i32));
         self.visible.set(true);
     }
 
@@ -797,6 +802,18 @@ impl Tooltip {
     /// 气泡所属候选行的屏幕矩形 `(left, top, right, bottom)`（宽限到期判「回到了候选行」）。
     pub fn set_anchor(&mut self, rect: (i32, i32, i32, i32)) {
         self.mouse.borrow_mut().anchor = Some(rect);
+    }
+
+    /// 「是否显示中」的共享标志：候选窗的悬停宽限读 `tip_rect` 之前先问它（气泡自己收起时
+    /// 候选窗那边不知道）。
+    pub(crate) fn visible_flag(&self) -> Rc<Cell<bool>> {
+        self.visible.clone()
+    }
+
+    /// 显示中的内容盒屏幕矩形 `(left, top, right, bottom)`；没显示为 `None`。候选窗的悬停
+    /// 宽限据此判「光标正朝气泡去」。
+    pub fn content_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        self.visible.get().then(|| self.placed.get())
     }
 
     /// 光标此刻是否在气泡上（窗口可见时才可能为真）。候选窗的悬停宽限据此判「已进入气泡」。

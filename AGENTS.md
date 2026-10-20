@@ -149,6 +149,13 @@ CI 承接）、CI 另有 `cargo tree` 断言 coordinator 无 wind-ui 依赖边�
      条目透不过来。
   ⇒ 加任何出厂预置前先答这一句：**用户在 UI 上做的删除落到哪个键？那个键能否压制出厂值所在
   的那个键？** 答不出「能」，就是上面这个 bug。
+- **`Config` / `Schema` 跨 crate 的 (反)序列化只走 wind-config 的非泛型入口**
+  （`from_toml_value` / `to_toml_value` / `to_json_value`、`Schema::probe_and_patch`）：release
+  不共享泛型，下游每写一处 `value.try_into::<Schema>()`、`serde_json::to_value(cfg)` 或
+  `toml::from_str::<Schema>`，就在那个 crate 里把整棵类型树的 serde 代码再编一份（每份约
+  0.2 MiB，曾累计 1.5 MiB）。编译器不报错，类型推断出来的 `.try_into()?` 也一样中招。
+  同理，文本解析成 `toml::Value` / `toml::Table` 用 `text.parse()`（实例在 toml crate 里只有
+  一份），别用 `toml::from_str`。
 
 ## 提交纪律（多会话共仓）
 

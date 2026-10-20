@@ -255,7 +255,12 @@ fn cmd_weight_check(args: &[String]) -> anyhow::Result<i32> {
         let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
         };
-        let Ok(schema) = toml::from_str::<wind_config::Schema>(&text) else {
+        // 经 `Schema::from_toml_value`：直接 from_str::<Schema> 会让整族方案类型再单态化一份。
+        let Some(schema) = text
+            .parse()
+            .ok()
+            .and_then(|v| wind_config::Schema::from_toml_value(v).ok())
+        else {
             continue;
         };
         let sid = f

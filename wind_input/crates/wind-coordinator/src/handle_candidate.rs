@@ -431,7 +431,9 @@ impl Coordinator {
     /// 而快捷输入数字透镜的上屏（计算结果、日期、金额）没有编码、恒不记词频，却同样是
     /// 一次上屏。历史点若只挂在选词上，「算完再按 ; 空格重复一次」永远取不到刚算的结果。
     pub(crate) fn push_commit_history(&self, text: &str) {
-        if text.is_empty() {
+        // 暂停学习也不记：它虽只在内存里，却会经 `;` 重复上屏、加词推荐把无痕框里打的字
+        // 带到下一个输入框去——隐私上与落库无异。
+        if text.is_empty() || self.learning_suspended() {
             return;
         }
         let mut h = self
@@ -586,7 +588,8 @@ impl Coordinator {
         // `$CC` 纯文本命令就是 `freq_text` 空而上屏文本非空的例子。
         self.push_commit_history(history_text);
         let text = freq_text;
-        if text.is_empty() {
+        // 暂停学习：一切选词记账（主路、临拼、快捷输入、特殊模式、英文头部候选）都汇到这里。
+        if text.is_empty() || self.learning_suspended() {
             return;
         }
         if source == CandidateSource::Phrase {
@@ -2293,6 +2296,12 @@ impl Coordinator {
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
     /// 返回输入结局（全码自动上屏 / 满码空码清空）；多数调用方忽略，仅正向输入字母时消费。
     pub(crate) fn update_candidates(&self, state: &mut State) -> InputOutcome {
+        let outcome = self.refill_candidates(state);
+        self.grid_resume(state);
+        outcome
+    }
+
+    fn refill_candidates(&self, state: &mut State) -> InputOutcome {
         state.candidates.clear();
         state.preedit = state.input_buffer.clone();
         state.preedit_split_body.clear();
@@ -2502,6 +2511,8 @@ impl Coordinator {
         let (engine_count, _) = self.build_candidates(state, new_limit);
         // 重建后立刻重新展开变体（列表整份重建，变体须随之重展）。
         self.expand_s2t_variants(state);
+        // 展开态正在按分类筛选：重建出来的是完整列表，重新筛一遍（见 `grid_reapply_filter`）。
+        self.grid_reapply_filter(state);
         // 可见列表可能变短（同组常用字进来、先前放行的生僻字被滤走），页码/高亮须夹回范围，
         // 下面两条出口都要——见 `clamp_candidate_view`。
         self.clamp_candidate_view(state);
@@ -2548,7 +2559,7 @@ impl Coordinator {
         state: &mut State,
         offset: usize,
     ) -> Option<KeyAction> {
-        let (start, end) = self.page_range(state);
+        let (start, end) = self.select_range(state);
         let gi = start + offset;
         if gi >= end {
             return None;
@@ -3211,6 +3222,9 @@ impl Coordinator {
         source: CandidateSource,
         freq_code: &str,
     ) -> String {
+        // 满码 / 唯一候选自动上屏不经选词：下一词学习的断点。不能只靠顶层兜底统计
+        // （`record_input_stats`）去清——移动端直调 `handle_key_event`，不走那道兜底。
+        self.note_word_boundary();
         self.record_selection_cased_in(None, freq_code, freq_text, text, source);
         let mut out = match s2t_override {
             Some(t) => t.to_string(),
@@ -3639,6 +3653,9 @@ impl Coordinator {
         if !from_assoc {
             self.record_selection_cand(&self.main_freq_code(&state.input_buffer, cand), cand);
         }
+        // 下一词学习的上文：`record_commit` 一律清上文（默认断开），选词是唯一接得上的
+        // 出口，故先取出来——分步选的前段放回去，整体上屏交给 `learn_next_word`。
+        let next_word_prev = self.take_next_word_prev();
         // 输入统计：每次选词记一段（分段逐字选各段各记一次，不重复整串）；
         // 在 partial 分支之前，两分支都经此处一次。
         self.record_commit(
@@ -3649,6 +3666,7 @@ impl Coordinator {
         );
         let raw_code = Self::raw_consumed_code(&state.input_buffer, consumed, partial);
         if partial {
+            self.restore_next_word_prev(next_word_prev);
             state.committed_segs.push(CommittedSeg {
                 raw_code,
                 code,
@@ -3757,6 +3775,17 @@ impl Coordinator {
             if from_assoc {
                 self.record_assoc_pick(cand);
             }
+            // 下一词学习：「上一个整体上屏的词 → 这个词」。选联想时上屏的整词是 `cand.text`
+            // （`out` 只是补出的那截），否则是简体域的完整文本（理由同下方上文的取法）。
+            self.learn_next_word(
+                next_word_prev,
+                if from_assoc {
+                    &cand.text
+                } else {
+                    &final_simplified
+                },
+                from_assoc && cand.commit_override.is_some(),
+            );
             let assoc_ctx = if from_assoc {
                 cand.text.clone()
             } else {
@@ -3792,7 +3821,7 @@ impl Coordinator {
     /// 数字键选词统一入口（num 为 1-based：1-9 选页内对应候选，10 表示主键盘 `0` 选第 10 个）。
     /// 命中当前页范围 → 选词上屏；越界 → 走 overflow 策略（对齐 Go handleNumberKey）。
     pub(crate) fn handle_number_key_select(&self, state: &mut State, num: usize) -> KeyAction {
-        let (start, end) = self.page_range(state);
+        let (start, end) = self.select_range(state);
         let idx = start + (num - 1);
         if idx < end {
             let cand = state.candidates[idx].clone();
@@ -4280,6 +4309,9 @@ impl Coordinator {
         // 余码是缓冲的后缀 → 影子串同步掐头，否则大写会在这里静默丢掉。
         preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
         state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
+        // 首选已上屏，余码是新的一次组合：不继承上一次的展开（按键入口那道「没有输入会话」
+        // 判不到——这一键按下时候选还在）。
+        state.grid_keep = false;
         let _ = self.update_candidates(state); // 余码候选（不再消费其结局）
         let preedit = state.preedit.clone();
         // 顶码 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合起点已变。
@@ -4556,7 +4588,7 @@ impl Coordinator {
         if state.candidates.is_empty() {
             return;
         }
-        let (start, end) = self.page_range(&state);
+        let (start, end) = self.select_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
             return;
@@ -4612,11 +4644,12 @@ impl Coordinator {
         {
             return;
         }
+        // 位置一律按完整列表计（分类筛选中 `idx` 只是子集下标），见 `reorder_positions`。
+        let pos = self.reorder_positions(&state, idx);
         // 已在首位：置顶是冗余规则，直接忽略（菜单已灰显，热键路径 defensive）。
-        if matches!(op, CandidateOp::MoveTop) && idx == 0 {
+        if matches!(op, CandidateOp::MoveTop) && pos.here == 0 {
             return;
         }
-        let last = state.candidates.len().saturating_sub(1);
         if let Some(store) = &self.store {
             // 候选调整按 data_schema_id 归属（拼音族折叠）；Delete 分支仍传原始 schema，
             // 供 delete_candidate_by_source 对用户词/临时词按来源分流（混输）。
@@ -4629,10 +4662,10 @@ impl Coordinator {
             let r = match op {
                 CandidateOp::MoveTop => store.pin_shadow(&sh_schema, &code, &word, cand_id, 0),
                 CandidateOp::MoveUp => {
-                    store.pin_shadow(&sh_schema, &code, &word, cand_id, idx.saturating_sub(1))
+                    store.pin_shadow(&sh_schema, &code, &word, cand_id, pos.prev)
                 }
                 CandidateOp::MoveDown => {
-                    store.pin_shadow(&sh_schema, &code, &word, cand_id, (idx + 1).min(last))
+                    store.pin_shadow(&sh_schema, &code, &word, cand_id, pos.next)
                 }
                 // ⚠️ Delete 走 `raw_code`（击键）而非归一码：它落的是短语表 / 用户词库，
                 // 两者的键空间都是击键域（短语按 `input_buffer` 召回），与 shadow 不同。
@@ -4654,12 +4687,17 @@ impl Coordinator {
         // 重新构建候选（会重新应用 Shadow）并重绘。
         // **必须按模式分派**：主路径的 `update_candidates` 读 `input_buffer`，而特殊模式下它
         // 恒为空 —— 在快符里走主路径的后果不是「不刷新」而是候选窗当场被清空。
+        let grid = Self::grid_snapshot(&state);
         if special {
             // 返回值是「全码策略请求自动上屏」的意向，此处**刻意丢弃**：编码一个字没变，
             // 用户只是在调整候选顺序，凭空上屏是错的。
             let _ = self.update_special_candidates(&mut state);
         } else {
             self.update_candidates(&mut state);
+        }
+        // 展开态：别跳回首行、丢掉分类——用户正在第几行调的就留在第几行。
+        if let Some(snap) = grid {
+            self.grid_restore(&mut state, snap);
         }
         // 用户看到的那一半判据。「记录删掉了、但同文的系统词条目还在」与「根本没删到」
         // 在屏幕上完全同形（都是点了没反应），只有把这一行和上面的「删前命中」并排看
@@ -4963,7 +5001,7 @@ impl Coordinator {
                 .highlighted_global_index(&state)
                 .min(state.candidates.len() - 1),
             Some(n) => {
-                let (start, end) = self.page_range(&state);
+                let (start, end) = self.select_range(&state);
                 if start + n >= end {
                     return Some(KeyAction::Consumed);
                 }
@@ -5015,6 +5053,14 @@ impl Coordinator {
     /// 页内下标 → 绝对下标的换算在此，**页范围校验也在此**：桌面候选窗只画当前页，
     /// 点到页外即为坐标算错，必须拒绝。移动端不是这样（见 [`Self::select_candidate_at`]）。
     fn mouse_select_action(&self, page_local: usize) -> Option<KeyAction> {
+        // 展开态下 UI 回传的是网格平铺下标，先切到那一格再按页内下标选。
+        // 点的是展开态的分类标签（tag 段见 `GRID_TAB_TAG_BASE`）：切分类，不选词。
+        if let Some(tab) = self.grid_tab_of_event(page_local) {
+            self.grid_click_tab(tab);
+            return None;
+        }
+        // 切高亮时即重绘：选词可能不上屏（`$CC` 命令、组折叠），那时屏幕上要看到高亮已到这一格。
+        let page_local = self.resolve_event_index(page_local, true)?;
         let (start, end) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             self.page_range(&state)
@@ -5978,7 +6024,7 @@ mod finalize_candidates_tests {
             ("handle_candidate.rs", "fn build_candidates", "主输入路"),
             (
                 "handle_temp.rs",
-                "fn update_temp_pinyin_candidates",
+                "fn refill_temp_pinyin_candidates",
                 "临时拼音",
             ),
             ("handle_mode.rs", "fn update_mix_candidates", "快捷输入/mix"),

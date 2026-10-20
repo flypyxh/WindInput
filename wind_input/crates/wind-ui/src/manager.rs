@@ -413,6 +413,7 @@ impl UiManager {
                         hover,
                         page,
                         total_pages,
+                        grid,
                         caret_x,
                         caret_y,
                         caret_height,
@@ -438,6 +439,7 @@ impl UiManager {
                         } else {
                             preedit
                         };
+                        candidate_window.set_grid(grid);
                         candidate_window.update(
                             &preedit,
                             preedit_caret,
@@ -500,7 +502,11 @@ impl UiManager {
                     // 显示器自查工作区，协调器也只在 Linux 形态下发这几条。
                     UiCommand::MenuPointer { .. }
                     | UiCommand::SetWorkArea { .. }
-                    | UiCommand::TooltipMenuAt { .. } => {}
+                    | UiCommand::TooltipMenuAt { .. }
+                    | UiCommand::PanelPointer { .. }
+                    | UiCommand::PanelMoved { .. }
+                    | UiCommand::SetHostFullscreen(_)
+                    | UiCommand::HostReconnected => {}
                     UiCommand::CopyToClipboard(text) => {
                         crate::popup_menu::set_clipboard_text(&text);
                     }

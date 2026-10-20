@@ -99,6 +99,9 @@ const REPEAT_RATE_MS: u64 = 33;
 const KEY_FLASH_MS: u64 = 140;
 /// 物理 Shift / 大写锁定的跟随节奏（毫秒）。**仅面板可见期间生效**。
 const MODIFIER_POLL_MS: u64 = 40;
+/// 本平台读得到物理 Shift / 大写锁定（见 [`read_shift_caps`]）。读不到时不登记上面那个节奏——
+/// 醒来也无事可做，只是白白把线程叫起来（Linux 外部宿主形态）。
+const MODIFIER_POLLS: bool = cfg!(any(windows, target_os = "macos"));
 
 /// 面板上的 Caps 键点了能不能翻转系统大写锁定。
 ///
@@ -272,6 +275,16 @@ impl SoftMouse {
         crate::sys::HWND(self.hwnd as *mut core::ffi::c_void)
     }
 
+    /// Linux 外部宿主形态：窗口壳是 `ext_panel`，句柄就是浮层 kind。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn hwnd_handle(&self) -> crate::sys::HWND {
+        crate::sys::HWND(self.hwnd)
+    }
+
+    /// Linux 外部宿主形态：addon 每次指针离开都报 `LEAVE`，不需要订阅。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn arm_leave(&mut self) {}
+
     /// 订阅一次性 `WM_MOUSELEAVE`（光标移出窗口时收到）。收到后系统即注销，需重订。
     #[cfg(windows)]
     fn arm_leave(&mut self) {
@@ -293,9 +306,7 @@ impl SoftMouse {
         }
     }
 
-    /// ⚠️ 调用点都在平台分支里（Windows 的 `mouse_impl`、macOS 的 `mouse_macos`，
-    /// 以及两者各自的 `refresh_hover`），Linux 上确实无人读。
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    /// 调用点：各平台的鼠标分支与 `refresh_hover`，以及导出拖动区的 [`drag_regions_of`]。
     fn hit_at(&self, x: f32, y: f32) -> i32 {
         // 逆序找：后画的（层级更高的）优先。键帽之间不重叠，这里只是稳妥。
         self.hits
@@ -310,7 +321,7 @@ impl SoftMouse {
 /// 长按重复参数：优先取系统的键盘重复设置。
 ///
 /// ★ 不自定常数——鼠标长按与物理键长按必须同一个手感，而物理那条走的就是系统设置。
-fn repeat_params() -> (u64, u64) {
+pub(crate) fn repeat_params() -> (u64, u64) {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -421,7 +432,9 @@ impl SoftKeyboard {
             pressed: -1,
             #[cfg(windows)]
             hwnd: window.hwnd().0 as isize,
-            #[cfg(not(windows))]
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            hwnd: window.hwnd().0,
+            #[cfg(not(any(windows, all(target_os = "linux", ext_presenter))))]
             hwnd: 0,
             ..Default::default()
         }));
@@ -631,7 +644,9 @@ impl SoftKeyboard {
             // 物理按键高亮的自动熄灭
             self.down_slot.as_ref().map(|(_, at)| *at),
             // 物理 Shift / 大写锁定的跟随节奏（仅面板可见期间，见 tick 里的说明）
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(MODIFIER_POLL_MS)),
+            MODIFIER_POLLS.then(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(MODIFIER_POLL_MS)
+            }),
         ]
         .into_iter()
         .flatten()
@@ -853,6 +868,46 @@ impl SoftKeyboard {
         self.mouse.borrow_mut().hits = hits;
     }
 
+    /// 按下即「抓住面板拖动」的区域（位图内 `x, y, w, h`），供外部宿主在本地拖动。
+    ///
+    /// 判据就是鼠标状态机自己那条：`drags_panel(hit_at(..))`，见 [`drag_regions_of`]。
+    pub fn drag_regions(&self) -> Vec<[i32; 4]> {
+        let (w, h) = self.window.size();
+        drag_regions_of(&self.mouse.borrow(), w, h)
+    }
+
+    /// 外部宿主本地拖完：落点（左上角）收进来，锚点改成新的右下角并上报协调器落盘——等同
+    /// Windows 拖动结束时 `tick` 收 `moved_to` / `dropped_at` 那两步。宿主只报左上角，换算右下角
+    /// 要用尺寸，而尺寸只有这里知道。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub fn on_host_moved(&mut self, x: i32, y: i32) {
+        let (w, h) = self.window.size();
+        let (right, bottom) = (x + w as i32, y + h as i32);
+        self.origin = Some((x, y));
+        self.anchor_br = Some((right, bottom));
+        let _ = self
+            .events
+            .send(UiEvent::SoftKeyboardMoved { right, bottom });
+    }
+
+    /// 测试用：当前悬停的 tag（-1 = 无）。
+    #[cfg(all(test, target_os = "linux", ext_presenter))]
+    pub(crate) fn hover(&self) -> i32 {
+        self.mouse.borrow().hover
+    }
+
+    /// 测试用：某个 tag 当前的命中矩形（forwarder 用例据此找键帽的位图内坐标）。
+    #[cfg(all(test, target_os = "linux", ext_presenter))]
+    pub(crate) fn hit_rect(&self, tag: i32) -> Option<Rect> {
+        self.mouse
+            .borrow()
+            .hits
+            .iter()
+            .rev()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, r)| *r)
+    }
+
     /// 重排 + 重画 + 上屏。
     fn render(&mut self) {
         if !self.visible || self.keys.is_empty() {
@@ -888,6 +943,9 @@ impl SoftKeyboard {
         let w = (w_f.ceil() as u32).max(64);
         let h = (h_f.ceil() as u32).max(64);
         self.window.resize(w, h);
+        // 拖动由 addon 本地做：拖动区随帧下发，与本帧的命中区同刻。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.window.set_drag_regions(self.drag_regions());
         {
             let buf = self.window.buffer_mut();
             let n = (w * h * 4) as usize;
@@ -896,6 +954,10 @@ impl SoftKeyboard {
         }
         if let Err(e) = self.window.update() {
             tracing::warn!("软键盘: 窗口更新失败: {e}");
+            // Linux：位图超出 SHM 段上限（高缩放下的大面板）时整帧送不出去，面板不显示，协调器却
+            // 仍在软键盘态接管主键区——打字全变符号。让协调器退出软键盘态，与点关闭按钮同一条路。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            let _ = self.events.send(UiEvent::SoftKeyboardClose);
             return;
         }
         // 落点每帧现算：锚右下角减去**当前**尺寸。切面会改面板尺寸（各面键数不同），
@@ -1158,7 +1220,33 @@ impl SoftKeyboard {
         true
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    /// Linux 外部宿主形态：照 macOS 的算法，光标（addon 最近报来的指针）减面板左上角。
+    ///
+    /// ⚠️ 先问指针还在不在面板里：「最后指针」在 LEAVE 后保持不动，不看这一位的话，
+    /// 指针离开后的任何一次重绘（切面、物理按键高亮）都会把它最后停过的那个键重新点亮。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn refresh_hover(&self) -> bool {
+        use crate::sys::{GetCursorPos, GetWindowRect, POINT, RECT};
+        let mut m = self.mouse.borrow_mut();
+        let hwnd = m.hwnd_handle();
+        if !crate::ext_panel::pointer_inside(hwnd) {
+            return false;
+        }
+        let (mut p, mut r) = (POINT::default(), RECT::default());
+        unsafe {
+            if GetCursorPos(&mut p).is_err() || GetWindowRect(hwnd, &mut r).is_err() {
+                return false;
+            }
+        }
+        let h = m.hit_at((p.x - r.left) as f32, (p.y - r.top) as f32);
+        if h == m.hover {
+            return false;
+        }
+        m.hover = h;
+        true
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", ext_presenter))))]
     fn refresh_hover(&self) -> bool {
         false
     }
@@ -1702,12 +1790,75 @@ fn is_page_tag(tag: i32) -> bool {
 /// 自己的命中区在它之后收集、盖在上面，所以命中到视口就说明点的是标签行的**留白**。
 /// 而 `WM_LBUTTONDOWN` 那条拖动分支的注释一直写着「空白处（标签行留白、键位之间的
 /// 缝）→ 拖动整块面板」，此前却只判 `h < 0`，留白根本走不到——注释与代码相矛盾。
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))] // 调用点在 mouse_impl / mouse_macos
 fn drags_panel(tag: i32) -> bool {
     tag < 0 || tag == SOFT_TAG_TAB_VIEWPORT
 }
 
-#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))] // 调用点在 mouse_impl / mouse_macos
+/// `w × h` 面板里按下会拖动的区域，切成互不重叠的矩形（位图内 `x, y, w, h`）。
+///
+/// ★ 不另写一套几何：按命中区的边把面板切成网格，每格取中心点问一次
+/// `drags_panel(hit_at(..))`——与鼠标状态机按下时的判据是同一行代码。再把同一行带里相邻
+/// 的格并成一段、上下两行带里同宽同位的段并成一块，矩形数就压到几十个。
+fn drag_regions_of(m: &SoftMouse, w: u32, h: u32) -> Vec<[i32; 4]> {
+    let edges = |pick: fn(&Rect) -> (f32, f32), max: u32| {
+        let mut v = vec![0, max as i32];
+        for (_, r) in &m.hits {
+            let (a, len) = pick(r);
+            for e in [a, a + len] {
+                v.push((e.round() as i32).clamp(0, max as i32));
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let xs = edges(|r| (r.x, r.w), w);
+    let ys = edges(|r| (r.y, r.h), h);
+    let mut out: Vec<[i32; 4]> = Vec::new();
+    // 上一行带延续下来、还能往下长的块在 `out` 里的下标，按 `(x, 宽)` 认。
+    let mut open: Vec<usize> = Vec::new();
+    for band in ys.windows(2) {
+        let (y0, y1) = (band[0], band[1]);
+        let cy = (y0 + y1) as f32 * 0.5;
+        let mut runs: Vec<(i32, i32)> = Vec::new();
+        for cell in xs.windows(2) {
+            let (x0, x1) = (cell[0], cell[1]);
+            if !drags_panel(m.hit_at((x0 + x1) as f32 * 0.5, cy)) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((_, end)) if *end == x0 => *end = x1,
+                _ => runs.push((x0, x1)),
+            }
+        }
+        let mut next_open = Vec::with_capacity(runs.len());
+        for (x0, x1) in runs {
+            let rect = [x0, y0, x1 - x0, y1 - y0];
+            match open
+                .iter()
+                .copied()
+                .find(|&i| out[i][0] == x0 && out[i][2] == x1 - x0 && out[i][1] + out[i][3] == y0)
+            {
+                Some(i) => {
+                    out[i][3] += y1 - y0;
+                    next_open.push(i);
+                }
+                None => {
+                    next_open.push(out.len());
+                    out.push(rect);
+                }
+            }
+        }
+        open = next_open;
+    }
+    out
+}
+
+// 调用点在 mouse_impl（Windows / Linux 外部宿主）与 mouse_macos；其余形态（开发机不带 linux-host）无人调
+#[cfg_attr(
+    not(any(windows, target_os = "macos", all(target_os = "linux", ext_presenter))),
+    allow(dead_code)
+)]
 fn fires_on_release(tag: i32) -> bool {
     // 关闭：不可撤销，按下即关像「还没点就没了」。
     if tag == SOFT_TAG_CLOSE || tag == SOFT_TAG_ESC {
@@ -1878,7 +2029,9 @@ fn default_origin(w: u32, h: u32, s: f32, work: Option<(i32, i32, i32, i32)>) ->
 
 // ───────────────────────── 鼠标 ─────────────────────────
 
-#[cfg(windows)]
+/// Win32 消息 → [`SoftMouse`]。Linux 外部宿主形态同样走这一份：`ext_panel` 把 addon 报来的
+/// 指针翻译成同一组 `WM_*`，`sys` 的 mock 给出指针与窗口矩形。
+#[cfg(any(windows, all(target_os = "linux", ext_presenter)))]
 mod mouse_impl {
     use super::{SoftMouse, drags_panel, fires_on_release, is_page_tag, repeat_params, repeats};
     use crate::sys::{
@@ -1886,9 +2039,13 @@ mod mouse_impl {
         SWP_NOSIZE, SWP_NOZORDER, SetCapture, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSELEAVE, WM_MOUSEMOVE, WM_MOUSEWHEEL, clamp_to_work_area,
     };
+    #[cfg(not(windows))]
+    use crate::sys::{HWND, LPARAM, LRESULT, ScreenToClient, WPARAM};
     use crate::window::WindowMouse;
     use wind_ui_types::{SOFT_TAG_TAB_LEFT, SOFT_TAG_TAB_RIGHT, SOFT_TAG_TAB_VIEWPORT};
+    #[cfg(windows)]
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    #[cfg(windows)]
     use windows::Win32::Graphics::Gdi::ScreenToClient;
 
     fn pos(lparam: LPARAM) -> (f32, f32) {
@@ -2438,7 +2595,7 @@ mod mouse_macos {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_os = "linux", ext_presenter))))]
 impl crate::window::WindowMouse for SoftMouse {
     // 句柄类型走 `crate::sys::`（真源，`sys.rs` 有 `pub use imp::*`）而非
     // `crate::window::`——后者那行 `use crate::sys::{...}` 是**私有** import，隔着模块
@@ -2634,6 +2791,46 @@ mod tests {
         assert!(!is_page_tag(SOFT_TAG_TAB_LEFT) && !is_page_tag(SOFT_TAG_TAB_RIGHT));
         assert!(!is_page_tag(SOFT_TAG_FN_BASE), "功能键不是面");
         assert!(!is_page_tag(0), "键位不是面");
+    }
+
+    /// 导出的拖动区与按下时的判据逐像素一致：落在某块拖动区里 ⇔ `drags_panel(hit_at(..))`。
+    /// 覆盖键位、键间缝、标签行留白（视口）和盖在视口上的标签。
+    #[test]
+    fn drag_regions_match_press_hit_test_pixel_by_pixel() {
+        let r = |x: f32, y: f32, w: f32, h: f32| Rect { x, y, w, h };
+        let m = SoftMouse {
+            hits: vec![
+                (0, r(10.0, 10.0, 20.0, 20.0)),
+                (1, r(40.0, 10.0, 20.0, 20.0)),
+                (SOFT_TAG_TAB_VIEWPORT, r(0.0, 40.0, 100.0, 20.0)),
+                (SOFT_TAG_PAGE_BASE, r(10.0, 40.0, 30.0, 20.0)),
+            ],
+            hover: -1,
+            pressed: -1,
+            ..Default::default()
+        };
+        let (w, h) = (100u32, 70u32);
+        let regions = drag_regions_of(&m, w, h);
+        for py in 0..h as i32 {
+            for px in 0..w as i32 {
+                let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let inside = regions
+                    .iter()
+                    .filter(|[x, y, rw, rh]| px >= *x && px < x + rw && py >= *y && py < y + rh)
+                    .count();
+                assert!(inside <= 1, "拖动区互不重叠 ({px},{py})");
+                assert_eq!(
+                    inside == 1,
+                    drags_panel(m.hit_at(cx, cy)),
+                    "({px},{py}) 的拖动区归属与按下判据不一致"
+                );
+            }
+        }
+        assert!(
+            regions.len() < 20,
+            "相邻格应合并，实际 {} 块",
+            regions.len()
+        );
     }
 
     /// 标签行留白按下 → 拖动整块面板，与那条分支自己的注释一致。

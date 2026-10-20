@@ -253,7 +253,7 @@ fn check_manifest(
             return None;
         }
     };
-    let raw: toml::Value = match toml::from_str(&text) {
+    let raw: toml::Value = match text.parse() {
         Ok(v) => v,
         Err(e) => {
             rep.error(
@@ -443,7 +443,8 @@ fn check_custom_config(custom: &toml::Value, data_dir: Option<&Path>, rep: &mut 
         .filter(|p| p.is_file())
         .and_then(|p| read_toml_opt(&p))
         .map(|sys| {
-            let mut base = toml::Value::try_from(Config::default())
+            let mut base = Config::default()
+                .to_toml_value()
                 .expect("Config::default 必须可序列化（wind-config 有守门测试）");
             merge_value(&mut base, sys);
             base
@@ -602,7 +603,7 @@ fn check_deserialization(
     let Some(base) = factory else {
         return;
     };
-    if base.clone().try_into::<Config>().is_err() {
+    if Config::from_toml_value(base.clone()).is_err() {
         rep.warn(
             format!("data/{CONFIG_NAME}（出厂值）"),
             None,
@@ -614,7 +615,7 @@ fn check_deserialization(
     }
     let mut full = base.clone();
     merge_value(&mut full, custom.clone());
-    let Err(e) = full.try_into::<Config>() else {
+    let Err(e) = Config::from_toml_value(full) else {
         return;
     };
     // ⚠️ `trim_end`：toml 的错误串自带尾随换行，直接嵌进多行 problem 会在输出里留一行
@@ -1238,7 +1239,7 @@ fn read_toml(path: &Path) -> TomlRead {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TomlRead::Absent,
         Err(e) => return TomlRead::Unreadable(e),
     };
-    match toml::from_str(&text) {
+    match text.parse() {
         Ok(v) => TomlRead::Parsed(v),
         Err(e) => TomlRead::BadSyntax(e),
     }
@@ -1283,7 +1284,8 @@ fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
 /// 这个定制包发出去之后**生效**的配置：内置默认 ⊕ data/config.toml ⊕ data_custom/config.toml。
 /// 刻意不含用户层。
 fn merged_config(data_dir: Option<&Path>, custom_cfg: Option<&toml::Value>) -> toml::Value {
-    let mut merged = toml::Value::try_from(Config::default())
+    let mut merged = Config::default()
+        .to_toml_value()
         .expect("Config::default 必须可序列化（wind-config 有守门测试）");
     if let Some(sys) = data_dir
         .map(|d| d.join(CONFIG_NAME))

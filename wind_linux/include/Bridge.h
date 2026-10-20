@@ -48,7 +48,7 @@ std::string shmName();
 /// 同上，uid 显式给（单测钉样例用）。
 std::string shmNameForUid(uint32_t uid);
 /// 光栅浮层某一层的 SHM 名：`base`（缺省 `shmName()`）+ `_TIP` / `_STS` / `_TST`，菜单第 k 级
-/// `_MN<k>`（与 Rust `endpoint.rs::overlay_shm_name` 对齐）。未知层返回空串。
+/// `_MN<k>`，工具栏 `_TB`、软键盘 `_SKB`（与 Rust `endpoint.rs::overlay_shm_name` 对齐）。未知层返回空串。
 std::string overlayShmName(uint32_t kind, const std::string& base = shmName());
 
 // ── 请求/响应 ────────────────────────────────────────────────────────

@@ -30,8 +30,8 @@ fontdb = "0.22"
 wind-quick-input = { path = "../wind-quick-input" }
 wind-bridge = { path = "../wind-bridge" }
 # 手工构造 .wpkg 用（export_package 写不出带说明的 package.toml）；
-# 与 wind-transfer 同一版本，不引入新的外部依赖。
-zip = "2"
+# 与 wind-transfer 同一版本、同一组 feature（取舍理由见那边）。
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 
 [lints]
 workspace = true

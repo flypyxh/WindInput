@@ -23,6 +23,8 @@ final class CandidateContentView: NSView {
     private var lastHover: Int = CandidateContentView.noHover
     var onSelect: ((Int) -> Void)?
     var onHover: ((Int) -> Void)?
+    /// 指针每次移动（不论命中变没变），悬停宽限据此判方向。
+    var onPointerMoved: (() -> Void)?
     /// 右键：候选上 → 该候选页内下标（≥0）；空白 / 翻页区 → -1（主菜单）。菜单由服务端自绘，
     /// 这里只报「在哪个目标上右键」，见 `OverlayHost.requestMenu`。
     var onContextMenu: ((Int) -> Void)?
@@ -159,6 +161,8 @@ final class CandidateContentView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         // 命中即上报：候选(index≥0) / 翻页器(-1 上页 / -2 下页) 均高亮；空白→无悬停哨兵。
+        // 先报移动再报命中：宽限起算时（onHover 里）要拿到的是这一次的指针位置。
+        onPointerMoved?()
         let report = hitIndex(event) ?? CandidateContentView.noHover
         if report != lastHover { lastHover = report; onHover?(report) }
     }
@@ -209,6 +213,10 @@ final class CandidatePanel: NSPanel {
     var onHover: ((Int) -> Void)? {
         get { content.onHover }
         set { content.onHover = newValue }
+    }
+    var onPointerMoved: (() -> Void)? {
+        get { content.onPointerMoved }
+        set { content.onPointerMoved = newValue }
     }
     /// 右键回调：候选下标（≥0）或 -1（空白 / 翻页区 → 主菜单）。
     var onContextMenu: ((Int) -> Void)? {

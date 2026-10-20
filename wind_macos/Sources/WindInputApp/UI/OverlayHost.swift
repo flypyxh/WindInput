@@ -81,6 +81,12 @@ final class OverlayHost: OverlayPanelDelegate {
         panels[kind]?.isVisible ?? false
     }
 
+    /// 显示中的悬停提示的 wire 矩形；没显示为 nil。
+    func tooltipWireRect() -> WireRect? {
+        guard let p = panels[OverlayKind.tooltip], p.isVisible else { return nil }
+        return p.wireRect
+    }
+
     /// 指针（wire 坐标）是否落在悬停提示上。
     func tooltipContainsWire(_ x: CGFloat, _ y: CGFloat) -> Bool {
         panels[OverlayKind.tooltip]?.containsWire(x, y) ?? false

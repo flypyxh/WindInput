@@ -374,6 +374,11 @@ impl Coordinator {
 
     /// 用临时拼音目标方案转换缓冲，刷新候选与组合区（前缀 + 已转换汉字 + 剩余拼音）
     pub(crate) fn update_temp_pinyin_candidates(&self, state: &mut State) {
+        self.refill_temp_pinyin_candidates(state);
+        self.grid_resume(state);
+    }
+
+    fn refill_temp_pinyin_candidates(&self, state: &mut State) {
         state.candidates.clear();
         self.reset_candidate_view(state);
         let prefix = format!("{}{}", state.temp_pinyin_prefix, state.committed_text);
@@ -879,7 +884,7 @@ impl Coordinator {
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
                 // 数字键选当前页第 N 个
-                let (start, end) = self.page_range(state);
+                let (start, end) = self.select_range(state);
                 let idx = start + (data.key_code - 0x31) as usize;
                 if idx < end {
                     let cand = state.candidates[idx].clone();
@@ -1022,7 +1027,7 @@ impl Coordinator {
                 if data.modifiers & MOD_SHIFT == 0
                     && let Some(offset) = self.select_key_offset(data.key_code)
                 {
-                    let (start, end) = self.page_range(state);
+                    let (start, end) = self.select_range(state);
                     let idx = start + offset;
                     if idx < end {
                         let cand = state.candidates[idx].clone();
@@ -1242,6 +1247,9 @@ impl Coordinator {
         state.english_case_variant = crate::english_candidates::CaseVariant::default();
         state.preedit.clear();
         state.candidates.clear();
+        state.grid_top = None;
+        state.grid_tab = wind_ui_types::GridTab::All;
+        state.grid_full.clear();
     }
 
     /// 刷新临时英文候选：`原文 → 大小写变形 → 英文词库前缀匹配（保持词库原文）`。
@@ -1256,6 +1264,11 @@ impl Coordinator {
     /// 小写去重会把它们全部抹掉。精确去重同时仍能挡住与原文/变形重复的词库项
     /// （如缓冲 `Hello` 时词库的 `hello` 被变形候选先占位挡下）。
     pub(crate) fn update_temp_english_candidates(&self, state: &mut State) {
+        self.refill_temp_english_candidates(state);
+        self.grid_resume(state);
+    }
+
+    fn refill_temp_english_candidates(&self, state: &mut State) {
         state.candidates.clear();
         self.reset_candidate_view(state);
         let buf = state.temp_english_buffer.clone();
@@ -1740,7 +1753,7 @@ impl Coordinator {
                 let digits_as_input = self.temp_english_char_allowed(ch)
                     || Self::temp_english_buffer_is_literal(state);
                 // 数字：有词库候选（>1，即除原文外还有匹配）时按页选词；否则作输入（英文含数字 v2）
-                let (start, end) = self.page_range(state);
+                let (start, end) = self.select_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
                 if !digits_as_input && state.candidates.len() > 1 && gi < end {
                     self.commit_temp_english_selected(state, gi)
@@ -1836,7 +1849,7 @@ impl Coordinator {
                         .is_none_or(|ch| !self.temp_english_char_allowed(ch))
                     && let Some(offset) = self.select_key_offset(data.key_code)
                 {
-                    let (start, end) = self.page_range(state);
+                    let (start, end) = self.select_range(state);
                     let gi = start + offset;
                     if gi < end {
                         return self.commit_temp_english_selected(state, gi);

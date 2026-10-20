@@ -223,13 +223,15 @@ pub fn overlay_shm_name(suffix: &str, kind: u32) -> Option<String> {
     Some(format!("{}{}", shm_name(suffix), overlay_tail(kind)?))
 }
 
-/// 层后缀：`_TIP` / `_STS` / `_TST` / `_MN<k>`。
+/// 层后缀：`_TIP` / `_STS` / `_TST` / `_MN<k>` / `_TB` / `_SKB`。
 fn overlay_tail(kind: u32) -> Option<String> {
     use wind_ipc::protocol::overlay::*;
     let tail = match kind {
         OVERLAY_KIND_TOOLTIP => "_TIP".to_string(),
         OVERLAY_KIND_STATUS => "_STS".to_string(),
         OVERLAY_KIND_TOAST => "_TST".to_string(),
+        OVERLAY_KIND_TOOLBAR => "_TB".to_string(),
+        OVERLAY_KIND_SOFTKEYBOARD => "_SKB".to_string(),
         // 菜单每级一段：`_MN0`、`_MN1`…
         k if (OVERLAY_KIND_MENU..OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS).contains(&k) => {
             format!("_MN{}", k - OVERLAY_KIND_MENU)
@@ -434,6 +436,22 @@ mod tests {
         );
         assert_eq!(longest, "/WindInputDev.4294967295_MN5");
         assert!(longest.len() <= 31);
+        assert_eq!(
+            format!(
+                "{}{}",
+                shm_name_for_uid("_dev", u32::MAX),
+                overlay_tail(OVERLAY_KIND_SOFTKEYBOARD).unwrap()
+            ),
+            "/WindInputDev.4294967295_SKB"
+        );
+        assert_eq!(
+            format!(
+                "{}{}",
+                shm_name_for_uid("", 1000),
+                overlay_tail(OVERLAY_KIND_TOOLBAR).unwrap()
+            ),
+            "/WindInput.1000_TB"
+        );
         let uid = unsafe { libc::getuid() };
         assert_eq!(shm_name("_dev"), format!("/WindInputDev.{uid}"));
         assert_eq!(
@@ -512,9 +530,17 @@ mod tests {
             Some("/WindInput_SHMDev_MN2")
         );
         assert_eq!(
-            overlay_shm_name("", OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS),
-            None,
-            "超出菜单级数上限"
+            overlay_shm_name("", OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS).as_deref(),
+            Some("/WindInput_SHM_TB"),
+            "菜单级数上限之外紧接着是工具栏那层，不会出 _MN6"
+        );
+        assert_eq!(
+            overlay_shm_name("_dev", OVERLAY_KIND_TOOLBAR).as_deref(),
+            Some("/WindInput_SHMDev_TB")
+        );
+        assert_eq!(
+            overlay_shm_name("_dev", OVERLAY_KIND_SOFTKEYBOARD).as_deref(),
+            Some("/WindInput_SHMDev_SKB")
         );
     }
 

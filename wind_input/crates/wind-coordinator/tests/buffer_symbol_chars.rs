@@ -783,3 +783,45 @@ fn yields_to_digit_candidate_selection() {
         "`1` 仍须选第 1 个候选，不该进缓冲，实际: {act:?}"
     );
 }
+
+// ───────────────────── 缓冲含符号时按标点：整串不该被当废码丢掉 ─────────────────────
+
+const VK_PERIOD: u32 = 0xBE;
+const VK_COMMA: u32 = 0xBC;
+
+/// 打 `gong-` 后按标点键，返回该键的动作（缓冲此时含符号、候选恒空）。
+fn punct_after_buffered_symbol(vk: u32, modifiers: u32) -> Option<KeyAction> {
+    let coord = coord_with("-")?;
+    press(&coord, "gong");
+    let act = press_vk(&coord, VK_MINUS);
+    assert_eq!(composing(&act), Some("gong-"), "前置：`-` 进了缓冲");
+    assert!(
+        coord.debug_page_texts().is_empty(),
+        "前置：含符号的缓冲候选恒空"
+    );
+    Some(coord.handle_key_event(&key_event_mods(vk, modifiers)))
+}
+
+/// `gong-` 后按 `>`（Shift+`.`）：用户在写 `gong->`，缓冲是他打的字面文本，不是打错的码。
+#[test]
+fn shift_period_after_buffered_symbol_keeps_the_text() {
+    let Some(act) = punct_after_buffered_symbol(VK_PERIOD, MOD_SHIFT) else {
+        return;
+    };
+    assert_eq!(
+        committed(&act),
+        Some("gong-》"),
+        "`gong-` 不该被当废码丢掉，标点照常转换，实际: {act:?}"
+    );
+}
+
+/// 同一情形的普通标点 `.` / `,`。
+#[test]
+fn period_and_comma_after_buffered_symbol_keep_the_text() {
+    for (vk, want) in [(VK_PERIOD, "gong-。"), (VK_COMMA, "gong-，")] {
+        let Some(act) = punct_after_buffered_symbol(vk, 0) else {
+            return;
+        };
+        assert_eq!(committed(&act), Some(want), "vk={vk:#x}，实际: {act:?}");
+    }
+}

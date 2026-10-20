@@ -153,7 +153,7 @@ pub(super) fn add_entry<H: WebDataRpc + ?Sized>(h: &H, params: &Value) -> anyhow
     let (code, boundary) = if code.contains(['\t', '\n', '\r']) {
         (code.to_string(), 0)
     } else {
-        h.normalize_add_code(schema_id, code, &text)
+        wind_coordinator::user_words_api::normalize_add_code(h, schema_id, code, &text)
     };
     if store.add_user_dict_entry(&ds, name, &code, &text, boundary, weight)? {
         changed(h, &ds);

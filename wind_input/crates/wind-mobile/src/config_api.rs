@@ -90,15 +90,19 @@ fn type_name(ty: &FieldType) -> &'static str {
     }
 }
 
-/// core 的配置字段注册表（248 个键）。
+/// core 的配置字段注册表。
 pub fn registry() -> Vec<ConfigFieldInfo> {
     config_schema::registry()
         .iter()
         .map(|f| ConfigFieldInfo {
             key: f.key.to_string(),
             ty: type_name(&f.ty).to_string(),
+            // LayoutEnum 也报成 enum（见 type_name），值域同样要交出去——此前只填了 Enum，
+            // LayoutEnum 键到宿主手里是「枚举但没有选项」，设置页画不出选择器。
             options: match f.ty {
-                FieldType::Enum(vals) => vals.iter().map(|s| s.to_string()).collect(),
+                FieldType::Enum(vals) | FieldType::LayoutEnum(vals) => {
+                    vals.iter().map(|s| s.to_string()).collect()
+                }
                 _ => Vec::new(),
             },
         })
@@ -193,6 +197,27 @@ pub fn set(key: &str, value: ConfigValue) -> Result<(), String> {
     if key.is_empty() {
         return Err("配置键为空".to_string());
     }
+    // 只认注册表里的键：设置清单写错键名时当场报错，而不是落盘一个引擎永远不读的值
+    // ——那样的症状是「这个开关点了没反应」，且什么都不提示。
+    if !config_schema::is_known_key(key) {
+        return Err(format!("未登记的配置键：{key}"));
+    }
     let path: Vec<&str> = key.split('.').collect();
     Config::set_user_value(&path, value.into_toml()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注册表里报成 enum 的键都要带值域：设置页拿空选项画不出选择器（LayoutEnum 曾漏填）。
+    #[test]
+    fn every_enum_field_has_options() {
+        let missing: Vec<_> = registry()
+            .into_iter()
+            .filter(|f| f.ty == "enum" && f.options.is_empty())
+            .map(|f| f.key)
+            .collect();
+        assert!(missing.is_empty(), "以下枚举键没有选项：{missing:?}");
+    }
 }

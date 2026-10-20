@@ -192,7 +192,7 @@ impl Coordinator {
     /// 跟随 `input.email.enabled`，没有第二道开关：记的是域名（`qq.com` 这类），**不含
     /// 用户名**，与「把打过的网址原文落盘」不是一个隐私量级。
     fn learn_email_suffix(&self, text: &str) {
-        if !self.rt().config.input.email.enabled {
+        if !self.rt().config.input.email.enabled || self.learning_suspended() {
             return;
         }
         let suffix = Self::email_suffix_part(text);
@@ -245,7 +245,7 @@ impl Coordinator {
                 rt.config.input.url.history_max as usize,
             )
         };
-        if !enabled || text.is_empty() {
+        if !enabled || text.is_empty() || self.learning_suspended() {
             return;
         }
         let Some(store) = self.store.as_ref() else {

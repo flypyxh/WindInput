@@ -158,6 +158,8 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
                     // 1-based，就是用户在编辑器里看到的行号。
                     "skippedLines": u.skipped_lines,
                     "salvagedKeys": u.salvaged_keys,
+                    // 编码不对（非 UTF-8）：设置端据此改讲「另存为 UTF-8」，而不是「修语法」。
+                    "notUtf8": u.not_utf8,
                 })).collect::<Vec<_>>(),
             }))
         }
@@ -193,7 +195,7 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
                 );
             }
             let cfg = Config::load(Config::data_dir().as_deref())?;
-            Ok(serde_json::to_value(cfg)?)
+            Ok(cfg.to_json_value()?)
         }
         "config.getDefaults" => {
             // 出厂默认 = 系统预置（代码默认 L1 ⊕ data/config.toml L2 ⊕
@@ -390,7 +392,7 @@ fn patch_entries(
     // 降级记录必须在序列化成 `toml::Value` **之前**留下来：`degradation` 是 `#[serde(skip)]`，
     // 转成值树那一刻就没了，而下面的 Map 合并种子正是从这棵树上取的。
     let degradation = cfg.degradation.clone();
-    let current = toml::Value::try_from(cfg)?;
+    let current = cfg.to_toml_value()?;
     let mut entries = wind_config::patch::preview(&fragment, &current);
     // ★ 降级闸，preview 与 apply 共用这一处判据（见 `mark_degraded_seeds`）：坏段处的
     // 生效表是出厂值，拿它当 Map 合并种子会把用户已有条目整表抹掉。标成条目级 error 之后，
@@ -496,7 +498,7 @@ fn get_item(params: &Value) -> anyhow::Result<Value> {
         anyhow::bail!("invalid_config: 键 '{}' 未登记", key);
     }
     let cfg = Config::load(Config::data_dir().as_deref())?;
-    let full = serde_json::to_value(cfg)?;
+    let full = cfg.to_json_value()?;
     let mut cur = &full;
     for part in key.split('.') {
         cur = cur

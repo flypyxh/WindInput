@@ -4682,7 +4682,8 @@ impl Engine for PinyinEngine {
         // ★ 这一层归一只保证**求解正确**，**不足以**让词条可用：本方法只返回 boundary，
         // 落库的 key 由调用侧那个 code 决定。key 若仍是 `xv`，而查询侧
         // （`convert_with_opts`）已把击键归一成 `xu`，就成了「加得进、打不出」。
-        // 落库前的码归一因此必须由调用侧另做一次——见 `webdata::normalize_add_code`。
+        // 落库前的码归一因此必须由调用侧另做一次——见 wind-coordinator 的
+        // `user_words_api::normalize_add_code`。
         //
         // ⚠️ 此处**有意不按 `shuangpin` 短路**（与 `normalize_gate_input` 相反）：
         // 入参 `code` 是**词典码域**（恒为全拼），不是击键域。双拼方案的词典码同样是

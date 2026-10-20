@@ -112,7 +112,8 @@ fn parse(text: &str) -> anyhow::Result<ParsedEnvelope> {
         );
     }
     // 非 TOML 文本同样不是信封:片段管线会给出更准确的解析错误。
-    let value: toml::Value = toml::from_str(text)
+    let value: toml::Value = text
+        .parse::<toml::Value>()
         .map_err(|e| anyhow::anyhow!("{NOT_SCHEMA_TEXT} 不是合法 TOML 文本: {e}"))?;
     let kind = value
         .get("package")

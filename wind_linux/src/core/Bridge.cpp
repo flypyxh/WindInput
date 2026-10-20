@@ -275,6 +275,10 @@ std::string overlayShmName(uint32_t kind, const std::string& base)
         return base + "_STS";
     case OVERLAY_KIND_TOAST:
         return base + "_TST";
+    case OVERLAY_KIND_TOOLBAR:
+        return base + "_TB";
+    case OVERLAY_KIND_SOFTKEYBOARD:
+        return base + "_SKB";
     default:
         // 菜单每级一段：`_MN0`、`_MN1`…
         if (kind >= OVERLAY_KIND_MENU && kind < OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS) {

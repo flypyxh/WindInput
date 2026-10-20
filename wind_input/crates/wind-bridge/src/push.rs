@@ -136,9 +136,8 @@ fn register_client(
 /// （客户端已注册进表、但尚未走到自己的 hook 调用点），认领保证恰好触发一次。
 /// 客户端若已断开出表则返回 `false`——不给死连接推帧。
 ///
-/// 触发点在 `cfg(windows)` 的连接线程里；unix 侧不走这条通路，故非 Windows 只在测试中编译。
-#[cfg(any(windows, test))]
-fn claim_connected_hook(clients: &Mutex<Vec<PushClient>>, token: u64) -> bool {
+/// 触发点在各平台的连接线程里（Windows 管道 / unix 的 `push_unix::handle_push_conn`）。
+pub(crate) fn claim_connected_hook(clients: &Mutex<Vec<PushClient>>, token: u64) -> bool {
     let mut guard = clients.lock().unwrap();
     match guard.iter_mut().find(|c| c.token == token) {
         Some(c) if !c.hooked => {
@@ -358,9 +357,10 @@ impl PushServer {
         let path = crate::endpoint::push_socket_path(&self.config.suffix);
         info!("Push UDS server starting on {:?}", path);
         let clients = self.clients.clone();
+        let hook = self.connected_hook.clone();
         std::thread::Builder::new()
             .name("push-server".into())
-            .spawn(move || crate::push_unix::run_uds_push_server(path, clients))?;
+            .spawn(move || crate::push_unix::run_uds_push_server(path, clients, hook))?;
         Ok(())
     }
 
@@ -374,6 +374,12 @@ impl PushServer {
     #[cfg(test)]
     pub(crate) fn clients_for_test(&self) -> Arc<Mutex<Vec<PushClient>>> {
         self.clients.clone()
+    }
+
+    /// 仅供测试：connected_hook 的 Arc 克隆，交给测试里直接起的 `run_uds_push_server`。
+    #[cfg(all(test, unix))]
+    pub(crate) fn connected_hook_for_test(&self) -> Arc<Mutex<Option<ClientConnectedHook>>> {
+        self.connected_hook.clone()
     }
 
     /// 挂一个内存客户端并设为活动客户端，返回它收到的全部推送（**测试接缝**）。

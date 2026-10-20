@@ -86,6 +86,24 @@ int main()
     CHECK(kTipSwitchMs < kTipGraceMs);
     CHECK_EQ(kTipGraceMs, 280u); // 与 tooltip.rs LEAVE_GRACE_MS / candidate_window TIP_GRACE 同值
 
+    CASE("朝向提示：同 Windows heading_to_tip 那张表");
+    {
+        const Rect rightTop{100, 0, 100, 40};
+        CHECK(headingToTip(10, 120, 14, 120, rightTop));  // 沿行水平右移
+        CHECK(headingToTip(10, 120, 14, 116, rightTop));  // 斜着往上
+        CHECK(!headingToTip(10, 120, 14, 126, rightTop)); // 往下偏得比靠近快
+        CHECK(!headingToTip(10, 120, 6, 120, rightTop));  // 往回走
+        CHECK(!headingToTip(10, 120, 10, 120, rightTop)); // 没动
+        CHECK(headingToTip(10, 20, 12, 26, rightTop));    // 跨度内上下随意
+        CHECK(headingToTip(10, 20, 6, 20, Rect{-200, 0, 100, 40}));  // 提示在左侧
+        CHECK(headingToTip(40, 10, 40, 14, Rect{0, 50, 80, 70}));    // 提示在下方
+        CHECK(!headingToTip(40, 10, 40, 6, Rect{0, 50, 80, 70}));
+        CHECK(!headingToTip(150, 60, 151, 60, Rect{100, 0, 100, 100})); // 已在提示上
+        CHECK_EQ(tipGap(25, 5, rightTop), 75);  // 同 Windows tip_gap
+        CHECK_EQ(tipGap(40, 10, Rect{0, 50, 80, 70}), 40);
+        CHECK_EQ(tipGap(150, 60, Rect{100, 0, 100, 100}), 0);
+    }
+
     CASE("离开提示后重定悬停：回到提示 / 回到所属候选不动；候选窗别处报那里；外面报 -1");
     CHECK_EQ(tipRecheckHover(true, false, kNoHit, 2), kKeepHover);
     CHECK_EQ(tipRecheckHover(false, true, 2, 2), kKeepHover);
@@ -177,6 +195,220 @@ int main()
     body = extBody(encodePosFrame(EXT_KIND_POS_STATUS_TIP, -800, 12), kind);
     CHECK_EQ(kind, std::string("pos.status_tip"));
     CHECK_EQ(body, std::string(R"({"x":-800,"y":12})"));
+
+    CASE("panel_press_in_drag_region_drags_else_forwards");
+    {
+        const std::vector<Rect> drag{Rect{0, 0, 12, 40}, Rect{100, 0, 20, 10}};
+        // 工具栏：左键落在任一拖动区 → 本端拖，不报服务端（报了它会另发一次 Moved）。
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 1, 0, 0, drag) == OverlayPress::Drag);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 1, 11, 39, drag) == OverlayPress::Drag);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 1, 105, 5, drag) == OverlayPress::Drag);
+        // 拖动区外（半开区间的右 / 下边界也算外）、或不是左键 → 原样转给服务端。
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 1, 12, 5, drag) == OverlayPress::Forward);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 1, 50, 5, drag) == OverlayPress::Forward);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 3, 5, 5, drag) == OverlayPress::Forward);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLBAR, 2, 5, 5, drag) == OverlayPress::Forward);
+        CHECK(overlayPressAction(OVERLAY_KIND_SOFTKEYBOARD, 4, 5, 5, drag) == OverlayPress::Forward);
+        // 软键盘同理；没有拖动区时左键一律转发。
+        CHECK(overlayPressAction(OVERLAY_KIND_SOFTKEYBOARD, 1, 5, 5, drag) == OverlayPress::Drag);
+        CHECK(overlayPressAction(OVERLAY_KIND_SOFTKEYBOARD, 1, 5, 5, {}) == OverlayPress::Forward);
+        // 非交互层：拖动区参数不起作用，与两参版本一致。
+        CHECK(overlayPressAction(OVERLAY_KIND_STATUS, 1, 5, 5, {}) == OverlayPress::Drag);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOOLTIP, 1, 5, 5, drag) == OverlayPress::None);
+        CHECK(overlayPressAction(OVERLAY_KIND_TOAST, 3, 500, 500, drag) == OverlayPress::Close);
+    }
+
+    CASE("pos.toolbar / pos.softkeyboard：{x,y[,output]}；拿不到输出名就不带该字段");
+    CHECK_EQ(std::string(panelPosKind(OVERLAY_KIND_TOOLBAR)), std::string("pos.toolbar"));
+    CHECK_EQ(std::string(panelPosKind(OVERLAY_KIND_SOFTKEYBOARD)), std::string("pos.softkeyboard"));
+    CHECK(panelPosKind(OVERLAY_KIND_STATUS) == nullptr);
+    body = extBody(encodePosFrame(EXT_KIND_POS_TOOLBAR, 1600, -20, "DP-1"), kind);
+    CHECK_EQ(kind, std::string("pos.toolbar"));
+    CHECK_EQ(body, std::string(R"({"x":1600,"y":-20,"output":"DP-1"})"));
+    body = extBody(encodePosFrame(EXT_KIND_POS_SOFTKEYBOARD, 3, 4, ""), kind);
+    CHECK_EQ(body, std::string(R"({"x":3,"y":4})"));
+    // 输出名来自显示服务器，按 JSON 转义（服务端 serde_json 解析）。
+    body = extBody(encodePosFrame(EXT_KIND_POS_TOOLBAR, 0, 0, "a\"b\\c\x01"), kind);
+    CHECK_EQ(body, std::string(R"({"x":0,"y":0,"output":"a\"b\\c\u0001"})"));
+
+    CASE("host.fullscreen：{fullscreen:bool}");
+    body = extBody(encodeHostFullscreenFrame(true), kind);
+    CHECK_EQ(kind, std::string("host.fullscreen"));
+    CHECK_EQ(body, std::string(R"({"fullscreen":true})"));
+    body = extBody(encodeHostFullscreenFrame(false), kind);
+    CHECK_EQ(body, std::string(R"({"fullscreen":false})"));
+
+    CASE("FullscreenReporter：只在值变化时发；服务重启后若仍全屏补报一次");
+    {
+        FullscreenReporter r;
+        CHECK(!r.change(false)); // 初值即「不全屏」（服务端同此默认），不发
+        CHECK(r.change(true));
+        CHECK(!r.change(true));
+        CHECK(r.change(false));
+        CHECK(!r.resyncAfterRestart()); // 不全屏：新服务的默认就对
+        CHECK(r.change(true));
+        CHECK(r.resyncAfterRestart());
+        CHECK(!r.change(true)); // 补报后仍是同值
+    }
+
+    CASE("clampToWorkArea：四边越界各自夹回，比工作区还大时保住左上");
+    {
+        const Rect wa{100, 50, 800, 600}; // [100, 900) × [50, 650)
+        auto same = [](const Rect& a, const Rect& b) {
+            return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+        };
+        CHECK(same(clampToWorkArea(Rect{200, 100, 50, 20}, wa), Rect{200, 100, 50, 20}));
+        CHECK(same(clampToWorkArea(Rect{60, 100, 50, 20}, wa), Rect{100, 100, 50, 20}));  // 左
+        CHECK(same(clampToWorkArea(Rect{880, 100, 50, 20}, wa), Rect{850, 100, 50, 20})); // 右
+        CHECK(same(clampToWorkArea(Rect{200, 10, 50, 20}, wa), Rect{200, 50, 50, 20}));   // 上
+        CHECK(same(clampToWorkArea(Rect{200, 640, 50, 20}, wa), Rect{200, 630, 50, 20})); // 下
+        CHECK(same(clampToWorkArea(Rect{-5000, 9000, 50, 20}, wa), Rect{100, 630, 50, 20}));
+        CHECK(same(clampToWorkArea(Rect{500, 500, 1000, 700}, wa), Rect{100, 50, 1000, 700}));
+    }
+
+    CASE("hasFullscreenState：_NET_WM_STATE 原子列表里有全屏原子才算");
+    CHECK(hasFullscreenState({301, 302, 377}, 377));
+    CHECK(!hasFullscreenState({301, 302}, 377));
+    CHECK(!hasFullscreenState({}, 377));
+    CHECK(!hasFullscreenState({0, 377}, 0)); // 原子没拿到（0）时不认
+
+    CASE("outputWorkArea：输出矩形 ∩ _NET_WORKAREA；没有或不相交时取整块输出");
+    {
+        const Rect left{0, 0, 1920, 1080};
+        const Rect right{1920, 0, 2560, 1440};
+        const Rect net{0, 32, 4480, 1408}; // 顶部 32px 面板横跨两屏
+        Rect w = outputWorkArea(left, net);
+        CHECK(w.x == 0 && w.y == 32 && w.w == 1920 && w.h == 1048);
+        w = outputWorkArea(right, net);
+        CHECK(w.x == 1920 && w.y == 32 && w.w == 2560 && w.h == 1408);
+        w = outputWorkArea(right, std::nullopt);
+        CHECK(w.x == 1920 && w.y == 0 && w.w == 2560 && w.h == 1440);
+        w = outputWorkArea(right, Rect{0, 0, 1920, 1080}); // 不相交：工作区属性不可信
+        CHECK(w.x == 1920 && w.y == 0 && w.w == 2560 && w.h == 1440);
+    }
+
+    CASE("outputIndexAt：点落在哪块输出（半开区间），都不在返回 -1");
+    {
+        const std::vector<Rect> outs{{0, 0, 1920, 1080}, {1920, 0, 2560, 1440}};
+        CHECK_EQ(outputIndexAt(outs, 10, 10), 0);
+        CHECK_EQ(outputIndexAt(outs, 1919, 1079), 0);
+        CHECK_EQ(outputIndexAt(outs, 1920, 0), 1);
+        CHECK_EQ(outputIndexAt(outs, 100, 1200), -1); // 左屏下方的空洞
+        CHECK_EQ(outputIndexAt({}, 0, 0), -1);
+    }
+
+    CASE("scaleRect：Wayland 输出的逻辑矩形折成面板屏幕坐标（位图像素 = 逻辑 × 缩放）");
+    {
+        Rect r = scaleRect(Rect{1920, 0, 1280, 720}, 1.5);
+        CHECK(r.x == 2880 && r.y == 0 && r.w == 1920 && r.h == 1080);
+        r = scaleRect(Rect{-1536, 100, 1536, 864}, 1.25);
+        CHECK(r.x == -1920 && r.y == 125 && r.w == 1920 && r.h == 1080);
+        r = scaleRect(Rect{10, 20, 30, 40}, 0); // 缩放无效按 1
+        CHECK(r.x == 10 && r.y == 20 && r.w == 30 && r.h == 40);
+    }
+
+    CASE("layerMarginFor：面板屏幕坐标的窗口左上 → 所在输出上 top|left 锚定的边距（逻辑像素）");
+    {
+        const Rect right{1920, 0, 1280, 720}; // 右屏，逻辑坐标
+        auto m = layerMarginFor(3000, 300, right, 1.5); // 3000/1.5=2000 → 2000-1920
+        CHECK_EQ(m.first, 80);
+        CHECK_EQ(m.second, 200);
+        m = layerMarginFor(100, 50, Rect{0, 0, 1920, 1080}, 1.0);
+        CHECK_EQ(m.first, 100);
+        CHECK_EQ(m.second, 50);
+        m = layerMarginFor(-1900, 125, Rect{-1536, 100, 1536, 864}, 1.25); // 左上方的屏
+        CHECK_EQ(m.first, 16);
+        CHECK_EQ(m.second, 0);
+    }
+
+    CASE("layerOriginFor：边距 → 面板屏幕坐标的窗口左上；与 layerMarginFor 往返不漂");
+    {
+        const Rect right{1920, 0, 1280, 720};
+        auto o = layerOriginFor(80, 200, right, 1.5);
+        CHECK_EQ(o.first, 3000);
+        CHECK_EQ(o.second, 300);
+        // 拖完报上去的坐标会原样回到下一帧：边距 → 坐标 → 边距必须回到原值，否则每次重绘挪一像素
+        bool stable = true;
+        for (double s : {1.0, 1.25, 1.5, 1.75, 2.0, 3.0}) {
+            for (const Rect& out : {Rect{0, 0, 1920, 1080}, Rect{1920, 0, 1280, 720},
+                                    Rect{-1536, -333, 1536, 864}}) {
+                for (int32_t ml = -7; ml < 40; ml += 3) {
+                    const auto px = layerOriginFor(ml, ml * 2 + 1, out, s);
+                    const auto back = layerMarginFor(px.first, px.second, out, s);
+                    stable = stable && back.first == ml && back.second == ml * 2 + 1;
+                }
+            }
+        }
+        CHECK(stable);
+    }
+
+    CASE("layerUsableArea：原点取输出原点、尺寸取探测到的可用区；没量到 / 量歪了取整块输出");
+    {
+        const Rect out{1920, 0, 1280, 720};
+        Rect r = layerUsableArea(out, 1280, 680); // 底部 40 的任务栏
+        CHECK(r.x == 1920 && r.y == 0 && r.w == 1280 && r.h == 680);
+        r = layerUsableArea(out, 0, 0); // 还没 configure / 没有 layer-shell
+        CHECK(r.x == 1920 && r.y == 0 && r.w == 1280 && r.h == 720);
+        r = layerUsableArea(out, 1300, 700); // 比输出还宽：不可信，宽取输出、高照用
+        CHECK(r.w == 1280 && r.h == 700);
+        r = layerUsableArea(out, 1240, -5);
+        CHECK(r.w == 1240 && r.h == 720);
+        // 折成面板坐标后的默认右下角落在任务栏上方
+        const Rect px = scaleRect(layerUsableArea(Rect{0, 0, 1536, 864}, 1536, 816), 1.25);
+        CHECK(px.x == 0 && px.y == 0 && px.w == 1920 && px.h == 1020);
+    }
+
+    CASE("panelOutputIndex：窗口中心落在哪块输出；都不在时用回退下标");
+    {
+        const std::vector<Rect> outs{{0, 0, 1920, 1080}, {1920, 0, 2560, 1440}};
+        CHECK_EQ(panelOutputIndex(outs, Rect{100, 100, 200, 40}, 1), 0);
+        CHECK_EQ(panelOutputIndex(outs, Rect{1800, 100, 200, 40}, 0), 0); // 中心 1900 仍在左屏
+        CHECK_EQ(panelOutputIndex(outs, Rect{1850, 100, 200, 40}, 0), 1); // 中心 1950 在右屏
+        CHECK_EQ(panelOutputIndex(outs, Rect{100, 1200, 200, 40}, 1), 1); // 空洞：回退
+        CHECK_EQ(panelOutputIndex(outs, Rect{100, 1200, 200, 40}, 7), 0); // 回退越界取第一块
+        CHECK_EQ(panelOutputIndex({}, Rect{0, 0, 10, 10}, 0), -1);
+    }
+
+    CASE("PanelMenuGate：面板按下后 1.5 秒内认领一次；本端另发起菜单请求后不再认领");
+    {
+        PanelMenuGate g;
+        CHECK(!g.pending(5'000'000));
+        g.note(42, 1'000'000);
+        CHECK(g.pending(1'000'000));
+        CHECK(g.pending(2'499'999));
+        CHECK(!g.pending(2'500'000)); // 过了窗口
+        CHECK(g.pending(1'200'000));
+        CHECK_EQ(g.take(), 42u);
+        CHECK(!g.pending(1'200'001)); // 一次按下只认一个菜单
+        g.note(7, 3'000'000);
+        g.clear(); // X11 候选右键等本端菜单请求
+        CHECK(!g.pending(3'100'000));
+    }
+
+    CASE("PanelMenuGate：服务端收起认领到的菜单后再认领一次（「更多…」→ 主菜单），同一输出");
+    {
+        PanelMenuGate g;
+        g.note(42, 1'000'000);
+        CHECK_EQ(g.take(), 42u);
+        g.serverClosed(5'000'000); // 菜单开了几秒后点「更多…」
+        CHECK(g.pending(5'000'000));
+        CHECK(g.pending(6'499'999));
+        CHECK(!g.pending(6'500'000));
+        CHECK_EQ(g.take(), 42u);
+        g.serverClosed(7'000'000); // 主菜单里点了普通项：仍重开窗口，只是不会有菜单帧来
+        CHECK(g.pending(7'000'000));
+        g.clear();
+        g.serverClosed(8'000'000); // 收的是本端请求的菜单（clear 过）：不认领
+        CHECK(!g.pending(8'000'000));
+        g.serverClosed(9'000'000); // 收过一次就不再续
+        CHECK(!g.pending(9'000'000));
+    }
+
+    CASE("effectiveFullscreen：Wayland 会话（layer-shell 面板）里一律不全屏，纯 X11 照报");
+    CHECK(effectiveFullscreen(true, false));
+    CHECK(!effectiveFullscreen(false, false));
+    CHECK(!effectiveFullscreen(true, true));
+    CHECK(!effectiveFullscreen(false, true));
 
     TEST_MAIN_END();
 }

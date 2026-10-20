@@ -298,6 +298,69 @@ void TestStableHash()
     CHECK_EQ(stableHash("a"), 0xE40C292Cu);
 }
 
+/// 一帧 72 字节的浮层元数据（kind 之外的字段随便填），尾段由调用方追加。
+Bytes overlay72(uint32_t kind)
+{
+    Bytes p;
+    for (uint32_t v : {kind, 3u, 200u, 40u, 0x5u, 4u, 10u, 20u, 10u, 20u, 0u, 0u, 0u, 0u, 200u,
+                       40u, 0u, 0x3F800000u /* 1.0f */}) {
+        append(p, le32(v));
+    }
+    return p;
+}
+
+void TestOverlayDragTail()
+{
+    CASE("overlay_drag_tail_parsed_only_for_panel_kinds");
+    // 工具栏：count + count × (x y w h)，偏移按 Rust `encode_overlay_frame` 写死（72 字节之后）。
+    Bytes tb = overlay72(OVERLAY_KIND_TOOLBAR);
+    append(tb, le32(2));
+    for (uint32_t v : {1u, 2u, 30u, 40u, uint32_t(-5), 6u, 7u, 8u}) {
+        append(tb, le32(v));
+    }
+    auto t = decodeOverlayFrame(tb);
+    CHECK(t.has_value());
+    CHECK_EQ(t->drag.size(), size_t(2));
+    CHECK_EQ(t->drag[0].x, 1);
+    CHECK_EQ(t->drag[0].y, 2);
+    CHECK_EQ(t->drag[0].w, 30);
+    CHECK_EQ(t->drag[0].h, 40);
+    CHECK_EQ(t->drag[1].x, -5);
+    CHECK_EQ(t->drag[1].h, 8);
+    // 尾段截断：count 说有两块、数据只够一块半 → 整帧拒收（不拿半截拖动区去命中）。
+    Bytes cut(tb.begin(), tb.end() - 8);
+    CHECK(!decodeOverlayFrame(cut).has_value());
+
+    // 软键盘零个拖动区：只多一个 count。
+    Bytes skb = overlay72(OVERLAY_KIND_SOFTKEYBOARD);
+    append(skb, le32(0));
+    auto s = decodeOverlayFrame(skb);
+    CHECK(s.has_value() && s->drag.empty());
+
+    // 其它 kind：72 字节之后的东西一概不认（服务端不编码；将来真多了别的字段也不该被当成拖动区）。
+    Bytes st = overlay72(OVERLAY_KIND_STATUS);
+    append(st, le32(1));
+    for (uint32_t v : {0u, 0u, 10u, 10u}) {
+        append(st, le32(v));
+    }
+    auto o = decodeOverlayFrame(st);
+    CHECK(o.has_value() && o->drag.empty());
+    Bytes menu = overlay72(OVERLAY_KIND_MENU);
+    append(menu, le32(7)); // 菜单帧后面跟着一个不成形的「count」：照样收、不读
+    CHECK(decodeOverlayFrame(menu).has_value());
+
+    CASE("CMD_PANEL_POINTER：20 字节，kind event button x y（x/y 有符号）");
+    Bytes pp = encodePanelPointer(OVERLAY_KIND_SOFTKEYBOARD, PANEL_POINTER_RELEASE, 1, -5, 40);
+    CHECK_EQ(pp.size(), HEADER_SIZE + 20);
+    CHECK_EQ(u16At(pp, 2), uint16_t(CMD_PANEL_POINTER));
+    CHECK_EQ(u32At(pp, 4), 20u);
+    CHECK_EQ(u32At(pp, 8), OVERLAY_KIND_SOFTKEYBOARD);
+    CHECK_EQ(u32At(pp, 12), PANEL_POINTER_RELEASE);
+    CHECK_EQ(u32At(pp, 16), 1u);
+    CHECK_EQ(int32_t(u32At(pp, 20)), -5);
+    CHECK_EQ(int32_t(u32At(pp, 24)), 40);
+}
+
 } // namespace
 
 int main()
@@ -312,6 +375,7 @@ int main()
     TestDecodeDeferred();
     TestDecodeMisc();
     TestDecodeRender();
+    TestOverlayDragTail();
     TestStableHash();
     TEST_MAIN_END();
 }

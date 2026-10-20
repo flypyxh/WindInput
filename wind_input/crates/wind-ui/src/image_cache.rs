@@ -863,6 +863,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 上一条的正面：SVG 里内嵌成 data: 的位图要画出来（主题编辑器就引导作者这么做）。
+    /// 它钉的是 resvg 的 `raster-images` feature——关掉后所有位图都静默不画，上一条照样绿。
+    #[test]
+    fn inline_svg_renders_embedded_data_uri_bitmap() {
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4" height="4"><image xlink:href="{}" width="4" height="4"/></svg>"##,
+            png_data_uri(4, 4, [255, 0, 0, 255])
+        );
+        let uri = format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&svg)
+        );
+
+        let mut cache = ImageCache::new();
+        let pm = cache
+            .fill(&uri, FillSpec::stretch(), 4, 4, [0, 0, 0, 0])
+            .expect("内嵌位图的 SVG 应当能填充");
+        let px = pm.pixel(1, 1).expect("像素");
+        // BGRA 序（见 compose）：源的红落在 blue 通道上。
+        assert_eq!(
+            (px.blue(), px.green(), px.red(), px.alpha()),
+            (255, 0, 0, 255)
+        );
+    }
+
     /// 候选窗宽度每变一个像素就是一条新的填充缓存条目，没有上界就只涨不落
     /// （实测宽 200→800、高 40 这一段是 45.9 MB）。超预算必须整体让位。
     #[test]

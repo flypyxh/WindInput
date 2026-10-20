@@ -43,6 +43,9 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, trace, warn};
 use wind_keys::keymap;
 
+/// CapsLock 作中英切换键时，按住超过这么久（毫秒）松开算长按：开关大写锁定而不切中英。
+const CAPS_TOGGLE_LONG_PRESS_MS: u32 = 500;
+
 use wind_bridge::handler::*;
 use wind_bridge::push::PushServer;
 use wind_candidate::{Candidate, CandidateSource};
@@ -647,6 +650,30 @@ pub(crate) struct State {
     /// 上一批的翻页史与新的这批无关）。**别在别处清**——`current_page` 归零的地方就是
     /// 它该归零的地方，两者分家就会漂移。
     pub(crate) paged: bool,
+    /// 候选展开态（多行网格）的可见区首行：`Some(p)` = 已展开，第 `p` 页在可见区第一行。
+    ///
+    /// 网格的**一行就是一页**，高亮行就是 `current_page`。于是页模型的一切——数字键、空格、
+    /// 扩容、末页放宽——原样适用，这里只多记一个滚动位置。设计见
+    /// `docs/design/candidate-grid-expand.md`。
+    ///
+    /// 清零在 [`Coordinator::reset_candidate_view`]：候选重新装填（打字、退格、分步上屏后续查）
+    /// 即收起，与 `paged` 同一个时机、同一个理由；本次组合展开过的话，装填完再由
+    /// [`Self::grid_keep`] 展开回来。
+    pub(crate) grid_top: Option<usize>,
+    /// 本次组合展开过：候选重新装填后（继续打字、分步上屏）自动再展开，直到 Esc 收起或组合结束。
+    ///
+    /// 组合结束的出口有几十处，不逐个清：每次按键开头若已没有候选，就说明是一次新组合，在
+    /// `handle_key_event` 开头清掉。
+    pub(crate) grid_keep: bool,
+    /// 展开态当前的分类标签（P3）。非 `All` 时 `candidates` 是**筛过的子集**，完整列表暂存在
+    /// [`Self::grid_full`]——下标在几十处调用里按 `candidates` 解释，就地换成子集，选词、序号、
+    /// 右键、置顶删除就都不用知道筛选的存在。重建候选的几处（扩容、末页放宽）之后要重新套一次
+    /// 筛选，见 `Coordinator::grid_reapply_filter`。
+    ///
+    /// 与 `grid_top` 同一个清零点（`reset_candidate_view`）。
+    pub(crate) grid_tab: wind_ui_types::GridTab,
+    /// 筛选期间的完整候选列表；`grid_tab == All` 时为空。
+    pub(crate) grid_full: Vec<Candidate>,
     /// 动态分级加载：当前候选对应的输入码
     pub(crate) candidate_input: String,
     /// 动态分级加载：当前加载上限
@@ -1417,7 +1444,10 @@ pub struct Coordinator {
     ///
     /// 在 `new` 里就建好并起好消费线程（那里才有 `Arc<Self>`），钩子装卸只是复用它。
     /// 消费线程空闲时阻塞在 channel 上，未装钩子时零开销。
-    capslock_press_tx: std::sync::mpsc::Sender<()>,
+    capslock_press_tx: std::sync::mpsc::Sender<wind_keys::capslock_hook::CapsEvent>,
+    /// 这次被钩子接管的 CapsLock 按下已被会话动作（翻页、选词、大小写档位等）用掉：
+    /// 松开时就不再当中英切换键处理。只在 CapsLock 动作消费线程里读写。
+    caps_press_claimed: std::sync::atomic::AtomicBool,
     /// 短语层（系统+用户，来自 store，仅 enabled）。变更后可 rebuild_phrases 重建。
     pub(crate) phrases: std::sync::RwLock<wind_phrase::PhraseLayer>,
     /// 最近一次解析的系统短语条目（启动时填充；"恢复默认"重读文件成功后刷新）。
@@ -1453,6 +1483,21 @@ pub struct Coordinator {
     /// 反复重置回记忆值。拖动落盘时（`save_toolbar_anchor`）同步更新，否则拖到别的屏之后
     /// 这里仍记着旧 key，下一次校正会被误判为「屏没变」而跳过。
     pub(crate) current_toolbar_monitor: Mutex<Option<String>>,
+    /// Linux：addon 最近一次 `host.display` 报的焦点输出（显示器）名与其工作区。服务端问不到
+    /// 屏幕几何，工具栏 / 软键盘的位置记忆改以输出名分桶（见 `Coordinator::current_monitor`）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) host_output: Mutex<Option<String>>,
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) host_work: Mutex<Option<(i32, i32, i32, i32)>>,
+    /// Linux：`pos.toolbar` / `pos.softkeyboard` 报的落点输出名，按浮层 kind 暂存，等渲染端把
+    /// 左上角换算成右下角回报（`ToolbarMoved` / `SoftKeyboardMoved`）时作为落盘的显示器键取走。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) panel_drop_output: Mutex<std::collections::HashMap<u32, String>>,
+    /// Linux：addon 在 `host.display` 里声明过 `panels`（能贴工具栏 / 软键盘浮层）。旧 addon 不认
+    /// 这两种浮层、收到就丢——升级 deb 后 fcitx5 没重启，旧 addon 拉起的是新服务，放任软键盘
+    /// 开着会接管主键区而屏上什么都没有。请求连接断开即复位（下一个 addon 实例得重新声明）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) host_panels: std::sync::atomic::AtomicBool,
     /// `state.toml` 的单点延迟写入器：合并连续微调、进程内串行化 load-modify-save。
     /// 无 `store`（headless 测试夹具）时是不写盘的空实现，见 [`state_writer::StateWriter`]。
     pub(crate) state_writer: state_writer::StateWriter,
@@ -1557,6 +1602,14 @@ pub struct Coordinator {
     /// 合成坐标去骗过闸门（Android 一度就是这么做的，`height` 写 0 还会被判为「宿主
     /// 尚未 reflow」整帧丢弃，候选一次都不下发）。
     caret_independent: std::sync::atomic::AtomicBool,
+    /// 暂停学习（隐私 / 无痕输入）：置位期间上屏照常、候选照常，但**不把这次输入写进任何
+    /// 用户数据**（词频、自动造词 / 草稿、联想历史与下一词、英文造词、输入统计、快捷输入 /
+    /// 网址 / 邮箱历史、上屏历史）。见 [`Coordinator::set_learning_suspended`]。
+    ///
+    /// 纯运行时、**不进配置**：它描述的是「当前这个输入框」的属性（Android 的
+    /// `IME_FLAG_NO_PERSONALIZED_LEARNING`），宿主每次聚焦重新声明；持久化下来反而会让
+    /// 一次无痕输入把之后所有输入框都变成不学习。
+    learning_suspended: std::sync::atomic::AtomicBool,
     /// 宿主报的光标坐标可直接当权威用（Linux addon：来自应用自己上报的光标矩形，没有 Windows
     /// 那种跨窗口 Win32 光标冒充插入点的问题，但来源字段恒为 UNKNOWN）。见 `host.display`。
     host_caret_trusted: std::sync::atomic::AtomicBool,
@@ -1984,6 +2037,10 @@ pub struct Coordinator {
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
     /// 上屏历史环形缓冲（index 0 = 最近）：供命令栏 `last(n)` 取最近上屏文本。
     pub(crate) recent_commits: Mutex<std::collections::VecDeque<String>>,
+    /// 下一词学习的上文：最近一次**选词整体上屏**的词（简体）。默认断开：任何上屏记账
+    /// （`record_commit`）、焦点变化、宿主自行出字 / 挪光标、取消、撤销上屏都清空，只有
+    /// `commit_selected` 接得上——只记真正相邻的两个词，见 [`Self::learn_next_word`]。
+    pub(crate) next_word_prev: Mutex<Option<String>>,
     /// 撤销上屏（`ime.undo_commit`）删除量：最近一次「同步落到光标前」的字符数（UTF-16 单元，
     /// 与 TSF ShiftStart / macOS NSRange 同量纲）。**刻意与 `recent_commits` 分离**——历史队列
     /// 记「上过什么」（供 last/加词，深度 16），本值记「光标前紧邻的还是不是它、有几个字」这一
@@ -2009,6 +2066,11 @@ pub struct Coordinator {
     pub(crate) stat_collector: Option<StatCollector>,
     /// 本次按键是否已被具体上屏路径记录统计（AtomicBool，避免与 state 锁冲突致死锁）。
     pub(crate) stat_recorded: std::sync::atomic::AtomicBool,
+    /// 本次按键命中了会话态动词 `commit_code`，出口处要把它当成一次回车重新分派。
+    /// 见 [`Coordinator::redispatch_commit_code`]。
+    pub(crate) commit_code_pending: std::sync::atomic::AtomicBool,
+    /// 正在为 `commit_code` 重新分派回车：这一下回车恒上屏编码，不看 `input.enter_behavior`。
+    pub(crate) commit_code_forced: std::sync::atomic::AtomicBool,
     /// 统计事件捕获（仅测试）：`None` = 不捕获（生产恒 `None`，零增长）；
     /// `debug_capture_stat_events` 置 `Some` 后，每次 `record_commit*` 追加 (来源, 文本)。
     pub(crate) debug_stat_events: Mutex<Option<Vec<(CommitSource, String)>>>,
@@ -2408,6 +2470,29 @@ impl Coordinator {
             .store(value, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// 暂停 / 恢复学习（隐私 / 无痕输入，见字段 `learning_suspended`）。
+    ///
+    /// 判断收口在各条**学习入口**（`record_selection_cased_in`、`learn_phrase_on_commit_in`、
+    /// `bump_selected_temp_word`、`promote_draft_on_commit`、`note_draft_commit`、
+    /// `learn_english_raw`、`record_assoc_pick`、`learn_next_word`、`record_commit_ks` /
+    /// `handle_english_stats`、`learn_quick_history`、`learn_url_history`、
+    /// `learn_email_suffix`、`push_commit_history`），而不是散在各个 store 写函数里：
+    /// 用户**主动**的操作（加词、删词、置顶、清空）也走同一批 store 写函数，那是用户意图、
+    /// 不是学习，暂停期间必须照常生效。读路径一概不看本开关。
+    ///
+    /// 切换时顺带打一个下一词断点：暂停前最后一个词不该和恢复后的第一个词连成一对。
+    pub fn set_learning_suspended(&self, on: bool) {
+        self.learning_suspended
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.note_word_boundary();
+    }
+
+    /// 当前是否暂停学习（见 [`Self::set_learning_suspended`]）。
+    pub fn learning_suspended(&self) -> bool {
+        self.learning_suspended
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// 声明宿主报的光标坐标可直接当权威（见字段 `host_caret_trusted`）。
     pub fn set_host_caret_trusted(&self, value: bool) {
         self.host_caret_trusted
@@ -2418,6 +2503,19 @@ impl Coordinator {
     pub fn set_host_inline_preedit(&self, supported: bool) {
         self.host_no_inline_preedit
             .store(!supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 宿主能否显示工具栏 / 软键盘面板。只有 Linux addon 要声明（见字段 `host_panels`），
+    /// 其它形态的面板由本进程或 `.app` 自己画，恒为真。
+    pub(crate) fn host_has_panels(&self) -> bool {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            self.host_panels.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
+        {
+            true
+        }
     }
 
     /// 退出（重启服务、注销 / 关机、SIGTERM）前把统计与待处理的用户数据落盘：`process::exit`
@@ -2454,6 +2552,20 @@ impl Coordinator {
                 c.flush_user_data_before_exit();
                 std::process::exit(0);
             }));
+        }
+    }
+
+    /// Linux addon 的 push 连接每（重）建立一次，就让渲染端补推可见的工具栏 / 软键盘：addon 收到
+    /// SERVICE_READY 会丢掉手里的面板，而同一服务换了连接时面板状态并没有变，不会自己再推。
+    /// 服务 main 在 `PushServer::mark_ready` 之后调一次；其它形态是空操作。
+    pub fn install_host_reconnect_hook(&self) {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            let tx = self.ui_tx.clone();
+            self.push_server
+                .set_client_connected_hook(Box::new(move |_token| {
+                    let _ = tx.send(wind_ui_types::UiCommand::HostReconnected);
+                }));
         }
     }
 
@@ -2783,7 +2895,8 @@ impl Coordinator {
         } else {
             (d.chinese_mode, d.full_width, d.chinese_punct)
         };
-        let (capslock_press_tx, capslock_press_rx) = std::sync::mpsc::channel::<()>();
+        let (capslock_press_tx, capslock_press_rx) =
+            std::sync::mpsc::channel::<wind_keys::capslock_hook::CapsEvent>();
         // 简繁两方向的生效口径（互斥，冲突时 s2t 赢）收在 config 层的单一函数里，
         // 与 reload 那处同源——散着写迟早漏改一处。
         let (conv_s2t, conv_t2s) = config.input.conversion_directions();
@@ -2827,6 +2940,10 @@ impl Coordinator {
                 candidates: Vec::new(),
                 selected_index: 0,
                 current_page: 0,
+                grid_top: None,
+                grid_keep: false,
+                grid_tab: wind_ui_types::GridTab::All,
+                grid_full: Vec::new(),
                 paged: false,
                 candidate_input: String::new(),
                 candidate_limit: 0,
@@ -2887,6 +3004,7 @@ impl Coordinator {
             punct: Mutex::new(punct_conv),
             capslock_hook: Mutex::new(None),
             capslock_press_tx,
+            caps_press_claimed: std::sync::atomic::AtomicBool::new(false),
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             draft_window: Mutex::new(crate::draft_window::DraftWindowBuf::new()),
             draft_queue: Mutex::new(Vec::new()),
@@ -2904,6 +3022,14 @@ impl Coordinator {
             toolbar_anchors: Mutex::new(toolbar_anchors_init),
             softkeyboard_anchors: Mutex::new(softkeyboard_anchors_init),
             current_toolbar_monitor: Mutex::new(None),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            host_output: Mutex::new(None),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            host_work: Mutex::new(None),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            panel_drop_output: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            host_panels: std::sync::atomic::AtomicBool::new(false),
             // 判据借 `store`：它的文档本来就写着「None = 无持久化（headless 测试）」。
             // 只看 `state_dir()` 挡不住测试夹具——那是进程外的全局路径，夹具同样取得到。
             state_writer: state_writer::StateWriter::new(persists_state, Config::state_dir()),
@@ -2939,6 +3065,7 @@ impl Coordinator {
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             caret_independent: std::sync::atomic::AtomicBool::new(false),
+            learning_suspended: std::sync::atomic::AtomicBool::new(false),
             host_caret_trusted: std::sync::atomic::AtomicBool::new(false),
             host_no_inline_preedit: std::sync::atomic::AtomicBool::new(false),
             eager_prewarm: std::sync::atomic::AtomicBool::new(true),
@@ -2999,6 +3126,7 @@ impl Coordinator {
             host_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
+            next_word_prev: Mutex::new(None),
             last_commit_len: std::sync::atomic::AtomicUsize::new(1),
             preedit_display: Mutex::new(preedit_display_init),
             hide_candidate_window: Mutex::new(hide_candidate_window_init),
@@ -3007,6 +3135,8 @@ impl Coordinator {
             candidate_font_sent: Mutex::new(String::new()),
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
+            commit_code_pending: std::sync::atomic::AtomicBool::new(false),
+            commit_code_forced: std::sync::atomic::AtomicBool::new(false),
             debug_stat_events: Mutex::new(None),
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
             fullscreen_probing: std::sync::atomic::AtomicBool::new(false),
@@ -3044,8 +3174,8 @@ impl Coordinator {
             std::thread::Builder::new()
                 .name("capslock-action".into())
                 .spawn(move || {
-                    for _ in capslock_press_rx {
-                        c.handle_capslock_hook_press();
+                    for ev in capslock_press_rx {
+                        c.handle_capslock_hook_event(ev);
                     }
                     debug!("CapsLock 钩子事件通道已关闭");
                 })
@@ -3127,7 +3257,16 @@ impl Coordinator {
     /// 此判据由它们共用。此前各路径内联比较字符串，且**只判在「空缓冲」分支上**，
     /// 于是「打了码再按回车」时配置静默失效、照旧上屏原码；收口成单一具名判据，
     /// 使「某条路径没接」退化为「没有调用点」这种更容易发现的缺失。
+    ///
+    /// 会话态动词 `commit_code` 借回车的臂上屏编码，那一下恒为假（见
+    /// [`Self::redispatch_commit_code`]）——这里是各臂唯一的读点，故只在这里拦。
     pub(crate) fn enter_clears_composition(&self) -> bool {
+        if self
+            .commit_code_forced
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
         self.rt().config.input.enter_behavior == "clear"
     }
 
@@ -3150,6 +3289,10 @@ impl Coordinator {
     /// `CommitAndHoldComposition`），第三态加进来时，bool 判据的漏接会静默落进 else 分支，
     /// 而 `match` 的漏接是编译错误。参见 [`Self::enter_clears_composition`] 的同款教训。
     pub(crate) fn punct_empty_code_policy(&self, state: &State) -> PunctEmptyCodePolicy {
+        // 缓冲里有入缓冲符号（`gong-`）时候选恒空，但那是用户打的字面文本，不是废码。
+        if self.buffer_has_literal_symbol(state) {
+            return PunctEmptyCodePolicy::Commit;
+        }
         self.punct_empty_code_policy_for(state, &state.input_buffer)
     }
 
@@ -5418,6 +5561,8 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = hidden;
         if hidden {
+            // 看不见的网格里 ←→ 还会移高亮而不移编码光标：随候选窗一起收起（§5.5）。
+            self.collapse_grid(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()));
             self.clear_hover();
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
@@ -5538,11 +5683,24 @@ impl Coordinator {
         data: &KeyEventData,
         include_printable: bool,
     ) -> Option<KeyAction> {
+        // 展开态专属键（←→ / Esc）先于绑定表：它们在网格里另有含义，且必须赶在各模式的
+        // 光标移动臂与 Esc 臂之前截下——本函数恰好是所有模式都先经过的那一处。
+        if let Some(changed) = self.grid_key(state, data) {
+            if changed && let Some(act) = self.after_nav_changed(state) {
+                return Some(act);
+            }
+            return Some(KeyAction::Consumed);
+        }
         let shift = data.modifiers & MOD_SHIFT != 0;
         let action = self.session_action_for(data.key_code, shift, include_printable)?;
         if action.requires_candidates() && state.candidates.is_empty() {
             return None;
         }
+        // 只认纯翻页动词：`AuxCode(PageNext)` 共键降级的那一下不归 `keys.overflow.page_key`。
+        let is_page_action = matches!(
+            action,
+            wind_config::SessionAction::PagePrev | wind_config::SessionAction::PageNext
+        );
         let nav = match action {
             wind_config::SessionAction::HighlightUp => keymap::NavAction::HighlightUp,
             wind_config::SessionAction::HighlightDown => keymap::NavAction::HighlightDown,
@@ -5553,6 +5711,11 @@ impl Coordinator {
                 // 判据与 `cancel_session` 的适用范围一致，见那里。
                 if !Self::has_input_session(state) {
                     return None;
+                }
+                // 展开态下取消键先收起（与 Esc 同一条两段式，见 `grid_key`）。
+                if Self::grid_active(state) && self.collapse_grid(state) {
+                    self.notify_ui_update(state);
+                    return Some(KeyAction::Consumed);
                 }
                 return Some(self.cancel_session(state));
             }
@@ -5627,6 +5790,23 @@ impl Coordinator {
             wind_config::SessionAction::CommitHighlighted => {
                 return self.commit_highlighted(state);
             }
+            // 上屏编码：这里只登记、吞键，持锁的这一层没法重入分派；由出口
+            // `redispatch_commit_code` 把这个键当回车再走一遍。
+            //
+            // 无会话放行，判据与 `Cancel` 同侧。联想态也放行：那里没有编码，回车在联想态
+            // 是「收窗并把回车交还宿主」，借过来就成了把 Tab / Ctrl 交还宿主。
+            // 绑在回车自己身上没有意义，也会让重新分派再命中一次，一并放行。
+            wind_config::SessionAction::CommitCode => {
+                if !Self::has_input_session(state)
+                    || state.assoc_active()
+                    || data.key_code == keymap::VK_RETURN
+                {
+                    return None;
+                }
+                self.commit_code_pending
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Some(KeyAction::Consumed);
+            }
             // 命令：执行，**当前组合原样不动**（不清空、不上屏），吞键。
             //
             // 无会话放行，判据与 `Cancel` / `SingleChar` 同侧：本表收的 Tab / 翻页键那一批
@@ -5655,40 +5835,81 @@ impl Coordinator {
         let flipped = self
             .candidate_flipped
             .load(std::sync::atomic::Ordering::Relaxed);
-        let changed = match nav {
-            keymap::NavAction::HighlightUp if flipped => self.move_down(state),
-            keymap::NavAction::HighlightDown if flipped => self.move_up(state),
-            keymap::NavAction::HighlightUp => self.move_up(state),
-            keymap::NavAction::HighlightDown => self.move_down(state),
-            keymap::NavAction::PagePrev => self.page_prev(state),
-            keymap::NavAction::PageNext => self.page_next(state),
+        //
+        // 展开态（`grid_top` 有值）整组改写：高亮上下 = 换行、翻页 = 滚一屏，见 `candidate_grid`。
+        // 网格只在横排出现，`flipped`（竖排专属）在这里恒为 false，两支不会相遇。
+        // 收起态按下翻页先试展开：展开了就只展开、不翻页（设计 D3）。
+        let changed = if Self::grid_active(state) {
+            match nav {
+                keymap::NavAction::HighlightUp => self.grid_move_row(state, false),
+                keymap::NavAction::HighlightDown => self.grid_move_row(state, true),
+                keymap::NavAction::PagePrev => self.grid_page(state, false),
+                keymap::NavAction::PageNext => self.grid_page(state, true),
+            }
+        } else {
+            match nav {
+                keymap::NavAction::HighlightUp if flipped => self.move_down(state),
+                keymap::NavAction::HighlightDown if flipped => self.move_up(state),
+                keymap::NavAction::HighlightUp => self.move_up(state),
+                keymap::NavAction::HighlightDown => self.move_down(state),
+                keymap::NavAction::PagePrev => self.page_prev(state),
+                keymap::NavAction::PageNext => self.try_expand_grid(state) || self.page_next(state),
+            }
         };
         if changed {
-            // 混输高亮跟随：普通模式下高亮在五笔↔拼音候选间移动可能切换 preedit 形态
-            // （原始码 ↔ 音节拆分）。重算 preedit；若形态变化且嵌入编码（app_inline），须回传
-            // 组合串使宿主内联编码同步；候选窗模式仅 notify_ui_update 刷新即可。
-            // 门控：仅普通模式（active==None）且存在拆分形态——纯五笔(无拆分)/纯拼音(全拼音
-            // 候选→形态恒定)均不触发，零回归。
-            let mut composed: Option<KeyAction> = None;
-            if state.active.is_none() && !state.preedit_split_body.is_empty() {
-                let before = state.preedit.clone();
-                self.sync_preedit_to_highlight(state);
-                if state.preedit != before {
-                    // ★ 必须用**有效**归属而不是配置原值：压制态下候选窗不下发，编码只剩组合区
-                    // 这一条出口，这里不回传就等于让游戏聊天框里的编码停在旧形态。
-                    if self.preedit_in_app_effective() {
-                        let text = state.preedit.clone();
-                        let caret_pos = text.chars().count() as u32;
-                        composed = Some(KeyAction::UpdateComposition { text, caret_pos });
-                    }
-                }
-            }
-            self.notify_ui_update(state);
-            if let Some(act) = composed {
+            if let Some(act) = self.after_nav_changed(state) {
                 return Some(act);
             }
+        } else if is_page_action && self.page_key_overflow_to_punct(state, data) {
+            // 翻不动（`page_next` 的检索范围放宽已在上面先行裁决，放宽了就是 `changed`）：
+            // 不消费，让键落到兜底标点臂，由它统一顶高亮候选并出符号（中文标点、全角、
+            // 智能符号、自动配对、`punct_commit` 都在那一处）。
+            return None;
         }
         Some(KeyAction::Consumed)
+    }
+
+    /// 高亮 / 页码变了之后的收尾：混输按新高亮重算组合区形态，再重绘候选窗。
+    ///
+    /// 返回 `Some` = 组合区形态变了且编码嵌在宿主里，须把新组合串回传给宿主。
+    /// 收进一处，是因为网格专属键（←→）与绑定表里的导航动作都要走它——少走一处，
+    /// 混输下用 ←→ 移到拼音候选时组合区就不跟着变形。
+    fn after_nav_changed(&self, state: &mut State) -> Option<KeyAction> {
+        // 混输高亮跟随：普通模式下高亮在五笔↔拼音候选间移动可能切换 preedit 形态
+        // （原始码 ↔ 音节拆分）。重算 preedit；若形态变化且嵌入编码（app_inline），须回传
+        // 组合串使宿主内联编码同步；候选窗模式仅 notify_ui_update 刷新即可。
+        // 门控：仅普通模式（active==None）且存在拆分形态——纯五笔(无拆分)/纯拼音(全拼音
+        // 候选→形态恒定)均不触发，零回归。
+        let mut composed: Option<KeyAction> = None;
+        if state.active.is_none() && !state.preedit_split_body.is_empty() {
+            let before = state.preedit.clone();
+            self.sync_preedit_to_highlight(state);
+            if state.preedit != before {
+                // ★ 必须用**有效**归属而不是配置原值：压制态下候选窗不下发，编码只剩组合区
+                // 这一条出口，这里不回传就等于让游戏聊天框里的编码停在旧形态。
+                if self.preedit_in_app_effective() {
+                    let text = state.preedit.clone();
+                    let caret_pos = text.chars().count() as u32;
+                    composed = Some(KeyAction::UpdateComposition { text, caret_pos });
+                }
+            }
+        }
+        self.notify_ui_update(state);
+        composed
+    }
+
+    /// 翻页键翻不动时是否按 `keys.overflow.page_key = "commit_and_input"` 交给标点臂。
+    ///
+    /// 只在主路（overlay 各有自己的翻页语义）、该键能出符号（PageUp/PageDown/Tab 不算，
+    /// 数字另有选词臂）、且本批候选**从未翻过页**时成立——判据取 `state.paged` 而非
+    /// `current_page == 0`，理由同 [`Self::symbol_buffer_key_free`]：翻回首页的用户仍在
+    /// 翻页，此刻按键突然出字会让人当场打错。
+    fn page_key_overflow_to_punct(&self, state: &State, data: &KeyEventData) -> bool {
+        state.active.is_none()
+            && !state.paged
+            && self.rt().config.keys.overflow.page_key == "commit_and_input"
+            && punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+                .is_some_and(|c| !c.is_ascii_digit())
     }
 
     /// 当前是否有输入会话：正在 overlay 模式里，或普通输入有编码 / 候选 / 已上屏段。
@@ -5720,6 +5941,7 @@ impl Coordinator {
     /// 语义；加词模式则消费全部按键。要让自定义取消键在那两处也生效，得改 `wind-ui` 的
     /// 键解释器，是另一层的事。
     pub(crate) fn cancel_session(&self, state: &mut State) -> KeyAction {
+        self.note_word_boundary();
         match state.active {
             Some(ModeKind::TempPinyin) => self.exit_temp_pinyin(state),
             Some(ModeKind::TempEnglish) => self.exit_temp_english(state),
@@ -5771,6 +5993,38 @@ impl Coordinator {
     ///
     /// ⚠️ 二期加 `clear` / `cancel` 时，判据要放宽到「有编码**或**有候选」——那时改**这一处**
     /// 的守卫，别在各调用点各判一次（Esc 散成七处就是那么来的）。
+    /// 会话态动词 `commit_code` 的执行：本次按键若命中了它，把触发键当成一次回车重新
+    /// 分派，并让这一下回车恒走「上屏编码」那一支。
+    ///
+    /// ★ 借回车的臂而不是另写上屏：回车在主路与各 overlay 里各有一条臂（引导符归还、
+    /// 已转换前缀、全角、英文造词、上屏历史各有讲究），另写一份就得跟着它们逐个维护。
+    /// 与回车唯一的不同是不看 `input.enter_behavior`——用户绑这个键要的就是上屏编码，
+    /// 「回车清空编码」是回车这个键的配置。
+    ///
+    /// 不在命中处直接执行：那里持着 `State` 锁，分派要自己取锁。按键出口
+    /// （`handle_key_event_policed`、CapsLock 钩子）都在锁外，于是挂在那里。
+    pub(crate) fn redispatch_commit_code(
+        &self,
+        data: &KeyEventData,
+        action: KeyAction,
+    ) -> KeyAction {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.commit_code_pending.swap(false, Relaxed) {
+            return action;
+        }
+        let enter = KeyEventData {
+            key_code: keymap::VK_RETURN,
+            modifiers: 0,
+            event_type: EVENT_KEY_DOWN,
+            ..data.clone()
+        };
+        self.commit_code_forced.store(true, Relaxed);
+        let act = wind_bridge::handler::MessageHandler::handle_key_event(self, &enter);
+        self.commit_code_forced.store(false, Relaxed);
+        self.commit_code_pending.store(false, Relaxed);
+        act
+    }
+
     fn handle_session_action_key_up(&self, data: &KeyEventData) -> Option<KeyAction> {
         if !keymap::is_key_up_only_vk(data.key_code) {
             return None;
@@ -6599,6 +6853,8 @@ impl Coordinator {
             return;
         }
         debug!("undo_commit: 删除 {} 个 UTF-16 单元", count);
+        // 删掉的正是下一词学习的上文
+        self.note_word_boundary();
         let encoded = wind_ipc::codec::encode_replace_backward(count, "");
         let _ = self.push_server.push_commit_to_active(&encoded);
     }
@@ -6811,6 +7067,14 @@ impl Coordinator {
         self.show_tip(mode.label());
     }
 
+    /// 用户是否隐藏了候选窗（candwin 切换 / `ui.candidate.hide_window`）。
+    pub(crate) fn candidate_window_hidden(&self) -> bool {
+        *self
+            .hide_candidate_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 切换候选窗显隐（运行时态）。隐藏时下次刷新即不显示候选。
     fn cmd_toggle_candwin(&self) {
         let hidden = {
@@ -6822,6 +7086,8 @@ impl Coordinator {
             *h
         };
         if hidden {
+            // 看不见的网格里 ←→ 还会移高亮而不移编码光标：随候选窗一起收起（§5.5）。
+            self.collapse_grid(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()));
             self.clear_hover();
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
@@ -7091,8 +7357,21 @@ impl Coordinator {
             );
         }
         let t_nu = std::time::Instant::now();
-        // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
-        let (start, end) = self.page_range(state);
+        // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）。
+        // 展开态推送可见区内的几页、逐行平铺（一行一页），见 `candidate_grid`。
+        let grid_range = self.grid_visible_range(state);
+        let (start, end) = grid_range.unwrap_or_else(|| self.page_range(state));
+        let per_page = self.per_page(state.active);
+        // 展开态一帧有好几页候选，悬停气泡**只为鼠标下的那一格**渲染——每格各渲染一份会把
+        // 持锁热路径上的开销放大成行数倍，而 UI 本来就只显示悬停那一格的气泡（悬停一变，
+        // `mouse_hover` 就会重新下发）。
+        let hover_now = self.hover_target();
+        // 展开态带序号的格子（平铺下标区间）：从高亮行行首起，按 `grid_index_fill` 往下顺延，
+        // 与数字键的选择范围 `select_range` 同源。
+        let grid_index = grid_range.map(|(vis_start, _)| {
+            let (sel_start, sel_end) = self.select_range(state);
+            (sel_start.saturating_sub(vis_start), sel_end - sel_start)
+        });
         // 候选序号标签：
         //  - 数字透镜：数字键正在录表达式 → 选词改用字母标签 a/b/c
         //  - 其余（含自由输入）：正常序号
@@ -7203,7 +7482,13 @@ impl Coordinator {
                 let full = self.cand_display_text(state, c);
                 // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
                 // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
-                let disp = cand_cfg.truncate_display(&full);
+                // 展开态按列对齐，一个长词会撑宽整列，另有更紧的格宽上限。
+                let disp = if grid_range.is_some() {
+                    cand_cfg.truncate_grid_cell(&full)
+                } else {
+                    cand_cfg.truncate_display(&full)
+                };
+                let tip_skipped = grid_range.is_some() && i as i32 != hover_now;
                 // 悬停提示按段列表渲染（见 `crate::tooltip`）。逐字段遍历**截断后**的显示文本、
                 // 且不含截断追加的 `…`：超长候选（如长短语）逐字展开会撑爆气泡，只提示实际
                 // 显示出的字；被截掉的部分由「完整原文」段（`${full_text}`）整段给出。
@@ -7219,6 +7504,7 @@ impl Coordinator {
                 // Some("")）。此时本段不显示，并已在循环外触发后台构建，建好后自动补上。
                 let word_code = code_schema
                     .as_deref()
+                    .filter(|_| !tip_skipped)
                     .and_then(|sid| {
                         #[cfg(test)]
                         WORD_CODE_LOOKUPS.with(|n| n.set(n.get() + 1));
@@ -7259,7 +7545,11 @@ impl Coordinator {
                     crate::tooltip::char_var(name, arg, ch, &reverse)
                         .or_else(|| self.eval_text_var(name, arg, &ch.to_string(), &reverse))
                 };
-                let rendered = tip.render(&disp, &full, &cand_eval, &char_eval);
+                let rendered = if tip_skipped {
+                    Default::default()
+                } else {
+                    tip.render(&disp, &full, &cand_eval, &char_eval)
+                };
                 let tooltip = rendered.doc.clone();
                 tip_page.push(crate::handle_tooltip::TooltipPageEntry {
                     text: c.text.clone(),
@@ -7304,6 +7594,14 @@ impl Coordinator {
                     code: c.code.clone(),
                     label: if alpha {
                         ((b'a' + i as u8) as char).to_string()
+                    } else if let Some((from, count)) = grid_index {
+                        // 带序号的格子从高亮行行首起顺延编号；其余格子的序号渲染端画成透明，
+                        // 这里照列号给一个，只为占住同样的宽度。
+                        if (from..from + count).contains(&i) {
+                            self.resolve_index_label(cand_cfg, i - from)
+                        } else {
+                            self.resolve_index_label(cand_cfg, i % per_page)
+                        }
                     } else {
                         self.resolve_index_label(cand_cfg, i)
                     },
@@ -7317,7 +7615,23 @@ impl Coordinator {
         *self.tooltip_page.lock().unwrap_or_else(|e| e.into_inner()) = tip_page;
         // 翻页信息改为结构化字段传给候选窗（窗口内渲染独立的页码指示）
         let total_pages = self.total_pages(state);
-        let selected = state.selected_index.min(items.len().saturating_sub(1));
+        let grid = state.grid_top.zip(grid_index).map(|(top, (from, count))| {
+            wind_ui_types::CandidateGrid {
+                cols: per_page as u16,
+                rows: self.grid_rows() as u16,
+                highlight_row: state.current_page.saturating_sub(top) as u16,
+                index_start: from as u16,
+                index_count: count as u16,
+                tabs: self.grid_tabs(state).iter().fold(0, |m, t| m | t.bit()),
+                active_tab: state.grid_tab as u8,
+            }
+        });
+        // 展开态的选中项是平铺下标：高亮行之前的整行都算进去。
+        let selected_flat = match grid {
+            Some(g) => g.highlight_row as usize * per_page + state.selected_index,
+            None => state.selected_index,
+        };
+        let selected = selected_flat.min(items.len().saturating_sub(1));
         // 悬停目标独立于选中项：候选越界视为无悬停，翻页器 tag 原样透传
         let hover =
             match self.hover_target() {
@@ -7418,6 +7732,7 @@ impl Coordinator {
             hover,
             page: state.current_page + 1,
             total_pages,
+            grid,
             caret_x,
             caret_y,
             caret_height,
@@ -7513,12 +7828,24 @@ impl Coordinator {
             UiEvent::SoftKeyboardMoved { right, bottom } => {
                 self.save_softkeyboard_anchor(right, bottom)
             }
-            UiEvent::CandidateOp { op, page_local } => self.candidate_op(op, page_local),
+            // 只在这里换算平铺下标：`candidate_op` 的另一批调用方（Ctrl+数字热键等）传的
+            // 本来就是页内下标。
+            UiEvent::CandidateOp { op, page_local } => {
+                if let Some(page_local) = self.resolve_event_index(page_local, false) {
+                    self.candidate_op(op, page_local)
+                }
+            }
             UiEvent::RequestCandidateMenu { page_local, x, y } => {
                 self.show_candidate_menu(page_local, x, y)
             }
-            UiEvent::RequestMainMenu(anchor) => self.show_main_menu(anchor),
+            UiEvent::RequestMainMenu(anchor) => {
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.send_host_work_area();
+                self.show_main_menu(anchor)
+            }
             UiEvent::RequestToolbarMenu { action, anchor } => {
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.send_host_work_area();
                 self.show_toolbar_menu(action, anchor)
             }
             UiEvent::MenuAction(kind) => self.menu_action(kind),
@@ -7909,15 +8236,24 @@ impl Coordinator {
     }
 
     /// 滚轮翻页：dir<0 上一页，dir>0 下一页；仅重绘候选窗，不上屏。
+    ///
+    /// 展开态下滚一行（翻页箭头同此）；收起态往下翻与翻页键同语义——先试展开。
     fn mouse_page(&self, dir: i32) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
             return;
         }
-        let changed = if dir < 0 {
+        let changed = if Self::grid_active(&state) {
+            // 鼠标往上滚到第一行就停住，不像 ↑ 那样收起：滚轮滚过头是常事。
+            if dir > 0 {
+                self.grid_scroll_down(&mut state)
+            } else {
+                state.current_page > 0 && self.grid_move_row(&mut state, false)
+            }
+        } else if dir < 0 {
             self.page_prev(&mut state)
         } else {
-            self.page_next(&mut state)
+            self.try_expand_grid(&mut state) || self.page_next(&mut state)
         };
         if changed {
             self.notify_ui_update(&state);
@@ -7940,7 +8276,10 @@ impl Coordinator {
         {
             target // 翻页器悬停
         } else if target >= 0 {
-            let (start, end) = self.page_range(&state);
+            // 展开态下悬停的是平铺下标，校验范围是整个可见区。
+            let (start, end) = self
+                .grid_visible_range(&state)
+                .unwrap_or_else(|| self.page_range(&state));
             if (target as usize) < end - start {
                 target
             } else {
@@ -8505,8 +8844,16 @@ impl Coordinator {
     /// `let (status, _)` 丢掉 commit_text，于是经热键表/菜单触发的中英切换既不上屏
     /// 也不结束组合——与本次修的方案切换是同一个缺口，只是少了一个出口。
     pub(crate) fn toggle_mode_with_commit(&self) -> (Option<StatusUpdateData>, SwitchCommit) {
+        self.toggle_mode_with_commit_cased(false)
+    }
+
+    /// 同 [`Self::toggle_mode_with_commit`]，`upper` 见 `handle_toggle_mode_cased`。
+    pub(crate) fn toggle_mode_with_commit_cased(
+        &self,
+        upper: bool,
+    ) -> (Option<StatusUpdateData>, SwitchCommit) {
         let had_pending = self.has_pending_composition();
-        let (status, text) = self.handle_toggle_mode();
+        let (status, text) = self.handle_toggle_mode_cased(upper);
         (status, SwitchCommit { text, had_pending })
     }
 
@@ -8739,9 +9086,14 @@ impl Coordinator {
     ///
     /// ★ 幂等：已装且仍该装 → 不动（重复 `SetWindowsHookExW` 会留下卸不掉的旧钩子）。
     pub(crate) fn sync_capslock_hook(&self) {
-        let want = self.capslock_bound();
+        let want = self.capslock_bound() || self.capslock_is_toggle_key();
         let mut slot = self.capslock_hook.lock().unwrap_or_else(|e| e.into_inner());
         if want == slot.is_some() {
+            // 配置热重载可能只改了「切换按键」：钩子不动，空闲闸门要跟着重算。
+            if want {
+                let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                self.sync_capslock_idle_gate(&s);
+            }
             // ★ 「没配所以没装」此前是**完全静默**的：装成功打 INFO、卸载打 INFO，唯独这条
             // 最常见的路径一行都没有。排障时日志里搜不到任何 CapsLock 字样，无从区分
             // 「用户没配」「配了但动词/键名写错被剔除」「装失败」——三者的处置完全不同。
@@ -8760,17 +9112,15 @@ impl Coordinator {
         // 钩子回调在钩子线程执行，**必须只做非阻塞投递**：它超时会被系统静默移除且无从察觉。
         // 故这里只 send，真正的动作在 new 起的消费线程里做（可安全加锁）。
         let tx = self.capslock_press_tx.clone();
-        match wind_keys::capslock_hook::CapsLockHook::install(Box::new(move || {
-            let _ = tx.send(());
+        match wind_keys::capslock_hook::CapsLockHook::install(Box::new(move |ev| {
+            let _ = tx.send(ev);
         })) {
             Ok(h) => {
                 *slot = Some(h);
                 // 立刻按当前会话状态校准一次，避免装好后到下一次按键之间状态为默认值。
-                let eat = {
-                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    Self::has_input_session(&s)
-                };
-                wind_keys::capslock_hook::set_should_eat(eat);
+                let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                wind_keys::capslock_hook::set_should_eat(Self::has_input_session(&s));
+                self.sync_capslock_idle_gate(&s);
             }
             Err(e) => {
                 // 装不上就退化为「CapsLock 绑定不生效」，不影响其余功能。绝不回退到
@@ -8778,6 +9128,29 @@ impl Coordinator {
                 tracing::error!("CapsLock 全局钩子安装失败，该绑定将不生效: {e}");
             }
         }
+    }
+
+    /// 「切换按键」勾了 CapsLock（`keys.toggle_mode_keys` 含 `capslock`）。
+    ///
+    /// 只有装得上钩子时它才真的切中英：锁定态由系统在 TSF 之前翻，没有钩子就压不住，
+    /// 那时 CapsLock 仍只是大写键（服务端 CapsLock 分支照旧只同步大写）。
+    pub(crate) fn capslock_is_toggle_key(&self) -> bool {
+        self.is_toggle_mode_keycode(keymap::VK_CAPITAL)
+    }
+
+    /// 同步「空闲时也吃 CapsLock」：CapsLock 是切换键且本输入法激活时，交给钩子当前活动
+    /// 客户端的进程 pid（token 高 32 位），钩子只在前台窗口属于它时接管。
+    ///
+    /// 激活态 `ime_active` 由焦点进出与输入法切入切出维护，凡改它的地方都要紧跟着调本函数
+    /// （焦点进入那处要在 `set_active_token` 之后）。宿主崩溃这类清不掉激活态的情形由钩子的
+    /// 前台进程比对兜住。
+    pub(crate) fn sync_capslock_idle_gate(&self, state: &State) {
+        let pid = if self.capslock_is_toggle_key() && state.ime_active {
+            (self.push_server.active_token() >> 32) as u32
+        } else {
+            0
+        };
+        wind_keys::capslock_hook::set_idle_pid(pid);
     }
 
     /// 同步「钩子此刻该不该吃 CapsLock」。
@@ -8939,7 +9312,12 @@ impl Coordinator {
         }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state: &mut State = &mut guard;
-        if state.active.is_some() || state.input_buffer.is_empty() || state.sentence_pool.len() < 2
+        // 展开态按分类筛选中：`candidates` 是子集，整句窗口按完整列表的位置滚，两者对不上。
+        // 筛选时把键让回原语义（多半是单字 / 词组标签里本就没有整句）。
+        if state.active.is_some()
+            || state.input_buffer.is_empty()
+            || state.sentence_pool.len() < 2
+            || state.grid_tab != wind_ui_types::GridTab::All
         {
             return None;
         }
@@ -8955,6 +9333,8 @@ impl Coordinator {
         let per_page = self.per_page(state.active);
         state.current_page = first / per_page;
         state.selected_index = first % per_page;
+        // 展开态下页码变了，可见区要跟上，否则高亮行落在可见区外（屏幕上高亮错格）。
+        self.grid_follow(state);
         self.clear_hover();
         // 高亮换了 ⇒ 组合区按高亮候选重算（双拼下简拼 / 整句的切法不同，审查查出漏了这步）。
         // 回传写法同方向键移动高亮（`handle_nav_key`）：只有形态真变了、且编码显示在宿主里时
@@ -9029,7 +9409,83 @@ impl Coordinator {
         );
     }
 
-    fn handle_capslock_hook_press(&self) {
+    /// 钩子报来的 CapsLock 事件（在专用消费线程执行，可安全加锁）。
+    ///
+    /// down 照旧走会话动作（含自动重复）；松开时若 CapsLock 是切换键、且这次按下没被会话
+    /// 动作用掉，按 [`Self::caps_toggle_key_released`] 处理。
+    fn handle_capslock_hook_event(&self, ev: wind_keys::capslock_hook::CapsEvent) {
+        use std::sync::atomic::Ordering::Relaxed;
+        use wind_keys::capslock_hook::CapsEvent;
+        match ev {
+            CapsEvent::Down { first } => {
+                // 首个 down 先清账：上一次按下的 up 若丢了（钩子被系统摘掉），标志不该带过来。
+                if first {
+                    self.caps_press_claimed.store(false, Relaxed);
+                }
+                if self.handle_capslock_hook_press() {
+                    self.caps_press_claimed.store(true, Relaxed);
+                }
+            }
+            CapsEvent::Up {
+                held_ms,
+                interrupted,
+            } => {
+                let claimed = self.caps_press_claimed.swap(false, Relaxed);
+                if claimed || !self.capslock_is_toggle_key() {
+                    return;
+                }
+                // 按住期间按了别的键：同 Shift 的轻敲判定，不算单按，什么都不做。
+                if interrupted {
+                    debug!("CapsLock 切换键：按住期间按了别的键，不切换");
+                    return;
+                }
+                self.caps_toggle_key_released(held_ms);
+            }
+        }
+    }
+
+    /// CapsLock 作切换键时松开：短按切中英，长按（或大写已开着时）开关大写锁定。
+    ///
+    /// 开关大写靠注入一次 CapsLock：注入事件钩子放行，系统照常翻锁定态，TSF 收到后走
+    /// 服务端 CapsLock 分支的原有处理（正在打的编码按 `commit_on_switch` / `commit_upper`
+    /// 上屏），与没勾切换键时按 CapsLock 同一条路。
+    ///
+    /// 短按也当大写键的两种情形：大写开着（短按是关大写）、焦点在密码框（那里中英切换没有
+    /// 意义，用户要的是大写）。
+    ///
+    /// 注入成功后先乐观翻转大写镜像：TSF 回报要走一个往返，紧接着的短按不能读到旧值。
+    fn caps_toggle_key_released(&self, held_ms: u32) {
+        let caps_on = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .caps_lock;
+        let password = self
+            .password_suppress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if held_ms >= CAPS_TOGGLE_LONG_PRESS_MS || caps_on || password {
+            debug!(
+                "CapsLock 切换键：开关大写锁定（按住 {held_ms}ms，大写原为 {caps_on}，密码框 {password}）"
+            );
+            match wind_keys::key_inject::tap_caps_lock() {
+                Ok(()) => {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.caps_lock = !caps_on;
+                }
+                Err(e) => warn!("CapsLock 切换键：注入 CapsLock 失败: {e}"),
+            }
+        } else {
+            debug!("CapsLock 切换键：短按切中英（按住 {held_ms}ms）");
+            // 同 `dispatch_hotkey("toggle_mode")`（无按键上下文，编码经 push 上屏），
+            // 只多一个 `commit_upper`：CapsLock 切的中英，编码同样转大写上屏。
+            let upper = self.rt().config.input.capslock.commit_upper;
+            let (_, commit) = self.toggle_mode_with_commit_cased(upper);
+            self.push_switch_commit(&commit);
+        }
+    }
+
+    /// 返回这次按下是否被某个会话动作用掉了。
+    fn handle_capslock_hook_press(&self) -> bool {
         // 合成一个 keyup 事件：CapsLock 在键盘路径上本来就只有 keyup 到得了服务端
         // （见 `handle_session_action_key_up`），保持同形以免两条路径的守卫产生差异。
         let data = KeyEventData {
@@ -9049,7 +9505,7 @@ impl Coordinator {
         {
             debug!("CapsLock 钩子：英文候选大小写档位循环");
             let _ = act;
-            return;
+            return true;
         }
         // ★ 必须先试选词出口，顺序与 `message_handler` 的 keyup 分支逐字一致。
         //   `apply_session_action` 对 `select_candidate:N` / `select_char:N` 一律
@@ -9060,10 +9516,12 @@ impl Coordinator {
         //   连大写都不翻。2026-08-31 修。
         let action = self
             .handle_select_key_up(&data)
-            .or_else(|| self.handle_session_action_key_up(&data));
+            .or_else(|| self.handle_session_action_key_up(&data))
+            .map(|act| self.redispatch_commit_code(&data, act));
         // 候选窗刷新已在各出口内部完成（`notify_ui_update`），此处无须再推。
         match action {
-            Some(KeyAction::Consumed) | None => {}
+            None => false,
+            Some(KeyAction::Consumed) => true,
             Some(act) => {
                 // 钩子路径**没有 TSF 按键上下文**可回传——与鼠标点选候选完全同一处境，
                 // 故复用它的既有出口 `push_no_key_ctx_action`（`UpdateComposition` / `InsertText`
@@ -9078,6 +9536,7 @@ impl Coordinator {
                     .chinese_mode;
                 debug!("CapsLock 钩子：经 push 通道投递 {:?}", act);
                 self.push_no_key_ctx_action(&act, chinese_mode);
+                true
             }
         }
     }
@@ -9239,12 +9698,30 @@ impl Coordinator {
     /// ——要触发得先在临拼/混输的逐步转换里选中一个带换行的词条，再切中英；而码表（五笔）
     /// 选词消费整串、根本不进那个态。⇒ 修它是为了让四条出口语义一致，不是修现场。
     pub(crate) fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
-        let text = self.take_input_on_mode_switch_raw(state, chinese);
+        self.take_input_on_mode_switch_cased(state, chinese, false)
+    }
+
+    /// 同 [`Self::take_input_on_mode_switch`]，`upper` 为真时上屏的原码转大写
+    /// （`input.capslock.commit_upper`，打字中按 CapsLock 开大写那一路）。
+    /// 只转用户打的码（含字母引导符），已转换前缀 `committed_text` 不动。
+    pub(crate) fn take_input_on_mode_switch_cased(
+        &self,
+        state: &mut State,
+        chinese: bool,
+        upper: bool,
+    ) -> String {
+        let text = self.take_input_on_mode_switch_raw(state, chinese, upper);
         self.convert_commit_newline(text)
     }
 
-    /// [`Self::take_input_on_mode_switch`] 的本体，不含换行改写。
-    fn take_input_on_mode_switch_raw(&self, state: &mut State, chinese: bool) -> String {
+    /// [`Self::take_input_on_mode_switch_cased`] 的本体，不含换行改写。
+    fn take_input_on_mode_switch_raw(
+        &self,
+        state: &mut State,
+        chinese: bool,
+        upper: bool,
+    ) -> String {
+        let cased = |code: String| if upper { code.to_uppercase() } else { code };
         // 切中英 / CapsLock / 系统切换三条路径全部经此。语境变了，上一句中文后面的联想
         // 已无意义。三个调用方随后都会 `notify_ui_hide`，故此处只清状态不动 UI。
         self.exit_assoc(state, crate::handle_assoc::AssocExit::ModeSwitch);
@@ -9259,10 +9736,11 @@ impl Coordinator {
             let text = if state.active == Some(ModeKind::TempEnglish)
                 && !state.temp_english_buffer.is_empty()
             {
+                let buf = cased(state.temp_english_buffer.clone());
                 let text = if state.full_width {
-                    to_full_width(&state.temp_english_buffer)
+                    to_full_width(&buf)
                 } else {
-                    state.temp_english_buffer.clone()
+                    buf
                 };
                 // 与临拼 / mix / 主路的残留同口径：本次上屏按模式切换来源记统计。
                 self.record_commit(
@@ -9314,7 +9792,8 @@ impl Coordinator {
                         // 符号引导符不输出、字母引导符归还，判据见 `guide_to_return`
                         // ——与临拼/mix 的回车上屏共用同一条，三处必须同进同出。
                         // committed 段已在选词时记过，此处只记本次实际上屏的原码（来源模式切换）。
-                        let guide = Self::guide_to_return(&prefix, &state.committed_text);
+                        let guide = cased(Self::guide_to_return(&prefix, &state.committed_text));
+                        let buf = cased(buf);
                         let code = format!("{}{}", guide, buf);
                         self.record_commit(&code, code.len() as u32, -1, CommitSource::ModeSwitch);
                         let raw = format!("{}{}{}", guide, state.committed_text, buf);
@@ -9331,6 +9810,7 @@ impl Coordinator {
                     } else if !prefix.is_empty() && !self.enter_clears_composition() {
                         // 只按了模式进入符（缓冲空）：原样上屏该前缀符号本身，与回车空缓冲上屏一致
                         // （enter_behavior=clear 时回车也不上屏，故一并放弃）。
+                        let prefix = cased(prefix);
                         self.record_commit(&prefix, 0, -1, CommitSource::Punctuation);
                         prefix
                     } else {
@@ -9352,9 +9832,10 @@ impl Coordinator {
             // 切到英文且配置上屏：把「已转换前缀 + 剩余原码」一并上屏。
             let prefix = self.take_committed(state);
             // 上屏原码 → 同回车，用用户所打的大小写形态（缓冲本身恒小写）。
-            let raw_code =
+            let raw_code = cased(
                 preedit_cursor::cased_or_buffer(&state.input_buffer, &state.input_buffer_cased)
-                    .to_string();
+                    .to_string(),
+            );
             // 模式切换上屏：committed 段已在选词时记过，此处只记剩余原码（来源模式切换）。
             self.record_commit(
                 &raw_code,
@@ -9409,6 +9890,9 @@ impl Coordinator {
         if text.is_empty() {
             return;
         }
+        // 下一词学习**默认断开**：任何上屏（标点、原码、顶码、满码自动上屏…）都清上文。
+        // 只有 `commit_selected` 记账前先暂存上文、记账后再学习，见那里。
+        self.note_word_boundary();
         if let Some(log) = self
             .debug_stat_events
             .lock()
@@ -9422,6 +9906,14 @@ impl Coordinator {
             None => return,
         };
         if !self.rt().config.stats.enabled {
+            return;
+        }
+        // 暂停学习：逐日字数与速度同样是「这次输入留下的痕迹」。放在断点与调试捕获之后——
+        // 断点照打，调试捕获只观测「本该记哪一笔」。`stat_recorded` 照常置位，与正常记账
+        // 同一形状，顶层 `record_input_stats` 才不会把这次当成漏记、再走一遍兜底。
+        if self.learning_suspended() {
+            self.stat_recorded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         let (chinese, english, punct, other) = wind_store::stats::classify_chars_full(text);
@@ -9454,6 +9946,17 @@ impl Coordinator {
         let text = match action {
             KeyAction::InsertText { text, .. } => text.as_str(),
             KeyAction::InsertTextWithCursor { text, .. } => text.as_str(),
+            // 不进统计但同样动了宿主正文、又没经 `record_commit` 的出口：下一词学习的断点
+            KeyAction::ReplaceBackward { .. }
+            | KeyAction::HoldComposition { .. }
+            | KeyAction::CommitReplacingHeld { .. }
+            | KeyAction::CommitAndHoldComposition { .. }
+            | KeyAction::CommitThenDeferComposition { .. }
+            | KeyAction::MoveCursorRight { .. }
+            | KeyAction::DeletePair => {
+                self.note_word_boundary();
+                return;
+            }
             _ => return,
         };
         if text.is_empty() {
@@ -16749,6 +17252,276 @@ mod capslock_tests {
         let s = c.state.lock().unwrap();
         assert!(s.caps_lock);
         assert!(s.input_buffer.is_empty(), "未绑定时维持既有的清空语义");
+    }
+
+    /// 打字中按 CapsLock 开大写（`toggles` 置 1）的那一下 keyup，返回上屏文本。
+    fn caps_on_commit(c: &Coordinator) -> String {
+        let mut ev = kev(keymap::VK_CAPITAL, EVENT_KEY_UP);
+        ev.toggles = 0x01;
+        match c.handle_key_event(&ev) {
+            KeyAction::InsertText { text, .. } => text,
+            other => panic!("开大写应上屏编码，实际: {other:?}"),
+        }
+    }
+
+    fn coord_commit_upper(on: bool) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.symbol.smart_mode = false;
+        cfg.input.capslock.commit_upper = on;
+        Coordinator::new_headless(cfg, None)
+    }
+
+    #[test]
+    fn caps_on_commits_code_uppercase_when_enabled() {
+        let c = coord_commit_upper(true);
+        c.state.lock().unwrap().input_buffer = "wps".to_string();
+        assert_eq!(caps_on_commit(&c), "WPS");
+        assert!(c.state.lock().unwrap().caps_lock, "之后是大写状态");
+    }
+
+    #[test]
+    fn caps_on_commits_code_as_typed_by_default() {
+        let c = coord_commit_upper(false);
+        c.state.lock().unwrap().input_buffer = "wps".to_string();
+        assert_eq!(caps_on_commit(&c), "wps");
+    }
+
+    /// 已转换前缀是选定的字词，不转大写。
+    #[test]
+    fn caps_on_upper_keeps_committed_prefix() {
+        let c = coord_commit_upper(true);
+        {
+            let mut s = c.state.lock().unwrap();
+            s.committed_text = "用iPhone".to_string();
+            s.input_buffer = "wps".to_string();
+        }
+        assert_eq!(caps_on_commit(&c), "用iPhoneWPS");
+    }
+
+    #[test]
+    fn caps_on_upper_applies_to_temp_english_buffer() {
+        let c = coord_commit_upper(true);
+        {
+            let mut s = c.state.lock().unwrap();
+            s.active = Some(ModeKind::TempEnglish);
+            s.temp_english_buffer = "Hello".to_string();
+        }
+        assert_eq!(caps_on_commit(&c), "HELLO");
+    }
+
+    #[test]
+    fn caps_on_upper_temp_english_full_width() {
+        let c = coord_commit_upper(true);
+        {
+            let mut s = c.state.lock().unwrap();
+            s.active = Some(ModeKind::TempEnglish);
+            s.temp_english_buffer = "Hi".to_string();
+            s.full_width = true;
+        }
+        assert_eq!(caps_on_commit(&c), "ＨＩ");
+    }
+
+    /// 字母引导符随原码转大写。
+    #[test]
+    fn caps_on_upper_temp_pinyin_letter_guide() {
+        let c = coord_commit_upper(true);
+        {
+            let mut s = c.state.lock().unwrap();
+            s.active = Some(ModeKind::TempPinyin);
+            s.temp_pinyin_prefix = "z".to_string();
+            s.temp_pinyin_buffer = "ni".to_string();
+        }
+        assert_eq!(caps_on_commit(&c), "ZNI");
+    }
+
+    /// 只按了字母引导符（缓冲空）也转。
+    #[test]
+    fn caps_on_upper_temp_pinyin_guide_only() {
+        let c = coord_commit_upper(true);
+        {
+            let mut s = c.state.lock().unwrap();
+            s.active = Some(ModeKind::TempPinyin);
+            s.temp_pinyin_prefix = "z".to_string();
+        }
+        assert_eq!(caps_on_commit(&c), "Z");
+    }
+
+    /// CapsLock 被勾成中英切换键（C++ 不带「仅状态通知」标记）时同一支、同一结果。
+    #[test]
+    fn caps_on_upper_when_capslock_is_toggle_key() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.symbol.smart_mode = false;
+        cfg.input.capslock.commit_upper = true;
+        cfg.keys.toggle_mode_keys = vec!["capslock".to_string()];
+        let c = Coordinator::new_headless(cfg, None);
+        c.state.lock().unwrap().input_buffer = "wps".to_string();
+        let mut ev = kev(keymap::VK_CAPITAL, EVENT_KEY_UP);
+        ev.toggles = 0x01;
+        ev.modifiers = 0x0100; // KEYMOD_CAPSLOCK，不带 0x8000「仅状态通知」
+        match c.handle_key_event(&ev) {
+            KeyAction::InsertText { text, .. } => assert_eq!(text, "WPS"),
+            other => panic!("开大写应上屏编码，实际: {other:?}"),
+        }
+    }
+
+    fn coord_caps_toggle_key() -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.symbol.smart_mode = false;
+        cfg.keys.toggle_mode_keys = vec!["lshift".to_string(), "capslock".to_string()];
+        Coordinator::new_headless(cfg, None)
+    }
+
+    fn caps_up(c: &Coordinator, held_ms: u32) {
+        c.handle_capslock_hook_event(wind_keys::capslock_hook::CapsEvent::Down { first: true });
+        c.handle_capslock_hook_event(wind_keys::capslock_hook::CapsEvent::Up {
+            held_ms,
+            interrupted: false,
+        });
+    }
+
+    #[test]
+    fn caps_toggle_key_is_recognized() {
+        assert!(coord_caps_toggle_key().capslock_is_toggle_key());
+        assert!(!coord_cn().capslock_is_toggle_key());
+    }
+
+    /// CapsLock 作切换键：短按切中英，再按切回。
+    #[test]
+    fn caps_toggle_key_short_press_toggles_mode() {
+        let c = coord_caps_toggle_key();
+        caps_up(&c, 120);
+        assert!(!c.is_chinese_mode(), "短按应切到英文");
+        caps_up(&c, 120);
+        assert!(c.is_chinese_mode(), "再短按应切回中文");
+    }
+
+    /// 打字中短按当成切英文：编码按 commit_on_switch 处置，不留在缓冲里。
+    #[test]
+    fn caps_toggle_key_short_press_while_composing_switches_to_english() {
+        let c = coord_caps_toggle_key();
+        c.state.lock().unwrap().input_buffer = "wps".to_string();
+        caps_up(&c, 120);
+        assert!(!c.is_chinese_mode());
+        assert!(c.state.lock().unwrap().input_buffer.is_empty());
+    }
+
+    /// 开了 commit_upper：CapsLock 短按切英文时编码同样转大写上屏（经 push 出口，这里看
+    /// 统计记账的上屏原码）；没开时原样。
+    #[test]
+    fn caps_toggle_key_short_press_commit_upper_follows_config() {
+        for (on, want) in [(true, "WPS"), (false, "wps")] {
+            let mut cfg = Config::default();
+            cfg.input.default.chinese_mode = true;
+            cfg.input.symbol.smart_mode = false;
+            cfg.input.capslock.commit_upper = on;
+            cfg.keys.toggle_mode_keys = vec!["capslock".to_string()];
+            let c = Coordinator::new_headless(cfg, None);
+            c.state.lock().unwrap().input_buffer = "wps".to_string();
+            c.debug_capture_stat_events();
+            caps_up(&c, 120);
+            assert!(!c.is_chinese_mode());
+            let texts: Vec<String> = c
+                .debug_take_stat_events()
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect();
+            assert!(
+                texts.iter().any(|t| t == want),
+                "commit_upper={on} 应上屏 {want}，实际 {texts:?}"
+            );
+        }
+    }
+
+    /// 长按是开关大写，不切中英（大写由注入的 CapsLock 经系统翻转，这里只验不切中英）。
+    #[test]
+    fn caps_toggle_key_long_press_does_not_toggle_mode() {
+        let c = coord_caps_toggle_key();
+        caps_up(&c, CAPS_TOGGLE_LONG_PRESS_MS);
+        assert!(c.is_chinese_mode());
+    }
+
+    /// 大写开着时短按是关大写，不切中英。
+    #[test]
+    fn caps_toggle_key_short_press_with_caps_on_does_not_toggle_mode() {
+        let c = coord_caps_toggle_key();
+        c.state.lock().unwrap().caps_lock = true;
+        caps_up(&c, 120);
+        assert!(c.is_chinese_mode());
+    }
+
+    /// 被会话动作用掉的按下，松开时不再切中英。
+    #[test]
+    fn caps_toggle_key_claimed_press_does_not_toggle_mode() {
+        let c = coord_caps_toggle_key();
+        c.caps_press_claimed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        c.handle_capslock_hook_event(wind_keys::capslock_hook::CapsEvent::Up {
+            held_ms: 120,
+            interrupted: false,
+        });
+        assert!(c.is_chinese_mode());
+    }
+
+    /// 首个 down 清掉上一次残留的「已被用掉」，这次短按照常切换。
+    #[test]
+    fn caps_toggle_key_first_down_clears_stale_claim() {
+        let c = coord_caps_toggle_key();
+        c.caps_press_claimed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        caps_up(&c, 120);
+        assert!(!c.is_chinese_mode());
+    }
+
+    /// 按住期间按了别的键：不算单按，不切中英。
+    #[test]
+    fn caps_toggle_key_interrupted_press_does_not_toggle_mode() {
+        let c = coord_caps_toggle_key();
+        c.handle_capslock_hook_event(wind_keys::capslock_hook::CapsEvent::Down { first: true });
+        c.handle_capslock_hook_event(wind_keys::capslock_hook::CapsEvent::Up {
+            held_ms: 120,
+            interrupted: true,
+        });
+        assert!(c.is_chinese_mode());
+    }
+
+    /// 密码框里短按是开关大写，不切中英。
+    #[test]
+    fn caps_toggle_key_short_press_in_password_field_does_not_toggle_mode() {
+        let c = coord_caps_toggle_key();
+        c.password_suppress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        caps_up(&c, 120);
+        assert!(c.is_chinese_mode());
+    }
+
+    /// 没勾切换键时，钩子（为会话绑定而装）报来的松开什么都不做。
+    #[test]
+    fn caps_release_without_toggle_key_does_nothing() {
+        let c = coord_cn();
+        caps_up(&c, 120);
+        assert!(c.is_chinese_mode());
+    }
+
+    /// 只管大小写：`commit_on_switch` 关时照旧丢弃编码。
+    #[test]
+    fn caps_on_upper_respects_commit_on_switch_off() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.capslock.commit_upper = true;
+        cfg.keys.commit_on_switch = false;
+        let c = Coordinator::new_headless(cfg, None);
+        c.state.lock().unwrap().input_buffer = "wps".to_string();
+        let mut ev = kev(keymap::VK_CAPITAL, EVENT_KEY_UP);
+        ev.toggles = 0x01;
+        let act = c.handle_key_event(&ev);
+        assert!(
+            !matches!(&act, KeyAction::InsertText { text, .. } if !text.is_empty()),
+            "不该上屏，实际: {act:?}"
+        );
+        assert!(c.state.lock().unwrap().input_buffer.is_empty());
     }
 
     /// ★ `capslock = "select_candidate:N"` 必须走得到选词出口。

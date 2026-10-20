@@ -87,6 +87,8 @@ mod imp {
     pub const WM_LBUTTONDOWN: u32 = 0x0201;
     pub const WM_LBUTTONUP: u32 = 0x0202;
     pub const WM_RBUTTONDOWN: u32 = 0x0204;
+    pub const WM_RBUTTONUP: u32 = 0x0205;
+    pub const WM_MBUTTONDOWN: u32 = 0x0207;
     pub const WM_MBUTTONUP: u32 = 0x0208;
     pub const WM_MOUSEMOVE: u32 = 0x0200;
     pub const WM_MOUSEWHEEL: u32 = 0x020A;
@@ -98,7 +100,17 @@ mod imp {
     // ---- 光标/窗口 API（mock：无副作用）----
     /// # Safety
     /// mock 不解引用指针；签名与 Win32 对齐以便调用点不变。
-    pub unsafe fn GetCursorPos(_lppoint: *mut POINT) -> Result<(), ()> {
+    ///
+    /// Linux 外部宿主形态例外：返回 addon 最近报来的指针屏幕坐标（见 `ext_panel`），
+    /// 此时 `lppoint` 须指向有效的 `POINT`（同 Win32 的约定）。
+    #[cfg_attr(not(all(target_os = "linux", ext_presenter)), allow(unused_variables))]
+    pub unsafe fn GetCursorPos(lppoint: *mut POINT) -> Result<(), ()> {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        if let Some((x, y)) = crate::ext_panel::cursor_pos()
+            && !lppoint.is_null()
+        {
+            unsafe { *lppoint = POINT { x, y } };
+        }
         Ok(())
     }
     pub unsafe fn LoadCursorW(_inst: Option<HINSTANCE>, _name: CursorName) -> Result<HCURSOR, ()> {
@@ -118,8 +130,39 @@ mod imp {
     pub unsafe fn GetAsyncKeyState(_vk: i32) -> i16 {
         0
     }
-    pub unsafe fn GetWindowRect(_hwnd: HWND, _rect: *mut RECT) -> Result<(), ()> {
+    /// Linux 外部宿主形态下，外部面板（`HWND(kind)`）给出服务端记下的当前矩形，见 `ext_panel`。
+    #[cfg_attr(not(all(target_os = "linux", ext_presenter)), allow(unused_variables))]
+    pub unsafe fn GetWindowRect(hwnd: HWND, rect: *mut RECT) -> Result<(), ()> {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        if let Some((left, top, right, bottom)) = crate::ext_panel::window_rect(hwnd)
+            && !rect.is_null()
+        {
+            unsafe {
+                *rect = RECT {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                }
+            };
+        }
         Ok(())
+    }
+    /// Linux 外部宿主形态：屏幕坐标减去外部面板的左上角（同 Win32，`WM_MOUSEWHEEL` 的 lparam
+    /// 是屏幕坐标，处理器要先换回客户区）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub unsafe fn ScreenToClient(hwnd: HWND, lppoint: *mut POINT) -> bool {
+        let Some((left, top, _, _)) = crate::ext_panel::window_rect(hwnd) else {
+            return false;
+        };
+        if lppoint.is_null() {
+            return false;
+        }
+        unsafe {
+            (*lppoint).x -= left;
+            (*lppoint).y -= top;
+        }
+        true
     }
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn SetWindowPos(

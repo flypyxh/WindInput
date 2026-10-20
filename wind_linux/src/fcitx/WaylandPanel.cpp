@@ -62,7 +62,10 @@ struct WaylandListeners {
     {
         static_cast<WaylandCandidatePanel*>(data)->onGlobal(name, iface, version);
     }
-    static void registryRemove(void*, wl_registry*, uint32_t) {}
+    static void registryRemove(void* data, wl_registry*, uint32_t name)
+    {
+        static_cast<WaylandCandidatePanel*>(data)->onGlobalRemove(name);
+    }
 
     static void bufferRelease(void* data, wl_buffer* b)
     {
@@ -117,6 +120,11 @@ struct WaylandListeners {
             self->pointerLayer_ = ls;
             self->layerPtrX_ = wl_fixed_to_double(x);
             self->layerPtrY_ = wl_fixed_to_double(y);
+            if (WaylandCandidatePanel::isPanel(*ls)) {
+                // 进入即带位置：当一次移动报上去（悬停高亮由服务端判）
+                self->panelPointer(*ls, PANEL_POINTER_MOTION, 0);
+                return;
+            }
             ls->hovered = true;
             // 指针停在上面：暂停到时收起（同 X11 的「交互中不计时」）
             self->layers_[ls->kind].hideTimer.reset();
@@ -143,6 +151,14 @@ struct WaylandListeners {
         if (self->pointerLayer_ && surface == self->pointerLayer_->surface) {
             LayerSurf* ls = self->pointerLayer_;
             self->pointerLayer_ = nullptr;
+            if (WaylandCandidatePanel::isPanel(*ls)) {
+                // 拖动靠按下时的隐式抓取收事件，离开了就收不到松开：按当下位置收尾（同 X11）
+                if (ls->dragging) {
+                    self->endPanelDrag(*ls, true);
+                }
+                self->panelPointerGone(*ls);
+                return;
+            }
             ls->hovered = false;
             if (!ls->dragging) {
                 self->armOverlayHide(ls->kind); // 交互结束：重新给满一份时长
@@ -171,6 +187,15 @@ struct WaylandListeners {
             self->layerPtrY_ = wl_fixed_to_double(y);
             // 有 relative-pointer 时拖动走相对位移（见 relMotion）；绝对坐标是相对 surface 的，
             // surface 自己在跟着动，按它算会把还没生效的移动重复计入，气泡来回乱跳。
+            if (WaylandCandidatePanel::isPanel(*ls)) {
+                if (!ls->dragging) {
+                    self->panelPointer(*ls, PANEL_POINTER_MOTION, 0);
+                } else if (!self->relPtr_) {
+                    self->movePanelDrag(*ls, int32_t(std::lround(self->layerPtrX_ - ls->grabX)),
+                                        int32_t(std::lround(self->layerPtrY_ - ls->grabY)));
+                }
+                return;
+            }
             if (ls->dragging && !self->relPtr_) {
                 self->moveStatusDrag(*ls, self->layerPtrX_, self->layerPtrY_);
             }
@@ -205,6 +230,30 @@ struct WaylandListeners {
         }
         if (self->screenMenu_) {
             return; // 底板没映射上之前的点击：不当作别的交互
+        }
+        if (LayerSurf* ls = self->pointerLayer_; ls && WaylandCandidatePanel::isPanel(*ls)) {
+            // 工具栏 / 软键盘：按 X11 的编号（左 1 中 2 右 3）报，侧键等不报（Windows 两个窗口都不处理）
+            const uint32_t b = button == kBtnLeft ? 1 : button == kBtnMiddle ? 2 : button == kBtnRight ? 3 : 0;
+            if (ls->dragging) {
+                // 拖动中：只认左键松开收尾；别的键服务端没见过这次拖动的按下，也不让它看到
+                if (b == 1 && !pressed) {
+                    self->endPanelDrag(*ls, true);
+                }
+                return;
+            }
+            if (b == 0) {
+                return;
+            }
+            if (pressed) {
+                const auto [px, py] = self->panelPointerPos();
+                if (overlayPressAction(ls->kind, uint8_t(b), px, py, ls->geo.drag) == OverlayPress::Drag) {
+                    // 拖动区里的左键：本端拖，按下不转给服务端（它会自己再报一次「已移动」，与 pos.* 重复）
+                    self->beginPanelDrag(*ls);
+                    return;
+                }
+            }
+            self->panelPointer(*ls, pressed ? PANEL_POINTER_PRESS : PANEL_POINTER_RELEASE, b);
+            return;
         }
         if (LayerSurf* ls = self->pointerLayer_) {
             if (ls->kind == OVERLAY_KIND_STATUS && button == kBtnLeft) {
@@ -270,6 +319,14 @@ struct WaylandListeners {
     static void ptrAxis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value)
     {
         auto* self = static_cast<WaylandCandidatePanel*>(data);
+        if (LayerSurf* ls = self->pointerLayer_; ls && WaylandCandidatePanel::isPanel(*ls)) {
+            // 工具栏 / 软键盘：同 X11 的滚轮按钮编号，4 = 上、5 = 下（正值 = 向下）
+            if (!ls->dragging && !self->screenMenu_ && axis == WL_POINTER_AXIS_VERTICAL_SCROLL
+                && value != 0) {
+                self->panelPointer(*ls, PANEL_POINTER_WHEEL, value > 0 ? 5 : 4);
+            }
+            return;
+        }
         // 只认竖直滚轮（axis 0）；正值 = 向下，协议上「正 = 上滚」与它相反。
         if (!self->pointerInside_ || axis != WL_POINTER_AXIS_VERTICAL_SCROLL || value == 0
             || !self->cb_.scroll) {
@@ -283,7 +340,11 @@ struct WaylandListeners {
     {
         auto* self = static_cast<WaylandCandidatePanel*>(data);
         if (LayerSurf* ls = self->pointerLayer_; ls && ls->dragging) {
-            self->moveStatusDragBy(*ls, wl_fixed_to_double(dx), wl_fixed_to_double(dy));
+            if (WaylandCandidatePanel::isPanel(*ls)) {
+                self->movePanelDragBy(*ls, wl_fixed_to_double(dx), wl_fixed_to_double(dy));
+            } else {
+                self->moveStatusDragBy(*ls, wl_fixed_to_double(dx), wl_fixed_to_double(dy));
+            }
         }
     }
 
@@ -318,6 +379,22 @@ struct WaylandListeners {
         auto* ls = static_cast<WaylandCandidatePanel::LayerSurf*>(data);
         ls->owner->layerClosed(*ls);
     }
+    static void probeConfigure(void* data, zwlr_layer_surface_v1*, uint32_t serial, uint32_t w,
+                               uint32_t h)
+    {
+        auto* o = static_cast<WaylandCandidatePanel::Output*>(data);
+        o->owner->probeConfigured(*o, serial, w, h);
+    }
+    static void probeClosed(void* data, zwlr_layer_surface_v1*)
+    {
+        // 合成器收回了（输出要没了）：不再量，可用区退回整块输出；输出还在的话要等下一次 onGlobal 才补建。
+        auto* o = static_cast<WaylandCandidatePanel::Output*>(data);
+        WaylandCandidatePanel* self = o->owner;
+        self->destroyWorkProbe(*o, true);
+        if (self->onWorkChanged_) {
+            self->onWorkChanged_();
+        }
+    }
 
     // ── 输出与缩放 ──
     static void outGeometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t,
@@ -334,13 +411,24 @@ struct WaylandListeners {
         }
     }
     static void outDone(void*, wl_output*) {}
+    static void outName(void* data, wl_output*, const char* name)
+    {
+        auto* o = static_cast<WaylandCandidatePanel::Output*>(data);
+        o->wlName = name ? name : "";
+    }
+    static void outDesc(void*, wl_output*, const char*) {}
     static void outScale(void* data, wl_output*, int32_t factor)
     {
         auto* o = static_cast<WaylandCandidatePanel::Output*>(data);
         o->scaleInt = factor > 0 ? factor : 1;
         o->owner->scaleMaybeChanged();
     }
-    static void xdgPos(void*, zxdg_output_v1*, int32_t, int32_t) {}
+    static void xdgPos(void* data, zxdg_output_v1*, int32_t x, int32_t y)
+    {
+        auto* o = static_cast<WaylandCandidatePanel::Output*>(data);
+        o->logX = x;
+        o->logY = y;
+    }
     static void xdgSize(void* data, zxdg_output_v1*, int32_t w, int32_t h)
     {
         auto* o = static_cast<WaylandCandidatePanel::Output*>(data);
@@ -396,12 +484,23 @@ const wl_registry_listener kRegistryListener = {WaylandListeners::registryGlobal
 const wl_buffer_listener kBufferListener = {WaylandListeners::bufferRelease};
 const zwp_input_popup_surface_v2_listener kPopupListener = {WaylandListeners::popupRect};
 const wl_callback_listener kRetiredSyncListener = {WaylandListeners::retiredSynced};
+// name / description 是 wl_output v4 的事件（libwayland 1.20 起的头文件才有）：头文件没有时只绑 v3，
+// 收不到名字（host.display 与 pos.* 都不报 output）。逐成员赋值免得各版本头文件成员数不同。
+#ifdef WL_OUTPUT_NAME_SINCE_VERSION
+constexpr uint32_t kOutputMaxVersion = 4;
+#else
+constexpr uint32_t kOutputMaxVersion = 3;
+#endif
 const wl_output_listener kOutputListener = [] {
-    wl_output_listener l{}; // 绑 v≤3：name / description（v4）不会来；逐成员赋值免得各版本头文件成员数不同
+    wl_output_listener l{};
     l.geometry = WaylandListeners::outGeometry;
     l.mode = WaylandListeners::outMode;
     l.done = WaylandListeners::outDone;
     l.scale = WaylandListeners::outScale;
+#ifdef WL_OUTPUT_NAME_SINCE_VERSION
+    l.name = WaylandListeners::outName;
+    l.description = WaylandListeners::outDesc;
+#endif
     return l;
 }();
 const zxdg_output_v1_listener kXdgOutputListener = [] {
@@ -433,6 +532,12 @@ const zwlr_layer_surface_v1_listener kLayerListener = [] {
     l.closed = WaylandListeners::layerClosed;
     return l;
 }();
+const zwlr_layer_surface_v1_listener kProbeListener = [] {
+    zwlr_layer_surface_v1_listener l{};
+    l.configure = WaylandListeners::probeConfigure;
+    l.closed = WaylandListeners::probeClosed;
+    return l;
+}();
 } // namespace
 
 // 绑的是 wl_pointer v1，较新的 frame / axis_* 事件不会来；逐成员赋值免得各版本头文件的成员数不同而告警。
@@ -452,6 +557,10 @@ WaylandCandidatePanel::WaylandCandidatePanel(fcitx::Instance* instance) : instan
     statusLs_.kind = OVERLAY_KIND_STATUS;
     toastLs_.owner = this;
     toastLs_.kind = OVERLAY_KIND_TOAST;
+    for (uint32_t i = 0; i < 2; ++i) {
+        panels_[i].owner = this;
+        panels_[i].kind = OVERLAY_KIND_TOOLBAR + i;
+    }
     menuIdleMs_ = menuIdleTimeoutMs(std::getenv("WIND_MENU_IDLE_TIMEOUT_MS"));
     menuMaxMs_ = menuMaxGrabMs(std::getenv("WIND_MENU_MAX_GRAB_MS"));
     // wayland 模块：Fcitx5 自己开的 Wayland 连接。回调对已存在的连接也会补调一次。
@@ -472,6 +581,7 @@ WaylandCandidatePanel::~WaylandCandidatePanel()
 {
     connCreated_.reset();
     connClosed_.reset();
+    cb_ = Callbacks{}; // 拆连接时会补报面板的离开：析构途中不回调引擎
     teardown(display_ != nullptr);
 }
 
@@ -518,7 +628,8 @@ void WaylandCandidatePanel::onGlobal(uint32_t name, const char* iface, uint32_t 
         auto o = std::make_unique<Output>();
         o->owner = this;
         o->name = name;
-        const uint32_t v = version < 3 ? version : 3;
+        const uint32_t v = version < kOutputMaxVersion ? version : kOutputMaxVersion;
+        o->version = v;
         o->wl = static_cast<wl_output*>(wl_registry_bind(registry_, name, &wl_output_interface, v));
         wl_output_add_listener(o->wl, &kOutputListener, o.get());
         attachXdgOutput(*o);
@@ -538,6 +649,9 @@ void WaylandCandidatePanel::onGlobal(uint32_t name, const char* iface, uint32_t 
         WIND_INFO() << "layer-shell v" << layerShellVersion_ << " 可用";
         layerShell_ = static_cast<zwlr_layer_shell_v1*>(
             wl_registry_bind(registry_, name, &zwlr_layer_shell_v1_interface, layerShellVersion_));
+        if (onLayerShell_) {
+            onLayerShell_();
+        }
     } else if (std::strcmp(iface, "wl_subcompositor") == 0 && !subcomp_) {
         subcomp_ = static_cast<wl_subcompositor*>(
             wl_registry_bind(registry_, name, &wl_subcompositor_interface, 1));
@@ -557,6 +671,8 @@ void WaylandCandidatePanel::onGlobal(uint32_t name, const char* iface, uint32_t 
         seat_ = static_cast<wl_seat*>(wl_registry_bind(registry_, name, &wl_seat_interface, 1));
         wl_seat_add_listener(seat_, &kSeatListener, this);
     }
+    // 输出、compositor、layer-shell 到达的先后不定：哪个最后到，哪次补建。
+    ensureWorkProbes();
 }
 
 void WaylandCandidatePanel::attachXdgOutput(Output& o)
@@ -601,6 +717,10 @@ void WaylandCandidatePanel::scaleMaybeChanged()
 
 void WaylandCandidatePanel::teardown(bool alive)
 {
+    // 面板随连接没了：指针还在上面的话补报离开（服务端的悬停 / 按下态要收掉）
+    for (LayerSurf& ls : panels_) {
+        panelPointerGone(ls);
+    }
     if (alive) {
         for (auto& m : menuSurfs_) {
             if (m.sub) {
@@ -631,7 +751,7 @@ void WaylandCandidatePanel::teardown(bool alive)
         if (relPtrMgr_) {
             zwp_relative_pointer_manager_v1_destroy(relPtrMgr_);
         }
-        for (LayerSurf* ls : {&statusLs_, &toastLs_}) {
+        for (LayerSurf* ls : {&statusLs_, &toastLs_, &panels_[0], &panels_[1]}) {
             if (ls->layer) {
                 zwlr_layer_surface_v1_destroy(ls->layer);
             }
@@ -670,6 +790,7 @@ void WaylandCandidatePanel::teardown(bool alive)
             wp_viewporter_destroy(viewporter_);
         }
         for (auto& o : outputs_) {
+            destroyWorkProbe(*o, true);
             if (o->xdg) {
                 zxdg_output_v1_destroy(o->xdg);
             }
@@ -697,13 +818,18 @@ void WaylandCandidatePanel::teardown(bool alive)
             wl_display_flush(display_);
         }
     }
-    for (LayerSurf* ls : {&statusLs_, &toastLs_}) {
+    for (LayerSurf* ls : {&statusLs_, &toastLs_, &panels_[0], &panels_[1]}) {
         ls->surface = nullptr;
         ls->layer = nullptr;
         ls->viewport = nullptr;
         ls->configured = ls->waiting = ls->mapped = ls->wanted = false;
         ls->hovered = ls->dragging = false;
+        ls->outputName = ls->boundOutput = 0;
+        ls->reqValid = false;
     }
+    pendingPanelMotion_.reset();
+    disarm(panelMotionFlush_);
+    disarm(panelRetry_);
     for (auto& m : menuSurfs_) {
         m.surface = nullptr;
         m.sub = nullptr;
@@ -717,6 +843,12 @@ void WaylandCandidatePanel::teardown(bool alive)
     subcomp_ = nullptr;
     screenMenu_ = false;
     pendingMenu_.reset();
+    for (auto& q : queuedMenus_) {
+        q.reset();
+    }
+    catcherOutput_ = 0;
+    menuOriginX_ = menuOriginY_ = 0;
+    panelMenu_.clear();
     menuPtrSurface_ = nullptr;
     pointerLayer_ = nullptr;
     relPtr_ = nullptr;
@@ -898,6 +1030,9 @@ bool WaylandCandidatePanel::show(fcitx::InputContext* ic, const SharedFrame& f)
 bool WaylandCandidatePanel::showOverlay(fcitx::InputContext* ic, uint32_t kind,
                                         const SharedFrame& f, const OverlayFramePayload& geo)
 {
+    if (isPanelOverlayKind(kind)) {
+        return showPanel(kind, f, geo);
+    }
     if (kind < 1 || kind >= kLayers) {
         return false;
     }
@@ -959,6 +1094,10 @@ void WaylandCandidatePanel::armOverlayHide(uint32_t kind)
 
 void WaylandCandidatePanel::hideOverlay(uint32_t kind)
 {
+    if (LayerSurf* ls = panelSurf(kind)) {
+        hidePanel(*ls);
+        return;
+    }
     if (kind < 1 || kind >= kLayers || !layers_[kind].on) {
         return;
     }
@@ -1261,6 +1400,9 @@ bool WaylandCandidatePanel::showMenuLevel(fcitx::InputContext* ic, uint32_t leve
     if (level >= kMenuLevels) {
         return false;
     }
+    if (!screenMenu_ && panelMenuPending()) {
+        openPanelMenu();
+    }
     if (screenMenu_) {
         return showScreenMenuLevel(level, f, p);
     }
@@ -1463,13 +1605,32 @@ WaylandCandidatePanel::LayerSurf* WaylandCandidatePanel::layerSurfOf(wl_surface*
     if (!s) {
         return nullptr;
     }
-    return s == statusLs_.surface ? &statusLs_ : s == toastLs_.surface ? &toastLs_ : nullptr;
+    for (LayerSurf* ls : {&statusLs_, &toastLs_, &panels_[0], &panels_[1]}) {
+        if (s == ls->surface) {
+            return ls;
+        }
+    }
+    return nullptr;
+}
+
+WaylandCandidatePanel::LayerSurf* WaylandCandidatePanel::panelSurf(uint32_t kind)
+{
+    return isPanelOverlayKind(kind) ? &panels_[kind - OVERLAY_KIND_TOOLBAR] : nullptr;
+}
+
+bool WaylandCandidatePanel::isPanel(const LayerSurf& ls)
+{
+    return isPanelOverlayKind(ls.kind);
 }
 
 bool WaylandCandidatePanel::wantsLayer(uint32_t kind, const OverlayFramePayload& geo) const
 {
     // 屏幕锚点（Toast 全部、气泡的屏幕锚点模式）与固定位置（气泡拖过 / 设了固定）按屏幕摆；
     // 跟随光标（FLIP）、跟随候选（tooltip）只能留在 popup 里由合成器按光标摆。
+    // 工具栏 / 软键盘常驻屏幕，一律走 layer-shell。
+    if (layerShell_ && isPanelOverlayKind(kind)) {
+        return true;
+    }
     if (!layerShell_ || (kind != OVERLAY_KIND_STATUS && kind != OVERLAY_KIND_TOAST)) {
         return false;
     }
@@ -1479,15 +1640,8 @@ bool WaylandCandidatePanel::wantsLayer(uint32_t kind, const OverlayFramePayload&
 std::pair<int32_t, int32_t> WaylandCandidatePanel::outputLogicalSize() const
 {
     const Output* o = currentOutput_ ? currentOutput_ : (outputs_.empty() ? nullptr : outputs_[0].get());
-    if (o) {
-        const double s = std::max(1.0, outputScale(*o));
-        const int32_t w = o->logW > 0 ? o->logW : int32_t(o->modeW / s);
-        const int32_t h = o->logH > 0 ? o->logH : int32_t(o->modeH / s);
-        if (w > 0 && h > 0) {
-            return {w, h};
-        }
-    }
-    return {1920, 1080};
+    const Rect r = o ? outputLogicalRect(*o) : noOutputRect();
+    return {r.w, r.h};
 }
 
 void WaylandCandidatePanel::placeLayer(LayerSurf& ls)
@@ -1542,6 +1696,11 @@ void WaylandCandidatePanel::showOnLayer(LayerSurf& ls, const SharedFrame& f,
     WIND_DEBUG() << "layer 浮层 kind=" << ls.kind << " place=" << geo.place << " anchor(wire)=" << geo.anchor
                 << " " << ls.lw << "x" << ls.lh << " 锚定边=" << ls.anchor << " 边距 t" << ls.mTop << " r"
                 << ls.mRight << " b" << ls.mBottom << " l" << ls.mLeft << " 已映射=" << ls.mapped;
+    mapLayer(ls);
+}
+
+void WaylandCandidatePanel::mapLayer(LayerSurf& ls)
+{
     if (!ls.surface) {
         ls.surface = wl_compositor_create_surface(compositor_);
         // 同 popup 的 surface：classicui 会把它的 user_data 当自己的窗口包装对象读（见 ensurePopup）。
@@ -1549,10 +1708,19 @@ void WaylandCandidatePanel::showOnLayer(LayerSurf& ls, const SharedFrame& f,
         wl_surface_set_user_data(ls.surface, ls.fakeUserData);
     }
     if (!ls.layer) {
-        // 输出传空：由合成器挑（通常是当前焦点所在的输出）。OVERLAY 层在任务栏（TOP 层）之上。
+        // 气泡 / Toast 的输出传空：由合成器挑（通常是当前焦点所在的输出）。OVERLAY 层在任务栏
+        // （TOP 层）之上。工具栏 / 软键盘按自己的坐标定了输出，放 TOP 层：全屏应用能盖住它们
+        // （Wayland 拿不到前台全屏状态，全屏隐藏靠这个近似），也不压过锁屏和通知。
+        const bool panel = isPanel(ls);
+        const Output* out = panel ? outputByName(ls.outputName) : nullptr;
+        const char* ns = ls.kind == OVERLAY_KIND_TOAST           ? "windinput-toast"
+                         : ls.kind == OVERLAY_KIND_TOOLBAR      ? "windinput-toolbar"
+                         : ls.kind == OVERLAY_KIND_SOFTKEYBOARD ? "windinput-softkeyboard"
+                                                                : "windinput-status";
         ls.layer = zwlr_layer_shell_v1_get_layer_surface(
-            layerShell_, ls.surface, nullptr, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
-            ls.kind == OVERLAY_KIND_TOAST ? "windinput-toast" : "windinput-status");
+            layerShell_, ls.surface, out ? out->wl : nullptr,
+            panel ? ZWLR_LAYER_SHELL_V1_LAYER_TOP : ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, ns);
+        ls.boundOutput = ls.outputName;
         zwlr_layer_surface_v1_add_listener(ls.layer, &kLayerListener, &ls);
         zwlr_layer_surface_v1_set_keyboard_interactivity(ls.layer, 0); // 不抢键盘
         // 0 = 自己不占独占区，但避让别人的（任务栏），锚在底边时落在任务栏上方
@@ -1632,12 +1800,24 @@ void WaylandCandidatePanel::layerClosed(LayerSurf& ls)
 {
     // 合成器收回了这个层（如所在输出被拔掉）：丢掉角色对象，surface 留着，下次显示重建角色
     WIND_DEBUG() << "layer surface kind=" << ls.kind << " 被合成器关闭";
+    const bool wasLive = ls.configured;
     if (ls.layer) {
         zwlr_layer_surface_v1_destroy(ls.layer);
         ls.layer = nullptr;
     }
     ls.configured = ls.waiting = ls.mapped = false;
     ls.dragging = false;
+    if (isPanel(ls)) {
+        panelPointerGone(ls);
+        // 常驻的面板不能等服务端下一帧（可能很久不来）：按现有输出重摆。刚建就被关（没 configure
+        // 过）的不重试，免得合成器一直拒、这边一直建
+        if (ls.wanted && wasLive) {
+            ls.reqValid = false;
+            armTimer(panelRetry_, 0, &WaylandCandidatePanel::onPanelRetry);
+        } else if (ls.wanted) {
+            WIND_WARN() << "layer surface kind=" << ls.kind << " 未映射就被合成器关闭，不再重试";
+        }
+    }
 }
 
 std::pair<int32_t, int32_t> WaylandCandidatePanel::layerTopLeft(const LayerSurf& ls) const
@@ -1751,6 +1931,400 @@ std::optional<std::pair<int32_t, int32_t>> WaylandCandidatePanel::statusContentO
                           int32_t(std::lround(y * sc)) + statusLs_.geo.contentY);
 }
 
+// ── 工具栏 / 软键盘（wlr-layer-shell，TOP 层）──────────────────────────────
+
+Rect WaylandCandidatePanel::outputLogicalRect(const Output& o)
+{
+    const double s = std::max(1.0, outputScale(o));
+    const int32_t w = o.logW > 0 ? o.logW : int32_t(o.modeW / s);
+    const int32_t h = o.logH > 0 ? o.logH : int32_t(o.modeH / s);
+    const Rect none = (w > 0 && h > 0) ? Rect{} : noOutputRect();
+    return Rect{o.logX, o.logY, w > 0 ? w : none.w, h > 0 ? h : none.h};
+}
+
+Rect WaylandCandidatePanel::usableLogicalRect(const Output& o)
+{
+    return layerUsableArea(outputLogicalRect(o), o.availW, o.availH);
+}
+
+Rect WaylandCandidatePanel::noOutputRect()
+{
+    WIND_DEBUG() << "没有可用的输出尺寸，按 1920x1080 兜底";
+    return Rect{0, 0, 1920, 1080};
+}
+
+void WaylandCandidatePanel::ensureWorkProbes()
+{
+    if (!compositor_ || !layerShell_) {
+        return;
+    }
+    for (auto& op : outputs_) {
+        Output& o = *op;
+        if (o.probe) {
+            continue;
+        }
+        if (!o.probeSurface) {
+            o.probeSurface = wl_compositor_create_surface(compositor_);
+            wl_surface_set_user_data(o.probeSurface, o.fakeUserData); // 同 mapLayer
+        }
+        // 层与面板相同（TOP）；独占区 0 = 自己不占、但避让别人的，与面板受的约束一致。
+        o.probe = zwlr_layer_shell_v1_get_layer_surface(layerShell_, o.probeSurface, o.wl,
+                                                        ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+                                                        "windinput-probe");
+        zwlr_layer_surface_v1_add_listener(o.probe, &kProbeListener, &o);
+        zwlr_layer_surface_v1_set_keyboard_interactivity(o.probe, 0);
+        zwlr_layer_surface_v1_set_exclusive_zone(o.probe, 0);
+        zwlr_layer_surface_v1_set_anchor(o.probe, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
+                                                      | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
+                                                      | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
+                                                      | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+        zwlr_layer_surface_v1_set_size(o.probe, 0, 0);
+        // 只做这一次空提交换 configure；之后从不贴 buffer，surface 一直不映射。
+        wl_surface_commit(o.probeSurface);
+    }
+    if (display_) {
+        wl_display_flush(display_);
+    }
+}
+
+void WaylandCandidatePanel::destroyWorkProbe(Output& o, bool alive)
+{
+    if (alive) {
+        if (o.probe) {
+            zwlr_layer_surface_v1_destroy(o.probe);
+        }
+        if (o.probeSurface) {
+            wl_surface_destroy(o.probeSurface);
+        }
+    }
+    o.probe = nullptr;
+    o.probeSurface = nullptr;
+    o.availW = o.availH = 0;
+}
+
+void WaylandCandidatePanel::probeConfigured(Output& o, uint32_t serial, uint32_t w, uint32_t h)
+{
+    zwlr_layer_surface_v1_ack_configure(o.probe, serial);
+    if (int32_t(w) == o.availW && int32_t(h) == o.availH) {
+        return;
+    }
+    o.availW = int32_t(w);
+    o.availH = int32_t(h);
+    WIND_DEBUG() << "输出 " << (o.wlName.empty() ? std::to_string(o.name) : o.wlName) << " 可用区 "
+                 << w << "x" << h;
+    if (onWorkChanged_) {
+        onWorkChanged_();
+    }
+}
+
+WaylandCandidatePanel::Output* WaylandCandidatePanel::outputByName(uint32_t name) const
+{
+    for (const auto& o : outputs_) {
+        if (o->name == name) {
+            return o.get();
+        }
+    }
+    return nullptr;
+}
+
+void WaylandCandidatePanel::onGlobalRemove(uint32_t name)
+{
+    auto it = std::find_if(outputs_.begin(), outputs_.end(),
+                           [name](const auto& o) { return o->name == name; });
+    if (it == outputs_.end()) {
+        return;
+    }
+    Output* o = it->get();
+    WIND_INFO() << "输出 " << (o->wlName.empty() ? std::to_string(name) : o->wlName) << " 已移除";
+    if (currentOutput_ == o) {
+        currentOutput_ = nullptr;
+    }
+    destroyWorkProbe(*o, true);
+    if (o->xdg) {
+        zxdg_output_v1_destroy(o->xdg);
+    }
+    if (o->version >= 3) {
+        wl_output_release(o->wl);
+    } else {
+        wl_output_destroy(o->wl);
+    }
+    outputs_.erase(it);
+    // 面板在这块屏上：换到还在的屏上重摆（合成器多半也会发 closed，重摆是幂等的）
+    for (LayerSurf& ls : panels_) {
+        if (ls.wanted && ls.outputName == name) {
+            ls.reqValid = false;
+            armTimer(panelRetry_, 0, &WaylandCandidatePanel::onPanelRetry);
+        }
+    }
+    scaleMaybeChanged();
+}
+
+std::optional<HostOutput> WaylandCandidatePanel::hostOutput() const
+{
+    if (!layerShell_ || !ready()) {
+        return std::nullopt;
+    }
+    const Output* o = currentOutput_ ? currentOutput_ : (outputs_.empty() ? nullptr : outputs_[0].get());
+    if (!o) {
+        return std::nullopt;
+    }
+    HostOutput out;
+    out.name = o->wlName;
+    out.work = scaleRect(usableLogicalRect(*o), reportedScale_);
+    return out;
+}
+
+bool WaylandCandidatePanel::showPanel(uint32_t kind, const SharedFrame& f, const OverlayFramePayload& p)
+{
+    LayerSurf* ls = panelSurf(kind);
+    if (!ls) {
+        return false;
+    }
+    if (!layerShell_) {
+        if (!warnedNoLayerShell_) {
+            warnedNoLayerShell_ = true;
+            WIND_WARN() << "合成器没有 wlr-layer-shell：Wayland 下不显示工具栏 / 软键盘";
+        }
+        return false;
+    }
+    if (!ready() || f.width == 0 || f.height == 0 || f.stride < f.width * 4
+        || f.bgra.size() < size_t(f.stride) * f.height) {
+        return false;
+    }
+    OverlayFramePayload geo = p;
+    geo.width = f.width;
+    geo.height = f.height;
+    const double sc = reportedScale_;
+    ls->frame = f;
+    ls->lw = std::max(1, int32_t(std::lround(f.width / sc)));
+    ls->lh = std::max(1, int32_t(std::lround(f.height / sc)));
+    if (ls->mapped
+        && (ls->dragging
+            || (ls->reqValid && p.x == ls->reqX && p.y == ls->reqY && f.width == ls->pixW
+                && f.height == ls->pixH))) {
+        // 拖动中：只换像素、不挪——服务端还不知道新位置，帧里是拖动前的坐标。
+        // 原地重绘（悬停高亮、按键反馈…）：沿用上次的落位；拖完到服务端回新坐标之前来的帧也走这里。
+    } else {
+        // EXACT 原样摆，再夹进窗口中心所在输出（不在任何输出上取候选窗所在的那块）：服务端记下的
+        // 位置可能在换过布局的屏幕外面。
+        std::vector<Rect> logical, px;
+        for (const auto& o : outputs_) {
+            logical.push_back(outputLogicalRect(*o));
+            px.push_back(scaleRect(logical.back(), sc));
+        }
+        int fallback = 0;
+        for (size_t i = 0; i < outputs_.size(); ++i) {
+            if (outputs_[i].get() == currentOutput_) {
+                fallback = int(i);
+            }
+        }
+        const Rect wa = px.empty() ? scaleRect(noOutputRect(), sc) : px[size_t(fallback)];
+        Rect r = placeOverlay(geo, wa, 0, 0);
+        const int i = panelOutputIndex(px, r, fallback);
+        // 夹进可用区（不压任务栏）；边距只用原点，与整块输出相同。
+        Rect outLogical = noOutputRect();
+        ls->outputName = 0;
+        if (i >= 0) {
+            outLogical = usableLogicalRect(*outputs_[size_t(i)]);
+            ls->outputName = outputs_[size_t(i)]->name;
+        }
+        r = clampToWorkArea(r, scaleRect(outLogical, sc));
+        const auto [ml, mt] = layerMarginFor(r.x, r.y, outLogical, sc);
+        ls->anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT;
+        ls->mLeft = ml;
+        ls->mTop = mt;
+        ls->mRight = ls->mBottom = 0;
+        ls->reqValid = true;
+        ls->reqX = p.x;
+        ls->reqY = p.y;
+        ls->pixW = f.width;
+        ls->pixH = f.height;
+        WIND_DEBUG() << "layer 面板 kind=" << kind << " " << ls->lw << "x" << ls->lh << " 输出 "
+                     << (i >= 0 ? outputs_[size_t(i)]->wlName : std::string("?")) << " 边距 l" << ml
+                     << " t" << mt << " 已映射=" << ls->mapped;
+    }
+    ls->geo = geo;
+    ls->wanted = true;
+    if (ls->layer && ls->boundOutput != ls->outputName) {
+        // 换屏：layer surface 的输出建角色时就定了，只能连角色一起重建（指针在上面的话合成器会发离开）
+        hideLayer(*ls);
+        ls->wanted = true;
+    }
+    mapLayer(*ls);
+    return true;
+}
+
+void WaylandCandidatePanel::hidePanel(LayerSurf& ls)
+{
+    if (!ls.wanted && !ls.layer) {
+        return;
+    }
+    WIND_DEBUG() << "layer 面板 kind=" << ls.kind << " 收起";
+    panelPointerGone(ls);
+    if (pointerLayer_ == &ls) {
+        pointerLayer_ = nullptr;
+    }
+    hideLayer(ls); // 连角色对象一起销毁（treeland 对无变化的重提交不发 configure），拖动作废不报
+    ls.reqValid = false;
+}
+
+std::pair<int32_t, int32_t> WaylandCandidatePanel::panelPointerPos() const
+{
+    return {int32_t(std::lround(layerPtrX_ * reportedScale_)),
+            int32_t(std::lround(layerPtrY_ * reportedScale_))};
+}
+
+void WaylandCandidatePanel::panelPointer(LayerSurf& ls, uint32_t event, uint32_t button)
+{
+    const auto [x, y] = panelPointerPos();
+    ls.pointerIn = event != PANEL_POINTER_LEAVE;
+    if (event == PANEL_POINTER_MOTION) {
+        // 每次上报都是一趟同步往返：本轮分发里的移动只报最后一个（同 X11 按批合并）
+        if (pendingPanelMotion_ && pendingPanelMotion_->kind != ls.kind) {
+            flushPanelMotion();
+        }
+        pendingPanelMotion_ = PanelMotion{ls.kind, x, y};
+        armTimer(panelMotionFlush_, 0, &WaylandCandidatePanel::flushPanelMotion);
+        return;
+    }
+    flushPanelMotion(); // 保序：积着的移动先报
+    if (event == PANEL_POINTER_PRESS || event == PANEL_POINTER_RELEASE) {
+        // 服务端可能因此开菜单（右键在按下时、设置键在松开时）：记下面板在哪块屏上
+        panelMenu_.note(ls.boundOutput, fcitx::now(CLOCK_MONOTONIC));
+    }
+    if (cb_.panelPointer) {
+        cb_.panelPointer(ls.kind, event, button, x, y);
+    }
+}
+
+bool WaylandCandidatePanel::panelMenuPending() const
+{
+    // 菜单帧在服务端处理完这次按下后紧接着推来；窗口容得下一次卡顿。期间本端别处发起的菜单
+    // 请求会清掉它（clearPanelMenuPending）
+    return layerShell_ && subcomp_ && ready() && panelMenu_.pending(fcitx::now(CLOCK_MONOTONIC));
+}
+
+void WaylandCandidatePanel::openPanelMenu()
+{
+    closeMenu(); // popup 里若还开着菜单，先收（不报：服务端开新菜单时自己会关旧的）
+    screenMenu_ = true;
+    screenMenuShown_ = false;
+    pendingMenu_.reset(); // 菜单已由服务端开好，不用再请求
+    catcherOutput_ = panelMenu_.take(); // 一次按下只认一个菜单
+    menuOriginX_ = menuOriginY_ = 0;
+    if (const Output* o = outputByName(catcherOutput_)) {
+        const Rect r = scaleRect(outputLogicalRect(*o), reportedScale_);
+        menuOriginX_ = r.x;
+        menuOriginY_ = r.y;
+    }
+    WIND_DEBUG() << "面板发起的菜单：底板开在输出 " << catcherOutput_ << "，原点 (" << menuOriginX_ << ","
+                 << menuOriginY_ << ")";
+    armTimer(menuMax_, menuMaxMs_, &WaylandCandidatePanel::onMenuMaxExpired);
+    armTimer(menuIdle_, menuIdleMs_, &WaylandCandidatePanel::onMenuIdleExpired);
+    armTimer(menuWait_, 2000, &WaylandCandidatePanel::onMenuWaitExpired); // 底板迟迟映射不上
+    showCatcher();
+}
+
+void WaylandCandidatePanel::flushPanelMotion()
+{
+    if (!pendingPanelMotion_) {
+        return;
+    }
+    const PanelMotion m = *pendingPanelMotion_;
+    pendingPanelMotion_.reset();
+    if (cb_.panelPointer) {
+        cb_.panelPointer(m.kind, PANEL_POINTER_MOTION, 0, m.x, m.y);
+    }
+}
+
+void WaylandCandidatePanel::panelPointerGone(LayerSurf& ls)
+{
+    if (!ls.pointerIn) {
+        return;
+    }
+    ls.pointerIn = false;
+    flushPanelMotion();
+    // 坐标无意义：服务端的 LEAVE 不更新「最后指针」。
+    if (cb_.panelPointer) {
+        cb_.panelPointer(ls.kind, PANEL_POINTER_LEAVE, 0, 0, 0);
+    }
+}
+
+void WaylandCandidatePanel::beginPanelDrag(LayerSurf& ls)
+{
+    if (!ls.layer || !ls.mapped) {
+        return;
+    }
+    flushPanelMotion();
+    ls.dragging = true;
+    ls.grabX = layerPtrX_;
+    ls.grabY = layerPtrY_;
+    dragAccX_ = dragAccY_ = 0;
+    WIND_DEBUG() << "开始拖动 layer 面板 kind=" << ls.kind << " @(" << ls.mLeft << "," << ls.mTop
+                 << ") 相对指针 " << (relPtr_ ? "有" : "无");
+}
+
+void WaylandCandidatePanel::movePanelDrag(LayerSurf& ls, int32_t dx, int32_t dy)
+{
+    if (!ls.layer || (dx == 0 && dy == 0)) {
+        return;
+    }
+    // 整幅位图夹在所在输出里（同 X11 拖动按输出工作区夹）。layer surface 的输出建角色时就定了，
+    // 拖不到别的屏上去。
+    const Output* o = outputByName(ls.boundOutput);
+    const Rect out = o ? usableLogicalRect(*o) : noOutputRect();
+    const Rect r = clampToWorkArea(Rect{ls.mLeft + dx, ls.mTop + dy, ls.lw, ls.lh}, Rect{0, 0, out.w, out.h});
+    if (r.x == ls.mLeft && r.y == ls.mTop) {
+        return;
+    }
+    ls.mLeft = r.x;
+    ls.mTop = r.y;
+    zwlr_layer_surface_v1_set_margin(ls.layer, ls.mTop, 0, 0, ls.mLeft);
+    wl_surface_commit(ls.surface);
+    wl_display_flush(display_);
+}
+
+void WaylandCandidatePanel::movePanelDragBy(LayerSurf& ls, double dx, double dy)
+{
+    dragAccX_ += dx;
+    dragAccY_ += dy;
+    const int32_t ix = int32_t(dragAccX_), iy = int32_t(dragAccY_);
+    dragAccX_ -= ix;
+    dragAccY_ -= iy;
+    movePanelDrag(ls, ix, iy);
+}
+
+void WaylandCandidatePanel::endPanelDrag(LayerSurf& ls, bool report)
+{
+    if (!ls.dragging) {
+        return;
+    }
+    ls.dragging = false;
+    if (!report || !ls.mapped || !cb_.panelMoved) {
+        return;
+    }
+    // 松手只报这一次 `pos.*`（拖动中的移动一个都不回传）；输出名与 host.display 同源。
+    const Output* o = outputByName(ls.boundOutput);
+    const Rect out = o ? outputLogicalRect(*o) : noOutputRect();
+    const auto [x, y] = layerOriginFor(ls.mLeft, ls.mTop, out, reportedScale_);
+    const std::string name = o ? o->wlName : std::string();
+    WIND_DEBUG() << "layer 面板 kind=" << ls.kind << " 拖动松手，上报内容左上 (" << x + ls.geo.contentX
+                 << "," << y + ls.geo.contentY << ") output=" << name;
+    cb_.panelMoved(ls.kind, x + ls.geo.contentX, y + ls.geo.contentY, name);
+}
+
+void WaylandCandidatePanel::onPanelRetry()
+{
+    for (LayerSurf& ls : panels_) {
+        if (ls.wanted && !ls.dragging) {
+            const SharedFrame f = ls.frame;
+            const OverlayFramePayload geo = ls.geo;
+            ls.reqValid = false;
+            showPanel(ls.kind, f, geo);
+        }
+    }
+}
+
 // ── 屏幕坐标系的菜单（状态气泡右键）──────────────────────────────────
 
 void WaylandCandidatePanel::armTimer(std::unique_ptr<fcitx::EventSourceTime>& t, uint32_t ms,
@@ -1811,6 +2385,9 @@ void WaylandCandidatePanel::openScreenMenu(int32_t target, int32_t x, int32_t y,
     screenMenu_ = true;
     screenMenuShown_ = false;
     pendingMenu_ = PendingMenu{target, x, y, locate};
+    panelMenu_.clear(); // 本端请求的菜单，不是面板的
+    catcherOutput_ = 0;
+    menuOriginX_ = menuOriginY_ = 0;
     layers_[OVERLAY_KIND_STATUS].hideTimer.reset(); // 菜单开着期间气泡不消失
     armTimer(menuMax_, menuMaxMs_, &WaylandCandidatePanel::onMenuMaxExpired);
     armTimer(menuIdle_, menuIdleMs_, &WaylandCandidatePanel::onMenuIdleExpired);
@@ -1831,8 +2408,10 @@ void WaylandCandidatePanel::showCatcher()
         wl_surface_set_user_data(catcher_.surface, catcher_.fakeUserData);
     }
     if (!catcher_.layer) {
+        const Output* out = outputByName(catcherOutput_);
         catcher_.layer = zwlr_layer_shell_v1_get_layer_surface(
-            layerShell_, catcher_.surface, nullptr, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "windinput-menu");
+            layerShell_, catcher_.surface, out ? out->wl : nullptr, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+            "windinput-menu");
         zwlr_layer_surface_v1_add_listener(catcher_.layer, &kCatcherListener, this);
         zwlr_layer_surface_v1_set_keyboard_interactivity(catcher_.layer, 0);
         // 铺满整个输出、无视别人的独占区：surface 坐标 = 输出坐标
@@ -1886,6 +2465,13 @@ void WaylandCandidatePanel::catcherConfigured(uint32_t serial, uint32_t w, uint3
     wl_display_flush(display_);
     catcher_.mapped = true;
     sendPendingMenu();
+    for (uint32_t level = 0; level < kMenuLevels; ++level) {
+        if (queuedMenus_[level]) {
+            const QueuedMenu q = std::move(*queuedMenus_[level]);
+            queuedMenus_[level].reset();
+            showScreenMenuLevel(level, q.frame, q.geo);
+        }
+    }
 }
 
 void WaylandCandidatePanel::sendPendingMenu()
@@ -1907,9 +2493,13 @@ void WaylandCandidatePanel::sendPendingMenu()
 bool WaylandCandidatePanel::showScreenMenuLevel(uint32_t level, const SharedFrame& f,
                                                 const OverlayFramePayload& p)
 {
-    if (!catcher_.mapped || f.width == 0 || f.height == 0
-        || f.bgra.size() < size_t(f.stride) * f.height) {
+    if (f.width == 0 || f.height == 0 || f.bgra.size() < size_t(f.stride) * f.height) {
         return false;
+    }
+    if (!catcher_.mapped) {
+        // 面板发起的菜单：帧比底板的 configure 先到，映射后补贴
+        queuedMenus_[level] = QueuedMenu{f, p};
+        return true;
     }
     disarm(menuWait_);
     armTimer(menuIdle_, menuIdleMs_, &WaylandCandidatePanel::onMenuIdleExpired);
@@ -1920,6 +2510,11 @@ bool WaylandCandidatePanel::showScreenMenuLevel(uint32_t level, const SharedFram
     OverlayFramePayload geo = p;
     geo.width = f.width;
     geo.height = f.height;
+    // 面板坐标 → 底板（输出）坐标；气泡菜单原点为 0
+    geo.x -= menuOriginX_;
+    geo.y -= menuOriginY_;
+    geo.altX -= menuOriginX_;
+    geo.altY -= menuOriginY_;
     const Rect wa{0, 0, int32_t(std::lround(catcher_.w * sc)), int32_t(std::lround(catcher_.h * sc))};
     const Rect r = placeOverlay(geo, wa, 0, 0);
     MenuSurf& m = menuSurfs_[level];
@@ -1956,6 +2551,7 @@ void WaylandCandidatePanel::hideScreenMenuLevel(uint32_t level)
     if (level >= kMenuLevels) {
         return;
     }
+    queuedMenus_[level].reset();
     MenuSurf& m = menuSurfs_[level];
     if (m.mapped && m.surface) {
         wl_surface_attach(m.surface, nullptr, 0, 0);
@@ -1972,6 +2568,8 @@ void WaylandCandidatePanel::hideScreenMenuLevel(uint32_t level)
         }
     }
     closeScreenMenu(nullptr); // 最后一级也收了：服务端关的菜单，不用再报
+    // 收的若是面板的菜单，紧接着的菜单帧（「更多…」的主菜单）照样认领到那块屏的底板上
+    panelMenu_.serverClosed(fcitx::now(CLOCK_MONOTONIC));
 }
 
 void WaylandCandidatePanel::closeScreenMenu(const char* reason)
@@ -1982,6 +2580,11 @@ void WaylandCandidatePanel::closeScreenMenu(const char* reason)
     WIND_DEBUG() << "收起屏幕菜单" << (reason ? std::string("：") + reason : std::string());
     screenMenu_ = false;
     pendingMenu_.reset();
+    for (auto& q : queuedMenus_) {
+        q.reset();
+    }
+    catcherOutput_ = 0;
+    menuOriginX_ = menuOriginY_ = 0;
     menuPtrSurface_ = nullptr;
     lastMenuMotion_.reset();
     disarm(menuWait_);
@@ -2035,8 +2638,9 @@ bool WaylandCandidatePanel::screenMenuOffset(wl_surface* s, int32_t& ox, int32_t
 void WaylandCandidatePanel::reportScreenMenuPointer(uint32_t event, uint32_t button)
 {
     const double sc = reportedScale_;
-    const int32_t x = int32_t(std::lround((menuPtrOffX_ + layerPtrX_) * sc));
-    const int32_t y = int32_t(std::lround((menuPtrOffY_ + layerPtrY_) * sc));
+    // 底板坐标 → 菜单帧的坐标系（面板发起的菜单加回输出原点）
+    const int32_t x = int32_t(std::lround((menuPtrOffX_ + layerPtrX_) * sc)) + menuOriginX_;
+    const int32_t y = int32_t(std::lround((menuPtrOffY_ + layerPtrY_) * sc)) + menuOriginY_;
     if (event == MENU_POINTER_MOTION) {
         if (lastMenuMotion_ && *lastMenuMotion_ == std::make_pair(x, y)) {
             return;

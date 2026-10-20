@@ -264,7 +264,7 @@ impl Coordinator {
     /// 与 [`Self::softkeyboard_hotkey`] 同一道理（面板一开就接管主键区，旧候选挂着像卡住了），
     /// 只是出口不同：菜单没有按键应答可搭，编码经 push 出口交还宿主。
     ///
-    /// 先开后处置、且以「开出来了」为准：Linux 外部宿主形态开不出面板，那里不能把用户
+    /// 先开后处置、且以「开出来了」为准：映射表为空时开不出面板，那里不能把用户
     /// 正在打的码白白清掉。关闭方向不必处置（软键盘态下本就没有输入会话）。
     pub(crate) fn softkeyboard_menu_toggle(&self, page: Option<&str>) {
         let was_open = self.softkeyboard_is_open();
@@ -278,25 +278,14 @@ impl Coordinator {
     }
 
     /// 开启软键盘。表为空时不开——弹一个一个符号都打不出的面板只会让用户以为坏了。
+    ///
+    /// 宿主贴不了面板（Linux 旧 addon，见 [`Self::host_has_panels`]）时也不开：主键区会被接管而
+    /// 屏上什么都没有——打字全变符号。热键、菜单、工具栏都经此处，键交还宿主。
     pub(crate) fn open_softkeyboard(&self, page: Option<&str>) -> KeyAction {
-        // Linux 外部宿主形态没有软键盘面板（addon 不画，Wayland 上也无法自由定位窗口）。
-        // 出厂配置却绑了 `ctrl+shift+k = "softkeyboard"`：放任它开，Rust 会接管主键区而用户看不到
-        // 任何窗口——打字全变符号、没反应，只有 Esc/再按一次能退出。所有开启路径（热键、菜单、
-        // 工具栏）都经此函数，在这里挡最彻底；键交还宿主，不吞。
-        #[cfg(all(target_os = "linux", ext_presenter))]
-        {
-            let _ = page;
-            debug!("软键盘: 本平台没有面板，忽略开启请求");
-            KeyAction::PassThrough
+        if !self.host_has_panels() {
+            debug!("软键盘: 宿主没声明面板能力，忽略开启请求");
+            return KeyAction::PassThrough;
         }
-        #[cfg(not(all(target_os = "linux", ext_presenter)))]
-        {
-            self.open_softkeyboard_impl(page)
-        }
-    }
-
-    #[cfg(not(all(target_os = "linux", ext_presenter)))]
-    fn open_softkeyboard_impl(&self, page: Option<&str>) -> KeyAction {
         if self.softkeyboard.is_empty() {
             warn!("软键盘: 映射表为空，忽略开启请求");
             return KeyAction::Consumed;
@@ -701,26 +690,6 @@ impl Drop for SoftKeyboardPushOnDrop<'_> {
     }
 }
 
-// 面板相关用例假设「开得出来」；Linux 外部宿主形态没有面板，改测「开不出来」。
-#[cfg(all(test, not(all(target_os = "linux", ext_presenter))))]
+#[cfg(test)]
 #[path = "handle_softkeyboard_tests.rs"]
 mod tests;
-
-#[cfg(all(test, target_os = "linux", ext_presenter))]
-mod no_panel_tests {
-    use super::*;
-    use wind_config::Config;
-
-    /// 出厂热键 ctrl+shift+k 在 Linux 上不能把主键区接管走。
-    #[test]
-    fn open_is_refused_and_key_passes_through() {
-        let c = Coordinator::new_headless(Config::default(), None);
-        assert!(matches!(c.open_softkeyboard(None), KeyAction::PassThrough));
-        assert!(!c.softkeyboard_is_open());
-        assert!(matches!(
-            c.toggle_softkeyboard(None),
-            KeyAction::PassThrough
-        ));
-        assert!(!c.softkeyboard_is_open(), "toggle 也不得把它开出来");
-    }
-}

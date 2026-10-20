@@ -44,6 +44,7 @@
 | `src/handle_tooltip.rs` | 候选悬停提示（编码/拆字/拼音反查） |
 | `src/hotkey_match.rs` | key_down 热键匹配 |
 | `src/web_host.rs` | `WebDataHost` trait（16 方法）+ 转发 impl：设置页数据 RPC（**独立 crate `wind-webdata`**）消费宿主能力的窄面。依赖方向 webdata→coordinator，本 crate 因此不依赖 wind-transfer/fontdb（Android 闭包免 C 依赖、check-android 免 NDK 的关键，Cargo.toml 有⚠注释）。★新增 RPC 需要新宿主能力时**必须加在本 trait 上** |
+| `src/user_words_api.rs` | 用户词管理（分页列表三条分流 / 加词 ü 归一与边界求解 / 删词 / 清空）的**存储域**本体，泛型于 `WebDataHost`。桌面 `dict.*` RPC（wind-webdata）与移动端门面（wind-mobile）共用——从 webdata 下沉是因为 Android 闭包不含 webdata。转义与 JSON 形状仍留 webdata |
 | `src/freq_learn_tests.rs` | 词频路由/选词记账/自动造词/加词的 crate 内行为测试（白盒零 RPC；原住 webdata 契约测试，按「是否用 web_data_rpc」分拣回归） |
 | `src/host_services.rs` | `HostServices` trait（剪贴板等平台能力注入面）+ 桌面/headless 实现；收录判据见模块文档 |
 | `src/stats.rs` | 输入统计采集 |

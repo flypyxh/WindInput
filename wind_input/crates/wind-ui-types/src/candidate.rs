@@ -24,6 +24,96 @@ pub struct CandidateItem {
     pub no_index: bool,
 }
 
+/// 候选展开态（多行网格）的版式，见 `docs/design/candidate-grid-expand.md`。
+///
+/// 网格的**一行就是原来的一页**：`candidates` 是可见区内逐行平铺的候选，第 `r` 行第 `c` 列
+/// 在 `r * cols + c`。`selected` / `hover` 与命中矩形的 tag 都是这个平铺数组的下标，
+/// 宿主照旧原样回传，换算回「哪一页、页内第几个」是协调器的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateGrid {
+    /// 每行候选数（= 每页候选数）。
+    pub cols: u16,
+    /// 可见行数。末屏行数不足时渲染端补等高占位行，保证滚动期间窗口高度不变。
+    pub rows: u16,
+    /// 高亮行在可见区内的行号（0 起）。
+    pub highlight_row: u16,
+    /// 显示序号的格子：平铺下标 `index_start..index_start + index_count`（从高亮行行首起，
+    /// 按 `ui.candidate.grid_index_fill` 往下顺延）。数字键选的就是这几格，其余格子的序号
+    /// 渲染端画成透明占位。
+    pub index_start: u16,
+    pub index_count: u16,
+    /// 分类标签栏：可用标签的位集（`1 << GridTab as u8`）；0 = 不显示标签栏。
+    pub tabs: u8,
+    /// 当前分类（`GridTab as u8`）。
+    pub active_tab: u8,
+}
+
+/// 展开态的候选分类（标签栏）。枚举顺序即标签栏从左到右的顺序。
+///
+/// 判据在协调器（`candidate_grid`），这里只有名字与编号的纯映射。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum GridTab {
+    #[default]
+    All = 0,
+    Single = 1,
+    Phrase = 2,
+    Rare = 3,
+    Symbol = 4,
+}
+
+impl GridTab {
+    pub const ALL: [GridTab; 5] = [
+        GridTab::All,
+        GridTab::Single,
+        GridTab::Phrase,
+        GridTab::Rare,
+        GridTab::Symbol,
+    ];
+
+    /// 标签栏上显示的名字。
+    pub fn label(self) -> &'static str {
+        match self {
+            GridTab::All => "全部",
+            GridTab::Single => "单字",
+            GridTab::Phrase => "词组",
+            GridTab::Rare => "生僻",
+            GridTab::Symbol => "符号",
+        }
+    }
+
+    /// 配置里的写法（`ui.candidate.grid_categories`）。
+    pub fn key(self) -> &'static str {
+        match self {
+            GridTab::All => "all",
+            GridTab::Single => "single",
+            GridTab::Phrase => "phrase",
+            GridTab::Rare => "rare",
+            GridTab::Symbol => "symbol",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.key() == key)
+    }
+
+    pub fn from_index(i: u8) -> Option<Self> {
+        Self::ALL.get(i as usize).copied()
+    }
+
+    /// 在 [`CandidateGrid::tabs`] 位集里的那一位。
+    pub fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// 分类标签在命中矩形里的 tag：`GRID_TAB_TAG_BASE + GridTab as u8`。
+///
+/// 取一个远大于网格格数（可见行 ≤ 10、每页 ≤ 10）的**正数**段：宿主只把翻页键重映射成负数，
+/// 其余命中下标一律当候选下标原样回传，于是标签点击走候选点选那条路回到协调器，三端宿主
+/// 不用改。悬停 / 右键落在这一段时，协调器的范围校验把它当越界忽略。
+pub const GRID_TAB_TAG_BASE: i32 = 1000;
+
 /// 结构化的悬停提示：有序段列表。纯文本形态见 [`TooltipDoc::to_plain_text`]。
 ///
 /// 段结构一路保留到 UI，右键才有东西可命中（按段 / 按行复制、上屏）：渲染端按

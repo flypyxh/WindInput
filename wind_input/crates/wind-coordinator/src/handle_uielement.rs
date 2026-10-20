@@ -389,14 +389,16 @@ impl Coordinator {
             }
             UIELEMENT_ACTION_FINALIZE => {
                 // 定稿当前高亮 = 鼠标点选当页高亮项，走同一条 push 出口。
-                let page_local = {
+                // 取绝对下标、不经 `mouse_select`：后者把下标当 UI 回传的（展开态下是网格平铺
+                // 下标）解释，而这里手里的是页内高亮。
+                let idx = {
                     let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     if state.candidates.is_empty() {
                         return;
                     }
-                    state.selected_index
+                    self.highlighted_global_index(&state)
                 };
-                self.mouse_select(page_local);
+                let _ = self.select_candidate_at(idx);
             }
             UIELEMENT_ACTION_ABORT => {
                 let act = {

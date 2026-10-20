@@ -146,7 +146,8 @@ pub struct PatchInfo {
 
 /// 解析片段文本。失败即整体错误，调用方不应再走展平/校验。
 pub fn parse_fragment(text: &str) -> Result<toml::Value, String> {
-    toml::from_str::<toml::Value>(text).map_err(|e| format!("TOML 解析失败: {e}"))
+    text.parse::<toml::Value>()
+        .map_err(|e| format!("TOML 解析失败: {e}"))
 }
 
 /// 从片段的 `[package]` 段提取说明元信息。

@@ -226,6 +226,15 @@ mod tests {
         assert_eq!(call(fn_regex, &["a1b22c", "\\d+", "#"]), "a#b#c");
     }
 
+    /// 文档写明 `\w` `\d` 可用，用户拿它处理中文剪贴板：类按 Unicode 算（汉字是 `\w`、
+    /// 全角数字是 `\d`）。钉的是 regex 的 `unicode` feature——换 regex-lite 或关 unicode
+    /// 会让这两类退成 ASCII。
+    #[test]
+    fn regex_classes_are_unicode_aware() {
+        assert_eq!(call(fn_regex, &["清风 input", "\\w+", "W"]), "W W");
+        assert_eq!(call(fn_regex, &["电话１２３", "\\d+", "#"]), "电话#");
+    }
+
     #[test]
     fn encoders() {
         assert_eq!(call(fn_url, &["a b&c"]), "a+b%26c");

@@ -62,8 +62,9 @@ if(WIND_BUILD_ADDON)
     find_package(Fcitx5Core 5.0 REQUIRED)
     find_package(Fcitx5Utils 5.0 REQUIRED)
     find_package(PkgConfig REQUIRED)
-    # 候选窗的 X11 呈现：自建 xcb 连接 + XShape（无合成器时按 alpha 抠形）。
-    pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb xcb-shape)
+    # 候选窗的 X11 呈现：自建 xcb 连接 + XShape（无合成器时按 alpha 抠形）+ RandR（工具栏 /
+    # 软键盘按输出取名字与工作区）。
+    pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb xcb-shape xcb-randr)
 
     add_library(windinput MODULE
         src/fcitx/WindEngine.cpp

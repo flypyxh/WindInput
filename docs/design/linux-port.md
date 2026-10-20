@@ -19,15 +19,15 @@ addon 只做按键转发、上屏/预编辑写回、候选窗呈现。宿主选 
 
 不走 Fcitx5 原生候选窗：自定义主题、tooltip、注释上方条等特色都靠自绘，原生窗全丢。
 
-## 2. 精简范围（与 macOS 一致）
+## 2. 精简范围（与 macOS 大体一致，工具栏 / 软键盘除外）
 
 **发布状态（2026-10-09 定）**：Linux 版以当前状态作为测试版随下个版本发布，之后按用户反馈再定增减。
 
 | 项 | 状态 | 理由 |
 |---|---|---|
-| 工具栏 | **确定不做** | 用户明确不要浮动工具栏（「不是这个系统的习惯」）；中英状态改由 Fcitx5 托盘 / 面板图标显示，见 §5d |
+| 工具栏 | 做（原「确定不做」已撤回） | 复查后多数中文输入法都带工具栏；改为与 Windows 一致的悬浮工具栏，见 [linux-toolbar-softkeyboard.md](linux-toolbar-softkeyboard.md) |
 | 全局热键 | **确定不做** | Wayland 无标准方案；热键只在输入法激活、有焦点时经按键通路生效 |
-| 软键盘 | 暂缓，视反馈再定 | Wayland 无法自由定位窗口（按屏幕摆的浮层现可走 layer-shell，技术上不再完全卡死） |
+| 软键盘 | 做（原「暂缓」已撤回） | 与工具栏同一套可交互浮层，见 [linux-toolbar-softkeyboard.md](linux-toolbar-softkeyboard.md) |
 | 输入诊断 HUD | 不做 | 依赖 Windows 专有诊断数据 |
 | 按应用独立配置（compat） | **提供**（最初列为不做，后改为保留） | 服务按 addon 报的程序名匹配规则；内置兼容规则全是 Windows 宿主修正，Linux 包带零规则版。2026-10-09 真机验过：两个应用分别配默认中文 / 默认英文，切换焦点时正确切换 |
 
@@ -122,9 +122,11 @@ addon 不排字——服务端光栅化（与候选窗同构），像素走各�
   组字中通往主菜单的路，有了状态区入口就多余；且点它时屏幕菜单已先关，服务端随后下发的主菜单
   在 Wayland 下落进候选窗那个 popup surface，把候选窗挤走）。状态区的显示由
   Fcitx5 的 UI 模块决定，我们只挂动作。
-- **按平台摘掉的主菜单项**（`build_main_menu_items`）：工具栏 / 状态图标开关（addon 不接
-  `CMD_MODE_STATUS`）、软键盘（`open_softkeyboard` 在 Linux 直接拒绝）、「截图所有窗口到文件」
-  （依赖宿主回应 `shot.panel` 才出结果 Toast，addon 不接）、输入诊断 HUD（同 macOS）。
+- **按平台摘掉的主菜单项**（`build_main_menu_items`）：「截图所有窗口到文件」（依赖宿主回应
+  `shot.panel` 才出结果 Toast，addon 不接）、输入诊断 HUD（同 macOS）。沿革：工具栏开关与软键盘
+  最初也摘掉（当时工具栏不显示、`open_softkeyboard` 在 Linux 直接拒绝），随
+  [linux-toolbar-softkeyboard.md](linux-toolbar-softkeyboard.md) 恢复，文案用 Windows 的「显示工具栏」
+  （macOS 的「显示状态图标」不出现）。
 - **关闭路径**：Esc / 点选 / 右键 / 点菜单外（抓指针看得见）/ 其它键（关并吞掉）走服务端
   `popup_menu`；失焦与切换输入上下文（addon `deactivate` 无条件收并报 `menu.dismiss`，服务端
   FocusLost 另有一条带 250ms 守卫的）；候选被清空 / 组合结束（候选右键菜单随候选收起，
@@ -145,7 +147,7 @@ addon 不排字——服务端光栅化（与候选窗同构），像素走各�
   kimpanel 都经 `Instance::inputMethodIcon` 取这个值。模式来源是服务端的四种帧：焦点进入的
   `MODE_PUSH`、按键响应的 `STATUS_UPDATE`、push 通道的 `STATE_PUSH`（菜单等别处切换）、带
   `MODE_CHANGED` 的上屏；变了就 `updateUserInterface(StatusArea)` 让各 UI 模块重取。不用
-  `CMD_MODE_STATUS`：那条由工具栏可见性驱动，Linux 不显示工具栏。
+  `CMD_MODE_STATUS`：那条由工具栏可见性驱动，而 Linux 的工具栏由服务端自己画，addon 用不上它。
 
 - **系统输入法配置里的「配置」**：输入法与 addon 都是 `Configurable=True`，addon 的配置只有一项
   `fcitx::ExternalOption`（指向设置程序，`WIND_INPUT_SETTING` 可覆盖）。依据：fcitx5-mozc /
@@ -347,8 +349,7 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
   `$XDG_DATA_HOME`（带标记），取消只撤带标记的文件与 `mimeapps.list` 里指向我们的项，别人的关联不动；
   自愈只修指向已消失路径的用户级文件。端到端 `scripts/linux/e2e-assoc.sh`；真桌面文件管理器、KDE 查询分支、
   snap / flatpak 浏览器未验。
-- **门控**：清单 `platform` 字段加 `linux`；在 macOS 精简范围之上，Linux 另藏工具栏显示/切换、
-  软键盘热键、`activate_ime`、Dota2 兼容与热键的「全局」勾选。逐项依据见 wind-setting README
+- **门控**：清单 `platform` 字段加 `linux`；工具栏 / 软键盘相关项（`keys.toggle_toolbar`、`keys.softkeyboard`、`ui.toolbar.*`，后者 `windows, linux`，仅 `fullscreen_watch` 留给 Windows）已对 Linux 放开，与 macOS 不同；其余在 macOS 精简范围之上，Linux 另藏 `activate_ime`、Dota2 兼容与热键的「全局」勾选。逐项依据见 wind-setting README
   「按平台屏蔽的设置项」。应用兼容性（按应用配置）**保留**：服务按 addon 报的程序名匹配规则，
   与 macOS 同一机制——§2「不做」指的是不为 Linux 维护内置规则，不是机制不可用。
 - **托盘 / 常驻（`run_resident`）缺失不影响设置端**：`wind_setting` 不用常驻模式也不用托盘；
@@ -376,6 +377,10 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    `handle_client_disconnected`，协调器据此把开着的菜单复位，不看断的是哪条连接。addon 目前只有一条
    请求连接，成立；将来若出现第二个请求客户端（探针、并行的 e2e 客户端），它断开会把 addon 那边开着的
    菜单在服务端复位（UI 随之收菜单，两端仍一致，只是菜单被无故收掉）。届时给断线回调带上连接标识。
+   同一回调还给工具栏 / 软键盘各补一次指针离开（addon 崩溃时按住的软键盘键当场停连发），同样不分
+   连接：请求连接超时熔断时 addon 还在，指针若正按在软键盘上，那次按住会被提前松开；指针若停在工具栏上，
+   会被当成已离开，可能开始自动隐藏淡出（下一次移动即恢复）。宿主上报状态的
+   完整复位（全屏态等）放在 push 连接重建时（渲染端 `HostReconnected`），不在这里。
 6. **字体文件被原地截断会 SIGBUS（已知限制）**：Linux 文本后端把字体文件只读 `mmap` 后常驻
    （`text/linux/store.rs` 的 `map_file`），文件若在服务运行中被**原地截断改写**（而不是包管理器那样
    写新文件再 rename），访问越过新文件尾的页触发 SIGBUS、服务崩溃。包管理器升级字体走 rename，旧映射
@@ -397,6 +402,18 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
    扩展取焦点窗口 frame 再回传（kimpanel 即此思路），成本高且随 GNOME 版本变，暂不做。
    X11 会话（含 XWayland 应用）正常；Deepin 25 的 treeland 有 input-method-v2，走 popup surface，正常。
    较新的 GNOME 是否有变化未验证。
+11. **Wayland 下工具栏 / 软键盘记住的位置可能跳角（已知限制）**：Wayland 面板坐标的单位是「合成器逻辑
+   坐标 × 服务端此刻的光栅化缩放」（§5b / `OverlayInput.h`「Wayland 面板坐标」），而光栅化缩放跟着焦点
+   走：XWayland 应用取 `Xft.dpi`，原生 Wayland 应用取输出缩放。两者不一致时（例如输出 150%、`Xft.dpi`
+   仍是 96），同一个落点在两种焦点下换算出的锚点不同，记住的位置会在记录点和默认角之间跳。只在混合
+   缩放配置下出现，未修。
+12. **软键盘不跟物理 Shift 换层（已知限制）**：Windows / macOS 上物理按住 Shift（或开着大写锁定）时软键盘
+   切到第二层（上档字符）；Linux 服务端读不到全局修饰键状态（`soft_keyboard.rs` 的 `MODIFIER_POLLS`），
+   按住 Shift 不换层。点软键盘自己的 Shift 键照常切换。
+13. **无合成器的 X11 下工具栏悬停唤回不可用（已知限制）**：没有合成器时窗口外形按像素 alpha 用 XShape
+   裁（§5b），自动隐藏淡出的整窗透明度乘进了像素，假隐藏那帧处处 alpha≈1，裁出来是空的——窗口既看不见
+   也收不到指针（X 的输入区不能超出外形），移回原位唤不回来，只能等状态变化重新出现。有合成器（ARGB）
+   时外形不裁、面板整个矩形都收指针，正常。
 
 ## 8. 安装包：只装 deb 就能用（不再有 `windinput-setup`）
 

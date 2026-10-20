@@ -885,6 +885,14 @@ pub(crate) fn dispatch_command(
             if is_async { None } else { Some(encode_ack()) }
         }
 
+        // ── Linux addon 工具栏 / 软键盘的指针事件（kind event button u32 + x y i32，上行）──
+        CMD_PANEL_POINTER => {
+            if let Some((kind, event, button, x, y)) = decode_panel_pointer(payload) {
+                handler.on_panel_pointer(kind, event, button, x, y);
+            }
+            if is_async { None } else { Some(encode_ack()) }
+        }
+
         // ── darwin .app 统一菜单项被选中（菜单 id i32 LE，上行）──
         CMD_MENU_ACTION => {
             if payload.len() >= 4 {
@@ -1197,6 +1205,9 @@ mod tests {
         CMD_CANDIDATE_SCROLL, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, CMD_KEY_EVENT,
     };
 
+    /// 面板指针事件 (kind, event, button, x, y)。
+    type PanelPointer = (u32, u32, u32, i32, i32);
+
     /// 最小测试 handler：记录 host_render_failed 的 reason 与鼠标 select/scroll 值，
     /// 其余方法返回安全默认值。
     #[derive(Default)]
@@ -1205,6 +1216,7 @@ mod tests {
         last_select: std::sync::atomic::AtomicI32,
         last_scroll: std::sync::atomic::AtomicI32,
         last_uielement: std::sync::Mutex<Vec<String>>,
+        last_panel_pointer: std::sync::Mutex<Vec<PanelPointer>>,
         /// 视为后台客户端的 pid（0 = 无）。
         background_pid: AtomicU32,
         activation_calls: std::sync::Mutex<Vec<String>>,
@@ -1273,6 +1285,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("state:{pid}:{host_draws}:{host_reads}"));
+        }
+        fn on_panel_pointer(&self, kind: u32, event: u32, button: u32, x: i32, y: i32) {
+            self.last_panel_pointer
+                .lock()
+                .unwrap()
+                .push((kind, event, button, x, y));
         }
         fn uielement_page(&self) -> UiElementPage {
             UiElementPage {
@@ -1374,6 +1392,31 @@ mod tests {
         {
             dispatch_command(handler, cmd, is_async, payload, ctx)
         }
+    }
+
+    /// 工具栏 / 软键盘的指针事件按载荷字段原样路由；同步回 ack，异步不回。
+    #[test]
+    fn panel_pointer_dispatches_to_handler() {
+        use wind_ipc::codec::encode_panel_pointer;
+        use wind_ipc::protocol::CMD_PANEL_POINTER;
+        let handler = Arc::new(RecordingHandler::default());
+        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
+        let ctx = ClientCtx { conn_id: 0, pid: 0 };
+        let payload = encode_panel_pointer(11, 3, 1, -5, 40);
+
+        let resp = dispatch_for_test(&dyn_handler, CMD_PANEL_POINTER, false, &payload, ctx)
+            .expect("同步请求必须回 ack");
+        assert_eq!(u16::from_le_bytes([resp[2], resp[3]]), CMD_ACK);
+        assert!(dispatch_for_test(&dyn_handler, CMD_PANEL_POINTER, true, &payload, ctx).is_none());
+        // 载荷过短：不路由，但同步仍回 ack。
+        assert!(
+            dispatch_for_test(&dyn_handler, CMD_PANEL_POINTER, false, &payload[..19], ctx)
+                .is_some()
+        );
+        assert_eq!(
+            *handler.last_panel_pointer.lock().unwrap(),
+            vec![(11, 3, 1, -5, 40); 2]
+        );
     }
 
     /// host 模式翻页按钮点击：DLL SendAsync 发负 index（-1 上页 / -2 下页），

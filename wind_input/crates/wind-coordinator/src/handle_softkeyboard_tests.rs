@@ -10,7 +10,18 @@ use wind_ipc::protocol::EVENT_KEY_DOWN;
 
 /// `data_dir = None` ⇒ 软键盘表回落内置兜底（一面「标点」）。
 fn coord() -> Arc<Coordinator> {
-    Coordinator::new_headless(Config::default(), None)
+    let c = Coordinator::new_headless(Config::default(), None);
+    declare_panels(&c);
+    c
+}
+
+/// Linux 外部宿主形态：面板能力要 addon 声明（见 `Coordinator::host_has_panels`），这里的用例都
+/// 假设宿主贴得出面板。未声明的那一面由 `linux_panel_tests::softkeyboard_needs_panels_declared_by_host` 测。
+fn declare_panels(c: &Coordinator) {
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    c.host_panels
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = c;
 }
 
 fn kev(vk: u32, modifiers: u32) -> KeyEventData {
@@ -253,6 +264,7 @@ fn coord_with_ui() -> (
     std::sync::mpsc::Receiver<wind_ui_types::UiCommand>,
 ) {
     let (c, rx) = Coordinator::new_headless_with_ui(Config::default(), None);
+    declare_panels(&c);
     {
         let mut s = c.state.lock().unwrap_or_else(|e| e.into_inner());
         s.ime_active = true;
@@ -467,4 +479,88 @@ fn numpad_stays_out_of_the_slot_table_so_the_cpp_side_can_pass_it_through() {
         map.contains_key(&0x35),
         "前置：主键盘 5（vk 0x35）应在键位表里"
     );
+}
+
+/// Linux 外部宿主形态：软键盘面板由服务端光栅化、addon 贴图，开启路径与 Windows 同一条。
+#[cfg(all(target_os = "linux", ext_presenter))]
+mod linux_host {
+    use super::*;
+    use wind_bridge::handler::MessageHandler;
+    use wind_ipc::protocol::FocusLostReason;
+    use wind_ui_types::UiCommand;
+
+    /// 当前面上第一个有符号的键位及其上屏文本。
+    fn first_symbol_slot(c: &Coordinator) -> (&'static str, String) {
+        let page = &c.softkeyboard.pages()[c.softkeyboard_page_idx()];
+        wind_softkeyboard::all_slots()
+            .find_map(|slot| page.output(slot, false).map(|t| (slot, t.to_string())))
+            .expect("前置：兜底面至少有一个符号键位")
+    }
+
+    /// 出厂热键 ctrl+shift+k 开得出面板，主键区随之接管（会话位与 C++ 吃键判定同步置位）。
+    #[test]
+    fn open_softkeyboard_works_on_linux_host() {
+        let (c, rx) = coord_with_ui();
+        assert!(matches!(c.open_softkeyboard(None), KeyAction::Consumed));
+        assert!(c.softkeyboard_is_open());
+        assert!(
+            rx.try_iter()
+                .any(|m| matches!(m, UiCommand::ShowSoftKeyboard { .. })),
+            "开启要把面板下发给渲染端"
+        );
+        assert!(
+            c.build_status().soft_keyboard,
+            "状态位要告诉 addon 吃主键区"
+        );
+        assert!(
+            text_of(press(&c, VK_1, 0)).is_some(),
+            "主键区的符号键位要被接管上屏"
+        );
+        assert!(matches!(c.toggle_softkeyboard(None), KeyAction::Consumed));
+        assert!(!c.softkeyboard_is_open(), "再按一次关掉");
+    }
+
+    /// 面板上点符号键帽：经 push 出口上屏（UI 事件不在按键路径上，没有按键应答可搭）。
+    #[test]
+    fn softkeyboard_symbol_click_commits() {
+        let (c, _rx) = coord_with_ui();
+        c.open_softkeyboard(None);
+        assert!(c.softkeyboard_is_open(), "前置：面板开得出来");
+        let (slot, text) = first_symbol_slot(&c);
+        let cap = c.push_server.attach_capture_client(7);
+        c.ui_softkeyboard_key(slot, false, false);
+        let want = wind_ipc::codec::encode_commit_text(&text, None, false, true, false);
+        let got: Vec<Vec<u8>> = cap.try_iter().collect();
+        assert!(
+            got.contains(&want),
+            "点 {slot} 应上屏 {text:?}，实际推送 {} 帧",
+            got.len()
+        );
+    }
+
+    /// 语义照 Windows：失焦（过了守卫期）**关闭**面板，而不是只藏起来——主键区接管跟着
+    /// 解除，C++ 侧会话位清掉，物理键回到常规链路；切回来也不会自己弹出。
+    #[test]
+    fn softkeyboard_focus_lost_releases_keys() {
+        let (c, rx) = coord_with_ui();
+        c.open_softkeyboard(None);
+        c.after_softkeyboard_change();
+        *c.softkeyboard_opened_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now() - crate::handle_menu::MENU_FOCUS_GUARD * 2);
+        let _ = rx.try_iter().count();
+        c.handle_focus_lost(1, FocusLostReason::Thread);
+        assert!(!c.softkeyboard_is_open(), "失焦要关闭软键盘");
+        assert!(
+            rx.try_iter()
+                .any(|m| matches!(m, UiCommand::HideSoftKeyboard)),
+            "面板要收起，否则屏上留着一个点了没反应的面板"
+        );
+        assert!(
+            !c.build_status().soft_keyboard,
+            "会话位要清，addon 不再吃主键区"
+        );
+        assert!(press(&c, VK_1, 0).is_none(), "物理键交还常规输入链路");
+    }
 }

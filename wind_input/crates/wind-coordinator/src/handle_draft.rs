@@ -44,6 +44,15 @@ impl Coordinator {
         if !self.draft_enabled() {
             return;
         }
+        // 暂停学习：不喂流，并就地断流——只「不喂」的话，暂停前留在窗口里的字会和恢复后的
+        // 字拼成跨界的假词；窗口里本就没有无痕期间的字，这里不必冲队列。
+        if self.learning_suspended() {
+            self.draft_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .terminate();
+            return;
+        }
         let text = match action {
             // 回改已上屏内容：先把被改掉的部分从流里退出去，再喂新文本。
             // 直接追加会让被替换掉的字留在流里，制造与退格幽灵字同源的脏数据。
@@ -343,7 +352,8 @@ impl Coordinator {
     /// 再让 6b 点查命中一次就是同一次上屏 count +2 —— 与 `learn_phrase_on_commit`
     /// 的返回值要跳过 6b 是同一个坑（那里记着「单段时两者 key 完全相同」）。
     pub(crate) fn promote_draft_on_commit(&self, code: &str, text: &str, boundary: u64) -> bool {
-        if !self.draft_enabled() {
+        // 暂停学习：草稿「用过即转正」也是从这次上屏里学，不做。
+        if !self.draft_enabled() || self.learning_suspended() {
             return false;
         }
         let Some(store) = &self.store else {

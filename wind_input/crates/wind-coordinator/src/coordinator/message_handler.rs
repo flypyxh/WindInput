@@ -12,11 +12,12 @@ use wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
 impl Coordinator {
     /// 光标前最后一段已不是我们上屏的那段（宿主自己出了字、重放了键，或用户挪了光标）：撤销上屏
     /// 计数退化为 1（否则「你好」后打个 0 再撤销删的是「好0」），草稿滑窗断流（否则「你」「0」
-    /// 「好」连打会登记「你好」）。
+    /// 「好」连打会登记「你好」），下一词学习断开（前后两次上屏已不相邻）。
     pub(crate) fn note_host_wrote_text(&self, reason: &str) {
         self.last_commit_len
             .store(1, std::sync::atomic::Ordering::Relaxed);
         self.terminate_auto_phrase(reason);
+        self.note_word_boundary();
     }
 
     /// 仍挂在组合里的智能符号（HoldComposition）。超出时限的视为没有：C++ 定时器到点已自行提交，
@@ -268,6 +269,39 @@ fn decode_ext_point(body: &[u8]) -> Option<(i32, i32)> {
     Some((i32::try_from(x).ok()?, i32::try_from(y).ok()?))
 }
 
+/// 扩展信封 body 里的 `output`（输出 / 显示器名）。缺字段、非字符串、空串都返回 `None`：
+/// 位置记忆按它分桶，空串当键只会多出一个读不回来的桶。
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn decode_ext_output(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let s = v.get("output")?.as_str()?;
+    (!s.is_empty()).then(|| s.to_owned())
+}
+
+/// 扩展信封 body 里的 `work`（`[左,上,右,下]`，屏幕坐标）。缺字段、不是四个整数、空矩形都返回 `None`。
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn decode_ext_work(body: &[u8]) -> Option<(i32, i32, i32, i32)> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let arr = v.get("work")?.as_array()?;
+    let mut w = [0i32; 4];
+    if arr.len() != 4 {
+        return None;
+    }
+    for (slot, n) in w.iter_mut().zip(arr) {
+        *slot = clamp_host_coord(i32::try_from(n.as_i64()?).ok()?);
+    }
+    let [left, top, right, bottom] = w;
+    (right > left && bottom > top).then_some((left, top, right, bottom))
+}
+
+/// `host.fullscreen` 的 body `{"fullscreen":bool}`。字段不是布尔就整条不认：把坏值当成「退出全屏」
+/// 会让工具栏冒到全屏应用上面。
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn decode_ext_fullscreen(body: &[u8]) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get("fullscreen")?.as_bool()
+}
+
 /// `host.display` 的 body：两个字段各自可缺省（缺省 = 不改现值）。
 #[derive(Debug, PartialEq)]
 struct HostDisplay {
@@ -494,7 +528,14 @@ impl MessageHandler for Coordinator {
         }
         let mut changed = false;
         for _ in 0..notches {
-            let moved = if up {
+            // 展开态滚一行（同 `mouse_page`）：网格里逐个移动高亮，滚一格只挪一个字，太慢。
+            let moved = if Self::grid_active(&state) {
+                if up {
+                    state.current_page > 0 && self.grid_move_row(&mut state, false)
+                } else {
+                    self.grid_scroll_down(&mut state)
+                }
+            } else if up {
                 self.move_up(&mut state)
             } else {
                 self.move_down(&mut state)
@@ -550,6 +591,23 @@ impl MessageHandler for Coordinator {
                     self.save_status_tip_pos(x, y);
                 }
             }
+            // Linux addon：工具栏 / 软键盘本地拖完的落点（内容盒左上，屏幕坐标）与落点输出名。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            ext_kind::POS_TOOLBAR | ext_kind::POS_SOFTKEYBOARD => {
+                use wind_ipc::protocol::overlay::{
+                    OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR,
+                };
+                let Some((x, y)) = decode_ext_point(body) else {
+                    tracing::warn!("扩展消息 {kind} 的 body 不是 {{x,y}}，忽略");
+                    return;
+                };
+                let panel = if kind == ext_kind::POS_TOOLBAR {
+                    OVERLAY_KIND_TOOLBAR
+                } else {
+                    OVERLAY_KIND_SOFTKEYBOARD
+                };
+                self.on_host_panel_dropped(panel, x, y, decode_ext_output(body));
+            }
             // Linux addon：当前焦点宿主的显示环境（光标坐标是否可用、界面缩放）。
             ext_kind::HOST_DISPLAY => match decode_ext_host_display(body) {
                 Some(d) => {
@@ -567,9 +625,47 @@ impl MessageHandler for Coordinator {
                     if let Some(scale) = d.scale {
                         wind_ui::dpi::set_host_scale(scale);
                     }
+                    // 能力声明 `panels`：能贴工具栏 / 软键盘浮层（旧 addon 不报，见字段 `host_panels`）。
+                    // 缺省同其它字段 = 不改现值；复位靠请求连接断开。
+                    #[cfg(all(target_os = "linux", ext_presenter))]
+                    if let Some(panels) = serde_json::from_slice::<serde_json::Value>(body)
+                        .ok()
+                        .and_then(|v| v.get("panels")?.as_bool())
+                    {
+                        self.host_panels
+                            .store(panels, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // 焦点输出名与其工作区：工具栏 / 软键盘位置记忆的分桶键与默认落点。两者成对：
+                    // 报了其一，工作区就跟着这次报告换（只报输出名 = 工作区未知），免得新输出配上旧输出的
+                    // 工作区；输出名只在报了时更新；都没报 = 不改现值。
+                    #[cfg(all(target_os = "linux", ext_presenter))]
+                    {
+                        let output = decode_ext_output(body);
+                        let work = decode_ext_work(body);
+                        if output.is_some() || work.is_some() {
+                            tracing::debug!("host.display: output={output:?} work={work:?}");
+                            if output.is_some() {
+                                *self.host_output.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    output;
+                            }
+                            *self.host_work.lock().unwrap_or_else(|e| e.into_inner()) = work;
+                        }
+                    }
                     tracing::debug!("host.display: {d:?}");
                 }
                 None => tracing::warn!("host.display 载荷无法解析，忽略"),
+            },
+            // Linux addon：焦点窗口进出全屏。全屏期间不显示工具栏，判据在渲染端（对位 Windows 的
+            // `blocked_by_exclusive_fullscreen`）。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            ext_kind::HOST_FULLSCREEN => match decode_ext_fullscreen(body) {
+                Some(on) => {
+                    tracing::debug!("host.fullscreen: {on}");
+                    let _ = self
+                        .ui_tx
+                        .send(wind_ui_types::UiCommand::SetHostFullscreen(on));
+                }
+                None => tracing::warn!("host.fullscreen 载荷无法解析，忽略"),
             },
             // Windows TSF：host render 候选窗落位诊断（SearchHost 写不了 tsf_log，只能看这条）。
             ext_kind::DIAG_HOST_RENDER_PLACED => match host_render_placed_log(body) {
@@ -626,12 +722,43 @@ impl MessageHandler for Coordinator {
         let _ = (event, button, x, y);
     }
 
+    /// Linux addon 报来的工具栏 / 软键盘指针事件：原样交给渲染端，由它翻译成 `WM_*` 喂给窗口
+    /// 自己的鼠标状态机（点格子、右键菜单、按住连发都在那一侧）。其它平台没有这条消息，沿用默认实现。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn on_panel_pointer(&self, kind: u32, event: u32, button: u32, x: i32, y: i32) {
+        let _ = self.ui_tx.send(wind_ui_types::UiCommand::PanelPointer {
+            kind,
+            event,
+            button,
+            x,
+            y,
+        });
+    }
+
     /// Linux：addon 的请求连接断了。菜单若开着，没人会再报关闭——就地复位，免得下一个
     /// addon 实例（fcitx5 重启）送来的方向键 / 回车 / Esc 被一个不存在的菜单吞掉。
+    ///
+    /// 宿主上报状态的统一复位在渲染端的 `HostReconnected`（push 连接重建，见 manager_macos
+    /// `reset_host_state`）。这里只先补一次面板离开，让 addon 崩溃时按住的软键盘键当场停止连发，
+    /// 不必等新 addon 连上；面板能力声明（`host_panels`）也在这里复位。全屏不在这里复位——请求连接
+    /// 超时熔断也会断开，addon 其实还在。
     fn handle_client_disconnected(&self) {
         #[cfg(ext_presenter)]
         if self.is_menu_open() {
             self.menu_dismissed_by_host("addon 连接断开");
+        }
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            // 面板能力随 addon 实例走：下一个连上来的可能是不认面板的旧 addon（重启 fcitx5 换了
+            // 版本），得它自己重新声明。还活着的 addon 在恢复连接时会重报焦点（含 host.display）。
+            // 不挂在 push 重连钩子上：服务启动时钩子补跑晚于 addon 首报，会把刚声明的冲掉。
+            self.host_panels
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            use wind_ipc::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
+            use wind_ipc::protocol::panel_pointer::PANEL_POINTER_LEAVE;
+            for kind in [OVERLAY_KIND_TOOLBAR, OVERLAY_KIND_SOFTKEYBOARD] {
+                self.on_panel_pointer(kind, PANEL_POINTER_LEAVE, 0, 0, 0);
+            }
         }
     }
 
@@ -655,7 +782,8 @@ impl MessageHandler for Coordinator {
             None => return,
         };
         let cfg = &self.rt().config.stats;
-        if !cfg.enabled || !cfg.track_english {
+        // 暂停学习同样不记（理由见 `record_commit_ks`）。
+        if !cfg.enabled || !cfg.track_english || self.learning_suspended() {
             return;
         }
         if chars == 0 && digits == 0 && puncts == 0 && spaces == 0 {
@@ -750,6 +878,7 @@ impl MessageHandler for Coordinator {
             self.note_host_wrote_text("宿主自行出字");
         }
         let action = self.handle_key_event(data);
+        let action = self.redispatch_commit_code(data, action);
         // 上屏换行改写。与 record_input_stats / note_commit_action 同一收口理由（上屏路径
         // 40+ 个返回点，散点接线必漏），而且这里还多一条：换行形式是**平台/宿主**的表达
         // 约定，属于服务端的职责——DLL 拿到什么就写什么，不再自己判断（A3-3）。
@@ -886,6 +1015,18 @@ impl MessageHandler for Coordinator {
         // 顶层 record_input_stats 仅在未置位时兜底（对齐 Go handle_key_event 开头 reset）。
         self.stat_recorded
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 不经 `handle_key_event_policed` 的调用方（移动端）没有重新分派这一步，
+        // 别让上一键的登记漏到这一键。
+        self.commit_code_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 按下时已没有输入会话（或只剩联想）= 上一次组合已经结束（出口有几十处），「本次展开过」
+        // 随之作废。不看「候选为空」：码表空码、拼音分步上屏后删空余码时组合还在。
+        if data.event_type == EVENT_KEY_DOWN {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !Self::has_input_session(&st) || st.assoc_active() {
+                st.grid_keep = false;
+            }
+        }
 
         // 方案级行为覆盖的**兜底**同步点：代际未变时是一次 atomic load + 比较，可忽略。
         // 它保证「切方案后 [punct] 没落地」最迟在下一次按键收敛——其余三个调用点
@@ -1049,7 +1190,8 @@ impl MessageHandler for Coordinator {
                 let commit_text = {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     // 切大写时按"切英文"语义处理待输入（commit_on_switch）；切回小写时直接丢弃。
-                    let text = self.take_input_on_mode_switch(&mut s, !caps_lock_on);
+                    let upper = caps_lock_on && self.rt().config.input.capslock.commit_upper;
+                    let text = self.take_input_on_mode_switch_cased(&mut s, !caps_lock_on, upper);
                     s.caps_lock = caps_lock_on;
                     text
                 };
@@ -1819,7 +1961,7 @@ impl MessageHandler for Coordinator {
                     && !self.assoc_yields_select_key(&state)
                     && let Some(offset) = self.select_key_offset(data.key_code)
                 {
-                    let (start, end) = self.page_range(&state);
+                    let (start, end) = self.select_range(&state);
                     let idx = start + offset;
                     if idx < end {
                         let cand = state.candidates[idx].clone();
@@ -2031,7 +2173,7 @@ impl MessageHandler for Coordinator {
                     if !self.assoc_yields_select_key(&state)
                         && let Some(offset) = self.select_key_offset(data.key_code)
                     {
-                        let (start, end) = self.page_range(&state);
+                        let (start, end) = self.select_range(&state);
                         let idx = start + offset;
                         if idx < end {
                             let cand = state.candidates[idx].clone();
@@ -2455,6 +2597,7 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData> {
+        self.note_word_boundary();
         // 与 handle_focus_lost 的 token 日志配对：只有两边都记 token，才能从日志算出
         // 「同一实例 gained 后多久自己 lost」——区分 DocMgr 抖动与真实离开就靠这个间隔。
         tracing::debug!(
@@ -2613,6 +2756,11 @@ impl MessageHandler for Coordinator {
             // 消费点在 handle_focus_lost 的 WARN。
             self.push_server.note_focus_gained(data.client_token);
         }
+        // 空闲吃 CapsLock 的闸门按活动客户端的 pid 下发，故在 set_active_token 之后同步。
+        {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_capslock_idle_gate(&s);
+        }
         // per-app 状态：进程名已入缓存，按规则表/记忆表/默认值切换本应用中英状态。若与同步段
         // get_current_mode 回传值不同（该进程首次聚焦），随后的 push_activation_status 推送修正。
         //
@@ -2713,6 +2861,7 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_focus_lost(&self, client_token: u64, reason: FocusLostReason) {
+        self.note_word_boundary();
         // 独立日志行：失焦此前在服务端日志里完全不可见，只能靠 TSF 日志反推 HideToolbar
         // 的来源（2026-07-26 工具栏闪隐排查即因此多绕一圈）。token 便于与 DLL 日志的
         // `Sending focus_lost token=…` 对齐到具体宿主实例。
@@ -2775,6 +2924,7 @@ impl MessageHandler for Coordinator {
                 // 别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。工具栏隐藏经
                 // UI 层 50ms 防抖——紧接着若有 FocusGained 会取消隐藏，无闪烁。
                 s.ime_active = false;
+                self.sync_capslock_idle_gate(&s);
                 // 真正离开了这个宿主 ⇒ 焦点气泡的去重记录作废，下次再进来该重新提示一次。
                 // **只在这一档清**：CtxLost/DocChanged 是宿主内部换 docMgr 的噪声，清了就等于
                 // 按 docMgr 计数，Excel 下又会变回「输入一次闪两下」。
@@ -2970,6 +3120,7 @@ impl MessageHandler for Coordinator {
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.ime_active = true;
+            self.sync_capslock_idle_gate(&s);
             // 兜底置真：宿主主动激活本输入法，通常意味着焦点已进入输入框。
             // 若某些宿主 IME_ACTIVATED 之后不补发 focus_gained，而这里不置位，
             // has_edit_context 将永远停在 false —— 工具栏再也不显示。
@@ -3032,6 +3183,7 @@ impl MessageHandler for Coordinator {
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.ime_active = false;
+            self.sync_capslock_idle_gate(&s);
             s.has_edit_context = false; // 切走本输入法：谈不上焦点在不在可编辑控件里
             s.focus_no_edit_ctx = false; // 同上：不表态（input_block 也会因 ime_active 早退）
             s.input_buffer.clear();
@@ -3077,53 +3229,7 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
-        // 模式变更的四个入口都打一条同形日志（见 handle_system_mode_switch 的说明）。
-        // 本入口 = 本地切换键（Shift 等），按键侧另有 `toggle_mode key_up` 记录键码，
-        // 但那条只在 policed 路径上，菜单/热键触发的 toggle 走不到，故这里仍要打。
-        tracing::debug!(
-            "toggle_mode: {} -> 翻转",
-            if self.is_chinese_mode() { "中" } else { "英" }
-        );
-        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，出厂语义是"回到可输入中文
-        // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
-        // chinese_mode 原本为 true（被 CapsLock 压制）时翻转反而落到英文，切换仍然无效。
-        // 落点可配（`input.capslock.mode_after_cancel`，论坛 t283 要「取消大写并进英文」），
-        // 判定见 `mode_after_caps_cancel`。
-        let caps_cancelled = self.cancel_caps_on_switch();
-        // 中英切换 = 一段输入结束。须在取 state 锁之前调用：terminate_auto_phrase 内部
-        // 走词库 IO，不可在持 state 锁时进行。
-        self.terminate_auto_phrase("toggle_mode");
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.chinese_mode = if caps_cancelled {
-            Self::mode_after_caps_cancel(
-                &self.rt().config.input.capslock.mode_after_cancel,
-                CapsCancelSwitch::Toggle,
-                state.chinese_mode,
-            )
-        } else {
-            !state.chinese_mode
-        };
-        let chinese = state.chinese_mode;
-        // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
-        if self.rt().config.input.punct.follow_mode {
-            self.set_punct_below_schema_intent(&mut state, chinese);
-        }
-        let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
-        drop(state);
-        self.record_app_mode(chinese);
-        self.record_last_state();
-        self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
-        self.disarm_smart_symbol();
-        // 配对栈**刻意不清**：中英切换既不移动光标也不消除已插入的右符号，「光标紧贴右符号」
-        // 这个前提仍然成立，清掉只会让用户切走再切回后 Tab/Enter 跳不出去。真正让前提失效的
-        // 是失焦与组合被终止，那两处仍清（见 clear_pair_tracker 的其余调用点）。
-        // C++ 侧同源：模式切换路径调 ResetComposingState(TRUE) 保留 _pairPendingDepth，
-        // 否则中文模式下 Enter 会被会话门控挡在 DLL 里，根本到不了这里。
-        self.push_state_update();
-        self.show_status();
-        self.notify_toolbar();
-        self.notify_ui_hide(); // 取消输入：隐藏候选窗
-        (Some(self.build_status()), commit_text)
+        self.handle_toggle_mode_cased(false)
     }
 
     fn handle_system_mode_switch(
@@ -4777,6 +4883,61 @@ mod ext_envelope_tests {
 }
 
 impl Coordinator {
+    /// 同 `MessageHandler::handle_toggle_mode`，`upper` 为真时切英文上屏的原码转大写
+    /// （CapsLock 作切换键且开了 `input.capslock.commit_upper`）。
+    pub(crate) fn handle_toggle_mode_cased(
+        &self,
+        upper: bool,
+    ) -> (Option<StatusUpdateData>, String) {
+        // 模式变更的四个入口都打一条同形日志（见 handle_system_mode_switch 的说明）。
+        // 本入口 = 本地切换键（Shift 等），按键侧另有 `toggle_mode key_up` 记录键码，
+        // 但那条只在 policed 路径上，菜单/热键触发的 toggle 走不到，故这里仍要打。
+        tracing::debug!(
+            "toggle_mode: {} -> 翻转",
+            if self.is_chinese_mode() { "中" } else { "英" }
+        );
+        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，出厂语义是"回到可输入中文
+        // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
+        // chinese_mode 原本为 true（被 CapsLock 压制）时翻转反而落到英文，切换仍然无效。
+        // 落点可配（`input.capslock.mode_after_cancel`，论坛 t283 要「取消大写并进英文」），
+        // 判定见 `mode_after_caps_cancel`。
+        let caps_cancelled = self.cancel_caps_on_switch();
+        // 中英切换 = 一段输入结束。须在取 state 锁之前调用：terminate_auto_phrase 内部
+        // 走词库 IO，不可在持 state 锁时进行。
+        self.terminate_auto_phrase("toggle_mode");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.chinese_mode = if caps_cancelled {
+            Self::mode_after_caps_cancel(
+                &self.rt().config.input.capslock.mode_after_cancel,
+                CapsCancelSwitch::Toggle,
+                state.chinese_mode,
+            )
+        } else {
+            !state.chinese_mode
+        };
+        let chinese = state.chinese_mode;
+        // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
+        if self.rt().config.input.punct.follow_mode {
+            self.set_punct_below_schema_intent(&mut state, chinese);
+        }
+        let commit_text = self.take_input_on_mode_switch_cased(&mut state, chinese, upper);
+        drop(state);
+        self.record_app_mode(chinese);
+        self.record_last_state();
+        self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        self.disarm_smart_symbol();
+        // 配对栈**刻意不清**：中英切换既不移动光标也不消除已插入的右符号，「光标紧贴右符号」
+        // 这个前提仍然成立，清掉只会让用户切走再切回后 Tab/Enter 跳不出去。真正让前提失效的
+        // 是失焦与组合被终止，那两处仍清（见 clear_pair_tracker 的其余调用点）。
+        // C++ 侧同源：模式切换路径调 ResetComposingState(TRUE) 保留 _pairPendingDepth，
+        // 否则中文模式下 Enter 会被会话门控挡在 DLL 里，根本到不了这里。
+        self.push_state_update();
+        self.show_status();
+        self.notify_toolbar();
+        self.notify_ui_hide(); // 取消输入：隐藏候选窗
+        (Some(self.build_status()), commit_text)
+    }
+
     /// 热键进入的 overlay 模式（临拼 / 特殊 / 生僻字）该发什么组合区。
     ///
     /// # 为什么只在 `display` 为空时看开关

@@ -17,6 +17,8 @@ wind-ipc = { path = "../wind-ipc" }
 # 引导键的键名 ↔ 字符对照（设置端的触发键控件与工具栏入口共用，见 symbol_keys）
 wind-keys = { path = "../wind-keys" }
 wind-ui-types = { path = "../wind-ui-types" }
+# 设置页「统计」的数据：报表算法在 wind-store（与桌面 wind-webdata 共用一份，见 stats_report）
+wind-store = { path = "../wind-store" }
 tracing = { workspace = true }
 # 配置快照的序列化与写入值的构造（见 config_api）。配置文件本身就是 TOML，
 # 宿主侧也已有解析器，用同一种表示就不需要第二套映射。

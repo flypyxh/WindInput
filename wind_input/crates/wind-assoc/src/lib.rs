@@ -163,8 +163,8 @@ impl AssocKind {
     pub fn allows(self, src: AssocSource) -> bool {
         match self {
             AssocKind::Off => false,
-            // History 今天只记前缀延伸类的选择（整词以上文开头），与词语联想「只出上文的
-            // 延长」同形 ⇒ 词语联想档也放行它。
+            // History 里的前缀延伸行（整词以上文开头）与词语联想「只出上文的延长」同形
+            // ⇒ 词语联想档也放行它；同表的「下一词」行由读端按档位挡掉（`HistoryWords`）。
             AssocKind::Word => matches!(src, AssocSource::Prefix | AssocSource::History),
             AssocKind::Smart => true,
         }
@@ -280,6 +280,12 @@ impl AssocConfig {
             prefix: cfg.prefix,
             punct,
         }
+    }
+
+    /// 是否学用户的「下一词」（写入端据此决定记不记）。与读端同口径：下一词只在智能联想档出
+    /// （词语联想只出上文的延长），且要历史源开着——用不上的用户不默默攒数据。
+    pub fn learns_next_words(&self) -> bool {
+        self.kind == AssocKind::Smart && self.source_enabled(AssocSource::History)
     }
 
     /// 该源是否启用：**先过档位、再过开关**。
@@ -607,6 +613,21 @@ mod tests {
             ["中国", "，"],
             "智能档两个源都出，且 Prefix 优先级更高"
         );
+    }
+
+    /// 下一词只在智能联想档读出（词语联想只出上文的延长），写入端须同口径：
+    /// 词语联想档开着历史源也不学，否则只写不读、白攒数据。
+    #[test]
+    fn learns_next_words_only_in_smart_with_history() {
+        let with = |kind, history| AssocConfig {
+            kind,
+            history,
+            ..Default::default()
+        };
+        assert!(with(AssocKind::Smart, true).learns_next_words());
+        assert!(!with(AssocKind::Smart, false).learns_next_words());
+        assert!(!with(AssocKind::Word, true).learns_next_words());
+        assert!(!with(AssocKind::Off, true).learns_next_words());
     }
 
     #[test]

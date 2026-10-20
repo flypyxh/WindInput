@@ -99,6 +99,7 @@ fn dispose_contract_rows(
     }
     (out, st)
 }
+use wind_coordinator::user_words_api;
 use wind_coordinator::web_host::WebDataHost;
 
 /// 解析方案的权威引擎类型（schema.toml 的 engine.type 可能为空，
@@ -350,14 +351,6 @@ fn parse_sort<'a>(params: &'a Value, valid_fields: &[&str]) -> Option<(&'a str, 
     }
     let desc = params.get("sortOrder").and_then(|v| v.as_str()) == Some("desc");
     Some((by, desc))
-}
-
-/// 本地今天日期 "YYYY-MM-DD"（统计摘要的参照点）。
-fn today_str() -> String {
-    chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string()
 }
 
 /// `system.memoryStats` 的回包：进程私有内存 + 已加载方案 + 各懒建结构的自报大小。
@@ -1012,9 +1005,10 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({ "modules": items, "userDir": wind_config::EMOJI_USER_DIR }))
     }
 
+    /// 三条分流（流式 / 排序 / 搜索两组）的本体在 [`user_words_api::list_paged`]（与移动端共用），
+    /// 这里只做参数解析与显示域投影（[`word_item`]）。
     fn web_dict_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let prefix = params
             .get("prefix")
             .and_then(|v| v.as_str())
@@ -1022,90 +1016,17 @@ pub trait WebDataRpc: WebDataHost {
             .unwrap_or("");
         let limit = usize_param(params, "limit", 50);
         let offset = usize_param(params, "offset", 0);
-        let store = self
-            .user_store()
-            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 编码前缀须用扁平码（key 是扁平的），用户可能照着列表显示的 `ni hao` 来搜。
-        // 下面的**词条内容**搜索仍用原串——那是拿汉字去匹配 text，与音节空格无关。
-        //
-        // ★ 再过一道 ü 归一：写入侧（`normalize_add_code`）已把 `xv` 落成 `xu`，而
-        // `search_user_words_prefix` 是**裸字节前缀匹配**——不归一则用户手打 `xv` 搜
-        // 自己刚加的词一条也出不来。写入归一了、查询入口没跟上，正是本仓踩过多次的
-        // 那个形态（见 `docs/design/pinyin-code-domains.md`）。
-        let (code_prefix, _) = wind_store::wdict::split_spaced_code(prefix);
-        let code_prefix = self.normalize_pinyin_code(&schema, code_prefix);
-        let sort = parse_sort(params, &["code", "text", "weight"]);
-
-        // ★ 不搜也不排序：按 key 序**流式**取一页，全表只物化 `limit` 条。
-        //
-        // 设置页打开词库标签走的就是这条，是三条路里最常被走的。从前它与另外两条一样
-        // 「先全收进 Vec 再 skip/take」——19 万条的库要先造 38 万个 `String` 才切出 50 条。
-        //
-        // ⚠️ 仍然**扫完整表**，不能中途早退：`total` 要精确（分页器显示「共 N 条」）。
-        // 省掉的是物化，不是扫描；redb 的读缓存该填还是填（见 wind-store 的
-        // `tests/redb_cache_high_water.rs`）。那笔高水位另有出路，不在这里解决。
-        if prefix.is_empty() && sort.is_none() {
-            let mut items: Vec<Value> = Vec::new();
-            let mut total = 0usize;
-            store.for_each_user_word(&schema, &code_prefix, &mut |w| {
-                if total >= offset && items.len() < limit {
-                    items.push(word_item(w.to_record()));
-                }
-                total += 1;
-                true
-            })?;
-            return Ok(json!({ "items": items, "total": total }));
-        }
-
-        let mut all = if prefix.is_empty() {
-            // 要排序：排序是跨页全局的，只能全量物化。
-            store.search_user_words_prefix(&schema, &code_prefix, 0)?
-        } else {
-            // 有搜索词：**一遍**扫描分两组，编码前缀命中在前、其余命中在后。
-            //   ① 词条内容包含搜索词（拿汉字匹配 text，用原串）
-            //   ② **编码中段包含**搜索词（用拆过的扁平码）—— 前缀扫描只能命中开头，
-            //      `haoya` 搜 `ya` 一条也出不来，而用户并不知道搜索框只认前缀。
-            //
-            // 从前这里扫**两遍**全表（一遍前缀、一遍全量），再拿一个全量 clone 的
-            // `HashSet<(String,String)>` 去重——而前缀命中本就是全量扫描的子集，第二遍
-            // 纯属重复，那个 HashSet 更是把整张表的 code/text 又抄了一份。分两组天然互斥，
-            // 去重结构一并不需要了。顺序与从前逐条相同。
-            let q = prefix.to_lowercase();
-            let code_q = code_prefix.to_lowercase();
-            let mut head = Vec::new();
-            let mut tail = Vec::new();
-            store.for_each_user_word(&schema, "", &mut |w| {
-                if w.code.starts_with(code_prefix.as_str()) {
-                    head.push(w.to_record());
-                } else if w.text.to_lowercase().contains(&q)
-                    || (!code_q.is_empty() && w.code.to_lowercase().contains(&code_q))
-                {
-                    tail.push(w.to_record());
-                }
-                true
-            })?;
-            head.append(&mut tail);
-            head
-        };
-        let total = all.len();
-        // 有 sortBy 时在切片前排序，实现跨页全局排序
-        if let Some((by, desc)) = sort {
-            all.sort_by(|a, b| {
-                let ord = match by {
-                    "weight" => a.weight.cmp(&b.weight),
-                    "text" => a.text.cmp(&b.text),
-                    _ => a.code.cmp(&b.code),
-                };
-                if desc { ord.reverse() } else { ord }
-            });
-        }
-        let items: Vec<Value> = all
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(word_item)
-            .collect();
-        Ok(json!({ "items": items, "total": total }))
+        let sort = parse_sort(params, &["code", "text", "weight"]).map(|(by, desc)| {
+            let by = match by {
+                "weight" => user_words_api::UserWordSort::Weight,
+                "text" => user_words_api::UserWordSort::Text,
+                _ => user_words_api::UserWordSort::Code,
+            };
+            (by, desc)
+        });
+        let page = user_words_api::list_paged(self, schema, prefix, sort, offset, limit)?;
+        let items: Vec<Value> = page.items.into_iter().map(word_item).collect();
+        Ok(json!({ "items": items, "total": page.total }))
     }
 
     fn web_dict_search(&self, params: &Value) -> anyhow::Result<Value> {
@@ -1118,9 +1039,9 @@ pub trait WebDataRpc: WebDataHost {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表显示的是带空格的音节码（见 word_item），用户很可能照着搜。key 是扁平的，
         // 不拆则 `ni ha` 一条也匹配不到。拆完仍是前缀语义（`ni ha` → `niha`）。
-        // 末尾再过一道 ü 归一，理由同 `web_dict_list_paged` 里的 ★。
+        // 末尾再过一道 ü 归一，理由同 `user_words_api::list_paged` 里的 ★。
         let (query, _) = wind_store::wdict::split_spaced_code(query);
-        let query = self.normalize_pinyin_code(&schema, query);
+        let query = user_words_api::normalize_pinyin_code(self, &schema, query);
         let items: Vec<Value> = store
             .search_user_words_prefix(&schema, &query, limit)?
             .into_iter()
@@ -1129,69 +1050,15 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!(items))
     }
 
+    /// 本体在 [`user_words_api::add`]（与移动端共用），这里只解参与还原转义。
     fn web_dict_add(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         // 设置页传的是转义形态，还原成存储域（真实文本）后再落库/比对。见 [`store_text`]。
         let text = &store_text(text);
         let weight = i32_param(params, "weight");
-        let store = self
-            .user_store()
-            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let (code, boundary) = self.normalize_add_code(&schema, code, text);
-        store.add_user_word(&schema, &code, text, weight, boundary)?;
+        user_words_api::add(self, schema, code, text, weight)?;
         Ok(json!({ "ok": true }))
-    }
-
-    /// 规范化设置端提交的编码，返回 `(扁平 code, boundary)`。
-    ///
-    /// 两条边界来源，按可信度取：
-    /// 1. **用户在码里打了空格**（`ni hao`）—— 显式声明的切分，直接采信。同时必须拆成扁平
-    ///    码：带空格的串若原样落库，key 就成了 `ni hao`，前缀查询再也匹配不到它。
-    /// 2. 无空格 → 交给 [`wind_engine::Engine::resolve_boundary`] 的四层求解链。
-    ///
-    /// ★ 这里原本是一个私有的 `infer_boundary_for`，只做「手输码 == 引擎推导码则借用其
-    /// 切分」这一条判据——**那正是求解链的层 3**，是重复实现。收敛掉之后手输码额外获得
-    /// 层 2（词典点查）与层 4（字数约束求解）两条来源：以前用户手打 `xianning` +「西安宁」
-    /// 因推导码对不上而拿 0，现在能解出 `xi|an|ning`。
-    ///
-    /// ⚠️ **有意不在这里拒收** `Unresolvable`：本函数服务于设置页手动加词，那是用户明确
-    /// 的意图，静默拒绝会变成「点了保存没反应」。合法性拦截只放在导入闸口（那里有预览
-    /// 可以如实告知）。此处非法码照旧落 `boundary = 0`，与改动前等价。
-    fn normalize_add_code(&self, schema: &str, code: &str, text: &str) -> (String, u64) {
-        let (flat, explicit) = wind_store::wdict::split_spaced_code(code);
-        // ü 拼写归一（`xv` → `xu`、`nue` → `nve`）。**落库 key 与查询侧必须同域**：
-        // 查询侧 `PinyinEngine::convert` 已把击键归一成正字法形态，key 若停在 `xv`
-        // 就成了「加得进、打不出」——用户看得见这条词，永远召不回。
-        //
-        // ⚠️ 必须先于 `explicit` 那条早退：带空格的码（`nue yao`）走的是另一条 return，
-        // 漏了它就只有「手打空格声明切分」的用户中招，而那恰恰是最难复现的一档。
-        // 归一化是等长替换，故 `explicit` 这个按位置算的 bitmask 不受影响。
-        let flat = self.normalize_pinyin_code(schema, flat);
-        if explicit != 0 {
-            return (flat, explicit);
-        }
-        let res = self
-            .engine_mgr()
-            .resolve_boundaries(schema, &[(flat.as_str(), text)])
-            .into_iter()
-            .next()
-            .unwrap_or(wind_engine::BoundaryResolution::NoInfo);
-        // 探测器：手输码落在契约之外时留一条痕。**不改变行为**（照旧落 boundary=0），
-        // 它是「有多少手输码求解不出」的唯一观测点——这类词的简拼会退化成 DAG 现猜，
-        // 而那在歧义码上必错，用户侧的表现是「加了词但简拼召不回」，无从追溯。
-        //
-        // ⚠️ 用 `debug!` 而非 `info!`：本行含 code 与 text，属用户词库内容。
-        // INFO 生产默认开启，不得记录用户输入类信息。
-        if res == wind_engine::BoundaryResolution::Unresolvable {
-            tracing::debug!(
-                "加词：拼音码求解失败，按无边界落库 code={} text={}",
-                flat,
-                text
-            );
-        }
-        (flat, res.boundary())
     }
 
     fn web_dict_update(&self, params: &Value) -> anyhow::Result<Value> {
@@ -1207,7 +1074,7 @@ pub trait WebDataRpc: WebDataHost {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 存在则改权重（boundary 沿用）；不存在则新增（upsert 语义）。
         // code 同样先规范化，否则带空格的码既查不到既有记录、又会新增出带空格的 key。
-        let (code, boundary) = self.normalize_add_code(&schema, code, text);
+        let (code, boundary) = user_words_api::normalize_add_code(self, &schema, code, text);
         if !store.update_user_word_weight(&schema, &code, text, weight)? {
             store.add_user_word(&schema, &code, text, weight, boundary)?;
         }
@@ -1216,15 +1083,10 @@ pub trait WebDataRpc: WebDataHost {
 
     fn web_dict_remove(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
-        let store = self
-            .user_store()
-            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 列表项的 code 带音节空格（见 word_item），而 key 是扁平的——不拆就删不掉。
-        // text 同理：列表给的是转义形态、key 是真实文本，不还原一样删不掉。
-        let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.remove_user_word(&schema, &code, &store_text(text))?;
+        // code 带音节空格由 [`user_words_api::remove`] 拆回扁平码；text 是列表给的转义形态、
+        // key 是真实文本，不还原就删不掉。
+        user_words_api::remove(self, schema, code, &store_text(text))?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1409,11 +1271,7 @@ pub trait WebDataRpc: WebDataHost {
 
     fn web_dict_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
-        let store = self
-            .user_store()
-            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let n = store.clear_user_words(&schema)?;
+        let n = user_words_api::clear(self, schema)?;
         Ok(json!(n))
     }
 
@@ -1453,35 +1311,9 @@ pub trait WebDataRpc: WebDataHost {
 
     /// 导入。WindDict 多段：`sections` 选要应用的类型（默认文件所含全部段）；
     /// Rime/TSV：仅用户词库。返回 `{sections:[...]}` 逐段结果。
-    /// 目标方案是否拼音族——决定归一化策略与是否执行准入判据。
-    fn target_is_pinyin(&self, schema_id: &str) -> bool {
-        self.engine_mgr()
-            .schema_engine_type(schema_id)
-            .map(|t| t == "pinyin")
-            .unwrap_or(false)
-    }
-
-    /// 拼音方案的 ü 拼写归一（`xv` → `xu`、`nue` → `nve`）；非拼音方案原样返回。
-    ///
-    /// 落点在这一层而非 [`wind_store::import_formats::CodePolicy`]（那是导入解析期的
-    /// 编码归一策略，概念上更贴），是因为 `wind-store` 在依赖图里位于 `wind-engine`
-    /// **下游**，拿不到 `normalize_u_umlaut`；复制一份规则则必然随时间漂移。
-    ///
-    /// ⚠️ 判据必须是「目标方案是不是拼音」而不是「码里有没有 v」：码表/五笔/快符的
-    /// 码里 `v` 是正经码元（五笔 `v` = 女字旁），动它会把用户的词改成打不出的码。
-    fn normalize_pinyin_code(&self, schema_id: &str, code: String) -> String {
-        if !self.target_is_pinyin(schema_id) {
-            return code;
-        }
-        match wind_engine::pinyin::spelling::normalize_u_umlaut(&code) {
-            std::borrow::Cow::Borrowed(_) => code,
-            std::borrow::Cow::Owned(s) => s,
-        }
-    }
-
     /// 按目标引擎挑编码归一化策略（`wind-store` 拿不到 `engine_mgr`，故由这一层决定）。
     fn code_policy_for(&self, schema_id: &str) -> wind_store::import_formats::CodePolicy {
-        if self.target_is_pinyin(schema_id) {
+        if user_words_api::target_is_pinyin(self, schema_id) {
             wind_store::import_formats::CodePolicy::PINYIN
         } else {
             wind_store::import_formats::CodePolicy::CODETABLE
@@ -1509,7 +1341,7 @@ pub trait WebDataRpc: WebDataHost {
         rows: Vec<wind_store::wdict::WordIo>,
         fill: bool,
     ) -> (Vec<wind_store::wdict::WordIo>, EntryContractStats) {
-        if !self.target_is_pinyin(schema_id) {
+        if !user_words_api::target_is_pinyin(self, schema_id) {
             return (rows, EntryContractStats::default());
         }
         // ü 拼写归一（`xv` → `xu`、`nue` → `nve`），与 `normalize_add_code` 同款。
@@ -1524,7 +1356,8 @@ pub trait WebDataRpc: WebDataHost {
         // 作者写下的切分不会被改写。
         let mut rows = rows;
         for r in rows.iter_mut() {
-            r.code = self.normalize_pinyin_code(schema_id, std::mem::take(&mut r.code));
+            r.code =
+                user_words_api::normalize_pinyin_code(self, schema_id, std::mem::take(&mut r.code));
         }
         // 层 1：文件自带空格的行，切分是词库作者写下的真值 —— 直接采信，不进求解。
         let mut flats: Vec<String> = Vec::with_capacity(rows.len());
@@ -2413,7 +2246,7 @@ pub trait WebDataRpc: WebDataHost {
         let cfg = wind_config::Config::load(wind_config::Config::data_dir().as_deref())?;
         // `degradation` 是 `#[serde(skip)]`，转成值树就没了，故先留一份。
         let degradation = cfg.degradation.clone();
-        let current = toml::Value::try_from(cfg)?;
+        let current = cfg.to_toml_value()?;
         let mut entries = wind_config::patch::preview(&fragment, &current);
         // 与 `config.previewPatch` 同判据：本函数只预览，但预览要显示的正是「应用后会
         // 变成什么」，降级时 Map 键的当前表是出厂值 ⇒ 不标出来，用户看到的 diff 是假的，
@@ -4011,115 +3844,30 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
-        use chrono::Datelike;
         let (collector, store) = match (self.stat_collector(), self.user_store()) {
             (Some(c), Some(s)) => (c, s),
             _ => return Ok(Self::empty_stats_summary()),
         };
-        // 当日数据来自采集器内存（始终最新、完整）；历史从 store 读。
-        let today_stat = collector.get_today_stat();
-        let meta = collector.get_meta();
-        let today = today_str();
-        let today_total = today_stat.total();
-
-        // 活跃天数（DB 天数；今天有数据但未 flush 时 +1）+ 日均。
-        let all = store
-            .daily_stats("0000-01-01", "9999-12-31")
-            .unwrap_or_default();
-        let mut active_days = all.iter().filter(|(_, r)| r.total() > 0).count();
-        let today_in_db = all.iter().any(|(d, _)| d == &today);
-        if today_total > 0 && !today_in_db {
-            active_days += 1;
-        }
-        let daily_avg = if active_days > 0 {
-            meta.total_chars / active_days as u64
-        } else {
-            0
-        };
-
-        // 周（周日起）/ 月统计（YYYY-MM-DD 字典序），今天用内存值。
-        let now = chrono::Local::now().date_naive();
-        let week_start = now - chrono::Duration::days(now.weekday().num_days_from_sunday() as i64);
-        let month_start = now.with_day(1).unwrap_or(now);
-        let week_chars: u64 = Self::daily_with_today_mem(
-            store,
-            &week_start.format("%Y-%m-%d").to_string(),
-            &today,
-            &today_stat,
-        )
-        .iter()
-        .map(|(_, r)| r.total() as u64)
-        .sum();
-        let month_chars: u64 = Self::daily_with_today_mem(
-            store,
-            &month_start.format("%Y-%m-%d").to_string(),
-            &today,
-            &today_stat,
-        )
-        .iter()
-        .map(|(_, r)| r.total() as u64)
-        .sum();
-
-        // 近 90 天：最高日 / 平均码长 / 首选率 / 平均速度。
-        let recent_from = (now - chrono::Duration::days(90))
-            .format("%Y-%m-%d")
-            .to_string();
-        let recent = Self::daily_with_today_mem(store, &recent_from, &today, &today_stat);
-        let (mut max_day_chars, mut max_day_date) = (0u32, String::new());
-        let (mut cl_sum, mut cl_cnt, mut first_sel, mut cand_sel) = (0u64, 0u64, 0u64, 0u64);
-        let (mut sp_chars, mut sp_millis) = (0u64, 0u64);
-        for (d, r) in &recent {
-            let t = r.total();
-            if t > max_day_chars {
-                max_day_chars = t;
-                max_day_date = d.clone();
-            }
-            cl_sum += r.code_len_sum as u64;
-            cl_cnt += r.code_len_count as u64;
-            first_sel += r.cand_pos_dist[0] as u64;
-            cand_sel += r.cand_pos_dist.iter().map(|&v| v as u64).sum::<u64>();
-            // 区间速度：两个分量分别累加后再除一次。逐日算速度再平均是错的——
-            // 那会给只打了几十字的日子和整天码字的日子同样的权重。
-            let (c, ms) = r.speed_parts();
-            sp_chars += c as u64;
-            sp_millis += ms;
-        }
-        let avg_code_len = if cl_cnt > 0 {
-            cl_sum as f64 / cl_cnt as f64
-        } else {
-            0.0
-        };
-        let first_select_rate = if cand_sel > 0 {
-            first_sel as f64 / cand_sel as f64
-        } else {
-            0.0
-        };
-        // 系数取自采集器而非配置：`max_speed` 是采集器在 flush 时算好落库的成品值，
-        // 两处若各读各的，热改配置后「历史最快」与「今日速度」会差出一个恒定倍数。
-        let factor = collector.speed_factor();
-        let (today_sp_chars, today_sp_ms) = today_stat.speed_parts();
-        let today_speed =
-            wind_store::stats::speed_per_minute_ms(today_sp_chars as u64, today_sp_ms, factor);
-        let overall_speed = wind_store::stats::speed_per_minute_ms(sp_chars, sp_millis, factor);
-
+        // 算法在 wind-store（与移动端共用一份），这里只管序列化
+        let s = wind_store::stats_report::summary(store, collector);
         Ok(json!({
-            "today_chars": today_total,
-            "today_chinese": today_stat.chinese,
-            "today_english": today_stat.english,
-            "total_chars": meta.total_chars,
-            "active_days": active_days,
-            "daily_avg": daily_avg,
-            "streak_current": meta.streak_current,
-            "streak_max": meta.streak_max,
-            "week_chars": week_chars,
-            "month_chars": month_chars,
-            "max_day_chars": max_day_chars,
-            "max_day_date": max_day_date,
-            "avg_code_len": avg_code_len,
-            "first_select_rate": first_select_rate,
-            "today_speed": today_speed,
-            "overall_speed": overall_speed,
-            "max_speed": meta.max_speed,
+            "today_chars": s.today_chars,
+            "today_chinese": s.today_chinese,
+            "today_english": s.today_english,
+            "total_chars": s.total_chars,
+            "active_days": s.active_days,
+            "daily_avg": s.daily_avg,
+            "streak_current": s.streak_current,
+            "streak_max": s.streak_max,
+            "week_chars": s.week_chars,
+            "month_chars": s.month_chars,
+            "max_day_chars": s.max_day_chars,
+            "max_day_date": s.max_day_date,
+            "avg_code_len": s.avg_code_len,
+            "first_select_rate": s.first_select_rate,
+            "today_speed": s.today_speed,
+            "overall_speed": s.overall_speed,
+            "max_speed": s.max_speed,
         }))
     }
 
@@ -4130,41 +3878,17 @@ pub trait WebDataRpc: WebDataHost {
             Some(s) => s,
             None => return Ok(json!([])),
         };
-        // 真实数据按日期索引；今天用采集器内存最新值覆盖（DB 可能未 flush）。
-        let mut by_date: std::collections::HashMap<String, wind_store::stats::DailyStats> =
-            store.daily_stats(&from, &to)?.into_iter().collect();
-        let today = today_str();
-        if let Some(c) = self.stat_collector() {
-            let ts = c.get_today_stat();
-            if today.as_str() >= from.as_str() && today.as_str() <= to.as_str() && ts.total() > 0 {
-                by_date.insert(today.clone(), ts);
-            }
-        }
         // 区间内连续日期补零值，输出完整 DailyStatItem（便于前端绘图）。
-        let mut out = Vec::new();
-        if let (Ok(f), Ok(t)) = (
-            chrono::NaiveDate::parse_from_str(&from, "%Y-%m-%d"),
-            chrono::NaiveDate::parse_from_str(&to, "%Y-%m-%d"),
-        ) {
-            let mut cur = f;
-            while cur <= t {
-                let key = cur.format("%Y-%m-%d").to_string();
-                let rec = by_date.get(&key).cloned().unwrap_or_default();
-                out.push(Self::daily_item_json(&key, &rec));
-                cur += chrono::Duration::days(1);
-            }
-        }
-        Ok(json!(out))
+        let days = wind_store::stats_report::daily_range(store, self.stat_collector(), &from, &to)?;
+        Ok(json!(
+            days.iter()
+                .map(|(d, r)| Self::daily_item_json(d, r))
+                .collect::<Vec<_>>()
+        ))
     }
 
     fn web_stats_clear(&self) -> anyhow::Result<Value> {
-        if let Some(store) = self.user_store() {
-            store.clear_stats()?;
-        }
-        // 同步清空采集器内存（今日 + 元数据），否则 summary 仍读到旧内存值。
-        if let Some(c) = self.stat_collector() {
-            c.reset();
-        }
+        wind_store::stats_report::clear(self.user_store().map(|s| &**s), self.stat_collector())?;
         Ok(json!({ "ok": true }))
     }
 
@@ -4193,27 +3917,6 @@ pub trait WebDataRpc: WebDataHost {
             store.recalculate_stats_meta(1.0)?;
         }
         Ok(json!({ "pruned": n }))
-    }
-
-    /// 取 [from, today] 的每日统计，今天用采集器内存值替换/追加（对齐 Go GetSummary 用内存今天）。
-    fn daily_with_today_mem(
-        store: &wind_store::Store,
-        from: &str,
-        today: &str,
-        today_stat: &wind_store::stats::DailyStats,
-    ) -> Vec<(String, wind_store::stats::DailyStats)> {
-        let mut days = store.daily_stats(from, today).unwrap_or_default();
-        let mut has = false;
-        for (d, r) in days.iter_mut() {
-            if d == today {
-                *r = today_stat.clone();
-                has = true;
-            }
-        }
-        if !has && today >= from && today_stat.total() > 0 {
-            days.push((today.to_string(), today_stat.clone()));
-        }
-        days
     }
 
     /// 组装前端 DailyStatItem JSON（紧凑字段名，含按方案 bs / 按来源 src）。
@@ -4911,10 +4614,10 @@ fn store_text(s: &str) -> String {
 ///
 /// `code` 输出**带空格的音节码**（`ni hao`），与 `dict.encode` 的出码结果同形，
 /// 让用户直观看到拼音词库的音节格式。存储侧 key 仍是扁平的——设置页把这个串原样回传
-/// 给 add/update/remove 时，由 `normalize_add_code` / `web_dict_remove` 拆回扁平码。
+/// 给 add/update/remove 时，由 `user_words_api` 的 `normalize_add_code` / `remove` 拆回扁平码。
 /// 无边界（旧数据/手输码/五笔码）则不含空格，与改动前一致。
 fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
-    let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
+    let code = user_words_api::display_code(&r);
     json!({ "code": code, "text": ui_text(&r.text), "weight": r.weight, "enabled": true })
 }
 
@@ -7109,7 +6812,7 @@ outside: rare
     #[test]
     fn stats_summary_daily_shape() {
         let c = coord("stats");
-        let today = today_str();
+        let today = wind_store::stats_report::today_str();
         // 采集器记录今日：中文 2（码长 4，首选）。
         c.debug_record_commit("你好", 4, 0, wind_store::stats::CommitSource::Candidate);
 
@@ -9249,7 +8952,7 @@ short_code_yield_level = 2
         let c = coord("stats_daily_rich");
         c.debug_record_commit("你好", 4, 0, CommitSource::Candidate);
         c.stat_collector().unwrap().flush(); // 落库才能被 daily 区间读到
-        let today = today_str();
+        let today = wind_store::stats_report::today_str();
         let r = c
             .web_data_rpc("stats.daily", &json!({ "from": today, "to": today }))
             .unwrap();

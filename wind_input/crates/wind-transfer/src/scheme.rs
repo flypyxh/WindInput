@@ -294,7 +294,8 @@ fn read_override_value(
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("读取方案 override 失败 {}: {e}", path.display()))?;
-    let v: toml::Value = toml::from_str(&text)
+    let v: toml::Value = text
+        .parse::<toml::Value>()
         .map_err(|e| anyhow::anyhow!("方案 override 无法解析 {}: {e}", path.display()))?;
     Ok(Some(v))
 }
@@ -382,16 +383,16 @@ fn collect_into(
     // 不走 Value 往返,方案文件字节原样入包(既有测试守护字节级不变)。
     let schema: wind_config::schema::Schema = match read_override_value(id, override_dir)? {
         Some(ov) => {
-            let mut base: toml::Value = toml::from_str(&text)?;
+            let mut base: toml::Value = text.parse()?;
             wind_config::schema::merge_toml(&mut base, ov);
             let folded_text = toml::to_string_pretty(&base)?;
-            let schema = base
-                .try_into()
+            let schema = wind_config::schema::Schema::from_toml_value(base)
                 .map_err(|e| anyhow::anyhow!("方案 {id} 与 override 合并后解析失败: {e}"))?;
             plan.folded.push((schema_rel, folded_text));
             schema
         }
-        None => toml::from_str(&text)?,
+        // 与上一支同走 Value：直接 from_str::<Schema> 会让整族方案类型再单态化一份。
+        None => wind_config::schema::Schema::from_toml_value(text.parse()?)?,
     };
     if is_root {
         plan.root_version = schema.schema.version.clone();
@@ -637,7 +638,8 @@ pub fn read_package_meta(package: &Path) -> anyhow::Result<PackageMeta> {
             Ok(meta)
         }
         Err(e) => {
-            let declares_format_version = toml::from_str::<toml::Value>(&text)
+            let declares_format_version = text
+                .parse::<toml::Value>()
                 .ok()
                 .and_then(|v| v.get("package")?.get("format_version").cloned())
                 .is_some();

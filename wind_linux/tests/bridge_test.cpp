@@ -508,10 +508,14 @@ void TestEndpoints()
         overlayShmName(OVERLAY_KIND_MENU + OVERLAY_MENU_LEVELS - 1, shmNameForUid(4294967295u));
     CHECK_EQ(longest, std::string("/WindInputDev.4294967295_MN5"));
     CHECK(longest.size() <= 31);
+    CHECK_EQ(overlayShmName(OVERLAY_KIND_SOFTKEYBOARD, shmNameForUid(4294967295u)),
+             std::string("/WindInputDev.4294967295_SKB"));
     setenv("WIND_VARIANT", "release", 1);
     CHECK_EQ(shmNameForUid(1000), std::string("/WindInput.1000"));
     CHECK_EQ(overlayShmName(OVERLAY_KIND_STATUS, shmNameForUid(1000)),
              std::string("/WindInput.1000_STS"));
+    CHECK_EQ(overlayShmName(OVERLAY_KIND_TOOLBAR, shmNameForUid(1000)),
+             std::string("/WindInput.1000_TB"));
     setenv("WIND_VARIANT", "DEV", 1);
     {
         std::ifstream in(std::string(WIND_REPO_DIR) + "/wind_input/crates/wind-bridge/src/endpoint.rs");
@@ -520,7 +524,8 @@ void TestEndpoints()
         const std::string rs = ss.str();
         CHECK(!rs.empty());
         for (const char* sample : {"\"/WindInputDev.4294967295_MN5\"", "\"/WindInput.1000\"",
-                                   "\"/WindInput.1000_STS\""}) {
+                                   "\"/WindInput.1000_STS\"", "\"/WindInput.1000_TB\"",
+                                   "\"/WindInputDev.4294967295_SKB\""}) {
             if (rs.find(sample) == std::string::npos) {
                 std::printf("  endpoint.rs 里没有样例 %s\n", sample);
                 CHECK(false);

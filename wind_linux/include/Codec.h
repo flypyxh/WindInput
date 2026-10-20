@@ -15,6 +15,14 @@ namespace windlinux {
 
 using Bytes = std::vector<uint8_t>;
 
+/// 屏幕 / 位图上的矩形（左上 + 宽高）。
+struct Rect {
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t w = 0;
+    int32_t h = 0;
+};
+
 struct Frame {
     uint16_t cmd = 0;
     bool isAsync = false;
@@ -98,13 +106,30 @@ Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, in
 /// MENU_TARGET_TOOLTIP 时用；按段 / 按行的命中在服务端按这个点做）。
 Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, int32_t top,
                           int32_t right, int32_t bottom, int32_t lx, int32_t ly);
-/// 上行扩展信封 `pos.*`（如 `pos.status_tip`）：body = `{"x":X,"y":Y}`，**内容**左上的屏幕坐标
-/// （与配置 `ui.status.custom_x/y` 同义）。对位 Rust `decode_ext_point`。
-Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y);
 /// 上行扩展信封 `menu.dismiss`：body = `{"reason":"…"}`（reason 只含 [a-z_]，不转义）。
 Bytes encodeMenuDismissFrame(const std::string& reason);
 /// `host.display`：当前焦点宿主的显示环境（见 ExtProtocol.h）。scale 非正 = 不带该字段。
 Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, bool inlinePreedit, double scale);
+/// 焦点（或候选窗）所在的输出：名字（X11 取 RandR 输出名，Wayland 取 wl_output 的 name 事件）
+/// 与它的工作区（屏幕坐标）。拿不到的留空——名字空串、工作区 nullopt——上报时就不带该字段。
+struct HostOutput {
+    std::string name;
+    std::optional<Rect> work;
+};
+/// 同上，另带 `"output":"…"` 与 `"work":[左,上,右,下]`（与 menu.open 的 work 同格式）。
+Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, bool inlinePreedit, double scale,
+                             const HostOutput& output);
+/// 上行扩展信封 `pos.*`（如 `pos.status_tip`）：body = `{"x":X,"y":Y}`，**内容**左上的屏幕坐标
+/// （与配置 `ui.status.custom_x/y` 同义）。对位 Rust `decode_ext_point`。即不带输出名的下一个。
+Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y);
+/// 上行扩展信封 `pos.toolbar` / `pos.softkeyboard`：body = `{"x":X,"y":Y,"output":"…"}`，内容盒
+/// 左上的屏幕坐标；`output` 为空时不带该字段（与 host.display 同源，两处要么都报要么都不报）。
+Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y, const std::string& output);
+/// 上行扩展信封 `host.fullscreen`：body = `{"fullscreen":true|false}`。
+Bytes encodeHostFullscreenFrame(bool fullscreen);
+/// CMD_PANEL_POINTER：kind u32 + event u32 + button u32 + x i32 + y i32（20 字节，**位图内**坐标，
+/// 含软阴影扩边）。对位 Rust `codec.rs::encode_panel_pointer`（那边只出载荷，这里带头）。
+Bytes encodePanelPointer(uint32_t kind, uint32_t event, uint32_t button, int32_t x, int32_t y);
 /// CMD_FRONT_CONTEXT：appLen+app + titleLen+title + selLen+sel（均 UTF-8）。
 Bytes encodeFrontContextFrame(const std::string& app, const std::string& title,
                               const std::string& sel);
@@ -188,6 +213,9 @@ std::optional<HostRenderFramePayload> decodeHostRenderFrame(const Bytes& p);
 /// `codec.rs::encode_overlay_frame`：kind seq w h flags place（u32）、x y altX altY（i32）、
 /// anchor（u32）、margin contentX contentY（i32）、contentW contentH（u32）、durationMs（i32）。
 /// 坐标一律是**内容盒**左上（不含软阴影扩边）。
+///
+/// 工具栏 / 软键盘（kind 10 / 11）在 72 字节之后多一段拖动区：count u32 + count × (x y w h) i32，
+/// 位图内坐标。只对这两个 kind 解析；尾段 count 与数据对不上整帧拒收。
 struct OverlayFramePayload {
     uint32_t kind = 0;
     uint32_t seq = 0;
@@ -206,9 +234,12 @@ struct OverlayFramePayload {
     uint32_t contentW = 0;
     uint32_t contentH = 0;
     int32_t durationMs = 0; // >0 由本端计时自动隐藏；0 = 常驻到下一帧
+    std::vector<Rect> drag; // 可拖动区域（位图内），仅 kind 10 / 11
     bool visible() const { return (flags & 0x1) != 0; }
 };
 std::optional<OverlayFramePayload> decodeOverlayFrame(const Bytes& p);
+/// 工具栏 / 软键盘：可交互、可拖动的两层（帧尾带拖动区、指针走 CMD_PANEL_POINTER）。
+bool isPanelOverlayKind(uint32_t kind);
 
 struct CandidateHitRect {
     int32_t index = 0;

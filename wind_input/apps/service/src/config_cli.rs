@@ -435,7 +435,7 @@ fn cmd_import(path: &str) -> i32 {
             return 1;
         }
     };
-    let root: toml::Value = match toml::from_str(&text) {
+    let root: toml::Value = match text.parse() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("解析 TOML 失败: {e}");
@@ -533,7 +533,7 @@ fn apply_items(items: Vec<(String, toml::Value)>) -> i32 {
 /// 读取某键的当前值（四层合并后），转为 JSON。
 fn load_value(key: &str) -> anyhow::Result<Value> {
     let cfg = Config::load(Config::data_dir().as_deref())?;
-    let full = serde_json::to_value(cfg)?;
+    let full = cfg.to_json_value()?;
     let mut cur = &full;
     for part in key.split('.') {
         cur = cur

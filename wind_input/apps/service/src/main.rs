@@ -401,6 +401,8 @@ fn main() {
     coordinator.set_host_render(host_render.clone());
     #[cfg(windows)]
     let coord_for_push_hook = coordinator.clone();
+    #[cfg(target_os = "linux")]
+    let coord_for_reconnect_hook = coordinator.clone();
     let coord_for_web = coordinator.clone();
     let coord_for_restart_toast = coordinator.clone();
     let coord_for_exit = coordinator.clone();
@@ -420,6 +422,10 @@ fn main() {
     push_server.set_client_connected_hook(Box::new(move |token| {
         coord_for_push_hook.on_push_client_connected(token);
     }));
+    // Linux addon：push 连接（重）建立后渲染端补推可见的工具栏 / 软键盘（addon 收到 SERVICE_READY
+    // 会丢掉手里的面板）。
+    #[cfg(target_os = "linux")]
+    coord_for_reconnect_hook.install_host_reconnect_hook();
 
     // 9.5 启动本地控制 / 配置 JSON-RPC 服务（命名管道：..._ctrl + ..._events）。
     // 本地授权靠 OS ACL（SDDL），不再需要 token/Origin/CORS/端口发现。

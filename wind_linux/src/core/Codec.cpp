@@ -63,6 +63,26 @@ Bytes i32Frame(uint16_t cmd, int32_t v)
     return frame(cmd, p);
 }
 
+/// JSON 字符串字面量（带引号）。服务端按 serde_json 解析，控制字符一律 \u 转义。
+std::string jsonString(const std::string& s)
+{
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += char(c);
+        } else if (c < 0x20) {
+            static const char kHex[] = "0123456789abcdef";
+            out += "\\u00";
+            out += kHex[c >> 4];
+            out += kHex[c & 0xF];
+        } else {
+            out += char(c);
+        }
+    }
+    return out + "\"";
+}
+
 /// 游标式读取器：越界即置 ok=false，后续读取全部返回空值。
 struct Reader {
     const Bytes& b;
@@ -247,21 +267,32 @@ Bytes encodeMenuOpenFrame(int32_t target, int32_t x, int32_t y, int32_t left, in
     return encodeExtFrame(EXT_KIND_MENU_OPEN, body);
 }
 
-Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y)
+Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, bool inlinePreedit, double scale)
 {
-    return encodeExtFrame(kind, "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) + "}");
+    return encodeHostDisplayFrame(caretFree, caretTrusted, inlinePreedit, scale, HostOutput{});
 }
 
-Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, bool inlinePreedit, double scale)
+Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, bool inlinePreedit, double scale,
+                             const HostOutput& output)
 {
     std::string body = std::string("{\"caret_free\":") + (caretFree ? "true" : "false")
                        + ",\"caret_trusted\":" + (caretTrusted ? "true" : "false")
-                       + ",\"inline_preedit\":" + (inlinePreedit ? "true" : "false");
+                       + ",\"inline_preedit\":" + (inlinePreedit ? "true" : "false")
+                       // 能力声明：本 addon 能贴工具栏 / 软键盘浮层。旧 addon 不报，服务端据此不开
+                       // 软键盘（否则主键区被接管而屏上什么都没有）。
+                       + ",\"panels\":true";
     if (scale > 0.0) {
         // 两位小数足够表达 125% / 150% / 175% 这类档位；不用 std::to_string（带 locale 的小数点）。
         const long hundredths = std::lround(scale * 100.0);
         body += ",\"scale\":" + std::to_string(hundredths / 100) + "."
                 + (hundredths % 100 < 10 ? "0" : "") + std::to_string(hundredths % 100);
+    }
+    if (!output.name.empty()) {
+        body += ",\"output\":" + jsonString(output.name);
+    }
+    if (const auto& w = output.work) {
+        body += ",\"work\":[" + std::to_string(w->x) + "," + std::to_string(w->y) + ","
+                + std::to_string(w->x + w->w) + "," + std::to_string(w->y + w->h) + "]";
     }
     body += "}";
     return encodeExtFrame(EXT_KIND_HOST_DISPLAY, body);
@@ -270,6 +301,37 @@ Bytes encodeHostDisplayFrame(bool caretFree, bool caretTrusted, bool inlinePreed
 Bytes encodeMenuDismissFrame(const std::string& reason)
 {
     return encodeExtFrame(EXT_KIND_MENU_DISMISS, "{\"reason\":\"" + reason + "\"}");
+}
+
+Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y)
+{
+    return encodePosFrame(kind, x, y, std::string());
+}
+
+Bytes encodePosFrame(const std::string& kind, int32_t x, int32_t y, const std::string& output)
+{
+    std::string body = "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y);
+    if (!output.empty()) {
+        body += ",\"output\":" + jsonString(output);
+    }
+    return encodeExtFrame(kind, body + "}");
+}
+
+Bytes encodeHostFullscreenFrame(bool fullscreen)
+{
+    return encodeExtFrame(EXT_KIND_HOST_FULLSCREEN,
+                          std::string("{\"fullscreen\":") + (fullscreen ? "true" : "false") + "}");
+}
+
+Bytes encodePanelPointer(uint32_t kind, uint32_t event, uint32_t button, int32_t x, int32_t y)
+{
+    Bytes p;
+    putU32(p, kind);
+    putU32(p, event);
+    putU32(p, button);
+    putU32(p, uint32_t(x));
+    putU32(p, uint32_t(y));
+    return frame(CMD_PANEL_POINTER, p);
 }
 
 Bytes encodeFrontContextFrame(const std::string& app, const std::string& title,
@@ -468,7 +530,24 @@ std::optional<OverlayFramePayload> decodeOverlayFrame(const Bytes& p)
     o.contentW = getU32(d + 56);
     o.contentH = getU32(d + 60);
     o.durationMs = getI32(d + 64);
+    // 拖动区尾段在 scale（68..72）之后，只有工具栏 / 软键盘的帧才编码。没有尾段（旧服务）= 无拖动区。
+    if (isPanelOverlayKind(o.kind) && p.size() >= 76) {
+        const uint32_t n = getU32(d + 72);
+        if ((p.size() - 76) / 16 < n) {
+            return std::nullopt;
+        }
+        o.drag.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint8_t* r = d + 76 + size_t(i) * 16;
+            o.drag.push_back(Rect{getI32(r), getI32(r + 4), getI32(r + 8), getI32(r + 12)});
+        }
+    }
     return o;
+}
+
+bool isPanelOverlayKind(uint32_t kind)
+{
+    return kind == OVERLAY_KIND_TOOLBAR || kind == OVERLAY_KIND_SOFTKEYBOARD;
 }
 
 std::optional<std::vector<CandidateHitRect>> decodeCandidateRects(const Bytes& p)

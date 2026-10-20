@@ -73,7 +73,7 @@ impl Coordinator {
             let al = &rt.config.schema.english.auto_learn;
             (al.enabled, al.promote_count)
         };
-        if !enabled || !learnable(text) {
+        if !enabled || !learnable(text) || self.learning_suspended() {
             return;
         }
         let Some(store) = self.store.as_ref() else {

@@ -54,7 +54,7 @@ pub fn theme_chain_dirs(dirs: &[PathBuf], name: &str) -> Vec<PathBuf> {
         }
         let base = std::fs::read_to_string(d.join(THEME_FILE))
             .ok()
-            .and_then(|t| toml::from_str::<Value>(&t).ok())
+            .and_then(|t| t.parse::<Value>().ok())
             .and_then(|v| {
                 v.get("base")
                     .and_then(|b| b.as_str())
@@ -78,13 +78,15 @@ pub fn read_meta(dirs: &[PathBuf], name: &str) -> Option<Meta> {
 
 /// 从主题 toml 文本解析其 meta（不读盘；用于导入时取主题名）。
 pub fn meta_from_text(text: &str) -> Option<Meta> {
-    let v: Value = toml::from_str(text).ok()?;
+    let v: Value = text.parse().ok()?;
     v.get("meta")?.clone().try_into().ok()
 }
 
 /// 校验主题 toml 文本可解析为合法 Theme（导入前校验）。Err 含原因。
 pub fn validate_text(text: &str) -> anyhow::Result<()> {
-    let v: Value = toml::from_str(text).map_err(|e| anyhow::anyhow!("TOML 解析失败: {}", e))?;
+    let v: Value = text
+        .parse::<Value>()
+        .map_err(|e| anyhow::anyhow!("TOML 解析失败: {}", e))?;
     let n = normalize_theme(v);
     let _theme: Theme = n
         .try_into()
@@ -148,7 +150,8 @@ fn load_merged_dirs_at(dirs: &[PathBuf], name: &str, depth: usize) -> anyhow::Re
     let path = dir.join(THEME_FILE);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("read theme {}: {}", path.display(), e))?;
-    let value: Value = toml::from_str(&text)
+    let value: Value = text
+        .parse::<Value>()
         .map_err(|e| anyhow::anyhow!("parse theme {}: {}", path.display(), e))?;
     // **归一化在合并之前，逐层各做一次**（`normalize_theme` 对已归一化的输入幂等）。
     //

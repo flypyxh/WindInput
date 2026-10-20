@@ -11,15 +11,99 @@
 #include "ShmFrame.h"
 
 #include <cstdint>
+#include <optional>
+#include <utility>
+#include <vector>
 
 namespace windlinux {
 
 /// 指针在某层浮层上按下时做什么。对位 Windows：
 ///   - 状态气泡 `StatusTipMouse`：左键拖动，右键请求菜单；
 ///   - 悬停提示 `TooltipMouse`：只认右键（请求菜单），左键无动作；
-///   - Toast：Windows 没有鼠标交互，这里加的是「点一下提前关掉」（任意键）。
-enum class OverlayPress { None, Drag, Menu, Close };
+///   - Toast：Windows 没有鼠标交互，这里加的是「点一下提前关掉」（任意键）；
+///   - 工具栏 / 软键盘：命中、高亮、按键都在服务端，按下一律 `Forward`（原样报 CMD_PANEL_POINTER）。
+///     唯一例外是左键落在拖动区里——见下面带拖动区的重载。
+enum class OverlayPress { None, Drag, Menu, Close, Forward };
 OverlayPress overlayPressAction(uint32_t kind, uint8_t button);
+
+/// 同上，工具栏 / 软键盘另看按下点 `(x, y)`（位图内）是否落在该帧的拖动区 `drag` 里：左键落在
+/// 拖动区 → `Drag`，这次按下连同随后的移动、松开都由本端拖，松手只报一次 `pos.*`——按下**不能**
+/// 转给服务端，它收到拖动区里的按下会自己再发一次「已移动」，与 `pos.*` 重复。其余 → `Forward`。
+/// 别的 kind 忽略坐标，同两参版本。
+OverlayPress overlayPressAction(uint32_t kind, uint8_t button, int32_t x, int32_t y,
+                                const std::vector<Rect>& drag);
+
+/// 工具栏 / 软键盘拖完后上报用的信封 kind（`pos.toolbar` / `pos.softkeyboard`）；别的 kind 返回空。
+const char* panelPosKind(uint32_t kind);
+
+/// `host.fullscreen` 的去重：只在值变化时报。初值「不全屏」与服务端默认相同，故首次报不全屏不发。
+/// 服务重启后新服务回到默认，此时若仍全屏要补报一次（`resyncAfterRestart`）。
+class FullscreenReporter {
+public:
+    /// 宿主全屏状态变为 `on`：返回要不要发。
+    bool change(bool on)
+    {
+        if (on == fullscreen_) {
+            return false;
+        }
+        fullscreen_ = on;
+        return true;
+    }
+    /// 服务（重）启：返回要不要把「全屏」补报给新服务。
+    bool resyncAfterRestart() const { return fullscreen_; }
+
+private:
+    bool fullscreen_ = false;
+};
+
+/// Wayland 面板发起的菜单的认领：在 layer-shell 面板上按下 / 松开（转给了服务端）后，随后
+/// `kWindowUs` 内来的第一张菜单帧算面板的（工具栏右键、设置键），开在面板所在输出的底板上。
+/// 期间本端若另有一处发起了菜单请求（X11 候选右键、气泡菜单…），那张菜单不是面板的：`clear`。
+class PanelMenuGate {
+public:
+    static constexpr uint64_t kWindowUs = 1500 * 1000;
+    void note(uint32_t output, uint64_t nowUs)
+    {
+        output_ = output;
+        at_ = nowUs;
+    }
+    void clear()
+    {
+        at_ = 0;
+        claimed_ = false;
+    }
+    bool pending(uint64_t nowUs) const { return at_ != 0 && nowUs - at_ < kWindowUs; }
+    /// 认领：返回面板所在输出，此后不再 pending（一次按下只认一个菜单）。
+    uint32_t take()
+    {
+        at_ = 0;
+        claimed_ = true;
+        return output_;
+    }
+    /// 服务端用隐藏帧收起了菜单。收的是认领到的那张时重新开窗、记回同一输出：分格菜单的「更多…」
+    /// 是先收分格菜单、紧接着推主菜单，主菜单帧也要开回那块屏的底板上——落进候选 popup 的话，屏幕
+    /// 坐标被当成 popup 内坐标，画布撑大、整块被合成器挤走。收的是本端请求的菜单则不动。
+    void serverClosed(uint64_t nowUs)
+    {
+        if (claimed_) {
+            claimed_ = false;
+            at_ = nowUs;
+        }
+    }
+
+private:
+    uint32_t output_ = 0;
+    uint64_t at_ = 0;
+    bool claimed_ = false; // 当前（最近一张）屏幕菜单是认领来的
+};
+
+/// 宿主全屏状态该怎么报：Wayland 会话（工具栏摆在 layer-shell 上）里一律不全屏——X11 那套只看
+/// XWayland 的 `_NET_ACTIVE_WINDOW`，焦点切到原生 Wayland 应用时它不变，全屏态复位不了，工具栏
+/// 会一直藏着；Wayland 下靠 TOP 层被全屏应用盖住来近似。纯 X11 会话照报。
+inline bool effectiveFullscreen(bool x11Fullscreen, bool waylandPanels)
+{
+    return x11Fullscreen && !waylandPanels;
+}
 
 /// 右键某层浮层时 `menu.open` 的 target（MENU_TARGET_STATUS / MENU_TARGET_TOOLTIP）；
 /// 该层没有菜单返回 MENU_TARGET_MAIN（调用方不应走到这里）。
@@ -60,6 +144,15 @@ constexpr uint32_t kTipGraceMs = 280;
 constexpr uint32_t kTipSwitchMs = 150;
 uint32_t hoverDeferMs(int32_t last, int32_t raw, bool tipShown);
 
+/// 指针从 (px, py) 移到 (nx, ny) 这一步是不是朝着悬停提示 `tip` 去。是的话延后的悬停变化按
+/// kTipSwitchMs 顺延（展开态的提示停靠在窗口外侧，过去要横穿好几格）。对位 Windows
+/// `candidate_window::heading_to_tip`：沿提示所在那一侧在靠近，且偏离提示跨度不比靠近快。
+bool headingToTip(int32_t px, int32_t py, int32_t nx, int32_t ny, const Rect& tip);
+
+/// 点到提示的距离（沿提示所在那一侧的轴；在提示上为 0）。只有刷新到本次宽限的新低才顺延：
+/// 指针停着抖动时一来一回刷不出新低，不会把切换无限拖住。对位 Windows `tip_gap`。
+int32_t tipGap(int32_t x, int32_t y, const Rect& tip);
+
 /// 「不改悬停」的哨兵（`tipRecheckHover` 的返回值）。
 constexpr int32_t kKeepHover = INT32_MIN;
 
@@ -99,5 +192,45 @@ private:
 
 /// 窗口矩形里是否包含屏幕点（半开区间）。
 bool rectContains(const Rect& r, int32_t x, int32_t y);
+
+/// 工具栏 / 软键盘的窗口夹进工作区（内容盒即整幅位图）：先右 / 下再左 / 上，比工作区还大时
+/// 保住左上角可见。与 `placeOverlay` 的末步同一条规则。服务端记下的位置可能落在换过布局的
+/// 显示器外面，首帧按 EXACT 摆、靠这里拉回来。
+Rect clampToWorkArea(const Rect& r, const Rect& workArea);
+
+/// `_NET_WM_STATE` 的原子列表里是否有 `_NET_WM_STATE_FULLSCREEN`（`fullscreenAtom` 为 0 表示
+/// 没拿到该原子，一律不认）。
+bool hasFullscreenState(const std::vector<uint32_t>& states, uint32_t fullscreenAtom);
+
+/// 一块输出的工作区：输出矩形 ∩ `_NET_WORKAREA`（窗口管理器只给整个虚拟屏一块，常见做法是
+/// 与各输出求交）。没有该属性、或交集为空（属性与输出布局对不上）时取整块输出。
+Rect outputWorkArea(const Rect& output, const std::optional<Rect>& netWorkArea);
+
+/// 屏幕点落在第几块输出（半开区间）；都不在返回 -1。
+int outputIndexAt(const std::vector<Rect>& outputs, int32_t x, int32_t y);
+
+/// 窗口中心落在第几块输出；都不在时取 `fallback`（越界取第一块），没有输出返回 -1。
+/// 工具栏 / 软键盘按它决定摆在哪块屏、夹进哪块工作区。
+int panelOutputIndex(const std::vector<Rect>& outputs, const Rect& window, int fallback);
+
+// ── Wayland 面板坐标 ──
+// 工具栏 / 软键盘在 Wayland 下的「屏幕坐标」= 合成器全局逻辑坐标（xdg-output 的 logical_position
+// 起算）× 服务端此刻的光栅化缩放，单位与位图像素一致——同状态气泡固定位置的约定，服务端拿位图
+// 宽高与坐标做加减时不必再折算。layer surface 只能按「所在输出 + 锚定边 + 边距」摆，边距是逻辑
+// 像素，故两头换算。缩放不是正数时按 1。
+
+/// 逻辑矩形 → 面板屏幕坐标（四个量各自 × 缩放取整）。
+Rect scaleRect(const Rect& logical, double scale);
+/// 面板屏幕坐标里的窗口左上 → 该输出上 top|left 锚定的边距（逻辑像素，左、上）。
+std::pair<int32_t, int32_t> layerMarginFor(int32_t x, int32_t y, const Rect& outputLogical,
+                                           double scale);
+/// 面板落位用的输出可用区（逻辑坐标）：原点取输出原点，宽高取探测 layer surface（四边锚定、
+/// 独占区 0）configure 来的尺寸——合成器扣掉了任务栏这类独占区。top|left 锚定的边距本就相对
+/// 可用区起算，原点不必挪；上 / 左边有任务栏时原点与真实可用区差一条任务栏，只影响越界判定。
+/// 某一维没量到（≤ 0）或比输出还大（不可信）时那一维取整块输出。
+Rect layerUsableArea(const Rect& outputLogical, int32_t availW, int32_t availH);
+/// `layerMarginFor` 的反向：边距 → 面板屏幕坐标里的窗口左上。缩放 ≥ 1 时两者往返不漂。
+std::pair<int32_t, int32_t> layerOriginFor(int32_t marginLeft, int32_t marginTop,
+                                           const Rect& outputLogical, double scale);
 
 } // namespace windlinux

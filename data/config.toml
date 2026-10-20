@@ -987,6 +987,11 @@ cancel_on_mode_switch = false
 #   "english" — 一律进英文（取消大写接着打小写）
 #   "toggle"  — 照常切换：Shift 翻转中英，Ctrl+空格 按它自己的切换方向
 mode_after_cancel = "chinese"
+# 打字中按 CapsLock 切换时，正在打的编码转大写上屏（打 wps 得 WPS）：开大写那一下，以及
+# CapsLock 作中英切换键（[keys] toggle_mode_keys）切到英文那一下，都转。
+# 只管大小写：上不上屏由 [keys] commit_on_switch 决定（临时英文总会上屏）；已选定的字词不转。
+# CapsLock 在打字时绑了别的动作（keys.session_actions / 英文大小写档位键）时不走这里。
+commit_upper = false
 [input.temp_pinyin]
 enabled = true
 trigger_keys = ["backtick"]
@@ -1170,6 +1175,10 @@ candidate_prefix = "⚡"
 min_prefix = 2
 
 [keys]
+# 中英切换键，可选 lshift / rshift / lctrl / rctrl / capslock。
+# capslock（仅 Windows）：短按切中英，按住 0.5 秒以上松开才开关大写锁定；大写开着时、在密码框里
+#   短按也是开关大写；带 Shift / Ctrl / Alt / Win 时交还系统。为此会装全局键盘钩子，
+#   只在本输入法所在的程序处于前台时拦下 CapsLock。
 toggle_mode_keys = ["lshift", "rshift"]
 commit_on_switch = true
 # Ctrl+空格 切换中英文。关掉后 Ctrl+空格 原样交给应用（如 IDEA 的代码提示）。
@@ -1251,7 +1260,8 @@ key_actions = {}
 # 两张表可以给同一个键各配一份，各自在各自的条件下生效（如 Tab 打字时翻页，没在打字时
 # 仍是宿主的制表符）。
 # 键名：tab / shift+tab / capslock / pageup / pagedown / up / down / left / right / home /
-#       end，以及符号键 minus equal lbracket rbracket comma period semicolon quote 等。
+#       end，lshift / rshift / lctrl / rctrl（单按一下、松开时生效），
+#       以及符号键 minus equal lbracket rbracket comma period semicolon quote 等。
 #       只认 shift+ 一种前缀；带 ctrl/alt 的组合键请写在上面的 key_actions 里。
 # 动词：page_prev / page_next / highlight_up / highlight_down
 #       cancel(放弃当前输入，等同 Esc；别名 clear) / none(在本态禁用该键)
@@ -1268,6 +1278,9 @@ key_actions = {}
 #           都一样。只在有候选时生效，没候选时这个键照常。临时英文里开了「空格作输入」
 #           时它仍是上屏高亮——想用别的键代替空格选词，就绑这个。联想候选跟随
 #           [input.association] space_commits：那里关掉时它也不选联想)
+#       commit_code(上屏编码，同回车上屏编码，但不看 [input] enter_behavior：那里设成
+#           清空编码时，这个键仍上屏编码。打了码没出候选时也能按，没在打字、联想候选时
+#           这个键照常。极点 / 小鸭的习惯是 lctrl = "commit_code")
 #       command:<表达式>(执行一段命令，写法同上面 key_actions 的 command:。正在打的码原样
 #           留着，不上屏也不清空；打了码还没出候选时也能按，没在打字时这个键照常)
 # 例（Tab 向下翻页、CapsLock 向上翻页）：
@@ -1306,6 +1319,14 @@ select_char_keys = []
 number_key = "ignore"
 select_key = "ignore"
 select_char_key = "ignore"
+# 翻页键翻不动时（首页按上翻、末页按下翻）：ignore=吞键 / commit_and_input=上屏高亮候选并
+# 输出该键的符号（与直接按标点同一条通路：中文标点、全角、自动配对照常生效）。
+# 只对能出字的翻页键生效（- = , . [ ]），PageUp/PageDown 不受影响；只在本批候选**从未翻过页**
+# 时生效——翻过页再翻回首页，那一下仍是吞键，免得翻页中途打出符号。末页按下翻若触发了检索
+# 范围放宽（scope_relax.page_end_key），放宽优先、不上屏。
+# ⚠ 与 input.buffer_symbol_chars 的优先级：其中的符号在组码中先进缓冲。出厂它是 "-"，所以首页
+#   按 - 仍是接着打码；想让首页的 - 也顶屏出字，需把 buffer_symbol_chars 清空（= 号不受影响）。
+page_key = "ignore"
 
 [ui.candidate]
 # 候选窗首显策略（全局默认档）：新组合的候选窗「何时」显示，是快与准之间的取舍。
@@ -1350,6 +1371,20 @@ min_window_height_vertical = 0
 # 只稳住候选区：翻页栏/编码栏的出现消失不在其量程内，要连这些一并罩住用
 # min_window_height_vertical（两项可同时配，取较大者）。
 min_rows = 0
+# 候选展开（卷轴）：候选多于一页时按翻页键，候选窗原地展开成多行网格，一行就是原来的一页。
+# 展开后 ↑↓ 换行、←→ 行内移动、翻页键一次滚一屏，数字键选高亮行；Esc 收起、再按一次取消。
+# 只对横排生效。
+grid_expand = false
+# 展开态的可见行数（2~10）。
+grid_rows = 5
+# 展开态每格最多显示几个字（0 = 只受 max_chars 约束）。超出部分在悬停提示里看全文。
+grid_cell_max_chars = 6
+# 展开态下序号（与数字键）从高亮行往下怎么顺延：rows = 只补整行（每页 5 个时下一行 6~0）、
+# cells = 逐格编到 0（可以停在半行）、off = 只编高亮行。
+grid_index_fill = "rows"
+# 展开态的分类标签（Tab / Shift+Tab 或鼠标点击切换）：all 全部、single 单字、phrase 词组、
+# rare 生僻、symbol 符号。只决定有哪些，顺序固定按这个次序；少于两个时不显示标签栏。
+grid_categories = ["all", "single", "phrase", "rare"]
 # 候选注释总开关。关掉后候选不再显示注释（含上方注释条），下面三层注释模板（全局 / 方案 /
 # 模式）一律不生效；关掉后不再计算注释，也不再为它预载反查编码、拆字等数据，省内存。
 # 此时 input.alt_commit = "comment" 按 "off" 处理（Alt+数字照常归程序）。

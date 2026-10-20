@@ -63,11 +63,12 @@ pub(crate) struct MenuOpenRequest {
 /// Windows 下它显隐的是跟随光标的悬浮工具栏窗口；macOS 下 `UpdateToolbar` 被
 /// `manager_macos` 编码成 mode_status 帧，最终落到 `ModeStatusController` 的
 /// `NSStatusItem.isVisible` —— 显隐的是菜单栏里那个中/英状态图标，压根没有悬浮工具栏。
-/// 照搬「显示工具栏」会让 mac 用户去找一个不存在的东西。
+/// 照搬「显示工具栏」会让 mac 用户去找一个不存在的东西。Linux 外部宿主形态显隐的是悬浮工具栏，
+/// 与 Windows 同一个实体，故按 macOS / 其余两档分，而不是按 `ext_presenter` 分。
 ///
 /// 常量而非各处字面量：三处菜单（IMK 输入源 / 候选框右键 / 状态指示器下拉）必须字字一致，
 /// 这正是本次统一要解决的问题，散成字面量迟早再次跑偏。
-pub(crate) const TOOLBAR_MENU_LABEL: &str = if cfg!(ext_presenter) {
+pub(crate) const TOOLBAR_MENU_LABEL: &str = if cfg!(target_os = "macos") {
     "显示状态图标"
 } else {
     "显示工具栏"
@@ -241,6 +242,8 @@ impl Coordinator {
             // 侧解释成"当前鼠标处"）——用户刚在那里点过，比回头去算工具栏几何更贴合，
             // 也不必把上一个菜单的锚点一路带过来。
             MenuCmd::OpenMainMenu => {
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.send_host_work_area();
                 self.show_main_menu(wind_ui_types::MenuAnchor::at_point(i32::MIN, i32::MIN));
             }
             MenuCmd::SoftKeyboardPage(i) => {
@@ -2050,27 +2053,6 @@ impl Coordinator {
             ]
         };
 
-        // Linux 摘掉这两项（`docs/design/linux-port.md` §2 精简范围）：
-        // - 工具栏 / 状态图标开关：它只翻 `toolbar_visible`，落点是 `UpdateToolbar` → forwarder 推
-        //   `CMD_MODE_STATUS`，而 addon 不接这一帧（没有工具栏，也还没有托盘指示器）——点了没有
-        //   任何可见变化。设置端同理藏了 `ui.toolbar.visible`。
-        // - 软键盘：Linux 的 `open_softkeyboard` 直接拒绝开启（没有面板，见那里的注释），菜单项
-        //   点了同样毫无反应。
-        #[cfg(not(all(target_os = "linux", ext_presenter)))]
-        let display_toggles = vec![
-            M::leaf(
-                TOOLBAR_MENU_LABEL,
-                cmd(MenuCmd::ToggleToolbar),
-                true,
-                toolbar_vis,
-            ),
-            self.soft_keyboard_menu_item(),
-        ];
-        #[cfg(all(target_os = "linux", ext_presenter))]
-        let display_toggles: Vec<wind_ui_types::MenuItemSpec> = {
-            let _ = toolbar_vis;
-            Vec::new()
-        };
         let mut items = vec![
             M::submenu("输入方案", schema_children),
             M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
@@ -2079,7 +2061,18 @@ impl Coordinator {
             M::submenu("检索范围", filter_children),
             M::separator(),
         ];
-        items.extend(display_toggles);
+        // 宿主贴不了面板（Linux 旧 addon）时两项都是点了没反应的死开关，不给。
+        if self.host_has_panels() {
+            items.extend([
+                M::leaf(
+                    TOOLBAR_MENU_LABEL,
+                    cmd(MenuCmd::ToggleToolbar),
+                    true,
+                    toolbar_vis,
+                ),
+                self.soft_keyboard_menu_item(),
+            ]);
+        }
         items.extend([
             M::submenu("主题", theme_children),
             M::separator(),
@@ -2301,6 +2294,25 @@ impl Coordinator {
         }
     }
 
+    /// Linux：面板（工具栏）发起的菜单打开前，把 `host.display` 报的焦点输出工作区下发给 UI。
+    /// 菜单定位只认这份工作区（`open_menu_from_host` 那条由 addon 随请求带），缺了它子菜单
+    /// 不判空间直接朝右展开、也不往回夹，弹到屏外。没报过就不发，沿用 UI 现值。
+    ///
+    /// 不放进 `show_main_menu`：`open_menu_from_host` 也调它，那里的工作区是 addon 随请求报的，
+    /// 会被这份覆盖。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn send_host_work_area(&self) {
+        let work = *self.host_work.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((left, top, right, bottom)) = work {
+            let _ = self.ui_tx.send(UiCommand::SetWorkArea {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
+    }
+
     /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。
     pub(crate) fn forward_menu_key(&self, key_code: u32) -> bool {
         if !self.is_menu_open() {
@@ -2352,6 +2364,28 @@ impl Coordinator {
     /// - 无词库落点者（临拼/临英/混输/网址，以及特殊模式的空码浏览态）：仅提供复制。
     pub(crate) fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
         use wind_ui_types::MenuItemSpec as M;
+        // 右键落在分类标签上：不是候选，没有候选菜单。
+        if self.grid_tab_of_event(page_local).is_some() {
+            return;
+        }
+        // 悬停落到被右键的这一格：菜单开着时鼠标消息到不了候选窗，悬停停在上一次右键的那格，
+        // 在另一格上再右键（关旧菜单开新菜单）时，旧格的悬停底色就留在原处，看上去像高亮没跟过来。
+        let ui_idx = page_local as i32;
+        let hover_moved = self
+            .hover_index
+            .swap(ui_idx, std::sync::atomic::Ordering::Relaxed)
+            != ui_idx;
+        // 展开态下右键的是网格里的某一格：先把高亮切过去（菜单操作的就是高亮那一格），
+        // 再按页内下标走下面的原有逻辑。悬停变了而高亮没变时，下面单独补一帧。
+        let Some(page_local) = self.resolve_event_index(page_local, !hover_moved) else {
+            return;
+        };
+        if hover_moved {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.candidates.is_empty() {
+                self.notify_ui_update(&st);
+            }
+        }
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
             return;
@@ -2363,7 +2397,7 @@ impl Coordinator {
         }
         let cand = state.candidates[idx].clone();
         let word = cand.text.clone();
-        let total = state.candidates.len();
+        let pos = self.reorder_positions(&state, idx);
         let scope = self.candidate_op_scope(&state);
         // 快捷输入的格式候选：判据独立于 candidate_op_scope（后者问「有没有词库落点」，
         // 混输没有，返回 None 是对的）。与写端 `candidate_or_quick_format_op` 同源。
@@ -2468,12 +2502,23 @@ impl Coordinator {
             let has_rule = has_rule && !emoji;
 
             vec![
-                M::leaf("置顶", op(CandidateOp::MoveTop), can_pin && idx > 0, false),
-                M::leaf("前移", op(CandidateOp::MoveUp), movable && idx > 0, false),
+                // 位置按完整列表计（分类筛选中 `idx` 只是子集下标），与写端同源。
+                M::leaf(
+                    "置顶",
+                    op(CandidateOp::MoveTop),
+                    can_pin && pos.here > 0,
+                    false,
+                ),
+                M::leaf(
+                    "前移",
+                    op(CandidateOp::MoveUp),
+                    movable && pos.here > 0,
+                    false,
+                ),
                 M::leaf(
                     "后移",
                     op(CandidateOp::MoveDown),
-                    movable && idx + 1 < total,
+                    movable && pos.here < pos.last,
                     false,
                 ),
                 M::leaf(delete_label, op(CandidateOp::Delete), delete_enabled, false),
@@ -2516,7 +2561,7 @@ impl Coordinator {
     /// 注意跳回只发生在**拖动结束之后**：拖动期间前台窗口未变，key 与缓存相同，
     /// 本函数一律 early-return，不会出现「拖到一半被拽走」。
     fn sync_toolbar_monitor(&self) {
-        let Some(mon) = focus_monitor() else {
+        let Some(mon) = self.current_monitor() else {
             return;
         };
         let key = mon.key;
@@ -2528,12 +2573,13 @@ impl Coordinator {
         //
         // 锁序 `current_toolbar_monitor` → `toolbar_anchors`，与 `save_toolbar_anchor`
         // 的取用先后一致（那边不嵌套）；⚠️ 新增取这两把锁的代码请沿用同一顺序。
+        let dedup = toolbar_dedup_key(&key, mon.work);
         let saved = {
             let mut cur = self
                 .current_toolbar_monitor
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if cur.as_deref() == Some(key.as_str()) {
+            if cur.as_deref() == Some(dedup.as_str()) {
                 return;
             }
             let saved = self
@@ -2542,7 +2588,14 @@ impl Coordinator {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&key)
                 .copied();
-            *cur = Some(key.clone());
+            // 无记录且工作区未知：下面不会发任何命令，也就不能记成「已校正」——否则工作区随后
+            // 报到（输出名不变）时会被去重挡掉，默认落点永远发不出去。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            if saved.is_none() && !work_known(mon.work) {
+                tracing::debug!("工具栏跟随焦点显示器 key={key}：无记录且工作区未知，不改位置");
+                return;
+            }
+            *cur = Some(dedup);
             saved
         };
         // ★ 记录必须真的落在这块屏上，否则当作"该屏没记过"。
@@ -2557,7 +2610,7 @@ impl Coordinator {
         // 据此删就会误删用户在别的显示器上的合法记录。只忽略、不删除——用户在本屏拖一次
         // 就自然覆盖成正确的 key。
         let saved = saved.filter(|&(right, bottom)| {
-            let ok = monitor_key_from_anchor(right, bottom).as_deref() == Some(key.as_str());
+            let ok = anchor_on_monitor(right, bottom, &key, mon.work);
             if !ok {
                 tracing::info!(
                     "工具栏记录 ({},{}) 不在 key={} 这块屏上，按未记录处理",
@@ -2570,6 +2623,8 @@ impl Coordinator {
         });
         let cmd = match saved {
             Some((right, bottom)) => UiCommand::SetToolbarAnchor { right, bottom },
+            // 工作区未知且无记录的情形已在上面临界区里返回：无从算右下角，维持 UI 现状，也别发一个
+            // 按 0 算出的负坐标——宿主夹回后会落到左上角。
             // 该屏从未拖过：交给 UI 侧按自己的尺寸算右下角（协调器不知道工具栏 w/h）。
             None => UiCommand::SetToolbarCorner {
                 work_right,
@@ -2583,9 +2638,9 @@ impl Coordinator {
     /// 启动时的初始定位：与运行期同一判据（前台窗口所在显示器），并把该 key 记进
     /// `current_toolbar_monitor`，使首个 notify_toolbar 不会重复下发。
     ///
-    /// 非 Windows 上 `focus_monitor` 恒为 None，故本函数恒为 no-op——位置恢复整体不生效。
-    /// 无实际影响：`manager_macos.rs` 的 forwarder 本就把 `SetToolbarAnchor`/`SetToolbarCorner`
-    /// 当留桩丢弃，工具栏在那边由 .app 原生承载。
+    /// macOS 上 `focus_monitor` 恒为 None，故本函数恒为 no-op——位置恢复整体不生效。
+    /// 无实际影响：macOS 的 forwarder 本就把 `SetToolbarAnchor`/`SetToolbarCorner` 当留桩丢弃，
+    /// 那边没有悬浮工具栏。Linux 外部宿主形态按 addon 报的输出名定位（见 [`Self::current_monitor`]）。
     ///
     /// 桌面构造路径（`new`）专用；headless/Android 入口不经此，故仅在无 desktop-ui 时放行
     /// dead_code——**不要**整体 feature 门控（同 impl 块的运行期工具栏逻辑配置重载仍要用）。
@@ -2601,12 +2656,21 @@ impl Coordinator {
     /// 键空间语义——取那侧问的是「焦点屏上记过什么位置」，存那侧答的是「这块屏上
     /// 工具栏在哪」，只有 key 同源才对得上。
     pub(crate) fn save_toolbar_anchor(&self, right: i32, bottom: i32) {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let key = self.panel_drop_key(wind_ipc::protocol::overlay::OVERLAY_KIND_TOOLBAR);
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
         let Some(key) = monitor_key_from_anchor(right, bottom) else {
             // 查不到显示器就别存：这块表的读取侧（`focus_monitor`）在同样的失败下返回
             // None，存进任何兜底 key 都只会是永远读不出来的垃圾。
             tracing::debug!("工具栏位置未保存：查不到 ({},{}) 所在显示器", right, bottom);
             return;
         };
+        self.store_toolbar_anchor(key, right, bottom);
+    }
+
+    /// [`Self::save_toolbar_anchor`] 的落盘半段：显示器 key 已由调用方定好。Linux 的 key 是 addon
+    /// 报的输出名，不经 `monitor_key_from_anchor`。
+    fn store_toolbar_anchor(&self, key: String, right: i32, bottom: i32) {
         // 拖到别的屏 = 用户在那块屏上重新定了位；同步当前屏记录，否则下一次
         // sync_toolbar_monitor 会认为「屏没变」而不再校正。
         {
@@ -2614,7 +2678,7 @@ impl Coordinator {
                 .current_toolbar_monitor
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *cur = Some(key.clone());
+            *cur = Some(self.toolbar_dedup_key_for_drop(&key));
         }
         let snapshot = {
             let mut map = self
@@ -2635,10 +2699,18 @@ impl Coordinator {
     /// 但**不碰** `current_toolbar_monitor`——那是工具栏跟随焦点换屏的去重缓存，
     /// 软键盘不参与那套跟随（它由用户显式开关，不跟着焦点跑）。
     pub(crate) fn save_softkeyboard_anchor(&self, right: i32, bottom: i32) {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let key = self.panel_drop_key(wind_ipc::protocol::overlay::OVERLAY_KIND_SOFTKEYBOARD);
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
         let Some(key) = monitor_key_from_anchor(right, bottom) else {
             tracing::debug!("软键盘位置未保存：查不到 ({},{}) 所在显示器", right, bottom);
             return;
         };
+        self.store_softkeyboard_anchor(key, right, bottom);
+    }
+
+    /// [`Self::save_softkeyboard_anchor`] 的落盘半段，key 的来历同 [`Self::store_toolbar_anchor`]。
+    fn store_softkeyboard_anchor(&self, key: String, right: i32, bottom: i32) {
         let snapshot = {
             let mut map = self
                 .softkeyboard_anchors
@@ -2657,7 +2729,7 @@ impl Coordinator {
     ///
     /// 查不到显示器时两者都是 `None`：UI 侧据此回退到自己的默认锚点。
     pub(crate) fn softkeyboard_placement(&self) -> SoftKeyboardPlacement {
-        let Some(mon) = focus_monitor() else {
+        let Some(mon) = self.current_monitor() else {
             return SoftKeyboardPlacement {
                 anchor: None,
                 work: None,
@@ -2674,12 +2746,92 @@ impl Coordinator {
             .copied();
         // 与 `sync_toolbar_monitor` 同一道闸门（理由见那里）：记录不在这块屏上就当
         // 没记过，落回该屏默认位置。软键盘的症状是"在副屏点开却开到主屏去"。
-        let anchor = saved.filter(|&(right, bottom)| {
-            monitor_key_from_anchor(right, bottom).as_deref() == Some(mon.key.as_str())
-        });
-        SoftKeyboardPlacement {
-            anchor,
-            work: Some(mon.work),
+        let anchor =
+            saved.filter(|&(right, bottom)| anchor_on_monitor(right, bottom, &mon.key, mon.work));
+        // 工作区未知（Linux 旧 addon）时不带：UI 侧回退到自己的默认落点。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let work = work_known(mon.work).then_some(mon.work);
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
+        let work = Some(mon.work);
+        SoftKeyboardPlacement { anchor, work }
+    }
+
+    /// Linux：addon 拖完 `kind` 浮层后的落盘键（`pos.*` 暂存，取一次即清）。没有暂存时按
+    /// `on_host_panel_dropped` 同一规则取焦点输出名。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn panel_drop_key(&self, kind: u32) -> String {
+        let dropped = self
+            .panel_drop_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&kind);
+        dropped.unwrap_or_else(|| self.host_focus_output())
+    }
+
+    /// Linux：addon 最近一次 `host.display` 报的焦点输出名，没报过 = `"default"`。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn host_focus_output(&self) -> String {
+        self.host_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| HOST_OUTPUT_DEFAULT.to_owned())
+    }
+
+    /// 拖动落盘时写进 `current_toolbar_monitor` 的去重键。Linux 的键带工作区（见
+    /// [`toolbar_dedup_key`]），落点输出就是焦点输出时取它此刻的工作区；落到别的输出则与焦点
+    /// 的键必然不同，下一次校正照常拽回焦点屏（同 Windows）。
+    fn toolbar_dedup_key_for_drop(&self, key: &str) -> String {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            let work = self
+                .host_work
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or((0, 0, 0, 0));
+            toolbar_dedup_key(key, work)
+        }
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
+        {
+            key.to_owned()
+        }
+    }
+
+    /// Linux addon 本地拖完工具栏 / 软键盘：记下落点输出名，再让渲染端同步位置。落盘要的是右下角，
+    /// 换算要用面板尺寸，所以由渲染端算好后经 `ToolbarMoved` / `SoftKeyboardMoved` 回报，
+    /// 走 [`Self::save_toolbar_anchor`] / [`Self::save_softkeyboard_anchor`] 那条与 Windows 相同的路。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub(crate) fn on_host_panel_dropped(&self, kind: u32, x: i32, y: i32, output: Option<String>) {
+        // 没报落点输出就记在焦点输出名下：与读取侧（`current_monitor`）同源，只有一边报了
+        // output 也不会错桶。
+        let key = output.unwrap_or_else(|| self.host_focus_output());
+        tracing::debug!("浮层 kind={kind} 拖到 ({x},{y}) output={key}");
+        self.panel_drop_output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(kind, key);
+        let _ = self.ui_tx.send(UiCommand::PanelMoved { kind, x, y });
+    }
+
+    /// 输入焦点所在显示器：工具栏 / 软键盘位置记忆的取用单位。
+    ///
+    /// Windows 问系统（[`focus_monitor`]）。Linux 外部宿主形态问不到屏幕几何，用 addon 经
+    /// `host.display` 报的焦点输出名分桶——没报过就落到固定键 `"default"`，退化成只记一个位置；
+    /// 工作区同样取它报的，没报则为全 0（见 `work_known`）。
+    pub(crate) fn current_monitor(&self) -> Option<MonitorInfo> {
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        {
+            let key = self.host_focus_output();
+            let work = self
+                .host_work
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or((0, 0, 0, 0));
+            Some(MonitorInfo { key, work })
+        }
+        #[cfg(not(all(target_os = "linux", ext_presenter)))]
+        {
+            focus_monitor()
         }
     }
 
@@ -3180,6 +3332,53 @@ fn monitor_info(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> Option<Monitor
     }
 }
 
+/// Linux 外部宿主形态拿不到输出名时的固定显示器键：所有屏共用一个位置。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub(crate) const HOST_OUTPUT_DEFAULT: &str = "default";
+
+/// 工作区是否有效（全 0 / 空矩形 = 不知道）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn work_known((left, top, right, bottom): (i32, i32, i32, i32)) -> bool {
+    right > left && bottom > top
+}
+
+/// 工具栏跟随焦点换屏的去重键（`current_toolbar_monitor` 里存的值）。
+///
+/// Windows 的显示器 key 本就含工作区右下角与缩放，分辨率一变 key 就变。Linux 的 key 只是输出名，
+/// 改分辨率、或工作区晚于输出名报到时名字都不变——单按名字去重会挡掉这两次校正，故拼上工作区。
+fn toolbar_dedup_key(key: &str, work: (i32, i32, i32, i32)) -> String {
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    {
+        let (left, top, right, bottom) = work;
+        format!("{key}@{left},{top},{right},{bottom}")
+    }
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
+    {
+        let _ = work;
+        key.to_owned()
+    }
+}
+
+/// 记下的右下角锚点还属不属于 `key` 这块屏（`work` 是它的工作区）。
+///
+/// Windows 按锚点反查显示器 key 比对（理由见 `sync_toolbar_monitor`）。Linux 的记录本就按输出名
+/// 分桶，查不了点所在的输出，只能看它是否还落在该输出的工作区里（换了分辨率 / 排列就不在了）；
+/// 工作区未知时照单全收，越界由宿主夹回。
+fn anchor_on_monitor(right: i32, bottom: i32, key: &str, work: (i32, i32, i32, i32)) -> bool {
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    {
+        let _ = key; // 记录已按输出名取出，key 必然相同
+        let (x, y) = anchor_probe_point(right, bottom);
+        let (left, top, wr, wb) = work;
+        !work_known(work) || (left..wr).contains(&x) && (top..wb).contains(&y)
+    }
+    #[cfg(not(all(target_os = "linux", ext_presenter)))]
+    {
+        let _ = work;
+        monitor_key_from_anchor(right, bottom).as_deref() == Some(key)
+    }
+}
+
 /// 窗口**右下角锚点**所在显示器的 key。查不到时返回 None。
 ///
 /// 失败语义要与 `focus_monitor` 对称——它同样在查不到时返回 None。此前这里回落到
@@ -3191,6 +3390,8 @@ fn monitor_info(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> Option<Monitor
 /// 右邻/下邻那块屏的 key 下 ⇒ 回到本屏读不到记录（像"没记住"）、切到邻屏却读到本屏
 /// 的坐标 ⇒ **工具栏跑到另一块屏上去，看起来像"不跟焦点窗口的显示器"**。
 /// ⚠️ 新增调用点一律传窗口右下角，不要在调用侧自己减 1（两处各减一次就减多了）。
+// Linux 外部宿主形态的记录按 addon 报的输出名分桶，不反查（见 `anchor_on_monitor`）。
+#[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
 fn monitor_key_from_anchor(right: i32, bottom: i32) -> Option<String> {
     let (x, y) = anchor_probe_point(right, bottom);
     monitor_key_from_point(x, y)
@@ -3214,6 +3415,7 @@ fn anchor_probe_point(right: i32, bottom: i32) -> (i32, i32) {
 /// ⚠️ 传进来的必须是**落在目标窗口/屏幕内**的点。要用窗口右下角定位请走
 /// [`monitor_key_from_anchor`]，它负责把排他边界退成屏内点。
 #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] // 显示器查询仅 Windows 有
+#[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
 fn monitor_key_from_point(x: i32, y: i32) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -3241,6 +3443,8 @@ fn monitor_key_from_point(x: i32, y: i32) -> Option<String> {
 ///
 /// 前台窗口是桌面/Shell（无应用在前台）时回退到光标所在屏：仍是同一层的「屏幕上某点」，
 /// 只是换了个更弱的信号源，不引入跨层耦合。
+// Linux 外部宿主形态改问 addon 的报告（见 `Coordinator::current_monitor`）。
+#[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
 pub(crate) fn focus_monitor() -> Option<MonitorInfo> {
     #[cfg(target_os = "windows")]
     {
@@ -3541,8 +3745,8 @@ mod tests {
     /// 回归背景：IMK 输入源菜单走精简树 `build_menu_items_macos()`、候选框右键与状态指示器
     /// 走完整树 `build_main_menu_items()`，两棵树各自维护 → 精简树当初把这项砍了，同一个
     /// 输入法在两处菜单里表现不一。这条测试同时钉住「都在」和「同名」。
-    // 只在 macOS：Linux 的完整菜单刻意摘掉了这一项（addon 不接状态帧，见 build_main_menu_items），
-    // 由 `linux_menu_tests::main_menu_drops_items_without_a_linux_landing` 钉住。
+    // 只在 macOS：Linux 的文案是「显示工具栏」，由
+    // `linux_panel_tests::main_menu_has_toolbar_and_softkeyboard_on_linux` 钉住。
     #[cfg(target_os = "macos")]
     #[test]
     fn toolbar_toggle_present_in_both_macos_menu_trees() {
@@ -4010,8 +4214,6 @@ impl Coordinator {
     ///
     /// 面多于一个时才给子菜单——只有一面的话，子菜单里孤零零一项，点它和点父项
     /// 效果一样，纯属多一层。
-    // Linux 主菜单摘掉了软键盘项（见 `build_main_menu_items`）。
-    #[cfg_attr(all(target_os = "linux", ext_presenter), allow(dead_code))]
     pub(crate) fn soft_keyboard_menu_item(&self) -> wind_ui_types::MenuItemSpec {
         use wind_ui_types::MenuItemSpec as M;
         let on = self.softkeyboard_is_open();
@@ -4485,12 +4687,10 @@ mod linux_menu_tests {
     fn main_menu_drops_items_without_a_linux_landing() {
         let (c, _rx) = coord();
         let all = labels(&c.build_main_menu_items());
-        for gone in [TOOLBAR_MENU_LABEL, "软键盘", "输入诊断 HUD"] {
-            assert!(
-                !all.iter().any(|l| l == gone),
-                "Linux 主菜单不该有「{gone}」"
-            );
-        }
+        assert!(
+            !all.iter().any(|l| l == "输入诊断 HUD"),
+            "Linux 主菜单不该有「输入诊断 HUD」"
+        );
         // 邻项还在：cfg 没把整块吞掉。
         for kept in [
             "输入方案",
@@ -4849,5 +5049,527 @@ mod linux_menu_tests {
         assert!(c.forward_menu_key(keymap::VK_DOWN));
         let touched = c.state.lock().unwrap().menu_touched_at.unwrap();
         assert!(touched > old, "菜单键刷新空闲计时");
+    }
+}
+
+/// Linux 外部宿主形态的工具栏 / 软键盘入口：主菜单、热键、addon 的位置 / 全屏 / 指针回报。
+/// 渲染与鼠标状态机在 wind-ui 的 forwarder 里测，这里只钉协调器这一侧的接线。
+#[cfg(all(test, target_os = "linux", ext_presenter))]
+mod linux_panel_tests {
+    use super::*;
+    use crate::coordinator::Coordinator;
+    use std::sync::mpsc::Receiver;
+    use wind_bridge::handler::{KeyEventData, MessageHandler};
+    use wind_ipc::protocol::ext_kind;
+
+    /// 已声明面板能力的 addon（当前版本的 addon 每次 `host.display` 都带 `panels`）。
+    fn coord() -> (std::sync::Arc<Coordinator>, Receiver<UiCommand>) {
+        let (c, rx) = Coordinator::new_headless_with_ui(Config::default(), None);
+        c.handle_ext(ext_kind::HOST_DISPLAY, br#"{"panels":true}"#);
+        (c, rx)
+    }
+
+    fn drain(rx: &Receiver<UiCommand>) -> Vec<UiCommand> {
+        rx.try_iter().collect()
+    }
+
+    fn labels(items: &[wind_ui_types::MenuItemSpec]) -> Vec<String> {
+        let mut out = Vec::new();
+        for it in items {
+            out.push(it.label.clone());
+            out.extend(labels(&it.children));
+        }
+        out
+    }
+
+    /// 文案用 Windows 的「显示工具栏」：Linux 显隐的是悬浮工具栏，不是 macOS 的菜单栏图标。
+    #[test]
+    fn main_menu_has_toolbar_and_softkeyboard_on_linux() {
+        let (c, _rx) = coord();
+        let all = labels(&c.build_main_menu_items());
+        assert_eq!(TOOLBAR_MENU_LABEL, "显示工具栏");
+        for want in ["显示工具栏", "软键盘"] {
+            assert!(all.iter().any(|l| l == want), "缺「{want}」：{all:?}");
+        }
+        assert!(!all.iter().any(|l| l == "显示状态图标"), "{all:?}");
+    }
+
+    /// 新服务 + 旧 addon（升级 deb 后没重启 fcitx5）：旧 addon 不报 `panels`，也不认软键盘浮层。
+    /// 热键 / 菜单都不能把主键区接管走，菜单里不出两个死开关；声明后照常；addon 断线即复位，
+    /// 下一个连上来的实例得重新声明。
+    #[test]
+    fn softkeyboard_needs_panels_declared_by_host() {
+        use wind_bridge::handler::KeyAction;
+        use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_SHIFT};
+        let (c, _rx) = Coordinator::new_headless_with_ui(Config::default(), None);
+        let ctrl_shift_k = KeyEventData {
+            key_code: 0x4B,
+            scan_code: 0,
+            modifiers: MOD_CTRL | MOD_SHIFT,
+            event_type: EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        };
+        let refused = |c: &Coordinator| {
+            assert!(matches!(c.open_softkeyboard(None), KeyAction::PassThrough));
+            c.handle_key_event(&ctrl_shift_k);
+            c.softkeyboard_menu_toggle(None);
+            assert!(!c.softkeyboard_is_open(), "未声明面板能力不得开软键盘");
+            let all = labels(&c.build_main_menu_items());
+            for no in ["显示工具栏", "软键盘"] {
+                assert!(!all.iter().any(|l| l == no), "不该有「{no}」：{all:?}");
+            }
+        };
+        refused(&c);
+        // 旧 addon 的 host.display 不带 panels：不改现值。
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"caret_free":false,"caret_trusted":true,"inline_preedit":true,"scale":1.00}"#,
+        );
+        refused(&c);
+
+        c.handle_ext(ext_kind::HOST_DISPLAY, br#"{"panels":true}"#);
+        assert!(matches!(c.open_softkeyboard(None), KeyAction::Consumed));
+        assert!(c.softkeyboard_is_open(), "声明后应开得出来");
+        c.close_softkeyboard();
+        c.handle_key_event(&ctrl_shift_k);
+        assert!(c.softkeyboard_is_open(), "声明后 ctrl+shift+k 应开得出来");
+        c.close_softkeyboard();
+
+        c.handle_client_disconnected();
+        refused(&c);
+    }
+
+    #[test]
+    fn host_fullscreen_forwards_to_ui() {
+        let (c, rx) = coord();
+        c.handle_ext(ext_kind::HOST_FULLSCREEN, br#"{"fullscreen":true}"#);
+        c.handle_ext(ext_kind::HOST_FULLSCREEN, br#"{"fullscreen":false}"#);
+        let got: Vec<bool> = drain(&rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                UiCommand::SetHostFullscreen(on) => Some(on),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, [true, false]);
+        // 坏载荷不能当成「退出全屏」：那会让工具栏在全屏应用上冒出来。
+        c.handle_ext(ext_kind::HOST_FULLSCREEN, br#"{"fullscreen":1}"#);
+        c.handle_ext(ext_kind::HOST_FULLSCREEN, b"oops");
+        assert!(
+            !drain(&rx)
+                .iter()
+                .any(|m| matches!(m, UiCommand::SetHostFullscreen(_)))
+        );
+    }
+
+    /// addon 报的面板指针事件原样转给渲染端，由它翻译成 `WM_*`。
+    #[test]
+    fn panel_pointer_forwards_to_ui() {
+        let (c, rx) = coord();
+        c.on_panel_pointer(11, 2, 1, -5, 40);
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::PanelPointer {
+                    kind: 11,
+                    event: 2,
+                    button: 1,
+                    x: -5,
+                    y: 40
+                }
+            )),
+            "指针事件没转给渲染端"
+        );
+    }
+
+    /// addon 断线（崩溃）时正按住软键盘的键：它再也报不来松开。就地给两块面板各补一次离开，
+    /// 连发当场停（不等新 addon 连上）。
+    #[test]
+    fn client_disconnect_sends_panel_leave() {
+        use wind_ipc::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
+        use wind_ipc::protocol::panel_pointer::PANEL_POINTER_LEAVE;
+        let (c, rx) = coord();
+        c.handle_client_disconnected();
+        let mut left: Vec<u32> = drain(&rx)
+            .iter()
+            .filter_map(|m| match m {
+                UiCommand::PanelPointer { kind, event, .. } if *event == PANEL_POINTER_LEAVE => {
+                    Some(*kind)
+                }
+                _ => None,
+            })
+            .collect();
+        left.sort_unstable();
+        assert_eq!(left, [OVERLAY_KIND_TOOLBAR, OVERLAY_KIND_SOFTKEYBOARD]);
+    }
+
+    fn panel_moved(cmds: &[UiCommand]) -> Vec<(u32, i32, i32)> {
+        cmds.iter()
+            .filter_map(|m| match m {
+                UiCommand::PanelMoved { kind, x, y } => Some((*kind, *x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `pos.toolbar` 按落点输出名分桶：两块屏各记各的，互不覆盖。落盘的右下角由渲染端按面板尺寸
+    /// 换算后回报（这里用 `inject_ui_event` 扮演渲染端）；没报输出名的落到 `"default"`。
+    #[test]
+    fn pos_toolbar_saves_anchor_per_output() {
+        use wind_ui_types::UiEvent;
+        let (c, rx) = coord();
+        c.handle_ext(
+            ext_kind::POS_TOOLBAR,
+            br#"{"x":100,"y":200,"output":"HDMI-1"}"#,
+        );
+        assert_eq!(panel_moved(&drain(&rx)), [(10, 100, 200)]);
+        c.inject_ui_event(UiEvent::ToolbarMoved {
+            right: 300,
+            bottom: 240,
+        });
+        c.handle_ext(
+            ext_kind::POS_TOOLBAR,
+            br#"{"x":3000,"y":500,"output":"DP-1"}"#,
+        );
+        assert_eq!(panel_moved(&drain(&rx)), [(10, 3000, 500)]);
+        c.inject_ui_event(UiEvent::ToolbarMoved {
+            right: 3200,
+            bottom: 540,
+        });
+        {
+            let map = c.toolbar_anchors.lock().unwrap();
+            assert_eq!(map.get("HDMI-1"), Some(&(300, 240)));
+            assert_eq!(map.get("DP-1"), Some(&(3200, 540)));
+        }
+        c.handle_ext(ext_kind::POS_SOFTKEYBOARD, br#"{"x":5,"y":6}"#);
+        assert_eq!(panel_moved(&drain(&rx)), [(11, 5, 6)]);
+        c.inject_ui_event(UiEvent::SoftKeyboardMoved {
+            right: 805,
+            bottom: 306,
+        });
+        assert_eq!(
+            c.softkeyboard_anchors.lock().unwrap().get("default"),
+            Some(&(805, 306))
+        );
+
+        // 焦点回到哪块屏，就取那块屏的记录。
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"HDMI-1","work":[0,0,1920,1080]}"#,
+        );
+        c.sync_toolbar_monitor();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarAnchor {
+                    right: 300,
+                    bottom: 240
+                }
+            )),
+            "回到 HDMI-1 要取它自己的记录"
+        );
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"DP-1","work":[1920,0,3840,1080]}"#,
+        );
+        c.sync_toolbar_monitor();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarAnchor {
+                    right: 3200,
+                    bottom: 540
+                }
+            )),
+            "切到 DP-1 要取 DP-1 的记录"
+        );
+    }
+
+    /// 记下的位置不在当前输出的工作区里（拔屏、改分辨率）：工具栏回到该屏右下角、软键盘回到
+    /// 默认落点，不把面板画到屏外。
+    #[test]
+    fn stale_anchor_falls_back_to_default() {
+        let (c, rx) = coord();
+        c.toolbar_anchors
+            .lock()
+            .unwrap()
+            .insert("DP-1".into(), (5000, 3000));
+        c.softkeyboard_anchors
+            .lock()
+            .unwrap()
+            .insert("DP-1".into(), (5000, 3000));
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"DP-1","work":[0,0,1920,1080]}"#,
+        );
+        c.sync_toolbar_monitor();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarCorner {
+                    work_right: 1920,
+                    work_bottom: 1080
+                }
+            )),
+            "失效的记录要回落到该屏右下角"
+        );
+        let p = c.softkeyboard_placement();
+        assert_eq!(p.anchor, None, "失效的软键盘记录不能下发");
+        assert_eq!(p.work, Some((0, 0, 1920, 1080)), "默认落点按该屏工作区算");
+    }
+
+    /// `host.display` 的输出名与工作区成对更新：只报新输出名时不能沿用旧输出的工作区；两者都不报
+    /// （只报缩放等）则不改。
+    #[test]
+    fn host_display_output_and_work_are_a_pair() {
+        let (c, _rx) = coord();
+        let mon = |c: &Coordinator| {
+            let m = c.current_monitor().unwrap();
+            (m.key, m.work)
+        };
+        assert_eq!(mon(&c), ("default".into(), (0, 0, 0, 0)), "没报过 = 固定键");
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"HDMI-1","work":[0,0,1920,1080]}"#,
+        );
+        c.handle_ext(ext_kind::HOST_DISPLAY, br#"{"scale":1.5}"#);
+        assert_eq!(mon(&c), ("HDMI-1".into(), (0, 0, 1920, 1080)));
+        c.handle_ext(ext_kind::HOST_DISPLAY, br#"{"output":"DP-1"}"#);
+        assert_eq!(mon(&c), ("DP-1".into(), (0, 0, 0, 0)));
+    }
+
+    /// 宿主没报工作区（旧 addon）：无从算默认落点，工具栏维持现状，而不是发一个按 0 算的右下角。
+    #[test]
+    fn unknown_work_area_keeps_toolbar_in_place() {
+        let (c, rx) = coord();
+        c.handle_ext(ext_kind::HOST_DISPLAY, br#"{"output":"DP-1"}"#);
+        c.sync_toolbar_monitor();
+        assert!(
+            !drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarCorner { .. } | UiCommand::SetToolbarAnchor { .. }
+            )),
+            "工作区未知时不该改工具栏位置"
+        );
+        assert_eq!(c.softkeyboard_placement().work, None);
+    }
+
+    /// 工作区晚于输出名报到（输出名不变）：前一次「无记录且工作区未知」没发命令，不能记成已校正，
+    /// 工作区一到就要下发默认落点。
+    #[test]
+    fn work_arriving_later_for_same_output_sends_corner() {
+        let (c, rx) = coord();
+        c.handle_ext(ext_kind::HOST_DISPLAY, br#"{"output":"DP-1"}"#);
+        c.sync_toolbar_monitor();
+        drain(&rx);
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"DP-1","work":[0,0,1920,1080]}"#,
+        );
+        c.sync_toolbar_monitor();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarCorner {
+                    work_right: 1920,
+                    work_bottom: 1080
+                }
+            )),
+            "工作区报到后要发默认落点"
+        );
+    }
+
+    /// 会话中途改分辨率：输出名不变、工作区缩小到记录之外，工具栏要回落默认，不能被去重挡掉。
+    #[test]
+    fn work_change_on_same_output_drops_stale_anchor() {
+        let (c, rx) = coord();
+        c.toolbar_anchors
+            .lock()
+            .unwrap()
+            .insert("DP-1".into(), (2500, 1400));
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"DP-1","work":[0,0,2560,1440]}"#,
+        );
+        c.sync_toolbar_monitor();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarAnchor {
+                    right: 2500,
+                    bottom: 1400
+                }
+            )),
+            "前置：记录在工作区内时照发"
+        );
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"DP-1","work":[0,0,1920,1080]}"#,
+        );
+        c.sync_toolbar_monitor();
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                UiCommand::SetToolbarCorner {
+                    work_right: 1920,
+                    work_bottom: 1080
+                }
+            )),
+            "工作区变小、记录越界要回落默认"
+        );
+    }
+
+    /// `pos.*` 没带落点输出名：记在焦点输出名下，与读取侧同一个桶——只有一边报 output 也不错键。
+    #[test]
+    fn pos_without_output_saves_under_focus_output() {
+        use wind_ui_types::UiEvent;
+        let (c, rx) = coord();
+        c.handle_ext(
+            ext_kind::HOST_DISPLAY,
+            br#"{"output":"HDMI-1","work":[0,0,1920,1080]}"#,
+        );
+        c.handle_ext(ext_kind::POS_TOOLBAR, br#"{"x":100,"y":200}"#);
+        c.inject_ui_event(UiEvent::ToolbarMoved {
+            right: 300,
+            bottom: 240,
+        });
+        c.handle_ext(ext_kind::POS_SOFTKEYBOARD, br#"{"x":5,"y":6}"#);
+        c.inject_ui_event(UiEvent::SoftKeyboardMoved {
+            right: 805,
+            bottom: 306,
+        });
+        drain(&rx);
+        assert_eq!(
+            c.toolbar_anchors.lock().unwrap().get("HDMI-1"),
+            Some(&(300, 240))
+        );
+        assert_eq!(
+            c.softkeyboard_anchors.lock().unwrap().get("HDMI-1"),
+            Some(&(805, 306))
+        );
+        assert!(!c.toolbar_anchors.lock().unwrap().contains_key("default"));
+    }
+
+    /// 工具栏 / 软键盘窗口产出的 UI 事件在 Linux 上照常落到处理函数：点软键盘格开面板、面板关闭
+    /// 按钮收面板、右键工具栏格弹自绘菜单（与 Windows 同一条 `ShowCandidateMenu`）。
+    #[test]
+    fn toolbar_and_softkeyboard_events_reach_handlers() {
+        use wind_ui_types::UiEvent;
+        let (c, rx) = coord();
+        c.inject_ui_event(UiEvent::Toolbar(ToolbarAction::ToggleSoftKeyboard));
+        assert!(c.softkeyboard_is_open(), "工具栏软键盘格没打开面板");
+        c.inject_ui_event(UiEvent::SoftKeyboardClose);
+        assert!(!c.softkeyboard_is_open(), "面板关闭按钮没收掉面板");
+        drain(&rx);
+        c.inject_ui_event(UiEvent::RequestToolbarMenu {
+            action: Some(ToolbarAction::ToggleSoftKeyboard),
+            anchor: MenuAnchor::at_point(10, 20),
+        });
+        assert!(
+            drain(&rx)
+                .iter()
+                .any(|m| matches!(m, UiCommand::ShowCandidateMenu { .. })),
+            "工具栏右键没弹菜单"
+        );
+        assert!(c.is_menu_open(), "菜单键要能路由给它");
+    }
+
+    /// 出厂的 `keys.softkeyboard`（ctrl+shift+k）与 `keys.toggle_toolbar`（ctrl+shift+\）在
+    /// Linux 上都编进按键热键表。软键盘那条走完整按键路径、翻转开关；工具栏那条只断言命中的
+    /// 动作——它的执行体会写用户目录下的 config.toml，单测碰不得，而分派表本身不分平台。
+    #[test]
+    fn toggle_hotkeys_work_on_linux() {
+        use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_SHIFT, calc_key_hash};
+        let (c, _rx) = coord();
+        let key = |vk: u32| KeyEventData {
+            key_code: vk,
+            scan_code: 0,
+            modifiers: MOD_CTRL | MOD_SHIFT,
+            event_type: EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        };
+        let vk_k = 0x4B;
+        assert!(!c.softkeyboard_is_open());
+        c.handle_key_event(&key(vk_k));
+        assert!(c.softkeyboard_is_open(), "ctrl+shift+k 应打开软键盘");
+        c.handle_key_event(&key(vk_k));
+        assert!(!c.softkeyboard_is_open(), "再按一次关掉");
+
+        let hash = calc_key_hash(MOD_CTRL | MOD_SHIFT, keymap::VK_BACKSLASH);
+        assert_eq!(
+            c.rt().compiled_hotkeys.match_key_down(hash),
+            Some("toggle_toolbar"),
+            "ctrl+shift+\\ 应命中 toggle_toolbar"
+        );
+    }
+
+    /// 面板（工具栏）发起的菜单：先把 `host.display` 报的工作区下发，再弹菜单——否则 UI 侧
+    /// 没有工作区，子菜单不判空间直接朝右展开到屏外。三条入口：工具栏右键格菜单、「设置」键
+    /// 主菜单、分格菜单末尾的「更多…」。没报过工作区就不发（不能拿全 0 冒充）。
+    #[test]
+    fn panel_menus_send_host_work_area_first() {
+        use wind_ui_types::UiEvent;
+        let work = (1920, 0, 3840, 1040);
+        let is_work = |m: &UiCommand| {
+            matches!(
+                m,
+                UiCommand::SetWorkArea { left, top, right, bottom }
+                    if (*left, *top, *right, *bottom) == work
+            )
+        };
+        let opens: [(&str, fn(&Coordinator)); 3] = [
+            ("工具栏右键", |c| {
+                c.inject_ui_event(UiEvent::RequestToolbarMenu {
+                    action: Some(ToolbarAction::TogglePunct),
+                    anchor: MenuAnchor::at_point(10, 20),
+                })
+            }),
+            ("设置键主菜单", |c| {
+                c.inject_ui_event(UiEvent::RequestMainMenu(MenuAnchor::at_point(10, 20)))
+            }),
+            ("更多…", |c| {
+                c.inject_ui_event(UiEvent::MenuAction(MenuKind::Command(
+                    MenuCmd::OpenMainMenu,
+                )))
+            }),
+        ];
+        for (name, open) in opens {
+            let (c, rx) = coord();
+            c.handle_ext(
+                ext_kind::HOST_DISPLAY,
+                br#"{"output":"DP-1","work":[1920,0,3840,1040]}"#,
+            );
+            drain(&rx);
+            open(&c);
+            let cmds = drain(&rx);
+            let wa = cmds.iter().position(is_work);
+            let show = cmds
+                .iter()
+                .position(|m| matches!(m, UiCommand::ShowCandidateMenu { .. }));
+            assert!(
+                matches!((wa, show), (Some(a), Some(b)) if a < b),
+                "{name}：{cmds:?}"
+            );
+
+            let (c, rx) = coord();
+            drain(&rx);
+            open(&c);
+            let cmds = drain(&rx);
+            assert!(
+                cmds.iter()
+                    .any(|m| matches!(m, UiCommand::ShowCandidateMenu { .. })),
+                "{name}：{cmds:?}"
+            );
+            assert!(
+                !cmds
+                    .iter()
+                    .any(|m| matches!(m, UiCommand::SetWorkArea { .. })),
+                "{name}：没报过工作区不该发 {cmds:?}"
+            );
+        }
     }
 }

@@ -324,7 +324,7 @@ fn coalesce(section: &str, rows: Vec<Obj>) -> Vec<Obj> {
 
 /// 解析 compat.toml 全文成原始键值。语法错 ⇒ `Err`（带行列号）。
 pub(crate) fn parse_raw(text: &str) -> Result<Raw, String> {
-    let root: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let root: toml::Value = text.parse::<toml::Value>().map_err(|e| e.to_string())?;
     let mut raw = Raw::default();
     let Some(top) = root.as_table() else {
         return Ok(raw);

@@ -804,7 +804,7 @@ fn parse_incoming(text: &str) -> Result<Incoming, String> {
         rejected: Vec::new(),
     };
     // 顶层不认识的整段也要报告（parse_raw 只认三段，别的被跳过）。
-    if let Ok(root) = toml::from_str::<toml::Table>(text) {
+    if let Ok(root) = text.parse::<toml::Table>() {
         for name in root.keys() {
             if Section::parse(name).is_none() {
                 inc.ignored.push(name.clone());

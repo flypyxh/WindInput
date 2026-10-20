@@ -3,7 +3,13 @@
 //! Windows 侧 `ui_thread` 直接驱动 LayeredWindow 呈现；macOS 侧无进程内窗口，
 //! 候选/工具栏/提示统一光栅化进 POSIX SHM，再经 push 管道通知 .app 端取帧呈现。
 //! 本模块在 `ext_presenter` 下编译：macOS，以及 Linux 的 `linux-host` 形态（宿主是 Fcitx5 addon）。
-//! 软键盘、全局热键这两块是 macOS 专属（AppKit / Carbon），Linux 不做，命令落 `other` 臂。
+//! 全局热键是 macOS 专属（Carbon），Linux 不做，命令落 `other` 臂。
+//!
+//! 工具栏 / 软键盘两平台分叉：macOS 是菜单栏状态图标 + 服务进程自开的 NSPanel；Linux 与 Windows
+//! 一样是悬浮条与面板，`toolbar.rs` / `soft_keyboard.rs` 原样驱动，窗口壳换成 `crate::ext_panel`
+//! （光栅化进 SHM、推浮层帧，addon 报回指针）。它们的计时（显隐迟滞、自动隐藏、按住连发）
+//! 由 [`forwarder_thread`] 按最近的 deadline 醒来推进，与 Windows `ui_thread` 的 `next_deadline`
+//! 同一套，见 [`Panels`]。
 //!
 //! 状态气泡 / Toast / 悬停提示 / 自绘菜单两平台同构：这里按主题光栅化，走 `CMD_OVERLAY_FRAME`
 //! （见 `crate::overlay_host` / `crate::menu_host`），宿主只贴图、落位、计时、转发鼠标。
@@ -60,6 +66,243 @@ pub struct Forwarder {
     overlays: crate::overlay_host::Overlays,
     /// 自绘菜单（主菜单 / 候选右键菜单）。
     menu: crate::menu_host::MenuHost,
+    /// 悬浮工具栏 / 软键盘（Linux）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    panels: Panels,
+}
+
+/// Linux 外部宿主形态的悬浮工具栏与软键盘。
+///
+/// 各命令的语义逐条照 Windows `manager.rs` 的 `ui_thread`：工具栏过 `ToolbarGate` 的显隐迟滞，
+/// 软键盘惰性创建并补上最近一次主题。不同处只有两点：
+/// - 工具栏也惰性创建（第一条工具栏命令时）：窗口壳要等 `ext_panel::install` 之后才能推帧，
+///   且没开工具栏的用户不必为它建一段 SHM。
+/// - 全屏判据来自宿主上报（`SetHostFullscreen`），而不是渲染端自己探前台。
+#[cfg(all(target_os = "linux", ext_presenter))]
+struct Panels {
+    ev_tx: Sender<UiEvent>,
+    toolbar: Option<crate::toolbar::Toolbar>,
+    soft_keyboard: Option<crate::soft_keyboard::SoftKeyboard>,
+    gate: crate::toolbar_gate::ToolbarGate,
+    /// 迟滞期间待显示的状态（同 Windows 的 `toolbar_pending_state`）。
+    pending: Option<crate::toolbar::ToolbarState>,
+    /// 最近一次该画出来的状态。全屏期间被挡下的显示不调 `Toolbar::update`，退出全屏补画时用它。
+    last_state: Option<crate::toolbar::ToolbarState>,
+    /// 闸门此刻判定工具栏「该显示」：立即渲染或迟滞到期之后、隐藏到期或撤销之前。
+    wanted: bool,
+    /// 宿主报告焦点窗口全屏。
+    fullscreen: bool,
+    /// 退出全屏时要不要补画：进入全屏那一刻工具栏可见，或全屏期间闸门到期本该显示。
+    /// 只看 `wanted` 不够——自动隐藏收起的工具栏闸门仍判「该显示」，补画就是凭空闪一下。
+    show_on_exit: bool,
+    /// 最近一次主题：惰性创建的两个窗口靠它补课（`SetTheme` 一般只在启动时发一次）。
+    last_theme: Option<wind_theme::Resolved>,
+}
+
+#[cfg(all(target_os = "linux", ext_presenter))]
+impl Panels {
+    fn new(ev_tx: Sender<UiEvent>) -> Self {
+        Self {
+            ev_tx,
+            toolbar: None,
+            soft_keyboard: None,
+            gate: crate::toolbar_gate::ToolbarGate::new(),
+            pending: None,
+            last_state: None,
+            wanted: false,
+            fullscreen: false,
+            show_on_exit: false,
+            last_theme: None,
+        }
+    }
+
+    fn toolbar(&mut self) -> Option<&mut crate::toolbar::Toolbar> {
+        if self.toolbar.is_none() {
+            match crate::toolbar::Toolbar::new(self.ev_tx.clone()) {
+                Ok(mut t) => {
+                    if let Some(theme) = &self.last_theme {
+                        t.set_theme(theme);
+                    }
+                    self.toolbar = Some(t);
+                }
+                Err(e) => tracing::error!("工具栏创建失败: {e}"),
+            }
+        }
+        self.toolbar.as_mut()
+    }
+
+    /// 真正把工具栏画出来；全屏期间改为隐藏（对位 Windows 的 `blocked_by_exclusive_fullscreen`）。
+    fn render_toolbar(&mut self, state: crate::toolbar::ToolbarState) {
+        let blocked = self.fullscreen;
+        if blocked {
+            tracing::debug!("forwarder: 工具栏不显示——宿主全屏");
+            self.show_on_exit = true;
+        }
+        self.last_state = Some(state.clone());
+        if let Some(t) = self.toolbar() {
+            if blocked {
+                t.hide();
+            } else {
+                t.update(&state);
+            }
+        }
+    }
+
+    fn update_toolbar(&mut self, state: crate::toolbar::ToolbarState) {
+        tracing::debug!("forwarder: UpdateToolbar {state:?}");
+        // 内容更新与可见性提升是两件事：已显示时切中英不该再等一档迟滞（见 toolbar_gate）。
+        let visible = self.toolbar().is_some_and(|t| t.is_visible());
+        match self.gate.on_update(std::time::Instant::now(), visible) {
+            crate::toolbar_gate::UpdateAction::RenderNow => {
+                self.wanted = true;
+                self.pending = None;
+                self.render_toolbar(state);
+            }
+            crate::toolbar_gate::UpdateAction::Deferred => {
+                self.wanted = false;
+                self.pending = Some(state);
+            }
+        }
+    }
+
+    fn hide_toolbar(&mut self) {
+        match self.gate.on_hide(std::time::Instant::now()) {
+            crate::toolbar_gate::HideAction::CancelledPending => {
+                self.wanted = false;
+                self.pending = None;
+                tracing::debug!("forwarder: HideToolbar 撤销待显示工具栏（迟滞窗口内）");
+            }
+            crate::toolbar_gate::HideAction::Scheduled => {}
+        }
+    }
+
+    fn set_fullscreen(&mut self, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        if on {
+            self.show_on_exit = false;
+            if let Some(t) = &mut self.toolbar {
+                self.show_on_exit = t.is_seen();
+                t.hide();
+            }
+        } else if self.wanted
+            && self.show_on_exit
+            && let Some(state) = self.last_state.clone()
+        {
+            self.render_toolbar(state);
+        }
+    }
+
+    /// addon 的 push 连接（重）建立：此前宿主报上来的状态一律作废。新 addon（fcitx5 重启）各项
+    /// 初值都是默认，与默认相同的不会再报；旧 addon 崩溃时报到一半的（按住的键、指针在面板里）
+    /// 也没人再来收尾。⚠ 以后新增「宿主上报的状态」，都要在这里复位，并配测试。
+    ///
+    /// - 全屏 → 不全屏：addon 只在变化时报，仍全屏会补报（`FullscreenReporter::resyncAfterRestart`）。
+    /// - 两块面板各补一次离开：停连发、收按下态与悬停、清「指针在面板里」。
+    /// - 输出名 / 工作区（协调器的 `host_output` / `host_work`）不清：每次获焦随 host.display 重报，
+    ///   旧值在重报前仍是同一台机器上最好的估计，清掉反而让默认落点退回无工作区的兜底。
+    fn reset_host_state(&mut self) {
+        use wind_ipc::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
+        use wind_ipc::protocol::panel_pointer::PANEL_POINTER_LEAVE;
+        self.set_fullscreen(false);
+        for kind in [OVERLAY_KIND_TOOLBAR, OVERLAY_KIND_SOFTKEYBOARD] {
+            crate::ext_panel::deliver_pointer(kind, PANEL_POINTER_LEAVE, 0, 0, 0);
+        }
+    }
+
+    fn set_theme(&mut self, theme: &wind_theme::Resolved) {
+        self.last_theme = Some(theme.clone());
+        if let Some(t) = &mut self.toolbar {
+            t.set_theme(theme);
+            // 仅在可见时重绘：repaint→render 末尾必 show，会绕过闸门的显示迟滞。
+            if t.is_visible() {
+                t.repaint();
+            }
+        }
+        if let Some(k) = &mut self.soft_keyboard {
+            k.set_theme(theme);
+        }
+    }
+
+    fn soft_keyboard(&mut self) -> Option<&mut crate::soft_keyboard::SoftKeyboard> {
+        if self.soft_keyboard.is_none() {
+            match crate::soft_keyboard::SoftKeyboard::new(self.ev_tx.clone()) {
+                Ok(mut k) => {
+                    if let Some(theme) = &self.last_theme {
+                        k.set_theme(theme);
+                    }
+                    self.soft_keyboard = Some(k);
+                }
+                Err(e) => tracing::error!("软键盘窗口创建失败: {e}"),
+            }
+        }
+        self.soft_keyboard.as_mut()
+    }
+
+    /// 宿主本地拖完：`ext_panel` 与窗口自己记下的位置一起改，下一帧不跳回旧处。
+    fn moved(&mut self, kind: u32, x: i32, y: i32) {
+        use wind_ipc::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
+        crate::ext_panel::set_position(kind, x, y);
+        match kind {
+            OVERLAY_KIND_TOOLBAR => {
+                if let Some(t) = &mut self.toolbar {
+                    t.on_host_moved(x, y);
+                }
+            }
+            OVERLAY_KIND_SOFTKEYBOARD => {
+                if let Some(k) = &mut self.soft_keyboard {
+                    k.on_host_moved(x, y);
+                }
+            }
+            _ => tracing::debug!("forwarder: PanelMoved 未知 kind {kind}"),
+        }
+    }
+
+    /// 推进计时与鼠标状态机产出的动作。同 Windows `ui_thread` 每轮做的那几步。
+    fn tick(&mut self) {
+        if self.gate.is_active() {
+            match self.gate.tick_at(std::time::Instant::now()) {
+                crate::toolbar_gate::GateTick::Show => {
+                    tracing::debug!("forwarder: 工具栏显示（迟滞到期）");
+                    self.wanted = true;
+                    if let Some(state) = self.pending.take() {
+                        self.render_toolbar(state);
+                    }
+                }
+                crate::toolbar_gate::GateTick::Hide => {
+                    self.wanted = false;
+                    if let Some(t) = &mut self.toolbar {
+                        t.hide();
+                    }
+                }
+                crate::toolbar_gate::GateTick::None => {}
+            }
+        }
+        if let Some(t) = &mut self.toolbar {
+            t.tick();
+        }
+        if let Some(k) = &mut self.soft_keyboard {
+            k.tick();
+        }
+    }
+
+    /// 最近一次需要 [`Self::tick`] 的时刻。清单照 `manager.rs` 的 `next_deadline` 同类项，
+    /// 漏登记一项，那件事就只在碰巧有命令到来时才推进。
+    fn next_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        [
+            // 工具栏显隐迟滞（50 / 120ms 两侧）
+            self.gate.deadline(),
+            // 工具栏自动隐藏（含淡出动画的逐帧推进）
+            self.toolbar.as_ref().and_then(|t| t.next_deadline(now)),
+            // 软键盘键帽的长按重复
+            self.soft_keyboard.as_ref().and_then(|k| k.next_deadline()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
 }
 
 impl Forwarder {
@@ -69,6 +312,11 @@ impl Forwarder {
             .expect("create candidate window (mock/raster host)");
         let overlays = crate::overlay_host::Overlays::new(ev_tx.clone(), suffix.clone());
         let menu = crate::menu_host::MenuHost::new(ev_tx.clone(), suffix.clone());
+        // 工具栏 / 软键盘的窗口壳在本线程推帧，先装上（它们惰性创建，见 `Panels`）。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        crate::ext_panel::install(Arc::clone(&sink), &suffix);
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        let panels = Panels::new(ev_tx.clone());
         Self {
             win,
             shm: None,
@@ -77,6 +325,8 @@ impl Forwarder {
             ev_tx,
             visible: false,
             overlays,
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            panels,
             menu,
         }
     }
@@ -141,6 +391,7 @@ impl Forwarder {
                 hover,
                 page,
                 total_pages,
+                grid,
                 caret_x,
                 caret_y,
                 caret_height,
@@ -165,6 +416,7 @@ impl Forwarder {
                 } else {
                     preedit
                 };
+                self.win.set_grid(grid);
                 self.win.update(
                     &preedit,
                     preedit_caret,
@@ -184,6 +436,8 @@ impl Forwarder {
                 self.push_current_frame();
             }
             UiCommand::HideCandidates => self.hide_frame(),
+            // macOS 没有悬浮工具栏，状态进菜单栏图标；Linux 的悬浮工具栏见下方 `panels` 那组臂。
+            #[cfg(target_os = "macos")]
             UiCommand::UpdateToolbar(s) => {
                 let mut flags = STATUS_TOOLBAR_VISIBLE;
                 if s.chinese_mode {
@@ -199,8 +453,70 @@ impl Forwarder {
                 self.sink
                     .push_frame(&encode_mode_status(flags, mode, &s.icon_label));
             }
+            #[cfg(target_os = "macos")]
             UiCommand::HideToolbar => {
                 self.sink.push_frame(&encode_mode_status(0, 0, ""));
+            }
+            // ── 悬浮工具栏（Linux）：语义逐条照 Windows `ui_thread`，见 `Panels` ──
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::UpdateToolbar(s) => self.panels.update_toolbar(s),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::HideToolbar => self.panels.hide_toolbar(),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetToolbarAnchor { right, bottom } => {
+                if let Some(t) = self.panels.toolbar() {
+                    t.set_anchor(right, bottom);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetToolbarCorner {
+                work_right,
+                work_bottom,
+            } => {
+                if let Some(t) = self.panels.toolbar() {
+                    t.set_corner(work_right, work_bottom);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetToolbarAutoHide {
+                enabled,
+                delay_ms,
+                hover_reveal,
+            } => {
+                if let Some(t) = self.panels.toolbar() {
+                    t.set_auto_hide(enabled, delay_ms, hover_reveal);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetToolbarVertical(v) => {
+                if let Some(t) = self.panels.toolbar() {
+                    t.set_vertical(v);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetToolbarLayout(items) => {
+                if let Some(t) = self.panels.toolbar() {
+                    t.set_layout(items);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SetHostFullscreen(on) => self.panels.set_fullscreen(on),
+            // addon 报上来的指针：翻译成 `WM_*` 交给该窗口的鼠标状态机；产出的点击 / 连发由
+            // 主循环紧接着的 `tick` 消费。
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::PanelPointer {
+                kind,
+                event,
+                button,
+                x,
+                y,
+            } => crate::ext_panel::deliver_pointer(kind, event, button, x, y),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::PanelMoved { kind, x, y } => self.panels.moved(kind, x, y),
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::HostReconnected => {
+                self.panels.reset_host_state();
+                crate::ext_panel::resend_visible();
             }
             UiCommand::ShowStatusTip {
                 text,
@@ -238,6 +554,8 @@ impl Forwarder {
                 // 面板是惰性建窗的，主题得在本模块之外留一份底，理由见 `SkCmd::Theme`。
                 #[cfg(target_os = "macos")]
                 self.push_softkeyboard(sk::SkCmd::Theme(t.clone()));
+                #[cfg(all(target_os = "linux", ext_presenter))]
+                self.panels.set_theme(&t);
                 self.overlays.set_theme(&t);
                 self.menu.set_theme(&*self.sink, &t);
                 self.win.set_theme(*t);
@@ -423,7 +741,7 @@ impl Forwarder {
             // 与其余浮窗相反，它**不走 SHM + `.app` 那条路**：面板由服务进程自己开窗
             // （macOS 上唯一一处），理由见 `crate::mac_panel` 模块头。这里只负责把命令
             // 从本工作线程转运到主线程——AppKit 碰不得工作线程。
-            // 软键盘仅 macOS（服务进程自开 NSPanel）；Linux 不做，落 `other` 臂。
+            // Linux 的软键盘是 `ext_panel` 窗口壳，见下面那组 Linux 臂。
             #[cfg(target_os = "macos")]
             UiCommand::ShowSoftKeyboard {
                 pages,
@@ -456,6 +774,43 @@ impl Forwarder {
             #[cfg(target_os = "macos")]
             UiCommand::SoftKeyboardLayer { shift } => {
                 self.push_softkeyboard(sk::SkCmd::Layer { shift })
+            }
+            // ── 软键盘（Linux）：同 Windows `ui_thread`，惰性创建 ──
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::ShowSoftKeyboard {
+                pages,
+                current,
+                keys,
+                send_keys,
+                anchor,
+                work_area,
+            } => {
+                tracing::debug!(
+                    "forwarder: ShowSoftKeyboard (page={current}, keys={})",
+                    keys.len()
+                );
+                if let Some(k) = self.panels.soft_keyboard() {
+                    k.set_placement(anchor, work_area);
+                    k.show(pages, current, keys, send_keys);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::HideSoftKeyboard => {
+                if let Some(k) = &mut self.panels.soft_keyboard {
+                    k.hide();
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SoftKeyboardKeyState { slot, down } => {
+                if let Some(k) = &mut self.panels.soft_keyboard {
+                    k.set_key_down(&slot, down);
+                }
+            }
+            #[cfg(all(target_os = "linux", ext_presenter))]
+            UiCommand::SoftKeyboardLayer { shift } => {
+                if let Some(k) = &mut self.panels.soft_keyboard {
+                    k.set_layer(shift);
+                }
             }
             UiCommand::OpenPath(path) => crate::manager::open_path(&path),
             UiCommand::OpenApp { path, args } => crate::manager::open_app(&path, &args),
@@ -519,6 +874,18 @@ impl Forwarder {
                 tracing::debug!("forwarder: 暂未处理 {:?}", std::mem::discriminant(&other));
             }
         }
+    }
+
+    /// 推进工具栏 / 软键盘的计时与鼠标动作（主循环每轮一次）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn tick(&mut self) {
+        self.panels.tick();
+    }
+
+    /// 主循环最多睡到这一刻；`None` = 只等命令。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.panels.next_deadline(std::time::Instant::now())
     }
 
     /// 把一条软键盘命令转运给主线程宿主。
@@ -706,13 +1073,35 @@ pub fn forwarder_thread(
 ) {
     let mut fwd = Forwarder::new(ev_tx, sink, suffix);
     tracing::info!("macOS host-render forwarder started");
-    // 不是裸 `for cmd in rx`：那样线程永远阻塞在 recv 上，背景图缓存的闲置回收
-    // （`manager.rs` 的消息循环负责的那件事）在 macOS 就一次都不会发生。
-    while let Some(cmd) = crate::view::recv_evicting_idle(&rx) {
+    run_loop(&mut fwd, &rx);
+}
+
+/// forwarder 主循环，收到 `Shutdown` 或发送端全部断开即返回。
+///
+/// 不是裸 `for cmd in rx`：那样线程永远阻塞在 recv 上，背景图缓存的闲置回收
+/// （`manager.rs` 的消息循环负责的那件事）就一次都不会发生。
+#[cfg(target_os = "macos")]
+fn run_loop(fwd: &mut Forwarder, rx: &Receiver<UiCommand>) {
+    while let Some(cmd) = crate::view::recv_evicting_idle(rx) {
         if matches!(cmd, UiCommand::Shutdown) {
             break;
         }
         fwd.handle(cmd);
+    }
+}
+
+/// Linux 多一件事：工具栏 / 软键盘有计时器，等命令时最多睡到最近的 deadline，醒来 `tick`。
+/// 闲置回收照旧挂在等待上（`recv_evicting_idle_until`）。
+#[cfg(all(target_os = "linux", ext_presenter))]
+fn run_loop(fwd: &mut Forwarder, rx: &Receiver<UiCommand>) {
+    use crate::view::Recv;
+    loop {
+        fwd.tick();
+        match crate::view::recv_evicting_idle_until(rx, fwd.next_deadline()) {
+            Recv::Cmd(UiCommand::Shutdown) | Recv::Disconnected => break,
+            Recv::Cmd(cmd) => fwd.handle(cmd),
+            Recv::Timeout => {}
+        }
     }
 }
 
@@ -769,6 +1158,7 @@ mod tests {
             hover: -1,
             page: 1,
             total_pages: 1,
+            grid: None,
             caret_x: 100,
             caret_y: 200,
             caret_height: 20,
@@ -815,6 +1205,7 @@ mod tests {
             hover: -1,
             page: 1,
             total_pages: 1,
+            grid: None,
             caret_x: 100,
             caret_y: 200,
             caret_height: 20,
@@ -905,6 +1296,7 @@ mod tests {
             hover: -1,
             page: 1,
             total_pages: 1,
+            grid: None,
             caret_x: 100,
             caret_y: 200,
             caret_height: 20,
@@ -1032,6 +1424,7 @@ mod tests {
             hover: -1,
             page: 1,
             total_pages: 1,
+            grid: None,
             caret_x: 10,
             caret_y: 20,
             caret_height: 20,
@@ -1051,6 +1444,8 @@ mod tests {
         assert_eq!(u32::from_le_bytes(hr[28..32].try_into().unwrap()) & 0x1, 0);
     }
 
+    /// 工具栏命令在 macOS 转成菜单栏状态图标（`CMD_MODE_STATUS`）；Linux 驱动的是悬浮工具栏，见 `panels`。
+    #[cfg(target_os = "macos")]
     #[test]
     fn hide_toolbar_emits_mode_status() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1064,6 +1459,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn update_toolbar_emits_mode_status() {
         let cap = Arc::new(Mutex::new(Vec::new()));
@@ -1077,6 +1473,534 @@ mod tests {
                 .iter()
                 .any(|x| cmd_of(x) == wind_ipc::protocol::CMD_MODE_STATUS)
         );
+    }
+
+    /// Linux 外部宿主形态：工具栏 / 软键盘经 `ext_panel` 推 kind 10 / 11 的浮层帧，
+    /// 指针经 `PanelPointer` 回到它们自己的鼠标状态机，计时由 forwarder 按 deadline 推进。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    mod panels {
+        use super::*;
+        use crate::toolbar::ToolbarState;
+        use crate::toolbar_gate::SHOW_DEBOUNCE;
+        use std::time::Duration;
+        use wind_ipc::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
+        use wind_ipc::protocol::panel_pointer::*;
+        use wind_ui_types::{SOFT_TAG_CLOSE, SoftKeyCap, ToolbarAction};
+
+        /// 计时类断言的余量：只用来盖过线程调度抖动，不参与语义。
+        const SLACK: Duration = Duration::from_millis(60);
+
+        /// 一帧 kind 10 / 11 浮层的元数据 + 拖动区。
+        #[derive(Debug)]
+        struct Panel {
+            visible: bool,
+            w: u32,
+            h: u32,
+            x: i32,
+            y: i32,
+            drag: Vec<[i32; 4]>,
+        }
+
+        fn panel_frames(cap: &Arc<Mutex<Vec<Vec<u8>>>>, kind: u32) -> Vec<Panel> {
+            cap.lock()
+                .unwrap()
+                .iter()
+                .filter(|f| cmd_of(f) == CMD_OVERLAY_FRAME)
+                .map(|f| &f[8..])
+                .filter(|p| u32::from_le_bytes(p[0..4].try_into().unwrap()) == kind)
+                .map(|p| {
+                    let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
+                    let n = u(72) as usize;
+                    let drag = (0..n)
+                        .map(|k| {
+                            let at = 76 + 16 * k;
+                            [0, 4, 8, 12].map(|d| u(at + d) as i32)
+                        })
+                        .collect();
+                    Panel {
+                        visible: u(16) & SharedRenderHeader::FLAG_VISIBLE != 0,
+                        w: u(8),
+                        h: u(12),
+                        x: u(24) as i32,
+                        y: u(28) as i32,
+                        drag,
+                    }
+                })
+                .collect()
+        }
+
+        /// 段名带进程号与用例名：并发跑的测试进程、同进程的各用例互不撞段。
+        fn mk_panels(
+            cap: Arc<Mutex<Vec<Vec<u8>>>>,
+            tag: &str,
+        ) -> (Forwarder, std::sync::mpsc::Receiver<UiEvent>) {
+            mk(cap, &format!("_p{tag}{}", std::process::id()))
+        }
+
+        fn pointer(f: &mut Forwarder, kind: u32, event: u32, button: u32, (x, y): (i32, i32)) {
+            f.handle(UiCommand::PanelPointer {
+                kind,
+                event,
+                button,
+                x,
+                y,
+            });
+            f.tick();
+        }
+
+        /// 显示工具栏：发状态、熬过显示迟滞、推进一次。返回最后一帧。
+        fn show_toolbar(f: &mut Forwarder, cap: &Arc<Mutex<Vec<Vec<u8>>>>) -> Panel {
+            f.handle(UiCommand::UpdateToolbar(ToolbarState::default()));
+            std::thread::sleep(SHOW_DEBOUNCE + SLACK);
+            f.tick();
+            panel_frames(cap, OVERLAY_KIND_TOOLBAR)
+                .pop()
+                .expect("迟滞到期后应推出工具栏帧")
+        }
+
+        /// 47 个键位都给符号，任何一个点下去都会上屏。
+        fn show_softkeyboard(f: &mut Forwarder) {
+            let keys = (0..47)
+                .map(|i| SoftKeyCap {
+                    slot: format!("k{i}"),
+                    base: "，".into(),
+                    shift: "《".into(),
+                })
+                .collect();
+            f.handle(UiCommand::ShowSoftKeyboard {
+                pages: vec!["标点".into(), "数学".into()],
+                current: 0,
+                keys,
+                send_keys: false,
+                anchor: None,
+                work_area: Some((0, 0, 1920, 1080)),
+            });
+        }
+
+        fn center_of(f: &Forwarder, tag: i32) -> (i32, i32) {
+            let r = f
+                .panels
+                .soft_keyboard
+                .as_ref()
+                .expect("软键盘已建")
+                .hit_rect(tag)
+                .unwrap_or_else(|| panic!("tag {tag} 没有命中区"));
+            ((r.x + r.w * 0.5) as i32, (r.y + r.h * 0.5) as i32)
+        }
+
+        fn key_events(ev: &std::sync::mpsc::Receiver<UiEvent>) -> usize {
+            ev.try_iter()
+                .filter(|e| matches!(e, UiEvent::SoftKeyboardKey { .. }))
+                .count()
+        }
+
+        #[test]
+        fn toolbar_update_shows_after_gate_debounce() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "tb1");
+            f.handle(UiCommand::UpdateToolbar(ToolbarState::default()));
+            f.tick();
+            assert!(
+                panel_frames(&cap, OVERLAY_KIND_TOOLBAR).is_empty(),
+                "显示迟滞期内不出帧"
+            );
+            let due = f.next_deadline().expect("迟滞要登记唤醒时刻");
+            assert!(due <= std::time::Instant::now() + SHOW_DEBOUNCE);
+
+            std::thread::sleep(SHOW_DEBOUNCE + SLACK);
+            f.tick();
+            let fr = panel_frames(&cap, OVERLAY_KIND_TOOLBAR);
+            let last = fr.last().expect("迟滞到期应出帧");
+            assert!(last.visible && last.w > 0 && last.h > 0);
+            assert_eq!(last.drag.len(), 1, "工具栏的拖动区就是拖动柄一块");
+        }
+
+        #[test]
+        fn toolbar_hidden_while_host_fullscreen() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "tb2");
+            f.handle(UiCommand::SetHostFullscreen(true));
+            f.handle(UiCommand::UpdateToolbar(ToolbarState::default()));
+            std::thread::sleep(SHOW_DEBOUNCE + SLACK);
+            f.tick();
+            assert!(
+                !panel_frames(&cap, OVERLAY_KIND_TOOLBAR)
+                    .iter()
+                    .any(|p| p.visible),
+                "全屏期间迟滞到期也不显示"
+            );
+
+            f.handle(UiCommand::SetHostFullscreen(false));
+            let fr = panel_frames(&cap, OVERLAY_KIND_TOOLBAR);
+            assert!(
+                fr.last().is_some_and(|p| p.visible),
+                "退出全屏：闸门处于显示态就补画"
+            );
+
+            f.handle(UiCommand::SetHostFullscreen(true));
+            let fr = panel_frames(&cap, OVERLAY_KIND_TOOLBAR);
+            assert!(
+                !fr.last().unwrap().visible,
+                "进入全屏：显示中的工具栏立即隐藏"
+            );
+
+            // 全屏期间的内容更新也不能把它推回屏上。
+            f.handle(UiCommand::UpdateToolbar(ToolbarState::default()));
+            std::thread::sleep(SHOW_DEBOUNCE + SLACK);
+            f.tick();
+            assert!(
+                !panel_frames(&cap, OVERLAY_KIND_TOOLBAR)
+                    .last()
+                    .unwrap()
+                    .visible
+            );
+
+            // 闸门已收起（HideToolbar 生效）时退出全屏不补画。
+            f.handle(UiCommand::HideToolbar);
+            std::thread::sleep(crate::toolbar_gate::HIDE_DEBOUNCE + SLACK);
+            f.tick();
+            let n = panel_frames(&cap, OVERLAY_KIND_TOOLBAR).len();
+            f.handle(UiCommand::SetHostFullscreen(false));
+            assert!(
+                panel_frames(&cap, OVERLAY_KIND_TOOLBAR)[n..]
+                    .iter()
+                    .all(|p| !p.visible),
+                "工具栏本就该藏着，退出全屏不能把它变出来"
+            );
+        }
+
+        #[test]
+        fn softkeyboard_show_pushes_kind_11_with_drag_regions() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "sk1");
+            show_softkeyboard(&mut f);
+            let fr = panel_frames(&cap, OVERLAY_KIND_SOFTKEYBOARD);
+            let p = fr.last().expect("打开软键盘应推 kind 11 的帧");
+            assert!(p.visible);
+            assert!(!p.drag.is_empty(), "要带拖动区");
+            let inside = |(x, y): (i32, i32)| {
+                p.drag
+                    .iter()
+                    .any(|[dx, dy, dw, dh]| x >= *dx && x < dx + dw && y >= *dy && y < dy + dh)
+            };
+            for [x, y, w, h] in &p.drag {
+                assert!(*x >= 0 && *y >= 0 && x + w <= p.w as i32 && y + h <= p.h as i32);
+            }
+            assert!(inside((1, 1)), "面板内边距（键位之外的留白）可拖");
+            assert!(!inside(center_of(&f, 0)), "键帽不能落进拖动区");
+            assert!(
+                !inside(center_of(&f, SOFT_TAG_CLOSE)),
+                "关闭按钮不能落进拖动区"
+            );
+        }
+
+        #[test]
+        fn panel_pointer_click_on_toolbar_cell_emits_toolbar_event() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk_panels(cap.clone(), "tb3");
+            let p = show_toolbar(&mut f, &cap);
+            // 拖动柄之后第一格是中英格（默认项序列打头的是 Mode）。
+            let [gx, _, gw, _] = p.drag[0];
+            let cells = wind_ui_types::DEFAULT_TOOLBAR_ITEMS.len() as i32;
+            let cell = (p.w as i32 - gw) / cells;
+            let at = (gx + gw + cell / 2, p.h as i32 / 2);
+            pointer(&mut f, OVERLAY_KIND_TOOLBAR, PANEL_POINTER_PRESS, 1, at);
+            pointer(&mut f, OVERLAY_KIND_TOOLBAR, PANEL_POINTER_RELEASE, 1, at);
+            let got: Vec<_> = ev
+                .try_iter()
+                .filter_map(|e| match e {
+                    UiEvent::Toolbar(a) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(got, vec![ToolbarAction::ToggleMode]);
+        }
+
+        /// 按 `next_deadline` 睡、醒来 `tick`，直到 `until`——等同主循环在没有命令时的行为。
+        fn drive_until(f: &mut Forwarder, until: std::time::Instant) {
+            loop {
+                let now = std::time::Instant::now();
+                if now >= until {
+                    return;
+                }
+                let wake = f.next_deadline().map_or(until, |d| d.min(until));
+                std::thread::sleep(wake.saturating_duration_since(now));
+                f.tick();
+            }
+        }
+
+        /// 自动隐藏已把工具栏收起：进出一次全屏不能把它补画出来（否则每次退出全屏闪一下）。
+        #[test]
+        fn fullscreen_exit_keeps_auto_hidden_toolbar_hidden() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "tb5");
+            // 1000ms 是 `AutoHide::configure` 的下限。
+            let delay = Duration::from_millis(1000);
+            f.handle(UiCommand::SetToolbarAutoHide {
+                enabled: true,
+                delay_ms: delay.as_millis() as u64,
+                hover_reveal: false,
+            });
+            show_toolbar(&mut f, &cap);
+            let until = std::time::Instant::now() + delay + crate::auto_hide::FADE_DURATION + SLACK;
+            drive_until(&mut f, until);
+            assert!(
+                !panel_frames(&cap, OVERLAY_KIND_TOOLBAR)
+                    .last()
+                    .unwrap()
+                    .visible,
+                "自动隐藏到期应已收起"
+            );
+            let n = panel_frames(&cap, OVERLAY_KIND_TOOLBAR).len();
+            f.handle(UiCommand::SetHostFullscreen(true));
+            f.handle(UiCommand::SetHostFullscreen(false));
+            assert!(
+                panel_frames(&cap, OVERLAY_KIND_TOOLBAR)[n..]
+                    .iter()
+                    .all(|p| !p.visible),
+                "退出全屏不该把自动隐藏收起的工具栏补画出来"
+            );
+        }
+
+        /// 内容在指针底下变了（切面重建面板）：指针还在面板里就按它重算高亮；LEAVE 之后
+        /// 「最后指针」虽然还停在那个键上，也不能把它点亮。
+        #[test]
+        fn softkeyboard_hover_follows_content_only_while_pointer_inside() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "sk4");
+            show_softkeyboard(&mut f);
+            let key = center_of(&f, 0);
+            let k = OVERLAY_KIND_SOFTKEYBOARD;
+            let hover = |f: &Forwarder| f.panels.soft_keyboard.as_ref().unwrap().hover();
+            pointer(&mut f, k, PANEL_POINTER_MOTION, 0, key);
+            assert_eq!(hover(&f), 0);
+
+            // 切面：`show` 先清掉悬停，重排后按指针位置补回来。
+            show_softkeyboard(&mut f);
+            assert_eq!(hover(&f), 0, "指针还在键上，切面后高亮应跟上");
+
+            pointer(&mut f, k, PANEL_POINTER_LEAVE, 0, (0, 0));
+            assert_eq!(hover(&f), -1);
+            show_softkeyboard(&mut f);
+            assert_eq!(hover(&f), -1, "指针已离开，切面不能点亮任何键");
+        }
+
+        /// 宿主本地拖完回报落点：之后的重绘落在新位置，不跳回旧处。
+        #[test]
+        fn panel_moved_keeps_toolbar_at_dropped_position() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "tb4");
+            show_toolbar(&mut f, &cap);
+            f.handle(UiCommand::PanelMoved {
+                kind: OVERLAY_KIND_TOOLBAR,
+                x: 300,
+                y: 400,
+            });
+            f.handle(UiCommand::UpdateToolbar(ToolbarState {
+                chinese_mode: true,
+                ..Default::default()
+            }));
+            let p = panel_frames(&cap, OVERLAY_KIND_TOOLBAR).pop().unwrap();
+            assert!(p.visible);
+            assert_eq!((p.x, p.y), (300, 400));
+        }
+
+        /// addon 收到 SERVICE_READY 会丢掉手里的工具栏 / 软键盘（它分不清服务是重启了还是只换了
+        /// 连接）。同一服务换了 push 连接时状态都还在，不重推的话面板要等下一次状态变化才回来。
+        #[test]
+        fn reconnect_resends_visible_panels() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "rc1");
+            let tb = show_toolbar(&mut f, &cap);
+            show_softkeyboard(&mut f);
+            let skb = panel_frames(&cap, OVERLAY_KIND_SOFTKEYBOARD)
+                .pop()
+                .expect("软键盘应出帧");
+            assert!(skb.visible);
+
+            let geo = |p: &Panel| (p.visible, p.x, p.y, p.w, p.h, p.drag.clone());
+            cap.lock().unwrap().clear();
+            f.handle(UiCommand::HostReconnected);
+            let again = panel_frames(&cap, OVERLAY_KIND_TOOLBAR);
+            assert_eq!(again.len(), 1, "可见的工具栏原样补推一帧：{again:?}");
+            assert_eq!(geo(&again[0]), geo(&tb));
+            let again = panel_frames(&cap, OVERLAY_KIND_SOFTKEYBOARD);
+            assert_eq!(again.len(), 1, "可见的软键盘同样补推：{again:?}");
+            assert_eq!(geo(&again[0]), geo(&skb));
+
+            // 收起的面板不补：补了就是把一个已经关掉的窗口推回屏幕上。
+            f.handle(UiCommand::HideSoftKeyboard);
+            cap.lock().unwrap().clear();
+            f.handle(UiCommand::HostReconnected);
+            assert_eq!(panel_frames(&cap, OVERLAY_KIND_TOOLBAR).len(), 1);
+            assert!(panel_frames(&cap, OVERLAY_KIND_SOFTKEYBOARD).is_empty());
+        }
+
+        /// addon 换了实例（fcitx5 重启）：新 addon 的全屏初值是「不全屏」，状态没变就不会报——
+        /// 旧 addon 报的「全屏」要在这里作废，否则工具栏再也不出来。
+        #[test]
+        fn reconnect_clears_host_fullscreen() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, _ev) = mk_panels(cap.clone(), "rc2");
+            show_toolbar(&mut f, &cap);
+            f.handle(UiCommand::SetHostFullscreen(true));
+            assert!(
+                !panel_frames(&cap, OVERLAY_KIND_TOOLBAR)
+                    .last()
+                    .unwrap()
+                    .visible
+            );
+            cap.lock().unwrap().clear();
+            f.handle(UiCommand::HostReconnected);
+            assert!(
+                panel_frames(&cap, OVERLAY_KIND_TOOLBAR)
+                    .last()
+                    .is_some_and(|p| p.visible),
+                "重连后按「不全屏」重新放出工具栏"
+            );
+        }
+
+        /// addon 崩溃时正按住软键盘的键：它再也报不来松开 / 离开。重连时补一次离开——连发停下、
+        /// 按下态与「指针在面板里」一并清掉，免得新 addon 连上后还在往焦点应用里打字。
+        #[test]
+        fn reconnect_releases_held_softkey_and_pointer() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk_panels(cap.clone(), "rc3");
+            show_softkeyboard(&mut f);
+            show_toolbar(&mut f, &cap);
+            let k = OVERLAY_KIND_SOFTKEYBOARD;
+            let key = center_of(&f, 0);
+            pointer(&mut f, k, PANEL_POINTER_PRESS, 1, key);
+            pointer(
+                &mut f,
+                OVERLAY_KIND_TOOLBAR,
+                PANEL_POINTER_MOTION,
+                0,
+                (20, 10),
+            );
+            assert!(crate::ext_panel::pointer_inside(crate::sys::HWND(
+                OVERLAY_KIND_TOOLBAR as isize
+            )));
+            assert_eq!(key_events(&ev), 1, "按下即出字一次");
+
+            f.handle(UiCommand::HostReconnected);
+            f.tick();
+            let (delay, rate) = crate::soft_keyboard::repeat_params();
+            std::thread::sleep(Duration::from_millis(delay + rate * 2) + SLACK);
+            f.tick();
+            assert_eq!(key_events(&ev), 0, "重连后不再连发");
+            assert_eq!(f.panels.soft_keyboard.as_ref().unwrap().hover(), -1);
+            for kind in [OVERLAY_KIND_TOOLBAR, k] {
+                assert!(
+                    !crate::ext_panel::pointer_inside(crate::sys::HWND(kind as isize)),
+                    "kind {kind}：指针不再算在面板里"
+                );
+            }
+        }
+
+        /// 宿主只报左上角；换算成右下角锚点要用面板尺寸，由渲染端算好回报协调器落盘（同 Windows
+        /// 拖动结束时的 `ToolbarMoved` / `SoftKeyboardMoved`）。
+        #[test]
+        fn panel_moved_reports_bottom_right_anchor() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk_panels(cap.clone(), "mv");
+            let tb = show_toolbar(&mut f, &cap);
+            show_softkeyboard(&mut f);
+            let skb = panel_frames(&cap, OVERLAY_KIND_SOFTKEYBOARD)
+                .pop()
+                .expect("软键盘应推出帧");
+            while ev.try_recv().is_ok() {}
+            f.handle(UiCommand::PanelMoved {
+                kind: OVERLAY_KIND_TOOLBAR,
+                x: 300,
+                y: 400,
+            });
+            f.handle(UiCommand::PanelMoved {
+                kind: OVERLAY_KIND_SOFTKEYBOARD,
+                x: 50,
+                y: 60,
+            });
+            let got: Vec<UiEvent> = ev.try_iter().collect();
+            let (tw, th) = (tb.w as i32, tb.h as i32);
+            let (sw, sh) = (skb.w as i32, skb.h as i32);
+            assert!(
+                got.iter()
+                    .any(|e| matches!(e, UiEvent::ToolbarMoved { right, bottom }
+                    if (*right, *bottom) == (300 + tw, 400 + th))),
+                "{got:?}"
+            );
+            assert!(
+                got.iter()
+                    .any(|e| matches!(e, UiEvent::SoftKeyboardMoved { right, bottom }
+                    if (*right, *bottom) == (50 + sw, 60 + sh))),
+                "{got:?}"
+            );
+        }
+
+        /// 按住键帽、此后不再有任何命令：连发靠 forwarder 自己按 deadline 醒来推进。
+        #[test]
+        fn softkeyboard_hold_repeats_via_deadline() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk_panels(cap.clone(), "sk2");
+            show_softkeyboard(&mut f);
+            let at = center_of(&f, 0);
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(UiCommand::PanelPointer {
+                kind: OVERLAY_KIND_SOFTKEYBOARD,
+                event: PANEL_POINTER_PRESS,
+                button: 1,
+                x: at.0,
+                y: at.1,
+            })
+            .unwrap();
+            let (delay, rate) = crate::soft_keyboard::repeat_params();
+            let hold = Duration::from_millis(delay + rate * 3) + SLACK;
+            let stopper = std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                let _ = tx.send(UiCommand::Shutdown);
+            });
+            run_loop(&mut f, &rx);
+            stopper.join().unwrap();
+            let n = key_events(&ev);
+            assert!(n >= 2, "按下一次 + 至少一次连发，实际 {n}");
+        }
+
+        /// 按下后挪出再松手 = 反悔：抬起才触发的控件（关闭）不触发；按下即出字的键帽
+        /// 只出按下那一次，不再连发。
+        #[test]
+        fn press_drag_out_release_cancels() {
+            let cap = Arc::new(Mutex::new(Vec::new()));
+            let (mut f, ev) = mk_panels(cap.clone(), "sk3");
+            show_softkeyboard(&mut f);
+            let close = center_of(&f, SOFT_TAG_CLOSE);
+            let key = center_of(&f, 0);
+            let k = OVERLAY_KIND_SOFTKEYBOARD;
+
+            pointer(&mut f, k, PANEL_POINTER_PRESS, 1, close);
+            pointer(&mut f, k, PANEL_POINTER_MOTION, 0, key);
+            pointer(&mut f, k, PANEL_POINTER_RELEASE, 1, key);
+            let closed = |ev: &std::sync::mpsc::Receiver<UiEvent>| {
+                ev.try_iter()
+                    .filter(|e| matches!(e, UiEvent::SoftKeyboardClose))
+                    .count()
+            };
+            assert_eq!(closed(&ev), 0, "挪出关闭按钮再松手不该关");
+
+            // 挪出后先**按住不放**熬过连发间隔再松手：抬起本身也会停连发，松手放在等待
+            // 之前就测不到「移出即停」。
+            pointer(&mut f, k, PANEL_POINTER_PRESS, 1, key);
+            pointer(&mut f, k, PANEL_POINTER_MOTION, 0, close);
+            let (delay, rate) = crate::soft_keyboard::repeat_params();
+            std::thread::sleep(Duration::from_millis(delay + rate * 2) + SLACK);
+            f.tick();
+            assert_eq!(key_events(&ev), 1, "键帽按下即出字一次，挪出后不再连发");
+            pointer(&mut f, k, PANEL_POINTER_RELEASE, 1, close);
+
+            // 对照：原地按下松开，关闭照常触发。
+            pointer(&mut f, k, PANEL_POINTER_PRESS, 1, close);
+            pointer(&mut f, k, PANEL_POINTER_RELEASE, 1, close);
+            assert_eq!(closed(&ev), 1);
+        }
     }
 
     /// 状态气泡 / Toast / tooltip 光栅化成 `CMD_OVERLAY_FRAME`。
@@ -1268,6 +2192,7 @@ mod tests {
                 hover,
                 page: 1,
                 total_pages: 1,
+                grid: None,
                 caret_x: 100,
                 caret_y: 200,
                 caret_height: 20,

@@ -170,6 +170,19 @@ bridge 回 `StatusUpdate`，而 C++ 的 StatusUpdate 分支**明确不结束组�
 记的是「在这个上文后你要过它」，这一维比「它是不是噪声词」更直接。选联想候选**不**给临时词
 count +1（`from_assoc` 不走造词 / 临时词记账），它在其他上文下仍留在补位档。
 
+**下一词（2026-10，移动端 v0.3 起用）。** 同一张表再记一类行：用户**相邻两次整体上屏**的词
+「我们」→「一直」（上文 = 前一个词，整词 = 后一个词，二者无前缀关系）。写入端
+`Coordinator::learn_next_word`，接在 `commit_selected` 的整体上屏分支：上一个整体上屏的词存在
+`next_word_prev`，**默认断开**：任何上屏记账（`record_commit`，含顶码 / 带高亮顶屏）、满码自动
+上屏（`commit_candidate`）、顶层兜底统计里没记账的写屏动作、取消（`cancel_session`）、撤销上屏、
+焦点得失、宿主自行出字 / 重放 / 挪光标（`note_host_wrote_text`）、移动端交还宿主的按键
+（`wind-mobile` 的 `key_down` 直通分支）都清空；只有 `commit_selected` 在记账前取出上文、整体
+上屏时交给 `learn_next_word`（分步选的前段放回去）。选中的词不含任何字母或汉字（标点联想、
+符号候选）也是断点。不记：不在智能联想档或历史源关着（与读端同口径，
+`AssocConfig::learns_next_words`）；任一侧纯 ASCII；后词以前词开头（读端会误当前缀延伸只补后半）。选前缀延伸类联想候选时那一笔已由 `record_assoc_pick` 记过，
+只更新上文。读端 `HistoryWords` 对无前缀关系的行整词上屏（`commit = None`），且**只在智能联想档
+出**——词语联想档的契约是「只出上文的延长」。用例 `tests/assoc_next_word.rs`。
+
 写入端与 FREQ 对齐：`record_freq` 与 `record_assoc_pick` 都是同步单写事务（`freq.rs` 注释里
 的「内存累积 + 批量 flush」尚未实现）。选联想候选不记 FREQ（`from_assoc` 跳过
 `record_selection`），故那条链路上只有这一次写事务，无可合并。
@@ -354,7 +367,7 @@ N-1 条」上。而 `PassThrough` / `NotHandled` 这一格，问一次就够。
 
 | 源 | 数据来源 | 状态 | word 档 | smart 档 |
 |---|---|---|---|---|
-| `History` | 用户上屏历史（redb） | ⬜ 待做，需新建搭配表 | — | ✔ |
+| `History` | 用户上屏历史（`assoc_history` 表：联想选择 + 相邻上屏的下一词） | ✅ 已实现（§3.1.2） | ✔ 仅前缀延伸行 | ✔ |
 | `Bigram` | 词→后继表 | ⬜ 待做，需离线蒸馏 | — | ✔ |
 | `Prefix` | 词库里以上文为前缀的更长的词 | ✅ 已实现 | ✔ **唯一** | ✔ |
 | `Punct` | 静态规则表 | ✅ 已实现 | ✖ **禁止** | ✔ |
@@ -371,7 +384,7 @@ log 概率 / 词频 i32 / 规则无分），归一化混排是条老路——`fr
 新用户会白白浪费掉最靠前的几个位置。被去重吃掉的名额同样顺延（按「已产出数」而非
 「已请求数」算剩余）。
 
-`History` / `Bigram` 尚无 provider ⇒ `associate` 对它们 `continue`，配额自动顺延。
+`Bigram` 尚无 provider ⇒ `associate` 对它 `continue`，配额自动顺延。
 这是**有意的分期，不是漏接**。
 
 ### 4.0 Prefix 源：怎么做到不加索引就能按前缀取词

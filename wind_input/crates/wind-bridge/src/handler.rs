@@ -379,6 +379,15 @@ pub trait MessageHandler: Send + Sync {
     /// `event` 见 `protocol::menu_pointer`；`button` 为 X11 按键号；`(x, y)` 为屏幕坐标。默认空。
     fn handle_menu_pointer(&self, _event: u32, _button: u32, _x: i32, _y: i32) {}
 
+    /// Linux addon：工具栏 / 软键盘上的指针事件（[`wind_ipc::protocol::CMD_PANEL_POINTER`]）。
+    /// `kind` 为浮层 kind，`event` 见 `protocol::panel_pointer`，`button` 为 X11 按键号，
+    /// `(x, y)` 为位图内坐标。**给默认实现是刻意的**：协调器之外的实现（含测试夹具）不必各写一遍空函数。
+    fn on_panel_pointer(&self, kind: u32, event: u32, button: u32, x: i32, y: i32) {
+        tracing::debug!(
+            "未处理的面板指针事件 kind={kind} event={event} button={button} x={x} y={y}"
+        );
+    }
+
     /// 处理焦点获取（返回状态用于 ActivationStatusPush）
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData>;
 

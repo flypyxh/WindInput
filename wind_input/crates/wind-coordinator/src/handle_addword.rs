@@ -149,9 +149,9 @@ fn check_derivable_word(word: &str, han_only: bool) -> anyhow::Result<()> {
 /// 唯独加词这三处（候选窗预览 / Ctrl+Enter 转设置页 / Ctrl+Shift+= 直开）此前只传扁平串，
 /// 于是同一个加词窗里预填显示 `nihao`、用户点一下「出码」却变成 `ni hao`，自相矛盾。
 ///
-/// 回写方向由设置端 `webdata::normalize_add_code` 兜住：带空格的码提交回来会被拆回扁平
-/// key，且串里的空格**被当作显式声明的切分直接采信**，比「手输码 == 推导码才借用边界」的
-/// 兜底更准。命令行参数侧亦已就绪——`build_settings_args` 对含空白的值加引号。
+/// 回写方向由设置端加词的 [`crate::user_words_api::normalize_add_code`] 兜住：带空格的码
+/// 提交回来会被拆回扁平 key，且串里的空格**被当作显式声明的切分直接采信**，比「手输码 ==
+/// 推导码才借用边界」的兜底更准。命令行参数侧亦已就绪——`build_settings_args` 对含空白的值加引号。
 ///
 /// 码表码 boundary 恒 0 → 原样返回，本函数对非拼音方案是恒等变换。
 fn display_code(code: &str, boundary: u64) -> String {
@@ -569,6 +569,11 @@ impl Coordinator {
         single_is_synthesized: bool,
         overlay: Option<&str>,
     ) -> Option<String> {
+        // 暂停学习：拼音分步 / 整句造词不进临时词库（返回 None，调用方的 6b 照常判，
+        // 它自己也挡）。
+        if self.learning_suspended() {
+            return None;
+        }
         // 单段仅当它是整句解时放行；其余仍要求 ≥2 段。
         if state.committed_segs.len() < 2
             && !(state.committed_segs.len() == 1 && single_is_synthesized)
@@ -773,6 +778,10 @@ impl Coordinator {
         code: &str,
         learned_code: Option<&str>,
     ) {
+        // 暂停学习：选中临时词也不累加计数、不推晋升。
+        if self.learning_suspended() {
+            return;
+        }
         let Some(store) = &self.store else {
             return;
         };
@@ -1516,6 +1525,7 @@ impl Coordinator {
             hover: -1,
             page: 1,
             total_pages: 1,
+            grid: None,
             caret_x: state.caret_x,
             caret_y: state.caret_y,
             caret_height: state.caret_height,

@@ -202,6 +202,10 @@ impl Coordinator {
         // 三件套整体建立：筛选会话（快照原始候选，后续筛选都从它重筛）+ 显示基线
         // （进入前的拼音显示，退出还原）+ 显示前缀（基线 + 分隔符，进入拼一次）。
         // 此后三者同生共死，退出/上屏/复位一律整体销毁，见 `AuxCodeOverlay`。
+        //
+        // 展开态正按分类筛选时先退回完整列表：快照要的是**原始**候选，拿子集当快照的话，
+        // 下面的刷新经视图复位清掉暂存的完整列表，退出辅助码后就只剩那一类了。
+        self.grid_restore_full(state);
         let session = wind_aux_code::AuxCodeSession::new(std::mem::take(&mut state.candidates));
         let preedit_base = std::mem::take(&mut state.preedit);
         let preedit_prefix = format!("{}    ", preedit_base);
@@ -285,6 +289,8 @@ impl Coordinator {
         state.active = overlay.origin;
         state.candidates = overlay.session.restore_original();
         state.preedit = overlay.preedit_base;
+        // 进辅助码前展开着的，退回来也展开着（与分步上屏同一条「本次组合保持」）。
+        self.grid_resume(state);
         debug!("aux_code: exited (origin={:?})", overlay.origin);
     }
 

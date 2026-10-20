@@ -24,6 +24,9 @@ pub mod caret_overlay;
 pub mod debounce;
 pub mod double_click;
 pub mod dpi;
+/// Linux 外部宿主的悬浮工具栏 / 软键盘窗口壳：`LayeredWindow` 的位图走 overlay 帧，指针由 addon 报来。
+#[cfg(all(target_os = "linux", ext_presenter))]
+pub mod ext_panel;
 #[cfg(target_os = "macos")]
 pub mod global_hotkey_macos;
 pub mod image_cache;

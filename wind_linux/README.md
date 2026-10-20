@@ -7,7 +7,7 @@ addon（`libwindinput.so`），负责把按键交给清风输入法服务（`win
 ## 构建
 
 依赖：Fcitx5 5.x 开发包（`libfcitx5core-dev` `libfcitx5utils-dev` `libfcitx5config-dev`）、
-`libxcb1-dev` `libxcb-shape0-dev`（候选窗）、CMake ≥ 3.16、C++17 编译器。较新的 Fcitx5 头文件（如 Arch 的 5.1.23）
+`libxcb1-dev` `libxcb-shape0-dev` `libxcb-randr0-dev`（候选窗 / 工具栏）、CMake ≥ 3.16、C++17 编译器。较新的 Fcitx5 头文件（如 Arch 的 5.1.23）
 要 C++20，配置时会自动探测并把 addon 升到 C++20，此时需要支持 C++20 的编译器；也可用 `-DCMAKE_CXX_STANDARD=20` 指定。
 
 ```bash

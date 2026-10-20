@@ -695,7 +695,7 @@ impl CoordConfig {
                  翻转它会覆盖你的真实设置，故拒绝；请先修好报错的配置键（见日志 WARN）。"
             );
         }
-        let full = serde_json::to_value(cfg)?;
+        let full = cfg.to_json_value()?;
         let mut cur = &full;
         for part in key.split('.') {
             cur = cur

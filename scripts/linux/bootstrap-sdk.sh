@@ -25,7 +25,7 @@ SEED_PKGS=(
     libfcitx5core-dev libfcitx5utils-dev libfcitx5config-dev fcitx5-modules-dev
     extra-cmake-modules
     xvfb x11-apps x11-utils xdotool xcompmgr
-    libxcb1-dev libxcb-shm0-dev libxcb-render0-dev libxcb-shape0-dev
+    libxcb1-dev libxcb-shm0-dev libxcb-render0-dev libxcb-shape0-dev libxcb-randr0-dev
 )
 
 # 让 Xvfb-wind 找得到 xkbcomp（见下文「Xvfb 启动时」一段）。/tmp 重启即清，故每次都补。

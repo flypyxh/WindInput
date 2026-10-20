@@ -34,7 +34,10 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }
-resvg = "0.44"
+# 只留 raster-images：主题 SVG 里内嵌的 data: 位图要能显示（主题编辑器就是这么引导的）。
+# 默认的 text / system-fonts / memmap-fonts 不开——我们从不往 usvg 的 fontdb 里装字体，
+# `<text>` 本来就画不出来，开着只是把 fontdb / rustybuzz / unicode-* 白编进去。
+resvg = { version = "0.44", default-features = false, features = ["raster-images"] }
 # 主题内嵌图片（`data:image/...;base64,` 形态）的载荷解码，见 image_cache。
 # 版本跟随 wind-cmdbar 里既有的那一份。
 base64 = "0.22"
@@ -53,13 +56,12 @@ windows-core = "0.58"
 
 # Linux（linux-host）：真字形文本后端（text/linux/）。两者都是零依赖纯 Rust；字体查找运行期
 # dlopen 系统 libfontconfig，编译期不链接任何系统库、不要 -dev 包。默认构建不编它们。
-# ttf-parser 取 0.24：resvg 已经拉进同一版本，不多编一份。
+# ttf-parser 取 0.24：与 rustybuzz 0.18 配套，不多编一份。
 [target.'cfg(target_os = "linux")'.dependencies]
 ttf-parser = { version = "0.24", optional = true }
 ab_glyph_rasterizer = { version = "0.1", optional = true }
 # 只给 emoji 簇整形（ZWJ 组合 / 国旗 / 键帽 / 肤色的 GSUB 连字），普通文字仍逐字排。
-# 0.18 与 ttf-parser 0.24 配套，且 resvg 的 text feature 已经把同一版本拉进依赖闭包，
-# 不多编一份。彩色字形的 PNG 解码、COLR / SVG 光栅复用已有的 image 与 resvg。
+# 0.18 与 ttf-parser 0.24 配套。彩色字形的 PNG 解码、COLR / SVG 光栅复用已有的 image 与 resvg。
 rustybuzz = { version = "0.18", optional = true }
 
 # macOS：CoreText 真字形文本后端（text/coretext.rs）。

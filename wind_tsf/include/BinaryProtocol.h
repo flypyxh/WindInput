@@ -67,6 +67,7 @@ constexpr uint16_t CMD_UIELEMENT_PAGE        = 0x0219; // core -> C++ (QUERY 的
 constexpr uint16_t CMD_UIELEMENT_ACTION      = 0x021A;
 // 0x021B = CMD_MENU_POINTER：仅 Linux addon 上行（自绘菜单的指针事件），TSF 不用；
 // 常量在 wind_linux/include/ExtProtocol.h。占着码位，新增上行命令别撞它。
+// 0x021C = CMD_PANEL_POINTER：仅 Linux addon 上行（工具栏 / 软键盘的指针事件），同上占位。
 constexpr uint16_t CMD_COMPOSITION_TERMINATED = 0x0209; // Composition unexpectedly terminated (e.g., user clicked in input field)
 constexpr uint16_t CMD_CARET_UPDATE     = 0x0301; // Caret position update
 constexpr uint16_t CMD_SELECTION_CHANGED = 0x0302; // Selection/caret changed without composition (from ITfTextEditSink)

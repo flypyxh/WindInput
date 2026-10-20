@@ -17,6 +17,7 @@
 #include "SettingsLauncher.h"
 #include "ExtProtocol.h"
 #include "HostUi.h"
+#include "OverlayInput.h"
 #include "ShmFrame.h"
 
 #include <fcitx-utils/event.h>
@@ -90,8 +91,11 @@ private:
     void sendFocusGained(fcitx::InputContext* ic);
     /// 获焦上报全套：FocusGained（含 host.display）+ 光标 + 前台应用。
     void reportFocus(fcitx::InputContext* ic);
-    /// `host.display`：光标坐标是否可用 + 界面缩放（见 ExtProtocol.h）。
+    /// `host.display`：光标坐标是否可用 + 界面缩放 + 所在输出（见 ExtProtocol.h）。
     void sendHostDisplay(fcitx::InputContext* ic);
+    /// 焦点（或候选窗）所在输出的名字与工作区，随 `host.display` 上报；工具栏 / 软键盘的
+    /// `pos.*` 用同一来源的名字（`reportPanelPos` 的 output），两处要么都报要么都不报。
+    HostOutput hostOutput(fcitx::InputContext* ic);
     void sendCaretUpdate(fcitx::InputContext* ic);
     uint16_t prevCharFor(fcitx::InputContext* ic);
     /// 修饰键单击 / CapsLock 状态通知：发一帧 eventType=UP 的 KeyEvent 并应用其响应。
@@ -119,6 +123,15 @@ private:
     void hideCandidate();
     /// 收起 Wayland popup 里的全部层（候选 + 浮层）。
     void hideAllWayland();
+
+    // ── 工具栏 / 软键盘（kind 10 / 11）──
+    /// 两层都藏起来（服务重启：新服务按自己的状态重新推帧）。
+    void hidePanels();
+    /// 本端拖完工具栏 / 软键盘：报 `pos.toolbar` / `pos.softkeyboard`（内容盒左上的屏幕坐标）。
+    /// `output` 是面板所在输出名，拿不到传空串（不带该字段）。
+    void reportPanelPos(uint32_t kind, int32_t x, int32_t y, const std::string& output);
+    /// 焦点窗口进入 / 退出全屏：`host.fullscreen`，只在值变化时发。
+    void reportFullscreen(bool fullscreen);
 
     // ── 自绘菜单 ──
     /// 请服务端打开菜单（`menu.open`）：target ≥ 0 候选右键菜单，-1 主菜单；(x, y) 锚点。
@@ -163,6 +176,9 @@ private:
     ShmFrameReader overlayShm_[3];
     /// 自绘菜单各级的 SHM 读端（下标 = 级）。
     ShmFrameReader menuShm_[OVERLAY_MENU_LEVELS];
+    /// 工具栏 / 软键盘的 SHM 读端（下标 = kind - OVERLAY_KIND_TOOLBAR）。
+    ShmFrameReader panelShm_[2];
+    FullscreenReporter fullscreen_;
     std::unique_ptr<X11CandidatePanel> panel_;
     /// Wayland 原生应用（frontend wayland_v2）的候选窗：popup surface，由合成器摆位。没有 Wayland
     /// 支持（编译时缺 libwayland）或不在 Wayland 会话时为空。

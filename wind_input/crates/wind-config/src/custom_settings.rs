@@ -43,6 +43,7 @@
 /// - `update_check`：关于页的「检查更新」按钮，连同打开设置时的自动检查。
 /// - `dark_mode`：底栏的浅色 / 深色切换。
 /// - `accent`：底栏的主题色下拉。
+/// - `subnav`：设置窗中间那一栏二级导航（各页的分块目录），所有页都不显示。
 pub const SETTINGS_FEATURES: &[&str] = &[
     "wizard",
     "theme_transfer",
@@ -55,6 +56,7 @@ pub const SETTINGS_FEATURES: &[&str] = &[
     "update_check",
     "dark_mode",
     "accent",
+    "subnav",
 ];
 
 /// 一条解析过的 `[settings] hide` 选择器。

@@ -309,6 +309,8 @@ pub struct UnparsableLayer {
     pub skipped_lines: Vec<usize>,
     /// 救回来的顶层键数量。0 且 `skipped_lines` 为空 ⇒ 该层完全作废。
     pub salvaged_keys: usize,
+    /// 文件不是 UTF-8（记事本存成 ANSI/GBK 最常见）：整层作废，与语法错误分开讲。
+    pub not_utf8: bool,
 }
 
 /// 文案里最多列出几个行号，其余折叠成计数。
@@ -361,6 +363,9 @@ impl UnparsableLayer {
     /// 两者同时成立，而那时说「加载其余内容」是在撒谎——一个字都没加载。
     pub fn describe(&self) -> String {
         let file = self.path.display();
+        if self.not_utf8 {
+            return format!("{file}：不是 UTF-8 编码，本次未能加载");
+        }
         if !self.is_salvaged() {
             // 尝试过的行号仍要给（用户拿它去看那几行怎么了），但走紧凑形态：
             // 啃不动的文件会攒到 32 个行号，全列出来只是噪音。
@@ -546,7 +551,7 @@ const LENIENT_MAX_SKIPS: usize = 32;
 /// ⚠️ 救回来的值里，「被跳过的键」与「用户从未写过的键」完全同形，事后无从区分。
 /// 这正是 [`ConfigDegradation::taints`] 在 `unparsable` 非空时对任何路径都返回真的理由。
 pub fn parse_toml_lenient(src: &str) -> LenientParse {
-    let first_error = match toml::from_str::<toml::Value>(src) {
+    let first_error = match src.parse::<toml::Value>() {
         Ok(v) => {
             return LenientParse {
                 value: Some(v),
@@ -609,7 +614,7 @@ pub fn parse_toml_lenient(src: &str) -> LenientParse {
         }
 
         let retry = lines.join("\n");
-        match toml::from_str::<toml::Value>(&retry) {
+        match retry.parse::<toml::Value>() {
             Ok(v) => {
                 skipped.sort_unstable();
                 skipped.dedup();
@@ -1915,6 +1920,7 @@ impl BoundAction {
 /// - `"select_char:N"`：以词定字，取当前高亮候选词的第 N 个字（N 从 1 起）
 /// - `"aux_code"` / `"aux_code:page_next"`：进辅助码筛选（后者与下翻页共键）
 /// - `"commit_highlighted"`：上屏当前高亮候选（即空格的「选词」功能）
+/// - `"commit_code"`：上屏编码（同回车上屏编码，但不看 `input.enter_behavior`）
 /// - `"command:<cmdbar 表达式>"`：执行一段命令，当前组合不动（同 [`BoundAction::Command`]）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAction {
@@ -1987,6 +1993,18 @@ pub enum SessionAction {
     /// 只在有候选时生效（[`Self::requires_candidates`]）：没有高亮可上屏时按键回落原语义，
     /// 空码空格的那套处置（`space_on_empty_behavior`）不属于本动词。
     CommitHighlighted,
+    /// 上屏编码——回车在「有编码」时做的那件事，换一个键来按（极点 / 小鸭用 Ctrl）。
+    ///
+    /// 恒为上屏编码，**不看 `input.enter_behavior`**：「回车清空编码」是回车这个键的配置，
+    /// 用户另绑一个键要的就是上屏编码。
+    ///
+    /// 执行方式是把这个键当成一次回车重新分派、且那一下强制走上屏编码那一支
+    /// （`Coordinator::redispatch_commit_code`），不另写上屏：回车在主路与各 overlay 里
+    /// 各有一条臂，另写一份就得跟着这些臂逐个维护。
+    ///
+    /// 不要候选（[`Self::requires_candidates`] 为假）：空码时上屏原码恰是它最常用的场合。
+    /// 无会话、联想态（没有编码可上屏）时放行，按键回落原语义。
+    CommitCode,
     /// 执行一段 cmdbar 表达式，**当前组合原样不动**（不清空、不上屏），吞键。
     /// 写法、载荷与执行通路都与 [`BoundAction::Command`] 逐字一致。
     ///
@@ -2093,6 +2111,7 @@ impl SessionAction {
             // （`key_actions` 那张表没有共键形态：它只认符号键与字母 z，翻页键压根解析不出来。）
             "aux_code" => Self::AuxCode(AuxCodeShare::Solo),
             "commit_highlighted" => Self::CommitHighlighted,
+            "commit_code" => Self::CommitCode,
             // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
             "cancel" | "clear" => Self::Cancel,
             _ => Self::None,
@@ -2112,9 +2131,10 @@ impl SessionAction {
         // ——单字模式下某个码本来就可能一条候选都不剩，那时按键若被判成「无事可做」而放行，
         // 用户就再也关不掉它了。
         // `Command` 同侧：命令与候选无关，打了码没出候选时照样要能执行。
+        // `CommitCode` 同侧：空码上屏原码正是它的用处。
         !matches!(
             self,
-            Self::None | Self::Cancel | Self::SingleChar(_) | Self::Command(_)
+            Self::None | Self::Cancel | Self::SingleChar(_) | Self::Command(_) | Self::CommitCode
         )
     }
 
@@ -2179,6 +2199,7 @@ impl std::fmt::Display for SessionAction {
             Self::AuxCode(AuxCodeShare::PageNext) => f.write_str("aux_code:page_next"),
             Self::SingleChar(a) => write!(f, "single_char:{}", a.as_payload()),
             Self::CommitHighlighted => f.write_str("commit_highlighted"),
+            Self::CommitCode => f.write_str("commit_code"),
             Self::Command(expr) => write!(f, "{COMMAND_VERB_PREFIX}{expr}"),
         }
     }
@@ -4493,6 +4514,13 @@ pub struct CapslockConfig {
     /// 平台门控与文档，改类型要做旧值兼容反序列化，收益只是少一个键。
     #[serde(default = "default_capslock_mode_after_cancel")]
     pub mode_after_cancel: String,
+    /// 打字中按 CapsLock 切换时，把正在打的编码转大写上屏（打 `wps` 得 `WPS`）：开大写那一下，
+    /// 以及 CapsLock 作中英切换键切到英文那一下。
+    ///
+    /// 只改大小写，上不上屏仍由 `keys.commit_on_switch` 决定（临英总会上屏）；已转换前缀不转。
+    /// 消费端见 `Coordinator::take_input_on_mode_switch_cased`。
+    #[serde(default)]
+    pub commit_upper: bool,
 }
 
 impl Default for CapslockConfig {
@@ -4500,6 +4528,7 @@ impl Default for CapslockConfig {
         Self {
             cancel_on_mode_switch: false,
             mode_after_cancel: default_capslock_mode_after_cancel(),
+            commit_upper: false,
         }
     }
 }
@@ -4699,6 +4728,26 @@ pub struct EmojiModuleEntry {
     /// 用户放置的文件（`false` = 内置模块）。
     pub user: bool,
     pub default_on: bool,
+}
+
+// 跨 crate 的序列化 / 反序列化一律走下面这几个入口，别在下游直接 `value.try_into::<Config>()`
+// 或 `serde_json::to_value(cfg)`：release 不共享泛型，每个调用的 crate 都会把整棵配置类型树的
+// serde 代码单态化一份（一份 ~0.2 MiB）。`inline(never)` 防 LTO 把它们又内联回各调用方。
+impl Config {
+    #[inline(never)]
+    pub fn from_toml_value(v: toml::Value) -> Result<Self, toml::de::Error> {
+        v.try_into()
+    }
+
+    #[inline(never)]
+    pub fn to_toml_value(&self) -> Result<toml::Value, toml::ser::Error> {
+        toml::Value::try_from(self)
+    }
+
+    #[inline(never)]
+    pub fn to_json_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
 }
 
 impl Config {
@@ -5623,6 +5672,11 @@ pub struct OverflowConfig {
     /// 以词定字键候选词长度不足时
     #[serde(default = "default_overflow_behavior")]
     pub select_char_key: String,
+    /// 可打印的翻页键（`-` `=` `,` `.` `[` `]`）在主路翻不动、且本批候选从未翻过页时：
+    /// "ignore"（吞键）/ "commit_and_input"（顶高亮候选并输出该键的符号，走标点通路）。
+    /// 只有这两档——「只顶不出字」没有诉求。
+    #[serde(default = "default_overflow_behavior")]
+    pub page_key: String,
 }
 
 fn default_overflow_behavior() -> String {
@@ -5635,6 +5689,7 @@ impl Default for OverflowConfig {
             number_key: default_overflow_behavior(),
             select_key: default_overflow_behavior(),
             select_char_key: default_overflow_behavior(),
+            page_key: default_overflow_behavior(),
         }
     }
 }
@@ -5644,6 +5699,23 @@ impl Default for OverflowConfig {
 fn default_per_page() -> usize {
     7
 }
+fn default_grid_rows() -> usize {
+    5
+}
+fn default_grid_cell_max_chars() -> usize {
+    6
+}
+fn default_grid_index_fill() -> String {
+    "rows".to_string()
+}
+fn default_grid_categories() -> Vec<String> {
+    ["all", "single", "phrase", "rare"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+/// 展开态可见行数的合法范围（[`UiCandidateConfig::grid_rows`]）。
+pub const GRID_ROWS_RANGE: std::ops::RangeInclusive<usize> = 2..=10;
 fn default_first_show_settle_ratio() -> f32 {
     0.8
 }
@@ -6524,6 +6596,32 @@ pub struct UiCandidateConfig {
     /// 要连这些一并罩住用 [`Self::min_window_height_vertical`]（两项可同时配，取较大者）。
     #[serde(default)]
     pub min_rows: usize,
+    /// 候选展开（卷轴，出厂关）：候选多于一页时按翻页键，候选窗原地展开成多行网格，
+    /// 一行就是原来的一页。设计见 `docs/design/candidate-grid-expand.md`。
+    ///
+    /// 只对横排生效：竖排 / 旋转态的自然形态是「多列并排」，不在本项范围内。
+    #[serde(default)]
+    pub grid_expand: bool,
+    /// 展开态的可见行数（出厂 5）。生效值夹在 [`GRID_ROWS_RANGE`] 内。
+    #[serde(default = "default_grid_rows")]
+    pub grid_rows: usize,
+    /// 展开态每格最多显示几个字（出厂 6，0 = 只受 [`Self::max_chars`] 约束）。
+    ///
+    /// 网格按列对齐，一个长词会把整列撑宽，故比单行的 `max_chars` 收得更紧。被截掉的
+    /// 部分由悬停提示的 `${full_text}` 段补齐。
+    #[serde(default = "default_grid_cell_max_chars")]
+    pub grid_cell_max_chars: usize,
+    /// 展开态下序号（与数字键）从高亮行起怎么往下顺延（1–0 共 10 个）：
+    /// - `"rows"`（出厂）：只补整行——每页 5 个时高亮行 1–5、下一行 6–0；每页 7 个时只编高亮行。
+    /// - `"cells"`：逐格编到 0 为止，可以停在半行。
+    /// - `"off"`：只编高亮行。
+    #[serde(default = "default_grid_index_fill")]
+    pub grid_index_fill: String,
+    /// 展开态的分类标签：`all` 全部 / `single` 单字 / `phrase` 词组 / `rare` 生僻 / `symbol` 符号。
+    /// 只决定**有哪些**，顺序固定按上面这个次序（「全部」恒在首位）。少于两个时不显示标签栏。
+    /// 未知名字忽略。
+    #[serde(default = "default_grid_categories")]
+    pub grid_categories: Vec<String>,
     /// 候选注释总开关（默认开）。关掉后不渲染注释段（含上方注释条与 `${code_hint}`），
     /// 注释模板也不再计入按需加载的需求（反查索引、用户层编码索引、拆字表随之可卸）。
     ///
@@ -6745,6 +6843,11 @@ impl Default for UiCandidateConfig {
             min_window_height_horizontal: 0,
             min_window_height_vertical: 0,
             min_rows: 0,
+            grid_expand: false,
+            grid_rows: default_grid_rows(),
+            grid_cell_max_chars: default_grid_cell_max_chars(),
+            grid_index_fill: default_grid_index_fill(),
+            grid_categories: default_grid_categories(),
             comment_enabled: true,
             comment_template_vertical: default_comment_template(),
             comment_template_horizontal: default_comment_template(),
@@ -6829,11 +6932,33 @@ impl UiCandidateConfig {
     /// 「字」按**字素簇**计（口径同悬停提示的截断与折行）：按码位切会把 emoji ZWJ 序列、
     /// 组合符、变体选择符拦腰切开，屏上冒出半个字形。
     pub fn truncate_display(&self, text: &str) -> String {
-        use unicode_segmentation::UnicodeSegmentation;
-        match text.grapheme_indices(true).nth(self.max_chars) {
-            Some((cut, _)) if self.max_chars > 0 => format!("{}{TRUNCATION_MARK}", &text[..cut]),
-            _ => text.to_string(),
-        }
+        truncate_graphemes(text, self.max_chars)
+    }
+
+    /// 展开态网格单格的显示截断：取 `max_chars` 与 `grid_cell_max_chars` 中更紧的那个
+    /// （0 表示该项不限）。
+    pub fn truncate_grid_cell(&self, text: &str) -> String {
+        let limit = match (self.max_chars, self.grid_cell_max_chars) {
+            (0, g) => g,
+            (m, 0) => m,
+            (m, g) => m.min(g),
+        };
+        truncate_graphemes(text, limit)
+    }
+
+    /// 展开态的生效可见行数（夹进 [`GRID_ROWS_RANGE`]）。
+    pub fn grid_rows(&self) -> usize {
+        self.grid_rows
+            .clamp(*GRID_ROWS_RANGE.start(), *GRID_ROWS_RANGE.end())
+    }
+}
+
+/// 按字素簇截断到 `limit` 个（0 = 不截），超出时追加 [`TRUNCATION_MARK`]。
+fn truncate_graphemes(text: &str, limit: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    match text.grapheme_indices(true).nth(limit) {
+        Some((cut, _)) if limit > 0 => format!("{}{TRUNCATION_MARK}", &text[..cut]),
+        _ => text.to_string(),
     }
 }
 
@@ -9030,6 +9155,22 @@ impl Config {
         }
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
+            // 编码不对是文件内容的问题，与语法错同类：必须进 `unparsable` 关上写盘闸，
+            // 否则这一层按「不存在」处理，下次保存就拿默认值覆盖掉用户的文件。
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn!("配置文件不是 UTF-8 编码 {}：{}", path.display(), e);
+                if !layer.is_empty() {
+                    unparsable.push(UnparsableLayer {
+                        layer,
+                        path: path.to_path_buf(),
+                        error: e.to_string(),
+                        skipped_lines: Vec::new(),
+                        salvaged_keys: 0,
+                        not_utf8: true,
+                    });
+                }
+                return None;
+            }
             Err(e) => {
                 // 读不出来（权限、被独占、坏扇区）不是语法问题，不进 `unparsable`：
                 // 那份文件在盘上可能完好，报「语法错误」会把用户支去改一个没错的文件。
@@ -9065,6 +9206,7 @@ impl Config {
                 error: parsed.first_error.clone().unwrap_or_default(),
                 skipped_lines: parsed.skipped_lines.clone(),
                 salvaged_keys,
+                not_utf8: false,
             });
         }
         parsed.value
@@ -10693,6 +10835,19 @@ mod tests {
             Some(SessionAction::CommitHighlighted)
         );
         assert!(a.requires_candidates(), "无候选时无高亮可上屏，须放行按键");
+    }
+
+    /// `commit_code`：解析与回写互逆，且**不要候选**——空码上屏原码正是它的用处。
+    #[test]
+    fn commit_code_round_trips_and_works_without_candidates() {
+        let a = SessionAction::parse(" Commit_Code ");
+        assert_eq!(a, SessionAction::CommitCode);
+        assert_eq!(
+            SessionAction::parse(&a.to_string()),
+            a,
+            "Display 与 parse 须互逆"
+        );
+        assert!(!a.requires_candidates(), "空码无候选时也要能上屏原码");
     }
 
     /// `command:<表达式>`：两张表同一套解析，表达式**原样保留大小写与内部空白**。
@@ -12706,6 +12861,7 @@ scripts = { latin = 42 }
             skipped_lines: vec![1, 2, 3],
             // ……但最终什么都没解析出来。
             salvaged_keys: 0,
+            not_utf8: false,
         };
         let s = u.describe();
         assert!(
@@ -12739,6 +12895,7 @@ scripts = { latin = 42 }
             error: String::new(),
             skipped_lines: (1..=n).collect(),
             salvaged_keys: 1,
+            not_utf8: false,
         };
         assert_eq!(mk(0).lines_phrase(), "", "没有行号就返回空串");
 
@@ -12761,6 +12918,39 @@ scripts = { latin = 42 }
             many.starts_with("第 ") && many.contains(" 行"),
             "短语须自带「第…行」：{many}"
         );
+    }
+
+    /// ★ 非 UTF-8 的配置文件要进 `unparsable`（关写盘闸），不能当「文件不存在」跳过。
+    #[test]
+    fn non_utf8_config_is_reported_as_unparsable() {
+        let dir = std::env::temp_dir().join(format!("wind_cfg_gbk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // 「# 中文」的 GBK 字节
+        std::fs::write(&path, b"# \xd6\xd0\xce\xc4\n[ui]\nx = 1\n").unwrap();
+        let mut un = Vec::new();
+        let v = Config::read_toml_value_reporting(&path, "user", &mut un);
+        assert!(v.is_none());
+        assert_eq!(un.len(), 1, "编码错误必须上报");
+        assert!(un[0].not_utf8);
+        assert!(un[0].describe().contains("UTF-8"), "{}", un[0].describe());
+
+        // 对照：带 BOM 的 UTF-8 照常加载，不上报。
+        std::fs::write(&path, "\u{FEFF}# 中文\n[ui]\nx = 1\n").unwrap();
+        let mut un = Vec::new();
+        let v = Config::read_toml_value_reporting(&path, "user", &mut un);
+        assert!(un.is_empty(), "{un:?}");
+        assert_eq!(v.unwrap()["ui"]["x"].as_integer(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 全仓约定用 `text.parse::<toml::Value>()` 解析整篇文档（见 AGENTS.md）。这依赖
+    /// toml 0.8 的 `FromStr for Value` 按文档解析；升级 toml 后语义若变成「单个值」，这里先红。
+    #[test]
+    fn toml_value_from_str_parses_whole_documents() {
+        let v: toml::Value = "a = 1\n[b]\nc = 2\n".parse().expect("整篇文档须能解析");
+        assert_eq!(v["a"].as_integer(), Some(1));
+        assert_eq!(v["b"]["c"].as_integer(), Some(2));
     }
 
     /// 合法文件走的是零改动的快路径：`is_clean` 为真、一行都没跳过。
@@ -12788,6 +12978,7 @@ scripts = { latin = 42 }
                 error: "duplicate key".into(),
                 skipped_lines: vec![6],
                 salvaged_keys: 2,
+                not_utf8: false,
             }],
         };
         assert!(deg.is_degraded());
@@ -13395,6 +13586,30 @@ scripts = { latin = 42 }
                 "{v} 解析结果与自身不符"
             );
         }
+    }
+
+    #[test]
+    fn grid_expand_defaults_off_and_cell_truncation_takes_the_tighter_limit() {
+        let cfg = Config::default();
+        assert!(
+            !cfg.ui.candidate.grid_expand,
+            "出厂关：只有设置里打开的用户才会展开"
+        );
+        assert_eq!(cfg.ui.candidate.grid_rows(), 5);
+        let mut c = cfg.ui.candidate.clone();
+        c.max_chars = 16;
+        c.grid_cell_max_chars = 3;
+        assert_eq!(c.truncate_grid_cell("一二三四"), "一二三…");
+        assert_eq!(c.truncate_grid_cell("一二三"), "一二三");
+        c.grid_cell_max_chars = 0;
+        c.max_chars = 2;
+        assert_eq!(
+            c.truncate_grid_cell("一二三"),
+            "一二…",
+            "0 = 只受 max_chars 约束"
+        );
+        c.grid_rows = 99;
+        assert_eq!(c.grid_rows(), 10, "可见行数夹进合法范围");
     }
 
     #[test]

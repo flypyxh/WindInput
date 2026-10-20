@@ -567,7 +567,8 @@ fn parse_common_chars_file(content: &str) -> anyhow::Result<ParsedCommonChars> {
         return Ok(parse_common_chars_jsonl(content));
     }
 
-    let table: toml::Table = toml::from_str(content)
+    let table: toml::Table = content
+        .parse::<toml::Table>()
         .map_err(|e| anyhow::anyhow!("不是一份有效的常用字调整文件: {e}"))?;
     if !table.contains_key(COMMON_CHARS_FILE_TAG) {
         anyhow::bail!("不是一份常用字调整文件（缺少 {COMMON_CHARS_FILE_TAG} 标记）");

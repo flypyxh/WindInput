@@ -1198,6 +1198,9 @@ impl Coordinator {
         state.english_case_variant = crate::english_candidates::CaseVariant::default();
         state.input_cursor_pos = 0;
         state.candidates.clear();
+        state.grid_top = None;
+        state.grid_tab = wind_ui_types::GridTab::All;
+        state.grid_full.clear();
         state.preedit.clear();
         // 拼音逐步转换的已转换前缀一并丢弃（焦点/模式切换不保留半成品组合）。
         state.committed_text.clear();

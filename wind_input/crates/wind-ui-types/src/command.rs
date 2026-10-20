@@ -34,6 +34,11 @@ pub enum UiCommand {
         page: usize,
         /// 总页数（含动态加载估计）
         total_pages: usize,
+        /// 展开态的网格版式；`None` = 单行（单列）的普通候选窗。
+        ///
+        /// 为 `Some` 时 `candidates` / `selected` / `hover` 都是网格内的平铺下标，见
+        /// [`CandidateGrid`]；`page` / `total_pages` 照旧，此时读作「高亮行 / 总行数」。
+        grid: Option<crate::candidate::CandidateGrid>,
         caret_x: i32,
         caret_y: i32,
         /// 光标高度（用于上翻时定位到光标上方）
@@ -319,6 +324,25 @@ pub enum UiCommand {
     SoftKeyboardKeyState { slot: String, down: bool },
     /// 软键盘：切层（按住 Shift 显示第二层，松开还原）。
     SoftKeyboardLayer { shift: bool },
+    /// 外部宿主（Linux addon）报上来的工具栏 / 软键盘指针事件（`CMD_PANEL_POINTER` 原样转来）：
+    /// `kind` 是浮层 kind，`event` / `button` 见 `panel_pointer`，`(x, y)` 是位图内坐标。
+    /// 渲染端翻译成 `WM_*` 交给窗口自己的鼠标状态机。Windows 窗口自己收鼠标消息，从不下发本命令。
+    PanelPointer {
+        kind: u32,
+        event: u32,
+        button: u32,
+        x: i32,
+        y: i32,
+    },
+    /// 外部宿主本地拖完工具栏 / 软键盘后的落点（内容盒左上，屏幕坐标）。协调器已据此落盘，
+    /// 渲染端只同步自己记下的位置，下一帧不跳回旧处。Windows 从不下发。
+    PanelMoved { kind: u32, x: i32, y: i32 },
+    /// 外部宿主报告焦点窗口进入 / 退出全屏：全屏期间不显示工具栏（对位 Windows 的独占全屏判据）。
+    /// Windows 渲染端自己探前台，从不下发。
+    SetHostFullscreen(bool),
+    /// 外部宿主（Linux addon）的 push 连接（重）建立：它收到 SERVICE_READY 会丢掉手里的工具栏 /
+    /// 软键盘，渲染端把此刻可见的原样补推一帧。Windows 从不下发。
+    HostReconnected,
     /// 关闭 UI
     Shutdown,
     /// 注入 host-render 管理器（Windows）；协调器 `set_host_render` 后下发，

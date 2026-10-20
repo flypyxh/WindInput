@@ -5,11 +5,13 @@
 
 #include <fcitx-utils/log.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <time.h>
+#include <xcb/randr.h>
 #include <xcb/shape.h>
 
 FCITX_DECLARE_LOG_CATEGORY(windinput_log);
@@ -93,10 +95,18 @@ X11CandidatePanel::X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb)
         menus_[k].instance = kMenuNames[k];
         menus_[k].interactive = true; // 收鼠标（抓指针期间事件落在菜单窗口上）
     }
+    panels_[OVERLAY_KIND_TOOLBAR - OVERLAY_KIND_TOOLBAR].instance = "wind-toolbar";
+    panels_[OVERLAY_KIND_SOFTKEYBOARD - OVERLAY_KIND_TOOLBAR].instance = "wind-softkeyboard";
+    for (Surface& p : panels_) {
+        p.interactive = true;
+        p.overlay = true;
+        p.panel = true;
+    }
 }
 
 X11CandidatePanel::~X11CandidatePanel()
 {
+    cb_ = Callbacks{}; // 析构途中不再回调引擎（摘面板会补报 LEAVE）
     dropConnection();
 }
 
@@ -128,11 +138,21 @@ bool X11CandidatePanel::ensureConnection()
     screen_ = it.data;
     const xcb_query_extension_reply_t* shape = xcb_get_extension_data(conn_, &xcb_shape_id);
     shapeAvailable_ = shape && shape->present;
+    // RandR ≥ 1.3（GetScreenResourcesCurrent / GetOutputPrimary）：按输出取名字与工作区。
+    randrAvailable_ = false;
+    const xcb_query_extension_reply_t* randr = xcb_get_extension_data(conn_, &xcb_randr_id);
+    if (randr && randr->present) {
+        auto* v =
+            xcb_randr_query_version_reply(conn_, xcb_randr_query_version(conn_, 1, 3), nullptr);
+        randrAvailable_ = v && (v->major_version > 1 || v->minor_version >= 3);
+        std::free(v);
+    }
     ioEvent_ = loop_.addIOEvent(xcb_get_file_descriptor(conn_), fcitx::IOEventFlag::In,
                                 [this](fcitx::EventSourceIO*, int, fcitx::IOEventFlags) {
                                     onReadable();
                                     return true;
                                 });
+    watchRoot();
     return true;
 }
 
@@ -155,6 +175,10 @@ void X11CandidatePanel::dropConnection()
     disarm(statusMenuWait_);
     statusMenuHold_ = false;
     drag_ = Drag{};
+    dragOutputs_.clear();
+    disarm(activeCheck_);
+    activeWindow_ = 0;
+    activeWatched_ = false; // 订阅随连接一起没了
     if (conn_) {
         if (dragCursor_) {
             xcb_free_cursor(conn_, dragCursor_);
@@ -167,6 +191,10 @@ void X11CandidatePanel::dropConnection()
         for (Surface& m : menus_) {
             destroyWindow(m);
         }
+        for (Surface& p : panels_) {
+            destroyWindow(p);
+        }
+        pendingPanelMotion_.reset();
         xcb_disconnect(conn_);
         conn_ = nullptr;
     }
@@ -251,6 +279,13 @@ bool X11CandidatePanel::ensureWindow(Surface& s, bool argb)
         xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, s.window, type, XCB_ATOM_ATOM, 32, 1,
                             &kind);
     }
+    // 工具栏 / 软键盘点了不能抢焦点（焦点一走，Fcitx5 的输入上下文就换了）：override-redirect
+    // 本就不归窗口管理器管，再声明 WM_HINTS.input = False，且不挂 WM_PROTOCOLS（没有 WM_TAKE_FOCUS）。
+    if (s.panel) {
+        const uint32_t hints[9] = {1 /* InputHint */, 0 /* input = False */};
+        xcb_change_property(conn_, XCB_PROP_MODE_REPLACE, s.window, XCB_ATOM_WM_HINTS,
+                            XCB_ATOM_WM_HINTS, 32, 9, hints);
+    }
     // 不收鼠标的窗口：输入区设为空，点击穿透到下面的应用。
     if (!s.interactive && shapeAvailable_) {
         xcb_shape_rectangles(conn_, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT,
@@ -266,6 +301,10 @@ bool X11CandidatePanel::ensureWindow(Surface& s, bool argb)
 void X11CandidatePanel::destroyWindow(Surface& s)
 {
     s.hideTimer.reset();
+    if (s.panel) {
+        panelPointerGone(s);
+        s.reqX = s.reqY = INT32_MIN;
+    }
     if (!conn_) {
         return;
     }
@@ -288,8 +327,9 @@ void X11CandidatePanel::destroyWindow(Surface& s)
     s.pixW = s.pixH = 0;
     s.mapped = false;
     s.hovered = false;
-    if (&s == &overlays_[OVERLAY_KIND_STATUS - 1]) {
+    if (drag_.active && &s == surfaceOf(drag_.kind)) {
         drag_ = Drag{}; // 窗口没了，它的隐式抓取与松开事件也就没了
+        dragOutputs_.clear();
     }
     if (&s == &menus_[0]) {
         pointerGrabbed_ = false; // 抓取窗口销毁，X 服务器随之放掉抓取
@@ -380,8 +420,11 @@ bool X11CandidatePanel::present(Surface& s, const SharedFrame& f, const Rect& r,
     upload(s, f);
     if (!s.argb) {
         applyShape(s, f, XCB_SHAPE_SK_BOUNDING); // 输入区随之裁掉
-    } else if (s.overlay) {
+    } else if (s.overlay && !s.panel) {
         // 真透明时外形不裁，但阴影 / 圆角外的透明处不该接住点击（点到的是下面的应用）。
+        // 工具栏 / 软键盘不裁：淡出时服务端把整窗透明度乘进了像素，假隐藏（悬停唤回）那帧
+        // 处处 alpha≈1，按 alpha 裁出的输入区是空的——指针穿透下去，悬停永远唤不回来。
+        // 整个矩形都收指针，同 Windows 上 alpha=1 的分层窗口仍可命中。
         applyShape(s, f, XCB_SHAPE_SK_INPUT);
     }
     if (!s.mapped) {
@@ -419,8 +462,11 @@ void X11CandidatePanel::unmapWindow(Surface& s)
     s.hovered = false;
     // 拖动中被摘掉（服务端推隐藏帧 / 服务重启）：X 在窗口不可见时自动放掉隐式抓取，不会再有
     // 松开事件来收尾——就地归位，不报落点（用户没松手，谈不上「摆到了哪」）。
-    if (&s == &overlays_[OVERLAY_KIND_STATUS - 1]) {
+    if (drag_.active && &s == surfaceOf(drag_.kind)) {
         endDrag(false);
+    }
+    if (s.panel) {
+        panelPointerGone(s); // 指针停在面板上时它被摘了：X 不会再发离开
     }
 }
 
@@ -461,9 +507,26 @@ X11CandidatePanel::Surface* X11CandidatePanel::overlay(uint32_t kind)
     return &overlays_[kind - 1];
 }
 
+X11CandidatePanel::Surface* X11CandidatePanel::panelSurface(uint32_t kind)
+{
+    if (!isPanelOverlayKind(kind)) {
+        return nullptr;
+    }
+    return &panels_[kind - OVERLAY_KIND_TOOLBAR];
+}
+
+X11CandidatePanel::Surface* X11CandidatePanel::surfaceOf(uint32_t kind)
+{
+    Surface* s = overlay(kind);
+    return s ? s : panelSurface(kind);
+}
+
 bool X11CandidatePanel::showOverlay(uint32_t kind, const SharedFrame& f,
                                     const OverlayFramePayload& p)
 {
+    if (isPanelOverlayKind(kind)) {
+        return showPanel(kind, f, p);
+    }
     Surface* s = overlay(kind);
     if (!s || f.width == 0 || f.height == 0 || f.bgra.empty() || !ensureConnection()) {
         return false;
@@ -479,7 +542,7 @@ bool X11CandidatePanel::showOverlay(uint32_t kind, const SharedFrame& f,
     geo.width = f.width;
     geo.height = f.height;
     Rect r;
-    if (kind == OVERLAY_KIND_STATUS && drag_.active && s->mapped) {
+    if (dragging(OVERLAY_KIND_STATUS) && kind == OVERLAY_KIND_STATUS && s->mapped) {
         // 拖动中：只换像素、不重新落位，免得状态刷新把气泡从指针下拽走（同 Windows
         // `StatusTip::show` 的 drag_pin 分支）。内容盒偏移变了就按新偏移保住内容左上。
         r = Rect{s->x + s->geo.contentX - geo.contentX, s->y + s->geo.contentY - geo.contentY,
@@ -520,7 +583,7 @@ bool X11CandidatePanel::held(uint32_t kind) const
     const Surface& s = overlays_[kind - 1];
     switch (kind) {
     case OVERLAY_KIND_STATUS:
-        return s.hovered || drag_.active || statusMenuHold_;
+        return s.hovered || dragging(OVERLAY_KIND_STATUS) || statusMenuHold_;
     case OVERLAY_KIND_TOAST:
         return s.hovered;
     default:
@@ -543,6 +606,10 @@ void X11CandidatePanel::refreshHold(uint32_t kind)
 
 void X11CandidatePanel::hideOverlay(uint32_t kind)
 {
+    if (Surface* ps = panelSurface(kind)) {
+        unmap(*ps);
+        return;
+    }
     Surface* s = overlay(kind);
     if (!s) {
         return;
@@ -591,6 +658,7 @@ void X11CandidatePanel::onReadable()
         std::free(ev);
     }
     flushMenuMotion();
+    flushPanelMotion();
     if (conn_ && xcb_connection_has_error(conn_) && ioEvent_) {
         WIND_WARN() << "X 连接断开，下一帧重连";
         // 不能在 IO 回调里销毁自己所属的 EventSourceIO，只先停掉它（断开的 fd 恒可读，
@@ -601,7 +669,28 @@ void X11CandidatePanel::onReadable()
 
 void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
 {
-    if (menuOpen() && (ev->response_type & 0x7F) != 0) {
+    const uint8_t type = ev->response_type & 0x7F;
+    if (type == XCB_PROPERTY_NOTIFY) {
+        // 全屏检测：根窗口换了活动窗口，或活动窗口的 _NET_WM_STATE 变了（菜单开着也照收）。
+        auto* e = reinterpret_cast<xcb_property_notify_event_t*>(ev);
+        if (screen_ && e->window == screen_->root && e->atom == atomActiveWindow_) {
+            refreshActiveWindow();
+        } else if (e->window == activeWindow_ && activeWindow_ && e->atom == atomWmState_) {
+            checkFullscreen();
+        }
+        return;
+    }
+    if (menuOpen() && type != 0) {
+        // 菜单抓指针时，指针所在的面板收到一个离开（mode = Grab）：照样转给服务端，否则它的
+        // 「指针在面板内」一直挂着（菜单开着期间面板收不到别的事件，收起后指针多半已在别处）。
+        if (type == XCB_LEAVE_NOTIFY) {
+            auto* e = reinterpret_cast<xcb_leave_notify_event_t*>(ev);
+            const uint32_t k = overlayKindOf(e->event);
+            if (isPanelOverlayKind(k)) {
+                handlePanelEvent(k, ev);
+                return;
+            }
+        }
         handleMenuEvent(ev);
         return;
     }
@@ -614,7 +703,11 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
     case XCB_ENTER_NOTIFY:
     case XCB_LEAVE_NOTIFY:
         if (uint32_t k = overlayKindOf(reinterpret_cast<xcb_motion_notify_event_t*>(ev)->event)) {
-            handleOverlayEvent(k, ev);
+            if (isPanelOverlayKind(k)) {
+                handlePanelEvent(k, ev);
+            } else {
+                handleOverlayEvent(k, ev);
+            }
             return;
         }
         break;
@@ -659,7 +752,7 @@ void X11CandidatePanel::handleEvent(xcb_generic_event_t* ev)
         }
         int32_t idx = hitTest(rects_, e->event_x, e->event_y);
         // 悬停只报候选（>=0）：命中表里的 -1/-2 是翻页按钮，而悬停协议里 -1 表示「无」。
-        candidateHover(idx >= 0 ? idx : -1);
+        candidateHover(idx >= 0 ? idx : -1, std::make_pair(int32_t(e->root_x), int32_t(e->root_y)));
         break;
     }
     case XCB_LEAVE_NOTIFY:
@@ -705,6 +798,11 @@ uint32_t X11CandidatePanel::overlayKindOf(xcb_window_t w) const
             return k;
         }
     }
+    for (size_t i = 0; i < kPanelCount; ++i) {
+        if (panels_[i].window == w) {
+            return OVERLAY_KIND_TOOLBAR + uint32_t(i);
+        }
+    }
     return 0;
 }
 
@@ -736,22 +834,37 @@ void X11CandidatePanel::cancelTipTimers()
     disarm(tipLeave_);
 }
 
-void X11CandidatePanel::candidateHover(int32_t raw)
+void X11CandidatePanel::candidateHover(int32_t raw, std::optional<std::pair<int32_t, int32_t>> at)
 {
+    const Surface& tip = overlays_[OVERLAY_KIND_TOOLTIP - 1];
+    const auto prev = std::exchange(lastPointer_, at);
+    const std::optional<int32_t> gap =
+        at && tip.mapped ? std::optional<int32_t>(tipGap(at->first, at->second, rectOf(tip))) : std::nullopt;
+    const bool toward = prev && gap && tipBest_ && *gap < *tipBest_ &&
+                        headingToTip(prev->first, prev->second, at->first, at->second, rectOf(tip));
     if (raw == hover_) {
         disarm(hoverDefer_); // 回到了原处：待报的变化作废
         return;
     }
-    const bool tipShown = overlays_[OVERLAY_KIND_TOOLTIP - 1].mapped;
-    const uint32_t ms = hoverDeferMs(hover_, raw, tipShown);
+    const uint32_t ms = hoverDeferMs(hover_, raw, tip.mapped);
     if (ms == 0) {
         setHover(raw);
         return;
     }
-    // 已在等：只换目标、不顺延（去往「无」的宽限不能被一路擦过的候选无限拖长）。
+    // 已在等：只换目标、不顺延（去往「无」的宽限不能被一路擦过的候选无限拖长）——除非正朝
+    // 提示去，那时按 kTipSwitchMs 顺延，停下来才切换。
     pendingHover_ = raw;
+    const uint64_t now = fcitx::now(CLOCK_MONOTONIC);
     if (!armed(hoverDefer_)) {
+        hoverDue_ = now + uint64_t(ms) * 1000;
+        tipBest_ = gap;
         armTimer(hoverDefer_, ms, &X11CandidatePanel::onHoverDeferred);
+    } else if (toward) {
+        tipBest_ = gap;
+        if (now + uint64_t(kTipSwitchMs) * 1000 > hoverDue_) {
+            hoverDue_ = now + uint64_t(kTipSwitchMs) * 1000;
+            armTimer(hoverDefer_, kTipSwitchMs, &X11CandidatePanel::onHoverDeferred);
+        }
     }
 }
 
@@ -787,7 +900,11 @@ void X11CandidatePanel::handleOverlayEvent(uint32_t kind, xcb_generic_event_t* e
         auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
         switch (overlayPressAction(kind, e->detail)) {
         case OverlayPress::Drag:
+            if (drag_.active) {
+                break; // 已在拖别的（不会同时有两个隐式抓取，防御）
+            }
             drag_.active = true;
+            drag_.kind = kind;
             drag_.grabDx = e->root_x - s.x;
             drag_.grabDy = e->root_y - s.y;
             setDragCursor(true);
@@ -812,13 +929,14 @@ void X11CandidatePanel::handleOverlayEvent(uint32_t kind, xcb_generic_event_t* e
             unmap(s);
             break;
         case OverlayPress::None:
+        case OverlayPress::Forward: // 只有工具栏 / 软键盘会给，三层浮层走不到
             break;
         }
         break;
     }
     case XCB_BUTTON_RELEASE: {
         auto* e = reinterpret_cast<xcb_button_release_event_t*>(ev);
-        if (kind == OVERLAY_KIND_STATUS && e->detail == 1) {
+        if (dragging(OVERLAY_KIND_STATUS) && kind == OVERLAY_KIND_STATUS && e->detail == 1) {
             moveDrag(e->root_x, e->root_y);
             endDrag(true);
         }
@@ -826,7 +944,7 @@ void X11CandidatePanel::handleOverlayEvent(uint32_t kind, xcb_generic_event_t* e
     }
     case XCB_MOTION_NOTIFY: {
         auto* e = reinterpret_cast<xcb_motion_notify_event_t*>(ev);
-        if (kind == OVERLAY_KIND_STATUS && drag_.active) {
+        if (kind == OVERLAY_KIND_STATUS && dragging(OVERLAY_KIND_STATUS)) {
             if (!(e->state & XCB_KEY_BUT_MASK_BUTTON_1)) {
                 endDrag(true); // 松开事件丢了（按住期间窗口被重建等）：按当下位置收尾
             } else {
@@ -858,7 +976,7 @@ void X11CandidatePanel::handleOverlayEvent(uint32_t kind, xcb_generic_event_t* e
             if (hover_ >= 0) {
                 armTimer(tipLeave_, kTipGraceMs, &X11CandidatePanel::onTipLeaveGrace);
             }
-        } else if (!drag_.active || kind != OVERLAY_KIND_STATUS) {
+        } else if (!dragging(OVERLAY_KIND_STATUS) || kind != OVERLAY_KIND_STATUS) {
             s.hovered = false;
             refreshHold(kind); // 交互结束：重新给满一份时长
         }
@@ -871,11 +989,26 @@ void X11CandidatePanel::handleOverlayEvent(uint32_t kind, xcb_generic_event_t* e
 
 void X11CandidatePanel::moveDrag(int32_t rootX, int32_t rootY)
 {
-    Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
-    if (!drag_.active || !conn_ || !s.window || !s.mapped) {
+    Surface* sp = surfaceOf(drag_.kind);
+    if (!drag_.active || !sp || !conn_ || !sp->window || !sp->mapped) {
         return;
     }
-    const Rect r = dragOverlay(rootX, rootY, drag_.grabDx, drag_.grabDy, s.geo, workArea());
+    Surface& s = *sp;
+    Rect r;
+    if (s.panel) {
+        // 面板：窗口跟着指针走，夹进指针所在输出的工作区（可以拖到另一块屏上）。
+        const Rect want{rootX - drag_.grabDx, rootY - drag_.grabDy, int32_t(s.pixW),
+                        int32_t(s.pixH)};
+        std::vector<Rect> rects;
+        for (const OutputInfo& o : dragOutputs_) {
+            rects.push_back(o.rect);
+        }
+        const int i = outputIndexAt(rects, rootX, rootY);
+        r = clampToWorkArea(want,
+                            i >= 0 ? dragOutputs_[i].work : panelWorkArea(want, dragOutputs_));
+    } else {
+        r = dragOverlay(rootX, rootY, drag_.grabDx, drag_.grabDy, s.geo, workArea());
+    }
     if (r.x == s.x && r.y == s.y) {
         return;
     }
@@ -891,25 +1024,47 @@ void X11CandidatePanel::endDrag(bool report)
     if (!drag_.active) {
         return;
     }
-    drag_.active = false;
     setDragCursor(false);
-    Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
+    const uint32_t kind = drag_.kind;
+    drag_ = Drag{};
+    Surface* s = surfaceOf(kind);
+    if (s && s->panel) {
+        // 面板松手只报这一次 `pos.*`（拖动中的移动一个都不回传）。输出名取松手时窗口中心所在的
+        // 那块，与 host.display 同源（都是 RandR 名字，拿不到就都不报）。
+        if (report && s->mapped && cb_.panelMoved) {
+            const Rect r = rectOf(*s);
+            std::string output;
+            for (const OutputInfo& o : dragOutputs_) {
+                if (rectContains(o.rect, r.x + r.w / 2, r.y + r.h / 2)) {
+                    output = o.name;
+                    break;
+                }
+            }
+            WIND_DEBUG() << s->instance << " 拖动松手，上报内容左上 (" << s->x + s->geo.contentX
+                         << "," << s->y + s->geo.contentY << ") output=" << output;
+            cb_.panelMoved(kind, s->x + s->geo.contentX, s->y + s->geo.contentY, output);
+        }
+        dragOutputs_.clear();
+        return;
+    }
+    Surface& st = overlays_[OVERLAY_KIND_STATUS - 1];
     // 松手就报（同 Windows WM_LBUTTONUP，没挪也报）：固定位置模式下它就是新的落点，跟随光标
     // 模式下服务端不落盘——判据只在服务端（`save_status_tip_pos`）。
-    if (report && s.mapped && cb_.statusMoved) {
-        WIND_DEBUG() << "状态气泡拖动松手，上报内容左上 (" << s.x + s.geo.contentX << ","
-                     << s.y + s.geo.contentY << ")";
-        cb_.statusMoved(s.x + s.geo.contentX, s.y + s.geo.contentY);
+    if (report && st.mapped && cb_.statusMoved) {
+        WIND_DEBUG() << "状态气泡拖动松手，上报内容左上 (" << st.x + st.geo.contentX << ","
+                     << st.y + st.geo.contentY << ")";
+        cb_.statusMoved(st.x + st.geo.contentX, st.y + st.geo.contentY);
     }
     refreshHold(OVERLAY_KIND_STATUS);
 }
 
 void X11CandidatePanel::setDragCursor(bool on)
 {
-    Surface& s = overlays_[OVERLAY_KIND_STATUS - 1];
-    if (!conn_ || !s.window) {
+    Surface* sp = surfaceOf(drag_.kind);
+    if (!conn_ || !sp || !sp->window) {
         return;
     }
+    Surface& s = *sp;
     if (on && !dragCursor_) {
         // 光标字体里的 fleur（四向箭头，XC_fleur = 52，掩码是下一个字形），同 Windows IDC_SIZEALL。
         xcb_font_t font = xcb_generate_id(conn_);
@@ -1272,6 +1427,362 @@ std::optional<std::pair<int32_t, int32_t>> X11CandidatePanel::pointerPosition()
     std::pair<int32_t, int32_t> p{r->root_x, r->root_y};
     std::free(r);
     return p;
+}
+
+} // namespace windlinux
+
+// ── 工具栏 / 软键盘 ──────────────────────────────────────────────────
+
+namespace windlinux {
+
+bool X11CandidatePanel::showPanel(uint32_t kind, const SharedFrame& f, const OverlayFramePayload& p)
+{
+    Surface* s = panelSurface(kind);
+    if (!s || f.width == 0 || f.height == 0 || f.bgra.empty() || !ensureConnection()) {
+        return false;
+    }
+    if (!ensureWindow(*s, hasCompositor()) || bitsPerPixel(conn_, s->depth) != 32) {
+        return false;
+    }
+    OverlayFramePayload geo = p;
+    geo.width = f.width;
+    geo.height = f.height;
+    const bool wasMapped = s->mapped;
+    Rect r{s->x, s->y, int32_t(f.width), int32_t(f.height)};
+    if (dragging(kind) && wasMapped) {
+        // 拖动中：只换像素、不挪——服务端还不知道新位置，帧里是拖动前的坐标。
+    } else if (wasMapped && p.x == s->reqX && p.y == s->reqY && f.width == s->pixW
+               && f.height == s->pixH) {
+        // 原地重绘（悬停高亮、按键反馈…）：沿用上次夹回的结果，不再为每帧往返查输出布局。
+    } else {
+        // EXACT 原样摆，再夹进所在输出的工作区：服务端记下的位置可能在换过布局的屏幕外面。
+        const Rect want = placeOverlay(geo, workArea(), 0, 0);
+        r = clampToWorkArea(want, panelWorkArea(want, queryOutputs()));
+        s->reqX = p.x;
+        s->reqY = p.y;
+    }
+    s->geo = geo;
+    // 只在新映射时提到最上：常驻面板每次重绘都提层的话，会盖住它自己弹出的菜单和候选窗。
+    return present(*s, f, r, !wasMapped);
+}
+
+void X11CandidatePanel::handlePanelEvent(uint32_t kind, xcb_generic_event_t* ev)
+{
+    Surface& s = *panelSurface(kind);
+    switch (ev->response_type & 0x7F) {
+    case XCB_BUTTON_PRESS: {
+        auto* e = reinterpret_cast<xcb_button_press_event_t*>(ev);
+        if (drag_.active) {
+            break; // 拖动中按别的键：服务端没见过这次拖动的按下，也不让它看到这一下
+        }
+        if (e->detail == 4 || e->detail == 5) {
+            panelPointer(kind, PANEL_POINTER_WHEEL, e->detail, e->event_x, e->event_y);
+            break;
+        }
+        if (e->detail > 5) {
+            break; // 横向滚轮 / 侧键：Windows 工具栏与软键盘都不处理
+        }
+        if (overlayPressAction(kind, e->detail, e->event_x, e->event_y, s.geo.drag)
+            == OverlayPress::Drag) {
+            // 拖动区里的左键：本端拖，按下不转给服务端（它会自己再报一次「已移动」，与 pos.* 重复）。
+            // 靠按下时的隐式抓取收移动与松开，拖出窗口也照收。
+            drag_.active = true;
+            drag_.kind = kind;
+            drag_.grabDx = e->root_x - s.x;
+            drag_.grabDy = e->root_y - s.y;
+            dragOutputs_ = queryOutputs();
+            setDragCursor(true);
+            break;
+        }
+        panelPointer(kind, PANEL_POINTER_PRESS, e->detail, e->event_x, e->event_y);
+        break;
+    }
+    case XCB_BUTTON_RELEASE: {
+        auto* e = reinterpret_cast<xcb_button_release_event_t*>(ev);
+        if (dragging(kind)) {
+            if (e->detail == 1) {
+                moveDrag(e->root_x, e->root_y);
+                endDrag(true);
+            }
+            break;
+        }
+        if (drag_.active || e->detail > 3) {
+            break; // 滚轮的松开没有意义（按下已报成一次滚动）
+        }
+        panelPointer(kind, PANEL_POINTER_RELEASE, e->detail, e->event_x, e->event_y);
+        break;
+    }
+    case XCB_MOTION_NOTIFY: {
+        auto* e = reinterpret_cast<xcb_motion_notify_event_t*>(ev);
+        if (dragging(kind)) {
+            if (!(e->state & XCB_KEY_BUT_MASK_BUTTON_1)) {
+                endDrag(true); // 松开事件丢了：按当下位置收尾（同状态气泡）
+            } else {
+                moveDrag(e->root_x, e->root_y);
+            }
+            break;
+        }
+        if (drag_.active) {
+            break;
+        }
+        panelPointer(kind, PANEL_POINTER_MOTION, 0, e->event_x, e->event_y);
+        break;
+    }
+    case XCB_LEAVE_NOTIFY: {
+        auto* e = reinterpret_cast<xcb_leave_notify_event_t*>(ev);
+        // 抓取引起的离开（菜单抓指针、拖完松手时指针已在外面）也报：之后面板收不到事件，
+        // 服务端的悬停 / 按下态要在这里收掉。移进子窗口不算（面板没有子窗口）。
+        if (e->detail == XCB_NOTIFY_DETAIL_INFERIOR || !s.pointerIn) {
+            break;
+        }
+        s.pointerIn = false;
+        panelPointer(kind, PANEL_POINTER_LEAVE, 0, e->event_x, e->event_y);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void X11CandidatePanel::panelPointer(uint32_t kind, uint32_t event, uint32_t button, int32_t x,
+                                     int32_t y)
+{
+    if (event != PANEL_POINTER_LEAVE) {
+        if (Surface* s = panelSurface(kind)) {
+            s->pointerIn = true;
+        }
+    }
+    if (event == PANEL_POINTER_MOTION) {
+        if (pendingPanelMotion_ && pendingPanelMotion_->kind != kind) {
+            flushPanelMotion();
+        }
+        pendingPanelMotion_ = PanelMotion{kind, x, y};
+        return;
+    }
+    flushPanelMotion(); // 保序：积着的移动先报
+    if (cb_.panelPointer) {
+        cb_.panelPointer(kind, event, button, x, y);
+    }
+}
+
+void X11CandidatePanel::flushPanelMotion()
+{
+    if (!pendingPanelMotion_) {
+        return;
+    }
+    const PanelMotion m = *pendingPanelMotion_;
+    pendingPanelMotion_.reset();
+    if (cb_.panelPointer) {
+        cb_.panelPointer(m.kind, PANEL_POINTER_MOTION, 0, m.x, m.y);
+    }
+}
+
+void X11CandidatePanel::panelPointerGone(Surface& s)
+{
+    if (!s.pointerIn) {
+        return;
+    }
+    s.pointerIn = false;
+    // 坐标无意义：服务端的 LEAVE 不更新「最后指针」。
+    panelPointer(OVERLAY_KIND_TOOLBAR + uint32_t(&s - panels_), PANEL_POINTER_LEAVE, 0, 0, 0);
+}
+
+std::optional<Rect> X11CandidatePanel::netWorkArea()
+{
+    if (!connectionUsable() || !atomWorkArea_) {
+        return std::nullopt;
+    }
+    // _NET_WORKAREA 每个虚拟桌面一组 (x, y, w, h)，取当前桌面那组（_NET_CURRENT_DESKTOP，没有按 0）。
+    uint32_t desktop = 0;
+    if (atomCurrentDesktop_) {
+        auto ck = xcb_get_property(conn_, 0, screen_->root, atomCurrentDesktop_,
+                                   XCB_ATOM_CARDINAL, 0, 1);
+        if (auto* r = xcb_get_property_reply(conn_, ck, nullptr)) {
+            if (r->format == 32 && xcb_get_property_value_length(r) >= 4) {
+                desktop = *static_cast<const uint32_t*>(xcb_get_property_value(r));
+            }
+            std::free(r);
+        }
+    }
+    auto ck = xcb_get_property(conn_, 0, screen_->root, atomWorkArea_, XCB_ATOM_CARDINAL, 0, 4096);
+    auto* r = xcb_get_property_reply(conn_, ck, nullptr);
+    if (!r) {
+        return std::nullopt;
+    }
+    std::optional<Rect> out;
+    const uint32_t n = r->format == 32 ? uint32_t(xcb_get_property_value_length(r)) / 4 : 0;
+    if (n >= 4) {
+        const uint32_t* v = static_cast<const uint32_t*>(xcb_get_property_value(r));
+        const uint32_t base = (desktop + 1) * 4 <= n ? desktop * 4 : 0;
+        out = Rect{int32_t(v[base]), int32_t(v[base + 1]), int32_t(v[base + 2]),
+                   int32_t(v[base + 3])};
+    }
+    std::free(r);
+    return out;
+}
+
+std::vector<X11CandidatePanel::OutputInfo> X11CandidatePanel::queryOutputs()
+{
+    std::vector<OutputInfo> out;
+    if (!randrAvailable_ || !connectionUsable()) {
+        return out;
+    }
+    auto* res = xcb_randr_get_screen_resources_current_reply(
+        conn_, xcb_randr_get_screen_resources_current(conn_, screen_->root), nullptr);
+    if (!res) {
+        return out;
+    }
+    xcb_randr_output_t primary = XCB_NONE;
+    if (auto* pr = xcb_randr_get_output_primary_reply(
+            conn_, xcb_randr_get_output_primary(conn_, screen_->root), nullptr)) {
+        primary = pr->output;
+        std::free(pr);
+    }
+    const std::optional<Rect> net = netWorkArea();
+    const xcb_randr_output_t* outs = xcb_randr_get_screen_resources_current_outputs(res);
+    const int n = xcb_randr_get_screen_resources_current_outputs_length(res);
+    for (int i = 0; i < n; ++i) {
+        auto* info = xcb_randr_get_output_info_reply(
+            conn_, xcb_randr_get_output_info(conn_, outs[i], res->config_timestamp), nullptr);
+        if (!info) {
+            continue;
+        }
+        // 只认点亮了的（挂在某个 CRTC 上）：没接的口、接了但关掉的屏都没有 CRTC。
+        if (info->crtc != XCB_NONE) {
+            auto* crtc = xcb_randr_get_crtc_info_reply(
+                conn_, xcb_randr_get_crtc_info(conn_, info->crtc, res->config_timestamp), nullptr);
+            if (crtc && crtc->width > 0 && crtc->height > 0) {
+                OutputInfo o;
+                o.name.assign(reinterpret_cast<const char*>(xcb_randr_get_output_info_name(info)),
+                              size_t(xcb_randr_get_output_info_name_length(info)));
+                o.rect = Rect{crtc->x, crtc->y, crtc->width, crtc->height};
+                o.work = outputWorkArea(o.rect, net);
+                // 主输出排最前：落在所有输出之外的面板夹回到它上面。
+                if (outs[i] == primary) {
+                    out.insert(out.begin(), std::move(o));
+                } else {
+                    out.push_back(std::move(o));
+                }
+            }
+            std::free(crtc);
+        }
+        std::free(info);
+    }
+    std::free(res);
+    return out;
+}
+
+Rect X11CandidatePanel::panelWorkArea(const Rect& r, const std::vector<OutputInfo>& outputs)
+{
+    if (outputs.empty()) {
+        return outputWorkArea(workArea(), netWorkArea());
+    }
+    std::vector<Rect> rects;
+    for (const OutputInfo& o : outputs) {
+        rects.push_back(o.rect);
+    }
+    const int i = outputIndexAt(rects, r.x + r.w / 2, r.y + r.h / 2);
+    return outputs[i >= 0 ? size_t(i) : 0].work;
+}
+
+std::optional<HostOutput> X11CandidatePanel::outputAt(int32_t x, int32_t y)
+{
+    for (const OutputInfo& o : queryOutputs()) {
+        if (rectContains(o.rect, x, y)) {
+            return HostOutput{o.name, o.work};
+        }
+    }
+    return std::nullopt;
+}
+
+// ── 全屏检测 ──
+
+void X11CandidatePanel::watchRoot()
+{
+    atomActiveWindow_ = internAtom(conn_, "_NET_ACTIVE_WINDOW");
+    atomWmState_ = internAtom(conn_, "_NET_WM_STATE");
+    atomFullscreen_ = internAtom(conn_, "_NET_WM_STATE_FULLSCREEN");
+    atomWorkArea_ = internAtom(conn_, "_NET_WORKAREA");
+    atomCurrentDesktop_ = internAtom(conn_, "_NET_CURRENT_DESKTOP");
+    // 事件掩码按客户端分开记：这里只设本连接在根窗口上的掩码，碰不到别的客户端。
+    const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+    xcb_change_window_attributes(conn_, screen_->root, XCB_CW_EVENT_MASK, &mask);
+    xcb_flush(conn_);
+    // 连上那一刻就判一次（别等到用户切窗口）。排到事件循环里做：这里可能正处在贴帧 / 上报
+    // 显示环境的路径上，不在其中途回调引擎发请求。
+    armTimer(activeCheck_, 0, &X11CandidatePanel::refreshActiveWindow);
+}
+
+bool X11CandidatePanel::ownsWindow(xcb_window_t w) const
+{
+    if (w == 0) {
+        return false;
+    }
+    if (w == cand_.window || overlayKindOf(w) != 0) {
+        return true;
+    }
+    for (const Surface& m : menus_) {
+        if (m.window == w) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void X11CandidatePanel::refreshActiveWindow()
+{
+    if (!connectionUsable() || !atomActiveWindow_) {
+        return;
+    }
+    xcb_window_t w = XCB_NONE;
+    auto ck = xcb_get_property(conn_, 0, screen_->root, atomActiveWindow_, XCB_ATOM_WINDOW, 0, 1);
+    if (auto* r = xcb_get_property_reply(conn_, ck, nullptr)) {
+        if (r->format == 32 && xcb_get_property_value_length(r) >= 4) {
+            w = *static_cast<const xcb_window_t*>(xcb_get_property_value(r));
+        }
+        std::free(r);
+    }
+    if (w != activeWindow_) {
+        // 撤掉对旧窗口的订阅：掩码按客户端分开记，置 0 只清本连接自己加的那份，别的客户端在
+        // 那个窗口上选的事件不受影响。没加过（本端的窗口 / 0）就不碰。旧窗口可能已经销毁，
+        // BadWindow 走错误事件、只记 debug。
+        if (activeWatched_) {
+            const uint32_t none = 0;
+            xcb_change_window_attributes(conn_, activeWindow_, XCB_CW_EVENT_MASK, &none);
+        }
+        activeWindow_ = w;
+        activeWatched_ = false;
+        // 先订阅再读状态：读和订阅之间的变化不会漏。
+        if (w != XCB_NONE && !ownsWindow(w)) {
+            const uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+            xcb_change_window_attributes(conn_, w, XCB_CW_EVENT_MASK, &mask);
+            activeWatched_ = true;
+        }
+        xcb_flush(conn_);
+    }
+    checkFullscreen();
+}
+
+void X11CandidatePanel::checkFullscreen()
+{
+    if (!connectionUsable()) {
+        return;
+    }
+    bool fullscreen = false;
+    if (activeWindow_ != XCB_NONE && atomWmState_) {
+        auto ck = xcb_get_property(conn_, 0, activeWindow_, atomWmState_, XCB_ATOM_ATOM, 0, 64);
+        if (auto* r = xcb_get_property_reply(conn_, ck, nullptr)) {
+            if (r->format == 32) {
+                const auto* a = static_cast<const xcb_atom_t*>(xcb_get_property_value(r));
+                const int n = xcb_get_property_value_length(r) / 4;
+                fullscreen = hasFullscreenState(std::vector<uint32_t>(a, a + n), atomFullscreen_);
+            }
+            std::free(r);
+        }
+    }
+    if (cb_.fullscreenChanged) {
+        cb_.fullscreenChanged(fullscreen);
+    }
 }
 
 } // namespace windlinux

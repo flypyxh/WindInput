@@ -1082,46 +1082,10 @@ mod tests {
         }
     }
 
-    /// 装一份最小常用字表。`retain_rare_admitted` 对空表整条早退（见那条测试），
-    /// 故凡要验过滤结果的用例都得先装表。
-    /// 灌出厂字表。
-    ///
-    /// ⚠️ **必须同时装配配套的 registry**：判定已经归 `CharsetRegistry`（`common_han`
-    /// 类给出「是汉字却不在名单里 ⇒ 生僻」），只灌 `CommonChars` 的话没有人表态，
-    /// 所有字兜底判常用——生僻字模式会一条候选都留不下，而看起来像是过滤写错了。
-    ///
-    /// 生产路径上两者同源：`CommonChars::load` 读 `schemas/common_chars.txt`，
-    /// registry 里 `common_han` 的 `file:` 指的也是那一个文件。
+    /// 装一份最小常用字表（连同配套 registry），见 [`set_common_chars`]。
+    /// `retain_rare_admitted` 对空表整条早退（见那条测试），故凡要验过滤结果的用例都得先装表。
     fn set_common(c: &Coordinator, chars: impl IntoIterator<Item = char> + Clone) {
-        *c.common_chars.write().unwrap() = wind_candidate::CommonChars::from_base(chars.clone());
-        // ⚠️ **合并而不是整份替换**：registry 里还有装配好的 emoji 类、50 个内置区块，
-        // 以及 `include_blocks` 打上的 `in_rare` 标记。整份换掉会把它们一并抹了
-        // ——表现为「配了 include_blocks 却不生效」，而根因在夹具。
-        let mut specs: Vec<wind_candidate::ClassSpec> = c
-            .engine_mgr
-            .charsets()
-            .classes()
-            .iter()
-            .filter(|s| s.key != "common_han")
-            .cloned()
-            .collect();
-        specs.push(common_han_spec(chars));
-        let (reg, dropped) = wind_candidate::CharsetRegistry::compile(specs);
-        assert!(dropped.is_empty());
-        c.engine_mgr.set_charsets(std::sync::Arc::new(reg));
-    }
-
-    /// 出厂 `common_han` 类的形态：作用域 = 汉字域、名单 = 这些字、名单外生僻。
-    fn common_han_spec(chars: impl IntoIterator<Item = char>) -> wind_candidate::ClassSpec {
-        wind_candidate::ClassSpec {
-            key: "common_han".into(),
-            members: chars.into_iter().map(|c| c.to_string()).collect(),
-            scope: Some(wind_candidate::Scope::Han),
-            default_common: Some(true),
-            outside_common: Some(false),
-            order: 50,
-            ..Default::default()
-        }
+        crate::charset_test_support::set_common_chars(c, chars);
     }
 
     /// ── 生僻字模式 ────────────────────────────────────────────────────────────

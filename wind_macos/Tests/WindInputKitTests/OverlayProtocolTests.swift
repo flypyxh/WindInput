@@ -175,6 +175,25 @@ final class OverlayProtocolTests: XCTestCase {
         XCTAssertEqual(OverlayInput.hoverDeferMs(last: 2, raw: 4, tipShown: true), 150)
     }
 
+    /// 同 Windows heading_to_tip 那张表。
+    func testHeadingToTip() {
+        let rightTop = WireRect(x: 100, y: 0, w: 100, h: 40)
+        XCTAssertTrue(OverlayInput.headingToTip(10, 120, 14, 120, tip: rightTop))   // 沿行水平右移
+        XCTAssertTrue(OverlayInput.headingToTip(10, 120, 14, 116, tip: rightTop))   // 斜着往上
+        XCTAssertFalse(OverlayInput.headingToTip(10, 120, 14, 126, tip: rightTop))  // 往下偏得比靠近快
+        XCTAssertFalse(OverlayInput.headingToTip(10, 120, 6, 120, tip: rightTop))   // 往回走
+        XCTAssertFalse(OverlayInput.headingToTip(10, 120, 10, 120, tip: rightTop))  // 没动
+        XCTAssertTrue(OverlayInput.headingToTip(10, 20, 12, 26, tip: rightTop))     // 跨度内上下随意
+        XCTAssertTrue(OverlayInput.headingToTip(10, 20, 6, 20, tip: WireRect(x: -200, y: 0, w: 100, h: 40)))
+        let below = WireRect(x: 0, y: 50, w: 80, h: 70)
+        XCTAssertTrue(OverlayInput.headingToTip(40, 10, 40, 14, tip: below))
+        XCTAssertFalse(OverlayInput.headingToTip(40, 10, 40, 6, tip: below))
+        XCTAssertFalse(OverlayInput.headingToTip(150, 60, 151, 60, tip: WireRect(x: 100, y: 0, w: 100, h: 100)))
+        XCTAssertEqual(OverlayInput.tipGap(25, 5, tip: rightTop), 75)   // 同 Windows tip_gap
+        XCTAssertEqual(OverlayInput.tipGap(40, 10, tip: below), 40)
+        XCTAssertEqual(OverlayInput.tipGap(150, 60, tip: WireRect(x: 100, y: 0, w: 100, h: 100)), 0)
+    }
+
     func testTipRecheckHover() {
         let keep = OverlayInput.keepHover
         XCTAssertEqual(OverlayInput.tipRecheckHover(onTip: true, onCandidate: false, candidateHit: -1, held: 2), keep)

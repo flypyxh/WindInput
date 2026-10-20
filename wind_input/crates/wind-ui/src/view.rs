@@ -136,21 +136,57 @@ pub fn paint_cache_evict_if_idle(now: std::time::Instant) -> bool {
 /// 连编译都不参与，写进去的代码没有任何本机可验证性。做成与命令类型无关的泛型后，它在
 /// 所有平台参与编译、在开发机上可测，macOS 那侧只剩一行调用。
 pub fn recv_evicting_idle<T>(rx: &std::sync::mpsc::Receiver<T>) -> Option<T> {
+    match recv_evicting_idle_until(rx, None) {
+        Recv::Cmd(cmd) => Some(cmd),
+        // 没给截止时刻就不会超时；按断开处理只是让 match 穷尽。
+        Recv::Timeout | Recv::Disconnected => None,
+    }
+}
+
+/// [`recv_evicting_idle_until`] 的结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recv<T> {
+    Cmd(T),
+    /// 到了调用方给的截止时刻，期间没有命令。
+    Timeout,
+    /// 发送端已全部断开。
+    Disconnected,
+}
+
+/// 同 [`recv_evicting_idle`]，但最多等到 `until`：调用方自己也有计时器要推进时用
+/// （Linux forwarder 的工具栏迟滞 / 自动隐藏、软键盘连发）。`None` = 只等命令。
+///
+/// 闲置回收照旧挂在等待上：到期时刻取「调用方的 `until`」与「缓存回收时刻」中较早者，
+/// 缓存先到就收一次再接着等，不会因此提前返回给调用方。
+pub fn recv_evicting_idle_until<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    until: Option<std::time::Instant>,
+) -> Recv<T> {
     use std::sync::mpsc::RecvTimeoutError;
     loop {
         let now = std::time::Instant::now();
         paint_cache_evict_if_idle(now);
+        if until.is_some_and(|u| now >= u) {
+            return Recv::Timeout;
+        }
         // 回收之后才问到期时刻：刚清空的缓存不再要求唤醒，于是退化为纯阻塞 recv，
         // 空闲时线程零开销地停住。
-        let Some(deadline) = paint_cache_next_deadline() else {
-            return rx.recv().ok();
+        let Some(deadline) = [paint_cache_next_deadline(), until]
+            .into_iter()
+            .flatten()
+            .min()
+        else {
+            return match rx.recv() {
+                Ok(cmd) => Recv::Cmd(cmd),
+                Err(_) => Recv::Disconnected,
+            };
         };
         match rx.recv_timeout(deadline.saturating_duration_since(now)) {
-            Ok(cmd) => return Some(cmd),
-            // 到点了：回到顶部收一次。不会忙等——那一轮的回收必定成功，
-            // 于是下一轮走上面的纯阻塞分支。
+            Ok(cmd) => return Recv::Cmd(cmd),
+            // 到点了：回到顶部收一次（或发现是调用方的截止时刻而返回）。不会忙等——
+            // 缓存那一轮的回收必定成功，于是不再要求唤醒。
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Disconnected) => return Recv::Disconnected,
         }
     }
 }
@@ -2458,6 +2494,33 @@ mod idle_evict_tests {
         assert_eq!(recv_evicting_idle(&rx), Some(1));
         drop(tx);
         assert_eq!(recv_evicting_idle(&rx), None, "发送端断开该返回 None");
+    }
+
+    /// 带截止时刻：没命令就按时返回 `Timeout`，不早不晚；闲置回收照旧在等待里发生。
+    #[test]
+    fn recv_until_times_out_and_still_reclaims() {
+        reset();
+        stage_stale_entry();
+        let (tx, rx) = channel::<u32>();
+        let wait = Duration::from_millis(30);
+        let start = Instant::now();
+        assert_eq!(
+            recv_evicting_idle_until(&rx, Some(start + wait)),
+            Recv::Timeout
+        );
+        assert!(start.elapsed() >= wait, "不能提前返回");
+        assert_eq!(paint_cache_next_deadline(), None, "等待期间该把缓存收掉");
+
+        tx.send(3).expect("发送");
+        assert_eq!(
+            recv_evicting_idle_until(&rx, Some(Instant::now() + wait)),
+            Recv::Cmd(3)
+        );
+        drop(tx);
+        assert_eq!(
+            recv_evicting_idle_until(&rx, Some(Instant::now() + wait)),
+            Recv::Disconnected
+        );
     }
 }
 

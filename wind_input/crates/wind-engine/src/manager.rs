@@ -6260,7 +6260,7 @@ impl EngineManager {
             return None;
         }
         let content = std::fs::read_to_string(&toml_path).ok()?;
-        let mut base: toml::Value = match toml::from_str(&content) {
+        let mut base: toml::Value = match content.parse() {
             Ok(v) => v,
             Err(e) => {
                 warn!("Parse schema TOML failed {}: {}", toml_path.display(), e);
@@ -6289,7 +6289,7 @@ impl EngineManager {
         // 否则用户的处境仍是「我写的这项没反应，也没人告诉我」。
         wind_config::tolerant_de::clear_fallbacks();
         let misplaced = misplaced_dict_font_keys(&base);
-        let mut schema = match base.clone().try_into::<Schema>() {
+        let mut schema = match Schema::from_toml_value(base.clone()) {
             Ok(mut s) => {
                 let fallbacks = wind_config::tolerant_de::take_fallbacks();
                 if !fallbacks.is_empty() {
@@ -6348,7 +6348,7 @@ impl EngineManager {
         merged: toml::Value,
         root_err: &toml::de::Error,
     ) -> Option<Schema> {
-        let default_v = match toml::Value::try_from(Schema::default()) {
+        let default_v = match Schema::default().to_toml_value() {
             Ok(v) => v,
             // 默认方案自己序列化不了属于代码 bug，此处无从补救。
             Err(e) => {
@@ -6357,12 +6357,12 @@ impl EngineManager {
             }
         };
         let wind_config::section_fallback::Patched { value, bad } =
-            wind_config::section_fallback::probe_and_patch::<Schema>(&merged, &default_v);
+            Schema::probe_and_patch(&merged, &default_v);
         if bad.is_empty() {
             warn!("Schema {schema_id} override 合并后解析失败且无法定位到具体段: {root_err}");
             return None;
         }
-        match value.try_into::<Schema>() {
+        match Schema::from_toml_value(value) {
             Ok(mut s) => {
                 for (path, err) in &bad {
                     // WARN 而非 INFO：这是**异常**不是正常降级，压成 INFO 会掩盖真实的
@@ -6392,7 +6392,7 @@ impl EngineManager {
     fn read_override_value(schema_id: &str, override_dir: &Path) -> Option<toml::Value> {
         let path = override_dir.join(format!("{schema_id}.toml"));
         let content = std::fs::read_to_string(&path).ok()?;
-        toml::from_str(&content).ok()
+        content.parse().ok()
     }
 
     /// 混输引用图（primary / secondary 两条边）上从 `start` 出发可达的第一个环，

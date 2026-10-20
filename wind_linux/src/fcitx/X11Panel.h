@@ -51,6 +51,16 @@ public:
             overlayMenu;
         /// 状态气泡拖动松手：内容左上的屏幕坐标 → `pos.status_tip`（落不落盘由服务端定）。
         std::function<void(int32_t x, int32_t y)> statusMoved;
+        /// 工具栏 / 软键盘上拖动区以外的指针事件（PANEL_POINTER_*、X11 按键号、位图内坐标）
+        /// → CMD_PANEL_POINTER。命中、高亮、点击都在服务端。
+        std::function<void(uint32_t kind, uint32_t event, uint32_t button, int32_t x, int32_t y)>
+            panelPointer;
+        /// 工具栏 / 软键盘本地拖完松手：内容左上的屏幕坐标与所在输出名（拿不到为空）→ `pos.*`。
+        std::function<void(uint32_t kind, int32_t x, int32_t y, const std::string& output)>
+            panelMoved;
+        /// 活动窗口的全屏状态（`_NET_ACTIVE_WINDOW` 的 `_NET_WM_STATE_FULLSCREEN`）。每次重查都调，
+        /// 去重在引擎（`FullscreenReporter`）。
+        std::function<void(bool fullscreen)> fullscreenChanged;
     };
 
     X11CandidatePanel(fcitx::EventLoop& loop, Callbacks cb);
@@ -65,6 +75,7 @@ public:
 
     /// 光栅浮层（CMD_OVERLAY_FRAME：tooltip / 状态气泡 / Toast）：各占一个窗口，落位见
     /// `placeOverlay`。`durationMs > 0` 时到点自己藏（计时归宿主，同 macOS `.app`）。
+    /// 工具栏 / 软键盘（kind 10 / 11）也走这里，见 `showPanel`。
     /// 鼠标交互对位 Windows（见 OverlayInput.h）：悬停 / 拖动 / 菜单开着时暂停自动隐藏，
     /// 悬停提示在指针移进它时保持、右键弹菜单，状态气泡可拖、可右键，Toast 点一下就关。
     bool showOverlay(uint32_t kind, const SharedFrame& frame, const OverlayFramePayload& p);
@@ -92,13 +103,17 @@ public:
     std::optional<Rect> screenWorkArea();
     /// 当前指针位置（根窗口坐标）。还没连上 / 连接已坏时返回空（不在这里重连）。
     std::optional<std::pair<int32_t, int32_t>> pointerPosition();
+    /// 屏幕点所在输出的 RandR 名字与工作区（输出矩形 ∩ `_NET_WORKAREA`）。没有 RandR、连接不可用、
+    /// 点不在任何已点亮的输出上时返回空（调用方回落到 `screenWorkArea`、不报输出名）。
+    std::optional<HostOutput> outputAt(int32_t x, int32_t y);
 
 private:
     /// 一个 override-redirect 窗口及其位图。候选窗与三层浮层各一个，共用一条 X 连接。
     struct Surface {
         const char* instance = ""; // WM_CLASS 实例名（xdotool search --classname）
         bool interactive = false;  // 收鼠标（候选窗 / 菜单 / 浮层）
-        bool overlay = false;      // 三层光栅浮层之一：另收进入 / 松开、窗口类型是 TOOLTIP
+        bool overlay = false;      // 光栅浮层之一：另收进入 / 松开、窗口类型是 TOOLTIP
+        bool panel = false;        // 工具栏 / 软键盘：常驻、指针转给服务端、WM_HINTS.input = False
         xcb_window_t window = 0;
         xcb_pixmap_t pixmap = 0;
         xcb_gcontext_t gc = 0;
@@ -115,8 +130,13 @@ private:
         OverlayFramePayload geo; // 最近一帧（尺寸取像素那一份）：内容盒偏移、自动隐藏时长
         HoverGate gate;          // 窗口出现那一刻的指针位置为基线
         bool hovered = false;    // 指针真实移动到它上面、尚未离开
+        // ── 仅工具栏 / 软键盘 ──
+        bool pointerIn = false; // 已报过移动、还没报离开：摘窗时要补一个 LEAVE
+        int32_t reqX = INT32_MIN; // 服务端最近要的窗口左上（EXACT）：没变就不重算夹回
+        int32_t reqY = INT32_MIN;
     };
     static constexpr size_t kOverlayCount = 3;
+    static constexpr size_t kPanelCount = 2;
     static constexpr size_t kMenuLevels = OVERLAY_MENU_LEVELS;
 
     /// 连上并就绪（必要时重连）。**只许**在贴帧路径上调：重连会销毁 IO 事件源与窗口，
@@ -138,7 +158,11 @@ private:
     void upload(Surface& s, const SharedFrame& frame);
     void applyShape(Surface& s, const SharedFrame& frame, uint8_t kind);
     Surface* overlay(uint32_t kind);
-    /// 哪一层浮层的窗口（不是浮层返回 0）。
+    /// 工具栏 / 软键盘的 Surface；别的 kind 返回空。
+    Surface* panelSurface(uint32_t kind);
+    /// 三层浮层或两块面板，按 kind 取。
+    Surface* surfaceOf(uint32_t kind);
+    /// 哪一层浮层 / 哪块面板的窗口（都不是返回 0）。
     uint32_t overlayKindOf(xcb_window_t w) const;
     Rect workArea() const;
     static Rect rectOf(const Surface& s) { return Rect{s.x, s.y, int32_t(s.pixW), int32_t(s.pixH)}; }
@@ -148,8 +172,40 @@ private:
 
     // ── 浮层交互（OverlayInput.h 是纯逻辑那一半）──
     void handleOverlayEvent(uint32_t kind, xcb_generic_event_t* ev);
-    /// 候选窗上的悬停变化：悬停提示正显示时按 `hoverDeferMs` 延后，给挪进提示留时间。
-    void candidateHover(int32_t raw);
+
+    // ── 工具栏 / 软键盘 ──
+    bool showPanel(uint32_t kind, const SharedFrame& frame, const OverlayFramePayload& p);
+    /// 拖动区外的事件原样转给服务端；拖动区里的左键本地拖（moveDrag / endDrag）。
+    void handlePanelEvent(uint32_t kind, xcb_generic_event_t* ev);
+    /// 报一个指针事件。移动先积着、按批末尾或下一个非移动事件之前再报（每次上报都是一趟同步请求）。
+    void panelPointer(uint32_t kind, uint32_t event, uint32_t button, int32_t x, int32_t y);
+    void flushPanelMotion();
+    /// 指针还算在面板里（报过移动、没报离开）就补报 LEAVE：窗口被摘 / 销毁时 X 不会再发离开，
+    /// 服务端「指针在面板内」会一直挂着。
+    void panelPointerGone(Surface& s);
+    /// 当前点亮的输出（RandR）：名字、矩形、工作区。没有 RandR 时为空。
+    struct OutputInfo {
+        std::string name;
+        Rect rect;
+        Rect work;
+    };
+    std::vector<OutputInfo> queryOutputs();
+    /// `_NET_WORKAREA`（当前桌面那一块）。没有时返回空。
+    std::optional<Rect> netWorkArea();
+    /// 面板窗口 `r` 该夹进的工作区：中心所在输出的工作区；不在任何输出上时取 RandR 主输出（再没有
+    /// 取第一块）；没有 RandR 时回落到根窗口的 `_NET_WORKAREA`（再没有取整个根窗口）。
+    Rect panelWorkArea(const Rect& r, const std::vector<OutputInfo>& outputs);
+
+    // ── 全屏检测 ──
+    /// 连上后订阅根窗口属性变化（`_NET_ACTIVE_WINDOW`），并排一次立即检查。
+    void watchRoot();
+    /// 重读 `_NET_ACTIVE_WINDOW`：换了窗口就撤掉对旧窗口的属性订阅、订阅新窗口，然后重判全屏。
+    void refreshActiveWindow();
+    void checkFullscreen();
+    bool ownsWindow(xcb_window_t w) const;
+    /// 候选窗上的悬停变化：悬停提示正显示时按 `hoverDeferMs` 延后，给挪进提示留时间；
+    /// `at` 是指针的根窗口坐标，正朝提示去时顺延（`headingToTip`）。
+    void candidateHover(int32_t raw, std::optional<std::pair<int32_t, int32_t>> at = std::nullopt);
     void onHoverDeferred();
     void onTipLeaveGrace();
     void cancelTipTimers();
@@ -158,6 +214,7 @@ private:
     /// 按 `held` 暂停或（交互结束时）重新给满一份时长。
     void refreshHold(uint32_t kind);
     void armHide(uint32_t kind);
+    bool dragging(uint32_t kind) const { return drag_.active && drag_.kind == kind; }
     void moveDrag(int32_t rootX, int32_t rootY);
     void endDrag(bool report);
     void setDragCursor(bool on);
@@ -198,10 +255,14 @@ private:
     ClickGate click_;    // 左键点选：按下记命中，松开同一项才选
     int32_t pendingHover_ = -1;
     std::unique_ptr<fcitx::EventSourceTime> hoverDefer_; // 延后报的悬停变化
+    uint64_t hoverDue_ = 0;                              // hoverDefer_ 的到期时刻（微秒）
+    std::optional<std::pair<int32_t, int32_t>> lastPointer_; // 上一次移动的根窗口坐标
+    std::optional<int32_t> tipBest_; // 本次宽限里离提示最近的距离（tipGap），刷新新低才顺延
     std::unique_ptr<fcitx::EventSourceTime> tipLeave_;   // 离开悬停提示后的宽限
 
     struct Drag {
         bool active = false;
+        uint32_t kind = 0;  // 拖的是哪一层（状态气泡 / 工具栏 / 软键盘）
         int32_t grabDx = 0; // 按下时指针相对窗口左上
         int32_t grabDy = 0;
     } drag_;
@@ -224,6 +285,28 @@ private:
     uint32_t menuIdleMs_;
     uint32_t menuMaxGrabMs_;
     std::optional<std::pair<int32_t, int32_t>> pendingMotion_;
+
+    Surface panels_[kPanelCount]; // 下标 = kind - OVERLAY_KIND_TOOLBAR
+    /// 拖面板期间的输出布局（按下时取一次，拖动中每次移动都按它挑工作区，不再往返查 RandR）。
+    std::vector<OutputInfo> dragOutputs_;
+    struct PanelMotion {
+        uint32_t kind;
+        int32_t x;
+        int32_t y;
+    };
+    std::optional<PanelMotion> pendingPanelMotion_;
+    bool randrAvailable_ = false;
+
+    // 全屏检测用的原子（连上时取一次）与当前订阅着的活动窗口。
+    xcb_atom_t atomActiveWindow_ = 0;
+    xcb_atom_t atomWmState_ = 0;
+    xcb_atom_t atomFullscreen_ = 0;
+    xcb_atom_t atomWorkArea_ = 0;
+    xcb_atom_t atomCurrentDesktop_ = 0;
+    xcb_window_t activeWindow_ = 0;
+    /// 对 activeWindow_ 的 PropertyChange 订阅是不是本端加的（只撤自己加的）。
+    bool activeWatched_ = false;
+    std::unique_ptr<fcitx::EventSourceTime> activeCheck_;
 };
 
 } // namespace windlinux

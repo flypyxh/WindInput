@@ -66,7 +66,7 @@ fn parses(bytes: &[u8], path: &Path, check: Check) -> bool {
     match check {
         Check::Words => wind_userdata::text::parse(bytes, path, false).is_ok(),
         Check::Table => wind_userdata::text::table::parse_table(bytes, path).is_ok(),
-        Check::Toml => toml::from_str::<toml::Value>(s).is_ok(),
+        Check::Toml => s.parse::<toml::Value>().is_ok(),
         Check::Yaml => serde_yaml::from_str::<serde_yaml::Value>(s).is_ok(),
         Check::Charset => {
             let head = s.split("\n...").next().unwrap_or("");

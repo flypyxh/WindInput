@@ -102,6 +102,9 @@ pub struct Toolbar {
     /// 边界过时不必担心：这对数值正是协调器 `sync_toolbar_monitor` 的去重 key 本身，
     /// 边界一变 key 必变，下一次 sync 会重新下发覆盖。
     pending_corner: Option<(i32, i32)>,
+    /// 最近一帧的拖动柄区域（设备像素，相对窗口左上角）；`render` 从 `bar_layout` 取。
+    /// 外部宿主据此在本地拖动，见 [`Self::drag_regions`]。
+    drag_rect: Rect,
 }
 
 /// 整条工具栏的几何：窗口尺寸 + 每格矩形（设备像素，相对窗口左上角）。
@@ -162,6 +165,12 @@ fn bar_layout(vertical: bool, thickness: f32, grip_len: f32, cell: f32, n: usize
         })
         .collect();
     BarLayout { w, h, grip, cells }
+}
+
+/// 拖动柄矩形 → 整数像素 `[x, y, w, h]`；空矩形（首帧之前）给 `None`。
+fn grip_region(r: &Rect) -> Option<[i32; 4]> {
+    let (w, h) = (r.w.round() as i32, r.h.round() as i32);
+    (w > 0 && h > 0).then(|| [r.x.round() as i32, r.y.round() as i32, w, h])
 }
 
 /// 整条外框圆角的兜底半径（主题 `[toolbar] border.radius` 未配时）：**短边**×0.30。
@@ -241,6 +250,7 @@ impl Toolbar {
             vertical: false,
             layout: wind_ui_types::DEFAULT_TOOLBAR_ITEMS.to_vec(),
             pending_corner: None,
+            drag_rect: Rect::default(),
         })
     }
 
@@ -588,6 +598,10 @@ impl Toolbar {
         let h = layout.h.ceil() as u32;
 
         self.window.resize(w, h);
+        self.drag_rect = layout.grip;
+        // 拖动由 addon 本地做：拖动柄随帧下发。
+        #[cfg(all(target_os = "linux", ext_presenter))]
+        self.window.set_drag_regions(self.drag_regions());
         let buf_size = (w * h * 4) as usize;
         {
             let buf = self.window.buffer_mut();
@@ -877,6 +891,33 @@ impl Toolbar {
     // 视觉上凭空跳一次），也不按当前朝向/DPI 重排尺寸。所有显示路径收口于 `render` 是
     // 本模块的既有约定，一个不走 render 的显示入口只会是下一个人的陷阱。
     // 若将来真需要「不改状态地重新显形」，用 `repaint()`（受 `visible` 门控）。
+
+    /// 按下即拖动整条工具栏的区域（位图内 `x, y, w, h`）：拖动柄。
+    ///
+    /// 与 `ToolbarMouse` 的判据同源——它在「没命中任何格」时开始拖动，而 `bar_layout`
+    /// 里格子铺满了拖动柄以外的整条，所以这块就是拖动柄本身。首帧之前为空。
+    pub fn drag_regions(&self) -> Vec<[i32; 4]> {
+        grip_region(&self.drag_rect).into_iter().collect()
+    }
+
+    /// 外部宿主本地拖完：等同 Windows 拖动结束时 `WM_LBUTTONUP` 那一步——记下落点与右下角锚点，
+    /// 并把锚点上报协调器落盘。宿主只报左上角，换算右下角要用尺寸，而尺寸只有这里知道。
+    /// 下一帧据此落位，不跳回旧处。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub fn on_host_moved(&mut self, x: i32, y: i32) {
+        let mut m = self.mouse.borrow_mut();
+        let (w, h) = m.size;
+        let (right, bottom) = (x + w as i32, y + h as i32);
+        m.pos = Some((x, y));
+        m.anchor_br = Some((right, bottom));
+        let _ = m.events.send(UiEvent::ToolbarMoved { right, bottom });
+    }
+
+    /// 用户此刻看得见它：可见且不在自动隐藏的假隐藏里（假隐藏时 `visible` 仍为 true）。
+    #[cfg(all(target_os = "linux", ext_presenter))]
+    pub fn is_seen(&self) -> bool {
+        self.visible && !self.auto_hide.is_ghosted()
+    }
 
     /// 当前是否可见（`render` 置 true，`hide` 置 false）。
     pub fn is_visible(&self) -> bool {
@@ -1464,6 +1505,28 @@ mod tests {
             assert_eq!(c.x, 12.0 + 30.0 * i as f32, "第 {i} 格 x");
             assert_eq!((c.y, c.w, c.h), (0.0, 30.0, 30.0), "第 {i} 格");
         }
+    }
+
+    /// 拖动区 = 拖动柄：横条在左端、纵条在顶端；格子不能落进去（否则 addon 会把点格子
+    /// 当成拖动吃掉）。首帧之前的空矩形不导出。
+    #[test]
+    fn drag_region_is_the_grip_and_excludes_cells() {
+        for vertical in [false, true] {
+            let l = bar_layout(vertical, THICK, GRIP, CELL, N);
+            let [x, y, w, h] = grip_region(&l.grip).expect("拖动柄非空");
+            let want = if vertical {
+                [0, 0, 30, 12]
+            } else {
+                [0, 0, 12, 30]
+            };
+            assert_eq!([x, y, w, h], want, "vertical={vertical}");
+            for c in &l.cells {
+                let inside =
+                    (c.x + c.w * 0.5) < (x + w) as f32 && (c.y + c.h * 0.5) < (y + h) as f32;
+                assert!(!inside, "格子中心落进了拖动区 vertical={vertical}");
+            }
+        }
+        assert_eq!(grip_region(&Rect::default()), None);
     }
 
     /// 右下角落点：从工作区右/下边界各退去工具栏尺寸再留 12px 边距。

@@ -14,7 +14,10 @@ toml = { workspace = true }
 # 主题包要在落盘前校验 theme.toml 本身合法（坏主题别等回滚才发现），并取 meta 作展示名。
 # wind-theme 是纯解析 crate，不反向依赖本 crate。
 wind-theme = { path = "../wind-theme" }
-zip = "2"
+# 只开 deflate（自家产出的主题/方案/备份包都是 deflate）+ time（条目时间戳取当前时间，
+# 不开会一律写成 1980-01-01）。默认 feature 会把 aes / bzip2 / xz / lzma / zstd / deflate64
+# 全拉进来（zstd-sys、bzip2-sys 还是 C 库），约 0.4 MiB 代码无人调用。
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

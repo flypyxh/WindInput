@@ -224,6 +224,15 @@ pub(crate) struct OverlayShms {
     shown: [bool; 3],
 }
 
+/// 建某一层的 SHM 段（段名见 `endpoint::overlay_shm_name`）。失败记 warn 返回 `None`，
+/// 调用方整帧放弃（不推无像素的通知）。
+pub(crate) fn create_layer_shm(suffix: &str, kind: u32) -> Option<PosixSharedMemory> {
+    let name = wind_bridge::endpoint::overlay_shm_name(suffix, kind)?;
+    PosixSharedMemory::create(&name, MAX_SHARED_RENDER_SIZE)
+        .map_err(|e| tracing::warn!("create overlay SHM {name} failed: {e}"))
+        .ok()
+}
+
 fn slot(kind: u32) -> usize {
     LAYERS
         .iter()
@@ -243,14 +252,7 @@ impl OverlayShms {
     fn ensure(&mut self, kind: u32) -> Option<&mut PosixSharedMemory> {
         let i = slot(kind);
         if self.shms[i].is_none() {
-            let name = wind_bridge::endpoint::overlay_shm_name(&self.suffix, kind)?;
-            match PosixSharedMemory::create(&name, MAX_SHARED_RENDER_SIZE) {
-                Ok(s) => self.shms[i] = Some(s),
-                Err(e) => {
-                    tracing::warn!("create overlay SHM {name} failed: {e}");
-                    return None;
-                }
-            }
+            self.shms[i] = Some(create_layer_shm(&self.suffix, kind)?);
         }
         self.shms[i].as_mut()
     }
