@@ -198,7 +198,7 @@ pub struct ConvertOptions {
     /// （同 `MixedEngine::truncate_with_pinyin_quota` 的既有教训）。
     /// 实测 `gedw`：`ge` 的残码同音字 219 条，把混合简拼「各单位」压到第 221 位。
     pub require_full_match: bool,
-    /// 本次转换**不要简拼保底配额**（见 `pinyin::truncate_with_abbrev_quota`）。
+    /// 本次转换**不要简拼保底配额**（见 `pinyin::truncate_with_quotas`）。
     ///
     /// ## 为什么要能关掉
     ///

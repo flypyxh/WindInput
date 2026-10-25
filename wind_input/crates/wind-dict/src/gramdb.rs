@@ -154,7 +154,7 @@ impl GramDb {
     pub fn open(path: &Path) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("打开语法模型失败: {}", path.display()))?;
-        let mmap = unsafe { Mmap::map(&file) }
+        let mmap = crate::mapping::map_file(&file)
             .with_context(|| format!("mmap 语法模型失败: {}", path.display()))?;
         if mmap.len() < METADATA_SIZE {
             bail!("语法模型过小({} 字节)，不含完整 metadata", mmap.len());

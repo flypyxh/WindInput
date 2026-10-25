@@ -298,6 +298,68 @@ impl AssocProvider for PrefixWords<'_> {
     }
 }
 
+/// 智能联想的「下一词」源：离线蒸馏的上文 → 后继表（[`wind_assoc::bigram`]）。
+///
+/// 表里的句末记号 `$` 换成「，」：模型说这里常断句，就把逗号给到候选条上。自训的表直接
+/// 存了统计出的句读（「，」「？」），同样处理。标点几乎是每个上文的头名——原样放第一位，
+/// 每次上屏后首位都是逗号，最可能的那个词反被挤到第二；故头名总留给词，标点最早排第二，
+/// 表里没有的标点仍由标点源按规则补。
+struct BigramWords<'a> {
+    table: &'a wind_assoc::bigram::AssocBigram,
+}
+
+/// 光标前文留几个字。「下一词」表只看 4 个字，多留一些给以后整句的上文用（语法模型）。
+pub(crate) const PRECEDING_KEEP_CHARS: usize = 32;
+
+fn pop_chars(s: &mut String, count: usize) {
+    for _ in 0..count {
+        if s.pop().is_none() {
+            break;
+        }
+    }
+}
+
+/// 后继是标点：旧表的句末记号 `$`，或自训表里保留下来的句读（「，」「？」）。
+fn is_punct_successor(w: &str) -> bool {
+    w == wind_assoc::bigram::SENTENCE_END || !w.chars().any(char::is_alphanumeric)
+}
+
+impl AssocProvider for BigramWords<'_> {
+    fn suggest(&self, ctx: &AssocContext<'_>, limit: usize) -> Vec<AssocHit> {
+        let Some(succ) = self
+            .table
+            .lookup_after(ctx.preceding, ctx.text, ctx.char_wise)
+        else {
+            return Vec::new();
+        };
+        let mut words: Vec<&str> = succ.into_iter().take(limit).collect();
+        for w in &mut words {
+            if *w == wind_assoc::bigram::SENTENCE_END {
+                *w = "，";
+            }
+        }
+        // 头名是标点：把排在最前的那个词提到它前面
+        if let Some(i) = words.iter().position(|w| !is_punct_successor(w))
+            && i > 0
+        {
+            let w = words.remove(i);
+            words.insert(0, w);
+        }
+        let n = words.len() as i64;
+        words
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| AssocHit {
+                text: w.to_string(),
+                commit: None,
+                source: AssocSource::Bigram,
+                // 按名次给分：表里已按模型分值排好
+                score: n - i as i64,
+            })
+            .collect()
+    }
+}
+
 /// 联想历史的取数源：用户**在这个上文之后**从联想里选过的词（论坛 t185 方案 B）。
 ///
 /// 读 store 的 `assoc_history` 表（一次范围扫描）；写在 [`Coordinator::record_assoc_pick`]。
@@ -449,6 +511,63 @@ impl Coordinator {
         self.restore_next_word_prev(None);
     }
 
+    /// 宿主报来光标前的正文（不含组合区）。只留末尾 [`PRECEDING_KEEP_CHARS`] 个字。
+    ///
+    /// 时机由宿主定：光标被挪动、宿主自己改了正文之后（Android `onUpdateSelection`）。
+    /// 核心自己的上屏不必等它报——[`Self::note_host_edits`] 已跟上。
+    /// 不知道光标前是什么（换了输入框、读不到）就报空串。
+    pub fn set_preceding_text(&self, text: &str) {
+        let n = text.chars().count();
+        let at = text
+            .char_indices()
+            .nth(n.saturating_sub(PRECEDING_KEEP_CHARS))
+            .map_or(text.len(), |(i, _)| i);
+        let mut cur = self
+            .preceding_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cur.clear();
+        cur.push_str(&text[at..]);
+    }
+
+    /// 一次按键 / 选词交给宿主的编辑，照样施加到光标前文上：宿主的报告是异步的，
+    /// 紧接着的下一次上屏多半等不到它。挪光标的情形算不出新位置的前文，清空等宿主报。
+    pub fn note_host_edits(&self, ops: &[wind_host::EditOp]) {
+        use wind_host::EditOp;
+        let mut cur = self
+            .preceding_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for op in ops {
+            match op {
+                EditOp::Commit(text) => cur.push_str(text),
+                EditOp::SetComposition { .. } => {}
+                EditOp::DeleteBackward { count } => pop_chars(&mut cur, *count),
+                EditOp::ReplaceBackward { count, text } => {
+                    pop_chars(&mut cur, *count);
+                    cur.push_str(text);
+                }
+                EditOp::MoveCursor { .. } => cur.clear(),
+            }
+        }
+        let n = cur.chars().count();
+        if n > PRECEDING_KEEP_CHARS {
+            let at = cur
+                .char_indices()
+                .nth(n - PRECEDING_KEEP_CHARS)
+                .map_or(0, |(i, _)| i);
+            cur.drain(..at);
+        }
+    }
+
+    /// 当前记着的光标前文（诊断 / 测试用）。
+    pub fn preceding_text(&self) -> String {
+        self.preceding_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// 退出联想态。已不在联想态时是空操作（返回 false）。
     ///
     /// 调用点遍布各条按键分派臂，故**必须幂等且极廉价**——绝大多数按键并不在联想态下发生。
@@ -466,6 +585,28 @@ impl Coordinator {
         true
     }
 
+    /// 「下一词」表：首次用到时读文件，之后复用；没有数据文件或读失败是 None。
+    pub(crate) fn assoc_bigram(&self) -> Option<std::sync::Arc<wind_assoc::bigram::AssocBigram>> {
+        self.assoc_bigram
+            .get_or_init(|| {
+                let path = self.assoc_bigram_path.as_ref()?;
+                let loaded = std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(wind_assoc::bigram::AssocBigram::parse);
+                match loaded {
+                    Ok(t) => {
+                        tracing::info!(n = t.len(), path = %path.display(), "联想下一词表已加载");
+                        Some(std::sync::Arc::new(t))
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), "联想下一词表读不了，本次运行不出: {e}");
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
+
     /// `[input.association]`（移动端再叠 `[mobile.association]`）的运行时视图（热重载快照）。
     pub(crate) fn assoc_config(&self) -> AssocConfig {
         let rt = self.rt();
@@ -474,12 +615,20 @@ impl Coordinator {
     }
 
     /// 按上文算联想候选（不改状态）。`maybe_enter_assoc` 与评测 / 诊断共用这一份。
-    pub(crate) fn assoc_hits(&self, cfg: &AssocConfig, text: &str) -> Vec<AssocHit> {
+    pub(crate) fn assoc_hits(
+        &self,
+        cfg: &AssocConfig,
+        preceding: &str,
+        text: &str,
+        char_wise: bool,
+    ) -> Vec<AssocHit> {
         if cfg.kind == AssocKind::Off {
             return Vec::new();
         }
         let ctx = AssocContext {
             text,
+            preceding,
+            char_wise,
             // 上屏这一瞬间上文必然连续——正是刚刚打进去的那段字。
             // 断链只发生在失焦/切窗/点击等**别的**入口，那些路径直接调 `exit_assoc`。
             boundary_broken: false,
@@ -492,10 +641,9 @@ impl Coordinator {
             // 恰恰常是混输。解析规则见 `assoc_word_schema`。
             schema: self.engine_mgr.assoc_word_schema(),
         };
-        // ⚠️ 四个源里目前接了三个（History 见 `HistoryWords`，2026-09 接入；2026-10 起
-        // 也出用户自己的「下一词」，见 `learn_next_word`）。Bigram
-        // （词→后继表，需离线蒸馏）尚无 provider ⇒ `associate` 对它 `continue`，
-        // 配额顺延。这是有意的分期，不是漏接。
+        // 四个源全部接上：History 见 `HistoryWords`（2026-09；2026-10 起也出用户自己的
+        // 「下一词」，见 `learn_next_word`），Bigram 见 `BigramWords`（2026-10，离线蒸馏表；
+        // 数据文件缺失时不登记 ⇒ `associate` 对它 `continue`，配额顺延）。
         //
         // 档位过滤在 `AssocConfig::source_enabled` 里，**不在这里**：这里一律登记全部
         // 已实现的源，由 kind 决定谁能出场。两处都做过滤会让「词语联想为什么没标点」
@@ -508,12 +656,28 @@ impl Coordinator {
             profile: self.engine_mgr.pinyin_freq_profile(),
             next_words: cfg.kind == AssocKind::Smart,
         });
+        // 这里只管**读不读表**，出不出场仍由 `associate` 判：表整份常驻约 2 MB，词语联想档
+        // （PC 用户常开的那档）用不上它，就不该因为调到这里而读进内存。
+        let bigram_table = cfg
+            .source_enabled(AssocSource::Bigram)
+            .then(|| self.assoc_bigram())
+            .flatten();
+        let bigram = bigram_table.as_deref().map(|table| BigramWords { table });
         let mut providers: Vec<(AssocSource, &dyn AssocProvider)> =
             vec![(AssocSource::Prefix, &prefix), (AssocSource::Punct, &punct)];
         if let Some(h) = &history {
             providers.push((AssocSource::History, h));
         }
+        if let Some(b) = &bigram {
+            providers.push((AssocSource::Bigram, b));
+        }
         wind_assoc::associate(&ctx, cfg, &providers)
+    }
+
+    /// 用户是不是逐字上屏的：拼音以外的方案（五笔等形码、混输）算是。单字上屏后「下一词」
+    /// 据此决定要不要给词内接续，见 [`wind_assoc::bigram::AssocBigram::lookup_after`]。
+    pub(crate) fn assoc_char_wise(&self) -> bool {
+        !self.engine_mgr.is_pinyin()
     }
 
     /// 按刚上屏的文本生成联想候选并进入联想态。返回是否真的进入了。
@@ -523,9 +687,14 @@ impl Coordinator {
     /// 调用前编码缓冲与常规候选**必须已清空**（互斥不变式，见
     /// [`State::debug_assert_assoc_invariant`]）。上屏路径上这件事由
     /// `reset_pinyin_composition` 完成，故本函数只该在它之后调用。
-    pub(crate) fn maybe_enter_assoc(&self, state: &mut State, text: &str) -> bool {
+    pub(crate) fn maybe_enter_assoc(&self, state: &mut State, text: &str, on_screen: &str) -> bool {
         let cfg = self.assoc_config();
-        let hits = self.assoc_hits(&cfg, text);
+        // 前文是这次按键之前的：本次上屏要等按键返回后才经 `note_host_edits` 记进去。
+        // `on_screen`：`text` 里本来就在屏上的那截（选前缀延伸联想「中国」时的「中」），
+        // 前文末尾就是它，去掉才接得上整词。
+        let preceding = self.preceding_text();
+        let preceding = preceding.strip_suffix(on_screen).unwrap_or(&preceding);
+        let hits = self.assoc_hits(&cfg, preceding, text, self.assoc_char_wise());
         if hits.is_empty() {
             return false;
         }
@@ -794,7 +963,7 @@ impl Coordinator {
     /// # 三道守卫
     ///
     /// - **只在 keydown**（守在调用点）：`ClearCompositionThenPassThrough` 的「交还按键」
-    ///   靠 C++ `_pendingReplayToHost`，而它只在 `OnKeyDown` 消费。理由同
+    ///   靠 C++ 在按键入口重放，只在 `OnKeyDown` / `DispatchHotkey` 消费。理由同
     ///   [`Self::adopt_orphaned_placeholder`]。
     /// - **纯修饰键与 CapsLock 除外**：按住 Shift 准备打 Shift+字母时，光按下修饰键不该
     ///   把联想窗收掉。Windows 侧这类 keydown 压根不转发（`OnTestKeyDown` 的
@@ -930,7 +1099,7 @@ impl Coordinator {
         if state.active.is_none()
             && state.committed_text.is_empty()
             && state.input_buffer.is_empty()
-            && self.maybe_enter_assoc(state, assoc_ctx)
+            && self.maybe_enter_assoc(state, assoc_ctx, "")
         {
             self.notify_ui_update(state);
             // 与 `commit_selected` 同：上屏后重开占位组合，联想态才收得到后续按键。
@@ -982,9 +1151,66 @@ mod tests {
         Coordinator::new_headless(cfg, None)
     }
 
+    /// 表里统计出的标点（与旧表的 `$`）不占头名：头名留给词，标点最早排第二。
+    #[test]
+    fn bigram_punct_successor_never_leads() {
+        let table =
+            wind_assoc::bigram::AssocBigram::parse("吗\t？ ！ 的 呢\n好的\t$ 我 谢谢\n".into())
+                .unwrap();
+        let src = BigramWords { table: &table };
+        let shown = |text: &str| -> Vec<String> {
+            let ctx = AssocContext {
+                text,
+                preceding: "",
+                char_wise: false,
+                boundary_broken: false,
+            };
+            src.suggest(&ctx, 9).into_iter().map(|h| h.text).collect()
+        };
+        assert_eq!(shown("吗"), ["的", "？", "！", "呢"]);
+        assert_eq!(shown("好的"), ["我", "，", "谢谢"]);
+    }
+
+    /// 下一词表只在用得上的档位读进内存：词语联想档（PC 常开的那档）不碰它。
+    /// 看的是 `OnceLock` 有没有被初始化过——无数据文件时初始化成 `None` 也算碰过。
+    #[test]
+    fn bigram_table_loads_only_when_smart() {
+        let word = coord_with(|c| c.input.association.kind = "word".to_string());
+        word.assoc_hits(&word.assoc_config(), "", "中", false);
+        assert!(word.assoc_bigram.get().is_none(), "词语联想档读了下一词表");
+
+        let smart = coord_smart();
+        smart.assoc_hits(&smart.assoc_config(), "", "中", false);
+        assert!(smart.assoc_bigram.get().is_some());
+    }
+
+    #[test]
+    fn preceding_text_follows_host_edits() {
+        use wind_host::EditOp;
+        let c = coord_with(|_| {});
+        c.set_preceding_text("你好，我们");
+        c.note_host_edits(&[EditOp::Commit("今".into())]);
+        assert_eq!(c.preceding_text(), "你好，我们今");
+        c.note_host_edits(&[EditOp::DeleteBackward { count: 2 }]);
+        assert_eq!(c.preceding_text(), "你好，我");
+        c.note_host_edits(&[EditOp::ReplaceBackward {
+            count: 1,
+            text: ".".into(),
+        }]);
+        assert_eq!(c.preceding_text(), "你好，.");
+        c.note_host_edits(&[EditOp::MoveCursor { delta: -1 }]);
+        assert_eq!(c.preceding_text(), "", "挪了光标算不出前文，等宿主报");
+        // 只留末尾若干字
+        c.set_preceding_text(&"字".repeat(PRECEDING_KEEP_CHARS + 5));
+        assert_eq!(c.preceding_text().chars().count(), PRECEDING_KEEP_CHARS);
+        c.note_host_edits(&[EditOp::Commit("尾".into())]);
+        assert_eq!(c.preceding_text().chars().count(), PRECEDING_KEEP_CHARS);
+        assert!(c.preceding_text().ends_with('尾'));
+    }
+
     fn enter(c: &Coordinator, text: &str) -> bool {
         let mut st = c.state.lock().unwrap_or_else(|e| e.into_inner());
-        c.maybe_enter_assoc(&mut st, text)
+        c.maybe_enter_assoc(&mut st, text, "")
     }
 
     fn texts(c: &Coordinator) -> Vec<String> {
@@ -1369,7 +1595,7 @@ mod tests {
         c.debug_mark_coords_ready();
         {
             let mut st = c.state.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(c.maybe_enter_assoc(&mut st, "你好"));
+            assert!(c.maybe_enter_assoc(&mut st, "你好", ""));
             c.notify_ui_update(&st);
         }
         let mut last: Option<Vec<String>> = None;
@@ -1398,7 +1624,7 @@ mod tests {
         c.debug_mark_coords_ready();
         {
             let mut st = c.state.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(c.maybe_enter_assoc(&mut st, "你好"));
+            assert!(c.maybe_enter_assoc(&mut st, "你好", ""));
             c.notify_ui_update(&st);
         }
         let mut label = None;

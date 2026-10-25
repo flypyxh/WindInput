@@ -22,6 +22,17 @@
 //! - `WIND_PINYIN_EVAL_N`     每类抽样数（默认 600）
 //! - `WIND_PINYIN_EVAL_SEED`  随机种子（默认 20260721）
 //! - `WIND_PINYIN_EVAL_DUMP`  每类导出的未命中明细条数（默认 40）
+//! - `WIND_PINYIN_EVAL_FUZZY` 开模糊音：逗号分隔的组名（`in_ing,an_ang`）或 `all`
+//! - `WIND_PINYIN_EVAL_CORRECTION` 换位纠错：不设 = 出厂；`off` = 关；否则为逗号分隔的规则 id
+//!   （`gn_ng,on_ong`，`all` = 八条全开）
+//! - `WIND_PINYIN_EVAL_PER_RULE` F/G 类每条规则抽样数（默认 300）
+//! - `WIND_PINYIN_EVAL_LATENCY=1` 额外跑一遍逐键耗时（每条样本按前缀逐键 convert）
+//! - `WIND_PINYIN_EVAL_MISREAD=1` 开正文提示与误读来源，另统计界面首页上的误读提示（打对的输入上
+//!   出现的都算误标候选，逐条列出供人工判）；`=0` 关掉「误读」来源（召回与提示都没有），与 `=1` 对比
+//!   即误读表对排序的影响
+//!
+//! 除 JSON 外还写 `<out>.ranks.tsv`：每条样本的引擎序 / 界面序位次与界面首页。两档之间逐位比对
+//! 用它；与协调器对拍见 `wind-coordinator/tests/pinyin_eval_ui_parity.rs`（读同一份 TSV）。
 //!
 //! ## 样本分类判据
 //!
@@ -46,6 +57,11 @@
 //! 的长串（`bzd`+`haobuhao`），E = 单个词的短简拼形态（`zhge` / `zhy` / `baichx`），见各自的
 //! 构造函数。
 //!
+//! F / G 两类为换位纠错而设，都用 A 池常用词按**规则**分组构造（规则表与本轮引擎开哪几条无关，
+//! 各档样本集相同）：F = 打对了的全拼 / 简拼 / 混合简拼，串里恰含某条规则的错误拼写（`xign`
+//! 是「习惯」类简拼，也是 `gn_ng` 的错拼），门禁要求它与关纠错时逐位相同；G = 换位错拼
+//! （`gognping` → 公平），看纠错命中率。
+//!
 //! ## 两套位次：引擎序与界面序
 //!
 //! **引擎序**（主表）= `convert` 直接给出的顺序，limit 取 [`TOP_N`]。它**不是**用户看到的顺序：
@@ -53,8 +69,8 @@
 //! 前缀的部分候选在引擎序里可以压住整串匹配，界面上恰好相反——`baichx` 下「拜城县」引擎序
 //! 第 72、界面第 1；混合整句改层级那轮，D 类引擎序 top-1 掉了 0.7 个点，界面上一条没变。
 //!
-//! **界面序**（第二张表）= 以协调器的 limit（[`UI_LIMIT`]）取候选 → 同一个
-//! `candidate_display_order` 排序 → 按文本去重（保留第一条）。协调器此后还有英文定位、
+//! **界面序**（第二张表）= 以协调器的 limit（[`UI_LIMIT`]）取候选 → 同文纠错让位 → 同一个
+//! `candidate_display_order` 排序 → 按文本去重（保留第一条）→ 纠错不占首选（D6）。协调器此后还有英文定位、
 //! 整句块等后处理，但对纯拼音出厂配置不改变顺序：与协调器实测（`Coordinator` +
 //! `debug_all_candidate_texts`）对拍过 E 类 5063 条、D 类 1000 条，首选与期望词位次**逐条一致**
 //! （2026-09-23）。**判断一个排序改动对用户的影响，看界面序。**
@@ -104,7 +120,134 @@ fn manager(dir: &Path) -> EngineManager {
     if let Ok(m) = std::env::var("WIND_GRAM_MODEL") {
         cfg.schema.pinyin.grammar.model = m;
     }
+    // 模糊音：逗号分隔的组名（`in_ing,an_ang`），`all` = 13 组全开。不设 = 出厂（全关）。
+    if let Ok(groups) = std::env::var("WIND_PINYIN_EVAL_FUZZY") {
+        let f = &mut cfg.schema.pinyin.fuzzy;
+        f.enabled = true;
+        for g in groups.split(',').map(str::trim) {
+            let all = g == "all";
+            let mut known = all;
+            for (name, slot) in [
+                ("zh_z", &mut f.zh_z),
+                ("ch_c", &mut f.ch_c),
+                ("sh_s", &mut f.sh_s),
+                ("n_l", &mut f.n_l),
+                ("f_h", &mut f.f_h),
+                ("r_l", &mut f.r_l),
+                ("an_ang", &mut f.an_ang),
+                ("en_eng", &mut f.en_eng),
+                ("in_ing", &mut f.in_ing),
+                ("ian_iang", &mut f.ian_iang),
+                ("uan_uang", &mut f.uan_uang),
+                ("un_ong", &mut f.un_ong),
+                ("eng_ong", &mut f.eng_ong),
+            ] {
+                if all || g == name {
+                    *slot = true;
+                    known = true;
+                }
+            }
+            assert!(known, "WIND_PINYIN_EVAL_FUZZY 里有不认识的组名「{g}」");
+        }
+    }
+    apply_correction_env(&mut cfg.input.correction);
+    match std::env::var("WIND_PINYIN_EVAL_MISREAD").as_deref() {
+        Ok("1") => {
+            cfg.input.correction.hint.enabled = true;
+            cfg.input.correction.hint.misread = true;
+        }
+        Ok("0") => cfg.input.correction.hint.misread = false,
+        _ => {}
+    }
     EngineManager::new(&cfg, Some(dir))
+}
+
+fn misread_eval() -> bool {
+    std::env::var("WIND_PINYIN_EVAL_MISREAD").is_ok_and(|v| v == "1")
+}
+
+fn misread_styled(c: &wind_candidate::Candidate) -> Option<String> {
+    let hints: Vec<_> = c
+        .meta
+        .pinyin_hints
+        .iter()
+        .filter(|h| h.kind == wind_candidate::HintKind::Misread)
+        .collect();
+    if hints.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, ch) in c.text.chars().enumerate() {
+        out.push(ch);
+        if let Some(h) = hints.iter().find(|h| h.char_index as usize == i) {
+            let _ = write!(out, "({})", h.correct);
+        }
+    }
+    Some(out)
+}
+
+/// 纠错规则 id 与配置开关（设计 §5.2）。
+fn correction_rule_slots(
+    r: &mut wind_config::CorrectionRuleToggles,
+) -> [(&'static str, &mut bool); 8] {
+    [
+        ("gn_ng", &mut r.gn_ng),
+        ("on_ong", &mut r.on_ong),
+        ("vowel_swap", &mut r.vowel_swap),
+        ("legacy_spelling", &mut r.legacy_spelling),
+        ("h_misplaced", &mut r.h_misplaced),
+        ("mg_ng", &mut r.mg_ng),
+        ("n_before_g", &mut r.n_before_g),
+        ("ai_ia", &mut r.ai_ia),
+    ]
+}
+
+const CORRECTION_RULE_IDS: [&str; 8] = [
+    "gn_ng",
+    "on_ong",
+    "vowel_swap",
+    "legacy_spelling",
+    "h_misplaced",
+    "mg_ng",
+    "n_before_g",
+    "ai_ia",
+];
+
+/// `WIND_PINYIN_EVAL_CORRECTION`：不设 = 出厂；`off` = 关纠错；否则为逗号分隔的规则 id
+/// （只开这几条，`all` = 八条全开），自定义规则恒为空。
+fn apply_correction_env(c: &mut wind_config::CorrectionConfig) {
+    let Ok(v) = std::env::var("WIND_PINYIN_EVAL_CORRECTION") else {
+        return;
+    };
+    c.custom.clear();
+    if v.trim() == "off" {
+        c.enabled = false;
+        return;
+    }
+    c.enabled = true;
+    for (_, slot) in correction_rule_slots(&mut c.rules) {
+        *slot = false;
+    }
+    for g in v.split(',').map(str::trim) {
+        let mut known = false;
+        for (name, slot) in correction_rule_slots(&mut c.rules) {
+            if g == "all" || g == name {
+                *slot = true;
+                known = true;
+            }
+        }
+        assert!(known, "WIND_PINYIN_EVAL_CORRECTION 里有不认识的规则「{g}」");
+    }
+}
+
+/// 只开 `rule` 一条的纠错规则表，用于构造 F/G 样本。
+/// 与引擎运行时开哪几条无关：样本集在各档之间必须相同才能逐条对比。
+fn rules_only(rule: &str) -> wind_engine::pinyin::correction::CorrectionRules {
+    let mut c = wind_config::CorrectionConfig::default();
+    for (name, slot) in correction_rule_slots(&mut c.rules) {
+        *slot = name == rule;
+    }
+    wind_engine::pinyin::correction::CorrectionRules::from_config(&c)
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -144,6 +287,8 @@ enum Class {
     C,
     D,
     E,
+    F,
+    G,
 }
 
 impl Class {
@@ -154,6 +299,8 @@ impl Class {
             Class::C => "C_multi_syllable_contracted",
             Class::D => "D_mixed_abbrev_sentence",
             Class::E => "E_short_abbrev",
+            Class::F => "F_abbrev_correction_conflict",
+            Class::G => "G_transposition_typo",
         }
     }
 
@@ -164,6 +311,8 @@ impl Class {
             Class::C => "C 多音节含缩合音 (跨多音节但边界不符)",
             Class::D => "D 简拼+全拼混合整句 (bzd+haobuhao)",
             Class::E => "E 短简拼 (zhge / zhy / baichx)",
+            Class::F => "F 简拼/混合简拼撞纠错拼写 (xign / dnu)",
+            Class::G => "G 换位错拼 (gognping / dignyue)",
         }
     }
 
@@ -175,7 +324,7 @@ impl Class {
     fn col4_meaning(self) -> &'static str {
         match self {
             Class::D => "首词命中",
-            Class::E => "无（击键不是音节）",
+            Class::E | Class::F | Class::G => "无（击键不是音节）",
             _ => "切分正确",
         }
     }
@@ -524,6 +673,126 @@ fn build_short_abbrev_samples(
     out
 }
 
+/// 常用词（词频前 1/3，须 `unigram > 0`），按词频降序。D/E/F/G 同一口径。
+fn common_words(pool: &[Sample]) -> Vec<&Sample> {
+    let mut common: Vec<&Sample> = pool.iter().filter(|s| s.unigram > 0).collect();
+    common.sort_by(|a, b| b.unigram.cmp(&a.unigram).then_with(|| a.text.cmp(&b.text)));
+    common.truncate((common.len() / 3).max(1));
+    common
+}
+
+/// 简拼取声母：zh/ch/sh 保留两个字母（与 E 类同）。
+fn abbrev_initial(syl: &str) -> &str {
+    if ["zh", "ch", "sh"].iter().any(|p| syl.starts_with(p)) {
+        &syl[..2]
+    } else {
+        &syl[..1]
+    }
+}
+
+/// F 类样本：**打对了的**简拼 / 混合简拼 / 全拼击键，串里含某条纠错规则的错误拼写，
+/// 期望 = 该词本身。
+///
+/// 纠错只收非法拼写，打对的全拼从结构上碰不到纠错候选——只用 A~E 门禁恒空过（设计 §9）。
+/// 本类专挑撞车的串：`xign` 是「习惯」类的混合简拼，同时是 `gn_ng` 的错拼（→xing）。
+///
+/// 每个 2~4 音节常用词枚举全部「每音节全拼或取声母」的组合，留下含 `rule` 这条规则某个
+/// 错误拼写的串（子串判定，宽于切分实际命中）；`form` = 规则 id。同键留词频最高者。
+/// 击键串 ≥ 3 字节。按规则分组，是为了逐条规则单开时各有足量的撞车样本。
+fn build_abbrev_conflict_samples(pool: &[Sample], rule: &'static str) -> Vec<Sample> {
+    let wrong: Vec<String> = rules_only(rule).spellings().map(str::to_string).collect();
+    let common = common_words(pool);
+    let hit = |stroke: &str| wrong.iter().any(|w| stroke.contains(w.as_str()));
+    if wrong.is_empty() {
+        return Vec::new();
+    }
+    let mut by_input: HashMap<String, Sample> = HashMap::new();
+    for w in common
+        .iter()
+        .filter(|s| (2..=4).contains(&s.true_syls.len()))
+    {
+        let syls = &w.true_syls;
+        let n = syls.len();
+        for mask in 0u32..(1 << n) {
+            let stroke: String = syls
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    if mask >> i & 1 == 1 {
+                        abbrev_initial(s)
+                    } else {
+                        s.as_str()
+                    }
+                })
+                .collect();
+            if stroke.len() < 3 {
+                continue;
+            }
+            if !hit(&stroke) {
+                continue;
+            }
+            by_input.entry(stroke.clone()).or_insert_with(|| Sample {
+                text: w.text.clone(),
+                input: stroke,
+                true_syls: syls.clone(),
+                mm: Vec::new(),
+                weight: w.weight,
+                unigram: w.unigram,
+                class: Class::F,
+                parts: Vec::new(),
+                form: rule,
+            });
+        }
+    }
+    let mut out: Vec<Sample> = by_input.into_values().collect();
+    out.sort_by(|a, b| a.input.cmp(&b.input));
+    out
+}
+
+/// F 类手写样本：隔音符形态等生成不出的串（`x'ai` 喜爱 撞 `ai_ia` 的 xai→xia）。
+const F_HAND: &[(&str, &str)] = &[("x'ai", "喜爱"), ("xign", "习惯")];
+
+/// G 类样本：常用词的**换位错拼**，期望 = 该词。按规则分组（`form` = 规则 id）：
+/// 取词里第一个有该规则错误拼写的音节，换成它的第一个错误拼写（`gongping` → `gognping`）。
+/// 同键留词频最高者。
+fn build_transposition_samples(pool: &[Sample], rule: &'static str) -> Vec<Sample> {
+    let rules = rules_only(rule);
+    let common = common_words(pool);
+    let mut by_input: HashMap<String, Sample> = HashMap::new();
+    for w in common
+        .iter()
+        .filter(|s| (2..=4).contains(&s.true_syls.len()))
+    {
+        let syls = &w.true_syls;
+        let Some((i, wrong)) = syls
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| rules.wrong_spellings_of(s).first().map(|x| (i, x.clone())))
+        else {
+            continue;
+        };
+        let stroke: String = syls
+            .iter()
+            .enumerate()
+            .map(|(k, s)| if k == i { wrong.as_str() } else { s.as_str() })
+            .collect();
+        by_input.entry(stroke.clone()).or_insert_with(|| Sample {
+            text: w.text.clone(),
+            input: stroke,
+            true_syls: syls.clone(),
+            mm: Vec::new(),
+            weight: w.weight,
+            unigram: w.unigram,
+            class: Class::G,
+            parts: Vec::new(),
+            form: rule,
+        });
+    }
+    let mut out: Vec<Sample> = by_input.into_values().collect();
+    out.sort_by(|a, b| a.input.cmp(&b.input));
+    out
+}
+
 // ---------------------------------------------------------------- 抽样
 
 /// 按词频分三层等量抽样，保证不全是低频词。
@@ -571,18 +840,24 @@ fn stratified_sample(mut pool: Vec<Sample>, n: usize, seed: u64) -> Vec<Sample> 
 
 const TOP_N: usize = 10;
 
-/// 界面序那一路的取数上限：协调器给引擎传的就是它（见 `truncate_with_abbrev_quota` 的文档）。
+/// 界面序那一路的取数上限：协调器给引擎传的就是它（见 `truncate_with_quotas` 的文档）。
 /// 引擎先排序后截断，上限不同则活过截断的候选不同，故必须与协调器同值，不能沿用 [`TOP_N`]。
 const UI_LIMIT: usize = 300;
 
-/// 界面序候选：与协调器同一个比较器排序、按文本去重（保留排序后的第一条，同协调器）。
+/// 界面每页候选数（`ui.per_page` 出厂值）。`page` 指标 = 界面序进首页。
+const PAGE: usize = 7;
+
+/// 界面序候选：与协调器同一串加工——同文纠错让位 → 同一个比较器排序 → 按文本去重
+/// （保留排序后的第一条）→ 纠错不占首选（D6）。后两步与协调器调同一组共享函数。
 ///
 /// 为什么可以不跑协调器：见模块文档「两套位次」一节（对拍逐条一致）。
 fn ui_candidates(mgr: &EngineManager, input: &str) -> Vec<wind_candidate::Candidate> {
     let mut c = mgr.convert_with("pinyin", input, UI_LIMIT).candidates;
+    wind_candidate::drop_corrected_duplicates(&mut c);
     c.sort_by(|a, b| wind_candidate::candidate_display_order(a, b, false, false, input));
     let mut seen = std::collections::HashSet::new();
     c.retain(|x| seen.insert(x.text.clone()));
+    wind_candidate::protect_top_from_corrected(&mut c, input.len());
     c
 }
 
@@ -632,11 +907,15 @@ struct Score {
     /// 界面序（见模块文档「两套位次」）的 top-1 / top-5 / MRR 累加。
     ui_top1: usize,
     ui_top5: usize,
+    /// 界面序进首页（[`PAGE`] 条）。
+    ui_page: usize,
     ui_mrr_sum: f64,
+    /// 界面首页上的纠错候选条数 → 样本数。
+    corrected_on_page: std::collections::BTreeMap<usize, usize>,
     /// 界面序未进首选的样本（`got_top1` 为界面首选）。
     ui_misses: Vec<Miss>,
-    /// **仅 E 类**：按击键形态（R/L/F）分列的 (样本数, 界面序首选命中)。
-    forms: std::collections::BTreeMap<&'static str, (usize, usize)>,
+    /// 按 `Sample::form` 分列的 (样本数, 界面序首选命中, 界面序首页命中)。E/F/G 类有。
+    forms: std::collections::BTreeMap<&'static str, (usize, usize, usize)>,
     misses: Vec<Miss>,
     /// 切分不正确的样本明细（含失败**原因分类**，见 `SegMiss::reason`）
     seg_misses: Vec<SegMiss>,
@@ -790,12 +1069,39 @@ fn pinyin_eval_report() {
     };
     *class_totals.entry(Class::E.key()).or_default() += e_pool.len();
     pools.insert(Class::E.key(), e_pool);
+    // F/G 按规则分组构造，构造用的规则表与本轮引擎开哪几条无关——各档样本集相同才能逐条比。
+    let (f_by_rule, g_by_rule) = {
+        let a_pool = pools
+            .get(Class::A.key())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let by_rule =
+            |f: fn(&[Sample], &'static str) -> Vec<Sample>| -> Vec<(&'static str, Vec<Sample>)> {
+                CORRECTION_RULE_IDS
+                    .iter()
+                    .map(|&r| (r, f(a_pool, r)))
+                    .collect()
+            };
+        (
+            by_rule(build_abbrev_conflict_samples),
+            by_rule(build_transposition_samples),
+        )
+    };
+    for (c, groups) in [(Class::F, &f_by_rule), (Class::G, &g_by_rule)] {
+        let pop: Vec<String> = groups
+            .iter()
+            .map(|(r, v)| format!("{r} {}", v.len()))
+            .collect();
+        println!("{} 各规则总体: {}", c.key(), pop.join("，"));
+        *class_totals.entry(c.key()).or_default() +=
+            groups.iter().map(|(_, v)| v.len()).sum::<usize>();
+    }
 
     let gen_ms = t_gen.elapsed().as_millis();
 
     println!("\n=== 评测集生成 ({} ms) ===", gen_ms);
     println!("词库原始条目: {}", raw.len());
-    for c in [Class::A, Class::B, Class::C, Class::D, Class::E] {
+    for c in ALL_CLASSES {
         println!(
             "  {:<44} 总体 {:>7}",
             c.label(),
@@ -812,6 +1118,38 @@ fn pinyin_eval_report() {
         let pool = pools.remove(c.key()).unwrap_or_default();
         samples.push((c, stratified_sample(pool, n_per_class, seed)));
     }
+    // F/G 按规则各抽一份（规则间总体差很多，混抽会让大规则占满）。同一击键串可能落进多条规则。
+    let per_rule = env_usize("WIND_PINYIN_EVAL_PER_RULE", 300);
+    let mut f_set: Vec<Sample> = F_HAND
+        .iter()
+        .map(|&(input, text)| Sample {
+            text: text.into(),
+            input: input.into(),
+            true_syls: Vec::new(),
+            mm: Vec::new(),
+            weight: 0,
+            unigram: 0,
+            class: Class::F,
+            parts: Vec::new(),
+            form: "hand",
+        })
+        .collect();
+    f_set.extend(
+        f_by_rule
+            .into_iter()
+            .flat_map(|(_, v)| stratified_sample(v, per_rule, seed)),
+    );
+    samples.push((Class::F, f_set));
+    samples.push((
+        Class::G,
+        g_by_rule
+            .into_iter()
+            .flat_map(|(_, v)| stratified_sample(v, per_rule, seed))
+            .collect(),
+    ));
+    for (c, set) in &samples {
+        println!("  抽样 {:<44} {:>6}", c.label(), set.len());
+    }
 
     // ---- 3. 打分（全程共享一次 EngineManager 初始化）
     let t_load = Instant::now();
@@ -820,8 +1158,16 @@ fn pinyin_eval_report() {
     println!("\n引擎初始化: {} ms", load_ms);
 
     let t_run = Instant::now();
+    // 逐条位次（`<out>.ranks.tsv`）：档间逐位对比、与协调器对拍都用它。
+    let mut ranks_tsv = String::from(
+        "class\tform\tinput\texpect\tengine_rank\tui_rank\tcorrected_on_page\tui_top1\tui_page\n",
+    );
     let mut scores: Vec<(Class, Score, usize)> = Vec::new();
+    // 误读统计（`WIND_PINYIN_EVAL_MISREAD=1`）：类 → (样本数, 首页有误读提示的样本数, 提示候选数, 期望词被标数)。
+    let mut misread_stats: Vec<(Class, [usize; 4])> = Vec::new();
+    let mut misread_rows: Vec<String> = Vec::new();
     for (class, set) in &samples {
+        let mut mr = [0usize; 4];
         let t = Instant::now();
         let mut sc = Score::default();
         for s in set {
@@ -837,13 +1183,66 @@ fn pinyin_eval_report() {
                 if r < 5 {
                     sc.ui_top5 += 1;
                 }
+                if r < PAGE {
+                    sc.ui_page += 1;
+                }
                 sc.ui_mrr_sum += 1.0 / (r as f64 + 1.0);
             }
-            if s.class == Class::E {
+            if misread_eval() && *class != Class::G {
+                mr[0] += 1;
+                let marked: Vec<(String, bool)> = ui
+                    .iter()
+                    .take(PAGE)
+                    .filter(|c| !c.is_misread_recall)
+                    .filter_map(|c| misread_styled(c).map(|t| (t, c.text == s.text)))
+                    .collect();
+                if !marked.is_empty() {
+                    mr[1] += 1;
+                    mr[2] += marked.len();
+                    mr[3] += marked.iter().filter(|m| m.1).count();
+                    misread_rows.push(format!(
+                        "{}\t{}\t{}\t{}",
+                        class.key(),
+                        s.input,
+                        s.text,
+                        marked
+                            .iter()
+                            .map(|m| m.0.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+            }
+            let corr_on_page = ui.iter().take(PAGE).filter(|c| c.is_corrected).count();
+            *sc.corrected_on_page.entry(corr_on_page).or_default() += 1;
+            if !s.form.is_empty() {
                 let f = sc.forms.entry(s.form).or_default();
                 f.0 += 1;
                 f.1 += usize::from(ui_rank == Some(0));
+                f.2 += usize::from(ui_rank.is_some_and(|r| r < PAGE));
             }
+            let fmt_rank = |r: Option<usize>| r.map_or("-".to_string(), |r| r.to_string());
+            let _ = writeln!(
+                ranks_tsv,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                class.key(),
+                s.form,
+                s.input,
+                s.text,
+                fmt_rank(rank),
+                fmt_rank(ui_rank),
+                corr_on_page,
+                ui.first().map(|c| c.text.as_str()).unwrap_or(""),
+                ui.iter()
+                    .take(PAGE)
+                    .map(|c| if c.is_corrected {
+                        format!("*{}", c.text)
+                    } else {
+                        c.text.clone()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
             if ui_rank != Some(0) {
                 sc.ui_misses.push(Miss {
                     input: s.input.clone(),
@@ -873,9 +1272,9 @@ fn pinyin_eval_report() {
                     sc.partial_recall += 1;
                 }
             }
-            // E 类击键不是音节（`zhge` 的 `zh` 是声母），切分判据无从成立，不计。
+            // E/F/G 类击键不是音节（`zhge` 的 `zh` 是声母），切分判据无从成立，不计。
             match cands.first() {
-                _ if s.class == Class::E => {}
+                _ if matches!(s.class, Class::E | Class::F | Class::G) => {}
                 Some(top) if top.code == s.input && top.boundary != 0 && top.boundary == tm => {
                     sc.seg_ok += 1;
                 }
@@ -942,8 +1341,33 @@ fn pinyin_eval_report() {
         }
         let ms = t.elapsed().as_millis() as usize;
         scores.push((*class, sc, ms));
+        misread_stats.push((*class, mr));
     }
     let run_ms = t_run.elapsed().as_millis();
+    if misread_eval() {
+        println!("\n=== 误读表：打对的输入上首页（{PAGE} 条）的误读提示 ===");
+        println!("类\t样本\t有提示的样本\t提示候选\t期望词被标");
+        let mut tot = [0usize; 4];
+        for (class, m) in misread_stats.iter().filter(|(c, _)| *c != Class::G) {
+            println!("{}\t{}\t{}\t{}\t{}", class.key(), m[0], m[1], m[2], m[3]);
+            for i in 0..4 {
+                tot[i] += m[i];
+            }
+        }
+        println!("合计\t{}\t{}\t{}\t{}", tot[0], tot[1], tot[2], tot[3]);
+        let path = out.with_extension("misread.tsv");
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let body = format!(
+            "class\tinput\texpect\tmarked\n{}\n",
+            misread_rows.join("\n")
+        );
+        match std::fs::write(&path, body) {
+            Ok(()) => println!("明细: {}", path.display()),
+            Err(e) => println!("明细写盘失败 {}: {e}", path.display()),
+        }
+    }
 
     // ---- 4. 报告
     println!("\n=== 基线报告 (seed={}, top_n={}) ===", seed, TOP_N);
@@ -997,16 +1421,17 @@ fn pinyin_eval_report() {
         UI_LIMIT
     );
     println!(
-        "{:<46} {:>6} {:>9} {:>9} {:>9}",
-        "类别", "样本", "top-1", "top-5", "MRR"
+        "{:<46} {:>6} {:>9} {:>9} {:>9} {:>9}",
+        "类别", "样本", "top-1", "top-5", "首页", "MRR"
     );
     for (c, sc, _) in &scores {
         println!(
-            "{:<46} {:>6} {:>8.2}% {:>8.2}% {:>9.4}",
+            "{:<46} {:>6} {:>8.2}% {:>8.2}% {:>8.2}% {:>9.4}",
             c.label(),
             sc.total,
             Score::rate(sc.ui_top1, sc.total) * 100.0,
             Score::rate(sc.ui_top5, sc.total) * 100.0,
+            Score::rate(sc.ui_page, sc.total) * 100.0,
             if sc.total == 0 {
                 0.0
             } else {
@@ -1014,16 +1439,38 @@ fn pinyin_eval_report() {
             },
         );
     }
-    if let Some((_, sc, _)) = scores.iter().find(|(c, _, _)| *c == Class::E) {
+    for (c, sc, _) in &scores {
+        if sc.forms.is_empty() {
+            continue;
+        }
         let forms: Vec<String> = sc
             .forms
             .iter()
-            .map(|(f, (n, hit))| format!("{f} {:.2}% (n={n})", Score::rate(*hit, *n) * 100.0))
+            .map(|(f, (n, hit, page))| {
+                format!(
+                    "{f} 首选 {:.2}% 首页 {:.2}% (n={n})",
+                    Score::rate(*hit, *n) * 100.0,
+                    Score::rate(*page, *n) * 100.0
+                )
+            })
             .collect();
-        println!(
-            "  E 类按形态（R 全声母 zhy / L 声母+末音节 zhge / F 首音节+声母 baichx）: {}",
-            forms.join("，")
-        );
+        println!("  {} 按形态: {}", c.key(), forms.join("，"));
+    }
+    println!("\n=== 界面首页（{PAGE} 条）上的纠错候选条数分布 ===");
+    for (c, sc, _) in &scores {
+        let dist: Vec<String> = sc
+            .corrected_on_page
+            .iter()
+            .map(|(k, n)| format!("{k}:{n}"))
+            .collect();
+        let mut all: Vec<usize> = sc
+            .corrected_on_page
+            .iter()
+            .flat_map(|(k, n)| std::iter::repeat_n(*k, *n))
+            .collect();
+        all.sort_unstable();
+        let median = all.get(all.len() / 2).copied().unwrap_or(0);
+        println!("  {:<32} 中位 {median}  分布 {}", c.key(), dist.join(" "));
     }
 
     println!("\n评测总耗时: {} ms（含引擎初始化 {} ms）", run_ms, load_ms);
@@ -1128,7 +1575,7 @@ fn pinyin_eval_report() {
     }
 
     for (c, sc, _) in &scores {
-        if *c != Class::E {
+        if !matches!(c, Class::E | Class::F | Class::G) {
             continue;
         }
         println!("\n--- {} 界面序非首选明细（前 {}）---", c.label(), dump);
@@ -1182,9 +1629,10 @@ fn pinyin_eval_report() {
         );
         let _ = writeln!(
             j,
-            "      \"ui_top1\": {:.6}, \"ui_top5\": {:.6}, \"ui_mrr\": {:.6}, \"ui_top1_hits\": {},",
+            "      \"ui_top1\": {:.6}, \"ui_top5\": {:.6}, \"ui_page\": {:.6}, \"ui_mrr\": {:.6}, \"ui_top1_hits\": {},",
             Score::rate(sc.ui_top1, sc.total),
             Score::rate(sc.ui_top5, sc.total),
+            Score::rate(sc.ui_page, sc.total),
             if sc.total == 0 {
                 0.0
             } else {
@@ -1192,14 +1640,15 @@ fn pinyin_eval_report() {
             },
             sc.ui_top1
         );
-        if *c == Class::E {
+        if !sc.forms.is_empty() {
             let forms: Vec<String> = sc
                 .forms
                 .iter()
-                .map(|(f, (n, hit))| {
+                .map(|(f, (n, hit, page))| {
                     format!(
-                        "\"{f}\": {{ \"n\": {n}, \"ui_top1\": {:.6} }}",
-                        Score::rate(*hit, *n)
+                        "\"{f}\": {{ \"n\": {n}, \"ui_top1\": {:.6}, \"ui_page\": {:.6} }}",
+                        Score::rate(*hit, *n),
+                        Score::rate(*page, *n)
                     )
                 })
                 .collect();
@@ -1269,7 +1718,54 @@ fn pinyin_eval_report() {
         Ok(()) => println!("\n结果已写入 {}", out.display()),
         Err(e) => eprintln!("\n写入 {} 失败: {}", out.display(), e),
     }
+    let ranks_path = out.with_extension("ranks.tsv");
+    match std::fs::write(&ranks_path, &ranks_tsv) {
+        Ok(()) => println!("逐条位次已写入 {}", ranks_path.display()),
+        Err(e) => eprintln!("写入 {} 失败: {}", ranks_path.display(), e),
+    }
+
+    // ---- 6. 逐键耗时（`WIND_PINYIN_EVAL_LATENCY=1`）：每条样本按前缀逐键 convert（协调器同一取数上限）。
+    if std::env::var("WIND_PINYIN_EVAL_LATENCY").is_ok_and(|v| v == "1") {
+        let mut per_key: Vec<f64> = Vec::new();
+        let mut per_input: Vec<f64> = Vec::new();
+        let t_all = Instant::now();
+        for (_, set) in &samples {
+            for s in set {
+                let t_in = Instant::now();
+                for end in 1..=s.input.len() {
+                    let t = Instant::now();
+                    let _ = mgr.convert_with("pinyin", &s.input[..end], UI_LIMIT);
+                    per_key.push(t.elapsed().as_secs_f64() * 1e6);
+                }
+                per_input.push(t_in.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        let wall_ms = t_all.elapsed().as_millis();
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[((v.len() as f64 - 1.0) * p).round() as usize]
+        };
+        println!(
+            "\n=== 逐键耗时 === 总 {wall_ms} ms；逐键 {} 次 p50 {:.0} µs p95 {:.0} µs；逐条 {} 条 p50 {:.0} µs p95 {:.0} µs",
+            per_key.len(),
+            pct(&mut per_key, 0.5),
+            pct(&mut per_key, 0.95),
+            per_input.len(),
+            pct(&mut per_input, 0.5),
+            pct(&mut per_input, 0.95),
+        );
+    }
 }
+
+const ALL_CLASSES: [Class; 7] = [
+    Class::A,
+    Class::B,
+    Class::C,
+    Class::D,
+    Class::E,
+    Class::F,
+    Class::G,
+];
 
 /// 只跑分类统计，不加载引擎（秒级）。用于核对 B 类总量是否与设计文档的 1110 条吻合。
 #[test]

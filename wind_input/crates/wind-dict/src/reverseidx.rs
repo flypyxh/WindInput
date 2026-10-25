@@ -161,7 +161,7 @@ impl ReverseIndex {
         let data = if len as usize <= resident_max_bytes {
             IndexData::Owned(std::fs::read(path)?)
         } else {
-            IndexData::Mapped(unsafe { Mmap::map(&file)? })
+            IndexData::Mapped(crate::mapping::map_file(&file)?)
         };
         let idx = Self::parse(data)?;
         info!(

@@ -227,6 +227,13 @@ if(WIND_TSF_TESTS)
     endif()
     add_test(NAME hold_replay_policy COMMAND hold_replay_policy_test)
 
+    add_executable(ctrl_alt_cleanup_policy_test tests/ctrl_alt_cleanup_policy_test.cpp)
+    target_include_directories(ctrl_alt_cleanup_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(ctrl_alt_cleanup_policy_test PRIVATE /utf-8 /W4)
+    endif()
+    add_test(NAME ctrl_alt_cleanup_policy COMMAND ctrl_alt_cleanup_policy_test)
+
     add_executable(deferred_composition_policy_test tests/deferred_composition_policy_test.cpp)
     target_include_directories(deferred_composition_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
     if(MSVC)

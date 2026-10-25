@@ -473,7 +473,16 @@ pub(crate) fn dispatch_command(
             };
             let data = KeyEventData::from(&key_payload);
             // policed 入口：非 app_inline 时把应用侧组合串替换为占位空格（避免与候选窗 preedit 重复）。
+            let t0 = std::time::Instant::now();
             let action = handler.handle_key_event_policed(&data);
+            // 宿主同步等这次应答，慢了就是打字卡顿（偶发慢键排查用）。
+            if t0.elapsed() >= std::time::Duration::from_millis(15) {
+                debug!(
+                    "key_event 处理慢: {:?} code=0x{:02X}",
+                    t0.elapsed(),
+                    data.key_code
+                );
+            }
             Some(encode_key_action(&action))
         }
 

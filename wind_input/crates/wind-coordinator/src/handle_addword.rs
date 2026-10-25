@@ -1453,6 +1453,7 @@ impl Coordinator {
     fn add_word_panel_rows(&self, state: &State) -> Vec<CandidateItem> {
         // no_index=true 完全不显示序号（三行都是提示行，避免默认主题的空圆圈）。
         let row = |text: String, comment: String| CandidateItem {
+            text_styled: Default::default(),
             text,
             code: String::new(),
             label: String::new(),

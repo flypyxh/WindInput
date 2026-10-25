@@ -455,7 +455,7 @@ impl Store {
         changed
     }
 
-    /// `dict.reload` 带路径：只认 `classify_text_path` 列出的那几种——短语、快捷格式、常用字、补全、
+    /// `dict.reload` 带路径：只认 `classify_text_path` 列出的那几种——短语、快捷格式、常用字、补全、误读表、
     /// `charsets/*.yaml`、`stats/*.toml`，以及 `<schema>/` 下的用户词、Shadow、学到的数据、用户分库与
     /// `dicts.toml`（按路径分量比对，不碰文件系统；`..` 是 `ParentDir` 分量，必然比对失败）。任一路径不合规 ⇒ 整体 Err、一个都不同步。返回值同 [`Self::sync_user_texts`]。
     pub fn reload_user_text_paths(&self, paths: &[String]) -> anyhow::Result<Vec<String>> {
@@ -475,6 +475,8 @@ impl Store {
                 TextPath::Learned(t, s) => self.sync_learned_text(t, &s).then_some(s),
                 TextPath::Completion => self.reload_completions().then(|| "completion".to_string()),
                 TextPath::Stats => None,
+                // 误读表归引擎：随配置重载重读
+                TextPath::Misread => None,
                 // 分库不归 store 管内容：交给调用方失效用到该数据方案的方案
                 TextPath::UserDicts(s) => Some(format!("{USER_DICTS_CHANGED}{s}")),
             };
@@ -567,6 +569,8 @@ pub(crate) enum TextPath {
     Stats,
     /// 用户分库 `<schema>/dicts/<名>.dict.yaml` 与开关 `<schema>/dicts.toml`。
     UserDicts(String),
+    /// 用户误读表 [`crate::MISREAD_FILE`]：引擎随配置重载读它，store 不管内容。
+    Misread,
 }
 
 /// 重载 / 结束编辑的返回里，用户分库变了记作 `dicts:<数据方案>`。
@@ -608,6 +612,7 @@ pub(crate) fn classify_text_path(
         [f] if is(f, "quick_format.toml") => Ok(TextPath::Quick),
         [f] if is(f, "common_chars.yaml") => Ok(TextPath::Common),
         [f] if is(f, "completion.table.yaml") => Ok(TextPath::Completion),
+        [f] if is(f, crate::MISREAD_FILE) => Ok(TextPath::Misread),
         [d, f] if is(d, "charsets") && f.ends_with(&fold(".yaml")) => {
             let name = schema_dir_name(&base.join("charsets"), f, fold_case);
             Ok(TextPath::Charsets(

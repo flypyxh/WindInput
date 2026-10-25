@@ -216,6 +216,53 @@ pub fn span_color(
     body
 }
 
+/// 正确拼音提示段的角色名（与 wind-ui-types `TEXT_ROLES` 里的 `pinyin_hint` 同名）。
+pub const PINYIN_HINT_ROLE: &str = "pinyin_hint";
+
+/// 候选正文里正确拼音提示段（`(ping)`）的颜色，角色名 [`PINYIN_HINT_ROLE`]。
+///
+/// - `text`：`views.text`（提示段在候选正文里，角色色写在 `[text.roles]`）；`comment`：`views.comment`。
+/// - `comment_fallback`：注释节点未配正文色时的渲染层兜底（候选窗的 `COMMENT_FALLBACK`）。
+/// - `state_bg`：该状态下候选正文背后的实际底色（已与窗口底合成、不透明）；渐变 / 图片 /
+///   透到桌面等取不到可靠值的情况传 `None`。常态不看它。
+///
+/// 顺序：① 该状态的 `text.<state>.roles` → ② 该状态改了正文色（有效色值比较，同 [`span_color`]
+/// 规则 3）时，③ 的常态提示色对 `state_bg` 的对比度 ≥ [`PINYIN_HINT_MIN_CONTRAST`] 才沿用，
+/// 否则（对比度不足、底色未知、或 ③ 没配）取该状态下的注释色 → ③ `text.roles`
+/// → ④ 注释在该状态下的正文色。即主题不配时提示段与注释同色，含选中 / 悬停态。
+/// 正文其余部分无角色，直接用 [`body_color`]`(text, state, 候选正文兜底)`。
+pub fn pinyin_hint_color(
+    text: &RvNode,
+    comment: &RvNode,
+    state: TextState,
+    text_fallback: Rgba,
+    comment_fallback: Rgba,
+    state_bg: Option<Rgba>,
+) -> Rgba {
+    if let Some(c) = state_patch(text, state).and_then(|n| n.roles.get(PINYIN_HINT_ROLE)) {
+        return *c;
+    }
+    let comment_color = body_color(comment, state, comment_fallback);
+    let normal = text.roles.get(PINYIN_HINT_ROLE).copied();
+    if state != TextState::Normal
+        && body_color(text, state, text_fallback)
+            != body_color(text, TextState::Normal, text_fallback)
+    {
+        return match (normal, state_bg) {
+            (Some(c), Some(bg))
+                if crate::palette::meets_contrast(c, bg, PINYIN_HINT_MIN_CONTRAST) =>
+            {
+                c
+            }
+            _ => comment_color,
+        };
+    }
+    normal.unwrap_or(comment_color)
+}
+
+/// 高亮态沿用常态提示色所需的最低对比度（WCAG 非正文图形 / 大字口径）。
+pub const PINYIN_HINT_MIN_CONTRAST: f64 = 3.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,30 +721,7 @@ mod tests {
         }
     }
 
-    /// WCAG 相对亮度对比度。
-    fn contrast(a: Rgba, b: Rgba) -> f64 {
-        fn lum(c: Rgba) -> f64 {
-            let f = |v: u8| {
-                let v = f64::from(v) / 255.0;
-                if v <= 0.03928 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
-        }
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
-    }
-
-    /// `top` 按 alpha 叠在不透明的 `under` 上（清风系选中底是半透明的 `accent_soft`）。
-    fn over(top: Rgba, under: Rgba) -> Rgba {
-        let a = f64::from(top[3]) / 255.0;
-        let mix =
-            |i: usize| (f64::from(top[i]) * a + f64::from(under[i]) * (1.0 - a)).round() as u8;
-        [mix(0), mix(1), mix(2), 255]
-    }
+    use crate::palette::{composite_over as over, contrast_ratio as contrast};
 
     /// ★ `_base` 的出厂角色色（§18），按与渲染同一口径的 `span_color` 在**全部出厂主题** × 亮暗下逐格求色：
     /// - 注释**不上色**（用户要求保持原外观）：各变量角色在常态 / 选中 / 悬停都等于注释正文色；
@@ -1226,5 +1250,121 @@ mod tests {
             got, want,
             "引擎求值与检入的期望表不一致；有意改变时 WIND_THEME_BLESS=1 重录"
         );
+    }
+
+    // ---------------- 正确拼音提示 ----------------
+
+    const CMT: Rgba = [10, 20, 30, 255];
+    const CMT_SEL: Rgba = [40, 50, 60, 255];
+    const TXT: Rgba = [1, 2, 3, 255];
+    const TXT_SEL: Rgba = [4, 5, 6, 255];
+    const TXT_FB: Rgba = [30, 30, 30, 255];
+
+    fn hint(text: &RvNode, comment: &RvNode, st: TextState) -> Rgba {
+        pinyin_hint_color(text, comment, st, TXT_FB, BODY, None)
+    }
+
+    fn comment_node() -> RvNode {
+        let mut c = RvNode {
+            text_color: Some(CMT),
+            ..Default::default()
+        };
+        c.selected = Some(Box::new(body_patch(CMT_SEL)));
+        c
+    }
+
+    #[test]
+    fn pinyin_hint_falls_back_to_comment() {
+        let (t, c) = (node(), comment_node());
+        assert_eq!(hint(&t, &c, Normal), CMT);
+        assert_eq!(hint(&t, &c, Selected), CMT_SEL);
+        assert_eq!(hint(&t, &c, Hover), CMT, "悬停没配色，回退注释基态色");
+        assert_eq!(hint(&t, &node(), Normal), BODY, "注释也没配 => 渲染层兜底");
+    }
+
+    #[test]
+    fn pinyin_hint_theme_override() {
+        let t = with_roles(node(), &[("pinyin_hint", RED)]);
+        let c = comment_node();
+        assert_eq!(hint(&t, &c, Normal), RED);
+        assert_eq!(hint(&t, &c, Selected), RED, "正文色没变的状态沿用常态配色");
+        // 状态单列优先。
+        let t = selected(t, with_roles(node(), &[("pinyin_hint", GREEN)]));
+        assert_eq!(hint(&t, &c, Selected), GREEN);
+        assert_eq!(hint(&t, &c, Normal), RED);
+    }
+
+    const LIGHT_SEL_BG: Rgba = [220, 235, 255, 255];
+    const DARK_SEL_BG: Rgba = [0, 90, 200, 255];
+
+    fn hint_on(text: &RvNode, st: TextState, bg: Option<Rgba>) -> Rgba {
+        pinyin_hint_color(text, &comment_node(), st, TXT_FB, BODY, bg)
+    }
+
+    /// 选中态改了正文色的主题：`text.roles` 配红、选中正文改色。
+    fn sel_changes_body() -> RvNode {
+        let mut t = with_roles(body_patch(TXT), &[("pinyin_hint", RED)]);
+        t.selected = Some(Box::new(body_patch(TXT_SEL)));
+        t.hover = Some(Box::new(body_patch(TXT_SEL)));
+        t
+    }
+
+    /// 浅色高亮底上常态提示色仍够醒目（≥ 3:1）：沿用，不回落注释色。
+    #[test]
+    fn pinyin_hint_keeps_color_on_readable_state_bg() {
+        assert!(crate::palette::contrast_ratio(RED, LIGHT_SEL_BG) >= PINYIN_HINT_MIN_CONTRAST);
+        let t = sel_changes_body();
+        assert_eq!(hint_on(&t, Selected, Some(LIGHT_SEL_BG)), RED);
+        assert_eq!(hint_on(&t, Hover, Some(LIGHT_SEL_BG)), RED);
+    }
+
+    /// 深色实心高亮底对比度不足：回落该态注释色。
+    #[test]
+    fn pinyin_hint_yields_on_low_contrast_state_bg() {
+        assert!(crate::palette::contrast_ratio(RED, DARK_SEL_BG) < PINYIN_HINT_MIN_CONTRAST);
+        assert_eq!(
+            hint_on(&sel_changes_body(), Selected, Some(DARK_SEL_BG)),
+            CMT_SEL
+        );
+    }
+
+    /// 底色未知（渐变 / 图片 / 透到桌面）：回落该态注释色。
+    #[test]
+    fn pinyin_hint_yields_when_state_bg_unknown() {
+        assert_eq!(hint_on(&sel_changes_body(), Selected, None), CMT_SEL);
+    }
+
+    /// 常态不看底色；没配常态提示色时即使底色够亮也是注释色。
+    #[test]
+    fn pinyin_hint_state_bg_only_matters_for_configured_hint() {
+        let t = sel_changes_body();
+        assert_eq!(hint_on(&t, Normal, Some(DARK_SEL_BG)), RED);
+        assert_eq!(hint_on(&t, Normal, None), RED);
+        let mut bare = body_patch(TXT);
+        bare.selected = Some(Box::new(body_patch(TXT_SEL)));
+        assert_eq!(hint_on(&bare, Selected, Some(LIGHT_SEL_BG)), CMT_SEL);
+    }
+
+    /// 状态单列的 roles 仍最优先，不受底色影响。
+    #[test]
+    fn pinyin_hint_state_role_beats_contrast_rule() {
+        let mut t = sel_changes_body();
+        let mut sel = body_patch(TXT_SEL);
+        sel.roles.insert("pinyin_hint".into(), GREEN);
+        t.selected = Some(Box::new(sel));
+        assert_eq!(hint_on(&t, Selected, Some(DARK_SEL_BG)), GREEN);
+        assert_eq!(hint_on(&t, Selected, None), GREEN);
+    }
+
+    /// 选中态把正文色改了（底色变了）且底色未知：常态配的固定色不带进去，改取该态注释色。
+    #[test]
+    fn pinyin_hint_yields_to_comment_when_state_changes_body() {
+        let mut t = with_roles(body_patch(TXT), &[("pinyin_hint", RED)]);
+        t.selected = Some(Box::new(body_patch(TXT_SEL)));
+        assert_eq!(hint(&t, &comment_node(), Selected), CMT_SEL);
+        assert_eq!(hint(&t, &comment_node(), Normal), RED);
+        // 写回同一个色值不算改了正文色。
+        t.selected = Some(Box::new(body_patch(TXT)));
+        assert_eq!(hint(&t, &comment_node(), Selected), RED);
     }
 }

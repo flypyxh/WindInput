@@ -28,6 +28,23 @@ pub enum CandidateSource {
     Assoc,
 }
 
+/// 正确拼音提示：候选**引擎文字**第 `char_index` 个字（0 起）对应的音节与用户所敲不同，
+/// 正确音节为 `correct`，来源见 `kind`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinyinHint {
+    pub char_index: u16,
+    pub correct: String,
+    pub kind: HintKind,
+}
+
+/// 提示来源：模糊音 / 读错的音 / 拼写纠错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintKind {
+    Fuzzy,
+    Misread,
+    Correction,
+}
+
 /// 候选词元数据
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CandidateMeta {
@@ -88,13 +105,37 @@ pub struct CandidateMeta {
     /// 排序/去重/显示一律不读本字段，它只服务「把这条候选写进词库」这个方向。
     #[serde(skip)]
     pub learn_code: Option<(String, u64)>,
-    /// 拼音「英文前缀补全」（`schema.pinyin.english_merge.prefix_complete`）补出来的英文候选。
+    /// 模糊命中走的那条**所打码**（候选 `code`）切分，各音节起点的 bitmask；`0` = 不是模糊
+    /// 命中，或命中词条没有边界真值。
+    ///
+    /// 模糊命中的 `boundary` 恒 0（见 `learn_code`），而 `pinan` 的「平安」走的是 `pin|an`、
+    /// 不是 `maximum_match` 的 `pi|nan`。只服务编码栏切分（见 `preedit_split`），排序/造词/边界核对一律不读。
+    #[serde(skip)]
+    pub fuzzy_typed_boundary: u64,
+    /// 高亮到这条候选时编码栏的拼音正文（`pi'nan`）：在本次 `convert` 的输入串里按这条候选
+    /// 自己走的切分插 `'`，候选只覆盖前缀时尾部按最大匹配接着切。`None` = 拿不到可信切分
+    /// （手动分隔符、双拼击键候选、无边界真值、补全等），编码栏退回首选那份。双拼下只有全拼
+    /// 降级候选有（击键即全拼码）。
+    ///
+    /// 只服务显示，排序/造词/边界核对一律不读。`Arc<str>`：同一切分的候选共用一份。
+    #[serde(skip)]
+    pub preedit_split: Option<std::sync::Arc<str>>,
+    /// 「英文前缀补全」（`english_merge.complete_min_length` 等）补出来的英文候选。
     ///
     /// 只由 `wind_engine::english_merge::lookup_prefix_complete` 置位；协调器
     /// `place_english_after_common_exact` 据此让它们排在整串拼音真词之后。不能拿「code 比输入
     /// 长」代替：英文方案、混输自己的前缀候选也长那样，却不该被挪动。
     #[serde(skip)]
     pub from_prefix_complete: bool,
+    /// 正确拼音提示（空 = 无提示）。引擎在提示开关（`HintSwitch`）开时填充，各来源一并给出，
+    /// 按来源勾选取舍由协调器做。
+    #[serde(skip)]
+    pub pinyin_hints: Vec<PinyinHint>,
+    /// 带提示候选的整词正确音节（一字一个，`["zhong", "guo"]`）；与 `pinyin_hints` 同时由引擎
+    /// 填，`pinyin_hints` 空时也空。切法与提示同源（词条码无边界时按音节图现切），协调器的
+    /// `${correct_pinyin}` 直接用它，不另行切分。
+    #[serde(skip)]
+    pub hint_syllables: Vec<String>,
 }
 
 /// 命令栏动作
@@ -225,6 +266,27 @@ pub struct Candidate {
     /// 前缀补全「思考」「似乎」）压到第 231 位，而生产候选上限是 50~300，模糊音
     /// 因此在三条路径（拼音 / 混输 / 临拼）上全部等价于未实现。
     pub is_fuzzy: bool,
+    /// 该候选**只有经字母换位纠错才得到**（`gogn` → 「工」）：同一文字另有非纠错来源时
+    /// 不标（那条非纠错候选留下）。整句里只要有一个音节经纠错就算。
+    ///
+    /// 与 [`Self::is_scope_filtered`] 同构，语义只是这个事实，不编码排序或显示决策：
+    /// - 排序：存在非纠错的完整候选时不占首选（[`protect_top_from_corrected`]）；
+    /// - 自动上屏：计数时跳过；
+    /// - UI：加 `input.correction.marker` 前缀（默认 `*`）。
+    ///
+    /// 纠错命中照旧带 `is_fuzzy`（它决定召回与罚分），本字段与之并列。
+    #[serde(default)]
+    pub is_corrected: bool,
+    /// 该候选**只因误读表召回**（用户打了表里的错误读音，词库读不出这个词，如 `xinxin` →
+    /// 「莘莘」）。词库已有同文字候选时不召回，那条不带本标记。
+    ///
+    /// 与 [`Self::is_corrected`] 同为低置信候选，消费者按同一口径对待，语义只是这个事实：
+    /// - 排序：引擎给同页最低权重再低一档；存在完整的普通候选时不占首选
+    ///   （[`protect_top_from_corrected`]）；
+    /// - 自动上屏：计数时跳过；
+    /// - UI：不加纠错标记，正确拼音由提示（`HintKind::Misread`）给出。
+    #[serde(default)]
+    pub is_misread_recall: bool,
     /// 是否为**简拼**（声母缩写）候选，如 `nh`→「你好」。排序时整体降到全拼候选之后。
     ///
     /// **为何不复用 `is_fuzzy`**：用户词简拼路径此前正是借它沉底（`mod.rs` step6 硬置
@@ -603,6 +665,8 @@ impl Default for Candidate {
             is_phrase: false,
             is_command: false,
             is_fuzzy: false,
+            is_corrected: false,
+            is_misread_recall: false,
             is_abbrev: false,
             is_fullpinyin_fallback: false,
             is_zero_weight_reading: false,
@@ -645,6 +709,12 @@ impl Default for Candidate {
 }
 
 impl Candidate {
+    /// 低置信候选：经纠错（[`Self::is_corrected`]）或只因误读表召回（[`Self::is_misread_recall`]）。
+    /// 不占首选、不计自动上屏、不否决上屏。
+    pub fn is_low_confidence(&self) -> bool {
+        self.is_corrected || self.is_misread_recall
+    }
+
     /// 词频 / 候选调整记账用的文本：模板展开前、大小写投影前的词库原文（都没发生时即 `text`）。
     ///
     /// 存在理由见 [`Candidate::case_source`] 与 [`Candidate::template_source`]——两端不同源，
@@ -697,6 +767,41 @@ pub fn effective_consumed(c: &Candidate, input_len: usize) -> usize {
         input_len
     } else {
         c.consumed_length
+    }
+}
+
+/// 同一文字既有经纠错（[`Candidate::is_corrected`]）又有非纠错的候选时，去掉纠错那条，
+/// 非纠错那条留在原位。
+pub fn drop_corrected_duplicates(cands: &mut Vec<Candidate>) {
+    if !cands.iter().any(|c| c.is_corrected) {
+        return;
+    }
+    let plain: std::collections::HashSet<String> = cands
+        .iter()
+        .filter(|c| !c.is_corrected)
+        .map(|c| c.text.clone())
+        .collect();
+    cands.retain(|c| !c.is_corrected || !plain.contains(&c.text));
+}
+
+/// 纠错候选不占首选（设计 D6）：首条经纠错（或误读召回，见 [`Candidate::is_low_confidence`]）、
+/// 且列表里有**完整**的普通候选时，把第一条这样的候选提到首位，其余相对顺序不变。
+///
+/// 「完整」= 消费整串、不是简拼 / 前缀补全 / 子短语。简拼不算：否则 `gogn` 切成 g+o+g+n
+/// 出的简拼整句会让「工」永远拿不到首选。
+pub fn protect_top_from_corrected(cands: &mut [Candidate], input_len: usize) {
+    if !cands.first().is_some_and(Candidate::is_low_confidence) {
+        return;
+    }
+    let complete = |c: &Candidate| {
+        !c.is_low_confidence()
+            && effective_consumed(c, input_len) >= input_len
+            && !c.is_abbrev
+            && !c.is_prefix
+            && !c.is_partial
+    };
+    if let Some(i) = cands.iter().position(complete) {
+        cands[..=i].rotate_right(1);
     }
 }
 
@@ -1655,5 +1760,81 @@ mod freq_text_tests {
     fn template_source_wins_over_case_source() {
         let c = cand("2026年10月9日", Some("2026年10月9日"), Some("$Y年$M月$D日"));
         assert_eq!(c.freq_text(), "$Y年$M月$D日");
+    }
+}
+
+#[cfg(test)]
+mod corrected_tests {
+    use super::*;
+
+    fn c(text: &str, corrected: bool) -> Candidate {
+        Candidate {
+            text: text.into(),
+            is_corrected: corrected,
+            ..Default::default()
+        }
+    }
+
+    fn texts(cs: &[Candidate]) -> Vec<&str> {
+        cs.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    #[test]
+    fn duplicate_keeps_uncorrected() {
+        let mut cs = vec![c("中", true), c("种", true), c("中", false), c("众", false)];
+        drop_corrected_duplicates(&mut cs);
+        assert_eq!(texts(&cs), ["种", "中", "众"]);
+        assert!(!cs[1].is_corrected);
+    }
+
+    #[test]
+    fn complete_uncorrected_takes_top() {
+        let mut abbrev = c("干呕", false);
+        abbrev.is_abbrev = true;
+        let mut partial = c("与", false);
+        partial.is_partial = true;
+        partial.consumed_length = 2;
+        let mut cs = vec![
+            c("有", true),
+            abbrev,
+            partial,
+            c("又", true),
+            c("与哦", false),
+        ];
+        protect_top_from_corrected(&mut cs, 3);
+        assert_eq!(texts(&cs), ["与哦", "有", "干呕", "与", "又"]);
+    }
+
+    /// 误读召回同为低置信：首条是它时让给完整普通候选；完整候选里也不算它。
+    #[test]
+    fn misread_recall_does_not_take_top() {
+        let recall = |t: &str| Candidate {
+            text: t.into(),
+            is_misread_recall: true,
+            ..Default::default()
+        };
+        let mut cs = vec![recall("莘莘"), recall("堤防"), c("欣欣", false)];
+        protect_top_from_corrected(&mut cs, 6);
+        assert_eq!(texts(&cs), ["欣欣", "莘莘", "堤防"]);
+    }
+
+    #[test]
+    fn no_complete_keeps_corrected_top() {
+        let mut abbrev = c("干呕功能", false);
+        abbrev.is_abbrev = true;
+        let mut prefix = c("公平", false);
+        prefix.is_prefix = true;
+        let mut short = c("公", false);
+        short.consumed_length = 2;
+        let mut cs = vec![c("工", true), abbrev, prefix, short];
+        protect_top_from_corrected(&mut cs, 4);
+        assert_eq!(texts(&cs), ["工", "干呕功能", "公平", "公"]);
+    }
+
+    #[test]
+    fn uncorrected_top_untouched() {
+        let mut cs = vec![c("公平", false), c("工", true)];
+        protect_top_from_corrected(&mut cs, 8);
+        assert_eq!(texts(&cs), ["公平", "工"]);
     }
 }

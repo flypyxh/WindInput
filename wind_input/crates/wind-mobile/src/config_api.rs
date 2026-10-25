@@ -142,11 +142,8 @@ pub fn apply_mobile_overrides(cfg: &mut Config) {
     // 宿主组合区、协调器**不下发 preedit** 给候选窗。移动端没有桌面那种浮在光标旁的
     // 候选窗，编码要显示在键盘上方的编码栏里，就必须让协调器把 preedit 发出来。
     cfg.ui.candidate.preedit_display = "candidate_top".to_string();
-    // 联想态空格出空格、不选联想（手机习惯，非偏好）：豆包、微信都是收起联想出空格，汉字后
-    // 双击空格出「。」也靠这一下真的是空格。桌面默认 `space_commits = true` 是实体键盘语义
-    // （联想高亮在候选窗里看得见，空格选词顺手）；手机上联想挤在候选条里，空格选走它就是
-    // 「我想打空格却上了个词」。此前 Android 侧先发 Esc 再出空格权宜绕过，改到这里收口。
-    cfg.input.association.space_commits = false;
+    // 联想态空格选不选联想：不在这里强制，归 `[mobile.association] space_commits`（出厂关，
+    // 设置页可开）。此前在这里强改成 false，用户想要「空格选首个联想」也没有办法。
 }
 
 /// **出厂默认**配置的全量快照（TOML 文本）。
@@ -424,6 +421,13 @@ pub fn set_tooltip_section_enabled(data_dir: &Path, label: &str, on: bool) -> Re
     // 读与写都在锁里：load 到 set_user_value 之间别处写进来的，会被这里整份写回冲掉
     let _w = write_guard();
     let mut cfg = Config::load(Some(data_dir)).map_err(|e| e.to_string())?;
+    // 整份段列表写回：降级时这份是出厂值，写回会抹掉用户原有的段设置
+    if cfg
+        .degradation
+        .blocks_write_back("ui.tooltip.sections", "移动端提示段开关")
+    {
+        return Err("配置文件有问题，本次未写入；修好配置文件后再试".to_string());
+    }
     let sec = cfg
         .ui
         .tooltip
@@ -466,7 +470,10 @@ mod tests {
     #[test]
     fn overrides_reach_snapshot_defaults() {
         let cfg = apply_overrides_to(Config::default());
-        assert!(!cfg.input.association.space_commits, "联想态空格不选联想");
+        assert!(
+            !cfg.mobile.association.space_commits,
+            "联想态空格出厂不选联想（移动端段）"
+        );
         assert_eq!(cfg.ui.candidate.preedit_display, "candidate_top");
     }
 

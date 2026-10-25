@@ -273,6 +273,12 @@ readings = "#9AD0FF"
   派生主题借此撤销 base 配的某个角色。唯一例外：`transparent` 在角色表里按未设置处理并 warn，
   与内联色口径一致（§4.5）——文字占着宽度却看不见，只会是误用。
 - 只有 `comment`（含 `selected` / `hover`）与 `tooltip` 消费；写在其它节点下的 `roles` 被忽略。
+  例外：`text` 节点消费且仅消费 `fuzzy_hint`（候选正文里的模糊音提示段 `(ping)`），由
+  `wind_theme::fuzzy_hint_color` 求色：状态单列 `text.<态>.roles` → 该状态改了正文色（有效色值比较）时，
+  `text.roles` 常态提示色对该状态候选项实际底色（窗口底 → `candidate_list` → 候选项状态底 → 正文叶子底，
+  逐层 alpha 合成）的 WCAG 对比度 ≥ 3:1 则沿用，否则（对比度不足、未配常态提示色、或底色取不到——任一层
+  带背景图 / 渐变 / 覆盖图、窗口底半透明）回落该状态下的注释色 → `text.roles` 常态角色色 → 注释色。
+  不配即整体随注释色。
 - 引擎**不校验**角色名：更新版本的主题（用到了新变量的角色）在旧引擎上应静默忽略而非报错。
   拼写检查交给主题编辑器的严格模式（§10）。
 
@@ -835,7 +841,7 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 | P1（前置） | **先录 golden，再改渲染层**：在**改动前的提交**上给 mock `imp` 加绘制调用记录（§7.4，这一步本身不改任何行为），录出「出厂主题 × 出厂模板 × 常态/选中/悬停 × 横排/竖排/直立」的 View 树 Debug dump + 绘制调用日志，入库作参照。参照必须来自改动前——事后用新代码录的 golden 只能证明「和自己一样」 |
 | P1 | （执行记录见表下「P1 执行记录」）Windows 目标：**第一步先验证 wine 的 DirectWrite 会不会把 drawing effect 传进 `DrawGlyphRun`**（写个最小用例看 `_effect` 是否非空）；传不进就改由 Windows CI 或编译机跑，不要让下面几条在 wine 上「空转全绿」。① 非空断言：绘制后被改动的像素数 > 0（否则后两条可能在什么都没画时平凡成立）；② 多个 effect 全取基色 vs 无 effect → 缓冲逐字节相同；③ 色相断言：两色文本（如红 `ab` + 蓝 `cd`），在各 run 字形的 x 区间内，被改动像素按色相统计以该 run 的颜色为主；④ 半透明底 + 两种 alpha 的多遍绘制，与逐 run 单独绘制再合成的结果一致（守 §7.2 的二次预乘）；⑤ `measure` 结果与缓存条目数不受 `draw_runs` 影响。macOS CI：带色 line 与无色 line 的 typographic width 相等（§7.3）；golden 对拍（Linux）逐字节相同 |
 | P2 | golden 对拍仍逐字节相同（P2 起协调器产出片段，出厂下必须全部解析到正文色而被丢弃，§6.4）。旧 `render()` 作为测试内参照实现保留：出厂模板 + 现有全部注释用例，`render_styled().text` 与参照逐字节相同；气泡 2⁵ 开关组合对拍（`tooltip.rs` 现有）改用 `doc.to_plain_text()` 断言，照旧全绿；每个 `$[…]{}` 用例同时断言「去掉 `$[…]{` `}` 后的模板输出相同文字」（§4.3 纯加法） |
-| P3 | 复用 P1 前置的 golden：出厂主题 × 出厂模板 × 三态 × 三种排布，View 树 dump 与绘制调用日志与改动前**逐字节相同**（含「没有任何调用走 runs」）。另：全部出厂主题（`_base`、`_qingfeng`、`default`、`amber`、`jade`、`violet`、`msime`）× 亮暗，`RvViews` 各节点 `roles` 为空、§5.4 契约名（含全部 `tooltip_*`）可解析 |
+| P3 | 复用 P1 前置的 golden：出厂主题 × 出厂模板 × 三态 × 三种排布，View 树 dump 与绘制调用日志与改动前**逐字节相同**（含「没有任何调用走 runs」）。另：全部出厂主题（`_base`、`_qingfeng`、`default`、`amber`、`jade`、`violet`、`msime`）× 亮暗，`RvViews` 各节点 `roles` 为空（`text` 仅可有 `fuzzy_hint`）、§5.4 契约名（含全部 `tooltip_*`）可解析 |
 
 **P1 执行记录（2026-09-27）**：
 
@@ -876,7 +882,7 @@ R3「外观覆盖主题」要求用户值逐格回落、只在一处合并。角
 
 - 引擎：`ViewNode.roles` → `RvNode.roles`；`""` / 未解析 token 不入表，`transparent` 与 alpha 0 拒收
   并 warn；`resolve_state` 的 nil 门控加上「有角色色」。出厂主题一律不配 roles（全部出厂主题 × 亮暗断言
-  各节点与状态 patch 的 roles 为空），渲染 golden 逐字节不变。
+  各节点与状态 patch 的 roles 为空），唯一例外是 `_base` 的 `[text.roles] fuzzy_hint`（深浅各一档，守卫测试只放行这一条），渲染 golden 逐字节不变。
 - 非出厂测试主题 `wind-theme/testdata/themes/span-roles`（+ 派生 `span-roles-child`）：token 与亮暗、
   拒收、只写 roles 的 hover patch、派生逐键深合并与 `""` 撤销；wind-ui 层注释三态区间与气泡段名回落。
 - 主题编辑器（WindInputThemeEditor `feat/span-colors`）：roles 读写往返、求值与门控、`spanColor.ts`

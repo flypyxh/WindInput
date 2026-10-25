@@ -53,6 +53,7 @@ impl FreqRanks {
     pub fn parse(text: &str) -> Self {
         let mut ranks = HashMap::new();
         let mut rank = 0u32;
+        let text = wind_utils::text::normalize_input(text);
         for line in text.lines() {
             let w = line.trim();
             if w.is_empty() || w.starts_with('#') {

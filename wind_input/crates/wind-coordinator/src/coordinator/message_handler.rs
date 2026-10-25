@@ -979,7 +979,7 @@ impl MessageHandler for Coordinator {
         // 这一步是会话层判定（这一键要不要顺带收口），会话层先定。
         //
         // ⚠️ **只在 keydown 改判**。`ClearCompositionThenPassThrough` 的「交还按键」那一半
-        // 靠 C++ 的 `_pendingReplayToHost`，而它只在 `OnKeyDown` 里消费（`OnKeyUp` 不碰，
+        // 靠 C++ 在按键入口重放，只在 `OnKeyDown` / `DispatchHotkey` 消费（`OnKeyUp` 不碰，
         // 残留由下一次 keydown 开头清零）。在 keyup 上改判 ⇒ 标记被消费掉、键却没重放，
         // 等于把「收口」这次机会浪费在一个做不成的时机上。keyup 保持原样，标记留给紧随
         // 其后的 keydown——用户要继续操作，必然还有 keydown。
@@ -1322,6 +1322,10 @@ impl MessageHandler for Coordinator {
         // ── 候选词操作热键（Ctrl+数字 置顶/删除）──
         // 这两组在编译期仅注册转发（action 为空，上方匹配不触发），实际语义在此分派。
         // 须先于下方 Ctrl/Alt 组合「清空隐藏候选」分支，否则 Ctrl+数字 会被当作普通组合吞掉。
+        // 快捷输入的选词键排在置顶/删除前面：出厂同为 Ctrl+数字，快捷输入里归选词。
+        if let Some(act) = self.try_quick_input_select(data) {
+            return act;
+        }
         if let Some(act) = self.handle_candidate_action_hotkey(data) {
             return act;
         }

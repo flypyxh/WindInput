@@ -50,6 +50,9 @@
 核心输入链路（词库 → 五类引擎 → 候选后处理）的**现状架构文档**见
 [docs/architecture/engine-candidate-pipeline.md](docs/architecture/engine-candidate-pipeline.md)
 （含混输拼音否决、顶码/满码一致性、各模式流程对比）；改引擎/候选逻辑时同步更新该文档。
+凡改动让用户能感知到候选的有无、先后、条数或上屏时机变化，同一分支里在
+[docs/architecture/candidate-behavior-changelog.md](docs/architecture/candidate-behavior-changelog.md)
+加一条（前后对比、触发条件、回退配置、钉住的测试）——用户反馈「以前不是这样」时靠它追查。
 
 ## 平台分层策略——平台/系统依赖放哪
 
@@ -391,6 +394,12 @@ cargo test -p wind-rpc --test wind_setting_assets
   安装包 `8`/`d8` → `.pkg`。
 - `.app` 侧单测：`cd wind_macos && swift test`。
 - 与 Windows 的功能差距（宿主层）登记在 `wind_macos/AGENTS.md`「与 Windows 的功能差距」。
+
+### 靶机按键延迟探针（`scripts/perf/key-latency.sh`）
+
+在靶机上直连服务 bridge 管道逐键发 KEY_EVENT 计往返耗时（Esc 撤销，不上屏不进词频），
+可造 trim / purge 冷场景。子命令 `codes`（从日志取编码清单）/ `run`（跑各轮）/ `report`（汇总），
+用法与注意事项（会闪候选窗、别在有人打字时跑）见脚本头部注释。
 
 ### 注意
 

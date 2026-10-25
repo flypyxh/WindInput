@@ -396,13 +396,14 @@ fn full_exact(e: &PinyinEngine) -> wind_candidate::Candidate {
         .expect("应产出整句")
 }
 
-/// 系统词模糊节点的规范边界**优先用词条自带的真值**，而不是按变体切分推。
+/// 系统词模糊节点的词条边界与**变体边界**同域：有边界就必须对上某条切分展开出的变体边界，
+/// 对上了造词码就带这份边界。
 ///
-/// `xian` 在词图上取最少音节的 `any_path` = 一个音节，ian=iang 展开出变体 `xiang`（推得的
-/// 边界只有位 0）；词条「西昂」登记的真值却是 xi|ang（位 0/2）。造词码的边界要跟词条走，
-/// 否则学进去的「西昂多练」少一个音节，简拼索引算出的声母串是 `xdl` 而不是 `xadl`。
+/// 词条「西昂」登记的真值是 xi|ang（位 0/2）。只开 ian=iang 时 `xian` 只能整音节展开成
+/// `xiang`（位 0），切法对不上、不进图；开 an=ang 时 `xi|an → xi|ang` 对得上，造词码的边界
+/// 跟着走——否则学进去的「西昂多练」少一个音节，简拼索引算出的声母串是 `xdl` 而不是 `xadl`。
 #[test]
-fn system_fuzzy_node_canon_prefers_entry_boundary() {
+fn system_fuzzy_node_boundary_must_match_variant_segmentation() {
     let dir = std::env::temp_dir().join("wind_s2_canon_entry_boundary");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -411,20 +412,32 @@ fn system_fuzzy_node_canon_prefers_entry_boundary() {
     w.add_with_boundary("duolian".into(), vec![("多练".into(), 5000, 0, 0b1001)]);
     w.add_with_boundary("xiang".into(), vec![("西昂".into(), 5000, 0, 0b101)]);
     w.write(&wdat).unwrap();
-    let dict = CachedDict::load_at(&dir.join("t.dict.yaml"), &wdat).expect("加载 wdat 夹具");
-    let eng = PinyinEngine::new(PyConfig::default(), dict).with_fuzzy(
-        wind_engine::pinyin::fuzzy::FuzzyConfig {
-            ian_iang: true,
-            ..Default::default()
-        },
+    let sentence = |fz: wind_engine::pinyin::fuzzy::FuzzyConfig| {
+        let dict = CachedDict::load_at(&dir.join("t.dict.yaml"), &wdat).expect("加载 wdat 夹具");
+        PinyinEngine::new(PyConfig::default(), dict)
+            .with_fuzzy(fz)
+            .convert("xianduolian", 100)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .find(|c| c.is_sentence)
+    };
+
+    let c = sentence(wind_engine::pinyin::fuzzy::FuzzyConfig {
+        ian_iang: true,
+        ..Default::default()
+    });
+    assert!(
+        c.as_ref().is_none_or(|c| !c.text.contains("西昂")),
+        "只开 ian=iang 时「西昂」的切法对不上，不该进整句：{:?}",
+        c.map(|c| c.text)
     );
-    let c = eng
-        .convert("xianduolian", 100)
-        .unwrap()
-        .candidates
-        .into_iter()
-        .find(|c| c.is_sentence)
-        .expect("应产出整句");
+
+    let c = sentence(wind_engine::pinyin::fuzzy::FuzzyConfig {
+        an_ang: true,
+        ..Default::default()
+    })
+    .expect("应产出整句");
     assert_eq!(c.text, "西昂多练");
     // xi|ang|duo|lian → 位 0/2/5/8
     assert_eq!(

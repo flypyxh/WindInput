@@ -238,6 +238,11 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.english_merge.enable", Bool),
     f("schema.codetable.english_merge.min_length", Int),
     f("schema.codetable.english_merge.block_commit", Bool),
+    f("schema.codetable.english_merge.complete_min_length", Int),
+    f("schema.codetable.english_merge.block_commit_on_word", Bool),
+    f("schema.codetable.english_merge.exact_position", Int),
+    f("schema.codetable.english_merge.complete_position", Int),
+    f("schema.codetable.english_merge.max_count", Int),
     // 带参数的值域（`mix:<id>` / `special:<id>`）故用 Str 而非 Enum；解析与校验见 `BoundAction`。
     f("schema.codetable.z_key_action", Str),
     // 通配输入（万能键）。键是单个字面字符，值域无法枚举故用 Str；合法性见 `parse_wildcard_key`。
@@ -318,7 +323,10 @@ static REGISTRY: &[ConfigField] = &[
     // 拼音方案两者都没有，登记它等于教用户去配一件不成立的事。见 `PinyinEnglishMerge`。
     f("schema.pinyin.english_merge.enable", Bool),
     f("schema.pinyin.english_merge.min_length", Int),
-    f("schema.pinyin.english_merge.prefix_complete", Bool),
+    f("schema.pinyin.english_merge.complete_min_length", Int),
+    f("schema.pinyin.english_merge.exact_position", Int),
+    f("schema.pinyin.english_merge.complete_position", Int),
+    f("schema.pinyin.english_merge.max_count", Int),
     f("schema.pinyin.fuzzy.enabled", Bool),
     f("schema.pinyin.fuzzy.zh_z", Bool),
     f("schema.pinyin.fuzzy.ch_c", Bool),
@@ -371,8 +379,13 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.top_code_override_pinyin", Bool),
     f("schema.mix.auto_commit_block_on_pinyin", Bool),
     f("schema.mix.auto_commit_block_on_english", Bool),
+    f("schema.mix.block_commit_on_english_word", Bool),
     f("schema.mix.min_pinyin_length", Int),
     f("schema.mix.min_english_length", Int),
+    f("schema.mix.english_complete_min_length", Int),
+    f("schema.mix.english_exact_position", Int),
+    f("schema.mix.english_complete_position", Int),
+    f("schema.mix.english_max_count", Int),
     f("schema.mix.block_commit_on_pinyin_word", Bool),
     f("schema.mix.pinyin_word_min_weight", Int),
     f("schema.mix.enable_pinyin_abbrev", Bool),
@@ -403,6 +416,26 @@ static REGISTRY: &[ConfigField] = &[
     // 检索范围放宽（智能档增强，见 docs/design/smart-filter-scope-relax.md）
     f("input.scope_relax.page_end_key", Bool),
     f("input.scope_relax.prefix", Str),
+    f("input.correction.enabled", Bool),
+    f("input.correction.marker", Str),
+    f("input.correction.custom", StrList),
+    f("input.correction.rules.gn_ng", Bool),
+    f("input.correction.rules.on_ong", Bool),
+    f("input.correction.rules.vowel_swap", Bool),
+    f("input.correction.rules.legacy_spelling", Bool),
+    f("input.correction.rules.h_misplaced", Bool),
+    f("input.correction.rules.mg_ng", Bool),
+    f("input.correction.rules.n_before_g", Bool),
+    f("input.correction.rules.ai_ia", Bool),
+    f("input.correction.hint.enabled", Bool),
+    f("input.correction.hint.fuzzy", Bool),
+    f("input.correction.hint.misread", Bool),
+    f("input.correction.hint.correction", Bool),
+    f("input.correction.hint.tone", Bool),
+    f(
+        "input.correction.hint.scope",
+        Enum(crate::config::HintScope::VALUES),
+    ),
     f("input.enter_behavior", Enum(EMPTY_CODE_BEHAVIOR_VALUES)),
     f(
         "input.space_on_empty_behavior",
@@ -578,6 +611,7 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.activate_ime", Str),
     f("keys.pin_candidate", Str),
     f("keys.delete_candidate", Str),
+    f("keys.quick_input_select", Str),
     f("keys.take_screenshot", Str),
     f("keys.softkeyboard", Str),
     f("keys.global_hotkeys", StrList),
@@ -763,6 +797,9 @@ static REGISTRY: &[ConfigField] = &[
     f("mobile.association.kind", Enum(&["off", "word", "smart"])),
     f("mobile.association.mode", Enum(&["one_shot", "continuous"])),
     f("mobile.association.punct", Bool),
+    f("mobile.association.space_commits", Bool),
+    f("mobile.grammar.weight", Float),
+    f("mobile.grammar.model", Str),
 ];
 
 /// 返回配置字段注册表。
@@ -1015,6 +1052,26 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         (
             "schema.codetable.english_merge.block_commit",
             em.block_commit.is_some(),
+        ),
+        (
+            "schema.codetable.english_merge.complete_min_length",
+            em.complete_min_length.is_some(),
+        ),
+        (
+            "schema.codetable.english_merge.block_commit_on_word",
+            em.block_commit_on_word.is_some(),
+        ),
+        (
+            "schema.codetable.english_merge.exact_position",
+            em.exact_position.is_some(),
+        ),
+        (
+            "schema.codetable.english_merge.complete_position",
+            em.complete_position.is_some(),
+        ),
+        (
+            "schema.codetable.english_merge.max_count",
+            em.max_count.is_some(),
         ),
         // ── [engine.aux_code] ⇄ schema.pinyin.aux_code.* ──
         ("schema.pinyin.aux_code.enabled", aux.enabled.is_some()),

@@ -43,6 +43,30 @@ pub trait DictLayer: Send + Sync {
     /// 前缀查找
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate>;
 
+    /// 带音节上限的前缀查找：只取 [`crate::cached::prefix_capped_keep`] 放行的条目，
+    /// `limit` 名额只发给合格条目（拼音短输入严格档，见 `search_prefix_syllable_capped`）。
+    ///
+    /// 默认实现先按 [`Self::search_prefix`] 取再过滤，名额可能被不合格条目占掉；背后是
+    /// wdat 的层应覆盖它，让过滤参与剪枝。
+    fn search_prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<Candidate> {
+        let mut v = self.search_prefix(prefix, limit);
+        v.retain(|c| {
+            crate::cached::prefix_capped_keep(
+                c.boundary,
+                c.code.len(),
+                max_syllables,
+                completed_len,
+            )
+        });
+        v
+    }
+
     /// **按声母串查找**（简拼召回）：返回该层里声母投影等于 `abbrev` 的词条。
     ///
     /// 返回的是**超集**，调用方仍须逐条过自己的判据（音节数、逐段全等、混合模式校验）。

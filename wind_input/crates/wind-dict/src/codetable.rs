@@ -739,7 +739,7 @@ impl CodetableDict {
                 break;
             }
             for e in entries {
-                if !crate::cached::prefix_entry_keep(
+                if !crate::cached::prefix_capped_keep(
                     e.boundary,
                     code.len(),
                     max_syllables,

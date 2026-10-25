@@ -112,6 +112,9 @@ fn attach_parent_console() {
     }
 }
 
+/// 性能测试模式的标记文件名（放在本地数据目录，即 `logs\` 的上一级）。
+const PERF_PRELOAD_MARKER: &str = "perf_preload";
+
 fn main() {
     // CLI 子命令（config/schema/...）：在服务启动前拦截，处理完即退出。
     // 注意保持在单例检查之前——CLI 进程不该被「另一实例已运行」挡掉。
@@ -258,6 +261,13 @@ fn main() {
     // 2. 初始化日志（含启动滚动：至此才确定本实例会真正运行）
     init_logger();
     startup_trace::stage("logger-ready");
+
+    // 性能测试模式：本地数据目录下有 `perf_preload` 标记文件时，词库整份拷进内存，
+    // 排除 mmap 读盘对按键延迟的影响。须在加载任何词库之前打开。
+    if wind_config::Config::local_dir().is_some_and(|d| d.join(PERF_PRELOAD_MARKER).exists()) {
+        wind_dict::mapping::set_preload(true);
+        info!("性能测试模式：词库将整份载入内存（{PERF_PRELOAD_MARKER} 标记文件）");
+    }
 
     let pipe_suffix = wind_config::variant::pipe_suffix();
     let variant = if wind_config::variant::is_dev() {

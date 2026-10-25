@@ -57,7 +57,9 @@ impl EditKind {
             TextPath::UserDicts(_) => Some(EditKind::UserDicts),
             TextPath::Learned(Target::Temp, _) => Some(EditKind::Temp),
             TextPath::Learned(Target::Freq, _) => Some(EditKind::Freq),
-            TextPath::Learned(..) | TextPath::Completion | TextPath::Stats => None,
+            TextPath::Learned(..) | TextPath::Completion | TextPath::Stats | TextPath::Misread => {
+                None
+            }
         }
     }
 }
@@ -161,6 +163,9 @@ impl Store {
             TextPath::Learned(..) | TextPath::Completion | TextPath::Stats => {
                 anyhow::bail!("{} 由程序自动维护，不提供编辑", self.data_rel(&abs))
             }
+            TextPath::Misread => {
+                anyhow::bail!("{} 直接编辑即可，应用设置时生效", self.data_rel(&abs))
+            }
         };
         Ok((path, tp))
     }
@@ -227,7 +232,7 @@ impl Store {
                 }
             }
             TextPath::Learned(t, s) => self.prepare_learned_edit(*t, s)?,
-            TextPath::Completion | TextPath::Stats => {}
+            TextPath::Completion | TextPath::Stats | TextPath::Misread => {}
         }
         sessions.insert(
             path.clone(),
@@ -1060,6 +1065,31 @@ mod tests {
         assert!(s.locate_data_path(Some("..")).is_err());
         assert!(s.locate_data_path(Some("/etc")).is_err());
         assert!(s.locate_data_path(Some("pinyin/x.txt")).is_err());
+    }
+
+    /// 设置端「误读表 → 打开文件」：用户误读表在数据目录根下，与引擎读它的位置是同一个。
+    #[test]
+    fn locate_accepts_user_misread_table() {
+        let s = open("locate_misread");
+        let root = s.user_text_dir().to_path_buf();
+        assert_eq!(
+            s.locate_data_path(Some(crate::MISREAD_FILE)).unwrap(),
+            root.join("pinyin_misread.yaml")
+        );
+        assert!(
+            s.locate_data_path(Some("pinyin/pinyin_misread.yaml"))
+                .is_err()
+        );
+        assert!(s.begin_edit(crate::MISREAD_FILE).is_err(), "不走编辑会话");
+        assert_eq!(
+            s.reload_user_text_paths(&[root
+                .join(crate::MISREAD_FILE)
+                .to_string_lossy()
+                .into_owned()])
+                .unwrap(),
+            Vec::<String>::new(),
+            "误读表随配置重载生效，store 无事可做"
+        );
     }
 
     /// 用户数据锁被别的进程占着（引擎只读）⇒ begin 拒绝。

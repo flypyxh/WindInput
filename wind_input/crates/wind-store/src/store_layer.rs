@@ -74,6 +74,19 @@ impl DictLayer for StoreUserLayer {
         self.floor(self.inner.search_prefix(prefix, limit))
     }
 
+    fn search_prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<Candidate> {
+        self.floor(
+            self.inner
+                .search_prefix_capped(prefix, limit, max_syllables, completed_len),
+        )
+    }
+
     fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
         self.floor(self.inner.search_abbrev(abbrev, limit))
     }
@@ -136,6 +149,17 @@ impl DictLayer for StoreTempLayer {
 
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
         self.inner.search_prefix(prefix, limit)
+    }
+
+    fn search_prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<Candidate> {
+        self.inner
+            .search_prefix_capped(prefix, limit, max_syllables, completed_len)
     }
 
     fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {

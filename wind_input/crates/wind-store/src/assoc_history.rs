@@ -38,6 +38,16 @@ impl Store {
             .collect())
     }
 
+    /// 某方案的联想历史条数（联想里选过的词 + 学到的下一词）。整段扫一遍，别放按键路径上。
+    pub fn assoc_history_len(&self, schema: &str) -> usize {
+        let mut n = 0usize;
+        self.runtime().for_each_assoc(schema, &mut |_, _, _| {
+            n += 1;
+            true
+        });
+        n
+    }
+
     /// 清空某方案的联想历史，返回删除条数。
     pub fn clear_assoc_history(&self, schema: &str) -> anyhow::Result<usize> {
         self.runtime().clear_assoc(schema)

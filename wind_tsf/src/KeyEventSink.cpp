@@ -1,5 +1,7 @@
 #include "KeyEventSink.h"
 #include "DeferredCompositionPolicy.h"
+#include "CtrlAltCleanupPolicy.h"
+#include "CandidateHotkeyPolicy.h"
 #include "HoldReplayPolicy.h"
 #include "NumberKeyPolicy.h"
 #include "SpaceKeyPolicy.h"
@@ -1601,6 +1603,7 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // This is simpler and matches Weasel's architecture
     // 先清零重放标志：只有本次响应置的位才算数（见其声明处说明）。
     _pendingReplayToHost = FALSE;
+    _responseCommitted = FALSE;
     // 记下本次应答对应的按键：CommitThenDefer 据此只让**这个键**的 keyup 开延迟组合。
     _responseKeyVk = (UINT)wParam;
     *pfEaten = _HandleServiceResponse();
@@ -1694,9 +1697,11 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // If Go handled the key as a candidate operation (pin/delete) and the composition
     // is still active, respect Go's decision and eat the key. Only override to FALSE
     // when Go actually cleared the composition (e.g., Ctrl+S cleanup).
+    // 上屏了候选（快捷输入选词键）同样算服务端用掉了这一键，判据见 CtrlAltCleanupPolicy.h。
     if (isCtrlAltCleanup && *pfEaten)
     {
-        if (_hasCandidates || _isComposing)
+        if (!wind::ctrlalt::ShouldReturnToHost(_hasCandidates != FALSE, _isComposing != FALSE,
+                                               _responseCommitted != FALSE))
         {
             // Go handled it as a candidate action (e.g., Ctrl+number pin/delete),
             // composition still active — keep pfEaten=TRUE to prevent app from seeing the key.
@@ -2217,12 +2222,31 @@ BOOL CKeyEventSink::DispatchHotkey(uint32_t vk, uint32_t mods)
     //   - AddWord（Ctrl+= 等）：中文+文本框时经全局拦截规避 Chromium 宿主双处理。
     //     composition 由 _HandleServiceResponse 处理 UpdateComposition 建立；caret 定位
     //     由 WM_HOTKEY 分发处先行 SendCaretPositionUpdate 补齐（见 TextService WndProc）。
+    //   - 快捷输入选词键（出厂与置顶同为 Ctrl+数字）/ Alt+数字上屏注释：响应是 CommitText。
+    //
+    // ★ 这里不在按键处理期间（裸 WM_HOTKEY 窗口消息回调），上屏须按 nonKeyContext 走异步
+    // 会话：Word 会拒发此时的 TF_ES_SYNC（见 CTextService::CommitText 的 nonKeyContext 分支）。
+    //
+    // 返回值是「这个键要不要交还宿主」：服务端没收到，或响应是交还类（GivesBackToHost）。
+    // 系统热键已把原键吃下，交还只能由调用方注入（见 TextService WndProc 与
+    // CandidateHotkeyPolicy.h 的 OnHotkeyDispatched）。
     if (!_SendKeyToService(vk, mods, KEY_EVENT_DOWN))
     {
         WIND_LOG_ERROR_FMT(L"DispatchHotkey: _SendKeyToService failed vk=0x%02X mods=0x%04X\n", vk, mods);
-        return FALSE;
+        return TRUE;
     }
-    return _HandleServiceResponse();
+    // 保存/恢复而非置 TRUE/FALSE：响应处理里若重入了别的热键派发，内层不能把外层复位。
+    const BOOL prevInHotkeyDispatch = _inHotkeyDispatch;
+    _inHotkeyDispatch = TRUE;
+    // 接收失败时 responseType 保持 Error ⇒ 不交还：键已送达，服务端可能已经处理过它，
+    // 再注入一次就是重复执行。
+    ResponseType responseType = ResponseType::Error;
+    _HandleServiceResponse(&responseType);
+    // ClearCompositionThenPassThrough 分支置的重放位是给 OnKeyDown 的，这里按响应类型判，
+    // 位清掉免得残留到下一次按键。
+    _pendingReplayToHost = FALSE;
+    _inHotkeyDispatch = prevInHotkeyDispatch;
+    return wind::candhotkey::GivesBackToHost(responseType) ? TRUE : FALSE;
 }
 
 BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint8_t eventType)
@@ -2350,7 +2374,7 @@ BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint
     return result;
 }
 
-BOOL CKeyEventSink::_HandleServiceResponse()
+BOOL CKeyEventSink::_HandleServiceResponse(ResponseType* outType)
 {
     LARGE_INTEGER startTime, midTime, freq;
     QueryPerformanceCounter(&startTime);
@@ -2379,7 +2403,7 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         WIND_LOG_ERROR(L"Failed to receive response from service, performing local composition reset");
         if (_pTextService->HasActiveComposition())
         {
-            _pTextService->EndComposition();
+            _pTextService->EndComposition(nullptr, _inHotkeyDispatch);
         }
         _isComposing = FALSE;
         _hasCandidates = FALSE;
@@ -2405,9 +2429,12 @@ BOOL CKeyEventSink::_HandleServiceResponse()
     }
 
     // 响应成功 → 状态由下方 switch 各分支按权威重建, 清 resync 旗 + 失败计数。
+    if (outType != nullptr) *outType = response.type;
     _needsCompositionResync = FALSE;
     _resyncDeadline = 0;
     _resyncFailStreak = 0;
+    // 上屏类响应记一笔，供 OnKeyDown 的 Ctrl/Alt cleanup 判定（见 CtrlAltCleanupPolicy.h）。
+    _responseCommitted = wind::ctrlalt::ResponseCommitsText(response.type) ? TRUE : FALSE;
 
     QueryPerformanceCounter(&midTime);
     int ipcMs = (int)((midTime.QuadPart - startTime.QuadPart) * 1000 / freq.QuadPart);
@@ -2423,7 +2450,7 @@ BOOL CKeyEventSink::_HandleServiceResponse()
     case ResponseType::PassThrough:
         // PassThrough means key was NOT handled, pass to system
         WIND_LOG_DEBUG(L"PassThrough: key not handled, passing to system\n");
-        _pTextService->FlushHoldCompositionIfActive();
+        _pTextService->FlushHoldCompositionIfActive(_inHotkeyDispatch);
         if (_pTextService->HasDeferredComposition())
             _pTextService->StartDeferredCompositionIfPending();
         return FALSE;
@@ -2455,7 +2482,8 @@ BOOL CKeyEventSink::_HandleServiceResponse()
                 // No new composition, commit text atomically (end composition + insert in one EditSession)
                 // replacingHeld：智能符号 press2 要覆盖 hold 预览态里的中文符号；其余提交
                 // 路径为 FALSE，held 符号并入前缀一起上屏（见 CTextService::CommitText）。
-                _pTextService->CommitText(response.text, FALSE, response.replacingHeld ? TRUE : FALSE);
+                _pTextService->CommitText(response.text, _inHotkeyDispatch,
+                                          response.replacingHeld ? TRUE : FALSE);
                 QueryPerformanceCounter(&ctMid1);
 
                 // 上屏文本末位即新的「光标前一字符」，据此维护输入序列记账（见 header 注释）。
@@ -2520,23 +2548,24 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         _isComposing = FALSE;
         _hasCandidates = FALSE;
         _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
-        _pTextService->EndComposition();
+        _pTextService->EndComposition(nullptr, _inHotkeyDispatch);
         return TRUE;
 
     case ResponseType::ClearCompositionThenPassThrough:
         // 与上一分支同样收组合，区别只在**这一键要还给宿主**（联想态透传：回车/退格，
-        // 以及 Del/Home/End/←→/Insert 等其余落到透传的键）。本分支与键码无关，服务端
-        // 判定改了也不必动这里。
+        // Del/Home/End/←→/Insert 与 Ctrl/Alt 组合等其余落到透传的键）。本分支与键码无关，
+        // 服务端判定改了也不必动这里。
         //
         // 这里仍返回 TRUE（吃掉原键）：OnTestKeyDown 已按「有会话」吃了它，此处吐 FALSE
         // 就是「吃了再吐」翻转，EverEdit 这类不补发 WM_KEYDOWN 的宿主会直接丢键（实测
-        // vk=0x0D）。改由 OnKeyDown 在收口完成后 SendInput 重放一个干净的按键——宿主先
-        // 看到收口后的文档，再看到一个与组合无关的普通回车/退格。同 hold / 配对跳出。
+        // vk=0x0D）。交还由两个按键入口在收口完成后 SendInput 重放一个干净的按键——宿主先
+        // 看到收口后的文档，再看到一个与组合无关的普通按键。OnKeyDown 读下面这一位；
+        // DispatchHotkey（WM_HOTKEY 已被系统吃下）按响应类型判，由 WndProc 注入。
         WIND_LOG_DEBUG(L"Received ClearCompositionThenPassThrough from service\n");
         _isComposing = FALSE;
         _hasCandidates = FALSE;
         _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
-        _pTextService->EndComposition();
+        _pTextService->EndComposition(nullptr, _inHotkeyDispatch);
         _pendingReplayToHost = TRUE;
         return TRUE;
 
@@ -2576,7 +2605,7 @@ BOOL CKeyEventSink::_HandleServiceResponse()
     case ResponseType::InsertTextWithCursor:
         {
             WIND_LOG_DEBUG(L"Processing InsertTextWithCursor response\n");
-            _pTextService->CommitText(response.text);
+            _pTextService->CommitText(response.text, _inHotkeyDispatch);
             // 输入序列记账：cursorOffset==0 时末位就是光标前一字符；cursorOffset>0（配对
             // 插入后光标回退到中间）时光标前其实是左符号，末位取的是右符号——但两者都是
             // 配对符号、都不是数字，结论同为清零，故无须为配对单独分支。
@@ -2626,6 +2655,9 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             // （已知 Chromium/Qt 部分宿主的 TSFTextStore 会谎报替换成功，届时若仍需要
             // 兼容，走按宿主进程名特判，而不是默认全局改用合成按键——见
             // ReplacePrecedingChars 里 kTryTsfRangeReplace 的取舍说明）。
+            //
+            // 热键派发期间不另传非按键上下文：同步会话被拒时本就落到 SendInput，那条不要编辑锁，
+            // 也没有组合会残留（与 CommitText 的 Word 泄漏不同形）。
             WIND_LOG_DEBUG(L"Processing ReplaceBackward response (smart symbol)\n");
             _pTextService->ReplacePrecedingChars(response.replaceCount, response.text);
             _isComposing = FALSE;
@@ -2674,7 +2706,7 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             WIND_LOG_DEBUG_FMT(L"Processing CommitThenDefer: commit=%ls defer=%ls timeoutMs=%u\n",
                                response.text.c_str(), response.newComposition.c_str(),
                                response.holdTimeoutMs);
-            _pTextService->CommitText(response.text);
+            _pTextService->CommitText(response.text, _inHotkeyDispatch);
             // 不记输入序列：余码组合随后就开，光标前是组合内容而非 response.text 末位
             // （同 restartComposition 分支的理由）。
             _isComposing = FALSE;
@@ -3418,11 +3450,11 @@ void CKeyEventSink::_ReplayKeyToHost(WORD vk)
     {
         // 注入失败＝这个键彻底消失（原键已被我们吃掉），且用户毫无感知。
         // 必须留痕：否则现象是「hold 后按某键偶尔没反应」，无从诊断。
-        WIND_LOG_WARN_FMT(L"HoldReplay: SendInput sent %u of 2 for vk=0x%02X, key lost\n",
+        WIND_LOG_WARN_FMT(L"Replay: SendInput sent %u of 2 for vk=0x%02X, key lost\n",
                           sent, (uint32_t)vk);
         return;
     }
-    WIND_LOG_DEBUG_FMT(L"HoldReplay: replayed vk=0x%02X to host after commit\n", (uint32_t)vk);
+    WIND_LOG_DEBUG_FMT(L"Replay: replayed vk=0x%02X to host\n", (uint32_t)vk);
 }
 
 bool CKeyEventSink::_AreModifiersHeld()

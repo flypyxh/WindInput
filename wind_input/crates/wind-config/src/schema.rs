@@ -525,6 +525,16 @@ pub struct CodeTableEnglishMergeSpec {
     pub min_length: Option<usize>,
     #[serde(default)]
     pub block_commit: Option<bool>,
+    #[serde(default)]
+    pub complete_min_length: Option<usize>,
+    #[serde(default)]
+    pub block_commit_on_word: Option<bool>,
+    #[serde(default)]
+    pub exact_position: Option<usize>,
+    #[serde(default)]
+    pub complete_position: Option<usize>,
+    #[serde(default)]
+    pub max_count: Option<usize>,
 }
 
 /// 方案级调频覆盖（`[engine.codetable.frequency]`），**逐字段稀疏**。

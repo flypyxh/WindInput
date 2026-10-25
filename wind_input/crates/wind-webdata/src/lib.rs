@@ -581,6 +581,9 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         // ── appearance.*（设置页预览，text-span-colors.md §11）──
         "appearance.previewTemplate" => h.web_appearance_preview_template(params),
 
+        // ── correction.*（拼写纠错，设置页自定义规则行的冲突示例）──
+        "correction.conflictExample" => correction_conflict_example(params),
+
         // ── theme.* ──────────────────────────────────────────
         "theme.list" => h.web_theme_list(),
         "theme.resolved" => Ok(serde_json::to_value(h.theme_follow_values())?),
@@ -604,6 +607,16 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
 
         other => anyhow::bail!("unknown method: {}", other),
     }
+}
+
+/// `correction.conflictExample {rule}` → `{valid:true, example}`（无冲突时 example 为 null）
+/// 或 `{valid:false, reason}`。判据与引擎同源（`wind_engine::pinyin::correction`）。
+fn correction_conflict_example(params: &Value) -> anyhow::Result<Value> {
+    use wind_engine::pinyin::correction::custom_rule_conflict;
+    Ok(match custom_rule_conflict(str_param(params, "rule")?) {
+        Ok(example) => json!({ "valid": true, "example": example }),
+        Err(reason) => json!({ "valid": false, "reason": reason }),
+    })
 }
 
 /// 数据文件问题 → 设置页用的 JSON（路径相对数据目录、`/` 分隔）。
@@ -5290,6 +5303,35 @@ outside: rare
         assert_eq!(
             at(json!({"path": "wubi86/user.dict.yaml"})).unwrap()["exists"],
             false
+        );
+        assert_eq!(
+            at(json!({"path": "pinyin_misread.yaml"})).unwrap()["path"],
+            root.join("pinyin_misread.yaml").to_string_lossy().as_ref(),
+            "设置端「误读表 → 打开文件」"
+        );
+    }
+
+    /// `correction.conflictExample`：设置页自定义纠错规则行的冲突示例。
+    #[test]
+    fn correction_conflict_example_contract() {
+        let c = coord("correction_conflict");
+        let call = |rule: &str| {
+            c.web_data_rpc("correction.conflictExample", &json!({ "rule": rule }))
+                .unwrap()
+        };
+        let r = call("uen=un");
+        assert_eq!(r["valid"], true, "{r}");
+        assert!(r["example"].as_str().unwrap().ends_with("u+en"), "{r}");
+        assert_eq!(call("ioa=iao"), json!({ "valid": true, "example": null }));
+        let bad = call("ogn");
+        assert_eq!(bad["valid"], false, "{bad}");
+        assert!(
+            bad["reason"].as_str().is_some_and(|s| !s.is_empty()),
+            "{bad}"
+        );
+        assert!(
+            c.web_data_rpc("correction.conflictExample", &json!({}))
+                .is_err()
         );
     }
 

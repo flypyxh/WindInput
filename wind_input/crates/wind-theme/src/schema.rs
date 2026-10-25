@@ -314,7 +314,7 @@ pub struct ViewNode {
 
     /// 文字角色色（分段着色，设计 text-span-colors.md §5）：角色名 → 颜色，值的写法同 `color`。
     /// `""` = 未设置（派生主题借此撤销 base 配的某个角色）。只有 `comment`（含 `selected` /
-    /// `hover`）、`comment_above` 与 `tooltip` 消费；角色名不校验——更新版本的主题在旧引擎上应静默忽略。
+    /// `hover`）、`comment_above`、`tooltip` 消费，另有 `text` 的 `pinyin_hint`（正确拼音提示段）；角色名不校验——更新版本的主题在旧引擎上应静默忽略。
     #[serde(default)]
     pub roles: std::collections::HashMap<String, Ld>,
 

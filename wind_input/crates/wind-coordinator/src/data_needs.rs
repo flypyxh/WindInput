@@ -27,6 +27,8 @@ use wind_engine::EngineManager;
 ///
 /// `code_rev` 也算用户层：它取的 `hint_code` 在系统层该长度没有码时会回落用户码。
 const CODE_REV_VARS: &[&str] = &["code_rev", "code", "code_rev_all", "code_all"];
+/// 正确拼音提示的变量名。
+const CORRECT_PINYIN_VAR: &str = "correct_pinyin";
 /// 拆字表的变量名。
 const CHAIZI_VARS: &[&str] = &["chaizi", "chaizi_code", "chaizi_all", "chaizi_code_all"];
 
@@ -43,6 +45,9 @@ pub(crate) struct DataNeeds {
     pub(crate) s2t: bool,
     /// 繁入简出转换器（`input.t2s.enabled`，与 s2t 互斥时让位）。
     pub(crate) t2s: bool,
+    /// 任一层注释模板或启用的悬停段引用 `${correct_pinyin}`：`hint` 关着也要让拼音引擎算正确拼音
+    /// 提示（`EngineManager::set_correct_pinyin_in_templates`）。
+    pub(crate) correct_pinyin: bool,
 }
 
 /// 判定材料里要问 `EngineManager` 的那部分。
@@ -164,6 +169,11 @@ impl DataNeeds {
                 ((*in_temp && temp_rev) || (*in_main && main_rev)) && refs_any(t, CODE_REV_VARS)
             });
         let comment_chaizi = comment_on && layers.iter().any(|(t, _, _)| refs_any(t, CHAIZI_VARS));
+        let correct_pinyin = (comment_on
+            && layers
+                .iter()
+                .any(|(t, _, _)| refs_any(t, &[CORRECT_PINYIN_VAR])))
+            || tip_any(&[CORRECT_PINYIN_VAR]);
 
         let tip_code = tip_any(&["word_code", "code_source"]) || tip_any(CODE_REV_VARS);
         let mobile = crate::handle_assoc::use_mobile_overrides().then_some(&cfg.mobile.association);
@@ -181,6 +191,7 @@ impl DataNeeds {
             chaizi: comment_chaizi || tip_any(CHAIZI_VARS),
             s2t,
             t2s,
+            correct_pinyin,
         }
     }
 }
@@ -243,8 +254,10 @@ mod tests {
                 chaizi: false,
                 s2t: false,
                 t2s: false,
+                correct_pinyin: false,
             },
-            "出厂：悬停[编码]开着 ⇒ 反查与用户层要；拆字段关着、注释不含拆字；简繁两向都关"
+            "出厂：悬停[编码]开着 ⇒ 反查与用户层要；拆字段关着、注释不含拆字；简繁两向都关；\
+             模板不含 ${{correct_pinyin}}"
         );
         assert_eq!(derive(&Config::default()), n, "L1 与 L2 在这几项上应一致");
     }
@@ -399,6 +412,90 @@ mod tests {
             }
         }
         assert!(derive(&c).chaizi, "出厂拆字段打开 ⇒ 要");
+    }
+
+    /// `${correct_pinyin}`：注释模板的每一个模板位（全局横竖、方案级、模式级各家、overlay）与
+    /// 悬停段（候选上下文回落 `eval_var`）都算；注释总开关关着时注释那些位不算。
+    #[test]
+    fn correct_pinyin_in_every_template_slot() {
+        const V: &str = "{(${correct_pinyin})}";
+        let base = factory();
+        assert!(!derive(&base).correct_pinyin, "前置条件：出厂不引用");
+        type Edit = fn(&mut Config);
+        let slots: [(&str, Edit); 16] = [
+            ("全局竖", |c| {
+                c.ui.candidate.comment_template_vertical = V.into()
+            }),
+            ("全局横", |c| {
+                c.ui.candidate.comment_template_horizontal = V.into()
+            }),
+            ("快捷输入竖", |c| {
+                c.schema.mix_modes[0].comment_template_vertical = Some(V.into())
+            }),
+            ("快捷输入横", |c| {
+                c.schema.mix_modes[0].comment_template_horizontal = Some(V.into())
+            }),
+            ("临拼竖", |c| {
+                c.input.temp_pinyin.comment_template_vertical = Some(V.into())
+            }),
+            ("临拼横", |c| {
+                c.input.temp_pinyin.comment_template_horizontal = Some(V.into())
+            }),
+            ("临英竖", |c| {
+                c.input.temp_english.comment_template_vertical = Some(V.into())
+            }),
+            ("临英横", |c| {
+                c.input.temp_english.comment_template_horizontal = Some(V.into())
+            }),
+            ("网址竖", |c| {
+                c.input.url.comment_template_vertical = Some(V.into())
+            }),
+            ("网址横", |c| {
+                c.input.url.comment_template_horizontal = Some(V.into())
+            }),
+            ("邮箱竖", |c| {
+                c.input.email.comment_template_vertical = Some(V.into())
+            }),
+            ("邮箱横", |c| {
+                c.input.email.comment_template_horizontal = Some(V.into())
+            }),
+            ("Unicode竖", |c| {
+                c.input.unicode.comment_template_vertical = Some(V.into())
+            }),
+            ("Unicode横", |c| {
+                c.input.unicode.comment_template_horizontal = Some(V.into())
+            }),
+            ("悬停段", |c| {
+                c.ui.tooltip.sections[0].template = V.into();
+                c.ui.tooltip.sections[0].enabled = true;
+            }),
+            ("回退链里", |c| {
+                c.ui.candidate.comment_template_vertical = "${code_hint|correct_pinyin}".into()
+            }),
+        ];
+        for (name, edit) in slots {
+            let mut c = base.clone();
+            edit(&mut c);
+            assert!(derive(&c).correct_pinyin, "{name}");
+        }
+        for facts in [
+            SchemaFacts {
+                schema_templates: vec![V.into()],
+                ..Default::default()
+            },
+            SchemaFacts {
+                overlay_templates: vec![V.into()],
+                ..Default::default()
+            },
+        ] {
+            assert!(DataNeeds::derive(&base, &facts).correct_pinyin, "{facts:?}");
+            let mut off = base.clone();
+            off.ui.candidate.comment_enabled = false;
+            assert!(
+                !DataNeeds::derive(&off, &facts).correct_pinyin,
+                "注释总开关关：{facts:?}"
+            );
+        }
     }
 
     // ───────────────────── 两个总开关（设计 §4.3，S2） ─────────────────────
@@ -1037,6 +1134,88 @@ mod tests {
             has_chaizi(&c),
             "配置里仍没有拆字消费者，但运行期装的不该被卸"
         );
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── ${correct_pinyin}：翻转不重建引擎 ─────────────────────
+
+    /// 自造拼音方案：「中国」一词，开 zh↔z，`hint` 关。
+    fn fuzzy_fixture() -> (PathBuf, Config) {
+        let dir = std::env::temp_dir().join(format!("wind_dn_{}_fzpy", std::process::id()));
+        let schemas = dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(schemas.join("fh")).unwrap();
+        std::fs::write(
+            schemas.join("fh/mini.dict.yaml"),
+            "---\nname: mini\nversion: \"1\"\nsort: by_weight\n...\n中国\tzhong guo\t3000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("fh.schema.toml"),
+            "[schema]\nid = \"fh\"\nname = \"fh\"\n[engine]\ntype = \"pinyin\"\n\
+             [[dictionaries]]\nid = \"mini\"\npath = \"fh/mini.dict.yaml\"\n\
+             type = \"rime_pinyin\"\ndefault = true\n",
+        )
+        .unwrap();
+        let mut c = Config::default();
+        c.schema.available = vec!["fh".into()];
+        c.schema.active = "fh".into();
+        c.input.default.chinese_mode = true;
+        c.schema.pinyin.fuzzy.enabled = true;
+        c.schema.pinyin.fuzzy.zh_z = true;
+        c.input.correction.hint.enabled = false;
+        (dir, c)
+    }
+
+    /// 清空输入后敲 `zongguo`，取候选「中国」的注释（候选窗同一求值链）。
+    fn zhongguo_comment(c: &Coordinator) -> String {
+        use wind_bridge::handler::{KeyEventData, MessageHandler};
+        let key = |key_code: u32| KeyEventData {
+            key_code,
+            scan_code: 0,
+            modifiers: 0,
+            event_type: wind_ipc::protocol::EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        };
+        c.handle_key_event(&key(0x1B));
+        for ch in "ZONGGUO".chars() {
+            c.handle_key_event(&key(ch as u32));
+        }
+        let st = c.state.lock().unwrap();
+        let cand = st
+            .candidates
+            .iter()
+            .find(|x| x.text == "中国")
+            .unwrap_or_else(|| panic!("应有「中国」：{:?}", st.candidates))
+            .clone();
+        c.alt_commit_text(&st, &cand, wind_config::config::AltCommit::Comment)
+    }
+
+    /// 热重载加上 / 去掉 `${correct_pinyin}`：变量随之出现 / 消失，引擎不重建（只翻提示开关）。
+    #[test]
+    fn correct_pinyin_template_toggle_does_not_rebuild_engine() {
+        let (dir, cfg) = fuzzy_fixture();
+        let c = Coordinator::new_headless(cfg, Some(&dir));
+        assert_eq!(zhongguo_comment(&c), "", "出厂模板不引用");
+        let built = c.engine_mgr.engines_generation();
+
+        let set_tpl = |tpl: &str| {
+            c.refresh_config_in_memory(|cfg| {
+                cfg.ui.candidate.comment_template_vertical = tpl.into();
+                cfg.ui.candidate.comment_template_horizontal = tpl.into();
+            });
+            c.apply_data_needs();
+        };
+        set_tpl("${correct_pinyin}");
+        assert!(c.engine_mgr.pinyin_hint_active());
+        assert_eq!(zhongguo_comment(&c), "zhong guo");
+        set_tpl("");
+        assert!(!c.engine_mgr.pinyin_hint_active());
+        assert_eq!(zhongguo_comment(&c), "");
+        assert_eq!(c.engine_mgr.engines_generation(), built, "翻转不该重建引擎");
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -338,3 +338,90 @@ fn assoc_key_path_latency_heavy_user() {
         pct(&mut space, 1.0)
     );
 }
+
+/// 「下一个想要的」评测：事件文件由 `scripts/lm/assoc_eval_prep.py` 生成，每行
+/// `前文<TAB>上屏<TAB>后文`。候选条上第 k 格（显示文本）是后文的开头即命中——与切词口径
+/// 无关，「们」「们的」都算对，句末给「？」也算。
+///
+/// ```text
+/// WIND_ASSOC_NEXT_EVAL=events_word.tsv,events_char.tsv \
+///   cargo test -p wind-coordinator --test assoc_eval assoc_next_eval -- --ignored --nocapture
+/// ```
+///
+/// 配置同手机出厂（智能联想、带标点、9 格），拼音方案（前缀词按拼音词库），空用户库。
+/// 每个文件跑两遍：带前文（宿主报了光标前文）与不带（只看刚上屏的）。文件名含 `char`
+/// 的按逐字上屏的用户算（运行时是形码方案，见 `Coordinator::assoc_char_wise`）。
+#[test]
+#[ignore = "评测工具：依赖 build_dev 词库与评测事件文件，手动跑"]
+fn assoc_next_eval() {
+    let Ok(files) = std::env::var("WIND_ASSOC_NEXT_EVAL") else {
+        eprintln!("!!! 跳过：未设 WIND_ASSOC_NEXT_EVAL");
+        return;
+    };
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["pinyin".to_string()];
+    cfg.schema.active = "pinyin".to_string();
+    cfg.input.default.chinese_mode = true;
+    cfg.input.association.kind = "smart".to_string();
+    cfg.input.association.punct = true;
+    cfg.input.association.max_count = 9;
+    let c = Coordinator::new_headless(cfg, Some(&data_dir()));
+    c.prewarm_indexes();
+
+    println!("文件\t前文\t事件\tTop1\tTop3\tTop9\tMRR\t有联想\t标点 Top3\t字词 Top3");
+    for file in files.split(',').filter(|f| !f.is_empty()) {
+        let text = std::fs::read_to_string(file).expect("读评测事件");
+        let events: Vec<(&str, &str, &str)> = text
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split('\t');
+                Some((it.next()?, it.next()?, it.next()?))
+            })
+            .collect();
+        let name = Path::new(file)
+            .file_name()
+            .map_or(file.into(), |n| n.to_string_lossy());
+        let char_wise = name.contains("char");
+        for with_ctx in [true, false] {
+            let (mut top1, mut top3, mut top9, mut rr, mut any) = (0, 0, 0, 0.0, 0);
+            let (mut punct_n, mut punct3, mut word_n, mut word3) = (0, 0, 0, 0);
+            for &(pre, commit, rest) in &events {
+                let shown =
+                    c.debug_assoc_display(if with_ctx { pre } else { "" }, commit, char_wise);
+                let rank = shown
+                    .iter()
+                    .position(|s| !s.is_empty() && rest.starts_with(s.as_str()));
+                any += usize::from(!shown.is_empty());
+                if let Some(r) = rank {
+                    top1 += usize::from(r == 0);
+                    top3 += usize::from(r < 3);
+                    top9 += usize::from(r < 9);
+                    rr += 1.0 / (r + 1) as f64;
+                }
+                let hit3 = usize::from(rank.is_some_and(|r| r < 3));
+                if rest.chars().next().is_some_and(is_cjk) {
+                    word_n += 1;
+                    word3 += hit3;
+                } else {
+                    punct_n += 1;
+                    punct3 += hit3;
+                }
+            }
+            let n = events.len().max(1) as f64;
+            let p = |k: usize| format!("{:.1}%", k as f64 / n * 100.0);
+            let q = |k: usize, d: usize| format!("{:.1}%", k as f64 / d.max(1) as f64 * 100.0);
+            println!(
+                "{name}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}",
+                if with_ctx { "带" } else { "不带" },
+                events.len(),
+                p(top1),
+                p(top3),
+                p(top9),
+                rr / n,
+                p(any),
+                q(punct3, punct_n),
+                q(word3, word_n),
+            );
+        }
+    }
+}

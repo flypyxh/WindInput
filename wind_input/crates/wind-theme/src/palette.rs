@@ -42,6 +42,35 @@ pub fn parse_hex(s: &str) -> Option<Rgba> {
     }
 }
 
+/// WCAG 2 相对亮度对比度（1.0 – 21.0），只看 RGB、忽略 alpha。
+pub fn contrast_ratio(a: Rgba, b: Rgba) -> f64 {
+    fn lum(c: Rgba) -> f64 {
+        let f = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+    }
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// `a` 与 `b` 的对比度达到 `min`（含恰好等于）。
+pub fn meets_contrast(a: Rgba, b: Rgba, min: f64) -> bool {
+    contrast_ratio(a, b) >= min
+}
+
+/// `top` 按自身 alpha 叠在不透明的 `under` 上，结果不透明。
+pub fn composite_over(top: Rgba, under: Rgba) -> Rgba {
+    let a = f64::from(top[3]) / 255.0;
+    let mix = |i: usize| (f64::from(top[i]) * a + f64::from(under[i]) * (1.0 - a)).round() as u8;
+    [mix(0), mix(1), mix(2), 255]
+}
+
 /// 解析整个调色板：colors 段（Mapping）→ {名称: Rgba}。
 /// is_dark 选择 {light,dark} 变体。derive 等非颜色项被忽略。
 pub fn resolve_palette(colors: Option<&Value>, is_dark: bool) -> HashMap<String, Rgba> {
@@ -143,6 +172,65 @@ pub fn color_token(v: &Value, palette: &HashMap<String, Rgba>, is_dark: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WHITE: Rgba = [255, 255, 255, 255];
+    const BLACK: Rgba = [0, 0, 0, 255];
+
+    #[test]
+    fn contrast_ratio_extremes_and_symmetry() {
+        assert_eq!(contrast_ratio(BLACK, WHITE), 21.0);
+        assert_eq!(contrast_ratio(WHITE, BLACK), 21.0, "与参数顺序无关");
+        assert_eq!(contrast_ratio([10, 20, 30, 255], [10, 20, 30, 255]), 1.0);
+        assert_eq!(
+            contrast_ratio([0, 0, 0, 0], WHITE),
+            21.0,
+            "只看 RGB、忽略 alpha"
+        );
+    }
+
+    /// 3:1 两侧最近的灰：`#949494` 对白底刚过、`#959595` 刚不过（WCAG 公式的已知值）。
+    #[test]
+    fn contrast_ratio_grays_around_three() {
+        let above = contrast_ratio([0x94, 0x94, 0x94, 255], WHITE);
+        let below = contrast_ratio([0x95, 0x95, 0x95, 255], WHITE);
+        assert!((above - 3.0335).abs() < 1e-4 && above > 3.0, "{above}");
+        assert!((below - 2.9953).abs() < 1e-4 && below < 3.0, "{below}");
+    }
+
+    /// 恰为阈值算达标（`>=`），高出一点点的阈值不达标。实色对的对比度凑不出恰好 3.0，故用
+    /// 某对颜色自身的对比度当阈值。
+    #[test]
+    fn meets_contrast_is_inclusive_at_threshold() {
+        let (a, b) = ([0x94, 0x94, 0x94, 255], WHITE);
+        let exact = contrast_ratio(a, b);
+        assert!(meets_contrast(a, b, exact));
+        assert!(!meets_contrast(a, b, exact * (1.0 + f64::EPSILON)));
+        assert!(meets_contrast(BLACK, WHITE, 21.0));
+    }
+
+    #[test]
+    fn composite_over_blends_by_top_alpha() {
+        let red_half = [255, 0, 0, 128];
+        assert_eq!(
+            composite_over(red_half, [0, 0, 255, 255]),
+            [128, 0, 127, 255]
+        );
+        assert_eq!(
+            composite_over([1, 2, 3, 255], WHITE),
+            [1, 2, 3, 255],
+            "不透明顶层整体替换"
+        );
+        assert_eq!(
+            composite_over([1, 2, 3, 0], [9, 8, 7, 255]),
+            [9, 8, 7, 255],
+            "全透明顶层不改底"
+        );
+        assert_eq!(
+            composite_over([0, 0, 0, 51], [200, 100, 50, 128])[3],
+            255,
+            "结果恒不透明"
+        );
+    }
 
     #[test]
     fn test_parse_hex() {

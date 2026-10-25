@@ -119,7 +119,8 @@ fn pinyin_merge_silent_when_chinese_side_has_candidates() {
     );
 }
 
-/// 混输（`schema.mix.enable_english`）：`github` 从 8 条降到只剩精确的那条。
+/// 混输（`schema.mix.enable_english`）：中文侧有候选时（`hen`）只收精确命中；`github` 中文侧
+/// 为空，按码表方案同口径给前缀补全（至多一页，不再是 8 条长词组刷屏）。
 ///
 /// ⚠️ `enable_english` 必须显式打开：出厂 false 在 L1（`Config::default()`），
 /// 而实际发布的出厂值与用户配置都在 L2/L3。不设这行本用例整个空转、却照样 `ok`。
@@ -135,9 +136,12 @@ fn mixed_keeps_only_exact() {
     cfg.schema.mix.min_english_length = 3;
     let mgr = EngineManager::new(&cfg, Some(&dir));
 
+    // `github` 中文侧为空：与码表方案同口径给一页前缀补全，精确词居首。
     let en = english_texts(&mgr.convert("github", 50));
-    assert_eq!(en.len(), 1, "混输下 github 应只剩精确命中一条，实际 {en:?}");
-    assert!(en[0].eq_ignore_ascii_case("github"));
+    assert!(
+        (1..=5).contains(&en.len()) && en[0].eq_ignore_ascii_case("github"),
+        "中文侧为空时应给至多一页补全且精确词居首，实际 {en:?}"
+    );
 
     let en_hen = english_texts(&mgr.convert("hen", 50));
     for t in &en_hen {

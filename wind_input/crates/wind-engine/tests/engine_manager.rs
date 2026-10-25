@@ -203,7 +203,7 @@ fn english_merge_vetoes_top_code_on_codetable() {
         eprintln!("跳过：wubi86 schema 或英文词库不存在");
         return;
     }
-    let build = |block: bool| {
+    let build = |block: bool, word: bool| {
         let mut cfg = make_config(&["wubi86"]);
         // ⚠️ 顶码开关必须显式打开：出厂值 true 在 **L2**（data/config.toml），而
         // `Config::default()` 是 L1，那里是 false。不设这行，`handle_top_code` 在第一行
@@ -211,21 +211,34 @@ fn english_merge_vetoes_top_code_on_codetable() {
         cfg.schema.codetable.top_code_commit = true;
         cfg.schema.codetable.english_merge.enable = true;
         cfg.schema.codetable.english_merge.block_commit = block;
+        // `github` 本身是英文单词：成词级也得跟着关，否则「关掉守护」的前提不成立。
+        cfg.schema.codetable.english_merge.block_commit_on_word = word;
         EngineManager::new(&cfg, Some(&dir))
     };
 
-    // 前提：关掉守护时这串确实会顶码。
-    let unguarded = build(false);
-    let Some(topped) = unguarded.handle_top_code("github") else {
-        eprintln!("跳过：wubi86 对 github 本就不顶码，测不到否决");
-        return;
-    };
-
-    let guarded = build(true);
+    // 前提：两级都关时这两串确实会顶码。
+    let unguarded = build(false, false);
+    let topped = unguarded
+        .handle_top_code("github")
+        .expect("前提：wubi86 对 github 顶码，否则测不到否决");
     assert!(
-        guarded.handle_top_code("github").is_none(),
-        "存在英文候选时顶码须被否决，否则打 github 会被顶出中文 {:?}",
-        topped
+        unguarded.handle_top_code("githu").is_some(),
+        "前提：wubi86 对 githu 顶码"
+    );
+
+    assert!(
+        build(true, false).handle_top_code("github").is_none(),
+        "前缀级：存在英文候选时顶码须被否决，否则打 github 会被顶出中文 {topped:?}"
+    );
+    // 成词级（前缀级关）：整串是英文单词才拦，`githu` 只是前缀，照常顶码。
+    let word_only = build(false, true);
+    assert!(
+        word_only.handle_top_code("github").is_none(),
+        "成词级：整串 github 是英文单词，顶码须被否决"
+    );
+    assert!(
+        word_only.handle_top_code("githu").is_some(),
+        "成词级不管前缀：githu 应照常顶码"
     );
 }
 
@@ -251,19 +264,19 @@ fn recheck_auto_commit_for_applies_schema_scoped_english_veto() {
         eprintln!("跳过：wubi86 schema 或英文词库不存在");
         return;
     }
-    let build = |block: bool| {
+    let build = |block: bool, word: bool| {
         let mut cfg = make_config(&["pinyin"]);
         cfg.schema.available.push("wubi86".to_string());
         // english_merge 写在 wubi86 自己的方案覆盖里，而不是全局 cfg.schema.codetable——
         // 这正是要锁住的差异：全局镜像按活跃方案（pinyin）折叠，读不到这条。
         let override_dir =
-            std::env::temp_dir().join(format!("wind_recheck_english_veto_ov_{}", block));
+            std::env::temp_dir().join(format!("wind_recheck_english_veto_ov_{block}_{word}"));
         let _ = std::fs::remove_dir_all(&override_dir);
         std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             override_dir.join("wubi86.toml"),
             format!(
-                "[engine.codetable]\nauto_commit_at_full = true\nenglish_merge = {{ enable = true, block_commit = {block} }}\n"
+                "[engine.codetable]\nauto_commit_at_full = true\nenglish_merge = {{ enable = true, block_commit = {block}, block_commit_on_word = {word} }}\n"
             ),
         )
         .unwrap();
@@ -276,7 +289,7 @@ fn recheck_auto_commit_for_applies_schema_scoped_english_veto() {
     let candidates = [cand("github", "随便一个候选")];
 
     // 前提：关掉否决时，这个唯一精确候选确实会被复评放行——否则测不到否决，断言空转。
-    let unguarded = build(false);
+    let unguarded = build(false, false);
     assert!(unguarded.ensure_schema("wubi86"), "wubi86 方案应可加载");
     assert!(
         unguarded
@@ -285,7 +298,7 @@ fn recheck_auto_commit_for_applies_schema_scoped_english_veto() {
         "前提：关闭英文否决时唯一精确候选应复评放行，否则测不到否决本身"
     );
 
-    let guarded = build(true);
+    let guarded = build(true, false);
     assert!(guarded.ensure_schema("wubi86"), "wubi86 方案应可加载");
     assert!(
         guarded
@@ -293,6 +306,16 @@ fn recheck_auto_commit_for_applies_schema_scoped_english_veto() {
             .is_none(),
         "存在英文候选时，特殊模式引用方案（wubi86）自己的 english_merge.block_commit \
          应否决复评上屏——按活跃方案(pinyin)取配置的话，这条否决对 wubi86 永远读不到"
+    );
+
+    // 成词级（前缀级关）：整串 github 是英文单词，复评同样被否决。
+    let word_only = build(false, true);
+    assert!(word_only.ensure_schema("wubi86"), "wubi86 方案应可加载");
+    assert!(
+        word_only
+            .recheck_auto_commit_for("wubi86", "github", &candidates)
+            .is_none(),
+        "成词级应否决复评上屏"
     );
 }
 

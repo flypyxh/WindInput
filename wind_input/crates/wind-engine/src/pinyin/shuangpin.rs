@@ -200,7 +200,7 @@ fn charset_spec(extra: &[u8]) -> String {
 // 合法音节判定复用 SyllableTrie（与 Go validPinyinSyllables 对齐）。
 // ============================================================================
 
-use crate::pinyin::fuzzy::{FuzzyConfig, fuzzy_spellings};
+use crate::pinyin::fuzzy::{FuzzyConfig, HintSwitch, fuzzy_spellings};
 use crate::pinyin::syllable::SyllableTrie;
 use std::collections::HashSet;
 
@@ -299,6 +299,9 @@ pub struct ShuangpinConverter {
     /// 键对拼出它们时照收、原样交给拼音引擎，由那边按模糊组展开（全拼打 `din` 同路）。
     /// 单独存一份而不并进 `trie`：严格音节表还管反向表建表等，那里不能认错音串。
     fuzzy_spellings: HashSet<String>,
+    /// 模糊音提示开着：转换时记下对偶声母键对的本义读音（[`SylSpan::literal`]）。与拼音引擎
+    /// 共享同一开关，转换时读取。
+    hint_literal: HintSwitch,
 }
 
 impl ShuangpinConverter {
@@ -310,6 +313,7 @@ impl ShuangpinConverter {
             fuzzy_ch_c: false,
             fuzzy_sh_s: false,
             fuzzy_spellings: HashSet::new(),
+            hint_literal: HintSwitch::default(),
         }
     }
 
@@ -319,6 +323,29 @@ impl ShuangpinConverter {
         self.fuzzy_ch_c = fuzzy.ch_c;
         self.fuzzy_sh_s = fuzzy.sh_s;
         self.fuzzy_spellings = fuzzy_spellings(fuzzy).into_iter().collect();
+        self.hint_literal = fuzzy.hint.clone();
+    }
+
+    /// `best`（键对 `key1 key2` 的转换结果）若来自模糊对偶声母，返回按布局不开模糊时的
+    /// 字面拼写（小鹤 `sx` → `shua` 时为 `sua`）；否则 `None`。见 [`SylSpan::literal`]。
+    ///
+    /// 不开模糊也能读出 `best` ⇒ 不是对偶来的。错音串垫底（`dn` → `din`）本就是字面读音，
+    /// 找不到对偶韵母、同样 `None`。
+    fn partner_literal(&self, key1: u8, key2: u8, best: &str) -> Option<String> {
+        let initial = self.layout.initial_of(key1)?;
+        let alt = self.fuzzy_initial_partners(initial)?;
+        if self
+            .convert_pair_inner(key1, key2, false)
+            .iter()
+            .any(|r| r == best)
+        {
+            return None;
+        }
+        self.layout
+            .finals_of(key2)
+            .iter()
+            .find(|f| normalize_pinyin(&format!("{alt}{f}")) == best)
+            .map(|f| normalize_pinyin(&format!("{initial}{f}")))
     }
 
     pub fn layout(&self) -> &Layout {
@@ -594,6 +621,11 @@ impl ShuangpinConverter {
 
             if !syllables.is_empty() {
                 let best = syllables[0].clone();
+                let literal = if self.hint_literal.get() {
+                    self.partner_literal(key1, key2, &best)
+                } else {
+                    None
+                };
                 if !preedit.is_empty() {
                     preedit.push(SEPARATOR);
                 }
@@ -607,6 +639,7 @@ impl ShuangpinConverter {
                     raw_end: i + 2,
                     fp_start: fp_pos,
                     fp_end: fp_pos + best_len,
+                    literal,
                 });
 
                 // 位置映射：全拼前半字节映射回 key1（i），后半映射回 key2（i+1）。

@@ -1281,6 +1281,8 @@ struct Pending {
     state: i32,
     /// `PathArena` 索引；`u32::MAX` 表示「路径就是查询前缀本身」。
     path: u32,
+    /// 该状态对应的完整码长（字节）。
+    len: u32,
 }
 impl PartialEq for Pending {
     fn eq(&self, other: &Self) -> bool {
@@ -1391,7 +1393,7 @@ impl WdatReader {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = crate::mapping::map_file(&file)?;
         if mmap.len() < HEADER_SIZE {
             anyhow::bail!("wdat too short");
         }
@@ -1737,7 +1739,8 @@ impl WdatReader {
     /// 过滤与分支限界的终止判据**正交**：`node.bound` 是子树内最大 weight 的上界，
     /// `bound < worst.key.weight` 意味着该子树内**所有**条目（合格与否）都劣于当前第
     /// `limit` 名，故合格条目也不可能入选，`break` 依然安全。代价在效率而非正确性 ——
-    /// 合格条目稀疏时堆更晚填满、剪枝更晚生效，扫描量上升（这正是找齐 N 条所必需的）。
+    /// 合格条目稀疏时堆更晚填满、剪枝更晚生效，扫描量上升。另按码长上限剪掉过深的子树，
+    /// 见 [`crate::cached::prefix_code_len_cap`]。
     pub fn search_prefix_syllable_capped(
         &self,
         prefix: &str,
@@ -1785,6 +1788,7 @@ impl WdatReader {
             bound: root_bound,
             state: start,
             path: u32::MAX,
+            len: prefix.len() as u32,
         });
         let mut arena: Vec<PathNode> = Vec::new();
         let out = self.bnb_collect(v, pq, &mut arena, prefix, limit, filter, &mut stats);
@@ -1809,6 +1813,7 @@ impl WdatReader {
         stats: &mut PrefixSearchStats,
     ) -> Vec<DictEntry> {
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+        let len_cap = filter.map_or(usize::MAX, |(m, _)| crate::cached::prefix_code_len_cap(m));
         while let Some(node) = pq.pop() {
             // 剪枝（见函数文档要害 1）：严格小于才终止，且是 break 而非 continue——
             // 出队顺序保证剩余各项上界都 <= 本项。
@@ -1837,7 +1842,12 @@ impl WdatReader {
                     // 音节数 + 边界对齐过滤（严格档）：`slot` 已自增、`entries_read` 已计数，
                     // 二者描述的是「读到了第几条」，与是否入选无关，故在此之后才丢弃。
                     if let Some((m, completed_len)) = filter
-                        && !crate::cached::prefix_entry_keep(boundary, code.len(), m, completed_len)
+                        && !crate::cached::prefix_capped_keep(
+                            boundary,
+                            code.len(),
+                            m,
+                            completed_len,
+                        )
                     {
                         return;
                     }
@@ -1868,6 +1878,10 @@ impl WdatReader {
             if bs < 0 {
                 continue; // 叶状态无出边
             }
+            // 子状态的码都比上限长，整棵子树都过不了过滤（剪枝理由见 `prefix_code_len_cap`）。
+            if node.len as usize >= len_cap {
+                continue;
+            }
             for c in 1..=v.max_code {
                 let t = bs + c;
                 if !Self::in_range(v, t) || self.check(v, t) != node.state {
@@ -1886,6 +1900,7 @@ impl WdatReader {
                     bound,
                     state: t,
                     path,
+                    len: node.len + 1,
                 });
             }
         }
@@ -2039,6 +2054,7 @@ impl WdatReader {
                     bound,
                     state: t,
                     path: arena.len() as u32 - 1,
+                    len: pattern.len() as u32 + 1,
                 });
             }
         }
@@ -2493,6 +2509,75 @@ mod tests {
                 &format!("剪枝对拍 limit={limit}"),
             );
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 裸声母（`sh`、cap=1）的形状：单字稀疏且权重低，每棵子树都挂着高权重的多音节词，
+    /// 按权重上界剪不动。码长上限的深度剪枝须既剪得动、又与全量过滤逐条一致。
+    #[test]
+    fn syllable_capped_prunes_by_code_len() {
+        let firsts = [
+            "sha", "shan", "shang", "she", "shen", "sheng", "shi", "shu", "shuang",
+        ];
+        let seconds = ["de", "men", "hou", "jian", "zhong", "guo", "ren", "zhuang"];
+        let mut data: Vec<(String, Vec<WriteEntry>)> = Vec::new();
+        for (i, s1) in firsts.iter().enumerate() {
+            data.push((s1.to_string(), vec![(format!("单{i}"), i as i32 + 1, 0, 1)]));
+            for (j, s2) in seconds.iter().enumerate() {
+                let b2 = 1u64 | 1 << s1.len();
+                data.push((
+                    format!("{s1}{s2}"),
+                    vec![(format!("词{i}{j}"), 1000, 0, b2)],
+                ));
+                for s3 in &seconds {
+                    let b3 = b2 | 1 << (s1.len() + s2.len());
+                    data.push((
+                        format!("{s1}{s2}{s3}"),
+                        vec![(format!("长{i}{j}"), 2000, 0, b3)],
+                    ));
+                }
+            }
+        }
+        // 无边界信息：码长 ≤ 6 的放行，超过的拦下。
+        data.push(("shix".into(), vec![("短无界".into(), 50, 0, 0)]));
+        data.push(("shishishi".into(), vec![("长无界".into(), 5000, 0, 0)]));
+        data.sort_by(|a, b| a.0.cmp(&b.0));
+        data.dedup_by(|a, b| a.0 == b.0);
+        let p = std::env::temp_dir().join("wdat_capped_len.wdat");
+        let mut w = WdatWriter::new();
+        for (code, ents) in data {
+            w.add_with_boundary(code, ents);
+        }
+        w.write(&p).expect("write wdat");
+        let r = WdatReader::open(&p).unwrap();
+
+        let expect = |limit: usize| -> Vec<DictEntry> {
+            let mut all = reference_prefix(&r, "sh", 100_000);
+            all.retain(|e| {
+                e.code.len() <= crate::cached::prefix_code_len_cap(1)
+                    && crate::cached::prefix_entry_keep(e.boundary, e.code.len(), 1, 0)
+            });
+            all.truncate(limit);
+            all
+        };
+        let got = r.search_prefix_syllable_capped("sh", 300, 1, 0);
+        assert!(got.iter().any(|e| e.text == "短无界"));
+        assert!(got.iter().all(|e| e.text != "长无界"));
+        for limit in [1usize, 5, 10, 300] {
+            assert_same(
+                &r.search_prefix_syllable_capped("sh", limit, 1, 0),
+                &expect(limit),
+                &format!("码长剪枝对拍 limit={limit}"),
+            );
+        }
+        let (_, capped) = r.search_prefix_inner("sh", 300, Some((1, 0)));
+        let (_, full) = r.search_prefix_stats("sh", 100_000);
+        assert!(
+            capped.states_visited * 4 < full.states_visited,
+            "cap=1 应按码长剪掉深层子树：capped={} full={}",
+            capped.states_visited,
+            full.states_visited
+        );
         let _ = std::fs::remove_file(&p);
     }
 

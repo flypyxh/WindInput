@@ -27,6 +27,7 @@ pub const TEXT_ROLES: &[&str] = &[
     "code_rev_all",
     "shuangpin",
     "pinyin",
+    "correct_pinyin",
     "chaizi",
     "chaizi_code",
     "chaizi_all",
@@ -48,7 +49,13 @@ pub const TEXT_ROLES: &[&str] = &[
     // 结构角色：`${name:分隔符}` 一类变量的分项分隔符（片段带 `separator` 标记、角色仍是变量名；
     // 主题没配它时随变量同色，见 `wind_theme::span_color`）
     "separator",
+    // 结构角色：候选正文里内嵌的模糊音正确拼音（「苹(ping)果」的 `(ping)`），协调器直接产出，
+    // 不是模板变量
+    "pinyin_hint",
 ];
+
+/// [`TEXT_ROLES`] 里的结构角色：不是模板变量、没有求值入口。两条守卫与注释预览按它豁免。
+pub const STRUCTURAL_ROLES: &[&str] = &["title", "literal", "separator", "pinyin_hint"];
 
 /// 清单里的同名常驻字符串（`Span::role` 用）；清单外为 `None`。
 pub fn static_role(name: &str) -> Option<&'static str> {

@@ -4,10 +4,30 @@
 //! 允许用户输入时忽略常见发音混淆（如 z/zh, c/ch, s/sh, n/l）。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
-/// 笛卡尔积展开的组合数上限（超出即降级，见 [`FuzzyMatcher::expand_syllables`]）。
-pub const MAX_FUZZY_COMBOS: usize = 64;
+use super::correction::{CORRECTION_EDITS, CorrectionRules};
+use super::misread::MisreadTable;
+
+/// 「算不算正确拼音提示」的运行时开关：克隆共享同一份值，`EngineManager` 持有一份并注入各引擎，
+/// 翻转即时生效、无需重建引擎。提示只是 `convert` 收尾的后处理，不影响候选集合与排序。
+#[derive(Debug, Clone, Default)]
+pub struct HintSwitch(Arc<AtomicBool>);
+
+impl HintSwitch {
+    pub fn new(on: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(on)))
+    }
+
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, on: bool) {
+        self.0.store(on, Ordering::Relaxed);
+    }
+}
 
 /// 模糊音配置
 #[derive(Debug, Clone, Default)]
@@ -27,6 +47,9 @@ pub struct FuzzyConfig {
     pub un_ong: bool,
     /// `eng ↔ ong`（`deng`↔`dong`、`zheng`↔`zhong`）。
     pub eng_ong: bool,
+    /// 算不算正确拼音提示（见 [`HintSwitch`]；管理器按 `pinyin_hint_on` 置值）。
+    /// 不影响展开/匹配，仅供上层消费。
+    pub hint: HintSwitch,
     /// 双拼**同键韵母**推出的等价音节：音节 → 同一键对下其余的合法读音
     /// （自定义布局 `q = ["iu", "ui"]` 时 `diu` → `[dui]`、`dui` → `[diu]`）。
     ///
@@ -37,6 +60,13 @@ pub struct FuzzyConfig {
     /// 展开时**零罚分**（处数计 0）：用户自己把两个韵母配在同一个键上，两种读音按词频平等
     /// 竞争，不是「打错了」。与用户开的模糊组叠加时，后者照旧计处数。
     pub shared_key: HashMap<String, Vec<String>>,
+    /// 字母换位纠错规则（[`CorrectionRules`]）。错误拼写并入 [`fuzzy_spellings`]，
+    /// [`FuzzyMatcher::fuzzy_variants_scored`] 对其追加正确音节、计 [`CORRECTION_EDITS`] 处。
+    /// 双拼方案恒空。
+    pub correction: Arc<CorrectionRules>,
+    /// 误读表（[`MisreadTable`]）：`None` = 「误读」来源未勾选或表空，不召回不标。
+    /// 不影响展开/匹配，由 `PinyinEngine::convert` 收尾召回与标提示。
+    pub misread: Option<Arc<MisreadTable>>,
 }
 
 impl FuzzyConfig {
@@ -71,6 +101,7 @@ impl FuzzyConfig {
             || self.un_ong
             || self.eng_ong
             || !self.shared_key.is_empty()
+            || !self.correction.is_empty()
     }
 }
 
@@ -79,8 +110,8 @@ impl FuzzyConfig {
 /// 此前写成 `from`/`to` 的单向规则表、正反两条各列一行，两个方向都用子串试探
 /// （声母 `starts_with`、韵母 `find`）匹配 —— 于是同一个音节会被表里**多条**规则重复命中：
 /// `sheng` 既被 `sh→s` 命中得 `seng`、又被 `s→sh` 命中得 `shheng`；`en→eng` 还能在
-/// `sheng` 中间 `find` 到 `en` 得 `shengg`。这些非法码查不到词、只白白撑大
-/// [`MAX_FUZZY_COMBOS`] 的组合预算。改为「按组取对端」后天然只匹配一次。
+/// `sheng` 中间 `find` 到 `en` 得 `shengg`。这些非法码查不到词、只白白撑大多音节展开的
+/// 组合预算。改为「按组取对端」后天然只匹配一次。
 struct FuzzyGroup {
     a: &'static str,
     b: &'static str,
@@ -227,7 +258,7 @@ pub fn retroflex_relaxed(head: char, config: &FuzzyConfig) -> bool {
 ///
 /// **处数随键一起返回**而不是让调用方事后逐位比较：它在笛卡尔积构造期是免费的
 /// （每选一个非原字母就 +1），五个召回点的罚分口径因此由构造侧统一保证、不会各自漂移。
-/// 与本模块 [`FuzzyMatcher::fuzzy_variants_scored`]、`expand_syllables` 同族形态。
+/// 与本模块 [`FuzzyMatcher::fuzzy_variants_scored`] 同族形态。
 ///
 /// 处数口径 = **逐位计**，与校验侧 `AbbrevSeg::Initial` 段计 1 处一致：简拼键的每一位
 /// 就是一个 `Initial` 段。`l` 的等价集 `{l,n,r}` 那种多来源不影响计量 —— 逐位比较不问
@@ -284,7 +315,7 @@ pub fn fuzzy_abbrev_keys(key: &str, config: &FuzzyConfig) -> Vec<(String, usize)
     out
 }
 
-/// [`fuzzy_abbrev_keys`] 的变体数上限。与同文件的 [`MAX_FUZZY_COMBOS`] 取同值。
+/// [`fuzzy_abbrev_keys`] 的变体数上限。
 ///
 /// 真机简拼键长度就是音节数，常见 2~4。**各位的等价集大小不一样**，所以位数不能直接
 /// 换算成变体数 —— `n`/`f`/`h`/`r` 是 2 选，只有 `l` 是 3 选（同属 `n↔l` 与 `r↔l`）：
@@ -305,12 +336,12 @@ pub fn fuzzy_abbrev_keys(key: &str, config: &FuzzyConfig) -> Vec<(String, usize)
 /// 超限时只返回原键，不做部分展开 —— 截一半等于按字母表顺序随机挑几个变体放行，
 /// 用户看到的是「有时出得来有时出不来」，比一致地出不来更难排查。
 ///
-/// 但 [`FuzzyMatcher::expand_syllables`] 面对同类问题用的是**分层降级**（逐级降低
-/// 「允许同时被模糊的音节数」而非整体放弃）。同样的办法这里也适用：按「改动了几位」
+/// 但多音节的全拼展开（`LatticeBuilder::fuzzy_spans`）面对同类问题用的是**按改动处数截断**
+/// （每层只留改动最少的那批）而非整体放弃。类似的办法这里也适用：按「改动了几位」
 /// 分层递增枚举，某层放不下就**整层丢弃并停止**，规则变成一句用户能理解的话
 /// 「改一个音能出、改两个音出不来」，而层内截断又会退回不可预期。
 /// 未做 —— 它是召回面的扩张，不该与罚分口径的修复混在一笔里。
-pub const MAX_ABBREV_KEY_VARIANTS: usize = MAX_FUZZY_COMBOS;
+pub const MAX_ABBREV_KEY_VARIANTS: usize = 64;
 
 /// 韵母模糊组。**整体相等**比较，不是子串查找：`jiang` 的韵母是 `iang`，它不该因为
 /// 「串里含 `ang`」就被 `an_ang` 组改成 `jian`（那是 `ian_iang` 组的事，用户可能根本没开）。
@@ -368,7 +399,7 @@ const INITIALS: &[&str] = &[
 
 /// 合法音节集合，用于剔除模糊组合产出的非法码（`juan`+uan_uang→`juang`、`yuan`→`yuang`）。
 /// 只在**输入本身是合法音节**时启用过滤，见 [`FuzzyMatcher::fuzzy_variants_scored`]。
-static VALID_SYLLABLES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+pub(crate) static VALID_SYLLABLES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     super::syllable::STANDARD_SYLLABLES
         .iter()
         .copied()
@@ -401,34 +432,12 @@ fn part_options<'a>(part: &'a str, groups: &[FuzzyGroup], config: &FuzzyConfig) 
     opts
 }
 
-/// 数「最多 `limit` 个音节被模糊」时的组合总数，用于 [`FuzzyMatcher::expand_syllables`]
-/// 选降级档位。`dp[j]` = 已处理音节中恰有 `j` 个被模糊的组合数。
-fn combo_count(per_syllable: &[Vec<(String, usize)>], limit: usize) -> usize {
-    let mut dp = vec![0usize; limit + 1];
-    dp[0] = 1;
-    for opts in per_syllable {
-        let alts = opts.len() - 1; // 除原音节外的变体数
-        let mut next = vec![0usize; limit + 1];
-        for j in 0..=limit {
-            if dp[j] == 0 {
-                continue;
-            }
-            next[j] = next[j].saturating_add(dp[j]); // 该音节取原值
-            if j < limit {
-                next[j + 1] = next[j + 1].saturating_add(dp[j].saturating_mul(alts));
-            }
-        }
-        dp = next;
-    }
-    dp.iter().fold(0usize, |acc, n| acc.saturating_add(*n))
-}
-
 /// 枚举「用户会打、但本身不是合法音节」的模糊拼写全集，供切分层注册。
 ///
 /// ## 为什么需要它
 ///
-/// 模糊音是在**切分之后**逐音节展开的（[`FuzzyMatcher::expand_syllables`] 的入参就是
-/// 已切好的音节数组）。而切分器 [`SyllableTrie`](super::syllable::SyllableTrie) 只认
+/// 模糊音是在**切分之后**逐音节展开的（`LatticeBuilder::fuzzy_spans` 沿音节图的边逐条
+/// 展开）。而切分器 [`SyllableTrie`](super::syllable::SyllableTrie) 只认
 /// 标准音节表，于是 `tin`（想打 `ting`）这类**本身不成音节**的串在图上根本没有边：
 /// `tinzhi` 的 DAG 最远只走到 `ti`，`nzhi` 全成残码，模糊展开一次都轮不到执行。
 /// 现象是「明明开了 in-ing，`tinzhi` 却打不出「停止」」——不是排序靠后，是候选里压根没有。
@@ -486,6 +495,7 @@ pub fn fuzzy_spellings(config: &FuzzyConfig) -> Vec<String> {
             }
         }
     }
+    out.extend(config.correction.spellings().map(str::to_string));
     out.into_iter().collect()
 }
 
@@ -505,11 +515,11 @@ impl FuzzyMatcher {
     ///
     /// 双拼同键音节（[`FuzzyConfig::shared_key`]）并在这里：对端计 **0 处**，对端再经用户
     /// 模糊组得到的变体照常计处数；同一变体多条来源取处数最小者。
+    ///
+    /// 换位纠错（[`FuzzyConfig::correction`]）也并在这里：`input` 是错误拼写时追加其正确音节，
+    /// 计 [`CORRECTION_EDITS`] 处；纠错得到的音节**不再**做模糊组展开（一个音节最多一处编辑来源）。
     pub fn fuzzy_variants_scored(input: &str, config: &FuzzyConfig) -> Vec<(String, usize)> {
         let mut variants = Self::group_variants_scored(input, config);
-        let Some(partners) = config.shared_key.get(input) else {
-            return variants;
-        };
         let mut add = |variant: String, edits: usize| {
             if variant == input {
                 return;
@@ -519,11 +529,16 @@ impl FuzzyMatcher {
                 None => variants.push((variant, edits)),
             }
         };
-        for partner in partners {
-            add(partner.clone(), 0);
-            for (v, e) in Self::group_variants_scored(partner, config) {
-                add(v, e);
+        if let Some(partners) = config.shared_key.get(input) {
+            for partner in partners {
+                add(partner.clone(), 0);
+                for (v, e) in Self::group_variants_scored(partner, config) {
+                    add(v, e);
+                }
             }
+        }
+        for correct in config.correction.corrections_of(input) {
+            add(correct.clone(), CORRECTION_EDITS);
         }
         variants
     }
@@ -557,93 +572,40 @@ impl FuzzyMatcher {
         variants
     }
 
+    /// 单音节的**拼写级**模糊变体（只看用户模糊组，不含双拼同键）：合法变体之外，再收
+    /// 非法错音串（`ding`→`din`），但不收零声母的非法串（与 [`fuzzy_spellings`] 同口径）。
+    ///
+    /// 供「模糊音提示」判定用户敲的段是不是这个音节的模糊拼写；[`Self::fuzzy_variants`]
+    /// 对合法音节会滤掉非法产物，`din` 这类真实误打因此判不出来。
+    ///
+    /// 不读 [`FuzzyConfig::shared_key`]：调用方传整份配置即可，无需先 `without_shared_key`。
+    pub(crate) fn fuzzy_spelling_variants(input: &str, config: &FuzzyConfig) -> Vec<String> {
+        let (initial, final_) = split_initial_final(input);
+        let initials = part_options(initial, INITIAL_GROUPS, config);
+        let finals = part_options(final_, FINAL_GROUPS, config);
+        let mut out = Vec::new();
+        for (i, init) in initials.iter().enumerate() {
+            for (j, fin) in finals.iter().enumerate() {
+                if i == 0 && j == 0 {
+                    continue;
+                }
+                let variant = format!("{init}{fin}");
+                if variant == input
+                    || (init.is_empty() && !VALID_SYLLABLES.contains(variant.as_str()))
+                {
+                    continue;
+                }
+                out.push(variant);
+            }
+        }
+        out
+    }
+
     /// [`Self::fuzzy_variants_scored`] 的丢弃计数版本。
     pub fn fuzzy_variants(input: &str, config: &FuzzyConfig) -> Vec<String> {
         Self::fuzzy_variants_scored(input, config)
             .into_iter()
             .map(|(v, _)| v)
-            .collect()
-    }
-
-    /// 逐音节展开模糊变体的笛卡尔积，拼成完整 code 列表（**含全原音节的原码本身**）。
-    ///
-    /// **必须逐音节调用 [`Self::fuzzy_variants`]，不可对多音节拼接串整体调用**：声母规则用
-    /// `input.starts_with(rule.from)`、韵母规则用 `input.find(rule.from)`，对整串只能改到
-    /// **第一个音节的声母**与**第一处**韵母匹配。`zhongzou`→`zhongzhou`（中州）这类
-    /// 非首音节模糊会整片丢失。切分信息在两个调用点都是现成的——`mod.rs` 有 DAG 的
-    /// `syllables`，`lattice.rs` 有 `graph.any_path` 的 `offsets`（还紧接着用
-    /// `slice_syllables` 切过一次）——本函数即为收口这两处而抽出。
-    ///
-    /// 组合数超 [`MAX_FUZZY_COMBOS`] 时**逐级降低「允许同时被模糊的音节数」**，而非整体
-    /// 放弃。此前是超限即 `return Vec::new()`，于是长句里模糊音会**静默全失效**——用户感受
-    /// 是「短词模糊音好使、长句就不灵」。降级后至少保留「只错一两个音节」的召回，那也正是
-    /// 模糊音的主场景（真按错五六个音节的输入，本就该由整句纠错而非模糊音兜）。
-    ///
-    /// 返回 `(变体码, 模糊改动处数)`。**第二项是惩罚的计量单位**：librime 的
-    /// `kFuzzySpellingPenalty` 与 libime 的 `fuzzyCost` 都是「每个模糊拼写 log(0.5)」并
-    /// 逐个累加，即概率域按改动处数**累乘 0.5**。我们此前两处惩罚（词图 −0.5、候选层
-    /// ×0.01）都是**一次性固定值**，`beijinsi`（2 处模糊）与 `si`（1 处）同等对待。
-    pub fn expand_syllables(syllables: &[String], config: &FuzzyConfig) -> Vec<(String, usize)> {
-        Self::expand_syllables_masked(syllables, config)
-            .into_iter()
-            .map(|(code, edits, _)| (code, edits))
-            .collect()
-    }
-
-    /// [`Self::expand_syllables`] 外加每个变体码**自己的音节边界**（各音节起始字节位，
-    /// 与词典 / store 的 `boundary` 同域）。展开与降级逻辑是同一份，只多记一个位掩码。
-    ///
-    /// 变体音节与原音节码长可以不同（`zong`→`zhong`），变体码的边界没法从原码切分推出。
-    /// 用途：整句词图的系统词模糊节点要带规范码 + 规范边界（`LatticeNode::canon`），
-    /// 词条自己没边界时就用这份。起始位 ≥ 64 的音节不记位。
-    pub fn expand_syllables_masked(
-        syllables: &[String],
-        config: &FuzzyConfig,
-    ) -> Vec<(String, usize, u64)> {
-        let per_syllable: Vec<Vec<(String, usize)>> = syllables
-            .iter()
-            .map(|s| {
-                // opts[0] 恒为原音节（0 处改动），故「下标 > 0」即「该音节被模糊了」。
-                let mut opts = vec![(s.clone(), 0usize)];
-                opts.extend(Self::fuzzy_variants_scored(s, config));
-                opts
-            })
-            .collect();
-
-        // 允许同时被模糊的音节数上限：从「全部可模糊」往下降，取第一个不超预算的。
-        let mut limit = per_syllable.len();
-        while limit > 0 && combo_count(&per_syllable, limit) > MAX_FUZZY_COMBOS {
-            limit -= 1;
-        }
-
-        // 元素为 (码, 累计改动处数, 已模糊的音节数, 边界位掩码)——第三项仅用于按 `limit` 剪枝。
-        let mut codes: Vec<(String, usize, usize, u64)> = vec![(String::new(), 0, 0, 0)];
-        for opts in &per_syllable {
-            let mut next: Vec<(String, usize, usize, u64)> = Vec::with_capacity(codes.len());
-            for (prefix, edits, fuzzy_syls, mask) in &codes {
-                let start_bit = if prefix.len() < 64 {
-                    1u64 << prefix.len()
-                } else {
-                    0
-                };
-                for (i, (opt, opt_edits)) in opts.iter().enumerate() {
-                    let fuzzy_syls = fuzzy_syls + usize::from(i > 0);
-                    if fuzzy_syls > limit {
-                        continue;
-                    }
-                    next.push((
-                        format!("{prefix}{opt}"),
-                        edits + opt_edits,
-                        fuzzy_syls,
-                        mask | start_bit,
-                    ));
-                }
-            }
-            codes = next;
-        }
-        codes
-            .into_iter()
-            .map(|(c, edits, _, mask)| (c, edits, mask))
             .collect()
     }
 
@@ -698,10 +660,7 @@ mod tests {
             FuzzyMatcher::fuzzy_variants_scored("diu", &c),
             vec![("dui".to_string(), 0)]
         );
-        assert_eq!(
-            FuzzyMatcher::expand_syllables(&syls(&["diu"]), &c),
-            vec![("diu".to_string(), 0), ("dui".to_string(), 0)]
-        );
+        assert_eq!(expand(&["diu"], &c), vec![("dui".to_string(), 0)]);
         assert!(fuzzy_spellings(&c).is_empty(), "同键音节都合法，不进错音串");
     }
 
@@ -720,6 +679,46 @@ mod tests {
         assert_eq!(edits("niu"), Some(1), "对端经 n_l 计 1 处: {v:?}");
         assert_eq!(edits("lin"), None, "不含自身");
         assert_eq!(v.len(), 5, "不重复: {v:?}");
+    }
+
+    // ---------------------------------------------------------------- correction
+
+    fn with_correction(on: bool) -> FuzzyConfig {
+        let mut c = wind_config::CorrectionConfig {
+            enabled: on,
+            ..Default::default()
+        };
+        c.rules.gn_ng = true; // 出厂关；用例是 gogn / zogn
+        cfg(|f| f.correction = Arc::new(CorrectionRules::from_config(&c)))
+    }
+
+    /// 纠错音节按 `CORRECTION_EDITS` 处计罚、不再做模糊组展开；关纠错时不出现。
+    #[test]
+    fn correction_variant_carries_heavy_edits() {
+        let on = with_correction(true);
+        assert!(on.any_enabled(), "只开纠错也须算作开启");
+        assert!(
+            FuzzyMatcher::fuzzy_variants_scored("gogn", &on)
+                .contains(&("gong".to_string(), CORRECTION_EDITS)),
+        );
+        assert!(fuzzy_spellings(&on).contains(&"gogn".to_string()));
+        let off = with_correction(false);
+        assert!(
+            !FuzzyMatcher::fuzzy_variants_scored("gogn", &off)
+                .iter()
+                .any(|(v, _)| v == "gong")
+        );
+        assert!(!off.any_enabled());
+    }
+
+    /// 纠错得到的音节不再经模糊组展开（同一音节上纠错与模糊不叠加）。
+    #[test]
+    fn correction_does_not_stack_with_fuzzy_groups() {
+        let mut c = with_correction(true);
+        c.zh_z = true;
+        let v = FuzzyMatcher::fuzzy_variants_scored("zogn", &c);
+        assert!(v.contains(&("zong".to_string(), CORRECTION_EDITS)), "{v:?}");
+        assert!(!v.iter().any(|(s, _)| s == "zhong"), "{v:?}");
     }
 
     // ---------------------------------------------------------------- any_enabled
@@ -829,70 +828,94 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------- expand_syllables
+    // ------------------------------------------------------------ 多音节整码展开
 
-    /// 测试辅助：只取变体码，丢掉模糊音节数。
+    /// 按给定切分展开整码的模糊变体（**不含原码**），各取改动最少的形态：
+    /// `(变体码, 改动处数, 变体边界)`。走生产同一份 `LatticeBuilder::fuzzy_spans`。
+    fn expand_masked(syllables: &[&str], c: &FuzzyConfig) -> Vec<(String, usize, u64)> {
+        use super::super::dag::SegGraph;
+        use super::super::lattice::{EdgeVariants, LatticeBuilder};
+        let syllables = syls(syllables);
+        let code = syllables.concat();
+        let graph = SegGraph::from_syllables(&syllables);
+        LatticeBuilder::new()
+            .fuzzy_spans(
+                0,
+                &code,
+                &graph,
+                c,
+                &mut EdgeVariants::new(),
+                code.len(),
+                code.len(),
+                &|_| true,
+            )
+            .into_iter()
+            .filter(|((q, _), _)| *q == code.len())
+            .map(|((_, variant), shapes)| {
+                let (mask, _, edits) = shapes.into_iter().min_by_key(|s| s.2).unwrap();
+                (variant, edits, mask)
+            })
+            .collect()
+    }
+
+    fn expand(syllables: &[&str], c: &FuzzyConfig) -> Vec<(String, usize)> {
+        expand_masked(syllables, c)
+            .into_iter()
+            .map(|(v, edits, _)| (v, edits))
+            .collect()
+    }
+
+    /// 测试辅助：只取变体码，丢掉改动处数。
     fn codes(out: &[(String, usize)]) -> Vec<String> {
         out.iter().map(|(c, _)| c.clone()).collect()
     }
 
-    /// 测试辅助：查某个变体码对应的模糊音节数。
+    /// 测试辅助：查某个变体码对应的改动处数。
     fn fuzzy_count_of(out: &[(String, usize)], code: &str) -> Option<usize> {
         out.iter().find(|(c, _)| c == code).map(|(_, k)| *k)
     }
 
-    /// 带边界的展开：变体码的边界按**变体音节**的长度记（`zong|guo` → `zhong|guo` 是 {0,5}
-    /// 而非 {0,4}），且与不带边界的版本逐项同码同处数。
+    /// 变体码的边界按**变体音节**的长度记（`zong|guo` → `zhong|guo` 是 {0,5} 而非 {0,4}）。
     #[test]
-    fn expand_syllables_masked_tracks_variant_boundaries() {
-        let c = cfg(|c| c.zh_z = true);
-        let input = syls(&["zong", "guo"]);
-        let masked = FuzzyMatcher::expand_syllables_masked(&input, &c);
-        assert!(masked.contains(&("zongguo".to_string(), 0, 0b10001)));
-        assert!(masked.contains(&("zhongguo".to_string(), 1, 0b100001)));
-        let plain: Vec<(String, usize)> = masked.into_iter().map(|(s, k, _)| (s, k)).collect();
-        assert_eq!(plain, FuzzyMatcher::expand_syllables(&input, &c));
+    fn expand_tracks_variant_boundaries() {
+        let out = expand_masked(&["zong", "guo"], &cfg(|c| c.zh_z = true));
+        assert!(
+            out.contains(&("zhongguo".to_string(), 1, 0b100001)),
+            "{out:?}"
+        );
     }
 
-    /// 全原音节组合恒排第一、且模糊音节数为 0（调用方据 `variant == code` 跳过精确命中，
-    /// 依赖此性质）。
+    /// 原码不在结果里：那是精确命中，由各自的精确分支处理。
     #[test]
-    fn expand_first_combo_is_original_code() {
+    fn expand_excludes_original_code() {
         let c = cfg(|c| {
             c.zh_z = true;
             c.sh_s = true;
         });
-        let out = FuzzyMatcher::expand_syllables(&syls(&["zhong", "guo"]), &c);
-        assert_eq!(out[0].0, "zhongguo", "首个组合须是原码，实际: {out:?}");
-        assert_eq!(out[0].1, 0, "原码的模糊音节数须为 0");
+        let out = expand(&["zhong", "guo"], &c);
+        assert!(!codes(&out).contains(&"zhongguo".to_string()), "{out:?}");
+        assert!(!out.is_empty());
     }
 
     #[test]
-    fn expand_disabled_yields_only_original() {
-        let out = FuzzyMatcher::expand_syllables(&syls(&["si", "jin"]), &FuzzyConfig::default());
-        assert_eq!(
-            out,
-            vec![("sijin".to_string(), 0)],
-            "全关时只应有原码，且计数为 0"
-        );
+    fn expand_disabled_yields_nothing() {
+        assert!(expand(&["si", "jin"], &FuzzyConfig::default()).is_empty());
     }
 
     #[test]
-    fn expand_single_syllable_degrades_to_variants() {
-        let out = FuzzyMatcher::expand_syllables(&syls(&["si"]), &cfg(|c| c.sh_s = true));
-        assert!(codes(&out).contains(&"si".to_string()));
+    fn expand_single_syllable() {
+        let out = expand(&["si"], &cfg(|c| c.sh_s = true));
         assert_eq!(
             fuzzy_count_of(&out, "shi"),
             Some(1),
-            "单音节 s→sh 须计 1 个模糊音节，实际: {out:?}"
+            "单音节 s→sh 须计 1 处，实际: {out:?}"
         );
     }
 
-    /// **本次修复的核心**：非首音节的**声母**变体必须能生成。
-    /// `zhongzou` → 「中州」需要第 2 音节 zou→zhou。
+    /// 非首音节的**声母**变体必须能生成：`zhongzou` → 「中州」需要第 2 音节 zou→zhou。
     #[test]
     fn expand_covers_non_initial_syllable_initial() {
-        let out = FuzzyMatcher::expand_syllables(&syls(&["zhong", "zou"]), &cfg(|c| c.zh_z = true));
+        let out = expand(&["zhong", "zou"], &cfg(|c| c.zh_z = true));
         assert_eq!(
             fuzzy_count_of(&out, "zhongzhou"),
             Some(1),
@@ -903,7 +926,7 @@ mod tests {
     /// 非首音节的**韵母**变体：`beijin` → `beijing`（第 2 音节 in→ing）。
     #[test]
     fn expand_covers_non_initial_syllable_final() {
-        let out = FuzzyMatcher::expand_syllables(&syls(&["bei", "jin"]), &cfg(|c| c.in_ing = true));
+        let out = expand(&["bei", "jin"], &cfg(|c| c.in_ing = true));
         assert_eq!(
             fuzzy_count_of(&out, "beijing"),
             Some(1),
@@ -911,33 +934,31 @@ mod tests {
         );
     }
 
-    /// **多处音节同时模糊**（笛卡尔积的意义）：`beijinsi` → `beijingshi`（北京市）
-    /// 需要第 2 音节 in→ing **且** 第 3 音节 s→sh。
+    /// **多处音节同时模糊**：`beijinsi` → `beijingshi`（北京市）需要第 2 音节 in→ing
+    /// **且** 第 3 音节 s→sh。
     ///
-    /// ★ 计数须为 **2** —— 惩罚按模糊音节数累乘（`0.5^2`），对齐 librime
-    /// `kFuzzySpellingPenalty` 与 libime `fuzzyCost` 的逐个累加。写成一次性固定折扣时，
-    /// 本串与单音节模糊同等对待，置信度差异被抹平。
+    /// ★ 计数须为 **2** —— 惩罚按改动处数累乘（`0.5^2`），对齐 librime
+    /// `kFuzzySpellingPenalty` 与 libime `fuzzyCost` 的逐个累加。
     #[test]
     fn expand_covers_multiple_syllables_at_once() {
         let c = cfg(|c| {
             c.in_ing = true;
             c.sh_s = true;
         });
-        let out = FuzzyMatcher::expand_syllables(&syls(&["bei", "jin", "si"]), &c);
+        let out = expand(&["bei", "jin", "si"], &c);
         assert_eq!(
             fuzzy_count_of(&out, "beijingshi"),
             Some(2),
             "第 2、3 音节同时变体须计 2，实际: {out:?}"
         );
-        // 同一次展开里，只改一个音节的组合计 1 —— 与上面合看才说明计数真在数音节，
+        // 同一次展开里，只改一个音节的组合计 1 —— 与上面合看才说明计数真在数改动，
         // 而非「只要有模糊就置 1」或「恒等于音节总数」。
         assert_eq!(fuzzy_count_of(&out, "beijingsi"), Some(1));
         assert_eq!(fuzzy_count_of(&out, "beijinshi"), Some(1));
     }
 
     /// **回归守卫（钉死旧 bug）**：对多音节**拼接串**整体调 `fuzzy_variants` 拿不到
-    /// 非首音节的声母变体——声母规则是 `starts_with`。谁把 `expand_syllables` 改回
-    /// 整串调用，这条就会挂。
+    /// 非首音节的声母变体——声母规则是 `starts_with`。多音节必须逐音节展开。
     #[test]
     fn whole_string_variants_miss_non_initial_initials() {
         let c = cfg(|c| {
@@ -950,36 +971,22 @@ mod tests {
             "整串调用本就拿不到非首音节声母变体（已知限制），实际: {whole:?}"
         );
 
-        // 而逐音节展开可以——两者的差集正是本次修复的价值。
-        let per_syllable = FuzzyMatcher::expand_syllables(&syls(&["bei", "jin", "si"]), &c);
+        // 而逐音节展开可以——两者的差集正是逐音节展开的价值。
+        let per_syllable = expand(&["bei", "jin", "si"], &c);
         assert!(codes(&per_syllable).contains(&"beijingshi".to_string()));
     }
 
-    /// 组合数超上限时**降级**（限制同时被模糊的音节数），而非整体放弃。
-    ///
-    /// 旧行为是超限即返回空 —— 长句里模糊音会静默全失效，用户感受是「短词好使、长句不灵」。
+    /// 组合超出每层预算时按改动处数截断，而非整体放弃：「只错一个音节」的组合全部保住。
     #[test]
-    fn expand_degrades_instead_of_giving_up_beyond_combo_limit() {
+    fn expand_keeps_fewest_edits_beyond_layer_budget() {
         let c = cfg(|c| c.in_ing = true);
-        // 每个 "jin" 有 2 个选项（jin / jing）→ 全展开 2^7 = 128 > MAX_FUZZY_COMBOS(64)
-        let out = FuzzyMatcher::expand_syllables(&syls(&["jin"; 7]), &c);
-        assert!(
-            out.len() <= MAX_FUZZY_COMBOS,
-            "降级后仍须守住预算: {}",
-            out.len()
-        );
-        assert_eq!(out[0].0, "jinjinjinjinjinjinjin", "原码恒在首位");
-        assert!(
-            out.iter().any(|(_, k)| *k == 1),
-            "至少保留「只错一个音节」的召回，而非整体放弃: {out:?}"
-        );
-
-        // 未超限时不降级：6 个 jin 全展开恰好 64 组合，7 个音节全模糊的组合此时应存在。
-        let full = FuzzyMatcher::expand_syllables(&syls(&["jin"; 6]), &c);
-        assert_eq!(full.len(), 64);
-        assert!(
-            full.iter().any(|(_, k)| *k == 6),
-            "未超限时须保留全模糊组合"
+        // 每个 "jin" 有 2 个选项 → 10 个音节全展开 2^10 = 1024，远超每层 256。
+        let out = expand(&["jin"; 10], &c);
+        assert!(out.len() < 256, "截断后仍须守住预算: {}", out.len());
+        assert_eq!(
+            out.iter().filter(|(_, k)| *k == 1).count(),
+            10,
+            "10 个「只错一个音节」的组合须全部保住: {out:?}"
         );
     }
 
@@ -1013,7 +1020,7 @@ mod tests {
         );
 
         // 端到端：整码 senxiao 须能展开出 shengxiao。
-        let expanded = FuzzyMatcher::expand_syllables(&syls(&["sen", "xiao"]), &c);
+        let expanded = expand(&["sen", "xiao"], &c);
         assert_eq!(
             expanded
                 .iter()
@@ -1111,12 +1118,7 @@ mod tests {
 
     #[test]
     fn expand_empty_input_is_safe() {
-        let out = FuzzyMatcher::expand_syllables(&[], &cfg(|c| c.zh_z = true));
-        assert_eq!(
-            out,
-            vec![(String::new(), 0)],
-            "空音节列表只产出空串，交调用方跳过"
-        );
+        assert!(expand(&[], &cfg(|c| c.zh_z = true)).is_empty());
     }
 
     // ------------------------------------------------------------ un_ong / eng_ong
@@ -1243,7 +1245,7 @@ mod tests {
         assert_eq!(out.len(), 5, "实际: {out:?}");
     }
 
-    /// 多音节展开：`dunxi` 在 un_ong 下出 `dongxi`（东西），且守住组合预算。
+    /// 多音节展开：`dunxi` 在 un_ong 下出 `dongxi`（东西）。
     #[test]
     fn un_ong_expands_within_multi_syllable_code() {
         let c = cfg(|c| {
@@ -1251,12 +1253,12 @@ mod tests {
             c.eng_ong = true;
             c.en_eng = true;
         });
-        let out = FuzzyMatcher::expand_syllables(&syls(&["dun", "xi"]), &c);
+        let out = expand(&["dun", "xi"], &c);
         assert_eq!(fuzzy_count_of(&out, "dongxi"), Some(1), "实际: {out:?}");
-        // ong 有两个对端 ⇒ 每个 zhong 3 个选项，4 个即 81 > 64，须降级而非放弃。
-        let out = FuzzyMatcher::expand_syllables(&syls(&["zhong"; 4]), &c);
-        assert!(out.len() <= MAX_FUZZY_COMBOS, "{}", out.len());
-        assert_eq!(out[0].0, "zhongzhongzhongzhong");
+        // ong 有两个对端 ⇒ 每个 zhong 3 个选项，4 个即 81 种组合，在每层预算内全部保留
+        // （扣掉原码 80 种）。
+        let out = expand(&["zhong"; 4], &c);
+        assert_eq!(out.len(), 80, "{out:?}");
         assert!(out.iter().any(|(_, k)| *k == 1));
     }
 

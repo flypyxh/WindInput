@@ -1,7 +1,8 @@
-//! 拼音「英文候选」的可选前缀补全（`schema.pinyin.english_merge.prefix_complete`）。
+//! 拼音「英文候选」的可选前缀补全（`schema.pinyin.english_merge.complete_min_length`）。
 //!
-//! 判据：中文侧有候选时，只在输入 ≥5 字母且整串切不成完整全拼音节时补，至多 2 条，
-//! 不与精确命中重复；双拼下不生效。开关关着时的行为由 `english_merge_exact_only.rs` 守。
+//! 判据：中文侧有候选时，只在输入达到 `complete_min_length` 且整串切不成完整全拼音节时补，
+//! 与完整单词合计不超 `max_count`（出厂 2），不与精确命中重复；双拼下不生效。补全关着
+//! （出厂 0）时的行为由 `english_merge_exact_only.rs` 守。
 //!
 //! 词库缺失时整族跳过（worktree 里要自备 `build_dev/data`，核对耗时）。
 
@@ -20,12 +21,13 @@ fn ready(schema: &str) -> bool {
         && dir.join("schemas/english/en.dict.yaml").exists()
 }
 
-fn manager(schema: &str, prefix_complete: bool) -> EngineManager {
+/// `complete`：开补全时用建议值 5，关时 0。
+fn manager(schema: &str, complete: bool) -> EngineManager {
     let mut cfg = Config::default();
     cfg.schema.available = vec![schema.to_string()];
     cfg.schema.active = schema.to_string();
     cfg.schema.pinyin.english_merge.enable = true;
-    cfg.schema.pinyin.english_merge.prefix_complete = prefix_complete;
+    cfg.schema.pinyin.english_merge.complete_min_length = if complete { 5 } else { 0 };
     EngineManager::new(&cfg, Some(&data_dir()))
 }
 
@@ -89,9 +91,9 @@ fn full_pinyin_is_not_completed() {
     }
 }
 
-/// 有精确命中时：精确那条之外至多再补 2 条，且不重复。
+/// 有精确命中时：完整单词优先，补全只填 `max_count`（出厂 2）剩下的座位，且不重复。
 #[test]
-fn exact_plus_at_most_two() {
+fn exact_plus_completion_within_max_count() {
     if !ready("pinyin") {
         eprintln!("跳过：pinyin 方案或英文词库不存在");
         return;
@@ -108,9 +110,10 @@ fn exact_plus_at_most_two() {
         "前提：table 精确命中在场，实际 {en:?}"
     );
     let extra: Vec<_> = en.iter().filter(|t| *t != "table").collect();
-    assert!(
-        !extra.is_empty() && extra.len() <= 2,
-        "精确之外应补 1~2 条，实际 {en:?}"
+    assert_eq!(
+        extra.len(),
+        1,
+        "出厂 max_count = 2：精确之外补 1 条，实际 {en:?}"
     );
     let mut dedup = en.clone();
     dedup.sort();
@@ -138,7 +141,7 @@ fn completion_follows_word_frequency() {
 
 /// 双拼下不生效：判据按全拼音节定义，双拼码套不上。
 #[test]
-fn shuangpin_ignores_prefix_complete() {
+fn shuangpin_ignores_completion() {
     if !ready("shuangpin") {
         eprintln!("跳过：shuangpin 方案或英文词库不存在");
         return;
@@ -155,4 +158,28 @@ fn shuangpin_ignores_prefix_complete() {
     );
     // 反向对照：同一串在全拼下会补，说明上面的空不是词库缺词造成的。
     assert!(!english_texts(&manager("pinyin", true), "templa").is_empty());
+}
+
+/// `exact_position` 出厂 0 = 按方案自动：全拼 1、双拼 2；显式写值时两者都用它。
+/// `complete_position` 出厂 2。
+#[test]
+fn exact_position_auto_by_scheme() {
+    if !ready("pinyin") || !ready("shuangpin") {
+        eprintln!("跳过：pinyin / shuangpin 方案或英文词库不存在");
+        return;
+    }
+    assert_eq!(manager("pinyin", false).active_english_positions(), (1, 2));
+    assert_eq!(
+        manager("shuangpin", false).active_english_positions(),
+        (2, 2)
+    );
+    for schema in ["pinyin", "shuangpin"] {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec![schema.to_string()];
+        cfg.schema.active = schema.to_string();
+        cfg.schema.pinyin.english_merge.enable = true;
+        cfg.schema.pinyin.english_merge.exact_position = 3;
+        let mgr = EngineManager::new(&cfg, Some(&data_dir()));
+        assert_eq!(mgr.active_english_positions(), (3, 2), "{schema} 显式 3");
+    }
 }

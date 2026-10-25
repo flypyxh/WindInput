@@ -34,6 +34,32 @@
   未经 LDC 授权的商业使用**。原文抄录于文件头。如您是权利人且认为本项目的使用不当，请通过
   Issue 联系我们
 
+#### 联想「下一词」表 (assoc_bigram.txt)
+
+- **用途**: 智能联想的「下一词」源——上屏一个词后，给出它后面常接的词（「谢谢」→「你」「大家」）
+- **文件**: `data/assoc/assoc_bigram.txt`
+- **来源**: [rime-octagram-data](https://github.com/lotem/rime-octagram-data)（`hans` 分支）的
+  语言模型 `zh-hans-t-essay-bgw.gram`，模型 sha256 写在文件头
+- **加工方式**: `scripts/lm/distill_assoc_bigram.py` 离线蒸馏：取白霜拼音词库权重最高的 4 万个
+  上文，在模型里走出各自的后继，只留词库内的词、按模型分值取前 12 个；句末记号 `$` 原样保留
+- **标点**: 每行的句末记号 `$` 换成了按[中文维基百科](https://zh.wikipedia.org)正文统计出的、该上文
+  后面最常接的句读（`scripts/lm/distill_assoc_punct.py`；语料与计数 sha256 写在文件头）
+- **许可证**: LGPL-3.0（上游）。本文件是其派生数据，同样适用 LGPL-3.0；其中的标点统计源自中文维基
+  百科（CC BY-SA 4.0，作者为维基百科贡献者），该部分同时适用 CC BY-SA 4.0
+
+#### 拼音整句语法模型 (wanxiang-mini.gram)
+
+- **用途**: 拼音整句打分的上下文语言模型（移动端默认启用，桌面默认关）
+- **文件**: `data/schemas/pinyin/grammar/wanxiang-mini.gram`
+- **来源**: [rime-wanxiang-data](https://github.com/amzxyz/rime-wanxiang-data)（作者 amzxyz）`LTS` 发布的
+  `wanxiang-lts-zh-hans.gram`（sha256 `9eedac1d…`，见 `scripts/lm/build_grammar.sh`）
+- **加工方式**: `scripts/lm/build_grammar.sh` 只保留原模型里的部分条目（格式与条目的值不变）：
+  挑选依据是条目在下列语料的正确切分上是否被用到——[Tatoeba](https://tatoeba.org)（CC BY 2.0 FR）、
+  [KdConv](https://github.com/thu-coai/KdConv) / [CrossWOZ](https://github.com/thu-coai/CrossWOZ) /
+  [CPED](https://github.com/scutcyr/CPED) 训练划分（Apache-2.0）、中文维基百科（CC BY-SA 4.0）。
+  这些语料本身不进产物
+- **许可证**: CC-BY-4.0（上游）。本文件是其子集，同样适用 CC-BY-4.0
+
 ### 构建时下载的资源（不包含在本仓库中）
 
 以下资源在构建过程中由构建脚本从原始仓库下载（缓存于 `.cache/`，已被
@@ -221,6 +247,9 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 GPL-3.0 许可的词库数据（rime-frost）与 LGPL-3.0 许可的笔画码表（rime-stroke）
 不包含在本仓库中，而是在构建过程中作为外部数据依赖从原始仓库下载；发行版中包含
 由其生成的数据文件，该部分数据分别适用 GPL-3.0 / LGPL-3.0 条款。
+
+LGPL-3.0 许可的联想「下一词」表（`data/assoc/assoc_bigram.txt`，蒸馏自 rime-octagram-data）
+入库并随发行版分发，适用 LGPL-3.0 条款；表中的标点统计源自中文维基百科，同时适用 CC BY-SA 4.0。
 
 LGPL-3.0 许可的 emoji 映射表（rime-emoji）同样不入库，但发行版中包含的是其
 **未经修改的原始文件**（`data/emoji/`），适用 LGPL-3.0 条款，并随附上游 LICENSE 全文。

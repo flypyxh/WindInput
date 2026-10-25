@@ -397,7 +397,7 @@ impl PhraseSegIndex {
             // SAFETY: 映射期间文件内容不得被改写。本模块只经「临时文件 + rename」替换，
             // 从不原地写，被映射的那份 inode 内容不变；外部篡改的风险与 `.wdat`/`.wridx`
             // 的 mmap 相同。
-            match unsafe { memmap2::Mmap::map(&file) } {
+            match wind_dict::mapping::map_file(&file) {
                 Ok(m) => ImageData::Mapped(m),
                 Err(e) => {
                     tracing::warn!(

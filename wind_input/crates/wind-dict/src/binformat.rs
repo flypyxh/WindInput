@@ -111,7 +111,7 @@ impl DictReader {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = crate::mapping::map_file(&file)?;
 
         let header = DictFileHeader::from_bytes(&mmap)
             .ok_or_else(|| anyhow::anyhow!("invalid wdb file: too short"))?;

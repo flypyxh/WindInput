@@ -1,0 +1,645 @@
+---
+# 拼音误读表（内置）
+#
+# 用户打出某个词常见的错误读音时，候选里带出正确拼音提示（莘(shen)莘(shen)）；词库读不出这个词时
+# 也以低权重召回到候选里（不占首选、不自动上屏）。召回与提示受设置「纠错与提示 → 提示来源 → 误读」控制。
+#
+# 列表体每项一个 mapping，一行一项：
+#   text   词（两字以上）
+#   wrong  错误读音；同一个词有几种常见读错法时写成列表 [a b, c d]
+#   right  正确读音
+#   读音按音节以空格分隔、不带声调，ü 写作 v。另可写 note（说明）、group（分组），引擎不读；
+#   不认识的字段一律忽略。格式不对的项跳过并在日志里告警，不影响其余条目。
+#
+# 用户可在用户数据目录的 data/pinyin_misread.yaml 用同样格式追加条目，同一「text + wrong」覆盖本表。
+#
+# 本表由清风输入法自行整理，读音以《现代汉语词典》为准，并逐条核对过随包拼音词库：正确读音是词库
+# 登记的读音，错误读音不是；错误拼写本身就是高频词拼写的（如 xinxin = 信心）不收，免得打常用词时
+# 候选里混进召回项。未参照其他输入法项目的误读表。
+name: pinyin_misread
+version: "2026.10.24"
+description: 常见误读词的正确读音（内置）
+...
+
+# —— 形声字：照声旁（半边）读错 ——
+- {text: 馄饨, wrong: hun dun, right: hun tun}
+- {text: 唾弃, wrong: chui qi, right: tuo qi}
+- {text: 蛤蟆, wrong: ge ma, right: ha ma}
+- {text: 炽热, wrong: zhi re, right: chi re}
+- {text: 酗酒, wrong: xiong jiu, right: xu jiu}
+- {text: 龋齿, wrong: yu chi, right: qu chi}
+- {text: 憎恨, wrong: ceng hen, right: zeng hen}
+- {text: 憎恶, wrong: ceng wu, right: zeng wu}
+- {text: 粗犷, wrong: cu kuang, right: cu guang}
+- {text: 惬意, wrong: xia yi, right: qie yi}
+- {text: 鞭笞, wrong: bian tai, right: bian chi}
+- {text: 狙击, wrong: zu ji, right: ju ji}
+- {text: 贿赂, wrong: hui luo, right: hui lu}
+- {text: 吮吸, wrong: yun xi, right: shun xi}
+- {text: 静谧, wrong: jing bi, right: jing mi}
+- {text: 联袂, wrong: lian jue, right: lian mei}
+- {text: 自诩, wrong: zi yu, right: zi xu}
+- {text: 包庇, wrong: bao pi, right: bao bi}
+- {text: 庇护, wrong: pi hu, right: bi hu}
+- {text: 庇荫, wrong: pi yin, right: bi yin}
+- {text: 奴婢, wrong: nu bei, right: nu bi}
+- {text: 刽子手, wrong: hui zi shou, right: gui zi shou}
+- {text: 酝酿, wrong: wen niang, right: yun niang}
+- {text: 横亘, wrong: heng geng, right: heng gen}
+- {text: 剽窃, wrong: biao qie, right: piao qie}
+- {text: 蹒跚, wrong: man shan, right: pan shan}
+- {text: 媲美, wrong: bi mei, right: pi mei}
+- {text: 憧憬, wrong: tong jing, right: chong jing}
+- {text: 谄媚, wrong: xian mei, right: chan mei}
+- {text: 皈依, wrong: ban yi, right: gui yi}
+- {text: 粳米, wrong: geng mi, right: jing mi}
+- {text: 鸟瞰, wrong: niao gan, right: niao kan}
+- {text: 绮丽, wrong: yi li, right: qi li}
+- {text: 熠熠, wrong: xi xi, right: yi yi}
+- {text: 纨绔, wrong: wan kua, right: wan ku}
+- {text: 桎梏, wrong: zhi gao, right: zhi gu}
+- {text: 掣肘, wrong: zhi zhou, right: che zhou}
+- {text: 牵掣, wrong: qian zhi, right: qian che}
+- {text: 浣熊, wrong: wan xiong, right: huan xiong}
+- {text: 莅临, wrong: wei lin, right: li lin}
+- {text: 蛊惑, wrong: chong huo, right: gu huo}
+- {text: 胴体, wrong: tong ti, right: dong ti}
+- {text: 畸形, wrong: qi xing, right: ji xing}
+- {text: 歼灭, wrong: qian mie, right: jian mie}
+- {text: 河畔, wrong: he ban, right: he pan}
+- {text: 混淆, wrong: hun yao, right: hun xiao}
+- {text: 赡养, wrong: zhan yang, right: shan yang}
+- {text: 濒临, wrong: pin lin, right: bin lin}
+- {text: 濒危, wrong: pin wei, right: bin wei}
+- {text: 啜泣, wrong: zhui qi, right: chuo qi}
+- {text: 镌刻, wrong: jun ke, right: juan ke}
+- {text: 阻挠, wrong: zu rao, right: zu nao}
+- {text: 狡黠, wrong: jiao jie, right: jiao xia}
+- {text: 谬论, wrong: miao lun, right: miu lun}
+- {text: 荒谬, wrong: huang miao, right: huang miu}
+- {text: 瓦砾, wrong: wa le, right: wa li}
+- {text: 绚丽, wrong: xun li, right: xuan li}
+- {text: 跻身, wrong: qi shen, right: ji shen}
+- {text: 犄角, wrong: qi jiao, right: ji jiao}
+- {text: 迸发, wrong: bing fa, right: beng fa}
+- {text: 毗邻, wrong: bi lin, right: pi lin}
+- {text: 呻吟, wrong: shen jin, right: shen yin}
+- {text: 渎职, wrong: mai zhi, right: du zhi}
+- {text: 浸渍, wrong: jin ji, right: jin zi}
+- {text: 汲取, wrong: xi qu, right: ji qu}
+- {text: 恣意, wrong: ci yi, right: zi yi}
+- {text: 揶揄, wrong: ye shu, right: ye yu}
+- {text: 歆羡, wrong: yin xian, right: xin xian}
+- {text: 憔悴, wrong: jiao cui, right: qiao cui}
+- {text: 舔舐, wrong: tian di, right: tian shi}
+- {text: 惆怅, wrong: zhou chang, right: chou chang}
+- {text: 怅然, wrong: zhang ran, right: chang ran}
+- {text: 蜷缩, wrong: juan suo, right: quan suo}
+- {text: 蓦然, wrong: mu ran, right: mo ran}
+- {text: 咫尺, wrong: chi chi, right: zhi chi}
+- {text: 剔透, wrong: yi tou, right: ti tou}
+- {text: 颀长, wrong: qin chang, right: qi chang}
+- {text: 鞭挞, wrong: bian da, right: bian ta}
+- {text: 隽永, wrong: jun yong, right: juan yong}
+- {text: 侥幸, wrong: rao xing, right: jiao xing}
+- {text: 胼胝, wrong: bing di, right: pian zhi}
+- {text: 发怵, wrong: fa shu, right: fa chu}
+- {text: 赝品, wrong: ying pin, right: yan pin}
+- {text: 呜咽, wrong: wu yan, right: wu ye}
+- {text: 哽咽, wrong: geng yan, right: geng ye}
+- {text: 枸杞, wrong: ju qi, right: gou qi}
+- {text: 遒劲, wrong: [you jin, qiu jin], right: qiu jing}
+- {text: 瞥见, wrong: bie jian, right: pie jian}
+- {text: 倏忽, wrong: you hu, right: shu hu}
+- {text: 臧否, wrong: zang fou, right: zang pi}
+- {text: 匮乏, wrong: gui fa, right: kui fa}
+- {text: 馈赠, wrong: gui zeng, right: kui zeng}
+- {text: 溃疡, wrong: gui yang, right: kui yang}
+- {text: 嗔怪, wrong: zhen guai, right: chen guai}
+- {text: 关隘, wrong: guan yi, right: guan ai}
+- {text: 狭隘, wrong: xia yi, right: xia ai}
+- {text: 讴歌, wrong: qu ge, right: ou ge}
+- {text: 殴打, wrong: qu da, right: ou da}
+- {text: 枢纽, wrong: qu niu, right: shu niu}
+- {text: 佝偻, wrong: ju lou, right: gou lou}
+- {text: 踽踽, wrong: yu yu, right: ju ju}
+- {text: 趔趄, wrong: lie ju, right: lie qie}
+- {text: 翌日, wrong: li ri, right: yi ri}
+- {text: 熨帖, wrong: [yun tie, wei tie], right: yu tie}
+- {text: 解剖, wrong: jie po, right: jie pou}
+- {text: 剖析, wrong: po xi, right: pou xi}
+- {text: 骈文, wrong: bing wen, right: pian wen}
+- {text: 翩跹, wrong: pian qian, right: pian xian}
+- {text: 蕴藉, wrong: yun ji, right: yun jie}
+- {text: 狼藉, wrong: lang jie, right: lang ji}
+- {text: 婀娜, wrong: a na, right: e nuo}
+- {text: 袅娜, wrong: niao na, right: niao nuo}
+- {text: 惴惴不安, wrong: rui rui bu an, right: zhui zhui bu an}
+- {text: 湍急, wrong: chuan ji, right: tuan ji}
+- {text: 睥睨, wrong: bei ni, right: pi ni}
+- {text: 裨益, wrong: bei yi, right: bi yi}
+- {text: 疱疹, wrong: bao zhen, right: pao zhen}
+- {text: 栖息, wrong: xi xi, right: qi xi}
+- {text: 两栖, wrong: liang xi, right: liang qi}
+- {text: 粗糙, wrong: cu zao, right: cu cao}
+- {text: 造诣, wrong: zao zhi, right: zao yi}
+- {text: 炙热, wrong: jiu re, right: zhi re}
+- {text: 针砭, wrong: zhen fa, right: zhen bian}
+- {text: 屹立, wrong: qi li, right: yi li}
+- {text: 摒弃, wrong: ping qi, right: bing qi}
+- {text: 屏息, wrong: ping xi, right: bing xi}
+- {text: 屏气, wrong: ping qi, right: bing qi}
+- {text: 绽放, wrong: ding fang, right: zhan fang}
+- {text: 破绽, wrong: po ding, right: po zhan}
+- {text: 绥靖, wrong: tuo jing, right: sui jing}
+- {text: 气馁, wrong: qi tuo, right: qi nei}
+- {text: 悚然, wrong: shu ran, right: song ran}
+- {text: 怂恿, wrong: cong yong, right: song yong}
+- {text: 拗口, wrong: you kou, right: ao kou}
+- {text: 倜傥, wrong: diao tang, right: ti tang}
+- {text: 蹉跎, wrong: cha tuo, right: cuo tuo}
+- {text: 嗟叹, wrong: cha tan, right: jie tan}
+- {text: 磋商, wrong: cha shang, right: cuo shang}
+- {text: 切磋, wrong: qie cha, right: qie cuo}
+- {text: 怦然心动, wrong: ping ran xin dong, right: peng ran xin dong}
+- {text: 抨击, wrong: ping ji, right: peng ji}
+- {text: 蹊跷, wrong: xi qiao, right: qi qiao}
+- {text: 奇葩, wrong: qi ba, right: qi pa}
+- {text: 孱弱, wrong: can ruo, right: chan ruo}
+- {text: 皑皑, wrong: kai kai, right: ai ai}
+- {text: 饕餮, wrong: tao can, right: tao tie}
+- {text: 罹难, wrong: luo nan, right: li nan}
+- {text: 罹患, wrong: luo huan, right: li huan}
+- {text: 相濡以沫, wrong: xiang xu yi mo, right: xiang ru yi mo}
+- {text: 孺子可教, wrong: xu zi ke jiao, right: ru zi ke jiao}
+- {text: 侏儒, wrong: zhu xu, right: zhu ru}
+- {text: 忏悔, wrong: qian hui, right: chan hui}
+- {text: 一语成谶, wrong: yi yu cheng qian, right: yi yu cheng chen}
+- {text: 缄默, wrong: xian mo, right: jian mo}
+- {text: 三缄其口, wrong: san xian qi kou, right: san jian qi kou}
+- {text: 苋菜, wrong: jian cai, right: xian cai}
+- {text: 觊觎, wrong: kai yu, right: ji yu}
+- {text: 牡蛎, wrong: mu wan, right: mu li}
+- {text: 河蚌, wrong: he feng, right: he bang}
+- {text: 诘问, wrong: ji wen, right: jie wen}
+- {text: 桔梗, wrong: ju geng, right: jie geng}
+- {text: 侗族, wrong: tong zu, right: dong zu}
+- {text: 遏制, wrong: he zhi, right: e zhi}
+- {text: 谒见, wrong: he jian, right: ye jian}
+- {text: 拜谒, wrong: bai he, right: bai ye}
+- {text: 呕心沥血, wrong: qu xin li xue, right: ou xin li xue}
+- {text: 怄气, wrong: qu qi, right: ou qi}
+- {text: 老妪, wrong: lao qu, right: lao yu}
+- {text: 骰子, wrong: gu zi, right: tou zi}
+- {text: 饮鸩止渴, wrong: yin jiu zhi ke, right: yin zhen zhi ke}
+- {text: 干涸, wrong: gan gu, right: gan he}
+- {text: 付梓, wrong: fu xin, right: fu zi}
+- {text: 桑梓, wrong: sang xin, right: sang zi}
+- {text: 渣滓, wrong: zha zai, right: zha zi}
+- {text: 锲而不舍, wrong: qi er bu she, right: qie er bu she}
+- {text: 提纲挈领, wrong: ti gang qi ling, right: ti gang qie ling}
+- {text: 麻痹, wrong: ma pi, right: ma bi}
+- {text: 篡改, wrong: suan gai, right: cuan gai}
+- {text: 篡夺, wrong: suan duo, right: cuan duo}
+- {text: 攒动, wrong: zan dong, right: cuan dong}
+- {text: 人头攒动, wrong: ren tou zan dong, right: ren tou cuan dong}
+- {text: 隔阂, wrong: ge hai, right: ge he}
+- {text: 弹劾, wrong: [dan he, dan hai], right: tan he}
+- {text: 言简意赅, wrong: yan jian yi hai, right: yan jian yi gai}
+- {text: 羸弱, wrong: ying ruo, right: lei ruo}
+- {text: 鬼鬼祟祟, wrong: gui gui chong chong, right: gui gui sui sui}
+- {text: 作祟, wrong: zuo chong, right: zuo sui}
+- {text: 泅渡, wrong: si du, right: qiu du}
+- {text: 拙劣, wrong: chu lie, right: zhuo lie}
+- {text: 笨拙, wrong: ben chu, right: ben zhuo}
+- {text: 弄巧成拙, wrong: nong qiao cheng chu, right: nong qiao cheng zhuo}
+- {text: 茁壮, wrong: chu zhuang, right: zhuo zhuang}
+- {text: 咄咄逼人, wrong: chu chu bi ren, right: duo duo bi ren}
+- {text: 相形见绌, wrong: xiang xing jian zhuo, right: xiang xing jian chu}
+- {text: 教唆, wrong: jiao jun, right: jiao suo}
+- {text: 逡巡, wrong: jun xun, right: qun xun}
+- {text: 气喘吁吁, wrong: qi chuan yu yu, right: qi chuan xu xu}
+- {text: 长吁短叹, wrong: chang yu duan tan, right: chang xu duan tan}
+- {text: 驰骋, wrong: chi pin, right: chi cheng}
+- {text: 娉婷, wrong: pin ting, right: ping ting}
+- {text: 澄澈, wrong: deng che, right: cheng che}
+- {text: 荨麻疹, wrong: qian ma zhen, right: xun ma zhen}
+- {text: 嫔妃, wrong: bin fei, right: pin fei}
+- {text: 挟持, wrong: jia chi, right: xie chi}
+- {text: 要挟, wrong: yao jia, right: yao xie}
+- {text: 谙熟, wrong: yin shu, right: an shu}
+- {text: 不谙世事, wrong: bu yin shi shi, right: bu an shi shi}
+- {text: 癫痫, wrong: dian jian, right: dian xian}
+- {text: 泌尿, wrong: bi niao, right: mi niao}
+- {text: 分泌, wrong: fen bi, right: fen mi}
+- {text: 壅塞, wrong: yong sai, right: yong se}
+- {text: 百折不挠, wrong: bai zhe bu rao, right: bai zhe bu nao}
+- {text: 不屈不挠, wrong: bu qu bu rao, right: bu qu bu nao}
+- {text: 抓耳挠腮, wrong: zhua er rao sai, right: zhua er nao sai}
+- {text: 蛲虫, wrong: rao chong, right: nao chong}
+- {text: 耄耋, wrong: mao zhi, right: mao die}
+- {text: 耄耋之年, wrong: mao zhi zhi nian, right: mao die zhi nian}
+- {text: 垂涎, wrong: chui yan, right: chui xian}
+- {text: 垂涎三尺, wrong: chui yan san chi, right: chui xian san chi}
+- {text: 觥筹交错, wrong: guang chou jiao cuo, right: gong chou jiao cuo}
+- {text: 傀儡, wrong: gui lei, right: kui lei}
+- {text: 旖旎, wrong: qi ni, right: yi ni}
+- {text: 涟漪, wrong: lian qi, right: lian yi}
+- {text: 妊娠, wrong: ren chen, right: ren shen}
+- {text: 赈灾, wrong: chen zai, right: zhen zai}
+- {text: 海市蜃楼, wrong: hai shi chen lou, right: hai shi shen lou}
+- {text: 栩栩如生, wrong: yu yu ru sheng, right: xu xu ru sheng}
+- {text: 叨扰, wrong: dao rao, right: tao rao}
+- {text: 贻笑大方, wrong: tai xiao da fang, right: yi xiao da fang}
+- {text: 贻误, wrong: tai wu, right: yi wu}
+- {text: 饴糖, wrong: tai tang, right: yi tang}
+- {text: 含饴弄孙, wrong: han tai nong sun, right: han yi nong sun}
+- {text: 戏谑, wrong: xi nve, right: xi xue}
+- {text: 诲人不倦, wrong: hai ren bu juan, right: hui ren bu juan}
+- {text: 范畴, wrong: fan shou, right: fan chou}
+- {text: 舷窗, wrong: xuan chuang, right: xian chuang}
+- {text: 船舷, wrong: chuan xuan, right: chuan xian}
+- {text: 儋州, wrong: zhan zhou, right: dan zhou}
+- {text: 蹙眉, wrong: qi mei, right: cu mei}
+- {text: 痤疮, wrong: zuo chuang, right: cuo chuang}
+- {text: 巨擘, wrong: ju bi, right: ju bo}
+- {text: 撷取, wrong: jie qu, right: xie qu}
+- {text: 采撷, wrong: cai jie, right: cai xie}
+- {text: 溯源, wrong: shuo yuan, right: su yuan}
+- {text: 追溯, wrong: zhui shuo, right: zhui su}
+- {text: 上溯, wrong: shang shuo, right: shang su}
+- {text: 樵夫, wrong: jiao fu, right: qiao fu}
+- {text: 熟稔, wrong: shu nian, right: shu ren}
+- {text: 租赁, wrong: zu ren, right: zu lin}
+- {text: 彷徨, wrong: fang huang, right: pang huang}
+- {text: 膀胱, wrong: bang guang, right: pang guang}
+- {text: 气势磅礴, wrong: qi shi bang bo, right: qi shi pang bo}
+- {text: 磅礴, wrong: bang bo, right: pang bo}
+- {text: 烘焙, wrong: hong pei, right: hong bei}
+- {text: 投掷, wrong: tou zheng, right: tou zhi}
+- {text: 掷地有声, wrong: zheng di you sheng, right: zhi di you sheng}
+- {text: 孤注一掷, wrong: gu zhu yi zheng, right: gu zhu yi zhi}
+- {text: 贵胄, wrong: gui you, right: gui zhou}
+- {text: 圭臬, wrong: gui zi, right: gui nie}
+- {text: 奉为圭臬, wrong: feng wei gui zi, right: feng wei gui nie}
+- {text: 谥号, wrong: yi hao, right: shi hao}
+- {text: 傩戏, wrong: nan xi, right: nuo xi}
+- {text: 徘徊, wrong: pai hui, right: pai huai}
+- {text: 引吭高歌, wrong: yin keng gao ge, right: yin hang gao ge}
+- {text: 黄发垂髫, wrong: huang fa chui zhao, right: huang fa chui tiao}
+- {text: 垂髫, wrong: chui zhao, right: chui tiao}
+- {text: 迢迢, wrong: zhao zhao, right: tiao tiao}
+- {text: 千里迢迢, wrong: qian li zhao zhao, right: qian li tiao tiao}
+- {text: 笤帚, wrong: zhao zhou, right: tiao zhou}
+- {text: 韶华, wrong: zhao hua, right: shao hua}
+- {text: 韶光, wrong: zhao guang, right: shao guang}
+- {text: 韶关, wrong: zhao guan, right: shao guan}
+- {text: 玷污, wrong: zhan wu, right: dian wu}
+- {text: 拈花惹草, wrong: zhan hua re cao, right: nian hua re cao}
+- {text: 信手拈来, wrong: xin shou zhan lai, right: xin shou nian lai}
+- {text: 鲶鱼, wrong: zhan yu, right: nian yu}
+- {text: 砧板, wrong: zhan ban, right: zhen ban}
+- {text: 不啻, wrong: bu di, right: bu chi}
+- {text: 草菅人命, wrong: cao guan ren ming, right: cao jian ren ming}
+- {text: 风驰电掣, wrong: feng chi dian zhi, right: feng chi dian che}
+- {text: 栉风沐雨, wrong: jie feng mu yu, right: zhi feng mu yu}
+- {text: 风声鹤唳, wrong: feng sheng he lei, right: feng sheng he li}
+- {text: 自出机杼, wrong: zi chu ji yu, right: zi chu ji zhu}
+- {text: 杳无音信, wrong: [xing wu yin xin, miao wu yin xin], right: yao wu yin xin}
+- {text: 茕茕孑立, wrong: ying ying jie li, right: qiong qiong jie li}
+- {text: 孑然一身, wrong: zi ran yi shen, right: jie ran yi shen}
+- {text: 踽踽独行, wrong: yu yu du xing, right: ju ju du xing}
+- {text: 按捺不住, wrong: an nai bu zhu, right: an na bu zhu}
+- {text: 纵横捭阖, wrong: zong heng bei he, right: zong heng bai he}
+- {text: 捭阖, wrong: bei he, right: bai he}
+- {text: 越俎代庖, wrong: yue zu dai bao, right: yue zu dai pao}
+- {text: 庖丁解牛, wrong: bao ding jie niu, right: pao ding jie niu}
+- {text: 暴殄天物, wrong: bao zhen tian wu, right: bao tian tian wu}
+- {text: 魑魅魍魉, wrong: li mei wang liang, right: chi mei wang liang}
+- {text: 并行不悖, wrong: bing xing bu bo, right: bing xing bu bei}
+- {text: 悖论, wrong: bo lun, right: bei lun}
+- {text: 虚与委蛇, wrong: xu yu wei she, right: xu yu wei yi}
+- {text: 卷帙浩繁, wrong: juan shi hao fan, right: juan zhi hao fan}
+- {text: 光风霁月, wrong: guang feng qi yue, right: guang feng ji yue}
+- {text: 荠菜, wrong: qi cai, right: ji cai}
+- {text: 穷兵黩武, wrong: qiong bing mai wu, right: qiong bing du wu}
+- {text: 市侩, wrong: shi hui, right: shi kuai}
+- {text: 脍炙人口, wrong: hui zhi ren kou, right: kuai zhi ren kou}
+- {text: 炙手可热, wrong: jiu shou ke re, right: zhi shou ke re}
+- {text: 针砭时弊, wrong: zhen fa shi bi, right: zhen bian shi bi}
+- {text: 未雨绸缪, wrong: wei yu chou miu, right: wei yu chou mou}
+
+# —— 多音字：读成另一个音 ——
+- {text: 调研, wrong: tiao yan, right: diao yan}
+- {text: 契机, wrong: qie ji, right: qi ji}
+- {text: 角色, wrong: jiao se, right: jue se}
+- {text: 主角, wrong: zhu jiao, right: zhu jue}
+- {text: 配角, wrong: pei jiao, right: pei jue}
+- {text: 丑角, wrong: chou jiao, right: chou jue}
+- {text: 名角, wrong: ming jiao, right: ming jue}
+- {text: 角逐, wrong: jiao zhu, right: jue zhu}
+- {text: 着陆, wrong: zhao lu, right: zhuo lu}
+- {text: 着装, wrong: zhao zhuang, right: zhuo zhuang}
+- {text: 着重, wrong: zhao zhong, right: zhuo zhong}
+- {text: 着手, wrong: zhao shou, right: zhuo shou}
+- {text: 着想, wrong: zhao xiang, right: zhuo xiang}
+- {text: 执着, wrong: zhi zhao, right: zhi zhuo}
+- {text: 穿着, wrong: chuan zhao, right: chuan zhuo}
+- {text: 着落, wrong: zhao luo, right: zhuo luo}
+- {text: 着眼, wrong: zhao yan, right: zhuo yan}
+- {text: 着实, wrong: zhao shi, right: zhuo shi}
+- {text: 着色, wrong: zhao se, right: zhuo se}
+- {text: 附着, wrong: fu zhao, right: fu zhuo}
+- {text: 沉着, wrong: chen zhao, right: chen zhuo}
+- {text: 着墨, wrong: zhao mo, right: zhuo mo}
+- {text: 不着边际, wrong: bu zhao bian ji, right: bu zhuo bian ji}
+- {text: 着急, wrong: zhuo ji, right: zhao ji}
+- {text: 着凉, wrong: zhuo liang, right: zhao liang}
+- {text: 着迷, wrong: zhuo mi, right: zhao mi}
+- {text: 着火, wrong: zhuo huo, right: zhao huo}
+- {text: 睡着, wrong: shui zhuo, right: shui zhao}
+- {text: 塑料, wrong: suo liao, right: su liao}
+- {text: 塑造, wrong: suo zao, right: su zao}
+- {text: 雕塑, wrong: diao suo, right: diao su}
+- {text: 塑像, wrong: suo xiang, right: su xiang}
+- {text: 可塑性, wrong: ke suo xing, right: ke su xing}
+- {text: 机械, wrong: ji jie, right: ji xie}
+- {text: 器械, wrong: qi jie, right: qi xie}
+- {text: 缴械, wrong: jiao jie, right: jiao xie}
+- {text: 械斗, wrong: jie dou, right: xie dou}
+- {text: 倔强, wrong: jue qiang, right: jue jiang}
+- {text: 堤防, wrong: ti fang, right: di fang}
+- {text: 提防, wrong: ti fang, right: di fang}
+- {text: 堤坝, wrong: ti ba, right: di ba}
+- {text: 河堤, wrong: he ti, right: he di}
+- {text: 栅栏, wrong: shan lan, right: zha lan}
+- {text: 果脯, wrong: guo pu, right: guo fu}
+- {text: 胸脯, wrong: xiong fu, right: xiong pu}
+- {text: 曝光, wrong: pu guang, right: bao guang}
+- {text: 曝晒, wrong: bao shai, right: pu shai}
+- {text: 一曝十寒, wrong: yi bao shi han, right: yi pu shi han}
+- {text: 咀嚼, wrong: ju jiao, right: ju jue}
+- {text: 埋怨, wrong: mai yuan, right: man yuan}
+- {text: 呆板, wrong: ai ban, right: dai ban}
+- {text: 呆滞, wrong: ai zhi, right: dai zhi}
+- {text: 弄堂, wrong: nong tang, right: long tang}
+- {text: 星宿, wrong: xing su, right: xing xiu}
+- {text: 发酵, wrong: fa xiao, right: fa jiao}
+- {text: 纤维, wrong: qian wei, right: xian wei}
+- {text: 纤细, wrong: qian xi, right: xian xi}
+- {text: 纤尘不染, wrong: qian chen bu ran, right: xian chen bu ran}
+- {text: 纤夫, wrong: xian fu, right: qian fu}
+- {text: 拉纤, wrong: la xian, right: la qian}
+- {text: 剥削, wrong: bo xiao, right: bo xue}
+- {text: 削弱, wrong: xiao ruo, right: xue ruo}
+- {text: 削减, wrong: xiao jian, right: xue jian}
+- {text: 瘦削, wrong: shou xiao, right: shou xue}
+- {text: 削足适履, wrong: xiao zu shi lv, right: xue zu shi lv}
+- {text: 剥夺, wrong: bao duo, right: bo duo}
+- {text: 剥蚀, wrong: bao shi, right: bo shi}
+- {text: 生吞活剥, wrong: sheng tun huo bao, right: sheng tun huo bo}
+- {text: 薄弱, wrong: bao ruo, right: bo ruo}
+- {text: 淡薄, wrong: dan bao, right: dan bo}
+- {text: 浅薄, wrong: qian bao, right: qian bo}
+- {text: 薄荷, wrong: bao he, right: bo he}
+- {text: 刻薄, wrong: ke bao, right: ke bo}
+- {text: 尖酸刻薄, wrong: jian suan ke bao, right: jian suan ke bo}
+- {text: 日薄西山, wrong: ri bao xi shan, right: ri bo xi shan}
+- {text: 妄自菲薄, wrong: wang zi fei bao, right: wang zi fei bo}
+- {text: 厚此薄彼, wrong: hou ci bao bi, right: hou ci bo bi}
+- {text: 自给自足, wrong: zi gei zi zu, right: zi ji zi zu}
+- {text: 配给, wrong: pei gei, right: pei ji}
+- {text: 给养, wrong: gei yang, right: ji yang}
+- {text: 大腹便便, wrong: da fu bian bian, right: da fu pian pian}
+- {text: 参差不齐, wrong: can cha bu qi, right: cen ci bu qi}
+- {text: 参差, wrong: can cha, right: cen ci}
+- {text: 人参, wrong: ren can, right: ren shen}
+- {text: 差使, wrong: cha shi, right: chai shi}
+- {text: 出差, wrong: chu cha, right: chu chai}
+- {text: 差遣, wrong: cha qian, right: chai qian}
+- {text: 一蹴而就, wrong: yi jiu er jiu, right: yi cu er jiu}
+- {text: 蹴鞠, wrong: jiu ju, right: cu ju}
+- {text: 似的, wrong: si de, right: shi de}
+- {text: 一模一样, wrong: yi mo yi yang, right: yi mu yi yang}
+- {text: 模样, wrong: mo yang, right: mu yang}
+- {text: 模具, wrong: mo ju, right: mu ju}
+- {text: 模板, wrong: mo ban, right: mu ban}
+- {text: 模子, wrong: mo zi, right: mu zi}
+- {text: 装模作样, wrong: zhuang mo zuo yang, right: zhuang mu zuo yang}
+- {text: 有模有样, wrong: you mo you yang, right: you mu you yang}
+- {text: 说服, wrong: shui fu, right: shuo fu}
+- {text: 说客, wrong: shuo ke, right: shui ke}
+- {text: 道行, wrong: dao hang, right: dao heng}
+- {text: 行伍, wrong: xing wu, right: hang wu}
+- {text: 行当, wrong: xing dang, right: hang dang}
+- {text: 校对, wrong: xiao dui, right: jiao dui}
+- {text: 校订, wrong: xiao ding, right: jiao ding}
+- {text: 校正, wrong: xiao zheng, right: jiao zheng}
+- {text: 校勘, wrong: xiao kan, right: jiao kan}
+- {text: 校准, wrong: xiao zhun, right: jiao zhun}
+- {text: 校验, wrong: xiao yan, right: jiao yan}
+- {text: 粘贴, wrong: nian tie, right: zhan tie}
+- {text: 粘连, wrong: nian lian, right: zhan lian}
+- {text: 浑身解数, wrong: hun shen jie shu, right: hun shen xie shu}
+- {text: 瓜蔓, wrong: gua man, right: gua wan}
+- {text: 可恶, wrong: ke e, right: ke wu}
+- {text: 厌恶, wrong: yan e, right: yan wu}
+- {text: 好恶, wrong: hao e, right: hao wu}
+- {text: 深恶痛绝, wrong: shen e tong jue, right: shen wu tong jue}
+- {text: 拓片, wrong: tuo pian, right: ta pian}
+- {text: 拓本, wrong: tuo ben, right: ta ben}
+- {text: 落枕, wrong: luo zhen, right: lao zhen}
+- {text: 丢三落四, wrong: diu san luo si, right: diu san la si}
+- {text: 厦门, wrong: sha men, right: xia men}
+- {text: 扁舟, wrong: bian zhou, right: pian zhou}
+- {text: 一叶扁舟, wrong: yi ye bian zhou, right: yi ye pian zhou}
+- {text: 心宽体胖, wrong: xin kuan ti pang, right: xin kuan ti pan}
+- {text: 呱呱坠地, wrong: gua gua zhui di, right: gu gu zhui di}
+- {text: 揠苗助长, wrong: yan miao zhu zhang, right: ya miao zhu zhang}
+- {text: 刚愎自用, wrong: gang fu zi yong, right: gang bi zi yong}
+- {text: 卡壳, wrong: [ka ke, ka qiao], right: qia ke}
+- {text: 地壳, wrong: di ke, right: di qiao}
+- {text: 贝壳, wrong: bei qiao, right: bei ke}
+- {text: 金蝉脱壳, wrong: jin chan tuo ke, right: jin chan tuo qiao}
+- {text: 弹壳, wrong: dan qiao, right: dan ke}
+- {text: 蛋壳, wrong: dan qiao, right: dan ke}
+- {text: 刀鞘, wrong: dao xiao, right: dao qiao}
+- {text: 剑鞘, wrong: jian xiao, right: jian qiao}
+- {text: 万马齐喑, wrong: wan ma qi an, right: wan ma qi yin}
+- {text: 咯血, wrong: ge xue, right: ka xue}
+- {text: 强劲, wrong: qiang jin, right: qiang jing}
+- {text: 刚劲, wrong: gang jin, right: gang jing}
+- {text: 劲敌, wrong: jin di, right: jing di}
+- {text: 劲旅, wrong: jin lv, right: jing lv}
+- {text: 苍劲, wrong: cang jin, right: cang jing}
+- {text: 亲家, wrong: qin jia, right: qing jia}
+- {text: 露脸, wrong: lu lian, right: lou lian}
+- {text: 露面, wrong: lu mian, right: lou mian}
+- {text: 露骨, wrong: lou gu, right: lu gu}
+- {text: 揭露, wrong: jie lou, right: jie lu}
+- {text: 暴露, wrong: bao lou, right: bao lu}
+- {text: 披露, wrong: pi lou, right: pi lu}
+- {text: 流露, wrong: liu lou, right: liu lu}
+- {text: 露宿, wrong: lou su, right: lu su}
+- {text: 恐吓, wrong: kong xia, right: kong he}
+- {text: 恫吓, wrong: dong xia, right: dong he}
+- {text: 威吓, wrong: wei xia, right: wei he}
+- {text: 吓唬, wrong: he hu, right: xia hu}
+- {text: 余勇可贾, wrong: yu yong ke jia, right: yu yong ke gu}
+- {text: 为虎作伥, wrong: wei hu zuo zhang, right: wei hu zuo chang}
+- {text: 稽首, wrong: ji shou, right: qi shou}
+- {text: 数见不鲜, wrong: shu jian bu xian, right: shuo jian bu xian}
+- {text: 怆然, wrong: qiang ran, right: chuang ran}
+- {text: 悲怆, wrong: bei qiang, right: bei chuang}
+- {text: 囹圄, wrong: ling wu, right: ling yu}
+- {text: 身陷囹圄, wrong: shen xian ling wu, right: shen xian ling yu}
+- {text: 乳臭未干, wrong: ru chou wei gan, right: ru xiu wei gan}
+- {text: 铜臭, wrong: tong chou, right: tong xiu}
+- {text: 自怨自艾, wrong: zi yuan zi ai, right: zi yuan zi yi}
+- {text: 炮烙, wrong: pao lao, right: pao luo}
+- {text: 刨根问底, wrong: bao gen wen di, right: pao gen wen di}
+- {text: 刨子, wrong: pao zi, right: bao zi}
+- {text: 刹那, wrong: sha na, right: cha na}
+- {text: 一刹那, wrong: yi sha na, right: yi cha na}
+- {text: 古刹, wrong: gu sha, right: gu cha}
+- {text: 刹车, wrong: cha che, right: sha che}
+- {text: 涮羊肉, wrong: shua yang rou, right: shuan yang rou}
+- {text: 涮锅, wrong: shua guo, right: shuan guo}
+- {text: 和面, wrong: he mian, right: huo mian}
+- {text: 和稀泥, wrong: he xi ni, right: huo xi ni}
+- {text: 暖和, wrong: nuan he, right: nuan huo}
+- {text: 掺和, wrong: chan he, right: chan huo}
+- {text: 系鞋带, wrong: xi xie dai, right: ji xie dai}
+- {text: 系领带, wrong: xi ling dai, right: ji ling dai}
+- {text: 囤积, wrong: dun ji, right: tun ji}
+- {text: 粮囤, wrong: liang tun, right: liang dun}
+- {text: 雪茄, wrong: xue qie, right: xue jia}
+- {text: 猪圈, wrong: zhu quan, right: zhu juan}
+- {text: 羊圈, wrong: yang quan, right: yang juan}
+- {text: 圈养, wrong: quan yang, right: juan yang}
+- {text: 色子, wrong: se zi, right: shai zi}
+- {text: 什锦, wrong: shen jin, right: shi jin}
+- {text: 家什, wrong: jia shen, right: jia shi}
+- {text: 盛饭, wrong: sheng fan, right: cheng fan}
+- {text: 盛汤, wrong: sheng tang, right: cheng tang}
+- {text: 省亲, wrong: sheng qin, right: xing qin}
+- {text: 反省, wrong: fan sheng, right: fan xing}
+- {text: 不省人事, wrong: bu sheng ren shi, right: bu xing ren shi}
+- {text: 发人深省, wrong: fa ren shen sheng, right: fa ren shen xing}
+- {text: 殷红, wrong: yin hong, right: yan hong}
+- {text: 优惠券, wrong: you hui juan, right: you hui quan}
+- {text: 证券, wrong: zheng juan, right: zheng quan}
+- {text: 国库券, wrong: guo ku juan, right: guo ku quan}
+- {text: 入场券, wrong: ru chang juan, right: ru chang quan}
+- {text: 稳操胜券, wrong: wen cao sheng juan, right: wen cao sheng quan}
+- {text: 奖券, wrong: jiang juan, right: jiang quan}
+- {text: 债券, wrong: zhai juan, right: zhai quan}
+- {text: 挑衅, wrong: tiao ban, right: tiao xin}
+- {text: 开辟, wrong: kai bi, right: kai pi}
+- {text: 精辟, wrong: jing bi, right: jing pi}
+- {text: 复辟, wrong: fu pi, right: fu bi}
+- {text: 辟邪, wrong: pi xie, right: bi xie}
+- {text: 杯盘狼藉, wrong: bei pan lang jie, right: bei pan lang ji}
+- {text: 声名狼藉, wrong: sheng ming lang jie, right: sheng ming lang ji}
+- {text: 否极泰来, wrong: fou ji tai lai, right: pi ji tai lai}
+- {text: 茅塞顿开, wrong: mao sai dun kai, right: mao se dun kai}
+- {text: 堵塞, wrong: du sai, right: du se}
+- {text: 阻塞, wrong: zu sai, right: zu se}
+- {text: 敷衍塞责, wrong: fu yan sai ze, right: fu yan se ze}
+- {text: 执拗, wrong: zhi ao, right: zhi niu}
+- {text: 独辟蹊径, wrong: du pi qi jing, right: du pi xi jing}
+- {text: 蹊径, wrong: qi jing, right: xi jing}
+- {text: 拾级而上, wrong: shi ji er shang, right: she ji er shang}
+- {text: 叱咤, wrong: [chi cha, chi tuo], right: chi zha}
+- {text: 叱咤风云, wrong: [chi tuo feng yun, chi cha feng yun], right: chi zha feng yun}
+- {text: 少不更事, wrong: shao bu gan shi, right: shao bu geng shi}
+
+# —— 成语与固定说法 ——
+- {text: 鳞次栉比, wrong: lin ci jie bi, right: lin ci zhi bi}
+- {text: 舐犊情深, wrong: tian du qing shen, right: shi du qing shen}
+- {text: 瞠目结舌, wrong: tang mu jie she, right: cheng mu jie she}
+- {text: 戛然而止, wrong: ga ran er zhi, right: jia ran er zhi}
+- {text: 怙恶不悛, wrong: gu e bu jun, right: hu e bu quan}
+- {text: 莘莘学子, wrong: xin xin xue zi, right: shen shen xue zi}
+- {text: 莞尔一笑, wrong: guan er yi xiao, right: wan er yi xiao}
+- {text: 莞尔, wrong: guan er, right: wan er}
+- {text: 一声不吭, wrong: yi sheng bu hang, right: yi sheng bu keng}
+- {text: 吭声, wrong: hang sheng, right: keng sheng}
+- {text: 力能扛鼎, wrong: li neng kang ding, right: li neng gang ding}
+- {text: 百战不殆, wrong: bai zhan bu tai, right: bai zhan bu dai}
+- {text: 谑而不虐, wrong: nve er bu nve, right: xue er bu nve}
+- {text: 狼吞虎咽, wrong: lang tun hu ye, right: lang tun hu yan}
+- {text: 细嚼慢咽, wrong: xi jiao man ye, right: xi jiao man yan}
+- {text: 咽气, wrong: ye qi, right: yan qi}
+
+# —— 地名 ——
+- {text: 蚌埠, wrong: bang bu, right: beng bu}
+- {text: 六安, wrong: liu an, right: lu an}
+- {text: 番禺, wrong: fan yu, right: pan yu}
+- {text: 亳州, wrong: hao zhou, right: bo zhou}
+- {text: 涪陵, wrong: pei ling, right: fu ling}
+- {text: 歙县, wrong: xi xian, right: she xian}
+- {text: 泌阳, wrong: mi yang, right: bi yang}
+- {text: 东莞, wrong: dong wan, right: dong guan}
+- {text: 枞阳, wrong: cong yang, right: zong yang}
+- {text: 鄱阳湖, wrong: fan yang hu, right: po yang hu}
+- {text: 鄱阳, wrong: fan yang, right: po yang}
+- {text: 犍为, wrong: jian wei, right: qian wei}
+- {text: 筠连, wrong: yun lian, right: jun lian}
+- {text: 耒阳, wrong: lai yang, right: lei yang}
+- {text: 郴州, wrong: bin zhou, right: chen zhou}
+- {text: 漯河, wrong: lei he, right: luo he}
+- {text: 洪洞, wrong: hong dong, right: hong tong}
+- {text: 乐亭, wrong: le ting, right: lao ting}
+- {text: 大埔, wrong: da pu, right: da bu}
+- {text: 珲春, wrong: hui chun, right: hun chun}
+- {text: 盱眙, wrong: [yu tai, yu yi], right: xu yi}
+- {text: 浚县, wrong: jun xian, right: xun xian}
+- {text: 黄陂, wrong: huang po, right: huang pi}
+- {text: 铅山, wrong: qian shan, right: yan shan}
+- {text: 栎阳, wrong: le yang, right: yue yang}
+- {text: 乐清, wrong: le qing, right: yue qing}
+- {text: 嵊州, wrong: cheng zhou, right: sheng zhou}
+- {text: 鄞州, wrong: jin zhou, right: yin zhou}
+- {text: 莒县, wrong: lv xian, right: ju xian}
+- {text: 郯城, wrong: yan cheng, right: tan cheng}
+- {text: 东阿, wrong: dong a, right: dong e}
+- {text: 单县, wrong: dan xian, right: shan xian}
+- {text: 兖州, wrong: yun zhou, right: yan zhou}
+- {text: 柘城, wrong: shi cheng, right: zhe cheng}
+- {text: 睢县, wrong: ju xian, right: sui xian}
+- {text: 睢宁, wrong: ju ning, right: sui ning}
+- {text: 渑池, wrong: sheng chi, right: mian chi}
+- {text: 讷河, wrong: na he, right: ne he}
+- {text: 焉耆, wrong: yan shi, right: yan qi}
+- {text: 郫县, wrong: bei xian, right: pi xian}
+- {text: 猇亭, wrong: hu ting, right: xiao ting}
+- {text: 蕲春, wrong: jin chun, right: qi chun}
+- {text: 涡阳, wrong: wo yang, right: guo yang}
+- {text: 汨罗, wrong: gu luo, right: mi luo}
+- {text: 汨罗江, wrong: gu luo jiang, right: mi luo jiang}
+- {text: 秘鲁, wrong: mi lu, right: bi lu}
+
+# —— 人名、姓氏与历史专名 ——
+- {text: 吐蕃, wrong: tu fan, right: tu bo}
+- {text: 单于, wrong: dan yu, right: chan yu}
+- {text: 龟兹, wrong: gui zi, right: qiu ci}
+- {text: 大宛, wrong: da wan, right: da yuan}
+- {text: 万俟, wrong: wan si, right: mo qi}
+- {text: 长孙, wrong: chang sun, right: zhang sun}
+- {text: 澹台, wrong: dan tai, right: tan tai}
+- {text: 秦桧, wrong: qin gui, right: qin hui}
+- {text: 嫪毐, wrong: liao ai, right: lao ai}
+- {text: 妲己, wrong: dan ji, right: da ji}
+- {text: 女娲, wrong: nv wo, right: nv wa}
+- {text: 郦食其, wrong: li shi qi, right: li yi ji}
+- {text: 刘禅, wrong: liu chan, right: liu shan}
+- {text: 曾国藩, wrong: ceng guo fan, right: zeng guo fan}
+- {text: 皇甫谧, wrong: huang fu bi, right: huang fu mi}
+- {text: 单田芳, wrong: dan tian fang, right: shan tian fang}
+
+# —— 宗教用语 ——
+- {text: 般若, wrong: ban ruo, right: bo re}
+- {text: 伽蓝, wrong: jia lan, right: qie lan}
+- {text: 阿弥陀佛, wrong: a mi tuo fo, right: e mi tuo fo}
+- {text: 偈语, wrong: jie yu, right: ji yu}

@@ -26,17 +26,21 @@
 
 use std::collections::HashSet;
 
+pub mod bigram;
 pub mod punct;
 
 /// 联想的上文。
-///
-/// ★ **一期就按「完整上文」设计，尽管桌面只填得起一条上屏文本。**
-/// 二期移动端会用 `InputConnection.getTextBeforeCursor` 填入光标前的真实内容，
-/// 那时不必改签名——避免「二期动接口、一期的调用点全部返工」。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AssocContext<'a> {
-    /// 上文文本。桌面 = 最近一次上屏的文本；移动端 = 光标前若干字符。
+    /// 刚上屏的文本（简体域的整词）。前缀词、联想历史、标点都按它查。
     pub text: &'a str,
+    /// 这次上屏**之前**光标前的正文（宿主报来的，见 `Coordinator::set_preceding_text`），
+    /// 末尾紧接着 `text`。只有「下一词」源用它：逐字上屏时把被拆开的词凑回来。
+    /// 宿主不报（桌面）就是空串，一切照旧。
+    pub preceding: &'a str,
+    /// 用户逐字上屏（形码方案）：单字上屏后「下一词」源也给词内接续（「我」→「们」），
+    /// 见 [`bigram::AssocBigram::lookup_after`]。
+    pub char_wise: bool,
     /// 连续性是否已断（失焦 / 切宿主 / 鼠标点击 / 方向键 / 超时）。
     ///
     /// ★ 断链时**不做联想**。`recent_commits` 是一个跨应用、跨焦点的全局队列，
@@ -44,6 +48,16 @@ pub struct AssocContext<'a> {
     /// 「你好」、切到 B 窗口打「世界」，朴素实现就会拿「你好」当上文。
     pub boundary_broken: bool,
 }
+
+/// 智能联想里前缀词最多占几个名额，见 [`AssocKind::source_cap`]。
+pub const SMART_PREFIX_CAP: usize = 4;
+
+/// 智能联想里「下一词」最多占几个名额：留几个位置给前缀词与标点（表里每个上文有十来个后继，
+/// 不设限会把名额全占掉）。
+pub const SMART_BIGRAM_CAP: usize = 6;
+
+/// 智能联想里前缀词补出部分的最大字数，见 [`AssocKind::keeps`]。
+pub const SMART_PREFIX_TAIL_MAX: usize = 2;
 
 /// 候选来自哪个源。**顺序即优先级**（靠前的先取配额）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -174,6 +188,46 @@ impl AssocKind {
     pub fn extends_context(self) -> bool {
         matches!(self, AssocKind::Word)
     }
+
+    /// 本档下，前缀延伸类候选（「中」→「中国」）是否**只显示补出的那一截**（「国」）。
+    ///
+    /// 智能联想问的是「后面接什么」，同一栏里还有下一词（「的」）与标点（「，」）——
+    /// 前缀词若显示整词，「中国」与「国」会并排出现，用户分不清选哪个得到什么（见上表）。
+    /// 词语联想整栏都是「以上文开头的词」，显示整词用户才看得懂自己在选什么。
+    ///
+    /// 只改**显示与去重的口径**：[`AssocHit::text`] 仍是整词、`commit` 仍是那一截，
+    /// 联想历史（前缀延伸行按「整词 − 补出的一截」还原上文）照旧记。
+    pub fn shows_continuation(self) -> bool {
+        matches!(self, AssocKind::Smart)
+    }
+
+    /// 本档下某个源最多占几个名额（`remaining` 是此刻还剩的总名额）。
+    ///
+    /// 智能联想里前缀词只是「把上文补长」，不是「猜下一个词」：拼音大词库里以「好的」开头的
+    /// 词成百上千，不设上限时它一口气占满全部名额，同栏的标点就永远出不来（实测「你好」后
+    /// 没有「，」）。压到 [`SMART_PREFIX_CAP`] 条，余下的顺延给标点。词语联想整栏就是前缀词，
+    /// 不设限。
+    pub fn source_cap(self, src: AssocSource, remaining: usize) -> usize {
+        match (self, src) {
+            (AssocKind::Smart, AssocSource::Prefix) => remaining.min(SMART_PREFIX_CAP),
+            (AssocKind::Smart, AssocSource::Bigram) => remaining.min(SMART_BIGRAM_CAP),
+            _ => remaining,
+        }
+    }
+
+    /// 本档下这条候选能不能出（源内过滤，先于去重）。
+    ///
+    /// 智能联想只显示补出的那一截（[`Self::shows_continuation`]），补出部分过长的前缀词
+    /// （「中」→「华人民共和国」）在候选条上读起来是半截词、也不像「下一个词」，丢掉；
+    /// 短的（「谢谢」→「大家」、「北京」→「大学」）正是下一词。
+    pub fn keeps(self, hit: &AssocHit) -> bool {
+        match (self, hit.source) {
+            (AssocKind::Smart, AssocSource::Prefix) => {
+                hit.commit_text().chars().count() <= SMART_PREFIX_TAIL_MAX
+            }
+            _ => true,
+        }
+    }
 }
 
 /// 联想何时展示、何时退出。
@@ -251,7 +305,7 @@ impl Default for AssocConfig {
 
 impl AssocConfig {
     /// 从配置段构造运行时视图。`cfg` 是桌面基线 `[input.association]`；`mobile` 是
-    /// `[mobile.association]`，**`Some` 时 `kind`/`mode`/`punct` 改从它取**，其余字段
+    /// `[mobile.association]`，**`Some` 时 `kind`/`mode`/`punct`/`space_commits` 改从它取**，其余字段
     /// 一律走基线（那些键当前没有平台差异，故根本不在移动端段里）。
     ///
     /// ⚠️ 「要不要取用 mobile 段」由**调用方**决定，而不是这里 `cfg!(target_os)` 判断：
@@ -265,15 +319,20 @@ impl AssocConfig {
         cfg: &wind_config::AssociationConfig,
         mobile: Option<&wind_config::MobileAssociationConfig>,
     ) -> Self {
-        let (kind, mode, punct) = match mobile {
-            Some(m) => (m.kind.as_str(), m.mode.as_str(), m.punct),
-            None => (cfg.kind.as_str(), cfg.mode.as_str(), cfg.punct),
+        let (kind, mode, punct, space_commits) = match mobile {
+            Some(m) => (m.kind.as_str(), m.mode.as_str(), m.punct, m.space_commits),
+            None => (
+                cfg.kind.as_str(),
+                cfg.mode.as_str(),
+                cfg.punct,
+                cfg.space_commits,
+            ),
         };
         Self {
             kind: AssocKind::parse(kind),
             mode: AssocMode::parse(mode),
             max_count: cfg.max_count,
-            space_commits: cfg.space_commits,
+            space_commits,
             hide_after_ms: cfg.hide_after_ms,
             history: cfg.history,
             bigram: cfg.bigram,
@@ -292,7 +351,7 @@ impl AssocConfig {
     ///
     /// 档位是硬性的（词语联想里标点源根本没有语义），用户开关只在档位放行的源上生效。
     /// 两者顺序反过来会让「词语联想 + punct=true」出标点——那正是用户报的问题。
-    fn source_enabled(&self, s: AssocSource) -> bool {
+    pub fn source_enabled(&self, s: AssocSource) -> bool {
         if !self.kind.allows(s) {
             return false;
         }
@@ -330,7 +389,9 @@ pub trait AssocProvider {
 ///
 /// ## 去重
 ///
-/// 按 `text` 去重，**先到先得**。于是同一个词若同时来自历史与 bigram，保留历史那条
+/// 按**显示口径**去重（[`AssocKind::shows_continuation`] 档按上屏的那一截，否则按 `text`），
+/// **先到先得**。智能联想里「中国」（前缀延伸，补「国」）与「国」（下一词）显示同为「国」，
+/// 只留一条，名额顺延。于是同一个词若同时来自历史与 bigram，保留历史那条
 /// （优先级更高），其来源标记也是历史——这对下游按来源做统计是正确的。
 pub fn associate(
     ctx: &AssocContext<'_>,
@@ -355,21 +416,49 @@ pub fn associate(
         if !cfg.source_enabled(src) {
             continue;
         }
+        // 智能联想、上文以语气词结尾（「好吗」）：后面几乎总是断句，只出个人学习与标点。
+        // 下一词表与前缀词在这里只有噪声（网络语料的「吗的」、前缀词「吗啡」）。
+        if cfg.kind == AssocKind::Smart
+            && matches!(src, AssocSource::Bigram | AssocSource::Prefix)
+            && punct::sentence_particle_punct(ctx.text).is_some()
+        {
+            continue;
+        }
         let Some((_, p)) = providers.iter().find(|(s, _)| *s == src) else {
             continue;
         };
-        let remaining = cfg.max_count - out.len();
-        let mut hits = p.suggest(ctx, remaining);
+        let cap = cfg.kind.source_cap(src, cfg.max_count - out.len());
+        // 有源内过滤时多取几条，免得滤完凑不满本源的名额
+        let mut hits = p.suggest(ctx, cap.saturating_mul(4));
         // 源内按分数降序；跨源不比较（量纲不同）。
         hits.sort_by_key(|h| std::cmp::Reverse(h.score));
+        let mut taken = 0;
         for h in hits {
-            if out.len() >= cfg.max_count {
+            if taken >= cap {
                 break;
             }
-            if h.text.is_empty() || !seen.insert(h.text.clone()) {
+            if !cfg.kind.keeps(&h) {
                 continue;
             }
+            let shown = if cfg.kind.shows_continuation() {
+                h.commit_text()
+            } else {
+                &h.text
+            };
+            if shown.is_empty() || seen.contains(shown) {
+                continue;
+            }
+            // 只显示补出的那截时，前缀词常是前面某条的延长：「我」后已有「们」（下一词表），
+            // 前缀词「我们的」再补「们的」就是重复的一格
+            if cfg.kind.shows_continuation()
+                && src == AssocSource::Prefix
+                && seen.iter().any(|s| shown.starts_with(s.as_str()))
+            {
+                continue;
+            }
+            seen.insert(shown.to_string());
             out.push(h);
+            taken += 1;
         }
     }
     out
@@ -399,6 +488,8 @@ mod tests {
     fn ctx() -> AssocContext<'static> {
         AssocContext {
             text: "你好",
+            preceding: "",
+            char_wise: false,
             boundary_broken: false,
         }
     }
@@ -420,6 +511,8 @@ mod tests {
         let cfg = AssocConfig::default().with_enabled();
         let c = AssocContext {
             text: "你好",
+            preceding: "",
+            char_wise: false,
             boundary_broken: true,
         };
         assert!(associate(&c, &cfg, &[(AssocSource::Punct, &p)]).is_empty());
@@ -431,6 +524,8 @@ mod tests {
         let cfg = AssocConfig::default().with_enabled();
         let c = AssocContext {
             text: "",
+            preceding: "",
+            char_wise: false,
             boundary_broken: false,
         };
         assert!(associate(&c, &cfg, &[(AssocSource::Punct, &p)]).is_empty());
@@ -715,7 +810,201 @@ mod tests {
         assert!(mobile.punct, "移动端出厂：标点联想开");
     }
 
-    /// 移动端段只该动 kind / mode / punct，其余六项一律走基线——它们当前没有平台差异。
+    /// 空格选不选联想：移动端段说了算（出厂关），桌面基线（出厂开）在手机上不起作用；
+    /// 用户在手机上打开后确实生效。
+    #[test]
+    fn mobile_section_switches_space_commits() {
+        let base = wind_config::AssociationConfig::default();
+        assert!(base.space_commits, "前提：桌面基线空格选联想");
+        assert!(AssocConfig::from_config(&base, None).space_commits);
+
+        let mut m = wind_config::MobileAssociationConfig::default();
+        assert!(
+            !AssocConfig::from_config(&base, Some(&m)).space_commits,
+            "移动端出厂：空格出空格、不选联想"
+        );
+        m.space_commits = true;
+        assert!(
+            AssocConfig::from_config(&base, Some(&m)).space_commits,
+            "手机上打开后生效"
+        );
+    }
+
+    /// ★ 智能联想里前缀词最多占 [`SMART_PREFIX_CAP`] 个名额，余下顺延给标点；补出部分超过
+    /// [`SMART_PREFIX_TAIL_MAX`] 字的丢掉、由后面更短的补上。词语联想两条都不管。
+    #[test]
+    fn smart_caps_prefix_and_leaves_room_for_punct() {
+        struct Words(Vec<&'static str>);
+        impl AssocProvider for Words {
+            fn suggest(&self, ctx: &AssocContext<'_>, limit: usize) -> Vec<AssocHit> {
+                let n = self.0.len() as i64;
+                self.0
+                    .iter()
+                    .take(limit)
+                    .enumerate()
+                    .map(|(i, w)| AssocHit {
+                        text: (*w).to_string(),
+                        commit: w.strip_prefix(ctx.text).map(str::to_string),
+                        source: AssocSource::Prefix,
+                        score: n - i as i64,
+                    })
+                    .collect()
+            }
+        }
+        let prefix = Words(vec![
+            "中国",
+            "中华人民共和国",
+            "中间",
+            "中心",
+            "中文",
+            "中午",
+            "中医",
+            "中学",
+        ]);
+        let punct = crate::punct::PunctRules;
+        let providers: [(AssocSource, &dyn AssocProvider); 2] =
+            [(AssocSource::Prefix, &prefix), (AssocSource::Punct, &punct)];
+        let run = |kind| {
+            let cfg = AssocConfig {
+                kind,
+                max_count: 9,
+                punct: true,
+                ..Default::default()
+            };
+            associate(
+                &AssocContext {
+                    text: "中",
+                    preceding: "",
+                    char_wise: false,
+                    boundary_broken: false,
+                },
+                &cfg,
+                &providers,
+            )
+        };
+        let smart = run(AssocKind::Smart);
+        let prefix_hits: Vec<_> = smart
+            .iter()
+            .filter(|h| h.source == AssocSource::Prefix)
+            .map(|h| h.commit_text())
+            .collect();
+        assert_eq!(
+            prefix_hits,
+            ["国", "间", "心", "文"],
+            "前 4 条短的，长尾那条跳过"
+        );
+        assert!(
+            smart.iter().any(|h| h.text == "，"),
+            "标点要排得进来，实得 {smart:?}"
+        );
+
+        let word = run(AssocKind::Word);
+        assert_eq!(word.len(), 8, "词语联想不设前缀上限，也不丢长词");
+        assert!(word.iter().any(|h| h.text == "中华人民共和国"));
+    }
+
+    /// ★ 语气词结尾（「好吗」）：智能联想只出个人学习与标点，句末标点排第一；
+    /// 词语联想不受影响（它本就只有前缀词）。
+    #[test]
+    fn smart_particle_tail_yields_punct_first() {
+        let bigram = Fixed(AssocSource::Bigram, vec![("的", 9)]);
+        let prefix = Fixed(AssocSource::Prefix, vec![("吗啡", 9)]);
+        let punct = crate::punct::PunctRules;
+        let providers: [(AssocSource, &dyn AssocProvider); 3] = [
+            (AssocSource::Bigram, &bigram),
+            (AssocSource::Prefix, &prefix),
+            (AssocSource::Punct, &punct),
+        ];
+        let cfg = AssocConfig {
+            kind: AssocKind::Smart,
+            max_count: 9,
+            punct: true,
+            ..Default::default()
+        };
+        let run = |text| {
+            associate(
+                &AssocContext {
+                    text,
+                    preceding: "",
+                    char_wise: false,
+                    boundary_broken: false,
+                },
+                &cfg,
+                &providers,
+            )
+            .into_iter()
+            .map(|h| h.text)
+            .collect::<Vec<_>>()
+        };
+        let got = run("好吗");
+        assert_eq!(got[0], "？", "{got:?}");
+        assert!(!got.iter().any(|t| t == "的" || t == "吗啡"), "{got:?}");
+        assert_eq!(run("你好")[0], "的", "非语气词照常出下一词");
+    }
+
+    /// ★ 智能联想按上屏的那一截去重：前缀延伸「中国」（补「国」）与下一词「国」只留先到的，
+    /// 名额顺延给后面的；补出的那截延长了已有一格的前缀词也不出。词语联想仍按整词去重（都留）。
+    #[test]
+    fn smart_dedups_by_continuation() {
+        struct WithCommit(AssocSource, Vec<(&'static str, Option<&'static str>)>);
+        impl AssocProvider for WithCommit {
+            fn suggest(&self, _ctx: &AssocContext<'_>, limit: usize) -> Vec<AssocHit> {
+                self.1
+                    .iter()
+                    .take(limit)
+                    .map(|(t, c)| AssocHit {
+                        text: (*t).to_string(),
+                        commit: c.map(str::to_string),
+                        source: self.0,
+                        score: 0,
+                    })
+                    .collect()
+            }
+        }
+        let history = WithCommit(AssocSource::History, vec![("国", None)]);
+        let prefix = WithCommit(
+            AssocSource::Prefix,
+            vec![
+                ("中国", Some("国")),
+                ("中国人", Some("国人")),
+                ("中间", Some("间")),
+            ],
+        );
+        let providers: [(AssocSource, &dyn AssocProvider); 2] = [
+            (AssocSource::History, &history),
+            (AssocSource::Prefix, &prefix),
+        ];
+        let run = |kind| {
+            let cfg = AssocConfig {
+                kind,
+                max_count: 9,
+                ..Default::default()
+            };
+            let hits = associate(
+                &AssocContext {
+                    text: "中",
+                    preceding: "",
+                    char_wise: false,
+                    boundary_broken: false,
+                },
+                &cfg,
+                &providers,
+            );
+            hits.into_iter().map(|h| h.text).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(AssocKind::Smart),
+            ["国", "中间"],
+            "「中国」显示同为「国」，去掉；「中国人」补「国人」是「国」的延长，也去掉"
+        );
+        assert_eq!(
+            run(AssocKind::Word),
+            ["国", "中国", "中国人", "中间"],
+            "词语联想按整词，都留"
+        );
+    }
+
+    /// 移动端段只该动 kind / mode / punct / space_commits，其余五项一律走基线——它们当前没有平台差异。
     ///
     /// ⚠️ 这条不是形式主义，它守的是**两个方向**：
     /// - 把某个键加进 `[mobile.association]` 却忘了在 `from_config` 里放行 ⇒
@@ -725,7 +1014,6 @@ mod tests {
     fn mobile_section_does_not_touch_other_fields() {
         let base = wind_config::AssociationConfig {
             max_count: 5,
-            space_commits: false,
             hide_after_ms: 1234,
             history: false,
             bigram: false,
@@ -735,7 +1023,6 @@ mod tests {
         let m = wind_config::MobileAssociationConfig::default();
         let got = AssocConfig::from_config(&base, Some(&m));
         assert_eq!(got.max_count, 5);
-        assert!(!got.space_commits);
         assert_eq!(got.hide_after_ms, 1234);
         assert!(!got.history);
         assert!(!got.bigram);
@@ -760,6 +1047,8 @@ mod tests {
         let hits = associate(
             &AssocContext {
                 text: "你好",
+                preceding: "",
+                char_wise: false,
                 boundary_broken: false,
             },
             &cfg,
@@ -773,6 +1062,8 @@ mod tests {
         let mhits = associate(
             &AssocContext {
                 text: "你好",
+                preceding: "",
+                char_wise: false,
                 boundary_broken: false,
             },
             &mcfg,

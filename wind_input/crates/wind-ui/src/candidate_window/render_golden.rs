@@ -99,6 +99,7 @@ fn role_text(text: &str, role: &'static str) -> StyledText {
 /// （§18），这些片段必须全部解析到正文色而被丢弃，候选窗部分才与分段着色之前逐字节相同（§6.4）。
 fn candidates() -> Vec<CandidateItem> {
     let c = |text: &str, comment: StyledText| CandidateItem {
+        text_styled: Default::default(),
         text: text.to_string(),
         code: String::new(),
         label: String::new(),
@@ -290,6 +291,7 @@ fn golden_covers_comments_and_tooltip() {
 /// 产物，守的是之后的回归）。
 fn above_candidates() -> Vec<CandidateItem> {
     let c = |text: &str, above: StyledText, comment: StyledText| CandidateItem {
+        text_styled: Default::default(),
         text: text.to_string(),
         code: String::new(),
         label: String::new(),
@@ -394,4 +396,360 @@ fn column_item(dump: &str, i: usize) -> bool {
     let tag = format!(" tag={i} ");
     dump.lines()
         .any(|l| l.trim_start().starts_with("Column") && l.contains(&tag))
+}
+
+// ══ 模糊音提示（设计 fuzzy-pinyin-hint.md）══
+//
+// 候选正文带分段（`text_styled`）：「苹(ping)果」里 `(ping)` 段角色 `pinyin_hint`，按提示色画。
+// 首录于提示落地时（此前无此功能，参照即新代码产物，守的是之后的回归）。
+
+/// 协调器产出的提示正文：`pre` + `(hint)`（角色 `pinyin_hint`）+ `post`。
+fn hint_styled(pre: &str, hint: &str, post: &str) -> StyledText {
+    let mut t = StyledText::from(pre);
+    piece(&mut t, &format!("({hint})"), "pinyin_hint", false);
+    t.push(post, &SpanStyle::default());
+    t
+}
+
+fn hint_cand(text: &str, styled: StyledText) -> CandidateItem {
+    CandidateItem {
+        text_styled: styled,
+        text: text.to_string(),
+        code: String::new(),
+        label: String::new(),
+        tooltip: Default::default(),
+        comment: Default::default(),
+        comment_above: Default::default(),
+        no_index: false,
+    }
+}
+
+/// 下标 0 选中、1 悬停、2 无提示、3 常态带提示（带注释，提示色与注释色同框可比）。
+fn fuzzy_candidates() -> Vec<CandidateItem> {
+    vec![
+        hint_cand("苹果", hint_styled("苹", "ping", "果")),
+        hint_cand("瓶子", hint_styled("瓶", "ping", "子")),
+        hint_cand("平安", StyledText::new()),
+        CandidateItem {
+            comment: role_text("pd", "code_hint"),
+            ..hint_cand("频道", hint_styled("频", "pin", "道"))
+        },
+    ]
+}
+
+/// 横排 / 竖排 / 旋转 / 直立四种排布 + 展开网格（2 列 × 2 行，选中 0、悬停 1）。
+fn render_fuzzy() -> String {
+    let theme = wind_theme::load_resolved(&themes_dir(), "default", false).unwrap();
+    let mut out = render_windows(&theme, &LAYOUTS[..4], fuzzy_candidates);
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+    w.scale = 1.0;
+    w.set_theme(theme.clone());
+    w.set_orientation(false, false, false);
+    w.set_grid(Some(wind_ui_types::CandidateGrid {
+        cols: 2,
+        rows: 2,
+        highlight_row: 0,
+        index_start: 0,
+        index_count: 2,
+        tabs: 0,
+        active_tab: 0,
+    }));
+    w.update("ping", 4, "", fuzzy_candidates(), 0, 1, 1, 1);
+    let mut root = w.build_tree(false);
+    root.layout(0.0, 0.0, &w.text_renderer);
+    out.push_str("== 候选窗 网格 ==\n");
+    out.push_str(&root.debug_dump());
+    let dir = themes_dir().to_string_lossy().into_owned();
+    out.replace(&dir, "<themes>")
+}
+
+/// 渲染段：`== 候选窗 {label} ==` 到下一段之间。
+fn section<'a>(dump: &'a str, label: &str) -> &'a str {
+    dump.split(&format!("== 候选窗 {label} =="))
+        .nth(1)
+        .unwrap_or_else(|| panic!("缺 {label} 段"))
+        .split("== 候选窗")
+        .next()
+        .unwrap()
+}
+
+/// `_base` 给 `pinyin_hint` 的亮色档 `#C2410C`。
+const HINT_LIGHT: [u8; 4] = [0xC2, 0x41, 0x0C, 255];
+
+#[test]
+fn golden_pinyin_hint_matches_golden() {
+    let got = render_fuzzy();
+    let file = golden_dir().join("pinyin_hint-default-light.txt");
+    if std::env::var_os("WIND_UI_BLESS_GOLDEN").is_some() {
+        std::fs::create_dir_all(golden_dir()).unwrap();
+        std::fs::write(&file, &got).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&file)
+        .unwrap_or_else(|e| panic!("读 golden {} 失败：{e}", file.display()));
+    if got != want {
+        let line = got
+            .lines()
+            .zip(want.lines())
+            .position(|(a, b)| a != b)
+            .unwrap_or(got.lines().count().min(want.lines().count()));
+        panic!(
+            "模糊音提示渲染与 golden 不一致（第 {} 行起）\n  实得 {:?}\n  参照 {:?}",
+            line + 1,
+            got.lines().nth(line),
+            want.lines().nth(line)
+        );
+    }
+}
+
+/// 常态带提示的那条（下标 3「频(pin)道」）：整段文字一个叶子，`(pin)` 字节区间 [3, 8) 着提示色。
+fn assert_plain_hint_run(sec: &str, label: &str) {
+    let line = sec
+        .lines()
+        .find(|l| l.contains("text=Some(\"频(pin)道\")"))
+        .unwrap_or_else(|| panic!("{label}：正文应完整显示「频(pin)道」"));
+    assert!(
+        line.contains(&format!(
+            "runs=[ColorRun {{ start: 3, end: 8, rgba: {HINT_LIGHT:?} }}]"
+        )),
+        "{label}：(pin) 段应着提示色：{line}"
+    );
+}
+
+#[test]
+fn golden_pinyin_hint_horizontal() {
+    let got = render_fuzzy();
+    let sec = section(&got, "横排");
+    assert_plain_hint_run(sec, "横排");
+    // 无提示的候选不带颜色区间。
+    let plain = sec
+        .lines()
+        .find(|l| l.contains("text=Some(\"平安\")"))
+        .expect("平安");
+    assert!(
+        !plain.contains("runs="),
+        "无提示候选不应带颜色区间：{plain}"
+    );
+}
+
+#[test]
+fn golden_pinyin_hint_vertical() {
+    let got = render_fuzzy();
+    assert_plain_hint_run(section(&got, "竖排"), "竖排");
+    assert_plain_hint_run(section(&got, "旋转"), "旋转");
+    // 直立态逐格扶正：`(`、`p`、`i`、`n`、`)` 各一格，每格整格着提示色；`频` / `道` 不着色。
+    let up = section(&got, "直立");
+    for cell in ["(", "p", "n", ")"] {
+        let line = up
+            .lines()
+            .find(|l| l.contains(&format!("text=Some(\"{cell}\")")))
+            .unwrap_or_else(|| panic!("直立：缺格 {cell}"));
+        assert!(
+            line.contains(&format!("rgba: {HINT_LIGHT:?}")),
+            "直立：格 {cell} 应着提示色：{line}"
+        );
+    }
+    for cell in ["频", "道"] {
+        let line = up
+            .lines()
+            .find(|l| l.contains(&format!("text=Some(\"{cell}\")")))
+            .unwrap_or_else(|| panic!("直立：缺格 {cell}"));
+        assert!(!line.contains("runs="), "直立：格 {cell} 不应着色：{line}");
+    }
+}
+
+#[test]
+fn golden_pinyin_hint_highlighted() {
+    let theme = wind_theme::load_resolved(&themes_dir(), "default", false).unwrap();
+    let v = &theme.views;
+    let got = render_fuzzy();
+    let sec = section(&got, "横排");
+    for (text, range, state) in [
+        ("苹(ping)果", (3, 9), wind_theme::TextState::Selected),
+        ("瓶(ping)子", (3, 9), wind_theme::TextState::Hover),
+    ] {
+        let want = wind_theme::pinyin_hint_color(
+            &v.text,
+            &v.comment,
+            state,
+            [30, 30, 30, 255],
+            wind_theme::fallback::COMMENT_TEXT,
+            crate::span_runs::candidate_backdrop(v, state),
+        );
+        let body = wind_theme::body_color(&v.text, state, [30, 30, 30, 255]);
+        let line = sec
+            .lines()
+            .find(|l| l.contains(&format!("text=Some(\"{text}\")")))
+            .unwrap_or_else(|| panic!("缺 {text}"));
+        if want == body {
+            assert!(
+                !line.contains("runs="),
+                "{state:?}：提示色等于正文色时不建区间：{line}"
+            );
+        } else {
+            assert!(
+                line.contains(&format!(
+                    "runs=[ColorRun {{ start: {}, end: {}, rgba: {want:?} }}]",
+                    range.0, range.1
+                )),
+                "{state:?}：提示段应按该状态取色 {want:?}：{line}"
+            );
+        }
+    }
+    // 防空转：出厂 default 的选中态改了正文色，但选中底是浅色、常态橙对它够醒目
+    // ⇒ 沿用常态橙（不回落注释色）。
+    let sel = wind_theme::TextState::Selected;
+    let sel_bg = crate::span_runs::candidate_backdrop(v, sel).expect("default 选中底可取色");
+    assert_ne!(
+        wind_theme::body_color(&v.text, sel, [30, 30, 30, 255]),
+        wind_theme::body_color(&v.text, wind_theme::TextState::Normal, [30, 30, 30, 255]),
+        "前提：default 选中态改了正文色"
+    );
+    let hint = |v: &wind_theme::RvViews| {
+        wind_theme::pinyin_hint_color(
+            &v.text,
+            &v.comment,
+            sel,
+            [30, 30, 30, 255],
+            wind_theme::fallback::COMMENT_TEXT,
+            crate::span_runs::candidate_backdrop(v, sel),
+        )
+    };
+    assert_eq!(hint(v), HINT_LIGHT, "浅色选中底 {sel_bg:?} 上应沿用常态橙");
+    // 反向：把选中底换成深色实心 accent ⇒ 对比度不足，回落选中态注释色。
+    let mut dark = v.clone();
+    dark.item
+        .selected
+        .get_or_insert_with(Default::default)
+        .bg_color = Some([37, 99, 235, 255]);
+    let cmt_sel = wind_theme::body_color(&dark.comment, sel, wind_theme::fallback::COMMENT_TEXT);
+    assert_eq!(hint(&dark), cmt_sel, "深色选中底上应回落选中态注释色");
+}
+
+/// 展开网格：格宽按含提示的实宽算，同一行的格子互不重叠、各行同列对齐。
+#[test]
+fn golden_pinyin_hint_grid() {
+    let got = render_fuzzy();
+    let sec = section(&got, "网格");
+    assert!(
+        sec.contains("text=Some(\"苹(ping)果\")"),
+        "网格：提示应完整显示"
+    );
+    assert_plain_hint_run(sec, "网格");
+
+    let theme = wind_theme::load_resolved(&themes_dir(), "default", false).unwrap();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+    w.scale = 1.0;
+    w.set_theme(theme);
+    w.set_orientation(false, false, false);
+    w.set_grid(Some(wind_ui_types::CandidateGrid {
+        cols: 2,
+        rows: 2,
+        highlight_row: 0,
+        index_start: 0,
+        index_count: 2,
+        tabs: 0,
+        active_tab: 0,
+    }));
+    // 第 1 列上下两格：一格带长提示、一格不带 ⇒ 列宽按带提示的那格撑开。
+    let cands = vec![
+        hint_cand("平安", StyledText::new()),
+        hint_cand("苹果", hint_styled("苹", "ping", "果")),
+        hint_cand("拼音", StyledText::new()),
+        hint_cand("品", StyledText::new()),
+    ];
+    w.update("ping", 4, "", cands, 0, -1, 1, 1);
+    let mut root = w.build_tree(false);
+    root.layout(0.0, 0.0, &w.text_renderer);
+    let mut hits = Vec::new();
+    root.collect_hits(&mut hits);
+    let rect = |t: i32| hits.iter().find(|(g, _)| *g == t).unwrap().1;
+    for row in [0, 2] {
+        let (a, b) = (rect(row), rect(row + 1));
+        assert!(
+            a.x + a.w <= b.x + 0.01,
+            "第 {row} 行两格重叠：{a:?} / {b:?}"
+        );
+    }
+    assert!(
+        (rect(1).x - rect(3).x).abs() < 0.01 && (rect(1).w - rect(3).w).abs() < 0.01,
+        "第 2 列上下格应对齐同宽：{:?} / {:?}",
+        rect(1),
+        rect(3)
+    );
+    // 带提示那格里正文叶子完整显示且落在格内。
+    let dump = root.debug_dump();
+    assert!(dump.contains("text=Some(\"苹(ping)果\")"), "网格：提示被截");
+}
+
+/// 窄窗：结果要么完整保留提示、要么整段去掉提示，绝不出现半截 `(pi…`；且存在一档宽度
+/// 恰好让「去掉提示后正文完整放下」。
+#[test]
+fn golden_pinyin_hint_truncated() {
+    let theme = wind_theme::load_resolved(&themes_dir(), "default", false).unwrap();
+    let shown = |vmax: i32, cand: CandidateItem| -> String {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        w.scale = 1.0;
+        w.set_theme(theme.clone());
+        w.set_orientation(true, false, false);
+        w.theme.behavior.vertical_max_width = vmax;
+        w.update("", 0, "", vec![cand], 0, -1, 1, 1);
+        let mut root = w.build_tree(false);
+        root.layout(0.0, 0.0, &w.text_renderer);
+        let dump = root.debug_dump();
+        // 候选正文叶子：序号之后第一个带 text 的叶子。
+        let mut texts = dump
+            .lines()
+            .filter_map(|l| l.split("text=Some(\"").nth(1))
+            .map(|r| r.split('"').next().unwrap().to_string());
+        let _index = texts.next();
+        texts.next().expect("缺正文叶子")
+    };
+    let mut saw_stripped = false;
+    let mut saw_full = false;
+    for vmax in (40..=400).step_by(4) {
+        let s = shown(vmax, hint_cand("苹果", hint_styled("苹", "ping", "果")));
+        match s.as_str() {
+            "苹(ping)果" => saw_full = true,
+            "苹果" => saw_stripped = true,
+            other => assert!(
+                !other.contains('(') && !other.contains(')'),
+                "vmax={vmax}：截出了半截提示 {other:?}"
+            ),
+        }
+        let long = shown(
+            vmax,
+            hint_cand(
+                "苹果果果果果果果果果",
+                hint_styled("苹", "ping", "果果果果果果果果果"),
+            ),
+        );
+        assert!(
+            long == "苹(ping)果果果果果果果果果" || (!long.contains('(') && !long.contains(')')),
+            "vmax={vmax}：长候选截出了半截提示 {long:?}"
+        );
+    }
+    assert!(saw_full, "应有一档宽度完整显示提示");
+    assert!(saw_stripped, "应有一档宽度去掉提示后正文完整");
+}
+
+/// 无提示（`text_styled` 空、或不带任何区间）时与改动前逐字节一致：出厂 golden 由
+/// `factory_render_matches_golden` 守；这里再钉「无区间的 text_styled 与空等价」。
+#[test]
+fn golden_no_hint_unchanged() {
+    let theme = wind_theme::load_resolved(&themes_dir(), "default", false).unwrap();
+    let plain = render_windows(&theme, LAYOUTS, candidates);
+    let with_plain_styled = render_windows(&theme, LAYOUTS, || {
+        candidates()
+            .into_iter()
+            .map(|c| CandidateItem {
+                text_styled: StyledText::from(c.text.as_str()),
+                ..c
+            })
+            .collect()
+    });
+    assert_eq!(plain, with_plain_styled);
 }

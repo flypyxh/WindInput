@@ -34,6 +34,7 @@ pub mod gramdb;
 pub mod hotcache;
 pub mod layer;
 pub mod manager;
+pub mod mapping;
 pub mod reader_pool;
 pub mod reverseidx;
 pub mod stats;

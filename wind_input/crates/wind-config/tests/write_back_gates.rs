@@ -94,8 +94,10 @@ const CONFIG_LOAD_SITES: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/wind-mobile/src/config_api.rs",
-        1,
-        "只读：`snapshot` 只把生效配置转成 TOML 文本给移动端设置页**显示**。★ 判据不是         「它没写盘」而是「设置页不拿这份快照当写回基线」——移动端的写回走逐键的         `config_set` → `Config::set_user_value`（见 `wind-mobile/src/lib.rs` 那三个口的         分工注释：注册表说有哪些键、快照说现在是什么值、写入逐键落到用户层）。         ⚠️ 哪天改成「把整份快照回写用户层」，这一条就得重判",
+        4,
+        "`emoji_modules` / `tooltip_sections` 只读，供设置页显示开关态；\
+         `set_tooltip_section_enabled` 整份段列表写回用户层，已闸（blocks_write_back）。\
+         `snapshot` 只把生效配置转成 TOML 文本给移动端设置页**显示**。★ 判据不是         「它没写盘」而是「设置页不拿这份快照当写回基线」——移动端的写回走逐键的         `config_set` → `Config::set_user_value`（见 `wind-mobile/src/lib.rs` 那三个口的         分工注释：注册表说有哪些键、快照说现在是什么值、写入逐键落到用户层）。         ⚠️ 哪天改成「把整份快照回写用户层」，这一条就得重判",
     ),
     (
         "crates/wind-mobile/src/lib.rs",

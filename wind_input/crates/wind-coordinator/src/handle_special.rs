@@ -495,6 +495,13 @@ impl Coordinator {
                 &state.special_buffer,
             );
         }
+        // 纠错候选不占首选（D6）：本路不重排，与主路 / 临拼同一个 helper、同一位置
+        // （全部重排之后、shadow 之前——用户置顶仍有最终话语权）。
+        wind_candidate::drop_corrected_duplicates(&mut state.candidates);
+        wind_candidate::protect_top_from_corrected(
+            &mut state.candidates,
+            state.special_buffer.len(),
+        );
         self.apply_shadow_in(
             owner.as_deref(),
             &mut state.candidates,

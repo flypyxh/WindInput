@@ -1014,6 +1014,7 @@ pub(crate) const EVAL_VAR_NAMES: &[&str] = &[
     "code_all",
     "shuangpin",
     "pinyin",
+    "correct_pinyin",
     "chaizi",
     "chaizi_code",
     "chaizi_all",
@@ -1564,6 +1565,15 @@ impl crate::coordinator::Coordinator {
                 |t| self.engine_mgr.word_pinyin_syllables(t),
                 |t, syls| reverse.toned_pinyin_of(t, syls, SYLLABLE_SEP),
             ),
+            // `correct_pinyin` —— 带已勾选来源提示的候选的整词正确拼音（`zhong guo`），带调随
+            // `[input.correction.hint] tone`。按来源过滤，不受 `hint.enabled` 与 `hint.scope`
+            // 约束；引擎在模板引用它时即使 `hint` 关着也会算提示（`DataNeeds::correct_pinyin`）。
+            "correct_pinyin" => {
+                let rt = self.rt();
+                let hint = &rt.config.input.correction.hint;
+                let tone = !c.meta.pinyin_hints.is_empty() && hint.tone;
+                crate::hint_text::correct_pinyin_text(c, hint, tone.then_some(reverse))
+            }
             "chaizi" if single => reverse.radicals_of(&c.text, ""),
             "chaizi" => String::new(),
             "chaizi_code" if single => reverse.chaizi_code_of(&c.text),

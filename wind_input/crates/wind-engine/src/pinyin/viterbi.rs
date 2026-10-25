@@ -19,6 +19,12 @@ const PERF_LOG_EVERY: u64 = 50;
 pub struct ViterbiResult {
     pub words: Vec<String>,
     pub log_prob: f64,
+    /// 同一条路径上**只算节点自身**的分（各节点 `log_prob` 之和），不含语法模型的转移分。
+    ///
+    /// 无语法模型时与 `log_prob` 相等。给「这条路径像不像话」类的闸门用：那些阈值是按
+    /// 词频标定的，挂上模型后 `log_prob` 里多出每个转移的搭配加减分（未命中 −weight×baseline），
+    /// 同一阈值就会把正解闸掉（`nhjianghanyu` 接模型后整句消失）。模型只该重排，不该决定出不出。
+    pub lexical_log_prob: f64,
     /// 最优路径**实际采用**的音节边界（全输入空间的起始位 bitmask）。
     ///
     /// 多路径切分下同一串输入可有多种切法，整句是按其中哪一条拼出来的，只有解码器
@@ -311,6 +317,7 @@ impl ViterbiDecoder {
             return ViterbiResult {
                 words: Vec::new(),
                 log_prob: 0.0,
+                lexical_log_prob: 0.0,
                 boundary: 0,
                 pieces: None,
             };
@@ -434,6 +441,7 @@ impl ViterbiDecoder {
             .unwrap_or(ViterbiResult {
                 words: Vec::new(),
                 log_prob: f64::NEG_INFINITY,
+                lexical_log_prob: f64::NEG_INFINITY,
                 boundary: 0,
                 pieces: None,
             })
@@ -551,13 +559,16 @@ impl ViterbiDecoder {
                     out.reverse();
                     out
                 });
+                let log_prob = if full_reach {
+                    dp[end][rank].log_prob
+                } else {
+                    f64::NEG_INFINITY
+                };
                 ViterbiResult {
                     words,
-                    log_prob: if full_reach {
-                        dp[end][rank].log_prob
-                    } else {
-                        f64::NEG_INFINITY
-                    },
+                    log_prob,
+                    // 无模型：路径分就只有节点分
+                    lexical_log_prob: log_prob,
                     boundary: if expressible { boundary } else { 0 },
                     pieces,
                 }
@@ -654,6 +665,7 @@ impl ViterbiDecoder {
         // beam 本就只回溯一条，片段随路收集（语法模型出厂关闭，这里不追零分配）；
         // 全精确时丢弃，结果与 DP 一侧同形。
         let mut pieces = Vec::new();
+        let mut lexical = 0.0;
         while pos > 0 {
             let Some(entry) = cursor else {
                 break;
@@ -661,6 +673,15 @@ impl ViterbiDecoder {
             if entry.word.is_empty() {
                 break;
             }
+            // 线上不存节点分，回到词图里按（跨度，词）取；同跨度同词有多个节点（模糊变体等）
+            // 时前向 DP 选的必是分最高那个——转移分与节点无关，同一前驱下高分节点恒胜。
+            lexical += nodes
+                .get(pos)
+                .into_iter()
+                .flatten()
+                .filter(|n| n.start == entry.prev_pos && n.word == entry.word)
+                .map(|n| n.log_prob)
+                .fold(f64::NEG_INFINITY, f64::max);
             words.push(entry.word.clone());
             if expressible {
                 boundary |= entry.syl_mask << entry.prev_pos;
@@ -686,6 +707,11 @@ impl ViterbiDecoder {
         ViterbiResult {
             words,
             log_prob: final_log_prob,
+            lexical_log_prob: if final_log_prob.is_finite() {
+                lexical
+            } else {
+                f64::NEG_INFINITY
+            },
             boundary: if expressible { boundary } else { 0 },
             pieces,
         }
@@ -958,6 +984,28 @@ mod tests {
     /// 这条守的是 `grammar.rs` 里「为什么 `NullGrammar` 必须返回 0.0」那段论证：
     /// 若它返回 librime 那样的 `kPenalty`，整句分会平白多出 `词数 × 常数`，
     /// 词数不同的路径之间的比较随之改变——本测试会立刻变红。
+    /// 挂上语法模型后 `log_prob` 含转移分，`lexical_log_prob` 仍只是路径上节点分之和
+    /// ——按词频标定的闸门（混合整句的每字分）读的是它。
+    #[test]
+    fn lexical_log_prob_excludes_grammar_scores() {
+        struct Penalize;
+        impl Grammar for Penalize {
+            fn query(&self, _context: &str, _word: &str, _is_rear: bool) -> f64 {
+                -5.0
+            }
+        }
+        let input_len = 4;
+        let mut nodes = vec![Vec::new(); input_len + 1];
+        nodes[2].push(node(0, 2, "你", -3.0));
+        nodes[4].push(node(2, 4, "好", -2.0));
+        let plain = ViterbiDecoder::new().decode(&nodes, input_len);
+        assert_eq!(plain.lexical_log_prob, plain.log_prob);
+        let with = ViterbiDecoder::with_grammar(Arc::new(Penalize)).decode(&nodes, input_len);
+        assert_eq!(with.words, ["你", "好"]);
+        assert_eq!(with.lexical_log_prob, -5.0);
+        assert_eq!(with.log_prob, -15.0, "两次转移各 −5");
+    }
+
     #[test]
     fn null_grammar_does_not_change_result() {
         let (nodes, input_len) = two_segment_lattice();

@@ -1122,6 +1122,7 @@ mod tests {
     }
     fn item(t: &str) -> CandidateItem {
         CandidateItem {
+            text_styled: Default::default(),
             text: t.into(),
             code: String::new(),
             label: String::new(),

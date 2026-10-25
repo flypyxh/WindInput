@@ -1411,7 +1411,8 @@ pub struct PinyinGrammar {
     /// 模型文件名，相对 `data/schemas/pinyin/grammar/`。**默认空串 = 不启用**。
     ///
     /// 格式是 librime-octagram 的 `.gram`（darts-clone double-array）。
-    /// 模型数据**不随安装包分发**（许可与体积，见设计文档 §5），需用户自行获取。
+    /// 随包带 `wanxiang-mini.gram`（万象的 5.3 MB 子集，见设计文档 §11）：桌面默认不启用，
+    /// 移动端经 [`MobileGrammarConfig`] 默认启用。
     ///
     /// ## ★ 为什么默认是空串而不是某个具体模型名
     ///
@@ -2488,6 +2489,21 @@ impl CodetableGlobal {
             if let Some(v) = e.block_commit {
                 out.english_merge.block_commit = v;
             }
+            if let Some(v) = e.complete_min_length {
+                out.english_merge.complete_min_length = v;
+            }
+            if let Some(v) = e.block_commit_on_word {
+                out.english_merge.block_commit_on_word = v;
+            }
+            if let Some(v) = e.exact_position {
+                out.english_merge.exact_position = v;
+            }
+            if let Some(v) = e.complete_position {
+                out.english_merge.complete_position = v;
+            }
+            if let Some(v) = e.max_count {
+                out.english_merge.max_count = v;
+            }
         }
         out
     }
@@ -2852,14 +2868,36 @@ pub struct MixGlobal {
     #[serde(default = "default_true")]
     pub auto_commit_block_on_pinyin: bool,
     /// 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。
+    /// **前缀级**：有英文词以当前串开头即否决；开着时涵盖下面的成词级。
     #[serde(default)]
     pub auto_commit_block_on_english: bool,
+    /// **成词级**英文否决：整串恰是一个英文完整单词时否决满码 / 顶码上屏（英文临时词不算）。
+    /// 默认开；与前缀级 `auto_commit_block_on_english` 的关系同拼音那对
+    /// （`auto_commit_block_on_pinyin` / `block_commit_on_pinyin_word`）。
+    #[serde(default = "default_true")]
+    pub block_commit_on_english_word: bool,
     /// 拼音最小触发长度（0=回退 2）。
     #[serde(default)]
     pub min_pinyin_length: usize,
     /// 英文最小触发长度（0=回退 3，即 2 字符以内不查英文；预留可配）。
     #[serde(default)]
     pub min_english_length: usize,
+    /// 中文侧有候选时，输入达到几码起也给英文前缀补全。0 = 不补（出厂值）。
+    /// 口径同 `schema.codetable.english_merge.complete_min_length`。
+    #[serde(default)]
+    pub english_complete_min_length: usize,
+    /// 完整单词英文最靠前排第几位（1 起；0 = 默认 1）。
+    /// 口径同 `schema.codetable.english_merge.exact_position`。
+    #[serde(default = "default_english_exact_position")]
+    pub english_exact_position: usize,
+    /// 前缀补全英文最靠前排第几位（1 起；0 = 默认 2）。
+    /// 口径同 `schema.codetable.english_merge.complete_position`。
+    #[serde(default = "default_english_complete_position")]
+    pub english_complete_position: usize,
+    /// 中文侧有候选时英文最多几条（0 = 默认 2），截断时为它们保底留座。
+    /// 口径同 `schema.codetable.english_merge.max_count`。
+    #[serde(default = "default_english_max_count")]
+    pub english_max_count: usize,
     /// 拼音歧义拦截（词强度启发式）：整串是强拼音词时否决五笔自动/顶码上屏，让拼音赢
     /// （如 wangba→网吧；aipu 无强词则放行落实）。默认开；独立于 auto_commit_block_on_pinyin。
     #[serde(default = "default_true")]
@@ -2906,8 +2944,13 @@ impl Default for MixGlobal {
             top_code_override_pinyin: false,
             auto_commit_block_on_pinyin: true,
             auto_commit_block_on_english: false,
+            block_commit_on_english_word: true,
             min_pinyin_length: 0,
             min_english_length: 0,
+            english_complete_min_length: 0,
+            english_exact_position: default_english_exact_position(),
+            english_complete_position: default_english_complete_position(),
+            english_max_count: default_english_max_count(),
             block_commit_on_pinyin_word: true,
             pinyin_word_min_weight: 0,
             // ⚠️ 同属「三处同源」：本处 / `MixConfig::default()` / `data/config.toml`。
@@ -2946,14 +2989,15 @@ impl Default for MixGlobal {
 /// 归属绑在一起。混输方案不读本段，否则两套英文各混一遍、档位与配额双重失真。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodetableEnglishMerge {
-    /// 在候选列表里混入英文词库候选（只收**精确命中**，前缀扩展不入列）。出厂关。
+    /// 在候选列表里混入英文词库候选（中文侧有候选时只收**精确命中**，按
+    /// [`Self::complete_min_length`] 才补前缀）。出厂关。
     #[serde(default)]
     pub enable: bool,
     /// 最小触发长度（0=回退 3，即 2 字符以内不查英文）。口径同 `schema.mix.min_english_length`。
     #[serde(default)]
     pub min_length: usize,
     /// 存在英文候选时否决**满码自动上屏 / 顶码上屏 / 满码空码清空**（保护正在输入英文词的用户）。
-    /// 默认开。
+    /// 默认开。**前缀级**：有英文词以当前串开头即否决，开着时涵盖成词级 [`Self::block_commit_on_word`]。
     ///
     /// ⚠️ 默认值与 `schema.mix.auto_commit_block_on_english`（默认**关**）刻意相反，不是漂移。
     /// 那边默认关，是因为混输用户以码表为主、顶码要保持可用，英文只是捎带；而本段是用户
@@ -2965,6 +3009,42 @@ pub struct CodetableEnglishMerge {
     /// `gith` 时精确命中还不存在，若否决也要求精确，满码就会在第 4 键把中文顶上屏。
     #[serde(default = "default_true")]
     pub block_commit: bool,
+    /// **成词级**否决：整串恰是一个英文完整单词时否决满码 / 顶码上屏 / 满码空码清空（英文
+    /// 临时词不算）。默认开。前缀级 [`Self::block_commit`] 关掉时，用它保住「打完一个英文词
+    /// 不被顶走」，又不让英文词的前缀拦住五笔满码。两级关系同混输拼音那对。
+    #[serde(default = "default_true")]
+    pub block_commit_on_word: bool,
+    /// 中文侧有候选时，输入达到几码起也给英文前缀补全（`gith` → github）。
+    /// 0 = 不补，只在中文侧为空时补（出厂值）。
+    #[serde(default)]
+    pub complete_min_length: usize,
+    /// 完整单词英文最靠前排第几位（1 起；0 = 默认 1）。仍先让过开头连续的完整匹配中文，
+    /// 只会更靠后。由协调器 `place_english_after_common_exact` 应用。
+    #[serde(default = "default_english_exact_position")]
+    pub exact_position: usize,
+    /// 前缀补全英文最靠前排第几位（1 起；0 = 默认 2）。同样先让过开头的完整匹配中文，且恒排在
+    /// 完整单词英文之后。
+    #[serde(default = "default_english_complete_position")]
+    pub complete_position: usize,
+    /// 中文侧有候选时英文最多几条（完整单词 + 补全合计，完整单词优先；0 = 默认 2）。
+    /// 中文侧为空时不受本项约束（给一页前缀补全）。
+    #[serde(default = "default_english_max_count")]
+    pub max_count: usize,
+}
+
+/// 完整单词英文最靠前位次的出厂值（码表 / 混输两份同值）。
+pub fn default_english_exact_position() -> usize {
+    1
+}
+
+/// 前缀补全英文最靠前位次的出厂值（码表 / 混输两份同值）。
+pub fn default_english_complete_position() -> usize {
+    2
+}
+
+/// 中文侧有候选时英文条数上限的出厂值（码表 / 混输两份同值）。
+fn default_english_max_count() -> usize {
+    2
 }
 
 impl Default for CodetableEnglishMerge {
@@ -2974,6 +3054,11 @@ impl Default for CodetableEnglishMerge {
             min_length: 0,
             // 见字段文档：这一项与 `schema.mix.auto_commit_block_on_english` 默认值相反是刻意的。
             block_commit: true,
+            block_commit_on_word: true,
+            complete_min_length: 0,
+            exact_position: default_english_exact_position(),
+            complete_position: default_english_complete_position(),
+            max_count: default_english_max_count(),
         }
     }
 }
@@ -2984,7 +3069,7 @@ impl Default for CodetableEnglishMerge {
 ///
 /// ⚠️ **刻意没有 `block_commit`**：那一项否决的是满码自动上屏 / 顶码上屏，而拼音方案
 /// 两者都没有。给它一个恒不生效的开关，等于教用户去配一件不成立的事。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinyinEnglishMerge {
     /// 在候选列表里混入英文词库候选（只收**精确命中**，前缀扩展不入列）。出厂关。
     #[serde(default)]
@@ -2992,16 +3077,44 @@ pub struct PinyinEnglishMerge {
     /// 最小触发长度（0=回退 3，即 2 字符以内不查英文）。
     #[serde(default)]
     pub min_length: usize,
-    /// 中文侧**有**候选时也补英文前缀（至多 2 条，不与精确命中重复）。出厂关。
+    /// 中文侧**有**候选时，输入达到几个字母起也补英文前缀（不与精确命中重复）。
+    /// 0 = 不补，只在中文侧为空时补（出厂值）；开时建议 5。口径同码表的同名项，另加一条拼音判据：
     ///
-    /// 只在「打的不是完整拼音」时补：输入至少 5 个字母，且整串**任何切法**都切不成完整的
-    /// 全拼音节序列（`templa` 补 template，`shang` / `chang` 不补）。判据见
+    /// 只在「打的不是完整拼音」时补：整串**任何切法**都切不成完整的全拼音节序列（`templa`
+    /// 补 template，`shang` / `chang` 不补）。判据见
     /// `wind_engine::english_merge::prefix_complete_applies`。
     ///
     /// ⚠️ 双拼方案下不生效：判据按全拼音节定义，双拼码两键一音节、几乎任何串都解得开，
     /// 套不上这条判据。
     #[serde(default)]
-    pub prefix_complete: bool,
+    pub complete_min_length: usize,
+    /// 完整单词英文最靠前排第几位（1 起）。0 = 按方案自动：全拼 1、双拼 2（出厂值）；
+    /// 写了非 0 值则全拼双拼都用它。仍先让过开头吃满整串的中文，只会更靠后。
+    ///
+    /// 双拼默认让一位：双拼两键一音节，`the` / `good` / `this` 这类常用英文词几乎都解得出
+    /// 中文，英文当首选会抢掉用户真正在打的那个字词。
+    #[serde(default)]
+    pub exact_position: usize,
+    /// 前缀补全英文最靠前排第几位（1 起；0 = 默认 2）。恒在完整单词英文之后。
+    #[serde(default = "default_english_complete_position")]
+    pub complete_position: usize,
+    /// 中文侧有候选时英文最多几条（完整单词 + 补全合计，完整单词优先；0 = 默认 2）。
+    /// 中文侧为空时不受本项约束（给一页前缀补全）。
+    #[serde(default = "default_english_max_count")]
+    pub max_count: usize,
+}
+
+impl Default for PinyinEnglishMerge {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            min_length: 0,
+            complete_min_length: 0,
+            exact_position: 0,
+            complete_position: default_english_complete_position(),
+            max_count: default_english_max_count(),
+        }
+    }
 }
 
 /// 全局模糊音（[schema.pinyin.fuzzy]）。字段对齐引擎 FuzzyConfig。
@@ -3035,6 +3148,110 @@ pub struct PinyinFuzzy {
     pub un_ong: bool,
     #[serde(default)]
     pub eng_ong: bool,
+}
+
+/// 拼音纠错与正确拼音提示（`[input.correction]`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CorrectionConfig {
+    /// 纠错总开关。
+    pub enabled: bool,
+    /// 纠错候选的标记，加在候选前（留空 = 不加）。
+    pub marker: String,
+    /// 内置纠错规则开关。
+    pub rules: CorrectionRuleToggles,
+    /// 自定义纠错，每项 `错误=正确`。
+    pub custom: Vec<String>,
+    /// 正确拼音提示。
+    pub hint: PinyinHintConfig,
+}
+
+impl Default for CorrectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            marker: "*".to_string(),
+            rules: CorrectionRuleToggles::default(),
+            custom: Vec::new(),
+            hint: PinyinHintConfig::default(),
+        }
+    }
+}
+
+/// 内置纠错规则开关（`[input.correction.rules]`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CorrectionRuleToggles {
+    pub gn_ng: bool,
+    pub on_ong: bool,
+    pub vowel_swap: bool,
+    pub legacy_spelling: bool,
+    pub h_misplaced: bool,
+    pub mg_ng: bool,
+    pub n_before_g: bool,
+    pub ai_ia: bool,
+}
+
+impl Default for CorrectionRuleToggles {
+    fn default() -> Self {
+        Self {
+            gn_ng: false,
+            on_ong: true,
+            vowel_swap: true,
+            legacy_spelling: false,
+            h_misplaced: false,
+            mg_ng: false,
+            n_before_g: false,
+            ai_ia: false,
+        }
+    }
+}
+
+/// 正确拼音提示（`[input.correction.hint]`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PinyinHintConfig {
+    /// 候选正文内嵌正确全拼（「苹(ping)果」）的总开关。
+    pub enabled: bool,
+    /// 模糊音命中时提示。
+    pub fuzzy: bool,
+    /// 易读错的字提示。
+    pub misread: bool,
+    /// 纠错命中时提示。
+    pub correction: bool,
+    /// 提示范围：first = 只标第一个带提示的候选；all = 标全部。
+    #[serde(deserialize_with = "crate::tolerant_de::tolerant")]
+    pub scope: HintScope,
+    /// 提示带声调（「苹(píng)果」），内嵌提示与注释变量 `${correct_pinyin}` 共用。
+    pub tone: bool,
+}
+
+impl Default for PinyinHintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fuzzy: true,
+            misread: true,
+            correction: false,
+            scope: HintScope::First,
+            tone: false,
+        }
+    }
+}
+
+/// 提示范围（`[input.correction.hint] scope`）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HintScope {
+    /// 只标候选列表里第一个带提示的候选。
+    #[default]
+    First,
+    /// 每个带提示的候选都标。
+    All,
+}
+
+impl HintScope {
+    pub const VALUES: &'static [&'static str] = &["first", "all"];
 }
 
 /// 快捷输入的**全局**行为配置。
@@ -3281,9 +3498,10 @@ pub type CommentTemplateOverride = Option<String>;
 /// 自由输入（字面输入）模式：让 mix 能打出 `GetTestData()` / `test_data` / `<TAB>`
 /// 这类**任何 member 都无法接受**的内容。
 ///
-/// - `Off`：完全维持既有行为（越界字符仍走「顶屏候选 + 上屏标点 + 退出」）。唯一例外是
+/// - `Off`：越界字符仍走「顶屏候选 + 上屏标点 + 退出」，没有 Free 透镜。例外两条：
 ///   含英文成员的实例里 Shift+字母：大写照样进缓冲、候选只给英文段（同 `Auto`），但数字 /
-///   符号键仍是功能键（选词、翻页、顶屏），见 `MixLens::English`（A2-50）。
+///   符号键仍是功能键（选词、翻页、顶屏），见 `MixLens::English`（A2-50）；下文的
+///   **第二条判据同样适用**——零候选时选词键归字面，`;.xlsx` 在 `Off` 下也打得出。
 /// - `Auto`（**默认**）：由缓冲内容自动推导，见 `MixLens`。
 /// - `Always`：本实例恒为自由输入——用于新建一个专做字面输入的融合模式。
 ///
@@ -3294,10 +3512,13 @@ pub type CommentTemplateOverride = Option<String>;
 /// 导航键组。于是判据落在**输入内容本身**：一个字符若不在当前透镜的合法字符集内，
 /// 它就不可能是编码，只能是字面内容。
 ///
-/// 判据有**第二条**（0.122 补）：**一个候选都没有时，选词键也不是功能键**，同样归字面。
+/// 判据有**第二条**（0.122 补，`Off` 档后来也纳入）：**一个候选都没有时，选词键也不是
+/// 功能键**，同样归字面。
 /// 上面那条对「本透镜合法、却换不来任何候选」的字符无能为力——`.` 是算式字符，缓冲 `.`
 /// 自身永不越界，而字母在数字透镜里被选词臂吃掉，于是越界字符永远进不了缓冲，`.txt`
 /// 打不出来。两条判据是同一句话的两面：这个键此刻根本没在起作用，它就只能是字面。
+/// 快捷输入历史的候选不算数：它是字面前缀补全、不是本透镜的产出，只有历史命中时
+/// 选词键同样归字面（否则 `.txt` 进了历史，`.xlsx` 又打不出）。
 ///
 /// # 为什么是缓冲的纯函数而非粘滞状态位
 ///
@@ -3387,6 +3608,12 @@ pub struct MixModeConfig {
     /// 触发的自由输入。
     #[serde(default = "default_true")]
     pub free_input_takes_select_keys: bool,
+    /// 数字透镜（首字符是数字/符号）下是否拿**小写字母**作选词键（a=首选）。默认开。
+    ///
+    /// 关掉后字母在数字透镜里是字面输入，`2fa`、`1.5x` 可以直接打进缓冲；序号标签随之
+    /// 改回数字，选词靠 `keys.quick_input_select`（出厂 Ctrl+数字）与空格。
+    #[serde(default = "default_true")]
+    pub numeric_letter_select: bool,
 }
 
 impl Default for MixModeConfig {
@@ -3403,6 +3630,7 @@ impl Default for MixModeConfig {
             free_input: FreeInputMode::default(),
             // 与 `#[serde(default = "default_true")]` 对齐，见结构体文档的 ⚠️。
             free_input_takes_select_keys: default_true(),
+            numeric_letter_select: default_true(),
         }
     }
 }
@@ -3462,6 +3690,7 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         // 夺取 `;`/`'` 作字面：它们选第 2/3 候选只是数字键的冗余别名，而 `rock'n'roll`
         // 这类内容里的 `'` 没有别的输入通路。
         free_input_takes_select_keys: true,
+        numeric_letter_select: true,
     }]
 }
 
@@ -3659,6 +3888,41 @@ impl Default for AssociationConfig {
 pub struct MobileConfig {
     #[serde(default)]
     pub association: MobileAssociationConfig,
+    #[serde(default)]
+    pub grammar: MobileGrammarConfig,
+}
+
+/// `[mobile.grammar]`：拼音整句语法模型的移动端取值。字段语义见 [`PinyinGrammar`]。
+///
+/// 移动端默认**开**随包的 `wanxiang-mini.gram`（5.3 MB，万象的子集，挑法见设计文档
+/// `language-model-integration.md` §10–§11）：软键盘上整句打错要逐字改，代价比桌面高。
+/// 桌面基线仍关（[`PinyinGrammar`] 默认），等移动端真机跑稳再议。
+///
+/// 覆盖同样不在 `Config::load` 里合并，由引擎在取拼音配置时按平台挑
+/// （[`Config::pinyin_effective`]）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileGrammarConfig {
+    #[serde(default = "default_mobile_grammar_weight")]
+    pub weight: f64,
+    #[serde(default = "default_mobile_grammar_model")]
+    pub model: String,
+}
+
+impl Default for MobileGrammarConfig {
+    fn default() -> Self {
+        Self {
+            weight: default_mobile_grammar_weight(),
+            model: default_mobile_grammar_model(),
+        }
+    }
+}
+
+fn default_mobile_grammar_weight() -> f64 {
+    0.5
+}
+
+fn default_mobile_grammar_model() -> String {
+    "wanxiang-mini.gram".to_string()
 }
 
 /// `[mobile.association]`：联想的移动端取值。字段语义见 [`AssociationConfig`] 同名字段。
@@ -3674,6 +3938,12 @@ pub struct MobileAssociationConfig {
     /// 桌面相反（见 [`AssociationConfig::punct`]）——实体键盘上标点一键可达。
     #[serde(default = "default_true")]
     pub punct: bool,
+    /// 移动端**关**：联想态空格出空格、收起联想，不选首个联想（豆包、微信都是这样）。
+    /// 汉字后双击空格出「。」也靠这一下真的是空格。桌面相反（[`AssociationConfig::space_commits`]
+    /// 默认开）——候选窗里看得见高亮，空格选词顺手；手机上联想挤在候选条里，空格选走它就是
+    /// 「我想打空格却上了个词」。留作开关给习惯「空格选首个联想」的人。
+    #[serde(default)]
+    pub space_commits: bool,
 }
 
 impl Default for MobileAssociationConfig {
@@ -3682,6 +3952,7 @@ impl Default for MobileAssociationConfig {
             kind: default_mobile_assoc_kind(),
             mode: default_mobile_assoc_mode(),
             punct: true,
+            space_commits: false,
         }
     }
 }
@@ -3905,6 +4176,9 @@ pub struct InputConfig {
     /// 检索范围放宽（智能档增强）。
     #[serde(default)]
     pub scope_relax: ScopeRelaxConfig,
+    /// 拼音纠错与正确拼音提示。
+    #[serde(default)]
+    pub correction: CorrectionConfig,
     #[serde(default = "default_enter_behavior")]
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
@@ -4107,6 +4381,7 @@ impl Default for InputConfig {
             english_case_cycle_key: String::new(),
             alt_commit: default_alt_commit(),
             scope_relax: ScopeRelaxConfig::default(),
+            correction: CorrectionConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
             punct_on_empty_behavior: default_punct_on_empty_behavior(),
@@ -4768,6 +5043,21 @@ impl Config {
 }
 
 impl Config {
+    /// 拼音全局配置的生效取值：`mobile` 时语法模型换成 `[mobile.grammar]`，其余照基线。
+    ///
+    /// 由引擎在取拼音配置的那一刻按平台调用（Android 构建传 `true`），不进 `Config::load`
+    /// ——理由见 [`MobileConfig`]：合并后移动端设置页一保存，就把移动端的值写进了桌面基线。
+    pub fn pinyin_effective(&self, mobile: bool) -> PinyinGlobalConfig {
+        let mut p = self.schema.pinyin.clone();
+        if mobile {
+            p.grammar = PinyinGrammar {
+                weight: self.mobile.grammar.weight,
+                model: self.mobile.grammar.model.clone(),
+            };
+        }
+        p
+    }
+
     /// 全部 emoji 附加模块：内置在前（注册表序），其后是 `emoji/` 目录里用户放置的
     /// OpenCC 表（`*.txt`，按文件名序；id = 文件名去掉 `.txt`，出厂关）。
     ///
@@ -5311,6 +5601,22 @@ pub struct KeysConfig {
     pub pin_candidate: String,
     #[serde(default = "default_delete_candidate")]
     pub delete_candidate: String,
+    /// 快捷输入（mix）专用选词上屏键，模板值域同 [`Self::pin_candidate`]
+    /// （见 `hotkey::number_template_mods`），`"none"` 不绑。
+    ///
+    /// 只在快捷输入里生效、且先于置顶/删除判定：快捷输入的候选没有词库落点，置顶本就
+    /// 无从谈起，而数字键常被算式/字面输入占着，候选一多就没有别的选词通路。
+    ///
+    /// ★ 本键自己不进 TSF 热键表，送达靠两条现成通路：
+    /// - 与置顶/删除**同模板**（出厂即是）：借它们的 SESSION 热键送达；候选可见时那批键被
+    ///   `RegisterHotKey` 抢成系统热键，走 WM_HOTKEY → `DispatchHotkey`（非按键上下文上屏）。
+    /// - 模板不同：快捷输入期间恒有组合，TSF 对会话中未登记的 Ctrl/Alt 组合一律先吃下转发
+    ///   （cleanup 通路），上屏后不再交还宿主。代价是不受 `RegisterHotKey` 保护，QQNT 一类
+    ///   Chromium 宿主可能对同一键再触发一次加速键。
+    ///
+    /// 不单独登记的理由：登记进 SESSION 表会让主输入路也吃掉它，而主输入路对它没有出口。
+    #[serde(default = "default_quick_input_select")]
+    pub quick_input_select: String,
     #[serde(default = "default_take_screenshot")]
     pub take_screenshot: String,
     /// 软键盘面板开关热键。
@@ -5476,6 +5782,9 @@ fn default_pin_candidate() -> String {
 }
 fn default_delete_candidate() -> String {
     "ctrl+shift+number".to_string()
+}
+fn default_quick_input_select() -> String {
+    "ctrl+number".to_string()
 }
 fn default_select_key_groups() -> Vec<String> {
     vec!["semicolon_quote".to_string()]
@@ -5658,6 +5967,7 @@ impl Default for KeysConfig {
             activate_ime: default_activate_ime(),
             pin_candidate: default_pin_candidate(),
             delete_candidate: default_delete_candidate(),
+            quick_input_select: default_quick_input_select(),
             take_screenshot: default_take_screenshot(),
             softkeyboard: default_softkeyboard(),
             global_hotkeys: Vec::new(),
@@ -10312,6 +10622,24 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// 语法模型的平台覆盖只在取用时挑：桌面看基线（出厂关），移动端看 [mobile.grammar]
+    /// （出厂开随包小模型），且挑的时候不改动 Config 本身。
+    #[test]
+    fn pinyin_grammar_follows_platform_override() {
+        let mut cfg = Config::default();
+        let desktop = cfg.pinyin_effective(false).grammar;
+        assert_eq!((desktop.weight, desktop.model.as_str()), (0.0, ""));
+        let mobile = cfg.pinyin_effective(true).grammar;
+        assert_eq!(
+            (mobile.weight, mobile.model.as_str()),
+            (0.5, "wanxiang-mini.gram")
+        );
+
+        cfg.mobile.grammar.weight = 0.0;
+        assert_eq!(cfg.pinyin_effective(true).grammar.weight, 0.0, "移动端可关");
+        assert_eq!(cfg.schema.pinyin.grammar.weight, 0.0, "基线不被覆盖值写穿");
+    }
+
     #[test]
     fn codetable_wildcard_folds_from_schema_and_validates_key() {
         let g = CodetableGlobal::default();
@@ -11873,6 +12201,10 @@ y = 2
         assert!(
             MixModeConfig::default().free_input_takes_select_keys,
             "夺取二三候选键默认应为开"
+        );
+        assert!(
+            MixModeConfig::default().numeric_letter_select,
+            "数字透镜下字母选词默认应为开"
         );
     }
 
@@ -13734,6 +14066,42 @@ scripts = { latin = 42 }
         let c = merged_with("[schema.pinyin.fuzzy]\nun_ong = true\n");
         assert!(c.schema.pinyin.fuzzy.un_ong);
         assert!(!c.schema.pinyin.fuzzy.eng_ong);
+    }
+
+    #[test]
+    fn correction_defaults() {
+        let c = Config::default().input.correction;
+        assert!(c.enabled);
+        assert_eq!(c.marker, "*");
+        assert!(c.rules.on_ong && c.rules.vowel_swap);
+        assert!(
+            !c.rules.gn_ng
+                && !c.rules.legacy_spelling
+                && !c.rules.h_misplaced
+                && !c.rules.mg_ng
+                && !c.rules.n_before_g
+                && !c.rules.ai_ia
+        );
+        assert!(c.custom.is_empty());
+        assert!(!c.hint.enabled && c.hint.fuzzy && c.hint.misread && !c.hint.correction);
+        assert_eq!(c.hint.scope, HintScope::First);
+        assert!(!c.hint.tone);
+    }
+
+    #[test]
+    fn bad_hint_scope_falls_back_to_first() {
+        let c: Config = toml::from_str("[input.correction.hint]\nscope = \"bogus\"").unwrap();
+        assert_eq!(c.input.correction.hint.scope, HintScope::First);
+    }
+
+    #[test]
+    fn correction_hint_parses_scope_and_tone() {
+        let c =
+            merged_with("[input.correction.hint]\nenabled = true\nscope = \"all\"\ntone = true\n");
+        let h = c.input.correction.hint;
+        assert!(h.enabled && h.tone);
+        assert_eq!(h.scope, HintScope::All);
+        assert!(h.fuzzy, "未写的键保持出厂值");
     }
 
     /// `auto_learn.max_word_length` 的默认值必须**两条路一致**：代码默认

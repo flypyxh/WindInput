@@ -39,6 +39,13 @@ pub struct SylSpan {
     pub fp_start: usize,
     /// 在全拼扁平串中的结束字节位（不含）。
     pub fp_end: usize,
+    /// 用户**本义**音节：双拼转换器为本键对取了模糊对偶声母时（小鹤开 s↔sh，`sx` 里
+    /// `s` + ia/ua 都不成音节、读成 `shua`），按布局不开模糊该读的字面拼写（`sua`）。
+    /// 其余情形（与 `pinyin` 相同、错音串垫底本就是字面读音、全拼）为 `None`。
+    ///
+    /// 只在模糊音提示开着时由转换器填（[`super::shuangpin::ShuangpinConverter::set_fuzzy`]），
+    /// 供引擎拿用户本义与词库读音对齐。
+    pub literal: Option<String>,
 }
 
 /// 为「全拼（可含 `'` 手动分隔符）」输入构造音节 span 序列。
@@ -65,6 +72,7 @@ pub fn spans_for_full_pinyin(input: &str, trie: &SyllableTrie) -> Vec<SylSpan> {
                 raw_end: raw_pos + n,
                 fp_start: fp_pos,
                 fp_end: fp_pos + n,
+                literal: None,
             });
             raw_pos += n;
             fp_pos += n;

@@ -209,7 +209,7 @@ pub fn open(dir: &Path, name: &str) -> anyhow::Result<Option<Snapshot>> {
     if !meta_path.is_file() {
         return Ok(None);
     }
-    let meta = unsafe { memmap2::Mmap::map(&std::fs::File::open(&meta_path)?)? };
+    let meta = wind_dict::mapping::map_file(&std::fs::File::open(&meta_path)?)?;
     if meta.len() < META_HEADER
         || &meta[..4] != META_MAGIC
         || u16::from_le_bytes([meta[4], meta[5]]) != META_VERSION
@@ -331,6 +331,39 @@ impl Snapshot {
             return Vec::new();
         };
         r.search_prefix(prefix, limit)
+            .into_iter()
+            .map(|e| {
+                let idx = self.idx_of(&e.code, e.order);
+                self.entry(&e.code, e.text, e.weight, e.boundary, idx)
+            })
+            .collect()
+    }
+
+    /// 同 [`Self::prefix`]，只取 [`wind_dict::cached::prefix_capped_keep`] 放行的条目，
+    /// 过滤在 wdat 里参与剪枝（权重全打平的导入词库靠它才不整棵子树遍历）。
+    pub fn prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<SnapshotEntry> {
+        if limit == 0 {
+            let mut v = self.prefix(prefix, 0);
+            v.retain(|e| {
+                wind_dict::cached::prefix_capped_keep(
+                    e.boundary,
+                    e.code.len(),
+                    max_syllables,
+                    completed_len,
+                )
+            });
+            return v;
+        }
+        let Some(r) = self.reader.as_deref() else {
+            return Vec::new();
+        };
+        r.search_prefix_syllable_capped(prefix, limit, max_syllables, completed_len)
             .into_iter()
             .map(|e| {
                 let idx = self.idx_of(&e.code, e.order);

@@ -66,12 +66,14 @@ fn pinyin() -> PinyinEngine {
     PinyinEngine::new(PinyinConfig::default(), CachedDict::Memory(d))
 }
 
-/// 「否决选项全关」＝ ①②③ 全关，⓪ 保持出厂 `true`（用户设置页里关得掉的就是 ①②③）。
+/// 「否决选项全关」＝ ①②③ 全关（③ 含英文前缀级与成词级两项），⓪ 保持出厂 `true`
+/// （用户设置页里关得掉的就是 ①②③）。
 fn all_vetoes_off() -> MixConfig {
     MixConfig {
         auto_commit_block_on_pinyin: false,
         block_commit_on_pinyin_word: false,
         auto_commit_block_on_english: false,
+        block_commit_on_english_word: false,
         pinyin_only_overflow: true,
         top_code_override_pinyin: false,
         ..Default::default()
@@ -600,6 +602,21 @@ fn topcode_on_english_word_is_still_governed_by_the_english_guard() {
         on.handle_top_code("github"),
         None,
         "③ 开 ⇒ 顶码被英文守护拦下，这才是顶码侧的正解"
+    );
+
+    // 成词级（前缀级关）：整串 github 是英文单词 ⇒ 拦；githu 只是前缀 ⇒ 照常顶码。
+    let word_only = mixed_en(MixConfig {
+        block_commit_on_english_word: true,
+        ..all_vetoes_off()
+    });
+    assert_eq!(word_only.handle_top_code("github"), None, "成词级应拦顶码");
+    assert!(
+        off.handle_top_code("githu").is_some(),
+        "前提：两级都关时 githu 顶码"
+    );
+    assert!(
+        word_only.handle_top_code("githu").is_some(),
+        "成词级不管前缀：githu 应照常顶码"
     );
 }
 

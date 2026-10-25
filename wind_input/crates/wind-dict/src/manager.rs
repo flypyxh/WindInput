@@ -47,6 +47,18 @@ impl DictManager {
         self.composite.search_prefix(prefix, limit)
     }
 
+    /// 带音节上限的前缀查找，见 [`crate::layer::DictLayer::search_prefix_capped`]。
+    pub fn search_prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<Candidate> {
+        self.composite
+            .search_prefix_capped(prefix, limit, max_syllables, completed_len)
+    }
+
     /// 按声母串查找（简拼召回）。返回超集，判据仍在引擎侧，
     /// 见 [`crate::layer::DictLayer::search_abbrev`]。
     pub fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {

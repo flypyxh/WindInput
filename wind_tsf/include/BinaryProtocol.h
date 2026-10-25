@@ -10,6 +10,8 @@
 #include <vector>
 #include <string>
 
+#include "ResponseType.h" // 不含 Win32，吃键判据可在 Linux 上单测
+
 // Protocol version (major.minor: high 4 bits = major, low 12 bits = minor)
 constexpr uint16_t PROTOCOL_VERSION = 0x1001; // v1.1 - Added barrier mechanism and state machine support
 
@@ -1004,29 +1006,6 @@ inline uint32_t GetCurrentModifiers()
 // ============================================================================
 // Parsed response structures (high-level, after decoding)
 // ============================================================================
-
-enum class ResponseType
-{
-    Ack,
-    PassThrough,  // Key not handled, pass to system
-    CommitText,
-    UpdateComposition,
-    ClearComposition,
-    ClearCompositionThenPassThrough, // 收组合 + 把当前键交还宿主（重放）
-    StatusUpdate,
-    SyncHotkeys,
-    Consumed,
-    InsertTextWithCursor, // Insert text and position cursor
-    MoveCursorRight,      // Move cursor right (smart skip)
-    DeletePair,           // Delete left + right char (smart delete)
-    ReplaceBackward,      // Delete N chars before caret + insert text (smart symbol)
-    HoldComposition,      // Open composition with text + start auto-commit timer (smart symbol)
-    CommitAndHold,        // Commit text then open composition with hold text + start timer
-    CommitThenDefer,      // Commit text now, defer new composition (余码) to trigger-key keyup
-    HostRenderSetup, // Host render setup (shared memory info)
-    UiElementPage,   // 候选快照（CMD_UIELEMENT_QUERY 的响应）
-    Error
-};
 
 struct ParsedResponse
 {

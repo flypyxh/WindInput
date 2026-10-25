@@ -686,9 +686,9 @@ fn decide_auto_commit(
     // ⚠️ **也排除整句候选**（`is_sentence`）：它的 `code` 是整串，超码长时又常是唯一一条
     // `code == input`、且超码长串没有更长后继 ⇒ 不排除的话，开了满码上屏后每多打一码
     // 整句就把自己上屏了（`trntw` → 「我人」），句子永远组不起来（论坛 t350）。
-    let mut exact = candidates
-        .iter()
-        .filter(|c| c.code == input && !c.is_scope_filtered && !c.is_sentence);
+    let mut exact = candidates.iter().filter(|c| {
+        c.code == input && !c.is_scope_filtered && !c.is_low_confidence() && !c.is_sentence
+    });
     let first = exact.next()?;
     if exact.next().is_some() {
         return None; // 多个精确匹配，不自动上屏

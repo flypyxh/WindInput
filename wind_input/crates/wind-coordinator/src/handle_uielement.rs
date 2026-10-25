@@ -1027,6 +1027,7 @@ mod tests {
         st.active = None;
         st.input_buffer = "saaa".into();
         st.input_buffer_cased = "saaa".into();
+        st.input_cursor_pos = 4; // 打完码光标在串尾，同真实按键
         st.preedit_split_body = "sa'a'a".into();
         st.committed_text.clear();
         st.candidates = vec![

@@ -117,6 +117,41 @@ impl WordLayer {
     }
 }
 
+impl WordLayer {
+    /// 前缀查询；`cap = Some((max_syllables, completed_len))` 时只取
+    /// [`wind_dict::cached::prefix_capped_keep`] 放行的条目。
+    fn prefix_query(
+        &self,
+        prefix: &str,
+        limit: usize,
+        cap: Option<(u32, usize)>,
+    ) -> Vec<Candidate> {
+        let v = self.ud.view();
+        let ops = v.delta.prefix(self.target, &self.schema, prefix);
+        // 每段多取「delta 覆盖的条数」：被删条目占名额、被调高的条目可能不在前 limit 里。
+        // limit == 0 = 不限（Snapshot::prefix 自己处理）。
+        let take = if limit == 0 { 0 } else { limit + ops.len() };
+        let base = v
+            .snapshots
+            .get(&(self.target, self.schema.clone()))
+            .map(|s| match cap {
+                Some((m, c)) => s.prefix_capped(prefix, take, m, c),
+                None => s.prefix(prefix, take),
+            })
+            .unwrap_or_default();
+        // 前缀补全一律 is_prefix = true，同 `StoreTempLayer`（`record_to_candidate(r, true, true)`）
+        let mut v = self.candidates(overlay_entries(base, ops), None);
+        if let Some((m, c)) = cap {
+            // delta 里的条目没经过快照那道过滤。
+            v.retain(|x| wind_dict::cached::prefix_capped_keep(x.boundary, x.code.len(), m, c));
+        }
+        for c in &mut v {
+            c.is_prefix = true;
+        }
+        sort_trunc(v, limit)
+    }
+}
+
 impl DictLayer for WordLayer {
     fn name(&self) -> &str {
         &self.name
@@ -145,22 +180,17 @@ impl DictLayer for WordLayer {
     }
 
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
-        let v = self.ud.view();
-        let ops = v.delta.prefix(self.target, &self.schema, prefix);
-        // 每段多取「delta 覆盖的条数」：被删条目占名额、被调高的条目可能不在前 limit 里。
-        // limit == 0 = 不限（Snapshot::prefix 自己处理）。
-        let take = if limit == 0 { 0 } else { limit + ops.len() };
-        let base = v
-            .snapshots
-            .get(&(self.target, self.schema.clone()))
-            .map(|s| s.prefix(prefix, take))
-            .unwrap_or_default();
-        // 前缀补全一律 is_prefix = true，同 `StoreTempLayer`（`record_to_candidate(r, true, true)`）
-        let mut v = self.candidates(overlay_entries(base, ops), None);
-        for c in &mut v {
-            c.is_prefix = true;
-        }
-        sort_trunc(v, limit)
+        self.prefix_query(prefix, limit, None)
+    }
+
+    fn search_prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<Candidate> {
+        self.prefix_query(prefix, limit, Some((max_syllables, completed_len)))
     }
 
     fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
@@ -228,6 +258,16 @@ macro_rules! forward_word_layer {
             }
             fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
                 self.0.search_prefix(prefix, limit)
+            }
+            fn search_prefix_capped(
+                &self,
+                prefix: &str,
+                limit: usize,
+                max_syllables: u32,
+                completed_len: usize,
+            ) -> Vec<Candidate> {
+                self.0
+                    .search_prefix_capped(prefix, limit, max_syllables, completed_len)
             }
             fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
                 self.0.search_abbrev(abbrev, limit)
@@ -484,6 +524,42 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
     }
+    /// 带音节上限的前缀查询：权重全打平时名额只发给合格条目，快照与 delta 两边都过滤。
+    #[test]
+    fn prefix_capped_fills_limit_with_qualifying_entries() {
+        let ud = open_ud("capped");
+        let put = |code: &str, text: &str, boundary: u64| {
+            ud.apply(
+                Target::Temp,
+                "py",
+                OpKind::Upsert,
+                code,
+                text,
+                Payload::Weight(5),
+                boundary,
+            )
+            .unwrap();
+        };
+        // 两音节词码序在前，不过滤时会先占满名额。
+        for (code, text) in [("shafa", "沙发"), ("shangai", "上海"), ("shide", "是的")] {
+            put(code, text, 1 | 1 << (code.len() - 2));
+        }
+        put("shi", "是", 1);
+        ud.fold(Target::Temp, "py").unwrap();
+        put("shu", "书", 1);
+        put("shuben", "书本", 1 | 1 << 3);
+        let layer = UserDataTempLayer::new(ud, "py");
+        let mut got = names(layer.search_prefix_capped("sh", 2, 1, 0));
+        got.sort();
+        assert_eq!(got, vec!["书", "是"]);
+        assert!(
+            layer
+                .search_prefix_capped("sh", 2, 1, 0)
+                .iter()
+                .all(|c| c.is_prefix)
+        );
+    }
+
     fn open_ud(name: &str) -> Arc<UserData> {
         let d = std::env::temp_dir().join(format!("wind_layer8_{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

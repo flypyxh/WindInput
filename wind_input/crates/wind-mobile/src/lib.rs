@@ -71,7 +71,7 @@ pub use wind_host::{EditOp, KeyOutcome, TimingHint};
 ///
 /// [`MAX_WINDOW`] 要跟着透出而不是让宿主自己记一份：宿主传的 `limit` 超过它会被
 /// 核心静默截断，宿主若按自记的数字判断「还有没有更多」，就会在边界上反复拉空窗口。
-pub use wind_coordinator::candidate_pull::{CandidateWindow, MAX_WINDOW};
+pub use wind_coordinator::candidate_pull::{CandidateWindow, MAX_WINDOW, TextSegment};
 pub use wind_store::stats_report::StatsSummary;
 
 /// 候选帧：编码栏与候选栏一次渲染所需的全部数据。
@@ -501,15 +501,33 @@ impl MobileCore {
         let probe = KeyProbe::new(vk).with_modifiers(Modifiers(modifiers));
         if !self.coord.should_handle_key(&probe) {
             // 交还宿主的键（空缓冲退格、方向键、回车…）动的是宿主里的正文，
-            // 前后两次上屏就不再相邻：下一词学习的断点
+            // 前后两次上屏就不再相邻：下一词学习的断点。光标前文也不知道变成什么了，
+            // 清空等宿主报（`set_preceding_text`）
             self.coord.note_word_boundary();
+            self.coord.set_preceding_text("");
             return KeyOutcome::passthrough();
         }
-        wind_coordinator::edit_ops::to_outcome(dispatch_key(&self.coord, vk, modifiers))
+        let outcome =
+            wind_coordinator::edit_ops::to_outcome(dispatch_key(&self.coord, vk, modifiers));
+        self.coord.note_host_edits(&outcome.ops);
+        outcome
+    }
+
+    /// 报告光标前的正文（不含组合区；末尾几十个字就够，多给的只留末尾）。
+    ///
+    /// 联想据此把逐字上屏拆开的词凑回来（五笔打「今」「天」，接「今天」的下一词）。
+    /// 宿主在**光标被挪动或正文被别人改过之后**报（Android `onUpdateSelection` 里
+    /// `getTextBeforeCursor`）、换输入框时报一次；本核心自己的上屏不必等报告，
+    /// [`Self::key_down`] / [`Self::select_candidate`] 已按下发的编辑指令跟上。
+    /// 读不到就报空串：联想退回只看刚上屏的那段。
+    pub fn set_preceding_text(&self, text: String) {
+        self.coord.set_preceding_text(&text);
     }
 
     /// 焦点获得（对应 Android `onStartInput`）。
     pub fn focus_gained(&self) {
+        // 新输入框的光标前文由宿主随后报（`set_preceding_text`），在那之前不沿用上一个框的
+        self.coord.set_preceding_text("");
         let _ = self.coord.handle_focus_gained(&FocusData {
             x: 0,
             y: 0,
@@ -531,6 +549,7 @@ impl MobileCore {
 
     /// 焦点丢失（对应 Android `onFinishInput`）。Thread 语义 = 真正离开，清输入态。
     pub fn focus_lost(&self) {
+        self.coord.set_preceding_text("");
         self.coord.handle_focus_lost(1, FocusLostReason::Thread);
     }
 
@@ -614,7 +633,9 @@ impl MobileCore {
     /// 取代此前「合成数字键」的做法——那条路把选词限死在页内 1-9，第 10 个及以后
     /// 永远点不到。
     pub fn select_candidate(&self, index: usize) -> KeyOutcome {
-        self.coord.select_candidate(index)
+        let outcome = self.coord.select_candidate(index);
+        self.coord.note_host_edits(&outcome.ops);
+        outcome
     }
 
     /// 第 `index`（**绝对下标**，与 [`Self::candidates`] 同一口径）个候选的长按菜单；
@@ -1034,6 +1055,38 @@ impl MobileCore {
         Ok(n as u64)
     }
 
+    /// 联想学习数据的条数（联想里选过的词 + 学到的「下一词」），所有方案合计。
+    pub fn assoc_history_count(&self) -> u64 {
+        use wind_coordinator::web_host::WebDataHost;
+        let Some(store) = self.coord.user_store() else {
+            return 0;
+        };
+        // 枚举存储里出现过的全部数据方案：停用了的方案下学到的也算
+        let n: usize = store
+            .list_data_schemas()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| store.assoc_history_len(s))
+            .sum();
+        store.mark_scan_pending();
+        n as u64
+    }
+
+    /// 清空全部方案的联想学习数据，返回删除条数。词频、用户词不动（桌面「清空词频」
+    /// 会一并清它，手机上单独给入口：用户怀疑联想被自己的输入带偏时，只想重置这一项）。
+    pub fn assoc_history_clear(&self) -> Result<u64, String> {
+        use wind_coordinator::web_host::WebDataHost;
+        self.ensure_writable()?;
+        let store = self.coord.user_store().ok_or("无持久化存储")?;
+        let mut n = 0usize;
+        for s in store.list_data_schemas().map_err(|e| e.to_string())? {
+            n += store.clear_assoc_history(&s).map_err(|e| e.to_string())?;
+        }
+        // 上一次上屏的词还记着，清完立刻再上屏一个词会接着学成一对；断开它
+        self.coord.note_word_boundary();
+        Ok(n as u64)
+    }
+
     // ── 词库导出 / 导入（个人词库备份）────────────────────────────────
     //
     // 本体与桌面 `dict.export` / `dict.import` 同一份（`wind_coordinator::dict_transfer_api`），
@@ -1106,6 +1159,28 @@ impl MobileCore {
                 })
                 .collect(),
         })
+    }
+
+    // ── 系统词库统计（设置页「词库 → 词库统计」）────────────────────────
+    //
+    // 本体与桌面 `dict.systemStats` 同一份（`wind_coordinator::dict_stats_api`）：选库、混输按
+    // 成员并排、结果缓存、用户词 / 临时词计数都不在本层重写。
+
+    /// 统计方案的系统词库，回包为 JSON 文本（形态同桌面 `dict.systemStats`：码表 / 拼音 /
+    /// 英文方案一份，混输方案 `members` 并排各成员）。`top_n` 为重码 Top 列表条数（上限
+    /// [`wind_coordinator::dict_stats_api::TOP_N_MAX`]），`refresh` 绕过缓存重算。
+    ///
+    /// ⚠️ O(全表)：拼音大词库一遍几十 MB 峰值、百毫秒级以上，宿主须在后台线程调用。
+    /// 未知方案 / 混输未配成员 → Err(原因)。
+    pub fn dict_stats(&self, schema_id: &str, top_n: u32, refresh: bool) -> Result<String, String> {
+        wind_coordinator::dict_stats_api::system_stats(
+            &*self.coord,
+            schema_id,
+            top_n as usize,
+            refresh,
+        )
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string())
     }
 
     // ── 方案附加词库（设置页「方案 → 拼音」等）────────────────────────
@@ -1756,6 +1831,55 @@ mod schema_dicts_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 词库统计门面：回包是桌面 `dict.systemStats` 同形态的 JSON，第二次命中缓存；
+    /// 未知方案带原因报错。统计口径在 wind-engine / wind-webdata 的用例里验。
+    #[test]
+    fn dict_stats_returns_json_and_caches() {
+        if !data_dir().join("schemas/wubi86.schema.toml").exists() {
+            eprintln!("!!! 跳过：build_dev 词库不存在");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("wind_mobile_ds_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let m = core_at(&root);
+        let first = m.dict_stats("wubi86", 5, false).unwrap();
+        assert!(first.contains(r#""schemaId":"wubi86""#), "{first}");
+        assert!(first.contains(r#""engineType":"codetable""#), "{first}");
+        assert!(first.contains(r#""total":{"#), "{first}");
+        let again = m.dict_stats("wubi86", 5, false).unwrap();
+        assert!(again.contains(r#""cached":true"#), "第二次走缓存: {again}");
+        let fresh = m.dict_stats("wubi86", 5, true).unwrap();
+        assert!(fresh.contains(r#""cached":false"#), "refresh 绕过缓存");
+        let err = m.dict_stats("no_such_schema", 5, false).unwrap_err();
+        assert!(err.contains("no_such_schema"), "原因要点名: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 联想学习数据：计数跨方案合计，清空后归零、返回删除条数。
+    #[test]
+    fn assoc_history_count_and_clear() {
+        if !data_dir().join("schemas/wubi86.schema.toml").exists() {
+            eprintln!("!!! 跳过：build_dev 词库不存在");
+            return;
+        }
+        use wind_coordinator::web_host::WebDataHost;
+        let root = std::env::temp_dir().join(format!("wind_mobile_ah_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let m = core_at(&root);
+        assert_eq!(m.assoc_history_count(), 0);
+        let store = m.coord.user_store().expect("有持久化存储");
+        // 一个启用的方案、一个没启用的（停用了的方案下学到的也要清得掉）
+        store.record_assoc_pick("wubi86", "我们", "一起").unwrap();
+        store.record_assoc_pick("wubi86", "我们", "一起").unwrap();
+        store.record_assoc_pick("pinyin", "谢谢", "大家").unwrap();
+        assert_eq!(m.assoc_history_count(), 2, "按条计、跨方案合计");
+        assert_eq!(m.assoc_history_clear().unwrap(), 2);
+        assert_eq!(m.assoc_history_count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 只读模式：带着原因拒绝，且先于方案校验（不论方案在不在）。
     #[test]
     fn readonly_rejects_with_reason() {
@@ -2058,5 +2182,116 @@ mod candidate_tooltip_tests {
         dispatch_key(&m.coord, 'I' as u32, 0);
         assert!(m.candidates(0, 5).total > 0, "预热后照常打字出候选");
         let _ = std::fs::remove_dir_all(&user);
+    }
+}
+
+/// 正确拼音提示的分段透传：核心按 `hint.enabled` / 来源 / `hint.scope` 给候选生成带提示正文，这里只验
+/// 「拉取窗口带出分段、提示段角色 `pinyin_hint`、关掉即空」。哪些候选该标在协调器测试里验。
+#[cfg(test)]
+mod pinyin_hint_tests {
+    use super::*;
+    use wind_config::HintScope;
+
+    /// 自造夹具：`pinguo` 精确命中「拼过」，in/ing 模糊命中「苹果」「平过」。
+    /// ⚠️ 目录名带 pid：多会话并行跑测试时固定名会互删夹具。
+    fn core(tag: &str, hint: bool, scope: HintScope) -> (MobileCore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wind_mobile_fh_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("data/schemas");
+        std::fs::create_dir_all(schemas.join("fh")).unwrap();
+        std::fs::create_dir_all(dir.join("user")).unwrap();
+        std::fs::write(
+            schemas.join("fh/mini.dict.yaml"),
+            "---\nname: mini\nversion: \"1\"\nsort: by_weight\n...\n\
+             拼过\tpin guo\t5000\n苹果\tping guo\t3000\n平过\tping guo\t100\n",
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("fh.schema.toml"),
+            "[schema]\nid = \"fh\"\nname = \"fh\"\n[engine]\ntype = \"pinyin\"\n\
+             [[dictionaries]]\nid = \"mini\"\npath = \"fh/mini.dict.yaml\"\n\
+             type = \"rime_pinyin\"\ndefault = true\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["fh".into()];
+        cfg.schema.active = "fh".into();
+        cfg.input.default.chinese_mode = true;
+        let fz = &mut cfg.schema.pinyin.fuzzy;
+        fz.enabled = true;
+        fz.in_ing = true;
+        let h = &mut cfg.input.correction.hint;
+        h.enabled = hint;
+        h.scope = scope;
+        let (coord, _rx) = Coordinator::new_headless_with_ui_at(
+            cfg,
+            Some(&dir.join("data")),
+            Some(&dir.join("user")),
+        );
+        let core = MobileCore {
+            coord,
+            warming: Arc::new(AtomicBool::new(false)),
+            data_dir: dir.join("user"),
+        };
+        (core, dir)
+    }
+
+    fn pinguo(tag: &str, hint: bool, scope: HintScope) -> CandidateWindow {
+        let (m, dir) = core(tag, hint, scope);
+        for ch in "pinguo".chars() {
+            dispatch_key(&m.coord, ch.to_ascii_uppercase() as u32, 0);
+        }
+        let w = m.candidates(0, MAX_WINDOW);
+        let _ = std::fs::remove_dir_all(dir);
+        w
+    }
+
+    fn joined(segs: &[TextSegment]) -> String {
+        segs.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn candidates_carry_hint_segments() {
+        let w = pinguo("on", true, HintScope::First);
+        assert_eq!(w.text_segments.len(), w.items.len(), "与 items 一一对应");
+        assert_eq!(w.items[0], "拼过", "前提：首选是精确命中：{:?}", w.items);
+        assert!(w.text_segments[0].is_empty(), "精确命中不分段");
+        let at = w
+            .items
+            .iter()
+            .position(|t| t == "苹果")
+            .expect("应有「苹果」");
+        let segs = &w.text_segments[at];
+        assert_eq!(joined(segs), "苹(ping)果");
+        assert_eq!(
+            segs.iter()
+                .map(|s| (s.text.as_str(), s.role.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("苹", None), ("(ping)", Some("pinyin_hint")), ("果", None)]
+        );
+        let later = w
+            .items
+            .iter()
+            .position(|t| t == "平过")
+            .expect("应有「平过」");
+        assert!(w.text_segments[later].is_empty(), "first：之后的不标");
+    }
+
+    #[test]
+    fn candidates_hint_scope_all_segments_every_fuzzy() {
+        let w = pinguo("all", true, HintScope::All);
+        let at = w
+            .items
+            .iter()
+            .position(|t| t == "平过")
+            .expect("应有「平过」");
+        assert_eq!(joined(&w.text_segments[at]), "平(ping)过");
+    }
+
+    #[test]
+    fn candidates_hint_off_no_segments() {
+        let w = pinguo("off", false, HintScope::All);
+        assert!(w.items.iter().any(|t| t == "苹果"), "{:?}", w.items);
+        assert!(w.text_segments.iter().all(Vec::is_empty));
     }
 }

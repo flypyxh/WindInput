@@ -27,6 +27,7 @@
 //! 起手只要够铺满一两屏，用户滚到尾部再要下一段。
 
 use wind_host::KeyOutcome;
+use wind_ui_types::StyledText;
 
 use crate::coordinator::Coordinator;
 use crate::edit_ops;
@@ -57,11 +58,48 @@ pub struct CandidateWindow {
     /// [`Coordinator::candidate_window_with_comments`] 填它，[`Coordinator::candidate_window`]
     /// 恒空——注释要逐条求值（反查、注释库），不要的宿主不该为它付钱。
     pub comments: Vec<String>,
+    /// 与 [`Self::items`] 一一对应的显示用分段正文；某条为空 = 按 `items` 那条纯文字显示。
+    ///
+    /// 目前只有正确拼音提示产出它：`items` 是「苹果」（上屏、长按标题照旧读它），这里是
+    /// 「苹」「(ping)」「果」三段，`(ping)` 段角色 `pinyin_hint`。标哪几条（`hint.enabled` / 来源 / `hint.scope`）
+    /// 与桌面候选窗同一份规则（`Coordinator::pinyin_hint_texts`），宿主照画即可，不要自己判。
+    pub text_segments: Vec<Vec<TextSegment>>,
     /// 本次拉取触发了扩容重建（[`Coordinator::candidate_window_growing`]）。
     ///
     /// 重建的池更大，词频重排可能把池外的常用词提到前面——**宿主已取到的前段可能变了**。
     /// 宿主见此须整份重取已显示的范围，不能只把这一段接在旧列表后面，否则按下标选词会选错。
     pub rebuilt: bool,
+}
+
+/// 分段正文的一段。`role` 是 `wind_ui_types::TEXT_ROLES` 里的角色名（如 `pinyin_hint`），
+/// `None` = 正文。宿主按角色取色，字号与正文相同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSegment {
+    pub text: String,
+    pub role: Option<String>,
+}
+
+/// 带样式文字压成首尾相接的段（无样式的空隙补成 `role = None` 的段）；空文字 ⇒ 空。
+fn segments_of(t: &StyledText) -> Vec<TextSegment> {
+    let s = t.as_str();
+    let mut out = Vec::new();
+    let mut at = 0;
+    let mut push = |text: &str, role: Option<&str>| {
+        if !text.is_empty() {
+            out.push(TextSegment {
+                text: text.to_string(),
+                role: role.map(str::to_string),
+            });
+        }
+    };
+    for sp in t.spans() {
+        let (a, b) = (sp.start as usize, sp.end as usize);
+        push(&s[at..a], None);
+        push(&s[a..b], sp.role);
+        at = b;
+    }
+    push(&s[at..], None);
+    out
 }
 
 impl Coordinator {
@@ -131,6 +169,24 @@ impl Coordinator {
                 .map(|c| self.cand_display_text(&state, c))
                 .collect()
         };
+        // 拉取窗口的显示形态是 `cand_display_text` 原样（不截断、无前缀标注），提示照此换算
+        let text_segments = if offset >= total {
+            Vec::new()
+        } else {
+            let rt = self.rt();
+            let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+            let hint = &rt.config.input.correction.hint;
+            let tone = hint.tone.then_some(&*reverse);
+            self.pinyin_hint_texts(&state, hint, offset, end, |c| {
+                let full = self.cand_display_text(&state, c);
+                self.cand_display_hints(&state, c, &full, hint, tone)
+                    .map(|h| crate::hint_text::hint_styled_text(&full, &h))
+                    .unwrap_or_default()
+            })
+            .iter()
+            .map(segments_of)
+            .collect()
+        };
         let comments = if with_comments && offset < total {
             self.comments_for(&state, offset, end)
         } else {
@@ -142,6 +198,7 @@ impl Coordinator {
             total,
             selected,
             comments,
+            text_segments,
             rebuilt,
         }
     }

@@ -3,7 +3,7 @@
 //! 与 Go 版本 `wind_input/internal/engine/pinyin/syllable_trie.go` 对齐。
 //! 使用 HashMap Trie 实现高效音节边界检测。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 音节 Trie 节点
 #[derive(Default)]
@@ -26,6 +26,8 @@ pub struct SyllableTrie {
     fuzzy_root: TrieNode,
     /// `fuzzy_root` 是否非空。切分是按键热路径，全关时据此跳过第二棵树的遍历。
     has_fuzzy: bool,
+    /// `fuzzy_root` 里哪些是换位纠错拼写（[`Self::set_correction_spellings`]）。
+    correction: HashSet<String>,
 }
 
 impl Default for SyllableTrie {
@@ -40,6 +42,7 @@ impl SyllableTrie {
             root: TrieNode::default(),
             fuzzy_root: TrieNode::default(),
             has_fuzzy: false,
+            correction: HashSet::new(),
         };
         trie.load_standard_syllables();
         trie
@@ -65,6 +68,18 @@ impl SyllableTrie {
         for s in spellings {
             Self::insert(&mut self.fuzzy_root, s);
         }
+    }
+
+    /// 标出 `fuzzy_root` 里的换位纠错拼写（它们须已随 [`Self::load_fuzzy_spellings`] 注册）。
+    /// 整表替换。纠错边只给词图与变体展开用，主切分（[`super::dag::Dag::maximum_match`]）
+    /// 不走它，见那里的说明。
+    pub fn set_correction_spellings<'a>(&mut self, spellings: impl IntoIterator<Item = &'a str>) {
+        self.correction = spellings.into_iter().map(str::to_string).collect();
+    }
+
+    /// `s` 是不是换位纠错拼写。
+    pub fn is_correction_spelling(&self, s: &str) -> bool {
+        !self.correction.is_empty() && self.correction.contains(s)
     }
 
     fn insert(root: &mut TrieNode, syl: &str) {

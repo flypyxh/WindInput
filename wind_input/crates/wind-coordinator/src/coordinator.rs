@@ -420,6 +420,32 @@ pub(crate) struct CommittedSeg {
     pub(crate) learn: Option<(String, u64)>,
 }
 
+/// 临拼 / mix 文本透镜从引擎结果取的编码栏形态（见 `State::overlay_forms`），各字段同主路
+/// `preedit_split_body` / `preedit_fp_body` / `preedit_abbrev_body`。空串 = 无此形态。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OverlayPreeditForms {
+    pub(crate) split: String,
+    pub(crate) fullpinyin: String,
+    pub(crate) abbrev: String,
+}
+
+impl OverlayPreeditForms {
+    /// 默认形态取 `preedit_pinyin`（双拼下是击键切法，首选是简拼时也不变），缺了才用
+    /// `preedit_display`——同主路，高亮从简拼候选移回时要取得回双拼切法。
+    pub(crate) fn of(result: &wind_engine::ConvertResult) -> Self {
+        let split = if result.preedit_pinyin.is_empty() {
+            &result.preedit_display
+        } else {
+            &result.preedit_pinyin
+        };
+        Self {
+            split: split.clone(),
+            fullpinyin: result.preedit_fullpinyin.clone(),
+            abbrev: result.preedit_abbrev.clone(),
+        }
+    }
+}
+
 /// ⚠️ `Default` **只在测试构建下存在**（`cfg_attr(test, ...)`）。
 ///
 /// 生产侧一律走 `Coordinator::new` 里的显式构造：那里每个字段的初值都有来历
@@ -723,6 +749,9 @@ pub(crate) struct State {
     /// 与缓冲不同形；临英 / 特殊 / URL 的主体恒等于自身缓冲，直接用缓冲即可（见
     /// `overlay_caret_parts`）。缓冲空时可能为 stale，但此时光标必为 0、换算不读它，无害。
     pub(crate) overlay_body: String,
+    /// 临拼 / mix 文本透镜的编码栏各形态，供高亮跟随（主路那几个 `preedit_*_body` 的 overlay
+    /// 对位，生命周期跟各自的候选刷新走）。`overlay_body` 是按高亮从中选出的那一份。
+    pub(crate) overlay_forms: OverlayPreeditForms,
     /// 临时拼音输入缓冲（拼音串）
     pub(crate) temp_pinyin_buffer: String,
     /// 临时拼音编码区光标（`temp_pinyin_buffer` 内字节偏移）。下同，各 overlay 缓冲各带一个。
@@ -894,6 +923,8 @@ thread_local! {
 /// 判据是「这个键有没有第二个消费者在引擎侧」，不是「它在不在 schema 段」。
 /// # 不收什么
 ///
+/// - `input.correction`：引擎侧 `EngineManager::sync_correction` 自己判要不要重建（只改提示开关的
+///   不重建），结果在 `reload_user_config` 里并进 `schema_dirty`。
 /// - `schema.keep_all_loaded`：方案常驻策略由 `apply_residency_change` 就地对齐（摘除 /
 ///   后台预热），引擎侧没有它的镜像；收进来会让「切换常驻开关」把全部引擎丢掉重建。
 pub(crate) fn engine_reload_needed(old: &Config, new: &Config) -> bool {
@@ -1463,6 +1494,13 @@ pub struct Coordinator {
     /// 最近一次解析的系统短语条目（启动时填充；"恢复默认"重读文件成功后刷新）。
     /// 作为重读失败（文件缺失/TOML 语法错误）时的回退，避免把库里系统短语清空。
     pub(crate) system_phrase_entries: std::sync::RwLock<Vec<wind_phrase::SystemPhraseEntry>>,
+    /// 智能联想「下一词」表的路径（`assoc/assoc_bigram.txt`，用户目录同名文件整体替代）；
+    /// None = 数据缺失，Bigram 源不出、配额顺延。
+    pub(crate) assoc_bigram_path: Option<std::path::PathBuf>,
+    /// 「下一词」表本体：**首次用到时才读**（桌面联想默认关，不该为它多占内存）。
+    /// 读失败记一条警告、之后一直是 None，不反复重试。
+    pub(crate) assoc_bigram:
+        std::sync::OnceLock<Option<std::sync::Arc<wind_assoc::bigram::AssocBigram>>>,
     /// system.phrases.toml 路径（None=无 data_dir，如 headless 测试）。
     /// "恢复默认"据此重读文件，使手工编辑无需重启服务即可生效。
     pub(crate) system_phrase_path: Option<std::path::PathBuf>,
@@ -2056,6 +2094,10 @@ pub struct Coordinator {
     /// （`record_commit`）、焦点变化、宿主自行出字 / 挪光标、取消、撤销上屏都清空，只有
     /// `commit_selected` 接得上——只记真正相邻的两个词，见 [`Self::learn_next_word`]。
     pub(crate) next_word_prev: Mutex<Option<String>>,
+    /// 光标前的正文（末尾若干字），联想「下一词」的前文。宿主报真值
+    /// （[`Self::set_preceding_text`]），核心自己上屏 / 删字时随手跟上（[`Self::note_host_edits`]），
+    /// 两次报告之间也不脱节。桌面宿主不报，恒空。
+    pub(crate) preceding_text: Mutex<String>,
     /// 撤销上屏（`ime.undo_commit`）删除量：最近一次「同步落到光标前」的字符数（UTF-16 单元，
     /// 与 TSF ShiftStart / macOS NSRange 同量纲）。**刻意与 `recent_commits` 分离**——历史队列
     /// 记「上过什么」（供 last/加词，深度 16），本值记「光标前紧邻的还是不是它、有几个字」这一
@@ -2665,6 +2707,8 @@ impl Coordinator {
             &bundle.config,
             &crate::data_needs::SchemaFacts::collect(&engine_mgr),
         );
+        // 模板引用 `${correct_pinyin}` 时拼音引擎要算提示（只翻开关，不重建引擎）。
+        engine_mgr.set_correct_pinyin_in_templates(needs.correct_pinyin);
 
         // 短语层（方案 B）：TOML 变更时同步进 store，再从 store（仅 enabled）建层。
         // 启动解析的条目缓存进结构体，作为"恢复默认"重读文件失败时的回退。
@@ -2672,6 +2716,7 @@ impl Coordinator {
         // 用户目录同名文件整体替代安装目录那份（覆盖替换，非合并）。
         // ⚠️ 解析在此**一次定死**：后续 `current_system_phrase_entries` 的重读走同一路径，
         // 故运行时新放的覆盖文件要下次启动才生效（与全仓其它覆盖点一致，无文件监视）。
+        let assoc_bigram_path = Config::resolve_data_file(data_dir, "assoc/assoc_bigram.txt");
         let system_phrase_path = Config::resolve_data_file(data_dir, "system.phrases.toml");
         if system_phrase_path.is_none() && data_dir.is_some() {
             warn!("system.phrases.toml 缺失（用户/安装目录均未找到），系统短语将为空");
@@ -2989,6 +3034,7 @@ impl Coordinator {
                 committed_segs: Vec::new(),
                 active: None,
                 overlay_body: String::new(),
+                overlay_forms: OverlayPreeditForms::default(),
                 temp_pinyin_buffer: String::new(),
                 temp_pinyin_cursor: 0,
                 temp_pinyin_schema: String::new(),
@@ -3051,6 +3097,8 @@ impl Coordinator {
             phrases,
             system_phrase_entries: std::sync::RwLock::new(system_phrase_entries),
             system_phrase_path,
+            assoc_bigram_path,
+            assoc_bigram: std::sync::OnceLock::new(),
             s2t: Mutex::new(s2t),
             t2s: Mutex::new(t2s),
             // 只含出厂基表：用户覆盖住在 store 里，而 store 在本结构体构造之后才可用，
@@ -3166,6 +3214,7 @@ impl Coordinator {
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
             next_word_prev: Mutex::new(None),
+            preceding_text: Mutex::new(String::new()),
             last_commit_len: std::sync::atomic::AtomicUsize::new(1),
             preedit_display: Mutex::new(preedit_display_init),
             hide_candidate_window: Mutex::new(hide_candidate_window_init),
@@ -4996,7 +5045,10 @@ impl Coordinator {
                 // 方案相关项（活跃/可用方案、全局上屏策略）是否变化：变了才热重建引擎，
                 // 避免每次保存都丢词典缓存（拼音合并/unigram 重建开销大）。
                 let old = self.rt();
-                let schema_dirty = engine_reload_needed(&old.config, &cfg);
+                // `[input.correction]` 由引擎侧同步：只改提示开关的就地生效，改纠错规则 /
+                // 「误读」勾选的并入重建。`|` 不短路：同步必须跑。
+                let schema_dirty =
+                    engine_reload_needed(&old.config, &cfg) | self.engine_mgr.sync_correction(&cfg);
                 // 候选窗定位方式切换的边沿检测（见下方 ReportCandidatePos）。
                 let cand_was_fixed = old.config.ui.candidate.is_fixed_position();
                 let was_keep_all = old.config.schema.keep_all_loaded;
@@ -5711,6 +5763,19 @@ impl Coordinator {
             .chinese_mode
     }
 
+    /// 展开态专属键（见 `grid_key`）的完整处置：键归网格时返回结局，否则 `None`。
+    pub(crate) fn grid_key_action(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
+        let changed = self.grid_key(state, data)?;
+        if changed && let Some(act) = self.after_nav_changed(state) {
+            return Some(act);
+        }
+        Some(KeyAction::Consumed)
+    }
+
     /// 会话态按键绑定的统一执行（配置驱动，见 `keys.session_actions`）：翻页 / 移高亮 /
     /// 取消。普通模式与所有 overlay 模式共用；`include_printable` 区分码表型（`-`/`=` 作
     /// 翻页）与文本/表达式型（临英/快捷输入，`-`/`=` 作输入字符，不夺为动作）。
@@ -5730,12 +5795,10 @@ impl Coordinator {
         include_printable: bool,
     ) -> Option<KeyAction> {
         // 展开态专属键（←→ / Esc）先于绑定表：它们在网格里另有含义，且必须赶在各模式的
-        // 光标移动臂与 Esc 臂之前截下——本函数恰好是所有模式都先经过的那一处。
-        if let Some(changed) = self.grid_key(state, data) {
-            if changed && let Some(act) = self.after_nav_changed(state) {
-                return Some(act);
-            }
-            return Some(KeyAction::Consumed);
+        // 光标移动臂与 Esc 臂之前截下——本函数恰好是所有模式都先经过的那一处
+        // （快捷输入例外，它的光标与 Esc 臂在本函数之前，自己先调 `grid_key_action`）。
+        if let Some(act) = self.grid_key_action(state, data) {
+            return Some(act);
         }
         let shift = data.modifiers & MOD_SHIFT != 0;
         let action = self.session_action_for(data.key_code, shift, include_printable)?;
@@ -5925,10 +5988,23 @@ impl Coordinator {
         // 混输高亮跟随：普通模式下高亮在五笔↔拼音候选间移动可能切换 preedit 形态
         // （原始码 ↔ 音节拆分）。重算 preedit；若形态变化且嵌入编码（app_inline），须回传
         // 组合串使宿主内联编码同步；候选窗模式仅 notify_ui_update 刷新即可。
-        // 门控：仅普通模式（active==None）且存在拆分形态——纯五笔(无拆分)/纯拼音(全拼音
-        // 候选→形态恒定)均不触发，零回归。
+        // 拼音候选各带自己的切分（`pinan` 高亮「平安」`pin'an`、高亮「皮」`pi'nan`），纯拼音
+        // 下形态同样会变。临拼 / mix 文本透镜与主路同一套跟随（overlay 对齐主路）。
+        // 门控：普通模式存在拆分形态或有候选自带切分（混输下首选与原始码同形时前者为空）
+        // ——纯五笔不触发，零回归；其余 overlay 各自维护 preedit，不碰。
         let mut composed: Option<KeyAction> = None;
-        if state.active.is_none() && !state.preedit_split_body.is_empty() {
+        let follows = match state.active {
+            None => {
+                !state.preedit_split_body.is_empty()
+                    || state
+                        .candidates
+                        .iter()
+                        .any(|c| c.meta.preedit_split.is_some())
+            }
+            Some(ModeKind::TempPinyin | ModeKind::Mix(_)) => true,
+            Some(_) => false,
+        };
+        if follows {
             let before = state.preedit.clone();
             self.sync_preedit_to_highlight(state);
             if state.preedit != before {
@@ -5936,13 +6012,24 @@ impl Coordinator {
                 // 这一条出口，这里不回传就等于让游戏聊天框里的编码停在旧形态。
                 if self.preedit_in_app_effective() {
                     let text = state.preedit.clone();
-                    let caret_pos = text.chars().count() as u32;
+                    let caret_pos = self.reshaped_caret(state);
                     composed = Some(KeyAction::UpdateComposition { text, caret_pos });
                 }
             }
         }
         self.notify_ui_update(state);
         composed
+    }
+
+    /// 编码栏形态随高亮变了之后回传宿主的光标（TSF 位置），按新形态换算，与按键路径同源：
+    /// 缓冲中间编辑时光标不在串尾，分隔符增减会挪动它的显示位置，按串尾给会把宿主光标甩到末尾。
+    /// 方向键移高亮（`after_nav_changed`）与整句切换（`try_sentence_cycle_key`）共用。
+    fn reshaped_caret(&self, state: &State) -> u32 {
+        if state.active.is_some() {
+            self.overlay_caret(state)
+        } else {
+            self.composition_caret(state)
+        }
     }
 
     /// 翻页键翻不动时是否按 `keys.overflow.page_key = "commit_and_input"` 交给标点臂。
@@ -7423,15 +7510,17 @@ impl Coordinator {
             (sel_start.saturating_sub(vis_start), sel_end - sel_start)
         });
         // 候选序号标签：
-        //  - 数字透镜：数字键正在录表达式 → 选词改用字母标签 a/b/c
+        //  - 数字透镜：数字键正在录表达式 → 选词改用字母标签 a/b/c（实例关了字母选词除外）
         //  - 其余（含自由输入）：正常序号
         //
         // ★ 自由输入（Free 透镜）下字母与数字**都是**字面输入，没有键能按序号选——曾经因此
         // 干脆不画序号。维护者 2026-10-07 改定为照常显示：与其它状态的候选窗外观一致，
         // 尤其快捷输入历史在这里置首、候选一多时，序号是用户辨认「第几条」的唯一参照。
-        // 选词仍靠空格（高亮）与方向键。
+        // 选词靠空格（高亮）、方向键与 `keys.quick_input_select`（出厂 Ctrl+序号）。
         let mix_lens = matches!(state.active, Some(ModeKind::Mix(_))).then(|| self.mix_lens(state));
-        let alpha = mix_lens == Some(MixLens::Numeric);
+        // 关掉 `numeric_letter_select` 的实例字母是字面输入，标签回到数字序号。
+        let alpha =
+            mix_lens == Some(MixLens::Numeric) && self.mix_numeric_letter_select(state.mix_id);
         // 悬停提示/候选微调配置（热重载快照）
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
@@ -7440,6 +7529,8 @@ impl Coordinator {
         let cmd_prefix = rt.config.input.cmdbar.candidate_prefix.as_str();
         // 检索范围放宽（自动补充）候选的前缀标注，见 docs/design/smart-filter-scope-relax.md
         let scope_prefix = rt.config.input.scope_relax.prefix.as_str();
+        // 换位纠错候选的标记（`input.correction.marker`，留空不加）。
+        let corrected_prefix = rt.config.input.correction.marker.as_str();
         // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
         // 受 source==Pinyin 守卫)。门控两类:
         //  - 普通拼音方案:跟随全局 schema.pinyin.code_hint_source(四档,见 CodeHintSource,出厂 off);
@@ -7476,19 +7567,50 @@ impl Coordinator {
         // 本页每个候选的气泡原文，右键菜单按段 / 按行复制、上屏时从这里取（见 handle_tooltip）。
         let mut tip_page: Vec<crate::handle_tooltip::TooltipPageEntry> =
             Vec::with_capacity(end.saturating_sub(start));
+        // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
+        // 检索范围放宽补进来的候选同理加标注（`input.scope_relax.prefix`），让用户
+        // 一眼看出「这几条是超出当前检索范围补来的」，而非词库里本该有的常用字。
+        let prefix_of = |c: &Candidate| {
+            if c.is_command && !cmd_prefix.is_empty() {
+                cmd_prefix
+            } else if c.is_scope_filtered {
+                scope_prefix
+            } else if c.is_corrected {
+                corrected_prefix
+            } else {
+                ""
+            }
+        };
+        // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
+        // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
+        // 展开态按列对齐，一个长词会撑宽整列，另有更紧的格宽上限。
+        let truncate = |full: &str| {
+            if grid_range.is_some() {
+                cand_cfg.truncate_grid_cell(full)
+            } else {
+                cand_cfg.truncate_display(full)
+            }
+        };
+        // 正确拼音提示（「苹(ping)果」）：按来源过滤、换算到显示文字、过了截断与前缀后的带提示正文。
+        let hint_cfg = &rt.config.input.correction.hint;
+        let tone_reverse = hint_cfg.tone.then_some(&*reverse);
+        let hint_styled = |c: &Candidate, full: &str, disp: &str| {
+            self.cand_display_hints(state, c, full, hint_cfg, tone_reverse)
+                .map(|h| crate::hint_text::styled_for_shown(full, disp, prefix_of(c), &h))
+                .unwrap_or_default()
+        };
+        // 哪些候选标（`first` / `all`）见 `pinyin_hint_texts`。
+        let mut hint_texts =
+            self.pinyin_hint_texts(state, &rt.config.input.correction.hint, start, end, |c| {
+                let full = self.cand_display_text(state, c);
+                hint_styled(c, &full, &truncate(&full))
+            });
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
             .map(|(i, c)| {
                 let full = self.cand_display_text(state, c);
-                // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
-                // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
-                // 展开态按列对齐，一个长词会撑宽整列，另有更紧的格宽上限。
-                let disp = if grid_range.is_some() {
-                    cand_cfg.truncate_grid_cell(&full)
-                } else {
-                    cand_cfg.truncate_display(&full)
-                };
+                let disp = truncate(&full);
                 let tip_skipped = grid_range.is_some() && i as i32 != hover_now;
                 let rendered = if tip_skipped {
                     Default::default()
@@ -7531,17 +7653,16 @@ impl Coordinator {
                     );
                     (wind_ui_types::StyledText::new(), comment)
                 };
+                let prefix = prefix_of(c);
+                let text_styled = std::mem::take(&mut hint_texts[i]);
+                let text = if prefix.is_empty() {
+                    disp
+                } else {
+                    format!("{prefix}{disp}")
+                };
                 CandidateItem {
-                    // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
-                    // 检索范围放宽补进来的候选同理加标注（`input.scope_relax.prefix`），让用户
-                    // 一眼看出「这几条是超出当前检索范围补来的」，而非词库里本该有的常用字。
-                    text: if c.is_command && !cmd_prefix.is_empty() {
-                        format!("{cmd_prefix}{disp}")
-                    } else if c.is_scope_filtered && !scope_prefix.is_empty() {
-                        format!("{scope_prefix}{disp}")
-                    } else {
-                        disp
-                    },
+                    text,
+                    text_styled,
                     code: c.code.clone(),
                     label: if alpha {
                         ((b'a' + i as u8) as char).to_string()
@@ -8059,6 +8180,8 @@ impl Coordinator {
     ///   改了要重启才生效（沿用原有行为，已加载的那份不重读）。
     pub(crate) fn apply_data_needs(&self) {
         let needs = self.data_needs();
+        self.engine_mgr
+            .set_correct_pinyin_in_templates(needs.correct_pinyin);
         self.sync_chaizi_assets_with(&needs);
         if needs.reverse_index {
             self.spawn_index_warm(&self.engine_mgr.code_source_schema(), false);
@@ -9290,7 +9413,7 @@ impl Coordinator {
         self.sync_preedit_to_highlight(state);
         let composed = (state.preedit != before && self.preedit_in_app_effective()).then(|| {
             let text = state.preedit.clone();
-            let caret_pos = text.chars().count() as u32;
+            let caret_pos = self.reshaped_caret(state);
             KeyAction::UpdateComposition { text, caret_pos }
         });
         self.notify_ui_update(state);
@@ -11209,7 +11332,7 @@ mod mode_comment_e2e_tests {
         let vars: Vec<&str> = wind_ui_types::TEXT_ROLES
             .iter()
             .copied()
-            .filter(|r| !matches!(*r, "title" | "literal" | "separator"))
+            .filter(|r| !wind_ui_types::STRUCTURAL_ROLES.contains(r))
             .collect();
         let whole: String = vars
             .iter()

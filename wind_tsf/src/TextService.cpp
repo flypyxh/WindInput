@@ -26,6 +26,11 @@ static_assert(wind::editable::kEmptyContextHr == static_cast<std::uint32_t>(TF_E
               "kEmptyContextHr 与 SDK 的 TF_E_EMPTYCONTEXT 不一致");
 static_assert(wind::editable::kReadOnlyDynFlag == static_cast<std::uint32_t>(TF_SD_READONLY),
               "kReadOnlyDynFlag 与 SDK 的 TF_SD_READONLY 不一致");
+// CandidateHotkeyPolicy.h 同理按数值重述了 KEYMOD_* 通用位。
+static_assert(wind::candhotkey::kModShift == KEYMOD_SHIFT, "candhotkey kModShift != KEYMOD_SHIFT");
+static_assert(wind::candhotkey::kModCtrl == KEYMOD_CTRL, "candhotkey kModCtrl != KEYMOD_CTRL");
+static_assert(wind::candhotkey::kModAlt == KEYMOD_ALT, "candhotkey kModAlt != KEYMOD_ALT");
+static_assert(wind::candhotkey::kModWin == KEYMOD_WIN, "candhotkey kModWin != KEYMOD_WIN");
 
 // GUID_PROP_INPUTSCOPE 在 SDK 头中仅为 EXTERN_C 声明，其字节定义需某个 TU 启用 INITGUID
 // 才会生成；直接引用会产生 LNK2019。这里本地定义该 GUID 值（与 inputscope.h 一致），
@@ -2236,7 +2241,9 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
             int id = (int)wParam;
             uint32_t vk = 0;
             uint32_t mods = 0;
-            if (id >= kHotkeyIdCandidateBase && id < kHotkeyIdCandidateBase + kHotkeyIdCandidateMax)
+            const bool candidateSegment =
+                id >= kHotkeyIdCandidateBase && id < kHotkeyIdCandidateBase + kHotkeyIdCandidateMax;
+            if (candidateSegment)
             {
                 // 候选热键：从注册记录反解 (vk, KEYMOD)，与加词热键同法。
                 // ⚠️ 绝不能按 id 推算修饰键——组合键来自服务端配置，本层不知道也不该知道
@@ -2302,7 +2309,32 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
             if (vk != 0)
             {
                 WIND_LOG_DEBUG_FMT(L"WM_HOTKEY id=0x%04X vk=0x%02X mods=0x%04X\n", id, vk, mods);
-                self->_pKeyEventSink->DispatchHotkey(vk, mods);
+                const BOOL giveBack = self->_pKeyEventSink->DispatchHotkey(vk, mods);
+                // 系统热键吃下的键必须有出口：服务端不要它（如联想态的 Ctrl+数字）就注入一次
+                // 原键交还宿主。只注入主键，修饰键靠物理按着，宿主看到的仍是 Ctrl+数字；注入前
+                // 候选热键必须已注销，判据见 OnHotkeyDispatched。
+                const auto giveBackAction = wind::candhotkey::OnHotkeyDispatched(
+                    candidateSegment, giveBack != FALSE, self->_hotkeysActive != FALSE);
+                if (giveBackAction != wind::candhotkey::GiveBack::None)
+                {
+                    const uint32_t held = GetCurrentModifiers();
+                    if (!wind::candhotkey::RequiredModifiersHeld(mods, held))
+                    {
+                        // 同步 IPC 期间修饰键已松开：注入出去就是另一个键，宁可丢掉。
+                        WIND_LOG_WARN_FMT(L"WM_HOTKEY give back skipped, modifier released: vk=0x%02X "
+                                          L"mods=0x%04X held=0x%04X\n", vk, mods, held);
+                    }
+                    else
+                    {
+                        if (giveBackAction == wind::candhotkey::GiveBack::UnregisterThenReplay)
+                        {
+                            self->_UnregisterCandidateHotkeys();
+                        }
+                        WIND_LOG_DEBUG_FMT(L"WM_HOTKEY give back to host: vk=0x%02X unregistered=%d\n", vk,
+                                           (int)(giveBackAction == wind::candhotkey::GiveBack::UnregisterThenReplay));
+                        self->_pKeyEventSink->ReplayKeyToHost((WORD)vk);
+                    }
+                }
             }
         }
         return 0;

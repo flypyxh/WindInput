@@ -222,17 +222,24 @@ const USER_NODE_LIMIT: usize = 8;
 /// 要彻底解决需在索引里按权重排序，本项不做。值与引擎侧 `ABBREV_INDEX_LIMIT` 同为 64。
 const USER_ABBREV_SCAN_LIMIT: usize = 64;
 
-/// 用户词模糊入图时，从一个起点出发、**同一音节数**上最多保留几条在途的
-/// （所打码切分 × 逐音节变体）组合（[`LatticeBuilder::add_store_fuzzy_nodes`]）。
+/// 模糊入图（系统词与用户词共用）时，从一个起点出发、**同一音节数**上最多保留几条在途的
+/// （所打码切分 × 逐音节变体）组合（[`LatticeBuilder::fuzzy_spans`]）。
 ///
 /// 超出时按改动处数升序保留，截掉的只是模糊处数多的组合（及其后继——后继的处数只增不减）。
 /// 每条组合在它到达的终点上各是一次候选点查（按变体码归并后），故这也是成本闸门。
 ///
-/// 取 256 = 旧口径「一条切分 [`super::fuzzy::MAX_FUZZY_COMBOS`](64) × 4 条切分」：
+/// 取 256 = 旧口径「一条切分 64 种组合 × 4 条切分」：
 /// 不再按切分截断之后，多切分的串（`fanganfangan…` 同音节数下有 8 条切分）要的是
 /// 「每条切分都至少保住少处模糊的那些组合」，按处数排序的同层预算正好表达这一点；
 /// 量级与旧上界持平，性能见 `pinyin_sentence_user_words_probe::fuzzy_store_node_cost_on_real_dict`。
-const USER_FUZZY_LAYER_BUDGET: usize = 256;
+const FUZZY_LAYER_BUDGET: usize = 256;
+
+/// 各音节边 `(起, 止)` 的变体表（首项恒为原音节、0 处改动）：同一条边会被许多起点、
+/// 许多前缀组合反复展开，算一次即可。
+pub(crate) type EdgeVariants = HashMap<(usize, usize), Vec<(String, usize)>>;
+
+/// 模糊变体到达某终点的一种形态：(变体边界, 所打码切分（相对起点的偏移）, 改动处数)。
+pub(crate) type FuzzyShape = (u64, Vec<usize>, usize);
 
 /// 用户词入图时的**对数域加成**（[`LatticeBuilder::add_store_nodes`]）。
 ///
@@ -605,6 +612,7 @@ impl LatticeBuilder {
 
         // nodes[end_pos] = 所有在 end_pos 结束的节点
         let mut nodes: Vec<Vec<LatticeNode>> = vec![Vec::new(); input_len + 1];
+        let mut edge_variants = EdgeVariants::new();
 
         for p in 0..input_len.min(graph.len()) {
             if require_reachable && !graph.is_reachable(p) {
@@ -646,62 +654,73 @@ impl LatticeBuilder {
                         canon: None,
                     });
                 }
+            }
 
-                // 模糊拼音变体
-                //
-                // **刻意不做边界校验**：词典返回的 boundary 是**变体码**空间的偏移
-                // （zhongguo 的 {0,5}），而本跨度在用户**原码**空间（zong|guo 的
-                // {0,4}）。z→zh 这类变体改变码长，两者位偏移不同域，直接比对会把正确的
-                // 模糊命中整片误杀。这与 mod.rs 对模糊变体一律置 boundary=0
-                // 的既有决策一致，是已记录的永久缺口（待跨域偏移映射），本阶段不碰。
-                // 音节标注取图上任意一条最短路径——模糊命中没有可信真值切分，
-                // 但节点仍需一个自洽的标注供整句边界回填。
-                if let Some(fuzzy) = fuzzy_config.filter(|f| f.any_enabled()) {
-                    // **先取切分，再逐音节展开变体**。此前这里对整串 `code` 调
-                    // `fuzzy_variants`，而其声母规则是 `starts_with`、韵母规则是 `find`，
-                    // 对多音节串只能改到首音节声母与第一处韵母——`zhongzou`→`zhongzhou`
-                    // （中州）这类非首音节模糊整片丢失。切分本就在下面 `slice_syllables`
-                    // 里用着，只是没回头喂给变体生成（同 P1 记的「信息拿在手上，用完即弃」）。
-                    let Some(offsets) = graph.any_path(p, q, self.max_word_len) else {
+            // 模糊拼音变体
+            //
+            // **词条边界不能拿去比所打码的偏移**：词典返回的 boundary 是**变体码**空间的偏移
+            // （zhongguo 的 {0,5}），而本跨度在用户**原码**空间（zong|guo 的 {0,4}）。z→zh
+            // 这类变体改变码长，两者位偏移不同域，直接比对会把正确的模糊命中整片误杀
+            // （mod.rs 对模糊命中对外一律置 boundary=0 也是这个理由）。
+            //
+            // 它只和**同域的变体边界**比。变体按图上**每条**切分逐音节展开（[`Self::fuzzy_spans`]）：
+            // `pinan` 的平安只在 `pin|an` 上，只取一条切分会整片漏掉。词条有边界时必须等于某个
+            // 形态的变体边界（`xi|an → xi|ang` 拼出的 `xiang` 撞上单音节的「想」就该拒），并取那个
+            // 形态的所打码切分；无边界时放行、取改动最少的形态。
+            let Some(fuzzy) = fuzzy_config.filter(|f| f.any_enabled()) else {
+                continue;
+            };
+            let spans = self.fuzzy_spans(
+                p,
+                input,
+                graph,
+                fuzzy,
+                &mut edge_variants,
+                input_len,
+                self.max_word_len,
+                &|v| dict.has_longer_code(v),
+            );
+            for ((q, variant), shapes) in &spans {
+                let q = *q;
+                let code = &input[p..q];
+                for hit in dict.search_with_boundary(variant) {
+                    let Some((variant_mask, offsets, fuzzy_edits)) = shapes
+                        .iter()
+                        .filter(|(mask, _, _)| hit.boundary == 0 || *mask == hit.boundary)
+                        .min_by_key(|(_, _, edits)| *edits)
+                    else {
                         continue;
                     };
-                    let syls = slice_syllables(code, &offsets);
-                    for (variant, fuzzy_edits, variant_mask) in
-                        FuzzyMatcher::expand_syllables_masked(&syls, fuzzy)
+                    // 模糊命中同样按所选切分计歧义罚：惩罚是**切分**的属性（该路径是否踩在
+                    // 歧义接缝上），与词条来源无关。
+                    let log_prob = score_node(&hit.text, variant, hit.weight)
+                        - FUZZY_SYLLABLE_LOG_PENALTY * *fuzzy_edits as f64
+                        - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, offsets) as f64;
+                    // 规范边界取变体边界：词条有边界时上面已验过两者相等，没有时只能用它。
+                    let canon_mask = *variant_mask;
+                    // 同词同起点：精确节点恒胜（不带模糊罚）；模糊节点之间取分高者，
+                    // 切分与规范码随胜者一起换（多个变体码可命中同一个词）。
+                    if let Some(existing) = nodes[q]
+                        .iter_mut()
+                        .find(|n| n.word == hit.text && n.start == p)
                     {
-                        // 全原音节组合 == 原码，属精确命中，已由上面的 search_with_boundary
-                        // 循环加入（且带真值边界校验），不可在此重复添加为模糊节点。
-                        if variant == code {
-                            continue;
+                        if existing.canon.is_some() && log_prob > existing.log_prob {
+                            existing.log_prob = log_prob;
+                            existing.syllables = slice_syllables(code, offsets);
+                            existing.syl_mask = offsets_mask(offsets);
+                            existing.canon = Some((variant.clone(), canon_mask));
                         }
-                        for hit in dict.search_with_boundary(&variant) {
-                            // 去重
-                            if nodes[q].iter().any(|n| n.word == hit.text && n.start == p) {
-                                continue;
-                            }
-                            // 模糊命中同样按图上那条标注路径计歧义罚：惩罚是**切分**的
-                            // 属性（该路径是否踩在歧义接缝上），与词条来源无关。
-                            let log_prob = score_node(&hit.text, &variant, hit.weight)
-                                - FUZZY_SYLLABLE_LOG_PENALTY * fuzzy_edits as f64
-                                - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
-                            // 规范边界优先用词条自带的真值（与变体码同域）；缺失时按变体
-                            // 音节长度推——变体就是按这条切分逐音节展开出来的。
-                            let canon_mask = if hit.boundary != 0 {
-                                hit.boundary
-                            } else {
-                                variant_mask
-                            };
-                            nodes[q].push(LatticeNode {
-                                start: p,
-                                end: q,
-                                word: hit.text,
-                                syllables: slice_syllables(code, &offsets),
-                                syl_mask: offsets_mask(&offsets),
-                                log_prob,
-                                canon: Some((variant.clone(), canon_mask)),
-                            });
-                        }
+                        continue;
                     }
+                    nodes[q].push(LatticeNode {
+                        start: p,
+                        end: q,
+                        word: hit.text,
+                        syllables: slice_syllables(code, offsets),
+                        syl_mask: offsets_mask(offsets),
+                        log_prob,
+                        canon: Some((variant.clone(), canon_mask)),
+                    });
                 }
             }
         }
@@ -854,7 +873,7 @@ impl LatticeBuilder {
     ) {
         let fuzzy = fuzzy_config.filter(|f| f.any_enabled());
         // 各音节边的变体表：同一条边会被许多起点、许多前缀组合反复展开，算一次即可。
-        let mut edge_variants: HashMap<(usize, usize), Vec<(String, usize)>> = HashMap::new();
+        let mut edge_variants = EdgeVariants::new();
         let input_len = input.len();
         for p in 0..input_len.min(graph.len()) {
             if require_reachable && !graph.is_reachable(p) {
@@ -924,61 +943,58 @@ impl LatticeBuilder {
         }
     }
 
-    /// [`Self::add_store_nodes`] 的模糊分支：从起点 `p` 出发的全部用户词模糊节点。
+    /// 从起点 `p` 出发、终点不超过 `end_limit`、至多 `max_syllables` 个音节的全部模糊变体码，
+    /// 按（终点, 变体码）归并，各附到达它的全部形态（变体边界、所打码切分、改动处数）。
+    /// 系统词（[`Self::build`]）与用户词（[`Self::add_store_fuzzy_nodes`]）的模糊节点、词候选的
+    /// 模糊变体码（`PinyinEngine::fuzzy_codes`）共用这一份。
     ///
-    /// ## 边界为什么要逐音节对
+    /// ## 为什么逐边展开而不取一条切分
     ///
-    /// 变体码与所打码**不同域**（`chai` 4 字节 vs `cai` 3 字节），记录的 `boundary` 不能直接套
-    /// `graph.mask_path`。做法：沿图的音节边从 `p` 逐层延伸，每走一条边就地展开该音节的变体
-    /// （[`FuzzyMatcher::fuzzy_variants_scored`]，与系统词、step 6 同一份判据），组合携带
-    /// （变体码、**变体码自己的**音节边界、所打码切分、改动处数）。命中记录的 `boundary` 必须
-    /// **恰好等于**变体边界——于是记录的每个音节都一一对应到所打码的一个音节上。节点的
-    /// `syllables` / `syl_mask` 用那条**所打码**切分，与精确节点同域（下游逐步上屏 / consumed
-    /// 都按所打码走）。
+    /// 同一跨度常有多条切分：`pinan` 是 `pi|nan` 也是 `pin|an`，平安只在后一条上
+    /// （`pin→ping`）。只按一条切分展开，另一条上的变体永远查不到。做法：沿图的音节边从 `p`
+    /// 逐层延伸，每走一条边就地展开该音节的变体（[`FuzzyMatcher::fuzzy_variants_scored`]，
+    /// 与 step 6 同一份判据），组合携带（变体码、**变体码自己的**音节边界、所打码切分、改动处数）。
     ///
     /// **不先枚举路径再展开**：那样要给路径条数设上限，而截断是按图的遍历顺序截的、没有语义，
-    /// 记录唯一对得上的那条切分可能正好被截掉（`fanganfangan…` 同音节数下 8 条切分）。
-    /// 逐层延伸时各切分共享前缀，截断只发生在同层组合超出 [`USER_FUZZY_LAYER_BUDGET`] 时，
+    /// 唯一对得上的那条切分可能正好被截掉（`fanganfangan…` 同音节数下 8 条切分）。
+    /// 逐层延伸时各切分共享前缀，截断只发生在同层组合超出 [`FUZZY_LAYER_BUDGET`] 时，
     /// 且按改动处数截——少处模糊的组合在任何切分上都先保住。
     ///
-    /// 比 [`Self::build`] 的系统词模糊节点**更严**：那边无边界校验、切分取 `any_path` 一条猜的；
-    /// 这边沿用精确分支的约束 2（整句节点要真值切分，`boundary == 0` 天然对不上任何变体边界）。
+    /// 全原音节组合（= 所打码本身）不收：那是精确命中，由各自的精确分支处理。
     ///
-    /// ## 打分
-    ///
-    /// 与 [`Self::build`] 的系统词模糊节点同口径：`score_node(变体码)` − 每处改动
-    /// [`FUZZY_SYLLABLE_LOG_PENALTY`] − 歧义罚，再叠 [`USER_NODE_WEIGHT_CAP`] / [`USER_NODE_BONUS`]。
-    /// 同词同起点仍取较大者（约束 3）。精确优先由罚分保证：同权重时模糊那条恒多扣
-    /// ln2 × 改动处数，压不过所打码的精确命中。同一个词两份记录（精确码、规范码各一）时
-    /// 出哪个词不变，但**分高者决定整句按哪个码造词**：替换时 `canon` / 切分随胜者一起换
-    /// （精确胜者清成 `None`、模糊胜者写记录自己的码与边界），整句的 `learn_code` 由此拼出。
+    /// `can_extend(变体码)` 为假的组合不再往后延伸（没有任何更长的码以它开头）。剪枝发生在
+    /// 本层预算截断**之后**、延伸下一层之前：被剪掉的组合仍占过本层预算（它自己还要点查），
+    /// 省下的是它的后代。系统词传词典的前缀存在性判据，用户层没有这一查询，传恒真。
     ///
     /// ## 成本
     ///
-    /// 变体码按（终点, 码）归并（`xi|an` 与 `xian` 都能展开出 `xiang`），每个只点查 store 一次；
-    /// 上界 = 层数(≤ `max_word_len`) × [`USER_FUZZY_LAYER_BUDGET`]，扣掉全原音节的组合。
+    /// 变体码按（终点, 码）归并（`xi|an` 与 `xian` 都能展开出 `xiang`），调用方每个只点查一次；
+    /// 上界 = 层数(≤ `max_syllables`) × [`FUZZY_LAYER_BUDGET`]，扣掉全原音节的组合。词图传
+    /// `max_word_len`（更长的词本就不进图）；词候选查的是整码，传码长当上界（层数实际止于
+    /// 最长切分的音节数，图上走不动了即停）。
     #[allow(clippy::too_many_arguments)]
-    fn add_store_fuzzy_nodes(
+    pub(crate) fn fuzzy_spans(
         &self,
         p: usize,
         input: &str,
         graph: &SegGraph,
-        store: &DictManager,
         fuzzy: &FuzzyConfig,
-        edge_variants: &mut HashMap<(usize, usize), Vec<(String, usize)>>,
-        nodes: &mut [Vec<LatticeNode>],
-    ) {
+        edge_variants: &mut EdgeVariants,
+        end_limit: usize,
+        max_syllables: usize,
+        can_extend: &dyn Fn(&str) -> bool,
+    ) -> BTreeMap<(usize, String), Vec<FuzzyShape>> {
         /// 在途组合：(当前位置, 变体码, 变体边界, 所打码切分（相对 p 的起点偏移）, 改动处数)
         type Combo = (usize, String, u64, Vec<usize>, usize);
-        /// 到达某终点的一种形态：(变体边界, 所打码切分, 改动处数)
-        type Shape = (u64, Vec<usize>, usize);
-        let end_limit = input.len().min(nodes.len().saturating_sub(1));
-        // (终点, 变体码) → 形态。BTreeMap：点查与建节点的顺序确定，节点次序不随哈希漂移。
-        let mut spans: BTreeMap<(usize, String), Vec<Shape>> = BTreeMap::new();
+        // BTreeMap：点查与建节点的顺序确定，节点次序不随哈希漂移。
+        let mut spans: BTreeMap<(usize, String), Vec<FuzzyShape>> = BTreeMap::new();
         let mut layer: Vec<Combo> = vec![(p, String::new(), 0, Vec::new(), 0)];
-        for _ in 0..self.max_word_len {
+        for _ in 0..max_syllables {
             let mut next: Vec<Combo> = Vec::new();
             for (pos, variant, mask, offsets, edits) in &layer {
+                if !variant.is_empty() && !can_extend(variant) {
+                    continue;
+                }
                 let bit = if variant.len() < 64 {
                     1u64 << variant.len()
                 } else {
@@ -992,7 +1008,7 @@ impl LatticeBuilder {
                     }
                     let opts = edge_variants.entry((*pos, e)).or_insert_with(|| {
                         let syl = &input[*pos..e];
-                        // 首项恒为原音节（0 处改动），同 `expand_syllables`。
+                        // 首项恒为原音节（0 处改动）。
                         let mut v = vec![(syl.to_string(), 0)];
                         v.extend(FuzzyMatcher::fuzzy_variants_scored(syl, fuzzy));
                         v
@@ -1011,13 +1027,13 @@ impl LatticeBuilder {
             if next.is_empty() {
                 break;
             }
-            if next.len() > USER_FUZZY_LAYER_BUDGET {
+            if next.len() > FUZZY_LAYER_BUDGET {
                 // 稳定排序后截断：结果确定，但**不是**「每层全局改动最少」的精确保证——
                 // 同改动数内部按遍历生成顺序截（先到的边、先到的变体先留），且只在本层比较：
                 // 被截掉的父组合，其后代可能比下一层留下的组合改动更少。实际会触发：11 组全开、
                 // 6 音节 4 条切分时，≤2 处改动的组合约 292 条，会在同改动数内部被截。
                 next.sort_by_key(|c| c.4);
-                next.truncate(USER_FUZZY_LAYER_BUDGET);
+                next.truncate(FUZZY_LAYER_BUDGET);
             }
             for (q, variant, mask, offsets, edits) in &next {
                 // 全原音节组合 = 所打码本身，已由精确分支处理（且带真值边界校验）。
@@ -1032,6 +1048,49 @@ impl LatticeBuilder {
             }
             layer = next;
         }
+        spans
+    }
+
+    /// [`Self::add_store_nodes`] 的模糊分支：从起点 `p` 出发的全部用户词模糊节点。
+    ///
+    /// 变体码与切分来自 [`Self::fuzzy_spans`]（与系统词模糊节点同一份）。命中记录的 `boundary`
+    /// 必须**恰好等于**某个形态的变体边界——于是记录的每个音节都一一对应到所打码的一个音节上。
+    /// 节点的 `syllables` / `syl_mask` 用那条**所打码**切分，与精确节点同域（下游逐步上屏 /
+    /// consumed 都按所打码走）。
+    ///
+    /// 比 [`Self::build`] 的系统词模糊节点**更严**：那边 `boundary == 0` 降级放行；
+    /// 这边沿用精确分支的约束 2（整句节点要真值切分，`boundary == 0` 天然对不上任何变体边界）。
+    ///
+    /// ## 打分
+    ///
+    /// 与 [`Self::build`] 的系统词模糊节点同口径：`score_node(变体码)` − 每处改动
+    /// [`FUZZY_SYLLABLE_LOG_PENALTY`] − 歧义罚，再叠 [`USER_NODE_WEIGHT_CAP`] / [`USER_NODE_BONUS`]。
+    /// 同词同起点仍取较大者（约束 3）。精确优先由罚分保证：同权重时模糊那条恒多扣
+    /// ln2 × 改动处数，压不过所打码的精确命中。同一个词两份记录（精确码、规范码各一）时
+    /// 出哪个词不变，但**分高者决定整句按哪个码造词**：替换时 `canon` / 切分随胜者一起换
+    /// （精确胜者清成 `None`、模糊胜者写记录自己的码与边界），整句的 `learn_code` 由此拼出。
+    #[allow(clippy::too_many_arguments)]
+    fn add_store_fuzzy_nodes(
+        &self,
+        p: usize,
+        input: &str,
+        graph: &SegGraph,
+        store: &DictManager,
+        fuzzy: &FuzzyConfig,
+        edge_variants: &mut EdgeVariants,
+        nodes: &mut [Vec<LatticeNode>],
+    ) {
+        let end_limit = input.len().min(nodes.len().saturating_sub(1));
+        let spans = self.fuzzy_spans(
+            p,
+            input,
+            graph,
+            fuzzy,
+            edge_variants,
+            end_limit,
+            self.max_word_len,
+            &|_| true,
+        );
 
         for ((q, variant), shapes) in &spans {
             let q = *q;

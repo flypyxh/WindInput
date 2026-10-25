@@ -42,4 +42,6 @@ pub use store::Store;
 
 /// 用户目录下装用户数据文件的子目录名（设计 §2.1，P5 起；此前叫 `user`）。
 pub const DATA_DIR_NAME: &str = "data";
+/// 用户误读表：数据目录根下的文件名（引擎读它、`data.locate` 认它，都按这个名字）。
+pub const MISREAD_FILE: &str = "pinyin_misread.yaml";
 pub use store_layer::{StoreDraftLayer, StoreTempLayer, StoreUserLayer};

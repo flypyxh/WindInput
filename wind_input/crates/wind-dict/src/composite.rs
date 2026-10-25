@@ -20,6 +20,11 @@ enum Query {
     Exact,
     /// 前缀补全
     Prefix,
+    /// 带音节上限的前缀补全（见 `DictLayer::search_prefix_capped`）
+    PrefixCapped {
+        max_syllables: u32,
+        completed_len: usize,
+    },
     /// 声母串（简拼召回）
     Abbrev,
     /// 声母串恰为本组、不含无边界词（整句词图用，见 `DictLayer::search_abbrev_exact`）
@@ -77,6 +82,24 @@ impl CompositeDict {
     /// 前缀查找：跨层合并去重。
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
         self.merge_search(prefix, limit, Query::Prefix)
+    }
+
+    /// 带音节上限的前缀查找，见 [`DictLayer::search_prefix_capped`]。
+    pub fn search_prefix_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+        completed_len: usize,
+    ) -> Vec<Candidate> {
+        self.merge_search(
+            prefix,
+            limit,
+            Query::PrefixCapped {
+                max_syllables,
+                completed_len,
+            },
+        )
     }
 
     /// 按声母串查找（简拼召回）：跨层合并去重，见 [`DictLayer::search_abbrev`]。
@@ -169,7 +192,7 @@ impl CompositeDict {
         //
         // 简拼尤其不能换：候选的 code 必须留全拼码，词频记账走的正是它
         // （见 step6「保留全拼码」那段——换成别层的码会让同一个词在两条流下各记各的）。
-        let is_prefix = matches!(kind, Query::Prefix);
+        let is_prefix = matches!(kind, Query::Prefix | Query::PrefixCapped { .. });
         let by_code = matches!(kind, Query::Pattern { .. });
 
         for layer in layers.iter() {
@@ -180,6 +203,10 @@ impl CompositeDict {
             let layer_results = match kind {
                 Query::Exact => layer.search(query, limit),
                 Query::Prefix => layer.search_prefix(query, limit),
+                Query::PrefixCapped {
+                    max_syllables,
+                    completed_len,
+                } => layer.search_prefix_capped(query, limit, max_syllables, completed_len),
                 Query::Abbrev => layer.search_abbrev(query, limit),
                 Query::AbbrevExact => layer.search_abbrev_exact(query, limit),
                 Query::Pattern {

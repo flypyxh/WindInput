@@ -1,0 +1,270 @@
+# 候选注释：命名模板、默认/详细两态与总表设置
+
+> 2026-10-22 设计，待实施。前身：`candidate-comment-layering.md`（三层覆盖）、
+> `candidate-comment-above-line.md`（上方注释条）。本设计**替换**前者的配置面，
+> 不改模板语法与求值（`comment.rs` 的变量、`${a|b}`、`{…}`、`$[色]{…}` 全部保留）。
+
+## 1 为什么做
+
+候选注释是特色功能，但「强大」没能变成「好用」：
+
+1. **开箱没有中英释义**。内置只有拆字、拼音、编码提示；英文词库只有 `word→word` 两列，
+   仓库不带任何释义数据，`${dict}` 要用户自己找词库挂。
+2. **配置难快速调**。模板是现场写的字符串，散在全局、方案文件 `[candidate]`、
+   `[overlay]`、`input.{temp_english,temp_pinyin,url,email,unicode}`、`schema.mix_modes[]`
+   七八处；模式级完全没有图形界面。想试几种组合、想备份，都只能手抄字符串。
+3. **只有一种状态**。日常要最简（编码提示），偶尔才要详细（拆字、拼音、释义）；现在开了就
+   一直是那一种，看一眼详细就得进设置改回来。
+
+## 2 目标 / 非目标 / 反目标
+
+**目标**
+
+- G1 模板**命名**、集中存放：系统内置一批，用户可自定义，数量不限，可整体备份。
+- G2 其它地方**只引用模板 id**，不再现场写模板字符串。
+- G3 按「模式 → 方案 → 方案类型 → 全局」逐层指定，每层分「默认 / 详细」×「竖 / 横」。
+  入门用户只配全局两格就能用。
+- G4 全局**一个**「默认 / 详细」状态，Alt 键与动作命令可切换；支持仅本次候选窗、持久、按住三种。
+- G5 内置中英释义数据（英→中、中→英），只要基础义项与词性，尽量覆盖全部系统词库。
+- G6 设置端一个带 Tab 的对话框，核心是一张「作用范围 × 四列」的总表。
+
+**非目标**
+
+- 不改模板语法、变量集、注释词库机制（`[[ui.comment_dicts]]` 原样保留，内置释义也走它）。
+- 不做第三态及以上（维护者明确：预留第三态太复杂）。
+- 不改 `comment_max_chars_*`、`comment_above`、`auto_comment_dicts`、悬停提示 `ui.tooltip`。
+
+**反目标（做成这样即失败，哪怕功能都在）**
+
+- Alt 单击切换干扰了正常上屏或应用自身的 Alt 行为（菜单栏、Alt+Tab、已有的 Alt+数字上屏注释）。
+- 各方案 / 模式各有各的状态，切来切去不知道当前处于哪一态。
+- 入门用户打开设置面对的是一张必须填满的大表。
+
+## 3 概念
+
+| 概念 | 含义 |
+|---|---|
+| **模板** | `id` + 显示名 + 模板串。内置模板随包发布、只读；用户模板存用户配置。 |
+| **两态** | `default`（默认）/ `detail`（详细）。全局唯一。 |
+| **作用范围** | 全局 / 方案类型 / 方案 / 模式。每个范围 4 格：默认·竖、默认·横、详细·竖、详细·横。 |
+| **格值** | 模板 id；`none`（不显示注释）；不写（跟随）。横排格另有「同竖排」。 |
+
+## 4 状态与切换（维护者已定）
+
+- **持久状态** `ui.comment.state`：`default` / `detail`，写回配置，重启保持。所有作用范围共用这一份。
+- **临时状态**：本次候选窗内对持久状态**取反**。候选窗关闭（上屏、取消、清空）即丢弃，下一次输入
+  回到持久状态。持久为 `detail` 时，临时取反看到的就是 `default`。
+  - 输入途中切模式（如进入临时拼音），临时状态**保留**，在新范围的模板上同样生效（我方判断，
+    理由：用户的意图是「这一下我想看详细」，与当前在哪个模式无关）。
+- **Alt 行为** `ui.comment.alt_switch`，四档：
+  - `off`：不拦 Alt。
+  - `session`：单击 Alt 切临时状态。**出厂档**（维护者已定）。
+  - `persist`：单击 Alt 改持久状态。
+  - `hold`：按住 Alt 期间临时为另一态，松开恢复。
+- **Alt 的拦截边界**（我方判断，实施须逐条钉测试）：
+  - 只在**候选窗可见**时拦；其余时候 Alt 原样交给应用。
+  - 只认「干净的单击」：Alt 按下到松开之间有任何别的键（含 Alt+数字上屏注释、Alt+Tab），
+    就不算切换，且不吞那次松开之外的任何键。
+  - 左右 Alt 都认（我方判断；如需区分可后续加 `lalt`/`ralt` 取值）。
+  - 被拦下的 Alt 松开**必须吃掉**，否则 Windows 应用会激活菜单栏、抢走焦点。
+  - `hold` 档：按住期间又按了别的键，放行该组合键；**先处理组合键、后恢复**。所以按住 Alt 看着详细
+    注释按 Alt+数字（`alt_commit = "comment"`），上屏的就是眼前那份详细注释（我方判断：上屏的应与所见一致）。
+    `alt_commit_text` 因此要读当前生效态（持久态 ⊕ 临时态），不能只读持久态。
+  - **实现路径**（我方判断）：做成与 `toggle_mode_keys` 同类的修饰键单击判定，不折算进按键表。
+    用户在 `key_actions` / `session_actions` 里显式绑了裸 `lalt` / `ralt` 时，用户绑定优先，
+    启动 `warn` 一次说明 `alt_switch` 被让位。
+- 切换只**重绘当前页**：不重新查询、不改候选顺序、不改高亮。
+- **动作命令**：
+  - 命令栏：`ime.toggle("comment")` 切持久状态；`ime.set("comment", "default"|"detail")` 直达。
+    命令短语即可绑定，如 `$CC("切注释", ime.toggle("comment"))`，系统短语表加一条。
+  - 按键动词 `comment_state`（切持久）、`comment_state:default` / `:detail`（直达持久）
+    **两张表都加**：`keys.key_actions`（无会话）与 `keys.session_actions`（组字中），同 `single_char` 的先例。
+    `comment_state:session`（切临时）只有会话里才有意义，**只进 `session_actions`**。
+  - 命令栏 `ime.set` 现只认 `on`/`off`（`dict_ime.rs` 校验），需为 `comment` 目标扩出 `default`/`detail`。
+    `comment` 与已占用的 `dict:<注释库id>` 是两个目标，互不影响。
+- 总开关 `ui.comment.enabled` 关掉时，两态都不显示，Alt 也不拦。
+
+## 5 解析链（维护者已定）
+
+取「当前态 × 当前排布」那一格，从具体到一般逐层找，第一个**有值**的胜出：
+
+```
+模式 → 方案 → 方案类型 → 全局
+```
+
+四层都在用户配置里，方案文件不参与（见 §6.1）。
+
+- **方案类型**取引擎类型，五类：`codetable` / `pinyin` / `shuangpin` / `mixed` / `english`。
+  `shuangpin` 是拼音引擎配了双拼布局，按此单独成类；其余直接取 `EngineType`。
+  维护者点名的是前三类，后两类是我方补齐（不补的话混输、英文方案只能落到全局）。
+- **方案层归属**取 active 方案（同 `candidate-comment-layering.md` 的既有判断：注释模板是呈现类配置）。
+- **模式**沿用现有映射（`comment.rs` 的 `template_for`）：临时拼音、临时英文、快捷输入及其它
+  mix_modes 实例、网址、Email、Unicode、引导键特殊模式（`special:<方案id>`）。生僻字、反查、
+  辅助码维持「无模式层」。
+- **横排格**：
+  - 写了值 → 用它；
+  - 写 `inherit` → 跟随上一层的**横排**；
+  - 不写 → 本范围竖排格**有值**时同竖排，竖排也不写时跟随上一层横排。
+- **`none`** 是一个有意见的值：压过下层，渲染成空注释（同现行三态里的空串）。
+- 全局层四格**必有值**：内置默认见 §7，用户删掉某格时按内置默认补。
+
+## 6 配置形态
+
+新段 `[ui.comment]`，取代 `ui.candidate` 里的 `comment_enabled` 与两份模板串：
+
+```toml
+[ui.comment]
+enabled = true                 # 原 ui.candidate.comment_enabled
+state = "default"              # 持久状态：default / detail，切换时写回
+alt_switch = "session"         # off / session（出厂）/ persist / hold
+
+# 用户模板（内置模板在 data/system.comments.toml，同 id 时用户版覆盖内置版）
+[[ui.comment.templates]]
+id = "wubi_learn"
+name = "五笔学习"
+text = "${chaizi} ${code_rev}{ · ${pinyin}}"
+
+# 作用范围 → 四格。键名固定为 default_vertical / default_horizontal /
+# detail_vertical / detail_horizontal；值 = 模板 id / "none" / "inherit"（仅横排）。
+[ui.comment.assign.global]
+default_vertical = "code_hint"
+detail_vertical = "detail_full"
+
+[ui.comment.assign.type.codetable]
+detail_vertical = "chaizi_pinyin"
+
+[ui.comment.assign.schema.wubi86]
+default_vertical = "code_hint"
+
+[ui.comment.assign.mode.temp_pinyin]
+default_vertical = "pinyin"
+detail_vertical = "chaizi_code"
+
+[ui.comment.assign.mode.temp_english]
+default_vertical = "none"
+detail_vertical = "en_meaning"
+detail_horizontal = "inherit"
+```
+
+- **模式键名**：`temp_pinyin` / `temp_english` / `url` / `email` / `unicode` / `mix:<mix_mode id>` /
+  `special:<方案id>`。TOML 表名里带冒号要加引号：`[ui.comment.assign.mode."mix:quick_mix"]`。
+- **引用了不存在的模板 id**：启动 `warn` 一次，该格按「不写」处理（跟随下一层），不报错不阻断。
+- **模板 id 规则**：`[a-z0-9_]+`。设置端新建时自动生成，用户可改名（改的是 `name`，不是 `id`）。
+- 方案层的**用户**设置统一在用户配置的 `assign.schema.<id>`，与总表一一对应。
+
+### 6.1 方案文件不再配置注释（维护者已定）
+
+注释依赖的数据（英文词库、反查码表、注释词库）往往不在方案自己身上：五笔方案的 `${pinyin}`
+来自拼音反查，`${dict:zh_en}` 来自全局注释词库。所以方案文件里写注释既做不到自包含，也让配置
+多出一处来源。为了简洁，**方案文件里的注释配置整体作废**：
+
+- `[candidate].comment_template_*` 与 `[overlay].comment_template_*` 不再读取。检测到残留时，
+  启动 `warn` 一次，提示改到设置端总表的方案行 / 模式行。做法同 `schema_hotkeys` 废弃时的先例。
+- 随包方案文件里的这些键一并删掉（当前随包方案都没写，实施时 grep 确认一次）。
+- 引导键特殊模式的注释改由用户配置的 `assign.mode."special:<方案id>"` 表达。
+- 用户覆盖层 `schema_overrides/<id>.toml` 里的旧键是用户写的内容，能否顺带迁到
+  `assign.schema.<id>` / `assign.mode."special:<id>"`，并入 §10 的迁移评估。
+
+## 7 内置模板与出厂分配
+
+内置模板放 `data/system.comments.toml`，与 `system.phrases.toml` / `system.quick.toml` 并列。
+初版清单（我方提议，实施时按实测效果微调）：
+
+| id | 显示名 | 模板串（示意） |
+|---|---|---|
+| `code_hint` | 编码提示 | `${code_hint\|code_rev\|shuangpin}`（即现行出厂值） |
+| `pinyin` | 拼音 | `${pinyin}` |
+| `chaizi` | 拆字 | `${chaizi}` |
+| `chaizi_code` | 拆字+编码 | `${chaizi} ${chaizi_code}` |
+| `chaizi_pinyin` | 拆字+拼音 | `${chaizi}{ · ${pinyin}}` |
+| `en_meaning` | 英文释义 | `${dict:en_zh}` |
+| `zh_english` | 中文对应英文 | `${dict:zh_en}` |
+| `detail_full` | 详细（全部） | `${chaizi}{ · ${pinyin}}{ · ${dict:zh_en}}` |
+
+出厂分配（我方提议）：
+
+| 作用范围 | 默认 | 详细 |
+|---|---|---|
+| 全局 | `code_hint` | `detail_full` |
+| 码表 | 跟随 | `chaizi_pinyin` |
+| 拼音 / 双拼 | 跟随 | `pinyin` 加 `zh_english` 的组合模板（实施时新增） |
+| 英文 | `none` | `en_meaning` |
+| 临时英文 | `none` | `en_meaning` |
+| 临时拼音 | 跟随 | `chaizi_code` |
+
+## 8 内置中英释义数据
+
+- 作为两张**内置注释词库**随包：`en_zh`（英→中）、`zh_en`（中→英），走现有
+  `[[ui.comment_dicts]]` 的加载与 `.wcmt` mmap 缓存，不另造机制。内置条目默认 `enabled = true`，
+  用户可在注释词库页关掉。
+- **内容**：每个词一行，「词性 + 最基础义项」，不要例句、不要多义项堆叠。
+  例：`apple → n. 苹果`；`苹果 → n. apple`。
+- **来源**：
+  - 英→中：ECDICT（MIT），按 `en.dict.yaml` + `en_ext.dict.yaml`（约 2.4 万词）裁剪；
+  - 中→英：CC-CEDICT（CC BY-SA 4.0，单向兼容本仓 GPL-3.0）打底，只覆盖约 12 万词条；
+  - 系统中文词库约 70 万词条（`base` 37 万、`ext` 24 万、`idiom` 5 万、五笔 `jidian` 9 万），
+    CC-CEDICT 覆盖不到的部分用 AI 生成补齐，并抽检。
+- **授权落实**：ECDICT 与 CC-CEDICT 的署名写进第三方声明；AI 生成部分标注来源，与 CC 部分**分文件**
+  存放，便于以后替换。
+- **体积**：目标是「尽量覆盖全部系统词库」，最终体积在数据生成后报给维护者确认，再决定内置还是
+  按需下载（维护者：最后确认体积）。
+- **发版节奏**（维护者已定）：AI 补齐、抽检完成后，与模板 / 切换功能**一起发**，不先发半套数据。
+  因此释义数据是主线阶段，不是可选的后续工作。生成过程中要持续盯住体积：
+  - 每条只留一个词性、最基础的一两个义项；
+  - 生僻词、长尾专名没有可靠释义就宁缺，不硬凑。
+  
+  中间产物的体积也要报给维护者。
+- **可复现的边界**：AI 生成的释义作为**源数据入库**（`data/` 下单独文件，带来源标注），`scripts/`
+  里的脚本只做裁剪、格式化、合并、去重，这一步可复现；调模型生成本身是一次性的离线工序，不进构建。
+- **加载时机**（我方判断）：沿用现行「模板引用到哪个变量 / 词库就加载哪个」（`data_needs.rs`）。
+  出厂的详细模板引用了拆字与 `zh_en`，所以启动即加载。释义库是 `.wcmt` mmap，冷页只占页缓存、
+  不计进程 Private 内存（见 `memory-footprint.md` 的口径），代价可接受；换来的是第一次按 Alt 不卡、
+  不空。体积报给维护者时一并报 mmap 映射量。
+
+## 9 设置端（wind-setting）
+
+带 Tab 的独立对话框，从「候选标注」分区的「候选注释」按钮打开，取代现有模板对话框。
+
+1. **分配**（主 Tab，维护者已定为总表 + 固定四列）
+   - 列：作用范围 / 默认·竖 / 默认·横 / 详细·竖 / 详细·横。每格一个下拉框：模板列表 + 「不显示」
+     + 「跟随」；横排格多一项「同竖排」（即不写）。
+   - 行：全局、五个方案类型常驻；方案行、模式行只列出**已有覆盖**的，底部「＋ 添加方案覆盖…」
+     「＋ 添加模式覆盖…」。
+   - 跟随的格子灰色斜体，并显示实际生效的模板名，让人看懂它落到了哪一层。
+   - 表格下方是当前选中格的实时预览，复用现有模板预览。
+2. **模板库**：左边列表（内置 / 自定义分组），右边编辑名称和模板串，带预览，复用现有
+   `comment_template_block`。内置模板只读，可以「复制为自定义」；用户版覆盖内置 id 时标「已修改」，
+   并提供「恢复内置」。
+3. **注释词库**：挪入现有 `comment_dicts_dialog`。
+4. **切换**：总开关、当前持久状态、Alt 四档、命令短语与快捷键的指引。
+5. 方案管理页（`schema_manager.rs`）里现有的方案级模板编辑入口删掉，改成一个「在注释设置中配置」的跳转。
+6. `comment_max_chars_*`、`comment_above` 放在「切换」Tab 下的「显示」小节，或另设一个「显示」Tab，
+   由实施者定。
+
+## 10 迁移
+
+维护者：当前用户不多，**先评估自动迁移的复杂度**；复杂就接受手动迁移（启动告警 + 文档指引），
+实施第一阶段给出结论。
+
+可行的自动迁移思路：每段旧的非空模板串生成一个用户模板，id 按来源取（如 `migrated_global`、
+`migrated_temp_english`），内容相同的去重；再写进对应 `assign.*.default_*`。旧的空串迁成 `none`；
+旧 `comment_enabled` 迁到 `ui.comment.enabled`。
+
+方案文件里的旧键见 §6.1：随包的直接删，用户覆盖层里的并入本节评估。
+
+需要算进复杂度的点：
+- 写回要遵守现有「保留用户内容 + 自检」的写回门禁。
+
+## 11 待维护者定
+
+1. 迁移是自动还是手动：实施第一阶段评估后再报。
+2. 中英释义的最终体积，以及内置还是按需下载：数据生成后再报。
+3. AI 补齐的抽检方式与抽样比例：生成第一批后，拿样本给维护者看。
+
+## 12 留给实施者
+
+- 状态与 Alt 的事件处理放在协调器哪一层；各平台（TSF / macOS Option / Fcitx5）Alt 单击的
+  投递差异，以及 Windows 下吃掉 Alt 松开的做法。
+- `system.comments.toml` 的加载、与用户模板合并的位置。
+- 设置端对话框的组件拆分。
+- 文档站 `candidate-comment.mdx` 改写，以及「分模式设置」一节补上 email / unicode（现有遗漏）。

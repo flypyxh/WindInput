@@ -523,6 +523,7 @@ fn png_candidate_window() {
         w.set_theme(theme);
         w.set_orientation(vertical, false, false);
         let item = |text: &str| CandidateItem {
+            text_styled: Default::default(),
             text: text.to_string(),
             code: String::new(),
             label: String::new(),
@@ -997,6 +998,7 @@ fn png_candidate_window_emoji() {
     let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
     w.set_theme(theme);
     let item = |text: &str| CandidateItem {
+        text_styled: Default::default(),
         text: text.to_string(),
         code: String::new(),
         label: String::new(),

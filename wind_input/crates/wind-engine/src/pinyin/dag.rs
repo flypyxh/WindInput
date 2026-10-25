@@ -11,6 +11,8 @@ pub struct DagNode {
     pub start: usize,
     pub end: usize,
     pub syllable: String,
+    /// 换位纠错拼写的边（[`SyllableTrie::is_correction_spelling`]）。
+    pub corrected: bool,
 }
 
 /// 有向无环图
@@ -50,6 +52,7 @@ impl Dag {
                 slot.push(DagNode {
                     start: i,
                     end,
+                    corrected: trie.is_correction_spelling(&syl),
                     syllable: syl,
                 });
             }
@@ -65,7 +68,21 @@ impl Dag {
     ///
     /// 为什么不用贪心： "henihejiele" 贪心选 "hen" 后 "i" 无法匹配。
     /// DP 选 "he"+"ni"+"he"+"jie"+"le" 覆盖全部。
+    ///
+    /// **不走换位纠错边**（`corrected`）：主切分决定编码栏、子短语、简拼闸门等整条下游，
+    /// 纠错边一旦当选（`yuo` 同覆盖时长边先到、`xign` 覆盖更多）就把关纠错时的
+    /// `yu|o`、`xi|gn` 解释整批换掉。纠错只能加候选：纠错词另由 [`Self::maximum_match_with_correction`]
+    /// 那条切分单独查（`PinyinEngine` 的纠错召回步），不经主切分。
     pub fn maximum_match(&self) -> Vec<String> {
+        self.maximum_match_inner(false)
+    }
+
+    /// 同 [`Self::maximum_match`]，但走换位纠错边（`gogn` → `[gogn]`）。
+    pub fn maximum_match_with_correction(&self) -> Vec<String> {
+        self.maximum_match_inner(true)
+    }
+
+    fn maximum_match_inner(&self, with_corrected: bool) -> Vec<String> {
         let n = self.input.len();
         if n == 0 {
             return Vec::new();
@@ -83,7 +100,10 @@ impl Dag {
             if dp[pos] < 0 {
                 continue;
             }
-            for node in &self.nodes[pos] {
+            for node in self.nodes[pos]
+                .iter()
+                .filter(|n| with_corrected || !n.corrected)
+            {
                 let end = node.end;
                 let covered = dp[pos] + (end - pos) as i32;
                 if covered > dp[end] {
@@ -249,12 +269,30 @@ impl SegGraph {
         }
     }
 
-    /// 全拼：消费 DAG 的**全部**切分路径。
+    /// 全拼：消费 DAG 的**全部**切分路径，但**不收换位纠错边**（`DagNode::corrected`）。
+    ///
+    /// 纠错只能加候选。纠错边进了这张图，整句（只出一条）、模糊变体、简拼就都可能经它
+    /// 抢先：整句「哟呢」换成「咏鹅」（`yone`），`boa` 的「薄」先以纠错身份占了同文位、
+    /// 再在截断时让位而整条消失。纠错词只由纠错召回步经 [`Self::from_dag_with_correction`] 查。
     pub fn from_dag(dag: &Dag) -> Self {
+        Self::from_dag_filtered(dag, false)
+    }
+
+    /// 同 [`Self::from_dag`]，含换位纠错边。只给纠错召回用。
+    pub fn from_dag_with_correction(dag: &Dag) -> Self {
+        Self::from_dag_filtered(dag, true)
+    }
+
+    fn from_dag_filtered(dag: &Dag, with_corrected: bool) -> Self {
         let len = dag.input_len();
         let mut edges = vec![Vec::new(); len + 1];
         for (p, slot) in edges.iter_mut().take(len).enumerate() {
-            let mut ends: Vec<usize> = dag.edges_from(p).iter().map(|n| n.end).collect();
+            let mut ends: Vec<usize> = dag
+                .edges_from(p)
+                .iter()
+                .filter(|n| with_corrected || !n.corrected)
+                .map(|n| n.end)
+                .collect();
             ends.sort_unstable();
             ends.dedup();
             *slot = ends;

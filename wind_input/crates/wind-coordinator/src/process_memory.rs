@@ -27,6 +27,12 @@ pub fn private_memory() -> Option<ProcessMemory> {
     imp::read()
 }
 
+/// 本进程累计缺页次数（Windows `PageFaultCount`，软、硬缺页都计）；其它平台 `None`。
+/// 慢键排查用：引擎转换前后各取一次，差值大说明耗时花在把 mmap 词库页换入内存上。
+pub fn page_faults() -> Option<u64> {
+    imp::page_faults()
+}
+
 #[cfg(windows)]
 mod imp {
     use super::ProcessMemory;
@@ -54,6 +60,16 @@ mod imp {
             kind: "private",
         })
     }
+
+    pub(super) fn page_faults() -> Option<u64> {
+        let mut c = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: 伪句柄无需关闭；`cb` 与传入结构体一致。
+        unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) }.ok()?;
+        Some(c.PageFaultCount as u64)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -67,6 +83,10 @@ mod imp {
             bytes: kb * 1024,
             kind: "rss_anon",
         })
+    }
+
+    pub(super) fn page_faults() -> Option<u64> {
+        None
     }
 
     /// `RssAnon:` 行（`RssAnon:<空白> 12345 kB`）→ 12345。
@@ -103,6 +123,10 @@ mod imp {
     use super::ProcessMemory;
 
     pub(super) fn read() -> Option<ProcessMemory> {
+        None
+    }
+
+    pub(super) fn page_faults() -> Option<u64> {
         None
     }
 }

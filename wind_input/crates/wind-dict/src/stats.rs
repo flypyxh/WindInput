@@ -735,7 +735,8 @@ fn rime_body(text: &str) -> &str {
 
 /// 把白霜字表（`文字\t拼音\t权重`）的单字权重累加进 `out`：同字各读音之和即字频。
 pub fn add_char_freq(text: &str, out: &mut HashMap<char, u64>) {
-    for line in rime_body(text).lines() {
+    let text = wind_utils::text::normalize_input(text);
+    for line in rime_body(&text).lines() {
         if line.starts_with('#') {
             continue;
         }
@@ -760,6 +761,7 @@ pub fn add_char_freq(text: &str, out: &mut HashMap<char, u64>) {
 pub fn parse_common_han_levels(text: &str) -> Vec<Vec<String>> {
     let mut levels: Vec<Vec<String>> = Vec::new();
     let mut body = false;
+    let text = wind_utils::text::normalize_input(text);
     for line in text.lines() {
         let s = line.trim();
         if !body {

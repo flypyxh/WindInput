@@ -116,8 +116,8 @@ leading_chars = ""
 # 的比较链**不含 weight**，只看「有没有被选过」。五笔一简 25 个码每个都是二选一
 # （a → 工 9999 / 戈 9998），次选字被误选一次就永久翻转。故简码位保住首选、全码位放开。
 # 英文候选混入（码表方案）：候选列表里捎带英文词库候选，打 hello 直接选到 hello，
-# 不必切英文方案或走临时英文。只有**整串恰好是一个英文词**时才混入——打 githu 不出
-# GitHub，想打某个词要敲完整。
+# 不必切英文方案或走临时英文。有中文候选时默认只在**整串恰好是一个英文词**时混入——
+# 打 githu 不出 GitHub；想边打边补全，见下方 complete_min_length。
 #
 # 与 [schema.pinyin.english_merge] 是**两件独立的事**：码表用户常打命令行、变量名，
 # 开着有用；全拼的英文词与拼音串大面积重叠，是否要开是另一个判断。取值互不共享。
@@ -127,10 +127,23 @@ leading_chars = ""
 enable = false
 # 最小触发长度（2 字符以内不查英文；0=回退 3）。调小只是让更短的词（the/and）也参与。
 min_length = 3
-# 有英文候选时否决满码自动上屏 / 顶码上屏 / 满码空码清空。
-# 定长码表**必须开着**：4 码即满码上屏，关掉的话打 github 到第 4 键就被顶出中文。
+# 有英文候选时否决满码自动上屏 / 顶码上屏 / 满码空码清空（**前缀级**：有英文词以当前串开头即否决）。
+# 定长码表建议开着：4 码即满码上屏，关掉的话打 github 到第 4 键就被顶出中文。
 # ⚠️ 本项按**前缀**命中判（打到 gith 时精确命中还不存在），与「只收精确命中」不同域。
+# 开着时涵盖下面的成词级。
 block_commit = true
+# **成词级**：整串恰是一个英文完整单词时否决上屏（英文临时词不算）。前缀级关掉时，
+# 它仍保住「打完一个英文词不被顶走」，又不让英文词的前缀拦住五笔满码。
+block_commit_on_word = true
+# 中文侧有候选时，输入达到几码起也给英文前缀补全（如设 4：五笔打 gith 也出 github）。
+# 0 = 不补，只在中文侧没有候选时补全。
+complete_min_length = 0
+# 完整单词英文最靠前排第几位（1 起；0 = 默认 1）。仍先让过开头连续的完整匹配中文，只会更靠后。
+exact_position = 1
+# 前缀补全英文最靠前排第几位（1 起；0 = 默认 2）。同样先让过开头的完整匹配中文，且恒在完整单词之后。
+complete_position = 2
+# 中文侧有候选时英文最多几条（完整单词优先，再补前缀补全）；中文侧没有候选时给一页补全。
+max_count = 2
 
 [schema.codetable.frequency]
 enabled = false
@@ -300,10 +313,18 @@ separator = "auto"
 [schema.pinyin.english_merge]
 enable = false
 min_length = 3
-# 中文侧有候选时也补英文前缀（至多 2 条）。只在打的不是完整拼音时补：输入至少 5 个字母、
-# 且整串怎么切都切不成完整全拼音节（templa 补 template；shang、chang 不补）。
-# 双拼方案下不生效（判据按全拼音节定义）。需先开 enable。
-prefix_complete = false
+# 以下四项口径同 [schema.codetable.english_merge] 的同名项。
+# 中文侧有候选时，输入达到几个字母起也给英文前缀补全（0 = 不补，只在中文侧没有候选时补全；
+# 开时建议 5）。另外只在打的不是完整拼音时补：整串怎么切都切不成完整全拼音节
+# （templa 补 template；shang、chang 不补）。双拼方案下不生效（判据按全拼音节定义）。
+complete_min_length = 0
+# 完整单词英文最靠前排第几位（1 起）。0 = 按方案自动：全拼 1、双拼 2（双拼下 the、good
+# 这类词几乎都解得出中文，英文不抢首选）；写了非 0 值则全拼双拼都用它。
+exact_position = 0
+# 前缀补全英文最靠前排第几位（1 起；0 = 默认 2；恒在完整单词之后）。
+complete_position = 2
+# 中文侧有候选时英文最多几条（完整单词优先，再补前缀补全）；中文侧没有候选时给一页补全。
+max_count = 2
 
 [schema.pinyin.shuangpin]
 # 双拼方案下额外把击键当全拼再解释一遍（多人共用一台机器：主力打双拼，别人只会全拼）。
@@ -411,16 +432,18 @@ max_extra_syllables = 5
 # 尾部没打完的音节照常补全（`nihaom` → 你好吗、搜狗双拼 `hkl` → 好了），那不算简拼。
 enabled = true
 
-# 上下文语言模型（n-gram）。
-# ⚠️ 实验性，尚未正式发布：默认关闭，且不随安装包提供模型文件。
-# 设计、实测与开启方式见 docs/design/language-model-integration.md。
+# 上下文语言模型（n-gram），给整句打分。**桌面默认关，移动端默认开**（见文件末尾 [mobile.grammar]）。
+# 随包带 wanxiang-mini.gram（5.3 MB，万象模型的子集，CC-BY-4.0；内存映射，常驻只是查到的页）。
+# 实测：独立口语评测首选整句 +5～+6.5 个点，单次转换多约 2 ms。设计与评测见
+# docs/design/language-model-integration.md §10–§11，重建见 scripts/lm/build_grammar.sh。
+#
+# 桌面要开：weight = 0.5、model = "wanxiang-mini.gram"。
 
 [schema.pinyin.grammar]
-# 0 = 关闭（默认）。关闭时不读模型文件、不占内存，整句结果与没有该功能时逐位相同。
+# 0 = 关闭（桌面默认）。关闭时不读模型文件、不占内存，整句结果与没有该功能时逐位相同。
 weight = 0.0
 # 模型文件名，相对 data/schemas/pinyin/grammar/。**空串（默认）= 不启用**。
 # weight 与 model 两个都要显式配置才生效——只调 weight 不会静默启用某个默认模型。
-# 模型需自行获取，不随安装包分发（许可与体积，见设计文档 §5、§8）。
 model = ""
 
 # 拼音自动造词：分步选词 / 整句上屏后按已上屏的词写入**临时词库**（立即可选），
@@ -546,10 +569,24 @@ top_code_override_pinyin = false
 # （wanle→完了，消费整串）照常拦住清空。
 auto_commit_block_on_pinyin = true
 # 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。
+# **前缀级**：有英文词以当前串开头即否决；开着时涵盖下面的成词级。
 auto_commit_block_on_english = false
+# **成词级**：整串恰是一个英文完整单词时否决满码 / 顶码上屏（英文临时词不算；仅 enable_english
+# 开时有意义）。两级关系同上面拼音那对（auto_commit_block_on_pinyin / block_commit_on_pinyin_word）。
+block_commit_on_english_word = true
 min_pinyin_length = 2
 # 英文最小触发长度（2 字符以内不查英文；0=回退 3）。
 min_english_length = 3
+# 以下四项口径同 [schema.codetable.english_merge] 的 complete_min_length / exact_position /
+# complete_position / max_count。
+# 中文侧有候选时，输入达到几码起也给英文前缀补全（0 = 不补，只在中文侧没有候选时补全）。
+english_complete_min_length = 0
+# 完整单词英文最靠前排第几位（1 起；0 = 默认 1；仍先让过开头连续的完整匹配中文）。
+english_exact_position = 1
+# 前缀补全英文最靠前排第几位（1 起；0 = 默认 2；恒在完整单词之后）。
+english_complete_position = 2
+# 中文侧有候选时英文最多几条；截断时为这几条保底留座。
+english_max_count = 2
 # 拼音歧义拦截（词强度）：整串是强拼音词时否决五笔自动/顶码上屏，让拼音赢
 # （wangba→网吧 拦；aipu→落实 无强词放行）。独立于 auto_commit_block_on_pinyin。
 block_commit_on_pinyin_word = true
@@ -742,6 +779,47 @@ page_end_key = true
 # 放宽放出来的候选的前缀标注（空串=不标注），用于与正常候选区分。
 prefix = "·"
 
+# 拼音纠错与正确拼音提示。
+[input.correction]
+# 纠错总开关：打错的拼音（如 gn、on）按纠正后的拼写出候选。
+enabled = true
+# 纠错候选前加的标记，如「*公平」；留空 = 不加。
+marker = "*"
+# 自定义纠错，每项 "错误=正确"，如 ["ogn=ong"]。
+custom = []
+
+[input.correction.rules]
+# ng 打成 gn（ogn → ong）。出厂关：xign 这类简拼会被纠成 xing 占满首页。
+gn_ng = false
+# 漏打 g（on → ong）。
+on_ong = true
+# 韵母字母颠倒（ia ↔ ai、ie ↔ ei 等）。
+vowel_swap = true
+# 旧式拼写（uei / iou / uen → ui / iu / un）。
+legacy_spelling = false
+# h 错位（hz → zh、zih → zhi）。
+h_misplaced = false
+# ng 打成 mg。
+mg_ng = false
+# ng 打成 nag / neg / nig / nog。
+n_before_g = false
+# 简拼冲突类（qai → qia、nu → un 等）；容易误纠，默认关。
+ai_ia = false
+
+[input.correction.hint]
+# 显示正确拼音：命中的候选正文内嵌正确全拼并着色（「苹(ping)果」）。
+enabled = false
+# 模糊音命中时提示。
+fuzzy = true
+# 易读错的字提示。
+misread = true
+# 纠错命中时提示。
+correction = false
+# 提示范围：first = 只标第一个带提示的候选；all = 标全部。
+scope = "first"
+# 提示带声调（「苹(píng)果」）；注释变量 ${correct_pinyin} 同样跟随。
+tone = false
+
 # 联想：上屏之后按**刚上屏的内容**给候选，而不是按编码。
 #
 # 有两种，回答的是完全不同的问题——同样打完「中」，一个给「中国」，另一个给「国」：
@@ -798,10 +876,11 @@ hint = "联想输入"
 #
 # ⚠️ 词语联想档只用 history 与 prefix 两个来源（二者都只出「上文的延长」），
 # 在那一档下开着 punct 也不会出标点。
-# ⚠️ bigram 尚无实现，开着也不会出候选（需要离线蒸馏的数据来源）。
-#    ⇒ 桌面上智能联想档目前能出的东西与词语联想档相同（punct 在桌面默认关）。
+# ⚠️ bigram 的数据是 data/assoc/assoc_bigram.txt（约 2 MB，智能联想档首次出联想时才读进内存，
+#    关着联想或用词语联想档不占）。表里自带句读（「吗」后的「？」），不受 punct 管。
+#    桌面宿主不报光标前文，只看刚上屏的那个词。重建见 scripts/lm/build_assoc.sh。
 history = true   # 联想历史：在这个上文之后从联想里选过的词，选得多的排前
-bigram = true    # 词→后继表，离线从 n-gram 模型蒸馏（待实现）
+bigram = true    # 下一词表：上文 → 常接的词，离线从语言模型蒸馏
 prefix = true    # 词库里以上文为前缀的更长的词——词语联想就是它
 # 标点与符号（静态规则表）。**桌面默认关**，移动端在 [mobile.association] 里开：
 # 实体键盘上标点一键可达，打完一个字就弹一串标点干扰远大于收益；软键盘上则要切键盘层，
@@ -1198,6 +1277,10 @@ toggle_full_width = "shift+space"
 toggle_punct = "ctrl+."
 delete_candidate = "ctrl+shift+number"
 pin_candidate = "ctrl+number"
+# 快捷输入里的选词上屏键（ctrl+number = Ctrl+1..9 选第 1..9 个、Ctrl+0 选第 10 个）。
+# 只在快捷输入里生效，优先于上面的置顶/删除；可选 ctrl+number / ctrl+shift+number /
+# ctrl+alt+number，"none" = 不绑。
+quick_input_select = "ctrl+number"
 toggle_toolbar = 'ctrl+shift+\'
 open_settings = "ctrl+shift+]"
 # 打开词库管理页的快捷键。"none" = 不绑；填一个组合键即可用，如 "ctrl+shift+d"。
@@ -1416,6 +1499,9 @@ comment_enabled = true
 #                      **全拼方案下照样有值**：布局按「活跃方案→主拼音方案→已装的首个
 #                      双拼方案」回退，一个双拼方案都没装才恒空
 #   pinyin             带声调注音 nǐ hǎo（多音字按词典消歧：「行长」得 háng zhǎng 而非 xíng cháng）
+#   correct_pinyin     带正确拼音提示的候选的整词正确拼音 zhong guo，其余候选为空；
+#                      按 input.correction.hint 的来源勾选过滤，带调随其 tone，
+#                      不依赖提示总开关与 scope
 #   chaizi             拆字字根串，仅单字候选（需方案配了 [engine.chaizi]）
 #   chaizi_code        该字在拆字库里的编码，仅单字候选
 #   chaizi_all[:分隔符] 拆字字根不限字数，默认空格连接；如 ${chaizi_all:／}（可能很长，慎用于横排）
@@ -1823,3 +1909,12 @@ mode = "continuous"
 # 移动端开标点联想：软键盘上打标点要切键盘层，从候选里点走省事得多。
 # 桌面相反（[input.association] 里 punct = false）——实体键盘上标点一键可达。
 punct = true
+# 移动端联想态空格出空格、收起联想，不选首个联想（汉字后双击空格出「。」也靠它）。
+# 桌面相反（[input.association] 里 space_commits = true）——候选窗里高亮看得见，空格选词顺手。
+space_commits = false
+
+[mobile.grammar]
+# 移动端默认开整句语法模型：软键盘上整句打错要逐字改，代价比桌面高。
+# 桌面相反（[schema.pinyin.grammar] 里 weight = 0）——等移动端真机跑稳再议。
+weight = 0.5
+model = "wanxiang-mini.gram"

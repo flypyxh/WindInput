@@ -380,7 +380,10 @@ impl Coordinator {
 
     fn refill_temp_pinyin_candidates(&self, state: &mut State) {
         state.candidates.clear();
+        // 不分批加载：主路残留的 `has_more` 不属于本模式，留着会让翻页 / 展开去走主路扩容。
+        state.has_more = false;
         self.reset_candidate_view(state);
+        state.overlay_forms = Default::default();
         let prefix = format!("{}{}", state.temp_pinyin_prefix, state.committed_text);
         if state.temp_pinyin_buffer.is_empty() {
             state.preedit = prefix;
@@ -407,6 +410,8 @@ impl Coordinator {
         } else {
             result.shadow_code.clone()
         };
+        // 编码栏跟随高亮用的各形态；候选排好后按高亮（初始即首选）重算，见本函数末尾。
+        state.overlay_forms = crate::coordinator::OverlayPreeditForms::of(&result);
         let display = if result.preedit_display.is_empty() {
             state.temp_pinyin_buffer.clone()
         } else {
@@ -429,6 +434,7 @@ impl Coordinator {
         // 供跨来源档位判「消费整串」与「码 == 输入」。缓冲恒 ASCII，字节长度与 `consumed_length` 同域。
         let input_str = state.temp_pinyin_buffer.clone();
         let mut candidates = result.candidates;
+        wind_candidate::drop_corrected_duplicates(&mut candidates);
         // mixed=false：临拼是纯拼音 overlay，不存在码表/拼音跨来源竞争。
         candidates.sort_by(|a, b| {
             crate::handle_candidate::candidate_display_order(a, b, ignore_weight, false, &input_str)
@@ -479,6 +485,8 @@ impl Coordinator {
             &mut candidates[..rerank_len],
             &state.temp_pinyin_buffer,
         );
+        // 纠错候选不占首选（D6），与主路径同位：重排之后、候选调整之前。
+        wind_candidate::protect_top_from_corrected(&mut candidates, input_str.len());
         // 候选调整（置顶 / 隐藏）：位置与主路径同序，在词频重排之后、简繁展开之前。
         //
         // ⚠️ 此前这一步**整段缺席**（不是归属取错）：规则写得进去、临拼永远读不出来，
@@ -497,6 +505,9 @@ impl Coordinator {
         state.candidates = candidates;
         // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
         self.expand_s2t_variants(state);
+        // 编码栏按排序后的首选（之后随高亮）选形态，同主路 `sync_preedit_to_highlight`。
+        // 引擎的 `preedit_display` 跟的是**引擎序**首选，上面按界面序重排后未必还是它。
+        self.sync_preedit_to_highlight(state);
     }
 
     /// 临时拼音选词 —— 组合区逐步转换（C）。部分匹配并入 committed 前缀留模式内（不上屏）；
@@ -882,13 +893,22 @@ impl Coordinator {
                     Self::commit_action(out, true)
                 }
             }
-            keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
+            // 展开态下 0 选第 10 格（序号顺延时标「0」的那格）；收起态的 0 不在此臂。
+            keymap::VK_0..=keymap::VK_9
+                if data.modifiers & MOD_SHIFT == 0
+                    && (data.key_code != keymap::VK_0 || Self::grid_active(state)) =>
+            {
                 // 数字键选当前页第 N 个
+                let off = if data.key_code == keymap::VK_0 {
+                    9
+                } else {
+                    (data.key_code - 0x31) as usize
+                };
                 let (start, end) = self.select_range(state);
-                let idx = start + (data.key_code - 0x31) as usize;
+                let idx = start + off;
                 if idx < end {
                     let cand = state.candidates[idx].clone();
-                    self.commit_temp_pinyin_selected(state, &cand, (data.key_code - 0x31) as i32)
+                    self.commit_temp_pinyin_selected(state, &cand, off as i32)
                 } else {
                     KeyAction::Consumed
                 }

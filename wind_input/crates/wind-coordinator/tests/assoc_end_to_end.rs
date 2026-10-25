@@ -217,6 +217,105 @@ fn selecting_assoc_commits_only_the_suffix() {
     );
 }
 
+/// ★ 智能联想里前缀延伸候选**只显示补出的那一截**（「中」→「国」，不是「中国」），
+/// 与同栏的下一词、标点同一口径；选中上屏的正是显示的那一截。
+///
+/// 对照用同一份词库的词语联想：它显示整词，去掉已在屏上的上文、按智能联想的口径筛过
+/// （补出部分不超过 `SMART_PREFIX_TAIL_MAX` 字、最多 `SMART_PREFIX_CAP` 条）后应与智能联想
+/// 逐条相同（桌面基线标点联想关、无历史，两档出的都只有前缀词）。
+#[test]
+fn smart_assoc_shows_only_the_continuation() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let word = coord("word", "wubi86_pinyin");
+    press(&word, "q");
+    let first = commit_with_space(&word);
+    let full = assoc_texts(&word);
+    assert!(!full.is_empty(), "前提：词语联想非空");
+    let expected: Vec<String> = full
+        .iter()
+        .map(|w| {
+            w.strip_prefix(&first)
+                .expect("词语联想以上文开头")
+                .to_string()
+        })
+        .filter(|t| t.chars().count() <= wind_assoc::SMART_PREFIX_TAIL_MAX)
+        .take(wind_assoc::SMART_PREFIX_CAP)
+        .collect();
+
+    // 关掉下一词源：本条只测前缀词的显示口径（下一词另见 `smart_assoc_brings_next_words`）
+    let smart = coord_tweak("smart", "wubi86_pinyin", |c| {
+        c.input.association.bigram = false
+    });
+    press(&smart, "q");
+    assert_eq!(commit_with_space(&smart), first, "前提：两档上屏同一个字");
+    let shown = assoc_texts(&smart);
+    assert_eq!(shown, expected, "智能联想只显示补出的那一截");
+
+    let out = match smart.handle_key_event(&key_event(0x31)) {
+        KeyAction::InsertText { text, .. } => text,
+        KeyAction::CommitThenDeferComposition { commit_text, .. } => commit_text,
+        other => panic!("数字键该上屏联想候选，实得 {other:?}"),
+    };
+    assert_eq!(out, shown[0], "上屏的就是显示的那一截");
+}
+
+/// ★ 智能联想出「下一词」（离线蒸馏表 `data/assoc/assoc_bigram.txt`）：上屏「我」后首位是
+/// 词内接续「们」（逐字打字最常要的），紧跟着是下一词「的」，名额用满。
+#[test]
+fn smart_assoc_brings_next_words() {
+    let dir = data_dir();
+    if !dict_ready(&dir) || !dir.join("assoc/assoc_bigram.txt").exists() {
+        eprintln!("!!! 跳过：build_dev 词库或下一词表不存在");
+        return;
+    }
+    let c = coord("smart", "wubi86_pinyin");
+    press(&c, "q");
+    assert_eq!(commit_with_space(&c), "我", "前提：q 上屏「我」");
+    let shown = assoc_texts(&c);
+    assert_eq!(shown.len(), 9, "名额用满：{shown:?}");
+    assert_eq!(
+        &shown[..2],
+        ["们", "的"],
+        "接续与下一词按概率混排：{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|t| t.starts_with('我')),
+        "智能联想不显示带上文的整词：{shown:?}"
+    );
+}
+
+/// ★ 宿主报了光标前文：逐字上屏「今」「天」，下一词按「今天」接，而不是按「天」。
+#[test]
+fn next_words_borrow_from_preceding_text() {
+    let dir = data_dir();
+    if !dict_ready(&dir) || !dir.join("assoc/assoc_bigram.txt").exists() {
+        eprintln!("!!! 跳过：build_dev 词库或下一词表不存在");
+        return;
+    }
+    let c = coord("smart", "wubi86_pinyin");
+    press(&c, "gdi");
+    assert_eq!(commit_with_space(&c), "天", "前提：gdi 上屏「天」");
+    let alone = assoc_texts(&c);
+    assert!(
+        !alone.iter().any(|t| t == "早上"),
+        "没有前文：按「天」接 {alone:?}"
+    );
+
+    let c = coord("smart", "wubi86_pinyin");
+    c.set_preceding_text("好的，今");
+    press(&c, "gdi");
+    assert_eq!(commit_with_space(&c), "天");
+    let joined = assoc_texts(&c);
+    assert!(
+        joined.iter().any(|t| t == "早上"),
+        "按「今天」接：{joined:?}"
+    );
+}
+
 /// 真机那次的确切复现：混输方案打 `lwty` 空格上屏，看联想出不出。
 ///
 /// 用户 2026-08-16 11:51 的日志里就是这一串（buf='lwty' → 2 候选 → 空格）。
@@ -879,6 +978,56 @@ fn assoc_ctrl_combo_closes_window_and_reaches_host() {
     assert!(assoc_texts(&c).is_empty(), "Ctrl+A 之后联想窗该收起");
 }
 
+/// ★ 联想态的候选热键（出厂置顶 Ctrl+数字、删除 Ctrl+Shift+数字）同样收组合 + 交还宿主。
+///
+/// 这组键在候选可见时被 TSF 用 RegisterHotKey 拦成系统热键、经 WM_HOTKEY 派发，原键已被
+/// 系统吃下；TSF 只在响应是「交还宿主」类时才注入原键。这里回 `Consumed` 就是丢键
+/// （浏览器 Ctrl+1 切标签没反应）。
+#[test]
+fn assoc_candidate_hotkeys_close_window_and_reach_host() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let c = coord_tweak("word", "wubi86_pinyin", |cfg| {
+        cfg.keys.pin_candidate = "ctrl+number".into();
+        cfg.keys.delete_candidate = "ctrl+shift+number".into();
+    });
+    for (mods, name) in [(MOD_CTRL, "Ctrl+1"), (MOD_CTRL | MOD_SHIFT, "Ctrl+Shift+1")] {
+        enter_assoc(&c);
+        match c.handle_key_event_policed(&key_event_mods(0x31, mods)) {
+            KeyAction::ClearCompositionThenPassThrough => {}
+            other => panic!("联想态 {name} 应收组合 + 交还宿主，实得 {other:?}"),
+        }
+        assert!(assoc_texts(&c).is_empty(), "{name} 之后联想窗该收起");
+    }
+}
+
+/// 对照：联想态开着 `input.alt_commit` 时 Alt+数字 仍归输入法（上屏该候选的拼音），
+/// 不交还宿主——TSF 的注入只认「交还宿主」类响应，这条不受影响。
+#[test]
+fn assoc_alt_digit_stays_with_alt_commit() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        eprintln!("!!! 跳过：build_dev 词库不存在");
+        return;
+    }
+    let c = coord_tweak("word", "wubi86_pinyin", |cfg| {
+        cfg.input.alt_commit = "pinyin".into();
+        cfg.keys.pin_candidate = "ctrl+number".into();
+        cfg.keys.delete_candidate = "ctrl+shift+number".into();
+    });
+    enter_assoc(&c);
+    match c.handle_key_event_policed(&key_event_mods(0x31, MOD_ALT)) {
+        KeyAction::InsertText { text, .. } => {
+            assert!(!text.is_empty(), "联想态 Alt+1 应上屏该候选的拼音")
+        }
+        other => panic!("联想态 Alt+1 应由 alt_commit 上屏，实得 {other:?}"),
+    }
+    assert!(assoc_texts(&c).is_empty(), "Alt+1 上屏后联想窗该收起");
+}
+
 /// ★★★ **用户报障**：联想窗弹出时按 Shift+字母想打英文，字母却落进了中文码表缓冲。
 ///
 /// 根因是 `try_activate_mode` 开头那句联想让位**让过头了**：它本意只为保住 `;`/`'` 的
@@ -1121,4 +1270,60 @@ fn assoc_yields_custom_letter_select_key() {
         host_visible(&idle.handle_key_event(&key_event(0x5A))),
         "该与联想窗不在时按 `z` 一致"
     );
+}
+
+/// 常用单字上屏后的联想（手机配置：智能、持续、带标点）。测量工具，手动跑看输出：
+///
+/// ```text
+/// cargo test -p wind-coordinator --test assoc_end_to_end common_char_dump -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "测量工具：打印常用字的联想，手动跑"]
+fn common_char_dump() {
+    let dir = data_dir();
+    if !dict_ready(&dir) {
+        return;
+    }
+    let c = coord_tweak("smart", "pinyin", |cfg| {
+        cfg.input.association.mode = "continuous".to_string();
+        cfg.input.association.punct = true;
+    });
+    for (code, want) in [
+        ("wo", "我"),
+        ("de", "的"),
+        ("da", "大"),
+        ("shi", "是"),
+        ("ni", "你"),
+        ("ta", "他"),
+        ("zai", "在"),
+        ("le", "了"),
+        ("bu", "不"),
+        ("you", "有"),
+        ("yi", "一"),
+        ("zhe", "这"),
+        ("hao", "好"),
+        ("jiu", "就"),
+        ("ye", "也"),
+        ("dou", "都"),
+        ("hen", "很"),
+        ("yao", "要"),
+        ("hui", "会"),
+        ("shuo", "说"),
+        ("ren", "人"),
+        ("dao", "到"),
+        ("shang", "上"),
+        ("ge", "个"),
+        ("zhong", "中"),
+        ("lai", "来"),
+        ("xiao", "小"),
+        ("men", "们"),
+        ("na", "那"),
+        ("he", "和"),
+    ] {
+        c.handle_key_event(&key_event(0x1B));
+        press(&c, code);
+        let out = commit_with_space(&c);
+        let mark = if out == want { "" } else { " ⚠" };
+        println!("{out}{mark}\t{}", assoc_texts(&c).join(" "));
+    }
 }

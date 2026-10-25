@@ -108,6 +108,20 @@ const AFTER_HAN: &[&str] = &["，", "。", "、", "？", "！", "：", "；"];
 /// 这是移动端体感差异最明显的一处：触屏切到符号键盘打一个「年」很贵。
 const AFTER_DIGIT: &[&str] = &["年", "月", "日", "元", "个", "点", "%", "℃"];
 
+/// 语气词结尾时，句末最可能接的标点；不是语气词结尾返回 `None`。
+///
+/// 这是规则表里**唯一看字的地方**：「吗→？」本是要语言模型才区分得了的语气，但语气词
+/// 就这么十来个，写死比等模型划算。用户反馈（2026-10-22）：「吗」后联想首位是「的」
+/// （网络语料里的「吗的」），问号排在很后面。
+pub fn sentence_particle_punct(text: &str) -> Option<&'static str> {
+    match text.chars().next_back()? {
+        '吗' | '么' | '呢' => Some("？"),
+        '啊' | '呀' | '啦' | '哇' | '哦' | '嘛' | '呗' | '哈' | '喔' => Some("！"),
+        '吧' => Some("。"),
+        _ => None,
+    }
+}
+
 /// 静态规则表实现的标点联想源。
 ///
 /// 无状态、无 IO；分数只用于**源内**排序，取「表内位置的倒序」，与其它源不可比。
@@ -116,12 +130,17 @@ pub struct PunctRules;
 
 impl AssocProvider for PunctRules {
     fn suggest(&self, ctx: &AssocContext<'_>, limit: usize) -> Vec<AssocHit> {
-        let list = match tail_kind(ctx.text) {
-            TailKind::Han => AFTER_HAN,
-            TailKind::Digit => AFTER_DIGIT,
+        let mut list: Vec<&str> = match tail_kind(ctx.text) {
+            TailKind::Han => AFTER_HAN.to_vec(),
+            TailKind::Digit => AFTER_DIGIT.to_vec(),
             // 标点后再接标点、以及英文/空白结尾，一律不联想。
             TailKind::Punct | TailKind::Other => return Vec::new(),
         };
+        // 语气词结尾：句末那个标点提到最前（「吗」→「？」）
+        if let Some(p) = sentence_particle_punct(ctx.text) {
+            list.retain(|x| *x != p);
+            list.insert(0, p);
+        }
         list.iter()
             .take(limit)
             .enumerate()
@@ -144,6 +163,8 @@ mod tests {
     fn ctx(text: &str) -> AssocContext<'_> {
         AssocContext {
             text,
+            preceding: "",
+            char_wise: false,
             boundary_broken: false,
         }
     }
@@ -171,6 +192,22 @@ mod tests {
         let out = PunctRules.suggest(&ctx("2026"), 3);
         let texts: Vec<_> = out.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(texts, ["年", "月", "日"]);
+    }
+
+    /// 语气词结尾：句末标点提到最前，其余顺序不变。
+    #[test]
+    fn particle_tail_puts_its_punct_first() {
+        let texts = |t| {
+            PunctRules
+                .suggest(&ctx(t), 3)
+                .into_iter()
+                .map(|h| h.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts("好吗"), ["？", "，", "。"]);
+        assert_eq!(texts("好啊"), ["！", "，", "。"]);
+        assert_eq!(texts("走吧"), ["。", "，", "、"]);
+        assert_eq!(texts("你好"), ["，", "。", "、"], "非语气词不变");
     }
 
     /// 标点后不再联想，否则会出现「。」后面接「，」。

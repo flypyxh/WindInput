@@ -6,6 +6,9 @@ use crate::styled::{SpanStyle, StyledText};
 #[derive(Debug, Clone)]
 pub struct CandidateItem {
     pub text: String,
+    /// 显示用正文（带分段样式）；空 = 按 `text` 显示。目前只有模糊音提示产出它：「苹(ping)果」，
+    /// `(ping)` 段角色 `pinyin_hint`。`text` 仍是「苹果」，上屏等非显示用途照旧读它。
+    pub text_styled: StyledText,
     pub code: String,
     /// 序号标签（如 "1" / "a"）；空则按位置自动用数字编号
     pub label: String,

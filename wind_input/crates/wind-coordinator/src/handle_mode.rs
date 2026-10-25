@@ -588,6 +588,18 @@ impl Coordinator {
             .unwrap_or(true)
     }
 
+    /// 本 mix 实例的数字透镜是否拿小写字母作选词键（`MixModeConfig::numeric_letter_select`，
+    /// 缺省 true）。①的字母臂与候选窗的字母序号标签都问这里。
+    pub(crate) fn mix_numeric_letter_select(&self, idx: u8) -> bool {
+        self.rt()
+            .config
+            .schema
+            .mix_modes
+            .get(idx as usize)
+            .map(|m| m.numeric_letter_select)
+            .unwrap_or(true)
+    }
+
     /// 二三候选键（`keys.select_key_groups`，默认 `;` `'`）在本实例上**是否仍作选词键**。
     ///
     /// 即「自由输入没开」或「开了但配置为不夺取」。
@@ -1055,7 +1067,17 @@ impl Coordinator {
     ///
     /// 简繁：先转**整串**再取尾部——OpenCC 按词转换带上下文，后段单独转与整串转可能不同，
     /// 显示就会与上屏对不上。转换改变了字数（罕见）时退回后段单独转。
+    ///
+    /// 智能联想的前缀延伸候选（「中」→「中国」）只显示补出的那一截「国」，与同栏的下一词、
+    /// 标点同一口径（见 [`wind_assoc::AssocKind::shows_continuation`]）；`text` 仍是整词，
+    /// 联想历史照旧按它记。显示的正是上屏的那一截，故直接走上屏的转换。
     pub(crate) fn cand_display_text(&self, state: &State, c: &Candidate) -> String {
+        if c.source == wind_candidate::CandidateSource::Assoc
+            && let Some(tail) = &c.commit_override
+            && self.assoc_config().kind.shows_continuation()
+        {
+            return self.maybe_convert(state, tail);
+        }
         let full = self.cand_convert_text(state, c);
         if !Self::split_back_only(state, c) {
             return full;
@@ -1067,6 +1089,90 @@ impl Coordinator {
         } else {
             self.maybe_convert(state, &c.display_text)
         }
+    }
+
+    /// 候选的正确拼音提示按来源勾选（`hint`）过滤后换算到显示文字 `display`
+    /// （[`Self::cand_display_text`] 的结果）上；没有勾选来源的提示、或显示文字与引擎文字字数
+    /// 对不上（简繁转换改了字数）⇒ `None`。`tone` 有值（`hint.tone` 开）时提示换成带调读音。
+    ///
+    /// 逆切分次选只显示后段时，字数要与引擎的后段（`display_text`）相同才按后段扣前段——
+    /// [`crate::hint_text::remap_hints`] 单凭字数分不清这两种情形，在这里先判掉。
+    pub(crate) fn cand_display_hints(
+        &self,
+        state: &State,
+        c: &Candidate,
+        display: &str,
+        hint: &wind_config::PinyinHintConfig,
+        tone: Option<&wind_reverse::ReverseLookup>,
+    ) -> Option<Vec<wind_candidate::PinyinHint>> {
+        let kept = crate::hint_text::enabled_hints(hint, &c.meta.pinyin_hints);
+        if kept.is_empty() {
+            return None;
+        }
+        let engine_shown = if Self::split_back_only(state, c) {
+            &c.display_text
+        } else {
+            &c.text
+        };
+        if display.chars().count() != engine_shown.chars().count() {
+            return None;
+        }
+        let hints = match tone {
+            Some(reverse) => crate::hint_text::toned_hints(&c.text, &kept, reverse),
+            None => kept,
+        };
+        crate::hint_text::remap_hints(&c.text, display, &hints).filter(|h| !h.is_empty())
+    }
+
+    /// `state.candidates[start..end]` 逐条的带提示正文（空 = 不标），按 `hint.scope` 定哪些
+    /// 候选标；`hint.enabled` 关着一律不标（引擎可能因模板引用 `${correct_pinyin}` 照样算了提示）。
+    /// 来源过滤在 `styled` 里做（[`Self::cand_display_hints`]），`first` 因此在过滤后的合并结果上取。
+    ///
+    /// `styled(c)` 是该候选在**宿主自己的显示形态**（截断、前缀标注…）下的带提示正文——桌面候选窗
+    /// 与移动端拉取窗口显示形态不同，各自传入，标哪条的规则只此一份。`first` 只标最终界面顺序里
+    /// 第一个 `styled` 非空的候选（换算或截断丢光了提示的顺延给下一条）：在排好序的完整列表上找，
+    /// 与翻页 / 窗口无关，之后的永不带提示；`all` 每个都标。
+    pub(crate) fn pinyin_hint_texts(
+        &self,
+        state: &State,
+        hint: &wind_config::PinyinHintConfig,
+        start: usize,
+        end: usize,
+        styled: impl Fn(&Candidate) -> wind_ui_types::StyledText,
+    ) -> Vec<wind_ui_types::StyledText> {
+        if !hint.enabled {
+            return vec![Default::default(); end.saturating_sub(start)];
+        }
+        let hinted = |c: &Candidate| {
+            if !c
+                .meta
+                .pinyin_hints
+                .iter()
+                .any(|h| crate::hint_text::hint_kind_enabled(hint, h.kind))
+            {
+                Default::default()
+            } else {
+                styled(c)
+            }
+        };
+        let first = match hint.scope {
+            wind_config::HintScope::All => None,
+            wind_config::HintScope::First => {
+                Some(state.candidates.iter().enumerate().find_map(|(at, c)| {
+                    let s = hinted(c);
+                    (!s.is_empty()).then_some((at, s))
+                }))
+            }
+        };
+        state.candidates[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match &first {
+                None => hinted(c),
+                Some(Some((at, s))) if *at == start + i => s.clone(),
+                Some(_) => Default::default(),
+            })
+            .collect()
     }
 
     /// 逆切分次选的 `(被隐藏的前段, 所见的后段)`；不是只显示后段的候选 ⇒ `("", text)`。
@@ -2130,7 +2236,8 @@ impl Coordinator {
     }
 
     pub(crate) fn mix_select(&self, state: &mut State, page_offset: usize) -> KeyAction {
-        let (start, end) = self.page_range(state);
+        // 展开态下序号顺延到下一行，数字键跟着走（同临拼）。
+        let (start, end) = self.select_range(state);
         let gi = start + page_offset;
         if gi >= end {
             return KeyAction::Consumed;
@@ -2357,7 +2464,14 @@ impl Coordinator {
     /// 数字透镜只取内置来源（表达式无拼音/英文意义），文本透镜只取真实方案，避免互相污染。
     /// **成员顺序即候选优先级**——把 `quick_input.calc` 排在最前即得「计算结果作首选」。
     pub(crate) fn update_mix_candidates(&self, state: &mut State) {
+        self.refill_mix_candidates(state);
+        self.grid_resume(state);
+    }
+
+    fn refill_mix_candidates(&self, state: &mut State) {
         state.candidates.clear();
+        // 不分批加载：主路残留的 `has_more` 不属于本模式，留着会让翻页 / 展开去走主路扩容。
+        state.has_more = false;
         self.reset_candidate_view(state);
         state.mix_repeat = false;
         // 组合区 = 显示态前缀 + 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
@@ -2367,6 +2481,7 @@ impl Coordinator {
         );
         // 默认主体 = 原始缓冲；文本透镜若给出音节分隔显示，下方会覆盖为该显示串。
         state.overlay_body = state.mix_buffer.clone();
+        state.overlay_forms = Default::default();
         if state.mix_buffer.is_empty() {
             self.inject_mix_repeat_candidate(state);
             return;
@@ -2413,6 +2528,8 @@ impl Coordinator {
         // 形态：用户把快符 `kf` 排在 `$primary_pinyin` 之前，拼音的拆分串就永远轮不上，
         // 表现为「快捷输入里完全没有拆分显示」。成员顺序管的是候选优先级，管不到这里。
         let mut text_display: Option<String> = None;
+        // 给出 `text_display` 的那个成员的各形态，供编码栏跟随高亮（同临拼）。
+        let mut text_forms: Option<crate::coordinator::OverlayPreeditForms> = None;
         for member in &members {
             if let Some(src) = wind_quick_input::QuickSource::from_member(member) {
                 if !numeric {
@@ -2563,6 +2680,7 @@ impl Coordinator {
                     && result.preedit_display != state.mix_buffer
                 {
                     text_display = Some(result.preedit_display.clone());
+                    text_forms = Some(crate::coordinator::OverlayPreeditForms::of(&result));
                 }
                 // ── 用户数据（词频 / 候选调整）：按**成员方案**归属，就地作用在本成员段内 ──
                 //
@@ -2608,6 +2726,12 @@ impl Coordinator {
                     mix_member_owner.as_deref(),
                     &mut member_cands,
                     &state.mix_buffer,
+                );
+                // 纠错候选不占首选（D6）：同主路 helper，放在重排之后、shadow 之前。
+                wind_candidate::drop_corrected_duplicates(&mut member_cands);
+                wind_candidate::protect_top_from_corrected(
+                    &mut member_cands,
+                    state.mix_buffer.len(),
                 );
                 self.apply_shadow_in(mix_member_owner.as_deref(), &mut member_cands, &shadow_code);
                 // 配额在**重排与候选调整之后**截取——这个顺序就是本次修复本身：先截再排，
@@ -2696,6 +2820,7 @@ impl Coordinator {
             state.preedit = format!("{}{}{}", state.mix_prefix, state.committed_text, disp);
             state.overlay_body = disp; // 供光标换算（含引擎插入的音节分隔符）
         }
+        state.overlay_forms = text_forms.unwrap_or_default();
         // 词组透镜下一条都没命中：给出所打原文兜底，与 [`MixLens::Free`] 同一个理由——
         // 候选窗空着时用户不知道自己打的这串还能不能上屏。
         //
@@ -2720,6 +2845,9 @@ impl Coordinator {
         self.apply_emoji_suggestions(&mut state.candidates);
         // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
         self.expand_s2t_variants(state);
+        // 编码栏按合并后的首选（之后随高亮）选形态：上面 `text_display` 取的是给出显示串的
+        // 那个成员的首选，合并后的首选未必是它。
+        self.sync_preedit_to_highlight(state);
     }
 
     /// Free 透镜下的**英文段**：缓冲是纯 ASCII 字母（Free 只因含大写才越界）、本实例含英文
@@ -2936,6 +3064,10 @@ impl Coordinator {
         ) {
             return act;
         }
+        // 展开态专属键（←→ / Esc / Tab）先于编码区光标与 Esc 臂，同临拼。
+        if let Some(act) = self.grid_key_action(state, data) {
+            return act;
+        }
         // 编码区光标移动（左右 / Home / End）。注：数字透镜下 -/= 等是输入字符，但方向键
         // 在两个透镜里都不是输入，故可在分派前统一拦截。
         if let Some(act) = self.overlay_cursor_key(state, data) {
@@ -3132,6 +3264,14 @@ impl Coordinator {
                     MixLens::Numeric if free_on && shift && is_letter => {
                         Some((b'A' + (data.key_code - keymap::VK_A) as u8) as char)
                     }
+                    // 关掉「数字透镜下字母选词」：字母一律字面（保留 Shift 形态），`;2fa`、
+                    // `;1.5x` 直接进缓冲。选词改由 `keys.quick_input_select` 与空格承担。
+                    MixLens::Numeric
+                        if is_letter && !self.mix_numeric_letter_select(state.mix_id) =>
+                    {
+                        let base = (data.key_code - keymap::VK_A) as u8;
+                        Some(if shift { b'A' + base } else { b'a' + base } as char)
+                    }
                     // 二三候选键（`;` `'`）在数字透镜下**必须让开**，交给第④步的选词判定。
                     //
                     // `mix_numeric_input_char` 收的是「一切非字母可打印字符」，比本透镜的
@@ -3211,6 +3351,9 @@ impl Coordinator {
                     // 上线后才暴露，因为在此之前这些符号本就走不进缓冲。
                     let sel = if lens == MixLens::Numeric {
                         is_letter.then(|| (data.key_code - keymap::VK_A) as usize)
+                    } else if !shift && data.key_code == keymap::VK_0 && Self::grid_active(state) {
+                        // 展开态下 0 选第 10 格（序号顺延时标「0」的那格）；收起态的 0 照旧。
+                        Some(9)
                     } else {
                         (!shift && (keymap::VK_1..=keymap::VK_9).contains(&data.key_code))
                             .then(|| (data.key_code - keymap::VK_1) as usize)
@@ -3243,15 +3386,33 @@ impl Coordinator {
                     // 任何成员都接不下数字，按⑤的判据它本就该是字面，退格一下即回（透镜是缓冲
                     // 的纯函数）。见 `text_only_mix_first_digit_is_literal`。
                     //
-                    // ⚠️ ④（配置的二三候选键）**刻意不加同样的判定**。它恰好在本守卫不生效时
-                    // 才可达 —— 两种情形：`free_input = off`（那时⑤本就走不到，加了也没用），
-                    // 或 `takes_select_keys = false`（用户明写的「这两个键归选词」，空候选下让
-                    // 它们改作字面等于推翻该配置）。后一种下 `;`/`'` 在零候选时确实还是死键，
-                    // 由 `select_keys_stay_dead_when_not_taken` 钉住。
-                    if let Some(off) = sel
-                        && !(free_on && state.candidates.is_empty())
-                    {
-                        return self.mix_select(state, off);
+                    // ⚠️ ④（配置的二三候选键）**刻意不加同样的判定**：它们只在 `free_input = off`
+                    // 或 `takes_select_keys = false` 时作选词键，后者是用户明写的「这两个键归
+                    // 选词」，空候选下让它们改作字面等于推翻该配置。`;`/`'` 在零候选时确实还是
+                    // 死键，由 `select_keys_stay_dead_when_not_taken` 钉住。
+                    //
+                    // ⚠️ 历史候选不算数：它是跨透镜的字面前缀补全，不是本透镜的产出。
+                    // 算进去的话 `.txt` 一旦进了历史，`;.` 就有了候选、`;.xlsx` 又打不出。
+                    //
+                    // ★ 本判据**不分 `free_input` 档**：`off` 下同样归字面（`;.xlsx` 打得出）。
+                    // 字面就地收进缓冲而不是落到⑤——⑤只对开着自由输入的实例生效；`off` 没有
+                    // Free 透镜，缓冲照旧按首字符定透镜，字母续打仍因零候选而归字面。
+                    if let Some(off) = sel {
+                        if !state
+                            .candidates
+                            .iter()
+                            .all(|c| c.id == crate::quick_history::QUICK_HISTORY_ID)
+                        {
+                            return self.mix_select(state, off);
+                        }
+                        if let Some(ch) = printable_char(data.key_code, shift) {
+                            preedit_cursor::BufEdit::new(
+                                &mut state.mix_buffer,
+                                &mut state.mix_cursor,
+                            )
+                            .insert(ch);
+                            return refresh(self, state);
+                        }
                     }
 
                     // ④ 配置二三候选键（默认 `;` `'`）。
