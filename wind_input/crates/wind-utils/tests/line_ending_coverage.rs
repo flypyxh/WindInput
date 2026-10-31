@@ -177,6 +177,12 @@ const DELEGATED: &[(&str, &str)] = &[
         "拿到的 header 来自 parse_comment_dict 已归一化的全文",
     ),
     ("lib.rs::declares_comment_column", "同上"),
+    // 误读表 YAML：入参已由 MisreadTable::parse 归一（孤立 \r 会让 meta 头与
+    // 列表体的切分整份算成一行），这里只对归一后的头做逐行检查。
+    (
+        "misread.rs::head_has_entries",
+        "入参来自 MisreadTable::parse 已 normalize_input 的全文",
+    ),
 ];
 
 /// 尚未处理、但**已经确认存在**的口子。清空它是目标，不是把它当摆设。

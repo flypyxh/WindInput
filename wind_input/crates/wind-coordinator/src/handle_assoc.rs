@@ -262,6 +262,20 @@ pub(crate) const fn use_mobile_overrides() -> bool {
     cfg!(target_os = "android")
 }
 
+/// 数字键此刻是否进编码缓冲（而不是选候选）。
+///
+/// 只有**移动端、英文方案、已在组码**三者同时成立才进：英文词里常带数字（mp3、h2o、win10），
+/// 软键盘上数字要上滑或切层才打得出，没人会拿它去选候选（点候选更顺手）。
+/// 中文方案不进：打完字接数字是常态，数字仍是「首选上屏 + 数字」（宿主侧处理）。
+/// 桌面不进：物理键盘上数字选词是长期习惯。
+pub(crate) const fn digit_enters_english_buffer(
+    mobile: bool,
+    composing: bool,
+    english: bool,
+) -> bool {
+    mobile && composing && english
+}
+
 /// 词语联想的取数源：词库里以上文为前缀的更长的词。
 ///
 /// ★ 显示整词、上屏只补剩余部分——`AssocHit::commit` 在这里填好，下游不再现算。
@@ -576,6 +590,7 @@ impl Coordinator {
             return false;
         }
         tracing::debug!(reason = ?why, n = state.candidates.len(), "退出联想态");
+        state.clear_comment_flips();
         state.candidates.clear();
         state.preedit.clear();
         self.reset_candidate_view(state);
@@ -612,6 +627,24 @@ impl Coordinator {
         let rt = self.rt();
         let mobile = use_mobile_overrides().then(|| &rt.config.mobile.association);
         AssocConfig::from_config(&rt.config.input.association, mobile)
+    }
+
+    /// 读一个联想布尔项：移动端取 `[mobile.association]`，桌面取 `[input.association]`。
+    fn assoc_flag(
+        &self,
+        base: impl Fn(&wind_config::AssociationConfig) -> bool,
+        mobile: impl Fn(&wind_config::MobileAssociationConfig) -> bool,
+    ) -> bool {
+        let rt = self.rt();
+        if use_mobile_overrides() {
+            mobile(&rt.config.mobile.association)
+        } else {
+            base(&rt.config.input.association)
+        }
+    }
+
+    fn assoc_select_keys_commit(&self) -> bool {
+        self.assoc_flag(|a| a.select_keys_commit, |m| m.select_keys_commit)
     }
 
     /// 按上文算联想候选（不改状态）。`maybe_enter_assoc` 与评测 / 诊断共用这一份。
@@ -699,6 +732,8 @@ impl Coordinator {
             return false;
         }
         tracing::debug!(n = hits.len(), kind = ?cfg.kind, mode = ?cfg.mode, "进入联想态");
+        // 上屏即关了上一个候选窗，其注释翻转不带进联想窗。
+        state.clear_comment_flips();
         // ★ 填进 **`candidates`**（而不是另建一份列表）——联想就是「没有输入缓冲的正常
         // 候选态」。放在这里，翻页 / 上下移高亮 / 二三候选键 / 数字选词 / 鼠标点选 / Esc
         // 取消全部自动可用，因为那些分支的门槛本来就只是「候选非空」。
@@ -1054,7 +1089,7 @@ impl Coordinator {
     /// 只给 keydown 消费的可打印选词键用（主路符号臂与字母臂）：让出后那一键照常往下走，
     /// 由既有分支收联想并出字 / 进模式——与联想态的其它标点同一条路，这里不另写出口。
     pub(crate) fn assoc_yields_select_key(&self, state: &State) -> bool {
-        state.assoc_active() && !self.rt().config.input.association.select_keys_commit
+        state.assoc_active() && !self.assoc_select_keys_commit()
     }
 
     /// 联想态的**回车**处置（`input.association.enter_cancels_only`，默认 `false` = 透传）。
@@ -1062,7 +1097,7 @@ impl Coordinator {
     /// 默认让回车穿过去：它是终结性动作，用户按它是要发送/换行，而联想窗是输入法自己弹的、
     /// 用户并没在选词。让一个「建议」吞掉一次回车，正事就被挡住了。
     pub(crate) fn assoc_enter(&self, state: &mut State) -> KeyAction {
-        let cancels_only = self.rt().config.input.association.enter_cancels_only;
+        let cancels_only = self.assoc_flag(|a| a.enter_cancels_only, |m| m.enter_cancels_only);
         self.assoc_dismiss_with(state, cancels_only)
     }
 
@@ -1072,7 +1107,8 @@ impl Coordinator {
     /// 却是**删掉刚上屏的字**——不可逆。联想窗弹出时用户的手正停在刚打完的字上，误触退格
     /// 若直接删字，代价远大于多按一次键。要这个行为的人可以开。
     pub(crate) fn assoc_backspace(&self, state: &mut State) -> KeyAction {
-        let cancels_only = self.rt().config.input.association.backspace_cancels_only;
+        let cancels_only =
+            self.assoc_flag(|a| a.backspace_cancels_only, |m| m.backspace_cancels_only);
         self.assoc_dismiss_with(state, cancels_only)
     }
 
@@ -1634,5 +1670,23 @@ mod tests {
             }
         }
         assert_eq!(label.as_deref(), Some(""), "联想态不该显示模式标记");
+    }
+
+    /// 数字进编码只在「移动端 + 英文 + 组码中」三者齐备时成立，缺一不可
+    #[test]
+    fn digit_enters_buffer_only_on_mobile_english_composing() {
+        assert!(digit_enters_english_buffer(true, true, true));
+        assert!(
+            !digit_enters_english_buffer(false, true, true),
+            "桌面数字照旧选词"
+        );
+        assert!(
+            !digit_enters_english_buffer(true, false, true),
+            "没在组码：数字原样出"
+        );
+        assert!(
+            !digit_enters_english_buffer(true, true, false),
+            "中文方案：顶屏 + 数字"
+        );
     }
 }

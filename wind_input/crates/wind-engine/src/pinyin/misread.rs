@@ -69,7 +69,10 @@ impl MisreadTable {
     /// 坏条目（缺字段、音节非纯字母、音节数与字数不等、错误读音与正确读音相同）warn 跳过；
     /// 列表体整体不是合法 YAML 时逐行解析，只丢坏的那几行。
     pub fn parse(src: &str, origin: &str) -> Self {
-        let (head, body) = split_head_body(src);
+        // 行尾守卫（`line_ending_coverage`）：用户在 Windows 记事本里维护的表常带 CRLF，
+        // 孤立 \r 会让逐行回退与 `head_has_entries` 把整份文件算成一行。
+        let normalized = wind_utils::text::normalize_input(src);
+        let (head, body) = split_head_body(&normalized);
         if head_has_entries(head) {
             warn!(
                 "误读表 {origin} 的 meta 头（`...` 之前）里有条目，这些条目不生效，应写在 `...` 之后"

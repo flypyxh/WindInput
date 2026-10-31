@@ -96,6 +96,19 @@ const SESSION_FUNCTION_KEYS: &[(&str, u32)] = &[
     ("lcontrol", VK_LCONTROL),
     ("rctrl", VK_RCONTROL),
     ("rcontrol", VK_RCONTROL),
+    // F1–F12：会话态绑功能（候选中按 F1 切换…）。与 `wind_config::hotkey::session_key_to_vk` 同步。
+    ("f1", 0x70),
+    ("f2", 0x71),
+    ("f3", 0x72),
+    ("f4", 0x73),
+    ("f5", 0x74),
+    ("f6", 0x75),
+    ("f7", 0x76),
+    ("f8", 0x77),
+    ("f9", 0x78),
+    ("f10", 0x79),
+    ("f11", 0x7A),
+    ("f12", 0x7B),
 ];
 
 /// 会话态键名 → [`SessionKey`]。大小写与首尾空白不敏感；不认的名字返回 `None`。
@@ -397,6 +410,11 @@ pub fn modifier_name_to_vk(name: &str) -> Option<u32> {
 /// 该 VK 是否为纯修饰键（四个连号，见常量定义处说明）。
 pub fn is_pure_modifier_vk(vk: u32) -> bool {
     (VK_LSHIFT..=VK_RCONTROL).contains(&vk)
+}
+
+/// 该 VK 是否为 Alt（左 / 右 / 不分左右）。不并进 [`is_pure_modifier_vk`]：Alt 不走修饰键轻敲那条路。
+pub fn is_alt_vk(vk: u32) -> bool {
+    matches!(vk, 0xA4 | 0xA5 | 0x12)
 }
 
 /// VK → 组合区前缀字符。无映射时返回 None（调用方自定默认）。

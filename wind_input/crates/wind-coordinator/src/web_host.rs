@@ -42,6 +42,14 @@ pub trait WebDataHost {
     fn sync_comment_dicts(&self);
     /// 词库自带 `comment` 列自动派生出的注释源（设置页据此列出只读条目）。
     fn auto_comment_sources(&self) -> Vec<crate::coordinator::AutoCommentSource>;
+    /// 随包内置注释词库清单（`system.comments.toml` 的 `[[dicts]]`）。
+    fn system_comment_dicts(&self) -> Vec<wind_config::comment_lib::BuiltinCommentDict>;
+    /// 出厂注释模板与分配（`system.comments.toml`）。
+    fn system_comments(&self) -> &wind_config::comment_lib::SystemComments;
+    /// 按当前配置合并好的注释模板库快照。
+    fn comment_library(&self) -> Arc<wind_config::comment_lib::CommentLibrary>;
+    /// 方案在注释分配表里的类型（`[ui.comment.assign.type]` 的键）。
+    fn comment_schema_type(&self, schema_id: &str) -> wind_config::comment_lib::SchemaType;
     fn sync_chaizi_assets(&self);
     /// 设置页「设为当前」直接切了引擎：通知宿主那是全局意图（按应用方案的全局方案随之更新），
     /// 见 `Coordinator::note_global_schema_set`。
@@ -185,12 +193,14 @@ pub trait WebDataHost {
     /// 会在加新变量时静默过时。
     fn quick_format_var_hints(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>;
 
-    /// 模板样例求值（设置页预览行，text-span-colors.md §11）：用固定样例按真实模板引擎渲染，
-    /// 附未知变量与内联色的位置。颜色按主题求值不在这里——wind-webdata 自己能加载主题。
+    /// 模板样例求值（设置页预览行，text-span-colors.md §11）：用固定样例（`sample`，取自
+    /// `template_preview::SAMPLES`）按真实模板引擎渲染，附未知变量与内联色的位置。颜色按主题
+    /// 求值不在这里——wind-webdata 自己能加载主题。
     fn template_sample(
         &self,
         template: &str,
         scene: &crate::template_preview::TemplateScene,
+        sample: &crate::template_preview::PreviewSample,
     ) -> crate::template_preview::TemplateSample;
 
     /// 新增一条用户自定义格式，返回分配到的 id。
@@ -231,8 +241,9 @@ impl WebDataHost for Coordinator {
         &self,
         template: &str,
         scene: &crate::template_preview::TemplateScene,
+        sample: &crate::template_preview::PreviewSample,
     ) -> crate::template_preview::TemplateSample {
-        crate::template_preview::sample(template, scene)
+        crate::template_preview::sample_with(template, scene, sample)
     }
     fn engine_mgr(&self) -> &EngineManager {
         &self.engine_mgr
@@ -266,6 +277,18 @@ impl WebDataHost for Coordinator {
     }
     fn auto_comment_sources(&self) -> Vec<crate::coordinator::AutoCommentSource> {
         Coordinator::auto_comment_sources(self)
+    }
+    fn system_comment_dicts(&self) -> Vec<wind_config::comment_lib::BuiltinCommentDict> {
+        self.system_comments.dicts.clone()
+    }
+    fn system_comments(&self) -> &wind_config::comment_lib::SystemComments {
+        &self.system_comments
+    }
+    fn comment_library(&self) -> Arc<wind_config::comment_lib::CommentLibrary> {
+        Coordinator::comment_lib(self)
+    }
+    fn comment_schema_type(&self, schema_id: &str) -> wind_config::comment_lib::SchemaType {
+        crate::comment::schema_type_of(&self.engine_mgr, schema_id)
     }
     fn sync_chaizi_assets(&self) {
         Coordinator::sync_chaizi_assets(self);

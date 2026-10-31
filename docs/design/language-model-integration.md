@@ -982,3 +982,19 @@ D 类标定的。挂上语法模型后 Viterbi 的 `log_prob` 里多了每个转
 CV 口语 2925 条里未命中 2291 条：**等长选错 2170**（`zf` 做法 → 政府、`mgl` 卖光了 → 没规律，
 简拼固有歧义，要靠更强的语言模型）、出得比期望长 75（完整音节被拆成声母：`deng` → 的那个，
 万象有同样毛病）、短 46（`ne` 女儿 → 呢）。没有结构性缺口；再往上要靠更大的模型或更好的词频。
+
+## 13. 总开关 `enabled`（2026-10-25）
+
+设置页要的是一个勾，而生效要 `weight` 与 `model` 两项都配，浮点和文件名做不成开关。于是加了
+`[schema.pinyin.grammar].enabled` 与 `[mobile.grammar].enabled`：
+
+- 生效判据收进 `PinyinGrammar::active()`：`enabled && weight != 0 && model 非空`，引擎只调它。
+- 结构体缺省 `enabled = true`，只做**否决**。桌面出厂 `data/config.toml` 写 `enabled = false`，同时
+  备好 `weight = 0.5` / `model = "wanxiang-mini.gram"`，所以设置页（拼音 → 候选行为）勾上即用；
+  手机端 `[mobile.grammar] enabled = true`，设置页在「方案 → 拼音」。
+- ⚠️ 缺省 true 只在单层成立：分层合并后出厂的 false 会盖住用户层没写的 `enabled`。
+  手写过 weight + model 的老配置靠 `migrate_grammar_enabled_value` 补 `enabled = true`
+  （`load` / `set_user_value` / `prune_user_config` 都跑）。边界：这类用户在设置页把开关关掉，
+  `enabled = false` 等于出厂值会被剪枝删掉、下次加载又被补回——要关只能删掉 weight / model 两行。
+- 设置页切换即时生效：`reload_from_config` 重读拼音配置并清引擎缓存，下一次转换按新开关重建
+  （模拟器实测：关着出「辆金苹果」，打开后下一句即出「公园」）。

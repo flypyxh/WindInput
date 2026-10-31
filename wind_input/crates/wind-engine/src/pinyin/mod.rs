@@ -861,7 +861,7 @@ fn should_promote_user_completion(
 pub struct Config {
     // 注：曾有 `show_code_hint: bool`。**已删** —— 引擎侧从未读过它，编码提示的门控
     // 早在 387ffa60「移除死状态 code_hint_cache」那次就改成协调器直接读全局配置了
-    // （见 `EngineManager::code_hint_source`），这个字段是那次重构漏下的残留：
+    // （后来编码来源整个并入注释分配，见设计 candidate-comment-templates §13.6），这个字段是那次重构漏下的残留：
     // manager 每次建引擎都老实赋值，而引擎内部一个消费点都没有。
     pub use_smart_compose: bool,
     /// 是否产出简拼候选（声母缩写，nh→你好）。默认 true = 历史行为（简拼此前恒开、无开关）。
@@ -5331,6 +5331,29 @@ impl Engine for PinyinEngine {
         self.contiguous_completed_from_start(&self.normalize_gate_input(prefix))
             .0
             .len()
+    }
+
+    fn shuangpin_units(&self, keys: &str) -> Vec<(String, usize, usize)> {
+        self.shuangpin
+            .as_ref()
+            .map(|c| {
+                c.convert(keys)
+                    .syllables
+                    .into_iter()
+                    .map(|s| (s.pinyin, s.raw_start, s.raw_end))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn fuzzy_siblings(&self, syllable: &str) -> Vec<String> {
+        if !self.fuzzy_config.any_enabled() {
+            return Vec::new();
+        }
+        fuzzy::FuzzyMatcher::fuzzy_variants(syllable, &self.fuzzy_config)
+            .into_iter()
+            .filter(|v| v != syllable && syllable::STANDARD_SYLLABLES.contains(&v.as_str()))
+            .collect()
     }
 
     fn shuangpin_full_syllable_count(&self, keys: &str) -> Option<usize> {

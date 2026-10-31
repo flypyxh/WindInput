@@ -80,7 +80,7 @@ const RUN_SHOWS: &[&str] = &["normal", "min", "max", "hidden"];
 /// 一致，否则同一条词条在 macOS 上写错值不报错、拿到 Windows 才失败——短语文件
 /// 是跟着用户跨机器走的，校验口径必须与平台无关。平台差异只体现在执行端
 /// （不支持的平台记 WARN 忽略），不体现在能不能写。
-fn check_enum(func: &str, key: &str, val: &str, allowed: &[&str]) -> Result<()> {
+pub(crate) fn check_enum(func: &str, key: &str, val: &str, allowed: &[&str]) -> Result<()> {
     if val.is_empty() || allowed.contains(&val) {
         return Ok(());
     }

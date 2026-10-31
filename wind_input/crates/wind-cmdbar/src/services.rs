@@ -161,6 +161,17 @@ pub trait ImeController: Send + Sync {
         let _ = on;
         anyhow::bail!("ime.set 不支持 target {target:?}")
     }
+    /// 把取值型目标设为指定值（`ime.set("comment", "detail")`）；与 [`Self::set`] 的分别是
+    /// 值不是 on / off。默认不支持。
+    fn set_value(&self, target: &str, value: &str) -> anyhow::Result<()> {
+        let _ = value;
+        anyhow::bail!("ime.set 不支持 target {target:?}")
+    }
+    /// 重新读取用户配置并应用（`ime.reload`），与设置端保存后的热重载同一条路径。
+    /// 读取失败（语法错误等）返回 `Err`。默认未支持（测试/精简宿主）。
+    fn reload_config(&self) -> anyhow::Result<()> {
+        anyhow::bail!("reload_config: 宿主未支持")
+    }
     /// 打开设置窗口的指定页面。`page` 为规范页 id（schema/input/keys/ui/dict/
     /// advanced/about），空串打开默认页。未知 id 由设置端忽略并落到默认页。
     ///
@@ -198,6 +209,16 @@ pub trait ImeController: Send + Sync {
 pub trait ConfigService: Send + Sync {
     fn get(&self, key: &str) -> anyhow::Result<String>;
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()>;
+    /// [`Self::set`] 的静默变体：写回成功后**不弹**宿主的「设置已更新」类确认提示，
+    /// 失败照常报。给 `$CC` 一条命令串多个动作、后面还有自己的自定义提示
+    /// （如 `wind.cli(…, ok="已关闭")`）的词条用，避免双提示。
+    ///
+    /// 默认实现忽略 `quiet` 直接转发 [`Self::set`]：宿主不区分时语义退化为
+    /// 「永远弹」，与改动前一致。
+    fn set_quiet(&self, key: &str, value: &str, quiet: bool) -> anyhow::Result<()> {
+        let _ = quiet;
+        self.set(key, value)
+    }
     /// 循环切换枚举或翻转 bool，返回新值。
     fn toggle(&self, key: &str) -> anyhow::Result<String>;
 }

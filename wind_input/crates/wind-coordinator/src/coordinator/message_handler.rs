@@ -7,7 +7,7 @@ use super::*;
 // 本模块自己导入，**不挂到 `coordinator.rs` 的那条 use 上**：那个文件是多方共同修改的热点，
 // 往它的 import 行搭一笔会让本功能的提交与别人的改动绑在同一个 hunk 上。
 use wind_config::app_compat::NewlineStyle;
-use wind_ipc::protocol::TOGGLE_PASSTHROUGH_KEY;
+use wind_ipc::protocol::{EVENT_MOD_DOWN, EVENT_MOD_UP, TOGGLE_PASSTHROUGH_KEY};
 
 impl Coordinator {
     /// 光标前最后一段已不是我们上屏的那段（宿主自己出了字、重放了键，或用户挪了光标）：撤销上屏
@@ -810,6 +810,16 @@ impl MessageHandler for Coordinator {
         Coordinator::composition_placeholder(self)
     }
 
+    fn syllable_separator(&self) -> Option<String> {
+        let active_none = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .is_none();
+        self.syllable_separator_for(active_none)
+    }
+
     fn preedit_uses_placeholder(&self) -> bool {
         // 非 app_inline（候选窗自显 preedit）→ 应用侧用占位空格，不重复显示编码。
         //
@@ -998,15 +1008,47 @@ impl MessageHandler for Coordinator {
         }
         if self.preedit_uses_placeholder() {
             action.with_composition_placeholder(self.composition_placeholder())
+        } else if let Some(sep) = self.syllable_separator() {
+            action.with_syllable_separator(&sep)
         } else {
             action
         }
     }
 
     fn handle_key_event(&self, data: &KeyEventData) -> KeyAction {
+        // 候选显示时如实上报的 Ctrl 按下 / 松开：服务端判单击，判出来再以原样的松开重进本函数
+        // （所以排在一切之前，也不经下面的统计 / 打字节奏 / 软键盘推送）。
+        if matches!(data.event_type, EVENT_MOD_DOWN | EVENT_MOD_UP) {
+            return self.handle_ctrl_raw(data);
+        }
         // 软键盘状态若在本次按键中变了，返回前推给 C++（吃键判定要用）。**声明在最开头**
         // 是必需的：局部变量逆序析构 ⇒ 它最后走 ⇒ 那时 `state` 的 MutexGuard 已经还了。
         let _sk_push = crate::handle_softkeyboard::SoftKeyboardPushOnDrop(self);
+        // 组字中的 Alt 按下 / 松开（平台只在组字中转发）：只管注释态，吃不吃都在这里定。
+        if keymap::is_alt_vk(data.key_code)
+            && matches!(data.event_type, EVENT_KEY_DOWN | EVENT_KEY_UP)
+        {
+            if data.event_type == EVENT_KEY_DOWN {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                crate::comment_switch::on_other_ctrl_key(&mut st.ctrl_track);
+            }
+            return self.handle_comment_alt(data);
+        }
+        // 按住档的功能键切换键：按下（含连发）与松开都在这里接走，排在下面「按住期间的别的键」之前。
+        if let Some(act) = self.handle_comment_fn_hold(data) {
+            return act;
+        }
+        // 按住切换键期间的别的键：照常处理完再收起详细态。声明位置的理由同 `_sk_push`。
+        // 同时弄脏 Alt / Ctrl 的单击判定（含 `WM_HOTKEY` 送来的 Ctrl+数字）。
+        let _hold_off = if data.event_type == EVENT_KEY_DOWN {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            crate::comment_switch::on_other_key(&mut st.alt_track);
+            crate::comment_switch::on_other_ctrl_key(&mut st.ctrl_track);
+            st.comment_hold_flip
+                .then(|| crate::comment::HoldOffOnDrop(self))
+        } else {
+            None
+        };
         // 每次按键开始重置统计标志：具体上屏路径调 record_commit 置位，
         // 顶层 record_input_stats 仅在未置位时兜底（对齐 Go handle_key_event 开头 reset）。
         self.stat_recorded
@@ -1021,6 +1063,11 @@ impl MessageHandler for Coordinator {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if !Self::has_input_session(&st) || st.assoc_active() {
                 st.grid_keep = false;
+            }
+            // 注释翻转只跟候选窗走：联想窗里翻的要留着（联想入口另行清掉上一次的）。
+            if !Self::has_input_session(&st) {
+                st.clear_comment_flips();
+                st.alt_track = None;
             }
         }
 
@@ -1251,6 +1298,9 @@ impl MessageHandler for Coordinator {
                 if let Some(status) = status {
                     return KeyAction::StatusUpdate(status);
                 }
+            } else if let Some(act) = self.handle_comment_ctrl_up(data) {
+                // 注释切换键（Ctrl 单击）排在以上各功能之后：撞键时它们优先。
+                return act;
             }
             return KeyAction::PassThrough;
         }
@@ -1273,6 +1323,16 @@ impl MessageHandler for Coordinator {
         let norm_hash = calc_key_hash(norm_mods, data.key_code);
         if let Some(action) = self.rt().compiled_hotkeys.match_key_down(norm_hash)
             && !action.is_empty()
+            // 裸 F 键在英文模式归宿主（TSF 靠策略位不吃；mac / Linux 整体转发，在这里挡）。
+            && !(hotkey::bare_function_key_needs_chinese(data.key_code, norm_mods, action)
+                && !self.is_chinese_mode())
+            // 组字中，会话表里绑了同一个裸 F 键（如出厂注释切换键 F1）时，会话优先：
+            // 全局 `key_actions` 里的 F 键绑定只管空闲态。
+            && !(hotkey::is_bare_function_key(data.key_code, norm_mods)
+                && self.has_active_session()
+                && self
+                    .session_action_for(data.key_code, data.modifiers & MOD_SHIFT != 0, true)
+                    .is_some())
         {
             debug!(
                 "Hotkey matched (key_down): {} (0x{:08X})",
@@ -1892,6 +1952,19 @@ impl MessageHandler for Coordinator {
                     KeyAction::PassThrough
                 }
             }
+            // 移动端英文方案组码中：数字是词的一部分（mp3、h2o、win10），进编码而不是选词。
+            // 判据见 `handle_assoc::digit_enters_english_buffer`；桌面与中文方案不进此臂，数字照旧选词。
+            keymap::VK_0..=keymap::VK_9
+                if data.modifiers & MOD_SHIFT == 0
+                    && crate::handle_assoc::digit_enters_english_buffer(
+                        crate::handle_assoc::use_mobile_overrides(),
+                        !state.input_buffer.is_empty(),
+                        self.engine_mgr.active_is_english(),
+                    ) =>
+            {
+                let digit = (b'0' + (data.key_code - keymap::VK_0) as u8) as char;
+                self.accumulate_code_char(&mut state, digit, digit)
+            }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
                 // 数字键 1-9 选当前页第 N 个候选；越界按 input.overflow.number_key 处理
                 // （ignore 吞键 / commit 上屏高亮 / commit_and_input 顶字+数字，对齐 Go）。
@@ -2015,12 +2088,30 @@ impl MessageHandler for Coordinator {
                         KeyAction::Consumed
                     }
                 } else {
+                    // 手机端拼音：← 按音节跳（电脑端仍按字母，见 `query_cut` 的说明）。
+                    // 拆分串对不回缓冲（双拼等）→ None，退回按字母。
+                    let syllable_jump = (data.key_code == keymap::VK_LEFT
+                        && crate::handle_candidate::cursor_by_syllable()
+                        && self.engine_mgr.is_pinyin())
+                    .then(|| {
+                        let split = self
+                            .engine_mgr
+                            .convert(&state.input_buffer, 1)
+                            .preedit_pinyin;
+                        preedit_cursor::syllable_spans(&state.input_buffer, &split)
+                    })
+                    .flatten();
                     let st = &mut *state;
+                    if let Some(spans) = &syllable_jump {
+                        st.input_cursor_pos =
+                            preedit_cursor::syllable_left(spans, st.input_cursor_pos);
+                    }
                     let mut ed = preedit_cursor::BufEdit::new(
                         &mut st.input_buffer,
                         &mut st.input_cursor_pos,
                     );
                     let moved = match data.key_code {
+                        keymap::VK_LEFT if syllable_jump.is_some() => true,
                         keymap::VK_LEFT => ed.move_left(),
                         keymap::VK_RIGHT => ed.move_right(),
                         keymap::VK_HOME => ed.home(),
@@ -2030,6 +2121,10 @@ impl MessageHandler for Coordinator {
                         // 光标移动**不重算候选**（不调 update_candidates）：光标不参与引擎查询，
                         // 候选与 preedit 文本均不变，只是 caret 位置变了。但仍须 notify_ui_update
                         // ——自绘编码栏要据新 caret 重画插入符（"不重算候选" ≠ "不刷新 UI"）。
+                        // 手机端例外：光标在中间时候选只查光标前一段（`query_cut`），移动后必须重算。
+                        if crate::handle_candidate::cursor_by_syllable() {
+                            self.update_candidates(&mut state);
+                        }
                         let display = state.preedit.clone();
                         let caret_pos = self.composition_caret(&state);
                         self.notify_ui_update(&state);
@@ -2875,10 +2970,13 @@ impl MessageHandler for Coordinator {
         // 会伤到「没在用输入法的时刻」的故障方向，必须在最宽的路径上归零。
         // 与 menu_close 同理放在 stale 判定之前：陈旧失焦同样证明用户动了别处。
         wind_keys::capslock_hook::set_should_eat(false);
+        wind_keys::capslock_hook::set_alt_gate(0);
+        wind_keys::capslock_hook::set_alt_pid(0);
         // 关菜单**先于** stale 判定与 reason 分流：菜单的生命周期与输入态无关，
         // 陈旧失焦/噪声层失焦同样证明用户动了别处。详见 menu_close_on_focus_change。
         self.menu_close_on_focus_change("focus_lost");
         self.close_softkeyboard_on_focus_change("focus_lost");
+        self.reset_comment_alt();
         if self.is_stale_focus_event(client_token, "handle_focus_lost") {
             return;
         }
@@ -3171,6 +3269,7 @@ impl MessageHandler for Coordinator {
         // （非陈旧路径的完整清理），两处幂等叠加无副作用。
         self.menu_close_on_focus_change("ime_deactivated");
         self.close_softkeyboard_on_focus_change("ime_deactivated");
+        self.reset_comment_alt();
         // 与 focus_lost 同源的乱序风险：切走本输入法时旧宿主的 IME_DEACTIVATED 同样可能
         // 晚于新宿主的 focus_gained 到达（两者都是 fire-and-forget 异步写）。
         if self.is_stale_focus_event(client_token, "handle_ime_deactivated") {

@@ -13,12 +13,13 @@ pub fn specs() -> Vec<FuncSpec> {
         "dict.add"        : Dict    (1, 2) effect => fn_dict_add,    "把文本加入用户词库; code 可选, 不传时按当前方案规则推导", "dict.add(clip())";
         "dict.rev"        : Dict    (1, 2) pure   => fn_dict_rev,    "反查文本中某个字的编码与读音; n 为第几个字 (1 起, 默认 1), 超出字数返回空串", "dict.rev(clip())"
             named(fn_dict_rev_named, "format" = "版式模板, 同候选注释段语法; 变量 ${char}/${code_rev_all}(全部码位)/${code_rev}(仅全码)/${code_schema}(本方案击键)/${pinyin}/${chaizi}/${chaizi_code}/${dict}; 省略='${char}: ${code_rev_all} ${pinyin}'");
-        "ime.toggle"      : Ime     (1, 1) effect => fn_ime_toggle,  "切换 IME 状态 (cn-en / fullshape / layout / candwin / s2t / t2s / preedit / toolbar)；数据开关 emoji / emoji:<模块id> / dict:<注释库id>", "ime.toggle(\"cn-en\")";
-        "ime.set"         : Ime     (2, 2) effect => fn_ime_set,     "把开关设为指定状态, 已是该状态则只提示不动作; target 为输入状态 (cn-en / fullshape / s2t / t2s / toolbar; cn-en 的 on=中文) 或数据开关 (emoji / emoji:<模块id> / dict:<注释库id>), 状态 on/off (也认 true/false、1/0、开/关)", "ime.set(\"emoji:frost_greek\", \"on\")";
+        "ime.toggle"      : Ime     (1, 1) effect => fn_ime_toggle,  "切换 IME 状态 (cn-en / fullshape / layout / candwin / s2t / t2s / preedit / toolbar / comment[注释默认↔详细])；数据开关 emoji / emoji:<模块id> / dict:<注释库id>", "ime.toggle(\"cn-en\")";
+        "ime.set"         : Ime     (2, 2) effect => fn_ime_set,     "把开关设为指定状态, 已是该状态则只提示不动作; target 为输入状态 (cn-en / fullshape / s2t / t2s / toolbar; cn-en 的 on=中文) 或数据开关 (emoji / emoji:<模块id> / dict:<注释库id>), 状态 on/off (也认 true/false、1/0、开/关); target 为 comment 时状态是 default / detail (候选注释的默认 / 详细态)", "ime.set(\"emoji:frost_greek\", \"on\")";
         "ime.schema"      : Ime     (1, 1) effect => fn_ime_schema,  "切换输入方案并持久化", "ime.schema(\"pinyin\")";
         "ime.theme"       : Ime     (1, 1) effect => fn_ime_theme,   "切换主题并持久化 (= config.set ui.theme.name)", "ime.theme(\"msime\")";
         "ime.theme_cycle" : Ime     (0, 1) effect => fn_theme_cycle, "循环切换主题并持久化; dir 可选 next(默认)/prev", "ime.theme_cycle()";
         "ime.undo_commit" : Ime     (0, 0) effect => fn_undo_commit,"撤销最近一次上屏 (删刚上屏的字符数; 焦点变化或又输入其它内容后退化删 1 个)", "ime.undo_commit()";
+        "ime.reload"      : Ime     (0, 0) effect => fn_ime_reload,"重新读取用户配置并应用 (等同设置端保存后的热重载; 手改 config.toml 后用)", "ime.reload()";
         "ime.pair"        : Ime     (2, 2) effect => fn_ime_pair,   "上屏配对文本并激活配对状态, 光标落两段之间, 可用跳出键 (Tab/Enter) 越过右段", "ime.pair(\"《\", \"》\")"
             named(fn_ime_pair_named, "jump" = "跳出时光标右移的格数; 省略=按右段字符数");
         "setting.open"    : Setting (1, 2) effect => fn_setting_open,"打开设置窗口的指定页面 (schema/input/keys/ui/dict/advanced/about/import; 空串=默认页); args 可选, 原样直通给设置程序", "setting.open(\"dict\", \"--schema=wubi86 --type=shadow\")";
@@ -94,6 +95,20 @@ fn fn_dict_rev_named(
 }
 
 fn fn_ime_set(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    // `comment` 的状态是 default / detail，不是开关，绕过 on/off 解析。
+    if args[0] == "comment" {
+        let value = args[1].trim().to_ascii_lowercase();
+        if value != "default" && value != "detail" {
+            return Err(runtime_err(
+                "ime.set",
+                anyhow::anyhow!("comment 的状态需要 default / detail，收到 {:?}", args[1]),
+            ));
+        }
+        let ime = ime(ctx, "ime.set")?;
+        ime.set_value(&args[0], &value)
+            .map_err(|e| runtime_err("ime.set", e))?;
+        return Ok(String::new());
+    }
     let on = parse_switch(&args[1]).ok_or_else(|| {
         runtime_err(
             "ime.set",
@@ -184,6 +199,13 @@ fn fn_undo_commit(ctx: &dyn EvalContext, _args: &[String]) -> Result<String> {
     Ok(String::new())
 }
 
+fn fn_ime_reload(ctx: &dyn EvalContext, _args: &[String]) -> Result<String> {
+    let ime = ime(ctx, "ime.reload")?;
+    ime.reload_config()
+        .map_err(|e| runtime_err("ime.reload", e))?;
+    Ok(String::new())
+}
+
 fn fn_setting_open(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let ime = ime(ctx, "setting.open")?;
     let extra = args.get(1).map(String::as_str).unwrap_or("");
@@ -259,6 +281,17 @@ mod tests {
             self.0.lock().unwrap().push(format!("set {target}={on}"));
             Ok(())
         }
+        fn set_value(&self, target: &str, value: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("set_value {target}={value}"));
+            Ok(())
+        }
+        fn reload_config(&self) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push("reload".into());
+            Ok(())
+        }
     }
 
     fn ctx_with(rec: Arc<RecIme>) -> MemoryContext {
@@ -300,6 +333,32 @@ mod tests {
         }
         assert!(fn_ime_set(&ctx, &["emoji".into(), "maybe".into()]).is_err());
         assert!(rec.0.lock().unwrap().is_empty(), "认不出的状态不该调用宿主");
+    }
+
+    /// `ime.reload()` 交宿主重载配置；宿主没实现时报错而不是静默成功。
+    #[test]
+    fn ime_reload_calls_host() {
+        let rec = Arc::new(RecIme(Mutex::new(Vec::new())));
+        let ctx = ctx_with(rec.clone());
+        fn_ime_reload(&ctx, &[]).unwrap();
+        assert_eq!(rec.0.lock().unwrap().pop().unwrap(), "reload");
+    }
+
+    /// `ime.set("comment", ...)` 的状态是 default / detail：走 `set_value`，on/off 报错且不调用宿主；
+    /// 其它 target 仍走原来的开关解析。
+    #[test]
+    fn ime_set_comment_accepts_state_values() {
+        let rec = Arc::new(RecIme(Mutex::new(Vec::new())));
+        let ctx = ctx_with(rec.clone());
+        fn_ime_set(&ctx, &["comment".into(), " Detail ".into()]).unwrap();
+        assert_eq!(
+            rec.0.lock().unwrap().pop().unwrap(),
+            "set_value comment=detail"
+        );
+        assert!(fn_ime_set(&ctx, &["comment".into(), "on".into()]).is_err());
+        assert!(rec.0.lock().unwrap().is_empty(), "非法状态不该调用宿主");
+        fn_ime_set(&ctx, &["dict:x".into(), "on".into()]).unwrap();
+        assert_eq!(rec.0.lock().unwrap().pop().unwrap(), "set dict:x=true");
     }
 
     /// 省略 n 取第 1 个字；省略 format 填默认版式。

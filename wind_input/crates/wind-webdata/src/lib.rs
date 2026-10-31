@@ -412,6 +412,9 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
 
         // ── dict.*（用户词库）────────────────────
         "comment.sources" => h.web_comment_sources(),
+        // 设置端注释总表：模板表（带来源）、出厂分配、每格实际生效的模板与所在层。
+        // 带 `comment`（未保存的 `[ui.comment]` 草稿）时按草稿算。
+        "comment.library" => h.web_comment_library(params),
         "emoji.modules" => h.web_emoji_modules(),
         "dict.listPaged" => h.web_dict_list_paged(params),
         "dict.search" => h.web_dict_search(params),
@@ -885,7 +888,52 @@ pub trait WebDataRpc: WebDataHost {
                 }),
         )
         .collect();
-        Ok(json!({ "auto": auto, "files": files }))
+        let builtin: Vec<Value> = self
+            .system_comment_dicts()
+            .iter()
+            .map(|b| json!({ "id": b.id, "label": b.label, "rel": b.path, "origin": "builtin" }))
+            .collect();
+        Ok(json!({ "auto": auto, "builtin": builtin, "files": files }))
+    }
+
+    fn web_comment_library(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_config::comment_lib::{CommentLibrary, TemplateOrigin, UiCommentConfig};
+        let system = self.system_comments();
+        let lib = match params.get("comment").filter(|v| !v.is_null()) {
+            Some(draft) => {
+                let user: UiCommentConfig = serde_json::from_value(draft.clone())
+                    .map_err(|e| anyhow::anyhow!("comment 草稿形态不对: {e}"))?;
+                std::sync::Arc::new(CommentLibrary::build(system, &user).0)
+            }
+            None => self.comment_library(),
+        };
+        let templates: Vec<Value> = lib
+            .templates()
+            .map(|(t, o)| {
+                let origin = match o {
+                    TemplateOrigin::Builtin => "builtin",
+                    TemplateOrigin::User => "user",
+                    TemplateOrigin::UserOverridesBuiltin => "user_overrides_builtin",
+                };
+                let mut v = json!({
+                    "id": t.id, "name": t.name, "text": t.text, "desc": t.desc, "origin": origin,
+                });
+                // 被用户覆盖的内置模板带上原版，供设置端「恢复内置」前对照。
+                if o == TemplateOrigin::UserOverridesBuiltin
+                    && let Some(b) = system.templates.iter().find(|b| b.id == t.id)
+                {
+                    v["builtin"] = json!({ "name": b.name, "text": b.text });
+                }
+                v
+            })
+            .collect();
+        let active = self.engine_mgr().active_schema_id();
+        let effective = lib.effective_table(&active, |s| self.comment_schema_type(s));
+        Ok(json!({
+            "templates": templates,
+            "system_assign": system.assign,
+            "effective": effective,
+        }))
     }
 
     /// emoji 附加模块清单（内置 + 用户放进 `emoji/` 的 OpenCC 表），供设置页对话框列出。
@@ -4023,9 +4071,12 @@ pub trait WebDataRpc: WebDataHost {
 
     /// `appearance.previewTemplate`：模板在当前主题下的渲染效果（设置页输入框下方的预览行）。
     ///
-    /// 入参 `{ template, scene: "comment" | "label" | "content", each?, swatches?: [名字] }`。回包：
+    /// 入参 `{ template, scene: "comment" | "label" | "content", each?, swatches?: [名字], sample? }`。
+    /// `sample` 是样例 id（缺省 = 「你好」），未知 id 报错。回包：
     /// ```text
-    /// { text, fg, bg, runs: [{start, end, rgba}],
+    /// { candidate, sample,                     // 本次用的样例词与它的 id
+    ///   samples: [{id, text, lang: "zh"|"en"}], // 全部可用样例，设置端据此按语种取
+    ///   text, fg, bg, runs: [{start, end, rgba}],
     ///   selected: { fg, bg, runs } | null,      // 仅 comment：高亮候选里的样子
     ///   problems: [{start, end, message}],
     ///   swatches: { 名字: rgba } }              // 入参 swatches 里每个名字写成 `$[名字]` 的实际颜色
@@ -4073,7 +4124,14 @@ pub trait WebDataRpc: WebDataHost {
             other => anyhow::bail!("未知 scene：{other}"),
         };
         let is_tooltip = scene != TemplateScene::Comment;
-        let sample = self.template_sample(template, &scene);
+        let sample_id = match params.get("sample") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(v) => anyhow::bail!("sample 须为字符串：{v}"),
+        };
+        let preset = wind_coordinator::template_preview::find_sample(sample_id)
+            .ok_or_else(|| anyhow::anyhow!("未知样例：{}", sample_id.unwrap_or_default()))?;
+        let sample = self.template_sample(template, &scene, preset);
         // 主题现取：与候选窗同一条搜索链、同一个当前主题与明暗。每次预览都从磁盘解析一次
         // （设计 §11 已知局限：低频的设置页操作，不值得为它挂一份缓存）。取不到（主题文件坏了）
         // 时退化为兜底色的预览，并给一条总的提示——不逐个把颜色名误报成「当前主题没有」。
@@ -4221,7 +4279,14 @@ pub trait WebDataRpc: WebDataHost {
             })
             .collect();
 
+        let samples: Vec<Value> = wind_coordinator::template_preview::SAMPLES
+            .iter()
+            .map(|s| json!({"id": s.id, "text": s.text, "lang": s.lang.as_str()}))
+            .collect();
         Ok(json!({
+            "candidate": preset.text,
+            "sample": preset.id,
+            "samples": samples,
             "text": sample.text.as_str(),
             "fg": fg,
             "bg": bg,
@@ -10687,5 +10752,111 @@ mod system_stats_tests {
                 .is_err()
         );
         assert!(c.web_data_rpc("dict.systemStats", &json!({})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod comment_library_tests {
+    //! `comment.library`：模板表带来源，总表每格给出实际生效的模板与所在层。
+    use super::*;
+    use std::sync::Arc;
+    use wind_config::Config;
+    use wind_coordinator::Coordinator;
+    use wind_store::Store;
+
+    fn coord(tag: &str) -> Arc<Coordinator> {
+        let base = std::env::temp_dir().join(format!("wind_cmtlib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("schemas")).unwrap();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../data/system.comments.toml"
+            ),
+            base.join("system.comments.toml"),
+        )
+        .unwrap();
+        let store = Arc::new(Store::open(base.join("s.redb")).unwrap());
+        Coordinator::new_headless_with_store(Config::default(), Some(&base), store)
+    }
+
+    fn cell<'a>(v: &'a Value, scope: &str, state: &str, vertical: bool) -> &'a Value {
+        v["effective"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["scope"] == scope && e["state"] == state && e["vertical"] == vertical)
+            .unwrap_or_else(|| panic!("effective 缺 {scope}/{state}/{vertical}: {v}"))
+    }
+
+    #[test]
+    fn builtin_templates_and_global_effective() {
+        let v = coord("base")
+            .web_data_rpc("comment.library", &json!({}))
+            .unwrap();
+        let code = v["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "code")
+            .expect("templates 应含 code");
+        assert_eq!(code["origin"], "builtin");
+        assert_eq!(code["name"], "编码（自动）");
+        assert!(code["desc"].as_str().is_some_and(|d| !d.is_empty()));
+        let g = cell(&v, "global", "default", true);
+        assert_eq!(g["template_id"], "code");
+        assert_eq!(g["from_scope"], "global");
+        assert_eq!(
+            v["system_assign"]["type"]["codetable"]["detail_horizontal"],
+            "chaizi_pinyin"
+        );
+        for vertical in [false, true] {
+            let e = cell(&v, "mode:temp_english", "default", vertical);
+            assert_eq!(e["template_id"], "none");
+            assert_eq!(e["from_scope"], "mode:temp_english");
+        }
+        let t = cell(&v, "type:codetable", "default", false);
+        assert_eq!(t["template_id"], "code");
+        assert_eq!(t["from_scope"], "global");
+    }
+
+    #[test]
+    fn draft_comment_param_drives_rows_and_origins() {
+        let v = coord("draft")
+            .web_data_rpc(
+                "comment.library",
+                &json!({"comment": {
+                    "templates": [
+                        {"id": "code", "name": "改", "text": "X"},
+                        {"id": "mine", "name": "我的", "text": "Y"}
+                    ],
+                    "assign": {"schema": {"wubi86": {"detail_horizontal": "mine"}}}
+                }}),
+            )
+            .unwrap();
+        let origin = |id: &str| {
+            v["templates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .map(|t| t["origin"].clone())
+        };
+        assert_eq!(origin("code"), Some(json!("user_overrides_builtin")));
+        let ch = v["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "code")
+            .unwrap();
+        assert_eq!(ch["builtin"]["name"], "编码（自动）");
+        assert_eq!(origin("mine"), Some(json!("user")));
+        for vertical in [false, true] {
+            let s = cell(&v, "schema:wubi86", "detail", vertical);
+            assert_eq!(s["template_id"], "mine", "竖排没写同本行横排");
+            assert_eq!(s["from_scope"], "schema:wubi86");
+        }
+        let s = cell(&v, "schema:wubi86", "default", true);
+        assert_eq!(s["from_scope"], "global");
     }
 }

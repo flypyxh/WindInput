@@ -622,7 +622,7 @@ pub struct EngineManager {
     single_char_codes: Mutex<Option<SingleCharCodeCache>>,
     /// 单字全码表的最后使用（[`Self::use_clock`] 读数），供闲置清扫（[`Self::evict_idle_caches`]）。
     single_char_used: std::sync::atomic::AtomicU64,
-    /// 全局拼音配置（fuzzy/code_hint_source/...）。Mutex 以支持热重载。
+    /// 全局拼音配置（fuzzy/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
     /// 纠错与提示配置（`[input.correction]`），与 `pinyin` 一同决定 [`pinyin_hint_on`]。
     correction_cfg: Mutex<wind_config::CorrectionConfig>,
@@ -686,16 +686,13 @@ pub struct EngineManager {
     /// 测试钩子：[`Self::build_reverse_index_for`] 被调用的次数（证明短路生效）。
     #[cfg(test)]
     reverse_index_build_calls: std::sync::atomic::AtomicUsize,
-    /// [`Self::schema_data_facts`] 的缓存（全部已安装方案的注释模板）。要扫方案目录、读 N 个
-    /// 方案文件，而协调器在按应用自动切方案（焦点驱动、高频）时也会问它。与 `overlay_cache`
-    /// 同批失效：`invalidate_schema` / `reload_from_config`。
-    data_facts_cache: Mutex<Option<Arc<SchemaDataFacts>>>,
     /// [`Self::active_data_facts`] 的缓存，按活跃方案 id 分键（随活跃方案变，切方案不必失效）。
-    /// 失效点同上。
+    /// 协调器在按应用自动切方案（焦点驱动、高频）时也会问它。与 `overlay_cache` 同批失效：
+    /// `invalidate_schema` / `reload_from_config`。
     active_facts_cache: Mutex<HashMap<String, ActiveDataFacts>>,
-    /// 上面两份缓存的失效代次（同 `aux_settings_gen` 的做法）。
+    /// 上面那份缓存的失效代次（同 `aux_settings_gen` 的做法）。
     data_facts_gen: std::sync::atomic::AtomicU64,
-    /// 测试钩子：上面两份事实被真正重算的次数。
+    /// 测试钩子：上面那份事实被真正重算的次数。
     #[cfg(test)]
     data_facts_builds: std::sync::atomic::AtomicUsize,
 }
@@ -719,17 +716,7 @@ pub struct MemoryReport {
     pub char_pinyin_builds: crate::text_codes::BuildStatsSnapshot,
 }
 
-/// 方案文件里「按需加载」要看的事实（协调器 `DataNeeds` 的材料），见
-/// [`EngineManager::schema_data_facts`]。
-#[derive(Debug, Default, Clone)]
-pub struct SchemaDataFacts {
-    /// 全部已安装方案的方案级注释模板（`[candidate].comment_template_*`，含覆盖层）。
-    pub schema_templates: Vec<String>,
-    /// overlay 方案 `[overlay]` 段的注释模板。
-    pub overlay_templates: Vec<String>,
-}
-
-/// 随活跃方案变的那部分事实，见 [`EngineManager::active_data_facts`]。
+/// 协调器 `DataNeeds` 要看的、随活跃方案变的事实，见 [`EngineManager::active_data_facts`]。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveDataFacts {
     /// 辅助码当下引用了码表方案（[`EngineManager::aux_code_schemas_in_use`] 非空）。
@@ -1045,7 +1032,6 @@ impl EngineManager {
             reverse_index_skipped: Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             reverse_index_build_calls: std::sync::atomic::AtomicUsize::new(0),
-            data_facts_cache: Mutex::new(None),
             active_facts_cache: Mutex::new(HashMap::new()),
             data_facts_gen: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -1055,39 +1041,6 @@ impl EngineManager {
         // 避免首次切换时同步重熔大词库卡顿。单飞构建锁保证预热与切换不重复构建。
         mgr.ensure_loaded(&active_id);
         mgr
-    }
-
-    /// 拼音方案（含双拼）下，候选注释里的编码从哪来（`schema.pinyin.code_hint_source`）。
-    ///
-    /// 直接读全局 `[schema.pinyin]`，没有方案级 override。临拼 / 快捷输入不读这份，
-    /// 见 [`Self::temp_pinyin_code_hint_source`]。
-    /// （码表类方案的「剩余编码」由码表引擎在 convert 内处理，走的是
-    /// `schema.codetable.show_code_hint`，与本键同名过一阵子，现已各归各名。）
-    pub fn code_hint_source(&self) -> wind_config::config::CodeHintSource {
-        wind_config::config::CodeHintSource::from_config(
-            &self
-                .pinyin
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .code_hint_source,
-            // 认不出的值回落本字段出厂档 `off`（`default_code_hint_source`）。
-            wind_config::config::CodeHintSource::Off,
-        )
-    }
-
-    /// 临拼 / 快捷输入期间，候选注释里的编码从哪来（`input.temp_pinyin.code_hint_source`）。
-    ///
-    /// 与 [`Self::code_hint_source`] 各管一摊、出厂值不同（这份 `auto`、那份 `off`）。
-    pub fn temp_pinyin_code_hint_source(&self) -> wind_config::config::CodeHintSource {
-        wind_config::config::CodeHintSource::from_config(
-            &self
-                .temp_pinyin
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .code_hint_source,
-            // 认不出的值回落本字段出厂档 `auto`（`default_temp_pinyin_code_hint_source`）。
-            wind_config::config::CodeHintSource::Auto,
-        )
     }
 
     /// 当前活跃引擎是否开启整句输入（当前只有码表引擎会返回 true）。
@@ -1988,6 +1941,22 @@ impl EngineManager {
             .get(schema_id)
             .filter(|l| l.engine.disabled_dict_layers().is_some())
             .map(|l| Arc::clone(&l.engine))
+    }
+
+    /// 主码表未启用扩展库里 `text` 的编码（码长升序，已带 `*` 前缀标明未启用）；
+    /// 仅剪贴板反查用——注释 / 悬停 / 查重仍只认已启用词库。开关关或无影子层时为空。
+    pub fn disabled_dict_codes(&self, text: &str) -> Vec<String> {
+        let primary = self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.loaded_disabled_dict_engine(&primary)
+            .and_then(|e| e.disabled_dict_layers().map(|d| d.codes_of(text)))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| format!("*{c}"))
+            .collect()
     }
 
     /// 阻塞地把 `schema_id` 已加载引擎的影子层建好（预热线程 / 测试用，**不可进按键链路**）。
@@ -3354,6 +3323,27 @@ impl EngineManager {
         self.active_engine()?.shuangpin_full_syllable_count(keys)
     }
 
+    /// 活跃双拼引擎把击键串按击键对拆成的音节：`(全拼音节, 击键起, 击键止)`；非双拼 → 空。
+    pub fn shuangpin_units(&self, keys: &str) -> Vec<(String, usize, usize)> {
+        self.active_engine()
+            .map(|e| e.shuangpin_units(keys))
+            .unwrap_or_default()
+    }
+
+    /// 活跃方案是不是双拼（有布局）。
+    pub fn is_shuangpin(&self) -> bool {
+        !self
+            .shuangpin_layout_of(&self.active_schema_id())
+            .is_empty()
+    }
+
+    /// 活跃拼音引擎下，音节 `syllable` 按模糊音配置展开的等价读音（没开模糊音 / 非拼音 → 空）。
+    pub fn fuzzy_siblings(&self, syllable: &str) -> Vec<String> {
+        self.active_engine()
+            .map(|e| e.fuzzy_siblings(syllable))
+            .unwrap_or_default()
+    }
+
     /// 当前活跃引擎是否为**纯码表**类型（混输 `Mixed` 不算——其拼音半边恒前缀匹配，
     /// 精确匹配语义只对纯码表方案自洽；供协调器判定短语是否随「精确匹配模式」抑制前缀枚举）。
     pub fn is_codetable(&self) -> bool {
@@ -4078,7 +4068,6 @@ impl EngineManager {
             }
         }
         // 反查索引依赖「启用词库合并」，启用集变了须失效（懒重建）。
-        // 注：编码提示开关已改读全局 schema.pinyin.code_hint_source，无方案级缓存需失效。
         self.reverse_index
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5845,57 +5834,6 @@ impl EngineManager {
         !self.is_pinyin() && self.codetable_settings().auto_phrase.enabled
     }
 
-    /// 全部已安装方案的注释模板（方案级 + overlay）。有缓存，见 `data_facts_cache`。
-    ///
-    /// 计算在锁外（要读盘），回填前比对失效代次：期间失效过就只用不存，旧结果盖不回去。
-    pub fn schema_data_facts(&self) -> Arc<SchemaDataFacts> {
-        if let Some(f) = self
-            .data_facts_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            return Arc::clone(f);
-        }
-        let generation = self
-            .data_facts_gen
-            .load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(test)]
-        self.data_facts_builds
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut facts = SchemaDataFacts::default();
-        for id in self.installed_schemas() {
-            let b = self.behavior_for(&id);
-            facts
-                .schema_templates
-                .extend(b.comment_template_vertical.iter().cloned());
-            facts
-                .schema_templates
-                .extend(b.comment_template_horizontal.iter().cloned());
-        }
-        for o in self.overlay_modes() {
-            facts
-                .overlay_templates
-                .extend(o.spec.comment_template_vertical.iter().cloned());
-            facts
-                .overlay_templates
-                .extend(o.spec.comment_template_horizontal.iter().cloned());
-        }
-        let facts = Arc::new(facts);
-        let mut cache = self
-            .data_facts_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if self
-            .data_facts_gen
-            .load(std::sync::atomic::Ordering::Acquire)
-            == generation
-        {
-            *cache = Some(Arc::clone(&facts));
-        }
-        facts
-    }
-
     /// 当前活跃方案下的辅助码 / 自动造词态。有缓存（按活跃方案 id），见 `active_facts_cache`。
     pub fn active_data_facts(&self) -> ActiveDataFacts {
         let active = self.active_schema_id();
@@ -5932,17 +5870,12 @@ impl EngineManager {
         facts
     }
 
-    /// 清上面两份事实缓存并推进失效代次（持两把锁完成，与回填互斥）。
+    /// 清事实缓存并推进失效代次（持锁完成，与回填互斥）。
     fn invalidate_data_facts(&self) {
-        let mut templates = self
-            .data_facts_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let mut active = self
             .active_facts_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *templates = None;
         active.clear();
         self.data_facts_gen
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -7107,8 +7040,8 @@ impl EngineManager {
                 allow_full_pinyin: pg.shuangpin.allow_full_pinyin && mix_secondary.is_none(),
             };
             let mut engine = PinyinEngine::new(pcfg, dict).with_fuzzy(fuzzy.clone());
-            // 上下文语言模型：**两个开关都得显式打开才启用**——
-            // `weight != 0` 且 `model` 非空。任一为默认值都**根本不读文件**，
+            // 上下文语言模型：开关（`enabled`）开着，且 **weight 与 model 都得显式配置**才启用——
+            // `weight != 0` 且 `model` 非空（见 `PinyinGrammar::active`）。开关关、weight 为 0、model 为空，任一成立都**根本不读文件**，
             // 既省内存，也让「没配就等于没这功能」在字节层面成立。
             //
             // ★ 为什么模型名也要参与判据：默认模型名一度是 `zh-hans-bgw.gram`，
@@ -7117,7 +7050,7 @@ impl EngineManager {
             // 都写过一遍才会生效，不存在「不知道自己开了什么」。
             //
             // 模型数据不随安装包分发，缺失时降级为关闭而非报错（见设计文档 §5）。
-            if pinyin_cfg.grammar.weight != 0.0 && !pinyin_cfg.grammar.model.trim().is_empty() {
+            if pinyin_cfg.grammar.active() {
                 let gram_path = schemas
                     .join("pinyin")
                     .join("grammar")
@@ -9151,16 +9084,12 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let mgr = EngineManager::new(&Config::default(), None);
         let builds = || mgr.data_facts_builds.load(Relaxed);
-        mgr.schema_data_facts();
-        mgr.schema_data_facts();
-        assert_eq!(builds(), 1, "连续两次只扫一遍方案文件");
         mgr.active_data_facts();
         mgr.active_data_facts();
-        assert_eq!(builds(), 2, "活跃方案没变就不重算");
+        assert_eq!(builds(), 1, "活跃方案没变就不重算");
         mgr.invalidate_schema("pinyin");
-        mgr.schema_data_facts();
         mgr.active_data_facts();
-        assert_eq!(builds(), 4, "方案失效后重算");
+        assert_eq!(builds(), 2, "方案失效后重算");
     }
 
     /// 单字全码表与反查索引同键同目录、只差扩展名。
@@ -9680,31 +9609,6 @@ mod tests {
         cfg.schema.english.frequency.code_scope = "candidate".to_string();
         let mgr2 = EngineManager::new(&cfg, None);
         assert!(!mgr2.freq_settings().english_code_by_input);
-    }
-
-    /// ★ 两份编码来源开关写错时各自回落**自己的**出厂档，互不串：拼音方案 → `off`、
-    /// 临拼 → `auto`。共用一个写死的兜底时，拼音方案写错值会意外显示编码。
-    #[test]
-    fn code_hint_source_unknown_value_falls_back_per_field() {
-        use wind_config::config::CodeHintSource;
-        // 前提：兜底档与各自的出厂值字面一致。改了出厂值却忘了改兜底，这里先红。
-        let def = Config::default();
-        assert_eq!(def.schema.pinyin.code_hint_source, "off");
-        assert_eq!(def.input.temp_pinyin.code_hint_source, "auto");
-
-        let mut cfg = Config::default();
-        cfg.schema.pinyin.code_hint_source = "shuangping".to_string();
-        cfg.input.temp_pinyin.code_hint_source = "shuangping".to_string();
-        let mgr = EngineManager::new(&cfg, None);
-        assert_eq!(mgr.code_hint_source(), CodeHintSource::Off);
-        assert_eq!(mgr.temp_pinyin_code_hint_source(), CodeHintSource::Auto);
-
-        // 反向对照：合法值照认，证明上面落的是兜底而非两个方法碰巧固定返回这两档。
-        cfg.schema.pinyin.code_hint_source = "auto".to_string();
-        cfg.input.temp_pinyin.code_hint_source = "off".to_string();
-        let mgr = EngineManager::new(&cfg, None);
-        assert_eq!(mgr.code_hint_source(), CodeHintSource::Auto);
-        assert_eq!(mgr.temp_pinyin_code_hint_source(), CodeHintSource::Off);
     }
 
     #[test]

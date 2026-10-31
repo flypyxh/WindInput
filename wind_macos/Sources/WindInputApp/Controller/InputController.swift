@@ -50,6 +50,10 @@ public class InputController: IMKInputController {
     // Go 触发模式切换 (如 lshift 切中英)。macOS 修饰键走 .flagsChanged, 不是 keyDown。
     private var pendingModVK: UInt32?    // 当前按住、待判定的修饰键 Win VK (nil=无)
     private var pendingModSawOther = false // 修饰键按住期间是否出现过其它键 (→ 非 tap)
+    // 组字中 ⌥ 转发 (注释态切换) 的这次按住记账, 见 OptionKeyHold。
+    private var optionHold = OptionKeyHold()
+    // 候选显示时 Ctrl 如实上报的这次按住记账, 见 CtrlRawReport。
+    private var ctrlRaw = CtrlRawReport()
 
     // 上次随 focusGained 上报给 Go 的系统安全输入(密码框)状态。handle 每键与系统实时值
     // 比对, 翻转即补发 focusGained —— 补偿同一 IMKit client 内字段切换不触发 activateServer
@@ -328,12 +332,37 @@ public class InputController: IMKInputController {
     // MARK: - 修饰键 tap (Shift/Ctrl 单击切换模式)
 
     /// 处理 .flagsChanged: 修饰键按下记录待判定; 抬起且其间无其它键 = tap, 发 VK 给 Go。
-    private func handleFlagsChanged(_ event: NSEvent, client sender: Any!) {
+    /// ⌥ 另走 handleOptionChanged。返回是否吃掉事件。
+    private func handleFlagsChanged(_ event: NSEvent, client sender: Any!) -> Bool {
+        optionHold.note(modifiers: KeyHandler.toModifiers(event.modifierFlags))
         guard let (vk, mask) = Self.modifierInfo(forKeyCode: event.keyCode) else {
             pendingModVK = nil
-            return
+            ctrlRaw.noteOther() // Command / Fn 等: Ctrl+⌘ 不算单击
+            return false
         }
         let pressed = (event.modifierFlags.rawValue & mask) != 0
+        let isCtrl = vk == 0xA2 || vk == 0xA3
+        if pressed && !isCtrl { ctrlRaw.noteOther() }
+        if vk == 0xA4 || vk == 0xA5 {
+            // ⌥ 不做单击切换模式; 按住期间同样作废 Shift/Ctrl 的单击判定 (与先前一致)。
+            pendingModVK = nil
+            return handleOptionChanged(vk, pressed: pressed, flags: event.modifierFlags, sender: sender)
+        }
+        if isCtrl && pressed {
+            let composing = OptionKeyHold.inputSession(
+                hasComposition: !composition.isEmpty,
+                candidatesVisible: CandidatePanelHost.shared.candidatesVisible)
+            if ctrlRaw.down(vk: vk, composing: composing) {
+                pendingModVK = nil // 这次按住走如实上报, 不再判单击 (一次按住只走一条路)
+                sendCtrlRaw(vk, .modDown, flags: event.modifierFlags, notTap: false, sender: sender)
+                return false
+            }
+        }
+        if isCtrl && !pressed, let notTap = ctrlRaw.up(vk: vk) {
+            pendingModVK = nil
+            sendCtrlRaw(vk, .modUp, flags: event.modifierFlags, notTap: notTap, sender: sender)
+            return false
+        }
         if pressed {
             pendingModVK = vk
             pendingModSawOther = false
@@ -343,15 +372,76 @@ public class InputController: IMKInputController {
             }
             pendingModVK = nil
         }
+        return false
     }
 
-    /// mac keyCode → (Win VK, NSEvent.ModifierFlags 掩码)。仅可作模式切换的修饰键。
+    /// 候选显示时 Ctrl 的按下 / 松开如实上报 (单击由服务端判, 见 CtrlRawReport)。
+    /// 应用回包 (单击可能切中英 / 选词 / 上屏编码), 但 Ctrl 本身永不吃。
+    private func sendCtrlRaw(_ vk: UInt32, _ type: KeyEventType, flags: NSEvent.ModifierFlags,
+                             notTap: Bool, sender: Any!) {
+        guard ensureConnected(), let bridge = bridge else { return }
+        if type == .modUp {
+            sendCaretUpdateIfAvailable(client: sender as? IMKTextInput) // 同 sendModifierTap
+        }
+        keySeq &+= 1
+        let frame = BinaryCodec.encodeKeyEventFrame(KeyEventPayload(
+            keyCode: vk, scanCode: 0, modifiers: KeyHandler.toModifiers(flags) | 0x0002,
+            eventType: type,
+            toggles: CtrlRawReport.toggles(capsLock: flags.contains(.capsLock), notTap: notTap),
+            eventSeq: keySeq, prevChar: router.digitTracker.prevChar))
+        do {
+            try bridge.send(frame)
+            let resp = try bridge.readFrame()
+            _ = applyResponse(resp, sender: sender)
+        } catch {
+            NSLog("WindInput[ctrlRaw] vk=\(vk) io error: \(error)")
+            reconnect()
+        }
+    }
+
+    /// 组字中 ⌥ 的按下 / 松开转发给服务切换注释态, 回包 Consumed 才吃。
+    /// 修饰位带上这次按住期间按过的 Shift/Ctrl/Command (协调器 `handle_comment_alt`)。
+    private func handleOptionChanged(_ vk: UInt32, pressed: Bool, flags: NSEvent.ModifierFlags,
+                                     sender: Any!) -> Bool {
+        let composing = OptionKeyHold.inputSession(
+            hasComposition: !composition.isEmpty,
+            candidatesVisible: CandidatePanelHost.shared.candidatesVisible)
+        let forward: Bool
+        if pressed {
+            forward = composing
+            optionHold.down(forwarded: forward)
+        } else {
+            forward = optionHold.shouldForwardUp(composing: composing)
+        }
+        let mods = KeyHandler.toModifiers(flags) | optionHold.stickyMods
+        if !pressed { optionHold.up() }
+        guard forward, ensureConnected(), let bridge = bridge else { return false }
+        keySeq &+= 1
+        let frame = BinaryCodec.encodeKeyEventFrame(KeyEventPayload(
+            keyCode: vk, scanCode: 0, modifiers: mods, eventType: pressed ? .down : .up,
+            eventSeq: keySeq, prevChar: router.digitTracker.prevChar))
+        do {
+            try bridge.send(frame)
+            let resp = try bridge.readFrame()
+            return applyResponse(resp, sender: sender)
+        } catch {
+            NSLog("WindInput[option] vk=\(vk) io error: \(error)")
+            reconnect()
+            return false
+        }
+    }
+
+    /// mac keyCode → (Win VK, NSEvent.ModifierFlags 掩码)。可作模式切换的修饰键, 外加 ⌥ (注释态切换)。
     private static func modifierInfo(forKeyCode kc: UInt16) -> (UInt32, UInt)? {
         switch kc {
         case 56: return (0xA0, NSEvent.ModifierFlags.shift.rawValue)   // 左 Shift → VK_LSHIFT
         case 60: return (0xA1, NSEvent.ModifierFlags.shift.rawValue)   // 右 Shift → VK_RSHIFT
-        case 59: return (0xA2, NSEvent.ModifierFlags.control.rawValue) // 左 Ctrl → VK_LCONTROL
-        case 62: return (0xA3, NSEvent.ModifierFlags.control.rawValue) // 右 Ctrl → VK_RCONTROL
+        // Ctrl 用设备相关位分左右 (NX_DEVICELCTLKEYMASK / NX_DEVICERCTLKEYMASK): 笼统的 .control
+        // 在另一侧还按着时松开这一侧仍为真, 判不出松开。
+        case 59: return (0xA2, 0x0001) // 左 Ctrl → VK_LCONTROL
+        case 62: return (0xA3, 0x2000) // 右 Ctrl → VK_RCONTROL
+        case 58: return (0xA4, NSEvent.ModifierFlags.option.rawValue)  // 左 ⌥ → VK_LMENU
+        case 61: return (0xA5, NSEvent.ModifierFlags.option.rawValue)  // 右 ⌥ → VK_RMENU
         default: return nil
         }
     }
@@ -384,9 +474,33 @@ public class InputController: IMKInputController {
     // MARK: - IMKit hook
 
     /// 告诉 IMKit 本输入法要接收哪些事件。默认只有 keyDown; 必须显式加 flagsChanged
-    /// 才能收到修饰键 (Shift/Ctrl) 变化, 做单击切换检测。
+    /// 才能收到修饰键 (Shift/Ctrl) 变化, 做单击切换检测; keyUp 只认服务端吃掉过按下的功能键
+    /// (见 eatenFnKeyCode), 其余一律交还宿主。
     public override func recognizedEvents(_ sender: Any!) -> Int {
-        return Int(NSEvent.EventTypeMask.keyDown.rawValue | NSEvent.EventTypeMask.flagsChanged.rawValue)
+        return Int(NSEvent.EventTypeMask.keyDown.rawValue | NSEvent.EventTypeMask.flagsChanged.rawValue
+            | NSEvent.EventTypeMask.keyUp.rawValue)
+    }
+
+    /// 服务端吃掉过按下的功能键 (macOS 只映射了 F1): 它的松开也报给服务端 —— 注释切换键选
+    /// 功能键 + 按住档时, 服务端靠松开收起详细态。按下吃了, 松开同样吃掉。
+    private var eatenFnKeyCode: UInt16?
+
+    private func noteEatenFnKey(_ event: NSEvent, consumed: Bool, hostShortcut: Bool) {
+        let vk = KeyHandler.toWindowsVK(event.keyCode)
+        if consumed && !hostShortcut && (0x70...0x7B).contains(vk) {
+            eatenFnKeyCode = event.keyCode
+        }
+    }
+
+    private func handleKeyUp(_ event: NSEvent, client sender: Any!) -> Bool {
+        guard let code = eatenFnKeyCode, code == event.keyCode else { return false }
+        eatenFnKeyCode = nil
+        guard let bridge = bridge else { return true }
+        keySeq &+= 1
+        if let frame = KeyHandler.encodeKeyEvent(event, seq: keySeq) {
+            _ = try? sendAndApply(frame, on: bridge, sender: sender)
+        }
+        return true
     }
 
     // MARK: - 系统输入菜单 (点击菜单栏输入源图标弹出)
@@ -459,14 +573,17 @@ public class InputController: IMKInputController {
         currentClient = sender as? (IMKTextInput & NSObjectProtocol)
         CandidatePanelHost.shared.activeResponder = self
 
-        // 修饰键变化 (Shift/Ctrl 等): 做 tap 检测, 不消费事件本身。
+        // 修饰键变化 (Shift/Ctrl 等): 做 tap 检测, 不消费事件本身; 组字中的 ⌥ 看回包。
         if event.type == .flagsChanged {
-            handleFlagsChanged(event, client: sender)
-            return false
+            return handleFlagsChanged(event, client: sender)
+        }
+        if event.type == .keyUp {
+            return handleKeyUp(event, client: sender)
         }
         guard event.type == .keyDown else { return false }
         // 任意真实按键出现 → 取消当前修饰键 tap 判定 (Shift+X 不算 tap)。
         pendingModSawOther = true
+        ctrlRaw.noteOther()
         guard ensureConnected(), let bridge = bridge else {
             NSLog("WindInput[handle] bridge not connected (重连失败), pass through")
             return passThroughToHost(event)
@@ -499,6 +616,7 @@ public class InputController: IMKInputController {
 
         do {
             let consumed = try sendAndApply(frame, on: bridge, sender: sender, hostShortcut: hostShortcut)
+            noteEatenFnKey(event, consumed: consumed, hostShortcut: hostShortcut)
             return consumed ? true : passThroughToHost(event)
         } catch {
             // 服务重启后这条连接已死 (write→EPIPE 或 read→EOF)。重连到新服务
@@ -512,6 +630,7 @@ public class InputController: IMKInputController {
             guard let fresh = self.bridge else { return passThroughToHost(event) }
             do {
                 let consumed = try sendAndApply(frame, on: fresh, sender: sender, hostShortcut: hostShortcut)
+                noteEatenFnKey(event, consumed: consumed, hostShortcut: hostShortcut)
                 return consumed ? true : passThroughToHost(event)
             } catch {
                 NSLog("WindInput[handle] 重连后重试仍失败: \(error)")

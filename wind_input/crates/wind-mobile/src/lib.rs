@@ -72,6 +72,8 @@ pub use wind_host::{EditOp, KeyOutcome, TimingHint};
 /// [`MAX_WINDOW`] 要跟着透出而不是让宿主自己记一份：宿主传的 `limit` 超过它会被
 /// 核心静默截断，宿主若按自记的数字判断「还有没有更多」，就会在边界上反复拉空窗口。
 pub use wind_coordinator::candidate_pull::{CandidateWindow, MAX_WINDOW, TextSegment};
+/// 展开页「首单元读法」的数据类型，见 [`MobileCore::leading_readings`]。
+pub use wind_coordinator::leading_reading::LeadingReading;
 pub use wind_store::stats_report::StatsSummary;
 
 /// 候选帧：编码栏与候选栏一次渲染所需的全部数据。
@@ -175,7 +177,7 @@ pub struct UserWord {
     pub weight: i32,
 }
 
-/// 一条快捷短语（设置页「快捷短语」列表项）：系统与用户短语的叠加视图。
+/// 一条命令短语（设置页「命令短语」列表项）：系统与用户短语的叠加视图。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Phrase {
     pub code: String,
@@ -611,6 +613,15 @@ impl MobileCore {
             .collect()
     }
 
+    /// 活跃方案此刻的手动音节分隔符字符（`'` 或 `` ` ``）；`None` = 没有，宿主不该摆「分词」键。
+    ///
+    /// 宿主界面的「分词」键发这个字符，引擎侧按同一条规则认它（单一真相源，
+    /// 见 `Coordinator::manual_separator_char`）。取值随方案、`separator` 设置、
+    /// 码表方案的整句开关变化，**每次要用时再问**，别缓存。纯读。
+    pub fn separator_key(&self) -> Option<char> {
+        self.coord.manual_separator_char()
+    }
+
     /// 拉取候选全量的一个窗口。**纯读**，不改状态，可随时调。
     ///
     /// 别在每次按键都拉一大段：序列化与宿主侧的文字测量都在宿主主线程上。
@@ -636,6 +647,20 @@ impl MobileCore {
         let outcome = self.coord.select_candidate(index);
         self.coord.note_host_edits(&outcome.ops);
         outcome
+    }
+
+    /// 首单元的几种读法（展开页左栏画它）：同一串字母的不同切分、模糊音兄弟、只取声母。
+    /// 没得选 / 非全拼 / 无编码 → 空。**不改编码**，只影响候选。
+    pub fn leading_readings(&self) -> Vec<LeadingReading> {
+        self.coord.leading_readings()
+    }
+
+    /// 选定首单元的一种读法，候选按它重算（选回默认读法 = 清除）。返回值与
+    /// [`Self::key_down`] 同形；读法已过期（编码变了）→ `None`，什么都没改。
+    pub fn set_leading_reading(&self, head: &str, orig_len: usize) -> Option<KeyOutcome> {
+        let outcome = self.coord.set_leading_reading(head, orig_len)?;
+        self.coord.note_host_edits(&outcome.ops);
+        Some(outcome)
     }
 
     /// 第 `index`（**绝对下标**，与 [`Self::candidates`] 同一口径）个候选的长按菜单；
@@ -955,7 +980,7 @@ impl MobileCore {
             .map_err(|e| e.to_string())
     }
 
-    /// 全部快捷短语（系统 + 用户的叠加视图，按编码升序）。无存储时为空。
+    /// 全部命令短语（系统 + 用户的叠加视图，按编码升序）。无存储时为空。
     ///
     /// 与桌面设置页 `phrase.list` 同一份数据（`Store::list_phrases`），只是不做那层 `\n` 转义。
     pub fn phrases(&self) -> Vec<Phrase> {
@@ -1517,7 +1542,7 @@ mod user_words_tests {
         );
     }
 
-    /// 快捷短语：加 / 列 / 开关 / 删用户短语；只读时拒写。系统短语的叠加与出厂开关语义在
+    /// 命令短语：加 / 列 / 开关 / 删用户短语；只读时拒写。系统短语的叠加与出厂开关语义在
     /// wind-store 的测试里验，这里只验门面这一层。
     #[test]
     fn phrase_add_list_toggle_remove() {

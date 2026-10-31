@@ -1394,6 +1394,79 @@ fn separator_off_by_default_for_shuangpin() {
     );
 }
 
+/// 移动端 `auto` 在两个键都被占时夺取 `'`，桌面不动。
+///
+/// 双拼 `'` 是三选键、反引号归辅助码：桌面 `auto` 不得动选词键（见上一条
+/// [`separator_off_by_default_for_shuangpin`]，要断词显式写 `quote`）；手机是触屏，选词键
+/// 没人按，而「分词」键需要一个出路，所以移动端夺取 `'`（它作三选键只是数字 3 的别名）。
+/// 编译期常量 `use_mobile_overrides()` 在主机上恒为桌面，故用 `manual_separator_char_as`
+/// 显式按移动端求值。
+#[test]
+fn separator_auto_takes_quote_on_mobile_only() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.schema.available = vec!["shuangpin".into(), "pinyin".into()];
+    cfg.schema.active = "shuangpin".into(); // separator 保持默认 auto
+    let coord = Coordinator::new_headless(cfg, Some(&d));
+    assert_eq!(
+        coord.manual_separator_char_as(false),
+        None,
+        "桌面 auto 不动选词键"
+    );
+    assert_eq!(
+        coord.manual_separator_char_as(true),
+        Some('\''),
+        "移动端 auto 夺取 `'`"
+    );
+}
+
+/// 移动端也遵循 `separator = "none"`：方案级关掉后不夺 `'`，宿主也拿不到分隔符字符。
+#[test]
+fn separator_none_override_wins_over_mobile_takeover() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        return;
+    }
+    let ov = std::env::temp_dir().join("wind_sp_sep_none_mobile_ov");
+    let _ = std::fs::remove_dir_all(&ov);
+    std::fs::create_dir_all(&ov).expect("建 override 目录");
+    std::fs::write(
+        ov.join("shuangpin.toml"),
+        "[engine.pinyin]\nseparator = \"none\"\n",
+    )
+    .expect("写方案覆盖");
+    let mut cfg = config_with("pinyin");
+    cfg.schema.available = vec!["shuangpin".into(), "pinyin".into()];
+    cfg.schema.active = "shuangpin".into();
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&d), Some(ov));
+    assert_eq!(coord.manual_separator_char_as(true), None);
+}
+
+/// 全拼的宿主分隔符字符是反引号（`'` 是选词键、反引号空闲），夺取只发生在两个键都被占时。
+#[test]
+fn separator_char_for_pinyin_is_backtick() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    assert_eq!(coord.manual_separator_char(), Some('`'));
+}
+
+/// 方案级 `separator = "none"` 关掉后，宿主也拿不到分隔符字符（不摆分词键）。
+#[test]
+fn separator_char_is_none_when_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = override_with_separator("char_none", "none");
+    let coord =
+        Coordinator::new_headless_with_override(config_with("pinyin"), Some(&data_dir()), Some(ov));
+    assert_eq!(coord.manual_separator_char(), None);
+}
+
 /// 双拼显式配 `separator = "quote"` 后，`'` 作分隔符压入缓冲。
 ///
 /// 这是「引擎侧支持 + 键位判定放行」两件事在协调器这一层的会合点。

@@ -37,7 +37,7 @@
 | 混输子引擎 | 与独立方案各一份 | 构建混输方案时新建，不复用表内实例 | 混输 | `manager.rs:5529/5571` |
 | 反查索引（主码表） | wubi86 2.3 MB 常驻（≤3 MB 进堆） | `prewarm_indexes` **无条件** | 悬停[编码]、`${code_rev}`、联想、辅助码、自动造词 | `coordinator.rs:4699-4708` |
 | `UserTextIndex` | 推断 19 万词 ≈ 5 MB/份，最多 4 份 | 悬停[编码]段按候选逐条触发；`${code_rev}` 经 `codetable_reverse_hint` 也会带上 | 同上 | `text_codes.rs:89`、`manager.rs:1273` |
-| 拆字表 | 推断 ≈ 0.8 MB | 构造期 `build()` 恒加载（`sync_chaizi_assets` 只管切方案 / 重载） | `${chaizi*}`（出厂注释不含，悬停拆字段出厂关） | `coordinator.rs:2524`、`wind-reverse/lib.rs:842` |
+| 拆字表 | 推断 ≈ 0.8 MB | 构造期 `build()` 恒加载（`sync_chaizi_assets` 只管切方案 / 重载） | `${chaizi*}`（出厂详细态模板引用，故启动即装；悬停拆字段出厂关） | `coordinator.rs:2524`、`wind-reverse/lib.rs:842` |
 | 简繁表 s2t + t2s | 实测约 1.6 + 0.2 MB | 启动恒加载，不看开关 | 简繁开着时上屏 | `coordinator.rs:2410-2428` |
 | `CharPinyinIndex` | 约 9.2 MB | 首次加词 / `${pinyin}` 用于非拼音候选 | 加词反推拼音 | `pinyin/generate.rs:29` |
 | redb 读缓存 | 实测 19 万词 ≈ 41 MB | 读到就进，空闲 60 秒才丢 | 用户词 / 词频 | `wind-store/store.rs:37` |
@@ -92,9 +92,9 @@ pub(crate) struct DataNeeds {
 
 判定要点（S1 实施时补全）：
 - 方案级模板取**全部已安装方案**的并集，宁可多装一份拆字表也不要切过去才空。
-- 悬停的逐字段 `${code_rev}` 走 `eval_text_var`，**不看** `code_hint_source`；`${code_source}` 单独
+- 悬停的逐字段 `${code_rev}` 走 `eval_text_var`，不限候选来源；`${code_source}` 单独
   出现也要查编码——两者都计入 `reverse_index`。
-- 出厂结果：反查要、用户层要（全局模板含 `${code_rev}` 且临拼来源出厂 `auto`），拆字、简繁不要。
+- 出厂结果：反查要、用户层要（临时拼音、快捷输入出厂分到含 `${code_rev}` 的「编码」模板），拆字、简繁不要。
   即出厂只省拆字 + 简繁约 2.6 MB（推断）；主要收益在用户关掉功能之后。
 
 判定材料已经现成：`Template::references`（`comment.rs:625`）、`CompiledTooltip::references`

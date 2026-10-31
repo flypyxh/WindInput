@@ -314,6 +314,10 @@ impl ImeController for CoordIme {
             if is_feature_target(target) {
                 return c.cmd_set_feature(target, None);
             }
+            // 写盘失败要报给命令栏。
+            if target == "comment" {
+                return c.cmd_comment_state(None);
+            }
             c.cmd_ime_toggle(target);
         }
         Ok(())
@@ -326,6 +330,21 @@ impl ImeController for CoordIme {
             c.cmd_set_feature(target, Some(on))
         } else {
             c.cmd_set_state(target, on)
+        }
+    }
+    fn set_value(&self, target: &str, value: &str) -> anyhow::Result<()> {
+        let Some(c) = self.0.upgrade() else {
+            return Ok(());
+        };
+        match (target, value) {
+            ("comment", "default") => {
+                c.cmd_comment_state(Some(wind_config::comment_lib::CommentState::Default))
+            }
+            ("comment", "detail") => {
+                c.cmd_comment_state(Some(wind_config::comment_lib::CommentState::Detail))
+            }
+            ("comment", _) => anyhow::bail!("comment 的状态需要 default / detail，收到 {value:?}"),
+            _ => anyhow::bail!("ime.set 不支持 target {target:?}"),
         }
     }
     fn open_setting(&self, page: &str, args: &str) -> anyhow::Result<()> {
@@ -356,6 +375,14 @@ impl ImeController for CoordIme {
     fn undo_commit(&self) -> anyhow::Result<()> {
         if let Some(c) = self.0.upgrade() {
             c.cmd_undo_commit();
+        }
+        Ok(())
+    }
+    fn reload_config(&self) -> anyhow::Result<()> {
+        if let Some(c) = self.0.upgrade()
+            && !c.reload_user_config()
+        {
+            anyhow::bail!("配置读取失败，沿用当前配置（详见日志）");
         }
         Ok(())
     }
@@ -643,6 +670,7 @@ pub(crate) fn state_unchanged_text(target: &str, on: bool) -> String {
 pub(crate) fn set_comment_dict(
     configured: &[wind_config::CommentDictSpec],
     auto_ids: &[String],
+    builtin_ids: &[String],
     id: &str,
     want: Option<bool>,
 ) -> anyhow::Result<Option<(Vec<wind_config::CommentDictSpec>, bool)>> {
@@ -669,6 +697,20 @@ pub(crate) fn set_comment_dict(
         });
         return Ok(Some((out, false)));
     }
+    if builtin_ids.iter().any(|b| b == id) {
+        // 未登记的内置库恒为开（见 `merge_comment_dicts`）
+        let on = want.unwrap_or(false);
+        if on {
+            return Ok(None);
+        }
+        out.push(wind_config::CommentDictSpec {
+            id: id.to_string(),
+            builtin: true,
+            enabled: false,
+            ..Default::default()
+        });
+        return Ok(Some((out, false)));
+    }
     anyhow::bail!("没有 id 为 {id:?} 的注释词库（见设置 → 候选标注 → 注释词库）")
 }
 
@@ -677,6 +719,20 @@ pub(crate) fn set_comment_dict(
 struct CoordConfig(Weak<Coordinator>);
 
 impl CoordConfig {
+    /// `set` 的共同实现。`quiet` 只压热重载**成功**的「设置已更新」；写回 / 重载失败
+    /// 的提示两档都照常弹（`config.set` 词条里写错键该当场看见，静默只会变成「没生效」）。
+    fn set_inner(this: &CoordConfig, key: &str, value: &str, quiet: bool) -> anyhow::Result<()> {
+        use wind_config::config_schema::{parse_str_value, validate};
+        let v = parse_str_value(key, value).map_err(|e| anyhow::anyhow!("{e}"))?;
+        validate(key, &v).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let parts: Vec<&str> = key.split('.').collect();
+        wind_config::Config::set_user_value(&parts, v)?;
+        if let Some(c) = this.0.upgrade() {
+            c.reload_user_config_quiet(quiet);
+        }
+        Ok(())
+    }
+
     /// 读某键当前值（四层合并后），字符串裸值、其余紧凑 JSON。
     ///
     /// `require_trustworthy` = 调用方要拿这个值**当种子写回**（`toggle`）。此时本次加载
@@ -715,15 +771,11 @@ impl ConfigService for CoordConfig {
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        use wind_config::config_schema::{parse_str_value, validate};
-        let v = parse_str_value(key, value).map_err(|e| anyhow::anyhow!("{e}"))?;
-        validate(key, &v).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let parts: Vec<&str> = key.split('.').collect();
-        wind_config::Config::set_user_value(&parts, v)?;
-        if let Some(c) = self.0.upgrade() {
-            c.reload_user_config();
-        }
-        Ok(())
+        Self::set_inner(self, key, value, false)
+    }
+
+    fn set_quiet(&self, key: &str, value: &str, quiet: bool) -> anyhow::Result<()> {
+        Self::set_inner(self, key, value, quiet)
     }
 
     fn toggle(&self, key: &str) -> anyhow::Result<String> {
@@ -1240,13 +1292,15 @@ mod feature_toggle_tests {
     #[test]
     fn flips_existing_entry_in_place() {
         let cfg = [manual("en", true), manual("chaifen", false)];
-        let (list, on) = set_comment_dict(&cfg, &[], "chaifen", None)
+        let (list, on) = set_comment_dict(&cfg, &[], &[], "chaifen", None)
             .unwrap()
             .unwrap();
         assert!(on);
         assert_eq!(list.len(), 2);
         assert!(list[0].enabled && list[1].enabled);
-        let (list, on) = set_comment_dict(&list, &[], "en", None).unwrap().unwrap();
+        let (list, on) = set_comment_dict(&list, &[], &[], "en", None)
+            .unwrap()
+            .unwrap();
         assert!(!on && !list[0].enabled);
     }
 
@@ -1255,11 +1309,11 @@ mod feature_toggle_tests {
     fn set_is_noop_when_already_in_state() {
         let cfg = [manual("en", true)];
         assert!(
-            set_comment_dict(&cfg, &[], "en", Some(true))
+            set_comment_dict(&cfg, &[], &[], "en", Some(true))
                 .unwrap()
                 .is_none()
         );
-        let (list, on) = set_comment_dict(&cfg, &[], "en", Some(false))
+        let (list, on) = set_comment_dict(&cfg, &[], &[], "en", Some(false))
             .unwrap()
             .unwrap();
         assert!(!on && !list[0].enabled);
@@ -1271,12 +1325,12 @@ mod feature_toggle_tests {
         let cfg = [manual("en", true)];
         let auto = vec!["auto:pinyin/cn_dicts/corrections.dict.yaml".to_string()];
         assert!(
-            set_comment_dict(&cfg, &auto, &auto[0], Some(true))
+            set_comment_dict(&cfg, &auto, &[], &auto[0], Some(true))
                 .unwrap()
                 .is_none()
         );
         for want in [None, Some(false)] {
-            let (list, on) = set_comment_dict(&cfg, &auto, &auto[0], want)
+            let (list, on) = set_comment_dict(&cfg, &auto, &[], &auto[0], want)
                 .unwrap()
                 .unwrap();
             assert!(!on);
@@ -1285,9 +1339,29 @@ mod feature_toggle_tests {
         }
     }
 
+    /// 内置库（未登记时是开的）：要开不动作；要关 / 取反就追加一条关着的 builtin 空壳。
+    #[test]
+    fn builtin_dict_gets_a_disabled_shell() {
+        let cfg = [manual("en", true)];
+        let builtin = vec!["zh_en".to_string()];
+        assert!(
+            set_comment_dict(&cfg, &[], &builtin, "zh_en", Some(true))
+                .unwrap()
+                .is_none()
+        );
+        for want in [None, Some(false)] {
+            let (list, on) = set_comment_dict(&cfg, &[], &builtin, "zh_en", want)
+                .unwrap()
+                .unwrap();
+            assert!(!on);
+            let shell = &list[1];
+            assert!(shell.id == "zh_en" && shell.builtin && !shell.enabled && !shell.auto);
+        }
+    }
+
     #[test]
     fn unknown_id_is_an_error() {
-        assert!(set_comment_dict(&[manual("en", true)], &[], "nope", Some(true)).is_err());
+        assert!(set_comment_dict(&[manual("en", true)], &[], &[], "nope", Some(true)).is_err());
     }
 }
 

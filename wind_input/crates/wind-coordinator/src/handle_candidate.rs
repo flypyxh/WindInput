@@ -1707,7 +1707,10 @@ impl Coordinator {
             // 补全候选塞进来（见 `ConvertResult::completion_hint`），故这个「空」判得准。
             // 不设码长闸门（论坛 t302）：满码长乃至超码长空码也补，与引擎侧 `completion_hints` 同口径。
             let complete_fallback = exact_only && ct.single_code_complete && candidates.is_empty();
-            let prefix_hits = if !exact_only || complete_fallback {
+            // `input.phrase.prefix_match` 关闭前缀列举（GH#264）：只留上面的精确码短语。空码补全兜底
+            // （`complete_fallback`）是精确匹配自己的功能，不受它管。
+            let prefix_match = self.rt().config.input.phrase.prefix_match;
+            let prefix_hits = if (prefix_match && !exact_only) || complete_fallback {
                 phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix, &phrase_scope)
             } else {
                 Vec::new()
@@ -2588,6 +2591,84 @@ impl Coordinator {
 
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
     /// 返回输入结局（全码自动上屏 / 满码空码清空）；多数调用方忽略，仅正向输入字母时消费。
+    /// 光标限定查询的截断位（字节）：`Some(n)` = 本轮候选只按 `input_buffer[..n]` 去问引擎。
+    ///
+    /// 手机端的拼音「中间修正」：光标挪到某个音节后面，候选就只剩这个音节（及其前缀）的字，
+    /// 选中后上屏、后半截留在编码栏续打（复用分步上屏，见 `partial`）。
+    ///
+    /// ⚠️ **默认关**（[`cursor_by_syllable`]）：电脑端 ←/→ 移光标**不改候选**是既有行为
+    /// （`State::input_cursor_pos` 注释：光标不参与引擎查询）。这是给电脑端「移光标改拼音」准备的
+    /// 机制，打开它之前不会改变任何现有行为；手机端不走它，用 [`crate::leading_reading`]。
+    /// 电脑端接入时只需调 [`set_cursor_by_syllable`]（由配置项驱动），下游无需再动。
+    /// 仅限普通输入的拼音方案；overlay 模式（临时拼音等）与码表方案不进。
+    fn query_cut(&self, state: &State) -> Option<usize> {
+        cut_position(
+            cursor_by_syllable(),
+            &state.input_buffer,
+            state.input_cursor_pos,
+            Self::overlay_caret_parts(state).is_none() && self.engine_mgr.is_pinyin(),
+        )
+    }
+
+    /// [`Self::build_candidates`] 的光标感知入口：光标在编码中间时只查光标前那一段。
+    ///
+    /// 做法是**临时**把缓冲截到光标处喂给引擎，查完立刻还原——引擎、短语、词频这几十处读
+    /// `input_buffer` 的地方全都看到一致的「前缀」，一处不用改。还原后补两件事：
+    /// - 候选的 `consumed_length` 一律夹到截断位。引擎对「吃掉整个前缀」的候选常标 0（未标注）
+    ///   或等于前缀长，选词那头会把它们当成「整串匹配」整体上屏、连后半截一起吞掉；夹成截断位后
+    ///   必走分步上屏，后半截留下来。
+    /// - 组合区拆分串换成**整串**的切分（`fang'xiang`），否则编码栏只剩光标前半截。
+    pub(crate) fn build_candidates_at_cursor(
+        &self,
+        state: &mut State,
+        limit: usize,
+    ) -> (usize, InputOutcome) {
+        // 手机端「首单元读法」：选了非默认读法时，按改写后的查询串问引擎（见 `leading_reading`）。
+        if let Some(applied) = state
+            .leading
+            .clone()
+            .filter(|a| a.buffer == state.input_buffer)
+        {
+            return self.build_candidates_with_leading(state, limit, &applied);
+        }
+        let Some(cut) = self.query_cut(state) else {
+            return self.build_candidates(state, limit);
+        };
+        let full = state.input_buffer.clone();
+        let full_cased = state.input_buffer_cased.clone();
+        let cased_ok = preedit_cursor::cased_is_valid(&full, &full_cased);
+        state.input_buffer.truncate(cut);
+        if cased_ok {
+            state.input_buffer_cased.truncate(cut);
+        }
+        let result = self.build_candidates(state, limit);
+        state.input_buffer = full;
+        state.input_buffer_cased = full_cased;
+        for c in &mut state.candidates {
+            if c.consumed_length == 0 || c.consumed_length > cut {
+                c.consumed_length = cut;
+            }
+        }
+        let body = self
+            .engine_mgr
+            .convert(&state.input_buffer, 1)
+            .preedit_pinyin;
+        if !body.is_empty() {
+            // 候选自带的切分（`meta.preedit_split`）只覆盖被查询的前缀，且显示时优先于整串拆分：
+            // 不补后半截，编码栏就只剩光标前那几个字母（`fang` 吞掉 `xiang`）。
+            let tail = tail_after_letters(&body, cut);
+            if !tail.is_empty() {
+                for c in &mut state.candidates {
+                    if let Some(own) = c.meta.preedit_split.as_deref() {
+                        c.meta.preedit_split = Some(format!("{own}'{tail}").into());
+                    }
+                }
+            }
+            state.preedit_split_body = body;
+        }
+        result
+    }
+
     pub(crate) fn update_candidates(&self, state: &mut State) -> InputOutcome {
         let outcome = self.refill_candidates(state);
         self.grid_resume(state);
@@ -2595,6 +2676,10 @@ impl Coordinator {
     }
 
     fn refill_candidates(&self, state: &mut State) -> InputOutcome {
+        // 联想窗被新组合替换（联想态下打字母不经 `exit_assoc`）：注释翻转随旧窗作废。
+        if state.assoc_active() {
+            state.clear_comment_flips();
+        }
         state.candidates.clear();
         state.preedit = state.input_buffer.clone();
         state.preedit_split_body.clear();
@@ -2659,7 +2744,7 @@ impl Coordinator {
             self.initial_candidate_limit(&state.input_buffer)
         };
         let t0 = std::time::Instant::now();
-        let (engine_count, outcome) = self.build_candidates(state, limit);
+        let (engine_count, outcome) = self.build_candidates_at_cursor(state, limit);
         let t_build = t0.elapsed();
         // 引导字母的「重复上屏」：输入恰为单个引导字母时，把最近一次上屏内容注入候选顶部
         // （对齐 Go），供「引导键 + 选词」重复上一次输入。资格判定见
@@ -2812,7 +2897,7 @@ impl Coordinator {
         }
         let prev_limit = state.candidate_limit;
         // 翻页扩展不消费全码自动上屏（仅正向输入字母时才上屏）。
-        let (engine_count, _) = self.build_candidates(state, new_limit);
+        let (engine_count, _) = self.build_candidates_at_cursor(state, new_limit);
         // 重建后立刻重新展开变体（列表整份重建，变体须随之重展）。
         self.expand_s2t_variants(state);
         // 展开态正在按分类筛选：重建出来的是完整列表，重新筛一遍（见 `grid_reapply_filter`）。
@@ -3086,49 +3171,90 @@ impl Coordinator {
     /// `separator` 本身也按方案取（见 `EngineManager::pinyin_separator_mode_of`）：
     /// 临拼引用哪个拼音方案，就用那个方案生效的分隔符策略。
     pub(crate) fn manual_separator_key_of(&self, key_code: u32, schema_id: &str) -> bool {
+        self.manual_separator_vk_of(schema_id) == Some(key_code)
+    }
+
+    /// 指定方案此刻的手动分隔符**是哪个键**；方案不支持 / 策略为 `none` / 没有键可用时 `None`。
+    ///
+    /// 「是不是分隔符」（[`Self::manual_separator_key_of`]）与「宿主界面该给哪个键」
+    /// （[`Self::manual_separator_char`]，手机的「分词」键用）都从这里取，**单一真相源**：
+    /// 键位判定有两份就会出现界面发 `'` 而引擎认反引号，且完全静默。
+    ///
+    /// 规则：
+    /// - 拼音族、码表**整句**放行，其余引擎 `None`（整句是分隔符的消歧手段：二简「旬 qj」
+    ///   与一简「我 q」+「是 j」击键串同形，打分无从区分）。
+    /// - `none` → `None`；`quote` → `'`；`backtick` → 反引号。显式模式尊重用户指定值。
+    /// - `auto`（默认 / 未知值）依次找：
+    ///   1. `'` 空闲（不是选词键、方案 `[key_actions]` 没绑）→ `'`；
+    ///   2. 反引号空闲（同样两项）→ 反引号；
+    ///   3. 都不空闲：桌面**不启用**；移动端夺取 `'`（见下）。
+    ///
+    /// ★ 第 3 步桌面与移动端分叉，是刻意的。桌面的 `auto` **不得动选词键**：用户的三选键
+    /// 是实打实的肌肉记忆，双拼（`'` 三选、反引号辅助码）与五笔整句（`'` 三选、反引号
+    /// 临时拼音）下 `auto` 因此不启用，要断词显式写 `separator = "quote"`（或 `backtick`）。
+    /// 手机是触屏，候选靠点、`;` `'` 这两个选词键在软键盘上没有人去按，而「分词」键
+    /// 却需要一个出路，否则双拼、五笔整句下 ⇧ 无事可做。所以移动端 `auto` 夺取 `'`，
+    /// 分隔符臂本就排在选词分派之前，「收进缓冲」与「不再作选词键」是同一个判断的两面。
+    /// 移动端不愿丢它的写 `separator = "none"`。
+    ///
+    /// ⚠️ 两端都不夺 `[key_actions]` 已绑的键：那条绑定被夺后只剩一条 warn，用户看到
+    /// 「配了没反应」。
+    ///
+    /// 每次实时求值（不缓存），`separator`、`select_key_groups` 热更新即时生效。
+    /// 缓冲是否为空由调用方判定（空缓冲维持标点路径）。
+    ///
+    /// ★★ overlay 必须走 `_of(&schema)` 版本。临拼在纯五笔方案下引用的是拼音方案，而
+    /// `engine_mgr.is_pinyin()` 问的是**活跃**引擎（= 码表）⇒ 恒 false ⇒ 临拼下分隔符
+    /// 永远不生效，且完全静默。凡「按当前引擎类型决定行为」的判据，在 overlay 里都需要
+    /// 一个 `_of(&schema)` 版本。`separator` 本身也按方案取（见
+    /// `EngineManager::pinyin_separator_mode_of`）。
+    pub(crate) fn manual_separator_vk_of(&self, schema_id: &str) -> Option<u32> {
+        self.manual_separator_vk_resolve(schema_id, crate::handle_assoc::use_mobile_overrides())
+    }
+
+    /// [`Self::manual_separator_vk_of`] 的实体，`mobile` 显式传入——编译期常量
+    /// `use_mobile_overrides()` 在主机上恒为假，不拆出来就没法在桌面测试里守住移动端那一支。
+    fn manual_separator_vk_resolve(&self, schema_id: &str, mobile: bool) -> Option<u32> {
         use wind_keys::keymap::{VK_BACKTICK, VK_QUOTE};
-        // 码表整句与拼音共用下面那套键位判定；两者都不成立时该键维持原本语义。
-        //
-        // ★ 双拼同样放行（原先在此早退，理由「buffer 会与 preedit 发散」）。发散那件事
-        // 已在引擎侧解决：`ShuangpinConverter::convert` 把 `'` 当配对硬边界自行消化，
-        // preedit 逐字节重建使手动与自动的分隔符合流，`consumed_length` 也把那一键算进去。
-        // 见 `docs/design/shuangpin-separator.md`。
-        //
-        // ⚠️ 放行的是**键位判定**，不是默认开启：双拼出厂 `separator = "none"`
-        // （反引号在双拼里归辅助码，见 `shuangpin.schema.toml`），要用得显式配成 `quote`。
         let pinyin_ok = self.engine_mgr.is_pinyin_of(schema_id);
         if !pinyin_ok && !self.engine_mgr.sentence_input_enabled_of(schema_id) {
-            return false;
+            return None;
         }
         match self.engine_mgr.pinyin_separator_mode_of(schema_id).as_str() {
-            "none" => false,
-            "quote" => key_code == VK_QUOTE,
-            "backtick" => key_code == VK_BACKTICK,
-            // auto（及其它未知值兜底）：挑一个当前**空闲**的符号键作分隔符。
-            //
-            // 两类占用都要避让：
-            //  ① 选词键——出厂 `semicolon_quote` 含 `'`，夺走它等于让三选不可用；
-            //  ② 本方案 `[key_actions]` 已绑的功能键——分隔符臂在按键裁决里排在 key_actions
-            //     之前，夺走的话那条绑定**只剩一条 warn 日志**，用户看到的是「配了没反应」。
-            //
-            // ★ 两个键都不空闲时 auto 退化成「不启用」。双拼正是这种情况：`'` 是选词键、
-            // 反引号出厂给了辅助码（`shuangpin.schema.toml`），于是双拼虽然支持分隔符，
-            // auto 下却不会自动占用任何键——要用得显式写 `separator = "quote"`。
-            //
-            // ⚠️ 这条避让**不能改成「双拼一律不给分隔符」**：那会让用户显式配的 `quote`
-            // 也一并失效，而显式模式的含义就是「我知道我在做什么」。判据的维度是
-            // 「这个键空不空闲」，不是「这是什么引擎」。
+            "none" => None,
+            "quote" => Some(VK_QUOTE),
+            "backtick" => Some(VK_BACKTICK),
             _ => {
-                let free = |vk: u32| {
-                    self.select_key_offset(vk).is_none()
-                        && self.bound_action_in_schema(vk, schema_id).is_none()
-                };
+                let bound = |vk: u32| self.bound_action_in_schema(vk, schema_id).is_some();
+                let free = |vk: u32| self.select_key_offset(vk).is_none() && !bound(vk);
                 if free(VK_QUOTE) {
-                    key_code == VK_QUOTE
+                    Some(VK_QUOTE)
+                } else if free(VK_BACKTICK) {
+                    Some(VK_BACKTICK)
+                } else if mobile && !bound(VK_QUOTE) {
+                    Some(VK_QUOTE)
                 } else {
-                    key_code == VK_BACKTICK && free(VK_BACKTICK)
+                    None
                 }
             }
+        }
+    }
+
+    /// 活跃方案的手动分隔符字符（`'` 或 `` ` ``），宿主界面据此决定「分词」键发什么；
+    /// `None` = 此刻没有分隔符，宿主不该摆分词键。见 [`Self::manual_separator_vk_of`]。
+    pub fn manual_separator_char(&self) -> Option<char> {
+        self.manual_separator_char_as(crate::handle_assoc::use_mobile_overrides())
+    }
+
+    /// 同 [`Self::manual_separator_char`]，但**指定按移动端还是桌面**求值。只给测试用：
+    /// 编译期常量在主机上恒为桌面，移动端那一支（`auto` 夺取 `'`）不经它就测不到。
+    #[doc(hidden)]
+    pub fn manual_separator_char_as(&self, mobile: bool) -> Option<char> {
+        use wind_keys::keymap::{VK_BACKTICK, VK_QUOTE};
+        match self.manual_separator_vk_resolve(&self.engine_mgr.active_schema_id(), mobile)? {
+            VK_QUOTE => Some('\''),
+            VK_BACKTICK => Some('`'),
+            _ => None,
         }
     }
 
@@ -4683,8 +4809,9 @@ impl Coordinator {
         preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
         state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
         // 首选已上屏，余码是新的一次组合：不继承上一次的展开（按键入口那道「没有输入会话」
-        // 判不到——这一键按下时候选还在）。
+        // 判不到——这一键按下时候选还在）。注释翻转同理。
         state.grid_keep = false;
+        state.clear_comment_flips();
         let _ = self.update_candidates(state); // 余码候选（不再消费其结局）
         let preedit = state.preedit.clone();
         // 顶码 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合起点已变。
@@ -4739,6 +4866,8 @@ impl Coordinator {
     /// 这类不是模式的动作不清，联想候选就会挂着；清候选也清不掉编码栏标识与自动隐藏计时。
     pub(crate) fn take_committed_with_highlight(&self, state: &mut State) -> Option<String> {
         self.exit_assoc(state, crate::handle_assoc::AssocExit::TopCommitKey);
+        // 顶屏进模式 = 旧候选窗关了，注释翻转不带进新模式。
+        state.clear_comment_flips();
         // 顶屏的高亮候选并进已转换段后造词 / 推 6b（见 `learn_on_top_commit`）。须在
         // `take_committed` 清段之前；主输入路归属活跃方案。
         let highlight = self.highlight_for_top_commit(state);
@@ -4911,6 +5040,8 @@ impl Coordinator {
             return self.spawn_command_action(cand, input);
         }
         let src = cand.phrase_template.clone();
+        // 余码是新的一次组合，不继承注释翻转（同 `commit_top_text`）。
+        state.clear_comment_flips();
         state.input_buffer = remainder.to_string();
         preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
         state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
@@ -5634,7 +5765,7 @@ impl Coordinator {
             };
             drop(state);
             // commit_selected 已按分支自行 notify_ui_update / notify_ui_hide，此处不再重复。
-            self.push_no_key_ctx_action(&act, chinese_mode);
+            self.push_no_key_ctx_action(&act, chinese_mode, true);
             return Some(act);
         }
         // ── 以下为 overlay 模式（active != None）路径 ──
@@ -5697,7 +5828,7 @@ impl Coordinator {
                 self.push_server
                     .push_commit_to_active(&wind_ipc::codec::encode_clear_composition());
             }
-            _ => self.push_no_key_ctx_action(&act, chinese_mode),
+            _ => self.push_no_key_ctx_action(&act, chinese_mode, false),
         }
         Some(act)
     }
@@ -5730,8 +5861,21 @@ impl Coordinator {
     /// 也就是说这里的缺口仍在：`handle_addword.rs` 里有七处返回 `ClearComposition`，
     /// 加词面板的鼠标点选哪天接进本函数就会再踩一次。届时应当**在此补一臂**，而不是
     /// 在调用点做第三次特判 —— 修现象不修机制，每次修复都正确，每次都不减少下次的概率。
-    pub(crate) fn push_no_key_ctx_action(&self, act: &KeyAction, chinese_mode: bool) {
-        match act {
+    ///
+    /// `main_path`：来自主输入路（非临英 / 快捷输入等 overlay）。组合区里的音节分隔符要照
+    /// `ui.candidate.syllable_separator` 换掉（键盘路径在 `handle_key_event_policed` 收口里换，
+    /// 这条通路不经过它，漏换的现象是鼠标点选首词后应用里又冒出 `'`）。
+    pub(crate) fn push_no_key_ctx_action(
+        &self,
+        act: &KeyAction,
+        chinese_mode: bool,
+        main_path: bool,
+    ) {
+        let act = match self.syllable_separator_for(main_path) {
+            Some(sep) => act.clone().with_syllable_separator(&sep),
+            None => act.clone(),
+        };
+        match &act {
             KeyAction::UpdateComposition { text, caret_pos } => {
                 let encoded = wind_ipc::codec::encode_update_composition(text, *caret_pos);
                 self.push_server.push_commit_to_active(&encoded);
@@ -8663,6 +8807,49 @@ mod expand_stop_tests {
 }
 
 /// 移动端拼音单字母收紧首批上限；桌面、多字母、其它引擎一律不动。
+/// 拼音拆分串（`fang'xiang`）里，跳过前 `letters` 个字母（及随后的隔音符）之后剩下的部分。
+/// `tail_after_letters("fang'xiang", 4)` = `xiang`；字母数用尽 → 空串。
+pub(crate) fn tail_after_letters(body: &str, letters: usize) -> String {
+    let mut seen = 0usize;
+    for (i, ch) in body.char_indices() {
+        if seen >= letters {
+            return body[i..].trim_start_matches('\'').to_string();
+        }
+        if ch != '\'' {
+            seen += 1;
+        }
+    }
+    String::new()
+}
+
+static CURSOR_BY_SYLLABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 打开 / 关闭「拼音按音节移光标、候选只查光标前一段」。默认关；电脑端的配置项接入时调用。
+pub fn set_cursor_by_syllable(on: bool) {
+    CURSOR_BY_SYLLABLE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn cursor_by_syllable() -> bool {
+    CURSOR_BY_SYLLABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`Coordinator::query_cut`] 的判据（纯函数，便于测试）：只有手机端、光标严格落在编码中间
+/// 且在字符边界、普通拼音输入时才截断。
+pub(crate) fn cut_position(
+    mobile: bool,
+    buffer: &str,
+    cursor: usize,
+    plain_pinyin: bool,
+) -> Option<usize> {
+    (mobile
+        && plain_pinyin
+        && cursor > 0
+        && cursor < buffer.len()
+        && buffer.is_char_boundary(cursor))
+    .then_some(cursor)
+}
+
 #[cfg(test)]
 mod mobile_limit_tests {
     use crate::coordinator::Coordinator;
@@ -8694,5 +8881,51 @@ mod mobile_limit_tests {
                 "{other:?} 不受影响（英文 t 曾因上限太小打不出 then）"
             );
         }
+    }
+
+    #[test]
+    fn cut_position_only_for_mobile_pinyin_with_cursor_inside() {
+        assert_eq!(
+            crate::handle_candidate::cut_position(true, "fangxiang", 4, true),
+            Some(4)
+        );
+        assert_eq!(
+            crate::handle_candidate::cut_position(true, "fangxiang", 9, true),
+            None,
+            "光标在末尾 = 整串"
+        );
+        assert_eq!(
+            crate::handle_candidate::cut_position(true, "fangxiang", 0, true),
+            None,
+            "光标在开头无前缀可查"
+        );
+        assert_eq!(
+            crate::handle_candidate::cut_position(false, "fangxiang", 4, true),
+            None,
+            "电脑端不改既有行为"
+        );
+        assert_eq!(
+            crate::handle_candidate::cut_position(true, "fangxiang", 4, false),
+            None,
+            "码表 / overlay 不进"
+        );
+        assert_eq!(
+            crate::handle_candidate::cut_position(true, "你好", 1, true),
+            None,
+            "非字符边界"
+        );
+    }
+
+    #[test]
+    fn tail_after_letters_skips_separators() {
+        use crate::handle_candidate::tail_after_letters;
+        assert_eq!(tail_after_letters("fang'xiang", 4), "xiang");
+        assert_eq!(
+            tail_after_letters("fang'xiang", 6),
+            "ang",
+            "光标在音节中间：余下半个音节"
+        );
+        assert_eq!(tail_after_letters("fang'xiang", 9), "");
+        assert_eq!(tail_after_letters("ni'hao'a", 2), "hao'a");
     }
 }

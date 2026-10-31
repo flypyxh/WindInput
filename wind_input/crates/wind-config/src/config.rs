@@ -175,6 +175,27 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 落盘、再清本清单。此前它刻意不登记、迁移也不摘旧键，于是旧键在用户文件里常驻，设置页把
     // 竖排改回 0（等于出厂 ⇒ 新键被删）后，下次 load 又被旧键补回原值。
     &["ui", "candidate", "comment_max_chars"],
+    // 候选注释重构（docs/design/candidate-comment-templates.md）：注释模板、开关与三个编码来源
+    // 并入 `[ui.comment]`。**不做值迁移**（维护者定）：会配这些的都是深度用户，让他们重新设置，
+    // 破坏性变更登记在 docs/config-key-migration.md。`schema.mix_modes[]` 条目里的同名键是数组
+    // 元素、无法按路径列出，留在原处无人读取。
+    &["ui", "candidate", "comment_enabled"],
+    &["ui", "candidate", "comment_template_vertical"],
+    &["ui", "candidate", "comment_template_horizontal"],
+    &["input", "temp_english", "comment_template_vertical"],
+    &["input", "temp_english", "comment_template_horizontal"],
+    &["input", "temp_pinyin", "comment_template_vertical"],
+    &["input", "temp_pinyin", "comment_template_horizontal"],
+    &["input", "url", "comment_template_vertical"],
+    &["input", "url", "comment_template_horizontal"],
+    &["input", "email", "comment_template_vertical"],
+    &["input", "email", "comment_template_horizontal"],
+    &["input", "unicode", "comment_template_vertical"],
+    &["input", "unicode", "comment_template_horizontal"],
+    &["schema", "pinyin", "code_hint_source"],
+    &["schema", "pinyin", "show_code_hint"],
+    &["input", "temp_pinyin", "code_hint_source"],
+    &["schema", "mix", "pinyin_code_hint"],
 ];
 
 /// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
@@ -1108,21 +1129,6 @@ impl Default for EnglishFrequency {
     }
 }
 
-/// `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` 的值域：
-/// 拼音来源候选的注释里，编码从哪来。两个键各管一摊（拼音方案 vs 临拼/快捷输入），值域相同。
-///
-/// 分工是「开关管允许哪些来源求值、模板管按什么顺序和格式摆」，两层不重叠。用户在模板里
-/// 写了某个变量却把它的来源关掉时，该变量恒空——按配置办事。
-///
-/// # 为什么从 bool 改成四档
-///
-/// 旧的 `show_code_hint` 只能回答「要不要显示反查来的码表编码」。用户要的是第三种东西
-/// ——**双拼编码**（GH#128「字或词的后面能不能显示双拼的编码」），它既不在码表词库里、
-/// 也不是「关掉」能表达的。硬塞进 bool 只会变成「开关开着，却显示着我不想要的那种码」。
-///
-/// ★ 改名顺带消解了一处长期的同名冲突：`schema.codetable.show_code_hint` 管的是**码表
-/// 引擎**给前缀候选标剩余编码（敲 `si` 时给 `sikao` 标 `kao`），与本键毫无关系却一直同名。
-/// `docs/design/candidate-comment-layering.md` 把这对同名键记为待办已久。
 /// `input.alt_commit` 的值域：Alt+数字 / Alt+空格 上屏候选的**什么**。
 ///
 /// 一个键兼作开关与内容选择（而不是 bool + 内容两键）：关着时内容无意义，两键组合里有一半
@@ -1153,82 +1159,21 @@ impl AltCommit {
         }
     }
 
-    /// **生效**档：`comment` 档而候选注释总开关（`ui.candidate.comment_enabled`）关着时按
+    /// **生效**档：`comment` 档而候选注释总开关（`ui.comment.enabled`）关着时按
     /// `Off` 处理——注释恒空，认领 Alt 组合只会把宿主的加速键吞掉。热键登记与协调器分派
     /// 都取这一份，两边口径一致（TSF 吃键集 ⊆ Rust 出字集）。
     pub fn effective(cfg: &Config) -> Self {
         match Self::from_config(&cfg.input.alt_commit) {
-            Self::Comment if !cfg.ui.candidate.comment_enabled => Self::Off,
+            Self::Comment if !cfg.ui.comment.enabled => Self::Off,
             kind => kind,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodeHintSource {
-    /// 两种编码都不显示（旧 `show_code_hint = false`）。
-    Off,
-    /// 只反查主码表（旧 `show_code_hint = true`）。
-    CodeTable,
-    /// 只显示双拼编码。
-    Shuangpin,
-    /// 两者都求值，谁先出由模板的回退链决定。临拼的出厂档。
-    #[default]
-    Auto,
-}
-
-impl CodeHintSource {
-    /// 认不出的值回落 `fallback`，由调用方传入**该字段自己的出厂档**：
-    /// `schema.pinyin.code_hint_source` 传 `Off`，`input.temp_pinyin.code_hint_source` 传 `Auto`。
-    /// 两份出厂值不同，函数内写死单一兜底的话，拼音方案用户手滑写错一个字母就会
-    /// 意外看到编码。写错不弹错误框、不让功能消失，与仓里其它字符串枚举同一取舍。
-    ///
-    /// ⚠️ match 臂必须与 `config_schema::CODE_HINT_SOURCE_VALUES` **逐项对齐**。这里多认
-    /// 一个别名（比如让 `none` 也算 `off`），就会变成「注册表说它非法、运行时却认」——
-    /// CLI 校验与设置页下拉都按注册表办事，用户会撞上「明明能用却填不进去」。
-    pub fn from_config(s: &str, fallback: Self) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "off" => Self::Off,
-            "codetable" => Self::CodeTable,
-            "shuangpin" => Self::Shuangpin,
-            "auto" => Self::Auto,
-            _ => fallback,
-        }
-    }
-
-    /// 允许 `${code_rev}` / `${code_rev_all}`（查主码表反向索引）求值吗？
-    pub fn allows_reverse(self) -> bool {
-        matches!(self, Self::CodeTable | Self::Auto)
-    }
-
-    /// 允许 `${shuangpin}`（双拼编码）求值吗？
-    pub fn allows_shuangpin(self) -> bool {
-        matches!(self, Self::Shuangpin | Self::Auto)
-    }
-}
-
-/// 拼音方案的出厂档：`off`，两种编码都不显示。
-///
-/// 编码反查提示是给码表用户设计的；绝大多数纯拼音/双拼用户不熟悉也不需要，出厂开着
-/// 只会让候选旁多一串看不懂的字母。码表用户照样可以在设置里打开。
-/// 老用户走 [`Config::migrate_show_code_hint_value`]，映到 `codetable` 保持原样。
-///
-/// ⚠️ 临拼/快捷输入不再共用本字段，出厂值也不同，见 `input.temp_pinyin.code_hint_source`
-/// （[`default_temp_pinyin_code_hint_source`]）。
-fn default_code_hint_source() -> String {
-    "off".to_string()
 }
 
 /// 全局拼音配置（[schema.pinyin]）。所有拼音类方案（全拼/双拼/混输拼音子方案）共用，
 /// 无方案级 override。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinyinGlobalConfig {
-    /// 拼音方案（含双拼）下，候选注释里的编码从哪来。值域与理由见 [`CodeHintSource`]。
-    /// 出厂 `off`（理由见 `default_code_hint_source`）；认不出的值同样回落 `off`。
-    /// 临拼/快捷输入不读本字段，读 `input.temp_pinyin.code_hint_source`；混输方案也不读，
-    /// 读 `schema.mix.pinyin_code_hint`。
-    #[serde(default = "default_code_hint_source")]
-    pub code_hint_source: String,
     #[serde(default = "default_true")]
     pub use_smart_compose: bool,
     /// 让**用户上屏过的词**（用户词 + 临时词）参与整句解码（S2）。**出厂 true**
@@ -1400,6 +1345,14 @@ impl AuxCodeGlobal {
 /// 设计与实测见 `docs/design/language-model-integration.md`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinyinGrammar {
+    /// 总开关，设置页的那个勾。**结构体缺省 true 且只做否决**：真正生效仍要 `weight` 与
+    /// `model` 都配了（见 [`PinyinGrammar::active`]）。出厂配置里桌面把它写成 false、同时
+    /// 备好 weight / model，设置页一勾即用。
+    ///
+    /// ⚠️ 缺省 true 只在**单层**成立：分层合并后桌面出厂的 false 会盖住用户层没写的这一项，
+    /// 手写过 weight + model 的老配置靠 [`Config::migrate_grammar_enabled_value`] 补 true。
+    #[serde(default = "default_grammar_enabled")]
+    pub enabled: bool,
     /// 影响力权重。**0 = 关闭**：不加载模型文件、不占内存，且整句结果与没有这个
     /// 功能时**逐位相同**。
     ///
@@ -1435,9 +1388,21 @@ fn default_grammar_weight() -> f64 {
     0.0
 }
 
+fn default_grammar_enabled() -> bool {
+    true
+}
+
+impl PinyinGrammar {
+    /// 引擎该不该加载模型：开关开着，且 `weight` 与 `model` 都显式配了。
+    pub fn active(&self) -> bool {
+        self.enabled && self.weight != 0.0 && !self.model.trim().is_empty()
+    }
+}
+
 impl Default for PinyinGrammar {
     fn default() -> Self {
         Self {
+            enabled: default_grammar_enabled(),
             weight: default_grammar_weight(),
             model: String::new(),
         }
@@ -1553,7 +1518,6 @@ impl Default for PinyinAbbrev {
 impl Default for PinyinGlobalConfig {
     fn default() -> Self {
         Self {
-            code_hint_source: default_code_hint_source(),
             use_smart_compose: true,
             // 出厂开（2026-09-28 起）。与引擎侧 `pinyin::Config::default()` 同值，
             // UI 侧靠 enabled_when 挂在 use_smart_compose 上防止关了智能组词还显得开着。
@@ -1633,6 +1597,10 @@ pub enum BoundAction {
     /// 它切的是**内存临时态**，不写配置——与同族的 `toggle_schema` 一样是「此刻的动作」，
     /// 而不是「改一项设置」。切方案即失效（见 `Coordinator::sync_schema_scope`）。
     SingleChar(SingleCharAction),
+    /// 切候选注释的详细 / 默认态（持久，写回 `ui.comment.state`）。载荷见 [`CommentStateAction`]。
+    ///
+    /// 本表没有「当前候选窗」可言，故不接受 `session` 档（见 [`CommentStateAction::Session`]）。
+    CommentState(CommentStateAction),
     /// 切到指定方案，**再按回到来源**（携带目标方案 id）。
     ///
     /// 往返语义由**运行时来源**兜底，不要求目标方案配对称的绑定。
@@ -1785,6 +1753,8 @@ impl BoundAction {
             | Self::Special(_) => true,
             // 字词范围切的是「这一码出什么」，没有中文候选就无从谈起。
             Self::SingleChar(_) => true,
+            // 注释态是持久设置，与中英态无关。
+            Self::CommentState(_) => false,
             // 命令不改输入状态，英文态下照样该按得动。
             Self::None
             | Self::SoftKeyboard(_)
@@ -1867,6 +1837,16 @@ impl BoundAction {
                 None => Self::None,
             };
         }
+        // 注释态 `comment_state[:<default|detail>]`；`session` 档只属于会话表，这里判无效。
+        if s.eq_ignore_ascii_case("comment_state") {
+            return Self::CommentState(CommentStateAction::Toggle);
+        }
+        if let Some(rest) = s.strip_prefix("comment_state:") {
+            return match CommentStateAction::parse_payload(rest) {
+                Some(CommentStateAction::Session) | None => Self::None,
+                Some(a) => Self::CommentState(a),
+            };
+        }
         let lower = s.to_lowercase();
         match lower.as_str() {
             "temp_pinyin" => Self::TempPinyin,
@@ -1883,6 +1863,37 @@ impl BoundAction {
     /// 是否启用（非 `None`）。
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::None)
+    }
+}
+
+/// `caret_right` 在编码区光标已到末尾时的动作（macOS 式 → 键的三种落法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaretEnd {
+    /// 上屏高亮候选（出厂 / 写 `caret_right`）。
+    Commit,
+    /// 高亮移到下一个候选（`caret_right:next`，macOS「→ 切到下一个候选词」）。
+    Next,
+    /// 开 / 关高亮候选的悬停提示（`caret_right:tip`，等同绑 `toggle_tip`）。
+    Tip,
+}
+
+impl CaretEnd {
+    fn parse_payload(s: &str) -> Option<Self> {
+        match s.trim() {
+            "commit" => Some(Self::Commit),
+            "next" => Some(Self::Next),
+            "tip" => Some(Self::Tip),
+            _ => None,
+        }
+    }
+
+    /// 落盘写法的后缀；默认档为空。
+    fn as_payload(&self) -> &'static str {
+        match self {
+            Self::Commit => "",
+            Self::Next => "next",
+            Self::Tip => "tip",
+        }
     }
 }
 
@@ -1958,6 +1969,9 @@ pub enum SessionAction {
     /// 没绑上」——而用户只是把配置从一张表挪到了另一张。这条纪律见
     /// [`Self::parse`] 里 `aux_code` 那一行的注释。
     SingleChar(SingleCharAction),
+    /// 切候选注释态。**动词与载荷同 [`BoundAction::CommentState`]**，另多一档 `session`
+    /// （只翻转当前候选窗，不写配置）。
+    CommentState(CommentStateAction),
     /// 以词定字：取当前高亮候选词的第 N 个字（**N 从 1 起**）。收编自 `keys.select_char_keys`。
     SelectChar(u8),
     /// 进辅助码筛选：对已出的候选按字形码二次过滤。
@@ -1994,6 +2008,29 @@ pub enum SessionAction {
     /// 只在有候选时生效（[`Self::requires_candidates`]）：没有高亮可上屏时按键回落原语义，
     /// 空码空格的那套处置（`space_on_empty_behavior`）不属于本动词。
     CommitHighlighted,
+    /// 编码区光标左移一字符（`input_buffer` 内，已转换前缀进不去）。
+    ///
+    /// 服务的交互形态（GH#234，C2-97）：「← 从编码末尾进入编辑编码」。底层是
+    /// `preedit_cursor::BufEdit::move_left`——光标是**编辑位置**，不参与引擎查询，
+    /// 中间改码后按整串重算候选，与末尾输入无差别。
+    ///
+    /// 边界：已在开头 = 吞键（方向键有宿主原义，但组合进行中把 ← 交给宿主会让宿主光标
+    /// 与组合区错位，macOS 同款行为也是吞）；**无会话 = 放行**（空闲 ← 是宿主的 ←）。
+    /// **overlay 让位**：临拼 / 快捷输入等各有自己的缓冲光标（`state.active` 非 `None`），
+    /// 本动词不接管，消费点据此放行。
+    CaretLeft,
+    /// 编码区光标右移一字符；**已在末尾 = 做 [`CaretEnd`] 指定的动作**，默认上屏高亮候选（macOS「→ 进入选词」）。
+    /// 写法 `caret_right` / `caret_right:commit|next|tip`。
+    ///
+    /// 边沿语义必须内建在动词里：「光标到末尾那一下改为选词」用静态绑定表达不出来——
+    /// 绑 `commit_highlighted` 就永远移动不了光标，绑移动就永远选不了词。无候选时末尾
+    /// 那一下纯吞键（没有可上屏的东西，也不该把 → 交给宿主）。其余边界同 [`Self::CaretLeft`]。
+    CaretRight(CaretEnd),
+    /// 开 / 关高亮候选的悬停提示气泡（反查编码、拆字等），不用鼠标悬停（t372）。
+    ///
+    /// 走鼠标悬停同一条通路（悬停目标 = 高亮项），气泡内容与定位完全一致；再按一次收起，
+    /// 移动高亮 / 翻页 / 候选刷新都会收起（同鼠标离开）。需要候选；候选没有提示内容时无效果。
+    ToggleTip,
     /// 上屏编码——回车在「有编码」时做的那件事，换一个键来按（极点 / 小鸭用 Ctrl）。
     ///
     /// 恒为上屏编码，**不看 `input.enter_behavior`**：「回车清空编码」是回车这个键的配置，
@@ -2102,6 +2139,21 @@ impl SessionAction {
                 None => Self::None,
             };
         }
+        if t == "comment_state" {
+            return Self::CommentState(CommentStateAction::Toggle);
+        }
+        if let Some(rest) = t.strip_prefix("comment_state:") {
+            return match CommentStateAction::parse_payload(rest) {
+                Some(a) => Self::CommentState(a),
+                None => Self::None,
+            };
+        }
+        if let Some(rest) = t.strip_prefix("caret_right:") {
+            return match CaretEnd::parse_payload(rest) {
+                Some(a) => Self::CaretRight(a),
+                None => Self::None,
+            };
+        }
         match t.as_str() {
             "page_prev" => Self::PagePrev,
             "page_next" => Self::PageNext,
@@ -2112,6 +2164,9 @@ impl SessionAction {
             // （`key_actions` 那张表没有共键形态：它只认符号键与字母 z，翻页键压根解析不出来。）
             "aux_code" => Self::AuxCode(AuxCodeShare::Solo),
             "commit_highlighted" => Self::CommitHighlighted,
+            "caret_left" => Self::CaretLeft,
+            "caret_right" => Self::CaretRight(CaretEnd::Commit),
+            "toggle_tip" => Self::ToggleTip,
             "commit_code" => Self::CommitCode,
             // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
             "cancel" | "clear" => Self::Cancel,
@@ -2128,14 +2183,26 @@ impl SessionAction {
     /// ★ 判据挂在**动作**上而不是写在消费点：消费点有三个（主输入 / mix / 候选导航），
     /// 写在那里就要维护三份一致的守卫，而这类「三处必须一致」的约束本仓已栽过四次。
     pub fn requires_candidates(&self) -> bool {
+        // 注释态：只有翻转当前候选窗（`session`）依赖候选窗；改持久态随时可做。
+        if let Self::CommentState(a) = self {
+            return *a == CommentStateAction::Session;
+        }
         // `SingleChar` 与 `Cancel` 同侧：切换在「打了码还没出候选」时**恰恰最该生效**
         // ——单字模式下某个码本来就可能一条候选都不剩，那时按键若被判成「无事可做」而放行，
         // 用户就再也关不掉它了。
         // `Command` 同侧：命令与候选无关，打了码没出候选时照样要能执行。
         // `CommitCode` 同侧：空码上屏原码正是它的用处。
+        // `CaretLeft` / `CaretRight` 同侧：光标移动改的是**编码本身**，「打了码还没出候选」
+        // 时恰恰是最想改码的时刻（候选因无匹配而空）。
         !matches!(
             self,
-            Self::None | Self::Cancel | Self::SingleChar(_) | Self::Command(_) | Self::CommitCode
+            Self::None
+                | Self::Cancel
+                | Self::SingleChar(_)
+                | Self::Command(_)
+                | Self::CommitCode
+                | Self::CaretLeft
+                | Self::CaretRight(_)
         )
     }
 
@@ -2199,7 +2266,17 @@ impl std::fmt::Display for SessionAction {
             Self::AuxCode(AuxCodeShare::Solo) => f.write_str("aux_code"),
             Self::AuxCode(AuxCodeShare::PageNext) => f.write_str("aux_code:page_next"),
             Self::SingleChar(a) => write!(f, "single_char:{}", a.as_payload()),
+            Self::CommentState(a) => match a.as_payload() {
+                "" => f.write_str("comment_state"),
+                p => write!(f, "comment_state:{p}"),
+            },
             Self::CommitHighlighted => f.write_str("commit_highlighted"),
+            Self::CaretLeft => f.write_str("caret_left"),
+            Self::CaretRight(a) => match a.as_payload() {
+                "" => f.write_str("caret_right"),
+                p => write!(f, "caret_right:{p}"),
+            },
+            Self::ToggleTip => f.write_str("toggle_tip"),
             Self::CommitCode => f.write_str("commit_code"),
             Self::Command(expr) => write!(f, "{COMMAND_VERB_PREFIX}{expr}"),
         }
@@ -2922,15 +2999,6 @@ pub struct MixGlobal {
     /// `mix_pinyin_abbrev_*` 三条测试守门。
     #[serde(default)]
     pub enable_pinyin_abbrev: bool,
-    /// 混输方案下，拼音候选旁是否显示主码表的编码（反查）。默认开。
-    ///
-    /// 独立于拼音方案那份 `schema.pinyin.code_hint_source`：那份出厂 `off`，照顾的是纯拼音
-    /// 用户；混输用户以码表为主，打拼音时看编码正是学码、补码的场景，共用一份就只能顾一头
-    /// （此前混输读的就是拼音那份，拼音出厂改 off 后混输跟着没了编码提示）。
-    /// 只有开关、不设四档：混输里的拼音是全拼，双拼编码没有意义。
-    /// 临拼 / 快捷输入期间不读本项，读 `input.temp_pinyin.code_hint_source`。
-    #[serde(default = "default_true")]
-    pub pinyin_code_hint: bool,
 }
 
 impl Default for MixGlobal {
@@ -2961,7 +3029,6 @@ impl Default for MixGlobal {
             // 用户把两个否决开关都关掉也无济于事）。混输用户以码表为主，默认让顶码可用；
             // 需要简拼的用户显式打开即可。详见 `data/config.toml` 同名项注释。
             enable_pinyin_abbrev: false,
-            pinyin_code_hint: true,
         }
     }
 }
@@ -3476,25 +3543,6 @@ impl Orientation {
     }
 }
 
-/// 模式级注释模板覆盖（三态）。见 `crate::comment::template_for` 的决策点说明。
-///
-/// - **键缺失**（`None`）= 跟随全局同方向的模板（默认，零回归）
-/// - **非空** = 本模式期间改用该模板
-/// - **空串** = 本模式期间不显示注释
-///
-/// # 为什么是 `Option<String>` 而不是 `String`
-///
-/// 用空串表达「跟随全局」的话，「本模式不要注释」就没法表达了——而这恰恰是本功能最主要的
-/// 用途（反查类模式信息太多、干扰正常输入）。三态里「缺失」与「空」必须是两件事。
-///
-/// # 横竖各一份，与全局同构
-///
-/// 字段名与 `ui.candidate.comment_template_vertical` / `_horizontal` 刻意保持一致，
-/// 且**两个方向各自独立三态**——只覆盖竖排、横排仍跟随全局是合法且常见的配置。
-/// 与 [`LayoutIntent`] 的取值词汇复用同一个理由：让「模式级」与「全局」在用户眼里
-/// 是同一件事的两个层级，而不是两套发明出来的键名。
-pub type CommentTemplateOverride = Option<String>;
-
 /// 自由输入（字面输入）模式：让 mix 能打出 `GetTestData()` / `test_data` / `<TAB>`
 /// 这类**任何 member 都无法接受**的内容。
 ///
@@ -3569,12 +3617,6 @@ pub struct MixModeConfig {
     /// （它本就是 quick_mix 这个实例的属性，却被存在了与实例无关的全局段里）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
-    /// 本 mix 期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// 本 mix 期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
     /// 自由（字面）输入，见 [`FreeInputMode`]。默认 `Auto`。
     ///
     /// 每实例独立：一个只做日期/计算的 mix 可以关掉它，保住「打完拼音按逗号顶屏出
@@ -3625,8 +3667,6 @@ impl Default for MixModeConfig {
             trigger_keys: Vec::new(),
             members: Vec::new(),
             candidate_layout: LayoutIntent::default(),
-            comment_template_vertical: None,
-            comment_template_horizontal: None,
             free_input: FreeInputMode::default(),
             // 与 `#[serde(default = "default_true")]` 对齐，见结构体文档的 ⚠️。
             free_input_takes_select_keys: default_true(),
@@ -3682,9 +3722,6 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         // 与旧 data/config.toml 的 `quick_input.force_vertical = true` 行为一致
         // （mix_modes 不能写进预置文件，故默认值只能落在这里，见 §迁移）。
         candidate_layout: LayoutIntent::Vertical,
-        // None = 跟随全局注释模板（内置 quick_mix 不预设覆盖）
-        comment_template_vertical: None,
-        comment_template_horizontal: None,
         // 出厂开自动自由输入：`;` 是为特殊内容而进的模式，字面输入是它的常见用途。
         free_input: FreeInputMode::Auto,
         // 夺取 `;`/`'` 作字面：它们选第 2/3 候选只是数字键的冗余别名，而 `rock'n'roll`
@@ -3902,6 +3939,9 @@ pub struct MobileConfig {
 /// （[`Config::pinyin_effective`]）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MobileGrammarConfig {
+    /// 总开关，语义见 [`PinyinGrammar::enabled`]。
+    #[serde(default = "default_grammar_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_mobile_grammar_weight")]
     pub weight: f64,
     #[serde(default = "default_mobile_grammar_model")]
@@ -3911,6 +3951,7 @@ pub struct MobileGrammarConfig {
 impl Default for MobileGrammarConfig {
     fn default() -> Self {
         Self {
+            enabled: default_grammar_enabled(),
             weight: default_mobile_grammar_weight(),
             model: default_mobile_grammar_model(),
         }
@@ -3944,6 +3985,21 @@ pub struct MobileAssociationConfig {
     /// 「我想打空格却上了个词」。留作开关给习惯「空格选首个联想」的人。
     #[serde(default)]
     pub space_commits: bool,
+    /// 移动端**关**：联想态的二三候选键（`;` `'`）不选联想，照常出标点。
+    /// 手机上选联想只靠点候选；这两个键在软键盘上就是普通标点键，不该被联想截走。
+    /// 桌面相反（[`AssociationConfig::select_keys_commit`] 默认开）。
+    #[serde(default)]
+    pub select_keys_commit: bool,
+    /// 移动端**关**（= 透传）：联想态按回车收起联想并照常换行/发送。语义同
+    /// [`AssociationConfig::enter_cancels_only`]。
+    #[serde(default)]
+    pub enter_cancels_only: bool,
+    /// 移动端**关**（= 透传）：联想态按退格收起联想并照常删字。
+    /// 桌面默认吃键（[`AssociationConfig::backspace_cancels_only`] = true），理由是桌面联想窗
+    /// 弹出时手停在刚打的字上、误触代价大；手机上联想只是候选条里的建议，退格就是要删字，
+    /// 吃掉一次反而成了「删不掉」。
+    #[serde(default)]
+    pub backspace_cancels_only: bool,
 }
 
 impl Default for MobileAssociationConfig {
@@ -3953,6 +4009,9 @@ impl Default for MobileAssociationConfig {
             mode: default_mobile_assoc_mode(),
             punct: true,
             space_commits: false,
+            select_keys_commit: false,
+            enter_cancels_only: false,
+            backspace_cancels_only: false,
         }
     }
 }
@@ -4032,6 +4091,46 @@ impl SingleCharAction {
             Self::Set(false) => "off",
             Self::Toggle => "toggle",
             Self::Follow => "follow",
+        }
+    }
+}
+
+/// `comment_state[:<载荷>]` 按键动词的载荷（[`BoundAction::CommentState`] /
+/// [`SessionAction::CommentState`] 共用）。
+///
+/// 载荷：空（裸动词）= 在持久态之间切换；`default` / `detail` = 直达该态；
+/// `session` = 只翻转当前候选窗（仅会话表有意义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentStateAction {
+    /// 切换持久态（写回 `ui.comment.state`）。
+    Toggle,
+    /// 直达指定持久态。
+    Set(crate::comment_lib::CommentState),
+    /// 只翻转当前候选窗，不写配置。
+    Session,
+}
+
+impl CommentStateAction {
+    /// 解析 `comment_state:` 之后的那一段；未知载荷返回 `None`（同 [`SingleCharAction::parse_payload`]）。
+    pub fn parse_payload(rest: &str) -> Option<Self> {
+        use crate::comment_lib::CommentState;
+        match rest.trim().to_ascii_lowercase().as_str() {
+            "" => Some(Self::Toggle),
+            "default" => Some(Self::Set(CommentState::Default)),
+            "detail" => Some(Self::Set(CommentState::Detail)),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+
+    /// 配置值（不含 `comment_state:` 前缀）；`Toggle` 为空串，对应裸动词。
+    pub fn as_payload(&self) -> &'static str {
+        use crate::comment_lib::CommentState;
+        match self {
+            Self::Toggle => "",
+            Self::Set(CommentState::Default) => "default",
+            Self::Set(CommentState::Detail) => "detail",
+            Self::Session => "session",
         }
     }
 }
@@ -4676,14 +4775,6 @@ pub struct TempEnglishConfig {
     /// 典型用法是设 `horizontal`——英文候选一行放得下，全局竖排时反而占屏。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
-    /// 临英期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    /// 典型用法 `"${dict}"`——只在打英文时显示挂载的英汉释义，中文输入不受影响。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// 临英期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    /// 临英常设 `candidate_layout = "horizontal"`，此时生效的是本项而非竖排那份。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
     /// 首候选是用户所打原文（保证能上屏自己输入的内容）。**三档**，见
     /// [`RawCandidateMode`]；出厂 [`RawCandidateMode::Always`]（＝老配置的 `true`，
     /// 保持既有行为——此前这条是硬编码、不可配的）。
@@ -4772,8 +4863,6 @@ impl Default for TempEnglishConfig {
             raw_candidate: RawCandidateMode::Always,
             case_variants: true,
             case_follow_input: true,
-            comment_template_vertical: None,
-            comment_template_horizontal: None,
             phrase_seg: false,
         }
     }
@@ -5043,6 +5132,29 @@ impl Config {
 }
 
 impl Config {
+    /// 运行时生效的会话态按键表：[`KeysConfig::effective_session_actions`] ⊕ 注释切换键。
+    ///
+    /// 注释切换键选功能键（F1–F12）时在这里补一条绑定，转发与分派都走会话按键的现成通路；用户自己
+    /// 在 `session_actions` 里绑过这个键（含 `none`）就让给用户。`hold` 档也补 `comment_state:session`：
+    /// 这条只负责让平台转发这个键，有候选时的按下与松开由协调器的按住判定先接走。
+    /// 设置页读写的仍是存储层的 `keys.session_actions`，补的这条不落盘。
+    pub fn effective_session_actions(&self) -> BTreeMap<String, String> {
+        use crate::comment_lib::SwitchMode;
+        let mut out = self.keys.effective_session_actions();
+        let c = &self.ui.comment;
+        if let Some(name) = c.switch_key.function_key_name().filter(|_| c.enabled) {
+            let verb = match c.switch_mode {
+                SwitchMode::Off => None,
+                SwitchMode::Persist => Some("comment_state"),
+                SwitchMode::Session | SwitchMode::Hold => Some("comment_state:session"),
+            };
+            if let Some(v) = verb {
+                out.entry(name.to_string()).or_insert_with(|| v.to_string());
+            }
+        }
+        out
+    }
+
     /// 拼音全局配置的生效取值：`mobile` 时语法模型换成 `[mobile.grammar]`，其余照基线。
     ///
     /// 由引擎在取拼音配置的那一刻按平台调用（Android 构建传 `true`），不进 `Config::load`
@@ -5051,6 +5163,7 @@ impl Config {
         let mut p = self.schema.pinyin.clone();
         if mobile {
             p.grammar = PinyinGrammar {
+                enabled: self.mobile.grammar.enabled,
                 weight: self.mobile.grammar.weight,
                 model: self.mobile.grammar.model.clone(),
             };
@@ -5217,31 +5330,10 @@ pub struct TempPinyinConfig {
     /// 进入临时拼音期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
-    /// 临拼期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    /// 反查场景的典型用法是设 `"${code}"` 只留编码，或设 `""` 什么都不显示。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// 临拼期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
-    /// 临拼与快捷输入（mix）期间，拼音候选注释里的编码从哪来。值域同 [`CodeHintSource`]。
-    ///
-    /// 独立于拼音方案那份 `schema.pinyin.code_hint_source`：临拼正是码表用户借拼音反查
-    /// 编码的典型场景，出厂 `auto`；拼音方案面向的是纯拼音/双拼用户，出厂 `off`。
-    /// 两类用户习惯相反，共用一份就只能顾一头。设成 `off` 即真正关掉（旧实现强制放行反查、
-    /// 关不掉）。
-    #[serde(default = "default_temp_pinyin_code_hint_source")]
-    pub code_hint_source: String,
 }
 
 fn default_temp_pinyin_triggers() -> Vec<String> {
     vec!["backtick".to_string()]
-}
-
-/// 临拼的编码来源出厂档：`auto`。⛔ 不能复用 [`default_code_hint_source`]——那份出厂是
-/// `off`，复用会把码表用户的反查场景一并关掉。
-fn default_temp_pinyin_code_hint_source() -> String {
-    "auto".to_string()
 }
 
 impl Default for TempPinyinConfig {
@@ -5251,9 +5343,6 @@ impl Default for TempPinyinConfig {
             trigger_keys: default_temp_pinyin_triggers(),
             hotkey: String::new(),
             candidate_layout: LayoutIntent::default(),
-            comment_template_vertical: None,
-            comment_template_horizontal: None,
-            code_hint_source: default_temp_pinyin_code_hint_source(),
         }
     }
 }
@@ -5290,12 +5379,6 @@ pub struct UrlConfig {
     /// 进入网址模式期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
-    /// 网址模式期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// 网址模式期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 fn default_url_history_max() -> u32 {
@@ -5320,8 +5403,6 @@ impl Default for UrlConfig {
             history_enabled: false,
             history_max: default_url_history_max(),
             candidate_layout: LayoutIntent::default(),
-            comment_template_vertical: None,
-            comment_template_horizontal: None,
         }
     }
 }
@@ -5353,12 +5434,6 @@ pub struct EmailConfig {
     /// 进入邮箱模式期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
-    /// 邮箱模式期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// 邮箱模式期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 /// 出厂预置的邮箱后缀。
@@ -5409,8 +5484,6 @@ impl Default for EmailConfig {
             enabled: false,
             suffixes: default_email_suffixes(),
             candidate_layout: LayoutIntent::default(),
-            comment_template_vertical: None,
-            comment_template_horizontal: None,
         }
     }
 }
@@ -5443,12 +5516,6 @@ pub struct UnicodeConfig {
     /// 进入 Unicode 模式期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
     pub candidate_layout: LayoutIntent,
-    /// Unicode 模式期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// Unicode 模式期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 fn default_unicode_prefixes() -> Vec<String> {
@@ -5461,8 +5528,6 @@ impl Default for UnicodeConfig {
             enabled: false,
             prefixes: default_unicode_prefixes(),
             candidate_layout: LayoutIntent::default(),
-            comment_template_vertical: None,
-            comment_template_horizontal: None,
         }
     }
 }
@@ -6005,6 +6070,16 @@ pub struct OverflowConfig {
     /// 只有这两档——「只顶不出字」没有诉求。
     #[serde(default = "default_overflow_behavior")]
     pub page_key: String,
+    /// **按键级覆盖**（`page_key` 的默认档之上）：键名（wind-keys KEY_TABLE names，如
+    /// `comma` / `period` / `minus` / `equal` / `lbracket` / `rbracket`）→ 策略，值域与
+    /// [`Self::page_key`] 相同。未列出的键回落 `page_key`。
+    ///
+    /// 为什么要有这张表：全局档把 `- = , . [ ]` 一把抓，而有人只要「逗号翻不动时上屏」、
+    /// 其余翻页键**无效就是无效**——行为策略必须能落到单个按键上（GH#249）。键名写错 /
+    /// 值非法由加载期告警（`config_bundle` 的 `warn_unknown_page_key_overrides`）并忽略，
+    /// 不静默吃掉。
+    #[serde(default)]
+    pub page_key_overrides: BTreeMap<String, String>,
 }
 
 fn default_overflow_behavior() -> String {
@@ -6018,6 +6093,7 @@ impl Default for OverflowConfig {
             select_key: default_overflow_behavior(),
             select_char_key: default_overflow_behavior(),
             page_key: default_overflow_behavior(),
+            page_key_overrides: BTreeMap::new(),
         }
     }
 }
@@ -6069,6 +6145,9 @@ fn default_first_show_mode() -> String {
 pub struct UiConfig {
     #[serde(default)]
     pub candidate: UiCandidateConfig,
+    /// 候选注释的命名模板与默认 / 详细两态（`[ui.comment]`）。
+    #[serde(default)]
+    pub comment: crate::comment_lib::UiCommentConfig,
     #[serde(default)]
     pub font: UiFontConfig,
     #[serde(default)]
@@ -6194,6 +6273,10 @@ pub struct CommentDictSpec {
     /// 被删/停用/关掉了总开关）的空壳静默跳过，不告警：那是常态而非配置错误。
     #[serde(default)]
     pub auto: bool,
+    /// **随包内置项的引用条目**：与 `auto` 同形，按 `id` 去认领 `system.comments.toml` 的
+    /// `[[dicts]]`，只保留用户的 `enabled` 与位置；认领不到静默丢弃。
+    #[serde(default)]
+    pub builtin: bool,
     /// 限定生效的方案 id；**留空 = 全部方案**。
     ///
     /// 注释库常常是方案专属的：一份大英汉词典只在英文方案下有意义，挂在五笔方案上
@@ -6665,6 +6748,10 @@ pub struct StatusIndicatorConfig {
     /// [`crate::app_compat::STATUS_FALLBACK_POSITIONS`]；读取请走 [`Self::fallback`]（写错回落 last）。
     #[serde(default = "default_status_fallback_position")]
     pub fallback_position: String,
+    /// follow_caret 下的默认位置："below"（光标下方，默认）| "above"（光标上方）。放不下翻到另一侧；
+    /// 与候选窗重叠时自动避让（见 docs/design/status-tip-avoid-candidates.md）。读取请走 [`Self::caret_above`]。
+    #[serde(default = "default_status_caret_side")]
+    pub caret_side: String,
     /// follow_caret 下相对默认位置（光标下方、左边缘对齐光标）的水平偏移（像素，正=右）。
     #[serde(default)]
     pub offset_x: i32,
@@ -6709,6 +6796,9 @@ fn default_status_position_mode() -> String {
 fn default_status_fallback_position() -> String {
     "last".to_string()
 }
+fn default_status_caret_side() -> String {
+    "below".to_string()
+}
 
 impl StatusIndicatorConfig {
     /// 解析后的定位方式；值域外的字符串回落出厂默认（跟随光标）——字段是自由字符串，
@@ -6716,6 +6806,11 @@ impl StatusIndicatorConfig {
     pub fn position(&self) -> crate::app_compat::StatusPositionMode {
         crate::app_compat::StatusPositionMode::from_config(&self.position_mode)
             .unwrap_or(crate::app_compat::StatusPositionMode::FollowCaret)
+    }
+
+    /// 默认位置是不是光标上方；值域外的字符串按出厂（下方）。
+    pub fn caret_above(&self) -> bool {
+        self.caret_side.eq_ignore_ascii_case("above")
     }
 
     /// 解析后的兜底位置；值域外的字符串回落出厂默认（`last`）。
@@ -6735,6 +6830,7 @@ impl Default for StatusIndicatorConfig {
             schema_name_style: default_schema_name_style(),
             position_mode: default_status_position_mode(),
             fallback_position: default_status_fallback_position(),
+            caret_side: default_status_caret_side(),
             offset_x: 0,
             offset_y: 0,
             custom_x: 0,
@@ -6814,6 +6910,13 @@ pub struct UiCandidateConfig {
     /// `docs/design/game-compat-tsf-uielement.md` §4.4 末。
     #[serde(default = "default_preedit_display")]
     pub preedit_display: String,
+    /// 拼音编码里音节之间显示的分隔符（`xiao'peng'you` 里的 `'`），默认 `'`，可留空。
+    ///
+    /// **只改显示**：应用里的组合串与候选窗编码栏都换，引擎内部的缓冲、手动分隔符 `'` 的
+    /// 输入与切分一概不变。Unreal Engine 等对资产名校验严格的程序不接受 `'`，留空或换成
+    /// 别的字符即可（GH#267）。只作用于主路拼音；临时英文等模式里的 `'` 是正文，不动。
+    #[serde(default = "default_syllable_separator")]
+    pub syllable_separator: String,
     #[serde(default)]
     pub hide_window: bool,
     /// 候选文本字号：0（默认）= 跟随主题 `behavior.font_size`，>0 = 用户指定。
@@ -6954,24 +7057,6 @@ pub struct UiCandidateConfig {
     /// 未知名字忽略。
     #[serde(default = "default_grid_categories")]
     pub grid_categories: Vec<String>,
-    /// 候选注释总开关（默认开）。关掉后不渲染注释段（含上方注释条与 `${code_hint}`），
-    /// 注释模板也不再计入按需加载的需求（反查索引、用户层编码索引、拆字表随之可卸）。
-    ///
-    /// 在注释模板三层裁决（模式级 → 方案级 → 全局）**之上**：关就是关。不用「把模板设空」
-    /// 表达，是因为全局设空会被方案级 / 模式级模板覆盖回来，且模板是专家级字符串
-    /// （设计 `docs/design/memory-footprint.md` §4.3）。
-    #[serde(default = "default_true")]
-    pub comment_enabled: bool,
-    /// **竖排**候选的注释段（候选右侧灰字）模板。语法见 `wind_coordinator::comment`。
-    ///
-    /// 横竖各持一份模板、互不影响：两种排布的可用横向空间差一个数量级（竖排每行独占，
-    /// 横排全部候选共享一行宽度），能放什么本就不是同一个答案。共用一份的结果是
-    /// 「为竖排配的拼音把横排候选窗撑爆」或「为横排收着配的注释让竖排一片空白」。
-    #[serde(default = "default_comment_template")]
-    pub comment_template_vertical: String,
-    /// **横排**候选的注释段模板。见 [`Self::comment_template_vertical`]。
-    #[serde(default = "default_comment_template")]
-    pub comment_template_horizontal: String,
     /// 上方注释条（默认关）：开启后注释模板里的**第一个字面 `\n`**（写在 `{…}` 之外）把注释
     /// 拆成上下两段，上段显示在候选上方一行，下段仍在候选右侧。关闭时不拆分，行为与本项
     /// 引入前逐字节一致。
@@ -6988,8 +7073,7 @@ pub struct UiCandidateConfig {
     /// 判据是**显式声明**：无 `columns:` 的词库一律不算（绝大多数码表是 `text\tcode\tweight`，
     /// 按注释库的默认列序读会把编码整列当成注释）。见 `wind_reverse::declares_comment_column`。
     ///
-    /// 落在 `[ui.candidate]` 而非 `[ui]`：与 `comment_template_*` 同段，说的是同一件事的
-    /// 两半（模板决定显示什么，本键决定去哪儿查）。
+    /// 与注释模板是同一件事的两半：模板决定显示什么，本键决定去哪儿查。
     #[serde(default = "default_true")]
     pub auto_comment_dicts: bool,
     /// **竖排**注释段的最大字数（0=不限），超出截断并加 `…`。
@@ -7066,6 +7150,10 @@ pub struct UiCandidateConfig {
     pub custom_y: i32,
 }
 
+fn default_syllable_separator() -> String {
+    "'".to_string()
+}
+
 fn default_preedit_display() -> String {
     "app_inline".to_string()
 }
@@ -7076,22 +7164,6 @@ fn default_candidate_shadow() -> String {
 
 fn default_candidate_position_mode() -> String {
     "follow_caret".to_string()
-}
-
-/// 注释段默认模板。前两段（`${code_hint|code_rev}`）**精确等价于本功能引入前的硬编码行为**
-/// （引擎产的剩余编码优先，为空则回退到拼音候选的主码表反查码）。
-///
-/// 出厂默认能用模板原样表达，是 `${a|b}` 回退语法存在的主要理由 —— 没有它，出厂行为
-/// 就得留在代码里作特例，模板便不再是注释内容的唯一真相源。
-fn default_comment_template() -> String {
-    // ⚠️ 必须与 `data/config.toml` 的 `comment_template_*` 逐字一致 —— 两处是同一个出厂
-    // 事实的两份写法（有配置文件时走那边，没有时走这里）。分叉的表现是「删掉配置文件后
-    // 注释栏变了样」，而两处单看都没写错。
-    //
-    // 回退链：引擎产的编码提示 → 主码表反查 → 本方案击键。前两段等价于本功能引入前的
-    // 固定行为，故配了主码表的用户升级后所见不变；第三段只在前两段都空时才出（没配主
-    // 码表的双拼用户，此前那里是空的）。
-    "${code_hint|code_rev|shuangpin}".to_string()
 }
 
 /// 编码显示方式（解析自 ui.candidate.preedit_display）。
@@ -7164,6 +7236,7 @@ impl Default for UiCandidateConfig {
             per_page_extended: 0,
             layout: "horizontal".to_string(),
             preedit_display: default_preedit_display(),
+            syllable_separator: default_syllable_separator(),
             hide_window: false,
             font_size: 0.0,
             pager_bar_display: ByLayout::default(),
@@ -7181,9 +7254,6 @@ impl Default for UiCandidateConfig {
             grid_index_fill: default_grid_index_fill(),
             grid_pageupdown_screen: true,
             grid_categories: default_grid_categories(),
-            comment_enabled: true,
-            comment_template_vertical: default_comment_template(),
-            comment_template_horizontal: default_comment_template(),
             comment_above: false,
             auto_comment_dicts: true,
             comment_max_chars_vertical: 0,
@@ -7240,17 +7310,7 @@ impl UiCandidateConfig {
         self.min_rows.min(self.per_page.max(1)) as u32
     }
 
-    /// 当前排布对应的注释模板（`vertical` 为 true 取竖排那份）。
-    pub fn comment_template(&self, vertical: bool) -> &str {
-        if vertical {
-            &self.comment_template_vertical
-        } else {
-            &self.comment_template_horizontal
-        }
-    }
-
-    /// 当前排布对应的注释段最大字数（0=不限）。与 [`Self::comment_template`] 同构：
-    /// 取哪一份由排布决定，调用方不必各自 `if vertical`。
+    /// 当前排布对应的注释段最大字数（0=不限）。
     pub fn comment_max_chars(&self, vertical: bool) -> usize {
         if vertical {
             self.comment_max_chars_vertical
@@ -7407,7 +7467,7 @@ pub struct TooltipConfig {
     pub sections: Vec<TooltipSection>,
 }
 
-/// 气泡的一段：段名 + 段内容，都是注释模板（语法与变量同 `ui.candidate.comment_template_*`）。
+/// 气泡的一段：段名 + 段内容，都是注释模板（语法与变量同 `ui.comment.templates`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TooltipSection {
     /// 段开关。保留「内置段关着」这种状态：设置页一键就能打开，不必删了再加。
@@ -7597,6 +7657,14 @@ impl Default for TooltipConfig {
 /// 短语前缀列举配置（[input.phrase]，对齐 Go）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhraseConfig {
+    /// 命令短语的前缀列举开关：敲前缀（如 `zz`、`co`）时列出以它开头的短语。关闭后只有编码
+    /// 完全相同的短语才出（GH#264：编码 `crr` 的短语不想在敲 `cr` 时冒出来）。默认开。
+    ///
+    /// 与码表「精确匹配」（`single_code_input`）的关系：精确匹配只管纯码表方案，且本来就不列
+    /// 前缀；本开关对所有方案生效，拼音 / 混输靠它关前缀列举。精确匹配的「空码补全」兜底
+    /// 另有自己的开关，不受本项影响。
+    #[serde(default = "default_true")]
+    pub prefix_match: bool,
     /// 触发前缀导航列举的最小输入长度（原 min_prefix_length）。默认 2。
     #[serde(default = "default_phrase_min_prefix")]
     pub min_prefix: usize,
@@ -7605,6 +7673,7 @@ pub struct PhraseConfig {
 impl Default for PhraseConfig {
     fn default() -> Self {
         Self {
+            prefix_match: true,
             min_prefix: default_phrase_min_prefix(),
         }
     }
@@ -7946,6 +8015,7 @@ mod bound_action_chinese_only_tests {
             "softkeyboard:num",
             "toggle_schema:english",
             "switch_schema:wubi",
+            "comment_state",
             "none",
         ] {
             assert!(
@@ -7953,6 +8023,60 @@ mod bound_action_chinese_only_tests {
                 "{verb} 不得限中文态"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod comment_state_verb_tests {
+    use super::*;
+    use crate::comment_lib::CommentState;
+
+    #[test]
+    fn parses_comment_state_verbs() {
+        for v in [
+            "comment_state",
+            "comment_state:detail",
+            "comment_state:default",
+        ] {
+            assert!(BoundAction::parse(v).is_enabled(), "{v} 两张表都应认");
+            assert!(SessionAction::parse(v).is_enabled(), "{v} 两张表都应认");
+            assert_eq!(SessionAction::parse(v).to_string(), v);
+        }
+        assert_eq!(
+            BoundAction::parse("comment_state:detail"),
+            BoundAction::CommentState(CommentStateAction::Set(CommentState::Detail))
+        );
+        assert_eq!(
+            SessionAction::parse("comment_state"),
+            SessionAction::CommentState(CommentStateAction::Toggle)
+        );
+        // session 档只属于会话表。
+        assert_eq!(
+            BoundAction::parse("comment_state:session"),
+            BoundAction::None
+        );
+        assert!(!BoundAction::parse("comment_state:session").is_enabled());
+        assert_eq!(
+            SessionAction::parse("comment_state:session"),
+            SessionAction::CommentState(CommentStateAction::Session)
+        );
+        assert_eq!(
+            SessionAction::parse("comment_state:session").to_string(),
+            "comment_state:session"
+        );
+        // 写错的载荷不静默降级。
+        assert_eq!(BoundAction::parse("comment_state:yes"), BoundAction::None);
+        assert_eq!(
+            SessionAction::parse("comment_state:yes"),
+            SessionAction::None
+        );
+    }
+
+    #[test]
+    fn only_session_payload_requires_candidates() {
+        assert!(SessionAction::parse("comment_state:session").requires_candidates());
+        assert!(!SessionAction::parse("comment_state").requires_candidates());
+        assert!(!SessionAction::parse("comment_state:detail").requires_candidates());
     }
 }
 
@@ -8628,7 +8752,7 @@ impl Config {
         Self::migrate_force_vertical_value(&mut merged);
         Self::migrate_index_labels_value(&mut merged);
         Self::migrate_empty_code_behavior_value(&mut merged);
-        // ⚠️ `migrate_comment_max_chars_value` / `migrate_show_code_hint_value` **不在这里**，
+        // ⚠️ `migrate_comment_max_chars_value` 等层内迁移**不在这里**，
         // 它们在各层合并前就地跑（见 [`Self::migrate_user_layer_value`]）。判据不同：
         // 那两条要问「用户写过新键吗」，而合并结果里的新键必然存在（L1 就是
         // `Config::default()` 序列化出来的），在这里问永远得到「写过」，迁移一次都不会执行。
@@ -8906,12 +9030,49 @@ impl Config {
     /// custom 层（L2.5）也跑一遍，保住「定制层里的旧值同样被救到」这个既有性质
     /// —— 那是合并后迁移白捡的好处，换成层内跑就得显式保留。
     fn migrate_user_layer_value(layer: &mut toml::Value) {
-        Self::migrate_show_code_hint_value(layer);
         Self::migrate_comment_max_chars_value(layer);
         Self::migrate_font_size_follow_theme_value(layer);
         Self::migrate_langbar_badge_colors_value(layer);
         Self::migrate_tooltip_sections_value(layer);
         Self::migrate_stale_factory_tooltip_sections_value(layer);
+        Self::migrate_grammar_enabled_value(layer);
+    }
+
+    /// 存量迁移（**层内**）：本层已手写 `[schema.pinyin.grammar]` 的 `weight`（非 0）与 `model`
+    /// （非空）、却没写 `enabled` → 补 `enabled = true`。
+    ///
+    /// 为什么需要：`enabled` 在单层反序列化时缺省 true，但**分层合并后**不成立——桌面出厂层
+    /// （L2 `data/config.toml`）显式写了 `enabled = false`，用户层没写的键保留下层的值，
+    /// 于是只手写过 weight + model 的老用户升级后被出厂的 false 盖住、模型悄悄关掉。
+    /// 手写过这两项就是明确想开，补一个 true 才是「老配置照旧生效」。
+    ///
+    /// 已知边界：这样的用户在设置页把开关关掉，`enabled = false` 等于出厂值会被剪枝删掉，
+    /// 下次加载又被本迁移补回 true。要关只能删掉 weight / model 两行——他们本就是手改配置的人。
+    fn migrate_grammar_enabled_value(layer: &mut toml::Value) {
+        let Some(g) = layer
+            .get_mut("schema")
+            .and_then(|s| s.get_mut("pinyin"))
+            .and_then(|p| p.get_mut("grammar"))
+            .and_then(toml::Value::as_table_mut)
+        else {
+            return;
+        };
+        if g.contains_key("enabled") {
+            return;
+        }
+        let weight_set = g.get("weight").is_some_and(|v| {
+            v.as_float()
+                .or_else(|| v.as_integer().map(|i| i as f64))
+                .is_some_and(|w| w != 0.0)
+        });
+        let model_set = g
+            .get("model")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|m| !m.trim().is_empty());
+        if weight_set && model_set {
+            g.insert("enabled".to_string(), toml::Value::Boolean(true));
+            info!("schema.pinyin.grammar has weight+model but no enabled → enabled = true");
+        }
     }
 
     /// 存量迁移（**层内**）：本层的 `ui.tooltip.sections` 与「释义」段加入之前的旧出厂 6 段
@@ -9115,45 +9276,6 @@ impl Config {
         cand.insert("font_size".to_string(), size);
     }
 
-    /// 存量迁移（**须在反序列化前**跑，字段已改名）：`schema.pinyin.show_code_hint`(bool)
-    /// → `schema.pinyin.code_hint_source`(枚举字符串)。
-    ///
-    /// 映射刻意**不对称**：
-    /// - `true`  → `"codetable"`（**不是** `"auto"`）—— 严格零回归。旧的 true 只表达
-    ///   「显示反查来的码表编码」这一件事；映到 auto 会让**没配主码表**的双拼用户从
-    ///   「注释位空着」变成「显示双拼码」。那不算回归（原本就是空的），但确实是行为变化，
-    ///   该由用户自己去开，而不是升级时替他决定。
-    /// - `false` → `"off"`
-    ///
-    /// 键不存在则不动，让出厂值 `auto` 生效——新装用户一上手就能看到本方案的击键编码。
-    fn migrate_show_code_hint_value(merged: &mut toml::Value) {
-        let Some(old) = merged
-            .get("schema")
-            .and_then(|s| s.get("pinyin"))
-            .and_then(|p| p.get("show_code_hint"))
-            .and_then(toml::Value::as_bool)
-        else {
-            return;
-        };
-        let Some(py) = merged
-            .get_mut("schema")
-            .and_then(|s| s.get_mut("pinyin"))
-            .and_then(toml::Value::as_table_mut)
-        else {
-            return;
-        };
-        // 用户已经写了新键就不覆盖——他的显式配置比迁移出来的推断更可信。
-        if py.contains_key("code_hint_source") {
-            return;
-        }
-        let mapped = if old { "codetable" } else { "off" };
-        py.insert(
-            "code_hint_source".to_string(),
-            toml::Value::String(mapped.to_string()),
-        );
-        info!("Migrated schema.pinyin.show_code_hint={old} → code_hint_source={mapped}");
-    }
-
     /// 存量迁移（**须在反序列化前**跑，字段已从 [`QuickInputConfig`] 移除）：
     /// 废弃键 `schema.quick_input.force_vertical` → 内置 quick_mix 的
     /// [`MixModeConfig::candidate_layout`]。
@@ -9307,6 +9429,7 @@ impl Config {
         Self::migrate_tooltip_sections_value(&mut root);
         Self::migrate_stale_factory_tooltip_sections_value(&mut root);
         Self::migrate_comment_max_chars_value(&mut root);
+        Self::migrate_grammar_enabled_value(&mut root);
         let migrated = usize::from(root != before);
         // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
         // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
@@ -10378,6 +10501,9 @@ impl Config {
         Self::migrate_tooltip_sections_value(&mut root);
         // 注释字数旧键同理：竖排改回 0（出厂值 ⇒ 被剪掉）后，残留的旧键会在下次 load 补回原值。
         Self::migrate_comment_max_chars_value(&mut root);
+        // 语法模型总开关：老用户只写了 weight + model 时，要在写新值**之前**补上 enabled = true，
+        // 否则别的键的保存会把与出厂相同的 weight / model 剪掉，补 true 的依据就丢了。
+        Self::migrate_grammar_enabled_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
@@ -10640,6 +10766,82 @@ mod tests {
         assert_eq!(cfg.schema.pinyin.grammar.weight, 0.0, "基线不被覆盖值写穿");
     }
 
+    /// 总开关的平台归属：移动端读 `[mobile.grammar].enabled`，不被桌面基线的 enabled 牵着走。
+    #[test]
+    fn pinyin_grammar_enabled_follows_platform_override() {
+        let mut cfg = Config::default();
+        cfg.schema.pinyin.grammar.weight = 0.5;
+        cfg.schema.pinyin.grammar.model = "wanxiang-mini.gram".into();
+
+        cfg.schema.pinyin.grammar.enabled = false;
+        assert!(!cfg.pinyin_effective(false).grammar.active(), "桌面关");
+        assert!(
+            cfg.pinyin_effective(true).grammar.active(),
+            "桌面关不波及手机"
+        );
+
+        cfg.schema.pinyin.grammar.enabled = true;
+        cfg.mobile.grammar.enabled = false;
+        assert!(!cfg.pinyin_effective(true).grammar.active(), "手机关");
+        assert!(
+            cfg.pinyin_effective(false).grammar.active(),
+            "手机关不波及桌面"
+        );
+        assert!(cfg.schema.pinyin.grammar.enabled, "基线不被覆盖值写穿");
+    }
+
+    /// 真实分层：L1 默认 ⊕ L2 出厂 `data/config.toml` ⊕ 用户层，返回桌面生效的语法模型配置。
+    fn desktop_grammar_with_user_layer(user_toml: &str) -> PinyinGrammar {
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/config.toml");
+        let factory: toml::Value =
+            toml::from_str(&std::fs::read_to_string(data).expect("读出厂 config.toml")).unwrap();
+        let mut user: toml::Value = toml::from_str(user_toml).unwrap();
+        Config::migrate_user_layer_value(&mut user);
+        let mut merged = toml::Value::try_from(Config::default()).unwrap();
+        merge_value(&mut merged, factory);
+        merge_value(&mut merged, user);
+        let cfg: Config = merged.try_into().expect("反序列化");
+        cfg.pinyin_effective(false).grammar
+    }
+
+    /// 桌面出厂：开关关，模型不加载，但 weight / model 已备好。
+    #[test]
+    fn desktop_factory_grammar_is_off_but_ready() {
+        let g = desktop_grammar_with_user_layer("");
+        assert!(!g.enabled && !g.active());
+        assert_eq!((g.weight, g.model.as_str()), (0.5, "wanxiang-mini.gram"));
+    }
+
+    /// 设置页勾上只写一个 enabled，就该生效。
+    #[test]
+    fn desktop_toggle_alone_activates_factory_model() {
+        let g = desktop_grammar_with_user_layer("[schema.pinyin.grammar]\nenabled = true");
+        assert!(g.active());
+    }
+
+    /// ★ 老配置：只手写了 weight + model（没有 enabled）的桌面用户，叠在出厂 enabled=false 上
+    /// 也必须照旧生效——否则升级后模型被悄悄关掉。
+    #[test]
+    fn desktop_legacy_weight_and_model_stay_active_over_factory_false() {
+        let g = desktop_grammar_with_user_layer(
+            "[schema.pinyin.grammar]\nweight = 0.4\nmodel = \"wanxiang-lts-zh-hans.gram\"",
+        );
+        assert!(g.active(), "老配置被出厂 enabled=false 盖住了");
+        assert_eq!(g.model, "wanxiang-lts-zh-hans.gram");
+    }
+
+    /// 迁移只认「两项都手写」：只写 weight 不算想开（与「不静默启用默认模型」同一原则），
+    /// 显式写了 enabled = false 的更不能被改回去。
+    #[test]
+    fn grammar_migration_is_conservative() {
+        let only_weight = desktop_grammar_with_user_layer("[schema.pinyin.grammar]\nweight = 0.4");
+        assert!(!only_weight.active());
+        let explicit_off = desktop_grammar_with_user_layer(
+            "[schema.pinyin.grammar]\nenabled = false\nweight = 0.4\nmodel = \"x.gram\"",
+        );
+        assert!(!explicit_off.active(), "显式 enabled=false 不能被迁移改回");
+    }
+
     #[test]
     fn codetable_wildcard_folds_from_schema_and_validates_key() {
         let g = CodetableGlobal::default();
@@ -10782,6 +10984,27 @@ mod tests {
         // 从空配置反序列化（用户没写这一段）也要落到同一处
         let from_empty: PinyinGrammar = toml::from_str("").expect("空表可反序列化");
         assert_eq!(from_empty, g, "缺省反序列化须与 Default 一致");
+        assert!(!g.active(), "默认不加载模型");
+    }
+
+    /// 开关只做否决：老配置只写 weight + model（没有 enabled）照旧生效；
+    /// 开关关掉则不论 weight / model 写了什么都不加载；开着但少一项仍不加载。
+    #[test]
+    fn grammar_enabled_only_vetoes() {
+        let legacy: PinyinGrammar =
+            toml::from_str("weight = 0.5\nmodel = \"wanxiang-mini.gram\"").unwrap();
+        assert!(
+            legacy.enabled && legacy.active(),
+            "老配置不写 enabled 须照旧生效"
+        );
+
+        let off: PinyinGrammar =
+            toml::from_str("enabled = false\nweight = 0.5\nmodel = \"wanxiang-mini.gram\"")
+                .unwrap();
+        assert!(!off.active(), "enabled=false 必须否决");
+
+        let no_model: PinyinGrammar = toml::from_str("enabled = true\nweight = 0.5").unwrap();
+        assert!(!no_model.active(), "只开开关不配模型仍不加载");
     }
 
     /// 注释库的方案限定：`schemas` 留空适用于全部方案，非空则只在列出的方案下加载。
@@ -11090,6 +11313,38 @@ mod tests {
     }
 
     /// 有效视图是纯函数：多次调用结果一致，且与调用前后的 normalize 无关。
+    /// 注释切换键选功能键时补进会话按键表；按档位选动词，切换键为无、注释关着或用户自己绑了这个键就不补。
+    #[test]
+    fn function_switch_key_joins_session_actions() {
+        use crate::comment_lib::{SwitchKey, SwitchMode};
+        let f1 = |c: &Config| c.effective_session_actions().get("f1").cloned();
+        let mut c = Config::default();
+        assert_eq!(c.ui.comment.switch_key, SwitchKey::F1);
+        assert_eq!(f1(&c).as_deref(), Some("comment_state:session"));
+        c.ui.comment.switch_mode = SwitchMode::Hold;
+        assert_eq!(f1(&c).as_deref(), Some("comment_state:session"));
+        c.ui.comment.switch_mode = SwitchMode::Persist;
+        assert_eq!(f1(&c).as_deref(), Some("comment_state"));
+        c.ui.comment.switch_mode = SwitchMode::Session;
+        c.ui.comment.switch_key = SwitchKey::None;
+        assert_eq!(f1(&c), None);
+        c.ui.comment.switch_key = SwitchKey::F5;
+        assert_eq!(f1(&c), None);
+        assert_eq!(
+            c.effective_session_actions().get("f5").map(String::as_str),
+            Some("comment_state:session")
+        );
+        c.ui.comment.switch_key = SwitchKey::F1;
+        c.keys.session_actions.insert("f1".into(), "none".into());
+        assert_eq!(f1(&c).as_deref(), Some("none"), "用户的绑定优先");
+        c.keys.session_actions.clear();
+        c.ui.comment.switch_key = SwitchKey::Ctrl;
+        assert_eq!(f1(&c), None);
+        c.ui.comment.switch_key = SwitchKey::F1;
+        c.ui.comment.enabled = false;
+        assert_eq!(f1(&c), None);
+    }
+
     #[test]
     fn effective_session_actions_is_pure() {
         let mut c = Config::default();
@@ -11941,39 +12196,6 @@ show_source_hint = false
 "#);
         assert_eq!(prune_redundant(&mut user, &preset), 2);
         assert_eq!(prune_redundant(&mut user, &preset), 0, "二次清理应无事可做");
-    }
-
-    /// ★ 模式级注释模板（三态 `Option`，**刻意不进注册表**）不得被写回清理掉。
-    ///
-    /// 这类键的出厂值是「键不存在」＝跟随全局，故 preset 里没有它们、注册表也不登记
-    /// （见 `config_schema::REGISTRY` 的说明）。若哪天有人为了「让设置页能看见」把它们
-    /// 补进注册表，`prune_redundant` 的第一道保险就失效——用户手写的模板会在某次保存后
-    /// 被静默删掉，表现为「配了几天突然没了」。本测试是那个改动的拦截点。
-    #[test]
-    fn prune_keeps_mode_comment_templates() {
-        let preset = preset_sample();
-        let mut user = tv(r#"
-[input.temp_english]
-comment_template_vertical = "${dict}"
-comment_template_horizontal = ""
-"#);
-        assert_eq!(prune_redundant(&mut user, &preset), 0, "未登记键一律不碰");
-        assert!(
-            get_nested(
-                &user,
-                &["input", "temp_english", "comment_template_vertical"]
-            )
-            .is_some(),
-            "用户手写的模式级模板必须原样保留"
-        );
-        assert!(
-            get_nested(
-                &user,
-                &["input", "temp_english", "comment_template_horizontal"]
-            )
-            .is_some(),
-            "空串（= 本模式不显示注释）同样是有效配置，不得被当成冗余删除"
-        );
     }
 
     #[test]
@@ -13743,207 +13965,6 @@ scripts = { latin = 42 }
     }
 
     #[test]
-    fn migrate_show_code_hint_works_through_the_real_layering() {
-        for (old, want) in [(false, "off"), (true, "codetable")] {
-            let mut user: toml::Value =
-                toml::from_str(&format!("[schema.pinyin]\nshow_code_hint = {old}\n")).unwrap();
-            Config::migrate_user_layer_value(&mut user);
-
-            let mut merged = toml::Value::try_from(Config::default()).unwrap();
-            merge_value(&mut merged, user);
-            let cfg: Config = merged.try_into().expect("反序列化");
-
-            assert_eq!(
-                cfg.schema.pinyin.code_hint_source, want,
-                "show_code_hint={old} 应迁移为 {want}"
-            );
-        }
-    }
-
-    /// 用户在设置页显式选过新键之后，旧键**不得**再把它顶回去。
-    ///
-    /// 这是「层内迁移」相对「合并后迁移」的全部意义所在：设置页写回时只写它管的那个键，
-    /// 不会顺手删掉旧键，于是用户配置里两个键长期并存。判据若是在**合并结果**上问
-    /// 「有没有新键」，那永远是有（L1 注入的），迁移一次都不会跑；判据若改成「旧键优先」，
-    /// 用户在设置页的每一次修改都会在下次启动时被打回。只有在**用户层那一份**上问，
-    /// `contains_key` 才真正表示「用户自己写过」。
-    #[test]
-    fn explicit_new_key_wins_over_stale_old_key() {
-        let mut user: toml::Value = toml::from_str(
-            "[schema.pinyin]\nshow_code_hint = true\ncode_hint_source = \"shuangpin\"\n",
-        )
-        .unwrap();
-        Config::migrate_user_layer_value(&mut user);
-
-        let mut merged = toml::Value::try_from(Config::default()).unwrap();
-        merge_value(&mut merged, user);
-        let cfg: Config = merged.try_into().expect("反序列化");
-        assert_eq!(cfg.schema.pinyin.code_hint_source, "shuangpin");
-    }
-
-    /// ★ `show_code_hint`(bool) → `code_hint_source`(枚举)。
-    ///
-    /// `true → "codetable"` 而**不是** `"auto"`：旧的 true 只表达「显示反查来的码表
-    /// 编码」。映到 auto 会让没配主码表的双拼用户升级后凭空多出一段双拼码——不算回归
-    /// （原本就是空的），但那该由用户自己去开。
-    #[test]
-    fn migrate_show_code_hint_maps_true_to_codetable_not_auto() {
-        let mut v: toml::Value =
-            toml::from_str("[schema.pinyin]\nshow_code_hint = true\n").unwrap();
-        Config::migrate_show_code_hint_value(&mut v);
-        let py = v.get("schema").unwrap().get("pinyin").unwrap();
-        assert_eq!(
-            py.get("code_hint_source").and_then(toml::Value::as_str),
-            Some("codetable"),
-            "true 必须映到 codetable —— 映到 auto 会给老用户凭空加显示"
-        );
-
-        // 幂等：每次启动都跑一遍，第二次不得再改。
-        let before = v.clone();
-        Config::migrate_show_code_hint_value(&mut v);
-        assert_eq!(v, before, "迁移必须幂等");
-    }
-
-    #[test]
-    fn migrate_show_code_hint_maps_false_to_off() {
-        let mut v: toml::Value =
-            toml::from_str("[schema.pinyin]\nshow_code_hint = false\n").unwrap();
-        Config::migrate_show_code_hint_value(&mut v);
-        assert_eq!(
-            v.get("schema")
-                .unwrap()
-                .get("pinyin")
-                .unwrap()
-                .get("code_hint_source")
-                .and_then(toml::Value::as_str),
-            Some("off")
-        );
-    }
-
-    /// 用户已经写了新键就不覆盖——显式配置比从旧键推断出来的更可信。
-    #[test]
-    fn migrate_show_code_hint_keeps_explicit_new_key() {
-        let mut v: toml::Value = toml::from_str(
-            "[schema.pinyin]\nshow_code_hint = true\ncode_hint_source = \"shuangpin\"\n",
-        )
-        .unwrap();
-        Config::migrate_show_code_hint_value(&mut v);
-        assert_eq!(
-            v.get("schema")
-                .unwrap()
-                .get("pinyin")
-                .unwrap()
-                .get("code_hint_source")
-                .and_then(toml::Value::as_str),
-            Some("shuangpin")
-        );
-    }
-
-    /// 没有旧键就不动，让出厂值 `off` 生效（纯拼音/双拼用户默认不看编码反查）。
-    #[test]
-    fn migrate_show_code_hint_leaves_fresh_config_alone() {
-        let mut v: toml::Value = toml::from_str("[schema.pinyin]\nseparator = \"auto\"\n").unwrap();
-        let before = v.clone();
-        Config::migrate_show_code_hint_value(&mut v);
-        assert_eq!(v, before);
-        assert_eq!(PinyinGlobalConfig::default().code_hint_source, "off");
-    }
-
-    /// ★ 两份编码来源开关各有各的出厂值：拼音方案 `off`、临时拼音 `auto`。
-    ///
-    /// 临拼那份若复用 `default_code_hint_source`，拼音方案改 off 时会被一并拖成 off——
-    /// 码表用户借临拼反查编码的典型场景就此静默失效。代码默认与 serde 缺键两条路都钉。
-    #[test]
-    fn temp_pinyin_code_hint_source_defaults_to_auto_independently() {
-        let c = Config::default();
-        assert_eq!(c.schema.pinyin.code_hint_source, "off");
-        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
-        assert_eq!(
-            CodeHintSource::from_config(&c.input.temp_pinyin.code_hint_source, CodeHintSource::Off),
-            CodeHintSource::Auto,
-            "出厂 auto 须是认出来的 auto，不是兜底落出来的"
-        );
-        // 写了 [input.temp_pinyin] 段但没写本键 → serde default 兜底，仍是 auto。
-        let c = merged_with("[input.temp_pinyin]\nenabled = true\n");
-        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
-        // 只改拼音方案那份，不连带临拼。
-        let c = merged_with("[schema.pinyin]\ncode_hint_source = \"shuangpin\"\n");
-        assert_eq!(c.input.temp_pinyin.code_hint_source, "auto");
-        // 临拼那份可以显式关掉。
-        let c = merged_with("[input.temp_pinyin]\ncode_hint_source = \"off\"\n");
-        assert_eq!(c.input.temp_pinyin.code_hint_source, "off");
-        assert_eq!(c.schema.pinyin.code_hint_source, "off");
-    }
-
-    /// 四档各自允许哪些变量求值——「开关管允许哪些来源、模板管怎么摆」的全部含义。
-    #[test]
-    fn code_hint_source_gates() {
-        use CodeHintSource::*;
-        for (src, rev, sch) in [
-            (Off, false, false),
-            (CodeTable, true, false),
-            (Shuangpin, false, true),
-            (Auto, true, true),
-        ] {
-            assert_eq!(src.allows_reverse(), rev, "{src:?}.allows_reverse");
-            assert_eq!(src.allows_shuangpin(), sch, "{src:?}.allows_shuangpin");
-        }
-    }
-
-    /// 认不出的值回落调用方传入的 `fallback`（各字段自己的出厂档），不是函数内写死的某一档。
-    ///
-    /// 两份字段出厂值不同（拼音方案 `off`、临拼 `auto`）：写死一档的话，总有一份字段写错
-    /// 后会落到别人的出厂档上——拼音方案用户手滑就意外看到编码。
-    #[test]
-    fn unknown_code_hint_source_falls_back_to_given_fallback() {
-        use CodeHintSource::*;
-        for fallback in [Off, CodeTable, Shuangpin, Auto] {
-            assert_eq!(
-                CodeHintSource::from_config("shuangping", fallback),
-                fallback
-            );
-            assert_eq!(CodeHintSource::from_config("", fallback), fallback);
-        }
-        // 大小写与空白不敏感（设置页写回的值与用户手打的都认），且认出来的值不看 fallback。
-        assert_eq!(
-            CodeHintSource::from_config("  CodeTable ", Off),
-            CodeHintSource::CodeTable
-        );
-        assert_eq!(
-            CodeHintSource::from_config("OFF", Auto),
-            CodeHintSource::Off
-        );
-        assert_eq!(
-            CodeHintSource::from_config(" Auto", Off),
-            CodeHintSource::Auto
-        );
-    }
-
-    /// 注册表值域与 `from_config` 的 match 臂必须逐项对齐。
-    ///
-    /// 不对齐 = 注册表说非法、运行时却认（或反过来）。CLI 校验与设置页下拉都按注册表
-    /// 办事，漂移的表现是「明明能用却填不进去」，或「填进去了却没反应」。
-    #[test]
-    fn code_hint_source_values_match_registry() {
-        use CodeHintSource::*;
-        for v in crate::config_schema::CODE_HINT_SOURCE_VALUES {
-            let parsed = CodeHintSource::from_config(v, Off);
-            // 换两个不同的 fallback 结果不变 = 这个值是被 match 臂认出来的，没落到兜底。
-            assert_eq!(
-                CodeHintSource::from_config(v, Auto),
-                parsed,
-                "注册表列出的 {v} 不该落到兜底档"
-            );
-            // 每个列出的值都要能被解析回它自己。
-            assert_eq!(
-                format!("{parsed:?}").to_ascii_lowercase(),
-                v.replace('_', ""),
-                "{v} 解析结果与自身不符"
-            );
-        }
-    }
-
-    #[test]
     fn grid_expand_defaults_off_and_cell_truncation_takes_the_tighter_limit() {
         let cfg = Config::default();
         assert!(
@@ -14055,7 +14076,6 @@ scripts = { latin = 42 }
     #[test]
     fn pinyin_global_config_defaults() {
         let c = Config::default();
-        assert_eq!(c.schema.pinyin.code_hint_source, "off");
         assert!(c.schema.pinyin.use_smart_compose);
         assert_eq!(c.schema.pinyin.separator, "auto");
         assert!(!c.schema.pinyin.fuzzy.enabled);
@@ -14148,10 +14168,6 @@ scripts = { latin = 42 }
         assert!(!c.schema.pinyin.fuzzy.ch_c, "ch_c 未覆盖，应保留默认 false");
         assert!(!c.schema.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
         // 未覆盖的 pinyin 顶层字段：保留默认值
-        assert_eq!(
-            c.schema.pinyin.code_hint_source, "off",
-            "code_hint_source 未覆盖，应保留出厂档"
-        );
         assert!(
             c.schema.pinyin.use_smart_compose,
             "use_smart_compose 未覆盖，应保留默认 true"
@@ -14805,5 +14821,39 @@ mod status_position_tests {
             ..Default::default()
         };
         assert_eq!(bad.reverse_wildcard_char(), 'z');
+    }
+}
+
+#[cfg(test)]
+mod caret_right_tests {
+    use super::*;
+
+    /// `caret_right[:commit|next|tip]` 往返；默认档不带后缀；写错的载荷不静默降级。
+    #[test]
+    fn caret_right_payload_round_trips() {
+        for (v, want) in [
+            ("caret_right", CaretEnd::Commit),
+            ("caret_right:commit", CaretEnd::Commit),
+            ("caret_right:next", CaretEnd::Next),
+            ("caret_right:tip", CaretEnd::Tip),
+        ] {
+            assert_eq!(
+                SessionAction::parse(v),
+                SessionAction::CaretRight(want),
+                "{v}"
+            );
+        }
+        assert_eq!(
+            SessionAction::parse("caret_right").to_string(),
+            "caret_right"
+        );
+        assert_eq!(
+            SessionAction::parse("caret_right:tip").to_string(),
+            "caret_right:tip"
+        );
+        assert_eq!(
+            SessionAction::parse("caret_right:bogus"),
+            SessionAction::None
+        );
     }
 }

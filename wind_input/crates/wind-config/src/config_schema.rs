@@ -155,12 +155,25 @@ const RARE_PHRASE_VALUES: &[&str] = &["keep", "filter"];
 const PUNCT_EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear", "clear_no_input"];
 
 /// 码表词频应用策略。
-/// `schema.pinyin.code_hint_source` / `input.temp_pinyin.code_hint_source` 共用的值域。
-///
-/// ⚠️ 必须与 [`wind_config::config::CodeHintSource::from_config`] 的 match 臂**逐项对齐**。
-/// 不对齐的表现是第二种漂移：注册表说某个值非法（CLI/设置页据此校验、生成下拉），
-/// 运行时却认它——或者反过来。
-pub(crate) const CODE_HINT_SOURCE_VALUES: &[&str] = &["off", "codetable", "shuangpin", "auto"];
+/// `ui.comment.assign.global` 的四格键名。⚠️ 与 [`crate::comment_lib::CommentCells`] 的字段名逐项对齐。
+pub(crate) const COMMENT_CELL_KEYS: &[&str] = &[
+    "default_vertical",
+    "default_horizontal",
+    "detail_vertical",
+    "detail_horizontal",
+];
+
+/// `ui.comment.state` 的值域。⚠️ 与 [`crate::comment_lib::CommentState`] 的 serde 名逐项对齐。
+pub(crate) const COMMENT_STATE_VALUES: &[&str] = &["default", "detail"];
+
+/// `ui.comment.switch_key` 的值域。⚠️ 与 [`crate::comment_lib::SwitchKey`] 的 serde 名逐项对齐。
+pub(crate) const COMMENT_SWITCH_KEY_VALUES: &[&str] = &[
+    "none", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "ctrl",
+    "lctrl", "rctrl", "alt", "lalt", "ralt",
+];
+
+/// `ui.comment.switch_mode` 的值域。⚠️ 与 [`crate::comment_lib::SwitchMode`] 的 serde 名逐项对齐。
+pub(crate) const COMMENT_SWITCH_MODE_VALUES: &[&str] = &["session", "persist", "hold"];
 
 /// `input.alt_commit` 的值域。⚠️ 与 [`wind_config::config::AltCommit::from_config`] 逐项对齐。
 pub(crate) const ALT_COMMIT_VALUES: &[&str] = &["off", "pinyin", "pinyin_plain", "comment"];
@@ -204,12 +217,11 @@ const EMOJI_SHOW_AS_VALUES: &[&str] = &["after", "tail", "comment"];
 ///
 /// # 三态键（`Option<T>`，默认 `None`）刻意不登记
 ///
-/// 模式级注释模板 `input.{temp_english,temp_pinyin,url}.comment_template_{vertical,horizontal}`
-/// 不在本表内，**这不是遗漏**：注册表是与 `Config::default()` 的序列化键集反向对照的，
-/// 而这类键的出厂值恰恰是「键不存在」（= 跟随全局），序列化时压根不出现，登记即被判「多余」。
+/// 这类键不在本表内，**这不是遗漏**：注册表是与 `Config::default()` 的序列化键集反向对照的，
+/// 而这类键的出厂值恰恰是「键不存在」，序列化时压根不出现，登记即被判「多余」。
 ///
 /// 不登记同时是**正确**的：`prune_redundant` 只清理「已登记且值等于出厂默认」的键，
-/// 未登记键一律不碰——用户手写的模板因此永远不会被写回逻辑清掉。这与废弃键、
+/// 未登记键一律不碰——用户手写的值因此永远不会被写回逻辑清掉。这与废弃键、
 /// `Map`/`StructList` 下钻子路径归为同一类处置，理由见该函数的「两道保险」。
 static REGISTRY: &[ConfigField] = &[
     // -- schema（方案 + 拼音 + 模式）--
@@ -302,10 +314,6 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.auto_phrase.draft_max_entries", Int),
     f("schema.codetable.auto_phrase.draft_flush_batch", Int),
     // 全局拼音
-    f(
-        "schema.pinyin.code_hint_source",
-        Enum(CODE_HINT_SOURCE_VALUES),
-    ),
     f("schema.pinyin.use_smart_compose", Bool),
     // 用户词进整句词图（S2）。**出厂 true**（2026-09-28 起），接用户词与临时词
     // （不接草稿层）。只在 use_smart_compose 开着时有效，UI 侧 enabled_when 挂在它上面。
@@ -357,7 +365,8 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.completion.min_syllables", Int),
     f("schema.pinyin.completion.max_extra_syllables", Int),
     f("schema.pinyin.abbrev.enabled", Bool),
-    // 上下文语言模型（n-gram）。weight=0 时不加载模型文件，整句结果与没有该功能时逐位相同。
+    // 上下文语言模型（n-gram）。enabled=false 或 weight=0 时都不加载模型文件，整句结果与没有该功能时逐位相同。
+    f("schema.pinyin.grammar.enabled", Bool),
     f("schema.pinyin.grammar.weight", Float),
     f("schema.pinyin.grammar.model", Str),
     // 双拼下的全拼降级输入（多人共用机器）。非双拼方案无效，混输次引擎强制关闭。
@@ -389,7 +398,6 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.block_commit_on_pinyin_word", Bool),
     f("schema.mix.pinyin_word_min_weight", Int),
     f("schema.mix.enable_pinyin_abbrev", Bool),
-    f("schema.mix.pinyin_code_hint", Bool),
     f("schema.mix.pinyin_partial_candidates", Bool),
     f("schema.mix.pinyin_partial_candidates_overflow", Bool),
     // 快捷输入：各候选来源的开关与优先级在 schema.mix_modes 的 members 里（有无=开关，
@@ -519,10 +527,6 @@ static REGISTRY: &[ConfigField] = &[
         "input.temp_pinyin.candidate_layout",
         Enum(LAYOUT_INTENT_VALUES),
     ),
-    f(
-        "input.temp_pinyin.code_hint_source",
-        Enum(CODE_HINT_SOURCE_VALUES),
-    ),
     f("input.url.enabled", Bool),
     f("input.url.prefixes", StrList),
     // 网址历史：独立于 url.enabled 的第二道开关（前者只改输入行为，后者开始落盘用户
@@ -568,6 +572,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.cmdbar.enabled", Bool),
     f("input.cmdbar.candidate_prefix", Str),
     // 短语前缀列举（原 dict.phrase）
+    f("input.phrase.prefix_match", Bool),
     f("input.phrase.min_prefix", Int),
     // 顶码上屏策略
     f(
@@ -632,6 +637,8 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.overflow.select_key", Enum(OVERFLOW_VALUES)),
     f("keys.overflow.select_char_key", Enum(OVERFLOW_VALUES)),
     f("keys.overflow.page_key", Enum(PAGE_KEY_OVERFLOW_VALUES)),
+    // 按键级覆盖（键名 → 策略），整体一张表；设置端编辑控件另案，先用配置文件。
+    f("keys.overflow.page_key_overrides", Map(&[])),
     // -- ui（外观）--
     f("ui.candidate.per_page", Int),
     f("ui.candidate.per_page_extended", Int),
@@ -640,6 +647,7 @@ static REGISTRY: &[ConfigField] = &[
         "ui.candidate.preedit_display",
         Enum(&["app_inline", "candidate_top", "candidate_inline"]),
     ),
+    f("ui.candidate.syllable_separator", Str),
     f("ui.candidate.hide_window", Bool),
     // 候选窗首显策略的全局默认档。per-app 覆盖走 compat.toml（右键菜单管理），
     // 那里的「跟随全局」一档就是回到本键。
@@ -679,14 +687,20 @@ static REGISTRY: &[ConfigField] = &[
     ),
     f("ui.candidate.grid_pageupdown_screen", Bool),
     f("ui.candidate.grid_categories", StrList),
-    f("ui.candidate.comment_enabled", Bool),
-    f("ui.candidate.comment_template_vertical", Str),
-    f("ui.candidate.comment_template_horizontal", Str),
     f("ui.candidate.comment_max_chars_vertical", Int),
     f("ui.candidate.comment_max_chars_horizontal", Int),
     f("ui.candidate.comment_above", Bool),
     f("ui.candidate.auto_comment_dicts", Bool),
     f("ui.comment_dicts", StructList),
+    f("ui.comment.enabled", Bool),
+    f("ui.comment.state", Enum(COMMENT_STATE_VALUES)),
+    f("ui.comment.switch_key", Enum(COMMENT_SWITCH_KEY_VALUES)),
+    f("ui.comment.switch_mode", Enum(COMMENT_SWITCH_MODE_VALUES)),
+    f("ui.comment.templates", StructList),
+    f("ui.comment.assign.global", Map(COMMENT_CELL_KEYS)),
+    f("ui.comment.assign.type", Map(&[])),
+    f("ui.comment.assign.schema", Map(&[])),
+    f("ui.comment.assign.mode", Map(&[])),
     f("ui.candidate.index_labels", StrList),
     f("ui.candidate.flip_when_above", Bool),
     f("ui.candidate.swap_preedit_when_above", Bool),
@@ -732,6 +746,7 @@ static REGISTRY: &[ConfigField] = &[
         "ui.status.fallback_position",
         Enum(&crate::app_compat::STATUS_FALLBACK_POSITIONS),
     ),
+    f("ui.status.caret_side", Enum(&["below", "above"])),
     f("ui.status.offset_x", Int),
     f("ui.status.offset_y", Int),
     f("ui.status.custom_x", Int),
@@ -798,6 +813,10 @@ static REGISTRY: &[ConfigField] = &[
     f("mobile.association.mode", Enum(&["one_shot", "continuous"])),
     f("mobile.association.punct", Bool),
     f("mobile.association.space_commits", Bool),
+    f("mobile.association.select_keys_commit", Bool),
+    f("mobile.association.enter_cancels_only", Bool),
+    f("mobile.association.backspace_cancels_only", Bool),
+    f("mobile.grammar.enabled", Bool),
     f("mobile.grammar.weight", Float),
     f("mobile.grammar.model", Str),
 ];
@@ -912,16 +931,6 @@ pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
         key: "ui.candidate.layout",
         section: "[candidate]",
         note: "方案可覆盖候选窗排列方向；方案没写则用这里的值。",
-    },
-    SchemaOverride {
-        key: "ui.candidate.comment_template_vertical",
-        section: "[candidate]",
-        note: "方案可覆盖注释模板；方案没写则用这里的值。",
-    },
-    SchemaOverride {
-        key: "ui.candidate.comment_template_horizontal",
-        section: "[candidate]",
-        note: "方案可覆盖注释模板；方案没写则用这里的值。",
     },
 ];
 
@@ -1087,14 +1096,6 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         (
             "ui.candidate.layout",
             cand.layout != crate::config::LayoutIntent::Follow,
-        ),
-        (
-            "ui.candidate.comment_template_vertical",
-            cand.comment_template_vertical.is_some(),
-        ),
-        (
-            "ui.candidate.comment_template_horizontal",
-            cand.comment_template_horizontal.is_some(),
         ),
     ];
     checks
@@ -1449,31 +1450,6 @@ mod tests {
         );
     }
 
-    /// L1↔L2 同源：全局注释模板（横竖两份）。`default_comment_template()` 与
-    /// `data/config.toml` 是同一个出厂事实的两份写法，分叉的表现是「删掉配置文件后注释栏变了样」。
-    #[test]
-    fn comment_template_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.candidate;
-        let cand = data_config_toml()
-            .get("ui")
-            .and_then(|u| u.get("candidate"))
-            .cloned()
-            .expect("data/config.toml 缺少 [ui.candidate]");
-        for (k, v) in [
-            ("comment_template_vertical", &l1.comment_template_vertical),
-            (
-                "comment_template_horizontal",
-                &l1.comment_template_horizontal,
-            ),
-        ] {
-            assert_eq!(
-                cand.get(k).and_then(toml::Value::as_str),
-                Some(v.as_str()),
-                "ui.candidate.{k} 的 L1 默认值与 L2 出厂文件不一致"
-            );
-        }
-    }
-
     /// L1↔L2 同源：气泡的单行上限与折行宽度（取值守门在 config.rs `test_tooltip_defaults`，
     /// 行为守门在协调器 `tooltip` 模块的出厂配置用例）。
     #[test]
@@ -1511,12 +1487,20 @@ mod tests {
         assert_eq!(l2_bool("tooltip", "enabled"), l1);
     }
 
-    /// L1↔L2 同源：候选注释总开关（出厂开，同上）。
+    /// L1↔L2 同源：`[ui.comment]` 的总开关、当前态、切换键与切换方式。
     #[test]
-    fn comment_enabled_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.candidate.comment_enabled;
-        assert!(l1, "ui.candidate.comment_enabled 出厂应为 true");
-        assert_eq!(l2_bool("candidate", "comment_enabled"), l1);
+    fn ui_comment_l1_matches_l2() {
+        let l1 = crate::Config::default().ui.comment;
+        assert!(l1.enabled, "ui.comment.enabled 出厂应为 true");
+        assert_eq!(l2_bool("comment", "enabled"), l1.enabled);
+        let comment = data_config_toml()
+            .get("ui")
+            .and_then(|u| u.get("comment"))
+            .cloned()
+            .expect("data/config.toml 缺少 [ui.comment]");
+        let l2: crate::comment_lib::UiCommentConfig =
+            comment.try_into().expect("[ui.comment] 须能反序列化");
+        assert_eq!(l2, l1, "[ui.comment] 的 L1 默认值与 L2 出厂文件不一致");
     }
 
     /// L1↔L2 同源：方案常驻策略（出厂关，设计 memory-footprint.md §9 D1）。
@@ -1717,6 +1701,14 @@ mod tests {
         // 的整表覆盖语义纠缠。格式与示例写在 `[ui.toolbar]` 段的注释里（不是数组表，
         // 只是注释），用户照抄即可。
         "ui.toolbar.buttons",
+        // 候选注释的用户模板与分配：用户结构化内容，出厂为空。出厂模板与分配放在
+        // `system.comments.toml`——config.toml 的表逐键深合并，写进这里的出厂行会在用户
+        // 删掉后下次加载又被合并回来。
+        "ui.comment.templates",
+        "ui.comment.assign.global",
+        "ui.comment.assign.type",
+        "ui.comment.assign.schema",
+        "ui.comment.assign.mode",
     ];
 
     /// `data/config.toml` 必须显式列出注册表里的每一个键（豁免名单除外）。
@@ -2238,12 +2230,6 @@ mod overridden_keys_tests {
                 "[punct.custom_mappings]\n\",\" = [\"，\", \"，\", \"，\", \",\"]\n"
             }
             "ui.candidate.layout" => "[candidate]\nlayout = \"vertical\"\n",
-            "ui.candidate.comment_template_vertical" => {
-                "[candidate]\ncomment_template_vertical = \"x\"\n"
-            }
-            "ui.candidate.comment_template_horizontal" => {
-                "[candidate]\ncomment_template_horizontal = \"x\"\n"
-            }
             other => panic!(
                 "新增了登记项 {other}：在此补一份只设该项的最小方案片段，并让 schema_overridden_keys 认它"
             ),

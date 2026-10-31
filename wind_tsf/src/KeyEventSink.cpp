@@ -214,15 +214,20 @@ static MouseAsyncState ReadMouseAsyncState()
 
 void CKeyEventSink::NoteSelectionChangedDuringToggle()
 {
-    if (_pendingKeyUpKey == 0)
+    if (_pendingKeyUpKey == 0 && _ctrlRaw.vk == 0)
         return;
     // OnEndEdit 是异步通知，快速单击时鼠标键可能已经抬起，故除「此刻按着」外还要看
     // 「按下过」位；读位会清它，命中就并入 mousePressedSincePress，keyup 时不丢。
+    // 待判单击与 Ctrl 如实上报各记一份（两者可能同时在按住中，如 Ctrl 按着再按 Shift）。
     const MouseAsyncState mouse = ReadMouseAsyncState();
-    if (mouse.pressedSinceLastCall)
-        _pendingTapSignals.mousePressedSincePress = true;
-    if (mouse.down || mouse.pressedSinceLastCall)
-        _pendingTapSignals.selectionChanged = true;
+    wind::toggletap::TapSignals* const sigs[] = {&_pendingTapSignals, &_ctrlRawTapSignals};
+    for (wind::toggletap::TapSignals* sig : sigs)
+    {
+        if (mouse.pressedSinceLastCall)
+            sig->mousePressedSincePress = true;
+        if (mouse.down || mouse.pressedSinceLastCall)
+            sig->selectionChanged = true;
+    }
 }
 
 // 记录「这个切换键正等着 keyup 触发切换」。
@@ -305,6 +310,113 @@ void CKeyEventSink::_CancelPendingToggle(WPARAM wParam, const wchar_t* reason)
     _pendingKeyUpModifiers = 0;
 }
 
+// Ctrl 的左右：优先 modifiers（双源），降级 GetAsyncKeyState；同 _MarkPendingToggleKey。认不出给 0。
+uint32_t CKeyEventSink::_ResolveCtrlVk(WPARAM wParam, uint32_t modifiers)
+{
+    if (wParam == VK_LCONTROL || wParam == VK_RCONTROL)
+        return (uint32_t)wParam;
+    if (wParam != VK_CONTROL)
+        return 0;
+    if (modifiers & KEYMOD_LCTRL)
+        return VK_LCONTROL;
+    if (modifiers & KEYMOD_RCTRL)
+        return VK_RCONTROL;
+    if (GetAsyncKeyState(VK_LCONTROL) & 0x8000)
+        return VK_LCONTROL;
+    if (GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+        return VK_RCONTROL;
+    return 0;
+}
+
+void CKeyEventSink::_NoteKeyDownForCtrlRaw(WPARAM wParam)
+{
+    if (wParam == VK_CONTROL || wParam == VK_LCONTROL || wParam == VK_RCONTROL)
+        return; // Ctrl 自己归 _TryCtrlRawDown
+    wind::ctrlraw::OnOtherKey(_ctrlRaw);
+}
+
+// 候选显示时 Ctrl 如实上报的按下（规则见 CtrlRawPolicy.h）。放在一切白名单判定之前：这条路
+// 与切换键、切换方式无关，服务端替中英切换 / 选词 / 会话绑定 / 注释切换判单击。
+BOOL CKeyEventSink::_TryCtrlRawDown(WPARAM wParam, LPARAM lParam, uint32_t modifiers)
+{
+    if (!(wParam == VK_CONTROL || wParam == VK_LCONTROL || wParam == VK_RCONTROL))
+        return FALSE;
+    const uint32_t vk = _ResolveCtrlVk(wParam, modifiers);
+    const bool autoRepeat = (lParam & 0x40000000) != 0;
+    switch (wind::ctrlraw::OnCtrlDown(_ctrlRaw, vk, _HasInputSession() != FALSE, autoRepeat, _pendingKeyUpKey))
+    {
+    case wind::ctrlraw::Down::Legacy:
+        return FALSE;
+    case wind::ctrlraw::Down::Repeat:
+        return TRUE;
+    case wind::ctrlraw::Down::Start:
+        break;
+    }
+    // 别的键的待判单击（如 Shift 按着再按 Ctrl）就此作废，与旧路「别的键取消待判」一致。
+    _pendingKeyUpKey = 0;
+    _pendingKeyUpModifiers = 0;
+    _ctrlRawTapSignals = {};
+    _ctrlRawTapSignals.mouseDownAtPress = ReadMouseAsyncState().down;
+    WIND_LOG_DEBUG_FMT(L"Ctrl 如实上报 按下: vk=0x%02X mods=0x%04X\n", vk, modifiers);
+    if (_SendKeyToService(vk, modifiers, KEY_EVENT_MOD_DOWN))
+        _HandleServiceResponse();
+    else
+        WIND_LOG_ERROR(L"IPC failed for Ctrl raw down\n");
+    return TRUE;
+}
+
+// 候选显示时 Ctrl 如实上报的松开：是那次按住就发 MOD_UP（按住翻转靠它收起，故不看此刻有没有会话）。
+void CKeyEventSink::_DispatchCtrlRawUp(WPARAM wParam)
+{
+    if (_ctrlRaw.vk == 0)
+        return;
+    if (!(wParam == VK_CONTROL || wParam == VK_LCONTROL || wParam == VK_RCONTROL))
+        return;
+    if (!_IsMatchingKeyUp(wParam, _ctrlRaw.vk))
+        return;
+    wind::toggletap::TapSignals signals = _ctrlRawTapSignals;
+    const MouseAsyncState mouse = ReadMouseAsyncState();
+    signals.mouseDownAtRelease = mouse.down;
+    signals.mousePressedSincePress = signals.mousePressedSincePress || mouse.pressedSinceLastCall;
+    _ctrlRawTapSignals = {};
+    const wind::ctrlraw::Up up =
+        wind::ctrlraw::OnCtrlUp(_ctrlRaw, true, wind::toggletap::IsTapCancelledByMouse(signals));
+    if (!up.report)
+        return;
+    const uint32_t mods = KEYMOD_CTRL | (up.vk == VK_LCONTROL ? KEYMOD_LCTRL : KEYMOD_RCTRL);
+    WIND_LOG_DEBUG_FMT(L"Ctrl 如实上报 松开: vk=0x%02X notTap=%d\n", up.vk, (int)up.notTap);
+    // 判出单击可能切中英（状态气泡要锚到当前插入点），同旧路。
+    _pTextService->SendCaretPositionUpdate();
+    if (_SendKeyToService(up.vk, mods, KEY_EVENT_MOD_UP, up.notTap ? TOGGLE_MOD_NOT_TAP : 0))
+        _HandleServiceResponse();
+    else
+        WIND_LOG_ERROR(L"IPC failed for Ctrl raw up\n");
+}
+
+// 服务端吃掉过按下的功能键：把松开也送过去（按住档的注释切换键靠它收起详细态）。按下吃了，
+// 松开同样吃掉，宿主两边都看不到这个键。OnTestKeyUp 先到就由它发、OnKeyUp 只收尾
+// （finalize）；只调 OnTestKeyUp 的宿主（mintty）留下的记账在下一次按下时覆盖。
+// 返回 TRUE = 这次松开属于那个键，调用方吃掉。
+BOOL CKeyEventSink::_DispatchEatenFnKeyUp(WPARAM wParam, BOOL finalize)
+{
+    if (_eatenFnKeyVk == 0 || (UINT)wParam != _eatenFnKeyVk)
+        return FALSE;
+    if (!_eatenFnKeyUpSent)
+    {
+        _eatenFnKeyUpSent = TRUE;
+        if (_SendKeyToService((uint32_t)wParam, 0, KEY_EVENT_UP))
+            _HandleServiceResponse();
+        else
+            WIND_LOG_ERROR(L"IPC failed for function key up\n");
+    }
+    if (finalize)
+    {
+        _eatenFnKeyVk = 0;
+        _eatenFnKeyUpSent = FALSE;
+    }
+    return TRUE;
+}
+
 // ITfKeyEventSink::OnSetFocus —— 名字像是焦点主回调，实际**很不可靠**，不要往这里挂
 // 任何独占职责：AutoCAD 实测整场只触发 2 次，且全是 fForeground=1，从来没有过 0。
 // （曾把 focus_lost 挂在它的 else 分支上，结果 focus_lost 完全断供。）
@@ -380,6 +492,10 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
 {
     *pfEaten = FALSE;
 
+    // 服务进程 Alt 钩子注入的屏蔽键：宿主要看到它才不激活菜单栏，一律放行、不转发、不记账。
+    if (wParam == WindPassthrough::kVkMenuMask)
+        return S_OK;
+
     // 透传上报：本函数有 40+ 个 return，逐个接线必漏；守卫在**出口**统一按最终的
     // `*pfEaten` 判。没吃下 = 这次输入服务端看不见，智能符号的 press2 判定要知道。
     // 详见 KeyEventSink.h 的 _NotePassthroughKeyDown。
@@ -405,6 +521,9 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         _ptNote.Suppress();
         return S_OK;
     }
+
+    // Ctrl 如实上报按住期间的别的键（含此后各分支放行给宿主、服务端看不见的那些）。
+    _NoteKeyDownForCtrlRaw(wParam);
 
     // Ctrl+Shift+F12: Dump TSF ring buffer logs to clipboard (works in AppContainer)
     // 默认关，且判据与 OnKeyDown 共用同一个函数——见 _IsLogDumpHotkey。
@@ -463,6 +582,16 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     uint32_t normalizedKeyHash = CHotkeyManager::CalcKeyHash(normalizedMods, (uint32_t)wParam);
 
     CHotkeyManager* pHotkeyMgr = _pTextService->GetHotkeyManager();
+
+    // 候选显示时 Ctrl 如实上报：放行给宿主，单击由服务端判（见 CtrlRawPolicy.h）。
+    if (_TryCtrlRawDown(wParam, lParam, modifiers))
+    {
+        *pfEaten = FALSE;
+        _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::ToggleMode,
+                        _pTextService->IsChineseMode(), _pTextService->HasActiveComposition(), _hasCandidates,
+                        TRUE, FALSE, L"ctrl_raw_report");
+        return S_OK;
+    }
 
     // Check if this is a KeyDown hotkey from the whitelist
     // Use normalized hash for function hotkeys (Ctrl+`, Shift+Space, etc.)
@@ -993,6 +1122,10 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
 {
     *pfEaten = FALSE;
 
+    // 屏蔽键一律放行（见 OnTestKeyDown）。
+    if (wParam == WindPassthrough::kVkMenuMask)
+        return S_OK;
+
     // 同 OnTestKeyDown 的守卫，两处都要 —— 但成因不是「宿主跳过 test」，而是**反过来**：
     // Chrome / QQ 等宿主会无视 OnTestKeyDown 的 pfEaten=FALSE **仍调用本函数**（见下方
     // 密码框守卫与 policy 早期闸门那两处同款注释）。也就是说 test 已经跑过、skip 条目
@@ -1055,6 +1188,9 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
             return S_OK;
         }
     }
+
+    // 同 OnTestKeyDown：不调 OnTestKeyDown 只调本函数的宿主（QQ 那类）也要记。重复记无妨。
+    _NoteKeyDownForCtrlRaw(wParam);
 
     // Ctrl+Shift+F12: Dump TSF ring buffer logs to clipboard (debug aid for AppContainer)
     // 默认关，判据与 OnTestKeyDown 共用——见 _IsLogDumpHotkey。
@@ -1126,6 +1262,10 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     uint32_t normalizedKeyHash = CHotkeyManager::CalcKeyHash(normalizedMods, (uint32_t)wParam);
 
     CHotkeyManager* pHotkeyMgr = _pTextService->GetHotkeyManager();
+
+    // 候选显示时 Ctrl 如实上报（OnTestKeyDown 已起头的这里是 Repeat，什么都不发）。
+    if (_TryCtrlRawDown(wParam, lParam, modifiers))
+        return S_OK;
 
     // Check if this is a KeyUp triggered key (toggle mode keys like Shift, Ctrl, CapsLock)
     // Use hash-based lookup first, then fallback to VK-based detection
@@ -1608,6 +1748,11 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     _responseKeyVk = (UINT)wParam;
     *pfEaten = _HandleServiceResponse();
     _responseKeyVk = 0;
+    if (*pfEaten && wParam >= VK_F1 && wParam <= VK_F12 && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
+    {
+        _eatenFnKeyVk = (UINT)wParam;
+        _eatenFnKeyUpSent = FALSE;
+    }
 
     // ── 联想态透传：组合已收口，把这一键还给宿主 ────────────────────────────────
     // 覆盖联想态下**全部**落到透传的键（回车/退格各有开关，Del/Home/End/←→/Insert 等
@@ -1727,6 +1872,10 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
 {
     *pfEaten = FALSE;
 
+    // 屏蔽键一律放行（见 OnTestKeyDown）。
+    if (wParam == WindPassthrough::kVkMenuMask)
+        return S_OK;
+
     // 合成提交触发键的 keyup 半程：down 已经在 OnTestKeyDown/OnKeyDown 里处理完毕，
     // 这里只需干净吃掉，不流入下面任何 keyup 逻辑（toggle/CapsLock 判据……）。
     if (wParam == VK_ASYNC_COMMIT_TRIGGER)
@@ -1743,6 +1892,15 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     if (_TryConsumeSkipKey(wParam, TRUE))
     {
         *pfEaten = FALSE;
+        return S_OK;
+    }
+
+    // Ctrl 如实上报的松开：先于禁用 / 配对拦截等一切闸门（按住翻转靠它收起）。不吃、不返回。
+    _DispatchCtrlRawUp(wParam);
+
+    if (_DispatchEatenFnKeyUp(wParam, FALSE))
+    {
+        *pfEaten = TRUE;
         return S_OK;
     }
 
@@ -1807,10 +1965,23 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
 {
     *pfEaten = FALSE;
 
+    // 屏蔽键一律放行（见 OnTestKeyDown）。
+    if (wParam == WindPassthrough::kVkMenuMask)
+        return S_OK;
+
     // 合成提交键（VK_ASYNC_COMMIT_TRIGGER）的 keyup 半程：已在 OnTestKeyUp 里吃过，这里
     // 直接放行返回，避免它被下面 direct_commit / auto-pair / 修饰键状态机等逻辑误当成
     // 真实按键处理——注意与下一行注释里的「顶码触发键」不是同一个概念，只是恰好同名字。
     if (wParam == VK_ASYNC_COMMIT_TRIGGER)
+    {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
+
+    // 同 OnTestKeyUp（那边先到就已清掉记账，这里不再发）。
+    _DispatchCtrlRawUp(wParam);
+
+    if (_DispatchEatenFnKeyUp(wParam, TRUE))
     {
         *pfEaten = TRUE;
         return S_OK;
@@ -2230,6 +2401,8 @@ BOOL CKeyEventSink::DispatchHotkey(uint32_t vk, uint32_t mods)
     // 返回值是「这个键要不要交还宿主」：服务端没收到，或响应是交还类（GivesBackToHost）。
     // 系统热键已把原键吃下，交还只能由调用方注入（见 TextService WndProc 与
     // CandidateHotkeyPolicy.h 的 OnHotkeyDispatched）。
+    //
+    // 待判单击的作废在 WM_HOTKEY 入口（NoteHotkeyMessage），不在这里：前台竞态丢弃的那次也要作废。
     if (!_SendKeyToService(vk, mods, KEY_EVENT_DOWN))
     {
         WIND_LOG_ERROR_FMT(L"DispatchHotkey: _SendKeyToService failed vk=0x%02X mods=0x%04X\n", vk, mods);
@@ -2249,7 +2422,37 @@ BOOL CKeyEventSink::DispatchHotkey(uint32_t vk, uint32_t mods)
     return wind::candhotkey::GivesBackToHost(responseType) ? TRUE : FALSE;
 }
 
-BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint8_t eventType)
+// 这一键不经按键回调，够不着那里「别的键取消待判单击」：在这里作废，否则 Ctrl+数字
+// 500ms 内松开 Ctrl 会被当成 Ctrl 单击（lctrl 作中英切换键时顺带切英文）。
+void CKeyEventSink::NoteHotkeyMessage()
+{
+    if (_pendingKeyUpKey != 0)
+        WIND_LOG_DEBUG_FMT(L"Cancel pending toggle (wm_hotkey): pending=0x%02X\n", _pendingKeyUpKey);
+    wind::ctrlraw::OnHotkeyDispatched(_ctrlRaw, _pendingKeyUpKey);
+    _pendingKeyUpModifiers = 0;
+}
+
+void CKeyEventSink::ResetCtrlRaw()
+{
+    wind::ctrlraw::OnFocusLost(_ctrlRaw);
+    _ctrlRawTapSignals = {};
+}
+
+// 失焦时吃掉过按下的功能键的松开多半送不到：补报一次松开（按住档的注释切换键靠它收起详细态），
+// 再丢掉记账——不丢的话，之后宿主正常处理的同一个键，松开会被误吃。
+void CKeyEventSink::ResetEatenFnKey()
+{
+    if (_eatenFnKeyVk != 0 && !_eatenFnKeyUpSent)
+    {
+        _eatenFnKeyUpSent = TRUE;
+        if (_SendKeyToService((uint32_t)_eatenFnKeyVk, 0, KEY_EVENT_UP))
+            _HandleServiceResponse();
+    }
+    _eatenFnKeyVk = 0;
+    _eatenFnKeyUpSent = FALSE;
+}
+
+BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint8_t eventType, uint8_t extraToggles)
 {
     DWORD startTime = GetTickCount();
 
@@ -2297,7 +2500,7 @@ BOOL CKeyEventSink::_SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint
     uint32_t scanCode = MapVirtualKeyW(keyCode, MAPVK_VK_TO_VSC);
 
     // Get toggles and event sequence
-    uint8_t toggles = _GetTogglesSnapshot();
+    uint8_t toggles = _GetTogglesSnapshot() | extraToggles;
     uint16_t eventSeq = _GetNextEventSeq();
 
     // IMPORTANT: Always use the passed-in modifiers from CHotkeyManager::GetCurrentModifiers()

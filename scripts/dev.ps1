@@ -482,6 +482,8 @@ function Download-Dicts {
     Get-Dict "$wubiBase/wubi86_jidian_extra.dict.yaml"          "$rimeWubi\wubi86_jidian_extra.dict.yaml"          "扩展词库"   | Out-Null
     Get-Dict "$wubiBase/wubi86_jidian_extra_district.dict.yaml" "$rimeWubi\wubi86_jidian_extra_district.dict.yaml" "行政区域"   | Out-Null
 
+    # 中英释义不再下载上游: ECDICT / CC-CEDICT 用到的部分已冻结进 data\comments-src\*_raw.tsv (见 Assemble-Data)。
+
     # Unicode CLDR emoji 中文注解 + emoji 白名单。不参与常规构建 —— emoji 命名表
     # (custom_emoji_named.txt) 已入库, 这些原始档只在需要重新生成它时用到:
     #   cargo run -p wind-tools --bin gen_emoji_names -- --cldr .cache\cldr `
@@ -591,6 +593,20 @@ function Remove-UnshippedImports ([string]$main) {
         }
     }
     [IO.File]::WriteAllText($main, ($lines -join "`n"), [Text.UTF8Encoding]::new($false))
+}
+
+# 找可用的 Python 3: 输出命令的各段 (如 python / py -3), 没有则无输出; 调用方必须用 @(Find-Python3) 收，
+# 单段命令会被展开成字符串。
+# 用 --version 验证而不是只看 Get-Command: 未装 Python 的 Windows 上 python 是指向应用商店的占位 stub。
+function Find-Python3 {
+    foreach ($c in @(@('python'), @('py', '-3'), @('python3'))) {
+        if (-not (Get-Command $c[0] -ErrorAction SilentlyContinue)) { continue }
+        $rest = @(); if ($c.Count -gt 1) { $rest = $c[1..($c.Count - 1)] }
+        $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+        try { $v = & $c[0] @rest --version 2>&1 | Out-String } catch { $v = "" } finally { $ErrorActionPreference = $old }
+        if ($v -match '^Python 3') { return $c }
+    }
+    return
 }
 
 # 从 data/(源) + .cache/(下载/生成) 组装完整运行时数据到 $outdir\data\
@@ -726,6 +742,36 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
         }
     } else { Warn "缺 .cache\rime-frost\opencc\, 白霜 emoji 模块不可用 (运行 gen-data 下载)" }
 
+    # 9. 内置中英释义注释词库 (Python 脚本 scripts\comment_dicts\build.py): en_zh 按英文词表、
+    #    zh_en 按拼音/五笔词表裁剪, 产物只进 build 目录、不入版本库。源数据全部入库在 data\comments-src\:
+    #    重整版、AI 补齐, 以及重整版没覆盖的原始释义快照 (*_raw.tsv, ECDICT MIT / CC-CEDICT CC BY-SA 4.0,
+    #    许可见 NOTICE.md)。冻结进仓后构建可复现、不依赖外网; 更新上游时手工跑 build.py snapshot 再提交。
+    #    随第 1 步一并复制进来, 用完剥掉不随包分发。缺 Python 或生成失败这里只 Warn, 发版由 Verify-DistData 拦下。
+    #    ⚠ dev.sh 与 mac/dev.sh 的同名步骤是同一件事, 改一边要同步另外两边。
+    $cdict = "$ProductRoot\scripts\comment_dicts\build.py"
+    $src   = "$data\comments-src"
+    $py    = @(Find-Python3)
+    if ($py.Count -lt 1 -or -not $py[0] -or "$($py[0])".Length -le 1) {
+        Warn "缺 Python 3 (python / py -3), 中英释义词库不可用"
+    } else {
+        Gray "生成中英释义注释词库 (comment_dicts) ..."
+        $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+        try {
+            New-Item -ItemType Directory -Path "$schemas\comments" -Force | Out-Null
+            $pyRest = @(); if ($py.Count -gt 1) { $pyRest = $py[1..($py.Count - 1)] }
+            # 拼音表用于丢掉 AI 释义里拼音化的专名; 缺了只是不过滤
+            $pmArgs = @(); if (Test-Path "$data\pinyin_map.txt") { $pmArgs = @("--pinyin", "$data\pinyin_map.txt") }
+            # build.py 把进度写到 stderr; 全局 $ErrorActionPreference=Stop 下 PS5.1 会把它当错误, 此处临时放宽。
+            & $py[0] @pyRest -I $cdict en-zh --raw "$src\en_zh_ecdict_raw.tsv" --words "$english\en.dict.yaml" "$english\en_ext.dict.yaml" --refined "$src\en_zh_refined.tsv" --out "$schemas\comments\en_zh.txt"
+            if ($LASTEXITCODE -ne 0) { Warn "英→中释义词库生成失败" }
+            & $py[0] @pyRest -I $cdict zh-en --raw "$src\zh_en_cedict_raw.tsv" --ai "$src\zh_en_ai.tsv" --refined "$src\zh_en_cedict_refined.tsv" @pmArgs --words "$pinyinCn\base.dict.yaml" "$pinyinCn\ext.dict.yaml" "$pinyin\ext\idiom.dict.yaml" "$schemas\wubi86\wubi86_jidian.dict.yaml" --out "$schemas\comments\zh_en.txt"
+            if ($LASTEXITCODE -ne 0) { Warn "中→英释义词库生成失败" }
+        } catch {
+            Warn "中英释义词库生成出错, 已跳过: $($_.Exception.Message)"
+        } finally { $ErrorActionPreference = $old }
+    }
+    if (Test-Path "$data\comments-src") { Remove-Item -Recurse -Force "$data\comments-src" }
+
     $cnt = (Get-ChildItem $data -Recurse -File).Count
     Gray "data/ 组装完成 ($cnt 文件)"
     return $true
@@ -784,7 +830,11 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
         @{ Path = "schemas\aux_code\stroke.txt";     Min = 500000 },
         @{ Path = "schemas\aux_code\flypy_full.txt"; Min = 50000 },
         # 笔画方案词库同为 gen_aux_code 生成物; 全拼默认辅助码经 schema:stroke 引用它
-        @{ Path = "schemas\stroke\stroke.dict.yaml"; Min = 500000 }
+        @{ Path = "schemas\stroke\stroke.dict.yaml"; Min = 500000 },
+        # 内置中英释义注释词库 (comment_dicts\build.py 生成物): 生成失败在组装时只 Warn,
+        # 缺了出厂详细态没有英文 / 中文释义且无任何报错。实测 en_zh 约 527KB、zh_en 约 4.3MB
+        @{ Path = "schemas\comments\en_zh.txt"; Min = 300000 },
+        @{ Path = "schemas\comments\zh_en.txt"; Min = 3000000 }
     )
     Say "`n校验发布数据完整性 → $data"
     foreach ($c in $checks) {

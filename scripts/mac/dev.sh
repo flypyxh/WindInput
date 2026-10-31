@@ -812,6 +812,8 @@ download_dicts() {
         get_dict "$wubibase/$f.dict.yaml" "$wubi/$f.dict.yaml"
     done
 
+    # 中英释义不再下载上游: ECDICT / CC-CEDICT 用到的部分已冻结进 data/comments-src/*_raw.tsv (见 assemble_data)。
+
     # 辅助码表: 拼音候选的字形二次筛选 (默认关闭, 见 schema.pinyin.aux_code)。
     # 小鹤/自然码零转换; 笔画表由 gen_aux_code 从 rime-stroke 的 .dict.yaml 转换 + 字集裁剪。
     # ⚠️ rime-stroke 是 LGPL-3.0 —— 同 rime-frost 处理: 只下载不入库, 见 NOTICE.md。
@@ -998,6 +1000,35 @@ assemble_data() {
         warn "缺 .cache/aux-code/, 辅助码不可用 (先跑 gd 下载)"
     fi
 
+    # 9. 内置中英释义注释词库 (Python 脚本 scripts/comment_dicts/build.py): en_zh 按英文词表、
+    # zh_en 按拼音/五笔词表裁剪, 产物只进 build 目录、不入版本库。源数据全部入库在 data/comments-src/:
+    # 重整版、AI 补齐, 以及重整版没覆盖的原始释义快照 (*_raw.tsv, ECDICT MIT / CC-CEDICT CC BY-SA 4.0,
+    # 许可见 NOTICE.md)。冻结进仓后构建可复现、不依赖外网; 更新上游时手工跑 build.py snapshot 再提交。
+    # 随第 1 步一并复制进来, 用完剥掉不随包分发。缺 python3 或生成失败这里只 warn, 发版由 verify_dist_data 拦下。
+    # ⚠ scripts/dev.sh 与 dev.ps1 的同名步骤是同一件事, 改一边要同步另外两边。
+    local cdict="$REPO_DIR/scripts/comment_dicts/build.py" src="$data/comments-src"
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "缺 python3, 中英释义词库不可用"
+    else
+        info "生成中英释义注释词库 (comment_dicts) ..."
+        mkdir -p "$data/schemas/comments"
+        # 拼音表用于丢掉 AI 释义里拼音化的专名; 缺了只是不过滤
+        local pm_args=()
+        [[ -f "$data/pinyin_map.txt" ]] && pm_args=(--pinyin "$data/pinyin_map.txt")
+        python3 -I "$cdict" en-zh --raw "$src/en_zh_ecdict_raw.tsv" \
+            --words "$english/en.dict.yaml" "$english/en_ext.dict.yaml" \
+            --refined "$src/en_zh_refined.tsv" \
+            --out "$data/schemas/comments/en_zh.txt" \
+            || warn "英→中释义词库生成失败"
+        python3 -I "$cdict" zh-en --raw "$src/zh_en_cedict_raw.tsv" --ai "$src/zh_en_ai.tsv" \
+            --refined "$src/zh_en_cedict_refined.tsv" ${pm_args[@]+"${pm_args[@]}"} \
+            --words "$pinyin_cn/base.dict.yaml" "$pinyin_cn/ext.dict.yaml" \
+                    "$pinyin/ext/idiom.dict.yaml" "$data/schemas/wubi86/wubi86_jidian.dict.yaml" \
+            --out "$data/schemas/comments/zh_en.txt" \
+            || warn "中→英释义词库生成失败"
+    fi
+    rm -rf "$data/comments-src"
+
     info "data/ 组装完成 ($(find "$data" -type f | wc -l | tr -d ' ') 文件)"
     return 0
 }
@@ -1056,6 +1087,10 @@ verify_dist_data() {
     _check_min "schemas/wubi86/wubi86_jidian_extra_district.dict.yaml" 10000
     # 笔画方案词库同为 gen_aux_code 生成物; 全拼默认辅助码经 schema:stroke 引用它
     _check_min "schemas/stroke/stroke.dict.yaml"                       500000
+    # 内置中英释义注释词库 (comment_dicts/build.py 生成物): 生成失败在组装时只 warn,
+    # 缺了出厂详细态没有英文 / 中文释义且无任何报错。实测 en_zh 约 527KB、zh_en 约 4.3MB
+    _check_min "schemas/comments/en_zh.txt"                            300000
+    _check_min "schemas/comments/zh_en.txt"                            3000000
     local oc; oc=$(ls "$data/opencc"/*.octrie 2>/dev/null | wc -l | tr -d ' ')
     if (( oc < 1 )); then err "  ✗ 缺失: opencc/*.octrie (简繁转换编译失败)"; ok=0
     else info "  ✓ opencc/*.octrie ($oc 个)"; fi

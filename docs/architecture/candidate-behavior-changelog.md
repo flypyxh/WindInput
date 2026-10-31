@@ -108,3 +108,24 @@
 - 钉住的测试：`wind-engine/tests/english_merge_policy.rs`、
   `wind-coordinator/tests/codetable_english_position.rs`、`wind-engine/tests/engine_manager.rs`（否决）
 - 来源：维护者实测（短码不出英文）、论坛 t355
+
+## 2026-10-30 · 码表行内通配：并查未启用扩展词库并标 `*`（0.129）
+
+- 合入：WindInput（本提交）；范围：开启通配的码表方案、混输主码表
+- 变化：行内通配（如 `uui?`）此前不看未启用的扩展词库，现在与反查模式一致（命令栏剪贴板反查 `dict.rev` 同样补查，码前带 `*`）：前追加这些命中
+  （排在已启用之后，如「门头沟区」）。反查与行内通配里，未启用库命中的注释前加 `*`。
+- 触发条件：需开 `input.reverse.lookup_disabled_dicts`（出厂关）；普通打字候选不受影响。
+- 回退旧行为：关掉该开关。
+- 钉住的测试：`wind-engine/tests/lookup_disabled_dicts.rs`、`wind-coordinator/tests/codetable_wildcard.rs`、
+  `codetable_reverse.rs`
+- 来源：维护者定（论坛 t348 / t361）
+
+## 2026-10-30 · 混输下符号通配键首位作通配（0.129）
+
+- 合入：WindInput `0c3caf8e`；范围：开启通配的五笔拼音混输方案
+- 变化：通配键是符号（如 `?`、`/`、反引号）时，首位按它不再直接上屏标点，而是进缓冲作通配；
+  字母通配键（`z`）首位仍按拼音。
+- 触发条件：`schema.codetable.wildcard` 开且通配键为符号（出厂通配关、键为 `z`）。
+- 回退旧行为：把通配键换回字母，或关闭通配。
+- 钉住的测试：`wind-coordinator/tests/wildcard_symbol_lead.rs`
+- 来源：维护者实测
