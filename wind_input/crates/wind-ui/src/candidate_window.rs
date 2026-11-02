@@ -688,9 +688,17 @@ impl CandidateWindow {
             // 那类脚本要的是 rotated。日志里带上这一位，才分得开「字体不对」与「排列不对」。
             tracing::info!("候选排列：vertical={vertical} rotated={rotated} upright={upright}");
         }
+        let was_vertical = self.vertical || self.rotated;
         self.vertical = vertical;
         self.rotated = rotated;
         self.upright = upright;
+        // 竖排变体随方向切换：只在「是否竖排」变了且主题有变体时重算生效主题。
+        if was_vertical != (vertical || rotated) && self.theme_source.views_vertical.is_some() {
+            self.refresh_effective_theme();
+            if let Some(tip) = self.tooltip.as_mut() {
+                tip.set_theme(&self.theme);
+            }
+        }
     }
 
     /// 设置预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
@@ -1412,6 +1420,12 @@ impl CandidateWindow {
     /// 两条路径因此天然同源，不在节点构建处散写「用户有值就用用户的」。
     fn refresh_effective_theme(&mut self) {
         let mut t = self.theme_source.clone();
+        // 竖排（含旋转排版）：主题写了 `[节点.vertical]` 时整套视图换成竖排变体。
+        if (self.vertical || self.rotated)
+            && let Some(v) = t.views_vertical.take()
+        {
+            t.views = v;
+        }
         apply_user_font(&mut t.views, &self.user_font_family);
         if !self.theme_shadow {
             clear_window_shadow(&mut t.views);
@@ -1443,6 +1457,9 @@ impl CandidateWindow {
         self.text_renderer
             .set_base_size(self.base_font_logical * self.scale);
         self.theme = t;
+        if let Some(tip) = self.tooltip.as_mut() {
+            tip.set_candidate_font(self.base_font_logical);
+        }
     }
 
     /// 主题各节点声明的字族逐个查一次存在性，缺的记 warn。见 [`Self::resolve_and_report`]。
@@ -3118,6 +3135,7 @@ impl CandidateWindow {
                 dim(v.window.border_width, 1.0).max(1.0),
             )
             .radius(dim(v.window.border_radius, 8.0))
+            .clip_to_corners()
             .pad(window_pad)
             // band 间距（预编辑条↔候选列表↔翻页）= 主题 candidate_list.band_gap，未配→0（与 Go 一致）。
             .gap(dim(v.window_gap, 0.0))
@@ -6154,6 +6172,25 @@ mod min_size_tests {
         let tall = measured(&mk(false, 0, 0, 200, THREE)).1;
         assert!(plain < 200.0, "前置：横排自然高度须低于下限");
         assert_eq!(tall, 200.0);
+    }
+
+    /// 主题的竖排变体：竖排时生效视图换成变体，切回横排恢复。
+    #[test]
+    fn vertical_theme_variant_follows_orientation() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
+        let mut theme = wind_theme::Resolved::default();
+        theme.views.window.border_radius = Some(wind_theme::schema::Dim::Dp(20.0));
+        let mut vv = theme.views.clone();
+        vv.window.border_radius = Some(wind_theme::schema::Dim::Dp(6.0));
+        theme.views_vertical = Some(vv);
+        w.set_theme(theme);
+        let r = |w: &CandidateWindow| w.theme.views.window.border_radius;
+        assert_eq!(r(&w), Some(wind_theme::schema::Dim::Dp(20.0)));
+        w.set_orientation(true, false, false);
+        assert_eq!(r(&w), Some(wind_theme::schema::Dim::Dp(6.0)), "竖排取变体");
+        w.set_orientation(false, false, false);
+        assert_eq!(r(&w), Some(wind_theme::schema::Dim::Dp(20.0)), "切回横排");
     }
 
     /// 横排/竖排的高度下限互不影响（同宽度那条的判据）。
