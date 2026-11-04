@@ -281,6 +281,10 @@ impl EvalContext for CmdbarCtx<'_> {
         self.host.clipboard_get_text().unwrap_or_default()
     }
     fn reverse_lookup(&self, text: &str, format: &str) -> String {
+        let max = self.coord.rt().config.input.reverse.clip_max_chars;
+        if exceeds_chars(text, max) {
+            return String::new();
+        }
         self.coord.reverse_render(text, format)
     }
     fn sel(&self) -> String {
@@ -740,8 +744,8 @@ impl CoordConfig {
     /// 把用户真实的设置改成「出厂值的反面」——单键版的整表抹除，同样静默、同样不可逆。
     /// 纯读（`get`）不设这道闸：显示一个出厂值不造成任何损失。
     fn load_value(key: &str, require_trustworthy: bool) -> anyhow::Result<String> {
-        use wind_config::config_schema::is_known_key;
-        if !is_known_key(key) {
+        use wind_config::config_schema::is_addressable_key;
+        if !is_addressable_key(key) {
             anyhow::bail!("未登记的配置键: {key}");
         }
         let cfg = wind_config::Config::load(wind_config::Config::data_dir().as_deref())?;
@@ -752,14 +756,10 @@ impl CoordConfig {
             );
         }
         let full = cfg.to_json_value()?;
-        let mut cur = &full;
-        for part in key.split('.') {
-            cur = cur
-                .get(part)
-                .ok_or_else(|| anyhow::anyhow!("配置缺少键 {key}"))?;
-        }
+        let cur = wind_config::config_schema::lookup_json_value(&full, key)
+            .ok_or_else(|| anyhow::anyhow!("配置缺少键 {key}"))?;
         Ok(match cur {
-            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::String(s) => s,
             other => other.to_string(),
         })
     }
@@ -779,8 +779,8 @@ impl ConfigService for CoordConfig {
     }
 
     fn toggle(&self, key: &str) -> anyhow::Result<String> {
-        use wind_config::config_schema::{FieldType, field};
-        let fld = field(key).ok_or_else(|| anyhow::anyhow!("未登记的配置键: {key}"))?;
+        use wind_config::config_schema::{FieldType, addressable_field};
+        let fld = addressable_field(key).ok_or_else(|| anyhow::anyhow!("未登记的配置键: {key}"))?;
         // 取当前值即取写回的种子，故必须过降级闸。
         let cur = Self::load_value(key, true)?;
         let next: String = match fld.ty {
@@ -1401,5 +1401,24 @@ mod set_state_tests {
         for t in ["layout", "preedit", "candwin", "nope"] {
             assert!(c.cmd_set_state(t, true).is_err(), "{t}");
         }
+    }
+}
+
+/// `text` 的字符数是否超过 `max`。只数到 `max + 1` 就停，剪贴板再大也不全量遍历。
+fn exceeds_chars(text: &str, max: usize) -> bool {
+    text.chars().take(max.saturating_add(1)).count() > max
+}
+
+#[cfg(test)]
+mod reverse_cap_tests {
+    use super::exceeds_chars;
+
+    #[test]
+    fn cap_counts_chars_not_bytes() {
+        assert!(!exceeds_chars("好吧", 2));
+        assert!(exceeds_chars("好吧么", 2));
+        assert!(!exceeds_chars("", 0));
+        assert!(!exceeds_chars(&"好".repeat(16), 16));
+        assert!(exceeds_chars(&"好".repeat(17), 16));
     }
 }

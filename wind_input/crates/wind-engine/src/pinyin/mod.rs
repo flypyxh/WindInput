@@ -616,6 +616,21 @@ fn completion_penalized(weight: i32, extra: u32) -> i32 {
 /// 取 1000 是 `push_unique` 的 O(n²) 查重与「单字母可持续翻页」之间的平衡点：
 /// 实测 1000 条约 3.5ms，5000 条则达 54ms。1000 条按每页 9 项可翻 110 页，
 /// 远超实用范围；该上限只约束**补全**，精确匹配候选不受影响。
+/// 剥除手动分隔符 `'` 后的前 `n` 个字节，对应原始输入里的字节长度（不含紧随的分隔符）。
+fn raw_len_for_stripped(input: &str, n: usize) -> usize {
+    let mut seen = 0usize;
+    for (i, ch) in input.char_indices() {
+        if ch == '\'' {
+            continue;
+        }
+        seen += ch.len_utf8();
+        if seen >= n {
+            return i + ch.len_utf8();
+        }
+    }
+    input.len()
+}
+
 const MAX_COMPLETION_CANDIDATES: usize = 1000;
 
 /// 查 `AbbrevSection` 时的取码上限。纯简拼（step 5 / 回退①）与混合简拼（step 5b / 回退②）
@@ -709,34 +724,42 @@ const MIN_MIXED_SENTENCE_LEN: usize = 4;
 /// 单字母不构成简拼，退到 1 只会拖出一堆高频单字。
 const MIN_ABBREV_STROKE: usize = 2;
 
-/// 前缀回退单个切点、**单个来源层**的产出上限。
+/// 简拼前缀回退（step 6.2）的**内部**限额，不进用户配置（`wind-config` 不认它）。
 ///
-/// 逐切点限流而非只设总额，是为了保证**短切点也挤得进来**：`bzdhaobuhao` 的
-/// `bzdh` 切点若把配额占满，`bzd`（→「不知道」，词频高 672 倍）就一条都进不来。
-///
-/// ⚠️ **系统层与 store 层各记各的**（`recall_abbrev_prefix` 的 `start` / `store_base`），
-/// 故单切点的实际上限是 **2×** 本值、两个切点合计 4×。共用一份时 ③④ 排在 ①② 之后，
-/// 系统的高频词占满席位 ⇒ 用户自己造的词在长输入下静默出局。调这个值时记得乘 2 再
-/// 对照候选规模（`mixed_partial_pinyin_filter.rs` 记着「219 条残码单字把简拼词压到
-/// 第 221 位」的教训）。
-const MAX_FALLBACK_PER_CUT: usize = 6;
+/// 集中成一个结构，是为了以后调值 / 对不同来源（移动端、混输）分档时只改这一处。
+/// 默认值参考主流输入法实测（2026-11）：微软拼音中间级不限条数，豆包 3 字不限、2 字 8 条。
+#[derive(Debug, Clone)]
+pub struct AbbrevFallbackConfig {
+    /// 前缀回退**参与竞争的切点数**（有产出的才计数）。
+    ///
+    /// 默认 2 = 「最长 + 次长」。相邻切点的竞争才是真实场景（`bzdhaobuhao` 里 `bzdh`→「表彰大会」
+    /// 与 `bzd`→「不知道」），再往下只会引入越来越短、越来越不相关的解释。
+    ///
+    /// ★ **整串无命中时放宽它已被评测否决。** D 类（简拼+全拼混合整句）实测：
+    /// 取 2 → 首词召回 40.30% / 首词命中 2.30%；取 8 → **14.60% / 0.00%**，大幅恶化。
+    /// 原因是短切点的高频词会占据首选并把长切点的正确候选挤出 top-10。整串命中时补进来的
+    /// 候选都沉在整长匹配之后，没有这个风险，但同一个值两种场景共用，改它先重跑 pinyin_eval。
+    pub cuts: usize,
+    /// 切点长度 ≥ 3 个字母（三字词组及以上）时，单切点、**单个来源层**的产出上限。
+    ///
+    /// ⚠️ **系统层与 store 层各记各的**（`recall_abbrev_prefix` 的 `start` / `store_base`），
+    /// 故单切点实际上限是 **2×** 本值。共用一份时用户自己造的词会被系统高频词挤出。
+    /// 调值时对照候选规模（`mixed_partial_pinyin_filter.rs` 记着「219 条残码单字把简拼词压到
+    /// 第 221 位」的教训）。受 `ABBREV_INDEX_LIMIT`（每个简拼键最多 64 个码）约束。
+    pub per_cut_long: usize,
+    /// 切点长度 = 2 个字母（两字词组）时的同类上限。两字词数量大、噪音多，取得比长切点小。
+    pub per_cut_short: usize,
+}
 
-/// 前缀回退**参与竞争的切点数**（有产出的才计数）。
-///
-/// 取 2 = 「最长 + 次长」。相邻切点的竞争才是真实场景（`bzdhaobuhao` 里 `bzdh`→「表彰大会」
-/// 与 `bzd`→「不知道」），再往下只会引入越来越短、越来越不相关的解释：试到 `bz` 时
-/// 「标准/帮助/保证」会凭着高词频（~5 万）挤进前几位，而它们只解释了 11 键里的 2 键。
-///
-/// 这是**软偏好**的落点——不给短切点打折扣（那要按未解释字母数调一个乘性系数，量纲难定
-/// 且依赖本轮最大消费长度、不稳定），而是限制它们**是否入场**。入场后一律同层按词频竞争。
-///
-/// ★ **放宽它已被评测否决，勿再尝试。** D 类（简拼+全拼混合整句）实测：
-/// 取 2 → 首词召回 40.30% / 首词命中 2.30%；取 8 → **14.60% / 0.00%**，大幅恶化。
-/// 原因是短切点的高频词会占据首选并把长切点的正确候选挤出 top-10
-/// （`dltqbandaoer` 首选变成 `dl`→「到了」、`dqsmayou` 变成 `dq`→「地球」）。
-/// 召回率要越过 40% 这个天花板，得让所有切点同时参与、由语言模型仲裁 —— 即简拼段入
-/// lattice（文档 §4.8），不是调这个常量能做到的。
-const MAX_FALLBACK_CUTS: usize = 2;
+impl Default for AbbrevFallbackConfig {
+    fn default() -> Self {
+        Self {
+            cuts: 2,
+            per_cut_long: 50,
+            per_cut_short: 20,
+        }
+    }
+}
 
 /// 全拼降级支路（双拼下按全拼解释击键）的召回条数上限，精确 + 子短语 + 前缀补全合计。
 ///
@@ -933,6 +956,8 @@ pub struct Config {
     /// 算得多、露得少：候选列表里露 `sentence_count` 条，切换键在这 `sentence_max_count`
     /// 条里滚动窗口，切换时不必重新解码。
     pub sentence_max_count: u8,
+    /// 简拼前缀回退的内部限额，见 [`AbbrevFallbackConfig`]。
+    pub abbrev_fallback: AbbrevFallbackConfig,
     /// **双拼方案下**是否额外把击键串当全拼解释一遍（`nihao` → 「你好」）。
     ///
     /// 服务「多人共用一台机器」：主力用户打双拼，偶尔来的人只会全拼。产出的候选整体沉在
@@ -1075,6 +1100,7 @@ impl Default for Config {
             // ⚠️ 与 `wind_config::PinyinGlobalConfig` 那两项**保持同值**。
             sentence_count: 1,
             sentence_max_count: 1,
+            abbrev_fallback: AbbrevFallbackConfig::default(),
         }
     }
 }
@@ -1508,10 +1534,53 @@ impl PinyinEngine {
         }
     }
 
+    /// 串的开头已经是完整音节（`baxzd` 的 `ba`、`buxzd` 的 `bu`），或两字母就是声母
+    /// （`sh`/`zh`/`ch`）：此时首字母不是用户要的单字声母，不补首声母单字。
+    fn first_letters_start_a_syllable(&self, abbr_query: &str) -> bool {
+        let max = abbr_query.len().min(6);
+        (2..=max).any(|n| abbr_query.is_char_boundary(n) && self.trie.is_syllable(&abbr_query[..n]))
+            || (abbr_query.len() == 2 && self.is_possible_pinyin_sequence(abbr_query))
+    }
+
+    /// 前缀回退的末一档：只消费首个声母，召回以它开头的高频单字（沉在词组之后）。
+    ///
+    /// 与 `recall_abbrev_prefix` 的 `MIN_ABBREV_STROKE` 下限分开：单字母本不构成简拼，
+    /// 这里不是在解释「简拼」，而是把首字母当作单字的声母；产出一律 `is_partial`，
+    /// 排在所有整长匹配与词组前缀之后。条数**不套** `AbbrevFallbackConfig::per_cut_*`：用户期望
+    /// 和直接打首字母一样能挑任意单字，取数量与主路径 step 4 同口径（`limit` 由调用方给）。
+    fn recall_first_initial_chars(&self, initial: &str, limit: usize, cands: &mut Vec<Candidate>) {
+        // 音节数上限 1 ⇒ 只取单音节词条（单字），边界对齐位 0 ⇒ 退化为字符前缀匹配。
+        for (idx, h) in self
+            .dict
+            .search_prefix_with_boundary_syllable_capped(initial, limit, 1, 0)
+            .into_iter()
+            .enumerate()
+        {
+            if h.text.chars().count() != 1 || cands.iter().any(|c| c.text == h.text) {
+                continue;
+            }
+            cands.push(Candidate {
+                text: h.text,
+                code: h.code,
+                // 单字权重（字频，量级远高于词组）若原样带入，引擎序里会压过词组，候选上限一收紧
+                // 词组先被截掉。权重置 0、用词库返回序（已按权重降序）当 natural_order 保持单字间先后；
+                // 界面序仍由消费长度决定。也不吃下方裸声母单字提权（同理）。
+                weight: 0,
+                natural_order: idx as i32,
+                source: CandidateSource::Pinyin,
+                is_abbrev: true,
+                is_partial: true,
+                boundary: h.boundary,
+                consumed_length: initial.len(),
+                ..Default::default()
+            });
+        }
+    }
+
     fn recall_abbrev_prefix(&self, stroke: &str, consumed: usize, cands: &mut Vec<Candidate>) {
         let trie = &self.trie;
         let dict = &self.dict;
-        // 本切点的产出配额（见 MAX_FALLBACK_PER_CUT：不逐切点限流，长切点会把额度占满，
+        // 本切点的产出配额（见 `AbbrevFallbackConfig::per_cut_long`：不逐切点限流，长切点会把额度占满，
         // 词频高得多的短切点一条都进不来）。
         //
         // ★ **系统层与 store 层各记各的基准**：配额按 `base` 分段计，系统层 ①② 用 `start`，
@@ -1526,6 +1595,11 @@ impl PinyinEngine {
         // 部分候选统一形态：`is_abbrev` 归入简拼层、`is_partial` 表示只覆盖了输入前缀
         // （沉在完整匹配之后），`consumed_length` **自带击键域的消费数**——下方那个按
         // code/query 关系统一计算 consumed 的循环会跳过它们（见其注释）。
+        let per_cut = if consumed >= 3 {
+            self.config.abbrev_fallback.per_cut_long
+        } else {
+            self.config.abbrev_fallback.per_cut_short
+        };
         let push = |cands: &mut Vec<Candidate>,
                     base: usize,
                     text: String,
@@ -1533,7 +1607,7 @@ impl PinyinEngine {
                     w: i32,
                     boundary: u64,
                     is_fuzzy: bool| {
-            if cands.len() - base >= MAX_FALLBACK_PER_CUT {
+            if cands.len() - base >= per_cut {
                 return;
             }
             if text.is_empty() || cands.iter().any(|c| c.text == text) {
@@ -3958,10 +4032,6 @@ impl Engine for PinyinEngine {
             }
         }
 
-        // 简拼族（纯简拼 step5 / 混合 step5b / 用户词 step6）是否命中了**整串**击键。
-        // step 6.2 的前缀回退只在这三处全都落空时才启动——整串能打出词就不该降级。
-        let mut abbrev_full_hit = false;
-
         // 整串是否**纯简拼形态**（每字母均为某音节首字母、且非完整音节序列）。
         // 提成变量供 step5 / step6 / step6.2 共用，`enable_abbrev` 仍在短路前（关闭时
         // 连 is_abbreviation 的 Dag 构建都省掉）。
@@ -4027,7 +4097,6 @@ impl Engine for PinyinEngine {
                         // 「夺不了冠」之后。同层之后两者才能按权重/词频正常竞争。
                         if candidates.len() > before {
                             candidates[before].is_abbrev = true;
-                            abbrev_full_hit = true;
                         }
                     }
                 }
@@ -4113,7 +4182,6 @@ impl Engine for PinyinEngine {
                         // ——它的 code 是词的全拼码，与当次击键根本不同域。
                         if candidates.len() > before {
                             candidates[before].is_abbrev = true;
-                            abbrev_full_hit = true;
                         }
                     }
                 }
@@ -4285,7 +4353,6 @@ impl Engine for PinyinEngine {
                     && !self.is_possible_pinyin_sequence(abbr_query)
                 {
                     c.is_abbrev = true;
-                    abbrev_full_hit = true;
                 }
                 // 用户/临时词的前缀补全（is_prefix=true，码更长）：打到词尾附近就提升进完整
                 // 匹配层，否则被首音节同音子短语整层淹没（长词打到第 3-4 音节才给的根因）。
@@ -4397,13 +4464,17 @@ impl Engine for PinyinEngine {
                         c.is_fuzzy = true;
                     }
                     candidates.push(c);
-                    abbrev_full_hit = true;
                 }
             }
         }
 
-        // 6.2 简拼族**前缀回退**：整串一无所获时，退到最长的能命中的前缀，
-        //     余下字母作残码留给下一次输入（分步上屏）。
+        // 6.2 简拼族**前缀回退**：退到更短的前缀，余下字母作残码留给下一次输入（分步上屏）。
+        //
+        //     ★ **整串命中时也照样补**（对齐微软拼音：整长匹配 → 词组前缀 → 首声母单字）。
+        //     补进来的都是 `is_partial`，沉在整长匹配之后，不改变首选；此前整串一命中就
+        //     不再降级，`tymh` 这类只有一个整长词的输入候选只剩 1 条（t371）。
+        //     下面各段「整串一无所获才降级」的论证是**旧设计**，保留作历史背景：它们
+        //     论证的风险（短切点高频词抢首选）在整串命中时由层级键挡住。
         //
         //     真机现场（连打 `bzdnihaobuhao`）：输到 `bzdha` **整串空码**。`bzd` 明明能出
         //     「不知道」，但简拼族的召回一直是「全串或无」——索引按完整简拼串点查、混合
@@ -4420,7 +4491,7 @@ impl Engine for PinyinEngine {
         //     `aobuhao` 成了垃圾。一个结构性偏好压过了三个数量级的词频差异。
         //     切点长短是**来源差异**、不是结构质量差异，只配走 weight，不配做布尔层级键
         //     （同款教训见模糊拼音 `is_fuzzy` 从层级键改惩罚的那一轮）。
-        //     代价是候选变多，用 `MAX_FALLBACK_PER_CUT` / `MAX_FALLBACK_TOTAL` 两道限流兜住。
+        //     代价是候选变多，用 `AbbrevFallbackConfig` 的限额兜住。
         //
         //     ⚠️ 这仍是**启发式**，不是智能组句：简拼段不进 lattice/Viterbi，`bzd|haobuhao`
         //     与 `bzdh|aobuhao` 之间没有语言模型仲裁，只靠词频。真正的解法是把简拼段作为
@@ -4442,11 +4513,7 @@ impl Engine for PinyinEngine {
         //     凡含成不了音节的字母（`bzdha`、`bzdnihaobuh`）⇒ 允许降级，且**逐前缀的严格
         //     判定在 `recall_abbrev_prefix` 内部**（每个 stroke 各自过 is_abbreviation /
         //     mixed_patterns），门槛只负责挡掉纯全拼、不负责替前缀把关。
-        if self.config.enable_abbrev
-            && !abbrev_full_hit
-            && !mixed_covered
-            && abbr_query.len() > MIN_ABBREV_STROKE
-        {
+        if self.config.enable_abbrev && !mixed_covered && abbr_query.len() >= MIN_ABBREV_STROKE {
             let mut cuts_with_hits = 0usize;
             for take in (MIN_ABBREV_STROKE..abbr_query.len()).rev() {
                 if !abbr_query.is_char_boundary(take) {
@@ -4456,10 +4523,19 @@ impl Engine for PinyinEngine {
                 self.recall_abbrev_prefix(&abbr_query[..take], take, &mut candidates);
                 if candidates.len() > before {
                     cuts_with_hits += 1;
-                    if cuts_with_hits >= MAX_FALLBACK_CUTS {
+                    if cuts_with_hits >= self.config.abbrev_fallback.cuts {
                         break;
                     }
                 }
+            }
+            // 最末一档：首声母对应的单字（微软拼音的「整串 → 词组 → 单字」）。
+            // 只对纯简拼形态做：`buxzd` 这类首个音节已打全的串，首字母不是用户的意图。
+            if stroke_is_plain_abbrev && !self.first_letters_start_a_syllable(abbr_query) {
+                self.recall_first_initial_chars(
+                    &abbr_query[..1],
+                    max_candidates.clamp(30, MAX_COMPLETION_CANDIDATES),
+                    &mut candidates,
+                );
             }
         }
 
@@ -4523,7 +4599,8 @@ impl Engine for PinyinEngine {
         // 仅此情形——完整音节输入的单字已靠精确层级(is_prefix=false)就位，无需提权。
         if syllables.is_empty() {
             for c in candidates.iter_mut() {
-                if c.text.chars().count() == 1 {
+                // 简拼前缀回退补的首声母单字（6.2 末档）不提权：要排在词组之后。
+                if c.text.chars().count() == 1 && !(c.is_abbrev && c.is_partial) {
                     c.weight = c.weight.saturating_add(BARE_INITIAL_SINGLE_CHAR_BOOST);
                 }
             }
@@ -4900,6 +4977,11 @@ impl Engine for PinyinEngine {
             // 双拼下同样跳过：简拼的判据本就走 raw_input（击键域），consumed_length 的语义
             // 就是「消费多少击键」，无须再过 map_consumed_length 换算。
             if c.is_abbrev && c.consumed_length != 0 {
+                // 含手动分隔符时，回退给的是剥除 `'` 之后的字节数，换算回原始输入空间，
+                // 否则选中词组后协调器按含 `'` 的缓冲切片会残留错位（`b'z'd` 选 `bz` 的词组）。
+                if has_sep {
+                    c.consumed_length = raw_len_for_stripped(input, c.consumed_length);
+                }
                 continue;
             }
             // 全拼降级候选（step 6.7）同样自带击键域的消费数。**不可再过

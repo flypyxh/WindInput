@@ -793,6 +793,8 @@ pub trait WebDataRpc: WebDataHost {
                     "builtin": !self.engine_mgr().is_user_schema(id),
                     // 隐藏方案（英文/快符）：设置页据此决定该行显示什么、能配什么。
                     "hidden": self.engine_mgr().schema_is_hidden(id),
+                    // 方案角色（空 / "aux"）：aux = 辅助码专用码表方案，默认不进方案管理常规区。
+                    "role": info.map(|i| i.role.clone()).unwrap_or_default(),
                     // 是否为 **overlay 方案**（方案文件带 `[overlay]` 段）：可由引导键/直达
                     // 热键临时叠加进入（快符/生僻字那类）。设置页据此枚举 `special:<id>`
                     // 动词的可选项，并决定要不要显示 overlay 那一节配置。
@@ -1659,7 +1661,15 @@ pub trait WebDataRpc: WebDataHost {
         let schemas: Vec<Value> = o
             .schemas
             .iter()
-            .map(|(id, name)| json!({ "id": id, "name": name }))
+            .map(|(id, name)| {
+                // role（空 / "aux"）：设置页据此把辅助码专用方案排到普通方案前面。
+                let role = self
+                    .engine_mgr()
+                    .schema_merged(id)
+                    .map(|s| s.schema.role.clone())
+                    .unwrap_or_default();
+                json!({ "id": id, "name": name, "role": role })
+            })
             .collect();
         let files: Vec<Value> = o
             .files
@@ -4450,6 +4460,7 @@ fn followed_behavior_of(cfg: &wind_config::Config, theme_font: Option<String>) -
     json!({
         "layout": wind_config::Orientation::from_layout_str(&cfg.ui.candidate.layout).layout_str(),
         "fontFamily": font,
+        "perPage": cfg.ui.candidate.per_page, // fold-gate:allow 显示「跟随」的全局值
         "auxEnabled": aux.enabled,
         "auxMaxPhraseLen": aux.max_phrase_len,
         "auxDirect": aux.direct,
@@ -10470,6 +10481,7 @@ mod followed_behavior_tests {
         let mut cfg = wind_config::Config::default();
         cfg.ui.candidate.layout = "vertical".into();
         cfg.ui.font.family = "霞鹜文楷".into();
+        cfg.ui.candidate.per_page = 9;
         cfg.schema.pinyin.aux_code.enabled = true;
         cfg.schema.pinyin.aux_code.max_phrase_len = 3;
         cfg.schema.pinyin.aux_code.direct = true;
@@ -10479,6 +10491,7 @@ mod followed_behavior_tests {
             json!({
                 "layout": "vertical",
                 "fontFamily": "霞鹜文楷",
+                "perPage": 9,
                 "auxEnabled": true,
                 "auxMaxPhraseLen": 3,
                 "auxDirect": true,

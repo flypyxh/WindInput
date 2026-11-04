@@ -1925,7 +1925,9 @@ impl CaretEnd {
 /// # 值域
 ///
 /// - `"none"`：在本态禁用该键（第三态，非「未声明」）
-/// - `"page_prev"` / `"page_next"`：上一页 / 下一页
+/// - `"page_prev"` / `"page_next"`：上一页 / 下一页（候选展开后逐行移动激活行）
+/// - `"page_screen_prev"` / `"page_screen_next"`：上一屏 / 下一屏——**候选展开后**翻一整屏
+///   （`rows` 行），**未展开时与 `page_prev` / `page_next` 完全相同**（翻一页，首次下翻仍先展开）
 /// - `"highlight_up"` / `"highlight_down"`：高亮上移 / 下移
 /// - `"cancel"`（别名 `"clear"`）：放弃当前输入，等同 Esc
 /// - `"select_candidate:N"`：选中当前页第 N 个候选（N 从 1 起、至多 10，`2` 即次选键）
@@ -1940,6 +1942,9 @@ pub enum SessionAction {
     None,
     PagePrev,
     PageNext,
+    /// 展开态翻整屏；未展开时同 `PagePrev`（见 `candidate_grid::grid_page_key`）。
+    PageScreenPrev,
+    PageScreenNext,
     HighlightUp,
     HighlightDown,
     /// 放弃当前输入：清空编码与候选，并退出 overlay 模式。**语义完全等同 Esc**。
@@ -2157,6 +2162,8 @@ impl SessionAction {
         match t.as_str() {
             "page_prev" => Self::PagePrev,
             "page_next" => Self::PageNext,
+            "page_screen_prev" => Self::PageScreenPrev,
+            "page_screen_next" => Self::PageScreenNext,
             "highlight_up" => Self::HighlightUp,
             "highlight_down" => Self::HighlightDown,
             // 与 `BoundAction::parse` 的同名动词逐字一致：同一个功能在两张表里写法不同的话，
@@ -2256,6 +2263,8 @@ impl std::fmt::Display for SessionAction {
             Self::None => f.write_str("none"),
             Self::PagePrev => f.write_str("page_prev"),
             Self::PageNext => f.write_str("page_next"),
+            Self::PageScreenPrev => f.write_str("page_screen_prev"),
+            Self::PageScreenNext => f.write_str("page_screen_next"),
             Self::HighlightUp => f.write_str("highlight_up"),
             Self::HighlightDown => f.write_str("highlight_down"),
             // 别名 `clear` 刻意不回写——规范名只有一个，避免同一份配置在两次保存后
@@ -5301,7 +5310,7 @@ pub struct RareCharConfig {
 /// 进入方式只由 `keys.key_actions` / 方案 `[key_actions]` / `z_key_action`（动词 `reverse`）
 /// 承载，出厂不绑任何键 ⇒ 默认不可用；**没有**总开关，与生僻字（[`RareCharConfig`]）同。
 /// 绑了键还要活跃方案有反查能力（码表 / 五笔拼音混输），门卫在协调器 `reverse_mode_available`。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReverseConfig {
     /// 反查模式期间的候选布局（默认跟随全局）。
     #[serde(default, deserialize_with = "crate::tolerant_de::tolerant")]
@@ -5311,6 +5320,25 @@ pub struct ReverseConfig {
     /// 出厂关。见 docs/design/codetable-reverse-mode.md §9。
     #[serde(default)]
     pub lookup_disabled_dicts: bool,
+    /// 命令栏整串反查（`dict.rev(clip())` 省略 n）接受的最大字数（按字符计，默认 16）。
+    /// 超过视为「不是一个词」，不查、返回空串，免得复制一大段文字时对全文算拼音/拆字。
+    /// 内部字段，设置页不开放。
+    #[serde(default = "default_clip_max_chars")]
+    pub clip_max_chars: usize,
+}
+
+fn default_clip_max_chars() -> usize {
+    16
+}
+
+impl Default for ReverseConfig {
+    fn default() -> Self {
+        Self {
+            candidate_layout: LayoutIntent::default(),
+            lookup_disabled_dicts: false,
+            clip_max_chars: default_clip_max_chars(),
+        }
+    }
 }
 
 /// 临时拼音配置（[input.temp_pinyin]）。码表方案下临时切到拼音反查。全局唯一。
@@ -7298,6 +7326,26 @@ impl UiCandidateConfig {
     /// 而三级裁决只有协调器持有主题槽位，是唯一有资格作答的地方。
     pub fn user_index_label(&self, i: usize) -> Option<String> {
         self.index_labels.get(i).filter(|s| !s.is_empty()).cloned()
+    }
+
+    /// 叠上方案级通用补丁（`[candidate]` 里已通过 [`crate::config_schema::split_candidate_patch`]
+    /// 校验的键），得到本方案下的生效配置。补丁空时等价于 `clone`。
+    ///
+    /// 做法是 序列化 → 覆盖同名叶子 → 反序列化：不为每个键写一行赋值，新增可覆盖键不用改这里。
+    /// 任何一步失败（补丁已校验，理论上不会）都退回原值——宁可「方案没生效」也不能带出半份配置。
+    pub fn folded_with(&self, patch: &toml::Table) -> Self {
+        if patch.is_empty() {
+            return self.clone();
+        }
+        let Ok(toml::Value::Table(mut tree)) = toml::Value::try_from(self) else {
+            return self.clone();
+        };
+        for (k, v) in patch {
+            tree.insert(k.clone(), v.clone());
+        }
+        toml::Value::Table(tree)
+            .try_into()
+            .unwrap_or_else(|_| self.clone())
     }
 
     /// 竖排最小行数的**生效值**：按每页候选数封顶（0=不补）。
@@ -10510,6 +10558,19 @@ impl Config {
         Self::migrate_grammar_enabled_value(&mut root);
         // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
         let value_for_hook = value.clone();
+        // 注释分配的单格 / 单个模板：按名字寻址，不走静态注册表（见 `CommentDynKey`）。
+        // 通知必须发**真实存在的路径**（分配的范围表 / 模板数组）——设置端镜像直接按路径写入，
+        // 虚拟键会在里面建出游离子树，之后被它整键写回覆盖。
+        let joined = path.join(".");
+        let mut dyn_notify: Option<(Vec<String>, toml::Value)> = None;
+        if let Some(dynk) = crate::config_schema::comment_dyn_key(&joined) {
+            let Some(text) = value.as_str() else {
+                anyhow::bail!("{joined} 的值须为字符串");
+            };
+            if let toml::Value::Table(t) = &mut root {
+                dyn_notify = Some(Self::apply_comment_dyn_key(t, dynk, text)?);
+            }
+        }
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
         // `is_known_key` 与 `prune_redundant` 同一道保险：未登记键（废弃键 / Map 子路径）不收口。
         let is_default = crate::config_schema::is_known_key(&path.join("."))
@@ -10517,7 +10578,9 @@ impl Config {
                 .as_ref()
                 .and_then(|p| get_nested(p, path))
                 .is_some_and(|d| *d == value);
-        if let toml::Value::Table(t) = &mut root {
+        if let toml::Value::Table(t) = &mut root
+            && dyn_notify.is_none()
+        {
             if is_default {
                 remove_nested(t, path);
             } else {
@@ -10535,8 +10598,100 @@ impl Config {
         // 落盘成功后通知订阅方（设置界面等）。放在 rename 之后：失败路径提前 `?`
         // 返回，不会误报。传出的是入参值——键被剪枝删除时用户层虽无此键，生效值
         // 仍是它（见上方剪枝说明），对订阅方语义一致。
-        crate::change_hook::notify_changed(path, &value_for_hook);
+        match &dyn_notify {
+            Some((p, v)) => {
+                let p: Vec<&str> = p.iter().map(String::as_str).collect();
+                crate::change_hook::notify_changed(&p, v)
+            }
+            None => crate::change_hook::notify_changed(path, &value_for_hook),
+        }
         Ok(())
+    }
+
+    /// 把一个 [`CommentDynKey`](crate::config_schema::CommentDynKey) 写进用户层表；
+    /// 空串＝删除（格回到下一层 / 删掉该用户模板）。
+    ///
+    /// 返回落盘后**真实存在的**通知路径与该路径上的值。途经的值类型不对（`templates` 不是数组、
+    /// 中间层不是表）时拒写：那是用户手改坏的内容，静默替换等于无备份销毁。
+    fn apply_comment_dyn_key(
+        root: &mut toml::Table,
+        key: crate::config_schema::CommentDynKey<'_>,
+        text: &str,
+    ) -> anyhow::Result<(Vec<String>, toml::Value)> {
+        use crate::config_schema::CommentDynKey;
+        match key {
+            CommentDynKey::Cell { scope, name, cell } => {
+                let mut path = vec!["ui", "comment", "assign", scope];
+                path.extend(name);
+                path.push(cell);
+                // 逐级核对：已存在的途经项必须是表。
+                let mut cur = Some(&*root);
+                for (i, k) in path[..path.len() - 1].iter().enumerate() {
+                    cur = match cur.and_then(|t| t.get(*k)) {
+                        Some(toml::Value::Table(t)) => Some(t),
+                        Some(_) => {
+                            anyhow::bail!("用户配置里 [{}] 不是表，拒绝覆盖", path[..=i].join("."))
+                        }
+                        None => None,
+                    };
+                }
+                if text.is_empty() {
+                    remove_nested(root, &path);
+                } else {
+                    set_nested(root, &path, toml::Value::String(text.to_string()));
+                }
+                let scope_path = vec!["ui", "comment", "assign", scope];
+                let v = get_nested(&toml::Value::Table(root.clone()), &scope_path)
+                    .cloned()
+                    .unwrap_or_else(|| toml::Value::Table(Default::default()));
+                Ok((scope_path.iter().map(|s| s.to_string()).collect(), v))
+            }
+            CommentDynKey::Template { id } => {
+                let path = ["ui", "comment", "templates"];
+                let mut list = match get_nested(&toml::Value::Table(root.clone()), &path) {
+                    Some(toml::Value::Array(a)) => a.clone(),
+                    None => Vec::new(),
+                    Some(_) => anyhow::bail!("用户配置里 ui.comment.templates 不是数组，拒绝覆盖"),
+                };
+                let pos = list
+                    .iter()
+                    .position(|t| t.get("id").and_then(|v| v.as_str()) == Some(id));
+                match (pos, text.is_empty()) {
+                    (Some(i), true) => {
+                        list.remove(i);
+                    }
+                    (Some(i), false) => {
+                        if let Some(t) = list[i].as_table_mut() {
+                            t.insert("text".into(), toml::Value::String(text.into()));
+                        }
+                    }
+                    (None, false) => {
+                        // 与内置同 id 的用户模板会整条替换内置，名称 / 说明沿用内置的，免得被冲成 id。
+                        let sys = crate::comment_lib::SystemComments::embedded();
+                        let builtin = sys.templates.iter().find(|t| t.id == id);
+                        let mut t = toml::Table::new();
+                        t.insert("id".into(), toml::Value::String(id.into()));
+                        t.insert(
+                            "name".into(),
+                            toml::Value::String(builtin.map_or(id, |b| b.name.as_str()).into()),
+                        );
+                        t.insert("text".into(), toml::Value::String(text.into()));
+                        if let Some(b) = builtin.filter(|b| !b.desc.is_empty()) {
+                            t.insert("desc".into(), toml::Value::String(b.desc.clone()));
+                        }
+                        list.push(toml::Value::Table(t));
+                    }
+                    (None, true) => {}
+                }
+                let v = toml::Value::Array(list.clone());
+                if list.is_empty() {
+                    remove_nested(root, &path);
+                } else {
+                    set_nested(root, &path, toml::Value::Array(list));
+                }
+                Ok((path.iter().map(|s| s.to_string()).collect(), v))
+            }
+        }
     }
 
     /// [`set_user_value`](Self::set_user_value) 的字符串便捷形式。
@@ -12535,6 +12690,89 @@ active = "x"
     }
 
     #[test]
+    fn comment_dyn_key_writes_cell_and_template_and_blank_deletes() {
+        use crate::config_schema::comment_dyn_key;
+        let mut root = toml::Table::new();
+        let mut put = |k: &str, v: &str| {
+            Config::apply_comment_dyn_key(&mut root, comment_dyn_key(k).unwrap(), v).unwrap()
+        };
+        put("ui.comment.assign.mode.url.default_vertical", "t1");
+        put("ui.comment.assign.global.detail_horizontal", "none");
+        put("ui.comment.template.t1", "${code}");
+        put("ui.comment.template.t1", "${dict}");
+        put("ui.comment.template.t2", "x");
+        let v = toml::Value::Table(root.clone());
+        let c: crate::comment_lib::UiCommentConfig = get_nested(&v, &["ui", "comment"])
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(c.assign.mode["url"].default_vertical.as_deref(), Some("t1"));
+        assert_eq!(c.assign.global.detail_horizontal.as_deref(), Some("none"));
+        assert_eq!(c.templates.len(), 2);
+        assert_eq!(c.templates[0].text, "${dict}");
+        let mut put = |k: &str, v: &str| {
+            Config::apply_comment_dyn_key(&mut root, comment_dyn_key(k).unwrap(), v).unwrap()
+        };
+        put("ui.comment.assign.mode.url.default_vertical", "");
+        put("ui.comment.assign.global.detail_horizontal", "");
+        put("ui.comment.template.t1", "");
+        put("ui.comment.template.t2", "");
+        assert!(root.is_empty(), "全删后应回收空段: {root:?}");
+    }
+
+    #[test]
+    fn comment_dyn_key_keeps_builtin_name_reports_real_path_and_refuses_bad_shapes() {
+        use crate::config_schema::comment_dyn_key;
+        let sys = crate::comment_lib::SystemComments::embedded();
+        let b = sys.templates.first().expect("内置模板非空").clone();
+        let mut root = toml::Table::new();
+        let tkey = format!("ui.comment.template.{}", b.id);
+        let (p, v) =
+            Config::apply_comment_dyn_key(&mut root, comment_dyn_key(&tkey).unwrap(), "${code}")
+                .unwrap();
+        assert_eq!(p, ["ui", "comment", "templates"]);
+        assert_eq!(v[0]["name"].as_str(), Some(b.name.as_str()), "名称沿用内置");
+        let (p, v) = Config::apply_comment_dyn_key(
+            &mut root,
+            comment_dyn_key("ui.comment.assign.type.pinyin.default_vertical").unwrap(),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(p, ["ui", "comment", "assign", "type"]);
+        assert_eq!(v["pinyin"]["default_vertical"].as_str(), Some("x"));
+        // 坏形状：拒写且不动原值。
+        let mut bad = toml::Table::new();
+        bad.insert(
+            "ui".into(),
+            toml::Value::Table({
+                let mut c = toml::Table::new();
+                c.insert(
+                    "comment".into(),
+                    toml::Value::Table({
+                        let mut t = toml::Table::new();
+                        t.insert("templates".into(), toml::Value::String("x".into()));
+                        t.insert("assign".into(), toml::Value::String("y".into()));
+                        t
+                    }),
+                );
+                c
+            }),
+        );
+        let before = bad.clone();
+        for k in [
+            "ui.comment.template.t1",
+            "ui.comment.assign.global.default_vertical",
+        ] {
+            assert!(
+                Config::apply_comment_dyn_key(&mut bad, comment_dyn_key(k).unwrap(), "z").is_err(),
+                "{k}"
+            );
+        }
+        assert_eq!(bad, before);
+    }
+
+    #[test]
     fn set_nested_creates_overwrites_and_preserves() {
         let mut t = toml::Table::new();
         t.insert("keep".into(), toml::Value::String("x".into()));
@@ -12596,6 +12834,39 @@ active = "x"
         let mut cfg: Config = base.try_into().unwrap();
         cfg.normalize();
         cfg
+    }
+
+    /// 补丁里的键覆盖同名叶子，其余字段（含全局改过的）原样保留。
+    #[test]
+    fn candidate_folded_with_overrides_only_patched_leaves() {
+        let base = UiCandidateConfig {
+            min_rows: 4,
+            per_page_extended: 6,
+            ..Default::default()
+        };
+        let mut patch = toml::Table::new();
+        patch.insert("per_page".into(), toml::Value::Integer(9));
+        let f = base.folded_with(&patch);
+        assert_eq!(f.per_page, 9);
+        assert_eq!(f.min_rows, 4, "未覆盖的项跟随全局");
+        assert_eq!(f.per_page_extended, 6);
+        assert_eq!(base.per_page, 7, "原值不被改动");
+    }
+
+    #[test]
+    fn candidate_folded_with_empty_patch_is_identity() {
+        let base = UiCandidateConfig::default();
+        let f = base.folded_with(&toml::Table::new());
+        assert_eq!(f.per_page, base.per_page);
+    }
+
+    /// 补丁里混进了反序列化不了的值时退回原值，而不是带出半份配置。
+    #[test]
+    fn candidate_folded_with_unparsable_patch_falls_back() {
+        let base = UiCandidateConfig::default();
+        let mut patch = toml::Table::new();
+        patch.insert("per_page".into(), toml::Value::String("x".into()));
+        assert_eq!(base.folded_with(&patch).per_page, base.per_page);
     }
 
     #[test]
@@ -14775,6 +15046,16 @@ mod status_position_tests {
             BoundAction::None,
             "未知动词仍回落 None"
         );
+    }
+
+    /// 整串反查字数上限：缺省 16，可被配置覆盖；其余字段缺省不受影响。
+    #[test]
+    fn reverse_clip_max_chars_defaults_to_16_and_parses() {
+        assert_eq!(Config::default().input.reverse.clip_max_chars, 16);
+        let t: ReverseConfig = toml::from_str("lookup_disabled_dicts = true\n").unwrap();
+        assert_eq!(t.clip_max_chars, 16, "缺省段落也是 16，不是 usize 零值");
+        let t: ReverseConfig = toml::from_str("clip_max_chars = 8\n").unwrap();
+        assert_eq!(t.clip_max_chars, 8);
     }
 
     /// 含未启用扩展词库是反查模式专属的全局开关，出厂关。

@@ -1653,6 +1653,15 @@ pub struct Coordinator {
     /// `State::menu_opened_at`：漏写会让守卫读到上一次的时间戳，于是刚弹出的面板
     /// 被一条迟到的焦点事件当场关掉。
     pub(crate) softkeyboard_opened_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// 软键盘开着时「它在服务哪个宿主进程」，0 = 未知（开启时尚无活动宿主）。
+    ///
+    /// 关闭判据按**宿主进程**粒度而不是按焦点事件粒度：同宿主内的 DocMgr 抖动、退出编辑、
+    /// 换文档都不算「用户离开」（Excel 退出单元格再切到下一格就是这样），只有换了宿主才算。
+    /// 与开启成对写入，见 `open_softkeyboard`。
+    pub(crate) softkeyboard_host_pid: std::sync::atomic::AtomicU32,
+    /// 钉住：面板不随焦点变化自动关闭（跨应用也留着）。**只对本次打开有效**，任何一条
+    /// 关闭路径都复位（见 `close_softkeyboard`），不持久化——忘了钉的面板会一直挡在屏上。
+    pub(crate) softkeyboard_pinned: std::sync::atomic::AtomicBool,
     /// 快捷输入格式表的**用户调整**（右键调序 / 停用）运行时镜像，键为格式类别。
     ///
     /// 真相在用户数据目录的 `quick_format.toml`，这里是读缓存：候选生成在热路径上
@@ -2143,6 +2152,8 @@ pub struct Coordinator {
     /// 编码显示方式运行时态（命令栏 ime.toggle("preedit") 循环切换；初值随配置）。
     /// 统一权威：决定候选窗是否显示 preedit（in_app→不显示）及是否内联首单元（embedded）。
     pub(crate) preedit_display: Mutex<PreeditDisplay>,
+    /// 方案级通用 UI 覆盖的折叠缓存，见 `schema_ui.rs`。
+    pub(crate) eff_candidate_cache: Mutex<Option<crate::schema_ui::EffCandidateCache>>,
     /// 候选窗隐藏开关（命令栏 ime.toggle("candwin") 切换；隐藏时 notify_ui_update 不显示候选）。
     hide_candidate_window: Mutex<bool>,
     /// 候选布局方向运行时态（命令栏 ime.toggle("layout") 切换；true=竖排，初值随配置，持久化）。
@@ -3209,6 +3220,8 @@ impl Coordinator {
             last_pushed_hotkey_session: std::sync::atomic::AtomicBool::new(false),
             hotkey_session_force_push: std::sync::atomic::AtomicBool::new(false),
             softkeyboard_opened_at: std::sync::Mutex::new(None),
+            softkeyboard_host_pid: std::sync::atomic::AtomicU32::new(0),
+            softkeyboard_pinned: std::sync::atomic::AtomicBool::new(false),
             // 空初值：真正的装载在 new() 里经 `reload_quick_adjust` 完成（需要 store，
             // 而 store 在本结构体构造之后才可用）。headless 无 store 时保持空 = 出厂顺序。
             quick_adjust: std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -3290,6 +3303,7 @@ impl Coordinator {
             preceding_text: Mutex::new(String::new()),
             last_commit_len: std::sync::atomic::AtomicUsize::new(1),
             preedit_display: Mutex::new(preedit_display_init),
+            eff_candidate_cache: Mutex::new(None),
             hide_candidate_window: Mutex::new(hide_candidate_window_init),
             candidate_orientation: Mutex::new(candidate_orientation_init),
             candidate_layout_sent: Mutex::new(candidate_orientation_init),
@@ -5770,13 +5784,7 @@ impl Coordinator {
             .ui_tx
             .send(UiCommand::SetCandidateShadow(cand.shadow != "off"));
         // 候选窗尺寸下限（ui.candidate.min_window_width_* / min_window_height_* / min_rows，抗抖动）
-        let _ = self.ui_tx.send(UiCommand::SetCandidateMinSize {
-            width_horizontal: cand.min_window_width_horizontal,
-            width_vertical: cand.min_window_width_vertical,
-            height_horizontal: cand.min_window_height_horizontal,
-            height_vertical: cand.min_window_height_vertical,
-            rows: cand.effective_min_rows(),
-        });
+        self.send_candidate_min_size();
         // 悬停提示延迟（ui.tooltip.delay）
         let _ = self
             .ui_tx
@@ -5911,13 +5919,25 @@ impl Coordinator {
         // 只认纯翻页动词：`AuxCode(PageNext)` 共键降级的那一下不归 `keys.overflow.page_key`。
         let is_page_action = matches!(
             action,
-            wind_config::SessionAction::PagePrev | wind_config::SessionAction::PageNext
+            wind_config::SessionAction::PagePrev
+                | wind_config::SessionAction::PageNext
+                | wind_config::SessionAction::PageScreenPrev
+                | wind_config::SessionAction::PageScreenNext
+        );
+        // 「翻屏」动词：展开态翻整屏，未展开时与翻页完全一致（下面落到同一条 nav 执行）。
+        let screen_verb = matches!(
+            action,
+            wind_config::SessionAction::PageScreenPrev | wind_config::SessionAction::PageScreenNext
         );
         let nav = match action {
             wind_config::SessionAction::HighlightUp => keymap::NavAction::HighlightUp,
             wind_config::SessionAction::HighlightDown => keymap::NavAction::HighlightDown,
-            wind_config::SessionAction::PagePrev => keymap::NavAction::PagePrev,
-            wind_config::SessionAction::PageNext => keymap::NavAction::PageNext,
+            wind_config::SessionAction::PagePrev | wind_config::SessionAction::PageScreenPrev => {
+                keymap::NavAction::PagePrev
+            }
+            wind_config::SessionAction::PageNext | wind_config::SessionAction::PageScreenNext => {
+                keymap::NavAction::PageNext
+            }
             wind_config::SessionAction::Cancel => {
                 // 无会话时放行：空闲按 Tab 该是宿主的制表符，不是「取消一个不存在的输入」。
                 // 判据与 `cancel_session` 的适用范围一致，见那里。
@@ -6138,8 +6158,12 @@ impl Coordinator {
             match nav {
                 keymap::NavAction::HighlightUp => self.grid_move_row(state, false),
                 keymap::NavAction::HighlightDown => self.grid_move_row(state, true),
-                keymap::NavAction::PagePrev => self.grid_page_key(state, false, data.key_code),
-                keymap::NavAction::PageNext => self.grid_page_key(state, true, data.key_code),
+                keymap::NavAction::PagePrev => {
+                    self.grid_page_key(state, false, data.key_code, screen_verb)
+                }
+                keymap::NavAction::PageNext => {
+                    self.grid_page_key(state, true, data.key_code, screen_verb)
+                }
             }
         } else {
             match nav {
@@ -8139,6 +8163,9 @@ impl Coordinator {
             }
             UiEvent::SoftKeyboardPage(i) => self.ui_softkeyboard_page(i),
             UiEvent::SoftKeyboardClose => self.ui_softkeyboard_close(),
+            UiEvent::SoftKeyboardPin => {
+                self.toggle_softkeyboard_pin();
+            }
             UiEvent::SoftKeyboardFunctionKey(name) => self.ui_softkeyboard_fn_key(&name),
             UiEvent::StatusTipMoved { x, y } => self.save_status_tip_pos(x, y),
             UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),

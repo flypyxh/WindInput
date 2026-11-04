@@ -547,6 +547,7 @@ static REGISTRY: &[ConfigField] = &[
     // 反查模式。进入方式只走 key_actions（动词 reverse），出厂不绑键；没有总开关（绑键即可用）。
     f("input.reverse.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
     f("input.reverse.lookup_disabled_dicts", Bool),
+    f("input.reverse.clip_max_chars", Int),
     // Emoji 候选扩展（按候选文本查表追加，与编码域无关 ⇒ 全方案通用，故在 input 而非 schema）。
     f("input.emoji.enabled", Bool),
     f("input.emoji.scope", Enum(EMOJI_SCOPE_VALUES)),
@@ -832,6 +833,112 @@ pub fn field(key: &str) -> Option<&'static ConfigField> {
     REGISTRY.iter().find(|f| f.key == key)
 }
 
+/// [`field`] 加上 [`CommentDynKey`] 的动态键。**只有 `config get/set` 与 cmdbar `config.*`
+/// 这类「单项按名字读写」的入口用它**；`field` / `is_known_key` 保持只查静态表——动态键在
+/// `Config` 结构体里没有同名字段，被 `config check`、patch、剪枝、设置端写回等一并认作
+/// 「已登记」会让它们对一个并不存在的路径做出错误判断。
+pub fn addressable_field(key: &str) -> Option<&'static ConfigField> {
+    field(key).or_else(|| comment_dyn_key(key).map(CommentDynKey::field))
+}
+
+/// [`addressable_field`] 是否命中。
+pub fn is_addressable_key(key: &str) -> bool {
+    addressable_field(key).is_some()
+}
+
+/// `ui.comment` 下两类**按名字寻址**的动态键，不在静态注册表里（名字是用户数据），
+/// 但可经 `config get/set` 与命令直通车 `config.get/config.set` 单项读写：
+///
+/// - 分配的一格：`ui.comment.assign.global.<格>`，或
+///   `ui.comment.assign.<type|schema|mode>.<名>.<格>`；`<格>` 取 [`COMMENT_CELL_KEYS`]，
+///   值为模板 id / `none` / `inherit`，**空串＝删除这一格**（回到下一层）。
+/// - 模板文本：`ui.comment.template.<id>`，值为模板串；id 不存在则新建（名称取 id），
+///   **空串＝删除该用户模板**。
+///
+/// 范围名与模板 id 里不能带 `.`；模板 id 须合 `[a-z0-9_]+` 且不是保留字 `none` / `inherit`，
+/// 与注释库加载时的取舍一致（不合格的模板加载时会被丢弃，写入时就该拒绝）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentDynKey<'a> {
+    Cell {
+        scope: &'a str,
+        name: Option<&'a str>,
+        cell: &'a str,
+    },
+    Template {
+        id: &'a str,
+    },
+}
+
+static DYN_CELL_FIELD: ConfigField = f("ui.comment.assign.<范围>.<格>", Str);
+static DYN_TEMPLATE_FIELD: ConfigField = f("ui.comment.template.<id>", Str);
+
+impl CommentDynKey<'_> {
+    fn field(self) -> &'static ConfigField {
+        match self {
+            Self::Cell { .. } => &DYN_CELL_FIELD,
+            Self::Template { .. } => &DYN_TEMPLATE_FIELD,
+        }
+    }
+}
+
+/// 解析 [`CommentDynKey`]；不是这两类形状返回 `None`。
+pub fn comment_dyn_key(key: &str) -> Option<CommentDynKey<'_>> {
+    if let Some(id) = key.strip_prefix("ui.comment.template.") {
+        return crate::comment_lib::valid_user_template_id(id)
+            .then_some(CommentDynKey::Template { id });
+    }
+    let rest = key.strip_prefix("ui.comment.assign.")?;
+    let (scope, tail) = rest.split_once('.')?;
+    let (name, cell) = match scope {
+        "global" => (None, tail),
+        "type" | "schema" | "mode" => {
+            let (n, c) = tail.split_once('.')?;
+            if n.is_empty() {
+                return None;
+            }
+            (Some(n), c)
+        }
+        _ => return None,
+    };
+    COMMENT_CELL_KEYS
+        .contains(&cell)
+        .then_some(CommentDynKey::Cell { scope, name, cell })
+}
+
+/// 按点分键从配置 JSON 取值，兼顾 [`CommentDynKey`]：未写的格与未自定义的模板读作空串。
+/// `config get` 与 cmdbar `config.get` 共用。
+pub fn lookup_json_value(full: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    match comment_dyn_key(key) {
+        Some(CommentDynKey::Template { id }) => {
+            let text = full
+                .pointer("/ui/comment/templates")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().find(|t| t["id"] == id))
+                .and_then(|t| t["text"].as_str())
+                .unwrap_or("");
+            Some(Value::String(text.to_string()))
+        }
+        Some(CommentDynKey::Cell { scope, name, cell }) => {
+            let mut cur = full
+                .pointer("/ui/comment/assign")
+                .and_then(|a| a.get(scope));
+            if let Some(n) = name {
+                cur = cur.and_then(|c| c.get(n));
+            }
+            let v = cur.and_then(|c| c.get(cell)).and_then(|v| v.as_str());
+            Some(Value::String(v.unwrap_or("").to_string()))
+        }
+        None => {
+            let mut cur = full;
+            for part in key.split('.') {
+                cur = cur.get(part)?;
+            }
+            Some(cur.clone())
+        }
+    }
+}
+
 /// 该键是否已在注册表登记。
 pub fn is_known_key(key: &str) -> bool {
     field(key).is_some()
@@ -852,6 +959,13 @@ pub struct SchemaOverride {
     pub section: &'static str,
     /// 覆盖语义，一句话，直接进设置页的提示——**写给用户，不是写给维护者**。
     pub note: &'static str,
+    /// 是否由**通用折叠器**生效：`true` ⇒ 方案文件 `[candidate]` 下写同名叶子键即可覆盖，
+    /// 不需要结构体字段，也不需要 `resolved()` 里的一行（见 [`split_candidate_patch`] 与
+    /// `UiCandidateConfig::folded_with`）。目前只支持 `ui.candidate.*` 的精确键。
+    ///
+    /// `false` 的登记是**手写形态**（码表 `resolved()`、标点、`layout` 的三态等），
+    /// 这张表只负责提示，生效逻辑在别处。
+    pub fold: bool,
 }
 
 /// 可被方案级配置覆盖的全局项。
@@ -884,6 +998,7 @@ pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
         key: "schema.codetable.",
         section: "[engine.codetable]",
         note: "码表方案可逐项覆盖这里的设置；方案没写的项仍然用这里的值。",
+        fold: false,
     },
     // 调频子段单独登记：段前缀不递归（见 `SchemaOverride::key`）。
     // ⚠️ 与它并列的 `auto_phrase` 子段**刻意不登记**——`CodetableGlobal::resolved` 里
@@ -893,32 +1008,38 @@ pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
         key: "schema.codetable.frequency.",
         section: "[engine.codetable.frequency]",
         note: "码表方案可逐项覆盖这里的调频设置；方案没写的项仍然用这里的值。",
+        fold: false,
     },
     // 同上：段前缀不递归，英文候选子段要自己登记一条。
     SchemaOverride {
         key: "schema.codetable.english_merge.",
         section: "[engine.codetable.english_merge]",
         note: "码表方案可逐项覆盖这里的英文候选设置；方案没写的项仍然用这里的值。",
+        fold: false,
     },
     SchemaOverride {
         key: "schema.pinyin.aux_code.enabled",
         section: "[engine.aux_code]",
         note: "方案可覆盖这一项；方案没写则用这里的值。",
+        fold: false,
     },
     SchemaOverride {
         key: "schema.pinyin.aux_code.max_phrase_len",
         section: "[engine.aux_code]",
         note: "方案可覆盖这一项；方案没写则用这里的值。",
+        fold: false,
     },
     SchemaOverride {
         key: "schema.pinyin.aux_code.direct",
         section: "[engine.aux_code]",
         note: "方案可覆盖这一项；方案没写则用这里的值。只对双拼方案生效。",
+        fold: false,
     },
     SchemaOverride {
         key: "input.punct.custom_mappings",
         section: "[punct]",
         note: "声明了自己标点表的方案**整表**不用这里的表——不是逐条合并。",
+        fold: false,
     },
     // ★ 这一条是 `PunctSpec::custom_mappings` 的文档点名要求「设置页与文档站必须写明」
     // 的那条推论：整表替换连开关一起换掉，所以关掉总开关，声明了自己标点表的方案
@@ -927,13 +1048,74 @@ pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
         key: "input.punct.custom_enabled",
         section: "[punct]",
         note: "声明了自己标点表的方案不受这个开关约束——整表替换时连它一起换掉了。",
+        fold: false,
     },
     SchemaOverride {
         key: "ui.candidate.layout",
         section: "[candidate]",
         note: "方案可覆盖候选窗排列方向；方案没写则用这里的值。",
+        fold: false,
+    },
+    // ── 通用折叠（fold = true）：在方案 `[candidate]` 写同名叶子键即生效 ──
+    // 新增一项只需加一行，并确认它的读取点走 `Coordinator::eff_candidate()`；
+    // `scheme_fold_read_gates` 会拦住绕过它直接读全局值的代码。
+    SchemaOverride {
+        key: "ui.candidate.per_page",
+        section: "[candidate]",
+        note: "方案可覆盖每页候选数；方案没写则用这里的值。临拼、快捷等扩展档不受影响。",
+        fold: true,
     },
 ];
+
+/// 通用折叠键的叶子名（`ui.candidate.` 之后的部分）→ 该登记。非折叠键返回 `None`。
+pub fn candidate_fold_entry(leaf: &str) -> Option<&'static SchemaOverride> {
+    let full = format!("ui.candidate.{leaf}");
+    SCHEMA_OVERRIDES.iter().find(|o| o.fold && o.key == full)
+}
+
+/// 把方案 `[candidate]` 里的通用补丁拆成「可生效的子集」和「问题清单」。
+///
+/// 判据三层，缺一即整条丢弃并进问题清单（写给用户看，所以带键名）：
+/// 1. 是登记过的折叠键（白名单，见 [`SchemaOverride::fold`]）；
+/// 2. 值过注册表校验（类型 / 枚举值域）；
+/// 3. 注册表表达不了的值域在 [`value_in_domain`] 补一刀。
+///
+/// ★ 「写错的值 = 没写」：错值若混进补丁，折叠时会把全局的好值一起盖没。
+pub fn split_candidate_patch(raw: &toml::Table) -> (toml::Table, Vec<String>) {
+    let mut ok = toml::Table::new();
+    let mut problems = Vec::new();
+    for (leaf, value) in raw {
+        let Some(entry) = candidate_fold_entry(leaf) else {
+            let why = if is_known_key(&format!("ui.candidate.{leaf}")) {
+                "该项暂不支持方案级覆盖"
+            } else {
+                "不是可识别的键"
+            };
+            problems.push(format!("[candidate] {leaf}（{why}）"));
+            continue;
+        };
+        if let Err(e) = validate(entry.key, value) {
+            problems.push(format!("[candidate] {leaf}（{e}）"));
+            continue;
+        }
+        if let Some(why) = value_in_domain(leaf, value) {
+            problems.push(format!("[candidate] {leaf}（{why}）"));
+            continue;
+        }
+        ok.insert(leaf.clone(), value.clone());
+    }
+    (ok, problems)
+}
+
+/// 注册表只有类型 / 枚举，表达不了的数值下限在此补。返回 `Some(原因)` 表示越界。
+/// 仅对 [`SchemaOverride::fold`] 的键调用；没有特殊值域的键不用登记。
+fn value_in_domain(leaf: &str, value: &toml::Value) -> Option<&'static str> {
+    match leaf {
+        // 全局侧 0 会被 normalize 成默认值；方案侧「0」没有意义，也不该悄悄变成 7。
+        "per_page" if value.as_integer().is_some_and(|n| n < 1) => Some("至少为 1"),
+        _ => None,
+    }
+}
 
 /// 查一个全局键是否可被方案级配置覆盖。段前缀登记（`key` 以 `.` 结尾）对该段下所有键成立。
 pub fn schema_override_of(key: &str) -> Option<&'static SchemaOverride> {
@@ -1099,11 +1281,19 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
             cand.layout != crate::config::LayoutIntent::Follow,
         ),
     ];
-    checks
+    let mut keys: Vec<&'static str> = checks
         .into_iter()
         .filter(|(_, on)| *on)
         .map(|(k, _)| k)
-        .collect()
+        .collect();
+    // ── 通用折叠键：补丁里有（且值合法）就算覆盖；判据与 `Schema::behavior` 同源 ──
+    let (patch, _) = split_candidate_patch(&cand.ui);
+    keys.extend(
+        patch
+            .keys()
+            .filter_map(|leaf| candidate_fold_entry(leaf).map(|o| o.key)),
+    );
+    keys
 }
 
 /// 把命令行/词条来源的原始字符串按注册表类型解析为 TOML 值（CLI `config set` 与
@@ -1113,7 +1303,7 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
 /// - Float 拒绝 nan/inf/溢出（`Value::from(非有限 f64)` 下游会静默变 null）
 /// - StrList 按逗号拆分；Map/StructList 需 JSON 文本
 pub fn parse_str_value(key: &str, raw: &str) -> Result<toml::Value, String> {
-    let fld = field(key).ok_or(ValidateError::UnknownKey.to_string())?;
+    let fld = addressable_field(key).ok_or(ValidateError::UnknownKey.to_string())?;
     let v = match fld.ty {
         FieldType::Bool => match raw.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => toml::Value::Boolean(true),
@@ -1212,7 +1402,7 @@ fn type_label(ty: FieldType) -> &'static str {
 /// 按注册表校验"键+值"。未登记键、类型不符、枚举越界均返回结构化错误。
 /// 宽松点：`Float` 字段接受整数值（用户常输 18 而非 18.0）。
 pub fn validate(key: &str, value: &toml::Value) -> Result<(), ValidateError> {
-    let f = field(key).ok_or(ValidateError::UnknownKey)?;
+    let f = addressable_field(key).ok_or(ValidateError::UnknownKey)?;
     let type_ok = match f.ty {
         FieldType::Bool => value.is_bool(),
         FieldType::Int => value.is_integer(),
@@ -1258,6 +1448,17 @@ pub fn validate(key: &str, value: &toml::Value) -> Result<(), ValidateError> {
         FieldType::StructList => value.is_array(),
     };
     if type_ok {
+        // 分配格的值：空串（删除）/ none / inherit / 形状合法的模板 id。
+        if let (Some(CommentDynKey::Cell { .. }), Some(v)) = (comment_dyn_key(key), value.as_str())
+            && !v.is_empty()
+            && !matches!(v, "none" | "inherit")
+            && !crate::comment_lib::valid_user_template_id(v)
+        {
+            return Err(ValidateError::EnumOutOfRange {
+                allowed: &["none", "inherit", "<模板 id：小写字母 数字 下划线>"],
+                got: v.to_string(),
+            });
+        }
         Ok(())
     } else {
         Err(ValidateError::TypeMismatch {
@@ -2218,6 +2419,30 @@ mod overridden_keys_tests {
         }
     }
 
+    /// 通用折叠登记的结构约束：必须是 `ui.candidate.<叶子>`、落点段是 `[candidate]`、
+    /// 注册表里有这个键，且叶子名不能与 `CandidateSpec` 的强类型字段撞车
+    /// （撞了 serde 会让强类型字段吃掉它，补丁永远收不到——登记成了摆设）。
+    #[test]
+    fn candidate_typed_keys_are_not_foldable() {
+        for o in SCHEMA_OVERRIDES.iter().filter(|o| o.fold) {
+            let leaf = o
+                .key
+                .strip_prefix("ui.candidate.")
+                .unwrap_or_else(|| panic!("{} 不在 ui.candidate. 下，通用折叠器不支持", o.key));
+            assert!(!leaf.contains('.'), "{} 只支持直接子键", o.key);
+            assert_eq!(
+                o.section, "[candidate]",
+                "{} 的落点段必须是 [candidate]",
+                o.key
+            );
+            assert!(is_known_key(o.key), "{} 未在注册表登记", o.key);
+            assert!(
+                !crate::schema::CANDIDATE_TYPED_KEYS.contains(&leaf),
+                "{leaf} 是 CandidateSpec 的强类型字段，不能走通用折叠"
+            );
+        }
+    }
+
     /// 精确登记项的最小方案片段——只设这一项。
     fn minimal_setting_of_exact(key: &str) -> &'static str {
         match key {
@@ -2281,6 +2506,16 @@ mod overridden_keys_tests {
                         (k, format!("[{section}]\n{leaf} = {}\n", sample_value(k)))
                     })
                     .collect()
+            } else if o.fold {
+                // 通用折叠键：片段由注册表类型自动生成，新增一条登记不需要改测试。
+                let leaf = o
+                    .key
+                    .strip_prefix("ui.candidate.")
+                    .expect("fold 键必须在 ui.candidate. 下");
+                vec![(
+                    o.key,
+                    format!("[candidate]\n{leaf} = {}\n", sample_value(o.key)),
+                )]
             } else {
                 vec![(o.key, minimal_setting_of_exact(o.key).to_string())]
             };
@@ -2295,5 +2530,71 @@ mod overridden_keys_tests {
         }
         // 防「循环体一次没进」的空过：登记表 + 前缀展开至少有这么多键。
         assert!(checked >= 30, "只验了 {checked} 个键，展开逻辑可能坏了");
+    }
+
+    #[test]
+    fn comment_dyn_keys_parse_by_shape() {
+        use super::{CommentDynKey as K, comment_dyn_key};
+        assert_eq!(
+            comment_dyn_key("ui.comment.assign.global.detail_vertical"),
+            Some(K::Cell {
+                scope: "global",
+                name: None,
+                cell: "detail_vertical"
+            })
+        );
+        assert_eq!(
+            comment_dyn_key("ui.comment.assign.mode.mix:quick_mix.default_horizontal"),
+            Some(K::Cell {
+                scope: "mode",
+                name: Some("mix:quick_mix"),
+                cell: "default_horizontal"
+            })
+        );
+        assert_eq!(
+            comment_dyn_key("ui.comment.template.my_tpl"),
+            Some(K::Template { id: "my_tpl" })
+        );
+        for bad in [
+            "ui.comment.assign.global.nope",
+            "ui.comment.assign.type.default_vertical",
+            "ui.comment.assign.other.x.default_vertical",
+            "ui.comment.template.",
+            "ui.comment.template.my.tpl",
+            "ui.comment.template.My",
+            "ui.comment.template.none",
+            "ui.comment.assign.mode.a.b.default_vertical",
+        ] {
+            assert_eq!(comment_dyn_key(bad), None, "{bad}");
+        }
+        assert!(is_addressable_key(
+            "ui.comment.assign.type.pinyin.default_vertical"
+        ));
+        assert!(!is_known_key(
+            "ui.comment.assign.type.pinyin.default_vertical"
+        ));
+        // 值形状：模板 id / none / inherit / 空串可，其余拒。
+        let v = |x: &str| {
+            validate(
+                "ui.comment.assign.global.default_vertical",
+                &toml::Value::from(x),
+            )
+        };
+        assert!(v("").is_ok() && v("none").is_ok() && v("my_tpl").is_ok());
+        assert!(v("My Tpl").is_err());
+    }
+
+    #[test]
+    fn lookup_json_reads_dynamic_keys_and_blank_when_unset() {
+        let full = serde_json::json!({"ui":{"comment":{
+            "templates":[{"id":"t1","name":"n","text":"${code}"}],
+            "assign":{"global":{"default_vertical":"t1"},"type":{"pinyin":{"detail_vertical":"t1"}}}}}});
+        let g = |k| lookup_json_value(&full, k).unwrap();
+        assert_eq!(g("ui.comment.template.t1"), "${code}");
+        assert_eq!(g("ui.comment.template.zz"), "");
+        assert_eq!(g("ui.comment.assign.global.default_vertical"), "t1");
+        assert_eq!(g("ui.comment.assign.global.detail_vertical"), "");
+        assert_eq!(g("ui.comment.assign.type.pinyin.detail_vertical"), "t1");
+        assert_eq!(g("ui.comment.assign.mode.url.default_vertical"), "");
     }
 }
