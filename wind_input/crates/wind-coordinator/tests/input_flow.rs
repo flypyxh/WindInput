@@ -293,7 +293,7 @@ fn test_candidate_action_hotkey_modifier_exact_match() {
     // （pin=ctrl+number）下按 Ctrl+Alt+2 会命中 pin 那条臂、把第 2 个候选静默置顶，
     // 而 TSF 侧同时把这个键交还宿主 ⇒ 宿主快捷键与置顶同时发生，用户完全看不出原因。
     // 每条用例都要重新起一段组合：不命中候选热键的 Ctrl/Alt 组合会落到「清空组合并隐藏
-    // 候选窗」那条兜底臂（`ClearComposition`），把缓冲清空。
+    // 候选窗」那条兜底臂（`ClearCompositionThenPassThrough`），把缓冲清空。
     let fresh = || {
         let c = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
         for ch in ['a', 'a', 'a', 'a'] {
@@ -303,13 +303,13 @@ fn test_candidate_action_hotkey_modifier_exact_match() {
     };
 
     // ① 多一个 Alt ⇒ 与 pin(ctrl+number) / delete(ctrl+shift+number) 都不相等。
-    //    正确结局是落到兜底臂 `ClearComposition`（语义：组合清掉，键仍归宿主），
+    //    正确结局是落到兜底臂 `ClearCompositionThenPassThrough`（组合清掉，键交还宿主），
     //    **不是** `Consumed`（那才是「被候选热键认领了」）。
     let coord = fresh();
     let ctrl_alt =
         coord.handle_key_event(&key_event_mods(0x32, EVENT_KEY_DOWN, MOD_CTRL | MOD_ALT));
     assert!(
-        matches!(ctrl_alt, KeyAction::ClearComposition),
+        matches!(ctrl_alt, KeyAction::ClearCompositionThenPassThrough),
         "出厂配置下 Ctrl+Alt+2 不该被候选热键认领（旧实现会误置顶），实际: {:?}",
         ctrl_alt
     );
@@ -322,7 +322,7 @@ fn test_candidate_action_hotkey_modifier_exact_match() {
         MOD_CTRL | MOD_SHIFT | MOD_ALT,
     ));
     assert!(
-        matches!(all_three, KeyAction::ClearComposition),
+        matches!(all_three, KeyAction::ClearCompositionThenPassThrough),
         "Ctrl+Shift+Alt+3 不该被删除热键认领，实际: {:?}",
         all_three
     );
@@ -377,7 +377,7 @@ fn test_candidate_action_hotkey_ctrl_alt_number() {
     let stale =
         fresh().handle_key_event(&key_event_mods(0x33, EVENT_KEY_DOWN, MOD_CTRL | MOD_SHIFT));
     assert!(
-        matches!(stale, KeyAction::ClearComposition),
+        matches!(stale, KeyAction::ClearCompositionThenPassThrough),
         "delete 改配后 Ctrl+Shift+3 不该再被认领，实际: {:?}",
         stale
     );
@@ -1399,8 +1399,7 @@ fn separator_off_by_default_for_shuangpin() {
 /// 双拼 `'` 是三选键、反引号归辅助码：桌面 `auto` 不得动选词键（见上一条
 /// [`separator_off_by_default_for_shuangpin`]，要断词显式写 `quote`）；手机是触屏，选词键
 /// 没人按，而「分词」键需要一个出路，所以移动端夺取 `'`（它作三选键只是数字 3 的别名）。
-/// 编译期常量 `use_mobile_overrides()` 在主机上恒为桌面，故用 `manual_separator_char_as`
-/// 显式按移动端求值。
+/// 档位由构造时的 `InputProfile` 决定，主机上直接构造移动档位即可。
 #[test]
 fn separator_auto_takes_quote_on_mobile_only() {
     let d = data_dir();
@@ -1410,14 +1409,20 @@ fn separator_auto_takes_quote_on_mobile_only() {
     let mut cfg = config_with("pinyin");
     cfg.schema.available = vec!["shuangpin".into(), "pinyin".into()];
     cfg.schema.active = "shuangpin".into(); // separator 保持默认 auto
-    let coord = Coordinator::new_headless(cfg, Some(&d));
+    let desktop = Coordinator::new_headless(cfg.clone(), Some(&d));
     assert_eq!(
-        coord.manual_separator_char_as(false),
+        desktop.manual_separator_char(),
         None,
         "桌面 auto 不动选词键"
     );
+    let (mobile, _rx) = Coordinator::new_headless_with_profile(
+        cfg,
+        Some(&d),
+        None,
+        wind_coordinator::InputProfile::mobile(),
+    );
     assert_eq!(
-        coord.manual_separator_char_as(true),
+        mobile.manual_separator_char(),
         Some('\''),
         "移动端 auto 夺取 `'`"
     );
@@ -1441,8 +1446,13 @@ fn separator_none_override_wins_over_mobile_takeover() {
     let mut cfg = config_with("pinyin");
     cfg.schema.available = vec!["shuangpin".into(), "pinyin".into()];
     cfg.schema.active = "shuangpin".into();
-    let coord = Coordinator::new_headless_with_override(cfg, Some(&d), Some(ov));
-    assert_eq!(coord.manual_separator_char_as(true), None);
+    let coord = Coordinator::new_headless_with_override_profile(
+        cfg,
+        Some(&d),
+        Some(ov),
+        wind_coordinator::InputProfile::mobile(),
+    );
+    assert_eq!(coord.manual_separator_char(), None);
 }
 
 /// 全拼的宿主分隔符字符是反引号（`'` 是选词键、反引号空闲），夺取只发生在两个键都被占时。
@@ -3444,7 +3454,7 @@ fn quick_input_ctrl_combo_does_not_insert_literal() {
     let mut ev = key_event(0x45, EVENT_KEY_DOWN); // E
     ev.modifiers = 0x0002; // MOD_CTRL
     match coord.handle_key_event(&ev) {
-        KeyAction::ClearComposition => {}
+        KeyAction::ClearCompositionThenPassThrough => {}
         other => panic!(
             "有待输入内容时 Ctrl 组合应放弃整段组合，实际: {:?}（回归：曾插入字面 e）",
             other
@@ -3791,7 +3801,7 @@ fn overlay_modes_treat_ctrl_combo_as_host_shortcut() {
     assert!(
         matches!(
             coord.handle_key_event(&ctrl_e()),
-            KeyAction::ClearComposition
+            KeyAction::ClearCompositionThenPassThrough
         ),
         "mix 下 Ctrl 组合应放弃整段组合（回归：曾插入字面 e）"
     );
@@ -3803,7 +3813,7 @@ fn overlay_modes_treat_ctrl_combo_as_host_shortcut() {
     assert!(
         matches!(
             coord.handle_key_event(&ctrl_e()),
-            KeyAction::ClearComposition
+            KeyAction::ClearCompositionThenPassThrough
         ),
         "临拼下 Ctrl 组合应放弃整段组合"
     );
@@ -3814,7 +3824,7 @@ fn overlay_modes_treat_ctrl_combo_as_host_shortcut() {
     assert!(
         matches!(
             coord.handle_key_event(&ctrl_e()),
-            KeyAction::ClearComposition
+            KeyAction::ClearCompositionThenPassThrough
         ),
         "临英下 Ctrl 组合应放弃整段组合"
     );
@@ -10552,7 +10562,7 @@ fn cmd_combo_goes_to_host_issue64() {
     press_letter(&coord, 'i');
     let act = coord.handle_key_event(&key_event_mods(0x43, EVENT_KEY_DOWN, MOD_WIN));
     assert!(
-        matches!(act, KeyAction::ClearComposition),
+        matches!(act, KeyAction::ClearCompositionThenPassThrough),
         "组码中 ⌘C 应清组合而非当码元，实际: {act:?}"
     );
 

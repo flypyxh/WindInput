@@ -53,10 +53,6 @@ const ENGLISH_FREQ_RANKS: &str = "english/en_freq.txt";
 /// 加载哪份布局必须同源，否则会出现「设置页显示自然码、打起来是小鹤」。
 pub const DEFAULT_SHUANGPIN_LAYOUT: &str = "xiaohe";
 
-/// 取拼音配置时是否套 `[mobile.*]` 覆盖（当前只有语法模型，见 `Config::pinyin_effective`）。
-/// 与协调器 `use_mobile_overrides` 同一判据：Android 构建即移动端。
-const MOBILE: bool = cfg!(target_os = "android");
-
 /// 码表词频应用策略（见 docs/redesign/frequency.md §3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreqStrategy {
@@ -624,6 +620,9 @@ pub struct EngineManager {
     single_char_used: std::sync::atomic::AtomicU64,
     /// 全局拼音配置（fuzzy/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
+    /// 取配置时套哪层覆盖（`[mobile.*]`）。构造时定下（见
+    /// [`Self::with_store_override_overlay`]），重载时继续读它。
+    overlay: Mutex<wind_config::ConfigOverlay>,
     /// 纠错与提示配置（`[input.correction]`），与 `pinyin` 一同决定 [`pinyin_hint_on`]。
     correction_cfg: Mutex<wind_config::CorrectionConfig>,
     /// 换位纠错规则（`[input.correction]` 生成），注入全拼引擎的 `FuzzyConfig::correction`；
@@ -921,8 +920,12 @@ impl EngineManager {
         data_dir: Option<&Path>,
         store: Option<Arc<wind_store::Store>>,
     ) -> Self {
-        let override_dir = Config::user_config_dir().map(|d| d.join("schema_overrides"));
-        Self::with_store_override(config, data_dir, store, override_dir)
+        Self::with_store_override(config, data_dir, store, Self::default_override_dir())
+    }
+
+    /// 默认的方案 override 目录：用户配置目录下的 `schema_overrides`。
+    pub fn default_override_dir() -> Option<std::path::PathBuf> {
+        Config::user_config_dir().map(|d| d.join("schema_overrides"))
     }
 
     /// 同 [`with_store`]，但显式指定 override 目录（测试用，避免污染真实用户目录）。
@@ -931,6 +934,23 @@ impl EngineManager {
         data_dir: Option<&Path>,
         store: Option<Arc<wind_store::Store>>,
         override_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_store_override_overlay(
+            config,
+            data_dir,
+            store,
+            override_dir,
+            wind_config::ConfigOverlay::Base,
+        )
+    }
+
+    /// 真实构造入口：覆盖层（`[mobile.*]`）在构造时定下，引擎一次建成，不经重载。
+    pub fn with_store_override_overlay(
+        config: &Config,
+        data_dir: Option<&Path>,
+        store: Option<Arc<wind_store::Store>>,
+        override_dir: Option<std::path::PathBuf>,
+        overlay: wind_config::ConfigOverlay,
     ) -> Self {
         // 初始化缓存根（一次）：%LOCALAPPDATA%\WindInput\cache，提前建好目录
         CACHE_DIR.get_or_init(|| {
@@ -1010,7 +1030,8 @@ impl EngineManager {
             user_text_built: std::sync::OnceLock::new(),
             single_char_codes: Mutex::new(None),
             single_char_used: std::sync::atomic::AtomicU64::new(0),
-            pinyin: Mutex::new(config.pinyin_effective(MOBILE)),
+            pinyin: Mutex::new(config.pinyin_effective(overlay)),
+            overlay: Mutex::new(overlay),
             correction_cfg: Mutex::new(config.input.correction.clone()),
             correction: Mutex::new(Arc::new(
                 crate::pinyin::correction::CorrectionRules::from_config(&config.input.correction),
@@ -3891,6 +3912,17 @@ impl EngineManager {
         Self::read_override_value(schema_id, dir)
     }
 
+    /// 某方案 override 文件的路径（目录未配置时 `None`；文件不一定存在）。
+    /// 供读改写方区分「文件不存在」与「文件存在但解析失败」——[`Self::get_schema_override`]
+    /// 两者都返回 `None`，拿空表起步写回会把坏文件里的其它内容整份冲掉。
+    pub fn schema_override_path(&self, schema_id: &str) -> Option<std::path::PathBuf> {
+        Some(
+            self.override_dir
+                .as_deref()?
+                .join(format!("{schema_id}.toml")),
+        )
+    }
+
     /// 仅写入某方案 override 层（原子 tmp+rename），**不**使引擎缓存失效。
     /// 供「持久化 + 对已加载引擎 live 生效」的场景（如扩展词库热插拔）使用。
     pub fn persist_schema_override(
@@ -4446,6 +4478,19 @@ impl EngineManager {
         true
     }
 
+    /// 当前生效的全局拼音配置（已套覆盖层）。测试 / 诊断用。
+    pub fn pinyin_global(&self) -> wind_config::config::PinyinGlobalConfig {
+        self.pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 当前取配置时套用的覆盖层。
+    pub fn config_overlay(&self) -> wind_config::ConfigOverlay {
+        *self.overlay.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 按新配置热重载方案集（无需重建 EngineManager）：重算可用方案、更新上屏策略、
     /// 清空引擎/词频/名称缓存使其按新配置/词典重建，并切到新的活跃方案。
     /// 返回活跃方案是否发生变化（供上层决定是否清输入缓冲、刷新 UI）。
@@ -4539,7 +4584,8 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = config.schema.primary_pinyin.clone();
         // 全局拼音配置变更：更新缓存，引擎缓存随下方 clear() 一起失效，下次按新配置重建。
-        *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) = config.pinyin_effective(MOBILE);
+        *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) =
+            config.pinyin_effective(self.config_overlay());
         *self
             .correction_cfg
             .lock()
@@ -4651,6 +4697,7 @@ impl EngineManager {
     /// `recheck_auto_commit` / `handle_top_code` 三条通路的收口点，一处接线即覆盖拼音、
     /// 码表及以后任何新引擎。详见 [`crate::english_merge`] 模块文档。
     pub fn convert(&self, input: &str, max_candidates: usize) -> ConvertResult {
+        let mut timer = crate::pinyin::ConvertStageTimer::new();
         let Some(engine) = self.active_engine() else {
             return ConvertResult::default();
         };
@@ -4658,6 +4705,7 @@ impl EngineManager {
             warn!("convert error: {}", e);
             ConvertResult::default()
         });
+        timer.mark("engine");
         if let Some((eng, cfg)) = self.english_merge_ctx(&engine) {
             // ★ 判据**只有一个**：中文侧有没有候选。它本身就完整表达了「用户在打中文
             // 还是在打英文」，不必再叠「有没有精确命中」——叠了会在「无精确→有精确」
@@ -4696,6 +4744,7 @@ impl EngineManager {
                 r.is_empty = r.candidates.is_empty();
             }
         }
+        timer.mark("english");
         r
     }
 
@@ -6268,9 +6317,11 @@ impl EngineManager {
         input: &str,
         max_candidates: usize,
     ) -> ConvertResult {
+        let mut timer = crate::pinyin::ConvertStageTimer::new();
         if !self.ensure_loaded(schema_id) {
             return ConvertResult::default();
         }
+        timer.mark(format!("cvwith:{schema_id}"));
         let engine = self.loaded_engine(schema_id);
         match engine {
             Some(e) => e.convert(input, max_candidates).unwrap_or_else(|err| {
@@ -8833,6 +8884,30 @@ fn pinyin_hint_on(
 
 #[cfg(test)]
 mod tests {
+    /// 覆盖层在构造时就位：不走重载路径（`engines_gen` 仍为 0），生效配置已是 `[mobile.grammar]`。
+    #[test]
+    fn overlay_applied_at_construction_without_rebuild() {
+        let mut cfg = Config::default();
+        cfg.schema.pinyin.grammar.weight = 0.0;
+        cfg.mobile.grammar.weight = 0.7;
+        let m = EngineManager::with_store_override_overlay(
+            &cfg,
+            None,
+            None,
+            None,
+            wind_config::ConfigOverlay::Mobile,
+        );
+        assert_eq!(m.config_overlay(), wind_config::ConfigOverlay::Mobile);
+        assert_eq!(m.pinyin_global().grammar.weight, 0.7);
+        assert_eq!(
+            m.engines_gen.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "构造期不得走重载路径"
+        );
+        let base = EngineManager::new(&cfg, None);
+        assert_eq!(base.pinyin_global().grammar.weight, 0.0);
+    }
+
     use super::*;
 
     #[test]

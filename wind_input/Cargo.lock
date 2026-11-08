@@ -2233,6 +2233,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wind-config",
+ "wind-quick-input",
 ]
 
 [[package]]
@@ -2372,6 +2373,7 @@ dependencies = [
  "wind-keys",
  "wind-phrase",
  "wind-store",
+ "wind-transfer",
  "wind-ui-types",
 ]
 
@@ -2608,6 +2610,7 @@ dependencies = [
  "wind-cmdbar",
  "wind-config",
  "wind-coordinator",
+ "wind-dict",
  "wind-engine",
  "wind-keys",
  "wind-quick-input",
