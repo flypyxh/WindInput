@@ -15,7 +15,18 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # 整个工作区的测试二进制很多，带完整调试信息会把 runner 磁盘写满（链接时 ld 被 Bus error）；
+    # CI 里不需要调试符号，只留行号表。
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      # runner 预装的 .NET / Android SDK / GHC 用不到（Android 只做 cargo check，不要 NDK），腾出十几 GB。
+      # 删除要一分多钟，丢到后台与 apt / toolchain 安装并行；dev.sh ci 前会等它收尾。
+      - name: 腾出磁盘（后台）
+        run: |
+          rm -f /tmp/disk-cleaned
+          setsid nohup bash -c 'sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; touch /tmp/disk-cleaned' >/dev/null 2>&1 &
+
       - uses: actions/checkout@v7
 
       # 统一 MSVC 工具链:clang-19(C++ TSF 需 clang≥19)+ lld-19 + llvm-19;
@@ -46,7 +57,10 @@ jobs:
 
       # fmt --check + clippy(msvc target) + test(本机)
       - name: dev.sh ci
-        run: ./scripts/dev.sh ci
+        run: |
+          until [ -e /tmp/disk-cleaned ]; do sleep 1; done
+          df -h /
+          ./scripts/dev.sh ci
 
       # headless/Android 防走样三道闸:
       # ① check 对象是 **wind-mobile 全包**(移动端门面,闭包含 coordinator headless):
@@ -99,6 +113,36 @@ jobs:
           make -C wind_tsf VERSION="$V"
           make -C wind_tsf x86 VERSION="$V"
 
+  # Linux 门禁: wind_linux addon 纯逻辑单测 + 服务端 linux-host 形态。
+  # 单测走仓库 canonical 的 Makefile 入口（g++ 直接编，不需要 Fcitx5 / CMake）；
+  # protocol_sync_test 已覆盖 Rust ↔ C++ 协议 id，故不再重复跑 CMake/ctest。
+  # 不做路径过滤：PR 全量跑；push 只按文件顶部的 docs/** 与 **.md 忽略规则跳过，
+  # 改 wind-ipc / 服务端 feature / 工作区清单时都会触发，不会因漏列路径而失守。
+  linux-check:
+    name: Linux Addon & Service
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 C++ 单测依赖
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends g++
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wind_input
+
+      - name: wind_linux 单测
+        run: make -C wind_linux test
+
+      - name: wind_service linux-host 编译检查
+        working-directory: wind_input
+        run: cargo check -p wind_service --features linux-host
+
   # 门控: 仅当 macOS 相关路径改动时才触发 macOS 编译校验。
   # GitHub 不支持 per-job paths, 故用一个 ubuntu 廉价 job 输出是否命中, macos-check 据此 if 短路。
   changes:
@@ -128,6 +172,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.macos == 'true'
     runs-on: macos-26
+    # 与 check job 同理：CI 不需要完整调试信息，只留行号表，省编译/链接时间和缓存体积。
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
 

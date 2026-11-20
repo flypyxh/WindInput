@@ -51,6 +51,8 @@ class CTextService : public ITfTextInputProcessorEx,
     friend class CCommitTextEditSession;
     friend class CReplaceBackwardEditSession;
     friend class CInsertTextEditSession;
+    friend class CDropLeftoverEditSession;
+    friend class CPurgeLeftoverEditSession;
 public:
     CTextService();
     ~CTextService();
@@ -273,8 +275,10 @@ public:
     // Get and send caret position to Go Service
     // pSource: 非空时输出命中的是回退链的哪一级（CARET_SRC_*）。**这条链的每一级语义都不同**，
     //          TSF 坐标与 GUI 光标分属两个域，混为一谈正是候选窗错位的历史根因。
+    // pRejectedOutsideView: 候选窗更新用。TSF 坐标被判越界时输出原因并停止回退。
     BOOL GetCaretPosition(LONG* px, LONG* py, LONG* pHeight, int* pSource = nullptr,
-                          RECT* pCompRect = nullptr, BOOL* pHasCompRect = nullptr);
+                          RECT* pCompRect = nullptr, BOOL* pHasCompRect = nullptr,
+                          BOOL* pRejectedOutsideView = nullptr);
     void SendCaretPositionUpdate();
 
     // 非按键上下文（WM_TIMER 等）专用：用异步 edit session 取坐标，结果经
@@ -308,7 +312,8 @@ public:
     //                （CARET_SRC_IMM_CANDIDATE_FORM）。为真时 pUsedCompStart 恒为假。
     BOOL GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BOOL* pUsedCompStart = nullptr,
                                  RECT* pCompRect = nullptr, BOOL* pHasCompRect = nullptr,
-                                 BOOL* pIsDefaultPos = nullptr, BOOL* pUsedImmCandidateForm = nullptr);
+                                 BOOL* pIsDefaultPos = nullptr, BOOL* pUsedImmCandidateForm = nullptr,
+                                 BOOL* pRejectedOutsideView = nullptr);
     BOOL GetCompositionStartPosition(LONG* px, LONG* py);
 
     // Input mode control
@@ -335,6 +340,9 @@ public:
     // InputScope 位 + compartment 未禁用 + 策略开关开）。DLL 必须能自行判定：吃键决策在
     // OnTestKeyDown 完成，早于 IPC，仅靠 core 回 PassThrough 会「吃了再吐」丢键。
     BOOL IsPasswordSuppressActive() const;
+    // 焦点是不是密码框（IS_PASSWORD / IS_NUMERIC_PASSWORD），**与强制英文开关无关**：
+    // 扩展旁路上报据此一个键都不报（隐私），而上面那个是吃键闸门，管的是输入行为。
+    BOOL IsPasswordScope() const;
     void SetPasswordSuppressEnabled(BOOL bEnabled) { _passwordSuppressEnabled = bEnabled; }
     // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；默认关）。
     void SetDiagSnapshotEnabled(BOOL bEnabled) { _diagSnapshotEnabled = bEnabled; }
@@ -406,6 +414,9 @@ public:
 
     // Check if there's an active composition
     BOOL HasActiveComposition() { return _pComposition != nullptr; }
+    // 有组合，或组合刚被宿主打断、缓冲仍保留着（恢复中）。会清服务端缓冲的同步判据要看它。
+    BOOL HasCompositionOrRecover() { return _pComposition != nullptr || !_recoverLeftover.empty(); }
+    BOOL HasRecoverRecord() const { return !_recoverLeftover.empty(); }
 
     // Clear the "composition just started" flag (used by timer fallback path).
     // 同时作废 EditSession 缓存：缓存是 StartComposition EditSession 内部抓的，
@@ -753,6 +764,23 @@ private:
     std::wstring _pendingCommitPrefix;
     std::wstring _lastCompositionText;  // Cache to skip redundant updates
     int _lastCaretPos = -1;             // Cache caret position to detect cursor movement
+    // 宿主过早终止组合后留在文档里的组合文字（见 CompositionRecoverPolicy.h）；空 = 不在恢复中。
+    // 下一次写文档的编辑会话开头经 _DropRecoverLeftover 核对并删掉。
+    std::wstring _recoverLeftover;
+    ITfContext* _recoverContext = nullptr;   // 残留所在的 context（持有引用）；核对与清除只认它
+    ITfRange* _recoverRange = nullptr;       // 残留区间（终止时组合区间的副本，持有引用），解除时据此清
+    LONG _recoverAcpStart = 0;               // 残留在文档里的起点（ACP 偏移）；核对靠位置，不只靠文字
+    ULONGLONG _recoverArmTick = 0;           // 进入恢复的时刻，焦点空档判「宿主在转移输入」用
+    ULONGLONG _lastCompositionWriteTick = 0; // 上次写组合文字的时刻，判「过早终止」用
+    // 在编辑会话里删掉光标前的残留（光标前恰好是残留才删），并清掉记录。无残留时什么也不做。
+    void _DropRecoverLeftover(TfEditCookie ec, ITfContext* pContext);
+    void _ArmRecover(ITfContext* pContext, ITfRange* pRange, const std::wstring& leftover, LONG acpStart);
+    void _ClearRecoverRecord();
+    void _DisarmRecover(const wchar_t* why); // 解除恢复，并按记下的位置异步清掉残留
+    void _PurgeLeftover(TfEditCookie ec, ITfRange* pRange, const std::wstring& text);
+    // 光标处无选区、恰在残留末尾、且残留文字未变。成立时 *ppLeftover 返回覆盖残留的 range（调用方 Release）。
+    BOOL _LeftoverBeforeCaret(TfEditCookie ec, ITfContext* pContext, ITfRange** ppLeftover);
+    void _RequestDropLeftover(); // 无组合时单独开一个编辑会话删残留（服务端清空缓冲）
     BOOL _asyncEdit;  // Track if last RequestEditSession returned TF_S_ASYNC (Weasel optimization)
 
     // Cached caret position from edit session (for WebView apps where separate

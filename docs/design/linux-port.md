@@ -404,24 +404,27 @@ DBus 客户端能直接断言 `ForwardKey` 序列；代价是只作用于当前�
      原来的根坐标直通，不乘 `hostScale`、也不叠窗口原点。
    - 仅 `RelativeRect`：扩展 `TranslateRelativeSpot`（`protocol_to_stage_rect` + compositor
      actor）再折到 X11；无该能力位的绝对屏坐标只缩放，不得叠窗口原点。
-   - 扩展 `spotScale`（矩形坐标系）：sf≈缓冲缩放 → 用客户端 sf（已预乘）；sf≈1 且 frontend=ibus
-     → 用输出缩放（相对矩形常已预乘却未报 scale）；其余（sf≈1 的其它前端，以及 sf>1 但不贴近
-     缓冲缩放的逻辑 DIP）主题 scale≈1。纯函数在 `GnomeCaretGeom`，单测覆盖 frontend × scale。
-   - 扩展未启用时退回 toolkit 折中——最大化大致可用，浮动窗会偏。问总线的连接会缓存；失败后
+   - 扩展 `spotScale`（矩形坐标系）：sf>1 → 用客户端 sf（GTK3/GTK4/Qt 都已按 sf 预乘，与 kimpanel
+     一致）；sf≈1 且 frontend=ibus → 用输出缩放（相对矩形常已预乘却未报 scale）；其余 1。
+     纯函数在 `GnomeCaretGeom`，单测覆盖 frontend × scale。
+   - 缓冲缩放取 `Xft.dpi / 96 / text-scaling-factor`：GNOME 写的 `Xft.dpi` 掺着字体缩放，不除掉
+     坐标会被多乘一次（只开字体缩放 1.3 时候选窗偏右下、离原点越远偏越多）。字体缩放取 XSETTINGS 的
+     `Gdk/UnscaledDPI`（gsd-xsettings 与 `Xft.dpi` 同时写），读不到按 1。光栅化仍用不除的
+     `Xft.dpi / 96`，字跟着字体缩放放大。
+   - 扩展未启用时退回 toolkit 折中——最大化大致可用，浮动窗会偏。折中按 fcitx 约定把 RelativeRect
+     当作已按 sf 预乘（fcitx5-gtk 的 GTK3/GTK4 与 fcitx5-qt 都这样报）：sf 远离缓冲缩放时按「矩形 / sf ×
+     缓冲缩放」，例如显示器 150% 时 GTK3 报整数 sf=2、Xwayland 缓冲缩放 1，要除 2。问总线的连接会缓存；失败后
      约 3 秒内不再同步重试；同一矩形不重复调用。`hostOutput` 复用 `sendCaretUpdate` 已经成功
      换算的结果。
-   - **扩展能装上的 Shell 是 47–50，不是 42，也不是 45/46。** ESM 扩展格式从 Shell 45 起；
-     `gi://Mtk` 也从 45 起就有（gnome-shell 45.0 自己的 `windowManager.js` 在 import）。
-     但本扩展调用的 `Meta.Window.protocol_to_stage_rect` 从 mutter 47.0 才进入公开头文件，
-     46.0–46.7 没有。`metadata.json` 因此只声明 47–50。安装与这段核对写在
-     `wind_linux/gnome-shell-extension/README.md`；CMake 在 Wayland 且找到 `gio-2.0` 时把扩展
-     装到 `${datadir}/gnome-shell/extensions/`（没有 gio 不阻塞其余 addon）。
-   - **验证环境还没定。** 2026-10-10 在 Ubuntu 22.04（GNOME Shell 42.9）上看到的是扩展还不存在
-     时的行为：gedit 报 `rect=(344,76 0x18)`，服务端摆到 `(344,96)`。Shell 42 不能加载 ESM
-     扩展，那次不能当作本扩展的实测。Ubuntu 24.04 的 Shell 是 46，同样不在 `shell-version` 里
-     （这是发行版包版本，不是在那台机器上启用过）。47–50 只核对了上游标签里相关符号还在，
-     **没有**在真实 GNOME 会话里对过光标，分数缩放也没有确认。需要作者补测后改这一条。
-   源码在 `wind_linux/gnome-shell-extension/windinput-caret@windinput/`。非 GNOME 的
+   - **两份扩展覆盖 Shell 42–51。** ESM 版（45–51）有 `Meta.Window.protocol_to_stage_rect`（mutter 47+）
+     就用它，45/46 没有时退回「窗口 actor 左上 + 相对坐标 × shellScale / sf」；旧格式版
+     `windinput-caret-legacy@windinput`（42–44）只用后者。这是 kimpanel 在 mutter 47 之前的做法。
+     CMake 在 Wayland 且找到 `gio-2.0` 时把两份都装到 `${datadir}/gnome-shell/extensions/`，
+     各自的 `shell-version` 只让对应 Shell 启用；默认不启用。
+   - **实测**：Ubuntu 22.04 / Shell 42.9 Wayland、显示器 150%（Xwayland 根 960×600、`Xft.dpi` 96），
+     legacy 扩展 + gedit（GTK3 报 sf=2）：`(360,140) sf=2 spot=2 → (428,276)`，最大化与浮动窗口
+     挪到不同位置都贴光标。45/46 回落、47+ 的分数缩放、多显示器仍未在真机上对过。
+   源码在 `wind_linux/gnome-shell-extension/` 下的两个目录。非 GNOME 的
    X11 会话与 treeland/KWin popup 不受影响。
 11. **Wayland 下工具栏 / 软键盘记住的位置可能跳角（已知限制）**：Wayland 面板坐标的单位是「合成器逻辑
    坐标 × 服务端此刻的光栅化缩放」（§5b / `OverlayInput.h`「Wayland 面板坐标」），而光栅化缩放跟着焦点
@@ -487,7 +490,9 @@ Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `
 
 **设置程序是私有仓**：没配 `WIND_REPOS_TOKEN`（fork）时整个 Linux 构建跳过并告警，不出缺设置入口的残缺包。
 
-**未做**：rpm（Fedora/openSUSE）与 Arch（PKGBUILD）需各自发行版实测；apt 仓库（签名密钥与托管）；Wayland。
+**rpm**：试验性，Fedora / openSUSE Leap，复用 deb 同一棵安装树，见 [linux-rpm.md](linux-rpm.md)。
+
+**未做**：Arch（PKGBUILD）；apt / yum 仓库（签名密钥与托管）；Wayland。
 
 **在线升级**：设置程序读 `latest-linux.json`，下载到 `~/.cache/windinput/update/`（0700，避免 `/tmp` 里被别的用户换包）并校验 sha256，
 安装时 `pkexec env DEBIAN_FRONTEND=noninteractive apt-get install -y <deb>`（polkit 授权，apt 解依赖）；无 pkexec 退到
@@ -504,7 +509,7 @@ Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `
 
 ### 打包规范审查（对照通行的 Fcitx5 插件打包建议）
 
-目前只发 Debian 系（Ubuntu 22.04+、Deepin 25），rpm / Arch 暂不做。逐项对照：
+主目标是 Debian 系（Ubuntu 22.04+、Deepin 25）；rpm 见 [linux-rpm.md](linux-rpm.md)；Arch 暂不做。逐项对照：
 
 - **发布基线**三条同时写明：glibc ≥ 2.34（`dpkg-shlibdeps` 实算，构建机 22.04）、libstdc++ ≥ 11、Fcitx5 ≥ 5.0.14
   （addon 按 5.0.14 头文件编；5.1.x 的 Deepin 25 上实测可加载）。基线只能随构建机变高不能变低。
@@ -519,5 +524,5 @@ Windows/macOS 同口径）。包内 `Version` 把预发布后缀的 `-` 换成 `
   fcitx5 本身留给用户重启（`fcitx5 -rd` 或重新登录）。
 - **包名保持 `windinput`**：不改 `fcitx5-<名>` 形式——这个包不只是 addon，还带服务、设置程序与词库；已部署的测试机以此名升级。
   日后若拆包，再按 `fcitx5-windinput`（addon）+ `windinput`（服务 / 数据）拆。
-- **不用 AppImage / Flatpak / Snap**，也不用 `alien` 转格式；将来做 rpm 要在 Fedora 容器里独立构建、独立实测。
+- **不用 AppImage / Flatpak / Snap**，也不用 `alien` 转格式。rpm 用 rpm 自己的 spec（依赖 / scriptlet / 文件清单按 rpm 规则写），复用 deb 的安装树，并在 Fedora、openSUSE 容器里独立实测安装。
 

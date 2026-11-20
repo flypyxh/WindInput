@@ -196,6 +196,10 @@ const RETIRED_KEYS: &[&[&str]] = &[
     &["schema", "pinyin", "show_code_hint"],
     &["input", "temp_pinyin", "code_hint_source"],
     &["schema", "mix", "pinyin_code_hint"],
+    // 按键级翻页溢出覆盖表，被翻页动作后缀取代（`page_prev:ignore` 这类写在 `keys.session_actions`
+    // 里，见 docs/design/keys-overflow-per-key.md）。**不做值迁移**（维护者定，0.131 破坏性变更）：
+    // 旧值已被 serde 丢弃，这里只把它从用户文件里清掉，免得看起来还在生效。
+    &["keys", "overflow", "page_key_overrides"],
 ];
 
 /// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
@@ -693,6 +697,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub stats: StatsConfig,
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
     #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
@@ -1877,6 +1883,40 @@ impl BoundAction {
     }
 }
 
+/// 翻页动作在「翻不动」时怎么办（`page_prev` / `page_next` 的后缀）。
+///
+/// 外面的 `keys.overflow.page_key` 是全局档；要把策略落到单个键上（「只有逗号翻不动时上屏」，
+/// GH#249），在自定义按键里给那个键绑带后缀的翻页动作。翻不动判定与闸门见
+/// `Coordinator::page_key_overflow_to_punct`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageOverflow {
+    /// 跟随全局档 `keys.overflow.page_key`（出厂 / 写 `page_prev`）。
+    Global,
+    /// 顶高亮候选并输出该键符号（`page_prev:commit_and_input`）。
+    CommitAndInput,
+    /// 吞键，全局档开了上屏也压住（`page_prev:ignore`）。
+    Ignore,
+}
+
+impl PageOverflow {
+    fn parse_payload(s: &str) -> Option<Self> {
+        match s.trim() {
+            "commit_and_input" => Some(Self::CommitAndInput),
+            "ignore" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
+
+    /// 落盘写法的后缀；跟随全局为空。
+    fn as_payload(&self) -> &'static str {
+        match self {
+            Self::Global => "",
+            Self::CommitAndInput => "commit_and_input",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
 /// `caret_right` 在编码区光标已到末尾时的动作（macOS 式 → 键的三种落法）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaretEnd {
@@ -1951,8 +1991,9 @@ impl CaretEnd {
 pub enum SessionAction {
     /// 未启用 / 显式禁用。
     None,
-    PagePrev,
-    PageNext,
+    /// 上一页 / 下一页；载荷是翻不动时的策略（写法 `page_prev` / `page_prev:commit_and_input|ignore`）。
+    PagePrev(PageOverflow),
+    PageNext(PageOverflow),
     /// 展开态翻整屏；未展开时同 `PagePrev`（见 `candidate_grid::grid_page_key`）。
     PageScreenPrev,
     PageScreenNext,
@@ -2164,6 +2205,15 @@ impl SessionAction {
                 None => Self::None,
             };
         }
+        for (prefix, page_next) in [("page_prev:", false), ("page_next:", true)] {
+            if let Some(rest) = t.strip_prefix(prefix) {
+                return match PageOverflow::parse_payload(rest) {
+                    Some(o) if page_next => Self::PageNext(o),
+                    Some(o) => Self::PagePrev(o),
+                    None => Self::None,
+                };
+            }
+        }
         if let Some(rest) = t.strip_prefix("caret_right:") {
             return match CaretEnd::parse_payload(rest) {
                 Some(a) => Self::CaretRight(a),
@@ -2171,8 +2221,8 @@ impl SessionAction {
             };
         }
         match t.as_str() {
-            "page_prev" => Self::PagePrev,
-            "page_next" => Self::PageNext,
+            "page_prev" => Self::PagePrev(PageOverflow::Global),
+            "page_next" => Self::PageNext(PageOverflow::Global),
             "page_screen_prev" => Self::PageScreenPrev,
             "page_screen_next" => Self::PageScreenNext,
             "highlight_up" => Self::HighlightUp,
@@ -2272,8 +2322,14 @@ impl std::fmt::Display for SessionAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => f.write_str("none"),
-            Self::PagePrev => f.write_str("page_prev"),
-            Self::PageNext => f.write_str("page_next"),
+            Self::PagePrev(o) => match o.as_payload() {
+                "" => f.write_str("page_prev"),
+                p => write!(f, "page_prev:{p}"),
+            },
+            Self::PageNext(o) => match o.as_payload() {
+                "" => f.write_str("page_next"),
+                p => write!(f, "page_next:{p}"),
+            },
             Self::PageScreenPrev => f.write_str("page_screen_prev"),
             Self::PageScreenNext => f.write_str("page_screen_next"),
             Self::HighlightUp => f.write_str("highlight_up"),
@@ -2362,6 +2418,28 @@ pub struct CodetableGlobal {
     /// 与 `wildcard` 主开关正交。见 reverse-mode spec §2。
     #[serde(default)]
     pub wildcard_single_only: bool,
+    /// 码表整句 N-best：候选列表里**露**几条整句。出厂 1。上限 8。
+    ///
+    /// 只在方案开了整句（`[engine.codetable].sentence_input`）时有消费者。语义与
+    /// `schema.pinyin.sentence_count` 相同，但**各管各的**：码表整句的首选准确率与拼音不在
+    /// 一个水平上，用户很可能只想给其中一边开备选。
+    #[serde(default = "default_sentence_count")]
+    pub sentence_count: u8,
+    /// 码表整句 N-best：解码时**算**几条（整句切换键的池子）。不足 `sentence_count` 时按后者抬。
+    #[serde(default = "default_sentence_count")]
+    pub sentence_max_count: u8,
+    /// 码表整句的切换键。**空串 = 关闭（出厂）**。键名取值、夺取规则同
+    /// `schema.pinyin.sentence_cycle_key`。
+    #[serde(default)]
+    pub sentence_cycle_key: String,
+    /// 码表整句挂语法模型的权重。**0 = 不挂**。出厂 0.5。
+    ///
+    /// 模型固定用随包的 `wanxiang-mini.gram`，不跟 `schema.pinyin.grammar`：拼音桌面端出厂
+    /// 不挂模型，码表整句挂上收益大得多（词组最短码打法首选 56.8% → 79.5%）。权重取 0.5
+    /// 而不是 1.0：1.0 在逐字全码打法上反而掉分（83.5% → 74.4%）。数据见
+    /// `docs/design/codetable-sentence-input.md` §12。
+    #[serde(default = "default_codetable_sentence_grammar_weight")]
+    pub sentence_grammar_weight: f64,
     /// 出简让全：有简码的字，在更长的码位上把首选让给词语（「路」的三简是 `kht`，
     /// 那么 `khtk` 的首选就该给「路上」之类）。值 = **参与让位的简码级别上限**：
     ///
@@ -2467,6 +2545,10 @@ impl Default for CodetableGlobal {
             wildcard: false,
             wildcard_key: default_wildcard_key(),
             wildcard_single_only: false,
+            sentence_count: default_sentence_count(),
+            sentence_max_count: default_sentence_count(),
+            sentence_cycle_key: String::new(),
+            sentence_grammar_weight: default_codetable_sentence_grammar_weight(),
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -2537,6 +2619,18 @@ impl CodetableGlobal {
         }
         if let Some(v) = o.wildcard_single_only {
             out.wildcard_single_only = v;
+        }
+        if let Some(v) = o.sentence_count {
+            out.sentence_count = v;
+        }
+        if let Some(v) = o.sentence_max_count {
+            out.sentence_max_count = v;
+        }
+        if let Some(v) = &o.sentence_cycle_key {
+            out.sentence_cycle_key = v.clone();
+        }
+        if let Some(v) = o.sentence_grammar_weight {
+            out.sentence_grammar_weight = v;
         }
         // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
         //
@@ -4390,6 +4484,9 @@ pub struct InputConfig {
     /// 智能符号模式。
     #[serde(default)]
     pub symbol: SymbolConfig,
+    /// 中英 / 中数之间自动补空格（[input.spacing]）。
+    #[serde(default)]
+    pub spacing: SpacingConfig,
     /// 标点配对（输入左括号自动补右括号 + 输右括号智能跳过）。
     #[serde(default)]
     pub auto_pair: AutoPairConfig,
@@ -4468,6 +4565,16 @@ pub struct InputConfig {
     /// 那正是判断「是不是误报」的依据。
     #[serde(default = "default_true")]
     pub password_force_english: bool,
+    /// 忽略软件（宿主）自己写 compartment 引起的中英切换，开和关两个方向都忽略。出厂关。
+    ///
+    /// 按应用的 compat.toml `ignore_host_ime_switch` 写了值就以它为准，没写才取本项。判据
+    /// （只认 compartment 来源、Ctrl 按住放行）见协调器 `host_ime_switch_ignored`。
+    ///
+    /// ⚠ 全局打开有代价：gvim 一类宿主依赖 OPENCLOSE 来保存/恢复中英，忽略后它们会失灵；
+    /// 按应用锁定中英的外部工具（KBLSwitch、AutoHotkey 脚本）写的也是 compartment，会被一并忽略。
+    /// 所以出厂关，只给用户自选；更推荐在「应用兼容性」里对出问题的软件单独开。
+    #[serde(default)]
+    pub ignore_host_ime_switch: bool,
     /// 联想（上屏后按上文推荐下一个词/标点）。默认关。
     #[serde(default)]
     pub association: AssociationConfig,
@@ -4521,6 +4628,7 @@ impl Default for InputConfig {
             default: InputDefaultConfig::default(),
             punct: PunctConfig::default(),
             symbol: SymbolConfig::default(),
+            spacing: SpacingConfig::default(),
             auto_pair: AutoPairConfig::default(),
             temp_english: TempEnglishConfig::default(),
             capslock: CapslockConfig::default(),
@@ -4539,6 +4647,7 @@ impl Default for InputConfig {
             top_commit_mode: TopCommitMode::default(),
             top_commit_learn: true,
             password_force_english: true,
+            ignore_host_ime_switch: false,
             association: AssociationConfig::default(),
             caret: CaretPlacementConfig::default(),
         }
@@ -4559,6 +4668,19 @@ pub struct PunctConfig {
     /// 参与"数字后智能英文标点"的标点集合。
     #[serde(default = "default_smart_punct_list")]
     pub smart_list: String,
+    /// 英文单词后的标点智能直出英文（`Node.js`、`a/b`、`snake_case`）。默认关。
+    ///
+    /// 「英文后」= 插入点前一字符是拉丁字母：空缓冲按标点时取客户端输入序列记账
+    /// （`KeyPayload.seq_char`），顶屏时取被顶出的那段文本的末字符。用户自己打了空格之后
+    /// 不再算英文后。与数字那一对互相独立（开关与集合各一份）。
+    #[serde(default)]
+    pub smart_after_latin: bool,
+    /// 参与「英文后智能英文标点」的标点集合（存键本身的 ASCII 标点）。
+    ///
+    /// 出厂刻意不含 `,;!?`：中文句子里英文词后接中文逗号很常见（「我用 Python，它……」）。
+    /// `.` 在内的代价是句末英文词后的句号也出 `.`，靠智能符号连按两次换回 `。`。
+    #[serde(default = "default_latin_smart_punct_list")]
+    pub latin_smart_list: String,
     /// 自定义标点映射开关。
     #[serde(default)]
     pub custom_enabled: bool,
@@ -4573,10 +4695,34 @@ impl Default for PunctConfig {
             follow_mode: false,
             smart_after_digit: true,
             smart_list: default_smart_punct_list(),
+            smart_after_latin: false,
+            latin_smart_list: default_latin_smart_punct_list(),
             custom_enabled: false,
             custom_mappings: HashMap::new(),
         }
     }
+}
+
+/// 中英 / 中数之间自动补空格（[input.spacing]）。设计见
+/// `docs/design/auto-spacing-and-latin-smart-punct.md`。
+///
+/// 只管**切换处**：空格是切换后那一笔上屏的前缀（`你好` → ` Hello`、`Hello` → ` 世界`），
+/// 交界一侧是标点、空白或不可知时一律不补。「上一笔末字符」来自客户端的输入序列记账
+/// （`KeyPayload.seq_char`），宿主光标碰巧停在哪个字后面不算。
+///
+/// 连续的英文之间不归这里管：英文词之间的空格是英文输入本身的 `schema.english.commit_space` /
+/// `input.temp_english.commit_space`（上屏时立即补尾随空格，之后接中文看到的是空格，不再补）。
+///
+/// 按应用关闭见 compat `[[apps]] auto_spacing = false`（自带 pangu 类空格处理的 Markdown
+/// 编辑器、终端）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpacingConfig {
+    /// 汉字与拉丁字母之间补空格（`中 en 中`）。默认关。
+    #[serde(default)]
+    pub cjk_latin: bool,
+    /// 汉字与数字之间补空格（`共 3 个`）。默认关。
+    #[serde(default)]
+    pub cjk_digit: bool,
 }
 
 /// 智能符号替换方案。两者是「体感」与「兼容性」的取舍，故都保留：
@@ -4848,7 +4994,7 @@ pub struct TempEnglishConfig {
     /// 英文段，其词库候选按本项投影（见 `Coordinator::mix_free_english_segment`）。
     #[serde(default = "default_true")]
     pub case_follow_input: bool,
-    /// 临英选词上屏后自动补一个空格。
+    /// 临英选词上屏后自动补一个空格。中文与英文之间的空格另见 [`SpacingConfig`]。
     ///
     /// 与 `schema.english.commit_space` 是**两个作用域各一份**，不是两个真相源 ——
     /// 同 [`Self::raw_candidate`] 那一对的理由：用户对「长时打英文」与「中文里插一个
@@ -4861,6 +5007,9 @@ pub struct TempEnglishConfig {
     ///
     /// ★ 也作用于**快捷输入里的英文**（A2-3b）：英文词库候选与所打原文上屏补空格，
     /// 中文候选与计算结果不补。判据见 `Coordinator::mix_candidate_is_english`。
+    ///
+    /// ★ 也作用于**中文方案主路径里的英文词库候选**（码表 / 拼音的英文混入）：同是「中文里
+    /// 插一个英文词」。原码与短语不补。判据见 `Coordinator::english_appends_space`。
     #[serde(default)]
     pub commit_space: bool,
     /// 临英下的词组分词输入（论坛 t42）：用 `'` 切开各段，每段只打前缀。**默认关**。
@@ -5141,6 +5290,9 @@ pub struct EmojiModuleEntry {
     pub user: bool,
     pub default_on: bool,
 }
+
+/// 宿主显式注入的 `(用户配置目录, 本地目录)`，见 [`Config::set_dir_override`]。
+static DIR_OVERRIDE: std::sync::RwLock<Option<(PathBuf, PathBuf)>> = std::sync::RwLock::new(None);
 
 // 跨 crate 的序列化 / 反序列化一律走下面这几个入口，别在下游直接 `value.try_into::<Config>()`
 // 或 `serde_json::to_value(cfg)`：release 不共享泛型，每个调用的 crate 都会把整棵配置类型树的
@@ -5923,24 +6075,24 @@ fn default_highlight_keys() -> Vec<String> {
 fn page_key_group_binds(group: &str) -> &'static [(&'static str, SessionAction)] {
     match group.trim().to_lowercase().as_str() {
         "pageupdown" => &[
-            ("pageup", SessionAction::PagePrev),
-            ("pagedown", SessionAction::PageNext),
+            ("pageup", SessionAction::PagePrev(PageOverflow::Global)),
+            ("pagedown", SessionAction::PageNext(PageOverflow::Global)),
         ],
         "minus_equal" => &[
-            ("minus", SessionAction::PagePrev),
-            ("equal", SessionAction::PageNext),
+            ("minus", SessionAction::PagePrev(PageOverflow::Global)),
+            ("equal", SessionAction::PageNext(PageOverflow::Global)),
         ],
         "brackets" => &[
-            ("lbracket", SessionAction::PagePrev),
-            ("rbracket", SessionAction::PageNext),
+            ("lbracket", SessionAction::PagePrev(PageOverflow::Global)),
+            ("rbracket", SessionAction::PageNext(PageOverflow::Global)),
         ],
         "comma_period" => &[
-            ("comma", SessionAction::PagePrev),
-            ("period", SessionAction::PageNext),
+            ("comma", SessionAction::PagePrev(PageOverflow::Global)),
+            ("period", SessionAction::PageNext(PageOverflow::Global)),
         ],
         "shift_tab" => &[
-            ("shift+tab", SessionAction::PagePrev),
-            ("tab", SessionAction::PageNext),
+            ("shift+tab", SessionAction::PagePrev(PageOverflow::Global)),
+            ("tab", SessionAction::PageNext(PageOverflow::Global)),
         ],
         _ => &[],
     }
@@ -6124,16 +6276,6 @@ pub struct OverflowConfig {
     /// 只有这两档——「只顶不出字」没有诉求。
     #[serde(default = "default_overflow_behavior")]
     pub page_key: String,
-    /// **按键级覆盖**（`page_key` 的默认档之上）：键名（wind-keys KEY_TABLE names，如
-    /// `comma` / `period` / `minus` / `equal` / `lbracket` / `rbracket`）→ 策略，值域与
-    /// [`Self::page_key`] 相同。未列出的键回落 `page_key`。
-    ///
-    /// 为什么要有这张表：全局档把 `- = , . [ ]` 一把抓，而有人只要「逗号翻不动时上屏」、
-    /// 其余翻页键**无效就是无效**——行为策略必须能落到单个按键上（GH#249）。键名写错 /
-    /// 值非法由加载期告警（`config_bundle` 的 `warn_unknown_page_key_overrides`）并忽略，
-    /// 不静默吃掉。
-    #[serde(default)]
-    pub page_key_overrides: BTreeMap<String, String>,
 }
 
 fn default_overflow_behavior() -> String {
@@ -6147,7 +6289,6 @@ impl Default for OverflowConfig {
             select_key: default_overflow_behavior(),
             select_char_key: default_overflow_behavior(),
             page_key: default_overflow_behavior(),
-            page_key_overrides: BTreeMap::new(),
         }
     }
 }
@@ -7493,6 +7634,10 @@ pub struct UiThemeConfig {
     pub name: String,
     #[serde(default)]
     pub style: String,
+    /// 播放主题动画（皮肤装饰的动图与事件切换）。关掉时装饰停在初始状态首帧；系统关了动画
+    /// 效果时同样不播。与上面两项不同，字段级缺省就是 true（没有旧版迁移要兜）。
+    #[serde(default = "default_true")]
+    pub animation: bool,
 }
 
 // 手写 Default：仅供 Config::default()（getDefaults/恢复本页）给出有效初值，
@@ -7502,6 +7647,7 @@ impl Default for UiThemeConfig {
         Self {
             name: "default".to_string(),
             style: "system".to_string(),
+            animation: true,
         }
     }
 }
@@ -7790,6 +7936,34 @@ impl Default for StatsConfig {
             speed_factor: default_speed_factor(),
         }
     }
+}
+
+// ───────────────────────── extensions（扩展程序）─────────────────────────
+
+/// 扩展程序（设计见 `docs/design/extension-hook-channel.md`）。扩展装在
+/// `<userdata>/extensions/<id>/`；这里只记总开关与每个扩展的启用状态、授予的档位。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtensionsConfig {
+    /// 总开关。关闭时核心不拉起扩展宿主，也不产出任何事件。
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub list: Vec<ExtensionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionEntry {
+    /// 扩展目录名。
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 授予的档位（`key.class` / `key.detail` / `mode` / `composition` / `candidates` /
+    /// `commit`）。扩展清单里申请的只是申请，以这里为准。
+    #[serde(default)]
+    pub granted: Vec<String>,
+    /// 扩展选项里用户改过的值（声明在扩展清单里，宿主按声明校验）。没存的取清单默认值。
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub options: serde_json::Map<String, serde_json::Value>,
 }
 
 // ───────────────────────── debug ─────────────────────────
@@ -8294,6 +8468,10 @@ fn default_sentence_count() -> u8 {
     1
 }
 
+fn default_codetable_sentence_grammar_weight() -> f64 {
+    0.5
+}
+
 fn default_true() -> bool {
     true
 }
@@ -8366,6 +8544,10 @@ fn default_commit_newline() -> String {
 
 fn default_smart_punct_list() -> String {
     ".,:".to_string()
+}
+
+fn default_latin_smart_punct_list() -> String {
+    "./_:@".to_string()
 }
 
 fn default_enter_behavior() -> String {
@@ -10094,6 +10276,23 @@ impl Config {
         crate::variant::app_dir_name()
     }
 
+    /// 宿主显式注入的 `(用户配置目录, 本地目录)`；没注入为 `None`（桌面恒如此）。
+    ///
+    /// 给没有「漫游 / 本地」known folder 的平台用（Android 由宿主传入：用户目录放在用户文件
+    /// 管理器可达的位置，缓存与日志留在私有目录）。优先于便携、`datadir.conf` 与系统目录，
+    /// 取代此前靠改 `XDG_*` 环境变量骗 `dirs` crate 的做法。
+    fn dir_override() -> Option<(PathBuf, PathBuf)> {
+        DIR_OVERRIDE.read().ok().and_then(|g| g.clone())
+    }
+
+    /// 注入用户配置目录与本地目录（见 [`Self::dir_override`]）。进程启动早期、读任何配置之前调用；
+    /// 重复调用以最后一次为准（测试用）。
+    pub fn set_dir_override(user: PathBuf, local: PathBuf) {
+        if let Ok(mut g) = DIR_OVERRIDE.write() {
+            *g = Some((user, local));
+        }
+    }
+
     /// 用户配置目录（config.toml / meta.toml / `data/` 下的全部用户数据 / 旧库 userdata.redb(.legacy)）。
     /// - 便携模式：`<exe目录>/userdata/`
     /// - 自定义数据目录（安装向导选定，落 `datadir.conf`）：该目录本身
@@ -10102,6 +10301,9 @@ impl Config {
     /// 三者优先级即上述顺序。注意自定义目录**只影响本函数**——`local_dir()` 系
     /// （cache / logs / state.toml）不跟随，详见 `variant::custom_userdata_dir`。
     pub fn user_config_dir() -> Option<PathBuf> {
+        if let Some((user, _)) = Self::dir_override() {
+            return Some(user);
+        }
         if crate::variant::is_portable() {
             return crate::variant::portable_userdata_dir();
         }
@@ -10147,6 +10349,10 @@ impl Config {
                 Some(d) => UserConfigProbe::Portable(d),
                 None => UserConfigProbe::RoamingUnavailable,
             };
+        }
+        // 宿主显式指定的目录（移动端）同样不经漫游 known folder，恒就绪。
+        if let Some((user, _)) = Self::dir_override() {
+            return UserConfigProbe::CustomDir(user);
         }
         // 自定义目录同样绕开漫游 known folder，恒就绪——若漏了这一支，配置已指向
         // 自定义目录、探测却仍盯着漫游根，就会出现「等一个根本不用的目录」的错配。
@@ -10746,6 +10952,9 @@ impl Config {
     /// 两者曾经收敛到 `userdata/`，于是备份用户数据要连带拖走上百 MB 的缓存与日志
     /// （论坛 t120）。分家的完整理由见 [`crate::variant::portable_localdata_dir`]。
     pub fn local_dir() -> Option<PathBuf> {
+        if let Some((_, local)) = Self::dir_override() {
+            return Some(local);
+        }
         if crate::variant::is_portable() {
             crate::variant::portable_localdata_dir()
         } else {
@@ -11609,8 +11818,8 @@ mod tests {
     #[test]
     fn only_navigation_actions_require_candidates() {
         for a in [
-            SessionAction::PagePrev,
-            SessionAction::PageNext,
+            SessionAction::PagePrev(PageOverflow::Global),
+            SessionAction::PageNext(PageOverflow::Global),
             SessionAction::HighlightUp,
             SessionAction::HighlightDown,
         ] {
@@ -15143,6 +15352,36 @@ mod status_position_tests {
             ..Default::default()
         };
         assert_eq!(bad.reverse_wildcard_char(), 'z');
+    }
+}
+
+#[cfg(test)]
+mod page_overflow_tests {
+    use super::*;
+
+    /// `page_prev|page_next[:commit_and_input|ignore]` 往返；跟随全局档不带后缀；写错的载荷
+    /// 不静默降级成普通翻页（那会让「配了没生效」无从察觉）。
+    #[test]
+    fn page_payload_round_trips() {
+        for (v, want) in [
+            ("page_prev", SessionAction::PagePrev(PageOverflow::Global)),
+            (
+                "page_prev:commit_and_input",
+                SessionAction::PagePrev(PageOverflow::CommitAndInput),
+            ),
+            (
+                "page_next:ignore",
+                SessionAction::PageNext(PageOverflow::Ignore),
+            ),
+        ] {
+            assert_eq!(SessionAction::parse(v), want, "{v}");
+            assert_eq!(want.to_string(), v, "{v} 应原样写回");
+        }
+        assert_eq!(
+            SessionAction::parse("page_prev:commit"),
+            SessionAction::None
+        );
+        assert_eq!(SessionAction::parse("page_next:"), SessionAction::None);
     }
 }
 

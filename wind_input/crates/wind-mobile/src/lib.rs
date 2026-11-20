@@ -37,8 +37,6 @@
 //!   于是候选栏的滚动也没有意义（一帧才 6~9 条）。桌面鼠标点选走 push 通道上屏，
 //!   headless 没有消费端，所以这里改走「返回编辑指令流」，与 `key_down` 同一种形状。
 //!
-//! 骨架期已知妥协（均有 TODO 标注）：目录经 XDG 环境变量挂载。
-//!
 //! # 工具栏与功能菜单的呈现不属于这一层
 //!
 //! 桌面那棵功能菜单树（截图、打开日志目录、诊断 HUD、语言栏图标调试…）大半在手机上
@@ -297,13 +295,14 @@ pub struct SchemaDictInfo {
 /// 候选长按菜单的一项（桌面候选右键菜单在手机上的对应物）。
 ///
 /// 只出可点的叶子：桌面菜单里的分隔线 / 标题行是绘制用的，命令项不会出现在候选菜单里；
-/// 子菜单（目前候选菜单没有）会被摊平成同级项。
+/// 子菜单（「固定到第 N 位」）会被摊平成同级项。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidateMenuItem {
-    /// 文案，与桌面同一候选的右键菜单逐字一致（如「隐藏候选」「设为生僻字」）
+    /// 文案，与桌面同一候选的右键菜单逐字一致（如「屏蔽该词」「设为生僻字」）
     pub label: String,
-    /// `"move_top"` | `"move_up"` | `"move_down"` | `"delete"` | `"reset"` |
-    /// `"toggle_common"` | `"copy"`。原样回传给 [`MobileCore::candidate_menu_run`]。
+    /// `"move_top"` | `"move_up"` | `"move_down"` | `"pin_at_N"`（N 为 1 起的名次）| `"delete"` |
+    /// `"hide_here"` | `"reset"` | `"toggle_common"` | `"copy"`。原样回传给
+    /// [`MobileCore::candidate_menu_run`]。
     pub action: String,
     /// 灰显项照样列出：用户要看得出「这条不能调」，而不是以为菜单少了一项
     pub enabled: bool,
@@ -323,24 +322,50 @@ pub struct InstalledSchema {
 pub use wind_coordinator::handle_tooltip::CandidateTooltipSection;
 
 /// [`CandidateMenuItem::action`] 与词条操作的对照。`copy` 不在此表——复制由宿主自己写剪贴板。
-const CANDIDATE_MENU_ACTIONS: [(&str, CandidateOp); 6] = [
+/// 「固定到第 N 位」不在表里，动作名是 `pin_at_N`（见 [`candidate_menu_action`]）。
+const CANDIDATE_MENU_ACTIONS: [(&str, CandidateOp); 7] = [
     ("move_top", CandidateOp::MoveTop),
     ("move_up", CandidateOp::MoveUp),
     ("move_down", CandidateOp::MoveDown),
     ("delete", CandidateOp::Delete),
+    ("hide_here", CandidateOp::HideHere),
     ("reset", CandidateOp::Reset),
     ("toggle_common", CandidateOp::ToggleCommon),
 ];
+
+/// 移动端「固定到第 N 位」的 N 上限（扁平化时截掉其余子项）。
+const MOBILE_PIN_AT_MAX: u8 = 9;
+
+/// 词条操作 → 动作名。
+fn candidate_menu_action(op: CandidateOp) -> Option<String> {
+    if let CandidateOp::PinAt(n) = op {
+        return Some(format!("pin_at_{n}"));
+    }
+    CANDIDATE_MENU_ACTIONS
+        .iter()
+        .find(|(_, o)| *o == op)
+        .map(|(a, _)| (*a).to_string())
+}
+
+/// 动作名 → 词条操作（`copy` 与未知名 → None）。
+fn candidate_menu_op(action: &str) -> Option<CandidateOp> {
+    if let Some(n) = action.strip_prefix("pin_at_") {
+        return n.parse().ok().map(CandidateOp::PinAt);
+    }
+    CANDIDATE_MENU_ACTIONS
+        .iter()
+        .find(|(a, _)| *a == action)
+        .map(|&(_, op)| op)
+}
 
 /// 把桌面菜单树压成移动端的扁平列表：只留 Op 与 Copy 叶子，子菜单摊平。
 fn flatten_candidate_menu(items: &[MenuItemSpec], out: &mut Vec<CandidateMenuItem>) {
     for item in items {
         let action = match item.kind {
-            MenuKind::Op(op) => CANDIDATE_MENU_ACTIONS
-                .iter()
-                .find(|(_, o)| *o == op)
-                .map(|(a, _)| *a),
-            MenuKind::Copy => Some("copy"),
+            // 长按菜单是扁平列表，「第 N 位」只列到 9，免得一屏全是它（桌面子菜单仍到 20）。
+            MenuKind::Op(CandidateOp::PinAt(n)) if n > MOBILE_PIN_AT_MAX => None,
+            MenuKind::Op(op) => candidate_menu_action(op),
+            MenuKind::Copy => Some("copy".to_string()),
             MenuKind::Submenu => {
                 flatten_candidate_menu(&item.children, out);
                 None
@@ -348,9 +373,14 @@ fn flatten_candidate_menu(items: &[MenuItemSpec], out: &mut Vec<CandidateMenuIte
             MenuKind::Command(_) | MenuKind::Separator | MenuKind::Label => None,
         };
         if let Some(action) = action {
+            // 桌面子项「第 3 位」挂在「固定到第 N 位」下；摊平后没有父项，文案补全。
+            let label = match item.kind {
+                MenuKind::Op(CandidateOp::PinAt(n)) => format!("固定到第 {n} 位"),
+                _ => item.label.clone(),
+            };
             out.push(CandidateMenuItem {
-                label: item.label.clone(),
-                action: action.to_string(),
+                label,
+                action,
                 enabled: item.enabled,
             });
         }
@@ -417,15 +447,18 @@ impl MobileCore {
     /// 构造核心。
     ///
     /// - `data_dir`: 出厂数据目录（`schemas/` 所在，Android 上即 filesDir/data）
-    /// - `user_root`: 用户/缓存数据根（Android 上即 filesDir/rust，内部分 config/data/cache）
+    /// - `user_root`: 用户目录（核心的「用户配置目录」：config.toml、schemas/、用户词库…，
+    ///   布局同桌面；Android 上放 `Android/data/<包名>/files`，用户可经文件管理器直接编辑）
+    /// - `local_root`: 本地目录（词库编译缓存与日志，可再生，不进用户视野；Android 上在私有 filesDir 下）
     /// - `fallback_schema`: **首装兜底**方案 id；用户上次选过的优先，见下方说明
     pub fn new(
         data_dir: &Path,
         user_root: &Path,
+        local_root: &Path,
         fallback_schema: &str,
         sink: Arc<dyn MobileEventSink>,
     ) -> Arc<Self> {
-        mount_dirs(data_dir, user_root);
+        mount_dirs(data_dir, user_root, local_root);
 
         // 四层配置加载（代码默认 ⊕ data/config.toml ⊕ data_custom/config.toml ⊕ 用户层），
         // 与桌面同一条路径——移动端没有定制版包时 L2.5 自然缺席，不需要分支——
@@ -756,7 +789,7 @@ impl MobileCore {
     /// 暂停学习（[`Self::set_learning_suspended`]）不拦这里：那是「别从输入里偷偷学」，
     /// 而这些是用户点名的显式编辑。
     pub fn candidate_menu_run(&self, index: usize, action: &str) -> bool {
-        let Some(&(_, op)) = CANDIDATE_MENU_ACTIONS.iter().find(|(a, _)| *a == action) else {
+        let Some(op) = candidate_menu_op(action) else {
             return false;
         };
         let offered = self
@@ -962,6 +995,16 @@ impl MobileCore {
     /// 打开 / 关闭一段候选提示（如「拆字」）。只写盘，生效要另发 [`MobileCommand::ReloadConfig`]。
     pub fn set_tooltip_section_enabled(&self, label: &str, on: bool) -> Result<(), String> {
         config_api::set_tooltip_section_enabled(&self.data_dir, label, on)
+    }
+
+    /// 快捷输入的候选来源：当前与出厂成员序（见 [`config_api::quick_mix_members`]）。
+    pub fn quick_mix_members(&self) -> config_api::QuickMixMembers {
+        config_api::quick_mix_members(&self.data_dir)
+    }
+
+    /// 整列写回快捷输入的候选来源。只写盘，生效要另发 [`MobileCommand::ReloadConfig`]。
+    pub fn set_quick_mix_members(&self, members: Vec<String>) -> Result<(), String> {
+        config_api::set_quick_mix_members(&self.data_dir, members)
     }
 
     // ── 输入统计（设置页「统计」）────────────────────────────────────
@@ -1185,6 +1228,13 @@ impl MobileCore {
         Ok(n as u64)
     }
 
+    /// 用户正在操作联想候选（手指按在候选条上、展开面板开着、长按菜单弹着）：
+    /// `true` 暂停联想的自动隐藏，`false` 结束操作、重新计满 `hide_after_ms`。
+    /// 不在联想态时无操作。见 `Coordinator::assoc_hold`。
+    pub fn assoc_hold(&self, hold: bool) {
+        self.coord.assoc_hold(hold);
+    }
+
     /// 联想学习数据的条数（联想里选过的词 + 学到的「下一词」），所有方案合计。
     pub fn assoc_history_count(&self) -> u64 {
         use wind_coordinator::web_host::WebDataHost;
@@ -1392,10 +1442,11 @@ impl MobileCore {
 /// 移动端词库页不提供权重输入（手机上没人会去调它），故固定取这个值。
 pub const USER_WORD_ADD_WEIGHT: i32 = 1200;
 
-/// 把用户目录与**安装根**钉进 App 私有路径。
+/// 把用户目录、本地目录与**安装根**钉到宿主给的路径。
 ///
-/// TODO(上游): wind-config 支持显式目录注入后移除环境变量挂载。
-/// `dirs` crate 在 unix 系按 XDG 变量解析，移动端进程私有目录不在默认位置上。
+/// 用户目录（`user_root`）= 核心的「用户配置目录」，config.toml / schemas / 用户词库都在里面，
+/// 布局与桌面一致；本地目录（`local_root`）放缓存与日志。两者经
+/// `Config::set_dir_override` 显式注入，不再靠改 `XDG_*` 环境变量骗 `dirs` crate。
 ///
 /// # 为什么安装根也必须钉
 ///
@@ -1422,20 +1473,15 @@ pub const USER_WORD_ADD_WEIGHT: i32 = 1200;
 /// 安装根指到别处。移动端没有这个前提——`current_exe()` 是 `/system/bin/app_process64`，
 /// 与 App 私有目录毫无关系，不设它就没有任何正确答案。
 ///
-/// 这与上面那三个 XDG 变量属于同一件事，共用同一个上游 TODO：**wind-config 支持显式
-/// 目录注入后，这四行一起删掉**。在那之前，移动端进程只有本函数一个写入方，
-/// 也只有一个核心实例，不存在两处争抢的问题。
+/// 移动端进程只有本函数一个写入方，也只有一个核心实例，不存在两处争抢的问题。
 ///
 /// 顺带确认过的一个连带风险：`is_portable()` 也读这个根，判据是根目录下有
 /// `portable_mode` 标记文件。App 私有的 `filesDir` 下只有 `data`/`user`/`rust`
 /// 三个目录，不会有这个文件；真有的话用户配置会改落 `filesDir/userdata`。
-fn mount_dirs(data_dir: &Path, user_root: &Path) {
-    let root = user_root.display();
+fn mount_dirs(data_dir: &Path, user_root: &Path, local_root: &Path) {
+    Config::set_dir_override(user_root.to_path_buf(), local_root.to_path_buf());
     unsafe {
-        std::env::set_var("HOME", user_root);
-        std::env::set_var("XDG_CONFIG_HOME", format!("{root}/config"));
-        std::env::set_var("XDG_DATA_HOME", format!("{root}/data"));
-        std::env::set_var("XDG_CACHE_HOME", format!("{root}/cache"));
+        std::env::set_var("HOME", local_root);
     }
     match (data_dir.file_name(), data_dir.parent()) {
         (Some(name), Some(install_root)) if name == "data" => unsafe {
@@ -1563,6 +1609,7 @@ fn dispatch_key(coord: &Coordinator, vk: u32, modifiers: u32) -> BridgeKeyAction
         toggles: 0,
         event_seq: 0,
         prev_char: 0,
+        seq_char: 0,
     })
 }
 
@@ -2061,6 +2108,12 @@ mod candidate_menu_tests {
     fn flatten_keeps_op_and_copy_leaves_and_inlines_submenus() {
         let items = vec![
             MenuItemSpec::leaf("置顶", MenuKind::Op(CandidateOp::MoveTop), false, false),
+            MenuItemSpec::leaf(
+                "在此编码下隐藏",
+                MenuKind::Op(CandidateOp::HideHere),
+                true,
+                false,
+            ),
             MenuItemSpec::separator(),
             MenuItemSpec::label("标题"),
             MenuItemSpec::leaf(
@@ -2093,9 +2146,67 @@ mod candidate_menu_tests {
             got,
             [
                 ("置顶", "move_top", false),
+                ("在此编码下隐藏", "hide_here", true),
                 ("设为生僻字", "toggle_common", true),
                 ("复制", "copy", true),
             ]
+        );
+    }
+
+    /// 「固定到第 N 位」子菜单摊平成 `pin_at_N`，文案补全；动作名能解析回原操作。
+    #[test]
+    fn pin_at_submenu_flattens_to_pin_at_n() {
+        let items = vec![MenuItemSpec::submenu(
+            "固定到第 N 位",
+            vec![
+                MenuItemSpec::leaf("第 1 位", MenuKind::Op(CandidateOp::PinAt(1)), true, false),
+                MenuItemSpec::leaf("第 2 位", MenuKind::Op(CandidateOp::PinAt(2)), false, false),
+            ],
+        )];
+        let mut out = Vec::new();
+        flatten_candidate_menu(&items, &mut out);
+        let got: Vec<(&str, &str, bool)> = out
+            .iter()
+            .map(|i| (i.label.as_str(), i.action.as_str(), i.enabled))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("固定到第 1 位", "pin_at_1", true),
+                ("固定到第 2 位", "pin_at_2", false),
+            ]
+        );
+        for n in 1..=wind_ui_types::PIN_AT_MAX {
+            let op = CandidateOp::PinAt(n);
+            assert_eq!(
+                candidate_menu_action(op)
+                    .as_deref()
+                    .and_then(candidate_menu_op),
+                Some(op)
+            );
+        }
+        assert_eq!(candidate_menu_op("pin_at_x"), None);
+    }
+
+    /// 移动端只摊平前 9 个「第 N 位」。
+    #[test]
+    fn pin_at_capped_to_nine_on_mobile() {
+        let kids = (1..=12)
+            .map(|n| {
+                MenuItemSpec::leaf(
+                    format!("第 {n} 位"),
+                    MenuKind::Op(CandidateOp::PinAt(n)),
+                    true,
+                    false,
+                )
+            })
+            .collect();
+        let mut out = Vec::new();
+        flatten_candidate_menu(&[MenuItemSpec::submenu("固定到第 N 位", kids)], &mut out);
+        let got: Vec<&str> = out.iter().map(|i| i.action.as_str()).collect();
+        assert_eq!(
+            got,
+            (1..=9).map(|n| format!("pin_at_{n}")).collect::<Vec<_>>()
         );
     }
 

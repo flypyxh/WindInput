@@ -265,6 +265,10 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.wildcard", Bool),
     f("schema.codetable.wildcard_key", Str),
     f("schema.codetable.wildcard_single_only", Bool),
+    f("schema.codetable.sentence_count", Int),
+    f("schema.codetable.sentence_max_count", Int),
+    f("schema.codetable.sentence_cycle_key", Str),
+    f("schema.codetable.sentence_grammar_weight", Float),
     // 码元字符集：范围+字面的自由文本（如 `a-x/`、`a-z0-9`），值域无法枚举故用 Str；
     // 解析与非法回落见 `CodeCharSet`。空 = 内置默认 `a-z`。
     f("schema.codetable.input_chars", Str),
@@ -469,8 +473,12 @@ static REGISTRY: &[ConfigField] = &[
     f("input.punct.follow_mode", Bool),
     f("input.punct.smart_after_digit", Bool),
     f("input.punct.smart_list", Str),
+    f("input.punct.smart_after_latin", Bool),
+    f("input.punct.latin_smart_list", Str),
     f("input.punct.custom_enabled", Bool),
     f("input.punct.custom_mappings", Map(&[])),
+    f("input.spacing.cjk_latin", Bool),
+    f("input.spacing.cjk_digit", Bool),
     f("input.symbol.smart_mode", Bool),
     f("input.symbol.smart_timeout_ms", Int),
     f("input.symbol.smart_chars", Str),
@@ -589,6 +597,8 @@ static REGISTRY: &[ConfigField] = &[
     f("input.top_commit_learn", Bool),
     // 密码框强制英文（内部配置，入口是高级菜单）
     f("input.password_force_english", Bool),
+    // 忽略软件写 compartment 引起的中英切换（按应用覆盖见 compat.toml 同名字段）
+    f("input.ignore_host_ime_switch", Bool),
     // 联想。kind 兼任开关与类型（"off" 即关）。本段是**桌面基线**，移动端的差异走
     // [mobile.association]——值域里不留平台哨兵。
     f("input.association.kind", Enum(&["off", "word", "smart"])),
@@ -644,7 +654,6 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.overflow.select_char_key", Enum(OVERFLOW_VALUES)),
     f("keys.overflow.page_key", Enum(PAGE_KEY_OVERFLOW_VALUES)),
     // 按键级覆盖（键名 → 策略），整体一张表；设置端编辑控件另案，先用配置文件。
-    f("keys.overflow.page_key_overrides", Map(&[])),
     // -- ui（外观）--
     f("ui.candidate.per_page", Int),
     f("ui.candidate.per_page_extended", Int),
@@ -731,6 +740,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.font.scripts", Map(FONT_SCRIPT_KEYS)),
     f("ui.theme.name", Str),
     f("ui.theme.style", Str),
+    f("ui.theme.animation", Bool),
     f("ui.mode_indicator.style", Enum(&["short", "full", "none"])),
     f("ui.tooltip.enabled", Bool),
     f("ui.tooltip.delay", Int),
@@ -798,6 +808,9 @@ static REGISTRY: &[ConfigField] = &[
     f("stats.enabled", Bool),
     f("stats.track_english", Bool),
     f("stats.speed_factor", Float),
+    // -- extensions（扩展程序）--
+    f("extensions.enabled", Bool),
+    f("extensions.list", StructList),
     // -- debug（调试）--
     // `off` = 整个日志功能关闭：主日志文件不创建，连 `startup_stage.log` 也不写
     // （见 startup_trace::disabled）。它排在最前是因为值域按"由关到详"排。
@@ -1198,6 +1211,22 @@ pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static st
         (
             "schema.codetable.wildcard_single_only",
             ct.wildcard_single_only.is_some(),
+        ),
+        (
+            "schema.codetable.sentence_count",
+            ct.sentence_count.is_some(),
+        ),
+        (
+            "schema.codetable.sentence_max_count",
+            ct.sentence_max_count.is_some(),
+        ),
+        (
+            "schema.codetable.sentence_cycle_key",
+            ct.sentence_cycle_key.is_some(),
+        ),
+        (
+            "schema.codetable.sentence_grammar_weight",
+            ct.sentence_grammar_weight.is_some(),
         ),
         // 码元字符集用空串表达「未设置」（见 `CodetableGlobal::resolved`）。
         ("schema.codetable.input_chars", !ct.input_chars.is_empty()),
@@ -1929,6 +1958,8 @@ mod tests {
         "ui.comment.assign.type",
         "ui.comment.assign.schema",
         "ui.comment.assign.mode",
+        // 扩展列表：同上，**出厂为空数组**，条目随用户安装的扩展增减。
+        "extensions.list",
     ];
 
     /// `data/config.toml` 必须显式列出注册表里的每一个键（豁免名单除外）。

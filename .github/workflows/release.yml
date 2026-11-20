@@ -2,7 +2,7 @@ name: Release
 
 # 三平台发布。两种触发:
 #   - push tag v*        → 产出草稿 Release(附 Windows Setup.exe/Portable.zip + macOS .pkg
-#                          + Linux .deb(amd64/arm64) + .sha256)
+#                          + Linux .deb(amd64/arm64) + 试验性 .rpm(x86_64/aarch64) + .sha256)
 #   - workflow_dispatch  → 只产出可测 artifact(不发 Release),供合并前多平台实测
 #
 # 作业编排(为什么是多个 job 而不是一个):
@@ -10,7 +10,7 @@ name: Release
 #                    手动触发时因 sha 截取口径漂移而产出对不上号的几套文件名。
 #   build-windows  → windows-2022 原生 MSVC,产 Setup.exe + Portable.zip
 #   build-macos    → macos-26,产通用二进制(arm64+x86_64) .pkg
-#   build-linux    → 调 linux-build.yml:ubuntu-22.04 / 22.04-arm 原生 runner 各产一个 .deb。
+#   build-linux    → 调 linux-build.yml:ubuntu-22.04 / 22.04-arm 原生 runner 各产一个 .deb,另在 Fedora 容器里打 .rpm(试验性,失败只告警)。
 #                    与 Windows / macOS 同等对待:**任一平台失败都不建草稿**,三平台同版同发。
 #                    想先单独发 Linux 包 / 补包:release-linux.yml(手动触发,填本 tag)。
 #   publish        → 汇总三个平台的 artifact,建**一个**草稿 Release
@@ -31,7 +31,10 @@ name: Release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch: {}     # 手动触发:走完整打包,只产出可测 artifact,不发 Release
+  # 手动触发:走完整打包,只产出可测 artifact,不发 Release。
+  # 发版前在 main 上先跑一次,可预热 rust-cache(缓存按 ref 隔离,tag 只读得到 main 的缓存,
+  # 否则发版冷编译,Windows 多约 8 分钟、macOS 多约 4 分钟)。
+  workflow_dispatch: {}
 
 permissions:
   contents: read            # 默认只读;仅 publish job 提权到 write
@@ -106,6 +109,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          # 只在 main 上保存:tag 运行存的缓存别人读不到,白花约 40 秒(见文件头 workflow_dispatch 注释)
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             WindInput/wind_input
             wind-installer
@@ -136,7 +141,7 @@ jobs:
       #
       # 为什么不能让本机只对上面那两个成品补签:签名夹在打包中间 —— PE 要在封进压缩块
       # 之前签,Setup.exe 要在 pack 之后、New-UpdateManifest 之前签。对成品补签只签得到
-      # 外壳,包内 5 个 PE 仍是全裸的,而 signtool verify 验 Setup.exe 照样通过 ——
+      # 外壳,包内 6 个 PE 仍是全裸的,而 signtool verify 验 Setup.exe 照样通过 ——
       # 从外面完全看不出来(实测踩过,见 dev.ps1 Do-Installer 第 2.5 步)。
       #
       # 带上安装器三件套是为了本机【一行代码都不编译】:Do-Installer 见它们已在就给
@@ -206,6 +211,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          # 只在 main 上保存:tag 运行存的缓存别人读不到,白花约 40 秒(见文件头 workflow_dispatch 注释)
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             WindInput/wind_input
             wind-ui-rust
@@ -349,6 +356,10 @@ jobs:
           for a in amd64 arm64; do
             [ -f "dist/WindInput-${BUILD_VERSION}-linux-${a}.deb" ] || { echo "缺产物: linux-${a}.deb" >&2; exit 1; }
           done
+          # rpm 是试验性产物(linux-build.yml 的 rpm 任务 continue-on-error):缺了只告警,不拦发布
+          for a in x86_64 aarch64; do
+            [ -f "dist/WindInput-${BUILD_VERSION}-linux-${a}.rpm" ] || echo "::warning::缺 linux-${a}.rpm(rpm 任务失败?Release 将不带该 rpm)"
+          done
 
       # Windows 产物在 CI 上【必然未签名】—— 云签名的会话要做二次验证、只活 2 小时、
       # 还需要一个本地客户端进程,托管 runner 上做不到。详见 docs/design/code-signing.md。
@@ -387,7 +398,7 @@ jobs:
             echo "> 发布前请在开发机上执行(需先建立签名会话):"
             echo "> \`.\\scripts\\release.ps1 sign-draft\`"
             echo "> 它会拉本次 CI 的中转产物, 在本机签名并【重新打包】(签名夹在打包中间,"
-            echo "> 对成品补签只签得到外壳, 包内 5 个 PE 仍是全裸的), 覆盖本页 4 个资产,"
+            echo "> 对成品补签只签得到外壳, 包内 6 个 PE 仍是全裸的), 覆盖本页 4 个资产,"
             echo "> 最后自动删掉这段提示。"
             echo ">"
             echo "> 为什么 CI 签不了:docs/design/code-signing.md 第 3 节。"

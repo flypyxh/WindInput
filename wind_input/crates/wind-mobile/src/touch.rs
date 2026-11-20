@@ -118,7 +118,7 @@ impl MobileCore {
             && self.candidates(0, 1).total > 0
         {
             if self.coord.is_composing() {
-                if !self.coord.latin_input() {
+                if !self.coord.latin_input() && !self.digits_are_input() {
                     // 中文组码：首选上屏，再出数字（同打标点）。不清 auto_spaced（Kotlin 在此直接返回）
                     let mut out = self.select_candidate_plain(0);
                     let ops = vec![EditOp::Commit(d.to_string())];
@@ -127,7 +127,7 @@ impl MobileCore {
                     out.consumed = true;
                     return out;
                 }
-                // 英文组码：数字是词的一部分，交给引擎
+                // 英文组码 / 数字属于输入的模式：数字是缓冲的一部分，交给引擎
             } else {
                 // 联想态：先收起联想，再走引擎
                 leading = Some(self.key_down(keymap::VK_ESCAPE, 0));
@@ -145,6 +145,44 @@ impl MobileCore {
                 first
             }
         }
+    }
+
+    /// 宿主的「原样上屏」键（九宫数字页的数字、句点、左列符号，123 层的半角句点）。
+    ///
+    /// 这些键平时绕过引擎：中文模式下句点不能变「。」，有编码时数字不能变成选词。但在
+    /// 文本缓冲模式（见 [`Self::digits_are_input`]，如快捷输入的 `;12+3`）里它们是缓冲的
+    /// 一部分，这里照触摸字符键交给引擎。其余情况返回 `consumed == false`、`ops` 为空，
+    /// 宿主维持原样上屏（有编码先顶首选）。只收单个字符，多字符项一律原样上屏。
+    pub fn press_literal(&self, text: &str) -> KeyOutcome {
+        let mut chars = text.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return KeyOutcome::passthrough();
+        };
+        if !self.digits_are_input() {
+            return KeyOutcome::passthrough();
+        }
+        self.engine_press(
+            PressKey::Char {
+                ch: c,
+                shifted: false,
+            },
+            Some(c),
+            KeySource::Touch,
+        )
+    }
+
+    /// 当前模式的缓冲是**文本**而不是编码，数字由引擎自己判定是入缓冲还是选词：
+    /// 快捷输入等融合模式（`;12+3`，算式透镜下数字是输入）、临时英文（`win10`）、
+    /// 网址 / 邮箱（原样累积）、Unicode（十六进制码点）。
+    ///
+    /// 这些模式里候选一进来就有（快捷输入的「重复上屏」），触摸数字若照普通组码
+    /// 「首选上屏 + 数字」，进快捷输入后上滑数字就把重复候选顶上屏了（真机反馈）。
+    /// 编码类模式（临时拼音、特殊码表、生僻字、反查、辅助码）数字不是合法编码，维持原状。
+    fn digits_are_input(&self) -> bool {
+        matches!(
+            self.coord.debug_active_mode(),
+            Some("mix" | "temp_english" | "url" | "email" | "unicode")
+        )
     }
 
     /// 对应 Kotlin `engineKey`：句末标点换位、清标记、翻译 VK、进引擎、英文空格补空格
@@ -171,7 +209,7 @@ impl MobileCore {
         }
         self.auto_spaced.store(false, Ordering::Relaxed);
 
-        let Some((vk, modifiers)) = to_vk(key, english) else {
+        let Some((vk, modifiers)) = to_vk(key) else {
             return KeyOutcome::passthrough();
         };
         // 触摸 `;` 默认不是引导键：压制期间核心按「该键未绑定」处理（空码出标点，
@@ -202,7 +240,7 @@ impl MobileCore {
 }
 
 /// 对应 Kotlin `RustSession.toVk`。`None` = 不进引擎（宿主走默认行为）
-fn to_vk(key: PressKey, english: bool) -> Option<(u32, u32)> {
+fn to_vk(key: PressKey) -> Option<(u32, u32)> {
     const SHIFT: u32 = wind_host::Modifiers::SHIFT;
     match key {
         PressKey::Space => Some((keymap::VK_SPACE, 0)),
@@ -210,10 +248,9 @@ fn to_vk(key: PressKey, english: bool) -> Option<(u32, u32)> {
         PressKey::Enter => Some((keymap::VK_RETURN, 0)),
         PressKey::Char { ch, shifted } => match ch {
             'a'..='z' if !shifted => Some((0x41 + (ch as u32 - 'a' as u32), 0)),
-            // 英文方案：大写字母也进组合（句首自动大写后补全不能断）
-            'a'..='z' if english => Some((0x41 + (ch as u32 - 'a' as u32), SHIFT)),
-            // 中文方案：Shift 态大写字母绕过引擎直输（引擎的 Shift+字母 是「临时英文」语义）
-            'a'..='z' => None,
+            // Shift 态字母一律进引擎：英文方案里进组合（句首自动大写后补全不能断）；
+            // 中文方案里由 `input.temp_english.shift_behavior` 定——进临时英文（出厂）或直接上屏大写
+            'a'..='z' => Some((0x41 + (ch as u32 - 'a' as u32), SHIFT)),
             _ => us_layout_vk(ch).map(|(vk, shift)| (vk, if shift { SHIFT } else { 0 })),
         },
     }
@@ -316,21 +353,38 @@ mod tests {
         assert!(m.coord.is_composing());
     }
 
+    fn shifted_a() -> PressKey {
+        PressKey::Char {
+            ch: 'a',
+            shifted: true,
+        }
+    }
+
+    /// 出厂：中文方案里 Shift+字母进临时英文（与电脑版一致）
     #[test]
-    fn shifted_letter_passes_through_in_chinese() {
+    fn shifted_letter_enters_temp_english_in_chinese() {
         let Some((m, _rx)) = core("shiftzh", "wubi86", |_| {}) else {
             return;
         };
-        let out = m.press(
-            PressKey::Char {
-                ch: 'a',
-                shifted: true,
-            },
-            KeySource::Touch,
+        let out = m.press(shifted_a(), KeySource::Touch);
+        assert!(out.consumed, "{out:?}");
+        assert!(m.coord.is_composing());
+    }
+
+    /// `shift_behavior = direct_commit`：不进临时英文，直接上屏大写字母
+    #[test]
+    fn shifted_letter_direct_commit_when_configured() {
+        let Some((m, _rx)) = core("shiftdc", "wubi86", |c| {
+            c.input.temp_english.shift_behavior = "direct_commit".into();
+        }) else {
+            return;
+        };
+        let out = m.press(shifted_a(), KeySource::Touch);
+        assert!(!m.coord.is_composing(), "{out:?}");
+        assert!(
+            out.ops.contains(&commit("A")) || !out.consumed,
+            "要么引擎上屏 A，要么交回宿主直输：{out:?}"
         );
-        assert!(!out.consumed);
-        assert!(out.ops.is_empty());
-        assert!(!m.coord.is_composing());
     }
 
     #[test]
@@ -763,5 +817,101 @@ mod tests {
         let out = m.press(ch(';'), KeySource::Touch);
         assert!(out.consumed);
         assert!(out.ops.contains(&commit(&second)), "ops={:?}", out.ops);
+    }
+
+    // ---- 快捷输入等「数字属于输入」的模式：触摸数字进缓冲 ----
+
+    /// 组合区文本（最后一条 SetComposition）
+    fn composition(out: &KeyOutcome) -> Option<String> {
+        out.ops.iter().rev().find_map(|o| match o {
+            EditOp::SetComposition { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn touch_digit_enters_quick_input_buffer_with_repeat_candidate() {
+        let Some((m, _rx)) = core("quick_digit", "wubi86", no_assoc) else {
+            return;
+        };
+        m.set_touch_quick_trigger(true);
+        // 先上屏一个字：快捷输入一进来就有「重复上屏」候选（真机反馈的触发条件）
+        type_str(&m, "wqvb");
+        m.press(PressKey::Space, KeySource::Touch);
+        m.press(ch(';'), KeySource::Touch);
+        assert!(
+            m.candidates(0, 1).total > 0,
+            "前提：快捷输入里有重复上屏候选"
+        );
+        let mut last = KeyOutcome::default();
+        for c in "12+3".chars() {
+            last = m.press(ch(c), KeySource::Touch);
+            assert!(
+                !last.ops.iter().any(|o| matches!(o, EditOp::Commit(_))),
+                "{c} 不能上屏: {last:?}"
+            );
+        }
+        assert!(m.coord.is_composing());
+        let comp = composition(&last).unwrap_or_default();
+        assert!(comp.contains("12+3"), "{last:?}");
+        assert!(
+            m.candidates(0, 5).items.iter().any(|t| t == "15"),
+            "算式算得出: {:?}",
+            m.candidates(0, 5).items
+        );
+    }
+
+    /// 九宫数字页 / 123 层的「原样上屏」键在快捷输入里进缓冲（真机反馈：切到数字页打
+    /// `12+3`，数字直接顶码上屏，算不了式子）。小数点也是缓冲，不变「。」
+    #[test]
+    fn literal_keys_enter_quick_input_buffer() {
+        let Some((m, _rx)) = core("literal_quick", "wubi86", no_assoc) else {
+            return;
+        };
+        m.set_touch_quick_trigger(true);
+        type_str(&m, "wqvb");
+        m.press(PressKey::Space, KeySource::Touch);
+        m.press(ch(';'), KeySource::Touch);
+        assert!(m.candidates(0, 1).total > 0, "前提：有重复上屏候选");
+        let mut last = KeyOutcome::default();
+        for c in "(1.5+3)*2".chars() {
+            last = m.press_literal(&c.to_string());
+            assert!(last.consumed, "{c} 要被引擎收下: {last:?}");
+            assert!(
+                !last.ops.iter().any(|o| matches!(o, EditOp::Commit(_))),
+                "{c} 不能上屏: {last:?}"
+            );
+        }
+        let comp = composition(&last).unwrap_or_default();
+        assert!(comp.contains("(1.5+3)*2"), "{last:?}");
+        assert!(
+            m.candidates(0, 5).items.iter().any(|t| t == "9"),
+            "算式算得出: {:?}",
+            m.candidates(0, 5).items
+        );
+    }
+
+    /// 普通组码 / 无编码时原样上屏键不进引擎：宿主照旧（有编码先顶首选，再接字符）
+    #[test]
+    fn literal_keys_pass_through_outside_text_buffer() {
+        let Some((m, _rx)) = core("literal_plain", "wubi86", no_assoc) else {
+            return;
+        };
+        let out = m.press_literal("1");
+        assert!(!out.consumed && out.ops.is_empty(), "无编码: {out:?}");
+        let out = m.press_literal(".");
+        assert!(!out.consumed && out.ops.is_empty(), "无编码句点: {out:?}");
+        type_str(&m, "wqvb");
+        for t in ["1", ".", "+"] {
+            let out = m.press_literal(t);
+            assert!(!out.consumed && out.ops.is_empty(), "组码中 {t}: {out:?}");
+            assert!(m.coord.is_composing(), "组码不被动");
+        }
+        // 多字符项在快捷输入里也原样上屏
+        m.set_touch_quick_trigger(true);
+        m.press(PressKey::Space, KeySource::Touch);
+        m.press(ch(';'), KeySource::Touch);
+        let out = m.press_literal("()");
+        assert!(!out.consumed && out.ops.is_empty(), "{out:?}");
     }
 }

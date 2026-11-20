@@ -4,11 +4,11 @@ import XCTest
 final class BinaryCodecTests: XCTestCase {
 
     func testHeaderRoundtrip_KeyEvent() throws {
-        let h = BinaryCodec.encodeHeader(cmd: UpstreamCmd.keyEvent, payloadLen: 18)
+        let h = BinaryCodec.encodeHeader(cmd: UpstreamCmd.keyEvent, payloadLen: 20)
         XCTAssertEqual(h.count, WireProtocol.headerSize)
         let (cmd, len, isAsync) = try BinaryCodec.decodeHeader(h)
         XCTAssertEqual(cmd, UpstreamCmd.keyEvent)
-        XCTAssertEqual(len, 18)
+        XCTAssertEqual(len, 20)
         XCTAssertFalse(isAsync)
     }
 
@@ -58,16 +58,17 @@ final class BinaryCodecTests: XCTestCase {
             eventType: .down,
             toggles: 0x01,
             eventSeq: 42,
-            prevChar: 0x4E2D  // '中'
+            prevChar: 0x4E2D,  // '中'
+            seqChar: 0x0061
         )
         let frame = BinaryCodec.encodeKeyEventFrame(original)
-        XCTAssertEqual(frame.count, WireProtocol.headerSize + 18)
+        XCTAssertEqual(frame.count, WireProtocol.headerSize + 20)
 
         // 验帧头
         let header = frame.prefix(WireProtocol.headerSize)
         let (cmd, len, _) = try BinaryCodec.decodeHeader(header)
         XCTAssertEqual(cmd, UpstreamCmd.keyEvent)
-        XCTAssertEqual(len, 18)
+        XCTAssertEqual(len, 20)
 
         // 验 payload
         let payload = frame.subdata(in: WireProtocol.headerSize..<frame.count)
@@ -81,6 +82,20 @@ final class BinaryCodecTests: XCTestCase {
         let (cmd, len, _) = try BinaryCodec.decodeHeader(f)
         XCTAssertEqual(cmd, DownstreamCmd.ack)
         XCTAssertEqual(len, 0)
+    }
+
+    func testTokenFrame_ImeActivated() throws {
+        // macOS 激活路径补发 IME_ACTIVATED：payload 就是 8 字节 clientToken。
+        let token: UInt64 = (UInt64(0x1234) << 32) | 7
+        let f = BinaryCodec.encodeTokenFrame(
+            cmd: UpstreamCmd.imeActivated, clientToken: token, async: true)
+        XCTAssertEqual(f.count, WireProtocol.headerSize + 8)
+        let (cmd, len, isAsync) = try BinaryCodec.decodeHeader(f)
+        XCTAssertEqual(cmd, UpstreamCmd.imeActivated)
+        XCTAssertEqual(len, 8)
+        XCTAssertTrue(isAsync)
+        let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
+        XCTAssertEqual(payload.readUInt64LE(at: 0), token)
     }
 
     func testFocusGainedFrame_InputScopeMask() throws {
