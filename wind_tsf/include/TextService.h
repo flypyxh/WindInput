@@ -187,6 +187,10 @@ public:
     BOOL CommitText(const std::wstring& text, BOOL nonKeyContext = FALSE,
                     BOOL replacingHeld = FALSE, BOOL* pAsyncDeferred = nullptr);
 
+    // 以 Unicode 按键（VK_PACKET）注入文本；失败返回 FALSE，调用方回退 CommitText。
+    // 配对插入（pair_via_comp）与 AutoCAD 类宿主的空闲态 ASCII 提交用它。
+    BOOL InjectUnicodeText(const std::wstring& text);
+
     // `CommitText(text, TRUE, ...)` 的替代：不直接在当前（非按键）调用栈里发起异步
     // EditSession，而是缓冲文本 + 合成一个触发键，把真正的提交挪到 OnKeyDown 里、
     // 以**按键上下文**同步提交——TF_ES_SYNC 合法，宿主自身的输入时处理链路（含内嵌
@@ -833,6 +837,9 @@ private:
     // caret_update。**两者都发就会被服务端的 handle_focus_gained 覆写掉**，见回调注释。
     ULONGLONG _focusGainedSentForSession = 0;
     BOOL _hasLastKnownCaretPos;
+    // 本线程的宿主是否给过 TSF 域坐标（SELECTION / COMPOSITION / CACHED）。用于挡掉同步会话被拒后
+    // 回退出的跨窗口 GUI 光标，见 SendCaretPositionUpdate。
+    BOOL _hostGaveTsfCaret;
     LONG _lastKnownCaretX;
     LONG _lastKnownCaretY;
     LONG _lastKnownCaretHeight;

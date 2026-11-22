@@ -132,6 +132,42 @@ pub struct ConvertResult {
 /// 交给引擎和调用方的兜底过滤（见 `Coordinator::rare_admit_fn`），两侧共享同一份闭包。
 pub type AdmitFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// 辅码表的只读视图，供击键坐标整句图加辅码边。
+///
+/// 引擎只要「某字是否有以 `prefix` 开头的辅码」，因此在引擎侧定义最小接口，由协调器
+/// 用已加载的辅码表实现，引擎不依赖 `wind-aux-code`，输入路径上也不读盘。
+pub trait AuxCharLookup: Send + Sync {
+    /// `ch` 的任一辅码以 `prefix` 开头。
+    fn any_code_starts_with(&self, ch: char, prefix: &str) -> bool;
+
+    /// 一个字都没有（未挂载）；引擎据此视同关闭。
+    fn is_empty(&self) -> bool;
+
+    /// `ch` 全部辅码**首字母**的掩码：bit i 置位 ⇔ 有以 `'a' + i` 开头的码（只看小写字母）。
+    ///
+    /// 建图时同一字要对 1 位、2 位辅码各判一次，按字取一次掩码就能先筛掉绝大多数字。
+    /// 默认由 [`Self::any_code_starts_with`] 逐字母推出；实现可给零分配的快速版本（见
+    /// [`aux_code_letter_bit`]），语义须与逐字母判定相同。
+    fn letter_mask(&self, ch: char) -> u32 {
+        let mut mask = 0;
+        let mut buf = [0u8; 4];
+        for (i, b) in (b'a'..=b'z').enumerate() {
+            if self.any_code_starts_with(ch, char::from(b).encode_utf8(&mut buf)) {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+}
+
+/// 一个辅码在 [`AuxCharLookup::letter_mask`] 里的位：首字节是小写字母时为该字母的位，否则 0。
+pub fn aux_code_letter_bit(code: &str) -> u32 {
+    match code.as_bytes().first() {
+        Some(&b) if b.is_ascii_lowercase() => 1 << (b - b'a'),
+        _ => 0,
+    }
+}
+
 /// 调用方按**路径**给拼音引擎的取舍覆写（[`Engine::convert_with_opts`]）。
 ///
 /// ## ⚠️ 为什么是参数而不是引擎配置
@@ -227,6 +263,42 @@ pub struct ConvertOptions {
     /// 代价是 `zaiyebuj` 的尾字母 `j` 不参与组句、打不出「在也不就」（纯拼音方案一直打得出）。
     /// ⇒ 判据从「是不是混输」改为「这串还可能是码表码吗」。
     pub allow_partial_final: Option<bool>,
+    /// 双拼走击键坐标整句图（内部开关，默认关；环境变量 `WIND_SP_RAW_LATTICE=1` 亦可打开，
+    /// 仅内部调试与评测用）。
+    pub sp_raw_lattice: bool,
+    /// 连续辅助码用的辅码表；`None` 或 `is_empty()` = 关闭（默认）。
+    pub aux_continuous: Option<std::sync::Arc<dyn AuxCharLookup>>,
+    /// 编码栏里辅码前插的分隔符（带辅码候选的 `meta.preedit_split`）；`None` =
+    /// [`AUX_PREEDIT_SEPARATOR`]。只在 `aux_continuous` 生效时用。
+    pub aux_preedit_separator: Option<std::sync::Arc<str>>,
+}
+
+/// 编码栏辅码前的默认分隔符：`ni hn'hc`、串尾 `ni'hc hn`（同已发布的串尾直接辅助 `ui'du p`）。
+/// 方案可经内部配置 `[engine.aux_code] preedit_separator` 改成空串或别的符号。
+pub const AUX_PREEDIT_SEPARATOR: &str = " ";
+
+/// 编码栏辅码分隔符的可选字符（白名单）：空格、`·`、`-`、`_`、`|`。
+const AUX_PREEDIT_SEPARATOR_CHARS: &[char] = &[' ', '·', '-', '_', '|'];
+
+/// 编码栏辅码分隔符是否可用：空串，或只由 [`AUX_PREEDIT_SEPARATOR_CHARS`] 组成。编码栏须是
+/// 「缓冲按序插入分隔符」的形态，光标换算（逐字节贪心同步）才成立；字母数字、`;` 之类会与缓冲
+/// 里的键混淆，`'` 会与音节分隔混淆，故用白名单。
+pub fn aux_preedit_separator_valid(sep: &str) -> bool {
+    sep.chars()
+        .all(|c| AUX_PREEDIT_SEPARATOR_CHARS.contains(&c))
+}
+
+#[cfg(test)]
+mod aux_separator_tests {
+    #[test]
+    fn aux_preedit_separator_whitelist() {
+        for ok in ["", " ", "·", "-", "_", "|", " · "] {
+            assert!(super::aux_preedit_separator_valid(ok), "{ok:?}");
+        }
+        for bad in ["'", ";", "x", "1", "/", "\t", " '"] {
+            assert!(!super::aux_preedit_separator_valid(bad), "{bad:?}");
+        }
+    }
 }
 
 /// [`Engine::resolve_boundary`] 的结果。见
@@ -568,4 +640,114 @@ pub trait ExtendedEngine: Engine {
 
     /// 处理空编码
     fn handle_empty_code(&self, input: &str) -> (bool, bool, String);
+}
+
+#[cfg(test)]
+mod aux_char_lookup_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct FakeAux(Vec<(char, &'static str)>);
+
+    impl AuxCharLookup for FakeAux {
+        fn any_code_starts_with(&self, ch: char, prefix: &str) -> bool {
+            self.0
+                .iter()
+                .any(|(c, code)| *c == ch && code.starts_with(prefix))
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+
+    #[test]
+    fn default_opts_have_no_aux_continuous() {
+        assert!(ConvertOptions::default().aux_continuous.is_none());
+    }
+
+    #[test]
+    fn fake_aux_satisfies_trait_through_arc_dyn() {
+        let aux: Arc<dyn AuxCharLookup> = Arc::new(FakeAux(vec![('好', "hn"), ('是', "uu")]));
+        assert!(aux.any_code_starts_with('好', "h"));
+        assert!(aux.any_code_starts_with('好', "hn"));
+        assert!(!aux.any_code_starts_with('好', "u"));
+        assert!(!aux.any_code_starts_with('无', "h"));
+        assert!(!aux.is_empty());
+        assert!(FakeAux(vec![]).is_empty());
+        let opts = ConvertOptions {
+            aux_continuous: Some(aux),
+            ..Default::default()
+        };
+        assert!(opts.clone().aux_continuous.is_some());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuxCharLookup, aux_code_letter_bit};
+
+    /// 只给逐字判定，掩码走默认实现。
+    struct Slow(Vec<(char, &'static str)>);
+
+    impl AuxCharLookup for Slow {
+        fn any_code_starts_with(&self, ch: char, prefix: &str) -> bool {
+            self.0
+                .iter()
+                .any(|(c, code)| *c == ch && code.starts_with(prefix))
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+
+    /// 同一张表，掩码按码的首字母直接拼。
+    struct Fast(Slow);
+
+    impl AuxCharLookup for Fast {
+        fn any_code_starts_with(&self, ch: char, prefix: &str) -> bool {
+            self.0.any_code_starts_with(ch, prefix)
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+        fn letter_mask(&self, ch: char) -> u32 {
+            self.0
+                .0
+                .iter()
+                .filter(|(c, _)| *c == ch)
+                .fold(0, |m, (_, code)| m | aux_code_letter_bit(code))
+        }
+    }
+
+    #[test]
+    fn aux_letter_mask_matches_starts_with() {
+        let rows = vec![
+            ('好', "nz"),
+            ('好', "zn"),
+            ('是', "uu"),
+            ('一', "a"),
+            ('乙', "Zy"),
+            ('人', "1r"),
+        ];
+        for table in [Slow(rows.clone()), Slow(Vec::new())] {
+            let fast = Fast(Slow(table.0.clone()));
+            for ch in ['好', '是', '一', '乙', '人', '无'] {
+                let mut buf = [0u8; 4];
+                let want = (b'a'..=b'z').enumerate().fold(0u32, |m, (i, b)| {
+                    let one = char::from(b).encode_utf8(&mut buf);
+                    m | (u32::from(table.any_code_starts_with(ch, one)) << i)
+                });
+                assert_eq!(table.letter_mask(ch), want, "默认实现 {ch}");
+                assert_eq!(fast.letter_mask(ch), want, "快速实现 {ch}");
+            }
+        }
+        let t = Slow(rows);
+        assert_eq!(
+            t.letter_mask('好'),
+            (1 << (b'n' - b'a')) | (1 << (b'z' - b'a'))
+        );
+        assert_eq!(t.letter_mask('乙'), 0, "大写开头不算");
+        assert_eq!(t.letter_mask('人'), 0, "数字开头不算");
+        assert_eq!(t.letter_mask('无'), 0, "无码");
+    }
 }

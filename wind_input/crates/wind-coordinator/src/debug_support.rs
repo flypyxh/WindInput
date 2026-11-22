@@ -31,6 +31,10 @@ impl Coordinator {
         self.per_page(overlay.then_some(ModeKind::TempPinyin))
     }
 
+    /// 切换前是否有未上屏的编码/候选/独占模式缓冲（测试/诊断用，包一层 `has_pending_composition`）。
+    pub fn debug_pending_composition(&self) -> bool {
+        self.has_pending_composition()
+    }
     /// 当前下发给 UI 的竖排补位行数（测试/诊断用）：按生效每页数封顶后的 `min_rows`。
     pub fn debug_candidate_min_rows(&self) -> u32 {
         self.eff_candidate().effective_min_rows()
@@ -326,7 +330,9 @@ impl Coordinator {
     /// 要验剪贴板相关短语得由调用方另行注入。
     pub fn debug_phrase_texts(&self, code: &str) -> Vec<String> {
         let clip = |_n: i64| String::new();
-        let reverse = |text: &str, fmt: &str| -> String { self.reverse_render(text, fmt) };
+        let reverse = |text: &str, fmt: &str, min_len: usize| -> String {
+            self.reverse_render_min(text, fmt, min_len)
+        };
         let host = wind_phrase::PhraseHost {
             clip: &clip,
             reverse: &reverse,
@@ -420,6 +426,25 @@ impl Coordinator {
             .iter()
             .map(|c| (c.text.clone(), c.code.clone(), c.comment.clone()))
             .collect()
+    }
+
+    /// 全部候选的 `(text, consumed_length, is_direct_aux)`（测试/诊断用）。连续辅助码的界面序
+    /// 评测要区分「串尾一步提上来的」与「引擎整句」，并看消费数分档。
+    pub fn debug_candidate_consumed(&self) -> Vec<(String, usize, bool)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .candidates
+            .iter()
+            .map(|c| (c.text.clone(), c.consumed_length, c.is_direct_aux))
+            .collect()
+    }
+
+    /// 对当前状态跑一次连续辅助码的生效判定（取设置 + 建本键辅码视图，与按键路径同一函数），
+    /// 返回是否生效（测试/诊断用）。耗时评测把这一步单列。
+    pub fn debug_continuous_aux_lookup(&self) -> bool {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.continuous_aux_lookup(&s).is_some()
     }
 
     /// 全部候选的 `(text, is_command, is_group, phrase_template)`（测试/诊断用）。

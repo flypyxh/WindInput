@@ -2328,6 +2328,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "wind-candidate",
+ "wind-cmdbar",
  "wind-config",
  "wind-dict",
  "wind-store",
@@ -2534,6 +2535,7 @@ dependencies = [
  "serde",
  "toml 0.8.23",
  "wind-candidate",
+ "wind-utils",
 ]
 
 [[package]]

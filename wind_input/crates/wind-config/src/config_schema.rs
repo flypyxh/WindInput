@@ -387,7 +387,9 @@ static REGISTRY: &[ConfigField] = &[
     // `files`（码表清单）不在此：它是方案属性，只住在 `[engine.aux_code]` 里。
     f("schema.pinyin.aux_code.enabled", Bool),
     f("schema.pinyin.aux_code.max_phrase_len", Int),
-    // 直接辅助码（仅双拼，末 1～2 位自动当辅码）。出厂关；只在 enabled 也生效时起作用。
+    // 直接辅助码（仅双拼，任一音节后 1～2 位自动当辅码）。出厂关；只在 enabled 也生效时起作用。
+    // 方案段另有两个内部项不登记在此（不进设置页、无全局键）：逃生口 `continuous` 与编码栏
+    // 分隔符 `preedit_separator`，见 `AuxCodeSpec`。
     f("schema.pinyin.aux_code.direct", Bool),
     // 全局混输（融合策略）
     f("schema.mix.show_source_hint", Bool),
@@ -495,6 +497,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.auto_pair.english_pairs", StrList),
     f("input.auto_pair.jump_out_keys", StrList),
     f("input.auto_pair.state_ttl_secs", Int),
+    f("input.auto_pair.commit_via_composition", Bool),
     f("input.temp_english.enabled", Bool),
     f("input.temp_english.show_candidates", Bool),
     f(

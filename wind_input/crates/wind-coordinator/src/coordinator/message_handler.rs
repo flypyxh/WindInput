@@ -1634,6 +1634,24 @@ impl MessageHandler for Coordinator {
             return act;
         }
 
+        // Ctrl+←/→：整音节跳（rime `left_by_syllable` / `right_by_syllable`）。
+        // 会话键表只认 vk+shift、不带 Ctrl，所以这里单独认；用户要关就写
+        // `session_actions = { "ctrl+left" = "none" }`（同时也不再向宿主转发该键）。
+        // 只在组码中（有编码）吃：无编码时 Ctrl+←/→ 是宿主的按词移动。
+        if data.modifiers & (MOD_SHORTCUT | MOD_SHIFT) == wind_ipc::protocol::MOD_CTRL
+            && matches!(data.key_code, keymap::VK_LEFT | keymap::VK_RIGHT)
+            && !state.input_buffer.is_empty()
+            && self.ctrl_syllable_enabled(data.key_code)
+        {
+            let moved =
+                Self::move_caret_syllable(&mut state, data.key_code == keymap::VK_RIGHT, false);
+            return if moved {
+                self.caret_moved_action(&mut state)
+            } else {
+                KeyAction::Consumed
+            };
+        }
+
         // Ctrl/Alt/Cmd 组合（非热键）：有输入则清空并隐藏候选窗，否则透传。
         // 必须 notify_ui_hide：否则候选窗残留（如 Ctrl+A 时卡死，需再输入才复位）。
         //
@@ -2204,16 +2222,29 @@ impl MessageHandler for Coordinator {
                         st.input_cursor_pos =
                             preedit_cursor::syllable_left(spans, st.input_cursor_pos);
                     }
-                    let mut ed = preedit_cursor::BufEdit::new(
-                        &mut st.input_buffer,
-                        &mut st.input_cursor_pos,
-                    );
-                    let moved = match data.key_code {
-                        keymap::VK_LEFT if syllable_jump.is_some() => true,
-                        keymap::VK_LEFT => ed.move_left(),
-                        keymap::VK_RIGHT => ed.move_right(),
-                        keymap::VK_HOME => ed.home(),
-                        _ => ed.end(),
+                    // ←/→ 按 rime 导航器语义：光标在音节边界上整音节跳，在音节中间按单字符
+                    // （见 `move_caret_syllable`）；无切分（双拼 / 单音节 / 码表单码）自然退回单字符。
+                    // 手机端的按音节左移（上面的 `syllable_jump`）优先，保持原样。
+                    let smart = (syllable_jump.is_none()
+                        && data.modifiers & MOD_SHIFT == 0
+                        && matches!(data.key_code, keymap::VK_LEFT | keymap::VK_RIGHT))
+                    .then(|| {
+                        Self::move_caret_syllable(st, data.key_code == keymap::VK_RIGHT, true)
+                    });
+                    let moved = if let Some(moved) = smart {
+                        moved
+                    } else {
+                        let mut ed = preedit_cursor::BufEdit::new(
+                            &mut st.input_buffer,
+                            &mut st.input_cursor_pos,
+                        );
+                        match data.key_code {
+                            keymap::VK_LEFT if syllable_jump.is_some() => true,
+                            keymap::VK_LEFT => ed.move_left(),
+                            keymap::VK_RIGHT => ed.move_right(),
+                            keymap::VK_HOME => ed.home(),
+                            _ => ed.end(),
+                        }
                     };
                     if moved {
                         // 光标移动**不重算候选**（不调 update_candidates）：光标不参与引擎查询，
@@ -2906,6 +2937,8 @@ impl MessageHandler for Coordinator {
             .composition_start
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+        self.tsf_frame_seen_in_composition
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // 矩形锚点与 pre_reflow 基准同步作废（理由同上：换了 docMgr，两者答的都是旧文档的事）。
         // ⚠ 两个都要清：字段注释承诺的是「组合结束与焦点换 docMgr 各一处」，漏一个就与注释不符，
         // 而这类状态的清位点从来不是只有一处（见 144925d8「挡住一处不等于挡住了」）。
@@ -3622,6 +3655,18 @@ impl MessageHandler for Coordinator {
         let active_compat = self.apply_caret_compat(&mut data);
         let data = &data;
         let composition_start_pair_guard = active_compat.composition_start_pair_guard;
+        // 本组合已有 TSF 坐标时，GUI 回退帧是噪声（见字段注释），在写缓存之前就挡掉。
+        if data.source == wind_ipc::protocol::caret_source::GUI_CARET
+            && self
+                .tsf_frame_seen_in_composition
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            debug!(
+                "caret_update → 忽略: 本组合已有 TSF 坐标，gui_caret ({},{}) 是跨窗口的陈旧位置",
+                data.x, data.y
+            );
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (prev_x, prev_y, prev_height, prev_source) = (
             state.caret_x,
@@ -3717,6 +3762,10 @@ impl MessageHandler for Coordinator {
                 wind_ipc::protocol::caret_source::is_tsf(data.source)
             );
             return;
+        }
+        if wind_ipc::protocol::caret_source::is_tsf(data.source) {
+            self.tsf_frame_seen_in_composition
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // 先记下「宿主上一帧如实上报的组合起点」，供后面的大偏移逃生阀判据使用。
         //
@@ -5154,12 +5203,27 @@ impl Coordinator {
         &self,
         upper: bool,
     ) -> (Option<StatusUpdateData>, String) {
+        self.handle_switch_mode_cased(None, upper)
+    }
+
+    /// 中英切换内核：`target` 给定终态（`Some(true)`＝置中文 / `Some(false)`＝置英文，
+    /// `ime.set("cn-en", …)` 走这里），`None`＝翻转（Shift 等切换键）。
+    pub(crate) fn handle_switch_mode_cased(
+        &self,
+        target: Option<bool>,
+        upper: bool,
+    ) -> (Option<StatusUpdateData>, String) {
         // 模式变更的四个入口都打一条同形日志（见 handle_system_mode_switch 的说明）。
         // 本入口 = 本地切换键（Shift 等），按键侧另有 `toggle_mode key_up` 记录键码，
         // 但那条只在 policed 路径上，菜单/热键触发的 toggle 走不到，故这里仍要打。
         tracing::debug!(
-            "toggle_mode: {} -> 翻转",
-            if self.is_chinese_mode() { "中" } else { "英" }
+            "switch_mode: {} -> {}",
+            if self.is_chinese_mode() { "中" } else { "英" },
+            match target {
+                Some(true) => "置中文",
+                Some(false) => "置英文",
+                None => "翻转",
+            }
         );
         // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，出厂语义是"回到可输入中文
         // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
@@ -5174,11 +5238,11 @@ impl Coordinator {
         state.chinese_mode = if caps_cancelled {
             Self::mode_after_caps_cancel(
                 &self.rt().config.input.capslock.mode_after_cancel,
-                CapsCancelSwitch::Toggle,
+                target.map_or(CapsCancelSwitch::Toggle, CapsCancelSwitch::Directed),
                 state.chinese_mode,
             )
         } else {
-            !state.chinese_mode
+            target.unwrap_or(!state.chinese_mode)
         };
         let chinese = state.chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。

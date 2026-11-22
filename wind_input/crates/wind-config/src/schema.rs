@@ -337,11 +337,21 @@ pub struct AuxCodeSpec {
     /// 单字恒参与匹配，不受此限。见 wind-aux-code 的 `AuxCodeFilterOptions::max_phrase_len`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_phrase_len: Option<usize>,
-    /// 本方案是否开直接辅助码（末尾 1～2 位自动当辅码，**仅双拼**）。`None` = 回落全局
+    /// 本方案是否开直接辅助码（任一音节后 1～2 位自动当该字辅码，**仅双拼**）。`None` = 回落全局
     /// `[schema.pinyin.aux_code].direct`。只在 `enabled` 也生效时起作用；全拼方案写了
     /// `true` 不生效、日志告警一次。见 `docs/design/aux-code-direct.md` §7。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct: Option<bool>,
+    /// 内部逃生口（不进设置页、无全局键）：`Some(false)` 让直接辅助码退回只做串尾，不走
+    /// 连续辅助码（`docs/design/aux-code-continuous.md` §6）。`None` / `true` = 开着 `direct`
+    /// 的双拼走连续模式。连续模式稳定后删除。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous: Option<bool>,
+    /// 内部项（不进设置页、无全局键）：编码栏里辅码前插的分隔符，连续辅助码的辅码候选
+    /// （`ni hn'hc`）与串尾直接辅助（`ui'du p`）共用。`None` = 空格；可设空串，或由空格、`·`、
+    /// `-`、`_`、`|` 组成的串，其余值不用（日志告警一次，退回空格）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preedit_separator: Option<String>,
 }
 
 impl AuxCodeSpec {
@@ -1366,5 +1376,61 @@ layout = "xiaohe"
             Some("codetable"),
             "未提及的键必须保留——这才是深合并"
         );
+    }
+
+    /// 连续辅助码的两个内部项（`continuous`、`preedit_separator`）：不写 = `None`，序列化时
+    /// 不冒出来（否则设置端 getConfig → saveConfig 的 diff 会把默认值写进 override）。
+    #[test]
+    fn aux_internal_keys_absent_are_none_and_not_serialized() {
+        let s: Schema = toml::from_str("[engine.aux_code]\ndirect = true\n").unwrap();
+        assert_eq!(s.engine.aux_code.continuous, None);
+        assert_eq!(s.engine.aux_code.preedit_separator, None);
+        let out = toml::to_string(&s).unwrap();
+        assert!(!out.contains("continuous"), "{out}");
+        assert!(!out.contains("preedit_separator"), "{out}");
+    }
+
+    /// 写了就原样解析、原样序列化；校验（分隔符白名单）在引擎侧，这里不改值——空串与
+    /// 不合格的值都要原样留着，用户改回来之前不能被配置层悄悄抹掉。
+    #[test]
+    fn aux_internal_keys_parse_and_roundtrip() {
+        for sep in ["", "·", " ", "x"] {
+            let src = format!(
+                "[engine.aux_code]\ndirect = true\ncontinuous = false\npreedit_separator = {sep:?}\n"
+            );
+            let s: Schema = toml::from_str(&src).unwrap();
+            assert_eq!(s.engine.aux_code.continuous, Some(false));
+            assert_eq!(s.engine.aux_code.preedit_separator.as_deref(), Some(sep));
+            let back: Schema = toml::from_str(&toml::to_string(&s).unwrap()).unwrap();
+            assert_eq!(back.engine.aux_code.continuous, Some(false));
+            assert_eq!(back.engine.aux_code.preedit_separator.as_deref(), Some(sep));
+        }
+    }
+
+    /// override 层只写内部项：与方案文件深合并，作者的 `files` / `direct` 保留；
+    /// 全局折叠（`AuxCodeGlobal::resolved`）不受内部项影响。
+    #[test]
+    fn aux_internal_keys_merge_from_override() {
+        let mut base = toml::from_str::<toml::Value>(
+            "[engine.aux_code]\nfiles = [\"aux_code/t.txt\"]\ndirect = true\n",
+        )
+        .unwrap();
+        let over = toml::from_str::<toml::Value>(
+            "[engine.aux_code]\ncontinuous = false\npreedit_separator = \"\"\n",
+        )
+        .unwrap();
+        merge_toml(&mut base, over);
+        let s: Schema = base.try_into().unwrap();
+        let aux = &s.engine.aux_code;
+        assert_eq!(aux.files, vec!["aux_code/t.txt".to_string()]);
+        assert_eq!(aux.direct, Some(true));
+        assert_eq!(aux.continuous, Some(false));
+        assert_eq!(aux.preedit_separator.as_deref(), Some(""));
+        let r = crate::config::AuxCodeGlobal {
+            enabled: true,
+            ..Default::default()
+        }
+        .resolved(Some(aux));
+        assert!(r.enabled && r.direct, "逃生口不改 direct 本身：{r:?}");
     }
 }

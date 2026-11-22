@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
 use wind_engine::manager::ENGLISH_SCHEMA;
-use wind_ipc::protocol::MOD_SHIFT;
+use wind_ipc::protocol::{MOD_SHIFT, MOD_SHORTCUT};
 use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
 use wind_ui_types::CandidateOp;
@@ -1424,7 +1424,9 @@ impl Coordinator {
         // 卡按键线程（阻塞版 clipboard_get_text 打不开时会 sleep 重试至 40ms）。真正执行
         // 动作时另有 CmdbarCtx 用非缓存版取值。
         let clip = |_n: i64| -> String { self.host_services().clipboard_get_text_cached() };
-        let reverse = |text: &str, fmt: &str| -> String { self.reverse_render(text, fmt) };
+        let reverse = |text: &str, fmt: &str, min_len: usize| -> String {
+            self.reverse_render_min(text, fmt, min_len)
+        };
         let host = wind_phrase::PhraseHost {
             clip: &clip,
             reverse: &reverse,
@@ -1638,6 +1640,11 @@ impl Coordinator {
         let wildcard_pattern = self.wildcard_pattern_of(state);
         // ★ 分段续转排在通配之前（spec §10）：续转态的剩余串是拼音后半截。
         // `wildcard_pattern_of` 在续转态本就给 `None`，这里的先后是第二道保险。
+        // 连续辅助码（双拼 + 直接辅助码）：只接主转换。分段续转走的是混输的拼音子方案、
+        // 通配不建整句图，两条都不接。未就绪 / 不适用 = `None`，整条走旧路径。
+        let continuous = (pinyin_schema.is_none() && wildcard_pattern.is_none())
+            .then(|| self.continuous_aux_lookup(state))
+            .flatten();
         let t_convert = std::time::Instant::now();
         let faults0 = crate::process_memory::page_faults();
         let result = match pinyin_schema {
@@ -1645,12 +1652,16 @@ impl Coordinator {
                 self.engine_mgr
                     .convert_with(&ps, &state.input_buffer, limit)
             }
-            _ => match &wildcard_pattern {
-                Some(p) => self
+            _ => match (&wildcard_pattern, &continuous) {
+                (Some(p), _) => self
                     .engine_mgr
                     .convert_wildcard(&state.input_buffer, p, limit)
                     .unwrap_or_default(),
-                None => self.engine_mgr.convert(&state.input_buffer, limit),
+                (None, Some(ca)) => {
+                    self.engine_mgr
+                        .convert_active_with_opts(&state.input_buffer, limit, ca.opts())
+                }
+                (None, None) => self.engine_mgr.convert(&state.input_buffer, limit),
             },
         };
         let t_convert = t_convert.elapsed();
@@ -1745,7 +1756,9 @@ impl Coordinator {
             // ⚠️ 它与上面的 `clip` 不同——`clip` 在非 Windows 恒空是**既定行为**，
             // 而反查没有那个约束。但二者串起来的后果要清楚：`{dict.rev(clip())}`
             // 在 macOS 上因 `clip` 恒空而查无可查，整条候选不出现。
-            let reverse = |text: &str, fmt: &str| -> String { self.reverse_render(text, fmt) };
+            let reverse = |text: &str, fmt: &str, min_len: usize| -> String {
+                self.reverse_render_min(text, fmt, min_len)
+            };
             let host = wind_phrase::PhraseHost {
                 clip: &clip,
                 reverse: &reverse,
@@ -2085,7 +2098,13 @@ impl Coordinator {
         // 直接辅助码（双拼，末 1～2 位自动当辅码）：命中项并入主候选。位置钉在全部重排
         // **之后**、shadow **之前**（设计 §6）：插在重排之前会被按消费长度 / 调频重新排走；
         // 而本函数也被翻页扩容调用，放进 `update_candidates` 会在翻页时丢失命中项。
-        self.apply_direct_aux(state, &mut candidates, limit, engine_count >= limit);
+        self.apply_direct_aux(
+            state,
+            &mut candidates,
+            limit,
+            engine_count >= limit,
+            continuous.as_ref().map(|c| &c.lookup),
+        );
         let shadow_code = Self::shadow_code_of(state).to_string();
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）。
         //
@@ -3526,7 +3545,8 @@ impl Coordinator {
             return &state.direct_aux_body;
         }
         // 拼音候选自带的切分：`pinan` 高亮「平安」是 `pin'an`、高亮「皮」是 `pi'nan`。引擎只在
-        // 全拼、无手动分隔符时给，双拼下只给全拼降级候选（见 `CandidateMeta::preedit_split`），
+        // 全拼、无手动分隔符时给，双拼下只给全拼降级候选与连续辅助码的辅码候选（`ni hn'hc`，
+        // 见 `CandidateMeta::preedit_split` / `aux_keys`），
         // 双拼击键分段 / 简拼 / 手动分隔符的形态因此不受影响，全拼降级没给时退回下面的
         // `preedit_fp_body`；分段上屏中它同样是拆分串，与下面「恒拆分」那条不冲突。
         // 排在「无拆分形态」守卫之前：混输下首选的切分与原始码同形时拆分串为空，别的拼音
@@ -3700,6 +3720,29 @@ impl Coordinator {
         }
     }
 
+    /// overlay 的音节停靠点：只有临拼 / 混输（显示串 `overlay_body` 带引擎拆的 `'`）有；
+    /// 对不上缓冲时 `None`，调用方退回单字符。
+    pub(crate) fn overlay_syllable_stops(state: &State) -> Option<Vec<usize>> {
+        let buffer = match state.active? {
+            ModeKind::TempPinyin => &state.temp_pinyin_buffer,
+            ModeKind::Mix(_) => &state.mix_buffer,
+            // 其余 overlay 没有音节切分，恒单字符。
+            ModeKind::TempEnglish
+            | ModeKind::Url
+            | ModeKind::Email
+            | ModeKind::Unicode
+            | ModeKind::Special(_)
+            | ModeKind::RareChar
+            | ModeKind::Reverse
+            | ModeKind::AuxCode => return None,
+        };
+        state
+            .overlay_body
+            .contains('\'')
+            .then(|| preedit_cursor::syllable_stops(buffer, &state.overlay_body))
+            .flatten()
+    }
+
     /// overlay 模式的编码区光标移动（左右 / Home / End）。`None` = 该键不是光标移动键，
     /// 调用方继续分派。
     ///
@@ -3716,13 +3759,30 @@ impl Coordinator {
         ) {
             return None;
         }
+        let arrow = matches!(data.key_code, keymap::VK_LEFT | keymap::VK_RIGHT);
+        // ←/→ 与主输入路径同一套 rime 语义（见 `move_caret_syllable`）：默认「边界整音节 / 中间单字符」，
+        // Ctrl 总是整音节，Shift 总是单字符。只有临拼 / 混输有音节切分，其余 overlay 恒单字符。
+        let stops = if arrow && data.modifiers & MOD_SHIFT == 0 {
+            Self::overlay_syllable_stops(state)
+        } else {
+            None
+        };
+        let smart = data.modifiers & MOD_SHORTCUT == 0;
         let moved = {
             let mut ed = Self::overlay_buf_edit(state)?;
-            match data.key_code {
-                keymap::VK_LEFT => ed.move_left(),
-                keymap::VK_RIGHT => ed.move_right(),
-                keymap::VK_HOME => ed.home(),
-                _ => ed.end(),
+            let right = data.key_code == keymap::VK_RIGHT;
+            let jump = stops
+                .and_then(|stops| preedit_cursor::syllable_jump(&stops, ed.pos(), right, smart));
+            if let Some(pos) = jump {
+                ed.set_pos(pos);
+                true
+            } else {
+                match data.key_code {
+                    keymap::VK_LEFT => ed.move_left(),
+                    keymap::VK_RIGHT => ed.move_right(),
+                    keymap::VK_HOME => ed.home(),
+                    _ => ed.end(),
+                }
             }
         };
         // 已在边界（含缓冲空、只剩只读前缀）：吃掉不透传，否则宿主光标会跳出组合区。

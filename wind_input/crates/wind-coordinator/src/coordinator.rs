@@ -1447,6 +1447,10 @@ pub(crate) enum CapsCancelSwitch {
     /// **恒按请求落地**、不吃 `mode_after_cancel` 的改写——宿主请求「中文」时 CapsLock
     /// 恰好开着被取消，不能因为用户选了 `english` 就落成英文。
     Host(bool),
+    /// 定向切换（`ime.set("cn-en", …)`）：用户**明确点了目标**，取消锁定只是附带动作，
+    /// 模式必须直达目标——出厂 `mode_after_cancel` 只该管「切一下」这种没有方向的翻转
+    /// （Shift / 切换键）。
+    Directed(bool),
 }
 
 impl CapsCancelSwitch {
@@ -2033,6 +2037,15 @@ pub struct Coordinator {
     ///
     /// 无需跨组合显式复位：换了组合，宿主报的起点自然与上一帧不同，判据随之不成立。
     last_reported_comp_start: Mutex<(i32, i32, bool)>,
+    /// 本组合内是否已收到过 TSF 域的 caret 帧。置位后，`GUI_CARET` 帧一律不再采信。
+    ///
+    /// 背景：Word 在按键期可拒绝同步 edit session（`TS_E_SYNCHRONOUS`），DLL 回退到 Win32
+    /// 光标上报——那是个跨窗口的陈旧位置（实测恒在别的行），不带组合起点与组合矩形。它若
+    /// 进入组合期的跟行 / 重锁，候选窗就在它与 TSF 真坐标之间来回跳。
+    ///
+    /// 只在「已有 TSF 坐标」后才屏蔽：纯 GUI 回退的宿主（无 TSF 坐标可言）行为不变。
+    /// 清位与 `composition_start` 同步：组合结束（`reset_first_show`）与焦点换 docMgr 各一处。
+    tsf_frame_seen_in_composition: std::sync::atomic::AtomicBool,
     /// 应用兼容规则表（compat.toml，系统层 + 用户层覆盖）。按焦点进程名查规则。
     ///
     /// 用 Mutex 而非不可变字段：右键菜单切换 per-app 开关后要写用户层并**立即重载**。
@@ -3341,6 +3354,7 @@ impl Coordinator {
             last_pre_reflow_probe: Mutex::new((0, 0, false)),
             pre_reflow_comp_start: Mutex::new((0, 0, false)),
             last_reported_comp_start: Mutex::new((0, 0, false)),
+            tsf_frame_seen_in_composition: std::sync::atomic::AtomicBool::new(false),
             last_authoritative_caret: Mutex::new((0, 0, false)),
             last_key_at: Mutex::new(None),
             last_key_interval_ms: Mutex::new(None),
@@ -3770,6 +3784,7 @@ impl Coordinator {
             for token in self.push_server.tokens_of_pid(pid) {
                 self.push_password_suppress_config(token);
                 self.push_english_pair_config(token);
+                self.push_pair_via_comp_config(token);
                 self.push_composition_placeholder_config(token);
                 self.push_space_before_digit_config(token);
                 self.push_multiline_commit_config(token);
@@ -4438,6 +4453,7 @@ impl Coordinator {
     ) -> bool {
         match (setting, switch) {
             (_, CapsCancelSwitch::Host(requested)) => requested,
+            (_, CapsCancelSwitch::Directed(requested)) => requested,
             ("english", _) => false,
             ("toggle", CapsCancelSwitch::Toggle) => !current,
             (_, CapsCancelSwitch::System(requested)) => requested,
@@ -5409,6 +5425,7 @@ impl Coordinator {
                 self.sync_capslock_hook();
                 // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
                 self.push_english_pair_config(0);
+                self.push_pair_via_comp_config(0); // 配对插入提交方式（组合语义 vs 直写，compat 可覆盖）
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
                 // 密码框抑制策略：内存开关随配置回灌（关掉即解除当前抑制）+ 推给 DLL 吃键门控。
                 self.set_password_suppress_enabled(new_cfg.input.password_force_english);
@@ -5989,7 +6006,62 @@ impl Coordinator {
 
     /// 编码区光标移动后的返回：刷新候选窗，并带上组合区新插入符位置（与默认 ←/→ 臂同形）。
     /// 只回 `Consumed` 的话宿主里的插入符不会跟着动。
-    fn caret_moved_action(&self, state: &mut State) -> KeyAction {
+    /// Ctrl+←/→ 整音节跳是否启用：`session_actions` 里写了 `ctrl+left` / `ctrl+right = "none"` 即关
+    /// （同时热键编译器也不再向宿主转发该键）。
+    pub(crate) fn ctrl_syllable_enabled(&self, vk: u32) -> bool {
+        let name = if vk == keymap::VK_LEFT {
+            "ctrl+left"
+        } else {
+            "ctrl+right"
+        };
+        !self
+            .rt()
+            .config
+            .keys
+            .session_actions
+            .get(name)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+    }
+
+    /// 编码区的音节停靠点（缓冲内字节位置，见 [`preedit_cursor::syllable_stops`]）。
+    ///
+    /// 拆分串取引擎对**整串缓冲**的切分（`preedit_split_body` / 码表整句的 `preedit_codetable_body`），
+    /// 不随高亮候选变——否则高亮一动，光标的停靠点就跟着变。对不上缓冲（双拼等）→ `None`。
+    fn caret_syllable_stops(state: &State) -> Option<Vec<usize>> {
+        [&state.preedit_split_body, &state.preedit_codetable_body]
+            .into_iter()
+            .filter(|split| split.contains('\''))
+            .find_map(|split| preedit_cursor::syllable_stops(&state.input_buffer, split))
+    }
+
+    /// 编码区光标左 / 右移一步（rime 导航器语义）。返回是否真的动了。
+    ///
+    /// - `smart` = 真（默认 ←/→，rime `Rewind` / `Forward`）：光标在音节边界上整音节跳，
+    ///   在音节中间按单字符；
+    /// - `smart` = 假（Ctrl+←/→，rime `left_by_syllable` / `right_by_syllable`）：总是整音节跳。
+    ///
+    /// 不足两个音节或拆分对不上缓冲时都退回单字符。左右两端按 rime 回绕（仅音节跳时）。
+    pub(crate) fn move_caret_syllable(state: &mut State, right: bool, smart: bool) -> bool {
+        let jump = Self::caret_syllable_stops(state).and_then(|stops| {
+            preedit_cursor::syllable_jump(&stops, state.input_cursor_pos, right, smart)
+        });
+        if let Some(pos) = jump {
+            state.input_cursor_pos = pos;
+            return true;
+        }
+        let mut ed = preedit_cursor::BufEdit::new_cased(
+            &mut state.input_buffer,
+            &mut state.input_cursor_pos,
+            &mut state.input_buffer_cased,
+        );
+        if right {
+            ed.move_right()
+        } else {
+            ed.move_left()
+        }
+    }
+
+    pub(crate) fn caret_moved_action(&self, state: &mut State) -> KeyAction {
         let text = state.preedit.clone();
         let caret_pos = self.composition_caret(state);
         self.notify_ui_update(state);
@@ -6231,6 +6303,19 @@ impl Coordinator {
                 } else {
                     return Some(KeyAction::Consumed);
                 }
+            }
+            // 整音节跳（出厂绑 Ctrl+←/→，rime `left_by_syllable` / `right_by_syllable`）。
+            // 门卫同 `CaretLeft`：overlay 让位、无会话放行；无切分时退回单字符。
+            wind_config::SessionAction::SyllablePrev | wind_config::SessionAction::SyllableNext => {
+                if state.active.is_some() || !Self::has_input_session(state) {
+                    return None;
+                }
+                let right = matches!(action, wind_config::SessionAction::SyllableNext);
+                return Some(if Self::move_caret_syllable(state, right, false) {
+                    self.caret_moved_action(state)
+                } else {
+                    KeyAction::Consumed
+                });
             }
             // 上屏编码：这里只登记、吞键，持锁的这一层没法重入分派；由出口
             // `redispatch_commit_code` 把这个键当回车再走一遍。
@@ -7454,8 +7539,9 @@ impl Coordinator {
     }
 
     /// `ime.set` 的输入状态开关（`cn-en` / `fullshape` / `s2t` / `t2s` / `toolbar`）：已是目标
-    /// 状态只提示（同数据开关），否则走 `ime.toggle` 同一条切换路径——那条路径自带状态气泡
-    /// 与工具栏刷新，这里不另弹提示，免得一次切换两个浮窗。
+    /// 状态只提示（同数据开关）。`cn-en` 是**直达**路径（置到目标态，CapsLock 取消后也按
+    /// 目标落地）；其余走 `ime.toggle` 同一条切换路径——那条路径自带状态气泡与工具栏刷新，
+    /// 这里不另弹提示，免得一次切换两个浮窗。
     ///
     /// `cn-en` 读的是 `chinese_mode`（用户选的中英），不含 CapsLock 临时英文：`set` 回答的是
     /// 「切到中文」，CapsLock 松开后自然回到中文。
@@ -7495,6 +7581,15 @@ impl Coordinator {
                 self.notify_set_unchanged(target, &text);
             }
             return Ok(false);
+        }
+        if target == "cn-en" {
+            // 中英开关走**直达**路径，不吃 ime.toggle 的翻转语义：ime.set 的契约是
+            // 「置为目标态」，已在目标态根本到不了这里（上面已 return）。
+            // CapsLock 开着时取消锁定并直达目标（Directed，不吃 mode_after_cancel 归位）；
+            // 待编码经 push 出口交还宿主，避免丢字（见 [`SwitchCommit`]）。
+            let (_, commit) = self.cn_en_set_with_commit(on);
+            self.push_switch_commit(&commit);
+            return Ok(true);
         }
         self.cmd_ime_toggle(target);
         Ok(true)
@@ -9379,6 +9474,21 @@ impl Coordinator {
     ) -> (Option<StatusUpdateData>, SwitchCommit) {
         let had_pending = self.has_pending_composition();
         let (status, text) = self.handle_toggle_mode_cased(upper);
+        (status, SwitchCommit { text, had_pending })
+    }
+
+    /// `ime.set("cn-en", …)` 的执行体：**置**中英态为目标值（区别于 toggle 的翻转）。
+    ///
+    /// 调用方保证「已在目标态」根本不会进来（`ime_state_set` 先判，只提示不动作），
+    /// 待编码零扰动的问题不存在；走到这里必然真切换，编码按 toggle 同一策略交还宿主。
+    /// CapsLock 开着时走 [`CapsCancelSwitch::Directed`]：取消锁定的同时直达目标，
+    /// 不吃 `mode_after_cancel` 的归位改写。
+    pub(crate) fn cn_en_set_with_commit(
+        &self,
+        chinese: bool,
+    ) -> (Option<StatusUpdateData>, SwitchCommit) {
+        let had_pending = self.has_pending_composition();
+        let (status, text) = self.handle_switch_mode_cased(Some(chinese), false);
         (status, SwitchCommit { text, had_pending })
     }
 
@@ -14736,6 +14846,85 @@ mod caret_compat_tests {
         );
     }
 
+    /// Word 按键期同步取坐标被 TS_E_SYNCHRONOUS 拒绝后，DLL 回退发出的 `gui_caret` 帧
+    /// 是一个固定的陈旧位置（论坛 t377 日志：真插入点 (1488,541)，GUI 光标恒为 (1434,272)）。
+    /// 本组合已收到过 TSF 域坐标后，这类帧只能是噪声：不得改写缓存、重锁组合起点、重显候选窗，
+    /// 否则候选窗在两者之间上下来回跳约 270px。
+    #[test]
+    fn a_gui_caret_frame_cannot_relocate_a_composition_that_has_tsf_coordinates() {
+        const TOP: i32 = 518;
+        const BOTTOM: i32 = 541;
+        const LINE_H: i32 = 23;
+
+        let (c, _rx) = Coordinator::new_headless_with_ui(Config::default(), None);
+        set_mode(&c, wind_config::app_compat::FirstShowMode::Instant);
+        *c.last_valid_caret.lock().unwrap() = (1472, BOTTOM, LINE_H);
+        c.last_sane_caret_height
+            .store(LINE_H, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "xg".into();
+            st.candidates = vec![wind_candidate::Candidate {
+                text: "线".into(),
+                ..Default::default()
+            }];
+        }
+        c.handle_caret_update(&CaretData {
+            x: 1488,
+            y: BOTTOM,
+            height: LINE_H,
+            composition_start_x: 1472,
+            composition_start_y: BOTTOM,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+            composition_rect: Some((1472, TOP, 1488, BOTTOM)),
+        });
+        let before = *c.composition_start.lock().unwrap();
+        assert_eq!(
+            (before.0, before.1),
+            (1472, BOTTOM),
+            "前提：TSF 帧已锁定组合起点"
+        );
+
+        // 回退链交出的 Win32 光标：无组合起点、无组合矩形
+        c.handle_caret_update(&CaretData {
+            x: 1434,
+            y: 272,
+            height: 20,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            source: wind_ipc::protocol::caret_source::GUI_CARET,
+            composition_rect: None,
+        });
+
+        let cs = *c.composition_start.lock().unwrap();
+        assert_eq!((cs.0, cs.1), (1472, BOTTOM), "GUI 帧不得重锁组合起点");
+        let (cy, src) = {
+            let st = c.state.lock().unwrap();
+            (st.caret_y, st.caret_source)
+        };
+        assert_eq!(cy, BOTTOM, "GUI 帧不得覆盖坐标缓存");
+        assert_eq!(src, wind_ipc::protocol::caret_source::TSF_SELECTION);
+
+        // 组合结束后，GUI 帧恢复原有语义（组合前空闲上报等），不能被永久屏蔽
+        c.reset_first_show();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer.clear();
+            st.candidates.clear();
+        }
+        c.handle_caret_update(&CaretData {
+            x: 1434,
+            y: 272,
+            height: 20,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            source: wind_ipc::protocol::caret_source::GUI_CARET,
+            composition_rect: None,
+        });
+        let cy = c.state.lock().unwrap().caret_y;
+        assert_eq!(cy, 272, "下一轮开始前 GUI 帧仍应照常写缓存");
+    }
+
     /// 只返回首行的宿主：`caret.y` 会大于 `rect.bottom` ⇒ 判定不可信 ⇒ 回退既有逻辑。
     ///
     /// 目前实测三家宿主都返回真包围盒（`caret.y` 恒等于 `bottom`），但规范不保证，
@@ -17806,7 +17995,7 @@ mod initial_mode_tests {
     /// Ctrl+空格 按它自己请求的方向；`english` 两条路都进英文（楼主要的就是这个）。
     #[test]
     fn mode_after_caps_cancel_matrix() {
-        use super::CapsCancelSwitch::{System, Toggle};
+        use super::CapsCancelSwitch::{Directed, System, Toggle};
         let f = Coordinator::mode_after_caps_cancel;
         for cur in [true, false] {
             // 出厂：Shift 归位中文（不看当前模式），Ctrl+空格 按请求。
@@ -17829,6 +18018,20 @@ mod initial_mode_tests {
             }
             assert!(!f("english", Toggle, cur), "english/Shift 应进英文");
             assert_eq!(f("toggle", Toggle, cur), !cur, "toggle/Shift 应照常翻转");
+            // 定向切换（ime.set）：带明确目标，归位配置怎么配都直达目标。
+            assert!(
+                f("chinese", Directed(true), cur),
+                "Directed(true) 应直达中文"
+            );
+            assert!(
+                !f("chinese", Directed(false), cur),
+                "Directed(false) 应直达英文"
+            );
+            assert!(
+                f("english", Directed(true), cur),
+                "Directed(true) 压过 english 归位"
+            );
+            assert!(!f("bogus", Directed(false), cur), "Directed 不吃归位改写");
             // 认不出的值回落出厂语义（设置端 options 与 core 值域脱节时不至于乱跳）。
             assert!(f("bogus", Toggle, cur));
             assert!(f("", Toggle, cur));

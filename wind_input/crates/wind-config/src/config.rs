@@ -1321,11 +1321,12 @@ pub struct AuxCodeGlobal {
     /// 单字恒参与匹配，不受此限。
     #[serde(default)]
     pub max_phrase_len: usize,
-    /// 直接辅助码（**仅双拼**）：不按引导键，输入末 1～2 位自动当辅码，字形对得上的字词
-    /// 提到前面（`docs/design/aux-code-direct.md`）。**出厂 `false`**。
+    /// 直接辅助码（**仅双拼**）：不按引导键，任一音节后直接敲 1～2 位形码当该字的辅码，
+    /// 长句中间也可以（连续辅助码：`gokqk` → 国情，国 = ky；`docs/design/aux-code-continuous.md`）。
+    /// 串尾末字 1 位照旧提前（`docs/design/aux-code-direct.md`）。**出厂 `false`**。
     ///
     /// 只在 [`Self::enabled`] 也生效时起作用：`enabled` 是总闸（码表加载），本项只决定
-    /// 「末尾字母要不要自动判为辅码」。它改变了末尾字母的语义，要用户表态，故出厂关——
+    /// 「音节后的字母要不要自动判为辅码」。它改变了字母的语义，要用户表态，故出厂关——
     /// 与 `enabled` 同一条「默认什么都不发生」。全拼方案写了也不生效（`lim` 既可能是
     /// li+m 也可能是「厘米」简拼），见 `EngineManager::aux_code_settings_of`。
     #[serde(default)]
@@ -2083,6 +2084,14 @@ pub enum SessionAction {
     /// 绑 `commit_highlighted` 就永远移动不了光标，绑移动就永远选不了词。无候选时末尾
     /// 那一下纯吞键（没有可上屏的东西，也不该把 → 交给宿主）。其余边界同 [`Self::CaretLeft`]。
     CaretRight(CaretEnd),
+    /// 编码区光标**整音节**左跳（rime `left_by_syllable`）：落到前一个音节起点，已在开头则回绕到
+    /// 最后一个音节起点。分隔符 `'` 之后算起点。无可用切分（双拼、码表单码等）时退回左移一字符。
+    /// 可绑到普通键（会话键表只认键 + Shift）。Ctrl+← 是内建的另一条通路（见
+    /// `Compiler` 的 Ctrl+←/→ 转发登记与协调器的 Ctrl 分支），不经本动词。
+    SyllablePrev,
+    /// 编码区光标**整音节**右跳（rime `right_by_syllable`），已在末尾则回绕到第一个音节边界。
+    /// 其余同 [`Self::SyllablePrev`]。
+    SyllableNext,
     /// 开 / 关高亮候选的悬停提示气泡（反查编码、拆字等），不用鼠标悬停（t372）。
     ///
     /// 走鼠标悬停同一条通路（悬停目标 = 高亮项），气泡内容与定位完全一致；再按一次收起，
@@ -2234,6 +2243,8 @@ impl SessionAction {
             "commit_highlighted" => Self::CommitHighlighted,
             "caret_left" => Self::CaretLeft,
             "caret_right" => Self::CaretRight(CaretEnd::Commit),
+            "syllable_prev" => Self::SyllablePrev,
+            "syllable_next" => Self::SyllableNext,
             "toggle_tip" => Self::ToggleTip,
             "commit_code" => Self::CommitCode,
             // `clear` 是 `cancel` 的别名（同一个动作，两种心智），见 `Cancel` 的文档。
@@ -2271,6 +2282,8 @@ impl SessionAction {
                 | Self::CommitCode
                 | Self::CaretLeft
                 | Self::CaretRight(_)
+                | Self::SyllablePrev
+                | Self::SyllableNext
         )
     }
 
@@ -2348,6 +2361,8 @@ impl std::fmt::Display for SessionAction {
             },
             Self::CommitHighlighted => f.write_str("commit_highlighted"),
             Self::CaretLeft => f.write_str("caret_left"),
+            Self::SyllablePrev => f.write_str("syllable_prev"),
+            Self::SyllableNext => f.write_str("syllable_next"),
             Self::CaretRight(a) => match a.as_payload() {
                 "" => f.write_str("caret_right"),
                 p => write!(f, "caret_right:{p}"),
@@ -4852,6 +4867,20 @@ pub struct AutoPairConfig {
     /// 跨焦点的陈旧不归它管——失焦一律清空配对状态（见 `handle_focus_lost`）。
     #[serde(default = "default_pair_state_ttl_secs")]
     pub state_ttl_secs: u32,
+    /// 配对插入改走 Unicode 按键注入提交（内部项，默认关 = 现状的 TSF 直写）。
+    ///
+    /// **为什么需要**：配对插入（`InsertTextWithCursor`）走 `ITfInsertAtSelection` 直写宿主
+    /// text store。AutoCAD 表格在位编辑器谎报 `S_OK` 却丢弃写入的 ASCII（2026-11-18 靶机
+    /// 实测：半角 `()` 丢、全角「（）」接受）；开组合 SetText、逐字符会话等 TSF 写法同样
+    /// 无效，只有 `VK_PACKET` 产生的真实 WM_CHAR 能上屏。
+    ///
+    /// 开启后 DLL 以按键注入上屏配对文本（空闲态被吃下的 ASCII 标点同理），光标回移仍走
+    /// `VK_LEFT`（修饰键按住时延后到松开，避免 Shift+Left 选中右符号）。
+    ///
+    /// 默认关：直写在多数宿主已工作多年；compat 层 `pair_via_comp` 按应用覆盖本值，
+    /// 目前只有 AutoCAD 需要。
+    #[serde(default)]
+    pub commit_via_composition: bool,
 }
 
 impl Default for AutoPairConfig {
@@ -4863,6 +4892,7 @@ impl Default for AutoPairConfig {
             english_pairs: default_english_pairs(),
             jump_out_keys: default_jump_out_keys(),
             state_ttl_secs: default_pair_state_ttl_secs(),
+            commit_via_composition: false,
         }
     }
 }
