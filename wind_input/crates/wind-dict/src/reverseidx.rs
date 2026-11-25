@@ -1,49 +1,28 @@
 //! `.wridx`：反查索引（词 → 该词的全部编码）的序列化格式与读取器。
 //!
-//! # 为什么它值得有自己的格式
-//!
-//! 反查索引此前是纯堆结构，随方案常驻。十万词级的码表约 2.4 MB 无所谓，但大词库上它
-//! 是个**长尾灾难**：真机实测 feihuzj2 方案 251 万词 → **95.4 MB**，且最多缓存两份。
-//! 其中光是定长条目数组就占 40 MB（16 B × 251 万）——42% 的内存花在「索引」而非「数据」上，
-//! 而这部分恰恰是最适合留在磁盘上按需分页的。
-//!
-//! # 为什么这里没有 DAT（与 `.wdat` 的分工）
-//!
-//! 曾试过把反查做成 **text 为键的 `.wdat`**（双数组 trie），实测 264 MB 磁盘 + 15 秒写入，
-//! 为的是省 95 MB 内存——**净亏**，方案作废。原因是 DAT 是为「按前缀逐键检索百万条」
-//! 付的钱，而反查的两种用法都不需要它：
-//!
-//! - `codes_of`：精确点查，每页候选查 5~9 次 → 二分足够；
-//! - `texts_with_prefix`：前缀顺扫，靠「按 text 字节序排」这一条性质就能做，无需额外索引。
-//!
-//! 所以本格式的骨架取自 [`crate::commentdict`]（`.wcmt`：排序数组 + 二分），数据语义
-//! 取自原先的堆结构（词 → 编码**列表** + 该词最大权重）。文件体积因此与堆结构同量级，
-//! mmap 才真正划算。
+//! 落盘后按文件大小常驻或 mmap，大词库的反查索引不再占私有内存。不用 text 为键的 `.wdat`：
+//! 反查只做精确点查（`codes_of`，二分足够）与前缀顺扫（`texts_with_prefix`，靠按 text 字节序排），
+//! 用不上双数组 trie。骨架取自 [`crate::commentdict`]（`.wcmt`：排序数组 + 二分）。
+//! 取舍与数据见 `docs/architecture/rime-dict-loading.md` 的反查索引一节。
 //!
 //! # 文件布局
 //!
 //! - Header (32 B)：magic `WRIX` + version u32 + entry_count u32
 //!   + index_off u32 + text_off u32 + value_off u32 + reserved u32 × 2
-//! - Entry[entry_count] (16 B 每条，**按 text UTF-8 字节序升序**)：
+//! - Entry[entry_count] (16 B 每条，按 text UTF-8 字节序升序)：
 //!   text_off u32（相对 `text_off` 段）+ text_len u16 + code_count u16
 //!   + value_off u32（相对 `value_off` 段）+ weight i32
 //! - TextPool：全部词按条目序连续拼接
 //! - ValuePool：每条目 `[len u8][code 字节]` × code_count，按条目序连续
 //!
-//! 两个池都**按条目序**写入，于是前缀顺扫在条目数组与文本池上都是顺序访问
-//! （mmap 下这决定了是「几次缺页」还是「每词一次缺页」）。
-//!
-//! ## 为什么编码用 1 字节长度前缀而不是全局结束偏移数组
-//!
-//! 堆版用 `code_ends: Vec<u32>`（每个编码 4 B）。改成紧跟数据的 1 B 长度前缀后每码省 3 B，
-//! 且省掉了一个独立的段。代价是 `CodeList` 只能顺序走而不能随机定位——但每词的编码数
-//! 是个位数，`last()` 走到底也是几步。
+//! 两个池都按条目序写入，前缀顺扫在 mmap 下是顺序访问（几次缺页而非每词一次）。
+//! 编码用 1 B 长度前缀而非偏移数组，每码省 3 B；代价是 `CodeList` 只能顺序走，
+//! 但每词编码数是个位数。
 //!
 //! # 常驻 vs 映射
 //!
 //! [`ReverseIndex::open`] 按文件大小自动选：小于阈值就整份读进内存（省掉缺页与文件句柄），
-//! 否则 mmap。**两条路走的是同一份字节布局、同一套查找代码**——这是刻意的：反查是低频
-//! 路径，两套实现的分叉会长期无人发现。
+//! 否则 mmap。两条路刻意共用同一份字节布局与查找代码：反查是低频路径，分叉会长期无人发现。
 
 use crate::mapping::Mapped;
 use std::path::Path;
@@ -315,14 +294,13 @@ impl ReverseIndex {
     /// # 为什么能这么便宜
     ///
     /// 条目本就按 `text` 字节序升序（反查用二分的前提）。字节序下同前缀的词必然连续，
-    /// 于是二分找到下界后顺序走到第一个不匹配即止——**无需任何额外索引**。
+    /// 于是二分找到下界后顺序走到第一个不匹配即止，无需额外索引。
     /// 顺扫方向与两个池的写入序一致，mmap 下也是顺序访问。
     ///
-    /// ⚠️ 前缀本身要排除：「中」的联想不该包含「中」自己。
+    /// 前缀本身要排除：「中」的联想不该包含「中」自己。
     ///
-    /// 扫描长度是该前缀下的词数（「中」约数千），每次上屏一次，微秒级。刻意不做提前截断
-    /// ——按权重取 top-N **必须看完全部候选**，扫到一半就停会退化成「字典序前 N 里权重
-    /// 最高的那几个」，那是个看起来对、实则完全不对的结果。
+    /// 扫描长度是该前缀下的词数（「中」约数千），微秒级。刻意不提前截断：按权重取 top-N
+    /// 必须看完全部候选，否则退化成「字典序前 N 里权重最高的」。
     pub fn texts_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(&str, i32)> {
         if prefix.is_empty() || limit == 0 {
             return Vec::new();
@@ -398,24 +376,11 @@ impl<'a> CodeList<'a> {
 /// 把 (词, 编码, 权重) 三元组序列化成 `.wridx` 镜像。
 ///
 /// 同一 (词, 编码) 重复只留一份；每词的编码按「码长升序 → 字典序」排，权重取该词全部
-/// 条目中的**最大**值。
+/// 条目中的最大值（供 [`ReverseIndex::texts_with_prefix`] 的词语联想按常用度排序）。
+/// 取 max 必须在按 (词, 码) 去重之前：同一 (词, 码) 跨库权重不同是常态，先去重会丢掉高权重那条。
 ///
-/// # 为什么权重要取 max，且必须在去重之前取
-///
-/// 反查本身用不到权重——它是给 [`ReverseIndex::texts_with_prefix`] 的：词语联想要的是
-/// 「以『中』开头的**最常用**的几个词」。同一个词在主库与扩展库各有一条时取到低的那个，
-/// 会让它在联想里莫名靠后。
-///
-/// ⚠️ **聚合必须发生在按 (词, 码) 去重之前**。同一个 (词, 码) 跨库出现、权重不同是常态
-/// （扩展库给同一个打法配了更高词频），去重后再取 max 等于「取排序后靠前那条的权重」
-/// ——而排序键里根本没有权重。这个错误不改变索引体积，只改变联想顺序，
-/// 靠「大小相等」一类的判据永远测不出来。
-///
-/// # 超限条目的处置
-///
-/// 三条上限（词 64 KB、单码 255 B、每词 65535 码）在真实词库上都触不到，但缓存格式必须
-/// 对畸形输入有确定行为。丢弃的是**单个编码**或**单个词**，且各自计数出 warn——
-/// 静默丢弃会表现为「某个词反查不到」，那是最难归因的一类故障。
+/// 三条上限（词 64 KB、单码 255 B、每词 65535 码）真实词库触不到，但对畸形输入须有确定行为：
+/// 丢弃单个编码或单个词，并各自计数出 warn，免得「某个词反查不到」无从归因。
 pub fn serialize(mut pairs: Vec<(String, String, i32)>) -> Vec<u8> {
     // 全局一次排序即同时满足：词分组相邻、组内码长升序、同长按字典序。
     // 权重不参与排序——它是分组内的聚合量，不影响条目次序。
@@ -444,11 +409,7 @@ pub fn serialize(mut pairs: Vec<(String, String, i32)>) -> Vec<u8> {
             long_text += 1;
             continue;
         }
-        // ★ 权重取该词**全部原始条目**的最大值——必须在下面的按码去重与超限过滤
-        //   **之前**算。此前是先 `dedup_by((词, 码))` 再在去重后的条目上取 max，于是
-        //   同一个 (词, 码) 分散在主库与扩展库、权重不同时，高权重那条被整条丢掉，
-        //   该词在词语联想里就按偏低的权重排序（真机上表现为常用词莫名靠后）。
-        //   这个洞能长期存活，是因为旧判据只比了「索引总字节数」——权重差异不改变体积。
+        // 权重取该词全部原始条目的最大值，必须在下面的按码去重与超限过滤之前算（见函数文档）。
         let weight = group.iter().map(|p| p.2).max().unwrap_or(0);
 
         let value_start = values.len();
@@ -456,7 +417,7 @@ pub fn serialize(mut pairs: Vec<(String, String, i32)>) -> Vec<u8> {
         let mut prev_code: Option<&str> = None;
         for (_, code, _) in group {
             // 同 (词, 码) 只留一份，否则同一个码会在候选的 [编码] 段里出现两次。
-            // 排序已让同码相邻，比上一条即可；判重放在超限过滤**之前**，
+            // 排序已让同码相邻，比上一条即可；判重放在超限过滤之前，
             // 使「留哪一条」与「这条留不留得下」两件事互不干扰。
             if prev_code == Some(code.as_str()) {
                 continue;
@@ -538,339 +499,9 @@ pub fn write_wridx(path: &Path, image: &[u8]) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build(v: &[(&str, &str, i32)]) -> ReverseIndex {
-        ReverseIndex::build(
-            v.iter()
-                .map(|(t, c, w)| (t.to_string(), c.to_string(), *w))
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn roundtrip_through_disk_is_byte_identical_and_behaviour_identical() {
-        let mem = build(&[
-            ("工", "aaaa", 100),
-            ("工", "a", 50),
-            ("中", "khk", 10),
-            ("大", "de", 7),
-        ]);
-        let p = std::env::temp_dir().join(format!("wind_wridx_rt_{}.wridx", std::process::id()));
-        write_wridx(&p, mem.image()).unwrap();
-
-        // 阈值给足 → 常驻；给 0 → mmap。两条路都必须与内存版**逐位相同**。
-        let resident = ReverseIndex::open(&p, usize::MAX).unwrap();
-        let mapped = ReverseIndex::open(&p, 0).unwrap();
-        assert!(resident.is_resident());
-        assert!(!mapped.is_resident());
-        assert_eq!(resident.image(), mem.image());
-        assert_eq!(mapped.image(), mem.image());
-        assert_eq!(mapped.resident_bytes(), 0, "mmap 不应计入常驻内存");
-        assert_eq!(resident.resident_bytes(), mem.data_bytes());
-
-        for idx in [&mem, &resident, &mapped] {
-            assert_eq!(idx.len(), 3);
-            assert_eq!(
-                idx.codes_of("工").unwrap().iter().collect::<Vec<_>>(),
-                ["a", "aaaa"]
-            );
-            assert_eq!(idx.codes_of("工").unwrap().last(), Some("aaaa"));
-            assert_eq!(idx.codes_of("工").unwrap().join("/"), "a/aaaa");
-            assert!(idx.codes_of("无").is_none());
-        }
-        drop((resident, mapped));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// arena 是连续拼接的，相邻词/码若边界算错会串味。等长且互为前缀的样本压这个边界。
-    #[test]
-    fn pool_boundaries_dont_bleed() {
-        let idx = build(&[
-            ("甲", "aa", 1),
-            ("甲", "aaa", 1),
-            ("乙", "bb", 1),
-            ("丙", "cc", 1),
-        ]);
-        assert_eq!(
-            idx.codes_of("甲").unwrap().iter().collect::<Vec<_>>(),
-            ["aa", "aaa"]
-        );
-        assert_eq!(
-            idx.codes_of("乙").unwrap().iter().collect::<Vec<_>>(),
-            ["bb"]
-        );
-        // 「丙」按字节序排首位，其编码起点必须是 0 而非前一条目的终点
-        assert_eq!(
-            idx.codes_of("丙").unwrap().iter().collect::<Vec<_>>(),
-            ["cc"]
-        );
-        assert!(idx.codes_of("").is_none(), "空词不应命中");
-    }
-
-    /// 多字节键的二分：比较按 UTF-8 字节序，与写入端 `String::cmp` 必须一致。
-    /// 混入扩展区汉字（4 字节）——若哪一端按 char 数或 UTF-16 比较，这里会错位。
-    #[test]
-    fn multibyte_keys_compare_consistently() {
-        let idx = build(&[
-            ("𠮷", "a", 1),
-            ("吉", "b", 1),
-            ("a", "c", 1),
-            ("Ω", "d", 1),
-            ("🀄", "e", 1),
-        ]);
-        for (k, want) in [
-            ("𠮷", "a"),
-            ("吉", "b"),
-            ("a", "c"),
-            ("Ω", "d"),
-            ("🀄", "e"),
-        ] {
-            assert_eq!(
-                idx.codes_of(k).unwrap().last(),
-                Some(want),
-                "键 {k} 应可查到"
-            );
-        }
-        // 边界：小于最小键 / 大于最大键
-        assert!(idx.codes_of("\u{1}").is_none());
-        assert!(idx.codes_of("\u{10FFFF}").is_none());
-    }
-
-    #[test]
-    fn empty_index_is_valid_everywhere() {
-        let mem = build(&[]);
-        assert!(mem.is_empty());
-        assert!(mem.codes_of("任意").is_none());
-        assert!(mem.texts_with_prefix("中", 9).is_empty());
-        let p = std::env::temp_dir().join(format!("wind_wridx_empty_{}.wridx", std::process::id()));
-        write_wridx(&p, mem.image()).unwrap();
-        let disk = ReverseIndex::open(&p, usize::MAX).unwrap();
-        assert!(disk.is_empty());
-        assert!(disk.codes_of("任意").is_none());
-        drop(disk);
-        let _ = std::fs::remove_file(&p);
-
-        // Default 与「序列化一个空表」必须行为一致（前者刻意不走序列化，故须单独验）
-        let d = ReverseIndex::default();
-        assert!(d.is_empty() && d.codes_of("x").is_none());
-        assert!(d.texts_with_prefix("x", 9).is_empty());
-    }
-
-    /// 非 wridx / 版本不符 / 过短的文件必须被拒绝而非当成空表——否则缓存格式升级后
-    /// 用户会静默失去反查，且毫无提示。
-    #[test]
-    fn rejects_foreign_or_stale_file() {
-        let p = std::env::temp_dir().join(format!("wind_wridx_bad_{}.wridx", std::process::id()));
-        std::fs::write(
-            &p,
-            b"not a wridx file at all, padded well past the header size",
-        )
-        .unwrap();
-        assert!(
-            ReverseIndex::open(&p, usize::MAX).is_err(),
-            "magic 不符须拒绝"
-        );
-        std::fs::write(&p, b"WRIX").unwrap();
-        assert!(ReverseIndex::open(&p, usize::MAX).is_err(), "过短须拒绝");
-        // 版本位改掉 → 拒绝（缓存格式升级的自动失效依赖这一条）
-        let mut img = build(&[("中", "a", 1)]).image().to_vec();
-        img[4..8].copy_from_slice(&(VERSION + 1).to_le_bytes());
-        std::fs::write(&p, &img).unwrap();
-        assert!(
-            ReverseIndex::open(&p, usize::MAX).is_err(),
-            "版本不符须拒绝"
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 超长编码被丢弃，但**同词的其它编码与权重必须留下**——整词消失才是真正的伤害。
-    #[test]
-    fn oversized_code_is_dropped_without_losing_the_word() {
-        let long = "x".repeat(MAX_CODE_BYTES + 1);
-        let idx = ReverseIndex::build(vec![
-            ("词".into(), "ok".into(), 5),
-            ("词".into(), long, 900),
-            ("别的".into(), "z".into(), 1),
-        ]);
-        assert_eq!(
-            idx.codes_of("词").unwrap().iter().collect::<Vec<_>>(),
-            ["ok"]
-        );
-        // 权重在编码过滤之**前**聚合，故被丢弃那条的 900 仍要生效
-        assert_eq!(
-            idx.texts_with_prefix("词", 1),
-            Vec::<(&str, i32)>::new(),
-            "「词」没有更长的词"
-        );
-        let all = build(&[("中", "a", 1)]);
-        assert_eq!(all.len(), 1);
-    }
-
-    /// 超长的**词**整条丢弃，但不能影响其相邻条目的偏移计算。
-    #[test]
-    fn oversized_text_is_dropped_without_shifting_neighbours() {
-        let huge = "中".repeat(MAX_TEXT_BYTES); // 3 字节/字 → 远超 64KB
-        let idx = ReverseIndex::build(vec![
-            ("阿".into(), "a".into(), 1),
-            (huge, "h".into(), 1),
-            ("龘".into(), "z".into(), 2),
-        ]);
-        assert_eq!(idx.len(), 2, "超长词整条丢弃");
-        assert_eq!(idx.codes_of("阿").unwrap().last(), Some("a"));
-        assert_eq!(idx.codes_of("龘").unwrap().last(), Some("z"));
-    }
-}
+#[path = "reverseidx_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod prefix_tests {
-    //! `texts_with_prefix`：词语联想的取数口。行为必须与常驻/mmap 无关，故每条都两路都跑。
-    use super::*;
-
-    fn both(
-        pairs: Vec<(String, String, i32)>,
-        tag: &str,
-    ) -> (ReverseIndex, ReverseIndex, std::path::PathBuf) {
-        let mem = ReverseIndex::build(pairs);
-        let p = std::env::temp_dir().join(format!(
-            "wind_wridx_pfx_{}_{}.wridx",
-            std::process::id(),
-            tag
-        ));
-        write_wridx(&p, mem.image()).unwrap();
-        let mapped = ReverseIndex::open(&p, 0).unwrap();
-        (mem, mapped, p)
-    }
-
-    fn sample() -> Vec<(String, String, i32)> {
-        // 刻意让**字典序**与**权重序**相反——两者一致的话，「按权重排」和「按字典序排」
-        // 会得出同样的结果，本组测试就什么都没验到。
-        [
-            ("中", "a", 1000),
-            ("中一", "aa", 1),
-            ("中丁", "ab", 2),
-            ("中国", "ac", 900),
-            ("中国人", "acd", 800),
-            ("中间", "ad", 700),
-            ("丰", "b", 500),
-            ("串", "c", 400),
-        ]
-        .iter()
-        .map(|(t, c, w)| (t.to_string(), c.to_string(), *w))
-        .collect()
-    }
-
-    #[test]
-    fn ranks_by_weight_not_dictionary_order() {
-        let (mem, mapped, p) = both(sample(), "rank");
-        for i in [&mem, &mapped] {
-            let texts: Vec<_> = i
-                .texts_with_prefix("中", 3)
-                .iter()
-                .map(|(t, _)| *t)
-                .collect();
-            assert_eq!(
-                texts,
-                ["中国", "中国人", "中间"],
-                "取的是最常用的三个，不是字典序前三（那会是 中一/中丁/中国）"
-            );
-        }
-        drop((mem, mapped));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// ★ 前缀词**自己**必须排除：「中」的联想不该包含「中」。
-    ///
-    /// 它的权重恰恰常常是全场最高（单字比词常用），不排除就会稳定占据首位，
-    /// 而选中它等于上屏一个空串。
-    #[test]
-    fn excludes_the_prefix_itself() {
-        let (mem, mapped, p) = both(sample(), "self");
-        for i in [&mem, &mapped] {
-            let out = i.texts_with_prefix("中", 9);
-            assert!(
-                !out.iter().any(|(t, _)| *t == "中"),
-                "前缀本身不是它自己的联想"
-            );
-            assert_eq!(out.len(), 5, "中一/中丁/中国/中国人/中间");
-        }
-        drop((mem, mapped));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 扫描必须在第一个不匹配处停下，且不越界到相邻前缀。
-    #[test]
-    fn does_not_leak_into_neighbouring_prefixes() {
-        let (mem, mapped, p) = both(sample(), "leak");
-        for i in [&mem, &mapped] {
-            assert!(
-                i.texts_with_prefix("丰", 9).is_empty(),
-                "「丰」没有更长的词"
-            );
-            assert!(i.texts_with_prefix("串", 9).is_empty());
-            assert!(i.texts_with_prefix("龘", 9).is_empty(), "不存在的前缀");
-            assert!(i.texts_with_prefix("", 9).is_empty());
-            assert!(i.texts_with_prefix("中", 0).is_empty());
-        }
-        drop((mem, mapped));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 同权时短词优先——「中国」比「中国人民」更适合当联想。
-    #[test]
-    fn same_weight_prefers_shorter() {
-        let i = ReverseIndex::build(vec![
-            ("中国人民".into(), "a".into(), 5),
-            ("中国".into(), "b".into(), 5),
-        ]);
-        assert_eq!(i.texts_with_prefix("中", 2)[0].0, "中国");
-    }
-
-    /// 权重取该词全部条目里的**最大**值——同一个词在主库与扩展库各有一条时，
-    /// 取到低的那个会让它在联想里莫名靠后。
-    #[test]
-    fn weight_is_max_across_codes() {
-        let i = ReverseIndex::build(vec![
-            ("中国".into(), "a".into(), 1),
-            ("中国".into(), "bb".into(), 900),
-            ("中间".into(), "c".into(), 500),
-        ]);
-        assert_eq!(i.texts_with_prefix("中", 2)[0].0, "中国", "取 900 而不是 1");
-    }
-
-    /// ★ 回归：**同一个 (词, 码) 跨库重复、权重不同**时，聚合必须取到高的那个。
-    ///
-    /// 上一条只覆盖「同词**不同**码」，而真正出问题的是同词**同码**：按 (词, 码) 去重
-    /// 会整条丢掉重复项，若聚合发生在去重之后，被丢的那条所带的高权重一并消失。
-    /// 2026-08-24 实测：`中` 在两个库里都是 `khk`（权重 10 / 999），逐库并集算出 10、
-    /// 先合并再构建算出 999——两条路径就此分叉，而当时的等价性判据（比索引总字节数）
-    /// 对权重差异完全不敏感。
-    ///
-    /// 两个方向都要断言：**颠倒输入顺序结果必须相同**。只测一个方向的话，
-    /// 「取第一条」这种错误实现会有一半概率蒙对。
-    #[test]
-    fn weight_is_max_even_when_the_same_code_repeats_across_dicts() {
-        // 两个方向都跑：只测一个方向的话，「取第一条权重」这种错误实现有一半概率蒙对。
-        for (w1, w2) in [(1, 999), (999, 1)] {
-            let i = ReverseIndex::build(vec![
-                ("甲乙".into(), "x".into(), w1),
-                ("甲乙".into(), "x".into(), w2), // 同码重复：必有一条被去重丢掉
-                ("甲丙".into(), "y".into(), 500),
-            ]);
-            assert_eq!(
-                i.codes_of("甲乙").unwrap().iter().collect::<Vec<_>>(),
-                ["x"],
-                "同 (词, 码) 仍须去重成一条"
-            );
-            assert_eq!(
-                i.texts_with_prefix("甲", 2)
-                    .iter()
-                    .map(|(t, w)| (*t, *w))
-                    .collect::<Vec<_>>(),
-                [("甲乙", 999), ("甲丙", 500)],
-                "被去重丢掉的那条所带的权重必须参与聚合（w1={w1}, w2={w2}）"
-            );
-        }
-    }
-}
+#[path = "reverseidx_prefix_tests.rs"]
+mod prefix_tests;

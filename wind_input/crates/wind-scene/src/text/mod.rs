@@ -15,17 +15,9 @@ pub struct TextMetrics {
 
 /// 一次文字排版所需的全部字体属性。
 ///
-/// ## 为什么收成结构体
-///
-/// 这些属性要穿过三个后端（DirectWrite / CoreText / mock）和全部测量与绘制调用点。
-/// 散开成位置参数时，每加一项都要改所有签名——重构前的 `draw_text_styled` 已是 11 个参数，
-/// 再加行高、斜体就到 13 个，而参数越多，传错顺序时编译器越抓不到（`size`/`weight`
-/// 都是数值，换个位置照样编译）。
-///
-/// 隔壁 wind-ui-rust 走过这条路并留下了教训：字重就是因为"每加一项都要改所有签名"
-/// 而**没有进签名**，改走线程局部注入——于是字重成了隐式全局状态，某条路径忘了复位，
-/// 后续无关文字就跟着变粗，且只在特定绘制顺序下显形。收成结构体后新增属性只是加一个
-/// 字段，签名不动、调用点不动。
+/// 收成结构体是为了穿过三个后端（DirectWrite / CoreText / mock）与全部测量、绘制调用点时，
+/// 新增属性只加字段、不改签名；也避免了改走线程局部注入那种隐式全局状态（忘了复位就串到
+/// 后续无关文字上）。
 ///
 /// 本仓暂不设 `line_height`：View 引擎还没有行高概念，高度直接取自后端度量。
 /// 加字段前先让它在渲染路径里真正生效，否则就是「声明未实现」。
@@ -65,7 +57,7 @@ impl<'a> TextStyle<'a> {
 
 /// 分段颜色的一段：文本里 `[start, end)` 这段字节区间改用 `rgba`（`[R, G, B, A]`）画。
 ///
-/// **只作用于绘制，不参与测量**——整串仍一次整形，理由同 `View::caret_at`：拆开各自排版会让
+/// 只作用于绘制，不参与测量——整串仍一次整形，理由同 `View::caret_at`：拆开各自排版会让
 /// 宽度随着色边界抖动。三个后端都按这条实现：DirectWrite 用 drawing effect（格式属性，
 /// 不参与整形），CoreText 整形一次后按字形子区间换填充色。
 ///
@@ -120,13 +112,13 @@ pub fn utf16_runs(text: &str, runs: &[ColorRun]) -> Vec<(u32, u32, [u8; 4])> {
 ///
 /// 存哈希而非完整键，是为了免掉每次查询都克隆 `String`——测量在热路径上，一帧数十次。
 /// 64 位下 4096 条目的碰撞概率约 4.5e-13，可忽略；真碰撞的后果是某段文本用了另一段的
-/// 宽度（布局错位），故键必须**覆盖所有影响测量的输入**，漏一项就是系统性错位而非偶发。
+/// 宽度（布局错位），故键必须覆盖所有影响测量的输入。
 ///
 /// 字号用 `to_bits()` 而非 `as u32`：字号是 DPI 缩放后的浮点（如 14.4/16.8），
 /// 取整会让相邻字号撞进同一个键。
 ///
-/// ⚠️ 给 [`TextStyle`] 加字段时**必须同步加进这里**——漏一项就是某段文本静默套用另一段
-/// 的宽度。这正是它按整个 `TextStyle` 取参、而非重新罗列各项的原因：字段列表只有一处。
+/// 给 [`TextStyle`] 加字段时必须同步加进这里，否则某段文本会静默套用另一段的宽度
+/// （按整个 `TextStyle` 取参正是为此）。
 pub fn measure_key(text: &str, ts: &TextStyle) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -315,83 +307,8 @@ impl TextBackend for MockText {
 // 这里测的是**键的区分度**而非缓存命中：键漏掉任何一项影响测量的输入，后果都是某段文本
 // 静默套用另一段的宽度——布局错位，且因为是缓存命中路径，重现条件依赖于测量顺序，极难定位。
 #[cfg(test)]
-mod measure_key_tests {
-    use super::{TextStyle, measure_key};
-
-    /// 字号 14、字重 400、指定字体族的基准样式。
-    fn base_style() -> TextStyle<'static> {
-        TextStyle::new(14.0)
-            .with_weight(400)
-            .with_family(Some("微软雅黑"))
-    }
-
-    /// 同一组输入恒得同一个键（缓存能命中的前提）。
-    #[test]
-    fn same_inputs_yield_same_key() {
-        assert_eq!(
-            measure_key("你好", &base_style()),
-            measure_key("你好", &base_style())
-        );
-    }
-
-    /// 四项输入各自独立参与键——逐项只改一个，键都必须变。
-    #[test]
-    fn each_input_affects_key() {
-        let s = base_style();
-        let base = measure_key("你好", &s);
-        assert_ne!(base, measure_key("你好啊", &s), "文本");
-        assert_ne!(
-            base,
-            measure_key("你好", &TextStyle { size: 16.0, ..s }),
-            "字号"
-        );
-        assert_ne!(base, measure_key("你好", &s.with_weight(700)), "字重");
-        assert_ne!(
-            base,
-            measure_key("你好", &s.with_family(Some("宋体"))),
-            "字体族"
-        );
-    }
-
-    /// 字号必须按 `to_bits()` 精确入键，不能取整。
-    ///
-    /// 字号是 DPI 缩放后的浮点：125% 下 12px→15.0、13px→16.25，150% 下 14px→21.0。
-    /// 若按 `as u32`/`round()` 入键，16.25 与 16.8 会撞进同一条缓存——注释与正文只差
-    /// 一两个像素时恰好落进这个区间，表现为某一档 DPI 下注释宽度突然用了正文的值。
-    #[test]
-    fn fractional_sizes_do_not_collide() {
-        assert_ne!(
-            measure_key("你好", &TextStyle::new(16.25)),
-            measure_key("你好", &TextStyle::new(16.8)),
-            "同一整数区间内的两个字号不得共用缓存键"
-        );
-    }
-
-    /// `None`（用全局字体族）与显式指定不是一回事：`set_font_family` 只会让前者失效。
-    /// 两者若共用键，换字体后显式指定的条目会被连带清掉（性能损失，无正确性问题），
-    /// 更糟的是反过来——全局族的条目被显式族的值命中，直接就是错误宽度。
-    #[test]
-    fn none_family_differs_from_explicit() {
-        let s = TextStyle::new(14.0);
-        assert_ne!(
-            measure_key("你好", &s),
-            measure_key("你好", &s.with_family(Some("微软雅黑"))),
-        );
-    }
-
-    /// 空串字体族经 `with_family` 归一成 `None`——统一在构造处收口，免得各调用点
-    /// 各自过滤，漏一处就多出一条与 `None` 等价却不同键的缓存。
-    #[test]
-    fn empty_family_normalizes_to_none() {
-        let s = TextStyle::new(14.0);
-        assert_eq!(
-            measure_key("你好", &s),
-            measure_key("你好", &s.with_family(Some(""))),
-            "空串字体族应归一为 None"
-        );
-        assert_eq!(s.with_family(Some("  ")).family, None, "纯空白也应归一");
-    }
-}
+#[path = "mod_measure_key_tests.rs"]
+mod measure_key_tests;
 
 // 分段颜色区间的纯逻辑（不依赖任何后端），不限平台。
 #[cfg(test)]

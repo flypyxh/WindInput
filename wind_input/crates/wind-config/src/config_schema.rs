@@ -1,11 +1,10 @@
 //! 配置字段注册表（声明式单一真相源）。
 //!
-//! 每个配置叶子键在此声明其值类型。通过测试与 [`Config`](crate::config::Config) 结构体
-//! **反向对照**（注册表覆盖所有键、类型与默认值一致），并与系统预置 `data/config.toml`
-//! 对照（无孤立键）。CLI、core 端校验、设置 UI 均由此注册表派生，杜绝多份手写真相源漂移。
+//! 每个配置叶子键在此声明其值类型，经测试与 [`Config`](crate::config::Config) 结构体及
+//! `data/config.toml` 反向对照。CLI、core 端校验、设置 UI 均由此注册表派生。
 //!
-//! 注：本注册表只描述 **config 类**（用户可改配置）；运行状态（state）与分发数据（data）不在此。
-//! 详见仓库根 `SETTINGS_REVAMP_PLAN.md` 的"数据三分准则"，键名映射见 `docs/config-key-migration.md`。
+//! 只描述 config 类（用户可改配置），运行状态与分发数据不在此（「数据三分准则」见
+//! `docs/architecture/config-design-rules.md`）；键名映射见 `docs/config-key-migration.md`。
 
 use crate::config::Config;
 
@@ -26,53 +25,31 @@ pub enum FieldType {
     StrList,
     /// 键值映射表（如自定义标点 mappings）。
     ///
-    /// 携带**键名值域**：非空表示这张表的键只能取这几个（如 `ui.font.scripts` 的脚本类名），
-    /// 空表示键由用户自由命名（如 `input.punct.custom_mappings`）。
-    ///
-    /// ⚠️ 值域为什么要进注册表：设置端的下拉/预填项若各自手抄一份，core 加了新类名而设置端
-    /// 没跟上，用户就永远看不到新类别；反向漂移（设置端多出 core 不认的键）则是「填了没反应」。
-    /// `ui.candidate.layout` 已经踩过这个形状（值域从 3 变 4，设置端滞后，方案里手写的第 4 个
-    /// 值被静默改写回默认）。有了这一位，设置端可用 capability 做守门比对。
+    /// 携带键名值域：非空表示键只能取这几个（如 `ui.font.scripts` 的脚本类名），空表示键由用户
+    /// 自由命名。值域进注册表，设置端才能用 capability 做守门比对，免得两边各抄一份而漂移。
     Map(&'static [&'static str]),
     /// 结构体数组（如 mix_modes），整体作不透明叶子。
     StructList,
-    /// **可按候选窗排布分档**的枚举（见 `crate::by_layout::ByLayout`）。
+    /// 可按候选窗排布分档的枚举（见 `crate::by_layout::ByLayout`）。
     ///
-    /// 值域与 [`Self::Enum`] 相同，差别只在：值可以是 `"h:hide v:always"` 这样的标签式，
-    /// 或 `{ h = "hide", v = "always" }` 这样的表——**每一档都要落在同一个值域里**。
-    ///
-    /// ★ 之所以是独立变体而不是给 `Enum` 加个 bool：值域校验要拆开逐档验（`Enum` 那条
-    /// 路直接拿整串比对，`"h:hide v:always"` 会被判越界），叶子展开也要在这里停住
-    /// （表写法会被下钻成 `….pager_bar_display.h` 这种注册表里没有的键）。两处行为都变了，
-    /// 不是一个开关能表达的。
+    /// 值域与 [`Self::Enum`] 相同，但值可以是 `"h:hide v:always"` 标签式或 `{ h = …, v = … }` 表，
+    /// 每一档都要落在同一个值域里。独立成变体是因为值域校验要逐档验、叶子展开要在这里停住。
     LayoutEnum(&'static [&'static str]),
 }
 
 impl FieldType {
     /// 这个类型的值在写回时是不是**整体一份**——即「写它 ＝ 用新值把旧值整个换掉」。
     ///
-    /// # 这个判据是给写盘闸用的
+    /// 给写盘闸 [`crate::config::ConfigDegradation::blocks_write_back`] 用：整体一份的值，调用方
+    /// 发来的必然是「读回来的旧值 ⊕ 本次编辑」，降级时读回的是出厂值，写回就抹掉用户数据；
+    /// 标量是显式单值，与种子无关，不该拦。
     ///
-    /// [`crate::config::ConfigDegradation::blocks_write_back`] 的规矩是：凡是拿
-    /// `Config::load()` 的结果当**种子**、再整表写回用户层的路径，落盘前必须先问它。
-    /// 「能不能构成这种路径」取决于**值是不是整体一份**——标量的落盘值是调用方发来的
-    /// 显式单值，与种子无关，拦它只会让降级期间整个设置页存不了盘；而整体一份的值，
-    /// 调用方发来的那一份必然是「读回来的旧值 ⊕ 本次编辑」，读回来的若是降级后的出厂
-    /// 值，写回去就是把用户的真实数据抹掉。
-    ///
-    /// ⛔ **不要写成 `matches!(ty, FieldType::Map(_))`**。闸门第一版就是这么写的，于是
-    /// `ui.toolbar.items`、`ui.langbar.badges`、`ui.toolbar.buttons`、`schema.mix_modes`
-    /// 这些数组型键全部漏在门外——它们同样是整体一份（设置端的 `diff_config` 里数组不是
-    /// 对象、走叶子分支整份发送），失效形态与 Map 一模一样：`[ui.toolbar]` 段因类型错误
-    /// 降级 ⇒ 设置页显示出厂工具栏 ⇒ 用户改一格保存 ⇒ 自定义顺序与自建按钮永久消失。
-    ///
-    /// 加新的 `FieldType` 变体时先回答一句「写它是整体换掉还是只动一个值」，答前者就
-    /// 加进来。
+    /// 不要只写 `Map(_)`：数组型键（`ui.toolbar.items`、`schema.mix_modes` 等）同样整份发送。
+    /// 加新变体时先回答「写它是整体换掉还是只动一个值」。
     pub fn is_whole_value_leaf(&self) -> bool {
         match self {
             Self::Map(_) | Self::StrList | Self::StructList => true,
-            // LayoutEnum 与 Enum 同侧：设置端写它时发的是**一个标量**（标签式字符串），
-            // 与「读回来的旧值 ⊕ 本次编辑」那种整份写回无关。
+            // LayoutEnum 与 Enum 同侧：设置端写它时发的是一个标量（标签式字符串）。
             Self::Bool
             | Self::Int
             | Self::Float
@@ -109,53 +86,38 @@ const NUMBER_OVERFLOW_VALUES: &[&str] =
 /// 翻页键翻不动时：只有吞键与「顶高亮候选 + 输出该键符号」两档。
 const PAGE_KEY_OVERFLOW_VALUES: &[&str] = &["ignore", "commit_and_input"];
 
-/// 空码（缓冲非空但无候选）时终结键怎么处置这串废码——**回车/空格两键**。
-/// **只有两态**：`commit` 上屏原码 / `clear` 丢弃。语义与实现见
-/// `docs/design/enter-behavior-clear-semantics.md`。
-///
-/// ⚠️ 登记成 `Enum` 而非 `Str` 是刻意的：这三键曾因值域不受约束，让设置端 manifest 抄来了
-/// [`OVERFLOW_VALUES`] 的四个选项，用户选「忽略」被静默当成「上屏编码」，界面与行为不一致
-/// 且无任何测试拦得住。值域进注册表后，设置端的守门测试即可比对。
+/// 空码（缓冲非空但无候选）时回车/空格怎么处置这串废码：`commit` 上屏原码 / `clear` 丢弃。
+/// 见 `docs/design/enter-behavior-clear-semantics.md`。登记成 `Enum` 而非 `Str`，设置端的
+/// 守门测试才能比对值域。
 const EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear"];
 
 /// 上屏文本的换行形式。四态，语义与「为什么必须按应用配」见
 /// `app_compat::NewlineStyle`（本常量是它的值域在配置注册表里的镜像）。
 ///
-/// ⚠️ 与 `NewlineStyle` 的变体集是两处独立事实，必须一致——由
-/// `newline_style_values_match_enum` 钉住。
+/// 与 `NewlineStyle` 的变体集必须一致，由 `newline_style_values_match_enum` 钉住。
 const NEWLINE_STYLE_VALUES: &[&str] = &["keep", "cr", "lf", "crlf"];
 
 /// 含生僻字的词在检索范围过滤下的处置。语义见 `wind_candidate::RarePhrasePolicy`
 /// （本常量是它的值域在配置注册表里的镜像）。
 ///
-/// ⚠️ 与那个枚举的变体集是两处独立事实，必须一致——由 `registry_values_match_the_policy_enum`
-/// 钉住（在 `wind-coordinator/tests/rare_phrase_contract.rs`，理由同 `input.rare_phrase` 的
-/// 默认值对照：本 crate 看不见 `wind_candidate`）。
+/// 与那个枚举的变体集必须一致，由 `wind-coordinator/tests/rare_phrase_contract.rs` 的
+/// `registry_values_match_the_policy_enum` 钉住（本 crate 看不见 `wind_candidate`）。
 const RARE_PHRASE_VALUES: &[&str] = &["keep", "filter"];
 
-/// 标点键的空码处置——比回车/空格**多一态**，故不能与 [`EMPTY_CODE_BEHAVIOR_VALUES`] 共用。
-///
-/// ★ 这一族配置描述的行为其实是**两根轴**，而值域只有一维：
+/// 标点键的空码处置，比回车/空格多一态，故不能与 [`EMPTY_CODE_BEHAVIOR_VALUES`] 共用。
+/// 行为其实是两根轴，值域只有一维：
 ///
 /// | | 键字符输出 | 键字符吞掉 |
 /// |---|---|---|
 /// | 废码上屏 | `commit` | （无意义，不设值） |
 /// | 废码丢弃 | `clear` | `clear_no_input` |
 ///
-/// 回车/空格的 `clear` 落在**吞键**那一格（返回 `ClearComposition`，键本身不产出任何字符），
-/// 标点的 `clear` 落在**出键**那一格（标点照常上屏）——同一个字面值在第二根轴上取值相反。
-/// 这不是笔误：标点是用户真正想输入的可见字符，吞掉等于吞掉用户的意图，故出键是对的默认。
-/// `clear_no_input` 补的正是这一族缺的第四格：「这串码作废，这个键也当没按过」。
-///
-/// ⚠️ **不要**为了「三键同族」把 `clear_no_input` 也加给回车/空格：它们的 `clear` 本就是
-/// 吞键态，加了会得到两个行为完全相同的值，设置页出现两个无法区分的选项。
-///
-/// ⚠️ 加值前先确认消费点真的分了那一支——`Coordinator::punct_empty_code_policy` 的 `match`
-/// 是唯一解释器，未知值一律落到 `commit`。
+/// 回车/空格的 `clear` 落在吞键格，标点的 `clear` 落在出键格（标点是用户想输入的字符）。
+/// 别把 `clear_no_input` 加给回车/空格：它们的 `clear` 本就吞键，会出现两个等价选项。
+/// 加值前先确认 `Coordinator::punct_empty_code_policy`（唯一解释器）分了那一支，未知值落到 `commit`。
 const PUNCT_EMPTY_CODE_BEHAVIOR_VALUES: &[&str] = &["commit", "clear", "clear_no_input"];
 
-/// 码表词频应用策略。
-/// `ui.comment.assign.global` 的四格键名。⚠️ 与 [`crate::comment_lib::CommentCells`] 的字段名逐项对齐。
+/// `ui.comment.assign.global` 的四格键名。与 [`crate::comment_lib::CommentCells`] 的字段名逐项对齐。
 pub(crate) const COMMENT_CELL_KEYS: &[&str] = &[
     "default_vertical",
     "default_horizontal",
@@ -163,21 +125,22 @@ pub(crate) const COMMENT_CELL_KEYS: &[&str] = &[
     "detail_horizontal",
 ];
 
-/// `ui.comment.state` 的值域。⚠️ 与 [`crate::comment_lib::CommentState`] 的 serde 名逐项对齐。
+/// `ui.comment.state` 的值域。与 [`crate::comment_lib::CommentState`] 的 serde 名逐项对齐。
 pub(crate) const COMMENT_STATE_VALUES: &[&str] = &["default", "detail"];
 
-/// `ui.comment.switch_key` 的值域。⚠️ 与 [`crate::comment_lib::SwitchKey`] 的 serde 名逐项对齐。
+/// `ui.comment.switch_key` 的值域。与 [`crate::comment_lib::SwitchKey`] 的 serde 名逐项对齐。
 pub(crate) const COMMENT_SWITCH_KEY_VALUES: &[&str] = &[
     "none", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "ctrl",
     "lctrl", "rctrl", "alt", "lalt", "ralt",
 ];
 
-/// `ui.comment.switch_mode` 的值域。⚠️ 与 [`crate::comment_lib::SwitchMode`] 的 serde 名逐项对齐。
+/// `ui.comment.switch_mode` 的值域。与 [`crate::comment_lib::SwitchMode`] 的 serde 名逐项对齐。
 pub(crate) const COMMENT_SWITCH_MODE_VALUES: &[&str] = &["session", "persist", "hold"];
 
-/// `input.alt_commit` 的值域。⚠️ 与 [`wind_config::config::AltCommit::from_config`] 逐项对齐。
+/// `input.alt_commit` 的值域。与 [`crate::config::AltCommit::from_config`] 逐项对齐。
 pub(crate) const ALT_COMMIT_VALUES: &[&str] = &["off", "pinyin", "pinyin_plain", "comment"];
 
+/// 码表词频应用策略。
 const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step", "position"];
 
 /// 前缀补全参与词频位置提升的范围（按语义单元数判定）。
@@ -188,9 +151,8 @@ const ENGLISH_CODE_SCOPE_VALUES: &[&str] = &["candidate", "input"];
 
 /// `ui.font.scripts` 的合法键名——**文字类别**，不是脚本的全集。
 ///
-/// 与渲染端 `wind_ui::text::script::ScriptClass::key()` 是同一件事的两处表达，由
-/// wind-ui 侧的 `script_class_keys_match_config_registry` 测试钉住（wind-config 依赖不到
-/// wind-ui，反向才能测）。**加类别时两处一起改，否则设置页永远不会列出新类别。**
+/// 与渲染端 `wind_ui::text::script::ScriptClass::key()` 两处表达，由 wind-ui 侧的
+/// `script_class_keys_match_config_registry` 钉住。加类别时两处一起改。
 pub const FONT_SCRIPT_KEYS: &[&str] = &[
     "latin", "greek", "cyrillic", "cjk", "emoji", "digits", "punct",
 ];
@@ -199,15 +161,11 @@ pub const FONT_SCRIPT_KEYS: &[&str] = &[
 /// mix / special 的同名字段是 StructList 条目内的属性，不在本注册表单独登记。
 const LAYOUT_INTENT_VALUES: &[&str] = &["follow", "vertical", "horizontal"];
 
-/// 「首候选是所打原文」的三档（`RawCandidateMode`）。老配置里本项是 `bool`，
-/// 反序列化侧仍认 `true` / `false`（见 `de_raw_candidate`），但**设置端只写新值域**
-/// ——两侧都认 bool 的话，写回一次就把用户的档位悄悄降级成两档。
+/// 「首候选是所打原文」的三档（`RawCandidateMode`）。反序列化侧仍认老的 `bool`（见
+/// `de_raw_candidate`），但设置端只写新值域，否则写回一次就把档位降成两档。
 const RAW_CANDIDATE_VALUES: &[&str] = &["always", "in_dict", "off"];
 
-/// emoji 扩展的触发范围（`input.emoji.scope`）。
-///
-/// ★ 值域登记在这里而不是只写进注释：core 与设置页 options 各写一份的话，两者脱节了
-/// 无人会报——本仓已经踩过这个坑。登记后设置页从同一个数组取值，改一处即两处同步。
+/// emoji 扩展的触发范围（`input.emoji.scope`）。值域登记在这里，设置页从同一个数组取值。
 const EMOJI_SCOPE_VALUES: &[&str] = &["off", "exact", "all"];
 /// emoji 扩展的呈现形态（`input.emoji.show_as`）。理由同 [`EMOJI_SCOPE_VALUES`]。
 const EMOJI_SHOW_AS_VALUES: &[&str] = &["after", "tail", "comment"];
@@ -217,12 +175,8 @@ const EMOJI_SHOW_AS_VALUES: &[&str] = &["after", "tail", "comment"];
 ///
 /// # 三态键（`Option<T>`，默认 `None`）刻意不登记
 ///
-/// 这类键不在本表内，**这不是遗漏**：注册表是与 `Config::default()` 的序列化键集反向对照的，
-/// 而这类键的出厂值恰恰是「键不存在」，序列化时压根不出现，登记即被判「多余」。
-///
-/// 不登记同时是**正确**的：`prune_redundant` 只清理「已登记且值等于出厂默认」的键，
-/// 未登记键一律不碰——用户手写的值因此永远不会被写回逻辑清掉。这与废弃键、
-/// `Map`/`StructList` 下钻子路径归为同一类处置，理由见该函数的「两道保险」。
+/// 它们的出厂值是「键不存在」，不在 `Config::default()` 的序列化键集里，登记即被判多余。
+/// 不登记也让 `prune_redundant` 永远不碰用户手写的值（同废弃键与 Map/StructList 子路径）。
 static REGISTRY: &[ConfigField] = &[
     // -- schema（方案 + 拼音 + 模式）--
     f("schema.active", Str),
@@ -323,8 +277,8 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.auto_phrase.draft_flush_batch", Int),
     // 全局拼音
     f("schema.pinyin.use_smart_compose", Bool),
-    // 用户词进整句词图（S2）。**出厂 true**（2026-09-28 起），接用户词与临时词
-    // （不接草稿层）。只在 use_smart_compose 开着时有效，UI 侧 enabled_when 挂在它上面。
+    // 用户词进整句词图。出厂 true，接用户词与临时词（不接草稿层）。只在 use_smart_compose
+    // 开着时有效，UI 侧 enabled_when 挂在它上面。
     f("schema.pinyin.sentence_uses_user_words", Bool),
     // 整句 N-best：露几条 / 算几条（切换键的池子）。出厂 1/1 = 单条整句。
     f("schema.pinyin.sentence_count", Int),
@@ -434,6 +388,7 @@ static REGISTRY: &[ConfigField] = &[
     // 检索范围放宽（智能档增强，见 docs/design/smart-filter-scope-relax.md）
     f("input.scope_relax.page_end_key", Bool),
     f("input.scope_relax.prefix", Str),
+    f("input.scope_relax.always_append", Bool),
     f("input.correction.enabled", Bool),
     f("input.correction.marker", Str),
     f("input.correction.custom", StrList),
@@ -588,6 +543,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.cmdbar.enabled", Bool),
     f("input.cmdbar.candidate_prefix", Str),
     f("input.cmdbar.backspace_collapse_group", Bool),
+    f("input.cmdbar.group_per_page", Int),
     // 短语前缀列举（原 dict.phrase）
     f("input.phrase.prefix_match", Bool),
     f("input.phrase.min_prefix", Int),
@@ -620,7 +576,7 @@ static REGISTRY: &[ConfigField] = &[
     // -- keys（全部按键，扁平；overflow 保留一层）--
     f("keys.toggle_mode_keys", StrList),
     f("keys.commit_on_switch", Bool),
-    // Ctrl+空格 中英切换开关（GH#172）。消费端读 `KeysConfig::ctrl_space_toggle_effective`。
+    // Ctrl+空格 中英切换开关。消费端读 `KeysConfig::ctrl_space_toggle_effective`。
     f("keys.ctrl_space_toggle", Bool),
     f("keys.switch_engine", Str),
     f("keys.toggle_full_width", Str),
@@ -639,13 +595,9 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.take_screenshot", Str),
     f("keys.softkeyboard", Str),
     f("keys.global_hotkeys", StrList),
-    // `keys.schema_hotkeys` 已废弃并**从登记表移除**（与当年 `schema.special_modes` 同样
-    // 的处置）：改写进下面的 key_actions（动词 `switch_schema:<id>`），**没有兼容折算**
-    // ——加载期只由 `Config::warn_legacy_schema_hotkeys` 告警一次随后清空，残留的老配置
-    // 不生效。serde 字段仍保留（`legacy_schema_hotkeys`），是为了**读得出残留值以便告警**，
-    // 不是为了让它继续工作；移出登记表则让 `config.setItems`
-    // 不再接受对它的写入——写旧键的客户端会收到 skipped 而不是静默成功，这正是我们想要的
-    // 可见性（本仓最忌讳「写进去了、没人读」）。
+    // `keys.schema_hotkeys` 已废弃、不登记：改写进 key_actions（`switch_schema:<id>`），无兼容
+    // 折算。serde 字段 `legacy_schema_hotkeys` 只为读出残留值告警；不登记让 `config.setItems`
+    // 对旧键回 skipped 而不是静默成功。
     f("keys.key_actions", Map(&[])),
     f("keys.session_actions", Map(&[])),
     f("keys.select_key_groups", StrList),
@@ -969,50 +921,30 @@ pub fn is_known_key(key: &str) -> bool {
 pub struct SchemaOverride {
     /// 全局键；**以 `.` 结尾表示段前缀，且只管这一段的直接子键**。
     ///
-    /// ★ 前缀刻意**不递归**到更深的子段。覆盖能力是逐字段实现的（`resolved()` 里一个
-    /// `if let Some` 一行），子段未必跟着——`schema.codetable.` 可覆盖，它下面的
-    /// `auto_phrase` 子段却整个不折叠。递归前缀会把 `auto_phrase.*` 一并标成「可被方案
-    /// 覆盖」，而那是**告诉用户一件不成立的事**：他会去方案里写这一段，写了没反应，
-    /// 然后怀疑是自己写错了。要覆盖某个子段就为它再登记一条。
+    /// 前缀刻意不递归：覆盖能力逐字段实现，子段未必跟着（如 `schema.codetable.auto_phrase`），
+    /// 递归会向用户提示一件不成立的事。要覆盖某个子段就为它再登记一条。
     pub key: &'static str,
     /// 方案文件（`.schema.toml` / `schema_overrides/<id>.toml`）里的落点段名。
     pub section: &'static str,
-    /// 覆盖语义，一句话，直接进设置页的提示——**写给用户，不是写给维护者**。
+    /// 覆盖语义，一句话，直接进设置页的提示（写给用户，不是写给维护者）。
     pub note: &'static str,
-    /// 是否由**通用折叠器**生效：`true` ⇒ 方案文件 `[candidate]` 下写同名叶子键即可覆盖，
-    /// 不需要结构体字段，也不需要 `resolved()` 里的一行（见 [`split_candidate_patch`] 与
-    /// `UiCandidateConfig::folded_with`）。目前只支持 `ui.candidate.*` 的精确键。
-    ///
-    /// `false` 的登记是**手写形态**（码表 `resolved()`、标点、`layout` 的三态等），
-    /// 这张表只负责提示，生效逻辑在别处。
+    /// 是否由通用折叠器生效：`true` ⇒ 方案文件 `[candidate]` 下写同名叶子键即可覆盖（见
+    /// [`split_candidate_patch`] 与 `UiCandidateConfig::folded_with`），目前只支持
+    /// `ui.candidate.*` 的精确键。`false` 的登记是手写形态，这张表只负责提示。
     pub fold: bool,
 }
 
 /// 可被方案级配置覆盖的全局项。
 ///
-/// # 这张表回答的问题
+/// 回答「全局改了，为什么某个方案里没变」，供设置页提示。它是静态事实，走 capability 快照
+/// （随 `system.capabilities` 拉一次）；别为它遍历 [`crate::config::OriginSnapshot`]。
 ///
-/// 「我在全局改了标点行为，为什么某个方案里没变」——因为那个方案自己声明了。这是本仓
-/// 配置模型里用户最常撞到的一层，而全局设置页此前**没有任何地方提示过它的存在**。
+/// 没有编译期约束：对应关系只在各 `resolved()` 函数体里（[`crate::schema::SchemaBehavior`]、
+/// [`crate::config::CodetableGlobal::resolved`]、[`crate::config::AuxCodeGlobal::resolved`]），
+/// 新增方案级字段时必须回来加一行，漏了没有测试会红。
 ///
-/// ★ 它是**静态事实**：某项能不能被方案覆盖由配置模型决定，与用户机器上有什么文件无关。
-/// 因此走 capability 快照（启动时随 `system.capabilities` 拉一次），**零运行时成本**。
-/// ⛔ 不要为它去遍历 [`crate::config::OriginSnapshot`]——那是排查用的重查询，
-/// 回答的也是另一个问题（「实际来自哪一层」）。
-///
-/// # ⚠️ 没有编译期约束，加方案级字段时必须回来加一行
-///
-/// 「方案的 `[engine.codetable].top_code_commit` 覆盖全局的 `schema.codetable.top_code_commit`」
-/// 这层对应关系只存在于 `resolved()` 的函数体里，类型系统看不见。新增方案级字段而漏了
-/// 这张表，后果是设置页那一行**不再提示可被覆盖**——没有任何测试会红。
-/// 各方案级段的权威定义：[`crate::schema::SchemaBehavior`]（punct/candidate/phrases）、
-/// [`crate::config::CodetableGlobal::resolved`]、[`crate::config::AuxCodeGlobal::resolved`]。
-///
-/// # 不在表里的方案级字段
-///
-/// `[candidate]` 的 `font_family` 与 `text_orientation`、`[punct]` 的 `mode`、`[phrases]`
-/// 整段：它们**没有对应的全局配置键**（回落目标分别是主题、运行时中英标点态、方案自身），
-/// 全局设置页上根本没有那一行，无从标记。
+/// 不在表里的：`[candidate]` 的 `font_family` / `text_orientation`、`[punct]` 的 `mode`、
+/// `[phrases]` 整段，它们没有对应的全局配置键。
 pub const SCHEMA_OVERRIDES: &[SchemaOverride] = &[
     SchemaOverride {
         key: "schema.codetable.",
@@ -1100,7 +1032,7 @@ pub fn candidate_fold_entry(leaf: &str) -> Option<&'static SchemaOverride> {
 /// 2. 值过注册表校验（类型 / 枚举值域）；
 /// 3. 注册表表达不了的值域在 [`value_in_domain`] 补一刀。
 ///
-/// ★ 「写错的值 = 没写」：错值若混进补丁，折叠时会把全局的好值一起盖没。
+/// 「写错的值 = 没写」：错值混进补丁会把全局的好值盖掉。
 pub fn split_candidate_patch(raw: &toml::Table) -> (toml::Table, Vec<String>) {
     let mut ok = toml::Table::new();
     let mut problems = Vec::new();
@@ -1156,12 +1088,9 @@ pub fn schema_override_of(key: &str) -> Option<&'static SchemaOverride> {
 /// 回答全局设置页「已被 N 个方案覆盖」的反查（R8.6）。键名与 [`SCHEMA_OVERRIDES`] 的登记
 /// 一一对应（前缀型登记展开成直接子键），每个键至多出现一次。
 ///
-/// 判据逐字段与各 `resolved()` 的折叠条件一致：`Option` 取 `is_some()`、`LayoutIntent`
-/// 取非 `Follow`、码元字符集取非空串——「写了但等于全局值」也算覆盖，因为此后改全局对
-/// 它已无影响，这正是用户要被提示的事。
-///
-/// ⚠️ 与 [`SCHEMA_OVERRIDES`] 一样没有编译期约束：新增方案级字段时两处都要加一行。
-/// 护栏是 `overridden_keys_covers_every_schema_override_entry`（登记了而这里漏了会红）。
+/// 判据逐字段与各 `resolved()` 的折叠条件一致；「写了但等于全局值」也算覆盖（此后改全局
+/// 对它已无影响）。新增方案级字段时与 [`SCHEMA_OVERRIDES`] 两处都要加一行，护栏是
+/// `overridden_keys_covers_every_schema_override_entry`。
 ///
 /// `[punct] mode` 不在内：它没有对应的全局键（见 [`SCHEMA_OVERRIDES`] 的「不在表里」一节）。
 pub fn schema_overridden_keys(schema: &crate::schema::Schema) -> Vec<&'static str> {
@@ -1457,11 +1386,8 @@ pub fn validate(key: &str, value: &toml::Value) -> Result<(), ValidateError> {
             }
             true
         }
-        // 可分档枚举：把值摊成「每一档的实际取值」，逐档过同一个值域。
-        //
-        // ★ 这一层正是「拼错档位名」的兜底：`"x:hide"` 在解析那边不算分档语法（与
-        // `"C:\path"` 同形，分辨不了），会原样落成标量到这里 ⇒ 不在值域内 ⇒ 报
-        // EnumOutOfRange。用户照样看得到错误，且真·路径值不被误伤。
+        // 可分档枚举：把值摊成每一档的实际取值，逐档过同一个值域。拼错档位名（`"x:hide"`）会
+        // 原样落成标量到这里而报 EnumOutOfRange。
         FieldType::LayoutEnum(allowed) => {
             let parts = crate::by_layout::domain_parts(value).ok_or({
                 ValidateError::TypeMismatch {
@@ -1510,14 +1436,8 @@ pub fn validate(key: &str, value: &toml::Value) -> Result<(), ValidateError> {
 /// 故 `[ui.candidate]`（非空表）会下钻，而 `input.punct.custom_mappings = {}`（空表）作叶子保留。
 fn collect_leaf_keys(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
     match value {
-        // ★ 注册表里登记为 Map 的键**就是叶子**，不再下钻。
-        //
-        // Map 的内容是**数据**（`keys.key_actions` 的键名 → 动词、`schema_hotkeys` 的
-        // 方案 id → 热键），不是配置项。下钻会把 `keys.key_actions.backtick` 这种数据
-        // 当成注册表键去比对——两个方向同时报错：注册表里没有它（"孤立键"），而
-        // `keys.key_actions` 本身又因为没出现过被算作"缺失"。
-        //
-        // 此前没暴露只是因为出厂配置里所有 Map 都是空表（`= {}`），没有子键可下钻。
+        // 登记为 Map 的键就是叶子，不再下钻：Map 的内容是数据（如 `keys.key_actions` 的键名 → 动词），
+        // 下钻会把它当成注册表键比对，两个方向同时报错。
         toml::Value::Table(_)
             if !prefix.is_empty()
                 && matches!(
@@ -1578,1075 +1498,14 @@ pub fn leaf_entries(value: &toml::Value) -> Vec<(String, toml::Value)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeSet;
-
-    /// 注册表里的值域与 `NewlineStyle` 的变体集是两处独立事实。
-    ///
-    /// 不一致的后果有先例：值域不受约束时，设置端 manifest 抄错了选项，用户选的那一档
-    /// 被静默当成另一档，界面与行为不一致且没有任何测试拦得住（见
-    /// `EMPTY_CODE_BEHAVIOR_VALUES` 的注释）。
-    #[test]
-    fn newline_style_values_match_enum() {
-        use crate::app_compat::NewlineStyle;
-        for v in NEWLINE_STYLE_VALUES {
-            assert!(
-                NewlineStyle::from_config(v).is_some(),
-                "注册表登记了 {v:?}，但 NewlineStyle 不认得它"
-            );
-        }
-        // 反方向：枚举新增变体后，注册表不能漏登记。
-        for style in [
-            NewlineStyle::Keep,
-            NewlineStyle::Cr,
-            NewlineStyle::Lf,
-            NewlineStyle::Crlf,
-        ] {
-            assert!(
-                NEWLINE_STYLE_VALUES.contains(&style.as_config()),
-                "NewlineStyle::{style:?} 没有登记进 NEWLINE_STYLE_VALUES"
-            );
-        }
-    }
-
-    /// 跨仓契约：`Float` 键必须吃得下 **TOML 整数**。
-    ///
-    /// wind-setting 的 number 控件写回时会做 `if v.fract() == 0.0 { Value::from(v as i64) }`
-    /// ——用户在设置页把半衰期填 `72`，落到 config.toml 里就是整数 `72` 而非 `72.0`。
-    /// 而 core 侧这些字段是 `f64`。两边隔着一个进程和一次文件往返，**没有任何编译期约束**
-    /// 能发现不匹配；真出问题的表现是「设置页填了值，重启后回到默认」这种最难查的静默失效。
-    #[test]
-    fn float_fields_accept_integer_toml_values() {
-        use crate::config::{CodetableFrequency, PinyinFrequency};
-        let ct: CodetableFrequency =
-            toml::from_str("half_life = 72").expect("码表 half_life 必须接受 TOML 整数");
-        assert_eq!(ct.half_life, 72.0);
-        let py: PinyinFrequency =
-            toml::from_str("half_life = 72").expect("拼音 half_life 必须接受 TOML 整数");
-        assert_eq!(py.half_life, 72.0);
-        // 反向对照：小数形式当然也要能读，否则上面那条可能只是「两边都坏」。
-        let ct2: CodetableFrequency = toml::from_str("half_life = 4.5").unwrap();
-        assert_eq!(ct2.half_life, 4.5);
-    }
-
-    /// L1↔L2 同源：`ui.toolbar.items` 的出厂值在 Rust 默认值与 `data/config.toml` 里
-    /// 必须逐项相同（`config-design-rules.md` §R4）。
-    ///
-    /// 这个键的顺序**有语义**（数组顺序即工具栏渲染顺序），所以不能只比集合。两侧任一
-    /// 处改了顺序或成员而另一处没跟，新装用户与老用户看到的工具栏就不一样——而这种
-    /// 差异不会有任何其它测试报出来。
-    ///
-    /// 放在本 crate 是因为**只有这里读得到 L2**（`data_config_toml()`）；协调器侧那条
-    /// 同名意图的测试只能覆盖 L1，两条不重复。
-    #[test]
-    fn toolbar_items_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.toolbar.items;
-        let l2: Vec<String> = data_config_toml()
-            .get("ui")
-            .and_then(|u| u.get("toolbar"))
-            .and_then(|t| t.get("items"))
-            .and_then(|v| v.as_array())
-            .expect("data/config.toml 缺少 ui.toolbar.items")
-            .iter()
-            .map(|v| v.as_str().expect("items 元素须为字符串").to_string())
-            .collect();
-        assert_eq!(l1, l2, "ui.toolbar.items 的 L1 默认值与 L2 出厂文件不一致");
-        // 两侧都必须是登记过的键，否则出厂配置里就躺着一个会被解析跳过的条目。
-        //
-        // ⚠️ 先剥 `-` 前缀：那是**值域自带的语法**（「在这个位置，但不显示」），出厂
-        // 的 `-s2t` 是合法条目而非拼错。按裸键名比会把它判成未登记——测试红了却指向
-        // 一个不存在的问题，而真正的拼错（`-punkt`）照样被这条拦下。
-        for k in &l2 {
-            let key = k.strip_prefix('-').unwrap_or(k);
-            assert!(
-                crate::TOOLBAR_ITEM_KEYS.contains(&key),
-                "出厂 items 含未登记条目 {k:?}"
-            );
-        }
-    }
-
-    /// L1↔L2 同源：`ui.tooltip.sections` 的出厂段列表在 Rust 默认值与 `data/config.toml` 里
-    /// 必须逐段、逐字段相同（`config-design-rules.md` §R4）。
-    ///
-    /// 数组在预置文件里是**整体覆盖**：L2 少写一段 = 成品里没有那一段，改了模板而 L1 没跟 =
-    /// 「恢复默认」与新装用户看到的不是同一份气泡。两种都不会有别的测试报出来。
-    #[test]
-    fn tooltip_sections_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.tooltip.sections;
-        let l2: Vec<crate::config::TooltipSection> = data_config_toml()
-            .get("ui")
-            .and_then(|u| u.get("tooltip"))
-            .and_then(|t| t.get("sections"))
-            .cloned()
-            .expect("data/config.toml 缺少 ui.tooltip.sections")
-            .try_into()
-            .expect("ui.tooltip.sections 须能反序列化");
-        assert_eq!(
-            l1, l2,
-            "ui.tooltip.sections 的 L1 默认值与 L2 出厂文件不一致"
-        );
-    }
-
-    /// L1↔L2 同源：气泡的单行上限与折行宽度（取值守门在 config.rs `test_tooltip_defaults`，
-    /// 行为守门在协调器 `tooltip` 模块的出厂配置用例）。
-    #[test]
-    fn tooltip_limits_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.tooltip;
-        let tip = data_config_toml()
-            .get("ui")
-            .and_then(|u| u.get("tooltip"))
-            .cloned()
-            .expect("data/config.toml 缺少 [ui.tooltip]");
-        let int = |k: &str| {
-            tip.get(k)
-                .and_then(toml::Value::as_integer)
-                .unwrap_or_else(|| panic!("data/config.toml 缺少 ui.tooltip.{k}"))
-        };
-        assert_eq!(int("max_chars"), l1.max_chars as i64);
-        assert_eq!(int("wrap_width"), l1.wrap_width as i64);
-    }
-
-    /// `[ui.<table>]` 下某个布尔键在 L2 里的值；缺键直接红。
-    fn l2_bool(table: &str, key: &str) -> bool {
-        data_config_toml()
-            .get("ui")
-            .and_then(|u| u.get(table))
-            .and_then(|t| t.get(key))
-            .and_then(toml::Value::as_bool)
-            .unwrap_or_else(|| panic!("data/config.toml 缺少布尔键 ui.{table}.{key}"))
-    }
-
-    /// L1↔L2 同源：悬停提示总开关（出厂开，设计 memory-footprint.md §9 D2「零回归」）。
-    #[test]
-    fn tooltip_enabled_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.tooltip.enabled;
-        assert!(l1, "ui.tooltip.enabled 出厂应为 true");
-        assert_eq!(l2_bool("tooltip", "enabled"), l1);
-    }
-
-    /// L1↔L2 同源：`[ui.comment]` 的总开关、当前态、切换键与切换方式。
-    #[test]
-    fn ui_comment_l1_matches_l2() {
-        let l1 = crate::Config::default().ui.comment;
-        assert!(l1.enabled, "ui.comment.enabled 出厂应为 true");
-        assert_eq!(l2_bool("comment", "enabled"), l1.enabled);
-        let comment = data_config_toml()
-            .get("ui")
-            .and_then(|u| u.get("comment"))
-            .cloned()
-            .expect("data/config.toml 缺少 [ui.comment]");
-        let l2: crate::comment_lib::UiCommentConfig =
-            comment.try_into().expect("[ui.comment] 须能反序列化");
-        assert_eq!(l2, l1, "[ui.comment] 的 L1 默认值与 L2 出厂文件不一致");
-    }
-
-    /// L1↔L2 同源：方案常驻策略（出厂关，设计 memory-footprint.md §9 D1）。
-    #[test]
-    fn keep_all_loaded_l1_matches_l2() {
-        let l1 = crate::Config::default().schema.keep_all_loaded;
-        assert!(!l1, "schema.keep_all_loaded 出厂应为 false");
-        let l2 = data_config_toml()
-            .get("schema")
-            .and_then(|t| t.get("keep_all_loaded"))
-            .and_then(toml::Value::as_bool)
-            .expect("data/config.toml 缺少布尔键 schema.keep_all_loaded");
-        assert_eq!(l2, l1);
-    }
-
-    /// L1↔L2 同源：词库缓存策略（出厂锁定）。
-    #[test]
-    fn dict_cache_policy_l1_matches_l2() {
-        let l1 = crate::Config::default().schema.dict_cache_policy;
-        assert_eq!(l1, "lock", "schema.dict_cache_policy 出厂应为 lock");
-        let l2 = data_config_toml()
-            .get("schema")
-            .and_then(|t| t.get("dict_cache_policy"))
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned)
-            .expect("data/config.toml 缺少字符串键 schema.dict_cache_policy");
-        assert_eq!(l2, l1);
-    }
-
-    /// 解析仓库内系统预置 `data/config.toml`。
-    /// ★★★ 出厂 `keys.key_actions` 里的动词必须真的编译得进热键表。
-    ///
-    /// 动词值域散在**三处**：`BoundAction::parse`（引导键链 / 方案级表）、
-    /// `hotkey::hotkey_action_entry`（组合键白名单）、协调器的分派臂。只加第一处的症状是
-    /// ——出厂热键按下去什么都不发生，与「这个键根本没绑」完全同形，唯一线索是日志里
-    /// 一行 `组合键不支持动词 ... 忽略`。软键盘的 `ctrl+shift+k` 就是这么漏的，
-    /// 部署到真机翻日志才发现。
-    #[test]
-    fn factory_combo_key_actions_are_accepted_by_the_hotkey_compiler() {
-        let Some(actions) = data_config_toml()
-            .get("keys")
-            .and_then(|k| k.get("key_actions"))
-            .and_then(|v| v.as_table())
-            .cloned()
-        else {
-            return; // 出厂没配 key_actions 时无可校验
-        };
-        for (key, action) in &actions {
-            let action = action.as_str().expect("key_actions 的值须为字符串").trim();
-            if action.is_empty() {
-                continue;
-            }
-            // 只校验走组合键通路的那些；单键与纯修饰键有各自的消费者。
-            if crate::hotkey::route_of_key_action(key)
-                != Some(crate::hotkey::KeyActionRoute::Hotkey)
-            {
-                continue;
-            }
-            assert!(
-                crate::hotkey::hotkey_action_entry(action).is_some(),
-                "出厂 keys.key_actions 的 {key:?} = {action:?} 不被组合键白名单接受，                 按下去会静默无反应（见 hotkey_action_entry）"
-            );
-        }
-    }
-
-    /// 出厂 `[keys]` 段里的热键串必须真的解析得动。
-    ///
-    /// L2 覆盖 L1，写错一个字（`Ctrl-Shift-K`、`ctrl-shift-k`）的表现是**静默失效**：
-    /// `parse_hotkey` 返回 `None` ⇒ 那条不进热键表 ⇒ 与「这个键根本没绑」完全同形，
-    /// 日志里一个字都没有。软键盘的出厂绑定从 `key_actions` 挪进 `keys.softkeyboard`
-    /// 时补的这道闸——那次挪动的全部意义就是让这条绑定生效且可关，写错即两头落空。
-    ///
-    /// ★ 判据自动排除模板与非热键串，**不用手写清单**：L1 默认值解析得动的字段，L2 那份
-    /// 也必须解析得动。`pin_candidate = "ctrl+number"` 这类模板在 L1 就解析不动，自动跳过；
-    /// 将来往 `[keys]` 加新的热键字段也自动纳入。
-    #[test]
-    fn factory_keys_hotkeys_are_parsable() {
-        let l1 = toml::Value::try_from(Config::default()).expect("默认配置应可序列化");
-        let l2 = data_config_toml();
-        let (Some(l1k), Some(l2k)) = (
-            l1.get("keys").and_then(toml::Value::as_table),
-            l2.get("keys").and_then(toml::Value::as_table),
-        ) else {
-            panic!("L1 与 data/config.toml 都该有 [keys] 段");
-        };
-        let mut checked = 0usize;
-        for (name, l2v) in l2k {
-            let (Some(s2), Some(s1)) = (l2v.as_str(), l1k.get(name).and_then(toml::Value::as_str))
-            else {
-                continue;
-            };
-            if crate::hotkey::parse_hotkey(s1).is_none() {
-                continue; // L1 那份就不是可解析的热键串（模板 / 非热键字段）
-            }
-            checked += 1;
-            assert!(
-                crate::hotkey::parse_hotkey(s2).is_some(),
-                "data/config.toml 的 keys.{name} = {s2:?} 解析不动，出厂绑定会静默失效"
-            );
-        }
-        // 一条都没校验到 = 判据本身失效（字段改名 / 段结构变了），那时它会假绿。
-        assert!(
-            checked >= 5,
-            "只校验到 {checked} 个热键字段，判据可能已失效"
-        );
-    }
-
-    fn data_config_toml() -> toml::Value {
-        // CARGO_MANIFEST_DIR = <repo>/wind_input/crates/wind-config
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data/config.toml");
-        let content = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("读取 {path} 失败（Stage1 注册表对照需要）: {e}"));
-        toml::from_str(&content).expect("data/config.toml 解析失败")
-    }
-
-    fn leaf_keys_of(value: &toml::Value) -> Vec<String> {
-        let mut out = Vec::new();
-        collect_leaf_keys("", value, &mut out);
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    #[test]
-    fn leaf_keys_drills_tables_and_keeps_arrays_maps_as_leaves() {
-        let keys: BTreeSet<String> = config_leaf_keys().into_iter().collect();
-        // 标量叶子
-        assert!(keys.contains("ui.candidate.per_page"), "应含标量叶子");
-        // 嵌套标量
-        assert!(
-            keys.contains("keys.overflow.number_key"),
-            "应含嵌套标量叶子"
-        );
-        // 空 HashMap 作叶子保留
-        assert!(
-            keys.contains("input.punct.custom_mappings"),
-            "空表(custom_mappings)应作叶子保留"
-        );
-        // 数组作叶子（不下钻元素）
-        assert!(keys.contains("schema.available"), "数组应作叶子");
-        assert!(
-            keys.contains("schema.mix_modes"),
-            "结构体数组应作单一叶子，不展开元素"
-        );
-        // 中间表不应作为叶子出现
-        assert!(!keys.contains("ui.candidate"), "中间表不应是叶子");
-        assert!(!keys.contains("ui"), "顶层表不应是叶子");
-    }
-
-    #[test]
-    fn leaf_entries_flattens_table_to_key_value_pairs() {
-        let v: toml::Value = toml::from_str(
-            "[ui.candidate]\nper_page = 9\nlayout = \"vertical\"\n[input.auto_pair]\nchinese = false\n",
-        )
-        .unwrap();
-        let entries = leaf_entries(&v);
-        assert!(
-            entries
-                .iter()
-                .any(|(k, val)| k == "ui.candidate.per_page" && val.as_integer() == Some(9))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|(k, val)| k == "ui.candidate.layout" && val.as_str() == Some("vertical"))
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|(k, val)| k == "input.auto_pair.chinese" && val.as_bool() == Some(false))
-        );
-        // 不应出现中间表键
-        assert!(!entries.iter().any(|(k, _)| k == "ui.candidate"));
-    }
-
-    #[test]
-    fn registry_covers_every_config_key() {
-        let struct_keys: BTreeSet<String> = config_leaf_keys().into_iter().collect();
-        let registry_keys: BTreeSet<String> =
-            registry().iter().map(|f| f.key.to_string()).collect();
-
-        let missing: Vec<&String> = struct_keys.difference(&registry_keys).collect();
-        let extra: Vec<&String> = registry_keys.difference(&struct_keys).collect();
-
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "注册表与 Config 不一致：\n  注册表缺失({}): {:?}\n  注册表多余({}): {:?}",
-            missing.len(),
-            missing,
-            extra.len(),
-            extra
-        );
-    }
-
-    /// 刻意不写进 `data/config.toml` 的键（配套 [`data_config_toml_covers_registry`]）。
-    ///
-    /// 二者均为**结构体数组**（`StructList`）。本文件写出的数组是整体覆盖而非合并，
-    /// 一旦列进预置文件就会把当时的定义冻结成快照，日后改代码侧默认值全被静默遮蔽。
-    /// 故其真相源留在 `config.rs` 的 `Default`，预置文件只在注释里说明。
-    ///
-    /// **加条目前请三思**：豁免一个键 = 它的默认值从此不在说明书里，
-    /// 只有「写进去会造成实际危害」才够格，「懒得写」不够格。
-    const ABSENT_FROM_DATA_CONFIG: &[&str] = &[
-        "schema.mix_modes",
-        // 注释词库挂载列表：**出厂为空数组**（不随附任何注释词库——词典内容多有版权，
-        // 由用户自行放置）。写进预置文件除了一行 `comment_dicts = []` 没有任何信息量，
-        // 而它一旦以数组表形态出现，用户增删条目就会与预置层的整表覆盖语义纠缠。
-        // 格式与示例在文档站 customize/candidate-comment。
-        "ui.comment_dicts",
-        // 工具栏自定义按钮：同上，**出厂为空数组**。写出一行 `buttons = []` 没有信息量，
-        // 却会把空数组冻结成 L2 值；而它一旦以数组表形态出现，用户增删按钮就要与预置层
-        // 的整表覆盖语义纠缠。格式与示例写在 `[ui.toolbar]` 段的注释里（不是数组表，
-        // 只是注释），用户照抄即可。
-        "ui.toolbar.buttons",
-        // 候选注释的用户模板与分配：用户结构化内容，出厂为空。出厂模板与分配放在
-        // `system.comments.toml`——config.toml 的表逐键深合并，写进这里的出厂行会在用户
-        // 删掉后下次加载又被合并回来。
-        "ui.comment.templates",
-        "ui.comment.assign.global",
-        "ui.comment.assign.type",
-        "ui.comment.assign.schema",
-        "ui.comment.assign.mode",
-        // 扩展列表：同上，**出厂为空数组**，条目随用户安装的扩展增减。
-        "extensions.list",
-    ];
-
-    /// `data/config.toml` 必须显式列出注册表里的每一个键（豁免名单除外）。
-    ///
-    /// 与 [`data_config_toml_has_no_orphan_keys`] 互为反向：那个测试管「不许多」，
-    /// 这个管「不许少」。缺了这一侧，新增配置项时漏写预置文件不会被任何测试发现——
-    /// 本测试补上前，预置文件已积压 31 个缺键（模糊音 10 项、自动造词 5 项、
-    /// 拼音调频衰减 3 项、截图热键、日志滚动 2 项等）。
-    #[test]
-    fn data_config_toml_covers_registry() {
-        let toml_keys: BTreeSet<String> = leaf_keys_of(&data_config_toml()).into_iter().collect();
-        let missing: Vec<&str> = registry()
-            .iter()
-            .map(|f| f.key)
-            .filter(|k| !toml_keys.contains(*k) && !ABSENT_FROM_DATA_CONFIG.contains(k))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "data/config.toml 缺少 {} 个已登记键（预置文件应完整列出全部可配置项，\
-             既是出厂默认值也是说明书）: {:?}",
-            missing.len(),
-            missing
-        );
-    }
-
-    /// 豁免名单自身不能腐烂：里面的键必须仍在注册表中，且确实没写进预置文件。
-    /// 否则删掉某个字段后，名单会留下一条永远为真的死条目。
-    #[test]
-    fn absent_allowlist_stays_accurate() {
-        let toml_keys: BTreeSet<String> = leaf_keys_of(&data_config_toml()).into_iter().collect();
-        for key in ABSENT_FROM_DATA_CONFIG {
-            assert!(is_known_key(key), "豁免名单含未登记键（已删字段？）: {key}");
-            assert!(
-                !toml_keys.contains(*key),
-                "{key} 已写进 data/config.toml，应从豁免名单移除"
-            );
-        }
-    }
-
-    #[test]
-    fn data_config_toml_has_no_orphan_keys() {
-        let struct_keys: BTreeSet<String> = config_leaf_keys().into_iter().collect();
-        let toml_keys = leaf_keys_of(&data_config_toml());
-        let orphans: Vec<&String> = toml_keys
-            .iter()
-            .filter(|k| !struct_keys.contains(*k))
-            .collect();
-        assert!(
-            orphans.is_empty(),
-            "data/config.toml 含 {} 个孤立键（struct 无对应字段，会被静默丢弃）: {:?}",
-            orphans.len(),
-            orphans
-        );
-    }
-
-    #[test]
-    fn field_lookup_finds_registered_key_and_rejects_unknown() {
-        let f = field("ui.candidate.layout").expect("已登记键应查到");
-        assert_eq!(f.key, "ui.candidate.layout");
-        assert!(matches!(f.ty, FieldType::Enum(_)));
-        assert!(is_known_key("keys.overflow.number_key"));
-        assert!(!is_known_key("ui.candidate.bogus"), "未登记键应返回 None");
-        assert!(!is_known_key("totally.made.up"));
-    }
-
-    /// 守卫：core 内部 setter 硬编码的 key 路径必须都在注册表中（防拼写/漂移）。
-    /// 新增 `Config::set_user_*` 调用点时，把其路径加到这里。
-    #[test]
-    fn internal_setter_paths_are_registered() {
-        const INTERNAL_PATHS: &[&str] = &[
-            "schema.active",
-            "ui.theme.style",
-            "ui.theme.name",
-            "ui.candidate.preedit_display",
-            "ui.toolbar.visible",
-        ];
-        for p in INTERNAL_PATHS {
-            assert!(is_known_key(p), "内部 setter 路径未在注册表登记: {p}");
-        }
-    }
-
-    #[test]
-    fn validate_accepts_correct_types() {
-        assert!(validate("ui.candidate.per_page", &toml::Value::Integer(9)).is_ok());
-        assert!(validate("ui.candidate.hide_window", &toml::Value::Boolean(true)).is_ok());
-        assert!(
-            validate(
-                "ui.candidate.layout",
-                &toml::Value::String("vertical".into())
-            )
-            .is_ok()
-        );
-        // Float 字段接受整数值（宽松）
-        assert!(validate("ui.candidate.font_size", &toml::Value::Integer(18)).is_ok());
-        assert!(validate("ui.candidate.font_size", &toml::Value::Float(18.0)).is_ok());
-        // Enum 允许空串成员（pager_bar_display 含 ""）
-        assert!(
-            validate(
-                "ui.candidate.pager_bar_display",
-                &toml::Value::String("".into())
-            )
-            .is_ok()
-        );
-        // 数组 / 表
-        assert!(
-            validate(
-                "schema.available",
-                &toml::Value::Array(vec![toml::Value::String("wubi86".into())])
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_rejects_unknown_key() {
-        assert_eq!(
-            validate("ui.candidate.bogus", &toml::Value::Integer(1)),
-            Err(ValidateError::UnknownKey)
-        );
-    }
-
-    #[test]
-    fn validate_rejects_type_mismatch() {
-        let r = validate(
-            "ui.candidate.per_page",
-            &toml::Value::String("seven".into()),
-        );
-        assert!(
-            matches!(r, Err(ValidateError::TypeMismatch { .. })),
-            "{r:?}"
-        );
-        let r2 = validate("ui.candidate.hide_window", &toml::Value::Integer(1));
-        assert!(
-            matches!(r2, Err(ValidateError::TypeMismatch { .. })),
-            "{r2:?}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_enum_out_of_range() {
-        let r = validate(
-            "ui.candidate.layout",
-            &toml::Value::String("diagonal".into()),
-        );
-        assert!(
-            matches!(r, Err(ValidateError::EnumOutOfRange { .. })),
-            "{r:?}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_strlist_with_non_string_element() {
-        let r = validate(
-            "schema.available",
-            &toml::Value::Array(vec![toml::Value::Integer(1)]),
-        );
-        assert!(
-            matches!(r, Err(ValidateError::TypeMismatch { .. })),
-            "{r:?}"
-        );
-    }
-
-    #[test]
-    fn registry_types_match_default_values() {
-        let default = toml::Value::try_from(Config::default()).unwrap();
-        for field in registry() {
-            let value = navigate(&default, field.key)
-                .unwrap_or_else(|| panic!("默认配置缺少注册表声明的键: {}", field.key));
-            assert!(
-                type_matches(field.ty, value),
-                "键 {} 声明类型 {:?} 与默认值实际类型不符: {:?}",
-                field.key,
-                field.ty,
-                value
-            );
-        }
-    }
-
-    /// 按点分路径在 TOML 表中导航取值。
-    fn navigate<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
-        let mut cur = root;
-        for part in key.split('.') {
-            cur = cur.as_table()?.get(part)?;
-        }
-        Some(cur)
-    }
-
-    fn type_matches(ty: FieldType, value: &toml::Value) -> bool {
-        match ty {
-            FieldType::Bool => value.is_bool(),
-            FieldType::Int => value.is_integer(),
-            FieldType::Float => value.is_float(),
-            FieldType::Str | FieldType::Enum(_) => value.is_str(),
-            // 可分档枚举：标签式是字符串，表写法是表，两种都合法。
-            FieldType::LayoutEnum(_) => value.is_str() || value.is_table(),
-            FieldType::StrList | FieldType::StructList => value.is_array(),
-            FieldType::Map(_) => value.is_table(),
-        }
-    }
-
-    /// data/config.toml 每个已登记叶子键的值，必须通过 registry 校验（类型 / enum 合法）。
-    /// 注意：config.toml 作为系统预置可合法覆盖 code default，故此处只校验「合法」而非「等于默认」。
-    #[test]
-    fn data_config_toml_values_pass_validation() {
-        let toml_val = data_config_toml();
-        let mut bad = Vec::new();
-        for (key, value) in leaf_entries(&toml_val) {
-            // 未登记键由 data_config_toml_has_no_orphan_keys 守护，这里只校验已登记项的值
-            if field(&key).is_none() {
-                continue;
-            }
-            if let Err(e) = validate(&key, &value) {
-                bad.push(format!("{key}: {e}"));
-            }
-        }
-        assert!(
-            bad.is_empty(),
-            "data/config.toml 含非法值（类型/enum 不符 registry）:\n{}",
-            bad.join("\n")
-        );
-    }
-
-    /// [`SCHEMA_OVERRIDES`] 里的每条登记都必须指到真实存在的键（或非空的段）。
-    ///
-    /// 这道闸拦的是**键名漂移**：全局键被改名或删掉之后，表里那条会静默失配，
-    /// 设置页那一行就不再提示可被方案覆盖——而这种缺失没有任何别的东西看得见。
-    ///
-    /// ⚠️ 它拦不住反方向（core 新增了方案级字段却没往表里加一条）：那层对应关系只存在于
-    /// `resolved()` 的函数体里，类型系统与本测试都看不见。见 `SCHEMA_OVERRIDES` 的文档。
-    #[test]
-    fn schema_overrides_point_at_real_keys() {
-        for o in SCHEMA_OVERRIDES {
-            match o.key.strip_suffix('.') {
-                // 段前缀：该段下至少要有一个已登记的叶子键。
-                Some(prefix) => {
-                    let n = registry()
-                        .iter()
-                        .filter(|f| {
-                            f.key
-                                .strip_prefix(prefix)
-                                .is_some_and(|r| r.starts_with('.'))
-                        })
-                        .count();
-                    assert!(
-                        n > 0,
-                        "SCHEMA_OVERRIDES 的段前缀 `{}` 在注册表里一个键都没匹配到——\
-                         多半是那一段被改名或删了",
-                        o.key
-                    );
-                }
-                None => assert!(
-                    is_known_key(o.key),
-                    "SCHEMA_OVERRIDES 登记了未知键 `{}`（改名或已删除？）",
-                    o.key
-                ),
-            }
-        }
-    }
-
-    /// 前缀匹配不能误伤同前缀的兄弟段，也不能把段名本身当成叶子键。
-    #[test]
-    fn schema_override_prefix_matches_only_that_section() {
-        // 段内叶子命中。
-        assert!(schema_override_of("schema.codetable.top_code_commit").is_some());
-        // 段名本身不是叶子键，不该命中。
-        assert!(schema_override_of("schema.codetable").is_none());
-        // 同前缀的兄弟段不该被误伤（`schema.codetableX` 与 `schema.codetable` 只差一个字符）。
-        assert!(schema_override_of("schema.codetableX.foo").is_none());
-        // 精确登记项。
-        assert!(schema_override_of("input.punct.custom_enabled").is_some());
-        // 同段但没登记的键不该命中（`smart_list` 不在方案级下放范围）。
-        assert!(schema_override_of("input.punct.smart_list").is_none());
-    }
-
-    /// 登记的段名必须是方案文件里真实存在的段——它原样进设置页提示，用户照着写。
-    ///
-    /// 现场：`[codetable]` / `[aux_code]` 挂了很久，而这两段实际在 `[engine.*]` 下、也没有
-    /// serde 别名；照提示写进方案文件的配置会被静默忽略（`Schema` 不拒未知字段）。
-    #[test]
-    fn schema_override_sections_exist_in_schema() {
-        // 可选子段默认是 None、序列化时不出现，先填上才能在树里找到它们。
-        let mut schema = crate::schema::Schema::default();
-        schema.engine.codetable.frequency = Some(Default::default());
-        schema.engine.codetable.english_merge = Some(Default::default());
-        let tree = toml::Value::try_from(schema).expect("序列化 Schema");
-        for o in SCHEMA_OVERRIDES {
-            let path = o
-                .section
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or_else(|| panic!("{} 的段名 {:?} 不是 [a.b] 形式", o.key, o.section));
-            let mut node = &tree;
-            for seg in path.split('.') {
-                node = node.get(seg).unwrap_or_else(|| {
-                    panic!(
-                        "{} 登记的段 {} 在 Schema 里不存在（断在 {seg}）",
-                        o.key, o.section
-                    )
-                });
-            }
-            assert!(node.is_table(), "{} 登记的段 {} 不是表", o.key, o.section);
-        }
-    }
-
-    /// 段前缀**不递归**：子段要么自己登记，要么不该被标记。
-    ///
-    /// 现场：第一版用递归前缀，`schema.codetable.auto_phrase.*` 六个键被一并标成
-    /// 「可被方案覆盖」，而 `CodetableGlobal::resolved` 折叠到 `frequency` 就返回了，
-    /// 根本不读 auto_phrase。标错比漏标更糟——用户会去方案里写一段不会被读的配置，
-    /// 写了没反应还以为是自己写错了。
-    #[test]
-    fn section_prefix_does_not_leak_into_subsections() {
-        // 登记了的子段：命中，且命中的是**子段那一条**（提示文案要说 [engine.codetable.frequency]）。
-        let hit = schema_override_of("schema.codetable.frequency.half_life")
-            .expect("frequency 子段已单独登记，应命中");
-        assert_eq!(hit.section, "[engine.codetable.frequency]");
-        // 没登记的子段：绝不能因为父段登记了就跟着被标。
-        for k in [
-            "schema.codetable.auto_phrase.enabled",
-            "schema.codetable.auto_phrase.min_phrase_len",
-            "schema.codetable.auto_phrase.temp_max_entries",
-        ] {
-            assert!(
-                schema_override_of(k).is_none(),
-                "{k} 没有方案级形态（resolved 不折叠 auto_phrase），不该被标记"
-            );
-        }
-    }
-    /// 写盘闸的判据必须**按「整值覆盖」而不是按 Map** 分类。
-    ///
-    /// 这条钉的是 0.120 周期的一个真实缺陷：`config.setItems` 的降级闸写成了
-    /// `matches!(ty, FieldType::Map(_))`，于是 `ui.toolbar.items`、`ui.langbar.badges`
-    /// 这些数组型键全部漏在门外——设置端把数组也是整份发送的，失效形态与 Map 完全一样
-    /// （段降级 ⇒ base 是出厂值 ⇒ 用户改一格保存 ⇒ 原有内容永久消失）。
-    ///
-    /// 逐个变体断言而不是只测两三个键：加新变体时这里编译不过（`is_whole_value_leaf`
-    /// 的 match 是穷举的），作者被迫回答「写它是整体换掉还是只动一个值」。
-    #[test]
-    fn whole_value_leaf_covers_arrays_not_just_maps() {
-        for ty in [
-            FieldType::Map(&[]),
-            FieldType::StrList,
-            FieldType::StructList,
-        ] {
-            assert!(ty.is_whole_value_leaf(), "{ty:?} 是整值覆盖，必须过写盘闸");
-        }
-        for ty in [
-            FieldType::Bool,
-            FieldType::Int,
-            FieldType::Float,
-            FieldType::Str,
-            FieldType::Enum(&[]),
-        ] {
-            assert!(
-                !ty.is_whole_value_leaf(),
-                "{ty:?} 是标量，拦它只会让降级期间整个设置页存不了盘"
-            );
-        }
-    }
-
-    /// 那几个真实的数组型键确实登记着数组类型——否则上一条测试只是在自说自话。
-    #[test]
-    fn the_array_keys_that_bit_us_are_registered_as_whole_value() {
-        for key in [
-            "ui.toolbar.items",
-            "ui.toolbar.buttons",
-            "ui.langbar.badges",
-            "schema.mix_modes",
-            "input.punct.custom_mappings",
-        ] {
-            let f = field(key).unwrap_or_else(|| panic!("{key} 未登记"));
-            assert!(
-                f.ty.is_whole_value_leaf(),
-                "{key}（{:?}）应被写盘闸拦下",
-                f.ty
-            );
-        }
-    }
-}
+#[path = "config_schema_tests.rs"]
+mod tests;
 
 /// 可分档枚举（`LayoutEnum`）的校验：每一档都要落在同一个值域里。
 #[cfg(test)]
-mod layout_enum_tests {
-    use super::*;
-
-    const KEY: &str = "ui.candidate.pager_bar_display";
-
-    fn v(s: &str) -> toml::Value {
-        toml::Value::String(s.to_string())
-    }
-
-    #[test]
-    fn scalar_value_still_validates() {
-        assert!(validate(KEY, &v("hide")).is_ok());
-        assert!(validate(KEY, &v("")).is_ok(), "空串＝跟随主题，是合法值");
-    }
-
-    #[test]
-    fn each_side_of_a_tagged_value_is_checked() {
-        assert!(validate(KEY, &v("h:hide v:always")).is_ok());
-        assert!(validate(KEY, &v("v:always")).is_ok(), "只覆盖一侧");
-    }
-
-    #[test]
-    fn a_bad_value_on_one_side_is_caught() {
-        // 分档不是绕过值域的后门：任一档越界都要报出来，且报的是那一档的值。
-        let e = validate(KEY, &v("h:hide v:alwys")).unwrap_err();
-        assert!(
-            matches!(&e, ValidateError::EnumOutOfRange { got, .. } if got == "alwys"),
-            "实得：{e:?}"
-        );
-    }
-
-    #[test]
-    fn misspelled_dim_falls_through_to_the_value_domain() {
-        // ★ 「拼错档位名」的兜底就在这里：`"x:hide"` 在解析层与 `"C:\path"` 同形、
-        // 分辨不了，于是原样当标量落到值域比对 ⇒ 报越界。错误照样看得见。
-        let e = validate(KEY, &v("x:hide")).unwrap_err();
-        assert!(
-            matches!(&e, ValidateError::EnumOutOfRange { got, .. } if got == "x:hide"),
-            "实得：{e:?}"
-        );
-    }
-
-    #[test]
-    fn table_form_validates_per_side() {
-        let mut t = toml::map::Map::new();
-        t.insert("h".into(), v("hide"));
-        t.insert("v".into(), v("always"));
-        assert!(validate(KEY, &toml::Value::Table(t.clone())).is_ok());
-        t.insert("v".into(), v("nope"));
-        assert!(
-            validate(KEY, &toml::Value::Table(t)).is_err(),
-            "表写法同样逐档验"
-        );
-    }
-
-    #[test]
-    fn table_form_is_a_leaf_not_drilled_into() {
-        // 下钻的话 `….pager_bar_display.h` 会被当成注册表里没有的键，两个方向同时报错。
-        let mut t = toml::map::Map::new();
-        t.insert("h".into(), v("hide"));
-        let mut out = Vec::new();
-        collect_leaf_keys(KEY, &toml::Value::Table(t), &mut out);
-        assert_eq!(out, vec![KEY.to_string()]);
-    }
-
-    #[test]
-    fn is_not_a_whole_value_leaf() {
-        // 设置端写它时发的是一个标量（标签式），不该落进写盘闸的「整体一份」那一类。
-        assert!(!field(KEY).unwrap().ty.is_whole_value_leaf());
-    }
-}
+#[path = "config_schema_layout_enum_tests.rs"]
+mod layout_enum_tests;
 
 #[cfg(test)]
-mod overridden_keys_tests {
-    use super::*;
-
-    fn schema_of(body: &str) -> crate::schema::Schema {
-        let src = format!("[schema]\nid = \"t\"\n[engine]\ntype = \"codetable\"\n{body}");
-        toml::from_str(&src).unwrap_or_else(|e| panic!("最小方案解析失败：{e}\n{src}"))
-    }
-
-    #[test]
-    fn overridden_keys_lists_codetable_option_fields_once() {
-        let s = schema_of(
-            "[engine.codetable]\ntop_code_commit = true\n[candidate]\nlayout = \"vertical\"\n",
-        );
-        let keys = schema_overridden_keys(&s);
-        assert!(
-            keys.contains(&"schema.codetable.top_code_commit"),
-            "{keys:?}"
-        );
-        assert!(keys.contains(&"ui.candidate.layout"), "{keys:?}");
-        assert_eq!(
-            keys.iter()
-                .filter(|k| **k == "schema.codetable.top_code_commit")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn overridden_keys_ignores_follow_and_none() {
-        // 显式写 follow、写空的码元字符集、只写引擎固定参数：都不算覆盖全局。
-        let s = schema_of(
-            "[engine.codetable]\nmax_code_length = 4\ninput_chars = \"\"\n[candidate]\nlayout = \"follow\"\n[punct]\nmode = \"chinese\"\n",
-        );
-        assert!(
-            schema_overridden_keys(&s).is_empty(),
-            "{:?}",
-            schema_overridden_keys(&s)
-        );
-    }
-
-    /// 前缀型登记在方案文件里的落点段。与 `SchemaOverride::section` 刻意不共用：那是给用户看
-    /// 的提示文案（带方括号，如 `[engine.codetable]`），这里要的是点分路径。
-    fn schema_section_of_prefix(prefix: &str) -> &'static str {
-        match prefix {
-            "schema.codetable." => "engine.codetable",
-            "schema.codetable.frequency." => "engine.codetable.frequency",
-            "schema.codetable.english_merge." => "engine.codetable.english_merge",
-            other => panic!(
-                "新增了前缀登记 {other}：在此补它在方案文件里的段，并让 schema_overridden_keys 认它"
-            ),
-        }
-    }
-
-    /// 通用折叠登记的结构约束：必须是 `ui.candidate.<叶子>`、落点段是 `[candidate]`、
-    /// 注册表里有这个键，且叶子名不能与 `CandidateSpec` 的强类型字段撞车
-    /// （撞了 serde 会让强类型字段吃掉它，补丁永远收不到——登记成了摆设）。
-    #[test]
-    fn candidate_typed_keys_are_not_foldable() {
-        for o in SCHEMA_OVERRIDES.iter().filter(|o| o.fold) {
-            let leaf = o
-                .key
-                .strip_prefix("ui.candidate.")
-                .unwrap_or_else(|| panic!("{} 不在 ui.candidate. 下，通用折叠器不支持", o.key));
-            assert!(!leaf.contains('.'), "{} 只支持直接子键", o.key);
-            assert_eq!(
-                o.section, "[candidate]",
-                "{} 的落点段必须是 [candidate]",
-                o.key
-            );
-            assert!(is_known_key(o.key), "{} 未在注册表登记", o.key);
-            assert!(
-                !crate::schema::CANDIDATE_TYPED_KEYS.contains(&leaf),
-                "{leaf} 是 CandidateSpec 的强类型字段，不能走通用折叠"
-            );
-        }
-    }
-
-    /// 精确登记项的最小方案片段——只设这一项。
-    fn minimal_setting_of_exact(key: &str) -> &'static str {
-        match key {
-            "schema.pinyin.aux_code.enabled" => "[engine.aux_code]\nenabled = true\n",
-            "schema.pinyin.aux_code.max_phrase_len" => "[engine.aux_code]\nmax_phrase_len = 3\n",
-            "schema.pinyin.aux_code.direct" => "[engine.aux_code]\ndirect = true\n",
-            // 方案级没有 `custom_enabled`（见 `PunctSpec::custom_mappings` 的 ⛔）：声明了自己的
-            // 表就整表替换、连全局开关一起换掉。于是两条登记由同一个字段判定，这是登记语义
-            // 本身（见 SCHEMA_OVERRIDES 那条 note），不是豁免。
-            "input.punct.custom_mappings" | "input.punct.custom_enabled" => {
-                "[punct.custom_mappings]\n\",\" = [\"，\", \"，\", \"，\", \",\"]\n"
-            }
-            "ui.candidate.layout" => "[candidate]\nlayout = \"vertical\"\n",
-            other => panic!(
-                "新增了登记项 {other}：在此补一份只设该项的最小方案片段，并让 schema_overridden_keys 认它"
-            ),
-        }
-    }
-
-    fn sample_value(key: &str) -> String {
-        match field(key)
-            .unwrap_or_else(|| panic!("{key} 未在注册表登记"))
-            .ty
-        {
-            FieldType::Bool => "true".into(),
-            FieldType::Int => "1".into(),
-            FieldType::Float => "1.5".into(),
-            FieldType::Str => "\"x\"".into(),
-            FieldType::Enum(vs) => format!("{:?}", vs[0]),
-            other => panic!("{key} 的类型 {other:?} 在方案级没有标量形态，测试需要单独处理"),
-        }
-    }
-
-    /// 每个被 SCHEMA_OVERRIDES 登记为「可被方案覆盖」的键，都必须能被本函数识别，
-    /// 否则全局页的「已被 N 个方案覆盖」会对它恒显示 0（R8.6），这是护栏。
-    ///
-    /// 前缀型登记按注册表展开成它管辖的**全部直接子键**（与 `schema_override_of` 同一判据），
-    /// 每个键各造一份只设该键的方案。展开取自注册表而不是 `CodeTableSpec` 字段：全局页的行
-    /// 是按注册表画的，注册表里多出一个方案读不进去的键，这里就该红。
-    ///
-    /// 豁免：无。每条登记都能由方案侧某个 Option / 非 Follow / 非空字段判定。
-    #[test]
-    fn overridden_keys_covers_every_schema_override_entry() {
-        let mut checked = 0;
-        for o in SCHEMA_OVERRIDES {
-            let cases: Vec<(&str, String)> = if o.key.ends_with('.') {
-                let section = schema_section_of_prefix(o.key);
-                let keys: Vec<&str> = registry()
-                    .iter()
-                    .map(|f| f.key)
-                    .filter(|k| schema_override_of(k).is_some_and(|hit| hit.key == o.key))
-                    .collect();
-                assert!(
-                    !keys.is_empty(),
-                    "前缀登记 {} 在注册表里一个子键都没有",
-                    o.key
-                );
-                keys.into_iter()
-                    .map(|k| {
-                        let leaf = &k[o.key.len()..];
-                        (k, format!("[{section}]\n{leaf} = {}\n", sample_value(k)))
-                    })
-                    .collect()
-            } else if o.fold {
-                // 通用折叠键：片段由注册表类型自动生成，新增一条登记不需要改测试。
-                let leaf = o
-                    .key
-                    .strip_prefix("ui.candidate.")
-                    .expect("fold 键必须在 ui.candidate. 下");
-                vec![(
-                    o.key,
-                    format!("[candidate]\n{leaf} = {}\n", sample_value(o.key)),
-                )]
-            } else {
-                vec![(o.key, minimal_setting_of_exact(o.key).to_string())]
-            };
-            for (key, body) in cases {
-                let got = schema_overridden_keys(&schema_of(&body));
-                assert!(
-                    got.contains(&key),
-                    "只设了 {key} 的方案没被识别为覆盖它（片段：{body:?}，结果：{got:?}）"
-                );
-                checked += 1;
-            }
-        }
-        // 防「循环体一次没进」的空过：登记表 + 前缀展开至少有这么多键。
-        assert!(checked >= 30, "只验了 {checked} 个键，展开逻辑可能坏了");
-    }
-
-    #[test]
-    fn comment_dyn_keys_parse_by_shape() {
-        use super::{CommentDynKey as K, comment_dyn_key};
-        assert_eq!(
-            comment_dyn_key("ui.comment.assign.global.detail_vertical"),
-            Some(K::Cell {
-                scope: "global",
-                name: None,
-                cell: "detail_vertical"
-            })
-        );
-        assert_eq!(
-            comment_dyn_key("ui.comment.assign.mode.mix:quick_mix.default_horizontal"),
-            Some(K::Cell {
-                scope: "mode",
-                name: Some("mix:quick_mix"),
-                cell: "default_horizontal"
-            })
-        );
-        assert_eq!(
-            comment_dyn_key("ui.comment.template.my_tpl"),
-            Some(K::Template { id: "my_tpl" })
-        );
-        for bad in [
-            "ui.comment.assign.global.nope",
-            "ui.comment.assign.type.default_vertical",
-            "ui.comment.assign.other.x.default_vertical",
-            "ui.comment.template.",
-            "ui.comment.template.my.tpl",
-            "ui.comment.template.My",
-            "ui.comment.template.none",
-            "ui.comment.assign.mode.a.b.default_vertical",
-        ] {
-            assert_eq!(comment_dyn_key(bad), None, "{bad}");
-        }
-        assert!(is_addressable_key(
-            "ui.comment.assign.type.pinyin.default_vertical"
-        ));
-        assert!(!is_known_key(
-            "ui.comment.assign.type.pinyin.default_vertical"
-        ));
-        // 值形状：模板 id / none / inherit / 空串可，其余拒。
-        let v = |x: &str| {
-            validate(
-                "ui.comment.assign.global.default_vertical",
-                &toml::Value::from(x),
-            )
-        };
-        assert!(v("").is_ok() && v("none").is_ok() && v("my_tpl").is_ok());
-        assert!(v("My Tpl").is_err());
-    }
-
-    #[test]
-    fn lookup_json_reads_dynamic_keys_and_blank_when_unset() {
-        let full = serde_json::json!({"ui":{"comment":{
-            "templates":[{"id":"t1","name":"n","text":"${code}"}],
-            "assign":{"global":{"default_vertical":"t1"},"type":{"pinyin":{"detail_vertical":"t1"}}}}}});
-        let g = |k| lookup_json_value(&full, k).unwrap();
-        assert_eq!(g("ui.comment.template.t1"), "${code}");
-        assert_eq!(g("ui.comment.template.zz"), "");
-        assert_eq!(g("ui.comment.assign.global.default_vertical"), "t1");
-        assert_eq!(g("ui.comment.assign.global.detail_vertical"), "");
-        assert_eq!(g("ui.comment.assign.type.pinyin.detail_vertical"), "t1");
-        assert_eq!(g("ui.comment.assign.mode.url.default_vertical"), "");
-    }
-}
+#[path = "config_schema_overridden_keys_tests.rs"]
+mod overridden_keys_tests;

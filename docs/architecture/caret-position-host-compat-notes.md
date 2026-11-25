@@ -79,6 +79,11 @@ QQNT、Excel、WPS 表格、EverEdit、记事本上暴露出**八种互不相同
 
 修法是让**组合前的空闲上报坐标**（按键前的光标位置，即真正的组合起点）抢在宿主之前锁定。
 
+同类还有 **Beyond Compare（`BCompare.exe`）**：组合期间的坐标与 compStart 恒为窗口左上角附近的固定值，
+与真实位置无关。对 `stale_probe_guard` 宿主，组合期间不仅 probe 不收，普通 `caret_update` 也整条
+不采信（缓存还原为组合前的空闲上报），否则首显对了、几十毫秒后第一帧 `caret_update` 又把候选窗
+重锁回错位。没有空闲上报时本守卫不生效。
+
 > ⚠ 判据用 `!shown`（本轮尚未下发过）而**不是** `is_first_frame`：兜底 timer 到期那条路径先置了
 > `show_authorized`，`is_first_frame` 已为 false，绑在它上面会整条漏掉——症状是「第三个字好了、
 > 第二个字仍挪一格」。
@@ -94,6 +99,15 @@ QQNT、Excel、WPS 表格、EverEdit、记事本上暴露出**八种互不相同
 应对：C++ 侧把重排前那一帧作为 `CARET_SRC_PRE_REFLOW` 发出来，服务端只拿它**刷新坐标缓存**、
 不参与首显判据。刷新缓存不改变任何档位的首显时机，故这条处理放在档位门**之前**——`wait` 档
 宿主同样需要（EverEdit 配的是 `wait`，曾因放在门后一条都收不到）。
+
+EverEdit 的空闲上报还会滞后一拍：点击移动光标后既不发 `caret_update` 也不发 selection 变更，缓存
+停在上一次的位置，而 probe 在 1ms 后就给出正确坐标。因此 probe 可信的宿主不拿空闲上报抢跑首显
+（`probe_is_untrusted` 为假时 idle_anchor 逃生口不开），否则候选窗恒慢一拍。
+
+焦点刚到达时的空闲上报同样不可信：宿主还没 reflow，报的往往是上一处的位置（EverEdit 实测焦点坐标、
+空闲上报、真实位置三者互不相同，拿空闲上报首显会错上千像素）。故焦点后的第一个组合不开 idle_anchor
+逃生口（`awaiting_first_authority_after_focus`），仍走 25ms 短兜底，其间 probe 已把缓存刷对；
+不能改为收窄 `caret_cache_verified` 的置位，那会让焦点后首字退回 600ms 长兜底。
 
 ### D 类：终端 / 浏览器
 
@@ -116,6 +130,17 @@ QQ 的 reported compStart 正常且稳定，但同一按键后会先后出现：
 反复改成 `start → selection → start`。`QQ.exe` 的出厂规则启用 `composition_start_pair_guard`；仅当
 前帧确为 `TSF_COMPOSITION`、其 caret 等于本帧 reported compStart、且该点仍等于已锁起点时，
 后续 `TSF_SELECTION` 才被判成正常组合跨度而禁止重锁。UI 的右边界钳制只放大了观感，不是根因。
+
+QQ 的另外两个事实，决定了重锁判据的写法：
+
+- **判据问宿主，不问自己**：「起点没错」的依据是宿主前后两帧报的 compStart 一致，而不是拿已锁的
+  `composition_start` 与它比。后者有三个写入者，其中两个写的是「候选窗画在哪」，与宿主值差 2px
+  就会让相等判据整条失效。
+- **输入框整体移动时，QQ 会如实改报 compStart**（x 不变、y 随框移动）。此时前后两帧不同、要重锁，
+  而对开了 `composition_start_pair_guard` 的宿主，重锁目标取宿主本帧报的 compStart；取 caret
+  会把锚点锁到组合末端，之后 guard 反而把这个错锚点钉住。
+- 组合区换行后 QQ 会补发一帧 `TSF_CACHED`，带着第一行行尾的陈旧坐标。只认
+  `TSF_COMPOSITION → TSF_SELECTION` 帧对的判据管不到它。
 
 ### F 类：游戏宿主——`GetTextExt` 返回**固定**垃圾值
 
@@ -319,6 +344,98 @@ B 屏的任务栏。
 逐键抖动（一会儿 `D3dExclusive`、一会儿 `Covering`），会让候选窗在上下方之间反复跳。
 （判 D3D 独占态仍是它的正当用途，`foreground.rs` 判据①靠 300ms TTL 压住抖动。）
 
+## 二·六、组合矩形（`composition_rect`）的三种形态
+
+组合矩形是宿主对整个组合范围的测量。它可信时直接取左下角作锚点：单行时 `left` 是组合起点、
+`bottom` 是行底；跨行时 `left` 落在最后一行行首。compStart 做不到这一点：它把组合折叠到起点，
+跨行后仍停在第一行（QQ、飞书、记事本实测均如此，三者的 `caret.y` 恒等于 `rect.bottom`），这是
+候选窗「换行后回不去」的根源。同行内 `left` 恒定，所以矩形每帧更新，不受「同一组合只锁一次」约束
+（例外是 H 类 Tabby，见上）。
+
+可信要同时满足两条（`handle_caret_update` 的 `rect_anchor`）：
+
+1. **是范围不是点**：宽度 > `INSERTION_POINT_MAX_WIDTH`（4px）。光标宽 0~2px，真包围盒最窄也是
+   一个字符宽（16~17px），中间是空带。
+2. **覆盖当前插入行**：`caret.y <= rect.bottom`。只返回首行的宿主会在换行后违反它，此时回退既有逻辑。
+
+不可信的两种形态，处理不同：
+
+| 形态 | 代表 | 含义 | 处理 |
+|---|---|---|---|
+| **整帧退化**（宽或高为 0） | Word 的 `tsf_cached` 帧 | 这次 `GetTextExt` 没算出布局，同帧的 caret 与 compStart 也不可信 | 抑制大偏移逃生阀，否则它与同期 selection 帧（差 100+px）交替到达，锚点来回抖 |
+| **插入点形态**（宽 1~2px） | WPS 文字（w=2）、WPS 表格 / Excel（w=1） | 宿主给不出组合范围，compStart 跟着插入点右移 | 见下 |
+
+插入点形态的宿主分两种，**数据完全一样、期望相反**，只能按宿主声明：
+
+- **WPS 文字**要钉住起点。若放任大偏移逃生阀，打字时锚点被漂移的 compStart 一路推远，删除时
+  逐字回退每步只有十几像素，永远够不到 3 倍行高的重锁阈值，锚点永久卡住。故 per-app
+  `pin_anchor_when_start_drifts` 同时抑制逃生阀；跨行时 x 保持钉住、y 跟随 caret 所在行。
+- **Excel / WPS 表格**每输入一个字就换一次 docMgr，候选窗本就该跟着单元格走，靠的正是逃生阀。
+  `pin_anchor_when_start_drifts` 曾做成全局默认，当场弄坏 Excel 的跟随。
+
+大偏移逃生阀（caret 偏离已锁起点超过 3 倍行高才重锁）有已知盲区：偏差落在 `tol_x`（约 2 倍行高）
+与 3 倍行高之间时 reshow 会触发、位置却仍取钉住的起点。阈值不能再往下调（会把逐字前移当成锚点
+错误），真遇到这个区间要换证据。有可信矩形时逃生阀整段跳过。
+
+## 二·七、非 TSF 坐标来源
+
+- **`gui_caret`**（`GetGUIThreadInfo`）可能是任务栏等别处残留的 Win32 光标。它够格当「没有更好
+  选择时的兜底位置」，不够格解除首帧信任门（`caret_cache_verified`）。它与 TSF 的 compStart 不同源，
+  锁组合起点时的 500px 同源校验对它不适用：此时直接采信 compStart。
+- **Word 组合期的 `gui_caret` 帧**：Word 在按键期可拒绝同步 edit session（`TS_E_SYNCHRONOUS`），
+  DLL 回退到 Win32 光标上报，那是跨窗口的陈旧位置（恒在别的行），不带组合起点与矩形。让它进入
+  组合期的跟行 / 重锁，候选窗就在它与 TSF 真坐标之间来回跳。故本组合收到过 TSF 域帧之后，GUI 帧
+  一律不再采信（`tsf_frame_seen_in_composition`）；纯 GUI 回退的宿主不受影响。
+- **焦点事件上的坐标**：`OnSetFocus` 不是按键上下文，同步 edit session 必被拒绝，回退链交出的是
+  跨窗口的 Win32 光标（Word 只在正文行维护它，标题行上取到的是别处的值，实测偏差 800px 以上）。
+  `ui.status.show_on_focus` 的焦点气泡因此在 `follow_caret` 模式下只认 TSF 域坐标，拿不到就挂起
+  等 DLL 补来的 TSF 帧（`pending_focus_tip`），不做回退。
+- **Java 被动客户端**（如 JTable 未进入编辑）按键时 DLL 退到 `gui_caret`，拿到的是窗口客户区原点；
+  TSF probe 报的是 Windows 输入编辑框的位置，它不随单元格移动，常恰好等于上一轮权威坐标而被判
+  「未 reflow」。此时 probe 仍应替换掉非 TSF 的缓存，否则兜底到期时候选窗先闪到屏幕左边。
+- **`tsf_default_pos`**：宿主不知道插入点在哪（如 Illustrator 画布），DLL 报宿主的默认位置。缓存装着
+  它时不算「对应当前插入点」，`caret_cache_verified` 必须清为 false，否则下一次组合会走 25ms 短兜底，
+  先在上一次 `gui_caret` 位置闪一下再跳到默认位置。代价是该宿主恒 arm 600ms 长兜底：默认位置帧
+  通常几十毫秒内就到并消费掉兜底，但 `IsHostDefaultPosition` 失败关闭时会等满 600ms。
+  - 识别指纹：`GetTextExt` 返回高度为 0 的退化矩形，选区、组合起点、组合矩形三者同值，且重试窗口
+    过完仍是它（Illustrator 画布恒为工作区右下角最后一个像素；多个宿主给同一个值，是 TSF 的通用
+    惯用语而非脏数据）。
+  - 要采信、不能丢：其它输入法直接采信，候选窗落在右下角任务栏之上；丢掉它回退链会跌到 `gui_caret`
+    （无关控件的 Win32 光标），候选窗被钉在左上角。采信后 `place_window` 现有的上翻 / 左移 / 钳制
+    就会把它落到右下角，无需新代码。
+  - 它不属 TSF 语义域（`caret_source::is_tsf` 为 false），因为它明说「没有插入点」，不能当权威坐标
+    参与跟行与漂移校正；但照常走首显（`pending_first_show` 消费不看来源），不再空等 600ms。
+  - 跟行（`pin_anchor_when_start_drifts` 把锚点 y 换成 `caret.y`）不看来源，本值也会被用上。没补来源闸，
+    因为该指纹下 `caret.y` 恒等于已锁锚点的 y，构造不出可达的失败。
+- **`imm_candidate_form`**：宿主经 `ImmSetCandidateWindow` 声明的候选窗位置（DLL 已换成屏幕坐标）。
+  DLL 只在出现上面 `tsf_default_pos` 指纹时才取。典型宿主是走 CUAS 的 Java AWT/Swing（医疗 HIS/LIS
+  客户端）：`GetTextExt` 恒为工作区右下角，而它把组合起点下沿写进 `CANDIDATEFORM`，微软拼音能跟随
+  光标靠的也是它。它属 TSF 语义域（点就是组合起点下沿）。这类帧不带组合起点：宿主写 `CANDIDATEFORM`
+  是异步的，组合首帧多是上次组合的旧值，带上会被锁成锚点、整场偏一截；不带则锚点跟逐帧 caret 走。
+
+## 二·八、热键直达模式的占位 composition（`input.caret`，`CaretPlacementConfig`）
+
+加词、临拼、特殊模式、生僻字等由热键激活的模式，激活瞬间没有输入内容却要立刻显示候选窗 / 预览窗。
+做法是发一个占位 composition：C++ 侧 `StartComposition` 并 `SetText(" ")` 撑开 range，再
+`GetTextExt` 取矩形。很多应用的 `GetTextExt` 之外的 Win32 取坐标 API 给不出正确坐标，只有基于
+composition 的才准，所以不能一律关掉。
+
+代价是占位 composition 建在当前 selection 上（`StartComposition` 不折叠、不改写 `tfSelection.range`），
+用户选中着文字时那个空格会把选中内容替换掉。这是 TSF 标准语义，Qt / Electron / QQ 都会发生。
+
+- 开关为 `false` 时协调器返回 `Consumed`、完全不发 `UpdateComposition`，DLL 不建 composition，选中内容
+  保留；坐标退到 `GetCaretPosition` 的回退链（GUITHREADINFO → GetCaretPos → 上次已知位置 → 窗口中心估计）。
+- 已否定：建了 composition 再折叠成插入点。只要对 composition 做操作，选中内容就会被清空，且与宿主有关。
+- 开关为 `false` 时后续 ↑↓ / Enter / Esc 的转发靠 C++ 的独立位 `_hotkeyModeSession` 撑起输入会话
+  （`SetCandidateSessionActive` 置位）。已否定：复用 `_hasCandidates`。加词窗一弹出宿主文档就丢焦点，
+  `CleanupInputStateForDocChange` → `ResetComposingState()` 会当场把它清零，那几个键又透传给宿主。
+- 开关为 `true` 时占位由协调器在进入模式时自己发出，不能指望出口的 `with_composition_placeholder`
+  补：那条只在非 `app_inline` 时走，而出厂 `preedit_display = "app_inline"`。零长度 range 回退化矩形
+  （height=0）的宿主（如 WPS）上会因此失去坐标来源。
+- 出厂只关加词：报障场景就是 Ctrl+= 造词吃掉选中文字；加词弹的是预览窗，对坐标精度不敏感，靶机实测
+  关掉后选中内容保住、记事本下预览窗位置仍正确。另几项弹候选列表，错位代价更大且缺实测数据，保持开，
+  这也是做成逐模式开关的原因。
+
 ## 三、必测矩阵
 
 **每次改动候选窗定位相关代码，以下组合都要跑一遍。** 单个宿主全绿完全不能说明问题——本轮
@@ -389,6 +506,11 @@ caret_probe → 拒绝: 该宿主 composition rect 恒陈旧，改用组合前�
    `context GetScreenExt` ——越界校验拒掉（`判为垃圾坐标，不采信`）或 `GetScreenExt 不可用`
    都会让二级降级失败关闭，退回兜底坐标。
 
+8. **长按 / 连打时候选窗一次都不显示？** 看 `SelectionChanged` 是否被回声过滤判成「用户移动光标」
+   （`since_self_commit` 远大于一次按键间隔）。自提交打点必须覆盖一切真落屏的返回变体（含满码自动上屏的
+   `CommitThenDeferComposition`），漏一种就会清掉 `caret_cache_verified`，下一组合 arm 600ms 长兜底，
+   而五笔长按时组合寿命仅约 128ms（4 码 × typematic 约 32ms），兜底永不到期。
+
 一个统计口径的提醒：**连打时每打一个字光标本就前移一个字宽，随之而来的 reshow 是正确的跟随，
 不是漂移。** 统计漂移率时必须只看「首显后、下一次按键前」的位置变化，否则会把正常跟随算成缺陷
 （本轮首版分析脚本因此把漂移率报成 25.2%，实际 3.6%）。
@@ -407,6 +529,15 @@ caret_probe → 拒绝: 该宿主 composition rect 恒陈旧，改用组合前�
   同一轮里 DLL 已经用 `CARET_SRC_PRE_REFLOW` 标出了重排前的那一帧，probe 与它逐位相同即未重排。
   分界线是「拿 pre_reflow **定位置**」（2026-08-01 翻车，错位被 settle 容差固定）与「拿它
   **否决别人**」（只会多等一轮，方向安全）——两者相反，别混为一谈。
+- **组合矩形可信判据写成 `left >= caret.x`**（「起点在插入点左边」）：只在单行成立，换行后 caret
+  回到行首恰好等于 `left`，真范围被误判成插入点（Excel 实测 w=402 的矩形被丢弃）。改为按宽度判，
+  见 §二·六。
+- **大偏移逃生阀拿已锁的 `composition_start` 与宿主上报的 compStart 比**：见 E 类，问宿主前后两帧，
+  别问自己。
+- **上屏后在 `reset_first_show` 里清掉 `caret_cache_verified`**，让下一组合改等权威坐标：上屏前移了
+  插入点、缓存确实陈旧（微信五笔满码上屏后约 20px），但清掉后下一组合走 600ms 长兜底，而长按时
+  组合寿命仅约 128ms，兜底每次都被作废、永不到期，候选窗停在几百像素之外。微信的权威坐标要约
+  190ms 才到，「等到正确坐标」与「在组合内显示」互斥，取一次性小抖动。
 - **靠单个宿主验证**：见第三节。
 
 ## 六、相关文件

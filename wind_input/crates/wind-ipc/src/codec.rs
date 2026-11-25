@@ -1,6 +1,4 @@
-//! 二进制协议编解码器
-//!
-//! 与 Go 版本 `wind_input/internal/ipc/binary_codec.go` 对齐。
+//! 二进制协议编解码器。线格式定义见 [`crate::protocol`]，与 C++ DLL / Swift `.app` 两侧解码器对齐。
 
 use crate::protocol::overlay::{OVERLAY_KIND_SOFTKEYBOARD, OVERLAY_KIND_TOOLBAR};
 use crate::protocol::*;
@@ -98,19 +96,11 @@ pub fn decode_ext(payload: &[u8]) -> Option<(&str, &[u8])> {
     Some((kind, body))
 }
 
-/// 解 CMD_FOCUS_GAINED 载荷尾部的 darwin bundleID 段（`bundleIdLen:u32 + utf8`，偏移 39）。
-///
-/// 该段是 macOS `.app` 专属：宿主 app 的 bundle id，服务端小写后当作「进程名」，供
-/// compat.toml 规则匹配与 per-app 中英记忆使用（macOS 上无法像 Windows 那样由服务进程
-/// `OpenProcess` 反查，只能由 `.app` 随焦点事件带上来）。
-///
-/// Windows DLL 不发该段；段缺失 / 长度越界 / 非法 UTF-8 一律返回空串——「取不到宿主名」
-/// 与「宿主名为空」在下游是同一语义（跳过按应用逻辑），不必区分。
 /// 读取 `off` 处的一个「`u32` 长度 + UTF-8 内容」变长段。
 ///
-/// 返回 `(内容, 下一段起始偏移)`；段残缺（长度域不全、内容不足、非法 UTF-8）一律
-/// 返回空串。**残缺不是错误**——变长段是纯追加的可选信息，旧 DLL 压根不发。
-/// 第二个返回值为 `None` 表示「本段都没走完，后面不可能有东西」，用于串联下一段。
+/// 返回 `(内容, 下一段起始偏移)`；段残缺（长度域不全、内容不足、非法 UTF-8）一律返回空串，
+/// 残缺不是错误：变长段是纯追加的可选信息，旧 DLL 不发。第二个返回值为 `None` 表示本段
+/// 都没走完、后面不可能有东西。
 fn read_len_prefixed(payload: &[u8], off: usize) -> (&str, Option<usize>) {
     // 偏移与长度都来自对端，全程 checked：32 位目标上 `start + n` 可能回绕成一个「合法」的
     // 小区间，解出错位的垃圾而不是空串。
@@ -130,14 +120,18 @@ fn read_len_prefixed(payload: &[u8], off: usize) -> (&str, Option<usize>) {
     }
 }
 
+/// 解 CMD_FOCUS_GAINED 载荷尾部的 darwin bundleID 段（`bundleIdLen:u32 + utf8`，偏移 39）。
+///
+/// macOS `.app` 专属：宿主 app 的 bundle id，服务端小写后当作「进程名」供 compat.toml 规则
+/// 与 per-app 中英记忆使用（macOS 无法由服务进程反查宿主）。Windows DLL 发长度 0 占位；
+/// 段缺失 / 越界 / 非法 UTF-8 一律返回空串，下游与「宿主名为空」同义。
 pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
     read_len_prefixed(payload, FocusGainedPayload::VAR_SECTION_OFFSET).0
 }
 
-/// 焦点所在**顶层窗口**的类名；旧 DLL / 段缺失时返回空串。
+/// 焦点所在顶层窗口的类名；旧 DLL / 段缺失时返回空串。
 ///
-/// ⚠ 必须**顺序走过 bundleId 段**再读，不能用固定偏移：bundleId 变长，macOS 上非空。
-/// Windows DLL 发 `bundleIdLen=0` 占位，故两平台共用这一条走法。
+/// 必须顺序走过 bundleId 段再读，不能用固定偏移：bundleId 变长，macOS 上非空。
 ///
 /// 空串的语义是「不知道焦点在哪」而非「窗口不在清单里」——消费端
 /// (`AppCompat::initial_mode_applies_to_window`) 据此保持现状，不按 per-app 规则重算。
@@ -148,9 +142,9 @@ pub fn decode_focus_gained_window_class(payload: &[u8]) -> &str {
     }
 }
 
-/// 焦点所在**顶层窗口**的标题（变长段 ③）；旧 DLL / 服务端未推开采集 / 段缺失时返回空串。
+/// 焦点所在顶层窗口的标题（变长段 ③）；旧 DLL / 服务端未推开采集 / 段缺失时返回空串。
 ///
-/// 同样必须**顺序走过**前两段（bundleId、windowClass）再读。空串与「窗口没有标题」同义：
+/// 同样必须顺序走过前两段（bundleId、windowClass）再读。空串与「窗口没有标题」同义：
 /// 带 `title` 条件的规则一律不命中。
 pub fn decode_focus_gained_window_title(payload: &[u8]) -> &str {
     let Some(class_off) = read_len_prefixed(payload, FocusGainedPayload::VAR_SECTION_OFFSET).1
@@ -306,13 +300,11 @@ pub fn encode_commit_text_assoc_session(
 
 /// 编码带 replacingHeld 标志的 CommitText 响应 (CMD_COMMIT_TEXT 0x0101, flags bit3)。
 ///
-/// 语义：本次提交要**替换**掉 C++ 端 HoldComposition 里那个待定的中文符号，而不是追加在
-/// 它后面。只有智能符号 press2（超时窗口内重按同一符号，中文→英文）需要它。
+/// 本次提交要替换掉 C++ 端 HoldComposition 里待定的中文符号，而不是追加在它后面。只有
+/// 智能符号 press2（超时窗口内重按同一符号，中文→英文）需要它。
 ///
-/// 其余一切上屏路径都是追加语义——C++ 端 `CommitText` 默认走 `AbsorbHeldIntoPrefix`，把
-/// held 符号并进 prefix 一起提交。这个默认值是刻意选的：hold 期间可能触发提交的路径远不止
-/// 一处（全角空格/数字、临时英文、各独占模式出字……），把安全的那一侧设为默认，新增路径
-/// 自动正确；只有这一个真正要覆盖的点显式声明。
+/// 其余上屏路径都是追加语义（C++ 端 `AbsorbHeldIntoPrefix` 把 held 符号并进 prefix 提交）：
+/// hold 期间触发提交的路径很多，把安全的一侧设为默认，新增路径自动正确。
 pub fn encode_commit_text_replacing_held(text: &str, chinese_mode: bool) -> Vec<u8> {
     encode_commit_text_inner(text, None, false, chinese_mode, false, true, false)
 }
@@ -453,8 +445,7 @@ pub fn decode_commit_request(payload: &[u8]) -> Result<CommitRequestPayload, Cod
     let modifiers = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
 
     let input_buffer = if payload.len() > 8 {
-        // 剩余字节为 inputBuffer（可能有长度前缀，也可能直接是 UTF-8）
-        // Go 版 DecodeCommitRequestPayload 读取：barrierSeq(2) + triggerKey(2) + modifiers(4) + inputBufferLen(4) + inputBuffer
+        // inputBufferLen(4) + inputBuffer；长度域不全或内容不足时按空串处理。
         if payload.len() >= 12 {
             let buf_len =
                 u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
@@ -502,10 +493,8 @@ pub fn encode_ack() -> Vec<u8> {
 /// 编码 ModePush 响应（FocusGained 同步路径）：4 字节 LE flags，携带中英 / 全半角 / 中英标点。
 /// DLL 收到后在首键前写好 `_bChineseMode` / `_bFullWidth` / `_bChinesePunct`。
 ///
-/// ⚠️ **标点位不可省**：DLL 的标点透传判据要按当下标点态在两份集合间二选一，而英文态那份
-/// 是超集。漏了这一位，`_bChinesePunct` 会在每次焦点切换后被清成 false，于是中文标点态下
-/// 误用英文态集合 —— `,` `.` `'` 这些本该转中文标点的键被直接透传成半角（B-9 的回归形态）。
-/// 旧版 DLL 忽略不认识的 bit，跨版本安全。
+/// 标点位不可省：DLL 的标点透传判据按标点态在两份集合间二选一（英文态那份是超集）。漏了它，
+/// 焦点切换后 `_bChinesePunct` 被清成 false，`,` `.` 等键会直接透传成半角。旧 DLL 忽略不认识的 bit。
 pub fn encode_mode_push(chinese_mode: bool, full_width: bool, chinese_punct: bool) -> Vec<u8> {
     let mut flags: u32 = 0;
     if chinese_mode {
@@ -534,15 +523,10 @@ pub fn encode_mode_push(chinese_mode: bool, full_width: bool, chinese_punct: boo
 /// - verb: ShellExecute 动词（`open` / `runas` / …），空串 = `open`
 /// - show: 初始窗口状态（`normal` / `min` / `max` / `hidden`），空串 = `normal`
 ///
-/// `verb` / `show` 传**语义名而非 SW_ 数值**：协议自描述（日志里 `show=min` 比
-/// `show=2` 好读），且 Windows API 常量留在 C++ 侧，跨平台的本 crate 不碰。
+/// `verb` / `show` 传语义名而非 SW_ 数值：协议自描述，Windows API 常量留在 C++ 侧。
 ///
-/// dir/verb/show 都是后加的段，两个方向都容错：旧 DLL 只读它认识的前几段、忽略
-/// 尾部（表现为新选项不生效，不会崩）；新 DLL 每读一段前先查剩余长度，遇旧服务
-/// 按空串处理。⚠️ 因此「装了新服务但宿主进程还挂着旧 DLL」时这些字段静默失效，
-/// 排查时服务端日志是唯一能证明"发过什么"的一侧。
-///
-/// ShellExecuteW 的入参到此已全部覆盖（hwnd 恒 null），这条协议不会再长。
+/// dir/verb/show 是追加段，两向容错：旧 DLL 只读前几段（新选项静默不生效），新 DLL 每段先查
+/// 剩余长度、遇旧服务按空串处理。ShellExecuteW 的入参已全部覆盖，这条协议不会再长。
 pub fn encode_shell_exec(target: &str, params: &str, dir: &str, verb: &str, show: &str) -> Vec<u8> {
     let segs = [target, params, dir, verb, show];
     let payload_len: usize = segs.iter().map(|s| 4 + s.len()).sum();
@@ -592,8 +576,7 @@ pub fn encode_clear_then_pass_through() -> Vec<u8> {
 ///
 /// 用于 bridge pipe 上的同步状态响应（如 ToggleMode、MenuCommand 等）。
 /// 与 EncodeActivationStatusPush 载荷格式一致，但 command 不同。
-// 状态位是**线协议的扁平字段**，逐个传即逐个写入报文；聚合成结构体只会在编码前多一层
-// 搬运，还要让 C++ 侧的字段顺序去对齐一个 Rust 结构体。故这几个 encode 函数一律豁免。
+// 状态位是线协议的扁平字段，逐个传即逐个写入报文；这几个 encode 函数一律豁免。
 #[allow(clippy::too_many_arguments)]
 pub fn encode_status_update(
     chinese_mode: bool,
@@ -700,17 +683,10 @@ pub fn encode_state_push(
 
 /// 状态编码公共逻辑（StatusUpdate / StatePush / ActivationStatusPush 共用）
 ///
-/// ⚠ **本消息不能再追加字段**：`icon_label` 是尾部不定长段，没有长度前缀，C++ 侧读的是
-/// 「structuredSize 到 payload 末尾」的全部字节（`IPCClient.cpp` 的 iconLabel 解析）。
-/// 在它后面加任何东西都会被当成标签内容——**不会报错，只会让标签变成一串垃圾**。
-///
-/// 真要加变长字段时，唯一正确的做法是先给 `icon_label` 补一个 `labelLen:u32` 前缀、
-/// 两侧同步改，再往后追加；这是破坏性变更，DLL 与服务端必须同版本发布（开发期混用
-/// 会解出垃圾，靠新旧 DLL 指纹辨认）。**不要为了绕开这一步而把状态塞进别的通道**——
-/// 除非那个字段本来就该走别的通道（如 `CONFIG_KEY_LANGBAR_TOOLTIP`：它需要广播，
-/// 而本消息是定向的，那是设计选择而非妥协）。
-///
-/// 加**布尔**字段则无此限制：`flags` 还有空位，加位不影响布局。
+/// 本消息不能再追加变长字段：`icon_label` 是无长度前缀的尾段，C++ 侧（`IPCClient.cpp`）把
+/// structuredSize 之后的全部字节当标签，追加内容只会静默变成标签垃圾。真要加，须先给
+/// `icon_label` 补 `labelLen:u32` 前缀、两侧同版本发布；别为绕开这一步把状态塞进别的通道。
+/// 加布尔字段无此限制：`flags` 还有空位。
 #[allow(clippy::too_many_arguments)]
 fn encode_status_update_ex(
     command: u16,
@@ -830,9 +806,8 @@ pub fn encode_commit_text_with_cursor(text: &str, cursor_offset: u32) -> Vec<u8>
 ///
 /// 格式: count(4) — 向右移动的格数（合成几次 VK_RIGHT）
 ///
-/// **语义变更**：该字段原名 `direction`（恒为 1，C++ 侧根本没读），现改为格数。
-/// 直通 `ime.pair` 的多字符右段要越过不止一格，才需要它真的携带信息。
-/// `0` 视同 1——协调器不发 0，但旧版 DLL 与新版 core 混搭时不该退化成「跳出没反应」。
+/// 直通 `ime.pair` 的多字符右段要越过不止一格。`0` 视同 1（协调器不发 0，防新旧混搭时
+/// 退化成「跳出没反应」）。
 pub fn encode_move_cursor(count: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(IpcHeader::SIZE + 4);
 
@@ -931,7 +906,7 @@ pub fn encode_hold_composition(timeout_ms: u32, text: &str) -> Vec<u8> {
 
 /// 编码 HostRenderSetup 响应 (CMD_HOST_RENDER_SETUP 0x0501，Windows)
 ///
-/// 线格式（对齐 C++ IPCClient.cpp:1524 解码端 / BinaryProtocol.h HostRenderSetupEntryHeader）：
+/// 线格式（对齐 C++ `IPCClient.cpp` 解码端 / `BinaryProtocol.h` 的 HostRenderSetupEntryHeader）：
 /// instanceId(u32) + entryCount(u32) + N × { kind(u32) + maxBufferSize(u32)
 ///   + shmNameLen(u32) + eventNameLen(u32) + shmName(UTF-8) + eventName(UTF-8) }
 pub fn encode_host_render_setup(
@@ -962,11 +937,8 @@ pub fn encode_host_render_setup(
 mod refresh_icon_tests {
     use super::*;
 
-    /// 命令号在两个仓里各硬编码一份（本处与 `wind_tsf/include/BinaryProtocol.h` 的
-    /// `CMD_REFRESH_ICON`），没有任何编译期约束把它们绑在一起。写死期望值是为了让
-    /// **单侧改动**在这里失败——两侧漂移的症状是「推了没反应」：DLL 收到一个不认识的
-    /// 命令直接走完 else 链丢弃，两边日志都不会有错误。本仓已按同一形态栽过
-    /// （触发键名两仓拼写不一致，静默不匹配）。
+    /// 命令号在本处与 `wind_tsf/include/BinaryProtocol.h` 各硬编码一份，无编译期约束。写死
+    /// 期望值让单侧改动在这里失败：两侧漂移时 DLL 静默丢弃不认识的命令，两边都无错误日志。
     #[test]
     fn refresh_icon_command_id_is_frozen_at_0x0216() {
         assert_eq!(
@@ -975,8 +947,7 @@ mod refresh_icon_tests {
         );
     }
 
-    /// 无载荷是本命令的设计要点而非省事：图标内容的唯一真相在共享内存里，
-    /// 载荷里再放一份就是第二条真相通路。这条测试把「不许带载荷」钉住。
+    /// 无载荷是设计要点：图标内容的唯一真相在共享内存里，载荷里再放一份就是第二条真相通路。
     #[test]
     fn refresh_icon_frame_is_header_only() {
         let f = encode_refresh_icon();
@@ -988,597 +959,14 @@ mod refresh_icon_tests {
 }
 
 #[cfg(test)]
-mod shell_exec_tests {
-    use super::*;
-
-    /// 按「长度前缀 + 内容」逐段解码，最多取 `max_segs` 段。
-    /// `max_segs=2` 即模拟只认 target/params 的**旧版 DLL**。
-    fn decode_segs(buf: &[u8], max_segs: usize) -> Vec<String> {
-        let mut p = &buf[IpcHeader::SIZE..];
-        let mut out = Vec::new();
-        while out.len() < max_segs && p.len() >= 4 {
-            let n = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
-            if p.len() < 4 + n {
-                break;
-            }
-            out.push(String::from_utf8(p[4..4 + n].to_vec()).unwrap());
-            p = &p[4 + n..];
-        }
-        out
-    }
-
-    #[test]
-    fn encodes_five_segments_in_order() {
-        let buf = encode_shell_exec("d.exe", "a b", "D:/W", "runas", "min");
-        assert_eq!(
-            decode_segs(&buf, 5),
-            vec!["d.exe", "a b", "D:/W", "runas", "min"]
-        );
-    }
-
-    /// 未指定的选项走空串段而非省略段——段数恒定，解码方不必猜"少的是哪一个"。
-    #[test]
-    fn omitted_options_are_empty_segments_not_missing_ones() {
-        let buf = encode_shell_exec("d.exe", "", "", "", "");
-        assert_eq!(decode_segs(&buf, 5), vec!["d.exe", "", "", "", ""]);
-    }
-
-    /// **向后兼容**：只认前两段的旧 DLL 读同一份新报文，仍应拿到正确的
-    /// target/params。新段追加在尾部，旧解析器读完就停，不会错位。
-    /// 这是「新服务 + 旧 DLL」组合下 proc.run 不至于整体失效的依据。
-    #[test]
-    fn old_two_segment_reader_still_gets_target_and_params() {
-        let buf = encode_shell_exec("d.exe", "a b", "D:/W", "runas", "min");
-        assert_eq!(decode_segs(&buf, 2), vec!["d.exe", "a b"]);
-    }
-
-    /// 载荷长度必须与声明一致，否则 C++ 侧以 header.length 为边界会截断尾部段。
-    #[test]
-    fn payload_len_in_header_covers_all_segments() {
-        let buf = encode_shell_exec("d.exe", "a b", "D:/W", "runas", "min");
-        let declared = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        assert_eq!(declared, buf.len() - IpcHeader::SIZE);
-    }
-
-    /// 非 ASCII 段按 UTF-8 字节计长（中文路径必经之路）。
-    #[test]
-    fn non_ascii_segments_use_byte_length() {
-        let buf = encode_shell_exec("d.exe", "", "D:/我的 词库", "", "");
-        assert_eq!(decode_segs(&buf, 3)[2], "D:/我的 词库");
-    }
-}
+#[path = "codec_shell_exec_tests.rs"]
+mod shell_exec_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "codec_tests.rs"]
+mod tests;
 
-    /// 从三种状态编码里取出 flags 字段（三者布局相同：header 之后第一个 u32）。
-    fn flags_of(buf: &[u8]) -> u32 {
-        // 三种状态编码共用 `encode_status_update_ex`，布局相同：8 字节 header 之后
-        // 第一个 u32 就是 flags（小端）。偏移写错的话下面 `on ^ off` 那条断言会红 ——
-        // 取到别处的字节不可能恰好只差 STATUS_HOTKEY_SESSION 这一位。
-        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
-    }
-
-    /// ★★★ 三条状态通路**都**必须把 `hotkey_session` 编进 flags。
-    ///
-    /// 这一位是 level-triggered 的：C++ 侧收到任何一条状态响应都会无条件镜像它。所以
-    /// 「漏带」不等于「带 false 无害」——它会把一个正活着的会话当场清掉。可达场景：
-    /// 加词开着时按 lshift 切中英，那条走 `encode_status_update` 的同步响应若不带本位，
-    /// 加词的 Enter/Esc 立刻失灵。
-    ///
-    /// 三个入口的参数全是 bool 且相邻，漏传/错位编译器不会报错，只能靠本条钉住。
-    /// 「把会话位编码进一条状态消息」的三个入口的共同形状。
-    ///
-    /// 抽成别名只为躲开 clippy::type_complexity——三个入口签名一致正是本用例的前提，
-    /// 写成一个名字反而更说明这件事。
-    type StatusEncoder = Box<dyn Fn(bool) -> Vec<u8>>;
-
-    #[test]
-    fn every_status_encoding_carries_the_hotkey_session_bit() {
-        let cases: [(&str, StatusEncoder); 3] = [
-            (
-                "encode_status_update",
-                Box::new(|on| {
-                    encode_status_update(
-                        true,
-                        false,
-                        true,
-                        true,
-                        false,
-                        false,
-                        false,
-                        false,
-                        on,
-                        &[],
-                        &[],
-                        "中",
-                    )
-                }),
-            ),
-            (
-                "encode_activation_status_push",
-                Box::new(|on| {
-                    encode_activation_status_push(
-                        true,
-                        false,
-                        true,
-                        true,
-                        false,
-                        false,
-                        false,
-                        false,
-                        on,
-                        &[],
-                        &[],
-                        "中",
-                    )
-                }),
-            ),
-            (
-                "encode_state_push",
-                Box::new(|on| {
-                    encode_state_push(true, false, true, true, false, false, false, on, "中")
-                }),
-            ),
-        ];
-
-        for (name, enc) in cases {
-            let on = flags_of(&enc(true));
-            let off = flags_of(&enc(false));
-            assert_ne!(
-                on & STATUS_HOTKEY_SESSION,
-                0,
-                "{name}: hotkey_session=true 时必须置 STATUS_HOTKEY_SESSION（flags=0x{on:08X}）"
-            );
-            assert_eq!(
-                off & STATUS_HOTKEY_SESSION,
-                0,
-                "{name}: hotkey_session=false 时不得置位（flags=0x{off:08X}）"
-            );
-            // 只有这一位变——防止参数错位把别的状态位一起改了。
-            assert_eq!(
-                on ^ off,
-                STATUS_HOTKEY_SESSION,
-                "{name}: 切换 hotkey_session 只应改变这一位，实际差异=0x{:08X}",
-                on ^ off
-            );
-        }
-    }
-
-    /// 拼一份 macOS `.app` 形态的 FOCUS_GAINED 载荷（39 定长 + bundleID 段）。
-    fn focus_payload_with_bundle(id: &str) -> Vec<u8> {
-        let mut p = vec![0u8; 39];
-        p.extend_from_slice(&(id.len() as u32).to_le_bytes());
-        p.extend_from_slice(id.as_bytes());
-        p
-    }
-
-    #[test]
-    fn uielement_state_and_action_roundtrip() {
-        let st = UiElementStatePayload {
-            pid: 4242,
-            flags: UIELEMENT_FLAG_HOST_DRAWS,
-        };
-        assert_eq!(decode_uielement_state(&st.to_bytes()).unwrap(), st);
-        assert!(st.host_draws());
-        // UI-less 线程位单独置位也算接管（从激活起就不弹窗，见常量注释）。
-        assert!(
-            UiElementStatePayload {
-                pid: 1,
-                flags: UIELEMENT_FLAG_UI_LESS_THREAD
-            }
-            .host_draws()
-        );
-        assert!(!UiElementStatePayload { pid: 1, flags: 0 }.host_draws());
-        assert!(decode_uielement_state(&[0u8; 7]).is_err());
-
-        let act = UiElementActionPayload {
-            action: UIELEMENT_ACTION_SET_SELECTION,
-            arg: 17,
-        };
-        assert_eq!(decode_uielement_action(&act.to_bytes()).unwrap(), act);
-        assert!(decode_uielement_action(&[0u8; 3]).is_err());
-    }
-
-    #[test]
-    fn uielement_page_roundtrip() {
-        let page = UiElementPage {
-            items: vec!["你好".into(), "拟好".into(), "".into(), "abc".into()],
-            selected: 1,
-            page_size: 9,
-            current_page: 0,
-        };
-        let frame = encode_uielement_page(&page);
-        assert_eq!(u16::from_le_bytes([frame[2], frame[3]]), CMD_UIELEMENT_PAGE);
-        let body_len = u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize;
-        assert_eq!(body_len, frame.len() - 8);
-        assert_eq!(decode_uielement_page(&frame[8..]).unwrap(), page);
-        // 空列表也要能往返（宿主 Abort 后 DLL 可能在 EndUIElement 前再拉一次）。
-        let empty = UiElementPage {
-            page_size: 5,
-            ..Default::default()
-        };
-        assert_eq!(
-            decode_uielement_page(&encode_uielement_page(&empty)[8..]).unwrap(),
-            empty
-        );
-        // page_size=0 会让 DLL 侧除零：编码器钉到 ≥1。
-        let zero = UiElementPage {
-            items: vec!["a".into()],
-            page_size: 0,
-            ..Default::default()
-        };
-        assert_eq!(
-            decode_uielement_page(&encode_uielement_page(&zero)[8..])
-                .unwrap()
-                .page_size,
-            1
-        );
-        // 条数超上限按 UIELEMENT_MAX_ITEMS 截断，count 与实际条数一致。
-        let long = UiElementPage {
-            items: (0..UIELEMENT_MAX_ITEMS + 50)
-                .map(|i| i.to_string())
-                .collect(),
-            page_size: 9,
-            ..Default::default()
-        };
-        let decoded = decode_uielement_page(&encode_uielement_page(&long)[8..]).unwrap();
-        assert_eq!(decoded.items.len(), UIELEMENT_MAX_ITEMS);
-        // 截断的载荷必须报错而不是静默给半截列表。
-        let mut truncated = encode_uielement_page(&page)[8..].to_vec();
-        truncated.truncate(truncated.len() - 2);
-        assert!(decode_uielement_page(&truncated).is_err());
-    }
-
-    #[test]
-    fn ext_envelope_roundtrip() {
-        let f = encode_ext("settings.open", br#"{"args":["--page=dict"]}"#);
-        assert_eq!(u16::from_le_bytes([f[2], f[3]]), CMD_EXT);
-        let (kind, body) = decode_ext(&f[8..]).expect("解不出信封");
-        assert_eq!(kind, "settings.open");
-        assert_eq!(body, br#"{"args":["--page=dict"]}"#);
-        // 空 body（纯信号型 kind）也须能往返。
-        let f2 = encode_ext("diag.hud", b"");
-        assert_eq!(decode_ext(&f2[8..]), Some(("diag.hud", &b""[..])));
-    }
-
-    #[test]
-    fn ext_envelope_rejects_truncated_or_invalid() {
-        // 截断：kind 长度声明超出实际字节。
-        let mut bad = 99u32.to_le_bytes().to_vec();
-        bad.extend_from_slice(b"abc");
-        assert_eq!(decode_ext(&bad), None);
-        // 截断：body 长度声明超出实际字节。
-        let mut bad2 = 3u32.to_le_bytes().to_vec();
-        bad2.extend_from_slice(b"abc");
-        bad2.extend_from_slice(&99u32.to_le_bytes());
-        assert_eq!(decode_ext(&bad2), None);
-        // 非法 UTF-8 的 kind。
-        let mut bad3 = 2u32.to_le_bytes().to_vec();
-        bad3.extend_from_slice(&[0xFF, 0xFE]);
-        bad3.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(decode_ext(&bad3), None);
-        // 空载荷。
-        assert_eq!(decode_ext(&[]), None);
-    }
-
-    #[test]
-    fn focus_gained_bundle_id_roundtrip() {
-        let p = focus_payload_with_bundle("com.apple.TextEdit");
-        assert_eq!(decode_focus_gained_bundle_id(&p), "com.apple.TextEdit");
-        // 定长段本身仍须能解（bundleID 是纯追加，不影响既有字段）。
-        assert!(decode_focus_gained(&p).is_ok());
-    }
-
-    #[test]
-    fn focus_gained_bundle_id_absent_or_malformed_is_empty() {
-        // Windows DLL 的 39 字节包：无 bundleID 段。
-        assert_eq!(decode_focus_gained_bundle_id(&[0u8; 39]), "");
-        // 旧 macOS `.app` 的 12 字节短包。
-        assert_eq!(decode_focus_gained_bundle_id(&[0u8; 12]), "");
-        // 长度字段越界（截断的帧）：不得 panic，按「取不到」处理。
-        let mut p = vec![0u8; 39];
-        p.extend_from_slice(&999u32.to_le_bytes());
-        p.extend_from_slice(b"abc");
-        assert_eq!(decode_focus_gained_bundle_id(&p), "");
-        // 非法 UTF-8 同样按「取不到」处理。
-        let mut q = vec![0u8; 39];
-        q.extend_from_slice(&2u32.to_le_bytes());
-        q.extend_from_slice(&[0xFF, 0xFE]);
-        assert_eq!(decode_focus_gained_bundle_id(&q), "");
-    }
-
-    /// 两个变长段的组合：`[39][bundleIdLen][bundleId][classLen][class]`。
-    fn focus_payload_with_sections(bundle: &str, class: &str) -> Vec<u8> {
-        let mut p = vec![0u8; 39];
-        p.extend_from_slice(&(bundle.len() as u32).to_le_bytes());
-        p.extend_from_slice(bundle.as_bytes());
-        p.extend_from_slice(&(class.len() as u32).to_le_bytes());
-        p.extend_from_slice(class.as_bytes());
-        p
-    }
-
-    #[test]
-    fn focus_gained_window_class_roundtrip_on_both_platform_shapes() {
-        // Windows 形态：bundleId 空占位 + 类名。
-        let win = focus_payload_with_sections("", "Shell_TrayWnd");
-        assert_eq!(decode_focus_gained_window_class(&win), "Shell_TrayWnd");
-        assert_eq!(decode_focus_gained_bundle_id(&win), "");
-
-        // macOS 形态：两段都非空。★ 这条钉住「类名段必须顺序走过 bundleId」——
-        // 若哪天有人改回固定偏移，非空 bundleId 会让它读到垃圾，而定长字段全对、
-        // 编译与其它测试都不会有任何信号。
-        let mac = focus_payload_with_sections("com.apple.TextEdit", "NSWindow");
-        assert_eq!(decode_focus_gained_bundle_id(&mac), "com.apple.TextEdit");
-        assert_eq!(decode_focus_gained_window_class(&mac), "NSWindow");
-
-        // 定长段不受影响
-        assert!(decode_focus_gained(&win).is_ok());
-        assert!(decode_focus_gained(&mac).is_ok());
-    }
-
-    #[test]
-    fn focus_gained_window_class_absent_or_malformed_is_empty() {
-        // 旧 DLL 的 39 字节包：两段都没有。
-        assert_eq!(decode_focus_gained_window_class(&[0u8; 39]), "");
-        // 只有 bundleId 段（本次改动之前的 macOS 包）。
-        assert_eq!(
-            decode_focus_gained_window_class(&focus_payload_with_bundle("com.apple.TextEdit")),
-            ""
-        );
-        // bundleId 段自身越界 ⇒ 后面不可能有东西，不得 panic。
-        let mut p = vec![0u8; 39];
-        p.extend_from_slice(&999u32.to_le_bytes());
-        p.extend_from_slice(b"abc");
-        assert_eq!(decode_focus_gained_window_class(&p), "");
-        // 类名段长度越界。
-        let mut q = focus_payload_with_sections("", "");
-        q.truncate(q.len() - 4);
-        q.extend_from_slice(&999u32.to_le_bytes());
-        assert_eq!(decode_focus_gained_window_class(&q), "");
-    }
-
-    /// 三个变长段：`[39][bundleIdLen][bundleId][classLen][class][titleLen][title]`。
-    fn focus_payload_with_title(bundle: &str, class: &str, title: &str) -> Vec<u8> {
-        let mut p = focus_payload_with_sections(bundle, class);
-        p.extend_from_slice(&(title.len() as u32).to_le_bytes());
-        p.extend_from_slice(title.as_bytes());
-        p
-    }
-
-    #[test]
-    fn focus_gained_window_title_roundtrip_on_both_platform_shapes() {
-        // Windows 形态（新 DLL、服务端推开了采集）：bundleId 空占位 + 类名 + 标题。
-        let win = focus_payload_with_title("", "Chrome_WidgetWin_1", "新标签页 - Google Chrome");
-        assert_eq!(
-            decode_focus_gained_window_title(&win),
-            "新标签页 - Google Chrome"
-        );
-        assert_eq!(decode_focus_gained_window_class(&win), "Chrome_WidgetWin_1");
-        assert_eq!(decode_focus_gained_bundle_id(&win), "");
-        // ★ 非空 bundleId + 类名：标题段必须顺序走过前两段，固定偏移会读到垃圾。
-        let mac = focus_payload_with_title("com.apple.TextEdit", "NSWindow", "Untitled");
-        assert_eq!(decode_focus_gained_window_title(&mac), "Untitled");
-        assert_eq!(decode_focus_gained_window_class(&mac), "NSWindow");
-        // 新 DLL、未推开采集：标题段在、长度 0。
-        let off = focus_payload_with_title("", "Notepad", "");
-        assert_eq!(decode_focus_gained_window_title(&off), "");
-        assert_eq!(decode_focus_gained_window_class(&off), "Notepad");
-        // 定长段不受影响
-        let fg = decode_focus_gained(&win).unwrap();
-        assert_eq!(fg.client_token, 0);
-    }
-
-    /// 新旧互通：旧 DLL 的帧（没有标题段）解出空串，类名照旧；截断 / 越界 / 非法 UTF-8 不 panic。
-    #[test]
-    fn focus_gained_window_title_absent_or_malformed_is_empty() {
-        // 旧 DLL：39 字节、或只带 bundleId + 类名两段（P3 之前的 Windows DLL）。
-        assert_eq!(decode_focus_gained_window_title(&[0u8; 39]), "");
-        let old = focus_payload_with_sections("", "Shell_TrayWnd");
-        assert_eq!(decode_focus_gained_window_title(&old), "");
-        assert_eq!(decode_focus_gained_window_class(&old), "Shell_TrayWnd");
-        // 只有 bundleId 段（旧 macOS 包）。
-        assert_eq!(
-            decode_focus_gained_window_title(&focus_payload_with_bundle("com.apple.TextEdit")),
-            ""
-        );
-        // 类名段越界 ⇒ 后面不可能有东西。
-        let mut p = focus_payload_with_sections("", "");
-        p.truncate(p.len() - 4);
-        p.extend_from_slice(&999u32.to_le_bytes());
-        assert_eq!(decode_focus_gained_window_title(&p), "");
-        // 标题段长度越界。
-        let mut q = focus_payload_with_title("", "C", "");
-        q.truncate(q.len() - 4);
-        q.extend_from_slice(&999u32.to_le_bytes());
-        q.extend_from_slice(b"abc");
-        assert_eq!(decode_focus_gained_window_title(&q), "");
-        assert_eq!(
-            decode_focus_gained_window_class(&q),
-            "C",
-            "标题段坏了不连累类名"
-        );
-        // 标题非法 UTF-8。
-        let mut r = focus_payload_with_sections("", "C");
-        r.extend_from_slice(&2u32.to_le_bytes());
-        r.extend_from_slice(&[0xFF, 0xFE]);
-        assert_eq!(decode_focus_gained_window_title(&r), "");
-    }
-
-    /// 长度域取极值（`u32::MAX`）：64 位上越界、32 位上 `start + n` 会回绕——一律按「取不到」。
-    #[test]
-    fn focus_gained_sections_with_huge_lengths_are_empty_not_wrapped() {
-        let mut p = focus_payload_with_sections("", "C");
-        p.extend_from_slice(&u32::MAX.to_le_bytes());
-        p.extend_from_slice(b"abc");
-        assert_eq!(decode_focus_gained_window_title(&p), "");
-        let mut q = vec![0u8; 39];
-        q.extend_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(decode_focus_gained_window_class(&q), "");
-        assert_eq!(
-            read_len_prefixed(&q, usize::MAX - 2),
-            ("", None),
-            "偏移本身溢出"
-        );
-    }
-
-    #[test]
-    fn compat_title_match_value_is_one_byte_flag() {
-        assert_eq!(encode_compat_title_match_value(true), vec![1]);
-        assert_eq!(encode_compat_title_match_value(false), vec![0]);
-    }
-
-    #[test]
-    fn test_encode_host_render_setup_layout_matches_cpp() {
-        use crate::protocol::HostRenderSetupEntry;
-        let entries = vec![HostRenderSetupEntry {
-            window_kind: 0,
-            max_buffer_size: 4 * 1024 * 1024,
-            shm_name: "Local\\W_SHM".to_string(),   // 11 B
-            event_name: "Local\\W_EVT".to_string(), // 11 B
-        }];
-        let buf = encode_host_render_setup(7, &entries);
-        // IpcHeader 8B: version u16 + command u16 + payload_len u32（以现有 IpcHeader::to_bytes 为准）
-        let p = &buf[8..];
-        // instanceId(4) + entryCount(4)
-        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7);
-        assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1);
-        // entry header 16B: kind + maxBufferSize + shmNameLen + eventNameLen
-        assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 0);
-        assert_eq!(
-            u32::from_le_bytes(p[12..16].try_into().unwrap()),
-            4 * 1024 * 1024
-        );
-        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 11);
-        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 11);
-        assert_eq!(&p[24..35], b"Local\\W_SHM");
-        assert_eq!(&p[35..46], b"Local\\W_EVT");
-        assert_eq!(p.len(), 46);
-        // payload_len 一致
-        assert_eq!(
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize,
-            46
-        );
-    }
-
-    #[test]
-    fn test_host_render_hit_rect_layout() {
-        use crate::protocol::HostRenderHitRect;
-        let r = HostRenderHitRect {
-            index: -1,
-            x: 1,
-            y: 2,
-            w: 3,
-            h: 4,
-        };
-        let b = r.to_bytes();
-        assert_eq!(b.len(), 20);
-        assert_eq!(i32::from_le_bytes(b[0..4].try_into().unwrap()), -1);
-        assert_eq!(i32::from_le_bytes(b[16..20].try_into().unwrap()), 4);
-    }
-
-    #[test]
-    fn test_encode_hold_composition_layout() {
-        let buf = encode_hold_composition(500, "，");
-        // IpcHeader: 8 bytes (cmd u16 LE + version u16 LE + payload_len u32 LE)
-        // payload: timeout_ms(4) + text_len(4) + "，"(3 UTF-8 bytes) = 11 bytes
-        assert_eq!(buf.len(), 8 + 11);
-        // cmd = 0x010A LE (at offset 2-4)
-        assert_eq!(buf[2], 0x0A);
-        assert_eq!(buf[3], 0x01);
-        // payload_len = 11 LE (at offset 4-8)
-        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 11);
-        // timeout_ms = 500 LE (at offset 8-12)
-        assert_eq!(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]), 500);
-        // text_len = 3 LE (at offset 12-16)
-        assert_eq!(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 3);
-        // UTF-8 bytes of "，" = [0xEF, 0xBC, 0x8C] (at offset 16+)
-        assert_eq!(&buf[16..], "，".as_bytes());
-    }
-
-    /// 智能符号 press2 的提交必须带 flags bit3，C++ 端据此改走「覆盖 held 符号」而非
-    /// 「并入前缀一起上屏」。漏置位的后果是 press2 打出「。.」而不是「.」。
-    #[test]
-    fn test_encode_commit_text_replacing_held_sets_flag_bit3() {
-        let buf = encode_commit_text_replacing_held(".", true);
-        let p = IpcHeader::SIZE;
-        let flags = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
-        assert_eq!(flags & 0x08, 0x08, "replacingHeld 位必须置位");
-        assert_eq!(flags & 0x04, 0x04, "chineseMode 位应透传");
-        assert_eq!(flags & 0x03, 0, "不得误置 modeChanged / hasNewComposition");
-        // 命令码仍是 CMD_COMMIT_TEXT——复用同一响应类型，只靠 flags 区分语义
-        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), CMD_COMMIT_TEXT);
-        assert_eq!(&buf[p + 12..], b".");
-    }
-
-    /// 反向守卫：普通提交路径绝不能带上 bit3，否则 hold 期间任何上屏都会吞掉待定符号。
-    #[test]
-    fn test_encode_commit_text_never_sets_replacing_held() {
-        for (comp, mode_changed, cn, has_comp) in
-            [(None, false, false, false), (Some("ni"), true, true, true)]
-        {
-            let buf = encode_commit_text("　", comp, mode_changed, cn, has_comp);
-            let p = IpcHeader::SIZE;
-            let flags = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
-            assert_eq!(flags & 0x08, 0, "普通 CommitText 不得置 replacingHeld");
-        }
-    }
-
-    #[test]
-    fn test_encode_commit_then_defer_layout() {
-        let buf = encode_commit_then_defer(150, "可能", "y");
-        let commit = "可能".as_bytes(); // 6 字节
-        let defer = "y".as_bytes(); // 1 字节
-        // header + timeout(4) + commit_len(4) + defer_len(4) + commit + defer
-        assert_eq!(buf.len(), IpcHeader::SIZE + 12 + commit.len() + defer.len());
-        // 命令码在 header 内
-        let cmd = u16::from_le_bytes([buf[2], buf[3]]);
-        assert_eq!(cmd, CMD_COMMIT_THEN_DEFER);
-        // payload 起始处 timeout_ms
-        let p = IpcHeader::SIZE;
-        assert_eq!(
-            u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]),
-            150
-        );
-        assert_eq!(
-            u32::from_le_bytes([buf[p + 4], buf[p + 5], buf[p + 6], buf[p + 7]]),
-            commit.len() as u32
-        );
-        assert_eq!(
-            u32::from_le_bytes([buf[p + 8], buf[p + 9], buf[p + 10], buf[p + 11]]),
-            defer.len() as u32
-        );
-    }
-
-    /// GH#175：占位档位按 kind 原样编成 1 字节；值与 C++ `PlaceholderForKind` 一一对应。
-    #[test]
-    fn composition_placeholder_value_is_the_kind_byte() {
-        use crate::protocol::{
-            COMPOSITION_PLACEHOLDER_BLANK, COMPOSITION_PLACEHOLDER_SPACE,
-            COMPOSITION_PLACEHOLDER_ZWSP,
-        };
-        assert_eq!(COMPOSITION_PLACEHOLDER_SPACE, 0);
-        assert_eq!(COMPOSITION_PLACEHOLDER_ZWSP, 1);
-        assert_eq!(COMPOSITION_PLACEHOLDER_BLANK, 2);
-        for k in [
-            COMPOSITION_PLACEHOLDER_SPACE,
-            COMPOSITION_PLACEHOLDER_ZWSP,
-            COMPOSITION_PLACEHOLDER_BLANK,
-        ] {
-            assert_eq!(encode_composition_placeholder_value(k), vec![k]);
-        }
-    }
-
-    /// 多行上屏方式：commit = 0、paste = 1，与 C++ 侧的判读一致。
-    #[test]
-    fn multiline_commit_value_is_one_byte() {
-        assert_eq!(encode_multiline_commit_value(false), vec![0]);
-        assert_eq!(encode_multiline_commit_value(true), vec![1]);
-    }
-}
-
-// ── darwin host-render push 帧编码器 (W4) ──
+// ── darwin host-render push 帧编码器 ──
 // 字节布局对照 Swift wind_macos/.../BinaryCodec.swift decoder。均小端，返回完整帧。
 
 /// 追加一个长度前缀(u32 LE)的 UTF-8 字符串
@@ -1917,7 +1305,7 @@ pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
 
 /// 编码组合区兜底占位字符的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_COMPOSITION_PLACEHOLDER）。
 /// 格式：kind(u8)，取 `protocol::COMPOSITION_PLACEHOLDER_*`（0 = 空格 U+0020、1 = ZWSP U+200B、
-/// 2 = 盲文空白 U+2800）。旧 DLL 认不出的值回落空格。GH#175。
+/// 2 = 盲文空白 U+2800）。旧 DLL 认不出的值回落空格。
 pub fn encode_composition_placeholder_value(kind: u8) -> Vec<u8> {
     vec![kind]
 }
@@ -1979,7 +1367,7 @@ pub fn encode_pair_via_comp_value(enabled: bool) -> Vec<u8> {
 }
 
 /// 编码 Ctrl+空格 切换开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_CTRL_SPACE_TOGGLE）。
-/// 格式：enabled(u8)。GH#172。
+/// 格式：enabled(u8)。
 pub fn encode_ctrl_space_toggle_value(enabled: bool) -> Vec<u8> {
     vec![enabled as u8]
 }
@@ -2020,280 +1408,5 @@ mod custom_en_punct_tests {
 }
 
 #[cfg(test)]
-mod darwin_push_tests {
-    use super::*;
-
-    fn cmd_of(frame: &[u8]) -> u16 {
-        u16::from_le_bytes([frame[2], frame[3]])
-    }
-
-    #[test]
-    fn host_render_frame_layout_is_60_bytes_le() {
-        let f = encode_host_render_frame(
-            7,
-            -3,
-            20,
-            100,
-            40,
-            0x3,
-            2,
-            (12, -5),
-            (-3, -70),
-            (12, 6, 76, 30),
-        );
-        assert_eq!(f.len(), 8 + 60);
-        assert_eq!(cmd_of(&f), CMD_HOST_RENDER_FRAME);
-        let p = &f[8..];
-        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7);
-        assert_eq!(i32::from_le_bytes(p[4..8].try_into().unwrap()), -3);
-        assert_eq!(i32::from_le_bytes(p[8..12].try_into().unwrap()), 20);
-        assert_eq!(u32::from_le_bytes(p[12..16].try_into().unwrap()), 100);
-        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 40);
-        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 0x3);
-        assert_eq!(u32::from_le_bytes(p[24..28].try_into().unwrap()), 2);
-        assert_eq!(i32::from_le_bytes(p[28..32].try_into().unwrap()), 12);
-        assert_eq!(i32::from_le_bytes(p[32..36].try_into().unwrap()), -5);
-        let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
-        assert_eq!((i(36), i(40)), (-3, -70));
-        assert_eq!((i(44), i(48), i(52), i(56)), (12, 6, 76, 30));
-    }
-
-    #[test]
-    fn overlay_frame_layout_is_72_bytes_le() {
-        let f = encode_overlay_frame(&OverlayFrameMeta {
-            kind: 2,
-            seq: 9,
-            width: 120,
-            height: 40,
-            flags: 0x5,
-            place: 1,
-            x: -30,
-            y: 200,
-            alt_x: -31,
-            alt_y: 150,
-            anchor: 7,
-            margin: 16,
-            content_x: 3,
-            content_y: 4,
-            content_w: 110,
-            content_h: 30,
-            duration_ms: 1500,
-            scale: 2.0,
-            drag: vec![],
-        });
-        assert_eq!(f.len(), 8 + 72);
-        assert_eq!(cmd_of(&f), CMD_OVERLAY_FRAME);
-        let p = &f[8..];
-        let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
-        let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
-        assert_eq!(
-            (u(0), u(4), u(8), u(12), u(16), u(20)),
-            (2, 9, 120, 40, 0x5, 1)
-        );
-        assert_eq!((i(24), i(28), i(32), i(36)), (-30, 200, -31, 150));
-        assert_eq!(u(40), 7);
-        assert_eq!((i(44), i(48), i(52)), (16, 3, 4));
-        assert_eq!((u(56), u(60)), (110, 30));
-        assert_eq!(i(64), 1500);
-        assert_eq!(f32::from_le_bytes(p[68..72].try_into().unwrap()), 2.0);
-    }
-
-    #[test]
-    fn candidate_skin_layout_matches_documented_offsets() {
-        use crate::protocol::skin::*;
-        let f = encode_candidate_skin(&CandidateSkinWire {
-            flags: SKIN_FLAG_ACTIVE | SKIN_FLAG_MASK,
-            frame: [10, 20, 300, 120],
-            decor: vec![
-                SkinDecorWire {
-                    index: 2,
-                    hit: SKIN_HIT_PASS,
-                    flags: SKIN_DECOR_UNDER | SKIN_DECOR_SPLIT,
-                    rect: [-5, -6, 40, 50],
-                },
-                SkinDecorWire {
-                    index: 0,
-                    hit: SKIN_HIT_BLOCK,
-                    flags: 0,
-                    rect: [1, 2, 3, 4],
-                },
-            ],
-            mask: vec![[10, 20, 300, 1], [0, 0, 7, 8]],
-        });
-        assert_eq!(cmd_of(&f), CMD_CANDIDATE_SKIN);
-        let p = &f[IpcHeader::SIZE..];
-        assert_eq!(p.len(), 4 + 16 + 4 + 2 * 28 + 4 + 2 * 16);
-        let u = |o: usize| u32::from_le_bytes(p[o..o + 4].try_into().unwrap());
-        let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
-        assert_eq!(u(0), 3);
-        assert_eq!((i(4), i(8), i(12), i(16)), (10, 20, 300, 120));
-        assert_eq!(u(20), 2);
-        assert_eq!((u(24), u(28), u(32)), (2, 2, 3));
-        assert_eq!((i(36), i(40), i(44), i(48)), (-5, -6, 40, 50));
-        assert_eq!((u(52), u(56), u(60)), (0, 1, 0));
-        assert_eq!((i(64), i(68), i(72), i(76)), (1, 2, 3, 4));
-        assert_eq!(u(80), 2);
-        assert_eq!((i(84), i(88), i(92), i(96)), (10, 20, 300, 1));
-        assert_eq!((i(100), i(104), i(108), i(112)), (0, 0, 7, 8));
-        // 没启用皮肤：28 字节全零。
-        let none = encode_candidate_skin(&CandidateSkinWire::default());
-        assert_eq!(&none[IpcHeader::SIZE..], &[0u8; 28][..]);
-    }
-
-    #[test]
-    fn overlay_frame_drag_tail_only_for_panel_kinds() {
-        let base = OverlayFrameMeta {
-            kind: 3,
-            drag: vec![[1, 2, 3, 4], [5, 6, 7, 8]],
-            ..Default::default()
-        };
-        // 非交互层：带不带拖动区都是 72 字节，逐字节相同。
-        let plain = encode_overlay_frame(&base);
-        assert_eq!(plain.len(), 8 + 72);
-        let no_drag = encode_overlay_frame(&OverlayFrameMeta {
-            drag: vec![],
-            ..base.clone()
-        });
-        assert_eq!(plain, no_drag);
-
-        // 工具栏：多 4 + 2*16 字节，并能原样解回。
-        let f = encode_overlay_frame(&OverlayFrameMeta {
-            kind: OVERLAY_KIND_TOOLBAR,
-            ..base.clone()
-        });
-        assert_eq!(f.len(), 8 + 72 + 4 + 2 * 16);
-        let p = &f[8 + 72..];
-        let i = |o: usize| i32::from_le_bytes(p[o..o + 4].try_into().unwrap());
-        assert_eq!(i(0), 2);
-        let rects: Vec<[i32; 4]> = (0..2)
-            .map(|k| std::array::from_fn(|j| i(4 + k * 16 + j * 4)))
-            .collect();
-        assert_eq!(rects, base.drag);
-
-        // 软键盘同样带尾段；零个拖动区只多 count。
-        let f = encode_overlay_frame(&OverlayFrameMeta {
-            kind: OVERLAY_KIND_SOFTKEYBOARD,
-            drag: vec![],
-            ..base
-        });
-        assert_eq!(f.len(), 8 + 72 + 4);
-    }
-
-    #[test]
-    fn panel_pointer_roundtrip() {
-        let p = encode_panel_pointer(11, 3, 1, -5, 40);
-        assert_eq!(p.len(), 20);
-        assert_eq!(decode_panel_pointer(&p), Some((11, 3, 1, -5, 40)));
-        assert_eq!(decode_panel_pointer(&p[..19]), None);
-    }
-
-    #[test]
-    fn candidate_rects_layout_count_then_5xi32() {
-        let f = encode_candidate_rects(&[(0, 1, 2, 30, 24), (-1, 5, 6, 12, 12)]);
-        assert_eq!(cmd_of(&f), CMD_CANDIDATE_RECTS);
-        let p = &f[8..];
-        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 2);
-        assert_eq!(i32::from_le_bytes(p[4..8].try_into().unwrap()), 0);
-        assert_eq!(i32::from_le_bytes(p[8..12].try_into().unwrap()), 1);
-        assert_eq!(i32::from_le_bytes(p[24..28].try_into().unwrap()), -1);
-    }
-
-    #[test]
-    fn mode_status_label_utf8_length_prefixed() {
-        let f = encode_mode_status(0x5, 1, "五笔");
-        assert_eq!(cmd_of(&f), CMD_MODE_STATUS);
-        let p = &f[8..];
-        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 0x5);
-        assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1);
-        let n = u32::from_le_bytes(p[8..12].try_into().unwrap()) as usize;
-        assert_eq!(n, "五笔".len());
-        assert_eq!(&p[12..12 + n], "五笔".as_bytes());
-    }
-
-    // 递归解码器：镜像 Swift BinaryCodec.decodeMenuItems，作为 encode_menu_show 的规范验证。
-    struct DecodedItem {
-        id: i32,
-        flags: u8,
-        label: String,
-        children: Vec<DecodedItem>,
-    }
-    fn decode_menu_items(p: &[u8], off: &mut usize) -> Vec<DecodedItem> {
-        let n = u32::from_le_bytes(p[*off..*off + 4].try_into().unwrap()) as usize;
-        *off += 4;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            let id = i32::from_le_bytes(p[*off..*off + 4].try_into().unwrap());
-            *off += 4;
-            let flags = p[*off];
-            *off += 1;
-            let ln = u32::from_le_bytes(p[*off..*off + 4].try_into().unwrap()) as usize;
-            *off += 4;
-            let label = String::from_utf8(p[*off..*off + ln].to_vec()).unwrap();
-            *off += ln;
-            let children = decode_menu_items(p, off);
-            out.push(DecodedItem {
-                id,
-                flags,
-                label,
-                children,
-            });
-        }
-        out
-    }
-
-    #[test]
-    fn menu_show_roundtrips_nested_tree_le() {
-        let tree = vec![
-            MenuNode {
-                id: 100,
-                label: "英文".into(),
-                checked: true,
-                ..Default::default()
-            },
-            MenuNode {
-                id: 0,
-                label: "主题".into(),
-                children: vec![
-                    MenuNode {
-                        id: 2000,
-                        label: "默认".into(),
-                        checked: true,
-                        ..Default::default()
-                    },
-                    MenuNode {
-                        separator: true,
-                        ..Default::default()
-                    },
-                    MenuNode {
-                        id: 4001,
-                        label: "亮色".into(),
-                        disabled: true,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
-        ];
-        let f = encode_menu_show(&tree);
-        assert_eq!(cmd_of(&f), CMD_MENU_SHOW);
-        let p = &f[8..];
-        let mut off = 0usize;
-        let top = decode_menu_items(p, &mut off);
-        assert_eq!(off, p.len(), "整帧应被消费完（无游离字节）");
-        assert_eq!(top.len(), 2);
-        assert_eq!(top[0].id, 100);
-        assert_eq!(top[0].flags & 0x02, 0x02); // checked
-        assert_eq!(top[0].label, "英文");
-        assert!(top[0].children.is_empty());
-        // 子菜单父项 id=0、无勾选，含 3 子项
-        assert_eq!(top[1].label, "主题");
-        assert_eq!(top[1].id, 0);
-        let sub = &top[1].children;
-        assert_eq!(sub.len(), 3);
-        assert_eq!(sub[0].id, 2000);
-        assert_eq!(sub[0].flags & 0x02, 0x02); // checked
-        assert_eq!(sub[1].flags & 0x01, 0x01); // separator
-        assert_eq!(sub[2].id, 4001);
-        assert_eq!(sub[2].flags & 0x04, 0x04); // disabled
-    }
-}
+#[path = "codec_darwin_push_tests.rs"]
+mod darwin_push_tests;

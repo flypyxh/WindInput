@@ -161,10 +161,12 @@
   ★ 两条路径的产出**都保留**（不同 `consumed_length` 层）：`nihaom` 既给整句「你好」
   (consumed=5，选它则 `m` 留缓冲续输)、也给残码整句 (consumed=6)。**改成「用残码整句替换
   step 2 结果」会破坏分步上屏。**
-  ★ 门槛 `syllables.len() >= 2`（同 step 2）：`nim` 这类 1 音节 + 残码不走，那种输入的正解是
-  词库补全（你们/你没），残码整句「你吗」只会挤掉它。同 fcitx5 `partialLongWordLimit` 的精神。
-  双拼跳过（`query` 是转换后全拼、与击键不同域），分隔符跳过（`completed` 由音节 join 得出，
-  与 `query` 字节位不同源）。
+  ★ 门槛：已完成 ≥ 2 个音节时立即插入；**1 音节 + 残码**（`zaim`/`nim`）先存进
+  `short_sentence_pending`、不进候选，到 step 6.5c 才按 `COMPLETION_WEAK_CEILING` 定夺 ——
+  立即插入会让 `wom`→「我吗」、`nim`→「你吗」挤进第 2 位，而正解「在吗」(w=0) 与这类噪音的
+  分野要等 step 4 跑完、看补全侧最强者有多弱才看得出（见下文「拼音常量的取值依据」）。
+  分隔符跳过（`completed` 由音节 join 得出，与 `query` 字节位不同源）；双拼不跳过（旧图在转换后
+  全拼上重切、消费数回映射回击键，击键图开关打开时改走击键图）。
 - **整句让位于「用完残码的补全」**（step 6.5b）：残码存在时，整句只解释 `completed`、**把用户
   已按下的残码丢掉**，却靠 `SENTENCE_WEIGHT_BASE`(3e7) 无条件置顶 —— 实测 2/3/4/6 音节一律
   如此（`nihaom`→你好 而非 你好吗、`zhongguor`→中国 而非 中国人）。判据复刻 librime
@@ -185,6 +187,102 @@
   这正是用户报的「候选长度来回跳动」：有残码时冷僻长词靠豁免登顶、无残码时整句 3e7 登顶，
   两套依据逐键切换。⚠️ 该常量**不是** `COMPLETION_NEAR_SYLLABLES`（后者只管用户词长词上浮，
   两者一度共用一个 2，改动时连带打断 `qingfengshu`→「清风输入法」）。
+- **截断保底**（`truncate_with_quotas`）：简拼候选（`is_abbrev`，`cmp_match_layers` 第二键、几乎沉底）
+  与换位纠错候选各留保底席位，只补不挤空；补进来的追加在尾部、不保证有序，依赖调用方重排
+  （主输入与临拼走 `candidate_display_order`；不重排的特殊模式 / overlay 用
+  `ConvertOptions::no_abbrev_quota` 关掉简拼配额）。混输主路径给子引擎传满值 `max_candidates`，
+  配额照常生效，随后混输还有自己的 `truncate_with_pinyin_quota`。
+- **词库层前缀判据**（`wind-dict/src/cached.rs::prefix_entry_keep`，严格档下推到词库层）由两半组成：
+  音节数不超过「输入自身的音节数」（`prefix_syllable_keep`），且补全必须在 `completed_len` 处开新音节
+  （`prefix_syllable_aligned`）。
+  ★ 音节数问的是**输入**有几个音节，不是候选切分下占几个：按候选切分会让 `xia` 因 `xi|an` 被当成
+  2 音节、放行整批词组。
+  ★ 对齐判据补的洞：wdat key 是扁平码，前缀匹配发生在字符域，`shen` 会召回 `sheng` 的「生」，
+  音节数判据分不开（都是 1 音节）。这等于绕过模糊音开关白送 `en→eng`，`an/ang`、`in/ing`、
+  `ni→nin/niu/nian…` 等同病。取 `completed_len`（DAG 已成音节的字节长度）而非击键长度，残码位
+  自动全放行：能延长当前音节的字符会被 `maximum_match` 并进音节，「残码」与「跨越已完成音节」互斥。
+  ★ 代价（已接受）：`yingu`→「因果」、`shaixu`→「筛选」同样被挡，须打完全拼。`fen→feng` 与
+  `yingu→因果` 在音节结构上同形，「只保护非末尾音节」「要求候选多出音节」「按 distance 分档」都
+  同时命中或同时放过两者，**不要再找只挡单字的判据**。取严格档的理由：用户要别的词会继续往下打。
+  候选数 `fen` 56→29、`shen` 68→48、`ni` 92→34。出厂 `min_syllables = 4` 下整音节输入只剩精确匹配，
+  前缀补全只在残码位起作用。
+
+#### 拼音常量的取值依据
+
+`pinyin/mod.rs`、`pinyin/lattice.rs` 等拼音侧阈值/系数的标定结论（真实词库实测），代码注释只留一句「依据见此」。
+
+- **`ABBREV_QUOTA_DIVISOR`=10（简拼截断保底）**：`is_abbrev` 是 `cmp_match_layers` 第二键，简拼候选
+  只靠「总数没超过 `max_candidates`」存活。`shengrikl` 关模糊音时 121 条、「生日快乐」第 121 位；
+  开 `sh_s + en_eng` 后总数 337、它落到第 337 位被 300 截断丢掉。改层级键会污染正常输入的候选面，
+  故用配额。混输侧的 `PINYIN_QUOTA_DIVISOR` 取 5 是因为它护整个拼音块、要抢的席位多。
+- **`FUZZY_WEIGHT_SCALE`=0.5**：曾用一次性 ×0.01（为让「四」守住 `si` 首位，同音字词频可差 80 倍），
+  既比参考实现严 50 倍、又不按模糊处数累计。`is_fuzzy` 更早曾是层级首键，`si` 的「是」落第 231 位、
+  `zong` 的「中」落第 158 位，生产截断线下等于未实现。
+- **`COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`=1**：旧值 2 时 `beijingd`→北京大学(w=2010)、
+  `jisuanjik`→计算机科学(w=1609) 收到 1 后改走门槛，照样上浮、位次不变；而 2 让 w=18 的
+  「中华人民」在 `zhonghuar` 登顶。
+- **`COMPLETION_NEAR_PROMOTE_LIMIT`=8**：`meiy` 一个残码补出 58 条 distance=1 的词，单字「没」被压到
+  第 59 位；限 8 条后升到第 9 位。候选窗每页 5~9 条。
+- **`COMPLETION_FAR_WEIGHT_FLOOR`=100**：合理项最低「中国人民解放军」w=252（`zhongguorenm`，距离 +4）、
+  「你好吗」w=166（距离 +1）；噪音项（`zhonghuarenmingongheg` 下的「中华人民共和国XXX法」）最高 w=60。
+- **`SENTENCE_YIELD_WEIGHT_FLOOR`=50（折后）**：缺它时 `zhonghuar` 首选变成 w=0 的「种花人」。
+  让位：你好吗 166 / 中国人民 605 / 中华人民共和国 3113；不让位：计算机课 41 / 种花人 0。
+- **`COMPLETION_WEAK_CEILING`=2500**（`completed_syls == 1` 全样本，grammar 开/关一致）：
+  补全侧最强 819（`zaim` 再买，正解「在吗」w=0）应输给整句；6363（`xiex`）、11131（`nih`）、
+  20624（`shih`）及 31281~237059（zhid/zenm/nim/shenm/meig/haiy/tam/wom/meiy/yinw）应补全赢。
+  819 与 6363 间有 7.8 倍空隙，2500 两侧各留约 3 倍。否决过的判据：整句一律豁免（`beijingd`→背景的、
+  `zhongguorenm`→中国人吗 翻上首位）；有无同名词条 / 词条 w 是否为 0（「在吗」「你和」都是 w=0，
+  分不开）；整句/补全倍数（开万象模型 w=0.5 后「在吗」从 61.3× 掉到 14.0×，被自己的闸门拦掉）。
+- **`SENTENCE_KEEP_MAX_COMPLETED_SYLS`=1**：放到 2 时 `beijingd` 的「北京的」1738、`zhongguorenm` 的
+  「中国人民」605 都低于 2500，错解翻上首位；`duibuq` 的「对不起」3984 不受影响。
+- **`ABBREV_INDEX_LIMIT`=64（纯简拼与混合简拼共用）**：纯简拼曾单独取 10，真实词库 `bcx` 下有 48 条，
+  「拜城县」(w=1，第 48 条) 在 `bcx` 下永不产生、在 `baicx` 下却是第 77 位。延迟实测（`build_dev/data`、
+  release、六个声母模糊组全开）最坏 `zhy` 551µs / `lll` 246µs；合成词库（每键塞满码）下 `lll` 4.99ms。
+- **`MIXED_SENTENCE_MIN_LOGP_PER_CHAR`=-8.0**：D 类受控对比（常用词口径，n=1000）——不设闸门 / -8.0 整句
+  top-1 都是 12.10%、首词命中 0%；-6.5 为 10.30% / 0.50%；-5.0 为 1.10% / 3.30%（砍掉 91% 正确整句）。
+  `nhaoma` 原出「你会熬吗」（每字 -11.01），闸掉后「你好吗」上位；用户真会打的组合每字在 -3.7 ~ -4.8。
+  调 `ABBREV_NODE_PENALTY`（1.2/2.5/4.0）治不了。语法模型（万象 weight=0.5，32 样本，
+  `tests/grammar_axis_shift.rs`）平移最小 -5.15、中位 +1.60、最大 +10.95，无样本因此跌破 -8.0：
+  打分 `weight × (ln 频次 − 8.34)`，命中搭配加分、未命中扣分，被扣分的整句关 grammar 时就在 -10 ~ -14。
+- **`MAX_ABBREV_KEY_VARIANTS`=64（`fuzzy.rs`，简拼键模糊变体上限）**：简拼键长即音节数，常见 2~4；
+  `n`/`f`/`h`/`r` 是 2 选，只有 `l` 是 3 选（同属 n↔l 与 r↔l）。`nqc`(n_l)=2、`nnnn`(n_l)=16、
+  `lllh`(n_l+r_l+f_h)=54 在限内，`llll`(n_l+r_l)=81 是 4 位键里唯一超限的形状，降级为只查原键。
+  超限整体放弃而非部分展开，与多音节全拼展开（`LatticeBuilder::fuzzy_spans`，按改动处数逐层截断）
+  不一致；可改进为按「改动了几位」分层递增、某层放不下就整层丢弃并停止（「改一个音能出、改两个
+  出不来」），未做。
+- **虚词表按「字 + 读音」登记（`lattice.rs::function_word_readings`）**：虚词优待合计 8.0 nat
+  （`FUNCTION_WORD_BONUS` +2.0、实词 `SINGLE_CHAR_PENALTY` −3.0、再豁免 `WORD_PENALTY` 3.0，≈2981 倍词频）。
+  只按字形发放时多音字冷僻读音白拿优待：kuai 下 会(w=334) −11.49 压 快(w=29689) −15.01（「快吃饭」出成
+  「会吃饭」）；zhao 着(263) −11.72 压 找(54117) −14.40；huan 还(12366) −7.88 压 换(18772) −15.47；
+  liao 了(51) −13.37 压 聊(8535) −16.26。与旧 unigram 表「按词取 max」是同型缺陷。
+- **`RETROFLEX_SPLIT_PENALTY`=8.0（`lattice.rs`，②b 把 zh/ch/sh 拆成 z|h）**：`pinyin_eval` 界面序扫参
+  （seed 20260721，A/B/C 不受影响）——E 短简拼 top-1 / 其中 R 全声母 / D 混合长串 top-1：
+  0 → 64.40% / 27.27% / 12.20%；2 → 68.20% / 52.27% / 12.20%；4 → 70.60% / 70.45% / 12.10%；
+  **8 → 74.40% / 90.91% / 12.00%**；50（≈禁止）→ 75.50% / 90.91% / 11.40%。取 8：E 新增 100 丢 0，D 丢的 2 条
+  正是用户真把 s|h、z|h 当两个声母打的（`ksh` 可视化、`xhbz` 相互帮助）；再往上 E 只多 11、D 丢 8。
+- **`CODA_STEAL_PENALTY`=8.0（`lattice.rs`，简拼段抢前一全拼音节的韵尾）**：同口径扫参（已含翘舌拆分罚）——
+  E / 其中 F 首音节+声母 / D：0 → 74.40% / 72.24% / 12.00%；2 → 75.20% / 73.43%；4 → 75.70% / 74.41%；
+  **8 → 76.20% / 75.20%**；16、50 不再变化，A~D 全程逐位不变。E 剩余 F 形态失败以同音/同简拼竞争为主
+  （就你能 / 就你那），另有零声母切分歧义（`xianzw` → 西安作为），不归本项管。
+  判据只看「前面存在能吸收该字母的音节」、不看 Viterbi 实际前驱，误伤在评测里未出现。
+- **`USER_ABBREV_SCAN_LIMIT`=64（`lattice.rs`，用户层简拼取数）**：曾是 8，同组 10 个词时「拜城县」被
+  字典序切掉。延迟（每个被查的两/三字母组塞 2000 个用户词、`bcxrmzf` 一次转换）：不设上限 +60~90ms，
+  64 +1.7ms，32 +1.1ms。
+- **`USER_NODE_BONUS`=+2.0 / `USER_NODE_WEIGHT_CAP`=1e6（`lattice.rs`，用户词进整句词图）**：「盖伦」(w=237)
+  同码有「概论」w=1217，出厂加词 `ADD_WORD_WEIGHT`=1200 恰好低 17 分，整句不认。+2.0 ≈ ×7.4，1200 等效
+  ~8900，从压过 96.3% 的系统词抬到 99.5%，仍输给真高频词（「这个」w=555006 ⇒ −6.08，加成后用户词 −10.22）。
+  上限：导入 wdict 的 `w=2e9` 时 `ln(w/DICT_TOTAL)=+2.11`，而系统最大词（15,378,475）才 −2.76；1e6 即
+  `ln=−5.49`（约 p99.99+）。造词晋升 800 压过 94.7%，故中间不做分布重映射。
+- **`DICT_TOTAL`=242,154,693（`lattice.rs`）**：合并前 `unigram.txt` 的总频次，使 99.95% 的词合并前后
+  `log_prob` 不变；`cn_dicts` 总权重 243,154,024，差 0.41%（来自 w=0、纯 ASCII 词与多音合并）。词库总权重
+  +50% 只让每词罚变化 0.4（相对 `WORD_PENALTY` 3.0 约 13%）。w ≤ 0 走 `0.5/T`：「种花人」旧式 −20.29、
+  新式 −19.99，数值连续。
+- **`AbbrevFallbackConfig::cuts`=2**：D 类实测取 2 → 首词召回 40.30% / 首词命中 2.30%；取 8 → 14.60% / 0.00%。
+- **`MAX_FULL_PINYIN_SUBPHRASE`=4**：无此限时 `zaijian` 下 `zai` 一级 20+ 条同音单字吃光
+  `MAX_FULL_PINYIN_RECALL`，「再见」没被召回。
+- **混合整句（step 2b）标 `is_abbrev`**：不标时落在全拼层、整层压过简拼候选（`zhge` 把 zh 读成 z|h 组出
+  「之后个」w=3263，压过「这个」w=555006）。标上后真实词库界面层：短简拼 5063 条首选命中 68.48% → 85.50%，
+  pinyin_eval D 类 1000 条逐条零差异。
 
 ### 4.3 混输引擎（`mixed/engine.rs`）——**截断优先级档**
 
@@ -357,6 +455,44 @@
   靠 `sort_by` 的**稳定性**维持引擎/注入序。**凡需要「确定性取一条」的调用方（如空码补全池取首条）
   必须自己补 `.then_with(|| a.text.cmp(&b.text))`**——`lookup_prefix`/HashMap 遍历序不定，不补末级会
   退化成「随机取一条」、重启可能不同（补全池已补，见第 4 步）。
+
+### 6.1 后加的分区键与音节数对齐档
+
+上面的七级图是骨架，现行链（以 `wind_candidate::candidate_display_order` 为准）在其中插了几级：
+`by_consumed → is_draft → is_split_composed → cmp_match_layers → cmp_completion_extra →
+cmp_exact_first → from_disabled_dict → source_tier（仅混输）→ weight → base_order → natural_order`。
+
+- **`by_consumed` 必须与 `cmp_match_layers` 成对、且在其前**。凡整体重排候选的地方两键要一起用。
+  反例：`freq_rerank::rerank_positional` 曾只带层级键，而它只在本次输入有词频记录时才跑，于是
+  「冰冻三尺非一日之寒」（`bingdongsanchi`，残码上浮不成立、落在前缀补全层）首次打出在第 1 位，
+  上屏一次进了词频表就掉到第 24 位，删掉记录又恢复——表现为「时灵时不灵」。
+- **`is_draft` / `is_split_composed` 两个沉底分区必须在 `cmp_match_layers` 之前**：草稿与切分候选
+  `is_prefix = false`，而用户词/临时词层的前缀补全 `is_prefix = true`（`store_layer.rs`），放在层级键
+  之后胜负已在 `eff_prefix` 分出，沉底层永远走不到（`hfkn` 无精确解、用户词有 `hfknq` 时用户词被挤到
+  第三位）。草稿比切分更沉：切分是按码表规则拼的，草稿只是滑窗猜测。
+  这类「按一个布尔分两区」的键是合法全序，且两条非标记候选之间恒 `Equal`，可证明不改变既有次序；
+  这与 `place_english_after_common_exact` 处否决的「只对部分候选对表态」的比较器不同。
+- **`cmp_completion_extra`（音节数对齐者优先）** 位于层级之后、权重之前：层内分档，不跨层提拔。
+  - 只在显示序施加一次，不要再写进 `freq_rerank` 的层级比较器：那里的 `base_pos` 已继承显示序，
+    重复施加会让它变成词频也翻不过的硬约束（`jisuanjik` 下选过 30 次的「计算机科学」压不过
+    「计算机看」）。音节数对齐是先验，词频是实证，实证应能推翻先验。
+  - 权重折扣替代不了它：`COMPLETION_WEIGHT_DISCOUNT` 的 0.5 在对数域只有 0.69，中文词频跨 5 个
+    数量级（`zaij` 下「再加上」折后 5278 仍压「再加」1461；`zaim` 下「在美国」压「再买」）。
+  - 参考实现用 0.5 就够，是因为它们的音节图结构上不产生这种候选：librime
+    （`algo/syllabifier.cc`）的 completion 只在最后一条边上展开，`Table::Query` 沿图逐音节前进，
+    「在美国」需要第 3 个音节位、匹配不到；词级预测只对 >3 音节长词生效。fcitx5/libime
+    （`pinyindictionary.cpp`）的超长词匹配要求路径长度 ≥ `max(3, LongWordLengthLimit=4) + 1`。
+    我们把 0.5 当 `extra ∈ 0..4` 的通用惩罚，超出了它被标定的范围，故补本档位。
+  - 现为严格逐级。若嫌 `beijingd` 下「北京大学」(extra=1) 掉得太深，可收成 `min(extra, 1)` 两档，
+    收之前先确认不是 `max_extra_syllables` 召回旋钮该调。
+- **`cmp_match_layers` 的首键是「低置信的全拼降级」**（`is_fullpinyin_fallback && (eff_prefix || is_partial)`）：
+  - 只沉低置信部分：单拿来源标记当层级键会把精确整词一起沉掉（`zaijian` 的「再见」曾被压到第 8 位）；
+    精确整词且消费整串的降级候选与双拼候选同层，由消费长度优先排到只吃 2 键的同音单字之前。
+  - 判据用 `eff_prefix` 而非裸 `is_prefix`：`is_promoted_completion` 正是引擎判定的「置信度够高」。
+    用裸值时，双拼下用全拼打用户词库长词（`qingfengshurufa`，降级支路是唯一产出通道）会被沉到
+    600 位左右、被 `truncate(300)` 丢掉，完全打不出。
+  - 必须是首键：挂在 `is_abbrev` 之后会让双拼简拼候选沉得比降级通道还深。
+  - 非双拼 / 开关关闭时该键恒相等，比较落到原来三键。
 
 ---
 

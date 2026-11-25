@@ -156,6 +156,15 @@ pub trait WebDataHost {
     /// 兼容规则（`compat.toml`）被设置端写过之后调：重载规则表并让前台进程立即生效。
     fn reload_compat(&self);
 
+    /// 软键盘编辑视图（设置 › 输入 › 软键盘）：`{ pages: [...] }`。
+    fn softkeyboard_view(&self) -> anyhow::Result<serde_json::Value>;
+
+    /// 软键盘整批编辑：稀疏写用户层并热重载，返回新视图。
+    fn softkeyboard_apply(
+        &self,
+        ops: &[wind_softkeyboard::admin::Op],
+    ) -> anyhow::Result<serde_json::Value>;
+
     /// 清理压在某个类上的冗余逐条覆盖（方向与当前默认相同的那些）。
     fn charset_clear_redundant(
         &self,
@@ -177,6 +186,13 @@ pub trait WebDataHost {
     fn common_char_edit(
         &self,
         ch: &str,
+        edit: crate::handle_common_chars::CommonCharEdit,
+    ) -> anyhow::Result<()>;
+
+    /// 一批 [`Self::common_char_edit`]（`Set` / `Reset`）：整批校验、一次写库、镜像回灌一次。
+    fn common_char_edit_batch(
+        &self,
+        chars: &[String],
         edit: crate::handle_common_chars::CommonCharEdit,
     ) -> anyhow::Result<()>;
 
@@ -215,6 +231,17 @@ pub trait WebDataHost {
         id: &str,
         edit: crate::handle_quick_format::QuickFormatEdit,
     ) -> anyhow::Result<()>;
+
+    /// 一批 [`Self::quick_format_edit`]（`(kind, id)`，可跨类别；只收 `SetEnabled` / `ResetEntry`）：
+    /// 类别先全部解析（有未知的整批报错），写库一次、回灌一次。
+    fn quick_format_edit_batch(
+        &self,
+        items: &[(String, String)],
+        edit: crate::handle_quick_format::QuickFormatEdit,
+    ) -> anyhow::Result<()>;
+
+    /// 一批 [`Self::quick_format_delete`]：任一条未知类别或是出厂条目 ⇒ 整批不删。
+    fn quick_format_delete_batch(&self, items: &[(String, String)]) -> anyhow::Result<()>;
 
     /// 每个类别可用的模板变量清单：`[(kind, [(变量名, 说明)])]`。
     ///
@@ -422,6 +449,15 @@ impl WebDataHost for Coordinator {
     fn reload_compat(&self) {
         Coordinator::reload_compat_and_refresh(self)
     }
+    fn softkeyboard_view(&self) -> anyhow::Result<serde_json::Value> {
+        Coordinator::softkeyboard_editor_view(self)
+    }
+    fn softkeyboard_apply(
+        &self,
+        ops: &[wind_softkeyboard::admin::Op],
+    ) -> anyhow::Result<serde_json::Value> {
+        Coordinator::softkeyboard_editor_apply(self, ops)
+    }
     fn charset_clear_redundant(
         &self,
         key: &str,
@@ -453,6 +489,13 @@ impl WebDataHost for Coordinator {
     ) -> anyhow::Result<crate::handle_common_chars::CommonCharBulkOutcome> {
         Coordinator::common_char_bulk_by_block(self, ch, common, apply)
     }
+    fn common_char_edit_batch(
+        &self,
+        chars: &[String],
+        edit: crate::handle_common_chars::CommonCharEdit,
+    ) -> anyhow::Result<()> {
+        Coordinator::common_char_edit_batch(self, chars, edit)
+    }
     fn common_chars_export(&self) -> anyhow::Result<String> {
         Coordinator::export_common_chars(self)
     }
@@ -478,6 +521,16 @@ impl WebDataHost for Coordinator {
         let kind = wind_quick_input::FormatKind::parse(kind)
             .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))?;
         Coordinator::edit_quick_format(self, kind, id, edit)
+    }
+    fn quick_format_edit_batch(
+        &self,
+        items: &[(String, String)],
+        edit: crate::handle_quick_format::QuickFormatEdit,
+    ) -> anyhow::Result<()> {
+        Coordinator::edit_quick_formats(self, &parse_quick_items(items)?, edit)
+    }
+    fn quick_format_delete_batch(&self, items: &[(String, String)]) -> anyhow::Result<()> {
+        Coordinator::delete_quick_formats(self, &parse_quick_items(items)?)
     }
     fn quick_format_var_hints(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         wind_quick_input::FormatKind::ALL
@@ -535,4 +588,18 @@ impl WebDataHost for Coordinator {
     ) -> Result<(), String> {
         Coordinator::ui_toast(self, text, kind, color, pos, duration_ms)
     }
+}
+
+/// `(kind, id)` 的类别整批先解析：有未知的整批报错，什么都不写。
+fn parse_quick_items(
+    items: &[(String, String)],
+) -> anyhow::Result<Vec<(wind_quick_input::FormatKind, String)>> {
+    items
+        .iter()
+        .map(|(kind, id)| {
+            wind_quick_input::FormatKind::parse(kind)
+                .map(|k| (k, id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("未知的快捷输入类别: {kind}"))
+        })
+        .collect()
 }

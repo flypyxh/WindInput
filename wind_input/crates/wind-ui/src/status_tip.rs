@@ -29,7 +29,7 @@ struct StatusTipMouse {
     drag_pin: Option<(i32, i32)>,
     /// 光标是否在气泡窗口内（`WM_MOUSEMOVE` 置 true / `WM_MOUSELEAVE` 置 false）。
     mouse_over: bool,
-    /// 上次**物理**光标屏幕坐标——过滤气泡自身出现/移动到光标下方引起的伪 `WM_MOUSEMOVE`。
+    /// 上次物理光标屏幕坐标——过滤气泡自身出现/移动到光标下方引起的伪 `WM_MOUSEMOVE`。
     /// 与候选窗 `CandidateMouse::last_cursor` 同构，见 [`StatusTipMouse::reset_hover`]。
     last_cursor: (i32, i32),
     /// 是否已注册过 `WM_MOUSELEAVE` 追踪（一次性，收到 LEAVE 后需重新注册）。
@@ -77,15 +77,15 @@ impl StatusTipMouse {
         true
     }
 
-    /// 复位悬停状态，并**以当前物理光标位重建基线**。
+    /// 复位悬停状态，并以当前物理光标位重建基线。
     ///
     /// 两个调用点，职责不同，缺一不可（与候选窗 `CandidateMouse::reset_hover` 同构）：
-    /// - [`StatusTip::mark_visible`]（不可见 → 可见）：**基线在这里才有意义**。判据问的是
+    /// - [`StatusTip::mark_visible`]（不可见 → 可见）：基线在这里才有意义。判据问的是
     ///   「气泡出现之后鼠标动没动」，基准就必须取自气泡出现那一刻。
     /// - [`StatusTip::hide`]：清掉悬停残留。隐藏时系统未必投出 `WM_MOUSELEAVE`，
     ///   不清则 `mouse_over` 一直挂着 true，之后每次显示都被判成「交互中」而永不自动隐藏；
     ///   `leave_armed` 同样残留会让 [`Self::arm_leave`] 一直早退，`WM_MOUSELEAVE` 再不会来。
-    ///   它顺带采的那次基线到下次显示时多半已过时，**不能当作基线的来源**。
+    ///   它顺带采的那次基线到下次显示时多半已过时，不能当作基线的来源。
     fn reset_hover(&mut self) {
         self.mouse_over = false;
         self.leave_armed = false;
@@ -301,14 +301,14 @@ impl StatusTip {
         })
     }
 
-    /// 标记气泡已显示；仅在**不可见 → 可见**这一沿重采悬停基线。
+    /// 标记气泡已显示；仅在不可见 → 可见这一沿重采悬停基线。
     ///
     /// 基线要回答的是「气泡出现之后鼠标动没动」，基准就只能取自气泡出现那一刻：
     /// - 取自 `hide()`（上一次显示结束）必然过时——这期间用户多半移动过鼠标，气泡再弹出时
     ///   系统投来的进入消息坐标与陈旧基线不同 → 被判成「用户真实移动了鼠标」；
     /// - 取构造初值则进程内第一次显示必不相等，同样误判。
     ///
-    /// 反过来，**已可见时不得重采**：连续切换状态时气泡只更新内容/位置，用户可能正悬停其上，
+    /// 反过来，已可见时不得重采：连续切换状态时气泡只更新内容/位置，用户可能正悬停其上，
     /// 此时重采基线会连同 `mouse_over` 一起清掉，把真实悬停也抹平。
     fn mark_visible(&self) {
         if !self.visible.get() {
@@ -500,7 +500,7 @@ impl StatusTip {
             above,
             self.cand_rect,
         );
-        // 基线采样刻意排在 `show` **之前**：窗口出现不会移动鼠标，两处取值物理上相同，
+        // 基线采样刻意排在 `show` 之前：窗口出现不会移动鼠标，两处取值物理上相同，
         // 但排在前面就完全不依赖「`show` 内部不会泵到 WM_MOUSEMOVE」这个前提。
         self.mark_visible();
         // 内容锚点 − 左/上 margin，阴影向四周溢出。
@@ -528,12 +528,12 @@ impl StatusTip {
         self.window.show(ax - ml as i32, ay - mt as i32);
     }
 
-    /// 锚点显示（C2-33 / GH#148）：前台窗口所在屏的工作区 / 前台窗口边框上的锚点，不跟随光标。
+    /// 锚点显示：前台窗口所在屏的工作区 / 前台窗口边框上的锚点，不跟随光标。
     /// `caret_*` 只在取不到前台窗口时用于选屏，见 [`anchor_frames`]。
     pub fn show_anchor(&mut self, text: &str, anchor: StatusTipAnchor, caret_x: i32, caret_y: i32) {
         let frames = anchor_frames(caret_x, caret_y);
         let (probe_x, probe_y) = anchor_probe_point(frames, caret_x, caret_y);
-        // ★ 顺序契约同 `show_fixed`：scale → 尺寸 → 落点。
+        // 顺序契约同 `show_fixed`：scale → 尺寸 → 落点。
         self.ensure_scale(probe_x, probe_y);
         let margin = (ANCHOR_MARGIN_DP * self.scale).round() as i32;
         let (cw, ch, ml, mt) = self.render_bubble(text);
@@ -589,7 +589,7 @@ impl StatusTip {
         self.mouse.borrow_mut().menu_open = open;
     }
 
-    /// 当前气泡**内容左上**屏幕坐标（窗口左上 + 阴影扩边）。
+    /// 当前气泡内容左上屏幕坐标（窗口左上 + 阴影扩边）。
     /// 供「固定位置」开关把当前实际位置落盘成 custom_x/custom_y。
     pub fn content_origin(&self) -> (i32, i32) {
         let m = self.mouse.borrow();
@@ -763,7 +763,7 @@ impl StatusTip {
                     gap,
                     above,
                 );
-                // 挡住候选窗：按候选窗**建议**落点算避让位置，交宿主随候选窗实际落点平移
+                // 挡住候选窗：按候选窗建议落点算避让位置，交宿主随候选窗实际落点平移
                 // （候选窗被宿主翻到光标上方时，提示泡跟着走）。没挡住就照旧翻转落位。
                 let avoid = self.cand_rect.map(|c| {
                     place_caret_tip(
@@ -820,7 +820,7 @@ const ANCHOR_MARGIN_DP: f32 = 16.0;
 type AnchorFrames = Option<((i32, i32, i32, i32), Option<(i32, i32, i32, i32)>)>;
 
 /// 取锚点的参照矩形（平台层）：前台窗口所在屏的工作区 + 前台窗口可见边框。
-/// 取不到前台窗口时退到**光标所在屏**的工作区（无窗口边框 ⇒ 窗口锚点降级为屏幕锚点）；
+/// 取不到前台窗口时退到光标所在屏的工作区（无窗口边框 ⇒ 窗口锚点降级为屏幕锚点）；
 /// 连工作区都查不到时返回 `None`，调用方按光标点夹回。非 Windows 恒 `None`（macOS 的气泡在
 /// `.app` 侧定位，不走本模块）。
 #[cfg_attr(not(windows), allow(unused_variables))]
@@ -904,13 +904,12 @@ fn place_anchor(
     crate::sys::clamp_rect_in_bounds(x, y, size.0, size.1, work)
 }
 
-/// `custom_x/custom_y` 的「从未设定」哨兵。配置默认即 0，而 (0,0) 恰是**主显示器**左上角
-/// —— 固定位置模式下这正是「气泡永远在主屏」的另一条通路：用户刚打开开关还没拖过，
-/// 气泡就钉死在主屏角上，且此前 fixed 路径完全不做屏幕钳制，副屏拔掉后再也拖不回来。
+/// `custom_x/custom_y` 的「从未设定」哨兵。配置默认即 0，而 (0,0) 恰是主显示器左上角，
+/// 不特判的话刚打开固定位置还没拖过，气泡就钉死在主屏角上。
 const FIXED_UNSET: (i32, i32) = (0, 0);
 
-/// `ensure_scale` 的探测点：未设定固定位置时，DPI 必须按**光标所在屏**取，
-/// 否则会拿主屏缩放去排版一个即将落在副屏的气泡（★ 顺序契约：scale → 尺寸 → 落点）。
+/// `ensure_scale` 的探测点：未设定固定位置时，DPI 必须按光标所在屏取，
+/// 否则会拿主屏缩放去排版一个即将落在副屏的气泡（顺序契约：scale → 尺寸 → 落点）。
 fn anchor_probe(fx: i32, fy: i32, caret_x: i32, caret_y: i32) -> (i32, i32) {
     if (fx, fy) == FIXED_UNSET {
         (caret_x, caret_y)
@@ -919,14 +918,13 @@ fn anchor_probe(fx: i32, fy: i32, caret_x: i32, caret_y: i32) -> (i32, i32) {
     }
 }
 
-/// 固定位置模式的**内容左上**锚点。
+/// 固定位置模式的内容左上锚点。
 ///
 /// - 已设定：原样使用用户拖定的绝对坐标（「固定」就该是固定，不跟随焦点换屏）。
-/// - 未设定（(0,0) 哨兵）：落到**光标所在屏**，而不是主屏左上角。
+/// - 未设定（(0,0) 哨兵）：落到光标所在屏，而不是主屏左上角。
 ///
 /// 两种情况都过一次 [`crate::sys::clamp_to_work_area`]：它按落点反查显示器、不预设原点，
-/// 所以既不会把副屏的合法负坐标拽回主屏，又能在副屏被拔掉后把气泡拉回可见区域
-/// （否则那对绝对坐标已不属于任何显示器，气泡不可见也就无法再拖动纠正）。
+/// 不会把副屏的合法负坐标拽回主屏，副屏拔掉后也能把气泡拉回可见区域。
 fn fixed_anchor(fx: i32, fy: i32, caret_x: i32, caret_y: i32, cw: u32, ch: u32) -> (i32, i32) {
     let (ax, ay) = if (fx, fy) == FIXED_UNSET {
         (caret_x, caret_y)
@@ -942,10 +940,8 @@ fn fixed_anchor(fx: i32, fy: i32, caret_x: i32, caret_y: i32, cw: u32, ch: u32) 
 /// 与引入避让前一致）。`x` 已含水平偏移；`off_y` 只加在首选侧。`bounds` 为 `None`（外部宿主
 /// 拿不到屏幕几何）时只看候选窗。
 ///
-/// 抽出来是为了可测——平台取工作区的部分埋在 `#[cfg(windows)]` + unsafe 里，Linux CI 上跑不到。
-/// 要锁住的性质之一是**坐标不得假设桌面原点为 (0,0)**：主显示器左上角才是虚拟桌面原点，
-/// 摆在主屏左侧/上方的副屏工作区坐标为负，任何 `max(0)` 都会把气泡推回主屏
-/// （见本模块测试 `left_monitor_negative_x_survives`）。
+/// 抽出来是为了在 Linux CI 上可测。坐标不得假设桌面原点为 (0,0)：主屏左侧/上方的副屏坐标为负，
+/// 任何 `max(0)` 都会把气泡推回主屏（测试 `left_monitor_negative_x_survives`）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn place_caret_tip(
     x: i32,
@@ -1022,8 +1018,8 @@ fn place_below_or_above(
 
 /// 跟随光标落位：取光标所在显示器工作区，交 [`place_caret_tip`]。
 ///
-/// 显示器按 **caret 点**反查（`MONITOR_DEFAULTTONEAREST`），故天然跟随光标所在屏；
-/// 查不到工作区时只按候选窗避让，**不得**再做任何以 0 为下界的兜底钳制。
+/// 显示器按 caret 点反查（`MONITOR_DEFAULTTONEAREST`），故天然跟随光标所在屏；
+/// 查不到工作区时只按候选窗避让，不得再做任何以 0 为下界的兜底钳制。
 #[allow(clippy::too_many_arguments)]
 fn clamp_caret_tip(
     x: i32,
@@ -1095,325 +1091,16 @@ impl StatusTip {
 }
 
 #[cfg(test)]
-mod hover_gate_tests {
-    //! 悬停防抖：**「收到 WM_MOUSEMOVE」不等于「用户动了鼠标」**。
-    //!
-    //! 该消息的语义是「鼠标与本窗口的相对位置变了」，气泡自己弹到静止的指针下方同样满足。
-    //! 少了物理坐标门控，气泡一弹在鼠标上就被判成悬停中，`interacting()` 恒真，
-    //! 主循环每轮把自动隐藏时刻顺延满一份 —— 表现为气泡常显不消失。
-
-    use super::StatusTipMouse;
-
-    fn mouse_at(baseline: (i32, i32)) -> StatusTipMouse {
-        // 接收端就地丢弃：本组测试只验状态迁移，不发任何 UiEvent。
-        let (tx, _) = std::sync::mpsc::channel();
-        StatusTipMouse {
-            hwnd: crate::sys::HWND::default(),
-            events: tx,
-            dragging: false,
-            grab_dx: 0,
-            grab_dy: 0,
-            margin: (0, 0),
-            drag_pin: None,
-            mouse_over: false,
-            last_cursor: baseline,
-            leave_armed: false,
-            menu_open: false,
-        }
-    }
-
-    /// 气泡出现/移动到静止指针下方：坐标与基线相同 → 不算移动。
-    #[test]
-    fn synthetic_move_at_same_cursor_is_rejected() {
-        let mut m = mouse_at((640, 480));
-        assert!(!m.accept_move((640, 480)));
-    }
-
-    /// 反向对照：真实移动必须放行，并把基线推进到新位置。
-    #[test]
-    fn real_move_is_accepted_and_advances_baseline() {
-        let mut m = mouse_at((640, 480));
-        assert!(m.accept_move((641, 480)));
-        assert_eq!(m.last_cursor, (641, 480));
-        // 放行后停在原地不动的后续消息又该被挡住。
-        assert!(!m.accept_move((641, 480)));
-    }
-
-    /// `reset_hover` 清悬停残留：隐藏时系统未必投 WM_MOUSELEAVE，不清则下次显示直接被判交互中。
-    #[test]
-    fn reset_hover_clears_over_and_leave_arm() {
-        let mut m = mouse_at((0, 0));
-        m.mouse_over = true;
-        m.leave_armed = true;
-        assert!(m.interacting(), "反向对照：悬停中确实算交互");
-        m.reset_hover();
-        assert!(!m.mouse_over);
-        assert!(
-            !m.leave_armed,
-            "不清则 arm_leave 永远早退，LEAVE 再也不会来"
-        );
-        assert!(!m.interacting());
-    }
-
-    /// 拖动与右键菜单不受门控影响，仍各自独立地维持「交互中」。
-    #[test]
-    fn drag_and_menu_still_hold_interacting() {
-        let mut m = mouse_at((0, 0));
-        m.dragging = true;
-        assert!(m.interacting());
-        m.dragging = false;
-        m.menu_open = true;
-        assert!(m.interacting());
-    }
-}
+#[path = "status_tip_hover_gate_tests.rs"]
+mod hover_gate_tests;
 
 #[cfg(test)]
-mod place_tests {
-    //! 气泡落点的纯几何：**坐标不得假设桌面原点为 (0,0)**。
-    //!
-    //! 此前 `clamp_below_or_above` 出口处有一行 `(nx.max(0), ny.max(0))`，把上面按
-    //! `MonitorFromPoint` + `rcWork` 算对的结果又拍回非负象限。摆在主屏左侧/上方的副屏
-    //! 坐标整块为负，于是气泡被吸到主屏边缘——多显示器下的「气泡永远在主屏」。
-    //! 同一病灶本仓在工具栏上踩过一次（`corner_in_work_area` 内明令禁止 `max(0)`）。
-    use super::{place_below_or_above, place_caret_tip};
-
-    /// 主屏（虚拟桌面原点）与摆在它**左侧**的副屏。副屏工作区 x 全为负数——
-    /// 这正是 `max(0)` 会把气泡整块吸回主屏的那种布局。
-    const MAIN: (i32, i32, i32, i32) = (0, 0, 2560, 1368);
-    const LEFT: (i32, i32, i32, i32) = (-1920, 0, 0, 1040);
-    /// 摆在主屏**上方**的副屏：y 为负。
-    const TOP: (i32, i32, i32, i32) = (0, -1080, 1920, -40);
-
-    const TIP: (u32, u32) = (120, 34);
-    const GAP: i32 = 4;
-
-    /// 光标底 500、高 20（顶 480）；候选窗在光标下方 (300, 504)–(900, 560)。
-    const CARET_B: i32 = 500;
-    const CARET_H: i32 = 20;
-    const CAND_BELOW: (i32, i32, i32, i32) = (300, 504, 900, 560);
-    const CAND_ABOVE: (i32, i32, i32, i32) = (300, 424, 900, 476);
-
-    fn tip(
-        above: bool,
-        cand: Option<(i32, i32, i32, i32)>,
-        bounds: Option<(i32, i32, i32, i32)>,
-    ) -> (i32, i32) {
-        place_caret_tip(300, CARET_B, CARET_H, TIP, GAP, 0, above, cand, bounds)
-    }
-
-    const BELOW_Y: i32 = CARET_B + GAP;
-    const ABOVE_Y: i32 = CARET_B - CARET_H - 34 - GAP;
-
-    #[test]
-    fn caret_side_picks_the_preferred_side_without_candidates() {
-        assert_eq!(tip(false, None, Some(MAIN)), (300, BELOW_Y));
-        assert_eq!(tip(true, None, Some(MAIN)), (300, ABOVE_Y));
-    }
-
-    /// 候选窗在下方挡住首选的下方：换到光标上方。首选上方本就不挡，照旧。
-    #[test]
-    fn candidate_below_pushes_tip_above_the_caret() {
-        assert_eq!(tip(false, Some(CAND_BELOW), Some(MAIN)), (300, ABOVE_Y));
-        assert_eq!(tip(true, Some(CAND_BELOW), Some(MAIN)), (300, ABOVE_Y));
-    }
-
-    /// 候选窗被翻到光标上方：首选下方不挡，照旧下方。
-    #[test]
-    fn candidate_above_leaves_tip_below() {
-        assert_eq!(tip(false, Some(CAND_ABOVE), Some(MAIN)), (300, BELOW_Y));
-        assert_eq!(tip(true, Some(CAND_ABOVE), Some(MAIN)), (300, BELOW_Y));
-    }
-
-    /// 光标贴着屏幕上沿（上方放不下）、候选窗在下方：贴到候选窗下沿外。
-    #[test]
-    fn no_room_above_goes_outside_the_candidate_window() {
-        let top_caret =
-            |cand| place_caret_tip(300, 30, 20, TIP, GAP, 0, false, Some(cand), Some(MAIN));
-        assert_eq!(top_caret((300, 34, 900, 90)), (300, 90 + GAP));
-    }
-
-    /// 提示泡与候选窗左右不重叠时不算挡住。
-    #[test]
-    fn horizontally_disjoint_candidate_does_not_count() {
-        assert_eq!(
-            tip(false, Some((1000, 504, 1400, 560)), Some(MAIN)),
-            (300, BELOW_Y)
-        );
-    }
-
-    /// 外部宿主没有屏幕几何：只按候选窗判，照样换到上方。
-    #[test]
-    fn without_bounds_only_the_candidate_window_matters() {
-        assert_eq!(tip(false, Some(CAND_BELOW), None), (300, ABOVE_Y));
-        assert_eq!(tip(false, None, None), (300, BELOW_Y));
-    }
-
-    /// 偏移只加在首选侧：换到另一侧时不叠。
-    #[test]
-    fn offset_applies_to_the_preferred_side_only() {
-        let p = |above, cand| {
-            place_caret_tip(300, CARET_B, CARET_H, TIP, GAP, 7, above, cand, Some(MAIN))
-        };
-        assert_eq!(p(false, None), (300, BELOW_Y + 7));
-        assert_eq!(p(true, None), (300, ABOVE_Y + 7));
-        assert_eq!(p(false, Some(CAND_BELOW)), (300, ABOVE_Y));
-    }
-
-    /// ★ 左侧副屏：负的 x/y 必须原样保留，绝不能被钳到 0（那会跳回主屏）。
-    #[test]
-    fn left_monitor_negative_x_survives() {
-        let (x, y) = place_below_or_above(-1200, 500, TIP, 480, 20, GAP, LEFT);
-        assert_eq!((x, y), (-1200, 500), "副屏内的合法负坐标不该被改写");
-    }
-
-    /// ★ 上方副屏：整块屏的 y 都是负的，上翻后仍须落在该屏内。
-    /// caret 必须取该屏内的坐标（-60），下方放不下（-56 + 34 > -40）故上翻。
-    #[test]
-    fn top_monitor_negative_y_survives() {
-        let caret_y = -60;
-        let (x, y) = place_below_or_above(300, caret_y + GAP, TIP, caret_y, 20, GAP, TOP);
-        assert_eq!(x, 300);
-        assert_eq!(y, caret_y - 20 - 34 - GAP, "应上翻到光标上方，且保持负坐标");
-        assert!(
-            y >= TOP.1 && y + TIP.1 as i32 <= TOP.3,
-            "必须留在上方副屏内"
-        );
-    }
-
-    /// 左侧副屏右边界是 0：贴右边缘时结果为负，同样不该被 `max(0)` 吃掉。
-    #[test]
-    fn left_monitor_right_edge_clamps_to_negative() {
-        let (x, _) = place_below_or_above(-60, 500, TIP, 480, 20, GAP, LEFT);
-        assert_eq!(x, -120, "右溢出应回拉到 right - w = -120，而非 0");
-    }
-
-    /// 主屏常规回归：下方放得下就用下方，坐标原样。
-    #[test]
-    fn main_monitor_below_unchanged() {
-        let (x, y) = place_below_or_above(800, 600, TIP, 580, 20, GAP, MAIN);
-        assert_eq!((x, y), (800, 600));
-    }
-
-    /// 主屏底部：下方放不下 → 上翻到光标上方。
-    #[test]
-    fn main_monitor_flips_above_near_bottom() {
-        let caret_y = 1360;
-        let (_, y) = place_below_or_above(800, 1364, TIP, caret_y, 20, GAP, MAIN);
-        assert_eq!(y, caret_y - 20 - 34 - GAP);
-    }
-
-    /// 上下都放不下（工作区比气泡还矮）时贴下沿，且左上角保持可见。
-    #[test]
-    fn degenerate_short_work_area_pins_to_bottom() {
-        let short = (0, 0, 1920, 30);
-        let (_, y) = place_below_or_above(100, 20, TIP, 10, 10, GAP, short);
-        assert_eq!(y, short.1, "上翻也放不下 → 贴下沿后再被上边界兜回 top");
-    }
-}
+#[path = "status_tip_place_tests.rs"]
+mod place_tests;
 
 #[cfg(test)]
-mod anchor_tests {
-    //! 锚点几何（C2-33 / GH#148）：参照矩形 → 气泡左上角，含边距与夹回。
-    use super::{anchor_origin, place_anchor};
-    use wind_ui_types::StatusTipAnchor as A;
-
-    /// 主屏工作区（任务栏在底部，40px）。
-    const WORK: (i32, i32, i32, i32) = (0, 0, 2560, 1400);
-    /// 左侧副屏：整块负坐标。
-    const LEFT_WORK: (i32, i32, i32, i32) = (-1920, 0, 0, 1040);
-    const TIP: (u32, u32) = (120, 34);
-    const M: i32 = 16;
-
-    #[test]
-    fn screen_anchors_on_work_area() {
-        assert_eq!(anchor_origin(WORK, TIP, M, A::ScreenCenter), (1220, 683));
-        assert_eq!(anchor_origin(WORK, TIP, M, A::ScreenTopLeft), (16, 16));
-        assert_eq!(
-            anchor_origin(WORK, TIP, M, A::ScreenTopRight),
-            (2560 - 16 - 120, 16)
-        );
-        assert_eq!(
-            anchor_origin(WORK, TIP, M, A::ScreenBottomLeft),
-            (16, 1400 - 16 - 34)
-        );
-        assert_eq!(
-            anchor_origin(WORK, TIP, M, A::ScreenBottomRight),
-            (2560 - 16 - 120, 1400 - 16 - 34)
-        );
-    }
-
-    /// 窗口锚点用窗口边框作参照，而不是工作区。
-    #[test]
-    fn window_anchors_use_frame() {
-        let frame = (400, 300, 1400, 900);
-        assert_eq!(
-            place_anchor(A::WindowCenter, WORK, Some(frame), TIP, M),
-            (900 - 60, 600 - 17)
-        );
-        assert_eq!(
-            place_anchor(A::WindowBottomLeft, WORK, Some(frame), TIP, M),
-            (416, 900 - 16 - 34)
-        );
-    }
-
-    /// 屏幕锚点不看窗口边框——即便给了也不用。
-    #[test]
-    fn screen_anchor_ignores_frame() {
-        let frame = (400, 300, 1400, 900);
-        assert_eq!(
-            place_anchor(A::ScreenTopLeft, WORK, Some(frame), TIP, M),
-            (16, 16)
-        );
-    }
-
-    /// 边距参与计算：边距为 0 时贴边。
-    #[test]
-    fn margin_is_applied() {
-        assert_eq!(anchor_origin(WORK, TIP, 0, A::ScreenTopLeft), (0, 0));
-        assert_eq!(
-            anchor_origin(WORK, TIP, 0, A::ScreenBottomRight),
-            (2560 - 120, 1400 - 34)
-        );
-        assert_ne!(
-            anchor_origin(WORK, TIP, 0, A::ScreenBottomRight),
-            anchor_origin(WORK, TIP, M, A::ScreenBottomRight)
-        );
-    }
-
-    /// 拿不到窗口边框 ⇒ 降级为同位置的屏幕锚点。
-    #[test]
-    fn window_anchor_without_frame_degrades_to_screen() {
-        assert_eq!(
-            place_anchor(A::WindowCenter, WORK, None, TIP, M),
-            anchor_origin(WORK, TIP, M, A::ScreenCenter)
-        );
-        assert_eq!(
-            place_anchor(A::WindowBottomLeft, WORK, None, TIP, M),
-            anchor_origin(WORK, TIP, M, A::ScreenBottomLeft)
-        );
-    }
-
-    /// 窗口一半拖出屏幕：锚点落在屏外的部分夹回工作区。
-    #[test]
-    fn window_anchor_outside_work_area_is_clamped() {
-        let frame = (-600, 1200, 400, 1800);
-        let (x, y) = place_anchor(A::WindowBottomLeft, WORK, Some(frame), TIP, M);
-        assert_eq!((x, y), (0, 1400 - 34), "左、下越界都应夹回工作区内");
-    }
-
-    /// 副屏负坐标原样保留，不被拉回主屏（同 place_tests 的同名性质）。
-    #[test]
-    fn negative_work_area_survives() {
-        assert_eq!(
-            place_anchor(A::ScreenTopLeft, LEFT_WORK, None, TIP, M),
-            (-1920 + 16, 16)
-        );
-        assert_eq!(
-            place_anchor(A::ScreenBottomRight, LEFT_WORK, None, TIP, M),
-            (-16 - 120, 1040 - 16 - 34)
-        );
-    }
-}
+#[path = "status_tip_anchor_tests.rs"]
+mod anchor_tests;
 
 #[cfg(test)]
 mod gradient_tests {

@@ -17,30 +17,30 @@ type Layers = [Option<String>; 2];
 // ───────────────────────── 文件形态（serde） ─────────────────────────
 
 #[derive(Debug, Deserialize)]
-struct RawFile {
+pub(crate) struct RawFile {
     #[serde(default)]
-    pages: Vec<RawPage>,
+    pub(crate) pages: Vec<RawPage>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawPage {
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RawPage {
     #[serde(default)]
-    id: String,
+    pub(crate) id: String,
     #[serde(default)]
-    name: String,
+    pub(crate) name: String,
     /// 基础层画布。**`None` 与 `Some(vec![])` 语义不同**——前者是「用户没写这一项」
     /// （只打补丁），后者是「显式给了一张空画布」（整面替换成空）。用户覆盖的三态
     /// 判据就架在这个区别上，见 [`SoftKeyboardTable::merge_user`]。
-    rows: Option<Vec<String>>,
+    pub(crate) rows: Option<Vec<String>>,
     /// 第二层画布。省略即第二层整层为空。
-    rows_shift: Option<Vec<String>>,
+    pub(crate) rows_shift: Option<Vec<String>>,
     /// 单键补丁，压在画布之上。键名形如 `q` / `shift+q`。
     #[serde(default)]
-    keys: BTreeMap<String, String>,
+    pub(crate) keys: BTreeMap<String, String>,
     /// 这一面**发送按键**而不是直接上屏符号。
     ///
     /// `None` = 用户没写这一项（合并时沿用出厂值），与 `Some(false)` 不同。
-    send_keys: Option<bool>,
+    pub(crate) send_keys: Option<bool>,
 }
 
 // ───────────────────────── 运行时形态 ─────────────────────────
@@ -281,6 +281,14 @@ impl SoftKeyboardTable {
     /// 程序不回写——写侧纪律见设计文档 §2.2，破坏它就是「整体替换 ⊕ 稀疏 diff」的数据丢失。
     pub fn merge_user(&mut self, toml_text: &str) -> Result<(), toml::de::Error> {
         let raw: RawFile = toml::from_str(toml_text)?;
+        self.merge_raw(&raw, false);
+        Ok(())
+    }
+
+    /// [`Self::merge_user`] 的本体。`keep_empty` 只给编辑视图用（[`crate::admin`]）：
+    /// 用户刚新建、还没填任何键的面在运行时不该出现在标签行里，但编辑器必须看得见它，
+    /// 否则「新建 → 应用 → 重开对话框」那张空面就凭空消失了。
+    pub(crate) fn merge_raw(&mut self, raw: &RawFile, keep_empty: bool) {
         for rp in &raw.pages {
             if rp.id.trim().is_empty() {
                 warn!("软键盘用户覆盖: 跳过一个没有 id 的面");
@@ -310,7 +318,7 @@ impl SoftKeyboardTable {
                 }
                 None => {
                     let page = Page::from_raw(rp);
-                    if page.is_empty() {
+                    if page.is_empty() && !keep_empty {
                         warn!("软键盘用户覆盖: 跳过新增面 {} —— 一个键位都没有映射", rp.id);
                         continue;
                     }
@@ -318,7 +326,6 @@ impl SoftKeyboardTable {
                 }
             }
         }
-        Ok(())
     }
 
     /// 代码内置的兜底表（出厂文件缺失/损坏时用）。
@@ -350,299 +357,5 @@ rows_shift = [
 "#;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn one_page(body: &str) -> SoftKeyboardTable {
-        SoftKeyboardTable::parse(body).expect("解析失败")
-    }
-
-    #[test]
-    fn canvas_maps_tokens_by_position() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-name = "T"
-rows = ["A B C", "D E F"]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("A"));
-        assert_eq!(p.output("1", false), Some("B"));
-        assert_eq!(p.output("2", false), Some("C"));
-        assert_eq!(p.output("q", false), Some("D"));
-        assert_eq!(p.output("w", false), Some("E"));
-        assert_eq!(p.output("e", false), Some("F"));
-        // 没铺到的键位是空的
-        assert_eq!(p.output("3", false), None);
-        assert_eq!(p.output("z", false), None);
-    }
-
-    #[test]
-    fn hole_and_escaped_dot() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["A . \\. B"]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("A"));
-        assert_eq!(p.output("1", false), None, ". 是空键位占位");
-        assert_eq!(p.output("2", false), Some("."), "\\. 是字面点");
-        assert_eq!(p.output("3", false), Some("B"));
-    }
-
-    #[test]
-    fn ideographic_space_survives_tokenizing() {
-        // U+3000 是 char::is_whitespace，split_whitespace 会把它吃掉。
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["A 　 B"]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("A"));
-        assert_eq!(
-            p.output("1", false),
-            Some("\u{3000}"),
-            "全角空格应作为符号保留"
-        );
-        assert_eq!(p.output("2", false), Some("B"));
-    }
-
-    #[test]
-    fn shift_layer_is_separate() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a b"]
-rows_shift = ["A B"]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("a"));
-        assert_eq!(p.output("grave", true), Some("A"));
-    }
-
-    #[test]
-    fn missing_shift_rows_means_empty_second_layer() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a b"]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", true), None);
-    }
-
-    #[test]
-    fn patch_overrides_canvas() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a b"]
-keys = { grave = "Z", "shift+1" = "Y" }
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("Z"), "补丁压过画布");
-        assert_eq!(p.output("1", false), Some("b"), "没打补丁的键位不动");
-        assert_eq!(p.output("1", true), Some("Y"), "补丁可以只写第二层");
-    }
-
-    #[test]
-    fn patch_can_clear_a_slot() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a b"]
-keys = { grave = "." }
-"#,
-        );
-        assert_eq!(t.page("t").unwrap().output("grave", false), None);
-    }
-
-    #[test]
-    fn output_accepts_aliases() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a b c d e f g h i j k l m"]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("`", false), Some("a"));
-        assert_eq!(p.output("GRAVE", false), Some("a"));
-        assert_eq!(p.output("-", false), Some("l"));
-        assert_eq!(p.output("equals", false), Some("m"));
-    }
-
-    #[test]
-    fn skips_bad_pages_but_keeps_good_ones() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = ""
-rows = ["x"]
-
-[[pages]]
-id = "good"
-rows = ["y"]
-
-[[pages]]
-id = "good"
-rows = ["z"]
-
-[[pages]]
-id = "blank"
-rows = [". . ."]
-"#,
-        );
-        assert_eq!(t.len(), 1, "空 id / 重复 id / 全空面都该剔除");
-        assert_eq!(t.page("good").unwrap().output("grave", false), Some("y"));
-    }
-
-    #[test]
-    fn unknown_patch_key_is_skipped_not_fatal() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a"]
-keys = { enter = "X", "ctrl+q" = "Y", w = "W" }
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("a"));
-        assert_eq!(p.output("w", false), Some("W"), "合法补丁照常生效");
-    }
-
-    #[test]
-    fn extra_rows_and_tokens_are_truncated() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = [
-  "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15",
-  "a", "b", "c", "d",
-]
-"#,
-        );
-        let p = t.page("t").unwrap();
-        assert_eq!(
-            p.output("equal", false),
-            Some("13"),
-            "第 13 个 token 落在最后一个键位"
-        );
-        assert_eq!(p.output("q", false), Some("a"));
-        assert_eq!(p.output("z", false), Some("c"), "第 4 行仍然有效");
-    }
-
-    // ── 用户覆盖三态 ──
-
-    #[test]
-    fn user_patch_only_when_rows_absent() {
-        let mut t = one_page(
-            r#"
-[[pages]]
-id = "t"
-name = "出厂"
-rows = ["a b c"]
-"#,
-        );
-        t.merge_user(
-            r#"
-[[pages]]
-id = "t"
-keys = { "1" = "X" }
-"#,
-        )
-        .unwrap();
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("a"), "基础画布不动");
-        assert_eq!(p.output("1", false), Some("X"), "补丁生效");
-        assert_eq!(p.output("2", false), Some("c"));
-        assert_eq!(p.name, "出厂", "没给 name 就不动");
-    }
-
-    #[test]
-    fn user_rows_replace_whole_page() {
-        let mut t = one_page(
-            r#"
-[[pages]]
-id = "t"
-name = "出厂"
-rows = ["a b c"]
-"#,
-        );
-        t.merge_user(
-            r#"
-[[pages]]
-id = "t"
-rows = ["X"]
-"#,
-        )
-        .unwrap();
-        let p = t.page("t").unwrap();
-        assert_eq!(p.output("grave", false), Some("X"));
-        assert_eq!(p.output("1", false), None, "整面替换，旧画布不残留");
-        assert_eq!(p.name, "出厂", "名字缺省时保留出厂名");
-    }
-
-    #[test]
-    fn user_unknown_id_appends_page() {
-        let mut t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a"]
-"#,
-        );
-        t.merge_user(
-            r#"
-[[pages]]
-id = "mine"
-name = "我的"
-rows = ["Z"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(t.len(), 2);
-        assert_eq!(t.index_of("mine"), Some(1), "新增面追加在末尾");
-        assert_eq!(t.page("mine").unwrap().name, "我的");
-    }
-
-    #[test]
-    fn builtin_is_parseable_and_nonempty() {
-        let t = SoftKeyboardTable::builtin();
-        assert!(!t.is_empty());
-        assert_eq!(t.page("punct").unwrap().output("1", false), Some("！"));
-    }
-
-    #[test]
-    fn entries_lists_both_layers() {
-        let t = one_page(
-            r#"
-[[pages]]
-id = "t"
-rows = ["a"]
-rows_shift = ["A"]
-"#,
-        );
-        let mut got: Vec<_> = t.page("t").unwrap().entries().collect();
-        got.sort();
-        assert_eq!(got, vec![("grave", false, "a"), ("grave", true, "A")]);
-    }
-}
+#[path = "table_tests.rs"]
+mod tests;

@@ -1,7 +1,5 @@
-//! 缓存有效性：基于源文件**内容指纹**而非 mtime。
-//!
-//! 痛点：词库源 mtime 会被 scp/部署/版本控制刷新，导致 mtime 校验恒失效 → 每次重建
-//! (300MB、耗时)。改用内容指纹后，只要源**内容**未变即复用缓存。
+//! 缓存有效性：基于源文件内容指纹而非 mtime（mtime 会被 scp / 部署 / 版本控制刷新，
+//! 按它判定会导致每次重建）。
 //!
 //! 用法（`tag` 标明「这份缓存是按什么方式解析出来的」，读写必须一致）：
 //!   - 加载前：`cache_is_fresh(cache, sources, tag)` 为 true 则直接用缓存；
@@ -11,16 +9,9 @@
 //!
 //! # 状态 sidecar `.st`：源没动就不读内容（S1）
 //!
-//! 内容指纹的代价是**每次判新鲜都要读满源**：大方案（feihuzj2 250 MB）一次启动的新鲜
-//! 判定就是几百 MB 的 I/O，而命中时本该是零成本。`.st` 记下「这份指纹是在哪组文件状态
-//! 下算出来的」——每个源的 (存在性, 长度, mtime)。下次判新鲜先 stat：状态逐项相同就直接
-//! 信 `.fp`，不读内容；有任何不同再算完整指纹，相等时顺手把 `.st` 刷成当前状态。
-//!
-//! 这不违背本模块「拒绝 mtime」的原则：那条原则拒绝的是**用 mtime 判定要不要重建**
-//! （部署刷新 mtime ⇒ 误判要重建 ⇒ 几十秒）；这里 mtime 只决定**要不要重新算指纹**，
-//! 误判的代价是多算一次哈希。反向风险「内容变了而长度与 mtime 都没变」需要有人刻意
-//! 回拨时间戳，`schema.rebuildCache` 仍是逃生口。
-//! 设计见 `docs/design/system-dict-cache-improvements.md` S1。
+//! `.st` 记下这份指纹是在哪组源状态（存在性、长度、mtime 等）下算出来的。判新鲜先 stat，
+//! 逐项相同就信 `.fp` 不读内容；否则算完整指纹，相等时把 `.st` 刷成当前状态。这里 mtime
+//! 只决定要不要重算指纹，不决定要不要重建。见 `docs/design/system-dict-cache-improvements.md` S1。
 
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
@@ -42,15 +33,12 @@ fn st_sidecar(cache: &Path) -> PathBuf {
 /// 一个源文件的瞬时状态。`Absent` 是稳定可比的状态（与 [`fingerprint`] 对缺失源的
 /// 处理一致），不是失败。
 ///
-/// `ino` / `ctime_nanos` 只在 Unix 上有意义（其余平台恒 0）：Flatpak / ostree 把部署文件的
-/// mtime 钉成 0、Nix store 钉成 1、按 `SOURCE_DATE_EPOCH` 打包的也把 mtime 拍平——那些
-/// 形态下「内容变了 mtime 必变」不成立，等长修订（权重 100→200）会被 len+mtime 漏过。
-/// 换文件必换 inode，ctime 用户态改不了，两者补上这个洞；代价只是 chmod 之类也会多算一次
-/// 哈希。
+/// `ino` / `ctime_nanos` 只在 Unix 上有意义（其余平台恒 0）：Flatpak / Nix / `SOURCE_DATE_EPOCH`
+/// 打包会把 mtime 钉死，等长修订会被 len+mtime 漏过；换文件必换 inode、ctime 用户态改不了。
+/// 代价是 chmod 之类也会多算一次哈希。
 ///
-/// **源存在但读不了**（权限、独占锁）时 metadata 仍成功，快路径会判新鲜、直接用旧缓存。
-/// 这是有意的：读不了的源也建不出新缓存，此时沿用旧缓存好过无候选；[`fingerprint`] 那套
-/// 「IO 故障 ⇒ 强制重建」只约束慢路径。
+/// 源存在但读不了（权限、独占锁）时快路径仍判新鲜，这是有意的：读不了也建不出新缓存，
+/// 沿用旧缓存好过无候选。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SourceStamp {
     Absent,
@@ -99,9 +87,8 @@ fn source_stamps(sources: &[&Path]) -> Option<Vec<SourceStamp>> {
     sources.iter().map(|p| source_stamp(p)).collect()
 }
 
-/// 一组源的状态快照（不透明），供调用方做「解析前后源没被改写」的复核：指纹在解析**之前**
-/// 算，解析要几秒，期间源被保存的话，按旧指纹命名的文件装的却是新内容——下次源改回去时
-/// `.st` 会直接命中这份内容错误的文件。解析完再取一次比对，不一致就别按这个指纹落盘。
+/// 一组源的状态快照（不透明），供调用方复核解析前后源没被改写：指纹在解析之前算，期间源
+/// 被保存的话，按旧指纹命名的文件会装着新内容。不一致就别按这个指纹落盘。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceStamps(Option<Vec<SourceStamp>>);
 
@@ -116,8 +103,8 @@ impl SourceStamps {
     }
 }
 
-/// `.st` 里记的源标识：**全路径**而不只是文件名。自带库与用户覆盖库共用槽位，Windows 上
-/// 没有 inode / ctime，两份不同内容的文件只靠 len + mtime 区分太薄；路径不同就直接不走快路径。
+/// `.st` 里记的源标识用全路径：自带库与用户覆盖库共用槽位，Windows 上没有 inode / ctime，
+/// 只靠 len + mtime 区分两份文件太薄。
 fn source_name(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -128,8 +115,7 @@ fn render_st(fp: &str, tag: &str, sources: &[&Path], stamps: &[SourceStamp]) -> 
     let mut out = String::with_capacity(48 + sources.len() * 48);
     out.push_str(fp);
     out.push('\n');
-    // 第二行：解析语义版本 + tag。指纹本身已含这两项，但快路径**不重算指纹**，只信
-    // `.fp`——若不把它们记进 `.st`，升级解析器或换 tag 后，源没动就会错误复用旧缓存。
+    // 第二行：解析语义版本 + tag。快路径不重算指纹，不记的话升级解析器或换 tag 后会复用旧缓存。
     out.push_str(&format!("v{PARSE_SEMANTICS_VERSION}\t{tag}\n"));
     for (p, st) in sources.iter().zip(stamps) {
         out.push_str(&source_name(p));
@@ -149,10 +135,7 @@ fn render_st(fp: &str, tag: &str, sources: &[&Path], stamps: &[SourceStamp]) -> 
     out
 }
 
-/// 读 `.st` 并与「当前源状态」比对。只有**首行指纹等于 `expected_fp`**、次行的解析语义
-/// 版本与 tag 相同、源数与名字逐项
-/// 相同、stamp 逐项相同，才返回 true。任何解析失败都按「不匹配」处理——`.st` 只是加速，
-/// 不能因它出错而把判定变错。
+/// `.st` 记录的指纹等于 `expected_fp` 且其余各项匹配（见 [`st_current_fp`]）时返回 true。
 fn st_matches(
     cache: &Path,
     expected_fp: &str,
@@ -219,16 +202,13 @@ fn st_current_fp(
 
 /// 「刚刚被改过」的源不记 stamp：mtime 离现在不足这么久的，下次仍走全量指纹。
 ///
-/// 文件系统的 mtime 刻度是粗的（Linux 取 `current_time()`，毫秒级；部分 FS 是秒级），
-/// 同一刻度内两次同长度写入得到**逐纳秒相同**的 mtime（`reader_pool` 早有实证）。
-/// 若在第一次写入的同一刻度里记下了 stamp，第二次写入就骗过了快路径。
-/// 这与 git 的 racy-index 规则同源：离「现在」太近的时间戳不可信。代价只是刚部署完
+/// mtime 刻度是粗的（毫秒到秒级），同一刻度内两次同长度写入的 mtime 相同，在第一次写入的
+/// 刻度里记下 stamp 会让第二次写入骗过快路径（同 git 的 racy-index 规则）。代价只是刚部署完
 /// 的那一次启动多算一遍哈希。
 const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// `stamps` 相对时刻 `basis` 是否 racy。`basis` 必须是**取 stamp 之前**的时刻：哈希几百 MB
-/// 可能超过 2 秒，若用哈希完成后的「现在」，同一刻度里发生在取 stamp 之后的改写会被判成
-/// 「早就过了窗口」而记进 `.st`（审查 b19e5f73 指出）。
+/// `stamps` 相对时刻 `basis` 是否 racy。`basis` 必须是取 stamp 之前的时刻：哈希可能超过
+/// 窗口，用哈希完成后的「现在」会把取 stamp 之后的改写判成早已过窗。
 fn stamps_are_racy(stamps: &[SourceStamp], basis: std::time::SystemTime) -> bool {
     let Ok(basis) = basis.duration_since(std::time::UNIX_EPOCH) else {
         return true;
@@ -245,13 +225,11 @@ fn stamp_basis() -> std::time::SystemTime {
     std::time::SystemTime::now()
 }
 
-/// 写 `.st`。只在哈希前后两次 stat 一致、且没有源处于 racy 窗口内时才写（否则记下的
-/// 状态可能对应的是被改写一半、或同一刻度内还会再被改写的内容）；写失败只记 WARN
-/// —— 没有 `.st` 不过是退回全量指纹。
+/// 写 `.st`。只在哈希前后两次 stat 一致、且没有源处于 racy 窗口内时才写；写失败只记 WARN
+/// （没有 `.st` 只是退回全量指纹）。
 ///
-/// racy 判两次：先按系统时钟（`basis` = 取 before stamp 之前的时刻），写完再按 `.st`
-/// 自身落盘后的 mtime 判一次——后者与源文件同一个文件系统时钟，网络盘服务器时钟比本机慢
-/// 时前者会失效（仿 git 的 racy-index 判法，用 index 文件的 mtime 作基准）。
+/// racy 判两次：先按系统时钟，写完再按 `.st` 自身的 mtime（与源同一文件系统时钟，防网络盘
+/// 服务器时钟比本机慢）。
 fn write_st(
     cache: &Path,
     fp: &str,
@@ -290,26 +268,16 @@ fn write_st(
     }
 }
 
-/// **解析语义版本**：改动会影响「同样的源文件解析出什么结果」时必须 +1。
+/// 解析语义版本：改动会影响「同样的源文件解析出什么结果」时必须 +1，否则源没变、指纹
+/// 不变，解析器修复对存量用户静默失效。
 ///
-/// 指纹原本只覆盖源数据，于是缓存回答的是「源文件变了吗」，而真正该回答的是
-/// 「这份缓存和当前程序会产出的结果一致吗」。二者在解析器被修复时会分叉：源文件没变
-/// → 指纹不变 → 复用旧缓存 → **解析器修复对存量用户静默失效**，且表现为「明明改了却
-/// 没生效」这种最难排查的样子。把语义版本混进指纹，修复即自动重建。
-///
-/// 历史：
+/// 各版语义：
 /// - 1 = 初始（列序逐行按 ASCII 猜）
-/// - 2 = 列序改为文件级判定：读头部 `columns:` 声明，无声明则整文件投票探测列序、
-///   权重仍按 librime 默认取第 3 列（纯 ASCII 词条如 `@`、`$CC(...)` 不再被误判成编码列）
-/// - 3 = 只剥行尾空白（前导 U+3000 等不再被当缩进削掉）、空 text/code 跳过、
-///   音节语义补上「code 列含空格」这条正面证据（编码在前的拼音库不再丢简拼与边界）、
-///   `columns:` 支持流式写法且残缺声明改为整库跳过
-/// - 4 = 词条文本的反转义对**命令栏语法条目**只还原换行/制表，反斜杠原样穿过
-///   （`$CC(..., open("D:\\notes"))` 不再被本层与 cmdbar lexer 各吃一个反斜杠）
-/// - 5 = 行尾空白只参与判定、不参与取值：text 列原样保留尾随空白，code/weight 各自
-///   `trim_end`（CodeFirst 布局下末列 text 的尾随空格不再被剥——蒙古文以空格作词间分隔）
-/// - 6 = 命令栏语法条目（`$CC(`/`$SS(` 等）落在 code 列时逐行对调列序（t172：照文档
-///   「编码在前」手写进文本在前的词库，整条 `$SS` 被当成编码、永远打不出来）
+/// - 2 = 列序文件级判定（`columns:` 声明或整文件投票），权重默认第 3 列
+/// - 3 = 只剥行尾空白、空 text/code 跳过、code 列含空格算音节证据、`columns:` 流式写法与残缺声明整库跳过
+/// - 4 = 命令栏语法条目反转义只还原换行/制表，反斜杠原样穿过
+/// - 5 = text 列保留尾随空白，code/weight 各自 `trim_end`
+/// - 6 = 命令栏语法条目落在 code 列时逐行对调列序
 const PARSE_SEMANTICS_VERSION: u32 = 6;
 
 #[cfg(test)]
@@ -319,37 +287,19 @@ thread_local! {
     static FULL_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// 流式读取时的喂料缓冲区大小：足够大以摊薄 syscall 次数，又不至于把峰值分配
-/// 重新做回「文件大小」量级——这正是 [`fingerprint`] 从 `std::fs::read` 整读
-/// 改为流式的目的（真机实测：拼音方案单次校验峰值 11.6 MB → 1.5 MB）。
+/// 流式读取的缓冲区大小：摊薄 syscall 次数，又不让峰值分配回到「文件大小」量级。
 const HASH_CHUNK_SIZE: usize = 64 * 1024;
 
 /// 计算源文件集合的内容指纹：混入解析语义版本 + 调用方 tag + 每个源的 文件名/存在性/长度/内容。
 ///
-/// `tag` 用于区分「同一份源文件、但解析方式不同」的缓存。**没有它就会出现这种静默错误**：
-/// 把某词库的 `dict_type` 在 english ↔ 非 english 之间切换，只改变 `lowercase_code`
-/// 而 `.yaml` 字节不变 → 指纹命中 → 永久复用大小写错误的缓存。
-/// 同理，不同种类的缓存（词库 / 注释库）也应各自持 tag，免得共用一个语义版本号
-/// 却各改各的、谁也没动机去 +1。
+/// `tag` 区分「同一份源文件、但解析方式不同」的缓存（如 `dict_type` 切换 english 只改变
+/// 是否小写化，`.yaml` 字节不变）。不同种类的缓存也各持 tag，各自独立 +1。
 ///
-/// # 源文件缺失 ≠ 指纹失败（2026-08-24 修）
+/// # 源文件缺失 ≠ 指纹失败
 ///
-/// **「缺一个源」是用户可达的日常状态**——方案声明了 `default_enabled` 的扩展词库、
-/// 而用户没装那个文件；此时该词库对构建产物的贡献就是「什么都没有」，是个**确定且稳定**
-/// 的事实，理应可以缓存。
-///
-/// 此前实现是 `std::fs::read(p).ok()?`：任一源读不到 → 整份指纹 `None` →
-/// `write_cache_fp` 什么都不写、`cache_is_fresh` 恒 false → 调用方**每次全量重建**。
-/// 真机现场（feihuzj2 方案，11 个词库里 `feihuzj2_extra_gr.dict.yaml` 不存在）
-/// 因此每次引擎重建都要重算 30 秒的 `combined.wdat`，且磁盘上从来没有过它的 `.fp`
-/// ——那正是本故障唯一的外部指纹。
-///
-/// 现在把**存在性本身**编进哈希：缺失记 `0`、存在记 `1` + 长度 + 内容。于是
-/// 「一直缺」指纹稳定可复用，而「后来补上了」指纹随之改变、缓存正确失效。
-///
-/// ⚠️ 只有 `NotFound` 按「稳定地不存在」处理。**其余 IO 错误（权限、磁盘故障）仍返回
-/// `None`**：那是「读不出来」而非「不存在」，把一次瞬时故障固化进指纹，会让故障恢复后
-/// 继续复用错误缓存。
+/// 缺源是日常状态（方案声明的扩展词库用户没装），其贡献稳定为空，应可缓存：存在性编进
+/// 哈希，缺失记 `0`、存在记 `1` + 长度 + 内容，补上后指纹随之改变。只有 `NotFound` 这样
+/// 处理；其余 IO 错误返回 `None`，免得把瞬时故障固化进指纹。
 fn fingerprint(sources: &[&Path], tag: &str) -> Option<String> {
     use std::io::Read;
     #[cfg(test)]
@@ -365,13 +315,8 @@ fn fingerprint(sources: &[&Path], tag: &str) -> Option<String> {
         }
         match std::fs::File::open(p) {
             Ok(mut f) => {
-                // 长度字段必须排在内容之前写入（见上方 framing 说明），但流式读取
-                // 只能边读边喂、读完才知道真实字节数——于是长度只能先从 metadata 拿。
-                // 这就打开了一道窄窗口：文件在 open 之后、读完之前被并发改写
-                // （部署脚本 scp 覆盖之类），metadata 报的长度可能与实际读到的字节数
-                // 对不上。宁可在这种情况下强制重建，也不能把错位的长度悄悄哈希进去
-                // ——那会制造出「同一份 fingerprint 对应两种不同内容」的静默错误，
-                // 比多花一次重建代价更难排查。
+                // 长度须先于内容写入，流式读取只能先从 metadata 拿。读完后与实际字节数比对，
+                // 不一致（并发改写）就放弃，免得同一指纹对应两种内容。
                 let declared_len = match f.metadata() {
                     Ok(m) => m.len(),
                     Err(_) => return None,
@@ -379,8 +324,7 @@ fn fingerprint(sources: &[&Path], tag: &str) -> Option<String> {
                 h.write_u8(1); // 存在
                 h.write_u64(declared_len);
 
-                // 缓冲区放堆上：本函数会在任意线程（含默认 2 MB 栈的工作线程）上跑，
-                // 64 KB 栈数组虽通常无碍，但这点分配相对于省下的整份文件不值一提。
+                // 缓冲区放堆上：本函数会在任意线程（含小栈工作线程）上跑。
                 let mut buf = vec![0u8; HASH_CHUNK_SIZE];
                 let mut actual_len: u64 = 0;
                 loop {
@@ -451,10 +395,8 @@ pub fn cache_is_fresh(cache: &Path, sources: &[&Path], tag: &str) -> bool {
     true
 }
 
-/// 删掉缓存的指纹 sidecar（不存在不算错）。**重建缓存之前**调用：新 `.fp` 一旦写失败，
-/// 盘上留下的是「没有指纹」而不是「旧指纹」——前者让 [`cache_is_fresh`] 判不新鲜、
-/// [`cache_digest`] 退到 `大小:mtime`，后者会让派生缓存（`.wridx`、英文词组索引）把新内容
-/// 当成没变过。不改任何指纹的算法，存量缓存键不受影响。
+/// 删掉缓存的指纹 sidecar（不存在不算错）。重建缓存之前调用：新 `.fp` 写失败时盘上留下
+/// 「没有指纹」而不是「旧指纹」，否则派生缓存（`.wridx`、英文词组索引）会把新内容当成没变过。
 pub fn remove_cache_fp(cache: &Path) {
     for side in [fp_sidecar(cache), st_sidecar(cache)] {
         if let Err(e) = std::fs::remove_file(&side)
@@ -467,9 +409,7 @@ pub fn remove_cache_fp(cache: &Path) {
 
 /// 缓存构建成功后调用：写入指纹 sidecar。
 ///
-/// 单次失败只是「下次多重建一次」，但**持续失败就是持续重建**——大词库上那是几十秒的
-/// 同步卡顿，而此前这里是 `let _ = ...` 完全静默，故障只能靠「磁盘上没有 .fp」这种
-/// 极隐蔽的方式被发现（真机上正是如此）。两条失败路径都留痕。
+/// 持续失败就是持续重建（大词库几十秒），故两条失败路径都记 WARN。
 pub fn write_cache_fp(cache: &Path, sources: &[&Path], tag: &str) {
     let basis = stamp_basis();
     let before = source_stamps(sources);
@@ -503,12 +443,10 @@ pub fn write_cache_fp(cache: &Path, sources: &[&Path], tag: &str) {
 
 // ───────────────── 内容寻址缓存（S2）：文件名带指纹，文件一旦写成不再改写 ─────────────────
 //
-// 「槽位」就是原来的逻辑缓存路径（如 `<cache>/<ns>/x.wdat`）；实际落盘的文件是
-// `<ns>/x-<指纹前 12 位>.wdat`。同名不同内容的源（用户目录覆盖了自带词库）各得各的文件，
-// 来回切换不再互踩；重建永远写新文件，不覆盖正被 mmap 的旧文件（Windows 上那要靠
-// `FILE_SHARE_DELETE` 与替换代数兜底）。`.st` 挂在槽位上（`x.wdat.st`），既跳过算指纹，
-// 又直接给出当前该指向的文件。`.fp` 仍写在实际文件旁，供二级缓存经 [`cache_digest`] 取摘要。
-// 设计见 `docs/design/system-dict-cache-improvements.md` S2。
+// 「槽位」是逻辑缓存路径（如 `<cache>/<ns>/x.wdat`），实际文件是 `<ns>/x-<指纹前 12 位>.wdat`。
+// 同名不同内容的源各得各的文件，重建永远写新文件、不覆盖正被 mmap 的旧文件。`.st` 挂在
+// 槽位上（`x.wdat.st`），直接给出当前该指向的指纹；`.fp` 仍写在实际文件旁供 [`cache_digest`]。
+// 见 `docs/design/system-dict-cache-improvements.md` S2。
 
 /// 文件名里带的指纹长度（十六进制字符数）。48 位对「同一槽位下的几份变体」绰绰有余；
 /// 完整 64 位在 `.fp` 里。
@@ -567,14 +505,11 @@ pub fn touch_cache(cache: &Path) {
     }
 }
 
-/// 同一槽位下只留最近 `keep` 份内容寻址文件（`current` 恒保留；按「最近使用」新者优先，
-/// 最近使用 = max(wdat mtime, `.fp` mtime)，命中时 [`touch_cache`] 推进后者），其余连同
-/// `.fp` 删掉；槽位旧式的非寻址文件（`x.wdat` 本身）一并清。写盘临时文件
-/// （`*.tmp.<pid>.<seq>`）**不清**：按名字分不出是不是别的进程正在写。
-/// best-effort：删不掉（Windows 上仍被别的实例映射着）就留到下次。
+/// 同一槽位下只留最近 `keep` 份内容寻址文件（`current` 恒保留；最近使用 = max(wdat mtime,
+/// `.fp` mtime)），其余连同 `.fp` 删掉，旧式非寻址文件一并清。写盘临时文件不清：分不出是不是
+/// 别的进程正在写。best-effort，删不掉（仍被映射）就留到下次。
 ///
-/// 默认 `keep = 2` 的用意：用户目录覆盖了同名词库时，自带与覆盖两份交替使用，两份都留
-/// 着才不会来回重建——这正是本机制要解决的现场。
+/// `keep = 2`：自带与用户覆盖两份交替使用时都留着，才不会来回重建。
 pub fn prune_slot(slot: &Path, current: &Path, keep: usize) {
     let Some(dir) = slot.parent() else {
         return;
@@ -634,25 +569,16 @@ pub fn prune_slot(slot: &Path, current: &Path, keep: usize) {
 
 // ───────────────── 二级缓存：以「缓存产物」而非「源文件」为源 ─────────────────
 
-/// 某个缓存产物的**稳定摘要**，供二级缓存（由缓存派生的缓存）校验用。
+/// 某个缓存产物的稳定摘要，供二级缓存（由缓存派生的缓存，如 `.wridx`）校验用。
 ///
-/// # 为什么二级缓存不能直接哈希源文件
+/// 二级缓存哈希各 `.wdat` 的 `.fp` 而不读 yaml 源：`.fp` 已编码了解析语义版本 + tag + 源内容，
+/// 判别力相同，I/O 从几百 MB 降到几百字节。
 ///
-/// 反查索引 `.wridx` 派生自一个方案的全部 `.wdat`。若照 [`fingerprint`] 的做法去读
-/// **yaml 源**，feihuzj2 那种方案每次启动都要读满 250 MB 才能回答「缓存还能不能用」
-/// ——而复用命中时本该是零成本。
-///
-/// 但每个 `.wdat` 自己就有一份 `.fp`，那 16 个十六进制字符已经编码了
-/// 「解析语义版本 + tag + 该 yaml 的全部内容」。于是二级缓存只要哈希这些摘要，
-/// 判别力与直接读源**完全相同**，I/O 却从几百 MB 降到几百字节。
-///
-/// # 三级回退，每级都有明确含义
-///
-/// 1. `fp:<hash>` —— 有指纹 sidecar（正常路径）；
-/// 2. `sz:<len>:<mtime>` —— 无 sidecar（wdat-only 分发的用户投放词库就没有）。
-///    这里用 mtime 是安全的：mtime 之所以在源文件上不可信，是因为 scp/部署会刷新它，
-///    而**缓存产物与用户投放的二进制只会被整体替换**，替换必然改 mtime。
-/// 3. `absent` —— 文件读不到。稳定可哈希，语义是「这一份此刻不在」。
+/// 三级回退：
+/// 1. `fp:<hash>`：有指纹 sidecar（正常路径）；
+/// 2. `sz:<len>:<mtime>`：无 sidecar（wdat-only 投放词库）。缓存产物与投放的二进制只会被
+///    整体替换，替换必改 mtime，故这里用 mtime 是安全的；
+/// 3. `absent`：文件读不到，语义是「这一份此刻不在」。
 pub fn cache_digest(cache: &Path) -> String {
     if let Ok(s) = std::fs::read_to_string(fp_sidecar(cache)) {
         return format!("fp:{}", s.trim());
@@ -671,8 +597,7 @@ pub fn cache_digest(cache: &Path) -> String {
 
 /// 二级缓存的指纹：混入解析语义版本 + tag + 各源摘要。
 ///
-/// 与 [`fingerprint`] 不同，**它不会失败**——摘要本身已经把「读不到」表达成了
-/// `absent`（见 [`cache_digest`]），故没有「无法判定」这一态。
+/// 不会失败：「读不到」已由 [`cache_digest`] 表达成 `absent`。
 fn derived_fingerprint(source_digests: &[String], tag: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write_u32(PARSE_SEMANTICS_VERSION);
@@ -686,7 +611,7 @@ fn derived_fingerprint(source_digests: &[String], tag: &str) -> String {
 }
 
 /// 二级缓存是否可复用。源是 [`cache_digest`] 摘要而非文件路径，其余语义同
-/// [`cache_is_fresh`]（**摘要的顺序参与哈希**：词库次序变了索引内容也会变）。
+/// [`cache_is_fresh`]（摘要的顺序参与哈希：词库次序变了索引内容也会变）。
 pub fn derived_cache_is_fresh(cache: &Path, source_digests: &[String], tag: &str) -> bool {
     if !cache.exists() {
         return false;
@@ -709,37 +634,29 @@ pub fn write_derived_cache_fp(cache: &Path, source_digests: &[String], tag: &str
 
 /// 反查索引（`.wridx`）的指纹 tag。
 ///
-/// ⚠️ **序列化产出的字节语义一变就必须 +1**。文件头里的格式 `VERSION` 只挡得住**布局**
-/// 变化，挡不住「同样的布局、不同的内容」——而后者同样会让存量缓存变成错的。
+/// 序列化产出的字节语义一变就必须 +1：文件头的格式 `VERSION` 只挡得住布局变化，挡不住
+/// 「同样的布局、不同的内容」（如权重聚合挪到去重前后，字节数一位不差）。
 ///
-/// 这不是假想：本格式落地当天就撞上一次。权重聚合从「按 (词,码) 去重**之后**取 max」
-/// 改成「去重**之前**取 max」，wubi86 的索引前后都是 2338080 字节、布局一位没动，
-/// `VERSION` 对它完全无感。当时还没发布，直接清掉存量文件即可；**一旦发布，
-/// 同类改动就只能靠这里 +1**，否则用户机器上那份错索引会被永久复用。
-///
-/// 历史：
-/// - v1 = 初始（含「权重在去重前聚合」的语义；发布前的中间态未单独计版）
+/// 各版语义：
+/// - v1 = 初始（权重在去重前聚合）
 pub const REVERSE_INDEX_TAG: &str = "reverse-index/v1";
 
-/// 单字全码表（`.wscc`）缓存的 tag。同 [`REVERSE_INDEX_TAG`]，**取码判据一改就要 +1**：
-/// 它与反查索引同源同批词库，但选码判据另有一套（码长 → 权重 → 码字典序，见
-/// [`crate::cached::build_single_char_full_codes_from`]），布局不动而选出的码变了，
-/// `VERSION` 一样拦不住。
+/// 单字全码表（`.wscc`）缓存的 tag。同 [`REVERSE_INDEX_TAG`]，取码判据（见
+/// [`crate::cached::build_single_char_full_codes_from`]）一改就要 +1。
 ///
-/// ⚠️ 这张表还依赖方案的 `max_code_length`，而那**不在词库指纹里**——
-/// 调用方必须把它并进 `source_digests`（见 `EngineManager::build_single_char_codes_for`）。
+/// 这张表还依赖方案的 `max_code_length`，它不在词库指纹里，调用方须并进 `source_digests`
+/// （见 `EngineManager::build_single_char_codes_for`）。
 ///
-/// 历史：
+/// 各版语义：
 /// - v1 = 初始
 pub const SINGLE_CHAR_CODES_TAG: &str = "single-char-codes/v1";
 
 /// 英文词组分词索引（`.wphr`，`wind_engine::english_phrase`）的指纹 tag。
 ///
-/// 同 [`REVERSE_INDEX_TAG`]：**索引语义一改就要 +1**——收词判据（几个词算词组）、小写化
-/// 规则、首词排序键，任何一项变了而文件布局没动，文件头里的格式版本拦不住，存量用户会
-/// 永久复用按旧语义建的索引。指纹进的是**文件名**，+1 即换一份新文件，旧的由保留上限清走。
+/// 同 [`REVERSE_INDEX_TAG`]：收词判据、小写化规则、首词排序键任一变了就要 +1。指纹进文件名，
+/// +1 即换新文件，旧的由保留上限清走。
 ///
-/// 历史：
+/// 各版语义：
 /// - v1 = 初始（`text` 按空白切词、≥2 词才收、逐词 `lower()`、按首词字节序稳定排序）
 pub const ENGLISH_PHRASE_INDEX_TAG: &str = "english-phrase/v1";
 
@@ -755,650 +672,20 @@ pub fn dict_tag(lowercase_code: bool) -> &'static str {
 /// 注释库缓存的 tag。同理独立于词库解析：注释库用的是 `wind-reverse` 里那份精简解析器
 /// （只取 text/comment/code 三列），与 `codetable` 的 rime 解析各自演进。
 ///
-/// 历史：
+/// 各版语义：
 /// - v1 = 初始
-/// - v2 = 无 `...` 的裸表按 OpenCC 约定读（丢重复键的值首项、跳过 `---` 行）；同一份裸表
-///   解析结果变了，旧缓存须作废
+/// - v2 = 无 `...` 的裸表按 OpenCC 约定读（丢重复键的值首项、跳过 `---` 行）
 pub const COMMENT_TAG: &str = "comment/v2";
 
 /// emoji 扩展表缓存的 tag（`.wemj`，见 [`crate::emojidict`]）。
 ///
-/// ★ 必须与 [`COMMENT_TAG`] 分开，即便两者的骨架同源：本表的产出不只取决于源文件字节，
-/// 还取决于**繁→简归一表**——`TSCharactersDerived.octrie` 换一版，同样的
-/// `emoji_word.txt` 会解析出不同的键。归一表因此也要作为「源」参与指纹计算
-/// （调用方把它一并传进 `sources`），否则 OpenCC 数据升级后旧缓存会被永久复用。
+/// 与 [`COMMENT_TAG`] 分开：本表产出还取决于繁→简归一表（`TSCharactersDerived.octrie`），
+/// 调用方须把它一并传进 `sources`，否则 OpenCC 数据升级后旧缓存会被永久复用。
 ///
-/// 历史：
+/// 各版语义：
 /// - v1 = 初始（丢值首项 + 逐字繁→简归一 + 同键合并保序去重）
 pub const EMOJI_TAG: &str = "emoji/v1";
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    fn tmp(name: &str, content: &[u8]) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("wind_fp_test_{name}"));
-        let mut f = std::fs::File::create(&p).unwrap();
-        f.write_all(content).unwrap();
-        // 清掉上轮可能残留的指纹 sidecar，确保固定 temp 路径下测试可重复（否则
-        // 上次 write_cache_fp 写的 `<p>.fp` 会让本轮「未写指纹应不新鲜」误判为新鲜）。
-        for ext in [".fp", ".st"] {
-            let mut side = p.clone().into_os_string();
-            side.push(ext);
-            let _ = std::fs::remove_file(side);
-        }
-        p
-    }
-
-    /// 语义版本参与指纹：源内容不变、但解析语义版本变了，缓存必须失效。
-    /// （否则解析器修复对存量用户静默不生效——本项目真实踩过。）
-    #[test]
-    fn parse_semantics_version_participates_in_fingerprint() {
-        let src = tmp("semver_src.txt", b"same content");
-        let fp_now = fingerprint(&[&src], "t").unwrap();
-        // 复算一份「仅版本号不同」的指纹：与 fingerprint() 严格同构（含 tag 部分），
-        // 只把版本 +1——否则差异可能来自别处，测试就名不副实了。
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        h.write_u32(PARSE_SEMANTICS_VERSION + 1);
-        h.write(b"t");
-        h.write_u8(0xfe);
-        let data = std::fs::read(&src).unwrap();
-        h.write(src.file_name().unwrap().to_string_lossy().as_bytes());
-        h.write_u64(data.len() as u64);
-        h.write(&data);
-        h.write_u8(0xff);
-        let fp_other = format!("{:016x}", h.finish());
-        assert_ne!(
-            fp_now, fp_other,
-            "同样的源内容，语义版本不同必须得到不同指纹"
-        );
-    }
-
-    /// tag 参与指纹：同一份源、不同解析方式（如 english 词库的 code 小写化）
-    /// 必须落到不同指纹，否则切换 dict_type 会永久复用大小写错误的缓存。
-    #[test]
-    fn tag_participates_in_fingerprint() {
-        let src = tmp("tag_src.txt", b"same content");
-        let raw = fingerprint(&[&src], dict_tag(false)).unwrap();
-        let lower = fingerprint(&[&src], dict_tag(true)).unwrap();
-        assert_ne!(raw, lower, "lowercase 与否必须得到不同指纹");
-        assert_ne!(
-            raw,
-            fingerprint(&[&src], COMMENT_TAG).unwrap(),
-            "不同种类缓存必须得到不同指纹"
-        );
-
-        // 端到端：用 raw tag 写的指纹，不该被 lowercase tag 判为新鲜
-        let cache = tmp("tag_src.cache", b"<built>");
-        write_cache_fp(&cache, &[&src], dict_tag(false));
-        assert!(cache_is_fresh(&cache, &[&src], dict_tag(false)));
-        assert!(
-            !cache_is_fresh(&cache, &[&src], dict_tag(true)),
-            "tag 不一致时必须判定为不新鲜"
-        );
-    }
-
-    /// ⚠️ 回归：**跨读缓冲区边界的大文件，流式哈希必须与整读等价**。
-    ///
-    /// `fingerprint` 从 `std::fs::read` 整读改为 64 KB 分块流式（峰值 11.6 MB → 1.5 MB），
-    /// 而本模块其余用例的源文件都只有几十字节，**只走得到单块路径**——分块拼接一旦写错
-    /// （少喂尾块、多喂一次、长度字段错位），小文件全都照常通过，真实词库（base.dict.yaml
-    /// 近 10 MB）却会静默换指纹，表现为**全部存量缓存一次性失效、每次启动重建几十秒**。
-    ///
-    /// 三个尺寸分别压住：恰好一块、块边界 ±1、多块且尾块不满。
-    #[test]
-    fn streaming_hash_matches_whole_read_across_chunk_boundaries() {
-        for (label, size) in [
-            ("恰好一块", HASH_CHUNK_SIZE),
-            ("一块少一字节", HASH_CHUNK_SIZE - 1),
-            ("一块多一字节", HASH_CHUNK_SIZE + 1),
-            ("多块且尾块不满", HASH_CHUNK_SIZE * 3 + 12345),
-        ] {
-            // 内容刻意非均质：全同字节会让「块顺序颠倒」之类的错误照样通过。
-            let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let src = tmp(&format!("chunk_{size}.bin"), &content);
-
-            // 参考值：按改动前的整读方式逐字节复算，与 fingerprint() 严格同构。
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            h.write_u32(PARSE_SEMANTICS_VERSION);
-            h.write(b"t");
-            h.write_u8(0xfe);
-            h.write(src.file_name().unwrap().to_string_lossy().as_bytes());
-            h.write_u8(1);
-            h.write_u64(content.len() as u64);
-            h.write(&content);
-            h.write_u8(0xff);
-            let whole_read = format!("{:016x}", h.finish());
-
-            assert_eq!(
-                fingerprint(&[&src], "t").unwrap(),
-                whole_read,
-                "{label}（{size} 字节）：流式哈希与整读结果必须一致，否则存量缓存全体失效"
-            );
-            let _ = std::fs::remove_file(&src);
-        }
-    }
-
-    #[test]
-    fn fresh_only_when_content_matches() {
-        let src = tmp("src.txt", b"hello dict");
-        let cache = tmp("src.cache", b"<built>");
-        // 未写指纹 → 不新鲜
-        assert!(!cache_is_fresh(&cache, &[&src], "t"));
-        // 写指纹后 → 新鲜
-        write_cache_fp(&cache, &[&src], "t");
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-    }
-
-    /// ⚠️ 回归：**源文件稳定缺失时，缓存必须照常可复用**。
-    ///
-    /// 真机现场（2026-08-24，feihuzj2 方案）：11 个词库里 `feihuzj2_extra_gr.dict.yaml`
-    /// 不存在（用户/安装目录均无），而它 `default_enabled = true` 故仍进 `sources`。
-    /// 旧实现 `std::fs::read(p).ok()?` 让整份指纹变 `None` ⇒ `.fp` 永不写、
-    /// `cache_is_fresh` 恒 false ⇒ `combined.wdat` **每次引擎重建都要重算 30 秒**。
-    /// 磁盘上「其余词库 `.fp` 都在、唯独 combined 没有」是该故障唯一的外部指纹。
-    ///
-    /// 三条断言对应三种状态迁移，缺一条这个 bug 都可能以另一种形态回来。
-    #[test]
-    fn absent_source_is_hashable_and_reappearing_invalidates() {
-        let present = tmp("absent_src_present.txt", b"hello");
-        let absent = std::env::temp_dir().join("wind_fp_test_absent_then_added");
-        let _ = std::fs::remove_file(&absent);
-
-        // ① 缺失不再毒化指纹——能算出来，才谈得上缓存。
-        let fp_absent =
-            fingerprint(&[&present, &absent], "t").expect("源稳定缺失应能算出指纹，而不是整份失败");
-
-        // ② 端到端：一直缺 → 指纹稳定 → 缓存可复用（这是修复的核心收益）。
-        let cache = tmp("absent_src.cache", b"<built>");
-        write_cache_fp(&cache, &[&present, &absent], "t");
-        assert!(
-            cache_is_fresh(&cache, &[&present, &absent], "t"),
-            "源稳定缺失时缓存必须可复用，否则就是那个 30 秒重建的 bug"
-        );
-
-        // ③ 缺失的文件后来被补上 → 指纹必须改变，否则新词库静默不生效。
-        //    （这正是「直接把缺失源剔除出指纹输入」那种修法会漏掉的一面。）
-        std::fs::write(&absent, b"now i exist").unwrap();
-        let fp_present = fingerprint(&[&present, &absent], "t").unwrap();
-        assert_ne!(
-            fp_absent, fp_present,
-            "文件从无到有必须让指纹改变，缓存才会正确失效"
-        );
-        assert!(!cache_is_fresh(&cache, &[&present, &absent], "t"));
-
-        let _ = std::fs::remove_file(&absent);
-    }
-
-    /// 非 NotFound 的 IO 错误仍须强制重建：那是「读不出来」，不是「不存在」。
-    /// 用目录冒充文件来制造一个稳定的非 NotFound 错误（读目录必失败，且跨平台可复现）。
-    #[test]
-    fn unreadable_non_missing_source_still_forces_rebuild() {
-        let dir_as_src = std::env::temp_dir().join("wind_fp_test_dir_as_source");
-        std::fs::create_dir_all(&dir_as_src).unwrap();
-        assert!(
-            fingerprint(&[&dir_as_src], "t").is_none(),
-            "读取失败（非 NotFound）必须让指纹失败，不能固化进哈希"
-        );
-        let _ = std::fs::remove_dir_all(&dir_as_src);
-    }
-
-    #[test]
-    fn mtime_change_keeps_fresh_content_change_invalidates() {
-        let src = tmp("src2.txt", b"content A");
-        let cache = tmp("src2.cache", b"<built>");
-        write_cache_fp(&cache, &[&src], "t");
-        // 仅改 mtime（重写相同内容）→ 仍新鲜（这正是修复点）
-        std::fs::write(&src, b"content A").unwrap();
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        // 改内容 → 失效
-        std::fs::write(&src, b"content B").unwrap();
-        assert!(!cache_is_fresh(&cache, &[&src], "t"));
-    }
-
-    #[test]
-    fn missing_cache_not_fresh() {
-        let src = tmp("src3.txt", b"x");
-        let cache = std::env::temp_dir().join("wind_fp_test_nope.cache");
-        let _ = std::fs::remove_file(&cache);
-        assert!(!cache_is_fresh(&cache, &[&src], "t"));
-    }
-
-    /// 二级缓存摘要的三级回退各有确定取值，且**互不相等**——三者若有两个碰撞，
-    /// 「有指纹」与「只有文件」就会被当成同一状态。
-    #[test]
-    fn cache_digest_falls_back_in_three_distinguishable_levels() {
-        let src = tmp("digest_src.txt", b"payload");
-        let cache = tmp("digest.cache", b"<built>");
-        // ② 无 sidecar → sz:len:mtime
-        let by_meta = cache_digest(&cache);
-        assert!(
-            by_meta.starts_with("sz:"),
-            "无指纹应回退到 (长度, mtime): {by_meta}"
-        );
-        // ① 有 sidecar → fp:<hash>，且优先于 ②
-        write_cache_fp(&cache, &[&src], "t");
-        let by_fp = cache_digest(&cache);
-        assert!(by_fp.starts_with("fp:"), "有指纹时必须优先取指纹: {by_fp}");
-        assert_ne!(by_fp, by_meta);
-        // ③ 文件不在 → absent
-        let gone = std::env::temp_dir().join("wind_fp_test_digest_absent");
-        let _ = std::fs::remove_file(&gone);
-        let mut side = gone.clone().into_os_string();
-        side.push(".fp");
-        let _ = std::fs::remove_file(side);
-        assert_eq!(cache_digest(&gone), "absent");
-    }
-
-    /// 二级缓存端到端：摘要不变则复用，任一摘要变了/顺序变了/tag 变了都必须失效。
-    ///
-    /// 顺序那条尤其要紧：反查索引的内容依赖词库次序（同词多码的排列），
-    /// 只把摘要当无序集合会让「调整扩展库顺序」静默复用错误索引。
-    #[test]
-    fn derived_cache_tracks_digests_order_and_tag() {
-        let cache = tmp("derived.cache", b"<index>");
-        let a = "fp:aaaaaaaaaaaaaaaa".to_string();
-        let b = "fp:bbbbbbbbbbbbbbbb".to_string();
-
-        write_derived_cache_fp(&cache, &[a.clone(), b.clone()], REVERSE_INDEX_TAG);
-        assert!(derived_cache_is_fresh(
-            &cache,
-            &[a.clone(), b.clone()],
-            REVERSE_INDEX_TAG
-        ));
-        // 某个词库变了
-        let b2 = "fp:cccccccccccccccc".to_string();
-        assert!(!derived_cache_is_fresh(
-            &cache,
-            &[a.clone(), b2],
-            REVERSE_INDEX_TAG
-        ));
-        // 顺序变了
-        assert!(!derived_cache_is_fresh(
-            &cache,
-            &[b.clone(), a.clone()],
-            REVERSE_INDEX_TAG
-        ));
-        // 少了一个词库
-        assert!(!derived_cache_is_fresh(
-            &cache,
-            std::slice::from_ref(&a),
-            REVERSE_INDEX_TAG
-        ));
-        // tag 变了（格式/语义升级）。刻意用一个**不可能成为真实 tag** 的串——
-        // 写成「下一个版本号」的话，`REVERSE_INDEX_TAG` 升版那天这条会静默变成
-        // 「拿同一个 tag 比同一个 tag」，从此恒真。（本测试已经这么绊过一次。）
-        assert!(!derived_cache_is_fresh(
-            &cache,
-            &[a, b],
-            "reverse-index/<某个不同的 tag>"
-        ));
-    }
-
-    /// 二级缓存的「源缺失」是可哈希的稳定状态（`absent`），而**补上之后必须失效**。
-    /// 这是一级指纹那条 30 秒重建 bug 的同族形态，在二级上提前钉死。
-    #[test]
-    fn derived_cache_handles_absent_source_and_its_return() {
-        let cache = tmp("derived_absent.cache", b"<index>");
-        let present = "fp:1111111111111111".to_string();
-        write_derived_cache_fp(&cache, &[present.clone(), "absent".into()], "t");
-        assert!(
-            derived_cache_is_fresh(&cache, &[present.clone(), "absent".into()], "t"),
-            "源稳定缺失时二级缓存必须可复用"
-        );
-        assert!(
-            !derived_cache_is_fresh(&cache, &[present, "fp:2222222222222222".into()], "t"),
-            "缺失的源后来出现，必须让缓存失效"
-        );
-    }
-
-    // ───────────── S1：状态 sidecar 快路径（docs/design/system-dict-cache-improvements.md） ─────────────
-
-    /// 把文件 mtime 设成一个确定值，并保证与当前值不同（秒级粒度的文件系统也能区分）。
-    fn set_mtime(p: &Path, secs_from_epoch: u64) {
-        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_from_epoch);
-        std::fs::File::options()
-            .write(true)
-            .open(p)
-            .unwrap()
-            .set_modified(t)
-            .unwrap();
-    }
-
-    fn mtime_of(p: &Path) -> std::time::SystemTime {
-        std::fs::metadata(p).unwrap().modified().unwrap()
-    }
-
-    /// 快路径：源没动就不算全量指纹。证据是 `FULL_HASHES` 计数不增加——比「换内容、回拨
-    /// mtime」那种证法可靠：Unix 上任何写入都会推进 ctime（用户态改不了），换内容再回拨
-    /// mtime 本来就该被识破。
-    #[test]
-    fn fast_path_skips_full_hash_when_stamps_unchanged() {
-        let hashes = || FULL_HASHES.with(|c| c.get());
-        let src = tmp("st_fast_src.txt", b"hello world");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_fast.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        assert!(st_sidecar(&cache).is_file(), "写指纹时应同时写 .st");
-
-        let c0 = hashes();
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        assert_eq!(hashes(), c0, "stamp 没变 ⇒ 两次判新鲜都不该算全量指纹");
-
-        // 去掉 .st 就没有快路径了，这时必须算一次。
-        std::fs::remove_file(st_sidecar(&cache)).unwrap();
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        assert_eq!(hashes(), c0 + 1, "没有 .st ⇒ 走全量");
-        assert!(st_sidecar(&cache).is_file(), "全量判新鲜后应回写 .st");
-    }
-
-    /// 只刷新 mtime、内容不变（scp / 部署 / git checkout 的日常）：仍新鲜，且 .st 被刷成
-    /// 新的 mtime，下一次又能走快路径。这正是「拒绝 mtime 判重建」与「用 mtime 跳过算指纹」
-    /// 的分界：前者误判多建一次库，后者误判只多算一次哈希。
-    #[test]
-    fn mtime_refresh_without_content_change_stays_fresh_and_refreshes_st() {
-        let src = tmp("st_touch_src.txt", b"content");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_touch.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        let st_before = std::fs::read_to_string(st_sidecar(&cache)).unwrap();
-
-        set_mtime(&src, 1_700_000_100);
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        let st_after = std::fs::read_to_string(st_sidecar(&cache)).unwrap();
-        assert_ne!(st_before, st_after, "mtime 变了，.st 应被重写");
-        assert!(st_after.contains(&format!(
-            "{}",
-            mtime_of(&src)
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
-        // 第三次：快路径直接命中，.st 不再变。
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        assert_eq!(
-            st_after,
-            std::fs::read_to_string(st_sidecar(&cache)).unwrap()
-        );
-    }
-
-    /// 内容变了、长度没变、mtime 变了（正常编辑）：不新鲜。
-    #[test]
-    fn content_change_with_new_mtime_is_stale() {
-        let src = tmp("st_edit_src.txt", b"aaaa");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_edit.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        std::fs::write(&src, b"bbbb").unwrap();
-        set_mtime(&src, 1_700_000_100);
-        assert!(!cache_is_fresh(&cache, &[&src], "t"));
-    }
-
-    /// .st 首行指纹与 .fp 不符（老版本重写过 .fp、或 .st 是上一代缓存留下的）：
-    /// 忽略 .st，走全量指纹。
-    #[test]
-    fn st_with_mismatched_fp_is_ignored() {
-        let src = tmp("st_mismatch_src.txt", b"hello world");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_mismatch.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        // 伪造：.fp 换成别的值（模拟老版本按另一套源重写了 .fp），.st 保持原样
-        std::fs::write(fp_sidecar(&cache), "0000000000000000").unwrap();
-        // 此时 stamp 全部匹配，但 .st 的指纹与 .fp 对不上 ⇒ 不能信 .st ⇒ 全量算出的
-        // 指纹也与伪造的 .fp 不等 ⇒ 不新鲜
-        assert!(!cache_is_fresh(&cache, &[&src], "t"));
-    }
-
-    /// 源的集合变了（多一个源）但旧的那个 stamp 没变：.st 的源数对不上 ⇒ 不走快路径。
-    #[test]
-    fn st_with_different_source_set_is_ignored() {
-        let src = tmp("st_set_a.txt", b"a");
-        set_mtime(&src, 1_700_000_000);
-        let extra = tmp("st_set_b.txt", b"b");
-        let cache = tmp("st_set.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        assert!(!cache_is_fresh(&cache, &[&src, &extra], "t"));
-    }
-
-    /// 缺失的源同样有 stamp（「不存在」是稳定状态）：一直缺则快路径照走；补上就失效。
-    #[test]
-    fn absent_source_has_stamp_and_appearing_invalidates() {
-        let src = tmp("st_absent_src.txt", b"x");
-        set_mtime(&src, 1_700_000_000);
-        let gone = std::env::temp_dir().join("wind_fp_test_st_absent_gone");
-        let _ = std::fs::remove_file(&gone);
-        let cache = tmp("st_absent.cache", b"cache");
-        write_cache_fp(&cache, &[&src, &gone], "t");
-        let st = std::fs::read_to_string(st_sidecar(&cache)).unwrap();
-        assert!(
-            st.lines().any(|l| l.ends_with("\t0")),
-            "缺失源应记为 0: {st}"
-        );
-        assert!(cache_is_fresh(&cache, &[&src, &gone], "t"));
-        std::fs::write(&gone, b"now here").unwrap();
-        assert!(!cache_is_fresh(&cache, &[&src, &gone], "t"));
-        let _ = std::fs::remove_file(&gone);
-    }
-
-    /// 快路径必须把 tag 绑进去：同一份源、同样的 stamp，换 tag 不能走快路径。
-    /// （现有 `tag_participates_in_fingerprint` 已覆盖此场景，本测试专门钉住 .st 这一层。）
-    #[test]
-    fn st_fast_path_is_bound_to_tag_and_semantics_version() {
-        let src = tmp("st_tag_src.txt", b"x");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_tag.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "dict/raw");
-        let stamps = source_stamps(&[&src]).unwrap();
-        let stored = std::fs::read_to_string(fp_sidecar(&cache)).unwrap();
-        assert!(st_matches(
-            &cache,
-            stored.trim(),
-            "dict/raw",
-            &[&src],
-            &stamps
-        ));
-        assert!(!st_matches(
-            &cache,
-            stored.trim(),
-            "dict/lowercase",
-            &[&src],
-            &stamps
-        ));
-        // 伪造一份「上一版解析器」写的 .st：只有版本号不同
-        let forged = std::fs::read_to_string(st_sidecar(&cache))
-            .unwrap()
-            .replacen(
-                &format!("v{PARSE_SEMANTICS_VERSION}\t"),
-                &format!("v{}\t", PARSE_SEMANTICS_VERSION + 1),
-                1,
-            );
-        std::fs::write(st_sidecar(&cache), forged).unwrap();
-        assert!(!st_matches(
-            &cache,
-            stored.trim(),
-            "dict/raw",
-            &[&src],
-            &stamps
-        ));
-    }
-
-    /// 刚写入的源（mtime 在 racy 窗口内）不记 stamp，`.st` 不写；时间戳足够旧才写。
-    /// 否则同一 mtime 刻度内的第二次同长度写入会骗过快路径——
-    /// `mtime_change_keeps_fresh_content_change_invalidates` 正是那个现场。
-    #[test]
-    fn racy_recent_mtime_is_not_recorded() {
-        let src = tmp("st_racy_src.txt", b"fresh"); // mtime = 现在
-        let cache = tmp("st_racy.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        assert!(fp_sidecar(&cache).is_file());
-        assert!(!st_sidecar(&cache).is_file(), "racy 窗口内不该写 .st");
-        assert!(cache_is_fresh(&cache, &[&src], "t"), "全量指纹仍判新鲜");
-        assert!(!st_sidecar(&cache).is_file(), "判新鲜那次同样不该写 .st");
-
-        set_mtime(&src, 1_700_000_000); // 把时间戳拨旧 ⇒ 不再 racy
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        assert!(st_sidecar(&cache).is_file(), "时间戳足够旧后才写 .st");
-    }
-
-    // ───────────── S2：内容寻址槽位 ─────────────
-
-    /// 槽位 + 指纹 → `<stem>-<fp12>.<ext>`；多段扩展名只切最后一段；无扩展名也能工作。
-    #[test]
-    fn slot_content_path_keeps_stem_and_last_extension() {
-        let fp = "0123456789abcdef";
-        assert_eq!(
-            slot_content_path(Path::new("/c/ns/x.wdat"), fp),
-            PathBuf::from("/c/ns/x-0123456789ab.wdat")
-        );
-        assert_eq!(
-            slot_content_path(Path::new("/c/ns/rime_frost.merged.wdat"), fp),
-            PathBuf::from("/c/ns/rime_frost.merged-0123456789ab.wdat")
-        );
-        assert_eq!(
-            slot_content_path(Path::new("/c/ns/noext"), fp),
-            PathBuf::from("/c/ns/noext-0123456789ab")
-        );
-    }
-
-    /// 解析槽位指纹：首次全量算并写 `.st`（源不 racy 时）；第二次走 `.st` 快路径得到同一个
-    /// 指纹；源内容变了得到另一个指纹。
-    #[test]
-    fn resolve_slot_fp_is_stable_and_tracks_content() {
-        let src = tmp("slot_src.txt", b"alpha");
-        set_mtime(&src, 1_700_000_000);
-        let slot = std::env::temp_dir().join("wind_fp_test_slot.wdat");
-        let _ = std::fs::remove_file(st_sidecar(&slot));
-        let fp1 = resolve_slot_fp(&slot, &[&src], "t").unwrap();
-        assert_eq!(fp1.len(), 16);
-        assert!(st_sidecar(&slot).is_file(), "不 racy 的源应写 .st");
-        assert_eq!(resolve_slot_fp(&slot, &[&src], "t").unwrap(), fp1);
-        assert_ne!(resolve_slot_fp(&slot, &[&src], "other-tag").unwrap(), fp1);
-
-        std::fs::write(&src, b"beta!").unwrap(); // 同长度
-        set_mtime(&src, 1_700_000_100);
-        assert_ne!(resolve_slot_fp(&slot, &[&src], "t").unwrap(), fp1);
-    }
-
-    /// 同槽位只留最近 `keep` 份：`current` 恒保留；旧式非寻址文件及其 `.fp` 清掉；
-    /// 别的槽位（前缀相同但 stem 不同）与非变体文件不碰。
-    #[test]
-    fn prune_slot_keeps_current_plus_newest_and_removes_legacy() {
-        let dir = std::env::temp_dir().join(format!("wind_fp_prune_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let slot = dir.join("x.wdat");
-        let mk = |name: &str, secs: u64| {
-            let p = dir.join(name);
-            std::fs::write(&p, b"v").unwrap();
-            set_mtime(&p, secs);
-            p
-        };
-        let cur = mk("x-aaaaaaaaaaaa.wdat", 1_700_000_300);
-        mk("x-aaaaaaaaaaaa.wdat.fp", 1_700_000_300);
-        let newer = mk("x-bbbbbbbbbbbb.wdat", 1_700_000_200);
-        let older = mk("x-cccccccccccc.wdat", 1_700_000_100);
-        mk("x-cccccccccccc.wdat.fp", 1_700_000_100);
-        let legacy = mk("x.wdat", 1_700_000_400);
-        let legacy_fp = mk("x.wdat.fp", 1_700_000_400);
-        let other_slot = mk("x_extra-dddddddddddd.wdat", 1_700_000_050);
-        let st = mk("x.wdat.st", 1_700_000_400);
-        let foreign = mk("x-notahexfp.wdat", 1_700_000_000);
-
-        prune_slot(&slot, &cur, 2);
-
-        assert!(cur.is_file(), "current 恒保留");
-        assert!(dir.join("x-aaaaaaaaaaaa.wdat.fp").is_file());
-        assert!(newer.is_file(), "keep=2：current 之外再留最新的一份");
-        assert!(!older.is_file(), "第三份应被清");
-        assert!(
-            !dir.join("x-cccccccccccc.wdat.fp").is_file(),
-            "连同它的 .fp"
-        );
-        assert!(
-            !legacy.is_file() && !legacy_fp.is_file(),
-            "旧式文件与 .fp 清掉"
-        );
-        assert!(other_slot.is_file(), "别的槽位不碰");
-        assert!(st.is_file(), ".st 不碰");
-        assert!(foreign.is_file(), "非十六进制指纹形态的文件不碰");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 被截断、被多写了一行的 `.st` 都不能走快路径。
-    #[test]
-    fn truncated_or_overlong_st_is_ignored() {
-        let src = tmp("st_trunc_src.txt", b"hello world");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_trunc.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        let good = std::fs::read_to_string(st_sidecar(&cache)).unwrap();
-        let stamps = source_stamps(&[&src]).unwrap();
-        let fp = std::fs::read_to_string(fp_sidecar(&cache)).unwrap();
-        assert!(st_matches(&cache, fp.trim(), "t", &[&src], &stamps));
-
-        // 截断：最后一行只剩一半
-        std::fs::write(st_sidecar(&cache), &good[..good.len() - 5]).unwrap();
-        assert!(!st_matches(&cache, fp.trim(), "t", &[&src], &stamps));
-        // 多一行：按另一组源写的
-        std::fs::write(st_sidecar(&cache), format!("{good}extra.txt\t0\n")).unwrap();
-        assert!(!st_matches(&cache, fp.trim(), "t", &[&src], &stamps));
-    }
-
-    /// racy 的基准是取 stamp **之前**的时刻：哈希期间无论过去多久，取 stamp 那一刻起
-    /// 2 秒内的 mtime 都算 racy。
-    #[test]
-    fn racy_basis_is_the_moment_before_stamping() {
-        let now = std::time::SystemTime::now();
-        let secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let src = tmp("st_basis_src.txt", b"x");
-        set_mtime(&src, secs - 1); // 距 basis 1 秒：在窗口内
-        let stamps = source_stamps(&[&src]).unwrap();
-        assert!(stamps_are_racy(&stamps, now), "距基准 1 秒应算 racy");
-        // 哈希「花了」10 秒：若错用哈希后的时刻作基准，就会判成不 racy
-        let later = now + std::time::Duration::from_secs(10);
-        assert!(
-            !stamps_are_racy(&stamps, later),
-            "前提：换成之后的时刻就判不出来"
-        );
-        set_mtime(&src, secs - 10);
-        let stamps = source_stamps(&[&src]).unwrap();
-        assert!(!stamps_are_racy(&stamps, now), "距基准 10 秒不算 racy");
-    }
-
-    /// Unix 上换文件（rename 进来的新 inode）即使 len 与 mtime 都一样也不走快路径。
-    /// 注意 rename 与 `set_mtime` 本身都会推进 ctime，所以本用例单靠 ctime 也会红——它守的
-    /// 是「换文件即失效」这条可观测行为，不是 ino 字段单独的作用。
-    #[cfg(unix)]
-    #[test]
-    fn replacing_the_file_invalidates_fast_path() {
-        let src = tmp("st_ino_src.txt", b"hello world");
-        set_mtime(&src, 1_700_000_000);
-        let cache = tmp("st_ino.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        assert!(cache_is_fresh(&cache, &[&src], "t"));
-        // 另建一个文件再 rename 过去：新 inode，内容等长不同，mtime 回拨到一样
-        let tmp_new = std::env::temp_dir().join("wind_fp_test_st_ino_new.txt");
-        std::fs::write(&tmp_new, b"HELLO WORLD").unwrap();
-        std::fs::rename(&tmp_new, &src).unwrap();
-        set_mtime(&src, 1_700_000_000);
-        assert!(
-            !cache_is_fresh(&cache, &[&src], "t"),
-            "inode 变了必须读内容"
-        );
-    }
-
-    /// 删指纹 sidecar 时 .st 一起删，免得下一代缓存捡到上一代的 stamp。
-    #[test]
-    fn remove_cache_fp_removes_st_too() {
-        let src = tmp("st_rm_src.txt", b"x");
-        set_mtime(&src, 1_700_000_000); // 不 racy，才会写 .st
-        let cache = tmp("st_rm.cache", b"cache");
-        write_cache_fp(&cache, &[&src], "t");
-        assert!(st_sidecar(&cache).is_file());
-        remove_cache_fp(&cache);
-        assert!(!st_sidecar(&cache).is_file());
-        assert!(!fp_sidecar(&cache).is_file());
-    }
-}
+#[path = "cache_fp_tests.rs"]
+mod tests;

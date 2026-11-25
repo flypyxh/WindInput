@@ -18,9 +18,8 @@ use wind_theme::schema::Dim;
 
 /// 阴影蒙版缓存键：(盒宽, 盒高, 圆角, 模糊, 亚像素相位 x, 亚像素相位 y)。
 ///
-/// 各项量化到 1/4 px：阴影经高斯模糊后，1/4 px 的几何差异不可见，而量化能吸收
-/// 浮点噪音，让几何不变的相邻帧稳定命中——否则 `spread`/`radius` 经 DPI 换算后的
-/// 末位抖动就足以让缓存永不命中，白付一次哈希。
+/// 各项量化到 1/4 px：模糊后不可见，而量化能吸收 DPI 换算的浮点噪音，让几何不变的
+/// 相邻帧稳定命中。
 type ShadowKey = (i32, i32, i32, i32, i32, i32);
 
 /// 蒙版量化因子（1/4 px）。
@@ -32,9 +31,8 @@ const SHADOW_CACHE_CAP: usize = 32;
 /// 阴影蒙版缓存：蒙版表 + 最后取用时刻（闲置回收与图片缓存同一个
 /// [`crate::image_cache::IDLE_EVICT_AFTER`]，设计 `docs/design/memory-footprint.md` §7）。
 ///
-/// 条数上限挡住「涨到多高」（32 条，满了整体清），挡不住「不用了也不落」：候选窗宽度几乎
-/// 每帧在变、每个宽度一条，打一阵字就停在十几到三十几条（推断：出厂主题 blur 8，1x 横排
-/// 一条约 80 KB、1.5x 竖排约 250 KB ⇒ 满表 2.7–8 MB），不打字时一直占着。
+/// 条数上限只挡住「涨到多高」，挡不住「不用了也不落」（候选窗宽度几乎每帧在变、每个宽度
+/// 一条），故另有闲置回收。
 #[derive(Default)]
 struct ShadowCache {
     masks: HashMap<ShadowKey, ShadowMask>,
@@ -57,12 +55,8 @@ thread_local! {
 
     /// 阴影蒙版缓存（UI 单线程，跨帧复用）。
     ///
-    /// 缓存 **alpha 蒙版而非着色后的像素**：蒙版只由几何决定、与阴影颜色无关，于是
-    /// 主题明暗切换、阴影调色都不会让它失效，内存也只要 1/4（1 字节/像素 vs BGRA）。
-    ///
-    /// 这层缓存省掉的是每帧 3 趟可分离方框模糊——400×120 的窗口配 blur=8，临时缓冲
-    /// 约 460×180，三轮双向模糊就是 ~50 万像素的 6 遍扫描，而候选窗在一次输入过程中
-    /// 尺寸高度重复（同码长、同候选数），几乎帧帧都在重算同一张图。
+    /// 缓存 alpha 蒙版而非着色后的像素：蒙版只由几何决定，换色不失效，内存也只要 1/4。
+    /// 省掉的是每帧 3 趟可分离方框模糊，而候选窗尺寸在输入过程中高度重复。
     static SHADOW_CACHE: RefCell<ShadowCache> = RefCell::new(ShadowCache::default());
 }
 
@@ -262,7 +256,7 @@ fn swap_paint_caches(c: &mut PaintCaches) {
     SHADOW_CACHE.with(|s| std::mem::swap(&mut *s.borrow_mut(), &mut c.shadow));
 }
 
-/// 在一套**临时**的图片 / 阴影缓存里跑 `f`，跑完丢掉、换回原来那套。
+/// 在一套临时的图片 / 阴影缓存里跑 `f`，跑完丢掉、换回原来那套。
 ///
 /// 给一次性出图（设置端预览）用：它画的是别的主题、甚至临时目录里的主题，进了实时窗口
 /// 那套线程局部缓存，大图会触发超预算整体清空（连实时窗口的源图与图集一起），临时路径
@@ -403,11 +397,9 @@ impl Default for ImagePlace {
 
 /// 定位图（背景图定位块 / 覆盖图）单边像素上限。
 ///
-/// 尺寸来自主题（市场主题不可信）：只给一维按原图比例推算、或不给尺寸取原图 × DPI，都能
-/// 推出天文数字（1×100000 的图写 w=20 → h=2,000,000），而填充位图按这个尺寸整块分配。
-/// 定位图最终都裁到宿主内，宿主是候选窗 / 弹窗这一级（远小于此），截掉的部分本就看不见。
-/// 4096：200% 屏上 2048dp 的合法大图仍原样保留；单张最坏 4096² × 4B = 64 MiB，有界。
-/// 两维各自截（不保比例）——只有病态主题会碰到它，此时保住内存比保住比例要紧。
+/// 尺寸来自主题（不可信）：按原图比例推算可能推出天文数字，而填充位图按这个尺寸整块分配。
+/// 定位图最终裁到宿主内，截掉的部分本就看不见。4096 保留 200% 屏上 2048dp 的合法大图，
+/// 单张最坏 64 MiB。两维各自截、不保比例（只有病态主题会碰到）。
 const MAX_PLACED_EDGE: f32 = 4096.0;
 
 impl ImagePlace {
@@ -564,7 +556,7 @@ impl Rect {
     }
 }
 
-/// 左侧强调条参数（选中候选的竖条）。**覆盖层语义**：不参与 measure/布局，仅 paint 期
+/// 左侧强调条参数（选中候选的竖条）。覆盖层语义：不参与 measure/布局，仅 paint 期
 /// 在节点左内边距内绘制。四个字段里三个是 `f32`，故用具名结构体而非元组——位置写反
 /// 编译器抓不到。
 #[derive(Clone, Copy, Debug)]
@@ -581,7 +573,7 @@ pub struct LeftBar {
 /// 子树旋转方向（见 [`View::rot`]）。
 ///
 /// 做成枚举而不是两个 `bool`：`rotate_cw && rotate_ccw` 是无意义状态，枚举让它压根表达不出来。
-/// 只有 ±90° 两向——180° 用不到，加进来反而要求映射函数处理宽高**不**交换的情形。
+/// 只有 ±90° 两向——180° 用不到，加进来反而要求映射函数处理宽高不交换的情形。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Rot {
     /// 不旋转（绝大多数节点）。
@@ -589,7 +581,7 @@ pub enum Rot {
     None,
     /// 顺时针 90°：局部左上角落到屏幕右上角 ⇒ 一行从左到右的文字转成一列从上到下。
     Cw,
-    /// 逆时针 90°：局部左上角落到屏幕左下角。单独用没意义，它的用途是**抵消**外层的
+    /// 逆时针 90°：局部左上角落到屏幕左下角。单独用没意义，它的用途是抵消外层的
     /// [`Rot::Cw`]，把整项旋转里的单个字扶正（对联式竖排）。
     Ccw,
 }
@@ -603,9 +595,8 @@ pub struct View {
     pub cross_align: Align,
     /// 主轴对齐：内容总长小于容器主轴长度时，富余空间落在哪一端（默认 `Start`＝末端留空）。
     ///
-    /// 只有存在富余时才有意义，而容器的主轴长度本就由内容决定——富余只可能来自
-    /// `fixed_h`/`min_h`（Column）或 `fixed_w`/`min_w`（Row）。候选窗根容器上翻显示时
-    /// 用 `End`：窗口最小高度撑出的空白必须落在**顶部**，否则贴光标的底边被空白顶开。
+    /// 富余只可能来自 `fixed_h`/`min_h`（Column）或 `fixed_w`/`min_w`（Row）。候选窗根容器
+    /// 上翻时用 `End`：空白落在顶部，贴光标的底边才不会被顶开。
     ///
     /// 与 `grow` 互斥：有 `grow` 子节点时富余已被它们吸收，本项自然失效。
     pub main_align: Align,
@@ -613,20 +604,14 @@ pub struct View {
     pub fixed_h: Option<f32>,
     /// 宽度下限（设备像素）：测得宽度不足时抬到此值，超出则按内容。
     ///
-    /// 与 `fixed_w` 的区别是「不得窄于」而非「就是这么宽」——候选窗的根容器用它施加
-    /// 窗口最小宽度（`ui.candidate.min_window_width_horizontal` / `_vertical`，dp×scale）。
+    /// 与 `fixed_w` 的区别是「不得窄于」而非「就是这么宽」，候选窗根容器用它施加窗口最小宽度。
     ///
-    /// ★ 撑出的富余空间**在 `arrange` 阶段**才分配：`fill_cross` 子节点会跟着撑到新的
-    /// 内容宽（竖排候选高亮因此自动铺满窗口），非 `fill_cross` 的子节点按 `cross_align`
-    /// 落位（默认 `Start`＝左对齐，右侧留空）。故调用方给根容器加下限即可，无需逐层接线。
+    /// 撑出的富余在 `arrange` 阶段分配：`fill_cross` 子节点跟着撑满，其余按 `cross_align`
+    /// 落位，故只需给根容器加下限。
     pub min_w: Option<f32>,
     /// 高度下限（设备像素）：测得高度不足时抬到此值，超出则按内容。与 `min_w` 对称。
     ///
-    /// 候选窗根容器用它施加窗口最小高度（`ui.candidate.min_window_height_*`，dp×scale）。
-    ///
-    /// ★ 富余高度**默认落在主轴末端**（Column 的底部）：子节点从 `cy0` 依次排下，排完
-    /// 即止。要把富余顶到另一端，在首个子节点位置插一个 `grow` 节点（`View::spacer()`）
-    /// 吸收——候选窗上翻时正是这么做的，否则贴光标的底边会被空白顶开。
+    /// 富余高度默认落在主轴末端，要落到另一端用 [`Self::main_align`] 或 `grow` 节点。
     pub min_h: Option<f32>,
     pub bg: Option<[u8; 4]>,
     pub corner_radius: f32,
@@ -636,9 +621,8 @@ pub struct View {
     pub text_color: [u8; 4],
     /// 分段颜色：按字节区间覆盖 `text_color`。空 = 整段 `text_color`（出厂路径）。
     ///
-    /// **只在 paint 消费，不参与 measure/布局**，理由同 [`View::caret_at`]：着色边界若拆成
-    /// 多个节点各自测量，`measure(a+b) != measure(a)+measure(b)`，宽度会随颜色边界抖动。
-    /// 整串一次整形，颜色只作用于绘制（见 [`TextBackend::draw_runs`]）。
+    /// 只在 paint 消费，不参与 measure，理由同 [`View::caret_at`]：拆成多个节点各自测量
+    /// 会让宽度随颜色边界抖动。见 [`TextBackend::draw_runs`]。
     pub color_runs: Vec<ColorRun>,
     /// 文本字号（设备像素）；None=用渲染器基准字号。序号/注释按相对偏移设具体值。
     pub font_size: Option<f32>,
@@ -649,10 +633,8 @@ pub struct View {
     pub text_align: Align,
     /// 文本内插入符位置（字节偏移，恒在字符边界；`None`=不画）。
     ///
-    /// **覆盖层语义**：只在 paint 阶段按偏移画一条竖线，**不参与 measure/布局**——文本始终作为
-    /// 整串一次性整形，故宽度与光标位置无关。这是系统 IME 的做法；若改成把文本拆成
-    /// 「前半 + 竖线 + 后半」三节点，`measure(a+b) != measure(a)+measure(b)`（字距在拆分边界
-    /// 丢失、每段各自亚像素舍入），拆分点随光标移动 → 整串宽度抖动 → 字符位移。
+    /// 覆盖层语义：只在 paint 阶段按偏移画一条竖线，不参与 measure。文本整串一次整形，宽度
+    /// 与光标位置无关；拆成「前半 + 竖线 + 后半」会因字距与舍入让宽度随光标抖动。
     pub caret_at: Option<usize>,
     /// 插入符竖线宽度（像素；调用方按 DPI 缩放传入，[`View::caret_at`] 取整到整像素）。
     pub caret_w: f32,
@@ -672,16 +654,11 @@ pub struct View {
     /// 跨轴填充：在父容器排布时把本节点撑满父内容的跨轴尺寸（Column→宽度），
     /// 供其内部 spacer 实现右对齐（如 preedit 栏让模式标记贴右）。
     pub fill_cross: bool,
-    /// 把子树**裁到本节点的矩形内**：溢出的部分既不绘制，也不参与命中。
+    /// 把子树裁到本节点的矩形内：溢出的部分既不绘制，也不参与命中（滚动视口的地基）。
     ///
-    /// 这是滚动视口的地基——内容比容器宽时，超出的部分必须消失而不是画到容器外面。
-    /// 没有它，「按像素滚动」在本渲染器里做不了，只能退化成「按项取舍」（放得下几个
-    /// 画几个），那种做法在项宽不一时永远对不齐容器边缘。
-    ///
-    /// ⚠️ 实现是「画完把界外像素还原」，故**本节点自己的背景/边框不受裁剪**（它就是
-    /// 裁剪框，画在框上是对的），只裁子节点。
+    /// 实现是「画完把界外像素还原」，只裁子节点，本节点自己的背景/边框不受裁剪。
     pub clip: bool,
-    /// 把子树裁到本节点的**圆角轮廓**内（只处理四个圆角处）：子节点配直角（或圆角比本节点小）
+    /// 把子树裁到本节点的圆角轮廓内（只处理四个圆角处）：子节点配直角（或圆角比本节点小）
     /// 时，贴边的高亮不会在圆角外露出方角——候选窗据此做出「首尾随窗口大圆弧、内部直角填充」
     /// 的胶囊形态。与 [`Self::clip`] 的矩形裁剪互补，裁的是矩形里被圆角削掉的那四小块。
     ///
@@ -696,26 +673,15 @@ pub struct View {
     ///
     /// # 形态约束（只支持这一种，越界即 debug_assert）
     ///
-    /// 本节点必须是**恰好一个子节点、无自身装饰**的裸包裹层：背景/边框/图层一律挂在
-    /// 子节点上（它们会跟着一起转），本节点只负责坐标系变换。这样旋转的数学只有一处、
-    /// 且不必回答「装饰是转前画还是转后画」这个没有正确答案的问题。
+    /// 本节点必须是恰好一个子节点、无自身装饰的裸包裹层（越界即 debug_assert）：装饰挂在
+    /// 子节点上一起转，本节点只负责坐标系变换。
     ///
-    /// # 为什么是「临时缓冲双向旋转」而不是让文本后端转
+    /// 用临时缓冲双向旋转而不让文本后端转：后端变换只能转文字、转不了背景/边框；纯像素操作
+    /// 让各平台后端自动跟上。已知代价：每帧多一次后端表面重建。
     ///
-    /// ⛔ 走 DirectWrite 的 `SetCurrentTransform` 只能转**文字**，转不了背景/边框/序号圆圈；
-    /// 而且差分法回写的包围盒要在旋转空间重算，等于把已经稳定的合成路径再撬一遍。
-    /// 临时缓冲是纯像素操作 ⇒ macOS 的 CoreText 后端与 HostRender 的 SHM 帧路径自动跟上，
-    /// 不用各写一份。
-    ///
-    /// ⚠️ 已知代价：子树画进临时缓冲时文本后端的表面尺寸会与窗口尺寸交替，
-    /// 每帧多一次 `CreateBitmapRenderTarget`。真机若测出可观占比，再考虑把临时缓冲
-    /// 固定成窗口大小、子树画在其一角。
-    ///
-    /// # 两向都要，且允许嵌套
-    ///
-    /// 「文字直立的竖排」（对联式）正是**外层顺时针 + 每个字逆时针**：外层把一行拆成一列，
-    /// 内层把每个字转回正的。两次旋转都是无损的整像素搬运，且 [`View::paint_rotated`]
-    /// 会把底子搬进临时缓冲再搬回，嵌套时内层看到的仍是正确的背景（差分法合成要用它）。
+    /// 两向都要且允许嵌套：直立竖排是外层顺时针 + 每个字逆时针。[`View::paint_rotated`] 会把
+    /// 底子搬进临时缓冲再搬回，嵌套时内层看到的仍是正确的背景。
+    /// 设计见 `docs/design/mongolian-vertical-candidates.md` 的「渲染：临时缓冲双向旋转」。
     pub rot: Rot,
     // 计算结果
     mw: f32,
@@ -871,10 +837,8 @@ impl View {
             }
             None => 0,
         });
-        // ★ 取整到整设备像素**必须在这里**，不能指望绘制端。`fill_rounded` 用
-        // `snap_to_pixels` 按边界取整，那个算法只对**整数尺寸**保尺寸；传进去 1.5，
-        // 画出来的宽度会随 `frac(x)` 在 1px 与 2px 之间跳，而插入符的 x 随打字逐字移动
-        // ——竖线粗细就会一边打字一边闪。1.25/1.5 倍缩放下 `scale.max(1.0)` 正好是这种值。
+        // 取整到整设备像素必须在这里：`snap_to_pixels` 只对整数尺寸保尺寸，传 1.5 会让竖线
+        // 粗细随插入符移动在 1px 与 2px 之间闪。
         self.caret_w = width.round().max(1.0);
         self
     }
@@ -953,7 +917,7 @@ impl View {
         Self::rotated(Rot::Cw, inner)
     }
 
-    /// 逆时针版。用途只有一个：套在**已被外层顺时针旋转**的子树内部，把单个字扶正。
+    /// 逆时针版。用途只有一个：套在已被外层顺时针旋转的子树内部，把单个字扶正。
     pub fn rotated_ccw(inner: View) -> Self {
         Self::rotated(Rot::Ccw, inner)
     }
@@ -979,10 +943,8 @@ impl View {
 
     /// 本节点文本的排版样式（字号回退到渲染器基准字号）。
     ///
-    /// 三处用到它——measure、paint 里算水平对齐、caret 量前半段——过去各自重复
-    /// `(font_size.unwrap_or(base), font_weight.unwrap_or(0), family.as_deref())`
-    /// 这串取值。收成一处是因为**它们必须完全一致**：measure 与 paint 的样式一旦分叉，
-    /// 布局按一种宽度排、文字按另一种画，表现为文字整体偏移或超出节点框。
+    /// measure、paint 的水平对齐、caret 量前半段三处共用，必须完全一致：样式一分叉，
+    /// 文字会整体偏移或超出节点框。
     fn text_style(&self, tr: &dyn TextBackend) -> TextStyle<'_> {
         TextStyle {
             family: self.font_family.as_deref(),
@@ -998,7 +960,7 @@ impl View {
                 1,
                 "旋转节点必须恰好一个子节点（见 View::rot 的形态约束）"
             );
-            // 子树按**未旋转**测量，本节点对外交换宽高——这是整个旋转能力的支点：
+            // 子树按未旋转测量，本节点对外交换宽高——这是整个旋转能力的支点：
             // 排版、宽度预算、文字截断全都在未旋转的局部空间里跑，一行都不用改。
             let (cw, ch) = match self.children.first_mut() {
                 Some(c) => {
@@ -1070,7 +1032,7 @@ impl View {
             return;
         }
         if self.rot != Rot::None {
-            // 子树排在**局部未旋转坐标系**里、原点 (0,0)：paint 时它被画进一张同尺寸的
+            // 子树排在局部未旋转坐标系里、原点 (0,0)：paint 时它被画进一张同尺寸的
             // 临时缓冲，那张缓冲的左上角就是这个原点。命中矩形随后由 collect_hits 映射回屏幕。
             if let Some(c) = self.children.first_mut() {
                 let (ml, mt) = (c.margin.l, c.margin.t);
@@ -1185,7 +1147,7 @@ impl View {
 
     /// 整棵树逐节点的文本转储（每节点一行，按深度缩进），供渲染 golden 对拍。
     ///
-    /// 每行只列**与默认值不同**的字段（布局结果 `m`/`rect` 恒列）。手写而不 `#[derive(Debug)]`：
+    /// 每行只列与默认值不同的字段（布局结果 `m`/`rect` 恒列）。手写而不 `#[derive(Debug)]`：
     /// 派生输出会随新增字段整体变形，而 golden 要守的恰恰是「加了新能力、出厂路径的树逐字节
     /// 不变」——新字段取默认值时不出现，出厂路径的转储就与加字段前相同。
     #[cfg(any(test, feature = "test-util"))]
@@ -1258,11 +1220,10 @@ impl View {
 
     /// 旋转 90° 绘制子树（方向由 [`Self::rot`] 定）。
     ///
-    /// 三步：**把屏幕上那块底子逆向旋转搬进临时缓冲 → 子树照常画进去 → 正向旋转搬回**。
+    /// 三步：把屏幕上那块底子逆向旋转搬进临时缓冲 → 子树照常画进去 → 正向旋转搬回。
     ///
-    /// ★ 第一步不能省、更不能用「填透明」代替：文本后端的差分法合成要拿目标像素当背景做
-    /// 抗锯齿混合（`dwrite.rs` 步骤 1），底子不对文字边缘就会带上错误的混色；窗口的圆角、
-    /// 渐变、九宫格背景也都在那块底子里。搬进来再搬回去，这些全部原样保留。
+    /// 第一步不能省、也不能用「填透明」代替：文本后端的差分法合成要拿目标像素当背景做
+    /// 抗锯齿混合，窗口的圆角、渐变、九宫格背景也都在那块底子里。
     fn paint_rotated(&self, buf: &mut [u8], buf_w: u32, buf_h: u32, tr: &dyn TextBackend) {
         // 屏幕上的尺寸已是交换后的；局部空间把它交换回来。
         let rw = self.rect.w.round().max(0.0) as u32;
@@ -1283,15 +1244,15 @@ impl View {
 
     /// 收集所有 tag>=0 节点的绝对矩形 → (tag, rect)
     ///
-    /// ⚠️ 穿过 [`View::rot`] 节点时必须把子树的矩形从局部空间映射回屏幕空间——
-    /// 漏掉这一步的表现是「鼠标悬停/点击到相邻候选」，而画面完全正常，从现象反推不出成因。
+    /// 穿过 [`View::rot`] 节点时必须把子树的矩形从局部空间映射回屏幕空间，否则悬停/点击
+    /// 会落到相邻候选上。
     pub fn collect_hits(&self, out: &mut Vec<(i32, Rect)>) {
         self.collect_hits_clipped(out, None);
     }
 
     /// `clip` 是祖先施加的裁剪框（多层嵌套取交集）。
     ///
-    /// ★ 命中区必须与**看得见的部分**一致：被裁掉一半的标签只有露出来那半能点，
+    /// 命中区必须与看得见的部分一致：被裁掉一半的标签只有露出来那半能点，
     /// 否则鼠标会在容器外面的空白处「点到」一个不可见的控件。
     fn collect_hits_clipped(&self, out: &mut Vec<(i32, Rect)>, clip: Option<Rect>) {
         let visible = match clip {
@@ -1305,20 +1266,16 @@ impl View {
         }
         // 本节点完全在裁剪框外 ⇒ 不再往下走。
         //
-        // ⚠️ 这条剪枝的**前提**是「子节点画在父节点的矩形之内」。本仓有负 margin（软键盘
-        // 的关闭按钮就靠它溢出到面板边距里），一个节点完全出框、而它的子节点又被负 margin
-        // 拉回框内时，这里会漏掉那个子节点的命中区。之所以仍然剪枝：改成按 `subtree_bbox`
-        // 判断要对每个节点重算整棵子树（O(n²)），而「出框的父 + 回框的子」这种组合在
-        // clip 容器内没有出现过。**真要用，先把这条改掉，别指望它自己正确。**
+        // 前提是「子节点画在父节点的矩形之内」：负 margin 把子节点拉回框内时会漏掉其命中区。
+        // 按 `subtree_bbox` 判断要 O(n²)，而这种组合在 clip 容器内没有出现过；真要用，先改这条。
         if clip.is_some() && visible.is_none() {
             return;
         }
         let child_clip = if self.clip { visible } else { clip };
 
-        // 旋转节点：子树在**未旋转的局部空间**里收集，映射回屏幕空间之后才谈得上裁剪。
+        // 旋转节点：子树在未旋转的局部空间里收集，映射回屏幕空间之后才谈得上裁剪。
         //
-        // ★ 裁剪框是屏幕空间的矩形，拿去和局部空间的子矩形相交毫无意义，所以顺序只能是
-        // 「先 rotate_rect 回屏幕空间，再按 child_clip 裁」——两个能力就是在这一行会合的。
+        // 裁剪框在屏幕空间，故顺序只能是「先 rotate_rect 回屏幕空间，再按 child_clip 裁」。
         if self.rot != Rot::None {
             let mut local = Vec::new();
             for c in &self.children {
@@ -1427,8 +1384,7 @@ impl View {
         for layer in self.layers.iter().filter(|l| l.z < 0) {
             paint_layer(buf, buf_w, buf_h, r, layer);
         }
-        // 边框压在背景图与 z<0 层**之上**（与主题编辑器预览同序）。放在背景图之前的话，
-        // 带背景图的主题（窗口整体铺一张图）边框被图盖掉，预览里有、实机没有（t206）。
+        // 边框压在背景图与 z<0 层之上（与主题编辑器预览同序），否则会被整窗背景图盖掉。
         if let Some((bc, bw)) = self.border.filter(|_| !round_clip) {
             fill_ring(
                 buf,
@@ -1504,12 +1460,8 @@ impl View {
         }
         // 子节点。
         //
-        // ★ 裁剪用「画完还原界外像素」而不是给每个绘制函数加 clip 参数：底层那十来个
-        // `fill_*` / `TextBackend::draw` 各自逐像素写缓冲，逐个开洞既繁琐又漏一个就
-        // 前功尽弃。还原法只碰一次缓冲，且对**所有**绘制方式一视同仁——包括以后新加的。
-        //
-        // 代价是那块像素要画两遍（先被子节点覆盖，再还原），只在真正开了 clip 的节点上
-        // 发生，而它们本来就是少数。
+        // 裁剪用「画完还原界外像素」而不是给每个绘制函数加 clip 参数：对所有绘制方式（含以后
+        // 新加的）一视同仁。代价是那块像素画两遍，只在开了 clip 的少数节点上发生。
         if self.clip {
             let bbox = self.subtree_bbox();
             // 溢出区域为空 ⇒ 无需备份，直接画（绝大多数帧走这里：内容没超出）。
@@ -1771,12 +1723,8 @@ const KAPPA: f32 = 0.552_284_8;
 
 /// 抗锯齿纯色画笔。`color` 为直通 [R,G,B,A]。
 ///
-/// **R/B 在此交换**：BGRA 缓冲被当作 tiny-skia 的 RGBA Pixmap 直接渲染（零拷贝），
-/// 故传色时取 [B,G,R,A]，输出即合法的预乘 BGRA。这个约定原先在五处填充函数里各抄一遍，
-/// 抄漏一处就是红蓝互换的显示 bug，收敛到此处只留一个出错点。
-///
-/// `#[inline]`：调用点在逐帧绘制路径上，语义上仍是「就地构造一个 Paint」，不该因为抽函数
-/// 而多一次调用。
+/// R/B 在此交换：BGRA 缓冲被当作 tiny-skia 的 RGBA Pixmap 直接渲染（零拷贝），故传色时取
+/// [B,G,R,A]，输出即合法的预乘 BGRA。各填充函数都经这里取画笔，别各自交换。
 #[inline]
 fn aa_paint(color: [u8; 4]) -> Paint<'static> {
     let mut paint = Paint {
@@ -1787,16 +1735,10 @@ fn aa_paint(color: [u8; 4]) -> Paint<'static> {
     paint
 }
 
-/// 在缓冲区子区域填充圆角矩形：tiny-skia 抗锯齿填充 + 源覆盖混合。
-/// `color` 约定为直通 [R,G,B,A]；缓冲区按预乘 BGRA 维护（供 UpdateLayeredWindow）。
-///
-/// 关键技巧：把 BGRA 缓冲当作 tiny-skia 的"RGBA" Pixmap 直接渲染（零拷贝），
-/// 传色时交换 R/B（Color 取 [B,G,R,A]）。预乘 alpha 合成逐通道对称，故输出即合法 BGRA。
-/// 绘制背景填充图：从线程局部缓存取目标尺寸填充位图（BGRA 预乘），以 Pattern 填到圆角路径内。
 /// 绘制背景渐变：以 tiny-skia 线性/径向着色器填到圆角路径内（叠在底色之上、背景图之下）。
 ///
 /// 本文件的绘图基元一律豁免 `too_many_arguments`：参数是「缓冲 + 缓冲尺寸 + 几何 + 颜色」
-/// 这组固定形状，且都在逐帧绘制路径上——包成参数对象只是把同一批标量搬一遍。
+/// 这组固定形状，包成参数对象只是把同一批标量搬一遍。
 #[allow(clippy::too_many_arguments)]
 fn paint_bg_gradient(
     buf: &mut [u8],
@@ -1874,6 +1816,7 @@ fn paint_bg_gradient(
     );
 }
 
+/// 绘制背景填充图：从线程局部缓存取目标尺寸填充位图（BGRA 预乘），以 Pattern 填到圆角路径内。
 fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, img: &ViewImage) {
     if let Some(place) = &img.place {
         paint_placed_bg_image(buf, buf_w, buf_h, r, radius, img, place);
@@ -2006,7 +1949,7 @@ fn draw_clipped(
 
 /// `ViewImage` → 填充规格。
 ///
-/// 单拎出来是为了能直接测：这是主题数据走到光栅化前的**最后一环**，而绘制本身在单测里
+/// 单拎出来是为了能直接测：这是主题数据走到光栅化前的最后一环，而绘制本身在单测里
 /// 验不了。漏传一个字段的表现是「主题里配了却没效果」，上游每一层的测试都照样绿。
 fn fill_spec_of(img: &ViewImage) -> crate::image_cache::FillSpec {
     let px = |v: f32| v.round().max(0.0) as u32;
@@ -2089,21 +2032,20 @@ fn anchor_pos(anchor: &str, host: Rect, lw: f32, lh: f32) -> (f32, f32) {
 
 // ─────────────────── 90° 旋转：几何与像素搬运（纯函数）───────────────────
 //
-// 唯一的映射约定写在这里，三处（矩形映射、两次像素搬运）共用，**不得各写一遍**：
+// 唯一的映射约定写在这里，三处（矩形映射、两次像素搬运）共用，不得各写一遍：
 //
 //   局部缓冲宽 `cw`、高 `ch`；屏幕矩形宽 `rw = ch`、高 `rh = cw`（两向都交换宽高）。
 //   屏幕内偏移 (sx, sy) ← 局部 (lx, ly)：
 //     顺时针  `lx = sy`、`ly = ch - 1 - sx`
 //     逆时针  `lx = cw - 1 - sy`、`ly = sx`
 //
-// 直觉校验：局部左上角 (0,0) 顺时针落到屏幕**右上角**、逆时针落到屏幕**左下角**。
+// 直觉校验：局部左上角 (0,0) 顺时针落到屏幕右上角、逆时针落到屏幕左下角。
 // 于是一行从左到右的文字，顺时针转完是一列从上到下 —— 蒙古文要的就是这个。
 
 /// 局部矩形 → 屏幕矩形。`host` 是旋转节点在屏幕上的矩形（宽高已交换）。
 ///
-/// ★ 与 [`for_each_mapped`] 必须同源：这里给的是**连续**坐标（矩形四边），那里是
-/// **离散**像素中心，故此处不出现 `-1`。两者若各推一遍，命中区会整体偏一像素——
-/// 画面完全正常，只有点击落点不对，从现象反推不出成因。
+/// 与 [`for_each_mapped`] 必须同源：这里是连续坐标（矩形四边），那里是离散像素中心，故此处
+/// 不出现 `-1`。各推一遍会让命中区整体偏一像素。
 fn rotate_rect(rot: Rot, local: Rect, host: Rect) -> Rect {
     match rot {
         Rot::None => local,
@@ -2122,7 +2064,7 @@ fn rotate_rect(rot: Rot, local: Rect, host: Rect) -> Rect {
     }
 }
 
-/// 把屏幕上 `(ox, oy)` 起、`ch × cw` 大小的那块**逆向**搬进局部缓冲（旋转的逆变换）。
+/// 把屏幕上 `(ox, oy)` 起、`ch × cw` 大小的那块逆向搬进局部缓冲（旋转的逆变换）。
 /// 越界像素留零：调用方随后会把同一批坐标搬回去，越界的部分两头都不参与。
 #[allow(clippy::too_many_arguments)]
 fn blit_unrotate(
@@ -2141,7 +2083,7 @@ fn blit_unrotate(
     });
 }
 
-/// 把局部缓冲**正向**旋转 90° 写回屏幕 `(ox, oy)` 处。
+/// 把局部缓冲正向旋转 90° 写回屏幕 `(ox, oy)` 处。
 #[allow(clippy::too_many_arguments)]
 fn blit_rotate(
     rot: Rot,
@@ -2161,12 +2103,9 @@ fn blit_rotate(
 
 /// 遍历两个缓冲之间的对应像素，回调收到 `(屏幕字节下标, 局部字节下标)`。
 ///
-/// ★ 两次搬运共用它而不是各写一个双重循环：两处的坐标映射必须逐像素一致，否则
-/// 「搬进来的底子」与「搬回去的结果」错开一个像素——表现是文字边缘发虚且整体偏移一格，
-/// 而两段代码各自看都对。同 `dwrite.rs` 那条「测量与绘制向同一个 API 传不同参数」的教训。
+/// 两次搬运共用它：坐标映射必须逐像素一致，否则底子与结果错开一像素，文字边缘发虚。
 ///
-/// `Rot::None` 不产出任何像素：调用点都在 `rot != None` 的分支里，真走到这儿说明
-/// 上游漏判了，什么都不画比画错位置更容易发现。
+/// `Rot::None` 不产出任何像素：走到这儿说明上游漏判，什么都不画比画错位置更容易发现。
 #[allow(clippy::too_many_arguments)]
 fn for_each_mapped(
     rot: Rot,
@@ -2204,33 +2143,25 @@ fn for_each_mapped(
     }
 }
 
-/// 把浮点矩形对齐到像素网格：**四条边界各自取整**，而不是「位置 round、尺寸也 round」。
+/// 把浮点矩形对齐到像素网格：四条边界各自取整，而不是「位置 round、尺寸也 round」。
 ///
-/// 判据是相邻两个盒子既不留缝也不重叠。竖排候选里上一行的 `y + h` 恰好就是下一行的 `y`，
-/// 只有让这条**公共边界**在两边取整到同一个整数，它们才始终严丝合缝。
+/// 相邻两个盒子的公共边界在两边取整到同一个整数，才既不留缝也不重叠；分别 round 在非整数
+/// 倍 DPI 下会时而重叠、时而空出 1px。
 ///
-/// 分别 round 的老写法在整数倍 DPI 下看不出问题（小数部分恒为 0，两种算法同解），
-/// 换成 1.25 / 1.5 倍缩放就会随小数相位时而重叠 1px、时而空 1px。论坛 t164
-/// 「候选行间距设为 0，绘制出来仍有微小间距」正是后者：scale=1.5 下行高 53.4、
-/// 行 y 依次 9.0 / 62.4 / 115.8，分别 round 得
-/// (9,53)=9..62、(62,53)=62..115、(116,53)=116..169 —— 115~116 空出整整一行像素。
+/// 不在这里兜 `max(1.0)`：各调用点对「退化成 0 尺寸」的处理不同。
 ///
-/// 不在这里兜 `max(1.0)`：各调用点对「退化成 0 尺寸」的处理不同（`fill_rounded` 直接不画，
-/// 背景图/渐变则钳到 1px），兜在这里会把那个差别抹掉。
-///
-/// # ⚠️ 只对**整数尺寸**保尺寸
-///
-/// `round(x + n) - round(x) == n` 仅在 `n` 为整数时恒成立；非整数尺寸的结果会随
-/// `frac(x)` 在 `⌊n⌋` 与 `⌈n⌉` 之间变。对相邻平铺的背景盒这正是要的（宁可行高差 1px
-/// 也不能留缝），但对**语义定宽**的元素（插入符、分隔线这类「就该是 1 个逻辑像素粗」
-/// 的东西）就是抖动：位置一变粗细就变。故这类尺寸必须在**源头**取整成整设备像素——
-/// 插入符收口在 [`View::caret_at`]，编码栏分隔线收口在它的 `fixed_h` 调用处。
+/// 只对整数尺寸保尺寸：非整数尺寸的结果随 `frac(x)` 在 `⌊n⌋`/`⌈n⌉` 间变。语义定宽的元素
+/// （插入符、分隔线）必须在源头取整成整设备像素：插入符收口在 [`View::caret_at`]，编码栏
+/// 分隔线收口在它的 `fixed_h` 调用处。
 fn snap_to_pixels(x: f32, y: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
     let x0 = x.round();
     let y0 = y.round();
     (x0, y0, (x + w).round() - x0, (y + h).round() - y0)
 }
 
+/// 在缓冲区子区域填充圆角矩形：tiny-skia 抗锯齿填充 + 源覆盖混合。
+/// `color` 约定为直通 [R,G,B,A]；缓冲区按预乘 BGRA 维护（供 UpdateLayeredWindow），
+/// 传色时交换 R/B（见 [`aa_paint`]）。
 #[allow(clippy::too_many_arguments)]
 pub fn fill_rounded(
     buf: &mut [u8],
@@ -2691,12 +2622,8 @@ pub fn fill_ring(
 
 // ———————————————— 测试 ————————————————
 //
-// 测试边界说明：本模块的盒模型布局（measure/arrange/collect_hits）与形状绘制
-// （fill_rounded/fill_circle/fill_ring，基于纯 Rust 的 tiny-skia）在 **所有平台
-// 行为一致**，Linux 上的测试结果对 Windows 同样有效。唯一的跨平台差异是**文本
-// 测量**：Windows 用 DirectWrite，非 Windows 用 mock 近似（字符数 × 字号 × 0.6）。
-// 因此凡断言**具体文本尺寸/含文本布局数值**的用例都 gate 到 `not(windows)`，
-// 以 mock 的确定尺寸做精确断言；纯几何与形状用例则跨平台运行。
+// 盒模型布局与形状绘制（纯 Rust tiny-skia）跨平台一致；唯一差异是文本测量（Windows 用
+// DirectWrite，其余用 mock）。故断言具体文本尺寸的用例 gate 到 `not(windows)`。
 
 /// 几何与形状绘制测试（跨平台真实：tiny-skia 纯 Rust 光栅化，不依赖文本后端）。
 #[cfg(test)]
@@ -2751,973 +2678,34 @@ mod fill_spec_tests {
 }
 
 #[cfg(test)]
-mod geom_tests {
-    use super::*;
-
-    #[test]
-    fn rect_contains_includes_edges() {
-        let r = Rect {
-            x: 10.0,
-            y: 10.0,
-            w: 20.0,
-            h: 20.0,
-        };
-        assert!(r.contains(10.0, 10.0)); // 左上角
-        assert!(r.contains(30.0, 30.0)); // 右下角（x+w, y+h 含边界）
-        assert!(r.contains(20.0, 20.0)); // 内部
-        assert!(!r.contains(9.9, 20.0)); // 左外
-        assert!(!r.contains(30.1, 20.0)); // 右外
-        assert!(!r.contains(20.0, 9.9)); // 上外
-    }
-
-    #[test]
-    fn edges_helpers() {
-        let a = Edges::all(5.0);
-        assert_eq!((a.l, a.t, a.r, a.b), (5.0, 5.0, 5.0, 5.0));
-        assert_eq!(a.w(), 10.0);
-        assert_eq!(a.h(), 10.0);
-        let xy = Edges::xy(3.0, 4.0);
-        assert_eq!((xy.l, xy.t, xy.r, xy.b), (3.0, 4.0, 3.0, 4.0));
-        assert_eq!(xy.w(), 6.0);
-        assert_eq!(xy.h(), 8.0);
-    }
-
-    #[test]
-    fn fill_rounded_writes_alpha() {
-        let mut buf = vec![0u8; 10 * 10 * 4];
-        fill_rounded(
-            &mut buf,
-            10,
-            10,
-            0.0,
-            0.0,
-            10.0,
-            10.0,
-            [255, 0, 0, 255],
-            0.0,
-        );
-        let center = (5 * 10 + 5) * 4;
-        assert!(buf[center + 3] > 0, "中心像素 alpha 应被写入");
-    }
-
-    // ─────────────────── 像素对齐：相邻盒子不留缝也不重叠 ───────────────────
-
-    /// ★ 论坛 t164「候选行间距设为 0，绘制出来仍有微小间距」的判据。
-    ///
-    /// 竖排候选一行接一行，上一行的 `y + h` 就是下一行的 `y`。非整数倍 DPI 下这些值全带小数
-    /// （scale=1.5：行高 53.4，y 依次 9.0 / 62.4 / 115.8），「位置 round、尺寸也 round」会让
-    /// 同一条公共边界在两边算出不同的整数 —— 时而空 1px（缝），时而多画 1px（叠）。
-    ///
-    /// 这里直接画三行真实数值，逐行扫 alpha：从第一行顶到最后一行底，**不允许有空行**。
-    #[test]
-    fn adjacent_rows_leave_no_gap_at_fractional_scale() {
-        // scale = 1.5 下候选窗实测的行几何（见 candidate_window 的行距探针）
-        let rows = [(9.0f32, 53.4f32), (62.4, 53.4), (115.8, 53.4)];
-        let (w, h) = (24u32, 200u32);
-        let mut buf = vec![0u8; (w * h) as usize * 4];
-        for (y, rh) in rows {
-            fill_rounded(&mut buf, w, h, 0.0, y, w as f32, rh, [255, 0, 0, 255], 0.0);
-        }
-        let alpha_at = |row: u32| buf[((row * w + w / 2) * 4 + 3) as usize];
-        let top = rows[0].0.round() as u32;
-        let bottom = (rows[2].0 + rows[2].1).round() as u32;
-        let empty: Vec<u32> = (top..bottom).filter(|r| alpha_at(*r) == 0).collect();
-        assert!(
-            empty.is_empty(),
-            "第 {top}~{bottom} 行之间不该有空行，实际空在 {empty:?}"
-        );
-        // 前置：确实画了东西，且范围之外没有越界涂抹（否则上面的「无空行」可能是整片糊了）
-        assert!(alpha_at(top) > 0, "前置：首行须被填上");
-        assert_eq!(alpha_at(top.saturating_sub(2)), 0, "首行之上不该被涂到");
-        assert_eq!(alpha_at(bottom + 2), 0, "末行之下不该被涂到");
-    }
-
-    /// 对照：整数倍缩放下行为不变（老写法在这一档本就正确，不能改坏）。
-    #[test]
-    fn integer_scale_rows_are_unchanged() {
-        let (w, h) = (24u32, 200u32);
-        let mut buf = vec![0u8; (w * h) as usize * 4];
-        for (y, rh) in [(6.0f32, 36.0f32), (42.0, 36.0), (78.0, 36.0)] {
-            fill_rounded(&mut buf, w, h, 0.0, y, w as f32, rh, [255, 0, 0, 255], 0.0);
-        }
-        let alpha_at = |row: u32| buf[((row * w + w / 2) * 4 + 3) as usize];
-        assert!((6..114).all(|r| alpha_at(r) > 0), "6~114 行须连续填满");
-        assert_eq!(alpha_at(5), 0, "盒子上沿之外不该被涂到");
-        assert_eq!(alpha_at(114), 0, "盒子下沿之外不该被涂到");
-    }
-
-    /// 边界取整本身：公共边界在两边必须解析成同一个整数。
-    ///
-    /// 直接测 `snap_to_pixels` 而不只测像素，是因为像素那条测不出「重叠」——
-    /// 多画一层 alpha 仍是非 0，扫描看不出来，而重叠在半透明背景下是看得见的深一道。
-    #[test]
-    fn snap_shares_the_boundary_between_neighbours() {
-        for (y0, h0, y1) in [
-            (9.0f32, 53.4f32, 62.4f32),
-            (7.5, 44.5, 52.0),
-            (0.3, 10.4, 10.7),
-        ] {
-            let (_, ya, _, ha) = snap_to_pixels(0.0, y0, 1.0, h0);
-            let (_, yb, _, _) = snap_to_pixels(0.0, y1, 1.0, h0);
-            assert_eq!(
-                ya + ha,
-                yb,
-                "上一个盒子的下边界须正好落在下一个的上边界（y0={y0} h0={h0} y1={y1}）"
-            );
-        }
-    }
-
-    /// 边界取整的**另一半**：整数尺寸必须与落点无关。
-    ///
-    /// 这条是「语义定宽」元素（插入符、分隔线）能继续用 `fill_rounded` 的全部依据——
-    /// 它们要的是「恒 n 像素粗」，而本函数只对整数 n 给这个保证。反面对照一并锁住：
-    /// 非整数尺寸**确实**会随落点变，那不是缺陷而是相邻平铺无缝的代价，故这类尺寸
-    /// 必须在源头取整（[`View::caret_at`]）。
-    #[test]
-    fn snap_keeps_integer_sizes_at_any_subpixel_offset() {
-        for n in [1.0f32, 2.0, 3.0] {
-            for x in [0.0f32, 0.1, 0.4, 0.5, 0.6, 0.9, 10.3, 10.7] {
-                let (_, _, w, _) = snap_to_pixels(x, 0.0, n, 1.0);
-                assert_eq!(w, n, "整数尺寸 {n} 在 x={x} 处不该变成 {w}");
-            }
-        }
-        // 反面对照：非整数尺寸随落点变 —— 正是插入符必须在源头取整的理由。
-        let (_, _, w_lo, _) = snap_to_pixels(10.0, 0.0, 1.5, 1.0);
-        let (_, _, w_hi, _) = snap_to_pixels(10.6, 0.0, 1.5, 1.0);
-        assert_ne!(
-            w_lo, w_hi,
-            "1.5 宽在不同落点该给出不同结果，否则本测试的前提不成立"
-        );
-    }
-
-    /// 插入符宽度在 `caret_at` 就取整，绘制端拿不到半像素。
-    ///
-    /// 1.5 是 1.5 倍缩放下 `scale.max(1.0)` 的真实取值；不取整的话竖线会一边打字
-    /// 一边在 1px / 2px 之间闪（插入符的 x 随前半段文本宽度逐字移动）。
-    #[test]
-    fn caret_width_snaps_to_whole_pixels() {
-        for (given, want) in [(1.0f32, 1.0f32), (1.25, 1.0), (1.5, 2.0), (2.0, 2.0)] {
-            let v = View::leaf("ab".to_string(), [0, 0, 0, 255]).caret_at(1, given);
-            assert_eq!(v.caret_w, want, "caret_w({given}) 应取整到 {want}");
-        }
-        // 缩放小于 1 时仍须看得见。
-        let v = View::leaf("ab".to_string(), [0, 0, 0, 255]).caret_at(1, 0.4);
-        assert_eq!(v.caret_w, 1.0, "亚像素缩放下插入符不该消失");
-    }
-
-    #[test]
-    fn fill_rounded_transparent_color_is_noop() {
-        let mut buf = vec![0u8; 4 * 4 * 4];
-        fill_rounded(&mut buf, 4, 4, 0.0, 0.0, 4.0, 4.0, [255, 0, 0, 0], 0.0);
-        assert!(buf.iter().all(|&b| b == 0), "alpha=0 不应写入任何像素");
-    }
-
-    #[test]
-    fn fill_circle_writes_center_not_corner() {
-        let mut buf = vec![0u8; 20 * 20 * 4];
-        fill_circle(&mut buf, 20, 20, 10.0, 10.0, 8.0, [0, 255, 0, 255]);
-        assert!(px_alpha(&buf, 20, 10, 10) > 0, "圆心应被填充");
-        assert_eq!(px_alpha(&buf, 20, 0, 0), 0, "角落在圆外，不应被填充");
-    }
-
-    #[test]
-    fn gradient_linear_writes_pixels() {
-        let mut buf = vec![0u8; 16 * 16 * 4];
-        let g = ViewGradient {
-            radial: false,
-            angle: 0.0,
-            stops: vec![([255, 0, 0, 255], 0.0), ([0, 0, 255, 255], 1.0)],
-        };
-        let r = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 16.0,
-            h: 16.0,
-        };
-        paint_bg_gradient(&mut buf, 16, 16, r, 0.0, &g);
-        assert!(px_alpha(&buf, 16, 8, 8) > 0, "渐变中心 alpha 应被写入");
-    }
-
-    #[test]
-    fn gradient_single_stop_falls_back_to_solid() {
-        let mut buf = vec![0u8; 8 * 8 * 4];
-        let g = ViewGradient {
-            radial: false,
-            angle: 0.0,
-            stops: vec![([0, 255, 0, 255], 0.5)],
-        };
-        let r = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 8.0,
-            h: 8.0,
-        };
-        paint_bg_gradient(&mut buf, 8, 8, r, 0.0, &g);
-        assert!(px_alpha(&buf, 8, 4, 4) > 0, "单停靠点退化为纯色填充");
-    }
-
-    #[test]
-    fn fill_ring_hollow_center() {
-        let mut buf = vec![0u8; 20 * 20 * 4];
-        fill_ring(
-            &mut buf,
-            20,
-            20,
-            0.0,
-            0.0,
-            20.0,
-            20.0,
-            [0, 0, 255, 255],
-            0.0,
-            2.0,
-        );
-        // 边框环：靠边像素被描边，正中心（挖空）保持透明
-        assert!(px_alpha(&buf, 20, 10, 0) > 0, "上边框应被描边");
-        assert_eq!(px_alpha(&buf, 20, 10, 10), 0, "环中心应镂空透明");
-    }
-
-    // ── 左侧强调条：height_ratio / offset ──────────────────────────────────
-    // 用无文本的固定尺寸容器，几何跨平台确定（不依赖 DirectWrite / mock 测量差异）。
-
-    /// 在 40×40 缓冲里画一个 40×40 的容器，带指定强调条参数；返回 BGRA 缓冲。
-    fn paint_left_bar(height_ratio: f32, offset: f32, width: f32) -> Vec<u8> {
-        let tr = crate::text::MockText::new("test", 20.0).unwrap();
-        let mut v = View::container(Layout::Row)
-            .fixed_w(40.0)
-            .fixed_h(40.0)
-            .left_bar(LeftBar {
-                color: [255, 0, 0, 255],
-                width,
-                height_ratio,
-                offset,
-            });
-        v.layout(0.0, 0.0, &tr);
-        let mut buf = vec![0u8; 40 * 40 * 4];
-        v.paint(&mut buf, 40, 40, &tr);
-        buf
-    }
-
-    /// BGRA 缓冲里 (x, y) 像素的 alpha 分量。`stride` 为缓冲宽度（像素）。
-    /// 写成函数而非手写 `(y * w + x) * 4 + 3`：坐标语义更清楚，也避开 clippy
-    /// 对 `0 * 20 + 0` 这类「保留坐标形状」写法的 erasing_op/identity_op 报错。
-    fn px_alpha(buf: &[u8], stride: usize, x: usize, y: usize) -> u8 {
-        buf[(y * stride + x) * 4 + 3]
-    }
-
-    /// 40×40 缓冲专用的 [`px_alpha`]。
-    fn alpha_at(buf: &[u8], x: usize, y: usize) -> u8 {
-        px_alpha(buf, 40, x, y)
-    }
-
-    #[test]
-    fn left_bar_height_ratio_controls_bar_height() {
-        // ratio=1.0：条高 = 行高，顶部与中部都被填充。
-        let full = paint_left_bar(1.0, 0.0, 4.0);
-        assert!(alpha_at(&full, 1, 1) > 0, "ratio=1.0 顶部应被填充");
-        assert!(alpha_at(&full, 1, 20) > 0, "ratio=1.0 中部应被填充");
-
-        // ratio=0.5：条高 = 行高一半、垂直居中 → 中部填充、顶部留白。
-        let half = paint_left_bar(0.5, 0.0, 4.0);
-        assert!(alpha_at(&half, 1, 20) > 0, "ratio=0.5 中部应被填充");
-        assert_eq!(alpha_at(&half, 1, 1), 0, "ratio=0.5 顶部应留白");
-    }
-
-    #[test]
-    fn left_bar_offset_shifts_bar_right() {
-        // offset=0：条贴左缘。
-        let flush = paint_left_bar(1.0, 0.0, 4.0);
-        assert!(alpha_at(&flush, 1, 20) > 0, "offset=0 左缘应被填充");
-
-        // offset=10：条右移 10px → 左缘留白，10px 之后才是条。
-        let shifted = paint_left_bar(1.0, 10.0, 4.0);
-        assert_eq!(alpha_at(&shifted, 1, 20), 0, "offset=10 左缘应留白");
-        assert!(alpha_at(&shifted, 11, 20) > 0, "offset=10 处应被填充");
-    }
-
-    /// 极小 ratio 仍保底 2px——否则主题写个 0.01 会让条彻底消失。
-    #[test]
-    fn left_bar_tiny_ratio_clamped_to_min_height() {
-        let tiny = paint_left_bar(0.001, 0.0, 4.0);
-        assert!(alpha_at(&tiny, 1, 20) > 0, "极小比例仍应保底 2px 可见");
-    }
-}
+#[path = "view_geom_tests.rs"]
+mod geom_tests;
 
 /// 阴影蒙版缓存：缓存不得改变渲染结果（跨平台真实——纯 tiny-skia 光栅化，不涉文本）。
 ///
-/// 这些用例的重心是**反向对照**：只断言"同参数两次结果一致"是抓不到缓存 bug 的——
+/// 这些用例的重心是反向对照：只断言"同参数两次结果一致"是抓不到缓存 bug 的——
 /// 键漏了某一项时，两次调用都会取到同一张错蒙版，结果照样一致、测试照样绿。真正能
 /// 抓住漏键的是"只改一项，输出必须变"。
 #[cfg(test)]
-mod shadow_cache_tests {
-    use super::*;
-
-    /// 在 64×64 透明缓冲上画一次阴影，返回缓冲。内容盒固定落在 (16,16)。
-    fn shadow_buf(bw: f32, bh: f32, radius: f32, blur: f32, color: [u8; 4]) -> Vec<u8> {
-        const W: u32 = 64;
-        const H: u32 = 64;
-        let mut buf = vec![0u8; (W * H * 4) as usize];
-        paint_blur_shadow(
-            &mut buf, W, H, 16.0, 16.0, bw, bh, radius, blur, 0.0, 0.0, 0.0, color,
-        );
-        buf
-    }
-
-    /// 基准形状：够小以完整落在 64×64 内，blur 够大以真正触发模糊路径。
-    fn base(color: [u8; 4]) -> Vec<u8> {
-        shadow_buf(20.0, 20.0, 4.0, 3.0, color)
-    }
-
-    const BLACK: [u8; 4] = [0, 0, 0, 200];
-
-    /// 缓存**确实在工作**：同几何重绘不新增条目，不同几何才新增。
-    ///
-    /// 这条是本模块其余用例的地基。没有它，那些"结果一致 / 结果不同"的断言在缓存
-    /// 完全失效（每帧照旧重算模糊）时也会全绿——而消除"每帧重算"正是这次改动的
-    /// 全部目的，测不出来就等于没测。
-    ///
-    /// 换色不新增条目这一条同时正面验证了键的设计：蒙版与颜色无关。
-    #[test]
-    fn cache_stores_and_reuses_masks() {
-        shadow_cache_clear();
-        assert_eq!(shadow_cache_len(), 0, "起手应为空");
-        let _ = base(BLACK);
-        assert_eq!(shadow_cache_len(), 1, "首次绘制应入缓存一条");
-        let _ = base(BLACK);
-        assert_eq!(shadow_cache_len(), 1, "同几何重绘应命中，不得新增");
-        let _ = base([255, 0, 0, 200]);
-        assert_eq!(shadow_cache_len(), 1, "仅换色应命中（蒙版与颜色无关）");
-        let _ = shadow_buf(28.0, 20.0, 4.0, 3.0, BLACK);
-        assert_eq!(shadow_cache_len(), 2, "不同几何应新增条目");
-    }
-
-    /// 同参数重复绘制结果逐字节一致——缓存命中路径与首次构建路径必须等价。
-    #[test]
-    fn cache_hit_reproduces_first_render() {
-        let first = base(BLACK);
-        let second = base(BLACK);
-        assert_eq!(first, second, "缓存命中不得改变渲染结果");
-    }
-
-    /// 阴影颜色**不在缓存键里**（缓存的是 alpha 蒙版），输出却必须随颜色变。
-    ///
-    /// 这是"缓存蒙版而非着色像素"这一设计的判据：一旦有人把着色也塞进缓存，
-    /// 换了颜色仍会取到上一色的像素——而因为几何没变，缓存必命中，错误 100% 复现。
-    #[test]
-    fn color_is_not_cached_though_absent_from_key() {
-        let black = base(BLACK);
-        let red = base([255, 0, 0, 200]);
-        assert_ne!(black, red, "换色必须改变输出（着色不得被缓存）");
-    }
-
-    /// 主题明暗切换只改颜色、不改几何——此时蒙版应复用而输出仍正确。
-    /// 与上一用例同源，但特意走"先浅后深"的顺序，覆盖缓存已被填充后再换色的路径。
-    #[test]
-    fn alpha_only_change_still_affects_output() {
-        let opaque = base([0, 0, 0, 255]);
-        let faint = base([0, 0, 0, 64]);
-        assert_ne!(opaque, faint, "仅改阴影透明度也必须改变输出");
-    }
-
-    /// 盒尺寸进键：只改宽度，输出必须变。
-    #[test]
-    fn box_size_changes_output() {
-        let a = shadow_buf(20.0, 20.0, 4.0, 3.0, BLACK);
-        let b = shadow_buf(28.0, 20.0, 4.0, 3.0, BLACK);
-        assert_ne!(a, b, "盒宽变化必须改变输出");
-    }
-
-    /// 圆角进键：直角与圆角的蒙版不同。
-    #[test]
-    fn radius_changes_output() {
-        let sharp = shadow_buf(20.0, 20.0, 0.0, 3.0, BLACK);
-        let round = shadow_buf(20.0, 20.0, 9.0, 3.0, BLACK);
-        assert_ne!(sharp, round, "圆角变化必须改变输出");
-    }
-
-    /// 模糊半径进键：它同时决定蒙版尺寸（pad）与衰减，漏掉它错得最明显。
-    #[test]
-    fn blur_changes_output() {
-        let tight = shadow_buf(20.0, 20.0, 4.0, 1.0, BLACK);
-        let wide = shadow_buf(20.0, 20.0, 4.0, 6.0, BLACK);
-        assert_ne!(tight, wide, "模糊半径变化必须改变输出");
-    }
-
-    /// 缓存超限后整体清空，不得影响正确性——清空前后同参数结果须一致。
-    /// 用 33 组不同几何（> `SHADOW_CACHE_CAP`）挤掉基准条目，再重画基准比对。
-    #[test]
-    fn eviction_preserves_correctness() {
-        let before = base(BLACK);
-        for i in 0..=SHADOW_CACHE_CAP {
-            let _ = shadow_buf(10.0 + i as f32, 12.0, 2.0, 2.0, BLACK);
-        }
-        let after = base(BLACK);
-        assert_eq!(before, after, "缓存清空后重建的蒙版须与首次一致");
-    }
-
-    /// 把阴影缓存的最后取用时刻挪到 `ago` 之前（模拟闲置）。
-    fn age_shadow_cache(ago: std::time::Duration) {
-        let stale = std::time::Instant::now()
-            .checked_sub(ago)
-            .expect("单调时钟回拨");
-        SHADOW_CACHE.with(|c| c.borrow_mut().last_use = Some(stale));
-    }
-
-    /// 设计 §7：阴影蒙版并入图片缓存那套 30 秒闲置回收——闲置到期整个清掉、不再要求唤醒；
-    /// 清掉后重画与清之前逐字节一致（按需重建）。
-    #[test]
-    fn idle_shadow_cache_is_evicted_and_rebuilt() {
-        shadow_cache_clear();
-        let before = base(BLACK);
-        assert_eq!(shadow_cache_len(), 1);
-        assert!(paint_cache_next_deadline().is_some(), "有驻留就要求唤醒");
-        age_shadow_cache(crate::image_cache::IDLE_EVICT_AFTER + std::time::Duration::from_secs(1));
-        assert!(
-            paint_cache_evict_if_idle(std::time::Instant::now()),
-            "闲置到期应回收"
-        );
-        assert_eq!(shadow_cache_len(), 0);
-        assert_eq!(paint_cache_next_deadline(), None, "清空后不再要求唤醒");
-        assert_eq!(base(BLACK), before, "回收后按需重建，结果一致");
-        assert_eq!(shadow_cache_len(), 1);
-    }
-
-    /// 期间用过（命中也算）就不回收：最后取用时刻随每次绘制刷新。
-    #[test]
-    fn used_shadow_cache_is_kept() {
-        shadow_cache_clear();
-        let _ = base(BLACK);
-        age_shadow_cache(crate::image_cache::IDLE_EVICT_AFTER + std::time::Duration::from_secs(1));
-        let _ = base(BLACK); // 命中
-        assert!(
-            !paint_cache_evict_if_idle(std::time::Instant::now()),
-            "刚用过不回收"
-        );
-        assert_eq!(shadow_cache_len(), 1);
-    }
-}
+#[path = "view_shadow_cache_tests.rs"]
+mod shadow_cache_tests;
 
 /// 顺时针 90° 旋转：几何映射、像素搬运、测量与命中。
 ///
-/// **不 gate 平台**：全部断言只用 `fixed_w`/`fixed_h` 与裸缓冲，不碰文本测量，
+/// 不 gate 平台：全部断言只用 `fixed_w`/`fixed_h` 与裸缓冲，不碰文本测量，
 /// 故三个平台答案相同（`layout_tests` 之所以 gate 是因为它断言文本尺寸）。
 #[cfg(test)]
-mod rotate_tests {
-    use super::*;
-    use crate::text::MockText as TextRenderer;
-
-    fn tr() -> TextRenderer {
-        TextRenderer::new("test", 20.0).unwrap()
-    }
-
-    fn fixed(w: f32, h: f32, tag: i32) -> View {
-        View::container(Layout::Row).fixed_w(w).fixed_h(h).tag(tag)
-    }
-
-    fn hit(root: &View, tag: i32) -> Rect {
-        let mut out = Vec::new();
-        root.collect_hits(&mut out);
-        out.into_iter()
-            .find(|(t, _)| *t == tag)
-            .unwrap_or_else(|| panic!("tag {tag} 未命中"))
-            .1
-    }
-
-    /// 旋转节点对外交换宽高——整个旋转能力的支点：子树仍在未旋转空间里排版。
-    #[test]
-    fn rotation_swaps_the_measured_size() {
-        let mut root = View::rotated_cw(fixed(40.0, 10.0, 0));
-        root.layout(0.0, 0.0, &tr());
-        assert_eq!(root.measured_size(), (10.0, 40.0));
-    }
-
-    /// ★ 方向判据：局部左上角必须落到屏幕**右上角**。落到左下角就是逆时针，
-    /// 蒙古文会变成自下而上读。
-    #[test]
-    fn local_top_left_maps_to_screen_top_right() {
-        let host = Rect {
-            x: 100.0,
-            y: 200.0,
-            w: 10.0,
-            h: 40.0,
-        };
-        // 局部 (0,0) 处 2×3 的小块。
-        let got = rotate_rect(
-            Rot::Cw,
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 2.0,
-                h: 3.0,
-            },
-            host,
-        );
-        assert_eq!(got.x, 100.0 + 10.0 - 3.0, "没贴到右缘 ⇒ 转反了");
-        assert_eq!(got.y, 200.0);
-        assert_eq!((got.w, got.h), (3.0, 2.0), "宽高没交换");
-    }
-
-    /// 命中矩形必须跟着转。漏掉映射时画面完全正常、只有鼠标点错候选，从现象反推不出成因。
-    ///
-    /// ★ 反向对照同样必要：不带旋转时矩形**不得**被映射。只测「转了」的话，
-    /// 一个无条件映射的实现会让普通候选窗的命中全错，而那条路径没人测。
-    #[test]
-    fn hit_rects_follow_the_rotation() {
-        let inner = View::container(Layout::Column)
-            .child(fixed(40.0, 10.0, 1))
-            .child(fixed(40.0, 10.0, 2));
-        let mut root = View::rotated_cw(inner);
-        root.layout(0.0, 0.0, &tr());
-        // 局部：1 在上 (y=0)、2 在下 (y=10)；屏幕宽 20（=局部高）。
-        // 顺时针后：1 贴右（x=10）、2 在左（x=0）。
-        assert_eq!(hit(&root, 1).x, 10.0);
-        assert_eq!(hit(&root, 2).x, 0.0);
-        assert_eq!(hit(&root, 1).w, 10.0, "屏幕宽应为局部高");
-        assert_eq!(hit(&root, 1).h, 40.0, "屏幕高应为局部宽");
-
-        let mut plain = View::container(Layout::Column)
-            .child(fixed(40.0, 10.0, 1))
-            .child(fixed(40.0, 10.0, 2));
-        plain.layout(0.0, 0.0, &tr());
-        assert_eq!(hit(&plain, 1).y, 0.0, "无旋转时不得映射");
-        assert_eq!(hit(&plain, 2).y, 10.0);
-    }
-
-    /// 像素方向：局部缓冲左上角那一点，搬到屏幕后必须在**右上角**。
-    /// 这条与 `local_top_left_maps_to_screen_top_right` 是同一约定的两个层面
-    /// （矩形 / 像素），必须一起钉——两处各写一遍映射正是最容易错开一格的地方。
-    #[test]
-    fn pixel_blit_puts_local_origin_at_screen_top_right() {
-        let (cw, ch) = (4u32, 3u32); // 局部 4×3 ⇒ 屏幕 3×4
-        let mut tmp = vec![0u8; (cw * ch * 4) as usize];
-        tmp[0..4].copy_from_slice(&[1, 2, 3, 4]); // 局部 (0,0)
-        let (bw, bh) = (3u32, 4u32);
-        let mut buf = vec![0u8; (bw * bh * 4) as usize];
-        blit_rotate(Rot::Cw, &tmp, cw, ch, &mut buf, bw, bh, 0, 0);
-        let top_right = ((bw - 1) * 4) as usize; // 第 0 行、最后一列
-        assert_eq!(&buf[top_right..top_right + 4], &[1, 2, 3, 4]);
-        assert_eq!(&buf[0..4], &[0, 0, 0, 0], "左上角不该有东西");
-    }
-
-    /// 搬进来再搬回去必须是恒等——底子（窗口圆角/渐变/背景图）要原样保留，
-    /// 且文本后端的差分法合成拿它当抗锯齿的背景基准，错一位文字边缘就带错误混色。
-    #[test]
-    fn blit_round_trip_is_identity() {
-        let (cw, ch) = (5u32, 7u32);
-        let (bw, bh) = (ch, cw);
-        let orig: Vec<u8> = (0..(bw * bh * 4)).map(|i| (i % 251) as u8).collect();
-        let mut buf = orig.clone();
-        let mut tmp = vec![0u8; (cw * ch * 4) as usize];
-        blit_unrotate(Rot::Cw, &buf, bw, bh, 0, 0, &mut tmp, cw, ch);
-        blit_rotate(Rot::Cw, &tmp, cw, ch, &mut buf, bw, bh, 0, 0);
-        assert_eq!(buf, orig, "往返不是恒等：底子会被搬歪");
-    }
-
-    /// 逆时针的方向判据：局部左上角落到屏幕**左下角**。
-    ///
-    /// ★ 必须与顺时针那条一起看：两条只测「宽高交换了」的话，一个把 Ccw 也实现成
-    /// 顺时针的版本能全绿——而那样对联式竖排的每个字会是倒的（转了 180°）。
-    #[test]
-    fn ccw_puts_local_origin_at_screen_bottom_left() {
-        let host = Rect {
-            x: 100.0,
-            y: 200.0,
-            w: 10.0,
-            h: 40.0,
-        };
-        let got = rotate_rect(
-            Rot::Ccw,
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 2.0,
-                h: 3.0,
-            },
-            host,
-        );
-        assert_eq!(got.x, 100.0, "没贴到左缘 ⇒ 转反了");
-        assert_eq!(got.y, 200.0 + 40.0 - 2.0, "没贴到下缘 ⇒ 转反了");
-        assert_eq!((got.w, got.h), (3.0, 2.0), "宽高没交换");
-
-        // 像素层同一约定（连续/离散两处最容易错开一格）。
-        let (cw, ch) = (4u32, 3u32); // 局部 4×3 ⇒ 屏幕 3×4
-        let mut tmp = vec![0u8; (cw * ch * 4) as usize];
-        tmp[0..4].copy_from_slice(&[1, 2, 3, 4]); // 局部 (0,0)
-        let (bw, bh) = (3u32, 4u32);
-        let mut buf = vec![0u8; (bw * bh * 4) as usize];
-        blit_rotate(Rot::Ccw, &tmp, cw, ch, &mut buf, bw, bh, 0, 0);
-        let bottom_left = ((bh - 1) * bw * 4) as usize;
-        assert_eq!(&buf[bottom_left..bottom_left + 4], &[1, 2, 3, 4]);
-        assert_eq!(&buf[0..4], &[0, 0, 0, 0], "左上角不该有东西");
-    }
-
-    /// ★★ 对联式竖排的**全部数学**就是这一条：外层顺时针套内层逆时针 ≡ 什么都没做。
-    ///
-    /// 它同时钉住三件事——两向的映射互为逆、嵌套时内层拿到的底子是对的、宽高交换两次
-    /// 回到原值。任何一处方向写反，这里的像素就与直画不同（而单看某一向的测试都能全绿）。
-    ///
-    /// 用左右异色的两块而不是单色：单色块转 180° 也一样，测不出方向。
-    #[test]
-    fn cw_around_ccw_is_the_identity() {
-        const RED: [u8; 4] = [0, 0, 255, 255];
-        const BLUE: [u8; 4] = [255, 0, 0, 255];
-        let leaf = || {
-            View::container(Layout::Row)
-                .child(
-                    View::container(Layout::Row)
-                        .fixed_w(2.0)
-                        .fixed_h(2.0)
-                        .bg(RED),
-                )
-                .child(
-                    View::container(Layout::Row)
-                        .fixed_w(2.0)
-                        .fixed_h(2.0)
-                        .bg(BLUE),
-                )
-        };
-        let (bw, bh) = (4u32, 2u32);
-
-        let mut plain = leaf();
-        plain.layout(0.0, 0.0, &tr());
-        assert_eq!(plain.measured_size(), (4.0, 2.0));
-        let mut direct = vec![0u8; (bw * bh * 4) as usize];
-        plain.paint(&mut direct, bw, bh, &tr());
-
-        let mut nested = View::rotated_cw(View::rotated_ccw(leaf()));
-        nested.layout(0.0, 0.0, &tr());
-        assert_eq!(nested.measured_size(), (4.0, 2.0), "两次交换应回到原尺寸");
-        let mut got = vec![0u8; (bw * bh * 4) as usize];
-        nested.paint(&mut got, bw, bh, &tr());
-
-        assert_eq!(got, direct, "cw∘ccw 不是恒等 ⇒ 竖排的字会歪或倒");
-    }
-
-    /// 嵌套下的命中矩形也必须还原——画面对而点击错是这类 bug 的典型形态。
-    #[test]
-    fn cw_around_ccw_restores_hit_rects() {
-        let build = || {
-            View::container(Layout::Row)
-                .child(fixed(4.0, 2.0, 1))
-                .child(fixed(6.0, 2.0, 2))
-        };
-        let mut plain = build();
-        plain.layout(0.0, 0.0, &tr());
-        let mut nested = View::rotated_cw(View::rotated_ccw(build()));
-        nested.layout(0.0, 0.0, &tr());
-        for tag in [1, 2] {
-            let (n, p) = (hit(&nested, tag), hit(&plain, tag));
-            assert_eq!(
-                (n.x, n.y, n.w, n.h),
-                (p.x, p.y, p.w, p.h),
-                "tag {tag} 的命中区没还原"
-            );
-        }
-    }
-
-    /// 旋转块部分落在缓冲外时不得 panic，也不得写坏界内像素。
-    #[test]
-    fn out_of_bounds_blit_is_clipped_not_panicking() {
-        let (cw, ch) = (4u32, 4u32);
-        let tmp = vec![9u8; (cw * ch * 4) as usize];
-        let (bw, bh) = (4u32, 4u32);
-        let mut buf = vec![0u8; (bw * bh * 4) as usize];
-        // 原点在负象限：只有右下角一部分落在界内。
-        blit_rotate(Rot::Cw, &tmp, cw, ch, &mut buf, bw, bh, -2, -2);
-        assert_eq!(&buf[0..4], &[9, 9, 9, 9], "界内部分应被写到");
-        // 完全在界外：一个字节都不该动。
-        let mut buf2 = vec![0u8; (bw * bh * 4) as usize];
-        blit_rotate(Rot::Cw, &tmp, cw, ch, &mut buf2, bw, bh, 100, 100);
-        assert!(buf2.iter().all(|&b| b == 0));
-    }
-}
+#[path = "view_rotate_tests.rs"]
+mod rotate_tests;
 
 /// 盒模型布局测试。断言含文本尺寸，依赖 mock 文本测量
 /// （`measure_text_sized` = 字符数 × 字号 × 0.6，行高 = 字号 × 1.2）。
 /// macOS 文本后端为真 CoreText（mock 失效），故同 Windows 一并 gate 出。
 #[cfg(test)]
-mod layout_tests {
-    use super::*;
-    use crate::text::MockText as TextRenderer;
+#[path = "view_layout_tests.rs"]
+mod layout_tests;
 
-    fn tr() -> TextRenderer {
-        TextRenderer::new("test", 20.0).unwrap()
-    }
-
-    /// 构造一个固定尺寸的叶容器（无文本，尺寸跨平台确定）。
-    fn fixed(w: f32, h: f32, tag: i32) -> View {
-        View::container(Layout::Row).fixed_w(w).fixed_h(h).tag(tag)
-    }
-
-    /// 取某 tag 节点 arrange 后的绝对矩形。
-    fn hit(root: &View, tag: i32) -> Rect {
-        let mut out = Vec::new();
-        root.collect_hits(&mut out);
-        out.into_iter()
-            .find(|(t, _)| *t == tag)
-            .unwrap_or_else(|| panic!("tag {tag} 未命中"))
-            .1
-    }
-
-    #[test]
-    fn measure_row_sums_main_axis_with_gap() {
-        let mut v = View::container(Layout::Row)
-            .gap(10.0)
-            .child(fixed(50.0, 20.0, -1))
-            .child(fixed(50.0, 20.0, -1));
-        v.layout(0.0, 0.0, &tr());
-        assert_eq!(v.measured_size(), (110.0, 20.0)); // 50+50+gap10, 交叉轴取 max
-    }
-
-    #[test]
-    fn measure_column_sums_main_axis_with_gap() {
-        let mut v = View::container(Layout::Column)
-            .gap(10.0)
-            .child(fixed(50.0, 20.0, -1))
-            .child(fixed(50.0, 20.0, -1));
-        v.layout(0.0, 0.0, &tr());
-        assert_eq!(v.measured_size(), (50.0, 50.0)); // 宽取 max50, 高 20+20+gap10
-    }
-
-    #[test]
-    fn measure_adds_padding() {
-        let mut v = View::container(Layout::Row)
-            .pad(Edges::all(8.0))
-            .child(fixed(50.0, 20.0, -1));
-        v.layout(0.0, 0.0, &tr());
-        assert_eq!(v.measured_size(), (66.0, 36.0)); // +16 两侧 padding
-    }
-
-    #[test]
-    fn fixed_size_overrides_content() {
-        let mut v = View::container(Layout::Row)
-            .fixed_w(200.0)
-            .fixed_h(30.0)
-            .child(fixed(999.0, 999.0, -1));
-        v.layout(0.0, 0.0, &tr());
-        assert_eq!(v.measured_size(), (200.0, 30.0));
-    }
-
-    /// 宽度下限：内容不足时抬到下限。
-    #[test]
-    fn min_w_raises_narrow_content() {
-        let mut v = View::container(Layout::Row)
-            .min_w(200.0)
-            .child(fixed(50.0, 20.0, -1));
-        v.layout(0.0, 0.0, &tr());
-        assert_eq!(v.measured_size(), (200.0, 20.0));
-    }
-
-    /// 反向对照：内容够宽时下限不得改变尺寸，否则 `min_w` 就退化成了 `fixed_w`。
-    #[test]
-    fn min_w_leaves_wide_content_untouched() {
-        let mut v = View::container(Layout::Row)
-            .min_w(200.0)
-            .child(fixed(300.0, 20.0, -1));
-        v.layout(0.0, 0.0, &tr());
-        assert_eq!(v.measured_size(), (300.0, 20.0));
-    }
-
-    /// 候选窗最小宽度的核心机制：下限设在叶子上，宽度逐层冒到祖先，父级 padding 照常累加
-    /// —— 调用方不必自己换算序号列宽与内边距。
-    #[test]
-    fn min_w_propagates_from_leaf_to_ancestor() {
-        let mut v = View::container(Layout::Column).pad(Edges::all(8.0)).child(
-            View::container(Layout::Row)
-                .child(fixed(10.0, 20.0, -1))
-                // fixed_w=30 且 min_w=120：下限在 fixed 之后施加，故取 120。
-                .child(fixed(30.0, 20.0, -1).min_w(120.0)),
-        );
-        v.layout(0.0, 0.0, &tr());
-        // 内层 Row = 10 + 120 = 130；外层再加两侧 padding 16。
-        assert_eq!(v.measured_size().0, 146.0);
-    }
-
-    #[test]
-    fn leaf_text_measured_via_mock() {
-        let mut v = View::leaf("abc", [0, 0, 0, 255]).font_size(20.0);
-        v.layout(0.0, 0.0, &tr());
-        // mock: 3 字符 × 20 × 0.6 = 36 宽；20 × 1.2 = 24 高
-        assert_eq!(v.measured_size(), (36.0, 24.0));
-    }
-
-    #[test]
-    fn arrange_cross_center_offsets_child() {
-        let mut root = View::container(Layout::Row)
-            .cross(Align::Center)
-            .fixed_h(40.0)
-            .child(fixed(50.0, 20.0, 0));
-        root.layout(0.0, 0.0, &tr());
-        let r = hit(&root, 0);
-        assert_eq!(r.x, 0.0);
-        assert_eq!(r.y, 10.0); // (40-20)/2 居中
-    }
-
-    #[test]
-    fn arrange_grow_spacer_absorbs_remaining() {
-        let mut root = View::container(Layout::Row)
-            .fixed_w(200.0)
-            .child(fixed(50.0, 10.0, 0))
-            .child(View::spacer())
-            .child(fixed(50.0, 10.0, 2));
-        root.layout(0.0, 0.0, &tr());
-        assert_eq!(hit(&root, 0).x, 0.0);
-        assert_eq!(hit(&root, 2).x, 150.0); // spacer 吸收 200-100=100，把末项推到 150
-    }
-
-    /// 「左固定 + 中间自由 + 右固定」——**不需要新的布局原语**，现有两件就够：
-    /// 窄行加 `fill_cross` 撑到列的内容宽（= 最宽那行的宽度），内部 `spacer().grow()`
-    /// 吃掉富余，末项就恒贴右缘。
-    ///
-    /// ★ 少了 `fill_cross`，行宽只等于自身内容宽，spacer 分不到一个像素，右组会跟着
-    /// 左组浮动——软键盘的关闭按钮与翻页键都栽在这里，而且**面板越宽错得越明显**，
-    /// 窄面板上看起来还挺对。
-    /// 命中区必须与**看得见的部分**一致，否则鼠标会在容器外的空白处「点到」
-    /// 一个不可见的控件。
-    #[test]
-    fn clip_trims_hits_to_the_visible_part() {
-        let mut root = View::container(Layout::Row)
-            .fixed_w(100.0)
-            .fixed_h(20.0)
-            .clipped()
-            .child(fixed(60.0, 20.0, 0)) // 0..60 全露
-            .child(fixed(60.0, 20.0, 1)) // 60..120，只露出 40
-            .child(fixed(60.0, 20.0, 2)); // 120..180，全在框外
-        root.layout(0.0, 0.0, &tr());
-        assert_eq!(hit(&root, 0).w, 60.0, "完全可见的不受影响");
-        assert_eq!(hit(&root, 1).w, 40.0, "跨边界的裁到露出的那段");
-        let mut out = Vec::new();
-        root.collect_hits(&mut out);
-        assert!(
-            !out.iter().any(|(t, _)| *t == 2),
-            "完全在框外的控件不该进命中表"
-        );
-    }
-
-    /// 裁剪的实现是「画完还原界外像素」，这条钉住它真的还原了。
-    #[test]
-    fn clip_keeps_paint_inside_the_box() {
-        let mut root = View::container(Layout::Row)
-            .fixed_w(10.0)
-            .fixed_h(10.0)
-            .clipped()
-            .child(
-                View::container(Layout::Row)
-                    .fixed_w(40.0)
-                    .fixed_h(10.0)
-                    .bg([200, 30, 30, 255]),
-            );
-        root.layout(0.0, 0.0, &tr());
-        let (w, h) = (40u32, 10u32);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        root.paint(&mut buf, w, h, &tr());
-        let px = |x: u32, y: u32| -> [u8; 4] {
-            let o = ((y * w + x) * 4) as usize;
-            [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]
-        };
-        assert_ne!(px(5, 5), [0, 0, 0, 0], "框内该被画到");
-        assert_eq!(px(20, 5), [0, 0, 0, 0], "框外必须保持原样");
-        assert_eq!(px(39, 5), [0, 0, 0, 0], "远处同样不能被涂到");
-    }
-
-    #[test]
-    fn fill_cross_row_lets_spacer_pin_the_last_child_right() {
-        let mut root = View::container(Layout::Column)
-            .child(fixed(200.0, 10.0, 9)) // 最宽的行，决定列宽
-            .child(
-                View::container(Layout::Row)
-                    .fill_cross()
-                    .child(fixed(20.0, 10.0, 0))
-                    .child(View::spacer().grow())
-                    .child(fixed(30.0, 10.0, 2)),
-            );
-        root.layout(0.0, 0.0, &tr());
-        assert_eq!(hit(&root, 0).x, 0.0, "左组贴左缘");
-        assert_eq!(hit(&root, 2).x, 170.0, "右组贴右缘 200-30");
-    }
-
-    #[test]
-    fn arrange_fill_cross_stretches_width() {
-        let mut root = View::container(Layout::Column).fixed_w(100.0).child(
-            View::container(Layout::Column)
-                .fixed_h(20.0)
-                .fill_cross()
-                .tag(0),
-        );
-        root.layout(0.0, 0.0, &tr());
-        assert_eq!(hit(&root, 0).w, 100.0); // 跨轴撑满列内容宽
-    }
-
-    #[test]
-    fn arrange_applies_child_margin() {
-        let mut root = View::container(Layout::Row).child(fixed(10.0, 10.0, 0).margin(Edges {
-            l: 5.0,
-            t: 3.0,
-            r: 0.0,
-            b: 0.0,
-        }));
-        root.layout(0.0, 0.0, &tr());
-        let r = hit(&root, 0);
-        assert_eq!((r.x, r.y), (5.0, 3.0)); // margin 偏移子节点原点
-    }
-
-    /// 插入符是**覆盖层**：改变 caret 位置不得改变文本的布局尺寸。
-    /// 这是回归测试——曾把 preedit 拆成「前半+竖线+后半」三节点，因
-    /// `measure(a+b) != measure(a)+measure(b)` 且拆分点随光标而变，导致移动光标时编码位移。
-    #[test]
-    fn caret_never_affects_measured_size() {
-        let tr = tr();
-        let mut base = View::leaf("nihao", [0, 0, 0, 255]).font_size(20.0);
-        base.layout(0.0, 0.0, &tr);
-        let want = base.measured_size();
-        for caret in 0..=5 {
-            let mut v = View::leaf("nihao", [0, 0, 0, 255])
-                .font_size(20.0)
-                .caret_at(caret, 1.0);
-            v.layout(0.0, 0.0, &tr);
-            assert_eq!(
-                v.measured_size(),
-                want,
-                "caret={caret} 不应改变文本布局尺寸"
-            );
-        }
-    }
-
-    /// caret_at 自夹到字符边界——paint 里 `&t[..cp]` 落在字符中间会 panic。
-    #[test]
-    fn caret_at_clamps_to_char_boundary() {
-        // 「你」占 3 字节：1/2 退回 0，3 是边界；越界截到末尾（"你hao" = 6 字节）
-        assert_eq!(
-            View::leaf("你hao", [0; 4]).caret_at(1, 1.0).caret_at,
-            Some(0)
-        );
-        assert_eq!(
-            View::leaf("你hao", [0; 4]).caret_at(2, 1.0).caret_at,
-            Some(0)
-        );
-        assert_eq!(
-            View::leaf("你hao", [0; 4]).caret_at(3, 1.0).caret_at,
-            Some(3)
-        );
-        assert_eq!(
-            View::leaf("你hao", [0; 4]).caret_at(99, 1.0).caret_at,
-            Some(6)
-        );
-    }
-
-    #[test]
-    fn collect_hits_depth_first_skips_untagged() {
-        let mut root = View::container(Layout::Column)
-            .child(fixed(10.0, 10.0, 0))
-            .child(fixed(10.0, 10.0, 1).child(fixed(5.0, 5.0, 2)));
-        root.layout(0.0, 0.0, &tr());
-        let mut out = Vec::new();
-        root.collect_hits(&mut out);
-        let tags: Vec<i32> = out.iter().map(|(t, _)| *t).collect();
-        assert_eq!(tags, vec![0, 1, 2]); // 先序遍历；root 默认 tag=-1 不收集
-    }
-}
-
-/// 绘制层序：边框必须压在背景图之上（t206）。
+/// 绘制层序：边框必须压在背景图之上。
 ///
 /// 不 gate 平台：只用定宽定高与纯色位图，不碰文本测量。
 #[cfg(test)]
@@ -3773,703 +2761,13 @@ mod paint_order_tests {
     }
 }
 
-/// 背景图定位（t238 / A2-52）：配了 anchor/offset/size 的背景图摆成一块、裁到节点圆角盒内；
+/// 背景图定位：配了 anchor/offset/size 的背景图摆成一块、裁到节点圆角盒内；
 /// 不配则铺满节点，与改前一致。覆盖图的尺寸口径（只给一维）一并钉在这里。
 ///
 /// 不 gate 平台：只用定宽定高与纯色位图，不碰文本测量。
 #[cfg(test)]
-mod bg_place_tests {
-    use super::*;
-    use crate::text::MockText as TextRenderer;
-    use base64::Engine as _;
-
-    const RED: [u8; 4] = [255, 0, 0, 255];
-    const WHITE: [u8; 3] = [255, 255, 255];
-
-    fn data_uri(img: image::RgbaImage) -> String {
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(img)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .expect("PNG 编码");
-        format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
-        )
-    }
-
-    fn png_uri(rgba: [u8; 4], w: u32, h: u32) -> String {
-        data_uri(image::RgbaImage::from_pixel(w, h, image::Rgba(rgba)))
-    }
-
-    /// 左半红、右半蓝：拿来对拍铺满结果，纯色图看不出拉伸方式变没变。
-    fn two_tone_uri() -> String {
-        data_uri(image::RgbaImage::from_fn(8, 4, |x, _| {
-            if x < 4 {
-                image::Rgba([255, 0, 0, 255])
-            } else {
-                image::Rgba([0, 0, 255, 255])
-            }
-        }))
-    }
-
-    fn image(path: String, place: Option<ImagePlace>) -> ViewImage {
-        ViewImage {
-            path,
-            mode: String::new(),
-            slice: [0.0; 4],
-            slice_repeat: [false; 2],
-            opacity: 1.0,
-            tint: None,
-            place,
-            scale: 1.0,
-            flip: wind_theme::Flip::NONE,
-        }
-    }
-
-    fn place(anchor: &str) -> ImagePlace {
-        ImagePlace {
-            anchor: anchor.to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// 节点 `nw×nh` 置于 `bw×bh` 缓冲左上角，白底；返回 BGRA 缓冲。
-    fn paint(v: View, nw: f32, nh: f32, bw: usize, bh: usize) -> Vec<u8> {
-        let tr = TextRenderer::new("test", 20.0).unwrap();
-        let mut v = v.fixed_w(nw).fixed_h(nh);
-        v.layout(0.0, 0.0, &tr);
-        let mut buf = vec![0u8; bw * bh * 4];
-        v.paint(&mut buf, bw as u32, bh as u32, &tr);
-        buf
-    }
-
-    fn node() -> View {
-        View::container(Layout::Row).bg([255, 255, 255, 255])
-    }
-
-    fn rgb(buf: &[u8], bw: usize, x: usize, y: usize) -> [u8; 3] {
-        let i = (y * bw + x) * 4;
-        [buf[i + 2], buf[i + 1], buf[i]]
-    }
-
-    fn alpha(buf: &[u8], bw: usize, x: usize, y: usize) -> u8 {
-        buf[(y * bw + x) * 4 + 3]
-    }
-
-    /// 圆角裁剪：贴满窗口的直角子节点，四角被窗口弧线削掉；不开则方角会露出来。
-    #[test]
-    fn clip_corners_trims_square_children_to_rounded_outline() {
-        let build = |clip: bool| {
-            let mut root = View::container(Layout::Column)
-                .bg([255, 255, 255, 255])
-                .radius(12.0);
-            if clip {
-                root = root.clip_to_corners();
-            }
-            root.child(
-                View::container(Layout::Row)
-                    .bg([255, 0, 0, 255])
-                    .fixed_w(60.0)
-                    .fixed_h(40.0),
-            )
-        };
-        let off = paint(build(false), 60.0, 40.0, 60, 40);
-        assert_eq!(rgb(&off, 60, 0, 0), [255, 0, 0], "未开裁剪：方角露出");
-        let on = paint(build(true), 60.0, 40.0, 60, 40);
-        assert_eq!(alpha(&on, 60, 0, 0), 0, "开裁剪：圆角外保持透明");
-        assert_eq!(alpha(&on, 60, 59, 39), 0);
-        assert_eq!(rgb(&on, 60, 30, 20), [255, 0, 0], "内部直角填充不受影响");
-        assert_eq!(rgb(&on, 60, 30, 0), [255, 0, 0], "直边不受影响");
-    }
-
-    /// 参照实现：整窗备份 + 整窗掩码（改成四角块之前的做法）。角块版必须与它逐字节一致，
-    /// 含奇数尺寸、胶囊形（半径被钳）、半径大于半边长。
-    #[test]
-    fn corner_save_matches_full_window_reference() {
-        for &(w, h, rad) in &[
-            (60u32, 40u32, 12.0f32),
-            (61, 41, 12.0),
-            (50, 21, 999.0),
-            (51, 20, 999.0),
-            (30, 30, 40.0),
-            (40, 40, 0.4),
-        ] {
-            let (bw, bh) = (w + 6, h + 6);
-            let mut base = vec![0u8; (bw * bh * 4) as usize];
-            fill_rounded(
-                &mut base,
-                bw,
-                bh,
-                3.0,
-                3.0,
-                w as f32,
-                h as f32,
-                [40, 80, 160, 255],
-                rad,
-            );
-            let rect = Rect {
-                x: 3.0,
-                y: 3.0,
-                w: w as f32,
-                h: h as f32,
-            };
-            // 模拟子节点：斜向渐变风格的不规则内容铺满整个窗口矩形。
-            let mut after = base.clone();
-            for y in 3..3 + h {
-                for x in 3..3 + w {
-                    let o = ((y * bw + x) * 4) as usize;
-                    let v = ((x * 7 + y * 13) % 251) as u8;
-                    after[o..o + 4].copy_from_slice(&[v, 255 - v, v / 2, 255]);
-                }
-            }
-            // 新实现。
-            let mut got = after.clone();
-            CornerSave::take(&base, bw, bh, rect, rad)
-                .unwrap()
-                .restore(&mut got, bw, bh);
-            // 参照：整窗掩码。
-            let mut mask = vec![0u8; (w * h * 4) as usize];
-            fill_rounded(&mut mask, w, h, 0.0, 0.0, w as f32, h as f32, [255; 4], rad);
-            let mut want = after.clone();
-            for y in 0..h {
-                for x in 0..w {
-                    let cov = mask[((y * w + x) * 4 + 3) as usize] as i32;
-                    let d = (((y + 3) * bw + x + 3) * 4) as usize;
-                    for c in 0..4 {
-                        let (cur, old) = (after[d + c] as i32, base[d + c] as i32);
-                        want[d + c] = (old + ((cur - old) * cov + 127) / 255) as u8;
-                    }
-                }
-            }
-            // tiny-skia 对「部分在画布外」的路径走裁剪光栅化，覆盖率与整窗掩码可差 1 级。
-            if let Some(i) = (0..got.len()).find(|&i| got[i].abs_diff(want[i]) > 1) {
-                let px = (i / 4) as u32;
-                panic!(
-                    "{w}x{h} r={rad}: ({},{}) ch{} got {} want {}",
-                    px % bw,
-                    px / bw,
-                    i % 4,
-                    got[i],
-                    want[i]
-                );
-            }
-        }
-    }
-
-    /// 窗口只有一部分在缓冲内（被屏幕边缘截断）时不越界、不 panic。
-    #[test]
-    fn corner_save_survives_rect_partly_outside_buffer() {
-        let mut buf = vec![255u8; 20 * 20 * 4];
-        let rect = Rect {
-            x: -5.0,
-            y: 10.0,
-            w: 40.0,
-            h: 30.0,
-        };
-        let saved = CornerSave::take(&buf, 20, 20, rect, 8.0).unwrap();
-        saved.restore(&mut buf, 20, 20);
-    }
-
-    /// z>=0 覆盖图也要被圆角轮廓裁掉（还原放在它之后）。
-    #[test]
-    fn clip_corners_also_trims_front_layers() {
-        let mut root = View::container(Layout::Column)
-            .bg([255, 255, 255, 255])
-            .radius(12.0)
-            .clip_to_corners();
-        root.layers.push(ViewLayer {
-            path: png_uri(RED, 4, 4),
-            z: 1,
-            place: ImagePlace {
-                w: 60.0,
-                h: 40.0,
-                ..place("top-left")
-            },
-            tint: [0, 0, 0, 0],
-            opacity: 1.0,
-            flip: wind_theme::Flip::NONE,
-        });
-        let buf = paint(root.fixed_w(60.0).fixed_h(40.0), 60.0, 40.0, 60, 40);
-        assert_eq!(alpha(&buf, 60, 0, 0), 0, "前景层不得露出圆角外");
-        assert_eq!(rgb(&buf, 60, 30, 20), [255, 0, 0]);
-    }
-
-    /// z<0 覆盖图同样不得露出圆角外：圆角备份要取在它之前。
-    #[test]
-    fn clip_corners_also_trims_back_layers() {
-        let mut root = View::container(Layout::Column)
-            .bg([255, 255, 255, 255])
-            .radius(12.0)
-            .clip_to_corners();
-        root.layers.push(ViewLayer {
-            path: png_uri(RED, 4, 4),
-            z: -1,
-            place: ImagePlace {
-                w: 60.0,
-                h: 40.0,
-                ..place("top-left")
-            },
-            tint: [0, 0, 0, 0],
-            opacity: 1.0,
-            flip: wind_theme::Flip::NONE,
-        });
-        let buf = paint(root.fixed_w(60.0).fixed_h(40.0), 60.0, 40.0, 60, 40);
-        assert_eq!(alpha(&buf, 60, 59, 39), 0, "底层图不得露出圆角外");
-        assert_eq!(rgb(&buf, 60, 30, 20), [255, 0, 0]);
-    }
-
-    /// 楼主的场景：候选窗最右侧钉一张小图。anchor=right + 向左 4px，落点之外不得被涂。
-    #[test]
-    fn anchored_bg_image_lands_at_anchor_plus_offset() {
-        let p = ImagePlace {
-            off_x: -4.0,
-            w: 10.0,
-            h: 10.0,
-            ..place("right")
-        };
-        let buf = paint(
-            node().bg_image(image(png_uri(RED, 10, 10), Some(p))),
-            100.0,
-            40.0,
-            100,
-            40,
-        );
-        // 期望 x∈[86,96)、y∈[15,25)。
-        assert_eq!(
-            rgb(&buf, 100, 86, 15),
-            [255, 0, 0],
-            "左上角没落在锚点+偏移处"
-        );
-        assert_eq!(
-            rgb(&buf, 100, 95, 24),
-            [255, 0, 0],
-            "右下角没落在锚点+偏移处"
-        );
-        assert_eq!(rgb(&buf, 100, 5, 20), WHITE, "背景图仍铺满了整个节点");
-        assert_eq!(rgb(&buf, 100, 85, 20), WHITE, "图左侧被涂");
-        assert_eq!(rgb(&buf, 100, 97, 20), WHITE, "偏移没生效：右缘留白被涂");
-        assert_eq!(rgb(&buf, 100, 90, 13), WHITE, "图上方被涂");
-        assert_eq!(rgb(&buf, 100, 90, 26), WHITE, "图下方被涂");
-    }
-
-    /// 百分比偏移相对节点宽高：50% × 100 = 50，25% × 40 = 10。
-    #[test]
-    fn bg_image_pct_offset_is_relative_to_node() {
-        let p = ImagePlace {
-            off_x_pct: 50.0,
-            off_y_pct: 25.0,
-            w: 10.0,
-            h: 10.0,
-            ..place("top-left")
-        };
-        let buf = paint(
-            node().bg_image(image(png_uri(RED, 10, 10), Some(p))),
-            100.0,
-            40.0,
-            100,
-            40,
-        );
-        assert_eq!(rgb(&buf, 100, 50, 10), [255, 0, 0]);
-        assert_eq!(rgb(&buf, 100, 59, 19), [255, 0, 0]);
-        assert_eq!(rgb(&buf, 100, 49, 15), WHITE);
-        assert_eq!(rgb(&buf, 100, 55, 9), WHITE);
-        assert_eq!(rgb(&buf, 100, 60, 15), WHITE);
-    }
-
-    /// 不给 size = 原图像素尺寸（与覆盖图一致）。
-    #[test]
-    fn bg_image_without_size_uses_source_pixels() {
-        let buf = paint(
-            node().bg_image(image(png_uri(RED, 6, 4), Some(place("bottom-right")))),
-            40.0,
-            20.0,
-            40,
-            20,
-        );
-        assert_eq!(rgb(&buf, 40, 34, 16), [255, 0, 0]);
-        assert_eq!(rgb(&buf, 40, 39, 19), [255, 0, 0]);
-        assert_eq!(rgb(&buf, 40, 33, 18), WHITE);
-        assert_eq!(rgb(&buf, 40, 36, 15), WHITE);
-    }
-
-    /// 尺寸规则的纯几何：只给一维 → 另一维按原图宽高比推算；两维都不给 → 原图 × DPI。
-    /// 两维都给时按给的来，不看原图（`src` 不该被调用——位图白解码一次不便宜）。
-    #[test]
-    fn rect_size_rules() {
-        let host = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 100.0,
-            h: 100.0,
-        };
-        let size = |p: ImagePlace, src: (u32, u32)| {
-            let (_, _, w, h) = p.rect(host, || Some(src)).expect("有原图尺寸就该出矩形");
-            (w, h)
-        };
-        let tl = place("top-left");
-
-        // 只给 w：h = w × src_h / src_w。
-        let only_w = ImagePlace {
-            w: 20.0,
-            ..tl.clone()
-        };
-        assert_eq!(
-            size(only_w, (10, 6)),
-            (20.0, 12.0),
-            "只给 w 时 h 没按原图比例"
-        );
-        // 只给 h：w = h × src_w / src_h。
-        let only_h = ImagePlace {
-            h: 12.0,
-            ..tl.clone()
-        };
-        assert_eq!(
-            size(only_h, (10, 6)),
-            (20.0, 12.0),
-            "只给 h 时 w 没按原图比例"
-        );
-        // 都不给：原图 × scale。
-        let none = ImagePlace {
-            scale: 2.0,
-            ..tl.clone()
-        };
-        assert_eq!(size(none, (6, 4)), (12.0, 8.0), "缺省尺寸没乘 DPI");
-        // 都给：不问原图。
-        let both = ImagePlace {
-            w: 7.0,
-            h: 9.0,
-            scale: 2.0,
-            ..tl.clone()
-        };
-        let (_, _, w, h) = both
-            .rect(host, || panic!("两维都给了还去取原图尺寸"))
-            .unwrap();
-        assert_eq!((w, h), (7.0, 9.0));
-        // 只给一维时 scale 不再叠乘（给定维已 ×scale，比例无量纲）。
-        let only_w_hidpi = ImagePlace {
-            w: 40.0,
-            scale: 2.0,
-            ..tl
-        };
-        assert_eq!(size(only_w_hidpi, (10, 6)), (40.0, 24.0));
-    }
-
-    /// 推算 / 缺省尺寸有上限（[`MAX_PLACED_EDGE`]）：市场主题给个 1×100000 的图再写 w=20，
-    /// 按比例推出 h=2,000,000，填充位图就是几 GB。双向钉：超了必须截，没超一点不能动。
-    #[test]
-    fn rect_size_is_capped() {
-        let host = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 100.0,
-            h: 100.0,
-        };
-        let size = |p: ImagePlace, src: (u32, u32)| {
-            let (_, _, w, h) = p.rect(host, || Some(src)).unwrap();
-            (w, h)
-        };
-        let tl = place("top-left");
-        let only_w = ImagePlace {
-            w: 20.0,
-            ..tl.clone()
-        };
-        assert_eq!(size(only_w.clone(), (1, 100_000)), (20.0, MAX_PLACED_EDGE));
-        let hidpi = ImagePlace {
-            scale: 2.0,
-            ..tl.clone()
-        };
-        assert_eq!(size(hidpi, (100_000, 1)), (MAX_PLACED_EDGE, 2.0));
-        let both = ImagePlace {
-            w: 99_999.0,
-            h: 3.0,
-            ..tl
-        };
-        assert_eq!(size(both, (1, 1)), (MAX_PLACED_EDGE, 3.0));
-        // 反向：贴着上限以下的合法大图原样保留。
-        assert_eq!(size(only_w, (1, 204)), (20.0, 4080.0));
-    }
-
-    /// 定位背景图（place=Some）+ SVG center：单元（文档尺寸）居中于定位块内，块内其余透明。
-    #[test]
-    fn positioned_svg_bg_image_centers_unit_in_its_block() {
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#FF0000"/></svg>"##;
-        let uri = format!(
-            "data:image/svg+xml;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(svg)
-        );
-        let p = ImagePlace {
-            off_x: 2.0,
-            off_y: 2.0,
-            w: 12.0,
-            h: 12.0,
-            ..place("top-left")
-        };
-        let img = ViewImage {
-            mode: "center".to_string(),
-            ..image(uri, Some(p))
-        };
-        let buf = paint(node().bg_image(img), 20.0, 20.0, 20, 20);
-        // 定位块 [2,14)，单元 4×4 居中 → [6,10)。
-        assert_eq!(rgb(&buf, 20, 6, 6), [255, 0, 0]);
-        assert_eq!(rgb(&buf, 20, 9, 9), [255, 0, 0]);
-        assert_eq!(rgb(&buf, 20, 5, 7), WHITE, "单元被拉伸到整块");
-        assert_eq!(rgb(&buf, 20, 10, 7), WHITE, "单元被拉伸到整块");
-        assert_eq!(rgb(&buf, 20, 7, 2), WHITE);
-    }
-
-    /// SVG 与位图同口径：原图尺寸取 SVG 文档尺寸，只给一维按文档宽高比推算。
-    #[test]
-    fn svg_layer_single_axis_keeps_document_aspect() {
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><rect width="10" height="6" fill="#FF0000"/></svg>"##;
-        let uri = format!(
-            "data:image/svg+xml;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(svg)
-        );
-        let p = ImagePlace {
-            w: 20.0,
-            ..place("top-left")
-        };
-        let buf = paint(node().layers(vec![layer(uri, 1, p)]), 40.0, 20.0, 40, 20);
-        assert_eq!(
-            rgb(&buf, 40, 19, 11),
-            [255, 0, 0],
-            "SVG 高没按文档比例推到 12"
-        );
-        assert_eq!(rgb(&buf, 40, 5, 12), WHITE, "SVG 高超出 12");
-        assert_eq!(rgb(&buf, 40, 20, 3), WHITE, "SVG 宽超出 size.w");
-    }
-
-    /// 只给一维 size：另一维按原图宽高比推算（背景图与覆盖图同此口径）。
-    #[test]
-    fn single_axis_size_keeps_source_aspect() {
-        let p = ImagePlace {
-            w: 20.0,
-            ..place("top-left")
-        };
-        let bg = paint(
-            node().bg_image(image(png_uri(RED, 10, 6), Some(p.clone()))),
-            40.0,
-            20.0,
-            40,
-            20,
-        );
-        let layer = paint(
-            node().layers(vec![ViewLayer {
-                path: png_uri(RED, 10, 6),
-                z: 1,
-                place: p,
-                opacity: 1.0,
-                tint: [0, 0, 0, 0],
-                flip: wind_theme::Flip::NONE,
-            }]),
-            40.0,
-            20.0,
-            40,
-            20,
-        );
-        for (name, buf) in [("背景图", &bg), ("覆盖图", &layer)] {
-            assert_eq!(rgb(buf, 40, 19, 5), [255, 0, 0], "{name}：宽没取 size.w");
-            assert_eq!(rgb(buf, 40, 20, 3), WHITE, "{name}：宽超出 size.w");
-            // 原图 10×6、w=20 → h=12。
-            assert_eq!(
-                rgb(buf, 40, 5, 11),
-                [255, 0, 0],
-                "{name}：高没按比例推到 12"
-            );
-            assert_eq!(rgb(buf, 40, 5, 12), WHITE, "{name}：高超出 12");
-        }
-    }
-
-    /// 定位图超出节点的部分裁掉：圆角外、节点右缘外都不能有图。
-    #[test]
-    fn positioned_bg_image_is_clipped_to_rounded_node() {
-        // 节点 40×40（圆角 12）放在 60×40 缓冲里；图 16×16 贴右上角再向右挪 6px，一半出界。
-        let p = ImagePlace {
-            off_x: 6.0,
-            ..place("top-right")
-        };
-        let buf = paint(
-            node()
-                .radius(12.0)
-                .bg_image(image(png_uri(RED, 16, 16), Some(p))),
-            40.0,
-            40.0,
-            60,
-            40,
-        );
-        assert_eq!(rgb(&buf, 60, 32, 8), [255, 0, 0], "盒内那半没画");
-        assert_eq!(alpha(&buf, 60, 42, 8), 0, "节点右缘外被涂");
-        assert_eq!(alpha(&buf, 60, 39, 0), 0, "圆角外被涂");
-    }
-
-    fn layer(path: String, z: i32, place: ImagePlace) -> ViewLayer {
-        ViewLayer {
-            path,
-            z,
-            place,
-            opacity: 1.0,
-            tint: [0, 0, 0, 0],
-            flip: wind_theme::Flip::NONE,
-        }
-    }
-
-    /// 图层 tint：语义同背景图（把图当 alpha 蒙版、RGB 换成 tint 色），此前 `paint_layer`
-    /// 写死 `[0,0,0,0]`，主题里给图层配的 tint 一声不响地被丢掉。
-    #[test]
-    fn layer_tint_recolors_like_bg_image() {
-        let p = ImagePlace {
-            w: 10.0,
-            h: 10.0,
-            ..place("top-left")
-        };
-        let tinted = ViewLayer {
-            tint: [0, 0, 255, 255],
-            ..layer(png_uri(RED, 10, 10), 1, p.clone())
-        };
-        let buf = paint(node().layers(vec![tinted]), 20.0, 20.0, 20, 20);
-        assert_eq!(rgb(&buf, 20, 5, 5), [0, 0, 255], "图层 tint 没生效");
-        assert_eq!(rgb(&buf, 20, 15, 15), WHITE, "图层外被涂");
-        // 反向对照：未配 tint 原样出图。
-        let plain = paint(
-            node().layers(vec![layer(png_uri(RED, 10, 10), 1, p)]),
-            20.0,
-            20.0,
-            20,
-            20,
-        );
-        assert_eq!(rgb(&plain, 20, 5, 5), [255, 0, 0]);
-    }
-
-    /// 覆盖图超出节点的部分裁掉，裁到节点**矩形**（不带圆角）——对齐编辑器预览
-    /// `paintLayers` 的 `ctx.rect` 硬裁；内容上下两层同一口径。
-    #[test]
-    fn layer_overflow_is_clipped_to_node_rect() {
-        for z in [-1, 1] {
-            // 节点 40×40（圆角 12）放在 60×40 缓冲里；图 16×16 贴右上角再向右挪 6px，一半出界。
-            let p = ImagePlace {
-                off_x: 6.0,
-                ..place("top-right")
-            };
-            let buf = paint(
-                View::container(Layout::Row).radius(12.0).layers(vec![layer(
-                    png_uri(RED, 16, 16),
-                    z,
-                    p,
-                )]),
-                40.0,
-                40.0,
-                60,
-                40,
-            );
-            assert_eq!(rgb(&buf, 60, 32, 8), [255, 0, 0], "z={z}：盒内那半没画");
-            assert_eq!(alpha(&buf, 60, 40, 8), 0, "z={z}：节点右缘外被涂");
-            assert_eq!(alpha(&buf, 60, 45, 8), 0, "z={z}：节点右缘外被涂");
-            assert_eq!(
-                rgb(&buf, 60, 39, 0),
-                [255, 0, 0],
-                "z={z}：覆盖图只裁矩形，圆角处照画（编辑器口径）"
-            );
-        }
-    }
-
-    /// 完全落在节点内的覆盖图不受裁剪影响：同一位置、节点大小不同，画出来逐像素一致。
-    #[test]
-    fn layer_inside_node_is_not_trimmed() {
-        let p = ImagePlace {
-            off_x: 5.0,
-            off_y: 5.0,
-            ..place("top-left")
-        };
-        let at = |n: f32| {
-            paint(
-                View::container(Layout::Row).layers(vec![layer(two_tone_uri(), 1, p.clone())]),
-                n,
-                n,
-                60,
-                60,
-            )
-        };
-        let small = at(13.0);
-        assert_eq!(rgb(&small, 60, 5, 5), [255, 0, 0]);
-        assert_eq!(
-            rgb(&small, 60, 12, 8),
-            [0, 0, 255],
-            "贴着节点边的那列被裁了"
-        );
-        assert!(small == at(60.0), "节点内的覆盖图被裁剪改了像素");
-    }
-
-    /// 不配定位 = 铺满节点。对拍：铺满结果与「左上锚点、尺寸恰为节点」的定位结果逐像素一致，
-    /// 且圆角外保持透明。
-    #[test]
-    fn unpositioned_bg_image_fills_node_as_before() {
-        let (w, h) = (30usize, 12usize);
-        let full = paint(
-            node().radius(4.0).bg_image(image(two_tone_uri(), None)),
-            w as f32,
-            h as f32,
-            w,
-            h,
-        );
-        let exact = ImagePlace {
-            w: w as f32,
-            h: h as f32,
-            ..place("top-left")
-        };
-        let placed = paint(
-            node()
-                .radius(4.0)
-                .bg_image(image(two_tone_uri(), Some(exact))),
-            w as f32,
-            h as f32,
-            w,
-            h,
-        );
-        assert_eq!(rgb(&full, w, 2, 6), [255, 0, 0]);
-        assert_eq!(rgb(&full, w, 27, 6), [0, 0, 255], "没有拉伸铺满");
-        assert_eq!(alpha(&full, w, 0, 0), 0);
-        assert!(full == placed, "铺满与等尺寸定位不一致");
-    }
-
-    /// flip 接到背景图（铺满 / 定位）与图层的绘制：左红右蓝翻成左蓝右红，摆放位置不变。
-    #[test]
-    fn flip_reaches_bg_image_and_layer_paint() {
-        let x = wind_theme::Flip { x: true, y: false };
-        let (w, h) = (30usize, 12usize);
-        let flipped = |place: Option<ImagePlace>| ViewImage {
-            flip: x,
-            ..image(two_tone_uri(), place)
-        };
-        let full = paint(node().bg_image(flipped(None)), w as f32, h as f32, w, h);
-        assert_eq!(rgb(&full, w, 2, 6), [0, 0, 255], "铺满背景图没翻");
-        assert_eq!(rgb(&full, w, 27, 6), [255, 0, 0]);
-        let p = ImagePlace {
-            w: 10.0,
-            h: 4.0,
-            off_x: 5.0,
-            ..place("top-left")
-        };
-        let placed = paint(
-            node().bg_image(flipped(Some(p.clone()))),
-            w as f32,
-            h as f32,
-            w,
-            h,
-        );
-        assert_eq!(rgb(&placed, w, 5, 1), [0, 0, 255], "定位背景图没翻");
-        assert_eq!(rgb(&placed, w, 14, 1), [255, 0, 0]);
-        assert_eq!(rgb(&placed, w, 4, 1), WHITE, "只翻像素，摆放位置不动");
-        assert_eq!(rgb(&placed, w, 15, 1), WHITE);
-        let lay = ViewLayer {
-            flip: x,
-            ..layer(two_tone_uri(), 1, p)
-        };
-        let buf = paint(node().layers(vec![lay]), w as f32, h as f32, w, h);
-        assert_eq!(rgb(&buf, w, 5, 1), [0, 0, 255], "图层没翻");
-        assert_eq!(rgb(&buf, w, 14, 1), [255, 0, 0]);
-        assert_eq!(rgb(&buf, w, 4, 1), WHITE);
-    }
-}
+#[path = "view_bg_place_tests.rs"]
+mod bg_place_tests;
 
 // 分段颜色的接线：有区间走 `draw_runs`、没有走原来的 `draw`，且区间不影响布局。
 // 只有 mock 后端记绘制调用。

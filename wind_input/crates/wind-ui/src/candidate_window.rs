@@ -29,17 +29,14 @@ use crate::view::{Edges, Layout, View};
 
 /// 内置默认字族：`ui.font.family` 为空时用它。
 ///
-/// 它同时是 `TextRenderer::new` 的初始字族与回退链的链首，**必须只有一个来源**——
-/// 两处写死同一个字符串，改一处漏一处时的表现是「链首与实际 base family 对不上」，
-/// 而那只会让回退链静默不生效，不报任何错。
+/// 它同时是 `TextRenderer::new` 的初始字族与回退链的链首，必须只有一个来源，否则链首与
+/// 实际 base family 对不上，回退链静默不生效。
 pub const DEFAULT_FONT_FAMILY: &str = "Microsoft YaHei UI";
 
 /// 空字族回落内置默认。
 ///
-/// ★ 抽成函数是因为 [`build_font_plan`] 必须用同一个答案：两处各写一次
-/// `if empty { … }` 的话，回退链的链首会变成空串，而 `AddMapping` 的 `baseFamilyName`
-/// 是空串就永远匹配不上任何段——表现是「配了 fallback，但只在显式写了 family 时才生效」，
-/// 且没有任何报错。
+/// [`build_font_plan`] 必须用同一个答案：链首是空串时 `AddMapping` 的 `baseFamilyName` 永远
+/// 匹配不上，fallback 只在显式写了 family 时才生效。
 fn resolve_font_family(family: &str) -> &str {
     let f = family.trim();
     if f.is_empty() { DEFAULT_FONT_FAMILY } else { f }
@@ -47,11 +44,8 @@ fn resolve_font_family(family: &str) -> &str {
 
 /// 把 `[ui.font]` 的三个键折成渲染层的 [`FontPlan`]。
 ///
-/// 纯函数：它承载了本功能全部的「配置怎么变成方案」的判定（链首归一、未知类名处置），
-/// 而这些判定与窗口/COM 都无关，抽出来才测得到（构造 `CandidateWindow` 要真窗口）。
-///
-/// 未知的脚本类名记一条 warn 后**忽略**：配置文件是用户手写的，拼错一个键不该让整份
-/// 字体配置失效，更不该 panic。
+/// 纯函数，承载「配置怎么变成方案」的全部判定（链首归一、未知类名处置），与窗口/COM 无关，
+/// 故可单测。未知的脚本类名记 warn 后忽略：拼错一个键不该让整份字体配置失效。
 pub(crate) fn build_font_plan(
     family: &str,
     fallback: &[String],
@@ -69,19 +63,13 @@ pub(crate) fn build_font_plan(
     }
     // emoji 类的出厂指派（仅 Windows；macOS 的脚本指派尚未实现，见 `coretext.rs`）。
     //
-    // 不靠 data/config.toml 的默认值而在这里注入，是因为配置层写回不剔除「等于默认」的键：
-    // 老用户的 config.toml 里已经躺着一句 `scripts = {}`，改出厂值对他们永远不生效。
-    // 用户显式写了 `emoji = [...]`（含空表）即按用户的来，空表就是「关掉这条指派」。
+    // 在这里注入而不靠 data/config.toml 的默认值：老用户的 config.toml 里已有 `scripts = {}`，
+    // 改出厂值对他们不生效。用户显式写了 `emoji = [...]`（含空表 = 关掉）即按用户的来。
     //
-    // 为什么必须指派而不是只靠系统回退（`DEFAULT_EMOJI_FAMILY` 的文档有全文）：
-    // - 新码位（Emoji 16.0 的 🫜 一类）本机 Segoe UI Emoji 明明有字形，DirectWrite 内置的
-    //   回退区间表却没把它映射过去，量出来是缺字宽度；
-    // - 键帽序列（1️⃣）的基字「1」基准字体自己就有，回退根本不会触发，只有把整串切进
-    //   emoji 段才能连字（见 `script::font_runs` 的回溯改写）。
-    //
-    // 已知代价：`U+2600..27BF` 里 ★ ☆ ✓ 这些中性符号会跟着搬到 Segoe UI Emoji（分类表
-    // `script.rs` 对这段的取舍写明了「声明后一并跟着走」）；`declared()` 非空后 `font_runs`
-    // 在每次绘制每个文本叶子上都会跑一遍，实测每叶子几个字、微秒级。
+    // 只靠系统回退不够：DirectWrite 的回退区间表漏映射新 emoji 码位；键帽序列的基字基准字体
+    // 自己就有，回退不触发（见 `script::font_runs` 的回溯改写）。背景见
+    // `docs/design/emoji-suggestion.md`。代价：`U+2600..27BF` 的中性符号（☆ ✓）也跟着走，
+    // 且 `font_runs` 在每个文本叶子上都要跑一遍（微秒级）。
     if cfg!(windows) && !assigned.iter().any(|(c, _)| *c == ScriptClass::Emoji) {
         assigned.push((ScriptClass::Emoji, vec![DEFAULT_EMOJI_FAMILY.to_string()]));
     }
@@ -388,7 +376,7 @@ pub struct CandidateWindow {
     tip_for: Rc<Cell<i32>>,
     /// 「屏幕点处最上层是不是这个窗口」，默认 [`crate::window::window_at`]；测试换桩。
     window_at: fn(HWND, i32, i32) -> bool,
-    /// **生效**主题：[`Self::theme_source`] 叠上外观覆盖（字体 / 字号）之后的那份。
+    /// 生效主题：[`Self::theme_source`] 叠上外观覆盖（字体 / 字号）之后的那份。
     /// 渲染与测量一律只读它，由 [`Self::refresh_effective_theme`] 单点产出。
     theme: wind_theme::Resolved,
     /// 协调器下发的原始主题（未叠外观覆盖）。只供 [`Self::refresh_effective_theme`] 读。
@@ -457,25 +445,22 @@ pub struct CandidateWindow {
     scale: f32,
     /// 竖排布局（候选纵向堆叠）；默认横排。来自 ui.candidate.layout。
     vertical: bool,
-    /// 候选**文字节点**的字族覆盖（方案级 `[candidate] font_family`）；空 = 不覆盖。
+    /// 候选文字节点的字族覆盖（方案级 `[candidate] font_family`）；空 = 不覆盖。
     ///
     /// 优先级：方案 > 用户 `ui.font.family`（非空）> 主题节点 `views.text.font_family` >
     /// 内置默认（合并见 [`scene::effective_theme`]）。
-    /// ⚠️ 只作用于候选文字：序号/编码栏/注释/翻页栏是拉丁与数字，跟着换蒙文字体反而更差；
-    /// 要按脚本换字体用全局 `ui.font.scripts`（按字符分，比按节点分更贴合真实问题）。
+    /// 只作用于候选文字：序号/编码栏/注释/翻页栏多为拉丁与数字，跟着换反而更差；按脚本换字体
+    /// 用全局 `ui.font.scripts`。
     text_family_override: String,
     /// 候选列表顺时针旋转 90° 呈现（蒙古文等纵向书写脚本）。来自 ui.candidate.layout。
     ///
-    /// ★ 旋转态下 [`Self::vertical`] 是 **false**——屏幕上候选确是并列的，于是所有按方向
-    /// 分叉的既有判据（窗口尺寸下限、注释模板、`flip_when_above`）自动走横排那一支。
-    /// 唯一额外判 `rotated` 的地方是**列表怎么构造**：局部空间里它按竖排堆叠，
-    /// 转完才成为并列的列（见 `build_tree` 的 `list_vertical`）。
+    /// 旋转态下 [`Self::vertical`] 是 false（屏幕上候选是并列的），按方向分叉的既有判据自动走
+    /// 横排那一支。唯一额外判 `rotated` 的是列表怎么构造（见 `build_tree` 的 `list_vertical`）。
     rotated: bool,
     /// 旋转态下把每个字逆时针扶正、逐字下行（对联式竖排）。来自 ui.candidate.layout。
     ///
-    /// ★ 蕴含 [`Self::rotated`]：它与旋转态是**同一种排列**，只有叶子怎么搭不同。
-    /// 于是列表构造、逆序、阴影轴、尺寸下限、分隔方向、翻页栏位置全部原样复用，
-    /// 本位只在 `build_tree` 拼文字/序号叶子时读一次。
+    /// 蕴含 [`Self::rotated`]：同一种排列，只有叶子怎么搭不同，本位只在 `build_tree` 拼文字/
+    /// 序号叶子时读。
     upright: bool,
     /// 预编辑嵌入模式（编码嵌入候选行首，不显示独立 preedit 条）。
     /// 来自 ui.candidate.preedit_display == "candidate_inline"。
@@ -493,7 +478,7 @@ pub struct CandidateWindow {
     user_offset: (i32, i32),
     /// 是否采用主题阴影（false = 用户覆盖为无阴影）。来自 ui.candidate.shadow。
     theme_shadow: bool,
-    /// 固定位置模式的**内容左上**屏幕坐标；`None`=跟随光标（默认）。
+    /// 固定位置模式的内容左上屏幕坐标；`None`=跟随光标（默认）。
     /// 来自 ui.candidate.position_mode + custom_x/custom_y，每次 UpdateCandidates 同步。
     /// `Some((0, 0))` 是"已开启固定但尚未设定位置"，定位时落到屏幕默认锚点。
     fixed_pos: Option<(i32, i32)>,
@@ -628,12 +613,8 @@ impl CandidateWindow {
     /// 设置候选文字的字族覆盖（方案级 `[candidate] font_family`）；空串 = 取消覆盖。
     /// 语义与优先级见 [`Self::text_family_override`]。
     ///
-    /// # ⚠️ 它是「替换」不是「补充」
-    ///
-    /// 声明了它，候选文字就**不再用** `ui.font.family`——升级前候选文字一律走全局主字体，
-    /// 升级后凡声明本键的方案都改用它。两个字体在同一 `font_size` 下视觉大小本就不同
-    /// （字形在 em 框内的占比各家不一），故「换了个字体」在用户眼里等同于「字被缩放了」。
-    /// 这一行日志是那件事的唯一线索：换字族不经任何会失败的调用，画面之外无迹可寻。
+    /// 它是「替换」不是「补充」：声明了就不再用 `ui.font.family`。不同字体同字号下视觉大小
+    /// 不同，用户会以为字被缩放了，这一行日志是唯一线索。
     pub fn set_text_family_override(&mut self, family: &str) {
         let want = family.trim().to_string();
         if want != self.text_family_override {
@@ -651,7 +632,7 @@ impl CandidateWindow {
     /// 设置候选布局方向。三位的语义见 [`Self::rotated`] / [`Self::upright`] 与
     /// `UiCommand::SetCandidateLayout`。
     ///
-    /// ⚠️ 三位并非正交，合法值只有四个；协调器只会发出其中之一，这里 debug 下断言两条
+    /// 三位并非正交，合法值只有四个；协调器只会发出其中之一，这里 debug 下断言两条
     /// 非法组合，把「谁手写了字段」挡在开发期。
     pub fn set_orientation(&mut self, vertical: bool, rotated: bool, upright: bool) {
         debug_assert!(!(vertical && rotated), "vertical 与 rotated 不能同时为真");
@@ -660,7 +641,7 @@ impl CandidateWindow {
         // Homebrew 工具链就停在 1.96。两种写法等价，取两个版本都干净的那个。
         debug_assert!(!upright || rotated, "upright 蕴含 rotated");
         if (vertical, rotated, upright) != (self.vertical, self.rotated, self.upright) {
-            // ⚠️ upright 会把整串按格切开逐格排版，这会**切断连写脚本**（蒙古文、阿拉伯文）
+            // upright 会把整串按格切开逐格排版，这会切断连写脚本（蒙古文、阿拉伯文）
             // 的字形连接，每格退回孤立形——孤立形比连写形窄小，画面上就是「字变小变散」。
             // 那类脚本要的是 rotated。日志里带上这一位，才分得开「字体不对」与「排列不对」。
             tracing::info!("候选排列：vertical={vertical} rotated={rotated} upright={upright}");
@@ -719,8 +700,7 @@ impl CandidateWindow {
     /// 场景退化为保守的兜底常量（见 [`CandidateSceneInput::screen_safety_max_width_px`]）。
     ///
     /// 每帧只在渲染入口开头查一次，存进 [`Self::screen_extent`]（见 [`Self::layout_frame`]），
-    /// 场景输入一律读存下的值：一帧里要借好几次输入，每次都查显示器（失败时每次还刷一条 warn）
-    /// 没有必要，同一帧内光标点与固定点也不会变。
+    /// 场景输入一律读存下的值。
     fn query_screen_extent(&self) -> Option<(u32, u32)> {
         #[cfg(windows)]
         {
@@ -839,10 +819,9 @@ impl CandidateWindow {
 
     /// 把配置里的字体名解析成渲染端认得的 family（+ 名字里带的字重），按名字缓存。
     ///
-    /// **所有**字体名入口（`ui.font.family` / `fallback` / `scripts`、方案级
-    /// `[candidate] font_family`、主题节点 `font_family`）都走这一个函数，判定顺序见
-    /// [`resolve_font_name`]：原串是 family 就原样用；否则剥掉结尾字重词、再否则按 face 全名
-    /// 查——存量配置里的旧 GDI face name（「思源宋体 SemiBold」）靠这两步自愈（看板 A2-1）。
+    /// 所有字体名入口（`ui.font.family` / `fallback` / `scripts`、方案级 `[candidate] font_family`、
+    /// 主题节点 `font_family`）都走这一个函数，判定顺序见 [`resolve_font_name`]：存量配置里的
+    /// 旧 GDI face name（「思源宋体 SemiBold」）靠剥字重词、按 face 全名查自愈。
     fn resolve_font(&self, name: &str) -> ResolvedFont {
         let name = name.trim();
         if let Some(r) = self.font_names.borrow().get(name) {
@@ -861,13 +840,8 @@ impl CandidateWindow {
 
     /// [`Self::resolve_font`] + 按结果记日志。空名字返回 `None`。
     ///
-    /// # ★ 缺失的判据是「解析后仍 `Missing`」，不是 `family_exists != Some(true)`
-    ///
-    /// `Unknown` 表示**查不了**（mock 后端、或拿不到系统字体集）。把它也当成缺失会让
-    /// 非 Windows 平台每次设字体都刷一条假 warn——「查不到」与「确实没有」是两件事。
-    ///
-    /// `source` 写配置键的**全名**：用户看到日志后要能直接去改那一项，
-    /// 而几个来源（全局主字体 / 回退链 / 方案级 / 主题节点）改的是不同的地方。
+    /// 缺失的判据是「解析后仍 `Missing`」：`Unknown` 表示查不了（mock 后端等），当成缺失会刷
+    /// 假 warn。`source` 写配置键的全名，用户看到日志能直接去改那一项。
     fn resolve_and_report(&self, family: &str, source: &str) -> Option<ResolvedFont> {
         let name = family.trim();
         if name.is_empty() {
@@ -939,8 +913,7 @@ impl CandidateWindow {
     /// `family` 必须与最近一次 [`Self::set_font_family`] 同源——它是默认链的链首。
     /// 二者由同一条 `UiCommand::SetCandidateFont` 携带，故不存在到达顺序问题。
     ///
-    /// ⚠️ 链首不在这里查存在性：它就是 `family`，已由 [`Self::set_font_family`] 查过，
-    /// 同一条命令里查两遍就是同一条 warn 刷两次。
+    /// 链首不在这里查存在性：已由 [`Self::set_font_family`] 查过。
     pub fn set_font_plan(
         &mut self,
         family: &str,
@@ -1010,14 +983,12 @@ impl CandidateWindow {
 
     /// 把「候选项当前是否被反转」上报给协调器（仅在取值变化时发事件）。
     ///
-    /// ★ **判据的真相源只能在这一侧**：`placed_above` 要窗口尺寸 + 屏幕工作区才算得出，
-    /// `vertical` 还会被模式级强制横/竖排改写 —— 协调器读配置推不出来。故复用
-    /// [`CandidateScene::above_layout`] 这个既有的单一真相源，把它第一个返回值送过去，
-    /// 由协调器把 `highlight_up` / `highlight_down` 的走向翻转（视觉方向优先于候选序）。
+    /// 判据的真相源只能在这一侧（`placed_above` 要窗口尺寸 + 屏幕工作区，协调器推不出来）：
+    /// 送 [`CandidateScene::above_layout`] 的第一个返回值过去，由协调器翻转
+    /// `highlight_up` / `highlight_down` 的走向。
     ///
-    /// 调用点＝每处「`placed_above` 刚刚定完」之后，以及 [`CandidateWindow::hide`]
-    /// 清除上翻粘滞时 —— 后者关掉的是「组合结束后状态残留为 true，下一轮首帧渲染前
-    /// 用户就按了方向键」的窗口期。
+    /// 调用点＝每处 `placed_above` 刚定完之后，以及 [`CandidateWindow::hide`] 清除上翻粘滞时
+    /// （防下一轮首帧前按方向键读到残留的 true）。
     fn report_flip_state(&mut self) {
         let (flip, _) = CandidateScene::above_layout(
             self.placed_above,
@@ -1031,20 +1002,11 @@ impl CandidateWindow {
         }
     }
 
-    /// 标记窗口进入可见态；**不可见 → 可见**的转换处重采鼠标防抖基线。
+    /// 标记窗口进入可见态；不可见 → 可见的转换处重采鼠标防抖基线。
     ///
-    /// # ★★★ 基线必须在「窗口即将出现」时采样，不能沿用 `hide()` 那次
-    ///
-    /// 防抖的门控是「物理光标坐标与基线相同 ⇒ 是内容刷新引起的伪移动 ⇒ 忽略」。基线一旦
-    /// 陈旧，判据就整个反转：窗口出现在**新**光标位下方时，Windows 投来的进入消息坐标与
-    /// 陈旧基线不同 → 被判成「用户真实移动了鼠标」→ 闸门放行 → 60ms 后自动高亮并弹 tooltip，
-    /// 而用户根本没动过鼠标。这正是本防抖要挡的那件事。
-    ///
-    /// 此前基线只在 [`CandidateWindow::hide`] 里采，于是两种情况必然失效：
-    /// - **进程内第一次显示**：此前没有任何 `hide()`，基线是构造初值 `i32::MIN`，必不相等；
-    /// - **两次显示之间用户移动过鼠标**：`hide()` 采的是上一次组合结束时的光标位，已经过时。
-    ///
-    /// 采样点挪到显示转换处后，两者一并消失——「窗口出现瞬间鼠标在哪」才是这个判据要的基准。
+    /// 基线必须在窗口即将出现时采样，不能沿用 `hide()` 那次：防抖判据是「物理光标与基线相同
+    /// ⇒ 伪移动 ⇒ 忽略」，基线陈旧（进程内首次显示、或两次显示间鼠标动过）会把窗口出现时的
+    /// 进入消息误判成真实移动，自动高亮并弹 tooltip。
     fn mark_visible(&mut self) {
         if !self.visible {
             self.mouse.borrow_mut().reset_hover();
@@ -1073,17 +1035,11 @@ impl CandidateWindow {
         self.mouse.borrow_mut().engage_delay_ms = delay_ms.max(0) as u64;
     }
 
-    /// 设置拆字字根字体（TTF 路径 + DWrite 家族名）。**两个渲染器都要收到**。
+    /// 设置拆字字根字体（TTF 路径 + DWrite 家族名）。两个渲染器都要收到。
     ///
-    /// 字根字符落在私用区（PUA），系统字体里没有对应字形，须靠渲染器把 PUA 连续段切到字根
-    /// 字体集（`text::dwrite` 的 `pua_runs` + `SetFontCollection`，测量与绘制共用同一函数）。
-    /// 那套机制本身与控件无关，但**它只对调用过本方法的那个 `TextRenderer` 实例生效**。
-    ///
-    /// 本方法此前名为 `set_tooltip_chaizi_font`，只转发给 `self.tooltip` —— 于是候选窗自己的
-    /// `self.text_renderer` 从未拿到过字根字体。悬停提示里的字根正常、候选行里的字根显示成
-    /// 豆腐块或空白，而配置/文件/家族名/日志四项全对，查不出所以然
-    /// （同 `project_chaizi_font_pua_plane_gap` 的形态：**四项全对就该查消费端，不是资源本身**）。
-    /// 此前无人发现是因为候选行从来没有渲染过字根——注释段接入拆字来源后才第一次有。
+    /// 字根字符落在私用区（PUA），靠渲染器把 PUA 连续段切到字根字体集（`text::dwrite` 的
+    /// `pua_runs` + `SetFontCollection`）。这套机制只对调用过本方法的那个 `TextRenderer` 实例
+    /// 生效，漏转发给候选窗自己的渲染器，候选行里的字根就显示成豆腐块。
     pub fn set_chaizi_font(&mut self, path: &str, family: &str) {
         if let Err(e) = self.text_renderer.set_chaizi_font(path, family) {
             tracing::warn!("候选窗字根字体加载失败: {e}");
@@ -1173,7 +1129,7 @@ impl CandidateWindow {
         }
     }
 
-    /// 由原始主题 + 外观覆盖算出生效主题（[`Self::theme`]）与生效字号——**唯一**的合并点。
+    /// 由原始主题 + 外观覆盖算出生效主题（[`Self::theme`]）与生效字号——唯一的合并点。
     ///
     /// 在四个低频入口（换主题 / 用户字体 / 方案级字体 / 用户字号）调用，不在渲染热路径。
     /// 渲染与测量（`build_tree` 里的 `measure_style` 与各叶子）都只读结果，
@@ -1192,7 +1148,7 @@ impl CandidateWindow {
             let r = self.resolve_font(f);
             (r.family, r.weight)
         });
-        // 存在性告警按**生效**字族查（叠上用户字体之后、方案级字体之前，见
+        // 存在性告警按生效字族查（叠上用户字体之后、方案级字体之前，见
         // [`scene::EffectiveTheme::declared_families`]）。未变就不再问。
         if eff.declared_families != self.checked_theme_families {
             self.warn_missing_theme_families(&eff.declared_families);
@@ -1212,15 +1168,8 @@ impl CandidateWindow {
 
     /// 主题各节点声明的字族逐个查一次存在性，缺的记 warn。见 [`Self::resolve_and_report`]。
     ///
-    /// 全局 `ui.font.family` 与方案级 `[candidate] font_family` 早有这道查，主题节点一直漏着
-    /// ——而主题是最容易写错的那处：作者自己机器上装着那款字体，换台机器就静默回落，
-    /// 画面只表现为「字体不对」，日志里一片安静。
-    ///
-    /// 只在换主题时走（`push_theme` 的那几个低频事件：启动 / 切主题 / 深浅色 / 配置 reload），
-    /// 不在渲染热路径——每个字族一次 `FindFamilyName` 是按 COM 调用计费的。
-    ///
-    /// **按字族去重**：一份主题里十来个节点常配同一个名字，缺失时刷十条一模一样的 warn
-    /// 只会把日志淹掉。留第一个声明它的节点路径，用户照着去主题文件里搜那个名字就够了。
+    /// 主题作者机器上装着的字体换台机器就静默回落，这里给出日志线索。只在换主题时走
+    /// （`push_theme` 的低频事件），不在渲染热路径。按字族去重，留第一个声明它的节点路径。
     fn warn_missing_theme_families(&self, declared: &[(String, String)]) {
         let mut seen = std::collections::HashSet::new();
         for (path, family) in declared {
@@ -1269,7 +1218,7 @@ impl CandidateWindow {
     /// 内容区在窗口里的左上（软阴影扩边）。
     fn note_grid_box(&self, (left, top): (f32, f32), w: f32) {
         if self.grid.is_some() {
-            // 气泡贴的是**窗口实际的**右缘：渲染入口随后会按屏幕安全宽度收窄窗口，超宽的网格
+            // 气泡贴的是窗口实际的右缘：渲染入口随后会按屏幕安全宽度收窄窗口，超宽的网格
             // 按测得宽度记会让气泡离窗口右缘空出一截。与入口那道钳制同一个上限。
             let shown = w.min(self.screen_safety_max_width_px() as f32);
             self.grid_box.set((left, left + shown, top));
@@ -1286,15 +1235,13 @@ impl CandidateWindow {
 
     /// 悬停气泡的锚点：`(放侧边?, 左缘, 右缘, 顶, 底)`，窗口内坐标。
     ///
-    /// - 展开态：**停靠**在整个窗口外侧的顶端（右侧优先、放不下改左），不随悬停行上下移动，
-    ///   只换内容。按单格放的话，横排的「下方」与竖排的「侧边」都会盖住相邻的格子；跟着行
-    ///   上下走则是「半跟随」——位置在变却够不着，鼠标斜着过去一路擦过别的格子。
+    /// - 展开态：停靠在整个窗口外侧的顶端（右侧优先、放不下改左），不随悬停行移动，只换内容
+    ///   （按单格放会盖住相邻的格子）。
     /// - 竖排 / 旋转态：候选项侧边（旋转态的候选项是又高又窄的一列，放上下会离得很远）。
     /// - 横排：候选项下方（不足时上翻）。
     ///
-    /// ★ 三处定位（本地显示 `update_tooltip`、host-render `render_tooltip_frame`、外部宿主
-    /// `render_tooltip_overlay`）都从这里取，一处放侧边、一处放上下的话，同一个悬停在
-    /// 「实时显示」与「重推帧」之间会跳位置。
+    /// 三处定位（`update_tooltip`、`render_tooltip_frame`、`render_tooltip_overlay`）都从这里取，
+    /// 否则同一个悬停在实时显示与重推帧之间会跳位置。
     fn tip_anchor(&self, r: &Rect) -> (bool, f32, f32, f32, f32) {
         if self.grid_shown() {
             let (l, rr, top) = self.grid_box.get();
@@ -1321,7 +1268,7 @@ impl CandidateWindow {
         self.fixed_pos = pos;
     }
 
-    /// 当前候选窗**内容左上**屏幕坐标（窗口左上 + 阴影扩边）。
+    /// 当前候选窗内容左上屏幕坐标（窗口左上 + 阴影扩边）。
     /// 供「定位方式」切到 fixed 时把当前实际位置落盘成 custom_x/custom_y。
     pub fn content_origin(&self) -> (i32, i32) {
         let m = self.mouse.borrow();
@@ -1401,7 +1348,7 @@ impl CandidateWindow {
     #[cfg(not(windows))]
     pub fn show(&mut self) {
         // DPI 动态化：按光标所在显示器实时取缩放，换显示器后自动按新 DPI 渲染。
-        // ⚠️ 本路径一直按光标点取，不像另两个渲染入口那样在固定位置模式下改按固定点取；
+        // 本路径一直按光标点取，不像另两个渲染入口那样在固定位置模式下改按固定点取；
         // 三份管线合并时保持原样，没有顺手统一。
         let new_scale = crate::dpi::scale_for_point(self.x, self.y);
         self.show_at(new_scale, Instant::now());
@@ -1433,11 +1380,9 @@ impl CandidateWindow {
         let (width, height) = frame.size();
         let t_layout = t_start.elapsed();
 
-        // 定位提前到 paint 前（供 flip_when_above 判定）。对齐 Go：每帧据当前光标 + 内容尺寸重算
-        // 位置（place_window 负责工作区钳制、上方底边参考、上翻粘滞），再用 4px 阈值抑制微移——
-        // 从而 (1) 输入缓冲变化致尺寸变化时按需重定位、不溢出屏幕；(2) 上方显示以底边贴光标为参考；
-        // (3) 已显示后宿主 caret 微抖动(<4px)不跳，位置保护；显著变化(换行/reflow 修正)才跟随；
-        // (4) 一旦上翻则粘滞上方。新组合首显已由协调器延迟到 reflow 后的权威坐标，故首帧即落在正确处。
+        // 定位提前到 paint 前（供 flip_when_above 判定）：每帧据当前光标 + 内容尺寸重算位置
+        // （place_window 负责工作区钳制、上方底边参考、上翻粘滞），再用 4px 阈值抑制宿主 caret
+        // 微抖动。新组合首显已由协调器延迟到 reflow 后的权威坐标。
         let offset = self.position_offset_px();
         let (px0, py0, above) = Self::place_window(
             self.x,
@@ -1503,7 +1448,7 @@ impl CandidateWindow {
 
         // 位置 (px, py) 已在 paint 前计算并锚定（组合期锁定后复用，避免漂移）。
         // 窗口实际左上 = 内容锚点 − 左/上 margin，使内容仍落在锚点处，阴影向四周溢出。
-        // 基线采样刻意排在 `show` **之前**：窗口出现不会移动鼠标，两处取值物理上相同，
+        // 基线采样刻意排在 `show` 之前：窗口出现不会移动鼠标，两处取值物理上相同，
         // 但排在前面就完全不依赖「`show` 内部不会泵到 WM_MOUSEMOVE」这个前提。
         self.mark_visible();
         self.window.show(px - ml as i32, py - mt as i32);
@@ -1529,7 +1474,7 @@ impl CandidateWindow {
         }
 
         // DPI：按光标所在屏取缩放（Retina=2），几何/字号由 self.scale 派生。
-        // 固定位置模式按**固定点**取——固定位置可能落在与光标不同缩放的另一块屏上，
+        // 固定位置模式按固定点取——固定位置可能落在与光标不同缩放的另一块屏上，
         // 按光标算会让窗口用错误的 DPI 渲染（字号忽大忽小）。与 Windows 分支同一判据。
         let (dpi_x, dpi_y) = match self.fixed_pos {
             Some(f) if f != (0, 0) => f,
@@ -1562,7 +1507,7 @@ impl CandidateWindow {
                 self.placed_above = false;
                 self.last_content_pos = None;
                 // 本路径坐标是逻辑点，尺寸与扩边是设备像素：先换成逻辑点再交给 place_fixed。
-                // 扩边来自皮肤装饰（macOS 不画软阴影）；place_fixed 返回**窗口**左上，加回扩边
+                // 扩边来自皮肤装饰（macOS 不画软阴影）；place_fixed 返回窗口左上，加回扩边
                 // 才是内容左上，与下面跟随光标分支的 (px, py) 同义（出口处再统一减扩边）。
                 let s = self.scale.max(1.0);
                 let lg = |v: u32| (v as f32 / s).round() as i32;
@@ -1638,16 +1583,13 @@ impl CandidateWindow {
         let shadow = frame.shadow;
 
         self.mark_visible();
-        // 关键单位换算：ml/mt/blur 都是 device px（含 scale），而 screen_x/y 是 .app 使用的【逻辑点】
-        // （图像按 scale 显示）。故补偿前必须 /scale 换回逻辑点，否则 Retina(×2) 下会多减一截 →
-        // 候选窗偏左、偏上盖住 caret（正是截图现象）。no-shadow(margin=0)→0，无变化。
+        // 单位换算：ml/mt/blur 是设备像素，screen_x/y 是 .app 的逻辑点，补偿前必须 /scale，
+        // 否则 Retina 下候选窗偏左上盖住 caret。
         let scale = self.scale.max(1.0);
         let ml_l = (ml as f32 / scale).round() as i32;
         let mt_l = (mt as f32 / scale).round() as i32;
-        // 软阴影上边距是完整 3σ 高斯尾(多为透明)；内容紧贴 caret 时上方约一个 blur 高的【可见浓阴影】
-        // 会盖住 caret。故内容较锚点再下移「可见浓阴影」高度(≈blur，换算逻辑点)，使浓阴影恰落 caret
-        // 下方、透明尾不碍观感。above(上翻)不额外下移；固定位置分支 placed_above 恒为 false，
-        // 但那条路上窗口本就不贴 caret，阴影补偿有没有都不影响观感。
+        // 软阴影上边距是完整 3σ 高斯尾，内容紧贴 caret 时上方约一个 blur 高的浓阴影会盖住 caret，
+        // 故内容再下移约 blur 高度。上翻不下移（固定位置分支本就不贴 caret）。
         let clear_l = if self.placed_above {
             0
         } else {
@@ -1768,7 +1710,7 @@ impl CandidateWindow {
             return None;
         }
 
-        // DPI 探测点：固定位置模式按**固定点**取缩放，而不是光标点——固定位置可能落在
+        // DPI 探测点：固定位置模式按固定点取缩放，而不是光标点——固定位置可能落在
         // 与光标不同缩放的另一块屏上，按光标算会让窗口用错误的 DPI 渲染（字号忽大忽小）。
         let (dpi_x, dpi_y) = match self.fixed_pos {
             Some(f) if f != (0, 0) => f,
@@ -1786,9 +1728,9 @@ impl CandidateWindow {
         let (content_w, content_h) = (frame.content_w, frame.content_h);
         let (width, height) = frame.size();
         // 正常情况下 `build_tree` 已按同一套预算把文字裁到位，屏幕安全上限的钳制是恒不生效的
-        // 兜底。**只在它真的生效时才记日志**——那意味着预算算漏了行内某个成员（这正是横排内联
+        // 兜底。只在它真的生效时才记日志——那意味着预算算漏了行内某个成员（这正是横排内联
         // 编码/徽标/翻页栏曾被漏算的形态），是需要看见的异常，不是每帧噪音。
-        // ⚠️ 只有本路径记这条（三份管线合并前就如此，非 Windows 两条路径从来不记），保持原样。
+        // 只有本路径记这条（三份管线合并前就如此，非 Windows 两条路径从来不记），保持原样。
         if let Some((natural, safety_max_w)) = frame.safety_clamped {
             tracing::debug!(
                 "candidate width safety-clamp 生效（预算漏算？）: natural={} safety_max_content={} clamped={} margin_lr={} scale={:.2} vertical={}",
@@ -1887,7 +1829,7 @@ impl CandidateWindow {
         debug_assert!(screen_xy.is_some(), "定位三分支必有其一赋值 screen_xy");
         let (screen_x, screen_y) = screen_xy.unwrap_or((self.x, self.y));
         // 鼠标层记录阴影扩边，两处要用：
-        // 1. 拖动落定时把窗口左上换算回**内容左上**再上报落盘，否则每次「拖动→保存→
+        // 1. 拖动落定时把窗口左上换算回内容左上再上报落盘，否则每次「拖动→保存→
         //    重显」都会多减一次阴影，窗口逐次漂移；
         // 2. 拖动中按内容矩形钳制，让可见内容能真正贴到屏幕边缘（含任务栏）。
         self.mouse.borrow_mut().margin = (ml as i32, mt as i32, mr as i32, mb as i32);
@@ -2067,7 +2009,7 @@ impl CandidateWindow {
         }
     }
 
-    /// Linux 外部宿主：渲染当前悬停 tooltip（位图 + 落位规则）。`(wx, wy)` 为候选窗**建议**
+    /// Linux 外部宿主：渲染当前悬停 tooltip（位图 + 落位规则）。`(wx, wy)` 为候选窗建议
     /// 落点（`render_frame` 的 screen_x/y），addon 再平移到候选窗实际位置。侧边 / 上下的判据
     /// 同 [`Self::render_tooltip_frame`]。
     #[cfg(ext_presenter)]
@@ -2097,39 +2039,32 @@ impl CandidateWindow {
         Some(self.tooltip.as_ref()?.menu_request_at(cx, cy))
     }
 
-    /// **内容**左上 → **窗口**左上（减去软阴影扩边）。
+    /// 内容左上 → 窗口左上（减去软阴影扩边）。
     ///
-    /// 落盘的 custom_x/y 记的是内容左上（用户视觉上看到的窗口边缘），而 Win32 定位用的是
-    /// 窗口左上。本函数与 `window_to_content` 必须严格互逆，否则每轮
-    /// 「拖动 → 落盘 → 重新显示」都会多减一次阴影，候选窗逐次向左上漂移。
+    /// 落盘的 custom_x/y 记的是内容左上，Win32 定位用窗口左上。本函数与 `window_to_content`
+    /// 必须严格互逆，否则每轮「拖动 → 落盘 → 重新显示」候选窗逐次向左上漂移。
     ///
-    /// 纯算术、无平台依赖，故【不加 cfg 门控】：调用方 `content_origin` 是未门控的 pub fn，
-    /// 若把本对函数限定为 windows-only，非 Windows 目标就会 E0599 找不到函数——这类不对称
-    /// 在 Windows 本地开发时永远显现不出来，只有 CI 的 macOS 目标才炸。
-    /// Linux（既非 windows 也非 macos，仅供跑测试）下 `place_fixed` 无调用者，故显式
-    /// allow(dead_code)：它与 `window_to_content` 共用互逆契约和 round-trip 测试，必须成对存在。
+    /// 纯算术，不加 cfg 门控（未门控的 `content_origin` 要调它）；Linux 下无调用者故
+    /// allow(dead_code)，与 `window_to_content` 成对存在。
     #[cfg_attr(not(any(windows, ext_presenter)), allow(dead_code))]
     fn content_to_window(content: (i32, i32), ml: u32, mt: u32) -> (i32, i32) {
         (content.0 - ml as i32, content.1 - mt as i32)
     }
 
-    /// **窗口**左上 → **内容**左上（加回软阴影扩边）。`content_to_window` 的逆。
+    /// 窗口左上 → 内容左上（加回软阴影扩边）。`content_to_window` 的逆。
     fn window_to_content(window: (i32, i32), ml: i32, mt: i32) -> (i32, i32) {
         (window.0 + ml, window.1 + mt)
     }
 
     /// 固定位置模式的窗口落点（返回窗口左上屏幕坐标，含阴影扩边）。
     ///
-    /// - `fixed` 是**内容**左上坐标，减去阴影扩边 `(ml, mt)` 才是窗口左上。
-    /// - `(0, 0)` 视作"已开启固定但尚未设定位置"（用户还没拖过），落到默认锚点。
-    /// - 钳制按**内容**矩形、且钳到整块屏幕（含任务栏）：`custom_x/y` 是绝对屏幕坐标，
-    ///   用户换分辨率或拔掉副屏后会指向不可见区域，候选窗就此"消失"且无法用鼠标拖回来；
-    ///   但按含阴影的窗口矩形去钳会让内容离屏幕边还有一整个阴影宽就被拦下，见
-    ///   [`clamp_content_to_monitor`]。
+    /// - `fixed` 是内容左上坐标，减去阴影扩边 `(ml, mt)` 才是窗口左上。
+    /// - `(0, 0)` 视作「已开启固定但尚未设定位置」，落到默认锚点。
+    /// - 钳制按内容矩形、钳到整块屏幕（含任务栏）：换分辨率或拔掉副屏后 `custom_x/y` 可能指向
+    ///   不可见区域；按含阴影的窗口矩形去钳会差一个阴影宽，见 [`clamp_content_to_monitor`]。
     ///
-    /// macOS 同样走这里（`.app` 的 NSPanel 只是照搬算好的坐标）：那边不画软阴影，扩边恒 0，
-    /// 且 `clamp_content_to_monitor` 在非 Windows 是恒等函数——真正的屏幕钳制由 `.app` 用
-    /// `NSScreen.visibleFrame` 做，服务进程这边查不到 macOS 的显示器几何。
+    /// macOS 同样走这里：不画软阴影、扩边恒 0，`clamp_content_to_monitor` 在非 Windows 是恒等
+    /// 函数，真正的屏幕钳制由 `.app` 用 `NSScreen.visibleFrame` 做。
     #[cfg_attr(not(any(windows, ext_presenter)), allow(dead_code))]
     fn place_fixed(
         fixed: (i32, i32),
@@ -2150,18 +2085,12 @@ impl CandidateWindow {
         clamp_content_to_monitor(wx, wy, width, height, margin)
     }
 
-    /// 固定模式尚未设定位置时的默认锚点（**内容**左上屏幕坐标）。
+    /// 固定模式尚未设定位置时的默认锚点（内容左上屏幕坐标）。
     ///
-    /// 取**光标所在**显示器的工作区（用户在哪块屏打字就在哪块屏出现），水平居中、
-    /// 垂直落在约 3/4 高度处：贴底会和任务栏/其他浮动 UI 挤在一起，居中则挡住正文。
-    /// 内容高度不参与——顶端定在 3/4 处即可，超出底部由调用方的钳制拉回。
+    /// 取光标所在显示器的工作区（`rcWork`，自动落位避开任务栏），水平居中、顶端落在约 3/4
+    /// 高度处（贴底会与任务栏挤、居中会挡正文），超出底部由调用方的钳制拉回。
     ///
-    /// 这里用 `rcWork` 而非 `rcMonitor`：自动落位应避开任务栏，只有用户**手动拖动**
-    /// 才允许压到任务栏上。
-    ///
-    /// 非 Windows 退化为「就落在光标处」：服务进程查不到 macOS 的显示器几何（`.app` 才有
-    /// `NSScreen`），而这只影响「刚打开固定位置、还没拖过」这一瞬——窗口出现在光标旁，
-    /// 用户拖一次就定下来了。与其为此加一轮 IPC 往返，不如让首帧落在最不意外的地方。
+    /// 非 Windows 退化为落在光标处：服务进程查不到 macOS 的显示器几何，只影响还没拖过的那一瞬。
     #[cfg_attr(not(windows), allow(unused_variables))]
     fn default_fixed_anchor(caret_x: i32, caret_y: i32, width: u32) -> (i32, i32) {
         #[cfg(windows)]
@@ -2191,26 +2120,12 @@ impl CandidateWindow {
         (caret_x, caret_y)
     }
 
-    /// 据冻结光标锚点与当前内容尺寸计算候选窗位置，钳制在光标所在显示器工作区内。
-    /// 规则：
-    /// - 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方。
-    /// - 上方显示以"窗口底边贴近光标顶端"为参考：`above_y = caret_top - h - gap`，
-    ///   底边 = caret_top - gap 与高度无关 → 候选变少（h 减小）时顶边下移、底边不动，不会离光标变远。
-    /// - `sticky_above`=true（当前已在上方）时优先保持上方，仅当上方也放不下才回落下方，
-    ///   避免候选数量变化时上下抖动（需求 4）。
-    /// - 左右溢出则贴边（横向右方空间不足时允许左移，属位置保护的例外）。
-    ///
-    /// 返回 (x, y, above)：above=true 表示窗口被上翻到光标上方（供 flip_when_above 判定）。
-    ///
-    /// 仅「跟随光标」定位方式走这里；固定位置见 [`Self::place_fixed`]。
-    // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
     #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
-    /// 候选窗相对光标的**锚点**计算（纯函数，不含屏幕钳制）：返回 `(x, below_y, above_y)`。
+    /// 候选窗相对光标的锚点计算（纯函数，不含屏幕钳制）：返回 `(x, below_y, above_y)`。
     ///
-    /// `caret_y` 为光标**底端**。下方锚点 = 底端 + gap；上方锚点以窗口底边贴光标顶端为参考。
-    /// 主题偏移 `off_y` 语义恒为「远离光标」：下方 **+**、上方 **−**。写成同号会让上翻时
-    /// 偏移把窗口压向光标，与配置意图相反——这是本函数存在的唯一理由（抽出来才测得到，
-    /// `place_window` 余下部分是 `#[cfg(windows)]` 的屏幕钳制，依赖真实显示器）。
+    /// `caret_y` 为光标底端。下方锚点 = 底端 + gap；上方锚点以窗口底边贴光标顶端为参考。
+    /// 主题偏移 `off_y` 语义恒为「远离光标」：下方 +、上方 −。抽成纯函数为了可测
+    /// （`place_window` 其余部分依赖真实显示器）。
     fn caret_anchors(
         caret_x: i32,
         caret_y: i32,
@@ -2224,26 +2139,14 @@ impl CandidateWindow {
         (caret_x + off_x, below_y, above_y)
     }
 
-    /// 按最终方位施加主题 Y 偏移：`off_y` 正值**恒为远离光标**——在下方就向下、
-    /// 在上方就向上。
+    /// 按最终方位施加主题 Y 偏移：`off_y` 正值恒为远离光标（在下方向下、在上方向上）。
     ///
-    /// ⚠️ 必须在**方位已定之后**调用，不能把偏移预先加进锚点：
-    /// `below_ok`/`above_ok` 是拿锚点跟工作区边界比出来的，锚点含偏移会让 off_y 越大
-    /// 两个条件越难成立 —— 本该上翻的场景被判成「上方也放不下」，落回下方分支再被钳到
-    /// `wa.bottom - hi`（贴屏幕底），窗口就压在光标上了。偏移只该改变距离，不该改变
-    /// 「往上还是往下」这个决策。
+    /// 必须在方位已定之后调用，不能预先加进锚点：锚点含偏移会让 `below_ok`/`above_ok` 越难
+    /// 成立，本该上翻的窗口落回下方被钳到屏幕底、压在光标上。偏移只改距离，不改方位决策。
     fn apply_offset_y(y: i32, above: bool, off_y: i32) -> i32 {
         if above { y - off_y } else { y + off_y }
     }
 
-    /// 跟随光标定位。`offset` 为主题 `window.position_offset`（设备像素，已 ×scale）。
-    ///
-    /// ⚠️ 偏移**必须在此函数内、锚点计算处注入**，不能在调用方给返回值加：
-    /// 下方那段 `rcWork` 越界兜底要在偏移之后跑，否则偏移能把窗口推出屏幕且再也钳不回来。
-    /// 上方锚点用**减号**——`off_y` 正值语义恒为「远离光标」，上翻时是向上推。
-    ///
-    /// 翻转/钳制整段在 `cfg(windows)` 内（靠 `GetMonitorInfoW` 取显示器边界），非 Windows
-    /// 直接返回下方锚点，于是那几个只服务于翻转的局部量在此平台无人读写。
     /// 皮肤避让：上下方位与偏移都定了之后，若窗体或装饰的不透明像素落进光标行保护带
     /// （`caret_y - caret_h .. caret_y`，上下各留 gap；横向范围已在 `mask` 里取好），把窗口沿
     /// 远离光标的方向逐像素推开到保护带清空为止。透明区越过光标行不算遮挡。
@@ -2289,6 +2192,18 @@ impl CandidateWindow {
         (ax - anchor.above.0, y)
     }
 
+    /// 跟随光标定位：据冻结光标锚点与当前内容尺寸计算候选窗位置，钳制在光标所在显示器工作区内。
+    /// `offset` 为主题 `window.position_offset`（设备像素，已 ×scale）。
+    /// - 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方。
+    /// - 上方以「窗口底边贴近光标顶端」为参考，底边与高度无关，候选变少时不会离光标变远。
+    /// - `sticky_above`=true 时优先保持上方，仅当上方也放不下才回落下方，避免上下抖动。
+    /// - 左右溢出则贴边。
+    ///
+    /// 返回 (x, y, above)：above=true 表示窗口被上翻到光标上方（供 flip_when_above 判定）。
+    /// 固定位置见 [`Self::place_fixed`]。
+    ///
+    /// 偏移必须在此函数内注入，不能在调用方给返回值加：`rcWork` 越界兜底要在偏移之后跑。
+    /// 翻转/钳制整段在 `cfg(windows)` 内，非 Windows 直接返回下方锚点（故有下面的 allow）。
     #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
     #[allow(clippy::too_many_arguments)]
     fn place_window(
@@ -2329,22 +2244,18 @@ impl CandidateWindow {
                     ..Default::default()
                 };
                 if GetMonitorInfoW(mon, &mut mi).as_bool() {
-                    // 垂直可用区：前台铺满**caret 所在这块屏**时任务栏不可见，按整屏算；
-                    // 否则照旧避开任务栏。全屏游戏下仍按 rcWork 算就白白少掉一条任务栏的高度
-                    // （实测 48px）：洛克王国 caret 底端 y=2024 时，rcMonitor 下方尚有 134px、
-                    // rcWork 只剩 86px，高度落在其间的候选窗被误判"放不下"而上翻，反过来遮住
-                    // 正在输入的那一行。
+                    // 垂直可用区：前台铺满 caret 所在这块屏时任务栏不可见，按整屏算，否则全屏
+                    // 游戏下会白少一条任务栏高度、误判放不下而上翻遮住输入行。
                     //
-                    // ⚠ 判据（含 DWM cloaked / shell 进程两道守卫）收口在 wind-keys，别在此重写：
-                    // 几何比较只是它的一半，那两道守卫才是它能用的原因。也**不能**改用
-                    // `foreground_fullscreen_kind() == Covering`——那个问的是"前台窗口自己那块屏"，
-                    // 而这里必须问 caret 所在那块屏：多屏下 A 屏的全屏游戏不会隐藏 B 屏的任务栏。
+                    // 判据（含 DWM cloaked / shell 进程两道守卫）收口在 wind-keys，别在此重写；
+                    // 也不能改用 `foreground_fullscreen_kind()`：那个问的是前台窗口自己那块屏，
+                    // 这里必须问 caret 所在那块屏。
                     let wa = if wind_keys::foreground::foreground_covers_monitor(&mi.rcMonitor) {
                         mi.rcMonitor
                     } else {
                         mi.rcWork
                     };
-                    // 可行性判定用**净锚点**（不含主题偏移）：偏移只该改变距离，
+                    // 可行性判定用净锚点（不含主题偏移）：偏移只该改变距离，
                     // 不该左右「往上还是往下」——含偏移会让 off_y 越大越容易判成两边都
                     // 放不下，落回下方再被钳到屏幕底、压住光标。
                     let below_ok = below_y + hi + cb <= wa.bottom;
@@ -2402,7 +2313,7 @@ impl CandidateWindow {
 
     /// 主题 `window.position_offset` + 用户偏移 → 设备像素 (x, y)。都未配=(0,0)，与旧行为一致。
     ///
-    /// 供边缘带装饰的主题拉开候选窗与光标的观感距离。**只喂给 place_window**——
+    /// 供边缘带装饰的主题拉开候选窗与光标的观感距离。只喂给 place_window——
     /// 固定位置与用户拖动是显式意图，再叠加会让窗口莫名偏离用户放的地方，
     /// 且会破坏拖动落盘的 window↔content 换算互逆性（见 place_fixed 一侧的坐标约定）。
     fn position_offset_px(&self) -> (i32, i32) {
@@ -2420,7 +2331,7 @@ impl CandidateWindow {
 
     /// 把插入符位置夹到合法字符边界。协调器发来的偏移与它自己的 preedit 同源、本应恒合法，
     /// 但 UI 与协调器是跨线程的两份状态（命令队列还会合并/丢弃），一旦错位 `split_at` 会
-    /// **panic 掉整个 UI 线程**。故在此收口：越界截到末尾，落在字符中间则退到前一个边界。
+    /// panic 掉整个 UI 线程。故在此收口：越界截到末尾，落在字符中间则退到前一个边界。
     fn clamp_caret(text: &str, caret: usize) -> usize {
         let mut c = caret.min(text.len());
         while c > 0 && !text.is_char_boundary(c) {
@@ -2641,10 +2552,8 @@ impl CandidateWindow {
 
     /// 下一次需要 [`Self::tick`] 的时刻；`None` = 无待到期者。
     ///
-    /// 消息循环据此安排唤醒。两个到期源：悬停激活闸门（`engage_at`，用户首次真实移动鼠标到
-    /// 候选窗上时武装，到期后悬停才开始响应；激活之后悬停走 `on_message` 即时发出，不再需要
-    /// 唤醒），以及右键压制「等菜单」阶段的兜底超时（见 [`TipHold::AwaitMenu`]）；另有隐藏后释放
-    /// 像素缓冲与皮肤装饰换帧。
+    /// 消息循环据此安排唤醒。到期源：悬停激活闸门（`engage_at`）、右键压制「等菜单」阶段的
+    /// 兜底超时（[`TipHold::AwaitMenu`]）、隐藏后释放像素缓冲、皮肤装饰换帧。
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         let m = self.mouse.borrow();
         let hold = match m.tip_hold {
@@ -2749,7 +2658,7 @@ pub struct CandidateMouse {
     /// 换算到当前扩边下，窗体才不随内容变化跳动。
     drag_pin_margin: (i32, i32),
     /// 当前阴影扩边 (left, top, right, bottom)，每帧渲染后由 `render_frame` 同步。
-    /// 窗口左上 + (left, top) = **内容**左上，即落盘用的坐标系；四个分量一起用于
+    /// 窗口左上 + (left, top) = 内容左上，即落盘用的坐标系；四个分量一起用于
     /// 按内容矩形做拖动钳制。
     margin: (i32, i32, i32, i32),
     /// 空白处双击判定（截图用，见 `UiEvent::CandidateDoubleClick`）。
@@ -2779,7 +2688,7 @@ pub struct CandidateMouse {
 /// [`crate::tooltip::LEAVE_GRACE_MS`] 同值——从候选行穿过空隙进入气泡要这么久。
 const TIP_GRACE: Duration = Duration::from_millis(crate::tooltip::LEAVE_GRACE_MS as u64);
 
-/// 气泡显示中、光标移到**另一个**候选的切换延迟。气泡在旁侧时，从候选 A 斜着去 A 的气泡
+/// 气泡显示中、光标移到另一个候选的切换延迟。气泡在旁侧时，从候选 A 斜着去 A 的气泡
 /// 会擦过相邻行 B；立刻切到 B，A 的气泡就被换掉、永远够不着。150ms 够手速正常地穿过一行
 /// （三四十像素），而在候选间正常移动时高亮只慢这么一点，不显得迟钝。比宽限短：去往另一个
 /// 候选多半是真想看它。
@@ -2875,15 +2784,10 @@ const HOLD_MENU_TIMEOUT: Duration = crate::popup_menu::MENU_REPLY_TIMEOUT;
 
 /// 候选窗右键对悬停气泡的压制（设计 §7.6 A）。
 ///
-/// 不压的话气泡会盖在菜单上：① 右键时气泡已显示，它不会自己消失；② 右键时激活延迟还没
-/// 到期，到期后照发 `Hover`，气泡在菜单弹出**之后**冒出来、叠在菜单上面（z 序后来者居上）。
+/// 不压的话气泡会盖在菜单上（已显示的不会自己消失；激活延迟到期后在菜单之后冒出来）。
 ///
-/// 做成阶段而不是一个布尔：右键到菜单可见之间，「菜单开着」还是 false，只靠它挡闸门的话，
-/// 这段来回里鼠标动 1px 就会重新武装闸门，到期时菜单已弹出，气泡照样叠上去；
-/// `ui.tooltip.delay=0` 时气泡甚至抢在菜单之前出来。
-///
-/// 只压气泡、不清悬停：悬停高亮还指着右键的那个候选，是「菜单作用于谁」的唯一提示。
-/// 清了（发 `Hover(-1)`）高亮会跳回键盘选中项，看上去像是菜单对着别的候选。
+/// 做成阶段而不是一个布尔：右键到菜单可见之间「菜单开着」还是 false，鼠标一动就会重新武装
+/// 闸门。只压气泡、不清悬停：悬停高亮是「菜单作用于谁」的唯一提示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TipHold {
     /// 不压。
@@ -2935,9 +2839,8 @@ impl CandidateMouse {
     /// UI 循环每轮调用：推进右键压制阶段；悬停激活闸门到期则激活并补发当前悬停。
     ///
     /// `drawn_hover` 是 UI 此刻画着的悬停（`CandidateWindow::hover`，协调器最近一次下发的值）。
-    /// 解除压制时拿它而不是 `last_hover` 比：压制期间候选若重绘过（协调器重置悬停），
-    /// `last_hover` 还是旧值，与光标下的目标相等就不发 `Hover`，而 UI 画的已经是 -1，
-    /// 气泡便再也不回来。
+    /// 解除压制时拿它而不是 `last_hover` 比：压制期间候选若重绘过，`last_hover` 是旧值，
+    /// 会漏发 `Hover`，气泡便再也不回来。
     fn flush(&mut self, now: Instant, drawn_hover: i32) {
         self.tip_hold = self
             .tip_hold
@@ -3020,13 +2923,10 @@ impl CandidateMouse {
         }
     }
 
-    /// 重置悬停状态：清空闸门与去重值，并**以当前物理光标位重建基线**。
+    /// 重置悬停状态：清空闸门与去重值，并以当前物理光标位重建基线。
     ///
-    /// 两个调用点，职责不同，缺一不可：
-    /// - [`CandidateWindow::mark_visible`]（不可见 → 可见）：**基线在这里才有意义**。判据问的是
-    ///   「窗口出现之后鼠标动没动」，基准就必须取自窗口出现那一刻，见该函数的说明。
-    /// - [`CandidateWindow::hide`]：清掉闸门与残留悬停，使下一轮从未激活态起步。它顺带采的
-    ///   那次基线到下次显示时多半已经过时（用户在这期间移动了鼠标），**不能当作基线的来源**。
+    /// 两个调用点：[`CandidateWindow::mark_visible`]（基线在这里才有意义，见该函数）；
+    /// [`CandidateWindow::hide`]（清掉闸门与残留悬停，它顺带采的基线不能当作来源）。
     fn reset_hover(&mut self) {
         self.deferred = None;
         self.last_pos = None;
@@ -3223,7 +3123,7 @@ impl WindowMouse for CandidateMouse {
                     if let Some(pos) = self.window_origin() {
                         self.drag_pin = Some(pos);
                         self.drag_pin_margin = (self.margin.0, self.margin.1);
-                        // 上报**内容左上**（窗口左上 + 阴影扩边）：固定位置模式下协调器把它
+                        // 上报内容左上（窗口左上 + 阴影扩边）：固定位置模式下协调器把它
                         // 落盘成 custom_x/custom_y；跟随模式下协调器直接忽略——那里的拖动
                         // 只是"临时挪开"，下次组合仍回到光标旁。
                         let (cx, cy) =
@@ -3262,7 +3162,7 @@ impl WindowMouse for CandidateMouse {
                 let nx = self.drag_origin.0 + (p.x - self.drag_anchor.0);
                 let ny = self.drag_origin.1 + (p.y - self.drag_anchor.1);
                 let (w, h) = self.window_size();
-                // 按**内容**矩形钳制、且钳到整块屏幕：软阴影可溢出屏幕，候选窗也允许
+                // 按内容矩形钳制、且钳到整块屏幕：软阴影可溢出屏幕，候选窗也允许
                 // 摆到任务栏上方。用 clamp_to_work_area 会让内容离屏幕边还差一个阴影
                 // 宽（blur=8 的主题约 29px）就拖不动了。
                 let (cx, cy) = clamp_content_to_monitor(nx, ny, w, h, self.margin);
@@ -3689,7 +3589,7 @@ mod grid_tests {
         assert_eq!(hits.iter().filter(|(t, _)| *t >= 0 && *t < 100).count(), 6);
     }
 
-    /// 展开态宽度跟着当前可见内容走：滚到窄的一屏，窗口缩回（GH#256）。
+    /// 展开态宽度跟着当前可见内容走：滚到窄的一屏，窗口缩回。
     #[test]
     fn width_follows_visible_content_while_expanded() {
         let mut w = grid_win(3, 2, 0, &["一二三四五", "一", "一", "一", "一", "一"]);
@@ -3748,11 +3648,8 @@ mod min_size_tests {
 
     /// 造一个候选窗：`rows` 是行数下限，`w_dp`/`h_dp` 是窗口宽/高下限（dp）。
     ///
-    /// 宽高下限只灌进与 `vertical` 相符的那一项（另一方向留 0），顺带白嫖一份「读错方向」的
-    /// 回归覆盖：本模块几乎每条测试都会在 `min_window_w_px`/`min_window_h_px` 误读另一方向
-    /// 的字段（恒为 0）时失效下限而变红。
-    ///
-    /// `scale` 钉成 1.0 使 dp == 设备像素——断言里的数值才有确定含义（本机 DPI 会漂）。
+    /// 宽高下限只灌进与 `vertical` 相符的那一项（另一方向留 0），顺带覆盖「读错方向」的回归。
+    /// `scale` 钉成 1.0 使 dp == 设备像素。
     fn mk(vertical: bool, rows: u32, w_dp: u32, h_dp: u32, texts: &[&str]) -> CandidateWindow {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
@@ -3807,7 +3704,7 @@ mod min_size_tests {
     const FIVE: &[&str] = &["一", "二", "三", "四", "五"];
     const THREE: &[&str] = &["一", "二", "三"];
 
-    // ────────────────── 只有模式徽标时的提示窗宽度（GH#127） ──────────────────
+    // ────────────────── 只有模式徽标时的提示窗宽度 ──────────────────
 
     /// 造一个「只有模式徽标、没有候选」的提示窗（刚进临时英文/临时拼音的那一帧）。
     fn hint(label: &str, min_w_dp: u32) -> CandidateWindow {
@@ -3825,14 +3722,8 @@ mod min_size_tests {
         s.chars().count() as f32 * w.theme.behavior.font_size as f32 * 0.6
     }
 
-    /// ★ GH#127 的**另一半**：那 12px 右留白在**宽度预算**段也得跟着条件化。
-    ///
-    /// 装配段（`trailing`）无候选时给 0，预算段却一直无条件加 `12 * s`——两边分叉的后果
-    /// 不是多出空白（方向反了，是少算可用宽），而是**超长编码提前一截被截断**：实测同一帧
-    /// 下窗宽 2988.4 而上限 3000，白白空掉 10.8px。只修装配段就只修好一半。
-    ///
-    /// 判据取「剩余空隙小于一个字符宽」而不是「宽度 == 上限」：截断按整字符走，量出来
-    /// 总比预算少小半个字。带 bug 时空隙 11.6px > 一个字宽（14×0.6=8.4），故这条会红。
+    /// 徽标的 12px 右留白在宽度预算段也须与装配段同条件（无候选时为 0），否则超长编码会提前
+    /// 一截被截断。判据取「剩余空隙小于一个字符宽」：截断按整字符走。
     #[test]
     fn hint_window_spends_its_whole_width_budget_on_a_long_preedit() {
         let long = "a'".repeat(200);
@@ -3850,7 +3741,7 @@ mod min_size_tests {
         let win_w = width_of(&w);
         let cap = w.screen_safety_max_width_px() as f32;
 
-        // 前置①：这一帧必须**已经被上限夹住**（再加长一倍宽度不变），否则下面的判据恒真。
+        // 前置①：这一帧必须已经被上限夹住（再加长一倍宽度不变），否则下面的判据恒真。
         let mut w2 = CandidateWindow::new(CandidateWindowConfig::default(), {
             let (tx2, _rx2) = std::sync::mpsc::channel();
             tx2
@@ -3878,14 +3769,8 @@ mod min_size_tests {
         );
     }
 
-    /// ★ GH#127：提示窗该紧贴文字，除了窗口自己的内边距不该再多出任何固定量。
-    ///
-    /// 修复前恒多 40.8px：无候选占位行把 `item_pad` 左右（10+8）连同那个撑高用的空格
-    /// （约 0.6 字宽）算进了行宽，模式徽标又带着「与后面候选拉开距离」的 12px 右留白 ——
-    /// 而这一帧后面根本没有候选。用户原话是「提示框右侧还有好多空白」。
-    ///
-    /// 判据写成等式而不是「差值一致」：多出来的是**固定量**，比较两个不同长度的徽标
-    /// 得到的差值在修复前后完全一样，那样的测试一个字都测不到。
+    /// 提示窗该紧贴文字，除了窗口内边距不该再多出固定量（占位行不计宽、无候选时徽标无右留白）。
+    /// 判据写成等式而不是「差值一致」：多出来的是固定量，差值比较测不到。
     #[test]
     fn mode_label_hint_window_hugs_its_text() {
         // 16 = 主题默认窗口内边距左右各 8（`window.padding` 的兜底值，scale=1）
@@ -3901,7 +3786,7 @@ mod min_size_tests {
         }
     }
 
-    /// 占位行的本职不能丢：提示窗的**高度**仍须与「有一条候选」时一致。
+    /// 占位行的本职不能丢：提示窗的高度仍须与「有一条候选」时一致。
     ///
     /// 它存在的唯一理由就是这个（刚进临英时窗口不要比随后出候选时矮一截）。
     /// 只盯着宽度改，很容易顺手把整行删掉 —— 那样宽度是对了，窗口却开始忽高忽低。
@@ -3919,7 +3804,7 @@ mod min_size_tests {
         );
     }
 
-    /// 用户显式配了候选窗最小宽度时，仍以配置为准（紧贴文字只是**没配**时的默认）。
+    /// 用户显式配了候选窗最小宽度时，仍以配置为准（紧贴文字只是没配时的默认）。
     #[test]
     fn configured_min_width_still_wins_on_hint_window() {
         let w = hint("英", 300);
@@ -3950,11 +3835,8 @@ mod min_size_tests {
 
     // ─────────────────────────── 行数下限（min_rows） ───────────────────────────
 
-    /// ★ 核心判据：补出的占位行必须与真实候选行**完全等高**。
-    ///
-    /// 「补了行、窗口变高了」是自动成立的废话；只有「3 条候选 + 2 空行 ≡ 5 条真实候选」
-    /// 才锁得住占位行装配不全（漏序号节点、漏 item.margin）导致的「矮一截」——那种缺陷
-    /// 的表现是窗口仍在抖、只是抖得小一点，肉眼很难认定为 bug。
+    /// 补出的占位行必须与真实候选行完全等高：「3 条候选 + 2 空行 ≡ 5 条真实候选」才锁得住
+    /// 占位行装配不全（漏序号节点、漏 item.margin）。
     #[test]
     fn padded_rows_equal_real_rows_in_height() {
         let full = measured(&win(true, 5, FIVE)).1;
@@ -3964,10 +3846,8 @@ mod min_size_tests {
 
     /// 占位行的文本属性必须逐项镜像真实候选行。
     ///
-    /// ★ 这条测的是等高性测试**测不到**的那一半：mock 文本后端只按字号估算、不区分字族与
-    /// 字重，占位行漏掉 `font_family` 时 `padded_rows_equal_real_rows_in_height` 照样全绿；
-    /// 而真实 DirectWrite 的行高取自该字族的 line metrics（宋体约 1.17em、雅黑约 1.33em），
-    /// 漏配就会让占位行矮一截。测量断言在此无能为力，只能从结构上比对。
+    /// 补等高性测试测不到的那一半：mock 后端不区分字族与字重，而真实后端行高取自字族
+    /// line metrics，只能从结构上比对。
     #[test]
     fn placeholder_row_mirrors_real_row_text_attrs() {
         let mut w = win(true, 5, THREE);
@@ -4102,11 +3982,8 @@ mod min_size_tests {
         assert_eq!(wide, plain);
     }
 
-    /// ★★ 本次重构的核心判据：下限量的是**窗口**，候选自身的宽度与位置一概不动。
-    ///
-    /// 旧实现（`min_width_chars_*`）把下限打在每个候选行容器的 `min_w` 上，横排时每格都被
-    /// 撑宽、格间距成倍放大——用户要的是「窗口大小不变」，不是「每个候选都变宽」。故这里
-    /// 逐条比对候选的命中矩形：配下限前后 x/w 必须逐位相等，多出来的宽度只能留在右侧空着。
+    /// 下限量的是窗口，候选自身的宽度与位置一概不动：配下限前后候选命中矩形的 x/w 逐位相等，
+    /// 多出来的宽度只能留在右侧空着。
     #[test]
     fn min_window_width_keeps_candidates_in_place() {
         let plain = laid(&mk(false, 0, 0, 0, &["字", "词"]), false);
@@ -4123,10 +4000,10 @@ mod min_size_tests {
         }
     }
 
-    /// ★ 竖排例外：候选行本就 `fill_cross`（高亮宽度统一），窗口被撑宽后高亮须跟着铺满，
+    /// 竖排例外：候选行本就 `fill_cross`（高亮宽度统一），窗口被撑宽后高亮须跟着铺满，
     /// 否则高亮只占左边一截、右侧空一块，观感比抖动更糟。
     ///
-    /// 与上一条不矛盾：铺满的是**行背景**，行内的序号/文字/注释仍按内容左对齐。
+    /// 与上一条不矛盾：铺满的是行背景，行内的序号/文字/注释仍按内容左对齐。
     #[test]
     fn vertical_highlight_fills_widened_window() {
         let root = laid(&mk(true, 0, 400, 0, &["字"]), false);
@@ -4147,7 +4024,7 @@ mod min_size_tests {
 
     /// 下限量的是整行内容（序号 + 文字 + 注释），注释在下限内时不得改变窗口宽度。
     ///
-    /// 真机实测出来的缺口：注释模板含拆字/编码/注音，宽度变化比候选文字本身还大。
+    /// 注释模板含拆字/编码/注音时，宽度变化比候选文字本身还大。
     #[test]
     fn min_window_width_covers_comment_segment() {
         let plain = measured(&win_c(true, 300, &[("字", "")])).0;
@@ -4174,11 +4051,8 @@ mod min_size_tests {
         assert_eq!(one, three);
     }
 
-    /// ★ 横排下限与竖排下限互不影响——两种排布的可用横向空间差一个数量级，共用一个值时
-    /// 调宽了竖排就顶得横排太松，调紧了横排就不够竖排用。
-    ///
-    /// 只灌一侧字段（另一侧留 0）后按**另一个**方向渲染：若 `min_window_w_px()` 读错了方向
-    /// （例如恒读 horizontal），这里会把本该跟随内容的渲染错锁成定宽。
+    /// 横排下限与竖排下限互不影响。只灌一侧字段后按另一个方向渲染：`min_window_w_px()` 读错
+    /// 方向时会把本该跟随内容的渲染错锁成定宽。
     #[test]
     fn horizontal_and_vertical_min_width_are_independent() {
         // 只配横排下限，竖排渲染时该下限不得生效。
@@ -4231,8 +4105,8 @@ mod min_size_tests {
         assert_eq!(clamped, plain);
     }
 
-    /// ★★ 高度下限存在的理由：`min_rows` 只数候选行，**翻页栏**的出现/消失它管不着
-    /// （用户真机反馈的正是这一处），窗口总高照样跳。窗口级下限把它一并罩住。
+    /// 高度下限存在的理由：`min_rows` 只数候选行，翻页栏的出现/消失它管不着，窗口总高照样跳。
+    /// 窗口级下限把它一并罩住。
     ///
     /// 前置断言不可省：若默认主题下翻页栏根本不显示，后半段就成了恒等式（假绿）。
     #[test]
@@ -4256,7 +4130,7 @@ mod min_size_tests {
         );
     }
 
-    /// ★★ 窗口翻到光标上方时，高度富余必须补在**顶部**。
+    /// 窗口翻到光标上方时，高度富余必须补在顶部。
     ///
     /// 上方显示时底边贴光标，空白压在下面会把候选整体顶离光标，位置反而随内容抖动——
     /// 正是本功能要消除的东西。与 min_rows 的占位行「反转时补顶部」同一判据。
@@ -4367,1204 +4241,34 @@ mod min_size_tests {
 
 /// 翻页栏并入「编码所在行」（`ui.candidate.pager_in_preedit`）。
 ///
-/// 这个开关的诉求只有一句：**竖排时别让翻页栏白占一行**。但编码有两种形态，落点因此有两处：
+/// 这个开关的诉求只有一句：竖排时别让翻页栏白占一行。但编码有两种形态，落点因此有两处：
 /// 独立编码栏（`candidate_top`）并进栏行右端，内联编码（`candidate_inline`）并进编码自己那一行。
 /// 本组钉的是「两种形态表现一致」，以及三条不该被波及的旁路（横排 / 旋转态 / 开关关闭）。
 ///
 /// 断言一律是相对量（谁比谁矮、谁在谁上面、有没有出右缘），与文本后端量出多宽无关，
 /// 故不 gate 平台 —— 与 [`width_budget_tests`] 同样的理由。
 #[cfg(test)]
-mod pager_inline_tests {
-    use super::*;
-    use crate::view::Rect;
+#[path = "candidate_window_pager_inline_tests.rs"]
+mod pager_inline_tests;
 
-    fn cand(text: &str) -> CandidateItem {
-        CandidateItem {
-            text_styled: Default::default(),
-            text: text.to_string(),
-            code: String::new(),
-            label: String::new(),
-            tooltip: Default::default(),
-            comment: Default::default(),
-            comment_above: Default::default(),
-            no_index: false,
-        }
-    }
-
-    /// 造一个多页候选窗。`embedded` = 内联编码（`candidate_inline`），false 即独立编码栏。
-    ///
-    /// `rotated`（蒙文竖排）与 `vertical` 互斥、不能同时为真（见 `set_orientation` 的断言），
-    /// 故这里传 `rotated=true` 时 `vertical` 一律置 false —— 两者在布局里殊途同归，
-    /// 都让 `list_vertical` 成立。
-    fn win(
-        vertical: bool,
-        rotated: bool,
-        embedded: bool,
-        on: bool,
-        preedit: &str,
-    ) -> CandidateWindow {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.scale = 1.0;
-        w.set_orientation(vertical && !rotated, rotated, false);
-        w.set_preedit_embedded(embedded);
-        w.set_pager_in_preedit(on);
-        let items: Vec<CandidateItem> = ["一", "二", "三"].iter().map(|t| cand(t)).collect();
-        // total_pages > 1 才有翻页栏；preedit 非空才谈得上「并入编码行」。
-        w.update(preedit, preedit.len(), "", items, 0, -1, 1, 3);
-        w
-    }
-
-    fn laid(w: &CandidateWindow, above: bool) -> View {
-        let mut root = w.scene.build_tree(&w.scene_input(above));
-        root.layout(0.0, 0.0, &w.text_renderer);
-        root
-    }
-
-    fn height(w: &CandidateWindow) -> f32 {
-        laid(w, false).measured_size().1
-    }
-
-    /// 递归收集树上所有叶子文本。
-    fn texts(v: &View) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(t) = &v.text {
-            out.push(t.clone());
-        }
-        for c in &v.children {
-            out.extend(texts(c));
-        }
-        out
-    }
-
-    /// 主题写的翻页字符要真的画到树上。
-    ///
-    /// `arrow_char` 那条纯函数测试挡不住这个 —— 把装配处的 `prev_txt`/`next_txt` 改回字面量
-    /// `"‹"`/`"›"`，它照样全绿。而「字段一路解析得好好的、渲染层不消费」正是本次修的 bug
-    /// 本体，测试若也绕开消费点，等于把同一个坑再踩一遍。故这条从 `set_theme` 出发，
-    /// 一直断言到布局后的树上。
-    #[test]
-    fn theme_arrow_chars_reach_the_view_tree() {
-        let mut w = win(false, false, false, false, "");
-        let mut t = wind_theme::Resolved::default();
-        t.views.footer_bar.prev_char = "$".into();
-        t.views.footer_bar.next_char = ")".into();
-        w.set_theme(t);
-        let found = texts(&laid(&w, false));
-        assert!(
-            found.iter().any(|s| s == "$"),
-            "上一页应画主题字符, 实得 {found:?}"
-        );
-        assert!(
-            found.iter().any(|s| s == ")"),
-            "下一页应画主题字符, 实得 {found:?}"
-        );
-        assert!(
-            !found.iter().any(|s| s == "‹" || s == "›"),
-            "内置箭头不该再出现, 实得 {found:?}"
-        );
-    }
-
-    /// 主题给 footer_bar 配的禁用态文字色，要真的画到禁用那一侧的箭头上。
-    ///
-    /// 判据取「首页时上一页与下一页**不同色**」这种相对量：绝对色值要跟着回退链（未配时
-    /// 回退全局 text_hint）走, 写死就成了另一份需要同步的副本。resolve 那侧另有一条
-    /// footer_bar_disabled_state_survives_resolve 钉住「patch 建得出来」, 这条钉住「渲染
-    /// 真的读它」—— 两段都断过一次。
-    #[test]
-    fn theme_disabled_arrow_color_reaches_the_view_tree() {
-        let leaf_colors = |ch_prev: &str, ch_next: &str, disabled: Option<[u8; 4]>| {
-            let mut w = win(false, false, false, false, "");
-            let mut t = wind_theme::Resolved::default();
-            t.views.footer_bar.prev_char = ch_prev.into();
-            t.views.footer_bar.next_char = ch_next.into();
-            if let Some(c) = disabled {
-                t.views.footer_bar.disabled = Some(Box::new(wind_theme::RvNode {
-                    text_color: Some(c),
-                    ..Default::default()
-                }));
-            }
-            w.set_theme(t);
-            let mut found = Vec::new();
-            collect_colors(&laid(&w, false), &mut found);
-            found
-        };
-        // 首页：上一页禁用、下一页可用 —— 两者取色分属禁用/启用两条路径。
-        let red = [255, 0, 0, 255];
-        let got = leaf_colors("<", ">", Some(red));
-        let prev_c = got.iter().find(|(t, _)| t == "<").map(|(_, c)| *c);
-        let next_c = got.iter().find(|(t, _)| t == ">").map(|(_, c)| *c);
-        assert_eq!(
-            prev_c,
-            Some(red),
-            "禁用侧应用主题配的禁用态色, 实得 {got:?}"
-        );
-        assert_ne!(next_c, Some(red), "可用侧不该被禁用色染上");
-
-        // 未配禁用态：回退全局 text_hint，行为与从前一致（内置主题都没配）。
-        let plain = leaf_colors("<", ">", None);
-        let prev_plain = plain.iter().find(|(t, _)| t == "<").map(|(_, c)| *c);
-        assert!(prev_plain.is_some() && prev_plain != Some(red));
-    }
-
-    /// 递归收集树上 (文本, 文字色)。
-    fn collect_colors(v: &View, out: &mut Vec<(String, [u8; 4])>) {
-        if let Some(t) = &v.text {
-            out.push((t.clone(), v.text_color));
-        }
-        for c in &v.children {
-            collect_colors(c, out);
-        }
-    }
-
-    /// 多字翻页符号要把按钮（连同命中区）撑宽，而不是盖到页码上或被裁掉。
-    ///
-    /// 宽度基线 `arrow_w` 是按一个字算的，schema 却不限 prev_char 的长度。判据用相对量
-    /// （多字宽 > 单字宽），与本组头注要求一致 —— 三个平台的文本后端量出的绝对宽度各不相同。
-    #[test]
-    fn multi_char_arrow_widens_the_hit_box() {
-        let hit_w = |ch: &str| {
-            let mut w = win(false, false, false, false, "");
-            let mut t = wind_theme::Resolved::default();
-            t.views.footer_bar.next_char = ch.into();
-            w.set_theme(t);
-            hit(&laid(&w, false), TAG_PAGE_NEXT)
-                .expect("下一页可点（首页 → 有下一页）")
-                .w
-        };
-        let one = hit_w(")");
-        let many = hit_w("下一页");
-        assert!(
-            many > one,
-            "多字应撑宽按钮: 单字 {one}, 多字 {many}（fixed_w 下两者相等）"
-        );
-    }
-
-    /// 多字箭头下，同一行的编码预算要跟着收窄 —— 否则超长编码把翻页栏顶出窗口右缘。
-    ///
-    /// 命中盒那条测试盖不住这个：按钮撑宽了、预算却按单字算，两者不一致恰恰是「箭头宽度
-    /// 公式写了两份」的后果。判据沿用同组既有那条（翻页栏右缘须落在窗口内），因为那正是
-    /// 预算算漏时真实会坏掉的地方；`pager_row_w` 的注释也明写着这条因果。
-    #[test]
-    fn multi_char_arrow_shrinks_the_preedit_budget() {
-        let themed = |ch: &str, preedit: &str| {
-            let mut w = win(true, false, true, true, preedit);
-            let mut t = wind_theme::Resolved::default();
-            t.views.footer_bar.next_char = ch.into();
-            t.views.footer_bar.prev_char = ch.into();
-            w.set_theme(t);
-            w
-        };
-        // 前置：编码必须已被宽度上限夹住, 否则下面的不等式恒真（同组头注反复警告的写法）。
-        let long = clamped_preedit(|p| themed("下一页", p));
-        let w1 = laid(&themed("下一页", &long), false).measured_size().0;
-        let w2 = laid(&themed("下一页", &long.repeat(2)), false)
-            .measured_size()
-            .0;
-        assert_eq!(w1, w2, "前置：超长编码须已被上限夹住（{w1} vs {w2}）");
-
-        let w = themed("下一页", &long);
-        let cap = w.screen_safety_max_width_px() as f32;
-        let root = laid(&w, false);
-        let (win_w, _) = root.measured_size();
-        // 判据必须是安全上限而不是「翻页栏落在 win_w 内」：预算算漏时整行照样排得下,
-        // 只是 win_w 自己跟着涨 —— 那个不等式恒真, 测了等于没测。真正坏掉的地方是渲染入口
-        // 那道 content_w.min(safety_max_w), 它是**裁切**语义, 超出部分在右缘直接被切掉。
-        assert!(
-            win_w <= cap + 0.5,
-            "多字箭头下整窗仍不得越过安全上限（{win_w} vs {cap}）—— 越界即预算按单字算漏了"
-        );
-        let p = pager(&root);
-        assert!(
-            p.x + p.w <= win_w + 0.5,
-            "翻页栏须完整落在窗口内（右缘 {} vs 窗口宽 {win_w}）",
-            p.x + p.w
-        );
-    }
-
-    /// 未配字符时回退内置 ‹ › —— 与上一条互为反面, 省得「让主题字符生效」被实现成
-    /// 「无论如何都不画内置箭头」。
-    #[test]
-    fn builtin_arrows_remain_when_theme_says_nothing() {
-        let w = win(false, false, false, false, "");
-        let found = texts(&laid(&w, false));
-        assert!(
-            found.iter().any(|s| s == "‹"),
-            "未配字符应回退内置, 实得 {found:?}"
-        );
-        assert!(
-            found.iter().any(|s| s == "›"),
-            "未配字符应回退内置, 实得 {found:?}"
-        );
-    }
-
-    /// 取某个 tag 的命中矩形；`None` = 该 tag 未参与命中（如翻页箭头被禁用或整个翻页栏没渲染）。
-    fn hit(root: &View, tag: i32) -> Option<Rect> {
-        let mut hits = Vec::new();
-        root.collect_hits(&mut hits);
-        hits.iter().find(|(t, _)| *t == tag).map(|(_, r)| *r)
-    }
-
-    fn pager(root: &View) -> Rect {
-        hit(root, TAG_PAGE_NEXT).expect("翻页栏须存在（多页 + 默认主题下可见）")
-    }
-
-    /// 首条候选的矩形（tag = 候选下标）。
-    fn first_cand(root: &View) -> Rect {
-        hit(root, 0).expect("首条候选须参与命中")
-    }
-
-    /// 造一段**确实已被宽度上限夹住**的超长编码：从 200 组 `a'` 起翻倍，直到「再翻一倍
-    /// 也不再变宽」为止，返回夹住的那一档。`mk` 是被测那一档的构造器 —— 必须与随后写
-    /// 前置断言时用的是同一个，否则夹住的是另一棵树。
-    ///
-    /// ⚠️ **重复次数不能写死。** 本组头注说「断言一律是相对量，与文本后端量出多宽无关」，
-    ///    可「超长编码须已被宽度上限夹住」这条**前置**恰恰是绝对量 —— 它成不成立取决于
-    ///    一个字有多宽，而三个平台的后端各不相同（Windows: DirectWrite；macOS: CoreText；
-    ///    Linux: 等宽 mock，见 `text/dwrite.rs` 末尾）。实测同样 200 组 `a'`：Windows 下
-    ///    已顶到 3000 的上限，macOS 下只有 2713.45，于是这三条**只在 macOS CI 上红**，
-    ///    Windows 与 Linux(mock) 全绿 —— 本机怎么跑都发现不了。
-    ///    判据要跟着字宽走，而不是把次数往上调一档、等下一个后端再把它顶穿。
-    ///
-    /// ★ `> floor` 那半条判据不能省。「加长一倍不再变宽」在**两端**都成立：
-    ///   一端是这里要的「顶到宽度上限」，另一端是「短得连窗口最小宽度都没撑满」——
-    ///   实测 mock 后端下 2 组 `a'` 与 4 组同为 116.4，正是后者。少了这半条，探测会在
-    ///   第一档就「收敛」并交回一段根本没被夹住的短编码，于是三条测试里那些
-    ///   「不得越过上限」的不等式**全部恒真** —— 绿得毫无意义，正是本组头注反复警告的
-    ///   那种写法。用空编码那档的树宽当 floor，两个平台期差着两个数量级，分得很开。
-    fn clamped_preedit(mk: impl Fn(&str) -> CandidateWindow) -> String {
-        let floor = laid(&mk(""), false).measured_size().0;
-        let mut n = 200usize;
-        for _ in 0..6 {
-            let one = "a'".repeat(n);
-            let w1 = laid(&mk(&one), false).measured_size().0;
-            let w2 = laid(&mk(&"a'".repeat(n * 2)), false).measured_size().0;
-            if w1 == w2 && w1 > floor {
-                return one;
-            }
-            n *= 2;
-        }
-        panic!("加到 {n} 组 `a'` 仍未被宽度上限夹住 —— 上限逻辑或文本测量变了，先查那边");
-    }
-
-    /// ★ 本次修复的核心判据：竖排下**两种编码形态的表现必须一致**。
-    ///
-    /// 修复前内联编码那档完全不理会开关（翻页栏照旧独占底部一行），用户看到的就是
-    /// 「同一个开关，换个编码显示方式就失灵」。
-    ///
-    /// 前置断言不可省：若独立编码栏那档本身就没省下这一行，后面两个相等就成了恒等式。
-    #[test]
-    fn inline_preedit_joins_pager_like_top_bar() {
-        let top_off = height(&win(true, false, false, false, "nihao"));
-        let top_on = height(&win(true, false, false, true, "nihao"));
-        let inline_off = height(&win(true, false, true, false, "nihao"));
-        let inline_on = height(&win(true, false, true, true, "nihao"));
-        assert!(
-            top_on < top_off,
-            "前置：独立编码栏下开关须真的省掉一行（{top_on} vs {top_off}）"
-        );
-        assert_eq!(
-            inline_off, top_off,
-            "开关关闭时两种编码形态本就同高（都是底部独立行）"
-        );
-        assert_eq!(
-            inline_on, top_on,
-            "开关开启时内联编码须与独立编码栏省下同样的一行（{inline_on} vs {top_on}）"
-        );
-    }
-
-    /// 并入后翻页栏须真的落在**编码那一行**里：整个矩形在首条候选之上。
-    ///
-    /// 只测高度不够——把翻页栏挂到窗口任意别处也能让总高少一行，位置才是这条开关的本意。
-    #[test]
-    fn inlined_pager_sits_above_first_candidate() {
-        let w = win(true, false, true, true, "nihao");
-        let root = laid(&w, false);
-        let p = pager(&root);
-        let c0 = first_cand(&root);
-        assert!(
-            p.y + p.h <= c0.y + 0.5,
-            "翻页栏须整体位于首条候选之上（翻页栏底 {} vs 候选顶 {}）",
-            p.y + p.h,
-            c0.y
-        );
-    }
-
-    /// ★ 开关关闭时翻页栏**不得消失**，仍是候选区下方的独立一行。
-    ///
-    /// 这条钉的是实现里的一个真实陷阱：并入分支若写成 `pager.take().filter(开关)`，
-    /// 开关关闭时翻页栏会被取出来直接丢掉，末尾装配段再也拿不到它 —— 症状是「关掉开关翻页栏
-    /// 就没了」，而开着的时候一切正常，最容易漏测的那一半。
-    #[test]
-    fn switch_off_keeps_pager_below_candidates() {
-        let w = win(true, false, true, false, "nihao");
-        let root = laid(&w, false);
-        let p = pager(&root);
-        let c0 = first_cand(&root);
-        assert!(
-            p.y > c0.y,
-            "开关关闭时翻页栏须留在候选下方（翻页栏 y={} vs 首候选 y={}）",
-            p.y,
-            c0.y
-        );
-    }
-
-    /// 横排不受影响：内联编码与候选本就同属一行，翻页栏本来就在该行末尾，开关无从谈起。
-    #[test]
-    fn horizontal_inline_is_untouched_by_switch() {
-        let off = height(&win(false, false, true, false, "nihao"));
-        let on = height(&win(false, false, true, true, "nihao"));
-        assert_eq!(off, on, "横排内联编码下开关不得改变布局");
-    }
-
-    /// ⚠️ 旋转态（蒙文竖排）刻意排除在外：内联编码在旋转包裹层**内部**，翻页栏跟进去会连
-    /// 箭头带页码一起转 90°。那一档维持底部独立行（它挂在 root 上，屏幕上仍是横的一条）。
-    #[test]
-    fn rotated_inline_keeps_bottom_pager() {
-        let off = height(&win(false, true, true, false, "nihao"));
-        let on = height(&win(false, true, true, true, "nihao"));
-        assert_eq!(off, on, "旋转态下不得并入（否则翻页箭头会跟着转）");
-        // 前置：同一组参数在非旋转竖排下开关是**有效**的，否则上面的相等只是「哪儿都没生效」。
-        assert!(
-            height(&win(true, false, true, true, "nihao"))
-                < height(&win(true, false, true, false, "nihao")),
-            "前置：非旋转竖排下开关须真的省掉一行"
-        );
-    }
-
-    /// 编码沉底（`swap_preedit_when_above`，窗口翻到光标上方）时，并入的翻页栏须**跟着编码一起**
-    /// 沉到底部 —— 它是编码那一行的子节点，本就该同进同退。
-    #[test]
-    fn inlined_pager_follows_preedit_to_bottom_on_swap() {
-        let mut w = win(true, false, true, true, "nihao");
-        w.set_swap_preedit_when_above(true);
-        let root = laid(&w, true);
-        let p = pager(&root);
-        let c0 = first_cand(&root);
-        assert!(
-            p.y > c0.y,
-            "沉底时翻页栏须随编码行落到候选之下（翻页栏 y={} vs 首候选 y={}）",
-            p.y,
-            c0.y
-        );
-    }
-
-    /// 造一个**独立编码栏**（`candidate_top`）的窗口，可带模式徽标。
-    ///
-    /// 与 `win()` 的区别只有两条：`embedded = false`，以及 `mode_label` 可非空。
-    /// 单列一个助手而不给 `win()` 再加参数——这两条测的是 band 那条落点，与内联那族无关。
-    fn bar_win(label: &str, on: bool, preedit: &str) -> CandidateWindow {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.scale = 1.0;
-        w.set_orientation(true, false, false);
-        w.set_preedit_embedded(false);
-        w.set_pager_in_preedit(on);
-        let items: Vec<CandidateItem> = ["一", "二", "三"].iter().map(|t| cand(t)).collect();
-        w.update(preedit, preedit.len(), label, items, 0, -1, 1, 3);
-        w
-    }
-
-    /// 独立编码栏必须撑满窗口内容宽，与主题编辑器预览一致。
-    ///
-    /// 只有编码那么宽时，配了背景色的编码栏后半截露出窗口底（窗口透明就是透明的一段）。
-    /// 取无徽标、无并入翻页栏的那档——那两者在时 band 本来就撑满，测不到这条。
-    /// 默认主题没配 `separator`，即「第三方主题」那条路径。
-    #[test]
-    fn own_preedit_bar_spans_window_content_width() {
-        let w = bar_win("", false, "a");
-        let root = laid(&w, false);
-        let band = &root.children[0];
-        assert!(
-            band.text.is_none() && !band.children.is_empty(),
-            "前置：首个子节点应为编码栏"
-        );
-        let content_w = root.measured_size().0 - root.padding.l - root.padding.r;
-        let band_w = band.laid_rect().w;
-        assert!(
-            band.children[0].measured_size().0 < content_w,
-            "前置：编码本身须比窗口内容窄，否则恒真"
-        );
-        assert_eq!(
-            band_w, content_w,
-            "编码栏只有 {band_w} 宽，窗口内容宽 {content_w}"
-        );
-    }
-
-    /// 编码栏下的分隔线：颜色 / 线粗 / 间距走 `views.divider`；`enabled=false` 不画。
-    #[test]
-    fn divider_node_controls_the_preedit_separator() {
-        // 找到编码栏之后紧跟的那条细线（Row、定高、无文字无子节点、背景色 = sep）。
-        let line_of = |root: &View, col: [u8; 4]| -> Option<(f32, f32)> {
-            fn walk(v: &View, col: [u8; 4], out: &mut Option<(f32, f32)>) {
-                if v.text.is_none() && v.children.is_empty() && v.bg == Some(col) {
-                    *out = Some((v.laid_rect().h, v.margin.b));
-                }
-                for c in &v.children {
-                    walk(c, col, out);
-                }
-            }
-            let mut out = None;
-            walk(root, col, &mut out);
-            out
-        };
-        let col = [10, 20, 30, 255];
-        let mut w = bar_win("", false, "a");
-        let mut t = wind_theme::Resolved::default();
-        t.views.divider.bg_color = Some(col);
-        w.set_theme(t.clone());
-        assert_eq!(
-            line_of(&laid(&w, false), col),
-            Some((1.0, 4.0)),
-            "缺省 1px、下距 4"
-        );
-
-        t.views.divider_height = Some(wind_theme::schema::Dim::Dp(3.0));
-        t.views.divider.margin.bottom = Some(wind_theme::schema::Dim::Dp(9.0));
-        w.set_theme(t.clone());
-        assert_eq!(
-            line_of(&laid(&w, false), col),
-            Some((3.0, 9.0)),
-            "线粗与下距可配"
-        );
-
-        t.views.divider_enabled = Some(false);
-        w.set_theme(t);
-        assert_eq!(line_of(&laid(&w, false), col), None, "enabled=false 不画");
-    }
-
-    /// ★ F-17：**独立**编码栏那条落点同样要为并入的翻页栏留出宽度。
-    ///
-    /// 这是 55032bc0 给内联那条补的同一笔账的另一半，当时漏了。band 排的是
-    /// `[编码][spacer][徽标][翻页栏]`，而 `preedit_bar_text_budget_px` 只扣了窗口内边距与
-    /// 自身内边距，后两个成员一个都没进预算。
-    ///
-    /// ⚠️ 症状**不是**「窗口探出屏幕」：渲染入口那道 `content_w.min(safety_max_w)` 是**裁切**
-    /// 语义、不回头改 `root`，所以窗口出不去，超出的部分在右缘直接被切掉且没有省略号——
-    /// 翻页栏看不见或只剩半截箭头。也正因如此 `width_budget_tests` 那组抓不到它（它断的是
-    /// 钳制**之后**的窗口宽，恒满足）。判据必须量 `laid()` 的**树宽**、与安全上限比。
-    ///
-    /// 实测（scale=1，200 组 `a'`，上限 3000）：修复前树宽 3091.6，修复后 2994.4。
-    #[test]
-    fn long_preedit_in_own_bar_reserves_room_for_inlined_pager() {
-        let long = clamped_preedit(|p| bar_win("", true, p));
-        let w = bar_win("", true, &long);
-        let cap = w.screen_safety_max_width_px() as f32;
-        // 前置①：这一行必须**已经被上限夹住**（再加长一倍不再变宽），否则不等式恒真。
-        let root = laid(&w, false);
-        let (win_w, _) = root.measured_size();
-        assert_eq!(
-            win_w,
-            laid(&bar_win("", true, &long.repeat(2)), false)
-                .measured_size()
-                .0,
-            "前置：超长编码须已被宽度上限夹住"
-        );
-        // 前置②：这一档确实并入了编码栏（翻页栏落在编码那一行，不是候选区底部）。
-        let p = pager(&root);
-        let c0 = first_cand(&root);
-        assert!(
-            p.y < c0.y,
-            "前置：翻页栏须并在编码行（y={} 应在首候选 y={} 之上）",
-            p.y,
-            c0.y
-        );
-
-        assert!(
-            win_w <= cap + 0.5,
-            "整棵树不得越过安全上限（{win_w} vs {cap}）—— 越过的部分会被右缘裁掉"
-        );
-        assert!(
-            p.x + p.w <= win_w + 0.5,
-            "翻页栏须完整落在窗口内（右缘 {} vs 窗口宽 {win_w}）",
-            p.x + p.w
-        );
-    }
-
-    /// ★ F-17 的另一半：模式徽标同样占着 band 的右端，同样得进预算。
-    ///
-    /// 与上一条分开是因为两者**各自独立**地漏掉了——实测（同参数）只带徽标不开翻页栏时
-    /// 树宽 3046.4，仍越上限 46.4；只有两项都扣掉，四种组合才全部落回上限内。
-    #[test]
-    fn long_preedit_in_own_bar_reserves_room_for_mode_chip() {
-        let long = clamped_preedit(|p| bar_win("临时英文", false, p));
-        let w = bar_win("临时英文", false, &long);
-        let cap = w.screen_safety_max_width_px() as f32;
-        let root = laid(&w, false);
-        let (win_w, _) = root.measured_size();
-        assert_eq!(
-            win_w,
-            laid(&bar_win("临时英文", false, &long.repeat(2)), false)
-                .measured_size()
-                .0,
-            "前置：超长编码须已被宽度上限夹住"
-        );
-        // 前置：对照组（无徽标）必须**本来就没越界**，否则这条量到的是别的账。
-        let plain = laid(&bar_win("", false, &long), false).measured_size().0;
-        assert!(plain <= cap + 0.5, "前置：无徽标时本就不该越界（{plain}）");
-        assert!(
-            win_w <= cap + 0.5,
-            "带模式徽标时整棵树仍不得越过安全上限（{win_w} vs {cap}）"
-        );
-    }
-
-    /// ★ 超长编码不得把这一行撑出宽度上限：编码的文字预算要先扣掉翻页栏占的那一截。
-    ///
-    /// 竖排下内联编码原本独占整行预算（与候选互不竞争），并入之后这个前提不再成立。
-    ///
-    /// ⚠️ 参照物必须是**屏幕安全上限**，不能拿 `measured_size()` 当窗口宽去比翻页栏右缘 ——
-    /// 树是自底向上量的，翻页栏当然落在自己撑出来的那个宽度里，那样写恒真（本条最初就是
-    /// 这么写的，变异检验里「预算不扣翻页栏」一改，七条测试全绿，才发现它什么都没测）。
-    #[test]
-    fn long_preedit_does_not_push_row_past_width_budget() {
-        let long = clamped_preedit(|p| win(true, false, true, false, p));
-        let w_on = win(true, false, true, true, &long);
-        let cap = w_on.screen_safety_max_width_px() as f32;
-        // 前置：这一行必须**已经被上限夹住**（再加长一倍宽度不变），否则下面的不等式恒真。
-        // 判据取「加长不再变宽」而不是「宽度 == 上限」：截断按整字符走，量出来总比预算少小半个字。
-        let off_w = laid(&win(true, false, true, false, &long), false)
-            .measured_size()
-            .0;
-        let off_w2 = laid(&win(true, false, true, false, &long.repeat(2)), false)
-            .measured_size()
-            .0;
-        assert_eq!(
-            off_w, off_w2,
-            "前置：超长编码须已被宽度上限夹住（{off_w} vs {off_w2}）"
-        );
-        assert!(
-            off_w <= cap + 0.5,
-            "前置自洽：夹住后不该超过上限（{off_w} vs {cap}）"
-        );
-        let root = laid(&w_on, false);
-        let (win_w, _) = root.measured_size();
-        assert!(
-            win_w <= cap + 0.5,
-            "并入翻页栏后整窗仍不得越过安全上限（{win_w} vs {cap}）"
-        );
-        let p = pager(&root);
-        assert!(
-            p.x + p.w <= win_w + 0.5,
-            "翻页栏须完整落在窗口内（右缘 {} vs 窗口宽 {win_w}）",
-            p.x + p.w
-        );
-    }
-}
-
-/// 宽度上限：**整棵树**都不得超过屏幕安全上限。
+/// 宽度上限：整棵树都不得超过屏幕安全上限。
 ///
-/// ★ 与 [`min_size_tests`] 不同，本组**不 gate 平台**——断言的是不等式（行宽 ≤ 上限）而非
-/// 具体像素值，与文本后端量出多宽无关，故真实 DirectWrite 与 mock 下同样成立。上限也不写死
-/// 常量，直接取 `screen_safety_max_width_px()`。本组不走渲染入口，`screen_extent` 恒为 None，
-/// 各平台都按兜底常量（3000dp）断言，不涉真实屏幕宽。
+/// 不 gate 平台：断言的是不等式而非具体像素值。上限取 `screen_safety_max_width_px()`；本组
+/// 不走渲染入口，`screen_extent` 恒为 None，按兜底常量断言。
 #[cfg(test)]
-mod width_budget_tests {
-    use super::*;
+#[path = "candidate_window_width_budget_tests.rs"]
+mod width_budget_tests;
 
-    fn cand(text: &str) -> CandidateItem {
-        CandidateItem {
-            text_styled: Default::default(),
-            text: text.to_string(),
-            code: String::new(),
-            label: String::new(),
-            tooltip: Default::default(),
-            comment: Default::default(),
-            comment_above: Default::default(),
-            no_index: false,
-        }
-    }
-
-    /// 造一个候选窗并布局，返回 (窗口, 内容宽)。scale 钉 1.0 使 dp == 设备像素。
-    fn build(vertical: bool, texts: &[&str]) -> (CandidateWindow, View) {
-        build_o(vertical, false, texts)
-    }
-
-    /// 同 [`build`]，可指定旋转位与直立位。
-    fn build_o(vertical: bool, rotated: bool, texts: &[&str]) -> (CandidateWindow, View) {
-        build_ou(vertical, rotated, false, texts)
-    }
-
-    /// 同 [`build_o`]，可指定「字直立」（对联式竖排）。
-    fn build_ou(
-        vertical: bool,
-        rotated: bool,
-        upright: bool,
-        texts: &[&str],
-    ) -> (CandidateWindow, View) {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.scale = 1.0;
-        w.set_orientation(vertical, rotated, upright);
-        let items: Vec<CandidateItem> = texts.iter().map(|t| cand(t)).collect();
-        w.update("", 0, "", items, 0, -1, 1, 1);
-        let mut root = w.scene.build_tree(&w.scene_input(false));
-        root.layout(0.0, 0.0, &w.text_renderer);
-        (w, root)
-    }
-
-    /// 取全部候选的命中矩形，按 tag 升序（tag = 原始候选下标）。
-    fn hits_by_tag(root: &View) -> Vec<Rect> {
-        let mut out = Vec::new();
-        root.collect_hits(&mut out);
-        out.retain(|(t, _)| *t >= 0);
-        out.sort_by_key(|(t, _)| *t);
-        out.into_iter().map(|(_, r)| r).collect()
-    }
-
-    /// ★★ 横排多候选：**整行**宽度不得超过屏幕安全上限——与候选个数无关。
-    ///
-    /// 这是「先到先得」贪心分配翻车的直接回归：那种做法下第一个候选吃光预算，其后每个候选
-    /// 仍各自加上「固定开销（item 内边距/序号/间隙）+ 文字下限」，累加必然突破上限，真机 9 个
-    /// 候选实测溢出约 1100px。★ 逐个候选看都「没超自己的预算」，**只有按整行断言才测得出来**
-    /// ——所以这里量的是 `build_tree` 产物的总宽，而不是任何单个候选的宽度。
-    #[test]
-    fn horizontal_row_never_exceeds_screen_budget_for_any_candidate_count() {
-        let long = "超长候选".repeat(200); // 800 字，远超任何屏幕宽度
-        for n in 1..=12usize {
-            let texts: Vec<&str> = (0..n).map(|_| long.as_str()).collect();
-            let (w, root) = build(false, &texts);
-            let cap = w.screen_safety_max_width_px() as f32;
-            let got = root.measured_size().0;
-            assert!(
-                got <= cap + 0.5,
-                "{n} 个超长候选横排时整行宽 {got} 超出上限 {cap}"
-            );
-        }
-    }
-
-    /// 横排「一条长整句 + 若干短词」——最常见的形态：短词必须**原样显示不被误截**，长句吃掉
-    /// 剩余空间。一刀切均分会把长句压到 1/n（明明还有大把空间），water-filling 才有这个性质。
-    #[test]
-    fn horizontal_short_candidates_survive_next_to_a_long_one() {
-        let long = "长".repeat(500);
-        let mut texts: Vec<&str> = vec![long.as_str()];
-        texts.extend(["你好", "世界", "输入", "法"]);
-        let (w, root) = build(false, &texts);
-        assert!(
-            root.measured_size().0 <= w.screen_safety_max_width_px() as f32 + 0.5,
-            "整行仍不得超上限"
-        );
-        let mut in_tree = Vec::new();
-        collect_texts(&root, &mut in_tree);
-        for short in ["你好", "世界", "输入", "法"] {
-            assert!(
-                in_tree.iter().any(|t| t == short),
-                "短候选 {short} 不该被截断，树内文本：{in_tree:?}"
-            );
-        }
-    }
-
-    /// 竖排：每候选独占一行、各自用满整行预算，行宽同样不得超上限。
-    #[test]
-    fn vertical_rows_never_exceed_screen_budget() {
-        let long = "超长候选".repeat(200);
-        let texts: Vec<&str> = (0..9).map(|_| long.as_str()).collect();
-        let (w, root) = build(true, &texts);
-        let cap = w.screen_safety_max_width_px() as f32;
-        let got = root.measured_size().0;
-        assert!(got <= cap + 0.5, "竖排宽 {got} 超出上限 {cap}");
-    }
-
-    /// 正常长度的候选完全不受影响：没超预算就不该动它（零回归）。
-    #[test]
-    fn normal_candidates_are_untouched() {
-        for vertical in [false, true] {
-            let (_, root) = build(vertical, &["你好", "世界", "输入法"]);
-            let mut in_tree = Vec::new();
-            collect_texts(&root, &mut in_tree);
-            for t in ["你好", "世界", "输入法"] {
-                assert!(
-                    in_tree.iter().any(|x| x == t),
-                    "vertical={vertical} 下正常候选 {t} 被改动了：{in_tree:?}"
-                );
-            }
-        }
-    }
-
-    /// 递归收集树内所有文本叶子的内容。
-    fn collect_texts(v: &View, out: &mut Vec<String>) {
-        if let Some(t) = &v.text {
-            out.push(t.clone());
-        }
-        for c in &v.children {
-            collect_texts(c, out);
-        }
-    }
-
-    /// 手动基准：量截断带来的 build_tree+layout 开销与测量缓存增长。
-    /// `cargo test -p wind-ui --release --lib bench_truncation_cost -- --ignored --nocapture`
-    ///
-    /// 只在 Windows：要量的是**真实 DirectWrite** 的排版/哈希成本，mock 后端（等宽近似）量出来
-    /// 的数字没有意义；`measure_cache_len` 也只有真实后端才有。
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "手动基准，不参与常规测试"]
-    fn bench_truncation_cost() {
-        use std::time::Instant;
-
-        let short: Vec<&str> = vec![
-            "你好",
-            "世界",
-            "输入法",
-            "候选",
-            "测试",
-            "性能",
-            "开销",
-            "评估",
-            "基准",
-        ];
-        let longs = "超长候选词条".repeat(140); // 840 字
-        let long: Vec<&str> = (0..9).map(|_| longs.as_str()).collect();
-
-        for (name, texts) in [("短候选(常态)", &short), ("超长候选(最坏)", &long)] {
-            for vertical in [false, true] {
-                let (tx, _rx) = std::sync::mpsc::channel();
-                let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-                w.scale = 2.0;
-                w.set_orientation(vertical, false, false);
-                let items: Vec<CandidateItem> = texts.iter().map(|t| cand(t)).collect();
-                w.update("ceshipinyin", 0, "", items, 0, -1, 1, 1);
-                let cache0 = w.text_renderer.measure_cache_len();
-
-                // 冷：首帧（所有测量都要真打 DirectWrite）
-                let t0 = Instant::now();
-                let mut root = w.scene.build_tree(&w.scene_input(false));
-                root.layout(0.0, 0.0, &w.text_renderer);
-                let cold = t0.elapsed();
-                let cache1 = w.text_renderer.measure_cache_len();
-
-                // 热：稳态（同样文本，测量走缓存）——真实打字时每帧都是这个路径
-                let n = 50;
-                let t1 = Instant::now();
-                for _ in 0..n {
-                    let mut r = w.scene.build_tree(&w.scene_input(false));
-                    r.layout(0.0, 0.0, &w.text_renderer);
-                }
-                let warm = t1.elapsed() / n;
-                let cache2 = w.text_renderer.measure_cache_len();
-
-                println!(
-                    "{name} {} | 冷={cold:?} 热={warm:?} | 缓存 {cache0}→{cache1}→{cache2}",
-                    if vertical { "竖排" } else { "横排" }
-                );
-            }
-        }
-
-        // 拆解：新增开销的两个构成——(a) 预扫阶段的「已缓存」测量，(b) 二分探测串的构造+哈希。
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        let st = TextStyle::new(36.0);
-        for (label, text) in [("短串(4字)", "输入法好"), ("长串(840字)", longs.as_str())]
-        {
-            w.text_renderer.measure(text, &st); // 预热入缓存
-            let n = 2000;
-            let t = Instant::now();
-            for _ in 0..n {
-                std::hint::black_box(w.text_renderer.measure(std::hint::black_box(text), &st));
-            }
-            println!("  已缓存 measure {label}: {:?}/次", t.elapsed() / n);
-        }
-        // 单次截断（含二分）的成本：预算取自然宽的一半，强制触发。
-        let full = w.text_renderer.measure(longs.as_str(), &st).width;
-        let n = 500;
-        let t = Instant::now();
-        for _ in 0..n {
-            std::hint::black_box(w.scene_input(false).truncate_text_for_width(
-                std::hint::black_box(longs.as_str()),
-                &st,
-                full * 0.5,
-            ));
-        }
-        println!(
-            "  truncate_text_for_width(840字, 热): {:?}/次",
-            t.elapsed() / n
-        );
-    }
-
-    // ───────────────────── 旋转态接线（A：候选项旋转 90°）─────────────────────
-
-    /// 旋转态的窗口尺寸相对**竖排**必须整个翻过来。
-    ///
-    /// ★ 对照必须选竖排而不是横排：竖排本身就是「窄而高」，拿横排比的话，
-    /// 一个「旋转位被当成竖排、根本没套旋转包裹」的实现照样通过——
-    /// 这正是本轮变异验证抓出来的第一条假绿。
-    #[test]
-    fn rotated_window_swaps_dimensions_against_vertical() {
-        let texts = ["候选一二三四五六", "候选一二三四五六", "候选一二三四五六"];
-        let (_, v_root) = build_o(true, false, &texts);
-        let (_, r_root) = build_o(false, true, &texts);
-        let (vw, vh) = v_root.measured_size();
-        let (rw, rh) = r_root.measured_size();
-        assert!(
-            rw < vw,
-            "旋转态的宽应远小于竖排（宽只由列数决定）: 旋转 {rw} vs 竖排 {vw}"
-        );
-        assert!(
-            rh > vh,
-            "旋转态的高应远大于竖排（文字长度落到高度上）: 旋转 {rh} vs 竖排 {vh}"
-        );
-    }
-
-    /// ★★ 候选 1 必须落在**最左**。
-    ///
-    /// 局部列首经顺时针 90° 会落到屏幕最右，故列表在局部空间里是**逆序**排的。
-    /// 少了那次逆序，候选顺序就整个左右颠倒——而画面看上去仍然「正常」，
-    /// 只有对着编号读才发现是反的。
-    #[test]
-    fn rotated_puts_candidate_one_leftmost() {
-        let (_, root) = build_o(false, true, &["甲", "乙", "丙"]);
-        let hits = hits_by_tag(&root);
-        assert_eq!(hits.len(), 3, "应收集到三个候选的命中矩形");
-        assert!(
-            hits[0].x < hits[1].x && hits[1].x < hits[2].x,
-            "候选应自左向右为 1、2、3，实测 x = {:?}",
-            hits.iter().map(|r| r.x).collect::<Vec<_>>()
-        );
-    }
-
-    // ─────────────── 直立态（B：文字竖排／对联式）───────────────
-
-    /// ★★ 直立态与旋转态的**唯一**几何差别：文字沿列前进的步长。
-    ///
-    /// 旋转态每个字占它的**前进宽度**，直立态每个字占它的**行高**。
-    /// 断言写成「加字带来的高度增量」而不是「总高」，是为了把内外边距、序号、
-    /// 固定开销全部约掉——那些两态完全一样，混在总高里会稀释掉真正的差异，
-    /// 真实字体下（行高只比汉字前进宽多两成）就可能淹没到测不出。
-    ///
-    /// 用拉丁文字放大差距：前进宽约 0.5em、行高约 1.2em，两倍以上。
-    #[test]
-    fn upright_advances_by_line_height_rotated_by_glyph_width() {
-        let step = |upright: bool| {
-            let (_, one) = build_ou(false, true, upright, &["a"]);
-            let (_, four) = build_ou(false, true, upright, &["aaaa"]);
-            one.measured_size();
-            four.measured_size().1 - one.measured_size().1
-        };
-        let (rot, upr) = (step(false), step(true));
-        assert!(rot > 0.0, "对照失效：旋转态加字也该变高，实测 {rot}");
-        assert!(
-            upr > rot * 1.5,
-            "直立态每字应按行高推进（远大于字宽）：直立 {upr} vs 旋转 {rot}"
-        );
-    }
-
-    /// 直立态与旋转态**同一种排列**：候选 1 同样在最左。
-    ///
-    /// 少了这条，一个「直立时忘了跟着逆序」的实现只会让候选左右颠倒——画面照样正常。
-    #[test]
-    fn upright_puts_candidate_one_leftmost() {
-        let (_, root) = build_ou(false, true, true, &["甲", "乙", "丙"]);
-        let hits = hits_by_tag(&root);
-        assert_eq!(hits.len(), 3, "应收集到三个候选的命中矩形");
-        assert!(
-            hits[0].x < hits[1].x && hits[1].x < hits[2].x,
-            "候选应自左向右为 1、2、3，实测 x = {:?}",
-            hits.iter().map(|r| r.x).collect::<Vec<_>>()
-        );
-    }
-
-    /// ★ 序号**整块**扶正，不逐格切：两位数的序号横着读，占的仍是一格的高度。
-    ///
-    /// 判据落在**列高**上：整块扶正时序号沿列只占一个行高，与位数无关；
-    /// 逐格切则两位数占两个行高，列会变高。宽度测不出来——两种实现下它都可能被
-    /// 别的节点顶住。
-    ///
-    /// 对照必不可少：同一批候选里**多一个字**必须让列变高，否则这条断言恒真。
-    #[test]
-    fn upright_index_is_one_block_not_stacked_digits() {
-        let build = |label: &str, text: &str| {
-            let (tx, _rx) = std::sync::mpsc::channel();
-            let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-            w.scale = 1.0;
-            w.set_orientation(false, true, true);
-            let mut item = cand(text);
-            item.label = label.to_string();
-            w.update("", 0, "", vec![item], 0, -1, 1, 1);
-            let mut root = w.scene.build_tree(&w.scene_input(false));
-            root.layout(0.0, 0.0, &w.text_renderer);
-            root.measured_size().1
-        };
-        let one = build("1", "字");
-        assert!(
-            (build("88", "字") - one).abs() < 0.5,
-            "两位序号让列变高了 ⇒ 序号被逐格竖着切了：{} vs {one}",
-            build("88", "字")
-        );
-        assert!(
-            build("1", "字字") > one + 0.5,
-            "对照失效：多一个字也没让列变高，本用例测不出东西"
-        );
-    }
-
-    /// ★★ 注释在直立态下也**逐格竖排**，拉丁编码不例外。
-    ///
-    /// 判据落在「加一段注释让列长了多少」上：旋转态注释躺着，每个拉丁字符只吃它的
-    /// 前进宽（约 0.5em）；直立态每格站着，吃一个行高（约 1.2em）。两者若增量相同，
-    /// 说明注释还躺着——而那正是真机反馈「看不懂」的成因：同一列里两种阅读方向。
-    ///
-    /// ⚠️ 断言写成**增量之比**而不是总高：内外边距、序号、固定开销两态完全一样，
-    /// 混在总高里会稀释掉真正的差异。同 `upright_advances_by_line_height…` 的写法。
-    #[test]
-    fn upright_stacks_the_comment_too() {
-        let col_h = |upright: bool, comment: &str| {
-            let (tx, _rx) = std::sync::mpsc::channel();
-            let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-            w.scale = 1.0;
-            w.set_orientation(false, true, upright);
-            let mut item = cand("甲");
-            item.comment = comment.into();
-            w.update("", 0, "", vec![item], 0, -1, 1, 1);
-            let mut root = w.scene.build_tree(&w.scene_input(false));
-            root.layout(0.0, 0.0, &w.text_renderer);
-            root.measured_size().1
-        };
-        let rot = col_h(false, "abcd") - col_h(false, "");
-        let upr = col_h(true, "abcd") - col_h(true, "");
-        assert!(rot > 0.0, "对照失效：旋转态加注释也该变长，实测 {rot}");
-        assert!(
-            upr > rot * 1.5,
-            "直立态的注释应按行高逐格推进：直立 {upr} vs 旋转 {rot}"
-        );
-    }
-
-    /// 模式徽标与内联编码同样在旋转包裹层里，直立态一并逐格扶正。
-    ///
-    /// ★ 这两处与注释共用同一个 `upright_text`，但仍各测一次：接线漏一处的表现只是
-    /// 「某一段还躺着」，画面正常、别的测试全绿。
-    ///
-    /// ⚠️ 判据落在**窗口高度**上，且要让被测那一段成为最长的一列（故用长串 + 短候选）：
-    /// 旋转态的列表在局部空间是 Column，往里加一个节点长的是局部**高度** ⇒ 屏幕**宽度**；
-    /// 只有该节点自身沿列的长度（局部宽度）才映射到屏幕高度。拿「加了它高度涨多少」当
-    /// 判据会恒为 0——本轮第一版正是这么写的，对照直接失效。
-    ///
-    /// 用拉丁串放大差距：前进宽约 0.5em、逐格站着约 1.2em，两倍以上；
-    /// 汉字两轴只差两成，测不出分辨力。
-    #[test]
-    fn upright_stacks_the_inline_preedit_and_mode_chip() {
-        const LONG: &str = "abcdefghijkl";
-        let h = |upright: bool, preedit: &str, label: &str| {
-            let (tx, _rx) = std::sync::mpsc::channel();
-            let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-            w.scale = 1.0;
-            w.set_orientation(false, true, upright);
-            w.set_preedit_embedded(true);
-            w.update(preedit, preedit.len(), label, vec![cand("甲")], 0, -1, 1, 1);
-            let mut root = w.scene.build_tree(&w.scene_input(false));
-            root.layout(0.0, 0.0, &w.text_renderer);
-            root.measured_size().1
-        };
-        let bare = h(false, "", "");
-        for (what, preedit, label) in [("内联编码", LONG, ""), ("模式徽标", "", LONG)] {
-            let rot = h(false, preedit, label);
-            let upr = h(true, preedit, label);
-            assert!(
-                rot > bare,
-                "{what} 对照失效：它没成为最长的一列，这条测不出东西（{rot} vs {bare}）"
-            );
-            assert!(
-                upr > rot * 1.8,
-                "{what} 没逐格扶正：直立 {upr} vs 旋转 {rot}"
-            );
-        }
-    }
-
-    /// ★ 截断量的是**沿列方向**的长度，不是文字的横向宽度。
-    ///
-    /// 同一个预算下，直立态能放的字必须比横向**少**——拉丁字母横向前进约 0.5em、
-    /// 竖着占一个行高约 1.2em。两者若一样多，说明截断还在按横向宽度估容量，
-    /// 表现是「英文候选在对联模式下戳出屏幕」，而中文候选看着完全正常
-    /// （汉字两轴只差两成，肉眼看不出来）。
-    #[test]
-    fn upright_truncation_measures_the_stacking_axis() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        let style = TextStyle::new(20.0);
-        let text = "abcdefghij";
-        // 预算取「横向刚好放得下五个字母」，两态用同一个数。
-        let budget = w.text_renderer.measure("abcde", &style).width;
-
-        w.set_orientation(false, false, false);
-        let flat = w
-            .scene_input(false)
-            .truncate_candidate_text(text, &style, budget);
-        w.set_orientation(false, true, true);
-        let stacked = w
-            .scene_input(false)
-            .truncate_candidate_text(text, &style, budget);
-
-        assert!(
-            flat.chars().count() > stacked.chars().count(),
-            "直立态该放得更少：横向 {flat:?} vs 直立 {stacked:?}"
-        );
-        // 再紧的预算也至少留一个字 + 省略号，不能什么都不显示。
-        w.set_orientation(false, true, true);
-        assert_eq!(
-            w.scene_input(false)
-                .truncate_candidate_text(text, &style, 0.0),
-            "a…"
-        );
-        assert_eq!(
-            w.scene_input(false)
-                .truncate_candidate_text("", &style, 0.0),
-            ""
-        );
-    }
-
-    /// ★★ 旋转态走的是**竖排**的列表路径：每个候选在局部空间里独占一行、宽度统一
-    /// （高亮宽度一致），转完就是**等宽的列**。
-    ///
-    /// ⚠️ 断言落在**高度**上：局部宽度经顺时针 90° 变成屏幕高度。
-    /// 断言宽度是测不出来的——那对应局部**高度**（行高），无论走哪条路径都恒等，
-    /// 本轮变异验证抓出的第二条假绿正是这个。
-    ///
-    /// 反向对照不可少：同一批长短不一的候选在横排下宽度必须**互不相同**。
-    #[test]
-    fn rotated_uses_the_vertical_list_path() {
-        let texts = ["甲", "乙丙丁", "戊己庚辛壬"];
-        let (_, r_root) = build_o(false, true, &texts);
-        let r = hits_by_tag(&r_root);
-        assert!(
-            (r[0].h - r[1].h).abs() < 0.5 && (r[1].h - r[2].h).abs() < 0.5,
-            "旋转态各列应等高（＝竖排路径统一的高亮宽度转过来）: {:?}",
-            r.iter().map(|x| x.h).collect::<Vec<_>>()
-        );
-        let (_, h_root) = build_o(false, false, &texts);
-        let h = hits_by_tag(&h_root);
-        assert!(
-            (h[0].w - h[2].w).abs() > 0.5,
-            "横排下长短候选宽度应不同，否则本用例的对照失效: {:?}",
-            h.iter().map(|x| x.w).collect::<Vec<_>>()
-        );
-    }
-}
-
-/// 竖排「主词条优先」宽度分配（论坛 t271）：注释过长时让步的是注释，不是候选文字。
+/// 竖排「主词条优先」宽度分配：注释过长时让步的是注释，不是候选文字。
 /// 分配规则见 `build_tree` 里竖排那一支的注释。mock 后端等宽（0.6em），只用几何断言。
 #[cfg(test)]
-mod vertical_comment_budget_tests {
-    use super::*;
-
-    fn cand(text: &str, comment: &str) -> CandidateItem {
-        CandidateItem {
-            text_styled: Default::default(),
-            text: text.to_string(),
-            code: String::new(),
-            label: String::new(),
-            tooltip: Default::default(),
-            comment: comment.into(),
-            comment_above: Default::default(),
-            no_index: false,
-        }
-    }
-
-    /// 竖排、scale=1、主题竖排最大宽度 `vmax_dp`（0=只受屏幕安全宽约束）。
-    fn build(vertical: bool, vmax_dp: i32, items: Vec<CandidateItem>) -> (CandidateWindow, View) {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.scale = 1.0;
-        w.set_orientation(vertical, false, false);
-        w.theme.behavior.vertical_max_width = vmax_dp;
-        w.update("", 0, "", items, 0, -1, 1, 1);
-        let mut root = w.scene.build_tree(&w.scene_input(false));
-        root.layout(0.0, 0.0, &w.text_renderer);
-        (w, root)
-    }
-
-    fn find_list(v: &View) -> Option<&View> {
-        if v.children.iter().any(|c| c.tag >= 0) {
-            return Some(v);
-        }
-        v.children.iter().find_map(find_list)
-    }
-
-    /// 候选 item 的 (文字, 注释) 文本（item = Row[序号, 文字, 注释?]）。
-    fn texts(root: &View) -> Vec<(String, Option<String>)> {
-        let list = find_list(root).expect("未找到候选列表容器");
-        let mut its: Vec<&View> = list.children.iter().filter(|c| c.tag >= 0).collect();
-        its.sort_by_key(|c| c.tag);
-        its.iter()
-            .map(|it| {
-                let t = it.children[1].text.clone().unwrap_or_default();
-                let c = it.children.get(2).and_then(|c| c.text.clone());
-                (t, c)
-            })
-            .collect()
-    }
-
-    /// ★ t271 主症状：注释极长时主词条完整显示，注释截断加 `…`，窗口不超上限。
-    #[test]
-    fn long_comment_yields_to_candidate_text() {
-        let long = "注".repeat(300);
-        for vmax in [0, 300] {
-            let (w, root) = build(true, vmax, vec![cand("你好", &long), cand("世界", "sj")]);
-            let t = texts(&root);
-            assert_eq!(t[0].0, "你好", "vmax={vmax}：主词条不得被注释挤截");
-            let c0 = t[0].1.as_deref().unwrap();
-            assert!(c0.ends_with('…'), "vmax={vmax}：超长注释应截断加省略号");
-            assert!(c0.chars().count() < long.chars().count());
-            assert_eq!(t[1], ("世界".into(), Some("sj".into())), "短注释不受影响");
-            let cap = if vmax > 0 {
-                vmax as f32
-            } else {
-                w.screen_safety_max_width_px() as f32
-            };
-            assert!(
-                root.measured_size().0 <= cap + 0.5,
-                "vmax={vmax}：窗口宽 {} 超出上限 {cap}",
-                root.measured_size().0
-            );
-        }
-    }
-
-    /// 放得下就一个字都不动（零回归）。
-    #[test]
-    fn fitting_text_and_comment_are_untouched() {
-        let (_, root) = build(true, 300, vec![cand("你好", "ni hao"), cand("世界", "")]);
-        let t = texts(&root);
-        assert_eq!(t[0], ("你好".into(), Some("ni hao".into())));
-        assert_eq!(t[1], ("世界".into(), None));
-    }
-
-    /// 主词条自身就超长：主词条截断，但仍给注释留出保底（看得见一截 + `…`），行宽不超上限。
-    #[test]
-    fn overlong_text_still_leaves_room_for_comment() {
-        let long_text = "长".repeat(100);
-        let (_, root) = build(true, 300, vec![cand(&long_text, "chang")]);
-        let t = texts(&root);
-        assert!(t[0].0.ends_with('…'), "主词条超出行宽时照常截断");
-        let c = t[0].1.as_deref().expect("注释节点仍在");
-        assert!(!c.is_empty());
-        assert!(
-            root.measured_size().0 <= 300.5,
-            "行宽 {}",
-            root.measured_size().0
-        );
-    }
-
-    /// 多行注释（竖排模板里写 `\n`）逐行截断：首行超长不会把后面几行整个吃掉。
-    #[test]
-    fn multiline_comment_truncates_per_line() {
-        let long = "注".repeat(300);
-        let comment = format!("{long}\nshort");
-        let (_, root) = build(true, 300, vec![cand("你好", &comment)]);
-        let t = texts(&root);
-        assert_eq!(t[0].0, "你好");
-        let c = t[0].1.as_deref().unwrap();
-        let lines: Vec<&str> = c.split('\n').collect();
-        assert_eq!(lines.len(), 2, "行数不变：{c:?}");
-        assert!(lines[0].ends_with('…'));
-        assert_eq!(lines[1], "short");
-    }
-}
+#[path = "candidate_window_vertical_comment_budget_tests.rs"]
+mod vertical_comment_budget_tests;
 
 /// 方案级候选字体（`[candidate] font_family`）的接线。
 ///
-/// ⚠️ **必须 gate 到 Windows**：断言的是「换了字族宽度就变」，而非 Windows 的 mock
-/// 后端明写「字重/字体族不影响等宽近似测量，只取字号」（`text/dwrite.rs` 的 mock `measure`）
-/// ⇒ Linux CI 上 `assert_ne!` 两边相等直接红，而本机 Windows 全绿看不见。
-/// 同组的 `assert_eq!` 那条在 Linux 上更糟——它**恒真**、是条假绿。
-/// 这正是本仓「test 跑 Linux、clippy 交叉编 Win」那条分工的典型踩法，
-/// 先例见 `text/dwrite.rs` 的 `font_plan_tests`。
+/// 必须 gate 到 Windows：断言的是「换了字族宽度就变」，而 mock 后端测量不看字族（`assert_ne!`
+/// 会红、`assert_eq!` 恒真）。先例见 `text/dwrite.rs` 的 `font_plan_tests`。
 ///
 /// 旋转那三条留在 `width_budget_tests` 里不动：它们只用几何、mock 下同样成立。
 #[cfg(all(test, windows))]
@@ -5597,7 +4301,7 @@ mod schema_font_tests {
         root.measured_size().0
     }
 
-    /// ★ 覆盖真的作用到排版上；空串 = 不覆盖。
+    /// 覆盖真的作用到排版上；空串 = 不覆盖。
     ///
     /// 反向对照不可少：只断言「变了」的话，一个「无条件套用覆盖」的实现在空串下也会改字体。
     #[test]
@@ -5608,7 +4312,7 @@ mod schema_font_tests {
         assert_ne!(base, overridden, "方案级字族没作用到排版上");
     }
 
-    /// ★★ 覆盖只作用于**候选文字**：编码栏由 preedit 决定，宽度不得受影响。
+    /// 覆盖只作用于候选文字：编码栏由 preedit 决定，宽度不得受影响。
     #[test]
     fn override_does_not_touch_the_preedit_bar() {
         // 长编码 + 短候选：窗口宽度由编码栏决定。
@@ -5673,10 +4377,9 @@ mod truncate_text_tests {
         );
     }
 
-    /// ★ 预算被行内其它成员吃光（≤0）时语义是**截到最短**，不是「不截断」。
+    /// 预算被行内其它成员吃光（≤0）时语义是截到最短，不是「不截断」。
     ///
-    /// 反向写法（早退返回原文）会让「预算耗尽」变成「完全放开」，把溢出放大而不是收敛——
-    /// 正是它此前被 `.max(20*s)` 地板掩盖着没暴露。
+    /// 反向写法（早退返回原文）会让「预算耗尽」变成「完全放开」，把溢出放大而不是收敛。
     #[test]
     fn non_positive_budget_truncates_to_minimum() {
         let w = win();
@@ -5731,7 +4434,7 @@ mod truncate_text_tests {
         );
     }
 
-    /// ★ 测量样式必须与渲染叶子同构：字重/字族归一化规则照抄 `View::font_weight`（>0 才生效）
+    /// 测量样式必须与渲染叶子同构：字重/字族归一化规则照抄 `View::font_weight`（>0 才生效）
     /// 与 `View::font_family`（非空才生效）。少一条就是两套样式，预算按一种字体算、排版按另一
     /// 种走，差值累积成窗口右侧留白或右缘溢出。
     #[test]
@@ -5758,369 +4461,22 @@ mod truncate_text_tests {
 
 /// 最大最小公平分配（water-filling）——纯算术，不依赖文本后端，故不 gate 平台。
 #[cfg(test)]
-mod water_fill_tests {
-    use super::CandidateScene;
-
-    /// 总额够用：人人原样满足，不做无谓截断。
-    #[test]
-    fn everyone_fits_when_total_is_enough() {
-        let got = CandidateScene::water_fill(&[100.0, 200.0, 50.0], 1000.0, 0.0);
-        assert_eq!(got, vec![100.0, 200.0, 50.0]);
-    }
-
-    /// ★ 核心性质：短需求原样保留，**把没用完的份额让给长需求**，而不是一刀切均分。
-    ///
-    /// 均分会给长的 600/3=200，water-filling 给到 400——这正是「1 条长整句 + 8 个短词」
-    /// 这个最常见场景里两者的观感差别。
-    #[test]
-    fn spare_share_flows_to_the_long_one() {
-        let got = CandidateScene::water_fill(&[100.0, 100.0, 1000.0], 600.0, 0.0);
-        assert_eq!(got, vec![100.0, 100.0, 400.0]);
-        assert_eq!(got.iter().sum::<f32>(), 600.0);
-    }
-
-    /// 顺序无关：同一组需求换个排列，各自拿到的份额不变（内部按需求升序处理，结果按原序返回）。
-    #[test]
-    fn allocation_is_order_independent() {
-        let a = CandidateScene::water_fill(&[1000.0, 100.0, 100.0], 600.0, 0.0);
-        assert_eq!(a, vec![400.0, 100.0, 100.0]);
-    }
-
-    /// ★ 不溢出保证：只要 total ≥ 0 且不触发 floor，`Σ result ≤ total` **与项数无关**。
-    /// 这正是贪心（先到先得 + 下限）给不了的性质——那种做法下第一项吃光预算，
-    /// 后面每项仍各自加上「固定开销 + 文字下限」，累加必然突破上限。
-    #[test]
-    fn sum_never_exceeds_total_regardless_of_count() {
-        for n in 1..=20usize {
-            let demands: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 500.0).collect();
-            let total = 1000.0;
-            let got = CandidateScene::water_fill(&demands, total, 0.0);
-            let sum: f32 = got.iter().sum();
-            assert!(sum <= total + 0.01, "n={n} 时 Σ={sum} 超出 total={total}");
-        }
-    }
-
-    /// 全员都超份额：平分总额。
-    #[test]
-    fn all_oversized_split_evenly() {
-        let got = CandidateScene::water_fill(&[900.0, 900.0, 900.0], 300.0, 0.0);
-        assert_eq!(got, vec![100.0, 100.0, 100.0]);
-    }
-
-    /// floor 是「无解时的保底」：固定开销已超预算（total ≤ 0）时每项仍拿到 floor，
-    /// 总和因此可能超出 total——这是刻意取舍，宁可溢出被裁，也不少显示候选
-    /// （选中键位与候选列表绑定，少一个会让用户按 8 选到错的词）。
-    #[test]
-    fn floor_guarantees_minimum_even_when_insolvent() {
-        let got = CandidateScene::water_fill(&[900.0, 900.0], 0.0, 20.0);
-        assert_eq!(got, vec![20.0, 20.0]);
-        let got = CandidateScene::water_fill(&[900.0, 900.0], -500.0, 20.0);
-        assert_eq!(got, vec![20.0, 20.0]);
-    }
-
-    /// 空输入不 panic（无候选时的退化情形）。
-    #[test]
-    fn empty_demands_yield_empty_result() {
-        assert!(CandidateScene::water_fill(&[], 100.0, 0.0).is_empty());
-    }
-}
+#[path = "candidate_window_water_fill_tests.rs"]
+mod water_fill_tests;
 
 /// `[ui.font]` → [`FontPlan`] 的折叠规则。平台无关（不碰窗口/COM），故随 Linux CI 跑。
 #[cfg(test)]
-mod font_plan_build_tests {
-    // DEFAULT_EMOJI_FAMILY 只被下面 `#[cfg(windows)]` 的出厂指派用例引用，
-    // 导入不带 cfg 的话 macOS/Linux 上就是 unused_imports（CI 的 -D warnings 会红）。
-    #[cfg(windows)]
-    use super::DEFAULT_EMOJI_FAMILY;
-    use super::{DEFAULT_FONT_FAMILY, build_font_plan};
-    use crate::text::script::ScriptClass;
-
-    fn v(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// ★ 空字族的链首必须是内置默认，不能是空串。
-    ///
-    /// 空串链首的表现最阴：`AddMapping` 的 `baseFamilyName` 是空串就永远匹配不上任何段
-    /// ⇒「用户没显式写 family 时，配了 fallback 也不生效」，而配置、日志、界面全都正常。
-    #[test]
-    fn empty_family_becomes_the_builtin_default_at_the_chain_head() {
-        let p = build_font_plan("", &v(&["Noto Sans Mongolian"]), &[]);
-        assert_eq!(p.base_family(), Some(DEFAULT_FONT_FAMILY));
-        assert_eq!(
-            p.chain_for(None),
-            [DEFAULT_FONT_FAMILY, "Noto Sans Mongolian"]
-        );
-        // 只有空白也算空。
-        assert_eq!(
-            build_font_plan("   ", &[], &[]).base_family(),
-            Some(DEFAULT_FONT_FAMILY)
-        );
-    }
-
-    /// 默认链 = `[family] + fallback`，顺序不能颠倒（颠倒后主字体成了回退项）。
-    #[test]
-    fn default_chain_is_family_then_fallback() {
-        let p = build_font_plan(
-            "Mongolian Baiti",
-            &v(&["Noto Sans Mongolian", "Segoe UI"]),
-            &[],
-        );
-        assert_eq!(
-            p.chain_for(None),
-            ["Mongolian Baiti", "Noto Sans Mongolian", "Segoe UI"]
-        );
-    }
-
-    /// 已知脚本类名进方案，未知的**只忽略这一条**——不得连累同一份配置里其余的类。
-    /// 用户拼错一个键就让整份字体配置失效是不能接受的。
-    #[test]
-    fn unknown_script_key_is_dropped_without_affecting_the_others() {
-        let p = build_font_plan(
-            "Mongolian Baiti",
-            &[],
-            &[
-                ("latin".to_string(), v(&["Segoe UI"])),
-                ("mongolian".to_string(), v(&["Whatever"])), // 未知：不是具名类
-                ("CJK".to_string(), v(&["宋体"])),           // 大小写不敏感
-            ],
-        );
-        // 顺序是 `ScriptClass` 的**声明序**（`FontPlan::new` 按 `Ord` 排），不是字母序。
-        // Windows 上出厂会再注入 emoji 一项，这里只看用户声明的那两条。
-        let user_declared: Vec<ScriptClass> = p
-            .declared()
-            .iter()
-            .copied()
-            .filter(|c| *c != ScriptClass::Emoji)
-            .collect();
-        assert_eq!(user_declared, [ScriptClass::Latin, ScriptClass::Cjk]);
-        assert_eq!(p.chain_for(Some(ScriptClass::Latin)), ["Segoe UI"]);
-        assert_eq!(p.chain_for(Some(ScriptClass::Cjk)), ["宋体"]);
-    }
-
-    /// 零配置（出厂）必须折成平凡方案——调用方据此完全走旧路径，一次 COM 调用都不多做。
-    ///
-    /// Windows 除外：出厂会注入 emoji 类的指派（见 `build_font_plan`），零配置不再平凡，
-    /// 由 `factory_config_assigns_emoji_on_windows` 守。
-    #[cfg(not(windows))]
-    #[test]
-    fn factory_config_folds_to_a_trivial_plan() {
-        assert!(build_font_plan("", &[], &[]).is_trivial());
-        assert!(build_font_plan("宋体", &[], &[]).is_trivial());
-    }
-
-    /// 反向对照（各平台）：只要有一项非零配置就不再平凡（否则「平凡」判据形同虚设）。
-    #[test]
-    fn any_non_factory_item_makes_the_plan_non_trivial() {
-        assert!(!build_font_plan("宋体", &v(&["Arial"]), &[]).is_trivial());
-        assert!(
-            !build_font_plan("宋体", &[], &[("latin".to_string(), v(&["Arial"]))]).is_trivial()
-        );
-    }
-
-    /// ★ Windows 出厂：emoji 类恒有指派（Segoe UI Emoji），否则 1️⃣ 与 Emoji 16.0 的新码位
-    /// 渲染不出来；用户显式声明 emoji（含空表）时按用户的来，空表即关掉这条指派。
-    #[cfg(windows)]
-    #[test]
-    fn factory_config_assigns_emoji_on_windows() {
-        let p = build_font_plan("", &[], &[]);
-        assert_eq!(p.declared(), &[ScriptClass::Emoji]);
-        assert_eq!(
-            p.chain_for(Some(ScriptClass::Emoji)),
-            [DEFAULT_EMOJI_FAMILY]
-        );
-        // 其余零配置语义不变：默认链仍只有一项。
-        assert_eq!(p.chain_for(None), [DEFAULT_FONT_FAMILY]);
-
-        // 用户自己指派 emoji：不覆盖。
-        let p = build_font_plan("", &[], &[("emoji".to_string(), v(&["Twemoji"]))]);
-        assert_eq!(p.chain_for(Some(ScriptClass::Emoji)), ["Twemoji"]);
-
-        // 逃生口：`emoji = []` 关掉出厂指派，回到纯系统回退。
-        let p = build_font_plan("", &[], &[("emoji".to_string(), vec![])]);
-        assert!(
-            p.is_trivial(),
-            "emoji = [] 应关掉出厂指派：{:?}",
-            p.declared()
-        );
-    }
-}
+#[path = "candidate_window_font_plan_build_tests.rs"]
+mod font_plan_build_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::{CandidateScene, CandidateWindow, plan_present};
-
-    #[test]
-    fn present_full_when_not_on_screen() {
-        assert_eq!(plan_present(None, (10, 20, 300, 100), true), (true, true));
-    }
-
-    #[test]
-    fn present_skips_identical_frame() {
-        let g = (10, 20, 300, 100);
-        assert_eq!(plan_present(Some(g), g, true), (false, false));
-    }
-
-    #[test]
-    fn present_moves_without_repaint_when_only_position_changed() {
-        assert_eq!(
-            plan_present(Some((10, 20, 300, 100)), (40, 20, 300, 100), true),
-            (false, true)
-        );
-    }
-
-    #[test]
-    fn present_repaints_in_place_when_pixels_changed() {
-        let g = (10, 20, 300, 100);
-        assert_eq!(plan_present(Some(g), g, false), (true, false));
-    }
-
-    /// 像素字节数相同但宽高互换（缓冲长度一样）也必须重推。
-    #[test]
-    fn present_repaints_when_size_changed_with_same_byte_count() {
-        assert_eq!(
-            plan_present(Some((10, 20, 300, 100)), (10, 20, 100, 300), true),
-            (true, true)
-        );
-    }
-
-    /// 主题位置偏移的方向语义：正值恒为「远离光标」——下方向下、上方向上。
-    ///
-    /// 上方若照抄下方的加号，上翻时偏移会把窗口**压向**光标，与配置意图相反。
-    /// 这类符号错误从现象很难反推（只有触发上翻的场景才露馅），故直接锁死。
-    #[test]
-    fn position_offset_always_pushes_away_from_caret() {
-        // 下方：正值下移
-        assert_eq!(CandidateWindow::apply_offset_y(300, false, 12), 312);
-        // 上方：正值上移（同样是远离，不是压向光标）
-        assert_eq!(CandidateWindow::apply_offset_y(300, true, 12), 288);
-        // 零偏移两侧都是恒等
-        assert_eq!(CandidateWindow::apply_offset_y(300, false, 0), 300);
-        assert_eq!(CandidateWindow::apply_offset_y(300, true, 0), 300);
-        // 负偏移语义对称（把窗口拉近光标）
-        assert_eq!(CandidateWindow::apply_offset_y(300, false, -6), 294);
-        assert_eq!(CandidateWindow::apply_offset_y(300, true, -6), 306);
-    }
-
-    /// **净锚点不含 Y 偏移**——这是「偏移不左右上下翻转决策」的地基。
-    ///
-    /// `below_ok`/`above_ok` 拿锚点跟工作区边界比：锚点一旦含偏移，off_y 越大两个条件
-    /// 越难成立，本该上翻的场景会被判成「上方也放不下」，落回下方再被钳到屏幕底、
-    /// 压住光标——表现就是「下方正常、上方遮盖」。故锁死锚点与 off_y 无关。
-    #[test]
-    fn caret_anchors_are_independent_of_y_offset() {
-        let (caret_x, caret_y, caret_h, win_h) = (100, 200, 20, 80);
-        let a = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 0);
-        // 净锚点即旧行为：下方=光标底端+gap，上方=底边贴光标顶端
-        assert_eq!(a.1, caret_y + 2, "下方 = 光标底端 + gap");
-        assert_eq!(a.2, caret_y - caret_h - win_h - 2, "上方 = 底边贴光标顶端");
-        // x 偏移仍在锚点里（水平方向没有翻转决策，不受影响）
-        let b = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 5);
-        assert_eq!(b.0 - a.0, 5, "x 偏移右移");
-        assert_eq!((b.1, b.2), (a.1, a.2), "x 偏移不该动垂直锚点");
-    }
-
-    /// 「上方反转候选」只对竖排成立，横排必须原样保持 1..n。
-    ///
-    /// 横排候选是左右并列，"反转"跟窗口在光标上方还是下方没有任何关系，只会把读序
-    /// 倒过来（1 跑到最右）。两个开关正交，故一并锁死 swap 不受排列方向影响。
-    #[test]
-    fn flip_when_above_applies_to_vertical_only() {
-        // (above, vertical, flip, swap) -> (flip_cands, swap_bands)
-        let f = CandidateScene::above_layout;
-        assert_eq!(
-            f(true, true, true, false),
-            (true, false),
-            "竖排上方：反转生效"
-        );
-        assert_eq!(
-            f(true, false, true, false),
-            (false, false),
-            "横排上方：反转不得生效"
-        );
-        assert_eq!(
-            f(false, true, true, false),
-            (false, false),
-            "下方：一律不生效"
-        );
-        // swap 交换的是上下两条带，横竖排都成立
-        assert_eq!(
-            f(true, false, false, true),
-            (false, true),
-            "横排上方：交换仍生效"
-        );
-        assert_eq!(f(true, true, false, true), (false, true));
-        // 叠加：竖排两个都开 → 两个都生效；横排只剩 swap
-        assert_eq!(f(true, true, true, true), (true, true));
-        assert_eq!(f(true, false, true, true), (false, true));
-    }
-
-    /// 插入符位置一律夹到合法字符边界——`split_at` 落在字符中间会 panic 掉 UI 线程。
-    #[test]
-    fn clamp_caret_never_splits_a_char() {
-        assert_eq!(CandidateWindow::clamp_caret("nihao", 3), 3);
-        assert_eq!(CandidateWindow::clamp_caret("nihao", 5), 5, "末尾合法");
-        assert_eq!(CandidateWindow::clamp_caret("nihao", 99), 5, "越界截到末尾");
-        assert_eq!(CandidateWindow::clamp_caret("", 4), 0, "空串恒 0");
-        // 「你」占 3 字节：落在 1/2 时退回 0，落在 3 是边界
-        assert_eq!(CandidateWindow::clamp_caret("你hao", 1), 0);
-        assert_eq!(CandidateWindow::clamp_caret("你hao", 2), 0);
-        assert_eq!(CandidateWindow::clamp_caret("你hao", 3), 3);
-        assert_eq!(CandidateWindow::clamp_caret("你hao", 4), 4);
-    }
-
-    /// clamp 后切分恒安全（本测试的意义在于：若 clamp 失效，split_at 会 panic）。
-    #[test]
-    fn clamped_caret_is_safe_to_split() {
-        for text in ["", "nihao", "你好hao", "·ni'hao"] {
-            for caret in 0..=text.len() + 2 {
-                let c = CandidateWindow::clamp_caret(text, caret);
-                let (head, tail) = text.split_at(c);
-                assert_eq!(format!("{head}{tail}"), text);
-            }
-        }
-    }
-
-    /// 固定位置的两个坐标系必须严格互逆。
-    ///
-    /// 落盘的 custom_x/y 是**内容**左上，Win32 定位用的是**窗口**左上（含软阴影扩边）：
-    /// 固定定位走 content→window，拖动落定上报走 window→content。若两者不互逆，
-    /// 每轮「拖动 → 落盘 → 重新显示」都会多减一次阴影，候选窗每次重显都往左上爬一点——
-    /// 这种漂移从现象极难反推，故在此直接锁死。
-    #[cfg(windows)]
-    #[test]
-    fn content_window_coord_roundtrip_is_lossless() {
-        // 覆盖有/无阴影、负坐标（副屏在主屏左侧时屏幕坐标为负）
-        for (content, ml, mt) in [
-            ((100, 200), 12u32, 10u32),
-            ((0, 0), 0, 0),
-            ((-1920, 40), 8, 8),
-            ((3, 7), 1, 0),
-        ] {
-            let w = CandidateWindow::content_to_window(content, ml, mt);
-            let back = CandidateWindow::window_to_content(w, ml as i32, mt as i32);
-            assert_eq!(back, content, "content={content:?} margin=({ml},{mt})");
-        }
-    }
-
-    /// 阴影扩边确实被减掉了——若 content_to_window 退化成恒等函数，
-    /// 上面的 round-trip 仍会通过，但固定位置会整体偏移一个阴影的量。
-    #[cfg(windows)]
-    #[test]
-    fn content_to_window_subtracts_the_shadow_margin() {
-        assert_eq!(
-            CandidateWindow::content_to_window((100, 200), 12, 10),
-            (88, 190)
-        );
-    }
-}
+#[path = "candidate_window_tests.rs"]
+mod tests;
 
 /// 主题节点字族的存在性检查接线。
 ///
-/// ⚠️ **只在 mock 后端下编译**：`family_exists` 在 Windows 上要问系统字体集、在 CoreText 上
-/// 尚未实现，两边都没有 `asked_families()` 这个读回口。而「有没有真的去问」正是这条链唯一
-/// 钉得住的一半——它此前整个不存在，主题里把字族名写错只表现为「字体不对」，日志里一个字
-/// 都没有。
+/// 只在 mock 后端下编译：只有 mock 有 `asked_families()` 读回口，而「有没有真的去问」正是这条
+/// 链钉得住的一半。
 #[cfg(all(test, mock_text))]
 mod theme_font_check_tests {
     use super::*;
@@ -6169,7 +4525,7 @@ mod theme_font_check_tests {
     }
 }
 
-/// 字体名解析的接线（看板 A2-1）：旧 GDI face name 在**每个**字体入口都换成 family + 字重。
+/// 字体名解析的接线：旧 GDI face name 在每个字体入口都换成 family + 字重。
 ///
 /// 只在 mock 后端下编译，理由同上：它靠 `set_mock_families` 注入「系统字体集」。
 #[cfg(all(test, mock_text))]
@@ -6251,9 +4607,8 @@ mod font_name_resolve_tests {
         assert_eq!(v.text.font_weight, 600);
     }
 
-    /// 靶机复现（维护者实测「字重无效」）：主题「Switch风格」给 `[text]` 写了 500、
-    /// `[text.selected]` 写了 700，用户 `ui.font.weight = 900` 对候选文字一个字都不生效。
-    /// 用户字重直接覆盖主题里所有节点（含选中等状态）写了的字重。
+    /// 用户字重直接覆盖主题里所有节点（含选中等状态）写了的字重：主题给 `[text]` 写 500、
+    /// `[text.selected]` 写 700 时，用户 `ui.font.weight = 900` 也必须生效。
     #[test]
     fn user_weight_overrides_every_theme_weight() {
         let mut w = win();
@@ -6411,7 +4766,7 @@ mod font_precedence_tests {
         );
     }
 
-    /// ★ 用户字体非空：全部节点（不只候选文字）的主题字族都让位，叶子回落全局字族（=用户字体）。
+    /// 用户字体非空：全部节点（不只候选文字）的主题字族都让位，叶子回落全局字族（=用户字体）。
     #[test]
     fn user_tier_beats_theme_on_every_node() {
         let mut w = win(themed());
@@ -6506,1445 +4861,26 @@ mod font_precedence_tests {
 /// `last_cursor` 拨开来模拟「鼠标真动了」。时间一律显式传入 `flush`，不依赖真实流逝；
 /// 「菜单是否可见」是线程局部，测试线程各自一份。
 #[cfg(test)]
-mod tip_hold_tests {
-    use super::*;
-    use crate::popup_menu::set_menu_visible;
-    use std::sync::mpsc::{Receiver, channel};
-
-    const DELAY: u64 = 60;
-
-    fn mouse(delay_ms: u64) -> (CandidateMouse, Receiver<UiEvent>) {
-        set_menu_visible(false);
-        let (tx, rx) = channel();
-        let r = |x| Rect {
-            x,
-            y: 0.0,
-            w: 10.0,
-            h: 10.0,
-        };
-        let m = CandidateMouse {
-            hit_rects: vec![(0, r(0.0)), (1, r(20.0))],
-            skin_frame: None,
-            skin_decor: Vec::new(),
-            skin_click_rects: Vec::new(),
-            decor_press: None,
-            skin_click: None,
-            pass_hwnd: None,
-            events: tx,
-            last_hover: -1,
-            last_cursor: (i32::MIN, i32::MIN),
-            engaged: false,
-            engage_at: None,
-            pending_raw: -1,
-            engage_delay_ms: delay_ms,
-            hwnd: HWND::default(),
-            dragging: false,
-            pressed: None,
-            drag_anchor: (0, 0),
-            drag_origin: (0, 0),
-            drag_pin: None,
-            drag_pin_margin: (0, 0),
-            margin: (0, 0, 0, 0),
-            double_click: crate::double_click::DoubleClick::new(),
-            tip_hold: TipHold::Off,
-            tip_released: false,
-            tip_for: Rc::new(Cell::new(-1)),
-            deferred: None,
-            tip_rect: None,
-            tip_visible: None,
-            tip_best: None,
-            last_pos: None,
-        };
-        (m, rx)
-    }
-
-    fn lp(x: i32, y: i32) -> LPARAM {
-        LPARAM(((y << 16) | x) as isize)
-    }
-
-    fn real_move(m: &mut CandidateMouse, x: i32) {
-        m.last_cursor = (i32::MIN, i32::MIN);
-        m.on_message(HWND::default(), WM_MOUSEMOVE, WPARAM(0), lp(x, 5));
-    }
-
-    fn right_click(m: &mut CandidateMouse, x: i32) {
-        m.on_message(HWND::default(), WM_RBUTTONDOWN, WPARAM(0), lp(x, 5));
-    }
-
-    /// 远在任何延迟之后（但早于「等菜单」的兜底超时）。
-    fn later() -> Instant {
-        Instant::now() + Duration::from_millis(1000)
-    }
-
-    fn hovers(rx: &Receiver<UiEvent>) -> Vec<i32> {
-        rx.try_iter()
-            .filter_map(|e| match e {
-                UiEvent::Hover(i) => Some(i),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn menu_requests(rx: &Receiver<UiEvent>) -> usize {
-        rx.try_iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    UiEvent::RequestCandidateMenu { .. } | UiEvent::RequestMainMenu(_)
-                )
-            })
-            .count()
-    }
-
-    fn selects(rx: &Receiver<UiEvent>) -> Vec<usize> {
-        rx.try_iter()
-            .filter_map(|e| match e {
-                UiEvent::CandidateSelect(i) => Some(i),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// 点选在松开时生效（同 macOS / Linux）：按下不选，松开仍在同一项才选，且只选一次。
-    #[test]
-    fn candidate_select_fires_on_release_over_same_item() {
-        let (mut m, rx) = mouse(DELAY);
-        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
-        assert!(selects(&rx).is_empty(), "按下就选了");
-        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(6, 5));
-        assert_eq!(selects(&rx), vec![0]);
-        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(6, 5));
-        assert!(selects(&rx).is_empty(), "一次按下只选一次");
-    }
-
-    /// 按下后移到别的候选 / 空白处松开 = 放弃。
-    #[test]
-    fn candidate_select_abandoned_when_released_elsewhere() {
-        let (mut m, rx) = mouse(DELAY);
-        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
-        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(25, 5));
-        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
-        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(500, 5));
-        assert!(selects(&rx).is_empty());
-        assert!(!m.dragging, "按在候选上不起拖");
-    }
-
-    /// 按住期间候选窗收起（上屏 / Esc / 失焦）：之后的松开不选。
-    #[test]
-    fn candidate_select_dropped_when_hidden_while_pressed() {
-        let (mut m, rx) = mouse(DELAY);
-        m.on_message(HWND::default(), WM_LBUTTONDOWN, WPARAM(0), lp(5, 5));
-        m.reset_drag();
-        m.on_message(HWND::default(), WM_LBUTTONUP, WPARAM(0), lp(5, 5));
-        assert!(selects(&rx).is_empty());
-    }
-
-    /// 已激活、悬停在候选 0 上（UI 画着的悬停也是 0）。
-    fn engaged_on_first(delay_ms: u64) -> (CandidateMouse, Receiver<UiEvent>) {
-        let (mut m, rx) = mouse(delay_ms);
-        real_move(&mut m, 5);
-        m.flush(later(), -1);
-        assert_eq!(hovers(&rx), vec![0]);
-        (m, rx)
-    }
-
-    /// 右键时激活延迟还没到期：到期后不能再发 Hover——那正是「气泡在菜单弹出后冒出来、
-    /// 叠在菜单上」的来路。
-    #[test]
-    fn right_click_cancels_pending_engage() {
-        let (mut m, rx) = mouse(DELAY);
-        real_move(&mut m, 5);
-        assert!(m.engage_at.is_some(), "首次真实移动武装闸门");
-        right_click(&mut m, 5);
-        m.flush(later(), -1);
-        assert!(m.tip_hold.active());
-        assert!(m.engage_at.is_none());
-        assert!(hovers(&rx).is_empty(), "闸门已撤，不应再发悬停");
-    }
-
-    /// 审查探针（H1）：右键 → 菜单可见之前鼠标动了 → 菜单可见 → 到期。整段都不得发 Hover。
-    /// 右键到菜单可见之间「菜单开着」还是 false，只靠它挡闸门时这里会漏。
-    fn probe_right_move_menu_flush(delay_ms: u64) {
-        let (mut m, rx) = engaged_on_first(delay_ms);
-        right_click(&mut m, 5);
-        real_move(&mut m, 25);
-        m.flush(later(), 0);
-        assert!(hovers(&rx).is_empty(), "等菜单阶段不得发悬停");
-        set_menu_visible(true);
-        m.flush(later(), 0);
-        real_move(&mut m, 6);
-        m.flush(later(), 0);
-        assert_eq!(m.tip_hold, TipHold::InMenu);
-        assert!(m.engage_at.is_none(), "菜单中不武装");
-        assert!(hovers(&rx).is_empty(), "菜单中不得发悬停");
-    }
-
-    #[test]
-    fn move_before_menu_shows_does_not_rearm() {
-        probe_right_move_menu_flush(DELAY);
-    }
-
-    /// `ui.tooltip.delay=0`：闸门一武装就到期，没有「等菜单」阶段时气泡会抢在菜单之前出来。
-    #[test]
-    fn move_before_menu_shows_does_not_rearm_with_zero_delay() {
-        probe_right_move_menu_flush(0);
-    }
-
-    /// 菜单关闭后要重新移动、再走一次延迟才解除；UI 画着的悬停就是光标下的目标时由窗口
-    /// 本地补显示（不发 Hover，协调器不会因同值重绘）。
-    #[test]
-    fn release_after_fresh_engage_same_target() {
-        let (mut m, rx) = engaged_on_first(DELAY);
-        right_click(&mut m, 5);
-        set_menu_visible(true);
-        m.flush(Instant::now(), 0);
-        set_menu_visible(false);
-        m.flush(later(), 0);
-        assert_eq!(m.tip_hold, TipHold::AwaitMove, "菜单一关、鼠标没动：仍压着");
-        real_move(&mut m, 6);
-        let armed = m.engage_at.expect("真实移动武装闸门");
-        m.flush(armed - Duration::from_millis(1), 0);
-        assert!(m.tip_hold.active(), "延迟没走完不解除");
-        m.flush(armed, 0);
-        assert_eq!(m.tip_hold, TipHold::Off);
-        assert!(m.tip_released, "UI 画着的就是它，须本地补显示");
-        assert!(hovers(&rx).is_empty());
-    }
-
-    /// 解除时目标变了：发 Hover，由协调器重绘带出气泡。
-    #[test]
-    fn release_after_fresh_engage_new_target() {
-        let (mut m, rx) = engaged_on_first(DELAY);
-        right_click(&mut m, 5);
-        m.flush(later(), 0);
-        real_move(&mut m, 25);
-        // 没有菜单出现：等兜底超时后才算关闭。
-        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, 0);
-        real_move(&mut m, 26);
-        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 3, 0);
-        assert_eq!(m.tip_hold, TipHold::Off);
-        assert!(!m.tip_released);
-        assert_eq!(hovers(&rx), vec![1]);
-    }
-
-    /// M1：压制期间候选重绘过、协调器把悬停清成 -1（UI 画的是 -1），而 `last_hover` 还是 0。
-    /// 解除时回到同一候选，必须发 Hover(0)——按 `last_hover` 判会以为「没变」，气泡不再回来。
-    #[test]
-    fn release_after_repaint_resends_hover() {
-        let (mut m, rx) = engaged_on_first(DELAY);
-        right_click(&mut m, 5);
-        set_menu_visible(true);
-        m.flush(Instant::now(), 0);
-        set_menu_visible(false);
-        real_move(&mut m, 6);
-        m.flush(later(), -1);
-        assert_eq!(m.tip_hold, TipHold::Off);
-        assert!(!m.tip_released);
-        assert_eq!(hovers(&rx), vec![0]);
-    }
-
-    /// 兜底超时：请求被丢、菜单始终没出现，压制不能永久持续。
-    #[test]
-    fn await_menu_times_out_to_await_move() {
-        let (mut m, _rx) = mouse(DELAY);
-        right_click(&mut m, 5);
-        let TipHold::AwaitMenu { until } = m.tip_hold else {
-            panic!("右键后应在等菜单：{:?}", m.tip_hold);
-        };
-        m.flush(until - Duration::from_millis(1), -1);
-        assert!(m.tip_hold.blocks_gate());
-        m.flush(until, -1);
-        assert_eq!(m.tip_hold, TipHold::AwaitMove);
-    }
-
-    /// 迟到的菜单（超时之后才出现）照样压住，已武装的闸门作废。
-    #[test]
-    fn late_menu_reenters_in_menu() {
-        let (mut m, rx) = mouse(DELAY);
-        right_click(&mut m, 5);
-        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, -1);
-        real_move(&mut m, 6);
-        assert!(m.engage_at.is_some());
-        set_menu_visible(true);
-        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 3, -1);
-        assert_eq!(m.tip_hold, TipHold::InMenu);
-        assert!(m.engage_at.is_none());
-        assert!(hovers(&rx).is_empty());
-    }
-
-    /// 菜单开着时候选窗自己收到的右键不理：这次按下由菜单轮询合成，两路都认会请求两遍。
-    #[test]
-    fn own_right_click_ignored_while_menu_visible() {
-        let (mut m, rx) = mouse(DELAY);
-        set_menu_visible(true);
-        right_click(&mut m, 5);
-        assert_eq!(menu_requests(&rx), 0);
-        assert!(!m.tip_hold.active());
-    }
-
-    /// 「等菜单」阶段自己的右键不理：合成那一路已发出请求、菜单还没出现（轮询已把旧菜单
-    /// 收起，看不出「开着」），同一次右键的真实消息随后才到——不挡就请求两遍、菜单重弹。
-    /// 超时转入「等重新移动」后恢复。
-    #[test]
-    fn own_right_click_ignored_while_awaiting_menu() {
-        let (mut m, rx) = mouse(DELAY);
-        m.right_click(5.0, 5.0, (5, 5));
-        assert_eq!(menu_requests(&rx), 1);
-        right_click(&mut m, 5);
-        assert_eq!(menu_requests(&rx), 0, "请求在途不得重发");
-        m.flush(Instant::now() + HOLD_MENU_TIMEOUT * 2, -1);
-        right_click(&mut m, 5);
-        assert_eq!(menu_requests(&rx), 1, "超时后恢复");
-    }
-
-    /// 组合结束 / 窗口重新出现：压制随悬停状态一并清掉，不带进下一轮。
-    #[test]
-    fn reset_hover_clears_hold() {
-        let (mut m, _rx) = mouse(DELAY);
-        right_click(&mut m, 5);
-        m.reset_hover();
-        assert_eq!(m.tip_hold, TipHold::Off);
-        assert!(!m.tip_released);
-    }
-
-    // ---- 窗口层：气泡真的被收起 / 补回（M2），菜单外右键合成（L1） ----
-
-    fn doc() -> wind_ui_types::TooltipDoc {
-        wind_ui_types::TooltipDoc {
-            sections: vec![wind_ui_types::TooltipSection {
-                title: None,
-                inline: false,
-                lines: vec![wind_ui_types::TooltipLine {
-                    text: "nǐ".into(),
-                    raw: 0,
-                }],
-            }],
-        }
-    }
-
-    /// 候选窗（mock）：两个带气泡的候选，UI 悬停在候选 0 上，气泡已显示。
-    fn window() -> (CandidateWindow, Receiver<UiEvent>) {
-        set_menu_visible(false);
-        let (tx, rx) = channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        let item = |t: &str| CandidateItem {
-            text_styled: Default::default(),
-            text: t.into(),
-            code: String::new(),
-            label: String::new(),
-            tooltip: std::sync::Arc::new(doc()),
-            comment: Default::default(),
-            comment_above: Default::default(),
-            no_index: false,
-        };
-        w.candidates = vec![item("你"), item("拟")];
-        let r = |x| Rect {
-            x,
-            y: 0.0,
-            w: 10.0,
-            h: 10.0,
-        };
-        w.hit_rects = vec![(0, r(0.0)), (1, r(20.0))];
-        w.mouse.borrow_mut().hit_rects = w.hit_rects.clone();
-        w.hover = 0;
-        w.visible = true;
-        w.update_tooltip(0, 0);
-        assert!(tip_shown(&w), "前提：气泡已显示");
-        (w, rx)
-    }
-
-    fn tip_shown(w: &CandidateWindow) -> bool {
-        w.tooltip.as_ref().is_some_and(|t| t.shown())
-    }
-
-    /// 右键当轮 tick 就收起已显示的气泡；压制期间重绘不再弹出；解除后补回。
-    #[test]
-    fn hold_hides_tip_and_repaint_keeps_it_hidden() {
-        let (mut w, _rx) = window();
-        w.mouse.borrow_mut().right_click(5.0, 5.0, (5, 5));
-        w.tick();
-        assert!(!tip_shown(&w), "右键后气泡须收起");
-        w.update_tooltip(0, 0);
-        assert!(!tip_shown(&w), "压制期间重绘不得弹出气泡");
-        // 菜单出现又关闭，随后重新移动、走完延迟。
-        set_menu_visible(true);
-        w.tick();
-        set_menu_visible(false);
-        w.tick();
-        {
-            let mut m = w.mouse.borrow_mut();
-            m.engage_delay_ms = 0;
-            real_move(&mut m, 6);
-        }
-        w.tick();
-        assert!(tip_shown(&w), "解除后同一候选的气泡须补回");
-    }
-
-    /// L1：菜单开着时在候选窗上右键（候选窗收不到，由菜单轮询转来）→ 关旧开新。
-    #[test]
-    fn outside_right_press_on_candidate_window_reopens_menu() {
-        let (mut w, rx) = window();
-        w.window_at = |_, _, _| true;
-        w.menu_outside_press(25, 5, true);
-        let evs: Vec<UiEvent> = rx.try_iter().collect();
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, UiEvent::RequestCandidateMenu { page_local: 1, .. })),
-            "命中候选 1 应请求其词条菜单：{evs:?}"
-        );
-        assert!(w.mouse.borrow().tip_hold.active(), "合成右键同样压住气泡");
-        // 左键：只关菜单。
-        w.menu_outside_press(25, 5, false);
-        assert_eq!(menu_requests(&rx), 0);
-    }
-
-    /// 右键落在候选窗外（且不在气泡上）：不合成。
-    #[test]
-    fn outside_right_press_elsewhere_is_ignored() {
-        let (mut w, rx) = window();
-        w.window_at = |_, _, _| false;
-        w.menu_outside_press(25, 5, true);
-        assert_eq!(menu_requests(&rx), 0);
-    }
-
-    // ---- 悬停宽限与强制隐藏（设计 §7.6 C）----
-
-    #[test]
-    fn hover_move_table() {
-        use HoverMove::*;
-        // 气泡跟着候选 0：去往「无」宽限，去往候选 1 切换延迟。
-        assert_eq!(hover_move(0, -1, 0), Defer(TIP_GRACE));
-        assert_eq!(
-            hover_move(0, TAG_PAGE_PREV, 0),
-            Defer(TIP_GRACE),
-            "翻页器按「无」"
-        );
-        assert_eq!(hover_move(0, 1, 0), Defer(TIP_SWITCH));
-        // 气泡不跟着移开的那个候选（没显示 / 跟着别的）：即时。
-        assert_eq!(hover_move(0, -1, -1), Now);
-        assert_eq!(hover_move(0, 1, 1), Now);
-        assert_eq!(hover_move(-1, 0, -1), Now);
-        assert_eq!(
-            hover_move(TAG_PAGE_PREV, 0, TAG_PAGE_PREV),
-            Now,
-            "翻页器没有气泡"
-        );
-        assert!(TIP_SWITCH < TIP_GRACE);
-    }
-
-    #[test]
-    fn resolve_deferred_table() {
-        let t0 = Instant::now();
-        let until = t0 + TIP_GRACE;
-        assert_eq!(resolve_deferred(t0, until, false), Deferred::Wait);
-        assert_eq!(resolve_deferred(until, until, false), Deferred::Fire);
-        assert_eq!(
-            resolve_deferred(t0, until, true),
-            Deferred::Cancel,
-            "进了气泡就撤"
-        );
-        assert_eq!(resolve_deferred(until, until, true), Deferred::Cancel);
-    }
-
-    /// 已激活、悬停在候选 0 上且气泡跟着它。
-    fn engaged_on_0() -> (CandidateMouse, Receiver<UiEvent>) {
-        let (mut m, rx) = mouse(0);
-        m.engaged = true;
-        m.last_hover = 0;
-        m.tip_for.set(0);
-        (m, rx)
-    }
-
-    /// 候选 → 空隙 → 气泡：穿过空隙时不发 `Hover(-1)`；进了气泡则整个撤掉，悬停留在 0。
-    #[test]
-    fn gap_on_the_way_to_tip_keeps_hover() {
-        let (mut m, rx) = engaged_on_0();
-        real_move(&mut m, 15);
-        assert!(hovers(&rx).is_empty(), "空隙里不得立刻清悬停");
-        assert!(m.deferred.is_some());
-        m.resolve_deferred(later(), true);
-        assert!(hovers(&rx).is_empty(), "进了气泡：撤掉");
-        assert!(m.deferred.is_none());
-        assert_eq!(m.last_hover, 0);
-    }
-
-    /// 朝向判据：气泡在右侧顶端时，水平右移、斜着往上右移都算；往左、往下偏离得比靠近快、
-    /// 原地不动都不算。气泡在下方时（收起态横排）同理换一条轴。
-    #[test]
-    fn heading_to_tip_table() {
-        let right_top = (100, 0, 200, 40);
-        assert!(
-            heading_to_tip((10, 120), (14, 120), right_top),
-            "沿行水平右移"
-        );
-        assert!(heading_to_tip((10, 120), (14, 116), right_top), "斜着往上");
-        assert!(
-            !heading_to_tip((10, 120), (14, 126), right_top),
-            "往下偏得比靠近快"
-        );
-        assert!(!heading_to_tip((10, 120), (6, 120), right_top), "往回走");
-        assert!(!heading_to_tip((10, 120), (10, 120), right_top), "没动");
-        assert!(
-            heading_to_tip((10, 20), (12, 26), right_top),
-            "跨度内上下随意"
-        );
-        let left = (-200, 0, -100, 40);
-        assert!(heading_to_tip((10, 20), (6, 20), left), "气泡在左侧：左移");
-        let below = (0, 50, 80, 120);
-        assert!(
-            heading_to_tip((40, 10), (40, 14), below),
-            "气泡在下方：下移"
-        );
-        assert!(!heading_to_tip((40, 10), (40, 6), below));
-        assert!(
-            !heading_to_tip((150, 60), (151, 60), (100, 0, 200, 100)),
-            "已在气泡上"
-        );
-    }
-
-    /// 宽限里朝气泡继续移动：截止顺延；背离气泡：照旧取较早者、不顺延。
-    #[test]
-    fn moving_toward_tip_extends_the_grace() {
-        let run = |tip: (i32, i32, i32, i32)| {
-            let (mut m, _rx) = engaged_on_0();
-            m.tip_rect = Some(tip);
-            m.tip_visible = Some(Rc::new(Cell::new(true)));
-            real_move(&mut m, 5);
-            real_move(&mut m, 22);
-            let first = m.deferred.expect("移开气泡所属候选应延后");
-            std::thread::sleep(Duration::from_millis(2));
-            real_move(&mut m, 25);
-            (first, m.deferred.unwrap())
-        };
-        let (first, after) = run((100, 0, 200, 40));
-        assert!(after > first, "朝右侧气泡移动：顺延");
-        let (first, after) = run((-200, 0, -100, 40));
-        assert_eq!(after, first, "背离气泡：不顺延");
-    }
-
-    /// 指针停在格子上左右抖动：一来一回刷不出离气泡的新低，截止不再往后推。
-    #[test]
-    fn jitter_does_not_keep_extending() {
-        let (mut m, _rx) = engaged_on_0();
-        m.tip_rect = Some((100, 0, 200, 40));
-        m.tip_visible = Some(Rc::new(Cell::new(true)));
-        real_move(&mut m, 5);
-        real_move(&mut m, 25);
-        real_move(&mut m, 26);
-        let settled = m.deferred.unwrap();
-        for x in [25, 26, 25, 26] {
-            std::thread::sleep(Duration::from_millis(2));
-            real_move(&mut m, x);
-        }
-        assert_eq!(m.deferred.unwrap(), settled, "抖动不顺延");
-    }
-
-    /// 气泡已自己收起（`tip_rect` 还是旧值）：不按它判朝向。
-    #[test]
-    fn hidden_tip_does_not_extend() {
-        let (mut m, _rx) = engaged_on_0();
-        m.tip_rect = Some((100, 0, 200, 40));
-        m.tip_visible = Some(Rc::new(Cell::new(false)));
-        real_move(&mut m, 5);
-        real_move(&mut m, 22);
-        let first = m.deferred.unwrap();
-        std::thread::sleep(Duration::from_millis(2));
-        real_move(&mut m, 25);
-        assert_eq!(m.deferred.unwrap(), first);
-    }
-
-    /// 宽限到期仍不在气泡上（也没回来）：照发。
-    #[test]
-    fn gap_fires_after_grace() {
-        let (mut m, rx) = engaged_on_0();
-        real_move(&mut m, 15);
-        m.resolve_deferred(Instant::now(), false);
-        assert!(hovers(&rx).is_empty(), "未到期不发");
-        m.resolve_deferred(later(), false);
-        assert_eq!(hovers(&rx), vec![-1]);
-        assert_eq!(m.last_hover, -1);
-    }
-
-    /// 宽限期内回到原候选：待发作废，到期也不发。
-    #[test]
-    fn return_to_same_candidate_cancels() {
-        let (mut m, rx) = engaged_on_0();
-        real_move(&mut m, 15);
-        real_move(&mut m, 5);
-        assert!(m.deferred.is_none());
-        m.resolve_deferred(later(), false);
-        assert!(hovers(&rx).is_empty());
-    }
-
-    /// 擦过相邻候选：不立刻切换，切换延迟到期才发；期间进了气泡则不切。
-    #[test]
-    fn crossing_neighbour_defers_switch() {
-        let (mut m, rx) = engaged_on_0();
-        real_move(&mut m, 25);
-        assert!(hovers(&rx).is_empty(), "擦过候选 1 不立刻切");
-        let until = m.deferred.expect("延后");
-        assert!(until <= Instant::now() + TIP_SWITCH);
-        m.resolve_deferred(until, false);
-        assert_eq!(hovers(&rx), vec![1]);
-        // 进了气泡的那种。
-        let (mut m, rx) = engaged_on_0();
-        real_move(&mut m, 25);
-        m.resolve_deferred(later(), true);
-        assert!(hovers(&rx).is_empty());
-    }
-
-    /// 先进空隙（宽限）、再到另一个候选：按较早的切换延迟收紧，不顺延。
-    #[test]
-    fn switch_after_gap_tightens_deadline() {
-        let (mut m, _rx) = engaged_on_0();
-        real_move(&mut m, 15);
-        let grace = m.deferred.unwrap();
-        real_move(&mut m, 25);
-        assert!(m.deferred.unwrap() < grace);
-    }
-
-    /// 气泡没跟着移开的候选：悬停照旧即时。
-    #[test]
-    fn no_tip_no_grace() {
-        let (mut m, rx) = engaged_on_0();
-        m.tip_for.set(-1);
-        real_move(&mut m, 15);
-        assert_eq!(hovers(&rx), vec![-1]);
-        assert!(m.deferred.is_none());
-    }
-
-    /// 窗口层：tick 在光标进了气泡时撤掉待发；到期时间进入 next_deadline。
-    #[test]
-    fn window_tick_cancels_when_cursor_on_tip() {
-        let (mut w, rx) = window();
-        assert_eq!(w.tip_for.get(), 0, "显示气泡即记下它跟着谁");
-        {
-            let mut m = w.mouse.borrow_mut();
-            m.engaged = true;
-            m.last_hover = 0;
-            real_move(&mut m, 15);
-        }
-        let _ = hovers(&rx);
-        let until = w.mouse.borrow().deferred.expect("延后");
-        assert_eq!(w.next_deadline(), Some(until));
-        w.tooltip_mut().unwrap().stub_on_tip(true);
-        w.tick();
-        assert!(w.mouse.borrow().deferred.is_none());
-        assert!(hovers(&rx).is_empty());
-    }
-
-    /// Esc / 上屏 / 失焦（候选窗收起）：光标就停在气泡上、跟踪挂着，气泡也得收；待发的
-    /// 悬停与「气泡跟着谁」一并清掉。
-    #[test]
-    fn candidate_hide_force_hides_tip_under_cursor() {
-        let (mut w, _rx) = window();
-        {
-            let t = w.tooltip_mut().unwrap();
-            t.stub_on_tip(true);
-            t.simulate_move();
-        }
-        w.mouse.borrow_mut().deferred = Some(later());
-        w.hide();
-        assert!(!tip_shown(&w), "候选窗收起，气泡不得残留");
-        assert_eq!(w.tip_for.get(), -1);
-        assert!(w.mouse.borrow().deferred.is_none());
-    }
-
-    /// 悬停变成「无」（协调器重绘）：`tip_for` 随之清掉，不再对后续移动延后。
-    #[test]
-    fn tip_for_clears_when_tip_goes_away() {
-        let (mut w, _rx) = window();
-        w.hover = -1;
-        w.update_tooltip(0, 0);
-        assert_eq!(w.tip_for.get(), -1);
-    }
-}
+#[path = "candidate_window_tip_hold_tests.rs"]
+mod tip_hold_tests;
 
 // 直立态逐格切叶子时，分段颜色跟着格走（设计 text-span-colors.md §7.1）。
 #[cfg(test)]
-mod upright_color_run_tests {
-    use super::*;
-    use crate::text::dwrite::ColorRun;
-
-    fn window(upright: bool) -> CandidateWindow {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.set_orientation(false, upright, upright);
-        w
-    }
-
-    const RED: [u8; 4] = [255, 0, 0, 255];
-    const BLUE: [u8; 4] = [0, 0, 255, 255];
-
-    /// 「a你b」：红 `a你`（0..4）、蓝 `b`（4..5）。
-    fn runs() -> Vec<ColorRun> {
-        vec![
-            ColorRun {
-                start: 0,
-                end: 4,
-                rgba: RED,
-            },
-            ColorRun {
-                start: 4,
-                end: 5,
-                rgba: BLUE,
-            },
-        ]
-    }
-
-    fn build(w: &CandidateWindow) -> View {
-        let runs = runs();
-        w.scene_input(false)
-            .upright_text("a你b", None, |seg, _, off| {
-                View::leaf(seg, [0, 0, 0, 255]).color_runs(ColorRun::slice(
-                    &runs,
-                    off,
-                    off + seg.len(),
-                ))
-            })
-    }
-
-    /// 不切格：偏移为 0，一个叶子拿全部区间，原样。
-    #[test]
-    fn unsplit_leaf_keeps_all_runs() {
-        let v = build(&window(false));
-        assert_eq!(v.text.as_deref(), Some("a你b"));
-        assert_eq!(v.color_runs, runs());
-    }
-
-    /// 直立态逐格切：每格拿到自己范围内的那段、平移到格内偏移。
-    #[test]
-    fn upright_cells_get_their_own_slice() {
-        let v = build(&window(true));
-        // 每格是扶正包裹层（旋转节点）里的一个叶子。
-        let cells: Vec<(&str, &[ColorRun])> = v
-            .children
-            .iter()
-            .map(|c| {
-                let leaf = &c.children[0];
-                (leaf.text.as_deref().unwrap(), leaf.color_runs.as_slice())
-            })
-            .collect();
-        let one = |end, rgba| {
-            vec![ColorRun {
-                start: 0,
-                end,
-                rgba,
-            }]
-        };
-        assert_eq!(
-            cells,
-            vec![
-                ("a", one(1, RED).as_slice()),
-                ("你", one(3, RED).as_slice()),
-                ("b", one(1, BLUE).as_slice()),
-            ]
-        );
-    }
-}
+#[path = "candidate_window_upright_color_run_tests.rs"]
+mod upright_color_run_tests;
 
 // 注释的分段颜色：按主题与候选状态求色，接到注释叶子的 color_runs（设计 text-span-colors.md §6）。
 #[cfg(test)]
-mod comment_color_tests {
-    use super::*;
-    use wind_ui_types::{SpanStyle, StyledText};
-
-    const RED: [u8; 4] = [0xC0, 0, 0, 255];
-
-    /// 「wq(nǐ)」：`wq` 带内联色 `#C00000`（选中态改用 `selected=` 给的色），其余无色。
-    fn comment(spec: &str) -> StyledText {
-        let mut t = StyledText::new();
-        t.push(
-            "wq",
-            &SpanStyle {
-                role: Some("code_rev"),
-                color: Some(std::sync::Arc::new(wind_theme::InlineColor::parse(spec))),
-                ..Default::default()
-            },
-        );
-        t.push(
-            "(nǐ)",
-            &SpanStyle {
-                role: Some("literal"),
-                ..Default::default()
-            },
-        );
-        t
-    }
-
-    fn window(theme: wind_theme::Resolved, upright: bool) -> CandidateWindow {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.scale = 1.0;
-        w.set_theme(theme);
-        w.set_orientation(false, upright, upright);
-        w
-    }
-
-    fn cand(c: StyledText) -> CandidateItem {
-        CandidateItem {
-            text_styled: Default::default(),
-            text: "你".into(),
-            code: String::new(),
-            label: String::new(),
-            tooltip: Default::default(),
-            comment: c,
-            comment_above: Default::default(),
-            no_index: false,
-        }
-    }
-
-    /// 树里所有带颜色区间的叶子：`(文字, 区间)`。
-    fn colored(v: &View, out: &mut Vec<(String, Vec<ColorRun>)>) {
-        if let Some(t) = &v.text
-            && !v.color_runs.is_empty()
-        {
-            out.push((t.clone(), v.color_runs.clone()));
-        }
-        for c in &v.children {
-            colored(c, out);
-        }
-    }
-
-    fn runs_of(
-        w: &mut CandidateWindow,
-        comment_spec: &str,
-        selected: usize,
-    ) -> Vec<(String, Vec<ColorRun>)> {
-        w.update(
-            "ni",
-            2,
-            "",
-            vec![cand(comment(comment_spec))],
-            selected,
-            -1,
-            1,
-            1,
-        );
-        let mut out = Vec::new();
-        colored(&w.scene.build_tree(&w.scene_input(false)), &mut out);
-        out
-    }
-
-    fn run(start: u32, end: u32, rgba: [u8; 4]) -> ColorRun {
-        ColorRun { start, end, rgba }
-    }
-
-    #[test]
-    fn inline_color_reaches_the_comment_leaf() {
-        let mut w = window(wind_theme::Resolved::default(), false);
-        // 候选 0 不是选中（selected 越界）⇒ 常态。
-        assert_eq!(
-            runs_of(&mut w, "#C00000", 9),
-            vec![("wq(nǐ)".to_string(), vec![run(0, 2, RED)])]
-        );
-    }
-
-    /// 规则 3：主题把选中态注释正文色改了 ⇒ 内联色回落该态正文色（区间被丢）；
-    /// `selected=` 单列的照用。
-    #[test]
-    fn selected_state_falls_back_unless_inline_says_selected() {
-        let mut theme = wind_theme::Resolved::default();
-        theme.views.comment.selected = Some(Box::new(wind_theme::RvNode {
-            text_color: Some([255, 255, 255, 255]),
-            ..Default::default()
-        }));
-        let mut w = window(theme, false);
-        assert_eq!(runs_of(&mut w, "#C00000", 0), vec![], "选中态回落正文色");
-        assert_eq!(
-            runs_of(&mut w, "#C00000,selected=#00FF00", 0),
-            vec![("wq(nǐ)".to_string(), vec![run(0, 2, [0, 255, 0, 255])])]
-        );
-    }
-
-    /// 非出厂测试主题 `span-roles`（wind-theme testdata）：主题角色色真的接到注释叶子，
-    /// 且选中 / 悬停态按 §6.3 回落。
-    fn roles_theme() -> wind_theme::Resolved {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        wind_theme::load_resolved_dirs(
-            &[
-                root.join("../wind-theme/testdata/themes"),
-                root.join("../../../data/themes"),
-            ],
-            "span-roles",
-            false,
-        )
-        .unwrap()
-    }
-
-    /// 「wq nǐ」：`wq` 角色 code_rev、` ` 字面、`nǐ` 角色 pinyin。
-    fn roles_comment() -> StyledText {
-        let mut t = StyledText::new();
-        t.push(
-            "wq",
-            &SpanStyle {
-                role: Some("code_rev"),
-                ..Default::default()
-            },
-        );
-        t.push(
-            " ",
-            &SpanStyle {
-                role: Some("literal"),
-                ..Default::default()
-            },
-        );
-        t.push(
-            "nǐ",
-            &SpanStyle {
-                role: Some("pinyin"),
-                ..Default::default()
-            },
-        );
-        t
-    }
-
-    fn roles_runs(w: &mut CandidateWindow, selected: usize, hover: i32) -> Vec<ColorRun> {
-        w.update(
-            "ni",
-            2,
-            "",
-            vec![cand(roles_comment())],
-            selected,
-            hover,
-            1,
-            1,
-        );
-        let mut out = Vec::new();
-        colored(&w.scene.build_tree(&w.scene_input(false)), &mut out);
-        out.into_iter().flat_map(|(_, r)| r).collect()
-    }
-
-    #[test]
-    fn theme_roles_color_the_comment_per_state() {
-        let mut w = window(roles_theme(), false);
-        const CODE: [u8; 4] = [0xC0, 0, 0, 255];
-        const LIT: [u8; 4] = [0xB0, 0xB0, 0xB0, 255];
-        const PY: [u8; 4] = [0, 0x80, 0, 255];
-        // 常态：三个角色各自的色。
-        assert_eq!(
-            roles_runs(&mut w, 9, -1),
-            vec![run(0, 2, CODE), run(2, 3, LIT), run(3, 6, PY)]
-        );
-        // 选中：主题改了选中态正文色 ⇒ 未单列的回落正文色（区间被丢）；code_rev 单列保留。
-        assert_eq!(
-            roles_runs(&mut w, 0, -1),
-            vec![run(0, 2, [0xFF, 0xE0, 0x8A, 255])]
-        );
-        // 悬停：正文色没改 ⇒ 常态角色色照用；pinyin 在悬停态单列。
-        assert_eq!(
-            roles_runs(&mut w, 9, 0),
-            vec![
-                run(0, 2, CODE),
-                run(2, 3, LIT),
-                run(3, 6, [0, 0, 0xFF, 255])
-            ]
-        );
-    }
-
-    /// 直立态逐格切：`w`、`q` 两格各得一段，其余格没有区间。
-    #[test]
-    fn upright_cells_get_their_slices() {
-        let mut w = window(wind_theme::Resolved::default(), true);
-        assert_eq!(
-            runs_of(&mut w, "#C00000", 9),
-            vec![
-                ("w".to_string(), vec![run(0, 1, RED)]),
-                ("q".to_string(), vec![run(0, 1, RED)]),
-            ]
-        );
-    }
-}
+#[path = "candidate_window_comment_color_tests.rs"]
+mod comment_color_tests;
 
 // 上方注释条（`CandidateItem.comment_above`，设计 candidate-comment-above-line.md §3.3）。
 //
-// ⚠️ host 上文本测量是 mock 近似（字宽 0.6em、行高只看字号），下面凡涉及尺寸的断言都写成
-// 相对关系（等高、同一 x、差值 == 某叶子外框），不钉像素——它们测的是**盒模型结构**，
-// 真实后端下结构不变、关系照样成立。唯一只在 mock 下成立的前提见各测试注释。
+// host 上文本测量是 mock 近似，下面凡涉及尺寸的断言都写成相对关系（等高、同一 x、差值 ==
+// 某叶子外框），测的是盒模型结构。唯一只在 mock 下成立的前提见各测试注释。
 #[cfg(test)]
-mod comment_above_tests {
-    use super::*;
-    use wind_ui_types::{SpanStyle, StyledText};
-
-    fn cand_above(text: &str, above: &str, comment: &str) -> CandidateItem {
-        CandidateItem {
-            text_styled: Default::default(),
-            text: text.to_string(),
-            code: String::new(),
-            label: String::new(),
-            tooltip: Default::default(),
-            comment: comment.into(),
-            comment_above: above.into(),
-            no_index: false,
-        }
-    }
-
-    fn mk(vertical: bool, rotated: bool, upright: bool, rows: u32) -> CandidateWindow {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut w = CandidateWindow::new(CandidateWindowConfig::default(), tx).unwrap();
-        w.scale = 1.0;
-        w.set_orientation(vertical, rotated, upright);
-        w.set_min_size(0, 0, 0, 0, rows);
-        w
-    }
-
-    fn win(vertical: bool, items: Vec<CandidateItem>) -> CandidateWindow {
-        let mut w = mk(vertical, false, false, 0);
-        w.update("", 0, "", items, 0, -1, 1, 1);
-        w
-    }
-
-    fn laid(w: &CandidateWindow) -> View {
-        let mut root = w.scene.build_tree(&w.scene_input(false));
-        root.layout(0.0, 0.0, &w.text_renderer);
-        root
-    }
-
-    fn find_list(v: &View) -> Option<&View> {
-        if v.children.iter().any(|c| c.tag >= 0) {
-            return Some(v);
-        }
-        v.children.iter().find_map(find_list)
-    }
-
-    /// 候选 item（按 tag 升序）。
-    fn items(root: &View) -> Vec<&View> {
-        let list = find_list(root).expect("未找到候选列表容器");
-        let mut out: Vec<&View> = list.children.iter().filter(|c| c.tag >= 0).collect();
-        out.sort_by_key(|c| c.tag);
-        out
-    }
-
-    fn all_leaves<'a>(v: &'a View, out: &mut Vec<&'a View>) {
-        if v.text.is_some() {
-            out.push(v);
-        }
-        for c in &v.children {
-            all_leaves(c, out);
-        }
-    }
-
-    /// 带上方条的 item：`(上方条叶子, 主行)`。
-    fn split_item(item: &View) -> (&View, &View) {
-        assert!(
-            matches!(item.layout, Layout::Column),
-            "带上方条的 item 应是 Column"
-        );
-        assert_eq!(item.children.len(), 2, "Column[上方条, 主行]");
-        (&item.children[0], &item.children[1])
-    }
-
-    /// 有上段 vs 无上段：item 恰好高出上方条叶子的外框高度（主行不变）。
-    #[test]
-    fn above_line_adds_one_row_height() {
-        for vertical in [true, false] {
-            let plain = laid(&win(vertical, vec![cand_above("你好", "", "wq")]));
-            let with = laid(&win(vertical, vec![cand_above("你好", "ni hao", "wq")]));
-            let h0 = items(&plain)[0].laid_rect().h;
-            let item = items(&with)[0];
-            let (above, _) = split_item(item);
-            let ar = above.laid_rect();
-            let above_box = ar.h + above.margin.t + above.margin.b;
-            assert!(above_box > 0.0);
-            assert!(
-                (item.laid_rect().h - h0 - above_box).abs() < 0.5,
-                "vertical={vertical}：item 应恰好高出一条上方条（{} vs {h0} + {above_box}）",
-                item.laid_rect().h
-            );
-        }
-    }
-
-    /// 按页预留：3 条里只有第 2 条有上段，三个 item 等高，且都高于「整页无上段」。
-    #[test]
-    fn above_line_reserves_height_page_wide() {
-        for vertical in [true, false] {
-            let root = laid(&win(
-                vertical,
-                vec![
-                    cand_above("一", "", "a"),
-                    cand_above("二", "er", "b"),
-                    cand_above("三", "", ""),
-                ],
-            ));
-            let hs: Vec<f32> = items(&root).iter().map(|i| i.laid_rect().h).collect();
-            assert_eq!(hs.len(), 3);
-            assert!(
-                hs.iter().all(|h| (h - hs[1]).abs() < 0.01),
-                "vertical={vertical}：整页 item 须等高（{hs:?}）"
-            );
-            let plain = laid(&win(vertical, vec![cand_above("一", "", "a")]));
-            assert!(
-                hs[0] > items(&plain)[0].laid_rect().h,
-                "无上段的候选也要预留"
-            );
-            // 无上段的候选放的是透明占位叶子，看不见。
-            let (ghost, _) = split_item(items(&root)[0]);
-            assert_eq!(ghost.text_color[3], 0, "占位叶子须透明");
-        }
-    }
-
-    /// 上方条字形起点 == 候选文字字形起点（≥ 序号右缘），含圆圈序号与无序号行。
-    #[test]
-    fn above_line_starts_at_text_origin() {
-        for circle in [false, true] {
-            for vertical in [true, false] {
-                let mut w = mk(vertical, false, false, 0);
-                if circle {
-                    w.theme.views.index.bg_shape = "circle".to_string();
-                }
-                let mut no_idx = cand_above("丙", "bing", "");
-                no_idx.no_index = true;
-                w.update(
-                    "",
-                    0,
-                    "",
-                    vec![
-                        cand_above("你好", "ni hao", "wq"),
-                        cand_above("甲", "jia", ""),
-                        no_idx,
-                    ],
-                    0,
-                    -1,
-                    1,
-                    1,
-                );
-                let root = laid(&w);
-                for item in items(&root) {
-                    let (above, main) = split_item(item);
-                    let text = if item.tag == 2 {
-                        &main.children[0]
-                    } else {
-                        let idx = &main.children[0];
-                        let text = &main.children[1];
-                        let ir = idx.laid_rect();
-                        assert!(
-                            above.laid_rect().x + 0.01 >= ir.x + ir.w,
-                            "上方条不得压到序号上（circle={circle}, vertical={vertical}）"
-                        );
-                        text
-                    };
-                    let a0 = above.laid_rect().x + above.padding.l;
-                    let t0 = text.laid_rect().x + text.padding.l;
-                    assert!(
-                        (a0 - t0).abs() < 1.0,
-                        "上方条起点 {a0} 应对齐文字起点 {t0}（tag={}, circle={circle}, vertical={vertical}）",
-                        item.tag
-                    );
-                }
-            }
-        }
-    }
-
-    /// 整页无上段：item 保持原来的 Row[序号, 文字, 注释]，没有任何 Column / 占位叶子。
-    /// （逐字节不变由 `render_golden` 的出厂对拍钉死，这条是本模块内的结构兜底。）
-    #[test]
-    fn no_above_keeps_tree_identical() {
-        for vertical in [true, false] {
-            let root = laid(&win(
-                vertical,
-                vec![cand_above("一", "", "a"), cand_above("二", "", "")],
-            ));
-            let its = items(&root);
-            assert!(its.iter().all(|i| matches!(i.layout, Layout::Row)));
-            assert_eq!(its[0].children.len(), 3, "序号 + 文字 + 注释");
-            assert_eq!(its[1].children.len(), 2, "序号 + 文字");
-        }
-    }
-
-    /// 上段极长：以 `…` 结尾，窗口不超过屏幕安全宽；文字本身不被上段挤截。
-    #[test]
-    fn above_line_overlong_is_ellipsized() {
-        let long = "x".repeat(2000);
-        for vertical in [true, false] {
-            let w = win(
-                vertical,
-                vec![
-                    cand_above("你好", &long, "wq"),
-                    cand_above("世界", &long, ""),
-                ],
-            );
-            let root = laid(&w);
-            let cap = w.screen_safety_max_width_px() as f32;
-            assert!(
-                root.measured_size().0 <= cap + 0.5,
-                "vertical={vertical}：窗口宽 {} 超出上限 {cap}",
-                root.measured_size().0
-            );
-            for item in items(&root) {
-                let (above, main) = split_item(item);
-                let t = above.text.as_deref().unwrap();
-                assert!(t.ends_with('…'), "上段应被截断加省略号");
-                assert!(t.len() < long.len());
-                assert_eq!(
-                    main.children[1].text.as_deref(),
-                    Some(if item.tag == 0 { "你好" } else { "世界" }),
-                    "候选文字不因上段而被截"
-                );
-            }
-        }
-    }
-
-    /// 旋转 / 直立态不支持上方条：无 Column，上段以 `\n` 合回右侧注释。
-    #[test]
-    fn upright_merges_above_into_comment() {
-        for upright in [false, true] {
-            let mut w = mk(false, true, upright, 0);
-            w.update(
-                "",
-                0,
-                "",
-                vec![cand_above("你", "ni", "亻尔"), cand_above("好", "hao", "")],
-                0,
-                -1,
-                1,
-                1,
-            );
-            let root = laid(&w);
-            for item in items(&root) {
-                assert!(
-                    matches!(item.layout, Layout::Row),
-                    "upright={upright}：不应出现 Column"
-                );
-            }
-            let mut leaves = Vec::new();
-            all_leaves(&root, &mut leaves);
-            let texts: Vec<&str> = leaves.iter().filter_map(|l| l.text.as_deref()).collect();
-            if upright {
-                // 直立态逐格切：上段的每个字都在。
-                for ch in ["n", "i", "亻", "尔", "h", "a", "o"] {
-                    assert!(texts.contains(&ch), "直立态缺 {ch}：{texts:?}");
-                }
-            } else {
-                assert!(
-                    texts.contains(&"ni\n亻尔"),
-                    "上下段应以 \\n 合并：{texts:?}"
-                );
-                assert!(texts.contains(&"hao"), "下段空时只剩上段：{texts:?}");
-            }
-        }
-    }
-
-    /// `min_rows` 补的占位行与带上方条的真实行同构、等高。
-    #[test]
-    fn placeholder_rows_match_real_rows_when_above() {
-        let five = |n: usize| {
-            let mut w = mk(true, false, false, 5);
-            w.theme.views.index.bg_shape = "circle".to_string();
-            let texts = ["一", "二", "三", "四", "五"];
-            let items: Vec<CandidateItem> = texts[..n]
-                .iter()
-                .enumerate()
-                .map(|(i, t)| cand_above(t, if i == 1 { "er" } else { "" }, ""))
-                .collect();
-            w.update("", 0, "", items, 0, -1, 1, 1);
-            w
-        };
-        let full = laid(&five(5)).measured_size().1;
-        let padded_w = five(3);
-        let padded = laid(&padded_w);
-        assert_eq!(
-            padded.measured_size().1,
-            full,
-            "3 候选补 2 空行须与 5 条等高"
-        );
-        let list = find_list(&padded).unwrap();
-        let ph = list.children.iter().find(|c| c.tag < 0).expect("占位行");
-        let real = list.children.iter().find(|c| c.tag == 1).unwrap();
-        let (ph_above, ph_main) = split_item(ph);
-        let (real_above, real_main) = split_item(real);
-        assert_eq!(ph_above.font_size, real_above.font_size);
-        assert_eq!(ph_above.font_family, real_above.font_family);
-        assert_eq!(ph_above.font_weight, real_above.font_weight);
-        let tb = |e: Edges| (e.t, e.b);
-        assert_eq!(tb(ph_above.padding), tb(real_above.padding));
-        assert_eq!(tb(ph_above.margin), tb(real_above.margin));
-        assert_eq!(ph_main.children.len(), real_main.children.len());
-        assert!((ph.laid_rect().h - real.laid_rect().h).abs() < 0.01);
-    }
-
-    /// `[comment_above.roles]` 只作用于上方条，右侧注释不受影响。
-    #[test]
-    fn above_line_colors_follow_comment_above_theme() {
-        const GREEN: [u8; 4] = [0, 0x80, 0, 255];
-        let py = |s: &str| {
-            let mut t = StyledText::new();
-            t.push(
-                s,
-                &SpanStyle {
-                    role: Some("pinyin"),
-                    ..Default::default()
-                },
-            );
-            t
-        };
-        let mut w = mk(true, false, false, 0);
-        w.theme
-            .views
-            .comment_above
-            .roles
-            .insert("pinyin".to_string(), GREEN);
-        let mut c = cand_above("你", "", "");
-        c.comment_above = py("ni");
-        c.comment = py("nn");
-        w.update("", 0, "", vec![c], 9, -1, 1, 1);
-        let root = laid(&w);
-        let (above, main) = split_item(items(&root)[0]);
-        assert_eq!(
-            above.color_runs,
-            vec![ColorRun {
-                start: 0,
-                end: 2,
-                rgba: GREEN
-            }]
-        );
-        let cmt = &main.children[2];
-        assert_eq!(cmt.text.as_deref(), Some("nn"));
-        assert!(cmt.color_runs.is_empty(), "右侧注释不该吃到上方条的角色色");
-    }
-
-    /// 纵向中线。
-    fn mid_y(v: &View) -> f32 {
-        let r = v.laid_rect();
-        r.y + r.h * 0.5
-    }
-
-    /// 横排：翻页栏、模式徽标、内联编码这些一行高的非 item 成员与候选**主行**对齐，而不是
-    /// 与两行高的整个 item 居中（那样会比主行高出半个上方条）。
-    #[test]
-    fn horizontal_single_line_members_align_with_main_row() {
-        // (preedit, 模式标记, 内联编码)：分别让徽标 / 内联编码落进候选行。
-        for (preedit, mode, embedded) in [("", "拼", false), ("nihao", "", true)] {
-            let mut w = mk(false, false, false, 0);
-            w.set_preedit_embedded(embedded);
-            w.update(
-                preedit,
-                preedit.len(),
-                mode,
-                vec![cand_above("好", "hǎo", "vb"), cand_above("浩", "", "")],
-                0,
-                -1,
-                1,
-                2,
-            );
-            let root = laid(&w);
-            let list = find_list(&root).unwrap();
-            let (_, main) = split_item(items(&root)[0]);
-            let want = mid_y(main);
-            let members: Vec<&View> = list.children.iter().filter(|c| c.tag < 0).collect();
-            assert!(
-                members.len() >= 2,
-                "应有翻页栏 + 徽标/内联编码：{}",
-                members.len()
-            );
-            for m in members {
-                assert!(
-                    (mid_y(m) - want).abs() <= 1.0,
-                    "非 item 成员中线 {} 应与主行中线 {want} 对齐（preedit={preedit:?} mode={mode:?}）：{:?}",
-                    mid_y(m),
-                    m.text
-                );
-            }
-        }
-    }
-
-    /// 点击上方条所在的区域命中该候选（上方条在 item 容器之内，命中区是整个 item）。
-    #[test]
-    fn click_on_above_line_hits_its_candidate() {
-        for vertical in [true, false] {
-            let root = laid(&win(
-                vertical,
-                vec![cand_above("好", "hǎo", ""), cand_above("号", "hào", "")],
-            ));
-            let mut hits = Vec::new();
-            root.collect_hits(&mut hits);
-            for item in items(&root) {
-                let (above, _) = split_item(item);
-                let r = above.laid_rect();
-                let (x, y) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
-                let tag = hits
-                    .iter()
-                    .find(|(_, hr)| hr.contains(x, y))
-                    .map_or(-1, |(t, _)| *t);
-                assert_eq!(tag, item.tag, "vertical={vertical}：上方条应命中本候选");
-            }
-        }
-    }
-
-    /// `[comment_above.hover.roles]`：悬停态的角色色接到上方条。
-    #[test]
-    fn above_line_hover_role_color() {
-        const GREEN: [u8; 4] = [0, 0x80, 0, 255];
-        const BLUE: [u8; 4] = [0, 0, 0xFF, 255];
-        let mut w = mk(true, false, false, 0);
-        let ca = &mut w.theme.views.comment_above;
-        ca.roles.insert("pinyin".to_string(), GREEN);
-        let mut hov = wind_theme::RvNode::default();
-        hov.roles.insert("pinyin".to_string(), BLUE);
-        ca.hover = Some(Box::new(hov));
-        let mut c = cand_above("你", "", "");
-        let mut t = StyledText::new();
-        t.push(
-            "ni",
-            &SpanStyle {
-                role: Some("pinyin"),
-                ..Default::default()
-            },
-        );
-        c.comment_above = t;
-        let runs = |w: &mut CandidateWindow, hover: i32| {
-            w.update("", 0, "", vec![c.clone()], 9, hover, 1, 1);
-            let root = laid(w);
-            let (above, _) = split_item(items(&root)[0]);
-            above.color_runs.clone()
-        };
-        let rgba = |r: Vec<ColorRun>| r.iter().map(|r| r.rgba).collect::<Vec<_>>();
-        assert_eq!(rgba(runs(&mut w, -1)), vec![GREEN], "常态");
-        assert_eq!(rgba(runs(&mut w, 0)), vec![BLUE], "悬停");
-    }
-
-    /// `[comment_above]` 的背景 / 边框接到上方条叶子（含选中态），右侧注释不受影响；
-    /// 占位叶子不画装饰。
-    #[test]
-    fn above_line_consumes_background_and_border() {
-        const BG: [u8; 4] = [1, 2, 3, 255];
-        const SEL_BG: [u8; 4] = [4, 5, 6, 255];
-        const BORDER: [u8; 4] = [7, 8, 9, 255];
-        let mut w = mk(true, false, false, 0);
-        let ca = &mut w.theme.views.comment_above;
-        ca.bg_color = Some(BG);
-        ca.border_color = Some(BORDER);
-        ca.selected = Some(Box::new(wind_theme::RvNode {
-            bg_color: Some(SEL_BG),
-            ..Default::default()
-        }));
-        w.update(
-            "",
-            0,
-            "",
-            vec![
-                cand_above("好", "hǎo", "vb"),
-                cand_above("号", "hào", "kg"),
-                cand_above("浩", "", "hj"),
-            ],
-            0,
-            -1,
-            1,
-            1,
-        );
-        let root = laid(&w);
-        let its = items(&root);
-        let (sel_above, sel_main) = split_item(its[0]);
-        let (above, _) = split_item(its[1]);
-        let (ghost, _) = split_item(its[2]);
-        assert_eq!(sel_above.bg, Some(SEL_BG), "选中态取 selected patch 的底色");
-        assert_eq!(above.bg, Some(BG));
-        assert_eq!(above.border.map(|b| b.0), Some(BORDER));
-        assert_eq!(sel_main.children[2].bg, None, "右侧注释不吃上方条的底色");
-        assert_eq!(sel_main.children[2].border, None);
-        assert_eq!(ghost.bg, None, "占位叶子不画底色");
-        assert_eq!(ghost.border, None);
-    }
-}
+#[path = "candidate_window_comment_above_tests.rs"]
+mod comment_above_tests;
 
 // 渲染 golden 对拍（Linux mock 后端才有绘制调用记录）。见模块文档。
 #[cfg(all(test, mock_text))]

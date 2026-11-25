@@ -7,49 +7,24 @@
 use crate::config::Config;
 use tracing::{debug, warn};
 
-/// `keys.key_actions` 里**组合键**条目的策略表：动词 → `(分发端 action, 策略位)`；
-/// 结构上走不通的动词返回 `None`。
+/// `keys.key_actions` 里组合键条目的策略表：动词 → `(分发端 action, 策略位)`；
+/// 解析不出 `BoundAction` 的动词返回 `None`。
 ///
-/// ★ **值域就是 [`crate::BoundAction`]**，与单键、修饰键两条通路同一张表。本函数只回答
-/// 「这个动词编进 key_down 热键表时该带哪些策略位」，不回答「组合键能不能绑它」——后者
-/// 由 `BoundAction::parse` 认不认得该动词决定。
+/// 值域就是 [`crate::BoundAction`]，与单键、修饰键两条通路同一张表；`add_word` 一类要激活
+/// C++ 全键转发的动词不在值域内，自然落 `None`。策略位按动词分（见 [`hotkey_policy_for`]），
+/// 且须与 `Compiler::compile` 里固定字段那几段逐条一致，否则同一功能经两条路进表行为不同：
 ///
-/// 2026-09-18 之前这里是一份**逐条追加**的六项白名单（`toggle_schema:` / `switch_schema:` /
-/// `special:` / `rare_char` / `softkeyboard`），每接一个新功能往里加一行，于是组合键能绑的
-/// 功能恒比单键少一大截——而组合键这条通路在按键链上位次更早（英文模式分水岭之前）、
-/// 不与输入争键、可全局拦截，本该是限制**最少**的一条。那份白名单不是设计论证的产物，
-/// 是演进残留；现已翻转为「解析得出 `BoundAction` 就收，减去结构上走不通的」。
-///
-/// 结构上走不通的只有两类，都不在 `BoundAction` 值域内、因而自然落 `None`：
-/// `add_word` / `open_add_word_dialog` 要返回占位 composition 激活 C++ 转发全部按键，
-/// 不符 `dispatch_hotkey` 的 `bool` 契约（分派端另有特判）。
-///
-/// ★★ **策略位必须按动词分**，不能一律不带：同一个位在两类机制下后果相反。分组与
-/// `Compiler::compile` 里固定字段那几段**逐条一致**——同一个功能经两条路进表却带不同的位，
-/// 表现是「在设置页配和在自定义按键里配，行为不一样」。
-///
-/// | 动词 | 策略位 | why |
+/// | 动词 | 策略位 | 理由 |
 /// |---|---|---|
-/// | `toggle_schema:` / `switch_schema:` / `toggle_mode` / `switch_engine` | 无 | 它们正是用来**离开/返回英文态**的；带上 `CHINESE_ONLY` 就成了单程票 |
-/// | `toggle_full_width` / `toggle_toolbar` / `open_settings` / `open_dictionary` / `take_screenshot` | 无 | 两模式下都该生效，与固定字段那段同档 |
-/// | `toggle_punct` / `toggle_s2t` / `toggle_t2s` / `single_char` | `CHINESE_ONLY` | 只在中文态有意义；**不带 `GLOBAL`**，避免不必要地抢占宿主快捷键 |
-/// | 进 overlay 的（`temp_pinyin` / `temp_english` / `aux_code` / `rare_char` / `reverse` / `mix:` / `special:`） | `CHINESE_ONLY \| GLOBAL` | 进 overlay 只在中文输入中途有意义；`GLOBAL` 让 TSF 用 `RegisterHotKey` 抢占，穿透 QQNT/Tabby 等 Chromium 宿主的同名加速键 |
-/// | `command:<表达式>` | 无 | 跑的是用户的命令，与中英态无关（英文态下也该按得动）；不改输入状态，不需要抢占 |
-/// | `softkeyboard[:<id>]` | `GLOBAL` | 面板画的是「键位 → 符号」，与中英文态无关（英文态想打个 ℃ 同样合理），C++ 侧为此专设了软键盘总闸 `IsSoftKeyboard()`；带上 `CHINESE_ONLY` 英文态连开都开不出来 |
+/// | `toggle_schema:` / `switch_schema:` / `toggle_mode` / `switch_engine` | 无 | 用来离开/返回英文态，带 `CHINESE_ONLY` 就成了单程票 |
+/// | `toggle_full_width` / `toggle_toolbar` / `open_settings` / `open_dictionary` / `take_screenshot` | 无 | 两模式下都该生效 |
+/// | `toggle_punct` / `toggle_s2t` / `toggle_t2s` / `single_char` | `CHINESE_ONLY` | 只在中文态有意义；不带 `GLOBAL`，免得抢占宿主快捷键 |
+/// | 进 overlay 的（`temp_pinyin` / `temp_english` / `aux_code` / `rare_char` / `reverse` / `mix:` / `special:`） | `CHINESE_ONLY \| GLOBAL` | `GLOBAL` 让 TSF 用 `RegisterHotKey` 抢占，穿透 Chromium 宿主的同名加速键 |
+/// | `command:<表达式>` | 无 | 与中英态无关，不改输入状态 |
+/// | `softkeyboard[:<id>]` | `GLOBAL` | 与中英态无关（C++ 侧有软键盘总闸 `IsSoftKeyboard()`）；带 `CHINESE_ONLY` 英文态开不出来 |
 ///
-/// ⚠️ `GLOBAL` 有**容量上限 16**（`TextService.cpp` 的 `kHotkeyIdAddWordBase + 16`，
-/// `RegisterHotKey` 超出后静默 break）。给位要克制：只在确需穿透 Chromium 宿主时给，
-/// 别为了「看起来更可靠」给整张表都挂上。
-///
-/// ★ 动词**原样**进表，不再改写成 `enter_special:` / `enter_rare_char` 那种分发端专用形态
-/// ——分派端现在也用 `BoundAction::parse` 认串，两条通路认的是同一个值域，映射失去了意义。
-/// （那层映射本身还制造过一类缺陷：新增动词时只在一处加，另一处忘了，症状是「配了没反应」。）
-///
-/// 值域语义见 docs/design/schema-key-actions.md §2。
-/// ⚠️ 进表的是**用户写的原串**（只 trim，不规范化）：`BoundAction::parse` 对无载荷动词
-/// 大小写不敏感，所以 `"TEMP_PINYIN"` 会以大写形态躺在 key_down 表里。消费方
-/// （`dispatch_bound_action_hotkey`）同样用 `BoundAction::parse` 认串，故行为正确——
-/// 但**别拿表里的 `action` 跟字面量直接比**，那种写法只在用户恰好写小写时成立。
+/// 动词原样进表（只 trim，不规范化），分派端同样用 `BoundAction::parse` 认串；别拿表里的
+/// `action` 跟字面量直接比，大写写法会对不上。值域与沿革见 docs/design/schema-key-actions.md。
 pub(crate) fn hotkey_action_entry(action: &str) -> Option<(String, u32)> {
     let action = action.trim();
     let policy = hotkey_policy_for(&crate::config::BoundAction::parse(action))?;
@@ -58,14 +33,9 @@ pub(crate) fn hotkey_action_entry(action: &str) -> Option<(String, u32)> {
 
 /// 组合键动词的策略位。`BoundAction::None`（含解析不出的未知动词）返回 `None` ⇒ 不进表。
 ///
-/// 两个位各有各的判据，分开取：
-///
-/// - `CHINESE_ONLY` —— 复用 [`crate::BoundAction::only_in_chinese_mode`]，**不在这里重写一份**。
-///   分派端的 `chinese_mode` 守卫读的是同一个方法，两处分叉的后果见那里的说明。
-/// - `GLOBAL` —— 只给「会被 Chromium 类宿主（QQNT/Tabby）的同名加速键抢走」的那些：进
-///   overlay 的一族与软键盘。⚠️ 它有**容量上限 16**（`TextService.cpp` 的
-///   `kHotkeyIdAddWordBase + 16`，`RegisterHotKey` 超出后静默 break），给位要克制，
-///   别为了「看起来更可靠」给整张表都挂上。
+/// - `CHINESE_ONLY`：复用 [`crate::BoundAction::only_in_chinese_mode`]，与分派端守卫同源，别重写。
+/// - `GLOBAL`：只给会被 Chromium 类宿主同名加速键抢走的（进 overlay 的一族与软键盘）。槽位上限
+///   16（`GLOBAL_HOTKEY_SLOTS`），给位要克制。
 fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
     use crate::config::BoundAction as BA;
     if matches!(action, BA::None) {
@@ -75,8 +45,8 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
     if action.only_in_chinese_mode() {
         policy |= HOTKEY_POLICY_CHINESE_ONLY;
     }
-    // ⚠️ 穷举 `match`，不用 `matches!`：漏给 GLOBAL 的症状是「在 QQNT / Tabby 里按不出来、
-    // 在记事本里正常」——本仓自述最难归因的一类。列全的话新增变体编译不过。
+    // 穷举 `match` 而非 `matches!`：新增变体时编译不过，逼着决定要不要 GLOBAL（漏给只在
+    // Chromium 宿主里按不出来，极难归因）。
     let needs_global = match action {
         BA::TempPinyin
         | BA::TempEnglish
@@ -86,10 +56,7 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
         | BA::Mix(_)
         | BA::Special(_)
         | BA::SoftKeyboard(_) => true,
-        // 不抢占：这些不进 overlay，被宿主同名加速键抢走的代价也小（最多是这一次没切成），
-        // 而 GLOBAL 的槽位只有 16 个（见下方 `warn_global_hotkey_overflow`）。
-        //
-        // `Command` 同档：跑的是用户自己的命令，被宿主加速键抢走时换个组合键即可。
+        // 不抢占：不进 overlay，被宿主加速键抢走代价小，而 GLOBAL 槽位有限。
         BA::None
         | BA::SingleChar(_)
         | BA::CommentState(_)
@@ -104,7 +71,7 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
     Some(policy)
 }
 
-/// `keys.key_actions` 的一条条目该走哪条通路。由**键的形态**决定，不由动词决定。
+/// `keys.key_actions` 的一条条目该走哪条通路。由键的形态决定，不由动词决定。
 ///
 /// 三条通路各有各的到达条件，判据见 docs/design/schema-key-actions.md §4.1 与 §4.4：
 ///
@@ -115,8 +82,7 @@ fn hotkey_policy_for(action: &crate::config::BoundAction) -> Option<u32> {
 /// | 单个有字符的键（`backtick`） | keydown 引导键链 | 英文模式下必须让它出字，故排在分水岭之后 |
 /// | 裸 F1–F12 | key_down 热键 | 不产出字符，空闲时 TSF 只有靠热键表才会转发 |
 ///
-/// ⚠ 单键**绝不能**编译进 key_down 热键表：`parse_hotkey("backtick")` 返回的是无修饰位的
-/// 裸 VK，进表后 TSF 会把它当热键转发并吞掉，该符号就再也打不出来了。
+/// 单个有字符的键绝不能编译进 key_down 热键表：TSF 会把它当热键吞掉，该符号就打不出来了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyActionRoute {
     /// 组合键：编译进 key_down 热键表。
@@ -188,19 +154,14 @@ pub const MOD_GENERIC_MASK: u32 = MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_WIN;
 /// 热键策略位（高位，发给 TSF；与 Go ipc.HotkeyPolicy* / TSF HOTKEY_POLICY_* 对齐）
 const HOTKEY_POLICY_CHINESE_ONLY: u32 = 0x40000000;
 const HOTKEY_POLICY_SESSION: u32 = 0x80000000;
-/// 全局拦截位（正交标记，与 CHINESE_ONLY 叠加）：TSF 侧在「中文模式 + 焦点在文本框」
-/// 时用 Win32 RegisterHotKey 把这些键注册为系统级热键，让 OS 在 WM_KEYDOWN 派发前
-/// 直接消费，规避 QQNT / Tabby 等 Chromium 类宿主无视 TSF pfEaten 契约的加速键双处理。
+/// 全局拦截位（可与 CHINESE_ONLY 叠加）：TSF 在「中文 + 文本框」时用 `RegisterHotKey` 注册成
+/// 系统热键，规避 Chromium 类宿主无视 `pfEaten` 的加速键双处理。
 const HOTKEY_POLICY_GLOBAL: u32 = 0x20000000;
-/// 「仅注册转发」标记：翻页键组 / 选词键组这类 action 为空的登记项——它们不是动作热键，
-/// 只是让 TSF 认得这些键、在有会话时转发给引擎；无会话时必须放行，由 TSF 下游的
-/// ClassifyInputKey 按普通标点处理（中文模式下要出中文标点）。
+/// 「仅注册转发」标记：翻页 / 选词键组这类 action 为空的登记项，有会话时转发给引擎，无会话时
+/// 放行给 TSF 下游按普通标点处理。
 ///
-/// ⚠ 真动作热键**绝不能**带此位。TSF 侧的「无 Ctrl/Alt 且无会话就不吃」闸门只认这个标记；
-/// 早先该闸门无差别地套在所有无 Ctrl/Alt 的 keydown 热键上，把 `shift+space`
-/// （toggle_full_width）一并放行了，而 Space 在下游只有「有会话」和「已是全角」两条
-/// 出路，半角空缓冲时无人接手 —— 严格 TSF 宿主（EverEdit）不再回调 OnKeyDown，
-/// 全半角切换彻底失效；宽松宿主（记事本/Chromium）照调 OnKeyDown 才碰巧还能用。
+/// 真动作热键绝不能带此位：TSF 的「无 Ctrl/Alt 且无会话就不吃」闸门只认它，带上的动作热键
+/// （如 `shift+space`）在空缓冲时会被放行而无人接手，严格 TSF 宿主下功能失效。
 const HOTKEY_POLICY_FORWARD_ONLY: u32 = 0x10000000;
 
 /// Windows 虚拟键码（toggle / select / page 用）
@@ -235,10 +196,8 @@ const VK_OEM_5: u32 = 0xDC; // \
 
 /// `keys.session_actions` 里 keyup 类绑定的 action 名。
 ///
-/// ★ **必须与 `toggle_mode` 区分开**。`is_toggle_mode_keycode` 按 action 过滤而非按键码
-/// ——若复用 `toggle_mode`，只把 CapsLock 配成翻页键的用户会在空闲敲 CapsLock 时莫名
-/// 切中英文。`select_key_groups` 进 keyup 表时已经踩过一次这个坑，`schema_bound` 是
-/// 第二次，本项是第三次；每次往 `key_up` 加东西都要重查这条。
+/// 必须与 `toggle_mode` 区分开：`is_toggle_mode_keycode` 按 action 过滤，复用的话把 CapsLock
+/// 配成翻页键的用户空闲敲它会莫名切中英文。每次往 `key_up` 加东西都要重查这条。
 pub const SESSION_ACTION: &str = "session_action";
 
 /// `f1`..`f12`（小写、无前导零）。
@@ -268,13 +227,9 @@ fn comment_switch_key_up_hashes(c: &crate::comment_lib::UiCommentConfig) -> Vec<
 
 /// 会话态键名 → (VK, 是否需 Shift)。支持单个 `shift+` 前缀。
 ///
-/// ⚠️ **这是 `wind_keys::keymap::session_key_name_to_vk` 的第二份实现**，因为
-/// `wind-config` 不能依赖 `wind-keys`（后者经 `wind-cmdbar` 反向依赖本 crate，加进去成环）。
-/// 本文件早已因同样的理由自带一份 VK 常量与键组展开表，这里延续该结构。
-///
-/// 两份表的一致性**没有编译期约束**，靠 `wind-coordinator` 的
-/// `session_key_tables_agree_across_crates` 守门（那里同时依赖两个 crate）。跨仓/跨 crate
-/// 契约漂移是本仓反复栽过的一类，别指望「改的时候会记得」。
+/// 这是 `wind_keys::keymap::session_key_name_to_vk` 的第二份实现：`wind-config` 依赖
+/// `wind-keys` 会成环。两份表的一致性靠 `wind-coordinator` 的
+/// `session_key_tables_agree_across_crates` 守门。
 pub fn session_key_to_vk(name: &str) -> Option<(u32, bool)> {
     let raw = name.trim().to_lowercase();
     let (shift, base) = match raw.strip_prefix("shift+") {
@@ -310,17 +265,9 @@ pub fn session_key_to_vk(name: &str) -> Option<(u32, bool)> {
         "slash" | "/" => VK_OEM_2,
         "backtick" | "grave" | "`" => VK_OEM_3,
         "backslash" | "\\" => VK_OEM_5,
-        // ★ 字母里**只收 z**。会话态查表（`apply_session_action`）排在大 match 的字母臂
-        // 之前，故收进来的字母在**有候选时**会被夺走、打不出以它接续的编码。z 是唯一
-        // 值得付这个代价的：它在多数码表里是最边缘的码元，且用户对「z 兼职功能键」已有
-        // 习惯（`z_key_action` 那条路早就这么用）。
-        //
-        // ⛔ 别顺手放开成全部字母：其余字母在任何码表里几乎都是活码前缀，配了等于把那个
-        // 字母在该方案里废掉，且没有任何提示。这与 `schema_key_actions` 的键名下拉「字母
-        // 只留 z」是同一条判据。
-        //
-        // ⚠️ 无会话时不受影响：导航类动词带 `requires_candidates` 守卫，空缓冲按 z 照常
-        // 起头组码。被夺走的只有「已出候选后再按 z」那一下（五笔的 zz 类短语）。
+        // 字母只收 z：会话态查表排在字母臂之前，收进来的字母在有候选时会被夺走。z 在多数码表里
+        // 最边缘、用户也习惯它兼职功能键；别放开成全部字母，那等于静默废掉活码前缀。无会话时
+        // 不受影响（导航类动词带 `requires_candidates` 守卫）。
         "z" => 0x5A,
         _ => return None,
     };
@@ -329,8 +276,8 @@ pub fn session_key_to_vk(name: &str) -> Option<(u32, bool)> {
 
 /// keyup-only 键（CapsLock / 四个纯修饰键）的 keyup hash；其余键返回 `None`。
 ///
-/// 这批键绑任何功能都只能走 keyup 轻敲（keydown 不能吃、`Ctrl+A` 会误触发、按住会连发），
-/// 判据同 `is_key_up_only_vk`。⚠️ CapsLock 与四个修饰键**不连号**，用区间判定会漏掉它。
+/// 这批键只能走 keyup 轻敲，判据同 `is_key_up_only_vk`。CapsLock 与四个修饰键不连号，
+/// 用区间判定会漏掉它。
 fn session_key_up_hash(vk: u32) -> Option<u32> {
     if vk == VK_CAPITAL {
         return Some(key_hash(MOD_CAPSLOCK, VK_CAPITAL));
@@ -373,11 +320,8 @@ impl CompiledHotkeys {
             .map(|e| e.action.as_str())
     }
 
-    /// 在 key_down 集合中按规范化 hash 查**吃键策略**。
-    ///
-    /// 供 `Coordinator::should_handle_key` 用（吃键判定的唯一真相源）。策略位本就在
-    /// 本文件定义，解码也放这里——此前只有 C++ 侧从 `tsf_hash` 高位解，
-    /// 判据实现分居两地，注释里那句「判据须与服务端保持单一真相源」就是这么来的。
+    /// 在 key_down 集合中按规范化 hash 查吃键策略。供 `Coordinator::should_handle_key` 用；
+    /// 策略位在本文件定义，解码也放这里。
     pub fn key_down_policy(&self, normalized_hash: u32) -> Option<KeyDownPolicy> {
         self.key_down
             .iter()
@@ -396,14 +340,12 @@ pub enum KeyDownPolicy {
     /// 仅中文模式 + 有会话时吃（置顶/删词，组合键见 [`number_template_mods`]；
     /// 无会话时宿主可能另有用途）。
     ///
-    /// ⚠️ 带本策略位的 keydown 条目在 TSF 侧还有**第二个消费者**：
-    /// `CTextService::_RegisterCandidateHotkeys` 会在候选可见期间把它们逐个
-    /// `RegisterHotKey` 成系统级热键——**那才是实际生效的通路**，`OnTestKeyDown`
-    /// 的白名单分支只是它失败时的退路。改本策略位的产出前先读
-    /// `docs/design/key-resolver-unification.md` §2.2 的那个警告框。
+    /// TSF 侧 `_RegisterCandidateHotkeys` 会在候选可见期间把这些条目 `RegisterHotKey` 成系统
+    /// 热键，那才是实际生效的通路。改本策略位的产出前先读
+    /// `docs/design/key-resolver-unification.md` §2.2。
     Session,
-    /// 仅注册转发（翻页键组 `-=`、选词键组 `;'`）：无会话时**放行并继续按常规按键
-    /// 逻辑判定**，不是直接不吃——中文模式下它们要当标点处理。
+    /// 仅注册转发（翻页键组 `-=`、选词键组 `;'`）：无会话时放行并继续按常规按键逻辑判定，
+    /// 中文模式下它们要当标点处理。
     ForwardOnly,
 }
 
@@ -426,20 +368,16 @@ fn key_hash(modifiers: u32, key_code: u32) -> u32 {
     (modifiers << 16) | (key_code & 0xFFFF)
 }
 
-/// 把一条**会话态**键名编译成 TSF 转发条目。返回 `(该进 key_up 表吗, 条目)`。
+/// 把一条会话态键名编译成 TSF 转发条目。返回 `(该进 key_up 表吗, 条目)`。
 ///
-/// ★ **分流规则的单一来源**：全局 `keys.session_actions` 与方案级 `[session_actions]`
-/// 共用本函数。两处各写一份的表现是「同一个键名在全局配能用、写进方案文件就不转发」——
-/// 而 TSF 不转发的键在服务端根本收不到，与「配错了」完全同形。
-///
-/// 按**键的形态**分两条路，与 `keys.key_actions` 的三分通路同构：
+/// 全局 `keys.session_actions` 与方案级 `[session_actions]` 共用本函数，是分流规则的单一来源。
+/// 按键的形态分两条路：
 /// - keyup-only 键（CapsLock / 纯修饰键）→ `key_up`，带 `SESSION` 位，让 C++ 区分
 ///   「toggle 语义」（恒吃 keydown）与「会话语义」（仅有会话时吃）；
 /// - 其余（功能键 + 可打印符号键）→ `key_down`，带 `FORWARD_ONLY` 位。
 ///
-/// ⚠️ `FORWARD_ONLY` 那条**必须**保留「无会话时放行给下游按标点处理」的语义：本函数收的
-/// 键名含减号、方括号、分号等可打印符号，吃掉就是丢键。见
-/// `docs/design/key-resolver-unification.md` §8 注意点 5。
+/// `FORWARD_ONLY` 必须保留「无会话时放行给下游」：这里收的键含可打印符号，吃掉就是丢键
+/// （见 `docs/design/key-resolver-unification.md` §8 注意点 5）。
 pub fn compile_session_key(name: &str) -> Option<(bool, HotkeyEntry)> {
     let (vk, shift) = session_key_to_vk(name)?;
     if let Some(hash) = session_key_up_hash(vk) {
@@ -506,9 +444,7 @@ impl Compiler {
             ("toggle_t2s", &h.toggle_t2s),
         ] {
             if let Some(raw) = parse_hotkey(value) {
-                // 加词类热键额外叠加 GLOBAL 位：TSF 侧在中文+文本框时 RegisterHotKey 全局拦截，
-                // 规避 Chromium 类宿主（QQNT/Tabby）的加速键双处理。其余 chinese-only 键不拦截，
-                // 避免不必要地抢占宿主快捷键。
+                // 加词类热键额外叠加 GLOBAL 位以穿透 Chromium 类宿主；其余 chinese-only 键不抢占。
                 let policy = if matches!(name, "add_word" | "open_add_word_dialog") {
                     HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL
                 } else {
@@ -522,22 +458,10 @@ impl Compiler {
             }
         }
 
-        // ── KeyDown：软键盘开关（GLOBAL，**不带 CHINESE_ONLY**） ──
-        //
-        // 策略位与 `key_actions` 里 `softkeyboard` 动词那条**逐位相同**，理由见
-        // `hotkey_action_entry` 中那段注释：面板画的是「键位 → 符号」的映射，跟当前是
-        // 中文还是英文模式没关系（英文态想打个 ℃ 同样合理），C++ 侧为此专设了软键盘总闸
-        // `IsSoftKeyboard()`；带上 CHINESE_ONLY 的话英文态连开都开不出来。GLOBAL 位保留，
-        // 规避 Chromium 类宿主无视 `pfEaten` 造成的双处理。
-        //
-        // ★ action 用动词原文 `"softkeyboard"`（不像 `special:` 那样改写成 `enter_*`）：
-        // 协调器的 `softkeyboard_hotkey` 认的就是这个串，本分支与 `key_actions` 那条通路
-        // 落到**同一个**分派臂，分派端零改动。
-        //
-        // ⚠️ 两条通路可以同时命中同一个键（用户层 `key_actions` 里还留着 v0.120.0 物化
-        // 灌进去的 `ctrl+shift+k = "softkeyboard"`）。`match_key_down` 是 `.find()`
-        // 先注册者赢，本分支在前 ⇒ 行为一致、不重复分派；设置页只读组会把这种同键
-        // 重复标橙提示用户清理。
+        // ── KeyDown：软键盘开关（GLOBAL，不带 CHINESE_ONLY） ──
+        // 策略位与 `key_actions` 里 `softkeyboard` 动词逐位相同（理由见 `hotkey_action_entry`），
+        // action 用动词原文，与那条通路落到同一个分派臂。两条通路可能同时登记同一个键：
+        // `match_key_down` 先注册者赢，本分支在前，行为一致、不重复分派。
         if let Some(raw) = parse_hotkey(&h.softkeyboard) {
             result.key_down.push(HotkeyEntry {
                 tsf_hash: raw | HOTKEY_POLICY_GLOBAL,
@@ -547,18 +471,9 @@ impl Compiler {
         }
 
         // ── KeyDown：临拼直达热键（CHINESE_ONLY | GLOBAL，与加词键同策略） ──
-        // 与引导键共存：热键路径进入时组合区不写引导符（分发点传 key_code=0）。
-        // GLOBAL 位使 TSF 在「中文 + 文本框」时 RegisterHotKey 全局拦截，穿透 QQNT/Tabby 等
-        // Chromium 宿主的加速键双处理。
-        //
-        // 特殊模式的直达热键**不在这里**：它已收编进 `keys.key_actions`（写作
-        // `"ctrl+shift+u" = "special:<方案id>"`），由上方的 `KeyActionRoute::Hotkey`
-        // 分支按动词取策略位编译。原先那段遍历 `schema.special_modes[].hotkey` 的循环
-        // 连同「id 为空则跳过」那条陷阱一并消失——身份现在就是方案 id，不可能为空。
-        //
-        // ★ action 用动词原文 `"temp_pinyin"`（`BoundAction` 的值域），不是早先那个分发端
-        // 专用的 `enter_temp_pinyin`：分派端现已统一用 `BoundAction::parse` 认串，本条与
-        // `key_actions` 里写 `"ctrl+;" = "temp_pinyin"` 落到**同一个**分派臂。
+        // 与引导键共存：热键路径进入时组合区不写引导符（分发点传 key_code=0）。action 用动词原文，
+        // 与 `key_actions` 里写 `temp_pinyin` 落到同一个分派臂。特殊模式的直达热键已收编进
+        // `keys.key_actions`（`special:<方案id>`），不在这里。
         let mode_policy = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL;
         if let Some(raw) = parse_hotkey(&self.config.input.temp_pinyin.hotkey) {
             result.key_down.push(HotkeyEntry {
@@ -568,27 +483,14 @@ impl Compiler {
             });
         }
 
-        // ── 方案直达热键在这里**没有**独立编译段 ──
-        // `keys.schema_hotkeys` 已废弃，改写进下方的 `keys.key_actions`（动词
-        // `switch_schema:<id>`）。**没有兼容折算**：加载期只由
-        // `Config::warn_legacy_schema_hotkeys` 告警一次随后清空，残留的老配置不生效
-        // （用户拍板不做向后兼容，见 044a2a1a）。
-        //
-        // 合表的理由之一正是本段自己造成的：它与 key_actions 编译进**同一张**
-        // key_down 表，而 `match_key_down` 是 `.find()` 先注册者赢——本段排在前面，于是同一个
-        // 键两处都配时 key_actions 那条静默失效。另一条是本段**不问键形态**地把解析结果塞进
-        // key_down 表（下方 key_actions 走 `route_of_key_action` 三分），单字符键进表会被 TSF
-        // 当热键吞掉，那个符号从此打不出来。
-        //
-        // ⚠ 别在这里"顺手"把它加回来：加回来这两个洞就一起回来了。
+        // 方案直达热键没有独立编译段：`keys.schema_hotkeys` 已废弃（加载期由
+        // `Config::warn_legacy_schema_hotkeys` 告警后清空），改写进 `keys.key_actions` 的
+        // `switch_schema:<id>`。别在这里加回来：独立段会抢先注册而让 key_actions 同键静默失效，
+        // 且不问键形态，单字符键进表会被 TSF 吞掉。
 
         // ── KeyDown：按键功能表（keys.key_actions）──
-        // 策略位**逐动词**取自 `hotkey_action_entry`，本段自己不定位——同一个位在两类动词上
-        // 后果相反（切方案带 CHINESE_ONLY 就成单程票，进 overlay 不带就会在英文态凭空触发），
-        // 那张表是这批判断的单点，分组理由见其文档。
-        //
-        // BTreeMap 遍历即有序，无需像 schema_hotkeys 那样显式排序：撞键时的胜者顺序
-        // 在任何进程里都一致。
+        // 策略位逐动词取自 `hotkey_action_entry`，本段不自定。BTreeMap 遍历有序，撞键时的胜者在
+        // 任何进程里都一致。
         for (key, action) in &h.key_actions {
             let action = action.trim();
             if key.is_empty() || action.is_empty() {
@@ -604,16 +506,9 @@ impl Compiler {
             };
             match route {
                 KeyActionRoute::Hotkey => {
-                    // 显式 `none` = 用户在本层表态「这个键别干活」，用来压制**更低层**
-                    // 写在同一张表里的绑定（L2 出厂 / L2.5 定制版）。`merge_value` 与
-                    // `merge_toml` 都只能新增/覆盖、表达不了删除，所以「禁用」只能靠
-                    // 显式值承载——语义与单键、修饰键两条通路的 `BoundAction::None`
-                    // 逐条对应，见 `Coordinator::bound_action_with_source_layered`。
-                    //
-                    // ★ 必须在取策略位**之前**静默跳过。落到下面那句 warn 的话，会把
-                    // 「用户主动禁用」报成「配置写错了」——而这是一条预期内的配法。
-                    // `none` 与「动词写错了」在 `BoundAction::parse` 眼里都是 `None`，
-                    // 两者只能靠这里的先后顺序分开。
+                    // 显式 `none` 用来压制更低层（出厂 / 定制版）的同键绑定：层叠合并表达不了删除。
+                    // 必须在取策略位之前静默跳过：它与写错的动词在 `BoundAction::parse` 眼里都是 `None`，
+                    // 落到下面会被误报成配置错误。
                     if action.eq_ignore_ascii_case("none") {
                         debug!("keys.key_actions: {key:?} 显式禁用（none），不进热键表");
                         continue;
@@ -636,8 +531,7 @@ impl Compiler {
                         policy
                     };
                     result.key_down.push(HotkeyEntry {
-                        // match_hash 恒不含策略位——策略位是给 TSF 看的转发/抢占指示，
-                        // 服务端匹配只认裸 hash（与 enter_special / add_word 同构）。
+                        // match_hash 恒不含策略位：策略位只给 TSF 看，服务端匹配只认裸 hash。
                         tsf_hash: raw | policy,
                         match_hash: raw,
                         action: dispatch_action,
@@ -655,8 +549,7 @@ impl Compiler {
                         });
                     }
                 }
-                // 单个有字符的键：**不进任何热键表**。进了 TSF 就会把它当热键吞掉，
-                // 该符号再也打不出来。由引导键链（`bound_action_for`）查配置消费。
+                // 单个有字符的键不进任何热键表（进了会被 TSF 吞掉），由引导键链（`bound_action_for`）消费。
                 KeyActionRoute::LeadingKey => {}
             }
         }
@@ -669,16 +562,10 @@ impl Compiler {
         }
 
         // ── KeyDown：上屏注释 / 拼音（`input.alt_commit`，SESSION policy）──
-        //
-        // Alt+0..9 与 Alt+Space，只带 SESSION 位——与置顶/删除同一档：TSF 只在「中文 + 有会话」
-        // 时吃（`OnTestKeyDown` / `OnKeyDown` 两道闸门都按这个位判），候选可见期间才被
-        // `_RegisterCandidateHotkeys` 抢占成系统热键，其余时候 Alt+数字（宿主菜单加速键）、
-        // Alt+空格（窗口系统菜单）原样归宿主。action 为空＝仅转发，语义在协调器
-        // `try_alt_commit` 分派。
-        //
-        // ★ 必须排在 key_actions 与数字模板**之后**，且撞键就**不登记**：用户在 key_actions
-        // 里绑过的 Alt 组合让位给用户。只靠 `.find()` 先到先得不够——TSF 那侧的白名单是按
-        // 策略位分桶的集合，同一个 hash 同时进 SESSION 桶会改变用户绑定的吃键条件。
+        // Alt+0..9 与 Alt+Space 只带 SESSION 位：TSF 只在「中文 + 有会话」时吃，其余时候归宿主
+        // （菜单加速键、窗口系统菜单）。action 为空＝仅转发，语义在协调器 `try_alt_commit`。
+        // 必须排在 key_actions 与数字模板之后，且撞键就不登记：TSF 白名单按策略位分桶，同一 hash
+        // 再进 SESSION 桶会改变用户绑定的吃键条件。
         if crate::config::AltCommit::effective(&self.config) != crate::config::AltCommit::Off {
             for vk in std::iter::once(VK_SPACE).chain(0x30..=0x39) {
                 let raw = key_hash(MOD_ALT, vk);
@@ -695,20 +582,9 @@ impl Compiler {
         }
 
         // ── 会话态按键功能表（keys.session_actions）──
-        //
-        // 数据源是 `effective_session_actions()`＝四组键组配置的展开结果 ⊕ `session_actions`
-        // （后者优先）。⚠️ **不能**直接读 `config.keys.session_actions`：那只是用户显式配的
-        // 那部分，漏掉四组键组展开的键，表现是翻页/选词键全失效。
-        //
-        // ★ 按**键的形态**分两条路，与五c 给 `keys.key_actions` 做的分流同构：
-        //   - keyup-only 键（CapsLock / 纯修饰键）→ `key_up` 表，带 SESSION 位，让 C++ 区分
-        //     「toggle 语义」（恒吃 keydown）与「会话语义」（仅有会话时吃）；
-        //   - 其余（功能键 + 可打印符号键）→ `key_down` 表，带 FORWARD_ONLY 位。
-        //
-        // ⚠️ 功能键（Tab / PgUp / 方向键）本就在 C++ 的 `_IsSessionKey` 表里、有会话时免费
-        //    转发，登记与否都能工作。这里**仍照旧全部登记**：旧的 `compile_page_key_group`
-        //    就是这么做的，收编时顺手改可达性会把一次配置重构变成一次跨进程行为变更，
-        //    而后者只有真机才验得了。
+        // 数据源是 `effective_session_actions()`（键组展开 ⊕ `session_actions`），不能直接读
+        // `config.keys.session_actions`，否则漏掉键组展开的键。分流见 `compile_session_key`。
+        // 功能键（Tab / PgUp / 方向键）C++ 侧有会话时本就转发，仍全部登记，不改跨进程行为。
         for (name, verb) in &self.config.effective_session_actions() {
             if !crate::config::SessionAction::parse(verb).is_enabled() {
                 continue;
@@ -758,11 +634,8 @@ impl Compiler {
         }
 
         // ── KeyUp：注释切换键（`ui.comment.switch_key` 选 Ctrl 系）──
-        //
-        // 候选显示时 TSF 无条件如实上报 Ctrl（`EVENT_MOD_*`），用不着这条；它是 TSF 判无会话、
-        // 服务端却有候选时的退路：TSF 判过单击才转发 Ctrl 的松开，不登记就收不到。TSF 对修饰键
-        // keyup 不看 SESSION 位：有文本上下文就记待判、两向都不吃，无候选时服务端回 PassThrough。
-        // 已被上面登记过的键不再追加——那些功能优先，键本来就会送到。
+        // TSF 判无会话、服务端却有候选时的退路：不登记就收不到 Ctrl 的松开。无候选时服务端回
+        // PassThrough。已被上面登记过的键不再追加。
         for hash in comment_switch_key_up_hashes(&self.config.ui.comment) {
             if result.key_up.iter().any(|e| e.match_hash == hash) {
                 continue;
@@ -774,12 +647,8 @@ impl Compiler {
             });
         }
 
-        // 二三候选键（含修饰键组 lrshift / lrctrl）的登记已并入上面的 `session_actions` 段
-        // ——它按键的形态自动分流：可打印键进 key_down + FORWARD_ONLY，修饰键进 key_up。
-        //
-        // ⚠️ 同一个键可能既是切换键又是选词键（两条登记同 hash）：TSF 侧白名单是集合，重复
-        // 无害；服务端按 action 区分，切换只认 action=="toggle_mode"，故消费端**不能**用
-        // 「key_up 里有这个 key_code」当切换判据（见 is_toggle_mode_keycode）。
+        // 同一个键可能既是切换键又是选词键（同 hash 两条登记）：TSF 白名单是集合、重复无害；
+        // 服务端切换只认 action=="toggle_mode"，别用「key_up 里有这个 key_code」当切换判据。
 
         warn_global_hotkey_overflow(&result.key_down);
 
@@ -794,19 +663,14 @@ impl Compiler {
 
 /// Win32 `RegisterHotKey` 的槽位上限：带 `GLOBAL` 位的条目超过这么多就有一部分注册不上。
 ///
-/// 与 `wind_tsf/src/TextService.cpp` 的 `kHotkeyIdAddWordBase + 16` 对齐。那边超出后
-/// **静默 `break`**，只留一行 `registered=%d/%d` 的 debug 日志——说得出「少注册了几个」，
-/// 说不出「是哪几个键」（DLL 那侧只有 rawHash，翻不回键名）。
+/// 与 `wind_tsf/src/TextService.cpp` 的 `kHotkeyIdAddWordBase + 16` 对齐；那边超出后静默
+/// `break`，且翻不回键名。
 const GLOBAL_HOTKEY_SLOTS: usize = 16;
 
 /// 带 `GLOBAL` 位的条目超过槽位上限时告警，并点名会失效的那几个。
 ///
-/// ★ **这里是唯一说得出人话的地方**：本函数既知道数量、又还拿着用户写的键名。
-///
-/// 触发条件真实可达（不是恒假的护栏）：出厂基线只有 2~4 条带 GLOBAL，但
-/// `keys.key_actions` 里每绑一个进 overlay 的动词就加一条，绑满十来个组合键就会顶到上限。
-/// 2026-09-18 组合键值域合流后 `temp_english` / `aux_code` / `mix:` 也进了这一族，
-/// 从「结构上不可能顶到」变成了「结构上可能」。
+/// 这里是唯一既知道数量、又拿着用户键名的地方。触发真实可达：`keys.key_actions` 每绑一个
+/// 进 overlay 的动词就多一条 GLOBAL。
 fn warn_global_hotkey_overflow(key_down: &[HotkeyEntry]) {
     let (total, dropped) = global_hotkey_overflow(key_down);
     if dropped.is_empty() {
@@ -818,10 +682,8 @@ fn warn_global_hotkey_overflow(key_down: &[HotkeyEntry]) {
     );
 }
 
-/// 超限判定本体，抽出来是为了**可测**：`warn!` 只在日志里，断言不到。
-///
-/// 返回 `(带 GLOBAL 的总数, 注册不上的那些的动词)`。超出的是**靠后**的那些：
-/// TSF 侧按 `GlobalHotkeys()` 的顺序注册，填满即 break。
+/// 超限判定本体（抽出来以便测试）。返回 `(带 GLOBAL 的总数, 注册不上的那些的动词)`；
+/// 超出的是靠后的那些，TSF 按 `GlobalHotkeys()` 的顺序注册，填满即 break。
 fn global_hotkey_overflow(key_down: &[HotkeyEntry]) -> (usize, Vec<&str>) {
     let globals: Vec<&HotkeyEntry> = key_down
         .iter()
@@ -849,9 +711,7 @@ fn compile_toggle_mode_key(key: &str) -> Option<u32> {
 /// 纯修饰键 VK → keyup hash（含通用位+具体位）。方案级 `[key_actions]` 绑修饰键时，
 /// 用它把该键登记进 `key_up` 转发集——不登记 TSF 就不发这个 keyup，绑定形同虚设。
 ///
-/// 与 [`compile_toggle_mode_key`] 同格式但入参是 VK 而非键名：调用方（协调器）手里
-/// 已经是解析好的 VK（`keymap::modifier_name_to_vk`），再转回字符串只为了重新解析
-/// 一次，中间多一层拼写契约就多一处静默失配的机会。
+/// 与 [`compile_toggle_mode_key`] 同格式，但入参是调用方已解析好的 VK，免得多一层拼写契约。
 pub fn compile_modifier_key_up_hash(vk: u32) -> Option<u32> {
     match vk {
         VK_LSHIFT => Some(key_hash(MOD_SHIFT | MOD_LSHIFT, VK_LSHIFT)),
@@ -864,24 +724,17 @@ pub fn compile_modifier_key_up_hash(vk: u32) -> Option<u32> {
 
 /// 候选操作热键模板（`keys.pin_candidate` / `keys.delete_candidate`）→ 期望的修饰位集合。
 ///
-/// 这两项的值是**模板**而非普通热键串：`number` 是数字键组 0–9 的占位符，一条模板展开成
-/// 10 个键。值域故意收窄成下面这几项；`none`（以及任何其它值）返回 `None` ＝不绑定。
+/// 值是模板：`number` 是数字键组 0–9 的占位符，一条展开成 10 个键。值域故意收窄成下面几项
+/// （`alt+number` 会撞宿主菜单加速键）；其它值返回 `None` ＝不绑定。
 ///
-/// ★ **编译端与消费端的唯一真相源**。编译端（[`compile_number_hotkey`]）拿它算 TSF 转发表，
-/// 消费端（`Coordinator::match_candidate_action_key`）拿它判命中。两边各写一份白名单的话，
-/// 加一个取值只改一边的表现是「TSF 转发了但没人认」或「认得但 TSF 根本不发」——两种都不报错、
-/// 只是按下去毫无反应。
-///
-/// ⚠️ 返回值必须与实际修饰位做**相等**比较，不能按位包含：`ctrl+number` 的位集合是
-/// `ctrl+alt+number` 的**子集**，用包含判据的话前者会把后者的按键恒久劫走。
+/// 编译端（[`compile_number_hotkey`]）与消费端（`Coordinator::match_candidate_action_key`）的
+/// 唯一真相源。返回值必须与实际修饰位做相等比较：`ctrl+number` 是 `ctrl+alt+number` 的子集。
 pub fn number_template_mods(template: &str) -> Option<u32> {
     match template.trim().to_lowercase().as_str() {
         "ctrl+number" => Some(MOD_CTRL),
         "ctrl+shift+number" => Some(MOD_CTRL | MOD_SHIFT),
-        // Ctrl+Alt+数字：给「置顶」与「删除」各留一个不与出厂值冲突的备选。
-        // ⚠️ 欧洲键盘布局的 AltGr ＝ Ctrl+Alt，那些布局下本组合会与字符输入撞车；
-        // TSF 侧无法可靠区分真 Ctrl+Alt 与 AltGr。**有意不处理**——本项目是中文输入法，
-        // 目标用户是 US/CN 布局。想改主意的话，判据不在这里，在 TSF 的按键来源。
+        // Ctrl+Alt+数字：给「置顶」与「删除」各留一个不与出厂值冲突的备选。欧洲布局的 AltGr
+        // ＝ Ctrl+Alt 会与字符输入撞车，有意不处理（目标用户是 US/CN 布局）。
         "ctrl+alt+number" => Some(MOD_CTRL | MOD_ALT),
         _ => None,
     }
@@ -903,21 +756,6 @@ fn compile_number_hotkey(template: &str) -> Vec<HotkeyEntry> {
         })
         .collect()
 }
-
-// 选词键组 / 以词定字键组的四个解析器（`compile_select_key_group`、
-// `compile_select_modifier_group`、`select_key_vks`、`select_char_vks`）已随三期收编删除。
-//
-// 它们的职责现在由两处承担：**编译**走上面的 `session_actions` 段（按键的形态自动分流到
-// key_down + FORWARD_ONLY 或 key_up），**折算**走 `Config::select_key_group_binds` /
-// `select_char_group_binds`（组名 → 具体键 + 动词）。
-//
-// ★ 删而不是留着不用：这四个函数与 `session_actions` 是**平行的第二套真相源**，留着就是
-// 「两处慢慢漂移」的种子。此前 `select_key_vks`（不含 brackets）与 `select_char_vks`
-// （含 brackets）就被张冠李戴过一次，`brackets` 配置静默失效——收编后两者靠**动词**区分，
-// 那类错配从结构上消失了。
-//
-// 修饰键为什么只能走 keyup（三条独立理由：keydown 不能吃 / `Ctrl+A` 首下会误选 / 长按
-// 连发），见 `keymap::is_key_up_only_vk` 的文档。
 
 /// 计算 key_hash（与 wind-ipc::protocol::calc_key_hash 对齐）
 fn calc_key_hash(modifiers: u32, key_code: u32) -> u32 {
@@ -1044,1240 +882,6 @@ fn parse_key_name(name: &str) -> Option<u32> {
     }
 }
 
-// `parse_hotkey_prefix`（"ctrl+shift+number" → (modifiers, has_number)）已删除：全仓无调用者，
-// 而它做的事正是 [`number_template_mods`] 的事。留着就是同一份逻辑的第三份写法——本仓已经因为
-// 「两份手写清单慢慢漂移」翻过车（`hotkey_action_entry` 白名单 vs 设置页 `verb_allowed`）。
-//
-// ★ 它与 `number_template_mods` 有一处**语义差异**，不是等价物：它「解析得动就收」，
-// `alt+number`、`win+number` 都会返回一个修饰位；而模板值域是**白名单**，只认那几项。
-// 后者是有意的——放开值域会引入一批「配了但静默失效」的取值（`alt+number` 撞宿主菜单
-// 加速键与小键盘 Unicode 输入），而失效点在 TSF 侧，用户这边只看到「按了没反应」。
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn comment_switch_ctrl_registers_key_up_with_session_bit() {
-        use crate::comment_lib::{SwitchKey, SwitchMode};
-        let up_of = |key: SwitchKey, mode: SwitchMode, toggle: &[&str]| {
-            let mut cfg = Config::default();
-            cfg.ui.comment.switch_key = key;
-            cfg.ui.comment.switch_mode = mode;
-            cfg.keys.toggle_mode_keys = toggle.iter().map(|s| s.to_string()).collect();
-            cfg.keys.session_actions.clear();
-            cfg.keys.select_key_groups.clear();
-            Compiler::new(cfg)
-                .compile()
-                .key_up
-                .into_iter()
-                .filter(|e| e.action == COMMENT_SWITCH_ACTION)
-                .map(|e| e.tsf_hash)
-                .collect::<Vec<_>>()
-        };
-        let l = key_hash(MOD_CTRL | MOD_LCTRL, VK_LCONTROL);
-        let r = key_hash(MOD_CTRL | MOD_RCTRL, VK_RCONTROL);
-        let s = HOTKEY_POLICY_SESSION;
-        assert_eq!(
-            up_of(SwitchKey::Ctrl, SwitchMode::Session, &[]),
-            [l | s, r | s]
-        );
-        assert_eq!(up_of(SwitchKey::LCtrl, SwitchMode::Persist, &[]), [l | s]);
-        assert_eq!(up_of(SwitchKey::RCtrl, SwitchMode::Hold, &[]), [r | s]);
-        assert!(up_of(SwitchKey::Ctrl, SwitchMode::Off, &[]).is_empty());
-        assert!(up_of(SwitchKey::Alt, SwitchMode::Session, &[]).is_empty());
-        // 已是中英切换键的那一侧不再登记，切换键条目不改它的吃键条件。
-        assert_eq!(
-            up_of(SwitchKey::Ctrl, SwitchMode::Session, &["lctrl"]),
-            [r | s]
-        );
-    }
-
-    #[test]
-    fn test_parse_simple_key() {
-        let hash = parse_hotkey("lshift").unwrap();
-        assert_eq!(hash, 0xA0); // no modifiers, key=0xA0
-    }
-
-    #[test]
-    fn test_parse_ctrl_space() {
-        let hash = parse_hotkey("Ctrl+Space").unwrap();
-        assert_eq!(hash, (MOD_CTRL << 16) | 0x20);
-    }
-
-    #[test]
-    fn test_parse_ctrl_shift_e() {
-        let hash = parse_hotkey("ctrl+shift+e").unwrap();
-        assert_eq!(hash, ((MOD_CTRL | MOD_SHIFT) << 16) | 0x45);
-    }
-
-    #[test]
-    fn test_parse_shift_space() {
-        let hash = parse_hotkey("shift+space").unwrap();
-        assert_eq!(hash, (MOD_SHIFT << 16) | 0x20);
-    }
-
-    #[test]
-    fn test_parse_ctrl_dot() {
-        let hash = parse_hotkey("ctrl+.").unwrap();
-        assert_eq!(hash, (MOD_CTRL << 16) | 0xBE);
-    }
-
-    #[test]
-    fn test_parse_ctrl_equal() {
-        let hash = parse_hotkey("ctrl+equal").unwrap();
-        assert_eq!(hash, (MOD_CTRL << 16) | 0xBB);
-    }
-
-    #[test]
-    fn test_parse_empty() {
-        assert!(parse_hotkey("").is_none());
-    }
-
-    #[test]
-    fn test_toggle_mode_key_includes_specific_modifier() {
-        // 关键回归：lshift 的 keyUp hash 必须同时含通用位(MOD_SHIFT)和具体位(MOD_LSHIFT)，
-        // 否则 C++ TSF 算出的 0x1100A0 在白名单里找不到 → Shift 切换失效。
-        let lshift = compile_toggle_mode_key("lshift").unwrap();
-        assert_eq!(lshift, key_hash(MOD_SHIFT | MOD_LSHIFT, VK_LSHIFT));
-        assert_eq!(lshift, 0x0011_00A0);
-
-        let rshift = compile_toggle_mode_key("rshift").unwrap();
-        assert_eq!(rshift, key_hash(MOD_SHIFT | MOD_RSHIFT, VK_RSHIFT));
-        assert_eq!(rshift, 0x0021_00A1);
-    }
-
-    #[test]
-    fn test_number_hotkey_expands_to_ten_session_keys() {
-        let entries = compile_number_hotkey("ctrl+shift+number");
-        assert_eq!(entries.len(), 10);
-        // tsf_hash 含 session policy 位；match_hash 为 raw
-        assert!(entries[0].tsf_hash & HOTKEY_POLICY_SESSION != 0);
-        assert_eq!(entries[0].match_hash, key_hash(MOD_CTRL | MOD_SHIFT, 0x30));
-        assert!(compile_number_hotkey("none").is_empty());
-    }
-
-    #[test]
-    fn test_number_template_mods_is_whitelist_not_parser() {
-        // 白名单，不是「解析得动就收」：值域外的写法一律不绑定（含已删除的
-        // `parse_hotkey_prefix` 曾经会放行的 alt/win 变体）。
-        assert_eq!(number_template_mods("ctrl+number"), Some(MOD_CTRL));
-        assert_eq!(
-            number_template_mods("Ctrl+Shift+Number"), // 大小写/空白不敏感
-            Some(MOD_CTRL | MOD_SHIFT)
-        );
-        assert_eq!(number_template_mods(" ctrl+number "), Some(MOD_CTRL));
-        assert_eq!(
-            number_template_mods("ctrl+alt+number"),
-            Some(MOD_CTRL | MOD_ALT)
-        );
-        for bad in ["none", "", "alt+number", "win+number", "ctrl+shift+e"] {
-            assert_eq!(number_template_mods(bad), None, "{bad:?} 不该被接受");
-        }
-    }
-
-    #[test]
-    fn test_number_template_mods_are_pairwise_distinct() {
-        // 回归：消费端按**相等**比较修饰位，前提是任意两项的位集合不相等。
-        // （更强的性质——不存在子集关系——已不再要求：等值判据对子集免疫，
-        //   这正是 `ctrl+alt+number` 能安全加进值域的原因。）
-        let all = ["ctrl+number", "ctrl+shift+number", "ctrl+alt+number"];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(
-                    number_template_mods(a),
-                    number_template_mods(b),
-                    "{a:?} 与 {b:?} 修饰位相同，等值判据无法区分"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_compile_switch_engine_match_hash() {
-        let mut cfg = Config::default();
-        cfg.keys.switch_engine = "ctrl+shift+e".to_string();
-        cfg.keys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
-        let compiled = Compiler::new(cfg).compile();
-        // switch_engine 无 policy 位，match_hash == tsf_hash == 0x30045
-        let se = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "switch_engine")
-            .unwrap();
-        assert_eq!(se.match_hash, key_hash(MOD_CTRL | MOD_SHIFT, 0x45));
-        assert_eq!(se.tsf_hash, se.match_hash);
-        // 规范化匹配：带 L/R 具体位的入站事件也能命中
-        assert_eq!(
-            compiled.match_key_down(key_hash(MOD_CTRL | MOD_SHIFT, 0x45)),
-            Some("switch_engine")
-        );
-        // 出厂的注释切换键（Ctrl）另有两条，不计。
-        assert_eq!(
-            compiled
-                .key_up
-                .iter()
-                .filter(|e| e.action == "toggle_mode")
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn open_add_word_dialog_registered_chinese_only() {
-        let mut cfg = Config::default();
-        cfg.keys.open_add_word_dialog = "ctrl+shift+equal".to_string();
-        let compiled = Compiler::new(cfg).compile();
-        // action 串应出现在 key_down 组
-        assert!(
-            compiled
-                .key_down
-                .iter()
-                .any(|e| e.action == "open_add_word_dialog"),
-            "open_add_word_dialog 应注册进 key_down"
-        );
-    }
-
-    /// 把 (键名, 动词) 对拼成 `keys.session_actions`。测试直接构造 `Compiler`、不经
-    /// `Config::normalize`，故须显式写出折算后的形态。
-    fn session_actions(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    /// 清空四组键组配置，使 `effective_session_actions()` 只剩显式表。
-    ///
-    /// 出厂默认里 `page_keys` / `highlight_keys` / `select_key_groups` **都非空**，
-    /// 不清的话每个用例都会多出十来个折算来的键，断言「只该有这几个」必然失败。
-    fn only_explicit(cfg: &mut Config) {
-        cfg.keys.page_keys.clear();
-        cfg.keys.highlight_keys.clear();
-        cfg.keys.select_key_groups.clear();
-        cfg.keys.select_char_keys.clear();
-    }
-
-    /// ★★★ 四组键组配置必须经 `effective_session_actions()` 进 TSF 转发表。
-    ///
-    /// 2026-08-11 回归守门：折算从 `normalize` 移到消费层视图后，本编译器若仍直接读
-    /// `config.keys.session_actions`（只有用户显式配的那部分），出厂默认的翻页/选词键
-    /// **一个都不会进转发表**——表现是升级后翻页键、次选键全部失效，而配置文件看着好好的。
-    #[test]
-    fn key_group_config_reaches_forward_set_without_explicit_table() {
-        let cfg = Config::default();
-        assert!(
-            cfg.keys.session_actions.is_empty(),
-            "前置条件：出厂默认不该有显式会话态绑定，否则本测试证明不了什么"
-        );
-        let compiled = Compiler::new(cfg).compile();
-        // 默认 page_keys 含 pageupdown、highlight_keys 含 arrows、select_key_groups 含 semicolon_quote。
-        for (vk, label) in [
-            (VK_PRIOR, "PageUp（page_keys 默认）"),
-            (VK_NEXT, "PageDown（page_keys 默认）"),
-            (VK_UP, "↑（highlight_keys 默认）"),
-            (VK_OEM_1, "分号（select_key_groups 默认）"),
-        ] {
-            assert!(
-                compiled
-                    .key_down
-                    .iter()
-                    .any(|e| e.match_hash & 0xFFFF == vk
-                        && e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0),
-                "{label} 未进 FORWARD_ONLY 转发集——四组键组配置没被编译进去"
-            );
-        }
-    }
-
-    #[test]
-    fn ctrl_arrow_forward_registration_can_be_disabled() {
-        let mut cfg = Config::default();
-        let has = |c: &Config, vk: u32| {
-            Compiler::new(c.clone())
-                .compile()
-                .key_down
-                .iter()
-                .any(|e| e.match_hash == key_hash(MOD_CTRL, vk))
-        };
-        assert!(
-            has(&cfg, VK_LEFT) && has(&cfg, VK_RIGHT),
-            "出厂转发 Ctrl+←/→"
-        );
-        cfg.keys.session_actions = session_actions(&[("ctrl+left", "none")]);
-        assert!(!has(&cfg, VK_LEFT), "写 none 后 Ctrl+← 不再转发");
-        assert!(has(&cfg, VK_RIGHT), "另一个方向不受影响");
-    }
-
-    #[test]
-    fn forward_only_bit_marks_page_and_select_keys_only() {
-        let mut cfg = Config::default();
-        only_explicit(&mut cfg);
-        cfg.keys.toggle_full_width = "shift+space".to_string();
-        // 等价于旧的 `page_keys = ["minus_equal", "shift_tab"]` +
-        // `select_key_groups = ["semicolon_quote"]` 折算后的样子。
-        cfg.keys.session_actions = session_actions(&[
-            ("minus", "page_prev"),
-            ("equal", "page_next"),
-            ("shift+tab", "page_prev"),
-            ("tab", "page_next"),
-            ("semicolon", "select_candidate:2"),
-            ("quote", "select_candidate:3"),
-        ]);
-        let compiled = Compiler::new(cfg).compile();
-
-        // ⚠ 判据不能用「action 为空」：pin/delete 候选的数字热键 action 同样是空串
-        //（动作由服务端按 hash 自认），它们是 session 热键、不该带 FORWARD_ONLY。
-        // 只有会话态键才是仅注册转发，故按 raw hash 精确点名。
-        let forward_only_raw: Vec<u32> = vec![
-            key_hash(0, VK_OEM_MINUS),
-            key_hash(0, VK_OEM_PLUS),
-            key_hash(MOD_SHIFT, VK_TAB),
-            key_hash(0, VK_TAB),
-            key_hash(0, VK_OEM_1),
-            key_hash(0, VK_OEM_7),
-            // 出厂注释切换键 F1 补进会话按键表，同样只是转发登记。
-            key_hash(0, 0x70),
-            // Ctrl+←/→ 整音节跳：会话键表不带 Ctrl，由编译器单独登记转发。
-            key_hash(MOD_CTRL, VK_LEFT),
-            key_hash(MOD_CTRL, VK_RIGHT),
-        ];
-        assert_eq!(
-            forward_only_raw.len(),
-            9,
-            "样例绑定应展开出 6 个键，另加 F1 与 Ctrl+←/→"
-        );
-
-        for e in &compiled.key_down {
-            let expected = forward_only_raw.contains(&e.match_hash);
-            assert_eq!(
-                e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0,
-                expected,
-                "hash=0x{:08X} action={:?} 的 FORWARD_ONLY 位不符预期",
-                e.tsf_hash,
-                e.action
-            );
-            // match_hash 是服务端匹配用的裸 hash，任何 policy 位都不该混进去
-            assert_eq!(e.match_hash & HOTKEY_POLICY_FORWARD_ONLY, 0);
-        }
-
-        // 定桩：shift+space 无任何 policy 位，TSF 侧必须无条件吃。
-        let fw = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "toggle_full_width")
-            .expect("toggle_full_width 应在 key_down 组");
-        assert_eq!(fw.tsf_hash, fw.match_hash);
-        assert_eq!(fw.tsf_hash, key_hash(MOD_SHIFT, 0x20));
-    }
-
-    /// 修饰键作选词键时只进 key_up，绝不进 key_down。
-    ///
-    /// 回归点：曾与 `;'` 一起注册进 key_down，而 TSF 的 keydown 查表用的是「通用修饰位 +
-    /// 笼统 VK_CONTROL」，两个维度都对不上这里登记的「具体位 + VK_LCONTROL」，于是这项配置
-    /// 端到端从未生效过——且即便对上了也不能吃（纯修饰键 keydown 必须放行）。
-    ///
-    /// ⚠️ 三期收编后 action 从 `select_candidate` 改为统一的 `session_action`。这是安全的：
-    /// 该 action 名对 keyup 选词**没有功能作用**（`handle_select_key_up` 只按 VK 查偏移），
-    /// 唯一读 action 的是 `is_toggle_mode_keycode`，而它只认 `toggle_mode`。
-    #[test]
-    fn select_modifier_group_registers_on_key_up_only() {
-        let mut cfg = Config::default();
-        cfg.keys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
-        // 等价于旧的 `select_key_groups = ["lrctrl"]` 折算后的样子。
-        cfg.keys.session_actions = session_actions(&[
-            ("lctrl", "select_candidate:2"),
-            ("rctrl", "select_candidate:3"),
-        ]);
-        let compiled = Compiler::new(cfg).compile();
-
-        assert!(
-            !compiled
-                .key_down
-                .iter()
-                .any(|e| matches!(e.match_hash & 0xFFFF, VK_LCONTROL | VK_RCONTROL)),
-            "修饰键选词键不得出现在 key_down"
-        );
-        let sel: Vec<&HotkeyEntry> = compiled
-            .key_up
-            .iter()
-            .filter(|e| e.action == SESSION_ACTION)
-            .collect();
-        assert_eq!(sel.len(), 2, "lrctrl 应展开出左右两个 keyup 登记");
-        assert_eq!(
-            sel[0].match_hash,
-            key_hash(MOD_CTRL | MOD_LCTRL, VK_LCONTROL)
-        );
-        assert_eq!(
-            sel[1].match_hash,
-            key_hash(MOD_CTRL | MOD_RCTRL, VK_RCONTROL)
-        );
-        // 与 toggle 登记同格式（通用位+具体位），否则 C++ GetCurrentModifiers 的双位哈希对不上。
-        assert_eq!(
-            compiled
-                .key_up
-                .iter()
-                .filter(|e| e.action == "toggle_mode")
-                .count(),
-            2,
-            "切换键登记不应被选词登记挤掉"
-        );
-    }
-
-    /// 用户诉求二：`capslock = "page_prev"`。CapsLock 只有 keyup 到得了服务端，故必须进
-    /// `key_up` 表并带 SESSION 位——C++ 靠这个位区分「toggle 语义」（恒吃 keydown）与
-    /// 「会话语义」（仅有会话时吃）。
-    ///
-    /// ★★ 回归保护：action **不能**是 `toggle_mode`。`is_toggle_mode_keycode` 按 action
-    /// 过滤，混用会让「只把 CapsLock 配成翻页键」的用户在空闲敲 CapsLock 时莫名切中英文。
-    /// 这是第三次触碰该判据（前两次是 `select_key_groups` 与 `schema_bound`）。
-    #[test]
-    fn capslock_session_action_registers_on_key_up_with_session_policy() {
-        let mut cfg = Config::default();
-        cfg.keys.session_actions = session_actions(&[("capslock", "page_prev")]);
-        let compiled = Compiler::new(cfg).compile();
-
-        let e = compiled
-            .key_up
-            .iter()
-            .find(|e| e.action == SESSION_ACTION)
-            .expect("capslock 的会话态绑定应登记进 key_up");
-        assert_eq!(e.match_hash, key_hash(MOD_CAPSLOCK, VK_CAPITAL));
-        assert!(
-            e.tsf_hash & HOTKEY_POLICY_SESSION != 0,
-            "缺 SESSION 位，C++ 会把它当 toggle 键处理，keydown 恒被吃 ⇒ 大小写切换全局失效"
-        );
-        assert_eq!(
-            e.match_hash & HOTKEY_POLICY_SESSION,
-            0,
-            "match_hash 是服务端匹配用的裸 hash，policy 位不该混进去"
-        );
-        assert_ne!(
-            e.action, "toggle_mode",
-            "见本测试文档：会让空闲敲 CapsLock 切中英文"
-        );
-        assert!(
-            !compiled
-                .key_down
-                .iter()
-                .any(|e| e.match_hash & 0xFFFF == VK_CAPITAL),
-            "CapsLock 不得进 key_down —— C++ 侧根本不发它的 keydown"
-        );
-    }
-
-    /// 会话态的**功能键**走 key_down + FORWARD_ONLY（与旧 `page_keys` 的登记形态一致）。
-    /// 无会话时 C++ 靠 FORWARD_ONLY 闸门放行，键回落宿主的原语义（Tab 仍是制表符）。
-    #[test]
-    fn session_function_keys_register_on_key_down_forward_only() {
-        let mut cfg = Config::default();
-        cfg.keys.session_actions =
-            session_actions(&[("tab", "page_next"), ("shift+tab", "page_prev")]);
-        let compiled = Compiler::new(cfg).compile();
-
-        for (want_mods, label) in [(0, "tab"), (MOD_SHIFT, "shift+tab")] {
-            let raw = key_hash(want_mods, VK_TAB);
-            let e = compiled
-                .key_down
-                .iter()
-                .find(|e| e.match_hash == raw)
-                .unwrap_or_else(|| panic!("{label} 应登记进 key_down"));
-            assert!(
-                e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0,
-                "{label} 缺 FORWARD_ONLY：无会话时 TSF 会把它当动作热键吞掉"
-            );
-            assert!(
-                e.action.is_empty(),
-                "会话态键是仅注册转发，动作由服务端自认"
-            );
-        }
-    }
-
-    /// 显式 `none` 与拼错的键名都不产出登记，且不 panic。
-    #[test]
-    fn session_actions_skip_disabled_and_unknown_keys() {
-        let mut cfg = Config::default();
-        only_explicit(&mut cfg);
-        cfg.keys.session_actions =
-            session_actions(&[("tab", "none"), ("pgeup", "page_prev"), ("up", "")]);
-        let compiled = Compiler::new(cfg).compile();
-        assert!(
-            !compiled
-                .key_down
-                .iter()
-                .any(|e| matches!(e.match_hash & 0xFFFF, VK_TAB | VK_UP)),
-            "none / 空值不应登记"
-        );
-    }
-
-    /// 可打印选词键的通路不变：仍在 key_down 且带 FORWARD_ONLY，不进 key_up。
-    #[test]
-    fn printable_select_group_stays_on_key_down() {
-        let mut cfg = Config::default();
-        cfg.keys.session_actions = session_actions(&[
-            ("semicolon", "select_candidate:2"),
-            ("quote", "select_candidate:3"),
-        ]);
-        let compiled = Compiler::new(cfg).compile();
-        for raw in [key_hash(0, VK_OEM_1), key_hash(0, VK_OEM_7)] {
-            let e = compiled
-                .key_down
-                .iter()
-                .find(|e| e.match_hash == raw)
-                .expect("可打印选词键应在 key_down");
-            assert!(e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0);
-        }
-        assert!(
-            !compiled
-                .key_up
-                .iter()
-                .any(|e| e.action == "select_candidate"),
-            "可打印选词键不该跑到 key_up 去"
-        );
-    }
-
-    /// 软键盘开关键住在**专用字段**，策略位与它此前在 `key_actions` 里那条逐位相同：
-    /// 带 GLOBAL、**不带** CHINESE_ONLY——面板画的是键位→符号的映射，与中英文态无关，
-    /// 带上那个位英文态就连开都开不出来。
-    #[test]
-    fn softkeyboard_field_carries_global_but_not_chinese_only() {
-        let cfg = Config::default();
-        assert_eq!(
-            cfg.keys.softkeyboard, "ctrl+shift+k",
-            "出厂默认应绑 Ctrl+Shift+K"
-        );
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "softkeyboard")
-            .expect("软键盘开关键应进 key_down 表");
-        assert!(e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0, "应带 GLOBAL 位");
-        assert!(
-            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY == 0,
-            "不得带 CHINESE_ONLY——带上英文态连开都开不出来"
-        );
-    }
-
-    /// ★★★ 本次修复的核心不变量：**出厂绑定关得掉**。
-    ///
-    /// 此前出厂值写在 `data/config.toml` 的 `keys.key_actions` 里，而那张表四层深合并、
-    /// 只能新增/覆盖 ⇒ 用户在设置页删掉后每次 `load()` 都被灌回来，永远关不掉
-    /// （v0.120.0 报障）。挪到标量字段之后，清空就是清空。
-    #[test]
-    fn softkeyboard_field_cleared_disables_the_hotkey() {
-        let mut cfg = Config::default();
-        cfg.keys.softkeyboard = String::new();
-        let compiled = Compiler::new(cfg).compile();
-        assert!(
-            !compiled.key_down.iter().any(|e| e.action == "softkeyboard"),
-            "清空后不得再注册软键盘热键"
-        );
-    }
-
-    /// `key_actions` 里的显式 `none`：压制**更低层**（L2 出厂 / L2.5 定制版）在同一张表
-    /// 里写的绑定。`merge_value` 表达不了删除，禁用只能靠显式值承载——语义与单键、
-    /// 修饰键两条通路的 `BoundAction::None` 逐条对应。
-    ///
-    /// ⚠️ 第二条断言不是凑数：少了它，「整个 key_actions 循环被跳过」也会让第一条绿。
-    #[test]
-    fn explicit_none_keeps_a_combo_binding_out_of_the_table() {
-        let mut cfg = Config::default();
-        // 专用字段清空，免得出厂那条 softkeyboard 占着同一个键干扰判定。
-        cfg.keys.softkeyboard = String::new();
-        cfg.keys.key_actions = [
-            ("ctrl+shift+k".to_string(), "none".to_string()),
-            ("ctrl+shift+u".to_string(), "special:fuhao".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let compiled = Compiler::new(cfg).compile();
-
-        let raw_k = parse_hotkey("ctrl+shift+k").expect("ctrl+shift+k 应解析得动");
-        assert!(
-            !compiled.key_down.iter().any(|e| e.match_hash == raw_k),
-            "显式 none 的条目不得进热键表"
-        );
-        assert!(
-            compiled
-                .key_down
-                .iter()
-                .any(|e| e.action == "special:fuhao"),
-            "同表里其它条目不受影响"
-        );
-    }
-
-    #[test]
-    fn add_word_hotkeys_carry_global_policy() {
-        let mut cfg = Config::default();
-        cfg.keys.add_word = "ctrl+equal".to_string();
-        cfg.keys.open_add_word_dialog = "ctrl+shift+equal".to_string();
-        cfg.keys.toggle_punct = "ctrl+period".to_string();
-        let compiled = Compiler::new(cfg).compile();
-
-        let find = |a: &str| {
-            compiled
-                .key_down
-                .iter()
-                .find(|e| e.action == a)
-                .unwrap()
-                .clone()
-        };
-
-        // 加词两键：CHINESE_ONLY + GLOBAL 叠加
-        for a in ["add_word", "open_add_word_dialog"] {
-            let e = find(a);
-            assert!(
-                e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0,
-                "{a} 的 tsf_hash 应带 GLOBAL 位"
-            );
-            assert!(
-                e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
-                "{a} 的 tsf_hash 应仍带 CHINESE_ONLY 位"
-            );
-            // match_hash 是规范化的原始 hash，不含任何 policy 位
-            assert_eq!(
-                e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
-                0,
-                "{a} 的 match_hash 不应含 policy 位"
-            );
-        }
-
-        // 其它 chinese-only 键（toggle_punct）不该被全局拦截，避免多抢宿主快捷键
-        let tp = find("toggle_punct");
-        assert!(
-            tp.tsf_hash & HOTKEY_POLICY_GLOBAL == 0,
-            "toggle_punct 不应带 GLOBAL 位"
-        );
-        assert!(tp.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
-    }
-
-    /// 裸 F1–F12 绑的动作只在中文模式吃键（宿主的 F1 帮助 / F5 刷新英文态归宿主）；
-    /// 「离开 / 返回英文态」的动词例外；带修饰键的 F 组合键不受影响。
-    #[test]
-    fn bare_function_key_is_chinese_only_except_mode_switch_verbs() {
-        let compile = |key: &str, verb: &str| {
-            let mut cfg = Config::default();
-            cfg.keys
-                .key_actions
-                .insert(key.to_string(), verb.to_string());
-            Compiler::new(cfg)
-                .compile()
-                .key_down
-                .into_iter()
-                .find(|e| e.match_hash == parse_hotkey(key).expect("键名合法"))
-                .expect("应进表")
-                .tsf_hash
-        };
-        assert!(compile("f5", "command:ime.reload()") & HOTKEY_POLICY_CHINESE_ONLY != 0);
-        assert!(compile("f5", "comment_state:detail") & HOTKEY_POLICY_CHINESE_ONLY != 0);
-        assert_eq!(compile("f6", "toggle_mode") & HOTKEY_POLICY_CHINESE_ONLY, 0);
-        assert_eq!(
-            compile("f6", "toggle_schema:wubi86") & HOTKEY_POLICY_CHINESE_ONLY,
-            0
-        );
-        assert_eq!(
-            compile("ctrl+f5", "command:ime.reload()") & HOTKEY_POLICY_CHINESE_ONLY,
-            0,
-            "带修饰键的 F 组合键仍按动词的老规矩"
-        );
-    }
-
-    /// 特殊模式直达热键写在 `keys.key_actions` 里（`special:<方案id>`），动词**原样**
-    /// 进表（分派端用 `BoundAction::parse` 认串），并带 CHINESE_ONLY | GLOBAL。
-    #[test]
-    fn special_mode_hotkey_compiles_with_global_policy() {
-        let mut cfg = Config::default();
-        cfg.keys
-            .key_actions
-            .insert("ctrl+shift+u".to_string(), "special:rare".to_string());
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "special:rare")
-            .expect("key_actions 的 special:<id> 应原样进表");
-        // 与加词键同策略：CHINESE_ONLY | GLOBAL；match_hash 不含任何 policy 位
-        assert!(e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0);
-        assert!(e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
-        assert_eq!(
-            e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
-            0
-        );
-    }
-
-    #[test]
-    fn temp_pinyin_hotkey_compiles_with_global_policy() {
-        let mut cfg = Config::default();
-        cfg.input.temp_pinyin.hotkey = "ctrl+shift+p".to_string();
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "temp_pinyin")
-            .expect("temp_pinyin.hotkey 应编出动词原文 temp_pinyin");
-        assert!(e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0);
-        assert!(e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
-        assert_eq!(
-            e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
-            0
-        );
-    }
-
-    /// `keys.key_actions` 编出对应动词，且与方案直达热键同策略（不带 CHINESE_ONLY）。
-    ///
-    /// policy 位对 `toggle_schema` 比对 `switch_schema` 更要命：带上它，切到英文方案后
-    /// **回程那一下**就不响应了——功能恰好废掉一半，而"切过去"仍然好用，很容易被当成
-    /// 「回程没实现」而不是「策略位配错」。
-    #[test]
-    fn key_actions_compile_toggle_schema_without_chinese_only_policy() {
-        let mut cfg = Config::default();
-        cfg.keys.key_actions.insert(
-            "ctrl+shift+n".to_string(),
-            "toggle_schema:english".to_string(),
-        );
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "toggle_schema:english")
-            .expect("keys.key_actions 应编出 toggle_schema:<id>");
-        assert_eq!(
-            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
-            0,
-            "往返热键不得带 CHINESE_ONLY，否则从英文方案回不来"
-        );
-    }
-
-    /// 不支持的动词与解析不了的键都被丢弃，不进热键表。
-    ///
-    /// 守的是「静默失效」：写错的动词若混进表里，按下时分发端匹配不上，表现是「按了没反应」，
-    /// 与热键没注册上完全同形，用户无从分辨自己拼错了还是功能坏了。
-    #[test]
-    fn key_actions_drop_unknown_verbs_and_unparsable_keys() {
-        let mut cfg = Config::default();
-        cfg.keys.key_actions.insert(
-            "ctrl+shift+n".to_string(),
-            "no_such_verb:english".to_string(),
-        );
-        cfg.keys
-            .key_actions
-            .insert("ctrl+shift+m".to_string(), "toggle_schema:".to_string());
-        cfg.keys.key_actions.insert(
-            "这不是热键".to_string(),
-            "toggle_schema:english".to_string(),
-        );
-        let n = Config::default();
-        let base = Compiler::new(n).compile().key_down.len();
-        let compiled = Compiler::new(cfg).compile();
-        assert_eq!(compiled.key_down.len(), base, "三条非法项都不该进热键表");
-    }
-
-    /// `switch_schema:<id>`（单向）能编进 key_down 表，且**不带 CHINESE_ONLY**。
-    ///
-    /// 这个 policy 位是重点：带上它，切到英文方案后热键就不再响应，用户切得过去、切不
-    /// 回来。特殊模式热键需要它（overlay 只在中文输入中途有意义），方案切换恰恰相反——
-    /// 同一个位，两种机制下后果相反。
-    ///
-    /// ⚠️ 本契约的测试**函数体一度整个丢失**：注释与 `#[test]` 还在，函数被后加的
-    /// `key_actions_compile_toggle_schema_...` 顶替，两个 `#[test]` 落在同一个 fn 上。
-    /// 编译器只报一句 `duplicated attribute` 警告，而读代码的人看到注释会以为这条契约
-    /// 有守门——**「注释还在」是比「没有测试」更坏的状态**。
-    #[test]
-    fn switch_schema_compiles_without_chinese_only_policy() {
-        let mut cfg = Config::default();
-        cfg.keys.key_actions.insert(
-            "ctrl+shift+r".to_string(),
-            "switch_schema:wubi86".to_string(),
-        );
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "switch_schema:wubi86")
-            .expect("switch_schema 应编进 key_down 表");
-        assert_eq!(
-            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
-            0,
-            "方案切换热键不得带 CHINESE_ONLY，否则英文方案下切不回中文方案"
-        );
-        // 反向对照：同一份编译产物里，特殊模式热键确实是带 CHINESE_ONLY 的——
-        // 否则「不带」这条断言在 policy 位整体失效时也会通过。
-        let mut cfg2 = Config::default();
-        cfg2.keys
-            .key_actions
-            .insert("ctrl+shift+u".to_string(), "special:rare".to_string());
-        let c2 = Compiler::new(cfg2).compile();
-        let e2 = c2
-            .key_down
-            .iter()
-            .find(|e| e.action == "special:rare")
-            .unwrap();
-        assert!(
-            e2.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
-            "对照组：特殊模式热键应带 CHINESE_ONLY"
-        );
-    }
-
-    /// 残留的 `keys.schema_hotkeys` **不再生效**，且不悄悄折算进 key_actions。
-    ///
-    /// 兼容层已删除（用户拍板：不做向后兼容，换核心代码简洁）。但它必须**可见地**失效：
-    /// 告警在 `normalize` 里发出，随后清空该表——留着会让后续任何「有没有配过」的判断
-    /// 读到假信号。这里钉住「不生效」与「清空」两条，告警文本本身不断言（文案会改）。
-    #[test]
-    fn legacy_schema_hotkeys_are_dropped_not_migrated() {
-        let mut cfg = Config::default();
-        cfg.keys
-            .legacy_schema_hotkeys
-            .insert("wubi86".to_string(), "ctrl+shift+r".to_string());
-        cfg.normalize();
-        assert!(
-            cfg.keys.legacy_schema_hotkeys.is_empty(),
-            "告警后须清空，否则后续「有没有配过」的判断会读到假信号"
-        );
-        assert!(
-            !cfg.keys.key_actions.contains_key("ctrl+shift+r"),
-            "兼容层已删除，不该再折算进 key_actions"
-        );
-        let compiled = Compiler::new(cfg).compile();
-        assert!(
-            !compiled
-                .key_down
-                .iter()
-                .any(|e| e.action.starts_with("switch_schema:")),
-            "残留旧键不得产生任何热键条目"
-        );
-    }
-
-    /// 动词 id 为空（`special:`）不产生条目；`temp_pinyin.hotkey` 默认空同理。
-    ///
-    /// 「id 为空」原先是 `special_modes[]` 条目的一个真实陷阱（只写 schema 不写 id 的
-    /// 条目会静默不注册热键）。身份收敛到方案 id 后它不可能为空，这里只剩防脏数据。
-    #[test]
-    fn empty_or_idless_mode_hotkey_produces_no_entry() {
-        let mut cfg = Config::default();
-        cfg.keys
-            .key_actions
-            .insert("ctrl+shift+u".to_string(), "special:".to_string());
-        cfg.keys
-            .key_actions
-            .insert("ctrl+shift+i".to_string(), "special:   ".to_string());
-        let compiled = Compiler::new(cfg).compile();
-        assert!(
-            !compiled
-                .key_down
-                .iter()
-                .any(|e| e.action.starts_with("special:") || e.action == "temp_pinyin"),
-            "空 hotkey / 空 id 不应产生直达热键条目"
-        );
-    }
-
-    /// 修饰键的 keyup hash 必须带**通用位 + 具体位**：C++ `GetCurrentModifiers()` 对
-    /// 修饰键同时返回两者，只带一边会匹配不上（表现为「绑了没反应」）。
-    /// 与 `compile_toggle_mode_key` 同格式——两者服务于同一条 TSF keyup 通路。
-    #[test]
-    fn modifier_key_up_hash_matches_toggle_format() {
-        assert_eq!(
-            compile_modifier_key_up_hash(VK_RSHIFT),
-            compile_toggle_mode_key("rshift"),
-            "同一个键经两条入口应得到同一个 hash"
-        );
-        assert_eq!(
-            compile_modifier_key_up_hash(VK_LCONTROL),
-            compile_toggle_mode_key("lctrl")
-        );
-        // 低 16 位是 VK，供 is_pure_modifier_vk / 分派点反查。
-        let h = compile_modifier_key_up_hash(VK_RSHIFT).unwrap();
-        assert_eq!(h & 0xFFFF, VK_RSHIFT);
-        // 非修饰键没有 keyup 形态（CapsLock 也不在此列：它走 toggle_mode_keys 那条）。
-        assert_eq!(compile_modifier_key_up_hash(VK_OEM_1), None);
-        assert_eq!(compile_modifier_key_up_hash(VK_CAPITAL), None);
-    }
-
-    /// `keys.key_actions` 按**键形态**分三条通路，不按动词。
-    #[test]
-    fn key_action_routes_split_by_key_shape() {
-        use KeyActionRoute::*;
-        assert_eq!(route_of_key_action("ctrl+shift+n"), Some(Hotkey));
-        assert_eq!(route_of_key_action("ctrl+space"), Some(Hotkey));
-        assert_eq!(route_of_key_action("rshift"), Some(ModifierKeyUp));
-        assert_eq!(route_of_key_action("lctrl"), Some(ModifierKeyUp));
-        assert_eq!(route_of_key_action("backtick"), Some(LeadingKey));
-        assert_eq!(route_of_key_action("semicolon"), Some(LeadingKey));
-        assert_eq!(route_of_key_action("z"), Some(LeadingKey));
-        assert_eq!(route_of_key_action("f1"), Some(Hotkey));
-        assert_eq!(route_of_key_action("F12"), Some(Hotkey));
-        assert_eq!(route_of_key_action("不存在的键"), None);
-    }
-
-    /// ★★ 单个有字符的键**绝不能**进 key_down 热键表。
-    ///
-    /// `parse_hotkey("backtick")` 返回的是无修饰位的裸 VK（0xC0）。进表后 TSF 会把它
-    /// 当热键转发并吞掉，于是 `` ` `` 这个符号在所有方案里都再也打不出来——而用户只是
-    /// 想给它绑个功能。这条是本次收编最危险的一处，故单独立测。
-    #[test]
-    fn single_character_key_never_enters_keydown_hotkeys() {
-        let mut cfg = Config::default();
-        cfg.keys
-            .key_actions
-            .insert("backtick".into(), "temp_pinyin".into());
-        cfg.keys
-            .key_actions
-            .insert("semicolon".into(), "mix:quick_mix".into());
-        cfg.keys
-            .key_actions
-            .insert("rshift".into(), "toggle_mode".into());
-        cfg.keys
-            .key_actions
-            .insert("ctrl+shift+n".into(), "toggle_schema:wubi86".into());
-        // 折算后的选词绑定（本测试直接构造 Compiler、不经 normalize，故显式写出）。
-        // 顺带覆盖一个真实场景：**同一个键 `;` 同时在两张表里**——无会话时是 mix 引导键，
-        // 有会话时是次选键。两张表按触发态分野，本就该能共存。
-        cfg.keys.session_actions = session_actions(&[
-            ("semicolon", "select_candidate:2"),
-            ("quote", "select_candidate:3"),
-        ]);
-        let compiled = Compiler::new(cfg).compile();
-
-        // ★ 判据是「有没有产生**带这个动词的** key_down 条目」，不是「这个 VK 在不在
-        // key_down 里」——`;` / `'` 同时被会话态表以 FORWARD_ONLY 登记着，按 VK 判会把
-        // 那条误当成本段的产物，测了个寂寞。
-        for verb in ["temp_pinyin", "mix:quick_mix"] {
-            assert!(
-                !compiled.key_down.iter().any(|e| e.action == verb),
-                "单键条目 {verb} 不该产生 key_down 热键，实际 {:?}",
-                compiled
-                    .key_down
-                    .iter()
-                    .map(|e| &e.action)
-                    .collect::<Vec<_>>()
-            );
-        }
-        // 反向确认分流真的生效：会话态那条 `;` 仍在（action 为空的转发登记），
-        // 说明上面的「没有」不是因为整段编译被跳过了。
-        assert!(
-            compiled
-                .key_down
-                .iter()
-                .any(|e| (e.match_hash & 0xFFFF) == VK_OEM_1 && e.action.is_empty()),
-            "会话态表里 `;` 的转发登记应不受影响"
-        );
-
-        // 组合键照常进 key_down（收编不该动这条既有通路）。
-        assert!(
-            compiled
-                .key_down
-                .iter()
-                .any(|e| e.action == "toggle_schema:wubi86"),
-            "组合键条目应仍走热键通路"
-        );
-        // 修饰键进 key_up，且 action 是 schema_bound 而非动词本身——
-        // `is_toggle_mode_keycode` 按 action 过滤，塞动词进去它就认不出来了。
-        let up = compiled
-            .key_up
-            .iter()
-            .find(|e| (e.match_hash & 0xFFFF) == VK_RSHIFT)
-            .expect("rshift 应进 key_up 转发集");
-        assert_eq!(up.action, "schema_bound");
-    }
-
-    /// 全局拦截热键的槽位上限护栏**必须真的能触发**，不能是一条恒假的不等式。
-    ///
-    /// ⚠️ 这条测试的存在理由是本仓踩过的一类：护栏写好了，而上游某个闸门让它的条件恒不
-    /// 成立，于是它从来没报过——「没报警」被当成了「没问题」。所以这里两头都验：
-    /// 出厂配置下不报（不是噪音），配满 overlay 组合键时报得出来、且点得出是哪几个。
-    #[test]
-    fn global_hotkey_slot_guard_can_actually_fire() {
-        // ① 出厂基线不该触发——否则它就是常驻噪音，很快会被无视。
-        let base = Compiler::new(Config::default()).compile();
-        let (base_total, base_dropped) = global_hotkey_overflow(&base.key_down);
-        assert!(
-            base_dropped.is_empty(),
-            "出厂配置不该触发槽位告警（当前 {base_total} 个带 GLOBAL）"
-        );
-        assert!(
-            base_total <= GLOBAL_HOTKEY_SLOTS,
-            "出厂基线本身就顶满槽位了，护栏的余量判据要重算"
-        );
-
-        // ② 配满进 overlay 的组合键 ⇒ 必须报，且点得出是哪几个。
-        //    用 `rare_char`（无载荷、恒带 CHINESE_ONLY|GLOBAL）逐键绑满。
-        let mut cfg = Config::default();
-        for (i, vk) in ('a'..='z').enumerate().take(GLOBAL_HOTKEY_SLOTS + 4) {
-            let _ = i;
-            cfg.keys
-                .key_actions
-                .insert(format!("ctrl+alt+shift+{vk}"), "rare_char".to_string());
-        }
-        let full = Compiler::new(cfg).compile();
-        let (total, dropped) = global_hotkey_overflow(&full.key_down);
-        assert!(
-            total > GLOBAL_HOTKEY_SLOTS,
-            "前提没达成：只编出 {total} 个带 GLOBAL 的条目"
-        );
-        assert!(!dropped.is_empty(), "超限了却报不出来，护栏形同虚设");
-        assert_eq!(
-            dropped.len(),
-            total - GLOBAL_HOTKEY_SLOTS,
-            "报出的条数应恰好是溢出的那些"
-        );
-    }
-
-    /// 组合键的值域**就是** `BoundAction` 的全值域——这是 2026-09-18 合流的核心断言。
-    ///
-    /// 合流前这里是一份逐条追加的六项白名单，组合键能绑的功能恒比单键少一大截；而组合键
-    /// 这条通路在按键链上位次更早（英文模式分水岭之前）、不与输入争键，本该是限制最少的
-    /// 一条。若今后有人为了修某个具体问题把某一族重新挡回去，本测试会红。
-    #[test]
-    fn combo_keys_accept_the_whole_bound_action_domain() {
-        let verbs = [
-            // A 类状态切换
-            "toggle_mode",
-            "switch_engine",
-            "toggle_full_width",
-            "toggle_punct",
-            "toggle_s2t",
-            "toggle_t2s",
-            "toggle_toolbar",
-            "open_settings",
-            "open_dictionary",
-            "take_screenshot",
-            // B 类进 overlay
-            "temp_pinyin",
-            "temp_english",
-            "aux_code",
-            "rare_char",
-            "reverse",
-            "mix:quick_mix",
-            "special:fuhao",
-            "single_char",
-            "single_char:on",
-            "comment_state",
-            "comment_state:detail",
-            "softkeyboard",
-            "softkeyboard:num",
-            // C 类切方案
-            "toggle_schema:english",
-            "switch_schema:wubi",
-            // 命令直通
-            r#"command:proc.run("charmap.exe")"#,
-        ];
-        for verb in verbs {
-            let mut cfg = Config::default();
-            cfg.keys.softkeyboard = String::new(); // 免得出厂那条占着同一个键
-            cfg.keys
-                .key_actions
-                .insert("ctrl+alt+shift+j".to_string(), verb.to_string());
-            let compiled = Compiler::new(cfg).compile();
-            let raw = parse_hotkey("ctrl+alt+shift+j").expect("组合键应解析得动");
-            assert!(
-                compiled
-                    .key_down
-                    .iter()
-                    .any(|e| e.match_hash == raw && e.action == verb),
-                "组合键应能绑 {verb}，且动词原样进表"
-            );
-        }
-    }
-
-    /// 策略位按动词分，且与固定字段那两段**逐条一致**：同一个功能经两条路进表却带不同的
-    /// 位，表现是「在设置页配和在自定义按键里配，行为不一样」。
-    ///
-    /// ⚠️ `toggle_mode` 那条是本次合流最实际的收获，也是最容易配错的一条：带上
-    /// `CHINESE_ONLY` 就成了单程票——切到英文态后这个键 TSF 不再转发，再也切不回中文。
-    #[test]
-    fn combo_key_policy_bits_split_by_verb() {
-        // (动词, 期望 CHINESE_ONLY, 期望 GLOBAL)
-        let cases: &[(&str, bool, bool)] = &[
-            ("toggle_mode", false, false),
-            ("switch_engine", false, false),
-            ("toggle_schema:english", false, false),
-            ("switch_schema:wubi", false, false),
-            ("toggle_full_width", false, false),
-            ("toggle_toolbar", false, false),
-            ("open_settings", false, false),
-            ("open_dictionary", false, false),
-            ("take_screenshot", false, false),
-            ("toggle_punct", true, false),
-            ("toggle_s2t", true, false),
-            ("toggle_t2s", true, false),
-            ("single_char", true, false),
-            ("comment_state", false, false),
-            ("comment_state:detail", false, false),
-            ("temp_pinyin", true, true),
-            ("temp_english", true, true),
-            ("aux_code", true, true),
-            ("rare_char", true, true),
-            ("reverse", true, true),
-            ("mix:quick_mix", true, true),
-            ("special:fuhao", true, true),
-            ("softkeyboard", false, true),
-            (r#"command:open("https://example.com")"#, false, false),
-        ];
-        for (verb, want_chinese, want_global) in cases {
-            let mut cfg = Config::default();
-            cfg.keys.softkeyboard = String::new();
-            cfg.keys
-                .key_actions
-                .insert("ctrl+alt+shift+j".to_string(), (*verb).to_string());
-            let compiled = Compiler::new(cfg).compile();
-            let e = compiled
-                .key_down
-                .iter()
-                .find(|e| e.action == *verb)
-                .unwrap_or_else(|| panic!("{verb} 应进 key_down 表"));
-            assert_eq!(
-                e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
-                *want_chinese,
-                "{verb} 的 CHINESE_ONLY 位与预期不符"
-            );
-            assert_eq!(
-                e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0,
-                *want_global,
-                "{verb} 的 GLOBAL 位与预期不符"
-            );
-            // match_hash 恒不含策略位：服务端匹配只认裸 hash。
-            assert_eq!(
-                e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
-                0
-            );
-        }
-    }
-
-    /// 生僻字模式直达热键：`rare_char` 动词原样进表，策略位与 `special:` 一致
-    /// （CHINESE_ONLY | GLOBAL）。
-    ///
-    /// GLOBAL 那半不是可选的：少了它，QQNT / Tabby 这类 Chromium 宿主会用自己的同名
-    /// 加速键把这个组合吃掉，用户只在部分程序里按不出来——最难归因的一类问题。
-    #[test]
-    fn rare_char_hotkey_compiles_with_global_policy() {
-        let mut cfg = Config::default();
-        cfg.keys
-            .key_actions
-            .insert("ctrl+shift+r".to_string(), "rare_char".to_string());
-        let compiled = Compiler::new(cfg).compile();
-        let e = compiled
-            .key_down
-            .iter()
-            .find(|e| e.action == "rare_char")
-            .expect("key_actions 的 rare_char 应原样进表");
-        assert!(
-            e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0,
-            "须带 GLOBAL，否则 Chromium 类宿主会吃掉它"
-        );
-        assert!(
-            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
-            "进 overlay 只在中文输入中途有意义"
-        );
-    }
-
-    // ── 上屏注释 / 拼音（`input.alt_commit`，C2-6 / t138）──
-
-    fn alt_entries(compiled: &CompiledHotkeys) -> Vec<&HotkeyEntry> {
-        compiled
-            .key_down
-            .iter()
-            .filter(|e| (e.match_hash >> 16) == MOD_ALT)
-            .collect()
-    }
-
-    /// 出厂关：一个 Alt 组合都不进表——Alt+数字 / Alt+空格 原样归宿主（菜单加速键、系统菜单）。
-    #[test]
-    fn alt_commit_off_registers_nothing() {
-        let compiled = Compiler::new(Config::default()).compile();
-        assert!(
-            alt_entries(&compiled).is_empty(),
-            "出厂 alt_commit=off，不该登记任何 Alt 组合"
-        );
-    }
-
-    /// `alt_commit = comment` 而候选注释总开关关着：注释恒空，按 `off` 处理——一个 Alt 组合都不进表，
-    /// 否则 TSF 照 SESSION 位吃掉 Alt+数字，宿主的菜单加速键就丢了。`pinyin` 档不受影响。
-    #[test]
-    fn alt_commit_comment_with_comments_off_registers_nothing() {
-        let mut cfg = Config::default();
-        cfg.input.alt_commit = "comment".into();
-        cfg.ui.comment.enabled = false;
-        assert!(
-            alt_entries(&Compiler::new(cfg.clone()).compile()).is_empty(),
-            "注释关着时 comment 档等同 off，不该登记 Alt 组合"
-        );
-        cfg.input.alt_commit = "pinyin".into();
-        assert_eq!(
-            alt_entries(&Compiler::new(cfg).compile()).len(),
-            11,
-            "pinyin 档不看注释开关"
-        );
-    }
-
-    /// 开启后 Alt+0..9 与 Alt+Space 共 11 个键进 key_down，**只带 SESSION 位**：
-    /// 无会话 / 英文模式一律放行（TSF 两道闸门与 `should_handle_key` 都按这个位判），
-    /// 候选可见期间才由 `_RegisterCandidateHotkeys` 抢占。action 为空＝仅转发，
-    /// 语义在协调器的 `try_alt_commit` 里分派。
-    #[test]
-    fn alt_commit_on_registers_eleven_session_keys() {
-        let mut cfg = Config::default();
-        cfg.input.alt_commit = "pinyin".into();
-        let compiled = Compiler::new(cfg).compile();
-        let alts = alt_entries(&compiled);
-        let mut vks: Vec<u32> = alts.iter().map(|e| e.match_hash & 0xFFFF).collect();
-        vks.sort();
-        let mut want: Vec<u32> = (0x30..=0x39).collect();
-        want.insert(0, VK_SPACE);
-        assert_eq!(vks, want);
-        for e in alts {
-            assert_eq!(
-                e.tsf_hash & 0xF000_0000,
-                HOTKEY_POLICY_SESSION,
-                "只该带 SESSION 位（不能 GLOBAL/CHINESE_ONLY/FORWARD_ONLY）: 0x{:08X}",
-                e.tsf_hash
-            );
-            assert!(e.action.is_empty(), "仅转发登记，action 必须为空");
-            assert_eq!(
-                KeyDownPolicy::from_tsf_hash(e.tsf_hash),
-                KeyDownPolicy::Session
-            );
-        }
-    }
-
-    /// 用户在 `keys.key_actions` 里已绑的 Alt 组合**让位**：本功能不登记那个键，
-    /// 表里只剩用户那条（`.find()` 先到先得的同时，推给 TSF 的策略位也只有一份）。
-    #[test]
-    fn alt_commit_yields_to_user_combo_binding() {
-        let mut cfg = Config::default();
-        cfg.input.alt_commit = "comment".into();
-        cfg.keys
-            .key_actions
-            .insert("alt+3".into(), "toggle_punct".into());
-        let compiled = Compiler::new(cfg).compile();
-        let raw = key_hash(MOD_ALT, 0x33);
-        let hits: Vec<&HotkeyEntry> = compiled
-            .key_down
-            .iter()
-            .filter(|e| e.match_hash == raw)
-            .collect();
-        assert_eq!(hits.len(), 1, "Alt+3 只该有用户那一条");
-        assert_eq!(hits[0].action, "toggle_punct");
-        assert_eq!(alt_entries(&compiled).len(), 11, "其余 10 个照常登记");
-    }
-
-    /// 候选热键槽位（TSF `kHotkeyIdCandidateMax` = 32）装得下「出厂置顶 + 删除 + 本功能」。
-    /// 超出的那些 `_RegisterCandidateHotkeys` 静默 break，退回 OnTestKeyDown 退路。
-    #[test]
-    fn session_hotkeys_fit_candidate_slots_with_alt_commit() {
-        let mut cfg = Config::default();
-        cfg.input.alt_commit = "pinyin".into();
-        let compiled = Compiler::new(cfg).compile();
-        let n = compiled
-            .key_down
-            .iter()
-            .filter(|e| e.tsf_hash & HOTKEY_POLICY_SESSION != 0)
-            .count();
-        assert!(n <= 32, "SESSION 热键 {n} 个，超过 TSF 候选槽位 32");
-    }
-
-    #[test]
-    fn reverse_hotkey_policy_is_global_chinese_only() {
-        let p = hotkey_policy_for(&crate::config::BoundAction::Reverse).unwrap();
-        assert_eq!(p & HOTKEY_POLICY_CHINESE_ONLY, HOTKEY_POLICY_CHINESE_ONLY);
-        assert_eq!(p & HOTKEY_POLICY_GLOBAL, HOTKEY_POLICY_GLOBAL);
-    }
-}
+#[path = "hotkey_tests.rs"]
+mod tests;

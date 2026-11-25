@@ -83,8 +83,25 @@ keys = { q = "√", "shift+q" = "∛" }     # 单键补丁，压在画布之上
 **绝不允许把展开后的内存表倒灌回 `rows`**——那就是「整体替换 ⊕ 稀疏 diff」的数据丢失。
 
 P0 阶段该文件**只读**：出厂一份，用户可整份拷到 `%APPDATA%\WindInput\` 修改，
-GUI 不回写（同 `system.quick.toml`）。将来真要编辑器，按 `SideCommitter` 接
-（本仓已定：非 config.toml 落点一律登记 SideCommitter，禁止再加独立保存按钮）。
+GUI 不回写（同 `system.quick.toml`）。
+
+#### 2.2.1 设置端编辑器（已实施）
+
+「设置 › 输入 › 软键盘」打开编辑对话框：下拉选面、整块键盘展示两层输出、点键改符号与
+Shift 符号，可新建（空白 / 复制当前面）、改名、删除用户面、出厂面恢复默认。
+
+- **只写用户层，只写 `name` / `keys` / 新建面的 `send_keys`，永不写 `rows`**——上面那条
+  纪律的落实。改成与下层（出厂 ⊕ 定制 ⊕ 用户手写画布）一致的值，补丁自动消失；出厂面的
+  条目只剩 `id` 时整条删掉。别名键名（`[` 与 `lbracket`）改写时一并替换，不并存。
+- 用户文件用 `toml_edit` 原地改：手写的注释、画布、格式原样保留；写出前自检能被运行时读懂。
+- 纯逻辑在 `wind-softkeyboard::admin`（`view` / `apply`），RPC 是 `softkeyboard.get` /
+  `softkeyboard.apply`（整批操作，任一步失败整批作废、文件不动）。写完协调器
+  `reload_softkeyboard` 热重载（映射表是 `RwLock<Arc<_>>`），**不必再重启服务**；
+  当前面按 id 找回，面板开着时当场重画。
+- 设置端照 `SideCommitter` 接：对话框里改的是本地工作副本，随底栏「应用设置」一次提交
+  （本仓已定：非 config.toml 落点一律登记 SideCommitter，禁止再加独立保存按钮）。
+- 用户新建、还没填任何键的空面：运行时照旧不进标签行，编辑视图里保留（`merge_raw` 的
+  `keep_empty`），否则「新建 → 应用 → 重开」那张面会凭空消失。
 
 ### 2.3 用户覆盖的三态语义
 
@@ -296,9 +313,14 @@ WS_EX_TOPMOST`（候选窗与工具栏已在用，`wind-ui/src/window.rs`）。
 面板左上角的图钉按钮（`SOFT_TAG_PIN`，与右上角关闭按钮对称）。两态各一张 SVG（`res/icons/pin_off.svg` 描边斜放 / `pin_on.svg` 实心竖直），不用 emoji 字符——各平台字体里形状与彩色与否都不一致。钉住后焦点怎么变都不自动关闭，
 含整应用失焦、换宿主；Esc / 关闭按钮 / 工具栏 / 菜单仍可关。
 
-- **只对本次打开有效**：任何一条关闭路径都复位，不持久化——忘了钉的面板会一直挡在屏上。
+- **持久偏好**（此前是「只对本次打开有效」）：关闭不复位，下次打开照旧钉着，
+  跨重启记在 `state.toml` 的 `softkeyboard_pinned`。只记偏好、不记面板开着——重启后面板
+  不会自己弹出来，原先「忘了钉的面板一直挡在屏上」的顾虑落不到实处：挡着时用户刚亲手
+  打开过它。打开时先下发 `SoftKeyboardPinned` 再 Show（UI 隐藏时复位按钮外观，隐藏态
+  `set_pinned` 只记值不重画，故不闪）。点图钉经异步 `state_writer` 落盘：鼠标点击，
+  不在按键路径上。
 - ⚠️ 钉住跨应用后，点符号面的文本按**活动 token** 投递；若前台应用不发 focus_gained（别家输入法、桌面），可能送进后台旧宿主，待靶机验证。
-- 真相在协调器 `softkeyboard_pinned`，UI 只管高亮（`UiCommand::SoftKeyboardPinned`，面板隐藏时自行复位）。
+- 真相在协调器 `softkeyboard_pinned`，UI 只管高亮（`UiCommand::SoftKeyboardPinned`，面板隐藏时复位外观，每次打开由协调器重发）。
 - ★ **唯一入口是 `Coordinator::toggle_softkeyboard_pin()`**。要给钉住绑快捷键，只调它，别再写一份翻转逻辑。
   快捷键本身尚未接线（配置项、`key_actions` 动词、设置页都没有）。
 

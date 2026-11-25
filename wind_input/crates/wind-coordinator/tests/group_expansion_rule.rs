@@ -1,6 +1,6 @@
 //! `$SS` / `$AA` 组的展开态规则 + 嵌入 `$CC` 命令成员。
 //!
-//! 规则：前缀匹配恒折叠成组名；全码匹配**无重码**才自动展开，**有重码**不展开、折成组名候选，
+//! 规则：前缀匹配恒折叠成组名；全码匹配无重码才自动展开，有重码不展开、折成组名候选，
 //! 用户选中后才展开成员（且只列该组）。
 //!
 //! 自带临时码表方案，不依赖 `build_dev/data`。
@@ -325,9 +325,8 @@ fn pinyin_fixture(tag: &str, body: &str) -> Fixture {
     Fixture { coord, dir, ov }
 }
 
-/// 拼音域的普通候选不构成组重码：简拼词/回退补条与组同码，组仍全码自动展开。
-/// 组码是用户精心设计的缩写，拼音候选是泛化预测，恒让位（0.130 曾按「消费整串」判，
-/// 简拼形态的组码恒重码恒折叠，短语全码自动展开失效；本用例钉住拼音域不折叠）。
+/// 拼音域的普通候选不构成组重码：简拼词/回退补条与组同码，组仍全码自动展开。组码是用户设计的
+/// 缩写，拼音候选是泛化预测，恒让位；若按「消费整串」判重码，简拼形态的组码会恒折叠。
 #[test]
 fn pinyin_abbrev_words_do_not_fold_group() {
     let f = pinyin_fixture(
@@ -351,4 +350,45 @@ fn pinyin_abbrev_words_do_not_fold_group() {
         got.iter().any(|t| t == "技术"),
         "同码简拼词必须还在: {got:?}"
     );
+}
+
+fn fixture_with_group_pp(tag: &str, body: &str, per_page: usize, group_pp: usize) -> Fixture {
+    let dir = make_data_dir(tag, body);
+    let mut c = Config::default();
+    c.schema.available = vec!["st".into()];
+    c.schema.active = "st".into();
+    c.input.default.chinese_mode = true;
+    c.ui.candidate.per_page = per_page;
+    c.input.cmdbar.group_per_page = group_pp;
+    let ov = std::env::temp_dir().join(format!("wind_grp_rule_ov_{tag}"));
+    let _ = std::fs::remove_dir_all(&ov);
+    std::fs::create_dir_all(&ov).unwrap();
+    let coord = Coordinator::new_headless_with_override(c, Some(&dir), Some(ov.clone()));
+    Fixture { coord, dir, ov }
+}
+
+const SS6: &str = r#"$SS("六项", "一", "二", "三", "四", "五", "六")"#;
+
+/// `group_per_page` 默认 0 = 跟随 `per_page`；配了之后只对组展开视图生效。
+#[test]
+fn group_per_page_follows_by_default_and_overrides_when_set() {
+    let body = format!("阿\ta\n{SS6}\tuu\n");
+    let f = fixture_with_group_pp("gpp_follow", &body, 3, 0);
+    type_keys(&f.coord, "uu");
+    assert_eq!(f.coord.debug_page_texts().len(), 3, "默认跟随 per_page");
+    assert_eq!(f.coord.debug_page_info().2, 2);
+
+    let f = fixture_with_group_pp("gpp_set", &body, 3, 5);
+    type_keys(&f.coord, "uu");
+    assert_eq!(
+        f.coord.debug_page_texts().len(),
+        5,
+        "展开组按 group_per_page 分页"
+    );
+    assert_eq!(f.coord.debug_page_info().2, 2);
+
+    // 非组候选（折回前的普通输入）不受影响。
+    let f = fixture_with_group_pp("gpp_plain", &body, 3, 5);
+    type_keys(&f.coord, "a");
+    assert!(f.coord.debug_page_texts().len() <= 3);
 }

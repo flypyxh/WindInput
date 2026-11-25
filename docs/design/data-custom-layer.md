@@ -128,6 +128,17 @@ try_into(merged) 失败
 **凡是「拿 `Config::load()` 的结果当种子、再整表写回用户层或导出给用户」的路径，
 降级时都会把用户数据抹掉**。新增此类路径必须过闸，并有守门测试。
 
+第四条是 `config.setItems`（wind-rpc `dispatch.rs`）：设置端对 Map 与数组型键发送
+「base ⊕ 本次编辑」的整份值，base 取自 `config.get`，降级时就是出厂值。闸门判据收在
+`FieldType::is_whole_value_leaf`（Map 与 `ui.toolbar.items` 等数组型键都算），加新类型时
+在那里回答一次；标量键不拦（落盘值是显式单值，与 base 无关，拦了会让降级期间整页无法保存）。
+
+降级的「UI 可见」由 RPC `config.degradation` 提供：语义是「此刻盘上的配置试加载一遍会不会
+降级」（每次现读四层），不是服务运行中那份配置的快照，故用户改好之后横幅能自行消失。
+独立成方法而不并进 `system.info`（不碰磁盘）或 `config.get`（`degradation` 是
+`#[serde(skip)]` 的运行期元信息，混进配置命名空间会被当成键写回）；返回形态恒为固定字段的
+对象，「字段缺失」在跨仓契约里与「旧版 core」无从区分。
+
 未加闸但已确认安全的：`prune_user_config` / `set_user_value`（`system_preset_value`
 走生 `toml::Value`，根本不反序列化，不变量 1 不破）；`keys_overview`
 （wind-webdata）只影响显示、不写盘，留待 P3 一并处理。
@@ -520,7 +531,7 @@ english 由「用户 available 里排第一」那个子场景负责。把 `zz_hu
    - 文档站 `WindInputDocs` 新增「定制版制作指南」：层序、manifest 格式、
      「不要改 data，只写 data_custom」、「只写差异键」
    - `wind-installer`：确认覆盖式解包不会删 `data_custom`（当前只有 legacy 迁移会删东西，
-     应当安全，但需显式测试）；卸载时 `cleanup.rs` 的清理范围要覆盖它
+     应当安全，但需显式测试）；卸载**保留** `data_custom`（它不在安装包内，卸载只删包内顶层条目，见下方契约表）
    - ⚠️ 这是**跨仓单向契约、无编译期约束**，两侧各写各的测试证明不了接线。
      必须有一个**真的建出 `data_custom` 再跑完整解析**的端到端用例。
 
@@ -532,7 +543,7 @@ english 由「用户 available 里排第一」那个子场景负责。把 `zz_hu
 | 契约 | 结论 | 证据 |
 |---|---|---|
 | 升级/覆盖安装不删 `data_custom/` | ✅ 成立，且比原文的说法更强 | `installer/plan.rs:16-88` 是安装计划的唯一真相；解包前四个前置步骤里只有 `CleanupLegacy` 碰文件系统，而它是**逐条点名的黑名单**（`installer/legacy.rs:14-42`），没有递归扫描或通配。更进一步：本仓 `config/app.toml:29-30` 的 `legacy_files`/`legacy_dirs` **都是空的**，`plan.rs:40` 的门控使 `CleanupLegacy` 当前根本不入计划。`PrepareArchive`（`steps.rs:153-157`）只 `create_dir_all`、无前置清空；`ExtractFiles`（`steps.rs:170-188`）只正向遍历**包内条目**，从不 `read_dir(install_dir)` 反查差集 |
-| 卸载清得掉 `data_custom/` | ✅ 成立，不残留 | `uninstaller/cleanup.rs:242-246` 是**整目录递归删**（`remove_dir_all(install_dir)`），不是按清单逐项。前面那段逐项删（含显式点名的 `data/`，`cleanup.rs:215-218`）只是为这一刀解锁的预处理。GUI 路径还有第二道：卸载器把自己复制到 `%TEMP%` 后回头再删一次（`uninstaller/selfdelete.rs:48-53`） |
+| 卸载**保留** `data_custom/` | ✅ 已改（不再清掉） | 卸载只删安装包的顶层条目（打包器写入清单 `app.owned_entries`，卸载与自删除两条路径都按它删），`data_custom` 不在包内，原样留下；目录因此非空，安装目录本身也保留。原先的整目录 `remove_dir_all` 仅在旧包（清单无该字段）上沿用 |
 
 ⚠️ **一个既有缺口（不是 `data_custom` 引入的，知晓即可）**：`cleanup.rs:242` 的
 `remove_dir_all` 失败时兜底是 `schedule_delete_on_reboot(install_dir)`，而 `MoveFileExW`

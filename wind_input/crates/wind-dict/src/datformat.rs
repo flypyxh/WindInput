@@ -1,8 +1,6 @@
 //! DAT 格式 (wdat) — Double-Array Trie 词典
 //!
-//! 与 Go 版 `wind_input/internal/dict/datformat/` 对齐（主 DAT；暂不含简拼 AbbrevSection，
-//! 与现 wdb 内容对等——全拼/全码）。前缀查询为「数组跳转 + 子树 DFS」，较 wdb 的键索引
-//! 二分更省更快，适合拼音大词库逐键前缀检索。
+//! 前缀查询为「数组跳转 + 子树 DFS / 分支限界」，适合拼音大词库逐键前缀检索。
 //!
 //! 文件布局（小端）：
 //! ```text
@@ -11,17 +9,16 @@
 //! [LeafTable: leaf_count*8]   每条 {entry_off u32, entry_len u16, _ u16}
 //! [EntryRecords: entry_count*22]  每条 {text_off u32, text_len u16, weight i32, order u32, boundary u64}
 //! [StringPool]
+//! [AbbrevSection(可选)]  24B 自描述头 + DAT/MaxW/Leaf/Entry + 简拼 CharMap，共享 StringPool
 //! [CharMap 1028B]  {max_code i32, char_map[256] i32}
 //! [Meta(可选) 4B len + bytes]
 //! ```
 //! DAT 查询：`base[s]+c=t`（状态 s 经紧凑码 c 转移到 t），`check[t]==s` 校验；
 //! `base[t]<0` 表叶节点，`-base[t]-1` 为 LeafTable 索引；`c=0` 为终止符。
 //!
-//! **MaxW 段**（v6）：`maxw[s]` = 以状态 s 为根的子树内所有条目 weight 的最大值，
-//! `NO_MAXW`（= i32::MIN）表示子树无条目。它是前缀 Top-K 查询的**剪枝上界**，
-//! 使查询成本随 K 而非随子树规模 M 增长（见 `search_prefix`）。
-//! 段位置紧跟 Check 之后，无需 Header 新字段——`maxw_off = dat_off + dat_size*4*2` 可直接算出，
-//! 其后各段偏移（leaf/entry/str）本就在 Header 中显式存储。
+//! MaxW 段（v6）：`maxw[s]` = 以状态 s 为根的子树内所有条目 weight 的最大值，`NO_MAXW`
+//! （= i32::MIN）表示子树无条目。它是前缀 Top-K 查询的剪枝上界（见 `search_prefix`）。
+//! 段位置紧跟 Check 之后，偏移可直接算出，无需 Header 新字段。
 
 use crate::binformat::DictEntry;
 use crate::mapping::Mapped;
@@ -31,27 +28,19 @@ use std::path::Path;
 use tracing::info;
 
 const MAGIC: [u8; 4] = *b"WDAT";
-// v3：EntryRecord 增加 order u32（全局自然序，10→14B），跨编码等权时按词库出现顺序排序，
-// 不再退化为叶内序号致编码字母序。旧 v2 缓存 mtime/指纹不匹配自动重建。
-// v4：EntryRecord 增加 boundary u64（音节起始位 bitmask，14→22B）。源数据 rime `ni hao` 的
-// 空格本就是音节真值边界，此前在解析期被 replace(' ',"") 丢弃，迫使查询侧用 DAG 重新猜切分
-// （xi'an vs xian 无从分辨）、造词侧靠 410 音节暴力反推。key 仍为扁平串，故 DAT/前缀查询
-// 语义完全不变——边界只作为 entry 侧元数据随查询结果返回。旧缓存同样靠指纹不匹配自动重建。
-// v5：AbbrevSection 的条目文本从「词」改为「全拼码」——二级索引指向主键而非复制数据。
-// 简拼查询因此变成「查索引拿码 → 走主表装配候选」，候选得到真实的 code 与 boundary，
-// 词频不再因简拼/全拼分裂成两份计数。**二进制结构完全未变**，变的是那个字符串字段的
-// 语义，故必须 bump：旧 v4 缓存若按新逻辑读，会把词当成码拿去查主表、简拼全数落空。
-// 旧缓存靠内容指纹不匹配自动重建，无迁移代码。
-// v6：新增 MaxW 段（每状态 4B，子树最大 weight），前缀 Top-K 查询改为分支限界。
-// 旧 v5 缓存缺该段，且 leaf/entry 偏移整体前移，按新布局读必然错位，故必须 bump。
-// 旧缓存靠版本不匹配自动重建，无迁移代码。
+// 版本史（旧缓存一律靠版本/指纹不匹配自动重建，无迁移代码）：
+// v3：EntryRecord 加 order u32（全局出现序），等权候选跨编码按出现顺序而非编码字母序。
+// v4：EntryRecord 加 boundary u64（音节起始位 bitmask），key 仍为扁平串，查询语义不变。
+// v5：AbbrevSection 的条目文本从「词」改为「全拼码」。二进制结构未变但语义变了，旧缓存
+//     按新逻辑读会把词当码查主表，故必须 bump。
+// v6：新增 MaxW 段，leaf/entry 偏移整体后移。
 const VERSION: u32 = 6;
 const HEADER_SIZE: usize = 48;
 const LEAF_SIZE: usize = 8;
 const ENTRY_SIZE: usize = 22;
 const CHARMAP_SIZE: usize = 4 + 256 * 4; // 1028
 
-/// `maxw[s]` 的空子树哨兵。**刻意不复用 `i32::MIN` 之外的值**：weight 为 i32，
+/// `maxw[s]` 的空子树哨兵。刻意不复用 `i32::MIN` 之外的值：weight 为 i32，
 /// 任何真实条目的 weight 都 > i32::MIN，故该哨兵不会与真实值混淆。
 /// （当前词库最小 weight 为 0，但不依赖该事实。）
 const NO_MAXW: i32 = i32::MIN;
@@ -69,11 +58,10 @@ struct Dat {
     max_code: i32,
 }
 
-/// 从**已按字典序排好、唯一**的编码列表**直接构建 DAT**——不建中间 trie，峰值内存仅 base/check。
-/// `data_index` = 编码在列表中的下标（= LeafTable 索引）。这是相对「先建几百万小节点 trie 再转双数组」
-/// 的关键省内存改造：trie 那几百万个小分配会把堆撑高、碎片化、不还给系统（低配设备 OOM 风险）。
+/// 从已按字典序排好、唯一的编码列表直接构建 DAT，不建中间 trie（几百万小节点会把堆撑高、
+/// 碎片化）。`data_index` = 编码在列表中的下标（= LeafTable 索引）。
 ///
-/// 原理：一个 trie 节点 ⇔ 一段**共享前缀**的连续编码区间 `[lo,hi)`（前缀 = codes[lo][..depth]）。
+/// 原理：一个 trie 节点 ⇔ 一段共享前缀的连续编码区间 `[lo,hi)`（前缀 = codes[lo][..depth]）。
 /// BFS 处理 (state, lo, hi, depth)：终止符 = 区间内 len==depth 的那个唯一编码（排序在最前）；
 /// 其余编码按第 depth 字节连续分组即各子节点的子区间。
 fn build_dat_from_sorted(codes: &[&str]) -> Dat {
@@ -94,14 +82,9 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
         }
     }
 
-    // 2) base/check 初始化（check=-1 表空闲），root 占位 0；空闲位置(1..)串成链表，
-    //    见 FreeList 顶部说明——这是解决大规模 key 集合构建退化为平方级耗时的关键。
-    //    按键数预留：实测 dat_size ≈ 2.3–5.2 × 键数（雾凇主表 52.5 万键 → 271 万，简拼 18.4 万
-    //    → 43 万），按 6× 预留就不再翻倍扩容——扩容要把 base/check/next/prev 四个数组各拷一遍，
-    //    那是构建期约 80 MB 瞬时峰值的来源；尾部多余的空闲最后一步裁掉，不进文件。
-    //    预留本身的常驻是 16 B × 槽数（check/next/prev 都实际写满）。它不比旧做法差：旧做法
-    //    翻倍扩容最终停在 ≥ dat_size 的 2 的幂上，即 (1–2) × dat_size ≈ (2.3–10.4) × 键数，
-    //    6× 落在这个区间里；低比例词库（简拼类 2.3×）多留一些，裁掉后 shrink_to_fit 归还。
+    // 2) base/check 初始化（check=-1 表空闲），root 占位 0；空闲位置(1..)串成链表（见 FreeList）。
+    //    按 6× 键数预留：dat_size 实际约 2.3–5.2 × 键数，预留够就不再翻倍扩容（扩容要拷四个
+    //    数组，是构建期瞬时峰值的来源）；尾部多余空闲最后裁掉、shrink_to_fit 归还。
     let cap = (codes.len().saturating_mul(6)).max(256);
     let mut base = vec![0i32; cap];
     let mut check = vec![-1i32; cap];
@@ -196,15 +179,8 @@ fn build_dat_from_sorted(codes: &[&str]) -> Dat {
 /// 空闲槽位链表：把 base/check 中未占用的位置（`check[i]==-1`）串成一条按位置升序的
 /// 双向链表。位置 0 恒为根状态的占位，永不入链。
 ///
-/// **它解决的问题**：旧实现里 `find_base` 从一个整数游标逐个探测候选 base 值，游标只在
-/// "已确认占用"的前缀上推进——一次探测中途放弃、试过但没用上的大段位置不会被记住，
-/// 下一次调用又要把同一片已知大概率冲突的区间从头探一遍。在大规模（百万级 key）、编码
-/// 集中在小字母表（如本项目 a-z）的码表下，这片"重复无效探测"随构建推进线性变长，
-/// 总代价退化为 O(状态数²)——真实词库（146 万 key）上实测数分钟不收敛、内存伴随大量
-/// "探测失败也触发扩容"的调用被撑到 GB 级。
-///
-/// 改为只在**当前确实空闲**的位置间跳转，代价与空闲位置数成正比、不受历史已占用区间
-/// 影响，是双数组树构建的标准解法（darts-clone / cedar 等实现均采用同类机制）。
+/// `find_base` 只在当前确实空闲的位置间跳转，代价与空闲位置数成正比。若改回整数游标逐个
+/// 探测，大规模小字母表码表的构建会退化为 O(状态数²)。这是 darts-clone / cedar 的标准做法。
 struct FreeList {
     /// next[i] = 位置 i 之后第一个空闲位置，0 表示链尾（0 本身不会是空闲位置）。
     next: Vec<u32>,
@@ -275,11 +251,9 @@ impl FreeList {
 
 /// 子节点数达到这个值的节点按「稀疏游标」安放（[`find_base_sparse`]）。
 ///
-/// 从空闲链表头起首次适配，对小节点很好（填满头部的空洞），对高分支节点是灾难：每个候选
-/// 位置都要查全部子节点，而头部区域早被小节点填得七零八落，几十个子节点同时落空的概率
-/// 极低，于是一路试到很远——雾凇简拼 DAT 只有主表 1/3 的键，构建却比主表慢一半，正是
-/// 这个退化。darts-clone / cedar 的做法是分两个游标：高分支节点去数组尾部的稀疏区，
-/// 小节点继续填头部的洞。阈值取 4：拼音与简拼树里 ≥4 个子节点的节点占比不高但耗时占大头。
+/// 首次适配从链表头找位置，对小节点好（填头部空洞），对高分支节点是灾难：头部早被填得
+/// 七零八落，几十个子节点同时落空的位置要试到很远。故仿 darts-clone / cedar 分两个游标，
+/// 高分支节点去尾部稀疏区。取 4：≥4 个子节点的节点占比不高但耗时占大头。
 const HIGH_FANOUT: usize = 4;
 
 /// 高分支节点的 base：从 `cursor`（上一个高分支节点落下的位置）起向后找，不回头。
@@ -351,12 +325,9 @@ fn find_base(codes: &[i32], base: &mut Vec<i32>, check: &mut Vec<i32>, free: &mu
         }
         // 候选 base：令最小编码的目标落在这个空闲位置上。
         //
-        // `b` 必须 ≥1（不能只满足 `b+min_code>=1`）：`base[s]<0` 是整个格式用来判定
-        // "s 是叶子"的符号约定（见 compute_maxw 与读取侧多处），只有真正的叶子节点会被
-        // 显式写入负的 `-(leaf)-1`；任何**非叶状态**（走到这里、正在为其子节点找 base 的
-        // 节点）的 base 若意外为负，会被这些判定误当成叶子，其整棵子树从此在自顶向下的
-        // 遍历里"消失"（点查询仍能用，因为它按字节走 check[] 链、不看符号——这正是本 bug
-        // 曾经的隐蔽之处：exact match 全绿，只有 MaxW/前缀分支限界会跳过整棵子树）。
+        // `b` 必须 ≥1（不能只满足 `b+min_code>=1`）：`base[s]<0` 是格式判定叶子的符号约定，
+        // 非叶状态的 base 若为负，整棵子树会在 MaxW/前缀分支限界的遍历里消失（点查按 check[]
+        // 走、不看符号，所以精确匹配测试测不出来）。
         let b = pos as i32 - min_code;
         if b < 1 {
             pos = free.next[pos as usize];
@@ -410,23 +381,17 @@ fn pool_hash(bytes: &[u8]) -> u64 {
     // 长度混进去：否则 "ab\0" 与 "ab" 在补零后同哈希（相等性仍由 slot_of 逐字节判，
     // 这里只是少一次探测冲突）。
     let h = (h.rotate_left(5) ^ bytes.len() as u64).wrapping_mul(SEED);
-    // ★ 终混：把高位转到低位。乘法积的低 k 位只取决于两个乘数的低 k 位，而 `slot_of` 取
-    // 槽用的恰恰是低位（`h & mask`）——不转的话，短中文串的落点几乎只由头两个字节决定。
-    // 拿拼音词库全部 64 万个唯一文本模拟，最终 2^21 槽：不转时平均探测 7.4 次、最坏 300+，
-    // 只落在 28.5 万个不同的槽；转过之后平均 1.2、最坏十几，与理想哈希持平。
-    // rustc-hash 2.x 在 `finish` 里补的也是这一下（同样是 26）。
+    // 终混：把高位转到低位。`slot_of` 取槽用低位（`h & mask`），而乘法积的低位只取决于乘数
+    // 低位，不转的话短中文串的落点几乎只由头两个字节决定，探测次数暴涨。rustc-hash 2.x 的
+    // `finish` 补的也是这一下（同样是 26）。
     h.rotate_left(26)
 }
 
 /// 字符串池（去重）。
 ///
-/// **索引里不存字符串副本**：槽位存的是 `(池内偏移, 字节长)`，判等时回 `buf` 取那段字节。
-/// 从前是 `HashMap<String, u32>`，每个唯一文本要在索引里再留一份 `String`，而同一份字节
-/// 已经躺在 `buf` 里了——雾凇 65 万条那次实测，这份副本白占 54 MB（`String` 头 24 字节 +
-/// 内容 + HashMap 自身的桶开销）。换成开放寻址后索引恒为 `8 字节 × 槽数`。
-///
-/// 顺带比 `HashMap<String, u32>` 快：省掉每个唯一文本一次堆分配 + memcpy，查找也不必
-/// 顺着 `String` 的指针跳到堆上另一处。
+/// 索引里不存字符串副本：槽位存 `(池内偏移, 字节长)`，判等时回 `buf` 取字节。比
+/// `HashMap<String, u32>` 省掉每个唯一文本一份 `String`（大词库上几十 MB）和一次堆分配，
+/// 索引恒为 `8 字节 × 槽数`。
 struct StringPool {
     buf: Vec<u8>,
     /// 开放寻址（线性探测）表，槽位 `(offset, len)`，`len == POOL_EMPTY` 为空。
@@ -528,11 +493,8 @@ fn rss_mb() -> u64 {
 
 /// 构建完成、待落盘的 .wdat 各段（含全部区段偏移）。由 [`WdatWriter::build`] 产出。
 ///
-/// 与 [`WdatWriter`] 分开，是为了**让条目数据早点死**：`build` 消费 writer，文本进池即
-/// 释放，走到这里时那批数据已经还给分配器了（雾凇 65 万条构建期实测占 130 MB）。
-///
-/// 可以 [`emit`](Self::emit) 多次：落盘失败要退到别的目录、或写成了却打不开要换个地方
-/// 重来时，需要的只是这些字节，不是条目。
+/// 与 [`WdatWriter`] 分开是为了让条目数据早点释放。可以 [`emit`](Self::emit) 多次：
+/// 落盘失败要退到别的目录或换个地方重来时，需要的只是这些字节。
 pub struct WdatBlob {
     dat: Dat,
     leaves: Vec<DatLeafRow>,
@@ -682,14 +644,9 @@ impl WdatBlob {
 
 /// 计算 MaxW 段（v6）：`maxw[s]` = 以状态 s 为根的子树中所有条目 weight 的最大值。
 ///
-/// 这是前缀 Top-K 查询的剪枝上界，须满足**不变量**：
-/// 对任意状态 s 与任意 `e ∈ subtree(s)`，有 `weight(e) <= maxw[s]`。
-/// 上界只需保守（偏大无害、偏小会漏结果），故任何"取 max"的实现错误方向都是危险的，
-/// 单元测试须逐状态对拍暴力计算的结果。
-///
-/// **实现为两趟而非递归**：DAT 深度等于最长编码长度，用户词库可能出现极长编码，
-/// 递归有栈溢出风险。第一趟前序 DFS 收集访问序（父必先于子出现），第二趟逆序回填
-/// （于是子必先于父被算出），等价于后序遍历且无递归。
+/// 不变量：对任意状态 s 与任意 `e ∈ subtree(s)`，`weight(e) <= maxw[s]`。偏大无害、偏小会漏
+/// 结果，单元测试须逐状态对拍暴力结果。实现为两趟而非递归（极长编码有栈溢出风险）：前序 DFS
+/// 收集访问序，再逆序回填，等价于后序遍历。
 fn compute_maxw(dat: &Dat, leaves: &[DatLeafRow], entries: &[DatEntryRow]) -> Vec<i32> {
     let n = dat.base.len();
     let mut maxw = vec![NO_MAXW; n];
@@ -763,12 +720,12 @@ fn compute_maxw(dat: &Dat, leaves: &[DatLeafRow], entries: &[DatEntryRow]) -> Ve
     maxw
 }
 
-/// wdat 写入器：与 binformat::DictWriter 同样接口（add(code, entries)），输出 DAT 格式。
-/// `add_abbrev` 追加简拼（声母缩写）表，写入独立 AbbrevSection（与全拼查询互不污染）。
 /// 写入侧的一条候选：`(text, weight, order, boundary)`。
 /// boundary 见 [`DictEntry::boundary`]（音节起始位 bitmask，0=无边界信息）。
 type WriteEntry = (String, i32, u32, u64);
 
+/// wdat 写入器：`add(code, entries)` 收集全部条目后一次构建。`add_abbrev` 追加简拼表，
+/// 写入独立 AbbrevSection（与全拼查询互不污染）。
 pub struct WdatWriter {
     keys: Vec<(String, Vec<WriteEntry>)>,
     abbrevs: Vec<(String, Vec<WriteEntry>)>,
@@ -796,14 +753,14 @@ impl WdatWriter {
     }
 
     /// 追加一个 code 的候选（`(text, weight)`）。order 按 code 内序号自动补全（向后兼容旧语义）。
-    /// 需要**跨编码全局自然序**（无权重按词库出现顺序）时改用 [`add_with_order`]。
+    /// 需要跨编码全局自然序（无权重按词库出现顺序）时改用 [`add_with_order`]。
     pub fn add(&mut self, code: String, entries: Vec<(String, i32)>) {
         if !entries.is_empty() {
             self.keys.push((code, with_local_order(entries)));
         }
     }
 
-    /// 追加一个 code 的候选，携带**显式全局 order**（`(text, weight, order)`）。
+    /// 追加一个 code 的候选，携带显式全局 order（`(text, weight, order)`）。
     /// order 为词库文件内的全局出现序（跨编码单调），使等权候选跨编码按出现顺序排列。
     /// order 须 < `composite::PER_LAYER_NO_OFFSET`（1e7），否则会溢出到层序偏移带。
     /// boundary 置 0（无边界信息）；拼音全量构建请用 [`Self::add_with_boundary`]。
@@ -819,7 +776,7 @@ impl WdatWriter {
         }
     }
 
-    /// 追加一个 code 的候选，携带 order **与音节边界**（`(text, weight, order, boundary)`）。
+    /// 追加一个 code 的候选，携带 order 与音节边界（`(text, weight, order, boundary)`）。
     /// 供拼音词典构建路径使用——边界取自 rime 源数据 `ni hao` 的空格（真值，非 DAG 猜测）。
     /// boundary 语义见 [`DictEntry::boundary`]。
     pub fn add_with_boundary(&mut self, code: String, entries: Vec<WriteEntry>) {
@@ -828,9 +785,8 @@ impl WdatWriter {
         }
     }
 
-    /// 追加简拼条目：`abbrev`=声母序列（`nh`），`entries` 每条 `(全拼码, weight)`
-    /// —— **存的是码不是词**（v5，见文件头版本说明）。空条目忽略；order 按叶内序号补全。
-    ///
+    /// 追加简拼条目：`abbrev`=声母序列（`nh`），`entries` 每条 `(全拼码, weight)`，
+    /// 存的是码不是词（v5）。空条目忽略；order 按叶内序号补全。
     /// `weight` 只决定该简拼下截断时保留哪些码，候选自身的权重来自主表。
     pub fn add_abbrev(&mut self, abbrev: String, entries: Vec<(String, i32)>) {
         if !entries.is_empty() {
@@ -846,25 +802,18 @@ impl WdatWriter {
         self.keys.len()
     }
 
-    /// 构建各段并原子写 .wdat（tmp+pid+seq → rename，与 binformat 一致，仅防读到半文件）。
-    ///
-    /// **消费 `self`**：文本进池即释放，写盘时条目数据已经还给分配器了（雾凇 65 万条那次
-    /// 实测，这批数据在构建期间占 130 MB）。
-    ///
-    /// 要在多个目标之间回退的调用方用 [`Self::build`] 拿到 [`WdatBlob`]，它可以落盘多次。
+    /// 构建各段并原子写 .wdat（tmp+pid+seq → rename，防读到半文件）。消费 `self`，让条目数据
+    /// 早点释放。要在多个目标之间回退的调用方用 [`Self::build`] 拿到可多次落盘的 [`WdatBlob`]。
     pub fn write(self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         self.build().emit(path.as_ref())
     }
 
-    /// 排序 + 建 DAT + 入池，产出待落盘的 [`WdatBlob`]。消费 `self`。
-    ///
-    /// 想落盘多次（正式路径写不进去要退到临时目录、或写成了但打不开要换个地方重来）就用
-    /// 这个：条目数据在这一步结束时已经释放，而 `WdatBlob::emit` 只碰那些字节。
+    /// 排序 + 建 DAT + 入池，产出待落盘的 [`WdatBlob`]。消费 `self`，条目数据在这一步结束时
+    /// 已释放；想落盘多次就用这个。
     pub fn build(mut self) -> WdatBlob {
-        // 按 code 排序（确定性 + DAT key 唯一）。排的是 owned 元组：下面要逐 code 把
-        // entries 喂进流式写入器后立刻释放，持引用做不到。
-        // 两条路径共用一套构建：排好序喂给流式写入器。同一输入两条路径逐字节相同，
-        // 这是 S3 对拍的基础（`stream_writer_matches_batch_writer_byte_for_byte`）。
+        // 按 code 排序（确定性 + DAT key 唯一）后喂给流式写入器，与流式路径共用一套构建，
+        // 同一输入逐字节相同（`stream_writer_matches_batch_writer_byte_for_byte`）。排 owned
+        // 元组是为了逐 code 喂完立刻释放。
         let t_all = std::time::Instant::now();
         let mut keys = std::mem::take(&mut self.keys);
         keys.sort_by(|a, b| a.0.cmp(&b.0));
@@ -888,9 +837,8 @@ impl WdatWriter {
     }
 }
 
-/// 流式写入器（S3）：code **按字节序严格递增**喂入，text 字节直接进池、不建 `String`；
-/// 码存进一个连续字节缓冲加偏移表，而不是几十万个 `String`。常驻 ≈ 池 + 条目行 + 码缓冲，
-/// 取代 [`WdatWriter`] 那份把全部条目以 owned 元组收满内存的做法。
+/// 流式写入器：code 按字节序严格递增喂入，text 字节直接进池、不建 `String`，码存进连续
+/// 字节缓冲加偏移表。常驻 ≈ 池 + 条目行 + 码缓冲，不像 [`WdatWriter`] 那样收满 owned 元组。
 ///
 /// 喂入顺序就是 DAT 的键序（由段的 [`WdatReader::codes`] 游标或排好序的内存表保证）；
 /// 简拼键同样按序喂入，各简拼下的条目顺序照原样写（调用方负责「权重降序、码升序」）。
@@ -970,7 +918,7 @@ impl WdatStreamWriter {
         self.code_spans
             .push((self.codes_buf.len() as u32, code.len() as u16));
         self.codes_buf.extend_from_slice(code.as_bytes());
-        // 叶的计数是 u16：超过 65535 条只截断**计数**，条目区偏移仍按实际条数前进——
+        // 叶的计数是 u16：超过 65535 条只截断计数，条目区偏移仍按实际条数前进——
         // 与从前 `build_section` 一致，后续叶的偏移才不会错位（release 不查溢出，
         // 用 u16 累加会回绕）。
         self.leaves
@@ -1223,14 +1171,11 @@ pub struct PrefixSearchStats {
     pub entries_read: usize,
 }
 
-/// 前缀查询的排序键。`Ord` 定义为「**越差越大**」，故堆顶恒为当前最差的入选者，
+/// 前缀查询的排序键。`Ord` 定义为「越差越大」，故堆顶恒为当前最差的入选者，
 /// 且 `into_sorted_vec()`（升序）直接给出最优→最差的最终顺序。
 ///
-/// 三、四级 tie-break 取 `(leaf, slot)`（LeafTable 索引 + 叶内序号）而**不是遍历序**。
-/// 这一点是必须的：`with_local_order` 写入的词库（`export_to_writer` / combined 合并路径）
-/// order 是「code 内序号 0,1,2」，等权时会大量打平；若拿遍历序做 tie-break，DFS 与分支限界
-/// 两种遍历顺序会给出不同结果——既无法对拍验证，也会让候选顺序随实现改动而抖动。
-/// `leaf` 是构建期按 code 字典序分配的稳定编号，任何遍历顺序下答案唯一。
+/// 三、四级 tie-break 取 `(leaf, slot)` 而不是遍历序：局部 order 的词库等权时大量打平，
+/// 拿遍历序会让 DFS 与分支限界给出不同结果，既无法对拍也会随实现改动抖动。
 #[derive(PartialEq, Eq)]
 struct RankKey {
     weight: i32,
@@ -1305,10 +1250,8 @@ impl PartialOrd for Pending {
     }
 }
 
-/// 路径链节点：`(父节点索引, 该步字节)`。
-///
-/// **入队时不拼 String**：入队状态数可能远大于最终产出条目数，且绝大多数入队项会被剪枝
-/// 丢弃，给它们各分配一个 code 字符串是纯浪费。只在真正要产出条目时才回溯拼接。
+/// 路径链节点：`(父节点索引, 该步字节)`。入队时不拼 String（多数入队项会被剪枝），
+/// 只在真正产出条目时才回溯拼接。
 struct PathNode {
     parent: u32,
     byte: u8,
@@ -1377,11 +1320,8 @@ impl Iterator for CodeCursor<'_> {
 
 pub struct WdatReader {
     mmap: Mapped,
-    /// 本 reader 映射的文件路径。
-    ///
-    /// 不是给日志用的：**二级缓存要靠它认出「我是从哪几个文件派生出来的」**
-    /// （见 `reverseidx` 的 `.wridx` 指纹）。自己在调用方那边重新推导一遍那些路径，
-    /// 就是本仓反复出现的「同一份推导写两处、其中一处悄悄过时」。
+    /// 本 reader 映射的文件路径。二级缓存（`.wridx` 指纹）靠它认出派生源，不要在调用方
+    /// 重新推导一遍。
     path: std::path::PathBuf,
     leaf_count: u32,
     str_off: usize, // 共享字符串池（主表与简拼共用）
@@ -1660,16 +1600,11 @@ impl WdatReader {
         self.abbrev.is_some()
     }
 
-    /// 是否存在**严格长于** `prefix` 的编码（trie 上即：prefix 状态还有非终止后继）。
+    /// 是否存在严格长于 `prefix` 的编码（trie 上即：prefix 状态还有非终止后继）。
     ///
-    /// 成本 O(max_code)（≤ 出现过的字节种数，码表约 26）次数组读，**不触碰 LeafTable /
-    /// StringPool**。这是给「更长后继」这类**存在性**判据用的——此前调用方一律走
-    /// `search_prefix(input, 64)` 再 `.any(code 更长)`，等于为一个 bool 遍历整棵子树，
-    /// 在 `ok` 拼字这类单前缀 8.8 万条的词库上单次即 20ms 级。
-    ///
-    /// 注意语义比「search_prefix 后 any」**更严格也更正确**：后者的结果先经权重排序截断
-    /// （长码候选权重低时会被挤出而漏判），跨层合并时还会因「同 text 取最短码」抹掉长码；
-    /// 本函数直接问 trie，不受二者影响。
+    /// 成本 O(max_code) 次数组读，不触碰 LeafTable / StringPool，供「更长后继」这类存在性判据用。
+    /// 别改回「`search_prefix` 后 `.any(更长)`」：那要遍历整棵子树，且结果经权重截断与跨层去重
+    /// 后会漏判长码。
     pub fn has_longer_code(&self, prefix: &str) -> bool {
         let v = &self.main;
         if v.dat_size == 0 {
@@ -1705,42 +1640,23 @@ impl WdatReader {
         s
     }
 
-    /// 前缀查找：按权重降序、order 升序取前 `limit` 条（与 binformat::DictReader 对齐）。
+    /// 前缀查找：按权重降序、order 升序取前 `limit` 条。
     ///
-    /// **v6 起为分支限界（branch and bound）**，成本随 `limit` 而非随子树规模增长。
-    /// 借助 v6 的 MaxW 段（`maxw[s]` = 子树内最大 weight）按上界降序展开状态，一旦
-    /// 「结果已满 且 当前出队项的上界严格劣于第 `limit` 名」即可终止——此时优先队列中
-    /// 剩余各项的上界都不高于它，其子树内条目全部不可能入选。
-    ///
-    /// 改此实现前请先读 `docs/design/prefix-topk-branch-and-bound.md` 的正确性论证。两处要害：
-    ///
-    /// 1. **剪枝判据必须是严格小于**。上界只覆盖 RankKey 的首要键 weight；`bound == 第 limit 名
-    ///    的 weight` 时，子树内仍可能有同 weight 而 order 更小的条目应当取代它。放宽成 `<=`
-    ///    会静默漏结果——没有崩溃、没有日志，只是候选少了几条。
-    /// 2. **`NO_MAXW` 子树直接跳过**：空子树无条目可贡献，入队只是浪费。
-    ///
-    /// 旧的全遍历实现保留为 [`search_prefix_scan`](Self::search_prefix_scan)，仅供对拍验证。
+    /// 分支限界：借 MaxW 段按上界降序展开状态，「结果已满且出队项上界严格劣于第 `limit` 名」
+    /// 即终止，成本随 `limit` 而非子树规模增长。改前先读
+    /// `docs/design/prefix-topk-branch-and-bound.md`。两处要害：剪枝判据必须是严格小于
+    /// （上界只覆盖 weight，同 weight 的条目仍可能按 order 胜出，放宽成 `<=` 会静默漏结果）；
+    /// `NO_MAXW` 子树直接跳过。全遍历参考实现见 [`search_prefix_scan`](Self::search_prefix_scan)。
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
         self.search_prefix_stats(prefix, limit).0
     }
 
-    /// 前缀查找，只取**音节数不超过 `max_syllables`** 且**在 `completed_len` 处音节边界
-    /// 对齐**的条目（拼音短输入严格档，判据见 [`crate::cached::prefix_entry_keep`]）。
+    /// 前缀查找，只取音节数不超过 `max_syllables` 且在 `completed_len` 处音节边界对齐的条目
+    /// （拼音短输入严格档，判据见 [`crate::cached::prefix_entry_keep`]）。
     ///
-    /// ## 为什么必须下推到这一层，而不是查完再过滤
-    ///
-    /// 过滤放在调用方时，`limit` 配额会被**注定要丢弃**的条目吃光：实测单字母 `d` 取
-    /// 1000 条补全，过闸门的只有 68 条单字，其余 932 条白占名额 —— 且把上限提到 5000
-    /// 也没用（`MAX_COMPLETION_CANDIDATES` clamp 在 1000），只是让 `push_unique` 的
-    /// O(n²) 查重陪跑。下推之后 top-N 直接就是 N 条合格条目。
-    ///
-    /// ## 剪枝仍然正确
-    ///
-    /// 过滤与分支限界的终止判据**正交**：`node.bound` 是子树内最大 weight 的上界，
-    /// `bound < worst.key.weight` 意味着该子树内**所有**条目（合格与否）都劣于当前第
-    /// `limit` 名，故合格条目也不可能入选，`break` 依然安全。代价在效率而非正确性 ——
-    /// 合格条目稀疏时堆更晚填满、剪枝更晚生效，扫描量上升。另按码长上限剪掉过深的子树，
-    /// 见 [`crate::cached::prefix_code_len_cap`]。
+    /// 过滤必须下推到这一层：放在调用方时 `limit` 配额会被注定丢弃的条目吃光。过滤与分支限界
+    /// 的终止判据正交（上界覆盖子树内全部条目），剪枝依然正确，代价只在合格条目稀疏时扫描量
+    /// 上升。另按码长上限剪掉过深子树，见 [`crate::cached::prefix_code_len_cap`]。
     pub fn search_prefix_syllable_capped(
         &self,
         prefix: &str,
@@ -1852,7 +1768,7 @@ impl WdatReader {
                         return;
                     }
                     if heap.len() >= limit {
-                        // 堆顶是最差的入选者：不严格优于它就丢弃——**先比较后分配**，
+                        // 堆顶是最差的入选者：不严格优于它就丢弃——先比较后分配，
                         // 绝大多数条目走到这里即返回，不触碰 code/text 的 to_string()。
                         match heap.peek() {
                             Some(worst) if key >= worst.key => return,
@@ -1911,12 +1827,12 @@ impl WdatReader {
     }
 
     /// 通配查询（`docs/design/codetable-wildcard.md` §5.1）：`pattern` 中等于 `wildcard`
-    /// 的字节位匹配**恰好一个**任意码元，其余位字面匹配。
+    /// 的字节位匹配恰好一个任意码元，其余位字面匹配。
     ///
-    /// 1. **逐位推进前沿**：通配位遍历该状态全部有效转移（`1..=max_code`，稀疏，`NO_MAXW`
+    /// 1. 逐位推进前沿：通配位遍历该状态全部有效转移（`1..=max_code`，稀疏，`NO_MAXW`
     ///    子树直接跳过），字面位走一次转移；
-    /// 2. **等长档**：前沿各状态的终止叶按 `RankKey` 取前 `limit`；
-    /// 3. **更长档**（`with_prefix`）：余额 `limit - 等长条数` 交给 [`Self::bnb_collect`]，
+    /// 2. 等长档：前沿各状态的终止叶按 `RankKey` 取前 `limit`；
+    /// 3. 更长档（`with_prefix`）：余额 `limit - 等长条数` 交给 [`Self::bnb_collect`]，
     ///    以全部前沿状态的子节点为多起点入队。
     ///
     /// 两档分开取额的理由见 [`crate::layer::DictLayer::search_pattern`]。首位即通配时
@@ -2063,13 +1979,10 @@ impl WdatReader {
         out
     }
 
-    /// 前缀查找的**全遍历参考实现**（v6 之前的行为）：DFS 整棵子树 + top-N 堆。
+    /// 前缀查找的全遍历参考实现：DFS 整棵子树 + top-N 堆。
     ///
-    /// 保留它只为验证：[`search_prefix`](Self::search_prefix) 的分支限界结果必须与本函数
-    /// **逐条一致**（测试 `bnb_matches_full_scan`）。剪枝一旦写错就是静默漏候选，
-    /// 唯有对拍能可靠地发现。
-    ///
-    /// 生产路径不应调用——它的成本随子树规模而非 `limit` 增长。
+    /// 只为对拍：[`search_prefix`](Self::search_prefix) 的结果必须与它逐条一致
+    /// （`bnb_matches_full_scan`）。生产路径不应调用，成本随子树规模增长。
     pub fn search_prefix_scan(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
         let v = &self.main;
         if v.dat_size == 0 || limit == 0 {
@@ -2115,10 +2028,8 @@ impl WdatReader {
             .collect()
     }
 
-    /// 遍历全部条目（供反查索引构建）：DFS 全树**流式**回调 (code,text,weight)，
-    /// 不累积全量 Vec——避免在大词库反查时堆起数十万 DictEntry（私有堆峰值/碎片）。
-    /// 主表全部 code 的**有序游标**（字节序递增，短码在长码前），每项 `(code, leaf)`；
-    /// 配合 [`Self::leaf_entries`] 读候选。供多段 k 路归并（S4）用：拉式迭代，不像
+    /// 主表全部 code 的有序游标（字节序递增，短码在长码前），每项 `(code, leaf)`；
+    /// 配合 [`Self::leaf_entries`] 读候选。供多段 k 路归并用：拉式迭代，不像
     /// [`Self::for_each_entry`] 那样要把整段推完。
     pub fn codes(&self) -> CodeCursor<'_> {
         CodeCursor {
@@ -2179,6 +2090,7 @@ impl WdatReader {
         }
     }
 
+    /// 遍历全部条目（供反查索引构建）：DFS 全树流式回调 (code,text,weight)，不累积全量 Vec。
     pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
         if self.main.dat_size == 0 {
             return;
@@ -2192,7 +2104,7 @@ impl WdatReader {
         });
     }
 
-    /// DFS 子树：对每个叶**流式**调用 on_leaf(完整code, leaf_idx)，不累积候选。
+    /// DFS 子树：对每个叶流式调用 on_leaf(完整code, leaf_idx)，不累积候选。
     /// 用显式栈避免深递归；path 随进出栈增删。
     fn for_each_leaf(
         &self,
@@ -2231,1130 +2143,5 @@ impl WdatReader {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build(tmp_name: &str, data: &[(&str, &[(&str, i32)])]) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(tmp_name);
-        let mut w = WdatWriter::new();
-        for (code, ents) in data {
-            let v: Vec<(String, i32)> = ents.iter().map(|(t, wt)| (t.to_string(), *wt)).collect();
-            w.add(code.to_string(), v);
-        }
-        w.write(&p).expect("write wdat");
-        p
-    }
-
-    /// 按 (code, entries) 构建 wdat（owned 版，供批量生成用例）。走 `WdatWriter::add`
-    /// → `with_local_order`，即 order = code 内序号——与 `export_to_writer` / combined
-    /// 合并路径同语义，单条 code 时 order 恒 0（等权即全打平，最坏 tie-break 场景）。
-    fn build_owned(tmp_name: &str, data: &[(String, Vec<(String, i32)>)]) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(tmp_name);
-        let mut w = WdatWriter::new();
-        for (code, ents) in data {
-            w.add(code.clone(), ents.clone());
-        }
-        w.write(&p).expect("write wdat");
-        p
-    }
-
-    /// 参考实现 = 改造前的「DFS 全量收集 → 稳定排序 → 截断」。作为差分对比的黄金标准：
-    /// top-N 堆的输出必须与它**逐条相同**（含顺序），否则即为正确性回归。
-    fn reference_prefix(r: &WdatReader, prefix: &str, limit: usize) -> Vec<DictEntry> {
-        let v = &r.main;
-        let Some(start) = r.walk(v, prefix) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        let mut path: Vec<u8> = prefix.as_bytes().to_vec();
-        r.for_each_leaf(v, start, &mut path, &mut |code, leaf| {
-            r.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
-                out.push(DictEntry {
-                    code: code.to_string(),
-                    text: text.to_string(),
-                    weight,
-                    order,
-                    boundary,
-                });
-            });
-        });
-        out.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
-        out.truncate(limit);
-        out
-    }
-
-    /// 通配查询的**全遍历参考实现**：全树 DFS 收集全部条目 → 按 pattern 过滤 →
-    /// 等长 / 更长两档各自按 (weight 降, order 升) 稳定排序 → 等长先取满 `limit`，余额给更长档。
-    /// DFS 序即叶号序（构建期按 code 字典序分配），故稳定排序的 tie-break 与 `RankKey` 一致。
-    fn reference_pattern(
-        r: &WdatReader,
-        pattern: &str,
-        wildcard: char,
-        limit: usize,
-        with_prefix: bool,
-    ) -> Vec<DictEntry> {
-        let v = &r.main;
-        let n = pattern.len();
-        let mut exact: Vec<DictEntry> = Vec::new();
-        let mut longer: Vec<DictEntry> = Vec::new();
-        let mut path: Vec<u8> = Vec::new();
-        r.for_each_leaf(v, 0, &mut path, &mut |code, leaf| {
-            if !crate::layer::pattern_matches(pattern, wildcard, code, with_prefix) {
-                return;
-            }
-            let bucket = if code.len() == n {
-                &mut exact
-            } else {
-                &mut longer
-            };
-            r.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
-                bucket.push(DictEntry {
-                    code: code.to_string(),
-                    text: text.to_string(),
-                    weight,
-                    order,
-                    boundary,
-                });
-            });
-        });
-        let key =
-            |a: &DictEntry, b: &DictEntry| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order));
-        exact.sort_by(key);
-        longer.sort_by(key);
-        exact.truncate(limit);
-        let rest = limit - exact.len();
-        longer.truncate(rest);
-        exact.extend(longer);
-        exact
-    }
-
-    /// 通配查询 == 全遍历参考实现，逐条相同（含顺序）。覆盖多通配、首位通配、`with_prefix`、
-    /// 转移空洞（`i % 5` 挖掉的码）与大量等权 tie-break。
-    #[test]
-    fn search_pattern_matches_full_scan() {
-        let alphabet = ['a', 'b', 'c'];
-        let mut data: Vec<(String, Vec<(String, i32)>)> = Vec::new();
-        let mut i = 0u32;
-        for len in 1..=4u32 {
-            for k in 0..3usize.pow(len) {
-                let mut code = String::new();
-                let mut x = k;
-                for _ in 0..len {
-                    code.push(alphabet[x % 3]);
-                    x /= 3;
-                }
-                i += 1;
-                if i.is_multiple_of(5) {
-                    continue; // 挖空洞：逼出「该位无此转移」的分支
-                }
-                let w = ((i * 7919) % 7) as i32 * 100; // 权重大量重复，逼出 tie-break
-                let mut ents = vec![(format!("甲{i}"), w)];
-                if i.is_multiple_of(4) {
-                    ents.push((format!("乙{i}"), w)); // 一码多词
-                }
-                data.push((code, ents));
-            }
-        }
-        let p = build_owned("wdat_pattern_full_scan.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-        for pat in ["?", "a?", "?b", "??", "a?c", "??c?", "????", "c??a", "?a"] {
-            for with_prefix in [false, true] {
-                for limit in [1usize, 3, 10, 1000] {
-                    assert_same(
-                        &r.search_pattern(pat, '?', limit, with_prefix),
-                        &reference_pattern(&r, pat, '?', limit, with_prefix),
-                        &format!("pat={pat} with_prefix={with_prefix} limit={limit}"),
-                    );
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// ★ 等长档不得被更长的高权重编码挤出配额（Review Focus 第 5 条）。
-    #[test]
-    fn search_pattern_equal_length_never_crowded_out() {
-        let p = build(
-            "wdat_pattern_quota.wdat",
-            &[
-                ("ab", &[("等长", 1)]),
-                ("abcd", &[("长码", 9999)]),
-                ("ac", &[("等长二", 2)]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        let texts = |v: Vec<DictEntry>| v.into_iter().map(|e| e.text).collect::<Vec<_>>();
-        assert_eq!(
-            texts(r.search_pattern("a?", '?', 1, true)),
-            ["等长二"],
-            "limit=1 时名额先给等长档"
-        );
-        assert_eq!(
-            texts(r.search_pattern("a?", '?', 3, true)),
-            ["等长二", "等长", "长码"]
-        );
-        assert_eq!(
-            texts(r.search_pattern("a?", '?', 3, false)),
-            ["等长二", "等长"],
-            "不带前缀补全时只出等长"
-        );
-        assert!(
-            r.search_pattern("x?", '?', 3, true).is_empty(),
-            "字面位无转移 ⇒ 空"
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    fn assert_same(actual: &[DictEntry], expect: &[DictEntry], ctx: &str) {
-        let a: Vec<_> = actual
-            .iter()
-            .map(|e| (&e.code, &e.text, e.weight))
-            .collect();
-        let b: Vec<_> = expect
-            .iter()
-            .map(|e| (&e.code, &e.text, e.weight))
-            .collect();
-        assert_eq!(a, b, "{ctx}");
-    }
-
-    /// top-N 堆 == 全量排序取前 N，在**权重与 order 全部打平**时也成立。
-    ///
-    /// 这是 `ok` 拼字词库的真实形状：88020 条无 weight 列（全取 default_weight），
-    /// 每 code 单条（order 恒 0）。此时两级排序键完全失效，顺序只由稳定排序的
-    /// 「保持 DFS 序」兜底——正是 top-N 堆最容易与全排序分歧之处（堆本身不稳定，
-    /// 靠 `RankKey::seq` 复现）。
-    #[test]
-    fn topn_prefix_matches_full_sort_when_all_keys_tie() {
-        let data: Vec<(String, Vec<(String, i32)>)> = (0..500u32)
-            .map(|i| {
-                let c1 = (b'a' + (i / 26) as u8) as char;
-                let c2 = (b'a' + (i % 26) as u8) as char;
-                (format!("ok{c1}{c2}"), vec![(format!("字{i}"), 0)])
-            })
-            .collect();
-        let p = build_owned("wdat_topn_all_tie.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-
-        for limit in [1usize, 5, 90, 499, 500, 501, 1000] {
-            assert_same(
-                &r.search_prefix("ok", limit),
-                &reference_prefix(&r, "ok", limit),
-                &format!("全打平 limit={limit}"),
-            );
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// top-N 堆 == 全量排序取前 N，混合权重 + 同 code 多条（order 0,1,2）时也成立。
-    #[test]
-    fn topn_prefix_matches_full_sort_mixed_weights() {
-        let data: Vec<(String, Vec<(String, i32)>)> = (0..200u32)
-            .map(|i| {
-                let c1 = (b'a' + (i / 26) as u8) as char;
-                let c2 = (b'a' + (i % 26) as u8) as char;
-                // 权重故意大量重复（i % 7），并让部分 code 带 2 条（order 0/1）。
-                let mut ents = vec![(format!("甲{i}"), (i % 7) as i32 * 100)];
-                if i % 3 == 0 {
-                    ents.push((format!("乙{i}"), (i % 7) as i32 * 100));
-                }
-                (format!("ok{c1}{c2}"), ents)
-            })
-            .collect();
-        let p = build_owned("wdat_topn_mixed.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-
-        for limit in [1usize, 3, 50, 200, 999] {
-            assert_same(
-                &r.search_prefix("ok", limit),
-                &reference_prefix(&r, "ok", limit),
-                &format!("混合权重 limit={limit}"),
-            );
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **剪枝确实发生**：权重有区分度时，小 limit 的访问状态数须远低于全遍历。
-    ///
-    /// ⚠️ 上面两个对拍测试证明不了这件事。`..._all_keys_tie` 里 weight 全为 0，剪枝判据
-    /// `bound < worst.weight` 即 `0 < 0` 恒假，分支限界**退化成全遍历**，结果自然一致——
-    /// 剪枝逻辑若被误删或写成恒不触发，那个测试照样全绿。本测试直接钉 `states_visited`，
-    /// 是「剪枝真的执行了」唯一的证据。
-    #[test]
-    fn bnb_actually_prunes_when_weights_differ() {
-        let data: Vec<(String, Vec<(String, i32)>)> = (0..676u32)
-            .map(|i| {
-                let c1 = (b'a' + (i / 26) as u8) as char;
-                let c2 = (b'a' + (i % 26) as u8) as char;
-                // 伪随机但确定的权重，让高权重分散到不同子树（逼近真实词库形状）。
-                let w = ((i * 7919) % 10000) as i32;
-                (format!("ok{c1}{c2}"), vec![(format!("字{i}"), w)])
-            })
-            .collect();
-        let p = build_owned("wdat_bnb_prune.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-
-        let (_, full) = r.search_prefix_stats("ok", 100_000);
-        let (_, few) = r.search_prefix_stats("ok", 5);
-        assert!(
-            few.states_visited * 4 < full.states_visited,
-            "limit=5 应因剪枝远少于全遍历：few={} full={}",
-            few.states_visited,
-            full.states_visited
-        );
-        // 剪枝不得损害正确性。
-        for limit in [1usize, 5, 40, 676, 999] {
-            assert_same(
-                &r.search_prefix("ok", limit),
-                &r.search_prefix_scan("ok", limit),
-                &format!("剪枝对拍 limit={limit}"),
-            );
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 裸声母（`sh`、cap=1）的形状：单字稀疏且权重低，每棵子树都挂着高权重的多音节词，
-    /// 按权重上界剪不动。码长上限的深度剪枝须既剪得动、又与全量过滤逐条一致。
-    #[test]
-    fn syllable_capped_prunes_by_code_len() {
-        let firsts = [
-            "sha", "shan", "shang", "she", "shen", "sheng", "shi", "shu", "shuang",
-        ];
-        let seconds = ["de", "men", "hou", "jian", "zhong", "guo", "ren", "zhuang"];
-        let mut data: Vec<(String, Vec<WriteEntry>)> = Vec::new();
-        for (i, s1) in firsts.iter().enumerate() {
-            data.push((s1.to_string(), vec![(format!("单{i}"), i as i32 + 1, 0, 1)]));
-            for (j, s2) in seconds.iter().enumerate() {
-                let b2 = 1u64 | 1 << s1.len();
-                data.push((
-                    format!("{s1}{s2}"),
-                    vec![(format!("词{i}{j}"), 1000, 0, b2)],
-                ));
-                for s3 in &seconds {
-                    let b3 = b2 | 1 << (s1.len() + s2.len());
-                    data.push((
-                        format!("{s1}{s2}{s3}"),
-                        vec![(format!("长{i}{j}"), 2000, 0, b3)],
-                    ));
-                }
-            }
-        }
-        // 无边界信息：码长 ≤ 6 的放行，超过的拦下。
-        data.push(("shix".into(), vec![("短无界".into(), 50, 0, 0)]));
-        data.push(("shishishi".into(), vec![("长无界".into(), 5000, 0, 0)]));
-        data.sort_by(|a, b| a.0.cmp(&b.0));
-        data.dedup_by(|a, b| a.0 == b.0);
-        let p = std::env::temp_dir().join("wdat_capped_len.wdat");
-        let mut w = WdatWriter::new();
-        for (code, ents) in data {
-            w.add_with_boundary(code, ents);
-        }
-        w.write(&p).expect("write wdat");
-        let r = WdatReader::open(&p).unwrap();
-
-        let expect = |limit: usize| -> Vec<DictEntry> {
-            let mut all = reference_prefix(&r, "sh", 100_000);
-            all.retain(|e| {
-                e.code.len() <= crate::cached::prefix_code_len_cap(1)
-                    && crate::cached::prefix_entry_keep(e.boundary, e.code.len(), 1, 0)
-            });
-            all.truncate(limit);
-            all
-        };
-        let got = r.search_prefix_syllable_capped("sh", 300, 1, 0);
-        assert!(got.iter().any(|e| e.text == "短无界"));
-        assert!(got.iter().all(|e| e.text != "长无界"));
-        for limit in [1usize, 5, 10, 300] {
-            assert_same(
-                &r.search_prefix_syllable_capped("sh", limit, 1, 0),
-                &expect(limit),
-                &format!("码长剪枝对拍 limit={limit}"),
-            );
-        }
-        let (_, capped) = r.search_prefix_inner("sh", 300, Some((1, 0)));
-        let (_, full) = r.search_prefix_stats("sh", 100_000);
-        assert!(
-            capped.states_visited * 4 < full.states_visited,
-            "cap=1 应按码长剪掉深层子树：capped={} full={}",
-            capped.states_visited,
-            full.states_visited
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **剪枝判据必须是严格小于**，放宽成 `<=` 即静默漏候选。
-    ///
-    /// 上界只覆盖 RankKey 的首要键 weight。`bound == 第 limit 名的 weight` 时，该子树内
-    /// 仍可能有同 weight 但 order/leaf 更小的条目应当取代第 limit 名。
-    ///
-    /// 构造刻意让**出队顺序完全确定**（否则 `<` 与 `<=` 的差异会随 tie 顺序时隐时现，
-    /// 测试变成抛硬币）：`za` 一个叶子内含两条（300/100）**一次性填满 limit=2**，
-    /// 于是 worst 的 weight=100 由它独自决定；此时唯一待展开的 `a` 子树 maxw 恰为 100。
-    /// `甲`(order=0, leaf=0) 优于 `丙`(order=1, leaf=1)，故必须能取代它。
-    #[test]
-    fn pruning_bound_must_be_strictly_less() {
-        let p = build(
-            "wdat_bnb_strict.wdat",
-            &[
-                ("ab", &[("甲", 100)][..]),
-                ("za", &[("乙", 300), ("丙", 100)][..]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        let got: Vec<String> = r
-            .search_prefix("", 2)
-            .iter()
-            .map(|e| e.text.clone())
-            .collect();
-        assert_eq!(
-            got,
-            vec!["乙".to_string(), "甲".to_string()],
-            "同 weight 时 order 更小的「甲」应取代「丙」；若剪枝误用 <=，「甲」所在子树被整棵跳过"
-        );
-        assert_same(
-            &r.search_prefix("", 2),
-            &r.search_prefix_scan("", 2),
-            "严格小于对拍",
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// `maxw` 必须是**真实上界**：偏大只是剪枝变弱（结果仍正确），偏小则静默漏候选。
-    /// 逐前缀与暴力遍历子树求得的最大 weight 对拍。
-    #[test]
-    fn maxw_equals_brute_force_subtree_max() {
-        let p = build(
-            "wdat_maxw_bound.wdat",
-            &[
-                ("ab", &[("甲", 100)][..]),
-                ("abc", &[("乙", 700)][..]),
-                ("abd", &[("丙", 300)][..]),
-                ("az", &[("丁", 50)][..]),
-                ("z", &[("戊", 900)][..]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        let v = &r.main;
-        for prefix in ["", "a", "ab", "abc", "abd", "az", "z"] {
-            let Some(s) = r.walk(v, prefix) else {
-                panic!("前缀 {prefix:?} 应可达");
-            };
-            let mut brute = NO_MAXW;
-            let mut path: Vec<u8> = prefix.as_bytes().to_vec();
-            r.for_each_leaf(v, s, &mut path, &mut |_code, leaf| {
-                r.read_leaf_entries(v, leaf, &mut |_t, w, _o, _b| {
-                    brute = brute.max(w);
-                });
-            });
-            assert_eq!(
-                r.maxw(v, s),
-                brute,
-                "前缀 {prefix:?} 的子树权重上界与暴力结果不符"
-            );
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **护栏**：DFS 必须遍历完整棵子树，不得早停。
-    ///
-    /// 最高权重的词放在字典序最末。若把本函数「优化」成 `codetable.rs` / `binformat.rs`
-    /// 那种「攒够 limit(*2) 就 break」，DFS 按字典序推进，这条永远进不了结果集——
-    /// 那正是本次修复**刻意没有采用**早停方案的原因（8.8 万条的库上偏差极显著）。
-    #[test]
-    fn topn_prefix_keeps_high_weight_entry_at_lexical_tail() {
-        let mut data: Vec<(String, Vec<(String, i32)>)> = (0..400u32)
-            .map(|i| {
-                let c1 = (b'a' + (i / 26) as u8) as char;
-                let c2 = (b'a' + (i % 26) as u8) as char;
-                (format!("ok{c1}{c2}"), vec![(format!("庸{i}"), 10)])
-            })
-            .collect();
-        data.push(("okzz".to_string(), vec![("压轴".to_string(), 9999)]));
-        let p = build_owned("wdat_topn_tail.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-
-        let out = r.search_prefix("ok", 5);
-        assert_eq!(out.len(), 5);
-        assert_eq!(
-            out[0].text, "压轴",
-            "字典序最末的高权重词被漏掉 ⇒ DFS 提前中止了"
-        );
-        assert_eq!(out[0].code, "okzz");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// `has_longer_code` 的基本语义：只认**严格更长**的后继，前缀自身成词不算。
-    #[test]
-    fn has_longer_code_semantics() {
-        let p = build(
-            "wdat_has_longer.wdat",
-            &[
-                ("ok", &[("好", 10)]),     // 自身成词，且下面还有更长的
-                ("okz", &[("仄", 10)]),    // 中间节点，自身也成词
-                ("okzz", &[("最长", 10)]), // 该支最长
-                ("om", &[("某", 10)]),     // 自身成词，无更长后继
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-
-        assert!(r.has_longer_code(""), "空前缀：词库非空即有更长码");
-        assert!(r.has_longer_code("o"), "o 下有 ok/om");
-        assert!(r.has_longer_code("ok"), "ok 自身成词，但下面还有 okz/okzz");
-        assert!(r.has_longer_code("okz"), "okz 自身成词，但下面还有 okzz");
-        assert!(!r.has_longer_code("okzz"), "okzz 是该支最长，无更长后继");
-        assert!(!r.has_longer_code("om"), "om 自身成词且无后继");
-        assert!(!r.has_longer_code("xyz"), "前缀不存在");
-        assert!(!r.has_longer_code("okzzz"), "越过最长码");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// `has_longer_code` 与旧判据（`search_prefix(_, 64)` 再 `any(code 更长)`）在
-    /// **未触发截断**时逐一致——覆盖「前缀自身成词 / 中间节点 / 叶子 / 不存在」四类位置。
-    ///
-    /// 二者并非全等：旧判据经权重排序截断，长码候选权重偏低被挤出前 64 名时会漏判成
-    /// false。新实现直接问 trie，故 **新 ⊇ 旧**（只会更保守，不会更激进）——这正是
-    /// 「更长后继」作为上屏安全阀所需的方向。本测试锁住未截断场景下二者不得分歧。
-    #[test]
-    fn has_longer_code_agrees_with_legacy_predicate_when_untruncated() {
-        let data: Vec<(String, Vec<(String, i32)>)> = (0..300u32)
-            .map(|i| {
-                let c1 = (b'a' + (i / 26) as u8) as char;
-                let c2 = (b'a' + (i % 26) as u8) as char;
-                // 一半是 3 码（叶），一半再挂 4 码后继 → 覆盖有/无更长后继两类。
-                if i % 2 == 0 {
-                    (format!("z{c1}{c2}"), vec![(format!("甲{i}"), 10)])
-                } else {
-                    (format!("z{c1}{c2}q"), vec![(format!("乙{i}"), 10)])
-                }
-            })
-            .collect();
-        let p = build_owned("wdat_has_longer_agree.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-
-        let legacy = |prefix: &str| -> bool {
-            let n = prefix.chars().count();
-            r.search_prefix(prefix, 64)
-                .iter()
-                .any(|e| e.code.chars().count() > n)
-        };
-        // 枚举全部编码的全部前缀 + 空串 + 若干不存在的码。
-        let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        prefixes.insert(String::new());
-        for extra in ["zzzz", "q", "z"] {
-            prefixes.insert(extra.to_string());
-        }
-        r.for_each_entry(&mut |code, _t, _w| {
-            for i in 1..=code.len() {
-                prefixes.insert(code[..i].to_string());
-            }
-        });
-        for pre in &prefixes {
-            assert_eq!(
-                r.has_longer_code(pre),
-                legacy(pre),
-                "前缀 {pre:?} 上新旧判据分歧"
-            );
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// limit=0 → 空（与改造前 `truncate(0)` 语义一致，且不做无谓的 DFS）。
-    #[test]
-    fn topn_prefix_limit_zero_is_empty() {
-        let data = vec![("oka".to_string(), vec![("甲".to_string(), 10)])];
-        let p = build_owned("wdat_topn_zero.wdat", &data);
-        let r = WdatReader::open(&p).unwrap();
-        assert!(r.search_prefix("ok", 0).is_empty());
-        assert_eq!(r.search_prefix("ok", 1).len(), 1);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn exact_match_multi_key() {
-        let p = build(
-            "wdat_exact_test.wdat",
-            &[
-                ("a", &[("工", 9999), ("戈", 100)]),
-                ("ni", &[("你", 800), ("尼", 50)]),
-                ("nihao", &[("你好", 1200)]),
-                ("zhongguo", &[("中国", 2000)]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        assert_eq!(r.key_count(), 4);
-
-        let a = r.search("a");
-        assert_eq!(a.len(), 2);
-        assert!(a.iter().any(|e| e.text == "工" && e.weight == 9999));
-        assert!(a.iter().any(|e| e.text == "戈"));
-
-        let nihao = r.search("nihao");
-        assert_eq!(nihao.len(), 1);
-        assert_eq!(nihao[0].text, "你好");
-        assert_eq!(nihao[0].weight, 1200);
-        assert_eq!(nihao[0].code, "nihao");
-
-        let zg = r.search("zhongguo");
-        assert_eq!(zg.len(), 1);
-        assert_eq!(zg[0].text, "中国");
-
-        // 不存在的 code。
-        assert!(r.search("xyz").is_empty());
-        assert!(r.search("n").is_empty()); // "n" 非终止（是 ni/nihao 前缀但无 n 自身词）
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn prefix_collects_subtree_with_codes() {
-        let p = build(
-            "wdat_prefix_test.wdat",
-            &[
-                ("ni", &[("你", 800)]),
-                ("nihao", &[("你好", 1200)]),
-                ("nihaoma", &[("你好吗", 300)]),
-                ("nin", &[("您", 600)]),
-                ("zhong", &[("中", 500)]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        // 前缀 "ni" → ni/nihao/nihaoma/nin（不含 zhong）。
-        let res = r.search_prefix("ni", 10);
-        let texts: Vec<&str> = res.iter().map(|e| e.text.as_str()).collect();
-        assert!(texts.contains(&"你"));
-        assert!(texts.contains(&"你好"));
-        assert!(texts.contains(&"你好吗"));
-        assert!(texts.contains(&"您"));
-        assert!(!texts.contains(&"中"), "前缀 ni 不应含 zhong: {texts:?}");
-        // 重建的 code 正确。
-        let nihao = res.iter().find(|e| e.text == "你好").unwrap();
-        assert_eq!(nihao.code, "nihao");
-        let nihaoma = res.iter().find(|e| e.text == "你好吗").unwrap();
-        assert_eq!(nihaoma.code, "nihaoma");
-        // 按权重降序。
-        assert_eq!(res[0].text, "你好", "最高权重 1200 应排首: {texts:?}");
-        // limit 截断。
-        assert_eq!(r.search_prefix("ni", 2).len(), 2);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 回归（wdat v3）：无权重（全同权）时，跨编码前缀查询应按**全局 order（词库出现顺序）**
-    /// 排列，而非退化为编码字母序。构造 order 与字母序相反以区分两者。
-    #[test]
-    fn prefix_no_weight_sorts_by_global_order_not_code() {
-        let p = std::env::temp_dir().join("wdat_global_order_test.wdat");
-        let mut w = WdatWriter::new();
-        // 出现顺序 za → ma → aa（order 0,1,2），编码字母序则相反 aa < ma < za；权重全 0。
-        w.add_with_order("za".to_string(), vec![("Z".to_string(), 0, 0)]);
-        w.add_with_order("ma".to_string(), vec![("M".to_string(), 0, 1)]);
-        w.add_with_order("aa".to_string(), vec![("A".to_string(), 0, 2)]);
-        w.write(&p).expect("write wdat");
-        let r = WdatReader::open(&p).unwrap();
-        let res = r.search_prefix("", 10);
-        let texts: Vec<&str> = res.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(
-            texts,
-            vec!["Z", "M", "A"],
-            "无权重应按全局 order（出现序）排序而非编码字母序，实际: {texts:?}"
-        );
-        // 单编码多条同权：前缀查询（会按 weight desc、order asc 排序）亦按 order 升序恢复出现序。
-        // （精确 search 不排序、返回叶内存储序——生产路径写入前已预排序，故存储序即展示序。）
-        let mut w2 = WdatWriter::new();
-        w2.add_with_order(
-            "aa".to_string(),
-            vec![
-                ("三".to_string(), 0, 2),
-                ("一".to_string(), 0, 0),
-                ("二".to_string(), 0, 1),
-            ],
-        );
-        let p2 = std::env::temp_dir().join("wdat_global_order_test2.wdat");
-        w2.write(&p2).expect("write wdat");
-        let r2 = WdatReader::open(&p2).unwrap();
-        let t2: Vec<String> = r2
-            .search_prefix("aa", 10)
-            .into_iter()
-            .map(|e| e.text)
-            .collect();
-        assert_eq!(
-            t2,
-            vec!["一", "二", "三"],
-            "同码同权前缀查询应按 order 升序"
-        );
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(&p2);
-    }
-
-    #[test]
-    fn for_each_enumerates_all() {
-        let p = build(
-            "wdat_foreach_test.wdat",
-            &[("a", &[("工", 9999), ("戈", 100)]), ("aaaa", &[("叕", 50)])],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        let mut got: Vec<(String, String, i32)> = Vec::new();
-        r.for_each_entry(&mut |c, t, w| got.push((c.to_string(), t.to_string(), w)));
-        assert_eq!(got.len(), 3, "应枚举 3 条: {got:?}");
-        assert!(got.contains(&("a".to_string(), "工".to_string(), 9999)));
-        assert!(got.contains(&("a".to_string(), "戈".to_string(), 100)));
-        assert!(got.contains(&("aaaa".to_string(), "叕".to_string(), 50)));
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// **对拍**：同一份数据分别建 wdb(binformat) 与 wdat，比对精确/前缀/全枚举查询结果一致
-    /// （按 (code,text,weight) 集合比较，忽略 natural_order 这一格式差异）。这是 wdb→wdat
-    /// 迁移的核心正确性保证。
-    #[test]
-    fn parity_with_wdb() {
-        use crate::binformat::{DictReader, DictWriter};
-        let data: Vec<(&str, Vec<(&str, i32)>)> = vec![
-            ("a", vec![("工", 9999), ("戈", 100)]),
-            ("ni", vec![("你", 800), ("尼", 50)]),
-            ("nihao", vec![("你好", 1200)]),
-            ("nihaoma", vec![("你好吗", 300)]),
-            ("nin", vec![("您", 600)]),
-            ("zhong", vec![("中", 500)]),
-            ("zhongguo", vec![("中国", 2000)]),
-            ("zhi", vec![("之", 700), ("知", 690)]),
-        ];
-        let to_owned = |e: &Vec<(&str, i32)>| -> Vec<(String, i32)> {
-            e.iter().map(|(t, w)| (t.to_string(), *w)).collect()
-        };
-
-        let wdb_path = std::env::temp_dir().join("wdat_parity.wdb");
-        let mut dw = DictWriter::new();
-        for (c, e) in &data {
-            dw.add(c.to_string(), to_owned(e));
-        }
-        dw.write(&wdb_path).unwrap();
-        let wdb = DictReader::open(&wdb_path).unwrap();
-
-        let wdat_path = std::env::temp_dir().join("wdat_parity.wdat");
-        let mut ww = WdatWriter::new();
-        for (c, e) in &data {
-            ww.add(c.to_string(), to_owned(e));
-        }
-        ww.write(&wdat_path).unwrap();
-        let wdat = WdatReader::open(&wdat_path).unwrap();
-
-        assert_eq!(wdb.key_count(), wdat.key_count(), "key_count 应一致");
-
-        // 精确：每个 code 的 (text,weight) 集合一致。
-        for (c, _) in &data {
-            let mut a: Vec<(String, i32)> = wdb
-                .search(c)
-                .into_iter()
-                .map(|e| (e.text, e.weight))
-                .collect();
-            let mut b: Vec<(String, i32)> = wdat
-                .search(c)
-                .into_iter()
-                .map(|e| (e.text, e.weight))
-                .collect();
-            a.sort();
-            b.sort();
-            assert_eq!(a, b, "精确查询 '{c}' 不一致");
-        }
-        // 不存在 code 两者都空。
-        assert!(wdb.search("xyz").is_empty() && wdat.search("xyz").is_empty());
-
-        // 前缀：(code,text,weight) 集合一致（含空前缀=全量、单字母、整码）。
-        for pre in ["ni", "n", "nih", "zhong", "z", "a", "zh", ""] {
-            let mut a: Vec<(String, String, i32)> = wdb
-                .search_prefix(pre, 100000)
-                .into_iter()
-                .map(|e| (e.code, e.text, e.weight))
-                .collect();
-            let mut b: Vec<(String, String, i32)> = wdat
-                .search_prefix(pre, 100000)
-                .into_iter()
-                .map(|e| (e.code, e.text, e.weight))
-                .collect();
-            a.sort();
-            b.sort();
-            assert_eq!(a, b, "前缀查询 '{pre}' 不一致");
-        }
-
-        // for_each_entry：全量 (code,text,weight) 集合一致。
-        let mut ea = Vec::new();
-        wdb.for_each_entry(&mut |c, t, w| ea.push((c.to_string(), t.to_string(), w)));
-        let mut eb = Vec::new();
-        wdat.for_each_entry(&mut |c, t, w| eb.push((c.to_string(), t.to_string(), w)));
-        ea.sort();
-        eb.sort();
-        assert_eq!(ea, eb, "全枚举不一致");
-
-        let _ = std::fs::remove_file(&wdb_path);
-        let _ = std::fs::remove_file(&wdat_path);
-    }
-
-    /// `pool_hash` 的**低位**必须分布开——开放寻址取槽用的是 `h & mask`。
-    ///
-    /// 去重测试守不住这条：哈希再烂，判等也是逐字节的，结果永远对，只是线性探测退化成
-    /// 长链扫描、构建变慢。这里直接数「不同的落点」：两字中文串（与真实词库同形）在
-    /// 2^17 槽上应接近随机分布；低位只由头两字节决定时，落点数会塌到零头。
-    #[test]
-    fn pool_hash_spreads_low_bits_for_short_cjk_strings() {
-        let mask = (1usize << 17) - 1;
-        let mut homes = std::collections::HashSet::new();
-        let mut n = 0usize;
-        // 常用汉字区里取 256×256 个两字组合，头一个字只有 256 种——正是会把坏哈希
-        // 打回原形的那种输入。
-        for a in 0x4E00u32..0x4F00 {
-            for b in 0x5000u32..0x5100 {
-                let s: String = [char::from_u32(a).unwrap(), char::from_u32(b).unwrap()]
-                    .iter()
-                    .collect();
-                homes.insert((pool_hash(s.as_bytes()) as usize) & mask);
-                n += 1;
-            }
-        }
-        // 65536 个键扔进 131072 个槽，理想随机约落 51.6k 个不同槽（1-e^-0.5 的期望）。
-        // 下限取 45k 留足余量；去掉终混的 `rotate_left` 时实测只落 128 个槽。
-        assert!(
-            homes.len() > 45_000,
-            "{n} 个两字串只落在 {} 个不同的槽——低位没混开，线性探测会退化成长链",
-            homes.len()
-        );
-    }
-
-    /// 字符串池必须**真的**去重：同一文本无论来自哪个 code、哪个段，都返回同一个偏移，
-    /// 且 `buf` 里只存一份。
-    ///
-    /// 端到端的 roundtrip 用例守不住这条——去重失效时每份副本各自正确，读出来的候选一模
-    /// 一样，只是文件白白变大、构建期白白多占内存。而去重**错**（返回了别人的偏移）才是
-    /// 功能性事故：读出来是另一个词。两个方向这里都断言。
-    #[test]
-    fn string_pool_dedups_and_never_returns_a_foreign_offset() {
-        let mut pool = StringPool::new();
-
-        // 同串多次 add → 同一偏移，且 buf 不增长。
-        let a1 = pool.add("你好");
-        let a2 = pool.add("你好");
-        assert_eq!(a1, a2, "同一文本必须复用同一偏移");
-        assert_eq!(pool.buf.len(), "你好".len(), "重复文本不该再占 buf");
-
-        // 不同串 → 不同偏移，且各自读回来是自己。
-        let mut offs = Vec::new();
-        // 刻意混入：空串、单字节、长度相同但内容不同、互为前缀、以及足够多条触发多次 grow。
-        let mut words: Vec<String> = vec![
-            String::new(),
-            "a".into(),
-            "b".into(),
-            "ab".into(),
-            "abc".into(),
-            "你好".into(),
-            "你坏".into(),
-        ];
-        for i in 0..5000 {
-            words.push(format!("词{i}"));
-        }
-        for w in &words {
-            offs.push((w.clone(), pool.add(w)));
-        }
-        // 再来一遍：必须全部命中已有偏移。
-        for (w, off) in &offs {
-            assert_eq!(pool.add(w), *off, "第二次 add {w:?} 应命中原偏移");
-        }
-        // 逐条按偏移取回，必须是自己——去重表把偏移串了的话这里立刻红。
-        for (w, off) in &offs {
-            let a = *off as usize;
-            let got = std::str::from_utf8(&pool.buf[a..a + w.len()]).expect("utf8");
-            assert_eq!(got, w.as_str(), "偏移 {off} 处应是 {w:?}");
-        }
-        // 唯一文本数 == buf 里应有的总字节数（去重没漏）。
-        let uniq: std::collections::HashSet<&String> = words.iter().collect();
-        let expect: usize = uniq.iter().map(|w| w.len()).sum();
-        assert_eq!(pool.buf.len(), expect, "buf 应恰好装下每个唯一文本一份");
-    }
-
-    /// 简拼 AbbrevSection 往返：简拼查得到、按权重排序，且**不污染全拼**精确/前缀查询。
-    ///
-    /// ⚠️ **条目内容已随 v5 从「词」改为「全拼码」**（二级索引指向主键）。取出的
-    /// `DictEntry::text` 现在装的是码，调用方拿它去主表装配候选。
-    #[test]
-    fn abbrev_section_roundtrip() {
-        let p = std::env::temp_dir().join("wdat_abbrev_test.wdat");
-        let mut w = WdatWriter::new();
-        w.add("nihao".into(), vec![("你好".into(), 1200)]);
-        w.add("beijing".into(), vec![("北京".into(), 2000)]);
-        // 存码不存词；同一简拼下多个码按权重降序（权重只用于截断时取舍）。
-        w.add_abbrev(
-            "nh".into(),
-            vec![("nihao".into(), 1200), ("nihuo".into(), 5)],
-        );
-        w.add_abbrev("bj".into(), vec![("beijing".into(), 2000)]);
-        w.add_abbrev("nhm".into(), vec![("nihaoma".into(), 300)]);
-        w.write(&p).unwrap();
-
-        let r = WdatReader::open(&p).unwrap();
-        assert!(r.has_abbrev());
-        // 简拼命中 + 权重降序；取出的是**全拼码**。
-        let nh = r.search_abbrev("nh", 10);
-        assert_eq!(nh.len(), 2);
-        assert_eq!(nh[0].text, "nihao", "按权重降序，且存的是码: {nh:?}");
-        assert_eq!(nh[0].code, "nh");
-        assert_eq!(r.search_abbrev("bj", 10)[0].text, "beijing");
-        assert_eq!(r.search_abbrev("nhm", 10)[0].text, "nihaoma");
-        assert!(r.search_abbrev("zzz", 10).is_empty());
-        // **不污染全拼**：全拼 search/search_prefix 不应命中简拼码。
-        assert!(r.search("nh").is_empty(), "全拼精确不应命中简拼码 nh");
-        assert_eq!(r.search("nihao")[0].text, "你好");
-        let pre = r.search_prefix("n", 100);
-        assert!(pre.iter().any(|e| e.text == "你好"));
-        assert!(
-            !pre.iter().any(|e| e.code == "nh" || e.code == "nhm"),
-            "前缀查询不应含简拼码: {:?}",
-            pre.iter().map(|e| &e.code).collect::<Vec<_>>()
-        );
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 无简拼区段时 search_abbrev 返回空、has_abbrev=false。
-    #[test]
-    fn no_abbrev_section() {
-        let p = build("wdat_noabbrev_test.wdat", &[("a", &[("工", 1)])]);
-        let r = WdatReader::open(&p).unwrap();
-        assert!(!r.has_abbrev());
-        assert!(r.search_abbrev("nh", 10).is_empty());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn shared_prefix_and_branching() {
-        // 强分支：同前缀大量分叉，验证 base/check 冲突解决正确。
-        let data: Vec<(String, Vec<(String, i32)>)> = (0..200)
-            .map(|i| (format!("code{i:03}"), vec![(format!("词{i}"), i)]))
-            .collect();
-        let p = std::env::temp_dir().join("wdat_branch_test.wdat");
-        let mut w = WdatWriter::new();
-        for (c, e) in &data {
-            w.add(c.clone(), e.clone());
-        }
-        w.write(&p).unwrap();
-        let r = WdatReader::open(&p).unwrap();
-        assert_eq!(r.key_count(), 200);
-        for i in 0..200 {
-            let res = r.search(&format!("code{i:03}"));
-            assert_eq!(res.len(), 1, "code{i:03} 应命中");
-            assert_eq!(res[0].text, format!("词{i}"));
-            assert_eq!(res[0].weight, i);
-        }
-        // 前缀 code0 → code000..code099（100 条）。
-        let pre = r.search_prefix("code0", 1000);
-        assert_eq!(pre.len(), 100, "code0 前缀应 100 条");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// 回归测试：复刻真实故障现场的 key 形态——上百万条、编码几乎全落在 6/8 位、
-    /// 字母表仅 a-z（真实样本见 feihuzj2 方案的 `feihuzj2_extra_jichu_pro.dict.yaml`，
-    /// 146 万 key）。旧的线性探测 `find_base` 在这种"深、密、共享前缀"的输入下会
-    /// 退化为 O(状态数²)，实测数分钟不收敛、内存被撑到 GB 级（见 [`FreeList`] 顶部
-    /// 说明）。这里用 1/5 规模（30 万 key）验证新实现在合理时间内完成且结果正确。
-    #[test]
-    fn large_scale_build_stays_fast_and_correct() {
-        fn gen_code(mut n: u64, len: usize) -> String {
-            let mut buf = vec![b'a'; len];
-            for i in (0..len).rev() {
-                buf[i] = b'a' + (n % 26) as u8;
-                n /= 26;
-            }
-            String::from_utf8(buf).unwrap()
-        }
-        let total = 300_000usize;
-        let mut data: Vec<(String, Vec<(String, i32)>)> = Vec::with_capacity(total);
-        let (mut c4, mut c6, mut c8) = (0u64, 0u64, 0u64);
-        for i in 0..total {
-            // 大致复刻真实文件里 4/6/8 位码的比例（约 1:4:4）。
-            let code = match i % 9 {
-                0 => {
-                    let c = gen_code(c4, 4);
-                    c4 += 1;
-                    c
-                }
-                1..=4 => {
-                    let c = gen_code(c6, 6);
-                    c6 += 1;
-                    c
-                }
-                _ => {
-                    let c = gen_code(c8, 8);
-                    c8 += 1;
-                    c
-                }
-            };
-            data.push((code, vec![(format!("词{i}"), i as i32)]));
-        }
-
-        let p = std::env::temp_dir().join("wdat_large_scale_test.wdat");
-        let start = std::time::Instant::now();
-        let mut w = WdatWriter::new();
-        for (c, e) in &data {
-            w.add(c.clone(), e.clone());
-        }
-        w.write(&p).unwrap();
-        let elapsed = start.elapsed();
-        eprintln!("built {total} keys in {elapsed:?}");
-        assert!(
-            elapsed.as_secs() < 30,
-            "{total} 个 key 构建耗时 {elapsed:?}——若退化回平方级复杂度，这里会是\
-             几分钟甚至更久（历史故障见 FreeList 顶部说明）",
-        );
-
-        let r = WdatReader::open(&p).unwrap();
-        assert_eq!(r.key_count() as usize, total);
-        // 抽样点查验证正确性（量太大，不做全量校验）。
-        for i in (0..total).step_by(997) {
-            let (code, _) = &data[i];
-            let res = r.search(code);
-            assert_eq!(res.len(), 1, "{code} 应命中");
-            assert_eq!(res[0].text, format!("词{i}"));
-        }
-        let _ = std::fs::remove_file(&p);
-    }
-
-    // ───────────── S3：流式写入器与有序游标 ─────────────
-
-    /// 一份带简拼区、边界、order 与 meta 的输入，分别走批量写入器与流式写入器，
-    /// 产物逐字节相同。这是「两条路径共用一套构建」的对拍基础。
-    #[test]
-    fn stream_writer_matches_batch_writer_byte_for_byte() {
-        type Entries<'a> = Vec<(&'a str, i32, u32, u64)>;
-        let data: Vec<(&str, Entries)> = vec![
-            (
-                "nihao",
-                vec![("你好", 100, 0, 0b101), ("拟好", 20, 1, 0b101)],
-            ),
-            ("ni", vec![("你", 500, 0, 0b1), ("泥", 30, 1, 0b1)]),
-            ("xian", vec![("先", 80, 0, 0b1), ("西安", 70, 1, 0b101)]),
-            ("a", vec![("啊", 1, 0, 0b1)]),
-            ("nihaoma", vec![("你好吗", 10, 0, 0b10101)]),
-        ];
-        let abbrevs: Vec<(&str, Vec<(&str, i32)>)> = vec![
-            ("nh", vec![("nihao", 100)]),
-            ("xa", vec![("xian", 70)]),
-            ("nhm", vec![("nihaoma", 10)]),
-        ];
-        let mut batch = WdatWriter::new();
-        for (code, ents) in &data {
-            batch.add_with_boundary(
-                code.to_string(),
-                ents.iter()
-                    .map(|(t, w, o, b)| (t.to_string(), *w, *o, *b))
-                    .collect(),
-            );
-        }
-        for (ab, ents) in &abbrevs {
-            batch.add_abbrev(
-                ab.to_string(),
-                ents.iter().map(|(c, w)| (c.to_string(), *w)).collect(),
-            );
-        }
-        batch.set_meta(b"meta-bytes".to_vec());
-        let pb = std::env::temp_dir().join("wind_stream_eq_batch.wdat");
-        batch.write(&pb).unwrap();
-
-        let mut sorted = data.clone();
-        sorted.sort_by(|a, b| a.0.cmp(b.0));
-        let mut sw = WdatStreamWriter::new();
-        for (code, ents) in &sorted {
-            sw.push_code(code, ents.iter().map(|(t, w, o, b)| (*t, *w, *o, *b)));
-        }
-        let mut ab_sorted = abbrevs.clone();
-        ab_sorted.sort_by(|a, b| a.0.cmp(b.0));
-        for (ab, ents) in &ab_sorted {
-            sw.push_abbrev_sorted(ab, ents.iter().map(|(c, w)| (*c, *w)));
-        }
-        sw.set_meta(b"meta-bytes".to_vec());
-        let ps = std::env::temp_dir().join("wind_stream_eq_stream.wdat");
-        sw.build().emit(&ps).unwrap();
-
-        assert_eq!(
-            std::fs::read(&pb).unwrap(),
-            std::fs::read(&ps).unwrap(),
-            "批量与流式两条路径产物必须逐字节相同"
-        );
-        let _ = std::fs::remove_file(&pb);
-        let _ = std::fs::remove_file(&ps);
-    }
-
-    /// 同一 code 超过 65535 条候选：计数截断、偏移按实际条数前进，后续叶不错位，
-    /// 且与批量写入器逐字节相同。
-    #[test]
-    fn stream_writer_caps_leaf_count_without_misaligning_later_leaves() {
-        let big: Vec<(String, i32)> = (0..70_000).map(|i| (format!("w{i}"), 1)).collect();
-        let mut batch = WdatWriter::new();
-        batch.add("a".into(), big.clone());
-        batch.add("b".into(), vec![("乙".into(), 9)]);
-        let pb = std::env::temp_dir().join("wind_stream_cap_batch.wdat");
-        batch.write(&pb).unwrap();
-        let mut sw = WdatStreamWriter::new();
-        sw.push_code(
-            "a",
-            big.iter()
-                .enumerate()
-                .map(|(i, (t, w))| (t.as_str(), *w, i as u32, 0)),
-        );
-        sw.push_code("b", [("乙", 9, 0, 0)]);
-        let ps = std::env::temp_dir().join("wind_stream_cap_stream.wdat");
-        sw.build().emit(&ps).unwrap();
-        assert_eq!(std::fs::read(&pb).unwrap(), std::fs::read(&ps).unwrap());
-        let r = WdatReader::open(&ps).unwrap();
-        assert_eq!(r.search("a").len(), u16::MAX as usize);
-        assert_eq!(r.search("b").first().map(|e| e.text.as_str()), Some("乙"));
-        let _ = std::fs::remove_file(&pb);
-        let _ = std::fs::remove_file(&ps);
-    }
-
-    /// 乱序喂码必须 panic：这是 DAT 正确性的不变量，不能静默建错。
-    #[test]
-    #[should_panic(expected = "严格递增")]
-    fn stream_writer_rejects_unsorted_codes() {
-        let mut sw = WdatStreamWriter::new();
-        sw.push_code("b", [("乙", 1, 0, 0)]);
-        sw.push_code("a", [("甲", 1, 0, 0)]);
-    }
-
-    /// 游标按字节序严格递增、短码先于长码，且与 `for_each_entry` 的 (code,text,weight)
-    /// 序列**完全一致**（含同码多条与跨段重复）；`leaf_entries` 与精确查询一致。
-    #[test]
-    fn code_cursor_is_sorted_and_matches_for_each_entry() {
-        let p = build(
-            "wind_cursor.wdat",
-            &[
-                ("nihao", &[("你好", 100), ("拟好", 20)]),
-                ("ni", &[("你", 500)]),
-                ("", &[("空码", 1)]),
-                ("nihaoma", &[("你好吗", 10), ("你好吗", 10)]),
-                ("a", &[("啊", 1)]),
-                ("ab", &[("阿布", 2)]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        let mut via_cursor: Vec<(String, String, i32)> = Vec::new();
-        let mut prev: Option<String> = None;
-        for (code, leaf) in r.codes() {
-            if let Some(pv) = &prev {
-                assert!(code.as_bytes() > pv.as_bytes(), "{pv:?} -> {code:?} 不递增");
-            }
-            prev = Some(code.clone());
-            let ents = r.leaf_entries(leaf);
-            let direct = r.search(&code);
-            assert_eq!(
-                ents.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(),
-                direct
-                    .iter()
-                    .map(|e| (e.text.as_str(), e.weight))
-                    .collect::<Vec<_>>(),
-                "leaf_entries 与精确查询应一致: {code}"
-            );
-            for (t, w, _, _) in ents {
-                via_cursor.push((code.clone(), t.to_string(), w));
-            }
-        }
-        let mut via_each: Vec<(String, String, i32)> = Vec::new();
-        r.for_each_entry(&mut |c, t, w| via_each.push((c.to_string(), t.to_string(), w)));
-        assert_eq!(via_cursor, via_each);
-        assert_eq!(via_cursor.len(), 8);
-        assert_eq!(via_cursor[0].0, "", "空码（根为终止态）先出");
-        let _ = std::fs::remove_file(&p);
-    }
-}
+#[path = "datformat_tests.rs"]
+mod tests;

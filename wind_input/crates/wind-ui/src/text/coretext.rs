@@ -64,12 +64,11 @@ const CASCADE_FALLBACK: &[&str] = &[
     "Apple Color Emoji", // emoji 彩色字形（sbix）
 ];
 
-/// 内置回退链里**本机确实装着**的族名（保持原顺序）。
+/// 内置回退链里本机确实装着的族名（保持原顺序）。
 ///
-/// 为什么不直接逐个 `CTFontCreateWithName` 探测：Hiragino Sans GB / STHeiti 这类在新系统上
-/// 是「按需下载」字体，本机没装时 CoreText 不是立刻返回失败，而是去请求下载并**同步等**
-/// FontRegistryUI 应答；没有 GUI 会话（CI runner、登录前）时没人应答，一次调用能阻塞十几分钟。
-/// 先查家族名表（只读名表，不触发下载），没装的直接跳过。
+/// 不直接逐个 `CTFontCreateWithName` 探测：「按需下载」字体（Hiragino Sans GB / STHeiti）
+/// 没装时 CoreText 会请求下载并同步等应答，无 GUI 会话时能阻塞十几分钟。先查家族名表
+/// （不触发下载），没装的直接跳过。
 /// 只用于内置常量链——用户配置的字体名可能是 PostScript 名，不在家族名表里，不能这样筛。
 fn installed_among(cands: &[&'static str]) -> Vec<&'static str> {
     let names: Vec<String> = font_collection::get_family_names()
@@ -91,13 +90,11 @@ pub struct TextRenderer {
     font_size: f32,
     /// 拆字字根字体描述符（可选）：设置后构造级联回退，PUA 码位回退到它。
     chaizi: Option<CTFontDescriptor>,
-    /// 全局字体方案。**本后端只实现「默认回退链」这一半**：链尾各项进 cascade list，
+    /// 全局字体方案。本后端只实现「默认回退链」这一半：链尾各项进 cascade list，
     /// 语义与 DirectWrite 侧的自定义 fallback 一致。
     ///
-    /// ⚠️ **按脚本的字体指派（`FontPlan::declared`）在 macOS 上尚未实现**——它要按
-    /// `font_runs` 的分段构造 attributed string 的分段字体属性，而本后端目前是整行
-    /// 单字体（`make_line`）。蒙古文用户在 Windows 上，故先补 Windows 侧；这里如实标注，
-    /// 不做「声明未实现」的假接线。
+    /// 按脚本的字体指派（`FontPlan::declared`）在 macOS 上尚未实现：它要按 `font_runs` 分段
+    /// 设字体属性，而本后端是整行单字体（`make_line`）。
     plan: FontPlan,
     /// CTFont 缓存：按取整 px keyed，避免每次测量/绘制重建。
     fonts: RefCell<HashMap<u32, CTFont>>,
@@ -147,8 +144,7 @@ impl TextRenderer {
         if self.plan == plan {
             return;
         }
-        // 脚本指派在本后端是**静默无效**的。不吭一声的话，用户看到的是「配了没反应」，
-        // 要靠一轮误诊才查到平台差异——一行日志省掉那一轮。
+        // 脚本指派在本后端无效，记一行日志免得用户对着「配了没反应」误诊。
         if !plan.declared().is_empty() {
             tracing::warn!(
                 "ui.font.scripts 的按脚本字体指派在 macOS 上尚未实现，本次声明的 {} 个脚本类不生效（回退链仍生效）",
@@ -166,22 +162,12 @@ impl TextRenderer {
 
     /// 系统字体集里有没有这个字族名。`None` = 查不了（名字为空）。
     ///
-    /// 语义与 Windows 侧 `dwrite.rs` 的同名方法对齐：问的是**家族名表**里有没有这个名字
-    /// （`CTFontManagerCopyAvailableFontFamilyNames`），而不是「能不能凑出一款字体」——
-    /// 后者（`font_collection::create_for_family` 那条路）对写错的名字也会匹配出最近似的
-    /// 一款，那恰好是这条告警要抓的情形，用它等于自废。
-    /// 大小写不敏感，同 DirectWrite 的 `FindFamilyName`。
+    /// 语义同 Windows 侧 `dwrite.rs` 的同名方法：问家族名表里有没有这个名字，而不是「能不能
+    /// 凑出一款字体」（`font_collection::create_for_family` 对写错的名字也会匹配出近似款，
+    /// 恰好漏掉告警要抓的情形）。大小写不敏感。别改回恒返回 `None`：调用方
+    /// `CandidateWindow::resolve_and_report` 靠 `Some(false)` 才报字体缺失。
     ///
-    /// # ⚠️ 此前这里恒返回 `None`
-    ///
-    /// 理由写的是「先一律不知道，宁可少一条提示也不误报」，而调用方
-    /// （`CandidateWindow::resolve_and_report`）按 `Some(false)` 才判缺失
-    /// ⇒ **整条字体缺失告警在 macOS 上空转**：`ui.font.family` / 方案级 `[candidate]
-    /// font_family` / 主题节点写错字族名，画面静默回落、日志一个字都没有，而 macOS 上
-    /// 写错的概率比 Windows 还高（主题多半是在 Windows 上做的，字体名照抄过来就不存在）。
-    ///
-    /// 成本：一次全量家族名拷贝（本机几百条）。调用点都是换字体 / 换方案 / 换主题这类
-    /// 低频事件，不在渲染热路径——同 Windows 侧那条 `⚠️ 只在设置字体时查` 的约束。
+    /// 成本是一次全量家族名拷贝，只在换字体 / 方案 / 主题这类低频事件调用。
     pub fn family_exists(&self, family: &str) -> Option<bool> {
         let name = family.trim();
         if name.is_empty() {
@@ -201,8 +187,8 @@ impl TextRenderer {
         None
     }
 
-    /// 全局默认字重（`ui.font.weight`）：**本后端尚未实现**——与节点字重一样被
-    /// [`Self::font_styled`] 忽略（平台限制，见看板 A2-1）。保留接口是为了两平台配置通路一致。
+    /// 全局默认字重（`ui.font.weight`）：本后端尚未实现——与节点字重一样被
+    /// [`Self::font_styled`] 忽略（平台限制）。保留接口是为了两平台配置通路一致。
     pub fn set_default_weight(&mut self, _weight: i32) {}
 
     /// 加载拆字字根字体（TTF）作级联回退；失败返回 Err（不影响普通文本渲染）。
@@ -247,7 +233,7 @@ impl TextRenderer {
     /// 拆字字根（PUA，若已加载）→ 符号 → CJK 备选 → 彩色 emoji。
     ///
     /// 必须显式构链而非依赖系统默认级联：一旦设过拆字字体，若只放拆字 descriptor 会
-    /// **覆盖**系统默认级联，导致 emoji/符号丢失（渲染成方框）。故这里把符号 / CJK /
+    /// 覆盖系统默认级联，导致 emoji/符号丢失（渲染成方框）。故这里把符号 / CJK /
     /// Apple Color Emoji 一并纳入 cascade，使这些码位都能解析到对应字形。
     fn apply_cascade(&self, base: CTFont, pt: f64) -> CTFont {
         let mut descs: Vec<CTFontDescriptor> = Vec::new();
@@ -301,13 +287,10 @@ impl TextRenderer {
     /// 带字体族覆盖的 CTFont 解析（styled 路径）。family=None 时走缓存的基准族；
     /// family=Some 时按覆盖族即时构建（不入缓存，覆盖族通常少量出现）。
     ///
-    /// ⚠️ 「通常少量出现」这个前提在**方案级候选字体**下不再成立：方案一旦声明
-    /// `[candidate] font_family`，每个候选文字叶子的每次测量与每次绘制都走这条不缓存的路
-    /// （`resolve_base` + `apply_cascade`，后者内含一串 `new_from_name`）。
-    /// 蒙文用户在 Windows，故暂不改；macOS 上真用起这个功能时应加一个按 (族, 字号) 的缓存。
+    /// 方案声明 `[candidate] font_family` 时「少量出现」不再成立，每个候选叶子每次测量与绘制
+    /// 都走这条不缓存的路；macOS 上真用起来时应加按 (族, 字号) 的缓存。
     ///
-    /// weight 当前
-    /// 不合成粗体（CoreText 合成粗体涉及 symbolic traits，纯视觉差异，留待后续）。
+    /// weight 当前不合成粗体（涉及 symbolic traits，留待后续）。
     fn font_styled(&self, size: f32, _weight: i32, family: Option<&str>) -> CTFont {
         match family {
             None => self.font_for(size),
@@ -321,10 +304,9 @@ impl TextRenderer {
 
     /// 基准字体的自然行高：ascent + descent + leading。
     ///
-    /// 行高与基线都只看**基准字体**，不看 `CTLine` 的 typographic bounds——后者取行内所有
-    /// 回退字体（Apple Color Emoji 等）里最大的那个，含 emoji 的候选行会比纯汉字行高一截、
-    /// 候选窗高度随之抖动。与 dwrite 后端钉 UNIFORM 行距是同一条约定，两端必须一致，
-    /// 否则同一份配置两平台行高不同。比基准字体高的字形按溢出画，不裁切。
+    /// 行高与基线都只看基准字体，不看 `CTLine` 的 typographic bounds（取行内最大的回退字体，
+    /// 含 emoji 的行会更高、候选窗高度抖动）。与 dwrite 后端的 UNIFORM 行距是同一条约定，
+    /// 两端必须一致。比基准字体高的字形按溢出画，不裁切。
     fn line_height(font: &CTFont) -> f64 {
         font.ascent() + font.descent() + font.leading()
     }
@@ -373,9 +355,7 @@ impl TextRenderer {
         }
         let line = make_line(text, &font, None);
         let b = line.get_typographic_bounds();
-        // 行高取**基准字体**自身的度量，不取这一行的 typographic bounds：后者是行内所有
-        // 回退字体里最大的那个，含 emoji 的候选会比纯汉字行高出一截，候选窗高度随之抖动。
-        // 与 dwrite 后端的 UNIFORM 行距同一条约定（见 `dwrite.rs` 的 `line_height_for`）。
+        // 行高取基准字体自身的度量，理由见 `line_height`。
         let height = Self::line_height(&font) as f32;
         TextMetrics {
             width: b.width as f32,
@@ -429,7 +409,7 @@ impl TextRenderer {
             color[3] as f64 / 255.0,
         );
         let line = make_line(text, &font, Some(&cg_color));
-        // 基线按**基准字体**的 ascent 放，与 `measure` 取的行高同一口径：行高不再跟着
+        // 基线按基准字体的 ascent 放，与 `measure` 取的行高同一口径：行高不再跟着
         // 行内最高的回退字体走，基线也不能跟着走，否则 emoji 行里的汉字会整体下沉。
         let ascent = font.ascent();
         let space = CGColorSpace::create_device_rgb();
@@ -445,7 +425,7 @@ impl TextRenderer {
                 bitmap_info,
             );
             // 不翻转上下文：CGBitmapContext 默认 bottom-left 原点、CTLine 字形自然朝上；
-            // translate(0,h)+scale(1,-1) 会让字形上下颠倒（实测候选字倒置）。缓冲是 top-down
+            // translate(0,h)+scale(1,-1) 会让字形上下颠倒。缓冲是 top-down
             // （row0=顶，与 tiny-skia 框同向），故把基线的 top-down 坐标 y+ascent 换成 CG 的
             // bottom-left 坐标 h-(y+ascent)，文字即正立且落在正确行。
             ctx.set_text_position(x as f64, (h as f32 - (y + ascent as f32)) as f64);
@@ -463,7 +443,7 @@ impl TextRenderer {
     /// 属性不同的区间会被 CoreText 切成不同的 CTRun，跨边界的字距与连字可能因此变化——带色
     /// line 的宽度就不再等于 [`Self::measure`] 量出的宽度，布局与绘制对不上。
     ///
-    /// 做法是**整形只做一次**：整串设 `kCTForegroundColorFromContextAttributeName`（字色取
+    /// 做法是整形只做一次：整串设 `kCTForegroundColorFromContextAttributeName`（字色取
     /// 上下文填充色），这个 line 除此之外与测量用的完全同构；绘制时逐个 CTRun，用
     /// `string_indices` 把颜色区间换算成字形子区间，逐段换填充色再 `CTRunDraw`。字形位置
     /// 来自同一次整形，度量一致由构造保证。CoreGraphics 原生处理填充色的 alpha，无需像
@@ -756,282 +736,5 @@ fn make_context_colored_line(text: &str, font: &CTFont) -> CTLine {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn measure_nonempty_positive_and_scales() {
-        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
-        let m1 = r.measure_text("中文");
-        assert!(m1.width > 0.0 && m1.height > 0.0);
-        let m2 = r.measure_text_sized("中文", 32.0);
-        assert!(m2.width > m1.width);
-    }
-
-    #[test]
-    fn measure_empty_is_zero_width() {
-        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
-        let m = r.measure_text_sized("", 20.0);
-        assert_eq!(m.width, 0.0);
-        assert!((m.height - 24.0).abs() < 0.01); // 20*1.2
-    }
-
-    #[test]
-    fn draw_writes_nonbackground_pixels() {
-        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
-        let (w, h) = (64u32, 32u32);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        r.draw_text(&mut buf, w, h, 2.0, 2.0, "中", [0, 0, 0, 255])
-            .unwrap();
-        assert!(buf.iter().any(|&b| b != 0));
-    }
-
-    /// 内置回退链只留本机装着的族：没装的不能留（留了就会触发按需下载并阻塞），
-    /// 装着的不能丢（丢了级联里缺符号/emoji 回退）。
-    #[test]
-    fn installed_among_drops_absent_keeps_present_in_order() {
-        let got = installed_among(&["这个字族并不存在 ZZZ", FALLBACK_FAMILY, "另一个不存在 YYY"]);
-        assert_eq!(got, vec![FALLBACK_FAMILY], "只留装着的，且不改名");
-        assert!(installed_among(&[]).is_empty());
-    }
-
-    /// [`TextRenderer::family_exists`] 的三态各自落对。
-    ///
-    /// ★ 关键是**第二条**：装上之前这里恒返回 `None`，而调用方的判据是 `== Some(false)`
-    /// ⇒ 字体缺失告警在 macOS 上整条空转。只断言「存在的查得到」的话，一个恒 `Some(true)`
-    /// 的实现也能绿——那同样是空转，只是翻了个面。
-    #[test]
-    fn family_exists_tells_present_from_absent() {
-        let r = TextRenderer::new(FALLBACK_FAMILY, 16.0).unwrap();
-        assert_eq!(
-            r.family_exists(FALLBACK_FAMILY),
-            Some(true),
-            "本文件把它当兜底字体用，它必须在家族名表里"
-        );
-        assert_eq!(
-            r.family_exists("这个字族并不存在 ZZZ"),
-            Some(false),
-            "查不到必须明确报「没有」，报 None 等于告诉调用方「别 warn」"
-        );
-        assert_eq!(
-            r.family_exists("   "),
-            None,
-            "空名 = 没设置，与「系统里没有」是两件事"
-        );
-        assert_eq!(
-            r.family_exists(&FALLBACK_FAMILY.to_lowercase()),
-            Some(true),
-            "大小写不敏感，同 DirectWrite 的 FindFamilyName"
-        );
-    }
-
-    /// 分段着色用的 line 与测量用的 line 宽度相等——含连字 / 字距恰好落在颜色边界上的样例
-    /// （`fi` 在 `of|fice` 的 `f|i` 之间、`AV` 在 `A|V` 之间）。
-    ///
-    /// 这是「颜色不影响度量」在 CoreText 上的证据：若改成按区间设前景色属性，CTRun 会在
-    /// 颜色边界被切开，连字与字距就可能丢失，宽度随之漂移。
-    #[test]
-    fn colored_line_width_equals_measured_width() {
-        let r = TextRenderer::new("Helvetica", 16.0).unwrap();
-        for text in ["office", "AVATAR", "fi AV 你好", "WAVE fifty"] {
-            let font = r.font_for(16.0);
-            let plain = make_line(text, &font, None).get_typographic_bounds().width;
-            let colored = make_context_colored_line(text, &font)
-                .get_typographic_bounds()
-                .width;
-            assert_eq!(plain, colored, "{text:?}：带色 line 宽度与测量 line 不同");
-            assert_eq!(
-                r.measure(text, &TextStyle::new(16.0)).width,
-                colored as f32,
-                "{text:?}"
-            );
-        }
-    }
-
-    /// 区间全取基色时，`draw_runs` 与 `draw` 的缓冲应基本相同（容忍少量抗锯齿边缘漂移）。
-    ///
-    /// 两条路径的 line 不同（前者 `FromContext` + 逐 CTRun 的 `CTRunDraw`，后者整行
-    /// `CTLineDraw`），位置或基线若有一点漂移——例如 run 的原点没对上行原点——就在这里现形。
-    /// 含 CJK 与 emoji，覆盖回退字体切出的多个 CTRun。
-    ///
-    /// 2026-09-28 首次在真机 macOS CI 上跑通此用例时，逐字节比对报了 503/11520（约 4.3%）
-    /// 像素不同、且都是边缘级的小幅色差（非整段文字错位/丢失），怀疑是两条绘制路径下
-    /// CoreGraphics 抗锯齿/字体平滑的细微差异，尚未在真机上用 PNG 逐像素查实。在查清前
-    /// 放宽为容忍小比例、小幅度的差异，但仍要求：① 差异像素占比给足安全边际、
-    /// ② 差异像素本身的通道差值要小——真出现整段错位/漏画会让大量像素从「纯黑字」直接
-    /// 翻成「纯白底」（通道差值拉满），这两条护栏都会先报错，不会被本放宽悄悄盖过去。
-    #[test]
-    fn base_color_runs_equal_plain_draw() {
-        let r = TextRenderer::new("Helvetica", 24.0).unwrap();
-        let (w, h) = (240u32, 48u32);
-        let ts = TextStyle::new(24.0);
-        let text = "ab 你好 😀 cd";
-        let black = [0, 0, 0, 255];
-        let bg = [255u8, 255, 255, 255].repeat((w * h) as usize);
-        let mut plain = bg.clone();
-        r.draw(&mut plain, w, h, 4.5, 6.0, text, &ts, black)
-            .unwrap();
-        assert_ne!(plain, bg, "应画出字形");
-        let runs: Vec<ColorRun> = [(0usize, 2usize), (3, 9), (15, text.len())]
-            .iter()
-            .map(|&(s, e)| ColorRun {
-                start: s as u32,
-                end: e as u32,
-                rgba: black,
-            })
-            .collect();
-        let mut colored = bg.clone();
-        r.draw_runs(&mut colored, w, h, 4.5, 6.0, text, &ts, black, &runs)
-            .unwrap();
-        let total = (w * h) as usize;
-        let mut diff = 0usize;
-        let mut max_channel_delta = 0i32;
-        for i in 0..total {
-            let p = &plain[i * 4..i * 4 + 4];
-            let c = &colored[i * 4..i * 4 + 4];
-            if p != c {
-                diff += 1;
-                for k in 0..4 {
-                    let d = (p[k] as i32 - c[k] as i32).abs();
-                    max_channel_delta = max_channel_delta.max(d);
-                }
-            }
-        }
-        assert!(
-            diff * 10 <= total,
-            "全取基色的 draw_runs 应与 draw 大致相同：差异像素 {diff}/{total} 超过 10%"
-        );
-        assert!(
-            max_channel_delta <= 160,
-            "差异像素的通道差值 {max_channel_delta} 过大，疑似整段错位/漏画而非抗锯齿边缘漂移"
-        );
-    }
-
-    /// 真按区间上了色：红 `ab` + 蓝 `cd`，各自 x 区间内改动像素以本段色为主；并且非空。
-    #[test]
-    fn draw_runs_colors_each_range() {
-        let r = TextRenderer::new("Helvetica", 32.0).unwrap();
-        let (w, h) = (200u32, 60u32);
-        let bg = [255u8, 255, 255, 255].repeat((w * h) as usize);
-        let mut buf = bg.clone();
-        let ts = TextStyle::new(32.0);
-        let x0 = 4.0;
-        let split = x0 + r.measure("ab", &ts).width;
-        let runs = [
-            ColorRun {
-                start: 0,
-                end: 2,
-                rgba: [220, 0, 0, 255],
-            },
-            ColorRun {
-                start: 2,
-                end: 4,
-                rgba: [0, 0, 220, 255],
-            },
-        ];
-        r.draw_runs(&mut buf, w, h, x0, 4.0, "abcd", &ts, [0, 0, 0, 255], &runs)
-            .unwrap();
-        let (mut left, mut right) = ((0, 0), (0, 0));
-        for i in 0..(w * h) as usize {
-            if buf[i * 4..i * 4 + 4] == bg[i * 4..i * 4 + 4] {
-                continue;
-            }
-            // BGRA 内存序：[0]=B、[2]=R。
-            let (b, red) = (buf[i * 4] as i32, buf[i * 4 + 2] as i32);
-            let side = if ((i as u32 % w) as f32) < split {
-                &mut left
-            } else {
-                &mut right
-            };
-            if red > b + 30 {
-                side.0 += 1;
-            } else if b > red + 30 {
-                side.1 += 1;
-            }
-        }
-        assert!(
-            left.0 > 20 && left.0 > left.1 * 4,
-            "左半应以红为主：{left:?}"
-        );
-        assert!(
-            right.1 > 20 && right.1 > right.0 * 4,
-            "右半应以蓝为主：{right:?}"
-        );
-    }
-    /// `\n` 硬换行：高 = 行数 × 单行高，宽取最宽一行（悬停提示等多行文本依赖）。
-    #[test]
-    fn newline_stacks_lines_and_takes_widest() {
-        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
-        let ts = TextStyle::new(16.0);
-        let one = r.measure("你好世界啊", &ts);
-        let two = r.measure("你好世界啊\n你", &ts);
-        let three = r.measure("你好世界啊\n你\n", &ts);
-        assert!(
-            (two.height - one.height * 2.0).abs() < 0.5,
-            "两行高：{two:?} vs {one:?}"
-        );
-        assert!(
-            (three.height - one.height * 3.0).abs() < 0.5,
-            "末尾空行也占一行：{three:?}"
-        );
-        assert!(
-            (two.width - one.width).abs() < 0.5,
-            "宽取最宽一行：{two:?} vs {one:?}"
-        );
-    }
-
-    /// 第二行真画在第一行下面，而且分段颜色按行切分后各归各的行。
-    #[test]
-    fn newline_draws_second_line_below_with_its_own_colors() {
-        let r = TextRenderer::new("PingFang SC", 16.0).unwrap();
-        let ts = TextStyle::new(16.0);
-        let lh = r.measure("A", &ts).height;
-        let (w, h) = (96u32, (lh * 2.0).ceil() as u32 + 8);
-        let mut buf = vec![0u8; (w * h * 4) as usize];
-        // "红\n蓝"：第一行红、第二行蓝（字节区间：红 0..3，\n 3..4，蓝 4..7）。
-        let runs = [
-            ColorRun {
-                start: 0,
-                end: 3,
-                rgba: [255, 0, 0, 255],
-            },
-            ColorRun {
-                start: 4,
-                end: 7,
-                rgba: [0, 0, 255, 255],
-            },
-        ];
-        r.draw_runs(
-            &mut buf,
-            w,
-            h,
-            4.0,
-            2.0,
-            "红\n蓝",
-            &ts,
-            [0, 0, 0, 255],
-            &runs,
-        )
-        .unwrap();
-        let (mut top, mut bottom) = ((0, 0), (0, 0));
-        for i in 0..(w * h) as usize {
-            let (b, red, a) = (buf[i * 4] as i32, buf[i * 4 + 2] as i32, buf[i * 4 + 3]);
-            if a == 0 {
-                continue;
-            }
-            let row = (i as u32 / w) as f32;
-            let side = if row < 2.0 + lh {
-                &mut top
-            } else {
-                &mut bottom
-            };
-            if red > b + 30 {
-                side.0 += 1;
-            } else if b > red + 30 {
-                side.1 += 1;
-            }
-        }
-        assert!(top.0 > 10 && top.1 == 0, "上半行应只有红：{top:?}");
-        assert!(bottom.1 > 10 && bottom.0 == 0, "下半行应只有蓝：{bottom:?}");
-    }
-}
+#[path = "coretext_tests.rs"]
+mod tests;

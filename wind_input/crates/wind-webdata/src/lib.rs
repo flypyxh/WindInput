@@ -32,6 +32,62 @@ fn str_param<'a>(p: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("缺少参数 {}", key))
 }
 
+/// 写类方法的批量形式：参数里带 `items`（数组）即走批量，缺省 / `null` 走原单条路径。
+/// 批量时各条共享的参数（`schemaId`、`enabled` 等）仍在顶层，`items` 里只放每条不同的键；
+/// 整批先全部解析完再一次写入，任一条不合法整批报错、什么都不改；成功回 [`batch_done`]。
+fn batch_items(p: &Value) -> anyhow::Result<Option<&[Value]>> {
+    match p.get("items") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) => Ok(Some(a.as_slice())),
+        Some(_) => anyhow::bail!("参数 items 须是数组"),
+    }
+}
+
+/// 有 `items` 时逐条解析（错误带下标），否则把顶层参数当作唯一的一条。返回 `(各条, 是否批量)`。
+fn items_or_single<T>(
+    p: &Value,
+    one: impl Fn(&Value) -> anyhow::Result<T>,
+) -> anyhow::Result<(Vec<T>, bool)> {
+    match batch_items(p)? {
+        Some(items) => Ok((
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| one(v).map_err(|e| anyhow::anyhow!("items[{i}]：{e}")))
+                .collect::<anyhow::Result<_>>()?,
+            true,
+        )),
+        None => Ok((vec![one(p)?], false)),
+    }
+}
+
+/// 批量形式的成功回包。
+fn batch_done(count: usize) -> Value {
+    json!({ "ok": true, "count": count })
+}
+
+/// 一条 `{code, text}`：text 从设置页的转义形态还原成存储域（见 [`store_text`]），code 原样。
+fn code_text_item(p: &Value) -> anyhow::Result<(String, String)> {
+    Ok((
+        str_param(p, "code")?.to_string(),
+        store_text(str_param(p, "text")?),
+    ))
+}
+
+/// 一条 `{code, text}`，code 另拆掉音节空格（列表项的码带空格，词频 / 临时词的 key 是扁平的）。
+fn flat_code_text_item(p: &Value) -> anyhow::Result<(String, String)> {
+    let (code, text) = code_text_item(p)?;
+    Ok((wind_store::wdict::split_spaced_code(&code).0, text))
+}
+
+/// 一条 `{kind, id}`（快捷输入格式）。
+fn kind_id_item(p: &Value) -> anyhow::Result<(String, String)> {
+    Ok((
+        str_param(p, "kind")?.to_string(),
+        str_param(p, "id")?.to_string(),
+    ))
+}
+
 /// 导入类方法的文本来源：**`path` 优先，`content` 回落**。
 ///
 /// ## 为什么要有 `path` 这条路
@@ -643,6 +699,9 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         "quick.delete" => h.web_quick_delete(params),
         // ── compat.*：应用兼容规则的分层管理（逻辑全在 wind_config::compat_admin）──
         m if m.starts_with("compat.") => h.web_compat_rpc(m, params),
+        // ── softkeyboard.*：软键盘编辑器（逻辑在 wind_softkeyboard::admin）──
+        "softkeyboard.get" => h.softkeyboard_view(),
+        "softkeyboard.apply" => h.web_softkeyboard_apply(params),
         "quick.export" => h.web_quick_export(),
         "quick.import" => h.web_quick_import(params),
         "quick.previewImport" => h.web_quick_preview_import(params),
@@ -660,7 +719,7 @@ fn web_data_dispatch<H: WebDataRpc + ?Sized>(
         "correction.conflictExample" => correction_conflict_example(params),
 
         // ── theme.* ──────────────────────────────────────────
-        "theme.list" => h.web_theme_list(),
+        "theme.list" => h.web_theme_list(params),
         "theme.resolved" => Ok(serde_json::to_value(h.theme_follow_values())?),
         "theme.accent" => {
             let name = params
@@ -1080,13 +1139,20 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     /// 本体在 [`user_words_api::add`]（与移动端共用），这里只解参与还原转义。
+    /// 带 `items`（`[{code, text, weight?}]`）走 [`user_words_api::add_batch`]。
     fn web_dict_add(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         // 设置页传的是转义形态，还原成存储域（真实文本）后再落库/比对。见 [`store_text`]。
-        let text = &store_text(text);
-        let weight = i32_param(params, "weight");
-        user_words_api::add(self, schema, code, text, weight)?;
+        let (rows, batch) = items_or_single(params, |p| {
+            let (code, text) = code_text_item(p)?;
+            Ok((code, text, i32_param(p, "weight")))
+        })?;
+        if batch {
+            user_words_api::add_batch(self, schema, &rows)?;
+            return Ok(batch_done(rows.len()));
+        }
+        let (code, text, weight) = &rows[0];
+        user_words_api::add(self, schema, code, text, *weight)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1113,10 +1179,15 @@ pub trait WebDataRpc: WebDataHost {
 
     fn web_dict_remove(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         // code 带音节空格由 [`user_words_api::remove`] 拆回扁平码；text 是列表给的转义形态、
         // key 是真实文本，不还原就删不掉。
-        user_words_api::remove(self, schema, code, &store_text(text))?;
+        let (keys, batch) = items_or_single(params, code_text_item)?;
+        if batch {
+            user_words_api::remove_batch(self, schema, &keys)?;
+            return Ok(batch_done(keys.len()));
+        }
+        let (code, text) = &keys[0];
+        user_words_api::remove(self, schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -2483,13 +2554,20 @@ pub trait WebDataRpc: WebDataHost {
     fn web_freq_delete(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        // 列表项的 code 带音节空格（见 freq_display_code），而词频表 key 是扁平的。
+        let (keys, batch) = items_or_single(params, flat_code_text_item)?;
+        if keys.is_empty() {
+            return Ok(batch_done(0));
+        }
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 列表项的 code 带音节空格（见 freq_display_code），而词频表 key 是扁平的。
-        let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.delete_freq(&schema, &code, &store_text(text))?;
+        if batch {
+            store.delete_freqs(&schema, &keys)?;
+            return Ok(batch_done(keys.len()));
+        }
+        let (code, text) = &keys[0];
+        store.delete_freq(&schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -2561,13 +2639,20 @@ pub trait WebDataRpc: WebDataHost {
         Ok(json!({ "items": items, "total": total }))
     }
 
-    /// 删一条补全学习数据。返回它本来在不在。
+    /// 删一条补全学习数据。返回它本来在不在。带 `items`（`[{text}]`）时一次删一批。
     fn web_completion_delete(&self, kind: CompletionKind, params: &Value) -> anyhow::Result<Value> {
-        let text = str_param(params, "text")?;
+        let (texts, batch) = items_or_single(params, |p| Ok(store_text(str_param(p, "text")?)))?;
+        if texts.is_empty() {
+            return Ok(batch_done(0));
+        }
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        Ok(json!(store.remove_completion(kind, &store_text(text))?))
+        if batch {
+            store.remove_completions(kind, &texts)?;
+            return Ok(batch_done(texts.len()));
+        }
+        Ok(json!(store.remove_completion(kind, &texts[0])?))
     }
 
     /// 清空某一类补全学习数据，返回删除条数。
@@ -2719,20 +2804,29 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_shadow_remove_rule(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, word) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "word")?,
-        );
+        let schema = str_param(params, "schemaId")?;
         // 设置页删规则时回传 `shadow.list` 给出的 candId：动态短语规则的 word 是写入当天的
         // 求值文本，只按 word 定位会删不掉（列表里看得见、点删除无效）。
-        let cand_id = params.get("candId").and_then(|v| v.as_str());
+        let (rules, batch) = items_or_single(params, |p| {
+            Ok((
+                str_param(p, "code")?.to_string(),
+                str_param(p, "word")?.to_string(),
+                p.get("candId").and_then(|v| v.as_str()).map(str::to_string),
+            ))
+        })?;
+        if rules.is_empty() {
+            return Ok(batch_done(0));
+        }
         let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_shadow_rule(&schema, code, word, cand_id)?;
-        Ok(json!({ "ok": true }))
+        store.remove_shadow_rules(&schema, &rules)?;
+        Ok(if batch {
+            batch_done(rules.len())
+        } else {
+            json!({ "ok": true })
+        })
     }
 
     /// 候选调整手动添加/编辑：type="hide" 转屏蔽；否则（pin）按 position 置顶。
@@ -2874,30 +2968,55 @@ pub trait WebDataRpc: WebDataHost {
     fn web_temp_promote(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        // 列表项的 code 带音节空格（见 web_temp_list），key 是扁平的。
+        let (keys, batch) = items_or_single(params, flat_code_text_item)?;
+        if keys.is_empty() {
+            return Ok(batch_done(0));
+        }
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 列表项的 code 带音节空格（见 web_temp_list），key 是扁平的。
-        let (code, _) = wind_store::wdict::split_spaced_code(code);
-        let text = store_text(text);
-        // 手动转正是显式动作（自动晋升走 `maybe_promote_temp`，不清）。
-        if store.promote_temp_word(&schema, &code, &text)? {
-            user_words_api::clear_deleted_for_added(self, &schema, &[(&code, &text)]);
-        }
-        Ok(json!({ "ok": true }))
+        // 手动转正是显式动作（自动晋升走 `maybe_promote_temp`，不清）。批量选中转正同样是
+        // 用户逐条点选的显式动作，与「全部转正」不同，照单条撤规则。
+        let promoted = if batch {
+            store.promote_temp_words(&schema, &keys)?
+        } else {
+            let (code, text) = &keys[0];
+            if store.promote_temp_word(&schema, code, text)? {
+                vec![(code.clone(), text.clone())]
+            } else {
+                Vec::new()
+            }
+        };
+        let words: Vec<(&str, &str)> = promoted
+            .iter()
+            .map(|(c, t)| (c.as_str(), t.as_str()))
+            .collect();
+        user_words_api::clear_deleted_for_added(self, &schema, &words);
+        Ok(if batch {
+            batch_done(keys.len())
+        } else {
+            json!({ "ok": true })
+        })
     }
 
     fn web_temp_remove(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         let schema = self.engine_mgr().data_schema_id(schema); // 拼音族折叠到 "pinyin"
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        // 同 promote：列表项的 code 带音节空格，不拆则删不掉。
+        let (keys, batch) = items_or_single(params, flat_code_text_item)?;
+        if keys.is_empty() {
+            return Ok(batch_done(0));
+        }
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 同 promote：列表项的 code 带音节空格，不拆则删不掉。
-        let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.remove_temp_word(&schema, &code, &store_text(text))?;
+        if batch {
+            store.remove_temp_words(&schema, &keys)?;
+            return Ok(batch_done(keys.len()));
+        }
+        let (code, text) = &keys[0];
+        store.remove_temp_word(&schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -3010,32 +3129,46 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_phrase_remove(&self, params: &Value) -> anyhow::Result<Value> {
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        let (keys, batch) = items_or_single(params, code_text_item)?;
+        if keys.is_empty() {
+            return Ok(batch_done(0));
+        }
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_phrase(code, &store_text(text))?;
+        store.remove_phrases(&keys)?;
         // 删掉的可能是一条**遮蔽了系统条目**的用户短语（`overrides_system`）——主键只有
         // 一把，删掉它等于把那条系统短语也删了。用户的预期恰恰相反：删掉自己加的那条
         // 就该露出系统默认那条。故补回缺失的系统条目。
         self.restore_missing_system_phrases("删除短语");
         self.rebuild_phrases();
-        Ok(json!({ "ok": true }))
+        Ok(if batch {
+            batch_done(keys.len())
+        } else {
+            json!({ "ok": true })
+        })
     }
 
     fn web_phrase_set_enabled(&self, params: &Value) -> anyhow::Result<Value> {
-        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        // text 是查找键，须还原成存储域（见 `store_text`）——漏了就「开关点了没反应」。
+        let (keys, batch) = items_or_single(params, code_text_item)?;
         let enabled = params
             .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        if keys.is_empty() {
+            return Ok(batch_done(0));
+        }
         let store = self
             .user_store()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // text 是查找键，须还原成存储域（见 `store_text`）——漏了就「开关点了没反应」。
-        store.set_phrase_enabled(code, &store_text(text), enabled)?;
+        store.set_phrases_enabled(&keys, enabled)?;
         self.rebuild_phrases();
-        Ok(json!({ "ok": true }))
+        Ok(if batch {
+            batch_done(keys.len())
+        } else {
+            json!({ "ok": true })
+        })
     }
 
     fn web_phrase_reset(&self) -> anyhow::Result<Value> {
@@ -3386,12 +3519,18 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_common_chars_set(&self, params: &Value) -> anyhow::Result<Value> {
-        let ch = char_param(params, "char")?;
+        let (chars, batch) = items_or_single(params, |p| char_param(p, "char"))?;
         let common = params
             .get("common")
             .and_then(|v| v.as_bool())
             .ok_or_else(|| anyhow::anyhow!("缺少参数 common"))?;
-        self.common_char_edit(&ch, CommonCharEdit::Set(common))?;
+        if batch {
+            if !chars.is_empty() {
+                self.common_char_edit_batch(&chars, CommonCharEdit::Set(common))?;
+            }
+            return Ok(batch_done(chars.len()));
+        }
+        self.common_char_edit(&chars[0], CommonCharEdit::Set(common))?;
         Ok(json!({ "ok": true }))
     }
 
@@ -3528,8 +3667,14 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_common_chars_reset(&self, params: &Value) -> anyhow::Result<Value> {
-        let ch = char_param(params, "char")?;
-        self.common_char_edit(&ch, CommonCharEdit::Reset)?;
+        let (chars, batch) = items_or_single(params, |p| char_param(p, "char"))?;
+        if batch {
+            if !chars.is_empty() {
+                self.common_char_edit_batch(&chars, CommonCharEdit::Reset)?;
+            }
+            return Ok(batch_done(chars.len()));
+        }
+        self.common_char_edit(&chars[0], CommonCharEdit::Reset)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -3573,18 +3718,34 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_quick_set_enabled(&self, params: &Value) -> anyhow::Result<Value> {
-        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        let (items, batch) = items_or_single(params, kind_id_item)?;
         let enabled = params
             .get("enabled")
             .and_then(|v| v.as_bool())
             .ok_or_else(|| anyhow::anyhow!("缺少参数 enabled"))?;
-        self.quick_format_edit(kind, id, QuickFormatEdit::SetEnabled(enabled))?;
-        Ok(json!({ "ok": true }))
+        self.quick_edit_items(&items, batch, QuickFormatEdit::SetEnabled(enabled))
     }
 
     fn web_quick_reset_entry(&self, params: &Value) -> anyhow::Result<Value> {
-        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
-        self.quick_format_edit(kind, id, QuickFormatEdit::ResetEntry)?;
+        let (items, batch) = items_or_single(params, kind_id_item)?;
+        self.quick_edit_items(&items, batch, QuickFormatEdit::ResetEntry)
+    }
+
+    /// `quick.setEnabled` / `quick.resetEntry` 的单条与批量分流（批量可跨类别）。
+    fn quick_edit_items(
+        &self,
+        items: &[(String, String)],
+        batch: bool,
+        edit: QuickFormatEdit,
+    ) -> anyhow::Result<Value> {
+        if batch {
+            if !items.is_empty() {
+                self.quick_format_edit_batch(items, edit)?;
+            }
+            return Ok(batch_done(items.len()));
+        }
+        let (kind, id) = &items[0];
+        self.quick_format_edit(kind, id, edit)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -3633,9 +3794,29 @@ pub trait WebDataRpc: WebDataHost {
     }
 
     fn web_quick_delete(&self, params: &Value) -> anyhow::Result<Value> {
-        let (kind, id) = (str_param(params, "kind")?, str_param(params, "id")?);
+        let (items, batch) = items_or_single(params, kind_id_item)?;
+        if batch {
+            if !items.is_empty() {
+                self.quick_format_delete_batch(&items)?;
+            }
+            return Ok(batch_done(items.len()));
+        }
+        let (kind, id) = &items[0];
         self.quick_format_delete(kind, id)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// `softkeyboard.apply`：`{ ops: [{ op: "setKey", ... }, ...] }`，操作形态见
+    /// `wind_softkeyboard::admin::Op`。
+    fn web_softkeyboard_apply(&self, params: &Value) -> anyhow::Result<Value> {
+        let ops: Vec<wind_softkeyboard::admin::Op> = serde_json::from_value(
+            params
+                .get("ops")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("缺少参数 ops"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("ops 格式无效：{e}"))?;
+        self.softkeyboard_apply(&ops)
     }
 
     /// `compat.*` 的薄分派：纯逻辑在 `compat_admin::rpc`，这里只负责取目录、
@@ -4438,12 +4619,21 @@ pub trait WebDataRpc: WebDataHost {
         }))
     }
 
-    fn web_theme_list(&self) -> anyhow::Result<Value> {
+    /// `theme.list`。`skin`（默认假）为真时才补 `skin` / `animated`：它们要对每个主题做一次
+    /// 完整解析（占整条 RPC 的九成），而设置端启动时列表是必取项、这两项只有「主题信息」
+    /// 才用。`id` 非空时只回那一项。
+    fn web_theme_list(&self, params: &Value) -> anyhow::Result<Value> {
+        let with_skin = params.get("skin").and_then(Value::as_bool).unwrap_or(false);
+        let only = params
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
         // 复用右键菜单的 list_themes_full 顺序，保证与菜单一致 (#5/主题)。
         let dirs = self.theme_search_dirs();
         let out: Vec<Value> = self
             .list_themes_full()
             .into_iter()
+            .filter(|(id, _, _)| only.is_none_or(|o| o == id))
             .map(|(id, display, builtin)| {
                 let meta = wind_theme::read_meta(&dirs, &id);
                 let dir = wind_theme::theme::find_theme_dir(&dirs, &id);
@@ -4455,10 +4645,7 @@ pub trait WebDataRpc: WebDataHost {
                     .and_then(|t| t.parse::<toml::Value>().ok())
                     .and_then(|v| v.get("base")?.as_str().map(str::to_string))
                     .unwrap_or_default();
-                let (skin, animated) = wind_theme::load_resolved_dirs(&dirs, &id, false)
-                    .map(|t| theme_skin_summary(&t))
-                    .unwrap_or_default();
-                json!({
+                let mut item = json!({
                     "name": id,
                     "display_name": display,
                     "author": meta.as_ref().map(|m| m.author.clone()).unwrap_or_default(),
@@ -4470,9 +4657,15 @@ pub trait WebDataRpc: WebDataHost {
                         .map(|d| d.display().to_string())
                         .unwrap_or_default(),
                     "base": base,
-                    "skin": skin,
-                    "animated": animated,
-                })
+                });
+                if with_skin {
+                    let (skin, animated) = wind_theme::load_resolved_dirs(&dirs, &id, false)
+                        .map(|t| theme_skin_summary(&t))
+                        .unwrap_or_default();
+                    item["skin"] = json!(skin);
+                    item["animated"] = json!(animated);
+                }
+                item
             })
             .collect();
         Ok(json!(out))
@@ -11593,7 +11786,7 @@ mod theme_list_tests {
             wind_config::Config::default(),
             Some(&data_dir()),
         );
-        let list = c.web_theme_list().unwrap();
+        let list = c.web_theme_list(&json!({})).unwrap();
         let def = list
             .as_array()
             .unwrap()
@@ -11603,8 +11796,27 @@ mod theme_list_tests {
         assert_eq!(def["builtin"], true);
         assert_eq!(def["dir"], "");
         assert_eq!(def["base"], "_qingfeng");
-        assert_eq!(def["skin"], false);
-        assert_eq!(def["animated"], false);
+        // 默认不算皮肤概要（要整份解析主题，拖慢设置端启动）：键不在。
+        assert!(def.get("skin").is_none() && def.get("animated").is_none());
+    }
+
+    /// `skin:true` 补皮肤字段；`id` 只回那一项。
+    #[test]
+    fn list_skin_flag_and_id_filter() {
+        let c = wind_coordinator::Coordinator::new_headless(
+            wind_config::Config::default(),
+            Some(&data_dir()),
+        );
+        let one = c
+            .web_theme_list(&json!({ "skin": true, "id": "default" }))
+            .unwrap();
+        let arr = one.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "default");
+        assert_eq!(arr[0]["skin"], false);
+        assert_eq!(arr[0]["animated"], false);
+        let all = c.web_theme_list(&json!({})).unwrap();
+        assert!(all.as_array().unwrap().len() > 1);
     }
 
     #[test]
@@ -11642,3 +11854,8 @@ mod theme_list_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+// 放在文件最末：`schema_key_gate_wiring_tests` 的源码守卫只扫第一个 `#[cfg(test)]` 之前的部分，
+// 声明在文件头会把整个生产代码截没。
+#[cfg(test)]
+mod batch_tests;

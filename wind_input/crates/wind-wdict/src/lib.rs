@@ -5,7 +5,7 @@
 //! 文件 = `# 注释` + `wind_dict:` YAML 头 + `\n--- !<tag>\n` 分隔的 TSV 数据段。
 //! TSV 字段转义：`\`→`\\`、换行→`\n`、制表→`\t`；bool→"1"/"0"。
 //!
-//! **词条文本域（text / word）走 [`escape_text_field`] / [`unescape_text_field`]**，
+//! 词条文本域（text / word）走 [`escape_text_field`] / [`unescape_text_field`]，
 //! 命令栏语法条目在那里只保护分隔符、反斜杠原样穿过。编码域（code / action / cand_id）
 //! 不可能是命令栏语法，仍用下面这对原始函数。
 
@@ -49,21 +49,16 @@ pub fn unescape_field(s: &str) -> String {
 
 /// 词条文本域（`text` / `word`）的 TSV / 设置页转义。
 ///
-/// **命令栏语法条目（`$CC` / `$SS` / `$AA` / 含 `{}` 模板）不转义反斜杠**：那条源码里的
-/// `\` 已由 cmdbar lexer 负责（`\\` `\"` `\n` … 见 `wind_cmdbar::decode_escape`），本层
-/// 再转一次就是双重展开——用户按文档写 `open("D:\\notes")`，两层各吃一个反斜杠后 lexer
-/// 拿到的是 `D:\notes`，`\n` 当场变成换行，路径静默损坏。要写对得写四个反斜杠，而同一条
-/// 命令写进 `system.phrases.toml`（不过本层）却只需两个，同一份语法在不同载体规则不同。
+/// 命令栏语法条目（`$CC` / `$SS` / `$AA` / 含 `{}` 模板）不转义反斜杠：`\` 已由 cmdbar
+/// lexer 负责（见 `wind_cmdbar::decode_escape`），本层再转一次就是双重展开，`D:\\notes`
+/// 会变成含换行的路径，且同一条命令在 `system.phrases.toml` 里写法又不同。
 ///
-/// 仍然保护换行与制表：`.wdict.yaml` 是 TSV，一条记录一行、Tab 分列，而短语编辑框是
-/// **多行**输入（`dialogs.rs` 的 `text_multi`），源码里排版换行是允许的。不折成 `\n`
-/// 导出的文件会被那个换行切成两行，结构直接坏掉——这条与命令栏语法无关，是文件格式的
-/// 硬约束，故不可省。
+/// 仍然保护换行与制表：`.wdict.yaml` 是一条记录一行的 TSV，而短语编辑框允许多行，不折成
+/// `\n` 文件结构就坏了。
 ///
-/// 反斜杠不动带来一处**规范化**：源码里的 `\n`（两字符，lexer 的换行转义）经一轮
-/// 导出导入会变成真换行。二者在字符串字面量里语义相同（lexer 把 `\n` 解成换行，真换行
-/// 直接就是换行），且设置页出口又会把真换行显示回 `\n`，用户无感。反过来「不还原 `\n`」
-/// 才是真错：字符串**外部**的排版换行会被固化成字面 `\n`，在表达式位置即语法错误。
+/// 代价是一处规范化：源码里的 `\n` 两字符经一轮导出导入会变成真换行。字符串字面量里二者
+/// 语义相同、设置页出口又显示回 `\n`，用户无感；反过来不还原的话，字符串外部的排版换行会
+/// 固化成字面 `\n`，在表达式位置即语法错误。
 pub fn escape_text_field(s: &str) -> String {
     if !is_cmdbar_text(s) {
         return escape_field(s);
@@ -107,14 +102,14 @@ pub fn unescape_text_field(s: &str) -> String {
 
 /// 该文本是否按命令栏语法解析（[`escape_text_field`] 一对函数的分流判据）。
 ///
-/// 判据须在**存储形态与文件形态上给出同一答案**，否则两侧分流不一致，往返即损坏。
+/// 判据须在存储形态与文件形态上给出同一答案，否则两侧分流不一致，往返即损坏。
 /// 这里成立：两种形态的差别只有换行/制表与 `\n`/`\t` 的互换，而 `is_cmdbar_grammar`
 /// 看的是顶层 `$CC` 一类 marker 与顶层未转义 `{`，二者都不受影响。
 pub fn is_cmdbar_text(s: &str) -> bool {
     wind_cmdbar::is_cmdbar_grammar(s)
 }
 
-/// 词库列序纠错（t172）的判据：**编码列**里出现 `$CC(` / `$SS(` / `$AA(` marker
+/// 词库列序纠错的判据：编码列里出现 `$CC(` / `$SS(` / `$AA(` marker
 /// ⇒ 这一行的列序写反了，该与文本列对调。
 ///
 /// 刻意比 [`is_cmdbar_text`] 窄：后者单凭顶层 `{` 就成立，而 `{` 可以是某些方案编码
@@ -224,7 +219,7 @@ pub fn parse_phrases_wdict(text: &str) -> Result<(Vec<PhraseIo>, usize), String>
 /// wdict words 段的一行（用户词导入导出）。
 ///
 /// count = 选词次数（调频热度）；随导出流转，导入时取 max 合并（见 `import_user_words`）。
-/// created_at 属纯本机数据（创建时间），**不**导出。
+/// created_at 属纯本机数据（创建时间），不导出。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WordIo {
     pub code: String,
@@ -234,12 +229,8 @@ pub struct WordIo {
     pub count: u32,
     /// 显式音节边界，优先于 `code` 里的空格。`None` = 未提供，落库时按空格推断。
     ///
-    /// ★★ **为什么不能只靠 code 里的空格当载体**：空格表达不了「单音节」。
-    /// `join_code_by_boundary("xian", 0b1)` 产出的是无空格的 `xian`，
-    /// `split_spaced_code` 再读回来就是 `0`（既有测试
-    /// `single_syllable_boundary_does_not_survive_text_roundtrip` 记录着这条行为）。
-    /// 导入闸口求解出的单字词边界若走 code 传递，会**静默退化为 0 而调用方以为补上了**。
-    /// 故求解结果一律走本字段。
+    /// 不能只靠 code 里的空格当载体：空格表达不了「单音节」（`xian` 的 0b1 往返后是 0，见测试
+    /// `single_syllable_boundary_does_not_survive_text_roundtrip`）。导入闸口的求解结果一律走本字段。
     pub boundary: Option<u64>,
 }
 
@@ -247,27 +238,24 @@ const WORD_COLUMNS: &[&str] = &["code", "text", "weight", "count"];
 
 // ─────────────────── 音节码：空格表示 ↔ 存储表示（flat + boundary）───────────────────
 //
-// wdict 文本里拼音方案的 code 列写成**带空格的音节码**（`ni hao`），与 rime 源词库同形；
-// 落库时拆成 `flat + mask`。**列结构不变**（仍是 code/text/weight/count），只是 code 列
+// wdict 文本里拼音方案的 code 列写成带空格的音节码（`ni hao`），与 rime 源词库同形；
+// 落库时拆成 `flat + mask`。列结构不变（仍是 code/text/weight/count），只是 code 列
 // 的内容多了空格，故老文件天然兼容。
 //
 // key 必须保持扁平：`ni hao` 作存储键会让 `niha` 无法前缀匹配，而前缀查询是逐键出候选
 // 的命脉（见 docs/design/pinyin-code-domains.md §2.2）。
 //
-// **判据是「有没有空格」，不看方案类型** —— wind-store 拿不到 engine_mgr，无从判断引擎
-// 类型。这条规则对三种输入同时正确：拼音多音节词导出带空格 → 拆出边界；五笔码无空格
-// → 0；旧版无空格文件 → 0（与改动前等价）。
+// 判据是「有没有空格」，不看方案类型（本层拿不到引擎类型）：拼音多音节词带空格 → 拆出边界；
+// 五笔码与旧版无空格文件 → 0。
 //
-// ⚠️ 故意**不复用** `wind_dict::codetable::syllable_boundary_mask`：那个函数对无空格串
-// 返回 `0b1`（「整串一个音节」，因为它的输入保证是已知有音节语义的拼音码），而这里无空格
-// 必须解释为「未知」。语义不同，各自实现才是对的。依赖方向上也不可能复用——
-// wind-dict 依赖 wind-store，反向依赖会成环。
+// 故意不复用 `wind_dict::codetable::syllable_boundary_mask`：它对无空格串返回 `0b1`
+// （整串一个音节），这里无空格必须解释为「未知」。依赖方向上也不行（wind-dict 依赖本 crate）。
 
 /// 存储表示 → 空格表示（导出用）。
 ///
 /// `boundary` 语义同 `wind_dict::binformat::DictEntry::boundary`：各音节起始字节位 bitmask。
 ///
-/// ⚠️ **单音节不可逆**：`boundary=0b1`（「整串一个音节」）join 后无空格，
+/// 单音节不可逆：`boundary=0b1`（「整串一个音节」）join 后无空格，
 /// [`split_spaced_code`] 读回来是 0。单音节无切分歧义，该信息价值极低；且 0 在消费端
 /// 一律是「放行」而非「拒绝」（`boundary_compatible` 任一侧为 0 即放行），不会误杀。
 pub fn join_code_by_boundary(flat: &str, boundary: u64) -> String {
@@ -277,7 +265,7 @@ pub fn join_code_by_boundary(flat: &str, boundary: u64) -> String {
     }
     let mut out = String::with_capacity(flat.len() + 8);
     for (i, ch) in flat.char_indices() {
-        // bit 位是**字节**偏移；拼音码为 ASCII，char_indices 的下标即字节位。
+        // bit 位是字节偏移；拼音码为 ASCII，char_indices 的下标即字节位。
         if i > 0 && i < 64 && (boundary >> i) & 1 == 1 {
             out.push(' ');
         }
@@ -772,283 +760,5 @@ pub fn sections_present(text: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 空格表示 ↔ 存储表示的往返。多音节必须无损，否则备份还原仍会丢边界。
-    #[test]
-    fn spaced_code_roundtrip() {
-        // ni|hao → 起始字节位 {0,2}
-        assert_eq!(join_code_by_boundary("nihao", 0b101), "ni hao");
-        assert_eq!(split_spaced_code("ni hao"), ("nihao".into(), 0b101));
-        // xi|an|ning → {0,2,4}
-        assert_eq!(join_code_by_boundary("xianning", 0b10101), "xi an ning");
-        assert_eq!(
-            split_spaced_code("xi an ning"),
-            ("xianning".into(), 0b10101)
-        );
-        // 变长音节 zhuang|ni → {0,6}
-        assert_eq!(join_code_by_boundary("zhuangni", 0b1000001), "zhuang ni");
-        assert_eq!(
-            split_spaced_code("zhuang ni"),
-            ("zhuangni".into(), 0b1000001)
-        );
-    }
-
-    /// 无空格一律解释为「无边界信息」——五笔码、旧版导出的扁平拼音码走的都是这条路，
-    /// 结果与本次改动前完全等价（boundary=0 → 消费方降级回 DAG）。
-    #[test]
-    fn flat_code_means_unknown_boundary() {
-        assert_eq!(split_spaced_code("abcd"), ("abcd".into(), 0)); // 五笔
-        assert_eq!(split_spaced_code("nihao"), ("nihao".into(), 0)); // 旧版导出
-        assert_eq!(split_spaced_code(""), ("".into(), 0));
-        // 反向：无边界 / 单音节都不加空格（没有可插入的内部边界）
-        assert_eq!(join_code_by_boundary("nihao", 0), "nihao");
-        assert_eq!(join_code_by_boundary("ni", 0b1), "ni");
-    }
-
-    /// ⚠️ 单音节 `0b1` 不可逆（文档已声明）：join 后无空格，split 回来是 0。
-    /// 锁住这个**已知且可接受**的损失，避免日后被当成 bug 顺手「修」成 0b1 ——
-    /// 那会让五笔码也被判成单音节，语义反而错了。
-    #[test]
-    fn single_syllable_boundary_is_lossy_by_design() {
-        let joined = join_code_by_boundary("ni", 0b1);
-        assert_eq!(split_spaced_code(&joined).1, 0, "单音节边界不经文本往返");
-    }
-
-    /// 超过 64 字节的拼接：bitmask 装不下 → 整体降级为 0，不给半截错误边界。
-    #[test]
-    fn overlong_code_degrades_to_zero() {
-        let spaced = ["zhuang"; 12].join(" "); // 12*6=72B
-        let (flat, mask) = split_spaced_code(&spaced);
-        assert_eq!(flat.len(), 72);
-        assert_eq!(mask, 0, "超长码整体降级");
-    }
-
-    #[test]
-    fn phrases_wdict_roundtrip() {
-        let rows = vec![
-            PhraseIo {
-                code: "bj".into(),
-                text: "北京".into(),
-                weight: 1000,
-                position: 0,
-                enabled: true,
-            },
-            PhraseIo {
-                code: "ml".into(),
-                text: "多行\n第二行\t带制表".into(),
-                weight: 500,
-                position: 2,
-                enabled: false,
-            },
-        ];
-        let s = export_phrases_wdict(&rows, "2026-07-02T00:00:00+08:00");
-        assert!(s.contains("wind_dict:"));
-        assert!(s.contains("--- !phrases"));
-        let (parsed, skipped) = parse_phrases_wdict(&s).unwrap();
-        assert_eq!(skipped, 0);
-        assert_eq!(parsed, rows, "导出→解析应无损往返（含换行/制表）");
-    }
-
-    #[test]
-    fn parse_rejects_bad_version() {
-        let bad = "wind_dict:\n  version: 2\n  sections:\n    phrases:\n      columns: [code, text, weight, position, enabled]\n\n--- !phrases\nx\t词\t1\t0\t1\n";
-        assert!(parse_phrases_wdict(bad).is_err(), "version!=1 应拒绝");
-    }
-
-    #[test]
-    fn parse_tolerates_bad_lines() {
-        let s = "wind_dict:\n  version: 1\n  sections:\n    phrases:\n      columns: [code, text, weight, position, enabled]\n\n--- !phrases\nok\t好\t1000\t0\t1\nbadline_no_tabs\nkw\t坏权重\tNaN\t0\t1\n";
-        let (rows, skipped) = parse_phrases_wdict(s).unwrap();
-        // 第 2 行列数不足跳过；第 3 行权重非数字 → 回退 0，仍收（不算跳过）
-        assert_eq!(rows.len(), 2);
-        assert_eq!(skipped, 1);
-        assert_eq!(rows[0].code, "ok");
-        assert_eq!(rows[1].weight, 0, "非法数字回退 0");
-    }
-
-    #[test]
-    fn escape_roundtrip() {
-        for s in ["普通", "含\t制表", "含\n换行", "反斜杠\\结尾", "混\\t\n合"] {
-            assert_eq!(unescape_field(&escape_field(s)), s, "往返应还原: {s:?}");
-        }
-    }
-    #[test]
-    fn escape_only_special() {
-        assert_eq!(escape_field("abc"), "abc");
-        assert_eq!(escape_field("a\tb"), r"a\tb");
-        assert_eq!(escape_field("a\nb"), r"a\nb");
-        assert_eq!(escape_field(r"a\b"), r"a\\b");
-    }
-    /// 命令栏语法条目的反斜杠**零层数变化**：这是「文档写 `\\`、照做就对」的全部依据。
-    ///
-    /// 两层各吃一个是本次修复前的实际行为——用户按文档写两个，落库剩一个，lexer 再把
-    /// `\n` 解成换行，路径静默坏掉且不报错。
-    #[test]
-    fn cmdbar_text_keeps_backslashes() {
-        let src = r#"$CC("[打开]", open("D:\\notes\\temp"))"#;
-        assert_eq!(escape_text_field(src), src, "出口不得再转义反斜杠");
-        assert_eq!(unescape_text_field(src), src, "入口不得再还原反斜杠");
-        // `\\n`（字面反斜杠 + n）不可被拆成「反斜杠 + 换行」
-        let lit = r#"$CC("x", type("a\\nb"))"#;
-        assert_eq!(unescape_text_field(lit), lit);
-    }
-
-    /// 普通词条不受影响：仍按原表转义，`C:\Users` 那类未知序列原样保留。
-    #[test]
-    fn plain_text_still_escaped() {
-        assert_eq!(escape_text_field(r"C:\Users"), r"C:\\Users");
-        assert_eq!(unescape_text_field(r"C:\\Users"), r"C:\Users");
-        assert_eq!(unescape_text_field("甲\\n乙"), "甲\n乙");
-    }
-
-    /// 分隔符保护不可省：短语编辑框是多行输入，命令源码里的真换行若原样写进 TSV
-    /// 会把一条记录切成两行。**文件形态往返自洽**是这里的验收标准。
-    #[test]
-    fn cmdbar_text_protects_separators() {
-        let stored = "$CC(\"打开\",\n\topen(\"https://x\"))";
-        let file = escape_text_field(stored);
-        assert!(
-            !file.contains('\n') && !file.contains('\t'),
-            "真换行/制表必须折成转义序列，否则 TSV 行列结构损坏: {file:?}"
-        );
-        assert_eq!(unescape_text_field(&file), stored, "文件形态往返应还原");
-        assert_eq!(escape_text_field(&unescape_text_field(&file)), file);
-    }
-
-    #[test]
-    fn bool_format_parse() {
-        assert_eq!(format_bool(true), "1");
-        assert_eq!(format_bool(false), "0");
-        assert!(parse_bool("1"));
-        assert!(!parse_bool("0"));
-        assert!(!parse_bool(""));
-    }
-
-    #[test]
-    fn words_wdict_roundtrip() {
-        let rows = vec![
-            WordIo {
-                code: "a".into(),
-                text: "工".into(),
-                weight: 100,
-                count: 42,
-                boundary: None,
-            },
-            WordIo {
-                code: "ml".into(),
-                text: "多行\n带\t制表".into(),
-                weight: 0,
-                count: 0,
-                boundary: None,
-            },
-        ];
-        let s = export_words_wdict(&rows, "2026-07-11T00:00:00+08:00");
-        assert!(s.contains("wind_dict:"));
-        assert!(s.contains("--- !words"));
-        assert!(s.contains("count"), "列头应含 count");
-        let (parsed, skipped) = parse_words_wdict(&s).unwrap();
-        assert_eq!(skipped, 0);
-        assert_eq!(parsed, rows, "导出→解析应无损往返(含换行/制表/count)");
-    }
-
-    #[test]
-    fn words_wdict_reads_legacy_3col() {
-        // 老文件：words 段只声明 3 列、每行 3 字段（无 count）→ count 回退 0，不跳过。
-        let legacy = "wind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight]\n\n--- !words\na\t工\t100\n";
-        let (rows, skipped) = parse_words_wdict(legacy).unwrap();
-        assert_eq!(skipped, 0);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].count, 0, "缺 count 列回退 0");
-        assert_eq!(rows[0].weight, 100);
-    }
-
-    #[test]
-    fn words_parse_rejects_bad_version() {
-        let bad = "wind_dict:\n  version: 2\n\n--- !words\na\t工\t1\n";
-        assert!(parse_words_wdict(bad).is_err(), "version!=1 应拒绝");
-    }
-
-    #[test]
-    fn words_parse_tolerates_bad_lines() {
-        let s = "wind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight, count]\n\n--- !words\nok\t好\t10\t0\nbadline\nkw\t坏权重\tNaN\t0\n";
-        let (rows, skipped) = parse_words_wdict(s).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(skipped, 1, "单字段行跳过");
-        assert_eq!(rows[1].weight, 0, "非法数字回退 0");
-    }
-
-    #[test]
-    fn dict_wdict_roundtrip_words_and_shadow() {
-        let words = vec![WordIo {
-            code: "a".into(),
-            text: "工".into(),
-            weight: 100,
-            count: 7,
-            boundary: None,
-        }];
-        let shadow = vec![
-            ShadowActionIo {
-                action: "pin".into(),
-                code: "xhwp".into(),
-                word: "[小鹤网盘]".into(),
-                position: 0,
-                cand_id: None,
-            },
-            ShadowActionIo {
-                action: "pin".into(),
-                code: "aaaa".into(),
-                word: "日期".into(),
-                position: 1,
-                cand_id: Some("phrase:aaaa:date".into()),
-            },
-            ShadowActionIo {
-                action: "del".into(),
-                code: "j".into(),
-                word: "见".into(),
-                position: 0,
-                cand_id: None,
-            },
-        ];
-        let s = export_dict_wdict(&words, &shadow, "2026-07-14T00:00:00+08:00");
-        assert!(s.contains("--- !words"));
-        assert!(s.contains("--- !shadow"));
-
-        let (pw, sk1) = parse_words_wdict(&s).unwrap();
-        assert_eq!(sk1, 0);
-        assert_eq!(pw, words, "words 段往返无损（含 count）");
-
-        let (ps, sk2) = parse_shadow_wdict(&s).unwrap();
-        assert_eq!(sk2, 0);
-        // del 行 position 归 0（导出留空、解析回退 0）
-        let expected: Vec<ShadowActionIo> = shadow
-            .iter()
-            .cloned()
-            .map(|mut r| {
-                if r.action == "del" {
-                    r.position = 0;
-                }
-                r
-            })
-            .collect();
-        assert_eq!(ps, expected, "shadow 段往返无损（含 cand_id/del）");
-    }
-
-    #[test]
-    fn parse_shadow_skips_unknown_action() {
-        let s = "wind_dict:\n  version: 1\n  sections:\n    shadow:\n      columns: [action, code, word, position, cand_id]\n\n--- !shadow\npin\txhwp\t网盘\t0\t\nbogus\tj\t见\t\t\ndel\tj\t见\t\t\n";
-        let (rows, skipped) = parse_shadow_wdict(s).unwrap();
-        assert_eq!(rows.len(), 2, "pin + del 收，未知 action 跳过");
-        assert_eq!(skipped, 1);
-    }
-
-    #[test]
-    fn parse_shadow_missing_section_is_empty() {
-        // 只有 words 段的老文件：解析 shadow 段返回空，不报错。
-        let s = "wind_dict:\n  version: 1\n\n--- !words\na\t工\t1\t0\n";
-        let (rows, skipped) = parse_shadow_wdict(s).unwrap();
-        assert!(rows.is_empty());
-        assert_eq!(skipped, 0);
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

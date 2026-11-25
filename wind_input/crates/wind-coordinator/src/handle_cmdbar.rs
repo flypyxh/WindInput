@@ -1,17 +1,12 @@
-//! 命令栏（cmdbar）宿主集成
-//!
-//! 对照 Go `wind_input/internal/coordinator/cmdbar_context.go` + `cmdbar_services.go`。
-//! 负责三件事：
+//! 命令栏（cmdbar）宿主集成。负责三件事：
 //! 1. [`Coordinator::init_cmdbar`]：构造后装配 [`Services`] 与自身 Weak 引用；
 //! 2. [`CmdbarCtx`]：把 coordinator 运行时状态适配为 [`EvalContext`]；
 //! 3. 控制器（[`CoordIme`] / [`CoordDict`]）：把 cmdbar 动作映射到 coordinator 能力。
 //!
-//! **平台缺口**：search 留 `None`（经 open 默认可用），相关动作缺失时返回
-//! ServiceUnavailable（宿主侧记 WARN 降级）；已接通 ime.toggle/ime.schema/
-//! dict.add/proc/open/clip/keys/config（get/set/toggle 注册表校验 + 热重载）/
-//! wind.cli（自身 exe 跑 CLI 子命令）。
+//! 平台缺口：search 留 `None`（经 open 默认可用），缺失的动作返回 ServiceUnavailable
+//! （宿主侧记 WARN 降级）。
 //!
-//! **线程/锁**：动作经独立线程执行（见 `Coordinator::spawn_command`），故控制器回调
+//! 线程/锁：动作经独立线程执行（见 `Coordinator::spawn_command`），故控制器回调
 //! 自锁的 coordinator 方法是安全的（此刻按键处理已释放 state 锁）。
 
 use crate::coordinator::Coordinator;
@@ -28,7 +23,7 @@ use wind_ui_types::{ToastKind, ToastPosition};
 /// 告诉被 `wind.cli` 拉起的 CLI 子进程：输出走管道，别去附着父控制台。
 ///
 /// 服务多数时候没有控制台（`AttachConsole` 失败即放弃，继承来的管道句柄得以保留），
-/// 但**开发期从终端启动服务**时子进程会 attach 到那个终端，`println!` 就不进管道了——
+/// 但开发期从终端启动服务时子进程会 attach 到那个终端，`println!` 就不进管道了——
 /// 表现为「开发机上直通命令永远拿不到结果、装机版却正常」。用一个显式开关杜绝。
 pub const WIND_CLI_PIPED_ENV: &str = "WIND_INPUT_CLI_PIPED";
 
@@ -65,15 +60,13 @@ impl Coordinator {
         let _ = self.cmdbar_services.set(svc);
     }
 
-    /// 执行一个 `$CC` 命令源：解析 → 求值 → **按列表顺序**跑动作链。
+    /// 执行一个 `$CC` 命令源：解析 → 求值 → 按列表顺序跑动作链。
     /// type() 文本经 push 管道上屏；其余为副作用。文本上屏后稍候再跑后续副作用，
     /// 让落字先于后续按键（如 `type("「」")` 后 `key.tap("Left")` 才能把光标落到括号中间）。
-    /// **必须在独立线程、未持 state 锁时调用**（控制器会回调自锁的 coordinator 方法）。
+    /// 必须在独立线程、未持 state 锁时调用（控制器会回调自锁的 coordinator 方法）。
     ///
-    /// 失败一律弹 toast：此前求值/动作错误只进 `warn!` 日志，用户侧是「选了没反应」的
-    /// 哑失败——短语写错一个函数名或变量名，除了翻日志没有任何线索。这里是动作链的
-    /// 唯一失败出口，各动作自身不再重复弹（成功回显仍归各动作，见 `cmd_dict_add`）。
-    /// 整条链只弹**第一个**错误：链上后续动作往往因同一根因连环失败，逐个弹会刷屏。
+    /// 失败一律弹 toast（否则是「选了没反应」的哑失败）。这里是动作链的唯一失败出口，各动作
+    /// 不再重复弹；整条链只弹第一个错误，后续动作常因同一根因连环失败。
     pub(crate) fn run_command_candidate(&self, src: &str, input: &str) {
         let Some(services) = self.cmdbar_services.get() else {
             return;
@@ -186,7 +179,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// 测试入口：按**用户同层**的路径执行一条命令源（如 `ime.schema("pinyin")`）。
+    /// 测试入口：按用户同层的路径执行一条命令源（如 `ime.schema("pinyin")`）。
     ///
     /// 直接调 `cmd_set_schema` 之类的内部函数验不出「这条命令是否真能走到那里」——
     /// 求值、动作分派、`Services` 装配三段都在这条链上，任一段断了内部函数照样通过。
@@ -207,17 +200,13 @@ impl Coordinator {
         );
     }
 
-    /// 顶码等同步场景：求值命令源，动作链**全为 Text**（无副作用）时返回拼接文本 `Some(text)`；
-    /// 含任一 Effect（shell/key/clip 等需异步回调 coordinator 锁）返回 `None`，交异步 spawn 执行。
-    ///
-    /// **不跑任何 Effect**——纯文本求值只碰 `CmdbarCtx` 读快照（input/last/clip/now/env）与
-    /// 反查表读锁，无副作用，可在持 state 锁的按键线程内安全调用。
+    /// 顶码等同步场景：求值命令源，动作链全为 Text（无副作用）时返回拼接文本 `Some(text)`；
+    /// 含任一 Effect（需异步回调 coordinator 锁）返回 `None`，交异步 spawn 执行。
     /// `$SS` 组 / 求值失败 / services 未装配亦返回 None。
     ///
-    /// ⚠️ 「无锁」已不再成立：`dict.rev` 经 `reverse_render` 取 `self.reverse` 的**读**锁。
-    /// 这与候选构建路径（`build_candidates` 在同一按键线程、同样持 state 锁时取该读锁）
-    /// 是同一个加锁顺序，故不引入新的死锁面；但新增会取其它锁的 `EvalContext` 方法时
-    /// 必须回到这里重新核对顺序。
+    /// 可在持 state 锁的按键线程内调用：只读 `CmdbarCtx` 快照，外加 `dict.rev` 取
+    /// `self.reverse` 读锁——与 `build_candidates` 同一加锁顺序。新增会取其它锁的
+    /// `EvalContext` 方法时必须回来核对顺序。
     pub(crate) fn eval_command_text_only(&self, src: &str, input: &str) -> Option<String> {
         let services = self.cmdbar_services.get()?;
         let (front_app, front_title, front_sel) = self.front_ctx_snapshot();
@@ -429,7 +418,7 @@ impl ProcessRunner for CoordProc {
         #[cfg(ext_presenter)]
         {
             let _ = &self.0;
-            // verb/show 是 ShellExecuteW 的概念，本平台没有对应物。**必须留 WARN**：
+            // verb/show 是 ShellExecuteW 的概念，本平台没有对应物。必须留 WARN：
             // 词条能跨机器走，用户在 macOS 上写了 verb="runas" 却什么都不发生时，
             // 日志是唯一能说明「被忽略了」而不是「没生效」的线索。
             if !spec.verb.is_empty() || !spec.show.is_empty() {
@@ -462,11 +451,8 @@ impl ProcessRunner for CoordProc {
     }
     fn run_self(&self, spec: &CliSpawn<'_>) -> anyhow::Result<()> {
         // wind.cli：以服务自身 exe 跑 CLI 子命令。CLI 进程经控制管道回连本服务
-        // 执行（热重载/重建等）；GUI 子系统下 spawn 无控制台闪窗。
-        //
-        // 反馈：CLI 早就把结果写在自己的 stdout 上了（「✓ 用户词库: 新增 12 · 更新 3」），
-        // 但它是 GUI 子系统的短命子进程、没有控制台，那行字过去一直掉进黑洞。
-        // 这里把它接回来变成 toast——**不新造一套结果描述**，避免与 CLI 的说法漂移。
+        // 执行（热重载/重建等）；GUI 子系统下 spawn 无控制台闪窗。CLI 写在 stdout 的结果
+        // 没有控制台可看，这里接回来变成 toast，不另造一套结果描述以免与 CLI 漂移。
         let exe = std::env::current_exe()?;
         let mut cmd = std::process::Command::new(exe);
         cmd.args(spec.args);
@@ -486,7 +472,7 @@ impl ProcessRunner for CoordProc {
         let wait = std::time::Duration::from_millis(spec.wait_ms);
         // 收集与计时分成两层线程：
         // 内层只管阻塞读到子进程结束（`wait_with_output` 无法中途放弃）；外层
-        // `recv_timeout` 到点就走人。**不 kill 子进程**——它可能正在写词库。
+        // `recv_timeout` 到点就走人。不 kill 子进程——它可能正在写词库。
         // 只有子进程真的永不退出时才会留下内层这一个线程，这是刻意的取舍。
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -499,7 +485,7 @@ impl ProcessRunner for CoordProc {
         std::thread::Builder::new()
             .name("wind-cli-wait".into())
             .spawn(move || {
-                // ⚠️ 隐私：子进程输出可能带词条/路径，只允许进 toast（UI 通道），
+                // 隐私：子进程输出可能带词条/路径，只允许进 toast（UI 通道），
                 // 日志里只记退出码（见 handle_addword 的同款约定）。
                 let out = match rx.recv_timeout(wait) {
                     Ok(Ok(o)) => o,
@@ -507,7 +493,7 @@ impl ProcessRunner for CoordProc {
                         warn!("wind.cli: 等待子进程失败: {e}");
                         return;
                     }
-                    // 超时**不能静默**：那正是这个功能要消灭的症状（命令跑了、
+                    // 超时不能静默：那正是这个功能要消灭的症状（命令跑了、
                     // 用户什么也没看到）。给一条中性提示，说清"还在跑、结果未知"，
                     // 迟到的真结果不再补弹——几十秒后冒出来的提示比没有更扰人。
                     Err(_) => {
@@ -565,7 +551,7 @@ pub(crate) fn cli_toast_message(
     }
     if ok {
         // 成功文案三级：显式 ok= > CLI 自己打印的最后一行 > 兜底。
-        // 取**最后**一行而不是第一行：多段导入时最后一行是总结性的那条。
+        // 取最后一行而不是第一行：多段导入时最后一行是总结性的那条。
         let text = if !ok_text.trim().is_empty() {
             ok_text.to_string()
         } else if let Some(l) = last_nonempty_line(stdout) {
@@ -600,7 +586,7 @@ fn last_nonempty_line(s: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// 压成单行并按**字符**截断（不是字节——中文报告按字节切会切出半个字）。
+/// 压成单行并按字符截断（不是字节——中文报告按字节切会切出半个字）。
 pub(crate) fn clip_single_line(s: &str, max: usize) -> String {
     let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
     let clipped: String = joined.chars().take(max).collect();
@@ -636,7 +622,7 @@ impl NotifyService for CoordNotify {
 /// （落回按 kind 取色）而不是 panic。
 pub(crate) fn parse_hex_rgba(s: &str) -> Option<[u8; 4]> {
     let hex = s.strip_prefix('#')?;
-    // `is_ascii` 不是多余的：下面按**字节**下标切片，而 `len()` 也是字节数——
+    // `is_ascii` 不是多余的：下面按字节下标切片，而 `len()` 也是字节数——
     // `#中中` 恰好 6 字节，能穿过长度闸门，再切 `hex[0..2]` 就在字符中间 panic。
     // 现有调用方都先过 `validate_toast_args`，但本函数的契约是"非法返回 None"。
     if !matches!(hex.len(), 6 | 8) || !hex.is_ascii() {
@@ -732,7 +718,7 @@ pub(crate) fn set_comment_dict(
 struct CoordConfig(Weak<Coordinator>);
 
 impl CoordConfig {
-    /// `set` 的共同实现。`quiet` 只压热重载**成功**的「设置已更新」；写回 / 重载失败
+    /// `set` 的共同实现。`quiet` 只压热重载成功的「设置已更新」；写回 / 重载失败
     /// 的提示两档都照常弹（`config.set` 词条里写错键该当场看见，静默只会变成「没生效」）。
     fn set_inner(this: &CoordConfig, key: &str, value: &str, quiet: bool) -> anyhow::Result<()> {
         use wind_config::config_schema::{parse_str_value, validate};
@@ -748,7 +734,7 @@ impl CoordConfig {
 
     /// 读某键当前值（四层合并后），字符串裸值、其余紧凑 JSON。
     ///
-    /// `require_trustworthy` = 调用方要拿这个值**当种子写回**（`toggle`）。此时本次加载
+    /// `require_trustworthy` = 调用方要拿这个值当种子写回（`toggle`）。此时本次加载
     /// 若在该键处降级过就必须报错而不是照读：降级时读到的是出厂值，翻转它写回去等于
     /// 把用户真实的设置改成「出厂值的反面」——单键版的整表抹除，同样静默、同样不可逆。
     /// 纯读（`get`）不设这道闸：显示一个出厂值不造成任何损失。
@@ -881,7 +867,7 @@ enum WorkdirFallback {
 /// 解析被启动进程的工作目录，并在需要时记 WARN。
 ///
 /// 所有经 [`Coordinator::push_shell_exec`] 拉起进程的调用方都应先过这里——该通路
-/// 在 TSF 侧是**由前台宿主应用进程执行**的，不定目录就等于把宿主的当前目录
+/// 在 TSF 侧是由前台宿主应用进程执行的，不定目录就等于把宿主的当前目录
 /// （随文件对话框漂移）连同它的 DLL 搜索路径一起交给子进程。
 pub(crate) fn resolve_workdir(func: &str, cmd: &str, explicit: &str) -> String {
     let (dir, fallback) = resolve_workdir_with(cmd, explicit, |p| p.is_dir(), home_dir);
@@ -898,17 +884,12 @@ pub(crate) fn resolve_workdir(func: &str, cmd: &str, explicit: &str) -> String {
     dir
 }
 
-/// [`resolve_workdir`] 的纯逻辑内核：文件系统探测与主目录解析都从外部注入，
-/// 便于用假映射做确定性单测（与 `cli_util::expand_with` 同款做法）。
+/// [`resolve_workdir`] 的纯逻辑内核：文件系统探测与主目录解析都从外部注入，便于确定性单测。
 ///
-/// 默认策略 = **目标程序所在目录**，等价于在资源管理器里双击它；靠相对路径找
-/// 数据文件的程序（词典等）正是按这个假设写的。定位不到目标目录时退到主目录，
-/// 刻意**不**用输入法自身目录：那会把第三方进程的 CWD 挂到我们的安装目录上，
-/// 既可能被写入垃圾文件，也让它的 DLL 搜索路径指向我们这里。
-///
-/// 返回空串仅当连主目录都拿不到——空串下游即"不设置"，也就是继承调用方的当前
-/// 目录。在 Windows 上那是**前台宿主应用**的 CWD（还会被文件对话框改掉），
-/// 正是本函数要消除的不确定性，所以它是最后手段而非默认路径。
+/// 默认 = 目标程序所在目录（等价于资源管理器里双击它，靠相对路径找数据的程序按此假设写）；
+/// 定位不到时退到主目录，刻意不用输入法自身目录（第三方进程可能往里写垃圾，DLL 搜索路径也会
+/// 指向这里）。返回空串仅当连主目录都拿不到：下游即继承调用方 CWD（前台宿主的，不确定），
+/// 是最后手段。
 fn resolve_workdir_with(
     cmd: &str,
     explicit: &str,
@@ -1020,216 +1001,16 @@ impl ClipboardService for SysClip {
 }
 
 #[cfg(test)]
-mod workdir_tests {
-    use super::{WorkdirFallback, resolve_workdir_with};
-    use std::path::{Path, PathBuf};
-
-    /// 假文件系统：只有列出的路径算存在的目录。
-    fn dirs(list: &'static [&'static str]) -> impl Fn(&Path) -> bool {
-        move |p: &Path| list.iter().any(|d| Path::new(d) == p)
-    }
-
-    fn home() -> Option<PathBuf> {
-        Some(PathBuf::from("C:/Users/me"))
-    }
-
-    fn no_home() -> Option<PathBuf> {
-        None
-    }
-
-    /// 默认策略的主用例：目标是本地程序 → 落到它自己所在目录。
-    /// 词典类程序按相对路径找词库，靠的就是这个语义（等价于资源管理器双击）。
-    #[test]
-    fn defaults_to_directory_of_target_program() {
-        let (dir, fb) = resolve_workdir_with("D:/Dict/dict.exe", "", dirs(&["D:/Dict"]), home);
-        assert_eq!(dir, "D:/Dict");
-        assert_eq!(fb, None);
-    }
-
-    /// 裸命令名由 ShellExecute 走 PATH 解析，反推不出目录 → 中性目录。
-    /// 关键是**不能**返回空串：空串下游即继承前台宿主应用的当前目录。
-    #[test]
-    fn bare_command_name_falls_back_to_home_not_empty() {
-        let (dir, fb) = resolve_workdir_with("notepad.exe", "", dirs(&[]), home);
-        assert_eq!(dir, "C:/Users/me");
-        assert_eq!(fb, Some(WorkdirFallback::NoTargetDir));
-    }
-
-    /// URL 不能走 Path::parent：`https://a/b/c` 会切出 `https://a/b` 这种似是而非的路径。
-    ///
-    /// ⚠️ 白名单里放的正是 `Path::parent()` 对该 URL **真会产出**的那个值——这样
-    /// 一旦 `://` 短路被删掉，本例就会返回那个假路径而变红。若随便填一个对不上的
-    /// 字符串，`is_dir` 恒 false 会让它无论有没有短路都绿，成为典型的假绿用例。
-    #[test]
-    fn url_target_does_not_go_through_path_parent() {
-        const URL: &str = "https://www.zdic.net/hans/x";
-        let bogus_parent = Path::new(URL)
-            .parent()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let (dir, fb) =
-            resolve_workdir_with(URL, "", move |p: &Path| p == Path::new(&bogus_parent), home);
-        assert_eq!(dir, "C:/Users/me", "URL 不应被当成路径拆父目录");
-        assert_eq!(fb, Some(WorkdirFallback::NoTargetDir));
-    }
-
-    /// 显式 cwd 优先于默认策略。
-    #[test]
-    fn explicit_cwd_wins_over_target_dir() {
-        let (dir, fb) = resolve_workdir_with(
-            "D:/Dict/dict.exe",
-            "E:/Data",
-            dirs(&["D:/Dict", "E:/Data"]),
-            home,
-        );
-        assert_eq!(dir, "E:/Data");
-        assert_eq!(fb, None);
-    }
-
-    /// 显式 cwd 写错：降级而非让整个启动失败（ShellExecuteW 收到不存在的目录会整体失败）。
-    #[test]
-    fn missing_explicit_cwd_degrades_with_reason() {
-        let (dir, fb) =
-            resolve_workdir_with("D:/Dict/dict.exe", "E:/typo", dirs(&["D:/Dict"]), home);
-        assert_eq!(dir, "C:/Users/me");
-        assert_eq!(fb, Some(WorkdirFallback::ExplicitMissing));
-    }
-
-    /// 目标目录不存在（词条写了个错路径）时同样退到中性目录，而不是把不存在的目录传下去。
-    #[test]
-    fn nonexistent_target_dir_is_not_passed_through() {
-        let (dir, _) = resolve_workdir_with("D:/gone/x.exe", "", dirs(&[]), home);
-        assert_eq!(dir, "C:/Users/me");
-    }
-
-    /// 连主目录都拿不到才返回空串——这是最后手段，且必须报告出来。
-    #[test]
-    fn empty_only_when_nothing_resolvable() {
-        let (dir, fb) = resolve_workdir_with("notepad.exe", "", dirs(&[]), no_home);
-        assert_eq!(dir, "");
-        assert_eq!(fb, Some(WorkdirFallback::Unresolved));
-    }
-
-    /// 纯空白的 cwd 视同未指定（词条里 `cwd=" "` 是笔误，不该被当成合法目录）。
-    #[test]
-    fn blank_explicit_cwd_is_treated_as_unset() {
-        let (dir, fb) = resolve_workdir_with("D:/Dict/d.exe", "   ", dirs(&["D:/Dict"]), home);
-        assert_eq!(dir, "D:/Dict");
-        assert_eq!(fb, None);
-    }
-}
+#[path = "handle_cmdbar_workdir_tests.rs"]
+mod workdir_tests;
 
 /// `wind.cli` 执行结果 → toast 的判定表。
 ///
 /// 这些分支是整个功能最容易写反的部分（三种模式 × 成败 × 有无输出），而端到端跑一个
 /// 真子进程既慢又依赖 exe 存在，故判定单独抽成纯函数在这里钉死。
 #[cfg(test)]
-mod cli_toast_tests {
-    use super::{cli_toast_message, clip_single_line, parse_hex_rgba};
-    use wind_ui_types::ToastKind;
-
-    /// 成功时用 CLI 自己打印的**最后一行**——那是 `dict import` 的总结行。
-    /// 不自造文案：core 再写一遍"导入成功"就会与 CLI 的说法漂移。
-    #[test]
-    fn success_uses_cli_last_line() {
-        let (msg, kind) = cli_toast_message(
-            "",
-            "",
-            Some(0),
-            "✓ 用户词库: 新增 12 · 更新 3\n✓ 词频: 导入 40\n",
-            "",
-        )
-        .expect("默认模式成功要弹");
-        assert_eq!(msg, "✓ 词频: 导入 40");
-        assert_eq!(kind, ToastKind::Success);
-    }
-
-    /// 显式 `ok=` 压过 CLI 输出。
-    #[test]
-    fn explicit_ok_text_wins() {
-        let (msg, _) = cli_toast_message("on", "词库已更新", Some(0), "✓ 新增 12", "").unwrap();
-        assert_eq!(msg, "词库已更新");
-    }
-
-    /// 成功但**没有任何输出**时仍要有话说——否则用户看到的还是"什么都没发生"。
-    #[test]
-    fn success_without_output_still_reports() {
-        let (msg, _) = cli_toast_message("on", "", Some(0), "  \n", "").unwrap();
-        assert_eq!(msg, "命令已完成");
-    }
-
-    /// 失败取 stderr 首行；没有 stderr 时退到 stdout；都没有才用退出码兜底。
-    /// 兜底带退出码是刻意的：光说"命令失败"对排查毫无价值。
-    #[test]
-    fn failure_prefers_stderr_then_stdout_then_code() {
-        let (msg, kind) = cli_toast_message(
-            "",
-            "",
-            Some(1),
-            "",
-            "读取 x.yaml 失败: 系统找不到指定的文件。",
-        )
-        .unwrap();
-        assert_eq!(msg, "读取 x.yaml 失败: 系统找不到指定的文件。");
-        assert_eq!(kind, ToastKind::Error);
-
-        let (msg, _) = cli_toast_message("", "", Some(2), "用法: wind_input dict import …", "")
-            .expect("退出码 2（用法错）也要报");
-        assert!(msg.starts_with("用法"), "{msg}");
-
-        let (msg, _) = cli_toast_message("", "", Some(3), "", "").unwrap();
-        assert_eq!(msg, "命令失败（退出码 3）");
-        // 被信号/强杀：没有退出码，也不能假装成功
-        let (msg, kind) = cli_toast_message("", "", None, "", "").unwrap();
-        assert_eq!(msg, "命令被中止");
-        assert_eq!(kind, ToastKind::Error);
-    }
-
-    /// 三种模式的取舍：`off` 一律不弹；`error` 只在失败时弹（供 restart / config set
-    /// 这类服务侧已有提示的子命令，避免双提示）；默认两头都弹。
-    #[test]
-    fn toast_modes_gate_what_is_shown() {
-        assert!(cli_toast_message("off", "", Some(0), "✓ ok", "").is_none());
-        assert!(cli_toast_message("off", "", Some(1), "", "炸了").is_none());
-        assert!(cli_toast_message("error", "", Some(0), "✓ ok", "").is_none());
-        assert!(
-            cli_toast_message("error", "", Some(1), "", "炸了").is_some(),
-            "error 模式下失败仍必须弹——否则这个模式就等于 off"
-        );
-        // 显式 ok= 也压不过 off：模式是总闸。
-        assert!(cli_toast_message("off", "词库已更新", Some(0), "", "").is_none());
-    }
-
-    /// 多行/超长输出压成单行并按**字符**截断（按字节切中文会切出半个字）。
-    #[test]
-    fn message_is_single_line_and_clipped_by_chars() {
-        let long = "汉".repeat(300);
-        let (msg, _) = cli_toast_message("on", &long, Some(0), "", "").unwrap();
-        assert_eq!(msg.chars().count(), 201, "200 字 + 省略号");
-        assert!(msg.ends_with('…'));
-
-        assert_eq!(clip_single_line("a\r\nb\tc  d", 100), "a b c d");
-        // 恰好等于上限不加省略号
-        assert_eq!(clip_single_line("abcde", 5), "abcde");
-        // 截断点落在空格之后：判据若按"原串非空白字符数"算会漏掉省略号。
-        assert_eq!(clip_single_line("ab cd ef", 7), "ab cd e…");
-    }
-
-    #[test]
-    fn hex_color_parsing() {
-        assert_eq!(parse_hex_rgba("#52C41A"), Some([0x52, 0xC4, 0x1A, 255]));
-        assert_eq!(parse_hex_rgba("#52C41A80"), Some([0x52, 0xC4, 0x1A, 0x80]));
-        // 非法一律 None → 落回按 kind 取色，而不是 panic 或黑色
-        for bad in ["", "52C41A", "#52C", "#GGGGGG", "#52C41A8"] {
-            assert_eq!(parse_hex_rgba(bad), None, "{bad}");
-        }
-        // ★ 多字节：`#中中` 恰好 6 **字节**，会穿过长度闸门，再按字节切片就在
-        // 字符中间 panic。契约是"非法返回 None"，故这里必须也是 None。
-        assert_eq!(parse_hex_rgba("#中中"), None);
-        assert_eq!(parse_hex_rgba("#αβγδ"), None);
-    }
-}
+#[path = "handle_cmdbar_cli_toast_tests.rs"]
+mod cli_toast_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod reap_tests {
@@ -1265,114 +1046,8 @@ mod reap_tests {
 }
 
 #[cfg(test)]
-mod feature_toggle_tests {
-    use super::{is_feature_target, set_comment_dict, state_unchanged_text};
-    use wind_config::CommentDictSpec;
-
-    fn manual(id: &str, enabled: bool) -> CommentDictSpec {
-        CommentDictSpec {
-            id: id.into(),
-            path: format!("comments/{id}.txt"),
-            enabled,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn state_unchanged_text_uses_menu_wording() {
-        assert_eq!(state_unchanged_text("cn-en", true), "已是中文模式");
-        assert_eq!(state_unchanged_text("cn-en", false), "已是英文模式");
-        assert_eq!(state_unchanged_text("fullshape", false), "已是半角");
-        assert_eq!(state_unchanged_text("s2t", true), "简入繁出已是开启状态");
-        assert_eq!(state_unchanged_text("toolbar", false), "工具栏已是隐藏状态");
-    }
-
-    #[test]
-    fn feature_targets_are_recognized() {
-        for t in ["emoji", "emoji:frost_greek", "emoji:猫猫", "dict:en"] {
-            assert!(is_feature_target(t), "{t}");
-        }
-        for t in ["s2t", "cn-en", "emojis", "dictx"] {
-            assert!(!is_feature_target(t), "{t}");
-        }
-    }
-
-    /// 已在列表里的条目就地翻转，顺序与其它条目不动。
-    #[test]
-    fn flips_existing_entry_in_place() {
-        let cfg = [manual("en", true), manual("chaifen", false)];
-        let (list, on) = set_comment_dict(&cfg, &[], &[], "chaifen", None)
-            .unwrap()
-            .unwrap();
-        assert!(on);
-        assert_eq!(list.len(), 2);
-        assert!(list[0].enabled && list[1].enabled);
-        let (list, on) = set_comment_dict(&list, &[], &[], "en", None)
-            .unwrap()
-            .unwrap();
-        assert!(!on && !list[0].enabled);
-    }
-
-    /// 指定状态：与当前一致时不动作（None）；不一致才改。
-    #[test]
-    fn set_is_noop_when_already_in_state() {
-        let cfg = [manual("en", true)];
-        assert!(
-            set_comment_dict(&cfg, &[], &[], "en", Some(true))
-                .unwrap()
-                .is_none()
-        );
-        let (list, on) = set_comment_dict(&cfg, &[], &[], "en", Some(false))
-            .unwrap()
-            .unwrap();
-        assert!(!on && !list[0].enabled);
-    }
-
-    /// 自动来源（未登记时是开的）不在列表里：要开不动作；要关 / 取反就追加一条关着的引用空壳。
-    #[test]
-    fn auto_source_gets_a_disabled_shell() {
-        let cfg = [manual("en", true)];
-        let auto = vec!["auto:pinyin/cn_dicts/corrections.dict.yaml".to_string()];
-        assert!(
-            set_comment_dict(&cfg, &auto, &[], &auto[0], Some(true))
-                .unwrap()
-                .is_none()
-        );
-        for want in [None, Some(false)] {
-            let (list, on) = set_comment_dict(&cfg, &auto, &[], &auto[0], want)
-                .unwrap()
-                .unwrap();
-            assert!(!on);
-            let shell = &list[1];
-            assert!(shell.auto && !shell.enabled && shell.path.is_empty());
-        }
-    }
-
-    /// 内置库（未登记时是开的）：要开不动作；要关 / 取反就追加一条关着的 builtin 空壳。
-    #[test]
-    fn builtin_dict_gets_a_disabled_shell() {
-        let cfg = [manual("en", true)];
-        let builtin = vec!["zh_en".to_string()];
-        assert!(
-            set_comment_dict(&cfg, &[], &builtin, "zh_en", Some(true))
-                .unwrap()
-                .is_none()
-        );
-        for want in [None, Some(false)] {
-            let (list, on) = set_comment_dict(&cfg, &[], &builtin, "zh_en", want)
-                .unwrap()
-                .unwrap();
-            assert!(!on);
-            let shell = &list[1];
-            assert!(shell.id == "zh_en" && shell.builtin && !shell.enabled && !shell.auto);
-        }
-    }
-
-    #[test]
-    fn unknown_id_is_an_error() {
-        assert!(set_comment_dict(&[manual("en", true)], &[], &[], "nope", Some(true)).is_err());
-    }
-}
+#[path = "handle_cmdbar_feature_toggle_tests.rs"]
+mod feature_toggle_tests;
 
 #[cfg(test)]
 mod set_state_tests {

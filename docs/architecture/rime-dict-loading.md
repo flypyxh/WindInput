@@ -312,6 +312,27 @@ DictManager（每方案一个）→ CompositeDict
 缓存根：`%LOCALAPPDATA%\WindInput[Dev]\cache\{方案名}\`。
 `CACHE_DIR` 为 None 时**回退写到源文件旁**（安装目录可能只读）。
 
+**缓存命名空间是源文件在 `schemas/` 下的目录链**（`manager.rs::cache_path` →
+`wind_dict::cache_ns`），不是父目录名：词库可声明在 `schemas/<方案>/word/x.dict.yaml` 这种
+二级目录下，取父目录名会丢掉方案那一段而跨方案撞名。扁平结构下两种推导逐字节相同。
+旧布局（按父目录名）留下的孤儿产物**有意不清**：在 `cache_path` 里顺手删「按旧算法算出的
+路径」行不通——方案目录本身就叫 `word` 时那正是它的合法新路径，两个方案会互删缓存、永久重建；
+改成「布局版本标记 + 全量重建」又要让所有用户白建一次。受影响的只有用子目录的少数用户，
+卸载时缓存目录整体清掉，要立刻回收可走 `EngineManager::rebuild_all_caches`（CLI `schema rebuild`）。
+
+**反查索引常驻 / mmap 分界 `REVERSE_INDEX_RESIDENT_MAX = 3 MB`**：两条路查询行为完全相同，
+只影响性能。真实索引规模是离散几档（`wind-dict` 的 `reverse_index_bench`）：
+
+| 方案 | 词数 | 索引 | 重开耗时（常驻 / mmap） |
+|---|---|---|---|
+| wubi86（出厂） | 89081 | 2.3 MB | 1.06 ms / 9.37 ms |
+| pinyin（出厂） | 640842 | 23.0 MB | 7.65 ms / 9.08 ms |
+| feihuzj2（用户） | 2519693 | 88.2 MB | 29.3 ms / 9.73 ms |
+
+mmap 建映射开销近乎恒定 ~9 ms，小索引常驻更快；大索引常驻要多付私有内存，点查速度却相同
+（页缓存热后都是 ~0.25 µs/次）。3 MB 落在最低两档之间，两端都不敏感。按
+`config-design-rules.md` §R1（程序可判定的差异不加用户键）不做成配置项。
+
 **merged 由子表段归并生成（2026-10-14，S3/S4）**：旧做法是并行解析全部子表、HashMap 聚合、
 再把 65 万条 owned 元组交给 `WdatWriter`；现在每张子表先各自成段（`CachedDict::load_at_with`，
 改了哪张只重建哪张，串行建段以免两张大表的解析峰值叠加），再用各段的 `WdatReader::codes()`
@@ -397,6 +418,39 @@ derived_fingerprint(digests, tag) =
   静默复用错误索引。
 - 任一词库处于内存模式（wdat 写失败）→ **不落盘**：它没有稳定的磁盘产物，
   下次启动无从校验，只会复用一份来历不明的缓存。
+
+### 5.4 reader 共享池（`reader_pool.rs`）
+
+同一缓存文件常被多个方案引用（拼音、双拼、混输子引擎都解析到同一个 `pinyin/rime_frost.merged.wdat`），
+未加池时 62 MB 的 merged 会被 mmap 三份。池按缓存文件路径复用 reader，覆盖 `.wdat` / `.wcmt` / `.wemj`。
+
+- **池存 `Weak`**：最后一个引擎释放即解除映射。Windows 上被 mmap 的文件不能删除；内容寻址之后
+  重建虽不再覆盖旧文件，旧文件仍要等最后的持有者放手才能被 `prune_slot` 删掉。`EngineManager`
+  的 `engines.clear()` / `remove()` 因此仍是有效释放点，不必再叠手工引用计数。
+  「被映射即删不掉」并非处处成立：有的 Windows 环境（版本 / 文件系统 / 账户）下 `DeleteFileW`、
+  `MoveFileEx` 对被映射的文件照样成功；`std::fs::remove_file` 走 POSIX 删除语义，恒测不出占用。
+  测占用要用 `DeleteFileW`（资源管理器走它，被映射时返回 `ERROR_USER_MAPPED_FILE`），并拿必被映射的
+  主库做对照，见 `wind-engine/tests/engine_manager.rs` 的 Windows 专属用例。
+- **key 不 canonicalize**：缓存路径都由 `cache_path`（纯函数）生成，同一文件必得同一字符串；
+  万一出现不同写法只会退化成各开一份，不会取错 reader。
+- **复用前比对 `(大小, mtime, 替换代数)`**：tmp + rename 在 Windows 上对正被 mmap 的目标也会
+  成功（`File::open` 带 `FILE_SHARE_DELETE`，旧文件转 pending-delete），旧映射仍指向旧数据，
+  仅凭路径复用就是「改了词库不生效，重启才行」。这里要察觉的是「文件被替换」，与 `cache_fp`
+  拒绝 mtime（那里判的是「要不要重建」）不矛盾。
+- **为什么要替换代数**：同大小重建时只剩 mtime 可判，而 Linux inode 时间戳取自粗粒度时钟，
+  同一刻度内两次写入的 mtime 逐纳秒相同（`rebuilt_file_is_not_served_from_stale_entry` 稳定复现）。
+  全量哈希 62 MB 太贵；采样头尾会漏掉只改中段权重/文本的重建；Windows 上取 `file_index` 要
+  未稳定的 `windows_by_handle`。于是由替换方用 `replacing()` 守卫宣告替换。不走守卫的替换
+  （别的进程、用户手动覆盖）与本进程上次读取隔着人的操作时间，不会撞进同一刻度。
+- **守卫前后各 +1**：只在替换后记一次，`rename` 与 `+1` 之间读到「旧代数 + 新 metadata」就命中
+  陈旧条目；前后各记一次，窗口里读到的是中间代数，两侧都拒绝复用。替换失败也照样 +2（多开一份
+  映射，安全方向）。不依赖调用方持 `file_lock`：sidecar `open_wdat`、方案导入与备份还原都不在锁下。
+- **用代数而不是删池中条目**：线程 A 取完 stamp 正在 open 旧文件时，B 完成替换并删条目，A 随后
+  插入的陈旧条目就再无人清理；代数则让 A 带着旧代数，自然不被复用。代数表因此**不能清理**——
+  清回 0 可能恰好等于池中条目记的 0。
+- **`file_lock` 按文件而非 schema 加锁**：`pinyin` 与 `shuangpin` 是两把 schema 锁却争同一个
+  merged 文件；冷启动并发重建时第二次 rename 会撞上刚 mmap 的文件、落到 `temp_fallback` 临时
+  副本，副本路径不同，池也无法合并。
 
 ---
 

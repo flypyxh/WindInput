@@ -1,14 +1,13 @@
 //! 词语全拼编码生成（造词反推读音）。
 //!
-//! 与 Go 版 `internal/engine/pinyin` 的 `GenerateWordPinyin` 对齐：
-//! 为词语推断全拼编码（如"你好"→"nihao"），核心是解决**多音字在词里读哪个音**。
+//! 为词语推断全拼编码（如"你好"→"nihao"），核心是解决多音字在词里读哪个音。
 //!
 //! 三级优先策略：
 //!  1. 整词命中：枚举每字所有读音的笛卡尔积（按权重降序），第一个能让词典查回该词的组合即最优。
 //!  2. 最长子词切分：DP 把词切成已知子词序列（如"长江三角洲"=长江+三角洲），继承子词整体读音。
 //!  3. 逐字代表读音兜底：确保至少有结果。
 //!
-//! 单字读音索引 [`CharPinyinIndex`] 从**词典本身**派生（遍历标准音节查单字候选、按权重排序），
+//! 单字读音索引 [`CharPinyinIndex`] 从词典本身派生（遍历标准音节查单字候选、按权重排序），
 //! 不依赖 wind-reverse 的 pinyin_map.txt——代表读音 = 词典里权重最高的读音。
 
 use std::collections::HashMap;
@@ -26,8 +25,8 @@ pub static BUILD_STATS: crate::text_codes::BuildStats = crate::text_codes::Build
 
 /// 单字读音表的查询面：本模块的推断 / 求解只经这三个方法读读音表。
 ///
-/// 抽成 trait 只为一件事：等价性对拍（测试里的旧实现与 [`CharPinyinIndex`] 喂同一批词，
-/// 比上游函数的产出）。生产只有 [`CharPinyinIndex`] 一个实现。
+/// 抽成 trait 只为等价性对拍（`generate/legacy_equiv.rs` 的参照实现与 [`CharPinyinIndex`]
+/// 喂同一批词）。生产只有 [`CharPinyinIndex`] 一个实现。
 pub trait ReadingTable {
     /// 代表读音（权重最高者）；没收录的字为 `None`。
     fn representative(&self, c: char) -> Option<&str>;
@@ -43,10 +42,8 @@ pub trait ReadingTable {
 /// 由 [`CharPinyinIndex::build`] 遍历 [`STANDARD_SYLLABLES`] 查词典单字候选构建。
 ///
 /// 紧凑存储（与 `wind-reverse` 的 `PinyinTable` 同构）：按字升序的定长条目数组 + 读音结束偏移
-/// 数组 + 一整块读音文本，查询二分，**没有逐条堆分配**。此前是两张 `HashMap<char, String>` /
-/// `HashMap<char, Vec<String>>`：4 万字、5.2 万读音拆成 13.3 万个小块，实测在用堆 9.1 MB、
-/// 加上分配器开销常驻约 12.5 MB（`docs/design/memory-footprint.md` S5；对拍见
-/// `generate/legacy_equiv.rs`）。
+/// 数组 + 一整块读音文本，查询二分，没有逐条堆分配（逐字 `HashMap` 的小块分配开销见
+/// `docs/design/memory-footprint.md` S5；对拍见 `generate/legacy_equiv.rs`）。
 #[derive(Debug, Default)]
 pub struct CharPinyinIndex {
     /// 按 `ch` 升序。本字读音在 `reading_ends` 中的下标区间 = [前一条目的 `reading_end`,
@@ -81,7 +78,7 @@ impl CharPinyinIndex {
 
     fn build_inner(dict: &CachedDict) -> Self {
         // 音节 id = 它在 `STANDARD_SYLLABLES` 里**首次**出现的下标：同一音节串只算一个读音，
-        // 且 id 序就是遍历序（旧实现「同权重保留首次遇到的次序」靠的正是它）。
+        // 且 id 序就是遍历序（「同权重保留首次遇到的次序」靠的正是它）。
         let mut first: HashMap<&'static str, u32> =
             HashMap::with_capacity(STANDARD_SYLLABLES.len());
         // 中间态只有定长三元组 (字, 音节 id, 权重)，不为读音逐条分配。
@@ -105,7 +102,7 @@ impl CharPinyinIndex {
             }
             same
         });
-        // 字内按权重降序、同权重按音节 id（= 旧实现的稳定排序 + 首次出现次序）。
+        // 字内按权重降序、同权重按音节 id（即首次出现次序）。
         rows.sort_unstable_by_key(|&(c, sid, w)| (c, std::cmp::Reverse(w), sid));
 
         let chars =
@@ -121,7 +118,7 @@ impl CharPinyinIndex {
         };
         for (i, &(c, sid, _)) in rows.iter().enumerate() {
             idx.arena.push_str(STANDARD_SYLLABLES[sid as usize]);
-            // 偏移存 u32：读音池实测约 0.2 MB、读音 5 万条，离上限差四个数量级。
+            // 偏移存 u32：读音池约 0.2 MB、读音 5 万条，离上限差四个数量级。
             debug_assert!(u32::try_from(idx.arena.len()).is_ok(), "读音池超出 u32");
             idx.reading_ends.push(idx.arena.len() as u32);
             if rows.get(i + 1).is_none_or(|n| n.0 != c) {
@@ -196,17 +193,10 @@ impl ReadingTable for CharPinyinIndex {
     }
 }
 
-/// 按音节/词段拼接**带空格的音节码**（`ni hao`）。
+/// 按音节/词段拼接带空格的音节码（`ni hao`）。
 ///
-/// 造词本就是「逐音节拼起来」，边界是白送的——此前被 `String::push_str` 丢掉，逼得下游用
-/// DAG 反猜（甚至靠 410 音节暴力反查）。
-///
-/// 此前的形态是「扁平 code + 手工累积的 bitmask」两个独立值，有两个固有毛病，空格表示
-/// 一并消除：
-/// - **二者可以不一致**：`d4084b8` 已踩过「A 层的 code + B 层的 boundary」。空格串里
-///   码与边界物理上不可分离，错配连写都写不出来。
-/// - **64 字节天花板**：bitmask 装不下更长的拼接，只能整体降级为「无边界」，长词因此
-///   一律拿不到边界。字符串没有这个限制。
+/// 造词本就逐音节拼接，边界是白送的，不该丢给下游用 DAG 反猜。用空格而不是「扁平 code +
+/// bitmask」：码与边界物理上不可分离、无法错配，也没有 bitmask 的 64 字节上限。
 ///
 /// 落库时由 [`wind_store::wdict::split_spaced_code`] 拆回 `flat + mask`——key 必须保持
 /// 扁平，见 `docs/design/pinyin-code-domains.md` §2.2。
@@ -221,8 +211,7 @@ impl SpacedCode {
         }
     }
 
-    /// 追加一个**已带空格的多音节词段**（如整词 `ni hao`）。段内边界随空格原样并入，
-    /// 无需平移——这正是空格表示取代 bitmask 左移的地方。
+    /// 追加一个已带空格的多音节词段（如整词 `ni hao`）。段内边界随空格原样并入，无需平移。
     fn push_segment(&mut self, spaced: &str) {
         self.syls.extend(
             spaced
@@ -242,7 +231,7 @@ impl SpacedCode {
     }
 }
 
-/// 为词语生成**带空格的全拼音节码**（`你好` → `ni hao`）。含无读音字符时返回 `None`。
+/// 为词语生成带空格的全拼音节码（`你好` → `ni hao`）。含无读音字符时返回 `None`。
 ///
 /// 空格即音节边界，与 rime 源词库同形。落库时由
 /// [`wind_store::wdict::split_spaced_code`] 拆成扁平 code + boundary
@@ -448,7 +437,7 @@ const MAX_BOUNDARY_PATHS: usize = 16;
 
 /// [`boundary_by_char_count`] 的求解结果。
 ///
-/// `ambiguous` 与 `no_reading` **不是**两个可以任意组合的正交布尔：`no_reading` 为真时
+/// `ambiguous` 与 `no_reading` 不是两个可以任意组合的正交布尔：`no_reading` 为真时
 /// 读音表整体缺席，`ambiguous`（「多解，已按读音权重择一」）的语义不成立，调用方须先看
 /// `no_reading`。分成两个字段只是因为求解过程里它们在不同步骤得出。
 pub struct BoundarySolve {
@@ -456,47 +445,20 @@ pub struct BoundarySolve {
     pub mask: u64,
     /// 约束筛完仍多解（或路径枚举被截断），已按读音权重择一。
     pub ambiguous: bool,
-    /// `text` 含无读音字符 ⇒ **读音验证整体缺席**（不是「读音对不上」）。
+    /// `text` 含无读音字符 ⇒ 读音验证整体缺席（不是「读音对不上」）。
     pub no_reading: bool,
 }
 
 /// 按「音节数 == 汉字数」求解 `(code, text)` 的音节边界。
 ///
-/// 这是**导入闸口的第 4 层**（见 `docs/design/pinyin-entry-boundary-contract.md` §3.1）。
+/// 这是导入闸口的第 4 层（见 `docs/design/pinyin-entry-boundary-contract.md` §3.1）。
 ///
-/// ## 为什么这不是猜
+/// 不是猜：汉字词的音节数恒等于汉字数，`xianning` + 「西安宁」只有 `xi|an|ning` 一条
+/// 3 音节路径，切分由启发式降为可判定问题。与 [`generate_word_pinyin`]（字 → 码，多音字
+/// 靠权重猜）方向相反：这里读音已由词库作者写定，`chongqing` + 「重庆」直接切出，无需消歧。
 ///
-/// [`super::dag::Dag::maximum_match`] 只看 code，在等长路径间无从取舍（`xian` 切成
-/// `xi|an` 还是 `xian`，覆盖字符数都是 4），故只能算猜。而这里手上有 `text`，汉字词的
-/// **音节数恒等于汉字数**——`xianning` + 「西安宁」(3 字) 只有 `xi|an|ning` 一条 3 音节
-/// 路径，`xian|ning` 因只有 2 音节被约束直接排除。切分由此从启发式降为可判定问题。
-///
-/// ## 与 [`generate_word_pinyin`] 的关系：方向相反，互补
-///
-/// 那个是「字 → 码」（多音字必须靠权重猜），这个是「码 → 切分」（读音已由词库作者写定，
-/// 只需切分）。两者共用 [`CharPinyinIndex`]。**恰恰是最难的多音字，在有 code 的这条路上
-/// 不构成问题**：`chongqing` + 「重庆」直接切出 `chong|qing`，无需知道「重」是多音字。
-///
-/// ## 返回 `None` 的两种含义，调用方必须分开处置
-///
-/// 本函数只管求解，不区分「非法」与「码太长装不下 bitmask」——后者由调用方在进来之前
-/// 按 `code.len() > 64` 拦掉（那是**合法但无边界**，既定语义是降级为 0，见
-/// [`wind_store::wdict::split_spaced_code`] 的同款契约），到这里的 `None` 一律是非法。
-///
-/// ## 判据①（每字须有读音）为什么只标记、不拒收
-///
-/// 它曾是一条早退：`text` 里但凡有一个字符查不到读音就整行判非法。这误伤了**完全合法**
-/// 的一类词条——`zuo ←`、`dengyu ＝`（拼音码 → 符号候选），符号在拼音词典里当然没有
-/// 单字读音，可 `zuo` 本身是个正经音节、`←` 恰好一个字符，边界 `0b1` 是**确定**的，
-/// 根本不需要读音来定。见 issue #97。
-///
-/// 拦截「码表词库误导入拼音方案」的力量全部在**判据②**（`paths.is_empty()`）：`wgkq`
-/// 切不出 1 个音节、`aaaa` 切不出 1 段，两个既有测试样例都是判据② 挡下的，判据① 对它们
-/// 是多余的。判据① 唯一独占的战果是「中英/符号混排词条」，而那恰恰是上面那类合法用法。
-///
-/// ⚠️ 降级后逻辑是**自洽**的，不是绕过：无读音时 [`reading_score`] 里的
-/// `index.reading_count(runes[i])?` 本就会让每条路径都不计分，`scored` 自然为空，于是落进
-/// 下面那个早已存在、注释也早已写明「切分本身合法就不能否决」的降级分支。
+/// `code.len() > 64`（合法但无边界，降级为 0）须由调用方先拦掉，到这里的 `None` 一律是非法。
+/// 判据①（每字须有读音）只标记不拒收，拦误导入全靠判据②，见设计文档 §2.1。
 pub fn boundary_by_char_count(
     index: &(impl ReadingTable + ?Sized),
     trie: &SyllableTrie,
@@ -507,13 +469,11 @@ pub fn boundary_by_char_count(
     if runes.is_empty() || code.is_empty() || code.len() > 64 {
         return None;
     }
-    // 判据①（设计文档 §2.1）：每个字符都要有读音。**只作标记，不再拒收**（见上方说明）。
-    // ⚠️ `readings` 只收**单字词典条目**，故这条同时也是「该字在本方案词典里存在」。
+    // 判据①（设计文档 §2.1）：每个字符都要有读音。只作标记，不拒收。
+    // `readings` 只收单字词典条目，故这条同时也是「该字在本方案词典里存在」。
     let no_reading = runes.iter().any(|&c| index.reading_count(c).is_none());
-    // **必须 `build_strict`**：这里推的是词条的**真值边界**（哪几个字节属于哪个字的读音），
-    // 下面还要拿每个音节去比对该字的 readings。带模糊拼写层会凭空多出「用户错音」那些边，
-    // 既可能撑爆 `MAX_BOUNDARY_PATHS` 把本来唯一的解判成 truncated，也让判据②
-    // 「切得出与字数相符的音节序列」被错音串满足。见 `fuzzy::fuzzy_spellings`。
+    // 必须 `build_strict`：这里推的是真值边界。模糊拼写层多出的错音边既可能撑爆
+    // `MAX_BOUNDARY_PATHS` 把唯一解判成 truncated，也会让判据② 被错音串满足。
     let graph = SegGraph::from_dag(&Dag::build_strict(code, trie));
     let paths = graph.paths_with_edges(0, code.len(), runes.len(), MAX_BOUNDARY_PATHS);
     if paths.is_empty() {
@@ -533,7 +493,7 @@ pub fn boundary_by_char_count(
     let (best, multi) = if scored.is_empty() {
         // 读音表不认可任何一条切分（方言音 / 词库作者用了非常用读音 / 词典单字表不全 /
         // `no_reading`：text 含符号等无读音字符）。
-        // ★ 切分本身在音节图上合法，不能因此否决——否则会把「码没错、只是读音冷门」的
+        // 切分本身在音节图上合法，不能因此否决——否则会把「码没错、只是读音冷门」的
         // 词条误判成非法。退回「唯一即采信、多解算歧义」。
         (&paths[0], paths.len() > 1)
     } else {
@@ -580,234 +540,5 @@ fn mask_of(offsets: &[usize]) -> u64 {
 mod legacy_equiv;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use wind_dict::codetable::CodetableDict;
-
-    /// 用 (code, text, weight) 三元组建内存拼音词典。
-    fn dict_from(entries: &[(&str, &str, i32)]) -> CachedDict {
-        let mut d = CodetableDict::empty();
-        for (code, text, weight) in entries {
-            d.merge_single(code.to_string(), text.to_string(), *weight, 0);
-        }
-        CachedDict::Memory(d)
-    }
-
-    /// 扁平码（不关心边界的断言用）。
-    fn gen_py(entries: &[(&str, &str, i32)], word: &str) -> Option<String> {
-        gen_py_spaced(entries, word).map(|s| s.replace(' ', ""))
-    }
-
-    /// 引擎的原始产出：**带空格的音节码**。空格即边界，是本模块的真相源。
-    fn gen_py_spaced(entries: &[(&str, &str, i32)], word: &str) -> Option<String> {
-        let dict = dict_from(entries);
-        let idx = CharPinyinIndex::build(&dict);
-        generate_word_pinyin(&dict, &idx, word)
-    }
-
-    /// 落库口径：按 `wind_store::wdict::split_spaced_code` 拆成 `(flat, boundary)`，
-    /// 即用户词表里最终存下的形态。
-    fn gen_py_stored(entries: &[(&str, &str, i32)], word: &str) -> Option<(String, u64)> {
-        gen_py_spaced(entries, word).map(|s| wind_store::wdict::split_spaced_code(&s))
-    }
-
-    /// 同权重的多个读音按 [`STANDARD_SYLLABLES`] 的次序排（旧实现「稳定排序 + 按音节表遍历
-    /// 的首次出现序」的语义），与词条写进词典的先后无关。
-    ///
-    /// ⚠️ 样本形状是试出来的：只有两个同权重读音、或全部同权重时，第二遍排序的输入本就有序，
-    /// 排序键漏掉音节 id 也照样绿（实测）。这里给「长」40 个读音、两档权重交错，排序必须
-    /// 真的搬动元素，同档内的次序才只能靠音节 id 定。
-    #[test]
-    fn equal_weight_readings_follow_syllable_table_order() {
-        let pos = |s: &str| STANDARD_SYLLABLES.iter().position(|x| *x == s).unwrap();
-        let syls: Vec<&str> = STANDARD_SYLLABLES
-            .iter()
-            .step_by(9)
-            .take(40)
-            .copied()
-            .collect();
-        let weight = |i: usize| if i.is_multiple_of(2) { 100 } else { 500 };
-        // 故意按音节表**倒序**写进词典；另配两个字作陪。
-        let mut entries: Vec<(&str, &str, i32)> = syls
-            .iter()
-            .enumerate()
-            .rev()
-            .map(|(i, s)| (*s, "长", weight(i)))
-            .collect();
-        entries.extend([("ni", "你", 1), ("a", "阿", 3)]);
-        let dict = dict_from(&entries);
-        let idx = CharPinyinIndex::build(&dict);
-
-        // 期望：先 500 档、再 100 档，档内按音节表次序（`syls` 本身就是音节表次序）。
-        let mut want: Vec<&str> = syls
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| weight(*i) == 500)
-            .map(|(_, s)| *s)
-            .collect();
-        want.extend(
-            syls.iter()
-                .enumerate()
-                .filter(|(i, _)| weight(*i) == 100)
-                .map(|(_, s)| *s),
-        );
-        assert!(
-            want.windows(2).take(19).all(|w| pos(w[0]) < pos(w[1])),
-            "前提：档内升序"
-        );
-        let n = idx.reading_count('长').unwrap();
-        let got: Vec<&str> = (0..n).map(|i| idx.reading('长', i).unwrap()).collect();
-        assert_eq!(got, want, "同权重读音须按音节表次序");
-        assert_eq!(idx.representative('长'), Some(want[0]));
-    }
-
-    /// 造词须同时产出音节边界——用户自造词的边界从此有来源，不再是「空洞」。
-    /// 三条产码路径（整词消歧 / 子词切分 / 逐字兜底）都要带边界。
-    ///
-    /// 断言直接落在**带空格的产出**上：空格表示让切分肉眼可读，也免去了「bitmask 与 code
-    /// 各存一份、可以不一致」的老毛病（`d4084b8` 踩过）。
-    #[test]
-    fn generate_word_pinyin_carries_boundary() {
-        let entries = &[
-            ("ni", "你", 100),
-            ("hao", "好", 100),
-            ("nihao", "你好", 500),
-            ("chong", "重", 50),
-            ("zhong", "重", 900),
-            ("qing", "庆", 100),
-            ("chongqing", "重庆", 800),
-        ];
-        // 整词命中
-        assert_eq!(gen_py_spaced(entries, "你好").as_deref(), Some("ni hao"));
-        // 整词消歧（重庆读 chongqing 而非 zhongqing）
-        assert_eq!(
-            gen_py_spaced(entries, "重庆").as_deref(),
-            Some("chong qing")
-        );
-        // 单字：整串一个音节，无内部边界可标
-        assert_eq!(gen_py_spaced(entries, "你").as_deref(), Some("ni"));
-        // 逐字兜底（整词不在词典）
-        assert_eq!(gen_py_spaced(entries, "你重").as_deref(), Some("ni zhong"));
-
-        // 落库形态：key 扁平、边界随 value 存下
-        assert_eq!(
-            gen_py_stored(entries, "你好"),
-            Some(("nihao".into(), 0b101))
-        );
-        assert_eq!(
-            gen_py_stored(entries, "重庆"),
-            Some(("chongqing".into(), 0b100001))
-        );
-        assert_eq!(
-            gen_py_stored(entries, "你重"),
-            Some(("nizhong".into(), 0b101))
-        );
-        // ⚠️ 单音节的 `0b1` 不经文本往返（见 wdict::single_syllable_boundary_is_lossy_by_design）。
-        // 单音节无切分歧义，且 0 在消费端一律是「放行」，不会误杀。
-        assert_eq!(gen_py_stored(entries, "你"), Some(("ni".into(), 0)));
-    }
-
-    /// 子词切分路径：段自身是多音节整词时，段内边界须并入全局，不能把整段当一个音节。
-    ///
-    /// 空格表示下这是纯拼接（`push_segment` 按空格展开）；此前是 bitmask 左移 `base`，
-    /// 漏平移就会把长词的段内边界丢掉。
-    #[test]
-    fn subword_segmentation_preserves_inner_boundary() {
-        let entries = &[
-            ("ni", "你", 100),
-            ("hao", "好", 100),
-            ("nihao", "你好", 500),
-            ("a", "啊", 100),
-        ];
-        // 「你好啊」整词不在词典 → 子词切分：段「你好」(ni hao) + 单字「啊」(a)。
-        assert_eq!(
-            gen_py_spaced(entries, "你好啊").as_deref(),
-            Some("ni hao a")
-        );
-        assert_eq!(
-            gen_py_stored(entries, "你好啊"),
-            Some(("nihaoa".into(), 0b100101))
-        );
-    }
-
-    /// 超长词（拼接 >64 字节）：bitmask 装不下，落库时整体降级为 0；但**带空格的产出
-    /// 本身不受限**——这正是空格表示相对 bitmask 的增量，边界在传输/导出层面得以保全。
-    #[test]
-    fn overlong_word_keeps_spaces_though_mask_degrades() {
-        let entries = &[("zhuang", "装", 100)];
-        let word: String = std::iter::repeat_n('装', 12).collect(); // 12*6=72B
-        let spaced = gen_py_spaced(entries, &word).expect("应能逐字兜底产码");
-        assert_eq!(spaced.split(' ').count(), 12, "12 个音节全部保留");
-        assert_eq!(
-            gen_py_stored(entries, &word).unwrap().1,
-            0,
-            "落库时超 64B 整体降级为无边界（bitmask 的固有上限）"
-        );
-    }
-
-    /// 多音字按权重择优：费→fei(1000) 而非 bi(50)，强→qiang(1000) 而非 jiang(80)。
-    #[test]
-    fn multi_pron_by_weight() {
-        let entries = &[
-            ("fei", "费", 1000),
-            ("bi", "费", 50),
-            ("qiang", "强", 1000),
-            ("jiang", "强", 80),
-            ("xiao", "晓", 1000),
-        ];
-        assert_eq!(gen_py(entries, "费").as_deref(), Some("fei"));
-        assert_eq!(gen_py(entries, "强").as_deref(), Some("qiang"));
-        // 整词不在词典 → 逐字代表读音兜底
-        assert_eq!(gen_py(entries, "费晓强").as_deref(), Some("feixiaoqiang"));
-    }
-
-    /// 整词命中覆盖逐字代表读音：重→代表音 zhong，但"重庆"整词读 chongqing。
-    #[test]
-    fn whole_word_overrides_per_char() {
-        let entries = &[
-            ("zhong", "重", 1000),
-            ("chong", "重", 80),
-            ("qing", "庆", 1000),
-            ("chongqing", "重庆", 500),
-        ];
-        assert_eq!(gen_py(entries, "重庆").as_deref(), Some("chongqing"));
-    }
-
-    /// 长词子词切分继承读音：长→代表音 zhang，但经"长江"+"三角洲"得 changjiangsanjiaozhou。
-    #[test]
-    fn subword_segmentation() {
-        let entries = &[
-            ("zhang", "长", 1000),
-            ("chang", "长", 500),
-            ("jiang", "江", 1000),
-            ("san", "三", 1000),
-            ("jiao", "角", 1000),
-            ("zhou", "洲", 1000),
-            ("changjiang", "长江", 600),
-            ("sanjiaozhou", "三角洲", 500),
-        ];
-        assert_eq!(
-            gen_py(entries, "长江三角洲").as_deref(),
-            Some("changjiangsanjiaozhou")
-        );
-    }
-
-    /// 简单整词命中。
-    #[test]
-    fn simple_whole_word() {
-        let entries = &[
-            ("ni", "你", 1000),
-            ("hao", "好", 1000),
-            ("nihao", "你好", 800),
-        ];
-        assert_eq!(gen_py(entries, "你好").as_deref(), Some("nihao"));
-    }
-
-    /// 含无读音字符 → None。
-    #[test]
-    fn unknown_char_returns_none() {
-        let entries = &[("ni", "你", 1000)];
-        // "你X"：X 无任何读音
-        assert_eq!(gen_py(entries, "你X"), None);
-    }
-}
+#[path = "generate_tests.rs"]
+mod tests;

@@ -1,7 +1,6 @@
 //! Named Pipe 请求-响应服务器
 //!
-//! 与 Go 版本 `wind_input/internal/bridge/server.go` 对齐。
-//! 每个客户端连接在独立线程中处理（对应 Go 的 goroutine）。
+//! 每个客户端连接在独立线程中处理。
 
 use crate::handler::*;
 #[cfg(windows)]
@@ -245,11 +244,8 @@ fn handle_client(
     use windows::Win32::Foundation::*;
     use windows::Win32::Storage::FileSystem::*;
 
-    // 打字线程提速：hybrid CPU（P 核 + E 核）下服务线程常被放 E 核化解负载，同核还有
-    // 其它常驻线程（WorkBuddy 等后台任务），实测 convert 慢键的 PageFaultCount 差值
-    // 只有正常键的 1/60 —— 大部分时间片在被抢占，直观感受就是出候选顿挫 50–200ms。
-    // 键处理线程提到 HIGHEST（进程保持 Normal），同核排队快得多。失败静默：提不上去
-    // 只影响延迟上限，不破坏功能。
+    // 键处理线程提到 HIGHEST（进程保持 Normal）：hybrid CPU 下同核常驻线程会抢占时间片，
+    // 表现为出候选顿挫。失败静默，只影响延迟上限。
     unsafe {
         let _ = windows::Win32::System::Threading::SetThreadPriority(
             windows::Win32::System::Threading::GetCurrentThread(),
@@ -257,11 +253,8 @@ fn handle_client(
         );
     }
 
-    // 连接建立即通知：`ctx.pid` 是本次唯一能免费拿到、还没被任何消息处理耽搁的对端 pid。
-    // 放在读循环之前——命名管道有内核缓冲（见上方 CreateNamedPipeA 的 64KB 收发缓冲区），
-    // 对端此刻发消息不会因为我们还没开始 ReadFile 而丢失或阻塞；本调用只影响*本连接*
-    // 读到*第一条*消息前那一小段时间（<1ms 级的 GetForegroundWindow / 按需 OpenProcess），
-    // 每条连接仅此一次，不会摊到后续每次按键往返上。
+    // 连接建立即通知（此时 `ctx.pid` 现成可用）。放在读循环之前不会丢消息：命名管道有内核
+    // 缓冲，本调用只推迟本连接读第一条消息，每连接一次。
     handler.handle_client_connected(ctx.pid);
 
     let pipe = pipe.0;
@@ -383,9 +376,8 @@ fn handle_client(
             }
         }
 
-        // FOCUS_GAINED 重型段延后到响应写出之后（对齐 Go runActivationHandlerAndPush）：
-        // 同步段已回 ModePush 解除 DLL 阻塞，此处再 build_status + push 完整激活状态
-        // （工具栏/热键/图标/active token），不占用 DLL 的同步等待窗口。
+        // FOCUS_GAINED 重型段延后到响应写出之后：同步段已回 ModePush 解除 DLL 阻塞，此处再
+        // build_status + push 完整激活状态，不占用 DLL 的同步等待窗口。
         if cmd == CMD_FOCUS_GAINED
             && let Ok(fg) = decode_focus_gained(payload)
         {
@@ -442,11 +434,9 @@ fn handle_client(
 
 /// 分发命令到处理器，返回响应字节
 ///
-/// 与 Go 版 `processRequest` 对齐：
-/// - 同步命令返回 Some(response_bytes)
-/// - 异步命令返回 None（不写响应）
-/// - FOCUS_GAINED：同步命令，回 CMD_MODE_PUSH（权威 chinese/full）；重型 push 延后到
-///   handle_client 写出响应之后（见该处）。IME_ACTIVATED 仍异步，状态由 handler 经 push pipe 回送。
+/// - 同步命令返回 Some(response_bytes)，异步命令返回 None（不写响应）
+/// - FOCUS_GAINED：同步，回 CMD_MODE_PUSH；重型 push 延后到 handle_client 写出响应之后。
+///   IME_ACTIVATED 仍异步，状态由 handler 经 push pipe 回送。
 pub(crate) fn dispatch_command(
     handler: &Arc<dyn MessageHandler>,
     command: u16,
@@ -468,7 +458,7 @@ pub(crate) fn dispatch_command(
             // 键事件是「该实例正在输入」的最强焦点证据：SearchHost 等 locked/transient
             // DocMgr 宿主二次聚焦时 DLL 会跳过 focus_gained（OnSetFocus 见 TextService.cpp），
             // IME_ACTIVATED 也不重发——若不在此刷新 active，host-render 目标会停留在
-            // 上一个前台进程，导致第二次在开始菜单输入时回退本地渲染（真机踩坑）。
+            // 上一个前台进程，导致第二次在开始菜单输入时回退本地渲染。
             #[cfg(windows)]
             if let Some(mgr) = host_render {
                 mgr.note_focus(ctx.conn_id, ctx.pid);
@@ -529,12 +519,10 @@ pub(crate) fn dispatch_command(
             }
         },
 
-        // ── 焦点获取（同步命令，对齐 Go fix(focus) 0acf860b） ──
-        // 两段式：本同步段只做纯内存轻量操作并**立即回 CMD_MODE_PUSH**（权威 chinese/full）：
-        //   DLL 现为同步发送，在 OnSetFocus 内阻塞等本响应，首键前写好 _bChineseMode，
-        //   根治"切到微信首键上屏英文"；并解除阻塞（旧实现返回 None → DLL 卡到超时，
-        //   表现为切应用卡顿）。重型 handle_focus_gained（build_status + push 完整激活状态）
-        //   延后到 handle_client 写出响应之后再跑，不在 DLL 阻塞路径上（见 handle_client）。
+        // ── 焦点获取（同步命令）──
+        // DLL 在 OnSetFocus 内阻塞等本响应，首键前要写好中英模式，故这里只做轻量操作并立即回
+        // CMD_MODE_PUSH；不回则 DLL 卡到超时。重型 handle_focus_gained 延后到 handle_client
+        // 写出响应之后，不在 DLL 阻塞路径上。
         CMD_FOCUS_GAINED => {
             // 记录最近焦点实例（host-render 写帧目标）。已 setup 才在 active_target 生效。
             #[cfg(windows)]
@@ -542,19 +530,17 @@ pub(crate) fn dispatch_command(
                 mgr.note_focus(ctx.conn_id, ctx.pid);
             }
             if let Ok(fg) = decode_focus_gained(payload) {
-                // 同步 caret（首键前必须就绪，纯字段写入，对齐 Go applyFocusGainedCaret）。
-                // ⚠ 必须走 handle_focus_gained_caret 而**不是** handle_caret_update：
-                // 后者带副作用（消费首显等待 → 立即显示候选），会让焦点事件那一刻的
-                // 非权威坐标抢在 reflow 之前把候选窗显示出来，造成"先在旧位置再跳走"。
+                // 同步 caret（首键前必须就绪）。必须走 handle_focus_gained_caret 而不是
+                // handle_caret_update：后者会消费首显等待，让非权威坐标抢在 reflow 之前把
+                // 候选窗显示出来，造成「先在旧位置再跳走」。
                 handler.handle_focus_gained_caret(&CaretData {
                     x: fg.caret.x,
                     y: fg.caret.y,
                     height: fg.caret.height,
                     composition_start_x: fg.caret.composition_start_x,
                     composition_start_y: fg.caret.composition_start_y,
-                    // 来源随焦点载荷尾部的第 39 字节到达（旧 DLL 落 UNKNOWN）。
-                    // 「这一帧只落缓存、没有来源信息的消费者」已不再成立——`ui.status.show_on_focus`
-                    // 让状态气泡直接锚在这组坐标上，来源是它唯一能据以判断可信度的东西。
+                    // 来源随焦点载荷第 39 字节到达（旧 DLL 落 UNKNOWN）。`ui.status.show_on_focus`
+                    // 的状态气泡直接锚在这组坐标上，靠来源判断可信度。
                     source: fg.caret_source,
                     composition_rect: None,
                 });
@@ -595,8 +581,7 @@ pub(crate) fn dispatch_command(
         }
 
         // ── IME 激活（异步） ──
-        // Go 的两阶段模式：Phase1 更新 activeProcessID/activeToken + 回 Ack，
-        // Phase2 调用 HandleIMEActivated 并推送 ActivationStatusPush。
+        // 两阶段：先更新活动进程/token，再调用 handle_ime_activated 并推送激活状态。
         CMD_IME_ACTIVATED => {
             let token = decode_client_token(payload);
             // 后台客户端的激活不是焦点转移：不动 host render 写帧目标与活动客户端，
@@ -719,11 +704,8 @@ pub(crate) fn dispatch_command(
                             return Some(encode_host_render_setup(instance_id, &entries));
                         }
                         Err(e) => {
-                            // `{e:#}` 展开整条 anyhow 链:`setup` 内部给失败套了
-                            // 「create SHM kind=N」这类 context,而底下那层才是
-                            // `io::Error::last_os_error()`——真正要看的 Windows 错误码
-                            // （拒绝访问 / 名称已存在）。用 `{}` 只打印最外层那句,
-                            // 等于把排查 host render 唯一的线索丢掉。
+                            // `{:#}` 展开整条 anyhow 链：底层的 Windows 错误码才是排查线索，
+                            // `{}` 只打印最外层 context。
                             debug!(
                                 "host_render setup 拒绝 conn_id={} pid={}: {:#}",
                                 ctx.conn_id, ctx.pid, e
@@ -754,8 +736,8 @@ pub(crate) fn dispatch_command(
 
         // ── 光标更新（异步） ──
         CMD_CARET_UPDATE => {
-            // 后台客户端的光标不是输入位置：它在 ActivateEx 里随手报的 Win32 光标曾吃掉
-            // 前台宿主的首显等待，把第一个字的候选摆到 (0,74)。
+            // 后台客户端的光标不是输入位置：它在 ActivateEx 里报的 Win32 光标会吃掉前台宿主的
+            // 首显等待，把候选摆到错误位置。
             if handler.is_background_client(ctx.pid) {
                 debug!("caret_update 来自后台客户端 pid={}，忽略", ctx.pid);
                 return if is_async { None } else { Some(encode_ack()) };
@@ -795,13 +777,8 @@ pub(crate) fn dispatch_command(
                     }
                 })
             {
-                // ⚠ 2026-09-05 探针阶段：组合矩形**只观察、不参与决策**，故不进 `CaretData`。
-                // 目的是先用真机日志看清各宿主对**跨行** range 的 `GetTextExt` 究竟返回什么
-                // （规范说返回包围矩形，实现可能只返回首行、可能 TS_E_NOLAYOUT）。看清之后
-                // 再决定锚点公式，并连同消费代码一起把字段加进 `CaretData`。
-                //
-                // 判读要点：`h ≈ 单行行高` ⇒ 组合在一行内，`left` 就是组合起点；
-                // `h ≈ n 倍行高` ⇒ 跨了 n 行，此时 `(left, bottom)` 才是最后一行的行首。
+                // 组合矩形日志判读：`h ≈ 单行行高` ⇒ 组合在一行内，`left` 即组合起点；
+                // `h ≈ n 倍行高` ⇒ 跨了 n 行，`(left, bottom)` 才是最后一行的行首。
                 let comp_rect = wind_ipc::protocol::CaretPayload::comp_rect_from_bytes(payload);
                 if let Some((l, t, r, b)) = comp_rect {
                     // `CaretPayload` 是 packed 布局，格式化宏会对字段取引用 ⇒ 未对齐引用是 UB。
@@ -852,8 +829,7 @@ pub(crate) fn dispatch_command(
         // ── 首显试探采样（异步）──
         // 载荷同 CaretPayload；长度不足直接丢弃：半截坐标定位候选窗比不定位更糟。
         CMD_CARET_PROBE => {
-            // 入口无条件记一条：本分支此前对「解码失败」是静默丢弃的，真机排查时
-            // 「一条日志都没有」既可能是没收到、也可能是收到但解码失败，无从区分。
+            // 入口无条件记一条，以区分「没收到」与「收到但解码失败」。
             debug!("CMD_CARET_PROBE 到达: payload={} 字节", payload.len());
             if let Some(p) = wind_ipc::protocol::CaretPayload::from_bytes(payload) {
                 handler.handle_caret_probe(&CaretData {
@@ -953,8 +929,7 @@ pub(crate) fn dispatch_command(
 
         // ── 鼠标点选候选（页内下标 i32 LE，上行；darwin .app 同步 / Windows host DLL SendAsync）──
         // 0x020D 双用途：下行 CMD_MODE_PUSH（仅编码），上行 CMD_CANDIDATE_SELECT（仅 dispatch）。
-        // 负值为翻页按钮（-1 上页 / -2 下页），对齐 Go handleHostCandidateSelect 的 int32 解码——
-        // 按 u32 解码会把翻页点击变成巨大下标被 coordinator 丢弃（真机踩坑：翻页点击无效）。
+        // 负值为翻页按钮（-1 上页 / -2 下页），必须按 i32 解码，按 u32 会让翻页点击失效。
         // Windows DLL fire-and-forget（is_async）不读响应，回 ack 会污染管道 → 仅 !is_async 回 ack。
         CMD_CANDIDATE_SELECT => {
             if payload.len() >= 4 {
@@ -1153,8 +1128,6 @@ fn decode_focus_lost_reason(payload: &[u8]) -> wind_ipc::protocol::FocusLostReas
 }
 
 /// 将 KeyAction 编码为响应字节
-///
-/// 与 Go 版 handleKeyEvent 的 switch 分支对齐
 fn encode_key_action(action: &KeyAction, assoc_session: bool) -> Vec<u8> {
     // 标志位只属于「不带新组合的普通上屏」：带新组合的上屏、其它动作一律不置位。
     // （见 tests::assoc_session_flag_only_on_plain_commit）
@@ -1237,560 +1210,5 @@ fn encode_status_update_from_data(status: &StatusUpdateData) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// ASSOC_SESSION 标志（0x20）只加在不带新组合的 InsertText 上，其它一律不加。
-    #[test]
-    fn assoc_session_flag_only_on_plain_commit() {
-        let flags = |b: &[u8]| {
-            u32::from_le_bytes(
-                b[wind_ipc::protocol::IpcHeader::SIZE..][..4]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-        let plain = KeyAction::InsertText {
-            text: "好".into(),
-            new_composition: None,
-            mode_changed: false,
-            chinese_mode: true,
-            has_new_composition: false,
-        };
-        let with_comp = KeyAction::InsertText {
-            text: "好".into(),
-            new_composition: Some(" ".into()),
-            mode_changed: false,
-            chinese_mode: true,
-            has_new_composition: true,
-        };
-        assert_eq!(flags(&encode_key_action(&plain, true)) & 0x20, 0x20);
-        assert_eq!(flags(&encode_key_action(&plain, false)) & 0x20, 0);
-        assert_eq!(
-            flags(&encode_key_action(&with_comp, true)) & 0x20,
-            0,
-            "带新组合的上屏不置位"
-        );
-        assert_ne!(
-            encode_key_action(&KeyAction::Consumed, true),
-            Vec::<u8>::new()
-        );
-    }
-
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use wind_ipc::codec::decode_uielement_page;
-    use wind_ipc::protocol::{
-        CMD_ACK, CMD_CANDIDATE_SELECT, CMD_HOST_RENDER_FAILED, CMD_KEY_OBSERVED,
-        CMD_UIELEMENT_ACTION, CMD_UIELEMENT_PAGE, CMD_UIELEMENT_QUERY, CMD_UIELEMENT_STATE,
-        IpcHeader, KeyObservedPayload, MOD_SHIFT, UIELEMENT_ACTION_SET_SELECTION,
-        UIELEMENT_FLAG_UI_LESS_THREAD, UiElementActionPayload, UiElementStatePayload,
-    };
-    // host-render 与按键投递是 Windows 专属通路，相应用例也只在 Windows 编译。
-    #[cfg(windows)]
-    use wind_ipc::protocol::{
-        CMD_CANDIDATE_SCROLL, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, CMD_KEY_EVENT,
-    };
-
-    /// 面板指针事件 (kind, event, button, x, y)。
-    type PanelPointer = (u32, u32, u32, i32, i32);
-
-    /// 最小测试 handler：记录 host_render_failed 的 reason 与鼠标 select/scroll 值，
-    /// 其余方法返回安全默认值。
-    #[derive(Default)]
-    struct RecordingHandler {
-        last_failed_reason: AtomicU32,
-        last_select: std::sync::atomic::AtomicI32,
-        last_scroll: std::sync::atomic::AtomicI32,
-        last_uielement: std::sync::Mutex<Vec<String>>,
-        last_panel_pointer: std::sync::Mutex<Vec<PanelPointer>>,
-        /// 视为后台客户端的 pid（0 = 无）。
-        background_pid: AtomicU32,
-        activation_calls: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl MessageHandler for RecordingHandler {
-        fn handle_key_event(&self, _d: &KeyEventData) -> KeyAction {
-            KeyAction::PassThrough
-        }
-        fn handle_focus_gained(&self, _data: &FocusData) -> Option<StatusUpdateData> {
-            None
-        }
-        fn handle_focus_lost(&self, _client_token: u64, _reason: FocusLostReason) {}
-        fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
-            self.activation_calls
-                .lock()
-                .unwrap()
-                .push(format!("fg:{client_token:#x}"));
-            None
-        }
-        fn is_background_client(&self, pid: u32) -> bool {
-            pid != 0 && pid == self.background_pid.load(Ordering::SeqCst)
-        }
-        fn handle_background_ime_activated(&self, client_token: u64) {
-            self.activation_calls
-                .lock()
-                .unwrap()
-                .push(format!("bg:{client_token:#x}"));
-        }
-        fn handle_ime_deactivated(&self, _client_token: u64) {}
-        fn handle_mode_notify(&self, _flags: u32) {}
-        fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
-            (None, String::new())
-        }
-        fn handle_system_mode_switch(
-            &self,
-            _chinese_mode: bool,
-            _source: wind_ipc::protocol::ModeSwitchSource,
-            _ctrl_held: bool,
-        ) -> (Option<StatusUpdateData>, String) {
-            (None, String::new())
-        }
-        fn handle_menu_command(&self, _command: &str) -> Option<StatusUpdateData> {
-            None
-        }
-        fn handle_composition_terminated(&self) {}
-        fn handle_caret_update(&self, _data: &CaretData) {}
-        fn handle_focus_gained_caret(&self, _data: &CaretData) {}
-        fn handle_caret_probe(&self, _data: &CaretData) {}
-        fn handle_caret_pending(&self) {}
-        fn handle_selection_changed(&self, _prev_char: u16) {}
-        fn handle_commit_request(&self, _data: &CommitRequestData) -> Option<CommitResultData> {
-            None
-        }
-        fn handle_host_render_failed(&self, reason: u32) {
-            self.last_failed_reason.store(reason, Ordering::SeqCst);
-        }
-        fn handle_candidate_select(&self, page_local_index: i32) {
-            self.last_select.store(page_local_index, Ordering::SeqCst);
-        }
-        fn handle_candidate_scroll(&self, delta: i32) {
-            self.last_scroll.store(delta, Ordering::SeqCst);
-        }
-        fn handle_uielement_state(&self, pid: u32, host_draws: bool, host_reads: bool) {
-            self.last_uielement
-                .lock()
-                .unwrap()
-                .push(format!("state:{pid}:{host_draws}:{host_reads}"));
-        }
-        fn on_panel_pointer(&self, kind: u32, event: u32, button: u32, x: i32, y: i32) {
-            self.last_panel_pointer
-                .lock()
-                .unwrap()
-                .push((kind, event, button, x, y));
-        }
-        fn uielement_page(&self) -> UiElementPage {
-            UiElementPage {
-                items: vec!["你好".into(), "拟好".into()],
-                selected: 1,
-                page_size: 9,
-                current_page: 0,
-            }
-        }
-        fn handle_uielement_action(&self, action: u32, arg: u32) {
-            self.last_uielement
-                .lock()
-                .unwrap()
-                .push(format!("action:{action}:{arg}"));
-        }
-        fn handle_key_observed(&self, key_code: u32, modifiers: u32) {
-            self.last_uielement
-                .lock()
-                .unwrap()
-                .push(format!("observed:{key_code}:{modifiers}"));
-        }
-    }
-
-    /// 旁路按键是分发表里的已知命令：交给处理器、不回响应（漏登记会每键刷一条 Unknown command）。
-    #[test]
-    fn key_observed_dispatches_without_response() {
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-        let p = KeyObservedPayload {
-            key_code: 0x08,
-            modifiers: MOD_SHIFT,
-        };
-        assert!(
-            dispatch_for_test(&dyn_handler, CMD_KEY_OBSERVED, true, &p.to_bytes(), ctx).is_none()
-        );
-        assert_eq!(
-            *handler.last_uielement.lock().unwrap(),
-            vec![format!("observed:8:{MOD_SHIFT}")]
-        );
-    }
-
-    /// UIElement 三件套的分发：状态/操作异步不回响应（防管道污染），查询同步回快照帧。
-    #[test]
-    fn uielement_commands_dispatch() {
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-
-        let st = UiElementStatePayload {
-            pid: 99,
-            flags: UIELEMENT_FLAG_UI_LESS_THREAD,
-        };
-        assert!(
-            dispatch_for_test(&dyn_handler, CMD_UIELEMENT_STATE, true, &st.to_bytes(), ctx)
-                .is_none()
-        );
-        let act = UiElementActionPayload {
-            action: UIELEMENT_ACTION_SET_SELECTION,
-            arg: 3,
-        };
-        assert!(
-            dispatch_for_test(
-                &dyn_handler,
-                CMD_UIELEMENT_ACTION,
-                true,
-                &act.to_bytes(),
-                ctx
-            )
-            .is_none()
-        );
-        // 截断载荷：静默丢弃、不 panic、不触达 handler。
-        assert!(dispatch_for_test(&dyn_handler, CMD_UIELEMENT_STATE, true, &[1, 2], ctx).is_none());
-        assert_eq!(
-            *handler.last_uielement.lock().unwrap(),
-            vec!["state:99:true:false".to_string(), "action:1:3".to_string()]
-        );
-
-        // 只置读取位：声明位必须仍为 false——合并成一位就没法只关掉推断那一半。
-        let reads_only = UiElementStatePayload {
-            pid: 77,
-            flags: wind_ipc::protocol::UIELEMENT_FLAG_HOST_READS,
-        };
-        assert!(
-            dispatch_for_test(
-                &dyn_handler,
-                CMD_UIELEMENT_STATE,
-                true,
-                &reads_only.to_bytes(),
-                ctx
-            )
-            .is_none()
-        );
-        assert_eq!(
-            handler.last_uielement.lock().unwrap().last().unwrap(),
-            "state:77:false:true",
-            "HOST_READS 不得被当成 host_draws——那样 compat 覆盖就失去了作用对象"
-        );
-
-        let frame = dispatch_for_test(&dyn_handler, CMD_UIELEMENT_QUERY, false, &[], ctx)
-            .expect("同步查询必须回响应");
-        assert_eq!(u16::from_le_bytes([frame[2], frame[3]]), CMD_UIELEMENT_PAGE);
-        let page = decode_uielement_page(&frame[8..]).unwrap();
-        assert_eq!(page.items, vec!["你好".to_string(), "拟好".to_string()]);
-        assert_eq!(
-            (page.selected, page.page_size, page.current_page),
-            (1, 9, 0)
-        );
-    }
-
-    /// dispatch_command 的跨平台调用包装（Windows 多一个 host_render 参数）。
-    fn dispatch_for_test(
-        handler: &Arc<dyn MessageHandler>,
-        cmd: u16,
-        is_async: bool,
-        payload: &[u8],
-        ctx: ClientCtx,
-    ) -> Option<Vec<u8>> {
-        #[cfg(windows)]
-        {
-            dispatch_command(handler, cmd, is_async, payload, ctx, None)
-        }
-        #[cfg(not(windows))]
-        {
-            dispatch_command(handler, cmd, is_async, payload, ctx)
-        }
-    }
-
-    /// 工具栏 / 软键盘的指针事件按载荷字段原样路由；同步回 ack，异步不回。
-    #[test]
-    fn panel_pointer_dispatches_to_handler() {
-        use wind_ipc::codec::encode_panel_pointer;
-        use wind_ipc::protocol::CMD_PANEL_POINTER;
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-        let payload = encode_panel_pointer(11, 3, 1, -5, 40);
-
-        let resp = dispatch_for_test(&dyn_handler, CMD_PANEL_POINTER, false, &payload, ctx)
-            .expect("同步请求必须回 ack");
-        assert_eq!(u16::from_le_bytes([resp[2], resp[3]]), CMD_ACK);
-        assert!(dispatch_for_test(&dyn_handler, CMD_PANEL_POINTER, true, &payload, ctx).is_none());
-        // 载荷过短：不路由，但同步仍回 ack。
-        assert!(
-            dispatch_for_test(&dyn_handler, CMD_PANEL_POINTER, false, &payload[..19], ctx)
-                .is_some()
-        );
-        assert_eq!(
-            *handler.last_panel_pointer.lock().unwrap(),
-            vec![(11, 3, 1, -5, 40); 2]
-        );
-    }
-
-    /// host 模式翻页按钮点击：DLL SendAsync 发负 index（-1 上页 / -2 下页），
-    /// 必须按 i32 路由到 handler（u32 解码会丢弃翻页，真机踩坑），且异步不回响应
-    /// （回 ack 会污染管道，DLL 不读响应）。
-    #[test]
-    fn candidate_select_negative_pager_routed_async_silent() {
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-
-        let resp = dispatch_for_test(
-            &dyn_handler,
-            CMD_CANDIDATE_SELECT,
-            true,
-            &(-1i32).to_le_bytes(),
-            ctx,
-        );
-        assert!(resp.is_none(), "异步 select 不得回响应（防管道污染）");
-        assert_eq!(
-            handler.last_select.load(Ordering::SeqCst),
-            -1,
-            "上页按钮应路由 -1"
-        );
-
-        let resp = dispatch_for_test(
-            &dyn_handler,
-            CMD_CANDIDATE_SELECT,
-            true,
-            &(-2i32).to_le_bytes(),
-            ctx,
-        );
-        assert!(resp.is_none());
-        assert_eq!(
-            handler.last_select.load(Ordering::SeqCst),
-            -2,
-            "下页按钮应路由 -2"
-        );
-    }
-
-    /// darwin 同步点选（非负下标）行为不变：路由 + 回 ACK。
-    #[test]
-    fn candidate_select_sync_nonnegative_returns_ack() {
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-
-        let resp = dispatch_for_test(
-            &dyn_handler,
-            CMD_CANDIDATE_SELECT,
-            false,
-            &3i32.to_le_bytes(),
-            ctx,
-        )
-        .expect("同步 select 应回响应");
-        let hdr_arr: [u8; IpcHeader::SIZE] = resp[..IpcHeader::SIZE].try_into().unwrap();
-        let cmd = IpcHeader::from_bytes(&hdr_arr).command;
-        assert_eq!(cmd, CMD_ACK);
-        assert_eq!(handler.last_select.load(Ordering::SeqCst), 3);
-    }
-
-    /// host 候选框滚轮（DLL SendAsync）应路由 delta 且不回响应。
-    /// Windows-only：0x0211 在非 Windows 是 FRONT_CONTEXT 臂（平台双语义）。
-    #[cfg(windows)]
-    #[test]
-    fn candidate_scroll_routed_async_silent() {
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-
-        let resp = dispatch_for_test(
-            &dyn_handler,
-            CMD_CANDIDATE_SCROLL,
-            true,
-            &(-120i32).to_le_bytes(),
-            ctx,
-        );
-        assert!(resp.is_none(), "异步 scroll 不得回响应");
-        assert_eq!(handler.last_scroll.load(Ordering::SeqCst), -120);
-    }
-
-    /// 键事件必须刷新 host-render 活跃实例：SearchHost 等 transient DocMgr 宿主二次聚焦时
-    /// focus_gained 被 DLL 跳过、IME_ACTIVATED 不重发，键事件是唯一可靠的焦点信号
-    /// （否则 active 停留在别的进程 → 二次输入回退本地渲染，真机踩坑）。
-    #[cfg(windows)]
-    #[test]
-    fn key_event_notes_focus_for_host_render() {
-        let pid = std::process::id();
-        let suffix = format!("_srv_keyfocus_{}", pid);
-        let mgr = HostRenderManager::new(&suffix, vec!["*".to_string()]);
-        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
-        let ctx = ClientCtx { conn_id: 7, pid };
-
-        // 空 payload 解码失败也应先记焦点（note_focus 在解码之前）
-        let _ = dispatch_command(&handler, CMD_KEY_EVENT, false, &[], ctx, Some(&mgr));
-
-        // setup 后 active_target 应指向键事件来源的 conn 7
-        mgr.setup(7, pid, 0).expect("setup 应成功");
-        let target = mgr.active_target().expect("键事件应已刷新 active");
-        assert_eq!(target.instance_id, 7, "active 实例应为键事件来源连接");
-    }
-
-    /// 命中白名单（`*`）的连接请求应回 HostRenderSetup（含 instanceId + 三 kind 条目）。
-    #[cfg(windows)]
-    #[test]
-    fn host_render_request_returns_setup_payload() {
-        let pid = std::process::id();
-        let suffix = format!("_srv_setup_{}", pid);
-        let mgr = HostRenderManager::new(&suffix, vec!["*".to_string()]);
-        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
-        let ctx = ClientCtx { conn_id: 1, pid };
-
-        let resp = dispatch_command(
-            &handler,
-            CMD_HOST_RENDER_REQUEST,
-            false,
-            &[],
-            ctx,
-            Some(&mgr),
-        )
-        .expect("同步命令应有响应");
-
-        let hdr_arr: [u8; IpcHeader::SIZE] = resp[..IpcHeader::SIZE].try_into().unwrap();
-        let header = IpcHeader::from_bytes(&hdr_arr);
-        let cmd = header.command;
-        assert_eq!(cmd, CMD_HOST_RENDER_SETUP, "应回 HostRenderSetup 帧");
-        let p = &resp[IpcHeader::SIZE..];
-        assert_eq!(
-            u32::from_le_bytes(p[0..4].try_into().unwrap()),
-            1,
-            "instanceId 应等于 conn_id"
-        );
-        assert_eq!(
-            u32::from_le_bytes(p[4..8].try_into().unwrap()),
-            3,
-            "应含三 kind 条目"
-        );
-    }
-
-    /// 请求载荷里的能力位记到该实例上：带穿透层能力的 DLL 才拿到拆层帧，空载荷（旧 DLL）不拆。
-    #[cfg(windows)]
-    #[test]
-    fn host_render_request_records_capabilities() {
-        let pid = std::process::id();
-        let mgr = HostRenderManager::new(&format!("_srv_caps_{pid}"), vec!["*".to_string()]);
-        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
-        let caps = wind_ipc::protocol::HOST_RENDER_CAP_PASS_LAYER.to_le_bytes();
-        for (conn_id, payload) in [(1u32, &[][..]), (2, &caps[..])] {
-            let ctx = ClientCtx { conn_id, pid };
-            dispatch_command(
-                &handler,
-                CMD_HOST_RENDER_REQUEST,
-                false,
-                payload,
-                ctx,
-                Some(&mgr),
-            )
-            .expect("同步命令应有响应");
-        }
-        mgr.note_focus(1, pid);
-        assert!(!mgr.active_target().unwrap().pass_layer, "空载荷 = 旧 DLL");
-        mgr.note_focus(2, pid);
-        assert!(mgr.active_target().unwrap().pass_layer);
-    }
-
-    /// 未命中白名单的连接请求应回 ACK（DLL 退回进程内渲染）。
-    #[cfg(windows)]
-    #[test]
-    fn host_render_request_not_whitelisted_returns_ack() {
-        let pid = std::process::id();
-        let suffix = format!("_srv_reject_{}", pid);
-        // 白名单仅含 notepad.exe，当前测试进程不匹配。
-        let mgr = HostRenderManager::new(&suffix, vec!["notepad.exe".to_string()]);
-        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
-        let ctx = ClientCtx { conn_id: 1, pid };
-
-        let resp = dispatch_command(
-            &handler,
-            CMD_HOST_RENDER_REQUEST,
-            false,
-            &[],
-            ctx,
-            Some(&mgr),
-        )
-        .expect("同步命令应有响应");
-
-        let hdr_arr: [u8; IpcHeader::SIZE] = resp[..IpcHeader::SIZE].try_into().unwrap();
-        let header = IpcHeader::from_bytes(&hdr_arr);
-        let cmd = header.command;
-        assert_eq!(cmd, CMD_ACK, "未命中白名单应回 ACK");
-    }
-
-    /// 后台客户端的 IME_ACTIVATED 走 background 分支，不进常规激活（不抢活动客户端）。
-    #[test]
-    fn ime_activated_from_background_client_does_not_take_over() {
-        let handler = Arc::new(RecordingHandler::default());
-        handler.background_pid.store(27168, Ordering::SeqCst);
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let token: u64 = (27168u64 << 32) | 1;
-        let payload = token.to_le_bytes();
-        let send = |pid: u32| {
-            let ctx = ClientCtx { conn_id: 9, pid };
-            #[cfg(windows)]
-            {
-                dispatch_command(
-                    &dyn_handler,
-                    wind_ipc::protocol::CMD_IME_ACTIVATED,
-                    true,
-                    &payload,
-                    ctx,
-                    None,
-                )
-            }
-            #[cfg(not(windows))]
-            {
-                dispatch_command(
-                    &dyn_handler,
-                    wind_ipc::protocol::CMD_IME_ACTIVATED,
-                    true,
-                    &payload,
-                    ctx,
-                )
-            }
-        };
-        assert!(send(27168).is_none());
-        assert!(send(8092).is_none());
-        assert_eq!(
-            *handler.activation_calls.lock().unwrap(),
-            vec![format!("bg:{token:#x}"), format!("fg:{token:#x}")],
-            "后台 pid 只回推，前台 pid 走常规激活"
-        );
-    }
-
-    /// HOST_RENDER_FAILED 应把 reason 路由到 handler（跨平台，不涉及管理器）。
-    #[test]
-    fn host_render_failed_routes_reason_to_handler() {
-        let handler = Arc::new(RecordingHandler::default());
-        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
-        let ctx = ClientCtx { conn_id: 0, pid: 0 };
-        let payload = 42u32.to_le_bytes();
-
-        let resp = {
-            #[cfg(windows)]
-            {
-                dispatch_command(
-                    &dyn_handler,
-                    CMD_HOST_RENDER_FAILED,
-                    true,
-                    &payload,
-                    ctx,
-                    None,
-                )
-            }
-            #[cfg(not(windows))]
-            {
-                dispatch_command(&dyn_handler, CMD_HOST_RENDER_FAILED, true, &payload, ctx)
-            }
-        };
-        assert!(resp.is_none(), "失败通知为异步命令，不应有响应");
-        assert_eq!(
-            handler.last_failed_reason.load(Ordering::SeqCst),
-            42,
-            "reason 应路由到 handler"
-        );
-    }
-}
+#[path = "server_tests.rs"]
+mod tests;
